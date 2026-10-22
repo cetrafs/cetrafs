@@ -391,10 +391,18 @@ ct_procdir() { echo "/proc/fs/cetrafs/$(basename "$(readlink -f "$1")")"; }
 ct_dev() { ct_loop "$(ct_image "$1" "${2:-img}")"; }
 
 # --------------------------------------------------------------- tools
+# Build what the caller needs. A suite that never loads the module (the
+# whole of image/) must not drag in a kernel-module build: that demands
+# headers a packaging or CI host has no reason to carry, and the suite
+# would fail for a reason that has nothing to do with the filesystem.
 ct_build() {
     [ -n "${CT_BUILT:-}" ] && return 0
     log "building"
-    make -C "$ROOT" all >/dev/null
+    if [ "${CT_NEED_MODULE:-1}" = "1" ]; then
+        make -C "$ROOT" all >/dev/null
+    else
+        make -C "$ROOT" userspace >/dev/null
+    fi
     CT_BUILT=1
 }
 

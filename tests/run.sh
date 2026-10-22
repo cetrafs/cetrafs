@@ -67,16 +67,29 @@ done
     exit 2
 }
 
+# What the batch needs decides what gets built. image/ suites never load
+# the module -- they corrupt a structure mkfs wrote and require fsck to
+# report that fault -- so building it for them demands kernel headers a
+# packaging or CI host has no reason to carry.
+NEED_MODULE=0
+for s in "${SUITES[@]}"; do case "$s" in kernel/* | device/* | stress/*) NEED_MODULE=1 ;; esac; done
+
+# Tell the per-suite builder too: a suite invoked directly (not through
+# this runner) decides for itself, but inside a batch the batch decides.
+export CT_NEED_MODULE="$NEED_MODULE"
+
 # Build once for the whole batch rather than once per suite.
-make -C "$CT_DIR/.." all >/dev/null || exit 2
+if [ "$NEED_MODULE" = "1" ]; then
+    make -C "$CT_DIR/.." all >/dev/null || exit 2
+else
+    make -C "$CT_DIR/.." userspace >/dev/null || exit 2
+fi
 
 # Load the module once if any kernel-level suite is in the batch. Each
 # suite still calls require_module, which is a no-op when it is already
 # loaded -- so a suite stays runnable on its own.
 CT_QUIET=1   # the runner is not a suite: no summary, no dmesg verdict of its own
 . "$CT_DIR/lib/harness.sh"
-NEED_MODULE=0
-for s in "${SUITES[@]}"; do case "$s" in kernel/* | device/* | stress/*) NEED_MODULE=1 ;; esac; done
 # Fails fast and loudly: require_module exits 2 with the kernel's own
 # message. A module that cannot be loaded at all is a property of the
 # machine, and no suite below would tell us anything about the

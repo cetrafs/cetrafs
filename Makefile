@@ -48,6 +48,11 @@ format:
 # with DKMS. Bumping one and forgetting the others yields a package whose
 # postinst registers a directory that does not exist, and whose module
 # therefore never builds; checked here rather than shipped.
+# The version lives in debian/changelog and nowhere else. These checks
+# assert the OTHER files still derive it rather than carry a copy: they
+# used to grep debian/rules for the literal version, which stopped being
+# possible -- and so stopped passing -- once rules was parameterised on
+# $(VERSION), which is the better arrangement.
 deb:
 	@command -v dpkg-buildpackage >/dev/null 2>&1 || { \
 	  echo "make deb: dpkg-buildpackage not found -- apt install dpkg-dev"; exit 1; }
@@ -56,10 +61,10 @@ deb:
 	  echo "make deb: cannot read a version from debian/changelog"; exit 1; fi; \
 	if ! grep -q "^PACKAGE_VERSION=\"$$v\"" dkms.conf; then \
 	  echo "make deb: dkms.conf PACKAGE_VERSION != $$v (debian/changelog)"; exit 1; fi; \
-	if ! grep -q "dh_dkms -V $$v" debian/rules; then \
-	  echo "make deb: debian/rules dh_dkms -V != $$v (debian/changelog)"; exit 1; fi; \
-	if ! grep -q "/usr/src/cetrafs-$$v" debian/rules; then \
-	  echo "make deb: debian/rules installs to a /usr/src dir other than cetrafs-$$v"; exit 1; fi
+	if ! grep -q 'VERSION := $$(shell dpkg-parsechangelog' debian/rules; then \
+	  echo "make deb: debian/rules no longer derives VERSION from debian/changelog"; exit 1; fi; \
+	if ! grep -q '/usr/src/cetrafs-$$(VERSION)' debian/rules; then \
+	  echo "make deb: debian/rules installs to a /usr/src dir not keyed on \$$(VERSION)"; exit 1; fi
 	@dpkg-checkbuilddeps || { \
 	  echo "make deb: install the build dependencies listed above (apt install debhelper dh-dkms)"; exit 1; }
 	dpkg-buildpackage -us -uc -b

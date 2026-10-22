@@ -11,7 +11,7 @@ set -euo pipefail
 . "$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)/lib/harness.sh"
 require_root
 
-ct_build
+CT_NEED_MODULE=0 ct_build
 IMG="$(ct_image 560 main)"
 LOOPDEV="$(ct_loop "$IMG")"
 log "using $IMG (560 MiB sparse) on $LOOPDEV"

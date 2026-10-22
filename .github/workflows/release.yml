@@ -2,20 +2,22 @@
 #
 # Build the Debian packages and publish a release.
 #
-# Runs on a tag push (0.8, 0.8.1, ...) or manually via workflow_dispatch.
-# Re-running for a tag REPLACES that tag's release.
+# Tag push (0.8, 0.8.1, ...) or manual dispatch. Re-running for a tag
+# REPLACES that tag's release, assets and all.
 #
-# The kernel module is NOT compiled here and does not need to be: the
-# cetrafs-dkms package ships module SOURCE, and DKMS builds it against
-# whatever kernel the machine installing it is running. A hosted runner
-# could only build against headers nobody will use.
+# Built in a DEBIAN container, not on the Ubuntu runner: the packages
+# are for Debian and Proxmox, and the toolchains differ in ways that
+# matter -- Ubuntu defaults _FORTIFY_SOURCE to 3, Debian to 2, which is
+# why an unchecked pread built clean on one and failed on the other.
 #
-# What CI therefore proves: the packages build, the dkms package carries
-# the right source tree, and the image suites pass. The kernel suites,
-# crash rig, fuzzers, soak and the multi-node ctest suite need a loadable
-# module and real hardware -- they run before the tag, see
-# docs/internal/RELEASE.md. The release notes say so rather than letting
-# a green tick imply more than it means.
+# The kernel module is not compiled here: cetrafs-dkms ships module
+# SOURCE and DKMS builds it against the kernel that will run it.
+#
+# No tests run here. The validation that matters -- kernel suites, crash
+# rig, fuzzers, soak, and the multi-node ctest suite -- needs a loadable
+# out-of-tree module and real hardware, and happens before a tag is cut
+# (docs/internal/RELEASE.md). CI builds packages; it does not pretend to
+# vouch for them.
 name: release
 
 on:
@@ -33,8 +35,70 @@ permissions:
   contents: write
 
 jobs:
-  release:
+  build:
     runs-on: ubuntu-latest
+    container: debian:13
+    outputs:
+      version: ${{ steps.version.outputs.version }}
+    steps:
+      - name: Which tag are we building
+        id: tag
+        run: |
+          if [ "${{ github.event_name }}" = workflow_dispatch ]; then
+            echo "tag=${{ inputs.tag }}" >> "$GITHUB_OUTPUT"
+          else
+            echo "tag=${GITHUB_REF#refs/tags/}" >> "$GITHUB_OUTPUT"
+          fi
+
+      - name: Install build dependencies
+        run: |
+          apt-get update -qq
+          apt-get install -y --no-install-recommends \
+            build-essential debhelper dh-dkms dpkg-dev fakeroot git ca-certificates
+
+      - uses: actions/checkout@v4
+        with:
+          ref: ${{ steps.tag.outputs.tag }}
+          fetch-depth: 0
+
+      - name: The tag must match debian/changelog
+        id: version
+        run: |
+          git config --global --add safe.directory "$GITHUB_WORKSPACE"
+          CL="$(dpkg-parsechangelog -S Version)"
+          TAG="${{ steps.tag.outputs.tag }}"
+          if [ "$CL" != "$TAG" ]; then
+            echo "::error::tag $TAG does not match debian/changelog $CL -- the changelog is the single source of the version"
+            exit 1
+          fi
+          echo "version=$CL" >> "$GITHUB_OUTPUT"
+
+      # make deb already checks changelog vs dkms.conf vs debian/rules,
+      # runs dpkg-checkbuilddeps, and collects everything into dist/.
+      - name: Build the packages
+        run: make deb
+
+      - name: The dkms package must carry clean module source
+        run: |
+          V="${{ steps.version.outputs.version }}"
+          dpkg-deb --fsys-tarfile "dist/cetrafs-dkms_${V}_all.deb" | tar -tf - > /tmp/dkms.list
+          grep -q "usr/src/cetrafs-${V}/kmod/" /tmp/dkms.list \
+            || { echo "::error::the dkms package has no module source"; exit 1; }
+          # A .ko or .o in the shipped source means a dirty tree was packaged.
+          ! grep -qE "usr/src/.*\.(ko|o)$" /tmp/dkms.list \
+            || { echo "::error::the dkms package ships build artefacts, not clean source"; exit 1; }
+
+      - name: Keep the changelog entry for the notes
+        run: dpkg-parsechangelog -S Changes | tail -n +3 | sed 's/^\.$//; s/^  //' > dist/changes.txt
+
+      - uses: actions/upload-artifact@v4
+        with:
+          name: packages
+          path: dist/
+
+  release:
+    needs: build
+    runs-on: ubuntu-latest        # gh is preinstalled here; debian:13 has no gh
     steps:
       - name: Which tag are we releasing
         id: tag
@@ -45,92 +109,35 @@ jobs:
             echo "tag=${GITHUB_REF#refs/tags/}" >> "$GITHUB_OUTPUT"
           fi
 
-      - uses: actions/checkout@v4
+      - uses: actions/download-artifact@v4
         with:
-          ref: ${{ steps.tag.outputs.tag }}
-          fetch-depth: 0
-
-      - name: Install build dependencies
-        run: |
-          sudo apt-get update -qq
-          sudo apt-get install -y --no-install-recommends \
-            build-essential debhelper dh-dkms dpkg-dev fakeroot python3
-
-      - name: The tag must match debian/changelog
-        run: |
-          CL="$(dpkg-parsechangelog -S Version)"
-          TAG="${{ steps.tag.outputs.tag }}"
-          if [ "$CL" != "$TAG" ]; then
-            echo "::error::tag $TAG does not match debian/changelog $CL -- the changelog is the single source of the version"
-            exit 1
-          fi
-          echo "version=$CL" >> "$GITHUB_ENV"
-
-      - name: Build the Debian packages
-        run: |
-          dpkg-buildpackage -us -uc -b
-          mkdir -p dist && mv ../*.deb dist/
-          ls -l dist/
-
-      - name: The dkms package must carry the module source
-        run: |
-          T=dist/cetrafs-dkms_${{ env.version }}_all.deb
-          dpkg-deb --fsys-tarfile "$T" | tar -tf - > /tmp/dkms.list
-          for want in "usr/src/cetrafs-${{ env.version }}/kmod/" \
-                      "usr/src/cetrafs-${{ env.version }}/include/" \
-                      "usr/src/cetrafs-${{ env.version }}/dkms.conf"; do
-            grep -q "$want" /tmp/dkms.list || { echo "::error::$T is missing $want"; exit 1; }
-          done
-          # A .ko or .o in the shipped source means a dirty tree was packaged.
-          if grep -qE "usr/src/.*\.(ko|o)$" /tmp/dkms.list; then
-            echo "::error::$T ships build artefacts, not clean source"; exit 1
-          fi
-          dpkg-deb --fsys-tarfile "$T" | tar -xO "./usr/src/cetrafs-${{ env.version }}/dkms.conf" \
-            | grep -q 'PACKAGE_VERSION="${{ env.version }}"' \
-            || { echo "::error::dkms.conf was not stamped with ${{ env.version }}"; exit 1; }
-
-      - name: Run the image test suites
-        id: tests
-        run: |
-          set -o pipefail
-          sudo make -C tests image 2>&1 | tee /tmp/image.log
-          echo "pass=$(grep -oE '^TOTAL +[0-9]+ passed' /tmp/image.log | grep -oE '[0-9]+' | head -1)" >> "$GITHUB_OUTPUT"
-          echo "fail=$(grep -oE '[0-9]+ failed' /tmp/image.log | grep -oE '[0-9]+' | head -1)" >> "$GITHUB_OUTPUT"
-          echo "suites=$(ls tests/image/*.sh | wc -l)" >> "$GITHUB_OUTPUT"
+          name: packages
+          path: dist
 
       - name: Assemble the release notes
+        env:
+          V: ${{ needs.build.outputs.version }}
         run: |
           {
-            echo "## cetrafs ${{ env.version }}"
+            echo "## cetrafs $V"
             echo
-            # -S Changes is: blank line, the "source (ver) dist" header,
-            # then the entry with two-space indent and "." for blanks.
-            dpkg-parsechangelog -S Changes | tail -n +3 | sed 's/^\.$//; s/^  //'
+            cat dist/changes.txt
             echo
             echo "### Install"
             echo
             echo '```sh'
-            echo "sudo apt install ./cetrafs-dkms_${{ env.version }}_all.deb ./cetrafs-tools_${{ env.version }}_amd64.deb"
+            echo "sudo apt install ./cetrafs-dkms_${V}_all.deb ./cetrafs-tools_${V}_amd64.deb"
             echo '```'
             echo
-            echo "The module ships as DKMS source and is built for your running kernel"
-            echo "on install, and again on every kernel upgrade."
-            echo
-            echo "### Tested"
-            echo
-            echo "- **${{ steps.tests.outputs.pass }} assertions passed, ${{ steps.tests.outputs.fail }} failed** across ${{ steps.tests.outputs.suites }} image suites in CI."
-            echo "  Each takes a structure mkfs wrote, corrupts one field, and requires fsck to report *that* fault."
-            echo "- Packages build and the dkms package carries clean module source stamped ${{ env.version }}."
-            echo
-            echo "CI does **not** run the kernel suites, the crash-consistency rig, the"
-            echo "fuzzers, the soak or the multi-node \`ctest\` suite: those need a loadable"
-            echo "out-of-tree module and, for ctest, several machines sharing a LUN. They"
-            echo "run on real hardware before a tag is cut."
+            echo "Built on Debian 13. The module ships as DKMS source and is compiled for"
+            echo "your running kernel on install, and again on every kernel upgrade."
             echo
             echo "Alpha. The on-disk format carries no compatibility guarantee before 1.0:"
-            echo "a format bump means reformat."
-          } > /tmp/notes.md
-          cat /tmp/notes.md
+            echo "a format bump means reformat. Validation -- kernel suites, crash-consistency"
+            echo "rig, fuzzers, soak and the multi-node cluster suite -- runs on real hardware"
+            echo "before the tag; CI builds the packages and does not run those."
+          } > notes.md
+          cat notes.md
 
       - name: Replace any existing release for this tag
         env:
@@ -140,7 +147,8 @@ jobs:
           # Delete rather than edit: editing keeps the previous build's
           # assets, and a stale .deb beside a fresh one is worse than no
           # release. --cleanup-tag=false keeps the git tag itself.
-          gh release delete "$TAG" --yes --cleanup-tag=false 2>/dev/null || true
+          gh release delete "$TAG" --yes --cleanup-tag=false --repo "$GITHUB_REPOSITORY" 2>/dev/null || true
           gh release create "$TAG" dist/*.deb \
+            --repo "$GITHUB_REPOSITORY" \
             --title "cetrafs $TAG" \
-            --notes-file /tmp/notes.md
+            --notes-file notes.md
