@@ -1,0 +1,37 @@
+# DKMS configuration for the cetrafs out-of-tree kernel module.
+#
+# DKMS rebuilds and reinstalls cetrafs.ko automatically on every kernel
+# upgrade, so the "out-of-tree means rebuild per kernel" chore disappears.
+#
+# The module builds in kmod/ and includes the shared on-disk-format header
+# from ../include, so a DKMS source tree must contain BOTH kmod/ and
+# include/ (plus this file at its root).
+#
+# Install (as root):
+#   cp -r . /usr/src/cetrafs-<version>            # kmod/ + include/ + dkms.conf
+#   dkms add     -m cetrafs -v <version>
+#   dkms build   -m cetrafs -v <version>
+#   dkms install -m cetrafs -v <version>
+#
+# Package for distribution:
+#   dkms mkdeb  -m cetrafs -v <version> --source-only   # .deb (cetrafs-dkms)
+#   dkms mkrpm  -m cetrafs -v <version> --source-only   # .rpm
+#
+# PACKAGE_VERSION is stamped by dh_dkms (-V, from debian/changelog) at
+# package build -- the #MODULE_VERSION# token is NOT hand-edited. The
+# hand-install flow uses the top-level dkms.conf instead.
+
+PACKAGE_NAME="cetrafs"
+PACKAGE_VERSION="#MODULE_VERSION#"
+
+BUILT_MODULE_NAME[0]="cetrafs"
+BUILT_MODULE_LOCATION[0]="kmod"
+DEST_MODULE_LOCATION[0]="/kernel/fs/cetrafs"
+
+# Build against the kernel DKMS is targeting (${kernelver}), reusing the
+# module's own `mod` target so there is a single build recipe.
+MAKE[0]="make -C kmod KDIR=/lib/modules/${kernelver}/build mod"
+CLEAN="make -C kmod KDIR=/lib/modules/${kernelver}/build clean"
+
+# Rebuild automatically whenever a new kernel is installed.
+AUTOINSTALL="yes"

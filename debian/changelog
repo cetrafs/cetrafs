@@ -1,0 +1,20 @@
+cetrafs (0.8) unstable; urgency=medium
+
+  * First public release.
+
+  * cetrafs is a clustered, shared-disk filesystem for Linux: several
+    nodes mount one shared block device (iSCSI or FC LUN) at the same
+    time, coordinating through the storage itself with one atomic SCSI
+    COMPARE AND WRITE per contested claim. An out-of-tree kernel module
+    plus mkfs.cetra, fsck.cetra and defrag.cetra.
+
+  * On-disk format 0x0008. Pre-1.0: the format carries no backward
+    compatibility guarantee and a bump means reformat.
+
+  * Alpha. Reviewed, fuzzed, crash-tested and exercised on real
+    multi-node hardware, but not production-aged. Keep independent
+    backups.
+
+  * Per-release history is in the git log; this changelog starts here.
+
+ -- Massimo Cetra <mcetra@gmail.com>  Thu, 22 Oct 2026 13:16:23 +0000

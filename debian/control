@@ -1,0 +1,34 @@
+Source: cetrafs
+Section: admin
+Priority: optional
+Maintainer: Massimo Cetra <mcetra@gmail.com>
+Build-Depends: debhelper-compat (= 13), dh-dkms
+Standards-Version: 4.6.2
+Rules-Requires-Root: no
+
+Package: cetrafs-dkms
+Architecture: all
+Depends: ${misc:Depends}, dkms
+Recommends: cetrafs-tools
+Description: clustered shared-disk filesystem (VMFS alternative) - kernel module (DKMS)
+ cetrafs is a clustered, shared-disk Linux filesystem: several nodes mount
+ one shared block device (an iSCSI or FC LUN) at the same time, with VM disk
+ images living directly on the one volume, the way VMFS backs vSphere. Nodes
+ coordinate through the storage itself (atomic SCSI COMPARE AND WRITE), with
+ no cluster network or lock manager.
+ .
+ This package ships the out-of-tree kernel module source and builds it with
+ DKMS, so cetrafs.ko is rebuilt automatically on every kernel upgrade.
+
+Package: cetrafs-tools
+Architecture: any
+Depends: ${shlibs:Depends}, ${misc:Depends}
+Recommends: cetrafs-dkms
+Description: clustered shared-disk filesystem (VMFS alternative) - userspace tools
+ cetrafs is a clustered, shared-disk Linux filesystem (see the cetrafs-dkms
+ package for the kernel module and a fuller description).
+ .
+ This package provides the userspace tools:
+  * mkfs.cetra   - create a cetrafs volume
+  * fsck.cetra   - check and repair a volume
+  * defrag.cetra - online per-file defragmentation

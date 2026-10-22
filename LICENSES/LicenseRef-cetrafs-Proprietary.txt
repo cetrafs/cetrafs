@@ -1,0 +1,23 @@
+cetrafs commercial license
+==========================
+
+The cetrafs userspace tools (mkfs.cetra, fsck.cetra, defrag.cetra) and
+the shared on-disk-format header are available under a commercial
+license as an alternative to the GNU Affero General Public License.
+
+The AGPL requires, among other things, that if you convey the software
+-- or make its functionality available to users over a network -- you
+make the complete corresponding source available to those users under
+the same terms. If that obligation does not fit how you intend to ship
+or operate the software, a commercial license removes it.
+
+A commercial license is granted in writing by the copyright holder and
+is not granted by this file. This file records that the option exists
+and who to ask; it is not itself an offer, a grant, or a set of terms.
+
+Contact: Massimo Cetra <mcetra@gmail.com>
+
+Note that this option applies ONLY to the files whose SPDX identifier
+names LicenseRef-cetrafs-Proprietary. The kernel module in kmod/ is
+GPL-2.0-or-later and is not dual-licensed: it links against the Linux
+kernel, and no commercial license to it is or can be offered here.

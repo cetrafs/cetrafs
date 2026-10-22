@@ -1,0 +1,43 @@
+#!/usr/bin/make -f
+# SPDX-License-Identifier: GPL-2.0-or-later
+
+export DEB_BUILD_MAINT_OPTIONS = hardening=+all
+
+# One source of truth for the package/DKMS version: this changelog.
+# (The 0.7 release shipped with packaging still saying 0.6 because the
+# version was hardcoded here in five places -- never again.)
+VERSION := $(shell dpkg-parsechangelog -SVersion)
+
+%:
+	dh $@ --with dkms
+
+# Only the userspace tools are compiled at package-build time; the kernel
+# module itself is built on the target machine by DKMS, per kernel.
+override_dh_auto_build:
+	$(MAKE) -C userspace
+
+override_dh_auto_clean:
+	-$(MAKE) -C userspace clean
+
+override_dh_auto_install:
+	# userspace tools -> cetrafs-tools
+	install -d debian/cetrafs-tools/usr/sbin
+	install -m 0755 userspace/mkfs.cetra   debian/cetrafs-tools/usr/sbin/
+	install -m 0755 userspace/fsck.cetra   debian/cetrafs-tools/usr/sbin/
+	install -m 0755 userspace/defrag.cetra debian/cetrafs-tools/usr/sbin/
+	# kernel-module source -> cetrafs-dkms (dh_dkms adds dkms.conf + maint scripts)
+	install -d debian/cetrafs-dkms/usr/src/cetrafs-$(VERSION)
+	cp -a kmod include debian/cetrafs-dkms/usr/src/cetrafs-$(VERSION)/
+	# strip any stray build droppings from the copied module source
+	find debian/cetrafs-dkms/usr/src/cetrafs-$(VERSION)/kmod \
+	    \( -name '*.o' -o -name '*.ko' -o -name '.*.cmd' -o -name '*.mod' \
+	       -o -name '*.mod.c' -o -name 'Module.symvers' -o -name 'modules.order' \) -delete
+	rm -rf debian/cetrafs-dkms/usr/src/cetrafs-$(VERSION)/kmod/.tmp_versions
+
+# dh_dkms substitutes #MODULE_VERSION# in debian/cetrafs-dkms.dkms with -V.
+override_dh_dkms:
+	dh_dkms -V $(VERSION)
+
+# Skip the kernel test suite (make check) at package-build time:
+# it needs root, loads the module, and takes many minutes.
+override_dh_auto_test:

@@ -1,0 +1,27 @@
+Format: https://www.debian.org/doc/packaging-manuals/copyright-format/1.0/
+Upstream-Name: cetrafs
+Source: https://example.com/cetrafs
+
+Files: *
+Copyright: 2026 Massimo Cetra
+License: GPL-2
+ The kernel module declares MODULE_LICENSE("GPL") and, as a work derived
+ from the Linux kernel, must be GPL-2. The userspace tools are distributed
+ under the same terms here.
+ .
+ NOTE: the project's final license had not been chosen when this packaging
+ was written. Confirm or adjust this file (and add a top-level LICENSE)
+ before any public release.
+
+License: GPL-2
+ This program is free software; you can redistribute it and/or modify it
+ under the terms of the GNU General Public License version 2 as published
+ by the Free Software Foundation.
+ .
+ This program is distributed in the hope that it will be useful, but
+ WITHOUT ANY WARRANTY; without even the implied warranty of MERCHANTABILITY
+ or FITNESS FOR A PARTICULAR PURPOSE. See the GNU General Public License for
+ more details.
+ .
+ On Debian systems, the full text of the GNU General Public License
+ version 2 can be found in /usr/share/common-licenses/GPL-2.

@@ -1,0 +1,55 @@
+cetrafs licensing
+=================
+
+cetrafs is split across two licenses, because its two halves have
+genuinely different constraints. Every file carries an
+`SPDX-License-Identifier:` line; that line, not this summary, is
+authoritative for that file.
+
+    kmod/             GPL-2.0-or-later
+    include/          GPL-2.0-or-later OR AGPL-3.0-or-later
+                        OR LicenseRef-cetrafs-Proprietary
+    userspace/        AGPL-3.0-or-later OR LicenseRef-cetrafs-Proprietary
+    tests/, ctest/    GPL-2.0-or-later
+                      (except two fuzz helpers that build against
+                      userspace headers, which follow userspace)
+
+Everything else in the repository -- documentation, packaging, build
+files -- is GPL-2.0-or-later.
+
+Full texts are in LICENSES/.
+
+The kernel module: GPL-2.0-or-later
+-----------------------------------
+
+`kmod/` is a Linux kernel module. It is derived from and links against
+the kernel, so it is GPL-2.0-or-later and is NOT dual-licensed -- there
+is no proprietary option for it and none can be offered. It declares
+`MODULE_LICENSE("GPL")` accordingly.
+
+The userspace tools: AGPL-3.0-or-later, or commercial
+-----------------------------------------------------
+
+`userspace/` (mkfs.cetra, fsck.cetra, defrag.cetra) is dual-licensed:
+AGPL-3.0-or-later for open use, or a commercial license from the
+copyright holder for those whom the AGPL's source-availability
+obligation does not suit. See LICENSES/LicenseRef-cetrafs-Proprietary.txt.
+
+The shared on-disk-format header
+--------------------------------
+
+`include/cetrafs.h` is the single source of truth for the on-disk format
+and is compiled verbatim into BOTH halves. It is therefore offered under
+any of the three licenses above, so that each half can take it under
+terms it can actually use: the module takes it as GPL-2.0-or-later, the
+open tools as AGPL-3.0-or-later, and a commercial licensee under the
+commercial terms. A recipient chooses one.
+
+This also means the on-disk format itself is documented and implementable
+by anyone: see docs/ARCHITECTURE.md. An independent reader of a cetrafs
+volume is not encumbered by the choice of license here.
+
+Copyright
+---------
+
+Copyright (C) 2025-2026 Massimo Cetra.
