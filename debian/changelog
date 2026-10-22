@@ -1,3 +1,18 @@
+cetrafs (0.8.1) unstable; urgency=medium
+
+  * mkfs: check the reads in its bitmap read-modify-write. Each reads a
+    bitmap block, sets one bit and writes it back; an unchecked failed
+    read would have left a zeroed buffer and cleared every other bit in
+    that block on write-back. Harmless in practice -- the area is
+    zero-filled by that point -- but not something to leave unchecked in
+    a tool that formats devices.
+
+  * The userspace tools now build with _FORTIFY_SOURCE=3, which is what
+    marks a short or failed read an error rather than a silent return
+    value. On-disk format unchanged (0x0008); no reformat.
+
+ -- Massimo Cetra <mcetra@gmail.com>  Thu, 22 Oct 2026 16:46:16 +0000
+
 cetrafs (0.8) unstable; urgency=medium
 
   * First public release.
