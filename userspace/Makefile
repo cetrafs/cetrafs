@@ -27,14 +27,23 @@ ifeq ($(CETRAFS_NO_WERROR),)
 WERROR = -Werror
 endif
 
+# _FORTIFY_SOURCE=3 marks pread/pwrite and friends warn_unused_result,
+# so an ignored short or failed I/O becomes a build failure here rather
+# than a surprise in a distro build. Debian defaults to level 2, which
+# does NOT mark them, so two unchecked preads in mkfs -- a bitmap
+# read-modify-write whose failure would have cleared every other bit in
+# the block -- built clean locally and only failed on Ubuntu's level 3.
+# Needs optimisation to do anything, which -O2 below provides.
+HARDEN = -D_FORTIFY_SOURCE=3
+
 $(MKFS): mkfs.c $(HDRS)
-	$(CC) -D_FILE_OFFSET_BITS=64 -I $(SDIR)/include -O2 -std=gnu99 -Wall -Wextra $(WERROR) -o $@ $<
+	$(CC) -D_FILE_OFFSET_BITS=64 -I $(SDIR)/include -O2 $(HARDEN) -std=gnu99 -Wall -Wextra $(WERROR) -o $@ $<
 
 $(FSCK): fsck.c $(HDRS)
-	$(CC) -D_FILE_OFFSET_BITS=64 -I $(SDIR)/include -O2 -std=gnu99 -Wall -Wextra $(WERROR) -o $@ $<
+	$(CC) -D_FILE_OFFSET_BITS=64 -I $(SDIR)/include -O2 $(HARDEN) -std=gnu99 -Wall -Wextra $(WERROR) -o $@ $<
 
 $(DEFRAG): defrag.c $(HDRS)
-	$(CC) -D_FILE_OFFSET_BITS=64 -I $(SDIR)/include -O2 -std=gnu99 -Wall -Wextra $(WERROR) -o $@ $<
+	$(CC) -D_FILE_OFFSET_BITS=64 -I $(SDIR)/include -O2 $(HARDEN) -std=gnu99 -Wall -Wextra $(WERROR) -o $@ $<
 
 
 # Sparse (>= 0.6.5) static check that every on-disk-struct field is

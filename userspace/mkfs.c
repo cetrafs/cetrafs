@@ -773,8 +773,13 @@ int main(int argc, char **argv)
         u8 *bmblk = (u8 *) xcalloc(1, CETRAFS_BLOCK_SIZE);
 
         off_t off = (off_t) (i_bmap_lba + bm_block_off) * CETRAFS_BLOCK_SIZE;
-        if (!dry_run)
-            pread(fd, bmblk, CETRAFS_BLOCK_SIZE, off);
+        /* Read-modify-write: a failed read would leave the zeroed buffer
+         * and the write-back below would clear every other bit in this
+         * block. The area is zero-filled by now, so the read is only
+         * confirming that -- but an unchecked RMW is not something to
+         * leave in a tool that formats devices. */
+        if (!dry_run && pread(fd, bmblk, CETRAFS_BLOCK_SIZE, off) != (ssize_t) CETRAFS_BLOCK_SIZE)
+            die("inode bitmap read at %lld failed: %s", (long long) off, strerror(errno));
         bmap_set_bit(bmblk, bit % CETRAFS_BITS_PER_BLOCK);
         write_block(fd, (i_bmap_lba + bm_block_off), bmblk, !dry_run);
 
@@ -792,8 +797,11 @@ int main(int argc, char **argv)
         u64 dbm0_lba = root_bg_start + off_bmap32;
 
         u8 *bm = (u8 *) xcalloc(1, CETRAFS_BLOCK_SIZE);
-        if (!dry_run)
-            pread(fd, bm, CETRAFS_BLOCK_SIZE, (off_t) dbm0_lba * CETRAFS_BLOCK_SIZE);
+        if (!dry_run &&
+            pread(fd, bm, CETRAFS_BLOCK_SIZE, (off_t) dbm0_lba * CETRAFS_BLOCK_SIZE) !=
+                (ssize_t) CETRAFS_BLOCK_SIZE)
+            die("BG 0 data bitmap read at block %llu failed: %s", (unsigned long long) dbm0_lba,
+                strerror(errno));
         bmap_set_bit(bm, 0); /* first data block */
 
         write_block(fd, dbm0_lba, bm, !dry_run);
