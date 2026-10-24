@@ -1,0 +1,16 @@
+#!/bin/sh
+# SPDX-License-Identifier: GPL-2.0-or-later
+
+set -e
+
+HOOK=/usr/share/pve-storage-cetrafs/pve-ui-hook
+
+case "$1" in
+    remove|deconfigure)
+        "$HOOK" remove || true
+        ;;
+esac
+
+#DEBHELPER#
+
+exit 0

@@ -33,6 +33,11 @@ override_dh_auto_install:
 	    \( -name '*.o' -o -name '*.ko' -o -name '.*.cmd' -o -name '*.mod' \
 	       -o -name '*.mod.c' -o -name 'Module.symvers' -o -name 'modules.order' \) -delete
 	rm -rf debian/cetrafs-dkms/usr/src/cetrafs-$(VERSION)/kmod/.tmp_versions
+ifeq ($(filter pkg.cetrafs.nopve,$(DEB_BUILD_PROFILES)),)
+	# Proxmox VE storage plugin + optional web UI (skipped with PVE=0)
+	$(MAKE) -C pve install-plugin DESTDIR=$(CURDIR)/debian/pve-storage-cetrafs
+	$(MAKE) -C pve install-ui DESTDIR=$(CURDIR)/debian/pve-storage-cetrafs-ui
+endif
 
 # dh_dkms substitutes #MODULE_VERSION# in debian/cetrafs-dkms.dkms with -V.
 override_dh_dkms:

@@ -1,0 +1,73 @@
+#!/bin/sh
+# SPDX-License-Identifier: AGPL-3.0-or-later
+
+# Adds the <script> tag for the cetrafs web UI to the PVE index template, or
+# removes it again.
+#
+#   pve-ui-hook install | remove
+#
+# pve-manager upgrades replace the template. The Debian package re-runs
+# "install" from a dpkg trigger on the template; a hand install (make -C pve
+# install-ui) uses the apt hook /etc/apt/apt.conf.d/99pve-storage-cetrafs-ui.
+
+set -eu
+
+TPL=/usr/share/pve-manager/index.html.tpl
+JS=/usr/share/pve-manager/js/cetrafs.js
+MARKER='pve-storage-cetrafs-ui'
+ANCHOR='/pve2/js/pvemanagerlib.js'
+
+# Replace the template only if its content changes, and let pveproxy pick it
+# up.
+update_template() {
+    tmp=$1
+    if cmp -s "$tmp" "$TPL"; then
+        rm -f "$tmp"
+        return 0
+    fi
+    chmod 0644 "$tmp"
+    mv "$tmp" "$TPL"
+    if command -v systemctl >/dev/null 2>&1; then
+        systemctl try-reload-or-restart pveproxy.service || true
+    fi
+}
+
+do_install() {
+    [ -f "$TPL" ] || { echo "$TPL not found - is pve-manager installed?" >&2; exit 1; }
+    [ -f "$JS" ] || { echo "$JS not found" >&2; exit 1; }
+
+    # The file's mtime as version makes browsers fetch a changed file.
+    ver=$(stat -c %Y "$JS")
+    tag="    <script type=\"text/javascript\" src=\"/pve2/js/cetrafs.js?ver=$ver\"></script><!-- $MARKER -->"
+
+    tmp=$(mktemp "$TPL.XXXXXX")
+    if ! awk -v tag="$tag" -v marker="$MARKER" -v anchor="$ANCHOR" '
+        index($0, marker) { next }
+        { print }
+        index($0, anchor) && !done { print tag; done = 1 }
+        END { if (!done) exit 1 }
+    ' "$TPL" >"$tmp"; then
+        rm -f "$tmp"
+        echo "'$ANCHOR' not found in $TPL, cannot add the web UI integration" >&2
+        exit 1
+    fi
+
+    update_template "$tmp"
+}
+
+do_remove() {
+    [ -f "$TPL" ] || return 0
+
+    tmp=$(mktemp "$TPL.XXXXXX")
+    awk -v marker="$MARKER" '!index($0, marker)' "$TPL" >"$tmp"
+    update_template "$tmp"
+}
+
+case "${1:-}" in
+    install) do_install ;;
+    remove) do_remove ;;
+    *)
+        echo "usage: $0 install|remove" >&2
+        exit 2
+        ;;
+esac

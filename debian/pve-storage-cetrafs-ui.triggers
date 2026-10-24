@@ -1,0 +1,2 @@
+# pve-manager upgrades replace the index template: re-add the script tag.
+interest-noawait /usr/share/pve-manager/index.html.tpl

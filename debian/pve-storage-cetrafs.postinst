@@ -1,0 +1,22 @@
+#!/bin/sh
+# SPDX-License-Identifier: GPL-2.0-or-later
+
+set -e
+
+# PVE loads storage plugins when its daemons start.
+reload_pve_services() {
+    [ -d /run/systemd/system ] || return 0
+    for service in pvedaemon pveproxy pvestatd pvescheduler; do
+        systemctl try-reload-or-restart "$service.service" || true
+    done
+}
+
+case "$1" in
+    configure)
+        reload_pve_services
+        ;;
+esac
+
+#DEBHELPER#
+
+exit 0

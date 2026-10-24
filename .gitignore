@@ -43,6 +43,8 @@ __pycache__/
 /debian/.debhelper/
 /debian/cetrafs-dkms/
 /debian/cetrafs-tools/
+/debian/pve-storage-cetrafs/
+/debian/pve-storage-cetrafs-ui/
 /debian/files
 /debian/debhelper-build-stamp
 /debian/*.substvars

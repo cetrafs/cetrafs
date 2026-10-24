@@ -1,0 +1,5 @@
+// SPDX-License-Identifier: AGPL-3.0-or-later
+// Re-add the cetrafs web UI to the PVE index template after pve-manager
+// upgrades replaced it. Only installed by a hand install (make -C pve
+// install-ui); the Debian package uses a dpkg trigger instead.
+DPkg::Post-Invoke { "if [ -x /usr/share/pve-storage-cetrafs/pve-ui-hook ]; then /usr/share/pve-storage-cetrafs/pve-ui-hook install || true; fi"; };

@@ -129,6 +129,12 @@ jobs:
             echo "sudo apt install ./cetrafs-dkms_${V}_all.deb ./cetrafs-tools_${V}_amd64.deb"
             echo '```'
             echo
+            echo "On Proxmox VE, add the storage plugin on every node, and optionally its web UI:"
+            echo
+            echo '```sh'
+            echo "sudo apt install ./pve-storage-cetrafs_${V}_all.deb ./pve-storage-cetrafs-ui_${V}_all.deb"
+            echo '```'
+            echo
             echo "Built on Debian 13. The module ships as DKMS source and is compiled for"
             echo "your running kernel on install, and again on every kernel upgrade."
             echo

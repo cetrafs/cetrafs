@@ -143,6 +143,10 @@ with `dh_dkms -V` in `debian/rules` — those name the
 between them yields a package whose module silently never builds. And it
 checks the build dependencies up front rather than failing midway.
 
+Two more packages are for Proxmox VE: **`pve-storage-cetrafs`** (the
+storage plugin, see below) and the optional **`pve-storage-cetrafs-ui`**
+(its web UI). `make deb PVE=0` leaves both out.
+
 Note that `debian/rules` skips `make check` at package-build time (it
 needs root, loads the module and takes minutes), so **a built package is
 not a tested one** — run `make check` yourself.
@@ -158,6 +162,38 @@ mount -t cetrafs -o ro <dev> <mnt>     # mount as a read-only observer
 For VM images on a Proxmox cluster — shared storage, `cache=none`, and live
 migration with `-o nofilelock` — follow the runbook in
 the operations guide at cetrafs.com.
+
+## Proxmox VE storage plugin
+
+`pve/` holds a Proxmox VE storage plugin, storage type `cetrafs`: a
+cetrafs volume on a shared LUN, mounted at the same path on every node and
+used like a directory storage (VM images, container volumes, ISOs,
+templates, backups, snippets). PVE treats it as shared storage, so live
+migration and HA work without copying disks.
+
+On every node, install `cetrafs-dkms`, `cetrafs-tools` and
+`pve-storage-cetrafs`; for the web UI also `pve-storage-cetrafs-ui`, which
+adds **cetrafs** to *Datacenter -> Storage -> Add*. Create the volume once,
+on one node, then add the storage:
+
+```
+mkfs.cetra /dev/disk/by-id/<lun>
+pvesm add cetrafs san1 --cetrafs-device /dev/disk/by-id/<lun> --content images
+```
+
+Each node mounts it on first use, at `/mnt/pve/<storage id>` unless
+`--path` says otherwise. The device path must name the same LUN on every
+node -- a `/dev/disk/by-id/` link or a multipath alias, never `/dev/sdX`.
+
+The storage mounts with `nofilelock` by default (`--cetrafs-nofilelock 0`
+turns it off), because a live migration has the image open on both nodes
+during the handoff. Every node must use the same mode: the kernel refuses
+a mount that disagrees with the nodes already mounted, so a change only
+takes effect once the storage was unmounted everywhere.
+
+Without packages, `make pve-install` and `make pve-install-ui` (as root)
+install the same files from the checkout; the UI is then kept in place
+across `pve-manager` upgrades by an apt hook instead of a dpkg trigger.
 
 ## On-disk layout
 

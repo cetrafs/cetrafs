@@ -32,3 +32,35 @@ Description: clustered shared-disk filesystem (VMFS alternative) - userspace too
   * mkfs.cetra   - create a cetrafs volume
   * fsck.cetra   - check and repair a volume
   * defrag.cetra - online per-file defragmentation
+
+Package: pve-storage-cetrafs
+Architecture: all
+Build-Profiles: <!pkg.cetrafs.nopve>
+Depends: libpve-common-perl,
+         libpve-storage-perl,
+         ${misc:Depends},
+         ${perl:Depends},
+Recommends: cetrafs-dkms, cetrafs-tools
+Description: clustered shared-disk filesystem (VMFS alternative) - Proxmox VE storage plugin
+ cetrafs is a clustered, shared-disk Linux filesystem (see the cetrafs-dkms
+ package for the kernel module and a fuller description).
+ .
+ This package adds the Proxmox VE storage type "cetrafs": a cetrafs volume
+ on a shared LUN, mounted on every cluster node and used for VM images,
+ container volumes, ISOs, templates, backups and snippets. Install it on
+ every node. The web UI integration is in pve-storage-cetrafs-ui.
+
+Package: pve-storage-cetrafs-ui
+Architecture: all
+Build-Profiles: <!pkg.cetrafs.nopve>
+Depends: pve-manager,
+         pve-storage-cetrafs (= ${binary:Version}),
+         proxmox-widget-toolkit,
+         ${misc:Depends},
+Description: clustered shared-disk filesystem (VMFS alternative) - Proxmox VE web UI
+ cetrafs is a clustered, shared-disk Linux filesystem (see the cetrafs-dkms
+ package for the kernel module and a fuller description).
+ .
+ This optional package adds "cetrafs" to Datacenter -> Storage -> Add in
+ the Proxmox VE web interface, with the dialog to add and edit a cetrafs
+ storage. Without it the storage is managed with pvesm.

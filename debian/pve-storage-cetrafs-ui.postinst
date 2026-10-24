@@ -1,0 +1,16 @@
+#!/bin/sh
+# SPDX-License-Identifier: GPL-2.0-or-later
+
+set -e
+
+HOOK=/usr/share/pve-storage-cetrafs/pve-ui-hook
+
+case "$1" in
+    configure|triggered)
+        "$HOOK" install || echo "warning: could not add the cetrafs web UI to the PVE index template" >&2
+        ;;
+esac
+
+#DEBHELPER#
+
+exit 0

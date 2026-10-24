@@ -1,5 +1,5 @@
 # SPDX-License-Identifier: GPL-2.0-or-later
-.PHONY: soak all clean mod userspace format check check-one check-slow check-fsck check-caw check-crash ctest endian-check deb deb-clean
+.PHONY: soak all clean mod userspace format check check-one check-slow check-fsck check-caw check-crash ctest endian-check deb deb-clean pve-install pve-install-ui
 
 SDIR = $(CURDIR)
 
@@ -30,9 +30,14 @@ format:
 	bash -c 'pushd kmod      && clang-format -style=file -i *.{c,h}'
 	bash -c 'pushd userspace && clang-format -style=file -i *.{c,h}'
 
-# Build the two Debian packages:
-#   cetrafs-dkms  -- module source + DKMS wiring (rebuilt per kernel)
-#   cetrafs-tools -- mkfs.cetra / fsck.cetra / defrag.cetra
+# Build the Debian packages:
+#   cetrafs-dkms           -- module source + DKMS wiring (rebuilt per kernel)
+#   cetrafs-tools          -- mkfs.cetra / fsck.cetra / defrag.cetra
+#   pve-storage-cetrafs    -- Proxmox VE storage plugin (type "cetrafs")
+#   pve-storage-cetrafs-ui -- optional Proxmox VE web UI for it
+#
+# `make deb PVE=0` leaves the two Proxmox VE packages out (build profile
+# pkg.cetrafs.nopve).
 #
 # dpkg-buildpackage always writes beside the source tree, in the PARENT
 # directory -- it has no output-directory option -- so the artifacts are
@@ -67,11 +72,11 @@ deb:
 	  echo "make deb: debian/rules installs to a /usr/src dir not keyed on \$$(VERSION)"; exit 1; fi
 	@dpkg-checkbuilddeps || { \
 	  echo "make deb: install the build dependencies listed above (apt install debhelper dh-dkms)"; exit 1; }
-	dpkg-buildpackage -us -uc -b
+	dpkg-buildpackage -us -uc -b $(if $(filter 0,$(PVE)),-P pkg.cetrafs.nopve)
 	@v=$$(dpkg-parsechangelog -S Version); \
 	mkdir -p $(SDIR)/dist; \
-	for f in $(SDIR)/../cetrafs*_$$v_*.deb $(SDIR)/../cetrafs_$$v_*.buildinfo \
-	         $(SDIR)/../cetrafs_$$v_*.changes; do \
+	for f in $(SDIR)/../cetrafs*_$${v}_*.deb $(SDIR)/../pve-storage-cetrafs*_$${v}_*.deb \
+	         $(SDIR)/../cetrafs_$${v}_*.buildinfo $(SDIR)/../cetrafs_$${v}_*.changes; do \
 	  if [ -e "$$f" ]; then mv -f "$$f" $(SDIR)/dist/; fi; \
 	done; \
 	echo; echo "built, in dist/:"; ls -1 $(SDIR)/dist
@@ -82,6 +87,14 @@ deb:
 deb-clean:
 	dh clean
 	rm -rf $(SDIR)/dist
+
+# Proxmox VE integration from the checkout, without packages (as root, on
+# every node): the storage plugin, and optionally its web UI.
+pve-install:
+	$(MAKE) -C $(SDIR)/pve install-plugin
+
+pve-install-ui:
+	$(MAKE) -C $(SDIR)/pve install-ui
 
 check: all
 	$(MAKE) -C $(SDIR)/tests check

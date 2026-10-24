@@ -10,6 +10,9 @@ authoritative for that file.
     include/          GPL-2.0-or-later OR AGPL-3.0-or-later
                         OR LicenseRef-cetrafs-Proprietary
     userspace/        AGPL-3.0-or-later OR LicenseRef-cetrafs-Proprietary
+    pve/              AGPL-3.0-or-later
+                        (Proxmox VE plugin and web UI; built on the
+                        AGPL-3.0 Proxmox VE libraries)
     tests/, ctest/    GPL-2.0-or-later
                       (except two fuzz helpers that build against
                       userspace headers, which follow userspace)
