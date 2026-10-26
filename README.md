@@ -97,7 +97,8 @@ needed at all: the module declares the `fs-cetrafs` alias, so the first
 the device explicitly and never default to one. `ctest/` is the two-node
 suite and the only thing that exercises cross-node paths for real.
 
-## Install with DKMS
+## Installation
+### Install with DKMS
 
 For a persistent install that survives kernel upgrades, use DKMS — it
 rebuilds `cetrafs.ko` automatically whenever a new kernel is installed, so
@@ -116,7 +117,7 @@ Make a distributable source tarball with `dkms mktarball -m cetrafs -v 0.6
 --source-only` (install it elsewhere with `dkms ldtarball` + `dkms
 install`). Keep the `0.6` in step with the release.
 
-## Debian packages
+### Debian packages
 
 The repo carries its own `debian/`, so the packaged path is one target:
 
@@ -146,6 +147,24 @@ checks the build dependencies up front rather than failing midway.
 Note that `debian/rules` skips `make check` at package-build time (it
 needs root, loads the module and takes minutes), so **a built package is
 not a tested one** — run `make check` yourself.
+
+### Debian Repository
+
+The Debian repository way allows users to quickly install and update `cetrafs` in a native way for Debian, Ubuntu and Proxmox based systems.
+
+```bash
+curl https://git.gyptazy.com/api/packages/gyptazy/debian/repository.key -o /etc/apt/keyrings/gyptazy.asc
+echo "deb [signed-by=/etc/apt/keyrings/gyptazy.asc] https://packages.gyptazy.com/api/packages/gyptazy/debian trixie main" | sudo tee -a /etc/apt/sources.list.d/gyptazy.list
+apt-get update
+
+apt-get -y install cetrafs-dkms cetrafs-tools
+# Optionally for the Proxmox integration in addition
+apt-get -y install  pve-storage-cetrafs pve-storage-cetrafs-ui
+```
+
+> [!NOTE]
+> The repository is maintained & operated by <a href="https://gyptazy.com">gyptazy</a> as a third-party repository.
+
 
 ## Quickstart
 
