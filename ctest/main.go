@@ -53,7 +53,7 @@ func main() {
 		"master: also start a slave listening on this address, in-process -- include it in -slaves too "+
 			"(e.g. -local-slave=:9100 -slaves=local=127.0.0.1:9100,remote=10.0.0.2:9100) to run a slave on "+
 			"the same machine as the master")
-	scenario := flag.String("scenario", "", "lock-race | lock-sequential | lock-hold | explicit-lock | cluster-lock-mode | nocaw-mount-race | symlink-publish | zg-fairness | diag | module-info | xattrs | "+
+	scenario := flag.String("scenario", "", "lock-race | lock-sequential | lock-hold | explicit-lock | lock-suspend | cluster-lock-mode | nocaw-mount-race | symlink-publish | zg-fairness | diag | module-info | xattrs | "+
 		"cross-node-visibility | concurrent-create | concurrent-unlink | concurrent-mkdir | concurrent-mkdir-storm | concurrent-rename | "+
 		"read-presence | inode-reuse | dirent-cache | extent-leaf-staleness | record-write-race | "+
 		"dirent-torn | caw | pending-free | scrub-transit | hypervisor-storm | space-accounting | dir-storm | sparse-bigfile | "+
@@ -410,6 +410,8 @@ func dispatchScenario(cfg masterConfig, clients []*Client) (bool, error) {
 		return RunLockHold(clients, cfg.lockPath)
 	case "explicit-lock":
 		return RunExplicitLock(clients, cfg.lockPath)
+	case "lock-suspend":
+		return RunLockSuspend(clients, cfg.lockPath)
 	case "cluster-lock-mode":
 		return RunClusterLockMode(clients)
 	case "nocaw-mount-race":

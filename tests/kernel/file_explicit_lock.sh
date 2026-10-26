@@ -16,9 +16,10 @@
 #      refuses the open (file_lock_optional.sh asserts the OPPOSITE for a
 #      mount with no explicit lock in play; the discriminator is whether a
 #      lock is actually present).
-#   2. flock(LOCK_EX)/flock(LOCK_UN) claim/clear the real on-disk lock, the
-#      lock is released when the holding fd closes, and flock is refused
-#      (-EOPNOTSUPP) under the default mount where the lock is automatic.
+#   2. flock(LOCK_EX)/flock(LOCK_UN) claim/clear the real on-disk lock and
+#      the lock is released when the holding fd closes. Under the DEFAULT
+#      mount the same calls report and suspend the automatic lock instead
+#      (lock_suspend.sh covers that path properly).
 set -euo pipefail
 . "$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)/lib/harness.sh"
 require_root
@@ -74,17 +75,28 @@ echo "$D" | grep -q 'mode=0' &&
     fail "nofilelock: stale foreign lock NOT cleared -- it would linger ($D)"
 
 # ---------------------------------------------------------------- part 3
-# Under the DEFAULT mount flock is refused (the lock is automatic).
-log "default mount: flock is refused (-EOPNOTSUPP; lock already automatic)"
+# Under the DEFAULT mount flock no longer fails: LOCK_EX reports the
+# automatic lock this node already holds and LOCK_UN SUSPENDS it, so the
+# same fd sequence an orchestrator uses under nofilelock works unchanged
+# on a default mount. Suspension itself is covered by lock_suspend.sh;
+# this is the interop assertion that one script fits both modes.
+log "default mount: flock reports and suspends the automatic lock"
 ct_mount "$DEV" "$MNT"
 require_cetrafs_mount "$MNT"
+DNID="$(sed -n 's/^this_node_id: //p' "/proc/fs/cetrafs/$PROC_DEV/info")"
 exec 8>>"$MNT/victim"
-if flock -x -n 8 2>/dev/null; then
-    fail "default: flock succeeded -- expected -EOPNOTSUPP"
-    flock -u 8 2>/dev/null || true
-else
-    pass "default: flock is refused (the lock is automatic on write-open)"
-fi
+flock -x -n 8 && pass "default: flock(LOCK_EX) succeeds -- the lock is already ours" ||
+    fail "default: flock(LOCK_EX) refused a lock this node already holds"
+D="$(dump)"
+echo "$D" | grep -q "owner=$DNID mode=1" &&
+    pass "default: LOCK_EX left the automatic lock in place ($D)" ||
+    fail "default: LOCK_EX disturbed the automatic lock ($D)"
+flock -u 8 && pass "default: flock(LOCK_UN) succeeds (suspends the lock)" ||
+    fail "default: flock(LOCK_UN) failed"
+D="$(dump)"
+echo "$D" | grep -q 'mode=0' &&
+    pass "default: LOCK_UN surrendered the lock with the fd still open ($D)" ||
+    fail "default: LOCK_UN did not surrender the lock ($D)"
 exec 8>&-
 ct_umount "$MNT"
 

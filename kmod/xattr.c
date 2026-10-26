@@ -173,10 +173,21 @@ static int cetrafs_xattr_set_locked(struct inode *inode, const char *name, const
         ret = cetrafs_sb_get_node_id(sb, &my_node_id);
         if (ret)
             return ret;
-        ret = cetrafs_lock_foreign_claim_exists(sb, inode->i_ino, my_node_id, &blocked);
+        /* The LOCK is not the only mark a live writer leaves. A node
+         * that has SUSPENDED this file's automatic lock (lock.c, the
+         * handoff window) is still writing it through an open fd and
+         * publishes itself only in read_open_nodes -- so asking about
+         * the lock alone lets this xattr set rewrite the record out from
+         * under exactly the in-flight updates described above. Refuse on
+         * a peer READER too, as unlink, rename, link and truncate
+         * already do: rewriting a whole record is not something to do
+         * under any peer that has the file open. */
+        bool reader = false;
+
+        ret = cetrafs_lock_foreign_user_exists(sb, inode->i_ino, my_node_id, &blocked, &reader);
         if (ret)
             return ret;
-        if (blocked)
+        if (blocked || reader)
             return -ETXTBSY;
     }
 

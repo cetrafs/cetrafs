@@ -3545,10 +3545,17 @@ static int cetrafs_setattr_locked(struct mnt_idmap *idmap, struct dentry *dentry
             if (blocked || reader)
                 return -ETXTBSY;
         } else {
-            ret = cetrafs_lock_foreign_claim_exists(inode->i_sb, inode->i_ino, my_node_id, &blocked);
+            /* Same reasoning as the size branch above: a peer that has
+             * SUSPENDED this file's automatic lock (lock.c, the handoff
+             * window) is still writing it and is published only as
+             * presence, so the lock alone no longer answers "is a live
+             * writer here?". chmod/chown rewrite the record. */
+            bool reader = false;
+
+            ret = cetrafs_lock_foreign_user_exists(inode->i_sb, inode->i_ino, my_node_id, &blocked, &reader);
             if (ret)
                 return ret;
-            if (blocked)
+            if (blocked || reader)
                 return -ETXTBSY;
         }
     }
@@ -3798,6 +3805,18 @@ static int cetrafs_fsync(struct file *file, loff_t start, loff_t end, int datasy
         ret = ret2;
 
     return ret;
+}
+
+/*
+ * Everything the last-writer close makes durable, for a file that is
+ * STAYING open. lock.c's suspension path calls it before handing this
+ * file's exclusive lock to a peer: data, extent-tree blocks, allocation
+ * bitmaps and the record must all be on the device before the peer can
+ * open, exactly as at close.
+ */
+int cetrafs_file_make_durable(struct file *file)
+{
+    return cetrafs_fsync(file, 0, LLONG_MAX, /*datasync=*/0);
 }
 
 static int cetrafs_open(struct inode *inode, struct file *file)

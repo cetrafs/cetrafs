@@ -71,6 +71,23 @@ u64 cetrafs_file_cache_reconcile_count(void)
     return (u64) atomic64_read(&cetrafs_file_cache_reconciles);
 }
 
+/* Default-mount lock suspensions and resumptions (flock(LOCK_UN)/(LOCK_EX)
+ * on a file this node auto-locked). A suspend that is never resumed shows
+ * up here as a gap, which is what an orchestrator leaking handoff windows
+ * looks like from outside. */
+static atomic64_t cetrafs_lock_suspends = ATOMIC64_INIT(0);
+static atomic64_t cetrafs_lock_resumes = ATOMIC64_INIT(0);
+
+u64 cetrafs_lock_suspend_count(void)
+{
+    return (u64) atomic64_read(&cetrafs_lock_suspends);
+}
+
+u64 cetrafs_lock_resume_count(void)
+{
+    return (u64) atomic64_read(&cetrafs_lock_resumes);
+}
+
 /* Poll interval for a blocking flock(LOCK_EX) waiting on a held lock
  * (local or a peer). The on-disk claim is a non-blocking CAS, so blocking
  * is an interruptible retry, same as the cluster filesystems' glock wait. */
@@ -146,9 +163,9 @@ struct cetrafs_inode_info {
      * cetrafs_stat_baseline in kmod.h for why ->write_inode needs it. */
     struct cetrafs_stat_baseline stat_baseline;
 
-    u64 generation;                 /* on-disk cetrafs_inode_t.generation this object was
-                                     * instantiated from (v0x0008) -- the cross-node
-                                     * inode-number-reuse detector; see inode.c */
+    u64 generation; /* on-disk cetrafs_inode_t.generation this object was
+                     * instantiated from (v0x0008) -- the cross-node
+                     * inode-number-reuse detector; see inode.c */
 
     /* nofilelock metadata-freshness gate. With the exclusive lock OFF there
      * is nothing to guarantee "no peer can be changing this file", so a
@@ -183,6 +200,26 @@ struct cetrafs_inode_info {
      * lock_mutex. */
     struct file *explicit_lock_file;
 
+    /* DEFAULT mount only: this node has surrendered this inode's
+     * automatic lock on request (flock(LOCK_UN)) while still holding it
+     * open for write. The lock is gone from the record, so a peer may
+     * claim it; our writers carry on untouched, because the lock only
+     * ever gated open(). Taken back by flock(LOCK_EX), or dropped when
+     * the last local writer closes.
+     *
+     * While set, this inode must be INDISTINGUISHABLE from a nofilelock
+     * inode -- on the device (our bit is published in read_open_nodes,
+     * which a default-mount writer otherwise never sets) and in core
+     * (both cache predicates below take the nofilelock branch). That is
+     * what lets every destructive path -- unlink, rename, link,
+     * truncate, setxattr, evict, scrub -- keep working unchanged: they
+     * all ask the device "is anyone still using this file?", and
+     * presence is the only answer left once the lock is gone.
+     *
+     * Guarded by lock_mutex for mutation; READ_ONCE on the per-block
+     * read path, where it must stay a plain in-core bool. */
+    bool lock_suspended;
+
     /* Serializes THIS node's own threads over the per-inode namespace
      * lock (nslock.c); the on-disk field arbitrates between nodes. Kept
      * separate from lock_mutex, which guards open/close refcounting --
@@ -212,7 +249,8 @@ struct cetrafs_inode_info {
     bool ns_staged;
     bool ns_staged_fd; /* the staged record also changed FILE-domain fields (dir growth/shrink) */
     cetrafs_inode_t ns_record;
-    u32 ns_nlink_base; /* device nlink when the record was staged -- lets the CAS publish nlink as a DELTA, not a wholesale overwrite that reverts a peer's change */
+    u32 ns_nlink_base; /* device nlink when the record was staged -- lets the CAS publish nlink as a DELTA, not a
+                          wholesale overwrite that reverts a peer's change */
 
     /* The task currently holding this inode's namespace lock (NULL when
      * unheld). Lets cetrafs_write_vfs_inode() tell "the caller itself
@@ -679,6 +717,7 @@ static void cetrafs_inode_init_once(void *foo)
     ci->defrag_pinned = false;
     atomic_set(&ci->defrag_queued, 0);
     ci->explicit_lock_file = NULL;
+    ci->lock_suspended = false;
     mutex_init(&ci->ns_mutex);
     ci->dirent_seq_cached = U64_MAX;
     ci->file_seq_cached = U64_MAX;
@@ -706,7 +745,10 @@ void cetrafs_destroy_inode_cache(void)
  * zeroed the refcount for a freshly-created slab object; a recycled one
  * already has lock_writer_count==0 from the matching release path below
  * (an inode is never freed back to the slab while a local write-opener
- * still holds it open). */
+ * still holds it open). lock_suspended rides on the same invariant:
+ * suspending requires a local writer, and the last writer's close clears
+ * it, so a recycled object can never arrive still believing it has
+ * surrendered a lock. */
 struct inode *cetrafs_alloc_vfs_inode(struct super_block *sb)
 {
     struct cetrafs_inode_info *ci = alloc_inode_sb(sb, cetrafs_inode_cache, GFP_KERNEL);
@@ -872,7 +914,10 @@ static int cetrafs_lock_cas(struct inode *inode, struct cetrafs_lock_cas_ctx *ct
 /* Clear the on-disk lock this node holds -- defined far below, next to
  * defrag_end which also uses it, but forward-declared here for the
  * explicit-lock close cleanup in cetrafs_lock_release(). */
-static void cetrafs_lock_clear_on_disk(struct inode *inode, bool stamp_stat);
+static int cetrafs_lock_clear_on_disk(struct inode *inode, bool stamp_stat);
+/* Withdraw this node from read_open_nodes -- defined with the suspension
+ * code below, used by the close path above it. */
+static void cetrafs_lock_presence_put(struct inode *inode);
 
 
 /*
@@ -1018,7 +1063,11 @@ int cetrafs_lock_open(struct inode *inode, struct file *file)
         raw.lock_owner_node = cetrafs_cpu_to_le32(CETRAFS_NODE_ID_NONE);
     }
 
-    if (lock_on && want_write && (raw.lock_mode == CETRAFS_LOCK_NONE || reclaim_from_stale)) {
+    /* A SUSPENDED inode must not be silently re-locked by the next local
+     * write-open: the window belongs to whoever asked for it, and an
+     * unrelated opener closing it would strand the peer mid-handoff. The
+     * window is taken back explicitly, by flock(LOCK_EX). */
+    if (lock_on && want_write && !ci->lock_suspended && (raw.lock_mode == CETRAFS_LOCK_NONE || reclaim_from_stale)) {
         /* One atomic compare-and-swap carries the whole claim: no
          * write-then-verify-readback, because the swap can only
          * land on the exact record the decision above was made against.
@@ -1076,18 +1125,25 @@ int cetrafs_lock_open(struct inode *inode, struct file *file)
      * back empty, size 0) -- not a cross-node race at all, just this
      * node racing its own writeback.
      *
-     * raw.mtime vs this inode's own cached mtime resolves it correctly
-     * either way: write()/create() always advance the in-core mtime
-     * immediately, before any writeback runs, so as long as nothing has
-     * flushed yet raw.mtime (whatever stale value write_inode() last
-     * wrote) can never be newer than the in-core value -- refresh
-     * correctly stays skipped. A different node's write that *did* reach
-     * disk after this node last knew about this inode shows up as a
-     * strictly newer raw.mtime, so the refresh still fires exactly when
-     * it's actually needed.
+     * The question that actually decides it is WHOSE publish this record
+     * is carrying: a peer's (take it) or our own pre-writeback one (keep
+     * the in-core state). file_seq answers exactly that -- it names the
+     * node that last stamped the file sector, and it is stamped on every
+     * such publish including create, so it is never absent.
+     *
+     * This used to ask raw.mtime > our cached mtime instead. That gets
+     * the local case right for the same reason, but it is wrong across
+     * nodes: mtime has ONE-SECOND granularity, so a peer that wrote and
+     * closed within the same second as our last known mtime is not
+     * "strictly newer" and the refresh is skipped -- we open holding a
+     * stale i_size and read the peer's data beyond it as a hole. The
+     * identical mistake in the lock-resume path survived a two-node run
+     * on slow hardware and failed the moment it met a faster three-node
+     * one; this is the same bug in the path that predates it, and it is
+     * reachable in BOTH mount modes.
      */
     if (atomic_read(&ci->lock_local_open_count) == 0 &&
-        (time64_t) cetrafs_le64(raw.mtime) > inode_get_mtime_sec(inode)) {
+        CETRAFS_FILE_SEQ_NODE(cetrafs_le64(raw.file_seq)) != (u32) (my_node_id & 0xFFFFu)) {
         /* -EUCLEAN means the record changed type without changing
          * generation: corruption worth logging, but not worth failing a
          * read on -- the right outcome is simply not to apply it.
@@ -1232,7 +1288,7 @@ int cetrafs_lock_release(struct inode *inode, struct file *file)
      * never released it via flock(LOCK_UN), its close releases it --
      * the fd-scoped lifetime (Option A) that bounds a crashing holder. */
     if (ci->explicit_lock_file == file) {
-        cetrafs_lock_clear_on_disk(inode, /*stamp_stat=*/false);
+        (void) cetrafs_lock_clear_on_disk(inode, /*stamp_stat=*/false);
         ci->explicit_lock_file = NULL;
     }
 
@@ -1271,6 +1327,13 @@ int cetrafs_lock_release(struct inode *inode, struct file *file)
     if (atomic_dec_return(&ci->lock_writer_count) == 0) {
         cetrafs_inode_t raw;
         bool lock_cleared;
+        /* Closing while the lock is suspended: there is no lock to clear
+         * (we gave it back), but the presence bit suspension published in
+         * its place is ours to withdraw -- it is the only thing still
+         * telling peers this file is in use here. Done AFTER the flushes
+         * below for the same reason suspension does them first: the
+         * signal must not disappear before the data is durable. */
+        bool was_suspended = ci->lock_suspended;
         int ret;
         ktime_t t0 = ktime_get();
         ktime_t t_data, t_inode, t_bg, t_leaf;
@@ -1370,7 +1433,15 @@ int cetrafs_lock_release(struct inode *inode, struct file *file)
         t_leaf = ktime_get();
 
         lock_cleared = false;
-        if (!lock_on) {
+        if (was_suspended) {
+            cetrafs_lock_presence_put(inode);
+            ci->lock_suspended = false;
+        }
+
+        if (was_suspended) {
+            /* lock_mode is NONE by our own doing -- not an error, and
+             * nothing to clear. */
+        } else if (!lock_on) {
             /* nofilelock mount: this open never claimed the lock, so there
              * is nothing to clear -- lock_mode is NONE, not EXCLUSIVE, and
              * treating that as an error would log on every close. The
@@ -1716,6 +1787,23 @@ bool cetrafs_inode_foreign_opener_cached(struct inode *inode)
     return ci->foreign_open_cached;
 }
 
+/*
+ * Test-only. Each disables one half of what makes suspension safe, so the
+ * tests asserting that safety can be shown to actually discriminate --
+ * flip the knob and the test must fail.
+ */
+static bool cetrafs_lock_suspend_skip_publish;
+module_param_named(lock_suspend_skip_publish, cetrafs_lock_suspend_skip_publish, bool, 0644);
+MODULE_PARM_DESC(lock_suspend_skip_publish,
+                 "TEST ONLY: suspend without publishing presence (reproduces the invisible-writer bug: "
+                 "a peer's unlink or scrub frees blocks under a live writer)");
+
+static bool cetrafs_lock_suspend_trust_cache;
+module_param_named(lock_suspend_trust_cache, cetrafs_lock_suspend_trust_cache, bool, 0644);
+MODULE_PARM_DESC(lock_suspend_trust_cache,
+                 "TEST ONLY: keep trusting cached metadata while suspended (reproduces the frozen "
+                 "extent-tree bug)");
+
 bool cetrafs_lock_held_for_write_locally(struct inode *inode)
 {
     /* The premise every caller builds on is "no peer can be modifying this
@@ -1736,7 +1824,14 @@ bool cetrafs_lock_held_for_write_locally(struct inode *inode)
      * what lets nofilelock be both correct across a handoff and fast the
      * 99.9% of the time there is only one node. It does NOT serialise two
      * nodes writing at once -- that remains the upper layer's job. */
-    if (cetrafs_sb_file_lock_enabled(inode->i_sb))
+    /* ...unless this node has SUSPENDED that lock on request while
+     * keeping the file open (cetrafs_lock_suspend()). lock_writer_count
+     * is still positive -- the VM has its fd -- but the lock is gone from
+     * the record and a peer may be writing. Inferring ownership from the
+     * writer count is exactly what stops being true there, so fall
+     * through to the nofilelock logic, which asks the device. */
+    if (cetrafs_sb_file_lock_enabled(inode->i_sb) &&
+        (cetrafs_lock_suspend_trust_cache || !READ_ONCE(CETRAFS_I(inode)->lock_suspended)))
         return atomic_read(&CETRAFS_I(inode)->lock_writer_count) > 0;
 
     if (cetrafs_inode_foreign_opener_cached(inode))
@@ -1771,7 +1866,9 @@ bool cetrafs_lock_held_for_write_locally(struct inode *inode)
  */
 bool cetrafs_lock_identity_cache_trusted(struct inode *inode)
 {
-    if (cetrafs_sb_file_lock_enabled(inode->i_sb))
+    /* Suspended: same correction as the content predicate above. */
+    if (cetrafs_sb_file_lock_enabled(inode->i_sb) &&
+        (cetrafs_lock_suspend_trust_cache || !READ_ONCE(CETRAFS_I(inode)->lock_suspended)))
         return atomic_read(&CETRAFS_I(inode)->lock_writer_count) > 0;
     if (atomic_read(&CETRAFS_I(inode)->lock_local_open_count) <= 0)
         return false;
@@ -1801,7 +1898,7 @@ bool cetrafs_lock_identity_cache_trusted(struct inode *inode)
  * clears a record that still shows OUR exclusive claim, so a lock that
  * was meanwhile reclaimed from us (stale-peer steal) is left alone
  * instead of being blindly stomped. Caller holds ci->lock_mutex. */
-static void cetrafs_lock_clear_on_disk(struct inode *inode, bool stamp_stat)
+static int cetrafs_lock_clear_on_disk(struct inode *inode, bool stamp_stat)
 {
     struct super_block *sb = inode->i_sb;
     struct cetrafs_lock_cas_ctx ctx = {.claim = false};
@@ -1819,8 +1916,328 @@ static void cetrafs_lock_clear_on_disk(struct inode *inode, bool stamp_stat)
         if (!ret && stamp_stat)
             cetrafs_inode_stat_baseline_from_incore(inode);
     }
-    if (ret)
+    if (ret < 0)
         pr_err("lock clear: ino=%llu failed: %d\n", (unsigned long long) inode->i_ino, ret);
+    return ret < 0 ? ret : 0;
+}
+
+/*
+ * ---- default-mount lock suspension (flock(LOCK_UN) / flock(LOCK_EX)) ----
+ *
+ * Everything is locked by default; a file is unlocked only on request and
+ * only for as long as the request lasts. That is strictly safer than
+ * nofilelock, which removes the lock from every file on every node
+ * permanently in order to permit an operation that is per-file and lasts
+ * seconds.
+ *
+ * The lock surrendered here is the SAME on-disk lock a write-open claims
+ * -- same record fields, same CAS -- so there is no new primitive and no
+ * format change: CETRAFS_LOCK_NONE is already "unlocked".
+ *
+ * THE INVARIANT: while suspended, this inode must be indistinguishable
+ * from a nofilelock inode, on the device and in core. On the device that
+ * means our bit in read_open_nodes, which a default-mount writer does not
+ * otherwise set (cetrafs_lock_open() skips the publish for exactly that
+ * case, because the lock normally marks us). Without it the file reads as
+ * lock_mode=NONE, read_open_nodes=0 -- byte-identical to a file nobody
+ * has open -- to unlink, rename, link, truncate, setxattr, evict and the
+ * scrub's orphan reclaim, every one of which then feels free to destroy
+ * it while our writer is mid-I/O. In core it means both cache predicates
+ * take the nofilelock branch, or we map the guest's I/O through an extent
+ * tree the peer has since rewritten.
+ */
+
+/*
+ * Publish / withdraw this node in read_open_nodes for the suspension
+ * path, through the same read_opener_count protocol cetrafs_lock_open()
+ * and _release() use for readers (and for nofilelock writers). Going via
+ * the counter rather than straight to the CAS is load-bearing: a local
+ * reader of the same file may hold the bit too, and whoever takes the
+ * count to zero is the only one that may clear it.
+ *
+ * Caller holds lock_mutex.
+ */
+static int cetrafs_lock_presence_get(struct inode *inode)
+{
+    struct cetrafs_inode_info *ci = CETRAFS_I(inode);
+    struct super_block *sb = inode->i_sb;
+    cetrafs_inode_t raw;
+    u32 my_node_id;
+    int ret;
+
+    if (atomic_inc_return(&ci->read_opener_count) != 1)
+        return 0; /* already published by a local opener */
+
+    ret = cetrafs_sb_get_node_id(sb, &my_node_id);
+    if (!ret)
+        ret = cetrafs_read_raw_inode(sb, inode->i_ino, &raw);
+    if (!ret) {
+        struct cetrafs_lock_cas_ctx rctx = {
+            .my_node_id = my_node_id,
+            .generation = cetrafs_le64(raw.generation),
+            .reader_op = CETRAFS_READER_SET,
+        };
+
+        ret = cetrafs_lock_cas(inode, &rctx, &raw);
+        if (ret > 0)
+            ret = 0; /* bit already set -- nothing to do, not a failure */
+    }
+    if (ret < 0)
+        atomic_dec(&ci->read_opener_count);
+    return ret;
+}
+
+static void cetrafs_lock_presence_put(struct inode *inode)
+{
+    struct cetrafs_inode_info *ci = CETRAFS_I(inode);
+    struct super_block *sb = inode->i_sb;
+    cetrafs_inode_t raw;
+    u32 my_node_id;
+
+    if (atomic_dec_return(&ci->read_opener_count) != 0)
+        return; /* a local opener still needs the bit */
+
+    if (cetrafs_sb_get_node_id(sb, &my_node_id) != 0 || cetrafs_read_raw_inode(sb, inode->i_ino, &raw) != 0)
+        return; /* bit left set: the safe direction, peers merely stay cautious */
+
+    {
+        struct cetrafs_lock_cas_ctx rctx = {
+            .my_node_id = my_node_id,
+            .generation = cetrafs_le64(raw.generation),
+            .reader_op = CETRAFS_READER_CLEAR,
+        };
+        int ret = cetrafs_lock_cas(inode, &rctx, &raw);
+
+        if (ret < 0)
+            pr_warn_ratelimited("ino=%llu could not withdraw presence after resume: %d\n",
+                                (unsigned long long) inode->i_ino, ret);
+    }
+}
+
+/*
+ * flock(fd, LOCK_UN) on a default mount: give this inode's automatic lock
+ * back while keeping it open.
+ *
+ * Per INODE and node, not per fd: what is surrendered is the node's
+ * automatic lock, which is itself per-inode. (The nofilelock explicit
+ * lock stays fd-scoped -- a different object with a different lifetime.)
+ *
+ * Idempotent, and a no-op success when this node holds no automatic lock
+ * on the file, both per flock(2): unlocking what you do not hold succeeds.
+ */
+static int cetrafs_lock_suspend(struct inode *inode, struct file *file)
+{
+    struct cetrafs_inode_info *ci = CETRAFS_I(inode);
+    struct super_block *sb = inode->i_sb;
+    int ret;
+
+    if (sb_rdonly(sb))
+        return -EROFS;
+    if (cetrafs_sb_is_fenced(sb))
+        return -EIO;
+
+    mutex_lock(&ci->lock_mutex);
+
+    if (ci->lock_suspended) {
+        ret = 0;
+        goto out;
+    }
+    if (atomic_read(&ci->lock_writer_count) == 0) {
+        ret = 0; /* no automatic lock here to give back */
+        goto out;
+    }
+    if (READ_ONCE(ci->defrag_pinned)) {
+        /* The incremental mover's whole safety argument is that this
+         * lock stays ours for the pass. Refuse rather than pull it. */
+        ret = -EBUSY;
+        goto out;
+    }
+
+    /*
+     * The handoff durability boundary, and it must complete BEFORE the
+     * lock goes: the peer that opens the instant after must not find a
+     * short file, an extent tree naming unflushed blocks, or allocation
+     * bits that have not reached the platter (rule 8 -- a reference may
+     * not become durable before what it refers to; the lock-clear is a
+     * CAS and reaches the device immediately). Same flushes the
+     * last-writer close performs.
+     *
+     * Under lock_mutex, exactly as cetrafs_lock_release() does it. That
+     * is not incidental: this node may have OTHER local writers on the
+     * same file, and flushing outside the mutex would let one of them
+     * dirty a page between the flush and the lock-clear below -- handing
+     * the peer a file whose newest bytes are still in our page cache.
+     * The close path has no such window only because it runs when the
+     * last writer is already gone. (Writeback re-entering
+     * cetrafs_get_block() is safe under this mutex: that path takes
+     * resv_lock, never this one -- see the resv_lock comment above.)
+     */
+    ret = cetrafs_file_make_durable(file);
+    if (ret)
+        goto out;
+    ret = cetrafs_flush_dirty_free_counts(sb);
+    if (ret)
+        goto out;
+
+    /*
+     * Presence FIRST, lock second. Between the two we hold both signals,
+     * which is merely over-protective; the other order leaves a window in
+     * which this file looks unused to every peer and its blocks are free
+     * for the taking.
+     */
+    if (!cetrafs_lock_suspend_skip_publish) {
+        ret = cetrafs_lock_presence_get(inode);
+        if (ret)
+            goto out;
+    }
+
+    ret = cetrafs_lock_clear_on_disk(inode, /*stamp_stat=*/false);
+    if (ret) {
+        /* Still locked, so nothing was handed over: undo the publish and
+         * report, rather than leaving the record saying EXCLUSIVE while
+         * we believe we surrendered it. */
+        if (!cetrafs_lock_suspend_skip_publish)
+            cetrafs_lock_presence_put(inode);
+        goto out;
+    }
+
+    ci->lock_suspended = true;
+
+    /*
+     * The freshness verdict is cached for up to a second
+     * (cetrafs_inode_foreign_opener_cached). Without this we would keep
+     * trusting the cache for that long after giving the lock away.
+     */
+    ci->foreign_open_cached = true;
+    ci->foreign_open_valid = false;
+    ci->file_seq_cached = U64_MAX;
+
+    atomic64_inc(&cetrafs_lock_suspends);
+    ret = 0;
+out:
+    mutex_unlock(&ci->lock_mutex);
+    return ret;
+}
+
+/*
+ * flock(fd, LOCK_EX) on a default mount: take the automatic lock back.
+ *
+ * NEVER steals -- not even from a holder whose node has gone stale. That
+ * reclaim fences the peer and replays its journal, which belongs in
+ * cetrafs_lock_open() where it is already implemented and tested; a
+ * caller that needs it can close and reopen the file. Here a foreign
+ * lock simply means "you cannot have it back right now".
+ *
+ * Returns -ETXTBSY when a peer holds it, which cetrafs_flock() maps to
+ * -EWOULDBLOCK (or retries, for a blocking LOCK_EX).
+ */
+static int cetrafs_lock_resume(struct inode *inode)
+{
+    struct cetrafs_inode_info *ci = CETRAFS_I(inode);
+    struct super_block *sb = inode->i_sb;
+    cetrafs_inode_t raw;
+    u32 my_node_id;
+    int ret;
+
+    if (sb_rdonly(sb))
+        return -EROFS;
+    if (cetrafs_sb_is_fenced(sb))
+        return -EIO;
+
+    mutex_lock(&ci->lock_mutex);
+
+    if (!ci->lock_suspended) {
+        /*
+         * Nothing to take back. On a default mount the lock is automatic,
+         * so "do we hold it" is "do we have a local writer" -- answer
+         * yes rather than -EOPNOTSUPP, so a caller that does not know
+         * which mount mode it is on can simply ask and get the truth.
+         */
+        ret = atomic_read(&ci->lock_writer_count) > 0 ? 0 : -EOPNOTSUPP;
+        goto out;
+    }
+
+    ret = cetrafs_sb_get_node_id(sb, &my_node_id);
+    if (ret)
+        goto out;
+
+    /* Forced-fresh: the entire point of the window is that a peer may
+     * have taken the lock, and a cached record cannot show that. */
+    cetrafs_invalidate_raw_inode(sb, inode->i_ino);
+    ret = cetrafs_read_raw_inode(sb, inode->i_ino, &raw);
+    if (ret)
+        goto out;
+
+    if (cetrafs_le32(raw.lock_mode) != CETRAFS_LOCK_NONE) {
+        ret = -ETXTBSY;
+        goto out;
+    }
+
+    {
+        struct cetrafs_lock_cas_ctx ctx = {
+            .my_node_id = my_node_id,
+            .generation = cetrafs_le64(raw.generation),
+            .claim = true,
+        };
+
+        ret = cetrafs_lock_cas(inode, &ctx, &raw);
+        if (ret < 0)
+            goto out; /* -ETXTBSY: lost the race to a peer */
+        ret = 0;
+    }
+
+    /* Lock first, presence second -- the mirror of suspend, and for the
+     * same reason: never a moment with neither signal on the device. */
+    if (!cetrafs_lock_suspend_skip_publish)
+        cetrafs_lock_presence_put(inode);
+    ci->lock_suspended = false;
+
+    /*
+     * A peer may have rewritten this file while we were out, and once the
+     * lock is ours again both cache predicates go back to saying "trust
+     * the cache" -- so the reconcile has to happen HERE, not lazily. Same
+     * work the open path does for an arriving handoff: re-read the record
+     * fresh, drop the cached extent tree built from the old one, and drop
+     * clean data pages that may now name the wrong physical blocks.
+     *
+     * 'raw' is reused rather than declaring a second cetrafs_inode_t --
+     * see the open path's note about CONFIG_FRAME_WARN=1024.
+     */
+    if (!cetrafs_lock_suspend_trust_cache) {
+        cetrafs_invalidate_raw_inode(sb, inode->i_ino);
+        if (cetrafs_read_raw_inode(sb, inode->i_ino, &raw) == 0) {
+            cetrafs_tree_invalidate_cached(inode, &raw);
+
+            /* Whose publish is this record carrying? Ask file_seq, which
+             * names the node that stamped it -- NOT mtime.
+             *
+             * mtime has one-second granularity, and a handoff completes
+             * well inside one second on real hardware: the peer's write
+             * then carries the SAME mtime as our pre-window state, a
+             * strictly-newer test is false, and we resume holding a
+             * stale i_size -- the peer's data beyond it reads as a hole.
+             * That is not hypothetical. It passed on slow hardware and
+             * failed on a three-node run, which is the only reason it
+             * was caught before release.
+             *
+             * If we ourselves wrote during the window the last stamp is
+             * ours, so this correctly keeps our newer state; and
+             * cetrafs_apply_raw_to_vfs_inode() refuses a dirty inode
+             * anyway, so unflushed local work is never clobbered. */
+            if (CETRAFS_FILE_SEQ_NODE(cetrafs_le64(raw.file_seq)) != (u32) (my_node_id & 0xFFFFu))
+                (void) cetrafs_apply_raw_to_vfs_inode(inode, &raw);
+        }
+        ci->file_seq_cached = U64_MAX;
+        ci->foreign_open_cached = true;
+        ci->foreign_open_valid = false;
+        if (inode->i_mapping)
+            invalidate_mapping_pages(inode->i_mapping, 0, -1);
+    }
+
+    atomic64_inc(&cetrafs_lock_resumes);
+out:
+    mutex_unlock(&ci->lock_mutex);
+    return ret;
 }
 
 /*
@@ -1934,7 +2351,7 @@ static int cetrafs_lock_explicit_release(struct inode *inode, struct file *file)
     if (ci->explicit_lock_file != file) {
         ret = -EINVAL; /* this fd does not hold the explicit lock */
     } else {
-        cetrafs_lock_clear_on_disk(inode, /*stamp_stat=*/false);
+        (void) cetrafs_lock_clear_on_disk(inode, /*stamp_stat=*/false);
         ci->explicit_lock_file = NULL;
         ret = 0;
     }
@@ -1965,13 +2382,19 @@ int cetrafs_flock(struct file *file, int cmd, struct file_lock *fl)
 {
     struct inode *inode = file_inode(file);
     bool blocking = (cmd == F_SETLKW);
+    bool lock_on = cetrafs_sb_file_lock_enabled(inode->i_sb);
     int ret;
 
     if (!(fl->c.flc_flags & FL_FLOCK))
         return -ENOLCK; /* only real flock(2), not emulated posix/OFD */
 
     if (lock_is_unlock(fl)) {
-        /* Unlocking a lock we don't hold is a no-op success, per flock(2). */
+        /* Default mount: give the automatic lock back for this inode,
+         * keeping the file open -- the handoff window. Elsewhere: drop
+         * the fd's explicit lock. Unlocking what we do not hold is a
+         * no-op success in both, per flock(2). */
+        if (lock_on)
+            return cetrafs_lock_suspend(inode, file);
         cetrafs_lock_explicit_release(inode, file);
         return 0;
     }
@@ -1979,7 +2402,9 @@ int cetrafs_flock(struct file *file, int cmd, struct file_lock *fl)
         return -EOPNOTSUPP; /* exclusive-only: no shared (LOCK_SH) lock */
 
     for (;;) {
-        ret = cetrafs_lock_explicit_acquire(inode, file);
+        /* Default mount: take a suspended lock back (and answer "yes, it
+         * is yours" when it never left). Elsewhere: the explicit claim. */
+        ret = lock_on ? cetrafs_lock_resume(inode) : cetrafs_lock_explicit_acquire(inode, file);
         if (ret != -EBUSY && ret != -ETXTBSY)
             return ret; /* 0, or terminal (-EOPNOTSUPP default mount, -EROFS, -EIO) */
         if (!blocking)
@@ -2025,6 +2450,13 @@ int cetrafs_lock_defrag_begin(struct inode *inode)
      * operator switch; this is the hard safety floor under it. */
     if (!cetrafs_sb_file_lock_enabled(sb))
         return -EOPNOTSUPP;
+
+    /* Suspended: the lock this pass would pin is not ours right now, and
+     * "local writers exist, so it is already ours" -- the premise the pin
+     * below is built on -- is false. A peer may be writing the very
+     * blocks the mover would relocate. */
+    if (READ_ONCE(CETRAFS_I(inode)->lock_suspended))
+        return -EBUSY;
 
     ret = cetrafs_sb_get_node_id(sb, &my_node_id);
     if (ret)

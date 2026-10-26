@@ -1,0 +1,125 @@
+name: Bug report
+description: Something is broken, corrupt, hung, or behaving differently from the documentation.
+labels: ["bug"]
+body:
+  - type: markdown
+    attributes:
+      value: |
+        Thanks for taking the time. cetrafs is young, and a report from a
+        cluster that is not mine is worth more than any amount of review.
+
+        If data is at risk right now: unmount on every node before
+        experimenting further, and say so below — it changes how I'd
+        advise you to proceed.
+
+  - type: textarea
+    id: what-happened
+    attributes:
+      label: What happened, and what did you expect instead?
+      placeholder: |
+        e.g. A second node's open() of a VM disk returned EIO rather than
+        ETXTBSY while the first node held it.
+    validations:
+      required: true
+
+  - type: textarea
+    id: reproduce
+    attributes:
+      label: How can it be reproduced?
+      description: Even an unreliable recipe helps. If it happened once and never again, say that — it is still worth knowing.
+    validations:
+      required: false
+
+  - type: input
+    id: version
+    attributes:
+      label: cetrafs version
+      description: "`cat /sys/module/cetrafs/version`"
+      placeholder: "0.8.2"
+    validations:
+      required: true
+
+  - type: input
+    id: kernel
+    attributes:
+      label: Kernel and architecture
+      description: "`uname -srm`"
+      placeholder: "Linux 6.8.12-4-pve x86_64"
+    validations:
+      required: true
+
+  - type: input
+    id: nodes
+    attributes:
+      label: How many nodes mount the volume?
+      placeholder: "3"
+    validations:
+      required: true
+
+  - type: dropdown
+    id: lockmode
+    attributes:
+      label: Mount mode
+      options:
+        - default (automatic file lock)
+        - nofilelock
+        - not sure
+    validations:
+      required: true
+
+  - type: textarea
+    id: storage
+    attributes:
+      label: Shared storage
+      description: |
+        Transport (iSCSI / FC / other) and the kind of array — no need for
+        model numbers or WWNs. Most importantly: does it support atomic
+        COMPARE AND WRITE? Load the module with `caw_probe=<device>` and
+        paste the `max_caw_blocks` line from `dmesg`. A value of 0 means
+        no CAW, and only one node can safely mount.
+      placeholder: |
+        16G FC to an enterprise array.
+        cetrafs: caw_probe: max_caw_blocks=1
+    validations:
+      required: true
+
+  - type: dropdown
+    id: install
+    attributes:
+      label: How was it installed?
+      options:
+        - Debian packages (cetrafs-dkms / cetrafs-tools)
+        - DKMS from source
+        - Built from source
+        - Third-party repository
+        - Other
+    validations:
+      required: false
+
+  - type: textarea
+    id: dmesg
+    attributes:
+      label: Kernel log
+      description: "`dmesg | grep -i cetrafs` from every node involved, not just the one that noticed. Cross-node bugs are usually only legible from both sides."
+      render: text
+    validations:
+      required: false
+
+  - type: textarea
+    id: fsck
+    attributes:
+      label: fsck output
+      description: "`fsck.cetra <device>` with the volume unmounted everywhere. Safe to run — it does not repair unless given `-r`."
+      render: text
+    validations:
+      required: false
+
+  - type: checkboxes
+    id: confirm
+    attributes:
+      label: Before submitting
+      options:
+        - label: I have independent backups of anything I cannot lose.
+          required: false
+        - label: There is no private data (hostnames, IPs, WWNs, customer names) in what I pasted above.
+          required: true

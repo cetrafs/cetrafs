@@ -11,6 +11,7 @@ import (
 	"encoding/json"
 	"errors"
 	"fmt"
+	"io"
 	"log"
 	"net"
 	"os"
@@ -258,6 +259,28 @@ func (s *Slave) dispatch(req Request) Response {
 			return errResp(req.ID, err)
 		}
 		res, err := s.doReadAt(a)
+		if err != nil {
+			return errResp(req.ID, err)
+		}
+		return okResp(req.ID, res)
+
+	case "read_held":
+		var a HeldIOArgs
+		if err := unmarshalInto(&a); err != nil {
+			return errResp(req.ID, err)
+		}
+		res, err := s.doReadHeld(a)
+		if err != nil {
+			return errResp(req.ID, err)
+		}
+		return okResp(req.ID, res)
+
+	case "write_held":
+		var a HeldIOArgs
+		if err := unmarshalInto(&a); err != nil {
+			return errResp(req.ID, err)
+		}
+		res, err := s.doWriteHeld(a)
 		if err != nil {
 			return errResp(req.ID, err)
 		}
@@ -1026,6 +1049,50 @@ func (s *Slave) doReadAt(a ReadAtArgs) (ReadAtResult, error) {
 	return ReadAtResult{BytesRead: n, Checksum: hex.EncodeToString(sum[:])}, nil
 }
 
+// doReadHeld / doWriteHeld: I/O through a handle that is already open, so
+// no open() intervenes to refresh a cache the test is trying to observe.
+func (s *Slave) doReadHeld(a HeldIOArgs) (HeldIOResult, error) {
+	v, ok := s.handles.Load(a.Handle)
+	if !ok {
+		return HeldIOResult{}, fmt.Errorf("no such handle %d (open it with open_hold first)", a.Handle)
+	}
+	buf := make([]byte, a.Size)
+	n, err := v.(*os.File).ReadAt(buf, a.Offset)
+	if err != nil && n == 0 && !errors.Is(err, io.EOF) {
+		return HeldIOResult{}, fmt.Errorf("read at offset %d: %w", a.Offset, err)
+	}
+	// A short read AT or past EOF is reported, not raised: a node whose
+	// cached size is stale reads zero bytes where a reconciled one reads
+	// the peer's data, and that difference is the whole assertion.
+	sum := sha256.Sum256(buf[:n])
+	return HeldIOResult{Bytes: n, Checksum: hex.EncodeToString(sum[:])}, nil
+}
+
+func (s *Slave) doWriteHeld(a HeldIOArgs) (HeldIOResult, error) {
+	v, ok := s.handles.Load(a.Handle)
+	if !ok {
+		return HeldIOResult{}, fmt.Errorf("no such handle %d (open it with open_hold first)", a.Handle)
+	}
+	buf := make([]byte, a.Size)
+	stamp := a.Stamp
+	if stamp == "" {
+		stamp = "x"
+	}
+	for i := range buf {
+		buf[i] = stamp[i%len(stamp)]
+	}
+	f := v.(*os.File)
+	n, err := f.WriteAt(buf, a.Offset)
+	if err != nil {
+		return HeldIOResult{}, fmt.Errorf("write at offset %d: %w", a.Offset, err)
+	}
+	if err := f.Sync(); err != nil {
+		return HeldIOResult{}, fmt.Errorf("fsync: %w", err)
+	}
+	sum := sha256.Sum256(buf[:n])
+	return HeldIOResult{Bytes: n, Checksum: hex.EncodeToString(sum[:])}, nil
+}
+
 func (s *Slave) doOpenHold(a OpenHoldArgs) (OpenHoldResult, error) {
 	var flags int
 	switch a.Mode {
@@ -1402,6 +1469,9 @@ func doModuleInfo() (ModuleInfoResult, error) {
 	if id, err := readELFNoteBuildID("/sys/module/cetrafs/notes/.note.gnu.build-id"); err == nil {
 		res.BuildID = id
 	}
+	if v, err := os.ReadFile("/sys/module/cetrafs/version"); err == nil {
+		res.Version = strings.TrimSpace(string(v))
+	}
 
 	for _, p := range koPathCandidates {
 		info, err := os.Stat(p)
@@ -1459,9 +1529,13 @@ var settableControls = map[string]bool{
 // same reason set_control whitelists by key. See ModParamArgs in
 // protocol.go for why each one is here.
 var settableModParams = map[string]bool{
-	"caw_fail_discover": true,
-	"hb_interval_secs":  true,
-	"stale_secs":        true,
+	// Default-mount lock suspension: each disables one half of what makes
+	// it safe, so the scenario's assertions can be shown to discriminate.
+	"lock_suspend_skip_publish": true,
+	"lock_suspend_trust_cache":  true,
+	"caw_fail_discover":         true,
+	"hb_interval_secs":          true,
+	"stale_secs":                true,
 	// The background scrub's cadence. A scenario that has to watch the
 	// scrub make (or decline) a decision cannot wait out the 30-minute
 	// default, and these must be set BEFORE the mount: scrub_start()

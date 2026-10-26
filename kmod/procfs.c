@@ -241,6 +241,8 @@ static int cetrafs_proc_info_show(struct seq_file *m, void *v)
     seq_printf(m, "tree_blocks: %llu\n", cetrafs_tree_block_count());
     seq_printf(m, "tree_reads: %llu\n", cetrafs_tree_read_count());
     seq_printf(m, "file_cache_reconciles: %llu\n", cetrafs_file_cache_reconcile_count());
+    seq_printf(m, "lock_suspends: %llu\n", cetrafs_lock_suspend_count());
+    seq_printf(m, "lock_resumes: %llu\n", cetrafs_lock_resume_count());
     seq_printf(m, "journal_replay_applied: %llu\n", cetrafs_journal_replay_applied_count());
     seq_printf(m, "journal_replay_skipped: %llu\n", cetrafs_journal_replay_skipped_count());
     /* Nonzero means replay caught an entry whose target another node had

@@ -11,10 +11,21 @@ It is an out-of-tree kernel module (`kmod/`) plus the userspace tools
 coordinate through the storage itself — one atomic SCSI COMPARE AND WRITE
 per contested claim, the same idea as VMFS's ATS — not over a network.
 
+**[cetrafs.com](https://cetrafs.com/)** &nbsp;·&nbsp;
+[Documentation](https://cetrafs.com/docs/) &nbsp;·&nbsp;
+[Quick install](https://cetrafs.com/docs/how-tos/install-packages/) &nbsp;·&nbsp;
+[Project status](https://cetrafs.com/docs/intro/status/)
+
 > **Status: young, pre-1.0.** Heavily reviewed, fuzzed and crash-tested,
 > but not production-aged the way VMFS or ext4 are. Built and tested on
 > Linux `7.0.14` and `7.1.8+deb13` (Debian, arm64), on
 > little-endian hosts (arm64, amd64). Keep independent backups.
+>
+> **Before deploying anything, read
+> [Project status](https://cetrafs.com/docs/intro/status/).** It is the
+> honest account of what is verified, what is not, and what a trial
+> should check first. If you read one page about this project, read that
+> one.
 
 ## What you get
 
@@ -40,6 +51,43 @@ per contested claim, the same idea as VMFS's ATS — not over a network.
 - **Online maintenance** — in-place defragmentation, a background scrubber
   that reclaims leaked blocks, and an `fsck.cetra` that repairs the
   mechanically-derivable faults and refuses the ambiguous ones.
+
+## Feedback
+
+cetrafs is early, and the fastest way to improve it is to hear from
+people running it on real hardware. A cluster that is not mine finds
+things no amount of review does — that has been true of every serious
+bug so far.
+
+- **Something broken, or behaving strangely?** Please
+  [open an issue](https://github.com/cetrafs/cetrafs/issues). Kernel,
+  array, node count and what you expected are usually enough to make a
+  report actionable.
+- **Used it, or just have an opinion on the design?** Mail
+  **<mcetra@gmail.com>** — feedback is genuinely wanted, including the
+  unflattering kind.
+- **Found it useful?** A **star** on
+  [GitHub](https://github.com/cetrafs/cetrafs) helps the project reach
+  the people it is built for — and tells me it is working as expected,
+  which is hard to learn any other way.
+
+## Documentation
+
+- **Project site** — <https://cetrafs.com/>
+- **Documentation** — <https://cetrafs.com/docs/>: deployment
+  requirements, the operator runbook and the feature matrix.
+
+**Start with [Project status](https://cetrafs.com/docs/intro/status/).**
+It sets out what is actually verified and what is not, which is the first
+thing worth knowing about software this young. Nothing else in the docs
+replaces reading it.
+
+In this repo:
+
+- `docs/ARCHITECTURE.md` — the on-disk format reference and a status map
+- `docs/LOCKING.md` — the coordination mechanisms and their rules
+- `docs/PERFORMANCE.md` — the per-block cost invariants and what guards each
+- `docs/TESTING.md`, `docs/LOGGING.md` — test strategy and logging
 
 ## Requirements
 
@@ -75,7 +123,7 @@ per contested claim, the same idea as VMFS's ATS — not over a network.
   That sets the boot-time default on every mount. To change it on a live
   mount without a reload, write `stale_secs=<n>` to
   `/proc/fs/cetrafs/<dev>/controls` (bounded 15-240 s, and at least 3x
-  `hb_interval_secs`). See the operations guide at cetrafs.com.
+  `hb_interval_secs`). See the operations guide at <https://cetrafs.com/docs/>.
 - The on-disk format is little-endian but portable across host byte order; tested on little-endian hosts (arm64, amd64).
 
 ## Build and test
@@ -176,7 +224,7 @@ mount -t cetrafs -o ro <dev> <mnt>     # mount as a read-only observer
 
 For VM images on a Proxmox cluster — shared storage, `cache=none`, and live
 migration with `-o nofilelock` — follow the runbook in
-the operations guide at cetrafs.com.
+the operations guide at <https://cetrafs.com/docs/>.
 
 ## On-disk layout
 
@@ -216,16 +264,6 @@ compare-and-swap on one 512-byte record. A device with no CAW can only be
 mounted by a single node, which the mount gate enforces. Node liveness is a
 heartbeat with a staleness timeout; a reclaimed node self-fences (every
 write fails `-EIO`) until it remounts.
-
-## Documentation
-
-- `docs/ARCHITECTURE.md` — the on-disk format reference and a status map
-- `docs/LOCKING.md` — the coordination mechanisms and their rules
-- `docs/PERFORMANCE.md` — the per-block cost invariants and what guards each
-- `docs/TESTING.md`, `docs/LOGGING.md` — test strategy and logging
-
-Deployment requirements, the operator runbook and the feature matrix live
-at **cetrafs.com**.
 
 ## License
 

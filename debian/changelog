@@ -1,3 +1,35 @@
+cetrafs (0.8.2) unstable; urgency=medium
+
+  * A default mount can now hand one file's exclusive lock back on
+    request and take it again: flock(LOCK_UN) suspends it and
+    flock(LOCK_EX) resumes it, with the file still open and still being
+    written. That gives a live-migration handoff window per file, for as
+    long as the handoff needs, instead of running a whole cluster with
+    `nofilelock`, which turns the lock off for every file on every node
+    permanently. On-disk format unchanged (0x0008); no reformat.
+
+  * Fixed: a peer's write was invisible to another node when it landed in
+    the same second as that node's cached timestamp. Two refresh paths
+    asked "is the record's mtime strictly newer than mine?", and mtime
+    has one-second granularity, so a write-and-close inside one second
+    was not "newer" -- the reader kept a stale size and read the peer's
+    data beyond it as a hole. Both now ask which NODE last published the
+    record, which is what they meant. Affects both mount modes.
+
+  * Fixed: setxattr, and a chmod or chown, from one node could rewrite
+    the whole inode record of a file another node was actively writing,
+    racing that writer's in-flight size and extent updates. Both asked
+    only whether a peer held the exclusive lock, so neither could see a
+    writer that holds none -- which is every writer under `nofilelock`.
+    They now refuse while any peer has the file open, as unlink, rename,
+    link and truncate already did.
+
+  * The two-node suite gained a lock-suspension scenario and I/O through
+    an already-open handle; its build precondition now compares the
+    loaded module's version, not only the module file on disk.
+
+ -- Massimo Cetra <mcetra@gmail.com>  Mon, 26 Oct 2026 19:07:15 +0000
+
 cetrafs (0.8.1) unstable; urgency=medium
 
   * mkfs: check the reads in its bitmap read-modify-write. Each reads a

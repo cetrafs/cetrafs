@@ -1,0 +1,17 @@
+# Blank issues are off so that reports arrive with the handful of facts
+# that make them actionable -- see bug_report.yml. Everything that is not
+# a bug has a better home than the issue tracker, listed below.
+blank_issues_enabled: false
+
+contact_links:
+  - name: Read the project status first
+    url: https://cetrafs.com/docs/intro/status/
+    about: What is verified, what is not, and what a trial should check. Worth reading before filing anything.
+
+  - name: Documentation
+    url: https://cetrafs.com/docs/
+    about: Install guides, tutorials, the operator runbook and the format reference.
+
+  - name: Ask a question, or suggest something
+    url: mailto:mcetra@gmail.com
+    about: Usage, configuration, troubleshooting, feature ideas — or just tell me how it went. Feedback is genuinely wanted.

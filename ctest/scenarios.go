@@ -1198,6 +1198,320 @@ func mountAllNoFileLock(clients []*Client) error {
 	return nil
 }
 
+// mountAllDefault mounts every slave with the DEFAULT options (the
+// automatic file lock ON). Callers unmount first, since the slave adopts
+// an already-live mount verbatim.
+func mountAllDefault(clients []*Client) error {
+	for _, c := range clients {
+		resp, err := c.Call("mount", MountArgs{})
+		if err := decodeResult(c.Name, resp, err, nil); err != nil {
+			return fmt.Errorf("%s: default mount: %w", c.Name, err)
+		}
+	}
+	return nil
+}
+
+// callOK issues one RPC and reduces it to an error, for the many calls in
+// a scenario whose result carries nothing but success or failure.
+func callOK(c *Client, op string, args any) error {
+	resp, err := c.Call(op, args)
+	return decodeResult(c.Name, resp, err, nil)
+}
+
+// RunLockSuspend is the cross-node proof for default-mount lock
+// suspension: flock(LOCK_UN) hands this node's AUTOMATIC lock back for one
+// file without closing it, flock(LOCK_EX) takes it again.
+//
+// Everything stays locked by default and a file is unlocked only on
+// request, for as long as the request lasts -- the safe inverse of
+// nofilelock, which removes the lock from every file on every node
+// permanently so that an occasional per-file handoff can happen.
+//
+// The assertions that cannot exist anywhere but here:
+//
+//   - A suspended writer must still be VISIBLE to a peer's destructive
+//     paths. On a default mount a writer publishes no bit in
+//     read_open_nodes (the lock marks it), so surrendering the lock
+//     without publishing one leaves the record byte-identical to a file
+//     nobody has open -- and unlink/rename/link/truncate/setxattr on the
+//     peer would destroy a file this node is mid-write on. Part 2.
+//   - A suspended node must stop trusting its cached metadata and data.
+//     The peer writes through the window; the holder reads through the
+//     SAME fd it had open before, and must see the peer's bytes. Part 4.
+//
+// Both carry negative controls driven by the kernel's test-only params:
+// with the fix disabled the hazard must actually reproduce, or the
+// assertion above it proves nothing.
+func RunLockSuspend(clients []*Client, path string) (bool, error) {
+	if len(clients) < 2 {
+		return false, fmt.Errorf("lock-suspend needs at least 2 clients")
+	}
+	if err := ensureUnmounted(clients); err != nil {
+		return false, fmt.Errorf("pre-unmount (to mount default): %w", err)
+	}
+	if err := mountAllDefault(clients); err != nil {
+		return false, err
+	}
+	defer func() {
+		if uerr := ensureUnmounted(clients); uerr != nil {
+			fmt.Printf("WARNING: cleanup unmount failed: %v\n", uerr)
+		}
+	}()
+
+	holder, peer := clients[0], clients[1]
+	ok := true
+	linkPath := path + ".hardlink"
+	renameSrc := path + ".rename-src"
+	fmt.Printf("=== lock suspension (default mount): %s surrenders %q; %s tests what it may do ===\n",
+		holder.Name, path, peer.Name)
+
+	// setParam sets a kernel test param on one node and returns a restore.
+	setParam := func(c *Client, name, value string) (func(), error) {
+		resp, err := c.Call("mod_param", ModParamArgs{Name: name, Value: value})
+		var r ModParamResult
+		if err := decodeResult(c.Name, resp, err, &r); err != nil {
+			return nil, fmt.Errorf("%s: mod_param %s: %w", c.Name, name, err)
+		}
+		prev := r.Prev
+		return func() {
+			_, _ = c.Call("mod_param", ModParamArgs{Name: name, Value: prev})
+		}, nil
+	}
+	// refused reports whether an op was rejected, and why if it was not.
+	refused := func(c *Client, op string, args any) (bool, string) {
+		resp, err := c.Call(op, args)
+		if err != nil {
+			return true, err.Error()
+		}
+		if resp.OK {
+			return false, ""
+		}
+		return true, resp.Error
+	}
+	openHold := func(c *Client, mode string, create bool) (uint64, string) {
+		resp, err := c.Call("open_hold", OpenHoldArgs{Path: path, Mode: mode, Create: create})
+		var r OpenHoldResult
+		if derr := decodeResult(c.Name, resp, err, &r); derr != nil {
+			return 0, derr.Error()
+		}
+		return r.Handle, ""
+	}
+
+	// ------------------------------------------------------------ part 1
+	// Baseline: the automatic lock is real, and surrendering it is what
+	// lets the peer in. Without this the rest could pass on a mount that
+	// was never locked in the first place.
+	hh, e := openHold(holder, "rdwr", true)
+	if e != "" {
+		return false, fmt.Errorf("%s: open+hold %s: %s", holder.Name, path, e)
+	}
+	defer func() { _, _ = holder.Call("close", CloseArgs{Handle: hh}) }()
+
+	var hw HeldIOResult
+	resp, err := holder.Call("write_held", HeldIOArgs{Handle: hh, Offset: 0, Size: 4096, Stamp: "HOLDER-"})
+	if err := decodeResult(holder.Name, resp, err, &hw); err != nil {
+		return false, fmt.Errorf("%s: seed write: %w", holder.Name, err)
+	}
+	// Warm this node's cache of its own content: the staleness this
+	// scenario hunts is only observable against a warm cache.
+	if _, derr := holder.Call("read_held", HeldIOArgs{Handle: hh, Offset: 0, Size: 4096}); derr != nil {
+		return false, fmt.Errorf("%s: warm read: %w", holder.Name, derr)
+	}
+
+	// A real source for the rename-over check below: renaming a file that
+	// does not exist fails with ENOENT, which would look like a refusal
+	// and assert nothing.
+	if rh, e := func() (uint64, string) {
+		resp, err := peer.Call("open_hold", OpenHoldArgs{Path: renameSrc, Mode: "rdwr", Create: true})
+		var r OpenHoldResult
+		if derr := decodeResult(peer.Name, resp, err, &r); derr != nil {
+			return 0, derr.Error()
+		}
+		return r.Handle, ""
+	}(); e != "" {
+		return false, fmt.Errorf("%s: create the rename source: %s", peer.Name, e)
+	} else {
+		_, _ = peer.Call("close", CloseArgs{Handle: rh})
+	}
+
+	if yes, _ := refused(peer, "open_hold", OpenHoldArgs{Path: path, Mode: "rdwr"}); yes {
+		check(&ok, "baseline: the automatic lock refuses the peer's open", true, "")
+	} else {
+		check(&ok, "baseline: the automatic lock refuses the peer's open", false,
+			"peer opened a locked file -- is this really a default mount?")
+	}
+
+	if err := callOK(holder, "unlock_file", UnlockFileArgs{Handle: hh}); err != nil {
+		return false, fmt.Errorf("%s: suspend (flock LOCK_UN): %w", holder.Name, err)
+	}
+	fmt.Printf("  %-12s SUSPENDED its automatic lock (fd still open, still writable)\n", holder.Name)
+
+	// ------------------------------------------------------------ part 2
+	// THE invariant. The lock is gone, so presence is the only thing left
+	// saying "a node is writing this". Every destructive path on the peer
+	// must honour it.
+	for _, tc := range []struct {
+		label string
+		op    string
+		args  any
+	}{
+		{"unlink", "unlink", UnlinkArgs{Path: path}},
+		{"truncate", "truncate", TruncateArgs{Path: path, Size: 0}},
+		{"rename-over", "rename", RenameArgs{Old: renameSrc, New: path}},
+		{"link", "link", LinkArgs{OldPath: path, NewPath: linkPath}},
+		{"setxattr", "xattr_set", XattrSetArgs{Path: path, Name: "user.ctest", Value: "x"}},
+	} {
+		yes, why := refused(peer, tc.op, tc.args)
+		check(&ok, "suspended: peer's "+tc.label+" is refused (a live writer is still published)", yes,
+			"it SUCCEEDED -- "+tc.label+" ran on a file another node is writing; "+why)
+	}
+
+	// ------------------------------------------------------------ part 3
+	// The handoff itself, as one reusable cycle: the peer opens through
+	// the window (claiming the lock), writes, closes; the holder takes
+	// the lock back and reads through the SAME fd it has held throughout.
+	//
+	// Reading through a held fd is the point. A path-based read would
+	// open(), and open() is itself a refresh boundary -- it would mask a
+	// frozen cache instead of exposing it.
+	//
+	// Note what is deliberately NOT asserted: a read taken DURING the
+	// window may still come from the surrendering node's page cache.
+	// That is the documented no-close-to-open behaviour (LOCKING.md), it
+	// predates suspension, and the handoff contract is that the node
+	// giving the lock away stops using the image. What must hold is that
+	// taking the lock BACK reconciles everything the peer changed.
+	//
+	// The peer writes at an offset the holder has NEVER touched, so the
+	// holder's post-resume read cannot be served from its page cache: it
+	// must map through the extent tree and respect the size, both of
+	// which only the resume reconcile brings up to date. A frozen holder
+	// reads zero bytes there.
+	const windowOff = 1 << 20
+	handoff := func(stamp string) (peerSum, holderSum string, err error) {
+		if err = callOK(holder, "unlock_file", UnlockFileArgs{Handle: hh}); err != nil {
+			return "", "", fmt.Errorf("%s: suspend: %w", holder.Name, err)
+		}
+		ph, e := openHold(peer, "rdwr", false)
+		if e != "" {
+			return "", "", fmt.Errorf("%s: open through the window: %s", peer.Name, e)
+		}
+		var pw HeldIOResult
+		resp, cerr := peer.Call("write_held", HeldIOArgs{Handle: ph, Offset: windowOff, Size: 4096, Stamp: stamp})
+		if derr := decodeResult(peer.Name, resp, cerr, &pw); derr != nil {
+			_, _ = peer.Call("close", CloseArgs{Handle: ph})
+			return "", "", fmt.Errorf("%s: write through the window: %w", peer.Name, derr)
+		}
+		// While the peer holds the claim, the holder must NOT get it back.
+		if yes, _ := refused(holder, "lock_file", LockFileArgs{Handle: hh}); yes {
+			check(&ok, "resume is refused while the peer holds the lock", true, "")
+		} else {
+			check(&ok, "resume is refused while the peer holds the lock", false,
+				"both nodes believe they hold the exclusive lock")
+		}
+		if err = callOK(peer, "close", CloseArgs{Handle: ph}); err != nil {
+			return "", "", fmt.Errorf("%s: close: %w", peer.Name, err)
+		}
+		if err = callOK(holder, "lock_file", LockFileArgs{Handle: hh}); err != nil {
+			return "", "", fmt.Errorf("%s: resume after the peer let go: %w", holder.Name, err)
+		}
+		var hr HeldIOResult
+		resp, cerr = holder.Call("read_held", HeldIOArgs{Handle: hh, Offset: windowOff, Size: 4096})
+		if derr := decodeResult(holder.Name, resp, cerr, &hr); derr != nil {
+			return "", "", fmt.Errorf("%s: post-resume read: %w", holder.Name, derr)
+		}
+		if hr.Bytes == 0 {
+			// Nothing there as far as this node is concerned: its size
+			// and extent tree are still the pre-window ones.
+			return pw.Checksum, "<short-read:stale-metadata>", nil
+		}
+		return pw.Checksum, hr.Checksum, nil
+	}
+
+	peerSum, holderSum, herr := handoff("PEER-")
+	if herr != nil {
+		return false, herr
+	}
+	check(&ok, "the peer can open and claim through the window, and release it back", true, "")
+	if holderSum == peerSum {
+		check(&ok, "after resume the holder reads the PEER's bytes through its held fd", true, "")
+	} else if holderSum == hw.Checksum {
+		check(&ok, "after resume the holder reads the PEER's bytes through its held fd", false,
+			"it served its own pre-window content -- resume did not reconcile; a VM would map through a frozen tree")
+	} else {
+		check(&ok, "after resume the holder reads the PEER's bytes through its held fd", false,
+			"read matched neither node's content: "+holderSum)
+	}
+	if yes, _ := refused(peer, "open_hold", OpenHoldArgs{Path: path, Mode: "rdwr"}); yes {
+		check(&ok, "after resume the peer is locked out again", true, "")
+	} else {
+		check(&ok, "after resume the peer is locked out again", false, "the lock was not actually re-claimed")
+	}
+
+	// ------------------------------------------------------------ part 4
+	// NEGATIVE CONTROL for part 3. With the reconcile disabled the holder
+	// must serve its own stale pre-window bytes. If it does not, part 3
+	// was passing for some reason other than the reconcile.
+	restoreCache, err := setParam(holder, "lock_suspend_trust_cache", "1")
+	if err != nil {
+		return false, err
+	}
+	stalePeerSum, staleHolderSum, herr := handoff("STALE-")
+	restoreCache()
+	if herr != nil {
+		return false, herr
+	}
+	if staleHolderSum == stalePeerSum {
+		check(&ok, "negative control: with the reconcile off the holder still reads fresh", false,
+			"the hazard did NOT reproduce -- part 3 proves nothing about the reconcile")
+	} else {
+		check(&ok, "negative control: with the reconcile off the holder reads a frozen cache "+
+			"(so part 3 discriminates)", true, "")
+	}
+	// Re-sync the holder for anything downstream: resume already left the
+	// lock ours, so one more handoff with the fix back on restores it.
+	if _, _, herr := handoff("FRESH-"); herr != nil {
+		return false, herr
+	}
+
+	// ------------------------------------------------------------ part 5
+	// NEGATIVE CONTROL for part 2. With the presence publish disabled the
+	// suspended file must look unused to the peer, and the unlink must go
+	// through. If it does not, part 2 was passing for some other reason.
+	restore, err := setParam(holder, "lock_suspend_skip_publish", "1")
+	if err != nil {
+		return false, err
+	}
+	if err := callOK(holder, "unlock_file", UnlockFileArgs{Handle: hh}); err != nil {
+		restore()
+		return false, fmt.Errorf("%s: suspend for the negative control: %w", holder.Name, err)
+	}
+	yes, _ := refused(peer, "unlink", UnlinkArgs{Path: path})
+	restore()
+	if yes {
+		check(&ok, "negative control: without the publish the peer's unlink still fails", false,
+			"the hazard did NOT reproduce -- part 2 asserts something that is true for another reason")
+	} else {
+		check(&ok, "negative control: without the publish the peer's unlink destroys a live file "+
+			"(so part 2 discriminates)", true, "")
+	}
+
+	// The control deleted the file; put it back so a re-run starts clean.
+	_, _ = holder.Call("close", CloseArgs{Handle: hh})
+	if h2, e := openHold(holder, "rdwr", true); e == "" {
+		_, _ = holder.Call("close", CloseArgs{Handle: h2})
+	}
+	_, _ = peer.Call("unlink", UnlinkArgs{Path: linkPath})
+	_, _ = peer.Call("unlink", UnlinkArgs{Path: renameSrc})
+
+	if ok {
+		fmt.Printf("PASS: lock suspension: the window opens, the peer is seen, the cache goes cold\n")
+	} else {
+		fmt.Printf("FAIL: lock suspension: see failed checks above\n")
+	}
+	return ok, nil
+}
+
 // RunExplicitLock exercises the userspace-driven whole-file lock
 // whole-file lock (flock(2)) under nofilelock -- the real cross-node proof
 // that this feature hands exclusion back to userspace on demand.
@@ -2846,6 +3160,7 @@ func RunReleaseSuite(clients []*Client, cfg masterConfig) (bool, error) {
 			return RunConcurrentMkdirStorm(clients, cfg.testDir)
 		}},
 		{"explicit-lock", func() (bool, error) { return RunExplicitLock(clients, cfg.lockPath) }},
+		{"lock-suspend", func() (bool, error) { return RunLockSuspend(clients, cfg.lockPath) }},
 		{"cluster-lock-mode", func() (bool, error) { return RunClusterLockMode(clients) }},
 	}
 
@@ -3171,7 +3486,8 @@ func requireSameModuleBuild(clients []*Client) error {
 		if err := decodeResult(c.Name, resp, err, &res); err != nil {
 			return fmt.Errorf("%s: module_info: %w", c.Name, err)
 		}
-		fmt.Printf("  %-10s loaded=%v build_id=%s ko_sha256=%s\n", c.Name, res.Loaded, res.BuildID, res.KoSHA256)
+		fmt.Printf("  %-10s loaded=%v version=%s build_id=%s ko_sha256=%s\n",
+			c.Name, res.Loaded, res.Version, res.BuildID, res.KoSHA256)
 
 		switch {
 		case !res.Loaded:
@@ -3181,8 +3497,19 @@ func requireSameModuleBuild(clients []*Client) error {
 			// would let exactly the case this gate exists for through.
 			problems = append(problems,
 				fmt.Sprintf("%s reports no build-id, so its build cannot be compared", c.Name))
+		case res.Version == "":
+			problems = append(problems,
+				fmt.Sprintf("%s reports no module version, so what it is RUNNING cannot be compared", c.Name))
 		default:
-			builds[res.BuildID] = append(builds[res.BuildID], c.Name)
+			// Keyed on the LOADED module's version as well as the ELF
+			// build-id. The build-id alone proved insufficient: it
+			// compared equal across two nodes running different code,
+			// and ko_sha256 describes the FILE, which a node that was
+			// never reloaded is not running. The version string carries
+			// a hash of the source actually built, so a stale load
+			// shows up here as a mismatch instead of a green run whose
+			// failures make no sense.
+			builds[res.Version+" "+res.BuildID] = append(builds[res.Version+" "+res.BuildID], c.Name)
 		}
 	}
 
@@ -3197,7 +3524,7 @@ func requireSameModuleBuild(clients []*Client) error {
 		msg.WriteString("    " + p + "\n")
 	}
 	for id, names := range builds {
-		msg.WriteString(fmt.Sprintf("    build_id=%s -> %v\n", id, names))
+		msg.WriteString(fmt.Sprintf("    build=%s -> %v\n", id, names))
 	}
 	msg.WriteString("  rebuild and reload the module on every node, then re-run")
 	return fmt.Errorf("%s", msg.String())
@@ -5858,11 +6185,31 @@ func RunHypervisorStorm(clients []*Client, baseDir string, dur time.Duration, se
 				if r, e := victim.Call("link_down", nil); decodeResult(victim.Name, r, e, nil) == nil {
 					injectedDown.Store(victim.Name)
 					time.Sleep(20 * time.Second)
-					injectedDown.Store("")
 					if r2, e2 := victim.Call("link_up", nil); decodeResult(victim.Name, r2, e2, nil) != nil {
 						note("%s: link_up failed -- the node cannot rejoin", victim.Name)
 					}
 					fmt.Printf("    [storm] %s's device restored\n", victim.Name)
+					// The mark stays until this node can actually SERVE
+					// I/O again, which is not the same moment its cable
+					// comes back: the reads that were in flight have
+					// already failed, the buffer cache is full of errors
+					// and the mount keeps answering EIO until it is
+					// remounted (the quiesce below does that, and clears
+					// the mark then).
+					//
+					// This used to clear the mark one line EARLIER than
+					// link_up -- before the device was even restored --
+					// so the whole recovery tail was scored as
+					// filesystem faults. That is measuring the
+					// injection, not the filesystem.
+					if waited := stormWaitHealthy(victim, 30*time.Second); waited >= 0 {
+						injectedDown.Store("")
+						fmt.Printf("    [storm] %s serving I/O again after %s\n",
+							victim.Name, waited.Round(time.Second))
+					} else {
+						fmt.Printf("    [storm] %s still cannot serve I/O -- "+
+							"stays excused until the next remount\n", victim.Name)
+					}
 				}
 				quiesce.RUnlock()
 				time.Sleep(90 * time.Second)
@@ -5959,6 +6306,9 @@ func RunHypervisorStorm(clients []*Client, baseDir string, dur time.Duration, se
 				fmt.Printf("    [storm] remount failed: %v\n", err)
 				stopped.Store(true)
 			} else {
+				// Everyone is freshly mounted, so whatever the injected
+				// node was still failing on is over: end the window.
+				injectedDown.Store("")
 				// Cold: every cache was just dropped, so this is the
 				// device's own answer. It must match what the warm
 				// check above reported.
@@ -6032,6 +6382,22 @@ func RunHypervisorStorm(clients []*Client, baseDir string, dur time.Duration, se
 //
 // Every case states what MUST hold. "It did not crash" is not an
 // outcome; each either names the invariant it broke or passes silently.
+// stormWaitHealthy polls one cheap operation until the node answers it,
+// so an injection window can end when the node is USABLE again rather
+// than when its device was notionally restored. Returns how long that
+// took, or -1 if it never answered inside the budget -- which is left to
+// the caller to report, never silently excused.
+func stormWaitHealthy(c *Client, budget time.Duration) time.Duration {
+	start := time.Now()
+	for time.Since(start) < budget {
+		if r, e := c.Call("statfs", struct{}{}); e == nil && r.OK {
+			return time.Since(start)
+		}
+		time.Sleep(time.Second)
+	}
+	return -1
+}
+
 // injected reports whether a node's device is currently pulled. A node
 // that cannot reach the device answers every question with an error, and
 // an error is NOT evidence of absence -- without this the checks below

@@ -211,6 +211,25 @@ type ReadAtResult struct {
 	Checksum  string `json:"checksum"`
 }
 
+// HeldIOArgs: read or write through an ALREADY-OPEN handle, never through
+// a fresh open. Load-bearing for anything about cache freshness: an open()
+// is itself a refresh boundary (cetrafs_lock_open's mtime-gated refresh and
+// its tree reconcile), so a path-based read cannot tell a correctly
+// invalidated cache from one that was simply re-read on open. The lock
+// suspension scenario needs reads that go through the SAME fd that was
+// open before a peer touched the file.
+type HeldIOArgs struct {
+	Handle uint64 `json:"handle"`
+	Offset int64  `json:"offset"`
+	Size   int    `json:"size"`
+	Stamp  string `json:"stamp,omitempty"` // write only: repeated to fill Size
+}
+
+type HeldIOResult struct {
+	Bytes    int    `json:"bytes"`
+	Checksum string `json:"checksum"`
+}
+
 // OpenHoldArgs: open the file and keep the fd open on the slave side,
 // tracked by Handle, until a later "close" call -- needed for any
 // scenario where one node must hold a file open while another node tries
@@ -635,9 +654,16 @@ type ModuleInfoResult struct {
 	// point of this precondition is knowing WHICH build each node is
 	// running -- a node that auto-loaded a different module than the
 	// operator expected must be visible, not convenient.
-	LoadedBy  string `json:"loaded_by,omitempty"`
-	LoadErr   string `json:"load_err,omitempty"`
-	BuildID   string `json:"build_id,omitempty"`
+	LoadedBy string `json:"loaded_by,omitempty"`
+	LoadErr  string `json:"load_err,omitempty"`
+	BuildID  string `json:"build_id,omitempty"`
+	// The LOADED module's MODULE_VERSION, read from
+	// /sys/module/cetrafs/version. It embeds a hash of the source it was
+	// built from, and unlike KoSHA256 it describes what is actually
+	// RUNNING -- a node whose .ko file was replaced but never reloaded
+	// reports a new file hash and an old version, which is precisely the
+	// case that once let a stale module through this gate.
+	Version   string `json:"version,omitempty"`
 	KoPath    string `json:"ko_path,omitempty"`
 	KoSHA256  string `json:"ko_sha256,omitempty"`
 	KoModTime string `json:"ko_mod_time,omitempty"`

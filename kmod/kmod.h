@@ -523,6 +523,11 @@ int cetrafs_lock_foreign_user_exists(struct super_block *sb,
                                      bool *out_reader);
 bool cetrafs_lock_held_for_write_locally(struct inode *inode);
 bool cetrafs_lock_identity_cache_trusted(struct inode *inode);
+/* lock.c: default-mount lock suspension counters (procfs `info`). */
+u64 cetrafs_lock_suspend_count(void);
+u64 cetrafs_lock_resume_count(void);
+/* file.c: the close-equivalent durability boundary for a file staying open. */
+int cetrafs_file_make_durable(struct file *file);
 bool cetrafs_inode_foreign_opener_cached(struct inode *inode);
 void cetrafs_inode_set_generation(struct inode *inode, u64 gen);
 
