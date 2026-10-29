@@ -1,3 +1,23 @@
+cetrafs (0.9.1) unstable; urgency=medium
+
+  * Fixed: on a device whose atomic COMPARE AND WRITE unit is 4 KiB --
+    a 4Kn target -- every publish of a file's own metadata failed, so
+    fsync, fdatasync, writeback and closing a file all returned
+    EINVAL. Under qemu it showed as the first flush after a write
+    failing, while a second flush appeared to succeed because nothing
+    was left to write. Devices with 512-byte logical blocks were never
+    affected. No volume was damaged by it: the publish failed rather
+    than writing anything wrong. Reported, diagnosed and fixed by
+    gyptazy.
+
+  * The test gate can now exercise the wide-atomic-unit paths that only
+    such a device takes. Nothing here could reach them before -- the
+    test array has 512-byte logical blocks, and the loop devices CI
+    runs on have no COMPARE AND WRITE at all -- which is why the fault
+    above reached a release.
+
+ -- Massimo Cetra <mcetra@gmail.com>  Thu, 29 Oct 2026 23:05:44 +0000
+
 cetrafs (0.9) unstable; urgency=medium
 
   * A volume can now be grown in place into space the device already
