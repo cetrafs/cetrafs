@@ -862,9 +862,39 @@ int cetrafs_cas_record_seeded(struct super_block *sb,
     return cetrafs_cas_region_seeded_impl(sb, fs_lba, 0, seed, seed_len, mutate, priv, /*sole_region=*/true);
 }
 
+/* On a device whose atomic unit is wider than the namespace sector (4Kn:
+ * one CAS region = the whole record block), the file-domain sector is
+ * no region of its own -- it lives at CETRAFS_INODE_FD_OFF inside region
+ * 0. Hand the mutator exactly that slice, so it sees the same
+ * 512-byte image it gets on a 512-logical device. */
+struct cetrafs_cas_fd_slice_ctx {
+    cetrafs_cas_fn mutate;
+    void *priv;
+};
+
+static int cetrafs_cas_fd_slice_mutate(void *image, unsigned int len, void *priv)
+{
+    struct cetrafs_cas_fd_slice_ctx *s = priv;
+
+    if (len < CETRAFS_INODE_FD_OFF + CETRAFS_INODE_FD_BYTES)
+        return -EINVAL;
+    return s->mutate((u8 *) image + CETRAFS_INODE_FD_OFF, CETRAFS_INODE_FD_BYTES, s->priv);
+}
+
 /* The record's FILE-domain sector (region 1, bytes [512,1024) of the
  * record block) -- the half the file data path publishes. Same
- * keep-and-patch cache treatment as the namespace sector. */
+ * keep-and-patch cache treatment as the namespace sector.
+ *
+ * "Region 1" only exists while a CAS region is CETRAFS_INODE_FD_OFF
+ * bytes. On a 4Kn device with CAW the region is the whole block, region
+ * 1 would start past its end, and every file-domain publish -- fsync,
+ * fdatasync, writeback, close -- failed -EINVAL in the impl's bounds
+ * check (seen as qemu's first flush after a write failing while the
+ * second, with nothing left dirty, "succeeded"). There the swap goes
+ * through region 0 with the mutator confined to the fd slice: a peer's
+ * concurrent namespace change then miscompares and retries instead of
+ * being clobbered. The caller's seed is an fd-sector image, not a block
+ * image, so it is dropped and the first attempt reads fresh. */
 int cetrafs_cas_record_fd_seeded(struct super_block *sb,
                                  u64 fs_lba,
                                  const void *seed,
@@ -872,6 +902,12 @@ int cetrafs_cas_record_fd_seeded(struct super_block *sb,
                                  cetrafs_cas_fn mutate,
                                  void *priv)
 {
+    if (cetrafs_cas_region_size(sb) > CETRAFS_INODE_FD_OFF) {
+        struct cetrafs_cas_fd_slice_ctx s = {.mutate = mutate, .priv = priv};
+
+        return cetrafs_cas_region_seeded_impl(sb, fs_lba, 0, NULL, 0, cetrafs_cas_fd_slice_mutate, &s,
+                                              /*sole_region=*/true);
+    }
     return cetrafs_cas_region_seeded_impl(sb, fs_lba, 1, seed, seed_len, mutate, priv, /*sole_region=*/true);
 }
 
