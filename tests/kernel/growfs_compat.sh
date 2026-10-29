@@ -44,12 +44,22 @@ DUMP="$(ct_tmp growcompatdump)"
 
 sbver() { "$POKE" "$1" > "$DUMP" 2>/dev/null || true; sed -n 's/^version=//p' "$DUMP" | head -1; }
 
-# The PREVIOUS RELEASE means the last release tag, not HEAD. HEAD moves
-# the moment any work lands on the branch, and when it does this suite
-# quietly starts testing this build against itself -- which it did,
-# until the format-version assertion below caught it.
-PREV="$(git -C "$ROOT" describe --tags --abbrev=0 2>/dev/null || true)"
-[ -n "$PREV" ] || { skip "no release tag to compare against"; ct_exit; }
+# The PREVIOUS RELEASE means the newest tag that is NOT the version this
+# tree is, which is the version debian/changelog names (the single source
+# of it -- see docs/internal/RELEASE.md).
+#
+# `git describe --abbrev=0` was wrong in both directions. Before a
+# release it names the last tag, which is right by accident; the moment
+# that release is TAGGED it names the tree's own version, and the suite
+# starts comparing this build against itself. That is exactly what
+# happened when 0.9 was tagged: the "old" mkfs was the current one, and
+# the -s check below -- there to prove the old binary really is old --
+# caught it and failed rather than letting the suite pass vacuously.
+CURVER="$(sed -n '1s/^cetrafs (\([^)]*\)).*/\1/p' "$ROOT/debian/changelog")"
+# Release tags only: publish-tag.sh keeps the published ones under
+# public/<version>, which sort first and are the same code anyway.
+PREV="$(git -C "$ROOT" tag --sort=-v:refname 2>/dev/null | grep -v / | grep -vx "$CURVER" | head -1 || true)"
+[ -n "$PREV" ] || { skip "no earlier release tag to compare against (this tree is $CURVER)"; ct_exit; }
 log "rebuilding mkfs.cetra from $PREV (the previous release)"
 mkdir -p "$OLD/src"
 ok=1

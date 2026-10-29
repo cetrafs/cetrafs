@@ -560,11 +560,51 @@ static void cetrafs_cas_flush_block(struct super_block *sb, u64 fs_lba)
 /* Size of one CAS region: the device's atomic unit where there is one,
  * else the format's hot-sector rule. A filesystem block holds
  * CETRAFS_BLOCK_SIZE / this many regions, indexed from 0. */
+/*
+ * Test-only: pretend the CAS region is this wide.
+ *
+ * The region is the device's atomic unit, so on a 4Kn device it is the
+ * whole 4096-byte record block and there is exactly ONE region -- the
+ * file-domain sector is no region of its own, it is a slice inside
+ * region 0. Every path derives its region count from
+ * cetrafs_cas_region_size() and follows; the one that did not was
+ * cetrafs_cas_record_fd_seeded(), whose region index was the constant 1.
+ * Past the end of the block, so the bounds check refused it and every
+ * file-domain publish -- fsync, fdatasync, writeback, close -- returned
+ * -EINVAL.
+ *
+ * None of our own hardware can show that. The test LUN is 512-byte
+ * logical, and a loop device has no CAW at all, so the region is 512
+ * either way and region 1 always exists. The bug was reported from a
+ * 4Kn target and is invisible to the whole gate without this knob.
+ *
+ * Honoured ONLY where there is no CAW. With a real CAW the region size
+ * is a property of the device: the swap is issued as one logical block
+ * at dev_lba, so lying about its width would send a 4096-byte image to
+ * a 512-byte swap. Without CAW the width is purely a software notion --
+ * which buffer sizes, which offset, which bounds -- and that is exactly
+ * the part under test.
+ */
+static unsigned int cetrafs_cas_region_force;
+module_param_named(cas_region_force, cetrafs_cas_region_force, uint, 0644);
+MODULE_PARM_DESC(cas_region_force,
+                 "TEST ONLY: CAS region width to assume on a device with no CAW (power of two, "
+                 "512..4096; 0 = the format's hot-sector rule). Reaches the wide-region paths a "
+                 "4Kn device takes.");
+
 unsigned int cetrafs_cas_region_size(struct super_block *sb)
 {
     const struct cetrafs_caw_info *caw = cetrafs_sb_caw(sb);
+    unsigned int forced = READ_ONCE(cetrafs_cas_region_force);
 
-    return cetrafs_sb_caw_available(sb) ? caw->logical_block_size : CETRAFS_HOT_SECTOR;
+    if (cetrafs_sb_caw_available(sb))
+        return caw->logical_block_size;
+    /* A width that is not a power of two, or does not divide the block,
+     * would leave a partial region at the end of every block -- refuse
+     * it rather than model something no device can be. */
+    if (forced >= CETRAFS_HOT_SECTOR && forced <= CETRAFS_BLOCK_SIZE && is_power_of_2(forced))
+        return forced;
+    return CETRAFS_HOT_SECTOR;
 }
 
 /*
@@ -862,9 +902,39 @@ int cetrafs_cas_record_seeded(struct super_block *sb,
     return cetrafs_cas_region_seeded_impl(sb, fs_lba, 0, seed, seed_len, mutate, priv, /*sole_region=*/true);
 }
 
+/* On a device whose atomic unit is wider than the namespace sector (4Kn:
+ * one CAS region = the whole record block), the file-domain sector is
+ * no region of its own -- it lives at CETRAFS_INODE_FD_OFF inside region
+ * 0. Hand the mutator exactly that slice, so it sees the same
+ * 512-byte image it gets on a 512-logical device. */
+struct cetrafs_cas_fd_slice_ctx {
+    cetrafs_cas_fn mutate;
+    void *priv;
+};
+
+static int cetrafs_cas_fd_slice_mutate(void *image, unsigned int len, void *priv)
+{
+    struct cetrafs_cas_fd_slice_ctx *s = priv;
+
+    if (len < CETRAFS_INODE_FD_OFF + CETRAFS_INODE_FD_BYTES)
+        return -EINVAL;
+    return s->mutate((u8 *) image + CETRAFS_INODE_FD_OFF, CETRAFS_INODE_FD_BYTES, s->priv);
+}
+
 /* The record's FILE-domain sector (region 1, bytes [512,1024) of the
  * record block) -- the half the file data path publishes. Same
- * keep-and-patch cache treatment as the namespace sector. */
+ * keep-and-patch cache treatment as the namespace sector.
+ *
+ * "Region 1" only exists while a CAS region is CETRAFS_INODE_FD_OFF
+ * bytes. On a 4Kn device with CAW the region is the whole block, region
+ * 1 would start past its end, and every file-domain publish -- fsync,
+ * fdatasync, writeback, close -- failed -EINVAL in the impl's bounds
+ * check (seen as qemu's first flush after a write failing while the
+ * second, with nothing left dirty, "succeeded"). There the swap goes
+ * through region 0 with the mutator confined to the fd slice: a peer's
+ * concurrent namespace change then miscompares and retries instead of
+ * being clobbered. The caller's seed is an fd-sector image, not a block
+ * image, so it is dropped and the first attempt reads fresh. */
 int cetrafs_cas_record_fd_seeded(struct super_block *sb,
                                  u64 fs_lba,
                                  const void *seed,
@@ -872,6 +942,12 @@ int cetrafs_cas_record_fd_seeded(struct super_block *sb,
                                  cetrafs_cas_fn mutate,
                                  void *priv)
 {
+    if (cetrafs_cas_region_size(sb) > CETRAFS_INODE_FD_OFF) {
+        struct cetrafs_cas_fd_slice_ctx s = {.mutate = mutate, .priv = priv};
+
+        return cetrafs_cas_region_seeded_impl(sb, fs_lba, 0, NULL, 0, cetrafs_cas_fd_slice_mutate, &s,
+                                              /*sole_region=*/true);
+    }
     return cetrafs_cas_region_seeded_impl(sb, fs_lba, 1, seed, seed_len, mutate, priv, /*sole_region=*/true);
 }
 

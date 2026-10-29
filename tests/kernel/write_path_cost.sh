@@ -135,8 +135,23 @@ DD=$((D1 - D0))
     fail "cost: no drain ran while allocating -- the hook is not on the allocation path"
 
 # Negative control: with the rate limit pinned high, the same workload
-# must drive NONE. Without this the check above would pass against code
-# that drained unconditionally from somewhere else entirely.
+# must stop driving drains. Without this the check above would pass
+# against code that drained unconditionally from somewhere else.
+#
+# "Stop" rather than "none", and the difference is the heartbeat: its
+# tick drains unconditionally (heartbeat.c), deliberately -- the rate
+# limit exists to keep the drain off the PER-BLOCK path, and a tick is
+# not that path. hb_interval_secs is already pinned to its maximum
+# above, but a tick can still land inside this window, and then it
+# contributes exactly one drain however high the limit is pinned. The
+# first version asserted zero and so failed whenever the window happened
+# to contain a tick -- rarely, and therefore confusingly.
+#
+# One is still a decisive verdict: the fault this guards against drains
+# once per ALLOCATION, which the phase above measured at $DD for exactly
+# this workload. One against that is not a weaker control, it is the
+# same control with the heartbeat's single legitimate drain accounted
+# for instead of raced.
 ct_param_set pf_drain_min_ms 600000
 D0="$(c pf_drains)"
 dd if=/dev/zero of="$MNT/drain2.bin" bs=1M count=100 oflag=direct status=none
@@ -145,9 +160,9 @@ D1="$(c pf_drains)"
 ct_param_set pf_drain_min_ms 500
 ct_param_set hb_interval_secs 15
 DD2=$((D1 - D0))
-[ "$DD2" -eq 0 ] &&
-    pass "cost: negative control -- rate limit pinned high drove $DD2 drains" ||
-    fail "cost: rate limit ignored: $DD2 drains with the gap pinned to 10 minutes"
+[ "$DD2" -le 1 ] &&
+    pass "cost: negative control -- rate limit pinned high drove $DD2 drain(s), against $DD unpinned" ||
+    fail "cost: rate limit ignored: $DD2 drains with the gap pinned to 10 minutes (a heartbeat tick can account for one, not $DD2)"
 
 # ---------------------------------------------------------------- 6
 # A middle split needs two free slots. With one, the code released the
