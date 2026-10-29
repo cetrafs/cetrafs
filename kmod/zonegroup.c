@@ -50,7 +50,7 @@
  * byte struct onto the stack to zero it in place (it is a full block;
  * see alloc.c's comment on why that copy would be unsafe). Read-only.
  *
- * v0x0009 splits the record into an independently-checksummed HOT sector
+ * v0x0008 splits the record into an independently-checksummed HOT sector
  * (the CAS unit: ownership, free-block aggregate, lease stamps) and a
  * COLD remainder (mkfs-time BG geometry) -- see cetrafs.h. Two halves,
  * two checksums, so an atomic compare-and-swap of the hot sector alone
@@ -149,7 +149,7 @@ static int cetrafs_read_zg(struct super_block *sb, u32 zg_id, cetrafs_zone_group
 
 /* ---- ZG ownership as an atomic compare-and-swap --------------------
  *
- * owner_node_id lives in the ZG record's HOT sector (v0x0009), so a
+ * owner_node_id lives in the ZG record's HOT sector (v0x0008), so a
  * claim or release is one CAS of that 512-byte region --
  * replacing the PR-mutexed read / decide / write / read-back-to-check
  * dance. The swap only lands if the sector is byte-for-byte what the
@@ -244,9 +244,8 @@ int cetrafs_zg_get_info(struct super_block *sb, u32 zg_id, struct cetrafs_zg_inf
     ret = cetrafs_read_zg(sb, zg_id, zg);
     if (!ret) {
         out->owner_node_id = le16_to_cpu(zg->owner_node_id);
-        out->first_bg_id = le32_to_cpu(zg->first_bg_id);
-        out->bg_count = le32_to_cpu(zg->bg_count);
         out->free_data_blocks = le64_to_cpu(zg->free_data_blocks);
+        out->pool_free_blocks = le64_to_cpu(zg->pool_free_blocks);
     }
 
     kfree(zg);
@@ -370,6 +369,54 @@ static int cetrafs_zg_delta_mutate(void *image, unsigned int len, void *priv)
  * re-applies the delta to the new image -- so a counter update can never
  * republish stale ownership.
  */
+/* ---- unowned-BG pool shard ------------------------------------------
+ * pool_free_blocks counts the capacity of UNOWNED Block Groups sharded
+ * to this ZG record (shard key: bg_id %% zone_group_count). Unlike the
+ * free aggregate above, a pool adjustment is NOT gated on owning the
+ * ZG: the shard is a geometric bucket, and whoever wins the BG
+ * descriptor's claim/release CAS owns the matching pool update -- that
+ * CAS is what serializes adjusters, this one only has to apply the
+ * delta atomically. */
+struct cetrafs_zg_pool_ctx {
+    s64 delta;
+};
+
+static int cetrafs_zg_pool_mutate(void *image, unsigned int len, void *priv)
+{
+    struct cetrafs_zg_pool_ctx *ctx = priv;
+    cetrafs_zone_group_t *zg = (cetrafs_zone_group_t *) image;
+    s64 cur = (s64) le64_to_cpu(zg->pool_free_blocks);
+    s64 want = cur + ctx->delta;
+
+    (void) len;
+
+    if (!ctx->delta)
+        return 1; /* nothing to do */
+    if (want < 0) {
+        /* A count, never negative. Divergence is fsck's to report;
+         * refuse rather than write a wrapped u64. */
+        pr_err("ZG pool delta %lld would take the shard below zero (%lld)\n", (long long) ctx->delta,
+               (long long) cur);
+        return -EINVAL;
+    }
+    zg->pool_free_blocks = cpu_to_le64((u64) want);
+    zg->hot_checksum = cpu_to_le64(0);
+    zg->hot_checksum = cpu_to_le64((u64) cetrafs_zg_hot_crc(image));
+    return 0;
+}
+
+int cetrafs_zg_adjust_pool_blocks(struct super_block *sb, u32 bg_id, s64 delta)
+{
+    const cetrafs_superblock_t *raw_sb = cetrafs_sb_raw(sb);
+    struct cetrafs_zg_pool_ctx ctx = {.delta = delta};
+    u32 zg_id;
+
+    if (!raw_sb)
+        return -EINVAL;
+    zg_id = bg_id % le32_to_cpu(raw_sb->zone_group_count);
+    return cetrafs_cas_record(sb, le64_to_cpu(raw_sb->zg_table_start) + zg_id, cetrafs_zg_pool_mutate, &ctx);
+}
+
 int cetrafs_zg_apply_free_delta(struct super_block *sb, u32 zg_id, s64 delta)
 {
     const cetrafs_superblock_t *raw_sb = cetrafs_sb_raw(sb);
@@ -434,7 +481,7 @@ int cetrafs_compute_max_file_size(struct super_block *sb, loff_t *out_max)
 {
     const cetrafs_superblock_t *raw_sb = cetrafs_sb_raw(sb);
     u64 sum = 0, max_blocks;
-    u32 zg_count, z;
+    u32 zg_count, b;
     int ret;
 
     if (!raw_sb)
@@ -449,23 +496,23 @@ int cetrafs_compute_max_file_size(struct super_block *sb, loff_t *out_max)
         return 0;
     }
 
-    for (z = 0; z < zg_count; z++) {
-        struct cetrafs_zg_info info;
-        u32 b;
+    /*
+     * The total capacity of the volume, which is the sum over every
+     * Block Group -- it does not depend on who owns what. This used to
+     * walk Zone Groups and sum each one's contiguous range, which
+     * reached exactly the same Block Groups only because the ranges
+     * tile them. One flat pass says the same thing without needing
+     * that to be true (docs/internal/BG-OWNERSHIP-DESIGN.md), and
+     * without a Zone Group record read per Zone Group.
+     */
+    for (b = 0; b < le32_to_cpu(raw_sb->block_group_count); b++) {
+        u64 bg_total, bg_free;
 
-        ret = cetrafs_zg_get_info(sb, z, &info);
+        ret = cetrafs_bg_data_block_stats(sb, b, &bg_total, &bg_free);
         if (ret)
             return ret;
 
-        for (b = info.first_bg_id; b < info.first_bg_id + info.bg_count; b++) {
-            u64 bg_total, bg_free;
-
-            ret = cetrafs_bg_data_block_stats(sb, b, &bg_total, &bg_free);
-            if (ret)
-                return ret;
-
-            sum += bg_total;
-        }
+        sum += bg_total;
     }
 
     /* Clamp in block units before converting to bytes, to avoid
@@ -554,29 +601,59 @@ int cetrafs_compute_max_file_size(struct super_block *sb, loff_t *out_max)
  * The ZG's hot sector holds owner_node_id, maintained by CAS, and P1
  * showed that a cached update of any field in that block republishes
  * the ownership bytes as of its own read, silently reverting a peer's
- * steal with a correctly recomputed checksum. The accrued in-memory
- * delta for this ZG is zero here by construction (we have not allocated
- * from a ZG we have only just acquired), so the CAS sets it to truth.
+ * steal with a correctly recomputed checksum.
+ *
+ * The accrued in-memory delta for this ZG was once described here as
+ * "zero by construction (we have not allocated from a ZG we have only
+ * just acquired)". That is false for a ZG this node owned BEFORE: lost
+ * to a peer (or given back) and acquired again, it comes back with
+ * whatever this node accrued the first time around and never flushed --
+ * and a long-lived writer holds its delta for as long as it stays open,
+ * which for a VM image is days. Those deltas describe effects the
+ * recount below has just read out of the bitmaps, so they are DROPPED
+ * here rather than applied on top of it. The BG half of the same
+ * discard lives in cetrafs_sb_set_bg_epoch().
  */
-static int cetrafs_zg_reconcile_free_counts(struct super_block *sb, u32 zg_id, u32 first_bg, u32 bg_count)
+static int cetrafs_zg_reconcile_free_counts(struct super_block *sb, u32 zg_id)
 {
+    const cetrafs_superblock_t *raw_sb = cetrafs_sb_raw(sb);
     u64 truth = 0;
-    u32 b;
+    u32 b, nbg;
     int ret;
 
-    for (b = 0; b < bg_count; b++) {
+    if (!raw_sb)
+        return -EINVAL;
+    nbg = le32_to_cpu(raw_sb->block_group_count);
+
+    /* Before the recount, not after: a delta taken afterwards could
+     * include an allocation made while the scan ran, whose effect the
+     * truth below already carries. */
+    {
+        s64 stale = cetrafs_sb_take_zg_free_delta(sb, zg_id);
+
+        if (stale)
+            pr_warn("ZG %u: dropping an accrued aggregate delta of %lld -- this claim recounts the members\n", zg_id,
+                    (long long) stale);
+    }
+
+    /* The members are asked of the Block Groups, not of a range
+     * (docs/internal/BG-OWNERSHIP-DESIGN.md). Mount and claim only. */
+    for (b = 0; b < nbg; b++) {
         u64 total, free;
         s64 delta;
 
-        ret = cetrafs_bg_reconcile_free_count(sb, first_bg + b, &delta);
+        if (cetrafs_sb_bg_owner(sb, b) != zg_id)
+            continue;
+
+        ret = cetrafs_bg_reconcile_free_count(sb, b, &delta);
         if (ret) {
             /* Never fails the claim: a ZG with an unreadable BG is
              * still better owned than left to nobody, and the ordinary
              * allocator reports the real error when it gets there. */
-            pr_err("ZG %u reconcile: BG %u could not be reconciled (%d)\n", zg_id, first_bg + b, ret);
+            pr_err("ZG %u reconcile: BG %u could not be reconciled (%d)\n", zg_id, b, ret);
             return ret;
         }
-        ret = cetrafs_bg_data_block_stats(sb, first_bg + b, &total, &free);
+        ret = cetrafs_bg_data_block_stats(sb, b, &total, &free);
         if (ret)
             return ret;
         truth += free;
@@ -627,10 +704,9 @@ static int cetrafs_zg_try_claim_one(struct super_block *sb, u32 zg_id, u32 my_no
     owner = le16_to_cpu(zg->owner_node_id);
     if (owner == (u16) my_node_id) {
         /* re-attaching to a ZG we already owned */
-        u32 cached_first, cached_count;
-        bool was_cached = cetrafs_sb_zg_owned_cached(sb, zg_id, &cached_first, &cached_count);
+        bool was_cached = cetrafs_sb_zg_owned_cached(sb, zg_id);
 
-        cetrafs_sb_cache_zg_ownership(sb, zg_id, le32_to_cpu(zg->first_bg_id), le32_to_cpu(zg->bg_count));
+        cetrafs_sb_cache_zg_ownership(sb, zg_id);
         ret = 0;
         /* At MOUNT this is the "our own crash" case: whatever deltas
          * this node had accrued but not applied died with it, so the
@@ -653,9 +729,9 @@ static int cetrafs_zg_try_claim_one(struct super_block *sb, u32 zg_id, u32 my_no
         /* PERF(5): this branch runs every heartbeat tick -- neither call
          * may become unconditional. docs/PERFORMANCE.md */
         if (at_mount)
-            cetrafs_zg_reconcile_free_counts(sb, zg_id, le32_to_cpu(zg->first_bg_id), le32_to_cpu(zg->bg_count));
+            cetrafs_zg_reconcile_free_counts(sb, zg_id);
         else if (!was_cached)
-            cetrafs_bg_seed_count_epochs(sb, le32_to_cpu(zg->first_bg_id), le32_to_cpu(zg->bg_count));
+            cetrafs_bg_seed_count_epochs(sb, zg_id);
         goto out_unlock;
     }
     if (owner != CETRAFS_NODE_ID_NONE) {
@@ -721,14 +797,14 @@ static int cetrafs_zg_try_claim_one(struct super_block *sb, u32 zg_id, u32 my_no
      * record this ZG as ours in the in-memory ownership cache, same as
      * the already_ours branch above. */
     {
-        u32 first_bg = le32_to_cpu(zg->first_bg_id);
-        u32 bg_count = le32_to_cpu(zg->bg_count);
-        u32 b;
+        const cetrafs_superblock_t *rsb = cetrafs_sb_raw(sb);
+        u32 b, nbg = rsb ? le32_to_cpu(rsb->block_group_count) : 0;
 
-        for (b = 0; b < bg_count; b++)
-            cetrafs_bg_invalidate_cache(sb, first_bg + b);
+        for (b = 0; b < nbg; b++)
+            if (cetrafs_sb_bg_owner(sb, b) == zg_id)
+                cetrafs_bg_invalidate_cache(sb, b);
 
-        cetrafs_sb_cache_zg_ownership(sb, zg_id, first_bg, bg_count);
+        cetrafs_sb_cache_zg_ownership(sb, zg_id);
 
         /* Ownership has just transferred, which is the one moment this
          * ZG's bitmaps are provably ours and provably quiet -- so it is
@@ -738,7 +814,7 @@ static int cetrafs_zg_try_claim_one(struct super_block *sb, u32 zg_id, u32 my_no
          * so its numbers are exactly the ones expected to be wrong.
          * After the invalidate above, deliberately, so the scan reads
          * the device rather than this node's stale cache. */
-        cetrafs_zg_reconcile_free_counts(sb, zg_id, first_bg, bg_count);
+        cetrafs_zg_reconcile_free_counts(sb, zg_id);
     }
 
 out_unlock:
@@ -933,9 +1009,8 @@ int cetrafs_zg_scrub_adopt_one_stale(struct super_block *sb, bool *out_adopted)
     for (z = 0; z < zg_count; z++) {
         struct cetrafs_zg_info info;
         bool stale = false, claimed = false;
-        u32 fb, bc;
 
-        if (cetrafs_sb_zg_owned_cached(sb, z, &fb, &bc))
+        if (cetrafs_sb_zg_owned_cached(sb, z))
             continue; /* already ours -- the owned-ZG pass covers it */
         if (cetrafs_zg_get_info(sb, z, &info) != 0)
             continue;
@@ -991,9 +1066,8 @@ int cetrafs_zg_claim_unowned(struct super_block *sb,
      * later tick for that same ZG takes this fast path too. */
     for (z = 0; z < count; z++) {
         bool did_claim;
-        u32 unused_first_bg, unused_bg_count;
 
-        if (cetrafs_sb_zg_owned_cached(sb, z, &unused_first_bg, &unused_bg_count)) {
+        if (cetrafs_sb_zg_owned_cached(sb, z)) {
             owned++;
             continue;
         }
@@ -1046,12 +1120,22 @@ out:
  * live data anywhere in it)? Shared by cetrafs_zg_release_surplus()'s
  * scan and cetrafs_zg_try_release_one()'s own re-check immediately
  * before writing. */
-static int cetrafs_zg_is_fully_empty(struct super_block *sb, u32 first_bg, u32 bg_count, bool *out_empty)
+static int cetrafs_zg_is_fully_empty(struct super_block *sb, u32 zg_id, bool *out_empty)
 {
-    u32 bg;
+    const cetrafs_superblock_t *raw_sb = cetrafs_sb_raw(sb);
+    u32 bg, nbg;
 
     *out_empty = true;
-    for (bg = first_bg; bg < first_bg + bg_count; bg++) {
+    if (!raw_sb)
+        return -EINVAL;
+    nbg = le32_to_cpu(raw_sb->block_group_count);
+
+    /* Members from the Block Groups, not from a range. When membership
+     * stops being contiguous this is the only form that still answers
+     * the question (docs/internal/BG-OWNERSHIP-DESIGN.md). */
+    for (bg = 0; bg < nbg; bg++) {
+        if (cetrafs_sb_bg_owner(sb, bg) != zg_id)
+            continue;
         u64 total, free;
         int ret = cetrafs_bg_data_block_stats(sb, bg, &total, &free);
 
@@ -1104,7 +1188,7 @@ static int cetrafs_zg_try_release_one(struct super_block *sb, u32 zg_id, u32 my_
         goto out_unlock;
     }
 
-    ret = cetrafs_zg_is_fully_empty(sb, le32_to_cpu(zg->first_bg_id), le32_to_cpu(zg->bg_count), &empty);
+    ret = cetrafs_zg_is_fully_empty(sb, zg_id, &empty);
     if (ret)
         goto out_unlock;
     if (!empty) {
@@ -1184,14 +1268,34 @@ int cetrafs_zg_release_surplus(struct super_block *sb, u32 my_node_id)
     zg_count = le32_to_cpu(raw_sb->zone_group_count);
 
     for (z = 0; z < zg_count; z++) {
-        u32 first_bg, bg_count;
 
-        if (cetrafs_sb_zg_owned_cached(sb, z, &first_bg, &bg_count))
+        if (cetrafs_sb_zg_owned_cached(sb, z))
             owned_count++;
     }
 
+    /*
+     * Before considering whole Zone Groups, hand back the empty BLOCK
+     * GROUPS inside the ones we are keeping.
+     *
+     * This is the hoarding case: the whole-Zone-Group test below is
+     * all-or-nothing, so a Zone Group with two used Block Groups out of
+     * a hundred gives back nothing and the other ninety-eight stay out
+     * of everyone's reach. Runs even when this node owns a single Zone
+     * Group -- that is precisely when the old test can never fire, and
+     * when a node that deleted most of its data would otherwise sit on
+     * all of it. docs/internal/BG-OWNERSHIP-DESIGN.md
+     */
+    for (z = 0; z < zg_count; z++) {
+        u32 freed = 0;
+
+        if (!cetrafs_sb_zg_owned_cached(sb, z))
+            continue;
+        if (cetrafs_bg_release_empty(sb, z, &freed) == 0 && freed)
+            pr_info("ZG %u: handed back %u empty Block Group(s)\n", z, freed);
+    }
+
     if (owned_count <= 1)
-        return 0; /* nothing surplus to give back */
+        return 0; /* nothing surplus to give back at Zone Group level */
 
     /*
      * Flush before giving anything back.
@@ -1210,13 +1314,12 @@ int cetrafs_zg_release_surplus(struct super_block *sb, u32 my_node_id)
         return ret;
 
     for (z = 0; z < zg_count && owned_count > 1; z++) {
-        u32 first_bg, bg_count;
         bool empty, did_release;
 
-        if (!cetrafs_sb_zg_owned_cached(sb, z, &first_bg, &bg_count))
+        if (!cetrafs_sb_zg_owned_cached(sb, z))
             continue;
 
-        ret = cetrafs_zg_is_fully_empty(sb, first_bg, bg_count, &empty);
+        ret = cetrafs_zg_is_fully_empty(sb, z, &empty);
         if (ret)
             return ret;
         if (!empty)
@@ -1487,7 +1590,7 @@ queue_full:
      * every free past the first 1024 leaked for the whole outage.
      */
     {
-        u32 my_node_id, fb, bc;
+        u32 my_node_id;
         bool claimed = false;
 
         /* pf_force_queue_full models the PRODUCTION case: a full queue
@@ -1498,7 +1601,7 @@ queue_full:
          * the direct free instead. */
         if (!cetrafs_pf_force_queue_full && cetrafs_sb_get_node_id(sb, &my_node_id) == 0) {
             cetrafs_zg_try_claim_one(sb, zg_id, my_node_id, /*at_mount=*/false, &claimed);
-            if (cetrafs_sb_zg_owned_cached(sb, zg_id, &fb, &bc))
+            if (cetrafs_sb_zg_owned_cached(sb, zg_id))
                 return -EAGAIN; /* reclaimed -- caller frees directly */
         }
     }
@@ -1823,10 +1926,9 @@ int cetrafs_zg_drain_pending_frees(struct super_block *sb)
 
     zg_count = le32_to_cpu(raw_sb->zone_group_count);
     for (z = 0; z < zg_count; z++) {
-        u32 first_bg, bg_count;
         int rc;
 
-        if (!cetrafs_sb_zg_owned_cached(sb, z, &first_bg, &bg_count))
+        if (!cetrafs_sb_zg_owned_cached(sb, z))
             continue;
 
         rc = cetrafs_zg_drain_one(sb, z);
@@ -1850,27 +1952,34 @@ int cetrafs_zg_drain_pending_frees(struct super_block *sb)
  */
 int cetrafs_alloc_pick_run(struct super_block *sb, u64 count, u64 *out_lba)
 {
-    const cetrafs_superblock_t *raw_sb = cetrafs_sb_raw(sb);
-    u32 zg_count, z;
+    return cetrafs_alloc_pick_run_resv(sb, count, out_lba, NULL);
+}
 
-    if (!raw_sb)
-        return -EINVAL;
+/* As above; a given 'span' is published atomically with the bits -- see
+ * cetrafs_alloc_data_run_resv(). */
+int cetrafs_alloc_pick_run_resv(struct super_block *sb, u64 count, u64 *out_lba, struct cetrafs_resv_span *span)
+{
+    const unsigned long *owned = NULL;
+    u32 nbg = 0, bgi;
 
-    zg_count = le32_to_cpu(raw_sb->zone_group_count);
-    for (z = 0; z < zg_count; z++) {
-        u32 first_bg, bg_count, bgi;
+    cetrafs_sb_owned_bgs(sb, &owned, &nbg);
+    if (!owned)
+        return -ENOSPC;
 
-        if (!cetrafs_sb_zg_owned_cached(sb, z, &first_bg, &bg_count))
+    /* Flat over the Block Groups this node owns. The nested walk this
+     * replaces visited the same set only while a Zone Group's members
+     * were a contiguous range (docs/internal/BG-OWNERSHIP-DESIGN.md). */
+    for (bgi = 0; bgi < nbg; bgi++) {
+        int ret;
+
+        if (!test_bit(bgi, owned))
             continue;
 
-        for (bgi = first_bg; bgi < first_bg + bg_count; bgi++) {
-            int ret = cetrafs_alloc_data_run(sb, bgi, count, out_lba);
-
-            if (ret == 0)
-                return 0;
-            if (ret != -ENOSPC)
-                return ret;
-        }
+        ret = cetrafs_alloc_data_run_resv(sb, bgi, count, out_lba, span);
+        if (ret == 0)
+            return 0;
+        if (ret != -ENOSPC)
+            return ret;
     }
 
     return -ENOSPC;
@@ -1930,8 +2039,8 @@ u64 cetrafs_bg_pick_scan_count(void)
 int cetrafs_alloc_pick_bg(struct super_block *sb, u32 *out_bg_id)
 {
     const cetrafs_superblock_t *raw_sb = cetrafs_sb_raw(sb);
-    u32 my_node_id, zg_count, z;
-    bool tried_claim_more = false;
+    u32 my_node_id, zg_count;
+    bool tried_claim_more = false, tried_claim_bg = false;
     int ret;
 
     if (!raw_sb)
@@ -2028,16 +2137,27 @@ retry_scan:
         u64 best_free = 0;
         bool have_best = false;
 
-        for (z = 0; z < zg_count; z++) {
-            u32 bg, first_bg, bg_count;
+        /* PERF(1): one flat walk of the owned-Block-Group bitmap, all in
+         * memory, no Zone Group record read and no device I/O -- this
+         * runs per allocated block. docs/PERFORMANCE.md
+         *
+         * It replaces a nested walk over owned Zone Groups and each
+         * one's contiguous range, which visited exactly the same Block
+         * Groups and did exactly the same per-Block-Group work. The
+         * outer loop is gone rather than added to: where that version
+         * paid zone_group_count iterations plus a bitmap test each even
+         * when it owned nothing, this skips unowned Block Groups a word
+         * at a time. */
+        {
+            const unsigned long *owned = NULL;
+            u32 nbg = 0, bg;
 
-            /* PERF(1): cached ownership, never cetrafs_read_zg() -- this
-             * runs per allocated block. docs/PERFORMANCE.md */
-            if (!cetrafs_sb_zg_owned_cached(sb, z, &first_bg, &bg_count))
-                continue;
-
-            for (bg = first_bg; bg < first_bg + bg_count; bg++) {
+            cetrafs_sb_owned_bgs(sb, &owned, &nbg);
+            for (bg = 0; owned && bg < nbg; bg++) {
                 u64 total, free;
+
+                if (!test_bit(bg, owned))
+                    continue;
 
                 ret = cetrafs_bg_data_block_stats(sb, bg, &total, &free);
                 if (ret)
@@ -2077,6 +2197,34 @@ retry_scan:
              * is here looking for. */
             cetrafs_zg_drain_pending_frees(sb);
             goto retry_scan;
+        }
+    }
+
+    /*
+     * Nothing left to claim at Zone Group granularity -- but there may
+     * be Block Groups that belong to NOBODY, left unowned by a grow or
+     * handed back by a node that was not using them. Claim one into a
+     * Zone Group we already own
+     * (docs/internal/BG-OWNERSHIP-DESIGN.md).
+     *
+     * Only reached once every owned Block Group is full, so the scan
+     * inside is paid per exhaustion rather than per block.
+     */
+    if (!tried_claim_bg) {
+        u32 mine;
+
+        tried_claim_bg = true;
+
+        if (cetrafs_sb_first_owned_zg(sb, &mine) == 0) {
+            u32 got = 0;
+
+            ret = cetrafs_bg_claim_free(sb, mine, &got);
+            if (ret == 0) {
+                pr_info("alloc: out of space in owned Block Groups, claimed free BG %u into ZG %u\n", got, mine);
+                goto retry_scan;
+            }
+            if (ret != -ENOSPC)
+                return ret;
         }
     }
 

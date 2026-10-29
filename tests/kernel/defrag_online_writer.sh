@@ -30,6 +30,7 @@ CO_LOOPDEV="$(losetup --find --show "$CO_IMG")"
 CO_MNT="$(mktemp -d /tmp/cetrafs-co-mnt-XXXXXX)"
 "$ROOT/userspace/mkfs.cetra" "$CO_LOOPDEV" -z 1 -b 512 -J 0 -N 1024 -f >/dev/null
 mount -t cetrafs "$CO_LOOPDEV" "$CO_MNT"
+require_cetrafs_mount "$CO_MNT"
 ct_param_set auto_defrag 0  # manual control for this test
 
 CO_OK=$(python3 - "$CO_MNT/openfile" "$ROOT/userspace/defrag.cetra" << 'PYEOF2'

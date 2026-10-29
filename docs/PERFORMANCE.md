@@ -151,6 +151,25 @@ path depends on. Measured as a ~40% loss of streaming write bandwidth.
 Same mechanism as 3, different trigger. Anything that runs per tick and
 touches the BG table is in this category.
 
+## 5b. Zone Group claim/release updates both halves with immediate paired CAS
+
+Zone Group ownership changes and Block Group handback move both the per-ZG
+aggregate (`free_data_blocks`) and the per-ZG shard of unowned capacity
+(`pool_free_blocks`) by one CAS each, debit before credit so any window in
+between understates free space (never phantom space). They are **not** lazy
+accruals applied later — both CAS writes land at claim/release time, running
+on every heartbeat tick during the final quiesce window, and are thus
+heartbeat-paced rather than per-block. The per-tick cost is bounded by ZG
+count (typically 16), not block count — so the invariant stands. Lazy
+accrual remains as a fallback if a CAS fails; late beats lost.
+
+**Why this is not a hot path:** claim/release are not per-block — they happen
+at mount and whenever ownership must transfer (typically seconds apart or at
+explicit heartbeat rebalance), not 36,000 times a second. On a real device,
+the two CAS writes (each a 512-byte atomic operation) are serialised by the
+array's own atomicity and cost far less than the magnitude of the blocks they
+move, so the CAS overhead is invisible against the durability boundary.
+
 ## 6. `cetrafs_read_bg_geom()`'s first attempt must stay on the cached path
 
 Only the checksum-mismatch retries force a fresh read
@@ -226,6 +245,48 @@ adjacent in the array and merging would cost a scan per lookup.
 **Guarded by:** `tests/kernel/get_block_runs.sh` -- which asserts both
 directions, so a change that widens the buffered path fails too.
 
+## 12. A repeat lookup must not re-walk the extent tree
+
+Invariant 11 collapses the callback count for the callers that offer a
+window. The BUFFERED path is not one of them -- it hands in a real
+`buffer_head` sized to one block and must keep getting one block -- so
+every 4 KiB of a buffered write walks the tree from the record down.
+
+On a compact file that walk is free: the record's four root slots carry
+`ei_block_end` ranges, and for a 2-extent file they exclude everything
+without reading a block. The filter degenerates with fragmentation,
+because the arrays are append-only and unordered, so a file written in
+place for months ends up with leaves whose ranges are wide and nearly
+empty -- "may hold this block" becomes true for most of them and the
+walk reads most of them.
+
+`cetrafs_inode_info.ext_*` remembers the last extent a walk resolved
+(ext4's old `i_cached_extent`). Consecutive blocks fall inside it, so
+the walk happens once per extent instead of once per block.
+
+**Measured** on the reference FC array, 1 GiB rewritten at 64 KiB over a
+file whose blocks were already allocated:
+
+| | compact (2 extents) | fragmented, no cache | fragmented, cached |
+|---|---|---|---|
+| throughput | 1173 MB/s | 710 MB/s | **1091 MB/s** |
+| per `get_block` | 1.16 us | 3.24 us | **1.44 us** |
+| leaf+index reads per lookup | 0.00 | 4.39 | **0.12** |
+| tree reads, whole run | — | 1,150,546 | **32,109** |
+
+It is **keyed on the record it came from** (depth, entry count, block
+count), so a mutation that changed the map misses instead of needing
+every writer to remember to invalidate -- and it is only consulted where
+`cetrafs_lock_held_for_write_locally()` already says a CACHED leaf may be
+trusted, so it never widens that window. A preallocated extent is never
+remembered: clearing its uninit flag rewrites a leaf without touching
+any of the three keyed fields.
+
+**Guarded by:** `tests/kernel/extent_cache.sh` -- which asserts the hit
+counter moves AND runs its own negative control, because a content check
+that skips the punched range passes whether the entry was invalidated or
+not (the first version of that suite did exactly that).
+
 ## Measured baseline
 
 On the reference hardware -- an enterprise FC array over 32GFC multipath (two
@@ -249,6 +310,16 @@ baseline it was compared against was about 200 MB/s.
 
 What these numbers are NOT: a controlled benchmark. See the noise floor
 in the measurement notes at the end.
+
+**Always measure the raw device in the same session before concluding
+anything about cetrafs.** The array is shared, and its own figure moves:
+on 2026-10-29 the same LUN measured 564 MB/s at `bs=1M oflag=direct`
+with no filesystem in the path at all, while cetrafs on it measured
+470-543 -- 83-96% of a ceiling that was itself below this table's range.
+A session that skips the raw control reads that as a 30% regression in
+cetrafs. The same session A/B'd 0.9 against 0.8.2 on a freshly made
+volume and found them within the run-to-run spread (0.9: 436 then 461;
+0.8.2: 510 then 470), which is what the range above is warning about.
 
 ---
 

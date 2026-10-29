@@ -1117,7 +1117,12 @@ consume:
 
     /* Park the flag at CLEAN and drop the claim in ONE compare-and-swap:
      * leaving it DIRTY-but-unclaimed, or CLEAN-but-still-claimed, would
-     * each strand the area for a tick. */
+     * each strand the area for a tick. A failed park is tolerated by
+     * design -- the claim's owner==me re-entry lets the next trigger
+     * re-claim and re-park an idempotent redo -- but it must not be
+     * SILENT: a three-node run counted the resulting same-node double
+     * replay as two writers and a release scenario failed on it before
+     * anyone knew parks could fail at all (2026-10-29). */
     cetrafs_journal_release_replay(sb, area_start, my_node_id, /*set_clean=*/true);
     claimed = false;
 

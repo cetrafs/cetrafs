@@ -254,6 +254,10 @@ static int cetrafs_node_claim_mutate(void *image, unsigned int len, void *priv)
      * configured with. */
     ne.hb_interval_secs = cetrafs_cpu_to_le32(ctx->hb_interval);
     ne.file_lock_mode = cetrafs_cpu_to_le32(ctx->file_lock_mode);
+    /* Advertise what this build understands. A constant for the running
+     * module -- any node on this code is live-grow-safe; a node without
+     * it leaves 0 here and a grow excludes it. */
+    ne.caps = cetrafs_cpu_to_le32(CETRAFS_NODE_CAP_LIVE_GROW);
     strscpy(ne.label, init_utsname()->nodename, sizeof(ne.label));
 
     cetrafs_node_image_commit(image, len, &ne);
@@ -306,6 +310,9 @@ static int cetrafs_node_reattach_mutate(void *image, unsigned int len, void *pri
     /* Re-stamp the cluster file-lock mode: a returning node conforms to
      * whatever the cluster is now, not whatever it ran last time. */
     ne.file_lock_mode = cetrafs_cpu_to_le32(ctx->file_lock_mode);
+    /* And re-advertise this build's capabilities: an upgraded module
+     * re-attaching to its old row must publish what it now supports. */
+    ne.caps = cetrafs_cpu_to_le32(CETRAFS_NODE_CAP_LIVE_GROW);
 
     /* fence_epoch (and everything else) rides through untouched, and the
      * value reported back to the caller is the one in the image this swap
@@ -1110,6 +1117,52 @@ int cetrafs_node_single_mounter_conflict(struct super_block *sb, const u8 *my_uu
     }
 
     return cetrafs_for_each_live_peer(sb, my_uuid, cetrafs_single_mounter_visit, out_conflict);
+}
+
+/*
+ * Does EVERY registered node advertise capability bit 'cap'?
+ *
+ * The gate a live grow stands on (cetrafs_node_entry_t.caps): the layout
+ * is about to move under every mounted node's cached, lockless table
+ * offsets, and only a node that understands CETRAFS_NODE_CAP_LIVE_GROW
+ * re-reads them when layout_gen bumps. A node that does not -- an old
+ * build, or any row written before caps existed (caps == 0) -- would
+ * keep compare-and-swapping Block Group descriptors at superseded LBAs.
+ *
+ * Checks EVERY REGISTERED row, not just the non-stale ones: a stale row
+ * is a node that is merely paused (slow, swapped out, mid-reboot), and
+ * if it is an OLD build it will resume on the old layout with no idea
+ * the tables moved. A truly dead node's row is freed by stale-reclaim
+ * and then stops blocking; a live old node correctly blocks the grow for
+ * as long as it is mounted. Our own row is included and trivially passes
+ * (we stamped it). Returns false on any read error -- unknown is unsafe.
+ *
+ * One record read per row, bounded by the table's mkfs capacity; called
+ * only from the grow path, never on a hot path.
+ */
+bool cetrafs_cluster_all_advertise(struct super_block *sb, u32 cap)
+{
+    const cetrafs_superblock_t *raw_sb = cetrafs_sb_raw(sb);
+    u32 count, idx;
+
+    if (!raw_sb)
+        return false;
+    count = le32_to_cpu(raw_sb->node_table_count);
+
+    for (idx = 0; idx < count; idx++) {
+        cetrafs_node_entry_t ne;
+
+        if (cetrafs_read_node_entry(sb, idx, &ne) != 0)
+            return false; /* cannot read a row -> cannot vouch for the cluster */
+        if (cetrafs_le32(ne.state) != CETRAFS_NODE_STATE_REGISTERED)
+            continue; /* FREE or departed: not a live participant */
+        if ((cetrafs_le32(ne.caps) & cap) != cap) {
+            pr_warn("cluster capability gate: node row %u advertises caps 0x%x, missing 0x%x\n", idx,
+                    cetrafs_le32(ne.caps), cap);
+            return false;
+        }
+    }
+    return true;
 }
 
 /*

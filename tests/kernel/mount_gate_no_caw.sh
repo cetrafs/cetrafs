@@ -36,6 +36,7 @@ GATE_MNT="$(mktemp -d /tmp/cetrafs-gate-mnt-XXXXXX)"
 # First mount: legitimately claims node row 0 and ZG0 for this (the only
 # real) node -- establishes the baseline before we fake a foreign claim.
 mount -t cetrafs "$GATE_LOOPDEV" "$GATE_MNT"
+require_cetrafs_mount "$GATE_MNT"
 umount "$GATE_MNT"
 
 # Simulate "ZG0 is already claimed by some other, still-alive node":

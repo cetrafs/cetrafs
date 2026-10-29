@@ -29,6 +29,7 @@ MULTIZG_MNT="$(mktemp -d /tmp/cetrafs-multizg-mnt-XXXXXX)"
 "$ROOT/userspace/mkfs.cetra" "$MULTIZG_LOOPDEV" -z 3 -b 512 -J 0 -N 1024 -f >/dev/null
 
 mount -t cetrafs "$MULTIZG_LOOPDEV" "$MULTIZG_MNT"
+require_cetrafs_mount "$MULTIZG_MNT"
 # A fixed recent-tail slice rather than a dmesg-linecount mark + "tail -n
 # +N" diff: by this point in a long test run, the kernel ring buffer has
 # likely already wrapped past whatever count was recorded earlier, which
@@ -64,16 +65,15 @@ UNOWNED_COUNT="$(echo "$MZ_INFO" | grep -cP '^\s+zg [0-9]+: owner=none')"
 # Then confirm a write that needs a new data block still succeeds, by
 # claiming one of the other two still-unowned ZGs on demand instead of
 # failing -ENOSPC outright with 2/3 of the volume sitting unclaimed.
-ZG0_LINE="$(echo "$MZ_INFO" | grep -P '^\s+zg 0:')"
-ZG0_FIRST_BG="$(echo "$ZG0_LINE" | grep -oP 'first_bg=\K[0-9]+')"
-ZG0_BG_COUNT="$(echo "$ZG0_LINE" | grep -oP 'bg_count=\K[0-9]+')"
-
 umount "$MULTIZG_MNT"
-for ((bg = ZG0_FIRST_BG; bg < ZG0_FIRST_BG + ZG0_BG_COUNT; bg++)); do
+# Zone Group 0's members, from the Block Groups themselves
+# (tests/lib/harness.sh) -- procfs has no span to parse any more.
+for bg in $(ct_bgs_of_zg "$MULTIZG_LOOPDEV" 0); do
     "$BG_POKE" "$MULTIZG_LOOPDEV" "$bg" 0 fill-bitmap >/dev/null
 done
 
 mount -t cetrafs "$MULTIZG_LOOPDEV" "$MULTIZG_MNT"
+require_cetrafs_mount "$MULTIZG_MNT"
 
 if dd if=/dev/zero of="$MULTIZG_MNT/probe" bs=4096 count=1 2>/dev/null; then
     pass "alloc: write to a new file succeeded by claiming an additional ZG on demand"

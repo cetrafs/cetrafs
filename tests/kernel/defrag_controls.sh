@@ -158,14 +158,36 @@ log "the janitor DOES run when it is on -- the opposite control"
 # never runs at all, which proves nothing about the switch.
 echo "auto_defrag=on" >"$CTL"
 : >>"$MNT/f4"
+# 30s was too tight. The janitor is a background workqueue, and when
+# this suite follows a heavy one (churn_oracle, right before it
+# alphabetically) the probe queues behind that suite's backlog and the
+# machine's writeback: measured at ~22s with dynamic debug on, i.e.
+# inside the old budget but not reliably. The property under test is
+# that the janitor RUNS when enabled, not that it runs within some
+# arbitrary number of seconds, so give it a budget that load cannot
+# invalidate -- it still fails, just later, if the janitor is broken.
 A4="$B4"
-for _ in $(seq 1 30); do
+for _ in $(seq 1 120); do
     A4="$(leafcount_of "$MNT/f4")"
     [ "$A4" = "1" ] && break
     sleep 1
 done
-[ "$A4" = "1" ] && pass "the same probe is collapsed to 1 extent once the janitor is on ($B4 -> 1)" ||
+if [ "$A4" = "1" ]; then
+    pass "the same probe is collapsed to 1 extent once the janitor is on ($B4 -> 1)"
+else
     fail "the janitor never ran with auto_defrag on: still $A4 extents"
+    # DIAGNOSTIC: the janitor declines with -ENOSPC from
+    # cetrafs_alloc_pick_run(), which walks only the Block Groups this
+    # node OWNS. Show what it had to work with.
+    log "diagnostic: allocator view at the moment the janitor gave up"
+    # Every one of these is || true: pipefail turns a grep that matches
+    # nothing into a suite abort, and aborting here would swallow the
+    # failure this block exists to explain.
+    { grep -E "free_data_blocks|bg_pick" "$(ct_procdir "$LOOPDEV")/info" 2>/dev/null | sed 's/^/    /'; } || true
+    log "diagnostic: which Block Groups does this node own?"
+    { "$(ct_helper bg_map)" "$IMG" 2>/dev/null | head -6 | sed 's/^/    /'; } || true
+    { sed -n '1,6p' "$(ct_procdir "$LOOPDEV")/cluster" 2>/dev/null | sed 's/^/    /'; } || true
+fi
 
 log "cluster timing, settable on a live mount"
 # The staleness window is ~60s by default, which is a minute of waiting

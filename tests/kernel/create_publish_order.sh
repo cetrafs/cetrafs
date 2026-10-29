@@ -34,6 +34,7 @@ ct_mkfs_small "$DEV" -M 4 >/dev/null
 
 log "setup: a parent directory, settled on disk"
 mount -t cetrafs "$DEV" "$MNT"
+require_cetrafs_mount "$MNT"
 mkdir "$MNT/d"
 DINO="$(stat -c %i "$MNT/d")"
 ct_umount "$MNT"
@@ -43,6 +44,7 @@ BASE="$("$IPOKE" "$DEV" dump "$DINO")"
 # Control for the control: a mount/umount cycle that does nothing must not
 # dirty the parent record, or the comparison below would be meaningless.
 mount -t cetrafs "$DEV" "$MNT"
+require_cetrafs_mount "$MNT"
 ct_umount "$MNT"
 blockdev --flushbufs "$DEV"
 [ "$("$IPOKE" "$DEV" dump "$DINO")" = "$BASE" ] &&
@@ -52,6 +54,7 @@ blockdev --flushbufs "$DEV"
 log "a creation that fails BEFORE publishing must leave the parent untouched"
 ct_param_set symlink_fail_after_write 1
 mount -t cetrafs "$DEV" "$MNT"
+require_cetrafs_mount "$MNT"
 if ln -s "some-target" "$MNT/d/link" 2>/dev/null; then
     fail "the forced-failure symlink SUCCEEDED -- the knob is not wired"
 else
@@ -77,6 +80,7 @@ ct_fsck "$DEV" >/dev/null 2>&1 && pass "fsck clean after the unwind (no leaked i
 
 log "control: a SUCCESSFUL creation does change the parent (the compare can fail)"
 mount -t cetrafs "$DEV" "$MNT"
+require_cetrafs_mount "$MNT"
 ln -s "some-target" "$MNT/d/link"
 [ "$(readlink "$MNT/d/link")" = "some-target" ] && pass "the control symlink resolves" ||
     fail "control symlink broken: $(readlink "$MNT/d/link" 2>&1)"

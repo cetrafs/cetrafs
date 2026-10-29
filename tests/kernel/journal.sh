@@ -39,6 +39,7 @@ JOURNAL_MNT="$(mktemp -d /tmp/cetrafs-journal-mnt-XXXXXX)"
 "$ROOT/userspace/mkfs.cetra" "$JOURNAL_LOOPDEV" -z 1 -b 512 -J 4 -M 4 -N 1024 -f >/dev/null
 
 mount -t cetrafs "$JOURNAL_LOOPDEV" "$JOURNAL_MNT"
+require_cetrafs_mount "$JOURNAL_MNT"
 
 DMESG_MARK_J="$(dmesg_mark)"
 touch "$JOURNAL_MNT/newfile"
@@ -76,6 +77,7 @@ dd if=/dev/zero of="$JOURNAL_LOOPDEV" bs=4096 seek="$TARGET_LBA" count=1 conv=no
 
 DMESG_MARK_REPLAY="$(dmesg_mark)"
 mount -t cetrafs "$JOURNAL_LOOPDEV" "$JOURNAL_MNT"
+require_cetrafs_mount "$JOURNAL_MNT"
 REPLAY_LOG="$(dmesg_since "$DMESG_MARK_REPLAY")"
 
 if echo "$REPLAY_LOG" | grep -q 'journal replay: node 0 replayed 1 valid entry'; then
@@ -96,6 +98,7 @@ EXPECTED="$(printf '.\n..\nnewfile\n' | sort)"
 umount "$JOURNAL_MNT"
 DMESG_MARK_REPLAY2="$(dmesg_mark)"
 mount -t cetrafs "$JOURNAL_LOOPDEV" "$JOURNAL_MNT"
+require_cetrafs_mount "$JOURNAL_MNT"
 REPLAY_LOG2="$(dmesg_since "$DMESG_MARK_REPLAY2")"
 
 if echo "$REPLAY_LOG2" | grep -q 'journal replay:'; then
@@ -154,6 +157,7 @@ else
     # Keep the rest of the suite runnable on a destroyed volume.
     "$ROOT/userspace/mkfs.cetra" "$JOURNAL_LOOPDEV" -z 1 -b 512 -J 4 -M 4 -N 1024 -f >/dev/null
     mount -t cetrafs "$JOURNAL_LOOPDEV" "$JOURNAL_MNT"
+    require_cetrafs_mount "$JOURNAL_MNT"
 fi
 
 # Stale-node replay at reclaim time: simulate "node 1
@@ -171,6 +175,7 @@ dd if=/dev/zero of="$JOURNAL_LOOPDEV" bs=4096 seek="$TARGET_LBA" count=1 conv=no
 
 DMESG_MARK_STALEJ="$(dmesg_mark)"
 mount -t cetrafs "$JOURNAL_LOOPDEV" "$JOURNAL_MNT"
+require_cetrafs_mount "$JOURNAL_MNT"
 # The steal (and the replay that must precede it) happens on a tick once
 # node 1's heartbeat has demonstrably stopped, not at mount -- see the ZG
 # reclaim section for why first sight cannot judge a peer.

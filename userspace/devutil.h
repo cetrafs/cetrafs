@@ -164,6 +164,65 @@ static inline int cetrafs_read_live_candidate(int fd,
     return 1;
 }
 
+/*
+ * Walk the Node Registry and report, per REGISTERED row, whether that
+ * node's module advertised CETRAFS_NODE_CAP_LIVE_GROW.
+ *
+ * This is the only on-disk evidence of what build each peer is running:
+ * caps is written by the node itself at registration, and a row written
+ * by a build that predates capabilities reads 0. A node whose row says
+ * 0 cannot mount a grown (0x0009) volume -- its module refuses the
+ * layout -- so growing while such a node is expected back strands it.
+ *
+ * Unlike cetrafs_find_live_peer(), this does NOT care whether the row
+ * is heartbeating: a node that is merely unmounted right now is still
+ * coming back, and is exactly who the warning is for.
+ *
+ * Returns the number of registered rows, -1 on I/O error. Fills the
+ * caller's arrays up to 'max'.
+ */
+static inline int cetrafs_scan_node_caps(const char *dev,
+                                         char labels[][CETRAFS_NODE_LABEL_LEN + 1],
+                                         uint32_t *caps_out,
+                                         uint32_t *rows_out,
+                                         unsigned max)
+{
+    cetrafs_superblock_t sb;
+    cetrafs_node_entry_t e;
+    uint32_t count, idx;
+    unsigned n = 0;
+    int fd;
+
+    fd = open(dev, O_RDONLY | O_CLOEXEC);
+    if (fd < 0)
+        return -1;
+    if (pread(fd, &sb, sizeof(sb), 0) != (ssize_t) sizeof(sb) || cetrafs_le32(sb.magic) != CETRAFS_MAGIC) {
+        close(fd);
+        return -1;
+    }
+    count = cetrafs_le32(sb.node_table_count);
+    if (!count || count > 4096) {
+        close(fd);
+        return -1;
+    }
+    for (idx = 0; idx < count && n < max; idx++) {
+        off_t off = (off_t) cetrafs_le64(sb.node_table_start) * CETRAFS_BLOCK_SIZE + (off_t) idx * sizeof(e);
+
+        if (pread(fd, &e, sizeof(e), off) != (ssize_t) sizeof(e)) {
+            close(fd);
+            return -1;
+        }
+        if (cetrafs_le32(e.state) != CETRAFS_NODE_STATE_REGISTERED)
+            continue;
+        snprintf(labels[n], CETRAFS_NODE_LABEL_LEN + 1, "%.*s", CETRAFS_NODE_LABEL_LEN, e.label);
+        caps_out[n] = cetrafs_le32(e.caps);
+        rows_out[n] = idx;
+        n++;
+    }
+    close(fd);
+    return (int) n;
+}
+
 static inline int cetrafs_find_live_peer(const char *dev,
                                          uint32_t *out_row,
                                          char *out_label,

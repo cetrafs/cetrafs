@@ -8,6 +8,11 @@
 # trigger: the 128 MB per-extent cap means a big contiguous file
 # legitimately needs many extents and must never be churned.
 set -euo pipefail
+# A silent set -e abort in this suite's index-gate section has failed
+# three full-gate runs while every isolated run passed, and left its
+# mount behind for the suites after it. Name the dying command instead
+# of guessing at it.
+trap 'echo "ABORT at line $LINENO: $BASH_COMMAND (rc=$?)" >&2' ERR
 . "$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)/lib/harness.sh"
 require_root
 require_module
@@ -32,6 +37,7 @@ AD_LOOPDEV="$(losetup --find --show "$AD_IMG")"
 AD_MNT="$(mktemp -d /tmp/cetrafs-ad-mnt-XXXXXX)"
 "$ROOT/userspace/mkfs.cetra" "$AD_LOOPDEV" -z 1 -b 512 -J 0 -N 1024 -f >/dev/null
 mount -t cetrafs "$AD_LOOPDEV" "$AD_MNT"
+require_cetrafs_mount "$AD_MNT"
 
 ct_param_set auto_defrag 0
 
@@ -91,6 +97,13 @@ IDX_LOOPDEV="$(losetup --find --show "$IDX_IMG")"
 IDX_MNT="$(mktemp -d /tmp/cetrafs-idx-mnt-XXXXXX)"
 "$ROOT/userspace/mkfs.cetra" "$IDX_LOOPDEV" -z 1 -b 512 -J 0 -N 1024 -f >/dev/null
 mount -t cetrafs "$IDX_LOOPDEV" "$IDX_MNT"
+require_cetrafs_mount "$IDX_MNT"
+# Build the probes with THIS mount's janitor OFF. With it on, a fast
+# box collapses the fragmented probe WHILE the dd loop is still
+# interleaving it (a loaded 8-core traced the janitor moving 4, then 7,
+# then 10... blocks as the file grew), so the "20 fragments, then one
+# move" premise this gate asserts never exists to begin with.
+echo "auto_defrag off" >"$(ct_procdir "$IDX_LOOPDEV")/controls"
 ct_param_set auto_defrag 1  # this section tests the index gate
 
 DMESG_MARK_IDX="$(dmesg_mark)"
@@ -105,22 +118,37 @@ done
 rm -f /tmp/cetrafs-idx-blk
 sync "$IDX_MNT/contig" "$IDX_MNT/fragged"
 # bare write-open+close on each to fire the close trigger
+# Probes built and verified: NOW arm the janitor and only then take the
+# window the asserts read. The bare re-opens below are the triggers.
+echo "auto_defrag on" >"$(ct_procdir "$IDX_LOOPDEV")/controls"
+DMESG_MARK_IDX="$(dmesg_mark)"
 : >> "$IDX_MNT/contig"
 : >> "$IDX_MNT/fragged"
 
+# The same 120s budget as every other janitor wait in this directory --
+# the 10s one below missed under loaded full gates, and worse: the LOG
+# capture after it ran `grep` inside a command substitution with no
+# match tolerance, so a quiet janitor aborted the whole suite under
+# set -e with no error text, LEFT ITS MOUNT MOUNTED, and the three
+# defrag suites after it failed against the leftovers. Every "janitor
+# never ran" full-gate failure of 2026-10-29 traces back to this one
+# line; the ERR trap above is what finally named it.
 IDX_DONE=0
-for _ in $(seq 1 20); do
+for _ in $(seq 1 240); do
     dmesg_since "$DMESG_MARK_IDX" | grep -q 'auto-defrag: ino=.* blocks moved' && { IDX_DONE=1; break; }
     sleep 0.5
 done
-IDX_LOG="$(dmesg_since "$DMESG_MARK_IDX" | grep 'auto-defrag:')"
+IDX_LOG="$(dmesg_since "$DMESG_MARK_IDX" | grep 'auto-defrag:' || true)"
 
 # the fragged file must have been moved; the contig file must NOT appear
 FRAGGED_INO="$(stat -c '%i' "$IDX_MNT/fragged")"
 CONTIG_INO="$(stat -c '%i' "$IDX_MNT/contig")"
 echo "$IDX_LOG" | grep -q "ino=$FRAGGED_INO .*blocks moved" &&
     pass "index gate: the genuinely-fragmented file (index ~2000) was auto-defragged" ||
-    fail "index gate: fragmented file not defragged; log: $IDX_LOG"
+    { fail "index gate: fragmented file not defragged; log: $IDX_LOG"
+      log "diag: param auto_defrag=$(cat /sys/module/cetrafs/parameters/auto_defrag 2>/dev/null)"
+      log "diag: index mount controls: $(grep -E 'defrag' "$(ct_procdir "$IDX_LOOPDEV")/controls" 2>/dev/null | tr '\n' ' ')"
+      log "diag: index mount info: $(grep -E 'defrag' "$(ct_procdir "$IDX_LOOPDEV")/info" 2>/dev/null | tr '\n' ' ')"; }
 if echo "$IDX_LOG" | grep -q "ino=$CONTIG_INO .*blocks moved"; then
     fail "index gate: the CONTIGUOUS file (index 100) was wrongly auto-defragged"
 else

@@ -70,6 +70,25 @@ static unsigned int cetrafs_scrub_gap_secs = 15;
 module_param_named(scrub_gap_secs, cetrafs_scrub_gap_secs, uint, 0644);
 MODULE_PARM_DESC(scrub_gap_secs, "two-pass confirmation gap in seconds (must exceed any allocation's commit window)");
 
+/* TEST ONLY: decide from the on-disk record alone, ignoring the in-core
+ * shadow -- the negative control for the overlay in scrub_build_refset().
+ * With it the scrub frees blocks out from under a file that is being
+ * written, which is what it used to do unconditionally. */
+static bool cetrafs_scrub_ignore_shadow;
+module_param_named(scrub_ignore_shadow, cetrafs_scrub_ignore_shadow, bool, 0644);
+MODULE_PARM_DESC(scrub_ignore_shadow,
+                 "TEST ONLY: build the scrub reference set from the on-disk records only (frees live blocks)");
+
+/* TEST ONLY: act on the verdict even though the Block Group has been
+ * allocated from since the evidence was gathered -- the negative control
+ * for cetrafs_sb_info.bg_alloc_seq. With it, a concurrent workload gets
+ * blocks freed out from under files that were just given them.
+ * tests/kernel/churn_oracle.sh is what measures the difference. */
+static bool cetrafs_scrub_ignore_alloc_seq;
+module_param_named(scrub_ignore_alloc_seq, cetrafs_scrub_ignore_alloc_seq, bool, 0644);
+MODULE_PARM_DESC(scrub_ignore_alloc_seq,
+                 "TEST ONLY: free on a verdict older than the last allocation in the Block Group");
+
 static atomic64_t cetrafs_scrub_reclaimed = ATOMIC64_INIT(0);
 u64 cetrafs_scrub_reclaimed_count(void)
 {
@@ -103,8 +122,8 @@ u64 cetrafs_scrub_cycle_count(void)
  * and could a cycle have straddled it?" kept coming up in post-mortems
  * with only dmesg to answer it -- procfs 'info' now answers directly.
  * A cycle in progress shows its start time with the previous duration. */
-static atomic64_t cetrafs_scrub_last_start;  /* unix secs */
-static atomic64_t cetrafs_scrub_last_ms;     /* duration of the last completed cycle */
+static atomic64_t cetrafs_scrub_last_start; /* unix secs */
+static atomic64_t cetrafs_scrub_last_ms;    /* duration of the last completed cycle */
 u64 cetrafs_scrub_last_start_unix(void)
 {
     return (u64) atomic64_read(&cetrafs_scrub_last_start);
@@ -123,14 +142,16 @@ struct cetrafs_scrub {
 /* One Block Group being scrubbed this cycle. */
 struct scrub_bg {
     u32 bg_id;
-    u32 zg_id;          /* the ZG that owned it when this cycle collected it */
-    u64 data_start;     /* first data-block LBA */
-    u64 data_count;     /* data blocks in the BG */
-    u64 bmap_lba;       /* data-bitmap first LBA */
-    u64 bmap_blocks;    /* data-bitmap length in blocks */
-    unsigned long *ref; /* referenced set, data_count bits (indexed block - data_start) */
-    unsigned long *cand;/* pass-1 candidate set, data_count bits */
+    u32 zg_id;           /* the ZG that owned it when this cycle collected it */
+    u64 data_start;      /* first data-block LBA */
+    u64 data_count;      /* data blocks in the BG */
+    u64 bmap_lba;        /* data-bitmap first LBA */
+    u64 bmap_blocks;     /* data-bitmap length in blocks */
+    unsigned long *ref;  /* referenced set, data_count bits (indexed block - data_start) */
+    unsigned long *cand; /* pass-1 candidate set, data_count bits */
+    u64 alloc_seq;       /* allocations in this BG when the evidence was taken */
 };
+
 
 struct scrub_ctx {
     struct scrub_bg *bgs;
@@ -164,6 +185,7 @@ static int scrub_build_refset(struct cetrafs_scrub *s, struct scrub_ctx *ctx, bo
 {
     struct super_block *sb = s->sb;
     const cetrafs_superblock_t *raw_sb = cetrafs_sb_raw(sb);
+    struct inode *vfs_inode;
     u64 ninodes, ino;
     u32 i;
 
@@ -212,12 +234,51 @@ static int scrub_build_refset(struct cetrafs_scrub *s, struct scrub_ctx *ctx, bo
         if (fresh)
             cetrafs_invalidate_raw_inode(sb, ino);
 
-        ret = cetrafs_read_raw_inode(sb, ino, &raw);
+        /*
+         * ...AND from the in-core shadow when there is one.
+         *
+         * The on-disk record is not the whole truth about which blocks
+         * an inode owns. The hot write path stages extent state in
+         * cetrafs_inode_info.fd_shadow and publishes it only at a
+         * durability boundary, so a file being written RIGHT NOW owns
+         * blocks that are bitmap-allocated and named by nothing on the
+         * device. cetrafs_inode_fd_overlay() says "every file-path read
+         * of extent state goes through this" -- this read did not, and
+         * it is the one whose verdict FREES.
+         *
+         * The exemption list in this file's header covers the
+         * speculative run behind the written block, and point 2 argues
+         * that a real allocation commits its extent "within one
+         * get_block() -- milliseconds", which the two-pass gap then
+         * dwarfs. That was true before the shadow existed. With it, a
+         * single large write holds tens of thousands of blocks
+         * unpublished for as long as the writer goes without syncing,
+         * and the scrub freed them under a live file: the allocator
+         * handed them out again (cross-file overlap) and the owner's
+         * eventual free hit blocks that were already free.
+         *
+         * ilookup() never reads from the device -- it answers only for
+         * an inode already in core, which is exactly the set that can
+         * have an unpublished shadow -- so the common case costs one
+         * hash lookup per allocated inode per cycle.
+         */
+        vfs_inode = ilookup(sb, ino);
+        if (vfs_inode) {
+            ret = cetrafs_read_raw_inode_overlaid(sb, vfs_inode, &raw);
+            if (cetrafs_scrub_ignore_shadow) /* TEST ONLY: the negative control */
+                ret = cetrafs_read_raw_inode(sb, ino, &raw);
+        } else {
+            ret = cetrafs_read_raw_inode(sb, ino, &raw);
+        }
+        if (!ret)
+            ret = cetrafs_raw_inode_for_each_owned_block(sb, &raw, scrub_mark_ref, ctx);
+        /* One exit for the ilookup() reference: the record-read failure
+         * below returns too, and dropping it only on the success path
+         * pinned an inode for the life of the mount. */
+        if (vfs_inode)
+            iput(vfs_inode);
         if (ret)
-            return -EIO; /* allocated but unreadable: references unknown -> bail */
-        ret = cetrafs_raw_inode_for_each_owned_block(sb, &raw, scrub_mark_ref, ctx);
-        if (ret)
-            return -EIO; /* unreadable tree -> references unknown -> bail */
+            return -EIO; /* unreadable record or tree -> references unknown -> bail */
     }
 
     /*
@@ -306,10 +367,26 @@ static int scrub_free_confirmed(struct cetrafs_scrub *s, struct scrub_bg *b, u64
     if (!bmap)
         return -EIO;
     for (bit = 0; bit < b->data_count; bit++) {
-        u32 first_bg, bg_count;
-
         if (s->draining)
             break;
+        /*
+         * Anything allocated in this Block Group since the evidence was
+         * taken invalidates the whole verdict for it: the allocator
+         * hands out blocks that were free when the reference set was
+         * built, and "referenced by nothing" was true of them THEN.
+         * Freeing one now takes it from the file that has just been
+         * given it -- which is how two inodes came to map one block.
+         *
+         * Abandoning the Block Group (rather than skipping one bit) is
+         * the conservative answer: the reference set is equally stale
+         * for every candidate in it. A busy volume therefore reclaims
+         * little or nothing, which is correct for a background pass --
+         * a leak costs space, and freeing a live block costs data.
+         */
+        if (!cetrafs_scrub_ignore_alloc_seq && cetrafs_sb_bg_alloc_seq(sb, b->bg_id) != b->alloc_seq) {
+            pr_debug("scrub: BG %u saw an allocation since the deciding pass -- abandoning it this cycle\n", b->bg_id);
+            break;
+        }
         if (!test_bit((unsigned int) bit, b->cand))
             continue;
 
@@ -326,7 +403,7 @@ static int scrub_free_confirmed(struct cetrafs_scrub *s, struct scrub_bg *b, u64
          * allocated for itself. Cached lookup, the same one the
          * per-block allocation path trusts.
          */
-        if (!cetrafs_sb_zg_owned_cached(sb, b->zg_id, &first_bg, &bg_count)) {
+        if (!cetrafs_sb_zg_owned_cached(sb, b->zg_id)) {
             pr_info("scrub: ZG %u stopped being ours mid-cycle -- abandoning BG %u\n", b->zg_id, b->bg_id);
             break;
         }
@@ -351,7 +428,8 @@ static int scrub_free_confirmed(struct cetrafs_scrub *s, struct scrub_bg *b, u64
             if (reserved)
                 continue;
 
-            if (cetrafs_free_data_extent(sb, b->data_start + bit, 1) == 0) {
+            if (cetrafs_free_data_extent_unless_reserved(sb, b->data_start + bit, 1) == 0) {
+                ctrace("SCRUBFREE lba=%llu bg=%u\n", (unsigned long long) (b->data_start + bit), b->bg_id);
                 (*out_freed)++;
                 atomic64_inc(&cetrafs_scrub_reclaimed);
             }
@@ -363,24 +441,37 @@ static int scrub_free_confirmed(struct cetrafs_scrub *s, struct scrub_bg *b, u64
     return 0;
 }
 
-/* Build the scrub target list: every BG of every ZG this node owns. */
+/* Build the scrub target list: every Block Group this node owns. */
 static int scrub_collect_targets(struct super_block *sb, struct scrub_ctx *ctx)
 {
     const cetrafs_superblock_t *raw_sb = cetrafs_sb_raw(sb);
-    u32 zg_count, z, n = 0, cap = 0;
+    u32 n = 0, cap = 0;
     struct scrub_bg *bgs = NULL;
 
     if (!raw_sb)
         return -EINVAL;
-    zg_count = le32_to_cpu(raw_sb->zone_group_count);
 
-    for (z = 0; z < zg_count; z++) {
-        u32 first_bg, bg_count, k;
+    /*
+     * Every Block Group this node owns, flat. The nested walk this
+     * replaces -- for each owned Zone Group, for each Block Group in
+     * its contiguous range -- reached the same set only while
+     * membership was a range (docs/internal/BG-OWNERSHIP-DESIGN.md).
+     * The owning Zone Group is still recorded per entry, because the
+     * mid-cycle "is this still ours" check below is asked of the Zone
+     * Group.
+     */
+    {
+        const unsigned long *owned = NULL;
+        u32 nbg = 0, bgid;
 
-        if (!cetrafs_sb_zg_owned_cached(sb, z, &first_bg, &bg_count))
-            continue;
-        for (k = 0; k < bg_count; k++) {
+        cetrafs_sb_owned_bgs(sb, &owned, &nbg);
+        if (!owned)
+            nbg = 0;
+        for (bgid = 0; owned && bgid < nbg; bgid++) {
             struct scrub_bg *b;
+
+            if (!test_bit(bgid, owned))
+                continue;
 
             if (n == cap) {
                 u32 ncap = cap ? cap * 2 : 16;
@@ -393,10 +484,10 @@ static int scrub_collect_targets(struct super_block *sb, struct scrub_ctx *ctx)
             }
             b = &bgs[n];
             memset(b, 0, sizeof(*b));
-            b->bg_id = first_bg + k;
-            b->zg_id = z;
-            if (cetrafs_bg_data_layout(sb, b->bg_id, &b->data_start, &b->data_count, &b->bmap_lba,
-                                       &b->bmap_blocks) != 0)
+            b->bg_id = bgid;
+            b->zg_id = cetrafs_sb_bg_owner(sb, bgid);
+            if (cetrafs_bg_data_layout(sb, b->bg_id, &b->data_start, &b->data_count, &b->bmap_lba, &b->bmap_blocks) !=
+                0)
                 continue; /* skip an unreadable BG rather than fail the cycle */
             b->ref = kvcalloc(BITS_TO_LONGS(b->data_count), sizeof(long), GFP_NOFS);
             b->cand = kvcalloc(BITS_TO_LONGS(b->data_count), sizeof(long), GFP_NOFS);
@@ -487,6 +578,11 @@ static void scrub_reclaim_orphan_inodes(struct cetrafs_scrub *s)
 
         if (cetrafs_inode_is_allocated(sb, ino, &allocated) != 0 || !allocated)
             continue;
+        if (cetrafs_sb_birth_active(sb, ino))
+            continue; /* mid-birth on this node: its record is not yet
+                       * written, so the dead previous record would pass
+                       * every check below -- and freeing it hands the
+                       * number to a second owner (2026-10-29). */
 
         /* The verdict read: fresh, never this node's cache. */
         cetrafs_invalidate_raw_inode(sb, ino);
@@ -508,7 +604,7 @@ static void scrub_reclaim_orphan_inodes(struct cetrafs_scrub *s)
             continue; /* our own object is live -- its eviction owns the free */
         }
 
-        if (cetrafs_free_inode(sb, ino) == 0) {
+        if (cetrafs_free_inode_if_dead(sb, ino, cetrafs_le64(raw.generation)) == 0) {
             freed++;
             atomic64_inc(&cetrafs_scrub_orphans);
         }
@@ -559,6 +655,7 @@ static void cetrafs_scrub_cycle(struct cetrafs_scrub *s)
         if (scrub_mark_candidates(sb, &ctx.bgs[i]) != 0)
             goto done;
 
+
     /* The gap: let any in-flight allocation commit its extent. Bail early
      * if unmounting. */
     gap = cetrafs_scrub_gap_secs ? cetrafs_scrub_gap_secs : 1;
@@ -566,6 +663,14 @@ static void cetrafs_scrub_cycle(struct cetrafs_scrub *s)
         msleep(100);
     if (s->draining)
         goto done;
+
+    /* Snapshot each BG's allocation count BEFORE the evidence is
+     * gathered, not after: the refset build below reads one uncached
+     * record per allocated inode and is itself slow, so an allocation
+     * during it would otherwise go unnoticed by a verdict that claims to
+     * describe the state afterwards. */
+    for (i = 0; i < ctx.nbgs; i++)
+        ctx.bgs[i].alloc_seq = cetrafs_sb_bg_alloc_seq(sb, ctx.bgs[i].bg_id);
 
     /* Pass 2: rebuild the reference set FRESH, confirm, free. This is
      * the verdict that frees blocks, so it may not rest on a cached view
@@ -579,8 +684,8 @@ static void cetrafs_scrub_cycle(struct cetrafs_scrub *s)
     atomic64_inc(&cetrafs_scrub_cycles);
 
     if (freed)
-        pr_info("scrub: reclaimed %llu leaked data block(s) across %u owned BG(s)\n",
-                (unsigned long long) freed, ctx.nbgs);
+        pr_info("scrub: reclaimed %llu leaked data block(s) across %u owned BG(s)\n", (unsigned long long) freed,
+                ctx.nbgs);
 done:
     scrub_free_targets(&ctx);
     atomic64_set(&cetrafs_scrub_last_ms, ktime_ms_delta(ktime_get(), t0));

@@ -45,12 +45,17 @@ var (
 	// is what stops that recurring: a line that looks like a zg line but
 	// does not parse is now an error, not a shrug.
 	reZGLine = regexp.MustCompile(
-		`^\s*zg (\d+): owner=(none|\d+)(?: \(this node\))? first_bg=(\d+) bg_count=(\d+) free_data_blocks=(\d+)`)
+		`^\s*zg (\d+): owner=(none|\d+)(?: \(this node\))? block_groups=(\d+) free_data_blocks=(\d+)`)
 	reZGPrefix = regexp.MustCompile(`^\s*zg \d+: owner=`)
 
 	// "node 0: state=REGISTERED uuid=...-...-...-...-... hb_seq=8 last_seen=123 label=host1 stale=no (this node)"
+	// caps= arrived with the node capability byte (live-grow gating);
+	// without it in the pattern NO node line matched, Nodes stayed
+	// empty, and every staleness-driven scenario waited forever on a
+	// peer that was in fact long stale. Same lesson as reZGLine above:
+	// this parser must track the emitter, and silence is the failure.
 	reNodeLine = regexp.MustCompile(
-		`^node (\d+): state=(\S+) uuid=(\S+) hb_seq=(\d+) last_seen=(\d+) label=(\S+) stale=(\S+)`)
+		`^node (\d+): state=(\S+) uuid=(\S+) hb_seq=(\d+) last_seen=(\d+) label=(\S+) caps=(\S+) stale=(\S+)`)
 )
 
 func readProcSnapshot(device string) (ProcSnapshotResult, error) {
@@ -136,14 +141,16 @@ func parseInfoFile(path string, out *ProcSnapshotResult) error {
 			if m[2] != "none" {
 				owner, _ = strconv.Atoi(m[2])
 			}
-			firstBG, _ := strconv.Atoi(m[3])
-			bgCount, _ := strconv.Atoi(m[4])
-			free, _ := strconv.ParseUint(m[5], 10, 64)
+			// Membership stopped being a contiguous range when Block
+			// Groups started naming their own owner; the info line now
+			// carries only the member COUNT. FirstBG is gone with it.
+			bgCount, _ := strconv.Atoi(m[3])
+			free, _ := strconv.ParseUint(m[4], 10, 64)
 			out.ZoneGroups = append(out.ZoneGroups, ZGInfo{
 				ID:             id,
 				Owner:          owner,
 				ThisNode:       strings.Contains(line, "(this node)"),
-				FirstBG:        firstBG,
+				FirstBG:        -1,
 				BGCount:        bgCount,
 				FreeDataBlocks: free,
 			})
@@ -185,7 +192,7 @@ func parseClusterFile(path string, out *ProcSnapshotResult) error {
 			HBSeq:    hbSeq,
 			LastSeen: lastSeen,
 			Label:    m[6],
-			Stale:    m[7] == "yes",
+			Stale:    m[8] == "yes",
 			ThisNode: strings.Contains(line, "(this node)"),
 		})
 	}

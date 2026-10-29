@@ -163,6 +163,48 @@ struct cetrafs_inode_info {
      * cetrafs_stat_baseline in kmod.h for why ->write_inode needs it. */
     struct cetrafs_stat_baseline stat_baseline;
 
+    /*
+     * The last extent cetrafs_tree_lookup() resolved for this inode --
+     * ext4's old i_cached_extent, and for the same reason.
+     *
+     * The buffered write path hands get_block ONE block at a time by
+     * contract, so a 1 MiB write is 256 lookups, and each walks the
+     * tree from the record down. On a compact file that costs nothing
+     * (the root slots exclude everything). On a file with thousands of
+     * extents -- a VM image written in place for months -- the
+     * ei_block_end range filter stops excluding, because every leaf
+     * ends up covering a wide, sparse span: measured at 6.68 leaf+index
+     * reads per lookup on an 8221-extent file, against 0.00 on a
+     * 2-extent one, and the per-block cost went 1.15 us -> 4.98 us with
+     * throughput halved. Consecutive blocks almost always fall inside
+     * the extent the previous lookup just resolved, so remembering one
+     * extent answers them with no walk at all.
+     *
+     * KEYED ON THE RECORD IT CAME FROM (depth, entries, blocks). Every
+     * caller of cetrafs_tree_lookup() passes a freshly-read record, so
+     * a mutation that changed the map -- an append, a split, a truncate,
+     * a punch -- changes the key and the entry simply misses. That is
+     * what makes this safe WITHOUT having to find and annotate every
+     * writer: there is no "did someone forget to invalidate" to get
+     * wrong. The one mutation that can leave all three identical is a
+     * relocation (defrag) that moves an extent without changing its
+     * length, and that drops the entry explicitly.
+     *
+     * Only consulted while cetrafs_lock_held_for_write_locally() holds
+     * -- the same predicate that decides a CACHED leaf block may be
+     * trusted at all (cetrafs_read_tree_bh()). The entry is derived
+     * from those very blocks, so it is valid exactly as long as they
+     * are and never a window wider. Guarded by resv_lock.
+     */
+    bool ext_valid;
+    bool ext_uninit;
+    u16 ext_key_depth;
+    u16 ext_key_entries;
+    u64 ext_key_blocks;
+    u32 ext_block; /* first file-relative block the extent covers */
+    u32 ext_len;   /* how many blocks it covers */
+    u64 ext_lba;   /* device block ext_block lives at */
+
     u64 generation; /* on-disk cetrafs_inode_t.generation this object was
                      * instantiated from (v0x0008) -- the cross-node
                      * inode-number-reuse detector; see inode.c */
@@ -274,6 +316,29 @@ struct cetrafs_inode_info {
     spinlock_t fd_lock;
     bool fd_dirty;
     cetrafs_inode_t fd_shadow;
+
+    /* Lost-update guards for the shadow (2026-10-27, the ~15k-blocks-
+     * per-fill leak and its cross-link sibling).
+     *
+     * fd_seq counts stages. A publisher snapshots the shadow and its
+     * seq, CASes OUTSIDE fd_lock, and only then clears fd_dirty -- IF
+     * the seq is still the one it took. The old protocol cleared dirty
+     * at take time, so a get_block() landing inside the publisher's CAS
+     * window found no overlay, rebuilt its tree from the lagging device
+     * record, and staged that regressed tree over everything in flight:
+     * every extent being published leaked, and the file read zeroes
+     * over the lost range.
+     *
+     * fd_pub_mutex serialises every PUBLISHER of this record's file
+     * sector (writeback's CAS, and the rebuild-then-publish paths:
+     * truncate, punch, fallocate, defrag). Without it, writeback can
+     * snapshot the pre-rebuild shadow, lose the race to a rebuild's
+     * publish, and land the OLD tree over the new one -- the rebuild
+     * then frees the old tree's blocks while the device still
+     * references them, and the next allocation cross-links two files.
+     * Ordering: inode_lock -> fd_pub_mutex; the mutex is a leaf. */
+    u64 fd_seq;
+    struct mutex fd_pub_mutex;
 
     /* Directories: the dirent_seq at which this node last read this
      * directory's dirent blocks forced-fresh. While the on-disk seq
@@ -421,6 +486,136 @@ void cetrafs_inode_stat_baseline_set(struct inode *inode, const cetrafs_inode_t 
     spin_unlock(&ci->resv_lock);
 }
 
+/* ------ the cached extent (see cetrafs_inode_info.ext_valid) ------ */
+
+/*
+ * Test-only: keep trusting a remembered extent after the map changed.
+ *
+ * Disables BOTH halves of what makes the entry safe -- the key check,
+ * and the explicit drops on the paths that move or remove extents
+ * without changing the key. Either alone is not a negative control:
+ * with the drops still in place an ignored key changes nothing
+ * observable (the drops catch it), which is how the first version of
+ * tests/kernel/extent_cache.sh came to pass its own control and prove
+ * nothing. Flip this and the content assertions must FAIL.
+ */
+static bool cetrafs_ext_cache_trust_stale;
+module_param_named(ext_cache_trust_stale, cetrafs_ext_cache_trust_stale, bool, 0644);
+MODULE_PARM_DESC(ext_cache_trust_stale,
+                 "TEST ONLY: keep a remembered extent after the map changed (reproduces a stale "
+                 "extent mapping: reads land on the wrong blocks)");
+
+/* Turns the remembered extent off entirely -- the A/B control, and the
+ * escape hatch if it ever needs to be taken out of the picture on a
+ * live mount. */
+static bool cetrafs_ext_cache_enabled = true;
+module_param_named(ext_cache, cetrafs_ext_cache_enabled, bool, 0644);
+MODULE_PARM_DESC(ext_cache, "remember the last extent resolved per inode (default on)");
+
+static atomic64_t cetrafs_ext_cache_hits = ATOMIC64_INIT(0);
+static atomic64_t cetrafs_ext_cache_misses = ATOMIC64_INIT(0);
+
+u64 cetrafs_ext_cache_hit_count(void)
+{
+    return (u64) atomic64_read(&cetrafs_ext_cache_hits);
+}
+
+u64 cetrafs_ext_cache_miss_count(void)
+{
+    return (u64) atomic64_read(&cetrafs_ext_cache_misses);
+}
+
+/* The record fields the entry is keyed on -- see the struct comment for
+ * why these three, and for the one mutation they cannot catch. */
+static bool cetrafs_ext_key_matches(const struct cetrafs_inode_info *ci, const cetrafs_inode_t *raw)
+{
+    return ci->ext_key_depth == cetrafs_le16(raw->eh.eh_depth) &&
+           ci->ext_key_entries == cetrafs_le16(raw->eh.eh_entries) && ci->ext_key_blocks == cetrafs_le64(raw->blocks);
+}
+
+/*
+ * Answer 'iblock' from the remembered extent, or say no.
+ *
+ * Reports the same three things a tree walk would: the device block,
+ * how much of the extent follows contiguously (what lets get_block
+ * answer a multi-block mapping), and whether it is still preallocated.
+ */
+bool cetrafs_inode_ext_cache_lookup(struct inode *inode,
+                                    const cetrafs_inode_t *raw,
+                                    u32 iblock,
+                                    u64 *out_lba,
+                                    u32 *out_run,
+                                    bool *out_uninit)
+{
+    struct cetrafs_inode_info *ci = CETRAFS_I(inode);
+    bool hit = false;
+
+    if (!cetrafs_ext_cache_enabled)
+        return false;
+
+    spin_lock(&ci->resv_lock);
+    if (ci->ext_valid && (cetrafs_ext_cache_trust_stale || cetrafs_ext_key_matches(ci, raw)) &&
+        iblock >= ci->ext_block && iblock < ci->ext_block + ci->ext_len) {
+        *out_lba = ci->ext_lba + (iblock - ci->ext_block);
+        if (out_run)
+            *out_run = ci->ext_len - (iblock - ci->ext_block);
+        if (out_uninit)
+            *out_uninit = ci->ext_uninit;
+        hit = true;
+    }
+    spin_unlock(&ci->resv_lock);
+
+    atomic64_inc(hit ? &cetrafs_ext_cache_hits : &cetrafs_ext_cache_misses);
+    return hit;
+}
+
+/* Remember the extent a walk just resolved, against the record it was
+ * resolved from. */
+void cetrafs_inode_ext_cache_store(struct inode *inode,
+                                   const cetrafs_inode_t *raw,
+                                   u32 ext_block,
+                                   u32 ext_len,
+                                   u64 ext_lba,
+                                   bool uninit)
+{
+    struct cetrafs_inode_info *ci = CETRAFS_I(inode);
+
+    if (!ext_len || !cetrafs_ext_cache_enabled)
+        return;
+
+    spin_lock(&ci->resv_lock);
+    ci->ext_key_depth = cetrafs_le16(raw->eh.eh_depth);
+    ci->ext_key_entries = cetrafs_le16(raw->eh.eh_entries);
+    ci->ext_key_blocks = cetrafs_le64(raw->blocks);
+    ci->ext_block = ext_block;
+    ci->ext_len = ext_len;
+    ci->ext_lba = ext_lba;
+    ci->ext_uninit = uninit;
+    ci->ext_valid = true;
+    spin_unlock(&ci->resv_lock);
+}
+
+/*
+ * Forget it.
+ *
+ * The key catches every mutation that changes depth, entry count or
+ * block count. A RELOCATION changes none of them -- same extent, same
+ * length, different device blocks -- so defrag drops the entry by hand,
+ * and so does the open-time handoff that drops the cached tree blocks
+ * this entry was derived from.
+ */
+void cetrafs_inode_ext_cache_drop(struct inode *inode)
+{
+    struct cetrafs_inode_info *ci = CETRAFS_I(inode);
+
+    if (cetrafs_ext_cache_trust_stale)
+        return; /* test-only, see the knob */
+
+    spin_lock(&ci->resv_lock);
+    ci->ext_valid = false;
+    spin_unlock(&ci->resv_lock);
+}
+
 bool cetrafs_inode_stat_baseline_get(struct inode *inode, struct cetrafs_stat_baseline *out)
 {
     struct cetrafs_inode_info *ci = CETRAFS_I(inode);
@@ -509,6 +704,14 @@ void cetrafs_inode_note_local_file_seq(struct inode *inode, u64 seq)
     if (cetrafs_file_seq_skip_note)
         return;
     CETRAFS_I(inode)->file_seq_cached = seq;
+}
+
+/* The seq our last file-sector publish stamped (U64_MAX: none noted for
+ * this in-core object). inode.c's refresh uses it to recognise a read
+ * our own publish has superseded. */
+u64 cetrafs_inode_local_file_seq(struct inode *inode)
+{
+    return CETRAFS_I(inode)->file_seq_cached;
 }
 
 /*
@@ -600,7 +803,11 @@ void cetrafs_inode_fd_stage(struct inode *inode, const cetrafs_inode_t *raw)
     ci->fd_shadow.ino = raw->ino;
     ci->fd_shadow.generation = raw->generation;
     ci->fd_dirty = true;
+    ci->fd_seq++;
     spin_unlock(&ci->fd_lock);
+    ctrace("FDSTAGE ino=%llu blocks=%llu entries=%u depth=%u from=%pS\n", (unsigned long long) inode->i_ino,
+           (unsigned long long) cetrafs_le64(raw->blocks), (unsigned int) cetrafs_le16(raw->eh.eh_entries),
+           (unsigned int) cetrafs_le16(raw->eh.eh_depth), __builtin_return_address(0));
 }
 
 /* Overlay the shadow's file sector onto 'raw' if it is ahead of the
@@ -615,10 +822,67 @@ void cetrafs_inode_fd_overlay(struct inode *inode, cetrafs_inode_t *raw)
     spin_unlock(&ci->fd_lock);
 }
 
-/* Take the shadow for publishing: copies it out and clears the dirty
- * flag. Returns false when there is nothing pending. The caller that
- * fails to publish may re-stage what it took. */
-bool cetrafs_inode_fd_take(struct inode *inode, cetrafs_inode_t *out)
+/* The dirty flag, read under the lock -- the "before" half of the
+ * torn-read check below. */
+bool cetrafs_inode_fd_dirty_snap(struct inode *inode)
+{
+    struct cetrafs_inode_info *ci = CETRAFS_I(inode);
+    bool v;
+
+    spin_lock(&ci->fd_lock);
+    v = ci->fd_dirty;
+    spin_unlock(&ci->fd_lock);
+    return v;
+}
+
+/* cetrafs_inode_fd_overlay() with the torn-read check that the plain
+ * call cannot make: the caller sampled the dirty flag BEFORE reading the
+ * record, and if it was set then but is clear now, a publisher's
+ * CAS-then-clear landed in between -- so the record the caller read may
+ * PREDATE the publish whose content the (now clean) shadow no longer
+ * carries. Proceeding would rebuild the tree from that lagging record
+ * and stage it over everything published, silently dropping extents:
+ * exactly how a two-writer fill with auto-defrag lost a 223-block
+ * extent out of a file's middle (2026-10-28). -EAGAIN tells the caller
+ * to re-read; a read STARTED after the flag was seen clear includes the
+ * publish, because every publisher writes the record before it clears
+ * the flag. */
+int cetrafs_inode_fd_overlay_checked(struct inode *inode, cetrafs_inode_t *raw, bool dirty_before)
+{
+    struct cetrafs_inode_info *ci = CETRAFS_I(inode);
+    int ret = 0;
+
+    spin_lock(&ci->fd_lock);
+    if (ci->fd_dirty)
+        cetrafs_inode_fd_copy(raw, &ci->fd_shadow);
+    else if (dirty_before)
+        ret = -EAGAIN;
+    spin_unlock(&ci->fd_lock);
+    return ret;
+}
+
+/*
+ * TEST ONLY: restore the pre-2026-10-27 bug where take cleared the
+ * dirty flag immediately. With it set, a get_block landing inside a
+ * publisher's CAS window finds fd_dirty=false, so its overlay is a
+ * no-op, it rebuilds the file's tree from the LAGGING device record,
+ * and stages that near-empty tree over everything in flight -- every
+ * extent allocated since the publisher's snapshot is dropped from the
+ * shadow while its bitmap bit stays set, i.e. leaked. This is the knob
+ * tests/kernel/enospc_fill_no_leak.sh flips to prove it catches the
+ * regression; nothing in production sets it.
+ */
+static bool cetrafs_fd_take_clears_dirty;
+module_param_named(fd_take_clears_dirty, cetrafs_fd_take_clears_dirty, bool, 0644);
+MODULE_PARM_DESC(fd_take_clears_dirty, "TEST ONLY: restore the shadow lost-update leak");
+
+/* Snapshot the shadow for publishing. Returns false when there is
+ * nothing pending. Deliberately does NOT clear the dirty flag: the
+ * publish happens outside fd_lock, and anything staged meanwhile must
+ * survive it. The publisher reports back with
+ * cetrafs_inode_fd_published(*out_seq) once its write landed (or was
+ * superseded), and the flag clears only if nothing staged since. */
+bool cetrafs_inode_fd_take(struct inode *inode, cetrafs_inode_t *out, u64 *out_seq)
 {
     struct cetrafs_inode_info *ci = CETRAFS_I(inode);
     bool was;
@@ -627,22 +891,53 @@ bool cetrafs_inode_fd_take(struct inode *inode, cetrafs_inode_t *out)
     was = ci->fd_dirty;
     if (was)
         memcpy(out, &ci->fd_shadow, sizeof(*out));
-    ci->fd_dirty = false;
+    *out_seq = ci->fd_seq;
+    if (unlikely(cetrafs_fd_take_clears_dirty))
+        ci->fd_dirty = false; /* the bug, on purpose (test knob) */
     spin_unlock(&ci->fd_lock);
+    if (was)
+        ctrace("FDTAKE ino=%llu blocks=%llu entries=%u depth=%u\n", (unsigned long long) inode->i_ino,
+               (unsigned long long) cetrafs_le64(out->blocks), (unsigned int) cetrafs_le16(out->eh.eh_entries),
+               (unsigned int) cetrafs_le16(out->eh.eh_depth));
     return was;
 }
 
-/* Drop the pending shadow: a caller that just PUBLISHED a file sector it
- * built from an overlay of this shadow supersedes it -- keeping it dirty
- * would republish the older tree over the newer one at the next
- * boundary. Only ever call directly after a successful fd publish. */
-void cetrafs_inode_fd_discard(struct inode *inode)
+/* The publish that took (or overlaid) the shadow at 'seq' has landed --
+ * or published something strictly newer built from it. Clear the dirty
+ * flag ONLY if nothing staged since; a newer stage must survive to the
+ * next boundary, or its extents leak exactly the way the old
+ * clear-at-take protocol leaked them. */
+void cetrafs_inode_fd_published(struct inode *inode, u64 seq)
 {
     struct cetrafs_inode_info *ci = CETRAFS_I(inode);
 
     spin_lock(&ci->fd_lock);
-    ci->fd_dirty = false;
+    if (ci->fd_seq == seq)
+        ci->fd_dirty = false;
     spin_unlock(&ci->fd_lock);
+}
+
+u64 cetrafs_inode_fd_seq(struct inode *inode)
+{
+    struct cetrafs_inode_info *ci = CETRAFS_I(inode);
+    u64 seq;
+
+    spin_lock(&ci->fd_lock);
+    seq = ci->fd_seq;
+    spin_unlock(&ci->fd_lock);
+    return seq;
+}
+
+/* Every publisher of this record's FILE sector runs its snapshot-CAS-
+ * report sequence under this mutex -- see the field's comment. */
+void cetrafs_inode_fd_pub_lock(struct inode *inode)
+{
+    mutex_lock(&CETRAFS_I(inode)->fd_pub_mutex);
+}
+
+void cetrafs_inode_fd_pub_unlock(struct inode *inode)
+{
+    mutex_unlock(&CETRAFS_I(inode)->fd_pub_mutex);
 }
 
 /* Overlay AND claim: the caller is about to rebuild/publish the file
@@ -694,23 +989,37 @@ struct kmem_cache *cetrafs_inode_cache;
 /* Defined further down, next to the gate that schedules it. */
 static void cetrafs_inode_cold_work(struct work_struct *w);
 
-static void cetrafs_inode_init_once(void *foo)
+/*
+ * Per-IDENTITY state: everything here describes the FILE this object
+ * currently represents, so it must be re-initialized every time the
+ * object takes on a new identity -- cetrafs_iget()'s I_NEW fill path
+ * calls this (cetrafs_inode_identity_init()), not just the slab ctor.
+ *
+ * The slab constructor alone is NOT enough: it runs once per slab
+ * OBJECT, never on recycle, so a recycled object arrives carrying
+ * whatever these fields held when its previous file was evicted. Most
+ * fields have a provable back-to-initial-at-free invariant (argued at
+ * cetrafs_alloc_vfs_inode()), but defrag_queued does not: a background
+ * defrag request holds no inode reference, so an eviction can free the
+ * object with the dedup latch still SET -- and the next file unlucky
+ * enough to recycle that slot had its auto-defrag permanently disabled
+ * (every consider() declined "already queued", and the worker that
+ * clears the latch is exactly what the latch was blocking). Caught by
+ * a full-gate trace on an 8-core node: the armed index-gate trigger hit
+ * "decline latch" on a freshly-created file no one had ever queued
+ * (2026-10-29). The freshness caches (foreign_open_*, *_seq_cached,
+ * tree_cache_cold) are reset here for the same reason: inherited, they
+ * are not merely stale, they are the WRONG FILE's answers.
+ */
+static void cetrafs_inode_identity_init_ci(struct cetrafs_inode_info *ci)
 {
-    struct cetrafs_inode_info *ci = foo;
-
-    mutex_init(&ci->lock_mutex);
-    spin_lock_init(&ci->resv_lock);
-    spin_lock_init(&ci->fd_lock);
     ci->fd_dirty = false;
+    ci->fd_seq = 0;
     ci->resv_next = 0;
     ci->resv_remaining = 0;
     ci->stat_baseline.valid = false;
-    INIT_LIST_HEAD(&ci->resv_span.link);
     ci->resv_span.start = 0;
     ci->resv_span.count = 0;
-    atomic_set(&ci->lock_writer_count, 0);
-    atomic_set(&ci->read_opener_count, 0);
-    atomic_set(&ci->lock_local_open_count, 0);
     ci->foreign_open_cached = true; /* safe default: read fresh until proven sole opener */
     ci->foreign_open_valid = false;
     ci->foreign_open_checked = 0;
@@ -718,11 +1027,34 @@ static void cetrafs_inode_init_once(void *foo)
     atomic_set(&ci->defrag_queued, 0);
     ci->explicit_lock_file = NULL;
     ci->lock_suspended = false;
-    mutex_init(&ci->ns_mutex);
     ci->dirent_seq_cached = U64_MAX;
     ci->file_seq_cached = U64_MAX;
     ci->tree_cache_cold = false;
+    /* A slab object is recycled across identities; a remembered extent
+     * carried over would map the PREVIOUS file's blocks. */
+    ci->ext_valid = false;
+}
+
+void cetrafs_inode_identity_init(struct inode *inode)
+{
+    cetrafs_inode_identity_init_ci(CETRAFS_I(inode));
+}
+
+static void cetrafs_inode_init_once(void *foo)
+{
+    struct cetrafs_inode_info *ci = foo;
+
+    mutex_init(&ci->lock_mutex);
+    spin_lock_init(&ci->resv_lock);
+    spin_lock_init(&ci->fd_lock);
+    mutex_init(&ci->fd_pub_mutex);
+    INIT_LIST_HEAD(&ci->resv_span.link);
+    atomic_set(&ci->lock_writer_count, 0);
+    atomic_set(&ci->read_opener_count, 0);
+    atomic_set(&ci->lock_local_open_count, 0);
+    mutex_init(&ci->ns_mutex);
     INIT_WORK(&ci->cold_work, cetrafs_inode_cold_work);
+    cetrafs_inode_identity_init_ci(ci);
     inode_init_once(&ci->vfs_inode);
 }
 
@@ -1393,8 +1725,6 @@ int cetrafs_lock_release(struct inode *inode, struct file *file)
                    ret);
         t_bg = ktime_get();
 
-        ret = cetrafs_read_raw_inode(sb, inode->i_ino, &raw);
-
         /*
          * If this file spilled into an external extent-leaf block
          * (file.c's cetrafs_get_block()), a plain contiguous append
@@ -1425,8 +1755,10 @@ int cetrafs_lock_release(struct inode *inode, struct file *file)
          * -sector CAS (the !stat_persisted path, which nofilelock and
          * the lock-clear path both reach). Here we only make sure the
          * TREE-block flush below sees the shadow's view of the tree.
+         * (Combined read+overlay: torn-read-safe vs a concurrent
+         * publish -- see cetrafs_read_raw_inode_overlaid().)
          */
-        cetrafs_inode_fd_overlay(inode, &raw);
+        ret = cetrafs_read_raw_inode_overlaid(sb, inode, &raw);
 
         if (!ret && cetrafs_le16(raw.eh.eh_magic) == CETRAFS_EXT_MAGIC && cetrafs_le16(raw.eh.eh_depth) >= 1)
             cetrafs_flush_tree_blocks(inode, &raw);

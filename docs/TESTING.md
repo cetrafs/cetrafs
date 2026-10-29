@@ -18,6 +18,13 @@ corrupts in isolation, the bug is NOT cetrafs.
 Rule: prove layer N clean before testing N+1. Never debug an L_n symptom
 while L_{n-1} is unproven. Keep independent backups until L5 soaks clean.
 
+**This document is about a DEPLOYMENT.** For the automated suites that
+gate every change -- `make check`, the randomized content oracle, the
+fuzzers, the crash rig and the two-node `ctest` scenarios -- see
+`docs/TEST-SUITES.md`. L2 and L3 below assume those are already green:
+a layer that fails its own automated gate is not ready to be deployed
+and bisected by hand.
+
 ---
 
 ## L0 — raw LUN (no cetrafs)
@@ -64,9 +71,15 @@ ONE Proxmox VM only. `mkfs.cetra`, mount, then:
   on the Proxmox VM; remount; `fsck.cetra -r`; verify. **0 fsync loss.** fsck may
   report *unacknowledged* residue (orphan / referenced-but-free) — `-r` fixes it;
   that is the per-fsync (not per-syscall) model, not corruption.
+- The content oracle against the real device:
+  `CT_IMG_DIR=... tests/kernel/churn_oracle.sh` with several seeds and
+  `CHURN_ROUNDS` raised. It is the only check here that compares the
+  bytes read back against what was WRITTEN, per block, warm and cold
+  and after a remount.
 - After every run: `fsck.cetra <dev>` clean.
 
-PASS gate: zero fio verify errors; zero fsync loss; fsck clean (post-crash: clean after `-r`).
+PASS gate: zero fio verify errors; zero fsync loss; fsck clean (post-crash: clean after `-r`);
+content oracle clean across seeds.
 Isolates cetrafs correctness with NO cross-node effects.
 
 ---
@@ -123,14 +136,35 @@ node but relies on HA to kill a partitioned-but-alive node).
 | Corrupt only after migration/concurrent | L1 §2 coherency + §1 ATS | ATS+coherency OK → cetrafs L3 | ESXi caching/ATS → below cetrafs |
 | Two nodes both writing / split-brain | L1 ATS (`caw_probe`), HA fencing | ATS OK + no fence → HA misconfig | `caw_probe=0` → ESXi not passing ATS |
 | Leaked space (fsck "leaked") | L3 | — | cetrafs; check `scrub_reclaimed` rising, else report |
+| Guest reads data it never wrote | L2 (content oracle) | → L3/L4 | cetrafs; **fsck will NOT catch this** -- see below |
 | Slow metadata | expected | — | per-op cost is device round trips, not a bug |
+
+---
+
+## fsck clean is not the same as data correct
+
+Worth stating on its own, because it cost a week to learn: a filesystem
+can be perfectly CONSISTENT and still hand back the wrong bytes. On
+2026-10-28 a punch that split a preallocated extent dropped the
+"uninitialized" flag, so blocks that had never been written began
+serving a deleted file's contents. Throughout, `fsck.cetra` reported
+OK: one owner per block, every count matching the bitmaps, no overlap,
+no leak. There was nothing inconsistent to find.
+
+So at every layer, `fsck` clean is necessary and not sufficient. The
+checks that can catch this class are the ones that know what the bytes
+were SUPPOSED to be -- `fio --verify`, and the content oracle at L2 --
+and at least one of them has to run before a layer is called clean.
 
 ---
 
 ## Confidence bar
 
-cetrafs is from-scratch: heavily reviewed + tested (1233 single-node asserts,
-25 two-node ctest, fuzzing, crash rig) but NOT production-aged like VMFS/ext4.
+cetrafs is from-scratch: heavily reviewed + tested (~1757 single-node asserts
+across 164 suites, ~67 multi-node ctest scenarios on two rigs, fuzzing, a
+crash rig, and a randomized content oracle whose seeded replays caught
+microsecond-window corruption races at one-in-millions per-operation odds
+-- see docs/TEST-SUITES.md) but NOT production-aged like VMFS/ext4.
 Ship to real data only after: L1 gates pass, L2 power-loss clean ×dozens,
 L3–L4 load soak ≥ weeks with zero verify errors and no unexpected fsck finding,
 HA fencing configured. Keep independent backups (to OTHER storage) throughout.

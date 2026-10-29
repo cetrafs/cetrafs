@@ -41,12 +41,14 @@ SKEW_LOOPDEV="$(losetup --find --show "$SKEW_IMG")"
 SKEW_MNT="$(mktemp -d /tmp/cetrafs-skew-mnt-XXXXXX)"
 "$ROOT/userspace/mkfs.cetra" "$SKEW_LOOPDEV" -z 1 -b 512 -J 0 -N 1024 -f >/dev/null
 mount -t cetrafs "$SKEW_LOOPDEV" "$SKEW_MNT"
+require_cetrafs_mount "$SKEW_MNT"
 umount "$SKEW_MNT"
 
 set_stale_window "$TEST_STALE_SECS"
 # last_seen ~2.8h in the past by OUR clock: exactly what a healthy peer
 # whose clock runs behind ours writes on every single heartbeat.
 mount -t cetrafs "$SKEW_LOOPDEV" "$SKEW_MNT"
+require_cetrafs_mount "$SKEW_MNT"
 # Poked AFTER the mount: the no-CAW gate watches every registered row
 # for a full window before admitting a second mounter, and nothing beats
 # this one during a mount, so poking first would have the gate correctly

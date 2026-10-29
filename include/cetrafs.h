@@ -4,8 +4,11 @@
  *
  * The single source of truth for the on-disk format, shared verbatim by
  * the kernel module and the userspace tools. CETRAFS_VERSION (below) is
- * the format version; it is bumped freely and never migrated (pre-1.0,
- * no backward compatibility -- reformat to move between versions).
+ * the format version; it is bumped freely and, as a rule, never
+ * migrated (pre-1.0, no backward compatibility -- reformat to move
+ * between versions). The ONE exception is CETRAFS_VERSION_MIN: see the
+ * comment on it for why the 0x0008 -> 0x0009 step accepts both, and why
+ * that is temporary.
  *
  * Shape of the format:
  *  - Default Block Group (BG) size 1 GiB (mkfs can override).
@@ -120,10 +123,36 @@
  * churn, every step reformatted per the no-compat policy, so the
  * numbers carried no information worth keeping. Historical write-ups
  * (CLAUDE.md, docs) still say "format v0x000B" etc. about that era. */
-#define CETRAFS_VERSION              0x0008
+#define CETRAFS_VERSION              0x0009
+
+/*
+ * The OLDEST on-disk version this build will mount, fsck or grow.
+ *
+ * This is the first time the no-compat policy has been relaxed, and it
+ * is deliberate and temporary. 0x0009 exists so that a GROWN volume is
+ * refused by builds that predate the grow feature -- their fsck demands
+ * pending_free_start immediately after the node table, and their kernel
+ * module demands bg_regions_start >= 1+Z+B, neither of which a
+ * relocated layout satisfies. Without a version gate those builds
+ * report a healthy grown volume as structurally damaged, which is an
+ * invitation to run `fsck -r` on it.
+ *
+ * So: mkfs writes 0x0009, growfs stamps 0x0009 on any volume it grows,
+ * and this build accepts 0x0008 as well so that volumes formatted by
+ * the previous release keep working and can be grown in place without a
+ * reformat. 0x0008 support is TRANSITIONAL and will be dropped; when it
+ * goes, this becomes CETRAFS_VERSION and the usual reformat-to-upgrade
+ * policy resumes.
+ *
+ * Note what this does NOT mean: a 0x0009 volume is not necessarily a
+ * grown one (mkfs stamps it from birth). "Has this been grown?" is
+ * answered by layout_gen in the superblock, not by the version.
+ */
+#define CETRAFS_VERSION_MIN          0x0008
+
 #define CETRAFS_BLOCK_SIZE           4096U
 
-/* CAS granularity (v0x0009): the smallest region an
+/* CAS granularity (v0x0008): the smallest region an
  * atomic COMPARE AND WRITE can cover on any device we support is ONE
  * logical block, and the real deployment target reports 512 bytes with a
  * 1-block maximum (probed: "class=scsi logical_block_size=512
@@ -266,8 +295,93 @@ typedef struct {
     __le64 checksum;              /* CRC32C over struct with this field zeroed; low 32 bits used */
 
     u8  uuid[16];
-    u8  reserved[200];
+
+    /* ---- Grow (extendfs) ----
+     *
+     * Taken from the zero-filled reserved area below, exactly like the
+     * Node Registry's fence_epoch/hb_interval_secs/file_lock_mode: zero
+     * is the natural value a volume formatted before this existed
+     * already has, sizeof(superblock) and the CRC shape do not move,
+     * and fsck never validated `reserved` as zero. So CETRAFS_VERSION
+     * is NOT bumped for grow and a volume formatted by an older build
+     * grows in place -- see docs/internal/EXTENDFS-DESIGN.md for why
+     * relocation (rather than reserved slack) is what makes that
+     * possible.
+     */
+
+    /* Bumped by every published grow. This is a CHANGE STAMP, not a
+     * liveness or presence bit: a node asks "is my cached superblock
+     * the current one?" and nothing else answers that question (rule
+     * 10 -- the file_seq/dirent_seq lesson, applied before it can be
+     * learned the expensive way here). Zero on a volume that has never
+     * been grown; a mount caches it and the heartbeat compares. */
+    __le64 layout_gen;
+
+    /* The relocated descriptor tables' home, carved at the very END of
+     * the device by the grow (never in the gap between the old and new
+     * BG regions -- cetrafs_validate_layout() models the BG regions as
+     * one contiguous bg_cnt*bg_size_blocks span and would read tables
+     * placed there as an overlap). Zero on a never-grown volume, where
+     * the tables still sit in the mkfs-time prefix. */
+    __le64 tail_reserve_start;   /* LBA, 0 = none (never grown) */
+    __le64 tail_reserve_blocks;
+
+    /* Blocks stranded in the prefix by past grows: the superseded ZG
+     * table, BG table and pending-free region, which sit below
+     * bg_regions_start and can never be carved into a BG without
+     * breaking that contiguous-span model. Accumulates across grows.
+     * Reported rather than hidden -- an operator finding it in `df`
+     * instead of in the tool's output is how this becomes a bug
+     * report. */
+    __le64 orphan_blocks;
+
+    /*
+     * End (exclusive LBA) of the Block Group DATA area.
+     *
+     * Needed because a second grow cannot keep the regions contiguous.
+     * Each grow puts its relocated tables in a reserve immediately after
+     * the BGs; the NEXT grow must place its new BGs past that reserve,
+     * which leaves the superseded reserve as a HOLE between the old BGs
+     * and the new ones. The validators used to model the data area as
+     * exactly bg_regions_start + bg_cnt*bg_size_blocks, which a hole
+     * makes false -- and the tables, sitting inside that computed span,
+     * read as an overlap at every mount.
+     *
+     * So the data area is a BOUNDING BOX, not a computed span: the
+     * validator checks that no other region falls inside
+     * [bg_regions_start, bg_data_end) and says nothing about what is
+     * where within it. Individual Block Groups were never validated
+     * from the superblock anyway -- descriptors carry their own
+     * start_block/length_blocks and are checked when read.
+     *
+     * Zero on a volume that has never been grown, where the span IS
+     * contiguous and bg_regions_start + bg_cnt*bg_size_blocks is exact.
+     */
+    __le64 bg_data_end;
+
+    /* Block Group table chain (see cetrafs_bg_segment_t). Both zero on a
+     * volume that has never been grown, where the table is exactly the
+     * contiguous run at bg_table_start that it has always been. */
+    __le64 bg_table_next;        /* LBA of the first appended segment, 0 = none */
+    __le64 bg_table_first_count; /* descriptors in the implicit first segment */
+
+    u8  reserved[144];
 } CETRA_PACKED cetrafs_superblock_t;
+
+/*
+ * The superblock's whole structure, checksum included, must stay inside
+ * ONE sector. That is what lets a grow publish its new table offsets
+ * with a single cetrafs_cas_region(sb, 0, 0, ...) -- the same atomic
+ * primitive every other contested record uses -- instead of needing a
+ * new one. It is also what keeps the publish indivisible against peers.
+ *
+ * Asserted rather than asserted-in-a-comment (rule 7): the structure
+ * grows by carving from `reserved`, and the day someone appends a field
+ * past the sector instead, this is what says so.
+ */
+typedef char cetrafs_sb_fits_one_sector[(sizeof(cetrafs_superblock_t) <= CETRAFS_HOT_SECTOR) ? 1 : -1];
+typedef char cetrafs_sb_checksum_in_sector[(offsetof(cetrafs_superblock_t, checksum) + 8 <= CETRAFS_HOT_SECTOR) ? 1
+                                                                                                                : -1];
 
 /* Pending-free queue entry (see cetrafs_superblock_t.pending_free_start
  * above). Plain-native fields: only the kernel module ever writes these
@@ -392,7 +506,7 @@ struct cetrafs_defrag_stats {
 
 /* ---- Zone Group Descriptor (1 block per ZG) ---- */
 /*
- * Split into a HOT sector and a COLD remainder as of v0x0009, each with
+ * Split into a HOT sector and a COLD remainder as of v0x0008, each with
  * its own checksum (see CETRAFS_HOT_SECTOR above).
  *
  * HOT holds every field a running cluster mutates -- ownership, the
@@ -420,11 +534,36 @@ typedef struct {
     __le64 free_data_blocks;      /* sum of free blocks across member BGs */
     __le64 hb_seq;                /* heartbeat seq from owner */
     __le64 hot_checksum;          /* CRC32C over [0, CETRAFS_HOT_SECTOR) with this field zeroed */
-    u8     hot_pad[CETRAFS_HOT_SECTOR - 28];
+    /*
+     * Free capacity of UNOWNED Block Groups sharded to this record
+     * (shard key: bg_id % zone_group_count -- the same mapping mkfs
+     * uses for the initial assignment). A released-empty BG belongs to
+     * no ZG, so its blocks would otherwise be counted NOWHERE and
+     * statfs would shrink by 512 MiB per handed-back group (found by
+     * the cross-node release suite, 2026-10-28). Maintained by CAS at
+     * claim (-capacity) and release (+capacity), both ordered so a
+     * crash between the two records UNDERSTATES free space (never
+     * phantom space); fsck cross-checks each shard against the actual
+     * unowned members. Placed AFTER hot_checksum so every pre-existing
+     * field keeps its offset: on a volume formatted before the field
+     * existed these bytes are pad, read back as zero, and zero is
+     * correct -- every BG starts owned.
+     */
+    __le64 pool_free_blocks;
+    u8     hot_pad[CETRAFS_HOT_SECTOR - 36];
 
     /* ===== COLD: bytes [CETRAFS_HOT_SECTOR, CETRAFS_BLOCK_SIZE) ===== */
-    __le32 first_bg_id;           /* first BG id mapped to this ZG */
-    __le32 bg_count;              /* number of BGs for this ZG */
+    /*
+     * first_bg_id/bg_count are GONE. A Zone Group no longer describes
+     * which Block Groups belong to it; each Block Group records its own
+     * owner (cetrafs_block_group_t.owner_zg), which is what lets
+     * membership change while the cluster runs -- a grow can add Block
+     * Groups without touching any existing record, and a node can hand
+     * back the empty ones instead of sitting on them.
+     * See docs/internal/BG-OWNERSHIP-DESIGN.md.
+     */
+    __le32 cold_pad0;             /* was first_bg_id */
+    __le32 cold_pad1;             /* was bg_count */
     __le64 cold_checksum;         /* CRC32C over the cold region with this field zeroed */
     u8     cold_pad[CETRAFS_BLOCK_SIZE - CETRAFS_HOT_SECTOR - 16];
 } CETRA_PACKED cetrafs_zone_group_t;
@@ -595,6 +734,22 @@ typedef struct {
 
 #define CETRAFS_NODE_ID_NONE 0xFFFFu
 
+/*
+ * cetrafs_block_group_t.owner_zg when NOBODY owns this Block Group.
+ *
+ * An unowned Block Group is legal, quiescent and allocatable by
+ * whoever claims it: no node may allocate from it until one does, and
+ * claiming is a single compare-and-swap on the Block Group's own
+ * record. It is how a grow adds capacity without deciding in advance
+ * which node gets it, and how a node hands back space it is not using
+ * (docs/internal/BG-OWNERSHIP-DESIGN.md).
+ *
+ * 0xFFFF, not a count-relative value: Zone Groups are capped at 255,
+ * so this can never collide with a real id however the volume is
+ * formatted, and it reads the same way as CETRAFS_NODE_ID_NONE above.
+ */
+#define CETRAFS_BG_OWNER_FREE 0xFFFFu
+
 /* Node liveness timing. Shared rather than kernel-private because the
  * userspace tools need the same answer the kernel would give: mkfs and
  * fsck decide whether a registry row belongs to a node that is still
@@ -728,7 +883,19 @@ typedef struct {
      * opinion, and a peer reading it skips it. */
     __le32  file_lock_mode;
 
-    u8   reserved[36];
+    /* Capabilities this node's running module advertises, a bitmap of
+     * CETRAFS_NODE_CAP_*. Carved from the zero-filled reserved area like
+     * fence_epoch/hb_interval_secs/file_lock_mode above, so 0 means "a
+     * row written before capabilities existed" -- i.e. a node that
+     * predates live grow. A live grow REFUSES unless every REGISTERED
+     * row advertises CETRAFS_NODE_CAP_LIVE_GROW: a 0.8.x node (or any
+     * build without this) publishes 0 and is correctly excluded, which
+     * is what stops an old module being mounted ACROSS a grow -- it may
+     * READ a grown volume, never be live while the layout moves under
+     * its cached, lockless table offsets. */
+    __le32  caps;
+
+    u8   reserved[32];
 } CETRA_PACKED cetrafs_node_entry_t; /* 128 bytes */
 
 /* cetrafs_node_entry_t.file_lock_mode values. */
@@ -736,10 +903,61 @@ typedef struct {
 #define CETRAFS_FLOCK_MODE_ON    1 /* automatic whole-file lock (default mount) */
 #define CETRAFS_FLOCK_MODE_OFF   2 /* nofilelock */
 
+/* cetrafs_node_entry_t.caps bits. */
+#define CETRAFS_NODE_CAP_LIVE_GROW 0x1u /* understands layout_gen; safe to be live across a grow */
+
 /* Table ranges (derived helpers) */
 #define CETRAFS_ZG_TABLE_START(sb)      ((sb)->zg_table_start)
 #define CETRAFS_BG_TABLE_START(sb)      ((sb)->bg_table_start)
 #define CETRAFS_BG_REGIONS_START(sb)    ((sb)->bg_regions_start)
+
+/* ---- Block Group table SEGMENT header ---- */
+/*
+ * The Block Group table is a CHAIN of segments, not one contiguous run.
+ *
+ * Why: growing has to add descriptors, and a contiguous table can only
+ * grow by MOVING -- which is the one thing a running peer cannot
+ * tolerate. Every mounted node caches bg_table_start and reads it on
+ * the allocation path with no lock; relocate it and the peer keeps
+ * compare-and-swapping descriptors at superseded blocks until it next
+ * notices. A chain only ever gets LONGER, and existing links never
+ * change, so a node that has not re-walked it resolves every Block
+ * Group it knows about to exactly the right place -- it simply has not
+ * reached the new ones yet. Out of date means "I know about less",
+ * which is the harmless direction (docs/internal/BG-OWNERSHIP-DESIGN.md).
+ *
+ * The FIRST segment is implicit and has no header: it is the run mkfs
+ * laid down at cetrafs_superblock_t.bg_table_start, holding
+ * bg_table_first_count descriptors, and it never moves. That keeps a
+ * never-grown volume byte-identical to one from before this existed,
+ * and leaves `bg_table_start + id` correct for every Block Group that
+ * was there at format time -- including on the per-block path.
+ *
+ * APPENDED segments each have one of these headers followed by `count`
+ * descriptor blocks. The chain head is bg_table_next in the superblock;
+ * each later append sets the tail segment's `next`. Either way it is
+ * ONE compare-and-swap on one record inside one sector, like
+ * everything else contested here.
+ *
+ * A crash between writing a segment and linking it leaves the segment
+ * unreferenced: invisible, harmless, and reclaimable. The safe
+ * direction, same as a half-grown volume.
+ */
+typedef struct {
+    __le32 magic;                 /* CETRAFS_BGSEG_MAGIC */
+    __le32 count;                 /* descriptor blocks in THIS segment */
+    __le32 first_bg_id;           /* global id of this segment's first descriptor */
+    __le32 pad0;
+    __le64 next;                  /* LBA of the next segment header, 0 = tail */
+    __le64 checksum;              /* CRC32C over the header with this field zeroed */
+    u8     pad[CETRAFS_BLOCK_SIZE - 32];
+} CETRA_PACKED cetrafs_bg_segment_t;
+
+#define CETRAFS_BGSEG_MAGIC 0xC4553B65U
+
+/* The header's live fields and its checksum sit inside the first
+ * sector, which is what lets `next` be set by one atomic swap. */
+typedef char cetrafs_bgseg_fits_one_sector[(offsetof(cetrafs_bg_segment_t, pad) <= CETRAFS_HOT_SECTOR) ? 1 : -1];
 
 /* ---- Block Group Descriptor (global table; 1 block per BG) ---- */
 /*  Describes a contiguous DATA region owned by a ZG. No journals here. */

@@ -46,15 +46,6 @@ ct_param_set hb_interval_secs 2
 # the command substitutions in those args were expanded once, at call
 # time, so the condition could never change and every wait timed out
 # while the thing being waited for had already happened.
-wait_for() { # <seconds> <shell-expression>
-    local deadline=$(( SECONDS + $1 ))
-    while [ "$SECONDS" -lt "$deadline" ]; do
-        if eval "$2"; then return 0; fi
-        sleep 1
-    done
-    return 1
-}
-
 IMG="$(ct_image 560 hbwork)"
 DEV="$(ct_loop "$IMG")"
 MNT="$(ct_mnt hbwork)"

@@ -47,9 +47,20 @@ PY
 : >"$MNT/f"
 chattr +i "$MNT/f" 2>/dev/null && { chattr -i "$MNT/f" 2>/dev/null || true; fail "chattr set an attribute"; } ||
     pass "chattr is refused (no .fileattr_set, deliberate)"
-setfattr -n security.selinux -v x "$MNT/f" 2>/dev/null &&
-    fail "a security.* xattr was accepted on a filesystem that only handles user.*" ||
-    pass "a non-user.* xattr namespace is refused"
+# security.* is deliberately handled (SELinux labelling, kmod/xattr.c);
+# what has NO handler is the system.* namespace (no ACLs). Asserted via
+# python: the old setfattr call passed vacuously wherever the attr
+# package was missing -- "command not found" with stderr suppressed
+# reads exactly like a refusal (2026-10-29).
+python3 -c "
+import errno, os, sys
+try:
+    os.setxattr(sys.argv[1] + '/f', b'system.no_such_handler', b'x')
+except OSError as e:
+    sys.exit(0 if e.errno == errno.EOPNOTSUPP else 1)
+sys.exit(1)" "$MNT" &&
+    pass "an unhandled xattr namespace (system.*) is refused with EOPNOTSUPP" ||
+    fail "a system.* xattr was accepted (or refused with the wrong errno)"
 
 log "what IS reachable through the generic paths still works"
 # No .setattr on a symlink inode (page_symlink_inode_operations has

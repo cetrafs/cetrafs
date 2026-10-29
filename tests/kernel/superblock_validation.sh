@@ -76,6 +76,28 @@ log "a region that runs off the end of the device is refused"
 check bg_regions_start 300000 "the Block Group data regions would extend past total_blocks"
 check inode_table_blocks 400000 "the inode table would extend past total_blocks"
 
+# The version gate became a RANGE when 0x0009 was introduced so that
+# volumes from the previous release stay mountable and growable without
+# a reformat (cetrafs.h). A range is easier to get wrong than an
+# equality -- an off-by-one at either end silently admits a layout this
+# build does not understand, or locks out one it does -- so both ends
+# are poked, and the accepted values are required to still mount.
+log "the format version gate accepts exactly its supported range"
+check version 7 "a format version older than this build supports"
+check version 10 "a format version newer than this build knows"
+check version 65535 "a nonsense format version"
+
+for v in 8 9; do
+    "$SB_POKE" "$DEV" version "$v" >/dev/null
+    if mount -t cetrafs "$DEV" "$MNT" 2>/dev/null; then
+        umount "$MNT"
+        pass "format version $v is accepted"
+    else
+        fail "format version $v was refused, but this build is supposed to accept it"
+    fi
+done
+"$SB_POKE" "$DEV" version 9 >/dev/null
+
 log "counts must fit the regions that hold them"
 check inodes_count 999999 "more inodes than the bitmap has bits or the table has blocks"
 check inodes_count 0 "an inode table nothing can be allocated from"

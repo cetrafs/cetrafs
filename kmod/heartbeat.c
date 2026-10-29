@@ -81,6 +81,22 @@ module_param_named(fence_skip_precheck, cetrafs_fence_skip_precheck, bool, 0644)
 MODULE_PARM_DESC(fence_skip_precheck,
                  "test-only: skip the heartbeat's fence pre-check so the renew alone detects a revoked lease");
 
+/*
+ * Test-only: drop one Zone Group out of this node's OWNERSHIP CACHE,
+ * leaving the on-disk record untouched.
+ *
+ * That is the state a ZG is in between leaving this node and coming
+ * back -- and the next tick's re-attach then re-seeds its Block Groups'
+ * count epochs, which is the exact seam a delta accrued before the
+ * handover must not survive (tests/kernel/bg_delta_vs_reattach.sh).
+ * Reaching it for real needs a second node taking the ZG and dying;
+ * single-node, there is no other way in. Consumed on use, so one write
+ * arms exactly one re-attach.
+ */
+static int cetrafs_test_uncache_zg = -1;
+module_param_named(test_uncache_zg, cetrafs_test_uncache_zg, int, 0644);
+MODULE_PARM_DESC(test_uncache_zg, "TEST ONLY: forget owning this zone group, so the next tick re-attaches to it");
+
 static void cetrafs_heartbeat_tick(struct work_struct *work)
 {
     struct cetrafs_heartbeat *hb = container_of(work, struct cetrafs_heartbeat, work.work);
@@ -88,6 +104,14 @@ static void cetrafs_heartbeat_tick(struct work_struct *work)
     u32 my_node_id;
     u8 my_uuid[CETRAFS_NODE_UUID_LEN];
     int ret;
+
+    if (cetrafs_test_uncache_zg >= 0) {
+        u32 zg = (u32) cetrafs_test_uncache_zg;
+
+        cetrafs_test_uncache_zg = -1;
+        pr_info("heartbeat: TEST: forgetting ownership of ZG %u in cache\n", zg);
+        cetrafs_sb_uncache_zg_ownership(sb, zg);
+    }
 
     /* Self-fence latch: a fenced node's tick does NOTHING
      * -- renewing our row would make us look alive again and fight the

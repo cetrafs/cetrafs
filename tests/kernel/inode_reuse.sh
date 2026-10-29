@@ -40,6 +40,7 @@ REUSE_MNT="$(mktemp -d /tmp/cetrafs-reuse-mnt-XXXXXX)"
 "$ROOT/userspace/mkfs.cetra" "$REUSE_LOOPDEV" -z 1 -b 512 -J 0 -N 1024 -f >/dev/null
 
 mount -t cetrafs "$REUSE_LOOPDEV" "$REUSE_MNT"
+require_cetrafs_mount "$REUSE_MNT"
 
 mkdir "$REUSE_MNT/reuse-dir"
 REUSE_INO="$(stat -c '%i' "$REUSE_MNT/reuse-dir")"

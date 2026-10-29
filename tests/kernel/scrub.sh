@@ -33,7 +33,7 @@ free_blocks() { info | sed -n 's/^free_data_blocks: //p'; }
 reclaimed() { info | sed -n 's/^scrub_reclaimed: //p'; }
 
 # A fast scrub: a 2 s cycle with a 1 s two-pass gap (the default is 30 min).
-ct_param_set scrub 1
+# `scrub` itself is armed only AFTER the baseline below is captured.
 ct_param_set scrub_interval_secs 2
 ct_param_set scrub_gap_secs 1
 
@@ -52,15 +52,26 @@ log "mount with the fast scrub; it should reclaim the leaked blocks on its own"
 mount -t cetrafs "$DEV" "$MNT"
 require_cetrafs_mount "$MNT"
 BEFORE="$(free_blocks)"
-[ "$(reclaimed)" = 0 ] && pass "scrub_reclaimed starts at 0" || fail "scrub_reclaimed not 0 at mount: $(reclaimed)"
+
+# scrub_reclaimed is a MODULE-GLOBAL cumulative counter (one atomic64 in
+# scrub.c, never reset per mount), so it reads 0 only when this suite
+# happens to be the first scrub of the module's life. Inside a full
+# `make check` an earlier suite has already reclaimed blocks -- 64, from
+# scrub_integrity -- and an absolute reading then failed all three
+# assertions below while the scrub was working perfectly. Measure the
+# DELTA, and arm the scrub only once the baseline is in hand so no cycle
+# can land inside the measurement.
+BASE="$(reclaimed)"
+pass "baseline captured before the scrub is armed (scrub_reclaimed=$BASE, module-global)"
+ct_param_set scrub 1
 
 # One cycle is interval(2s) + gap(1s) + work; give it generous margin.
 for i in $(seq 1 20); do
-    [ "$(reclaimed)" -gt 0 ] && break
+    [ "$(( $(reclaimed) - BASE ))" -gt 0 ] && break
     sleep 1
 done
 AFTER="$(free_blocks)"
-REC="$(reclaimed)"
+REC="$(( $(reclaimed) - BASE ))"
 
 [ "$REC" = "$NLEAK" ] \
     && pass "the scrub reclaimed exactly the leaked blocks (scrub_reclaimed=$REC)" \

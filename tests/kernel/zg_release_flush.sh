@@ -58,10 +58,10 @@ pending()    { grep -oP '^zg_pending_deltas: \K[0-9]+' "$PROC/info"; }
 # genuinely full (fill-bitmap, not a poked counter -- a mount
 # reconciles a counter back from the bitmap).
 INFO="$(cat "$PROC/info")"
-ZG0_FIRST="$(echo "$INFO" | grep -P '^\s+zg 0:' | grep -oP 'first_bg=\K[0-9]+')"
-ZG0_N="$(echo "$INFO" | grep -P '^\s+zg 0:' | grep -oP 'bg_count=\K[0-9]+')"
 ct_umount "$MNT"
-for ((bg = ZG0_FIRST; bg < ZG0_FIRST + ZG0_N; bg++)); do
+# Zone Group 0's members, asked of the Block Groups -- there is no span
+# in procfs to walk any more (tests/lib/harness.sh).
+for bg in $(ct_bgs_of_zg "$DEV" 0); do
     "$BG_POKE" "$DEV" "$bg" 0 fill-bitmap >/dev/null
 done
 ct_mount "$DEV" "$MNT"

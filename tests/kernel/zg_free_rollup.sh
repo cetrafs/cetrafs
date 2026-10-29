@@ -33,6 +33,7 @@ ZGAGG_MNT="$(mktemp -d /tmp/cetrafs-zgagg-mnt-XXXXXX)"
 "$ROOT/userspace/mkfs.cetra" "$ZGAGG_LOOPDEV" -z 1 -b 512 -J 0 -N 1024 -f >/dev/null
 
 mount -t cetrafs "$ZGAGG_LOOPDEV" "$ZGAGG_MNT"
+require_cetrafs_mount "$ZGAGG_MNT"
 
 dd if=/dev/zero bs=4096 count=256 2>/dev/null | tr '\0' 'A' > "$ZGAGG_MNT/zgaggfile"
 sync

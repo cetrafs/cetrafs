@@ -16,7 +16,12 @@
 # Both halves are asserted: a regression that drops the cap wastes
 # space on small volumes, and one that drops the target silently brings
 # back the overflow this sizing exists to prevent.
-. "$(dirname "$0")/../lib/harness.sh"
+# set -euo pipefail, and the BASH_SOURCE form, like every other suite.
+# Without -e a failed mkfs or mount here was ignored and the assertions
+# below ran against nothing -- the vacuous pass tests/README.md exists
+# to prevent.
+set -euo pipefail
+. "$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)/lib/harness.sh"
 require_root
 suite "pending-free queue sizing"
 

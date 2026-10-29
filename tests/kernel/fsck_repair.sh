@@ -42,6 +42,17 @@ build() {
     FREE="$(stat -f -c '%f' "$MNT")"
     sync
     ct_umount "$MNT"
+    # The pokes below write through the LOOP DEVICE, and the module has
+    # just been writing through it too. Flush so a poke cannot land
+    # behind a page the device still holds -- every other poking suite
+    # here does the same. This suite used to poke the backing FILE
+    # instead, which is the same bytes reached through a second,
+    # independent page cache: fsck could then read the image as it was
+    # before the fault was injected, "detect" nothing, and the
+    # assertion that a non-repairable fault stops the repair would fail
+    # for a reason that had nothing to do with fsck. Intermittent, and
+    # it only ever showed up under a full batch.
+    blockdev --flushbufs "$DEV" 2>/dev/null || true
 }
 
 log "a healthy volume: -r must be silent and change nothing"
@@ -58,9 +69,9 @@ ct_fsck "$DEV" >/dev/null 2>&1 && pass "...and the volume is still clean afterwa
 
 log "the crash residue: a leaked block, a block marked free, a wrong link count"
 build
-"$CPOKE" "$IMG" bitset 0 900 >/dev/null     # marked used, nothing references it
-"$CPOKE" "$IMG" bitclr 0 1 >/dev/null       # referenced, marked free -- handed out twice
-"$IPOKE" "$IMG" nlink 1 9 >/dev/null        # root's link count
+"$CPOKE" "$DEV" bitset 0 900 >/dev/null     # marked used, nothing references it
+"$CPOKE" "$DEV" bitclr 0 1 >/dev/null       # referenced, marked free -- handed out twice
+"$IPOKE" "$DEV" nlink 1 9 >/dev/null        # root's link count
 BEFORE="$(ct_fsck "$DEV" 2>&1 | grep -cE '^(ERR|WARN)' || true)"
 [ "$BEFORE" -ge 3 ] && pass "the three faults are all detected before the repair ($BEFORE reports)" ||
     fail "only $BEFORE reports -- the image is not in the state this test needs"
@@ -95,9 +106,9 @@ log "a fault with no derivable answer must stop the repair ENTIRELY"
 # file's blocks back to the allocator.
 build
 ct_mount "$DEV" "$MNT"; INO="$(stat -c '%i' "$MNT/f")"; ct_umount "$MNT"
-"$CPOKE" "$IMG" bitset 0 901 >/dev/null
-"$CPOKE" "$IMG" extent "$INO" 9000 >/dev/null
-"$CPOKE" "$IMG" extent 2 9000 >/dev/null
+"$CPOKE" "$DEV" bitset 0 901 >/dev/null
+"$CPOKE" "$DEV" extent "$INO" 9000 >/dev/null
+"$CPOKE" "$DEV" extent 2 9000 >/dev/null
 OUT="$(ct_fsck_repair "$DEV" 2>&1 || true)"
 echo "$OUT" | grep -q "NOTE: repair is disabled" &&
     pass "fsck -r says why it will not repair a volume with cross-file overlap" ||
@@ -114,7 +125,7 @@ log "a record it cannot read must stop the repair too"
 # looks leaked. This is the dangerous case: the one where repairing
 # would turn a contained fault into cross-file corruption.
 build
-"$IPOKE" "$IMG" corrupt 3 >/dev/null 2>&1 || "$IPOKE" "$IMG" nlink 3 1 >/dev/null
+"$IPOKE" "$DEV" corrupt 3 >/dev/null 2>&1 || "$IPOKE" "$DEV" nlink 3 1 >/dev/null
 OUT="$(ct_fsck_repair "$DEV" 2>&1 || true)"
 if echo "$OUT" | grep -q "checksum is wrong"; then
     echo "$OUT" | grep -q "NOTE: repair is disabled" &&

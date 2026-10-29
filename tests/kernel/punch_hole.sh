@@ -43,6 +43,7 @@ FALLOC_MNT="$(mktemp -d /tmp/cetrafs-falloc-mnt-XXXXXX)"
 "$ROOT/userspace/mkfs.cetra" "$FALLOC_LOOPDEV" -z 1 -b 512 -J 0 -N 1024 -f >/dev/null
 
 mount -t cetrafs "$FALLOC_LOOPDEV" "$FALLOC_MNT"
+require_cetrafs_mount "$FALLOC_MNT"
 
 dd if=/dev/zero bs=4096 count=256 2>/dev/null | tr '\0' 'A' > "$FALLOC_MNT/punchme"
 sync

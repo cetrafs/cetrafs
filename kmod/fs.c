@@ -36,8 +36,11 @@ int cetrafs_sb_get_free_inodes(struct super_block *sb, u64 *out);
 int cetrafs_sb_get_node_id(struct super_block *sb, u32 *out);
 int cetrafs_sb_get_node_uuid(struct super_block *sb, u8 out[CETRAFS_NODE_UUID_LEN]);
 struct cetrafs_journal *cetrafs_sb_get_journal(struct super_block *sb);
-void cetrafs_sb_cache_zg_ownership(struct super_block *sb, u32 zg_id, u32 first_bg_id, u32 bg_count);
-bool cetrafs_sb_zg_owned_cached(struct super_block *sb, u32 zg_id, u32 *out_first_bg_id, u32 *out_bg_count);
+void cetrafs_sb_cache_zg_ownership(struct super_block *sb, u32 zg_id);
+bool cetrafs_sb_zg_owned_cached(struct super_block *sb, u32 zg_id);
+u32 cetrafs_sb_bg_owner(struct super_block *sb, u32 bg_id);
+void cetrafs_sb_set_bg_owner(struct super_block *sb, u32 bg_id, u32 zg_id);
+void cetrafs_sb_owned_bgs(struct super_block *sb, const unsigned long **out_bits, u32 *out_nbits);
 
 /* ------ private superblock info kept in s_fs_info ------ */
 struct cetrafs_sb_info {
@@ -276,8 +279,6 @@ struct cetrafs_sb_info {
      * that fact (and the ZG's static, mkfs-time-fixed first_bg_id/
      * bg_count) is always safe, not just an optimistic guess. */
     DECLARE_BITMAP(owned_zgs, CETRAFS_MAX_ZONE_GROUPS);
-    u32 owned_zg_first_bg[CETRAFS_MAX_ZONE_GROUPS];
-    u32 owned_zg_bg_count[CETRAFS_MAX_ZONE_GROUPS];
 
 
     /*
@@ -319,6 +320,40 @@ struct cetrafs_sb_info {
     unsigned long *bg_free_dirty;
 
     /*
+     * Per-Block-Group ownership, the replacement for the Zone Group's
+     * contiguous range (docs/internal/BG-OWNERSHIP-DESIGN.md).
+     *
+     * bg_owner_zg[] is every Block Group's owning Zone Group, read once
+     * at mount from the descriptors. owned_bgs is the derived answer to
+     * the only question the hot paths ask -- "may this node allocate
+     * here?" -- recomputed whenever a Zone Group is claimed or
+     * released, which is rare, so the per-block cost is one bit test
+     * and no device read.
+     *
+     * Both are sized to bg_count at mount and never reallocated, so a
+     * lockless reader can never see a freed array.
+     */
+    u16 *bg_owner_zg;
+    unsigned long *owned_bgs;
+
+    /*
+     * Where each Block Group's DESCRIPTOR lives.
+     *
+     * It used to be bg_table_start + bg_id, full stop. The table is a
+     * chain now (cetrafs_bg_segment_t): the first segment is still that
+     * contiguous run, and growing appends segments elsewhere rather
+     * than moving anything. Resolving an id therefore means knowing
+     * which segment holds it.
+     *
+     * Kept as a flat array, built once at mount, because this is read
+     * on the per-block allocation path and a walk of the chain there
+     * would be a lookup where there used to be an addition
+     * (PERFORMANCE.md rule 1). One u64 per Block Group: 512 KiB for a
+     * 64 TiB volume, which buys an O(1) answer with no device read.
+     */
+    u64 *bg_desc_lba;
+
+    /*
      * BGs whose DATA BITMAP carries allocation bits this node has not
      * made durable yet.
      *
@@ -346,6 +381,22 @@ struct cetrafs_sb_info {
      * reclaims it; that direction needs no barrier.
      */
     unsigned long *bmap_alloc_dirty;
+
+    /* TEST ONLY (alloc_shadow=1): in-core shadow of every data-block
+     * allocate/free this node performs, indexed by absolute LBA. A
+     * second SET of a still-set bit is a double allocation caught at
+     * the exact moment with a stack -- immune to any buffer-cache
+     * staleness, which is the point: it arbitrates between "the bitmap
+     * buffer lied" and "two allocators really were handed one block". */
+    unsigned long *alloc_shadow;
+    /* Inode numbers mid-BIRTH on this node: set by cetrafs_alloc_inode(),
+     * cleared once the first name is published (or by any free). The
+     * scrub's orphan reclaim must skip these: a newborn's record is not
+     * yet written, so to a scanner it is indistinguishable from the
+     * previous incarnation's dead record -- the scrub freed exactly such
+     * a number 378us after its rebirth and two files ended up sharing
+     * one inode (2026-10-29, full-probe churn tape). */
+    unsigned long *inode_birth;
 
     /* Per-ZG pending-free backoff.
      *
@@ -381,8 +432,23 @@ struct cetrafs_sb_info {
      * had just derived from the bitmaps, correctly checksummed and
      * undetectable. Same clobber, same cure as zg_free_delta below. */
     atomic64_t *bg_free_delta;
-    unsigned long bg_sweep_last;  /* jiffies of the last foreign-descriptor sweep */
-    unsigned long pf_drain_last;  /* jiffies of the last on-demand pending-free drain */
+    /*
+     * Per-BG count of ALLOCATIONS (never frees). The background scrub's
+     * verdict -- "this block is bitmap-set and referenced by nothing" --
+     * is gathered by a pass that reads one uncached record per allocated
+     * inode and so takes a long time under load, and is acted on later
+     * still, block by block. A block that was genuinely free when the
+     * evidence was taken can be handed to a new file inside that window,
+     * and freeing it then takes a block away from its brand-new owner:
+     * two inodes end up mapping it.
+     *
+     * The scrub snapshots this before gathering evidence and abandons a
+     * Block Group whose count moved. Frees deliberately do NOT bump it,
+     * so the scrub's own reclaims don't invalidate the rest of its pass.
+     */
+    atomic64_t *bg_alloc_seq;
+    unsigned long bg_sweep_last; /* jiffies of the last foreign-descriptor sweep */
+    unsigned long pf_drain_last; /* jiffies of the last on-demand pending-free drain */
 
     /* Each BG count's ownership epoch (cetrafs_block_group_t.
      * reconcile_seq) as of OUR reconcile -- the epoch our accrued
@@ -390,7 +456,9 @@ struct cetrafs_sb_info {
      * whose epoch moved (a new owner reconciled; our deltas' durable
      * effects are already in its recount). Written on the ownership
      * paths (alloc.c's reconcile, zonegroup.c's re-attach seeding),
-     * read at flush. */
+     * read at flush. Moving it DROPS any delta still accrued for that
+     * BG (cetrafs_sb_set_bg_epoch()): the epoch only moves on a
+     * recount, and a recount already includes it. */
     u64 *bg_count_epoch;
 
     /* The ZG free_data_blocks aggregate is ACCRUED here and applied by
@@ -521,7 +589,18 @@ static int cetrafs_validate_layout(const cetrafs_superblock_t *sb, u64 total_blo
 
     r[n++] = (struct cetrafs_region) {"superblock", 0, 1};
     r[n++] = (struct cetrafs_region) {"zone group table", le64_to_cpu(sb->zg_table_start), zg_cnt};
-    r[n++] = (struct cetrafs_region) {"block group table", le64_to_cpu(sb->bg_table_start), bg_cnt};
+    /* the FIRST SEGMENT only. The Block Group table is a chain: the run at
+     * bg_table_start holds bg_table_first_count descriptors and the rest
+     * live in appended segments elsewhere, so block_group_count stopped
+     * being this region's length the moment a volume was grown
+     * (docs/internal/BG-OWNERSHIP-DESIGN.md). */
+    {
+        u64 first = le64_to_cpu(sb->bg_table_first_count);
+
+        if (!first || first > bg_cnt)
+            first = bg_cnt; /* never grown: the table is the whole run */
+        r[n++] = (struct cetrafs_region) {"block group table", le64_to_cpu(sb->bg_table_start), first};
+    }
     r[n++] =
         (struct cetrafs_region) {"inode bitmap", le64_to_cpu(sb->inode_bmap_start), le64_to_cpu(sb->inode_bmap_blocks)};
     r[n++] = (struct cetrafs_region) {"inode table", le64_to_cpu(sb->inode_table_start),
@@ -532,8 +611,45 @@ static int cetrafs_validate_layout(const cetrafs_superblock_t *sb, u64 total_blo
                                       zg_cnt * le32_to_cpu(sb->pending_free_blocks_per_zg)};
     r[n++] = (struct cetrafs_region) {"per-node journals", le64_to_cpu(sb->node_journal_start),
                                       (u64) le32_to_cpu(sb->node_table_count) * le32_to_cpu(sb->node_journal_blocks)};
-    r[n++] = (struct cetrafs_region) {"block group regions", le64_to_cpu(sb->bg_regions_start),
-                                      bg_cnt * le64_to_cpu(sb->bg_size_blocks)};
+    /* The data area is a BOUNDING BOX when bg_data_end is set: a grown
+     * volume has a hole where a superseded tail reserve used to be, so
+     * bg_cnt * bg_size_blocks is no longer its extent (cetrafs.h). A
+     * never-grown volume keeps the exact computed span. */
+    {
+        u64 data_start = le64_to_cpu(sb->bg_regions_start);
+        u64 data_end = le64_to_cpu(sb->bg_data_end);
+
+        if (!data_end)
+            data_end = data_start + bg_cnt * le64_to_cpu(sb->bg_size_blocks);
+        if (data_end < data_start) {
+            pr_err("superblock: bg_data_end (%llu) precedes bg_regions_start (%llu)\n", (unsigned long long) data_end,
+                   (unsigned long long) data_start);
+            return -EINVAL;
+        }
+
+        /*
+         * The box must be at least big enough to HOLD its Block Groups.
+         *
+         * This is what the old contiguous-span model gave for free and
+         * the bounding box silently gave up: with the span, a carve
+         * placed one BG too low made the computed span reach past the
+         * tables and the overlap test caught it. The box is derived
+         * from the same carve, so a low carve just produces a smaller
+         * box that still "contains" its overlapping BGs -- and mounts.
+         * A grow test injecting exactly that found this.
+         *
+         * A hole only ever makes the box LARGER than the sum of its
+         * BGs, never smaller, so >= is the honest invariant. O(1), from
+         * the superblock alone: no BG table scan on the mount path.
+         */
+        if (data_end - data_start < bg_cnt * le64_to_cpu(sb->bg_size_blocks)) {
+            pr_err("superblock: data area [%llu,%llu) is too small for %llu Block Group(s) of %llu blocks\n",
+                   (unsigned long long) data_start, (unsigned long long) data_end, (unsigned long long) bg_cnt,
+                   (unsigned long long) le64_to_cpu(sb->bg_size_blocks));
+            return -EINVAL;
+        }
+        r[n++] = (struct cetrafs_region) {"block group regions", data_start, data_end - data_start};
+    }
 
     /* Drop the regions that are legitimately absent (a zero-sized
      * journal, no pending-free reservation) rather than treating a zero
@@ -626,7 +742,6 @@ int cetrafs_fill_super(struct super_block *sb, struct fs_context *fc)
     cetrafs_superblock_t *ondisk;
     u64 dev_bytes, dev_blocks;
     u64 zg_cnt, bg_cnt, bg_regions_start, bg_size_blocks;
-    u64 topology_min;
     u64 features_incompat;
 
     pr_debug("fill_super()\n");
@@ -652,10 +767,18 @@ int cetrafs_fill_super(struct super_block *sb, struct fs_context *fc)
         brelse(bh);
         return -EINVAL;
     }
-    if (le16_to_cpu(ondisk->version) != CETRAFS_VERSION) {
-        pr_err("unsupported version: 0x%04x (want 0x%04x)\n", le16_to_cpu(ondisk->version), CETRAFS_VERSION);
-        brelse(bh);
-        return -EOPNOTSUPP;
+    {
+        u16 v = le16_to_cpu(ondisk->version);
+
+        /* A RANGE, not an equality: CETRAFS_VERSION_MIN (cetrafs.h)
+         * keeps volumes from the previous release mountable so they can
+         * be grown in place rather than reformatted. Transitional. */
+        if (v < CETRAFS_VERSION_MIN || v > CETRAFS_VERSION) {
+            pr_err("unsupported version: 0x%04x (this build accepts 0x%04x..0x%04x)\n", v, CETRAFS_VERSION_MIN,
+                   CETRAFS_VERSION);
+            brelse(bh);
+            return -EOPNOTSUPP;
+        }
     }
     if (le32_to_cpu(ondisk->block_size) != CETRAFS_BLOCK_SIZE) {
         pr_err("on-disk block size %u != %u\n", le32_to_cpu(ondisk->block_size), CETRAFS_BLOCK_SIZE);
@@ -733,21 +856,23 @@ int cetrafs_fill_super(struct super_block *sb, struct fs_context *fc)
         return -EINVAL;
     }
 
-    /* The on-disk layout reserves:
-     *  [0] superblock
-     *  [1..Z] ZG table
-     *  [1+Z .. 1+Z+B-1] BG table (1 block per BG)
-     *  Then inode bitmap/table/journals (whose LBAs are present in SB)
-     *  bg_regions_start points to the first BG region
-     * Sanity: bg_regions_start must not precede 1+Z+B.
+    /*
+     * There used to be a `bg_regions_start >= 1 + Z + B` check here.
+     * It encoded the mkfs-time layout -- both descriptor tables sitting
+     * in the prefix, immediately below the regions -- as if it were an
+     * invariant of the format. It is not: every table's location is a
+     * superblock field, and a GROWN volume has relocated its ZG table,
+     * BG table and pending-free region into a reserve at the END of the
+     * device (docs/internal/EXTENDFS-DESIGN.md). B then outgrows the
+     * original prefix and a perfectly valid volume fails to mount: a
+     * 64 TiB grow puts 1+Z+B at ~65k blocks, past a 1 TiB volume's
+     * bg_regions_start.
+     *
+     * Nothing is lost by dropping it. cetrafs_validate_layout() below
+     * sorts every region and tests them pairwise for overlap, which is
+     * strictly stronger than one ordering constraint between two of
+     * them -- and unlike this check it holds wherever the tables are.
      */
-    topology_min = 1 + zg_cnt + bg_cnt; /* minimum after the two descriptor tables */
-    if (bg_regions_start < topology_min) {
-        pr_err("bg_regions_start (%llu) < 1+Z+B (%llu)\n", (unsigned long long) bg_regions_start,
-               (unsigned long long) topology_min);
-        brelse(bh);
-        return -EINVAL;
-    }
 
     /* inode structure sanity */
     if (!le64_to_cpu(ondisk->inode_bmap_blocks) || !le64_to_cpu(ondisk->inode_table_blocks)) {
@@ -893,13 +1018,28 @@ int cetrafs_fill_super(struct super_block *sb, struct fs_context *fc)
         }
 
         sbi->bmap_alloc_dirty = bitmap_zalloc(bg_cnt, GFP_KERNEL);
+        if (cetrafs_alloc_shadow_enabled && sbi->total_blocks <= UINT_MAX)
+            sbi->alloc_shadow =
+                bitmap_zalloc((unsigned int) sbi->total_blocks, GFP_KERNEL); /* test-only; NULL is fine */
+        sbi->inode_birth = bitmap_zalloc(le32_to_cpu(ondisk->inodes_count) + 1, GFP_KERNEL);
         sbi->bg_free_dirty = bitmap_zalloc(bg_cnt, GFP_KERNEL);
         sbi->bg_free_delta = kcalloc(bg_cnt, sizeof(*sbi->bg_free_delta), GFP_KERNEL);
+        sbi->bg_alloc_seq = kcalloc(bg_cnt, sizeof(*sbi->bg_alloc_seq), GFP_KERNEL);
         sbi->bg_count_epoch = kcalloc(bg_cnt, sizeof(*sbi->bg_count_epoch), GFP_KERNEL);
-        if (!sbi->bg_free_dirty || !sbi->bg_free_delta || !sbi->bg_count_epoch || !sbi->bmap_alloc_dirty) {
+        sbi->bg_owner_zg = kcalloc(bg_cnt, sizeof(*sbi->bg_owner_zg), GFP_KERNEL);
+        sbi->owned_bgs = bitmap_zalloc(bg_cnt, GFP_KERNEL);
+        sbi->bg_desc_lba = kcalloc(bg_cnt, sizeof(*sbi->bg_desc_lba), GFP_KERNEL);
+        if (!sbi->bg_free_dirty || !sbi->bg_free_delta || !sbi->bg_alloc_seq || !sbi->bg_count_epoch ||
+            !sbi->bmap_alloc_dirty || !sbi->bg_owner_zg || !sbi->owned_bgs || !sbi->bg_desc_lba) {
+            kfree(sbi->bg_desc_lba);
+            bitmap_free(sbi->owned_bgs);
+            kfree(sbi->bg_owner_zg);
             kfree(sbi->bg_count_epoch);
             kfree(sbi->bg_free_delta);
+            kfree(sbi->bg_alloc_seq);
             bitmap_free(sbi->bmap_alloc_dirty);
+            bitmap_free(sbi->alloc_shadow);
+    bitmap_free(sbi->inode_birth);
             bitmap_free(sbi->bg_free_dirty);
             kfree(sbi->zg_pf_drop_blocks);
             kfree(sbi->zg_pf_drop_runs);
@@ -912,9 +1052,15 @@ int cetrafs_fill_super(struct super_block *sb, struct fs_context *fc)
 
         sbi->raw_sb = kmemdup(ondisk, sizeof(*ondisk), GFP_KERNEL); /* optional debug */
         if (!sbi->raw_sb) {
+            kfree(sbi->bg_desc_lba);
+            bitmap_free(sbi->owned_bgs);
+            kfree(sbi->bg_owner_zg);
             kfree(sbi->bg_count_epoch);
             kfree(sbi->bg_free_delta);
+            kfree(sbi->bg_alloc_seq);
             bitmap_free(sbi->bmap_alloc_dirty);
+            bitmap_free(sbi->alloc_shadow);
+    bitmap_free(sbi->inode_birth);
             bitmap_free(sbi->bg_free_dirty);
             kfree(sbi->zg_pf_drop_blocks);
             kfree(sbi->zg_pf_drop_runs);
@@ -1028,29 +1174,33 @@ int cetrafs_fill_super(struct super_block *sb, struct fs_context *fc)
                     bool cluster_off = (cluster_mode == CETRAFS_FLOCK_MODE_OFF);
 
                     if (local_off && !cluster_off) {
-                        pr_err("mount: -o nofilelock conflicts with this cluster -- the first "
-                               "mounter established the file lock ON, and a mixed cluster has no "
-                               "coherent cross-node locking. Refusing. Unmount every node to "
-                               "change the mode, or drop nofilelock to inherit it.\n");
+                        pr_err(
+                            "mount: -o nofilelock conflicts with this cluster -- the first "
+                            "mounter established the file lock ON, and a mixed cluster has no "
+                            "coherent cross-node locking. Refusing. Unmount every node to "
+                            "change the mode, or drop nofilelock to inherit it.\n");
                         cetrafs_free_sb_info(sb);
                         brelse(bh);
                         return -EINVAL;
                     }
                     if (cluster_off != local_off)
-                        pr_info("mount: inheriting file_lock=%s from the cluster (set by the "
-                                "first mounter), overriding this node's default\n",
-                                cluster_off ? "off" : "on");
+                        pr_info(
+                            "mount: inheriting file_lock=%s from the cluster (set by the "
+                            "first mounter), overriding this node's default\n",
+                            cluster_off ? "off" : "on");
                     sbi->file_lock_enabled = !cluster_off;
                 } else {
-                    pr_info("mount: no live peer -- this node leads the cluster with "
-                            "file_lock=%s\n",
-                            sbi->file_lock_enabled ? "on" : "off");
+                    pr_info(
+                        "mount: no live peer -- this node leads the cluster with "
+                        "file_lock=%s\n",
+                        sbi->file_lock_enabled ? "on" : "off");
                 }
 
                 if (!sbi->file_lock_enabled)
-                    pr_info("file lock OFF (nofilelock): this node claims no exclusive open "
-                            "lock and refuses no open -- the upper layer must prevent "
-                            "concurrent writers. Defragmentation is off too.\n");
+                    pr_info(
+                        "file lock OFF (nofilelock): this node claims no exclusive open "
+                        "lock and refuses no open -- the upper layer must prevent "
+                        "concurrent writers. Defragmentation is off too.\n");
             }
         }
 
@@ -1074,12 +1224,94 @@ int cetrafs_fill_super(struct super_block *sb, struct fs_context *fc)
         {
             u32 nbg = le32_to_cpu(ondisk->block_group_count), b;
 
+            /*
+             * Resolve every Block Group's descriptor address BEFORE
+             * reading any of them -- cetrafs_bg_mount_info() below
+             * needs the map it is helping to build. Walks the chain
+             * once: the implicit first segment at bg_table_start, then
+             * each appended segment's header
+             * (docs/internal/BG-OWNERSHIP-DESIGN.md).
+             */
+            {
+                u64 first = le64_to_cpu(ondisk->bg_table_first_count);
+                u64 seg_lba = le64_to_cpu(ondisk->bg_table_next);
+                u64 tbl = le64_to_cpu(ondisk->bg_table_start);
+                u32 filled = 0, guard = 0;
+
+                /* Zero on a volume that has never been grown: the table
+                 * is the contiguous run it has always been. */
+                if (!first || first > nbg)
+                    first = nbg;
+                for (b = 0; b < first && b < nbg; b++)
+                    sbi->bg_desc_lba[b] = tbl + b;
+                filled = (u32) first;
+
+                /* To the END of the chain, not just until enough
+                 * descriptors are collected: stopping early never
+                 * follows the tail's next, so a loop or a link into
+                 * nowhere would mount clean. */
+                while (seg_lba) {
+                    struct buffer_head *sbh = sb_bread(sb, seg_lba);
+                    const cetrafs_bg_segment_t *seg;
+                    u32 cnt, i;
+
+                    /* A chain is a loop waiting to happen; bound it by
+                     * the only number that can honestly bound it. */
+                    if (++guard > nbg + 1) {
+                        pr_err("BG table chain does not terminate -- refusing\n");
+                        brelse(sbh);
+                        cetrafs_free_sb_info(sb);
+                        brelse(bh);
+                        return -EUCLEAN;
+                    }
+                    if (!sbh) {
+                        cetrafs_free_sb_info(sb);
+                        brelse(bh);
+                        return -EIO;
+                    }
+                    seg = (const cetrafs_bg_segment_t *) sbh->b_data;
+                    if (le32_to_cpu(seg->magic) != CETRAFS_BGSEG_MAGIC) {
+                        pr_err("BG table segment at %llu has no magic\n", (unsigned long long) seg_lba);
+                        brelse(sbh);
+                        cetrafs_free_sb_info(sb);
+                        brelse(bh);
+                        return -EUCLEAN;
+                    }
+                    cnt = le32_to_cpu(seg->count);
+                    for (i = 0; i < cnt; i++, filled++)
+                        if (filled < nbg)
+                            sbi->bg_desc_lba[filled] = seg_lba + 1 + i;
+                    if (filled > nbg) {
+                        pr_err("BG table chain describes more Block Groups than the %u recorded\n", nbg);
+                        brelse(sbh);
+                        cetrafs_free_sb_info(sb);
+                        brelse(bh);
+                        return -EUCLEAN;
+                    }
+                    seg_lba = le64_to_cpu(seg->next);
+                    brelse(sbh);
+                }
+
+                if (filled != nbg) {
+                    pr_err("BG table chain describes %u of %u Block Groups\n", filled, nbg);
+                    cetrafs_free_sb_info(sb);
+                    brelse(bh);
+                    return -EUCLEAN;
+                }
+            }
+
             sbi->total_data_blocks = 0;
             for (b = 0; b < nbg; b++) {
-                u64 t = 0, f = 0;
+                u64 t = 0;
+                u32 owner = CETRAFS_NODE_ID_NONE;
 
-                if (cetrafs_bg_data_block_stats(sb, b, &t, &f) == 0)
+                /* Same single pass now also records which Zone Group
+                 * owns each Block Group, which is what lets ownership
+                 * be answered from memory from here on. */
+                if (cetrafs_bg_mount_info(sb, b, &t, &owner) == 0) {
                     sbi->total_data_blocks += t;
+                    sbi->bg_owner_zg[b] = (u16) owner;
+                }
             }
         }
 
@@ -1132,9 +1364,10 @@ int cetrafs_fill_super(struct super_block *sb, struct fs_context *fc)
 
                 if (crc || foreign) {
                     if (foreign)
-                        pr_err("mount: lost a simultaneous-mount race -- another node registered on "
-                               "this no-CAW volume while this mount was in flight, and only one node "
-                               "may mount it. Refusing; retry the mount.\n");
+                        pr_err(
+                            "mount: lost a simultaneous-mount race -- another node registered on "
+                            "this no-CAW volume while this mount was in flight, and only one node "
+                            "may mount it. Refusing; retry the mount.\n");
                     else
                         pr_err("mount: post-registration single-mounter re-check failed: %d\n", crc);
                     cetrafs_free_sb_info(sb);
@@ -1162,10 +1395,11 @@ int cetrafs_fill_super(struct super_block *sb, struct fs_context *fc)
 
                 if (crc || conflict) {
                     if (conflict)
-                        pr_err("mount: lost a simultaneous-mount race -- a live peer runs a "
-                               "different file-lock mode than this node registered (file_lock=%s). "
-                               "Refusing rather than forming a mixed cluster; retry the mount.\n",
-                               sbi->file_lock_enabled ? "on" : "off");
+                        pr_err(
+                            "mount: lost a simultaneous-mount race -- a live peer runs a "
+                            "different file-lock mode than this node registered (file_lock=%s). "
+                            "Refusing rather than forming a mixed cluster; retry the mount.\n",
+                            sbi->file_lock_enabled ? "on" : "off");
                     else
                         pr_err("mount: post-registration mode re-check failed: %d\n", crc);
                     cetrafs_free_sb_info(sb);
@@ -1395,8 +1629,12 @@ int cetrafs_fill_super(struct super_block *sb, struct fs_context *fc)
     }
     CETRAFS_MOUNT_FAIL_POINT(8);
 
-    brelse(bh);
+    /* TEST ONLY (alloc_shadow=1): seed the shadow from the on-disk
+     * bitmaps, so a remount mid-test keeps double-alloc detection armed
+     * against pre-mount owners instead of restarting blind. */
+    cetrafs_shadow_seed(sb);
 
+    brelse(bh);
     pr_info("mounted OK: Z=%u, B=%u, bg_size=%llu blocks, data@%llu, node_id=%u\n", sbi->zg_count, sbi->bg_count,
             (unsigned long long) sbi->bg_size_blocks, (unsigned long long) sbi->bg_regions_start, sbi->node_id);
 
@@ -1570,10 +1808,16 @@ void cetrafs_free_sb_info(struct super_block *sb)
     cetrafs_journal_free(sbi->journal);
     cetrafs_dmpath_forget(sb->s_bdev); /* stop holding a path device open */
     kfree(sbi->raw_sb);
+    kfree(sbi->bg_desc_lba);
+    bitmap_free(sbi->owned_bgs);
+    kfree(sbi->bg_owner_zg);
     kfree(sbi->bg_count_epoch);
     kfree(sbi->bg_free_delta);
+    kfree(sbi->bg_alloc_seq);
     bitmap_free(sbi->bg_free_dirty);
     bitmap_free(sbi->bmap_alloc_dirty);
+    bitmap_free(sbi->alloc_shadow);
+    bitmap_free(sbi->inode_birth);
     kfree(sbi->zg_pf_drop_blocks);
     kfree(sbi->zg_pf_drop_runs);
     kfree(sbi->zg_pf_full_until);
@@ -1775,7 +2019,8 @@ bool cetrafs_resv_covers(struct super_block *sb, u64 lba)
         return false;
 
     spin_lock(&sbi->resv_list_lock);
-    list_for_each_entry(span, &sbi->resv_list, link) {
+    list_for_each_entry(span, &sbi->resv_list, link)
+    {
         if (span->count && lba >= span->start && lba < span->start + span->count) {
             hit = true;
             break;
@@ -1797,6 +2042,73 @@ void cetrafs_sb_alloc_unlock(struct super_block *sb)
     struct cetrafs_sb_info *sbi = sb->s_fs_info;
 
     mutex_unlock(&sbi->alloc_mutex);
+}
+
+/* TEST ONLY -- see cetrafs_sb_info.alloc_shadow. */
+bool cetrafs_alloc_shadow_enabled;
+module_param_named(alloc_shadow, cetrafs_alloc_shadow_enabled, bool, 0644);
+MODULE_PARM_DESC(alloc_shadow, "TEST ONLY: shadow-track every data alloc/free; scream on double alloc");
+
+void cetrafs_sb_birth_begin(struct super_block *sb, u64 ino)
+{
+    struct cetrafs_sb_info *sbi = sb->s_fs_info;
+
+    if (sbi && sbi->inode_birth)
+        set_bit((unsigned int) ino, sbi->inode_birth);
+}
+
+void cetrafs_sb_birth_end(struct super_block *sb, u64 ino)
+{
+    struct cetrafs_sb_info *sbi = sb->s_fs_info;
+
+    if (sbi && sbi->inode_birth)
+        clear_bit((unsigned int) ino, sbi->inode_birth);
+}
+
+bool cetrafs_sb_birth_active(struct super_block *sb, u64 ino)
+{
+    struct cetrafs_sb_info *sbi = sb->s_fs_info;
+
+    return sbi && sbi->inode_birth && test_bit((unsigned int) ino, sbi->inode_birth);
+}
+
+bool cetrafs_shadow_active(struct super_block *sb)
+{
+    struct cetrafs_sb_info *sbi = sb->s_fs_info;
+
+    return sbi && sbi->alloc_shadow;
+}
+
+void cetrafs_shadow_set(struct super_block *sb, u64 lba, u64 count, const char *who)
+{
+    struct cetrafs_sb_info *sbi = sb->s_fs_info;
+    u64 k;
+
+    if (!sbi || !sbi->alloc_shadow)
+        return;
+    for (k = 0; k < count; k++) {
+        if (lba + k >= sbi->total_blocks)
+            return;
+        if (test_and_set_bit((unsigned int) (lba + k), sbi->alloc_shadow)) {
+            pr_err("SHADOW DOUBLE-ALLOC lba=%llu by %s (bit already set)\n", (unsigned long long) (lba + k), who);
+            dump_stack();
+        }
+    }
+}
+
+void cetrafs_shadow_clear(struct super_block *sb, u64 lba, u64 count, const char *who)
+{
+    struct cetrafs_sb_info *sbi = sb->s_fs_info;
+    u64 k;
+
+    if (!sbi || !sbi->alloc_shadow)
+        return;
+    for (k = 0; k < count; k++) {
+        if (lba + k >= sbi->total_blocks)
+            return;
+        if (!test_and_clear_bit((unsigned int) (lba + k), sbi->alloc_shadow))
+            pr_warn("SHADOW FREE-OF-UNTRACKED lba=%llu by %s\n", (unsigned long long) (lba + k), who);
+    }
 }
 
 /* Held across cetrafs_cas_region()'s no-CAW read-decide-write only; a
@@ -1957,16 +2269,30 @@ void cetrafs_sb_set_stale_secs(struct super_block *sb, unsigned int v)
  * Idempotent: safe to call again for a ZG already marked owned (the
  * re-attach-at-every-mount/heartbeat-tick path does exactly that).
  */
-void cetrafs_sb_cache_zg_ownership(struct super_block *sb, u32 zg_id, u32 first_bg_id, u32 bg_count)
+void cetrafs_sb_cache_zg_ownership(struct super_block *sb, u32 zg_id)
 {
     struct cetrafs_sb_info *sbi = sb->s_fs_info;
 
     if (zg_id >= CETRAFS_MAX_ZONE_GROUPS)
         return;
 
-    sbi->owned_zg_first_bg[zg_id] = first_bg_id;
-    sbi->owned_zg_bg_count[zg_id] = bg_count;
     set_bit(zg_id, sbi->owned_zgs);
+
+    /* Derive "which Block Groups may this node allocate from" from the
+     * owners recorded at mount, rather than from the Zone Group's
+     * range. Same answer today -- the two describe the same mapping --
+     * but it is the Block Group that will still be able to answer once
+     * the range is gone (docs/internal/BG-OWNERSHIP-DESIGN.md), and it
+     * stays correct when membership is no longer a contiguous run.
+     * O(bg_count) in memory, on a path taken only when ownership
+     * changes. */
+    if (sbi->bg_owner_zg && sbi->owned_bgs) {
+        u32 b;
+
+        for (b = 0; b < sbi->bg_count; b++)
+            if (sbi->bg_owner_zg[b] == (u16) zg_id)
+                set_bit(b, sbi->owned_bgs);
+    }
 }
 
 /*
@@ -1986,6 +2312,14 @@ void cetrafs_sb_uncache_zg_ownership(struct super_block *sb, u32 zg_id)
         return;
 
     clear_bit(zg_id, sbi->owned_zgs);
+
+    if (sbi->bg_owner_zg && sbi->owned_bgs) {
+        u32 b;
+
+        for (b = 0; b < sbi->bg_count; b++)
+            if (sbi->bg_owner_zg[b] == (u16) zg_id)
+                clear_bit(b, sbi->owned_bgs);
+    }
 }
 
 /* The hot-path counterpart: true (with first_bg_id/bg_count filled in)
@@ -1994,20 +2328,16 @@ void cetrafs_sb_uncache_zg_ownership(struct super_block *sb, u32 zg_id)
  * the reason this exists: it used to call cetrafs_read_zg() (always a
  * forced-uncached, real device round trip) for every ZG on every single
  * new block a write needed. */
-bool cetrafs_sb_zg_owned_cached(struct super_block *sb, u32 zg_id, u32 *out_first_bg_id, u32 *out_bg_count)
+bool cetrafs_sb_zg_owned_cached(struct super_block *sb, u32 zg_id)
 {
     struct cetrafs_sb_info *sbi = sb->s_fs_info;
 
-    if (zg_id >= CETRAFS_MAX_ZONE_GROUPS || !test_bit(zg_id, sbi->owned_zgs))
-        return false;
-
-    /* The spans are optional: a caller that only wants the ownership
-     * answer passes NULL rather than two throwaway variables. */
-    if (out_first_bg_id)
-        *out_first_bg_id = sbi->owned_zg_first_bg[zg_id];
-    if (out_bg_count)
-        *out_bg_count = sbi->owned_zg_bg_count[zg_id];
-    return true;
+    /* Just the ownership answer. It used to also hand back the Zone
+     * Group's contiguous range of Block Groups, and most callers passed
+     * two variables they then ignored -- two were literally named
+     * unused_first_bg/unused_bg_count. Membership is the Block Group's
+     * business now (cetrafs_sb_bg_owner()). */
+    return zg_id < CETRAFS_MAX_ZONE_GROUPS && test_bit(zg_id, sbi->owned_zgs);
 }
 
 /*
@@ -2041,21 +2371,138 @@ bool cetrafs_sb_zg_owned_cached(struct super_block *sb, u32 zg_id, u32 *out_firs
  * each wipe). Same mechanism, different trigger, as the per-tick epoch
  * seeding cured in zonegroup.c's cetrafs_zg_try_claim_one().
  */
+/*
+ * Record that a Block Group has changed owner, in core.
+ *
+ * Called after a claim's compare-and-swap has STUCK, so the on-disk
+ * record already says this -- and the in-core map must follow or the
+ * allocator will not look at the Block Group it just won. Updating
+ * owned_bgs is what makes it allocatable; nothing else consults it.
+ */
+/*
+ * Take a Block Group out of this node's allocator reach, and put it
+ * back.
+ *
+ * The allocator picks exclusively from owned_bgs, so clearing the bit
+ * is all it takes -- and doing it BEFORE checking the Block Group is
+ * empty is what closes the only window the per-Block-Group release
+ * opens: this node allocating into something it is halfway through
+ * giving away. Under alloc_mutex, which is what serialises this node's
+ * own bitmap read-modify-writes, so a concurrent allocation either
+ * sees the bit or does not and never straddles it.
+ *
+ * Nothing persists: a node that dies while draining simply still owns
+ * the Block Group on disk, which is the safe direction.
+ */
+void cetrafs_sb_drain_bg(struct super_block *sb, u32 bg_id)
+{
+    struct cetrafs_sb_info *sbi = sb ? sb->s_fs_info : NULL;
+
+    if (!sbi || !sbi->owned_bgs || bg_id >= sbi->bg_count)
+        return;
+    mutex_lock(&sbi->alloc_mutex);
+    clear_bit(bg_id, sbi->owned_bgs);
+    mutex_unlock(&sbi->alloc_mutex);
+}
+
+void cetrafs_sb_undrain_bg(struct super_block *sb, u32 bg_id)
+{
+    struct cetrafs_sb_info *sbi = sb ? sb->s_fs_info : NULL;
+
+    if (!sbi || !sbi->owned_bgs || bg_id >= sbi->bg_count)
+        return;
+    mutex_lock(&sbi->alloc_mutex);
+    if (sbi->bg_owner_zg && sbi->bg_owner_zg[bg_id] < CETRAFS_MAX_ZONE_GROUPS &&
+        test_bit(sbi->bg_owner_zg[bg_id], sbi->owned_zgs))
+        set_bit(bg_id, sbi->owned_bgs);
+    mutex_unlock(&sbi->alloc_mutex);
+}
+
+void cetrafs_sb_set_bg_owner(struct super_block *sb, u32 bg_id, u32 zg_id)
+{
+    struct cetrafs_sb_info *sbi = sb ? sb->s_fs_info : NULL;
+
+    if (!sbi || !sbi->bg_owner_zg || bg_id >= sbi->bg_count)
+        return;
+
+    sbi->bg_owner_zg[bg_id] = (u16) zg_id;
+    if (sbi->owned_bgs) {
+        if (zg_id < CETRAFS_MAX_ZONE_GROUPS && test_bit(zg_id, sbi->owned_zgs))
+            set_bit(bg_id, sbi->owned_bgs);
+        else
+            clear_bit(bg_id, sbi->owned_bgs);
+    }
+}
+
+/* Any Zone Group this node owns, for claiming a free Block Group into.
+ * -ENOENT if it owns none. */
+int cetrafs_sb_first_owned_zg(struct super_block *sb, u32 *out_zg)
+{
+    struct cetrafs_sb_info *sbi = sb ? sb->s_fs_info : NULL;
+    u32 z;
+
+    if (!sbi)
+        return -EINVAL;
+    z = (u32) find_first_bit(sbi->owned_zgs, CETRAFS_MAX_ZONE_GROUPS);
+    if (z >= CETRAFS_MAX_ZONE_GROUPS)
+        return -ENOENT;
+    if (out_zg)
+        *out_zg = z;
+    return 0;
+}
+
+/*
+ * Where Block Group bg_id's descriptor lives.
+ *
+ * Replaces `bg_table_start + bg_id`, which stopped being true once the
+ * table became a chain -- correct only for the ids in the implicit
+ * first segment. Resolved from the map built at mount, so this is an
+ * array read with no device I/O, which is what the per-block budget
+ * requires (PERFORMANCE.md rule 1).
+ *
+ * Returns 0 for an out-of-range id; 0 is the superblock's own block and
+ * can never hold a descriptor, so a caller that ignores the check
+ * writes somewhere obviously wrong rather than somewhere plausible.
+ */
+u64 cetrafs_sb_bg_desc_lba(struct super_block *sb, u32 bg_id)
+{
+    struct cetrafs_sb_info *sbi = sb ? sb->s_fs_info : NULL;
+
+    if (!sbi || !sbi->bg_desc_lba || bg_id >= sbi->bg_count)
+        return 0;
+    return sbi->bg_desc_lba[bg_id];
+}
+
+u32 cetrafs_sb_bg_owner(struct super_block *sb, u32 bg_id)
+{
+    struct cetrafs_sb_info *sbi = sb ? sb->s_fs_info : NULL;
+
+    if (!sbi || !sbi->bg_owner_zg || bg_id >= sbi->bg_count)
+        return CETRAFS_NODE_ID_NONE;
+    return sbi->bg_owner_zg[bg_id];
+}
+
+void cetrafs_sb_owned_bgs(struct super_block *sb, const unsigned long **out_bits, u32 *out_nbits)
+{
+    struct cetrafs_sb_info *sbi = sb ? sb->s_fs_info : NULL;
+
+    *out_bits = sbi ? sbi->owned_bgs : NULL;
+    *out_nbits = sbi ? sbi->bg_count : 0;
+}
+
 bool cetrafs_sb_bg_is_ours(struct super_block *sb, u32 bg_id)
 {
     struct cetrafs_sb_info *sbi = sb->s_fs_info;
-    u32 zg_id;
 
-    if (!sbi)
+    if (!sbi || !sbi->owned_bgs || bg_id >= sbi->bg_count)
         return false;
 
-    for_each_set_bit (zg_id, sbi->owned_zgs, CETRAFS_MAX_ZONE_GROUPS) {
-        u32 first = sbi->owned_zg_first_bg[zg_id];
-
-        if (bg_id >= first && bg_id - first < sbi->owned_zg_bg_count[zg_id])
-            return true;
-    }
-    return false;
+    /* One bit test. This used to walk every owned Zone Group comparing
+     * the Block Group id against a contiguous range; the answer is the
+     * same, but it no longer depends on membership BEING contiguous,
+     * which is what has to stop being true
+     * (docs/internal/BG-OWNERSHIP-DESIGN.md). */
+    return test_bit(bg_id, sbi->owned_bgs);
 }
 
 /* The allocation cursor (see its field comment). Advisory: plain
@@ -2127,6 +2574,16 @@ bool cetrafs_sb_take_bmap_alloc_dirty(struct super_block *sb, u32 bg_id)
     return test_and_clear_bit(bg_id, sbi->bmap_alloc_dirty);
 }
 
+/* Allocations only -- see cetrafs_sb_info.bg_alloc_seq. */
+u64 cetrafs_sb_bg_alloc_seq(struct super_block *sb, u32 bg_id)
+{
+    struct cetrafs_sb_info *sbi = sb->s_fs_info;
+
+    if (!sbi || !sbi->bg_alloc_seq || bg_id >= sbi->bg_count)
+        return 0;
+    return (u64) atomic64_read(&sbi->bg_alloc_seq[bg_id]);
+}
+
 void cetrafs_sb_accrue_bg_free(struct super_block *sb, u32 bg_id, s64 delta)
 {
     struct cetrafs_sb_info *sbi = sb->s_fs_info;
@@ -2134,6 +2591,11 @@ void cetrafs_sb_accrue_bg_free(struct super_block *sb, u32 bg_id, s64 delta)
     if (sbi && bg_id < sbi->bg_count) {
         atomic64_add(delta, &sbi->bg_free_delta[bg_id]);
         set_bit(bg_id, sbi->bg_free_dirty);
+        /* A negative delta IS an allocation. One uncontended atomic on
+         * the per-block path -- no device I/O, so PERFORMANCE.md's
+         * per-block budget is untouched. */
+        if (delta < 0 && sbi->bg_alloc_seq)
+            atomic64_inc(&sbi->bg_alloc_seq[bg_id]);
     }
 }
 
@@ -2188,12 +2650,46 @@ u64 cetrafs_sb_bg_epoch(struct super_block *sb, u32 bg_id)
     return READ_ONCE(sbi->bg_count_epoch[bg_id]);
 }
 
+/*
+ * Move a BG count's epoch -- and DISCARD whatever delta this node still
+ * has accrued for it, because the epoch only ever moves when somebody
+ * recounted that Block Group's bitmap, and a recount already includes
+ * every durable effect our pending delta describes.
+ *
+ * The guard in cetrafs_bg_count_mutate() reads this epoch at FLUSH
+ * time, not at accrual time, so it cannot tell "our delta is older than
+ * this reconcile" from "our delta belongs to it": re-seeding here while
+ * a delta sat pending made the stale delta look current and it applied
+ * on top of the recount. Seen in the field as a count driven below zero
+ * (a long-lived writer -- a VM image held open for days -- accrues for
+ * as long as it stays open, so a delta easily outlives an ownership
+ * event), and that refusal is only the LOUD half: a delta small enough
+ * to still fit would have silently corrupted the count instead.
+ *
+ * Dropping is the conservative direction and the same one the apply
+ * path already takes for a foreign epoch: the member bitmaps are the
+ * truth, the recount just read them, and nothing of ours is lost that
+ * the recount did not already record.
+ */
 void cetrafs_sb_set_bg_epoch(struct super_block *sb, u32 bg_id, u64 seq)
 {
     struct cetrafs_sb_info *sbi = sb->s_fs_info;
+    u64 prev;
+    s64 stale;
 
-    if (sbi && bg_id < sbi->bg_count)
-        WRITE_ONCE(sbi->bg_count_epoch[bg_id], seq);
+    if (!sbi || bg_id >= sbi->bg_count)
+        return;
+
+    prev = READ_ONCE(sbi->bg_count_epoch[bg_id]);
+    WRITE_ONCE(sbi->bg_count_epoch[bg_id], seq);
+    if (prev == seq)
+        return; /* re-attach with nobody having reconciled: our deltas stand */
+
+    stale = atomic64_xchg(&sbi->bg_free_delta[bg_id], 0);
+    clear_bit(bg_id, sbi->bg_free_dirty);
+    if (stale)
+        pr_warn("BG %u: dropping an accrued free delta of %lld -- the count was recounted (epoch %llu -> %llu)\n", bg_id,
+                (long long) stale, (unsigned long long) prev, (unsigned long long) seq);
 }
 
 /* Same idea as cetrafs_sb_mark_bg_free_dirty() above, for a ZG's own
@@ -2207,6 +2703,18 @@ void cetrafs_sb_accrue_zg_free(struct super_block *sb, u32 zg_id, s64 delta)
 
     if (sbi && zg_id < sbi->zg_count)
         atomic64_add(delta, &sbi->zg_free_delta[zg_id]);
+}
+
+/* Take and clear a ZG's accrued aggregate delta -- for a caller that is
+ * about to replace the aggregate with a recount of the member bitmaps,
+ * which already includes everything the delta describes. */
+s64 cetrafs_sb_take_zg_free_delta(struct super_block *sb, u32 zg_id)
+{
+    struct cetrafs_sb_info *sbi = sb->s_fs_info;
+
+    if (!sbi || zg_id >= sbi->zg_count)
+        return 0;
+    return atomic64_xchg(&sbi->zg_free_delta[zg_id], 0);
 }
 
 /*
@@ -2359,7 +2867,7 @@ int cetrafs_flush_dirty_free_counts(struct super_block *sb)
          * this aggregate is what statfs reports and what
          * cetrafs_zg_claim_one_more() ranks candidates on.
          */
-        if (!cetrafs_sb_zg_owned_cached(sb, zg_id, NULL, NULL)) {
+        if (!cetrafs_sb_zg_owned_cached(sb, zg_id)) {
             pr_warn("ZG %u: dropping a free-count delta of %lld for a zone group this node no longer owns\n", zg_id,
                     (long long) delta);
             continue;
@@ -2388,8 +2896,7 @@ static const struct fs_parameter_spec cetrafs_fs_parameters[] = {
     /* Turn the cross-node exclusive open lock off (default: on). Mount-time
      * only -- a remount cannot change it; see cetrafs_reconfigure(). */
     fsparam_flag("nofilelock", Opt_nofilelock),
-    {}
-};
+    {}};
 
 static int cetrafs_parse_param(struct fs_context *fc, struct fs_parameter *param)
 {

@@ -107,6 +107,84 @@ be checked to refuse *for that reason*, not merely to fail.
 that returns nonzero ends the run with no FAIL line and no summary.
 Guard anything expected to fail, and assert on its output.
 
+**A poke must go through whatever is going to READ it.**  A loop device
+and its backing file are the same bytes through two independent page
+caches, and which one is right depends on the reader.  fsck reads the
+device, so a fault fsck must see is poked into the device.  A mounted
+kernel simulating a *peer's* write is the opposite: poking the file is
+precisely how the change is made invisible until the node re-reads,
+which is the only way to simulate a peer on a one-node harness -- every
+"did it read fresh?" suite depends on it, and poking the device there
+puts the change straight into the cache the filesystem's own buffers
+are mapped onto, so the node sees it without re-reading and the
+assertion passes while testing nothing.
+
+The bug is a MISMATCH.  `kernel/fsck_repair.sh` poked the file where
+fsck, reading the device, had to see it: fsck's own earlier reads left
+pages cached on the device, the poke landed behind them, and fsck
+checked the volume as it was before the fault was injected.  Only ever
+under a full batch, because whether those pages were still resident
+depended on what every other suite had done first.
+`image/lint_poke_target.sh` flags that exact shape.
+
+Two remedies, both valid: poke the device (direct, for a fault only fsck
+needs to see), or keep poking the file and `blockdev --flushbufs "$DEV"`
+before each read.  The second is the older house style and the reason is
+written down in `image/fsck_negative_controls.sh`, which hit this while
+`fsck_checksum_controls.sh` was being written -- "the same case passed
+and failed across consecutive runs ... this suite has always had the
+same exposure and passed on cache luck".  Keep the file poke wherever
+the invisibility is the point.
+
+**Capture, then match -- never `producer | grep -q` as a condition.**
+Under `set -o pipefail` a pipeline carries the *producer's* exit status,
+and several producers here exit non-zero BY DESIGN: `fsck` on a bad
+image, `mkfs` printing usage, `growfs` refusing.  So
+`if fsck "$DEV" | grep -q 'the error'; then` is non-zero whether or not
+grep matched, and both branches can reach a pass -- a check that cannot
+fail.  Write `out="$(fsck "$DEV" 2>&1 || true)"` and then
+`grep -q 'the error' <<<"$out"` -- a HERESTRING, not a pipe.
+
+**And `printf '%s' "$out" | grep -q ...` is the same bug wearing a
+different hat.**  `grep -q` exits at the first match, the `printf`
+feeding it takes SIGPIPE, and `pipefail` reports 141 -- so the pipeline
+says FAILED about a match that succeeded.  It depends on whether
+`printf` finishes before `grep` exits, so it passes on small output and
+fails on large output or under load: measured at 0 failures on a short
+string and **200 out of 200** on a 400 KB one.  Two suites flaked this
+way inside the full gate while passing standalone, and the second cost
+an hour of looking for a mechanism that was in the shell, not the
+filesystem.
+
+Note which way it breaks.  "Output must CONTAIN x" fails loudly and
+gets noticed.  "Output must NOT contain x" **passes** -- so a check for
+an error message that really is present reports clean.  Prefer
+`grep -q PATTERN <<<"$var"` or `case "$var" in *x*)`; both measured at
+0 failures.
+This has been got wrong three separate times: `run_fsck` in
+`image/fsck_negative_controls.sh`, the fsck-reason check in
+`kernel/growfs.sh`, and `growfs_compat.sh`'s "is this really the old
+mkfs?" guard -- which was then re-broken a second way (running `mkfs`
+against `/dev/null`, where it dies before printing the usage text it
+was being searched for).
+
+**A green gate after a fully-explained failure buys nothing.**  The
+gate's value is covering what you did NOT reason about.  When a run
+produces one failure, you know its mechanism, and the fix is confined
+to what failed, re-running all ~1650 assertions re-verifies code that
+already passed on that same tree -- 18 minutes to learn something you
+were already told.  Run the affected suites instead.
+
+The test is whether anything UNEXAMINED changed.  Re-run the gate when
+the fix touched `kmod/` or `userspace/` (a change there is validated by
+the full `make check` and nothing less -- CLAUDE.md), when you are not
+certain why the thing failed, or when the fix was broad enough that you
+cannot name what it could have disturbed.  Do not re-run it to feel
+better about an assertion rewrite whose mechanism you have measured.
+
+The failure mode this guards against is not wasted minutes, it is
+attention: a gate you run reflexively is a gate you stop reading.
+
 **Set up what you depend on.**  Every suite starts from its own fresh
 image.  A suite that needs a dead peer in row 1 must *create* one: an
 absent row also reads as stale, so the assertions would pass for

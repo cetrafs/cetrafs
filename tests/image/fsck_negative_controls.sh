@@ -1,4 +1,4 @@
-#!/bin/bash
+#!/usr/bin/env bash
 # SPDX-License-Identifier: GPL-2.0-or-later
 # negative controls for fsck.cetra: every check, broken on purpose
 # Negative controls for fsck.cetra's cluster-metadata and
@@ -20,6 +20,13 @@ set -u
 
 ROOT="$(cd "$(dirname "$0")/../.." && pwd)"
 PASS=0
+# This suite predates the harness and keeps its own reporting, but it
+# runs inside `make check` and so needs the same floor as everything
+# else: without -e a failed mkfs or a failed helper build is ignored and
+# the checks below run against nothing, reporting success. pipefail
+# matters here too -- most checks are `fsck | grep`.
+set -euo pipefail
+
 FAIL=0
 
 pass() {
@@ -82,8 +89,10 @@ run_fsck() {
     # consecutive runs. This suite has always had the same exposure and
     # passed on cache luck.
     blockdev --flushbufs "$LOOPDEV" 2>/dev/null || true
-    FSCK_OUT="$("$ROOT/userspace/fsck.cetra" "$LOOPDEV" 2>&1)"
-    FSCK_RC=$?
+    # fsck is EXPECTED to exit non-zero here -- that is what a negative
+    # control is -- so the status is captured explicitly rather than
+    # left to abort the suite under set -e.
+    FSCK_OUT="$("$ROOT/userspace/fsck.cetra" "$LOOPDEV" 2>&1)" && FSCK_RC=0 || FSCK_RC=$?
 }
 
 expect_clean() {
@@ -142,8 +151,14 @@ JP_OUT="$("$JOURNAL_POKE" "$LOOPDEV" 0 0 $((BG_START + 1000)) "$PAYLOAD")"
 PAY_LBA="$(grep -oP 'payload_lba=\K[0-9]+' <<<"$JP_OUT")"
 if [ -n "$PAY_LBA" ]; then
     # Alter the payload, leaving the header's checksum of the ORIGINAL
-    # payload in place.
-    printf 'x' | dd of="$LOOPDEV" bs=4096 seek="$PAY_LBA" conv=notrunc 2>/dev/null
+    # payload in place. FLIP the first byte rather than writing a
+    # constant: the payload is random, so a constant matches it 1 run in
+    # 256 and the "alteration" is a no-op -- fsck then correctly reports
+    # OK and this control fails as a flake (seen on a release matrix,
+    # 2026-10-29).
+    ORIG_BYTE="$(dd if="$LOOPDEV" bs=4096 skip="$PAY_LBA" count=1 2>/dev/null | head -c1 | od -An -tu1 | tr -d ' ')"
+    printf "$(printf '\\%03o' $(((ORIG_BYTE ^ 0xff) & 0xff)))" |
+        dd of="$LOOPDEV" bs=4096 seek="$PAY_LBA" conv=notrunc 2>/dev/null
     expect_caught "payload CRC mismatch" \
         "journal: an entry whose payload was altered is reported"
 else
@@ -162,15 +177,23 @@ expect_caught "outside every BG data region" \
 # owner would clear bits in somebody else's bitmap on its next drain.
 log "pending-free: entry belonging to another ZG"
 mkfs_fresh
+ZGS="$(grep -oP '^\s*ZGs: \K[0-9]+' <<<"$MKFS_OUT")"
 BGS="$(grep -oP '^\s*ZGs: [0-9]+, BGs: \K[0-9]+' <<<"$MKFS_OUT")"
 BGSZ="$(grep -oP 'BG size: \K[0-9]+' <<<"$MKFS_OUT")"
 BG_START="$(grep -oP 'BG regions start: LBA \K[0-9]+' <<<"$MKFS_OUT")"
-if [ -n "$BGS" ] && [ -n "$BGSZ" ] && [ -n "$BG_START" ] && [ "$BGS" -gt 1 ]; then
-    # mkfs spreads BGs across ZGs, so the LAST BG belongs to the last ZG.
-    # +1000 clears that BG's header and bitmap, landing well inside its
-    # data region. Queueing it on ZG 0 is a cross-ZG entry by
-    # construction, whatever the exact split was.
-    FAR=$((BG_START + (BGS - 1) * BGSZ + 1000))
+if [ -n "$ZGS" ] && [ -n "$BGS" ] && [ -n "$BGSZ" ] && [ -n "$BG_START" ] &&
+   [ "$BGS" -gt 1 ] && [ "$ZGS" -gt 1 ]; then
+    # mkfs assigns Block Groups ROUND-ROBIN, so Block Group b belongs to
+    # Zone Group b % ZGs -- Block Group 1 therefore belongs to Zone
+    # Group 1, and queueing its blocks on Zone Group 0 is cross-ZG by
+    # construction. This used to take the LAST Block Group on the
+    # reasoning that it belonged to the last Zone Group, which was true
+    # only while membership was a contiguous span: with round-robin the
+    # last one often belongs to Zone Group 0, and the entry was then
+    # perfectly legal, so the check caught nothing.
+    # +1000 clears that Block Group's header and bitmap, landing well
+    # inside its data region.
+    FAR=$((BG_START + 1 * BGSZ + 1000))
     "$PENDING_POKE" "$LOOPDEV" add 0 "$FAR" 1 >/dev/null
     expect_caught "belongs to ZG" \
         "pending-free: an entry naming another ZG's blocks is reported"

@@ -240,6 +240,11 @@ static int cetrafs_proc_info_show(struct seq_file *m, void *v)
     seq_printf(m, "giveback_blocks: %llu\n", cetrafs_giveback_block_count());
     seq_printf(m, "tree_blocks: %llu\n", cetrafs_tree_block_count());
     seq_printf(m, "tree_reads: %llu\n", cetrafs_tree_read_count());
+    /* The remembered-extent hit rate. Exposed because throughput alone
+     * cannot tell a cache that works from one that silently never hits:
+     * both look like SAN noise until the file is big enough. */
+    seq_printf(m, "ext_cache_hits: %llu\n", cetrafs_ext_cache_hit_count());
+    seq_printf(m, "ext_cache_misses: %llu\n", cetrafs_ext_cache_miss_count());
     seq_printf(m, "file_cache_reconciles: %llu\n", cetrafs_file_cache_reconcile_count());
     seq_printf(m, "lock_suspends: %llu\n", cetrafs_lock_suspend_count());
     seq_printf(m, "lock_resumes: %llu\n", cetrafs_lock_resume_count());
@@ -272,8 +277,20 @@ static int cetrafs_proc_info_show(struct seq_file *m, void *v)
         /* No per-ZG journal size anymore -- journals are per-node since
          * the per-node journal design (see the superblock's
          * node_journal_start/node_journal_blocks). */
-        seq_printf(m, " first_bg=%u bg_count=%u free_data_blocks=%llu\n", info.first_bg_id, info.bg_count,
-                   (unsigned long long) info.free_data_blocks);
+        /* Membership is no longer a contiguous range the Zone Group
+         * knows about, so this counts the Block Groups that name this
+         * Zone Group as their owner. In memory, no device read -- and
+         * it is the number an operator actually wants now that the
+         * count changes over the volume's life. */
+        {
+            u32 b, members = 0, nbg = le32_to_cpu(raw_sb->block_group_count);
+
+            for (b = 0; b < nbg; b++)
+                if (cetrafs_sb_bg_owner(sb, b) == z)
+                    members++;
+            seq_printf(m, " block_groups=%u free_data_blocks=%llu\n", members,
+                       (unsigned long long) info.free_data_blocks);
+        }
     }
 
     return 0;
@@ -374,12 +391,20 @@ static int cetrafs_proc_cluster_show(struct seq_file *m, void *v)
         u = ne.node_uuid;
         seq_printf(m,
                    "node %u: state=%s uuid=%02x%02x%02x%02x-%02x%02x-%02x%02x-%02x%02x-%02x%02x%02x%02x%02x%02x "
-                   "hb_seq=%llu last_seen=%llu label=%s stale=%s%s\n",
+                   "hb_seq=%llu last_seen=%llu label=%s caps=0x%x stale=%s%s\n",
                    idx, cetrafs_le32(ne.state) == CETRAFS_NODE_STATE_REGISTERED ? "REGISTERED" : "UNKNOWN", u[0], u[1], u[2], u[3],
                    u[4], u[5], u[6], u[7], u[8], u[9], u[10], u[11], u[12], u[13], u[14], u[15],
-                   (unsigned long long) cetrafs_le64(ne.hb_seq), (unsigned long long) cetrafs_le64(ne.last_seen), ne.label, stale ? "yes" : "no",
+                   (unsigned long long) cetrafs_le64(ne.hb_seq), (unsigned long long) cetrafs_le64(ne.last_seen), ne.label,
+                   cetrafs_le32(ne.caps), stale ? "yes" : "no",
                    idx == my_node_id ? " (this node)" : "");
     }
+
+    /* The grow gate, surfaced: yes iff every REGISTERED row advertises
+     * live-grow support. An operator reads it to know whether a live
+     * grow would be accepted now; the test reads it to prove the gate
+     * flips when an old-style row (caps=0) is present. */
+    seq_printf(m, "live_grow_ready: %s\n",
+               cetrafs_cluster_all_advertise(sb, CETRAFS_NODE_CAP_LIVE_GROW) ? "yes" : "no");
 
     return 0;
 }

@@ -58,7 +58,37 @@
 #include <linux/string.h>
 #include <linux/workqueue.h>
 
+#include <linux/mm.h>
+
 #include "kmod.h"
+
+/* TEST ONLY: make invalidate_inode_pages2_range() "fail" after a step's
+ * commit, on demand. The abort that used to sit on that failure freed
+ * part of the just-committed destination run (cross-file overlap); the
+ * forced-drop that replaced it is only testable if the failure can be
+ * produced deterministically. */
+/* TEST ONLY: skip the preallocated-extent refusal below, which is the
+ * only way to show that the refusal -- and not something further down --
+ * is what keeps an uninitialized extent's stale blocks out of the
+ * file's data. */
+/* TEST ONLY: leave the destination run OFF the live-reservation
+ * registry, the way it used to be -- the negative control showing that
+ * the registration is what stops the scrub reclaiming a move in
+ * progress. */
+static bool cetrafs_defrag_skip_resv;
+module_param_named(defrag_skip_resv, cetrafs_defrag_skip_resv, bool, 0644);
+MODULE_PARM_DESC(defrag_skip_resv,
+                 "TEST ONLY: do not register the defrag destination run (the scrub may reclaim it mid-move)");
+
+static bool cetrafs_defrag_ignore_uninit;
+module_param_named(defrag_ignore_uninit, cetrafs_defrag_ignore_uninit, bool, 0644);
+MODULE_PARM_DESC(defrag_ignore_uninit,
+                 "TEST ONLY: defrag a file with preallocated extents anyway (publishes their stale blocks)");
+
+static bool cetrafs_defrag_fail_invalidate;
+module_param_named(defrag_fail_invalidate, cetrafs_defrag_fail_invalidate, bool, 0644);
+MODULE_PARM_DESC(defrag_fail_invalidate,
+                 "TEST ONLY: make the post-commit page drop fail, exercising the forced-drop path");
 
 /* Soft cap on blocks relocated per inode_lock hold -- rounded UP to the
  * next whole original extent (always at least one), so a step never
@@ -72,11 +102,12 @@
 struct cetrafs_ext_list {
     cetrafs_extent_t *arr;
     u32 count;
-    u32 cap;      /* entries the caller allocated arr for */
+    u32 cap; /* entries the caller allocated arr for */
     u16 depth;
-    u64 nblocks;  /* total logical blocks covered */
-    u64 leaf_lba; /* external leaf LBA if depth==1, else 0 */
-    bool dense;   /* no interior holes: extent i starts where i-1 ended */
+    u64 nblocks;     /* total logical blocks covered */
+    u64 leaf_lba;    /* external leaf LBA if depth==1, else 0 */
+    bool dense;      /* no interior holes: extent i starts where i-1 ended */
+    bool has_uninit; /* any extent is preallocated-but-never-written */
 };
 
 /* Cap on how fragmented a file this collapser will take on. Each commit
@@ -128,8 +159,8 @@ static int cetrafs_defrag_read_extents(struct inode *inode, const cetrafs_inode_
             return fret;
         if (n > el->cap) {
             kfree(flat);
-            pr_debug("defrag: ino=%llu has %u extents (> cap %u) -- declined\n",
-                     (unsigned long long) inode->i_ino, n, el->cap);
+            pr_debug("defrag: ino=%llu has %u extents (> cap %u) -- declined\n", (unsigned long long) inode->i_ino, n,
+                     el->cap);
             return -EOPNOTSUPP;
         }
         el->count = n;
@@ -139,9 +170,16 @@ static int cetrafs_defrag_read_extents(struct inode *inode, const cetrafs_inode_
     }
 
     el->dense = true;
+    el->has_uninit = false;
     for (i = 0; i < el->count; i++) {
         if (cetrafs_le32(el->arr[i].ee_block) != expect)
             el->dense = false;
+        /* cetrafs_extent_len() MASKS the uninit bit off, so a
+         * preallocated extent is indistinguishable from data here
+         * unless it is asked about explicitly. See the refusal below
+         * for why that mattered. */
+        if (cetrafs_extent_is_uninit(el->arr[i].ee_len))
+            el->has_uninit = true;
         expect += cetrafs_extent_len(el->arr[i].ee_len);
     }
     el->nblocks = expect;
@@ -205,9 +243,33 @@ static int cetrafs_defrag_commit(struct inode *inode,
         goto out;
     }
     raw->blocks = cetrafs_cpu_to_le64((nblocks + meta) * (CETRAFS_BLOCK_SIZE / 512));
-    ret = cetrafs_write_raw_inode_fd(sb, inode->i_ino, raw, inode);
-    if (!ret)
-        cetrafs_inode_fd_discard(inode); /* this publish supersedes the overlaid shadow */
+    {
+        u64 fd_seq;
+
+        cetrafs_inode_fd_pub_lock(inode);
+        /*
+         * Size and times come from the LIVE inode, read under the
+         * publish mutex -- NOT from the record image this move started
+         * from. The mover re-reads the extent map every step, so the
+         * tree it publishes tracks a concurrent local writer -- but
+         * raw->size was frozen at move start, and the final step's
+         * publish copied it wholesale over a size the owner had grown
+         * meanwhile: fresh tree, stale size, fresh stamp. An 8-core
+         * churn run lost the owner's extension to exactly this (ino 76:
+         * blocks said 95, size said 76 -- a mixed-vintage record), and
+         * it is why "defrag an open file" is legal but was not SAFE.
+         * Every local size writer updates i_size under locks this mutex
+         * orders with, so this read cannot regress (2026-10-29).
+         */
+        raw->size = cetrafs_cpu_to_le64((u64) i_size_read(inode));
+        raw->atime = cetrafs_cpu_to_le64((u64) inode_get_atime_sec(inode));
+        raw->mtime = cetrafs_cpu_to_le64((u64) inode_get_mtime_sec(inode));
+        fd_seq = cetrafs_inode_fd_seq(inode);
+        ret = cetrafs_write_raw_inode_fd(sb, inode->i_ino, raw, inode);
+        if (!ret)
+            cetrafs_inode_fd_published(inode, fd_seq); /* this publish supersedes the overlaid shadow */
+        cetrafs_inode_fd_pub_unlock(inode);
+    }
     if (ret) {
         cetrafs_tree_free_meta(inode, raw); /* undo the fresh tree */
         *raw = old;
@@ -233,6 +295,19 @@ int cetrafs_defrag_inode(struct inode *inode, struct cetrafs_defrag_stats *out_s
     cetrafs_inode_t raw;
     u64 nblocks, dst_base = 0, moved = 0;
     bool have_dst = false;
+    /*
+     * The destination run is bitmap-allocated and referenced by NOTHING
+     * until each step's commit publishes it -- for the whole move, which
+     * for a large file is seconds, not the single get_block() the
+     * scrub's leak argument assumes. scrub.c's header states the rule:
+     * "anything that leaves a block bitmap-allocated for longer than one
+     * get_block() without committing an extent MUST appear there [on the
+     * reservation registry]". This run did not, and lock.c's speculative
+     * run was the only thing that ever did -- so the background scrub
+     * reclaimed a live defrag destination, the allocator handed those
+     * blocks to another file, and the commit published them anyway.
+     */
+    struct cetrafs_resv_span dst_span = {.link = LIST_HEAD_INIT(dst_span.link)};
     int ret;
 
     el.cap = CETRAFS_DEFRAG_MAX_EXTENTS;
@@ -241,10 +316,9 @@ int cetrafs_defrag_inode(struct inode *inode, struct cetrafs_defrag_stats *out_s
         return -ENOMEM;
 
     inode_lock(inode);
-    ret = cetrafs_read_raw_inode(sb, inode->i_ino, &raw);
+    ret = cetrafs_read_raw_inode_overlaid(sb, inode, &raw); /* torn-read-safe vs a concurrent publish */
     if (ret)
         goto out_unlock;
-    cetrafs_inode_fd_overlay(inode, &raw); /* include pending hot-path extents; claimed only if we publish (v0x0005) */
     if (!S_ISREG(inode->i_mode)) {
         ret = -EINVAL;
         goto out_unlock;
@@ -265,8 +339,38 @@ int cetrafs_defrag_inode(struct inode *inode, struct cetrafs_defrag_stats *out_s
         ret = -EOPNOTSUPP; /* interior holes: block-for-block copy wouldn't hold */
         goto out_unlock;
     }
+    if (el.has_uninit && !cetrafs_defrag_ignore_uninit) {
+        /*
+         * A preallocated extent maps real blocks that have never been
+         * written, and reads as zeros BECAUSE of the uninit flag -- the
+         * blocks themselves still hold whatever the previous owner left
+         * in them. This mover is a block-for-block copy that rebuilds
+         * the prefix as one plain (initialized) extent, so it would
+         * copy those bytes to the new run and publish them as the
+         * file's data: fallocate a range, defrag, read back content
+         * that was freed from somewhere else.
+         *
+         * Found by tests/kernel/churn_oracle.sh, which reported it as
+         * "HOLE HOLDS DATA" -- punch a hole, fallocate over it, defrag,
+         * and the punched block came back.
+         *
+         * Declining is the same answer the interior-hole case gets: the
+         * file is left fragmented, which costs performance and nothing
+         * else. Honouring the flag instead would mean splitting the
+         * destination into init/uninit extents, which is a different
+         * (and much larger) change than a mover that promises one run.
+         */
+        ret = -EOPNOTSUPP;
+        goto out_unlock;
+    }
 
-    ret = cetrafs_alloc_pick_run(sb, nblocks, &dst_base);
+    /* The span rides INSIDE the allocation -- bits set and span
+     * published under one alloc_mutex hold -- because publish-after-
+     * return left the run's first blocks stealable for a scrub cycle
+     * (322 of them, in a loaded full-gate run). The negative control
+     * passes NULL and publishes nothing, same observable as before. */
+    ret = cetrafs_alloc_pick_run_resv(sb, nblocks, &dst_base,
+                                      cetrafs_defrag_skip_resv ? NULL : &dst_span);
     if (ret)
         goto out_unlock;
     have_dst = true;
@@ -295,13 +399,12 @@ int cetrafs_defrag_inode(struct inode *inode, struct cetrafs_defrag_stats *out_s
          * truncate, a hole punch, a spill that changed the layout, inode
          * reuse -- aborts cleanly; the committed prefix is already the
          * file's real data and the suffix still points at valid blocks. */
-        ret = cetrafs_read_raw_inode(sb, inode->i_ino, &raw);
+        ret = cetrafs_read_raw_inode_overlaid(sb, inode, &raw); /* torn-read-safe vs a concurrent publish */
         if (ret || cetrafs_le64(raw.generation) != cetrafs_inode_get_generation(inode)) {
             ret = ret ? ret : -ESTALE;
             inode_unlock(inode);
             goto out_free_tail;
         }
-        cetrafs_inode_fd_overlay(inode, &raw); /* v0x0005: include pending hot-path extents (claimed only on publish) */
         ret = cetrafs_defrag_read_extents(inode, &raw, &el);
         if (ret || el.nblocks != nblocks || !el.dense) {
             ret = ret ? ret : -ECANCELED;
@@ -411,6 +514,16 @@ int cetrafs_defrag_inode(struct inode *inode, struct cetrafs_defrag_stats *out_s
                 goto out_free_tail;
             }
 
+            /* The commit just published [0, step_end) on the new run.
+             * Advance the cursor BEFORE anything below can fail:
+             * out_free_tail frees dst[moved, nblocks) on the promise
+             * that [0, moved) is the file's real data, and an abort
+             * between a commit and this line used to free 251 committed
+             * blocks of an 8 MiB file -- which the allocator then handed
+             * to other files (cross-file overlap, found by fsck after a
+             * two-writer fill with auto-defrag). */
+            moved = step_end;
+
             /* Drop the file's cached pages for the just-moved range: they
              * hold buffer_heads still mapped to the OLD blocks we're
              * about to free, so a subsequent read (or a racing reader's
@@ -418,10 +531,26 @@ int cetrafs_defrag_inode(struct inode *inode, struct cetrafs_defrag_stats *out_s
              * space. Clean here (we flushed above and hold inode_lock),
              * so this can't lose a dirty page; next access re-faults
              * against the new mapping and reads our synced new blocks. */
-            ret = invalidate_inode_pages2_range(inode->i_mapping, moved, step_end - 1);
+            ret = invalidate_inode_pages2_range(inode->i_mapping, freed_from, step_end - 1);
+            if (cetrafs_defrag_fail_invalidate)
+                ret = -EBUSY; /* TEST ONLY: a racing reader's page reference, on demand */
             if (ret) {
-                inode_unlock(inode);
-                goto out_free_tail;
+                /* A failure here is a transient reference (a racing
+                 * reader) on a CLEAN page whose content equals the new
+                 * blocks. Aborting is not an option: the commit is
+                 * published, and a stale page left in the cache still
+                 * maps the OLD blocks through its attached buffers, so a
+                 * later write through it would land on freed (and by
+                 * then reallocated) space. Force the pages out instead
+                 * -- clean and flushed, so nothing is lost -- and carry
+                 * on with the step. */
+                unmap_mapping_range(inode->i_mapping, (loff_t) freed_from << 12, (loff_t) (step_end - freed_from) << 12,
+                                    1);
+                truncate_inode_pages_range(inode->i_mapping, (loff_t) freed_from << 12, ((loff_t) step_end << 12) - 1);
+                pr_info_ratelimited("defrag: ino=%llu forced page drop for blocks [%llu, %llu)\n",
+                                    (unsigned long long) inode->i_ino, (unsigned long long) freed_from,
+                                    (unsigned long long) step_end);
+                ret = 0;
             }
 
             /* The committed prefix now points at the new run; the old
@@ -446,7 +575,6 @@ int cetrafs_defrag_inode(struct inode *inode, struct cetrafs_defrag_stats *out_s
             }
         }
 
-        moved = step_end;
         inode_unlock(inode);
         cond_resched();
     }
@@ -478,11 +606,18 @@ out_unlock:
 out_free_tail:
     /* Free the never-committed tail of the destination run; the
      * committed prefix [0, moved) is the file's real data now. */
-    if (have_dst && moved < nblocks)
+    if (have_dst && moved < nblocks) {
+        ctrace("DEFRAGFREE-TAIL ino=%llu lba=%llu count=%llu\n", (unsigned long long) inode->i_ino,
+               (unsigned long long) (dst_base + moved), (unsigned long long) (nblocks - moved));
         cetrafs_free_data_extent(sb, dst_base + moved, nblocks - moved);
+    }
     cetrafs_flush_dirty_free_counts(sb);
 
 out_done:
+    /* After the tail free above: the freed remainder must become
+     * allocatable again, and the committed prefix is referenced by the
+     * file's own extents from here on. */
+    cetrafs_resv_unpublish(sb, &dst_span);
     if (out_stats)
         *out_stats = stats;
     kvfree(el.arr);
@@ -527,11 +662,11 @@ static void cetrafs_defrag_worker(struct work_struct *work)
             ret = cetrafs_defrag_inode(inode, &stats);
             if (ret == 0 && stats.blocks_moved)
                 pr_debug("auto-defrag: ino=%llu extents %llu -> %llu (%llu blocks moved)\n",
-                        (unsigned long long) inode->i_ino, (unsigned long long) stats.extents_before,
-                        (unsigned long long) stats.extents_after, (unsigned long long) stats.blocks_moved);
+                         (unsigned long long) inode->i_ino, (unsigned long long) stats.extents_before,
+                         (unsigned long long) stats.extents_after, (unsigned long long) stats.blocks_moved);
             else if (ret == -ECANCELED)
                 pr_debug("auto-defrag: ino=%llu stopped early (file in use / unmount); left consistent\n",
-                        (unsigned long long) inode->i_ino);
+                         (unsigned long long) inode->i_ino);
             /*
              * Say so when we DECLINE, too -- but at DEBUG. A decline is
              * a NORMAL outcome, not an anomaly: a sparse file is the
@@ -559,6 +694,32 @@ static void cetrafs_defrag_worker(struct work_struct *work)
                 pr_warn("auto-defrag: ino=%llu failed: %d\n", (unsigned long long) inode->i_ino, ret);
 
             cetrafs_lock_defrag_end(inode);
+            /*
+             * A CANCELED move must hand the baton back. The mover's pin
+             * made the writer's close skip its own janitor trigger (the
+             * release defers the lock-clear to defrag_end and considers
+             * nothing), and the cancel means the move did not finish the
+             * job -- so if nothing re-queues here, a file whose only
+             * close raced one in-flight nudge stays fragmented FOREVER.
+             * A full-gate tape showed exactly that staffette: nudge ->
+             * begin -> writer's close (pin set, trigger skipped) ->
+             * -ECANCELED -> silence. Re-judge it now that the pin is
+             * gone; consider()'s own thresholds filter, and a writer
+             * that is still active just repeats this handoff until its
+             * real last close takes the normal path.
+             */
+            if (ret == -ECANCELED) {
+                cetrafs_inode_t rr;
+
+                if (cetrafs_read_raw_inode_overlaid(sb, inode, &rr) == 0 &&
+                    cetrafs_le16(rr.eh.eh_magic) == CETRAFS_EXT_MAGIC) {
+                    u32 ext2 = cetrafs_tree_extent_count(inode, &rr);
+
+                    if (ext2)
+                        cetrafs_defrag_consider(inode, ext2,
+                                                CETRAFS_DIV_ROUND_UP(cetrafs_le64(rr.size), CETRAFS_BLOCK_SIZE));
+                }
+            }
         } else {
             /* Could not take the file's lock: it is open for write
              * somewhere, or a peer holds it, or the inode was replaced.

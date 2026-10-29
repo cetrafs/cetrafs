@@ -9,8 +9,9 @@ SDIR = $(CURDIR)/..
 MKFS = mkfs.cetra
 FSCK = fsck.cetra
 DEFRAG = defrag.cetra
+GROWFS = growfs.cetra
 
-all: $(MKFS) $(FSCK) $(DEFRAG)
+all: $(MKFS) $(FSCK) $(DEFRAG) $(GROWFS)
 
 # The shared on-disk-format header is a prerequisite: editing it MUST
 # rebuild every tool, or a stale binary parses the new layout with the
@@ -45,13 +46,16 @@ $(FSCK): fsck.c $(HDRS)
 $(DEFRAG): defrag.c $(HDRS)
 	$(CC) -D_FILE_OFFSET_BITS=64 -I $(SDIR)/include -O2 $(HARDEN) -std=gnu99 -Wall -Wextra $(WERROR) -o $@ $<
 
+$(GROWFS): growfs.c $(HDRS)
+	$(CC) -D_FILE_OFFSET_BITS=64 -I $(SDIR)/include -O2 $(HARDEN) -std=gnu99 -Wall -Wextra $(WERROR) -o $@ $<
+
 
 # Sparse (>= 0.6.5) static check that every on-disk-struct field is
 # accessed through the cetrafs_le*/cetrafs_cpu_to_le* macros, so a
 # wrong-endian access is a type error. Needs sparse installed; the
 # tools build fine without it (plain-int __le on a normal compiler).
 endian-check:
-	@for f in mkfs.c fsck.c defrag.c; do \
+	@for f in mkfs.c fsck.c defrag.c growfs.c; do \
 	  sparse -fmax-warnings=5000 -I $(SDIR)/include -I $(CURDIR) \
 	    -D_FILE_OFFSET_BITS=64 $$f; \
 	done
@@ -60,6 +64,7 @@ clean:
 	rm -f $(MKFS)
 	rm -f $(FSCK)
 	rm -f $(DEFRAG)
+	rm -f $(GROWFS)
 
 format:
 	bash -c 'clang-format -i *.{c,h}'

@@ -3,9 +3,9 @@
 
 #include <linux/blkdev.h>
 #include <linux/buffer_head.h>
+#include <linux/delay.h>
 #include <linux/falloc.h>
 #include <linux/fiemap.h>
-#include <linux/delay.h>
 #include <linux/fs.h>
 #include <linux/highmem.h>
 #include <linux/kernel.h>
@@ -146,7 +146,7 @@ struct cetrafs_inode_extents {
     struct buffer_head *leaf_bh; /* held for depth 1 (arr points into it); NULL otherwise */
     cetrafs_extent_t *heap;      /* depth 2: a flattened copy, freed by _put; NULL otherwise */
     const cetrafs_extent_t *arr;
-    u32 entries;                 /* u32: a depth-2 tree can hold far more than 65535 extents */
+    u32 entries; /* u32: a depth-2 tree can hold far more than 65535 extents */
 };
 
 /*
@@ -172,6 +172,11 @@ void cetrafs_tree_invalidate_cached(struct inode *inode, const cetrafs_inode_t *
     u16 depth = cetrafs_le16(raw->eh.eh_depth);
     u32 ni;
 
+    /* The remembered extent was resolved out of the very blocks being
+     * dropped here, so it goes with them -- before them, so no walk can
+     * repopulate it from a block this function has already dropped. */
+    cetrafs_inode_ext_cache_drop(inode);
+
     if (depth == 0)
         return; /* inline extents only: nothing external is cached */
 
@@ -187,14 +192,13 @@ void cetrafs_tree_invalidate_cached(struct inode *inode, const cetrafs_inode_t *
 
             if (ibh) {
                 const cetrafs_extent_hdr_t *ihdr = (const cetrafs_extent_hdr_t *) ibh->b_data;
-                const cetrafs_extent_idx_t *iarr =
-                    (const cetrafs_extent_idx_t *) (ibh->b_data + sizeof(*ihdr));
+                const cetrafs_extent_idx_t *iarr = (const cetrafs_extent_idx_t *) (ibh->b_data + sizeof(*ihdr));
                 u32 iln = min_t(u32, cetrafs_le16(ihdr->eh_entries), CETRAFS_EXT_BLOCK_MAX_IDX);
                 u32 li;
 
                 for (li = 0; li < iln; li++)
-                    cetrafs_invalidate_block(
-                        sb, cetrafs_extent_phys_from_hilo(iarr[li].ei_leaf_hi, iarr[li].ei_leaf_lo));
+                    cetrafs_invalidate_block(sb,
+                                             cetrafs_extent_phys_from_hilo(iarr[li].ei_leaf_hi, iarr[li].ei_leaf_lo));
                 brelse(ibh);
             }
             cetrafs_invalidate_block(sb, ilba);
@@ -208,8 +212,7 @@ void cetrafs_tree_invalidate_cached(struct inode *inode, const cetrafs_inode_t *
  * is required and that is exactly what the read-side callers (seek,
  * fiemap) do. Single pass, growing the buffer, bounded by the format's
  * structural maximum. */
-int cetrafs_tree_flatten(struct inode *inode, const cetrafs_inode_t *raw, cetrafs_extent_t **out_arr,
-                         u32 *out_n)
+int cetrafs_tree_flatten(struct inode *inode, const cetrafs_inode_t *raw, cetrafs_extent_t **out_arr, u32 *out_n)
 {
     cetrafs_extent_t *arr = NULL;
     u32 cap = 0, n = 0, ni;
@@ -274,8 +277,7 @@ fail:
 }
 
 /* Walk one external leaf block's extents (read by LBA, plain cached). */
-static int cetrafs_scrub_walk_leaf(struct super_block *sb, u64 lba,
-                                   void (*cb)(void *, u64, u32), void *ctx)
+static int cetrafs_scrub_walk_leaf(struct super_block *sb, u64 lba, void (*cb)(void *, u64, u32), void *ctx)
 {
     struct buffer_head *bh = sb_bread(sb, lba);
     const cetrafs_extent_hdr_t *hdr;
@@ -340,8 +342,10 @@ static int cetrafs_scrub_walk_leaf(struct super_block *sb, u64 lba,
  * (dirent blocks, reached through the extents), file.c (data, leaf,
  * index), xattr.c (the xattr block).
  */
-int cetrafs_raw_inode_for_each_owned_block(struct super_block *sb, const cetrafs_inode_t *raw,
-                                           void (*cb)(void *ctx, u64 phys, u32 len), void *ctx)
+int cetrafs_raw_inode_for_each_owned_block(struct super_block *sb,
+                                           const cetrafs_inode_t *raw,
+                                           void (*cb)(void *ctx, u64 phys, u32 len),
+                                           void *ctx)
 {
     u16 depth;
     u32 i, n;
@@ -435,8 +439,8 @@ static int cetrafs_inode_extents_get(struct inode *inode, const cetrafs_inode_t 
         return -EIO;
 
     ex->arr = (const cetrafs_extent_t *) (ex->leaf_bh->b_data + sizeof(cetrafs_extent_hdr_t));
-    ex->entries =
-        min_t(u32, cetrafs_le16(((const cetrafs_extent_hdr_t *) ex->leaf_bh->b_data)->eh_entries), CETRAFS_EXT_BLOCK_MAX_LEAVES);
+    ex->entries = min_t(u32, cetrafs_le16(((const cetrafs_extent_hdr_t *) ex->leaf_bh->b_data)->eh_entries),
+                        CETRAFS_EXT_BLOCK_MAX_LEAVES);
     return 0;
 }
 
@@ -542,10 +546,9 @@ static loff_t cetrafs_seek_hole_data(struct file *file, loff_t offset, int whenc
         return -ENXIO;
     }
 
-    ret = cetrafs_read_raw_inode(inode->i_sb, inode->i_ino, &raw);
+    ret = cetrafs_read_raw_inode_overlaid(inode->i_sb, inode, &raw); /* torn-read-safe vs a concurrent publish */
     if (ret)
         goto out;
-    cetrafs_inode_fd_overlay(inode, &raw); /* the hot path's pending extents (v0x0005) */
 
     ret = cetrafs_inode_extents_get(inode, &raw, &ex);
     if (ret)
@@ -610,10 +613,9 @@ int cetrafs_fiemap(struct inode *inode, struct fiemap_extent_info *fi, u64 start
 
     inode_lock_shared(inode);
 
-    ret = cetrafs_read_raw_inode(inode->i_sb, inode->i_ino, &raw);
+    ret = cetrafs_read_raw_inode_overlaid(inode->i_sb, inode, &raw); /* torn-read-safe vs a concurrent publish */
     if (ret)
         goto out;
-    cetrafs_inode_fd_overlay(inode, &raw); /* the hot path's pending extents (v0x0005) */
     ret = cetrafs_inode_extents_get(inode, &raw, &ex);
     if (ret)
         goto out;
@@ -775,7 +777,8 @@ void cetrafs_free_inline_extents(struct inode *dir, const cetrafs_inode_t *raw)
     struct super_block *sb = dir->i_sb;
 
     if (raw->eh.eh_depth == 0) {
-        cetrafs_free_leaf_array(sb, raw->et.leaf, min_t(u16, cetrafs_le16(raw->eh.eh_entries), ARRAY_SIZE(raw->et.leaf)));
+        cetrafs_free_leaf_array(sb, raw->et.leaf,
+                                min_t(u16, cetrafs_le16(raw->eh.eh_entries), ARRAY_SIZE(raw->et.leaf)));
         return;
     }
 
@@ -806,6 +809,26 @@ void cetrafs_free_inline_extents(struct inode *dir, const cetrafs_inode_t *raw)
     }
 }
 
+/*
+ * Remember an extent a walk just resolved, so the next block of the same
+ * write does not walk again.
+ *
+ * A PREALLOCATED extent is deliberately never remembered. Its uninit
+ * flag is cleared by a split that rewrites a LEAF block while leaving
+ * the record's depth, entry count and block count untouched -- the three
+ * fields the entry is keyed on -- so a remembered uninit extent is the
+ * one case the key cannot invalidate. Getting that wrong in either
+ * direction is serious (serving a preallocated block as data hands the
+ * reader a deleted file's contents), and preallocated extents are rare
+ * enough that skipping them costs nothing.
+ */
+static void cetrafs_tree_remember(struct inode *inode, const cetrafs_inode_t *raw, const struct cetrafs_ext_span *span)
+{
+    if (span->uninit || !span->len)
+        return;
+    cetrafs_inode_ext_cache_store(inode, raw, span->block, span->len, span->lba, false);
+}
+
 /* Find the extent covering 'iblock' in a leaf array (inline or external),
  * returning its physical LBA. Shared by both locations an extent array can
  * live in. */
@@ -825,8 +848,13 @@ void cetrafs_free_inline_extents(struct inode *dir, const cetrafs_inode_t *raw)
  * a scan per lookup. One extent's worth is the cheap, always-correct
  * answer, and a contiguous file is one extent anyway.
  */
-static bool cetrafs_leaf_array_lookup(const cetrafs_extent_t *arr, u16 entries, u32 iblock, u64 *out_lba, u32 *out_run,
-                                      bool *out_uninit)
+static bool cetrafs_leaf_array_lookup(const cetrafs_extent_t *arr,
+                                      u16 entries,
+                                      u32 iblock,
+                                      u64 *out_lba,
+                                      u32 *out_run,
+                                      bool *out_uninit,
+                                      struct cetrafs_ext_span *out_span)
 {
     u16 i;
 
@@ -835,11 +863,23 @@ static bool cetrafs_leaf_array_lookup(const cetrafs_extent_t *arr, u16 entries, 
         u32 eb = cetrafs_le32(arr[i].ee_block);
 
         if (iblock >= eb && iblock < (u64) eb + len) {
-            *out_lba = cetrafs_extent_phys_from_hilo(arr[i].ee_start_hi, arr[i].ee_start_lo) + (iblock - eb);
+            u64 base = cetrafs_extent_phys_from_hilo(arr[i].ee_start_hi, arr[i].ee_start_lo);
+
+            *out_lba = base + (iblock - eb);
             if (out_run)
                 *out_run = len - (iblock - eb);
             if (out_uninit)
                 *out_uninit = cetrafs_extent_is_uninit(arr[i].ee_len);
+            /* The WHOLE extent, not just the tail from iblock: that is
+             * what lets the caller remember it and answer the blocks
+             * BEFORE iblock too, which a backwards or strided walk
+             * asks for. */
+            if (out_span) {
+                out_span->block = eb;
+                out_span->len = len;
+                out_span->lba = base;
+                out_span->uninit = cetrafs_extent_is_uninit(arr[i].ee_len);
+            }
             return true;
         }
     }
@@ -870,8 +910,8 @@ static u64 cetrafs_leaf_array_next_contig_lba(const cetrafs_extent_t *arr, u16 e
  * after it both logically and physically, else appending a new entry.
  * Returns 0, or -ENOSPC if the array is full and the last entry can't be
  * extended. */
-static int cetrafs_leaf_array_insert(cetrafs_extent_t *arr, __le16 *entries, u16 max, u32 iblock, u64 lba,
-                                     u32 count, bool uninit);
+static int
+cetrafs_leaf_array_insert(cetrafs_extent_t *arr, __le16 *entries, u16 max, u32 iblock, u64 lba, u32 count, bool uninit);
 
 /* Preallocated blocks RELEASED because an extent split had no room --
  * the give-back. It is a last resort: the middle split now puts the
@@ -913,8 +953,14 @@ u64 cetrafs_giveback_block_count(void)
  * they are not there, so the caller can fall back rather than leave a
  * half-split array: nothing is modified until the room is known.
  */
-static int cetrafs_leaf_array_convert(struct super_block *sb, cetrafs_extent_t *arr, __le16 *entries, u16 max,
-                                      u32 iblock, u64 lba, u32 want, u32 *done)
+static int cetrafs_leaf_array_convert(struct super_block *sb,
+                                      cetrafs_extent_t *arr,
+                                      __le16 *entries,
+                                      u16 max,
+                                      u32 iblock,
+                                      u64 lba,
+                                      u32 want,
+                                      u32 *done)
 {
     const cetrafs_superblock_t *raw_sb = cetrafs_sb_raw(sb);
     u16 n = cetrafs_le16(*entries), i;
@@ -1162,8 +1208,8 @@ static int cetrafs_leaf_array_convert(struct super_block *sb, cetrafs_extent_t *
  * content. Folding the other way would lose real data behind a
  * reads-as-zero extent. Only like merges with like.
  */
-static int cetrafs_leaf_array_insert(cetrafs_extent_t *arr, __le16 *entries, u16 max, u32 iblock, u64 lba,
-                                     u32 count, bool uninit)
+static int
+cetrafs_leaf_array_insert(cetrafs_extent_t *arr, __le16 *entries, u16 max, u32 iblock, u64 lba, u32 count, bool uninit)
 {
     u16 n = cetrafs_le16(*entries);
 
@@ -1243,6 +1289,9 @@ static u16 cetrafs_leaf_array_trim(struct super_block *sb,
 
     for (i = 0; i < entries; i++) {
         u32 len = cetrafs_extent_len(arr[i].ee_len);
+        /* Same rule as the punch's splits: a trimmed PREALLOCATED
+         * extent stays preallocated. */
+        int uninit_entry = cetrafs_extent_is_uninit(arr[i].ee_len);
         u64 start = cetrafs_le32(arr[i].ee_block);
         u64 end = start + len; /* exclusive */
         u64 phys = cetrafs_extent_phys_from_hilo(arr[i].ee_start_hi, arr[i].ee_start_lo);
@@ -1260,7 +1309,7 @@ static u16 cetrafs_leaf_array_trim(struct super_block *sb,
             if (do_free)
                 cetrafs_free_data_extent(sb, phys + new_len, len - new_len);
             freed += len - new_len;
-            arr[i].ee_len = cetrafs_extent_pack_len(new_len, 0);
+            arr[i].ee_len = cetrafs_extent_pack_len(new_len, uninit_entry);
         }
 
         if (kept != i)
@@ -1340,6 +1389,16 @@ static int cetrafs_leaf_array_punch(struct super_block *sb,
 
     for (i = 0; i < count; i++) {
         u32 len = cetrafs_extent_len(arr[i].ee_len);
+        /*
+         * Whether this entry is PREALLOCATED, carried through every
+         * rewrite below. cetrafs_extent_pack_len() packs the flag into
+         * the length's high bit, so passing 0 STRIPS it: punching part
+         * of a fallocate(KEEP_SIZE) range used to turn the surviving
+         * head/tail into ordinary data, and blocks that had never been
+         * written stopped reading as zeros -- they served whatever
+         * their previous owner had left in them.
+         */
+        int uninit_entry = cetrafs_extent_is_uninit(arr[i].ee_len);
         u64 estart = cetrafs_le32(arr[i].ee_block);
         u64 eend = estart + len; /* exclusive */
         u64 phys = cetrafs_extent_phys_from_hilo(arr[i].ee_start_hi, arr[i].ee_start_lo);
@@ -1365,10 +1424,10 @@ static int cetrafs_leaf_array_punch(struct super_block *sb,
 
             arr[i].ee_block = cetrafs_cpu_to_le32((u32) he);
             cetrafs_extent_phys_to_hilo(phys + (he - estart), &arr[i].ee_start_hi, &arr[i].ee_start_lo);
-            arr[i].ee_len = cetrafs_extent_pack_len(new_len, 0);
+            arr[i].ee_len = cetrafs_extent_pack_len(new_len, uninit_entry);
         } else if (he == eend) {
             /* hole eats the back (same shape as _trim()'s own case) */
-            arr[i].ee_len = cetrafs_extent_pack_len((u32) (hs - estart), 0);
+            arr[i].ee_len = cetrafs_extent_pack_len((u32) (hs - estart), uninit_entry);
         } else {
             /* hole lands entirely inside: split into front + tail */
             cetrafs_extent_t tail;
@@ -1386,9 +1445,9 @@ static int cetrafs_leaf_array_punch(struct super_block *sb,
 
             tail.ee_block = cetrafs_cpu_to_le32((u32) he);
             cetrafs_extent_phys_to_hilo(phys + (he - estart), &tail.ee_start_hi, &tail.ee_start_lo);
-            tail.ee_len = cetrafs_extent_pack_len((u32) (eend - he), 0);
+            tail.ee_len = cetrafs_extent_pack_len((u32) (eend - he), uninit_entry);
 
-            arr[i].ee_len = cetrafs_extent_pack_len((u32) (hs - estart), 0);
+            arr[i].ee_len = cetrafs_extent_pack_len((u32) (hs - estart), uninit_entry);
 
             memmove(&arr[i + 2], &arr[i + 1], (count - i - 1) * sizeof(*arr));
             arr[i + 1] = tail;
@@ -1553,9 +1612,15 @@ static bool cetrafs_idx_may_hold(const cetrafs_extent_idx_t *e, u32 iblock)
 
 /* Point query across depth 0/1/2. Early-returns on the first match, so
  * it never flattens the whole tree (the full-scan readers do that). */
-static int cetrafs_tree_lookup(struct inode *inode, const cetrafs_inode_t *raw, u32 iblock, u64 *out_lba, u32 *out_run,
-                               bool *out_uninit, bool *found)
+static int cetrafs_tree_lookup(struct inode *inode,
+                               const cetrafs_inode_t *raw,
+                               u32 iblock,
+                               u64 *out_lba,
+                               u32 *out_run,
+                               bool *out_uninit,
+                               bool *found)
 {
+    struct cetrafs_ext_span span = {0};
     u32 ni;
 
     *found = false;
@@ -1565,8 +1630,29 @@ static int cetrafs_tree_lookup(struct inode *inode, const cetrafs_inode_t *raw, 
         *out_run = 1;
 
     if (raw->eh.eh_depth == 0) {
-        *found = cetrafs_leaf_array_lookup(raw->et.leaf, min_t(u16, cetrafs_le16(raw->eh.eh_entries), ARRAY_SIZE(raw->et.leaf)),
-                                           iblock, out_lba, out_run, out_uninit);
+        /* Inline extents live in the record the caller just read: the
+         * scan is a handful of comparisons over at most 4 slots and
+         * touches no block at all. Nothing to cache, and nothing a
+         * cache could save. */
+        *found = cetrafs_leaf_array_lookup(raw->et.leaf,
+                                           min_t(u16, cetrafs_le16(raw->eh.eh_entries), ARRAY_SIZE(raw->et.leaf)),
+                                           iblock, out_lba, out_run, out_uninit, NULL);
+        return 0;
+    }
+
+    /*
+     * Spilled tree: try the remembered extent first.
+     *
+     * Gated on exactly the predicate cetrafs_read_tree_bh() uses to
+     * decide a CACHED leaf may be trusted -- this entry was built out
+     * of those leaves, so it must not outlive their trust. Where that
+     * predicate is false every leaf read goes to the device anyway, and
+     * answering from memory there would be the frozen-extent-tree bug
+     * with extra steps.
+     */
+    if (cetrafs_lock_held_for_write_locally(inode) &&
+        cetrafs_inode_ext_cache_lookup(inode, raw, iblock, out_lba, out_run, out_uninit)) {
+        *found = true;
         return 0;
     }
 
@@ -1579,8 +1665,11 @@ static int cetrafs_tree_lookup(struct inode *inode, const cetrafs_inode_t *raw, 
             return -EIO;
         lhdr = (const cetrafs_extent_hdr_t *) lbh->b_data;
         *found = cetrafs_leaf_array_lookup((const cetrafs_extent_t *) (lbh->b_data + sizeof(*lhdr)),
-                                           min_t(u16, cetrafs_le16(lhdr->eh_entries), CETRAFS_EXT_BLOCK_MAX_LEAVES), iblock, out_lba, out_run, out_uninit);
+                                           min_t(u16, cetrafs_le16(lhdr->eh_entries), CETRAFS_EXT_BLOCK_MAX_LEAVES),
+                                           iblock, out_lba, out_run, out_uninit, &span);
         brelse(lbh);
+        if (*found)
+            cetrafs_tree_remember(inode, raw, &span);
         return 0;
     }
 
@@ -1623,11 +1712,12 @@ static int cetrafs_tree_lookup(struct inode *inode, const cetrafs_inode_t *raw, 
             }
             lhdr = (const cetrafs_extent_hdr_t *) lbh->b_data;
             *found = cetrafs_leaf_array_lookup((const cetrafs_extent_t *) (lbh->b_data + sizeof(*lhdr)),
-                                               min_t(u16, cetrafs_le16(lhdr->eh_entries), CETRAFS_EXT_BLOCK_MAX_LEAVES), iblock,
-                                               out_lba, out_run, out_uninit);
+                                               min_t(u16, cetrafs_le16(lhdr->eh_entries), CETRAFS_EXT_BLOCK_MAX_LEAVES),
+                                               iblock, out_lba, out_run, out_uninit, &span);
             brelse(lbh);
             if (*found) {
                 brelse(ibh);
+                cetrafs_tree_remember(inode, raw, &span);
                 return 0;
             }
         }
@@ -1645,8 +1735,8 @@ static u64 cetrafs_tree_last_contig_lba(struct inode *inode, const cetrafs_inode
     const cetrafs_extent_hdr_t *h;
 
     if (raw->eh.eh_depth == 0)
-        return cetrafs_leaf_array_next_contig_lba(raw->et.leaf, min_t(u16, cetrafs_le16(raw->eh.eh_entries),
-                                                                      ARRAY_SIZE(raw->et.leaf)));
+        return cetrafs_leaf_array_next_contig_lba(
+            raw->et.leaf, min_t(u16, cetrafs_le16(raw->eh.eh_entries), ARRAY_SIZE(raw->et.leaf)));
     if (raw->eh.eh_entries == 0)
         return 0;
 
@@ -1688,7 +1778,8 @@ void cetrafs_tree_free_meta(struct inode *inode, const cetrafs_inode_t *raw)
     u32 ni;
 
     if (cetrafs_le16(raw->eh.eh_depth) == 1) {
-        cetrafs_free_data_block(sb, cetrafs_extent_phys_from_hilo(raw->et.idx[0].ei_leaf_hi, raw->et.idx[0].ei_leaf_lo));
+        cetrafs_free_data_block(sb,
+                                cetrafs_extent_phys_from_hilo(raw->et.idx[0].ei_leaf_hi, raw->et.idx[0].ei_leaf_lo));
         return;
     }
     if (cetrafs_le16(raw->eh.eh_depth) != 2)
@@ -1727,7 +1818,8 @@ u32 cetrafs_tree_extent_count(struct inode *inode, const cetrafs_inode_t *raw)
         struct buffer_head *lbh = cetrafs_read_leaf_bh(inode, llba);
 
         if (lbh) {
-            total = min_t(u32, cetrafs_le16(((const cetrafs_extent_hdr_t *) lbh->b_data)->eh_entries), CETRAFS_EXT_BLOCK_MAX_LEAVES);
+            total = min_t(u32, cetrafs_le16(((const cetrafs_extent_hdr_t *) lbh->b_data)->eh_entries),
+                          CETRAFS_EXT_BLOCK_MAX_LEAVES);
             brelse(lbh);
         }
         return total;
@@ -1776,9 +1868,14 @@ u64 cetrafs_flat_data_blocks(const cetrafs_extent_t *flat, u32 n)
  * old). *out_meta is the number of leaf+interior blocks allocated, for
  * the caller's raw->blocks recompute. n==0 and n<=4 need no meta.
  */
-int cetrafs_tree_build(struct inode *inode, const cetrafs_extent_t *flat, u32 n, cetrafs_inode_t *raw,
-                       u64 *out_meta)
+int cetrafs_tree_build(struct inode *inode, const cetrafs_extent_t *flat, u32 n, cetrafs_inode_t *raw, u64 *out_meta)
 {
+    /* The whole map is being rewritten. This is also the choke point
+     * that covers a defrag RELOCATION -- the one mutation that can
+     * leave depth, entry count and block count all identical while
+     * every extent moves, so the key alone would not catch it. */
+    cetrafs_inode_ext_cache_drop(inode);
+
     struct super_block *sb = inode->i_sb;
     u32 nleaves, ninter, bg, i, j, off;
     u64 *blk = NULL; /* [0..nleaves) leaves, [nleaves..) interiors */
@@ -1926,8 +2023,13 @@ fail:
 
 
 /* Defined below: grows the tree (new leaf/interior) as needed. */
-static int cetrafs_tree_append(struct inode *inode, cetrafs_inode_t *raw, u32 iblock, u64 lba, bool uninit,
-                               bool *merged, u32 *leaf_count);
+static int cetrafs_tree_append(struct inode *inode,
+                               cetrafs_inode_t *raw,
+                               u32 iblock,
+                               u64 lba,
+                               bool uninit,
+                               bool *merged,
+                               u32 *leaf_count);
 
 /*
  * The converted block could not fit its leaf, so the leaf was shrunk in
@@ -1960,16 +2062,20 @@ static int cetrafs_tree_convert_append(struct inode *inode, cetrafs_inode_t *raw
  * guessing). -ENOSPC means the split needs room the array has not got;
  * nothing was modified.
  */
-static int cetrafs_tree_convert_inner(struct inode *inode, cetrafs_inode_t *raw, u32 iblock, u64 lba,
-                                      u32 want, u32 *done)
+static int cetrafs_tree_convert_inner(struct inode *inode,
+                                      cetrafs_inode_t *raw,
+                                      u32 iblock,
+                                      u64 lba,
+                                      u32 want,
+                                      u32 *done)
 {
     struct super_block *sb = inode->i_sb;
     u32 ni;
     int ret;
 
     if (raw->eh.eh_depth == 0) {
-        ret = cetrafs_leaf_array_convert(sb, raw->et.leaf, &raw->eh.eh_entries, (u16) ARRAY_SIZE(raw->et.leaf),
-                                         iblock, lba, want, done);
+        ret = cetrafs_leaf_array_convert(sb, raw->et.leaf, &raw->eh.eh_entries, (u16) ARRAY_SIZE(raw->et.leaf), iblock,
+                                         lba, want, done);
         if (ret == CETRAFS_CONVERT_APPEND)
             return cetrafs_tree_convert_append(inode, raw, (u32) iblock, lba);
         return ret;
@@ -2018,7 +2124,7 @@ static int cetrafs_tree_convert_inner(struct inode *inode, cetrafs_inode_t *raw,
             brelse(lbh);
         } else {
             int wret;
-            
+
             /* Regular file: defer to the durability boundary (see above). */
             if (S_ISREG(inode->i_mode)) {
                 cetrafs_blk_tail_stamp(lbh, CETRAFS_LEAF_TAIL_MAGIC);
@@ -2088,7 +2194,7 @@ static int cetrafs_tree_convert_inner(struct inode *inode, cetrafs_inode_t *raw,
                 brelse(ibh);
             } else {
                 int wret;
-                
+
                 /* Regular file: defer to the durability boundary (see above). */
                 if (S_ISREG(inode->i_mode)) {
                     cetrafs_bh_end_update(lbh);
@@ -2118,6 +2224,10 @@ static int cetrafs_tree_convert_inner(struct inode *inode, cetrafs_inode_t *raw,
  */
 static int cetrafs_tree_convert(struct inode *inode, cetrafs_inode_t *raw, u32 iblock, u64 lba, u32 want, u32 *done)
 {
+    /* A split rewrites a LEAF and can leave the record's depth, entry
+     * count and block count untouched -- the key cannot see it. */
+    cetrafs_inode_ext_cache_drop(inode);
+
     int ret;
 
     *done = 0;
@@ -2133,7 +2243,11 @@ static int cetrafs_tree_convert(struct inode *inode, cetrafs_inode_t *raw, u32 i
     return ret;
 }
 
-static int cetrafs_tree_append(struct inode *inode, cetrafs_inode_t *raw, u32 iblock, u64 lba, bool uninit,
+static int cetrafs_tree_append(struct inode *inode,
+                               cetrafs_inode_t *raw,
+                               u32 iblock,
+                               u64 lba,
+                               bool uninit,
                                bool *merged,
                                u32 *leaf_count)
 {
@@ -2147,7 +2261,8 @@ static int cetrafs_tree_append(struct inode *inode, cetrafs_inode_t *raw, u32 ib
     if (raw->eh.eh_depth == 0) {
         u16 before = cetrafs_le16(raw->eh.eh_entries);
 
-        ret = cetrafs_leaf_array_insert(raw->et.leaf, &raw->eh.eh_entries, ARRAY_SIZE(raw->et.leaf), iblock, lba, 1, uninit);
+        ret = cetrafs_leaf_array_insert(raw->et.leaf, &raw->eh.eh_entries, ARRAY_SIZE(raw->et.leaf), iblock, lba, 1,
+                                        uninit);
         if (ret == 0) {
             *merged = (cetrafs_le16(raw->eh.eh_entries) == before);
             return 0;
@@ -2291,10 +2406,11 @@ static int cetrafs_tree_append(struct inode *inode, cetrafs_inode_t *raw, u32 ib
             raw->eh.eh_entries = cetrafs_cpu_to_le16(1);
             raw->eh.eh_max = cetrafs_cpu_to_le16(ARRAY_SIZE(raw->et.idx));
             cetrafs_idx_set(&raw->et.idx[0], 0, 0 /* root: unknown by design, see below */, new_idx);
-            raw->blocks = cetrafs_cpu_to_le64(cetrafs_le64(raw->blocks) + (2 * (CETRAFS_BLOCK_SIZE / 512))); /* new leaf + new interior */
+            raw->blocks = cetrafs_cpu_to_le64(cetrafs_le64(raw->blocks) +
+                                              (2 * (CETRAFS_BLOCK_SIZE / 512))); /* new leaf + new interior */
             *leaf_count = 1;
             return 0;
-d1_fail:
+        d1_fail:
             cetrafs_free_data_block(sb, new_idx);
             cetrafs_free_data_block(sb, new_leaf);
             return ret;
@@ -2447,7 +2563,8 @@ d1_fail:
                     cetrafs_free_data_block(sb, new_leaf);
                     return ret;
                 }
-                raw->blocks = cetrafs_cpu_to_le64(cetrafs_le64(raw->blocks) + (CETRAFS_BLOCK_SIZE / 512)); /* new leaf */
+                raw->blocks =
+                    cetrafs_cpu_to_le64(cetrafs_le64(raw->blocks) + (CETRAFS_BLOCK_SIZE / 512)); /* new leaf */
                 return 0;
             }
 
@@ -2475,7 +2592,8 @@ d1_fail:
                 }
                 cetrafs_idx_set(&raw->et.idx[cetrafs_le16(raw->eh.eh_entries)], 0, 0 /* root: unknown */, new_idx);
                 raw->eh.eh_entries = cetrafs_cpu_to_le16(cetrafs_le16(raw->eh.eh_entries) + 1);
-                raw->blocks = cetrafs_cpu_to_le64(cetrafs_le64(raw->blocks) + (2 * (CETRAFS_BLOCK_SIZE / 512))); /* new leaf + new interior */
+                raw->blocks = cetrafs_cpu_to_le64(cetrafs_le64(raw->blocks) +
+                                                  (2 * (CETRAFS_BLOCK_SIZE / 512))); /* new leaf + new interior */
                 return 0;
             }
         }
@@ -2597,13 +2715,12 @@ static int cetrafs_get_block(struct inode *inode, sector_t iblock, struct buffer
     if (S_ISDIR(inode->i_mode) || !cetrafs_lock_held_for_write_locally(inode))
         cetrafs_invalidate_raw_inode(sb, inode->i_ino);
 
-    ret = cetrafs_read_raw_inode(sb, inode->i_ino, &raw);
+    ret = cetrafs_read_raw_inode_overlaid(sb, inode, &raw); /* torn-read-safe vs a concurrent publish */
     if (ret)
         return ret;
     /* The device's file sector may lag this node's own in-flight writes:
      * overlay the pending shadow (v0x0005) so this mapping sees every
      * extent the hot path has already handed out. */
-    cetrafs_inode_fd_overlay(inode, &raw);
 
     /* The inline root holds at most ARRAY_SIZE(leaf) (== ARRAY_SIZE(idx))
      * entries at every depth; a corrupt-but-checksum-valid eh_entries past
@@ -2641,14 +2758,14 @@ static int cetrafs_get_block(struct inode *inode, sector_t iblock, struct buffer
      * write_inode gap documented in inode.c.
      */
     if (cetrafs_le64(raw.generation) != cetrafs_inode_get_generation(inode)) {
-        pr_warn_ratelimited("ino=%llu: record generation %llu != in-core %llu -- the number was reused; refusing to map\n",
-                            (unsigned long long) inode->i_ino, (unsigned long long) cetrafs_le64(raw.generation),
-                            (unsigned long long) cetrafs_inode_get_generation(inode));
+        pr_warn_ratelimited(
+            "ino=%llu: record generation %llu != in-core %llu -- the number was reused; refusing to map\n",
+            (unsigned long long) inode->i_ino, (unsigned long long) cetrafs_le64(raw.generation),
+            (unsigned long long) cetrafs_inode_get_generation(inode));
         return -ESTALE;
     }
 
-    if (cetrafs_le16(raw.eh.eh_magic) != CETRAFS_EXT_MAGIC ||
-        cetrafs_le16(raw.eh.eh_depth) > CETRAFS_EXT_MAX_DEPTH ||
+    if (cetrafs_le16(raw.eh.eh_magic) != CETRAFS_EXT_MAGIC || cetrafs_le16(raw.eh.eh_depth) > CETRAFS_EXT_MAX_DEPTH ||
         cetrafs_le16(raw.eh.eh_entries) > ARRAY_SIZE(raw.et.leaf))
         return -EIO;
 
@@ -2823,8 +2940,8 @@ static int cetrafs_get_block(struct inode *inode, sector_t iblock, struct buffer
                     if (cetrafs_bg_reconcile_free_count(sb, bg_id, &delta) != 0)
                         return ret; /* cannot even recount: report the original */
                     pr_warn_ratelimited(
-                        "alloc: BG %u reported free space but its bitmap is full -- recounted (delta %lld)\n",
-                        bg_id, (long long) delta);
+                        "alloc: BG %u reported free space but its bitmap is full -- recounted (delta %lld)\n", bg_id,
+                        (long long) delta);
                     /* Back off before re-picking: a recount is real I/O
                      * and a retry here is rare (only a BG whose cached
                      * count lied), so the cost is nil and it keeps this
@@ -2881,7 +2998,8 @@ static int cetrafs_get_block(struct inode *inode, sector_t iblock, struct buffer
         return ret;
     }
 
-    raw.blocks = cetrafs_cpu_to_le64(cetrafs_le64(raw.blocks) + (CETRAFS_BLOCK_SIZE / 512)); /* the newly allocated data block */
+    raw.blocks =
+        cetrafs_cpu_to_le64(cetrafs_le64(raw.blocks) + (CETRAFS_BLOCK_SIZE / 512)); /* the newly allocated data block */
 
     /*
      * The hot per-allocated-block path (256 calls for a 1 MiB write).
@@ -2912,6 +3030,8 @@ static int cetrafs_get_block(struct inode *inode, sector_t iblock, struct buffer
     }
 
     inode->i_blocks = cetrafs_le64(raw.blocks);
+    ctrace("MAP ino=%llu lblk=%llu lba=%llu merged=%d\n", (unsigned long long) inode->i_ino,
+           (unsigned long long) iblock, (unsigned long long) lba, (int) merged);
     map_bh(bh_result, sb, lba);
     set_buffer_new(bh_result);
 
@@ -2979,6 +3099,9 @@ MODULE_PARM_DESC(fail_extent_record_write, "TEST ONLY: fail the record write in 
 
 static int cetrafs_truncate_shrink(struct inode *inode, loff_t new_size)
 {
+    /* Extents are about to go away under us. */
+    cetrafs_inode_ext_cache_drop(inode);
+
     struct super_block *sb = inode->i_sb;
     cetrafs_inode_t *recs; /* [0]=raw, [1]=old_raw -- 2 KiB, off the stack */
 #define raw (recs[0])
@@ -3021,12 +3144,11 @@ static int cetrafs_truncate_shrink(struct inode *inode, loff_t new_size)
      * from a pre-peer list double-frees. CLAUDE.md rule 1.
      */
     cetrafs_invalidate_raw_inode(sb, inode->i_ino);
-    ret = cetrafs_read_raw_inode(sb, inode->i_ino, &raw);
+    ret = cetrafs_read_raw_inode_overlaid(sb, inode, &raw); /* torn-read-safe vs a concurrent publish */
     if (ret) {
         kfree(recs);
         return ret;
     }
-    cetrafs_inode_fd_overlay(inode, &raw); /* include pending hot-path extents; claimed only on publish (v0x0005) */
     old_raw = raw; /* its et/eh still name the OLD tree, freed after publish */
 
     /* Flatten the whole tree into an independent copy (depth 0/1/2). */
@@ -3072,15 +3194,32 @@ static int cetrafs_truncate_shrink(struct inode *inode, loff_t new_size)
     }
 
     raw.size = cetrafs_cpu_to_le64(new_size);
-    raw.blocks = cetrafs_cpu_to_le64((cetrafs_flat_data_blocks(new_flat, kept) + meta_blocks) * (CETRAFS_BLOCK_SIZE / 512));
+    raw.blocks =
+        cetrafs_cpu_to_le64((cetrafs_flat_data_blocks(new_flat, kept) + meta_blocks) * (CETRAFS_BLOCK_SIZE / 512));
 
     /* The injection stands IN PLACE OF the write: a record that never
      * reached the device. On failure, free the NEW tree we just built
      * (the old one is still the durable truth) and bail. */
-    ret = unlikely(cetrafs_fail_extent_record_write) ? -EIO
-                                                     : cetrafs_write_raw_inode_fd(sb, inode->i_ino, &raw, inode);
-    if (!ret)
-        cetrafs_inode_fd_discard(inode); /* this publish supersedes the overlaid shadow */
+    {
+        u64 fd_seq;
+
+        cetrafs_inode_fd_pub_lock(inode);
+        /* Same rule as the defrag step publish: size and times from the
+         * LIVE inode under the publish mutex, never from the image this
+         * operation read earlier -- a punch must be size-neutral, and
+         * copying a size read before a concurrent boundary publish
+         * regresses it (the defrag sibling of this line lost an owner's
+         * extension exactly that way, 2026-10-29). */
+        raw.size = cetrafs_cpu_to_le64((u64) i_size_read(inode));
+        raw.atime = cetrafs_cpu_to_le64((u64) inode_get_atime_sec(inode));
+        raw.mtime = cetrafs_cpu_to_le64((u64) inode_get_mtime_sec(inode));
+        fd_seq = cetrafs_inode_fd_seq(inode);
+        ret = unlikely(cetrafs_fail_extent_record_write) ? -EIO
+                                                         : cetrafs_write_raw_inode_fd(sb, inode->i_ino, &raw, inode);
+        if (!ret)
+            cetrafs_inode_fd_published(inode, fd_seq); /* this publish supersedes the overlaid shadow */
+        cetrafs_inode_fd_pub_unlock(inode);
+    }
     if (ret) {
         cetrafs_tree_free_meta(inode, &raw);
         kfree(new_flat);
@@ -3183,10 +3322,9 @@ static int cetrafs_do_allocate(struct inode *inode, loff_t offset, loff_t len, b
     if (end_block > CETRAFS_MAX_FILE_BLOCKS)
         return -EFBIG;
 
-    ret = cetrafs_read_raw_inode(sb, inode->i_ino, &raw);
+    ret = cetrafs_read_raw_inode_overlaid(sb, inode, &raw); /* torn-read-safe vs a concurrent publish */
     if (ret)
         return ret;
-    cetrafs_inode_fd_overlay(inode, &raw); /* include pending hot-path extents; claimed only on publish (v0x0005) */
     if (cetrafs_le16(raw.eh.eh_magic) != CETRAFS_EXT_MAGIC)
         return -EIO;
 
@@ -3228,10 +3366,17 @@ static int cetrafs_do_allocate(struct inode *inode, loff_t offset, loff_t len, b
     if (!keep_size && end > i_size_read(inode))
         raw.size = cetrafs_cpu_to_le64((u64) end);
 
-    ret = cetrafs_write_raw_inode_fd(sb, inode->i_ino, &raw, inode);
+    cetrafs_inode_fd_pub_lock(inode);
+    {
+        u64 fd_seq = cetrafs_inode_fd_seq(inode);
+
+        ret = cetrafs_write_raw_inode_fd(sb, inode->i_ino, &raw, inode);
+        if (!ret)
+            cetrafs_inode_fd_published(inode, fd_seq); /* this publish supersedes the overlaid shadow */
+    }
+    cetrafs_inode_fd_pub_unlock(inode);
     if (ret)
         goto out;
-    cetrafs_inode_fd_discard(inode); /* this publish supersedes the overlaid shadow */
 
     inode->i_blocks = cetrafs_le64(raw.blocks);
     if (!keep_size && end > i_size_read(inode))
@@ -3245,8 +3390,15 @@ out:
     /* Partial progress stays: the blocks added so far are real, on the
      * bitmap and referenced by the record we publish here. Leaving them
      * unpublished would leak every one of them. */
-    if (added && cetrafs_write_raw_inode_fd(sb, inode->i_ino, &raw, inode) == 0)
-        cetrafs_inode_fd_discard(inode);
+    if (added) {
+        u64 fd_seq;
+
+        cetrafs_inode_fd_pub_lock(inode);
+        fd_seq = cetrafs_inode_fd_seq(inode);
+        if (cetrafs_write_raw_inode_fd(sb, inode->i_ino, &raw, inode) == 0)
+            cetrafs_inode_fd_published(inode, fd_seq);
+        cetrafs_inode_fd_pub_unlock(inode);
+    }
     return ret;
 }
 
@@ -3271,6 +3423,10 @@ static long cetrafs_fallocate(struct file *file, int mode, loff_t offset, loff_t
     if (!recs)
         return -ENOMEM;
 
+    /* Punch frees extents and ALLOCATE creates preallocated ones; both
+     * rewrite the map under whatever a walk last resolved. */
+    cetrafs_inode_ext_cache_drop(inode);
+
     if (offset < 0 || len <= 0) {
         kfree(recs);
         return -EINVAL;
@@ -3281,8 +3437,7 @@ static long cetrafs_fallocate(struct file *file, int mode, loff_t offset, loff_t
         long arc;
 
         inode_lock(inode);
-        arc = cetrafs_sb_is_fenced(sb) ? -EIO
-                                       : cetrafs_do_allocate(inode, offset, len, mode & FALLOC_FL_KEEP_SIZE);
+        arc = cetrafs_sb_is_fenced(sb) ? -EIO : cetrafs_do_allocate(inode, offset, len, mode & FALLOC_FL_KEEP_SIZE);
         inode_unlock(inode);
         kfree(recs);
         return arc;
@@ -3339,10 +3494,9 @@ static long cetrafs_fallocate(struct file *file, int mode, loff_t offset, loff_t
             goto out;
     }
 
-    ret = cetrafs_read_raw_inode(sb, inode->i_ino, &raw);
+    ret = cetrafs_read_raw_inode_overlaid(sb, inode, &raw); /* torn-read-safe vs a concurrent publish */
     if (ret)
         goto out;
-    cetrafs_inode_fd_overlay(inode, &raw); /* include pending hot-path extents; claimed only on publish (v0x0005) */
     old_raw = raw; /* names the OLD tree; freed after publish */
 
     /* Flatten the whole tree (depth 0/1/2) into an independent copy. */
@@ -3430,12 +3584,20 @@ static long cetrafs_fallocate(struct file *file, int mode, loff_t offset, loff_t
         goto out;
     }
 
-    raw.blocks = cetrafs_cpu_to_le64((cetrafs_flat_data_blocks(new_flat, new_n) + meta_blocks) * (CETRAFS_BLOCK_SIZE / 512));
+    raw.blocks =
+        cetrafs_cpu_to_le64((cetrafs_flat_data_blocks(new_flat, new_n) + meta_blocks) * (CETRAFS_BLOCK_SIZE / 512));
 
-    ret = unlikely(cetrafs_fail_extent_record_write) ? -EIO
-                                                     : cetrafs_write_raw_inode_fd(sb, inode->i_ino, &raw, inode);
-    if (!ret)
-        cetrafs_inode_fd_discard(inode); /* this publish supersedes the overlaid shadow */
+    {
+        u64 fd_seq;
+
+        cetrafs_inode_fd_pub_lock(inode);
+        fd_seq = cetrafs_inode_fd_seq(inode);
+        ret = unlikely(cetrafs_fail_extent_record_write) ? -EIO
+                                                         : cetrafs_write_raw_inode_fd(sb, inode->i_ino, &raw, inode);
+        if (!ret)
+            cetrafs_inode_fd_published(inode, fd_seq); /* this publish supersedes the overlaid shadow */
+        cetrafs_inode_fd_pub_unlock(inode);
+    }
     if (ret) {
         cetrafs_tree_free_meta(inode, &raw);
         kfree(new_flat);
@@ -3449,8 +3611,8 @@ static long cetrafs_fallocate(struct file *file, int mode, loff_t offset, loff_t
     cetrafs_tree_free_meta(inode, &old_raw);
     {
         u16 discard_entries = (u16) old_n;
-        int fret = cetrafs_leaf_array_punch(sb, old_flat, &discard_entries, (u16) (old_n + 2),
-                                            start_block, end_block, &discard, /*do_free=*/true);
+        int fret = cetrafs_leaf_array_punch(sb, old_flat, &discard_entries, (u16) (old_n + 2), start_block, end_block,
+                                            &discard, /*do_free=*/true);
         if (fret)
             pr_err("punch: freeing the old blocks failed (%d) -- %u block(s) may have leaked\n", fret, freed);
     }
@@ -3760,8 +3922,7 @@ static int cetrafs_fsync(struct file *file, loff_t start, loff_t end, int datasy
     if (ret2 && !ret)
         ret = ret2;
 
-    if (cetrafs_read_raw_inode(sb, inode->i_ino, &raw) == 0) {
-        cetrafs_inode_fd_overlay(inode, &raw); /* the shadow's tree is the one to flush (v0x0005) */
+    if (cetrafs_read_raw_inode_overlaid(sb, inode, &raw) == 0) { /* torn-read-safe vs a concurrent publish */
         if (cetrafs_le16(raw.eh.eh_magic) == CETRAFS_EXT_MAGIC && cetrafs_le16(raw.eh.eh_depth) >= 1)
             ret2 = cetrafs_flush_tree_blocks(inode, &raw);
         else

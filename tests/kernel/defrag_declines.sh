@@ -56,8 +56,13 @@ echo "$EXT" | grep -q "depth=1" &&
     pass "the sparse file is fragmented enough to reach the worker ($EXT)" ||
     fail "not fragmented enough: $EXT -- the worker would never be asked"
 
-# Give the workqueue a moment; it is a separate thread.
-for _ in $(seq 1 20); do
+# Give the workqueue a moment; it is a separate thread. The budget is
+# the same 120s the suite's other janitor waits carry, for the same
+# reason: under a loaded full gate the worker queues behind every other
+# suite's backlog, and three different asserts in this file have each
+# missed a 20-30s window while passing every isolated run. The property
+# is that the decline IS logged, not that it is logged quickly.
+for _ in $(seq 1 120); do
     dmesg_since "$MARK" | grep -q "auto-defrag: ino=$INO" && break
     sleep 1
 done
@@ -67,6 +72,14 @@ if dmesg_since "$MARK" | grep -q "auto-defrag: ino=$INO"; then
     dmesg_since "$MARK" | grep "auto-defrag: ino=$INO" | head -1 | sed 's/^/       /'
 else
     fail "no auto-defrag line for ino=$INO -- a file that will never be defragmented says so nowhere"
+    # Self-diagnosis: this assert has failed only inside loaded full
+    # gates, never isolated, and the line it greps for is pr_debug --
+    # one dropped dyndbg enable, one missed dmesg window or one disabled
+    # param produces exactly this. Say which.
+    log "diag: auto_defrag=$(cat /sys/module/cetrafs/parameters/auto_defrag 2>/dev/null)"
+    log "diag: dyndbg defrag lines: $(grep -c "defrag.c.*=p" /sys/kernel/debug/dynamic_debug/control 2>/dev/null || echo unreadable)"
+    log "diag: full-ring hits for ino=$INO: $(dmesg | grep -c "auto-defrag: ino=$INO" || true)"
+    log "diag: any auto-defrag lines since mark: $(dmesg_since "$MARK" | grep -c "auto-defrag" || true)"
 fi
 dmesg_since "$MARK" | grep "auto-defrag: ino=$INO" | grep -qiE "sparse|hole|not supported|declin" &&
     pass "...and says WHY, not merely that something happened" ||
@@ -109,7 +122,13 @@ os.close(b); os.close(a)
 PY
 sync
 DINO="$(stat -c '%i' "$MNT/dense")"
-for _ in $(seq 1 30); do
+# 30s was too tight under a full-gate load -- the janitor is a background
+# workqueue queued behind every other suite's backlog, and this suite
+# fails roughly once per full run while passing 3/3 isolated. Same
+# property, same fix, same reasoning as defrag_controls.sh: what is
+# under test is that the janitor relocates AND LOGS, not that it does so
+# within an arbitrary deadline. It still fails, just later, if broken.
+for _ in $(seq 1 120); do
     dmesg_since "$MARK2" | grep -q "auto-defrag: ino=$DINO" && break
     sleep 1
 done

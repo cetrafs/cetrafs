@@ -1,3 +1,69 @@
+cetrafs (0.9) unstable; urgency=medium
+
+  * A volume can now be grown in place into space the device already
+    has: growfs.cetra extends the Block Group chain OFFLINE -- the
+    volume must be unmounted on every node, and the tool refuses to run
+    while any node still heartbeats. Its plan names any cluster node
+    whose module is too old to follow, before anything is written.
+    Growing stamps the volume with on-disk format 0x0009 -- a ONE-WAY
+    DOOR: once grown, packages older than this one refuse the volume at
+    mount, so upgrade every node BEFORE growing. Volumes from 0.8.2
+    (format 0x0008) mount unchanged and need no reformat. (The node
+    registry already advertises the live-grow capability; growing
+    without unmounting is roadmap, not this release.)
+
+  * Block Group ownership now lives in the Block Group itself rather
+    than in a Zone Group's fixed range, so ownership moves between nodes
+    one group at a time: a node claims unowned groups when it needs
+    space and hands empty ones back -- which is also what makes freshly
+    grown space usable by every node.
+
+  * A new randomized concurrent-churn suite drives several writers
+    against a content oracle that knows what every byte of every file
+    must be, with the background workers (defragmenter, scrub) forced to
+    run throughout. It exists to catch what scripted tests structurally
+    miss, and it did: a handful of very rare defects -- each needing a
+    precise coincidence of concurrent writers, block reuse under disk
+    pressure and a background pass in the same narrow window -- were
+    found and fixed. In the worst of them a heavily rewritten file
+    could, in very unlikely circumstances, read back stale or zeroed
+    data. None were reachable by a quiet workload; none survive the new
+    suite, which now runs in the standard gate.
+
+  * Large files that have been rewritten in place for a long time are
+    substantially faster. Every 4 KiB of a buffered write resolved its
+    position by walking the file's extent tree from the top, which costs
+    nothing while a file is laid out compactly but grows with how
+    scattered it has become -- so a virtual-machine image slowed down as
+    it aged. Each file now remembers the last extent it resolved, which
+    answers the blocks that follow without walking at all. Measured on a
+    heavily fragmented file: 710 MB/s to 1091 MB/s, and thirty-six times
+    fewer metadata reads. Compact files were already on the fast path and
+    are unchanged.
+
+  * Fixed: a Zone Group that left a node and came back could leave that
+    node's free-space bookkeeping double counted. Free-block counts are
+    accumulated in memory and written out at a durability boundary, so a
+    file held open for a long time carries its pending change for as
+    long as it stays open -- across a change of ownership, after which
+    the new owner has already recounted from the bitmaps. The guard
+    meant to catch that compared against the wrong moment in time and
+    let the stale change through. Where the result would have gone
+    negative it was refused and then retried forever, logging every
+    fifteen seconds and blocking the pass that returns unneeded Zone
+    Groups; where it still fit, the count was quietly wrong. No file
+    data was ever at risk -- the bitmaps, which are the truth, were
+    always correct -- but free space could be misreported and allocation
+    could avoid groups that were in fact usable.
+
+  * Background maintenance was hardened along the same lines: the scrub
+    cross-checks live in-core state and recent allocation activity
+    before reclaiming anything, the defragmenter refuses work it cannot
+    relocate safely and no longer frees blocks it has already handed
+    over, and an emptied Block Group is verified in place before being
+    withdrawn from service.
+
+ -- Massimo Cetra <mcetra@gmail.com>  Wed, 28 Oct 2026 23:25:27 +0000
 cetrafs (0.8.2) unstable; urgency=medium
 
   * A default mount can now hand one file's exclusive lock back on

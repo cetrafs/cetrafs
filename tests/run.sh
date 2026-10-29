@@ -19,6 +19,31 @@ set -uo pipefail
 CT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
 cd "$CT_DIR"
 
+# ---------------------------------------------------------------- preflight
+# Refuse to START a batch that cannot finish. The largest suite writes a
+# ~6 GiB image into CT_BIG_DIR; a batch that runs 19 minutes and then
+# ABORTS one suite on ENOSPC wastes the whole run (it happened: a full
+# check died on leftover debug images squatting in /root, 2026-10-28).
+# Override the floor with CT_MIN_FREE_MB for a deliberately small box.
+CT_MIN_FREE_MB="${CT_MIN_FREE_MB:-7168}"
+preflight_space() {
+    local dir="${CT_BIG_DIR:-/root}" free
+    free=$(df -Pm "$dir" 2>/dev/null | awk 'NR==2 {print $4}')
+    if [ -n "$free" ] && [ "$free" -lt "$CT_MIN_FREE_MB" ]; then
+        echo "FATAL: only ${free} MiB free in $dir -- the largest suite needs ~6144 MiB" >&2
+        echo "       and a batch must not start what it cannot finish." >&2
+        echo "       Free space (biggest offenders: stale test images, /var/log after" >&2
+        echo "       a printk-heavy run) or lower CT_MIN_FREE_MB deliberately." >&2
+        exit 1
+    fi
+    free=$(df -Pm /tmp 2>/dev/null | awk 'NR==2 {print $4}')
+    if [ -n "$free" ] && [ "$free" -lt 256 ]; then
+        echo "FATAL: only ${free} MiB free in /tmp -- suites stage small images there (need ~256 MiB)" >&2
+        exit 1
+    fi
+}
+preflight_space
+
 usage() {
     sed -n '2,16p' "$0" | sed 's/^# \?//'
     exit "${1:-0}"

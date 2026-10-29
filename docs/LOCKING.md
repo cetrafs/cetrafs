@@ -156,6 +156,23 @@ ownership — and whichever write landed last would silently win while
 both nodes' `open()` had already returned success. A lost race now
 returns `-ETXTBSY`.
 
+### Single-node data publication: `fd_pub_mutex`
+
+The namespace lock (Mechanism 3, below) governs cross-node access to extent trees and metadata. Within one node, `cetrafs_inode_fd_pub_mutex` serialises every publisher of a file's record — the things that mutate its inode image and write it back to disk:
+
+- `cetrafs_write_vfs_inode()` (the file's own write path)
+- `cetrafs_punch_hole()` (hole-punch ioctl)
+- `cetrafs_defrag_step()` (the background defragmenter moving extents)
+- `cetrafs_refresh_vfs_inode_if_newer()` (a reader refreshing cached inode fields)
+
+Holding this mutex across a publish does three jobs:
+
+1. **Size/timestamp are sourced from the live inode.** A background mover (defrag or punch) that runs while a local writer has the file open will read a stale extent map and re-read the live file's size/atime/mtime under the mutex at publish time, not use what it read at operation start. This prevents the symptom where a defrag step's first read sees extent 0 and a 100-block size, a concurrent local write grows the file to 200 blocks with a new extent, and the defrag's final publish overwrites the size back to 100 with both extents — a size-extent mismatch that fsck calls consistent but the data is wrong.
+
+2. **Read refreshes and publish CAS are atomic.** A read that happens while the file's own publish is in flight can observe the pre-publish image. Without the mutex, a reader could refresh while a publisher's CAS is running, pick up a stale value, mark it as fresh, and persist that staleness despite the publish succeeding. The mutex ensures the refresh either happens entirely before the publish (and is corrected by its merge write-back) or entirely after (and sees the published state).
+
+3. **The refresh guard prevents self-reverting reads.** A read that completes after this node's own file-sector publish CAS started but before it finished sees the pre-publish record, and if that read's timestamp is stamped it reverts in-core state the publish just made newer. A guard in `cetrafs_refresh_vfs_inode_if_newer()` checks whether the record's last file-sector stamp is this node's own: if so, the read is declined (in-core is already at least this new), and a peer's stamp still applies (necessary for cross-node coherency).
+
 ## Mechanism 3: the per-inode namespace lock + lock-aware destructive ops
 
 Two problems sit below the two mechanisms above.

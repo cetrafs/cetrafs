@@ -52,10 +52,10 @@ ct_mount "$DEV" "$MNT"
 # Make every BG of the OWNED ZG look full, so an allocation has to go
 # looking for another zone group -- the same trick the claim-policy suite
 # uses, rather than writing hundreds of MiB for real.
-OWNED_FIRST="$(grep -oP "zg $OWNED: owner=0 .*first_bg=\K[0-9]+" /proc/fs/cetrafs/$(basename "$DEV")/info | head -1)"
-OWNED_CNT="$(grep -oP "zg $OWNED: owner=0 .*bg_count=\K[0-9]+" /proc/fs/cetrafs/$(basename "$DEV")/info | head -1)"
 ct_umount "$MNT"
-for b in $(seq "${OWNED_FIRST:-0}" $((${OWNED_FIRST:-0} + ${OWNED_CNT:-1} - 1))); do
+# The owned Zone Group's members, asked of the Block Groups: procfs no
+# longer publishes a span to walk (tests/lib/harness.sh).
+for b in $(ct_bgs_of_zg "$DEV" "$OWNED"); do
     "$BG_POKE" "$DEV" "$b" 0 sync-zg >/dev/null
 done
 ct_mount "$DEV" "$MNT"

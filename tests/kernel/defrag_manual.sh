@@ -24,6 +24,7 @@ DEFRAG_LOOPDEV="$(losetup --find --show "$DEFRAG_IMG")"
 DEFRAG_MNT="$(mktemp -d /tmp/cetrafs-defrag-mnt-XXXXXX)"
 "$ROOT/userspace/mkfs.cetra" "$DEFRAG_LOOPDEV" -z 1 -b 512 -J 0 -N 1024 -f >/dev/null
 mount -t cetrafs "$DEFRAG_LOOPDEV" "$DEFRAG_MNT"
+require_cetrafs_mount "$DEFRAG_MNT"
 # This section exercises the MANUAL tool, so keep the background janitor
 # out of it -- otherwise it defrags the file on close before the tool runs.
 ct_param_set auto_defrag 0
@@ -74,6 +75,7 @@ umount "$DEFRAG_MNT"
     pass "defrag: fsck clean after the move (bitmaps and ZG/BG counters consistent)" ||
     fail "defrag: fsck reported errors after the move"
 mount -t cetrafs "$DEFRAG_LOOPDEV" "$DEFRAG_MNT"
+require_cetrafs_mount "$DEFRAG_MNT"
 DEFRAG_SUM_REMOUNT="$(sha256sum "$DEFRAG_MNT/fragfile" | cut -d' ' -f1)"
 [ "$DEFRAG_SUM_BEFORE" = "$DEFRAG_SUM_REMOUNT" ] && pass "defrag: content persisted across remount" ||
     fail "defrag: content wrong after remount"

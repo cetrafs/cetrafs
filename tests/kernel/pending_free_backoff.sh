@@ -23,7 +23,12 @@
 #                           gets its ZG reclaimed and the free goes
 #                           direct, so the drop path never runs
 #   pf_full_backoff_ms=0 -- the negative control
-. "$(dirname "$0")/../lib/harness.sh"
+# set -euo pipefail, and the BASH_SOURCE form, like every other suite.
+# Without -e a failed mkfs or mount here was ignored and the assertions
+# below ran against nothing -- the vacuous pass tests/README.md exists
+# to prevent.
+set -euo pipefail
+. "$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)/lib/harness.sh"
 require_root
 require_module
 suite "pending-free backoff when the queue is full"

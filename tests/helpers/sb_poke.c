@@ -35,6 +35,7 @@ static const struct {
     size_t off;
     int width;
 } FIELDS[] = {
+    {"version", offsetof(cetrafs_superblock_t, version), 2},
     {"sb_bytes", offsetof(cetrafs_superblock_t, sb_bytes), 2},
     {"total_blocks", offsetof(cetrafs_superblock_t, total_blocks), 8},
     {"zone_group_count", offsetof(cetrafs_superblock_t, zone_group_count), 4},
@@ -61,6 +62,13 @@ static const struct {
     {"features_compat", offsetof(cetrafs_superblock_t, features_compat), 8},
     {"features_incompat", offsetof(cetrafs_superblock_t, features_incompat), 8},
     {"features_ro_compat", offsetof(cetrafs_superblock_t, features_ro_compat), 8},
+    /* Grow (extendfs): all four read 0 on a volume that has never been
+     * grown, which is what tests/image/mkfs_partial_size.sh asserts. */
+    {"layout_gen", offsetof(cetrafs_superblock_t, layout_gen), 8},
+    {"tail_reserve_start", offsetof(cetrafs_superblock_t, tail_reserve_start), 8},
+    {"tail_reserve_blocks", offsetof(cetrafs_superblock_t, tail_reserve_blocks), 8},
+    {"orphan_blocks", offsetof(cetrafs_superblock_t, orphan_blocks), 8},
+    {"bg_data_end", offsetof(cetrafs_superblock_t, bg_data_end), 8},
 };
 
 static uint64_t field_get(const cetrafs_superblock_t *sb, int i)

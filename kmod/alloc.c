@@ -577,16 +577,22 @@ int cetrafs_alloc_inode(struct super_block *sb, u64 *out_ino)
             }
         }
         if (have && cetrafs_le32(raw.nlink) != 0) {
-            pr_err("alloc_inode: the bitmap handed out ino=%llu but its record still claims %u link(s) "
-                   "(generation=%llu mode=0%o size=%llu) -- refusing to hand a LIVE inode to a second owner\n",
-                   (unsigned long long) *out_ino, (unsigned int) cetrafs_le32(raw.nlink),
-                   (unsigned long long) cetrafs_le64(raw.generation), (unsigned int) cetrafs_le32(raw.mode),
-                   (unsigned long long) cetrafs_le64(raw.size));
+            pr_err(
+                "alloc_inode: the bitmap handed out ino=%llu but its record still claims %u link(s) "
+                "(generation=%llu mode=0%o size=%llu) -- refusing to hand a LIVE inode to a second owner\n",
+                (unsigned long long) *out_ino, (unsigned int) cetrafs_le32(raw.nlink),
+                (unsigned long long) cetrafs_le64(raw.generation), (unsigned int) cetrafs_le32(raw.mode),
+                (unsigned long long) cetrafs_le64(raw.size));
             *out_ino = 0;
             return -EIO;
         }
     }
 
+    /* Mark the number mid-birth BEFORE returning it: from here until the
+     * first name is published, the on-disk record cannot prove this node
+     * owns the number (the dead previous record is still what a scanner
+     * reads), so the orphan scrub keys off this registry instead. */
+    cetrafs_sb_birth_begin(sb, *out_ino);
     cetrafs_sb_adjust_free_inodes(sb, -1);
     return 0;
 }
@@ -601,6 +607,10 @@ int cetrafs_free_inode(struct super_block *sb, u64 ino)
         return -EIO; /* self-fenced */
     if (!raw_sb || !ino)
         return -EINVAL;
+
+    /* Any free ends the number's gestation: every create error path
+     * funnels through here, so the birth registry cannot leak. */
+    cetrafs_sb_birth_end(sb, ino);
 
     /*
      * Zero the record's nlink before the bit goes back. Until now a
@@ -620,9 +630,9 @@ int cetrafs_free_inode(struct super_block *sb, u64 ino)
 
         cetrafs_invalidate_raw_inode(sb, ino);
         if (cetrafs_read_raw_inode(sb, ino, &raw) == 0) {
-            ctrace("INOFREE ino=%llu nlink_on_disk=%u size=%llu from=%pS\n",
-                    (unsigned long long) ino, (unsigned int) cetrafs_le32(raw.nlink),
-                    (unsigned long long) cetrafs_le64(raw.size), __builtin_return_address(0));
+            ctrace("INOFREE ino=%llu nlink_on_disk=%u size=%llu from=%pS\n", (unsigned long long) ino,
+                   (unsigned int) cetrafs_le32(raw.nlink), (unsigned long long) cetrafs_le64(raw.size),
+                   __builtin_return_address(0));
             if (cetrafs_le32(raw.nlink) != 0)
                 (void) cetrafs_inode_ns_zero_nlink(sb, ino, &raw);
         }
@@ -637,6 +647,44 @@ int cetrafs_free_inode(struct super_block *sb, u64 ino)
                    * freeing its blocks double-frees them (one pending-free
                    * entry per evict; the second apply lands after the
                    * owner reallocated the block). */
+    if (!ret)
+        cetrafs_sb_adjust_free_inodes(sb, 1);
+    return ret;
+}
+
+/*
+ * The orphan scrub's conditioned free. cetrafs_free_inode() trusts its
+ * caller's verdict; the scrub's verdict can go stale in MICROSECONDS (a
+ * create can reuse the number between the verdict read and the free --
+ * caught live: INOFREE with nlink_on_disk=1, 378us after the INOALLOC,
+ * two files then sharing one inode; 2026-10-29). Re-read the record
+ * FRESH immediately before the free and require it to still be the dead
+ * record the verdict saw: nlink==0 AND the same generation (every
+ * rebirth stamps a new generation, so a reborn number can never match).
+ * A mismatch returns -ESTALE and frees nothing. The residual window
+ * (create wrote its record after this re-read) is closed by the birth
+ * registry, which the scrub checks before ever reaching here.
+ */
+int cetrafs_free_inode_if_dead(struct super_block *sb, u64 ino, u64 generation)
+{
+    cetrafs_inode_t raw;
+    int ret;
+
+    if (cetrafs_sb_is_fenced(sb))
+        return -EIO;
+    if (!ino)
+        return -EINVAL;
+
+    cetrafs_invalidate_raw_inode(sb, ino);
+    ret = cetrafs_read_raw_inode(sb, ino, &raw);
+    if (ret)
+        return ret; /* cannot vouch -- free nothing */
+    if (cetrafs_le32(raw.nlink) != 0 || cetrafs_le64(raw.generation) != generation)
+        return -ESTALE; /* reborn under the verdict -- not ours to free */
+
+    ret = cetrafs_inode_bitmap_cas_free(sb, ino - 1);
+    if (ret > 0)
+        return 1;
     if (!ret)
         cetrafs_sb_adjust_free_inodes(sb, 1);
     return ret;
@@ -704,7 +752,7 @@ static int cetrafs_read_bg_geom(struct super_block *sb, u32 bg_id, struct cetraf
     if (bg_id >= le32_to_cpu(raw_sb->block_group_count))
         return -EINVAL;
 
-    blk = le64_to_cpu(raw_sb->bg_table_start) + bg_id;
+    blk = cetrafs_sb_bg_desc_lba(sb, bg_id);
 
     for (attempt = 0; attempt < 5; attempt++) {
         const cetrafs_block_group_t *bg;
@@ -826,7 +874,7 @@ void cetrafs_bg_desc_refresh_foreign(struct super_block *sb, u32 bg_id)
         return;
     }
 
-    cetrafs_invalidate_block(sb, le64_to_cpu(raw_sb->bg_table_start) + bg_id);
+    cetrafs_invalidate_block(sb, cetrafs_sb_bg_desc_lba(sb, bg_id));
     atomic64_inc(&cetrafs_bg_desc_refreshed);
 }
 
@@ -840,7 +888,7 @@ int cetrafs_bg_invalidate_cache(struct super_block *sb, u32 bg_id)
     if (!raw_sb)
         return -EINVAL;
 
-    cetrafs_invalidate_block(sb, le64_to_cpu(raw_sb->bg_table_start) + bg_id);
+    cetrafs_invalidate_block(sb, cetrafs_sb_bg_desc_lba(sb, bg_id));
 
     ret = cetrafs_read_bg_geom(sb, bg_id, &bg);
     if (ret)
@@ -878,11 +926,22 @@ int cetrafs_bg_invalidate_cache(struct super_block *sb, u32 bg_id)
  *
  * Also rolls the same delta up into the owning ZG's aggregate
  * (fsck cross-checks "ZG == sum of its BGs", and the roll-up
- * was once missing entirely). owner_zg is immutable after mkfs, so the
- * cached descriptor read serving it here costs no round trip. A roll-up
- * failure is loud but doesn't fail the alloc/free itself: the operation
- * this was called from already succeeded, matching every caller (which
- * ignore this return).
+ * was once missing entirely).
+ *
+ * owner_zg USED to be immutable after mkfs, which is what justified
+ * serving it from the cached descriptor here. It is not any more: a
+ * Block Group owned by nobody can be claimed while the volume runs
+ * (docs/internal/BG-OWNERSHIP-DESIGN.md). The cached read stays --
+ * invalidating per allocation is exactly the per-block device round
+ * trip PERFORMANCE.md forbids -- and the claim path invalidates the
+ * descriptor itself, so the next read here sees the new owner. What
+ * this must not do is trust a stale FREE: rolling a delta into Zone
+ * Group 0xFFFF would index past every per-ZG array, so it is checked
+ * below rather than assumed away.
+ *
+ * A roll-up failure is loud but doesn't fail the alloc/free itself:
+ * the operation this was called from already succeeded, matching every
+ * caller (which ignore this return).
  */
 static int cetrafs_bg_adjust_free_blocks(struct super_block *sb, u32 bg_id, s64 delta)
 {
@@ -897,7 +956,7 @@ static int cetrafs_bg_adjust_free_blocks(struct super_block *sb, u32 bg_id, s64 
     if (bg_id >= le32_to_cpu(raw_sb->block_group_count))
         return -EINVAL;
 
-    bh = sb_bread(sb, le64_to_cpu(raw_sb->bg_table_start) + bg_id);
+    bh = sb_bread(sb, cetrafs_sb_bg_desc_lba(sb, bg_id));
     if (!bh)
         return -EIO;
     bg = (const cetrafs_block_group_t *) bh->b_data;
@@ -907,6 +966,17 @@ static int cetrafs_bg_adjust_free_blocks(struct super_block *sb, u32 bg_id, s64 
     /* PERF(4): accrue only -- a sync here is one device round trip per
      * allocated block (1 MiB write: 2s -> 40s). docs/PERFORMANCE.md */
     cetrafs_sb_accrue_bg_free(sb, bg_id, delta);
+
+    /* Nobody's Block Group has nobody's aggregate to roll into, and
+     * CETRAFS_BG_OWNER_FREE as an index would run off every per-ZG
+     * array. Reaching here with a free owner means this node allocated
+     * from a Block Group it has not claimed, which is a bug worth
+     * saying out loud rather than papering over. */
+    if (owner_zg == CETRAFS_BG_OWNER_FREE) {
+        pr_err("BG %u free-count adjust: the Block Group is owned by nobody -- allocated from unclaimed space\n",
+               bg_id);
+        return 0;
+    }
 
     ret = cetrafs_zg_adjust_free_blocks(sb, owner_zg, delta);
     if (ret)
@@ -945,11 +1015,12 @@ static u32 cetrafs_bg_image_crc(const void *image, unsigned int len)
 }
 
 struct cetrafs_bg_count_ctx {
-    bool absolute;    /* reconcile: count = value and the epoch advances */
-    s64 value;        /* the delta, or (absolute) the bitmap truth */
-    u64 expect_seq;   /* delta mode: the epoch the delta was accrued under */
-    u64 out_seq;      /* the epoch in the image the swap committed */
-    u32 bg_id;        /* for the log lines */
+    bool absolute;  /* reconcile: count = value and the epoch advances */
+    s64 value;      /* the delta, or (absolute) the bitmap truth */
+    u64 expect_seq; /* delta mode: the epoch the delta was accrued under */
+    u64 out_seq;    /* the epoch in the image the swap committed */
+    u32 bg_id;      /* for the log lines */
+    bool refused;   /* delta mode: the image could not take it (underflow) */
 };
 
 static int cetrafs_bg_count_mutate(void *image, unsigned int len, void *priv)
@@ -957,6 +1028,11 @@ static int cetrafs_bg_count_mutate(void *image, unsigned int len, void *priv)
     struct cetrafs_bg_count_ctx *ctx = priv;
     cetrafs_block_group_t *bg = (cetrafs_block_group_t *) image;
     s64 want;
+
+    /* Re-run from scratch on every CAS attempt: a miscompare retry gets
+     * a fresh image, so a verdict from the previous attempt must not
+     * survive into this one. */
+    ctx->refused = false;
 
     if (ctx->absolute) {
         /* A reconcile: the new owner writing the bitmap truth. Advances
@@ -978,18 +1054,29 @@ static int cetrafs_bg_count_mutate(void *image, unsigned int len, void *priv)
          * be byte-identical to what this node expects. The epoch cannot.
          */
         if (cetrafs_le64(bg->reconcile_seq) != ctx->expect_seq) {
-            pr_warn("BG %u free delta %lld dropped: the count was reconciled by a new owner (epoch %llu, ours was %llu)\n",
-                    ctx->bg_id, (long long) ctx->value,
-                    (unsigned long long) cetrafs_le64(bg->reconcile_seq), (unsigned long long) ctx->expect_seq);
+            pr_warn(
+                "BG %u free delta %lld dropped: the count was reconciled by a new owner (epoch %llu, ours was %llu)\n",
+                ctx->bg_id, (long long) ctx->value, (unsigned long long) cetrafs_le64(bg->reconcile_seq),
+                (unsigned long long) ctx->expect_seq);
             ctx->out_seq = cetrafs_le64(bg->reconcile_seq);
             return 1; /* dropped, loudly -- not an error */
         }
         want = (s64) cetrafs_le64(bg->free_data_blocks) + ctx->value;
         if (want < 0) {
             /* A count, never negative -- same refusal as the ZG
-             * aggregate's mutator: fsck cross-checks these. */
-            pr_err("BG %u free delta %lld would take the count below zero (%llu)\n", ctx->bg_id,
-                   (long long) ctx->value, (unsigned long long) cetrafs_le64(bg->free_data_blocks));
+             * aggregate's mutator: fsck cross-checks these.
+             *
+             * Flagged rather than returned as a plain error, because
+             * the two are not the same thing to the caller: an I/O
+             * error is worth retrying the delta on, while a delta that
+             * does not FIT never will. Re-accruing one of those is an
+             * endless loop -- the heartbeat re-flushes every tick, logs
+             * the same pair of lines, and the surplus-ZG release that
+             * flushes first can never complete. Observed in the field
+             * for hours; the delta is dropped here instead. */
+            pr_err("BG %u free delta %lld would take the count below zero (%llu)\n", ctx->bg_id, (long long) ctx->value,
+                   (unsigned long long) cetrafs_le64(bg->free_data_blocks));
+            ctx->refused = true;
             return -EINVAL;
         }
         bg->free_data_blocks = cetrafs_cpu_to_le64((u64) want);
@@ -1040,13 +1127,25 @@ int cetrafs_bg_apply_free_delta(struct super_block *sb, u32 bg_id, s64 delta)
      * reconcile landed, or the cache was simply cold -- just MISCOMPAREs
      * and the retry re-reads fresh, where the epoch guard decides. */
     {
-        struct buffer_head *bh = sb_bread(sb, le64_to_cpu(raw_sb->bg_table_start) + bg_id);
+        struct buffer_head *bh = sb_bread(sb, cetrafs_sb_bg_desc_lba(sb, bg_id));
 
-        ret = cetrafs_cas_record_seeded(sb, le64_to_cpu(raw_sb->bg_table_start) + bg_id,
-                                        bh ? bh->b_data : NULL, bh ? cetrafs_cas_region_size(sb) : 0,
-                                        cetrafs_bg_count_mutate, &ctx);
+        ret = cetrafs_cas_record_seeded(sb, cetrafs_sb_bg_desc_lba(sb, bg_id), bh ? bh->b_data : NULL,
+                                        bh ? cetrafs_cas_region_size(sb) : 0, cetrafs_bg_count_mutate, &ctx);
         if (bh)
             brelse(bh);
+    }
+
+    /* A delta the descriptor cannot take is CONSUMED, like a dropped
+     * stale one: it is not a transient failure and no number of retries
+     * turns it into a fit. Our count for this BG is out of step with
+     * its bitmap; the bitmap is the truth and the next reconcile of
+     * this Block Group (its ownership entering this node) repairs the
+     * descriptor from it. fsck cross-checks the same pair meanwhile. */
+    if (ctx.refused) {
+        pr_err("BG %u: dropping the delta -- this node's free count for it is out of step with its bitmap, "
+               "which a reconcile (or fsck) repairs\n",
+               bg_id);
+        return 0;
     }
     return ret;
 }
@@ -1058,21 +1157,31 @@ int cetrafs_bg_apply_free_delta(struct super_block *sb, u32 bg_id, s64 delta)
  * itself everywhere it runs; a ZG cached without one would accrue every
  * delta under epoch 0, all to be dropped at the first flush.
  */
-int cetrafs_bg_seed_count_epochs(struct super_block *sb, u32 first_bg, u32 bg_count)
+int cetrafs_bg_seed_count_epochs(struct super_block *sb, u32 zg_id)
 {
     const cetrafs_superblock_t *raw_sb = cetrafs_sb_raw(sb);
-    u32 b;
+    u32 b, nbg;
     int ret;
 
     if (!raw_sb)
         return -EINVAL;
 
-    for (b = first_bg; b < first_bg + bg_count; b++) {
+    nbg = le32_to_cpu(raw_sb->block_group_count);
+
+    /* Every Block Group this Zone Group owns, asked of the Block
+     * Groups themselves rather than of a contiguous range
+     * (docs/internal/BG-OWNERSHIP-DESIGN.md). Runs on a Zone Group
+     * claim, not per block, so the scan over every Block Group is
+     * affordable where it would not be on the allocation path. */
+    for (b = 0; b < nbg; b++) {
         struct cetrafs_bg_geom bg;
+
+        if (cetrafs_sb_bg_owner(sb, b) != zg_id)
+            continue;
 
         /* Fresh: a cached descriptor can predate an epoch advanced by
          * whoever last reconciled this BG. */
-        cetrafs_invalidate_block(sb, le64_to_cpu(raw_sb->bg_table_start) + b);
+        cetrafs_invalidate_block(sb, cetrafs_sb_bg_desc_lba(sb, b));
         ret = cetrafs_read_bg_geom(sb, b, &bg);
         if (ret)
             return ret;
@@ -1120,11 +1229,9 @@ MODULE_PARM_DESC(alloc_force_foreign, "test-only: treat every Block Group as own
 
 static int cetrafs_alloc_check_owned(struct super_block *sb, u32 bg_id, const struct cetrafs_bg_geom *bg)
 {
-    u32 first_bg = 0, bg_count = 0;
-
     if (cetrafs_alloc_force_foreign)
         goto not_ours;
-    if (cetrafs_sb_zg_owned_cached(sb, bg->owner_zg, &first_bg, &bg_count))
+    if (cetrafs_sb_zg_owned_cached(sb, bg->owner_zg))
         return 0;
 
 not_ours:
@@ -1176,6 +1283,7 @@ int cetrafs_alloc_data_block(struct super_block *sb, u32 bg_id, u64 *out_lba)
         return (int) bit;
 
     *out_lba = bg.start_block + bg.off_data_region + (u64) bit;
+    cetrafs_shadow_set(sb, *out_lba, 1, "alloc_data_block");
     ctrace("BLKALLOC lba=%llu bg=%u from=%pS\n", (unsigned long long) *out_lba, bg_id, __builtin_return_address(0));
     return 0;
 }
@@ -1277,6 +1385,7 @@ int cetrafs_alloc_data_block_near(struct super_block *sb, u32 bg_id, u64 preferr
 
             if (ret == 0) {
                 *out_lba = preferred_lba;
+                cetrafs_shadow_set(sb, *out_lba, 1, "alloc_near_exact");
                 ctrace("BLKALLOC lba=%llu bg=%u from=%pS\n", (unsigned long long) *out_lba, bg_id,
                        __builtin_return_address(0));
                 return 0;
@@ -1344,6 +1453,7 @@ u32 cetrafs_alloc_run_after(struct super_block *sb, u32 bg_id, u64 start_lba, u3
     if (got) {
         cetrafs_bg_adjust_free_blocks(sb, bg_id, -(s64) got);
         cetrafs_sb_note_bmap_alloc(sb, bg_id);
+        cetrafs_shadow_set(sb, start_lba, got, "alloc_run_after");
     }
     cetrafs_sb_alloc_unlock(sb);
 
@@ -1351,6 +1461,24 @@ u32 cetrafs_alloc_run_after(struct super_block *sb, u32 bg_id, u64 start_lba, u3
 }
 
 int cetrafs_alloc_data_run(struct super_block *sb, u32 bg_id, u64 count, u64 *out_lba)
+{
+    return cetrafs_alloc_data_run_resv(sb, bg_id, count, out_lba, NULL);
+}
+
+/*
+ * As above, but when 'span' is given it is PUBLISHED on the reservation
+ * list inside the same alloc_mutex section that sets the bits. The two
+ * becoming visible atomically (w.r.t. the scrub's free, which rechecks
+ * the list under the same mutex) is the whole point: publish-after-
+ * return left a window in which the run was bitmap-set, referenced by
+ * nothing and covered by nothing, and a loaded full-gate run watched
+ * the scrub walk off with the first 322 blocks of a live defrag
+ * destination -- fsck then said "referenced by an inode but marked
+ * FREE" about the finished move (2026-10-29, rule 5: a block must be
+ * protected at the moment it becomes stealable).
+ */
+int cetrafs_alloc_data_run_resv(struct super_block *sb, u32 bg_id, u64 count, u64 *out_lba,
+                                struct cetrafs_resv_span *span)
 {
     struct cetrafs_bg_geom bg;
     u64 bmap_lba, bmap_blocks, bit, run = 0, run_start = 0, b;
@@ -1417,6 +1545,11 @@ int cetrafs_alloc_data_run(struct super_block *sb, u32 bg_id, u64 count, u64 *ou
     cetrafs_bg_adjust_free_blocks(sb, bg_id, -(s64) count);
     cetrafs_sb_note_bmap_alloc(sb, bg_id);
     *out_lba = bg.start_block + bg.off_data_region + run_start;
+    cetrafs_shadow_set(sb, *out_lba, count, "alloc_data_run(defrag)");
+    if (span)
+        cetrafs_resv_publish(sb, span, *out_lba, (u32) min_t(u64, count, U32_MAX));
+    ctrace("BLKRUNALLOC lba=%llu count=%llu bg=%u resv=%d from=%pS\n", (unsigned long long) *out_lba,
+           (unsigned long long) count, bg_id, span ? 1 : 0, __builtin_return_address(0));
     ret = 0;
 
 out_unlock:
@@ -1434,6 +1567,42 @@ out_unlock:
  * BG descriptor block stays hot in the buffer cache after the first
  * touch.
  */
+/*
+ * TEST ONLY (alloc_shadow=1): seed the in-core allocation shadow from the
+ * on-disk data bitmaps, so a mount mid-test does not restart the shadow
+ * EMPTY -- an empty shadow makes every free of a pre-mount allocation
+ * scream FREE-OF-UNTRACKED, and (worse) it is blind to a double
+ * allocation whose first owner allocated before the mount. Mount-time
+ * cost only, and only when the shadow is armed.
+ */
+void cetrafs_shadow_seed(struct super_block *sb)
+{
+    const cetrafs_superblock_t *raw_sb = cetrafs_sb_raw(sb);
+    u32 bg_count, bg_id;
+
+    if (!cetrafs_shadow_active(sb) || !raw_sb)
+        return;
+    bg_count = le32_to_cpu(raw_sb->block_group_count);
+    for (bg_id = 0; bg_id < bg_count; bg_id++) {
+        struct cetrafs_bg_geom bg;
+        u64 blk, bit = 0;
+
+        if (cetrafs_read_bg_geom(sb, bg_id, &bg))
+            continue;
+        for (blk = 0; blk < bg.off_data_region - bg.off_data_bmap; blk++) {
+            struct buffer_head *bh = sb_bread(sb, bg.start_block + bg.off_data_bmap + blk);
+            u64 i;
+
+            if (!bh)
+                break;
+            for (i = 0; i < CETRAFS_BLOCK_SIZE * 8 && bit < bg.data_block_count; i++, bit++)
+                if (bh->b_data[i >> 3] & (1 << (i & 7)))
+                    cetrafs_shadow_set(sb, bg.start_block + bg.off_data_region + bit, 1, "seed");
+            brelse(bh);
+        }
+    }
+}
+
 static int cetrafs_bg_id_for_lba(struct super_block *sb, u64 lba, u32 *out_bg_id)
 {
     const cetrafs_superblock_t *raw_sb = cetrafs_sb_raw(sb);
@@ -1581,6 +1750,42 @@ static int cetrafs_bitmap_test_bit(struct super_block *sb, u64 bmap_lba, u64 nbl
  * Walking only allocated inodes is what lets the scrub see those blocks as
  * unreferenced and reclaim them.
  */
+/*
+ * Birth re-verify (dir.c, after the newborn record's first write): is the
+ * bit this create allocated STILL set, read fresh off the device? A
+ * PEER's orphan scrub can free a mid-birth number -- its verdict read
+ * the previous incarnation's dead record, and our birth registry is
+ * node-local so it cannot see our gestation. Detecting the theft here
+ * and failing the create LOUDLY is the correctness bar's requirement
+ * for a race we cannot yet exclude cross-node; silently proceeding is
+ * how two files end up sharing one inode (2026-10-29, single-node
+ * variant, closed by the registry + the conditioned free).
+ */
+int cetrafs_alloc_inode_still_owned(struct super_block *sb, u64 ino, bool *out_set)
+{
+    const cetrafs_superblock_t *raw_sb = cetrafs_sb_raw(sb);
+    u64 bit, blk;
+    u32 bit_in_block, byte, bit_in_byte;
+    struct buffer_head *bh;
+
+    *out_set = false;
+    if (!raw_sb || !ino || ino > le32_to_cpu(raw_sb->inodes_count))
+        return -EINVAL;
+    bit = ino - 1;
+    blk = bit / CETRAFS_BITS_PER_BLOCK;
+    bit_in_block = bit % CETRAFS_BITS_PER_BLOCK;
+    byte = bit_in_block / 8;
+    bit_in_byte = bit_in_block % 8;
+    if (blk >= le64_to_cpu(raw_sb->inode_bmap_blocks))
+        return -EINVAL;
+    bh = cetrafs_bread_uncached_retry(sb, le64_to_cpu(raw_sb->inode_bmap_start) + blk);
+    if (!bh)
+        return -EIO;
+    *out_set = (*((const u8 *) bh->b_data + byte) & (1u << bit_in_byte)) != 0;
+    brelse(bh);
+    return 0;
+}
+
 int cetrafs_inode_is_allocated(struct super_block *sb, u64 ino, bool *out_set)
 {
     const cetrafs_superblock_t *raw_sb = cetrafs_sb_raw(sb);
@@ -1589,8 +1794,8 @@ int cetrafs_inode_is_allocated(struct super_block *sb, u64 ino, bool *out_set)
         *out_set = false;
         return 0;
     }
-    return cetrafs_bitmap_test_bit(sb, le64_to_cpu(raw_sb->inode_bmap_start),
-                                   le64_to_cpu(raw_sb->inode_bmap_blocks), ino - 1, out_set);
+    return cetrafs_bitmap_test_bit(sb, le64_to_cpu(raw_sb->inode_bmap_start), le64_to_cpu(raw_sb->inode_bmap_blocks),
+                                   ino - 1, out_set);
 }
 
 /*
@@ -1662,8 +1867,12 @@ int cetrafs_alloc_flush_bitmaps(struct super_block *sb)
  * cross-checks them against the referenced-block set it builds from the
  * inode table. Plain geometry, no bitmap access of its own.
  */
-int cetrafs_bg_data_layout(struct super_block *sb, u32 bg_id, u64 *out_data_start, u64 *out_data_count,
-                           u64 *out_bmap_lba, u64 *out_bmap_blocks)
+int cetrafs_bg_data_layout(struct super_block *sb,
+                           u32 bg_id,
+                           u64 *out_data_start,
+                           u64 *out_data_count,
+                           u64 *out_bmap_lba,
+                           u64 *out_bmap_blocks)
 {
     struct cetrafs_bg_geom bg;
     int ret = cetrafs_read_bg_geom(sb, bg_id, &bg);
@@ -1692,7 +1901,29 @@ u64 cetrafs_foreign_free_leak_count(void)
     return (u64) atomic64_read(&cetrafs_foreign_free_leaks);
 }
 
+static int __cetrafs_free_data_extent(struct super_block *sb, u64 lba, u32 count, bool unless_reserved);
+
 int cetrafs_free_data_extent(struct super_block *sb, u64 lba, u32 count)
+{
+    return __cetrafs_free_data_extent(sb, lba, count, false);
+}
+
+/*
+ * The scrub's free: identical, except the reservation list is rechecked
+ * UNDER alloc_mutex before any bit is cleared. The scrub's own check at
+ * decision time is only a fast path -- between it and this free, a
+ * defrag can allocate-and-publish a destination run over these very
+ * bits (both sides of that now happen under this same mutex), and
+ * freeing them then is the referenced-but-FREE corruption the full-gate
+ * run produced. Owner paths keep the plain variant: the reservation
+ * DROP deliberately frees blocks its own span still covers.
+ */
+int cetrafs_free_data_extent_unless_reserved(struct super_block *sb, u64 lba, u32 count)
+{
+    return __cetrafs_free_data_extent(sb, lba, count, true);
+}
+
+static int __cetrafs_free_data_extent(struct super_block *sb, u64 lba, u32 count, bool unless_reserved)
 {
     struct cetrafs_bg_geom bg;
     u64 data_start, bit, b, freed = 0;
@@ -1706,12 +1937,18 @@ int cetrafs_free_data_extent(struct super_block *sb, u64 lba, u32 count)
         return -EIO; /* self-fenced */
 
     ret = cetrafs_bg_id_for_lba(sb, lba, &bg_id);
-    if (ret)
+    if (ret) {
+        pr_err_ratelimited("free: extent [%llu +%u): no BG for the LBA (%d) -- leaked\n", (unsigned long long) lba,
+                           count, ret);
         return ret;
+    }
 
     ret = cetrafs_read_bg_geom(sb, bg_id, &bg);
-    if (ret)
+    if (ret) {
+        pr_err_ratelimited("free: extent [%llu +%u): BG %u geometry unreadable (%d) -- leaked\n",
+                           (unsigned long long) lba, count, bg_id, ret);
         return ret;
+    }
 
     data_start = bg.start_block + bg.off_data_region;
     if (lba + count > data_start + bg.data_block_count) {
@@ -1734,9 +1971,7 @@ int cetrafs_free_data_extent(struct super_block *sb, u64 lba, u32 count)
      * the loop harness on the fast path).
      */
     if (cetrafs_sb_caw_available(sb) || cetrafs_pf_force_foreign) {
-        u32 first_bg, bg_count;
-
-        if (cetrafs_pf_force_foreign || !cetrafs_sb_zg_owned_cached(sb, bg.owner_zg, &first_bg, &bg_count)) {
+        if (cetrafs_pf_force_foreign || !cetrafs_sb_zg_owned_cached(sb, bg.owner_zg)) {
             ret = cetrafs_zg_queue_foreign_free(sb, bg.owner_zg, lba, count);
             ctrace("BLKQUEUE lba=%llu count=%u zg=%u ret=%d from=%pS\n", (unsigned long long) lba, count,
                    (unsigned int) bg.owner_zg, ret, __builtin_return_address(0));
@@ -1789,6 +2024,9 @@ int cetrafs_free_data_extent(struct super_block *sb, u64 lba, u32 count)
     for (b = 0; b < count; b++) {
         bool set = false;
 
+        if (unless_reserved && cetrafs_resv_covers(sb, lba + b))
+            continue; /* a live reservation claimed it since the caller decided -- not ours to free */
+
         ret = cetrafs_bitmap_test_bit(sb, bg.start_block + bg.off_data_bmap, bg.off_data_region - bg.off_data_bmap,
                                       bit + b, &set);
         if (ret)
@@ -1803,6 +2041,7 @@ int cetrafs_free_data_extent(struct super_block *sb, u64 lba, u32 count)
                                       bit + b, /*sync=*/false);
         if (ret)
             break;
+        cetrafs_shadow_clear(sb, lba + b, 1, "free_data_extent");
         freed++;
     }
     if (freed)
@@ -1884,14 +2123,15 @@ int cetrafs_apply_pending_free(struct super_block *sb, u64 lba, u32 count, u32 e
                                       bit + b, /*sync=*/false);
         if (ret)
             break;
+        cetrafs_shadow_clear(sb, lba + b, 1, "free_data_extent");
         freed++;
     }
     if (freed)
         cetrafs_bg_adjust_free_blocks(sb, bg_id, (s64) freed);
     cetrafs_sb_alloc_unlock(sb);
 
-    ctrace("BLKAPPLY lba=%llu count=%u freed=%llu zg=%u\n", (unsigned long long) lba, count,
-           (unsigned long long) freed, expect_zg);
+    ctrace("BLKAPPLY lba=%llu count=%u freed=%llu zg=%u\n", (unsigned long long) lba, count, (unsigned long long) freed,
+           expect_zg);
     return ret;
 }
 
@@ -1997,8 +2237,7 @@ int cetrafs_bg_reconcile_free_count(struct super_block *sb, u32 bg_id, s64 *out_
          * (one sector CAW, cache left warm and correct) -- unseeded here:
          * reconcile runs at ownership transfer, where the cache is being
          * repopulated anyway. */
-        ret = cetrafs_cas_record_seeded(sb, le64_to_cpu(raw_sb->bg_table_start) + bg_id, NULL, 0,
-                                        cetrafs_bg_count_mutate, &ctx);
+        ret = cetrafs_cas_record_seeded(sb, cetrafs_sb_bg_desc_lba(sb, bg_id), NULL, 0, cetrafs_bg_count_mutate, &ctx);
         if (ret)
             return ret;
         /* Deltas accrued from here on belong to this fresh epoch. */
@@ -2007,6 +2246,348 @@ int cetrafs_bg_reconcile_free_count(struct super_block *sb, u32 bg_id, s64 *out_
 
     if (out_delta)
         *out_delta = delta;
+    return 0;
+}
+
+/*
+ * One descriptor read answering both questions the mount-time scan
+ * asks: how much capacity this Block Group has, and which Zone Group
+ * owns it.
+ *
+ * The owner is what makes per-Block-Group ownership possible
+ * (docs/internal/BG-OWNERSHIP-DESIGN.md). Recording it once at mount is
+ * what keeps the answer free afterwards: "do I own this Block Group"
+ * becomes a bit test, with no device read on a path that runs tens of
+ * thousands of times a second. Combined with the capacity read rather
+ * than added beside it, so mount still makes exactly one pass.
+ */
+/* Claim one unowned Block Group into zg_id: the CAS mutate. */
+struct cetrafs_bg_claim_ctx {
+    u32 zg_id;
+    u32 bg_id;
+};
+
+static int cetrafs_bg_claim_mutate(void *image, unsigned int len, void *priv)
+{
+    struct cetrafs_bg_claim_ctx *ctx = priv;
+    cetrafs_block_group_t *bg = (cetrafs_block_group_t *) image;
+
+    /* Re-read inside the swap. Between the scan that picked this Block
+     * Group and this callback, a peer may have claimed it -- the whole
+     * point of doing this as one compare-and-swap rather than a
+     * read-then-write. Refusing here is how the loser of that race
+     * finds out, and it leaves the record exactly as the winner wrote
+     * it. */
+    if (cetrafs_le16(bg->owner_zg) != CETRAFS_BG_OWNER_FREE)
+        return -EAGAIN;
+
+    bg->owner_zg = cetrafs_cpu_to_le16((u16) ctx->zg_id);
+    /* Same normalise-then-checksum as cetrafs_bg_count_mutate(): the
+     * in-sector tail past the real fields is zero by construction, and
+     * cetrafs_bg_image_crc() rests on that. */
+    memset((u8 *) image + offsetof(cetrafs_block_group_t, pad), 0, len - offsetof(cetrafs_block_group_t, pad));
+    bg->checksum = 0;
+    bg->checksum = cetrafs_cpu_to_le64(cetrafs_bg_image_crc(image, len));
+    return 0;
+}
+
+/*
+ * Find a Block Group nobody owns and claim it into one of this node's
+ * Zone Groups.
+ *
+ * Called only when every Block Group this node already owns is full,
+ * so the scan over the Block Group table is paid once per exhaustion,
+ * not per block -- the same budget rule that keeps
+ * cetrafs_alloc_pick_bg()'s own scan rare (PERFORMANCE.md rule 1).
+ *
+ * The claim is ONE compare-and-swap on the Block Group's own record,
+ * the same primitive used for a Zone Group claim, an inode, or a file
+ * lock -- the record's live fields end at byte 68 and its checksum sits
+ * at 52, so the whole thing is inside one 512-byte sector. Two nodes
+ * reaching for the same free Block Group resolve to exactly one
+ * winner; the loser gets -EAGAIN from the mutate and tries the next
+ * one.
+ */
+/*
+ * TEST-ONLY. Claim with a blind write instead of a compare-and-swap.
+ *
+ * The negative control for the claim: with this set, two claimers that
+ * both saw the Block Group free both "win", both roll its capacity
+ * into their Zone Group's aggregate, and fsck reports the aggregate as
+ * double-counted. Without a way to turn the swap off, "the swap is
+ * what excludes them" is an assertion nobody has measured
+ * (tests/README.md).
+ */
+bool cetrafs_bg_claim_blind;
+module_param_named(bg_claim_blind, cetrafs_bg_claim_blind, bool, 0644);
+MODULE_PARM_DESC(bg_claim_blind, "test-only: claim a free Block Group with a blind write, not a compare-and-swap");
+
+extern bool cetrafs_bg_release_skip_empty_check;
+
+/* Hand one Block Group back: the CAS mutate. */
+struct cetrafs_bg_release_ctx {
+    u32 zg_id;
+};
+
+static int cetrafs_bg_release_mutate(void *image, unsigned int len, void *priv)
+{
+    struct cetrafs_bg_release_ctx *ctx = priv;
+    cetrafs_block_group_t *bg = (cetrafs_block_group_t *) image;
+
+    /*
+     * Both conditions re-checked INSIDE the swap, against the image the
+     * device is about to compare.
+     *
+     * Still ours: if the Zone Group was reclaimed from under us the
+     * release is not ours to make.
+     *
+     * Still empty: this is the one that matters. Releasing is the
+     * dangerous direction -- a Block Group handed back while anything
+     * lives in it gets allocated over by whoever takes it next -- so
+     * the emptiness is confirmed here, not merely at the caller's scan
+     * (rule 6: a cached read feeding a DESTRUCTIVE decision; an older
+     * free count reads MORE free than reality, which is exactly the
+     * wrong direction).
+     */
+    (void) len;
+    if (cetrafs_le16(bg->owner_zg) != ctx->zg_id)
+        return -EAGAIN;
+    if (cetrafs_le64(bg->free_data_blocks) != cetrafs_le64(bg->data_block_count) &&
+        !cetrafs_bg_release_skip_empty_check)
+        return -EAGAIN;
+
+    bg->owner_zg = cetrafs_cpu_to_le16((u16) CETRAFS_BG_OWNER_FREE);
+    memset((u8 *) image + offsetof(cetrafs_block_group_t, pad), 0, len - offsetof(cetrafs_block_group_t, pad));
+    bg->checksum = 0;
+    bg->checksum = cetrafs_cpu_to_le64(cetrafs_bg_image_crc(image, len));
+    return 0;
+}
+
+/*
+ * Hand back every Block Group of zg_id that has gone completely empty,
+ * keeping any that still holds data.
+ *
+ * This is the hoarding fix. cetrafs_zg_release_surplus() gives back a
+ * Zone Group only when ALL of it is empty, so a node with two used
+ * Block Groups out of a hundred gives back nothing and its peers see a
+ * full volume. Same rule -- only what is provably empty -- one level
+ * down.
+ *
+ * The node keeps the Zone Group and keeps allocating from it, so the
+ * window this opens is its OWN allocator taking a block between the
+ * emptiness check and the swap. That is same-node, and it is closed by
+ * clearing the Block Group from owned_bgs BEFORE looking: the allocator
+ * consults nothing else, so from that moment it cannot pick this Block
+ * Group. If the release then fails, the bit goes back.
+ */
+/*
+ * TEST-ONLY. Hand a Block Group back without confirming it is empty.
+ *
+ * The negative control for the one rule this whole path rests on. With
+ * it set, a Block Group holding live data is released, somebody else
+ * claims it and allocates over the data -- which is exactly the
+ * outcome the emptiness check exists to prevent, and until it can be
+ * produced on demand, "only what is provably empty" is an assertion
+ * nobody has measured.
+ */
+bool cetrafs_bg_release_skip_empty_check;
+module_param_named(bg_release_skip_empty_check, cetrafs_bg_release_skip_empty_check, bool, 0644);
+MODULE_PARM_DESC(bg_release_skip_empty_check, "test-only: hand back a Block Group without checking it is empty");
+
+int cetrafs_bg_release_empty(struct super_block *sb, u32 zg_id, u32 *out_released)
+{
+    const cetrafs_superblock_t *raw_sb = cetrafs_sb_raw(sb);
+    u32 b, nbg, released = 0;
+
+    if (!raw_sb)
+        return -EINVAL;
+    nbg = le32_to_cpu(raw_sb->block_group_count);
+
+    for (b = 0; b < nbg; b++) {
+        struct cetrafs_bg_release_ctx ctx = {.zg_id = zg_id};
+        u64 total = 0, free = 0;
+        int ret;
+
+        if (cetrafs_sb_bg_owner(sb, b) != zg_id)
+            continue;
+        if (!cetrafs_sb_bg_is_ours(sb, b))
+            continue;
+
+        /*
+         * Cheap pre-check BEFORE draining: skip any Block Group whose
+         * cached count already says it holds data.
+         *
+         * Draining clears the owned bit, so between the drain below and
+         * the undrain further down this node does not own this Block
+         * Group -- and on a volume with only one, it owns NOTHING. That
+         * window spans a free-count flush, a descriptor invalidate and
+         * a full bitmap scan, and anything allocating inside it fails:
+         * cetrafs_alloc_pick_run() walks the owned set and returns
+         * -ENOSPC with the volume 99.9% free, so the online defragmenter
+         * declined ("no contiguous run large enough in the zone groups
+         * this node owns") on an almost empty filesystem. Every heartbeat
+         * tick opened that window once per owned Block Group.
+         *
+         * A stale count errs the safe way: it can only make us SKIP a
+         * Block Group that turned out to be empty, deferring its release
+         * to a later tick. It can never make us release one that is in
+         * use -- the authoritative bitmap scan below still decides that,
+         * and still runs under the drain.
+         */
+        if (!cetrafs_bg_release_skip_empty_check) {
+            struct cetrafs_bg_geom pre;
+
+            if (cetrafs_read_bg_geom(sb, b, &pre) == 0 && pre.free_data_blocks != pre.data_block_count)
+                continue; /* obviously in use -- never take it out of reach */
+        }
+
+        /* Take it out of the allocator's reach first, then look. The
+         * other order leaves a window in which this node allocates into
+         * a Block Group it is in the middle of giving away. */
+        cetrafs_sb_drain_bg(sb, b);
+
+        /* Our own accrued delta has to reach the descriptor before its
+         * free count can be believed -- otherwise "empty" is a count
+         * that predates this node's own frees. */
+        cetrafs_flush_dirty_free_counts(sb);
+        cetrafs_bg_invalidate_cache(sb, b);
+
+        if (cetrafs_bg_data_block_stats(sb, b, &total, &free) != 0 || total == 0 ||
+            (free != total && !cetrafs_bg_release_skip_empty_check)) {
+            cetrafs_sb_undrain_bg(sb, b); /* still in use -- keep it */
+            continue;
+        }
+
+        ret = cetrafs_cas_record(sb, cetrafs_sb_bg_desc_lba(sb, b), cetrafs_bg_release_mutate, &ctx);
+        if (ret) {
+            cetrafs_sb_undrain_bg(sb, b);
+            continue; /* somebody changed it under us; leave it alone */
+        }
+
+        cetrafs_bg_invalidate_cache(sb, b);
+        cetrafs_sb_set_bg_owner(sb, b, CETRAFS_BG_OWNER_FREE);
+        /* BOTH counter moves go by immediate CAS, debit before credit.
+         * The pool write is cluster-visible the moment it lands, so
+         * pairing it with a LAZY local accrual let every peer's statfs
+         * see one half of the move until this node's next durability
+         * boundary -- a df dip/bump of a whole Block Group, caught by
+         * the cross-node xattrs scenario (2026-10-29). Claim and
+         * release are heartbeat-paced; one CAS each is nothing. The
+         * debit-first order keeps any crash window UNDERSTATING. */
+        if (cetrafs_zg_apply_free_delta(sb, zg_id, -(s64) total))
+            cetrafs_zg_adjust_free_blocks(sb, zg_id, -(s64) total); /* lazy fallback: never lose the move */
+        if (cetrafs_zg_adjust_pool_blocks(sb, b, (s64) total))
+            pr_warn("BG %u: released but its pool shard credit failed -- df will understate until fsck\n", b);
+        released++;
+        pr_info("BG %u handed back from ZG %u (empty, %llu blocks)\n", b, zg_id, (unsigned long long) total);
+    }
+
+    if (out_released)
+        *out_released = released;
+    return 0;
+}
+
+int cetrafs_bg_claim_free(struct super_block *sb, u32 zg_id, u32 *out_bg_id)
+{
+    const cetrafs_superblock_t *raw_sb = cetrafs_sb_raw(sb);
+    u32 b, nbg;
+
+    if (!raw_sb)
+        return -EINVAL;
+    nbg = le32_to_cpu(raw_sb->block_group_count);
+
+    for (b = 0; b < nbg; b++) {
+        struct cetrafs_bg_claim_ctx ctx = {.zg_id = zg_id, .bg_id = b};
+        struct cetrafs_bg_geom geom;
+        int ret;
+
+        /* Forced fresh: the cached copy can predate a peer's claim, and
+         * a stale FREE here is exactly the read that makes two nodes
+         * reach for the same Block Group (rule 1). The swap would still
+         * refuse, but scanning on fresh data finds a real candidate
+         * sooner. */
+        cetrafs_invalidate_block(sb, cetrafs_sb_bg_desc_lba(sb, b));
+        if (cetrafs_read_bg_geom(sb, b, &geom) != 0)
+            continue;
+        if (geom.owner_zg != CETRAFS_BG_OWNER_FREE)
+            continue;
+
+        if (cetrafs_bg_claim_blind) {
+            /* test-only: read, decide, write -- no exclusion at all */
+            struct buffer_head *wbh = sb_bread(sb, cetrafs_sb_bg_desc_lba(sb, b));
+
+            if (!wbh)
+                continue;
+            /* Through the buffer-update protocol, not a bare
+             * mark_buffer_dirty(): this knob exists to remove the
+             * COMPARE-AND-SWAP, not to break buffer handling as well --
+             * a control that injects two faults at once cannot say
+             * which one it measured. image/source_invariants.sh
+             * enforces the protocol and caught exactly that here. */
+            cetrafs_bh_begin_update(wbh);
+            cetrafs_bg_claim_mutate(wbh->b_data, CETRAFS_BLOCK_SIZE, &ctx);
+            cetrafs_bh_end_update(wbh);
+            sync_dirty_buffer(wbh);
+            brelse(wbh);
+            ret = 0;
+        } else {
+            ret = cetrafs_cas_record(sb, cetrafs_sb_bg_desc_lba(sb, b), cetrafs_bg_claim_mutate, &ctx);
+        }
+        if (ret == -EAGAIN)
+            continue; /* a peer got there first */
+        if (ret)
+            return ret;
+
+        /* The descriptor just changed owner, so anything holding the
+         * old one must not serve it -- see
+         * cetrafs_bg_adjust_free_blocks(), which reads owner_zg from
+         * the cache on the allocation path. */
+        cetrafs_bg_invalidate_cache(sb, b);
+        cetrafs_sb_set_bg_owner(sb, b, zg_id);
+
+        /*
+         * The Zone Group just gained this Block Group's free space, and
+         * its aggregate has to say so -- fsck cross-checks "a Zone
+         * Group's aggregate equals the sum over its Block Groups", and
+         * the allocator ranks Zone Groups by it. Read fresh: the
+         * descriptor was just invalidated above precisely because the
+         * cached copy is the pre-claim one.
+         */
+        {
+            u64 total = 0, free = 0;
+
+            if (cetrafs_bg_data_block_stats(sb, b, &total, &free) == 0 && free) {
+                /* Debit the pool BEFORE crediting the aggregate, both by
+                 * immediate CAS -- see the release path for why a lazy
+                 * accrual here made peers' statfs dip by this whole
+                 * Block Group, and why debit-first keeps a crash window
+                 * understating rather than inventing space. */
+                if (cetrafs_zg_adjust_pool_blocks(sb, b, -(s64) free))
+                    pr_warn("BG %u: claimed but its pool shard debit failed -- df will overstate until fsck\n", b);
+                if (cetrafs_zg_apply_free_delta(sb, zg_id, (s64) free))
+                    cetrafs_zg_adjust_free_blocks(sb, zg_id, (s64) free); /* lazy fallback: never lose the move */
+            }
+        }
+
+        pr_info("BG %u claimed into ZG %u (was owned by nobody, %llu blocks free)\n", b, zg_id, (unsigned long long) 0);
+        if (out_bg_id)
+            *out_bg_id = b;
+        return 0;
+    }
+    return -ENOSPC;
+}
+
+int cetrafs_bg_mount_info(struct super_block *sb, u32 bg_id, u64 *out_total, u32 *out_owner)
+{
+    struct cetrafs_bg_geom bg;
+    int ret = cetrafs_read_bg_geom(sb, bg_id, &bg);
+
+    if (ret)
+        return ret;
+    if (out_total)
+        *out_total = bg.data_block_count;
+    if (out_owner)
+        *out_owner = bg.owner_zg;
     return 0;
 }
 

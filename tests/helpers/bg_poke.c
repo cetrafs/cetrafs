@@ -46,6 +46,45 @@ static void pwrite_all(int fd, const void *buf, size_t len, off_t off)
     }
 }
 
+/* Move a Zone Group's cached aggregate by delta, restamping only the
+ * HOT checksum (free_data_blocks is a hot field; the cold half is
+ * untouched). Shared by --owner and sync-zg. */
+static void zg_adjust_free(int fd, const cetrafs_superblock_t *sb, uint32_t zg_id, int64_t delta)
+{
+    off_t zg_off = (off_t) (cetrafs_le64(sb->zg_table_start) + zg_id) * CETRAFS_BLOCK_SIZE;
+    cetrafs_zone_group_t zg;
+
+    if (!delta)
+        return;
+    pread_all(fd, &zg, sizeof(zg), zg_off);
+    zg.free_data_blocks = cetrafs_cpu_to_le64((uint64_t) ((int64_t) cetrafs_le64(zg.free_data_blocks) + delta));
+    zg.hot_checksum = 0;
+    zg.hot_checksum = cetrafs_cpu_to_le64((uint64_t) crc32c_struct(
+        (const uint8_t *) &zg + CETRAFS_ZG_HOT_OFF, CETRAFS_ZG_HOT_LEN,
+        offsetof(cetrafs_zone_group_t, hot_checksum) - CETRAFS_ZG_HOT_OFF, sizeof(zg.hot_checksum)));
+    pwrite_all(fd, &zg, sizeof(zg), zg_off);
+}
+
+/* Move a pool shard (capacity of unowned Block Groups sharded to this
+ * ZG record) by delta -- the pool-side mirror of zg_adjust_free(), used
+ * when --owner moves a Block Group in or out of the FREE state. */
+static void zg_adjust_pool(int fd, const cetrafs_superblock_t *sb, uint32_t bg_id, int64_t delta)
+{
+    uint32_t zg_id = bg_id % cetrafs_le32(sb->zone_group_count);
+    off_t zg_off = (off_t) (cetrafs_le64(sb->zg_table_start) + zg_id) * CETRAFS_BLOCK_SIZE;
+    cetrafs_zone_group_t zg;
+
+    if (!delta)
+        return;
+    pread_all(fd, &zg, sizeof(zg), zg_off);
+    zg.pool_free_blocks = cetrafs_cpu_to_le64((uint64_t) ((int64_t) cetrafs_le64(zg.pool_free_blocks) + delta));
+    zg.hot_checksum = 0;
+    zg.hot_checksum = cetrafs_cpu_to_le64((uint64_t) crc32c_struct(
+        (const uint8_t *) &zg + CETRAFS_ZG_HOT_OFF, CETRAFS_ZG_HOT_LEN,
+        offsetof(cetrafs_zone_group_t, hot_checksum) - CETRAFS_ZG_HOT_OFF, sizeof(zg.hot_checksum)));
+    pwrite_all(fd, &zg, sizeof(zg), zg_off);
+}
+
 int main(int argc, char **argv)
 {
     /* A 4th argument "sync-zg" also moves the owning Zone Group's
@@ -70,12 +109,44 @@ int main(int argc, char **argv)
     if (argc != 4 && argc != 5) {
         fprintf(stderr, "usage: %s <image> <bg_id> <free_data_blocks> [sync-zg|fill-bitmap]\n", argv[0]);
         fprintf(stderr, "       %s <image> <bg_id> --dump | --bumpseq\n", argv[0]);
+        fprintf(stderr, "       %s <image> <bg_id> --owner <zg_id>\n", argv[0]);
         return 2;
     }
 
     const char *path = argv[1];
+
+    /* <image> zg-pool <zg_id> <value>: stamp a ZG record's
+     * pool_free_blocks (hot field) and restamp the hot checksum, the
+     * way the kernel's claim/release CAS would. Fault injector for the
+     * fsck shard cross-check. */
+    if (argc == 5 && strcmp(argv[2], "zg-pool") == 0) {
+        uint32_t zg_id = (uint32_t) strtoul(argv[3], NULL, 0);
+        uint64_t val = (uint64_t) strtoull(argv[4], NULL, 0);
+        int pfd = open(path, O_RDWR);
+        cetrafs_superblock_t psb;
+        cetrafs_zone_group_t zg;
+        off_t zg_off;
+
+        if (pfd < 0) {
+            perror(path);
+            return 1;
+        }
+        pread_all(pfd, &psb, sizeof(psb), 0);
+        zg_off = (off_t) (cetrafs_le64(psb.zg_table_start) + zg_id) * CETRAFS_BLOCK_SIZE;
+        pread_all(pfd, &zg, sizeof(zg), zg_off);
+        zg.pool_free_blocks = cetrafs_cpu_to_le64(val);
+        zg.hot_checksum = 0;
+        zg.hot_checksum = cetrafs_cpu_to_le64((uint64_t) crc32c_struct(
+            (const uint8_t *) &zg + CETRAFS_ZG_HOT_OFF, CETRAFS_ZG_HOT_LEN,
+            offsetof(cetrafs_zone_group_t, hot_checksum) - CETRAFS_ZG_HOT_OFF, sizeof(zg.hot_checksum)));
+        pwrite_all(pfd, &zg, sizeof(zg), zg_off);
+        close(pfd);
+        return 0;
+    }
+
     uint32_t bg_id = (uint32_t) strtoul(argv[2], NULL, 0);
-    uint64_t free_blocks = (dump || bumpseq) ? 0 : (uint64_t) strtoull(argv[3], NULL, 0);
+    uint64_t free_blocks =
+        (dump || bumpseq || (argc == 5 && strcmp(argv[3], "--owner") == 0)) ? 0 : (uint64_t) strtoull(argv[3], NULL, 0);
 
     int fd = open(path, O_RDWR);
     if (fd < 0) {
@@ -92,6 +163,7 @@ int main(int argc, char **argv)
     }
 
     bool fill_bitmap = (argc == 5 && strcmp(argv[4], "fill-bitmap") == 0);
+    bool set_owner = (argc == 5 && strcmp(argv[3], "--owner") == 0);
 
     off_t bg_off = (off_t) (cetrafs_le64(sb.bg_table_start) + bg_id) * CETRAFS_BLOCK_SIZE;
     cetrafs_block_group_t bg;
@@ -101,6 +173,47 @@ int main(int argc, char **argv)
         printf("free_data_blocks=%llu reconcile_seq=%llu\n", (unsigned long long) cetrafs_le64(bg.free_data_blocks),
                (unsigned long long) cetrafs_le64(bg.reconcile_seq));
         close(fd);
+        return 0;
+    }
+
+    /* --owner <zg>: retarget this Block Group at a different Zone Group.
+     *
+     * The negative control for tests/kernel/bg_ownership.sh. That suite
+     * pins down what Zone Group <-> Block Group ownership means before
+     * the representation changes
+     * (docs/internal/BG-OWNERSHIP-DESIGN.md), and its assertions are
+     * worth nothing unless they are shown to fire. Pointing one Block
+     * Group at a Zone Group that does not exist, or at a different
+     * valid one, is exactly the damage those assertions claim to
+     * catch. */
+    if (set_owner) {
+        uint32_t newz = (uint32_t) strtoul(argv[4], NULL, 0);
+        uint32_t oldz = cetrafs_le16(bg.owner_zg);
+        uint64_t bgfree = cetrafs_le64(bg.free_data_blocks);
+
+        /* Moving a Block Group between owners moves its free space with
+         * it. Without this the image is self-inconsistent -- the old
+         * owner's aggregate still counts blocks it no longer has -- and
+         * fsck rightly reports that instead of whatever the test was
+         * injecting. Mirrors what the kernel's claim path does. */
+        if (oldz != newz) {
+            if (oldz < CETRAFS_MAX_ZONE_GROUPS)
+                zg_adjust_free(fd, &sb, oldz, -(int64_t) bgfree);
+            else
+                zg_adjust_pool(fd, &sb, bg_id, -(int64_t) bgfree);
+            if (newz < CETRAFS_MAX_ZONE_GROUPS)
+                zg_adjust_free(fd, &sb, newz, (int64_t) bgfree);
+            else
+                zg_adjust_pool(fd, &sb, bg_id, (int64_t) bgfree);
+        }
+
+        bg.owner_zg = cetrafs_cpu_to_le16((uint16_t) newz);
+        bg.checksum = 0;
+        bg.checksum = cetrafs_cpu_to_le64(
+            crc32c_struct(&bg, sizeof(bg), offsetof(cetrafs_block_group_t, checksum), sizeof(cetrafs_le64(bg.checksum))));
+        pwrite_all(fd, &bg, sizeof(bg), bg_off);
+        close(fd);
+        printf("bg_poke: BG%u owner_zg -> %u\n", bg_id, newz);
         return 0;
     }
 

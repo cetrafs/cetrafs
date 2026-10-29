@@ -65,6 +65,16 @@ deb:
 	  echo "make deb: debian/rules no longer derives VERSION from debian/changelog"; exit 1; fi; \
 	if ! grep -q '/usr/src/cetrafs-$$(VERSION)' debian/rules; then \
 	  echo "make deb: debian/rules installs to a /usr/src dir not keyed on \$$(VERSION)"; exit 1; fi
+	@# Every tool userspace/ builds must be INSTALLED by debian/rules.
+	@# growfs.cetra was written, tested and committed while debian/rules
+	@# still installed only three tools, so the whole feature would have
+	@# shipped invisible. Nothing checked, so nothing noticed.
+	@for t in $$(sed -n 's/^[A-Z][A-Z]* *= *\([a-z]*\.cetra\)$$/\1/p' userspace/Makefile); do \
+	  grep -q "userspace/$$t" debian/rules || { \
+	    echo "make deb: userspace builds $$t but debian/rules does not install it"; exit 1; }; \
+	  grep -q "$$t" debian/control || { \
+	    echo "make deb: $$t is installed but not listed in debian/control"; exit 1; }; \
+	done
 	@dpkg-checkbuilddeps || { \
 	  echo "make deb: install the build dependencies listed above (apt install debhelper dh-dkms)"; exit 1; }
 	dpkg-buildpackage -us -uc -b

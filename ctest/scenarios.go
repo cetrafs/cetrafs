@@ -731,18 +731,31 @@ func RunXattrs(clients []*Client, baseDir string) (bool, error) {
 	if err != nil {
 		return false, fmt.Errorf("baseline statfs: %w", err)
 	}
-	// Is the volume actually idle? Sample again after a pause: anything
-	// that moves in between is unrelated activity (most often the
-	// previous run's teardown still draining its pending frees), and it
-	// will go on moving through the one-block checks below.
-	time.Sleep(3 * time.Second)
-	base2, err := statfsOf(a)
-	if err != nil {
-		return false, fmt.Errorf("baseline statfs (second sample): %w", err)
+	// Is the volume actually idle? Sample until two readings a full
+	// drain period apart agree: pending frees from earlier scenarios
+	// land on the HEARTBEAT (15s in production), so two samples 3s
+	// apart routinely sat inside the same quiet gap, called the volume
+	// idle, and then had 4 Block Groups' worth of queued frees land in
+	// the middle of the one-block checks below -- free overshot a
+	// baseline that was simply captured too early (seen on a three-node
+	// run, 2026-10-29). The window must out-wait the drain cadence, not
+	// the sampling comfort.
+	var drift int64
+	quiet := false
+	for try := 0; try < 4; try++ {
+		time.Sleep(16 * time.Second)
+		base2, err := statfsOf(a)
+		if err != nil {
+			return false, fmt.Errorf("baseline statfs (second sample): %w", err)
+		}
+		drift = int64(base2.FreeBlocks) - int64(base.FreeBlocks)
+		base = base2
+		if drift == 0 {
+			quiet = true
+			break
+		}
+		fmt.Printf("  note: %d block(s) of unrelated drift while quiescing; sampling again\n", drift)
 	}
-	drift := int64(base2.FreeBlocks) - int64(base.FreeBlocks)
-	quiet := drift == 0
-	base = base2
 
 	// --- lifecycle, cross-node in both directions ---
 	if err := call(a, "xattr_set", XattrSetArgs{Path: path, Name: "user.one", Value: "alpha"}); err != nil {
@@ -5289,13 +5302,20 @@ func RunReplayRace(clients []*Client, baseDir string) (bool, error) {
 			return false, fmt.Errorf("snapshot %s: %v", cl.Name, e)
 		}
 	}
-	replays := (after[0].JournalReplays - before[0].JournalReplays) +
-		(after[1].JournalReplays - before[1].JournalReplays)
+	replaysA := after[0].JournalReplays - before[0].JournalReplays
+	replaysB := after[1].JournalReplays - before[1].JournalReplays
+	replays := replaysA + replaysB
 	declines := (after[0].JournalReplayDeclines - before[0].JournalReplayDeclines) +
 		(after[1].JournalReplayDeclines - before[1].JournalReplayDeclines)
 
-	check(&ok, "exactly one of them replays the dead node's journal area (sweep or open)", replays == 1,
-		fmt.Sprintf("%d replays across both survivors -- two nodes writing one journal area is the corruption this claim exists to prevent", replays))
+	// The invariant is per NODE, not per count: the claim's owner==me
+	// re-entry deliberately lets one node re-claim and re-park an
+	// idempotent redo after a raced park (seen as two replays 11ms
+	// apart on one survivor). Two NODES replaying is the corruption;
+	// one node replaying twice is the design healing itself.
+	check(&ok, "only one NODE replays the dead node's journal area (sweep or open)",
+		replays >= 1 && (replaysA == 0 || replaysB == 0),
+		fmt.Sprintf("%d/%d replays on the two survivors -- two nodes writing one journal area is the corruption this claim exists to prevent", replaysA, replaysB))
 	// Evidence the race actually happened. A decline of 0 means the
 	// loser's pre-check saw the area already clean and it never
 	// attempted the claim -- a correct outcome, but one that proves
@@ -6368,6 +6388,14 @@ func RunHypervisorStorm(clients []*Client, baseDir string, dur time.Duration, se
 	if !final.Clean {
 		fmt.Printf("---- final fsck output ----\n%s\n", strings.TrimSpace(final.Output))
 	}
+	// The final fsck's verdict is a GATE, not a printout. It was only
+	// printed, so a storm could end with fsck reporting errors and the
+	// scenario still said "volume clean throughout" -- caught by an
+	// operator reading the log, not by the suite (2026-10-29; the error
+	// itself came from a stale embedded fsck, which is its own lesson:
+	// build ctest with make, never bare go build, or embedded/ keeps
+	// yesterday's tools).
+	check(&ok, "final fsck is clean", final.Clean, "fsck reported problems after the storm (output above)")
 	if ok {
 		fmt.Printf("PASS: hypervisor storm: %d ops, volume clean throughout\n", ops)
 	}

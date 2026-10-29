@@ -37,6 +37,7 @@ PF_MNT="$(mktemp -d /tmp/cetrafs-pf-mnt-XXXXXX)"
 "$ROOT/userspace/mkfs.cetra" "$PF_LOOPDEV" -z 1 -b 512 -J 0 -N 1024 -f >/dev/null
 
 mount -t cetrafs "$PF_LOOPDEV" "$PF_MNT"
+require_cetrafs_mount "$PF_MNT"
 PF_FREE_BEFORE="$(stat -f -c '%f' "$PF_MNT")"
 dd if=/dev/zero of="$PF_MNT/pfprobe" bs=4096 count=2 conv=fsync status=none
 PF_INO="$(stat -c '%i' "$PF_MNT/pfprobe")"
@@ -69,6 +70,7 @@ read -r PF_LBA2 PF_LEN2 <<< "$PF_LBA $PF_LEN"
 
 DMESG_MARK_PF="$(dmesg_mark)"
 mount -t cetrafs "$PF_LOOPDEV" "$PF_MNT"
+require_cetrafs_mount "$PF_MNT"
 PF_LOG="$(dmesg_since "$DMESG_MARK_PF")"
 
 if echo "$PF_LOG" | grep -q 'pending free: ZG 0 drained 2 entries'; then
@@ -98,6 +100,7 @@ for i in $(seq 0 $((PF_SPAN_N - 1))); do
 done
 DMESG_MARK_PF2="$(dmesg_mark)"
 mount -t cetrafs "$PF_LOOPDEV" "$PF_MNT"
+require_cetrafs_mount "$PF_MNT"
 PF_LOG2="$(dmesg_since "$DMESG_MARK_PF2")"
 if echo "$PF_LOG2" | grep -q "pending free: ZG 0 drained $PF_SPAN_N entries"; then
     pass "pending-free: $PF_SPAN_N entries spanning multiple CAS regions all drained"
@@ -112,6 +115,7 @@ PF_QDUMP2="$("$PENDING_POKE" "$PF_IMG" dump 0)"
     pass "pending-free: fsck clean after the multi-region drain" ||
     fail "pending-free: fsck failed after the multi-region drain"
 mount -t cetrafs "$PF_LOOPDEV" "$PF_MNT"
+require_cetrafs_mount "$PF_MNT"
 umount "$PF_MNT"
 
 PF_QDUMP="$("$PENDING_POKE" "$PF_IMG" dump 0)"

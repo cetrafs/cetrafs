@@ -43,6 +43,11 @@ dd if=/dev/zero of="$MNT/payload" bs=4096 count=64 status=none
 sync
 BASE="$(free_blocks)"
 ct_umount "$MNT"
+# The pokes below are read by fsck THROUGH THE DEVICE, so they are
+# written through the device too -- see tests/README.md. Poking the
+# backing file here would put them behind pages fsck's own earlier
+# reads had already cached, and fsck would check the volume as it was
+# before the fault was injected.
 ct_fsck "$DEV" >/dev/null 2>&1 && pass "a healthy volume is fsck-clean before anything is broken" ||
     fail "the volume was already inconsistent: $(ct_fsck "$DEV" 2>&1 | grep -i err | head -2)"
 
@@ -52,7 +57,7 @@ log "a BG count that drifted from its bitmap is corrected at mount"
 # been applied before the power went. Poked rather than crashed, because
 # a loop device cannot lose power -- the two-node ctest scenario kills a
 # node for real.
-"$BGPOKE" "$IMG" 0 999999 >/dev/null
+"$BGPOKE" "$DEV" 0 999999 >/dev/null
 OUT="$(ct_fsck "$DEV" 2>&1 || true)"
 echo "$OUT" | grep -qiE "free_data_blocks|bitmap says" &&
     pass "fsck detects the drifted BG counter (the control: the fault is really there)" ||
@@ -75,7 +80,7 @@ ct_fsck "$DEV" >/dev/null 2>&1 && pass "fsck is clean after the reconcile" ||
 log "P16's case: a ZG aggregate that drifted to 0 is repaired, not written off"
 # The aggregate alone, with the BG counters left correct -- the exact
 # shape that made a Zone Group permanently unclaimable.
-"$ZGPOKE" "$IMG" 0 free 0 >/dev/null
+"$ZGPOKE" "$DEV" 0 free 0 >/dev/null
 OUT="$(ct_fsck "$DEV" 2>&1 || true)"
 echo "$OUT" | grep -qiE "free_data_blocks|sum of" &&
     pass "fsck detects the drifted ZG aggregate" ||

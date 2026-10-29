@@ -64,15 +64,34 @@ skip() { echo "SKIP: $*"; }
 # ("alloc selftest did not run") when the line had in fact printed.
 # Filtering by the kernel's own monotonic timestamp is immune: a line's
 # timestamp never changes however many older lines are dropped.
-dmesg_mark() { dmesg | tail -1 | sed -n 's/^\[\s*\([0-9.]\+\)\].*/\1/p'; }
+# POSITIONAL markers, not timestamps. printk stamps lines with each
+# CPU's local clock, which skews by milliseconds across CPUs -- so a
+# line emitted AFTER the mark can carry a timestamp BEFORE it, and a
+# timestamp filter silently loses it. A loaded 8-core gate lost the
+# janitor's decline line to exactly that (the line sat in the ring, the
+# since-mark window swore it never happened) and three defrag suites
+# failed in rotation for a night. A unique token written to /dev/kmsg
+# is ordered by ring POSITION, which is emission order, always.
+dmesg_mark() {
+    local tok="CTMARK-$$-$RANDOM-$RANDOM"
+    echo "$tok" >/dev/kmsg 2>/dev/null || { dmesg | tail -1 | sed -n 's/^\[\s*\([0-9.]\+\)\].*/\1/p'; return; }
+    echo "$tok"
+}
 dmesg_since() {
     local mark="${1:-0}"
-    dmesg | awk -v mark="$mark" '{
-        ts = $0
-        sub(/^\[[ \t]*/, "", ts)
-        sub(/\].*/, "", ts)
-        if ((ts + 0) > (mark + 0)) print
-    }'
+    case "$mark" in
+    CTMARK-*)
+        dmesg | awk -v tok="$mark" 'found { print } index($0, tok) { found = 1 }'
+        ;;
+    *)
+        dmesg | awk -v mark="$mark" '{
+            ts = $0
+            sub(/^\[[ \t]*/, "", ts)
+            sub(/\].*/, "", ts)
+            if ((ts + 0) > (mark + 0)) print
+        }'
+        ;;
+    esac
 }
 
 # ----------------------------------------------------------- resources
@@ -101,6 +120,15 @@ ct_track() { echo "$1 $2" >>"$CT_REG"; }
 
 ct_cleanup() {
     set +e
+    # Module parameters FIRST, because this trap is the only cleanup an
+    # ABORTING suite runs -- ct_exit() never gets there. compress_timing
+    # sets stale_secs=3 module-globally, so a suite that died after
+    # calling it used to leave every LATER suite with that value: the
+    # next controls write of hb_interval_secs=5 was then refused
+    # (stale_secs must be >= 3 beats), and THAT suite aborted too. One
+    # environmental abort cascaded into unrelated failures and made the
+    # whole gate read as flaky.
+    ct_param_restore_all 2>/dev/null
     local kind path
     # Mounts first, then the loop devices under them, then the module,
     # then directories, then files -- each category in reverse order of
@@ -261,18 +289,41 @@ ct_tmp() {
 
 # ct_image <size_mb> [name] -> path to a tracked sparse image file
 ct_image() {
-    local p avail
+    local p avail dir="${CT_IMG_DIR:-/tmp}"
     # /tmp is a tmpfs here and every suite puts a half-gigabyte image in
     # it. The images are sparse, so the cost is what gets WRITTEN, and a
     # run that fills /tmp does not fail where the space ran out -- it
     # fails later, in some unrelated suite, looking like flakiness.
     # Three suites failed intermittently in one session before anyone
     # asked how much room was left. Say so here instead.
-    avail="$(df -Pm /tmp | awk 'NR==2 {print $4}')"
-    if [ -n "$avail" ] && [ "$avail" -lt 200 ]; then
-        fail "only ${avail} MiB free in /tmp -- a suite that runs out of space fails somewhere else entirely"
+    #
+    # CT_IMG_DIR redirects these images off /tmp (e.g. to a disk-backed
+    # /root) for a run on a box whose tmpfs is too small to hold a
+    # suite's image AND the harness's own scratch at once -- the same
+    # escape hatch CT_BIG_DIR gives the grow suites.
+    avail="$(df -Pm "$dir" | awk 'NR==2 {print $4}')"
+    # An image is sparse, so it costs only what gets WRITTEN -- but a
+    # suite that fills its volume writes all of it. On the usual dev box
+    # $dir is a ~1 GiB tmpfs, so a 1800 MiB volume cannot fit however
+    # sparse it starts, and the fill ends at the TMPFS's limit instead of
+    # the filesystem's: bg_release_empty aborted with "rm: Input/output
+    # error" (the loop device passing ENOSPC back up) and read as a
+    # filesystem fault. Put the image where it fits rather than making
+    # every such suite remember to ask.
+    if [ -n "$avail" ] && [ "$1" -gt $((avail - 200)) ] && [ -n "${CT_BIG_DIR:-/root}" ]; then
+        local big="${CT_BIG_DIR:-/root}"
+        local bigavail
+        bigavail="$(df -Pm "$big" | awk 'NR==2 {print $4}')"
+        if [ -n "$bigavail" ] && [ "$bigavail" -gt $(($1 + 200)) ]; then
+            log "image of ${1} MiB does not fit in $dir (${avail} MiB) -- placing it in $big" >&2
+            dir="$big"
+            avail="$bigavail"
+        fi
     fi
-    p="$(mktemp "/tmp/cetrafs-${2:-img}-XXXXXX.img")"
+    if [ -n "$avail" ] && [ "$avail" -lt 200 ]; then
+        fail "only ${avail} MiB free in $dir -- a suite that runs out of space fails somewhere else entirely"
+    fi
+    p="$(mktemp "$dir/cetrafs-${2:-img}-XXXXXX.img")"
     truncate -s "${1}M" "$p"
     ct_track file "$p"
     echo "$p"
@@ -388,6 +439,57 @@ ct_procdir() { echo "/proc/fs/cetrafs/$(basename "$(readlink -f "$1")")"; }
 
 # ct_dev <size_mb> [name] -> a loop device over a fresh sparse image.
 # The common case: one call instead of three.
+# ct_big_image <size_mb> [name] -> sparse image OUTSIDE /tmp, tracked.
+#
+# /tmp is a ~1 GiB tmpfs on the usual dev box and ct_image guards against
+# filling it. A grow suite cannot live within that: the smallest Block
+# Group this filesystem will format is 512 MiB, and proving that grown
+# space is real means actually WRITING into a new BG, which only happens
+# once the old one is full. So two BGs get written for real, and that
+# does not fit in a tmpfs.
+#
+# Same escape hatch ct_huge_dev's COW already uses: CT_BIG_DIR, default
+# /root. Sparse, so the cost is still only what gets written.
+ct_big_image() {
+    local p avail dir="${CT_BIG_DIR:-/root}"
+
+    avail="$(df -Pm "$dir" | awk 'NR==2 {print $4}')"
+    if [ -n "$avail" ] && [ "$avail" -lt $(($1 + 200)) ]; then
+        fail "only ${avail} MiB free in $dir -- need ~${1} MiB for this suite's image"
+        return 1
+    fi
+    p="$(mktemp "$dir/cetrafs-${2:-big}-XXXXXX.img")"
+    truncate -s "${1}M" "$p"
+    ct_track file "$p"
+    echo "$p"
+}
+
+# ct_big_dev <size_mb> [name] -> loop device over a ct_big_image
+ct_big_dev() { ct_loop "$(ct_big_image "$1" "${2:-big}")"; }
+
+# ct_sparse_dev <size_mb> [name] -> loop device over a NOMINALLY huge
+# sparse image, with NO free-space check.
+#
+# For the one case that needs a large volume but writes almost nothing
+# to it: reaching the 255-Zone-Group cap takes >127 GiB of nominal
+# capacity (the smallest Block Group is 512 MiB), while mkfs and a grow
+# together write only the tables and each BG's header plus bitmap -- a
+# few MiB. ct_big_image's "is there room for all of it" guard would
+# refuse a device nobody intends to fill.
+#
+# ONLY for suites that never write bulk data. A suite that fills one of
+# these will fill the host filesystem instead, which fails somewhere
+# else entirely -- the exact failure mode ct_image's guard exists to
+# prevent.
+ct_sparse_dev() {
+    local p dir="${CT_BIG_DIR:-/root}"
+
+    p="$(mktemp "$dir/cetrafs-${2:-sparse}-XXXXXX.img")"
+    truncate -s "${1}M" "$p"
+    ct_track file "$p"
+    ct_loop "$p"
+}
+
 ct_dev() { ct_loop "$(ct_image "$1" "${2:-img}")"; }
 
 # --------------------------------------------------------------- tools
@@ -434,6 +536,48 @@ ct_mkfs() {
     "$ROOT/userspace/mkfs.cetra" "$dev" "$@"
 }
 ct_fsck() { "$ROOT/userspace/fsck.cetra" "$1"; }
+ct_growfs() { "$ROOT/userspace/growfs.cetra" "$@"; }
+
+# suite <title> -- a one-line banner for a suite that wants to restate
+# what it is testing. Two suites called this for a long time while it
+# did not exist: bash printed "suite: command not found" to stderr and
+# carried on, so the call did nothing and nobody noticed, because the
+# runner prints the suite name anyway.
+suite() { log "$*"; }
+
+# wait_for <seconds> <shell-expression> -- poll until it succeeds.
+#
+# For anything the heartbeat does on its own schedule: a tick-driven
+# release, a stale reclaim, a drain. Polling beats sleeping a guessed
+# interval, which either flakes or wastes the difference.
+# Lived in heartbeat_tick_work.sh; promoted when a second suite needed
+# it rather than copied.
+wait_for() { # <seconds> <shell-expression>
+    local deadline=$((SECONDS + $1))
+
+    while [ "$SECONDS" -lt "$deadline" ]; do
+        if eval "$2"; then return 0; fi
+        sleep 1
+    done
+    return 1
+}
+
+# ct_bgs_of_zg <device> <zg_id> -> the Block Group ids that Zone Group
+# owns, one per line.
+#
+# A Zone Group no longer records a contiguous range of members, so this
+# cannot be read off its record or out of procfs any more -- the Block
+# Groups are the only place the mapping lives
+# (docs/internal/BG-OWNERSHIP-DESIGN.md). Four suites used to parse
+# `first_bg=`/`bg_count=` out of procfs and walk the span; they call
+# this instead.
+#
+# Reads the raw device, so the volume should be unmounted or quiescent.
+ct_bgs_of_zg() {
+    local dev="$1" zg="$2" map
+    map="$(ct_helper bg_map)" || return 1
+    "$map" "$dev" | awk -v z="$zg" '/^bg /{split($3,a,"="); if (a[2]+0 == z+0) print $2}'
+}
 # fsck in REPAIR mode. Separate from ct_fsck on purpose: every other
 # caller in this suite must stay read-only, so a suite cannot start
 # repairing the fault it is asserting by accident.

@@ -169,7 +169,8 @@ static bool is_device_nonempty(int fd, u64 blocks_to_scan, u32 *found_magic)
 static void usage(const char *argv0)
 {
     fprintf(stderr,
-            "Usage: %s <blockdev> [-z ZGs] [-b BG_MiB] [-N inodes] [-J MiB] [-M nodes] [-n] [-f]\n"
+            "Usage: %s <blockdev> [-z ZGs] [-b BG_MiB] [-N inodes] [-J MiB] [-M nodes]\n"
+            "       [-s size] [-n] [-f]\n"
             "  -z: number of Zone Groups (1..%u), default 16 (clamped down to\n"
             "      however many Block Groups the device can actually back if\n"
             "      fewer than that -- a ZG with no BGs is never useful, even if\n"
@@ -183,9 +184,56 @@ static void usage(const char *argv0)
             "      at ~5%% of capacity; 0 disables; pass -J explicitly to\n"
             "      disable the auto-shrink)\n"
             "  -M: Node Registry capacity, max cluster nodes (default 64)\n"
+            "  -s: format only this much of the device, leaving the rest unused\n"
+            "      until the volume is grown (default: the whole device). Accepts\n"
+            "      a K/M/G/T suffix; a bare number is MiB, like -b and -J\n"
             "  -n: dry-run (compute & print, no writes)\n"
             "  -f: force (overwrite even if device looks non-empty)\n",
             argv0, CETRAFS_MAX_ZONE_GROUPS);
+}
+
+/*
+ * Parse a -s size: a decimal number with an optional binary suffix
+ * (K/M/G/T, case-insensitive). A bare number is MiB, consistent with
+ * -b and -J. Returns bytes; dies on anything malformed or out of range.
+ *
+ * Bounded well below u64 overflow before the multiply, the same way -b
+ * and -J are: a size that wraps feeds a garbage total_blocks into every
+ * geometry computation downstream.
+ */
+static u64 parse_size_bytes(const char *arg)
+{
+    char *end = NULL;
+    unsigned long long v;
+    u64 mult;
+
+    errno = 0;
+    v = strtoull(arg, &end, 10);
+    if (errno || end == arg)
+        die_arg("-s: not a number: %s", arg);
+
+    switch (*end) {
+    case '\0':
+    case 'm':
+    case 'M': mult = 1024ULL * 1024ULL; break;
+    case 'k':
+    case 'K': mult = 1024ULL; break;
+    case 'g':
+    case 'G': mult = 1024ULL * 1024ULL * 1024ULL; break;
+    case 't':
+    case 'T': mult = 1024ULL * 1024ULL * 1024ULL * 1024ULL; break;
+    default:  die_arg("-s: unknown suffix '%s' (use K, M, G or T)", end);
+              return 0; /* unreachable; keeps the compiler quiet */
+    }
+    if (*end && end[1] != '\0')
+        die_arg("-s: trailing garbage after suffix: %s", arg);
+
+    if (v == 0)
+        die_arg("-s: zero");
+    if (v > UINT64_MAX / mult)
+        die_arg("-s: too large");
+
+    return (u64) v * mult;
 }
 
 /*
@@ -234,9 +282,10 @@ int main(int argc, char **argv)
     bool force = false;
     bool bg_size_explicit = false;
     bool j_explicit = false;
+    u64 fs_bytes = 0; /* -s: format only this much of the device (0 => all) */
 
     int opt;
-    while ((opt = getopt(argc - 1, argv + 1, "z:b:N:J:M:nf")) != -1) {
+    while ((opt = getopt(argc - 1, argv + 1, "z:b:N:J:M:s:nf")) != -1) {
         switch (opt) {
         case 'z': {
             long v = strtol(optarg, NULL, 10);
@@ -314,6 +363,11 @@ int main(int argc, char **argv)
             node_table_count = (u64) m;
             break;
         }
+        case 's':
+            fs_bytes = parse_size_bytes(optarg);
+            if (fs_bytes % CETRAFS_BLOCK_SIZE)
+                die_arg("-s must be a multiple of 4KiB");
+            break;
         case 'n':
             dry_run = true;
             break;
@@ -372,13 +426,51 @@ int main(int argc, char **argv)
     if (ioctl(fd, BLKGETSIZE64, &dev_bytes) < 0)
         die_dev("BLKGETSIZE64: %s", strerror(errno));
 
-    u64 total_blocks = dev_bytes / CETRAFS_BLOCK_SIZE;
-    if (total_blocks < 1024) {
-        die("device too small: %llu bytes (blocks=%" PRIu64 ")", dev_bytes, (uint64_t) total_blocks);
+    /*
+     * -s formats only the first fs_bytes of the device. The filesystem
+     * is then smaller than the LUN it sits on, and everything past
+     * total_blocks is untouched -- which is exactly the state a volume
+     * is in after its LUN has been grown but before the filesystem has.
+     *
+     * That equivalence is the point: `growfs` has only two inputs,
+     * sb.total_blocks and the device's block count, so an undersized
+     * mkfs and a real LUN resize present it with the identical delta.
+     * It makes the grow path testable without ever asking a storage
+     * array for anything (docs/internal/EXTENDFS-DESIGN.md).
+     *
+     * It is a real option, not a test hook -- deliberately formatting
+     * smaller than the LUN and growing into it later is the normal
+     * reason the grow feature exists -- but it is a footgun, so an
+     * undersize is always announced, dry-run included.
+     */
+    u64 fs_size_bytes = dev_bytes;
+
+    if (fs_bytes) {
+        if (fs_bytes > dev_bytes)
+            die_arg("-s %llu bytes exceeds the device (%llu bytes)", (unsigned long long) fs_bytes, dev_bytes);
+        fs_size_bytes = fs_bytes;
     }
 
+    u64 total_blocks = fs_size_bytes / CETRAFS_BLOCK_SIZE;
+    if (total_blocks < 1024) {
+        die("%s too small: %llu bytes (blocks=%" PRIu64 ")", fs_bytes ? "-s size" : "device",
+            (unsigned long long) fs_size_bytes, (uint64_t) total_blocks);
+    }
+
+    if (fs_size_bytes < dev_bytes)
+        fprintf(stderr,
+                "note: formatting %llu of %llu bytes (%.1f%%) -- %llu bytes past the end of the\n"
+                "      filesystem are left untouched and are not usable until the volume is grown\n",
+                (unsigned long long) fs_size_bytes, dev_bytes, 100.0 * (double) fs_size_bytes / (double) dev_bytes,
+                dev_bytes - (unsigned long long) fs_size_bytes);
+
+    /* Derived from the FILESYSTEM size, not the device: with -s the two
+     * differ, and sizing the inode table for space the volume does not
+     * yet have would spend a large fraction of a small filesystem on a
+     * table for files it cannot hold. A grow does not add inodes
+     * (-N at grow time is fixed), so this is also the honest number. */
     if (!inodes_total)
-        inodes_total = cetrafs_default_inodes_for_bytes(dev_bytes);
+        inodes_total = cetrafs_default_inodes_for_bytes(fs_size_bytes);
 
     /* --- non-empty check --- */
     if (!dry_run && !force) {
@@ -567,6 +659,15 @@ int main(int argc, char **argv)
 
     sb.bg_regions_start = cetrafs_cpu_to_le64(bg_regions_lba);
 
+    /* The Block Group table starts as ONE contiguous run -- the
+     * implicit first segment of the chain (cetrafs_bg_segment_t).
+     * Saying so explicitly rather than leaving it zero means a reader
+     * never has to infer it from block_group_count, which stops being
+     * the first segment's size the moment the volume is grown.
+     * bg_table_next stays 0: nothing is appended yet. */
+    sb.bg_table_first_count = cetrafs_cpu_to_le64(B);
+    sb.bg_table_next = cetrafs_cpu_to_le64(0);
+
     sb.root_ino = cetrafs_cpu_to_le64(CETRAFS_ROOT_INO);
     sb.inode_size = cetrafs_cpu_to_le32(CETRAFS_INODE_ONDISK_SIZE);
     sb.inodes_count = cetrafs_cpu_to_le32(inodes_total);
@@ -600,15 +701,26 @@ int main(int argc, char **argv)
     u64 data_cnt;
     cetrafs_calc_bg_layout(bg_size_blocks, &off_bmap32, &off_data32, &data_cnt);
 
-    /* Distribute BGs evenly across ZGs: the first (B % zg_count) ZGs get
-     * one extra BG each. Spans are contiguous and increasing by
-     * construction (ZG 0 gets BG ids [0, cnt0), ZG 1 gets the next
-     * cnt1, ...) -- fsck checks this. bg_owner_zg[b] records which ZG
-     * will claim BG b, for the BG table loop below to stamp into
-     * bg.owner_zg. */
-    u64 base = B / zg_count, rem = B % zg_count;
+    /* bg_owner_zg[b] records which ZG will claim BG b, for the BG table
+     * loop below to stamp into bg.owner_zg.
+     *
+     * ROUND-ROBIN, not contiguous runs.
+     *
+     * A Zone Group no longer records which Block Groups belong to it --
+     * each Block Group names its own owner -- so membership does not
+     * have to be contiguous, and interleaving is the honest default: it
+     * spreads capacity across every Zone Group instead of giving each
+     * one a single run at one end of the device, which matters once
+     * Block Groups can move between Zone Groups at runtime.
+     * docs/internal/BG-OWNERSHIP-DESIGN.md
+     *
+     * BG 0 still falls to ZG 0 (0 % zg_count == 0), which the root
+     * directory's one-block discount below depends on.
+     */
     u32 *bg_owner_zg = (u32 *) xcalloc(B, sizeof(u32));
-    u64 next_bg_id = 0;
+
+    for (u64 b = 0; b < B; ++b)
+        bg_owner_zg[b] = (u32) (b % zg_count);
 
     for (u32 z = 0; z < zg_count; ++z) {
         cetrafs_zone_group_t zg;
@@ -620,27 +732,27 @@ int main(int argc, char **argv)
          * claimed by that node. Real claiming happens at mount. */
         zg.owner_node_id = cetrafs_cpu_to_le16((u16) CETRAFS_NODE_ID_NONE);
 
-        u64 cnt = base + (z < rem ? 1 : 0);
+        /* Count this Zone Group's members from the assignment above --
+         * there is no span to read it off any more. */
+        u64 cnt = 0;
 
-        zg.first_bg_id = cetrafs_cpu_to_le32((u32) next_bg_id);
-        zg.bg_count = cetrafs_cpu_to_le32((u32) cnt);
+        for (u64 b = 0; b < B; ++b)
+            if (bg_owner_zg[b] == z)
+                cnt++;
 
         /* free_data_blocks: sum of each member BG's usable data blocks.
-         * BG 0 (always owned by ZG 0, since spans start at BG 0) is
-         * special-cased by -1 for the one block the root directory
-         * consumes below -- mirrors the same discount applied to BG 0's
-         * own free_data_blocks (see the BG table loop). */
+         * BG 0 is owned by ZG 0 and holds the root directory's one
+         * block, so ZG 0's aggregate is discounted by 1 -- mirrors the
+         * same discount applied to BG 0's own free_data_blocks (see the
+         * BG table loop). */
         u64 fdb = data_cnt * cnt;
+
         if (z == 0 && cnt > 0)
             fdb -= 1;
         zg.free_data_blocks = cetrafs_cpu_to_le64(fdb);
 
-        for (u64 i = 0; i < cnt; i++)
-            bg_owner_zg[next_bg_id + i] = z;
-        next_bg_id += cnt;
 
-
-        /* v0x0009: two independently-checksummed halves (cetrafs.h) --
+        /* v0x0008: two independently-checksummed halves (cetrafs.h) --
          * the HOT sector is the CAS unit, the COLD remainder is mkfs-time
          * geometry. Each checksum covers only its own half, with its own
          * field zeroed. */
@@ -893,7 +1005,8 @@ int main(int argc, char **argv)
     /* --- summary --- */
     fprintf(stdout,
             "cetrafs mkfs %s\n"
-            "  device bytes: %llu (blocks=%" PRIu64
+            "  device bytes: %llu\n"
+            "  filesystem bytes: %llu (blocks=%" PRIu64
             ")\n"
             "  ZGs: %u, BGs: %" PRIu64 ", BG size: %" PRIu64
             " blocks (%llu MiB)\n"
@@ -909,16 +1022,18 @@ int main(int argc, char **argv)
             "\n"
             "  BG regions start: LBA %" PRIu64
             "\n"
-            "  ZG<->BG ownership: base %" PRIu64 " BG/ZG, first %" PRIu64
-            " ZG(s) get +1\n"
+            "  ZG<->BG ownership: round-robin, %" PRIu64 "-%" PRIu64
+            " BG per ZG\n"
             "  SB CRC32C: 0x%08X\n",
-            dry_run ? "(DRY-RUN)" : "completed", dev_bytes, (uint64_t) total_blocks, zg_count, (uint64_t) B,
+            dry_run ? "(DRY-RUN)" : "completed", dev_bytes, (unsigned long long) fs_size_bytes,
+            (uint64_t) total_blocks, zg_count, (uint64_t) B,
             (uint64_t) bg_size_blocks, (unsigned long long) (bg_size_blocks * CETRAFS_BLOCK_SIZE / 1024 / 1024),
             (uint64_t) i_bmap_lba, (uint64_t) i_bmap_blk, (uint64_t) i_tbl_lba, (uint64_t) i_tbl_blk,
             (uint64_t) node_tbl_lba, (uint64_t) node_tbl_blk, (uint64_t) node_table_count, (uint64_t) pending_lba,
             (uint64_t) pending_total_blk, (unsigned) pending_per_zg, (uint64_t) j_area_lba,
             (uint64_t) j_total_blk, (uint64_t) j_per_node_blk, (uint64_t) bg_table_lba, (uint64_t) bg_table_blk,
-            (uint64_t) bg_regions_lba, base, rem, sb_crc);
+            (uint64_t) bg_regions_lba, (uint64_t) (B / zg_count), (uint64_t) ((B + zg_count - 1) / zg_count),
+            sb_crc);
 
     return 0;
 }

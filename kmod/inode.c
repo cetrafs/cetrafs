@@ -225,14 +225,10 @@ int cetrafs_read_raw_inode(struct super_block *sb, u64 ino, cetrafs_inode_t *out
          * garbage -- this shows the kernel's view at failure time. */
         struct buffer_head *_b = sb_find_get_block(sb, blk);
 
-        ctrace("EUCLEANDUMP ino=%llu stored=0x%llx calc=0x%x bhstate=%s%s%s bytes=%*ph\n",
-               (unsigned long long) ino,
-               (unsigned long long) cetrafs_le64(out->ns_checksum),
-               cetrafs_inode_crc_ns(out),
-               _b && buffer_uptodate(_b) ? "U" : "-",
-               _b && buffer_dirty(_b) ? "D" : "-",
-               _b && buffer_locked(_b) ? "L" : "-",
-               64, (const u8 *) out);
+        ctrace("EUCLEANDUMP ino=%llu stored=0x%llx calc=0x%x bhstate=%s%s%s bytes=%*ph\n", (unsigned long long) ino,
+               (unsigned long long) cetrafs_le64(out->ns_checksum), cetrafs_inode_crc_ns(out),
+               _b && buffer_uptodate(_b) ? "U" : "-", _b && buffer_dirty(_b) ? "D" : "-",
+               _b && buffer_locked(_b) ? "L" : "-", 64, (const u8 *) out);
         if (_b)
             brelse(_b);
     }
@@ -241,6 +237,56 @@ int cetrafs_read_raw_inode(struct super_block *sb, u64 ino, cetrafs_inode_t *out
            (unsigned long long) ino, CETRAFS_RAW_INODE_READ_RETRIES);
     return -EUCLEAN;
 }
+
+/* TEST ONLY: widen the window between the record read and the shadow
+ * overlay to a size a test can reliably hit -- the race below needs a
+ * writeback publish inside a few-instruction gap otherwise. */
+static unsigned int cetrafs_fd_overlay_stall_ms;
+module_param_named(fd_overlay_stall_ms, cetrafs_fd_overlay_stall_ms, uint, 0644);
+MODULE_PARM_DESC(fd_overlay_stall_ms, "TEST ONLY: widen the record-read-to-overlay window to make the torn-read race hittable");
+
+/*
+ * cetrafs_read_raw_inode() + the hot path's shadow overlay, as ONE unit.
+ *
+ * The naive pair -- read the record, then overlay the shadow -- is torn
+ * against a concurrent publisher (VFS writeback's CAS does not take
+ * inode_lock): the read can return a record from BEFORE the publish and
+ * the overlay can run AFTER its dirty-clear, leaving neither source
+ * carrying the published extents. The shadow's dirty flag is therefore
+ * sampled BEFORE the read; a clear that lands in between is detected by
+ * cetrafs_inode_fd_overlay_checked() and answered with a re-read, which
+ * then necessarily includes the publish (record write happens before
+ * flag clear, both under fd_lock/pub_mutex ordering).
+ *
+ * The retry cap never triggers in practice (it needs a publish per
+ * iteration); if it ever does, the publish mutex serializes the last
+ * attempt outright.
+ */
+int cetrafs_read_raw_inode_overlaid(struct super_block *sb, struct inode *inode, cetrafs_inode_t *raw)
+{
+    int tries, ret;
+
+    for (tries = 0; tries < 8; tries++) {
+        bool pre = cetrafs_inode_fd_dirty_snap(inode);
+
+        ret = cetrafs_read_raw_inode(sb, inode->i_ino, raw);
+        if (ret)
+            return ret;
+        if (unlikely(cetrafs_fd_overlay_stall_ms))
+            msleep(cetrafs_fd_overlay_stall_ms); /* TEST ONLY: hold the torn-read window open */
+        if (cetrafs_inode_fd_overlay_checked(inode, raw, pre) == 0)
+            return 0;
+        /* a publish landed between the read and the check -- re-read */
+    }
+
+    cetrafs_inode_fd_pub_lock(inode);
+    ret = cetrafs_read_raw_inode(sb, inode->i_ino, raw);
+    if (!ret)
+        cetrafs_inode_fd_overlay(inode, raw);
+    cetrafs_inode_fd_pub_unlock(inode);
+    return ret;
+}
+
 
 /*
  * Drop any cached copy of inode #ino's backing block(s) -- called by
@@ -304,8 +350,8 @@ void cetrafs_invalidate_raw_inode(struct super_block *sb, u64 ino)
 
             (void) _r;
             ctrace("DIRTYREC ino=%llu mode=0%o size=%llu -- syncing a DIRTY record at invalidate\n",
-                    (unsigned long long) ino, (unsigned int) cetrafs_le32(_r->mode),
-                    (unsigned long long) cetrafs_le64(_r->size));
+                   (unsigned long long) ino, (unsigned int) cetrafs_le32(_r->mode),
+                   (unsigned long long) cetrafs_le64(_r->size));
             sync_dirty_buffer(bh);
         }
         brelse(bh);
@@ -396,8 +442,8 @@ int cetrafs_inode_ns_cas(struct super_block *sb,
     if (cetrafs_sb_is_fenced(sb))
         return -EIO;
     {
-        int ret = cetrafs_cas_record_seeded(sb, lba, seed, seed ? CETRAFS_INODE_NS_BYTES : 0, cetrafs_ns_cas_mutate,
-                                            &ctx);
+        int ret =
+            cetrafs_cas_record_seeded(sb, lba, seed, seed ? CETRAFS_INODE_NS_BYTES : 0, cetrafs_ns_cas_mutate, &ctx);
 
         if (ret == 0)
             cetrafs_record_write_counted();
@@ -442,7 +488,7 @@ static int cetrafs_fd_write_mutate(void *image, unsigned int len, void *priv)
         return -ESTALE;
 
     cetrafs_inode_fd_copy(&rec, ctx->src);
-    rec.ino = ctx->src->ino;               /* for the echo stamp below */
+    rec.ino = ctx->src->ino; /* for the echo stamp below */
     rec.generation = ctx->src->generation;
     cetrafs_inode_stamp_crc_fd(ctx->sb, &rec);
     ctx->stamped_seq = cetrafs_le64(rec.file_seq);
@@ -491,10 +537,9 @@ int cetrafs_write_raw_inode_fd(struct super_block *sb, u64 ino, const cetrafs_in
 int cetrafs_write_raw_inode(struct super_block *sb, u64 ino, const cetrafs_inode_t *in, bool sync)
 {
     if (S_ISDIR(cetrafs_le32(in->mode)))
-        ctrace("DRECW ino=%llu size=%llu eh=%u depth=%u from=%pS\n",
-                (unsigned long long) ino, (unsigned long long) cetrafs_le64(in->size),
-                (unsigned int) cetrafs_le16(in->eh.eh_entries),
-                (unsigned int) cetrafs_le16(in->eh.eh_depth), __builtin_return_address(0));
+        ctrace("DRECW ino=%llu size=%llu eh=%u depth=%u from=%pS\n", (unsigned long long) ino,
+               (unsigned long long) cetrafs_le64(in->size), (unsigned int) cetrafs_le16(in->eh.eh_entries),
+               (unsigned int) cetrafs_le16(in->eh.eh_depth), __builtin_return_address(0));
 
     const cetrafs_superblock_t *raw_sb = cetrafs_sb_raw(sb);
     cetrafs_inode_t stamped = *in;
@@ -671,6 +716,14 @@ retry:
      * 0 bytes on the other because this read landed on an inode-table
      * block that node had cached for an unrelated reason before the
      * write ever happened. */
+
+    /* A recycled slab object still carries the PREVIOUS file's
+     * per-identity state (the slab ctor runs once per object, never on
+     * recycle) -- including a defrag dedup latch a dead file left set,
+     * which silently disabled auto-defrag for whatever file landed on
+     * that slot next. New identity, clean slate. */
+    cetrafs_inode_identity_init(inode);
+
     cetrafs_invalidate_raw_inode(sb, ino);
 
     ret = cetrafs_read_raw_inode(sb, ino, &raw);
@@ -827,25 +880,25 @@ static int cetrafs_vfs_stat_cas_mutate(void *image, unsigned int len, void *priv
      * legitimate shrinker, truncate, publishes through its own path
      * under the namespace lock with foreign users refused); times take
      * the later. */
-#define CETRAFS_FD_MERGE64(field, ours_expr, write_ours)                                                               \
-    do {                                                                                                               \
-        u64 ours = (u64) (ours_expr);                                                                                  \
-        u64 theirs = cetrafs_le64(rec.field);                                                                          \
-        u64 b = (u64) (ctx->base.field);                                                                               \
-        u64 v = theirs;                                                                                                \
-                                                                                                                       \
-        if (ours != b && theirs != b)                                                                                  \
-            v = max(ours, theirs);                                                                                     \
-        else if (ours != b)                                                                                            \
-            v = ours;                                                                                                  \
-        rec.field = cetrafs_cpu_to_le64(v);                                                                            \
-        write_ours(v);                                                                                                 \
+#define CETRAFS_FD_MERGE64(field, ours_expr, write_ours) \
+    do {                                                 \
+        u64 ours = (u64) (ours_expr);                    \
+        u64 theirs = cetrafs_le64(rec.field);            \
+        u64 b = (u64) (ctx->base.field);                 \
+        u64 v = theirs;                                  \
+                                                         \
+        if (ours != b && theirs != b)                    \
+            v = max(ours, theirs);                       \
+        else if (ours != b)                              \
+            v = ours;                                    \
+        rec.field = cetrafs_cpu_to_le64(v);              \
+        write_ours(v);                                   \
     } while (0)
 
-#define CETRAFS_FD_SET_SIZE(v)   i_size_write(inode, (loff_t) (v))
+#define CETRAFS_FD_SET_SIZE(v) i_size_write(inode, (loff_t) (v))
 #define CETRAFS_FD_SET_BLOCKS(v) (inode->i_blocks = (blkcnt_t) (v))
-#define CETRAFS_FD_SET_ATIME(v)  inode_set_atime(inode, (time64_t) (v), 0)
-#define CETRAFS_FD_SET_MTIME(v)  inode_set_mtime(inode, (time64_t) (v), 0)
+#define CETRAFS_FD_SET_ATIME(v) inode_set_atime(inode, (time64_t) (v), 0)
+#define CETRAFS_FD_SET_MTIME(v) inode_set_mtime(inode, (time64_t) (v), 0)
 
     CETRAFS_FD_MERGE64(size, i_size_read(inode), CETRAFS_FD_SET_SIZE);
     CETRAFS_FD_MERGE64(blocks, inode->i_blocks, CETRAFS_FD_SET_BLOCKS);
@@ -899,6 +952,7 @@ int cetrafs_write_vfs_inode(struct inode *inode)
     struct cetrafs_vfs_stat_cas_ctx *ctx;
     cetrafs_inode_t *bufs; /* [0]=raw, [1]=shadow, [2]=written -- heap: 3 KiB of records */
     u32 my_node_id = 0;
+    u64 fd_seq = 0;
     int ret;
 
     bufs = kmalloc(3 * sizeof(*bufs), GFP_NOFS);
@@ -922,7 +976,8 @@ int cetrafs_write_vfs_inode(struct inode *inode)
     /* A record a LIVE other node holds exclusively locked is that node's
      * file domain to write -- our stat dirt predates its claim. */
     (void) cetrafs_sb_get_node_id(sb, &my_node_id);
-    if (cetrafs_le32(bufs[0].lock_mode) == CETRAFS_LOCK_EXCLUSIVE && cetrafs_le32(bufs[0].lock_owner_node) != my_node_id) {
+    if (cetrafs_le32(bufs[0].lock_mode) == CETRAFS_LOCK_EXCLUSIVE &&
+        cetrafs_le32(bufs[0].lock_owner_node) != my_node_id) {
         bool stale = false;
 
         ret = cetrafs_node_is_stale(sb, cetrafs_le32(bufs[0].lock_owner_node), &stale);
@@ -962,7 +1017,14 @@ int cetrafs_write_vfs_inode(struct inode *inode)
     ctx->ino_le = bufs[0].ino;
     ctx->shadow = &bufs[1];
     ctx->written = &bufs[2];
-    ctx->have_shadow = cetrafs_inode_fd_take(inode, &bufs[1]);
+
+    /* Snapshot-CAS-report runs under the per-inode publish mutex: a
+     * rebuild path (truncate/punch/fallocate/defrag) publishing a fresh
+     * tree and then freeing the old one must never interleave with this
+     * CAS, or the pre-rebuild shadow lands on top of the fresh tree and
+     * the device ends up referencing freed blocks. */
+    cetrafs_inode_fd_pub_lock(inode);
+    ctx->have_shadow = cetrafs_inode_fd_take(inode, &bufs[1], &fd_seq);
 
     /* Nothing to publish? A no-op CAS still costs a device round trip
      * (and showed up as "a punch that frees nothing published 10 record
@@ -972,13 +1034,24 @@ int cetrafs_write_vfs_inode(struct inode *inode)
     if (!ctx->have_shadow && (u64) i_size_read(inode) == ctx->base.size && (u64) inode->i_blocks == ctx->base.blocks &&
         (u64) inode_get_atime_sec(inode) == ctx->base.atime && (u64) inode_get_mtime_sec(inode) == ctx->base.mtime) {
         ret = 0;
-        goto out;
+        goto out_pub;
     }
 
     ret = cetrafs_cas_record_fd_seeded(sb, cetrafs_inode_lba(sb, inode->i_ino),
                                        (const u8 *) &bufs[0] + CETRAFS_INODE_FD_OFF, CETRAFS_INODE_FD_LIVE,
                                        cetrafs_vfs_stat_cas_mutate, ctx);
+    ctrace("FDPUB ino=%llu ret=%d shadow=%d blocks=%llu size=%llu seq=%llx\n", (unsigned long long) inode->i_ino,
+           ret, (int) ctx->have_shadow, (unsigned long long) (ret == 0 ? cetrafs_le64(ctx->written->blocks) : 0),
+           (unsigned long long) (ret == 0 ? cetrafs_le64(ctx->written->size) : 0),
+           (unsigned long long) (ret == 0 ? cetrafs_le64(ctx->written->file_seq) : 0));
     if (ret == 0) {
+        /* Landed: the state through fd_seq is durable. Anything staged
+         * DURING the CAS bumped the seq and keeps the dirty flag -- the
+         * old protocol cleared it at take time, and a get_block in this
+         * window then rebuilt its tree from the lagging device record,
+         * leaking every extent in flight (the ~15k-blocks-per-fill
+         * leak, 2026-10-27). */
+        cetrafs_inode_fd_published(inode, fd_seq);
         cetrafs_record_write_counted();
         cetrafs_inode_stat_baseline_set(inode, ctx->written);
         /* Adopt what we just stamped. The decode in lock.c already stops
@@ -986,16 +1059,19 @@ int cetrafs_write_vfs_inode(struct inode *inode)
          * the cached value exact so the common path never even has to
          * ask. */
         cetrafs_inode_note_local_file_seq(inode, cetrafs_le64(ctx->written->file_seq));
-    } else if (ctx->have_shadow) {
-        /* The publish did not land; the pending extent state must not be
-         * lost -- put it back for the next boundary. (-ESTALE means the
-         * file is GONE under us: nothing to re-stage onto.) */
-        if (ret != -ESTALE)
-            cetrafs_inode_fd_stage(inode, &bufs[1]);
     }
-    if (ret == -ESTALE)
-        ret = 0; /* reused number: our dirt is for a dead file -- dropped by design */
+    /* A failed publish needs no re-stage: take no longer clears the
+     * shadow, so the pending state simply stays dirty for the next
+     * boundary. */
+    if (ret == -ESTALE) {
+        /* Reused number: our dirt is for a dead file -- dropped by
+         * design, including the shadow. */
+        cetrafs_inode_fd_published(inode, fd_seq);
+        ret = 0;
+    }
 
+out_pub:
+    cetrafs_inode_fd_pub_unlock(inode);
 out:
     kfree(ctx);
     kfree(bufs);
@@ -1286,10 +1362,21 @@ int cetrafs_refresh_vfs_inode_if_newer(struct inode *inode)
     if (cetrafs_lock_identity_cache_trusted(inode))
         return 0;
 
+    /* Read AND stamp under the publish mutex: the publisher holds it
+     * across its CAS and its note of the stamped seq, so this refresh
+     * runs either entirely before the publish (whatever it stamps is
+     * immediately re-corrected by the publish's own merge write-back)
+     * or entirely after it (and the seq guard below then recognises a
+     * superseded read). Without the mutex there is a window where a
+     * fresh-at-read-time image lands on in-core state the publish just
+     * made newer. */
+    cetrafs_inode_fd_pub_lock(inode);
     cetrafs_invalidate_raw_inode(sb, inode->i_ino);
     ret = cetrafs_read_raw_inode(sb, inode->i_ino, &raw);
-    if (ret)
+    if (ret) {
+        cetrafs_inode_fd_pub_unlock(inode);
         return ret;
+    }
 
     /* v0x0008 reuse detection: a different generation means this is not
      * the same file this object was instantiated from -- a peer deleted
@@ -1302,10 +1389,60 @@ int cetrafs_refresh_vfs_inode_if_newer(struct inode *inode)
      * iget's cache-hit path by dropping its ref and retrying. */
     if (cetrafs_inode_get_generation(inode) != cetrafs_le64(raw.generation)) {
         remove_inode_hash(inode);
+        cetrafs_inode_fd_pub_unlock(inode);
         return -ESTALE;
     }
 
+    /*
+     * A SUPERSEDED self-stamp must not be applied. If the record's last
+     * file-sector stamp is this node's own but is NOT the seq our last
+     * publish noted, the read predates a publish we have since made --
+     * stamping it reverts in-core state (an 8-core churn run lost 154
+     * blocks of a file to exactly that: extents intact, size reverted
+     * to the end of the last small write, 2026-10-29). Equality means
+     * the read IS our last publish -- apply freely, which is also what
+     * keeps the corruption/type checks inside apply() reachable on a
+     * single node (a poked record with an unchanged seq must still be
+     * refused LOUDLY, not short-circuited). No noted seq yet means this
+     * in-core object has published nothing the read could be older
+     * than. lock.c's two apply sites guard their windows with the
+     * node-id check alone because foreign writes are the only
+     * legitimate changes there; this path serves d_revalidate and
+     * iget's cache hit, where our own record writes are routine.
+     */
+    {
+        u32 my_node_id = 0;
+        u64 cached = cetrafs_inode_local_file_seq(inode);
+
+        /* Same-node seqs embed the same clock's nanoseconds in the low
+         * 48 bits (~3 days before wrap), so for OUR OWN stamps "older
+         * than the publish we noted" is decidable -- and that is the
+         * only read that must be refused. A NEWER self-stamp means a
+         * local publisher ran after our note (background defrag, a
+         * staged release, writeback) and in-core is the stale side:
+         * applying is then the fix, not the bug. The first cut refused
+         * every mismatched self-stamp and wedged refresh until the next
+         * close reset the note -- a full-gate run reproduced it on two
+         * architectures while every isolated run passed. */
+        if (cached != U64_MAX && cetrafs_sb_get_node_id(sb, &my_node_id) == 0 &&
+            CETRAFS_FILE_SEQ_NODE(cetrafs_le64(raw.file_seq)) == (u32) (my_node_id & 0xFFFFu) &&
+            CETRAFS_FILE_SEQ_NODE(cached) == (u32) (my_node_id & 0xFFFFu) &&
+            (cetrafs_le64(raw.file_seq) & CETRAFS_FILE_SEQ_VAL_MASK) < (cached & CETRAFS_FILE_SEQ_VAL_MASK)) {
+            ctrace("FDREFRESH ino=%llu verdict=superseded rawseq=%llx cached=%llx rawsize=%llu coresize=%llu\n",
+                   (unsigned long long) inode->i_ino, (unsigned long long) cetrafs_le64(raw.file_seq),
+                   (unsigned long long) cached, (unsigned long long) cetrafs_le64(raw.size),
+                   (unsigned long long) i_size_read(inode));
+            cetrafs_inode_fd_pub_unlock(inode);
+            return 0;
+        }
+        ctrace("FDREFRESH ino=%llu verdict=apply rawseq=%llx cached=%llx rawsize=%llu coresize=%llu dirty=%d\n",
+               (unsigned long long) inode->i_ino, (unsigned long long) cetrafs_le64(raw.file_seq),
+               (unsigned long long) cached, (unsigned long long) cetrafs_le64(raw.size),
+               (unsigned long long) i_size_read(inode), (int) cetrafs_inode_fd_dirty(inode));
+    }
+
     ret = cetrafs_apply_raw_to_vfs_inode(inode, &raw);
+    cetrafs_inode_fd_pub_unlock(inode);
     if (ret == -ESTALE) {
         /* apply() says the record describes a deleted file (the
          * generation case was handled above). Unhash for the same

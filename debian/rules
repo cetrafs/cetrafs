@@ -25,6 +25,7 @@ override_dh_auto_install:
 	install -m 0755 userspace/mkfs.cetra   debian/cetrafs-tools/usr/sbin/
 	install -m 0755 userspace/fsck.cetra   debian/cetrafs-tools/usr/sbin/
 	install -m 0755 userspace/defrag.cetra debian/cetrafs-tools/usr/sbin/
+	install -m 0755 userspace/growfs.cetra debian/cetrafs-tools/usr/sbin/
 	# kernel-module source -> cetrafs-dkms (dh_dkms adds dkms.conf + maint scripts)
 	install -d debian/cetrafs-dkms/usr/src/cetrafs-$(VERSION)
 	cp -a kmod include debian/cetrafs-dkms/usr/src/cetrafs-$(VERSION)/

@@ -157,6 +157,11 @@ static int cetrafs_statfs(struct dentry *dentry, struct kstatfs *stat)
 
         zfree = (s64) zi.free_data_blocks + cetrafs_sb_zg_pending_delta(sb, zg_id);
         free_blocks += zfree > 0 ? (u64) zfree : 0;
+        /* Capacity of unowned Block Groups sharded to this record: a
+         * handed-back BG belongs to no ZG, so without this bucket df
+         * would shrink by the group's full size at every surplus
+         * release (the cross-node suite caught exactly that). */
+        free_blocks += zi.pool_free_blocks;
     }
 
     /* Capacity is fixed at mkfs time, so it is computed once at mount

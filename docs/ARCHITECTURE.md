@@ -135,7 +135,7 @@ and must be accessed through `cetrafs_le*()`/`cetrafs_cpu_to_le*()`; see
 | Field | Type | Meaning |
 |---|---|---|
 | magic | `__le32` | `0xC4553770` |
-| version | `__le16` | `CETRAFS_VERSION` — currently `0x0003`; bumped freely, never migrated |
+| version | `__le16` | `CETRAFS_VERSION` — currently `0x0009`; bumped freely, never migrated. v0x0008..0x0009 is a temporary compatibility window: a volume from the previous release (0x0008) can be grown in place without reformatting; `growfs` stamps 0x0009 on any grown volume to gate older builds from attempting to mount it |
 | sb_bytes | `__le16` | `sizeof(superblock)`, sanity check |
 | block_size | `__le32` | fixed 4096 |
 | total_blocks | `__le64` | device size in blocks |
@@ -155,16 +155,17 @@ and must be accessed through `cetrafs_le*()`/`cetrafs_cpu_to_le*()`; see
 | pending_free_blocks_per_zg | `__le32` | queue blocks per ZG (`CETRAFS_PENDING_FREE_BLOCKS_PER_ZG`) |
 | node_journal_start | `__le64` | LBA of the per-node journal area |
 | node_journal_blocks | `__le32` | blocks per node (flag block + slots) |
+| layout_gen | `__le64` | layout generation counter: incremented each time `growfs` relocates on-disk structures. Gates which nodes may mount a live volume during a grow (only nodes that understand `layout_gen` via `CETRAFS_NODE_CAP_LIVE_GROW`) |
 | features_compat/incompat/ro_compat | `__le64` | feature bitmasks |
 | checksum | `__le64` | CRC32C over the struct with this field zeroed (low 32 bits used) |
 | uuid[16] | `u8[]` | filesystem UUID |
-| reserved[200] | `u8[]` | padding to keep the struct growable |
+| reserved[144] | `u8[]` | padding to keep the struct growable |
 
 ### Zone Group Descriptor — `cetrafs_zone_group_t` (1 block per ZG)
 
 Split into a **hot sector** (the first `CETRAFS_HOT_SECTOR` = 512 bytes, the
 atomic compare-and-swap unit — ownership and the free-count aggregate live
-here) and a **cold** remainder (mkfs-time-fixed span fields), each with its own
+here) and a **cold** remainder (mkfs-time-fixed and historical fields), each with its own
 checksum.
 
 | Field | Section | Meaning |
@@ -174,14 +175,19 @@ checksum.
 | free_data_blocks | hot | cached aggregate of its member BGs' free counts; kept in sync by the owner and reconciled from the bitmaps whenever ownership arrives |
 | hb_seq | hot | heartbeat seq from the owner |
 | hot_checksum | hot | CRC32C over `[0, HOT_SECTOR)` with this field zeroed |
-| first_bg_id, bg_count | cold | span of BGs owned by this ZG (`mkfs` assigns it) |
+| pool_free_blocks | hot | capacity (free blocks) of unowned Block Groups sharded to this ZG (shard key: `bg_id % zone_group_count`, the same mapping `mkfs` uses for initial assignment). Maintained by CAS at claim (debit) and release (credit), both ordered so a crash between the two records understates free space. `fsck` cross-checks each shard against the actual unowned members. Placed after `hot_checksum` so pre-0x0009 volumes read it as zero (correct: every BG starts owned) |
+| first_bg_id, bg_count | cold | **UNUSED** (v0x0009+). Block Group ownership is now stored in each BG's `owner_zg` field, not in the ZG's span — this lets a grow add Block Groups without touching any existing ZG record |
 | cold_checksum | cold | CRC32C over the cold region with this field zeroed |
 
-> **Note:** `mkfs.cetra` distributes BGs evenly across ZGs: `B / Z` each, with
-> the first `B % Z` ZGs getting one extra, so spans are contiguous and
-> increasing (ZG 0 owns BG ids `[0, cnt0)`, ZG 1 the next `cnt1`, …). `owner_node_id`
-> is left at `CETRAFS_NODE_ID_NONE`; a real node claims it at runtime. There
-> are no longer any per-ZG journal fields — journals are per-node (below).
+> **Note:** `mkfs.cetra` distributes BGs across ZGs ROUND-ROBIN (BG `b`
+> belongs to ZG `b % Z`), not as contiguous spans: each BG names its own
+> owner, so membership needs no contiguity, and interleaving spreads
+> capacity across every ZG instead of giving each one a single run at
+> one end of the device. Since v0x0009,
+> BG ownership is carried by each Block Group itself (`cetrafs_block_group_t.owner_zg`),
+> which also enables a node to hand back empty Block Groups and lets a grow add new ones
+> without mutating existing ZG records. `owner_node_id` is left at `CETRAFS_NODE_ID_NONE` at
+> mkfs time; a real node claims it at runtime. Journals are per-node (below).
 
 ### Node Registry — `cetrafs_node_entry_t` (128 bytes/entry, global table)
 
@@ -199,6 +205,7 @@ and the inode lock fields store elsewhere.
 | checksum | CRC32C over the row with this field zeroed |
 | fence_epoch | the node's lease: bumped by whoever reclaims this row's claims; the owner self-fences when it changes |
 | hb_interval_secs | this node's own tick rate, so a peer judges staleness against the rate the node actually beats at, not the observer's setting |
+| caps | `__le32` bitmask of node capabilities (e.g., `CETRAFS_NODE_CAP_LIVE_GROW`), set by the node at registration. Gates features that require understanding new on-disk structures or sematics; a 0.8.x node without the bit cannot mount during a live grow |
 
 `CETRAFS_NODE_ID_NONE` (`0xFFFF`) is the "no node" sentinel, capping real
 registrations at 0xFFFE rows — but the read-presence bitmask (below) caps a

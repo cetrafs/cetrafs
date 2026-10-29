@@ -63,6 +63,7 @@ int cetrafs_sb_get_node_id(struct super_block *sb, u32 *out);
 bool cetrafs_sb_peer_progress_stale(struct super_block *sb, u32 node_id, u64 hb_seq, u32 peer_hb_interval);
 void cetrafs_node_report_clock_skew(struct super_block *sb);
 void cetrafs_node_seed_peer_watch(struct super_block *sb);
+bool cetrafs_cluster_all_advertise(struct super_block *sb, u32 cap);
 int cetrafs_node_my_uuid(u8 out[CETRAFS_NODE_UUID_LEN]);
 int cetrafs_node_live_peer_exists(struct super_block *sb, const u8 *my_uuid, bool *out_exists);
 /* The file-lock mode a LIVE peer advertises (the first mounter's choice),
@@ -83,9 +84,9 @@ void cetrafs_sb_set_fence_epoch(struct super_block *sb, u64 epoch);
 int cetrafs_sb_get_node_uuid(struct super_block *sb, u8 out[CETRAFS_NODE_UUID_LEN]);
 struct cetrafs_journal *cetrafs_sb_get_journal(struct super_block *sb);
 struct cetrafs_defrag *cetrafs_sb_get_defrag(struct super_block *sb);
-void cetrafs_sb_cache_zg_ownership(struct super_block *sb, u32 zg_id, u32 first_bg_id, u32 bg_count);
+void cetrafs_sb_cache_zg_ownership(struct super_block *sb, u32 zg_id);
 void cetrafs_sb_uncache_zg_ownership(struct super_block *sb, u32 zg_id);
-bool cetrafs_sb_zg_owned_cached(struct super_block *sb, u32 zg_id, u32 *out_first_bg_id, u32 *out_bg_count);
+bool cetrafs_sb_zg_owned_cached(struct super_block *sb, u32 zg_id);
 bool cetrafs_sb_zg_pf_backoff_active(struct super_block *sb, u32 zg_id);
 bool cetrafs_sb_zg_pf_note_drop(struct super_block *sb, u32 zg_id, u32 count, unsigned int backoff_ms);
 bool cetrafs_sb_zg_pf_take_drops(struct super_block *sb, u32 zg_id, u64 *runs, u64 *blocks);
@@ -144,10 +145,12 @@ void cetrafs_sb_note_bmap_alloc(struct super_block *sb, u32 bg_id);
 bool cetrafs_sb_take_bmap_alloc_dirty(struct super_block *sb, u32 bg_id);
 int cetrafs_alloc_flush_bitmaps(struct super_block *sb);
 void cetrafs_sb_accrue_bg_free(struct super_block *sb, u32 bg_id, s64 delta);
+u64 cetrafs_sb_bg_alloc_seq(struct super_block *sb, u32 bg_id);
 s64 cetrafs_sb_bg_pending_delta(struct super_block *sb, u32 bg_id);
 u64 cetrafs_sb_bg_epoch(struct super_block *sb, u32 bg_id);
 void cetrafs_sb_set_bg_epoch(struct super_block *sb, u32 bg_id, u64 seq);
 void cetrafs_sb_accrue_zg_free(struct super_block *sb, u32 zg_id, s64 delta);
+s64 cetrafs_sb_take_zg_free_delta(struct super_block *sb, u32 zg_id);
 int cetrafs_flush_dirty_free_counts(struct super_block *sb);
 /* Zone Groups carrying an unapplied free-count delta. A delta must
  * never outlive ownership of its ZG -- see fs.c. */
@@ -176,7 +179,7 @@ int cetrafs_caw_discover(struct block_device *bdev, struct cetrafs_caw_info *out
 // its COMPARE AND WRITE to a SCSI device underneath while ordinary I/O
 // keeps going through dm. This only enumerates; caw.c decides usability.
 #define CETRAFS_DM_MAX_SLAVES 16
-#define CETRAFS_DM_MAX_DEPTH  3
+#define CETRAFS_DM_MAX_DEPTH 3
 int cetrafs_dm_underlying(struct block_device *bdev, dev_t *out, unsigned int max, unsigned int *out_n);
 struct scsi_device;
 /* A referenced scsi_device to send 'bdev's passthrough commands to when
@@ -243,11 +246,11 @@ int cetrafs_cas_record_seeded(struct super_block *sb,
                               cetrafs_cas_fn mutate,
                               void *priv);
 int cetrafs_cas_record_fd_seeded(struct super_block *sb,
-                              u64 fs_lba,
-                              const void *seed,
-                              unsigned int seed_len,
-                              cetrafs_cas_fn mutate,
-                              void *priv);
+                                 u64 fs_lba,
+                                 const void *seed,
+                                 unsigned int seed_len,
+                                 cetrafs_cas_fn mutate,
+                                 void *priv);
 int cetrafs_cas_region_seeded(struct super_block *sb,
                               u64 fs_lba,
                               unsigned int region_idx,
@@ -290,6 +293,30 @@ struct buffer_head *cetrafs_bread_uncached_retry(struct super_block *sb, sector_
 /* inode.c -- read an inode's external extent-leaf block at the right
  * freshness for who currently owns the file. */
 struct buffer_head *cetrafs_read_leaf_bh(struct inode *inode, u64 lba);
+
+/* lock.c: one remembered extent per inode -- see cetrafs_inode_info's
+ * ext_valid comment for what keys it and what may not be cached. */
+struct cetrafs_ext_span {
+    u32 block; /* first file-relative block the extent covers */
+    u32 len;   /* blocks */
+    u64 lba;   /* device block 'block' lives at */
+    bool uninit;
+};
+bool cetrafs_inode_ext_cache_lookup(struct inode *inode,
+                                    const cetrafs_inode_t *raw,
+                                    u32 iblock,
+                                    u64 *out_lba,
+                                    u32 *out_run,
+                                    bool *out_uninit);
+void cetrafs_inode_ext_cache_store(struct inode *inode,
+                                   const cetrafs_inode_t *raw,
+                                   u32 ext_block,
+                                   u32 ext_len,
+                                   u64 ext_lba,
+                                   bool uninit);
+void cetrafs_inode_ext_cache_drop(struct inode *inode);
+u64 cetrafs_ext_cache_hit_count(void);
+u64 cetrafs_ext_cache_miss_count(void);
 struct buffer_head *cetrafs_read_dir_leaf_bh(struct inode *inode, u64 lba, bool fresh);
 struct buffer_head *cetrafs_read_tree_bh(struct inode *inode, u64 lba, u32 tail_magic, const char *what);
 struct buffer_head *cetrafs_read_index_bh(struct inode *inode, u64 lba);
@@ -324,11 +351,12 @@ void cetrafs_invalidate_raw_inode(struct super_block *sb, u64 ino);
  *
  * The messages are a debugging interface, not ABI: grep-stable tags
  * (ADDNAME, REMNAME, RETGT, DISCARD, ADDREC, INOALLOC, INOFREE, IBCAS,
- * CAWPATH, NSHOLD, DSHRINK, EUCLEANDUMP, DIRTYREC, and the block-free
+ * CAWPATH, NSHOLD, DSHRINK, EUCLEANDUMP, DIRTYREC, the block-free
  * lifecycle set BLKALLOC, BLKFREE, BLKQUEUE, BLKAPPLY, PFDRAIN,
- * EVICTFREE that located the referenced-but-free double
- * free) with key=value fields, consumed by the analysers under
- * ctest/tools/.
+ * EVICTFREE that located the referenced-but-free double free, and the
+ * file-domain shadow set FDSTAGE, FDTAKE, FDPUB that located the
+ * publish-window lost-update leak) with key=value fields, consumed by
+ * the analysers under ctest/tools/.
  */
 #ifdef CETRAFS_TRACE
 #define ctrace(fmt, ...) pr_warn(fmt, ##__VA_ARGS__)
@@ -342,8 +370,8 @@ u64 cetrafs_inode_lba(struct super_block *sb, u64 ino);
 u32 cetrafs_inode_crc_ns(const cetrafs_inode_t *in);
 u32 cetrafs_inode_crc_fd(const cetrafs_inode_t *in);
 bool cetrafs_inode_crcs_ok(const cetrafs_inode_t *in);
-void cetrafs_inode_stamp_crc(struct super_block *sb, cetrafs_inode_t *in);    /* whole record: echoes + both sector CRCs */
-void cetrafs_inode_stamp_crc_ns(cetrafs_inode_t *in); /* sector 0 only (the CAS mutates) */
+void cetrafs_inode_stamp_crc(struct super_block *sb, cetrafs_inode_t *in); /* whole record: echoes + both sector CRCs */
+void cetrafs_inode_stamp_crc_ns(cetrafs_inode_t *in);                      /* sector 0 only (the CAS mutates) */
 void cetrafs_inode_stamp_crc_fd(struct super_block *sb, cetrafs_inode_t *in);
 u64 cetrafs_file_seq_new(struct super_block *sb); /* sector 1 only (the file-path publish) */
 int cetrafs_apply_raw_to_vfs_inode(struct inode *inode, const cetrafs_inode_t *raw);
@@ -393,6 +421,10 @@ int cetrafs_init_security(struct inode *inode, struct inode *dir, const struct q
 // alloc.c
 int cetrafs_alloc_inode(struct super_block *sb, u64 *out_ino);
 int cetrafs_free_inode(struct super_block *sb, u64 ino);
+/* The scrub's conditioned variant: frees ONLY if a fresh read still shows
+ * the record dead (nlink==0) and unchanged (same generation as the
+ * caller's verdict read). -ESTALE means the number was reborn. */
+int cetrafs_free_inode_if_dead(struct super_block *sb, u64 ino, u64 generation);
 int cetrafs_alloc_data_block(struct super_block *sb, u32 bg_id, u64 *out_lba);
 int cetrafs_alloc_data_block_near(struct super_block *sb, u32 bg_id, u64 preferred_lba, u64 *out_lba);
 int cetrafs_alloc_block_anywhere(struct super_block *sb, u32 *out_bg, u64 *out_lba);
@@ -408,6 +440,31 @@ static inline int cetrafs_free_data_block(struct super_block *sb, u64 lba)
 int cetrafs_apply_pending_free(struct super_block *sb, u64 lba, u32 count, u32 expect_zg);
 int cetrafs_count_free_inodes(struct super_block *sb, u64 *out_free);
 int cetrafs_bg_data_block_stats(struct super_block *sb, u32 bg_id, u64 *out_total, u64 *out_free);
+int cetrafs_bg_mount_info(struct super_block *sb, u32 bg_id, u64 *out_total, u32 *out_owner);
+
+/* Which Zone Group owns this Block Group, from the owners recorded at
+ * mount -- no device read. CETRAFS_NODE_ID_NONE if out of range.
+ * Replaces asking a Zone Group for its contiguous range of members
+ * (docs/internal/BG-OWNERSHIP-DESIGN.md). */
+u32 cetrafs_sb_bg_owner(struct super_block *sb, u32 bg_id);
+void cetrafs_sb_set_bg_owner(struct super_block *sb, u32 bg_id, u32 zg_id);
+/* The LBA of a Block Group's descriptor. The table is a chain, so this
+ * is no longer bg_table_start + bg_id. docs/internal/BG-OWNERSHIP-DESIGN.md */
+u64 cetrafs_sb_bg_desc_lba(struct super_block *sb, u32 bg_id);
+int cetrafs_sb_first_owned_zg(struct super_block *sb, u32 *out_zg);
+/* Claim a Block Group nobody owns into zg_id, with one compare-and-swap.
+ * -ENOSPC if there is none free. docs/internal/BG-OWNERSHIP-DESIGN.md */
+int cetrafs_bg_claim_free(struct super_block *sb, u32 zg_id, u32 *out_bg_id);
+/* Hand back every empty Block Group of zg_id. The hoarding fix.
+ * docs/internal/BG-OWNERSHIP-DESIGN.md */
+int cetrafs_bg_release_empty(struct super_block *sb, u32 zg_id, u32 *out_released);
+void cetrafs_sb_drain_bg(struct super_block *sb, u32 bg_id);
+void cetrafs_sb_undrain_bg(struct super_block *sb, u32 bg_id);
+
+/* Iterate every Block Group this node may allocate from. Flat: it does
+ * not care which Zone Group each one belongs to, or whether a Zone
+ * Group's members are contiguous. */
+void cetrafs_sb_owned_bgs(struct super_block *sb, const unsigned long **out_bits, u32 *out_nbits);
 /* Recompute a BG's cached free count from its bitmap and correct it
  *. *out_delta is (truth - cached), for the caller to fix
  * the owning ZG's aggregate with. Only meaningful at a moment when this
@@ -426,7 +483,7 @@ int cetrafs_bg_apply_free_delta(struct super_block *sb, u32 bg_id, s64 delta);
 /* Seed this node's in-memory count epoch for every BG of a ZG whose
  * ownership entered the cache WITHOUT a reconcile (the tick re-attach
  * path) -- deltas accrued under an unseeded epoch would all be dropped. */
-int cetrafs_bg_seed_count_epochs(struct super_block *sb, u32 first_bg, u32 bg_count);
+int cetrafs_bg_seed_count_epochs(struct super_block *sb, u32 zg_id);
 /* Minimum gap between whole-volume foreign-descriptor sweeps. The
  * counts they refresh are caches; the allocator's warm descriptors are
  * not. See the sweep's comment in procfs.c. */
@@ -452,6 +509,16 @@ u64 cetrafs_map_call_count(void);
 u64 cetrafs_map_block_count(void);
 int cetrafs_bg_owner_zg_for_lba(struct super_block *sb, u64 lba, u32 *out_zg_id);
 int cetrafs_bg_invalidate_cache(struct super_block *sb, u32 bg_id);
+extern bool cetrafs_alloc_shadow_enabled;
+void cetrafs_shadow_set(struct super_block *sb, u64 lba, u64 count, const char *who);
+void cetrafs_shadow_seed(struct super_block *sb);
+bool cetrafs_shadow_active(struct super_block *sb);
+/* Birth registry: a number between cetrafs_alloc_inode() and its first
+ * published name. The orphan scrub must not judge it (see fs.c). */
+void cetrafs_sb_birth_begin(struct super_block *sb, u64 ino);
+void cetrafs_sb_birth_end(struct super_block *sb, u64 ino);
+bool cetrafs_sb_birth_active(struct super_block *sb, u64 ino);
+void cetrafs_shadow_clear(struct super_block *sb, u64 lba, u64 count, const char *who);
 
 // super_ops.c
 extern const struct super_operations cetrafs_super_ops;
@@ -491,15 +558,23 @@ int cetrafs_zg_drain_pending_frees(struct super_block *sb);
 int cetrafs_zg_pending_free_for_each(struct super_block *sb, u32 zg_id, void (*cb)(void *, u64, u32), void *ctx);
 int cetrafs_alloc_pick_bg(struct super_block *sb, u32 *out_bg_id);
 int cetrafs_alloc_pick_run(struct super_block *sb, u64 count, u64 *out_lba);
+int cetrafs_alloc_pick_run_resv(struct super_block *sb, u64 count, u64 *out_lba, struct cetrafs_resv_span *span);
+int cetrafs_alloc_data_run_resv(struct super_block *sb, u32 bg_id, u64 count, u64 *out_lba,
+                                struct cetrafs_resv_span *span);
+int cetrafs_free_data_extent_unless_reserved(struct super_block *sb, u64 lba, u32 count);
 struct cetrafs_zg_info {
     u32 owner_node_id; /* CETRAFS_NODE_ID_NONE if unclaimed */
-    u32 first_bg_id;
-    u32 bg_count;
     u64 free_data_blocks;
+    u64 pool_free_blocks; /* capacity of unowned BGs sharded here */
+    /* No member list: a Zone Group no longer describes which Block
+     * Groups belong to it. Ask the Block Group -- cetrafs_sb_bg_owner()
+     * -- or walk cetrafs_sb_owned_bgs() for the ones this node may use.
+     * docs/internal/BG-OWNERSHIP-DESIGN.md */
 };
 int cetrafs_zg_get_info(struct super_block *sb, u32 zg_id, struct cetrafs_zg_info *out);
 int cetrafs_zg_adjust_free_blocks(struct super_block *sb, u32 zg_id, s64 delta);
 int cetrafs_zg_apply_free_delta(struct super_block *sb, u32 zg_id, s64 delta);
+int cetrafs_zg_adjust_pool_blocks(struct super_block *sb, u32 bg_id, s64 delta);
 int cetrafs_compute_max_file_size(struct super_block *sb, loff_t *out_max);
 
 // lock.c
@@ -560,6 +635,7 @@ u64 cetrafs_inode_get_generation(struct inode *inode);
 u64 cetrafs_inode_dirent_seq_cached(struct inode *inode);
 void cetrafs_inode_set_dirent_seq_cached(struct inode *inode, u64 seq);
 void cetrafs_inode_note_local_file_seq(struct inode *inode, u64 seq);
+u64 cetrafs_inode_local_file_seq(struct inode *inode);
 u64 cetrafs_file_cache_drop_count(void);
 u64 cetrafs_journal_write_count(void);
 u64 cetrafs_bg_geom_read_count(void);
@@ -581,12 +657,23 @@ void cetrafs_inode_ns_mutex_unlock(struct inode *inode);
 void cetrafs_inode_ns_holder_set(struct inode *inode, bool held);
 void cetrafs_inode_fd_stage(struct inode *inode, const cetrafs_inode_t *raw);
 void cetrafs_inode_fd_overlay(struct inode *inode, cetrafs_inode_t *raw);
-bool cetrafs_inode_fd_take(struct inode *inode, cetrafs_inode_t *out);
+bool cetrafs_inode_fd_dirty_snap(struct inode *inode);
+int cetrafs_inode_fd_overlay_checked(struct inode *inode, cetrafs_inode_t *raw, bool dirty_before);
+/* read_raw_inode + fd_overlay as one torn-read-safe unit -- see inode.c */
+int cetrafs_read_raw_inode_overlaid(struct super_block *sb, struct inode *inode, cetrafs_inode_t *raw);
+bool cetrafs_inode_fd_take(struct inode *inode, cetrafs_inode_t *out, u64 *out_seq);
 bool cetrafs_inode_fd_dirty(struct inode *inode);
 void cetrafs_inode_fd_fold(struct inode *inode, cetrafs_inode_t *raw);
-void cetrafs_inode_fd_discard(struct inode *inode);
-int cetrafs_inode_ns_cas(struct super_block *sb, u64 ino, u64 generation, const cetrafs_inode_t *seed,
-                         void (*apply)(cetrafs_inode_t *rec, void *arg), void *arg);
+void cetrafs_inode_fd_published(struct inode *inode, u64 seq);
+u64 cetrafs_inode_fd_seq(struct inode *inode);
+void cetrafs_inode_fd_pub_lock(struct inode *inode);
+void cetrafs_inode_fd_pub_unlock(struct inode *inode);
+int cetrafs_inode_ns_cas(struct super_block *sb,
+                         u64 ino,
+                         u64 generation,
+                         const cetrafs_inode_t *seed,
+                         void (*apply)(cetrafs_inode_t *rec, void *arg),
+                         void *arg);
 int cetrafs_write_raw_inode_fd(struct super_block *sb, u64 ino, const cetrafs_inode_t *src, struct inode *self);
 int cetrafs_inode_ns_zero_nlink(struct super_block *sb, u64 ino, const cetrafs_inode_t *seed);
 bool cetrafs_inode_ns_held_by_current(struct inode *inode);
@@ -599,6 +686,7 @@ int cetrafs_lock_defrag_begin(struct inode *inode);
 void cetrafs_lock_defrag_end(struct inode *inode);
 bool cetrafs_lock_defrag_try_queue(struct inode *inode);
 void cetrafs_lock_defrag_unqueue(struct inode *inode);
+void cetrafs_inode_identity_init(struct inode *inode);
 extern struct kmem_cache *cetrafs_inode_cache;
 
 // heartbeat.c
@@ -622,9 +710,9 @@ u64 cetrafs_scrub_last_duration_ms(void);
 /* raw-record extent walk (file.c) + BG data/bitmap geometry (alloc.c), both
  * consumed by the scrub. */
 int cetrafs_raw_inode_for_each_owned_block(struct super_block *sb,
-                                      const cetrafs_inode_t *raw,
-                                      void (*cb)(void *ctx, u64 phys, u32 len),
-                                      void *ctx);
+                                           const cetrafs_inode_t *raw,
+                                           void (*cb)(void *ctx, u64 phys, u32 len),
+                                           void *ctx);
 int cetrafs_bg_data_layout(struct super_block *sb,
                            u32 bg_id,
                            u64 *out_data_start,
@@ -632,6 +720,7 @@ int cetrafs_bg_data_layout(struct super_block *sb,
                            u64 *out_bmap_lba,
                            u64 *out_bmap_blocks);
 int cetrafs_inode_is_allocated(struct super_block *sb, u64 ino, bool *out_set);
+int cetrafs_alloc_inode_still_owned(struct super_block *sb, u64 ino, bool *out_set);
 
 // journal.c -- per-NODE journal
 struct cetrafs_journal; /* opaque; owned entirely by journal.c */

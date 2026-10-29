@@ -32,6 +32,7 @@ GEN_LOOPDEV="$(losetup --find --show "$GEN_IMG")"
 GEN_MNT="$(mktemp -d /tmp/cetrafs-gen-mnt-XXXXXX)"
 "$ROOT/userspace/mkfs.cetra" "$GEN_LOOPDEV" -z 1 -b 512 -J 0 -N 1024 -f >/dev/null
 mount -t cetrafs "$GEN_LOOPDEV" "$GEN_MNT"
+require_cetrafs_mount "$GEN_MNT"
 
 ln -s "gen-target-content" "$GEN_MNT/genlink"
 GEN_INO="$(stat -c '%i' "$GEN_MNT/genlink")"

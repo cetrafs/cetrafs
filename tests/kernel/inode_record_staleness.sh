@@ -42,6 +42,7 @@ STALE_MNT="$(mktemp -d /tmp/cetrafs-stale-mnt-XXXXXX)"
 "$ROOT/userspace/mkfs.cetra" "$STALE_LOOPDEV" -z 1 -b 512 -J 0 -N 1024 -f >/dev/null
 
 mount -t cetrafs "$STALE_LOOPDEV" "$STALE_MNT"
+require_cetrafs_mount "$STALE_MNT"
 touch "$STALE_MNT/f1"
 touch "$STALE_MNT/f2"
 F1_INO="$(stat -c '%i' "$STALE_MNT/f1")"

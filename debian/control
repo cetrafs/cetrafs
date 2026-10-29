@@ -32,3 +32,9 @@ Description: clustered shared-disk filesystem (VMFS alternative) - userspace too
   * mkfs.cetra   - create a cetrafs volume
   * fsck.cetra   - check and repair a volume
   * defrag.cetra - online per-file defragmentation
+  * growfs.cetra - grow a volume into space the device already has
+ .
+ growfs.cetra is OFFLINE: the volume must be unmounted on every node, and
+ the tool refuses rather than risking it. Growing also stamps a format
+ version the previous release will not mount, so upgrade every node
+ before growing and do not roll the package back afterwards.

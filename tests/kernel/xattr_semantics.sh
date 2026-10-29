@@ -146,20 +146,61 @@ sync
 [ "$(avail)" = "$FREE_NOXATTR" ] && pass "removing the last attribute frees it again" ||
     fail "free space is $(avail), was $FREE_NOXATTR before any attribute existed"
 
-log "only user.* -- the other namespaces are refused, not half-stored"
-for ns in trusted.t security.s system.posix_acl_access; do
-    if setfattr -n "$ns" -v x "$MNT/b" 2>/dev/null; then
-        fail "a '$ns' attribute was accepted"
-    else
-        pass "'$ns' is refused"
-    fi
-done
-# Nothing from a refused namespace may appear in the listing.
-python3 -c "
+log "namespaces: user/trusted/security are stored; unhandled ones are refused"
+# trusted.* and security.* are deliberately SUPPORTED (an overlayfs upper
+# layer needs trusted.overlay.*, SELinux labels through security.selinux;
+# see kmod/xattr.c's handler table). What has no handler -- ACLs and the
+# rest of system.* -- must be refused outright, not half-stored. All of
+# it goes through python's os.setxattr: this block used to run setfattr
+# with stderr suppressed and read a failure as "refused", so on every box
+# WITHOUT the attr package it passed vacuously against any behaviour at
+# all -- the one box that had setfattr was the only one running the
+# assertion, and it showed the module accepting what the suite swore it
+# refused (2026-10-29).
+if python3 - "$MNT" <<'PY'
+import errno, os, sys
+p = sys.argv[1] + '/b'
+os.setxattr(p, b'trusted.t', b'tv')
+os.setxattr(p, b'security.s', b'sv')
+assert os.getxattr(p, b'trusted.t') == b'tv'
+assert os.getxattr(p, b'security.s') == b'sv'
+try:
+    os.setxattr(p, b'system.no_such_handler', b'x')
+except OSError as e:
+    assert e.errno == errno.EOPNOTSUPP, e
+else:
+    sys.exit(1)
+names = os.listxattr(p)
+assert 'trusted.t' in names and 'security.s' in names, names
+assert not any(n.startswith('system.') for n in names), names
+PY
+then
+    pass "trusted.*/security.* stored and listed to root; system.* refused"
+else
+    fail "namespace semantics broken (python traceback above)"
+fi
+
+# Visibility gating: trusted.* names are for CAP_SYS_ADMIN eyes only --
+# an unprivileged listxattr must not advertise them, while security.*
+# and user.* stay visible (same contract as ext4). This discriminates:
+# the custom .listxattr walk used to skip the handlers' .list hooks
+# entirely, showing trusted.* to everyone.
+chmod 755 "$MNT"   # the fs root; /tmp above it is already traversable
+if runuser -u nobody -- python3 -c "
 import os, sys
 names = os.listxattr(sys.argv[1] + '/b')
-sys.exit(0 if all(n.startswith('user.') for n in names) else 1)" "$MNT" &&
-    pass "every listed name is in the user namespace" || fail "a non-user.* name was listed"
+assert not any(n.startswith('trusted.') for n in names), names
+assert 'security.s' in names, names" "$MNT"
+then
+    pass "trusted.* is hidden from an unprivileged listing, security.* is not"
+else
+    fail "unprivileged listxattr leaked trusted.* (or lost security.*)"
+fi
+python3 -c "
+import os, sys
+p = sys.argv[1] + '/b'
+os.removexattr(p, b'trusted.t')
+os.removexattr(p, b'security.s')" "$MNT" || fail "could not remove the namespace probes"
 
 log "attributes survive a remount"
 python3 -c "

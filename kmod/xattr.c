@@ -349,7 +349,27 @@ static int cetrafs_xattr_set_locked(struct inode *inode, const char *name, const
  * ext2/ext4's own custom listxattr, this walks the xattr block directly
  * and emits each NUL-terminated name (prefix included). size==0 (or a NULL
  * buffer) is a size query -- matches vfs_listxattr()'s convention.
+ *
+ * Visibility is the matching handler's call: each name is emitted only
+ * if xattr_handler_can_list() allows it, which is how trusted.* stays
+ * hidden from callers without CAP_SYS_ADMIN (ext4 does the same inside
+ * its own listxattr walk). Before this the handlers' .list hooks were
+ * dead code -- this walk never consulted them, so an unprivileged
+ * getfattr saw trusted.* names while the handler comment claimed they
+ * were hidden. tests/kernel/xattr_semantics.sh asserts both directions.
  */
+static const struct xattr_handler *cetrafs_xattr_match_handler(const char *key)
+{
+    int i;
+
+    for (i = 0; cetrafs_xattr_handlers[i]; i++) {
+        const char *p = cetrafs_xattr_handlers[i]->prefix;
+
+        if (!strncmp(key, p, strlen(p)))
+            return cetrafs_xattr_handlers[i];
+    }
+    return NULL; /* unknown prefix: never listed (can_list(NULL) is false) */
+}
 ssize_t cetrafs_listxattr(struct dentry *dentry, char *list, size_t size)
 {
     struct inode *inode = d_inode(dentry);
@@ -377,6 +397,8 @@ ssize_t cetrafs_listxattr(struct dentry *dentry, char *list, size_t size)
         size_t len;
 
         if (cetrafs_xattr_slot_free(&arr[i]))
+            continue;
+        if (!xattr_handler_can_list(cetrafs_xattr_match_handler(arr[i].key), dentry))
             continue;
         len = strlen(arr[i].key) + 1; /* NUL included */
         if (list && size) {

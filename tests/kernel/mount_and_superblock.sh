@@ -25,6 +25,7 @@ ct_track mnt "$MNT"   # so an abort mid-suite still unmounts
 
 log "mounting"
 mount -t cetrafs "$LOOPDEV" "$MNT"
+require_cetrafs_mount "$MNT"
 MOUNTED=1
 
 # --- assertions ----------------------------------------------------------
@@ -178,6 +179,7 @@ umount "$MNT"
 MOUNTED=0
 DMESG_MARK2="$(dmesg_mark)"
 mount -t cetrafs "$LOOPDEV" "$MNT"
+require_cetrafs_mount "$MNT"
 MOUNTED=1
 
 REATTACH_LOG="$(dmesg_since "$DMESG_MARK2")"

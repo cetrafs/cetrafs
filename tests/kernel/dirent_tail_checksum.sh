@@ -45,6 +45,7 @@ else
 fi
 
 mount -t cetrafs "$G7_LOOPDEV" "$G7_MNT"
+require_cetrafs_mount "$G7_MNT"
 if ls "$G7_MNT" >/dev/null 2>&1; then
     fail "dirent tail: kernel readdir accepted a corrupted dirent block"
 else
@@ -54,6 +55,7 @@ umount "$G7_MNT"
 
 dd if="$G7_SAVED" of="$G7_IMG" bs=1 seek="$G7_TAIL_OFF" conv=notrunc status=none
 mount -t cetrafs "$G7_LOOPDEV" "$G7_MNT"
+require_cetrafs_mount "$G7_MNT"
 ls "$G7_MNT" >/dev/null 2>&1 && pass "dirent tail: restoring the tail restores normal operation" ||
     fail "dirent tail: still broken after restoring the original tail"
 umount "$G7_MNT"

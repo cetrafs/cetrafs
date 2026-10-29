@@ -31,6 +31,7 @@ G6_LOOPDEV="$(losetup --find --show "$G6_IMG")"
 G6_MNT="$(mktemp -d /tmp/cetrafs-g6-mnt-XXXXXX)"
 "$ROOT/userspace/mkfs.cetra" "$G6_LOOPDEV" -z 1 -b 512 -J 0 -N 1024 -f >/dev/null
 mount -t cetrafs "$G6_LOOPDEV" "$G6_MNT"
+require_cetrafs_mount "$G6_MNT"
 
 # Donor: a 1-block file with known content, synced so its block is real.
 printf 'DONORDONOR' >"$G6_MNT/donor"

@@ -702,6 +702,15 @@ static void fsck_mark_run(struct fsck_refctx *c, uint64_t phys, uint64_t len, ui
                 overlap_reported = 1;
             }
         } else {
+            /* CETRAFS_FSCK_DUMP_REFS=1: one line per block a live inode
+             * OWNS, with that inode. Intersecting it with a trace of
+             * what the online scrub freed is what turns "the scrub
+             * reclaimed N blocks" into "the scrub freed inode X's
+             * blocks". Marked here rather than in the bitmap sweep: the
+             * sweep's reference set also counts blocks merely QUEUED for
+             * a free, which are not owned by anybody. */
+            if (getenv("CETRAFS_FSCK_DUMP_REFS"))
+                fprintf(stderr, "REF: lba=%" PRIu64 " ino=%" PRIu64 "\n", phys + k, ino);
             FSCK_SET(c->refd, idx);
             (*c->blocks_referenced)++;
         }
@@ -828,6 +837,21 @@ int main(int argc, char **argv)
                 (uint64_t) cetrafs_le64(sb.total_blocks), total_blocks);
         return 1;
     }
+    /*
+     * fsck checked every structure in this filesystem except which
+     * VERSION of the filesystem it was looking at. A build handed a
+     * layout it does not understand reports the differences as damage,
+     * which is the worst possible answer from the tool an operator asks
+     * whether a volume is sound -- and the reason the 0x0008 -> 0x0009
+     * step exists at all (cetrafs.h). Checked here, in the same place
+     * and the same way the kernel checks it at mount.
+     */
+    if (cetrafs_le16(sb.version) < CETRAFS_VERSION_MIN || cetrafs_le16(sb.version) > CETRAFS_VERSION) {
+        fprintf(stderr, "ERR: format version 0x%04X: this build accepts 0x%04X..0x%04X\n",
+                (unsigned) cetrafs_le16(sb.version), (unsigned) CETRAFS_VERSION_MIN, (unsigned) CETRAFS_VERSION);
+        return 1;
+    }
+
     if (cetrafs_le64(sb.features_incompat) & ~CETRAFS_KNOWN_INCOMPAT) {
         fprintf(stderr,
                 "ERR: unsupported INCOMPAT feature bits 0x%" PRIx64
@@ -875,7 +899,18 @@ int main(int argc, char **argv)
 
         r[n++] = (typeof(r[0])) {"superblock", 0, 1};
         r[n++] = (typeof(r[0])) {"zone group table", cetrafs_le64(sb.zg_table_start), zg_cnt};
-        r[n++] = (typeof(r[0])) {"block group table", cetrafs_le64(sb.bg_table_start), bg_cnt};
+        /* the FIRST SEGMENT only. The Block Group table is a chain: the run at
+         * bg_table_start holds bg_table_first_count descriptors and the rest
+         * live in appended segments elsewhere, so block_group_count stopped
+         * being this region's length the moment a volume was grown
+         * (docs/internal/BG-OWNERSHIP-DESIGN.md). */
+        {
+            uint64_t first = cetrafs_le64(sb.bg_table_first_count);
+
+            if (!first || first > bg_cnt)
+                first = bg_cnt; /* never grown */
+            r[n++] = (typeof(r[0])) {"block group table", cetrafs_le64(sb.bg_table_start), first};
+        }
         r[n++] = (typeof(r[0])) {"inode bitmap", cetrafs_le64(sb.inode_bmap_start), cetrafs_le64(sb.inode_bmap_blocks)};
         r[n++] = (typeof(r[0])) {"inode table", cetrafs_le64(sb.inode_table_start), cetrafs_le64(sb.inode_table_blocks)};
         r[n++] = (typeof(r[0])) {"node registry", cetrafs_le64(sb.node_table_start), cetrafs_le64(sb.node_table_blocks)};
@@ -883,7 +918,44 @@ int main(int argc, char **argv)
                                  zg_cnt * (uint64_t) cetrafs_le32(sb.pending_free_blocks_per_zg)};
         r[n++] = (typeof(r[0])) {"per-node journals", cetrafs_le64(sb.node_journal_start),
                                  (uint64_t) cetrafs_le32(sb.node_table_count) * cetrafs_le32(sb.node_journal_blocks)};
-        r[n++] = (typeof(r[0])) {"block group regions", cetrafs_le64(sb.bg_regions_start), bg_cnt * cetrafs_le64(sb.bg_size_blocks)};
+        /* Bounding box, not a computed span, once a grow has left a
+         * hole where a superseded tail reserve was (cetrafs.h). */
+        {
+            uint64_t data_start = cetrafs_le64(sb.bg_regions_start);
+            uint64_t data_end = cetrafs_le64(sb.bg_data_end);
+
+            if (!data_end)
+                data_end = data_start + bg_cnt * cetrafs_le64(sb.bg_size_blocks);
+            if (data_end < data_start) {
+                fprintf(stderr, "ERR: layout: bg_data_end (%" PRIu64 ") precedes bg_regions_start (%" PRIu64 ")\n",
+                        data_end, data_start);
+                return 1;
+            }
+
+            /*
+             * The box must be at least big enough to HOLD its Block Groups.
+             *
+             * This is what the old contiguous-span model gave for free and
+             * the bounding box silently gave up: with the span, a carve
+             * placed one BG too low made the computed span reach past the
+             * tables and the overlap test caught it. The box is derived
+             * from the same carve, so a low carve just produces a smaller
+             * box that still "contains" its overlapping BGs -- and mounts.
+             * A grow test injecting exactly that found this.
+             *
+             * A hole only ever makes the box LARGER than the sum of its
+             * BGs, never smaller, so >= is the honest invariant. O(1), from
+             * the superblock alone: no BG table scan on the mount path.
+             */
+            if (data_end - data_start < bg_cnt * cetrafs_le64(sb.bg_size_blocks)) {
+                fprintf(stderr,
+                        "ERR: layout: data area [%" PRIu64 ",%" PRIu64 ") is too small for %" PRIu64
+                        " Block Group(s) of %" PRIu64 " blocks\n",
+                        data_start, data_end, bg_cnt, (uint64_t) cetrafs_le64(sb.bg_size_blocks));
+                return 1;
+            }
+            r[n++] = (typeof(r[0])) {"block group regions", data_start, data_end - data_start};
+        }
 
         /* A legitimately absent region (a zero-sized journal, no
          * pending-free reservation) is dropped rather than read as an
@@ -958,10 +1030,7 @@ int main(int argc, char **argv)
      * span of BG ids starting at 0 and covering all of them. (The
      * counts themselves are checked against the bitmaps by the content
      * pass, never cache-against-cache here -- see below.) */
-    uint32_t *zg_first = (uint32_t *) xcalloc(cetrafs_le32(sb.zone_group_count), sizeof(uint32_t));
-    uint32_t *zg_bgcount = (uint32_t *) xcalloc(cetrafs_le32(sb.zone_group_count), sizeof(uint32_t));
     uint32_t *zg_owner = (uint32_t *) xcalloc(cetrafs_le32(sb.zone_group_count), sizeof(uint32_t));
-    uint64_t next_expected_bg = 0;
 
     for (uint32_t z = 0; z < cetrafs_le32(sb.zone_group_count); ++z) {
         uint8_t blk[CETRAFS_BLOCK_SIZE] = {0};
@@ -972,7 +1041,7 @@ int main(int argc, char **argv)
             fprintf(stderr, "ERR: ZG id %u != %u\n", zg.zg_id, z);
             return 1;
         }
-        /* v0x0009: hot sector and cold remainder are checksummed
+        /* v0x0008: hot sector and cold remainder are checksummed
          * independently (cetrafs.h) -- verify both. */
         uint32_t zhot =
             crc32c_struct((const uint8_t *) &zg + CETRAFS_ZG_HOT_OFF, CETRAFS_ZG_HOT_LEN,
@@ -988,38 +1057,29 @@ int main(int argc, char **argv)
             fprintf(stderr, "ERR: ZG%u cold-region CRC mismatch\n", z);
             return 1;
         }
-        if ((uint64_t) cetrafs_le32(zg.first_bg_id) + cetrafs_le32(zg.bg_count) > cetrafs_le32(sb.block_group_count)) {
-            fprintf(stderr, "ERR: ZG%u BG span out of range\n", z);
-            return 1;
-        }
-        if (cetrafs_le32(zg.first_bg_id) != next_expected_bg) {
-            fprintf(stderr, "ERR: ZG%u first_bg_id %u != expected %" PRIu64 " (ZG<->BG spans must be contiguous)\n", z,
-                    zg.first_bg_id, next_expected_bg);
-            return 1;
-        }
-        next_expected_bg += cetrafs_le32(zg.bg_count);
-
-        zg_first[z] = cetrafs_le32(zg.first_bg_id);
-        zg_bgcount[z] = cetrafs_le32(zg.bg_count);
+        /* No span to check. A Zone Group no longer says which Block
+         * Groups are its members; the Block Groups say so themselves,
+         * and that mapping is validated below once they have been read
+         * (docs/internal/BG-OWNERSHIP-DESIGN.md). What used to be
+         * checked here -- that the spans were in range, contiguous, and
+         * tiled the whole Block Group space -- was a property of how
+         * mkfs laid them out, not of the format. */
         zg_owner[z] = cetrafs_le16(zg.owner_node_id);
     }
-    if (next_expected_bg != cetrafs_le32(sb.block_group_count)) {
-        fprintf(stderr, "ERR: ZG spans cover %" PRIu64 " BGs, expected all %u\n", next_expected_bg,
-                sb.block_group_count);
-        return 1;
-    }
 
-    /* Reverse lookup: which ZG owns BG b, per the spans just verified. */
+    /* Which Zone Group owns each Block Group, read from the Block
+     * Groups. Filled by the BG table pass below, which is the only
+     * thing that knows. */
     uint32_t *bg_owner_expected = (uint32_t *) xcalloc(cetrafs_le32(sb.block_group_count), sizeof(uint32_t));
-    for (uint32_t z = 0; z < cetrafs_le32(sb.zone_group_count); ++z) {
-        for (uint32_t i = 0; i < zg_bgcount[z]; ++i)
-            bg_owner_expected[zg_first[z] + i] = z;
-    }
     /* What each ZG's aggregate SHOULD be, accumulated in the content
      * pass from the bitmaps themselves rather than from the cached
      * per-BG numbers -- so a repair rebuilds it from the truth even
      * when several BG counters were wrong. */
     uint64_t *zg_free_truth = (uint64_t *) xcalloc(cetrafs_le32(sb.zone_group_count), sizeof(uint64_t));
+    /* What each ZG record's pool_free_blocks SHOULD be: the capacity of
+     * every UNOWNED Block Group sharded to it (bg %% zone_group_count --
+     * the mkfs assignment mapping, reused as the shard key). */
+    uint64_t *zg_pool_truth = (uint64_t *) xcalloc(cetrafs_le32(sb.zone_group_count), sizeof(uint64_t));
 
     /* Per-BG geometry, kept for the content passes at the end of main()
      * (extent overlap, bitmap-vs-reachability). Those need to map a
@@ -1031,17 +1091,124 @@ int main(int argc, char **argv)
      * what that BG's bitmap actually says -- see the check there. */
     uint64_t *bg_free_cached = (uint64_t *) xcalloc(cetrafs_le32(sb.block_group_count), sizeof(uint64_t));
 
+    /*
+     * Where each Block Group's descriptor actually lives.
+     *
+     * The table is a chain: the run at bg_table_start holds
+     * bg_table_first_count descriptors, and growing APPENDS segments
+     * rather than moving anything, so `bg_table_start + b` is right
+     * only for the first segment's ids
+     * (docs/internal/BG-OWNERSHIP-DESIGN.md). Resolved once here, with
+     * the chain validated as it is walked -- a loop, a bad magic or a
+     * short chain is corruption and is reported as such.
+     */
+    uint64_t *bg_desc_lba = (uint64_t *) xcalloc(cetrafs_le32(sb.block_group_count), sizeof(uint64_t));
+    {
+        uint32_t nbg = cetrafs_le32(sb.block_group_count), filled = 0, guard = 0;
+        uint64_t first = cetrafs_le64(sb.bg_table_first_count);
+        uint64_t seg_lba = cetrafs_le64(sb.bg_table_next);
+
+        if (!first || first > nbg)
+            first = nbg; /* never grown */
+        for (uint32_t b = 0; b < first && b < nbg; b++)
+            bg_desc_lba[b] = cetrafs_le64(sb.bg_table_start) + b;
+        filled = (uint32_t) first;
+
+        /* The WHOLE chain, not just until enough descriptors have been
+         * collected. Stopping at `filled == nbg` never follows the
+         * tail's `next`, so a chain that loops, or whose last link
+         * points past the volume or into metadata, read as clean --
+         * three injections that this check missed until they were
+         * actually tried. A dangling tail is corruption even when every
+         * descriptor is accounted for. */
+        while (seg_lba) {
+            cetrafs_bg_segment_t seg;
+
+            if (++guard > nbg + 1) {
+                fprintf(stderr, "ERR: Block Group table chain does not terminate\n");
+                return 1;
+            }
+            if (seg_lba >= total_blocks) {
+                fprintf(stderr, "ERR: Block Group table segment at %" PRIu64 " is past the end of the volume\n",
+                        seg_lba);
+                return 1;
+            }
+            pread_all(fd, &seg, sizeof(seg), (off_t) seg_lba * CETRAFS_BLOCK_SIZE);
+            if (cetrafs_le32(seg.magic) != CETRAFS_BGSEG_MAGIC) {
+                fprintf(stderr, "ERR: Block Group table segment at %" PRIu64 " has no magic\n", seg_lba);
+                return 1;
+            }
+            {
+                uint32_t scrc = crc32c_struct(&seg, sizeof(seg), offsetof(cetrafs_bg_segment_t, checksum),
+                                              sizeof(seg.checksum));
+                if ((uint32_t) cetrafs_le64(seg.checksum) != scrc) {
+                    fprintf(stderr, "ERR: Block Group table segment at %" PRIu64 " fails its checksum\n", seg_lba);
+                    return 1;
+                }
+            }
+            if (cetrafs_le32(seg.first_bg_id) != filled) {
+                fprintf(stderr, "ERR: Block Group table segment at %" PRIu64 " starts at id %u, expected %u\n",
+                        seg_lba, cetrafs_le32(seg.first_bg_id), filled);
+                return 1;
+            }
+            for (uint32_t i = 0; i < cetrafs_le32(seg.count); i++, filled++)
+                if (filled < nbg)
+                    bg_desc_lba[filled] = seg_lba + 1 + i;
+            if (filled > nbg) {
+                fprintf(stderr, "ERR: Block Group table chain describes %u Block Groups, more than the %u recorded\n",
+                        filled, nbg);
+                return 1;
+            }
+            seg_lba = cetrafs_le64(seg.next);
+        }
+        if (filled != nbg) {
+            fprintf(stderr, "ERR: Block Group table chain describes %u of %u Block Groups\n", filled, nbg);
+            return 1;
+        }
+    }
+
     /* BG table & regions monotonicity */
     uint64_t next = cetrafs_le64(sb.bg_regions_start);
     for (uint64_t b = 0; b < cetrafs_le32(sb.block_group_count); ++b) {
         uint8_t blk[CETRAFS_BLOCK_SIZE] = {0};
-        pread_all(fd, blk, sizeof(blk), (off_t) (cetrafs_le64(sb.bg_table_start) + b) * CETRAFS_BLOCK_SIZE);
+        pread_all(fd, blk, sizeof(blk), (off_t) bg_desc_lba[b] * CETRAFS_BLOCK_SIZE);
         cetrafs_block_group_t bg;
         memcpy(&bg, blk, sizeof(bg));
-        if (cetrafs_le64(bg.start_block) != next) {
-            fprintf(stderr, "ERR: BG%zu start %" PRIu64 " != expected %" PRIu64 "\n", (size_t) b,
-                    (uint64_t) cetrafs_le64(bg.start_block), (uint64_t) next);
+        /*
+         * Ordered and non-overlapping, NOT exactly adjacent.
+         *
+         * This used to require start_block == the end of the previous
+         * BG, which made contiguity a format invariant. It is not: each
+         * grow leaves a HOLE where its predecessor's tail reserve was
+         * (cetrafs.h's bg_data_end), so BG N+1 legitimately begins after
+         * a gap. A correctly grown volume failed here on its SECOND
+         * grow -- the fourth positional assumption this feature found,
+         * after the three in the region-layout block above and one in
+         * the kernel's own validator.
+         *
+         * What actually has to hold is that no two BGs overlap and none
+         * escapes the data area, and that is what is checked now.
+         */
+        if (cetrafs_le64(bg.start_block) < next) {
+            fprintf(stderr,
+                    "ERR: BG%zu start %" PRIu64 " overlaps the previous Block Group (which ends at %" PRIu64 ")\n",
+                    (size_t) b, (uint64_t) cetrafs_le64(bg.start_block), (uint64_t) next);
             return 1;
+        }
+        {
+            uint64_t data_end = cetrafs_le64(sb.bg_data_end);
+            uint64_t bg_end = cetrafs_le64(bg.start_block) + cetrafs_le64(bg.length_blocks);
+
+            if (!data_end)
+                data_end = cetrafs_le64(sb.bg_regions_start) +
+                           (uint64_t) cetrafs_le32(sb.block_group_count) * cetrafs_le64(sb.bg_size_blocks);
+            if (bg_end > data_end || cetrafs_le64(bg.start_block) < cetrafs_le64(sb.bg_regions_start)) {
+                fprintf(stderr,
+                        "ERR: BG%zu [%" PRIu64 ",+%" PRIu64 ") falls outside the data area [%" PRIu64 ",%" PRIu64 ")\n",
+                        (size_t) b, (uint64_t) cetrafs_le64(bg.start_block), (uint64_t) cetrafs_le64(bg.length_blocks),
+                        (uint64_t) cetrafs_le64(sb.bg_regions_start), data_end);
+                return 1;
+            }
         }
         if (bg.off_bg_header != 0) {
             fprintf(stderr, "ERR: BG%zu header off not 0\n", (size_t) b);
@@ -1087,13 +1254,22 @@ int main(int argc, char **argv)
             return 1;
         }
 
-        if (cetrafs_le16(bg.owner_zg) != bg_owner_expected[b]) {
-            fprintf(stderr, "ERR: BG%zu owner_zg %u != expected %u (per the ZG spans above)\n", (size_t) b, bg.owner_zg,
-                    bg_owner_expected[b]);
+        /* The Block Group's own record is the authority on who owns it.
+         * What can still be wrong is that it names a Zone Group that
+         * does not exist -- which would leave the Block Group
+         * unreachable by any node, and would index past every per-ZG
+         * array below. This replaces a comparison against the Zone
+         * Group spans, which no longer exist
+         * (docs/internal/BG-OWNERSHIP-DESIGN.md). */
+        if (cetrafs_le16(bg.owner_zg) != CETRAFS_BG_OWNER_FREE &&
+            cetrafs_le16(bg.owner_zg) >= cetrafs_le32(sb.zone_group_count)) {
+            fprintf(stderr, "ERR: BG%zu is owned by Zone Group %u, but only %u exist\n", (size_t) b,
+                    cetrafs_le16(bg.owner_zg), cetrafs_le32(sb.zone_group_count));
             return 1;
         }
+        bg_owner_expected[b] = cetrafs_le16(bg.owner_zg);
 
-        next += cetrafs_le64(bg.length_blocks);
+        next = cetrafs_le64(bg.start_block) + cetrafs_le64(bg.length_blocks);
     }
 
     /* NO structural "ZG aggregate == sum of its BGs" cross-check here any
@@ -1126,28 +1302,69 @@ int main(int argc, char **argv)
         return 1;
     }
 
-    /* Pending-free queues + per-node journals (version 0x0006): both
-     * regions sit between the node table and the BG regions, in that
-     * order, exactly as mkfs lays them out. */
-    if (cetrafs_le64(sb.pending_free_start) != cetrafs_le64(sb.node_table_start) + cetrafs_le64(sb.node_table_blocks) || cetrafs_le32(sb.pending_free_blocks_per_zg) == 0) {
-        fprintf(stderr, "ERR: pending-free queue region layout mismatch\n");
+    /*
+     * A zero-sized pending-free queue is broken however it is placed:
+     * every cross-node free would have nowhere to go.
+     */
+    if (cetrafs_le32(sb.pending_free_blocks_per_zg) == 0) {
+        fprintf(stderr, "ERR: pending-free queue has zero blocks per ZG\n");
         return 1;
     }
-    {
-        uint64_t pending_end = cetrafs_le64(sb.pending_free_start) + (uint64_t) cetrafs_le32(sb.pending_free_blocks_per_zg) * cetrafs_le32(sb.zone_group_count);
-        uint64_t j_end = pending_end;
 
-        if (sb.node_journal_blocks) {
-            if (cetrafs_le64(sb.node_journal_start) != pending_end) {
-                fprintf(stderr, "ERR: per-node journal region layout mismatch\n");
-                return 1;
-            }
-            j_end = cetrafs_le64(sb.node_journal_start) + (uint64_t) cetrafs_le32(sb.node_journal_blocks) * cetrafs_le32(sb.node_table_count);
-        }
-        if (j_end > cetrafs_le64(sb.bg_regions_start)) {
-            fprintf(stderr, "ERR: pending-free/journal regions overlap the BG regions\n");
+    /*
+     * Three adjacency checks used to live here: pending_free_start ==
+     * node_table_start + node_table_blocks, node_journal_start ==
+     * pending_end, and pending/journal ending before bg_regions_start.
+     * All three encoded the order mkfs happens to pack the prefix in as
+     * if it were an invariant of the FORMAT. It is not -- every region's
+     * location is a superblock field, and a GROWN volume has relocated
+     * its ZG table, BG table and pending-free region into a reserve at
+     * the end of the device, leaving the journals where they were
+     * (docs/internal/EXTENDFS-DESIGN.md). A correct grown volume failed
+     * all three.
+     *
+     * Nothing is lost: the sorted pairwise overlap pass above checks
+     * every region against every other and bounds each one by
+     * total_blocks, which is strictly stronger than three hand-picked
+     * adjacency equalities -- and it holds wherever the regions are.
+     * (The kernel's cetrafs_validate_layout() carried the same mistake
+     * in the shape of a `bg_regions_start >= 1+Z+B` check; both were
+     * found by the same grown image.)
+     */
+
+    /*
+     * The tail reserve, when a grow has created one: the relocated
+     * tables must actually live inside the region the superblock claims
+     * holds them. The overlap pass proves they do not collide with
+     * anything; this proves the superblock's own account of itself is
+     * self-consistent, so a half-written grow cannot read as clean.
+     */
+    if (cetrafs_le64(sb.tail_reserve_blocks)) {
+        uint64_t rs = cetrafs_le64(sb.tail_reserve_start);
+        uint64_t re = rs + cetrafs_le64(sb.tail_reserve_blocks);
+        uint64_t head = cetrafs_le64(sb.bg_table_next);
+
+        /*
+         * The reserve holds the Block Group table segment the last grow
+         * APPENDED -- nothing else. It used to hold relocated copies of
+         * the Zone Group table, the whole Block Group table and the
+         * pending-free region; none of those move any more, so checking
+         * that they live inside it is checking something that stopped
+         * being true (docs/internal/BG-OWNERSHIP-DESIGN.md).
+         */
+        if (re > total_blocks || rs == 0) {
+            fprintf(stderr, "ERR: tail reserve [%" PRIu64 ",+%" PRIu64 ") does not fit in total_blocks=%" PRIu64 "\n",
+                    rs, cetrafs_le64(sb.tail_reserve_blocks), total_blocks);
             return 1;
         }
+        if (!head) {
+            fprintf(stderr, "ERR: a tail reserve is recorded but the Block Group table chain is empty\n");
+            return 1;
+        }
+    } else if (cetrafs_le64(sb.layout_gen)) {
+        fprintf(stderr, "ERR: layout_gen is %" PRIu64 " but no tail reserve is recorded\n",
+                cetrafs_le64(sb.layout_gen));
+        return 1;
     }
     uint8_t *node_registered = (uint8_t *) xcalloc(cetrafs_le32(sb.node_table_count) ? cetrafs_le32(sb.node_table_count) : 1, 1);
     for (uint32_t n = 0; n < cetrafs_le32(sb.node_table_count); ++n) {
@@ -1351,7 +1568,13 @@ int main(int argc, char **argv)
                             cl_problems++;
                             continue;
                         }
-                        if (bg_owner_expected[fbg] != z) {
+                        if (bg_owner_expected[fbg] == CETRAFS_BG_OWNER_FREE) {
+                            fprintf(stderr,
+                                    "ERR: ZG%u pending-free entry %u names blocks in BG%" PRId64
+                                    ", which is owned by nobody\n",
+                                    z, e, fbg);
+                            cl_problems++;
+                        } else if (bg_owner_expected[fbg] != z) {
                             fprintf(stderr,
                                     "ERR: ZG%u pending-free entry %u names blocks in BG%" PRId64
                                     ", which belongs to ZG%u\n",
@@ -1799,6 +2022,11 @@ int main(int argc, char **argv)
 
                 if (marked && !is_refd) {
                     leaked++;
+                    /* CETRAFS_FSCK_DUMP_LEAKS=1: one line per leaked
+                     * block, for post-mortem correlation against traces
+                     * (who allocated it, who should have freed it). */
+                    if (getenv("CETRAFS_FSCK_DUMP_LEAKS"))
+                        fprintf(stderr, "LEAK: lba=%" PRIu64 "\n", bg_data_start[b] + i);
                     /* Nothing references it, so clearing the bit cannot
                      * lose anything -- the 128 MiB evict_inode class,
                      * which until now could only be recovered by
@@ -1862,7 +2090,7 @@ int main(int argc, char **argv)
                     uint8_t blk[CETRAFS_BLOCK_SIZE] = {0};
                     cetrafs_block_group_t bgd;
 
-                    pread_all(fd, blk, sizeof(blk), (off_t) (cetrafs_le64(sb.bg_table_start) + b) * CETRAFS_BLOCK_SIZE);
+                    pread_all(fd, blk, sizeof(blk), (off_t) bg_desc_lba[b] * CETRAFS_BLOCK_SIZE);
                     memcpy(&bgd, blk, sizeof(bgd));
                     bgd.free_data_blocks = cetrafs_cpu_to_le64(really_free);
                     bgd.checksum = 0;
@@ -1872,14 +2100,24 @@ int main(int argc, char **argv)
                     bgd.checksum = cetrafs_cpu_to_le64(crc32c_struct(&bgd, sizeof(bgd), offsetof(cetrafs_block_group_t, checksum),
                                                  sizeof(bgd.checksum)));
                     memcpy(blk, &bgd, sizeof(bgd));
-                    pwrite_all(fd, blk, sizeof(blk), (off_t) (cetrafs_le64(sb.bg_table_start) + b) * CETRAFS_BLOCK_SIZE);
+                    pwrite_all(fd, blk, sizeof(blk), (off_t) bg_desc_lba[b] * CETRAFS_BLOCK_SIZE);
                     repairs_made++;
                 }
             }
             /* Carry the corrected figure, so the ZG aggregate below is
              * rebuilt from repaired numbers rather than stale ones. */
             bg_free_cached[b] = really_free;
-            zg_free_truth[bg_owner_expected[b]] += really_free;
+            /* An unowned Block Group belongs to no Zone Group, so its
+             * free space is in nobody's aggregate -- and indexing
+             * zg_free_truth with CETRAFS_BG_OWNER_FREE would run off
+             * the end of an array sized by the Zone Group count. */
+            if (bg_owner_expected[b] != CETRAFS_BG_OWNER_FREE)
+                zg_free_truth[bg_owner_expected[b]] += really_free;
+            else
+                /* ...except in the sharded pool, which exists precisely
+                 * so that handed-back capacity is counted SOMEWHERE and
+                 * statfs does not shrink by 512 MiB per release. */
+                zg_pool_truth[b % cetrafs_le32(sb.zone_group_count)] += really_free;
 
             free(bmap);
         }
@@ -1896,17 +2134,30 @@ int main(int argc, char **argv)
 
             pread_all(fd, zblk, sizeof(zblk), (off_t) (cetrafs_le64(sb.zg_table_start) + z) * CETRAFS_BLOCK_SIZE);
             memcpy(&zg, zblk, sizeof(zg));
-            if (cetrafs_le64(zg.free_data_blocks) == zg_free_truth[z])
-                continue;
+            int agg_ok = cetrafs_le64(zg.free_data_blocks) == zg_free_truth[z];
+            int pool_ok = cetrafs_le64(zg.pool_free_blocks) == zg_pool_truth[z];
 
-            fprintf(stderr,
-                    "ERR: ZG%u aggregate free_data_blocks %" PRIu64 " != %" PRIu64
-                    " actually free in its Block Groups\n",
-                    z, (uint64_t) cetrafs_le64(zg.free_data_blocks), zg_free_truth[z]);
-            problems++;
+            if (agg_ok && pool_ok)
+                continue;
+            if (!pool_ok) {
+                fprintf(stderr,
+                        "ERR: ZG%u pool_free_blocks %" PRIu64 " != %" PRIu64
+                        " actually free in the unowned Block Groups sharded to it\n",
+                        z, (uint64_t) cetrafs_le64(zg.pool_free_blocks), zg_pool_truth[z]);
+                problems++;
+            }
+
+            if (!agg_ok) {
+                fprintf(stderr,
+                        "ERR: ZG%u aggregate free_data_blocks %" PRIu64 " != %" PRIu64
+                        " actually free in its Block Groups\n",
+                        z, (uint64_t) cetrafs_le64(zg.free_data_blocks), zg_free_truth[z]);
+                problems++;
+            }
             if (repair_mode && !repair_blocked) {
                 zg.free_data_blocks = cetrafs_cpu_to_le64(zg_free_truth[z]);
-                /* free_data_blocks is a HOT field (v0x0009): only the
+                zg.pool_free_blocks = cetrafs_cpu_to_le64(zg_pool_truth[z]);
+                /* free_data_blocks is a HOT field (v0x0008): only the
                  * hot half's checksum covers it. */
                 zg.hot_checksum = 0;
                 memcpy(zblk, &zg, sizeof(zg));
