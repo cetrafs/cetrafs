@@ -26,7 +26,9 @@ and `docs/` the long-form detail.
 | Integrity | Functional | CRC32C on every record and on the block tails of dirent, extent (leaf/interior) and xattr blocks (v0x000F), kernel-enforced on read with transient-tear retry; per-inode generation detects cross-node inode-number reuse |
 | Introspection | Functional | `/proc/fs/cetrafs/<device>/{info,properties,cluster,controls}` (`controls` is writable: per-mount defrag toggles and bounded cluster timing) |
 | Sparse-file APIs | Functional | `SEEK_HOLE`/`SEEK_DATA` and `FS_IOC_FIEMAP`, so `cp --sparse=auto`, `tar -S`, `qemu-img convert` and `filefrag` all work on a thin image |
-| Not built | — | Multi-extent (spanned-across-LUNs) volumes, snapshot/clone resignaturing, VAAI-style offload, special files (`mknod`), `O_TMPFILE`, POSIX ACLs |
+| Discard / `UNMAP` | **Not built** | No `FITRIM`, no `discard` mount option. Space freed in the filesystem stays mapped in a thin pool for the life of the volume. Designed, not implemented: `docs/DISCARD-DESIGN.md` |
+| Growing a volume | Functional, **OFFLINE only** | `growfs.cetra` extends the Block Group chain into space the device already has. It refuses while the volume is mounted anywhere, and that refusal is load-bearing: the tool relocates the Block Group table, which every mounted node reads from its cached superblock on the allocation path with no lock held. Growing without unmounting needs an RCU'd superblock swap, a `layout_gen` check on the heartbeat, and a node-registry capability gate; the registry half is in place (`live_grow_ready` in procfs), the other two are not |
+| Not built | — | Multi-extent (spanned-across-LUNs) volumes, snapshot/clone resignaturing, VAAI-style offload beyond ATS (no `XCOPY`, no `WRITE SAME`), special files (`mknod`), `O_TMPFILE`, POSIX ACLs |
 
 What is deferred and why -- along with the deployment requirements a
 cluster must satisfy -- is documented at cetrafs.com.
