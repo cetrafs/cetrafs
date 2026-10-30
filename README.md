@@ -90,6 +90,9 @@ In this repo:
 - `docs/TEST-SUITES.md` — what the automated test effort covers and the
   faults each tier exists to catch
 - `docs/TESTING.md`, `docs/LOGGING.md` — deployment test plan and logging
+- `docs/DISCARD-DESIGN.md` — returning freed space to a thin LUN
+  (UNMAP/discard): what to build and the two things that make it
+  dangerous. Not implemented yet
 
 ## Requirements
 
