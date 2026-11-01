@@ -1049,6 +1049,13 @@ retry:
 /* CAS context for cetrafs_write_vfs_inode()'s stat publish -- see the
  * commentary at its call site. 'written' carries the image the swap
  * actually landed, for the baseline update. */
+/* TEST ONLY: stall the stat publish's merge between reading the in-core
+ * size and acting on it, so a test can land a local extending write in
+ * that gap. */
+static unsigned int cetrafs_fd_merge_stall_ms;
+module_param_named(fd_merge_stall_ms, cetrafs_fd_merge_stall_ms, uint, 0644);
+MODULE_PARM_DESC(fd_merge_stall_ms, "TEST ONLY: widen the stat publish's read-to-merge window on i_size");
+
 struct cetrafs_vfs_stat_cas_ctx {
     struct inode *inode;
     u64 generation;   /* in-core identity; checked against the fd echo */
@@ -1057,7 +1064,14 @@ struct cetrafs_vfs_stat_cas_ctx {
     cetrafs_inode_t *shadow;
     struct cetrafs_stat_baseline base;
     cetrafs_inode_t *written;
+    /* The in-core values the LAST mutate run merged from, and what the
+     * merge made of them -- the adopt after a landed CAS works from
+     * these, never from inside the CAS. Index: CETRAFS_FD_F_*. */
+    u64 ours[4];
+    u64 merged[4];
 };
+
+enum { CETRAFS_FD_F_SIZE, CETRAFS_FD_F_BLOCKS, CETRAFS_FD_F_ATIME, CETRAFS_FD_F_MTIME };
 
 /*
  * The FILE-sector publish (CAS region 1). This is writeback's and
@@ -1096,36 +1110,41 @@ static int cetrafs_vfs_stat_cas_mutate(void *image, unsigned int len, void *priv
      * maximum (shrinking past a peer's extents orphans the tail; the one
      * legitimate shrinker, truncate, publishes through its own path
      * under the namespace lock with foreign users refused); times take
-     * the later. */
-#define CETRAFS_FD_MERGE64(field, ours_expr, write_ours) \
-    do {                                                 \
-        u64 ours = (u64) (ours_expr);                    \
-        u64 theirs = cetrafs_le64(rec.field);            \
-        u64 b = (u64) (ctx->base.field);                 \
-        u64 v = theirs;                                  \
-                                                         \
-        if (ours != b && theirs != b)                    \
-            v = max(ours, theirs);                       \
-        else if (ours != b)                              \
-            v = ours;                                    \
-        rec.field = cetrafs_cpu_to_le64(v);              \
-        write_ours(v);                                   \
+     * the later.
+     *
+     * The merge does NOT write the result back into the in-core inode.
+     * It used to, right here -- a value read from i_size a few
+     * instructions earlier, stored back with no lock the write path
+     * holds. An extending write landing in between was undone in core,
+     * and the next publish carried the regressed size to the device:
+     * the extent past it became a tail no size reaches (churn_oracle,
+     * "SIZE MISMATCH", 2026-11-01; tests/kernel/stat_publish_size_race.sh).
+     * cetrafs_vfs_stat_adopt() does it after the CAS lands, under the
+     * lock each field's local writers hold. */
+#define CETRAFS_FD_MERGE64(idx, field, ours_expr)  \
+    do {                                           \
+        u64 ours = (u64) (ours_expr);              \
+        u64 theirs, b, v;                          \
+                                                   \
+        if (cetrafs_fd_merge_stall_ms)             \
+            mdelay(cetrafs_fd_merge_stall_ms);     \
+        theirs = cetrafs_le64(rec.field);          \
+        b = (u64) (ctx->base.field);               \
+        v = theirs;                                \
+        if (ours != b && theirs != b)              \
+            v = max(ours, theirs);                 \
+        else if (ours != b)                        \
+            v = ours;                              \
+        rec.field = cetrafs_cpu_to_le64(v);        \
+        ctx->ours[idx] = ours;                     \
+        ctx->merged[idx] = v;                      \
     } while (0)
 
-#define CETRAFS_FD_SET_SIZE(v) i_size_write(inode, (loff_t) (v))
-#define CETRAFS_FD_SET_BLOCKS(v) (inode->i_blocks = (blkcnt_t) (v))
-#define CETRAFS_FD_SET_ATIME(v) inode_set_atime(inode, (time64_t) (v), 0)
-#define CETRAFS_FD_SET_MTIME(v) inode_set_mtime(inode, (time64_t) (v), 0)
+    CETRAFS_FD_MERGE64(CETRAFS_FD_F_SIZE, size, i_size_read(inode));
+    CETRAFS_FD_MERGE64(CETRAFS_FD_F_BLOCKS, blocks, inode->i_blocks);
+    CETRAFS_FD_MERGE64(CETRAFS_FD_F_ATIME, atime, inode_get_atime_sec(inode));
+    CETRAFS_FD_MERGE64(CETRAFS_FD_F_MTIME, mtime, inode_get_mtime_sec(inode));
 
-    CETRAFS_FD_MERGE64(size, i_size_read(inode), CETRAFS_FD_SET_SIZE);
-    CETRAFS_FD_MERGE64(blocks, inode->i_blocks, CETRAFS_FD_SET_BLOCKS);
-    CETRAFS_FD_MERGE64(atime, (u64) inode_get_atime_sec(inode), CETRAFS_FD_SET_ATIME);
-    CETRAFS_FD_MERGE64(mtime, (u64) inode_get_mtime_sec(inode), CETRAFS_FD_SET_MTIME);
-
-#undef CETRAFS_FD_SET_SIZE
-#undef CETRAFS_FD_SET_BLOCKS
-#undef CETRAFS_FD_SET_ATIME
-#undef CETRAFS_FD_SET_MTIME
 #undef CETRAFS_FD_MERGE64
 
     /* But a shadow's size/blocks never merge DOWN: they are the newest
@@ -1148,6 +1167,79 @@ static int cetrafs_vfs_stat_cas_mutate(void *image, unsigned int len, void *priv
     memcpy(ctx->written, &rec, sizeof(rec));
     cetrafs_inode_fd_to_image(image, &rec);
     return 0;
+}
+
+/*
+ * After a landed stat publish: take into core what the merge brought in
+ * from the device (a peer's size, blocks or times), and only that. A
+ * field the merge left at the in-core value is not touched at all --
+ * that store was the whole bug: a stale copy of i_size written back over
+ * a concurrent extending write.
+ *
+ * Each adopt runs under the lock that field's local writers hold, as a
+ * TRY: writeback cannot wait on them (fsync and close reach this with
+ * inode_lock already held), and must not move a value someone changed
+ * since the merge read it -- so it also requires the field to still be
+ * what the merge read. All local i_size writers hold inode_lock
+ * (write_end, truncate, fallocate, the O_DIRECT extension); i_blocks is
+ * moved by get_block under the exclusive invalidate_lock (write_begin,
+ * page_mkwrite, O_DIRECT, punch, defrag). Times: inode_lock covers
+ * write(2)'s update; page_mkwrite's has no lock to take -- a second of
+ * mtime, not data.
+ *
+ * A field NOT adopted keeps, as its baseline, the in-core value the
+ * merge started from instead of the published one -- so the next merge
+ * sees the device value as a change made elsewhere and keeps it (or the
+ * max, for size/blocks), and never takes the in-core lag as a shrink.
+ * That is done through 'written', which the caller then installs as the
+ * baseline.
+ */
+static void cetrafs_vfs_stat_adopt(struct inode *inode, struct cetrafs_vfs_stat_cas_ctx *ctx)
+{
+    cetrafs_inode_t *w = ctx->written;
+    bool need_ilock = false, need_blocks;
+    bool have_ilock = false, have_inval = false;
+    int i;
+
+    for (i = 0; i < 4; i++)
+        if (i != CETRAFS_FD_F_BLOCKS && ctx->merged[i] != ctx->ours[i])
+            need_ilock = true;
+    need_blocks = ctx->merged[CETRAFS_FD_F_BLOCKS] != ctx->ours[CETRAFS_FD_F_BLOCKS];
+
+    if (need_ilock)
+        have_ilock = inode_trylock(inode);
+    if (need_blocks)
+        have_inval = down_write_trylock(&inode->i_mapping->invalidate_lock);
+
+    if (ctx->merged[CETRAFS_FD_F_SIZE] != ctx->ours[CETRAFS_FD_F_SIZE]) {
+        if (have_ilock && (u64) i_size_read(inode) == ctx->ours[CETRAFS_FD_F_SIZE])
+            i_size_write(inode, (loff_t) ctx->merged[CETRAFS_FD_F_SIZE]);
+        else
+            w->size = cetrafs_cpu_to_le64(ctx->ours[CETRAFS_FD_F_SIZE]);
+    }
+    if (need_blocks) {
+        if (have_inval && (u64) inode->i_blocks == ctx->ours[CETRAFS_FD_F_BLOCKS])
+            inode->i_blocks = (blkcnt_t) ctx->merged[CETRAFS_FD_F_BLOCKS];
+        else
+            w->blocks = cetrafs_cpu_to_le64(ctx->ours[CETRAFS_FD_F_BLOCKS]);
+    }
+    if (ctx->merged[CETRAFS_FD_F_ATIME] != ctx->ours[CETRAFS_FD_F_ATIME]) {
+        if (have_ilock && (u64) inode_get_atime_sec(inode) == ctx->ours[CETRAFS_FD_F_ATIME])
+            inode_set_atime(inode, (time64_t) ctx->merged[CETRAFS_FD_F_ATIME], 0);
+        else
+            w->atime = cetrafs_cpu_to_le64(ctx->ours[CETRAFS_FD_F_ATIME]);
+    }
+    if (ctx->merged[CETRAFS_FD_F_MTIME] != ctx->ours[CETRAFS_FD_F_MTIME]) {
+        if (have_ilock && (u64) inode_get_mtime_sec(inode) == ctx->ours[CETRAFS_FD_F_MTIME])
+            inode_set_mtime(inode, (time64_t) ctx->merged[CETRAFS_FD_F_MTIME], 0);
+        else
+            w->mtime = cetrafs_cpu_to_le64(ctx->ours[CETRAFS_FD_F_MTIME]);
+    }
+
+    if (have_inval)
+        up_write(&inode->i_mapping->invalidate_lock);
+    if (have_ilock)
+        inode_unlock(inode);
 }
 
 /*
@@ -1285,6 +1377,7 @@ int cetrafs_write_vfs_inode(struct inode *inode)
          * leak, 2026-10-27). */
         cetrafs_inode_fd_published(inode, fd_seq);
         cetrafs_record_write_counted();
+        cetrafs_vfs_stat_adopt(inode, ctx); /* may point 'written' fields back at core: baseline only */
         cetrafs_inode_stat_baseline_set(inode, ctx->written);
         /* Adopt what we just stamped. The decode in lock.c already stops
          * this node mistaking its own publish for a peer's; this keeps
