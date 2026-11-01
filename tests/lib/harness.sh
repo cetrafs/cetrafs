@@ -208,7 +208,16 @@ ct_cleanup() {
         tac "$CT_REG" 2>/dev/null | while read -r k path; do
             [ "$k" = "$kind" ] || continue
             case "$k" in
-            dir) rmdir "$path" 2>/dev/null ;;
+            # A tracked dir is often used as scratch (a reference tree
+            # beside the mount), and rmdir alone left every one of those
+            # behind in /tmp after each gate. Remove its contents too --
+            # only for our own /tmp/cetrafs-* dirs, never a mountpoint,
+            # and never across into another filesystem.
+            dir) case "$path" in
+                 /tmp/cetrafs-*)
+                     mountpoint -q "$path" 2>/dev/null || rm -rf --one-file-system -- "$path" 2>/dev/null ;;
+                 *) rmdir "$path" 2>/dev/null ;;
+                 esac ;;
             file) rm -f "$path" 2>/dev/null ;;
             esac
         done

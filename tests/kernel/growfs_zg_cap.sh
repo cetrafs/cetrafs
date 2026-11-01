@@ -35,6 +35,7 @@ DEV="$(ct_sparse_dev 200000 growzgcap)"
 MNT="$(ct_mnt growzgcap)"
 POKE="$(ct_helper sb_poke)"
 DUMP="$(ct_tmp growzgcapdump)"
+ct_track file "$DUMP.dig"
 
 sbval() { sed -n "s/^$1=//p" "$DUMP" | head -1; }
 
