@@ -796,6 +796,7 @@ u64 cetrafs_journal_write_count(void);
 u64 cetrafs_bg_geom_read_count(void);
 u64 cetrafs_pf_drain_count(void);
 u64 cetrafs_giveback_block_count(void);
+u64 cetrafs_convert_leaf_full_count(void);
 u64 cetrafs_tree_block_count(void);
 u64 cetrafs_tree_read_count(void);
 u64 cetrafs_file_cache_reconcile_count(void);

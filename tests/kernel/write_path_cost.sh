@@ -188,9 +188,19 @@ os.fsync(fd); os.close(fd)
 PY
 B1="$(c giveback_blocks)"
 BD=$((B1 - B0))
-[ "$BD" -lt 500 ] &&
-    pass "cost: 3000 middle splits released $BD preallocated block(s) (<500)" ||
+# 3000 splits fill the first leaf (339 slots), so this reaches both
+# the one-slot case and the leaf-FULL case. The leaf-full case used to
+# keep the head and free the whole tail -- the rest of the 96 MiB
+# preallocation, ~24500 blocks -- without counting it, so this
+# assertion passed while the reservation was gone.
+[ "$BD" = 0 ] &&
+    pass "cost: 3000 middle splits released no preallocated block" ||
     fail "cost: 3000 middle splits released $BD preallocated block(s) -- the tree is not growing"
+# By the mapping, not st_blocks: the give-back never lowered i_blocks.
+FB="$(filefrag -v "$F" | awk -F: '$1 ~ /^ *[0-9]+$/ { split($4, l, " "); n += l[1] } END { print n + 0 }')"
+[ "$FB" -ge $((96 * 256)) ] &&
+    pass "cost: the file still maps its whole 96 MiB preallocation ($FB blocks)" ||
+    fail "cost: the file maps $FB blocks, less than its 96 MiB preallocation -- part of it was given back"
 
 # ------------------------------------------------- 8
 # A lookup must not scale with the file's fragmentation.

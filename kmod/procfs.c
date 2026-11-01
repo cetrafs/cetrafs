@@ -239,6 +239,7 @@ static int cetrafs_proc_info_show(struct seq_file *m, void *v)
     seq_printf(m, "pf_drop_runs: %llu\n", cetrafs_pf_drop_runs_count());
     seq_printf(m, "pf_drop_blocks: %llu\n", cetrafs_pf_drop_blocks_count());
     seq_printf(m, "giveback_blocks: %llu\n", cetrafs_giveback_block_count());
+    seq_printf(m, "convert_leaf_full: %llu\n", cetrafs_convert_leaf_full_count());
     seq_printf(m, "tree_blocks: %llu\n", cetrafs_tree_block_count());
     seq_printf(m, "tree_reads: %llu\n", cetrafs_tree_read_count());
     /* The remembered-extent hit rate. Exposed because throughput alone

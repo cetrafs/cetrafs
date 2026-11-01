@@ -38,6 +38,9 @@ require_cetrafs_mount "$MNT"
 # is what makes a leaf actually fill.
 ct_param_set alloc_run_blocks 1
 
+inf() { sed -n "s/^$1: //p" "/proc/fs/cetrafs/$PD/info"; }
+LF0="$(inf convert_leaf_full)"
+GB0="$(inf giveback_blocks)"
 F="$MNT/prealloc.bin"
 log "preallocate, then fragment it with scattered writes until leaves fill"
 python3 - "$F" <<'PY'
@@ -74,31 +77,37 @@ OUT="$(python3 - "$F" <<'PY'
 import os, sys
 fd = os.open(sys.argv[1], os.O_RDONLY)
 bad = 0
+z = bytes(4096)
 for i in range(0, 1500):
     d = os.pread(fd, 4096, i * 8192)
     if d != bytes([(i % 251) or 1]) * 4096:
         bad += 1
+    # the never-written block between: still preallocated, reads as zeros
+    if os.pread(fd, 4096, i * 8192 + 4096) != z:
+        bad += 1
 os.close(fd); print(bad)
 PY
 )"
-[ "$OUT" = "0" ] && pass "uninit convert: every written block reads back correctly" ||
+[ "$OUT" = "0" ] && pass "uninit convert: every written block reads back, every gap reads as zeros" ||
     fail "uninit convert: $OUT block(s) read back wrong -- data lost splitting preallocated extents"
 
 # fiemap coalesces adjacent extents, so filefrag's count says nothing
-# about how full a LEAF is. The leaf-full message is the direct
-# evidence that the path under test was actually entered -- without at
-# least one, every assertion here is vacuous.
-GB="$(dmesg | grep -c 'extent leaf full' || true)"
-[ "$GB" -ge 1 ] &&
-    pass "uninit convert: the full-leaf path was actually reached ($GB event(s))" ||
+# about how full a LEAF is. convert_leaf_full is the direct evidence
+# that the path under test was actually entered -- without at least
+# one, every assertion here is vacuous. (It used to count a dmesg line,
+# which also counted every earlier run's.)
+LF=$(($(inf convert_leaf_full) - LF0))
+[ "$LF" -ge 1 ] &&
+    pass "uninit convert: the full-leaf path was actually reached ($LF time(s))" ||
     fail "uninit convert: the full-leaf path was never reached -- this test proves nothing"
 
-# ...and it must stay a last resort. If it fires on a large fraction of
-# the writes the tree is not growing, which is the pathological slow
-# path the guest suffered.
-[ "$GB" -lt 150 ] &&
-    pass "uninit convert: the give-back path stayed rare ($GB events for 1500 writes)" ||
-    fail "uninit convert: give-back fired $GB times in 1500 writes -- the leaf is not growing"
+# ...and it must grow the tree, not give the preallocation back: a
+# give-back leaves the leaf full, so every later write takes the same
+# path, which is the pathological slow path the guest suffered.
+GB=$(($(inf giveback_blocks) - GB0))
+[ "$GB" = 0 ] &&
+    pass "uninit convert: no preallocated block was given back" ||
+    fail "uninit convert: $GB preallocated block(s) given back in 1500 writes -- the leaf is not growing"
 
 # ------------------------------------- the convert must be RUN-WISE
 # Converting one block per get_block call turned a 1 MiB guest write
