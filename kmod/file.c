@@ -3294,7 +3294,10 @@ static int cetrafs_get_block(struct inode *inode, sector_t iblock, struct buffer
         if (S_ISDIR(inode->i_mode)) {
             ret = cetrafs_dirent_block_init(sb, lba);
             if (ret) {
-                cetrafs_free_data_block(sb, lba);
+                /* -EUCLEAN: a live directory still lists it, so the bit
+                 * we just set is the truth -- keep it. */
+                if (ret != -EUCLEAN)
+                    cetrafs_free_data_block(sb, lba);
                 return ret;
             }
         }

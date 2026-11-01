@@ -191,65 +191,111 @@ static struct buffer_head *cetrafs_dirent_bread(struct super_block *sb, u64 lba)
  * Synchronous on purpose: this has to be on the device before the extent
  * that points at it is.
  */
-int cetrafs_dirent_block_init(struct super_block *sb, u64 lba)
+/*
+ * Does 'lba', which the allocator has just handed out as FREE, still
+ * belong to a live directory? 0 if nothing proves it does, -EUCLEAN if
+ * it does, -EIO if the question could not be answered.
+ *
+ * The answer drives a DESTRUCTIVE act -- the caller zeroes the block --
+ * so every input is read forced-fresh, in the direction that matters:
+ * a stale or merely cached read can only make a live block look free
+ * (rule 6). The block itself comes off the DEVICE: this used to inspect
+ * cetrafs_getblk_overwrite()'s buffer, which is never read, so on a
+ * cold cache it saw nothing at all.
+ *
+ * Dirent bytes alone prove nothing: freeing a block does not zero it,
+ * so a recycled block still carries its old directory's entries. In use
+ * means the block's '.' entry names a LIVE directory whose extent tree
+ * still lists this block. Only a directory's first block carries '.',
+ * and nothing in a later block names its owner (there is no back
+ * pointer in the format), so a later block is not covered: this is a
+ * check behind the allocator, which stays the authority.
+ */
+static int cetrafs_dirent_block_live_owner(struct super_block *sb, u64 lba)
 {
-    struct buffer_head *bh = cetrafs_getblk_overwrite(sb, lba);
+    struct buffer_head *bh = cetrafs_bread_uncached(sb, lba);
+    const cetrafs_dirent_t *d;
+    const cetrafs_extent_t *arr;
+    struct buffer_head *leaf = NULL;
+    cetrafs_inode_t r;
+    u64 self;
+    u32 n, i;
+    int ret = 0;
 
     if (!bh)
         return -EIO;
+    d = (const cetrafs_dirent_t *) bh->b_data;
+    if (!cetrafs_dirent_block_valid(bh) || cetrafs_le16(d[0].name_len) != 1 || d[0].name[0] != '.') {
+        brelse(bh);
+        return 0;
+    }
+    self = cetrafs_le64(d[0].inode);
+    brelse(bh);
 
-    {
-        /* Is this block really free? It is about to be zeroed as a
-         * brand-new directory block. If it already carries a valid
-         * dirent tail AND live entries, it still belongs to somebody:
-         * the allocator handed out a block that is in use, and zeroing
-         * it destroys every name in it -- files that are then gone on
-         * every node, with their inodes left allocated and unnamed. */
-        const cetrafs_dirent_t *_d = (const cetrafs_dirent_t *) bh->b_data;
-        unsigned int _e, _n = 0;
+    cetrafs_invalidate_raw_inode(sb, self);
+    if (!self || cetrafs_read_raw_inode(sb, self, &r) || !cetrafs_le32(r.nlink) || !S_ISDIR(cetrafs_le32(r.mode)) ||
+        cetrafs_le16(r.eh.eh_magic) != CETRAFS_EXT_MAGIC)
+        return 0;
 
-        if (cetrafs_dirent_block_valid(bh)) {
-            for (_e = 0; _e < CETRAFS_DIRENTS_PER_BLOCK; _e++)
-                if (_d[_e].inode)
-                    _n++;
-            /* Dirent bytes alone prove nothing: freeing a block does
-             * not zero it, so a recycled block still carries its old
-             * directory's entries. In use means the '.' entry names a
-             * LIVE directory that still lists this block. */
-            if (_n) {
-                u64 _self = cetrafs_le64(_d[0].inode);
-                cetrafs_inode_t _r;
+    if (cetrafs_le16(r.eh.eh_depth) == 0) {
+        arr = r.et.leaf;
+        n = min_t(u32, cetrafs_le16(r.eh.eh_entries), ARRAY_SIZE(r.et.leaf));
+    } else if (cetrafs_le16(r.eh.eh_depth) == 1) {
+        u64 leaf_lba = cetrafs_extent_phys_from_hilo(r.et.idx[0].ei_leaf_hi, r.et.idx[0].ei_leaf_lo);
 
-                cetrafs_invalidate_raw_inode(sb, _self);
-                if (_self && cetrafs_read_raw_inode(sb, _self, &_r) == 0 && cetrafs_le32(_r.nlink) != 0 &&
-                    S_ISDIR(cetrafs_le32(_r.mode))) {
-                    u16 _i;
-                    bool _listed = false;
+        if (!cetrafs_lba_run_is_data(sb, leaf_lba, 1))
+            return 0; /* not a tree that can list anything */
+        leaf = cetrafs_blk_tail_bread(sb, leaf_lba, CETRAFS_LEAF_TAIL_MAGIC, "extent leaf");
+        if (!leaf)
+            return -EIO; /* cannot prove the block free: do not zero it */
+        arr = (const cetrafs_extent_t *) (leaf->b_data + sizeof(cetrafs_extent_hdr_t));
+        n = min_t(u32, cetrafs_le16(((const cetrafs_extent_hdr_t *) leaf->b_data)->eh_entries),
+                  CETRAFS_EXT_BLOCK_MAX_LEAVES);
+    } else {
+        return 0;
+    }
 
-                    for (_i = 0; _i < cetrafs_le16(_r.eh.eh_entries) && _i < ARRAY_SIZE(_r.et.leaf); _i++) {
-                        u64 _p = cetrafs_extent_phys_from_hilo(_r.et.leaf[_i].ee_start_hi,
-                                                               _r.et.leaf[_i].ee_start_lo);
-                        u32 _l = cetrafs_extent_len(_r.et.leaf[_i].ee_len);
+    for (i = 0; i < n; i++) {
+        u64 p = cetrafs_extent_phys_from_hilo(arr[i].ee_start_hi, arr[i].ee_start_lo);
 
-                        if (lba >= _p && lba < _p + _l)
-                            _listed = true;
-                    }
-                    if (_listed)
-                        pr_err("dirent_block_init: block %llu is being zeroed as new, but LIVE directory "
-                               "ino=%llu (nlink=%u) still lists it and it holds %u name(s) -- the allocator "
-                               "handed out a block that is STILL IN USE\n",
-                               (unsigned long long) lba, (unsigned long long) _self,
-                               (unsigned int) cetrafs_le32(_r.nlink), _n);
-                }
-            }
+        if (lba >= p && lba - p < cetrafs_extent_len(arr[i].ee_len)) {
+            pr_err(
+                "dirent_block_init: block %llu was allocated as free, but LIVE directory ino=%llu "
+                "(nlink=%u) still lists it -- refusing to zero it, the block stays allocated (fsck)\n",
+                (unsigned long long) lba, (unsigned long long) self, (unsigned int) cetrafs_le32(r.nlink));
+            ret = -EUCLEAN;
+            break;
         }
     }
+    brelse(leaf);
+    return ret;
+}
+
+/*
+ * Returns -EUCLEAN when the block still belongs to a live directory: it
+ * is then left untouched AND must stay allocated -- the caller must not
+ * free it. The bitmap read FREE for a block an extent references, and
+ * keeping the bit set is the repair, in the safe direction: at worst a
+ * block the scrub reclaims later, never one shared by two directories.
+ */
+int cetrafs_dirent_block_init(struct super_block *sb, u64 lba)
+{
+    struct buffer_head *bh;
+    int ret;
+
+    ret = cetrafs_dirent_block_live_owner(sb, lba);
+    if (ret)
+        return ret;
+
+    bh = cetrafs_getblk_overwrite(sb, lba);
+    if (!bh)
+        return -EIO;
     memset(bh->b_data, 0, CETRAFS_BLOCK_SIZE);
     cetrafs_dirent_block_stamp(bh);
     cetrafs_bh_end_update(bh);
-    sync_dirty_buffer(bh);
+    ret = cetrafs_sync_buffer(bh); /* on the device before its extent: a failure is the caller's */
     brelse(bh);
-    return 0;
+    return ret;
 }
 
 /*
