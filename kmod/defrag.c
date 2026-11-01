@@ -113,6 +113,12 @@ static unsigned int cetrafs_defrag_step_delay_ms;
 module_param_named(defrag_step_delay_ms, cetrafs_defrag_step_delay_ms, uint, 0644);
 MODULE_PARM_DESC(defrag_step_delay_ms, "TEST ONLY: pause between defrag steps, with inode_lock dropped");
 
+/* TEST ONLY: pause after the last step, locks dropped, before the pass
+ * finishes its bookkeeping. */
+static unsigned int cetrafs_defrag_final_stall_ms;
+module_param_named(defrag_final_stall_ms, cetrafs_defrag_final_stall_ms, uint, 0644);
+MODULE_PARM_DESC(defrag_final_stall_ms, "TEST ONLY: pause after the last defrag step, with inode_lock dropped");
+
 /* The per-step shape re-check (length + density) happens to catch a
  * rewritten prefix too, because today's writers APPEND the new extent
  * and the array stops being in logical order. That makes the prefix
@@ -696,6 +702,10 @@ int cetrafs_defrag_inode(struct inode *inode, struct cetrafs_defrag_stats *out_s
                 cetrafs_defrag_inode_unlock(inode);
                 goto out_free_tail;
             }
+            /* The count the commit published, into core while this
+             * step still holds the locks every i_blocks writer takes --
+             * see the note after the loop. */
+            inode->i_blocks = cetrafs_le64(raw.blocks);
 
             /* The commit just published [0, step_end) on the new run.
              * Advance the cursor BEFORE anything below can fail:
@@ -771,14 +781,16 @@ int cetrafs_defrag_inode(struct inode *inode, struct cetrafs_defrag_stats *out_s
      * cetrafs_defrag_commit() as it published the next tree, so there is
      * nothing left to free here.
      *
-     * Carry the final block count into the IN-CORE inode: the commits
-     * updated the on-disk record, but inode->i_blocks still holds the
-     * pre-defrag value, and the VFS's writeback at close would otherwise
-     * write that stale count straight back over the record (a depth-2
-     * collapse frees meta blocks, so i_blocks must drop). 'raw' reflects
-     * the last commit. (Latent for depth-1->0 collapse before depth 2;
-     * harmless there only because i_blocks happened to match.) */
-    inode->i_blocks = cetrafs_le64(raw.blocks);
+     * The final block count reached the IN-CORE inode inside each
+     * step, under its locks (a depth-2 collapse frees meta blocks, so
+     * i_blocks must drop, or writeback carries the stale count back).
+     * It used to be stored HERE, from the last step's record, with both
+     * locks already dropped -- an append landing in this gap had its
+     * block counted by get_block and then uncounted, and the next
+     * publish took the short count to the device
+     * (tests/kernel/defrag_final_blocks.sh). */
+    if (cetrafs_defrag_final_stall_ms)
+        msleep(cetrafs_defrag_final_stall_ms); /* test-only: no lock held here */
     cetrafs_flush_dirty_free_counts(sb);
 
     stats.extents_after = CETRAFS_DIV_ROUND_UP(nblocks, (u64) CETRAFS_EXT_LEN_MASK);

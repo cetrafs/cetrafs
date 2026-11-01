@@ -727,6 +727,17 @@ int cetrafs_write_raw_inode_fd(struct super_block *sb, u64 ino, const cetrafs_in
              * growing-file hot path. */
             if (self)
                 cetrafs_inode_note_local_file_seq(self, ctx.stamped_seq);
+            /* ...and make it the stat merge's baseline. Every caller is
+             * a LOCAL rebuild (truncate, punch, fallocate, defrag, the
+             * nslock release) that also brings core to these values.
+             * Left at the previous publish, the next merge read this
+             * publish as a change made ELSEWHERE: a defrag that dropped
+             * the leaf's 8 sectors, then an append that added 8 back,
+             * left core equal to the stale baseline -- "unchanged" --
+             * and the merge adopted the defrag's count over the append
+             * (tests/kernel/defrag_final_blocks.sh). */
+            if (self)
+                cetrafs_inode_stat_baseline_set(self, src);
         }
         return ret;
     }
