@@ -89,8 +89,9 @@ static loff_t cetrafs_llseek(struct file *file, loff_t offset, int whence);
  * writeback that follows finds every buffer mapped, and an -ENOSPC
  * becomes the SIGBUS the caller can see.
  *
- * invalidate_lock (shared) is the other half: punch/truncate/fallocate
- * hold it EXCLUSIVELY while they drop the page cache and free blocks.
+ * invalidate_lock is the other half, and this takes it EXCLUSIVELY --
+ * see the note at the lock itself. punch/truncate/fallocate hold it
+ * exclusively too, while they drop the page cache and free blocks.
  * Without it a fault lands between those two steps, re-instantiates the
  * folio over extents that are about to disappear, and its buffers keep
  * pointing at blocks the allocator has since handed to another file --
@@ -4141,7 +4142,10 @@ static int cetrafs_setattr_locked(struct mnt_idmap *idmap, struct dentry *dentry
         /* Shrinking frees blocks whose folios a concurrent fault would
          * otherwise re-instantiate; growing changes the map a fault may
          * be allocating into. Both exclude faults -- see
-         * cetrafs_page_mkwrite(), which takes this shared. */
+         * cetrafs_page_mkwrite(), which takes this EXCLUSIVELY. Shared
+         * would exclude these two and not another fault, and two
+         * faults allocating at once is the lost update that cost 56
+         * blocks of a writer's data. */
         filemap_invalidate_lock(inode->i_mapping);
         if (attr->ia_size < i_size_read(inode))
             ret = cetrafs_truncate_shrink(inode, attr->ia_size);
