@@ -2720,7 +2720,7 @@ static int cetrafs_tree_append(struct inode *inode,
 
             one.ee_block = cetrafs_cpu_to_le32(iblock);
             one.ee_pad = 0;
-            one.ee_len = cetrafs_extent_pack_len(1, 0);
+            one.ee_len = cetrafs_extent_pack_len(1, uninit);
             cetrafs_extent_phys_to_hilo(lba, &one.ee_start_hi, &one.ee_start_lo);
 
             ret = cetrafs_alloc_block_anywhere(sb, &bg, &new_leaf);
@@ -2887,7 +2887,7 @@ static int cetrafs_tree_append(struct inode *inode,
 
             one.ee_block = cetrafs_cpu_to_le32(iblock);
             one.ee_pad = 0;
-            one.ee_len = cetrafs_extent_pack_len(1, 0);
+            one.ee_len = cetrafs_extent_pack_len(1, uninit);
             cetrafs_extent_phys_to_hilo(lba, &one.ee_start_hi, &one.ee_start_lo);
 
             ret = cetrafs_alloc_block_anywhere(sb, &bg, &new_leaf);
