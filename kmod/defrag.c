@@ -93,6 +93,15 @@ MODULE_PARM_DESC(defrag_fail_invalidate,
                  "TEST ONLY: make the post-commit page drop fail, exercising the forced-drop path");
 
 /*
+ * Test only: the next tree publish lands, but reports a failure -- the
+ * CAS whose timeout could not be settled (its re-read failed, or someone
+ * wrote the region meanwhile).
+ */
+static bool cetrafs_defrag_publish_lost_ack;
+module_param_named(defrag_publish_lost_ack, cetrafs_defrag_publish_lost_ack, bool, 0644);
+MODULE_PARM_DESC(defrag_publish_lost_ack, "TEST ONLY: the next defrag tree publish lands but reports -EIO");
+
+/*
  * Test-only: hold inode_lock open between steps for this long.
  *
  * The window the per-step re-check exists for is the gap where this
@@ -266,6 +275,7 @@ static int cetrafs_defrag_commit(struct inode *inode,
     cetrafs_inode_t old = *raw; /* names the OLD tree, freed after publish */
     u32 n = 0, i, cap = suffix_count + 8;
     u64 off, meta = 0;
+    bool verdict_old = false; /* a failed publish proven NOT to have landed */
     int ret;
 
     out = kvmalloc_array(cap, sizeof(*out), GFP_KERNEL);
@@ -296,6 +306,7 @@ static int cetrafs_defrag_commit(struct inode *inode,
     {
         u64 fd_seq;
 
+        verdict_old = false;
         cetrafs_inode_fd_pub_lock(inode);
         /*
          * Size and times come from the LIVE inode, read under the
@@ -316,13 +327,55 @@ static int cetrafs_defrag_commit(struct inode *inode,
         raw->mtime = cetrafs_cpu_to_le64((u64) inode_get_mtime_sec(inode));
         fd_seq = cetrafs_inode_fd_seq(inode);
         ret = cetrafs_write_raw_inode_fd(sb, inode->i_ino, raw, inode);
+        if (!ret && cetrafs_defrag_publish_lost_ack) {
+            cetrafs_defrag_publish_lost_ack = false;
+            ret = -EIO; /* test only, see the knob */
+        }
+        if (ret) {
+            /*
+             * A failed publish is not proof that nothing landed: a CAS
+             * whose timeout could not be settled returns an error with
+             * its outcome unknown. Freeing the new tree on the strength
+             * of the error alone leaves a record that may name it
+             * reading FREE to the allocator. Ask the record which tree
+             * it names -- under this mutex, so a landing is marked
+             * published exactly as a clean one is -- and free only what
+             * it provably does not name. If it cannot say, free
+             * neither: a leak the scrub reclaims, never a shared block.
+             */
+            cetrafs_inode_t *now = kmalloc(sizeof(*now), GFP_NOFS);
+            int vret = -ENOMEM;
+
+            if (now) {
+                cetrafs_invalidate_raw_inode(sb, inode->i_ino);
+                vret = cetrafs_read_raw_inode(sb, inode->i_ino, now);
+            }
+            if (!vret && !memcmp(&now->eh, &raw->eh, sizeof(now->eh)) && !memcmp(&now->et, &raw->et, sizeof(now->et))) {
+                pr_warn("defrag: ino=%llu publish reported %d but the record names the new tree -- keeping it\n",
+                        (unsigned long long) inode->i_ino, ret);
+                ret = 0;
+            } else if (!vret && !memcmp(&now->eh, &old.eh, sizeof(now->eh)) &&
+                       !memcmp(&now->et, &old.et, sizeof(now->et))) {
+                verdict_old = true;
+            } else {
+                pr_err("defrag: ino=%llu publish failed (%d) and the record names neither tree (%d) -- freeing "
+                       "neither, nor the copied data; what is unreferenced is a leak the scrub reclaims\n",
+                       (unsigned long long) inode->i_ino, ret, vret);
+            }
+            kfree(now);
+        }
         if (!ret)
             cetrafs_inode_fd_published(inode, fd_seq); /* this publish supersedes the overlaid shadow */
         cetrafs_inode_fd_pub_unlock(inode);
     }
     if (ret) {
-        cetrafs_tree_free_meta(inode, raw); /* undo the fresh tree */
+        if (verdict_old) {
+            cetrafs_tree_free_meta(inode, raw); /* provably unreferenced: undo the fresh tree */
+            *raw = old;
+            goto out;
+        }
         *raw = old;
+        ret = -ENOTRECOVERABLE; /* outcome unknown: the caller must free no destination block */
         goto out;
     }
     cetrafs_tree_free_meta(inode, &old); /* the old tree's meta is now unreferenced */
@@ -633,6 +686,12 @@ int cetrafs_defrag_inode(struct inode *inode, struct cetrafs_defrag_stats *out_s
             u64 freed_from = moved;
 
             ret = cetrafs_defrag_commit(inode, &raw, dst_base, step_end, nblocks, suffix, suffix_count);
+            if (ret == -ENOTRECOVERABLE) {
+                /* The record may name the new run: free none of it. */
+                cetrafs_defrag_inode_unlock(inode);
+                ret = -EIO;
+                goto out_done;
+            }
             if (ret) {
                 cetrafs_defrag_inode_unlock(inode);
                 goto out_free_tail;
