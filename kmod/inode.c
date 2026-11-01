@@ -1255,6 +1255,12 @@ static void cetrafs_vfs_stat_adopt(struct inode *inode, struct cetrafs_vfs_stat_
  * sector CAS; nlink by the namespace operations; in-core copies of those
  * are ADOPTED from the fresh read below so a stale local view re-syncs.
  */
+/* TEST ONLY: stall writeback's publish between its fresh record read and
+ * everything it does with it. */
+static unsigned int cetrafs_write_inode_read_stall_ms;
+module_param_named(write_inode_read_stall_ms, cetrafs_write_inode_read_stall_ms, uint, 0644);
+MODULE_PARM_DESC(write_inode_read_stall_ms, "TEST ONLY: widen the stat publish's read-to-adopt window");
+
 int cetrafs_write_vfs_inode(struct inode *inode)
 {
     struct super_block *sb = inode->i_sb;
@@ -1262,6 +1268,7 @@ int cetrafs_write_vfs_inode(struct inode *inode)
     cetrafs_inode_t *bufs; /* [0]=raw, [1]=shadow, [2]=written -- heap: 3 KiB of records */
     u32 my_node_id = 0;
     u64 fd_seq = 0;
+    bool ilocked = false;
     int ret;
 
     bufs = kmalloc(3 * sizeof(*bufs), GFP_NOFS);
@@ -1272,14 +1279,52 @@ int cetrafs_write_vfs_inode(struct inode *inode)
         return -ENOMEM;
     }
 
+    /*
+     * The namespace-domain fields this publish adopts below are moved
+     * locally only by operations that hold this inode's inode_lock
+     * (unlink/link/rmdir lock the victim, setattr runs under it, a
+     * directory's own count moves under its lock as the parent). Taking
+     * it BEFORE the fresh read makes the read include every one of them
+     * that has completed and excludes any still in flight, so adopting
+     * from it cannot put back a value one of them just changed. It
+     * used to be adopted unlocked, from a read made before the stale-
+     * owner check's I/O: an unlink in that gap had its nlink 0 put back
+     * to 1 in core, evict then freed nothing, and the inode leaked
+     * (tests/kernel/writeback_nlink_adopt.sh). TRY-lock: fsync and
+     * close reach this holding it already, and writeback must never
+     * wait on a writer -- without it the adopt is skipped, which only
+     * delays seeing a peer's change.
+     */
+    ilocked = inode_trylock(inode);
     cetrafs_invalidate_raw_inode(sb, inode->i_ino);
     ret = cetrafs_read_raw_inode(sb, inode->i_ino, &bufs[0]);
     if (ret)
         goto out;
+    if (cetrafs_write_inode_read_stall_ms)
+        msleep(cetrafs_write_inode_read_stall_ms);
 
     if (cetrafs_le64(bufs[0].generation) != cetrafs_inode_get_generation(inode)) {
         ret = -ESTALE; /* dead object for a reused number -- nothing of ours to write */
         goto out;
+    }
+
+    /* Adopt the namespace-domain truth in core (never write it): nlink
+     * is the accumulator only ns ops move; mode/uid/gid may have been
+     * chmod/chowned by a peer. Only under the lock -- see above. (This
+     * used to compare mode/uid/gid against the stat baseline first; the
+     * baseline is installed from the file-sector image, whose namespace
+     * fields are zero, so that compare had quietly stopped adopting
+     * anything but a root owner's uid/gid.) A type change is never
+     * adopted: apply() refuses it loudly, and this is no place for it. */
+    if (ilocked) {
+        if (((inode->i_mode ^ cetrafs_le32(bufs[0].mode)) & S_IFMT) == 0) {
+            set_nlink(inode, cetrafs_le32(bufs[0].nlink));
+            inode->i_mode = (umode_t) cetrafs_le32(bufs[0].mode);
+            i_uid_write(inode, cetrafs_le32(bufs[0].uid));
+            i_gid_write(inode, cetrafs_le32(bufs[0].gid));
+        }
+        inode_unlock(inode);
+        ilocked = false;
     }
 
     /* A record a LIVE other node holds exclusively locked is that node's
@@ -1298,20 +1343,10 @@ int cetrafs_write_vfs_inode(struct inode *inode)
         }
     }
 
-    /* Adopt the namespace-domain truth in core (never write it): nlink
-     * is the accumulator only ns ops move; mode/uid/gid may have been
-     * chmod/chowned by a peer. */
-    set_nlink(inode, cetrafs_le32(bufs[0].nlink));
     {
         struct cetrafs_stat_baseline b;
 
         if (cetrafs_inode_stat_baseline_get(inode, &b)) {
-            if ((u32) inode->i_mode == b.mode)
-                inode->i_mode = (umode_t) cetrafs_le32(bufs[0].mode);
-            if (i_uid_read(inode) == b.uid)
-                i_uid_write(inode, cetrafs_le32(bufs[0].uid));
-            if (i_gid_read(inode) == b.gid)
-                i_gid_write(inode, cetrafs_le32(bufs[0].gid));
             ctx->base = b;
         } else {
             pr_warn_ratelimited("ino=%llu: no stat baseline at writeback -- dropping dirt rather than guessing\n",
@@ -1398,6 +1433,8 @@ int cetrafs_write_vfs_inode(struct inode *inode)
 out_pub:
     cetrafs_inode_fd_pub_unlock(inode);
 out:
+    if (ilocked)
+        inode_unlock(inode);
     kfree(ctx);
     kfree(bufs);
     return ret;
