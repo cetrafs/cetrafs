@@ -2324,6 +2324,7 @@ int cetrafs_bg_reconcile_free_count(struct super_block *sb, u32 bg_id, s64 *out_
 struct cetrafs_bg_claim_ctx {
     u32 zg_id;
     u32 bg_id;
+    u64 seq; /* the count's ownership epoch on the image the claim landed on */
 };
 
 static int cetrafs_bg_claim_mutate(void *image, unsigned int len, void *priv)
@@ -2340,6 +2341,7 @@ static int cetrafs_bg_claim_mutate(void *image, unsigned int len, void *priv)
     if (cetrafs_le16(bg->owner_zg) != CETRAFS_BG_OWNER_FREE)
         return -EAGAIN;
 
+    ctx->seq = cetrafs_le64(bg->reconcile_seq);
     bg->owner_zg = cetrafs_cpu_to_le16((u16) ctx->zg_id);
     /* Same normalise-then-checksum as cetrafs_bg_count_mutate(): the
      * in-sector tail past the real fields is zero by construction, and
@@ -2602,6 +2604,15 @@ int cetrafs_bg_claim_free(struct super_block *sb, u32 zg_id, u32 *out_bg_id)
          * cetrafs_bg_adjust_free_blocks(), which reads owner_zg from
          * the cache on the allocation path. */
         cetrafs_bg_invalidate_cache(sb, b);
+        /* Ownership is entering this node's cache, so its count epoch
+         * must too -- BEFORE set_bg_owner() makes the Block Group
+         * allocatable, or the first deltas accrue under whatever epoch
+         * the array held (0 since mount) and every one is refused as a
+         * stale owner's: the count then stays "all free" while the Block
+         * Group fills, and the empty-release path takes it at its word
+         * (tests/kernel/bg_claim_epoch.sh). The ZG claim reconciles and
+         * the re-attach seeds; this path did neither. */
+        cetrafs_sb_set_bg_epoch(sb, b, ctx.seq);
         cetrafs_sb_set_bg_owner(sb, b, zg_id);
 
         /*
