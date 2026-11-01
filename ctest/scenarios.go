@@ -330,7 +330,7 @@ func RunLockSequential(clients []*Client, path string) (bool, error) {
 func RunModuleInfo(clients []*Client) (bool, error) {
 	fmt.Println("=== module info: which cetrafs.ko build is actually loaded on each node ===")
 
-	var buildIDs = map[string][]string{} // build_id -> client names reporting it
+	var buildIDs = map[string][]string{} // source hash -> client names reporting it
 	ok := true
 
 	for _, c := range clients {
@@ -341,8 +341,8 @@ func RunModuleInfo(clients []*Client) (bool, error) {
 			ok = false
 			continue
 		}
-		fmt.Printf("  %-12s loaded=%v via=%s build_id=%s ko_path=%s ko_sha256=%s ko_mod_time=%s\n",
-			c.Name, res.Loaded, res.LoadedBy, res.BuildID, res.KoPath, res.KoSHA256, res.KoModTime)
+		fmt.Printf("  %-12s loaded=%v via=%s version=%s build_id=%s ko_path=%s ko_sha256=%s ko_mod_time=%s\n",
+			c.Name, res.Loaded, res.LoadedBy, res.Version, res.BuildID, res.KoPath, res.KoSHA256, res.KoModTime)
 		if !res.Loaded {
 			fmt.Printf("  %-12s WARNING: no cetrafs module loaded, and it could not be loaded: %s\n",
 				c.Name, res.LoadErr)
@@ -354,20 +354,26 @@ func RunModuleInfo(clients []*Client) (bool, error) {
 			ok = false
 			continue
 		}
-		buildIDs[res.BuildID] = append(buildIDs[res.BuildID], c.Name)
+		src := moduleSourceID(res.Version)
+		if src == "" {
+			fmt.Printf("  %-12s WARNING: version %q has no source hash -- can't confirm source alignment\n", c.Name, res.Version)
+			ok = false
+			continue
+		}
+		buildIDs[src] = append(buildIDs[src], c.Name)
 	}
 
 	if len(buildIDs) > 1 {
-		fmt.Printf("FAIL: module info: nodes are running DIFFERENT builds:\n")
+		fmt.Printf("FAIL: module info: nodes are running modules built from DIFFERENT source:\n")
 		for id, names := range buildIDs {
-			fmt.Printf("  build_id=%s -> %v\n", id, names)
+			fmt.Printf("  source=%s -> %v\n", id, names)
 		}
 		return false, nil
 	}
 	if !ok {
 		return false, nil
 	}
-	fmt.Printf("PASS: module info: all %d node(s) report the same build-id\n", len(clients))
+	fmt.Printf("PASS: module info: all %d node(s) run modules built from the same source\n", len(clients))
 	return true, nil
 }
 
@@ -3487,6 +3493,20 @@ func RunMkfsGuard(clients []*Client) (bool, error) {
 // Unmounting on the way out matters too: leaving a half-configured
 // cluster mounted on a shared LUN is exactly the state that makes the
 // NEXT investigation harder.
+// moduleSourceID is the "+src.<hash>" suffix of the module version: a hash
+// of the source the module was compiled from (kmod/Makefile). Nodes on
+// different kernel builds cannot load one .ko, so two modules from the
+// same source differ in ELF build-id by necessity -- the source hash is
+// what says they implement the same protocol. "" when absent: a module
+// that cannot say what it was built from does not pass.
+func moduleSourceID(version string) string {
+	i := strings.LastIndex(version, "+src.")
+	if i < 0 || i+len("+src.") >= len(version) {
+		return ""
+	}
+	return version[i+len("+src."):]
+}
+
 func requireSameModuleBuild(clients []*Client) error {
 	fmt.Println("=== precondition: every node must be running the same cetrafs.ko ===")
 
@@ -3513,21 +3533,25 @@ func requireSameModuleBuild(clients []*Client) error {
 		case res.Version == "":
 			problems = append(problems,
 				fmt.Sprintf("%s reports no module version, so what it is RUNNING cannot be compared", c.Name))
+		case moduleSourceID(res.Version) == "":
+			problems = append(problems,
+				fmt.Sprintf("%s runs a module with no source hash in its version (%s) -- rebuild it", c.Name, res.Version))
 		default:
-			// Keyed on the LOADED module's version as well as the ELF
-			// build-id. The build-id alone proved insufficient: it
-			// compared equal across two nodes running different code,
-			// and ko_sha256 describes the FILE, which a node that was
-			// never reloaded is not running. The version string carries
-			// a hash of the source actually built, so a stale load
-			// shows up here as a mismatch instead of a green run whose
-			// failures make no sense.
-			builds[res.Version+" "+res.BuildID] = append(builds[res.Version+" "+res.BuildID], c.Name)
+			// Keyed on the SOURCE hash in the LOADED module's version.
+			// Not on the ELF build-id: nodes on different kernel builds
+			// need different .ko files, whose build-ids never match, and
+			// the build-id once compared equal across two nodes running
+			// different code anyway. Not on ko_sha256 either: that is
+			// the FILE, which a node never reloaded is not running. The
+			// source hash is read from what is loaded, so a stale load
+			// is still a mismatch here.
+			id := moduleSourceID(res.Version)
+			builds[id] = append(builds[id], c.Name)
 		}
 	}
 
 	if len(problems) == 0 && len(builds) == 1 {
-		fmt.Printf("  OK: all %d node(s) share one build\n", len(clients))
+		fmt.Printf("  OK: all %d node(s) run modules built from one source\n", len(clients))
 		return nil
 	}
 
@@ -3537,7 +3561,7 @@ func requireSameModuleBuild(clients []*Client) error {
 		msg.WriteString("    " + p + "\n")
 	}
 	for id, names := range builds {
-		msg.WriteString(fmt.Sprintf("    build=%s -> %v\n", id, names))
+		msg.WriteString(fmt.Sprintf("    source=%s -> %v\n", id, names))
 	}
 	msg.WriteString("  rebuild and reload the module on every node, then re-run")
 	return fmt.Errorf("%s", msg.String())

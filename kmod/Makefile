@@ -101,7 +101,16 @@ endif
 CETRAFS_SRCDIR := $(if $(src),$(src),$(CURDIR))
 CETRAFS_GIT_DESC := $(shell git -C $(CETRAFS_SRCDIR) describe --tags --always --dirty 2>/dev/null || echo unknown)
 CETRAFS_DIRTY_HASH := $(if $(findstring -dirty,$(CETRAFS_GIT_DESC)),.$(shell git -C $(CETRAFS_SRCDIR) diff HEAD 2>/dev/null | sha1sum | cut -c1-8),)
-CETRAFS_BUILD_VERSION := $(CETRAFS_GIT_DESC)$(CETRAFS_DIRTY_HASH)
+# What a multi-node test must compare is the SOURCE, not the binary: two
+# hypervisors on different kernel builds need two .ko files, which can
+# never share an ELF build-id, and the git stamp above only describes the
+# source when the building tree's git is current. So the stamp ends in a
+# hash of the bytes compiled: every module .c/.h, the on-disk format
+# header and this Makefile (its flags change code). modpost's
+# generated *.mod.c is per-kernel and left out. ctest's build gate keys
+# on this "+src." suffix (ctest/scenarios.go, moduleSourceID()).
+CETRAFS_SRC_HASH := $(shell cd $(CETRAFS_SRCDIR) && cat $$(ls *.c *.h Makefile | grep -v '\.mod\.c$$' | LC_ALL=C sort) ../include/cetrafs.h 2>/dev/null | sha1sum | cut -c1-12)
+CETRAFS_BUILD_VERSION := $(CETRAFS_GIT_DESC)$(CETRAFS_DIRTY_HASH)+src.$(CETRAFS_SRC_HASH)
 ccflags-y += -DCETRAFS_BUILD_VERSION=\"$(CETRAFS_BUILD_VERSION)\"
 
 KDIR ?= /lib/modules/$(shell uname -r)/build
