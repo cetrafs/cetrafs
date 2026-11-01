@@ -141,6 +141,10 @@ struct cetrafs_inode_info {
     u64 resv_next;      /* next free LBA of the run */
     u32 resv_remaining; /* blocks left in it */
     u32 resv_bg;        /* which BG they came from (for freeing) */
+    /* Length of the NEXT run to ask for: doubles each time the file
+     * streams through a whole run, back to the base after a jump or a
+     * close. See cetrafs_inode_next_run_len(). 0 = not started. */
+    u32 resv_run;
 
     /*
      * The same run, published to the mount so the background scrub can
@@ -396,13 +400,16 @@ void cetrafs_inode_drop_reservation(struct inode *inode)
     n = ci->resv_remaining;
     ci->resv_remaining = 0;
     ci->resv_next = 0;
+    ci->resv_run = 0;
     spin_unlock(&ci->resv_lock);
 
     /* Free FIRST, unpublish after: the span still covers these blocks
      * while we hand them back, so a scrub running concurrently skips
-     * them rather than racing us to free the same bits. */
-    while (n--)
-        cetrafs_free_data_block(sb, lba++);
+     * them rather than racing us to free the same bits. One extent
+     * free: the run is contiguous, inside one BG, and never cached
+     * (nothing was written to it). */
+    if (n)
+        cetrafs_free_data_extent(sb, lba, n);
 
     cetrafs_resv_unpublish(sb, &ci->resv_span);
 }
@@ -462,10 +469,42 @@ void cetrafs_inode_set_reservation(struct inode *inode, u64 next, u32 count, u32
      * bitmap-set at its first pass, and every block of a run the
      * allocator just handed out was FREE at that pass -- so none of them
      * can be a candidate in the cycle now running. */
-    while (old_n--)
-        cetrafs_free_data_block(sb, old_lba++);
+    if (old_n)
+        cetrafs_free_data_extent(sb, old_lba, old_n);
 
     cetrafs_resv_publish(sb, &ci->resv_span, next, count);
+}
+
+/*
+ * How long a run to ask for next, called when a write found no usable
+ * reservation. A file that consumed its whole previous run is
+ * streaming (a VM image filling, a copy): give it twice as much, up to
+ * 'max'. One that left blocks unused jumped elsewhere: back to 'base'.
+ *
+ * Two costs scale with the NUMBER of runs, not their length: one
+ * allocator pass each, and -- since the extent tree may not be edited
+ * while allocation bits are only cached (cetrafs_tree_append()) -- one
+ * synchronous bitmap write each. Growing the run is what keeps that
+ * second one off a streaming write's path: at 256 blocks it was one
+ * bitmap write per MiB, at the 4096-block cap one per 16 MiB. Small
+ * files never grow past 'base', so they do not tie up more space than
+ * before; the remainder is given back at every close.
+ */
+u32 cetrafs_inode_next_run_len(struct inode *inode, u32 base, u32 max)
+{
+    struct cetrafs_inode_info *ci = CETRAFS_I(inode);
+    u32 len;
+
+    if (max < base)
+        max = base;
+    spin_lock(&ci->resv_lock);
+    if (!ci->resv_run || ci->resv_remaining)
+        ci->resv_run = base;
+    else
+        ci->resv_run = min_t(u32, ci->resv_run * 2, max);
+    len = ci->resv_run;
+    spin_unlock(&ci->resv_lock);
+    return len;
 }
 
 void cetrafs_inode_stat_baseline_set(struct inode *inode, const cetrafs_inode_t *raw)
@@ -1028,6 +1067,7 @@ static void cetrafs_inode_identity_init_ci(struct cetrafs_inode_info *ci)
     ci->fd_seq = 0;
     ci->resv_next = 0;
     ci->resv_remaining = 0;
+    ci->resv_run = 0;
     ci->stat_baseline.valid = false;
     ci->resv_span.start = 0;
     ci->resv_span.count = 0;

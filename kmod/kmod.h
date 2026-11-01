@@ -741,6 +741,7 @@ int cetrafs_lock_release(struct inode *inode, struct file *file);
 void cetrafs_inode_drop_reservation(struct inode *inode);
 bool cetrafs_inode_take_reserved(struct inode *inode, u64 want_lba, u64 *out_lba);
 void cetrafs_inode_set_reservation(struct inode *inode, u64 next, u32 count, u32 bg);
+u32 cetrafs_inode_next_run_len(struct inode *inode, u32 base, u32 max);
 int cetrafs_lock_foreign_claim_exists(struct super_block *sb, u64 ino, u32 my_node_id, bool *out_exists);
 int cetrafs_lock_foreign_reader_exists(struct super_block *sb, u64 ino, u32 my_node_id, bool *out_exists);
 /* Both of the above from ONE forced-fresh read, for the three sites

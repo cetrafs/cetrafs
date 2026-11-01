@@ -3039,6 +3039,12 @@ static unsigned int cetrafs_alloc_run_blocks = 256;
 module_param_named(alloc_run_blocks, cetrafs_alloc_run_blocks, uint, 0644);
 MODULE_PARM_DESC(alloc_run_blocks, "blocks reserved per speculative allocation run (0 disables)");
 
+/* A streaming file's run doubles from alloc_run_blocks up to this --
+ * see cetrafs_inode_next_run_len(). */
+static unsigned int cetrafs_alloc_run_max_blocks = 4096;
+module_param_named(alloc_run_max_blocks, cetrafs_alloc_run_max_blocks, uint, 0644);
+MODULE_PARM_DESC(alloc_run_max_blocks, "largest speculative run a streaming file grows to, in blocks");
+
 static int cetrafs_get_block(struct inode *inode, sector_t iblock, struct buffer_head *bh_result, int create)
 {
     u32 want = 1, converted = 1;
@@ -3336,7 +3342,8 @@ static int cetrafs_get_block(struct inode *inode, sector_t iblock, struct buffer
              * the volume has no long free run left.
              */
             if (S_ISREG(inode->i_mode) && cetrafs_alloc_run_blocks) {
-                u32 got = cetrafs_alloc_run_after(sb, bg_id, lba + 1, cetrafs_alloc_run_blocks);
+                u32 want = cetrafs_inode_next_run_len(inode, cetrafs_alloc_run_blocks, cetrafs_alloc_run_max_blocks);
+                u32 got = cetrafs_alloc_run_after(sb, bg_id, lba + 1, want);
 
                 if (got)
                     cetrafs_inode_set_reservation(inode, lba + 1, got, bg_id);
