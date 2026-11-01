@@ -16,7 +16,10 @@
 #
 # It is a LEASE, not a flag, and that half matters just as much: a
 # repairer that is killed must not leave the volume unmountable
-# forever. Both halves are asserted below.
+# forever. Both halves are asserted below. A repairer renews its row on
+# a timer and observers watch hb_seq move (repair_claim_clock.sh), so a
+# LIVE claim here is one that is being renewed -- a fresh last_seen
+# alone proves nothing on hosts whose clocks disagree.
 #
 # Discrimination: remove the check from fill_super() and the mount with
 # a live claim in place succeeds.
@@ -38,13 +41,18 @@ require_cetrafs_mount "$MNT"
 pass "control: the volume mounts normally"
 ct_umount "$MNT"
 
-# 2. A live repair claim: state 2, refreshed just now.
+# 2. A live repair claim: state 2, renewed while the mount watches it.
+renewing() { ( for _ in $(seq 1 25); do "$NPOKE" "$IMG" 0 --beat >/dev/null 2>&1 || true; sleep 1; done ) & }
 "$NPOKE" "$IMG" 0 2 aa "$(date +%s)" >/dev/null 2>&1 ||
     fail "could not write a repair claim into registry row 0"
 blockdev --flushbufs "$DEV" 2>/dev/null || true
 
+renewing
+RENEW=$!
 RC=0
 mount -t cetrafs "$DEV" "$MNT" 2>/dev/null || RC=$?
+kill "$RENEW" 2>/dev/null || true
+wait "$RENEW" 2>/dev/null || true
 if [ "$RC" = 0 ]; then
     umount "$MNT" 2>/dev/null || true
     fail "the volume mounted while a repair claim was live -- a node and fsck -r would be writing it at once"
@@ -55,9 +63,11 @@ else
         pass "refused, though the kernel message was not in the last few lines"
 fi
 
-# 3. The lease side: a claim nobody is refreshing must stop blocking.
-"$NPOKE" "$IMG" 0 2 aa "$(( $(date +%s) - 3600 ))" >/dev/null 2>&1 ||
-    fail "could not backdate the repair claim"
+# 3. The lease side: a claim nobody is renewing must stop blocking --
+# even one stamped "just now", which is what a repairer killed a moment
+# ago leaves behind.
+"$NPOKE" "$IMG" 0 2 aa "$(date +%s)" >/dev/null 2>&1 ||
+    fail "could not write the dead repairer's claim"
 blockdev --flushbufs "$DEV" 2>/dev/null || true
 
 ct_mount "$DEV" "$MNT" &&
@@ -68,7 +78,11 @@ ct_umount "$MNT"
 # 4. The tools refuse each other through the same claim.
 "$NPOKE" "$IMG" 0 2 aa "$(date +%s)" >/dev/null 2>&1
 blockdev --flushbufs "$DEV" 2>/dev/null || true
+renewing
+RENEW=$!
 OUT="$("$ROOT/userspace/fsck.cetra" -r "$DEV" 2>&1 || true)"
+kill "$RENEW" 2>/dev/null || true
+wait "$RENEW" 2>/dev/null || true
 echo "$OUT" | grep -q "already being repaired" &&
     pass "fsck -r refuses a volume another repairer holds" ||
     fail "fsck -r ran against a volume with a live repair claim: $(echo "$OUT" | head -1)"

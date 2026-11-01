@@ -908,9 +908,9 @@ int cetrafs_node_my_uuid(u8 out[CETRAFS_NODE_UUID_LEN])
  * CETRAFS_NODE_STATE_REPAIR for the duration, which this reports and
  * fill_super() refuses to mount past.
  *
- * A LEASE, not a flag: last_seen is refreshed as the repair works, so a
- * repairer that was killed stops blocking the volume after the usual
- * staleness window instead of forever. A row whose checksum does not
+ * A LEASE, not a flag: the repairer renews hb_seq on a timer, so a
+ * repairer that was killed stops blocking the volume as soon as a probe
+ * sees its row stand still. A row whose checksum does not
  * verify is ignored -- garbage must not be able to make a volume
  * unmountable.
  *
@@ -921,7 +921,9 @@ int cetrafs_node_repair_claim_exists(struct super_block *sb, bool *out_exists, c
 {
     const cetrafs_superblock_t *raw_sb = cetrafs_sb_raw(sb);
     cetrafs_node_entry_t ne;
-    u32 count, idx;
+    u64 *seq_before;
+    u32 count, idx, claims = 0;
+    int ret = 0;
 
     *out_exists = false;
     if (!raw_sb)
@@ -929,28 +931,61 @@ int cetrafs_node_repair_claim_exists(struct super_block *sb, bool *out_exists, c
     count = cetrafs_le32(raw_sb->node_table_count);
     if (!count || count > CETRAFS_MAX_READER_NODES)
         return 0;
+    seq_before = kcalloc(count, sizeof(*seq_before), GFP_KERNEL);
+    if (!seq_before)
+        return -ENOMEM;
 
+    /*
+     * Live is decided by WATCHING hb_seq, which a repairer renews on a
+     * timer (CETRAFS_REPAIR_RENEW_SECS), never by comparing last_seen
+     * with this node's clock. That comparison let a node whose clock ran
+     * ahead of the repairer's by more than the staleness window mount in
+     * the middle of a repair, and kept a dead repairer's claim blocking
+     * every mount for as long as its last_seen lay in our future. The
+     * wait is paid only when a claim exists at all.
+     */
     for (idx = 0; idx < count; idx++) {
-        u64 age;
-        int ret = cetrafs_node_get_entry(sb, idx, &ne);
+        int r = cetrafs_node_get_entry(sb, idx, &ne);
 
-        if (ret == -EIO)
-            return ret; /* cannot verify: see the contract above */
-        if (ret)
-            continue;   /* a bad row is not a claim */
-        if (cetrafs_le32(ne.state) != CETRAFS_NODE_STATE_REPAIR)
+        if (r == -EIO) {
+            ret = r;
+            goto out; /* cannot verify: see the contract above */
+        }
+        if (r || cetrafs_le32(ne.state) != CETRAFS_NODE_STATE_REPAIR)
+            continue;                                  /* a bad row is not a claim */
+        seq_before[idx] = cetrafs_le64(ne.hb_seq) + 1; /* 0 means "not a claim" */
+        claims++;
+    }
+    if (!claims)
+        goto out;
+
+    pr_info("a repair claim is registered on this volume -- watching it %us to see whether its repairer is alive\n",
+            (unsigned int) CETRAFS_REPAIR_PROBE_SECS);
+    if (msleep_interruptible(CETRAFS_REPAIR_PROBE_SECS * 1000)) {
+        ret = -EINTR;
+        goto out;
+    }
+    for (idx = 0; idx < count; idx++) {
+        if (!seq_before[idx])
             continue;
-        age = ktime_get_real_seconds() - cetrafs_le64(ne.last_seen);
-        if ((s64) age > (s64) cetrafs_sb_stale_secs(sb))
-            continue; /* its lease ran out */
+        int r = cetrafs_node_get_entry(sb, idx, &ne);
+
+        if (r == -EIO) {
+            ret = r;
+            goto out;
+        }
+        if (r || cetrafs_le32(ne.state) != CETRAFS_NODE_STATE_REPAIR || cetrafs_le64(ne.hb_seq) + 1 == seq_before[idx])
+            continue; /* released, or not renewed: its repairer is gone */
         if (out_label && label_sz) {
             strscpy(out_label, ne.label, min(label_sz, sizeof(ne.label)));
             out_label[label_sz - 1] = 0;
         }
         *out_exists = true;
-        return 0;
+        break;
     }
-    return 0;
+out:
+    kfree(seq_before);
+    return ret;
 }
 
 int cetrafs_node_live_peer_exists(struct super_block *sb, const u8 *my_uuid, bool *out_exists)

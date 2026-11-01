@@ -25,18 +25,33 @@
 #ifndef CETRAFS_DEVUTIL_H
 #define CETRAFS_DEVUTIL_H
 
+#include <errno.h>
 #include <fcntl.h>
+#include <signal.h>
 #include <stdint.h>
 #include <stdio.h>
 #include <stdlib.h>
 #include <string.h>
 #include <sys/stat.h>
+#include <sys/time.h>
 #include <sys/types.h>
 #include <time.h>
 #include <unistd.h>
 
 #include "cetrafs.h"
 #include "crc32c.h"
+
+/* Sleep the whole interval. sleep() returns early on any signal, and a
+ * repair holds a SIGALRM timer for its renewals (below) -- a liveness
+ * probe cut short by one would conclude "nobody is beating" from a
+ * window too short to see a beat. */
+static inline void cetrafs_sleep_full(unsigned secs)
+{
+    struct timespec ts = {.tv_sec = (time_t) secs, .tv_nsec = 0};
+
+    while (nanosleep(&ts, &ts) != 0 && errno == EINTR)
+        ;
+}
 
 /* Returns 1 (and copies the mountpoint into 'where') if 'dev' is a block
  * device currently mounted on this system, 0 otherwise (including when
@@ -201,41 +216,74 @@ static inline int cetrafs_find_repair_claim(int fd,
                                             char *out_label,
                                             size_t label_sz)
 {
-    uint32_t count = cetrafs_le32(sb->node_table_count), idx;
+    uint32_t count = cetrafs_le32(sb->node_table_count), idx, ncand = 0;
+    cetrafs_node_entry_t *first;
+    int found = 0;
 
     if (!count || count > 4096)
         return 0;
+    first = (cetrafs_node_entry_t *) calloc(count, sizeof(*first));
+    if (!first)
+        return -1; /* cannot verify is not "nobody" */
 
-    for (idx = 0; idx < count; idx++) {
-        unsigned char blk[CETRAFS_BLOCK_SIZE];
-        cetrafs_node_entry_t ne;
-        uint32_t want;
-        long long age;
-        ssize_t got = pread(fd, blk, sizeof(blk), cetrafs_node_row_off(sb, idx));
-
-        if (got < 0)
-            return -1;
-        if (got != (ssize_t) sizeof(blk))
-            return 0; /* past the device end: a corrupt layout, not a claim */
-        memcpy(&ne, blk, sizeof(ne));
-        if (cetrafs_le32(ne.state) != CETRAFS_NODE_STATE_REPAIR)
-            continue;
-        want = (uint32_t) cetrafs_le64(ne.checksum);
-        ne.checksum = 0;
-        if (crc32c_struct(&ne, sizeof(ne), offsetof(cetrafs_node_entry_t, checksum), sizeof(ne.checksum)) != want)
-            continue; /* garbage must not be able to block a repair */
-        age = (long long) time(NULL) - (long long) cetrafs_le64(ne.last_seen);
-        if (age > (long long) CETRAFS_NODE_STALE_SECS)
-            continue; /* the repairer that wrote it is gone */
-        if (out_row)
-            *out_row = idx;
-        if (out_label && label_sz) {
-            memcpy(out_label, ne.label, label_sz - 1 < sizeof(ne.label) ? label_sz - 1 : sizeof(ne.label));
-            out_label[label_sz - 1] = 0;
+    /*
+     * Live is decided by WATCHING, as for a node: a repairer renews its
+     * row every CETRAFS_REPAIR_RENEW_SECS on a timer, so a claim whose
+     * hb_seq does not move over CETRAFS_REPAIR_PROBE_SECS belongs to a
+     * repairer that is gone. This compared last_seen with THIS machine's
+     * clock, which on skewed hosts let a second repair run beside a live
+     * one -- and kept a dead one's claim "live" for as long as its
+     * last_seen sat in our future. The wait is paid only when a claim
+     * exists at all.
+     */
+    for (int pass = 0; pass < 2 && !found; pass++) {
+        if (pass == 1) {
+            if (!ncand)
+                break;
+            fprintf(stderr, "a repair claim is registered; watching it %us to see whether its repairer is alive...\n",
+                    (unsigned) CETRAFS_REPAIR_PROBE_SECS);
+            fflush(stderr);
+            cetrafs_sleep_full(CETRAFS_REPAIR_PROBE_SECS);
+            posix_fadvise(fd, 0, 0, POSIX_FADV_DONTNEED); /* or the re-read is served from our cache */
         }
-        return 1;
+        for (idx = 0; idx < count; idx++) {
+            unsigned char blk[CETRAFS_BLOCK_SIZE];
+            cetrafs_node_entry_t ne;
+            uint32_t want;
+            ssize_t got = pread(fd, blk, sizeof(blk), cetrafs_node_row_off(sb, idx));
+
+            if (got < 0) {
+                free(first);
+                return -1;
+            }
+            if (got != (ssize_t) sizeof(blk))
+                break; /* past the device end: a corrupt layout, not a claim */
+            memcpy(&ne, blk, sizeof(ne));
+            if (cetrafs_le32(ne.state) != CETRAFS_NODE_STATE_REPAIR)
+                continue;
+            want = (uint32_t) cetrafs_le64(ne.checksum);
+            ne.checksum = 0;
+            if (crc32c_struct(&ne, sizeof(ne), offsetof(cetrafs_node_entry_t, checksum), sizeof(ne.checksum)) != want)
+                continue; /* garbage must not be able to block a repair */
+            if (pass == 0) {
+                first[idx] = ne;
+                ncand++;
+                continue;
+            }
+            if (cetrafs_le32(first[idx].state) != CETRAFS_NODE_STATE_REPAIR || ne.hb_seq == first[idx].hb_seq)
+                continue; /* not seen before, or not renewed: no live repairer here */
+            if (out_row)
+                *out_row = idx;
+            if (out_label && label_sz) {
+                memcpy(out_label, ne.label, label_sz - 1 < sizeof(ne.label) ? label_sz - 1 : sizeof(ne.label));
+                out_label[label_sz - 1] = 0;
+            }
+            found = 1;
+            break;
+        }
     }
-    return 0;
+    free(first);
+    return found;
 }
 
 /*
@@ -288,6 +336,8 @@ static inline unsigned cetrafs_probe_window(uint32_t max_advertised)
     return pi && 2 * pi + 5 > base ? 2 * pi + 5 : base;
 }
 
+static inline void cetrafs_repair_timer(int fd, const cetrafs_superblock_t *sb, uint32_t row, int on);
+
 /* Claim a row for this repairer. Returns the row, or -1 if none could
  * be taken (or the write failed) -- in which case the caller must not
  * proceed: an unclaimed repair is the thing being fixed. */
@@ -338,7 +388,7 @@ static inline int cetrafs_repair_claim(int fd, const cetrafs_superblock_t *sb, c
                     "no free or cleanly released registry row; watching for %us for one whose node is gone...\n",
                     cetrafs_probe_window(slowest));
             fflush(stderr);
-            sleep(cetrafs_probe_window(slowest));
+            cetrafs_sleep_full(cetrafs_probe_window(slowest));
             posix_fadvise(fd, 0, 0, POSIX_FADV_DONTNEED); /* or the re-read is served from our cache */
         }
         for (idx = 0; idx < count; idx++) {
@@ -381,6 +431,7 @@ static inline int cetrafs_repair_claim(int fd, const cetrafs_superblock_t *sb, c
              * claim does not exist as far as a mounting node is concerned. */
             if (fsync(fd) != 0)
                 return -1;
+            cetrafs_repair_timer(fd, sb, idx, 1); /* renewals from here until the release */
             return (int) idx;
         }
     }
@@ -409,12 +460,64 @@ static inline int cetrafs_repair_renew(int fd, const cetrafs_superblock_t *sb, u
     return 0;
 }
 
+/*
+ * The claim's renewals, on a timer: every CETRAFS_REPAIR_RENEW_SECS,
+ * whatever phase the repair is in. Renewing from the work loops left
+ * every other phase -- and the whole of growfs, which never renewed --
+ * without a heartbeat, so a long one let the lease lapse mid-repair and
+ * a node mount under it. pread/pwrite and the checksum are all the
+ * handler does, which is safe in a signal handler; the row is written
+ * by nobody else while the timer runs. A renewal that finds the row
+ * taken sets cetrafs_repair_lost for the work loop to stop on.
+ */
+static volatile sig_atomic_t cetrafs_repair_lost;
+static int cetrafs_renew_fd = -1;
+static cetrafs_superblock_t cetrafs_renew_sb;
+static uint32_t cetrafs_renew_row;
+
+static void cetrafs_repair_tick(int sig)
+{
+    int saved = errno;
+
+    (void) sig;
+    if (cetrafs_renew_fd >= 0 && cetrafs_repair_renew(cetrafs_renew_fd, &cetrafs_renew_sb, cetrafs_renew_row) != 0)
+        cetrafs_repair_lost = 1;
+    errno = saved;
+}
+
+static inline void cetrafs_repair_timer(int fd, const cetrafs_superblock_t *sb, uint32_t row, int on)
+{
+    struct itimerval it;
+    struct sigaction sa;
+
+    memset(&it, 0, sizeof(it));
+    memset(&sa, 0, sizeof(sa));
+    if (!on) {
+        setitimer(ITIMER_REAL, &it, NULL);
+        sa.sa_handler = SIG_DFL;
+        sigaction(SIGALRM, &sa, NULL);
+        cetrafs_renew_fd = -1;
+        return;
+    }
+    cetrafs_renew_sb = *sb;
+    cetrafs_renew_row = row;
+    cetrafs_renew_fd = fd;
+    sa.sa_handler = cetrafs_repair_tick;
+    sa.sa_flags = SA_RESTART;
+    sigemptyset(&sa.sa_mask);
+    sigaction(SIGALRM, &sa, NULL);
+    it.it_interval.tv_sec = CETRAFS_REPAIR_RENEW_SECS;
+    it.it_value.tv_sec = CETRAFS_REPAIR_RENEW_SECS;
+    setitimer(ITIMER_REAL, &it, NULL);
+}
+
 /* Give the volume back. Best effort by construction: if this never runs
  * -- a kill, a crash, a power cut -- the lease above expires on its own. */
 static inline void cetrafs_repair_release(int fd, const cetrafs_superblock_t *sb, uint32_t row)
 {
     unsigned char blk[CETRAFS_BLOCK_SIZE];
 
+    cetrafs_repair_timer(fd, sb, row, 0); /* no renewal may land after the release */
     if (cetrafs_repair_borrowed) {
         memcpy(blk, cetrafs_repair_saved, sizeof(blk)); /* put the registration back */
         cetrafs_repair_borrowed = 0;
@@ -558,7 +661,7 @@ static inline int cetrafs_find_live_peer(const char *dev,
                 "still heartbeating...\n",
                 dev, ncand, probe);
         fflush(stderr);
-        sleep(probe);
+        cetrafs_sleep_full(probe);
     }
 
     /*

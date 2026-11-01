@@ -134,6 +134,11 @@ static void fsck_repair_heartbeat(void)
 
     if (repair_row < 0 || repair_fd < 0)
         return;
+    if (cetrafs_repair_lost) {
+        /* The timer's renewal found the row taken (devutil.h). */
+        fprintf(stderr, "ERR: this repair's registry claim was taken away -- stopping before writing more\n");
+        exit(FSCK_EXIT_NOEXAM);
+    }
     now = time(NULL);
     if (last && now - last < 5)
         return;
@@ -1022,6 +1027,12 @@ int main(int argc, char **argv)
         repair_sb = sb;
         atexit(fsck_repair_release_atexit);
         printf("  claimed registry row %d for the duration of this repair\n", repair_row);
+        fflush(stdout);
+        /* Test knob only: a phase that does no inode work for this long,
+         * so a suite can see the claim renew on its timer regardless.
+         * Unset in every normal invocation. */
+        if (getenv("CETRAFS_TEST_REPAIR_HOLD_SECS"))
+            cetrafs_sleep_full((unsigned) atoi(getenv("CETRAFS_TEST_REPAIR_HOLD_SECS")));
     }
 
     {

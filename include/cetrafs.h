@@ -861,6 +861,14 @@ typedef struct {
  * block. */
 #define CETRAFS_PEER_PROBE_SECS (CETRAFS_HEARTBEAT_INTERVAL_SECS + 5)
 
+/* An offline repairer's registry claim (CETRAFS_NODE_STATE_REPAIR) is
+ * renewed -- hb_seq bumped -- on a timer this often, whatever phase the
+ * repair is in, and an observer judges it live by watching hb_seq move
+ * over CETRAFS_REPAIR_PROBE_SECS: three renewals, never a comparison of
+ * last_seen with the observer's own clock. */
+#define CETRAFS_REPAIR_RENEW_SECS 5
+#define CETRAFS_REPAIR_PROBE_SECS (3 * CETRAFS_REPAIR_RENEW_SECS)
+
 /* Hard cap on registry rows, set by cetrafs_inode_t.read_open_nodes being
  * a 64-bit presence mask. Enforced by mkfs on -M, so the mask can never
  * silently fail to represent a reader. Far beyond the handful of hosts
