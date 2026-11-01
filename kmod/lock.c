@@ -775,6 +775,17 @@ bool cetrafs_inode_peek_staged_record(struct inode *inode, cetrafs_inode_t *out)
     return true;
 }
 
+/* Forget a staged record that will never be published (a release that
+ * cannot proceed): left in place, the NEXT release on this inode would
+ * publish it as its own. */
+void cetrafs_inode_drop_staged_record(struct inode *inode)
+{
+    struct cetrafs_inode_info *ci = CETRAFS_I(inode);
+
+    ci->ns_staged = false;
+    ci->ns_staged_fd = false;
+}
+
 bool cetrafs_inode_take_staged_record(struct inode *inode, cetrafs_inode_t *out, bool *out_fd_too)
 {
     struct cetrafs_inode_info *ci = CETRAFS_I(inode);
@@ -1033,6 +1044,13 @@ static void cetrafs_inode_identity_init_ci(struct cetrafs_inode_info *ci)
     /* A slab object is recycled across identities; a remembered extent
      * carried over would map the PREVIOUS file's blocks. */
     ci->ext_valid = false;
+    /* Nor may a namespace operation's staged record: the next release
+     * would publish the previous file's image onto this one. The ctor
+     * runs this too, so a never-used object starts clean -- slab memory
+     * is not zeroed. */
+    ci->ns_staged = false;
+    ci->ns_staged_fd = false;
+    ci->ns_holder = NULL;
 }
 
 void cetrafs_inode_identity_init(struct inode *inode)

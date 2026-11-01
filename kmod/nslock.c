@@ -117,6 +117,15 @@ MODULE_PARM_DESC(nslock_release_fail, "TEST ONLY: namespace-lock releases do not
  * a test can make the heartbeat's deferred-release retry fire while a
  * local operation holds the lock.
  */
+/*
+ * Test-only: every read of the record inside a release fails, as a
+ * device error would. The deferred retry then has only what the
+ * release knew before it read anything.
+ */
+static bool cetrafs_nslock_release_read_fail;
+module_param_named(nslock_release_read_fail, cetrafs_nslock_release_read_fail, bool, 0644);
+MODULE_PARM_DESC(nslock_release_read_fail, "TEST ONLY: a namespace-lock release cannot read the record");
+
 static unsigned int cetrafs_nslock_hold_ms;
 module_param_named(nslock_hold_ms, cetrafs_nslock_hold_ms, uint, 0644);
 MODULE_PARM_DESC(nslock_hold_ms, "TEST ONLY: sleep this long holding each namespace lock just acquired");
@@ -421,9 +430,21 @@ void cetrafs_nslock_release(struct inode *inode)
     bool have_staged, staged_fd = false;
     int ret, attempt;
 
+    /* The identity the lock was taken on, for the deferred retry when
+     * nothing below gets as far as a fresh read of it. Deferring with 0
+     * made the retry's swap see a "reused number" (-ESTALE) and drop the
+     * entry -- leaving the lock on the record of a node that keeps
+     * beating, which stale-reclaim never touches. */
+    ctx.generation = cetrafs_inode_get_generation(inode);
+
     recs = kmalloc(2 * sizeof(*recs), GFP_NOFS);
     if (!recs) {
-        pr_err("nslock: ino=%llu release: out of memory -- leaving the lock for stale-reclaim\n",
+        /* Not "for stale-reclaim": that never comes while we beat. The
+         * retry is a pure lock-clear, so the staged update is lost --
+         * dropped here rather than published by some later release. */
+        cetrafs_inode_drop_staged_record(inode);
+        cetrafs_sb_nslock_defer(sb, inode->i_ino, ctx.generation);
+        pr_err("nslock: ino=%llu release: out of memory -- staged update lost, lock queued for retry\n",
                (unsigned long long) inode->i_ino);
         cetrafs_inode_ns_mutex_unlock(inode);
         return;
@@ -439,8 +460,13 @@ void cetrafs_nslock_release(struct inode *inode)
     ret = cetrafs_sb_get_node_id(sb, &ctx.my_node_id);
     if (ret) {
         /* Cannot even identify ourselves -- cannot safely touch the
-         * record. Leave the lock for stale-reclaim rather than guess. */
-        pr_err("nslock: ino=%llu release: no node id (%d) -- leaving lock\n", (unsigned long long) inode->i_ino, ret);
+         * record now. The retry pass asks again before it writes; the
+         * staged update is lost either way (see the OOM case above). */
+        if (have_staged)
+            pr_err("nslock: ino=%llu release: staged update lost\n", (unsigned long long) inode->i_ino);
+        cetrafs_sb_nslock_defer(sb, inode->i_ino, ctx.generation);
+        pr_err("nslock: ino=%llu release: no node id (%d) -- queued for retry\n", (unsigned long long) inode->i_ino,
+               ret);
         cetrafs_inode_ns_mutex_unlock(inode);
         kfree(recs);
         return;
@@ -487,7 +513,8 @@ void cetrafs_nslock_release(struct inode *inode)
      */
     for (attempt = 0; attempt < CETRAFS_NSLOCK_RELEASE_RETRIES; attempt++) {
         cetrafs_invalidate_raw_inode(sb, inode->i_ino);
-        ret = cetrafs_read_raw_inode(sb, inode->i_ino, &recs[0]);
+        ret = cetrafs_nslock_release_read_fail ? -EIO /* test-only, see the knob */
+                                               : cetrafs_read_raw_inode(sb, inode->i_ino, &recs[0]);
         if (!ret) {
             ctx.generation = cetrafs_le64(recs[0].generation);
             ctx.clobbered = CETRAFS_NODE_ID_NONE;
