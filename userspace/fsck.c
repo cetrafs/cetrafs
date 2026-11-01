@@ -2272,27 +2272,75 @@ int main(int argc, char **argv)
          * owner drains the queue. Count them as referenced here, or
          * every volume with a queued cross-node free would report
          * phantom leaks, and a warning that cries wolf is one nobody
-         * reads. */
-        uint64_t pending = 0;
+         * reads.
+         *
+         * A queued block that a file ALSO references is the opposite
+         * case and a fault: the drain consumes an entry before applying
+         * it, so an entry still queued has never been applied, and
+         * applying it frees a block a live file names -- the allocator
+         * then hands it to a second file. The reference wins; repair
+         * drops the entry (the drain's own way of consuming one: zero
+         * it), and any block of it nothing references is then an
+         * ordinary leak the pass below reclaims. A block queued twice
+         * is the same fault one drain later, and is treated the same. */
+        uint64_t pending = 0, queued_live = 0;
+        uint8_t *queued = (uint8_t *) xcalloc(bmwords, 1);
         if (sb.pending_free_start && sb.pending_free_blocks_per_zg) {
             for (uint32_t z = 0; z < cetrafs_le32(sb.zone_group_count); ++z) {
                 for (uint32_t qb = 0; qb < cetrafs_le32(sb.pending_free_blocks_per_zg); ++qb) {
                     uint8_t q[CETRAFS_BLOCK_SIZE];
                     uint64_t qlba = cetrafs_le64(sb.pending_free_start) + (uint64_t) z * cetrafs_le32(sb.pending_free_blocks_per_zg) + qb;
+                    int q_dirty = 0;
 
                     pread_all(fd, q, sizeof(q), (off_t) qlba * CETRAFS_BLOCK_SIZE);
                     for (uint32_t e = 0; e < CETRAFS_PENDING_FREE_PER_BLOCK; ++e) {
                         cetrafs_pending_free_t pe;
+                        uint64_t live_lba = 0;
+                        int live = 0;
 
                         memcpy(&pe, q + e * sizeof(pe), sizeof(pe));
                         if (!cetrafs_le64(pe.lba) || cetrafs_le32(pe.magic) != CETRAFS_PENDING_FREE_MAGIC || !cetrafs_le32(pe.count))
                             continue;
+                        /* Pass 1: does any block of this entry already
+                         * have an owner -- a file, or an earlier entry? */
+                        for (uint32_t k = 0; k < cetrafs_le32(pe.count) && !live; ++k) {
+                            uint64_t lba = cetrafs_le64(pe.lba) + k, ix = 0;
+
+                            for (uint32_t b = 0; b < cetrafs_le32(sb.block_group_count); ++b) {
+                                if (lba >= bg_data_start[b] && lba < bg_data_start[b] + bg_data_cnt[b]) {
+                                    ix += lba - bg_data_start[b];
+                                    if (FSCK_GET(refd, ix) || FSCK_GET(queued, ix)) {
+                                        live = 1;
+                                        live_lba = lba;
+                                    }
+                                    break;
+                                }
+                                ix += bg_data_cnt[b];
+                            }
+                        }
+                        if (live) {
+                            if (queued_live < 8)
+                                fprintf(stderr,
+                                        "ERR: block %" PRIu64 " is queued for free in Zone Group %u (entry %" PRIu64
+                                        "+%u) but is still in use -- draining the queue would free live data\n",
+                                        live_lba, z, (uint64_t) cetrafs_le64(pe.lba), cetrafs_le32(pe.count));
+                            queued_live++;
+                            problems++;
+                            if (repair_mode && !repair_blocked) {
+                                memset(q + e * sizeof(pe), 0, sizeof(pe));
+                                q_dirty = 1;
+                                repairs_made++;
+                                continue; /* dropped: its blocks are queued no longer */
+                            }
+                        }
+                        /* Pass 2: count it as queued. */
                         for (uint32_t k = 0; k < cetrafs_le32(pe.count); ++k) {
                             uint64_t lba = cetrafs_le64(pe.lba) + k, ix = 0;
 
                             for (uint32_t b = 0; b < cetrafs_le32(sb.block_group_count); ++b) {
                                 if (lba >= bg_data_start[b] && lba < bg_data_start[b] + bg_data_cnt[b]) {
                                     ix += lba - bg_data_start[b];
+                                    FSCK_SET(queued, ix);
                                     if (!FSCK_GET(refd, ix)) {
                                         FSCK_SET(refd, ix); /* queued, not leaked */
                                         pending++;
@@ -2303,9 +2351,12 @@ int main(int argc, char **argv)
                             }
                         }
                     }
+                    if (q_dirty)
+                        pwrite_all(fd, q, sizeof(q), (off_t) qlba * CETRAFS_BLOCK_SIZE);
                 }
             }
         }
+        free(queued);
 
         /* Reconcile what is referenced against what the bitmaps claim.
          * A block marked used but referenced by nothing is a leak; one

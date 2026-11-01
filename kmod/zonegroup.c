@@ -1427,10 +1427,13 @@ int cetrafs_zg_release_surplus(struct super_block *sb, u32 my_node_id)
  *
  * Crash safety: an appender syncs the entry before returning (a crash
  * before that loses the free -- a bounded leak, same class as crashing
- * before evict ever ran). The drain applies entries BEFORE zeroing the
- * queue block, and applying is idempotent (alloc.c's
- * cetrafs_apply_pending_free() only clears+counts a bit that's actually
- * set), so a crash between apply and consume re-applies harmlessly.
+ * before evict ever ran). The drain CONSUMES an entry (zeroes it, by
+ * CAS) before it applies it, so a crash between the two loses the free
+ * -- a leak the scrub reclaims -- and never applies one twice. Applying
+ * twice would NOT be harmless: cetrafs_apply_pending_free() clears any
+ * bit that is set, and by the second time the block may belong to a new
+ * file. The same ordering is why an entry still in the queue has never
+ * been applied, and why fsck refuses one that names a block in use.
  */
 
 static int cetrafs_zg_queue_span(struct super_block *sb, u32 zg_id, u64 *out_start, u32 *out_blocks)
