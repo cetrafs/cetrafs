@@ -426,6 +426,36 @@ static bool cetrafs_reattach_race_bump;
 module_param_named(reattach_race_bump, cetrafs_reattach_race_bump, bool, 0644);
 MODULE_PARM_DESC(reattach_race_bump, "TEST ONLY: bump our own fence_epoch mid re-attach, as a racing reclaimer would");
 
+/*
+ * Watch row 'idx' (as read into 'ne') for long enough that a node
+ * beating at its advertised interval must move hb_seq at least once:
+ * 0 if it did not, -EBUSY if it did. Two beats plus margin, the same
+ * window the userspace tools use (devutil.h's cetrafs_probe_window());
+ * the advertised interval is clamped so a corrupt row cannot park the
+ * mount for days.
+ */
+static int cetrafs_node_row_quiet(struct super_block *sb, u32 idx, const cetrafs_node_entry_t *ne)
+{
+    u32 pi = min_t(u32, cetrafs_le32(ne->hb_interval_secs), CETRAFS_HB_INTERVAL_MAX_SECS);
+    cetrafs_node_entry_t now;
+    u32 window;
+    int ret;
+
+    if (!pi)
+        pi = CETRAFS_HEARTBEAT_INTERVAL_SECS;
+    window = 2 * pi + 5;
+    pr_info(
+        "node registration: row %u carries this machine's identity and was not left cleanly -- watching it "
+        "%us to be sure no other machine is using it\n",
+        idx, window);
+    if (msleep_interruptible(window * 1000))
+        return -EINTR;
+    ret = cetrafs_read_node_entry(sb, idx, &now);
+    if (ret)
+        return ret;
+    return now.hb_seq == ne->hb_seq ? 0 : -EBUSY;
+}
+
 int cetrafs_node_register(struct super_block *sb,
                           u32 file_lock_mode,
                           u32 *out_node_id,
@@ -473,6 +503,29 @@ int cetrafs_node_register(struct super_block *sb,
             struct cetrafs_node_reattach_ctx ctx = {.uuid = my_uuid.b,
                                                     .hb_interval = cetrafs_heartbeat_interval_secs(sb),
                                                     .file_lock_mode = file_lock_mode};
+
+            /* Is the row ours because we LEFT it, or because another
+             * machine with our identity is using it right now? A clean
+             * departure (last_seen == 0) answers itself. Otherwise watch
+             * it: a previous incarnation of this machine that crashed
+             * never beats again, a live twin does. Taking a live twin's
+             * row makes two machines one node -- same Zone Groups, same
+             * allocations -- which nothing downstream can detect. Paid
+             * only on a mount after an unclean shutdown. */
+            if (ne.last_seen != 0) {
+                ret = cetrafs_node_row_quiet(sb, idx, &ne);
+                if (ret == -EBUSY) {
+                    pr_err(
+                        "node registration: row %u carries this machine's identity and is still heartbeating -- "
+                        "another machine has the same node UUID (a cloned VM, or firmware without a unique "
+                        "one). Refusing to mount as the same node; give one of them its own with "
+                        "cetrafs.node_uuid=<uuid>\n",
+                        idx);
+                    return ret;
+                }
+                if (ret)
+                    return ret;
+            }
 
             if (cetrafs_reattach_race_bump) /* test knob, see its MODULE_PARM_DESC */
                 cetrafs_node_fence_peer(sb, idx, "a test-forced concurrent reclaim (reattach_race_bump)");

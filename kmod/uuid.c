@@ -27,6 +27,22 @@ static void hash_to_uuid(const u8 *hash, char *uuid_str)
              hash[11], hash[12], hash[13], hash[14], hash[15]);
 }
 
+/*
+ * This node's identity in the Node Registry, set explicitly. Two
+ * machines with the same identity act as ONE node -- same row, same
+ * Zone Groups, same allocations -- and the DMI-derived default is not
+ * unique everywhere: a cloned VM keeps its SMBIOS UUID unless the
+ * hypervisor regenerates it, firmware ships placeholder UUIDs, and the
+ * fallback below hashes vendor/product/serial strings that boards often
+ * leave empty or generic. A mount that finds its own identity live on
+ * another machine refuses and names this parameter (node.c).
+ */
+static char *cetrafs_node_uuid;
+module_param_named(node_uuid, cetrafs_node_uuid, charp, 0444);
+MODULE_PARM_DESC(node_uuid,
+                 "This machine's node identity (a UUID); overrides the DMI-derived one, which is not "
+                 "unique on cloned VMs or on boards without a serial");
+
 const char *get_stable_machine_uuid(void)
 {
     /* +1: UUID_STRING_LEN (36) excludes the NUL -- a buffer of exactly
@@ -35,6 +51,16 @@ const char *get_stable_machine_uuid(void)
      * produced a UUID string too short for uuid_parse() to accept. */
     static char uuid_str[UUID_STRING_LEN + 1];
     const char *dmi_uuid;
+    uuid_t parsed;
+
+    if (cetrafs_node_uuid && *cetrafs_node_uuid) {
+        if (strlen(cetrafs_node_uuid) == UUID_STRING_LEN && !uuid_parse(cetrafs_node_uuid, &parsed)) {
+            strscpy(uuid_str, cetrafs_node_uuid, sizeof(uuid_str));
+            return uuid_str;
+        }
+        pr_err("node_uuid=%s is not a UUID -- refusing to guess an identity\n", cetrafs_node_uuid);
+        return NULL;
+    }
 
     dmi_uuid = dmi_get_system_info(DMI_PRODUCT_UUID);
     if (dmi_uuid && strlen(dmi_uuid) >= UUID_STRING_LEN) {
