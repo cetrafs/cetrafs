@@ -61,6 +61,20 @@ else
     fail "buffer protocol: hand-rolled buffer locking in: $(echo "$HAND" | xargs -n1 basename | tr '\n' ' ')"
 fi
 
+# sync_dirty_buffer() decides failure by looking at BH_Uptodate AFTER the
+# write, and this module's forced-fresh readers clear that bit
+# concurrently: a write that landed reads as -EIO (it failed
+# dir_concurrency on 2026-11-01), and a site that cannot trust the result
+# learns to ignore it -- which is how eight sites came to drop real write
+# errors. cetrafs_sync_buffer() reports BH_Write_EIO, the write's own
+# outcome; it lives in ioutil.c and is the only caller left.
+SDB="$(code_hits '[^_]sync_dirty_buffer\(' | cut -d: -f1 | sort -u | grep -v "/ioutil\.c$" || true)"
+if [ -z "$SDB" ]; then
+    pass "buffer protocol: no file outside ioutil.c calls sync_dirty_buffer()"
+else
+    fail "buffer protocol: sync_dirty_buffer() (its result comes from BH_Uptodate) in: $(echo "$SDB" | xargs -n1 basename | tr '\n' ' ')"
+fi
+
 log "checking every begin_update reaches exactly one end/abort"
 # P3's original question, kept because it is still worth asking -- just no
 # longer mistaken for the whole audit.

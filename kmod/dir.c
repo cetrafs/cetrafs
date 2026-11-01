@@ -1786,7 +1786,7 @@ static struct dentry *cetrafs_mkdir_locked(struct mnt_idmap *idmap,
      * consume) and on the real LUN a write is ~38 ms. */
     cetrafs_dirent_block_stamp(bh);
     cetrafs_bh_end_update(bh);
-    ret = sync_dirty_buffer(bh);
+    ret = cetrafs_sync_buffer(bh);
     brelse(bh);
     if (ret) {
         cetrafs_free_data_block(sb, lba);

@@ -109,8 +109,8 @@ static long cetrafs_bitmap_alloc_bit(struct super_block *sb, u64 bmap_lba, u64 n
                     cetrafs_bh_begin_update(bh);
                     *b |= (u8) (1u << bit);
                     cetrafs_bh_end_update(bh);
-                    if (sync)
-                        sync_dirty_buffer(bh);
+                    if (sync) /* no caller passes true today */
+                        (void) cetrafs_sync_buffer(bh);
                     brelse(bh);
                     return (long) idx;
                 }
@@ -259,8 +259,8 @@ static int cetrafs_bitmap_free_bit(struct super_block *sb, u64 bmap_lba, u64 nbl
     cetrafs_bh_begin_update(bh);
     *((u8 *) bh->b_data + byte) &= (u8) ~(1u << bit_in_byte);
     cetrafs_bh_end_update(bh);
-    if (sync)
-        sync_dirty_buffer(bh);
+    if (sync) /* no caller passes true today */
+        (void) cetrafs_sync_buffer(bh);
     brelse(bh);
 
     return 0;
@@ -305,8 +305,8 @@ static int cetrafs_bitmap_try_alloc_exact(struct super_block *sb,
     cetrafs_bh_begin_update(bh);
     *b |= (u8) (1u << bit_in_byte);
     cetrafs_bh_end_update(bh);
-    if (sync)
-        sync_dirty_buffer(bh);
+    if (sync) /* no caller passes true today */
+        (void) cetrafs_sync_buffer(bh);
     brelse(bh);
 
     return 0;
@@ -2692,7 +2692,7 @@ int cetrafs_bg_claim_free(struct super_block *sb, u32 zg_id, u32 *out_bg_id)
             cetrafs_bh_begin_update(wbh);
             cetrafs_bg_claim_mutate(wbh->b_data, CETRAFS_BLOCK_SIZE, &ctx);
             cetrafs_bh_end_update(wbh);
-            sync_dirty_buffer(wbh);
+            (void) cetrafs_sync_buffer(wbh); /* test-only path */
             brelse(wbh);
             ret = 0;
         } else {

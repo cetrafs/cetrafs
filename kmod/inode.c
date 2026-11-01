@@ -352,7 +352,9 @@ void cetrafs_invalidate_raw_inode(struct super_block *sb, u64 ino)
             ctrace("DIRTYREC ino=%llu mode=0%o size=%llu -- syncing a DIRTY record at invalidate\n",
                    (unsigned long long) ino, (unsigned int) cetrafs_le32(_r->mode),
                    (unsigned long long) cetrafs_le64(_r->size));
-            sync_dirty_buffer(bh);
+            if (cetrafs_sync_buffer(bh))
+                pr_err_ratelimited("ino=%llu: a dirty record could not be written back at invalidate\n",
+                                   (unsigned long long) ino);
         }
         brelse(bh);
     }

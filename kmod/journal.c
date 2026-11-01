@@ -167,7 +167,7 @@ static int cetrafs_journal_write_flag(struct super_block *sb, u64 area_start, bo
      * of this area skips them, so a failed write here must reach the
      * caller. Both callers already check -- it was this function that
      * reported success unconditionally. */
-    ret = sync_dirty_buffer(bh);
+    ret = cetrafs_sync_buffer(bh);
     if (ret)
         pr_err("journal: could not write the %s flag at %llu (%d)\n", dirty ? "DIRTY" : "CLEAN",
                (unsigned long long) area_start, ret);
@@ -675,7 +675,7 @@ write_target:
          * skip_consume path: a released slot is reused immediately, and
          * the next entry would overwrite this header.
          */
-        int werr = sync_dirty_buffer(bh);
+        int werr = cetrafs_sync_buffer(bh);
 
         if (werr) {
             pr_err("journal: target %llu failed to write (%d) -- txn %llu stays LIVE for replay\n",
@@ -712,7 +712,13 @@ write_target:
         if (jbh) {
             memset(jbh->b_data, 0, CETRAFS_BLOCK_SIZE);
             cetrafs_bh_end_update(jbh);
-            sync_dirty_buffer(jbh);
+            /* A consume that does not land leaves the entry live, which
+             * the replay guard makes harmless (below) -- but say so. */
+            if (cetrafs_sync_buffer(jbh))
+                pr_err(
+                    "journal: consume of slot %llu did not reach the device (entry stays; replay of it is "
+                    "harmless)\n",
+                    (unsigned long long) slot);
             brelse(jbh);
         } else {
             /* Failing to consume is safe, just loud: the entry stays
@@ -803,10 +809,9 @@ int cetrafs_journal_write_new_block(struct super_block *sb, struct buffer_head *
     }
 
     cetrafs_bh_end_update(bh);
-    sync_dirty_buffer(bh);
-    if (!buffer_uptodate(bh))
-        return -EIO;
-    return 0;
+    /* The result from the write itself, never from BH_Uptodate -- a
+     * forced-fresh reader may clear that concurrently (ioutil.c). */
+    return cetrafs_sync_buffer(bh);
 }
 
 /*
@@ -1159,7 +1164,7 @@ int cetrafs_journal_replay_node(struct super_block *sb, u32 node_id, bool wait_f
             cetrafs_bh_begin_update(tbh);
             memcpy(tbh->b_data, pbh->b_data, CETRAFS_BLOCK_SIZE);
             cetrafs_bh_end_update(tbh);
-            werr = sync_dirty_buffer(tbh);
+            werr = cetrafs_sync_buffer(tbh);
             if (werr) {
                 /* Do NOT consume this entry and do NOT park the area
                  * CLEAN: the redo did not land, and the entry is the
@@ -1191,7 +1196,7 @@ consume:
         cetrafs_bh_begin_update(hbh);
         memset(hbh->b_data, 0, CETRAFS_BLOCK_SIZE);
         cetrafs_bh_end_update(hbh);
-        if (sync_dirty_buffer(hbh))
+        if (cetrafs_sync_buffer(hbh))
             /* Safe, just loud, and the same reasoning as the write
              * path's consume: the entry stays live and replay verifies
              * prev_checksum before applying anything, so a re-apply

@@ -4341,7 +4341,7 @@ static int cetrafs_fsync_one_block(struct super_block *sb, u64 lba)
 
     if (bh) {
         if (buffer_dirty(bh))
-            ret = sync_dirty_buffer(bh);
+            ret = cetrafs_sync_buffer(bh);
         brelse(bh);
     }
     return ret;
