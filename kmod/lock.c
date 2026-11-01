@@ -2695,6 +2695,48 @@ static int cetrafs_lock_explicit_acquire(struct inode *inode, struct file *file)
         };
 
         ret = cetrafs_lock_cas(inode, &ctx, &raw);
+        if (ret == -ETXTBSY) {
+            /*
+             * Held. If its holder is DEAD, nothing will ever release it:
+             * the open path steps past a stale holder, but a holder that
+             * died after this fd was opened left a blocking LOCK_EX
+             * polling for ever -- the migration orchestrator's case when
+             * the source host dies. Do what the open path does: fence
+             * the holder, replay its journal (it may have died mid-write
+             * on this very file), then displace exactly that holder's
+             * claim and no other.
+             */
+            u32 owner;
+            bool stale = false;
+
+            cetrafs_invalidate_raw_inode(sb, inode->i_ino);
+            ret = cetrafs_read_raw_inode(sb, inode->i_ino, &raw);
+            if (ret)
+                goto out;
+            owner = cetrafs_le32(raw.lock_owner_node);
+            if (cetrafs_le32(raw.lock_mode) != CETRAFS_LOCK_EXCLUSIVE || owner == my_node_id ||
+                cetrafs_node_is_stale(sb, owner, &stale) != 0 || !stale) {
+                ret = -ETXTBSY; /* a live holder (or it just let go): keep waiting */
+                goto out;
+            }
+            cetrafs_node_fence_peer(sb, owner, "a file lock (flock)");
+            ret = cetrafs_journal_replay_node(sb, owner, /*wait_for_claim=*/false);
+            if (ret) {
+                pr_err("flock: ino=%llu could not replay stale node %u's journal (%d) -- not taking its lock\n",
+                       (unsigned long long) inode->i_ino, owner, ret);
+                goto out;
+            }
+            pr_warn("flock: ino=%llu reclaiming a stale lock from node %u\n", (unsigned long long) inode->i_ino,
+                    owner);
+            cetrafs_invalidate_raw_inode(sb, inode->i_ino);
+            ret = cetrafs_read_raw_inode(sb, inode->i_ino, &raw);
+            if (ret)
+                goto out;
+            ctx.generation = cetrafs_le64(raw.generation);
+            ctx.allow_steal = true;
+            ctx.steal_from = owner;
+            ret = cetrafs_lock_cas(inode, &ctx, &raw);
+        }
         if (ret)
             goto out;
     }
