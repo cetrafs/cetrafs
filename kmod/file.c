@@ -6,6 +6,7 @@
 #include <linux/delay.h>
 #include <linux/falloc.h>
 #include <linux/fiemap.h>
+#include <linux/sort.h>
 #include <linux/fs.h>
 #include <linux/highmem.h>
 #include <linux/kernel.h>
@@ -603,21 +604,13 @@ void cetrafs_inode_extents_put(struct cetrafs_inode_extents *ex)
  * **The extent array is NOT sorted.** cetrafs_leaf_array_insert()
  * appends and only ever merges with the LAST entry, so a file written
  * at descending offsets has its extents in the order they were created,
- * not in logical order. Both scans below therefore consider every entry
- * rather than stopping at the first match -- assuming order here would
- * give confidently wrong answers on exactly the files (randomly
+ * not in logical order. SEEK_DATA's single pass therefore considers
+ * every entry rather than stopping at the first match, and SEEK_HOLE --
+ * which must follow runs that abut -- works on a sorted copy
+ * (cetrafs_extents_sorted() below). Assuming order in the array itself
+ * would give confidently wrong answers on exactly the files (randomly
  * written VM images) this exists to serve.
  */
-static bool cetrafs_extent_covers(const cetrafs_extent_t *e, u64 iblock, u64 *out_end)
-{
-    u64 start = cetrafs_le32(e->ee_block);
-    u64 end = start + cetrafs_extent_len(e->ee_len);
-
-    if (out_end)
-        *out_end = end;
-    return iblock >= start && iblock < end;
-}
-
 /* First mapped block at or after `from`, or U64_MAX if there is none. */
 static u64 cetrafs_next_data_block(const struct cetrafs_inode_extents *ex, u64 from)
 {
@@ -638,31 +631,76 @@ static u64 cetrafs_next_data_block(const struct cetrafs_inode_extents *ex, u64 f
     return best;
 }
 
-/* First unmapped block at or after `from`. Walks forward across
- * adjacent extents, since the next one may begin exactly where this one
- * ends -- and, the array being unsorted, that next one can be anywhere
- * in it. */
-static u64 cetrafs_next_hole_block(const struct cetrafs_inode_extents *ex, u64 from, u64 nblocks)
+/*
+ * The extent array in logical order, for the two walks that need it.
+ *
+ * The array is unsorted (appends merge only with the last entry), and
+ * both SEEK_HOLE and fiemap used to answer "what comes next?" with a
+ * fresh scan per step: O(n^2). A depth-2 tree holds ~258k extents --
+ * a fragmented VM image -- which made one lseek(SEEK_HOLE) tens of
+ * seconds of CPU under inode_lock_shared with no signal check: the
+ * file's writers blocked behind it and nothing could kill it. Sorted
+ * once, both are linear. Zero-length entries are dropped here (they
+ * are corruption, and a walk that steps by a length must never see
+ * one -- rule 14).
+ */
+struct cetrafs_ext_run {
+    u64 start, len, phys;
+    bool uninit;
+};
+
+static int cetrafs_ext_run_cmp(const void *a, const void *b)
 {
-    while (from < nblocks) {
-        bool covered = false;
-        u64 end = 0;
-        u32 i;
+    const struct cetrafs_ext_run *x = a, *y = b;
 
-        for (i = 0; i < ex->entries; i++) {
-            u64 e;
+    return x->start < y->start ? -1 : x->start > y->start;
+}
 
-            if (cetrafs_extent_covers(&ex->arr[i], from, &e)) {
-                covered = true;
-                end = e;
-                break;
-            }
+static int cetrafs_extents_sorted(struct inode *inode, const struct cetrafs_inode_extents *ex,
+                                  struct cetrafs_ext_run **out, u32 *out_n)
+{
+    struct cetrafs_ext_run *r;
+    u32 i, n = 0;
+
+    r = kvmalloc_array(max_t(u32, ex->entries, 1), sizeof(*r), GFP_KERNEL);
+    if (!r)
+        return -ENOMEM;
+    for (i = 0; i < ex->entries; i++) {
+        u64 l = cetrafs_extent_len(ex->arr[i].ee_len);
+
+        if (!l) {
+            pr_err_ratelimited("ino=%llu: extent at block %llu has zero length -- skipping it (fsck)\n",
+                               (unsigned long long) inode->i_ino,
+                               (unsigned long long) cetrafs_le32(ex->arr[i].ee_block));
+            continue;
         }
-        if (!covered)
-            return from;
-        from = end;
+        r[n].start = cetrafs_le32(ex->arr[i].ee_block);
+        r[n].len = l;
+        r[n].phys = cetrafs_extent_phys_from_hilo(ex->arr[i].ee_start_hi, ex->arr[i].ee_start_lo);
+        r[n].uninit = cetrafs_extent_is_uninit(ex->arr[i].ee_len);
+        n++;
     }
-    return nblocks; /* everything to EOF is data; EOF itself is the hole */
+    sort(r, n, sizeof(*r), cetrafs_ext_run_cmp, NULL);
+    *out = r;
+    *out_n = n;
+    return 0;
+}
+
+/* First unmapped block at or after `from`, over the sorted runs: one
+ * pass, extending `from` across every run that covers it (runs may
+ * overlap on a damaged tree, hence the max). */
+static u64 cetrafs_next_hole_block(const struct cetrafs_ext_run *r, u32 n, u64 from, u64 nblocks)
+{
+    u32 i;
+
+    for (i = 0; i < n && from < nblocks; i++) {
+        if (r[i].start + r[i].len <= from)
+            continue; /* entirely behind us */
+        if (r[i].start > from)
+            break; /* a gap before the next run: `from` is the hole */
+        from = r[i].start + r[i].len;
+    }
+    return from < nblocks ? from : nblocks; /* EOF itself is the hole */
 }
 
 static loff_t cetrafs_seek_hole_data(struct file *file, loff_t offset, int whence)
@@ -705,7 +743,16 @@ static loff_t cetrafs_seek_hole_data(struct file *file, loff_t offset, int whenc
          * is the caller's own offset, not the block boundary below it. */
         ret = (found == iblock) ? offset : (loff_t) (found * CETRAFS_BLOCK_SIZE);
     } else {
-        found = cetrafs_next_hole_block(&ex, iblock, nblocks);
+        struct cetrafs_ext_run *runs;
+        u32 nruns;
+
+        ret = cetrafs_extents_sorted(inode, &ex, &runs, &nruns);
+        if (ret) {
+            cetrafs_inode_extents_put(&ex);
+            goto out;
+        }
+        found = cetrafs_next_hole_block(runs, nruns, iblock, nblocks);
+        kvfree(runs);
         ret = (found == iblock) ? offset : (loff_t) (found * CETRAFS_BLOCK_SIZE);
         if (ret > isize)
             ret = isize; /* EOF is a hole, but never report past it */
@@ -732,16 +779,19 @@ out:
  * Reuses the same accessor and the same unsorted-array rule as the seek
  * pair: cetrafs_leaf_array_insert() appends and merges only with the
  * last entry, so the array is in creation order. FIEMAP's contract is
- * that extents come back in increasing logical order, so this walks the
- * array once per emitted extent, taking the lowest ee_block still
- * ahead of the previous one -- O(n^2) on at most 343 entries, bounded
- * and paid only by a tool that asked for the map.
+ * that extents come back in increasing logical order, so the array is
+ * sorted once (cetrafs_extents_sorted()) and walked. It used to be
+ * rescanned per emitted extent, under a comment calling that "O(n^2) on
+ * at most 343 entries" -- true of a depth-1 tree, not of a depth-2 one,
+ * which holds ~258k.
  */
 int cetrafs_fiemap(struct inode *inode, struct fiemap_extent_info *fi, u64 start, u64 len)
 {
     struct cetrafs_inode_extents ex;
+    struct cetrafs_ext_run *runs;
     cetrafs_inode_t raw;
     u64 cursor, end;
+    u32 nruns, i;
     int ret;
 
     ret = fiemap_prep(inode, fi, start, &len, 0);
@@ -757,92 +807,51 @@ int cetrafs_fiemap(struct inode *inode, struct fiemap_extent_info *fi, u64 start
     if (ret)
         goto out;
 
+    ret = cetrafs_extents_sorted(inode, &ex, &runs, &nruns);
+    if (ret) {
+        cetrafs_inode_extents_put(&ex);
+        goto out;
+    }
+
+    /* In logical order, once (see cetrafs_extents_sorted()): each step
+     * emits the lowest run starting at or after the cursor, exactly as
+     * the per-step rescan did, and a run starting behind the cursor (an
+     * overlap on a damaged tree) is skipped the same way. */
     end = start + len;
-    cursor = 0; /* lowest ee_block not yet emitted */
-    for (;;) {
-        u64 best_start = U64_MAX, best_len = 0, best_phys = 0;
-        bool best_uninit = false;
+    cursor = 0; /* lowest block not yet emitted */
+    i = 0;
+    while (i < nruns) {
+        const struct cetrafs_ext_run *r = &runs[i];
         u64 logical, phys, blen;
-        u32 flags = 0;
-        u32 i;
+        u32 flags = 0, j;
 
-        /* The array is unsorted, so each step is a scan. On a tree with
-         * hundreds of thousands of extents that is a long time to hold
-         * a CPU without offering it up. */
-        cond_resched();
-
-        for (i = 0; i < ex.entries; i++) {
-            u64 s = cetrafs_le32(ex.arr[i].ee_block);
-            u64 l = cetrafs_extent_len(ex.arr[i].ee_len);
-
-            /*
-             * A zero-length extent is not an extent, and this loop
-             * advances by exactly the length it just reported:
-             * `cursor = best_start + best_len`. Pick one of those and
-             * the cursor stops moving, the same entry is chosen again
-             * on every pass, and the walk spins forever -- holding
-             * inode_lock_shared, so it takes the rest of the file's
-             * readers down with it. Any user can ask for this.
-             *
-             * It cannot be reported either: a length of zero is not an
-             * answer fiemap has a way to express. Skip it, loudly --
-             * it is corruption, and the right place to notice that is
-             * fsck, not a hung task.
-             */
-            if (!l) {
-                pr_err_ratelimited("ino=%llu: extent at block %llu has zero length -- skipping it (fsck)\n",
-                                   (unsigned long long) inode->i_ino, (unsigned long long) s);
-                continue;
-            }
-            if (s < cursor)
-                continue;
-            if (s < best_start) {
-                best_start = s;
-                best_len = l;
-                best_phys = cetrafs_extent_phys_from_hilo(ex.arr[i].ee_start_hi, ex.arr[i].ee_start_lo);
-                /* Preallocated and never written: the blocks are real
-                 * and mapped, the CONTENT is not there yet. fiemap has
-                 * a flag that says exactly this, and leaving it off
-                 * reported a fallocate'd range as ordinary data --
-                 * which is what filefrag and every backup tool that
-                 * reads extents would then believe. */
-                best_uninit = cetrafs_extent_is_uninit(ex.arr[i].ee_len);
-            }
+        if (r->start < cursor) {
+            i++;
+            continue;
         }
-        if (best_start == U64_MAX)
-            break;
+        cursor = r->start + r->len;
+        logical = r->start * CETRAFS_BLOCK_SIZE;
+        blen = r->len * CETRAFS_BLOCK_SIZE;
+        phys = r->phys * CETRAFS_BLOCK_SIZE;
 
-        cursor = best_start + best_len;
-        logical = best_start * CETRAFS_BLOCK_SIZE;
-        blen = best_len * CETRAFS_BLOCK_SIZE;
-        phys = best_phys * CETRAFS_BLOCK_SIZE;
+        /* The next run that would be emitted, which is also the answer
+         * to LAST ("no extent begins after this one"). */
+        for (j = i + 1; j < nruns && runs[j].start < cursor; j++)
+            ;
 
         if (logical >= end)
             break;
-        if (logical + blen <= start)
+        if (logical + blen <= start) {
+            i = j;
             continue;
-
-        /* LAST means "no extent begins after this one", which with an
-         * unsorted array is a second scan, not a loop-position test. */
-        {
-            bool more = false;
-
-            for (i = 0; i < ex.entries; i++) {
-                /* Same exclusion as the selection above: a zero-length
-                 * entry is never reported, so it cannot be what makes
-                 * this one not the last. */
-                if (!cetrafs_extent_len(ex.arr[i].ee_len))
-                    continue;
-                if (cetrafs_le32(ex.arr[i].ee_block) >= cursor) {
-                    more = true;
-                    break;
-                }
-            }
-            if (!more)
-                flags |= FIEMAP_EXTENT_LAST;
-        if (best_uninit)
-            flags |= FIEMAP_EXTENT_UNWRITTEN;
         }
+
+        if (j >= nruns)
+            flags |= FIEMAP_EXTENT_LAST;
+        /* Preallocated and never written: the blocks are real and
+         * mapped, the CONTENT is not there yet. */
+        if (r->uninit)
+            flags |= FIEMAP_EXTENT_UNWRITTEN;
 
         ret = fiemap_fill_next_extent(fi, logical, phys, blen, flags);
         if (ret) {
@@ -852,7 +861,9 @@ int cetrafs_fiemap(struct inode *inode, struct fiemap_extent_info *fi, u64 start
                 ret = 0;
             break;
         }
+        i = j;
     }
+    kvfree(runs);
     cetrafs_inode_extents_put(&ex);
 
 out:
