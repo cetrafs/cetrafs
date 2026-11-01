@@ -415,6 +415,30 @@ void cetrafs_invalidate_block(struct super_block *sb, sector_t block)
 }
 
 /*
+ * A block is about to be FREED: drop this node's cached copy of it,
+ * dirty or not. cetrafs_invalidate_block() above deliberately leaves a
+ * dirty buffer alone -- right for a block we still own, whose pending
+ * write is the newest content -- and exactly wrong for one we are
+ * giving away: that pending write would land after the next owner's.
+ * Taking the buffer lock waits out a write already in flight, which
+ * lands while the block is still ours and is harmless.
+ */
+void cetrafs_forget_block(struct super_block *sb, sector_t block)
+{
+    struct buffer_head *bh = sb_find_get_block(sb, block);
+
+    if (!bh)
+        return;
+
+    lock_buffer(bh);
+    clear_buffer_dirty(bh);
+    clear_buffer_uptodate(bh);
+    unlock_buffer(bh);
+
+    brelse(bh);
+}
+
+/*
  * The {magic, crc} tail that whole-block structures carry so a lock-free
  * reader can tell a torn concurrent write from real corruption
  * (format v0x000F).

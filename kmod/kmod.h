@@ -382,6 +382,7 @@ extern bool cetrafs_cas_selftest_enabled;
 // ioutil.c
 struct buffer_head *cetrafs_bread_uncached(struct super_block *sb, sector_t block);
 void cetrafs_invalidate_block(struct super_block *sb, sector_t block);
+void cetrafs_forget_block(struct super_block *sb, sector_t block);
 /* Keep a cached block coherent with a swap that went straight to the
  * device, without throwing the cached copy away -- see ioutil.c. */
 void cetrafs_cache_region_after_cas(struct super_block *sb,
@@ -565,8 +566,19 @@ u32 cetrafs_alloc_run_after(struct super_block *sb, u32 bg_id, u64 start_lba, u3
 int cetrafs_free_data_extent(struct super_block *sb, u64 lba, u32 count);
 /* Inline so the BLKFREE/BLKQUEUE traces' from=%pS names the real caller,
  * not this wrapper. */
+/*
+ * Single blocks are what the extent tree, xattrs and directories free
+ * their METADATA through -- blocks this node wrote via the buffer cache,
+ * a regular file's extent leaf deliberately left dirty until the next
+ * durability boundary. Such a buffer must be forgotten before the block
+ * goes back: writeback would otherwise put the dead leaf on top of
+ * whatever the block's next owner writes, here or on a peer
+ * (tests/kernel/freed_leaf_writeback.sh). Whole-extent frees of file
+ * DATA do not pay for this: file data never lives in this cache.
+ */
 static inline int cetrafs_free_data_block(struct super_block *sb, u64 lba)
 {
+    cetrafs_forget_block(sb, lba);
     return cetrafs_free_data_extent(sb, lba, 1);
 }
 int cetrafs_apply_pending_free(struct super_block *sb, u64 lba, u32 count, u32 expect_zg);

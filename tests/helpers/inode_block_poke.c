@@ -252,6 +252,7 @@ int main(int argc, char **argv)
             uint8_t blk[CETRAFS_BLOCK_SIZE];
             const cetrafs_extent_hdr_t *lh = (const cetrafs_extent_hdr_t *) blk;
 
+            printf("leaf=%llu\n", (unsigned long long) lba); /* the leaf block's own address */
             pread_all(fd, blk, sizeof(blk), (off_t) lba * CETRAFS_BLOCK_SIZE);
             const cetrafs_extent_t *le = (const cetrafs_extent_t *) (blk + sizeof(*lh));
             uint32_t n = cetrafs_le16(lh->eh_entries) > CETRAFS_EXT_BLOCK_MAX_LEAVES ? CETRAFS_EXT_BLOCK_MAX_LEAVES : cetrafs_le16(lh->eh_entries);
