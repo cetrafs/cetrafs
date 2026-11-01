@@ -65,8 +65,9 @@ int main(int argc, char **argv)
                 "usage: %s <image> <row> [<state> <uuid_byte_hex> <last_seen_unix>]\n"
                 "       %s <image> <row> --bump-fence <n>   (simulate a peer revoking this row's lease)\n"
                 "       %s <image> <row> --beat             (advance hb_seq, i.e. impersonate a live node)\n"
-                "       %s <image> <row> --beat-keep-time   (same, but leave last_seen alone: a SKEWED live node)\n",
-                argv[0], argv[0], argv[0], argv[0]);
+                "       %s <image> <row> --beat-keep-time   (same, but leave last_seen alone: a SKEWED live node)\n"
+                "       %s <image> <row> --label <text>     (fill the label field with <text>, NO terminating NUL)\n",
+                argv[0], argv[0], argv[0], argv[0], argv[0]);
         return 2;
     }
 
@@ -142,6 +143,24 @@ int main(int argc, char **argv)
         pwrite_all(fd, &ne, sizeof(ne), row_off);
         close(fd);
         printf("node_poke: row %u checksum invalidated\n", row);
+        return 0;
+    }
+
+    /* --label: the field's bytes exactly as given, repeated to fill all
+     * of it, with no terminating NUL -- a row a reader must not trust to
+     * end inside its field. Checksum restamped: the row is VALID. */
+    if (argc == 5 && strcmp(argv[3], "--label") == 0) {
+        size_t n = strlen(argv[4]);
+
+        if (n == 0)
+            return 2;
+        for (size_t i = 0; i < sizeof(ne.label); i++)
+            ne.label[i] = argv[4][i % n];
+        ne.checksum = 0;
+        ne.checksum = cetrafs_cpu_to_le64(crc32c_struct(&ne, sizeof(ne), offsetof(cetrafs_node_entry_t, checksum), sizeof(cetrafs_le64(ne.checksum))));
+        pwrite_all(fd, &ne, sizeof(ne), row_off);
+        close(fd);
+        printf("node_poke: row %u label filled, unterminated\n", row);
         return 0;
     }
 

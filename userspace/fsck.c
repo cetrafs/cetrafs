@@ -1634,8 +1634,8 @@ int main(int argc, char **argv)
             long long age = (long long) time(NULL) - (long long) cetrafs_le64(ne.last_seen);
 
             if ((int) n != repair_row && age > (long long) CETRAFS_NODE_STALE_SECS)
-                fprintf(stderr, "WARN: node slot %u holds a repair claim last refreshed %llds ago (%s)\n", n, age,
-                        ne.label[0] ? ne.label : "no label");
+                fprintf(stderr, "WARN: node slot %u holds a repair claim last refreshed %llds ago (%.*s)\n", n, age,
+                        ne.label[0] ? (int) sizeof(ne.label) : 8, ne.label[0] ? ne.label : "no label");
             continue;
         }
         if (cetrafs_le32(ne.state) != CETRAFS_NODE_STATE_REGISTERED) {
