@@ -602,7 +602,7 @@ int cetrafs_nslock_acquire_set(struct inode **inodes, int n)
             ordered[count++] = inodes[i];
     }
 
-    /* Insertion sort by inode number: count is at most 4. */
+    /* Insertion sort by inode number: count is at most CETRAFS_NSLOCK_MAX_SET. */
     for (i = 1; i < count; i++) {
         struct inode *key = ordered[i];
 

@@ -525,8 +525,10 @@ void cetrafs_defrag_consider(struct inode *inode, u32 extents, u64 nblocks);
 int cetrafs_nslock_acquire(struct inode *inode);
 void cetrafs_nslock_release(struct inode *inode);
 /* The widest set any single operation needs: rename's two parents, the
- * moved inode, and a replaced target. */
-#define CETRAFS_NSLOCK_MAX_SET 4
+ * moved inode, a replaced target, and -- for a directory changing
+ * parent -- the root directory, whose lock orders every such move
+ * cluster-wide (see cetrafs_rename()). */
+#define CETRAFS_NSLOCK_MAX_SET 5
 int cetrafs_nslock_acquire_set(struct inode **inodes, int n);
 void cetrafs_nslock_release_set(struct inode **inodes, int n);
 

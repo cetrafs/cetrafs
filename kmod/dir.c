@@ -2747,6 +2747,76 @@ out_uncount:
  */
 #define CETRAFS_RENAME_MAX_ATTEMPTS 4
 
+/* How far up the '..' chain a directory move looks before calling the
+ * chain corrupt. Far deeper than any path can be (PATH_MAX allows ~2048
+ * levels); the bound exists so a corrupt chain -- a loop already on the
+ * device -- ends the walk instead of spinning (rule 14). */
+#define CETRAFS_RENAME_MAX_DEPTH 4096
+
+/*
+ * Would moving 'moved_ino' into 'new_dir' put it inside itself? Asked
+ * of the DEVICE, from 'new_dir' up through each '..' to the root.
+ *
+ * The VFS asks the same question of this node's dentry cache, which is
+ * enough on one machine and not on a shared LUN: a peer's move is not
+ * in our cache. Node A `mv P Q/` and node B `mv Q P/` each passed the
+ * VFS check, and P and Q left the tree as each other's children --
+ * unreachable from the root on every node
+ * (tests/kernel/rename_cycle_peer.sh).
+ *
+ * Only sound under the root directory's namespace lock, which every
+ * directory move to another parent takes (cetrafs_rename()): those are
+ * the only operations that rewrite a '..', so the chain cannot change
+ * under the walk. Each step's dirent read goes through the dirent_seq
+ * gate, which reads the record forced-fresh and re-reads the blocks if
+ * a peer changed them.
+ */
+static int cetrafs_rename_dest_under_source(struct inode *new_dir, u64 moved_ino)
+{
+    static const struct qstr dotdot = QSTR_INIT("..", 2);
+    struct super_block *sb = new_dir->i_sb;
+    u64 root_ino = d_inode(sb->s_root)->i_ino;
+    u64 cur = new_dir->i_ino;
+    unsigned int depth;
+
+    for (depth = 0; depth < CETRAFS_RENAME_MAX_DEPTH; depth++) {
+        struct cetrafs_lookup_ctx ctx = {.name = &dotdot, .ino = 0};
+        struct inode *dir;
+        int ret;
+
+        if (cur == moved_ino)
+            return -EINVAL; /* the destination is inside what is being moved */
+        if (cur == root_ino)
+            return 0;
+        dir = cetrafs_iget(sb, cur);
+        if (IS_ERR(dir))
+            return PTR_ERR(dir);
+        if (!S_ISDIR(dir->i_mode)) {
+            iput(dir);
+            return -EUCLEAN;
+        }
+        ret = cetrafs_walk_dirents(dir, cetrafs_lookup_visit, &ctx);
+        iput(dir);
+        if (ret < 0)
+            return ret;
+        if (!ctx.ino) {
+            pr_err("rename: directory ino=%llu has no '..' -- refusing the move\n", (unsigned long long) cur);
+            return -EUCLEAN;
+        }
+        cur = ctx.ino;
+        cond_resched();
+    }
+    pr_err("rename: the '..' chain above ino=%llu is longer than %u -- a loop already on the device; refusing\n",
+           (unsigned long long) new_dir->i_ino, CETRAFS_RENAME_MAX_DEPTH);
+    return -EUCLEAN;
+}
+
+/* TEST ONLY: stall a rename after the VFS's lookups and before its
+ * namespace locks, where a peer's rename lands in the real race. */
+static unsigned int cetrafs_rename_prelock_stall_ms;
+module_param_named(rename_prelock_stall_ms, cetrafs_rename_prelock_stall_ms, uint, 0644);
+MODULE_PARM_DESC(rename_prelock_stall_ms, "TEST ONLY: pause a rename between its lookups and its namespace locks");
+
 static int cetrafs_rename(struct mnt_idmap *idmap,
                           struct inode *old_dir,
                           struct dentry *old_dentry,
@@ -2779,7 +2849,9 @@ static int cetrafs_rename(struct mnt_idmap *idmap,
     for (attempt = 0; attempt < CETRAFS_RENAME_MAX_ATTEMPTS; attempt++) {
         struct inode *discovered = NULL;
         struct inode *target;
-        struct inode *set[4];
+        struct inode *set[5];
+        struct inode *moved = d_inode(old_dentry);
+        bool dir_move = S_ISDIR(moved->i_mode) && old_dir != new_dir;
         bool target_changed = false;
 
         /* The first attempt trusts the VFS's own lookup and only walks
@@ -2814,8 +2886,17 @@ static int cetrafs_rename(struct mnt_idmap *idmap,
          * NULLs), whose nlink drops and whose blocks may be freed. */
         set[0] = old_dir;
         set[1] = new_dir;
-        set[2] = d_inode(old_dentry);
+        set[2] = moved;
         set[3] = target;
+        /* A directory changing parent also takes the ROOT directory's
+         * lock: one lock every such move on every node takes, so they
+         * are totally ordered and the '..' walk below sees a chain no
+         * peer is rewriting. A directory's ancestry is changed by
+         * nothing else. Same-parent renames and file moves skip it. */
+        set[4] = dir_move ? d_inode(old_dir->i_sb->s_root) : NULL;
+
+        if (cetrafs_rename_prelock_stall_ms && attempt == 0)
+            msleep(cetrafs_rename_prelock_stall_ms);
 
         ret = cetrafs_nslock_acquire_set(set, ARRAY_SIZE(set));
         if (ret) {
@@ -2824,7 +2905,10 @@ static int cetrafs_rename(struct mnt_idmap *idmap,
             return ret;
         }
 
-        ret = cetrafs_rename_locked(idmap, old_dir, old_dentry, new_dir, new_dentry, flags, target, &target_changed);
+        ret = dir_move ? cetrafs_rename_dest_under_source(new_dir, moved->i_ino) : 0;
+        if (!ret)
+            ret = cetrafs_rename_locked(idmap, old_dir, old_dentry, new_dir, new_dentry, flags, target,
+                                        &target_changed);
         cetrafs_ns_report("rename", old_dir, &old_dentry->d_name, ret);
 
         cetrafs_nslock_release_set(set, ARRAY_SIZE(set));
