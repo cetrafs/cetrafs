@@ -77,7 +77,24 @@ dmesg_mark() {
     echo "$tok" >/dev/kmsg 2>/dev/null || { dmesg | tail -1 | sed -n 's/^\[\s*\([0-9.]\+\)\].*/\1/p'; return; }
     echo "$tok"
 }
+# Captured, then written with SIGPIPE ignored: suites read this as
+# `dmesg_since "$MARK" | grep -q ...` under pipefail, and grep -q exits
+# at its first match. A producer still writing then died of SIGPIPE, the
+# pipeline returned 141, and a line that WAS in the log read as missing
+# -- 5 times out of 5 once ~70 KiB followed the mark
+# (image/harness_dmesg_pipefail.sh). A reader that stops early is not
+# this function's failure.
 dmesg_since() {
+    local out
+    out="$(_dmesg_since_raw "$@")"
+    [ -n "$out" ] || return 0
+    (
+        trap '' PIPE
+        printf '%s\n' "$out"
+    ) 2>/dev/null || true
+}
+
+_dmesg_since_raw() {
     local mark="${1:-0}"
     case "$mark" in
     CTMARK-*)
