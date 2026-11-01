@@ -92,6 +92,7 @@ int main(int argc, char **argv)
         fprintf(stderr, "       %s <backing-file> plantrec <ino> <mode>  (a valid record at ANY slot, in range or not)\n",
                 argv[0]);
         fprintf(stderr, "       %s <backing-file> setsize <ino> <bytes> (as a PEER extending it would)\n", argv[0]);
+        fprintf(stderr, "       %s <backing-file> reuse <ino> <gen> <node> (a peer reused the number)\n", argv[0]);
         fprintf(stderr, "       %s <backing-file> size <ino>           (print the on-disk size)\n", argv[0]);
         fprintf(stderr, "       %s <backing-file> bumpseq <ino>        (advance dirent_seq, as a peer would)\n", argv[0]);
         fprintf(stderr, "       %s <backing-file> extents <ino>       (prints depth/entries/blocks)\n", argv[0]);
@@ -387,6 +388,24 @@ int main(int argc, char **argv)
         pwrite_all(fd, &rec, sizeof(rec), rec_off);
         fprintf(stderr, "inode_block_poke: ino %llu generation -> %llu (type untouched)\n",
                 (unsigned long long) ino, g);
+    } else if (strcmp(mode, "reuse") == 0) {
+        /* What a PEER deleting the file and reusing its number leaves in
+         * the record: a new generation, and a file_seq stamped by that
+         * peer -- which is what makes this node's open treat the record
+         * as foreign and refresh from it. bumpgen alone keeps our own
+         * file_seq, so an open never looks at the generation. */
+        cetrafs_inode_t rec;
+        unsigned long long g = (argc > 4) ? strtoull(argv[4], NULL, 0) : 0;
+        unsigned long long node = (argc > 5) ? strtoull(argv[5], NULL, 0) : 0;
+
+        pread_all(fd, &rec, sizeof(rec), rec_off);
+        rec.generation = cetrafs_cpu_to_le64(g);
+        rec.file_seq = cetrafs_cpu_to_le64((node << CETRAFS_FILE_SEQ_NODE_SHIFT) |
+                                           ((cetrafs_le64(rec.file_seq) + 1) & CETRAFS_FILE_SEQ_VAL_MASK));
+        cetrafs_inode_stamp_crcs_us(&rec);
+        pwrite_all(fd, &rec, sizeof(rec), rec_off);
+        fprintf(stderr, "inode_block_poke: ino %llu reused by node %llu: generation -> %llu\n",
+                (unsigned long long) ino, node, g);
     } else if (strcmp(mode, "setsize") == 0) {
         /* Set the on-disk size directly, as a PEER extending the file
          * would leave it. Used to prove this node's deferred

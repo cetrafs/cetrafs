@@ -1331,6 +1331,19 @@ int cetrafs_lock_open(struct inode *inode, struct file *file)
     if (ret)
         goto out_pr_unlock;
 
+    /* Is this record still the file this inode is? Decided HERE, before
+     * anything below acts on the record's lock. The claim CAS is keyed on
+     * raw.generation -- the reused number's, not ours -- so it lands on a
+     * different file's record; the refresh further down then refused the
+     * open with -ESTALE and left that claim on the device, owned by a
+     * live node with no fd on it (tests/kernel/open_claim_estale.sh).
+     * cetrafs_lock_defrag_begin() makes the same check for the same
+     * reason. */
+    if (cetrafs_le64(raw.generation) != cetrafs_inode_get_generation(inode)) {
+        ret = -ESTALE;
+        goto out_pr_unlock;
+    }
+
     /* Enforcement honors a lock that is actually PRESENT on disk, in BOTH
      * mount modes -- this is not gated on lock_on. The default mount AND a
      * nofilelock mount both refuse an open while a live peer holds the
