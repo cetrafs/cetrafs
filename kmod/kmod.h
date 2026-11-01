@@ -96,6 +96,58 @@ int cetrafs_init_fs_context(struct fs_context *fc);
 void cetrafs_kill_sb(struct super_block *sb);
 void cetrafs_free_sb_info(struct super_block *sb);
 const cetrafs_superblock_t *cetrafs_sb_raw(struct super_block *sb);
+
+/*
+ * Is [lba, lba+count) an address a FILE's blocks may legally occupy?
+ *
+ * cetrafs_blk_struct_ok_magic() validates the COUNTS and LENGTHS read
+ * off the disk -- name_len, value_len, eh_entries -- and says so in its
+ * own comment. It never covered the ADDRESSES beside them, and those
+ * are trusted absolutely: cetrafs_leaf_array_lookup() turns
+ * ee_start_hi/lo straight into the LBA cetrafs_get_block() hands to
+ * map_bh(). An extent pointing into the global tables therefore makes
+ * an ordinary write(2) land on them. Measured on a 560 MiB image with
+ * one inode's extent moved to the inode table and its CRCs restamped:
+ * the write destroyed the records of inodes 1..4 and fsck then reported
+ * "root is not a dir" -- the volume, and on a shared LUN every node's
+ * view of it, gone. Reading the same file returned the root inode's
+ * record as file content.
+ *
+ * Note which side of this the filesystem already got right:
+ * __cetrafs_free_data_extent() resolves the BG, checks the region
+ * bounds and the ZG ownership before freeing, and fsck's
+ * fsck_mark_run() refuses the same extent with "outside every data
+ * region". The block about to be FREED was validated; the block about
+ * to be WRITTEN was not.
+ *
+ * O(1) and no I/O, which is what lets it sit on the per-block mapping
+ * path (docs/PERFORMANCE.md invariant 1) next to the generation compare
+ * already there. Everything below bg_regions_start is a global table --
+ * superblock, ZG and BG tables, inode bitmap, inode table, Node
+ * Registry, journals, pending-free queues -- so one pair of comparisons
+ * fences a file's blocks away from all of them.
+ *
+ * What it does NOT catch, stated rather than implied: a block inside
+ * the BG regions but pointing at some OTHER BG's header or bitmap,
+ * which are interleaved with the data. Catching those needs the BG
+ * geometry, which is a device read per BG (cetrafs_bg_id_for_lba()) and
+ * cannot be afforded here. They damage one Block Group's bookkeeping,
+ * not the whole volume, and fsck names them.
+ */
+static inline bool cetrafs_lba_run_is_data(struct super_block *sb, u64 lba, u64 count)
+{
+    const cetrafs_superblock_t *raw_sb = cetrafs_sb_raw(sb);
+    u64 lo, hi;
+
+    if (!raw_sb)
+        return false;
+    lo = le64_to_cpu(raw_sb->bg_regions_start);
+    hi = le64_to_cpu(raw_sb->total_blocks);
+
+    if (!count || count > hi)
+        return false;
+    return lba >= lo && lba <= hi - count;
+}
 int cetrafs_sb_adjust_free_inodes(struct super_block *sb, s64 delta);
 int cetrafs_sb_get_free_inodes(struct super_block *sb, u64 *out);
 int cetrafs_sb_get_node_id(struct super_block *sb, u32 *out);

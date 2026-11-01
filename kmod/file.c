@@ -1816,13 +1816,13 @@ static bool cetrafs_idx_may_hold(const cetrafs_extent_idx_t *e, u32 iblock)
 
 /* Point query across depth 0/1/2. Early-returns on the first match, so
  * it never flattens the whole tree (the full-scan readers do that). */
-static int cetrafs_tree_lookup(struct inode *inode,
-                               const cetrafs_inode_t *raw,
-                               u32 iblock,
-                               u64 *out_lba,
-                               u32 *out_run,
-                               bool *out_uninit,
-                               bool *found)
+static int cetrafs_tree_lookup_unchecked(struct inode *inode,
+                                         const cetrafs_inode_t *raw,
+                                         u32 iblock,
+                                         u64 *out_lba,
+                                         u32 *out_run,
+                                         bool *out_uninit,
+                                         bool *found)
 {
     struct cetrafs_ext_span span = {0};
     u32 ni;
@@ -1926,6 +1926,52 @@ static int cetrafs_tree_lookup(struct inode *inode,
             }
         }
         brelse(ibh);
+    }
+    return 0;
+}
+
+/*
+ * The resolver above, with the one thing it never checked: that the
+ * address it produced is one a file's blocks may occupy.
+ *
+ * ee_start_hi/lo is 48 bits read off the device, and every return path
+ * above turns it straight into *out_lba. cetrafs_get_block() then hands
+ * that to map_bh(), so an extent pointing at the inode table makes a
+ * write(2) land on the inode table -- demonstrated on a 560 MiB image:
+ * the records of inodes 1..4 overwritten by file data, fsck afterwards
+ * reporting "root is not a dir". A read of the same file returned the
+ * root inode's record as its contents.
+ *
+ * A wrapper rather than a check at each of the four return points,
+ * because four places that must each remember is three that can forget
+ * -- the same reasoning cetrafs_blk_struct_ok_magic() gives for
+ * validating counts where the block is read. See
+ * cetrafs_lba_run_is_data() for what this costs and what it cannot see.
+ *
+ * -EUCLEAN, not -EIO: the device answered perfectly, the record is
+ * wrong. The mapping is refused rather than clamped -- there is no
+ * nearby address that is the "right" one, and guessing would publish
+ * the guess.
+ */
+static int cetrafs_tree_lookup(struct inode *inode,
+                               const cetrafs_inode_t *raw,
+                               u32 iblock,
+                               u64 *out_lba,
+                               u32 *out_run,
+                               bool *out_uninit,
+                               bool *found)
+{
+    int ret = cetrafs_tree_lookup_unchecked(inode, raw, iblock, out_lba, out_run, out_uninit, found);
+
+    if (ret || !*found)
+        return ret;
+
+    if (!cetrafs_lba_run_is_data(inode->i_sb, *out_lba, out_run ? *out_run : 1)) {
+        pr_err_ratelimited("ino=%llu: logical block %u maps to [%llu,+%u), which is not a data address -- refusing it (fsck)\n",
+                           (unsigned long long) inode->i_ino, iblock, (unsigned long long) *out_lba,
+                           out_run ? *out_run : 1);
+        *found = false;
+        return -EUCLEAN;
     }
     return 0;
 }

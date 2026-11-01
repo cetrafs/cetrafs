@@ -83,6 +83,7 @@ Roughly by area:
 | mount / superblock | validation, refusal of damaged or foreign volumes, remount, the Block Group table chain a grown volume carries, and the claim an offline `fsck -r`/`growfs` holds while it works |
 | inode / dirent / dir | the namespace, directory growth past inline extents, cross-node reuse |
 | file / extent / punch | the extent tree at depth 0/1/2, truncate, hole punch, sparse files, `fiemap`/`SEEK` |
+| addresses read off the disk | an extent whose physical block names the inode table is refused before anything maps it -- the checksum cannot catch it (the record is restamped and merely says something impossible), and following it made an ordinary `write(2)` destroy the global tables |
 | mmap | allocation at fault time (so `-ENOSPC` reaches the storing process as SIGBUS), and the exclusion between a fault and punch/truncate/`write(2)` -- a fault takes no `inode_lock` and never can |
 | vfs conformance | the answers userspace reads: `EISDIR` on reading a directory, a nonzero `f_fsid`, `FIEMAP_EXTENT_UNWRITTEN` on preallocated ranges, a root inode that must be a directory |
 | controls / procfs | the writable knobs, including the timing pair that constrains itself |

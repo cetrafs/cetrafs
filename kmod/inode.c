@@ -1141,6 +1141,19 @@ u64 cetrafs_tree_read_count(void)
 struct buffer_head *cetrafs_read_tree_bh(struct inode *inode, u64 lba, u32 tail_magic, const char *what)
 {
     atomic64_inc(&cetrafs_tree_reads);
+
+    /* ei_leaf_hi/lo is an address read off the device, exactly like the
+     * ee_start the data path refuses in cetrafs_tree_lookup(). These
+     * blocks are not only read: the extent-tree writers journal them
+     * and write them back, so a leaf pointer aimed at the inode table
+     * puts a tree update there. Checked at the one place both the leaf
+     * and the interior reader funnel through. */
+    if (!cetrafs_lba_run_is_data(inode->i_sb, lba, 1)) {
+        pr_err_ratelimited("ino=%llu: %s block %llu is not a data address -- refusing it (fsck)\n",
+                           (unsigned long long) inode->i_ino, what, (unsigned long long) lba);
+        return NULL;
+    }
+
     /* Holding the file's exclusive lock means no peer can be rewriting
      * this tree, so the cached copy is authoritative AND cannot be
      * torn -- this is the growing-file hot path and must stay off the
@@ -1201,6 +1214,16 @@ struct buffer_head *cetrafs_read_leaf_bh(struct inode *inode, u64 lba)
  */
 struct buffer_head *cetrafs_read_dir_leaf_bh(struct inode *inode, u64 lba, bool fresh)
 {
+    /* dir.c reaches a leaf through here rather than through
+     * cetrafs_read_tree_bh(), so the address check has to be repeated:
+     * a subsystem with its own reader is exactly how a check added at
+     * "the" choke point misses the blocks it was written for. */
+    if (!cetrafs_lba_run_is_data(inode->i_sb, lba, 1)) {
+        pr_err_ratelimited("dir ino=%llu: extent leaf %llu is not a data address -- refusing it (fsck)\n",
+                           (unsigned long long) inode->i_ino, (unsigned long long) lba);
+        return NULL;
+    }
+
     if (!fresh) {
         /* Same as the file path above: unchanged-since-we-last-read is
          * not the same as sane. */
