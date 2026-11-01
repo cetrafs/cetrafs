@@ -362,10 +362,16 @@ struct buffer_head *cetrafs_getblk_overwrite(struct super_block *sb, sector_t bl
  * the exact bytes the device now holds, so write them into the cached
  * buffer and leave it CLEAN: coherent, and still warm.
  *
- * Only a clean, uptodate buffer is patched. A dirty one holds a write
- * that has not reached the device, which this cannot reason about --
- * fall back to the invalidate, which deliberately leaves dirty buffers
- * alone. A buffer that is not uptodate has nothing stale to correct.
+ * Any uptodate buffer is patched, dirty or not. A dirty one holds a
+ * write that has not reached the device; the swap was computed against
+ * the device without it, so for THIS region the swap's bytes are the
+ * newer truth, and the rest of the block keeps its pending write. What
+ * must not happen is the old fallback, which cleared uptodate on a
+ * dirty buffer: "dirty implies uptodate" is what every forced-fresh
+ * read relies on to leave a pending write alone (cetrafs_bread_uncached
+ * above), and without it the next read fetched the device over the
+ * pending write and the write-back then put the old bytes back. A
+ * buffer that is not uptodate has nothing stale to correct.
  */
 void cetrafs_cache_region_after_cas(struct super_block *sb, sector_t block, unsigned int off, const void *src,
                                     unsigned int len)
@@ -380,10 +386,8 @@ void cetrafs_cache_region_after_cas(struct super_block *sb, sector_t block, unsi
         return;
 
     lock_buffer(bh);
-    if (buffer_uptodate(bh) && !buffer_dirty(bh))
+    if (buffer_uptodate(bh))
         memcpy(bh->b_data + off, src, len);
-    else
-        clear_buffer_uptodate(bh); /* cannot patch it; make the next read fetch */
     unlock_buffer(bh);
     brelse(bh);
 }
