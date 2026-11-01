@@ -358,6 +358,19 @@ int main(int argc, char **argv)
                 (u32) stored, calc);
     }
 
+    /* The geometry every computation below divides or multiplies by.
+     * The CRC only proves the superblock is the one written; the mount
+     * refuses these values (fs.c), and growing a volume the kernel will
+     * not mount used to "complete" -- with a modulo by zero further
+     * down for some of them. Same limits as the mount path. */
+    if (!cetrafs_le32(sb.zone_group_count) || cetrafs_le32(sb.zone_group_count) > CETRAFS_MAX_ZONE_GROUPS)
+        die("%s: invalid zone_group_count %u -- run fsck.cetra first", dev, cetrafs_le32(sb.zone_group_count));
+    if (!cetrafs_le32(sb.block_group_count))
+        die("%s: invalid block_group_count 0 -- run fsck.cetra first", dev);
+    if (cetrafs_le64(sb.bg_size_blocks) < 64)
+        die("%s: invalid bg_size_blocks %" PRIu64 " -- run fsck.cetra first", dev,
+            (u64) cetrafs_le64(sb.bg_size_blocks));
+
     const u64 old_total = cetrafs_le64(sb.total_blocks);
     const u32 old_z = cetrafs_le32(sb.zone_group_count);
     const u32 old_b = cetrafs_le32(sb.block_group_count);
