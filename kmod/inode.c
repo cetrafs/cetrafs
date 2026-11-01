@@ -664,7 +664,7 @@ int cetrafs_write_raw_inode(struct super_block *sb, u64 ino, const cetrafs_inode
          * dirent naming it, or a directory that had just grown keep a
          * name in a block its record never mapped: reported created,
          * gone after a remount (tests/kernel/record_write_error.sh). */
-        ret = sync_dirty_buffer(bh);
+        ret = cetrafs_sync_buffer(bh);
     }
     brelse(bh);
 

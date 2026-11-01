@@ -394,6 +394,10 @@ u32 cetrafs_bh_begin_update_crc(struct buffer_head *bh);
  * replaces every byte. See ioutil.c. */
 struct buffer_head *cetrafs_getblk_overwrite(struct super_block *sb, sector_t block);
 void cetrafs_bh_end_update(struct buffer_head *bh);
+/* Synchronous write whose result is TRUE, unlike sync_dirty_buffer()'s
+ * here -- see ioutil.c. _keep never discards the cached bytes on error. */
+int cetrafs_sync_buffer(struct buffer_head *bh);
+int cetrafs_sync_buffer_keep(struct buffer_head *bh);
 void cetrafs_bh_copy_stable(struct buffer_head *bh, void *out, size_t len);
 void cetrafs_bh_abort_update(struct buffer_head *bh);
 /* sb_bread() that tolerates a concurrent invalidation of the same block

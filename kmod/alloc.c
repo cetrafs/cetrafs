@@ -1824,26 +1824,10 @@ static bool cetrafs_alloc_flush_fail;
 module_param_named(alloc_flush_fail, cetrafs_alloc_flush_fail, bool, 0644);
 MODULE_PARM_DESC(alloc_flush_fail, "test-only: fail allocation-bitmap syncs at durability boundaries with -EIO");
 
-/*
- * Completion for a bitmap block's synchronous write. Unlike
- * end_buffer_write_sync() it never clears BH_Uptodate on an error: these
- * bytes are the allocator's ONLY record of bits that did not reach the
- * device, and a buffer left !uptodate is re-read from the device by the
- * next sb_bread() -- silently forgetting allocations of blocks that are
- * already in use. The error is reported to the waiter instead.
- */
-static void cetrafs_bmap_end_write(struct buffer_head *bh, int uptodate)
-{
-    if (!uptodate)
-        set_buffer_write_io_error(bh);
-    unlock_buffer(bh);
-    put_bh(bh);
-}
-
 static int cetrafs_sync_one_block(struct super_block *sb, u64 lba)
 {
     struct buffer_head *bh = sb_find_get_block(sb, lba);
-    int ret = 0;
+    int ret;
 
     /* find, not read: a block we never cached cannot be dirty, and
      * reading it in just to discover that would turn a flush into I/O
@@ -1855,35 +1839,9 @@ static int cetrafs_sync_one_block(struct super_block *sb, u64 lba)
         brelse(bh);
         return -EIO; /* as a failed write leaves it: still dirty */
     }
-
-    lock_buffer(bh); /* also waits out a writeback already in flight */
-    if (buffer_write_io_error(bh)) {
-        /* An earlier write of this block -- ours or the flusher's --
-         * failed. The flusher's completion clears BH_Uptodate; while it
-         * is still clear nobody has re-read the block over our bits, so
-         * the bytes are ours to put back. Either way the bits it carried
-         * are not on the device: re-dirty and report, never succeed. */
-        clear_buffer_write_io_error(bh);
-        set_buffer_uptodate(bh);
-        unlock_buffer(bh);
-        mark_buffer_dirty(bh);
-        brelse(bh);
-        return -EIO;
-    }
-    if (!test_clear_buffer_dirty(bh)) {
-        unlock_buffer(bh);
-        brelse(bh);
-        return 0;
-    }
-    get_bh(bh);
-    bh->b_end_io = cetrafs_bmap_end_write;
-    submit_bh(REQ_OP_WRITE | REQ_SYNC, bh);
-    wait_on_buffer(bh);
-    if (buffer_write_io_error(bh)) {
-        clear_buffer_write_io_error(bh);
-        mark_buffer_dirty(bh); /* still uptodate: the next boundary retries it */
-        ret = -EIO;
-    }
+    /* _keep: on a failed write these bytes are the only record of the
+     * bits that did not land -- see ioutil.c. */
+    ret = cetrafs_sync_buffer_keep(bh);
     brelse(bh);
     return ret;
 }

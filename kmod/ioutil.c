@@ -199,6 +199,89 @@ void cetrafs_bh_end_update(struct buffer_head *bh)
 }
 
 /*
+ * Write a dirty buffer synchronously and say whether it reached the
+ * device. Use this, not sync_dirty_buffer(), wherever the answer matters.
+ *
+ * sync_dirty_buffer() decides failure by looking at BH_Uptodate AFTER
+ * the write completes. In this module that is a race, not an answer: a
+ * forced-fresh reader (cetrafs_bread_uncached(), every stat/lookup)
+ * takes the buffer lock the moment the write's completion drops it and
+ * clears BH_Uptodate to re-read. The writer then sees !uptodate and
+ * reports -EIO for a write that landed -- measured as creates failing
+ * EIO while `ls -la` loops ran (dir_concurrency.sh), the moment the
+ * record writers started honouring the result. BH_Write_EIO is set by
+ * the write's own completion and nothing else clears it, so it is the
+ * one honest witness.
+ *
+ * Not dirty: nothing to write, 0 -- after waiting out a write already in
+ * flight (the buffer lock), whose own caller owns its result.
+ */
+int cetrafs_sync_buffer(struct buffer_head *bh)
+{
+    lock_buffer(bh);
+    if (!test_clear_buffer_dirty(bh)) {
+        unlock_buffer(bh);
+        return 0;
+    }
+    clear_buffer_write_io_error(bh);
+    get_bh(bh);
+    bh->b_end_io = end_buffer_write_sync;
+    submit_bh(REQ_OP_WRITE | REQ_SYNC, bh);
+    wait_on_buffer(bh);
+    return buffer_write_io_error(bh) ? -EIO : 0;
+}
+
+/*
+ * Completion for cetrafs_sync_buffer_keep(): unlike end_buffer_write_sync()
+ * it never clears BH_Uptodate on an error -- see there.
+ */
+static void cetrafs_end_write_keep(struct buffer_head *bh, int uptodate)
+{
+    if (!uptodate)
+        set_buffer_write_io_error(bh);
+    unlock_buffer(bh);
+    put_bh(bh);
+}
+
+/*
+ * cetrafs_sync_buffer() for a block whose cached bytes are the ONLY copy
+ * of state the device does not have yet -- the allocation bitmaps. A
+ * failed write must not discard them: a buffer left !uptodate is re-read
+ * from the device by the next sb_bread(), which silently forgets
+ * allocations of blocks already in use. So on failure the buffer stays
+ * uptodate and is re-dirtied, and the next durability boundary retries.
+ *
+ * Also catches an EARLIER failed write of the same block (the flusher's,
+ * whose completion does clear BH_Uptodate): while the bit is still clear
+ * nobody has re-read the block over our bytes, so they are put back.
+ */
+int cetrafs_sync_buffer_keep(struct buffer_head *bh)
+{
+    lock_buffer(bh); /* also waits out a writeback already in flight */
+    if (buffer_write_io_error(bh)) {
+        clear_buffer_write_io_error(bh);
+        set_buffer_uptodate(bh);
+        unlock_buffer(bh);
+        mark_buffer_dirty(bh);
+        return -EIO;
+    }
+    if (!test_clear_buffer_dirty(bh)) {
+        unlock_buffer(bh);
+        return 0;
+    }
+    get_bh(bh);
+    bh->b_end_io = cetrafs_end_write_keep;
+    submit_bh(REQ_OP_WRITE | REQ_SYNC, bh);
+    wait_on_buffer(bh);
+    if (buffer_write_io_error(bh)) {
+        clear_buffer_write_io_error(bh);
+        mark_buffer_dirty(bh); /* still uptodate: the next boundary retries it */
+        return -EIO;
+    }
+    return 0;
+}
+
+/*
  * Copy bytes out of a buffer a writer may be modifying RIGHT NOW under
  * the update protocol above. An unlocked memcpy can copy mid-
  * modification: a torn in-memory view that fails its checksum even

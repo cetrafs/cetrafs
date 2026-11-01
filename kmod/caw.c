@@ -638,7 +638,7 @@ static int cetrafs_cas_flush_block(struct super_block *sb, u64 fs_lba)
     /* A failed flush discards the pending write (clean, !uptodate): the
      * CAS must not go ahead as if it had landed. */
     if (buffer_dirty(bh))
-        ret = sync_dirty_buffer(bh);
+        ret = cetrafs_sync_buffer(bh);
     brelse(bh);
     return ret;
 }
@@ -749,7 +749,7 @@ static int cetrafs_cas_nocaw(struct super_block *sb,
      * leaves the buffer clean and !uptodate, the new image is gone, and
      * reporting success there told a namespace-lock acquire, an inode
      * bitmap claim or a record publish that it had happened. */
-    ret = sync_dirty_buffer(bh);
+    ret = cetrafs_sync_buffer(bh);
     brelse(bh);
     return ret;
 }
