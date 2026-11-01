@@ -1312,15 +1312,24 @@ static int cetrafs_leaf_array_convert(struct super_block *sb,
                  * the head, give the tail back. Same trade the
                  * one-slot-free case below already makes, and only the
                  * tail -- not everything around the block. */
-                u32 k;
-
                 arr[i].ee_len = cetrafs_extent_pack_len(head, true);
                 pr_warn_ratelimited(
                     "extent leaf full splitting a preallocated extent: releasing %u block(s) at %llu "
                     "(they become a hole; no data is lost)\n",
                     tail, (unsigned long long) (phys + head + 1));
-                for (k = 0; k < tail; k++)
-                    cetrafs_free_data_block(sb, phys + head + 1 + k);
+                /* One extent free, as the middle-split case below does:
+                 * this was a cetrafs_free_data_block() per block -- a BG
+                 * lookup and a bitmap or queue update each, with no
+                 * reschedule -- and a preallocated extent can be 2^31
+                 * blocks long.
+                 *
+                 * NOT counted in giveback_blocks, deliberately for now:
+                 * counting it shows write_path_cost.sh's "middle splits
+                 * release < 500 blocks" has never seen this branch -- it
+                 * releases the whole 96 MiB preallocation there (24571
+                 * blocks). Growing the tree here instead is a design
+                 * change, tracked separately. */
+                (void) cetrafs_free_data_extent(sb, phys + head + 1, tail);
             }
             /* Leaf updated and the slot requirement is gone; the caller
              * appends the converted block through the tree. */
