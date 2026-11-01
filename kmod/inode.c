@@ -577,6 +577,7 @@ int cetrafs_write_raw_inode(struct super_block *sb, u64 ino, const cetrafs_inode
     const cetrafs_superblock_t *raw_sb = cetrafs_sb_raw(sb);
     cetrafs_inode_t stamped = *in;
     struct buffer_head *bh;
+    int ret = 0;
 
     /*
      * A SYNCHRONOUS record write publishes this inode's extents to every
@@ -657,13 +658,19 @@ int cetrafs_write_raw_inode(struct super_block *sb, u64 ino, const cetrafs_inode
     cetrafs_bh_end_update(bh);
     if (sync) {
         cetrafs_record_write_counted();
-        sync_dirty_buffer(bh);
+        /* The result IS the answer this function exists to give. A
+         * failed sync leaves the buffer clean and !uptodate -- the
+         * record image is gone -- and a 0 here let a create publish a
+         * dirent naming it, or a directory that had just grown keep a
+         * name in a block its record never mapped: reported created,
+         * gone after a remount (tests/kernel/record_write_error.sh). */
+        ret = sync_dirty_buffer(bh);
     }
     brelse(bh);
 
     if (serialise)
         cetrafs_sb_cas_unlock(sb);
-    return 0;
+    return ret;
 }
 
 /*

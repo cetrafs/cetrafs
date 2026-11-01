@@ -628,15 +628,19 @@ int cetrafs_caw(struct block_device *bdev, u64 lba, unsigned int nblocks, const 
  * CAW: the compare image comes from the DEVICE, so a pending write would
  * both make the compare stale (permanent MISCOMPARE) and, worse, later
  * write back over the swap we just did. */
-static void cetrafs_cas_flush_block(struct super_block *sb, u64 fs_lba)
+static int cetrafs_cas_flush_block(struct super_block *sb, u64 fs_lba)
 {
     struct buffer_head *bh = sb_find_get_block(sb, fs_lba);
+    int ret = 0;
 
     if (!bh)
-        return;
+        return 0;
+    /* A failed flush discards the pending write (clean, !uptodate): the
+     * CAS must not go ahead as if it had landed. */
     if (buffer_dirty(bh))
-        sync_dirty_buffer(bh);
+        ret = sync_dirty_buffer(bh);
     brelse(bh);
+    return ret;
 }
 
 /* Size of one CAS region: the device's atomic unit where there is one,
@@ -741,9 +745,13 @@ static int cetrafs_cas_nocaw(struct super_block *sb,
     cetrafs_bh_begin_update(bh);
     memcpy(bh->b_data + off, new, region);
     cetrafs_bh_end_update(bh);
-    sync_dirty_buffer(bh);
+    /* The swap is only done if it reached the device: a failed sync
+     * leaves the buffer clean and !uptodate, the new image is gone, and
+     * reporting success there told a namespace-lock acquire, an inode
+     * bitmap claim or a record publish that it had happened. */
+    ret = sync_dirty_buffer(bh);
     brelse(bh);
-    return 0;
+    return ret;
 }
 
 /*
@@ -856,7 +864,9 @@ static int cetrafs_cas_region_seeded_impl(struct super_block *sb,
          * paid a wasted CAW *plus* the re-read and CAW it was trying to
          * avoid. Only the READ is skippable. */
         /* PERF(8): not optional -- docs/PERFORMANCE.md */
-        cetrafs_cas_flush_block(sb, fs_lba);
+        ret = cetrafs_cas_flush_block(sb, fs_lba);
+        if (ret)
+            goto out;
 
         if (attempt == 0 && seed && seed_len == region) {
             /* Trust the caller's image once. A stale one just fails the
