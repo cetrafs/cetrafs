@@ -177,6 +177,9 @@ if [ -w /sys/module/cetrafs/parameters/bg_release_skip_empty_check ]; then
     dd if=/dev/urandom of="$MNT/live" bs=1M count=64 status=none
     sync
     ct_param_set bg_release_skip_empty_check 1
+    # The bitmap scan is a second, independent refusal (bg_release_safety.sh
+    # measures it alone); both must go for this control to fire.
+    ct_param_set bg_release_skip_bitmap_scan 1
     # Poll for the heartbeat's release pass rather than sleeping a
     # guess. A fixed 6s was too short -- the suite's own positive case
     # uses wait_for 30 for the same tick -- so the control "failed"
@@ -185,6 +188,7 @@ if [ -w /sys/module/cetrafs/parameters/bg_release_skip_empty_check ]; then
     # one that does not fire.
     wait_for 40 '[ "$('"$MAP"' '"$DEV"' | awk -v f='"$FREE_MARK"' "/^bg /{split(\$3,a,\"=\"); if (a[2]+0 == f+0) n++} END{print n+0}")" -gt 0 ]' || true
     ct_param_set bg_release_skip_empty_check 0
+    ct_param_set bg_release_skip_bitmap_scan 0
     ct_umount "$MNT"
 
     gone="$("$MAP" "$DEV" | awk -v f="$FREE_MARK" '/^bg /{split($3,a,"="); if (a[2]+0 == f+0) n++} END{print n+0}')"

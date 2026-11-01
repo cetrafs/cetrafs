@@ -2455,6 +2455,88 @@ bool cetrafs_bg_release_skip_empty_check;
 module_param_named(bg_release_skip_empty_check, cetrafs_bg_release_skip_empty_check, bool, 0644);
 MODULE_PARM_DESC(bg_release_skip_empty_check, "test-only: hand back a Block Group without checking it is empty");
 
+/*
+ * Test-only: skip the release's bitmap scan, so a suite can show that
+ * the count checks and the scan are each what refuses a Block Group with
+ * data in it (bg_release_empty.sh turns both off; bg_release_safety.sh
+ * only the count checks).
+ */
+static bool cetrafs_bg_release_skip_bitmap_scan;
+module_param_named(bg_release_skip_bitmap_scan, cetrafs_bg_release_skip_bitmap_scan, bool, 0644);
+MODULE_PARM_DESC(bg_release_skip_bitmap_scan, "test-only: hand back a Block Group without scanning its bitmap");
+
+/*
+ * The last word before a Block Group is handed back, run under the
+ * drain (no local allocation can land in it).
+ *
+ * The BITMAP decides it is empty: the free count is a cache, and a cache
+ * feeding the destructive direction of a decision is rule 6's case -- a
+ * count one too high released live data to whoever claimed next.
+ *
+ * And the bitmap must be ON THE DEVICE before the release CAS: frees
+ * clear bits with sync=false, so this node's cached block can be dirty,
+ * and the claimer reads the device. Worse than a stale read, our later
+ * writeback would put our image back over the claimer's allocations.
+ * Synced here, the blocks are clean and can be dropped after the CAS
+ * (cetrafs_bg_release_drop_bitmap()). tests/kernel/bg_release_safety.sh.
+ */
+int cetrafs_bg_release_bitmap_ready(struct super_block *sb, u32 b)
+{
+    struct cetrafs_bg_geom bg;
+    u64 lba, blk, nblocks;
+    int ret;
+
+    ret = cetrafs_read_bg_geom(sb, b, &bg);
+    if (ret)
+        return ret;
+    if (bg.off_data_region <= bg.off_data_bmap)
+        return -EUCLEAN;
+    lba = bg.start_block + bg.off_data_bmap;
+    nblocks = (u64) bg.off_data_region - bg.off_data_bmap;
+
+    if (!READ_ONCE(cetrafs_bg_release_skip_bitmap_scan)) {
+        long free = cetrafs_bitmap_count_free(sb, lba, nblocks, bg.data_block_count);
+
+        if (free < 0)
+            return (int) free;
+        if ((u64) free != bg.data_block_count) {
+            pr_warn_ratelimited("BG %u: count says empty, bitmap has %llu block(s) in use -- not released\n", b,
+                                (unsigned long long) (bg.data_block_count - (u64) free));
+            return -EBUSY;
+        }
+    }
+    for (blk = 0; blk < nblocks; blk++) {
+        ret = cetrafs_sync_one_block(sb, lba + blk);
+        if (ret)
+            return ret;
+    }
+    return 0;
+}
+
+/* After the release CAS: our copy of a bitmap we no longer own must not
+ * be served again -- a later claim would allocate from it, over whatever
+ * the owner in between did. Clean (synced above), so droppable. */
+void cetrafs_bg_release_drop_bitmap(struct super_block *sb, u32 b)
+{
+    struct cetrafs_bg_geom bg;
+    u64 blk;
+
+    if (cetrafs_read_bg_geom(sb, b, &bg) || bg.off_data_region <= bg.off_data_bmap)
+        return;
+    for (blk = 0; blk < (u64) bg.off_data_region - bg.off_data_bmap; blk++)
+        cetrafs_invalidate_block(sb, bg.start_block + bg.off_data_bmap + blk);
+}
+
+/*
+ * Test-only: no per-Block-Group release at all. It runs first on every
+ * tick and hands back each empty member before the Zone Group release
+ * looks, so the latter's own handover of member bitmaps is reachable in
+ * a test only with this off (bg_release_safety.sh, part C).
+ */
+static bool cetrafs_bg_release_off;
+module_param_named(bg_release_off, cetrafs_bg_release_off, bool, 0644);
+MODULE_PARM_DESC(bg_release_off, "test-only: never hand back individual Block Groups");
+
 int cetrafs_bg_release_empty(struct super_block *sb, u32 zg_id, u32 *out_released)
 {
     const cetrafs_superblock_t *raw_sb = cetrafs_sb_raw(sb);
@@ -2462,6 +2544,11 @@ int cetrafs_bg_release_empty(struct super_block *sb, u32 zg_id, u32 *out_release
 
     if (!raw_sb)
         return -EINVAL;
+    if (READ_ONCE(cetrafs_bg_release_off)) {
+        if (out_released)
+            *out_released = 0;
+        return 0;
+    }
     nbg = le32_to_cpu(raw_sb->block_group_count);
 
     for (b = 0; b < nbg; b++) {
@@ -2489,11 +2576,11 @@ int cetrafs_bg_release_empty(struct super_block *sb, u32 zg_id, u32 *out_release
          * this node owns") on an almost empty filesystem. Every heartbeat
          * tick opened that window once per owned Block Group.
          *
-         * A stale count errs the safe way: it can only make us SKIP a
-         * Block Group that turned out to be empty, deferring its release
-         * to a later tick. It can never make us release one that is in
-         * use -- the authoritative bitmap scan below still decides that,
-         * and still runs under the drain.
+         * A stale count errs the safe way HERE: it can only make us SKIP
+         * a Block Group that turned out to be empty, deferring its
+         * release to a later tick. In the other direction -- a count
+         * saying empty over a bitmap that is not -- the bitmap scan in
+         * cetrafs_bg_release_bitmap_ready() decides, under the drain.
          */
         if (!cetrafs_bg_release_skip_empty_check) {
             struct cetrafs_bg_geom pre;
@@ -2518,6 +2605,10 @@ int cetrafs_bg_release_empty(struct super_block *sb, u32 zg_id, u32 *out_release
             cetrafs_sb_undrain_bg(sb, b); /* still in use -- keep it */
             continue;
         }
+        if (cetrafs_bg_release_bitmap_ready(sb, b)) {
+            cetrafs_sb_undrain_bg(sb, b); /* not provably empty, or not durable: keep it */
+            continue;
+        }
 
         ret = cetrafs_cas_record(sb, cetrafs_sb_bg_desc_lba(sb, b), cetrafs_bg_release_mutate, &ctx);
         if (ret) {
@@ -2525,6 +2616,7 @@ int cetrafs_bg_release_empty(struct super_block *sb, u32 zg_id, u32 *out_release
             continue; /* somebody changed it under us; leave it alone */
         }
 
+        cetrafs_bg_release_drop_bitmap(sb, b);
         cetrafs_bg_invalidate_cache(sb, b);
         cetrafs_sb_set_bg_owner(sb, b, CETRAFS_BG_OWNER_FREE);
         /* BOTH counter moves go by immediate CAS, debit before credit.

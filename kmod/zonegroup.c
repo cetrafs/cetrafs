@@ -1200,6 +1200,7 @@ static int cetrafs_zg_try_release_one(struct super_block *sb, u32 zg_id, u32 my_
 {
     cetrafs_zone_group_t *zg; /* heap, not stack -- see the comment above */
     bool empty;
+    u32 b, nbg = 0;
     int ret;
 
     *out_released = false;
@@ -1225,13 +1226,32 @@ static int cetrafs_zg_try_release_one(struct super_block *sb, u32 zg_id, u32 my_
         goto out_unlock;
     }
 
+    /*
+     * Everything the per-Block-Group release does, for every member:
+     * take them out of the allocator's reach FIRST (the drain waits out
+     * an allocation already holding alloc_mutex, and none can start
+     * after), then let the counts -- now including our own deltas --
+     * and then the bitmaps decide, and make those bitmaps durable before
+     * the CAS hands them to the next owner, who reconciles from the
+     * device. Without the drain an allocation could land between the
+     * emptiness check and the CAS, in a Zone Group we no longer own;
+     * without the sync, our later writeback put a stale bitmap over the
+     * new owner's allocations. See cetrafs_bg_release_bitmap_ready().
+     */
+    nbg = le32_to_cpu(cetrafs_sb_raw(sb)->block_group_count);
+    for (b = 0; b < nbg; b++)
+        if (cetrafs_sb_bg_owner(sb, b) == zg_id)
+            cetrafs_sb_drain_bg(sb, b);
+    cetrafs_flush_dirty_free_counts(sb);
+
     ret = cetrafs_zg_is_fully_empty(sb, zg_id, &empty);
-    if (ret)
-        goto out_unlock;
-    if (!empty) {
+    if (ret || !empty) {
         ret = 0; /* a local allocation landed here since the caller checked */
-        goto out_unlock;
+        goto out_undrain;
     }
+    for (b = 0; b < nbg; b++)
+        if (cetrafs_sb_bg_owner(sb, b) == zg_id && cetrafs_bg_release_bitmap_ready(sb, b))
+            goto out_undrain; /* not provably empty, or not durable: keep it */
 
     {
         /* One CAS gives it back: it only lands while the record still
@@ -1243,14 +1263,22 @@ static int cetrafs_zg_try_release_one(struct super_block *sb, u32 zg_id, u32 my_
         if (ret) {
             pr_warn("ZG release: ZG %u not released (%d)\n", zg_id, ret);
             ret = 0;
-            goto out_unlock;
+            goto out_undrain;
         }
     }
 
+    for (b = 0; b < nbg; b++)
+        if (cetrafs_sb_bg_owner(sb, b) == zg_id)
+            cetrafs_bg_release_drop_bitmap(sb, b);
     *out_released = true;
     pr_info("ZG release: gave back ZG %u (empty, surplus to this node's needs)\n", zg_id);
     cetrafs_sb_uncache_zg_ownership(sb, zg_id);
+    goto out_unlock;
 
+out_undrain:
+    for (b = 0; b < nbg; b++)
+        if (cetrafs_sb_bg_owner(sb, b) == zg_id)
+            cetrafs_sb_undrain_bg(sb, b);
 out_unlock:
     kfree(zg);
     return ret;

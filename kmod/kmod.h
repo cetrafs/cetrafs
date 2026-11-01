@@ -854,6 +854,11 @@ int cetrafs_bg_data_layout(struct super_block *sb,
                            u64 *out_bmap_lba,
                            u64 *out_bmap_blocks);
 int cetrafs_inode_is_allocated(struct super_block *sb, u64 ino, bool *out_set);
+/* Handing a Block Group's bitmap over (BG release, ZG release): provably
+ * empty on the bitmap and durable before the CAS; dropped from the cache
+ * after it. See alloc.c. */
+int cetrafs_bg_release_bitmap_ready(struct super_block *sb, u32 b);
+void cetrafs_bg_release_drop_bitmap(struct super_block *sb, u32 b);
 
 // journal.c -- per-NODE journal
 struct cetrafs_journal; /* opaque; owned entirely by journal.c */
