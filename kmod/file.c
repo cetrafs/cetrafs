@@ -203,6 +203,34 @@ const struct file_operations cetrafs_file_ops = {
  * becomes durable at fsync, which is what qemu's flush barriers issue
  * and what F7's fix made correct. ext4 behaves the same way.
  */
+/*
+ * The DIO get_block. An allocating call mutates the extent tree, and
+ * mapping->invalidate_lock, held EXCLUSIVELY, is what serialises that
+ * against every other mutator -- a page fault in particular, which holds
+ * no i_rwsem and never can. i_rwsem alone (all a direct write holds
+ * here) let a fault and this append start from the same record and one
+ * of the two extents was lost (tests/kernel/mmap_vs_odirect_alloc.sh).
+ *
+ * Taken around each get_block call and not around blockdev_direct_IO()
+ * as a whole: the DIO code pins the user's pages between calls, and a
+ * user buffer mmapped from this very file would fault, and a fault
+ * takes invalidate_lock -- held across that, it deadlocks on itself.
+ * Order is i_rwsem -> invalidate_lock, the same as fallocate. A lookup
+ * (create == 0) mutates nothing and stays lockless: reads are the hot
+ * side of a VM image, and they never took it.
+ */
+static int cetrafs_dio_get_block(struct inode *inode, sector_t iblock, struct buffer_head *bh_result, int create)
+{
+    int ret;
+
+    if (!create)
+        return cetrafs_get_block(inode, iblock, bh_result, 0);
+    filemap_invalidate_lock(inode->i_mapping);
+    ret = cetrafs_get_block(inode, iblock, bh_result, create);
+    filemap_invalidate_unlock(inode->i_mapping);
+    return ret;
+}
+
 static ssize_t cetrafs_direct_IO(struct kiocb *iocb, struct iov_iter *iter)
 {
     struct inode *inode = iocb->ki_filp->f_mapping->host;
@@ -210,7 +238,7 @@ static ssize_t cetrafs_direct_IO(struct kiocb *iocb, struct iov_iter *iter)
     if (iov_iter_rw(iter) == WRITE && cetrafs_sb_is_fenced(inode->i_sb))
         return -EIO; /* self-fenced: no new writes */
 
-    return blockdev_direct_IO(iocb, inode, iter, cetrafs_get_block);
+    return blockdev_direct_IO(iocb, inode, iter, cetrafs_dio_get_block);
 }
 
 /*
