@@ -1689,7 +1689,7 @@ int cetrafs_lock_release(struct inode *inode, struct file *file)
          * below for the same reason suspension does them first: the
          * signal must not disappear before the data is durable. */
         bool was_suspended = ci->lock_suspended;
-        int ret, bmap_ret, pub_ret;
+        int ret, bmap_ret, tree_ret, pub_ret;
         ktime_t t0 = ktime_get();
         ktime_t t_data, t_inode, t_bg, t_leaf;
 
@@ -1782,9 +1782,14 @@ int cetrafs_lock_release(struct inode *inode, struct file *file)
          */
         ret = cetrafs_read_raw_inode_overlaid(sb, inode, &raw);
 
+        tree_ret = 0;
         if (!ret && !bmap_ret && cetrafs_le16(raw.eh.eh_magic) == CETRAFS_EXT_MAGIC &&
             cetrafs_le16(raw.eh.eh_depth) >= 1)
-            cetrafs_flush_tree_blocks(inode, &raw);
+            tree_ret = cetrafs_flush_tree_blocks(inode, &raw);
+        if (tree_ret)
+            pr_err("lock release: ino=%llu extent-tree blocks not durable (%d) -- leaving the record unpublished "
+                   "and keeping the lock\n",
+                   (unsigned long long) inode->i_ino, tree_ret);
         t_leaf = ktime_get();
 
         /*
@@ -1802,8 +1807,12 @@ int cetrafs_lock_release(struct inode *inode, struct file *file)
          * a record missing this node's last writes
          * (tests/kernel/close_publish_order.sh).
          */
-        pub_ret = cetrafs_write_vfs_inode(inode);
-        if (pub_ret)
+        /* Not over a tree whose leaves did not reach the device: the
+         * record CAS is durable at once, and a peer opening after the
+         * lock clear would map the file through the on-disk leaves --
+         * without this writer's extents (rule 8). */
+        pub_ret = tree_ret ? tree_ret : cetrafs_write_vfs_inode(inode);
+        if (pub_ret && !tree_ret)
             pr_err("lock release: ino=%llu failed to persist inode state: %d -- keeping the lock\n",
                    (unsigned long long) inode->i_ino, pub_ret);
         if (cetrafs_release_step_gap_ms)

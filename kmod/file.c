@@ -4349,11 +4349,24 @@ static int cetrafs_fsync_one_block(struct super_block *sb, u64 lba)
 
 /* Flush every dirty leaf (depth 1) or leaf+interior (depth 2) block of a
  * file's extent tree. */
+/*
+ * Test-only: the next extent-tree flush fails, as a device write error
+ * on a leaf would.
+ */
+static bool cetrafs_tree_flush_fail_once;
+module_param_named(tree_flush_fail_once, cetrafs_tree_flush_fail_once, bool, 0644);
+MODULE_PARM_DESC(tree_flush_fail_once, "TEST ONLY: the next extent-tree block flush fails with -EIO");
+
 int cetrafs_flush_tree_blocks(struct inode *inode, const cetrafs_inode_t *raw)
 {
     struct super_block *sb = inode->i_sb;
     int ret = 0, r;
     u32 ni;
+
+    if (cetrafs_tree_flush_fail_once) {
+        cetrafs_tree_flush_fail_once = false;
+        return -EIO; /* test-only, see the knob */
+    }
 
     if (cetrafs_le16(raw->eh.eh_depth) == 1)
         return cetrafs_fsync_one_block(
@@ -4374,6 +4387,11 @@ int cetrafs_flush_tree_blocks(struct inode *inode, const cetrafs_inode_t *raw)
                     ret = r;
             }
             brelse(ibh);
+        } else if (!ret) {
+            /* Its leaves cannot be found, so they cannot be flushed:
+             * say so, or the caller publishes a record over leaves that
+             * may never have reached the device. */
+            ret = -EIO;
         }
         r = cetrafs_fsync_one_block(sb, ilba);
         if (r && !ret)
@@ -4431,14 +4449,13 @@ static int cetrafs_fsync(struct file *file, loff_t start, loff_t end, int datasy
     if (ret2 && !ret)
         ret = ret2;
 
-    if (cetrafs_read_raw_inode_overlaid(sb, inode, &raw) == 0) { /* torn-read-safe vs a concurrent publish */
-        if (cetrafs_le16(raw.eh.eh_magic) == CETRAFS_EXT_MAGIC && cetrafs_le16(raw.eh.eh_depth) >= 1)
-            ret2 = cetrafs_flush_tree_blocks(inode, &raw);
-        else
-            ret2 = 0;
-        if (ret2 && !ret)
-            ret = ret2;
-    }
+    /* Torn-read-safe vs a concurrent publish. A record that cannot be
+     * read names leaves that cannot be flushed: an error, not a skip. */
+    ret2 = cetrafs_read_raw_inode_overlaid(sb, inode, &raw);
+    if (!ret2 && cetrafs_le16(raw.eh.eh_magic) == CETRAFS_EXT_MAGIC && cetrafs_le16(raw.eh.eh_depth) >= 1)
+        ret2 = cetrafs_flush_tree_blocks(inode, &raw);
+    if (ret2 && !ret)
+        ret = ret2;
 
     /*
      * The record: i_size, i_blocks, and at depth 0 the extent list
