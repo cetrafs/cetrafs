@@ -1457,14 +1457,14 @@ cetrafs_leaf_array_insert(cetrafs_extent_t *arr, __le16 *entries, u16 max, u32 i
  * publish that, and then run it again with do_free = true over a COPY
  * of the old array to do the freeing.
  */
-static u16 cetrafs_leaf_array_trim(struct super_block *sb,
+static u32 cetrafs_leaf_array_trim(struct super_block *sb,
                                    cetrafs_extent_t *arr,
-                                   u16 entries,
+                                   u32 entries,
                                    u64 new_block_count,
                                    u32 *out_freed,
                                    bool do_free)
 {
-    u16 i, kept = 0;
+    u32 i, kept = 0;
     u32 freed = 0;
 
     for (i = 0; i < entries; i++) {
@@ -1518,19 +1518,26 @@ static u16 cetrafs_leaf_array_trim(struct super_block *sb,
  * cost you -ENOSPC" posture instead of adding chained
  * leaf blocks just for this.
  */
-/* See cetrafs_leaf_array_trim() for what 'do_free' is for. */
+/* See cetrafs_leaf_array_trim() for what 'do_free' is for.
+ *
+ * Counts are u32 here and in cetrafs_leaf_array_trim(), as they are in
+ * struct cetrafs_inode_extents: both edit the FLATTENED map of a whole
+ * file, and a depth-2 tree holds far more than 65535 extents. They took
+ * u16 once, so a file with 65536 + k extents was edited as if it had k
+ * and rebuilt from those -- every other extent dropped from the map, its
+ * blocks leaked (tests/kernel/extent_count_u16.sh). */
 static int cetrafs_leaf_array_punch(struct super_block *sb,
                                     cetrafs_extent_t *arr,
-                                    u16 *entries,
-                                    u16 max,
+                                    u32 *entries,
+                                    u32 max,
                                     u64 start_block,
                                     u64 end_block,
                                     u32 *out_freed,
                                     bool do_free)
 {
-    u16 i, count = *entries;
+    u32 i, count = *entries;
     u32 freed = 0;
-    u16 splits = 0;
+    u32 splits = 0;
 
     /*
      * Dry run first: decide whether this punch can complete BEFORE a
@@ -1564,7 +1571,7 @@ static int cetrafs_leaf_array_punch(struct super_block *sb,
         if (hs > estart && he < eend)
             splits++;
     }
-    if ((u32) count + splits > max)
+    if ((u64) count + splits > max)
         return -ENOSPC; /* nothing freed, nothing changed */
 
     for (i = 0; i < count; i++) {
@@ -3778,7 +3785,7 @@ static long cetrafs_fallocate(struct file *file, int mode, loff_t offset, loff_t
     struct cetrafs_inode_extents ex;
     cetrafs_extent_t *old_flat = NULL, *new_flat = NULL;
     u32 old_n = 0, new_cap = 0;
-    u16 new_n = 0;
+    u32 new_n = 0;
     u64 meta_blocks = 0;
     u32 freed = 0, discard = 0;
     int ret;
@@ -3990,8 +3997,8 @@ static long cetrafs_fallocate(struct file *file, int mode, loff_t offset, loff_t
     }
     if (old_n)
         memcpy(new_flat, old_flat, (size_t) old_n * sizeof(*new_flat));
-    new_n = (u16) old_n;
-    ret = cetrafs_leaf_array_punch(sb, new_flat, &new_n, (u16) new_cap, start_block, end_block, &freed,
+    new_n = old_n;
+    ret = cetrafs_leaf_array_punch(sb, new_flat, &new_n, new_cap, start_block, end_block, &freed,
                                    /*do_free=*/false);
     if (ret) {
         kvfree(new_flat);
@@ -4017,7 +4024,7 @@ static long cetrafs_fallocate(struct file *file, int mode, loff_t offset, loff_t
      * Checked by content, not just by the freed count, so a punch that
      * only RESHAPES the map (a split freeing nothing) still publishes.
      */
-    if (freed == 0 && new_n == (u16) old_n &&
+    if (freed == 0 && new_n == old_n &&
         (old_n == 0 || !memcmp(new_flat, old_flat, (size_t) old_n * sizeof(*new_flat)))) {
         kvfree(new_flat);
         kvfree(old_flat);
@@ -4071,9 +4078,9 @@ static long cetrafs_fallocate(struct file *file, int mode, loff_t offset, loff_t
      * publish-before-free shape as cetrafs_truncate_shrink(). */
     cetrafs_tree_free_meta(inode, &old_raw);
     {
-        u16 discard_entries = (u16) old_n;
-        int fret = cetrafs_leaf_array_punch(sb, old_flat, &discard_entries, (u16) (old_n + 2), start_block, end_block,
-                                            &discard, /*do_free=*/true);
+        u32 discard_entries = old_n;
+        int fret = cetrafs_leaf_array_punch(sb, old_flat, &discard_entries, old_n + 2, start_block, end_block, &discard,
+                                            /*do_free=*/true);
         if (fret)
             pr_err("punch: freeing the old blocks failed (%d) -- %u block(s) may have leaked\n", fret, freed);
     }
