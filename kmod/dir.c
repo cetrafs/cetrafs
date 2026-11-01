@@ -2350,6 +2350,14 @@ static unsigned int cetrafs_rename_force_retry;
 module_param_named(rename_force_retry, cetrafs_rename_force_retry, uint, 0644);
 MODULE_PARM_DESC(rename_force_retry, "test only: report a lost destination race on the next N renames");
 
+/*
+ * Test only: the next rename destination re-verification cannot read the
+ * target's record, as a device error would.
+ */
+static bool cetrafs_rename_recheck_read_fail;
+module_param_named(rename_recheck_read_fail, cetrafs_rename_recheck_read_fail, bool, 0644);
+MODULE_PARM_DESC(rename_recheck_read_fail, "test only: the next rename target re-check cannot read the record");
+
 static int cetrafs_rename_locked(struct mnt_idmap *idmap,
                                  struct inode *old_dir,
                                  struct dentry *old_dentry,
@@ -2422,9 +2430,23 @@ static int cetrafs_rename_locked(struct mnt_idmap *idmap,
         if (ctx.ino != 0 && ctx.ino == locked_ino && new_inode) {
             cetrafs_inode_t *tr = kmalloc(sizeof(*tr), GFP_NOFS); /* off the stack: records are 1 KiB (v0x0005) */
 
+            /* A check that could not run is not a pass: renaming over a
+             * target whose identity went unverified is exactly what this
+             * guards against, so a failed read or allocation fails the
+             * rename instead of skipping the check. */
+            if (!tr)
+                return -ENOMEM;
             cetrafs_invalidate_raw_inode(new_dir->i_sb, ctx.ino);
-            if (tr && cetrafs_read_raw_inode(new_dir->i_sb, ctx.ino, tr) == 0 &&
-                cetrafs_le64(tr->generation) != cetrafs_inode_get_generation(new_inode)) {
+            ret = cetrafs_read_raw_inode(new_dir->i_sb, ctx.ino, tr);
+            if (cetrafs_rename_recheck_read_fail) {
+                cetrafs_rename_recheck_read_fail = false;
+                ret = -EIO; /* test only, see the knob */
+            }
+            if (ret) {
+                kfree(tr);
+                return ret;
+            }
+            if (cetrafs_le64(tr->generation) != cetrafs_inode_get_generation(new_inode)) {
                 pr_warn_ratelimited(
                     "rename: '%.*s' in dir ino=%llu still names ino=%llu, but that is a DIFFERENT file now "
                     "(generation %llu on disk, %llu in core) -- retrying rather than renaming over it\n",

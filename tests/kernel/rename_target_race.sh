@@ -112,6 +112,24 @@ force 0
 dmesg_since "$MARK" | grep -q "giving up" &&
     pass "...and the give-up is logged, not silent" || fail "nothing was logged when the rename gave up"
 
+log "a destination re-check that cannot read the target fails the rename"
+# The re-check is what tells "still the file we locked" from "a new file
+# that took its number"; it used to be skipped on a read error or a
+# failed allocation, and the rename went ahead over an unverified target.
+# DISCRIMINATION (measured on the unfixed code): the rename succeeds.
+force 0
+mk s6 "SIX"
+mk d6 "OLD6"
+ct_param_set rename_recheck_read_fail 1
+if mv "$MNT/s6" "$MNT/d6" 2>/dev/null; then
+    fail "the rename went ahead although its target re-check could not run"
+else
+    pass "the rename failed rather than replace an unverified target"
+fi
+ct_param_set rename_recheck_read_fail 0
+[ "$(cat "$MNT/d6")" = "OLD6" ] && [ "$(cat "$MNT/s6" 2>/dev/null)" = "SIX" ] &&
+    pass "...and both names are untouched" || fail "the failed rename changed something: d6=$(cat "$MNT/d6" 2>&1)"
+
 log "the filesystem is still healthy afterwards"
 force 0
 mk s5 "FIVE"
