@@ -540,6 +540,12 @@ struct cetrafs_sb_info {
      */
     spinlock_t resv_list_lock;
     struct list_head resv_list;
+    /* Bumped, under resv_list_lock, every time blocks LEAVE the
+     * registry: a span unpublished or re-pointed. A released run has
+     * become somebody's data (written and closed, committed by a
+     * defrag), so a scrub verdict taken before the release may not free
+     * on it -- see cetrafs_sb_resv_seq(). */
+    u64 resv_seq;
 };
 
 /* Mount-option state, carried on fc->fs_private from parse time to
@@ -2209,6 +2215,8 @@ void cetrafs_resv_publish(struct super_block *sb, struct cetrafs_resv_span *span
         return;
 
     spin_lock(&sbi->resv_list_lock);
+    if (!list_empty(&span->link) && (span->start != start || span->count != count))
+        sbi->resv_seq++; /* re-pointed: the old run's blocks left the registry */
     span->start = start;
     span->count = count;
     if (list_empty(&span->link))
@@ -2231,11 +2239,34 @@ void cetrafs_resv_unpublish(struct super_block *sb, struct cetrafs_resv_span *sp
     }
 
     spin_lock(&sbi->resv_list_lock);
-    if (!list_empty(&span->link))
+    if (!list_empty(&span->link)) {
         list_del_init(&span->link);
+        sbi->resv_seq++;
+    }
     span->start = 0;
     span->count = 0;
     spin_unlock(&sbi->resv_list_lock);
+}
+
+/*
+ * How many times blocks have left the reservation registry. The scrub
+ * takes it before the reference set its frees rest on, and frees a block
+ * only if, at that instant, the block is covered by no span AND this has
+ * not moved: then no span held the block at any point since the evidence
+ * was taken, so no released run can have turned it into data the
+ * evidence does not show (tests/kernel/scrub_vs_released_run.sh).
+ */
+u64 cetrafs_sb_resv_seq(struct super_block *sb)
+{
+    struct cetrafs_sb_info *sbi = sb->s_fs_info;
+    u64 v;
+
+    if (!sbi)
+        return 0;
+    spin_lock(&sbi->resv_list_lock);
+    v = sbi->resv_seq;
+    spin_unlock(&sbi->resv_list_lock);
+    return v;
 }
 
 bool cetrafs_resv_covers(struct super_block *sb, u64 lba)

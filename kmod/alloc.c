@@ -1988,11 +1988,11 @@ u64 cetrafs_foreign_free_leak_count(void)
     return (u64) atomic64_read(&cetrafs_foreign_free_leaks);
 }
 
-static int __cetrafs_free_data_extent(struct super_block *sb, u64 lba, u32 count, bool unless_reserved);
+static int __cetrafs_free_data_extent(struct super_block *sb, u64 lba, u32 count, const u64 *resv_seq);
 
 int cetrafs_free_data_extent(struct super_block *sb, u64 lba, u32 count)
 {
-    return __cetrafs_free_data_extent(sb, lba, count, false);
+    return __cetrafs_free_data_extent(sb, lba, count, NULL);
 }
 
 /*
@@ -2005,12 +2005,14 @@ int cetrafs_free_data_extent(struct super_block *sb, u64 lba, u32 count)
  * run produced. Owner paths keep the plain variant: the reservation
  * DROP deliberately frees blocks its own span still covers.
  */
-int cetrafs_free_data_extent_unless_reserved(struct super_block *sb, u64 lba, u32 count)
+int cetrafs_free_data_extent_unless_reserved(struct super_block *sb, u64 lba, u32 count, u64 resv_seq)
 {
-    return __cetrafs_free_data_extent(sb, lba, count, true);
+    return __cetrafs_free_data_extent(sb, lba, count, &resv_seq);
 }
 
-static int __cetrafs_free_data_extent(struct super_block *sb, u64 lba, u32 count, bool unless_reserved)
+/* resv_seq: NULL for an owner's free; the scrub passes the registry's
+ * release count from before its evidence (cetrafs_sb_resv_seq()). */
+static int __cetrafs_free_data_extent(struct super_block *sb, u64 lba, u32 count, const u64 *resv_seq)
 {
     struct cetrafs_bg_geom bg;
     u64 data_start, bit, b, freed = 0;
@@ -2111,8 +2113,16 @@ static int __cetrafs_free_data_extent(struct super_block *sb, u64 lba, u32 count
     for (b = 0; b < count; b++) {
         bool set = false;
 
-        if (unless_reserved && cetrafs_resv_covers(sb, lba + b))
+        if (resv_seq && cetrafs_resv_covers(sb, lba + b))
             continue; /* a live reservation claimed it since the caller decided -- not ours to free */
+        /* Not covered NOW -- but a run released since the verdict was
+         * covered then and is somebody's data now. Order matters: the
+         * count is read AFTER the coverage test, so "unchanged" means no
+         * span held this block at any point since the verdict. */
+        if (resv_seq && cetrafs_sb_resv_seq(sb) != *resv_seq) {
+            ret = -EAGAIN;
+            break;
+        }
 
         ret = cetrafs_bitmap_test_bit(sb, bg.start_block + bg.off_data_bmap, bg.off_data_region - bg.off_data_bmap,
                                       bit + b, &set);
@@ -2143,7 +2153,7 @@ static int __cetrafs_free_data_extent(struct super_block *sb, u64 lba, u32 count
      * block leak. The queue path on the other side of this function
      * already logs its own failure loudly; this half did not.
      */
-    if (ret)
+    if (ret && ret != -EAGAIN) /* -EAGAIN: the scrub's verdict went stale; it keeps the blocks */
         pr_err("free: extent [%llu +%u) failed after %llu block(s): %d -- those blocks are leaked\n",
                (unsigned long long) lba, count, (unsigned long long) freed, ret);
 

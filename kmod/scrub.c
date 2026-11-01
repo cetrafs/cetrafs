@@ -84,6 +84,12 @@ MODULE_PARM_DESC(scrub_ignore_shadow,
  * for cetrafs_sb_info.bg_alloc_seq. With it, a concurrent workload gets
  * blocks freed out from under files that were just given them.
  * tests/kernel/churn_oracle.sh is what measures the difference. */
+/* TEST ONLY: hold the scrub between its verdict (pass 2) and its frees,
+ * so a test can release a run inside that window. */
+static unsigned int cetrafs_scrub_verdict_stall_ms;
+module_param_named(scrub_verdict_stall_ms, cetrafs_scrub_verdict_stall_ms, uint, 0644);
+MODULE_PARM_DESC(scrub_verdict_stall_ms, "TEST ONLY: ms to hold between the scrub's verdict and its frees");
+
 static bool cetrafs_scrub_ignore_alloc_seq;
 module_param_named(scrub_ignore_alloc_seq, cetrafs_scrub_ignore_alloc_seq, bool, 0644);
 MODULE_PARM_DESC(scrub_ignore_alloc_seq,
@@ -150,6 +156,7 @@ struct scrub_bg {
     unsigned long *ref;  /* referenced set, data_count bits (indexed block - data_start) */
     unsigned long *cand; /* pass-1 candidate set, data_count bits */
     u64 alloc_seq;       /* allocations in this BG when the evidence was taken */
+    u64 resv_seq;        /* reservation releases when the evidence was taken */
 };
 
 
@@ -363,6 +370,7 @@ static int scrub_free_confirmed(struct cetrafs_scrub *s, struct scrub_bg *b, u64
     struct super_block *sb = s->sb;
     u8 *bmap = scrub_read_bitmap(sb, b);
     u64 bit;
+    int ret;
 
     if (!bmap)
         return -EIO;
@@ -428,7 +436,15 @@ static int scrub_free_confirmed(struct cetrafs_scrub *s, struct scrub_bg *b, u64
             if (reserved)
                 continue;
 
-            if (cetrafs_free_data_extent_unless_reserved(sb, b->data_start + bit, 1) == 0) {
+            ret = cetrafs_free_data_extent_unless_reserved(sb, b->data_start + bit, 1, b->resv_seq);
+            if (ret == -EAGAIN) {
+                /* A run was released since the verdict: it is somebody's
+                 * data now, and the evidence predates it. Same answer as
+                 * a moved allocation count -- abandon, retry next cycle. */
+                pr_debug("scrub: a reservation was released since the verdict -- abandoning BG %u\n", b->bg_id);
+                break;
+            }
+            if (ret == 0) {
                 ctrace("SCRUBFREE lba=%llu bg=%u\n", (unsigned long long) (b->data_start + bit), b->bg_id);
                 (*out_freed)++;
                 atomic64_inc(&cetrafs_scrub_reclaimed);
@@ -669,14 +685,24 @@ static void cetrafs_scrub_cycle(struct cetrafs_scrub *s)
      * record per allocated inode and is itself slow, so an allocation
      * during it would otherwise go unnoticed by a verdict that claims to
      * describe the state afterwards. */
-    for (i = 0; i < ctx.nbgs; i++)
+    for (i = 0; i < ctx.nbgs; i++) {
         ctx.bgs[i].alloc_seq = cetrafs_sb_bg_alloc_seq(sb, ctx.bgs[i].bg_id);
+        ctx.bgs[i].resv_seq = cetrafs_sb_resv_seq(sb);
+    }
 
     /* Pass 2: rebuild the reference set FRESH, confirm, free. This is
      * the verdict that frees blocks, so it may not rest on a cached view
      * of a table other nodes write. */
     if (scrub_build_refset(s, &ctx, /*fresh=*/true) != 0)
         goto done;
+    if (cetrafs_scrub_verdict_stall_ms) { /* TEST ONLY */
+        unsigned int ms;
+
+        pr_info("scrub: holding the verdict %u ms (test)\n", cetrafs_scrub_verdict_stall_ms);
+        for (ms = 0; ms < cetrafs_scrub_verdict_stall_ms && !s->draining; ms += 100)
+            msleep(100);
+        pr_info("scrub: verdict released (test)\n");
+    }
     for (i = 0; i < ctx.nbgs && !s->draining; i++)
         if (scrub_free_confirmed(s, &ctx.bgs[i], &freed) != 0)
             break;

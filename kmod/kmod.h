@@ -716,7 +716,8 @@ int cetrafs_alloc_pick_run(struct super_block *sb, u64 count, u64 *out_lba);
 int cetrafs_alloc_pick_run_resv(struct super_block *sb, u64 count, u64 *out_lba, struct cetrafs_resv_span *span);
 int cetrafs_alloc_data_run_resv(struct super_block *sb, u32 bg_id, u64 count, u64 *out_lba,
                                 struct cetrafs_resv_span *span);
-int cetrafs_free_data_extent_unless_reserved(struct super_block *sb, u64 lba, u32 count);
+int cetrafs_free_data_extent_unless_reserved(struct super_block *sb, u64 lba, u32 count, u64 resv_seq);
+u64 cetrafs_sb_resv_seq(struct super_block *sb);
 struct cetrafs_zg_info {
     u32 owner_node_id; /* CETRAFS_NODE_ID_NONE if unclaimed */
     u64 free_data_blocks;
