@@ -482,12 +482,20 @@ static u64 cetrafs_dir_extents_nblocks(const struct cetrafs_dir_extents *de)
 
 typedef int (*cetrafs_dirent_visit_fn)(void *priv, const cetrafs_dirent_t *de, loff_t pos);
 
-static int cetrafs_walk_dirents(struct inode *dir, cetrafs_dirent_visit_fn visit, void *priv)
+/*
+ * min_pos: every entry below this position is of no interest to the
+ * caller, so a block wholly below it is not even read. readdir resumes
+ * at its last position on every getdents call, and walking -- reading
+ * -- the whole directory from the top each time made listing a large
+ * directory quadratic in device reads whenever it had changed on
+ * another node (every read is forced fresh then).
+ */
+static int cetrafs_walk_dirents_from(struct inode *dir, cetrafs_dirent_visit_fn visit, void *priv, loff_t min_pos)
 {
     unsigned int dirents_per_block = CETRAFS_DIRENTS_PER_BLOCK;
     struct cetrafs_dir_extents dx;
     cetrafs_inode_t raw;
-    bool fresh;
+    bool fresh, skipped = false;
     int ret, i;
 
     /* Any node can add/remove entries in any directory at any time (no
@@ -517,10 +525,16 @@ static int cetrafs_walk_dirents(struct inode *dir, cetrafs_dirent_visit_fn visit
 
         for (b = 0; b < len; b++) {
             loff_t base_pos = ((loff_t) cetrafs_le32(ext->ee_block) + b) * CETRAFS_BLOCK_SIZE;
-            struct buffer_head *bh = cetrafs_dirent_read(dir->i_sb, phys + b, fresh);
+            struct buffer_head *bh;
             const cetrafs_dirent_t *de;
             unsigned int e;
 
+            if (base_pos + CETRAFS_BLOCK_SIZE <= min_pos) {
+                skipped = true;
+                continue;
+            }
+            cond_resched(); /* O(blocks) per pass, whatever their content */
+            bh = cetrafs_dirent_read(dir->i_sb, phys + b, fresh);
             if (!bh) {
                 ret = -EIO;
                 goto out;
@@ -550,13 +564,19 @@ static int cetrafs_walk_dirents(struct inode *dir, cetrafs_dirent_visit_fn visit
      * the whole directory in cache at exactly this sequence; note that,
      * so the next walk can stay cached until someone mutates it. A pass
      * that stopped early (found what it wanted, or errored) has NOT
-     * refreshed every block, so it must not claim this. */
-    if (fresh)
+     * refreshed every block, so it must not claim this -- and neither
+     * has one that skipped blocks below min_pos. */
+    if (fresh && !skipped)
         cetrafs_inode_set_dirent_seq_cached(dir, cetrafs_le64(raw.dirent_seq));
     ret = 0;
 out:
     cetrafs_dir_extents_put(&dx);
     return ret;
+}
+
+static int cetrafs_walk_dirents(struct inode *dir, cetrafs_dirent_visit_fn visit, void *priv)
+{
+    return cetrafs_walk_dirents_from(dir, visit, priv, 0);
 }
 
 /*
@@ -1452,7 +1472,7 @@ static int cetrafs_readdir(struct file *file, struct dir_context *dctx)
 {
     struct cetrafs_readdir_ctx ctx = {.dctx = dctx};
 
-    return cetrafs_walk_dirents(file_inode(file), cetrafs_readdir_visit, &ctx);
+    return cetrafs_walk_dirents_from(file_inode(file), cetrafs_readdir_visit, &ctx, dctx->pos);
 }
 
 /*
