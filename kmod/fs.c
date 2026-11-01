@@ -469,6 +469,12 @@ struct cetrafs_sb_info {
      * is no worse than the behaviour this replaces.
      */
     spinlock_t nsrel_lock;
+    /* Held by a retry pass from taking the set to putting back what it
+     * could not settle; nsrel_active says one is in flight (under
+     * nsrel_lock). A local acquire waits it out before dropping its own
+     * inode's entry -- see cetrafs_sb_nslock_forget(). */
+    struct mutex nsrel_mutex;
+    bool nsrel_active;
     u32 nsrel_count;
     struct cetrafs_nsrel_pending nsrel[CETRAFS_NSLOCK_DEFERRED_MAX];
 
@@ -1074,6 +1080,7 @@ int cetrafs_fill_super(struct super_block *sb, struct fs_context *fc)
          * alive", which errs toward never reclaiming from a live node. */
         spin_lock_init(&sbi->resv_list_lock);
         spin_lock_init(&sbi->nsrel_lock);
+        mutex_init(&sbi->nsrel_mutex);
         INIT_LIST_HEAD(&sbi->resv_list);
 
         spin_lock_init(&sbi->peer_lock);
@@ -2933,7 +2940,8 @@ void cetrafs_sb_nslock_defer(struct super_block *sb, u64 ino, u64 generation)
 }
 
 /* Take the whole pending set, for one retry pass. Entries the pass
- * cannot settle are put back by it. */
+ * cannot settle are put back by it. The pass runs between
+ * cetrafs_sb_nslock_retry_begin() and _end(), which this requires. */
 u32 cetrafs_sb_nslock_take_deferred(struct super_block *sb, struct cetrafs_nsrel_pending *out, u32 max)
 {
     struct cetrafs_sb_info *sbi = sb->s_fs_info;
@@ -2946,8 +2954,70 @@ u32 cetrafs_sb_nslock_take_deferred(struct super_block *sb, struct cetrafs_nsrel
     n = min(sbi->nsrel_count, max);
     memcpy(out, sbi->nsrel, n * sizeof(*out));
     sbi->nsrel_count = 0;
+    sbi->nsrel_active = n != 0;
     spin_unlock(&sbi->nsrel_lock);
     return n;
+}
+
+void cetrafs_sb_nslock_retry_begin(struct super_block *sb)
+{
+    mutex_lock(&((struct cetrafs_sb_info *) sb->s_fs_info)->nsrel_mutex);
+}
+
+void cetrafs_sb_nslock_retry_end(struct super_block *sb)
+{
+    struct cetrafs_sb_info *sbi = sb->s_fs_info;
+
+    spin_lock(&sbi->nsrel_lock);
+    sbi->nsrel_active = false;
+    spin_unlock(&sbi->nsrel_lock);
+    mutex_unlock(&sbi->nsrel_mutex);
+}
+
+/*
+ * A local acquire of 'ino' is about to make this node the lock's live
+ * holder: drop any deferred release of it, so the heartbeat's retry
+ * cannot clear the lock out from under that holder. (The retry's CAS
+ * cannot tell the difference -- the record says "ours" either way.)
+ *
+ * Called under the inode's ns_mutex, which is what makes the fast path
+ * sound: only a release of this inode enqueues it, and a release runs
+ * under that same mutex, so if nothing is queued and no pass is in
+ * flight now, nothing for 'ino' can appear until we release. Otherwise
+ * wait out any pass in flight, then remove the entry.
+ *
+ * Returns true and fills *generation if an entry was dropped: if the
+ * acquire then fails, the caller must put it back
+ * (cetrafs_sb_nslock_defer()), or the leftover lock is retried by
+ * nobody.
+ */
+bool cetrafs_sb_nslock_forget(struct super_block *sb, u64 ino, u64 *generation)
+{
+    struct cetrafs_sb_info *sbi = sb->s_fs_info;
+    bool busy, found = false;
+    u32 i;
+
+    if (!sbi)
+        return false;
+
+    spin_lock(&sbi->nsrel_lock);
+    busy = sbi->nsrel_count || sbi->nsrel_active;
+    spin_unlock(&sbi->nsrel_lock);
+    if (!busy)
+        return false;
+
+    mutex_lock(&sbi->nsrel_mutex);
+    spin_lock(&sbi->nsrel_lock);
+    for (i = 0; i < sbi->nsrel_count; i++)
+        if (sbi->nsrel[i].ino == ino) {
+            *generation = sbi->nsrel[i].generation;
+            sbi->nsrel[i] = sbi->nsrel[--sbi->nsrel_count];
+            found = true;
+            break;
+        }
+    spin_unlock(&sbi->nsrel_lock);
+    mutex_unlock(&sbi->nsrel_mutex);
+    return found;
 }
 
 void cetrafs_sb_accrue_zg_free(struct super_block *sb, u32 zg_id, s64 delta)

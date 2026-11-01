@@ -109,6 +109,15 @@ static bool cetrafs_nslock_release_fail;
 module_param_named(nslock_release_fail, cetrafs_nslock_release_fail, bool, 0644);
 MODULE_PARM_DESC(nslock_release_fail, "TEST ONLY: namespace-lock releases do not commit");
 
+/*
+ * Test-only: hold every namespace lock this long after acquiring it, so
+ * a test can make the heartbeat's deferred-release retry fire while a
+ * local operation holds the lock.
+ */
+static unsigned int cetrafs_nslock_hold_ms;
+module_param_named(nslock_hold_ms, cetrafs_nslock_hold_ms, uint, 0644);
+MODULE_PARM_DESC(nslock_hold_ms, "TEST ONLY: sleep this long holding each namespace lock just acquired");
+
 static int cetrafs_nslock_mutate(void *image, unsigned int len, void *priv)
 {
     struct cetrafs_nslock_ctx *ctx = priv;
@@ -145,12 +154,16 @@ static int cetrafs_nslock_mutate(void *image, unsigned int len, void *priv)
         bool mine_already = (cetrafs_le32(rec.ns_lock_owner) == ctx->my_node_id);
         bool stealable = ctx->steal && cetrafs_le32(rec.ns_lock_owner) == ctx->steal_from;
 
-        /* "Already ours" is reachable only as leftover state from a
-         * previous incarnation of this node (we crashed holding it and
-         * remounted onto the same registry row): the per-inode local
-         * mutex guarantees no live local holder. Taking it back is
-         * correct and is what keeps a self-crash from wedging us out of
-         * our own directories forever. */
+        /* "Already ours" is leftover state: from a previous
+         * incarnation of this node (we crashed holding it and remounted
+         * onto the same registry row), or from a release of ours that
+         * did not commit. The per-inode local mutex guarantees no live
+         * local holder, and the acquire has already dropped any
+         * deferred retry of that release (cetrafs_sb_nslock_forget()),
+         * which would otherwise clear the lock under the holder this
+         * makes. Taking it back is correct and is what keeps a
+         * self-crash from wedging us out of our own directories
+         * forever. */
         if (!free_now && !mine_already && !stealable)
             return -EBUSY;
 
@@ -225,14 +238,17 @@ void cetrafs_nslock_retry_deferred(struct super_block *sb)
     u32 n, i;
     u32 my_node_id;
 
+    /* Begin/end bracket the pass so a local acquire of one of these
+     * inodes waits it out (cetrafs_sb_nslock_forget()). */
+    cetrafs_sb_nslock_retry_begin(sb);
     n = cetrafs_sb_nslock_take_deferred(sb, pend, ARRAY_SIZE(pend));
     if (!n)
-        return;
+        goto out;
     if (cetrafs_sb_is_fenced(sb) || cetrafs_sb_get_node_id(sb, &my_node_id) != 0) {
         /* Nothing we may write right now; keep them for later. */
         for (i = 0; i < n; i++)
             cetrafs_sb_nslock_defer(sb, pend[i].ino, pend[i].generation);
-        return;
+        goto out;
     }
 
     for (i = 0; i < n; i++) {
@@ -264,6 +280,8 @@ void cetrafs_nslock_retry_deferred(struct super_block *sb)
             cetrafs_sb_nslock_defer(sb, pend[i].ino, pend[i].generation);
         }
     }
+out:
+    cetrafs_sb_nslock_retry_end(sb);
 }
 
 
@@ -331,6 +349,8 @@ static int cetrafs_nslock_try(struct inode *inode, u32 my_node_id)
 static int cetrafs_nslock_acquire_tries(struct inode *inode, int max_tries)
 {
     struct super_block *sb = inode->i_sb;
+    u64 deferred_gen = 0;
+    bool had_deferred;
     u32 my_node_id;
     int attempt, ret;
 
@@ -342,6 +362,9 @@ static int cetrafs_nslock_acquire_tries(struct inode *inode, int max_tries)
         return ret;
 
     cetrafs_inode_ns_mutex_lock(inode);
+    /* Before the acquire can make us the live holder: a deferred retry
+     * of an earlier release of ours would clear the lock under us. */
+    had_deferred = cetrafs_sb_nslock_forget(sb, inode->i_ino, &deferred_gen);
 
     for (attempt = 0; attempt < max_tries; attempt++) {
         ret = cetrafs_nslock_try(inode, my_node_id);
@@ -349,15 +372,23 @@ static int cetrafs_nslock_acquire_tries(struct inode *inode, int max_tries)
             if (!ret) {
                 ctrace("NSHOLD ino=%llu ACQ\n", (unsigned long long) inode->i_ino);
                 cetrafs_inode_ns_holder_set(inode, true);
+                if (cetrafs_nslock_hold_ms)
+                    msleep(cetrafs_nslock_hold_ms); /* test-only, see the knob */
             }
             if (ret)
-                cetrafs_inode_ns_mutex_unlock(inode);
+                goto fail;
             return ret;
         }
         msleep(CETRAFS_NSLOCK_SLEEP_MS);
     }
+    ret = -EBUSY;
+fail:
+    /* Not the holder after all: whatever the dropped retry was for is
+     * still owed. */
+    if (had_deferred)
+        cetrafs_sb_nslock_defer(sb, inode->i_ino, deferred_gen);
     cetrafs_inode_ns_mutex_unlock(inode);
-    return -EBUSY;
+    return ret;
 }
 
 /*
