@@ -136,6 +136,27 @@ D="$(dump)"
 echo "$D" | grep -q 'mode=0' &&
     pass "nofilelock: closing the holding fd released the lock (fd-scoped) ($D)" ||
     fail "nofilelock: lock still held after the fd closed ($D)"
+
+# The reader check that runs right after the claim cannot read the
+# record: flock must back out and fail, not keep a lock nobody verified
+# (the error used to fall through to success).
+# DISCRIMINATION (measured on the unfixed code): flock succeeds and the
+# on-disk lock stays claimed.
+exec 9>>"$MNT/victim"
+ct_param_set flock_reader_check_fail_once 1
+if flock -x -n 9; then
+    fail "nofilelock: flock succeeded although its reader check failed -- exclusivity unverified"
+    flock -u 9 || true
+else
+    pass "nofilelock: a reader check that failed fails the flock"
+fi
+D="$(dump)"
+echo "$D" | grep -q 'mode=0' &&
+    pass "nofilelock: the failed flock gave the on-disk lock back ($D)" ||
+    fail "nofilelock: the failed flock left the lock held ($D)"
+ct_param_set flock_reader_check_fail_once 0
+flock -x -n 9 && pass "nofilelock: the next flock succeeds" || fail "nofilelock: flock still failing after the fault"
+exec 9>&-
 ct_umount "$MNT"
 
 ct_fsck "$DEV" >/dev/null 2>&1 && pass "fsck clean" || fail "fsck: $(ct_fsck "$DEV" 2>&1 | grep -i err | head -2)"

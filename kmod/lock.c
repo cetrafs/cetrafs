@@ -2596,6 +2596,14 @@ out:
 }
 
 /*
+ * Test-only: the next post-claim reader check in flock(LOCK_EX) fails as
+ * a device error reading the record would.
+ */
+static bool cetrafs_flock_reader_check_fail_once;
+module_param_named(flock_reader_check_fail_once, cetrafs_flock_reader_check_fail_once, bool, 0644);
+MODULE_PARM_DESC(flock_reader_check_fail_once, "TEST ONLY: the next flock reader check fails with -EIO");
+
+/*
  * The non-blocking claim behind flock(fd, LOCK_EX) (cetrafs_flock below).
  * Claims the whole-file exclusive lock for this node: the on-disk lock it
  * takes is the exact same one a write-open claims under the default mount,
@@ -2671,7 +2679,15 @@ static int cetrafs_lock_explicit_acquire(struct inode *inode, struct file *file)
      * than assert a false exclusivity. Checking AFTER the claim (not before)
      * means the set of possible openers is frozen: only a peer already
      * present can be found, never a new one racing in. */
-    if (cetrafs_lock_foreign_reader_exists(sb, inode->i_ino, my_node_id, &present) == 0 && present) {
+    ret = cetrafs_lock_foreign_reader_exists(sb, inode->i_ino, my_node_id, &present);
+    if (cetrafs_flock_reader_check_fail_once) {
+        cetrafs_flock_reader_check_fail_once = false;
+        ret = -EIO;
+    }
+    /* A check that could not run is not a check that passed: back out on
+     * an error exactly as on a reader found, or flock would assert an
+     * exclusivity nobody verified. */
+    if (ret || present) {
         struct cetrafs_lock_cas_ctx rel = {
             .my_node_id = my_node_id,
             .generation = cetrafs_le64(raw.generation),
@@ -2679,7 +2695,8 @@ static int cetrafs_lock_explicit_acquire(struct inode *inode, struct file *file)
         };
 
         cetrafs_lock_cas(inode, &rel, NULL); /* give the lock back */
-        ret = -EBUSY;
+        if (!ret)
+            ret = -EBUSY;
         goto out;
     }
 
