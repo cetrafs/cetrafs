@@ -1574,7 +1574,7 @@ static int cetrafs_leaf_array_punch(struct super_block *sb,
                                     u32 *out_freed,
                                     bool do_free)
 {
-    u32 i, count = *entries;
+    u32 i, w, count = *entries;
     u32 freed = 0;
     u32 splits = 0;
 
@@ -1613,8 +1613,17 @@ static int cetrafs_leaf_array_punch(struct super_block *sb,
     if ((u64) count + splits > max)
         return -ENOSPC; /* nothing freed, nothing changed */
 
-    for (i = 0; i < count; i++) {
-        u32 len = cetrafs_extent_len(arr[i].ee_len);
+    /*
+     * One compaction pass: entries are read at i and kept at w <= i.
+     * It used to memmove the whole remaining array for every dropped
+     * entry, and the array is the FLATTENED tree -- up to ~258k entries
+     * -- so punching a large range (a guest's TRIM of a VM image) was
+     * O(dropped x n) of memmove under the exclusive invalidate_lock,
+     * with no reschedule.
+     */
+    for (i = 0, w = 0; i < count; i++) {
+        cetrafs_extent_t e = arr[i];
+        u32 len = cetrafs_extent_len(e.ee_len);
         /*
          * Whether this entry is PREALLOCATED, carried through every
          * rewrite below. cetrafs_extent_pack_len() packs the flag into
@@ -1624,63 +1633,72 @@ static int cetrafs_leaf_array_punch(struct super_block *sb,
          * written stopped reading as zeros -- they served whatever
          * their previous owner had left in them.
          */
-        int uninit_entry = cetrafs_extent_is_uninit(arr[i].ee_len);
-        u64 estart = cetrafs_le32(arr[i].ee_block);
+        int uninit_entry = cetrafs_extent_is_uninit(e.ee_len);
+        u64 estart = cetrafs_le32(e.ee_block);
         u64 eend = estart + len; /* exclusive */
-        u64 phys = cetrafs_extent_phys_from_hilo(arr[i].ee_start_hi, arr[i].ee_start_lo);
+        u64 phys = cetrafs_extent_phys_from_hilo(e.ee_start_hi, e.ee_start_lo);
         u64 hs = max_t(u64, estart, start_block); /* [hs, he) is this entry's overlap with the hole */
         u64 he = min_t(u64, eend, end_block);
 
-        if (hs >= he)
-            continue; /* no overlap with the hole */
+        if (hs >= he) {
+            arr[w++] = e; /* no overlap with the hole */
+            continue;
+        }
 
         if (do_free)
             cetrafs_free_data_extent(sb, phys + (hs - estart), (u32) (he - hs));
         freed += (u32) (he - hs);
 
         if (hs == estart && he == eend) {
-            /* hole covers the whole entry: drop it, then re-examine
-             * whatever just shifted down into this same slot. */
-            memmove(&arr[i], &arr[i + 1], (count - i - 1) * sizeof(*arr));
-            count--;
-            i--;
+            /* hole covers the whole entry: drop it */
         } else if (hs == estart) {
             /* hole eats the front */
-            u32 new_len = (u32) (eend - he);
-
-            arr[i].ee_block = cetrafs_cpu_to_le32((u32) he);
-            cetrafs_extent_phys_to_hilo(phys + (he - estart), &arr[i].ee_start_hi, &arr[i].ee_start_lo);
-            arr[i].ee_len = cetrafs_extent_pack_len(new_len, uninit_entry);
+            e.ee_block = cetrafs_cpu_to_le32((u32) he);
+            cetrafs_extent_phys_to_hilo(phys + (he - estart), &e.ee_start_hi, &e.ee_start_lo);
+            e.ee_len = cetrafs_extent_pack_len((u32) (eend - he), uninit_entry);
+            arr[w++] = e;
         } else if (he == eend) {
             /* hole eats the back (same shape as _trim()'s own case) */
-            arr[i].ee_len = cetrafs_extent_pack_len((u32) (hs - estart), uninit_entry);
+            e.ee_len = cetrafs_extent_pack_len((u32) (hs - estart), uninit_entry);
+            arr[w++] = e;
         } else {
             /* hole lands entirely inside: split into front + tail */
             cetrafs_extent_t tail;
 
+            tail.ee_block = cetrafs_cpu_to_le32((u32) he);
+            cetrafs_extent_phys_to_hilo(phys + (he - estart), &tail.ee_start_hi, &tail.ee_start_lo);
+            tail.ee_len = cetrafs_extent_pack_len((u32) (eend - he), uninit_entry);
+            e.ee_len = cetrafs_extent_pack_len((u32) (hs - estart), uninit_entry);
+
+            if (w < i) {
+                /* An earlier drop left room: both fit at or below i. */
+                arr[w++] = e;
+                arr[w++] = tail;
+                continue;
+            }
+            /* w == i: nothing dropped yet, so the array grows here. A
+             * punch is one range, so on a sound tree at most one entry
+             * can contain it -- this shift runs once, not per entry. */
             if (count >= max) {
                 /* Unreachable: the dry run above already refused any
                  * punch that could get here. Kept as an assertion rather
                  * than deleted -- if it ever fires, the two loops have
-                 * drifted apart and blocks have already been freed. */
+                 * drifted apart and blocks have already been freed. The
+                 * array is intact here (w == i: nothing compacted). */
                 pr_err("punch: split would overflow the leaf after freeing %u block(s) -- dry run disagreed\n", freed);
                 *entries = count;
                 *out_freed = freed;
                 return -ENOSPC;
             }
-
-            tail.ee_block = cetrafs_cpu_to_le32((u32) he);
-            cetrafs_extent_phys_to_hilo(phys + (he - estart), &tail.ee_start_hi, &tail.ee_start_lo);
-            tail.ee_len = cetrafs_extent_pack_len((u32) (eend - he), uninit_entry);
-
-            arr[i].ee_len = cetrafs_extent_pack_len((u32) (hs - estart), uninit_entry);
-
             memmove(&arr[i + 2], &arr[i + 1], (count - i - 1) * sizeof(*arr));
+            arr[i] = e;
             arr[i + 1] = tail;
             count++;
             i++; /* skip the newly inserted tail entry -- it can't overlap the hole */
+            w = i + 1;
         }
     }
+    count = w;
 
     *entries = count;
     *out_freed = freed;
