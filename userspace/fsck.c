@@ -1694,7 +1694,7 @@ int main(int argc, char **argv)
      * about this volume is provisional until it is replayed by a mount.
      */
     {
-        uint64_t cl_problems = 0;
+        uint64_t cl_problems = 0, journal_unapplied = 0;
 
         /* An LBA is legal as a journal target or a queued free only if
          * it lands inside some BG's data region -- the same question
@@ -1775,6 +1775,29 @@ int main(int argc, char **argv)
                                 "over block %" PRIu64 "\n",
                                 n, sl, (uint64_t) cetrafs_le64(hdr.target_lba));
                         cl_problems++;
+                    } else if (!(cetrafs_le32(hdr.flags) & CETRAFS_JRNL_F_FRESH)) {
+                        /* A whole, valid entry. If its target already
+                         * holds the payload, only the consume was lost
+                         * and replay will change nothing. Otherwise the
+                         * next mount WRITES it -- a dirent, an extent
+                         * leaf, an xattr block this walk has not seen.
+                         * Repairing now would reconcile against the
+                         * pre-replay volume: clear bits the replayed
+                         * leaf names, link into lost+found an inode the
+                         * replayed dirent names. Replay is the mount's
+                         * job (journal.c, with its guards); until it
+                         * has run, this verdict is provisional and the
+                         * repair must not run on it. */
+                        uint8_t tgt[CETRAFS_BLOCK_SIZE];
+
+                        pread_all(fd, tgt, sizeof(tgt), (off_t) cetrafs_le64(hdr.target_lba) * CETRAFS_BLOCK_SIZE);
+                        if (crc32c_update(0, tgt, sizeof(tgt)) != (uint32_t) cetrafs_le32(hdr.payload_checksum)) {
+                            fprintf(stderr,
+                                    "WARN: node %u journal slot %" PRIu64
+                                    " holds an entry not yet applied to block %" PRIu64 " -- a mount replays it\n",
+                                    n, sl, (uint64_t) cetrafs_le64(hdr.target_lba));
+                            journal_unapplied++;
+                        }
                     }
                 }
             }
@@ -1840,6 +1863,11 @@ int main(int argc, char **argv)
             }
         }
 #undef FSCK_BG_FOR_LBA
+
+        if (journal_unapplied)
+            repair_block(
+                "journal entries a mount has not yet replayed -- mount the volume once (replay runs at "
+                "mount) and re-run fsck -r");
 
         if (cl_problems) {
             fprintf(stderr, "cetrafs fsck: %" PRIu64 " cluster-metadata problem(s) found\n", cl_problems);
