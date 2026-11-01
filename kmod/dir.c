@@ -2253,15 +2253,58 @@ static int cetrafs_rmdir(struct inode *dir, struct dentry *dentry)
 }
 
 /*
+ * Test-only: sleep between the two durable steps of link() and rename()
+ * -- the instant a crash would freeze -- so a test can snapshot the
+ * device there and check which way the record and the names disagree.
+ */
+static unsigned int cetrafs_ns_step_gap_ms;
+module_param_named(ns_step_gap_ms, cetrafs_ns_step_gap_ms, uint, 0644);
+MODULE_PARM_DESC(ns_step_gap_ms, "TEST ONLY: sleep between link/rename's count change and its name change");
+
+/*
+ * Move 'inode''s link count by 'delta' through a namespace-sector CAS
+ * on generation 'generation', and set the in-core count to the value
+ * the swap landed (evict_inode() reads i_nlink; a stale relative change
+ * misleads it). 'seed' is a fresh read of the record, or NULL to read
+ * one here.
+ */
+static int cetrafs_nlink_step(struct super_block *sb,
+                              struct inode *inode,
+                              u64 generation,
+                              const cetrafs_inode_t *seed,
+                              s32 delta,
+                              time64_t now)
+{
+    struct cetrafs_ns_delta d = {.nlink_delta = delta, .ctime = (u64) now};
+    cetrafs_inode_t raw;
+    int ret;
+
+    if (!seed) {
+        cetrafs_invalidate_raw_inode(sb, inode->i_ino);
+        ret = cetrafs_read_raw_inode(sb, inode->i_ino, &raw);
+        if (ret)
+            return ret;
+        seed = &raw;
+    }
+    ret = cetrafs_inode_ns_cas(sb, inode->i_ino, generation, seed, cetrafs_ns_apply_delta, &d);
+    if (!ret)
+        set_nlink(inode, d.out_nlink);
+    return ret;
+}
+
+/*
  * Rename/move a dirent, optionally replacing an existing target (POSIX
  * semantics: replacing a directory requires the target be an empty
  * directory and the source also be a directory; replacing a non-directory
  * requires the source also be a non-directory). RENAME_EXCHANGE and
  * RENAME_WHITEOUT aren't supported (-EINVAL); RENAME_NOREPLACE is.
  *
- * Adds the new dirent before removing the old one, so a failure here (only
- * -ENOSPC, if new_dir's own extents are full) leaves the source intact
- * under its original name rather than losing it. If an existing target is
+ * Adds the new dirent before removing the old one, so a failure to ADD
+ * (-ENOSPC, an I/O error) leaves the source intact under its original
+ * name rather than losing it. A failure to REMOVE the old name after
+ * that leaves the file under both names -- with the link count raised
+ * to match first (see below), so that state is consistent, merely
+ * surprising, and never one where unlinking a name frees live blocks. If an existing target is
  * being replaced, its dirent is removed (and resources freed, mirroring
  * unlink/rmdir) up front -- a failure between then and the add below would
  * leave the target gone without the move completing; accepted as a known,
@@ -2318,7 +2361,8 @@ static int cetrafs_rename_locked(struct mnt_idmap *idmap,
 {
     struct inode *old_inode = d_inode(old_dentry);
     struct inode *new_inode = target;
-    u64 old_ino, discard_ino;
+    u64 old_ino, discard_ino, old_gen;
+    bool counted = false;
     u8 discard_file_type;
     u8 old_file_type;
     time64_t now;
@@ -2499,6 +2543,26 @@ static int cetrafs_rename_locked(struct mnt_idmap *idmap,
     old_file_type = cetrafs_dirent_type(old_inode);
     now = ktime_get_real_seconds();
 
+    /*
+     * Between the new name landing and the old one going, the moved
+     * file has TWO names, each durable on its own -- the journal does
+     * not make the pair atomic. A crash there kept both under nlink=1,
+     * and unlinking either name then freed the blocks the other still
+     * names. So the count goes up first, and comes back down in the
+     * ctime swap at the end, once the old name is gone: at every
+     * instant nlink >= names, the direction that can only leak.
+     *
+     * Not for a directory: its nlink is not a name count, and a
+     * directory left with two names is the cycle problem, not this.
+     */
+    old_gen = cetrafs_inode_get_generation(old_inode);
+    if (old_file_type != CETRAFS_FT_DIR) {
+        ret = cetrafs_nlink_step(old_dir->i_sb, old_inode, old_gen, NULL, 1, now);
+        if (ret)
+            goto out;
+        counted = true;
+    }
+
     if (new_inode) {
         u64 removed_ino;
         u8 removed_file_type;
@@ -2513,7 +2577,7 @@ static int cetrafs_rename_locked(struct mnt_idmap *idmap,
         ret = cetrafs_dir_retarget_entry(new_dir, &new_dentry->d_name, old_ino, old_file_type, &removed_ino,
                                          &removed_file_type);
         if (ret)
-            goto out;
+            goto out_uncount;
 
         /* Neither branch frees blocks/the inode number here -- just
          * persists the correct nlink (0 for a replaced directory, which
@@ -2573,9 +2637,13 @@ static int cetrafs_rename_locked(struct mnt_idmap *idmap,
          * old one, so a failure leaves the source intact. */
         ret = cetrafs_dir_add_entry(new_dir, &new_dentry->d_name, old_ino, old_file_type);
         if (ret)
-            goto out;
+            goto out_uncount;
     }
+    if (cetrafs_ns_step_gap_ms)
+        msleep(cetrafs_ns_step_gap_ms); /* test-only, see the knob */
 
+    /* A failure from here on leaves the file with both names and the
+     * count that says so: consistent, so nothing is given back. */
     ret = cetrafs_dir_remove_entry(old_dir, &old_dentry->d_name, &discard_ino, &discard_file_type);
     if (ret)
         goto out;
@@ -2600,16 +2668,27 @@ static int cetrafs_rename_locked(struct mnt_idmap *idmap,
          * opener to avoid racing its deferred record state. */
         cetrafs_invalidate_raw_inode(old_dir->i_sb, old_ino);
         if (!cetrafs_read_raw_inode(old_dir->i_sb, old_ino, &oraw)) {
-            struct cetrafs_ns_delta d = {.ctime = (u64) now};
+            /* ...carrying the -1 that matches the +1 above, now that
+             * the old name is gone. If it does not land the count stays
+             * one high: a leak, never a free. */
+            struct cetrafs_ns_delta d = {.ctime = (u64) now, .nlink_delta = counted ? -1 : 0};
 
-            cetrafs_inode_ns_cas(old_dir->i_sb, old_ino, cetrafs_le64(oraw.generation), &oraw,
-                                 cetrafs_ns_apply_delta, &d);
+            if (!cetrafs_inode_ns_cas(old_dir->i_sb, old_ino, cetrafs_le64(oraw.generation), &oraw,
+                                      cetrafs_ns_apply_delta, &d) &&
+                counted)
+                set_nlink(old_inode, d.out_nlink);
         }
     }
     inode_set_ctime(old_inode, now, 0);
     ret = 0;
 
 out:
+    return ret;
+
+out_uncount:
+    /* The new name never landed: give the count back. */
+    if (counted)
+        cetrafs_nlink_step(old_dir->i_sb, old_inode, old_gen, NULL, -1, now);
     return ret;
 }
 
@@ -2808,43 +2887,33 @@ static int cetrafs_link_locked(struct dentry *old_dentry, struct inode *dir, str
     fs_debug(info, "link '%.*s' -> ino=%llu in dir ino=%llu", (int) dentry->d_name.len, dentry->d_name.name,
              (unsigned long long) inode->i_ino, (unsigned long long) dir->i_ino);
 
-    ret = cetrafs_dir_add_entry(dir, &dentry->d_name, inode->i_ino, cetrafs_dirent_type(inode));
+    /*
+     * The +1 FIRST, then the name. Each is durable on its own and the
+     * journal does not make the pair atomic, so a crash between them
+     * keeps whichever came first -- and the two orders fail in opposite
+     * directions. Name first left two names and nlink=1: unlinking
+     * either one then frees the blocks the other still names. Count
+     * first leaves nlink one too high: a leak, which fsck repairs and
+     * nothing reads as license to free.
+     *
+     * By namespace-sector CAS (v0x0005): applied to the LIVE value, so
+     * it composes with every other sector-0 mutation -- lock.c's
+     * presence bits above all, which run without this lock. The seed is
+     * the forced-fresh read that just verified the identity.
+     */
+    now = ktime_get_real_seconds();
+    ret = cetrafs_nlink_step(dir->i_sb, inode, cetrafs_le64(raw.generation), &raw, 1, now);
     if (ret)
         return ret;
+    if (cetrafs_ns_step_gap_ms)
+        msleep(cetrafs_ns_step_gap_ms); /* test-only, see the knob */
 
-    cetrafs_invalidate_raw_inode(dir->i_sb, inode->i_ino);
-    ret = cetrafs_read_raw_inode(dir->i_sb, inode->i_ino, &raw);
+    ret = cetrafs_dir_add_entry(dir, &dentry->d_name, inode->i_ino, cetrafs_dirent_type(inode));
     if (ret) {
-        u64 discard_ino;
-        u8 discard_file_type;
-
-        cetrafs_dir_remove_entry(dir, &dentry->d_name, &discard_ino, &discard_file_type);
+        /* No name was added: give the count back. If even that fails
+         * the count stays one high -- the safe direction. */
+        cetrafs_nlink_step(dir->i_sb, inode, cetrafs_le64(raw.generation), NULL, -1, now);
         return ret;
-    }
-
-    /*
-     * The +1 by namespace-sector CAS (v0x0005): applied to the LIVE
-     * value, so it composes with every other sector-0 mutation --
-     * lock.c's presence bits above all, which run without this lock and
-     * which the old whole-record write here could silently revert. */
-    now = ktime_get_real_seconds();
-    {
-        struct cetrafs_ns_delta d = {.nlink_delta = 1, .ctime = (u64) now};
-
-        ret = cetrafs_inode_ns_cas(dir->i_sb, inode->i_ino, cetrafs_le64(raw.generation), &raw,
-                                   cetrafs_ns_apply_delta, &d);
-        if (ret) {
-            u64 discard_ino;
-            u8 discard_file_type;
-
-            cetrafs_dir_remove_entry(dir, &dentry->d_name, &discard_ino, &discard_file_type);
-            return ret;
-        }
-
-        /* In-core set to the absolute value the swap landed, not
-         * inc_nlink() off a possibly stale cached count -- evict_inode()
-         * reads inode->i_nlink and a stale count misleads it. */
-        set_nlink(inode, d.out_nlink);
     }
     inode_set_ctime(inode, now, 0);
     ihold(inode);
