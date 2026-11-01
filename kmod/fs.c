@@ -989,7 +989,9 @@ int cetrafs_fill_super(struct super_block *sb, struct fs_context *fc)
         u64 inodes = le32_to_cpu(ondisk->inodes_count);
         u64 bmap_bits = le64_to_cpu(ondisk->inode_bmap_blocks) * CETRAFS_BLOCK_SIZE * 8;
 
-        if (!inodes || inodes > bmap_bits || inodes > le64_to_cpu(ondisk->inode_table_blocks)) {
+        /* < U32_MAX: the birth map below has inodes_count + 1 bits, and
+         * that +1 must not wrap to a zero-size map set_bit() overruns. */
+        if (!inodes || inodes >= U32_MAX || inodes > bmap_bits || inodes > le64_to_cpu(ondisk->inode_table_blocks)) {
             pr_err("inodes_count=%llu does not fit its bitmap (%llu bits) / table (%llu blocks)\n",
                    (unsigned long long) inodes, (unsigned long long) bmap_bits,
                    (unsigned long long) le64_to_cpu(ondisk->inode_table_blocks));
@@ -1109,7 +1111,13 @@ int cetrafs_fill_super(struct super_block *sb, struct fs_context *fc)
         if (cetrafs_alloc_shadow_enabled && sbi->total_blocks <= UINT_MAX)
             sbi->alloc_shadow =
                 bitmap_zalloc((unsigned int) sbi->total_blocks, GFP_KERNEL); /* test-only; NULL is fine */
-        sbi->inode_birth = bitmap_zalloc(le32_to_cpu(ondisk->inodes_count) + 1, GFP_KERNEL);
+        /* kv-: a volume with millions of inodes asks for a contiguous
+         * megabyte, which kmalloc can refuse on a fragmented host -- and
+         * a NULL here used to be accepted, silently switching off the
+         * birth guard the scrub relies on not to reclaim a file mid-
+         * create (cetrafs_sb_birth_active()). */
+        sbi->inode_birth = kvcalloc(BITS_TO_LONGS(le32_to_cpu(ondisk->inodes_count) + 1), sizeof(unsigned long),
+                                    GFP_KERNEL);
         sbi->bg_free_dirty = bitmap_zalloc(bg_cnt, GFP_KERNEL);
         sbi->bg_free_delta = kcalloc(bg_cnt, sizeof(*sbi->bg_free_delta), GFP_KERNEL);
         sbi->bg_alloc_seq = kcalloc(bg_cnt, sizeof(*sbi->bg_alloc_seq), GFP_KERNEL);
@@ -1118,7 +1126,7 @@ int cetrafs_fill_super(struct super_block *sb, struct fs_context *fc)
         sbi->owned_bgs = bitmap_zalloc(bg_cnt, GFP_KERNEL);
         sbi->bg_desc_lba = kcalloc(bg_cnt, sizeof(*sbi->bg_desc_lba), GFP_KERNEL);
         if (!sbi->bg_free_dirty || !sbi->bg_free_delta || !sbi->bg_alloc_seq || !sbi->bg_count_epoch ||
-            !sbi->bmap_alloc_dirty || !sbi->bg_owner_zg || !sbi->owned_bgs || !sbi->bg_desc_lba) {
+            !sbi->bmap_alloc_dirty || !sbi->bg_owner_zg || !sbi->owned_bgs || !sbi->bg_desc_lba || !sbi->inode_birth) {
             kfree(sbi->bg_desc_lba);
             bitmap_free(sbi->owned_bgs);
             kfree(sbi->bg_owner_zg);
@@ -1127,7 +1135,7 @@ int cetrafs_fill_super(struct super_block *sb, struct fs_context *fc)
             kfree(sbi->bg_alloc_seq);
             bitmap_free(sbi->bmap_alloc_dirty);
             bitmap_free(sbi->alloc_shadow);
-    bitmap_free(sbi->inode_birth);
+    kvfree(sbi->inode_birth);
             bitmap_free(sbi->bg_free_dirty);
             kfree(sbi->zg_pf_drop_blocks);
             kfree(sbi->zg_pf_drop_runs);
@@ -1148,7 +1156,7 @@ int cetrafs_fill_super(struct super_block *sb, struct fs_context *fc)
             kfree(sbi->bg_alloc_seq);
             bitmap_free(sbi->bmap_alloc_dirty);
             bitmap_free(sbi->alloc_shadow);
-    bitmap_free(sbi->inode_birth);
+    kvfree(sbi->inode_birth);
             bitmap_free(sbi->bg_free_dirty);
             kfree(sbi->zg_pf_drop_blocks);
             kfree(sbi->zg_pf_drop_runs);
@@ -2029,7 +2037,7 @@ void cetrafs_free_sb_info(struct super_block *sb)
     bitmap_free(sbi->bg_free_dirty);
     bitmap_free(sbi->bmap_alloc_dirty);
     bitmap_free(sbi->alloc_shadow);
-    bitmap_free(sbi->inode_birth);
+    kvfree(sbi->inode_birth);
     kfree(sbi->zg_pf_drop_blocks);
     kfree(sbi->zg_pf_drop_runs);
     kfree(sbi->zg_pf_full_until);
