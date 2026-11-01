@@ -488,28 +488,44 @@ static void cetrafs_ns_apply_zero_nlink(cetrafs_inode_t *rec, void *arg)
 
 /*
  * Inode-number ownership is arbitrated on the RECORD, between a creator
- * and an orphan scrub (possibly a peer's). The bitmap bit alone cannot:
- * between a creator's bit CAS and its record write the record is still
- * the dead previous one, and a scrub judging "bit set, record dead"
- * reclaims a number that is being born. The birth registry stops this
- * node's own scrub only. Both sides therefore CAS sector 0:
+ * and an orphan scrub (possibly a peer's) or an evict. The bitmap bit
+ * alone cannot: between a creator's bit CAS and its record write the
+ * record is still the dead previous one, and a scrub judging "bit set,
+ * record dead" reclaims a number that is being born. The birth registry
+ * stops this node's own scrub only. Both sides therefore CAS sector 0:
  *
  *   creator: bit CAS, read record R, BIRTH CLAIM = CAS(R -> R with
- *            ns_lock_owner=me and a new generation). Miscompare, or a
- *            foreign ns_lock_owner in R: a scrub is reclaiming this
- *            number -- abandon it, bit untouched, take another.
- *   scrub:   verdict on (bit set, record dead gen G, no lock), RECLAIM
- *            CLAIM = CAS(dead G, unlocked -> ns_lock_owner=me), clear
- *            the bit, RELEASE = CAS(me -> unlocked, NEW generation).
+ *            ns_lock_owner=me). Miscompare, or a foreign ns_lock_owner
+ *            in R: a reclaim holds this number -- abandon it, bit
+ *            untouched, take another.
+ *   reclaim: verdict on (bit set, record dead gen G, no lock), CLAIM =
+ *            CAS(dead G, unlocked -> ns_lock_owner=me), clear the bit,
+ *            RELEASE = CAS(exactly what the claim wrote -> unlocked).
  *
- * The new generation on release is what makes a creator's R -- read
- * before the claim, compared after the release -- miscompare.
+ * Every one of these swaps also advances dirent_seq, sector 0's change
+ * stamp (unused on a dead record otherwise), and that is what keeps the
+ * arbitration free of ABA: a claim-clear-release that put back exactly
+ * the bytes a creator read would let that creator's birth CAS land on a
+ * number whose bit had been cleared under it. The stamp only ever moves
+ * forward, so it never does.
+ *
+ * NOT the generation: it is echoed into the file sector (fd_generation),
+ * which none of these swaps writes, and a record whose two sectors
+ * disagree on it is a half-landed write to every reader -- the kernel's
+ * and fsck's ("marked in use but its checksum is wrong"). The previous
+ * version of this bumped it, and churn_oracle caught it.
+ *
+ * A VIRGIN number (never allocated since mkfs: sector 0 all zero) needs
+ * no birth claim: no reclaim judges a record that fails its checksum.
  * tests/kernel/scrub_vs_birth.sh.
  */
+static void cetrafs_ns_stamp_advance(cetrafs_inode_t *rec)
+{
+    rec->dirent_seq = cetrafs_cpu_to_le64(cetrafs_le64(rec->dirent_seq) + 1);
+}
+
 struct cetrafs_birth_ctx {
-    struct super_block *sb;
     const u8 *seed; /* sector 0 as the creator judged it */
-    u64 ino;
     u32 me;
     bool lost; /* the verdict travels here: a >0 mutate return is flattened to success */
 };
@@ -527,20 +543,19 @@ static int cetrafs_birth_claim_mutate(void *image, unsigned int len, void *priv)
     }
     memset(&rec, 0, sizeof(rec));
     memcpy(&rec, image, CETRAFS_INODE_NS_BYTES);
-    rec.ino = cetrafs_cpu_to_le64(ctx->ino); /* a virgin record has none */
-    rec.nlink = 0;
     rec.ns_lock_owner = cetrafs_cpu_to_le32(ctx->me);
-    rec.generation = cetrafs_cpu_to_le64(cetrafs_inode_new_generation(ctx->sb));
+    cetrafs_ns_stamp_advance(&rec);
     cetrafs_inode_stamp_crc_ns(&rec);
     memcpy(image, &rec, CETRAFS_INODE_NS_BYTES);
     return 0;
 }
 
-/* The creator's half. 'seed' is the record read after the bit CAS. Sets
- * *out_lost when a scrub got to the record first. */
+/* The creator's half. 'seed' is the record read after the bit CAS, and
+ * must be a checksummed record (a virgin one needs no claim). Sets
+ * *out_lost when a reclaim got to the record first. */
 int cetrafs_inode_birth_claim(struct super_block *sb, u64 ino, const cetrafs_inode_t *seed, bool *out_lost)
 {
-    struct cetrafs_birth_ctx ctx = {.sb = sb, .seed = (const u8 *) seed, .ino = ino};
+    struct cetrafs_birth_ctx ctx = {.seed = (const u8 *) seed};
     u64 lba = cetrafs_inode_lba(sb, ino);
     int ret;
 
@@ -560,10 +575,10 @@ int cetrafs_inode_birth_claim(struct super_block *sb, u64 ino, const cetrafs_ino
 }
 
 struct cetrafs_reclaim_ctx {
-    struct super_block *sb;
     u64 generation;
+    u64 seq; /* claim: out, the stamp it wrote; release: in, the stamp required */
     u32 me;
-    bool release;
+    int mode;
 };
 
 static int cetrafs_reclaim_mutate(void *image, unsigned int len, void *priv)
@@ -578,29 +593,43 @@ static int cetrafs_reclaim_mutate(void *image, unsigned int len, void *priv)
     if (!cetrafs_ns_image_trustworthy(&rec))
         return -EUCLEAN;
     if (cetrafs_le64(rec.generation) != ctx->generation)
-        return -ESTALE; /* reborn, or released by someone else */
+        return -ESTALE; /* reborn */
 
-    if (!ctx->release) {
-        /* The claim: still exactly the dead, unlocked record judged. */
+    switch (ctx->mode) {
+    case CETRAFS_RECLAIM_CLAIM:
+        /* Still exactly the dead, unlocked record judged. */
         if (cetrafs_le32(rec.nlink) != 0 || cetrafs_le32(rec.ns_lock_owner) != CETRAFS_NODE_ID_NONE)
             return -ESTALE;
         rec.ns_lock_owner = cetrafs_cpu_to_le32(ctx->me);
-    } else {
-        if (cetrafs_le32(rec.ns_lock_owner) != ctx->me)
+        break;
+    case CETRAFS_RECLAIM_RELEASE:
+        /* Exactly what our claim wrote: a creator's birth claim on the
+         * same number (this node's creator also writes our id) has
+         * advanced the stamp, and then the record is the creator's. */
+        if (cetrafs_le32(rec.ns_lock_owner) != ctx->me || cetrafs_le64(rec.dirent_seq) != ctx->seq)
             return -ESTALE;
         rec.ns_lock_owner = cetrafs_cpu_to_le32(CETRAFS_NODE_ID_NONE);
-        rec.generation = cetrafs_cpu_to_le64(cetrafs_inode_new_generation(ctx->sb));
+        break;
+    default: /* CETRAFS_RECLAIM_BIRTH_ABORT: a create that claimed and failed */
+        if (cetrafs_le32(rec.ns_lock_owner) != ctx->me || cetrafs_le32(rec.nlink) != 0)
+            return -ESTALE;
+        rec.ns_lock_owner = cetrafs_cpu_to_le32(CETRAFS_NODE_ID_NONE);
+        break;
     }
+    cetrafs_ns_stamp_advance(&rec);
+    ctx->seq = cetrafs_le64(rec.dirent_seq);
     cetrafs_inode_stamp_crc_ns(&rec);
     memcpy(image, &rec, CETRAFS_INODE_NS_BYTES);
     return 0;
 }
 
-/* The scrub's halves: claim the dead record it judged (generation G),
- * and -- after clearing the bit -- release it under a new generation. */
-int cetrafs_inode_reclaim_claim(struct super_block *sb, u64 ino, u64 generation, bool release)
+/* The reclaim's halves -- claim the dead record judged (generation G),
+ * and, after clearing the bit, release it -- plus a failed create's
+ * undo of its birth claim. *seq carries the claim's stamp to the
+ * release. */
+int cetrafs_inode_reclaim_claim(struct super_block *sb, u64 ino, u64 generation, int mode, u64 *seq)
 {
-    struct cetrafs_reclaim_ctx ctx = {.sb = sb, .generation = generation, .release = release};
+    struct cetrafs_reclaim_ctx ctx = {.generation = generation, .mode = mode, .seq = seq ? *seq : 0};
     u64 lba = cetrafs_inode_lba(sb, ino);
     int ret;
 
@@ -612,8 +641,11 @@ int cetrafs_inode_reclaim_claim(struct super_block *sb, u64 ino, u64 generation,
     if (ret)
         return ret;
     ret = cetrafs_cas_record(sb, lba, cetrafs_reclaim_mutate, &ctx);
-    if (ret == 0)
+    if (ret == 0) {
         cetrafs_record_write_counted();
+        if (seq)
+            *seq = ctx.seq;
+    }
     return ret;
 }
 

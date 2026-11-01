@@ -97,8 +97,14 @@ assert_lt "mkdir does not journal the child dirent block nothing can reach" "$DI
 # separately from the sector-0 swap that carries dirent_seq -- the
 # two-step publish that makes dirent_seq the freshness barrier. One
 # extra 512-byte sector write per directory-mutating op, bounded here.
+# The inode-number arbitration (alloc.c / inode.c, birth and reclaim
+# claims on sector 0) adds one sector CAS to a create that REUSES a
+# number -- a never-used one needs none. The warm-up above freed 20
+# numbers, so about half the creates measured here reuse one: +0.5 on
+# average (create 12.1 -> 12.6). It buys this: a peer's orphan scrub can
+# no longer reclaim a number mid-birth.
 assert_lt "mkdir device writes stay bounded" "$MKDIR_W" 14.8
-assert_lt "create device writes stay bounded" "$CREATE_W" 12.6
+assert_lt "create device writes stay bounded" "$CREATE_W" 13.1
 
 # The content must still be right: a blind write that skipped the read
 # publishes uninitialised memory if any byte goes unwritten.
@@ -146,7 +152,13 @@ log "record writes per op: create=$CW unlink=$UW"
 # the ORDER of cost, not the exact fold: a regression to per-field
 # writes would blow straight past them.
 assert_lt "create stays at child-record + two-step parent release" "$CW" 3.5
-assert_lt "unlink folds its updates into the release publishes" "$UW" 1.6
+# The free of the number then costs two record swaps more (1.0 -> 3.0):
+# evict claims the dead record, clears the bit, and releases it. Those
+# two are the arbitration itself -- a bare bitmap clear could land after
+# another freer's clear and a creator's re-allocation, clearing the NEW
+# owner's bit -- so the bound moves with them and still catches anything
+# beyond.
+assert_lt "unlink folds its updates into the release publishes" "$UW" 3.6
 
 ct_umount "$MNT"
 ct_mount "$LOOPDEV" "$MNT"

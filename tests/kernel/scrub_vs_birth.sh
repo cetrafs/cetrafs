@@ -12,7 +12,7 @@
 #
 # The fix makes the RECORD the arbiter. The scrub claims the dead record
 # (ns_lock_owner, by CAS against the image it judged) before it clears
-# the bit, and releases it with a new generation. The creator publishes
+# the bit, and releases it, advancing sector 0's change stamp. The creator publishes
 # its record by CAS against the image it read after taking the bit, so a
 # claim landing in between makes it miscompare: it abandons that number
 # -- leaving the bit to the scrub that owns it -- and takes another.
@@ -101,11 +101,14 @@ fi
 wait "$CPID" || true
 
 # ...and, its claim having landed, the rest of its reclaim: clear the
-# bit, release the record under a new generation.
+# bit, release the record. The release advances sector 0's change stamp
+# (dirent_seq), never the generation: that is echoed into the file
+# sector, and changing it in sector 0 alone makes the record read as a
+# half-landed write ("checksum is wrong").
 if [ "$claimed" = 1 ]; then
     bit "$N" 0
     "$LPOKE" "$BACK" "$N" --ns 65535 >/dev/null
-    "$IPOKE" "$BACK" bumpgen "$N" 0x5c5c5c5c 2>/dev/null
+    "$IPOKE" "$BACK" bumpseq "$N" 2>/dev/null
 fi
 
 ct_umount "$MNT"

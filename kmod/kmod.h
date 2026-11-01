@@ -808,7 +808,10 @@ int cetrafs_inode_ns_zero_nlink(struct super_block *sb, u64 ino, const cetrafs_i
 /* Inode-number arbitration between a creator and an orphan scrub, on the
  * record itself -- see inode.c. */
 int cetrafs_inode_birth_claim(struct super_block *sb, u64 ino, const cetrafs_inode_t *seed, bool *out_lost);
-int cetrafs_inode_reclaim_claim(struct super_block *sb, u64 ino, u64 generation, bool release);
+#define CETRAFS_RECLAIM_CLAIM 0
+#define CETRAFS_RECLAIM_RELEASE 1
+#define CETRAFS_RECLAIM_BIRTH_ABORT 2
+int cetrafs_inode_reclaim_claim(struct super_block *sb, u64 ino, u64 generation, int mode, u64 *seq);
 bool cetrafs_inode_ns_held_by_current(struct inode *inode);
 /* ->flock: the standard flock(2) interface onto the userspace-driven
  * whole-file exclusive lock, meaningful only under nofilelock. Fd-scoped

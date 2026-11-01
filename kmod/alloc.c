@@ -616,6 +616,9 @@ int cetrafs_alloc_inode(struct super_block *sb, u64 *out_ino)
         owner = cetrafs_le32(raw.ns_lock_owner);
         if (have && owner != CETRAFS_NODE_ID_NONE && owner != me)
             lost = true;
+        else if (!memchr_inv(&raw, 0, CETRAFS_INODE_NS_BYTES))
+            ; /* virgin: no reclaim judges an unchecksummed record, so
+               * nothing to arbitrate -- and no extra write per first use */
         else {
             ret = cetrafs_inode_birth_claim(sb, *out_ino, &raw, &lost);
             if (ret) {
@@ -650,6 +653,7 @@ int cetrafs_alloc_inode(struct super_block *sb, u64 *out_ino)
 int cetrafs_free_inode(struct super_block *sb, u64 ino)
 {
     const cetrafs_superblock_t *raw_sb = cetrafs_sb_raw(sb);
+    bool mid_birth;
     int ret;
 
     if (cetrafs_sb_is_fenced(sb))
@@ -659,6 +663,7 @@ int cetrafs_free_inode(struct super_block *sb, u64 ino)
 
     /* Any free ends the number's gestation: every create error path
      * funnels through here, so the birth registry cannot leak. */
+    mid_birth = cetrafs_sb_birth_active(sb, ino);
     cetrafs_sb_birth_end(sb, ino);
 
     /*
@@ -684,6 +689,12 @@ int cetrafs_free_inode(struct super_block *sb, u64 ino)
                    __builtin_return_address(0));
             if (cetrafs_le32(raw.nlink) != 0)
                 (void) cetrafs_inode_ns_zero_nlink(sb, ino, &raw);
+            /* A create that failed before its record write still holds
+             * its birth claim: give it back, or every peer that later
+             * draws this number reads a foreign lock and abandons it. */
+            else if (mid_birth && cetrafs_le32(raw.ns_lock_owner) != CETRAFS_NODE_ID_NONE)
+                (void) cetrafs_inode_reclaim_claim(sb, ino, cetrafs_le64(raw.generation), CETRAFS_RECLAIM_BIRTH_ABORT,
+                                                   NULL);
         }
     }
 
@@ -720,6 +731,7 @@ int cetrafs_free_inode(struct super_block *sb, u64 ino)
  */
 int cetrafs_free_inode_if_dead(struct super_block *sb, u64 ino, u64 generation)
 {
+    u64 seq = 0;
     int ret;
 
     if (cetrafs_sb_is_fenced(sb))
@@ -735,7 +747,7 @@ int cetrafs_free_inode_if_dead(struct super_block *sb, u64 ino, u64 generation)
      * or loses to it and abandons the number. See inode.c's
      * cetrafs_inode_birth_claim(). A re-read alone could not be adjacent
      * enough to the free; only this is. */
-    ret = cetrafs_inode_reclaim_claim(sb, ino, generation, /*release=*/false);
+    ret = cetrafs_inode_reclaim_claim(sb, ino, generation, CETRAFS_RECLAIM_CLAIM, &seq);
     if (ret)
         return ret; /* reborn, locked, or unreadable: free nothing */
 
@@ -743,7 +755,7 @@ int cetrafs_free_inode_if_dead(struct super_block *sb, u64 ino, u64 generation)
     if (!ret)
         cetrafs_sb_adjust_free_inodes(sb, 1);
     {
-        int rret = cetrafs_inode_reclaim_claim(sb, ino, generation, /*release=*/true);
+        int rret = cetrafs_inode_reclaim_claim(sb, ino, generation, CETRAFS_RECLAIM_RELEASE, &seq);
 
         if (rret)
             pr_warn_ratelimited(
