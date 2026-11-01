@@ -21,7 +21,14 @@ set -euo pipefail
 require_root
 require_module
 
-bh_count() { grep -E "^buffer_head" /proc/slabinfo 2>/dev/null | awk '{print $2}'; }
+# Under KASAN a freed object sits in the quarantine and still counts as
+# active in slabinfo, so a correct build read 20520 objects of "growth"
+# here. Shrinking the cache drains the quarantine for it; a buffer that
+# really leaked is still attached and dirty, and the shrink cannot touch it.
+bh_count() {
+    echo 1 >/sys/kernel/slab/buffer_head/shrink 2>/dev/null || true
+    grep -E "^buffer_head" /proc/slabinfo 2>/dev/null | awk '{print $2}'
+}
 
 IMG="$(ct_image 560 bufs)"
 DEV="$(ct_loop "$IMG")"

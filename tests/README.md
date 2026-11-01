@@ -44,6 +44,11 @@ Needs root, `linux-headers-$(uname -r)`, and a few loop devices.  The
 runner builds the tree and loads the module once for the batch; a suite
 run on its own does both itself, so either works.
 
+Every suite runs under a 300 s deadline, because a wedged buffer lock
+shows up as a hang, not as a failure. A suite that legitimately needs
+longer says so in a `# ct-timeout: <seconds>` line of its own header
+(only `kernel/growfs.sh` does); `CT_SUITE_TIMEOUT` overrides all of them.
+
 `device/` and `stress/` are never part of a group run: they take
 arguments, and one of them reformats whatever you name.
 

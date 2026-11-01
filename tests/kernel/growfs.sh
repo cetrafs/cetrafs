@@ -24,6 +24,7 @@
 # to ENOSPC before growing: the allocator will not touch a new BG while
 # the old one still has room, so "the new space is real" cannot be
 # tested without first exhausting the old.
+# ct-timeout: 900
 set -euo pipefail
 . "$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)/lib/harness.sh"
 require_root

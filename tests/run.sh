@@ -137,8 +137,15 @@ for s in "${SUITES[@]}"; do
     # and every later access to that block blocks forever. Without a
     # deadline that is a suite with no FAIL line, no summary and no exit
     # -- indistinguishable from "still running", and in CI it just hangs.
-    # The slowest real suite is ~26s; CT_SUITE_TIMEOUT overrides.
-    OUT="$(timeout -k 10 "${CT_SUITE_TIMEOUT:-300}" bash "$s" 2>&1)"
+    # Most suites finish well inside two minutes. One that legitimately
+    # needs longer says so with a "# ct-timeout: <seconds>" header line
+    # rather than raising the deadline for everyone: growfs.sh moves
+    # ~10 GB through a disk-backed image and took 201-300s on the same
+    # box, so the shared 300s cap failed it whenever the box was busy.
+    # CT_SUITE_TIMEOUT overrides both.
+    LIMIT="$(sed -n 's/^# ct-timeout: *\([0-9][0-9]*\) *$/\1/p' "$s" | head -1)"
+    LIMIT="${CT_SUITE_TIMEOUT:-${LIMIT:-300}}"
+    OUT="$(timeout -k 10 "$LIMIT" bash "$s" 2>&1)"
     RC=$?
     echo "$OUT"
     TOOK=$((SECONDS - START))
@@ -154,7 +161,7 @@ for s in "${SUITES[@]}"; do
         # timeout(1) reports 124 (or 137 after its -k kill). A hung suite
         # is a failure, and naming it TIMEOUT rather than FAIL says where
         # to look: something is waiting on a lock that is never released.
-        echo "FAIL: $s did not finish within ${CT_SUITE_TIMEOUT:-300}s -- killed (a wedged buffer lock looks like this)"
+        echo "FAIL: $s did not finish within ${LIMIT}s -- killed (a wedged buffer lock looks like this)"
         VERDICT=TIMEOUT
         TOTAL_FAIL=$((TOTAL_FAIL + 1))
     elif [ "$F" -gt 0 ]; then
