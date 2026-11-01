@@ -77,6 +77,7 @@ fi
 log "B: a dead repairer whose last_seen is 30 min in our future"
 "$NODE_POKE" "$DEV" 1 2 aa $(($(date +%s) + 1800)) >/dev/null
 if ct_mount "$DEV" "$MNT"; then
+    require_cetrafs_mount "$MNT"
     pass "B: mounted -- the claim did not move, so its repairer is gone"
     ct_umount "$MNT"
 else
