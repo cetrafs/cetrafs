@@ -1604,19 +1604,9 @@ static int cetrafs_create_locked(struct mnt_idmap *idmap,
         cetrafs_free_inode(sb, ino);
         return ret;
     }
-    {
-        bool still = false;
-
-        /* Mid-birth theft check -- see cetrafs_alloc_inode_still_owned().
-         * On theft nothing here owns the number any more: do NOT free it
-         * (that would clobber the thief's arbitration); fail loudly. */
-        if (cetrafs_alloc_inode_still_owned(sb, ino, &still) != 0 || !still) {
-            pr_err("create: ino=%llu was freed out from under its own birth (a peer scrub's stale verdict?) -- refusing\n",
-                   (unsigned long long) ino);
-            cetrafs_sb_birth_end(sb, ino);
-            return -EIO;
-        }
-    }
+    /* No mid-birth theft check here: cetrafs_alloc_inode()'s birth claim
+     * made this record ours on the device, and a scrub's reclaim claim
+     * cannot land on it -- see cetrafs_inode_birth_claim(). */
 
     /* Instantiate, label, and only then name it -- see
      * cetrafs_create_publish(). Nothing on these failure paths removes a
@@ -1798,21 +1788,9 @@ static struct dentry *cetrafs_mkdir_locked(struct mnt_idmap *idmap,
         cetrafs_free_inode(sb, ino);
         return ERR_PTR(ret);
     }
-    {
-        bool still = false;
-
-        /* Mid-birth theft check -- see cetrafs_alloc_inode_still_owned().
-         * On theft nothing here owns the number any more: do NOT free it
-         * (that would clobber the thief's arbitration); fail loudly. The
-         * '.'/'..' block is ours alone and never became reachable. */
-        if (cetrafs_alloc_inode_still_owned(sb, ino, &still) != 0 || !still) {
-            pr_err("mkdir: ino=%llu was freed out from under its own birth (a peer scrub's stale verdict?) -- refusing\n",
-                   (unsigned long long) ino);
-            cetrafs_sb_birth_end(sb, ino);
-            cetrafs_free_data_block(sb, lba);
-            return ERR_PTR(-EIO);
-        }
-    }
+    /* No mid-birth theft check here: cetrafs_alloc_inode()'s birth claim
+     * made this record ours on the device, and a scrub's reclaim claim
+     * cannot land on it -- see cetrafs_inode_birth_claim(). */
 
     /* Instantiate, label, and only then name it -- see
      * cetrafs_create_publish(). Nothing on these failure paths removes a
@@ -2922,19 +2900,9 @@ static int cetrafs_symlink_locked(struct mnt_idmap *idmap,
         cetrafs_free_inode(sb, ino);
         return ret;
     }
-    {
-        bool still = false;
-
-        /* Mid-birth theft check -- see cetrafs_alloc_inode_still_owned().
-         * On theft nothing here owns the number any more: do NOT free it
-         * (that would clobber the thief's arbitration); fail loudly. */
-        if (cetrafs_alloc_inode_still_owned(sb, ino, &still) != 0 || !still) {
-            pr_err("create: ino=%llu was freed out from under its own birth (a peer scrub's stale verdict?) -- refusing\n",
-                   (unsigned long long) ino);
-            cetrafs_sb_birth_end(sb, ino);
-            return -EIO;
-        }
-    }
+    /* No mid-birth theft check here: cetrafs_alloc_inode()'s birth claim
+     * made this record ours on the device, and a scrub's reclaim claim
+     * cannot land on it -- see cetrafs_inode_birth_claim(). */
 
     /* Instantiate, write the target text, label, and only then name it --
      * see cetrafs_create_publish(). The text goes in while the symlink is

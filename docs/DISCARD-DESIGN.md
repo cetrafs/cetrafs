@@ -154,8 +154,10 @@ conservative. The material already exists:
   NOT by frees, which is precisely "someone allocated here while I was
   looking". The scrub already snapshots it and abandons a Block Group
   whose value moved; a trim pass must do the same.
-* `cetrafs_alloc_inode_still_owned()` -- the model for a fresh,
-  narrow re-verification immediately before acting.
+* `cetrafs_free_inode_if_dead()` -- the model for acting on a verdict
+  only through a CAS that lands on exactly the state judged (it claims
+  the record before clearing the bit; a fresh re-read alone was not
+  adjacent enough).
 * The live-reservation registry -- a speculative allocation run reads
   as allocated, so it is skipped for free. Nothing to add.
 

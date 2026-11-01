@@ -805,6 +805,10 @@ int cetrafs_inode_ns_cas(struct super_block *sb,
                          void *arg);
 int cetrafs_write_raw_inode_fd(struct super_block *sb, u64 ino, const cetrafs_inode_t *src, struct inode *self);
 int cetrafs_inode_ns_zero_nlink(struct super_block *sb, u64 ino, const cetrafs_inode_t *seed);
+/* Inode-number arbitration between a creator and an orphan scrub, on the
+ * record itself -- see inode.c. */
+int cetrafs_inode_birth_claim(struct super_block *sb, u64 ino, const cetrafs_inode_t *seed, bool *out_lost);
+int cetrafs_inode_reclaim_claim(struct super_block *sb, u64 ino, u64 generation, bool release);
 bool cetrafs_inode_ns_held_by_current(struct inode *inode);
 /* ->flock: the standard flock(2) interface onto the userspace-driven
  * whole-file exclusive lock, meaningful only under nofilelock. Fd-scoped
@@ -850,7 +854,6 @@ int cetrafs_bg_data_layout(struct super_block *sb,
                            u64 *out_bmap_lba,
                            u64 *out_bmap_blocks);
 int cetrafs_inode_is_allocated(struct super_block *sb, u64 ino, bool *out_set);
-int cetrafs_alloc_inode_still_owned(struct super_block *sb, u64 ino, bool *out_set);
 
 // journal.c -- per-NODE journal
 struct cetrafs_journal; /* opaque; owned entirely by journal.c */

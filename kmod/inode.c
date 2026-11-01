@@ -486,6 +486,137 @@ static void cetrafs_ns_apply_zero_nlink(cetrafs_inode_t *rec, void *arg)
     rec->nlink = 0;
 }
 
+/*
+ * Inode-number ownership is arbitrated on the RECORD, between a creator
+ * and an orphan scrub (possibly a peer's). The bitmap bit alone cannot:
+ * between a creator's bit CAS and its record write the record is still
+ * the dead previous one, and a scrub judging "bit set, record dead"
+ * reclaims a number that is being born. The birth registry stops this
+ * node's own scrub only. Both sides therefore CAS sector 0:
+ *
+ *   creator: bit CAS, read record R, BIRTH CLAIM = CAS(R -> R with
+ *            ns_lock_owner=me and a new generation). Miscompare, or a
+ *            foreign ns_lock_owner in R: a scrub is reclaiming this
+ *            number -- abandon it, bit untouched, take another.
+ *   scrub:   verdict on (bit set, record dead gen G, no lock), RECLAIM
+ *            CLAIM = CAS(dead G, unlocked -> ns_lock_owner=me), clear
+ *            the bit, RELEASE = CAS(me -> unlocked, NEW generation).
+ *
+ * The new generation on release is what makes a creator's R -- read
+ * before the claim, compared after the release -- miscompare.
+ * tests/kernel/scrub_vs_birth.sh.
+ */
+struct cetrafs_birth_ctx {
+    struct super_block *sb;
+    const u8 *seed; /* sector 0 as the creator judged it */
+    u64 ino;
+    u32 me;
+    bool lost; /* the verdict travels here: a >0 mutate return is flattened to success */
+};
+
+static int cetrafs_birth_claim_mutate(void *image, unsigned int len, void *priv)
+{
+    struct cetrafs_birth_ctx *ctx = priv;
+    cetrafs_inode_t rec;
+
+    if (len < CETRAFS_INODE_NS_BYTES)
+        return -EINVAL;
+    if (memcmp(image, ctx->seed, CETRAFS_INODE_NS_BYTES)) {
+        ctx->lost = true;
+        return 1; /* changed since the verdict: not ours to claim */
+    }
+    memset(&rec, 0, sizeof(rec));
+    memcpy(&rec, image, CETRAFS_INODE_NS_BYTES);
+    rec.ino = cetrafs_cpu_to_le64(ctx->ino); /* a virgin record has none */
+    rec.nlink = 0;
+    rec.ns_lock_owner = cetrafs_cpu_to_le32(ctx->me);
+    rec.generation = cetrafs_cpu_to_le64(cetrafs_inode_new_generation(ctx->sb));
+    cetrafs_inode_stamp_crc_ns(&rec);
+    memcpy(image, &rec, CETRAFS_INODE_NS_BYTES);
+    return 0;
+}
+
+/* The creator's half. 'seed' is the record read after the bit CAS. Sets
+ * *out_lost when a scrub got to the record first. */
+int cetrafs_inode_birth_claim(struct super_block *sb, u64 ino, const cetrafs_inode_t *seed, bool *out_lost)
+{
+    struct cetrafs_birth_ctx ctx = {.sb = sb, .seed = (const u8 *) seed, .ino = ino};
+    u64 lba = cetrafs_inode_lba(sb, ino);
+    int ret;
+
+    *out_lost = false;
+    if (!lba)
+        return -EINVAL;
+    if (cetrafs_sb_is_fenced(sb))
+        return -EIO;
+    ret = cetrafs_sb_get_node_id(sb, &ctx.me);
+    if (ret)
+        return ret;
+    ret = cetrafs_cas_record_seeded(sb, lba, seed, CETRAFS_INODE_NS_BYTES, cetrafs_birth_claim_mutate, &ctx);
+    *out_lost = ctx.lost;
+    if (ret == 0 && !ctx.lost)
+        cetrafs_record_write_counted();
+    return ret;
+}
+
+struct cetrafs_reclaim_ctx {
+    struct super_block *sb;
+    u64 generation;
+    u32 me;
+    bool release;
+};
+
+static int cetrafs_reclaim_mutate(void *image, unsigned int len, void *priv)
+{
+    struct cetrafs_reclaim_ctx *ctx = priv;
+    cetrafs_inode_t rec;
+
+    if (len < CETRAFS_INODE_NS_BYTES)
+        return -EINVAL;
+    memset(&rec, 0, sizeof(rec));
+    memcpy(&rec, image, CETRAFS_INODE_NS_BYTES);
+    if (!cetrafs_ns_image_trustworthy(&rec))
+        return -EUCLEAN;
+    if (cetrafs_le64(rec.generation) != ctx->generation)
+        return -ESTALE; /* reborn, or released by someone else */
+
+    if (!ctx->release) {
+        /* The claim: still exactly the dead, unlocked record judged. */
+        if (cetrafs_le32(rec.nlink) != 0 || cetrafs_le32(rec.ns_lock_owner) != CETRAFS_NODE_ID_NONE)
+            return -ESTALE;
+        rec.ns_lock_owner = cetrafs_cpu_to_le32(ctx->me);
+    } else {
+        if (cetrafs_le32(rec.ns_lock_owner) != ctx->me)
+            return -ESTALE;
+        rec.ns_lock_owner = cetrafs_cpu_to_le32(CETRAFS_NODE_ID_NONE);
+        rec.generation = cetrafs_cpu_to_le64(cetrafs_inode_new_generation(ctx->sb));
+    }
+    cetrafs_inode_stamp_crc_ns(&rec);
+    memcpy(image, &rec, CETRAFS_INODE_NS_BYTES);
+    return 0;
+}
+
+/* The scrub's halves: claim the dead record it judged (generation G),
+ * and -- after clearing the bit -- release it under a new generation. */
+int cetrafs_inode_reclaim_claim(struct super_block *sb, u64 ino, u64 generation, bool release)
+{
+    struct cetrafs_reclaim_ctx ctx = {.sb = sb, .generation = generation, .release = release};
+    u64 lba = cetrafs_inode_lba(sb, ino);
+    int ret;
+
+    if (!lba)
+        return -EINVAL;
+    if (cetrafs_sb_is_fenced(sb))
+        return -EIO;
+    ret = cetrafs_sb_get_node_id(sb, &ctx.me);
+    if (ret)
+        return ret;
+    ret = cetrafs_cas_record(sb, lba, cetrafs_reclaim_mutate, &ctx);
+    if (ret == 0)
+        cetrafs_record_write_counted();
+    return ret;
+}
+
 /* Zero a record's nlink by sector-0 CAS -- the free path's "make the
  * on-disk state honest" write, now unable to clobber anything else. */
 int cetrafs_inode_ns_zero_nlink(struct super_block *sb, u64 ino, const cetrafs_inode_t *seed)

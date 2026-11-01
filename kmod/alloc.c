@@ -517,65 +517,85 @@ static int cetrafs_inode_bitmap_cas_free(struct super_block *sb, u64 bit)
 }
 
 /* Allocate a free inode number (1-based) from the global inode bitmap. */
+/*
+ * Test-only: pause an inode allocation between taking the bit and
+ * claiming the record -- the window in which the number's on-disk record
+ * is still the dead previous one, which is all a peer's orphan scrub can
+ * see. tests/kernel/scrub_vs_birth.sh plays that scrub inside it.
+ */
+static unsigned int cetrafs_birth_gap_ms;
+module_param_named(birth_gap_ms, cetrafs_birth_gap_ms, uint, 0644);
+MODULE_PARM_DESC(birth_gap_ms, "test-only: delay between an inode allocation's bit CAS and its birth claim");
+
 int cetrafs_alloc_inode(struct super_block *sb, u64 *out_ino)
 {
     const cetrafs_superblock_t *raw_sb = cetrafs_sb_raw(sb);
+    unsigned int attempt;
+    u32 me;
     long bit;
 
     if (cetrafs_sb_is_fenced(sb))
         return -EIO; /* self-fenced */
     if (!raw_sb)
         return -EINVAL;
+    if (cetrafs_sb_get_node_id(sb, &me))
+        return -EIO;
 
-    bit = cetrafs_inode_bitmap_cas_alloc(sb);
-    if (bit < 0)
-        return (int) bit;
-
-    *out_ino = (u64) bit + 1; /* bit is 0-based, ino is 1-based */
-    ctrace("INOALLOC ino=%llu\n", (unsigned long long) *out_ino);
-
-    /*
-     * The bitmap said this number was free. Ask the RECORD whether it
-     * agrees: the bit and the record are two independent pieces of
-     * state, and only their agreement makes a number safe to reuse.
-     * A record still claiming links belongs to a LIVE file, and handing
-     * that number to a second owner is how a populated directory gets
-     * reinitialised by somebody else's mkdir -- every name in it
-     * orphaned, its blocks unreachable, the files simply gone.
-     *
-     * cetrafs_free_inode() zeroes nlink precisely so this means
-     * something: a properly freed record claims nothing, so nlink != 0
-     * here is not stale residue.
-     *
-     * Per the correctness bar a detected collision is never silently
-     * accepted. Losing one number is a leak the scrub reclaims; handing
-     * it out twice is data loss.
-     */
-    {
+    /* Bounded: each lost number is one a scrub is reclaiming right now,
+     * and the bitmap scan moves on past it. */
+    for (attempt = 0; attempt < 8; attempt++) {
         cetrafs_inode_t raw;
-        bool have = false;
+        bool have = false, lost = false;
+        u32 owner;
+        int ret;
 
-        /* Read the record ONCE, raw. cetrafs_read_raw_inode() is wrong
-         * here twice over: a VIRGIN number -- never allocated since
-         * mkfs -- has an all-zero record, which fails the checksum, so
-         * that reader burns its whole retry budget and then logs
-         * 'corrupted, not just a torn concurrent read' for every first
-         * allocation of every number. Storms of those messages (and
-         * +1.5ms per create) were chased as filesystem corruption for
-         * half a morning. All-zero IS the expected shape
-         * of a free record; only a checksummed record claiming links
-         * means the number is in use. */
+        bit = cetrafs_inode_bitmap_cas_alloc(sb);
+        if (bit < 0)
+            return (int) bit;
+
+        *out_ino = (u64) bit + 1; /* bit is 0-based, ino is 1-based */
+        ctrace("INOALLOC ino=%llu\n", (unsigned long long) *out_ino);
+
+        /*
+         * The bitmap said this number was free. Ask the RECORD whether it
+         * agrees: the bit and the record are two independent pieces of
+         * state, and only their agreement makes a number safe to reuse.
+         * A record still claiming links belongs to a LIVE file, and handing
+         * that number to a second owner is how a populated directory gets
+         * reinitialised by somebody else's mkdir -- every name in it
+         * orphaned, its blocks unreachable, the files simply gone.
+         *
+         * cetrafs_free_inode() zeroes nlink precisely so this means
+         * something: a properly freed record claims nothing, so nlink != 0
+         * here is not stale residue.
+         *
+         * Per the correctness bar a detected collision is never silently
+         * accepted. Losing one number is a leak the scrub reclaims; handing
+         * it out twice is data loss.
+         *
+         * Read the record ONCE, raw. cetrafs_read_raw_inode() is wrong
+         * here twice over: a VIRGIN number -- never allocated since mkfs
+         * -- has an all-zero record, which fails the checksum, so that
+         * reader burns its whole retry budget and then logs 'corrupted,
+         * not just a torn concurrent read' for every first allocation of
+         * every number. All-zero IS the expected shape of a free record;
+         * only a checksummed record claiming links means the number is in
+         * use. This read is also the image the birth claim below is
+         * compared against.
+         */
         {
             struct buffer_head *bh;
 
             cetrafs_invalidate_raw_inode(sb, *out_ino);
             bh = cetrafs_bread_retry(sb, cetrafs_inode_lba(sb, *out_ino));
-            if (bh) {
-                cetrafs_bh_copy_stable(bh, &raw, sizeof(raw));
-                brelse(bh);
-                have = cetrafs_inode_crcs_ok(&raw);
-            }
+            if (!bh)
+                return -EIO; /* the bit stays set: a leak, never a second owner */
+            cetrafs_bh_copy_stable(bh, &raw, sizeof(raw));
+            brelse(bh);
+            have = cetrafs_inode_crcs_ok(&raw);
         }
+        if (cetrafs_birth_gap_ms)
+            msleep(cetrafs_birth_gap_ms); /* test-only; see the parameter */
         if (have && cetrafs_le32(raw.nlink) != 0) {
             pr_err(
                 "alloc_inode: the bitmap handed out ino=%llu but its record still claims %u link(s) "
@@ -586,15 +606,44 @@ int cetrafs_alloc_inode(struct super_block *sb, u64 *out_ino)
             *out_ino = 0;
             return -EIO;
         }
-    }
 
-    /* Mark the number mid-birth BEFORE returning it: from here until the
-     * first name is published, the on-disk record cannot prove this node
-     * owns the number (the dead previous record is still what a scanner
-     * reads), so the orphan scrub keys off this registry instead. */
-    cetrafs_sb_birth_begin(sb, *out_ino);
-    cetrafs_sb_adjust_free_inodes(sb, -1);
-    return 0;
+        /* A record a PEER holds the namespace lock of is mid-reclaim by
+         * its scrub (nothing else locks a dead number): the bit we just
+         * took is about to be cleared under us. Ours (a scrub of this
+         * node finished, or a create of ours failed after its claim) is
+         * safe to take over -- this node's own scrub never touches a
+         * number mid-birth here. */
+        owner = cetrafs_le32(raw.ns_lock_owner);
+        if (have && owner != CETRAFS_NODE_ID_NONE && owner != me)
+            lost = true;
+        else {
+            ret = cetrafs_inode_birth_claim(sb, *out_ino, &raw, &lost);
+            if (ret) {
+                *out_ino = 0;
+                return ret; /* bit left set: a leak the scrub reclaims */
+            }
+        }
+        if (lost) {
+            /* Abandon: the bit belongs to the reclaim that beat us, and
+             * clearing it would clobber that arbitration. Count it used --
+             * it is set -- and take another number. */
+            pr_info_ratelimited("alloc_inode: ino=%llu is being reclaimed by a scrub -- taking another number\n",
+                                (unsigned long long) *out_ino);
+            cetrafs_sb_adjust_free_inodes(sb, -1);
+            continue;
+        }
+
+        /* Mark the number mid-birth BEFORE returning it: from here until
+         * the first name is published, the on-disk record cannot prove
+         * this node owns the number (the dead previous record is still
+         * what a scanner reads), so the orphan scrub keys off this
+         * registry instead. */
+        cetrafs_sb_birth_begin(sb, *out_ino);
+        cetrafs_sb_adjust_free_inodes(sb, -1);
+        return 0;
+    }
+    *out_ino = 0;
+    return -EAGAIN;
 }
 
 /* Release an inode number back to the global inode bitmap. */
@@ -661,13 +710,16 @@ int cetrafs_free_inode(struct super_block *sb, u64 ino)
  * FRESH immediately before the free and require it to still be the dead
  * record the verdict saw: nlink==0 AND the same generation (every
  * rebirth stamps a new generation, so a reborn number can never match).
- * A mismatch returns -ESTALE and frees nothing. The residual window
- * (create wrote its record after this re-read) is closed by the birth
- * registry, which the scrub checks before ever reaching here.
+ * A mismatch returns -ESTALE and frees nothing.
+ *
+ * A re-read is not enough on its own, though: it said nothing about a
+ * PEER whose create took the bit and has not written its record yet --
+ * the birth registry that covers that window is per-node. So the
+ * "re-read" is a claim CAS on the record, which a creator's own birth
+ * claim excludes; see cetrafs_inode_birth_claim().
  */
 int cetrafs_free_inode_if_dead(struct super_block *sb, u64 ino, u64 generation)
 {
-    cetrafs_inode_t raw;
     int ret;
 
     if (cetrafs_sb_is_fenced(sb))
@@ -675,18 +727,32 @@ int cetrafs_free_inode_if_dead(struct super_block *sb, u64 ino, u64 generation)
     if (!ino)
         return -EINVAL;
 
-    cetrafs_invalidate_raw_inode(sb, ino);
-    ret = cetrafs_read_raw_inode(sb, ino, &raw);
+    /* The verdict is acted on through the record itself: claim it --
+     * a CAS that lands only on the dead, unlocked record of generation
+     * 'generation' the verdict saw -- clear the bit, release it under a
+     * new generation. A creator that took the bit meanwhile either beat
+     * the claim (its own birth claim changed the record: ours refuses)
+     * or loses to it and abandons the number. See inode.c's
+     * cetrafs_inode_birth_claim(). A re-read alone could not be adjacent
+     * enough to the free; only this is. */
+    ret = cetrafs_inode_reclaim_claim(sb, ino, generation, /*release=*/false);
     if (ret)
-        return ret; /* cannot vouch -- free nothing */
-    if (cetrafs_le32(raw.nlink) != 0 || cetrafs_le64(raw.generation) != generation)
-        return -ESTALE; /* reborn under the verdict -- not ours to free */
+        return ret; /* reborn, locked, or unreadable: free nothing */
 
     ret = cetrafs_inode_bitmap_cas_free(sb, ino - 1);
-    if (ret > 0)
-        return 1;
     if (!ret)
         cetrafs_sb_adjust_free_inodes(sb, 1);
+    {
+        int rret = cetrafs_inode_reclaim_claim(sb, ino, generation, /*release=*/true);
+
+        if (rret)
+            pr_warn_ratelimited(
+                "scrub: ino=%llu reclaim lock not released (%d) -- the number stays unusable "
+                "until fsck\n",
+                (unsigned long long) ino, rret);
+    }
+    if (ret > 0)
+        return 1;
     return ret;
 }
 
@@ -1750,42 +1816,6 @@ static int cetrafs_bitmap_test_bit(struct super_block *sb, u64 bmap_lba, u64 nbl
  * Walking only allocated inodes is what lets the scrub see those blocks as
  * unreferenced and reclaim them.
  */
-/*
- * Birth re-verify (dir.c, after the newborn record's first write): is the
- * bit this create allocated STILL set, read fresh off the device? A
- * PEER's orphan scrub can free a mid-birth number -- its verdict read
- * the previous incarnation's dead record, and our birth registry is
- * node-local so it cannot see our gestation. Detecting the theft here
- * and failing the create LOUDLY is the correctness bar's requirement
- * for a race we cannot yet exclude cross-node; silently proceeding is
- * how two files end up sharing one inode (2026-10-29, single-node
- * variant, closed by the registry + the conditioned free).
- */
-int cetrafs_alloc_inode_still_owned(struct super_block *sb, u64 ino, bool *out_set)
-{
-    const cetrafs_superblock_t *raw_sb = cetrafs_sb_raw(sb);
-    u64 bit, blk;
-    u32 bit_in_block, byte, bit_in_byte;
-    struct buffer_head *bh;
-
-    *out_set = false;
-    if (!raw_sb || !ino || ino > le32_to_cpu(raw_sb->inodes_count))
-        return -EINVAL;
-    bit = ino - 1;
-    blk = bit / CETRAFS_BITS_PER_BLOCK;
-    bit_in_block = bit % CETRAFS_BITS_PER_BLOCK;
-    byte = bit_in_block / 8;
-    bit_in_byte = bit_in_block % 8;
-    if (blk >= le64_to_cpu(raw_sb->inode_bmap_blocks))
-        return -EINVAL;
-    bh = cetrafs_bread_uncached_retry(sb, le64_to_cpu(raw_sb->inode_bmap_start) + blk);
-    if (!bh)
-        return -EIO;
-    *out_set = (*((const u8 *) bh->b_data + byte) & (1u << bit_in_byte)) != 0;
-    brelse(bh);
-    return 0;
-}
-
 int cetrafs_inode_is_allocated(struct super_block *sb, u64 ino, bool *out_set)
 {
     const cetrafs_superblock_t *raw_sb = cetrafs_sb_raw(sb);
