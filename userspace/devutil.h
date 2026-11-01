@@ -127,13 +127,73 @@ static inline int cetrafs_device_mounted(const char *dev, char *where, size_t wh
  * only; it is meaningless under skew and nothing decides anything with
  * it.
  */
+/*
+ * A row in a live state (REGISTERED, REPAIR) whose checksum does not
+ * verify may be one its node is rewriting right now: re-read it, from
+ * the device, before believing that.
+ *
+ * Skipping it on the first bad read made a live node's row caught
+ * mid-update count as NO node, and mkfs -f / fsck -r went ahead on a
+ * mounted volume (tests/image/peer_probe_torn_row.sh). A checksum
+ * detects; a lockless reader next to a writer re-reads (CLAUDE.md,
+ * rule 3). A row that never verifies is garbage after all, and must
+ * still not block a tool forever -- so the retries are bounded per row
+ * (10..160 ms, 310 ms in all) and per scan (*budget_ms), and a
+ * registry full of garbage costs seconds, not minutes.
+ *
+ * Returns the pread result for the last read: the caller checks the
+ * state and checksum again exactly as before.
+ */
+#define CETRAFS_ROW_SETTLE_BUDGET_MS 2000u
+
+static inline int cetrafs_node_row_crc_ok(const cetrafs_node_entry_t *ne)
+{
+    cetrafs_node_entry_t c = *ne;
+    uint32_t want = (uint32_t) cetrafs_le64(c.checksum);
+
+    c.checksum = 0;
+    return crc32c_struct(&c, sizeof(c), offsetof(cetrafs_node_entry_t, checksum), sizeof(c.checksum)) == want;
+}
+
+static inline ssize_t cetrafs_node_row_pread_settled(int fd, unsigned char *blk, off_t off, unsigned *budget_ms)
+{
+    unsigned delay = 10;
+    ssize_t got;
+
+    for (;;) {
+        cetrafs_node_entry_t ne;
+        uint32_t st;
+
+        got = pread(fd, blk, CETRAFS_BLOCK_SIZE, off);
+        if (got != (ssize_t) CETRAFS_BLOCK_SIZE)
+            return got;
+        memcpy(&ne, blk, sizeof(ne));
+        st = cetrafs_le32(ne.state);
+        if ((st != CETRAFS_NODE_STATE_REGISTERED && st != CETRAFS_NODE_STATE_REPAIR) || cetrafs_node_row_crc_ok(&ne))
+            return got;
+        if (delay > 160 || !budget_ms || *budget_ms < delay)
+            return got; /* never verified: garbage, and the caller says so */
+        *budget_ms -= delay;
+        {
+            struct timespec ts = {.tv_sec = 0, .tv_nsec = (long) delay * 1000000L};
+
+            while (nanosleep(&ts, &ts) != 0 && errno == EINTR)
+                ;
+        }
+        posix_fadvise(fd, off, CETRAFS_BLOCK_SIZE, POSIX_FADV_DONTNEED); /* the device, not our cache */
+        delay *= 2;
+    }
+}
+
 /* Read one Node Registry row; 1 = a checksum-valid, REGISTERED row that
- * is not an explicit clean departure; 0 = anything else readable;
+ * is not an explicit clean departure; 2 = a REGISTERED row whose
+ * checksum never verified, even re-read; 0 = anything else readable;
  * -1 = the row CANNOT be read (I/O error -- see the contract above). */
 static inline int cetrafs_read_live_candidate(int fd,
                                               const cetrafs_superblock_t *sb,
                                               uint32_t idx,
-                                              cetrafs_node_entry_t *out)
+                                              cetrafs_node_entry_t *out,
+                                              unsigned *budget_ms)
 {
     /* This runs BEFORE any layout validation -- it is the "is somebody
      * mounted?" gate, which deliberately trusts nothing but the magic --
@@ -149,10 +209,9 @@ static inline int cetrafs_read_live_candidate(int fd,
         return 0;
     off_t off = (off_t) (lba * CETRAFS_BLOCK_SIZE);
     cetrafs_node_entry_t ne;
-    uint32_t want;
 
     {
-        ssize_t got = pread(fd, blk, CETRAFS_BLOCK_SIZE, off);
+        ssize_t got = cetrafs_node_row_pread_settled(fd, blk, off, budget_ms);
 
         if (got < 0)
             return -1; /* I/O error: cannot VERIFY, which is not "nobody" */
@@ -164,11 +223,8 @@ static inline int cetrafs_read_live_candidate(int fd,
     if (cetrafs_le32(ne.state) != CETRAFS_NODE_STATE_REGISTERED)
         return 0;
 
-    want = (uint32_t) cetrafs_le64(ne.checksum);
-    ne.checksum = 0;
-    if (crc32c_struct(&ne, sizeof(ne), offsetof(cetrafs_node_entry_t, checksum), sizeof(ne.checksum)) != want)
-        return 0; /* garbage row -- must not be able to block a format */
-    ne.checksum = cetrafs_cpu_to_le64(want);
+    if (!cetrafs_node_row_crc_ok(&ne))
+        return 2; /* never verified, re-read included: the caller decides */
 
     /* An explicit clean departure. A single exact sentinel, not a
      * duration, so it needs no clock and stays reliable under skew. */
@@ -219,6 +275,7 @@ static inline int cetrafs_find_repair_claim(int fd,
     uint32_t count = cetrafs_le32(sb->node_table_count), idx, ncand = 0;
     cetrafs_node_entry_t *first;
     int found = 0;
+    unsigned budget = CETRAFS_ROW_SETTLE_BUDGET_MS;
 
     if (!count || count > 4096)
         return 0;
@@ -249,8 +306,8 @@ static inline int cetrafs_find_repair_claim(int fd,
         for (idx = 0; idx < count; idx++) {
             unsigned char blk[CETRAFS_BLOCK_SIZE];
             cetrafs_node_entry_t ne;
-            uint32_t want;
-            ssize_t got = pread(fd, blk, sizeof(blk), cetrafs_node_row_off(sb, idx));
+            int changed;
+            ssize_t got = cetrafs_node_row_pread_settled(fd, blk, cetrafs_node_row_off(sb, idx), &budget);
 
             if (got < 0) {
                 free(first);
@@ -261,16 +318,23 @@ static inline int cetrafs_find_repair_claim(int fd,
             memcpy(&ne, blk, sizeof(ne));
             if (cetrafs_le32(ne.state) != CETRAFS_NODE_STATE_REPAIR)
                 continue;
-            want = (uint32_t) cetrafs_le64(ne.checksum);
-            ne.checksum = 0;
-            if (crc32c_struct(&ne, sizeof(ne), offsetof(cetrafs_node_entry_t, checksum), sizeof(ne.checksum)) != want)
-                continue; /* garbage must not be able to block a repair */
+            changed = 0;
+            if (!cetrafs_node_row_crc_ok(&ne)) {
+                /* Never verified, re-read included. At the first look
+                 * that is garbage, which must not block a repair; at
+                 * the second, after a valid first look, the row CHANGED
+                 * during the probe -- a repairer at work. */
+                if (pass == 0 || cetrafs_le32(first[idx].state) != CETRAFS_NODE_STATE_REPAIR)
+                    continue;
+                ne = first[idx]; /* report what we could verify */
+                changed = 1;
+            }
             if (pass == 0) {
                 first[idx] = ne;
                 ncand++;
                 continue;
             }
-            if (cetrafs_le32(first[idx].state) != CETRAFS_NODE_STATE_REPAIR || ne.hb_seq == first[idx].hb_seq)
+            if (cetrafs_le32(first[idx].state) != CETRAFS_NODE_STATE_REPAIR || (!changed && ne.hb_seq == first[idx].hb_seq))
                 continue; /* not seen before, or not renewed: no live repairer here */
             if (out_row)
                 *out_row = idx;
@@ -596,6 +660,7 @@ static inline int cetrafs_find_live_peer(const char *dev,
     cetrafs_superblock_t sb;
     cetrafs_node_entry_t *first = NULL;
     uint32_t count, idx, ncand = 0, slowest = 0;
+    unsigned budget = CETRAFS_ROW_SETTLE_BUDGET_MS;
     int fd, found = 0;
 
     fd = open(dev, O_RDONLY | O_CLOEXEC);
@@ -629,7 +694,7 @@ static inline int cetrafs_find_live_peer(const char *dev,
         return -1;
     }
     for (idx = 0; idx < count; idx++) {
-        int rc = cetrafs_read_live_candidate(fd, &sb, idx, &first[idx]);
+        int rc = cetrafs_read_live_candidate(fd, &sb, idx, &first[idx], &budget);
 
         if (rc < 0) { /* an unreadable row fails the whole verdict closed */
             free(iscand);
@@ -637,7 +702,7 @@ static inline int cetrafs_find_live_peer(const char *dev,
             close(fd);
             return -1;
         }
-        if (rc) {
+        if (rc == 1) { /* 2: never verified, even re-read -- garbage */
             iscand[idx] = 1;
             ncand++;
             if (cetrafs_le32(first[idx].hb_interval_secs) > slowest)
@@ -687,7 +752,7 @@ static inline int cetrafs_find_live_peer(const char *dev,
 
         if (!iscand[idx])
             continue;
-        rc = cetrafs_read_live_candidate(fd, &sb, idx, &now_ne);
+        rc = cetrafs_read_live_candidate(fd, &sb, idx, &now_ne, &budget);
         if (rc < 0) { /* unreadable mid-probe: fail closed, same as pass 1 */
             free(iscand);
             free(first);
@@ -696,8 +761,12 @@ static inline int cetrafs_find_live_peer(const char *dev,
         }
         if (!rc)
             continue; /* it left, or its row went away, during the probe */
-        if (now_ne.hb_seq == first[idx].hb_seq)
+        /* rc == 2: verified at the first look, never since -- the row
+         * CHANGED during the probe, which is a writer at work. */
+        if (rc == 1 && now_ne.hb_seq == first[idx].hb_seq)
             continue; /* registered, but not heartbeating: gone */
+        if (rc == 2)
+            now_ne = first[idx]; /* report what we last could verify */
 
         if (out_row)
             *out_row = idx;
