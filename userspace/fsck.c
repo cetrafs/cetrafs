@@ -202,6 +202,22 @@ static void repair_set_nlink(int fd, const cetrafs_superblock_t *sb, uint64_t in
     pwrite_all(fd, blk, sizeof(blk), off);
 }
 
+/* Rewrite a directory record's size -- same read-modify-write and
+ * restamp as repair_set_nlink() above. */
+static void repair_set_dir_size(int fd, const cetrafs_superblock_t *sb, uint64_t ino, uint64_t size)
+{
+    uint8_t blk[CETRAFS_BLOCK_SIZE] = {0};
+    off_t off = (off_t) (cetrafs_le64(sb->inode_table_start) + (ino - 1)) * CETRAFS_BLOCK_SIZE;
+    cetrafs_inode_t in;
+
+    pread_all(fd, blk, sizeof(blk), off);
+    memcpy(&in, blk, sizeof(in));
+    in.size = cetrafs_cpu_to_le64(size);
+    cetrafs_inode_stamp_crcs_us(&in);
+    memcpy(blk, &in, sizeof(in));
+    pwrite_all(fd, blk, sizeof(blk), off);
+}
+
 /*
  * Directory data blocks found with a broken dirent tail during the scan,
  * repaired after the namespace pass -- '..' needs the parent, and the
@@ -2584,6 +2600,18 @@ int main(int argc, char **argv)
          * reachability is just "does the parent chain reach the root",
          * with no extra I/O and no edge list to store. */
         uint32_t *dir_parent = (uint32_t *) xcalloc(cetrafs_le32(sb.inodes_count) + 1, sizeof(uint32_t));
+        /* A directory's size is a count: sizeof(cetrafs_dirent_t) per
+         * occupied slot, '.' and '..' included -- mkdir starts it at two,
+         * every add_entry/remove_entry moves it by one (dir.c). Nothing
+         * checked it, so a size left wrong (a lost publish, a crash
+         * between the entry and the record) stayed wrong for good, every
+         * later create and unlink adjusting the wrong number
+         * (tests/kernel/nslock_fd_publish_error.sh). dslots[] counts what
+         * the walk finds; dwhole[] says the walk saw EVERY block, the
+         * only case in which that count is the truth. */
+        uint64_t *dsize = (uint64_t *) xcalloc(cetrafs_le32(sb.inodes_count) + 1, sizeof(uint64_t));
+        uint32_t *dslots = (uint32_t *) xcalloc(cetrafs_le32(sb.inodes_count) + 1, sizeof(uint32_t));
+        uint8_t *dwhole = (uint8_t *) xcalloc(cetrafs_le32(sb.inodes_count) + 1, 1);
         uint64_t dirents_seen = 0;
 
         /*
@@ -2612,6 +2640,7 @@ int main(int argc, char **argv)
                 continue; /* already reported above */
             nlinks[ino] = cetrafs_le32(in.nlink);
             is_dir[ino] = ((cetrafs_le32(in.mode) & 0170000u) == 0040000u);
+            dsize[ino] = cetrafs_le64(in.size);
         }
 
         /* Pass B: walk every directory's entries. */
@@ -2634,6 +2663,7 @@ int main(int argc, char **argv)
              * below are meaningful for it. A directory skipped above was
              * never looked at and must not be reported as missing them. */
             walked[ino] = 1;
+            dwhole[ino] = 1; /* until a block is skipped below */
 
             cetrafs_extent_t ext[4 + CETRAFS_EXT_BLOCK_MAX_LEAVES];
             uint32_t n;
@@ -2654,6 +2684,7 @@ int main(int argc, char **argv)
                             "ERR: directory inode %" PRIu64 " names extent leaf block %" PRIu64 ", which is not on the device\n",
                             ino, lf);
                     problems++;
+                    dwhole[ino] = 0;
                     continue;
                 }
                 pread_all(fd, leafblk, sizeof(leafblk), (off_t) lf * CETRAFS_BLOCK_SIZE);
@@ -2680,6 +2711,7 @@ int main(int argc, char **argv)
                             ino, phys, len);
                     problems++;
                     logical += len;
+                    dwhole[ino] = 0;
                     continue;
                 }
 
@@ -2695,6 +2727,7 @@ int main(int argc, char **argv)
                                 ino, phys + k);
                         problems++;
                         note_bad_dirent_block(ino, phys + k, logical == 0);
+                        dwhole[ino] = 0;
                         continue;
                     }
                     /* Same convention as dir.c's cetrafs_dirent_block_stamp():
@@ -2731,6 +2764,7 @@ int main(int argc, char **argv)
                              * right here into /lost+found. */
                         } else {
                             note_bad_dirent_block(ino, phys + k, logical == 0);
+                            dwhole[ino] = 0;
                             continue;
                         }
                     }
@@ -2740,6 +2774,7 @@ int main(int argc, char **argv)
                         if (de[s].inode == 0)
                             continue;
                         dirents_seen++;
+                        dslots[ino]++; /* every occupied slot is in the size, valid or not */
                         if (cetrafs_le64(de[s].inode) > cetrafs_le32(sb.inodes_count)) {
                             fprintf(stderr,
                                     "ERR: directory %" PRIu64 " has an entry for inode %" PRIu64
@@ -2820,6 +2855,23 @@ int main(int argc, char **argv)
                     }
                 }
             }
+        }
+
+        /* Before the orphan pass below: it links into lost+found, which
+         * moves that directory's entries past what the walk counted. */
+        for (uint64_t ino = 1; ino <= cetrafs_le32(sb.inodes_count); ++ino) {
+            uint64_t want_size = (uint64_t) dslots[ino] * sizeof(cetrafs_dirent_t);
+
+            if (!is_dir[ino] || !walked[ino] || !dwhole[ino] || dsize[ino] == want_size)
+                continue;
+            if (repair_mode && !repair_blocked) {
+                repair_set_dir_size(fd, &sb, ino, want_size);
+                repairs_made++;
+            }
+            fprintf(stderr,
+                    "ERR: directory inode %" PRIu64 " has size %" PRIu64 " but holds %u entries (expected %" PRIu64 ")\n",
+                    ino, dsize[ino], dslots[ino], want_size);
+            problems++;
         }
 
         for (uint64_t ino = 2; ino <= cetrafs_le32(sb.inodes_count); ++ino) {
@@ -3136,6 +3188,9 @@ int main(int argc, char **argv)
         free(walked);
         free(subdirs);
         free(dir_parent);
+        free(dsize);
+        free(dslots);
+        free(dwhole);
 
         problems += early_problems;
         if (problems) {
