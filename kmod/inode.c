@@ -1566,6 +1566,12 @@ const struct inode_operations cetrafs_symlink_iops = {
     .setattr = cetrafs_setattr,
 };
 
+/* TEST ONLY: stall a refresh between its "no local changes" verdict and
+ * the stores that act on it, so a test can land a local write there. */
+static unsigned int cetrafs_apply_refresh_stall_ms;
+module_param_named(apply_refresh_stall_ms, cetrafs_apply_refresh_stall_ms, uint, 0644);
+MODULE_PARM_DESC(apply_refresh_stall_ms, "TEST ONLY: widen a refresh's dirty-check-to-store window");
+
 int cetrafs_apply_raw_to_vfs_inode(struct inode *inode, const cetrafs_inode_t *raw)
 {
     int ret;
@@ -1646,12 +1652,37 @@ int cetrafs_apply_raw_to_vfs_inode(struct inode *inode, const cetrafs_inode_t *r
      * Dirty means this node holds the newer copy, so there is nothing on
      * disk worth stamping on top of it. i_state is read under i_lock,
      * the way the VFS does.
+     *
+     * And the verdict must still hold when the stores land. Checked
+     * bare, it did not: an extending write sets i_size and only THEN
+     * dirties the inode, so a refresh judging "clean" in between -- or
+     * just before the write -- went on to store the device's older
+     * size over it (tests/kernel/refresh_vs_local_write.sh: 20 of 20
+     * rounds, 2026-11-01). The check and the stores therefore run
+     * under the locks the local writers of these fields hold:
+     * inode_lock (write(2), truncate, fallocate, setattr) and the
+     * exclusive invalidate_lock (get_block's i_blocks from a page
+     * fault). Both are TRY-locks -- callers reach this from
+     * d_revalidate and open with fd_pub_mutex held, which ranks below
+     * both -- and a lock someone holds means a local writer is active:
+     * decline, exactly as for a dirty inode.
      */
+    if (!inode_trylock(inode))
+        return 0;
+    if (!down_write_trylock(&inode->i_mapping->invalidate_lock)) {
+        inode_unlock(inode);
+        return 0;
+    }
     spin_lock(&inode->i_lock);
     dirty = (inode_state_read(inode) & I_DIRTY_ALL) != 0;
     spin_unlock(&inode->i_lock);
-    if (dirty)
+    if (dirty) {
+        up_write(&inode->i_mapping->invalidate_lock);
+        inode_unlock(inode);
         return 0;
+    }
+    if (cetrafs_apply_refresh_stall_ms && S_ISREG(inode->i_mode))
+        msleep(cetrafs_apply_refresh_stall_ms);
 
     inode->i_mode = cetrafs_le32(raw->mode);
     i_uid_write(inode, cetrafs_le32(raw->uid));
@@ -1663,6 +1694,8 @@ int cetrafs_apply_raw_to_vfs_inode(struct inode *inode, const cetrafs_inode_t *r
     inode_set_mtime(inode, (time64_t) cetrafs_le64(raw->mtime), 0);
     inode_set_ctime(inode, (time64_t) cetrafs_le64(raw->ctime), 0);
     cetrafs_inode_stat_baseline_set(inode, raw);
+    up_write(&inode->i_mapping->invalidate_lock);
+    inode_unlock(inode);
 
     /* Dropping the page cache below forces the
      * next read back through cetrafs_get_block() -- but for a depth-1
@@ -1739,8 +1772,8 @@ int cetrafs_refresh_vfs_inode_if_newer(struct inode *inode)
 
     /* Read AND stamp under the publish mutex: the publisher holds it
      * across its CAS and its note of the stamped seq, so this refresh
-     * runs either entirely before the publish (whatever it stamps is
-     * immediately re-corrected by the publish's own merge write-back)
+     * runs either entirely before the publish (whatever it stamps, it
+     * also makes the baseline, so the publish's merge starts from it)
      * or entirely after it (and the seq guard below then recognises a
      * superseded read). Without the mutex there is a window where a
      * fresh-at-read-time image lands on in-core state the publish just
