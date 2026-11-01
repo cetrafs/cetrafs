@@ -296,6 +296,24 @@ void cetrafs_bh_copy_stable(struct buffer_head *bh, void *out, size_t len)
     unlock_buffer(bh);
 }
 
+/*
+ * Run a read-only test over a buffer's bytes under the buffer lock, for
+ * a reader that must not see a writer's half-edited image -- and must
+ * not CLAIM the buffer to get that guarantee: a claim released with
+ * cetrafs_bh_abort_update() drops a clean buffer's cached image, which
+ * on a lookup path means a device re-read every time (file.c's
+ * cetrafs_leaf_bh_holds_uninit()).
+ */
+bool cetrafs_bh_test_stable(struct buffer_head *bh, bool (*test)(const void *data, void *arg), void *arg)
+{
+    bool r;
+
+    lock_buffer(bh);
+    r = test(bh->b_data, arg);
+    unlock_buffer(bh);
+    return r;
+}
+
 /* Release a buffer claimed by cetrafs_bh_begin_update() WITHOUT
  * publishing it: for a path that claimed the block and then decided it
  * had nothing to write after all, or that is about to free the block

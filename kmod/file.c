@@ -2394,27 +2394,30 @@ static int cetrafs_tree_convert_append(struct inode *inode,
  * guessing). -ENOSPC means the split needs room the array has not got;
  * nothing was modified.
  */
+static bool cetrafs_leaf_data_holds_uninit(const void *data, void *arg)
+{
+    const cetrafs_extent_hdr_t *lhdr = data;
+    const cetrafs_extent_t *arr = (const cetrafs_extent_t *) ((const u8 *) data + sizeof(*lhdr));
+    u32 iblock = *(const u32 *) arg;
+    u16 n = min_t(u16, cetrafs_le16(lhdr->eh_entries), CETRAFS_EXT_BLOCK_MAX_LEAVES), i;
+
+    for (i = 0; i < n; i++) {
+        u32 eb = cetrafs_le32(arr[i].ee_block);
+
+        if (cetrafs_extent_is_uninit(arr[i].ee_len) && iblock >= eb &&
+            (u64) iblock < (u64) eb + cetrafs_extent_len(arr[i].ee_len))
+            return true;
+    }
+    return false;
+}
+
 /* Does this leaf hold 'iblock' in a preallocated extent? Read-only,
  * under the buffer lock so it never sees a writer's half-edited array;
  * the extent-tree writers are excluded by invalidate_lock, which the
  * caller holds. */
 static bool cetrafs_leaf_bh_holds_uninit(struct buffer_head *lbh, u32 iblock)
 {
-    const cetrafs_extent_hdr_t *lhdr = (const cetrafs_extent_hdr_t *) lbh->b_data;
-    const cetrafs_extent_t *arr = (const cetrafs_extent_t *) (lbh->b_data + sizeof(*lhdr));
-    bool hit = false;
-    u16 n, i;
-
-    lock_buffer(lbh);
-    n = min_t(u16, cetrafs_le16(lhdr->eh_entries), CETRAFS_EXT_BLOCK_MAX_LEAVES);
-    for (i = 0; i < n && !hit; i++) {
-        u32 eb = cetrafs_le32(arr[i].ee_block);
-
-        hit = cetrafs_extent_is_uninit(arr[i].ee_len) && iblock >= eb &&
-              (u64) iblock < (u64) eb + cetrafs_extent_len(arr[i].ee_len);
-    }
-    unlock_buffer(lbh);
-    return hit;
+    return cetrafs_bh_test_stable(lbh, cetrafs_leaf_data_holds_uninit, &iblock);
 }
 
 /*
