@@ -1279,6 +1279,16 @@ static bool cetrafs_lock_fail_reader_publish;
 module_param_named(lock_fail_reader_publish, cetrafs_lock_fail_reader_publish, bool, 0644);
 MODULE_PARM_DESC(lock_fail_reader_publish, "test-only: force the reader-set publish to fail");
 
+/*
+ * Test-only: sleep between the last-writer close's two cross-node
+ * steps -- clearing the on-disk lock and publishing the file sector
+ * (size, blocks, extents) -- so a test can look at the device in the
+ * gap. tests/kernel/close_publish_order.sh.
+ */
+static unsigned int cetrafs_release_step_gap_ms;
+module_param_named(release_step_gap_ms, cetrafs_release_step_gap_ms, uint, 0644);
+MODULE_PARM_DESC(release_step_gap_ms, "test-only: delay between the close's lock clear and state publish");
+
 int cetrafs_lock_open(struct inode *inode, struct file *file)
 {
     struct cetrafs_inode_info *ci = CETRAFS_I(inode);
@@ -1666,7 +1676,7 @@ int cetrafs_lock_release(struct inode *inode, struct file *file)
          * below for the same reason suspension does them first: the
          * signal must not disappear before the data is durable. */
         bool was_suspended = ci->lock_suspended;
-        int ret, bmap_ret;
+        int ret, bmap_ret, pub_ret;
         ktime_t t0 = ktime_get();
         ktime_t t_data, t_inode, t_bg, t_leaf;
 
@@ -1694,18 +1704,11 @@ int cetrafs_lock_release(struct inode *inode, struct file *file)
          * The in-core i_size/i_mtime/nlink reach the on-disk record only
          * via cetrafs_write_vfs_inode(), which the VFS calls on its own
          * delayed writeback schedule, never synchronously from
-         * write()/close(). Without this call a write() followed by
-         * close()+reopen reads back the PRE-write size and mtime --
-         * nothing persisted them -- and silently regresses the in-core
-         * state to stale. Calling it here makes the last writer's close
-         * a durability boundary for the stat fields, not just the data.
-         *
-         * They are not persisted by their own write, though: the
-         * lock-clearing CAS at the bottom of this function stamps them
-         * into the SAME swap. Two synchronous read-modify-writes of one
-         * 4096-byte record cost tens of milliseconds each on a real
-         * LUN, and folding them also tightens ordering -- a peer can
-         * never see the lock released with the new size not yet durable.
+         * write()/close(). Without the publish further down a write()
+         * followed by close()+reopen reads back the PRE-write size and
+         * mtime, so the last writer's close is a durability boundary for
+         * the stat fields, not just the data -- published by their own
+         * file-sector CAS, ahead of the lock clear (see there).
          */
         t_inode = ktime_get();
 
@@ -1771,6 +1774,28 @@ int cetrafs_lock_release(struct inode *inode, struct file *file)
             cetrafs_flush_tree_blocks(inode, &raw);
         t_leaf = ktime_get();
 
+        /*
+         * The close boundary's FILE-sector publish (v0x0005): size,
+         * blocks, times and any pending hot-path extent shadow, by
+         * region-1 CAS -- every close path takes it, locked or
+         * nofilelock, lock-clear or deferred (the defrag mover holding
+         * the lock pinned still owes the new size its write).
+         *
+         * BEFORE the lock clear below, never after: a peer may open the
+         * instant the lock reads NONE and refreshes from the record it
+         * finds, so everything this writer did must already be in it.
+         * The two used to be one CAS, then were split with the publish
+         * last -- leaving a window in which the device said "free" about
+         * a record missing this node's last writes
+         * (tests/kernel/close_publish_order.sh).
+         */
+        pub_ret = cetrafs_write_vfs_inode(inode);
+        if (pub_ret)
+            pr_err("lock release: ino=%llu failed to persist inode state: %d -- keeping the lock\n",
+                   (unsigned long long) inode->i_ino, pub_ret);
+        if (cetrafs_release_step_gap_ms)
+            msleep(cetrafs_release_step_gap_ms); /* test-only; see the parameter */
+
         lock_cleared = false;
         if (was_suspended) {
             cetrafs_lock_presence_put(inode);
@@ -1786,6 +1811,12 @@ int cetrafs_lock_release(struct inode *inode, struct file *file)
              * treating that as an error would log on every close. The
              * stat-persist fallback below is what keeps the close a
              * durability boundary. */
+        } else if (pub_ret) {
+            /* What this writer did is not on the device. Handing the
+             * file over now would give the next opener a record without
+             * it, and leave our unpublished state to land over theirs
+             * later. Fail loudly instead: the lock stays ours (a later
+             * close retries; a dead node is reclaimed as stale). */
         } else if (READ_ONCE(ci->defrag_pinned)) {
             /* The incremental defrag mover is mid-pass and depends on
              * the on-disk lock staying ours: every flush above still
@@ -1808,13 +1839,10 @@ int cetrafs_lock_release(struct inode *inode, struct file *file)
                 pr_err("lock release: ino=%llu held by node %u, not us (%u) -- leaving as-is\n",
                        (unsigned long long) inode->i_ino, raw.lock_owner_node, my_node_id);
             } else {
-                /* One compare-and-swap that both persists this inode's
-                 * stat fields and clears our lock -- see the comment on
-                 * the removed write_vfs_inode() call above. It only
-                 * lands on a record still showing OUR claim, so a lock
-                 * reclaimed from us meanwhile is left alone rather than
-                 * blindly stomped (which the old blind write did not
-                 * check for). */
+                /* Clear our lock -- the file sector was published above.
+                 * It only lands on a record still showing OUR claim, so
+                 * a lock reclaimed from us meanwhile is left alone rather
+                 * than blindly stomped. */
                 struct cetrafs_lock_cas_ctx ctx = {
                     .my_node_id = my_node_id,
                     .generation = cetrafs_le64(raw.generation),
@@ -1827,32 +1855,7 @@ int cetrafs_lock_release(struct inode *inode, struct file *file)
                            ret);
                 else
                     lock_cleared = true;
-                /* v0x0005: the lock-clear swap no longer carries the stat
-                 * fields -- they live in the FILE sector, published by
-                 * write_vfs_inode()'s own CAS below, always. */
             }
-        }
-
-        /*
-         * The combined swap above only runs when we actually clear the
-         * lock. Every other path -- the defrag mover holding it pinned,
-         * a lock already reclaimed from us, a failed read -- still owes
-         * the stat fields their own write, which is exactly what this
-         * function has always guaranteed at a last-writer close. Losing
-         * that was a real regression when the two writes were first
-         * folded together: a close while the defragmenter held the lock
-         * pinned silently never persisted the new size.
-         */
-        {
-            /* The close boundary's FILE-sector publish (v0x0005): size,
-             * blocks, times and any pending hot-path extent shadow, by
-             * region-1 CAS -- every close path takes it, locked or
-             * nofilelock, lock-clear or deferred. */
-            int sret = cetrafs_write_vfs_inode(inode);
-
-            if (sret)
-                pr_err("lock release: ino=%llu failed to persist inode state: %d\n", (unsigned long long) inode->i_ino,
-                       sret);
         }
 
         /*
