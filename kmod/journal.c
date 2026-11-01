@@ -1181,6 +1181,22 @@ int cetrafs_journal_replay_node(struct super_block *sb, u32 node_id, bool wait_f
                 ret = werr;
                 goto out_free;
             }
+            /* Durable, not just completed, before the consume below --
+             * the write path's own rule: a volatile cache can otherwise
+             * persist the zeroed header and lose the redo, erasing the
+             * only thing that could still repair the target. Replay is
+             * rare; one flush per redo is nothing. */
+            werr = blkdev_issue_flush(sb->s_bdev);
+            if (werr) {
+                pr_err("journal replay: node %u txn %llu flush after redo of target %llu failed (%d) -- "
+                       "entry kept, area stays dirty for a later attempt\n",
+                       node_id, (unsigned long long) entries[s].txn_id,
+                       (unsigned long long) entries[s].target_lba, werr);
+                brelse(tbh);
+                brelse(pbh);
+                ret = werr;
+                goto out_free;
+            }
             atomic64_inc(&cetrafs_journal_replay_applied);
             applied++;
         }
