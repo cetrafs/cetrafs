@@ -251,60 +251,111 @@ static inline int cetrafs_find_repair_claim(int fd,
 static unsigned char cetrafs_repair_saved[CETRAFS_BLOCK_SIZE];
 static int cetrafs_repair_borrowed;
 
+/* How long a liveness probe watches hb_seq. CETRAFS_PEER_PROBE_SECS is
+ * a test knob only: the suite cannot afford a real heartbeat interval
+ * per assertion. Unset in every normal invocation. */
+static inline unsigned cetrafs_peer_probe_secs(void)
+{
+    const char *env = getenv("CETRAFS_PEER_PROBE_SECS");
+
+    if (env && *env) {
+        long v = strtol(env, NULL, 10);
+
+        if (v > 0)
+            return (unsigned) v;
+    }
+    return CETRAFS_PEER_PROBE_SECS;
+}
+
 /* Claim a row for this repairer. Returns the row, or -1 if none could
  * be taken (or the write failed) -- in which case the caller must not
  * proceed: an unclaimed repair is the thing being fixed. */
 static inline int cetrafs_repair_claim(int fd, const cetrafs_superblock_t *sb, const char *label)
 {
     uint32_t count = cetrafs_le32(sb->node_table_count), idx;
+    unsigned char *seen = NULL;
     int pass;
 
     if (!count || count > 4096)
         return -1;
 
-    /* Pass 0 takes a free row; pass 1 borrows a departed one. Never the
-     * other way round: borrowing while a free row exists would displace
-     * a registration for no reason. */
-    for (pass = 0; pass < 2; pass++)
-    for (idx = 0; idx < count; idx++) {
-        unsigned char blk[CETRAFS_BLOCK_SIZE];
-        cetrafs_node_entry_t ne;
-
-        if (pread(fd, blk, sizeof(blk), cetrafs_node_row_off(sb, idx)) != (ssize_t) sizeof(blk))
-            return -1;
-        memcpy(&ne, blk, sizeof(ne));
-        if (pass == 0) {
-            if (cetrafs_le32(ne.state) != CETRAFS_NODE_STATE_FREE)
-                continue;
-        } else {
-            long long age;
-
-            if (cetrafs_le32(ne.state) != CETRAFS_NODE_STATE_REGISTERED)
-                continue;
-            age = (long long) time(NULL) - (long long) cetrafs_le64(ne.last_seen);
-            if (ne.last_seen != 0 && age <= (long long) CETRAFS_NODE_STALE_SECS)
-                continue; /* still beating: not ours to take */
-            memcpy(cetrafs_repair_saved, blk, sizeof(cetrafs_repair_saved));
-            cetrafs_repair_borrowed = 1;
+    /*
+     * Pass 0 takes a free row; pass 1 borrows a cleanly departed one
+     * (last_seen == 0); pass 2 borrows one whose node is PROVEN gone.
+     * Never in another order: borrowing while a free row exists would
+     * displace a registration for no reason.
+     *
+     * Proven gone means watched: its hb_seq did not move over a probe
+     * window, the test cetrafs_find_live_peer() applies. This used to
+     * compare the row's last_seen with THIS machine's clock, and a live
+     * node whose clock lagged by more than the staleness window had its
+     * row overwritten -- after which the live-peer probe could not see
+     * it either (the row read REPAIR) and the repair ran on a mounted
+     * volume. The wait is paid only when the table is full and nobody
+     * left cleanly.
+     */
+    for (pass = 0; pass < 3; pass++) {
+        if (pass == 2) {
+            seen = (unsigned char *) calloc(count, CETRAFS_BLOCK_SIZE);
+            if (!seen)
+                return -1;
+            for (idx = 0; idx < count; idx++)
+                if (pread(fd, seen + (size_t) idx * CETRAFS_BLOCK_SIZE, CETRAFS_BLOCK_SIZE,
+                          cetrafs_node_row_off(sb, idx)) != (ssize_t) CETRAFS_BLOCK_SIZE) {
+                    free(seen);
+                    return -1;
+                }
+            fprintf(stderr,
+                    "no free or cleanly released registry row; watching for %us for one whose node is gone...\n",
+                    cetrafs_peer_probe_secs());
+            fflush(stderr);
+            sleep(cetrafs_peer_probe_secs());
+            posix_fadvise(fd, 0, 0, POSIX_FADV_DONTNEED); /* or the re-read is served from our cache */
         }
+        for (idx = 0; idx < count; idx++) {
+            unsigned char blk[CETRAFS_BLOCK_SIZE];
+            cetrafs_node_entry_t ne;
 
-        memset(&ne, 0, sizeof(ne));
-        ne.state = cetrafs_cpu_to_le32(CETRAFS_NODE_STATE_REPAIR);
-        ne.last_seen = cetrafs_cpu_to_le64((uint64_t) time(NULL));
-        ne.hb_seq = cetrafs_cpu_to_le64(1);
-        snprintf(ne.label, sizeof(ne.label), "%s", label);
-        cetrafs_node_row_stamp(&ne);
+            if (pread(fd, blk, sizeof(blk), cetrafs_node_row_off(sb, idx)) != (ssize_t) sizeof(blk)) {
+                free(seen);
+                return -1;
+            }
+            memcpy(&ne, blk, sizeof(ne));
+            if (pass == 0) {
+                if (cetrafs_le32(ne.state) != CETRAFS_NODE_STATE_FREE)
+                    continue;
+            } else {
+                if (cetrafs_le32(ne.state) != CETRAFS_NODE_STATE_REGISTERED)
+                    continue;
+                if (pass == 1 && ne.last_seen != 0)
+                    continue; /* not a clean departure: only a probe can tell */
+                if (pass == 2 && memcmp(blk, seen + (size_t) idx * CETRAFS_BLOCK_SIZE, sizeof(blk)) != 0)
+                    continue; /* written during the probe: alive, not ours to take */
+                memcpy(cetrafs_repair_saved, blk, sizeof(cetrafs_repair_saved));
+                cetrafs_repair_borrowed = 1;
+            }
+            free(seen);
+            seen = NULL;
 
-        memset(blk, 0, sizeof(blk));
-        memcpy(blk, &ne, sizeof(ne));
-        if (pwrite(fd, blk, sizeof(blk), cetrafs_node_row_off(sb, idx)) != (ssize_t) sizeof(blk))
-            return -1;
-        /* On the platter before the first structural write, or the
-         * claim does not exist as far as a mounting node is concerned. */
-        if (fsync(fd) != 0)
-            return -1;
-        return (int) idx;
+            memset(&ne, 0, sizeof(ne));
+            ne.state = cetrafs_cpu_to_le32(CETRAFS_NODE_STATE_REPAIR);
+            ne.last_seen = cetrafs_cpu_to_le64((uint64_t) time(NULL));
+            ne.hb_seq = cetrafs_cpu_to_le64(1);
+            snprintf(ne.label, sizeof(ne.label), "%s", label);
+            cetrafs_node_row_stamp(&ne);
+
+            memset(blk, 0, sizeof(blk));
+            memcpy(blk, &ne, sizeof(ne));
+            if (pwrite(fd, blk, sizeof(blk), cetrafs_node_row_off(sb, idx)) != (ssize_t) sizeof(blk))
+                return -1;
+            /* On the platter before the first structural write, or the
+             * claim does not exist as far as a mounting node is concerned. */
+            if (fsync(fd) != 0)
+                return -1;
+            return (int) idx;
+        }
     }
+    free(seen);
     return -1;
 }
 
@@ -469,17 +520,8 @@ static inline int cetrafs_find_live_peer(const char *dev,
     /* Pass 2: give every candidate more than one full heartbeat interval
      * to prove it is alive by moving its own counter. */
     {
-        /* Test knob only: the suite cannot afford a real heartbeat
-         * interval per assertion. Unset in every normal invocation. */
-        const char *env = getenv("CETRAFS_PEER_PROBE_SECS");
-        unsigned probe = CETRAFS_PEER_PROBE_SECS;
+        unsigned probe = cetrafs_peer_probe_secs();
 
-        if (env && *env) {
-            long v = strtol(env, NULL, 10);
-
-            if (v > 0)
-                probe = (unsigned) v;
-        }
         fprintf(stderr,
                 "%s: %u node registry row(s) look mounted; watching for %us to see whether they are "
                 "still heartbeating...\n",
