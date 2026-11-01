@@ -25,6 +25,7 @@
 #define pr_fmt(fmt) "cetrafs: " fmt
 
 #include <linux/buffer_head.h>
+#include <linux/version.h>
 #include <linux/delay.h>
 #include <linux/fs.h>
 
@@ -224,9 +225,15 @@ int cetrafs_sync_buffer(struct buffer_head *bh)
         return 0;
     }
     clear_buffer_write_io_error(bh);
+#if LINUX_VERSION_CODE >= KERNEL_VERSION(7, 2, 0)
+    /* 7.2 completes per bio and takes no buffer reference of its own;
+     * bh_end_write() is end_buffer_write_sync() without the put_bh(). */
+    bh_submit(bh, REQ_OP_WRITE | REQ_SYNC, bh_end_write);
+#else
     get_bh(bh);
     bh->b_end_io = end_buffer_write_sync;
     submit_bh(REQ_OP_WRITE | REQ_SYNC, bh);
+#endif
     wait_on_buffer(bh);
     return buffer_write_io_error(bh) ? -EIO : 0;
 }
@@ -235,6 +242,16 @@ int cetrafs_sync_buffer(struct buffer_head *bh)
  * Completion for cetrafs_sync_buffer_keep(): unlike end_buffer_write_sync()
  * it never clears BH_Uptodate on an error -- see there.
  */
+#if LINUX_VERSION_CODE >= KERNEL_VERSION(7, 2, 0)
+static void cetrafs_end_write_keep(struct bio *bio)
+{
+    struct buffer_head *bh;
+
+    if (!bio_endio_bh(bio, &bh))
+        set_buffer_write_io_error(bh);
+    unlock_buffer(bh);
+}
+#else
 static void cetrafs_end_write_keep(struct buffer_head *bh, int uptodate)
 {
     if (!uptodate)
@@ -242,6 +259,7 @@ static void cetrafs_end_write_keep(struct buffer_head *bh, int uptodate)
     unlock_buffer(bh);
     put_bh(bh);
 }
+#endif
 
 /*
  * cetrafs_sync_buffer() for a block whose cached bytes are the ONLY copy
@@ -269,9 +287,13 @@ int cetrafs_sync_buffer_keep(struct buffer_head *bh)
         unlock_buffer(bh);
         return 0;
     }
+#if LINUX_VERSION_CODE >= KERNEL_VERSION(7, 2, 0)
+    bh_submit(bh, REQ_OP_WRITE | REQ_SYNC, cetrafs_end_write_keep);
+#else
     get_bh(bh);
     bh->b_end_io = cetrafs_end_write_keep;
     submit_bh(REQ_OP_WRITE | REQ_SYNC, bh);
+#endif
     wait_on_buffer(bh);
     if (buffer_write_io_error(bh)) {
         clear_buffer_write_io_error(bh);
