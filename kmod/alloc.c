@@ -98,8 +98,10 @@ static long cetrafs_bitmap_alloc_bit(struct super_block *sb, u64 bmap_lba, u64 n
             for (bit = 0; bit < 8; bit++) {
                 u64 idx = blk * CETRAFS_BITS_PER_BLOCK + byte * 8 + bit;
 
-                if (idx >= nbits)
+                if (idx >= nbits) {
+                    brelse(bh); /* the bottom-of-loop release is skipped */
                     goto out_full;
+                }
 
                 if (!(*b & (1u << bit))) {
                     /* Buffer lock across the modification -- see
