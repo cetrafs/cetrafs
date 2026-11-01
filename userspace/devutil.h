@@ -251,9 +251,10 @@ static inline int cetrafs_find_repair_claim(int fd,
 static unsigned char cetrafs_repair_saved[CETRAFS_BLOCK_SIZE];
 static int cetrafs_repair_borrowed;
 
-/* How long a liveness probe watches hb_seq. CETRAFS_PEER_PROBE_SECS is
- * a test knob only: the suite cannot afford a real heartbeat interval
- * per assertion. Unset in every normal invocation. */
+/* How long a liveness probe watches hb_seq, before the watched rows
+ * have their say (cetrafs_probe_window()). CETRAFS_PEER_PROBE_SECS is a
+ * test knob only: the suite cannot afford a real heartbeat interval per
+ * assertion. Unset in every normal invocation. */
 static inline unsigned cetrafs_peer_probe_secs(void)
 {
     const char *env = getenv("CETRAFS_PEER_PROBE_SECS");
@@ -267,12 +268,32 @@ static inline unsigned cetrafs_peer_probe_secs(void)
     return CETRAFS_PEER_PROBE_SECS;
 }
 
+/*
+ * The probe window for a set of rows: long enough for the SLOWEST of
+ * them to beat, twice. A node advertises its own interval in its row
+ * (hb_interval_secs, up to CETRAFS_HB_INTERVAL_MAX_SECS) and the fixed
+ * window (one default interval + 5 s = 20 s) was shorter than a legal
+ * 30 s one: a live node beating that slowly could pass a whole probe
+ * unseen and be declared gone -- by mkfs -f, by fsck -r. Clamped to the
+ * legal maximum, so a hostile row cannot make us sleep for days; 0 is a
+ * row that predates the field and leaves the base window. The kernel's
+ * own probe (node.c) floors on four beats; this one blocks a human at a
+ * prompt and is paid only when some row looks live, so two.
+ */
+static inline unsigned cetrafs_probe_window(uint32_t max_advertised)
+{
+    unsigned base = cetrafs_peer_probe_secs();
+    uint32_t pi = max_advertised < CETRAFS_HB_INTERVAL_MAX_SECS ? max_advertised : CETRAFS_HB_INTERVAL_MAX_SECS;
+
+    return pi && 2 * pi + 5 > base ? 2 * pi + 5 : base;
+}
+
 /* Claim a row for this repairer. Returns the row, or -1 if none could
  * be taken (or the write failed) -- in which case the caller must not
  * proceed: an unclaimed repair is the thing being fixed. */
 static inline int cetrafs_repair_claim(int fd, const cetrafs_superblock_t *sb, const char *label)
 {
-    uint32_t count = cetrafs_le32(sb->node_table_count), idx;
+    uint32_t count = cetrafs_le32(sb->node_table_count), idx, slowest = 0;
     unsigned char *seen = NULL;
     int pass;
 
@@ -305,11 +326,19 @@ static inline int cetrafs_repair_claim(int fd, const cetrafs_superblock_t *sb, c
                     free(seen);
                     return -1;
                 }
+            for (idx = 0; idx < count; idx++) {
+                const cetrafs_node_entry_t *r =
+                    (const cetrafs_node_entry_t *) (seen + (size_t) idx * CETRAFS_BLOCK_SIZE);
+
+                if (cetrafs_le32(r->state) == CETRAFS_NODE_STATE_REGISTERED &&
+                    cetrafs_le32(r->hb_interval_secs) > slowest)
+                    slowest = cetrafs_le32(r->hb_interval_secs);
+            }
             fprintf(stderr,
                     "no free or cleanly released registry row; watching for %us for one whose node is gone...\n",
-                    cetrafs_peer_probe_secs());
+                    cetrafs_probe_window(slowest));
             fflush(stderr);
-            sleep(cetrafs_peer_probe_secs());
+            sleep(cetrafs_probe_window(slowest));
             posix_fadvise(fd, 0, 0, POSIX_FADV_DONTNEED); /* or the re-read is served from our cache */
         }
         for (idx = 0; idx < count; idx++) {
@@ -463,7 +492,7 @@ static inline int cetrafs_find_live_peer(const char *dev,
 {
     cetrafs_superblock_t sb;
     cetrafs_node_entry_t *first = NULL;
-    uint32_t count, idx, ncand = 0;
+    uint32_t count, idx, ncand = 0, slowest = 0;
     int fd, found = 0;
 
     fd = open(dev, O_RDONLY | O_CLOEXEC);
@@ -508,6 +537,8 @@ static inline int cetrafs_find_live_peer(const char *dev,
         if (rc) {
             iscand[idx] = 1;
             ncand++;
+            if (cetrafs_le32(first[idx].hb_interval_secs) > slowest)
+                slowest = cetrafs_le32(first[idx].hb_interval_secs);
         }
     }
     if (ncand == 0) {
@@ -520,7 +551,7 @@ static inline int cetrafs_find_live_peer(const char *dev,
     /* Pass 2: give every candidate more than one full heartbeat interval
      * to prove it is alive by moving its own counter. */
     {
-        unsigned probe = cetrafs_peer_probe_secs();
+        unsigned probe = cetrafs_probe_window(slowest);
 
         fprintf(stderr,
                 "%s: %u node registry row(s) look mounted; watching for %us to see whether they are "

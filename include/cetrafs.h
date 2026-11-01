@@ -851,12 +851,14 @@ typedef struct {
 #define CETRAFS_STALE_MAX_SECS       240
 #define CETRAFS_STALE_MIN_BEATS      3 /* stale_secs >= this * hb_interval_secs */
 
-/* How long a userspace tool (mkfs/fsck) watches a Node Registry row
- * before concluding nobody is heartbeating on it. Must exceed one full
- * heartbeat interval so a live node is guaranteed at least one bump,
- * with margin for a node whose tick is running late under load. The
- * kernel does not use this: a mounted node watches its peers
- * continuously and has no reason to block. */
+/* The BASE of how long a userspace tool (mkfs/fsck/growfs) watches a
+ * Node Registry row before concluding nobody is heartbeating on it --
+ * enough for one DEFAULT interval with margin. It is only a floor: a
+ * node may run a slower interval (up to CETRAFS_HB_INTERVAL_MAX_SECS)
+ * and advertises it in its row, and the window grows to cover that
+ * (devutil.h's cetrafs_probe_window()). The kernel does not use this: a
+ * mounted node watches its peers continuously and has no reason to
+ * block. */
 #define CETRAFS_PEER_PROBE_SECS (CETRAFS_HEARTBEAT_INTERVAL_SECS + 5)
 
 /* Hard cap on registry rows, set by cetrafs_inode_t.read_open_nodes being
