@@ -19,10 +19,10 @@
 # lock must read ours for as long as that operation holds it.
 #
 # DISCRIMINATION (measured on the unfixed code): the record shows the
-# lock FREE while the second operation still holds it. (Its release does
-# NOT then complain: a lock found cleared to NONE is reported through
-# ctx.clobbered, whose "nobody" value is NONE itself -- so that assertion
-# below is a sanity check, not the detector.)
+# lock FREE while the second operation still holds it, and that
+# operation's release reports the lock found cleared. (The release used
+# to say nothing -- a lock found cleared to NONE was reported through a
+# field whose "nobody" value is NONE itself; fixed alongside.)
 set -euo pipefail
 . "$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)/lib/harness.sh"
 require_root
@@ -82,10 +82,10 @@ else
     fail "the heartbeat retry CLEARED the lock while a local operation held it -- a peer could take it"
 fi
 LOG="$(dmesg_since "$MARK")"
-if ! grep -q "no longer ours at release" <<<"$LOG"; then
+if ! grep -qE "no longer ours at release|found CLEARED at release" <<<"$LOG"; then
     pass "the operation's own release found its lock still its own"
 else
-    fail "the operation's release found the lock gone: $(grep 'no longer ours' <<<"$LOG" | tail -1)"
+    fail "the operation's release found the lock gone: $(grep -E 'no longer ours|found CLEARED' <<<"$LOG" | tail -1)"
 fi
 o="$(ns_owner)"
 [ "$o" = 65535 ] && pass "and released, the lock is free" || fail "after both releases the lock reads owner $o"

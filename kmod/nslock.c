@@ -88,7 +88,10 @@ struct cetrafs_nslock_ctx {
     bool acquire;
     bool steal; /* acquire: allowed to displace steal_from */
     u32 steal_from;
-    u32 clobbered; /* release: set if the lock was no longer ours */
+    u32 clobbered; /* release: who held it, when it was no longer ours */
+    bool not_ours; /* release: it was no longer ours -- the verdict. Not
+                    * clobbered != NONE: a lock found CLEARED has
+                    * clobbered == NONE, which read as "fine". */
     u64 dbg_ino;   /* DEBUG: for the DSHRINK probe below */
 
     /* The operation's final update to this record, published by the
@@ -175,6 +178,7 @@ static int cetrafs_nslock_mutate(void *image, unsigned int len, void *priv)
              * ours -- a peer wrongly judged us stale and stole it. Say
              * so loudly rather than treating it as a quiet no-op. */
             ctx->clobbered = cetrafs_le32(rec.ns_lock_owner);
+            ctx->not_ours = true;
             return 1;
         }
         /* Publish the operation's own NAMESPACE-sector updates in this
@@ -271,7 +275,7 @@ void cetrafs_nslock_retry_deferred(struct super_block *sb)
          * The mutator records who holds it in ctx.clobbered; that is
          * the channel the comment prescribes.
          */
-        if (ret == 0 && ctx.clobbered == CETRAFS_NODE_ID_NONE) {
+        if (ret == 0 && !ctx.not_ours) {
             pr_info("nslock: ino=%llu release committed on retry\n", (unsigned long long) pend[i].ino);
         } else if (ret == 0 || ret == -ESTALE) {
             pr_info("nslock: ino=%llu no longer ours to release (%d) -- dropping the retry\n",
@@ -487,6 +491,7 @@ void cetrafs_nslock_release(struct inode *inode)
         if (!ret) {
             ctx.generation = cetrafs_le64(recs[0].generation);
             ctx.clobbered = CETRAFS_NODE_ID_NONE;
+            ctx.not_ours = false;
             ret = cetrafs_cas_record_seeded(sb, cetrafs_inode_lba(sb, inode->i_ino), &recs[0], CETRAFS_INODE_NS_BYTES,
                                             cetrafs_nslock_mutate, &ctx);
         }
@@ -501,7 +506,12 @@ void cetrafs_nslock_release(struct inode *inode)
         msleep(CETRAFS_NSLOCK_SLEEP_MS);
     }
 
-    if (ctx.clobbered != CETRAFS_NODE_ID_NONE)
+    if (ctx.not_ours && ctx.clobbered == CETRAFS_NODE_ID_NONE)
+        pr_warn(
+            "nslock: ino=%llu namespace lock was found CLEARED at release -- something released it while this "
+            "operation held it\n",
+            (unsigned long long) inode->i_ino);
+    else if (ctx.not_ours)
         pr_warn("nslock: ino=%llu namespace lock was no longer ours at release (now %u) -- a peer judged us stale and "
                 "took it\n",
                 (unsigned long long) inode->i_ino, ctx.clobbered);
