@@ -93,6 +93,36 @@ GTYPE="$(stat -c '%F' "$MNT/gen" 2>/dev/null || echo gone)"
     fail "refresh guards: reused number came back as '$GTYPE'"
 ct_umount "$MNT"
 
+log "checking iget's cache hit reports a refused refresh instead of serving the stale object"
+# A NEW dentry for an inode that is already resident: the second name of
+# a hardlink, its dentry dropped while the first name's open file keeps
+# the inode. The lookup then reaches cetrafs_iget()'s cache hit, not
+# d_revalidate. It treated only -ESTALE as a failed refresh; a refused
+# record (-EUCLEAN) or a device error fell through and the lookup
+# returned the old object as though the refresh had confirmed it.
+# DISCRIMINATION (measured on the unfixed code): the second name stats
+# as the old regular file while the kernel logs the refusal.
+ct_mount "$DEV" "$MNT"
+echo hello >"$MNT/hl_a"
+ln "$MNT/hl_a" "$MNT/hl_b"
+HINO="$(stat -c '%i' "$MNT/hl_a")"
+sync
+exec 7<"$MNT/hl_a"
+echo 2 >/proc/sys/vm/drop_caches # hl_b's dentry goes; the inode stays (fd 7)
+"$POKE" "$IMG" retype_keep_gen "$HINO" >/dev/null
+MARK3="$(dmesg_mark)"
+rc=0
+BTYPE="$(stat -c '%F' "$MNT/hl_b" 2>&1)" || rc=$?
+exec 7<&-
+if dmesg_since "$MARK3" | grep -q "refusing a refresh that would change its type"; then
+    pass "iget cache hit: setup -- the lookup reached a refresh that refused the record"
+else
+    fail "iget cache hit: setup -- no refused refresh logged, the path under test did not run (stat: $BTYPE)"
+fi
+[ "$rc" != 0 ] && pass "iget cache hit: the lookup failed rather than return an unconfirmed object" ||
+    fail "iget cache hit: the lookup returned the stale object ('$BTYPE') after its refresh was refused"
+ct_umount "$MNT"
+
 # Deliberately NO fsck assertion here. This suite ends with an image that
 # has been corrupted on purpose -- a record retyped behind the mount's
 # back -- so "fsck is clean" would be the wrong thing to want, and "fsck

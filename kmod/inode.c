@@ -909,6 +909,14 @@ retry:
             iput(inode);
             goto retry;
         }
+        if (ret) {
+            /* -EUCLEAN (a record the refresh refused) or a device error:
+             * nothing confirmed this object, so it is not ours to hand
+             * out -- same answer as cetrafs_d_revalidate() gives. The
+             * caller sees the errno; a later lookup re-reads. */
+            iput(inode);
+            return ERR_PTR(ret);
+        }
         return inode;
     }
 
