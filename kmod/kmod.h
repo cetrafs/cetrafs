@@ -239,6 +239,8 @@ bool cetrafs_resv_covers(struct super_block *sb, u64 lba);
 void cetrafs_sb_note_bmap_alloc(struct super_block *sb, u32 bg_id);
 bool cetrafs_sb_take_bmap_alloc_dirty(struct super_block *sb, u32 bg_id);
 int cetrafs_alloc_flush_bitmaps(struct super_block *sb);
+bool cetrafs_sb_bmap_alloc_any_dirty(struct super_block *sb);
+int cetrafs_alloc_flush_bitmaps_if_dirty(struct super_block *sb);
 void cetrafs_sb_accrue_bg_free(struct super_block *sb, u32 bg_id, s64 delta);
 u64 cetrafs_sb_bg_alloc_seq(struct super_block *sb, u32 bg_id);
 s64 cetrafs_sb_bg_pending_delta(struct super_block *sb, u32 bg_id);

@@ -1935,6 +1935,20 @@ int cetrafs_alloc_flush_bitmaps(struct super_block *sb)
 }
 
 /*
+ * cetrafs_alloc_flush_bitmaps(), but nearly free when there is nothing to
+ * flush -- for the extent-tree edit gate in file.c, which runs once per
+ * mapped block (cetrafs_tree_append()). With speculative runs the bits
+ * of a whole run are set at once, so the sync it does costs one bitmap
+ * write per run, not per block.
+ */
+int cetrafs_alloc_flush_bitmaps_if_dirty(struct super_block *sb)
+{
+    if (!cetrafs_sb_bmap_alloc_any_dirty(sb))
+        return 0;
+    return cetrafs_alloc_flush_bitmaps(sb);
+}
+
+/*
  * A BG's data-region and data-bitmap LBA ranges, for the background scrub
  * (scrub.c): it reads the bitmap blocks directly to find allocated bits and
  * cross-checks them against the referenced-block set it builds from the

@@ -2630,6 +2630,24 @@ static int cetrafs_tree_append(struct inode *inode,
         }
     }
 
+    /*
+     * Depth >= 1: from here the new reference goes into an EXTERNAL tree
+     * block edited in place -- for a regular file left dirty in the block
+     * device's cache until the close/fsync boundary, for a directory
+     * journaled at once. Either way it can reach the device before the
+     * allocation bitmap bit for the block it names: the block device's
+     * own flusher writes dirty buffers in whatever order it likes, and
+     * the bit was set with sync=false. A crash then leaves a tree naming
+     * a block every node reads as FREE (rule 8;
+     * tests/kernel/leaf_before_bitmap.sh, 3 of 3 rounds before this).
+     * So no tree block is edited while any allocation bit is still only
+     * in cache. Depth 0 needs nothing: its only reference is the record,
+     * whose publish has the same flush as its choke point.
+     */
+    ret = cetrafs_alloc_flush_bitmaps_if_dirty(sb);
+    if (ret)
+        return ret;
+
     /* ---- depth 1: one external leaf ---- */
     if (cetrafs_le16(raw->eh.eh_depth) == 1) {
         u64 llba = cetrafs_extent_phys_from_hilo(raw->et.idx[0].ei_leaf_hi, raw->et.idx[0].ei_leaf_lo);
@@ -2874,6 +2892,14 @@ static int cetrafs_tree_append(struct inode *inode,
 
             ret = cetrafs_alloc_block_anywhere(sb, &bg, &new_leaf);
             if (ret) {
+                brelse(ibh);
+                return ret;
+            }
+            /* Linked below from an interior edited in place: its bit
+             * first, same as the gate above. */
+            ret = cetrafs_alloc_flush_bitmaps_if_dirty(sb);
+            if (ret) {
+                cetrafs_free_data_block(sb, new_leaf);
                 brelse(ibh);
                 return ret;
             }

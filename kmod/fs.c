@@ -2791,6 +2791,17 @@ void cetrafs_sb_note_bmap_alloc(struct super_block *sb, u32 bg_id)
         set_bit(bg_id, sbi->bmap_alloc_dirty);
 }
 
+/* Does any BG have allocation bits not yet on the device? O(words), no
+ * atomics -- the tree-edit gate asks this once per mapped block. */
+bool cetrafs_sb_bmap_alloc_any_dirty(struct super_block *sb)
+{
+    struct cetrafs_sb_info *sbi = sb->s_fs_info;
+
+    if (!sbi || !sbi->bmap_alloc_dirty)
+        return false;
+    return find_first_bit(sbi->bmap_alloc_dirty, sbi->bg_count) < sbi->bg_count;
+}
+
 /* Take and clear the set, for the flush. Clearing first means a racing
  * allocation re-marks its BG rather than having its mark dropped by a
  * flush that did not cover it. */
