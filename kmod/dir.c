@@ -2378,6 +2378,21 @@ static bool cetrafs_rename_recheck_read_fail;
 module_param_named(rename_recheck_read_fail, cetrafs_rename_recheck_read_fail, bool, 0644);
 MODULE_PARM_DESC(rename_recheck_read_fail, "test only: the next rename target re-check cannot read the record");
 
+/* TEST ONLY: the next '..' rewrite of a directory changing parent fails,
+ * as a device error would. */
+static bool cetrafs_rename_dotdot_fail_once;
+module_param_named(rename_dotdot_fail_once, cetrafs_rename_dotdot_fail_once, bool, 0644);
+MODULE_PARM_DESC(rename_dotdot_fail_once, "TEST ONLY: the next rename's '..' rewrite fails with -EIO");
+
+static int cetrafs_rename_dotdot(struct inode *dir, u64 parent_ino)
+{
+    if (cetrafs_rename_dotdot_fail_once) {
+        cetrafs_rename_dotdot_fail_once = false;
+        return -EIO;
+    }
+    return cetrafs_dir_update_dotdot(dir, parent_ino);
+}
+
 static int cetrafs_rename_locked(struct mnt_idmap *idmap,
                                  struct inode *old_dir,
                                  struct dentry *old_dentry,
@@ -2391,6 +2406,7 @@ static int cetrafs_rename_locked(struct mnt_idmap *idmap,
     struct inode *new_inode = target;
     u64 old_ino, discard_ino, old_gen;
     bool counted = false;
+    bool dotdot_moved = false;
     u8 discard_file_type;
     u8 old_file_type;
     time64_t now;
@@ -2605,6 +2621,25 @@ static int cetrafs_rename_locked(struct mnt_idmap *idmap,
         counted = true;
     }
 
+    /*
+     * A directory changing parent: its '..' FIRST. It used to be the
+     * last of the three writes, so when it failed the directory had
+     * already moved -- new name in, old name out -- while rename(2)
+     * reported an error and '..' still named the old parent; fsck then
+     * found a '..' naming a directory that is not the parent
+     * (tests/kernel/rename_dotdot_error.sh). Now its failure leaves
+     * everything untouched, and a failure of the name write below puts
+     * it back. A crash between the two leaves a '..' ahead of the names,
+     * which fsck reports the same way it reported the old order's crash
+     * window (names ahead of '..').
+     */
+    if (old_file_type == CETRAFS_FT_DIR && old_dir != new_dir) {
+        ret = cetrafs_rename_dotdot(old_inode, new_dir->i_ino);
+        if (ret)
+            goto out_uncount;
+        dotdot_moved = true;
+    }
+
     if (new_inode) {
         u64 removed_ino;
         u8 removed_file_type;
@@ -2690,12 +2725,6 @@ static int cetrafs_rename_locked(struct mnt_idmap *idmap,
     if (ret)
         goto out;
 
-    if (old_file_type == CETRAFS_FT_DIR && old_dir != new_dir) {
-        ret = cetrafs_dir_update_dotdot(old_inode, new_dir->i_ino);
-        if (ret)
-            goto out;
-    }
-
     /* POSIX: a successful rename updates the moved inode's ctime. This
      * used to touch only the in-core object, which nothing then wrote
      * out (inode_set_ctime() does not dirty the inode), so the on-disk
@@ -2728,9 +2757,18 @@ out:
     return ret;
 
 out_uncount:
-    /* The new name never landed: give the count back. */
+    /* The new name never landed: give the count back, and the '..'. */
     if (counted)
         cetrafs_nlink_step(old_dir->i_sb, old_inode, old_gen, NULL, -1, now);
+    if (dotdot_moved) {
+        int dret = cetrafs_dir_update_dotdot(old_inode, old_dir->i_ino);
+
+        if (dret)
+            pr_err("rename: directory ino=%llu stayed in ino=%llu but its '..' could not be put back from ino=%llu "
+                   "(%d) -- fsck will report it\n",
+                   (unsigned long long) old_ino, (unsigned long long) old_dir->i_ino,
+                   (unsigned long long) new_dir->i_ino, dret);
+    }
     return ret;
 }
 
