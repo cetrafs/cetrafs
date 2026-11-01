@@ -2394,6 +2394,56 @@ static int cetrafs_tree_convert_append(struct inode *inode,
  * guessing). -ENOSPC means the split needs room the array has not got;
  * nothing was modified.
  */
+/* Does this leaf hold 'iblock' in a preallocated extent? Read-only,
+ * under the buffer lock so it never sees a writer's half-edited array;
+ * the extent-tree writers are excluded by invalidate_lock, which the
+ * caller holds. */
+static bool cetrafs_leaf_bh_holds_uninit(struct buffer_head *lbh, u32 iblock)
+{
+    const cetrafs_extent_hdr_t *lhdr = (const cetrafs_extent_hdr_t *) lbh->b_data;
+    const cetrafs_extent_t *arr = (const cetrafs_extent_t *) (lbh->b_data + sizeof(*lhdr));
+    bool hit = false;
+    u16 n, i;
+
+    lock_buffer(lbh);
+    n = min_t(u16, cetrafs_le16(lhdr->eh_entries), CETRAFS_EXT_BLOCK_MAX_LEAVES);
+    for (i = 0; i < n && !hit; i++) {
+        u32 eb = cetrafs_le32(arr[i].ee_block);
+
+        hit = cetrafs_extent_is_uninit(arr[i].ee_len) && iblock >= eb &&
+              (u64) iblock < (u64) eb + cetrafs_extent_len(arr[i].ee_len);
+    }
+    unlock_buffer(lbh);
+    return hit;
+}
+
+/*
+ * A split that hands part of an extent to ANOTHER leaf (the converted
+ * block, the preallocated tail) shrank it here first, and both leaves
+ * are regular-file tree blocks left dirty for the close/fsync boundary.
+ * The block device writes dirty buffers in any order: the destination
+ * reaching the device without this one leaves the device's tree naming
+ * the moved blocks TWICE, and a later delete frees them twice -- the
+ * second time from under whichever file was given them in between
+ * (tests/kernel/convert_leaf_order.sh). So this leaf goes to the device
+ * NOW, before anything else names what it gave up: a crash in between
+ * leaves those blocks named by nothing, a leak the scrub reclaims (the
+ * safe direction, rule 8). One write per split of a FULL leaf -- a rare
+ * path, never per block.
+ *
+ * Kept dirty on failure: the cached leaf is the only copy of the shrunk
+ * state, and the caller then appends nothing.
+ */
+static int cetrafs_convert_source_durable(struct inode *inode, struct buffer_head *lbh)
+{
+    int ret = cetrafs_sync_buffer_keep(lbh);
+
+    if (ret)
+        pr_err_ratelimited("ino=%llu: extent leaf %llu could not be written before its split moved on (%d)\n",
+                           (unsigned long long) inode->i_ino, (unsigned long long) lbh->b_blocknr, ret);
+    return ret;
+}
+
 static int cetrafs_tree_convert_inner(struct inode *inode,
                                       cetrafs_inode_t *raw,
                                       u32 iblock,
@@ -2454,6 +2504,14 @@ static int cetrafs_tree_convert_inner(struct inode *inode,
         cetrafs_blk_tail_stamp(lbh, CETRAFS_LEAF_TAIL_MAGIC);
         if (S_ISREG(inode->i_mode)) {
             cetrafs_bh_end_update(lbh);
+            if (ret == CETRAFS_CONVERT_APPEND) {
+                int wret = cetrafs_convert_source_durable(inode, lbh);
+
+                if (wret) {
+                    brelse(lbh);
+                    return wret;
+                }
+            }
             brelse(lbh);
         } else {
             int wret;
@@ -2491,12 +2549,30 @@ static int cetrafs_tree_convert_inner(struct inode *inode,
 
         for (li = 0; li < iln; li++) {
             u64 llba = cetrafs_extent_phys_from_hilo(iarr[li].ei_leaf_hi, iarr[li].ei_leaf_lo);
-            struct buffer_head *lbh = cetrafs_read_leaf_bh(inode, llba);
+            struct buffer_head *lbh;
             cetrafs_extent_hdr_t *lhdr;
 
+            if (!cetrafs_idx_may_hold(&iarr[li], iblock))
+                continue; /* its range rules it out: not even read */
+            lbh = cetrafs_read_leaf_bh(inode, llba);
             if (!lbh) {
                 brelse(ibh);
                 return -EIO;
+            }
+            /*
+             * Look before claiming. The claim (begin_update) of a leaf
+             * that turns out not to hold the block is released by
+             * cetrafs_bh_abort_update(), which drops a CLEAN buffer's
+             * cached image -- right for its error-path callers, and a
+             * device re-read of every clean leaf this walk passed, on
+             * every later lookup. Invisible while converted leaves stayed
+             * dirty until fsync; once a split writes its source leaf
+             * (cetrafs_convert_source_durable()) it cost 20x on
+             * write_path_cost.sh: 34000 device reads instead of 52.
+             */
+            if (!cetrafs_leaf_bh_holds_uninit(lbh, iblock)) {
+                brelse(lbh);
+                continue; /* not in this leaf; try the next */
             }
             const u32 prev_crc = cetrafs_bh_begin_update_crc(lbh);
             lhdr = (cetrafs_extent_hdr_t *) lbh->b_data;
@@ -2519,37 +2595,49 @@ static int cetrafs_tree_convert_inner(struct inode *inode,
              * -EAGAIN escape to block_write_begin, where io_uring reads
              * it as "retry" and span forever: a stuck worker in D state
              * and a migration that never completed. */
-            /*
-             * Something LEFT this leaf (the converted block, the
-             * preallocated tail, or both go through the tree below), so
-             * its range in the interior may now be far too wide: ranges
-             * only ever widen, and a leaf that once held the tail of a
-             * preallocation advertises everything to the file's end.
-             * Left so, every leaf that ever held the tail is read by
-             * every later lookup past it -- write_path_cost.sh's lookup
-             * cost went from under 8 tree reads per lookup to 48. The
-             * leaf's whole array is in hand, so its exact range is
-             * known: narrow it. Regular files only (directories never
-             * reach depth 2).
-             */
-            if (ret == CETRAFS_CONVERT_APPEND && S_ISREG(inode->i_mode) && cetrafs_le32(iarr[li].ei_block_end)) {
-                u32 lo, hi;
-
-                cetrafs_leaf_array_range((const cetrafs_extent_t *) (lbh->b_data + sizeof(*lhdr)),
-                                         min_t(u16, cetrafs_le16(lhdr->eh_entries), CETRAFS_EXT_BLOCK_MAX_LEAVES), &lo,
-                                         &hi);
-                if (hi && (lo != cetrafs_le32(iarr[li].ei_block) || hi != cetrafs_le32(iarr[li].ei_block_end))) {
-                    (void) cetrafs_bh_begin_update_crc(ibh);
-                    iarr[li].ei_block = cetrafs_cpu_to_le32(lo);
-                    iarr[li].ei_block_end = cetrafs_cpu_to_le32(hi);
-                    cetrafs_blk_tail_stamp(ibh, CETRAFS_INDEX_TAIL_MAGIC);
-                    cetrafs_bh_end_update(ibh);
-                }
-            }
             /* Same trade as the depth-1 site above. */
             cetrafs_blk_tail_stamp(lbh, CETRAFS_LEAF_TAIL_MAGIC);
             if (S_ISREG(inode->i_mode)) {
                 cetrafs_bh_end_update(lbh);
+                if (ret == CETRAFS_CONVERT_APPEND) {
+                    int wret = cetrafs_convert_source_durable(inode, lbh);
+
+                    if (wret) {
+                        brelse(lbh);
+                        brelse(ibh);
+                        return wret;
+                    }
+                    /* Only now: a narrowed range on the device must
+                     * never sit over a leaf the device still has
+                     * unshrunk. */
+                    /*
+                     * Something LEFT this leaf (the converted block, the
+                     * preallocated tail, or both go through the tree below), so
+                     * its range in the interior may now be far too wide: ranges
+                     * only ever widen, and a leaf that once held the tail of a
+                     * preallocation advertises everything to the file's end.
+                     * Left so, every leaf that ever held the tail is read by
+                     * every later lookup past it -- write_path_cost.sh's lookup
+                     * cost went from under 8 tree reads per lookup to 48. The
+                     * leaf's whole array is in hand, so its exact range is
+                     * known: narrow it. Regular files only (directories never
+                     * reach depth 2).
+                     */
+                    if (cetrafs_le32(iarr[li].ei_block_end)) {
+                        u32 lo, hi;
+
+                        cetrafs_leaf_array_range((const cetrafs_extent_t *) (lbh->b_data + sizeof(*lhdr)),
+                                                 min_t(u16, cetrafs_le16(lhdr->eh_entries), CETRAFS_EXT_BLOCK_MAX_LEAVES), &lo,
+                                                 &hi);
+                        if (hi && (lo != cetrafs_le32(iarr[li].ei_block) || hi != cetrafs_le32(iarr[li].ei_block_end))) {
+                            (void) cetrafs_bh_begin_update_crc(ibh);
+                            iarr[li].ei_block = cetrafs_cpu_to_le32(lo);
+                            iarr[li].ei_block_end = cetrafs_cpu_to_le32(hi);
+                            cetrafs_blk_tail_stamp(ibh, CETRAFS_INDEX_TAIL_MAGIC);
+                            cetrafs_bh_end_update(ibh);
+                        }
+                    }
+                }
                 brelse(lbh);
                 brelse(ibh);
             } else {

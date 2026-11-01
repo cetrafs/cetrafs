@@ -214,6 +214,8 @@ FB="$(filefrag -v "$F" | awk -F: '$1 ~ /^ *[0-9]+$/ { split($4, l, " "); n += l[
 log "a lookup must not scale with the number of leaves"
 FR="$MNT/lookupcost.bin"
 prealloc "$FR" $((192 * 1024 * 1024))
+devreads() { awk '{print $1}' "/sys/block/$PD/stat"; }
+DR0="$(devreads)"
 python3 - "$FR" <<'PY3'
 import os, sys, ctypes
 buf = ctypes.create_string_buffer(8192)
@@ -226,6 +228,14 @@ for i in range(12000):
     os.pwrite(fd, mv, i * 8192)
 os.fsync(fd); os.close(fd)
 PY3
+DRD=$(($(devreads) - DR0))
+# The splitting writes find their leaf in cache. A walk that claimed and
+# released every leaf it passed dropped each clean one's cached image
+# (cetrafs_bh_abort_update()), and every later lookup re-read it from the
+# device: 236692 reads for these writes, against ~130.
+[ "$DRD" -lt 2000 ] &&
+    pass "cost: 12000 splitting writes read the device $DRD time(s) (<2000)" ||
+    fail "cost: 12000 splitting writes read the device $DRD times -- the extent leaves are not staying cached"
 sync
 TB="$(c tree_blocks)"
 # Now read single blocks scattered across the whole file and count how
