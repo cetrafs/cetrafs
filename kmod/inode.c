@@ -400,6 +400,28 @@ struct cetrafs_ns_cas_ctx {
     void *arg;
 };
 
+/*
+ * A mutator that KEEPS fields from the image it was handed has to be
+ * able to trust them.
+ *
+ * The image comes straight off the device, independently of whatever
+ * the caller read and verified earlier -- a peer may have rewritten the
+ * sector, or the read may have caught a write in flight. With no check,
+ * a torn or corrupt sector has one field changed and a FRESH checksum
+ * stamped over the rest: a transient tear, which a reader would have
+ * retried through, becomes permanent corruption that no checker can
+ * see any more.
+ *
+ * -EUCLEAN, not a retry: cetrafs_cas_region() re-reads and re-runs the
+ * mutator on a MISCOMPARE, so a tear that settles is already handled
+ * above this. Reaching here with a bad sum means the bytes really are
+ * wrong.
+ */
+static int cetrafs_ns_image_trustworthy(const cetrafs_inode_t *rec)
+{
+    return cetrafs_inode_crc_ns(rec) == (u32) cetrafs_le64(rec->ns_checksum);
+}
+
 static int cetrafs_ns_cas_mutate(void *image, unsigned int len, void *priv)
 {
     struct cetrafs_ns_cas_ctx *ctx = priv;
@@ -409,6 +431,13 @@ static int cetrafs_ns_cas_mutate(void *image, unsigned int len, void *priv)
         return -EINVAL;
     memset(&rec, 0, sizeof(rec));
     memcpy(&rec, image, CETRAFS_INODE_NS_BYTES);
+
+    if (!cetrafs_ns_image_trustworthy(&rec)) {
+        pr_warn_ratelimited("ns CAS on ino=%llu: the sector on the device fails its checksum -- refusing to stamp a "
+                            "fresh one over it\n",
+                            (unsigned long long) cetrafs_le64(rec.ino));
+        return -EUCLEAN;
+    }
 
     if (cetrafs_le64(rec.generation) != ctx->generation)
         return -ESTALE; /* the number was reused for a different file */
@@ -1116,8 +1145,24 @@ struct buffer_head *cetrafs_read_tree_bh(struct inode *inode, u64 lba, u32 tail_
      * this tree, so the cached copy is authoritative AND cannot be
      * torn -- this is the growing-file hot path and must stay off the
      * wire. */
-    if (cetrafs_lock_held_for_write_locally(inode))
-        return cetrafs_bread_retry(inode->i_sb, lba);
+    if (cetrafs_lock_held_for_write_locally(inode)) {
+        /* Cached, but still CHECKED for sense. The cached branch skips
+         * the tail verification because nobody else can be mid-write --
+         * which is an argument about CONCURRENCY and says nothing about
+         * whether the block makes sense. The counts in this header are
+         * indexed with, so a hostile or damaged one is an out-of-bounds
+         * access however exclusively we hold the file. One comparison,
+         * and this is the per-block mapping path. */
+        struct buffer_head *bh = cetrafs_bread_retry(inode->i_sb, lba);
+
+        if (bh && !cetrafs_blk_struct_ok_magic(bh, tail_magic)) {
+            pr_err_ratelimited("ino=%llu: %s block %llu has an impossible entry count -- refusing it\n",
+                               (unsigned long long) inode->i_ino, what, (unsigned long long) lba);
+            brelse(bh);
+            return NULL;
+        }
+        return bh;
+    }
 
     /* Without it, a peer may be mid-write. A DIRECTORY is always in
      * this case: it never holds a file lock, so every peer walking a
@@ -1156,8 +1201,19 @@ struct buffer_head *cetrafs_read_leaf_bh(struct inode *inode, u64 lba)
  */
 struct buffer_head *cetrafs_read_dir_leaf_bh(struct inode *inode, u64 lba, bool fresh)
 {
-    if (!fresh)
-        return cetrafs_bread_retry(inode->i_sb, lba);
+    if (!fresh) {
+        /* Same as the file path above: unchanged-since-we-last-read is
+         * not the same as sane. */
+        struct buffer_head *bh = cetrafs_bread_retry(inode->i_sb, lba);
+
+        if (bh && !cetrafs_blk_struct_ok_magic(bh, CETRAFS_LEAF_TAIL_MAGIC)) {
+            pr_err_ratelimited("dir ino=%llu: extent leaf %llu has an impossible entry count -- refusing it\n",
+                               (unsigned long long) inode->i_ino, (unsigned long long) lba);
+            brelse(bh);
+            return NULL;
+        }
+        return bh;
+    }
     return cetrafs_blk_tail_bread(inode->i_sb, lba, CETRAFS_LEAF_TAIL_MAGIC, "extent leaf");
 }
 

@@ -56,5 +56,7 @@ __pycache__/
 
 /release-matrix-*
 
-# Working notes, deliberately untracked (see 2026-10-20 session)
-TODO.md
+# Working notes, deliberately untracked (see 2026-10-20 session).
+# Anchored to the root on purpose: docs/internal/TODO.md is a TRACKED
+# document and an unanchored rule swallowed it.
+/TODO.md

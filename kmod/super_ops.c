@@ -9,7 +9,20 @@
 #include <linux/seq_file.h>
 #include <linux/statfs.h>
 
+#include <linux/delay.h>
+
 #include "kmod.h"
+
+/*
+ * Test-only: widen the gap between evict's verdict (fresh record, same
+ * generation, nlink still zero) and the bitmap CAS that acts on it.
+ * Production keeps that gap as narrow as it can; the point of the guard
+ * is that "narrow" is not "closed", which is only demonstrable if
+ * something can be driven into it.
+ */
+static unsigned int cetrafs_evict_stall_before_free_ms;
+module_param_named(evict_stall_before_free_ms, cetrafs_evict_stall_before_free_ms, uint, 0644);
+MODULE_PARM_DESC(evict_stall_before_free_ms, "TEST ONLY: pause between evict's verdict and its free");
 
 static void cetrafs_put_super(struct super_block *sb)
 {
@@ -180,6 +193,11 @@ static int cetrafs_statfs(struct dentry *dentry, struct kstatfs *stat)
     stat->f_files = le32_to_cpu(raw_sb->inodes_count);
     stat->f_ffree = free_inodes;
     stat->f_namelen = CETRAFS_FILENAME_MAX;
+    /* f_fsid: left zero, every cetrafs mount looked like the same
+     * filesystem to anything that identifies one by it -- NFS export
+     * and `find -xdev` among them. The device number is the identifier
+     * the rest of the kernel already uses for this mount. */
+    stat->f_fsid = u64_to_fsid(huge_encode_dev(sb->s_bdev->bd_dev));
     return 0;
 }
 
@@ -355,18 +373,74 @@ static void cetrafs_evict_inode(struct inode *inode)
              * blocks set and referenced by no allocated record: the leak
              * the scrub reclaims, which is the safe direction (rule 8).
              */
-            int fret = cetrafs_free_inode(sb, inode->i_ino);
+            /*
+             * Guarded, not plain. The generation and nlink checks above
+             * are real, but they are not ADJACENT to this: the foreign
+             * -opener check between them is another forced-fresh read,
+             * so the verdict is at least one device round trip old by
+             * the time the bitmap CAS runs. The scrub lost exactly that
+             * race with 378 microseconds to play with (2026-10-29), and
+             * the fix there was to re-read immediately before the free
+             * and require the record to still be the dead one it judged
+             * -- same nlink, same generation. The same reasoning
+             * applies here, so use the same primitive rather than a
+             * second copy of the argument.
+             *
+             * -ESTALE joins the "somebody else has a claim" family
+             * below: free nothing, leave it diagnosable.
+             */
+            int fret;
+            struct cetrafs_inode_extents ex;
+
+            /*
+             * Fetch the extent list BEFORE the arbitration, because the
+             * arbitration is what hands the number back.
+             *
+             * The order is forced: the bitmap CAS decides which of two
+             * evicts (or the scrub) owns this inode, so it has to come
+             * first. What must not happen is reaching it without
+             * knowing the blocks can still be found -- a tree that
+             * cannot be read at that point leaves them allocated while
+             * the number is already reusable, and the next file to take
+             * it overwrites the only record naming them. This file's
+             * own comment above says exactly that about a failed
+             * RECORD read; the extent-tree read can fail the same way,
+             * from an I/O error on a leaf or an allocation failure
+             * flattening a large tree.
+             */
+            if (cetrafs_inode_extents_get(inode, &raw, &ex) != 0) {
+                pr_err("evict_inode: ino=%llu: its extent tree cannot be read -- freeing NEITHER the number nor the "
+                       "blocks, so fsck can still name them\n",
+                       (unsigned long long) inode->i_ino);
+                goto skip_free;
+            }
+
+            if (cetrafs_evict_stall_before_free_ms)
+                /* Test-only: hold the gap between the verdict and the
+                 * free open long enough to drive something into it. The
+                 * gap is real and microseconds wide in production; this
+                 * only makes it addressable. */
+                msleep(cetrafs_evict_stall_before_free_ms);
+
+            fret = cetrafs_free_inode_if_dead(sb, inode->i_ino, cetrafs_inode_get_generation(inode));
 
             ctrace("EVICTFREE ino=%llu fret=%d gen=%llu\n", (unsigned long long) inode->i_ino, fret,
                    (unsigned long long) cetrafs_inode_get_generation(inode));
             if (fret == 0) {
-                cetrafs_free_inline_extents(inode, &raw);
+                cetrafs_free_fetched_extents(inode, &raw, &ex);
                 if (raw.xattr_block)
                     cetrafs_free_data_block(sb, cetrafs_le64(raw.xattr_block));
             }
+            cetrafs_inode_extents_put(&ex);
             /* fret == 1: a peer's evict or the scrub won -- the blocks
              * are theirs (or the block scrub's). fret < 0: the CAS
-             * failed; leave everything allocated and diagnosable. */
+             * failed, or the record stopped being the dead one we
+             * judged (-ESTALE); leave everything allocated and
+             * diagnosable either way. */
+            if (fret == -ESTALE)
+                pr_warn("evict_inode: ino=%llu changed under the verdict -- freeing nothing\n",
+                        (unsigned long long) inode->i_ino);
+skip_free:;
         } else if (ret != -ETXTBSY && ret != -ESTALE && ret != -EBUSY) {
             /* -ETXTBSY/-ESTALE/-EBUSY are the "somebody else still has
              * a claim on this" refusals above; each logs its own

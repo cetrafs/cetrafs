@@ -60,6 +60,29 @@ os.fsync(fd)
 os.close(fd)
 PY
 umount "$MNT"
-"$ROOT/userspace/fsck.cetra" "$LOOP" >/dev/null || { echo "golden image is not fsck-clean" >&2; exit 1; }
+
+# GROWN, deliberately.
+#
+# Everything that only exists after a grow was unfuzzed, because every
+# golden was a freshly-made volume: on one of those bg_table_next is 0,
+# so the Block Group table is the contiguous run it has always been and
+# fs.c's chain walk never executes a single iteration. The segment
+# chain, the tail reserve and layout_gen had no representation in the
+# corpus at all -- not because the fuzzer was weak, but because there
+# was nothing of them in the images it was given.
+#
+# The grow adds a second Block Group, which is what puts a real
+# cetrafs_bg_segment_t on the device for the fuzzer to mutate.
 losetup -d "$LOOP"; LOOP=""
-echo "golden: $OUT"
+truncate -s 1300M "$OUT"
+LOOP="$(losetup --find --show "$OUT")"
+"$ROOT/userspace/growfs.cetra" "$LOOP" >/dev/null 2>&1 || {
+    echo "growing the golden failed" >&2; exit 1; }
+
+"$ROOT/userspace/fsck.cetra" "$LOOP" >/dev/null || { echo "golden image is not fsck-clean" >&2; exit 1; }
+# And it must really have a chain, or the targets below silently cover
+# nothing -- the exact shape of blindness this grow exists to remove.
+"$ROOT/tests/.build/sb_poke" "$OUT" 2>/dev/null | grep -q "bg_table_next=[1-9]" || {
+    echo "the grown golden has no BG table chain (bg_table_next is 0)" >&2; exit 1; }
+losetup -d "$LOOP"; LOOP=""
+echo "golden: $OUT (grown, with a BG table chain)"

@@ -51,7 +51,12 @@ static struct file_system_type cetrafs_file_system_type = {
     .init_fs_context = cetrafs_init_fs_context,
     .kill_sb = cetrafs_kill_sb,
     .fs_flags = FS_REQUIRES_DEV,
-    .next = NULL,
+    /* .next is the VFS's own list link, managed by
+     * register_filesystem(). Setting it here was redundant (static
+     * initialisation already zeroes it) and became a build error the
+     * moment the member moved: 7.2 has no such field, so this module
+     * would not compile against it at all. A filesystem does not
+     * initialise the VFS's internals. */
 };
 
 static int __init cetrafs_init(void)

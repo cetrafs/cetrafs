@@ -1,8 +1,50 @@
 /* SPDX-License-Identifier: GPL-2.0-or-later */
 
+#include <linux/mm.h>
 #include <linux/workqueue.h>
 
 #include "cetrafs.h"
+
+/*
+ * Blocks are not pages, and on the hardware this is usually built for
+ * they happen to be the same size -- which is exactly what makes the
+ * confusion invisible.
+ *
+ * This filesystem addresses in 4 KiB BLOCKS; the page cache indexes in
+ * PAGES. On a 4K-page kernel block N is also page N, so handing a block
+ * index to a function that wants a page index works by accident. arm64
+ * can be built with 16K or 64K pages (CONFIG_ARM64_16K_PAGES and
+ * friends), and there the two differ by 4x or 16x: the call silently
+ * addresses a quarter, or a sixteenth, of what the caller meant. That
+ * is how a block index reached invalidate_inode_pages2_range() in
+ * defrag, where the page left behind still mapped blocks that the next
+ * line freed.
+ *
+ * So: convert, never assume. And the assumptions that remain are
+ * asserted here rather than left implicit -- nothing in this module
+ * checked them at all before.
+ */
+static_assert(PAGE_SIZE >= CETRAFS_BLOCK_SIZE, "a page must hold at least one whole filesystem block");
+static_assert((PAGE_SIZE % CETRAFS_BLOCK_SIZE) == 0, "the page size must be a whole number of filesystem blocks");
+
+/* The page holding file block 'blk' -- for the page-cache helpers that
+ * index in pages (invalidate_inode_pages2_range(), filemap_get_folio(),
+ * ...). The byte-offset helpers (truncate_inode_pages_range(),
+ * unmap_mapping_range(), filemap_write_and_wait_range()) want
+ * blk * CETRAFS_BLOCK_SIZE instead and are not this. */
+static inline pgoff_t cetrafs_blk_to_pgoff(u64 blk)
+{
+    return (pgoff_t) ((blk * CETRAFS_BLOCK_SIZE) >> PAGE_SHIFT);
+}
+
+/* The page holding the LAST byte of file block 'blk' -- what the
+ * inclusive 'end' of a page-index range needs. Rounding outward is
+ * required, not sloppy: a page that only partly covers the range still
+ * carries buffer_heads for the blocks inside it, so it has to go. */
+static inline pgoff_t cetrafs_blk_end_pgoff(u64 blk)
+{
+    return (pgoff_t) ((blk * CETRAFS_BLOCK_SIZE + CETRAFS_BLOCK_SIZE - 1) >> PAGE_SHIFT);
+}
 
 /* Per-operation trace: every lookup/create/iget/statfs and the like.
  * Compiled in but OFF by default -- pr_debug() sites are switched at
@@ -66,6 +108,7 @@ void cetrafs_node_seed_peer_watch(struct super_block *sb);
 bool cetrafs_cluster_all_advertise(struct super_block *sb, u32 cap);
 int cetrafs_node_my_uuid(u8 out[CETRAFS_NODE_UUID_LEN]);
 int cetrafs_node_live_peer_exists(struct super_block *sb, const u8 *my_uuid, bool *out_exists);
+int cetrafs_node_repair_claim_exists(struct super_block *sb, bool *out_exists, char *out_label, size_t label_sz);
 /* The file-lock mode a LIVE peer advertises (the first mounter's choice),
  * or CETRAFS_FLOCK_MODE_UNSET if no live peer -- so a joining node inherits
  * the cluster's mode and the first mounter leads. See node.c. */
@@ -150,6 +193,18 @@ s64 cetrafs_sb_bg_pending_delta(struct super_block *sb, u32 bg_id);
 u64 cetrafs_sb_bg_epoch(struct super_block *sb, u32 bg_id);
 void cetrafs_sb_set_bg_epoch(struct super_block *sb, u32 bg_id, u64 seq);
 void cetrafs_sb_accrue_zg_free(struct super_block *sb, u32 zg_id, s64 delta);
+
+/* fs.c: namespace locks whose release did not commit, retried by the
+ * heartbeat rather than left for a stale-reclaim that will not come
+ * while this node is alive. */
+struct cetrafs_nsrel_pending {
+    u64 ino;
+    u64 generation;
+};
+void cetrafs_sb_nslock_defer(struct super_block *sb, u64 ino, u64 generation);
+u32 cetrafs_sb_nslock_take_deferred(struct super_block *sb, struct cetrafs_nsrel_pending *out, u32 max);
+/* nslock.c: one retry pass over them, called from the heartbeat tick. */
+void cetrafs_nslock_retry_deferred(struct super_block *sb);
 s64 cetrafs_sb_take_zg_free_delta(struct super_block *sb, u32 zg_id);
 int cetrafs_flush_dirty_free_counts(struct super_block *sb);
 /* Zone Groups carrying an unapplied free-count delta. A delta must
@@ -234,6 +289,10 @@ int cetrafs_fiemap(struct inode *inode, struct fiemap_extent_info *fi, u64 start
 #define CETRAFS_BLK_TAIL_READ_RETRIES 5
 void cetrafs_blk_tail_stamp(struct buffer_head *bh, u32 magic);
 bool cetrafs_blk_tail_valid(const struct buffer_head *bh, u32 magic);
+/* Structure sanity on its own, for the CACHED read paths that skip the
+ * tail verification: a block nobody else can be writing is still not
+ * necessarily a block that makes sense. */
+bool cetrafs_blk_struct_ok_magic(const struct buffer_head *bh, u32 magic);
 struct buffer_head *cetrafs_blk_tail_bread(struct super_block *sb, u64 lba, u32 magic, const char *what);
 int cetrafs_cas_region(struct super_block *sb, u64 fs_lba, unsigned int region_idx, cetrafs_cas_fn mutate, void *priv);
 /* Seeded variants: pass the caller's already-fresh image of the region to
@@ -406,6 +465,20 @@ void cetrafs_nslock_release_set(struct inode **inodes, int n);
 // file.c
 int cetrafs_inode_map_block(struct inode *inode, u32 iblock, bool create, u64 *out_lba);
 void cetrafs_free_inline_extents(struct inode *dir, const cetrafs_inode_t *raw);
+
+/* file.c: an inode's extent list, resolved at any depth. Evict holds one
+ * ACROSS the inode-number arbitration: the list has to be proven
+ * readable before the number is handed back, or a failure there leaks
+ * the blocks with nothing left naming them. */
+struct cetrafs_inode_extents {
+    struct buffer_head *leaf_bh; /* held for depth 1 (arr points into it); NULL otherwise */
+    cetrafs_extent_t *heap;      /* depth 2: a flattened copy, freed by _put; NULL otherwise */
+    const cetrafs_extent_t *arr;
+    u32 entries; /* u32: a depth-2 tree can hold far more than 65535 extents */
+};
+int cetrafs_inode_extents_get(struct inode *inode, const cetrafs_inode_t *raw, struct cetrafs_inode_extents *ex);
+void cetrafs_inode_extents_put(struct cetrafs_inode_extents *ex);
+void cetrafs_free_fetched_extents(struct inode *dir, const cetrafs_inode_t *raw, struct cetrafs_inode_extents *ex);
 int cetrafs_setattr(struct mnt_idmap *idmap, struct dentry *dentry, struct iattr *attr);
 extern const struct inode_operations cetrafs_symlink_iops;
 extern const struct file_operations cetrafs_file_ops;
@@ -692,7 +765,8 @@ extern struct kmem_cache *cetrafs_inode_cache;
 // heartbeat.c
 struct cetrafs_heartbeat {
     struct super_block *sb;
-    struct delayed_work work;
+    struct delayed_work work;  /* the lease renewal, and nothing else */
+    struct delayed_work maint; /* reclaim/drain/replay: unbounded, and not on the lease's clock */
 };
 int cetrafs_heartbeat_start(struct super_block *sb, struct cetrafs_heartbeat **out_hb);
 unsigned int cetrafs_heartbeat_interval_secs(struct super_block *sb);

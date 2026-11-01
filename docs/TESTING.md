@@ -160,8 +160,8 @@ and at least one of them has to run before a layer is called clean.
 
 ## Confidence bar
 
-cetrafs is from-scratch: heavily reviewed + tested (~1757 single-node asserts
-across 164 suites, ~67 multi-node ctest scenarios on two rigs, fuzzing, a
+cetrafs is from-scratch: heavily reviewed + tested (1918 single-node asserts
+across 191 suites, ~67 multi-node ctest scenarios on two rigs, fuzzing, a
 crash rig, and a randomized content oracle whose seeded replays caught
 microsecond-window corruption races at one-in-millions per-operation odds
 -- see docs/TEST-SUITES.md) but NOT production-aged like VMFS/ext4.

@@ -88,6 +88,9 @@ int main(int argc, char **argv)
         fprintf(stderr, "       %s <backing-file> extlen <ino> <len>    (absurd preallocated extent)\n", argv[0]);
         fprintf(stderr, "       %s <backing-file> growext <ino> <n>     (valid record a peer just extended)\n", argv[0]);
         fprintf(stderr, "       %s <backing-file> bumpgen <ino> <gen>   (reuse: generation only)\n", argv[0]);
+        fprintf(stderr, "       %s <backing-file> setdepth <ino> <n>    (an extent depth the format lacks)\n", argv[0]);
+        fprintf(stderr, "       %s <backing-file> plantrec <ino> <mode>  (a valid record at ANY slot, in range or not)\n",
+                argv[0]);
         fprintf(stderr, "       %s <backing-file> setsize <ino> <bytes> (as a PEER extending it would)\n", argv[0]);
         fprintf(stderr, "       %s <backing-file> size <ino>           (print the on-disk size)\n", argv[0]);
         fprintf(stderr, "       %s <backing-file> bumpseq <ino>        (advance dirent_seq, as a peer would)\n", argv[0]);
@@ -114,6 +117,33 @@ int main(int argc, char **argv)
 
     cetrafs_superblock_t sb;
     pread_all(fd, &sb, sizeof(sb), 0);
+
+    if (strcmp(mode, "plantrec") == 0) {
+        /* Write a VALID record at the slot an arbitrary inode number
+         * addresses -- deliberately including numbers past the end of
+         * the table, whose slots land in the DATA region. That is the
+         * forgery a user can perform with ordinary writes to their own
+         * file, and what fsck must refuse to read as an inode. */
+        cetrafs_inode_t rec;
+        unsigned long long m = (argc > 4) ? strtoull(argv[4], NULL, 8) : 040755;
+        off_t off = (off_t) (cetrafs_le64(sb.inode_table_start) + ino - 1) * cetrafs_le32(sb.block_size);
+        uint8_t blk[CETRAFS_BLOCK_SIZE] = {0};
+
+        memset(&rec, 0, sizeof(rec));
+        rec.ino = cetrafs_cpu_to_le64(ino);
+        rec.mode = cetrafs_cpu_to_le32((uint32_t) m);
+        rec.nlink = cetrafs_cpu_to_le32(2);
+        rec.generation = cetrafs_cpu_to_le64(1);
+        rec.ns_lock_owner = cetrafs_cpu_to_le32(CETRAFS_NODE_ID_NONE);
+        rec.eh.eh_magic = cetrafs_cpu_to_le16(CETRAFS_EXT_MAGIC);
+        rec.eh.eh_max = cetrafs_cpu_to_le16(4);
+        cetrafs_inode_stamp_crcs_us(&rec);
+        memcpy(blk, &rec, sizeof(rec));
+        pwrite_all(fd, blk, sizeof(blk), off);
+        fprintf(stderr, "inode_block_poke: planted a mode %llo record at the slot for ino %llu (offset %lld)\n", m,
+                (unsigned long long) ino, (long long) off);
+        return 0;
+    }
 
     if (!ino || ino > cetrafs_le32(sb.inodes_count)) {
         fprintf(stderr, "ino %llu out of range (inodes_count=%u)\n", (unsigned long long) ino, sb.inodes_count);
@@ -327,6 +357,20 @@ int main(int argc, char **argv)
         cetrafs_inode_stamp_crcs_us(&rec); /* v0x0005 */
         pwrite_all(fd, &rec, sizeof(rec), rec_off);
         printf("inode_block_poke: ino %llu extent0 len %u -> %lu\n", (unsigned long long) ino, len0, len0 + n);
+    } else if (strcmp(mode, "setdepth") == 0) {
+        /* An extent depth the format does not have, on a record whose
+         * checksums are otherwise perfect. fsck must refuse to REPAIR a
+         * volume holding one: it cannot walk the tree, so it cannot
+         * tell that inode's blocks from leaked ones, and clearing them
+         * is the file. */
+        cetrafs_inode_t rec;
+        unsigned long long d = (argc > 4) ? strtoull(argv[4], NULL, 0) : 3;
+
+        pread_all(fd, &rec, sizeof(rec), rec_off);
+        rec.eh.eh_depth = cetrafs_cpu_to_le16((uint16_t) d);
+        cetrafs_inode_stamp_crcs_us(&rec);
+        pwrite_all(fd, &rec, sizeof(rec), rec_off);
+        fprintf(stderr, "inode_block_poke: ino %llu extent depth -> %llu\n", (unsigned long long) ino, d);
     } else if (strcmp(mode, "bumpgen") == 0) {
         /* Change ONLY the generation, leaving type/size/extents alone:
          * the inode number was reused, but nothing else about the

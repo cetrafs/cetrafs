@@ -43,6 +43,7 @@
 #include <linux/kernel.h>
 #include <linux/string.h>
 
+#include <linux/delay.h>
 #include "kmod.h"
 
 /* One directory level of /sys/block/<dm>/slaves/ collected by name. */
@@ -134,7 +135,21 @@ static bool cetrafs_dm_has_slaves(const char *disk_name)
  */
 static int cetrafs_dm_collect(const char *disk_name, dev_t *out, unsigned int max, unsigned int *n, int depth)
 {
-    struct cetrafs_slave_dir d = {.ctx.actor = cetrafs_slave_actor};
+    /*
+     * On the heap, because this function RECURSES.
+     *
+     * struct cetrafs_slave_dir carries names[16][32] -- half a kilobyte
+     * -- and CETRAFS_DM_MAX_DEPTH lets four of these frames nest, so a
+     * stacked device cost ~2.5 KiB of kernel stack to walk. A KASAN
+     * build makes the same frame 1056 bytes and refuses to compile it
+     * (-Werror=frame-larger-than=1024), which is how this surfaced; the
+     * recursion made it worth fixing rather than silencing.
+     *
+     * Path resolution is not a hot path (the result is cached per
+     * device, see cetrafs_dmpath_sdev), so one allocation per level is
+     * free in any sense that matters.
+     */
+    struct cetrafs_slave_dir *d;
     char path[96];
     struct file *f;
     unsigned int i;
@@ -146,30 +161,41 @@ static int cetrafs_dm_collect(const char *disk_name, dev_t *out, unsigned int ma
     if (snprintf(path, sizeof(path), "/sys/block/%s/slaves", disk_name) >= (int) sizeof(path))
         return -ENAMETOOLONG;
 
-    f = filp_open(path, O_RDONLY | O_DIRECTORY, 0);
-    if (IS_ERR(f))
-        return PTR_ERR(f); /* not a stacked device: nothing under it */
+    d = kzalloc(sizeof(*d), GFP_KERNEL);
+    if (!d)
+        return -ENOMEM;
+    d->ctx.actor = cetrafs_slave_actor;
 
-    ret = iterate_dir(f, &d.ctx);
+    f = filp_open(path, O_RDONLY | O_DIRECTORY, 0);
+    if (IS_ERR(f)) {
+        ret = PTR_ERR(f); /* not a stacked device: nothing under it */
+        goto out_free;
+    }
+
+    ret = iterate_dir(f, &d->ctx);
     filp_close(f, NULL);
     if (ret)
-        return ret;
-    if (d.truncated)
+        goto out_free;
+    if (d->truncated)
         pr_warn("dm path: %s has more than %u slaves; considering the first %u\n", disk_name,
-                (unsigned int) ARRAY_SIZE(d.names), d.n);
+                (unsigned int) ARRAY_SIZE(d->names), d->n);
 
-    for (i = 0; i < d.n && *n < max; i++) {
+    for (i = 0; i < d->n && *n < max; i++) {
         dev_t dev;
 
-        if (snprintf(path, sizeof(path), "/sys/block/%s/slaves/%s/dev", disk_name, d.names[i]) >= (int) sizeof(path))
+        if (snprintf(path, sizeof(path), "/sys/block/%s/slaves/%s/dev", disk_name, d->names[i]) >= (int) sizeof(path))
             continue;
         if (cetrafs_sysfs_devt(path, &dev) == 0)
             out[(*n)++] = dev;
 
-        if (cetrafs_dm_has_slaves(d.names[i]))
-            cetrafs_dm_collect(d.names[i], out, max, n, depth + 1);
+        if (cetrafs_dm_has_slaves(d->names[i]))
+            cetrafs_dm_collect(d->names[i], out, max, n, depth + 1);
     }
-    return 0;
+    ret = 0;
+
+out_free:
+    kfree(d);
+    return ret;
 }
 
 /*
@@ -213,11 +239,34 @@ struct cetrafs_dmpath_entry {
     dev_t avoid;               /* a path that just failed a command; skipped when re-resolving */
     struct file *file;         /* the path, held open NON-exclusively */
     struct scsi_device *sdev;  /* reference held; NULL = needs (re)resolution */
+    bool resolving;            /* a resolution is in flight; the slot is claimed but empty */
     char name[DISK_NAME_LEN];
 };
 
 static struct cetrafs_dmpath_entry cetrafs_dmpath_cache[CETRAFS_DM_CACHE_SLOTS];
+/*
+ * Protects the cache ARRAY -- never a resolution.
+ *
+ * Resolving a path opens a block device and issues a READ, which on a
+ * flapping or transitioning path blocks for as long as the SCSI layer
+ * is willing to wait. Held across that, this one mutex serialises every
+ * CAW on every volume this node has mounted, the HEARTBEAT's lease
+ * renewal included -- so one bad cable on one LUN stops a node renewing
+ * and a peer fences it. The device whose path is being resolved has to
+ * wait (it has no path); nothing else does.
+ *
+ * So the resolve runs unlocked, with the slot marked 'resolving' so a
+ * second caller for the same device waits for that one result instead
+ * of starting its own walk.
+ */
 static DEFINE_MUTEX(cetrafs_dmpath_mutex);
+static DECLARE_WAIT_QUEUE_HEAD(cetrafs_dmpath_wq);
+
+/* A resolve is one open plus one READ, both bounded by the SCSI layer's
+ * own timeouts. If it somehow outlasts this, a waiter stops waiting and
+ * resolves for itself rather than hanging: duplicated work, never a
+ * stuck heartbeat. */
+#define CETRAFS_DMPATH_RESOLVE_WAIT (15 * HZ)
 
 /* One SCSI READ(16), used only by the identity guard below. */
 /* Same generous ceiling caw.c uses: one small synchronous command. */
@@ -367,6 +416,19 @@ static int cetrafs_dmpath_try(struct block_device *dm_bdev, dev_t path_dev, stru
 }
 
 /*
+ * TEST ONLY: make a path resolution take this long.
+ *
+ * A resolution opens a block device and issues a READ; on a flapping or
+ * transitioning path those block for as long as the SCSI layer waits,
+ * which is the whole reason this must not run under the cache mutex. A
+ * healthy rig resolves in microseconds, so a test needs the stall
+ * manufactured. See tests/device/dmpath_no_global_stall.sh.
+ */
+static unsigned int cetrafs_dmpath_resolve_delay_ms;
+module_param_named(dmpath_resolve_delay_ms, cetrafs_dmpath_resolve_delay_ms, uint, 0644);
+MODULE_PARM_DESC(dmpath_resolve_delay_ms, "TEST ONLY: milliseconds a path resolution takes");
+
+/*
  * Pick a usable path, preferring one that is not 'avoid' -- the path
  * that just failed a command. The second pass DOES reconsider it: on a
  * single-path map it is the only candidate, and a path that failed once
@@ -378,6 +440,9 @@ static int cetrafs_dmpath_resolve(struct block_device *bdev, dev_t avoid, struct
     dev_t devs[CETRAFS_DM_MAX_SLAVES];
     unsigned int n = 0, i, pass;
     int ret;
+
+    if (cetrafs_dmpath_resolve_delay_ms)
+        msleep(cetrafs_dmpath_resolve_delay_ms); /* test-only; see the parameter */
 
     ret = cetrafs_dm_underlying(bdev, devs, ARRAY_SIZE(devs), &n);
     if (ret || !n)
@@ -418,11 +483,15 @@ struct scsi_device *cetrafs_dmpath_sdev(struct block_device *bdev)
     struct cetrafs_dmpath_entry *slot = NULL, *free_slot = NULL, tmp = {0};
     struct scsi_device *sdev = NULL;
     dev_t avoid = 0;
+    bool resolved, waited = false;
     unsigned int i;
 
     if (!bdev || !bdev->bd_disk)
         return NULL;
 
+retry:
+    slot = NULL;
+    free_slot = NULL;
     mutex_lock(&cetrafs_dmpath_mutex);
 
     for (i = 0; i < ARRAY_SIZE(cetrafs_dmpath_cache); i++) {
@@ -437,6 +506,27 @@ struct scsi_device *cetrafs_dmpath_sdev(struct block_device *bdev)
             slot = e;
             break;
         }
+    }
+
+    /* Someone is already resolving this device: wait for their answer
+     * rather than walking the slaves a second time. Once -- if the
+     * whole timeout passes with them still at it, resolve separately
+     * instead of waiting again, so no caller can be parked here
+     * indefinitely by one stuck path. */
+    if (slot && slot->resolving) {
+        struct cetrafs_dmpath_entry *busy = slot;
+
+        mutex_unlock(&cetrafs_dmpath_mutex);
+        if (!waited) {
+            waited = true;
+            wait_event_timeout(cetrafs_dmpath_wq, !READ_ONCE(busy->resolving), CETRAFS_DMPATH_RESOLVE_WAIT);
+            goto retry;
+        }
+        pr_warn_ratelimited("dm path: %s has had a path resolution in flight for %us -- resolving separately\n",
+                            bdev->bd_disk->disk_name, CETRAFS_DMPATH_RESOLVE_WAIT / HZ);
+        slot = NULL;    /* uncached, one-shot: never write into their slot */
+        avoid = 0;
+        goto resolve;
     }
 
     if (slot && slot->sdev) {
@@ -456,28 +546,60 @@ struct scsi_device *cetrafs_dmpath_sdev(struct block_device *bdev)
 
     if (slot)
         avoid = slot->avoid;
-
-    if (cetrafs_dmpath_resolve(bdev, avoid, &tmp) != 0)
-        goto out;
-
-    if (!slot)
+    else
         slot = free_slot;
+
+    /* Claim the slot before dropping the mutex, so it is not handed to
+     * another device while we are off resolving, and so a second caller
+     * for THIS device finds it and waits above. */
+    if (slot) {
+        slot->dm_dev = bdev->bd_dev;
+        slot->avoid = avoid;
+        slot->resolving = true;
+    }
+    mutex_unlock(&cetrafs_dmpath_mutex);
+
+resolve:
+    resolved = cetrafs_dmpath_resolve(bdev, avoid, &tmp) == 0;
+
+    mutex_lock(&cetrafs_dmpath_mutex);
     if (!slot) {
-        /* No slot free: use this resolution once and release it, rather
-         * than refuse CAW entirely. */
-        if (scsi_device_get(tmp.sdev) == 0)
-            sdev = tmp.sdev;
-        cetrafs_dmpath_drop_refs(&tmp);
+        /* No slot free (more stacked volumes than slots): use this
+         * resolution once and release it, rather than refuse CAW. */
+        if (resolved) {
+            if (scsi_device_get(tmp.sdev) == 0)
+                sdev = tmp.sdev;
+            cetrafs_dmpath_drop_refs(&tmp);
+        }
+        goto out;
+    }
+
+    if (slot->dm_dev != bdev->bd_dev || !slot->resolving) {
+        /* The slot was taken from us while unlocked -- an unmount
+         * (cetrafs_dmpath_forget) is the only way that happens. Do not
+         * write into it; hand this resolution to the caller once. */
+        if (resolved) {
+            if (scsi_device_get(tmp.sdev) == 0)
+                sdev = tmp.sdev;
+            cetrafs_dmpath_drop_refs(&tmp);
+        }
+        goto out;
+    }
+
+    if (!resolved) {
+        memset(slot, 0, sizeof(*slot)); /* release the claim: no path found */
         goto out;
     }
 
     tmp.avoid = avoid;
     *slot = tmp;
+    slot->resolving = false;
     if (scsi_device_get(slot->sdev) == 0)
         sdev = slot->sdev;
 
 out:
     mutex_unlock(&cetrafs_dmpath_mutex);
+    wake_up_all(&cetrafs_dmpath_wq); /* harmless when nothing was claimed */
     return sdev;
 }
 
@@ -526,12 +648,24 @@ void cetrafs_dmpath_forget(struct block_device *bdev)
     if (!bdev)
         return;
 
+restart:
     mutex_lock(&cetrafs_dmpath_mutex);
     for (i = 0; i < ARRAY_SIZE(cetrafs_dmpath_cache); i++) {
-        if (cetrafs_dmpath_cache[i].dm_dev == bdev->bd_dev) {
-            cetrafs_dmpath_drop_refs(&cetrafs_dmpath_cache[i]);
-            memset(&cetrafs_dmpath_cache[i], 0, sizeof(cetrafs_dmpath_cache[i]));
+        struct cetrafs_dmpath_entry *e = &cetrafs_dmpath_cache[i];
+
+        if (e->dm_dev != bdev->bd_dev)
+            continue;
+        /* A resolution is in flight for this device and will write its
+         * result into this slot. Let it finish -- clearing the slot
+         * underneath it would leave the path open with nothing naming
+         * it. This is the unmount path; waiting is what it is for. */
+        if (e->resolving) {
+            mutex_unlock(&cetrafs_dmpath_mutex);
+            wait_event_timeout(cetrafs_dmpath_wq, !READ_ONCE(e->resolving), CETRAFS_DMPATH_RESOLVE_WAIT);
+            goto restart;
         }
+        cetrafs_dmpath_drop_refs(e);
+        memset(e, 0, sizeof(*e));
     }
     mutex_unlock(&cetrafs_dmpath_mutex);
 }

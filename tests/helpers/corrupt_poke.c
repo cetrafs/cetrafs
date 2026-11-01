@@ -54,15 +54,17 @@ static void wr(int fd, const void *b, size_t n, off_t o)
 int main(int argc, char **argv)
 {
     {
-        int six = (strcmp(argv[2], "repoint") == 0 || strcmp(argv[2], "filetype") == 0);
+        int six = (strcmp(argv[2], "repoint") == 0 || strcmp(argv[2], "filetype") == 0 ||
+                   strcmp(argv[2], "namelen") == 0);
         if (argc < 5 || (six && argc != 6) || (!six && argc != 5)) {
             fprintf(stderr,
-                    "usage: %s <image> bitset|bitclr <bg_id> <bit>\n"
+                    "usage: %s <image> namelen <dir_ino> <name> <poison_len>\n"
+                    "       %s <image> bitset|bitclr <bg_id> <bit>\n"
                     "       %s <image> extent <ino> <phys>\n"
                     "       %s <image> dirent <dir_ino> <name>\n"
                     "       %s <image> repoint <dir_ino> <name> <new_target>\n"
                     "       %s <image> filetype <dir_ino> <name> <ft>\n",
-                    argv[0], argv[0], argv[0], argv[0], argv[0]);
+                    argv[0], argv[0], argv[0], argv[0], argv[0], argv[0]);
             return 2;
         }
     }
@@ -184,6 +186,63 @@ int main(int argc, char **argv)
                     t.magic = cetrafs_cpu_to_le32(CETRAFS_DIRENT_TAIL_MAGIC);
                     t.crc = cetrafs_cpu_to_le32(crc32c_update(0, db, CETRAFS_DIRENT_TAIL_OFF));
                     memcpy(db + CETRAFS_DIRENT_TAIL_OFF, &t, sizeof(t));
+                    wr(fd, db, sizeof(db), off);
+                    close(fd);
+                    return 0;
+                }
+            }
+        }
+        fprintf(stderr, "dirent '%s' not found in inode %" PRIu64 "\n", name, dino);
+        return 1;
+    }
+
+    /*
+     * Poison a dirent's name_len and restamp the tail.
+     *
+     * The point is a block that PASSES its checksum and still carries a
+     * value nothing can act on: readdir handed name_len straight to
+     * dir_emit(), so a length past the 255-byte field copied adjacent
+     * kernel memory to userspace. A CRC proves integrity, not sense,
+     * and restamping is what makes the two separable.
+     */
+    if (!strcmp(argv[2], "namelen")) {
+        uint64_t dino = strtoull(argv[3], NULL, 0);
+        const char *name = argv[4];
+        unsigned poison = (unsigned) strtoul(argv[5], NULL, 0);
+        cetrafs_inode_t in;
+        uint32_t n;
+
+        rd(fd, &in, sizeof(in), (off_t) (cetrafs_le64(sb.inode_table_start) + dino - 1) * CETRAFS_BLOCK_SIZE);
+        if (in.eh.eh_depth != 0) {
+            fprintf(stderr, "namelen mode only handles depth-0 directories\n");
+            return 1;
+        }
+        n = cetrafs_le16(in.eh.eh_entries) > 4 ? 4 : cetrafs_le16(in.eh.eh_entries);
+        for (uint32_t e = 0; e < n; ++e) {
+            uint64_t phys = ((uint64_t) cetrafs_le16(in.et.leaf[e].ee_start_hi) << 32) |
+                            cetrafs_le32(in.et.leaf[e].ee_start_lo);
+            uint64_t len = cetrafs_le32(in.et.leaf[e].ee_len) & CETRAFS_EXT_LEN_MASK;
+
+            for (uint64_t k = 0; k < len; ++k) {
+                uint8_t db[CETRAFS_BLOCK_SIZE];
+                cetrafs_dirent_t *de;
+                off_t off = (off_t) (phys + k) * CETRAFS_BLOCK_SIZE;
+
+                rd(fd, db, sizeof(db), off);
+                de = (cetrafs_dirent_t *) db;
+                for (unsigned sl = 0; sl < CETRAFS_DIRENTS_PER_BLOCK; ++sl) {
+                    if (!cetrafs_le64(de[sl].inode) || cetrafs_le16(de[sl].name_len) != strlen(name) ||
+                        memcmp(de[sl].name, name, cetrafs_le16(de[sl].name_len)))
+                        continue;
+                    printf("corrupt_poke: dirent '%s' name_len %u -> %u, tail restamped\n", name,
+                           (unsigned) cetrafs_le16(de[sl].name_len), poison);
+                    de[sl].name_len = cetrafs_cpu_to_le16((uint16_t) poison);
+                    {
+                        cetrafs_dirent_tail_t t;
+                        t.magic = cetrafs_cpu_to_le32(CETRAFS_DIRENT_TAIL_MAGIC);
+                        t.crc = cetrafs_cpu_to_le32(crc32c_update(0, db, CETRAFS_DIRENT_TAIL_OFF));
+                        memcpy(db + CETRAFS_DIRENT_TAIL_OFF, &t, sizeof(t));
+                    }
                     wr(fd, db, sizeof(db), off);
                     close(fd);
                     return 0;

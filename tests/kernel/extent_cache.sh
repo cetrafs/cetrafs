@@ -109,6 +109,7 @@ os.fsync(f)
 for i in range(0, N, 2):
     if os.pread(f, ISL, i * ISL) != bytes([(i & 0x7f) | 0x80]) * ISL:
         print("island %d was already wrong before any mutation" % i)
+        sys.stdout.flush()
         os._exit(1)
 
 # Now change what those offsets map to.
@@ -117,6 +118,7 @@ FALLOC_FL_KEEP_SIZE, FALLOC_FL_PUNCH_HOLE = 0x01, 0x02
 if libc.fallocate(f, FALLOC_FL_PUNCH_HOLE | FALLOC_FL_KEEP_SIZE,
                   ctypes.c_long(PUNCH * ISL), ctypes.c_long(ISL)) != 0:
     print("punch failed: %s" % os.strerror(ctypes.get_errno()))
+    sys.stdout.flush()
     os._exit(1)
 os.ftruncate(f, 64 * ISL)       # drop the upper half
 os.ftruncate(f, N * ISL)        # and grow back: those offsets are holes now
@@ -142,6 +144,7 @@ for i in range(0, 64, 2):       # untouched: must still be intact
 os.close(f)
 for b in bad:
     print(b)
+sys.stdout.flush()
 os._exit(1 if bad else 0)
 PY
 }

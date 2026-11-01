@@ -38,8 +38,12 @@ const char *get_stable_machine_uuid(void)
 
     dmi_uuid = dmi_get_system_info(DMI_PRODUCT_UUID);
     if (dmi_uuid && strlen(dmi_uuid) >= UUID_STRING_LEN) {
-        strncpy(uuid_str, dmi_uuid, UUID_STRING_LEN);
-        uuid_str[UUID_STRING_LEN] = '\0';
+        /* strscpy, not strncpy: the kernel is retiring strncpy and 7.2
+         * no longer declares it at all, so this would not build there.
+         * Same result -- the length was checked above, and strscpy
+         * NUL-terminates, which is why the explicit terminator is
+         * gone. */
+        strscpy(uuid_str, dmi_uuid, sizeof(uuid_str));
         return uuid_str;
     }
 

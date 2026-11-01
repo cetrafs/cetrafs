@@ -44,6 +44,7 @@
 #include <linux/slab.h>
 #include <linux/workqueue.h>
 
+#include <linux/delay.h>
 #include "kmod.h"
 
 /*
@@ -97,13 +98,43 @@ static int cetrafs_test_uncache_zg = -1;
 module_param_named(test_uncache_zg, cetrafs_test_uncache_zg, int, 0644);
 MODULE_PARM_DESC(test_uncache_zg, "TEST ONLY: forget owning this zone group, so the next tick re-attaches to it");
 
+/*
+ * TEST ONLY: make the maintenance pass take this long.
+ *
+ * Its real duration is a dead peer's journal replay, a whole-registry
+ * scan or a pending-free drain against a device that is answering
+ * slowly -- none of which a single-node rig can produce on demand, and
+ * all of which used to push the next lease renewal out by exactly that
+ * much. See tests/kernel/heartbeat_renew_cadence.sh.
+ */
+static unsigned int cetrafs_hb_maint_delay_ms;
+module_param_named(hb_maint_delay_ms, cetrafs_hb_maint_delay_ms, uint, 0644);
+MODULE_PARM_DESC(hb_maint_delay_ms, "TEST ONLY: milliseconds the heartbeat's maintenance pass takes");
+
 static void cetrafs_heartbeat_tick(struct work_struct *work)
 {
     struct cetrafs_heartbeat *hb = container_of(work, struct cetrafs_heartbeat, work.work);
     struct super_block *sb = hb->sb;
     u32 my_node_id;
-    u8 my_uuid[CETRAFS_NODE_UUID_LEN];
     int ret;
+
+    /*
+     * Re-arm BEFORE doing anything, not after.
+     *
+     * A peer decides we are dead by how long ago we last renewed, so
+     * the renewal's period is the only number that window is measured
+     * against. Arming at the END of the tick made that period
+     * "interval PLUS however long this tick took" -- and the tick also
+     * claimed Zone Groups, drained peers' queued frees and replayed a
+     * dead node's journal, none of which has a bound. A slow device
+     * turned a 10-second heartbeat into minutes and a live node into a
+     * fenced one.
+     *
+     * The work item cannot run twice at once, so arming first costs
+     * nothing when a tick overruns: the next one simply starts as soon
+     * as this returns.
+     */
+    queue_delayed_work(system_long_wq, &hb->work, msecs_to_jiffies(cetrafs_sb_hb_interval_secs(sb) * 1000));
 
     if (cetrafs_test_uncache_zg >= 0) {
         u32 zg = (u32) cetrafs_test_uncache_zg;
@@ -165,10 +196,49 @@ static void cetrafs_heartbeat_tick(struct work_struct *work)
     if (sb_rdonly(sb))
         goto reschedule;
 
+    /* The heavy half runs as its OWN work item -- see
+     * cetrafs_heartbeat_maint(). */
+    queue_delayed_work(system_long_wq, &hb->maint, 0);
+
+reschedule:
+    return;
+}
+
+
+/*
+ * Everything the tick does that is NOT the lease renewal: claim and
+ * release Zone Groups, retry deferred namespace-lock releases, apply
+ * peers' queued frees, replay a dead peer's journal.
+ *
+ * All of it writes to shared state, all of it can block on the device
+ * for as long as the device feels like, and none of it has a deadline
+ * -- which is exactly why it must not share a work item with the one
+ * thing that does.
+ */
+static void cetrafs_heartbeat_maint(struct work_struct *work)
+{
+    struct cetrafs_heartbeat *hb = container_of(work, struct cetrafs_heartbeat, maint.work);
+    struct super_block *sb = hb->sb;
+    u32 my_node_id;
+    u8 my_uuid[CETRAFS_NODE_UUID_LEN];
+    int ret;
+
+    if (cetrafs_hb_maint_delay_ms)
+        msleep(cetrafs_hb_maint_delay_ms); /* test-only; see the parameter */
+
+    /* Re-checked here, not inherited from the renewal that queued us:
+     * a peer may have fenced us in between, and these are all writes we
+     * would no longer have any right to make. */
+    if (cetrafs_sb_is_fenced(sb) || sb_rdonly(sb))
+        return;
+
+    if (cetrafs_sb_get_node_id(sb, &my_node_id))
+        return;
+
     ret = cetrafs_sb_get_node_uuid(sb, my_uuid);
     if (ret) {
         pr_warn("heartbeat: failed to get our own node uuid: %d\n", ret);
-        goto reschedule;
+        return;
     }
 
     ret = cetrafs_zg_claim_unowned(sb, my_node_id, my_uuid, /*at_mount=*/false);
@@ -178,6 +248,11 @@ static void cetrafs_heartbeat_tick(struct work_struct *work)
     /* Apply any frees other nodes queued against ZGs we own
      * before the release-surplus pass below, so a ZG these frees
      * just emptied can be given back on this same tick. */
+    /* Namespace locks we took and could not give back. Stale reclaim
+     * will not come for them -- it fires for a node that stopped
+     * heartbeating, and we are the one beating. */
+    cetrafs_nslock_retry_deferred(sb);
+
     ret = cetrafs_zg_drain_pending_frees(sb);
     if (ret)
         pr_warn("heartbeat: pending-free drain pass failed: %d\n", ret);
@@ -215,7 +290,12 @@ static void cetrafs_heartbeat_tick(struct work_struct *work)
              * and still just skips that row. */
             if (ret == -EIO)
                 break;
-            if (ret || ne.state == CETRAFS_NODE_STATE_FREE)
+            /* Only a NODE can have crashed mid-operation. A row in
+             * CETRAFS_NODE_STATE_REPAIR belongs to an offline tool that
+             * owns no journal slice; treating it as a dead peer would
+             * mean fencing and replaying on behalf of something that
+             * was never writing through the journal at all. */
+            if (ret || cetrafs_le32(ne.state) != CETRAFS_NODE_STATE_REGISTERED)
                 continue;
             if (cetrafs_node_is_stale(sb, n, &stale) || !stale)
                 continue;
@@ -250,8 +330,6 @@ static void cetrafs_heartbeat_tick(struct work_struct *work)
         }
     }
 
-reschedule:
-    queue_delayed_work(system_long_wq, &hb->work, msecs_to_jiffies(cetrafs_sb_hb_interval_secs(sb) * 1000));
 }
 
 /* This node's heartbeat period, for publishing in its registry row so
@@ -271,6 +349,7 @@ int cetrafs_heartbeat_start(struct super_block *sb, struct cetrafs_heartbeat **o
 
     hb->sb = sb;
     INIT_DELAYED_WORK(&hb->work, cetrafs_heartbeat_tick);
+    INIT_DELAYED_WORK(&hb->maint, cetrafs_heartbeat_maint);
     queue_delayed_work(system_long_wq, &hb->work, msecs_to_jiffies(cetrafs_sb_hb_interval_secs(sb) * 1000));
 
     *out_hb = hb;
@@ -289,6 +368,10 @@ void cetrafs_heartbeat_stop(struct cetrafs_heartbeat *hb)
     if (!hb)
         return;
 
+    /* The renewal first: it is the one that queues the other, so
+     * cancelling it first means the maintenance cancel below cannot be
+     * raced by a fresh queue_delayed_work() from a tick still running. */
     cancel_delayed_work_sync(&hb->work);
+    cancel_delayed_work_sync(&hb->maint);
     kfree(hb);
 }

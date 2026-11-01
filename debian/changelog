@@ -1,3 +1,148 @@
+cetrafs (0.9.2) unstable; urgency=medium
+
+  * Most of this release comes from a detailed external review of the
+    kernel module and the userspace tools by Matteo Croce (teknoraver),
+    who read the whole tree and reported what follows -- including two
+    faults nothing here could have found on its own: one reachable by
+    any user with a writable file, and one that only shows on a kernel
+    with pages larger than 4 KiB, which he runs and we do not. Our
+    thanks: this is the most valuable thing anyone can do for a
+    filesystem that is not yet 1.0.
+
+  * ACTION REQUIRED for a volume still on on-disk format 0x0008 -- made
+    by 0.8.x and never grown. The compatibility window that let the
+    previous package mount one is closed, so this package will refuse
+    it. Grow such a volume with 0.9.1 first, which stamps 0x0009, or
+    reformat it. Volumes made or grown by 0.9 or 0.9.1 are unaffected
+    and need nothing; the format is otherwise unchanged by this
+    release.
+
+  * Fixed: punching a hole in a range that covered no whole block but
+    crossed a block boundary -- fallocate(FALLOC_FL_PUNCH_HOLE) of two
+    bytes spanning the end of a page, for instance -- crashed the
+    kernel. Any user with a writable file on the mount could reach it.
+    The test that covers it now enumerates the boundary cases rather
+    than sampling them.
+
+  * Fixed: on a kernel whose page size is larger than the filesystem
+    block size -- 16 KiB or 64 KiB pages, as several arm64
+    distributions ship -- the online defragmenter invalidated only a
+    fraction of the page cache it had to, because it passed block
+    numbers where page indexes were wanted. Pages still mapped to the
+    moved blocks survived those blocks being freed and reused, and a
+    later writeback through one landed on another file's data. On a
+    4 KiB-page kernel the two numbers are equal, which is why this had
+    gone unseen; the module now states that assumption as a
+    compile-time assertion and the mount reports what it is running
+    on.
+
+  * Fixed: a shared writable memory mapping was the one write path with
+    no filesystem code at the store. Its blocks were allocated during
+    writeback, with nobody to return an error to, so a store to a full
+    volume was accepted and the data dropped -- only an explicit
+    msync(2) said otherwise. Nothing excluded a page fault from a hole
+    punch or a truncate either, so a fault in that window could leave
+    blocks still carrying the mapping's bytes freed for another file to
+    take. Allocation happens at fault time now, where out of space
+    becomes SIGBUS as POSIX requires, and every mutation of a file's
+    extent tree is serialised against the others.
+
+  * Fixed: several ways a damaged or hostile volume could hang or
+    mislead a node rather than being rejected. A directory entry
+    claiming a name longer than its field read past the end of it; an
+    extent recording a length of zero made fiemap (filefrag, backup
+    tools) spin in the kernel forever, holding the file's lock and
+    surviving SIGKILL; the Block Group table chain, the root inode's
+    type, extent-tree depths and Block Group sizes were used without
+    being checked against the device. All are validated where they are
+    read now, and the image fuzzer was extended to reach them -- it
+    could not produce a volume with a grown Block Group chain at all,
+    so that code had never been fuzzed.
+
+  * Fixed: fallocate(2) over a large range could not be interrupted --
+    not even by SIGKILL -- and ignored RLIMIT_FSIZE, so a process
+    limited to a small file could preallocate as much as the device
+    could back.
+
+  * Fixed, on a multipath SAN: a COMPARE AND WRITE that timed out was
+    re-issued on another path, but a timeout means the host stopped
+    waiting, not that the target did not execute the command. If the
+    first had landed, the retry failed its compare, which the layer
+    above read as an ordinary lost race and re-ran -- applying twice
+    any update expressed as a delta rather than an absolute value, the
+    free-space-accounting corruption this filesystem has paid for once
+    already. An ambiguous outcome is now distinguished from a refusal
+    and resolved by re-reading the record, which tells the three cases
+    apart.
+
+  * Fixed: a journal entry was consumed even when the write it
+    protected had failed, destroying the only copy that could have
+    redone it while the caller was told the write had landed; a failed
+    replay did the same. The journal exists for that case and was
+    discarding itself precisely when it was needed.
+
+  * Fixed: a transient I/O error while revalidating a directory entry
+    was reported to the VFS as "this name is invalid", which detaches
+    any mount point on it. One unreadable directory block was therefore
+    enough to silently tear down a bind mount, permanently, from a path
+    that merely walked through it.
+
+  * Fixed: evicting an inode freed its number before reading the extent
+    tree, so a tree it could not read left the file's blocks allocated
+    with nothing naming them, while the number was already reusable --
+    a permanent, untraceable leak. The tree is fetched first now and a
+    failure refuses the whole eviction, leaving an orphan fsck can
+    report.
+
+  * Fixed: recording a node's departure at unmount wrote the whole
+    registry row back from a copy taken earlier, which could erase a
+    fence a surviving peer had just recorded against it. That row is
+    now changed by compare-and-swap like every other; no blind writer
+    of it is left.
+
+  * Fixed: three answers userspace reads were wrong. read(2) on a
+    directory returned EINVAL instead of EISDIR; statfs left f_fsid
+    zero, so every cetrafs mount looked like the same filesystem to
+    anything that tells them apart by it, NFS export included; and
+    fiemap never marked preallocated ranges unwritten, so backup tools
+    reading extents copied blocks whose contents are not yet the
+    file's.
+
+  * Fixed: mkfs.cetra wrote the superblock before the structures it
+    points at, so an mkfs interrupted partway left a volume that looked
+    mountable over a stale journal from whatever cetrafs volume had
+    been on the device before -- and mounting it replayed those entries
+    into the new filesystem. The superblock is now the last write, made
+    after everything else is flushed, and the flush is checked rather
+    than assumed. Its size argument is also parsed strictly now, where
+    a large value could overflow instead of being refused.
+
+  * Fixed: a directory extent claiming an absurd number of blocks --
+    ee_len is 31 bits read off the disk -- made fsck.cetra complain
+    once per block rather than once per extent: hundreds of thousands
+    of identical lines and tens of MB of output from a single crafted
+    field, and a near-hang where the count was larger still. The
+    content pass had been taught to judge a run before walking it; the
+    namespace walk and two repair paths had their own loops and had
+    not. Found by this release's own fuzz stage.
+
+  * fsck.cetra repairs more and refuses more: it rebuilds an extent
+    tree with an unreadable depth, validates what it finds in
+    lost+found before trusting it, keeps a directory's names when the
+    damage is confined to the tail of a dirent block, and declines to
+    repair a tree it cannot walk rather than guessing. An offline
+    repair now claims the volume for as long as it runs, so no node can
+    mount underneath it; the claim is heartbeated and released.
+
+  * The module builds against kernels through 7.2 and with clang
+    (make mod LLVM=1), and can be built with KASAN (make mod KASAN=1)
+    -- with the measured caveat, documented rather than assumed, that
+    KASAN sees allocation bounds and not the field bounds most of the
+    faults above lived in. The test gate is 192 suites and 1918
+    assertions.
+
+ -- Massimo Cetra <mcetra@gmail.com>  Sat, 31 Oct 2026 23:30:00 +0000
+
 cetrafs (0.9.1) unstable; urgency=medium
 
   * Fixed: on a device whose atomic COMPARE AND WRITE unit is 4 KiB --

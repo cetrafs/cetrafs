@@ -95,6 +95,10 @@ static void pwrite_all(int fd, const void *buf, size_t len, off_t off)
         ssize_t w = pwrite(fd, p, len, off);
         if (w < 0)
             die("pwrite failed: %s", strerror(errno));
+        /* pwrite(2) returning 0 for a nonzero count means it is making
+         * no progress -- retrying it is an infinite loop, not patience. */
+        if (w == 0)
+            die("pwrite wrote nothing at offset %lld with %zu bytes left", (long long) off, len);
         p += (size_t) w;
         off += (off_t) w;
         len -= (size_t) w;
@@ -135,7 +139,19 @@ static bool is_device_nonempty(int fd, u64 blocks_to_scan, u32 *found_magic)
 
     /* check block 0 for our magic */
     if (pread(fd, buf, CETRAFS_BLOCK_SIZE, 0) == (ssize_t) CETRAFS_BLOCK_SIZE) {
-        u32 mg = *(u32 *) buf;
+        /* The magic is __le32 on the device. Reading it in NATIVE byte
+         * order compares the wrong number on a big-endian host, where
+         * an existing cetrafs volume would read as empty and this
+         * refusal -- the one thing standing between an operator and a
+         * reformat of a live LUN -- would not fire. The whole format is
+         * __le* and `make endian-check` guards it; this peek predated
+         * the rule. memcpy, also, because the buffer is not guaranteed
+         * to be u32-aligned. */
+        __le32 mg_raw;
+        u32 mg;
+
+        memcpy(&mg_raw, buf, sizeof(mg_raw));
+        mg = cetrafs_le32(mg_raw);
         if (found_magic)
             *found_magic = mg;
         if (mg == CETRAFS_MAGIC) {
@@ -201,6 +217,23 @@ static void usage(const char *argv0)
  * and -J are: a size that wraps feeds a garbage total_blocks into every
  * geometry computation downstream.
  */
+/* strtol with nothing checked accepts "-z 5x" as 5: the trailing
+ * garbage is simply dropped, and an operator who mistyped a geometry
+ * gets a volume built to something they did not ask for. -s has always
+ * parsed strictly (it has to, for its suffixes); the plain integers
+ * did not. */
+static long long parse_int_arg(const char *arg, const char *what)
+{
+    char *end = NULL;
+    long long v;
+
+    errno = 0;
+    v = strtoll(arg, &end, 10);
+    if (errno || end == arg || *end != '\0')
+        die_arg("%s: not a whole number: %s", what, arg);
+    return v;
+}
+
 static u64 parse_size_bytes(const char *arg)
 {
     char *end = NULL;
@@ -288,22 +321,36 @@ int main(int argc, char **argv)
     while ((opt = getopt(argc - 1, argv + 1, "z:b:N:J:M:s:nf")) != -1) {
         switch (opt) {
         case 'z': {
-            long v = strtol(optarg, NULL, 10);
+            long v = (long) parse_int_arg(optarg, "-z");
             if (v < 1 || v > (long) CETRAFS_MAX_ZONE_GROUPS)
                 die_arg("-z out of range");
             zg_count = (u32) v;
             break;
         }
         case 'b': {
-            long long mib = strtoll(optarg, NULL, 10);
+            long long mib = parse_int_arg(optarg, "-b/-J");
             if (mib < 512)
                 die_arg("-b too small (min 512 MiB)");
-            /* Bounded ABOVE too: past ~2^44 MiB the byte multiplication
-             * below wraps u64 and a garbage bg_size feeds every geometry
-             * computation. 1 PiB per BG is already far beyond any device
-             * this supports. */
-            if (mib > (1LL << 30))
-                die_arg("-b too large (max 1 PiB)");
+            /*
+             * Bounded ABOVE by what the kernel can INDEX, not by what
+             * the arithmetic survives. A Block Group's blocks are
+             * tracked in core by the kernel's bitmap API, whose indices
+             * are `unsigned int`; past CETRAFS_MAX_BG_SIZE_BLOCKS the
+             * scrub's reference set truncated the offset and marked the
+             * wrong blocks as referenced, which makes it free live
+             * ones. The old ceiling was 1 PiB per group -- 2^38 blocks,
+             * 64 times past the point the index stops meaning anything.
+             */
+            /* Compared in MiB, the unit the value ARRIVED in. The
+             * first version of this cap multiplied up to bytes first --
+             * and `-b 1125899906842624` makes that product 2^70, which
+             * wraps u64 to exactly 0, sails under the ceiling and
+             * through the 4KiB-multiple test below, leaving bg_size 0
+             * to feed every geometry computation. The bound a wrap can
+             * slip past is not a bound. */
+            if (mib > (long long) (CETRAFS_MAX_BG_SIZE_BLOCKS * (u64) CETRAFS_BLOCK_SIZE / (1024ULL * 1024ULL)))
+                die_arg("-b too large (max %llu MiB -- a Block Group's blocks must be indexable)",
+                        (unsigned long long) (CETRAFS_MAX_BG_SIZE_BLOCKS * (u64) CETRAFS_BLOCK_SIZE / (1024ULL * 1024ULL)));
             bg_size_bytes = (u64) mib * 1024ULL * 1024ULL;
             if (bg_size_bytes % CETRAFS_BLOCK_SIZE)
                 die_arg("-b must be multiple of 4KiB");
@@ -311,7 +358,7 @@ int main(int argc, char **argv)
             break;
         }
         case 'N': {
-            long long nin = strtoll(optarg, NULL, 10);
+            long long nin = parse_int_arg(optarg, "-N");
             if (nin < 1024)
                 die_arg("-N too small (min 1024)");
             /*
@@ -335,7 +382,7 @@ int main(int argc, char **argv)
             break;
         }
         case 'J': {
-            long long mib = strtoll(optarg, NULL, 10);
+            long long mib = parse_int_arg(optarg, "-b/-J");
             if (mib < 0)
                 die_arg("-J invalid");
             /* Same overflow bound as -b; a journal slice has no business
@@ -349,7 +396,7 @@ int main(int argc, char **argv)
             break;
         }
         case 'M': {
-            long long m = strtoll(optarg, NULL, 10);
+            long long m = parse_int_arg(optarg, "-M");
             if (m < 1 || m > 0xFFFE)
                 die_arg("-M out of range (1..65534)");
             if (m > CETRAFS_MAX_READER_NODES) {
@@ -686,10 +733,23 @@ int main(int argc, char **argv)
     uint32_t sb_crc = crc32c_struct(&sb, sizeof(sb), offsetof(cetrafs_superblock_t, checksum), sizeof(sb.checksum));
     sb.checksum = cetrafs_cpu_to_le64((u64) sb_crc);
 
-    /* pad to a block */
+    /* pad to a block
+     *
+     * NOT written here. The superblock is what makes this volume
+     * mountable, and everything it points at -- the journal area above
+     * all -- is written after this point. Stamped here, an mkfs that
+     * stopped anywhere in between (a power cut, an I/O error, a ^C)
+     * left a VALID superblock over the PREVIOUS volume's journal slots,
+     * which a mount then replays into the new filesystem. The same rule
+     * the kernel follows: a reference may not become durable before
+     * what it refers to. See the stamp at the end of this function. */
+    /* Its OWN buffer: 'blk' below is a scratch block reused for the ZG
+     * table, the BG table and the BG headers, so deferring the stamp
+     * while sharing it writes the last of those into block 0 (fsck:
+     * "bad magic", caught the first time this ran). */
+    u8 *sb_blk = (u8 *) xcalloc(1, CETRAFS_BLOCK_SIZE);
     u8 *blk = (u8 *) xcalloc(1, CETRAFS_BLOCK_SIZE);
-    memcpy(blk, &sb, sizeof(sb));
-    write_block(fd, sb_lba, blk, !dry_run);
+    memcpy(sb_blk, &sb, sizeof(sb));
 
     /* --------------------------- */
     /* --- ZG table & journals --- */
@@ -998,9 +1058,24 @@ int main(int argc, char **argv)
         pwrite_all(fd, &ri, sizeof(ri), ino_off);
 
     if (!dry_run) {
-        fsync(fd);
+        /* Everything the superblock will point at, on the device. */
+        if (fsync(fd) != 0)
+            die("fsync failed before stamping the superblock: %s", strerror(errno));
+
+        /* Only now does the volume become mountable. */
+        write_block(fd, sb_lba, sb_blk, true);
+
+        /* And an unchecked fsync is not a flush, it is a hope: on a
+         * thin LUN that just ran out, or a device that is going away,
+         * this is where mkfs learns the volume it is about to call
+         * "completed" is not on the platter. */
+        if (fsync(fd) != 0)
+            die("fsync of the superblock failed: %s", strerror(errno));
     }
-    close(fd);
+    /* close(2) reports errors a buffered write deferred -- EIO, ENOSPC
+     * on some filesystems -- and this is the last chance to see them. */
+    if (close(fd) != 0)
+        die("close failed: %s", strerror(errno));
 
     /* --- summary --- */
     fprintf(stdout,

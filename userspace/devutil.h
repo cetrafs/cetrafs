@@ -164,6 +164,187 @@ static inline int cetrafs_read_live_candidate(int fd,
     return 1;
 }
 
+/* ---- the offline repairer's claim --------------------------------
+ *
+ * `fsck -r` and growfs refuse to touch a volume a node has mounted.
+ * That covers one direction: nothing stopped a node MOUNTING halfway
+ * through a repair, because the repairer put nothing on the device for
+ * a mount to see. These three write (and clear) a Node Registry row in
+ * CETRAFS_NODE_STATE_REPAIR, which fill_super() refuses to mount past.
+ *
+ * It is a lease. cetrafs_repair_renew() must be called as the work
+ * proceeds, and a repairer that dies releases the volume after the
+ * ordinary staleness window rather than blocking it forever.
+ */
+static inline off_t cetrafs_node_row_off(const cetrafs_superblock_t *sb, uint32_t idx)
+{
+    return (off_t) ((cetrafs_le64(sb->node_table_start) + idx) * CETRAFS_BLOCK_SIZE);
+}
+
+static inline void cetrafs_node_row_stamp(cetrafs_node_entry_t *ne)
+{
+    ne->checksum = 0;
+    ne->checksum = cetrafs_cpu_to_le64(
+        crc32c_struct(ne, sizeof(*ne), offsetof(cetrafs_node_entry_t, checksum), sizeof(ne->checksum)));
+}
+
+/*
+ * Is somebody else repairing this volume right now?
+ *
+ * Returns 1 and fills out_row/out_label if a REPAIR row is live, 0 if
+ * none is, -1 on an I/O error (which, like cetrafs_find_live_peer(),
+ * means "cannot verify" and must fail closed in the caller).
+ */
+static inline int cetrafs_find_repair_claim(int fd,
+                                            const cetrafs_superblock_t *sb,
+                                            uint32_t *out_row,
+                                            char *out_label,
+                                            size_t label_sz)
+{
+    uint32_t count = cetrafs_le32(sb->node_table_count), idx;
+
+    if (!count || count > 4096)
+        return 0;
+
+    for (idx = 0; idx < count; idx++) {
+        unsigned char blk[CETRAFS_BLOCK_SIZE];
+        cetrafs_node_entry_t ne;
+        uint32_t want;
+        long long age;
+        ssize_t got = pread(fd, blk, sizeof(blk), cetrafs_node_row_off(sb, idx));
+
+        if (got < 0)
+            return -1;
+        if (got != (ssize_t) sizeof(blk))
+            return 0; /* past the device end: a corrupt layout, not a claim */
+        memcpy(&ne, blk, sizeof(ne));
+        if (cetrafs_le32(ne.state) != CETRAFS_NODE_STATE_REPAIR)
+            continue;
+        want = (uint32_t) cetrafs_le64(ne.checksum);
+        ne.checksum = 0;
+        if (crc32c_struct(&ne, sizeof(ne), offsetof(cetrafs_node_entry_t, checksum), sizeof(ne.checksum)) != want)
+            continue; /* garbage must not be able to block a repair */
+        age = (long long) time(NULL) - (long long) cetrafs_le64(ne.last_seen);
+        if (age > (long long) CETRAFS_NODE_STALE_SECS)
+            continue; /* the repairer that wrote it is gone */
+        if (out_row)
+            *out_row = idx;
+        if (out_label && label_sz) {
+            memcpy(out_label, ne.label, label_sz - 1 < sizeof(ne.label) ? label_sz - 1 : sizeof(ne.label));
+            out_label[label_sz - 1] = 0;
+        }
+        return 1;
+    }
+    return 0;
+}
+
+/*
+ * The bytes a claim displaced, so release can put them back. A registry
+ * full of departed nodes is the normal state of a cluster that has been
+ * reinstalled a few times, and a volume that cannot be REPAIRED because
+ * every row is spoken for would be a trap of its own -- so a row whose
+ * node has provably left (the last_seen == 0 clean-departure sentinel,
+ * or a lease older than the staleness window) is borrowed and restored.
+ * The node it belongs to re-attaches by UUID, and a mount cannot happen
+ * while the claim is live anyway.
+ */
+static unsigned char cetrafs_repair_saved[CETRAFS_BLOCK_SIZE];
+static int cetrafs_repair_borrowed;
+
+/* Claim a row for this repairer. Returns the row, or -1 if none could
+ * be taken (or the write failed) -- in which case the caller must not
+ * proceed: an unclaimed repair is the thing being fixed. */
+static inline int cetrafs_repair_claim(int fd, const cetrafs_superblock_t *sb, const char *label)
+{
+    uint32_t count = cetrafs_le32(sb->node_table_count), idx;
+    int pass;
+
+    if (!count || count > 4096)
+        return -1;
+
+    /* Pass 0 takes a free row; pass 1 borrows a departed one. Never the
+     * other way round: borrowing while a free row exists would displace
+     * a registration for no reason. */
+    for (pass = 0; pass < 2; pass++)
+    for (idx = 0; idx < count; idx++) {
+        unsigned char blk[CETRAFS_BLOCK_SIZE];
+        cetrafs_node_entry_t ne;
+
+        if (pread(fd, blk, sizeof(blk), cetrafs_node_row_off(sb, idx)) != (ssize_t) sizeof(blk))
+            return -1;
+        memcpy(&ne, blk, sizeof(ne));
+        if (pass == 0) {
+            if (cetrafs_le32(ne.state) != CETRAFS_NODE_STATE_FREE)
+                continue;
+        } else {
+            long long age;
+
+            if (cetrafs_le32(ne.state) != CETRAFS_NODE_STATE_REGISTERED)
+                continue;
+            age = (long long) time(NULL) - (long long) cetrafs_le64(ne.last_seen);
+            if (ne.last_seen != 0 && age <= (long long) CETRAFS_NODE_STALE_SECS)
+                continue; /* still beating: not ours to take */
+            memcpy(cetrafs_repair_saved, blk, sizeof(cetrafs_repair_saved));
+            cetrafs_repair_borrowed = 1;
+        }
+
+        memset(&ne, 0, sizeof(ne));
+        ne.state = cetrafs_cpu_to_le32(CETRAFS_NODE_STATE_REPAIR);
+        ne.last_seen = cetrafs_cpu_to_le64((uint64_t) time(NULL));
+        ne.hb_seq = cetrafs_cpu_to_le64(1);
+        snprintf(ne.label, sizeof(ne.label), "%s", label);
+        cetrafs_node_row_stamp(&ne);
+
+        memset(blk, 0, sizeof(blk));
+        memcpy(blk, &ne, sizeof(ne));
+        if (pwrite(fd, blk, sizeof(blk), cetrafs_node_row_off(sb, idx)) != (ssize_t) sizeof(blk))
+            return -1;
+        /* On the platter before the first structural write, or the
+         * claim does not exist as far as a mounting node is concerned. */
+        if (fsync(fd) != 0)
+            return -1;
+        return (int) idx;
+    }
+    return -1;
+}
+
+/* Refresh the lease. Cheap enough to call often; the caller decides how
+ * often, and "too rarely" means a mount can slip in mid-repair. */
+static inline int cetrafs_repair_renew(int fd, const cetrafs_superblock_t *sb, uint32_t row)
+{
+    unsigned char blk[CETRAFS_BLOCK_SIZE];
+    cetrafs_node_entry_t ne;
+
+    if (pread(fd, blk, sizeof(blk), cetrafs_node_row_off(sb, row)) != (ssize_t) sizeof(blk))
+        return -1;
+    memcpy(&ne, blk, sizeof(ne));
+    if (cetrafs_le32(ne.state) != CETRAFS_NODE_STATE_REPAIR)
+        return -1; /* somebody took our row: say so rather than fight */
+    ne.last_seen = cetrafs_cpu_to_le64((uint64_t) time(NULL));
+    ne.hb_seq = cetrafs_cpu_to_le64(cetrafs_le64(ne.hb_seq) + 1);
+    cetrafs_node_row_stamp(&ne);
+    memcpy(blk, &ne, sizeof(ne));
+    if (pwrite(fd, blk, sizeof(blk), cetrafs_node_row_off(sb, row)) != (ssize_t) sizeof(blk))
+        return -1;
+    return 0;
+}
+
+/* Give the volume back. Best effort by construction: if this never runs
+ * -- a kill, a crash, a power cut -- the lease above expires on its own. */
+static inline void cetrafs_repair_release(int fd, const cetrafs_superblock_t *sb, uint32_t row)
+{
+    unsigned char blk[CETRAFS_BLOCK_SIZE];
+
+    if (cetrafs_repair_borrowed) {
+        memcpy(blk, cetrafs_repair_saved, sizeof(blk)); /* put the registration back */
+        cetrafs_repair_borrowed = 0;
+    } else {
+        memset(blk, 0, sizeof(blk)); /* all-zero is CETRAFS_NODE_STATE_FREE */
+    }
+    if (pwrite(fd, blk, sizeof(blk), cetrafs_node_row_off(sb, row)) == (ssize_t) sizeof(blk))
+        (void) fsync(fd);
+}
+
 /*
  * Walk the Node Registry and report, per REGISTERED row, whether that
  * node's module advertised CETRAFS_NODE_CAP_LIVE_GROW.

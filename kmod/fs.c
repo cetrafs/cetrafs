@@ -24,6 +24,7 @@
 #include <linux/string.h>
 #include <linux/xattr.h>
 
+#include <linux/overflow.h>
 #include "kmod.h" /* on-disk layout; uses __le* when __KERNEL__ is set */
 
 /* Forward decls for exported symbols to silence -Wmissing-prototypes */
@@ -450,6 +451,27 @@ struct cetrafs_sb_info {
     unsigned long bg_sweep_last; /* jiffies of the last foreign-descriptor sweep */
     unsigned long pf_drain_last; /* jiffies of the last on-demand pending-free drain */
 
+    /*
+     * Namespace locks this node took and could not give back.
+     *
+     * The release is a compare-and-swap and it can fail -- a transient
+     * device error, memory pressure. The code logged "leaving the lock
+     * for stale-reclaim", which is an accurate description of what
+     * happens and a poor outcome: stale reclaim only fires when a node
+     * stops heartbeating, and this one is alive. The lock would sit
+     * there until the node died or unmounted, and every namespace
+     * operation on that inode, from any node, would exhaust its retry
+     * budget and return -EBUSY. Not a hang -- the waiters do give up --
+     * but the inode is unusable cluster-wide for as long as we live.
+     *
+     * So a failed release is remembered and retried on the heartbeat.
+     * Bounded: past this many the oldest is dropped and reported, which
+     * is no worse than the behaviour this replaces.
+     */
+    spinlock_t nsrel_lock;
+    u32 nsrel_count;
+    struct cetrafs_nsrel_pending nsrel[CETRAFS_NSLOCK_DEFERRED_MAX];
+
     /* Each BG count's ownership epoch (cetrafs_block_group_t.
      * reconcile_seq) as of OUR reconcile -- the epoch our accrued
      * deltas were born under. The delta-apply CAS refuses an image
@@ -580,6 +602,24 @@ struct cetrafs_region {
     u64 count;
 };
 
+/* CRC32C over a BG table segment header with its checksum field treated
+ * as zero -- the convention growfs stamps with and fsck verifies, three
+ * segments like alloc.c's cetrafs_bg_crc_verify(). */
+static u32 cetrafs_bgseg_crc(const cetrafs_bg_segment_t *seg)
+{
+    static const u8 zero[8] = {0};
+    size_t off = offsetof(cetrafs_bg_segment_t, checksum);
+    size_t clen = sizeof(seg->checksum);
+    u32 crc = ~0U;
+
+    BUILD_BUG_ON(sizeof(zero) != sizeof(seg->checksum));
+
+    crc = crc32c(crc, seg, off);
+    crc = crc32c(crc, zero, clen);
+    crc = crc32c(crc, (const u8 *) seg + off + clen, sizeof(*seg) - off - clen);
+    return ~crc;
+}
+
 static int cetrafs_validate_layout(const cetrafs_superblock_t *sb, u64 total_blocks)
 {
     struct cetrafs_region r[10];
@@ -618,9 +658,39 @@ static int cetrafs_validate_layout(const cetrafs_superblock_t *sb, u64 total_blo
     {
         u64 data_start = le64_to_cpu(sb->bg_regions_start);
         u64 data_end = le64_to_cpu(sb->bg_data_end);
+        u64 bg_size = le64_to_cpu(sb->bg_size_blocks);
+        u64 span;
 
-        if (!data_end)
-            data_end = data_start + bg_cnt * le64_to_cpu(sb->bg_size_blocks);
+        /*
+         * The cap moved UP here, ahead of the multiplication it bounds.
+         * It used to sit after both uses of bg_cnt * bg_size_blocks --
+         * so the product it exists to keep sane was computed twice
+         * before anyone had checked either factor.
+         */
+        if (bg_size > CETRAFS_MAX_BG_SIZE_BLOCKS) {
+            pr_err("superblock: Block Group size %llu blocks exceeds the largest that can be indexed (%llu)\n",
+                   (unsigned long long) bg_size, (unsigned long long) CETRAFS_MAX_BG_SIZE_BLOCKS);
+            return -EINVAL;
+        }
+
+        /*
+         * And the product itself is checked, not assumed. Both factors
+         * come off the device: bg_cnt * bg_size overflows u64 long
+         * before either field runs out of range, and a wrapped span is
+         * SMALL -- which makes the "is the data area big enough"
+         * test below pass for a geometry that does not fit at all.
+         */
+        if (check_mul_overflow(bg_cnt, bg_size, &span)) {
+            pr_err("superblock: %llu Block Groups of %llu blocks overflow a 64-bit span\n",
+                   (unsigned long long) bg_cnt, (unsigned long long) bg_size);
+            return -EINVAL;
+        }
+
+        if (!data_end && check_add_overflow(data_start, span, &data_end)) {
+            pr_err("superblock: data area starting at %llu plus %llu blocks overflows\n",
+                   (unsigned long long) data_start, (unsigned long long) span);
+            return -EINVAL;
+        }
         if (data_end < data_start) {
             pr_err("superblock: bg_data_end (%llu) precedes bg_regions_start (%llu)\n", (unsigned long long) data_end,
                    (unsigned long long) data_start);
@@ -642,10 +712,20 @@ static int cetrafs_validate_layout(const cetrafs_superblock_t *sb, u64 total_blo
          * BGs, never smaller, so >= is the honest invariant. O(1), from
          * the superblock alone: no BG table scan on the mount path.
          */
-        if (data_end - data_start < bg_cnt * le64_to_cpu(sb->bg_size_blocks)) {
+        /*
+         * A Block Group's blocks are tracked in core by the kernel's
+         * bitmap API, whose indices are `unsigned int`. A group bigger
+         * than that cannot be addressed by them: the scrub's reference
+         * set cast the offset down and marked the WRONG blocks as
+         * referenced, which makes it free live ones. mkfs refuses such
+         * a geometry; this refuses the image, because the superblock is
+         * a file on a shared device and nothing stops it being written
+         * by something else.
+         */
+        if (data_end - data_start < span) {
             pr_err("superblock: data area [%llu,%llu) is too small for %llu Block Group(s) of %llu blocks\n",
                    (unsigned long long) data_start, (unsigned long long) data_end, (unsigned long long) bg_cnt,
-                   (unsigned long long) le64_to_cpu(sb->bg_size_blocks));
+                   (unsigned long long) bg_size);
             return -EINVAL;
         }
         r[n++] = (struct cetrafs_region) {"block group regions", data_start, data_end - data_start};
@@ -993,6 +1073,7 @@ int cetrafs_fill_super(struct super_block *sb, struct fs_context *fc)
          * cetrafs_node_is_stale() falls back to "cannot judge, assume
          * alive", which errs toward never reclaiming from a live node. */
         spin_lock_init(&sbi->resv_list_lock);
+        spin_lock_init(&sbi->nsrel_lock);
         INIT_LIST_HEAD(&sbi->resv_list);
 
         spin_lock_init(&sbi->peer_lock);
@@ -1135,6 +1216,33 @@ int cetrafs_fill_super(struct super_block *sb, struct fs_context *fc)
                 return rc;
             }
 
+            /* An offline repairer -- fsck -r, growfs -- rewrites the
+             * structures this mount is about to allocate out of. It
+             * holds a registry row for the duration; refusing while
+             * that row is alive is the other half of those tools
+             * refusing to run against a mounted volume. Checked before
+             * the CAW question, because it applies on every device. */
+            {
+                bool repairing = false;
+                char who[CETRAFS_NODE_LABEL_LEN] = {0};
+
+                rc = cetrafs_node_repair_claim_exists(sb, &repairing, who, sizeof(who));
+                if (rc) {
+                    pr_err("mount: cannot read the Node Registry to check for a repair in progress: %d\n", rc);
+                    cetrafs_free_sb_info(sb);
+                    brelse(bh);
+                    return rc;
+                }
+                if (repairing) {
+                    pr_err("%s is being repaired right now (%s) -- refusing to mount; wait for it to finish, "
+                           "or for its lease to expire if it died\n",
+                           sb->s_id, who[0] ? who : "an offline tool");
+                    cetrafs_free_sb_info(sb);
+                    brelse(bh);
+                    return -EBUSY;
+                }
+            }
+
             if (!cetrafs_sb_caw_available(sb)) {
                 bool foreign = false;
 
@@ -1251,7 +1359,19 @@ int cetrafs_fill_super(struct super_block *sb, struct fs_context *fc)
                  * follows the tail's next, so a loop or a link into
                  * nowhere would mount clean. */
                 while (seg_lba) {
-                    struct buffer_head *sbh = sb_bread(sb, seg_lba);
+                    struct buffer_head *sbh;
+
+                    /* The link itself, before it is followed: a next
+                     * pointing off the device is a corrupt chain, not an
+                     * I/O error to puzzle over. */
+                    if (seg_lba >= le64_to_cpu(ondisk->total_blocks)) {
+                        pr_err("BG table chain links to block %llu, past the end of the device (%llu)\n",
+                               (unsigned long long) seg_lba, (unsigned long long) le64_to_cpu(ondisk->total_blocks));
+                        cetrafs_free_sb_info(sb);
+                        brelse(bh);
+                        return -EUCLEAN;
+                    }
+                    sbh = sb_bread(sb, seg_lba);
                     const cetrafs_bg_segment_t *seg;
                     u32 cnt, i;
 
@@ -1277,17 +1397,62 @@ int cetrafs_fill_super(struct super_block *sb, struct fs_context *fc)
                         brelse(bh);
                         return -EUCLEAN;
                     }
-                    cnt = le32_to_cpu(seg->count);
-                    for (i = 0; i < cnt; i++, filled++)
-                        if (filled < nbg)
-                            sbi->bg_desc_lba[filled] = seg_lba + 1 + i;
-                    if (filled > nbg) {
-                        pr_err("BG table chain describes more Block Groups than the %u recorded\n", nbg);
+                    /*
+                     * The checksum this header CARRIES, which the mount
+                     * path never looked at.
+                     *
+                     * growfs writes it and fsck verifies it; here only
+                     * the magic was checked -- so a single flipped bit
+                     * in count, first_bg_id or next was trusted
+                     * completely, by the one reader that acts on them.
+                     * The field exists for exactly this and was being
+                     * ignored.
+                     */
+                    if (cetrafs_bgseg_crc(seg) != (u32) le64_to_cpu(seg->checksum)) {
+                        pr_err("BG table segment at %llu fails its checksum\n", (unsigned long long) seg_lba);
                         brelse(sbh);
                         cetrafs_free_sb_info(sb);
                         brelse(bh);
                         return -EUCLEAN;
                     }
+
+                    cnt = le32_to_cpu(seg->count);
+                    /*
+                     * Checked BEFORE the loop, not after it.
+                     *
+                     * 'cnt' comes off the device and 'filled' is a u32:
+                     * a segment claiming four billion descriptors walked
+                     * that many times, wrapped 'filled' past 2^32, and
+                     * could land back on exactly nbg -- at which point
+                     * both the test below and the "describes all of
+                     * them" test further down PASS, with bg_desc_lba[]
+                     * overwritten by whatever the last passes wrote.
+                     * The loop also ran four billion times before any of
+                     * that was noticed.
+                     */
+                    if (cnt > nbg - filled) {
+                        pr_err("BG table segment at %llu claims %u descriptors; only %u are left of %u\n",
+                               (unsigned long long) seg_lba, cnt, nbg - filled, nbg);
+                        brelse(sbh);
+                        cetrafs_free_sb_info(sb);
+                        brelse(bh);
+                        return -EUCLEAN;
+                    }
+                    /*
+                     * And the descriptors a segment points at have to be
+                     * ON the device. Nothing bounded them, so a corrupt
+                     * segment aimed every descriptor wherever it liked.
+                     */
+                    if (seg_lba + 1 + cnt > le64_to_cpu(ondisk->total_blocks)) {
+                        pr_err("BG table segment at %llu describes blocks past the end of the device (%llu)\n",
+                               (unsigned long long) seg_lba, (unsigned long long) le64_to_cpu(ondisk->total_blocks));
+                        brelse(sbh);
+                        cetrafs_free_sb_info(sb);
+                        brelse(bh);
+                        return -EUCLEAN;
+                    }
+                    for (i = 0; i < cnt; i++, filled++)
+                        sbi->bg_desc_lba[filled] = seg_lba + 1 + i;
                     seg_lba = le64_to_cpu(seg->next);
                     brelse(sbh);
                 }
@@ -1304,14 +1469,36 @@ int cetrafs_fill_super(struct super_block *sb, struct fs_context *fc)
             for (b = 0; b < nbg; b++) {
                 u64 t = 0;
                 u32 owner = CETRAFS_NODE_ID_NONE;
+                int brc;
 
                 /* Same single pass now also records which Zone Group
                  * owns each Block Group, which is what lets ownership
                  * be answered from memory from here on. */
-                if (cetrafs_bg_mount_info(sb, b, &t, &owner) == 0) {
-                    sbi->total_data_blocks += t;
-                    sbi->bg_owner_zg[b] = (u16) owner;
+                brc = cetrafs_bg_mount_info(sb, b, &t, &owner);
+                if (brc) {
+                    /*
+                     * The result used to be DISCARDED on failure, and
+                     * the mount carried on.
+                     *
+                     * cetrafs_read_bg_geom() has already retried a
+                     * checksum mismatch, so an error here means the
+                     * descriptor really does not verify -- and skipping
+                     * it does not leave that Block Group unknown, it
+                     * leaves it WRONG: bg_owner_zg[] is kcalloc'd, so
+                     * the group silently reads as owned by Zone Group
+                     * 0, and total_data_blocks is short by its
+                     * capacity. The allocator then works from both.
+                     *
+                     * Found by the fuzzer's fsck-versus-mount oracle
+                     * the first time it could see this class at all.
+                     */
+                    pr_err("Block Group %u's descriptor does not verify (%d) -- refusing to mount\n", b, brc);
+                    cetrafs_free_sb_info(sb);
+                    brelse(bh);
+                    return brc == -EIO ? -EIO : -EUCLEAN;
                 }
+                sbi->total_data_blocks += t;
+                sbi->bg_owner_zg[b] = (u16) owner;
             }
         }
 
@@ -1596,6 +1783,24 @@ int cetrafs_fill_super(struct super_block *sb, struct fs_context *fc)
             cetrafs_free_sb_info(sb);
             brelse(bh);
             return PTR_ERR(rooti);
+        }
+
+        /*
+         * And it has to BE a directory.
+         *
+         * d_make_root() on a regular file produces a root dentry the
+         * VFS will happily walk into, and every path operation then
+         * works against an object whose ops are not a directory's. The
+         * record comes off a shared device and nothing else on this
+         * path asks the question.
+         */
+        if (!S_ISDIR(rooti->i_mode)) {
+            pr_err("root inode %llu is not a directory (mode 0%o) -- refusing to mount\n",
+                   (unsigned long long) le64_to_cpu(ondisk->root_ino), rooti->i_mode);
+            iput(rooti);
+            cetrafs_free_sb_info(sb);
+            brelse(bh);
+            return -EUCLEAN;
         }
 
         /* d_make_root() already does iput(rooti) on failure; don't double it. */
@@ -2697,6 +2902,54 @@ void cetrafs_sb_set_bg_epoch(struct super_block *sb, u32 bg_id, u64 seq)
  * adjust_free_blocks(). */
 /* Accrue a pending change to a ZG's free-block aggregate. Applied to the
  * record by cetrafs_flush_dirty_free_counts() below, as one CAS. */
+/* Remember a namespace lock whose release did not commit, for the
+ * heartbeat to retry. See cetrafs_sb_info.nsrel. */
+void cetrafs_sb_nslock_defer(struct super_block *sb, u64 ino, u64 generation)
+{
+    struct cetrafs_sb_info *sbi = sb->s_fs_info;
+    u32 i;
+
+    if (!sbi)
+        return;
+
+    spin_lock(&sbi->nsrel_lock);
+    for (i = 0; i < sbi->nsrel_count; i++)
+        if (sbi->nsrel[i].ino == ino) { /* already queued; keep the newer identity */
+            sbi->nsrel[i].generation = generation;
+            spin_unlock(&sbi->nsrel_lock);
+            return;
+        }
+    if (sbi->nsrel_count == CETRAFS_NSLOCK_DEFERRED_MAX) {
+        spin_unlock(&sbi->nsrel_lock);
+        pr_err("nslock: ino=%llu release deferral dropped -- %u already pending, so this one is left for "
+               "stale-reclaim\n",
+               (unsigned long long) ino, (unsigned int) CETRAFS_NSLOCK_DEFERRED_MAX);
+        return;
+    }
+    sbi->nsrel[sbi->nsrel_count].ino = ino;
+    sbi->nsrel[sbi->nsrel_count].generation = generation;
+    sbi->nsrel_count++;
+    spin_unlock(&sbi->nsrel_lock);
+}
+
+/* Take the whole pending set, for one retry pass. Entries the pass
+ * cannot settle are put back by it. */
+u32 cetrafs_sb_nslock_take_deferred(struct super_block *sb, struct cetrafs_nsrel_pending *out, u32 max)
+{
+    struct cetrafs_sb_info *sbi = sb->s_fs_info;
+    u32 n;
+
+    if (!sbi)
+        return 0;
+
+    spin_lock(&sbi->nsrel_lock);
+    n = min(sbi->nsrel_count, max);
+    memcpy(out, sbi->nsrel, n * sizeof(*out));
+    sbi->nsrel_count = 0;
+    spin_unlock(&sbi->nsrel_lock);
+    return n;
+}
+
 void cetrafs_sb_accrue_zg_free(struct super_block *sb, u32 zg_id, s64 delta)
 {
     struct cetrafs_sb_info *sbi = sb->s_fs_info;

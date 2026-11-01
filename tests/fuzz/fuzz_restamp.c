@@ -75,6 +75,10 @@ static int do_info(int fd)
     printf("bg_regions_start=%llu\n", U64(bg_regions_start));
     printf("node_journal_start=%llu\n", U64(node_journal_start));
     printf("node_journal_blocks=%llu\n", U32(node_journal_blocks));
+    /* The BG table chain. Zero on a never-grown volume, which is every
+     * golden this fuzzer had until mkgolden.sh learned to grow one. */
+    printf("bg_table_next=%llu\n", U64(bg_table_next));
+    printf("bg_table_first_count=%llu\n", U64(bg_table_first_count));
 #undef U32
 #undef U64
     return 0;
@@ -119,6 +123,20 @@ static int stamp_block_csum(int fd, off_t off, size_t csum_off)
         return 1;
     uint32_t crc = crc32c_struct(blk, CETRAFS_BLOCK_SIZE, csum_off, sizeof(uint64_t));
     put_csum64(blk, csum_off, crc);
+    return write_at(fd, blk, sizeof(blk), off);
+}
+
+/* A BG table segment header. Its CRC covers the STRUCT, not the whole
+ * block -- the convention growfs stamps with -- so the generic
+ * block-wide helper would produce a checksum nothing agrees with. */
+static int stamp_bgseg(int fd, off_t off)
+{
+    uint8_t blk[CETRAFS_BLOCK_SIZE];
+    if (read_at(fd, blk, sizeof(blk), off))
+        return 1;
+    uint32_t crc = crc32c_struct(blk, sizeof(cetrafs_bg_segment_t),
+                                 offsetof(cetrafs_bg_segment_t, checksum), sizeof(uint64_t));
+    put_csum64(blk, offsetof(cetrafs_bg_segment_t, checksum), crc);
     return write_at(fd, blk, sizeof(blk), off);
 }
 
@@ -471,6 +489,8 @@ int main(int argc, char **argv)
             rc = stamp_inode(fd, off);
         else if (strcmp(type, "node") == 0)
             rc = stamp_node(fd, off);
+        else if (strcmp(type, "bgseg") == 0)
+            rc = stamp_bgseg(fd, off);
         else if (strcmp(type, "tail") == 0)
             rc = stamp_tail(fd, off);
         else if (strcmp(type, "journal") == 0)

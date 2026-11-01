@@ -35,6 +35,7 @@
 #include <linux/seq_file.h>
 #include <linux/slab.h>
 
+#include <linux/delay.h>
 #include "kmod.h"
 
 /* /proc/fs/cetrafs itself -- created once at module init (kmod.c), torn
@@ -310,6 +311,14 @@ static int cetrafs_proc_properties_show(struct seq_file *m, void *v)
 
     seq_printf(m, "version: 0x%04x\n", le16_to_cpu(raw_sb->version));
     seq_printf(m, "block_size: %u\n", le32_to_cpu(raw_sb->block_size));
+    /* The kernel's PAGE size, not the filesystem's block size, and the
+     * reason it is worth reporting: where a page is one block the two
+     * indices coincide and mixing them is invisible. A result -- a test
+     * run, a bug report -- should say which of those worlds it came
+     * from. arm64 can be built at 16K or 64K; everything here has been
+     * exercised at 4K. */
+    seq_printf(m, "kernel_page_size: %lu\n", PAGE_SIZE);
+    seq_printf(m, "blocks_per_page: %lu\n", PAGE_SIZE / CETRAFS_BLOCK_SIZE);
     seq_printf(m, "cluster_id: %u\n", le32_to_cpu(raw_sb->cluster_id));
     seq_printf(m, "features_compat: 0x%llx\n", (unsigned long long) le64_to_cpu(raw_sb->features_compat));
     seq_printf(m, "features_ro_compat: 0x%llx\n", (unsigned long long) le64_to_cpu(raw_sb->features_ro_compat));
@@ -383,6 +392,15 @@ static int cetrafs_proc_cluster_show(struct seq_file *m, void *v)
         }
         if (ne.state == CETRAFS_NODE_STATE_FREE)
             continue;
+        if (cetrafs_le32(ne.state) == CETRAFS_NODE_STATE_REPAIR) {
+            /* Not a node: an offline repairer holding the volume. Shown
+             * because it is why mounts are being refused, and an
+             * operator reading this file is usually asking exactly
+             * that. */
+            seq_printf(m, "row=%u REPAIR-IN-PROGRESS last_seen=%llu label=%s\n", idx,
+                       (unsigned long long) cetrafs_le64(ne.last_seen), ne.label);
+            continue;
+        }
 
         ret = cetrafs_node_is_stale(sb, idx, &stale);
         if (ret)
@@ -442,6 +460,21 @@ static int cetrafs_proc_controls_show(struct seq_file *m, void *v)
     return 0;
 }
 
+/* Serialises the timing pair; see the comment at its only user. */
+static DEFINE_MUTEX(cetrafs_controls_lock);
+
+/*
+ * TEST ONLY: hold the timing pair's critical section open.
+ *
+ * The window between reading the other knob and writing this one is a
+ * few instructions wide in production, which is why a cross-field
+ * invariant could be broken by two concurrent writers for as long as it
+ * was. See tests/kernel/controls_timing_race.sh.
+ */
+static unsigned int cetrafs_controls_delay_ms;
+module_param_named(controls_delay_ms, cetrafs_controls_delay_ms, uint, 0644);
+MODULE_PARM_DESC(controls_delay_ms, "TEST ONLY: pause inside a controls timing write");
+
 static int cetrafs_proc_controls_open(struct inode *inode, struct file *file)
 {
     return single_open(file, cetrafs_proc_controls_show, pde_data(inode));
@@ -494,9 +527,28 @@ static ssize_t cetrafs_proc_controls_write(struct file *file, const char __user 
      * still applied on top of whatever is set here. */
     if (!strcmp(key, "hb_interval_secs") || !strcmp(key, "stale_secs")) {
         unsigned int v;
+        int trc = (int) len;
 
         if (kstrtouint(val, 10, &v))
             return -EINVAL;
+
+        /*
+         * The two knobs constrain EACH OTHER, so the pair is read,
+         * checked and written under one lock.
+         *
+         * Each arm below reads the other value and then sets its own.
+         * Two writers interleaving between those steps both pass their
+         * own check and leave the pair violating the invariant: from
+         * hb=10/stale=60, one setting hb=20 (60 >= 3x20, fine) and one
+         * setting stale=30 (30 >= 3x10 against the OLD hb, fine) ends
+         * at hb=20/stale=30 -- a staleness window shorter than the
+         * minimum beats, which declares healthy peers dead. That is
+         * precisely the failure the floor exists to prevent.
+         *
+         * One mutex for the module: writing this file is an operator
+         * action, never a hot path.
+         */
+        mutex_lock(&cetrafs_controls_lock);
 
         if (!strcmp(key, "hb_interval_secs")) {
             /* Range, then the ratio against the CURRENT stale_secs. The
@@ -507,30 +559,36 @@ static ssize_t cetrafs_proc_controls_write(struct file *file, const char __user 
             if (v < CETRAFS_HB_INTERVAL_MIN_SECS || v > CETRAFS_HB_INTERVAL_MAX_SECS) {
                 pr_warn("%s: controls: hb_interval_secs=%u out of range [%u,%u]\n", sb->s_id, v,
                         CETRAFS_HB_INTERVAL_MIN_SECS, CETRAFS_HB_INTERVAL_MAX_SECS);
-                return -EINVAL;
+                { trc = -EINVAL; goto timing_out; }
             }
             if (cetrafs_sb_stale_secs(sb) < (unsigned int) CETRAFS_STALE_MIN_BEATS * v) {
                 pr_warn("%s: controls: hb_interval_secs=%u would leave stale_secs=%u below %u beats; "
                         "raise stale_secs first\n",
                         sb->s_id, v, cetrafs_sb_stale_secs(sb), CETRAFS_STALE_MIN_BEATS);
-                return -EINVAL;
+                { trc = -EINVAL; goto timing_out; }
             }
+            if (cetrafs_controls_delay_ms)
+                msleep(cetrafs_controls_delay_ms); /* test-only: the gap between the cross-check and this write */
             cetrafs_sb_set_hb_interval_secs(sb, v);
         } else {
             if (v < CETRAFS_STALE_MIN_SECS || v > CETRAFS_STALE_MAX_SECS) {
                 pr_warn("%s: controls: stale_secs=%u out of range [%u,%u]\n", sb->s_id, v, CETRAFS_STALE_MIN_SECS,
                         CETRAFS_STALE_MAX_SECS);
-                return -EINVAL;
+                { trc = -EINVAL; goto timing_out; }
             }
             if (v < (unsigned int) CETRAFS_STALE_MIN_BEATS * cetrafs_sb_hb_interval_secs(sb)) {
                 pr_warn("%s: controls: stale_secs=%u is below %u x hb_interval_secs=%u\n", sb->s_id, v,
                         CETRAFS_STALE_MIN_BEATS, cetrafs_sb_hb_interval_secs(sb));
-                return -EINVAL;
+                { trc = -EINVAL; goto timing_out; }
             }
+            if (cetrafs_controls_delay_ms)
+                msleep(cetrafs_controls_delay_ms); /* test-only: the gap between the cross-check and this write */
             cetrafs_sb_set_stale_secs(sb, v);
         }
         pr_info("%s: controls: %s -> %u\n", sb->s_id, key, v);
-        return len;
+timing_out:
+        mutex_unlock(&cetrafs_controls_lock);
+        return trc;
     }
 
     if (cetrafs_proc_parse_bool(val, &on))

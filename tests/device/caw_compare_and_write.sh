@@ -166,6 +166,23 @@ echo "$RUN_LOG" | grep -q "CAS selftest: PASSED" &&
     pass "cas: single-threaded CAS round trip" ||
     fail "cas: self-test did not pass: $(echo "$RUN_LOG" | grep 'CAS selftest')"
 
+# PASSED is only worth something if the checks behind it ran. The
+# timed-out-command phase is guarded on the device having atomic CAW, so
+# on anything else it is silently absent and PASSED would mean less than
+# it looks. Name the two cases explicitly.
+#
+# What they guard: a timeout says the HOST stopped waiting, not that the
+# command was not executed. Re-issuing it -- which the multipath retry
+# used to do unconditionally -- MISCOMPAREs if the first one landed, the
+# CAS layer reads that as a lost race and runs the mutator again, and a
+# mutator that adds a delta applies it TWICE. Measured on this hardware
+# before the fix as 0x10 -> 0x12.
+for CASE in lost landed; do
+    echo "$RUN_LOG" | grep -q "a timed-out ($CASE) command applied the delta exactly once" &&
+        pass "cas: a timed-out command that was $CASE applied its delta exactly once" ||
+        fail "cas: the timed-out-$CASE check did not run or did not pass: $(echo "$RUN_LOG" | grep -i 'timed out\|timed-out' | head -2)"
+done
+
 # The assertion this whole script exists for. Every increment that
 # returned success must be present in the final counter: a CAS that
 # overwrote a value it never compared against would show up here as a

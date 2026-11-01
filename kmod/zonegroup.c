@@ -184,8 +184,35 @@ struct cetrafs_zg_cas_ctx {
     u32 steal_from; /* meaningful only when allow_steal */
 };
 
+/*
+ * The hot half of the image a mutator was handed, verified before any
+ * of its fields is believed.
+ *
+ * The image comes off the device inside the swap, independently of
+ * whatever the caller read: a mutator that keeps the fields it does not
+ * change, then stamps a fresh checksum, turns a torn or corrupt record
+ * into one that passes every check from then on. Same reasoning as
+ * inode.c's namespace mutator; this is the Zone Group record's half of
+ * it.
+ *
+ * -EUCLEAN, not a retry: cetrafs_cas_region() already re-reads and
+ * re-runs the mutator on a MISCOMPARE, so a tear that settles never
+ * reaches here.
+ */
+static bool cetrafs_zg_image_ok(const void *image)
+{
+    const cetrafs_zone_group_t *zg = image;
+
+    return cetrafs_zg_hot_crc(image) == (u32) le64_to_cpu(zg->hot_checksum);
+}
+
 static int cetrafs_zg_cas_mutate(void *image, unsigned int len, void *priv)
 {
+    if (!cetrafs_zg_image_ok(image)) {
+        pr_warn_ratelimited("ZG CAS: the record on the device fails its checksum -- refusing to stamp a fresh one\n");
+        return -EUCLEAN;
+    }
+
     struct cetrafs_zg_cas_ctx *ctx = priv;
     cetrafs_zone_group_t *zg = (cetrafs_zone_group_t *) image; /* hot fields only */
     u16 owner = le16_to_cpu(zg->owner_node_id);
@@ -307,6 +334,11 @@ struct cetrafs_zg_delta_ctx {
 
 static int cetrafs_zg_delta_mutate(void *image, unsigned int len, void *priv)
 {
+    if (!cetrafs_zg_image_ok(image)) {
+        pr_warn_ratelimited("ZG CAS: the record on the device fails its checksum -- refusing to stamp a fresh one\n");
+        return -EUCLEAN;
+    }
+
     struct cetrafs_zg_delta_ctx *ctx = priv;
     cetrafs_zone_group_t *zg = (cetrafs_zone_group_t *) image; /* hot fields only */
     s64 cur = (s64) le64_to_cpu(zg->free_data_blocks);
@@ -383,6 +415,11 @@ struct cetrafs_zg_pool_ctx {
 
 static int cetrafs_zg_pool_mutate(void *image, unsigned int len, void *priv)
 {
+    if (!cetrafs_zg_image_ok(image)) {
+        pr_warn_ratelimited("ZG CAS: the record on the device fails its checksum -- refusing to stamp a fresh one\n");
+        return -EUCLEAN;
+    }
+
     struct cetrafs_zg_pool_ctx *ctx = priv;
     cetrafs_zone_group_t *zg = (cetrafs_zone_group_t *) image;
     s64 cur = (s64) le64_to_cpu(zg->pool_free_blocks);

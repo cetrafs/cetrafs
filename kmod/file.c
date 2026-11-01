@@ -59,6 +59,7 @@ static int cetrafs_release(struct inode *inode, struct file *file);
 static int cetrafs_fsync(struct file *file, loff_t start, loff_t end, int datasync);
 static long cetrafs_fallocate(struct file *file, int mode, loff_t offset, loff_t len);
 static long cetrafs_ioctl(struct file *file, unsigned int cmd, unsigned long arg);
+static int cetrafs_file_mmap(struct file *file, struct vm_area_struct *vma);
 
 /*
  * .open/.release (lock.c) enforce the cross-node exclusive open lock
@@ -68,6 +69,89 @@ static long cetrafs_ioctl(struct file *file, unsigned int cmd, unsigned long arg
  */
 static loff_t cetrafs_llseek(struct file *file, loff_t offset, int whence);
 
+/*
+ * A shared writable mapping is the one write path that never calls
+ * .write_begin, so with generic_file_mmap's vm_ops it reached
+ * cetrafs_get_block() for the first time in WRITEBACK: unlocked, in
+ * kswapd or a flusher thread, long after the store. Two consequences,
+ * both measured:
+ *
+ *  - a store over a hole allocated at writeback, so -ENOSPC arrived
+ *    where nobody is left to tell. POSIX says a mapping whose backing
+ *    store cannot be allocated raises SIGBUS at the store; cetrafs
+ *    dropped the data and reported nothing to the storing process.
+ *
+ *  - the allocation mutated the extent tree with no inode_lock, while
+ *    write(2)/fallocate/truncate mutate it holding one.
+ *
+ * Allocating here, at fault time, answers both: block_page_mkwrite()
+ * calls get_block with create=1 while the folio is locked, so the
+ * writeback that follows finds every buffer mapped, and an -ENOSPC
+ * becomes the SIGBUS the caller can see.
+ *
+ * invalidate_lock (shared) is the other half: punch/truncate/fallocate
+ * hold it EXCLUSIVELY while they drop the page cache and free blocks.
+ * Without it a fault lands between those two steps, re-instantiates the
+ * folio over extents that are about to disappear, and its buffers keep
+ * pointing at blocks the allocator has since handed to another file --
+ * writeback then overwrites that file. Measured on a full volume:
+ * 1048320 of 1048576 bytes of an unrelated file replaced.
+ */
+static vm_fault_t cetrafs_page_mkwrite(struct vm_fault *vmf)
+{
+    struct vm_area_struct *vma = vmf->vma;
+    struct inode *inode = file_inode(vma->vm_file);
+    int ret;
+
+    if (cetrafs_sb_is_fenced(inode->i_sb))
+        return VM_FAULT_SIGBUS; /* self-fenced: no new dirty data */
+
+    sb_start_pagefault(inode->i_sb);
+    file_update_time(vma->vm_file);
+
+    /*
+     * EXCLUSIVE, not shared, and the difference is data.
+     *
+     * This call ALLOCATES: get_block reads the record, appends an
+     * extent and stages the result. Every other mutator of that tree
+     * runs under inode_lock, which a fault cannot take -- so shared
+     * here let an mmap store and a write(2) to the same file append
+     * from the same starting record and one overwrite the other.
+     * Measured over 512 blocks of a sparse file written both ways at
+     * once: 56 blocks of write(2) data lost and 74 blocks leaked.
+     *
+     * Exclusive here plus the same lock around write_begin and the
+     * punch/truncate/fallocate paths makes invalidate_lock the one
+     * thing serialising extent-tree mutation, which is what the fault
+     * path needed and inode_lock could never give it.
+     */
+    filemap_invalidate_lock(inode->i_mapping);
+    ret = block_page_mkwrite(vma, vmf, cetrafs_get_block);
+    filemap_invalidate_unlock(inode->i_mapping);
+
+    sb_end_pagefault(inode->i_sb);
+    return vmf_fs_error(ret); /* 0 -> VM_FAULT_LOCKED, -ENOSPC -> SIGBUS */
+}
+
+static const struct vm_operations_struct cetrafs_file_vm_ops = {
+    .fault = filemap_fault,
+    .map_pages = filemap_map_pages,
+    .page_mkwrite = cetrafs_page_mkwrite,
+};
+
+/* generic_file_mmap() still does the useful part (the readahead checks
+ * and file_accessed); only the vm_ops need replacing. Kept on .mmap
+ * rather than the newer .mmap_prepare so the module still builds
+ * against the kernels this ships to. */
+static int cetrafs_file_mmap(struct file *file, struct vm_area_struct *vma)
+{
+    int ret = generic_file_mmap(file, vma);
+
+    if (!ret)
+        vma->vm_ops = &cetrafs_file_vm_ops;
+    return ret;
+}
+
 const struct file_operations cetrafs_file_ops = {
     .owner = THIS_MODULE,
     .open = cetrafs_open,
@@ -75,7 +159,7 @@ const struct file_operations cetrafs_file_ops = {
     .llseek = cetrafs_llseek,
     .read_iter = generic_file_read_iter,
     .write_iter = generic_file_write_iter,
-    .mmap = generic_file_mmap,
+    .mmap = cetrafs_file_mmap,
     .fsync = cetrafs_fsync,
     .fallocate = cetrafs_fallocate,
     /*
@@ -142,12 +226,8 @@ static ssize_t cetrafs_direct_IO(struct kiocb *iocb, struct iov_iter *iter)
  * They should all end up here -- extents are this file's business --
  * but that migration is not worth bundling into an unrelated change.
  */
-struct cetrafs_inode_extents {
-    struct buffer_head *leaf_bh; /* held for depth 1 (arr points into it); NULL otherwise */
-    cetrafs_extent_t *heap;      /* depth 2: a flattened copy, freed by _put; NULL otherwise */
-    const cetrafs_extent_t *arr;
-    u32 entries; /* u32: a depth-2 tree can hold far more than 65535 extents */
-};
+/* struct cetrafs_inode_extents now lives in kmod.h -- evict holds one
+ * across the arbitration, see cetrafs_free_fetched_extents(). */
 
 /*
  * Drop every CACHED external block of this file's extent tree.
@@ -249,7 +329,19 @@ int cetrafs_tree_flatten(struct inode *inode, const cetrafs_inode_t *raw, cetraf
 
             if (n + ln > cap) {
                 u32 ncap = max_t(u32, cap ? cap * 2 : 512, n + ln);
-                cetrafs_extent_t *narr = krealloc(arr, (size_t) ncap * sizeof(*narr), GFP_NOFS);
+                /*
+                 * kv-, not k-. kmalloc wants PHYSICALLY CONTIGUOUS
+                 * memory and gives up past KMALLOC_MAX_SIZE, which at
+                 * 16 bytes per extent is 262144 of them -- a 1 GiB
+                 * file whose every block is its own extent. The
+                 * failure did not stop at "flatten returned -ENOMEM":
+                 * evict frees the inode NUMBER and then asks this for
+                 * the blocks to free, so the number went back and the
+                 * file's blocks stayed allocated, referenced by
+                 * nothing. A fragmented file big enough to matter is
+                 * exactly the one a VM image becomes.
+                 */
+                cetrafs_extent_t *narr = kvrealloc(arr, (size_t) ncap * sizeof(*narr), GFP_NOFS);
 
                 if (!narr) {
                     brelse(lbh);
@@ -272,7 +364,7 @@ int cetrafs_tree_flatten(struct inode *inode, const cetrafs_inode_t *raw, cetraf
     return 0;
 
 fail:
-    kfree(arr);
+    kvfree(arr);
     return ret;
 }
 
@@ -406,8 +498,24 @@ int cetrafs_raw_inode_for_each_owned_block(struct super_block *sb,
     return 0;
 }
 
-static int cetrafs_inode_extents_get(struct inode *inode, const cetrafs_inode_t *raw, struct cetrafs_inode_extents *ex)
+/*
+ * Test-only: make the extent-list fetch fail once.
+ *
+ * The real failures are an I/O error on a leaf and an allocation
+ * failure flattening a large tree -- neither is reachable on demand,
+ * and the consequence (the inode number freed while its blocks stay
+ * allocated and unnamed) is permanent, so it needs to be reachable.
+ */
+static bool cetrafs_extents_fetch_fail_once;
+module_param_named(extents_fetch_fail_once, cetrafs_extents_fetch_fail_once, bool, 0644);
+MODULE_PARM_DESC(extents_fetch_fail_once, "TEST ONLY: the next extent-list fetch fails");
+
+int cetrafs_inode_extents_get(struct inode *inode, const cetrafs_inode_t *raw, struct cetrafs_inode_extents *ex)
 {
+    if (cetrafs_extents_fetch_fail_once) {
+        cetrafs_extents_fetch_fail_once = false;
+        return -ENOMEM; /* test-only, see the knob */
+    }
     u64 leaf_lba;
 
     ex->leaf_bh = NULL;
@@ -444,11 +552,11 @@ static int cetrafs_inode_extents_get(struct inode *inode, const cetrafs_inode_t 
     return 0;
 }
 
-static void cetrafs_inode_extents_put(struct cetrafs_inode_extents *ex)
+void cetrafs_inode_extents_put(struct cetrafs_inode_extents *ex)
 {
     if (ex->leaf_bh)
         brelse(ex->leaf_bh);
-    kfree(ex->heap);
+    kvfree(ex->heap);
     ex->leaf_bh = NULL;
     ex->heap = NULL;
 }
@@ -624,19 +732,52 @@ int cetrafs_fiemap(struct inode *inode, struct fiemap_extent_info *fi, u64 start
     cursor = 0; /* lowest ee_block not yet emitted */
     for (;;) {
         u64 best_start = U64_MAX, best_len = 0, best_phys = 0;
+        bool best_uninit = false;
         u64 logical, phys, blen;
         u32 flags = 0;
         u32 i;
 
+        /* The array is unsorted, so each step is a scan. On a tree with
+         * hundreds of thousands of extents that is a long time to hold
+         * a CPU without offering it up. */
+        cond_resched();
+
         for (i = 0; i < ex.entries; i++) {
             u64 s = cetrafs_le32(ex.arr[i].ee_block);
+            u64 l = cetrafs_extent_len(ex.arr[i].ee_len);
 
+            /*
+             * A zero-length extent is not an extent, and this loop
+             * advances by exactly the length it just reported:
+             * `cursor = best_start + best_len`. Pick one of those and
+             * the cursor stops moving, the same entry is chosen again
+             * on every pass, and the walk spins forever -- holding
+             * inode_lock_shared, so it takes the rest of the file's
+             * readers down with it. Any user can ask for this.
+             *
+             * It cannot be reported either: a length of zero is not an
+             * answer fiemap has a way to express. Skip it, loudly --
+             * it is corruption, and the right place to notice that is
+             * fsck, not a hung task.
+             */
+            if (!l) {
+                pr_err_ratelimited("ino=%llu: extent at block %llu has zero length -- skipping it (fsck)\n",
+                                   (unsigned long long) inode->i_ino, (unsigned long long) s);
+                continue;
+            }
             if (s < cursor)
                 continue;
             if (s < best_start) {
                 best_start = s;
-                best_len = cetrafs_extent_len(ex.arr[i].ee_len);
+                best_len = l;
                 best_phys = cetrafs_extent_phys_from_hilo(ex.arr[i].ee_start_hi, ex.arr[i].ee_start_lo);
+                /* Preallocated and never written: the blocks are real
+                 * and mapped, the CONTENT is not there yet. fiemap has
+                 * a flag that says exactly this, and leaving it off
+                 * reported a fallocate'd range as ordinary data --
+                 * which is what filefrag and every backup tool that
+                 * reads extents would then believe. */
+                best_uninit = cetrafs_extent_is_uninit(ex.arr[i].ee_len);
             }
         }
         if (best_start == U64_MAX)
@@ -658,6 +799,11 @@ int cetrafs_fiemap(struct inode *inode, struct fiemap_extent_info *fi, u64 start
             bool more = false;
 
             for (i = 0; i < ex.entries; i++) {
+                /* Same exclusion as the selection above: a zero-length
+                 * entry is never reported, so it cannot be what makes
+                 * this one not the last. */
+                if (!cetrafs_extent_len(ex.arr[i].ee_len))
+                    continue;
                 if (cetrafs_le32(ex.arr[i].ee_block) >= cursor) {
                     more = true;
                     break;
@@ -665,6 +811,8 @@ int cetrafs_fiemap(struct inode *inode, struct fiemap_extent_info *fi, u64 start
             }
             if (!more)
                 flags |= FIEMAP_EXTENT_LAST;
+        if (best_uninit)
+            flags |= FIEMAP_EXTENT_UNWRITTEN;
         }
 
         ret = fiemap_fill_next_extent(fi, logical, phys, blen, flags);
@@ -772,6 +920,37 @@ void cetrafs_tree_free_meta(struct inode *inode, const cetrafs_inode_t *raw);
  * (kept for its two existing callers), this works on any inode's raw
  * record: only dir->i_sb is used.
  */
+/*
+ * Free the data extents of an ALREADY-FETCHED list, then the tree's
+ * own meta blocks.
+ *
+ * Split from the fetch deliberately. Evict frees the inode NUMBER
+ * first -- the bitmap CAS is what arbitrates between two evicts and
+ * the scrub, so it has to come first -- and only then the blocks. If
+ * the tree turned out to be unreadable at that point, the number was
+ * already back in the pool and the blocks stayed allocated, referenced
+ * by a record the next file to take the number would overwrite. A
+ * permanent, untraceable leak.
+ *
+ * evict_inode says exactly this about a failed RECORD read, three
+ * screens above where it frees: "the only evidence of which blocks
+ * leaked disappears the moment some later file reuses the number." The
+ * reasoning was right and covered one of the two ways the read can
+ * fail. So the list is fetched BEFORE the arbitration now, and a fetch
+ * that fails refuses the whole eviction rather than half of it.
+ */
+void cetrafs_free_fetched_extents(struct inode *dir, const cetrafs_inode_t *raw, struct cetrafs_inode_extents *ex)
+{
+    struct super_block *sb = dir->i_sb;
+    u32 i;
+
+    for (i = 0; i < ex->entries; i++)
+        cetrafs_free_data_extent(sb, cetrafs_extent_phys_from_hilo(ex->arr[i].ee_start_hi, ex->arr[i].ee_start_lo),
+                                 cetrafs_extent_len(ex->arr[i].ee_len));
+    if (cetrafs_le16(raw->eh.eh_depth) != 0)
+        cetrafs_tree_free_meta(dir, raw);
+}
+
 void cetrafs_free_inline_extents(struct inode *dir, const cetrafs_inode_t *raw)
 {
     struct super_block *sb = dir->i_sb;
@@ -1540,12 +1719,36 @@ static void cetrafs_leaf_array_range(const cetrafs_extent_t *arr, u16 n, u32 *ou
 
     for (i = 0; i < n; i++) {
         u32 eb = cetrafs_le32(arr[i].ee_block);
-        u32 end = eb + cetrafs_extent_len(arr[i].ee_len);
+        u64 end = (u64) eb + cetrafs_extent_len(arr[i].ee_len);
+
+        /*
+         * In 64 bits, because the sum does not fit in 32.
+         *
+         * A legal block number runs to CETRAFS_MAX_FILE_BLOCKS - 1, so
+         * an extent reaching the last block ends at exactly 2^32 and
+         * wrapped this to 0 -- which is not merely wrong, it is wrong
+         * in the UNSAFE direction: 0 does not raise 'hi', so a leaf
+         * holding that extent plus any lower one advertises a range
+         * that EXCLUDES it, and the walk then skips the leaf and reads
+         * the block as a hole.
+         *
+         * An unrepresentable end becomes UNKNOWN (the 0 that means
+         * "read this child anyway"), never a smaller number. Through
+         * the VFS this is unreachable -- s_maxbytes stops one block
+         * short, measured as EFBIG at block 2^32-1 -- so what it
+         * defends against is a corrupt leaf steering the walk away from
+         * blocks that are really there.
+         */
+        if (end > U32_MAX) {
+            *out_lo = 0;
+            *out_hi = 0; /* unknown: never skipped */
+            return;
+        }
 
         if (eb < lo)
             lo = eb;
         if (end > hi)
-            hi = end;
+            hi = (u32) end;
     }
     if (lo == U32_MAX)
         lo = 0;
@@ -1930,7 +2133,7 @@ int cetrafs_tree_build(struct inode *inode, const cetrafs_extent_t *flat, u32 n,
         return -ENOSPC;
     total = nleaves + ninter;
 
-    blk = kmalloc_array(total, sizeof(*blk), GFP_NOFS);
+    blk = kvmalloc_array(total, sizeof(*blk), GFP_NOFS);
     if (!blk)
         return -ENOMEM;
 
@@ -1998,14 +2201,14 @@ int cetrafs_tree_build(struct inode *inode, const cetrafs_extent_t *flat, u32 n,
         }
     }
     *out_meta = total;
-    kfree(blk);
+    kvfree(blk);
     return 0;
 
 fail:
     /* free whatever we claimed; the caller's old tree is untouched */
     for (i = 0; i < allocated; i++)
         cetrafs_free_data_block(sb, blk[i]);
-    kfree(blk);
+    kvfree(blk);
     return ret;
 }
 
@@ -2419,8 +2622,23 @@ static int cetrafs_tree_append(struct inode *inode,
 
     /* ---- depth 2: interiors ---- */
     {
-        u32 last = cetrafs_le16(raw->eh.eh_entries) - 1;
-        u64 ilba = cetrafs_extent_phys_from_hilo(raw->et.idx[last].ei_leaf_hi, raw->et.idx[last].ei_leaf_lo);
+        /* A depth-2 tree with no root slots is not a tree this code can
+         * append to, and "last = entries - 1" on zero wraps to
+         * 0xffffffff and indexes far outside the record. The upper
+         * bound is enforced where the record is read; the lower one has
+         * to be here, because an empty root is a legal intermediate
+         * state rather than corruption. */
+        u32 entries = cetrafs_le16(raw->eh.eh_entries);
+        u32 last;
+        u64 ilba;
+
+        if (entries == 0 || entries > ARRAY_SIZE(raw->et.idx)) {
+            pr_err_ratelimited("ino=%llu: depth-2 tree with %u root slot(s) -- refusing to append\n",
+                               (unsigned long long) inode->i_ino, entries);
+            return -EUCLEAN;
+        }
+        last = entries - 1;
+        ilba = cetrafs_extent_phys_from_hilo(raw->et.idx[last].ei_leaf_hi, raw->et.idx[last].ei_leaf_lo);
         struct buffer_head *ibh = cetrafs_read_index_bh(inode, ilba);
         cetrafs_extent_hdr_t *ihdr;
         cetrafs_extent_idx_t *iarr;
@@ -2434,6 +2652,14 @@ static int cetrafs_tree_append(struct inode *inode,
             return -EIO;
         ihdr = (cetrafs_extent_hdr_t *) ibh->b_data;
         iarr = (cetrafs_extent_idx_t *) (ibh->b_data + sizeof(*ihdr));
+        /* Same wrap, one level down -- and unlike the sibling walk in
+         * cetrafs_tree_last_contig_lba(), this one had no zero check. */
+        if (cetrafs_le16(ihdr->eh_entries) == 0) {
+            pr_err_ratelimited("ino=%llu: interior %llu has no entries -- refusing to append\n",
+                               (unsigned long long) inode->i_ino, (unsigned long long) ilba);
+            brelse(ibh);
+            return -EUCLEAN;
+        }
         llba = cetrafs_extent_phys_from_hilo(iarr[cetrafs_le16(ihdr->eh_entries) - 1].ei_leaf_hi,
                                              iarr[cetrafs_le16(ihdr->eh_entries) - 1].ei_leaf_lo);
 
@@ -3051,6 +3277,28 @@ static int cetrafs_read_folio(struct file *file, struct folio *folio)
     return block_read_full_folio(folio, cetrafs_get_block);
 }
 
+/*
+ * The body of .write_begin, for callers that ALREADY hold
+ * mapping->invalidate_lock.
+ *
+ * invalidate_lock is not recursive, and cetrafs_zero_range() reaches
+ * this from inside the punch path, which holds it for the whole
+ * operation -- so routing that through the locking wrapper deadlocked
+ * the caller against itself. Four fallocate(ZERO_RANGE) actors wedged
+ * in D state, unkillable, taking the mount with them (churn_oracle.sh,
+ * on the gate run of the commit that introduced it).
+ *
+ * The split is the fix and the documentation: a path that holds the
+ * lock calls this, a path that does not calls cetrafs_write_begin().
+ */
+static int cetrafs_write_begin_held(struct address_space *mapping, loff_t pos, unsigned len, struct folio **foliop)
+{
+    if (cetrafs_sb_is_fenced(mapping->host->i_sb))
+        return -EIO; /* self-fenced: no new dirty data */
+
+    return block_write_begin(mapping, pos, len, foliop, cetrafs_get_block);
+}
+
 static int cetrafs_write_begin(const struct kiocb *iocb,
                                struct address_space *mapping,
                                loff_t pos,
@@ -3058,10 +3306,18 @@ static int cetrafs_write_begin(const struct kiocb *iocb,
                                struct folio **foliop,
                                void **fsdata)
 {
-    if (cetrafs_sb_is_fenced(mapping->host->i_sb))
-        return -EIO; /* self-fenced: no new dirty data */
+    int ret;
 
-    return block_write_begin(mapping, pos, len, foliop, cetrafs_get_block);
+    /* block_write_begin() allocates through cetrafs_get_block(). The
+     * caller holds inode_lock, which excludes the other write paths but
+     * NOT a page fault -- see cetrafs_page_mkwrite(), which takes this
+     * same lock for the same reason. Held across this call only: the
+     * copy_from_user() that follows happens in the VFS, after we
+     * return, and may itself fault. */
+    filemap_invalidate_lock(mapping);
+    ret = cetrafs_write_begin_held(mapping, pos, len, foliop);
+    filemap_invalidate_unlock(mapping);
+    return ret;
 }
 
 /*
@@ -3093,6 +3349,19 @@ static int cetrafs_writepages(struct address_space *mapping, struct writeback_co
  * external extent leaf unreachable, and nothing a test can supply makes
  * it fail on its own.
  */
+/*
+ * TEST ONLY: hold the punch open after the page cache is dropped and
+ * before the blocks behind it are freed.
+ *
+ * That gap is where a page fault must not be allowed to re-instantiate
+ * a folio -- in production it is a tree build plus a synchronous record
+ * write, so a real workload hits it; a test needs it held open to hit
+ * it every time. See tests/kernel/mmap_vs_punch.sh.
+ */
+static unsigned int cetrafs_punch_pagecache_delay_ms;
+module_param_named(punch_pagecache_delay_ms, cetrafs_punch_pagecache_delay_ms, uint, 0644);
+MODULE_PARM_DESC(punch_pagecache_delay_ms, "TEST ONLY: pause inside punch between the page-cache drop and the free");
+
 static bool cetrafs_fail_extent_record_write;
 module_param_named(fail_extent_record_write, cetrafs_fail_extent_record_write, bool, 0644);
 MODULE_PARM_DESC(fail_extent_record_write, "TEST ONLY: fail the record write in truncate/punch-hole");
@@ -3164,9 +3433,10 @@ static int cetrafs_truncate_shrink(struct inode *inode, loff_t new_size)
      * dry run would see count+1 > max and refuse with -ENOSPC, freeing
      * NOTHING -- the punched blocks then leak (bitmap set, no extent).
      * The split write also needs the room. (new_flat gets the same +2.) */
-    old_flat = kmalloc_array(old_n + 2, sizeof(*old_flat), GFP_NOFS);
+    old_flat = kvmalloc_array(old_n + 2, sizeof(*old_flat), GFP_NOFS);
     if (!old_flat) {
         cetrafs_inode_extents_put(&ex);
+        kfree(recs); /* 2 KiB, leaked on this path and the next one */
         return -ENOMEM;
     }
     if (old_n)
@@ -3174,9 +3444,10 @@ static int cetrafs_truncate_shrink(struct inode *inode, loff_t new_size)
     cetrafs_inode_extents_put(&ex);
 
     /* Trim a COPY to the kept set. */
-    new_flat = kmalloc_array(old_n ? old_n : 1, sizeof(*new_flat), GFP_NOFS);
+    new_flat = kvmalloc_array(old_n ? old_n : 1, sizeof(*new_flat), GFP_NOFS);
     if (!new_flat) {
-        kfree(old_flat);
+        kvfree(old_flat);
+        kfree(recs);
         return -ENOMEM;
     }
     if (old_n)
@@ -3187,8 +3458,8 @@ static int cetrafs_truncate_shrink(struct inode *inode, loff_t new_size)
      * tree is still fully intact on disk until we publish below. */
     ret = cetrafs_tree_build(inode, new_flat, kept, &raw, &meta_blocks);
     if (ret) {
-        kfree(new_flat);
-        kfree(old_flat);
+        kvfree(new_flat);
+        kvfree(old_flat);
         kfree(recs);
         return ret;
     }
@@ -3222,8 +3493,8 @@ static int cetrafs_truncate_shrink(struct inode *inode, loff_t new_size)
     }
     if (ret) {
         cetrafs_tree_free_meta(inode, &raw);
-        kfree(new_flat);
-        kfree(old_flat);
+        kvfree(new_flat);
+        kvfree(old_flat);
         kfree(recs);
         return ret;
     }
@@ -3241,8 +3512,8 @@ static int cetrafs_truncate_shrink(struct inode *inode, loff_t new_size)
     cetrafs_tree_free_meta(inode, &old_raw);
     cetrafs_leaf_array_trim(sb, old_flat, old_n, new_block_count, &discard, /*do_free=*/true);
 
-    kfree(new_flat);
-    kfree(old_flat);
+    kvfree(new_flat);
+    kvfree(old_flat);
     inode->i_blocks = cetrafs_le64(raw.blocks);
     kfree(recs);
     return 0;
@@ -3277,13 +3548,13 @@ static int cetrafs_truncate_shrink(struct inode *inode, loff_t new_size)
 static int cetrafs_zero_range(struct address_space *mapping, loff_t from, size_t len)
 {
     struct folio *folio;
-    void *fsdata;
+    void *fsdata = NULL; /* block_write_begin() sets none; generic_write_end() ignores it here */
     int ret;
 
     if (!len)
         return 0;
 
-    ret = cetrafs_write_begin(NULL, mapping, from, len, &folio, &fsdata);
+    ret = cetrafs_write_begin_held(mapping, from, len, &folio); /* the punch holds invalidate_lock */
     if (ret)
         return ret;
 
@@ -3308,6 +3579,18 @@ static int cetrafs_zero_range(struct address_space *mapping, loff_t from, size_t
  * Blocks already mapped are skipped -- fallocate must not disturb data
  * that is already there, and must not double-allocate.
  */
+/*
+ * Test-only: slow the per-block allocation loop down.
+ *
+ * Killability cannot be tested by asking for a huge range: the loop
+ * ends at ENOSPC, which on any image a test can afford arrives in well
+ * under a second. This makes the loop long without making the device
+ * big, so a SIGKILL has something to land in.
+ */
+static unsigned int cetrafs_fallocate_block_delay_us;
+module_param_named(fallocate_block_delay_us, cetrafs_fallocate_block_delay_us, uint, 0644);
+MODULE_PARM_DESC(fallocate_block_delay_us, "TEST ONLY: microseconds to spend per preallocated block");
+
 static int cetrafs_do_allocate(struct inode *inode, loff_t offset, loff_t len, bool keep_size)
 {
     struct super_block *sb = inode->i_sb;
@@ -3322,6 +3605,19 @@ static int cetrafs_do_allocate(struct inode *inode, loff_t offset, loff_t len, b
     if (end_block > CETRAFS_MAX_FILE_BLOCKS)
         return -EFBIG;
 
+    /*
+     * The format's ceiling is not the only one. Without KEEP_SIZE this
+     * grows i_size, so it is a size change and RLIMIT_FSIZE applies --
+     * inode_newsize_ok() is what enforces it (and raises SIGXFSZ), and
+     * it was simply never asked. A process under a 1 MiB file-size
+     * limit could preallocate terabytes.
+     */
+    if (!keep_size) {
+        ret = inode_newsize_ok(inode, end);
+        if (ret)
+            return ret;
+    }
+
     ret = cetrafs_read_raw_inode_overlaid(sb, inode, &raw); /* torn-read-safe vs a concurrent publish */
     if (ret)
         return ret;
@@ -3333,6 +3629,27 @@ static int cetrafs_do_allocate(struct inode *inode, loff_t offset, loff_t len, b
         u32 bg_id;
         u64 lba;
         bool merged;
+
+        /*
+         * One block per iteration, up to CETRAFS_MAX_FILE_BLOCKS of
+         * them, under inode_lock -- a 16 TiB request is billions of
+         * passes. Without these two lines it could neither be
+         * scheduled away from nor killed: fallocate(2) on a large
+         * range became an uninterruptible occupation of the CPU and
+         * the inode.
+         *
+         * Stopping early leaves the range PARTIALLY preallocated,
+         * which is allowed and is what the other filesystems do: the
+         * blocks already added are real, recorded and freeable. Losing
+         * them silently would be the worse answer.
+         */
+        if (fatal_signal_pending(current)) {
+            ret = -EINTR;
+            goto out;
+        }
+        cond_resched();
+        if (cetrafs_fallocate_block_delay_us)
+            usleep_range(cetrafs_fallocate_block_delay_us, cetrafs_fallocate_block_delay_us * 2);
         u32 leaf_count;
 
         ret = cetrafs_tree_lookup(inode, &raw, (u32) b, &lba, NULL, &un, &found);
@@ -3437,7 +3754,30 @@ static long cetrafs_fallocate(struct file *file, int mode, loff_t offset, loff_t
         long arc;
 
         inode_lock(inode);
+        /*
+         * Preallocation appends extents over what are holes right now,
+         * and a write fault allocating the same offset would append a
+         * second extent for it.
+         *
+         * HELD FOR THE WHOLE CALL, and that is the long one: a 1 GiB
+         * preallocation walks block by block and has been measured at
+         * 11 seconds, during which a page fault on this file waits.
+         * inode_lock already blocked write(2) for that long; this
+         * extends the wait to faults.
+         *
+         * Shortening it is not free. cetrafs_do_allocate() reads the
+         * record ONCE and appends to that copy for the whole loop, so
+         * releasing the lock part way means appending from a stale
+         * image while a fault mutates the real one -- the exact lost
+         * update this lock exists to prevent. A bounded hold would
+         * require re-reading the record at every release, which puts a
+         * record read back on a per-chunk path (docs/PERFORMANCE.md,
+         * invariant 2). Worth doing with a chunk size large enough to
+         * pay for it; not worth doing by simply moving the lock.
+         */
+        filemap_invalidate_lock(inode->i_mapping);
         arc = cetrafs_sb_is_fenced(sb) ? -EIO : cetrafs_do_allocate(inode, offset, len, mode & FALLOC_FL_KEEP_SIZE);
+        filemap_invalidate_unlock(inode->i_mapping);
         inode_unlock(inode);
         kfree(recs);
         return arc;
@@ -3449,9 +3789,55 @@ static long cetrafs_fallocate(struct file *file, int mode, loff_t offset, loff_t
     }
 
     inode_lock(inode);
+    /* And the same reason again for page faults, which hold no
+     * inode_lock at all: this excludes them from the window between
+     * dropping the cached folios below and freeing the blocks behind
+     * them. Taken for the whole call, including the no-op fast path --
+     * an uncontended rwsem is nothing next to the tree walk that
+     * follows, and one exit point cannot forget to drop it. */
+    filemap_invalidate_lock(inode->i_mapping);
     /* Same reason as cetrafs_truncate_shrink(): a punch frees blocks,
      * and in-flight direct I/O is aimed at the physical ones. */
     inode_dio_wait(inode);
+
+    /*
+     * And the same refusal truncate gives, for the same reason -- which
+     * cetrafs_setattr()'s own comment already states about BOTH of
+     * them: "a truncate/punch landing under [a peer's open file] both
+     * frees blocks the writer is still extending into and gets its
+     * extent removal reverted by the writer's eventual flush, leaving
+     * extents that reference FREE blocks."
+     *
+     * The reasoning covered punch; the guard was only ever added to
+     * truncate. Under `nofilelock` -- the mount mode a VM datastore
+     * actually runs in -- no exclusive claim exists for the claim check
+     * to see, so a peer writing an image while this node punches a hole
+     * in it was simply allowed.
+     *
+     * A peer with the file merely open is the same -ETXTBSY unlink
+     * gives. Punching a hole in a file another host is writing is not a
+     * meaningful operation on this workload.
+     */
+    {
+        u32 my_node_id;
+
+        ret = cetrafs_sb_get_node_id(sb, &my_node_id);
+        if (ret)
+            goto out;
+        {
+            bool blocked = false, reader = false;
+
+            ret = cetrafs_lock_foreign_user_exists(sb, inode->i_ino, my_node_id, &blocked, &reader);
+            if (ret)
+                goto out;
+            if (blocked || reader) {
+                pr_warn_ratelimited("punch: ino=%llu is open on another node -- refusing to free its blocks\n",
+                                    (unsigned long long) inode->i_ino);
+                ret = -ETXTBSY;
+                goto out;
+            }
+        }
+    }
 
     isize = i_size_read(inode);
     end = offset + len;
@@ -3466,12 +3852,37 @@ static long cetrafs_fallocate(struct file *file, int mode, loff_t offset, loff_t
     end_block = (u64) end / CETRAFS_BLOCK_SIZE; /* only whole blocks strictly inside [offset,end) get freed */
 
     if (start_block >= end_block) {
-        /* The whole hole fits inside a single block (or doesn't cover
-         * any whole block at all): zero exactly [offset, end) and free
-         * nothing -- the general boundary handling below assumes the
-         * two boundaries are in *different* blocks, which doesn't hold
-         * here. */
-        ret = cetrafs_zero_range(inode->i_mapping, offset, (size_t) (end - offset));
+        /*
+         * No WHOLE block lies inside [offset, end), so nothing is freed
+         * here -- the general boundary handling below assumes the two
+         * boundaries are in *different* blocks, which does not hold.
+         *
+         * But "covers no whole block" is NOT "lies within one block",
+         * and conflating the two was a kernel BUG reachable by any user
+         * with write access to a file: punching [PAGE_SIZE-1, +2)
+         * straddles a block boundary while covering no whole block, and
+         * the single zeroing below then handed block_write_begin() a
+         * range crossing the end of the folio it was given --
+         * `BUG_ON(to > folio_size)`, fs/buffer.c.
+         *
+         * Zeroing goes through the ordinary write path, which is given
+         * one folio at a time, so every range handed to it must stay
+         * inside one block. Split on the boundary. The two blocks are
+         * adjacent by construction: a gap of two would put a whole
+         * block inside the hole and we would not be here.
+         */
+        u64 first_block = (u64) offset / CETRAFS_BLOCK_SIZE;
+        u64 last_block = (u64) (end - 1) / CETRAFS_BLOCK_SIZE;
+
+        if (first_block == last_block) {
+            ret = cetrafs_zero_range(inode->i_mapping, offset, (size_t) (end - offset));
+        } else {
+            loff_t split = (loff_t) last_block * CETRAFS_BLOCK_SIZE;
+
+            ret = cetrafs_zero_range(inode->i_mapping, offset, (size_t) (split - offset));
+            if (!ret)
+                ret = cetrafs_zero_range(inode->i_mapping, split, (size_t) (end - split));
+        }
         goto out;
     }
 
@@ -3510,7 +3921,7 @@ static long cetrafs_fallocate(struct file *file, int mode, loff_t offset, loff_t
      * dry run would see count+1 > max and refuse with -ENOSPC, freeing
      * NOTHING -- the punched blocks then leak (bitmap set, no extent).
      * The split write also needs the room. (new_flat gets the same +2.) */
-    old_flat = kmalloc_array(old_n + 2, sizeof(*old_flat), GFP_NOFS);
+    old_flat = kvmalloc_array(old_n + 2, sizeof(*old_flat), GFP_NOFS);
     if (!old_flat) {
         cetrafs_inode_extents_put(&ex);
         ret = -ENOMEM;
@@ -3524,9 +3935,9 @@ static long cetrafs_fallocate(struct file *file, int mode, loff_t offset, loff_t
      * so +2 slack is ample; cetrafs_leaf_array_punch() dry-runs and
      * refuses up front if it would not fit, changing nothing. */
     new_cap = old_n + 2;
-    new_flat = kmalloc_array(new_cap, sizeof(*new_flat), GFP_NOFS);
+    new_flat = kvmalloc_array(new_cap, sizeof(*new_flat), GFP_NOFS);
     if (!new_flat) {
-        kfree(old_flat);
+        kvfree(old_flat);
         ret = -ENOMEM;
         goto out;
     }
@@ -3536,8 +3947,8 @@ static long cetrafs_fallocate(struct file *file, int mode, loff_t offset, loff_t
     ret = cetrafs_leaf_array_punch(sb, new_flat, &new_n, (u16) new_cap, start_block, end_block, &freed,
                                    /*do_free=*/false);
     if (ret) {
-        kfree(new_flat);
-        kfree(old_flat);
+        kvfree(new_flat);
+        kvfree(old_flat);
         goto out;
     }
 
@@ -3561,8 +3972,8 @@ static long cetrafs_fallocate(struct file *file, int mode, loff_t offset, loff_t
      */
     if (freed == 0 && new_n == (u16) old_n &&
         (old_n == 0 || !memcmp(new_flat, old_flat, (size_t) old_n * sizeof(*new_flat)))) {
-        kfree(new_flat);
-        kfree(old_flat);
+        kvfree(new_flat);
+        kvfree(old_flat);
         ret = 0;
         goto out;
     }
@@ -3576,11 +3987,14 @@ static long cetrafs_fallocate(struct file *file, int mode, loff_t offset, loff_t
      * its own right. */
     truncate_pagecache_range(inode, offset, end - 1);
 
+    if (cetrafs_punch_pagecache_delay_ms)
+        msleep(cetrafs_punch_pagecache_delay_ms); /* test-only; see the parameter */
+
     /* Build the fresh tree; the old one stays intact until we publish. */
     ret = cetrafs_tree_build(inode, new_flat, new_n, &raw, &meta_blocks);
     if (ret) {
-        kfree(new_flat);
-        kfree(old_flat);
+        kvfree(new_flat);
+        kvfree(old_flat);
         goto out;
     }
 
@@ -3600,8 +4014,8 @@ static long cetrafs_fallocate(struct file *file, int mode, loff_t offset, loff_t
     }
     if (ret) {
         cetrafs_tree_free_meta(inode, &raw);
-        kfree(new_flat);
-        kfree(old_flat);
+        kvfree(new_flat);
+        kvfree(old_flat);
         goto out;
     }
 
@@ -3616,8 +4030,8 @@ static long cetrafs_fallocate(struct file *file, int mode, loff_t offset, loff_t
         if (fret)
             pr_err("punch: freeing the old blocks failed (%d) -- %u block(s) may have leaked\n", fret, freed);
     }
-    kfree(new_flat);
-    kfree(old_flat);
+    kvfree(new_flat);
+    kvfree(old_flat);
 
     inode->i_blocks = cetrafs_le64(raw.blocks);
     inode_set_ctime(inode, ktime_get_real_seconds(), 0);
@@ -3630,6 +4044,7 @@ static long cetrafs_fallocate(struct file *file, int mode, loff_t offset, loff_t
         ret = sync_inode_metadata(inode, 1);
 
 out:
+    filemap_invalidate_unlock(inode->i_mapping);
     inode_unlock(inode);
     kfree(recs);
     return ret;
@@ -3723,10 +4138,16 @@ static int cetrafs_setattr_locked(struct mnt_idmap *idmap, struct dentry *dentry
     }
 
     if ((attr->ia_valid & ATTR_SIZE) && attr->ia_size != i_size_read(inode)) {
+        /* Shrinking frees blocks whose folios a concurrent fault would
+         * otherwise re-instantiate; growing changes the map a fault may
+         * be allocating into. Both exclude faults -- see
+         * cetrafs_page_mkwrite(), which takes this shared. */
+        filemap_invalidate_lock(inode->i_mapping);
         if (attr->ia_size < i_size_read(inode))
             ret = cetrafs_truncate_shrink(inode, attr->ia_size);
         else
             truncate_setsize(inode, attr->ia_size);
+        filemap_invalidate_unlock(inode->i_mapping);
 
         if (ret)
             return ret;
@@ -4011,13 +4432,44 @@ static long cetrafs_defrag_ioctl(struct file *file, struct cetrafs_defrag_stats 
     if (!(file->f_mode & FMODE_WRITE))
         return -EBADF; /* the write-open IS the cross-node exclusivity */
 
+    /*
+     * An ioctl that writes has to ask the MOUNT for permission, not
+     * just the file: FMODE_WRITE says this descriptor was opened for
+     * writing, and says nothing about the mount still being writable
+     * now. Every other write path here goes through the VFS, which
+     * takes this for them; an ioctl is on its own.
+     */
+    ret = mnt_want_write_file(file);
+    if (ret)
+        return ret;
+
+    /*
+     * And the flags that mean "do not touch this file". Relocation does
+     * not change a byte of content, but it rewrites the inode record
+     * and moves every block -- which is exactly what an immutable or
+     * append-only file is promised will not happen to it.
+     *
+     * NOT TESTED, and said plainly rather than left to look covered:
+     * cetrafs implements no FS_IOC_SETFLAGS, so neither flag can be set
+     * on one of its inodes from userspace at all, and nothing in the
+     * harness can reach this branch. It is here because the day the
+     * flag becomes settable is not the day anybody will remember to
+     * come back for it.
+     */
+    if (IS_IMMUTABLE(inode) || IS_APPEND(inode)) {
+        ret = -EPERM;
+        goto out_drop_write;
+    }
+
     /* Turned off for this mount: refuse rather than silently doing
      * nothing, so an operator who disabled it and then ran
      * defrag.cetra is told why. This is the gate that makes "nothing on
      * this mount pins a file's exclusive lock for an optimisation" true
      * -- the janitor's own switch leaves this path open. */
-    if (!cetrafs_sb_defrag_enabled(inode->i_sb))
-        return -EOPNOTSUPP;
+    if (!cetrafs_sb_defrag_enabled(inode->i_sb)) {
+        ret = -EOPNOTSUPP;
+        goto out_drop_write;
+    }
 
     /* Pin this node's exclusive lock for the pass (the caller's own
      * write-open already holds it, so this just marks it pinned and
@@ -4025,12 +4477,15 @@ static long cetrafs_defrag_ioctl(struct file *file, struct cetrafs_defrag_stats 
      * same incremental mover the background path uses. */
     ret = cetrafs_lock_defrag_begin(inode);
     if (ret)
-        return ret;
+        goto out_drop_write;
     ret = cetrafs_defrag_inode(inode, &stats);
     cetrafs_lock_defrag_end(inode);
 
     if (ret == 0 && uarg && copy_to_user(uarg, &stats, sizeof(stats)))
         ret = -EFAULT;
+
+out_drop_write:
+    mnt_drop_write_file(file);
     return ret;
 }
 

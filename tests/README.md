@@ -31,6 +31,9 @@ make check-one SUITE=kernel/nslock.sh
 make check-caw DEV=/dev/sdX    # DESTRUCTIVE: reformats that device
 make check-slow                # slow sparse/s_maxbytes test (loop-backed)
 make soak ROUNDS=20            # module must already be loaded
+
+make mod KASAN=1               # build for a KASAN kernel, then run as usual
+make mod LLVM=1                # build with clang (diagnostics; see below)
 ```
 
 `make check` is the single CI entry point.  It exits nonzero if any
@@ -43,6 +46,43 @@ run on its own does both itself, so either works.
 
 `device/` and `stress/` are never part of a group run: they take
 arguments, and one of them reformats whatever you name.
+
+### Clean up after a killed run, before starting the next one
+
+A gate that is interrupted does not unwind: it leaves its image, 2-3
+GiB of it, plus possibly a mount, a loop device and the module. The
+next run then starts with less room, dies earlier, and leaves another
+one. Five accumulated images took a box from comfortable to 8004 MiB
+free against the 7168 MiB floor, at which point every further run
+aborted instantly -- and from the inside that reads as runs failing
+for no reason, not as a disk problem.
+
+```
+pgrep -af 'run.sh|make check'            # nothing else running?
+umount <any cetrafs mount>; rmmod cetrafs
+losetup -D                               # free stray loop devices
+rm -f /root/cetrafs-*.img /tmp/cetrafs-*.img
+df -Pm /                                 # must clear CT_MIN_FREE_MB (7168)
+```
+
+### Running under KASAN
+
+`make mod KASAN=1` and then the ordinary suites. The flag only raises
+the pinned stack-frame budget to 2048 for that build: KASAN's redzones
+sit between locals, so a function measuring 900 bytes in the build that
+ships measures ~1300 under it, and the pin would reject a kernel it was
+never written to describe. Nothing else about the module changes.
+
+Worth doing: this build is what surfaced a four-deep recursion carrying
+half a kilobyte per frame, which a per-frame budget cannot see.
+
+**Do not expect it to cover field overreads.** KASAN instruments the
+bounds of allocations, not of fields inside them. A dirent claiming a
+4000-byte name is read out of a 255-byte field inside a 4096-byte
+block: the read never leaves the allocation and there is no report.
+Measured by removing the `name_len` validation and firing the poke from
+`hostile_fields.sh` -- silence. Those fields are defended by the
+explicit check at block-read time, and only by it.
 
 ## What is where
 
@@ -86,6 +126,15 @@ summary printed from the cleanup trap rather than the end of the script.
 tested, revert the fix (or disable the check) and watch *that* assertion
 fail.  Record which ones discriminate and which pass either way -- an
 assertion whose discriminating power you have not measured is a guess.
+
+**A failing assertion must SAY why, and `os._exit()` loses it.**  A
+suite's helper is usually a `python3 - <<'PY'` heredoc that prints what
+went wrong and then exits non-zero.  `os._exit()` skips the exit
+handlers, so a block-buffered stdout -- which it always is, piped to the
+runner -- is discarded: the suite correctly reports FAIL and prints
+nothing about it.  Call `sys.stdout.flush()` first, or use `sys.exit()`.
+Four suites in this tree had it, including one that was silently
+swallowing the reason for a SKIP.
 
 **Beware the thing that catches the fault first.**  The fence-lease tests
 asserted that a revoked lease gets noticed, and it always was -- by the

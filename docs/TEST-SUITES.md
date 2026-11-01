@@ -26,7 +26,7 @@ make check
 ```
 
 That is the gate. It runs every suite under `tests/image/` and
-`tests/kernel/` -- **164 suites, about 1757 individual assertions** --
+`tests/kernel/` -- **192 suites, 1918 individual assertions** --
 against a loop-backed volume, and exits nonzero if any assertion fails
 OR if any suite aborts without failing one. Nothing ships on a red gate.
 
@@ -39,9 +39,25 @@ override the threshold. A full run aborts immediately if the space is not
 available, rather than wasting 20+ minutes building a large image only to
 fail at the last suite on ENOSPC.
 
+**A killed run does not clean up after itself, and that compounds.**
+Each interrupted gate leaves its image behind -- 2 to 3 GiB apiece, in
+the working directory. Five of them took a box from comfortable to
+8004 MiB free against the 7168 MiB floor, at which point the next run
+aborted at once with `FATAL: only NNN MiB free`, leaving another image,
+and so on. The abort message names the real cause, but the spiral it
+belongs to does not look like a disk problem from the inside: it looks
+like runs dying for no reason, earlier each time.
+
+So after any interrupted run:
+
+```
+rm -f /root/cetrafs-*.img /tmp/cetrafs-*.img   # whatever the box uses
+df -Pm /                                       # confirm the floor
+```
+
 ### `tests/image/` -- the tools, with no kernel involved
 
-17 suites. No module is loaded and nothing is mounted: `mkfs.cetra`
+19 suites. No module is loaded and nothing is mounted: `mkfs.cetra`
 writes the structures, a poke helper corrupts exactly one of them, and
 `fsck.cetra` must report *that* fault and exit nonzero.
 
@@ -50,16 +66,26 @@ validation, geometry, the version window that lets a previous release's
 volume be grown rather than rebuilt, and the ~99 distinct faults
 `fsck.cetra` can name.
 
+One of them asserts something else: that a fault costs ONE complaint.
+`fsck_hostile_extent_len.sh` gives a directory an extent claiming 2^31
+blocks and bounds the SIZE of what fsck writes about it, because the
+tool always noticed this one -- 327,409 times, until the walk learned
+to judge a run before reading it. A report that is correct and
+unbounded is still the bug.
+
 ### `tests/kernel/` -- the regression suite proper
 
-147 suites, one concern each, against a loaded module and a real mount.
+173 suites, one concern each, against a loaded module and a real mount.
 Roughly by area:
 
 | area | what it covers |
 |---|---|
-| mount / superblock | validation, refusal of damaged or foreign volumes, remount |
+| mount / superblock | validation, refusal of damaged or foreign volumes, remount, the Block Group table chain a grown volume carries, and the claim an offline `fsck -r`/`growfs` holds while it works |
 | inode / dirent / dir | the namespace, directory growth past inline extents, cross-node reuse |
 | file / extent / punch | the extent tree at depth 0/1/2, truncate, hole punch, sparse files, `fiemap`/`SEEK` |
+| mmap | allocation at fault time (so `-ENOSPC` reaches the storing process as SIGBUS), and the exclusion between a fault and punch/truncate/`write(2)` -- a fault takes no `inode_lock` and never can |
+| vfs conformance | the answers userspace reads: `EISDIR` on reading a directory, a nonzero `f_fsid`, `FIEMAP_EXTENT_UNWRITTEN` on preallocated ranges, a root inode that must be a directory |
+| controls / procfs | the writable knobs, including the timing pair that constrains itself |
 | alloc / bg / zg | allocation, Block Group and Zone Group ownership, free accounting |
 | lock / nslock | the whole-file exclusive lock, `flock(2)`, the per-inode namespace lock |
 | journal | redo journalling and replay, including a dead node's journal |
@@ -216,9 +242,66 @@ superblock and the metadata, and both `fsck.cetra` and the *mount path*
 must refuse them without crashing. A filesystem must survive a corrupt
 disk being handed to it deliberately.
 
+Three properties of this tier are worth knowing, because each was a
+blind spot that looked like coverage:
+
+*The golden image is GROWN.* A segment of the Block Group table chain
+only exists after a `growfs`; on a freshly made volume `bg_table_next`
+is 0 and `fs.c`'s chain walk never executes an iteration. Every golden
+used to be fresh, so the walk -- which builds the descriptor table from
+a count and a next pointer read straight off the device -- had no
+representation in the corpus at all. `mkgolden.sh` grows it now and
+refuses to produce one without a chain.
+
+*Targets are picked by TYPE, then by instance.* A flat choice over the
+target list is a choice weighted by how many instances the image
+happens to contain: 48 inodes against one chain segment gave the
+segment 1.5% of the iterations.
+
+*One iteration in three on a mount-critical structure does NOT restamp
+the checksum.* The point of field-aware fuzzing is to get a
+hostile-but-VALID record past validation -- which structurally hides
+the opposite fault, a reader that never verifies the checksum it was
+handed. 800 iterations against a kernel that demonstrably mounted a
+corrupt chain found nothing. The no-restamp arm requires the mount to
+refuse, and confirms with `fsck` **after the unmount** (fsck declines to
+examine a mounted device, so asking earlier says nothing). The oracle
+requires fsck's complaint to name the structure that was mutated: a
+bare grep for "checksum" fires on an unrelated inode and reads exactly
+like a real finding.
+
 **`tests/device/`** -- DESTRUCTIVE, real hardware, explicitly opt-in.
 The only tier that exercises the real SCSI COMPARE AND WRITE primitive:
 a loop device has none, so everything else runs the serialised fallback.
+
+**A KASAN kernel** -- `make mod KASAN=1`, then the ordinary suites.
+KASAN's redzones inflate every stack frame, so the pinned frame budget
+(`-Wframe-larger-than=1024`, see `kmod/Makefile` for why it is pinned)
+would reject a build it was never written to describe; `KASAN=1` raises
+it to 2048 for that build only. The module does not otherwise change.
+
+It earns its place: the same build is what surfaced
+`cetrafs_dm_collect()` recursing four deep with half a kilobyte per
+frame, and a kilobyte-sized record on `cetrafs_defrag_inode()`'s stack.
+A per-frame budget cannot see recursion.
+
+**What KASAN does NOT catch here, measured rather than assumed.** It
+instruments the bounds of ALLOCATIONS, not of fields within them. A
+dirent claiming a 4000-byte name is read out of a 255-byte field that
+sits inside a 4096-byte block -- the read stays inside the allocation,
+and KASAN says nothing. Disabling the `name_len` validation and firing
+the 4000-byte poke from `hostile_fields.sh` produces no report at all.
+For fields inside a block the only defence is the explicit validation
+at block-read time; do not expect a sanitiser to stand in for it.
+
+**A clang build** -- `make mod LLVM=1`. Every source compiles clean
+under clang 19 with `-Werror` genuinely in force (verified by injecting
+an unused variable, which stops the build). It gets every object built
+and linked and then fails on `cetrafs.mod.o`, the stub kbuild generates
+itself with the kernel's own flags, out of reach of any per-module
+knob -- so a LOADABLE clang module needs a kernel configured with
+clang. What the target buys today is clang's diagnostics over the whole
+source, which is most of the value.
 
 ---
 

@@ -26,4 +26,4 @@ if ! lsmod | grep -q '^cetrafs '; then
     trap 'rmmod cetrafs 2>/dev/null || true' EXIT
 fi
 python3 "$HERE/fuzz.py" mount-fields "$WORK/golden.img" --iters "$ITERS" --seed "$SEED" \
-    --restamp "$WORK/fuzz_restamp" --findings "$WORK/findings-mount-fields" --mnt "$WORK/mnt"
+    --fsck "$ROOT/userspace/fsck.cetra" --restamp "$WORK/fuzz_restamp" --findings "$WORK/findings-mount-fields" --mnt "$WORK/mnt"

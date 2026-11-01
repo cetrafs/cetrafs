@@ -30,6 +30,54 @@ endif
 # stack costs.
 ccflags-y += -Wframe-larger-than=1024
 
+# KASAN inflates EVERY frame: its redzones sit between the locals, so a
+# function that measures 900 bytes in production measures ~1300 under
+# it. The pin above would reject a kernel it was never written to
+# describe -- five dir.c functions fail a KASAN build while being well
+# inside budget in the build that ships.
+#
+# So raise it for that build only:
+#   make mod KASAN=1
+# It does not relax anything for an ordinary build, and it is not a
+# licence to grow frames: a KASAN build that fails even at 2048 is
+# telling you something real (cetrafs_dm_collect(), which RECURSES four
+# deep, and cetrafs_defrag_inode()'s kilobyte record were both found
+# exactly this way).
+ifeq ($(KASAN),1)
+ccflags-y += -Wframe-larger-than=2048
+endif
+
+# Building with clang: `make mod LLVM=1`.
+#
+# Every source here compiles clean under clang 19 (zero diagnostics on
+# cetrafs code), but only once three things the KERNEL puts on the
+# command line are dealt with. They are there because the kernel this
+# builds against was configured for GCC -- a kernel configured for clang
+# never emits them:
+#
+#   -fconserve-stack, -fmin-function-alignment=  GCC-only, clang errors
+#   -fsanitize=bounds-strict                     GCC's UBSAN spelling
+#   -Wimplicit-fallthrough=5 and friends         GCC-only -W spellings
+#
+# The first two come out with ccflags-remove-y; the UBSAN one cannot
+# (kbuild appends sanitiser flags AFTER that filter), so UBSAN is off
+# for this module under clang -- KASAN, which is the one we want, stays
+# on. The -W spellings are silenced rather than removed, since the list
+# grows with every kernel.
+#
+# KNOWN LIMIT, so nobody rediscovers it: this gets every object built
+# and linked, then fails on cetrafs.mod.o -- the stub kbuild generates
+# itself, compiled by scripts/Makefile.modfinal with the kernel's own
+# flags and out of reach of any per-module knob. A LOADABLE clang module
+# needs a kernel built with clang (CONFIG_CC_IS_CLANG=y). What this
+# target buys today is clang's diagnostics over the whole source, which
+# is most of the value.
+ifeq ($(LLVM),1)
+ccflags-remove-y += -fconserve-stack -fmin-function-alignment=8
+UBSAN_SANITIZE := n
+ccflags-y += -Wno-unknown-warning-option -Wno-microsoft-anon-tag -Wno-address-of-packed-member
+endif
+
 # Trace instrumentation (see kmod.h's ctrace): OFF unless asked for.
 #   make mod CETRAFS_TRACE=1
 ifneq ($(CETRAFS_TRACE),)

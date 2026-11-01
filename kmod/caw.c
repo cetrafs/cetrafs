@@ -131,6 +131,26 @@ static bool cetrafs_caw_fail_path_once;
 module_param_named(caw_fail_path_once, cetrafs_caw_fail_path_once, bool, 0644);
 MODULE_PARM_DESC(caw_fail_path_once, "TEST ONLY: fail the next CAW issued over a dm path, once");
 
+/*
+ * Test-only: report a timed-out command, with the two outcomes a real
+ * timeout leaves ambiguous.
+ *
+ *   landed  -- the swap IS issued and then reported as timed out, which
+ *              is the dangerous case: the device has the new image and
+ *              the caller does not know it.
+ *   lost    -- the swap is NOT issued and reported as timed out.
+ *
+ * Both must end with the mutator having been applied EXACTLY ONCE. A
+ * mutator that adds a delta is the one that can tell the difference.
+ */
+static bool cetrafs_caw_timeout_landed_once;
+module_param_named(caw_timeout_landed_once, cetrafs_caw_timeout_landed_once, bool, 0644);
+MODULE_PARM_DESC(caw_timeout_landed_once, "TEST ONLY: next CAW executes, then reports a timeout");
+
+static bool cetrafs_caw_timeout_lost_once;
+module_param_named(caw_timeout_lost_once, cetrafs_caw_timeout_lost_once, bool, 0644);
+MODULE_PARM_DESC(caw_timeout_lost_once, "TEST ONLY: next CAW does not execute and reports a timeout");
+
 static bool cetrafs_caw_fail_discover;
 module_param_named(caw_fail_discover, cetrafs_caw_fail_discover, bool, 0644);
 MODULE_PARM_DESC(caw_fail_discover, "test-only: force CAW capability discovery to fail");
@@ -160,6 +180,17 @@ void cetrafs_caw_probe_at_load(void)
                 cetrafs_caw_class_name(info.klass), info.logical_block_size, info.max_caw_blocks,
                 info.max_caw_blocks ? "available" : "unavailable");
 
+    /*
+     * Give the dmpath cache slot back.
+     *
+     * Discovery on a stacked device resolves a SCSI path and CACHES it,
+     * holding the path device open and an sdev reference with it. This
+     * probe then closed its own handle and walked away, so a load-time
+     * probe permanently consumed one of the four slots -- and kept a
+     * device open that nothing was using -- for a bdev nobody will ever
+     * ask about again.
+     */
+    cetrafs_dmpath_forget(bdev);
     bdev_fput(f);
 }
 
@@ -300,8 +331,19 @@ static int cetrafs_caw_scsi(struct scsi_device *sdev,
                                    (unsigned long long) lba, sshdr.sense_key, sshdr.asc, sshdr.ascq);
             }
         } else {
-            pr_err_ratelimited("CAW lba=%llu failed with no valid sense (scsi_execute_cmd returned %d)\n",
+            /*
+             * No valid sense: the target never answered. A timeout says
+             * the HOST stopped waiting, not that the command was not
+             * executed -- the swap may well have landed. Report that
+             * ambiguity as its own thing instead of folding it into
+             * -EIO, which the layers above read as "definitely did not
+             * happen" and used to resolve by simply issuing it again.
+             */
+            pr_err_ratelimited("CAW lba=%llu failed with no valid sense (scsi_execute_cmd returned %d) -- "
+                               "outcome UNKNOWN\n",
                                (unsigned long long) lba, ret);
+            ret = -ETIMEDOUT;
+            break;
         }
         ret = -EIO;
         break;
@@ -456,6 +498,14 @@ int cetrafs_caw(struct block_device *bdev, u64 lba, unsigned int nblocks, const 
         return -EINVAL;
     if (nblocks == 0)
         return -EINVAL;
+
+    if (cetrafs_caw_timeout_lost_once) {
+        /* Test-only: never issued, reported as timed out. */
+        cetrafs_caw_timeout_lost_once = false;
+        pr_warn("CAW lba=%llu: TEST caw_timeout_lost_once -- not issued, reporting a timeout\n",
+                (unsigned long long) lba);
+        return -ETIMEDOUT;
+    }
     /* NUMBER OF LOGICAL BLOCKS is one byte of the CDB. Casting a larger
      * count into it would silently truncate -- 256 blocks becoming 0,
      * i.e. "transfer nothing", against a data-out buffer sized for 256.
@@ -472,17 +522,40 @@ int cetrafs_caw(struct block_device *bdev, u64 lba, unsigned int nblocks, const 
         int ret = cetrafs_caw_scsi(sdev, lba, nblocks, compare, write_data, lbs);
 
         scsi_device_put(sdev);
+        if (ret == 0 && cetrafs_caw_timeout_landed_once) {
+            /* Test-only: it DID execute; the caller is told it timed
+             * out. The dangerous half of the ambiguity. */
+            cetrafs_caw_timeout_landed_once = false;
+            pr_warn("CAW lba=%llu: TEST caw_timeout_landed_once -- executed, reporting a timeout anyway\n",
+                    (unsigned long long) lba);
+            return -ETIMEDOUT;
+        }
         return ret;
     }
 
     /*
      * Not SCSI itself: a device-mapper node, i.e. the multipath case.
-     * Issue over a path underneath (dmpath.c), and on a TRANSPORT error
-     * -- never on -EBUSY, which is a MISCOMPARE and a legitimate lost
-     * race -- drop that path and retry once on another. Without the
-     * retry a single path failure surfaces as a failed claim, and since
-     * heartbeat renewal is itself a compare-and-swap, a path that stays
-     * broken gets this node declared dead and fenced by its peers.
+     * Issue over a path underneath (dmpath.c), and on a path failure
+     * drop that path -- never on -EBUSY, which is a MISCOMPARE and a
+     * legitimate lost race. A single path failure must not surface as a
+     * failed claim: heartbeat renewal is itself a compare-and-swap, so
+     * a path that stays broken would get this node declared dead and
+     * fenced by its peers.
+     *
+     * What it must NOT do is re-issue a command whose outcome is
+     * UNKNOWN (-ETIMEDOUT). If the first one landed, the second
+     * MISCOMPAREs, the layer above reads that as a lost race, re-reads
+     * and runs the mutator again -- and a mutator that adds a delta
+     * rather than writing an absolute value then applies it TWICE:
+     * cetrafs_zg_delta_mutate(), cetrafs_zg_pool_mutate(),
+     * cetrafs_pf_append_mutate(), cetrafs_bg_count_mutate()'s delta
+     * arm. Silent, and exactly the free-count corruption shape this
+     * filesystem has already paid for once.
+     *
+     * So the path is marked failed and the ambiguity is handed up to
+     * cetrafs_cas_region_seeded_impl(), which can re-read the region
+     * and tell the three cases apart before deciding to retry. The
+     * retry still happens -- one level up, and informed.
      */
     {
         unsigned int attempt;
@@ -495,18 +568,27 @@ int cetrafs_caw(struct block_device *bdev, u64 lba, unsigned int nblocks, const 
 
             if (cetrafs_caw_fail_path_once) { /* test knob, see its MODULE_PARM_DESC */
                 cetrafs_caw_fail_path_once = false;
-                ret = -EIO;
+                ret = -ETIMEDOUT;
             } else {
                 ret = cetrafs_caw_scsi(sdev, lba, nblocks, compare, write_data, lbs);
+                if (ret == 0 && cetrafs_caw_timeout_landed_once) {
+                    cetrafs_caw_timeout_landed_once = false;
+                    pr_warn("CAW lba=%llu: TEST caw_timeout_landed_once -- executed, reporting a timeout anyway\n",
+                            (unsigned long long) lba);
+                    ret = -ETIMEDOUT;
+                }
             }
 
-            if (ret != -EIO) { /* success, or MISCOMPARE, or a non-path error */
+            if (ret != -EIO && ret != -ETIMEDOUT) { /* success, or MISCOMPARE, or a non-path error */
                 scsi_device_put(sdev);
                 return ret;
             }
 
             cetrafs_dmpath_failed(bdev, sdev);
             scsi_device_put(sdev);
+
+            if (ret == -ETIMEDOUT) /* outcome unknown: the caller re-reads and decides */
+                return ret;
         }
         if (ret != -EOPNOTSUPP)
             return ret;
@@ -776,12 +858,21 @@ static int cetrafs_cas_region_seeded_impl(struct super_block *sb,
         /* PERF(8): not optional -- docs/PERFORMANCE.md */
         cetrafs_cas_flush_block(sb, fs_lba);
 
-        if (attempt == 0 && seed && seed_len && seed_len <= region) {
+        if (attempt == 0 && seed && seed_len == region) {
             /* Trust the caller's image once. A stale one just fails the
-             * CAW below and the next attempt reads fresh. */
-            memcpy(old, seed, seed_len);
-            if (seed_len < region)
-                memset(old + seed_len, 0, region - seed_len);
+             * CAW below and the next attempt reads fresh.
+             *
+             * ONLY a full-region seed. A shorter one used to be
+             * zero-padded to the region, and on a 4Kn device the region
+             * is the WHOLE record block -- both sectors -- while every
+             * seeding caller has one sector in hand. The other sector
+             * was therefore compared as zeros against a record that is
+             * never zero: a guaranteed MISCOMPARE, so the optimisation
+             * that exists to skip a read instead cost a wasted CAW
+             * round trip and then did the read anyway. Falling straight
+             * through to the read is strictly cheaper.
+             */
+            memcpy(old, seed, region);
         } else {
             bh = cetrafs_bread_uncached_retry(sb, fs_lba); /* see the no-CAW path above */
             if (!bh) {
@@ -834,6 +925,68 @@ static int cetrafs_cas_region_seeded_impl(struct super_block *sb,
                 cetrafs_invalidate_block(sb, fs_lba);
             goto out;
         }
+        if (ret == -ETIMEDOUT) {
+            /*
+             * The command's outcome is UNKNOWN: the target never
+             * answered, so the swap may or may not have landed. Issuing
+             * it again is exactly what must not happen -- a mutator
+             * that adds a delta would apply it twice.
+             *
+             * The region itself settles it. Re-read it fresh and look:
+             *
+             *   - it holds our post-image  -> the swap landed; done.
+             *   - it holds our pre-image   -> it did not; retrying is
+             *                                 provably safe, and the
+             *                                 failed path is already
+             *                                 out of rotation.
+             *   - anything else            -> somebody wrote it in the
+             *                                 meantime and we cannot
+             *                                 tell whether ours landed
+             *                                 first. Refuse loudly
+             *                                 rather than guess.
+             *
+             * The residue: a peer that produced a byte-identical image
+             * is read as our own success. For every idempotent mutator
+             * that is simply true -- the outcome is the outcome. For a
+             * delta it would drop one, and it needs a timeout AND a
+             * peer landing the identical bytes in the same window; the
+             * log line below is what makes it visible if it ever
+             * happens. Closing it for good needs the record to carry
+             * who wrote it, which is a format change.
+             */
+            struct buffer_head *vbh = cetrafs_bread_uncached_retry(sb, fs_lba);
+
+            if (!vbh) {
+                pr_err("CAS lba=%llu: outcome unknown and the region could not be re-read\n",
+                       (unsigned long long) fs_lba);
+                ret = -EIO;
+                goto out;
+            }
+            if (!memcmp(vbh->b_data + off, new, region)) {
+                pr_warn("CAS lba=%llu: command timed out but the swap IS on the device -- taking it as done\n",
+                        (unsigned long long) fs_lba);
+                brelse(vbh);
+                if (sole_region)
+                    cetrafs_cache_region_after_cas(sb, fs_lba, off, new, region);
+                else
+                    cetrafs_invalidate_block(sb, fs_lba);
+                ret = 0;
+                goto out;
+            }
+            if (!memcmp(vbh->b_data + off, old, region)) {
+                pr_warn("CAS lba=%llu: command timed out and did NOT land -- retrying on another path\n",
+                        (unsigned long long) fs_lba);
+                brelse(vbh);
+                continue;
+            }
+            brelse(vbh);
+            pr_err("CAS lba=%llu: command timed out and the region has changed since -- cannot tell whether "
+                   "the swap landed, refusing to repeat it\n",
+                   (unsigned long long) fs_lba);
+            ret = -EIO;
+            goto out;
+        }
+
         if (ret != -EBUSY)
             goto out; /* real transport error */
 
@@ -978,6 +1131,17 @@ MODULE_PARM_DESC(
 
 #define CETRAFS_CAS_SELFTEST_OFF 256 /* inside the row block's zero padding */
 
+/* A DELTA mutator for the self-test: the only kind that can show a
+ * double application, because re-running it on its own post-image does
+ * not converge the way an absolute write does. */
+static int cetrafs_cas_selftest_inc(void *image, unsigned int len, void *priv)
+{
+    (void) len;
+    (void) priv;
+    ((u8 *) image)[CETRAFS_CAS_SELFTEST_OFF]++;
+    return 0;
+}
+
 static int cetrafs_cas_selftest_set(void *image, unsigned int len, void *priv)
 {
     (void) len;
@@ -1100,6 +1264,70 @@ void cetrafs_cas_selftest(struct super_block *sb, u32 my_node_id)
         kfree(seed);
     }
 
+    /*
+     * 2c. A timed-out command must leave the mutator applied EXACTLY
+     * ONCE, whichever way the ambiguity fell.
+     *
+     * This is the one the delta mutator exists for. An absolute write
+     * converges -- re-running it on its own post-image produces the
+     * same bytes and the CAS layer's "mutator made no change" exit
+     * turns the second attempt into a no-op, so it can never show a
+     * double application. An increment can, and so can every real
+     * mutator shaped like it: the ZG free aggregate, the pool shard,
+     * the pending-free append, the BG count's delta arm.
+     *
+     * Only on hardware with atomic CAW: without it there is no command
+     * to time out.
+     */
+    if (ok && have_caw) {
+        u8 base = 0x10;
+        unsigned int phase;
+
+        for (phase = 0; phase < 2; phase++) {
+            const char *what = phase ? "landed" : "lost";
+
+            ret = cetrafs_cas_record(sb, lba, cetrafs_cas_selftest_set, &base);
+            if (ret) {
+                pr_err("CAS selftest: could not set the %s-case baseline: %d\n", what, ret);
+                ok = false;
+                break;
+            }
+
+            if (phase)
+                cetrafs_caw_timeout_landed_once = true;
+            else
+                cetrafs_caw_timeout_lost_once = true;
+
+            ret = cetrafs_cas_record(sb, lba, cetrafs_cas_selftest_inc, NULL);
+            cetrafs_caw_timeout_landed_once = false;
+            cetrafs_caw_timeout_lost_once = false;
+
+            if (ret) {
+                pr_err("CAS selftest: increment across a timed-out (%s) command failed: %d\n", what, ret);
+                ok = false;
+                break;
+            }
+
+            bh = cetrafs_bread_uncached_retry(sb, lba);
+            if (!bh) {
+                pr_err("CAS selftest: could not read back the %s case\n", what);
+                ok = false;
+                break;
+            }
+            if ((u8) bh->b_data[CETRAFS_CAS_SELFTEST_OFF] != (u8) (base + 1)) {
+                pr_err("CAS selftest: a timed-out (%s) command left the delta applied %d time(s), expected once "
+                       "(0x%02x -> 0x%02x)\n",
+                       what, (int) ((u8) bh->b_data[CETRAFS_CAS_SELFTEST_OFF] - base), base,
+                       (u8) bh->b_data[CETRAFS_CAS_SELFTEST_OFF]);
+                ok = false;
+            }
+            brelse(bh);
+            if (!ok)
+                break;
+            pr_info("CAS selftest: a timed-out (%s) command applied the delta exactly once\n", what);
+        }
+    }
+
     /* 3. restore the padding byte */
     ret = cetrafs_cas_record(sb, lba, cetrafs_cas_selftest_set, &restore);
     if (ret) {
@@ -1164,7 +1392,29 @@ struct cetrafs_cas_stress_ctx {
     atomic_t running;
     wait_queue_head_t done;
     unsigned int iters;
+    /*
+     * On the HEAP, with a reference per participant.
+     *
+     * This used to live on the launcher's stack. The last thread does
+     * atomic_dec_and_test(&running) and then wake_up(&done) -- and
+     * between those two the waiter can observe zero, return, and take
+     * its stack frame with it, leaving wake_up() writing into a frame
+     * that no longer exists.
+     *
+     * kthread_stop() is NOT the way back: it was tried, and without a
+     * get_task_struct() it was a use-after-free of the task itself
+     * (refcount_warn_saturate, then an Oops in mount). A reference
+     * count on the context is what makes the last toucher the one who
+     * frees it, whichever that turns out to be.
+     */
+    atomic_t refs;
 };
+
+static void cetrafs_cas_stress_put(struct cetrafs_cas_stress_ctx *ctx)
+{
+    if (atomic_dec_and_test(&ctx->refs))
+        kfree(ctx);
+}
 
 static int cetrafs_cas_stress_inc(void *image, unsigned int len, void *priv)
 {
@@ -1200,6 +1450,7 @@ static int cetrafs_cas_stress_thread(void *arg)
      * Oops in mount, reproduced on the first run against real CAW). */
     if (atomic_dec_and_test(&ctx->running))
         wake_up(&ctx->done);
+    cetrafs_cas_stress_put(ctx); /* the waiter may already be gone */
     return 0;
 }
 
@@ -1217,7 +1468,7 @@ void cetrafs_cas_stress(struct super_block *sb, u32 my_node_id)
 {
     u64 lba = cetrafs_node_row_lba(sb, my_node_id);
     bool have_caw = cetrafs_sb_caw_available(sb);
-    struct cetrafs_cas_stress_ctx ctx;
+    struct cetrafs_cas_stress_ctx *ctxp;
     struct buffer_head *bh;
     unsigned int n = cetrafs_cas_stress_threads;
     unsigned int i, started = 0;
@@ -1230,6 +1481,11 @@ void cetrafs_cas_stress(struct super_block *sb, u32 my_node_id)
     if (n > 64)
         n = 64;
 
+    ctxp = kzalloc(sizeof(*ctxp), GFP_KERNEL);
+    if (!ctxp)
+        return;
+    atomic_set(&ctxp->refs, 1); /* the launcher's own */
+#define ctx (*ctxp)
     ctx.sb = sb;
     ctx.lba = lba;
     ctx.iters = cetrafs_cas_stress_iters ? cetrafs_cas_stress_iters : 1;
@@ -1241,6 +1497,7 @@ void cetrafs_cas_stress(struct super_block *sb, u32 my_node_id)
     ret = cetrafs_cas_record(sb, lba, cetrafs_cas_stress_zero, NULL);
     if (ret) {
         pr_err("CAS stress: could not zero the counter: %d\n", ret);
+        cetrafs_cas_stress_put(ctxp);
         return;
     }
     mc_before = cetrafs_cas_miscompare_count();
@@ -1255,8 +1512,10 @@ void cetrafs_cas_stress(struct super_block *sb, u32 my_node_id)
         struct task_struct *t;
 
         atomic_inc(&ctx.running);
-        t = kthread_run(cetrafs_cas_stress_thread, &ctx, "cetrafs_cas%u", i);
+        atomic_inc(&ctx.refs); /* the thread's own, dropped as it exits */
+        t = kthread_run(cetrafs_cas_stress_thread, ctxp, "cetrafs_cas%u", i);
         if (IS_ERR(t)) {
+            atomic_dec(&ctx.refs);
             atomic_dec(&ctx.running);
             break;
         }
@@ -1286,6 +1545,8 @@ void cetrafs_cas_stress(struct super_block *sb, u32 my_node_id)
     }
 
     cetrafs_cas_record(sb, lba, cetrafs_cas_stress_zero, NULL);
+#undef ctx
+    cetrafs_cas_stress_put(ctxp);
 }
 
 /* Records live in region 0 of their own block -- the common case. */

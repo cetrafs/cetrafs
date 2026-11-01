@@ -137,7 +137,7 @@ and must be accessed through `cetrafs_le*()`/`cetrafs_cpu_to_le*()`; see
 | Field | Type | Meaning |
 |---|---|---|
 | magic | `__le32` | `0xC4553770` |
-| version | `__le16` | `CETRAFS_VERSION` — currently `0x0009`; bumped freely, never migrated. v0x0008..0x0009 is a temporary compatibility window: a volume from the previous release (0x0008) can be grown in place without reformatting; `growfs` stamps 0x0009 on any grown volume to gate older builds from attempting to mount it |
+| version | `__le16` | `CETRAFS_VERSION` — currently `0x0009`; bumped freely, never migrated. `CETRAFS_VERSION_MIN` equals `CETRAFS_VERSION` as of 0.9.2: the 0x0008..0x0009 compatibility window that let a 0.8.x volume be grown in place is closed, and only the current format mounts. `growfs` stamps 0x0009 on any grown volume |
 | sb_bytes | `__le16` | `sizeof(superblock)`, sanity check |
 | block_size | `__le32` | fixed 4096 |
 | total_blocks | `__le64` | device size in blocks |
@@ -200,7 +200,7 @@ and the inode lock fields store elsewhere.
 | Field | Meaning |
 |---|---|
 | node_uuid[16] | the node's stable machine UUID (`uuid.c`), raw 128-bit |
-| state | `CETRAFS_NODE_STATE_FREE` (0) or `_REGISTERED` (1) |
+| state | `CETRAFS_NODE_STATE_FREE` (0), `_REGISTERED` (1), or `_REPAIR` (2) — an offline repairer (`fsck -r`, `growfs`) holding the volume. `fill_super()` refuses to mount while such a row is still being refreshed; it is a lease, so a repairer that dies releases the volume after the usual staleness window |
 | hb_seq | heartbeat sequence, bumped every heartbeat tick while mounted |
 | last_seen | unix seconds of the last heartbeat write (backdated to the epoch on a clean unmount, so peers see the departure immediately) |
 | label[32] | informational hostname, NUL-terminated; not used for identity |

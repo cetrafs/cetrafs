@@ -151,6 +151,13 @@ def save_finding(findings_dir, i, seed, m, why, extra, work_img):
 # ---------------------------------------------------------------------------
 
 TAIL_MAGICS = {0x44424c4b, 0x4c424c4b, 0x58424c4b, 0x49424c4b}  # DBLK LBLK XBLK IBLK
+BGSEG_MAGIC = 0xC4553B65  # cetrafs_bg_segment_t, only present on a grown volume
+
+# Structures the MOUNT path must read before it can mount at all. A
+# checksum failure in one of these is not a matter of policy: the bytes
+# are not what they claim, and a mount that proceeds anyway is reading
+# something nobody wrote. Used by the no-restamp arm below.
+MOUNT_CRITICAL = {"sb", "zg", "bg", "bgseg"}
 INODE_CSUM_LEN = 204   # sizeof(cetrafs_inode_t); mutate only the record, not the pad
 
 
@@ -175,7 +182,15 @@ def field_targets(restamp, golden, mode):
     t = [("sb", 0, 0, 424)]
     for i in range(g["zone_group_count"]):
         t.append(("zg", (g["zg_table_start"] + i) * B, 0, B))      # hot+cold both restamped
-    for i in range(g["block_group_count"]):
+    # Block Group descriptors are NOT a contiguous run on a grown
+    # volume: the first bg_table_first_count of them live at
+    # bg_table_start and the rest are in the appended segments. Reading
+    # them as contiguous aimed targets at blocks nothing mounts --
+    # which produced a confident "finding" whose fsck evidence turned
+    # out to be about INODES. The layout is the superblock's to
+    # describe, so ask it.
+    first = g.get("bg_table_first_count", 0) or g["block_group_count"]
+    for i in range(min(first, g["block_group_count"])):
         t.append(("bg", (g["bg_table_start"] + i) * B, 0, B))
     size = os.path.getsize(golden)
     fd = os.open(golden, os.O_RDONLY)
@@ -218,6 +233,36 @@ def field_targets(restamp, golden, mode):
             pos = de
     finally:
         os.close(fd)
+    # The BG table chain.
+    #
+    # A segment only exists on a GROWN volume: on a freshly-made one
+    # bg_table_next is 0 and fs.c's chain walk never runs an iteration.
+    # Every golden was fresh, so the walk -- which reads a count and a
+    # next pointer straight off the device and builds the descriptor
+    # table from them -- had no representation in this corpus at all.
+    # mkgolden.sh grows the golden now; this is what finds the chain in
+    # it.
+    #
+    # The magic is left out of the mutable range on purpose: a bad magic
+    # is refused immediately, and what is worth reaching is what lies
+    # past that test -- count, first_bg_id and next.
+    nxt = g.get("bg_table_next", 0)
+    fd2 = os.open(golden, os.O_RDONLY)
+    try:
+        guard = 0
+        while nxt and guard < 64:
+            off = nxt * B
+            if off + 32 > size:
+                break
+            hdr = os.pread(fd2, 32, off)
+            if int.from_bytes(hdr[0:4], "little") != BGSEG_MAGIC:
+                break
+            t.append(("bgseg", off, 4, 24))
+            nxt = int.from_bytes(hdr[16:24], "little")
+            guard += 1
+    finally:
+        os.close(fd2)
+
     # Journal replay only runs at MOUNT, and only when a node's flag block is
     # DIRTY -- which the clean golden never is. For mount-fields the loop plants
     # a replayable entry into node 0's slot 0 each iteration; target the whole
@@ -331,7 +376,17 @@ def run_stage2(args, rng, fd, loop, env, t0, targets):
         if args.mode == "mount-fields":
             # node 0's journal replayable, so EVERY mount exercises replay
             run([args.restamp, work, "plant-journal"], 10)
-        typ, base, lo, hi = rng.choice(targets)
+        # The TYPE first, then an instance of it.
+        #
+        # A flat choice over the target list is a choice weighted by how
+        # many instances the golden happens to contain: 48 inodes and
+        # ONE Block Group segment meant the segment -- the structure a
+        # grown volume adds and nothing else exercises -- got 1.5% of
+        # the iterations. Picking the type uniformly gives every
+        # structure the same attention regardless of how many of it the
+        # image has.
+        typ = rng.choice(sorted({t[0] for t in targets}))
+        typ, base, lo, hi = rng.choice([t for t in targets if t[0] == typ])
         if typ == "inode" and rng.random() < 0.5:
             # structure-aware: a valid-header, hostile-content extent tree
             # (overlaps/huge-len/metadata-or-oob targets/zero-len/dup, and
@@ -341,14 +396,33 @@ def run_stage2(args, rng, fd, loop, env, t0, targets):
             # 8-11 depth-2 (the interior level only the deep tree reaches).
             run([args.restamp, work, "craft-tree", str(base), str(rng.randrange(12))], 10)
             exercised += 1
+            no_restamp = False
         else:
             # multi-field: 1..4 coordinated byte mutations, then one restamp
             for _ in range(rng.randint(1, 4)):
                 field_mutate(fd, rng, base + lo, base + hi)
             os.fsync(fd)
-            rrc, _ = run([args.restamp, work, "stamp", typ, str(base)], 10)
-            if rrc == 0:
+            # Normally we restamp, because the point of field-aware
+            # fuzzing is to get a HOSTILE-BUT-VALID record past the
+            # checksum and into the parser.
+            #
+            # One iteration in eight on a mount-critical structure, we
+            # deliberately do NOT -- and then the mount is required to
+            # refuse. That arm exists because the restamp hides an
+            # entire fault class: a reader that never verifies the
+            # checksum it was given is invisible to a fuzzer that always
+            # hands it a valid one. The Block Group segment header was
+            # exactly that -- growfs stamps the CRC, fsck checks it,
+            # fill_super() ignored it -- and 800 iterations of the
+            # restamping arm against the unfixed kernel found nothing.
+            if typ in MOUNT_CRITICAL and args.mode == "mount-fields" and rng.random() < 0.3:
+                no_restamp = True
                 exercised += 1
+            else:
+                no_restamp = False
+                rrc, _ = run([args.restamp, work, "stamp", typ, str(base)], 10)
+                if rrc == 0:
+                    exercised += 1
         why = None
         extra = ""
         if args.mode == "fsck-fields":
@@ -388,6 +462,36 @@ def run_stage2(args, rng, fd, loop, env, t0, targets):
                 rc3, _ = run(["umount", args.mnt], 30)
                 if why is None and rc3 == "TIMEOUT":
                     why = "umount hang"
+                # The differential oracle, and it has to run AFTER the
+                # umount: fsck refuses to examine a mounted device at
+                # all, so asking it here cost nothing and said nothing
+                # -- which is how the first version of this reported no
+                # findings against a kernel that was demonstrably
+                # mounting a corrupt chain.
+                #
+                # The claim is narrow on purpose: this iteration left a
+                # checksum deliberately broken in a structure the mount
+                # MUST read, and the mount took it anyway. fsck's own
+                # verdict is what confirms it, so the fuzzer is not
+                # trusting its own arithmetic about what it mutated.
+                if why is None and no_restamp and args.fsck and rc3 != "TIMEOUT":
+                    _, fout = run([args.fsck, loop], 20, env=env)
+                    ftxt = fout.decode(errors="replace")
+                    # fsck must be complaining about the structure WE
+                    # broke. Grepping its whole output for "checksum"
+                    # fired on an inode complaint while the mutation was
+                    # elsewhere -- a false positive that read exactly
+                    # like a real one.
+                    expect = {"sb": ["superblock", "bad magic"],
+                              "zg": ["zone group", "zg "],
+                              "bg": ["block group", "bg "],
+                              "bgseg": ["segment", "chain"]}.get(typ, [])
+                    low = ftxt.lower()
+                    hit = [ln for ln in low.splitlines()
+                           if ("crc" in ln or "checksum" in ln) and any(e in ln for e in expect)]
+                    if hit:
+                        why = f"mounted a {typ} whose checksum fsck rejects"
+                        extra = ftxt[-2000:]
             d = dmesg_since(marker)
             if why is None and any(b in d for b in KERNEL_BAD):
                 why = "kernel splat"

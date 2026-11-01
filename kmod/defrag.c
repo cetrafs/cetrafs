@@ -60,6 +60,8 @@
 
 #include <linux/mm.h>
 
+#include <linux/delay.h>
+
 #include "kmod.h"
 
 /* TEST ONLY: make invalidate_inode_pages2_range() "fail" after a step's
@@ -90,11 +92,59 @@ module_param_named(defrag_fail_invalidate, cetrafs_defrag_fail_invalidate, bool,
 MODULE_PARM_DESC(defrag_fail_invalidate,
                  "TEST ONLY: make the post-commit page drop fail, exercising the forced-drop path");
 
+/*
+ * Test-only: hold inode_lock open between steps for this long.
+ *
+ * The window the per-step re-check exists for is the gap where this
+ * mover deliberately drops inode_lock, and in production it is as
+ * short as the mover can make it. Driving a writer into it needs it
+ * held open.
+ */
+static unsigned int cetrafs_defrag_step_delay_ms;
+module_param_named(defrag_step_delay_ms, cetrafs_defrag_step_delay_ms, uint, 0644);
+MODULE_PARM_DESC(defrag_step_delay_ms, "TEST ONLY: pause between defrag steps, with inode_lock dropped");
+
+/* The per-step shape re-check (length + density) happens to catch a
+ * rewritten prefix too, because today's writers APPEND the new extent
+ * and the array stops being in logical order. That makes the prefix
+ * walk below unreachable from a test -- and an unreachable check is an
+ * unproven one. This knob relaxes the density half so a suite can make
+ * the walk the sole guard and prove it works: with it set and the walk
+ * removed, the rewritten bytes are lost and 16 blocks leak. */
+static bool cetrafs_defrag_skip_dense_recheck;
+module_param_named(defrag_skip_dense_recheck, cetrafs_defrag_skip_dense_recheck, bool, 0644);
+MODULE_PARM_DESC(defrag_skip_dense_recheck,
+                 "TEST ONLY: skip the per-step density re-check, leaving the prefix walk alone");
+
 /* Soft cap on blocks relocated per inode_lock hold -- rounded UP to the
  * next whole original extent (always at least one), so a step never
  * splits an extent. Small enough that a VM write rarely waits long for
  * the lock. */
 #define CETRAFS_DEFRAG_STEP_BLOCKS 128
+
+/*
+ * The mover mutates the extent tree and frees the blocks it moved off.
+ * inode_lock excludes write(2), truncate, punch and fallocate -- but not
+ * a page fault, which cannot take it (it holds mmap_lock, and i_rwsem is
+ * taken before mmap_lock everywhere else). invalidate_lock is the one
+ * the fault path can take, and cetrafs_page_mkwrite()/cetrafs_write_begin()
+ * now do: without it here a store through a mapping appends to the tree
+ * this is rebuilding, or keeps buffers on blocks this is about to free.
+ *
+ * Always as a pair, so the ten exits below cannot drop one and keep the
+ * other.
+ */
+static void cetrafs_defrag_inode_lock(struct inode *inode)
+{
+    inode_lock(inode);
+    filemap_invalidate_lock(inode->i_mapping);
+}
+
+static void cetrafs_defrag_inode_unlock(struct inode *inode)
+{
+    filemap_invalidate_unlock(inode->i_mapping);
+    inode_unlock(inode);
+}
 
 /* A file's extent list, read out of the inode (inline) or its one
  * external leaf. 'arr' is caller-allocated (CETRAFS_EXT_BLOCK_MAX_LEAVES
@@ -292,7 +342,19 @@ int cetrafs_defrag_inode(struct inode *inode, struct cetrafs_defrag_stats *out_s
     struct super_block *sb = inode->i_sb;
     struct cetrafs_ext_list el;
     struct cetrafs_defrag_stats stats = {0};
-    cetrafs_inode_t raw;
+    /*
+     * The record lives on the HEAP, like fallocate's pair and for the
+     * same reason: cetrafs_inode_t is a kilobyte, and a kilobyte of
+     * kernel stack in a function that then calls into the allocator,
+     * the journal and the CAS layer is a lot to spend on one local. A
+     * KASAN build puts the frame at 1296 bytes and refuses to compile
+     * it, which is how this one surfaced.
+     *
+     * The macro keeps the body reading as it did -- the same shape
+     * cetrafs_fallocate() uses.
+     */
+    cetrafs_inode_t *rawp;
+#define raw (*rawp)
     u64 nblocks, dst_base = 0, moved = 0;
     bool have_dst = false;
     /*
@@ -314,8 +376,13 @@ int cetrafs_defrag_inode(struct inode *inode, struct cetrafs_defrag_stats *out_s
     el.arr = kvmalloc_array(el.cap, sizeof(*el.arr), GFP_KERNEL);
     if (!el.arr)
         return -ENOMEM;
+    rawp = kmalloc(sizeof(*rawp), GFP_NOFS);
+    if (!rawp) {
+        kvfree(el.arr);
+        return -ENOMEM;
+    }
 
-    inode_lock(inode);
+    cetrafs_defrag_inode_lock(inode);
     ret = cetrafs_read_raw_inode_overlaid(sb, inode, &raw); /* torn-read-safe vs a concurrent publish */
     if (ret)
         goto out_unlock;
@@ -374,7 +441,7 @@ int cetrafs_defrag_inode(struct inode *inode, struct cetrafs_defrag_stats *out_s
     if (ret)
         goto out_unlock;
     have_dst = true;
-    inode_unlock(inode);
+    cetrafs_defrag_inode_unlock(inode);
 
     while (moved < nblocks) {
         struct blk_plug plug;
@@ -386,7 +453,10 @@ int cetrafs_defrag_inode(struct inode *inode, struct cetrafs_defrag_stats *out_s
             goto out_free_tail;
         }
 
-        inode_lock(inode);
+        if (cetrafs_defrag_step_delay_ms)
+            msleep(cetrafs_defrag_step_delay_ms); /* test-only: the lock is NOT held here, which is the point */
+
+        cetrafs_defrag_inode_lock(inode);
         /* The step below frees the old physical blocks once the new run
          * is committed, and O_DIRECT bypasses the page cache -- so an
          * already-submitted DIO is aimed straight at those blocks and
@@ -402,14 +472,68 @@ int cetrafs_defrag_inode(struct inode *inode, struct cetrafs_defrag_stats *out_s
         ret = cetrafs_read_raw_inode_overlaid(sb, inode, &raw); /* torn-read-safe vs a concurrent publish */
         if (ret || cetrafs_le64(raw.generation) != cetrafs_inode_get_generation(inode)) {
             ret = ret ? ret : -ESTALE;
-            inode_unlock(inode);
+            cetrafs_defrag_inode_unlock(inode);
             goto out_free_tail;
         }
         ret = cetrafs_defrag_read_extents(inode, &raw, &el);
-        if (ret || el.nblocks != nblocks || !el.dense) {
+        if (ret || el.nblocks != nblocks || (!el.dense && !cetrafs_defrag_skip_dense_recheck)) {
             ret = ret ? ret : -ECANCELED;
-            inode_unlock(inode);
+            cetrafs_defrag_inode_unlock(inode);
             goto out_free_tail;
+        }
+
+        /*
+         * And the prefix we already moved must still BE where we put
+         * it.
+         *
+         * inode_lock is dropped between steps, which is what makes this
+         * mover incremental and what lets a local writer in. The checks
+         * above catch a different file (generation) and a resized one
+         * (nblocks), but a punch FOLLOWED BY A REWRITE of the committed
+         * prefix restores the block count while putting those logical
+         * blocks on completely different physical ones. The commit
+         * below would then republish [0, moved) as living at dst_base:
+         * the rewritten data lost, the blocks after it corrupted, and
+         * 16 blocks leaked -- measured, with this walk removed, by
+         * tests/kernel/defrag_prefix_moved.sh.
+         *
+         * The density check above DOES reject that today, but only by
+         * accident: the rewrite is APPENDED, so the array stops being
+         * in logical order. That is a statement about array ordering,
+         * not about where the prefix lives, and it would stop holding
+         * the day a writer updates an entry in place or rebuilds the
+         * array sorted. Hence defrag_skip_dense_recheck, which lets the
+         * suite relax it and prove this walk alone is sufficient.
+         *
+         * Cheap, because the prefix is by construction one contiguous
+         * run: walk the extents covering it and require them to be
+         * exactly dst_base + offset.
+         */
+        if (moved) {
+            u64 off = 0;
+            u32 e;
+
+            for (e = 0; e < el.count && off < moved; e++) {
+                u64 phys = cetrafs_extent_phys_from_hilo(el.arr[e].ee_start_hi, el.arr[e].ee_start_lo);
+                u64 len = cetrafs_extent_len(el.arr[e].ee_len);
+
+                if (phys != dst_base + off) {
+                    pr_warn_ratelimited(
+                        "defrag: ino=%llu block %llu moved to %llu but now reads %llu -- rewritten under us, "
+                        "abandoning the move\n",
+                        (unsigned long long) inode->i_ino, (unsigned long long) off,
+                        (unsigned long long) (dst_base + off), (unsigned long long) phys);
+                    ret = -ECANCELED;
+                    cetrafs_defrag_inode_unlock(inode);
+                    goto out_free_tail;
+                }
+                off += len;
+            }
+            if (off < moved) {
+                ret = -ECANCELED;
+                cetrafs_defrag_inode_unlock(inode);
+                goto out_free_tail;
+            }
         }
 
         /* Choose this step's end: advance by >= one whole original
@@ -449,7 +573,7 @@ int cetrafs_defrag_inode(struct inode *inode, struct cetrafs_defrag_stats *out_s
          * block on disk authoritative; the uncached read then gets it. */
         ret = filemap_write_and_wait_range(inode->i_mapping, (loff_t) moved << 12, (((loff_t) step_end) << 12) - 1);
         if (ret) {
-            inode_unlock(inode);
+            cetrafs_defrag_inode_unlock(inode);
             goto out_free_tail;
         }
 
@@ -496,7 +620,7 @@ int cetrafs_defrag_inode(struct inode *inode, struct cetrafs_defrag_stats *out_s
         }
         blk_finish_plug(&plug);
         if (ret) {
-            inode_unlock(inode);
+            cetrafs_defrag_inode_unlock(inode);
             goto out_free_tail;
         }
 
@@ -510,7 +634,7 @@ int cetrafs_defrag_inode(struct inode *inode, struct cetrafs_defrag_stats *out_s
 
             ret = cetrafs_defrag_commit(inode, &raw, dst_base, step_end, nblocks, suffix, suffix_count);
             if (ret) {
-                inode_unlock(inode);
+                cetrafs_defrag_inode_unlock(inode);
                 goto out_free_tail;
             }
 
@@ -531,7 +655,11 @@ int cetrafs_defrag_inode(struct inode *inode, struct cetrafs_defrag_stats *out_s
              * space. Clean here (we flushed above and hold inode_lock),
              * so this can't lose a dirty page; next access re-faults
              * against the new mapping and reads our synced new blocks. */
-            ret = invalidate_inode_pages2_range(inode->i_mapping, freed_from, step_end - 1);
+            /* PAGE indices, not block numbers -- see cetrafs_blk_to_pgoff().
+             * These were passed raw, which is correct only while a page
+             * is one block. */
+            ret = invalidate_inode_pages2_range(inode->i_mapping, cetrafs_blk_to_pgoff(freed_from),
+                                                cetrafs_blk_end_pgoff(step_end - 1));
             if (cetrafs_defrag_fail_invalidate)
                 ret = -EBUSY; /* TEST ONLY: a racing reader's page reference, on demand */
             if (ret) {
@@ -575,7 +703,7 @@ int cetrafs_defrag_inode(struct inode *inode, struct cetrafs_defrag_stats *out_s
             }
         }
 
-        inode_unlock(inode);
+        cetrafs_defrag_inode_unlock(inode);
         cond_resched();
     }
 
@@ -600,7 +728,7 @@ int cetrafs_defrag_inode(struct inode *inode, struct cetrafs_defrag_stats *out_s
     goto out_done;
 
 out_unlock:
-    inode_unlock(inode);
+    cetrafs_defrag_inode_unlock(inode);
     goto out_done;
 
 out_free_tail:
@@ -621,7 +749,9 @@ out_done:
     if (out_stats)
         *out_stats = stats;
     kvfree(el.arr);
+    kfree(rawp);
     return ret;
+#undef raw
 }
 
 /* ---- automatic background defrag ------------------------------------ */

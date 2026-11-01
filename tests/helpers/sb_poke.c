@@ -69,6 +69,11 @@ static const struct {
     {"tail_reserve_blocks", offsetof(cetrafs_superblock_t, tail_reserve_blocks), 8},
     {"orphan_blocks", offsetof(cetrafs_superblock_t, orphan_blocks), 8},
     {"bg_data_end", offsetof(cetrafs_superblock_t, bg_data_end), 8},
+    /* The BG table chain. Neither field was reachable from any helper,
+     * so no test could build a hostile chain -- which is part of why
+     * the chain walk went unexercised for so long. */
+    {"bg_table_next", offsetof(cetrafs_superblock_t, bg_table_next), 8},
+    {"bg_table_first_count", offsetof(cetrafs_superblock_t, bg_table_first_count), 8},
 };
 
 static uint64_t field_get(const cetrafs_superblock_t *sb, int i)

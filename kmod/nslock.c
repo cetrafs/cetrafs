@@ -47,6 +47,8 @@
 #include <linux/string.h>
 #include <linux/timekeeping.h>
 
+#include <linux/moduleparam.h>
+
 #include "kmod.h"
 
 /* How long to keep trying before declaring the holder wedged. A
@@ -98,6 +100,15 @@ struct cetrafs_nslock_ctx {
     struct super_block *sb; /* for fresh dirent_seq stamps at publish */
 };
 
+/*
+ * Test-only: make the namespace-lock release fail to commit, as a
+ * transient device error would. The consequence -- a live node holding
+ * a lock nobody else can take -- is not otherwise reachable.
+ */
+static bool cetrafs_nslock_release_fail;
+module_param_named(nslock_release_fail, cetrafs_nslock_release_fail, bool, 0644);
+MODULE_PARM_DESC(nslock_release_fail, "TEST ONLY: namespace-lock releases do not commit");
+
 static int cetrafs_nslock_mutate(void *image, unsigned int len, void *priv)
 {
     struct cetrafs_nslock_ctx *ctx = priv;
@@ -110,8 +121,21 @@ static int cetrafs_nslock_mutate(void *image, unsigned int len, void *priv)
      * making the dirent_seq this swap lands the publish barrier. */
     if (len < CETRAFS_INODE_NS_BYTES)
         return -EINVAL;
+    if (!ctx->acquire && cetrafs_nslock_release_fail)
+        return -EIO; /* test-only, see the knob */
     memset(&rec, 0, sizeof(rec));
     memcpy(&rec, image, CETRAFS_INODE_NS_BYTES);
+
+    /* The sector as it is ON THE DEVICE, verified before any field of
+     * it is believed. Keeping the fields we do not change and stamping
+     * a fresh checksum over a torn or corrupt record makes it valid
+     * from then on -- the same hazard inode.c's namespace mutator
+     * guards, and this writes the same sector. */
+    if (cetrafs_inode_crc_ns(&rec) != (u32) cetrafs_le64(rec.ns_checksum)) {
+        pr_warn_ratelimited("nslock: ino=%llu sector fails its checksum -- refusing to stamp a fresh one\n",
+                            (unsigned long long) cetrafs_le64(rec.ino));
+        return -EUCLEAN;
+    }
 
     if (cetrafs_le64(rec.generation) != ctx->generation)
         return -ESTALE; /* inode number reused for a different file */
@@ -180,6 +204,68 @@ static int cetrafs_nslock_mutate(void *image, unsigned int len, void *priv)
     memcpy(image, &rec, CETRAFS_INODE_NS_BYTES);
     return 0;
 }
+
+/*
+ * One retry pass over the namespace locks whose release did not
+ * commit. Called from the heartbeat tick.
+ *
+ * A pure lock-clear: no staged record goes with it. Whatever the
+ * failed release was also trying to publish is already lost and was
+ * logged as lost at the time -- the point here is only to stop holding
+ * a lock nobody else can take.
+ *
+ * An entry is settled and dropped when the swap commits, when the
+ * record says the lock is no longer ours, or when the identity has
+ * changed (-ESTALE: the number was reused, so the lock is not ours to
+ * clear). Anything else goes back on the queue for the next tick.
+ */
+void cetrafs_nslock_retry_deferred(struct super_block *sb)
+{
+    struct cetrafs_nsrel_pending pend[CETRAFS_NSLOCK_DEFERRED_MAX];
+    u32 n, i;
+    u32 my_node_id;
+
+    n = cetrafs_sb_nslock_take_deferred(sb, pend, ARRAY_SIZE(pend));
+    if (!n)
+        return;
+    if (cetrafs_sb_is_fenced(sb) || cetrafs_sb_get_node_id(sb, &my_node_id) != 0) {
+        /* Nothing we may write right now; keep them for later. */
+        for (i = 0; i < n; i++)
+            cetrafs_sb_nslock_defer(sb, pend[i].ino, pend[i].generation);
+        return;
+    }
+
+    for (i = 0; i < n; i++) {
+        struct cetrafs_nslock_ctx ctx = {
+            .my_node_id = my_node_id,
+            .generation = pend[i].generation,
+            .acquire = false,
+            .staged = NULL,
+            .clobbered = CETRAFS_NODE_ID_NONE,
+        };
+        int ret = cetrafs_cas_record(sb, cetrafs_inode_lba(sb, pend[i].ino), cetrafs_nslock_mutate, &ctx);
+
+        /*
+         * The VERDICT comes from the ctx, never from ret.
+         *
+         * cetrafs_cas_record() flattens a mutator's >0 ("nothing to
+         * do") to 0, and says so in a comment that names this exact
+         * trap -- so `ret == 1` below could not fire, and a release
+         * whose lock a peer had already taken was logged as committed.
+         * The mutator records who holds it in ctx.clobbered; that is
+         * the channel the comment prescribes.
+         */
+        if (ret == 0 && ctx.clobbered == CETRAFS_NODE_ID_NONE) {
+            pr_info("nslock: ino=%llu release committed on retry\n", (unsigned long long) pend[i].ino);
+        } else if (ret == 0 || ret == -ESTALE) {
+            pr_info("nslock: ino=%llu no longer ours to release (%d) -- dropping the retry\n",
+                    (unsigned long long) pend[i].ino, ret);
+        } else {
+            cetrafs_sb_nslock_defer(sb, pend[i].ino, pend[i].generation);
+        }
+    }
+}
+
 
 /* One acquire attempt. Returns 0 on success, -EBUSY if a live peer holds
  * it, or another errno. */
@@ -379,19 +465,28 @@ void cetrafs_nslock_release(struct inode *inode)
          * very inode). 1: the lock is no longer ours -- a peer judged us
          * stale and stole it; our staged update is forfeit, which is
          * correct because that peer has already replayed our journal. */
-        if (ret == 0 || ret == -ESTALE || ret == 1)
-            break;
+        if (ret == 0 || ret == -ESTALE)
+            break; /* ret > 0 cannot reach here: the CAS layer flattens it */
         msleep(CETRAFS_NSLOCK_SLEEP_MS);
     }
 
-    if (ret == 1 && ctx.clobbered != CETRAFS_NODE_ID_NONE)
+    if (ctx.clobbered != CETRAFS_NODE_ID_NONE)
         pr_warn("nslock: ino=%llu namespace lock was no longer ours at release (now %u) -- a peer judged us stale and "
                 "took it\n",
                 (unsigned long long) inode->i_ino, ctx.clobbered);
-    else if (ret < 0 && ret != -ESTALE)
-        pr_err("nslock: ino=%llu release did not commit after %d attempts (%d) -- leaving the lock for stale-reclaim "
+    else if (ret < 0 && ret != -ESTALE) {
+        /* Remember it and retry on the heartbeat. "Leaving it for
+         * stale-reclaim" describes what used to happen accurately and
+         * is a poor outcome: stale reclaim only fires for a node that
+         * stopped heartbeating, and this one has not. The lock would
+         * have sat there until we died or unmounted, with every
+         * namespace operation on this inode -- from any node --
+         * exhausting its retry budget and returning -EBUSY. */
+        cetrafs_sb_nslock_defer(sb, inode->i_ino, ctx.generation);
+        pr_err("nslock: ino=%llu release did not commit after %d attempts (%d) -- queued for retry "
                "rather than clobbering the record\n",
                (unsigned long long) inode->i_ino, CETRAFS_NSLOCK_RELEASE_RETRIES, ret);
+    }
 
     cetrafs_inode_ns_mutex_unlock(inode);
     kfree(recs);

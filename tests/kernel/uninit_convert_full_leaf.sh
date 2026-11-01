@@ -47,7 +47,9 @@ path = sys.argv[1]
 fd = os.open(path, os.O_RDWR | os.O_CREAT, 0o644)
 SZ = 256 << 20
 if libc.fallocate(fd, 0, ctypes.c_long(0), ctypes.c_long(SZ)) != 0:
-    print("SKIP: fallocate unsupported:", os.strerror(ctypes.get_errno())); os._exit(3)
+    print("SKIP: fallocate unsupported:", os.strerror(ctypes.get_errno()))
+    sys.stdout.flush()  # os._exit() does not flush: without this the reason is lost
+    os._exit(3)
 # Every other block, so each write SPLITS a preallocated extent -- that
 # is what consumes leaf slots. A spacer file interleaves so the written
 # blocks are not physically contiguous and cannot merge away.

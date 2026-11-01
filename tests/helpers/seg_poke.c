@@ -67,7 +67,7 @@ int main(int argc, char **argv)
     int fd;
 
     if (argc < 3) {
-        fprintf(stderr, "usage: %s <dev> loop|magic|crc|dangle <lba>|firstid <n>|dump\n", argv[0]);
+        fprintf(stderr, "usage: %s <dev> loop|magic|crc|dangle <lba>|firstid <n>|count <n>|dump\n", argv[0]);
         return 2;
     }
     fd = open(argv[1], O_RDWR);
@@ -120,6 +120,19 @@ int main(int argc, char **argv)
         restamp(&seg);
         wr(fd, &seg, sizeof(seg), (off_t) cur * CETRAFS_BLOCK_SIZE);
         printf("seg_poke: tail %" PRIu64 " now points at %s\n", cur, argv[3]);
+    } else if (!strcmp(argv[2], "count")) {
+        /* The descriptor count a segment claims. Nothing could set it
+         * before, which is why the chain walk's use of it went
+         * untested: a count large enough wraps the walker's u32 cursor
+         * and can land it back on exactly the recorded Block Group
+         * count, at which point every check it passes through agrees. */
+        if (argc < 4)
+            die("count needs a value");
+        rd(fd, &seg, sizeof(seg), (off_t) head * CETRAFS_BLOCK_SIZE);
+        seg.count = cetrafs_cpu_to_le32((uint32_t) strtoul(argv[3], NULL, 0));
+        restamp(&seg);
+        wr(fd, &seg, sizeof(seg), (off_t) head * CETRAFS_BLOCK_SIZE);
+        printf("seg_poke: head %" PRIu64 " count -> %s (checksum restamped)\n", head, argv[3]);
     } else if (!strcmp(argv[2], "firstid")) {
         if (argc < 4)
             die("firstid needs a value");

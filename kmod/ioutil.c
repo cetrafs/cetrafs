@@ -354,13 +354,90 @@ void cetrafs_blk_tail_stamp(struct buffer_head *bh, u32 magic)
     tail->crc = cetrafs_cpu_to_le32(~crc32c(~0U, bh->b_data, CETRAFS_BLK_TAIL_OFF));
 }
 
+/*
+ * Structure sanity, which is NOT what the checksum proves.
+ *
+ * A CRC says the bytes are the ones that were written. It says nothing
+ * about whether they make sense, and every field below was trusted the
+ * moment the CRC passed: a dirent's name_len went straight to
+ * dir_emit(), an xattr's value_len straight to a memcpy() aimed at
+ * userspace, an extent header's entry count straight into an array
+ * index. A peer running older or broken code, a crafted image, or a
+ * flipped bit inside a correctly restamped block all produce exactly
+ * that -- hostile values behind a valid checksum.
+ *
+ * Checked where the block is READ rather than at each use, because
+ * eh_entries alone has 69 use sites and a rule that every one of them
+ * must remember is a rule one of them will forget.
+ *
+ * Cost: for an extent leaf or index this is ONE comparison, because
+ * that read is on the per-block mapping path and anything proportional
+ * to the entry count would land in cetrafs_get_block()'s budget
+ * (docs/PERFORMANCE.md). Dirent and xattr blocks are read by namespace
+ * and xattr operations only, never per block of data, so there the scan
+ * over the entries is affordable and is done.
+ */
+bool cetrafs_blk_struct_ok_magic(const struct buffer_head *bh, u32 magic)
+{
+    const void *p = bh->b_data;
+    unsigned int i;
+
+    switch (magic) {
+    case CETRAFS_DIRENT_TAIL_MAGIC: {
+        const cetrafs_dirent_t *de = (const cetrafs_dirent_t *) p;
+
+        for (i = 0; i < CETRAFS_DIRENTS_PER_BLOCK; i++)
+            if (cetrafs_le16(de[i].name_len) > CETRAFS_FILENAME_MAX)
+                return false;
+        return true;
+    }
+    case CETRAFS_XATTR_TAIL_MAGIC: {
+        const cetrafs_xattr_entry_t *xa = (const cetrafs_xattr_entry_t *) p;
+
+        /* As many as actually fit -- CETRAFS_MAX_XATTRS is the per-INODE
+         * limit, not the per-block one, and iterating that many would
+         * read past the end of the block. (xattr.c computes the same
+         * thing locally; this is the one place it is needed outside
+         * it.) */
+        const unsigned int per_block = CETRAFS_BLOCK_SIZE / sizeof(cetrafs_xattr_entry_t);
+
+        for (i = 0; i < per_block; i++) {
+            if (cetrafs_le16(xa[i].value_len) > CETRAFS_XATTR_VALUE_MAX)
+                return false;
+            /* The key is compared with strcmp() and measured with
+             * strlen(): it has to terminate inside its own field. */
+            if (!memchr(xa[i].key, '\0', CETRAFS_XATTR_KEY_MAX))
+                return false;
+        }
+        return true;
+    }
+    case CETRAFS_LEAF_TAIL_MAGIC: {
+        const cetrafs_extent_hdr_t *h = (const cetrafs_extent_hdr_t *) p;
+
+        return cetrafs_le16(h->eh_entries) <= CETRAFS_EXT_BLOCK_MAX_LEAVES;
+    }
+    case CETRAFS_INDEX_TAIL_MAGIC: {
+        const cetrafs_extent_hdr_t *h = (const cetrafs_extent_hdr_t *) p;
+
+        return cetrafs_le16(h->eh_entries) <= CETRAFS_EXT_BLOCK_MAX_IDX;
+    }
+    default:
+        return true;
+    }
+}
+
 bool cetrafs_blk_tail_valid(const struct buffer_head *bh, u32 magic)
 {
     const cetrafs_blk_tail_t *tail = (const cetrafs_blk_tail_t *) (bh->b_data + CETRAFS_BLK_TAIL_OFF);
 
     if (cetrafs_le32(tail->magic) != magic)
         return false;
-    return cetrafs_le32(tail->crc) == ~crc32c(~0U, bh->b_data, CETRAFS_BLK_TAIL_OFF);
+    if (cetrafs_le32(tail->crc) != ~crc32c(~0U, bh->b_data, CETRAFS_BLK_TAIL_OFF))
+        return false;
+    /* Integrity first, then sense. Both failures take the same route --
+     * retry fresh, then -EUCLEAN -- because a lockless reader can catch
+     * a writer mid-update and see either. */
+    return cetrafs_blk_struct_ok_magic(bh, magic);
 }
 
 /*

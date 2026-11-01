@@ -115,74 +115,11 @@ static int cetrafs_read_node_entry(struct super_block *sb, u32 idx, cetrafs_node
     return -EUCLEAN;
 }
 
-/* Write node registry row #idx, stamping a fresh checksum first. One row
- * per block (v0x0007) makes this a blind full-block write -- this row is
- * the only thing in its block, and a row's only legitimate writer is its
- * own node (or, for a contested FREE-row claim, a PR-mutex'd claimant
- * with verify-readback), so there is nothing else in the block to
- * preserve and no concurrent writer to merge with. */
-static int cetrafs_write_node_entry(struct super_block *sb, u32 idx, const cetrafs_node_entry_t *in)
-{
-    const cetrafs_superblock_t *raw_sb = cetrafs_sb_raw(sb);
-    cetrafs_node_entry_t stamped = *in;
-    struct buffer_head *bh;
-
-    if (!raw_sb)
-        return -EINVAL;
-    if (idx >= le32_to_cpu(raw_sb->node_table_count))
-        return -EINVAL;
-
-    stamped.checksum = cetrafs_cpu_to_le64(cetrafs_node_crc(&stamped));
-
-    /*
-     * Serialise against cetrafs_cas_region()'s no-CAW fallback, which
-     * read-modify-writes this very record (the read-presence bitmask and
-     * the namespace lock both live in it) with no compare to protect it.
-     * Without this, a CAS can read the record, a blind write like this
-     * one can land, and the CAS then writes its pre-write image back --
-     * silently reverting the record write. Measured on a loop device: 5
-     * lost chmods across three runs of 1200 files with the CAS window
-     * widened, 0 after.
-     *
-     * Only on a device WITHOUT atomic CAW. With one, the CAS compares
-     * against the device, so a write that lands in between makes it
-     * MISCOMPARE and retry against the new image -- which is the whole
-     * point of having it, and serialising there would throw it away.
-     */
-    bool serialise = !cetrafs_sb_caw_available(sb);
-
-    if (serialise)
-        cetrafs_sb_cas_lock(sb);
-
-    bh = sb_getblk(sb, le64_to_cpu(raw_sb->node_table_start) + idx);
-    if (!bh) {
-        if (serialise)
-            cetrafs_sb_cas_unlock(sb);
-        return -EIO;
-    }
-
-    /* The helpers, not a hand-rolled equivalent: cetrafs_bh_end_update()
-     * marks the buffer dirty BEFORE unlocking it, and that order is the
-     * whole point. Dirtying after the unlock leaves a window in which
-     * the buffer is uptodate, clean, and holding an image that exists
-     * only in memory -- and a concurrent forced-fresh reader takes the
-     * lock in exactly that state, clears uptodate and re-reads the OLD
-     * bytes from the device straight over it. The record write is then
-     * marked dirty on reverted content and synced, silently losing it.
-     * (This is hazard 1 in ioutil.c's own comment -- the one measured as
-     * 12 of 292 directory entries lost -- reintroduced by not using the
-     * helper that exists to prevent it.) */
-    cetrafs_bh_begin_update(bh);
-    memcpy(bh->b_data, &stamped, sizeof(stamped));
-    memset(bh->b_data + sizeof(stamped), 0, CETRAFS_BLOCK_SIZE - sizeof(stamped));
-    cetrafs_bh_end_update(bh);
-    sync_dirty_buffer(bh);
-    brelse(bh);
-
-    if (serialise)
-        cetrafs_sb_cas_unlock(sb);
-    return 0;
-}
+/* There is no blind row writer any more, and that is the point: a Node
+ * Registry row is only ever changed by one compare-and-swap of its own
+ * sector (cetrafs_cas_record). The last blind full-row write was
+ * mark-offline's, and it could revert a peer's fence_epoch bump -- see
+ * cetrafs_node_depart_mutate(). */
 
 /*
  * Read-only passthrough for procfs.c's "cluster" dump -- every other file in this codebase that needs a specific row
@@ -362,6 +299,40 @@ static int cetrafs_node_fence_mutate(void *image, unsigned int len, void *priv)
     if (ctx->mark_departed)
         ne.last_seen = 0;
 
+    cetrafs_node_image_commit(image, len, &ne);
+    return 0;
+}
+
+/*
+ * Leave: clear our own last_seen, the "departed deliberately" sentinel,
+ * and touch nothing else.
+ *
+ * As a CAS, not a read-modify-write. The blind write this replaces
+ * carried a comment claiming "a concurrent fence_epoch bump is carried
+ * through rather than reverted" -- which is exactly backwards: the
+ * whole row goes back from a copy read before the bump, so the bump is
+ * what gets reverted. A peer that fenced us while we were unmounting
+ * had its revocation quietly undone, and this node's next incarnation
+ * re-attached by UUID and cached an epoch that no longer reflected
+ * reality.
+ *
+ * CLAUDE.md rule 7: a comment asserting a safety property is a claim,
+ * not a premise. This one named its own hazard and got the direction
+ * wrong.
+ */
+static int cetrafs_node_depart_mutate(void *image, unsigned int len, void *priv)
+{
+    cetrafs_node_entry_t ne;
+
+    (void) priv;
+    memcpy(&ne, image, sizeof(ne));
+
+    if (cetrafs_le32(ne.state) != CETRAFS_NODE_STATE_REGISTERED)
+        return 1; /* already gone: nothing to do, and not an error */
+    if (ne.last_seen == 0)
+        return 1; /* somebody already recorded our departure */
+
+    ne.last_seen = 0;
     cetrafs_node_image_commit(image, len, &ne);
     return 0;
 }
@@ -686,6 +657,20 @@ int cetrafs_node_renew_heartbeat(struct super_block *sb, u32 my_node_id)
  * everywhere else in this codebase), but a mismatch here means real
  * corruption, not a lost race against another node.
  */
+/*
+ * TEST ONLY: pause inside mark-offline, between reading our row and
+ * recording the departure.
+ *
+ * That gap is where a peer's fence_epoch bump used to be lost: the row
+ * was written back whole from the copy read before it. The window is
+ * microseconds wide in production, which is why the blind write
+ * survived review -- and why a test needs it held open. See
+ * tests/kernel/node_offline_fence.sh.
+ */
+static unsigned int cetrafs_node_offline_delay_ms;
+module_param_named(node_offline_delay_ms, cetrafs_node_offline_delay_ms, uint, 0644);
+MODULE_PARM_DESC(node_offline_delay_ms, "TEST ONLY: pause inside mark-offline before recording the departure");
+
 int cetrafs_node_mark_offline(struct super_block *sb, u32 my_node_id)
 {
     cetrafs_node_entry_t ne, check;
@@ -700,16 +685,14 @@ int cetrafs_node_mark_offline(struct super_block *sb, u32 my_node_id)
         return -EINVAL;
     }
 
-    /* Read-modify-write of a row a peer may also be touching: the read
-     * above is forced-fresh, and the only field changed is our own
-     * last_seen, so a concurrent fence_epoch bump is carried through
-     * rather than reverted. (Renewal does this as a CAS; here, at
-     * unmount, we are leaving anyway and a lost race costs nothing but
-     * a peer waiting out the stale window.) */
-    ne.last_seen = 0;
+    if (cetrafs_node_offline_delay_ms)
+        msleep(cetrafs_node_offline_delay_ms); /* test-only; see the parameter */
 
-    ret = cetrafs_write_node_entry(sb, my_node_id, &ne);
-    if (ret)
+    /* One CAS of the row's own sector -- see cetrafs_node_depart_mutate().
+     * Renewal has always done it this way; this path blind-wrote the
+     * whole row and could revert a peer's fence_epoch bump. */
+    ret = cetrafs_cas_record(sb, cetrafs_node_row_lba(sb, my_node_id), cetrafs_node_depart_mutate, NULL);
+    if (ret < 0)
         return ret;
 
     ret = cetrafs_read_node_entry(sb, my_node_id, &check);
@@ -861,6 +844,62 @@ int cetrafs_node_my_uuid(u8 out[CETRAFS_NODE_UUID_LEN])
  * yet, so "self" can only be told by UUID. (The post-registration caller
  * passes its own UUID too, which excludes the row it just claimed just the
  * same.) */
+/*
+ * Is an offline repairer holding this volume?
+ *
+ * `fsck -r` and growfs refuse to touch a volume a node has mounted, but
+ * nothing stopped a node mounting halfway through a repair: the
+ * repairer claimed nothing a mount could see, and a repair pass is
+ * minutes of blind full-block writes to the inode table, the bitmaps
+ * and the dirent blocks. The tools now hold a registry row in
+ * CETRAFS_NODE_STATE_REPAIR for the duration, which this reports and
+ * fill_super() refuses to mount past.
+ *
+ * A LEASE, not a flag: last_seen is refreshed as the repair works, so a
+ * repairer that was killed stops blocking the volume after the usual
+ * staleness window instead of forever. A row whose checksum does not
+ * verify is ignored -- garbage must not be able to make a volume
+ * unmountable.
+ *
+ * Fails CLOSED on an I/O error: not being able to read the registry is
+ * not the same as there being no repairer in it.
+ */
+int cetrafs_node_repair_claim_exists(struct super_block *sb, bool *out_exists, char *out_label, size_t label_sz)
+{
+    const cetrafs_superblock_t *raw_sb = cetrafs_sb_raw(sb);
+    cetrafs_node_entry_t ne;
+    u32 count, idx;
+
+    *out_exists = false;
+    if (!raw_sb)
+        return -EIO;
+    count = cetrafs_le32(raw_sb->node_table_count);
+    if (!count || count > CETRAFS_MAX_READER_NODES)
+        return 0;
+
+    for (idx = 0; idx < count; idx++) {
+        u64 age;
+        int ret = cetrafs_node_get_entry(sb, idx, &ne);
+
+        if (ret == -EIO)
+            return ret; /* cannot verify: see the contract above */
+        if (ret)
+            continue;   /* a bad row is not a claim */
+        if (cetrafs_le32(ne.state) != CETRAFS_NODE_STATE_REPAIR)
+            continue;
+        age = ktime_get_real_seconds() - cetrafs_le64(ne.last_seen);
+        if ((s64) age > (s64) cetrafs_sb_stale_secs(sb))
+            continue; /* its lease ran out */
+        if (out_label && label_sz) {
+            strscpy(out_label, ne.label, min(label_sz, sizeof(ne.label)));
+            out_label[label_sz - 1] = 0;
+        }
+        *out_exists = true;
+        return 0;
+    }
+    return 0;
+}
+
 int cetrafs_node_live_peer_exists(struct super_block *sb, const u8 *my_uuid, bool *out_exists)
 {
     const cetrafs_superblock_t *raw_sb = cetrafs_sb_raw(sb);

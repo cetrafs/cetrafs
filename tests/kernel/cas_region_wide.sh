@@ -59,6 +59,7 @@ try:
     os.fsync(f)
 except OSError as e:
     print("fsync: %s" % e)
+    sys.stdout.flush()
     os._exit(1)
 os.close(f)
 PY

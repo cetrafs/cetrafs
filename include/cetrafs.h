@@ -137,18 +137,40 @@
  * report a healthy grown volume as structurally damaged, which is an
  * invitation to run `fsck -r` on it.
  *
- * So: mkfs writes 0x0009, growfs stamps 0x0009 on any volume it grows,
- * and this build accepts 0x0008 as well so that volumes formatted by
- * the previous release keep working and can be grown in place without a
- * reformat. 0x0008 support is TRANSITIONAL and will be dropped; when it
- * goes, this becomes CETRAFS_VERSION and the usual reformat-to-upgrade
- * policy resumes.
+ * So: mkfs writes 0x0009 and growfs stamps 0x0009 on any volume it
+ * grows.
+ *
+ * The transitional window is CLOSED as of 0.9.2. It existed so volumes
+ * formatted by 0.8.x could be grown in place instead of rebuilt; that
+ * window has served its purpose and this build accepts 0x0009 only.
+ * A 0.8.x volume is refused at mount and must be reformatted -- the
+ * ordinary pre-1.0 policy, resumed.
  *
  * Note what this does NOT mean: a 0x0009 volume is not necessarily a
  * grown one (mkfs stamps it from birth). "Has this been grown?" is
  * answered by layout_gen in the superblock, not by the version.
  */
-#define CETRAFS_VERSION_MIN          0x0008
+#define CETRAFS_VERSION_MIN          CETRAFS_VERSION
+
+/*
+ * The largest a Block Group may be, in blocks.
+ *
+ * Not a policy number: the in-core bitmaps that track a BG's blocks are
+ * the kernel's `bitmap_*` API, whose indices and lengths are
+ * `unsigned int`. A Block Group with more blocks than that cannot be
+ * addressed by them at all -- the scrub's reference set cast the offset
+ * down and marked the WRONG blocks as referenced, which makes it free
+ * live ones. mkfs used to allow 1 PiB per group (2^38 blocks), 64 times
+ * past the point where the index stops meaning anything.
+ *
+ * Enforced by mkfs when the geometry is chosen and again at mount, so a
+ * crafted or hand-edited superblock is refused rather than truncated.
+ */
+#define CETRAFS_MAX_BG_SIZE_BLOCKS   0xFFFFFFFFULL
+
+/* How many un-released namespace locks a node will remember and retry
+ * on the heartbeat before giving up on the rest (kmod/fs.c's nsrel). */
+#define CETRAFS_NSLOCK_DEFERRED_MAX  32U
 
 #define CETRAFS_BLOCK_SIZE           4096U
 
@@ -664,6 +686,29 @@ typedef struct {
 
 #define CETRAFS_NODE_STATE_FREE       0 /* slot never used, or released */
 #define CETRAFS_NODE_STATE_REGISTERED 1 /* claimed by the node in node_uuid */
+/*
+ * An offline REPAIRER -- `fsck -r`, or growfs -- holds this row while it
+ * rewrites the volume's structures.
+ *
+ * Those tools refuse to touch a volume another node has mounted, which
+ * covers the race in one direction only: nothing used to stop a node
+ * MOUNTING halfway through a repair, because the repairer claimed
+ * nothing on the device for a mount to see. A repair pass is minutes of
+ * blind full-block writes to the inode table, the bitmaps and the
+ * dirent blocks, with a kernel allocating out of the same structures.
+ *
+ * Registering as a REGISTERED node would not do: on a CAW device
+ * several mounters are the normal case and a peer would simply join.
+ * This state means "do not mount at all", and fs.c's fill_super()
+ * refuses while a row holding it is still beating.
+ *
+ * It is a LEASE, like everything else here: the repairer refreshes
+ * last_seen as it works, so a repairer that dies takes the usual
+ * staleness window to release the volume rather than blocking it
+ * forever. The value is new but the layout is not -- `state` already
+ * exists, so no format change.
+ */
+#define CETRAFS_NODE_STATE_REPAIR     2
 
 /* Sentinel "no node" / "unassigned" -- matches the width of
  * cetrafs_zone_group_t.owner_node_id (__le16), the narrowest field that

@@ -213,6 +213,41 @@ static u64 parse_size_bytes(const char *arg)
     return (u64) v * mult;
 }
 
+/* The Node Registry row this grow holds, so a node cannot mount the
+ * volume while its tables are being relocated. -1 when nothing is held;
+ * released by atexit() so every path, die() included, gives it back.
+ * A missed release expires on its own -- it is a lease. */
+static int grow_repair_row = -1;
+static int grow_repair_fd = -1;
+static cetrafs_superblock_t grow_repair_sb;
+
+static void growfs_repair_release_atexit(void)
+{
+    if (grow_repair_row >= 0 && grow_repair_fd >= 0) {
+        cetrafs_repair_release(grow_repair_fd, &grow_repair_sb, (uint32_t) grow_repair_row);
+        grow_repair_row = -1;
+    }
+}
+
+/*
+ * Give the volume back while the descriptor is still open.
+ *
+ * The atexit backstop above runs after main() returns, by which time fd
+ * is closed and its write silently does nothing. Every ordinary exit
+ * from here goes through close(fd), so every one of them has to release
+ * first -- the one that did not was the TEST_NO_PUBLISH path, and
+ * growfs.sh caught it immediately: the claim stayed live and the kernel
+ * then refused, correctly, to mount the half-grown volume. The backstop
+ * is for die(), where fd is still open.
+ */
+static void growfs_release_claim(int fd)
+{
+    if (grow_repair_row >= 0 && fd >= 0) {
+        cetrafs_repair_release(fd, &grow_repair_sb, (uint32_t) grow_repair_row);
+        grow_repair_row = -1;
+    }
+}
+
 int main(int argc, char **argv)
 {
     if (argc < 2) {
@@ -625,8 +660,41 @@ int main(int argc, char **argv)
     }
 
     if (dry_run) {
+        growfs_release_claim(fd);
         close(fd);
         return 0;
+    }
+
+    /*
+     * Claim the volume before STEP 1 writes anything.
+     *
+     * The live-peer check above refuses to grow a volume a node has
+     * MOUNTED. Nothing covered the other direction: a node mounting
+     * while this runs caches descriptor tables that are being
+     * relocated under it. The claim is a Node Registry row in
+     * CETRAFS_NODE_STATE_REPAIR -- the same lease `fsck -r` takes, and
+     * the same one fill_super() refuses to mount past.
+     */
+    if (!dry_run) {
+        uint32_t other_row = 0;
+        char other[CETRAFS_NODE_LABEL_LEN + 1] = {0};
+        int busy = cetrafs_find_repair_claim(fd, &sb, &other_row, other, sizeof(other));
+
+        if (busy < 0)
+            die_dev("%s: cannot read its Node Registry -- refusing to grow blind", dev);
+        if (busy)
+            die_dev("%s is being repaired right now (registry row %u%s%s) -- wait for it to finish", dev, other_row,
+                    other[0] ? ", " : "", other[0] ? other : "");
+
+        grow_repair_row = cetrafs_repair_claim(fd, &sb, "growfs");
+        if (grow_repair_row < 0)
+            die_dev("%s: no free Node Registry row to claim for the grow -- refusing to write while a node could "
+                    "still mount it",
+                    dev);
+        grow_repair_fd = fd;
+        grow_repair_sb = sb;
+        atexit(growfs_repair_release_atexit);
+        printf("  claimed registry row %d for the duration of this grow\n", grow_repair_row);
     }
 
     /* ---------------------------------------------------------------
@@ -907,6 +975,7 @@ int main(int argc, char **argv)
      */
     if (getenv("CETRAFS_GROWFS_TEST_NO_PUBLISH")) {
         fprintf(stderr, "growfs.cetra: TEST MODE: stopping before the superblock publish\n");
+        growfs_release_claim(fd);
         close(fd);
         free(blk);
         return 0;
@@ -957,6 +1026,12 @@ int main(int argc, char **argv)
     }
     free(zg_added);
     sync_device(fd, true);
+    /* Give the volume back BEFORE the fd goes: the atexit backstop runs
+     * after main() returns, by which time this descriptor is closed and
+     * its write would silently do nothing (measured: the claim was
+     * still on the device after a successful grow). The backstop stays
+     * for the die() paths, where fd is still open. */
+    growfs_release_claim(fd);
     close(fd);
     free(blk);
 

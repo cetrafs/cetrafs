@@ -151,6 +151,7 @@ static int cetrafs_journal_write_flag(struct super_block *sb, u64 area_start, bo
 {
     struct buffer_head *bh = cetrafs_getblk_overwrite(sb, area_start);
     cetrafs_node_journal_hdr_t *hdr;
+    int ret;
 
     if (!bh)
         return -EIO;
@@ -161,9 +162,17 @@ static int cetrafs_journal_write_flag(struct super_block *sb, u64 area_start, bo
     hdr->state = cetrafs_cpu_to_le32(dirty ? CETRAFS_NODE_JOURNAL_DIRTY : CETRAFS_NODE_JOURNAL_CLEAN);
     hdr->replay_owner = cetrafs_cpu_to_le32(CETRAFS_NODE_ID_NONE); /* 0 is a real node id -- be explicit */
     cetrafs_bh_end_update(bh);
-    sync_dirty_buffer(bh);
+    /* The flag is the whole point of this block: committing entries
+     * while the on-disk state still reads CLEAN means the next replay
+     * of this area skips them, so a failed write here must reach the
+     * caller. Both callers already check -- it was this function that
+     * reported success unconditionally. */
+    ret = sync_dirty_buffer(bh);
+    if (ret)
+        pr_err("journal: could not write the %s flag at %llu (%d)\n", dirty ? "DIRTY" : "CLEAN",
+               (unsigned long long) area_start, ret);
     brelse(bh);
-    return 0;
+    return ret;
 }
 
 /* --- replay claim (replaces the cluster mutex) -------
@@ -435,6 +444,25 @@ static bool cetrafs_journal_skip_target_write;
 module_param_named(journal_skip_target_write, cetrafs_journal_skip_target_write, bool, 0644);
 MODULE_PARM_DESC(journal_skip_target_write, "test-only: journal the entry but do not write the target in place");
 
+/*
+ * Test-only: make the target's synchronous write REPORT FAILURE.
+ *
+ * Distinct from journal_skip_target_write above, which models a crash:
+ * it suppresses the write and deliberately returns SUCCESS, because a
+ * crashed writer never returns at all. This one models a device that
+ * REFUSES the write: the target keeps its prior image, exactly as it
+ * would, and the caller -- still alive -- has to be told.
+ *
+ * Both halves matter. An injection that let the write land and only
+ * reported failure would leave the target NEWER than the entry, and
+ * replay's prev_checksum guard would then (rightly) refuse to apply it
+ * -- so the suite would watch the entry survive and still conclude
+ * nothing about whether it was usable.
+ */
+static bool cetrafs_journal_fail_target_write;
+module_param_named(journal_fail_target_write, cetrafs_journal_fail_target_write, bool, 0644);
+MODULE_PARM_DESC(journal_fail_target_write, "test-only: the target's write fails (the entry must stay live)");
+
 static bool cetrafs_journal_ignore_guard;
 module_param_named(journal_ignore_guard, cetrafs_journal_ignore_guard, bool, 0644);
 MODULE_PARM_DESC(journal_ignore_guard, "test-only: replay without the prev_checksum guard (reproduces the pre-fix bug)");
@@ -623,8 +651,38 @@ write_target:
         blkdev_issue_flush(sb->s_bdev);
     /* end_update marks it dirty and releases it; the sync must follow,
      * never precede, because sync_dirty_buffer() takes the buffer lock. */
+    if (cetrafs_journal_fail_target_write) {
+        /* Test-only: the device refuses it. Abort rather than end the
+         * update, so the target keeps the image a refused write would
+         * have left, then fail exactly as a real error does below. */
+        cetrafs_bh_abort_update(bh);
+        pr_err("journal: journal_fail_target_write set -- target %llu refused, txn %llu stays LIVE for replay\n",
+               (unsigned long long) bh->b_blocknr, (unsigned long long) txn_id);
+        return -EIO;
+    }
+
     cetrafs_bh_end_update(bh);
-    sync_dirty_buffer(bh);
+    {
+        /*
+         * CHECK it. "The target is durable" below was asserted, never
+         * tested: on a failed write the entry was consumed anyway,
+         * destroying the only copy that could have redone it. Keeping
+         * the entry live is the whole reason the journal exists, and
+         * the operation must fail rather than report a write that did
+         * not land.
+         *
+         * Keeping the slot busy is deliberate and matches the
+         * skip_consume path: a released slot is reused immediately, and
+         * the next entry would overwrite this header.
+         */
+        int werr = sync_dirty_buffer(bh);
+
+        if (werr) {
+            pr_err("journal: target %llu failed to write (%d) -- txn %llu stays LIVE for replay\n",
+                   (unsigned long long) bh->b_blocknr, werr, (unsigned long long) txn_id);
+            return werr;
+        }
+    }
 
     /* 4. Consume: the target is durable, so the entry is spent. Leaving
      * it live would let a later replay of our area (after our crash in
@@ -1092,9 +1150,32 @@ int cetrafs_journal_replay_node(struct super_block *sb, u32 node_id, bool wait_f
         }
 
         if (apply) {
+            int werr;
+
+            /* Through the update protocol, not a bare mark_buffer_dirty:
+             * it takes the buffer lock and asserts uptodate, so a
+             * concurrent reader cannot observe this block half-replaced.
+             * Every other writer in the tree goes through it. */
+            cetrafs_bh_begin_update(tbh);
             memcpy(tbh->b_data, pbh->b_data, CETRAFS_BLOCK_SIZE);
-            mark_buffer_dirty(tbh);
-            sync_dirty_buffer(tbh);
+            cetrafs_bh_end_update(tbh);
+            werr = sync_dirty_buffer(tbh);
+            if (werr) {
+                /* Do NOT consume this entry and do NOT park the area
+                 * CLEAN: the redo did not land, and the entry is the
+                 * only thing that can still repair the target. Leaving
+                 * the area DIRTY is what brings a later sweep back to
+                 * it. Entries already applied and consumed above stay
+                 * consumed, which is correct -- they succeeded. */
+                pr_err("journal replay: node %u txn %llu failed to redo target %llu (%d) -- "
+                       "entry kept, area stays dirty for a later attempt\n",
+                       node_id, (unsigned long long) entries[s].txn_id,
+                       (unsigned long long) entries[s].target_lba, werr);
+                brelse(tbh);
+                brelse(pbh);
+                ret = werr;
+                goto out_free;
+            }
             atomic64_inc(&cetrafs_journal_replay_applied);
             applied++;
         }
@@ -1107,9 +1188,16 @@ consume:
             ret = -EIO;
             goto out_free;
         }
+        cetrafs_bh_begin_update(hbh);
         memset(hbh->b_data, 0, CETRAFS_BLOCK_SIZE);
-        mark_buffer_dirty(hbh);
-        sync_dirty_buffer(hbh);
+        cetrafs_bh_end_update(hbh);
+        if (sync_dirty_buffer(hbh))
+            /* Safe, just loud, and the same reasoning as the write
+             * path's consume: the entry stays live and replay verifies
+             * prev_checksum before applying anything, so a re-apply
+             * that is no longer valid is skipped. */
+            pr_err("journal replay: node %u could not consume txn %llu (entry stays; a re-apply is checked)\n",
+                   node_id, (unsigned long long) entries[s].txn_id);
         brelse(hbh);
     }
 

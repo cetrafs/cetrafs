@@ -44,22 +44,52 @@ DUMP="$(ct_tmp growcompatdump)"
 
 sbver() { "$POKE" "$1" > "$DUMP" 2>/dev/null || true; sed -n 's/^version=//p' "$DUMP" | head -1; }
 
-# The PREVIOUS RELEASE means the newest tag that is NOT the version this
-# tree is, which is the version debian/changelog names (the single source
-# of it -- see docs/internal/RELEASE.md).
+# THE PREVIOUS RELEASE, for this suite, is not "the tag before this one".
+# It is the newest release whose on-disk format equals this build's
+# CETRAFS_VERSION_MIN -- the oldest format we still accept, which is the
+# whole reason the compatibility window exists and the only thing worth
+# growing in place.
 #
-# `git describe --abbrev=0` was wrong in both directions. Before a
-# release it names the last tag, which is right by accident; the moment
-# that release is TAGGED it names the tree's own version, and the suite
-# starts comparing this build against itself. That is exactly what
-# happened when 0.9 was tagged: the "old" mkfs was the current one, and
-# the -s check below -- there to prove the old binary really is old --
-# caught it and failed rather than letting the suite pass vacuously.
+# Two earlier spellings both rotted, in opposite directions:
+#
+#   `git describe --abbrev=0` named the tree's OWN version the moment
+#   that version was tagged, so the suite compared this build against
+#   itself (caught when 0.9 was tagged).
+#
+#   "newest tag that is not the changelog version" then named 0.9 once
+#   0.9.1 existed -- a real previous release, but one that writes the
+#   CURRENT format, so there was no old format left to test.
+#
+# Asking the tags what format they produce cannot rot: it is the same
+# question the window is defined in terms of.
+# Both are read from the header, and CETRAFS_VERSION_MIN may be the
+# literal token CETRAFS_VERSION rather than a number -- which is exactly
+# what "the window is closed" looks like in the source. Resolve that one
+# level of indirection instead of parsing it as 0 and silently skipping.
+hdrdef() { sed -n "s/^#define $1  *//p" "$2" | head -1 | awk '{print $1}'; }
+CURFMT="$(hdrdef CETRAFS_VERSION "$ROOT/include/cetrafs.h")"
+MINTOK="$(hdrdef CETRAFS_VERSION_MIN "$ROOT/include/cetrafs.h")"
+[ "$MINTOK" = "CETRAFS_VERSION" ] && MINTOK="$CURFMT"
+MINVER="$(awk -v v="$MINTOK" 'BEGIN{print strtonum(v)}')"
+CURFMT="$(awk -v v="$CURFMT" 'BEGIN{print strtonum(v)}')"   # decimal, as the poke tool reports it
+[ "${MINVER:-0}" -gt 0 ] || fail "could not resolve CETRAFS_VERSION_MIN (read '$MINTOK')"
+
+# This tree's own version never counts as the previous release, however
+# the formats line up -- with the window closed, MIN equals VERSION and
+# the newest tag writing that format is this one.
 CURVER="$(sed -n '1s/^cetrafs (\([^)]*\)).*/\1/p' "$ROOT/debian/changelog")"
-# Release tags only: publish-tag.sh keeps the published ones under
-# public/<version>, which sort first and are the same code anyway.
-PREV="$(git -C "$ROOT" tag --sort=-v:refname 2>/dev/null | grep -v / | grep -vx "$CURVER" | head -1 || true)"
-[ -n "$PREV" ] || { skip "no earlier release tag to compare against (this tree is $CURVER)"; ct_exit; }
+
+PREV=""
+for TAG in $(git -C "$ROOT" tag --sort=-v:refname 2>/dev/null | grep -v / | grep -vx "$CURVER"); do
+    TAGVER="$(git -C "$ROOT" show "$TAG:include/cetrafs.h" 2>/dev/null |
+        sed -n 's/^#define CETRAFS_VERSION  *//p' | head -1 | awk '{print strtonum($1)}')"
+    [ -n "$TAGVER" ] || continue
+    if [ "$TAGVER" = "$MINVER" ]; then
+        PREV="$TAG"
+        break
+    fi
+done
+[ -n "$PREV" ] || { skip "no released tag writes format $MINVER, so there is no older format to grow"; ct_exit; }
 log "rebuilding mkfs.cetra from $PREV (the previous release)"
 mkdir -p "$OLD/src"
 ok=1
@@ -76,26 +106,20 @@ if ! (cd "$OLD/src" && cc -D_FILE_OFFSET_BITS=64 -I . -O2 -std=gnu99 -w -o "$OLD
 fi
 pass "built the previous release's mkfs.cetra"
 
-# If this binary understands -s it is not the old one, and the whole
-# suite would be testing this build against itself.
+# "Is this really the old binary?" is now answered by WHICH TAG WE
+# PICKED -- the newest one whose CETRAFS_VERSION equals this build's
+# CETRAFS_VERSION_MIN -- and proved empirically a few lines below, where
+# the volume it formats must carry that format number.
 #
-# Asked of the USAGE TEXT, not by running it against a device. The
-# earlier version ran `mkfs.old /dev/null -s 100M` and checked for the
-# undersize line -- which never appears, because mkfs rejects /dev/null
-# long before it gets that far. It passed whether or not the binary
-# understood -s, i.e. it could not fail.
-# Captured, THEN matched. `mkfs.old 2>&1 | grep -q` returns mkfs's exit
-# status under `set -o pipefail`, and mkfs with no arguments exits 2 for
-# usage -- so the pipeline was non-zero whether or not grep matched, and
-# BOTH branches reached a pass. This guard could not fail, which is the
-# second time it has been wrong: the first version ran mkfs against
-# /dev/null, where it dies before printing the usage text at all.
-old_usage="$("$OLD/mkfs.old" 2>&1 || true)"
-if grep -qE '^  -s:|\[-s ' <<<"$old_usage"; then
-    fail "the 'old' mkfs understands -s -- it is not the previous release, this suite proves nothing"
-    ct_exit
-fi
-pass "the old mkfs has no -s flag, so it really is the previous release"
+# It used to be asked of the usage text instead: "if this binary
+# understands -s it is not the old one". That proxy has now been wrong
+# three times. Run against /dev/null it died before printing any usage
+# at all; piped into grep under `set -o pipefail` it returned mkfs's
+# exit status rather than grep's, so both branches passed; and finally
+# it became simply false, because -s shipped in 0.9 and 0.9 is a
+# legitimate previous release. A proxy for a property is worth exactly
+# as long as nobody changes the property.
+log "previous release: $PREV (writes on-disk format $MINVER, this build's CETRAFS_VERSION_MIN)"
 
 # A 600 MiB backing file, grown later with truncate+losetup -c.
 IMG="$(ct_big_image 600 growcompat)"
@@ -113,8 +137,8 @@ fi
 # the whole of the no-reformat promise, so it is asserted rather than
 # assumed -- and if this ever reads 9, the "old" mkfs is not old.
 v="$(sbver "$DEV")"
-[ "$v" = "8" ] && pass "the previous release's volume carries format version 8" ||
-    fail "expected format version 8 from the old mkfs, got '$v'"
+[ "$v" = "$MINVER" ] && pass "the previous release's volume carries format version $MINVER" ||
+    fail "expected format version $MINVER from $PREV's mkfs, got '$v'"
 
 ct_fsck "$DEV" >/dev/null 2>&1 && pass "this build's fsck accepts the previous release's volume" ||
     fail "this build's fsck rejects a volume the previous release just formatted"
@@ -168,7 +192,10 @@ ct_fsck "$DEV" >/dev/null 2>&1 && pass "the grown volume is clean" || fail "the 
 # release from touching the volume again -- and makes it say so plainly
 # instead of reporting a healthy layout as damage.
 v="$(sbver "$DEV")"
-[ "$v" = "9" ] && pass "the grow bumped the format version 8 -> 9 (one-way door)" ||
+# With the compatibility window closed these are the same number, so
+# the grow leaves it alone rather than bumping it -- the assertion is
+# that the grown volume ends at the CURRENT format either way.
+[ "$v" = "$CURFMT" ] && pass "the grown volume carries format version $CURFMT" ||
     fail "the grow left the format version at '$v'; the previous release would still try to read it"
 
 ct_mount "$DEV" "$MNT"

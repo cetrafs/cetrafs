@@ -112,6 +112,47 @@ static void *xcalloc(size_t n, size_t s)
 #define CETRAFS_KNOWN_RO_COMPAT 0ULL
 
 static int repair_mode;    /* -r given */
+/* The Node Registry row this run holds while it repairs, so a node
+ * cannot mount the volume mid-pass. -1 when nothing is held. See
+ * devutil.h's cetrafs_repair_claim(). */
+static int repair_row = -1;
+static int repair_fd = -1;
+static cetrafs_superblock_t repair_sb;
+
+/* Registered with atexit() the moment the row is taken: every exit from
+ * here on -- including die(), which the write helpers call -- has to
+ * give the volume back. A missed release is not fatal (the lease
+ * expires) but it leaves the volume unmountable for the staleness
+ * window, which an operator would rightly call a bug. */
+/* Refresh the claim while the passes run. Rate-limited to one write a
+ * few seconds apart: a repair walks millions of inodes and the lease
+ * only has to outlive the staleness window, not every iteration. */
+static void fsck_repair_heartbeat(void)
+{
+    static time_t last;
+    time_t now;
+
+    if (repair_row < 0 || repair_fd < 0)
+        return;
+    now = time(NULL);
+    if (last && now - last < 5)
+        return;
+    last = now;
+    if (cetrafs_repair_renew(repair_fd, &repair_sb, (uint32_t) repair_row) != 0) {
+        /* Somebody cleared our row. Carrying on would be repairing a
+         * volume a node believes is free to mount. */
+        fprintf(stderr, "ERR: this repair's registry claim was taken away -- stopping before writing more\n");
+        exit(FSCK_EXIT_NOEXAM);
+    }
+}
+
+static void fsck_repair_release_atexit(void)
+{
+    if (repair_row >= 0 && repair_fd >= 0) {
+        cetrafs_repair_release(repair_fd, &repair_sb, (uint32_t) repair_row);
+        repair_row = -1;
+    }
+}
 static int repair_blocked; /* a fault we must not repair around */
 static uint64_t repairs_made;
 /* Faults found before the content pass declares its own counter (the
@@ -253,9 +294,30 @@ static void repair_reinit_dirent_block(int fd, uint64_t phys, uint64_t self_ino,
  * namespace pass knows who the orphans are, so a second `fsck -r`
  * settles them from the bitmaps, which is the truth. fsck says so.
  */
+/*
+ * Read one inode record.
+ *
+ * The bound is not decoration. Three of the four callers pass a number
+ * fsck itself resolved, but the fourth takes it from a DIRENT on the
+ * device -- and `inode_table_start + (ino - 1)` with an unchecked ino
+ * addresses anything at all, including the data region, where the
+ * bytes are whatever a user wrote into their own file. A record read
+ * from there is attacker-chosen, and the caller in question goes on to
+ * adopt it as /lost+found and write orphan entries into it.
+ *
+ * Out of range is zero-filled, which reads as mode 0: not a directory,
+ * no valid checksum, no identity. Every caller already handles that.
+ */
 static void fsck_read_inode(int fd, const cetrafs_superblock_t *sb, uint64_t ino, cetrafs_inode_t *out)
 {
     uint8_t blk[CETRAFS_BLOCK_SIZE] = {0};
+
+    if (ino < 1 || ino > cetrafs_le32(sb->inodes_count)) {
+        fprintf(stderr, "ERR: inode number %" PRIu64 " is outside the inode table (1..%u) -- not reading it\n", ino,
+                cetrafs_le32(sb->inodes_count));
+        memset(out, 0, sizeof(*out));
+        return;
+    }
 
     pread_all(fd, blk, sizeof(blk), (off_t) (cetrafs_le64(sb->inode_table_start) + (ino - 1)) * CETRAFS_BLOCK_SIZE);
     memcpy(out, blk, sizeof(*out));
@@ -268,6 +330,64 @@ static void fsck_write_inode(int fd, const cetrafs_superblock_t *sb, uint64_t in
     cetrafs_inode_stamp_crcs_us(in);
     memcpy(blk, in, sizeof(*in));
     pwrite_all(fd, blk, sizeof(blk), (off_t) (cetrafs_le64(sb->inode_table_start) + (ino - 1)) * CETRAFS_BLOCK_SIZE);
+}
+
+/*
+ * Does every slot in this dirent block still parse?
+ *
+ * The tail CRC covers the whole block, so a mismatch says "something in
+ * here changed" and nothing about WHAT. The repair for an unreadable
+ * block erases it and lets /lost+found have the contents by inode
+ * number -- which is right when the entries are rubble, and throws away
+ * every name in the directory when the damage was confined to the tail
+ * (a torn write of the tail itself, a stamp that never landed, a bit
+ * flipped in the CRC).
+ *
+ * This is the test for the second case, and it is deliberately
+ * all-or-nothing: salvaging SOME entries out of a block means deciding
+ * which of two disagreeing copies of the truth to keep, and a dirent
+ * that parses can still name the wrong inode. Either the whole block is
+ * coherent -- in which case re-stamping is lossless -- or it is not,
+ * and the old answer stands.
+ */
+static int fsck_dirent_block_coherent(const uint8_t *db, const cetrafs_superblock_t *sb, int first_block,
+                                      uint64_t self_ino)
+{
+    const cetrafs_dirent_t *de = (const cetrafs_dirent_t *) db;
+    int saw_dot = 0, saw_dotdot = 0;
+
+    for (unsigned s = 0; s < CETRAFS_DIRENTS_PER_BLOCK; ++s) {
+        uint64_t ino = cetrafs_le64(de[s].inode);
+        uint16_t nl = cetrafs_le16(de[s].name_len);
+
+        if (ino == 0) {
+            if (nl != 0)
+                return 0; /* a free slot that is not blank is damage */
+            continue;
+        }
+        if (ino > cetrafs_le32(sb->inodes_count))
+            return 0;
+        if (nl < 1 || nl > CETRAFS_FILENAME_MAX)
+            return 0;
+        if (memchr(de[s].name, 0, nl))
+            return 0; /* a NUL inside the name it declares */
+        if (de[s].file_type > CETRAFS_FT_SOCK)
+            return 0;
+        if (nl == 1 && de[s].name[0] == '.')
+            saw_dot = (ino == self_ino);
+        else if (nl == 2 && de[s].name[0] == '.' && de[s].name[1] == '.')
+            saw_dotdot = 1;
+    }
+
+    /* A first block has to carry '.' and '..', and '.' has to point at
+     * the directory itself. Without this an ERASED block -- every slot
+     * blank, which passes every test above -- would be re-stamped as
+     * "intact" and the directory would come back readable, empty, and
+     * missing its structural entries. The rebuild path exists for
+     * exactly that block. */
+    if (first_block && !(saw_dot && saw_dotdot))
+        return 0;
+    return 1;
 }
 
 /* Stamp a dirent block's {magic, crc32c} tail, exactly as dir.c's
@@ -341,23 +461,66 @@ static int fsck_alloc_block(int fd,
  * at depth 0: a directory that spilled into an external leaf is left to
  * the kernel, and this only ever ADDS entries to a directory it created
  * itself. */
-static int fsck_dir_block(const cetrafs_inode_t *in, uint32_t n, uint64_t *out_lba)
+/* A block number read from a (possibly hostile) on-disk record, about to
+ * become a byte offset as (off_t) lba * CETRAFS_BLOCK_SIZE. A value past
+ * total_blocks is corruption, and that multiply is signed-overflow UB for a
+ * huge lba besides (a fuzz finding). 0 is never a valid data/meta block
+ * here (the superblock lives there). */
+static int fsck_lba_in_range(uint64_t lba, uint64_t total_blocks)
 {
-    uint32_t seen = 0;
+    return lba != 0 && lba < total_blocks;
+}
+
+static int fsck_dir_block(const cetrafs_inode_t *in, uint32_t n, uint64_t total_blocks, uint64_t *out_lba)
+{
+    uint64_t seen = 0;
 
     if (in->eh.eh_depth != 0)
         return -1;
     for (uint32_t e = 0; e < cetrafs_le16(in->eh.eh_entries) && e < 4; ++e) {
-        uint32_t len = cetrafs_le32(in->et.leaf[e].ee_len) & CETRAFS_EXT_LEN_MASK;
+        uint64_t len = cetrafs_le32(in->et.leaf[e].ee_len) & CETRAFS_EXT_LEN_MASK;
         uint64_t phys = ((uint64_t) cetrafs_le16(in->et.leaf[e].ee_start_hi) << 32) | cetrafs_le32(in->et.leaf[e].ee_start_lo);
 
         if (n < seen + len) {
-            *out_lba = phys + (n - seen);
+            uint64_t lba = phys + (n - seen);
+
+            /* phys and len both come off the disk, so the block this
+             * resolves to need not be on the device at all -- and every
+             * caller turns it into (off_t) lba * CETRAFS_BLOCK_SIZE,
+             * which is signed-overflow UB before it is a bad read.
+             * Refusing here covers all three callers at once. */
+            if (!fsck_lba_in_range(lba, total_blocks))
+                return -1;
+            *out_lba = lba;
             return 0;
         }
         seen += len;
     }
     return -1;
+}
+
+/* How many blocks a depth-0 directory has, counting only extents that
+ * lie wholly on the device.
+ *
+ * ee_len is 31 bits read off the disk, so four hostile extents sum to
+ * eight billion -- and both callers below turn that count into one
+ * pread per block. Same unbounded walk fsck_run_bg() stops in the
+ * content pass, in the two repair paths that do not have the BG tables
+ * to hand; a block past the end of the device holds no dirent either
+ * way, so dropping it loses nothing a walk could have found. */
+static uint32_t fsck_dir_nblocks(const cetrafs_inode_t *dir, uint64_t total_blocks)
+{
+    uint64_t n = 0;
+
+    for (uint32_t e = 0; e < cetrafs_le16(dir->eh.eh_entries) && e < 4; ++e) {
+        uint64_t len = cetrafs_le32(dir->et.leaf[e].ee_len) & CETRAFS_EXT_LEN_MASK;
+        uint64_t phys = ((uint64_t) cetrafs_le16(dir->et.leaf[e].ee_start_hi) << 32) | cetrafs_le32(dir->et.leaf[e].ee_start_lo);
+
+        if (len == 0 || !fsck_lba_in_range(phys, total_blocks) || phys + len > total_blocks)
+            continue;
+        n += len;
+    }
+    return n > total_blocks ? (uint32_t) total_blocks : (uint32_t) n;
 }
 
 /* State for one repair run's lost+found: resolved or created lazily, on
@@ -392,13 +555,12 @@ static int fsck_dir_link(int fd,
     fsck_read_inode(fd, sb, dir_ino, &dir);
     if (dir.eh.eh_depth != 0)
         return -1;
-    for (uint32_t e = 0; e < cetrafs_le16(dir.eh.eh_entries) && e < 4; ++e)
-        nblocks += cetrafs_le32(dir.et.leaf[e].ee_len) & CETRAFS_EXT_LEN_MASK;
+    nblocks = fsck_dir_nblocks(&dir, cetrafs_le64(sb->total_blocks));
 
     for (uint32_t n = 0; n < nblocks; ++n) {
         cetrafs_dirent_t *de;
 
-        if (fsck_dir_block(&dir, n, &lba))
+        if (fsck_dir_block(&dir, n, cetrafs_le64(sb->total_blocks), &lba))
             return -1;
         pread_all(fd, blk, sizeof(blk), (off_t) lba * CETRAFS_BLOCK_SIZE);
         de = (cetrafs_dirent_t *) blk;
@@ -446,15 +608,21 @@ static int fsck_dir_link(int fd,
             uint64_t lphys = ((uint64_t) cetrafs_le16(last->ee_start_hi) << 32) | cetrafs_le32(last->ee_start_lo);
             uint32_t llen = cetrafs_le32(last->ee_len) & CETRAFS_EXT_LEN_MASK;
 
-            if (lphys + llen == nlba) {
-                last->ee_len = cetrafs_cpu_to_le32((uint16_t) (llen + 1));
+            /* The packer, not a cast. ee_len is 31 bits of length plus
+             * the uninit flag; casting the sum to uint16_t truncated it
+             * at 65535 and, one block later, wrapped the length to ZERO
+             * -- the exact value that made fiemap spin forever before
+             * cetrafs_fiemap() learned to reject it. Growing past the
+             * mask simply starts a new entry instead. */
+            if (lphys + llen == nlba && (uint64_t) llen + 1 <= CETRAFS_EXT_LEN_MASK) {
+                last->ee_len = cetrafs_extent_pack_len(llen + 1, 0);
                 goto grown;
             }
         }
         if (e >= 4)
             return -1;
         dir.et.leaf[e].ee_block = cetrafs_cpu_to_le32(nblocks);
-        dir.et.leaf[e].ee_len = cetrafs_cpu_to_le32(1);
+        dir.et.leaf[e].ee_len = cetrafs_extent_pack_len(1, 0);
         dir.et.leaf[e].ee_start_lo = cetrafs_cpu_to_le32((uint32_t) (nlba & 0xFFFFFFFFu));
         dir.et.leaf[e].ee_start_hi = cetrafs_cpu_to_le16((uint16_t) (nlba >> 32));
         dir.eh.eh_entries = cetrafs_cpu_to_le16((uint16_t) (e + 1));
@@ -485,7 +653,7 @@ static void fsck_set_dotdot(int fd, const cetrafs_superblock_t *sb, uint64_t dir
     uint64_t lba = 0;
 
     fsck_read_inode(fd, sb, dir_ino, &in);
-    if (fsck_dir_block(&in, 0, &lba))
+    if (fsck_dir_block(&in, 0, cetrafs_le64(sb->total_blocks), &lba))
         return;
     pread_all(fd, blk, sizeof(blk), (off_t) lba * CETRAFS_BLOCK_SIZE);
     de = (cetrafs_dirent_t *) blk;
@@ -525,20 +693,33 @@ static uint64_t fsck_lost_found(int fd,
      * somewhere to graft orphans. */
     fsck_read_inode(fd, sb, lf->root_ino, &root);
     if (root.eh.eh_depth == 0) {
-        for (uint32_t e = 0; e < cetrafs_le16(root.eh.eh_entries) && e < 4; ++e)
-            nblocks += cetrafs_le32(root.et.leaf[e].ee_len) & CETRAFS_EXT_LEN_MASK;
+        nblocks = fsck_dir_nblocks(&root, cetrafs_le64(sb->total_blocks));
         for (uint32_t n = 0; n < nblocks; ++n) {
             const cetrafs_dirent_t *de;
 
-            if (fsck_dir_block(&root, n, &lba))
+            if (fsck_dir_block(&root, n, cetrafs_le64(sb->total_blocks), &lba))
                 break;
             pread_all(fd, blk, sizeof(blk), (off_t) lba * CETRAFS_BLOCK_SIZE);
             de = (const cetrafs_dirent_t *) blk;
             for (unsigned k = 0; k < CETRAFS_DIRENTS_PER_BLOCK; ++k) {
                 if (cetrafs_le64(de[k].inode) && cetrafs_le16(de[k].name_len) == 10 && !memcmp(de[k].name, "lost+found", 10)) {
                     cetrafs_inode_t cand;
+                    uint64_t cand_ino = cetrafs_le64(de[k].inode);
 
-                    fsck_read_inode(fd, sb, cetrafs_le64(de[k].inode), &cand);
+                    fsck_read_inode(fd, sb, cand_ino, &cand);
+                    /* Everything about this number came off the device.
+                     * Before orphans are grafted into whatever it names,
+                     * the record has to pass its own checksums and echo
+                     * the number we looked it up by -- a valid record
+                     * belonging to a different inode is not /lost+found
+                     * either. */
+                    if (!cetrafs_inode_crcs_ok(&cand) || cetrafs_le64(cand.ino) != cand_ino) {
+                        fprintf(stderr,
+                                "ERR: the /lost+found entry names inode %" PRIu64
+                                ", whose record does not check out -- cannot recover orphans\n",
+                                cand_ino);
+                        return 0;
+                    }
                     if (!S_ISDIR(cetrafs_le32(cand.mode))) {
                         fprintf(stderr, "ERR: /lost+found exists and is not a directory -- cannot recover orphans\n");
                         return 0;
@@ -602,7 +783,7 @@ static uint64_t fsck_lost_found(int fd,
     nd.eh.eh_entries = cetrafs_cpu_to_le16(1);
     nd.eh.eh_max = cetrafs_cpu_to_le16(4);
     nd.et.leaf[0].ee_block = 0;
-    nd.et.leaf[0].ee_len = cetrafs_cpu_to_le32(1);
+    nd.et.leaf[0].ee_len = cetrafs_extent_pack_len(1, 0);
     nd.et.leaf[0].ee_start_lo = cetrafs_cpu_to_le32((uint32_t) (lba & 0xFFFFFFFFu));
     nd.et.leaf[0].ee_start_hi = cetrafs_cpu_to_le16((uint16_t) (lba >> 32));
     fsck_write_inode(fd, sb, ino, &nd);
@@ -638,40 +819,52 @@ struct fsck_refctx {
  * an out-of-region block or a cross-file overlap. The one place the
  * content pass turns an extent (or a meta block) into bitmap bits, shared
  * by depth 0/1/2 so the depth-2 walk reuses exactly the depth-0 checks. */
-/* A block number read from a (possibly hostile) on-disk record, about to
- * become a byte offset as (off_t) lba * CETRAFS_BLOCK_SIZE. A value past
- * total_blocks is corruption, and that multiply is signed-overflow UB for a
- * huge lba besides (a fuzz finding). 0 is never a valid data/meta block
- * here (the superblock lives there). */
-static int fsck_lba_in_range(uint64_t lba, uint64_t total_blocks)
+/* The BG whose data region holds the WHOLE run [phys, phys+len), or -1.
+ * An extent never crosses a BG, so a legal run fits entirely inside one
+ * BG's data range and the question has a single answer for the run.
+ *
+ * It must be asked ONCE, before anything iterates: a hostile extent
+ * carries len up to 2^31 with a wild phys, and a per-block loop then
+ * runs billions of times and prints one complaint PER block -- GiB of
+ * output and a near-hang on one crafted extent. fsck_mark_run() learned
+ * that from a fuzz finding and fixed it HERE; the namespace walk in
+ * main() had rolled its own loop over the same extents and had not, so
+ * one mutated directory size still bought 19 MB of "no dirent-tail
+ * magic" and a SIGXFSZ under a write limit (a later fuzz finding).
+ * Hence a shared predicate rather than a second copy of the reasoning.
+ *
+ * *base_out, when asked for, receives the number of data blocks in the
+ * BGs before the one found -- the caller's bitmap index of its first
+ * block. It is meaningless, and untouched, when the answer is -1. */
+static int fsck_run_bg(const uint64_t *bg_start, const uint64_t *bg_cnt, uint32_t nbg, uint64_t phys, uint64_t len,
+                       uint64_t *base_out)
 {
-    return lba != 0 && lba < total_blocks;
+    uint64_t base = 0;
+
+    for (uint32_t b = 0; b < nbg; ++b) {
+        if (phys >= bg_start[b] && phys < bg_start[b] + bg_cnt[b]) {
+            if (len > bg_cnt[b] || phys + len > bg_start[b] + bg_cnt[b])
+                return -1;
+            if (base_out)
+                *base_out = base;
+            return (int) b;
+        }
+        base += bg_cnt[b];
+    }
+    return -1;
 }
 
 static void fsck_mark_run(struct fsck_refctx *c, uint64_t phys, uint64_t len, uint64_t ino)
 {
     uint64_t base = 0, idx0;
-    int b, found = -1;
+    int found;
     int overlap_reported = 0;
 
     if (len == 0)
         return;
 
-    /* Validate the whole run against the data regions ONCE, up front. A
-     * hostile extent can carry len up to 2^31 and a wild phys; the old
-     * per-block loop then iterated billions of times and printed one
-     * "outside every data region" line PER block -- GiB of output and a
-     * near-hang on a single crafted extent (a fuzz finding). An extent
-     * never crosses a BG, so a legal run fits entirely inside one BG's
-     * data range; anything else is one problem, reported once. */
-    for (b = 0; b < (int) c->nbg; ++b) {
-        if (phys >= c->bg_start[b] && phys < c->bg_start[b] + c->bg_cnt[b]) {
-            found = b;
-            break;
-        }
-        base += c->bg_cnt[b];
-    }
-    if (found < 0 || len > c->bg_cnt[found] || phys + len > c->bg_start[found] + c->bg_cnt[found]) {
+    found = fsck_run_bg(c->bg_start, c->bg_cnt, c->nbg, phys, len, &base);
+    if (found < 0) {
         fprintf(stderr,
                 "ERR: inode %" PRIu64 " extent [%" PRIu64 ",+%" PRIu64 ") is outside every data region\n",
                 ino, phys, len);
@@ -782,6 +975,53 @@ int main(int argc, char **argv)
     if (cetrafs_le32(sb.magic) != (uint32_t) CETRAFS_MAGIC) {
         fprintf(stderr, "ERR: bad magic\n");
         return 1;
+    }
+
+    /*
+     * Claim the volume before anything is written to it.
+     *
+     * The check below refuses to run against a volume a NODE has
+     * mounted. This is the other direction, which nothing covered: a
+     * node mounting halfway through `-r` finds structures being
+     * rewritten under it by minutes of blind full-block writes. The
+     * claim is a Node Registry row in CETRAFS_NODE_STATE_REPAIR, which
+     * fill_super() refuses to mount past, and it is a lease -- renewed
+     * as the passes run, expiring on its own if this process dies.
+     *
+     * BEFORE the live-peer check, not after, and the order is the
+     * whole point: check-then-claim leaves the window between them
+     * open, and a node mounting inside it sees no claim and is let in.
+     * Claiming first means such a node is refused, and the check that
+     * follows catches the peer that was already there -- in which case
+     * this run bails and the row is released on the way out.
+     */
+    if (repair_mode) {
+        uint32_t other_row = 0;
+        char other[CETRAFS_NODE_LABEL_LEN + 1] = {0};
+        int busy = cetrafs_find_repair_claim(fd, &sb, &other_row, other, sizeof(other));
+
+        if (busy < 0) {
+            fprintf(stderr, "ERR: %s: cannot read its Node Registry -- refusing to repair blind\n", dev);
+            return FSCK_EXIT_NOEXAM;
+        }
+        if (busy) {
+            fprintf(stderr, "ERR: %s is already being repaired (registry row %u%s%s)\n", dev, other_row,
+                    other[0] ? ", " : "", other[0] ? other : "");
+            return FSCK_EXIT_NOEXAM;
+        }
+
+        repair_row = cetrafs_repair_claim(fd, &sb, "fsck -r");
+        if (repair_row < 0) {
+            fprintf(stderr,
+                    "ERR: %s: no free Node Registry row to claim for the repair -- refusing to\n"
+                    "     write while a node could still mount it\n",
+                    dev);
+            return FSCK_EXIT_NOEXAM;
+        }
+        repair_fd = fd;
+        repair_sb = sb;
+        atexit(fsck_repair_release_atexit);
+        printf("  claimed registry row %d for the duration of this repair\n", repair_row);
     }
 
     {
@@ -1373,6 +1613,20 @@ int main(int argc, char **argv)
         pread_all(fd, &ne, sizeof(ne), (off_t) (cetrafs_le64(sb.node_table_start) + n) * CETRAFS_BLOCK_SIZE);
         if (ne.state == CETRAFS_NODE_STATE_FREE)
             continue;
+        if (cetrafs_le32(ne.state) == CETRAFS_NODE_STATE_REPAIR) {
+            /* An offline repairer holding the volume -- including this
+             * process, which claimed a row above. It is not a node and
+             * owns no Zone Groups, so it takes no further part in the
+             * checks below. A STALE one left behind by a killed
+             * repairer is reported: it blocks mounting until its lease
+             * expires, and an operator should know why. */
+            long long age = (long long) time(NULL) - (long long) cetrafs_le64(ne.last_seen);
+
+            if ((int) n != repair_row && age > (long long) CETRAFS_NODE_STALE_SECS)
+                fprintf(stderr, "WARN: node slot %u holds a repair claim last refreshed %llds ago (%s)\n", n, age,
+                        ne.label[0] ? ne.label : "no label");
+            continue;
+        }
         if (cetrafs_le32(ne.state) != CETRAFS_NODE_STATE_REGISTERED) {
             fprintf(stderr, "ERR: node slot %u has unrecognized state %u\n", n, ne.state);
             return 1;
@@ -1757,6 +2011,7 @@ int main(int argc, char **argv)
         /* (inline below; kept as a lambda-ish loop for clarity) */
 
         for (uint64_t ino = 1; ino <= cetrafs_le32(sb.inodes_count); ++ino) {
+            fsck_repair_heartbeat();
             uint64_t bit = ino - 1;
             if (!(ibmap[bit / 8] & (1u << (bit % 8))))
                 continue; /* free inode */
@@ -1809,6 +2064,14 @@ int main(int argc, char **argv)
                 fprintf(stderr, "ERR: inode %" PRIu64 " has extent depth %u (only 0, 1 and 2 exist)\n", ino,
                         in.eh.eh_depth);
                 problems++;
+                /* Same reason as the bad-magic case above, and it was
+                 * missing here: a tree this walker cannot descend means
+                 * that inode's blocks never get marked referenced, so
+                 * the leak pass sees them as unowned and `-r` CLEARS
+                 * them. The file is the blocks. */
+                repair_block(
+                    "an inode's extent tree is deeper than the format allows, so the blocks it owns cannot be "
+                    "distinguished from leaked ones");
                 continue;
             }
 
@@ -2246,6 +2509,7 @@ int main(int argc, char **argv)
          * with the type of every target already known.
          */
         for (uint64_t ino = 1; ino <= cetrafs_le32(sb.inodes_count); ++ino) {
+            fsck_repair_heartbeat();
             uint64_t bit = ino - 1;
             uint8_t iblk[CETRAFS_BLOCK_SIZE];
             cetrafs_inode_t in;
@@ -2262,6 +2526,7 @@ int main(int argc, char **argv)
 
         /* Pass B: walk every directory's entries. */
         for (uint64_t ino = 1; ino <= cetrafs_le32(sb.inodes_count); ++ino) {
+            fsck_repair_heartbeat();
             uint64_t bit = ino - 1;
             uint8_t iblk[CETRAFS_BLOCK_SIZE];
             cetrafs_inode_t in;
@@ -2289,6 +2554,18 @@ int main(int argc, char **argv)
                 memcpy(ext, in.et.leaf, n * sizeof(ext[0]));
             } else {
                 uint64_t lf = ((uint64_t) cetrafs_le16(in.et.idx[0].ei_leaf_hi) << 32) | cetrafs_le32(in.et.idx[0].ei_leaf_lo);
+
+                /* The index entry is read off the device, so the leaf it
+                 * names may be anywhere. Past total_blocks the multiply
+                 * below is signed-overflow UB before it is even a bad
+                 * read -- the reason fsck_lba_in_range() exists. */
+                if (!fsck_lba_in_range(lf, total_blocks)) {
+                    fprintf(stderr,
+                            "ERR: directory inode %" PRIu64 " names extent leaf block %" PRIu64 ", which is not on the device\n",
+                            ino, lf);
+                    problems++;
+                    continue;
+                }
                 pread_all(fd, leafblk, sizeof(leafblk), (off_t) lf * CETRAFS_BLOCK_SIZE);
                 cetrafs_extent_hdr_t *lh = (cetrafs_extent_hdr_t *) leafblk;
                 n = cetrafs_le16(lh->eh_entries) > CETRAFS_EXT_BLOCK_MAX_LEAVES ? CETRAFS_EXT_BLOCK_MAX_LEAVES : cetrafs_le16(lh->eh_entries);
@@ -2300,6 +2577,21 @@ int main(int argc, char **argv)
             for (uint32_t e = 0; e < n; ++e) {
                 uint64_t phys = ((uint64_t) cetrafs_le16(ext[e].ee_start_hi) << 32) | cetrafs_le32(ext[e].ee_start_lo);
                 uint64_t len = cetrafs_le32(ext[e].ee_len) & CETRAFS_EXT_LEN_MASK;
+
+                /* Judge the whole run before reading a single block of
+                 * it -- see fsck_run_bg(). The content pass reports the
+                 * same extent through fsck_mark_run(), so this walk only
+                 * has to decline to follow it: skipping leaves the names
+                 * it would have held unseen, which the reachability pass
+                 * reports as what it is rather than as 300,000 lines. */
+                if (fsck_run_bg(bg_data_start, bg_data_cnt, cetrafs_le32(sb.block_group_count), phys, len, NULL) < 0) {
+                    fprintf(stderr,
+                            "ERR: directory inode %" PRIu64 " extent [%" PRIu64 ",+%" PRIu64 ") is outside every data region\n",
+                            ino, phys, len);
+                    problems++;
+                    logical += len;
+                    continue;
+                }
 
                 for (uint64_t k = 0; k < len; ++k, ++logical) {
                     uint8_t db[CETRAFS_BLOCK_SIZE];
@@ -2325,8 +2617,32 @@ int main(int argc, char **argv)
                                 "ERR: directory inode %" PRIu64 " block %" PRIu64 " fails its dirent-tail CRC\n", ino,
                                 phys + k);
                         problems++;
-                        note_bad_dirent_block(ino, phys + k, logical == 0);
-                        continue;
+                        /* Damage confined to the tail leaves every entry
+                         * intact; erasing the block would cost the
+                         * directory all of its names for nothing. See
+                         * fsck_dirent_block_coherent(). */
+                        if (fsck_dirent_block_coherent(db, &sb, logical == 0, ino)) {
+                            if (repair_mode && !repair_blocked) {
+                                fsck_stamp_dirent_block(db);
+                                pwrite_all(fd, db, sizeof(db), (off_t) (phys + k) * CETRAFS_BLOCK_SIZE);
+                                repairs_made++;
+                                printf("  re-stamped the dirent tail of block %" PRIu64 " of directory inode %" PRIu64
+                                       " -- every entry in it is intact\n",
+                                       phys + k, ino);
+                            } else {
+                                printf("  block %" PRIu64 " of directory inode %" PRIu64
+                                       " has an intact entry table: -r would re-stamp its tail\n",
+                                       phys + k, ino);
+                            }
+                            /* Deliberately NOT skipped: the entries are
+                             * sound, so counting them keeps nlink and
+                             * reachability accurate -- and stops the
+                             * orphan pass linking files that are named
+                             * right here into /lost+found. */
+                        } else {
+                            note_bad_dirent_block(ino, phys + k, logical == 0);
+                            continue;
+                        }
                     }
 
                     de = (cetrafs_dirent_t *) db;

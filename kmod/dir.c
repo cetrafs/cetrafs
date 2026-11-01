@@ -67,6 +67,11 @@ static int cetrafs_dir_fsync(struct file *file, loff_t start, loff_t end, int da
 /* Directory file operations */
 const struct file_operations cetrafs_dir_ops = {
     .owner = THIS_MODULE,
+    /* read(2) on a directory is EISDIR, and that is what this returns.
+     * With no .read at all the VFS answers EINVAL instead -- a
+     * different errno for a case POSIX names exactly, which userspace
+     * does distinguish. */
+    .read = generic_read_dir,
     .llseek = generic_file_llseek,
     .iterate_shared = cetrafs_readdir,
     .fsync = cetrafs_dir_fsync,
@@ -117,7 +122,22 @@ static bool cetrafs_dirent_block_valid(const struct buffer_head *bh)
 {
     const cetrafs_dirent_tail_t *tail = (const cetrafs_dirent_tail_t *) (bh->b_data + CETRAFS_DIRENT_TAIL_OFF);
 
-    return cetrafs_le32(tail->magic) == CETRAFS_DIRENT_TAIL_MAGIC && cetrafs_le32(tail->crc) == ~crc32c(~0U, bh->b_data, CETRAFS_DIRENT_TAIL_OFF);
+    if (cetrafs_le32(tail->magic) != CETRAFS_DIRENT_TAIL_MAGIC ||
+        cetrafs_le32(tail->crc) != ~crc32c(~0U, bh->b_data, CETRAFS_DIRENT_TAIL_OFF))
+        return false;
+    /*
+     * And the entries have to make sense, which the checksum does not
+     * say. readdir hands name_len straight to dir_emit(), and the VFS
+     * bounds it at PATH_MAX rather than NAME_MAX -- deliberately, see
+     * verify_dirent_name() -- so a length of a few thousand is accepted
+     * there and read out of a 255-byte field.
+     *
+     * This file reads dirent blocks through its OWN helper rather than
+     * ioutil.c's, so the shared check had to be wired in here too: the
+     * first version of this fix validated every other block kind and
+     * silently skipped the one the bug was reported against.
+     */
+    return cetrafs_blk_struct_ok_magic(bh, CETRAFS_DIRENT_TAIL_MAGIC);
 }
 
 static struct buffer_head *cetrafs_dirent_bread(struct super_block *sb, u64 lba)
@@ -1247,6 +1267,17 @@ static struct dentry *cetrafs_lookup(struct inode *dir, struct dentry *dentry, u
  *     this node not holding the write lock, NOT on an mtime comparison
  *     -- chmod, truncate and hardlink do not reliably bump mtime here.
  */
+/*
+ * Test-only: make the next positive-dentry revalidation fail to
+ * determine anything, as a device error reading the directory would.
+ * The consequence of answering that with "invalid" -- the VFS
+ * detaching the caller's mounts -- is not otherwise reachable on
+ * demand.
+ */
+static bool cetrafs_revalidate_fail_once;
+module_param_named(revalidate_fail_once, cetrafs_revalidate_fail_once, bool, 0644);
+MODULE_PARM_DESC(revalidate_fail_once, "TEST ONLY: the next dentry revalidation cannot determine validity");
+
 static int cetrafs_d_revalidate(struct inode *dir, const struct qstr *name, struct dentry *dentry, unsigned int flags)
 {
     if (flags & LOOKUP_RCU)
@@ -1257,8 +1288,31 @@ static int cetrafs_d_revalidate(struct inode *dir, const struct qstr *name, stru
         struct inode *inode = d_inode(dentry);
         int ret;
 
+        /*
+         * Two different answers live here and they must not be
+         * conflated.
+         *
+         * "This name no longer resolves to this inode" is INVALID: 0,
+         * and the VFS looks it up again.
+         *
+         * "I could not find out" -- a device error reading the dirents,
+         * an allocation failure -- is an ERROR, and returning 0 for it
+         * asserts something we do not know. The VFS answers a 0 with
+         * d_invalidate(), which unhashes the dentry and DETACHES ANY
+         * MOUNTS ON IT. A transient -EIO on one directory block would
+         * therefore tear down a bind mount, permanently, and report
+         * nothing. Propagating the errno leaves the mount alone and
+         * lets the caller see what actually happened.
+         */
+        if (cetrafs_revalidate_fail_once) {
+            cetrafs_revalidate_fail_once = false;
+            return -EIO; /* test-only, see the knob */
+        }
+
         ret = cetrafs_walk_dirents(dir, cetrafs_lookup_visit, &ctx);
-        if (ret || ctx.ino != inode->i_ino)
+        if (ret)
+            return ret; /* could not determine -- not the same as "invalid" */
+        if (ctx.ino != inode->i_ino)
             return 0; /* removed, renamed away, or replaced -- force a fresh lookup */
 
         /* ANY failure to refresh invalidates the dentry. It used to be
@@ -1275,9 +1329,18 @@ static int cetrafs_d_revalidate(struct inode *dir, const struct qstr *name, stru
          * Note the refresh returns 0, not an error, when it declines
          * for an ordinary reason (this node holds the write lock, or
          * the inode has unwritten local changes) -- so this does not
-         * churn dentries for dirty inodes. */
-        if (cetrafs_refresh_vfs_inode_if_newer(inode) != 0)
-            return 0;
+         * churn dentries for dirty inodes.
+         *
+         * Of its failures only -ESTALE means "this is a different file
+         * now", which is genuinely invalid. -EUCLEAN and -EIO mean the
+         * record could not be read or did not validate, and the honest
+         * answer to the VFS is the errno, not an invalidation that
+         * would take the caller's mounts with it. */
+        ret = cetrafs_refresh_vfs_inode_if_newer(inode);
+        if (ret == -ESTALE)
+            return 0; /* same number, different FILE: genuinely invalid */
+        if (ret)
+            return ret; /* -EIO, -EUCLEAN, -ENOMEM: we could not tell */
         return 1;
     }
 
@@ -2435,13 +2498,31 @@ static int cetrafs_rename_locked(struct mnt_idmap *idmap,
          * the last reference actually goes away. Same reasoning as
          * cetrafs_unlink_locked()/cetrafs_rmdir_locked() above. */
         if (removed_file_type == CETRAFS_FT_DIR) {
-            cetrafs_invalidate_raw_inode(new_dir->i_sb, removed_ino);
-            if (!cetrafs_read_raw_inode(new_dir->i_sb, removed_ino, &raw)) {
-                struct cetrafs_ns_delta d = {.set_nlink_zero = true, .ctime = (u64) now};
+            struct cetrafs_ns_delta d = {.set_nlink_zero = true, .ctime = (u64) now};
+            int nret;
 
-                cetrafs_inode_ns_cas(new_dir->i_sb, removed_ino, cetrafs_le64(raw.generation), &raw,
-                                     cetrafs_ns_apply_delta, &d);
-            }
+            cetrafs_invalidate_raw_inode(new_dir->i_sb, removed_ino);
+            nret = cetrafs_read_raw_inode(new_dir->i_sb, removed_ino, &raw);
+            if (!nret)
+                nret = cetrafs_inode_ns_cas(new_dir->i_sb, removed_ino, cetrafs_le64(raw.generation), &raw,
+                                            cetrafs_ns_apply_delta, &d);
+            /*
+             * Both results used to be discarded, and the rename carried
+             * on as if the record had been zeroed. It cannot be undone
+             * from here -- the entry has already been replaced, so the
+             * directory is unreachable whatever its record says -- but
+             * it must not pass in SILENCE: the record then still claims
+             * a live link while nothing names it, evict's re-read
+             * refuses to free an inode that is not dead, and the number
+             * stays allocated until fsck or the scrub notices. Saying
+             * so is the difference between a known orphan and a
+             * mystery. The sibling branch below has always reported it.
+             */
+            if (nret)
+                pr_warn_ratelimited(
+                    "rename: replaced directory ino=%llu kept a live link count (%d) -- it is unreachable and "
+                    "will be reclaimed as an orphan\n",
+                    (unsigned long long) removed_ino, nret);
             clear_nlink(new_inode);
         } else {
             struct cetrafs_ns_delta d = {.nlink_delta = -1, .ctime = (u64) now};

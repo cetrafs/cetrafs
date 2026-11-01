@@ -37,12 +37,19 @@ rc_of 2 "defrag with two files" "$DEFRAG" /etc/hostname /etc/hosts
 log "mkfs rejects bad arguments with the usage code (2), not a failure code"
 rc_of 2 "mkfs with an unknown option" "$MKFS" /dev/null -Q
 rc_of 2 "mkfs with -z out of range" "$MKFS" /dev/null -z 0 -f
+# Trailing garbage: strtol dropped it silently, so "-z 5x" built a
+# volume with 5 Zone Groups for an operator who typed something else.
+rc_of 2 "mkfs with trailing garbage after -z" "$MKFS" /dev/null -z 5x -f
+rc_of 2 "mkfs with trailing garbage after -b" "$MKFS" /dev/null -b 1024abc -f
 rc_of 2 "mkfs with -N below the minimum" "$MKFS" /dev/null -N 1 -f
 rc_of 2 "mkfs with -M above the reader-mask cap" "$MKFS" /dev/null -M 99999 -f
 # both MiB arguments overflowed the byte multiplication past
 # ~2^44 and fed wrapped garbage into every geometry computation -- each of
 # these was accepted (and then failed arbitrarily downstream) before the
 # upper clamps, so each discriminates.
+# 2^50 MiB: the value is chosen so that converting it to BYTES wraps
+# u64 to exactly 0, which is how a ceiling that multiplies first lets it
+# through. Refusing it is a bound; computing with it is not.
 rc_of 2 "mkfs with -b past the overflow clamp" "$MKFS" /dev/null -b 1125899906842624 -f
 rc_of 2 "mkfs with -J past the overflow clamp" "$MKFS" /dev/null -J 1125899906842624 -f
 

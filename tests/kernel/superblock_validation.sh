@@ -76,18 +76,33 @@ log "a region that runs off the end of the device is refused"
 check bg_regions_start 300000 "the Block Group data regions would extend past total_blocks"
 check inode_table_blocks 400000 "the inode table would extend past total_blocks"
 
-# The version gate became a RANGE when 0x0009 was introduced so that
-# volumes from the previous release stay mountable and growable without
-# a reformat (cetrafs.h). A range is easier to get wrong than an
-# equality -- an off-by-one at either end silently admits a layout this
-# build does not understand, or locks out one it does -- so both ends
-# are poked, and the accepted values are required to still mount.
-log "the format version gate accepts exactly its supported range"
-check version 7 "a format version older than this build supports"
-check version 10 "a format version newer than this build knows"
+# The version gate is a RANGE, CETRAFS_VERSION_MIN..CETRAFS_VERSION, and
+# a range is easier to get wrong than an equality: an off-by-one at
+# either end silently admits a layout this build does not understand, or
+# locks out one it does. So both ends are poked and everything inside is
+# required to still mount.
+#
+# The bounds are READ FROM THE HEADER rather than written out. They were
+# 8 and 9 until the compatibility window closed in 0.9.2 and the range
+# collapsed to a single value; a suite that spells them out does not
+# fail when the window moves, it fails when someone changes the window
+# -- which is backwards, and cost a red gate to notice.
+# CETRAFS_VERSION_MIN may itself be the token CETRAFS_VERSION, which is
+# what a closed window looks like in the source.
+hdrdef() { sed -n "s/^#define $1  *//p" "$ROOT/include/cetrafs.h" | head -1 | awk '{print $1}'; }
+FMT_CUR="$(awk -v v="$(hdrdef CETRAFS_VERSION)" 'BEGIN{print strtonum(v)}')"
+FMT_MINTOK="$(hdrdef CETRAFS_VERSION_MIN)"
+[ "$FMT_MINTOK" = "CETRAFS_VERSION" ] && FMT_MINTOK="$(hdrdef CETRAFS_VERSION)"
+FMT_MIN="$(awk -v v="$FMT_MINTOK" 'BEGIN{print strtonum(v)}')"
+[ "${FMT_MIN:-0}" -gt 0 ] && [ "${FMT_CUR:-0}" -ge "$FMT_MIN" ] ||
+    fail "could not resolve the supported format range from include/cetrafs.h (got '$FMT_MIN'..'$FMT_CUR')"
+
+log "the format version gate accepts exactly its supported range ($FMT_MIN..$FMT_CUR)"
+check version "$((FMT_MIN - 1))" "a format version older than this build supports"
+check version "$((FMT_CUR + 1))" "a format version newer than this build knows"
 check version 65535 "a nonsense format version"
 
-for v in 8 9; do
+for v in $(seq "$FMT_MIN" "$FMT_CUR"); do
     "$SB_POKE" "$DEV" version "$v" >/dev/null
     if mount -t cetrafs "$DEV" "$MNT" 2>/dev/null; then
         umount "$MNT"
@@ -96,7 +111,7 @@ for v in 8 9; do
         fail "format version $v was refused, but this build is supposed to accept it"
     fi
 done
-"$SB_POKE" "$DEV" version 9 >/dev/null
+"$SB_POKE" "$DEV" version "$FMT_CUR" >/dev/null
 
 log "counts must fit the regions that hold them"
 check inodes_count 999999 "more inodes than the bitmap has bits or the table has blocks"
