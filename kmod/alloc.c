@@ -2668,6 +2668,70 @@ int cetrafs_bg_release_empty(struct super_block *sb, u32 zg_id, u32 *out_release
     return 0;
 }
 
+/*
+ * Bring the in-core Block Group -> Zone Group map up to date with the
+ * descriptors. Called when a Zone Group is about to ENTER this node's
+ * ownership, before its members are derived from the map.
+ *
+ * The map is read at mount, and peers move Block Groups after that: an
+ * owner hands an empty one back, another node claims it into its own
+ * Zone Group. Taking a Zone Group over -- reclaiming a dead peer's is
+ * the common case -- from the mount-time map made this node treat a
+ * Block Group that had moved to another node as its own: the allocator
+ * refused it with -EPERM, and the scrub, which takes its targets from
+ * the same map, judged the other node's blocks leaked and FREED them
+ * (tests/kernel/bg_owner_map_refresh.sh: all 131067 of them).
+ *
+ * Fresh reads, skipping the Block Groups this node already owns: it is
+ * their only writer (PERF(3), docs/PERFORMANCE.md). Read ahead first, so
+ * a large table is one batch rather than a round trip per descriptor.
+ * Runs once per Zone Group claim -- never per tick (PERF(5)).
+ *
+ * A descriptor that cannot be read is taken OUT of the map's reach
+ * (marked free here): this node must not allocate from or scrub a Block
+ * Group it cannot show it owns. claim_free re-reads before using one.
+ */
+void cetrafs_bg_refresh_owner_map(struct super_block *sb)
+{
+    const cetrafs_superblock_t *raw_sb = cetrafs_sb_raw(sb);
+    u32 b, nbg, moved = 0;
+
+    if (!raw_sb)
+        return;
+    nbg = le32_to_cpu(raw_sb->block_group_count);
+
+    for (b = 0; b < nbg; b++) {
+        u64 lba;
+
+        if (cetrafs_sb_bg_is_ours(sb, b))
+            continue;
+        lba = cetrafs_sb_bg_desc_lba(sb, b);
+        cetrafs_invalidate_block(sb, lba);
+        sb_breadahead(sb, lba);
+    }
+    for (b = 0; b < nbg; b++) {
+        struct cetrafs_bg_geom geom;
+        u32 owner;
+
+        if (cetrafs_sb_bg_is_ours(sb, b))
+            continue;
+        if (cetrafs_read_bg_geom(sb, b, &geom) != 0) {
+            pr_warn("BG %u: descriptor unreadable while refreshing ownership -- leaving it out of reach\n", b);
+            owner = CETRAFS_BG_OWNER_FREE;
+        } else {
+            owner = geom.owner_zg;
+        }
+        if (owner != cetrafs_sb_bg_owner(sb, b)) {
+            cetrafs_sb_set_bg_owner(sb, b, owner);
+            moved++;
+        }
+        if ((b & 1023) == 1023)
+            cond_resched();
+    }
+    if (moved)
+        pr_info("%u Block Group(s) changed owner since this node last looked\n", moved);
+}
+
 int cetrafs_bg_claim_free(struct super_block *sb, u32 zg_id, u32 *out_bg_id)
 {
     const cetrafs_superblock_t *raw_sb = cetrafs_sb_raw(sb);

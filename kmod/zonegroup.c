@@ -837,6 +837,12 @@ static int cetrafs_zg_try_claim_one(struct super_block *sb, u32 zg_id, u32 my_no
         const cetrafs_superblock_t *rsb = cetrafs_sb_raw(sb);
         u32 b, nbg = rsb ? le32_to_cpu(rsb->block_group_count) : 0;
 
+        /* Which Block Groups this Zone Group has NOW: the map is from
+         * this node's mount, and the previous owner may have handed
+         * some back since -- to be claimed by other nodes. Everything
+         * below derives the members from the map. */
+        cetrafs_bg_refresh_owner_map(sb);
+
         for (b = 0; b < nbg; b++)
             if (cetrafs_sb_bg_owner(sb, b) == zg_id)
                 cetrafs_bg_invalidate_cache(sb, b);

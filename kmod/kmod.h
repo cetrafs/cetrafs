@@ -609,6 +609,7 @@ int cetrafs_sb_first_owned_zg(struct super_block *sb, u32 *out_zg);
 /* Claim a Block Group nobody owns into zg_id, with one compare-and-swap.
  * -ENOSPC if there is none free. docs/internal/BG-OWNERSHIP-DESIGN.md */
 int cetrafs_bg_claim_free(struct super_block *sb, u32 zg_id, u32 *out_bg_id);
+void cetrafs_bg_refresh_owner_map(struct super_block *sb);
 /* Hand back every empty Block Group of zg_id. The hoarding fix.
  * docs/internal/BG-OWNERSHIP-DESIGN.md */
 int cetrafs_bg_release_empty(struct super_block *sb, u32 zg_id, u32 *out_released);
