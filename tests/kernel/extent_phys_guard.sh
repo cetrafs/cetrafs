@@ -31,6 +31,7 @@ MNT="$(ct_mnt extphys)"
 
 ct_mkfs "$DEV" -z 1 -b 512 -J 1 -M 4 -N 1024 -f >/dev/null
 ct_mount "$DEV" "$MNT"
+require_cetrafs_mount "$MNT"
 
 # A file with a real inline extent to redirect. Four blocks, so the poisoned
 # run covers the records of inodes 1..4 -- the root among them, which is what
@@ -64,6 +65,7 @@ TABLE_BEFORE="$(sha256sum < "$TBEFORE" | cut -d' ' -f1)"
 
 MARK="$(dmesg_mark)"
 ct_mount "$DEV" "$MNT"
+require_cetrafs_mount "$MNT"
 
 # --- direction 1: the read must not serve metadata -------------------------
 RBACK="$(ct_tmp read-back)"
