@@ -613,6 +613,8 @@ int cetrafs_node_register(struct super_block *sb,
 struct cetrafs_node_renew_ctx {
     u64 expect_epoch; /* the lease we registered with */
     bool fenced;      /* out: the epoch moved -- a peer revoked us */
+    u8 my_uuid[CETRAFS_NODE_UUID_LEN];
+    bool lost;        /* out: the row is not ours any more (freed, a repairer's, another node's) */
     /* This mount's advertised beat rate: the mutator runs inside the
      * compare-and-swap and has no super_block to ask. */
     unsigned int hb_interval;
@@ -625,8 +627,18 @@ static int cetrafs_node_renew_mutate(void *image, unsigned int len, void *priv)
 
     memcpy(&ne, image, sizeof(ne));
 
-    if (cetrafs_le32(ne.state) != CETRAFS_NODE_STATE_REGISTERED)
-        return -EINVAL;
+    /* Not REGISTERED, or registered to someone else: whoever changed it
+     * decided this row is no longer ours -- a peer that freed it, an
+     * offline repairer that took it, a node that registered into it.
+     * That is a revoked lease in every way that matters, and writing
+     * our heartbeat into it would fight whoever holds it now. It used to
+     * be -EINVAL, which the tick only logged before going on to claim,
+     * drain and replay as a node nobody believes exists. */
+    if (cetrafs_le32(ne.state) != CETRAFS_NODE_STATE_REGISTERED ||
+        memcmp(ne.node_uuid, ctx->my_uuid, CETRAFS_NODE_UUID_LEN) != 0) {
+        ctx->lost = true;
+        return 1; /* write nothing */
+    }
 
     /* The whole point of doing this as a compare-and-swap: renewing used
      * to be read / modify / blind-write-the-whole-row, so a peer that
@@ -658,15 +670,21 @@ static int cetrafs_node_renew_mutate(void *image, unsigned int len, void *priv)
 
 /*
  * Renew this node's own row. Returns -EPERM if a peer has revoked our
- * lease, which the caller must treat as "fence yourself", never as a
- * transient error.
+ * lease, -EOWNERDEAD if the row is no longer ours at all; the caller
+ * must treat both as "fence yourself", never as a transient error.
  */
 int cetrafs_node_renew_heartbeat(struct super_block *sb, u32 my_node_id)
 {
     struct cetrafs_node_renew_ctx ctx = {.expect_epoch = cetrafs_sb_get_fence_epoch(sb),
                                          .hb_interval = cetrafs_heartbeat_interval_secs(sb)};
-    int ret = cetrafs_cas_record(sb, cetrafs_node_row_lba(sb, my_node_id), cetrafs_node_renew_mutate, &ctx);
+    int ret = cetrafs_sb_get_node_uuid(sb, ctx.my_uuid);
 
+    if (ret)
+        return ret;
+    ret = cetrafs_cas_record(sb, cetrafs_node_row_lba(sb, my_node_id), cetrafs_node_renew_mutate, &ctx);
+
+    if (ctx.lost)
+        return -EOWNERDEAD;
     if (ctx.fenced)
         return -EPERM;
     return ret < 0 ? ret : 0;

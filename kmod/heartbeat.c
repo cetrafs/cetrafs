@@ -184,6 +184,10 @@ static void cetrafs_heartbeat_tick(struct work_struct *work)
         cetrafs_sb_fence(sb, "our Node Registry lease was revoked, found while renewing it");
         goto reschedule;
     }
+    if (ret == -EOWNERDEAD) {
+        cetrafs_sb_fence(sb, "our Node Registry row is no longer ours (freed, or taken by another node or a repairer)");
+        goto reschedule;
+    }
     if (ret)
         pr_warn("heartbeat: failed to renew our own row: %d\n", ret);
 
