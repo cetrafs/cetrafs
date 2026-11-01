@@ -419,6 +419,12 @@ int cetrafs_nslock_acquire(struct inode *inode)
     return ret;
 }
 
+/* TEST ONLY: fail this many staged file-sector publishes at release, as
+ * a device error would. */
+static unsigned int cetrafs_nslock_fd_publish_fail;
+module_param_named(nslock_fd_publish_fail, cetrafs_nslock_fd_publish_fail, uint, 0644);
+MODULE_PARM_DESC(nslock_fd_publish_fail, "TEST ONLY: fail the next N staged file-sector publishes at release");
+
 void cetrafs_nslock_release(struct inode *inode)
 {
     ctrace("NSHOLD ino=%llu REL\n", (unsigned long long) inode->i_ino);
@@ -481,11 +487,30 @@ void cetrafs_nslock_release(struct inode *inode)
      * state before the sector that describes it is on the device.
      */
     if (have_staged && staged_fd) {
-        ret = cetrafs_write_raw_inode_fd(sb, inode->i_ino, &recs[1], inode);
-        if (ret)
-            pr_err("nslock: ino=%llu staged file-sector publish failed (%d) -- size/extents lag the dirents "
-                   "(fsck-visible, repaired by -r)\n",
-                   (unsigned long long) inode->i_ino, ret);
+        /* Retried like the swap below, and for the same reason: the lock
+         * is ours, so a failure here is transient or the device is
+         * failing. It used to give up at once -- and the size it carries
+         * is never re-derived: every later create or unlink adjusts the
+         * value it reads from the device, so one lost publish left the
+         * directory's size wrong for good
+         * (tests/kernel/nslock_fd_publish_error.sh). Only the size is at
+         * stake: growth commits the extents synchronously, before the
+         * entry is written. */
+        for (attempt = 0; attempt < CETRAFS_NSLOCK_RELEASE_RETRIES; attempt++) {
+            if (cetrafs_nslock_fd_publish_fail) {
+                cetrafs_nslock_fd_publish_fail--; /* test-only, see the knob */
+                ret = -EIO;
+            } else {
+                ret = cetrafs_write_raw_inode_fd(sb, inode->i_ino, &recs[1], inode);
+            }
+            if (!ret || ret == -ESTALE)
+                break;
+            msleep(CETRAFS_NSLOCK_SLEEP_MS);
+        }
+        if (ret && ret != -ESTALE)
+            pr_err("nslock: ino=%llu staged file-sector publish failed %d times (%d) -- this directory's size is "
+                   "off by this operation's change until it is fixed by hand; no entry or extent is lost\n",
+                   (unsigned long long) inode->i_ino, CETRAFS_NSLOCK_RELEASE_RETRIES, ret);
     }
 
     /*
