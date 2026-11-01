@@ -545,10 +545,14 @@ int cetrafs_write_raw_inode_fd(struct super_block *sb, u64 ino, const cetrafs_in
         return -EIO;
     /* The fd sector publishes extents: the blocks they name must be
      * durably allocated first (rule 8's choke point, same as the whole
-     * -record writer's). */
-    cetrafs_alloc_flush_bitmaps(sb);
+     * -record writer's). If they are not, publish NOTHING: the shadow
+     * stays in core and the next boundary retries both. */
     {
-        int ret = cetrafs_cas_record_fd_seeded(sb, lba, NULL, 0, cetrafs_fd_write_mutate, &ctx);
+        int ret = cetrafs_alloc_flush_bitmaps(sb);
+
+        if (ret)
+            return ret;
+        ret = cetrafs_cas_record_fd_seeded(sb, lba, NULL, 0, cetrafs_fd_write_mutate, &ctx);
 
         if (ret == 0) {
             cetrafs_record_write_counted();
@@ -591,8 +595,12 @@ int cetrafs_write_raw_inode(struct super_block *sb, u64 ino, const cetrafs_inode
      * Free when nothing was allocated since the last boundary: the dirty
      * set is empty and the scan finds no marked BG.
      */
-    if (sync)
-        cetrafs_alloc_flush_bitmaps(sb);
+    if (sync) {
+        int fret = cetrafs_alloc_flush_bitmaps(sb);
+
+        if (fret)
+            return fret; /* the record would name blocks still FREE on disk */
+    }
 
     if (!raw_sb)
         return -EINVAL;
@@ -1054,6 +1062,21 @@ int cetrafs_write_vfs_inode(struct inode *inode)
      * the device ends up referencing freed blocks. */
     cetrafs_inode_fd_pub_lock(inode);
     ctx->have_shadow = cetrafs_inode_fd_take(inode, &bufs[1], &fd_seq);
+
+    /* The shadow carries this file's hot-path extents, and this CAS is
+     * what publishes them: rule 8's flush belongs here exactly as in
+     * cetrafs_write_raw_inode_fd(). This path used to have none, so it
+     * was the one that published blocks whose bits never reached the
+     * device -- every close and every writeback reaches it, and a fsync
+     * that saw the flush fail went on to publish through it anyway
+     * (tests/kernel/bitmap_flush_error.sh). After the take, so it covers
+     * every allocation the shadow names; take does not clear the shadow,
+     * so refusing leaves it pending for the next boundary. */
+    if (ctx->have_shadow) {
+        ret = cetrafs_alloc_flush_bitmaps(sb);
+        if (ret)
+            goto out_pub;
+    }
 
     /* Nothing to publish? A no-op CAS still costs a device round trip
      * (and showed up as "a punch that frees nothing published 10 record

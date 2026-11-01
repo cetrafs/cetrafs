@@ -1814,6 +1814,32 @@ int cetrafs_inode_is_allocated(struct super_block *sb, u64 ino, bool *out_set)
  * the cost PERFORMANCE.md forbids, and this is why the allocator can go
  * on using sync=false.
  */
+/*
+ * Test-only: fail every bitmap-block sync at the durability boundary
+ * with -EIO, without writing, as a device write error would. The block
+ * stays dirty, which is the state a failed write must leave it in for a
+ * retry to be possible at all. tests/kernel/bitmap_flush_error.sh.
+ */
+static bool cetrafs_alloc_flush_fail;
+module_param_named(alloc_flush_fail, cetrafs_alloc_flush_fail, bool, 0644);
+MODULE_PARM_DESC(alloc_flush_fail, "test-only: fail allocation-bitmap syncs at durability boundaries with -EIO");
+
+/*
+ * Completion for a bitmap block's synchronous write. Unlike
+ * end_buffer_write_sync() it never clears BH_Uptodate on an error: these
+ * bytes are the allocator's ONLY record of bits that did not reach the
+ * device, and a buffer left !uptodate is re-read from the device by the
+ * next sb_bread() -- silently forgetting allocations of blocks that are
+ * already in use. The error is reported to the waiter instead.
+ */
+static void cetrafs_bmap_end_write(struct buffer_head *bh, int uptodate)
+{
+    if (!uptodate)
+        set_buffer_write_io_error(bh);
+    unlock_buffer(bh);
+    put_bh(bh);
+}
+
 static int cetrafs_sync_one_block(struct super_block *sb, u64 lba)
 {
     struct buffer_head *bh = sb_find_get_block(sb, lba);
@@ -1822,11 +1848,43 @@ static int cetrafs_sync_one_block(struct super_block *sb, u64 lba)
     /* find, not read: a block we never cached cannot be dirty, and
      * reading it in just to discover that would turn a flush into I/O
      * over the whole bitmap. */
-    if (bh) {
-        if (buffer_dirty(bh))
-            ret = sync_dirty_buffer(bh);
+    if (!bh)
+        return 0;
+
+    if (unlikely(READ_ONCE(cetrafs_alloc_flush_fail)) && buffer_dirty(bh)) {
         brelse(bh);
+        return -EIO; /* as a failed write leaves it: still dirty */
     }
+
+    lock_buffer(bh); /* also waits out a writeback already in flight */
+    if (buffer_write_io_error(bh)) {
+        /* An earlier write of this block -- ours or the flusher's --
+         * failed. The flusher's completion clears BH_Uptodate; while it
+         * is still clear nobody has re-read the block over our bits, so
+         * the bytes are ours to put back. Either way the bits it carried
+         * are not on the device: re-dirty and report, never succeed. */
+        clear_buffer_write_io_error(bh);
+        set_buffer_uptodate(bh);
+        unlock_buffer(bh);
+        mark_buffer_dirty(bh);
+        brelse(bh);
+        return -EIO;
+    }
+    if (!test_clear_buffer_dirty(bh)) {
+        unlock_buffer(bh);
+        brelse(bh);
+        return 0;
+    }
+    get_bh(bh);
+    bh->b_end_io = cetrafs_bmap_end_write;
+    submit_bh(REQ_OP_WRITE | REQ_SYNC, bh);
+    wait_on_buffer(bh);
+    if (buffer_write_io_error(bh)) {
+        clear_buffer_write_io_error(bh);
+        mark_buffer_dirty(bh); /* still uptodate: the next boundary retries it */
+        ret = -EIO;
+    }
+    brelse(bh);
     return ret;
 }
 
@@ -1845,16 +1903,29 @@ int cetrafs_alloc_flush_bitmaps(struct super_block *sb)
         u64 b, nblocks;
         int r;
 
+        int bg_ret = 0;
+
         if (!cetrafs_sb_take_bmap_alloc_dirty(sb, bg_id))
             continue;
-        if (cetrafs_read_bg_geom(sb, bg_id, &bg) != 0)
-            continue;
-
-        nblocks = bg.off_data_region - bg.off_data_bmap;
-        for (b = 0; b < nblocks; b++) {
-            r = cetrafs_sync_one_block(sb, bg.start_block + bg.off_data_bmap + b);
-            if (r && !ret)
-                ret = r;
+        /* Taken, so from here every failure must put the mark BACK: a
+         * BG whose bits did not reach the device and is no longer marked
+         * is never synced by any later boundary, and that boundary then
+         * reports success and publishes extents naming those blocks. */
+        bg_ret = cetrafs_read_bg_geom(sb, bg_id, &bg);
+        if (!bg_ret) {
+            nblocks = bg.off_data_region - bg.off_data_bmap;
+            for (b = 0; b < nblocks; b++) {
+                r = cetrafs_sync_one_block(sb, bg.start_block + bg.off_data_bmap + b);
+                if (r && !bg_ret)
+                    bg_ret = r;
+            }
+        }
+        if (bg_ret) {
+            cetrafs_sb_note_bmap_alloc(sb, bg_id);
+            pr_err_ratelimited("BG %u: allocation bitmap not made durable (%d) -- refusing to publish extents\n", bg_id,
+                               bg_ret);
+            if (!ret)
+                ret = bg_ret;
         }
         cond_resched();
     }

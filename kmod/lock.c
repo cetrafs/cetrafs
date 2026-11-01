@@ -1666,7 +1666,7 @@ int cetrafs_lock_release(struct inode *inode, struct file *file)
          * below for the same reason suspension does them first: the
          * signal must not disappear before the data is durable. */
         bool was_suspended = ci->lock_suspended;
-        int ret;
+        int ret, bmap_ret;
         ktime_t t0 = ktime_get();
         ktime_t t_data, t_inode, t_bg, t_leaf;
 
@@ -1744,8 +1744,14 @@ int cetrafs_lock_release(struct inode *inode, struct file *file)
          * stamp further down, which is a CAS and therefore reaches the
          * device immediately. Unconditional: an INLINE extent (depth 0,
          * no leaf to flush) names blocks just as durably once the
-         * record is stamped. */
-        cetrafs_alloc_flush_bitmaps(sb);
+         * record is stamped. If they did not reach the device, push no
+         * reference to them either: the leaf flush below is skipped, and
+         * the record publish refuses on its own (the same flush is its
+         * choke point) -- the inode stays dirty for a later retry. */
+        bmap_ret = cetrafs_alloc_flush_bitmaps(sb);
+        if (bmap_ret)
+            pr_err("lock release: ino=%llu allocation bitmaps not durable (%d) -- extents left unpublished\n",
+                   (unsigned long long) inode->i_ino, bmap_ret);
 
         /*
          * v0x0005: the hot path's record updates live in the in-core
@@ -1760,7 +1766,8 @@ int cetrafs_lock_release(struct inode *inode, struct file *file)
          */
         ret = cetrafs_read_raw_inode_overlaid(sb, inode, &raw);
 
-        if (!ret && cetrafs_le16(raw.eh.eh_magic) == CETRAFS_EXT_MAGIC && cetrafs_le16(raw.eh.eh_depth) >= 1)
+        if (!ret && !bmap_ret && cetrafs_le16(raw.eh.eh_magic) == CETRAFS_EXT_MAGIC &&
+            cetrafs_le16(raw.eh.eh_depth) >= 1)
             cetrafs_flush_tree_blocks(inode, &raw);
         t_leaf = ktime_get();
 
