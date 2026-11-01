@@ -256,6 +256,9 @@ static void cetrafs_heartbeat_maint(struct work_struct *work)
      * will not come for them -- it fires for a node that stopped
      * heartbeating, and we are the one beating. */
     cetrafs_nslock_retry_deferred(sb);
+    /* Same, for file locks: a lock this node kept because its last close
+     * could not finish is reclaimed by nobody while we keep beating. */
+    cetrafs_lock_retry_deferred(sb);
 
     ret = cetrafs_zg_drain_pending_frees(sb);
     if (ret)

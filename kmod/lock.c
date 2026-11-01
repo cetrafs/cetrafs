@@ -1639,6 +1639,152 @@ out_pr_unlock:
     return ret;
 }
 
+/* TEST ONLY: fail the next last-writer close's lock-clear CAS, as a
+ * device error would. */
+static bool cetrafs_lock_clear_fail_once;
+module_param_named(lock_clear_fail_once, cetrafs_lock_clear_fail_once, bool, 0644);
+MODULE_PARM_DESC(lock_clear_fail_once, "TEST ONLY: the next last-writer close's lock clear fails with -EIO");
+
+/*
+ * The second half of the last writer's close, from the allocation
+ * bitmaps to the lock clear: shared by cetrafs_lock_release() and the
+ * heartbeat's retry of a close that could not finish
+ * (cetrafs_lock_retry_deferred()). Caller holds ci->lock_mutex.
+ *
+ * 'may_clear' is false when there is no lock of ours to clear at all
+ * (nofilelock, or a suspended lock) -- the publish still runs.
+ *
+ * Returns nonzero when the lock is still OURS for a reason a later
+ * attempt can fix (a record read, the tree or record publish, the clear
+ * CAS). The lock is kept on purpose in those cases -- handing the file
+ * over without this writer's state is worse -- but kept by a node that
+ * keeps heartbeating, nobody reclaims it: every other node got -ETXTBSY
+ * until something on this node opened and closed the file again. The
+ * caller queues it for the heartbeat instead.
+ */
+static int cetrafs_lock_publish_and_clear(struct inode *inode, cetrafs_inode_t *raw, bool may_clear,
+                                          bool *lock_cleared)
+{
+    struct cetrafs_inode_info *ci = CETRAFS_I(inode);
+    struct super_block *sb = inode->i_sb;
+    int ret, bmap_ret, tree_ret, pub_ret;
+
+    *lock_cleared = false;
+    bmap_ret = cetrafs_alloc_flush_bitmaps(sb);
+    if (bmap_ret)
+        pr_err("lock release: ino=%llu allocation bitmaps not durable (%d) -- extents left unpublished\n",
+               (unsigned long long) inode->i_ino, bmap_ret);
+
+    /*
+     * v0x0005: the hot path's record updates live in the in-core
+     * file-domain shadow, never in a dirty buffer -- the "zombie
+     * flush" this spot used to need is gone by construction. The
+     * shadow itself is published below by write_vfs_inode()'s file
+     * -sector CAS (the !stat_persisted path, which nofilelock and
+     * the lock-clear path both reach). Here we only make sure the
+     * TREE-block flush below sees the shadow's view of the tree.
+     * (Combined read+overlay: torn-read-safe vs a concurrent
+     * publish -- see cetrafs_read_raw_inode_overlaid().)
+     */
+    ret = cetrafs_read_raw_inode_overlaid(sb, inode, raw);
+
+    tree_ret = 0;
+    if (!ret && !bmap_ret && cetrafs_le16(raw->eh.eh_magic) == CETRAFS_EXT_MAGIC &&
+        cetrafs_le16(raw->eh.eh_depth) >= 1)
+        tree_ret = cetrafs_flush_tree_blocks(inode, raw);
+    if (tree_ret)
+        pr_err("lock release: ino=%llu extent-tree blocks not durable (%d) -- leaving the record unpublished "
+               "and keeping the lock\n",
+               (unsigned long long) inode->i_ino, tree_ret);
+
+    /*
+     * The close boundary's FILE-sector publish (v0x0005): size,
+     * blocks, times and any pending hot-path extent shadow, by
+     * region-1 CAS -- every close path takes it, locked or
+     * nofilelock, lock-clear or deferred (the defrag mover holding
+     * the lock pinned still owes the new size its write).
+     *
+     * BEFORE the lock clear below, never after: a peer may open the
+     * instant the lock reads NONE and refreshes from the record it
+     * finds, so everything this writer did must already be in it.
+     * The two used to be one CAS, then were split with the publish
+     * last -- leaving a window in which the device said "free" about
+     * a record missing this node's last writes
+     * (tests/kernel/close_publish_order.sh).
+     */
+    /* Not over a tree whose leaves did not reach the device: the
+     * record CAS is durable at once, and a peer opening after the
+     * lock clear would map the file through the on-disk leaves --
+     * without this writer's extents (rule 8). */
+    pub_ret = tree_ret ? tree_ret : cetrafs_write_vfs_inode(inode);
+    if (pub_ret && !tree_ret)
+        pr_err("lock release: ino=%llu failed to persist inode state: %d -- keeping the lock\n",
+               (unsigned long long) inode->i_ino, pub_ret);
+    if (cetrafs_release_step_gap_ms)
+        msleep(cetrafs_release_step_gap_ms); /* test-only; see the parameter */
+
+    if (!may_clear) {
+        /* Suspended (lock_mode is NONE by our own doing) or a
+         * nofilelock mount (this open never claimed it): nothing to
+         * clear, and not an error. */
+    } else if (pub_ret) {
+        /* What this writer did is not on the device. Handing the
+         * file over now would give the next opener a record without
+         * it, and leave our unpublished state to land over theirs
+         * later. Fail loudly instead: the lock stays ours, and the
+         * caller queues the close for the heartbeat to finish. */
+        return pub_ret;
+    } else if (READ_ONCE(ci->defrag_pinned)) {
+        /* The incremental defrag mover is mid-pass and depends on
+         * the on-disk lock staying ours: every flush above still
+         * ran (the durability boundary peers rely on is intact),
+         * only the lock-clear is deferred -- the mover's own
+         * cetrafs_lock_defrag_end() performs it if no new writer
+         * has appeared by then. */
+    } else if (ret) {
+        pr_err("lock release: failed to read ino=%llu raw inode: %d\n", (unsigned long long) inode->i_ino, ret);
+        return ret;
+    } else if (cetrafs_le32(raw->lock_mode) != CETRAFS_LOCK_EXCLUSIVE) {
+        pr_err("lock release: ino=%llu lock_mode=%u, expected EXCLUSIVE -- leaving as-is\n",
+               (unsigned long long) inode->i_ino, raw->lock_mode);
+    } else {
+        u32 my_node_id;
+
+        ret = cetrafs_sb_get_node_id(sb, &my_node_id);
+        if (ret) {
+            pr_err("lock release: failed to get node id: %d\n", ret);
+            return ret;
+        } else if (cetrafs_le32(raw->lock_owner_node) != my_node_id) {
+            pr_err("lock release: ino=%llu held by node %u, not us (%u) -- leaving as-is\n",
+                   (unsigned long long) inode->i_ino, raw->lock_owner_node, my_node_id);
+        } else {
+            /* Clear our lock -- the file sector was published above.
+             * It only lands on a record still showing OUR claim, so
+             * a lock reclaimed from us meanwhile is left alone rather
+             * than blindly stomped. */
+            struct cetrafs_lock_cas_ctx ctx = {
+                .my_node_id = my_node_id,
+                .generation = cetrafs_le64(raw->generation),
+                .claim = false,
+            };
+
+            if (cetrafs_lock_clear_fail_once) {
+                cetrafs_lock_clear_fail_once = false; /* test-only */
+                ret = -EIO;
+            } else {
+                ret = cetrafs_lock_cas(inode, &ctx, raw);
+            }
+            if (ret < 0) {
+                pr_err("lock release: failed to write ino=%llu raw inode: %d\n", (unsigned long long) inode->i_ino,
+                       ret);
+                return ret;
+            }
+            *lock_cleared = true;
+        }
+    }
+    return 0;
+}
+
 /*
  * ->release: drops this node's local open count (read or write alike --
  * the counterpart to cetrafs_lock_open()'s refresh-on-first-open above,
@@ -1707,7 +1853,7 @@ int cetrafs_lock_release(struct inode *inode, struct file *file)
          * below for the same reason suspension does them first: the
          * signal must not disappear before the data is durable. */
         bool was_suspended = ci->lock_suspended;
-        int ret, bmap_ret, tree_ret, pub_ret;
+        int ret, retry;
         ktime_t t0 = ktime_get();
         ktime_t t_data, t_inode, t_bg, t_leaf;
 
@@ -1782,121 +1928,15 @@ int cetrafs_lock_release(struct inode *inode, struct file *file)
          * reference to them either: the leaf flush below is skipped, and
          * the record publish refuses on its own (the same flush is its
          * choke point) -- the inode stays dirty for a later retry. */
-        bmap_ret = cetrafs_alloc_flush_bitmaps(sb);
-        if (bmap_ret)
-            pr_err("lock release: ino=%llu allocation bitmaps not durable (%d) -- extents left unpublished\n",
-                   (unsigned long long) inode->i_ino, bmap_ret);
-
-        /*
-         * v0x0005: the hot path's record updates live in the in-core
-         * file-domain shadow, never in a dirty buffer -- the "zombie
-         * flush" this spot used to need is gone by construction. The
-         * shadow itself is published below by write_vfs_inode()'s file
-         * -sector CAS (the !stat_persisted path, which nofilelock and
-         * the lock-clear path both reach). Here we only make sure the
-         * TREE-block flush below sees the shadow's view of the tree.
-         * (Combined read+overlay: torn-read-safe vs a concurrent
-         * publish -- see cetrafs_read_raw_inode_overlaid().)
-         */
-        ret = cetrafs_read_raw_inode_overlaid(sb, inode, &raw);
-
-        tree_ret = 0;
-        if (!ret && !bmap_ret && cetrafs_le16(raw.eh.eh_magic) == CETRAFS_EXT_MAGIC &&
-            cetrafs_le16(raw.eh.eh_depth) >= 1)
-            tree_ret = cetrafs_flush_tree_blocks(inode, &raw);
-        if (tree_ret)
-            pr_err("lock release: ino=%llu extent-tree blocks not durable (%d) -- leaving the record unpublished "
-                   "and keeping the lock\n",
-                   (unsigned long long) inode->i_ino, tree_ret);
-        t_leaf = ktime_get();
-
-        /*
-         * The close boundary's FILE-sector publish (v0x0005): size,
-         * blocks, times and any pending hot-path extent shadow, by
-         * region-1 CAS -- every close path takes it, locked or
-         * nofilelock, lock-clear or deferred (the defrag mover holding
-         * the lock pinned still owes the new size its write).
-         *
-         * BEFORE the lock clear below, never after: a peer may open the
-         * instant the lock reads NONE and refreshes from the record it
-         * finds, so everything this writer did must already be in it.
-         * The two used to be one CAS, then were split with the publish
-         * last -- leaving a window in which the device said "free" about
-         * a record missing this node's last writes
-         * (tests/kernel/close_publish_order.sh).
-         */
-        /* Not over a tree whose leaves did not reach the device: the
-         * record CAS is durable at once, and a peer opening after the
-         * lock clear would map the file through the on-disk leaves --
-         * without this writer's extents (rule 8). */
-        pub_ret = tree_ret ? tree_ret : cetrafs_write_vfs_inode(inode);
-        if (pub_ret && !tree_ret)
-            pr_err("lock release: ino=%llu failed to persist inode state: %d -- keeping the lock\n",
-                   (unsigned long long) inode->i_ino, pub_ret);
-        if (cetrafs_release_step_gap_ms)
-            msleep(cetrafs_release_step_gap_ms); /* test-only; see the parameter */
-
         lock_cleared = false;
+        retry = cetrafs_lock_publish_and_clear(inode, &raw, lock_on && !was_suspended, &lock_cleared);
+        t_leaf = ktime_get();
         if (was_suspended) {
             cetrafs_lock_presence_put(inode);
             ci->lock_suspended = false;
         }
-
-        if (was_suspended) {
-            /* lock_mode is NONE by our own doing -- not an error, and
-             * nothing to clear. */
-        } else if (!lock_on) {
-            /* nofilelock mount: this open never claimed the lock, so there
-             * is nothing to clear -- lock_mode is NONE, not EXCLUSIVE, and
-             * treating that as an error would log on every close. The
-             * stat-persist fallback below is what keeps the close a
-             * durability boundary. */
-        } else if (pub_ret) {
-            /* What this writer did is not on the device. Handing the
-             * file over now would give the next opener a record without
-             * it, and leave our unpublished state to land over theirs
-             * later. Fail loudly instead: the lock stays ours (a later
-             * close retries; a dead node is reclaimed as stale). */
-        } else if (READ_ONCE(ci->defrag_pinned)) {
-            /* The incremental defrag mover is mid-pass and depends on
-             * the on-disk lock staying ours: every flush above still
-             * ran (the durability boundary peers rely on is intact),
-             * only the lock-clear is deferred -- the mover's own
-             * cetrafs_lock_defrag_end() performs it if no new writer
-             * has appeared by then. */
-        } else if (ret) {
-            pr_err("lock release: failed to read ino=%llu raw inode: %d\n", (unsigned long long) inode->i_ino, ret);
-        } else if (cetrafs_le32(raw.lock_mode) != CETRAFS_LOCK_EXCLUSIVE) {
-            pr_err("lock release: ino=%llu lock_mode=%u, expected EXCLUSIVE -- leaving as-is\n",
-                   (unsigned long long) inode->i_ino, raw.lock_mode);
-        } else {
-            u32 my_node_id;
-
-            ret = cetrafs_sb_get_node_id(sb, &my_node_id);
-            if (ret) {
-                pr_err("lock release: failed to get node id: %d\n", ret);
-            } else if (cetrafs_le32(raw.lock_owner_node) != my_node_id) {
-                pr_err("lock release: ino=%llu held by node %u, not us (%u) -- leaving as-is\n",
-                       (unsigned long long) inode->i_ino, raw.lock_owner_node, my_node_id);
-            } else {
-                /* Clear our lock -- the file sector was published above.
-                 * It only lands on a record still showing OUR claim, so
-                 * a lock reclaimed from us meanwhile is left alone rather
-                 * than blindly stomped. */
-                struct cetrafs_lock_cas_ctx ctx = {
-                    .my_node_id = my_node_id,
-                    .generation = cetrafs_le64(raw.generation),
-                    .claim = false,
-                };
-
-                ret = cetrafs_lock_cas(inode, &ctx, &raw);
-                if (ret < 0)
-                    pr_err("lock release: failed to write ino=%llu raw inode: %d\n", (unsigned long long) inode->i_ino,
-                           ret);
-                else
-                    lock_cleared = true;
-            }
-        }
+        if (retry)
+            cetrafs_sb_flock_defer(sb, inode->i_ino, cetrafs_inode_get_generation(inode));
 
         /*
          * Breakdown timing for this close's durability flush, added
@@ -1944,6 +1984,81 @@ int cetrafs_lock_release(struct inode *inode, struct file *file)
 
     mutex_unlock(&ci->lock_mutex);
     return 0;
+}
+
+/*
+ * The heartbeat's pass over closes that could not finish (see
+ * cetrafs_lock_publish_and_clear()). For each one: find the inode
+ * again, and if this node still has no writer, no flock holder, no
+ * suspension and no defrag pin on it -- under lock_mutex, which every
+ * one of those takes -- run the same publish-then-clear the close
+ * would have. An inode whose publish failed stays dirty, and a dirty
+ * inode is never evicted, so iget finds the very object that holds
+ * the unpublished state; one that published and was evicted since is
+ * read back fresh and has nothing left but the clear.
+ *
+ * A local holder appearing meanwhile ends the entry: its own last
+ * close does this work. A file deleted or its number reused ends it
+ * too (the generation check), and so does a lock that is no longer
+ * ours. Anything else that fails goes back on the queue.
+ */
+void cetrafs_lock_retry_deferred(struct super_block *sb)
+{
+    struct cetrafs_nsrel_pending pend[CETRAFS_FLOCK_DEFERRED_MAX];
+    cetrafs_inode_t *raw;
+    u32 n, i;
+
+    n = cetrafs_sb_flock_take_deferred(sb, pend, ARRAY_SIZE(pend));
+    if (!n)
+        return;
+    raw = kmalloc(sizeof(*raw), GFP_NOFS);
+    if (!raw) {
+        for (i = 0; i < n; i++)
+            cetrafs_sb_flock_defer(sb, pend[i].ino, pend[i].generation);
+        return;
+    }
+
+    for (i = 0; i < n; i++) {
+        struct inode *inode = cetrafs_iget(sb, pend[i].ino);
+        struct cetrafs_inode_info *ci;
+        bool cleared = false;
+        int ret;
+
+        if (IS_ERR(inode)) {
+            if (PTR_ERR(inode) != -ESTALE && PTR_ERR(inode) != -ENOENT)
+                cetrafs_sb_flock_defer(sb, pend[i].ino, pend[i].generation);
+            continue;
+        }
+        if (cetrafs_inode_get_generation(inode) != pend[i].generation || !S_ISREG(inode->i_mode)) {
+            iput(inode);
+            continue;
+        }
+        ci = CETRAFS_I(inode);
+        mutex_lock(&ci->lock_mutex);
+        if (atomic_read(&ci->lock_writer_count) > 0 || ci->lock_suspended || ci->explicit_lock_file ||
+            READ_ONCE(ci->defrag_pinned)) {
+            mutex_unlock(&ci->lock_mutex);
+            iput(inode);
+            continue;
+        }
+        ret = filemap_write_and_wait(inode->i_mapping);
+        if (ret)
+            pr_err("lock release retry: ino=%llu failed to flush dirty data: %d\n", (unsigned long long) inode->i_ino,
+                   ret);
+        ret = cetrafs_flush_dirty_free_counts(sb);
+        if (ret)
+            pr_err("lock release retry: ino=%llu failed to flush BG/ZG free counts: %d\n",
+                   (unsigned long long) inode->i_ino, ret);
+        ret = cetrafs_lock_publish_and_clear(inode, raw, true, &cleared);
+        mutex_unlock(&ci->lock_mutex);
+        if (ret)
+            cetrafs_sb_flock_defer(sb, pend[i].ino, pend[i].generation);
+        else
+            pr_info("lock release: ino=%llu close finished by the heartbeat%s\n", (unsigned long long) inode->i_ino,
+                    cleared ? "" : " (the lock was no longer ours)");
+        iput(inode);
+    }
+    kfree(raw);
 }
 
 /*

@@ -478,6 +478,14 @@ struct cetrafs_sb_info {
     u32 nsrel_count;
     struct cetrafs_nsrel_pending nsrel[CETRAFS_NSLOCK_DEFERRED_MAX];
 
+    /* File locks whose last close could not publish or clear them (see
+     * cetrafs_lock_retry_deferred()). Kept as (ino, generation), never
+     * as an inode reference, so nothing here can hold up an unmount.
+     * Under flrel_lock. */
+    spinlock_t flrel_lock;
+    u32 flrel_count;
+    struct cetrafs_nsrel_pending flrel[CETRAFS_FLOCK_DEFERRED_MAX];
+
     /* Each BG count's ownership epoch (cetrafs_block_group_t.
      * reconcile_seq) as of OUR reconcile -- the epoch our accrued
      * deltas were born under. The delta-apply CAS refuses an image
@@ -1082,6 +1090,7 @@ int cetrafs_fill_super(struct super_block *sb, struct fs_context *fc)
          * alive", which errs toward never reclaiming from a live node. */
         spin_lock_init(&sbi->resv_list_lock);
         spin_lock_init(&sbi->nsrel_lock);
+        spin_lock_init(&sbi->flrel_lock);
         mutex_init(&sbi->nsrel_mutex);
         INIT_LIST_HEAD(&sbi->resv_list);
 
@@ -2945,6 +2954,51 @@ void cetrafs_sb_nslock_defer(struct super_block *sb, u64 ino, u64 generation)
     sbi->nsrel[sbi->nsrel_count].generation = generation;
     sbi->nsrel_count++;
     spin_unlock(&sbi->nsrel_lock);
+}
+
+/* Remember a file lock whose last close did not finish, for the
+ * heartbeat. See cetrafs_lock_retry_deferred(). */
+void cetrafs_sb_flock_defer(struct super_block *sb, u64 ino, u64 generation)
+{
+    struct cetrafs_sb_info *sbi = sb->s_fs_info;
+    u32 i;
+
+    if (!sbi)
+        return;
+    spin_lock(&sbi->flrel_lock);
+    for (i = 0; i < sbi->flrel_count; i++)
+        if (sbi->flrel[i].ino == ino) {
+            sbi->flrel[i].generation = generation;
+            spin_unlock(&sbi->flrel_lock);
+            return;
+        }
+    if (sbi->flrel_count == CETRAFS_FLOCK_DEFERRED_MAX) {
+        spin_unlock(&sbi->flrel_lock);
+        pr_err("lock release: ino=%llu could not be queued for retry -- %u already pending; the lock stays held "
+               "until this file is opened and closed here again, or this node unmounts\n",
+               (unsigned long long) ino, (unsigned int) CETRAFS_FLOCK_DEFERRED_MAX);
+        return;
+    }
+    sbi->flrel[sbi->flrel_count].ino = ino;
+    sbi->flrel[sbi->flrel_count].generation = generation;
+    sbi->flrel_count++;
+    spin_unlock(&sbi->flrel_lock);
+}
+
+u32 cetrafs_sb_flock_take_deferred(struct super_block *sb, struct cetrafs_nsrel_pending *out, u32 max)
+{
+    struct cetrafs_sb_info *sbi = sb->s_fs_info;
+    u32 n;
+
+    if (!sbi)
+        return 0;
+    spin_lock(&sbi->flrel_lock);
+    n = min(sbi->flrel_count, max);
+    memcpy(out, sbi->flrel, n * sizeof(*out));
+    memmove(sbi->flrel, sbi->flrel + n, (sbi->flrel_count - n) * sizeof(*out));
+    sbi->flrel_count -= n;
+    spin_unlock(&sbi->flrel_lock);
+    return n;
 }
 
 /* Take the whole pending set, for one retry pass. Entries the pass

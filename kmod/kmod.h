@@ -260,6 +260,12 @@ void cetrafs_sb_nslock_retry_end(struct super_block *sb);
 bool cetrafs_sb_nslock_forget(struct super_block *sb, u64 ino, u64 *generation);
 /* nslock.c: one retry pass over them, called from the heartbeat tick. */
 void cetrafs_nslock_retry_deferred(struct super_block *sb);
+/* fs.c + lock.c: last-writer closes whose publish or lock clear failed,
+ * finished by the heartbeat. */
+#define CETRAFS_FLOCK_DEFERRED_MAX 32
+void cetrafs_sb_flock_defer(struct super_block *sb, u64 ino, u64 generation);
+u32 cetrafs_sb_flock_take_deferred(struct super_block *sb, struct cetrafs_nsrel_pending *out, u32 max);
+void cetrafs_lock_retry_deferred(struct super_block *sb);
 s64 cetrafs_sb_take_zg_free_delta(struct super_block *sb, u32 zg_id);
 int cetrafs_flush_dirty_free_counts(struct super_block *sb);
 /* Zone Groups carrying an unapplied free-count delta. A delta must
