@@ -89,19 +89,14 @@ echo "$FSCK_OUT" | grep -qi "ERR" &&
     fail "fsck reports a fault after the failed truncate: $(echo "$FSCK_OUT" | grep -i err | head -2)" ||
     pass "fsck is clean after the failed truncate"
 
-log "what a failed truncate does leave behind, stated plainly"
-# The in-core size was already set to 0 before the extent work (the
-# pages must be gone before their blocks are -- ext2 does the same), and
-# ordinary writeback carries that 0 into the record. So the durable
-# residue is a file of size 0 whose extents are intact: space stuck
-# inside a live file until it is deleted. Conventional for a truncate
-# that failed halfway, and strictly better than the alternative this
-# suite exists to prevent -- blocks handed to another file while this
-# one still references them. Asserted so the residue is a known
-# quantity rather than a surprise.
+log "a failed truncate leaves the file's size alone"
+# The in-core size used to be set before the record write and was not
+# put back when it failed, so writeback made the smaller size durable.
+# It now moves only with the published record
+# (truncate_fail_keeps_data.sh covers the data).
 ct_mount "$DEV" "$MNT"
-[ "$(stat -c '%s' "$MNT/victim")" = "0" ] &&
-    pass "the failed truncate leaves the file at size 0 with its blocks still its own" ||
+[ "$(stat -c '%s' "$MNT/victim")" = "$((40 * 4096))" ] &&
+    pass "the failed truncate leaves the file at its full size" ||
     fail "the file's size is $(stat -c '%s' "$MNT/victim")"
 rm -f "$MNT/victim" "$MNT/noise_victim"
 sync

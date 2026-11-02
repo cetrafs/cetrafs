@@ -3722,10 +3722,10 @@ static int cetrafs_writepages(struct address_space *mapping, struct writeback_co
 
 /*
  * Shrink a regular file to 'new_size' (new_size < current i_size):
- * zero-fill the tail of the page still covering new_size, drop it from the
- * page cache, then trim/free whichever extent array currently holds the
- * file's blocks -- freeing the external leaf block too if it ends up
- * empty, reverting to depth-0. Growing a file needs none of this: holes
+ * publish a record whose extent tree holds only the kept blocks, then
+ * zero-fill the tail of the block still covering new_size, drop the page
+ * cache past it, and only then free the dropped blocks -- the external
+ * leaf block too if it ends up empty, reverting to depth-0. Growing a file needs none of this: holes
  * read as zero already via cetrafs_get_block(), so cetrafs_setattr() just
  * calls truncate_setsize() directly for that case.
  */
@@ -3752,7 +3752,7 @@ static bool cetrafs_fail_extent_record_write;
 module_param_named(fail_extent_record_write, cetrafs_fail_extent_record_write, bool, 0644);
 MODULE_PARM_DESC(fail_extent_record_write, "TEST ONLY: fail the record write in truncate/punch-hole");
 
-static int cetrafs_truncate_shrink(struct inode *inode, loff_t new_size)
+static int __cetrafs_truncate_shrink(struct inode *inode, loff_t new_size)
 {
     /* Extents are about to go away under us. */
     cetrafs_inode_ext_cache_drop(inode);
@@ -3767,28 +3767,11 @@ static int cetrafs_truncate_shrink(struct inode *inode, loff_t new_size)
     u32 old_n, kept;
     u32 freed_dummy, discard = 0;
     u64 meta_blocks = 0;
-    int ret;
+    int ret, zret;
 
     recs = kmalloc(2 * sizeof(*recs), GFP_NOFS);
     if (!recs)
         return -ENOMEM;
-
-    /*
-     * Wait for any direct I/O already in flight against this inode before
-     * a single block is freed: O_DIRECT bypasses the page cache, so
-     * inode_lock does not exclude an already-submitted DIO whose bio is
-     * aimed at a physical block this is about to hand back. (ext4 does
-     * the same in ext4_setattr().)
-     */
-    inode_dio_wait(inode);
-
-    ret = block_truncate_page(inode->i_mapping, new_size, cetrafs_get_block);
-    if (ret) {
-        kfree(recs);
-        return ret;
-    }
-
-    truncate_setsize(inode, new_size);
 
     /*
      * Forced fresh, not cached. This runs under the inode's namespace
@@ -3861,20 +3844,22 @@ static int cetrafs_truncate_shrink(struct inode *inode, loff_t new_size)
         u64 fd_seq;
 
         cetrafs_inode_fd_pub_lock(inode);
-        /* Same rule as the defrag step publish: size and times from the
-         * LIVE inode under the publish mutex, never from the image this
-         * operation read earlier -- a punch must be size-neutral, and
-         * copying a size read before a concurrent boundary publish
-         * regresses it (the defrag sibling of this line lost an owner's
-         * extension exactly that way, 2026-10-29). */
-        raw.size = cetrafs_cpu_to_le64((u64) i_size_read(inode));
+        /* Times from the LIVE inode under the publish mutex, never from
+         * the image this operation read earlier (the defrag step publish
+         * has the same rule). The size is the one being set: the in-core
+         * size moves to it under the same mutex, only once the record
+         * says so -- a failed write leaves both where they were, and no
+         * other publish can slip the old size in between. */
+        raw.size = cetrafs_cpu_to_le64((u64) new_size);
         raw.atime = cetrafs_cpu_to_le64((u64) inode_get_atime_sec(inode));
         raw.mtime = cetrafs_cpu_to_le64((u64) inode_get_mtime_sec(inode));
         fd_seq = cetrafs_inode_fd_seq(inode);
         ret = unlikely(cetrafs_fail_extent_record_write) ? -EIO
                                                          : cetrafs_write_raw_inode_fd(sb, inode->i_ino, &raw, inode);
-        if (!ret)
+        if (!ret) {
             cetrafs_inode_fd_published(inode, fd_seq); /* this publish supersedes the overlaid shadow */
+            i_size_write(inode, new_size);
+        }
         cetrafs_inode_fd_pub_unlock(inode);
     }
     if (ret) {
@@ -3886,7 +3871,21 @@ static int cetrafs_truncate_shrink(struct inode *inode, loff_t new_size)
     }
 
     /*
-     * Published. Only now does anything go back to the allocator: the OLD
+     * Published, and i_size already says so. The tail of the block at the
+     * new end is zeroed (its folio was read before the publish, so this
+     * does no I/O), and the page cache past it goes before any of its
+     * blocks do -- ext2's order. A failure to zero comes back as the
+     * error, but the truncate itself is done and durable: stopping here
+     * would leak the dropped blocks without making the tail any better.
+     */
+    zret = block_truncate_page(inode->i_mapping, new_size, cetrafs_get_block);
+    if (zret)
+        pr_warn_ratelimited("cetrafs: inode %llu: truncated to %lld but its tail was not zeroed (%d)\n",
+                            (unsigned long long) inode->i_ino, (long long) new_size, zret);
+    truncate_pagecache(inode, new_size);
+
+    /*
+     * Only now does anything go back to the allocator: the OLD
      * tree's meta blocks (leaves + interiors), then the dropped DATA
      * blocks (a do_free pass over the old flat array). New and old meta
      * are disjoint -- the new tree was allocated while the old was still
@@ -3902,9 +3901,59 @@ static int cetrafs_truncate_shrink(struct inode *inode, loff_t new_size)
     kvfree(old_flat);
     inode->i_blocks = cetrafs_le64(raw.blocks);
     kfree(recs);
-    return 0;
+    return zret;
 #undef raw
 #undef old_raw
+}
+
+static int cetrafs_truncate_shrink(struct inode *inode, loff_t new_size)
+{
+    struct folio *tail = NULL;
+    int ret;
+
+    /*
+     * Wait for any direct I/O already in flight against this inode before
+     * a single block is freed: O_DIRECT bypasses the page cache, so
+     * inode_lock does not exclude an already-submitted DIO whose bio is
+     * aimed at a physical block this is about to hand back. (ext4 does
+     * the same in ext4_setattr().)
+     */
+    inode_dio_wait(inode);
+
+    /*
+     * Nothing in core changes before the record write below succeeds:
+     * not the size, not the page cache, not the tail of the block at the
+     * new end. They used to change first, and a failed write put none of
+     * them back -- the dropped dirty pages were simply gone, and ordinary
+     * writeback then made the zeroed tail and the smaller size durable
+     * over extents that still held every block. A truncate that returned
+     * an error had truncated anyway (tests/kernel/truncate_fail_keeps_data.sh).
+     *
+     * Two things make the late page-cache drop safe. Dirty pages past
+     * the new end are written back first: once the trimmed tree is
+     * published, writeback of such a page would map it through a tree
+     * that no longer has its block and ALLOCATE one. And nothing can
+     * dirty them again meanwhile -- write(2) is excluded by inode_lock
+     * and a fault by invalidate_lock, which the caller holds
+     * exclusively and cetrafs_page_mkwrite() needs.
+     *
+     * The folio at the new end is read now, while failing is still
+     * free, so block_truncate_page() after the publish finds it
+     * uptodate and mapped and does no I/O of its own.
+     */
+    ret = filemap_write_and_wait_range(inode->i_mapping, new_size, LLONG_MAX);
+    if (ret)
+        return ret;
+    if (new_size & (CETRAFS_BLOCK_SIZE - 1)) {
+        tail = read_mapping_folio(inode->i_mapping, (pgoff_t) (new_size >> PAGE_SHIFT), NULL);
+        if (IS_ERR(tail))
+            return PTR_ERR(tail);
+    }
+
+    ret = __cetrafs_truncate_shrink(inode, new_size);
+    if (tail)
+        folio_put(tail);
+    return ret;
 }
 
 /*
