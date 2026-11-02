@@ -100,6 +100,7 @@ int main(int argc, char **argv)
                 argv[0]);
         fprintf(stderr, "       %s <backing-file> nlink <ino> <n>      (set nlink; 0 = a deleted file's record)\n",
                 argv[0]);
+        fprintf(stderr, "       %s <backing-file> xattrblk <ino> [<lba>] (print or set its xattr block)\n", argv[0]);
         fprintf(stderr, "       %s <backing-file> retype_keep_gen <ino> (type change, same generation)\n", argv[0]);
         fprintf(stderr, "       %s <backing-file> dirtytail <ino>      (garbage past the record)\n", argv[0]);
         fprintf(stderr, "       %s <backing-file> tailzero <ino>       (prints yes/no)\n", argv[0]);
@@ -439,6 +440,18 @@ int main(int argc, char **argv)
 
         pread_all(fd, &rec, sizeof(rec), rec_off);
         printf("%llu\n", (unsigned long long) cetrafs_le64(rec.size));
+    } else if (strcmp(mode, "xattrblk") == 0) {
+        /* Print the record's xattr block, or set it (as a peer that
+         * dropped or moved the file's xattrs would). */
+        cetrafs_inode_t rec;
+
+        pread_all(fd, &rec, sizeof(rec), rec_off);
+        if (argc > 4) {
+            rec.xattr_block = cetrafs_cpu_to_le64(strtoull(argv[4], NULL, 0));
+            cetrafs_inode_stamp_crcs_us(&rec);
+            pwrite_all(fd, &rec, sizeof(rec), rec_off);
+        }
+        printf("%llu\n", (unsigned long long) cetrafs_le64(rec.xattr_block));
     } else if (strcmp(mode, "nlink") == 0) {
         /* Set nlink directly. nlink = 0 with the dirent still in place
          * is exactly the "dangling entry" state fsck reports and that a

@@ -60,6 +60,110 @@ static int cetrafs_xattr_find_slot(const cetrafs_xattr_entry_t *arr, const char 
 }
 
 /*
+ * TEST ONLY: pause a lockless xattr read (get or list) between its read
+ * of the record and its read of the xattr block the record names --
+ * where a peer can free that block and another file can take it
+ * (tests/kernel/xattr_read_vs_reuse.sh).
+ */
+static unsigned int cetrafs_xattr_read_pause_ms;
+module_param_named(xattr_read_pause_ms, cetrafs_xattr_read_pause_ms, uint, 0644);
+MODULE_PARM_DESC(xattr_read_pause_ms, "TEST ONLY: pause between an xattr read's record read and its block read");
+
+static void cetrafs_xattr_read_pause(u64 ino)
+{
+    if (likely(!cetrafs_xattr_read_pause_ms))
+        return;
+    pr_info("xattr: ino=%llu pausing %ums between the record and the block\n", (unsigned long long) ino,
+            cetrafs_xattr_read_pause_ms);
+    msleep(cetrafs_xattr_read_pause_ms);
+}
+
+/*
+ * The xattr block for a LOCKLESS reader (getxattr, listxattr), as a
+ * private copy the caller kfree()s; *out stays NULL when the file has
+ * none.
+ *
+ * Reading the record and then the block it names proves nothing about
+ * the second read: a peer that removed this file's last xattr freed the
+ * block in between, another file's setxattr could take it, and the
+ * block read then finds a perfectly valid xattr block -- magic and
+ * checksum intact -- that is somebody else's. So the record is read
+ * fresh AGAIN after the block, and the copy is used only if the record
+ * still names that block for this same file; otherwise start over.
+ */
+#define CETRAFS_XATTR_READ_RETRIES 5
+
+static int cetrafs_xattr_read_block(struct inode *inode, void **out)
+{
+    struct super_block *sb = inode->i_sb;
+    cetrafs_inode_t raw;
+    void *copy = NULL;
+    int attempt, ret;
+
+    *out = NULL;
+    for (attempt = 0; attempt < CETRAFS_XATTR_READ_RETRIES; attempt++) {
+        struct buffer_head *bh;
+        u64 lba;
+
+        cetrafs_invalidate_raw_inode(sb, inode->i_ino);
+        ret = cetrafs_read_raw_inode(sb, inode->i_ino, &raw);
+        if (ret)
+            goto out;
+        /* Fresh is not the same as MINE: a peer that unlinked the name
+         * freed the number and the next create took it. Same check
+         * unlink, rmdir, rename and link make. */
+        if (cetrafs_le64(raw.generation) != cetrafs_inode_get_generation(inode)) {
+            pr_warn_ratelimited("xattr on ino=%llu refused: that number is a DIFFERENT file now (generation disk=%llu core=%llu)\n",
+                                (unsigned long long) inode->i_ino,
+                                (unsigned long long) cetrafs_le64(raw.generation),
+                                (unsigned long long) cetrafs_inode_get_generation(inode));
+            ret = -ESTALE;
+            goto out;
+        }
+        lba = cetrafs_le64(raw.xattr_block);
+        if (!lba) {
+            ret = 0;
+            goto out;
+        }
+
+        if (!attempt)
+            cetrafs_xattr_read_pause(inode->i_ino);
+        bh = cetrafs_blk_tail_bread(sb, lba, CETRAFS_XATTR_TAIL_MAGIC, "xattr");
+        if (!bh) {
+            ret = -EIO;
+            goto out;
+        }
+        if (!copy) {
+            copy = kmalloc(CETRAFS_BLOCK_SIZE, GFP_NOFS);
+            if (!copy) {
+                brelse(bh);
+                ret = -ENOMEM;
+                goto out;
+            }
+        }
+        memcpy(copy, bh->b_data, CETRAFS_BLOCK_SIZE);
+        brelse(bh);
+
+        cetrafs_invalidate_raw_inode(sb, inode->i_ino);
+        ret = cetrafs_read_raw_inode(sb, inode->i_ino, &raw);
+        if (ret)
+            goto out;
+        if (cetrafs_le64(raw.generation) == cetrafs_inode_get_generation(inode) &&
+            cetrafs_le64(raw.xattr_block) == lba) {
+            *out = copy;
+            return 0;
+        }
+        /* The record moved under the read: the copy may be anybody's. */
+    }
+    pr_err_ratelimited("xattr on ino=%llu: its xattr block kept changing under %d reads -- giving up\n",
+                       (unsigned long long) inode->i_ino, CETRAFS_XATTR_READ_RETRIES);
+    ret = -EIO;
+out:
+    kfree(copy);
+    return ret;
+}
+
+/*
  * Core getxattr: 'name' already has its namespace prefix (e.g. "user.foo"),
  * reconstructed by the caller via xattr_full_name(). size==0 is a size
  * query (buffer may be NULL); otherwise returns -ERANGE if buffer is too
@@ -67,63 +171,41 @@ static int cetrafs_xattr_find_slot(const cetrafs_xattr_entry_t *arr, const char 
  */
 static int cetrafs_xattr_get(struct inode *inode, const char *name, void *buffer, size_t size)
 {
-    struct super_block *sb = inode->i_sb;
-    cetrafs_inode_t raw;
-    struct buffer_head *bh;
     const cetrafs_xattr_entry_t *arr;
+    void *blk;
     int idx, ret;
     u16 vlen;
 
     /* Another node may have (de)allocated this inode's xattr block at
      * any moment -- xattr ops never go through .open, so no lock pins
-     * the record between our reads. Force the one read that locates the
-     * xattr block to be fresh (same reasoning as every other
-     * read-shared-state-first path in this codebase). */
-    cetrafs_invalidate_raw_inode(sb, inode->i_ino);
-    ret = cetrafs_read_raw_inode(sb, inode->i_ino, &raw);
+     * the record between our reads. See cetrafs_xattr_read_block(). */
+    ret = cetrafs_xattr_read_block(inode, &blk);
     if (ret)
         return ret;
-
-    /* Fresh is not the same as MINE. The read above is accurate and the
-     * foreign-lock check above refuses a record a live peer owns, but
-     * neither asks whether this number still belongs to the file this
-     * node resolved. A peer that unlinked the name freed the number and
-     * the next create took it; writing here then attaches this xattr to
-     * an unrelated file (and rewrites its record). Same check unlink,
-     * rmdir, rename and link make. */
-    if (cetrafs_le64(raw.generation) != cetrafs_inode_get_generation(inode)) {
-        pr_warn_ratelimited("xattr on ino=%llu refused: that number is a DIFFERENT file now (generation disk=%llu core=%llu)\n",
-                            (unsigned long long) inode->i_ino,
-                            (unsigned long long) cetrafs_le64(raw.generation),
-                            (unsigned long long) cetrafs_inode_get_generation(inode));
-        return -ESTALE;
-    }
-    if (!raw.xattr_block)
+    if (!blk)
         return -ENODATA;
-
-    bh = cetrafs_blk_tail_bread(sb, cetrafs_le64(raw.xattr_block), CETRAFS_XATTR_TAIL_MAGIC, "xattr");
-    if (!bh)
-        return -EIO;
-    arr = (const cetrafs_xattr_entry_t *) bh->b_data;
+    arr = (const cetrafs_xattr_entry_t *) blk;
 
     idx = cetrafs_xattr_find_slot(arr, name);
     if (idx < 0) {
-        brelse(bh);
-        return idx;
+        ret = idx;
+        goto out;
     }
 
     vlen = cetrafs_le16(arr[idx].value_len);
     if (size == 0) {
-        brelse(bh);
-        return vlen;
+        ret = vlen;
+        goto out;
     }
     if (size < vlen) {
-        brelse(bh);
-        return -ERANGE;
+        ret = -ERANGE;
+        goto out;
     }
     memcpy(buffer, arr[idx].value, vlen);
-    brelse(bh);
-    return vlen;
+    ret = vlen;
+out:
+    kfree(blk);
+    return ret;
 }
 
 /*
@@ -387,25 +469,18 @@ static const struct xattr_handler *cetrafs_xattr_match_handler(const char *key)
 ssize_t cetrafs_listxattr(struct dentry *dentry, char *list, size_t size)
 {
     struct inode *inode = d_inode(dentry);
-    struct super_block *sb = inode->i_sb;
-    cetrafs_inode_t raw;
-    struct buffer_head *bh;
     const cetrafs_xattr_entry_t *arr;
     size_t total = 0;
     unsigned int i;
+    void *blk;
     int ret;
 
-    cetrafs_invalidate_raw_inode(sb, inode->i_ino); /* same freshness rule as xattr_get above */
-    ret = cetrafs_read_raw_inode(sb, inode->i_ino, &raw);
+    ret = cetrafs_xattr_read_block(inode, &blk); /* same rules as xattr_get above */
     if (ret)
         return ret;
-    if (!raw.xattr_block)
+    if (!blk)
         return 0;
-
-    bh = cetrafs_blk_tail_bread(sb, cetrafs_le64(raw.xattr_block), CETRAFS_XATTR_TAIL_MAGIC, "xattr");
-    if (!bh)
-        return -EIO;
-    arr = (const cetrafs_xattr_entry_t *) bh->b_data;
+    arr = (const cetrafs_xattr_entry_t *) blk;
 
     for (i = 0; i < CETRAFS_XATTR_ENTRIES_PER_BLOCK; i++) {
         size_t len;
@@ -417,14 +492,14 @@ ssize_t cetrafs_listxattr(struct dentry *dentry, char *list, size_t size)
         len = strlen(arr[i].key) + 1; /* NUL included */
         if (list && size) {
             if (total + len > size) {
-                brelse(bh);
+                kfree(blk);
                 return -ERANGE;
             }
             memcpy(list + total, arr[i].key, len);
         }
         total += len;
     }
-    brelse(bh);
+    kfree(blk);
     return (ssize_t) total;
 }
 
