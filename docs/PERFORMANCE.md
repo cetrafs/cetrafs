@@ -222,8 +222,8 @@ accounting for the record writes.
 
 `map_bh()` hard-sets `b_size` to one block. A `get_block()` that stops
 there forces every caller back once per 4 KiB however contiguous the file
-is. `blockdev_direct_IO()` and `mpage_writepages()` pass a `b_size`
-covering the whole remaining request and use what we return to learn how
+is. `blockdev_direct_IO()`, `mpage_writepages()` and `mpage_readahead()`
+pass a `b_size` covering the whole remaining request and use what we return to learn how
 much got mapped, so reporting the run collapses the callback count.
 
 **Measured:** an O_DIRECT read of 2048 contiguous blocks went from 2048
@@ -243,7 +243,8 @@ at every depth, so physically adjacent extents are not necessarily
 adjacent in the array and merging would cost a scan per lookup.
 
 **Guarded by:** `tests/kernel/get_block_runs.sh` -- which asserts both
-directions, so a change that widens the buffered path fails too.
+directions (runs for O_DIRECT and readahead, 1:1 for `read_folio`), so a
+change that widens a folio's own buffer fails too.
 
 ## 12. A repeat lookup must not re-walk the extent tree
 
@@ -286,6 +287,47 @@ any of the three keyed fields.
 counter moves AND runs its own negative control, because a content check
 that skips the punched range passes whether the entry was invalidated or
 not (the first version of that suite did exactly that).
+
+## 13. A READ must not re-read the record per block
+
+`cetrafs_get_block()` re-reads the inode record from the device whenever
+the cache predicate says "not trusted". For a writer that predicate is
+the write lock, and it must stay that strict: a writer mapping through a
+stale tree allocates over a peer's extents. A READER asked the same
+question and got the same answer -- not trusted, because a read-only
+open holds no lock -- so every 4 KiB it mapped, holes included, cost a
+synchronous device round trip.
+
+The read paths (`read_folio`, `readahead`, an O_DIRECT lookup) ask
+`cetrafs_lock_read_cache_trusted()` instead. A reader may trust its cache
+because nothing it maps through can be freed under it: its open is
+published in `read_open_nodes`, and every block-freeing path refuses
+while a live peer is there -- defrag included, since 0.9.3. A peer can
+only write blocks the file already has or add new ones, so a stale map
+reads old contents or zeroes. Staleness is bounded by `file_seq`,
+re-checked once a second and at the first read after every open; a
+peer's stamp sends the reader fresh until the reconcile has dropped the
+old tree. The function gives the write lock's answer whenever this node
+has the file open for write, which is what makes it safe on the paths
+that can write.
+
+**Measured** on the reference FC array, 2 GiB data / 8 GiB sparse,
+`read()` in 1 MiB:
+
+| read-only open | before | after |
+|---|---|---|
+| default mount, sparse | 18 MB/s | **2051 MB/s** |
+| default mount, data | 18 MB/s | **2361 MB/s** |
+| nofilelock, file also open on a second node | 17 MB/s | **2393 MB/s** |
+
+`.readahead` (it had none, so every page was its own 4 KiB bio) came in
+the same change and lifted the read-WRITE data path too, 1834 to 2730
+MB/s on the default mount.
+
+**Guarded by:** `tests/kernel/read_cache_trust.sh` -- device reads per
+cold read-only pass, a held read-only fd keeping its map, a peer's stamp
+still sending it fresh, and defrag refusing a file a peer has open; each
+with the knob that breaks it.
 
 ## Measured baseline
 

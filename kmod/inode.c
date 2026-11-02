@@ -1489,7 +1489,13 @@ u64 cetrafs_tree_read_count(void)
     return (u64) atomic64_read(&cetrafs_tree_reads);
 }
 
-struct buffer_head *cetrafs_read_tree_bh(struct inode *inode, u64 lba, u32 tail_magic, const char *what)
+/*
+ * 'reader': the caller only READS through this block -- it maps a block
+ * to serve a read and will write nothing on the strength of it -- so
+ * the cache trust question is cetrafs_lock_read_cache_trusted()'s, not
+ * the write lock's. See that function for why the two differ.
+ */
+struct buffer_head *cetrafs_read_tree_bh_for(struct inode *inode, u64 lba, u32 tail_magic, const char *what, bool reader)
 {
     atomic64_inc(&cetrafs_tree_reads);
 
@@ -1509,7 +1515,7 @@ struct buffer_head *cetrafs_read_tree_bh(struct inode *inode, u64 lba, u32 tail_
      * this tree, so the cached copy is authoritative AND cannot be
      * torn -- this is the growing-file hot path and must stay off the
      * wire. */
-    if (cetrafs_lock_held_for_write_locally(inode)) {
+    if (reader ? cetrafs_lock_read_cache_trusted(inode) : cetrafs_lock_held_for_write_locally(inode)) {
         /* Cached, but still CHECKED for sense. The cached branch skips
          * the tail verification because nobody else can be mid-write --
          * which is an argument about CONCURRENCY and says nothing about
@@ -1534,6 +1540,11 @@ struct buffer_head *cetrafs_read_tree_bh(struct inode *inode, u64 lba, u32 tail_
      * and retry a mismatch, which is a torn write far more often than
      * it is corruption. */
     return cetrafs_blk_tail_bread(inode->i_sb, lba, tail_magic, what);
+}
+
+struct buffer_head *cetrafs_read_tree_bh(struct inode *inode, u64 lba, u32 tail_magic, const char *what)
+{
+    return cetrafs_read_tree_bh_for(inode, lba, tail_magic, what, false);
 }
 
 struct buffer_head *cetrafs_read_leaf_bh(struct inode *inode, u64 lba)
@@ -1596,6 +1607,17 @@ struct buffer_head *cetrafs_read_dir_leaf_bh(struct inode *inode, u64 lba, bool 
 struct buffer_head *cetrafs_read_index_bh(struct inode *inode, u64 lba)
 {
     return cetrafs_read_tree_bh(inode, lba, CETRAFS_INDEX_TAIL_MAGIC, "extent index");
+}
+
+/* The read-path variants: see cetrafs_read_tree_bh_for(). */
+struct buffer_head *cetrafs_read_leaf_bh_for(struct inode *inode, u64 lba, bool reader)
+{
+    return cetrafs_read_tree_bh_for(inode, lba, CETRAFS_LEAF_TAIL_MAGIC, "extent leaf", reader);
+}
+
+struct buffer_head *cetrafs_read_index_bh_for(struct inode *inode, u64 lba, bool reader)
+{
+    return cetrafs_read_tree_bh_for(inode, lba, CETRAFS_INDEX_TAIL_MAGIC, "extent index", reader);
 }
 
 /*
@@ -1773,6 +1795,15 @@ int cetrafs_apply_raw_to_vfs_inode(struct inode *inode, const cetrafs_inode_t *r
      * (cetrafs_read_leaf_bh() below), where the clear-and-reread is one
      * atomic operation under the buffer lock rather than two threads
      * fighting over the same buffer's flags. */
+
+    /* The same goes for the tree a READER maps through: it trusts its
+     * cached leaves on the strength of file_seq alone
+     * (cetrafs_lock_read_cache_trusted()), and this record is the
+     * device's word that the file may have changed. Cold sends its reads
+     * fresh until the reconcile -- which runs where buffers may be
+     * dropped -- has thrown the old tree away. */
+    if (S_ISREG(inode->i_mode))
+        cetrafs_inode_mark_tree_cold(inode);
 
     ret = invalidate_inode_pages2(inode->i_mapping);
     if (ret)

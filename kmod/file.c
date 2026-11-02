@@ -47,7 +47,9 @@
 #define CETRAFS_SLOW_ALLOC_US 20000 /* 20ms */
 
 static int cetrafs_get_block(struct inode *inode, sector_t iblock, struct buffer_head *bh_result, int create);
+static int cetrafs_get_block_read(struct inode *inode, sector_t iblock, struct buffer_head *bh_result, int create);
 static int cetrafs_read_folio(struct file *file, struct folio *folio);
+static void cetrafs_readahead(struct readahead_control *rac);
 static int cetrafs_write_begin(const struct kiocb *iocb,
                                struct address_space *mapping,
                                loff_t pos,
@@ -225,7 +227,7 @@ static int cetrafs_dio_get_block(struct inode *inode, sector_t iblock, struct bu
     int ret;
 
     if (!create)
-        return cetrafs_get_block(inode, iblock, bh_result, 0);
+        return cetrafs_get_block_read(inode, iblock, bh_result, 0);
     filemap_invalidate_lock(inode->i_mapping);
     ret = cetrafs_get_block(inode, iblock, bh_result, create);
     filemap_invalidate_unlock(inode->i_mapping);
@@ -881,6 +883,7 @@ static loff_t cetrafs_llseek(struct file *file, loff_t offset, int whence)
 const struct address_space_operations cetrafs_aops = {
     .direct_IO = cetrafs_direct_IO,
     .read_folio = cetrafs_read_folio,
+    .readahead = cetrafs_readahead,
     .writepages = cetrafs_writepages,
     .write_begin = cetrafs_write_begin,
     .write_end = generic_write_end,
@@ -1876,7 +1879,8 @@ static int cetrafs_tree_lookup_unchecked(struct inode *inode,
                                          u64 *out_lba,
                                          u32 *out_run,
                                          bool *out_uninit,
-                                         bool *found)
+                                         bool *found,
+                                         bool reader)
 {
     struct cetrafs_ext_span span = {0};
     u32 ni;
@@ -1908,7 +1912,7 @@ static int cetrafs_tree_lookup_unchecked(struct inode *inode,
      * answering from memory there would be the frozen-extent-tree bug
      * with extra steps.
      */
-    if (cetrafs_lock_held_for_write_locally(inode) &&
+    if ((reader ? cetrafs_lock_read_cache_trusted(inode) : cetrafs_lock_held_for_write_locally(inode)) &&
         cetrafs_inode_ext_cache_lookup(inode, raw, iblock, out_lba, out_run, out_uninit)) {
         *found = true;
         return 0;
@@ -1916,7 +1920,7 @@ static int cetrafs_tree_lookup_unchecked(struct inode *inode,
 
     if (cetrafs_le16(raw->eh.eh_depth) == 1) {
         u64 llba = cetrafs_extent_phys_from_hilo(raw->et.idx[0].ei_leaf_hi, raw->et.idx[0].ei_leaf_lo);
-        struct buffer_head *lbh = cetrafs_read_leaf_bh(inode, llba);
+        struct buffer_head *lbh = cetrafs_read_leaf_bh_for(inode, llba, reader);
         const cetrafs_extent_hdr_t *lhdr;
 
         if (!lbh)
@@ -1942,7 +1946,7 @@ static int cetrafs_tree_lookup_unchecked(struct inode *inode,
         if (!cetrafs_idx_may_hold(&raw->et.idx[ni], iblock))
             continue;
         ilba = cetrafs_extent_phys_from_hilo(raw->et.idx[ni].ei_leaf_hi, raw->et.idx[ni].ei_leaf_lo);
-        ibh = cetrafs_read_index_bh(inode, ilba);
+        ibh = cetrafs_read_index_bh_for(inode, ilba, reader);
 
         if (!ibh)
             return -EIO;
@@ -1962,7 +1966,7 @@ static int cetrafs_tree_lookup_unchecked(struct inode *inode,
             if (!cetrafs_idx_may_hold(&iarr[li], iblock))
                 continue;
             llba = cetrafs_extent_phys_from_hilo(iarr[li].ei_leaf_hi, iarr[li].ei_leaf_lo);
-            lbh = cetrafs_read_leaf_bh(inode, llba);
+            lbh = cetrafs_read_leaf_bh_for(inode, llba, reader);
 
             if (!lbh) {
                 brelse(ibh);
@@ -2013,9 +2017,10 @@ static int cetrafs_tree_lookup(struct inode *inode,
                                u64 *out_lba,
                                u32 *out_run,
                                bool *out_uninit,
-                               bool *found)
+                               bool *found,
+                               bool reader)
 {
-    int ret = cetrafs_tree_lookup_unchecked(inode, raw, iblock, out_lba, out_run, out_uninit, found);
+    int ret = cetrafs_tree_lookup_unchecked(inode, raw, iblock, out_lba, out_run, out_uninit, found, reader);
 
     if (ret || !*found)
         return ret;
@@ -3179,7 +3184,11 @@ static unsigned int cetrafs_alloc_run_max_blocks = 4096;
 module_param_named(alloc_run_max_blocks, cetrafs_alloc_run_max_blocks, uint, 0644);
 MODULE_PARM_DESC(alloc_run_max_blocks, "largest speculative run a streaming file grows to, in blocks");
 
-static int cetrafs_get_block(struct inode *inode, sector_t iblock, struct buffer_head *bh_result, int create)
+static int __cetrafs_get_block(struct inode *inode,
+                               sector_t iblock,
+                               struct buffer_head *bh_result,
+                               int create,
+                               bool reader)
 {
     u32 want = 1, converted = 1;
     struct super_block *sb = inode->i_sb;
@@ -3224,7 +3233,10 @@ static int cetrafs_get_block(struct inode *inode, sector_t iblock, struct buffer
      * identically in cetrafs_read_tree_bh(). This is the read half of what
      * makes nofilelock both safe across a handoff and fast when alone.
      */
-    if (S_ISDIR(inode->i_mode) || !cetrafs_lock_held_for_write_locally(inode))
+    /* A pure READ asks a different question -- may a reader trust its
+     * cache? -- answered by cetrafs_lock_read_cache_trusted(). */
+    if (S_ISDIR(inode->i_mode) ||
+        !(reader ? cetrafs_lock_read_cache_trusted(inode) : cetrafs_lock_held_for_write_locally(inode)))
         cetrafs_invalidate_raw_inode(sb, inode->i_ino);
 
     ret = cetrafs_read_raw_inode_overlaid(sb, inode, &raw); /* torn-read-safe vs a concurrent publish */
@@ -3281,7 +3293,7 @@ static int cetrafs_get_block(struct inode *inode, sector_t iblock, struct buffer
         cetrafs_le16(raw.eh.eh_entries) > ARRAY_SIZE(raw.et.leaf))
         return -EIO;
 
-    ret = cetrafs_tree_lookup(inode, &raw, (u32) iblock, &lba, &run, &uninit, &found);
+    ret = cetrafs_tree_lookup(inode, &raw, (u32) iblock, &lba, &run, &uninit, &found, reader);
     if (ret)
         return ret;
     if (found && uninit && !create) {
@@ -3562,9 +3574,41 @@ static int cetrafs_get_block(struct inode *inode, sector_t iblock, struct buffer
     return 0;
 }
 
+static int cetrafs_get_block(struct inode *inode, sector_t iblock, struct buffer_head *bh_result, int create)
+{
+    return __cetrafs_get_block(inode, iblock, bh_result, create, false);
+}
+
+/*
+ * The get_block of the READ paths: read_folio, readahead and
+ * blockdev_direct_IO's create == 0 lookups.
+ *
+ * create == 0 alone does not mean "read": block_truncate_page() maps
+ * with it and then WRITES the block, which is why that path keeps
+ * cetrafs_get_block(). Two of the callers here can write too -- a
+ * shared writable mapping faults pages in through read_folio, and an
+ * O_DIRECT write inside i_size maps with create == 0 (DIO_SKIP_HOLES)
+ * -- but both need the file open for write on this node, and while it
+ * is, cetrafs_lock_read_cache_trusted() gives exactly the write lock's
+ * answer. Only a node with no writer gets the reader's cheaper one.
+ */
+static int cetrafs_get_block_read(struct inode *inode, sector_t iblock, struct buffer_head *bh_result, int create)
+{
+    if (WARN_ON_ONCE(create))
+        return -EIO;
+    return __cetrafs_get_block(inode, iblock, bh_result, 0, true);
+}
+
 static int cetrafs_read_folio(struct file *file, struct folio *folio)
 {
-    return block_read_full_folio(folio, cetrafs_get_block);
+    return block_read_full_folio(folio, cetrafs_get_block_read);
+}
+
+/* Without it every page was read on its own, one 4 KiB bio at a time,
+ * and a sequential reader could not get past one request in flight. */
+static void cetrafs_readahead(struct readahead_control *rac)
+{
+    mpage_readahead(rac, cetrafs_get_block_read);
 }
 
 /*
@@ -3942,7 +3986,7 @@ static int cetrafs_do_allocate(struct inode *inode, loff_t offset, loff_t len, b
             usleep_range(cetrafs_fallocate_block_delay_us, cetrafs_fallocate_block_delay_us * 2);
         u32 leaf_count;
 
-        ret = cetrafs_tree_lookup(inode, &raw, (u32) b, &lba, NULL, &un, &found);
+        ret = cetrafs_tree_lookup(inode, &raw, (u32) b, &lba, NULL, &un, &found, false);
         if (ret)
             goto out;
         if (found)

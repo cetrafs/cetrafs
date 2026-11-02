@@ -103,6 +103,7 @@ int main(int argc, char **argv)
         fprintf(stderr, "       %s <backing-file> retype_keep_gen <ino> (type change, same generation)\n", argv[0]);
         fprintf(stderr, "       %s <backing-file> dirtytail <ino>      (garbage past the record)\n", argv[0]);
         fprintf(stderr, "       %s <backing-file> tailzero <ino>       (prints yes/no)\n", argv[0]);
+        fprintf(stderr, "       %s <backing-file> peerseq <ino> <node> (file_seq as a peer's publish)\n", argv[0]);
         return 2;
     }
 
@@ -407,6 +408,19 @@ int main(int argc, char **argv)
         pwrite_all(fd, &rec, sizeof(rec), rec_off);
         fprintf(stderr, "inode_block_poke: ino %llu reused by node %llu: generation -> %llu\n",
                 (unsigned long long) ino, node, g);
+    } else if (strcmp(mode, "peerseq") == 0) {
+        /* Move file_seq on as a PEER's publish would, stamped with that
+         * peer's node id and nothing else changed: the change stamp a
+         * reader's cache check keys on (read_cache_trust.sh). */
+        cetrafs_inode_t rec;
+        unsigned long long node = (argc > 4) ? strtoull(argv[4], NULL, 0) : 1;
+
+        pread_all(fd, &rec, sizeof(rec), rec_off);
+        rec.file_seq = cetrafs_cpu_to_le64((node << CETRAFS_FILE_SEQ_NODE_SHIFT) |
+                                           ((cetrafs_le64(rec.file_seq) + 1) & CETRAFS_FILE_SEQ_VAL_MASK));
+        cetrafs_inode_stamp_crcs_us(&rec);
+        pwrite_all(fd, &rec, sizeof(rec), rec_off);
+        fprintf(stderr, "inode_block_poke: ino %llu file_seq stamped by node %llu\n", (unsigned long long) ino, node);
     } else if (strcmp(mode, "setsize") == 0) {
         /* Set the on-disk size directly, as a PEER extending the file
          * would leave it. Used to prove this node's deferred

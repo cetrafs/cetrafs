@@ -14,8 +14,10 @@
 # Reported runs are clamped to what the caller asked for, which is also
 # required for correctness: __block_write_begin/block_read_full_folio pass
 # a REAL buffer_head off a folio, sized to one block, and widening that
-# would corrupt it. So buffered stays 1:1 and only the multi-block callers
-# see more -- both directions are asserted below.
+# would corrupt it. So read_folio stays 1:1 and only the multi-block
+# callers see more -- readahead (mpage_readahead, which maps through a
+# private buffer_head of its own) among them. Both directions are
+# asserted below.
 #
 # Discrimination: drop the b_size widening in cetrafs_get_block() and
 # map_blocks tracks map_calls exactly, so the first assertion fails.
@@ -72,15 +74,37 @@ log "O_DIRECT read of 2048 blocks: $DC get_block calls covering $DB blocks"
 [ "$DC" -lt 64 ] ||
     fail "$DC get_block calls for 2048 contiguous blocks -- barely better than one per block"
 
-# ---- buffered read: must stay exactly 1 block per call ----
+# ---- buffered sequential read: readahead asks for runs too ----
 echo 3 > /proc/sys/vm/drop_caches
 C2="$(calls)"; B2="$(blocks)"
 dd if="$MNT/f" of=/dev/null bs=1M count=8 status=none
 C3="$(calls)"; B3="$(blocks)"
 BC=$((C3 - C2)); BB=$((B3 - B2))
-log "buffered read: $BC calls covering $BB blocks"
-[ "$BC" -gt 0 ] && [ "$BB" -eq "$BC" ] ||
-    fail "buffered read got $BB blocks in $BC calls -- it must stay 1:1 (a widened folio bh is corruption)"
+log "buffered sequential read: $BC calls covering $BB blocks"
+[ "$BC" -gt 0 ] && [ "$BB" -gt "$BC" ] ||
+    fail "buffered read got $BB blocks in $BC calls -- readahead is not being handed runs"
+
+# ---- read_folio: a real folio bh, must stay exactly 1 block per call ----
+# MADV_RANDOM makes a fault skip readahead and read the one folio through
+# ->read_folio, i.e. block_read_full_folio with the folio's own buffers.
+echo 3 > /proc/sys/vm/drop_caches
+C4="$(calls)"; B4="$(blocks)"
+python3 - "$MNT/f" <<'PY'
+import mmap, os, sys
+fd = os.open(sys.argv[1], os.O_RDONLY)
+m = mmap.mmap(fd, 8 << 20, prot=mmap.PROT_READ)
+m.madvise(mmap.MADV_RANDOM)
+s = 0
+for off in range(0, 8 << 20, 64 * 4096):
+    s += m[off]
+m.close(); os.close(fd)
+PY
+C5="$(calls)"; B5="$(blocks)"
+FC=$((C5 - C4)); FB=$((B5 - B4))
+log "read_folio faults: $FC calls covering $FB blocks"
+[ "$FC" -gt 0 ] || fail "setup: the faults made no get_block calls -- read_folio was not exercised"
+[ "$FB" -eq "$FC" ] ||
+    fail "read_folio got $FB blocks in $FC calls -- it must stay 1:1 (a widened folio bh is corruption)"
 
 # ---- the data must still be right ----
 cmp -s <(dd if=/dev/zero bs=1M count=8 status=none) "$MNT/f" ||
@@ -89,6 +113,6 @@ cmp -s <(dd if=/dev/zero bs=1M count=8 status=none) "$MNT/f" ||
 ct_umount "$MNT"
 ct_fsck "$DEV" >/dev/null || fail "fsck found faults"
 
-pass "get_block reports contiguous runs to O_DIRECT and stays 1:1 for buffered callers"
+pass "get_block reports contiguous runs to O_DIRECT and readahead, and stays 1:1 for read_folio"
 
 ct_exit

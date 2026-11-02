@@ -364,6 +364,13 @@ struct cetrafs_inode_info {
      * cached and become trusted again the moment the gate goes quiet. */
     bool tree_cache_cold;
 
+    /* cetrafs_lock_read_cache_trusted()'s once-a-second stamp check, the
+     * reader's twin of foreign_open_valid/_checked. Kept apart from
+     * those because it asks only "did the file change?", never "who
+     * has it open?". */
+    bool read_seq_valid;
+    unsigned long read_seq_checked;
+
     /* Clears tree_cache_cold from a context that holds no buffer lock.
      * The gate itself runs on the per-block path and must not do the
      * work (it deadlocks there); waiting for the next open() instead
@@ -1081,6 +1088,8 @@ static void cetrafs_inode_identity_init_ci(struct cetrafs_inode_info *ci)
     ci->dirent_seq_cached = U64_MAX;
     ci->file_seq_cached = U64_MAX;
     ci->tree_cache_cold = false;
+    ci->read_seq_valid = false;
+    ci->read_seq_checked = 0;
     /* A slab object is recycled across identities; a remembered extent
      * carried over would map the PREVIOUS file's blocks. */
     ci->ext_valid = false;
@@ -1647,6 +1656,7 @@ int cetrafs_lock_open(struct inode *inode, struct file *file)
      * rounding error but the difference between a disk that opens and
      * one that does not. */
     ci->foreign_open_valid = false;
+    ci->read_seq_valid = false;
 
     /* The one safe place to do the heavy half of a reconcile: no buffer
      * is locked here and no folio is held, unlike the per-block gate.
@@ -2229,6 +2239,24 @@ static void cetrafs_inode_cold_work(struct work_struct *w)
     iput(inode);
 }
 
+/*
+ * Distrust this inode's cached extent tree until the reconcile above
+ * has dropped it. For a caller that has just applied a record it read
+ * fresh -- cetrafs_apply_raw_to_vfs_inode() -- and so knows the device
+ * may describe a different tree than the cache does, but may not drop
+ * buffers itself (see the comment there).
+ */
+void cetrafs_inode_mark_tree_cold(struct inode *inode)
+{
+    struct cetrafs_inode_info *ci = CETRAFS_I(inode);
+
+    WRITE_ONCE(ci->tree_cache_cold, true);
+    if (igrab(inode)) {
+        if (!schedule_work(&ci->cold_work))
+            iput(inode);
+    }
+}
+
 /* Defined below, next to the public wrapper it came from. */
 static int cetrafs_foreign_reader_from_raw(struct super_block *sb,
                                            u64 ino,
@@ -2236,27 +2264,16 @@ static int cetrafs_foreign_reader_from_raw(struct super_block *sb,
                                            u32 my_node_id,
                                            bool *out_exists);
 
-static bool cetrafs_inode_has_foreign_opener(struct inode *inode)
+/*
+ * The change-stamp half of the gate: compare a forced-fresh record's
+ * file_seq with the one this node's cache was reconciled at, and if a
+ * PEER moved it, mark the tree cold and schedule the reconcile.
+ */
+static void cetrafs_inode_note_stamp(struct inode *inode, const cetrafs_inode_t *rawp, u32 my_node_id)
 {
-    struct super_block *sb = inode->i_sb;
     struct cetrafs_inode_info *ci = CETRAFS_I(inode);
-    cetrafs_inode_t raw;
-    u32 my_node_id;
-    bool exists = false;
-    u64 seq;
+    u64 seq = cetrafs_le64(rawp->file_seq);
 
-    if (cetrafs_force_foreign_opener)
-        return true;
-    if (cetrafs_sb_get_node_id(sb, &my_node_id) != 0)
-        return true;
-
-    /* Forced-fresh: a peer publishes on the device, and our buffer cache
-     * is exactly what we are here to question. */
-    cetrafs_invalidate_raw_inode(sb, inode->i_ino);
-    if (cetrafs_read_raw_inode(sb, inode->i_ino, &raw) != 0)
-        return true; /* cannot tell -> assume present, read fresh */
-
-    seq = cetrafs_le64(raw.file_seq);
     if (!cetrafs_file_seq_ignore && seq != ci->file_seq_cached) {
         /* Whose publish is this? Our OWN writeback moves the stamp on
          * every durability boundary, and the cache it leaves behind is
@@ -2298,6 +2315,27 @@ static bool cetrafs_inode_has_foreign_opener(struct inode *inode)
         }
         ci->file_seq_cached = seq;
     }
+}
+
+static bool cetrafs_inode_has_foreign_opener(struct inode *inode)
+{
+    struct super_block *sb = inode->i_sb;
+    cetrafs_inode_t raw;
+    u32 my_node_id;
+    bool exists = false;
+
+    if (cetrafs_force_foreign_opener)
+        return true;
+    if (cetrafs_sb_get_node_id(sb, &my_node_id) != 0)
+        return true;
+
+    /* Forced-fresh: a peer publishes on the device, and our buffer cache
+     * is exactly what we are here to question. */
+    cetrafs_invalidate_raw_inode(sb, inode->i_ino);
+    if (cetrafs_read_raw_inode(sb, inode->i_ino, &raw) != 0)
+        return true; /* cannot tell -> assume present, read fresh */
+
+    cetrafs_inode_note_stamp(inode, &raw, my_node_id);
 
     if (cetrafs_foreign_reader_from_raw(sb, inode->i_ino, &raw, my_node_id, &exists) != 0)
         return true;
@@ -2375,6 +2413,99 @@ bool cetrafs_lock_held_for_write_locally(struct inode *inode)
         return false;
     /* Checked AFTER the gate, which is what sets it. */
     return !READ_ONCE(CETRAFS_I(inode)->tree_cache_cold);
+}
+
+/*
+ * May a READ trust this node's cached record and extent tree?
+ *
+ * Not the write lock's question. cetrafs_lock_held_for_write_locally()
+ * asks whether anybody else can be changing the file, because a writer
+ * that maps through a stale tree allocates over a peer's extents and
+ * publishes the result. A reader publishes nothing: the worst a stale
+ * map can do is send it to blocks the file USED to have there. That is
+ * harmless exactly when those blocks cannot have been given to anybody
+ * else, and they cannot: this node's read-open is published in
+ * read_open_nodes, and every path that frees a file's blocks refuses
+ * while a live peer is in it -- unlink, rename-replace and evict
+ * (dir.c, super_ops.c), truncate and punch (cetrafs_setattr(),
+ * cetrafs_fallocate()), and defrag (cetrafs_lock_defrag_begin()). What
+ * is left to a peer is writing blocks the file already has and adding
+ * new ones, so a stale map reads old contents or zeroes -- what a read
+ * racing a write on another host gets anyway, page cache included.
+ *
+ * Asking the write lock's question here instead put a forced-fresh
+ * record read in front of every 4 KiB a reader mapped, holes included:
+ * a read-only open read at ~10 MB/s on an iSCSI LUN against ~100 MB/s
+ * read-write, and a VM's qcow2 backing file is opened read-only.
+ *
+ * Staleness stays bounded by a CHANGE STAMP (rule 10), not by time
+ * alone: once a second, and at the first read after every open, the
+ * record is read fresh and a peer's file_seq marks the tree cold, which
+ * sends every read fresh until the reconcile has dropped the old tree
+ * and the clean pages built from it.
+ *
+ * Only for a node with no local writer: while this node has the file
+ * open for write the answer is the write lock's, unchanged, which is
+ * what makes it safe to call from paths that can write (see
+ * cetrafs_get_block_read()).
+ */
+static bool cetrafs_read_trust_off;
+module_param_named(read_trust_off, cetrafs_read_trust_off, bool, 0644);
+MODULE_PARM_DESC(read_trust_off, "TEST ONLY: readers re-read the record per block (the pre-fix behaviour)");
+
+static bool cetrafs_read_trust_ignore_stamp;
+module_param_named(read_trust_ignore_stamp, cetrafs_read_trust_ignore_stamp, bool, 0644);
+MODULE_PARM_DESC(read_trust_ignore_stamp, "TEST ONLY: readers trust their cache without the file_seq check");
+
+/* false: the record could not be read, so nothing is known -- the
+ * caller must not trust its cache for this read. */
+static bool cetrafs_inode_read_stamp_check(struct inode *inode)
+{
+    struct cetrafs_inode_info *ci = CETRAFS_I(inode);
+    struct super_block *sb = inode->i_sb;
+    unsigned long now = jiffies;
+    cetrafs_inode_t *raw;
+    u32 my_node_id;
+
+    bool ok = false;
+
+    if (cetrafs_read_trust_ignore_stamp)
+        return true;
+    if (READ_ONCE(ci->read_seq_valid) && !time_after(now, READ_ONCE(ci->read_seq_checked) + HZ))
+        return true;
+    /* Off the stack: this is reached from deep in the read path, and
+     * the record is 652 bytes (see the open path's FRAME_WARN note). */
+    raw = kmalloc(sizeof(*raw), GFP_NOFS);
+    if (raw && cetrafs_sb_get_node_id(sb, &my_node_id) == 0) {
+        cetrafs_invalidate_raw_inode(sb, inode->i_ino);
+        if (cetrafs_read_raw_inode(sb, inode->i_ino, raw) == 0) {
+            cetrafs_inode_note_stamp(inode, raw, my_node_id);
+            WRITE_ONCE(ci->read_seq_checked, now);
+            WRITE_ONCE(ci->read_seq_valid, true);
+            ok = true;
+        }
+    }
+    kfree(raw);
+    return ok;
+}
+
+bool cetrafs_lock_read_cache_trusted(struct inode *inode)
+{
+    struct cetrafs_inode_info *ci = CETRAFS_I(inode);
+
+    if (cetrafs_lock_held_for_write_locally(inode))
+        return true;
+    if (cetrafs_read_trust_off || !S_ISREG(inode->i_mode))
+        return false;
+    if (atomic_read(&ci->lock_writer_count) > 0 || READ_ONCE(ci->defrag_pinned))
+        return false; /* a writer here: the write lock's answer stands */
+
+    /* Under nofilelock the predicate above has just run the stamp check
+     * itself (cetrafs_inode_foreign_opener_cached()); asking again
+     * would only add a device read. */
+    if (cetrafs_sb_file_lock_enabled(inode->i_sb) && !cetrafs_inode_read_stamp_check(inode))
+        return false;
+    return !READ_ONCE(ci->tree_cache_cold);
 }
 
 /*

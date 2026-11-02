@@ -448,6 +448,9 @@ u64 cetrafs_ext_cache_miss_count(void);
 struct buffer_head *cetrafs_read_dir_leaf_bh(struct inode *inode, u64 lba, bool fresh);
 struct buffer_head *cetrafs_read_tree_bh(struct inode *inode, u64 lba, u32 tail_magic, const char *what);
 struct buffer_head *cetrafs_read_index_bh(struct inode *inode, u64 lba);
+struct buffer_head *cetrafs_read_tree_bh_for(struct inode *inode, u64 lba, u32 tail_magic, const char *what, bool reader);
+struct buffer_head *cetrafs_read_leaf_bh_for(struct inode *inode, u64 lba, bool reader);
+struct buffer_head *cetrafs_read_index_bh_for(struct inode *inode, u64 lba, bool reader);
 int cetrafs_flush_tree_blocks(struct inode *inode, const cetrafs_inode_t *raw);
 void cetrafs_tree_invalidate_cached(struct inode *inode, const cetrafs_inode_t *raw);
 int cetrafs_tree_flatten(struct inode *inode, const cetrafs_inode_t *raw, cetrafs_extent_t **out_arr, u32 *out_n);
@@ -757,6 +760,8 @@ int cetrafs_lock_foreign_user_exists(struct super_block *sb,
                                      bool *out_writer,
                                      bool *out_reader);
 bool cetrafs_lock_held_for_write_locally(struct inode *inode);
+bool cetrafs_lock_read_cache_trusted(struct inode *inode);
+void cetrafs_inode_mark_tree_cold(struct inode *inode);
 bool cetrafs_lock_identity_cache_trusted(struct inode *inode);
 /* lock.c: default-mount lock suspension counters (procfs `info`). */
 u64 cetrafs_lock_suspend_count(void);

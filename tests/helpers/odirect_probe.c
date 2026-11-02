@@ -11,8 +11,9 @@
 // re-looking-up. O_DIRECT forces every read through get_block (no page
 // cache), exactly like Proxmox's cache=none.
 //
-// usage: odirect_probe <file> <ready_gate> <go_gate>
-//   open <file> O_RDWR|O_DIRECT, read 4096 @ offset 0, print first 10 bytes,
+// usage: odirect_probe <file> <ready_gate> <go_gate> [ro]
+//   open <file> O_RDWR|O_DIRECT (O_RDONLY|O_DIRECT with "ro": a reader,
+//   which asks a different cache question -- read_cache_trust.sh), read 4096 @ offset 0, print first 10 bytes,
 //   create <ready_gate>, wait for <go_gate> to appear (peer poke happens
 //   meanwhile), read 4096 @ offset 0 again through the SAME fd, print first
 //   10 bytes. Two lines on stdout: "read1 <bytes>" then "read2 <bytes>".
@@ -36,8 +37,11 @@ static void rd(int fd, char *out)
 
 int main(int argc, char **argv)
 {
-    if (argc != 4) { fprintf(stderr, "usage: %s <file> <ready> <go>\n", argv[0]); return 2; }
-    int fd = open(argv[1], O_RDWR | O_DIRECT);
+    if (argc != 4 && !(argc == 5 && strcmp(argv[4], "ro") == 0)) {
+        fprintf(stderr, "usage: %s <file> <ready> <go> [ro]\n", argv[0]);
+        return 2;
+    }
+    int fd = open(argv[1], (argc == 5 ? O_RDONLY : O_RDWR) | O_DIRECT);
     if (fd < 0) { perror("open O_DIRECT"); return 2; }
 
     char a[16], b[16];
