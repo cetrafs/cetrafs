@@ -156,9 +156,37 @@ static int cetrafs_file_mmap(struct file *file, struct vm_area_struct *vma)
     return ret;
 }
 
+/*
+ * ->flush: the only file operation whose return value close(2) passes
+ * on. ->release runs after it, and its return is discarded.
+ *
+ * The last writer's close publishes size and extents and releases the
+ * lock in ->release, after flushing the data. A data write that failed
+ * there was logged and nothing else: the close returned 0 over extents
+ * naming blocks that never got the data and read back whatever they held
+ * before -- possibly another file's. It cannot be retried (a failed
+ * writeback leaves the pages clean), so the behaviour chosen is ext4's
+ * default: publish anyway, and REPORT. Flushing here makes the error
+ * reach close(2); file_write_and_wait() reports through this fd's
+ * errseq, so a write error from background writeback since the open (or
+ * the last fsync) is reported too, not only one from this flush.
+ *
+ * Nothing dirty -- every read-only fd, and O_DIRECT writers like qemu
+ * with cache=none -- costs a check of the mapping and nothing else.
+ * tests/kernel/close_data_error.sh.
+ */
+static int cetrafs_file_flush(struct file *file, fl_owner_t id)
+{
+    (void) id;
+    if (!(file->f_mode & FMODE_WRITE))
+        return 0;
+    return file_write_and_wait(file);
+}
+
 const struct file_operations cetrafs_file_ops = {
     .owner = THIS_MODULE,
     .open = cetrafs_open,
+    .flush = cetrafs_file_flush,
     .release = cetrafs_release,
     .llseek = cetrafs_llseek,
     .read_iter = generic_file_read_iter,

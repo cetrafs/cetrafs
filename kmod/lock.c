@@ -2036,6 +2036,12 @@ int cetrafs_lock_release(struct inode *inode, struct file *file)
          * whatever extent/size bookkeeping is already sitting
          * unsynced in the buffer cache from this write session.
          */
+        /* A failure here is logged and NOT acted on: the data cannot be
+         * retried (failed writeback leaves the pages clean), and the
+         * chosen behaviour is to publish anyway. What reports it to the
+         * application is ->flush (cetrafs_file_flush()), which ran this
+         * same flush before close(2) returned -- by the time we get here
+         * there is normally nothing left to write. */
         ret = filemap_write_and_wait(inode->i_mapping);
         if (ret)
             pr_err("lock release: ino=%llu failed to flush dirty data: %d\n", (unsigned long long) inode->i_ino, ret);
