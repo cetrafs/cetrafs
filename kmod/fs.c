@@ -2463,6 +2463,16 @@ void cetrafs_sb_fence(struct super_block *sb, const char *reason)
         "SELF-FENCED: %s -- a peer has declared this node dead and reclaimed its claims; "
         "all writes now fail with EIO. Unmount and remount to rejoin the cluster.\n",
         reason);
+    /* After the flag, so nothing re-dirties behind the sweep through an
+     * entry point that already checks it. */
+    if (sb->s_bdev) {
+        unsigned long n = cetrafs_drop_dirty_metadata(sb);
+
+        if (n)
+            pr_err("SELF-FENCED: discarded %lu dirty metadata buffer(s) without writing them -- the blocks "
+                   "they describe belong to the peer that fenced us\n",
+                   n);
+    }
 }
 
 bool cetrafs_sb_is_fenced(struct super_block *sb)

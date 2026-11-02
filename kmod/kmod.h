@@ -393,6 +393,7 @@ extern bool cetrafs_cas_selftest_enabled;
 struct buffer_head *cetrafs_bread_uncached(struct super_block *sb, sector_t block);
 void cetrafs_invalidate_block(struct super_block *sb, sector_t block);
 void cetrafs_forget_block(struct super_block *sb, sector_t block);
+unsigned long cetrafs_drop_dirty_metadata(struct super_block *sb);
 /* Keep a cached block coherent with a swap that went straight to the
  * device, without throwing the cached copy away -- see ioutil.c. */
 void cetrafs_cache_region_after_cas(struct super_block *sb,

@@ -28,6 +28,13 @@
 #include <linux/version.h>
 #include <linux/delay.h>
 #include <linux/fs.h>
+#include <linux/pagemap.h>
+/* struct folio_batch moved out of pagevec.h; build against either. */
+#if __has_include(<linux/folio_batch.h>)
+#include <linux/folio_batch.h>
+#else
+#include <linux/pagevec.h>
+#endif
 
 #include <linux/crc32c.h>
 
@@ -467,6 +474,67 @@ void cetrafs_invalidate_block(struct super_block *sb, sector_t block)
  * Taking the buffer lock waits out a write already in flight, which
  * lands while the block is still ours and is harmless.
  */
+/*
+ * Self-fence: discard every dirty metadata buffer this node holds, without
+ * writing it.
+ *
+ * Fenced means a peer has declared this node dead and taken its Zone
+ * Groups, locks and journal; from then on every image this node had
+ * dirtied -- allocation bitmaps set with sync=false, tree blocks waiting
+ * for a boundary -- is a write aimed at blocks somebody else now owns.
+ * The entry points refuse new writes and writepages refuses file data,
+ * but what was already dirty in the block device's cache went out with
+ * ordinary writeback, over the new owner's bitmap
+ * (tests/kernel/fence_drops_dirty_metadata.sh).
+ *
+ * Only the dirty state goes: buffers stay mapped and uptodate, because
+ * this node still holds references to some of them and a cleared mapping
+ * under a later submit_bh() is a BUG. Takes the folio lock, then each
+ * buffer's lock (the order writeback uses); a write already in flight is
+ * waited out -- it was issued before the fence was noticed, the window
+ * the fence has always had. Call from process context with nothing held
+ * (the heartbeat).
+ */
+unsigned long cetrafs_drop_dirty_metadata(struct super_block *sb)
+{
+    struct address_space *mapping = sb->s_bdev->bd_mapping;
+    struct folio_batch fbatch;
+    unsigned long dropped = 0;
+    pgoff_t index = 0;
+    unsigned int nr, i;
+
+    folio_batch_init(&fbatch);
+    while ((nr = filemap_get_folios_tag(mapping, &index, (pgoff_t) -1, PAGECACHE_TAG_DIRTY, &fbatch))) {
+        for (i = 0; i < nr; i++) {
+            struct folio *folio = fbatch.folios[i];
+            struct buffer_head *head, *bh;
+
+            folio_lock(folio);
+            if (folio->mapping != mapping) {
+                folio_unlock(folio);
+                continue;
+            }
+            folio_wait_writeback(folio);
+            head = folio_buffers(folio);
+            if (head) {
+                bh = head;
+                do {
+                    lock_buffer(bh);
+                    if (test_clear_buffer_dirty(bh))
+                        dropped++;
+                    unlock_buffer(bh);
+                    bh = bh->b_this_page;
+                } while (bh != head);
+            }
+            folio_cancel_dirty(folio);
+            folio_unlock(folio);
+        }
+        folio_batch_release(&fbatch);
+        cond_resched();
+    }
+    return dropped;
+}
+
 void cetrafs_forget_block(struct super_block *sb, sector_t block)
 {
     struct buffer_head *bh = sb_find_get_block(sb, block);
