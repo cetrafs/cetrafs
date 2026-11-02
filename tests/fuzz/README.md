@@ -134,7 +134,11 @@ Stage 2 found three classes behind the checksums:
   single crafted extent. Fixed by validating each run as a range once.
   (A fourth "finding" -- fsck hanging on a node row mutated to look live --
   was a false positive, fsck's deliberate 20s live-peer watch; the runner
-  now sets `CETRAFS_PEER_PROBE_SECS=1`.)
+  now sets `CETRAFS_PEER_PROBE_SECS=1`. That only lowers the window's
+  floor: since the watch covers two of the row's ADVERTISED intervals,
+  a mutated row brought it back as six "hangs" in one run, each fsck
+  finishing OK after 35 s. A timed-out fsck now gets one retry at the
+  longest legal window before it counts as a hang.)
 - A KERNEL crash-and-wedge, found by the write exercise on its first
   3000-iter run: a checksum-valid inode with a corrupt extent header
   (`eh_entries` past capacity) made `cetrafs_leaf_array_insert()` read

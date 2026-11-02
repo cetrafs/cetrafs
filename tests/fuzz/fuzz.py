@@ -485,6 +485,25 @@ t(lambda: os.statvfs(m))
 """
 
 
+# fsck watches any Node Registry row that looks mounted before it will
+# touch the volume, and the watch is TWO of the row's advertised heartbeat
+# intervals + 5 s -- up to 65 s for the slowest legal one. The fuzzer's
+# CETRAFS_PEER_PROBE_SECS=1 only lowers the floor of that window; it
+# cannot shorten what a mutated row advertises, and must not (that
+# stretch is what keeps a slow live node from being declared gone). So a
+# 15 s budget read a correct 35 s watch as a hang: six "findings" in one
+# 3000-iteration run, every one a node row, every one fsck finishing OK.
+# A timeout earns one patient retry; only a second one is a hang.
+FSCK_PATIENT_SECS = 15 + 2 * 30 + 5
+
+
+def run_fsck(args, loop, env):
+    rc, out = run([args.fsck, loop], 15, env=env)
+    if rc == "TIMEOUT":
+        rc, out = run([args.fsck, loop], FSCK_PATIENT_SECS, env=env)
+    return rc, out
+
+
 def run_stage2(args, rng, fd, loop, env, t0, targets):
     work = args.golden + ".work"
     kinds = {}
@@ -557,7 +576,7 @@ def run_stage2(args, rng, fd, loop, env, t0, targets):
         extra = ""
         if args.mode == "fsck-fields":
             run(["blockdev", "--flushbufs", loop], 10)
-            rc, out = run([args.fsck, loop], 15, env=env)
+            rc, out = run_fsck(args, loop, env)
             txt = out.decode(errors="replace")
             if rc == "TIMEOUT":
                 why = "hang"
@@ -739,7 +758,7 @@ def run_loop(args, rng, mut, fd, loop, env, t0):
         extra = ""
         if args.mode == "fsck":
             run(["blockdev", "--flushbufs", loop], 10)
-            rc, out = run([args.fsck, loop], 15, env=env)
+            rc, out = run_fsck(args, loop, env)
             if rc == "TIMEOUT":
                 why, extra = "hang", ""
             elif isinstance(rc, int) and rc < 0:
