@@ -77,6 +77,16 @@ struct cetrafs_journal {
     u64 next_txn_id;
     bool flag_dirty;     /* our on-disk flag's current state -- truthful, since we're its only writer */
     unsigned long *busy; /* logged-but-not-yet-consumed slots (in-flight operations) */
+    /*
+     * Slots held past their operation: a target write that failed keeps
+     * its entry live for replay (stuck_lba[slot] = its target, so the
+     * next write of that block takes the slot over), and the test knobs
+     * that retain entries on purpose. 'held' counts both; when every slot
+     * is held, a writer fails instead of waiting for one to come free.
+     */
+    u64 *stuck_lba;
+    u64 held;
+    wait_queue_head_t slot_wq; /* a slot was given back */
 };
 
 /* Resolve node #node_id's journal slice. *out_start = 0 means journaling
@@ -337,6 +347,7 @@ int cetrafs_journal_init(struct super_block *sb, struct cetrafs_journal **out_j)
         return -ENOMEM;
 
     mutex_init(&j->lock);
+    init_waitqueue_head(&j->slot_wq);
     /* area_start/slots stay 0 until cetrafs_journal_attach_node() --
      * fill_super() calls cetrafs_journal_init() before node registration
      * has produced a node id, and until attached every log call is a
@@ -350,6 +361,7 @@ void cetrafs_journal_free(struct cetrafs_journal *j)
     if (!j)
         return;
     kfree(j->busy);
+    kfree(j->stuck_lba);
     kfree(j);
 }
 
@@ -376,7 +388,12 @@ int cetrafs_journal_attach_node(struct super_block *sb, u32 node_id)
         return 0; /* journaling disabled volume-wide (mkfs -J 0) */
 
     j->busy = kcalloc(BITS_TO_LONGS(j->slots), sizeof(unsigned long), GFP_KERNEL);
-    if (!j->busy) {
+    j->stuck_lba = kcalloc(j->slots, sizeof(*j->stuck_lba), GFP_KERNEL);
+    if (!j->busy || !j->stuck_lba) {
+        kfree(j->busy);
+        kfree(j->stuck_lba);
+        j->busy = NULL;
+        j->stuck_lba = NULL;
         j->area_start = 0;
         j->slots = 0;
         return -ENOMEM;
@@ -463,6 +480,16 @@ static bool cetrafs_journal_fail_target_write;
 module_param_named(journal_fail_target_write, cetrafs_journal_fail_target_write, bool, 0644);
 MODULE_PARM_DESC(journal_fail_target_write, "test-only: the target's write fails (the entry must stay live)");
 
+/*
+ * Test-only: make writing the journal ENTRY itself (payload + header)
+ * report failure. Nothing a test can supply makes that write fail, and
+ * the question it reaches is what the caller's modification does when
+ * it cannot be protected: it must fail, never go out unjournaled.
+ */
+static bool cetrafs_journal_fail_entry_write;
+module_param_named(journal_fail_entry_write, cetrafs_journal_fail_entry_write, bool, 0644);
+MODULE_PARM_DESC(journal_fail_entry_write, "test-only: the journal entry's own write fails");
+
 static bool cetrafs_journal_ignore_guard;
 module_param_named(journal_ignore_guard, cetrafs_journal_ignore_guard, bool, 0644);
 MODULE_PARM_DESC(journal_ignore_guard, "test-only: replay without the prev_checksum guard (reproduces the pre-fix bug)");
@@ -475,6 +502,48 @@ MODULE_PARM_DESC(journal_ignore_guard, "test-only: replay without the prev_check
 static bool cetrafs_journal_ignore_torn;
 module_param_named(journal_ignore_torn, cetrafs_journal_ignore_torn, bool, 0644);
 MODULE_PARM_DESC(journal_ignore_torn, "test-only: refuse to redo a torn target (reproduces the 0.7.3 bug)");
+
+static u64 cetrafs_journal_header_lba(const struct cetrafs_journal *j, u64 slot)
+{
+    return j->area_start + 1 + slot * CETRAFS_JOURNAL_SLOT_BLOCKS;
+}
+
+/* Overwrite a slot's header with zeroes and wait for it: the entry is
+ * spent. Nonzero if that cannot be shown to have reached the device. */
+static int cetrafs_journal_zero_header(struct super_block *sb, u64 header_lba)
+{
+    struct buffer_head *jbh = cetrafs_getblk_overwrite(sb, header_lba);
+    int ret;
+
+    if (!jbh)
+        return -EIO;
+    memset(jbh->b_data, 0, CETRAFS_BLOCK_SIZE);
+    cetrafs_bh_end_update(jbh);
+    ret = cetrafs_sync_buffer(jbh);
+    brelse(jbh);
+    return ret;
+}
+
+/* Hold 'slot' past its operation. Called with j->lock held. A nonzero
+ * 'lba' names the target whose next write takes the slot over. */
+static void cetrafs_journal_hold_slot(struct cetrafs_journal *j, u64 slot, u64 lba)
+{
+    j->stuck_lba[slot] = lba;
+    j->held++;
+}
+
+/* Lockless: only a wake-up condition, re-checked under j->lock. */
+static bool cetrafs_journal_slot_or_none(struct cetrafs_journal *j)
+{
+    return find_first_zero_bit(j->busy, j->slots) < j->slots || READ_ONCE(j->held) >= j->slots;
+}
+
+u64 cetrafs_journal_held_slots(struct super_block *sb)
+{
+    struct cetrafs_journal *j = cetrafs_sb_get_journal(sb);
+
+    return (j && j->area_start) ? READ_ONCE(j->held) : 0;
+}
 
 static int cetrafs_journal_write_block_flags(struct super_block *sb, struct buffer_head *bh, u32 flags, u32 prev_crc)
 {
@@ -489,28 +558,59 @@ static int cetrafs_journal_write_block_flags(struct super_block *sb, struct buff
     }
 
     u64 slot, txn_id, header_lba, payload_lba;
-    struct buffer_head *jbh;
     struct buffer_head *pbh, *hbh;
     cetrafs_journal_header_t *hdr;
     bool journaled = false;
-    bool degraded = false; /* fell back to an unjournaled write on a journaling volume */
 
+    /*
+     * On a journaling volume, a block the journal cannot protect is NOT
+     * written. Every failure below -- no slot, the area flag, the entry
+     * itself -- used to fall back to an unjournaled write with a
+     * ratelimited warning and report success, so a crash inside that
+     * write left a torn dirent/xattr/leaf block with nothing to redo it
+     * from. Now the update is aborted (the buffer drops its unpublished
+     * image, see cetrafs_bh_abort_update()) and the caller gets the
+     * error, the same contract as a failed target write below.
+     * mkfs -J 0 is a different thing: no journal at all, by choice.
+     */
     if (j && j->area_start) {
         mutex_lock(&j->lock);
 
-        slot = find_first_zero_bit(j->busy, j->slots);
-        if (slot >= j->slots) {
-            /* Every slot is held by a concurrently in-flight operation
-             * -- effectively impossible at realistic slot counts, and
-             * journaling is best-effort by design (mkfs -J 0 is a
-             * supported configuration), so warn loudly and fall through
-             * to an unjournaled-but-still-synced write rather than
-             * failing the operation. */
-            pr_warn_ratelimited("journal: all %llu slots in flight, writing block %llu unjournaled\n",
-                                (unsigned long long) j->slots, (unsigned long long) bh->b_blocknr);
+        for (;;) {
+            /* An entry a failed write of THIS block kept is superseded by
+             * the one about to be written -- built from the block as it
+             * was re-read after that failure -- so its slot is ours to
+             * reuse. Without this, a full set of kept entries refused the
+             * very write that would have retired them. */
+            if (j->held) {
+                for (slot = 0; slot < j->slots; slot++)
+                    if (j->stuck_lba[slot] == bh->b_blocknr)
+                        break;
+                if (slot < j->slots) {
+                    j->stuck_lba[slot] = 0;
+                    j->held--;
+                    clear_bit(slot, j->busy); /* re-set below, still under j->lock */
+                    break;
+                }
+            }
+            slot = find_first_zero_bit(j->busy, j->slots);
+            if (slot < j->slots)
+                break;
+            if (j->held >= j->slots) {
+                /* Nothing in flight will free one: every slot is held
+                 * by an entry a failed write kept. */
+                mutex_unlock(&j->lock);
+                pr_err_ratelimited("journal: all %llu slots are held by kept entries -- refusing to write block "
+                                   "%llu unjournaled\n",
+                                   (unsigned long long) j->slots, (unsigned long long) bh->b_blocknr);
+                cetrafs_bh_abort_update(bh);
+                return -EIO;
+            }
+            /* Every free slot is in flight: those operations hold no lock
+             * we hold and only do their own I/O, so one comes back. */
             mutex_unlock(&j->lock);
-            degraded = true;
-            goto write_target;
+            wait_event(j->slot_wq, cetrafs_journal_slot_or_none(j));
+            mutex_lock(&j->lock);
         }
 
         /* First entry of this session: durably flip our flag to DIRTY
@@ -520,16 +620,12 @@ static int cetrafs_journal_write_block_flags(struct super_block *sb, struct buff
             int ret = cetrafs_journal_write_flag(sb, j->area_start, true);
 
             if (ret) {
-                /* Same degradation as the all-slots-busy path below:
-                 * journaling is best-effort by design, and the target
-                 * still gets a synchronous write. Returning here instead
-                 * would leave the caller's modification locked in memory
-                 * with nothing to publish it. */
-                pr_warn_ratelimited("journal: could not mark our area dirty (%d), writing block %llu unjournaled\n",
-                                    ret, (unsigned long long) bh->b_blocknr);
                 mutex_unlock(&j->lock);
-                degraded = true;
-                goto write_target;
+                pr_err_ratelimited("journal: could not mark our area dirty (%d) -- refusing to write block %llu "
+                                   "unjournaled\n",
+                                   ret, (unsigned long long) bh->b_blocknr);
+                cetrafs_bh_abort_update(bh);
+                return ret;
             }
             j->flag_dirty = true;
         }
@@ -538,7 +634,7 @@ static int cetrafs_journal_write_block_flags(struct super_block *sb, struct buff
         txn_id = ++j->next_txn_id;
         mutex_unlock(&j->lock);
 
-        header_lba = j->area_start + 1 + slot * CETRAFS_JOURNAL_SLOT_BLOCKS;
+        header_lba = cetrafs_journal_header_lba(j, slot);
         payload_lba = header_lba + 1;
 
         /* 1+2. Payload and header, issued TOGETHER and waited for once.
@@ -597,7 +693,7 @@ static int cetrafs_journal_write_block_flags(struct super_block *sb, struct buff
 
             wait_on_buffer(pbh);
             wait_on_buffer(hbh);
-            ok = buffer_uptodate(pbh) && buffer_uptodate(hbh);
+            ok = buffer_uptodate(pbh) && buffer_uptodate(hbh) && !cetrafs_journal_fail_entry_write;
             brelse(pbh);
             brelse(hbh);
             if (!ok)
@@ -610,7 +706,6 @@ static int cetrafs_journal_write_block_flags(struct super_block *sb, struct buff
                  (unsigned long long) slot, (unsigned long long) bh->b_blocknr);
     }
 
-write_target:
     /* 3. The real in-place write. The journal entry (if any) must be
      * durable before this may legally reach the device -- which is why the
      * buffer was held locked until here. But the wait_on_buffer() above
@@ -621,20 +716,9 @@ write_target:
      * to redo it. Flush the cache so the entry is genuinely on the platter
      * first. Free on a write-through / NV-cache device.
      *
-     * The DEGRADED (unjournaled fallback) case flushes too, for the
-     * mirror-image reason: a consume below only syncs its zeroed header,
-     * so the zero can still be sitting in the device cache -- ordinarily
-     * harmless, because the next JOURNALED write's flush here lands it
-     * before any covered block changes again, and re-applying a consumed
-     * entry over an unchanged target is idempotent. An unjournaled write
-     * is the one writer of a covered block with no entry of its own and,
-     * without this flush, no barrier: a reordering cache could persist it
-     * while losing an earlier consume's zero, and a crash then has replay
-     * resurrect the consumed entry and roll this very write back. The
-     * flush makes every prior zero durable BEFORE this write can be.
-     * Only the degraded fallbacks pay it (loud error paths already);
-     * a volume with journaling off (mkfs -J 0) has no entries to order
-     * against and skips it. */
+     * A volume with journaling off (mkfs -J 0) has no entries to order
+     * against and skips it; on a journaling volume nothing reaches here
+     * unjournaled any more. */
     if (journaled && cetrafs_journal_skip_target_write) {
         blkdev_issue_flush(sb->s_bdev);
         /* Abort rather than end the update: the modification is dropped
@@ -642,12 +726,15 @@ write_target:
          * keeps its prior image exactly as a crash here would leave it.
          * The slot is deliberately retained (see skip_consume). */
         cetrafs_bh_abort_update(bh);
+        mutex_lock(&j->lock);
+        cetrafs_journal_hold_slot(j, slot, 0); /* kept on purpose: never superseded */
+        mutex_unlock(&j->lock);
         pr_warn_ratelimited("journal: journal_skip_target_write set -- txn %llu committed, target %llu NOT written\n",
                             (unsigned long long) txn_id, (unsigned long long) bh->b_blocknr);
         return 0;
     }
 
-    if (journaled || degraded)
+    if (journaled)
         blkdev_issue_flush(sb->s_bdev);
     /* end_update marks it dirty and releases it; the sync must follow,
      * never precede, because sync_dirty_buffer() takes the buffer lock. */
@@ -656,6 +743,11 @@ write_target:
          * update, so the target keeps the image a refused write would
          * have left, then fail exactly as a real error does below. */
         cetrafs_bh_abort_update(bh);
+        if (journaled) {
+            mutex_lock(&j->lock);
+            cetrafs_journal_hold_slot(j, slot, bh->b_blocknr);
+            mutex_unlock(&j->lock);
+        }
         pr_err("journal: journal_fail_target_write set -- target %llu refused, txn %llu stays LIVE for replay\n",
                (unsigned long long) bh->b_blocknr, (unsigned long long) txn_id);
         return -EIO;
@@ -673,11 +765,18 @@ write_target:
          *
          * Keeping the slot busy is deliberate and matches the
          * skip_consume path: a released slot is reused immediately, and
-         * the next entry would overwrite this header.
+         * the next entry would overwrite this header. It is held only
+         * until the next write of the same block, which takes the slot
+         * over (see the slot search above).
          */
         int werr = cetrafs_sync_buffer(bh);
 
         if (werr) {
+            if (journaled) {
+                mutex_lock(&j->lock);
+                cetrafs_journal_hold_slot(j, slot, bh->b_blocknr);
+                mutex_unlock(&j->lock);
+            }
             pr_err("journal: target %llu failed to write (%d) -- txn %llu stays LIVE for replay\n",
                    (unsigned long long) bh->b_blocknr, werr, (unsigned long long) txn_id);
             return werr;
@@ -693,8 +792,10 @@ write_target:
          * immediately reused, and the next entry would overwrite this
          * header -- leaving only ONE live entry at crash time, which is
          * not the state a real crash produces. Entries accumulate until
-         * the area fills (then the ordinary all-slots-busy degradation
-         * takes over, loudly). */
+         * the area fills, and then writes fail. */
+        mutex_lock(&j->lock);
+        cetrafs_journal_hold_slot(j, slot, 0); /* kept on purpose: never superseded */
+        mutex_unlock(&j->lock);
         pr_warn_ratelimited("journal: journal_skip_consume set -- leaving txn %llu (target %llu) LIVE in slot %llu\n",
                             (unsigned long long) txn_id, (unsigned long long) bh->b_blocknr,
                             (unsigned long long) slot);
@@ -708,51 +809,53 @@ write_target:
          * consume (zeroed header) but lose the torn target, erasing the one
          * entry that could have redone it. */
         blkdev_issue_flush(sb->s_bdev);
-        jbh = cetrafs_getblk_overwrite(sb, header_lba);
-        if (jbh) {
-            memset(jbh->b_data, 0, CETRAFS_BLOCK_SIZE);
-            cetrafs_bh_end_update(jbh);
-            /* A consume that does not land leaves the entry live, which
-             * the replay guard makes harmless (below) -- but say so. */
-            if (cetrafs_sync_buffer(jbh))
-                pr_err(
-                    "journal: consume of slot %llu did not reach the device (entry stays; replay of it is "
-                    "harmless)\n",
-                    (unsigned long long) slot);
-            brelse(jbh);
-        } else {
-            /* Failing to consume is safe, just loud: the entry stays
-             * live, and replay now verifies prev_checksum against the
-             * device before applying anything -- so by the time this
-             * block has legitimately changed again (by us or by a peer)
-             * the entry no longer matches and is skipped. It used to be
-             * safe only "while we hold this op's lock", which under
-             * nofilelock is no lock at all. */
-            pr_err("journal: failed to consume slot %llu (entry stays; replay of it is harmless)\n",
+        if (cetrafs_journal_zero_header(sb, header_lba)) {
+            /* Not consumed: the entry stays live, which the replay guard
+             * makes harmless -- the target is durable, so a replay finds
+             * the after-image (or, once the block has legitimately changed
+             * again, a complete image that is neither) and skips it. It
+             * used to be safe only "while we hold this op's lock", which
+             * under nofilelock is no lock at all. The slot is held, as a
+             * kept entry's is, until a later write of the block retires
+             * it (by taking the slot over): released now, it could be
+             * reused while the zero might still land late over the new
+             * entry's header. */
+            pr_err("journal: consume of slot %llu did not reach the device (entry stays; replay of it is "
+                   "harmless)\n",
                    (unsigned long long) slot);
+            mutex_lock(&j->lock);
+            cetrafs_journal_hold_slot(j, slot, bh->b_blocknr);
+            mutex_unlock(&j->lock);
             return 0;
         }
 
         mutex_lock(&j->lock);
         clear_bit(slot, j->busy);
         mutex_unlock(&j->lock);
+        wake_up(&j->slot_wq);
     }
 
     return 0;
 
 journal_failed:
-    /* Could not write the entry. Degrade to an unjournaled-but-synced
-     * write rather than returning with the caller's modification stranded
-     * in a locked buffer -- same choice as the all-slots-busy path, and
-     * the same bounded loss of crash protection. Loud, never silent. */
+    /* Could not write the entry: the target is not written either (see
+     * the top of this function). What did reach the device may be a
+     * complete entry -- both writes can land and still be reported
+     * failed -- so retire it before giving the slot back; if even that
+     * cannot be shown, hold the slot as a kept entry's is held. */
+    cetrafs_bh_abort_update(bh);
     mutex_lock(&j->lock);
-    clear_bit(slot, j->busy);
-    mutex_unlock(&j->lock);
-    pr_err("journal: could not write an entry for block %llu -- writing it unjournaled\n",
-           (unsigned long long) bh->b_blocknr);
-    journaled = false;
-    degraded = true;
-    goto write_target;
+    if (cetrafs_journal_zero_header(sb, header_lba)) {
+        cetrafs_journal_hold_slot(j, slot, bh->b_blocknr);
+        mutex_unlock(&j->lock);
+    } else {
+        clear_bit(slot, j->busy);
+        mutex_unlock(&j->lock);
+        wake_up(&j->slot_wq);
+    }
+    pr_err_ratelimited("journal: could not write an entry for block %llu -- refusing to write it unjournaled\n",
+                       (unsigned long long) bh->b_blocknr);
+    return -EIO;
 }
 
 /*
