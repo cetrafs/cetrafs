@@ -3028,6 +3028,36 @@ int cetrafs_flock(struct file *file, int cmd, struct file_lock *fl)
  * A write-open that arrives while pinned proceeds normally (owner is
  * this node); its close then simply hands release duty back here.
  */
+static bool cetrafs_defrag_ignore_readers;
+module_param_named(defrag_ignore_readers, cetrafs_defrag_ignore_readers, bool, 0644);
+MODULE_PARM_DESC(defrag_ignore_readers, "TEST ONLY: defrag a file a peer has open for read");
+
+/*
+ * Defrag needs the file to itself, and the exclusive lock alone does not
+ * say that: a peer that opened the file for READ holds no lock, it is
+ * only a bit in read_open_nodes, and the lock claim never looked there.
+ * Relocating frees the old blocks, so a peer still reading through its
+ * map of them could be handed another file's data. Asked once the lock
+ * is OURS, which is what makes the answer final -- no peer open, read or
+ * write, gets past a live holder's lock (cetrafs_lock_open()).
+ *
+ * noinline: the reader check carries its own cetrafs_inode_t, and
+ * inlined next to the caller's that is 1360 bytes of frame -- over
+ * CONFIG_FRAME_WARN=1024 on the kernels this ships to.
+ */
+static noinline int cetrafs_defrag_check_sole(struct inode *inode, u32 my_node_id)
+{
+    bool reader = false;
+    int ret;
+
+    if (cetrafs_defrag_ignore_readers)
+        return 0;
+    ret = cetrafs_lock_foreign_reader_exists(inode->i_sb, inode->i_ino, my_node_id, &reader);
+    if (ret)
+        return ret;
+    return reader ? -EBUSY : 0;
+}
+
 int cetrafs_lock_defrag_begin(struct inode *inode)
 {
     struct cetrafs_inode_info *ci = CETRAFS_I(inode);
@@ -3066,8 +3096,12 @@ int cetrafs_lock_defrag_begin(struct inode *inode)
     }
 
     if (atomic_read(&ci->lock_writer_count) > 0) {
-        ci->defrag_pinned = true; /* lock already ours via local writers */
-        ret = 0;
+        /* The lock is already ours via local writers -- but a peer that
+         * opened for read BEFORE our writer did is still in. */
+        ret = cetrafs_defrag_check_sole(inode, my_node_id);
+        if (ret)
+            goto out;
+        ci->defrag_pinned = true;
         goto out;
     }
 
@@ -3101,6 +3135,14 @@ int cetrafs_lock_defrag_begin(struct inode *inode)
             ret = (ret == -ETXTBSY) ? -EBUSY : ret;
             goto out;
         }
+    }
+
+    ret = cetrafs_defrag_check_sole(inode, my_node_id);
+    if (ret) {
+        /* Give back the lock we took for nothing: no local writer
+         * exists to release it later. */
+        cetrafs_lock_clear_on_disk(inode, /*stamp_stat=*/false);
+        goto out;
     }
 
     ci->defrag_pinned = true;
