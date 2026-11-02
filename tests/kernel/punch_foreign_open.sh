@@ -59,7 +59,15 @@ sys.stdout.flush()
 PY
 }
 
+# The punch needs a write fd, and the access rule now refuses a
+# write-open while a live peer reads (access_rule.sh) -- under the
+# default mount this file could not be opened for write here at all.
+# Turn that half off for this one open, so the punch's own check is
+# the only thing that can refuse: it is still what stands between a
+# nofilelock writer and a peer's blocks.
+ct_param_set lock_ignore_readers 1
 OUT="$(punch)"
+ct_param_set lock_ignore_readers 0
 RC="${OUT% *}"; ERR="${OUT#* }"
 log "punch while a peer has it open -> rc=$RC errno=$ERR"
 
