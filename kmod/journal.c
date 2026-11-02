@@ -1037,6 +1037,12 @@ int cetrafs_journal_replay_node(struct super_block *sb, u32 node_id, bool wait_f
     if (ret)
         return ret;
 
+    /* Replay writes the data region, and a self-fenced node writes
+     * nothing -- whichever path brought it here (cetrafs_node_fence_peer()
+     * refuses too; this is the same rule where the writes happen). */
+    if (cetrafs_sb_is_fenced(sb))
+        return -EIO;
+
     /* Claim the right to replay this area. -EEXIST means another node is
      * already on it (or beat us to it entirely) -- not an error: whoever
      * holds the claim finishes the job, exactly as the contended mutex

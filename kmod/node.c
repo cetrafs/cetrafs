@@ -401,6 +401,15 @@ static int cetrafs_node_fence_peer_full(struct super_block *sb, u32 node_id, con
 
 int cetrafs_node_fence_peer(struct super_block *sb, u32 node_id, const char *what)
 {
+    /*
+     * A node whose own lease was revoked takes nothing from anybody:
+     * its peers have declared it dead and are reclaiming from it. Every
+     * caller is about to reclaim, and several are reachable without a
+     * write (a read-only open past a stale lock), which is where the
+     * per-path fence checks did not look.
+     */
+    if (cetrafs_sb_is_fenced(sb))
+        return -EIO;
     /* The reclaim paths only: the no-CAW mount gate's own verdict goes
      * through _full() and is not what the knob is for. */
     if (unlikely(cetrafs_fence_peer_fail)) {
