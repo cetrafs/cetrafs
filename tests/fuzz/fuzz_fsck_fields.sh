@@ -17,7 +17,8 @@ cc -D_FILE_OFFSET_BITS=64 -I "$ROOT/include" -O1 -g -std=gnu99 \
     -fsanitize=address,undefined -fno-sanitize-recover=all \
     -o "$WORK/fsck.asan" "$ROOT/userspace/fsck.c"
 if [ ! -f "$WORK/golden.img" ] || [ "$ROOT/include/cetrafs.h" -nt "$WORK/golden.img" ] \
-   || [ "$ROOT/userspace/mkfs.c" -nt "$WORK/golden.img" ]; then
+   || [ "$ROOT/userspace/mkfs.c" -nt "$WORK/golden.img" ] \
+   || [ "$HERE/mkgolden.sh" -nt "$WORK/golden.img" ]; then
     "$HERE/mkgolden.sh" "$WORK/golden.img"
 fi
 python3 "$HERE/fuzz.py" fsck-fields "$WORK/golden.img" --iters "$ITERS" --seed "$SEED" \

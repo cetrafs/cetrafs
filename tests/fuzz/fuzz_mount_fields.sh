@@ -15,7 +15,8 @@ SEED="${2:-$RANDOM$RANDOM}"
 cc -D_FILE_OFFSET_BITS=64 -I "$ROOT/include" -I "$ROOT/userspace" -O2 -std=gnu99 \
     -o "$WORK/fuzz_restamp" "$HERE/fuzz_restamp.c"
 if [ ! -f "$WORK/golden.img" ] || [ "$ROOT/include/cetrafs.h" -nt "$WORK/golden.img" ] \
-   || [ "$ROOT/userspace/mkfs.c" -nt "$WORK/golden.img" ]; then
+   || [ "$ROOT/userspace/mkfs.c" -nt "$WORK/golden.img" ] \
+   || [ "$HERE/mkgolden.sh" -nt "$WORK/golden.img" ]; then
     "$HERE/mkgolden.sh" "$WORK/golden.img"
 fi
 modprobe libcrc32c 2>/dev/null || true

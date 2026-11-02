@@ -18,8 +18,11 @@ cc -D_FILE_OFFSET_BITS=64 -I "$ROOT/include" -O1 -g -std=gnu99 \
 # Rebuild the golden if it is missing OR older than the on-disk format or
 # mkfs -- a cached golden from a prior layout silently fuzzes stale offsets
 # (measured: a v2->v3 field shift left node_table_start reading garbage).
+# And older than mkgolden.sh itself: a golden built before the script
+# gained a file never contains it, and nothing says so.
 if [ ! -f "$WORK/golden.img" ] || [ "$ROOT/include/cetrafs.h" -nt "$WORK/golden.img" ] \
-   || [ "$ROOT/userspace/mkfs.c" -nt "$WORK/golden.img" ]; then
+   || [ "$ROOT/userspace/mkfs.c" -nt "$WORK/golden.img" ] \
+   || [ "$HERE/mkgolden.sh" -nt "$WORK/golden.img" ]; then
     "$HERE/mkgolden.sh" "$WORK/golden.img"
 fi
 python3 "$HERE/fuzz.py" fsck "$WORK/golden.img" --iters "$ITERS" --seed "$SEED" \
