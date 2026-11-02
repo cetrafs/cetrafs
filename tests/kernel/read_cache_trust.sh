@@ -171,6 +171,10 @@ ct_mount "$DEV" "$MNT"
 # After the mount, as read_presence.sh explains: a row nobody has watched
 # yet reads alive.
 "$NODE_POKE" "$DEV" 1 1 cc "$(date +%s)" >/dev/null
+# defrag.cetra opens the file for write, which the access rule already
+# refuses past a live reader (access_rule.sh). Turn that off for both
+# arms, so defrag's own check is the only thing that can refuse here.
+ct_param_set lock_ignore_readers 1
 
 OUT="$("$ROOT/userspace/defrag.cetra" "$MNT/frag" 2>&1 || true)"
 log "defrag.cetra: $OUT"
@@ -183,6 +187,7 @@ fi
 ct_param_set defrag_ignore_readers 1
 OUT="$("$ROOT/userspace/defrag.cetra" "$MNT/frag" 2>&1 || true)"
 ct_param_set defrag_ignore_readers 0
+ct_param_set lock_ignore_readers 0
 echo "$OUT" | grep -qE '[1-9][0-9]* blocks moved' &&
     pass "control: with the check off the same defrag moves blocks (case 4 discriminates)" ||
     fail "control: defrag_ignore_readers still moved nothing ($OUT) -- case 4 proves nothing"

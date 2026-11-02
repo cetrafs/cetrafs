@@ -134,6 +134,17 @@ only** — directories are never lockable this way, see Mechanism 3.
   `CETRAFS_LOCK_EXCLUSIVE` is held rejects with `-ETXTBSY`, unless the
   holder's Node Registry row has gone stale, in which case the open
   proceeds (and a write-open reclaims the lock).
+- A write-open from a node while a *different* live node has the file
+  open for read (`read_open_nodes`) also rejects with `-ETXTBSY`: one
+  writer and nobody else, or readers and no writer
+  (`docs/internal/BASICS.md`). Both halves are re-checked INSIDE the
+  CAS that claims the lock or publishes the reader, so two opens racing
+  on two nodes cannot both pass. A dead reader's bit is cleared first and
+  does not block.
+- A writer that suspended its lock for a handoff (`flock(LOCK_UN)`)
+  keeps writing with only a presence bit on the device; it marks that bit
+  in `suspended_writer_nodes`. The handoff's destination may claim past
+  it, and a reader may not open while it is there.
 - This node's own *local* open-for-write refcount (`lock_writer_count`, a
   private per-inode `atomic_t`) is what the lock actually releases against
   — the on-disk claim drops only when the *last* local write-opener
@@ -341,16 +352,16 @@ path but get explicitly invalidated exactly when ownership changes hands —
 a ZG's BGs when that ZG is freshly claimed/reclaimed, an inode's block right
 before `lock.c` decides whether to grant a cross-node claim.
 
-**Residual limitation.** The fix above covers every *ownership/claim*
-decision, but a read-only open of a file is still explicitly allowed even
-while another node holds the exclusive write lock (Mechanism 2), and that
-reader's cache of the file's *content* (not its lock state) is never forced
-fresh on every access — only the claim fields are. A node that read-opened a
-file earlier and is still holding stale cached pages won't see a
-concurrent write from the current lock holder without re-opening. This is
-the same "no close-to-open consistency" tradeoff most network filesystems
-make for concurrent readers, not a correctness hole in any of the three
-mechanisms above.
+**What a reader sees.** Under the access rule a reader never shares the
+file with a writer on another node: a read-open is refused while a live
+peer holds the lock or is handing it over, and a write-open is refused
+while a live peer reads. A reader therefore trusts its cached map
+(`cetrafs_lock_read_cache_trusted()`), re-checking `file_seq` once a
+second for the cases the rule does not cover -- `nofilelock`, where two
+nodes may write, and a writer that published and closed before this
+node opened. Even there nothing a reader maps through can be freed:
+truncate, punch, unlink, rename-replace, evict and defrag all refuse
+while a live peer is in `read_open_nodes`.
 
 **Within a node, nothing beyond ordinary VFS/page-cache behavior
 serializes concurrent *local* writers to the same file.** The whole-file

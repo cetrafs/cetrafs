@@ -1253,7 +1253,18 @@ typedef struct {
     __le64 generation;
 
     __le64 ns_checksum;           /* CRC32C over [0, 512) with this field zeroed */
-    u8 ns_pad[CETRAFS_INODE_NS_BYTES - 96];
+
+    /* Which of the read_open_nodes bits are a WRITER that suspended its
+     * automatic lock for a handoff (flock(LOCK_UN) on a default mount)
+     * rather than a reader. The access rule (docs/internal/BASICS.md)
+     * keeps a writer out while a peer reads, and the two look identical
+     * in read_open_nodes; this is what lets the handoff's destination
+     * claim the lock while a real reader still keeps it out. Always a
+     * subset of read_open_nodes. Carved from ns_pad, which is zero on
+     * every record ever written and inside ns_checksum's range already,
+     * so an older volume reads "none" and nothing moves. */
+    __le64 suspended_writer_nodes;
+    u8 ns_pad[CETRAFS_INODE_NS_BYTES - 104];
 
     /* ===== SECTOR 1: the FILE DOMAIN ===== */
     __le64 fd_ino;                /* identity echo of .ino */

@@ -67,9 +67,28 @@ int main(int argc, char **argv)
         if (strcmp(argv[ai], "--rec") == 0)
             has_rec = true;
 
+    /* --sw <ino>: print suspended_writer_nodes alone (access_rule.sh). */
+    if (argc == 4 && strcmp(argv[2], "--sw") == 0) {
+        int sfd = open(argv[1], O_RDONLY);
+        cetrafs_superblock_t ssb;
+        cetrafs_inode_t sin;
+
+        if (sfd < 0) {
+            perror("open");
+            return 1;
+        }
+        pread_all(sfd, &ssb, sizeof(ssb), 0);
+        pread_all(sfd, &sin, sizeof(sin),
+                  (off_t) (cetrafs_le64(ssb.inode_table_start) + strtoull(argv[3], NULL, 0) - 1) * CETRAFS_BLOCK_SIZE);
+        printf("suspended=0x%" PRIx64 " readers=0x%" PRIx64 "\n", (uint64_t) cetrafs_le64(sin.suspended_writer_nodes),
+               (uint64_t) cetrafs_le64(sin.read_open_nodes));
+        close(sfd);
+        return 0;
+    }
+
     if (argc != 3 && argc != 5 && !(argc == 4 && has_rec)) {
         fprintf(stderr,
-                "usage: %s <image> <ino> [<owner_node_id> <lock_mode> | --ns <id> | --reader <node_id>]\n",
+                "usage: %s <image> <ino> [<owner_node_id> <lock_mode> | --ns <id> | --reader <node_id> | --suspended <node_id>]\n",
                 argv[0]);
         return 2;
     }
@@ -132,9 +151,17 @@ int main(int argc, char **argv)
 
     bool ns_mode = (strcmp(argv[3], "--ns") == 0);
     bool reader_mode = (strcmp(argv[3], "--reader") == 0);
+    bool suspended_mode = (strcmp(argv[3], "--suspended") == 0);
     uint32_t owner = 0, lock_mode = 0;
 
-    if (reader_mode) {
+    if (suspended_mode) {
+        /* Simulate a PEER that suspended its write lock for a handoff
+         * and is still writing: presence bit plus writer mark. */
+        uint64_t bit = 1ULL << (strtoul(argv[4], NULL, 0) % 64);
+
+        in.read_open_nodes = cetrafs_cpu_to_le64(cetrafs_le64(in.read_open_nodes) | bit);
+        in.suspended_writer_nodes = cetrafs_cpu_to_le64(cetrafs_le64(in.suspended_writer_nodes) | bit);
+    } else if (reader_mode) {
         /* Simulate a PEER holding this file open for read: set its bit
          * in the presence mask. */
         in.read_open_nodes = cetrafs_cpu_to_le64(cetrafs_le64(in.read_open_nodes) | (1ULL << (strtoul(argv[4], NULL, 0) % 64)));
@@ -151,9 +178,9 @@ int main(int argc, char **argv)
     pwrite_all(fd, &in, sizeof(in), ino_off);
     close(fd);
 
-    if (reader_mode)
-        printf("inode_lock_poke: ino=%" PRIu64 " read_open_nodes -> 0x%" PRIx64 "\n", ino,
-               (uint64_t) cetrafs_le64(in.read_open_nodes));
+    if (reader_mode || suspended_mode)
+        printf("inode_lock_poke: ino=%" PRIu64 " read_open_nodes -> 0x%" PRIx64 " suspended_writer_nodes -> 0x%" PRIx64 "\n",
+               ino, (uint64_t) cetrafs_le64(in.read_open_nodes), (uint64_t) cetrafs_le64(in.suspended_writer_nodes));
     else if (ns_mode)
         printf("inode_lock_poke: ino=%" PRIu64 " ns_lock_owner -> %u\n", ino, in.ns_lock_owner);
     else

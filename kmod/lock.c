@@ -1201,7 +1201,9 @@ void cetrafs_free_vfs_inode(struct inode *inode)
 enum cetrafs_reader_op {
     CETRAFS_READER_NONE = 0,
     CETRAFS_READER_SET,
-    CETRAFS_READER_CLEAR,
+    CETRAFS_READER_CLEAR, /* clears this node's suspended-writer bit too */
+    CETRAFS_SUSPEND_SET,  /* mark this node's presence as a suspended writer */
+    CETRAFS_SUSPEND_CLEAR,
 };
 
 struct cetrafs_lock_cas_ctx {
@@ -1220,6 +1222,19 @@ struct cetrafs_lock_cas_ctx {
      * read_open_nodes and leaves the write lock alone -- the two are
      * orthogonal and a reader must never disturb a writer's claim. */
     enum cetrafs_reader_op reader_op;
+
+    /* The access rule (docs/internal/BASICS.md): one writer and nobody
+     * else, or readers and no writer. Checked INSIDE the swap, so two
+     * opens cannot both pass by each checking before the other landed:
+     *  - refuse_readers: a write claim fails while another node is in
+     *    read_open_nodes as a READER (suspended writers -- a handoff in
+     *    progress -- do not count; stale bits were cleared beforehand);
+     *  - refuse_foreign_lock: a reader publish fails while another node
+     *    holds the exclusive lock or is a suspended writer -- except
+     *    lock_owner_ok, a holder the caller judged stale and reads past. */
+    bool refuse_readers;
+    bool refuse_foreign_lock;
+    u32 lock_owner_ok;
 
     /* Release path only: also stamp this inode's in-core stat fields
      * into the same swap. The close path used to persist them with one
@@ -1247,8 +1262,46 @@ static int cetrafs_lock_cas_mutate(void *image, unsigned int len, void *priv)
 
     if (ctx->reader_op != CETRAFS_READER_NONE) {
         u64 bit = 1ULL << (ctx->my_node_id % CETRAFS_MAX_READER_NODES);
-        u64 want = (ctx->reader_op == CETRAFS_READER_SET) ? (cetrafs_le64(rec.read_open_nodes) | bit)
-                                                          : (cetrafs_le64(rec.read_open_nodes) & ~bit);
+        u64 want;
+
+        if (ctx->reader_op == CETRAFS_SUSPEND_SET || ctx->reader_op == CETRAFS_SUSPEND_CLEAR) {
+            u64 sw = cetrafs_le64(rec.suspended_writer_nodes);
+            u64 nsw = (ctx->reader_op == CETRAFS_SUSPEND_SET) ? (sw | bit) : (sw & ~bit);
+
+            /* Only ever a subset of read_open_nodes: presence is
+             * published first, and is what every destructive path reads. */
+            if (ctx->reader_op == CETRAFS_SUSPEND_SET && !(cetrafs_le64(rec.read_open_nodes) & bit))
+                return -EINVAL;
+            if (nsw == sw)
+                return 1;
+            rec.suspended_writer_nodes = cetrafs_cpu_to_le64(nsw);
+            cetrafs_inode_stamp_crc_ns(&rec);
+            memcpy(image, &rec, CETRAFS_INODE_NS_BYTES);
+            return 0;
+        }
+
+        if (ctx->reader_op == CETRAFS_READER_SET && ctx->refuse_foreign_lock) {
+            u32 owner = cetrafs_le32(rec.lock_owner_node);
+
+            if (cetrafs_le32(rec.lock_mode) == CETRAFS_LOCK_EXCLUSIVE && owner != ctx->my_node_id &&
+                owner != ctx->lock_owner_ok)
+                return -ETXTBSY; /* a writer claimed it since our check */
+            if (cetrafs_le64(rec.suspended_writer_nodes) & ~bit)
+                return -ETXTBSY; /* a writer handing it over still writes */
+        }
+
+        want = (ctx->reader_op == CETRAFS_READER_SET) ? (cetrafs_le64(rec.read_open_nodes) | bit)
+                                                      : (cetrafs_le64(rec.read_open_nodes) & ~bit);
+        if (ctx->reader_op == CETRAFS_READER_CLEAR && (cetrafs_le64(rec.suspended_writer_nodes) & bit)) {
+            /* Gone entirely: a suspended writer's mark goes with its
+             * presence (last close while suspended, or a dead node's
+             * bits being cleared). */
+            rec.suspended_writer_nodes = cetrafs_cpu_to_le64(cetrafs_le64(rec.suspended_writer_nodes) & ~bit);
+            rec.read_open_nodes = cetrafs_cpu_to_le64(want);
+            cetrafs_inode_stamp_crc_ns(&rec);
+            memcpy(image, &rec, CETRAFS_INODE_NS_BYTES);
+            return 0;
+        }
 
         if (want == cetrafs_le64(rec.read_open_nodes))
             return 1; /* already in the desired state -- nothing to do */
@@ -1279,6 +1332,9 @@ static int cetrafs_lock_cas_mutate(void *image, unsigned int len, void *priv)
 
         if (!free_now && !stealable)
             return -ETXTBSY; /* held by someone else, or taken since we looked */
+        if (ctx->refuse_readers && (cetrafs_le64(rec.read_open_nodes) & ~cetrafs_le64(rec.suspended_writer_nodes) &
+                                    ~(1ULL << (ctx->my_node_id % CETRAFS_MAX_READER_NODES))))
+            return -ETXTBSY; /* another node is reading it */
 
         rec.lock_owner_node = cetrafs_cpu_to_le32(ctx->my_node_id);
         rec.lock_mode = cetrafs_cpu_to_le32(CETRAFS_LOCK_EXCLUSIVE);
@@ -1317,6 +1373,7 @@ static int cetrafs_lock_clear_on_disk(struct inode *inode, bool stamp_stat);
 /* Withdraw this node from read_open_nodes -- defined with the suspension
  * code below, used by the close path above it. */
 static void cetrafs_lock_presence_put(struct inode *inode);
+static int cetrafs_lock_suspend_mark(struct inode *inode, bool set);
 
 
 /*
@@ -1355,6 +1412,19 @@ MODULE_PARM_DESC(lock_fail_reader_publish, "test-only: force the reader-set publ
 static unsigned int cetrafs_release_step_gap_ms;
 module_param_named(release_step_gap_ms, cetrafs_release_step_gap_ms, uint, 0644);
 MODULE_PARM_DESC(release_step_gap_ms, "test-only: delay between the close's lock clear and state publish");
+
+/* Defined below, next to the public wrapper it came from. 'ignore':
+ * bits not to count (the caller's own exemption, e.g. suspended writers). */
+static int cetrafs_foreign_reader_from_raw(struct super_block *sb,
+                                           u64 ino,
+                                           const cetrafs_inode_t *rawp,
+                                           u32 my_node_id,
+                                           u64 ignore,
+                                           bool *out_exists);
+
+static bool cetrafs_lock_ignore_readers;
+module_param_named(lock_ignore_readers, cetrafs_lock_ignore_readers, bool, 0644);
+MODULE_PARM_DESC(lock_ignore_readers, "TEST ONLY: drop the readers-exclude-a-writer half of the access rule");
 
 int cetrafs_lock_open(struct inode *inode, struct file *file)
 {
@@ -1489,6 +1559,41 @@ int cetrafs_lock_open(struct inode *inode, struct file *file)
      * write-open: the window belongs to whoever asked for it, and an
      * unrelated opener closing it would strand the peer mid-handoff. The
      * window is taken back explicitly, by flock(LOCK_EX). */
+    /* One writer and NOBODY else (docs/internal/BASICS.md): a peer
+     * reading the file keeps a writer out, as a writer keeps a reader
+     * out above. The read also clears the bits of readers that have
+     * died, so the claim sees only live ones; one that opens between
+     * here and the swap is caught inside it (refuse_readers). A
+     * suspended writer -- the source of a handoff -- is not a reader. */
+    if (lock_on && want_write && !ci->lock_suspended && !cetrafs_lock_ignore_readers &&
+        (raw.lock_mode == CETRAFS_LOCK_NONE || reclaim_from_stale)) {
+        bool reader = false;
+
+        ret = cetrafs_foreign_reader_from_raw(sb, inode->i_ino, &raw, my_node_id,
+                                              cetrafs_le64(raw.suspended_writer_nodes), &reader);
+        if (ret)
+            goto out_pr_unlock;
+        if (reader) {
+            ret = -ETXTBSY;
+            goto out_pr_unlock;
+        }
+    }
+    /* And a READ-open while a writer is handing the file over: that
+     * writer is still writing, so it is the "writer" of the rule. Only
+     * the suspended bits are asked about here; a dead one's are cleared. */
+    if (!want_write && !cetrafs_lock_ignore_readers &&
+        (cetrafs_le64(raw.suspended_writer_nodes) & ~(1ULL << (my_node_id % CETRAFS_MAX_READER_NODES)))) {
+        bool writer = false;
+
+        ret = cetrafs_foreign_reader_from_raw(sb, inode->i_ino, &raw, my_node_id,
+                                              ~cetrafs_le64(raw.suspended_writer_nodes), &writer);
+        if (ret)
+            goto out_pr_unlock;
+        if (writer) {
+            ret = -ETXTBSY;
+            goto out_pr_unlock;
+        }
+    }
     if (lock_on && want_write && !ci->lock_suspended && (raw.lock_mode == CETRAFS_LOCK_NONE || reclaim_from_stale)) {
         /* One atomic compare-and-swap carries the whole claim: no
          * write-then-verify-readback, because the swap can only
@@ -1501,6 +1606,7 @@ int cetrafs_lock_open(struct inode *inode, struct file *file)
             .claim = true,
             .allow_steal = reclaim_from_stale,
             .steal_from = stale_owner,
+            .refuse_readers = !cetrafs_lock_ignore_readers,
         };
 
         ret = cetrafs_lock_cas(inode, &ctx, &raw);
@@ -1613,6 +1719,13 @@ int cetrafs_lock_open(struct inode *inode, struct file *file)
             .my_node_id = my_node_id,
             .generation = cetrafs_le64(raw.generation),
             .reader_op = CETRAFS_READER_SET,
+            /* The checks above ran before this swap; a peer may have
+             * claimed the file since. Re-asked inside it. Only for a
+             * READ-open: a nofilelock writer publishes here too, and the
+             * rule does not hold there. A stale holder this open already
+             * decided to read past is still allowed. */
+            .refuse_foreign_lock = !want_write && !cetrafs_lock_ignore_readers,
+            .lock_owner_ok = stale_owner,
         };
         int rret = cetrafs_lock_fail_reader_publish ? -EIO : cetrafs_lock_cas(inode, &rctx, &raw);
 
@@ -1638,8 +1751,9 @@ int cetrafs_lock_open(struct inode *inode, struct file *file)
              * ->release is NOT called for a failed open, so unwind every
              * count this open bumped.
              */
-            pr_warn_ratelimited("ino=%llu could not publish this node as an opener: %d -- refusing the open\n",
-                                (unsigned long long) inode->i_ino, rret);
+            if (rret != -ETXTBSY) /* a writer got in first: an ordinary refusal */
+                pr_warn_ratelimited("ino=%llu could not publish this node as an opener: %d -- refusing the open\n",
+                                    (unsigned long long) inode->i_ino, rret);
             atomic_dec(&ci->read_opener_count);
             if (want_write)
                 atomic_dec(&ci->lock_writer_count);
@@ -1982,6 +2096,9 @@ int cetrafs_lock_release(struct inode *inode, struct file *file)
         retry = cetrafs_lock_publish_and_clear(inode, &raw, lock_on && !was_suspended, &lock_cleared);
         t_leaf = ktime_get();
         if (was_suspended) {
+            /* Not writing any more: drop the writer mark even if a local
+             * reader keeps the presence bit. */
+            (void) cetrafs_lock_suspend_mark(inode, false);
             cetrafs_lock_presence_put(inode);
             ci->lock_suspended = false;
         }
@@ -2257,12 +2374,6 @@ void cetrafs_inode_mark_tree_cold(struct inode *inode)
     }
 }
 
-/* Defined below, next to the public wrapper it came from. */
-static int cetrafs_foreign_reader_from_raw(struct super_block *sb,
-                                           u64 ino,
-                                           const cetrafs_inode_t *rawp,
-                                           u32 my_node_id,
-                                           bool *out_exists);
 
 /*
  * The change-stamp half of the gate: compare a forced-fresh record's
@@ -2337,7 +2448,7 @@ static bool cetrafs_inode_has_foreign_opener(struct inode *inode)
 
     cetrafs_inode_note_stamp(inode, &raw, my_node_id);
 
-    if (cetrafs_foreign_reader_from_raw(sb, inode->i_ino, &raw, my_node_id, &exists) != 0)
+    if (cetrafs_foreign_reader_from_raw(sb, inode->i_ino, &raw, my_node_id, 0, &exists) != 0)
         return true;
     return exists;
 }
@@ -2655,6 +2766,36 @@ static int cetrafs_lock_presence_get(struct inode *inode)
     return ret;
 }
 
+/*
+ * Mark (or unmark) this node's presence bit as a suspended WRITER in
+ * suspended_writer_nodes. The access rule tells a handoff's source from
+ * a reader by it: the destination may claim past the first, never past
+ * the second. Caller holds lock_mutex; the presence bit is already set.
+ */
+static int cetrafs_lock_suspend_mark(struct inode *inode, bool set)
+{
+    struct super_block *sb = inode->i_sb;
+    cetrafs_inode_t raw;
+    u32 my_node_id;
+    int ret;
+
+    ret = cetrafs_sb_get_node_id(sb, &my_node_id);
+    if (!ret)
+        ret = cetrafs_read_raw_inode(sb, inode->i_ino, &raw);
+    if (!ret) {
+        struct cetrafs_lock_cas_ctx rctx = {
+            .my_node_id = my_node_id,
+            .generation = cetrafs_le64(raw.generation),
+            .reader_op = set ? CETRAFS_SUSPEND_SET : CETRAFS_SUSPEND_CLEAR,
+        };
+
+        ret = cetrafs_lock_cas(inode, &rctx, &raw);
+        if (ret > 0)
+            ret = 0; /* already so */
+    }
+    return ret;
+}
+
 static void cetrafs_lock_presence_put(struct inode *inode)
 {
     struct cetrafs_inode_info *ci = CETRAFS_I(inode);
@@ -2757,6 +2898,13 @@ static int cetrafs_lock_suspend(struct inode *inode, struct file *file)
         ret = cetrafs_lock_presence_get(inode);
         if (ret)
             goto out;
+        /* ...as a WRITER: without the mark this presence reads as a
+         * reader, and the destination's write-open would be refused. */
+        ret = cetrafs_lock_suspend_mark(inode, true);
+        if (ret) {
+            cetrafs_lock_presence_put(inode);
+            goto out;
+        }
     }
 
     ret = cetrafs_lock_clear_on_disk(inode, /*stamp_stat=*/false);
@@ -2764,8 +2912,10 @@ static int cetrafs_lock_suspend(struct inode *inode, struct file *file)
         /* Still locked, so nothing was handed over: undo the publish and
          * report, rather than leaving the record saying EXCLUSIVE while
          * we believe we surrendered it. */
-        if (!cetrafs_lock_suspend_skip_publish)
+        if (!cetrafs_lock_suspend_skip_publish) {
+            (void) cetrafs_lock_suspend_mark(inode, false);
             cetrafs_lock_presence_put(inode);
+        }
         goto out;
     }
 
@@ -2846,6 +2996,9 @@ static int cetrafs_lock_resume(struct inode *inode)
             .my_node_id = my_node_id,
             .generation = cetrafs_le64(raw.generation),
             .claim = true,
+            /* Taking the file back for writing is a write claim like
+             * any other: not past a reader. */
+            .refuse_readers = !cetrafs_lock_ignore_readers,
         };
 
         ret = cetrafs_lock_cas(inode, &ctx, &raw);
@@ -2855,9 +3008,13 @@ static int cetrafs_lock_resume(struct inode *inode)
     }
 
     /* Lock first, presence second -- the mirror of suspend, and for the
-     * same reason: never a moment with neither signal on the device. */
-    if (!cetrafs_lock_suspend_skip_publish)
+     * same reason: never a moment with neither signal on the device. The
+     * writer mark goes explicitly: presence_put clears it only with the
+     * bit, and a local reader may be keeping the bit. */
+    if (!cetrafs_lock_suspend_skip_publish) {
+        (void) cetrafs_lock_suspend_mark(inode, false);
         cetrafs_lock_presence_put(inode);
+    }
     ci->lock_suspended = false;
 
     /*
@@ -3340,6 +3497,7 @@ static int cetrafs_foreign_reader_from_raw(struct super_block *sb,
                                            u64 ino,
                                            const cetrafs_inode_t *rawp,
                                            u32 my_node_id,
+                                           u64 ignore,
                                            bool *out_exists)
 {
     const cetrafs_inode_t raw = *rawp;
@@ -3349,7 +3507,7 @@ static int cetrafs_foreign_reader_from_raw(struct super_block *sb,
     *out_exists = false;
     (void) ret;
 
-    others = cetrafs_le64(raw.read_open_nodes) & ~(1ULL << (my_node_id % CETRAFS_MAX_READER_NODES));
+    others = cetrafs_le64(raw.read_open_nodes) & ~ignore & ~(1ULL << (my_node_id % CETRAFS_MAX_READER_NODES));
     while (others) {
         u32 n = (u32) __ffs64(others);
         bool stale = false;
@@ -3386,7 +3544,7 @@ int cetrafs_lock_foreign_reader_exists(struct super_block *sb, u64 ino, u32 my_n
     ret = cetrafs_read_raw_inode(sb, ino, &raw);
     if (ret)
         return ret;
-    return cetrafs_foreign_reader_from_raw(sb, ino, &raw, my_node_id, out_exists);
+    return cetrafs_foreign_reader_from_raw(sb, ino, &raw, my_node_id, 0, out_exists);
 }
 
 /*
@@ -3436,7 +3594,7 @@ int cetrafs_lock_foreign_user_exists(struct super_block *sb,
             return ret;
     }
 
-    return cetrafs_foreign_reader_from_raw(sb, ino, &raw, my_node_id, out_reader);
+    return cetrafs_foreign_reader_from_raw(sb, ino, &raw, my_node_id, 0, out_reader);
 }
 
 /* The decision half of cetrafs_lock_foreign_claim_exists(), working
