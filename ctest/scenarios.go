@@ -6246,7 +6246,7 @@ func RunHypervisorStorm(clients []*Client, baseDir string, dur time.Duration, se
 					// so the whole recovery tail was scored as
 					// filesystem faults. That is measuring the
 					// injection, not the filesystem.
-					if waited := stormWaitHealthy(victim, 30*time.Second); waited >= 0 {
+					if waited := stormWaitHealthy(victim, root, 30*time.Second); waited >= 0 {
 						injectedDown.Store("")
 						fmt.Printf("    [storm] %s serving I/O again after %s\n",
 							victim.Name, waited.Round(time.Second))
@@ -6439,10 +6439,19 @@ func RunHypervisorStorm(clients []*Client, baseDir string, dur time.Duration, se
 // than when its device was notionally restored. Returns how long that
 // took, or -1 if it never answered inside the budget -- which is left to
 // the caller to report, never silently excused.
-func stormWaitHealthy(c *Client, budget time.Duration) time.Duration {
+func stormWaitHealthy(c *Client, dir string, budget time.Duration) time.Duration {
+	// The probe has to go where the storm's operations go. It used to be
+	// statfs, which this filesystem answers from in-memory counters: it
+	// succeeded "after 0s" on every pull while the node's creates and
+	// fsyncs were still failing, so the recovery tail -- which the caller's
+	// own comment says is the injection, not the filesystem -- was scored
+	// as filesystem faults. A create, write, fsync and close is a real
+	// round trip through the allocator, the journal and the device.
 	start := time.Now()
+	probe := fmt.Sprintf("%s/health-probe-%s", dir, c.Name)
 	for time.Since(start) < budget {
-		if r, e := c.Call("statfs", struct{}{}); e == nil && r.OK {
+		if r, e := c.Call("write", WriteArgs{Path: probe, Size: 4096, Stamp: "health-" + c.Name}); e == nil && r.OK {
+			_, _ = c.Call("unlink", UnlinkArgs{Path: probe})
 			return time.Since(start)
 		}
 		time.Sleep(time.Second)
@@ -6761,8 +6770,16 @@ func stormCheckWitnesses(clients []*Client, dir string, ws []stormWitness, when 
 			}
 			var rr ReadAtResult
 			r, e := c.Call("read_at", ReadAtArgs{Path: w.path, Offset: 0, Size: w.size})
-			if decodeResult(c.Name, r, e, &rr) != nil {
-				note("[%s] %s cannot read witness %s", when, c.Name, w.path)
+			if derr := decodeResult(c.Name, r, e, &rr); derr != nil {
+				// The stat above can be answered from the node's cache
+				// while its device is pulled; the read cannot. Same rule
+				// as the readdir below: a node with no device is the
+				// injection, not a finding -- but one that is UP and
+				// cannot read a file nobody touches is.
+				if injected(c.Name) {
+					continue
+				}
+				note("[%s] %s cannot read witness %s: %v", when, c.Name, w.path, derr)
 				continue
 			}
 			ans[c.Name] = answer{size: st.Size, sum: rr.Checksum, ok: true}
