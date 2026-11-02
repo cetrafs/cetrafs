@@ -98,7 +98,15 @@ LOOP="$(losetup --find --show "$OUT")"
 "$ROOT/userspace/fsck.cetra" "$LOOP" >/dev/null || { echo "golden image is not fsck-clean" >&2; exit 1; }
 # And it must really have a chain, or the targets below silently cover
 # nothing -- the exact shape of blindness this grow exists to remove.
-"$ROOT/tests/.build/sb_poke" "$OUT" 2>/dev/null | grep -q "bg_table_next=[1-9]" || {
+# Built here: tests/.build/sb_poke exists only once some kernel suite
+# has built it, so on a fresh tree this check failed with the cause
+# hidden by 2>/dev/null.
+SB_POKE="$(mktemp /tmp/cetrafs-sbpoke-XXXXXX)"
+cc -D_FILE_OFFSET_BITS=64 -I "$ROOT/include" -I "$ROOT/userspace" -O2 -std=gnu99 \
+    -o "$SB_POKE" "$ROOT/tests/helpers/sb_poke.c" || { echo "cannot build sb_poke" >&2; exit 1; }
+"$SB_POKE" "$OUT" 2>/dev/null | grep -q "bg_table_next=[1-9]" || {
+    rm -f "$SB_POKE"
     echo "the grown golden has no BG table chain (bg_table_next is 0)" >&2; exit 1; }
+rm -f "$SB_POKE"
 losetup -d "$LOOP"; LOOP=""
 echo "golden: $OUT (grown, with a BG table chain)"
