@@ -1245,6 +1245,44 @@ struct cetrafs_lock_cas_ctx {
      * behaviour for every other caller. */
 };
 
+/*
+ * Inside an opener's swap (presence publish or write claim): has the
+ * file lost its last name, and does this node hold nothing on it yet?
+ *
+ * Eviction frees a file once its record reads nlink 0 and no live peer
+ * shows in read_open_nodes or the lock. It asks that with a forced-fresh
+ * read, but the free itself is a later CAS that checks only nlink,
+ * generation and the namespace lock -- so an open whose presence (or
+ * claim) landed between the two went unseen, and the evicting node freed
+ * blocks the opener then read and wrote through its fd. The opener's own
+ * check of nlink ran on its read, before its swap, which is the same gap
+ * from the other side.
+ *
+ * Refusing here closes it without moving the evict's check: both swaps
+ * act on this one sector, and the evict reads nlink 0 BEFORE it asks
+ * about openers. An opener that lands before that read is seen by it; one
+ * that lands after it finds nlink 0 here and is refused. Nothing can land
+ * in between.
+ *
+ * "Holds nothing yet": a node that already has the file open -- its bit
+ * in read_open_nodes, or the lock -- is already visible to every evict,
+ * so its further opens (a reopen of an unlinked file through
+ * /proc/self/fd, a lock resumed after a suspend) are not this race.
+ * tests/kernel/open_vs_evict.sh.
+ */
+static bool cetrafs_lock_rec_dead_to_us(const cetrafs_inode_t *rec, u32 my_node_id)
+{
+    u64 bit = 1ULL << (my_node_id % CETRAFS_MAX_READER_NODES);
+
+    if (cetrafs_le32(rec->nlink) != 0)
+        return false;
+    if (cetrafs_le64(rec->read_open_nodes) & bit)
+        return false;
+    if (cetrafs_le32(rec->lock_mode) == CETRAFS_LOCK_EXCLUSIVE && cetrafs_le32(rec->lock_owner_node) == my_node_id)
+        return false;
+    return true;
+}
+
 static int cetrafs_lock_cas_mutate(void *image, unsigned int len, void *priv)
 {
     struct cetrafs_lock_cas_ctx *ctx = priv;
@@ -1279,6 +1317,9 @@ static int cetrafs_lock_cas_mutate(void *image, unsigned int len, void *priv)
             memcpy(image, &rec, CETRAFS_INODE_NS_BYTES);
             return 0;
         }
+
+        if (ctx->reader_op == CETRAFS_READER_SET && cetrafs_lock_rec_dead_to_us(&rec, ctx->my_node_id))
+            return -ENOENT; /* deleted since our read: see the helper */
 
         if (ctx->reader_op == CETRAFS_READER_SET && ctx->refuse_foreign_lock) {
             u32 owner = cetrafs_le32(rec.lock_owner_node);
@@ -1332,6 +1373,8 @@ static int cetrafs_lock_cas_mutate(void *image, unsigned int len, void *priv)
 
         if (!free_now && !stealable)
             return -ETXTBSY; /* held by someone else, or taken since we looked */
+        if (cetrafs_lock_rec_dead_to_us(&rec, ctx->my_node_id))
+            return -ENOENT; /* deleted since our read: see the helper */
         if (ctx->refuse_readers && (cetrafs_le64(rec.read_open_nodes) & ~cetrafs_le64(rec.suspended_writer_nodes) &
                                     ~(1ULL << (ctx->my_node_id % CETRAFS_MAX_READER_NODES))))
             return -ETXTBSY; /* another node is reading it */
@@ -1422,6 +1465,13 @@ static int cetrafs_foreign_reader_from_raw(struct super_block *sb,
                                            u64 ignore,
                                            bool *out_exists);
 
+/* TEST ONLY, one-shot: pause the next open between its fresh read of the
+ * record and the swaps that publish it -- where a peer's unlink can land
+ * (tests/kernel/open_vs_evict.sh). Cleared by the pause it causes. */
+static unsigned int cetrafs_lock_open_pause_ms;
+module_param_named(lock_open_pause_ms, cetrafs_lock_open_pause_ms, uint, 0644);
+MODULE_PARM_DESC(lock_open_pause_ms, "TEST ONLY: one-shot pause between an open's record read and its swaps");
+
 static bool cetrafs_lock_ignore_readers;
 module_param_named(lock_ignore_readers, cetrafs_lock_ignore_readers, bool, 0644);
 MODULE_PARM_DESC(lock_ignore_readers, "TEST ONLY: drop the readers-exclude-a-writer half of the access rule");
@@ -1479,6 +1529,13 @@ int cetrafs_lock_open(struct inode *inode, struct file *file)
     if (cetrafs_le64(raw.generation) != cetrafs_inode_get_generation(inode)) {
         ret = -ESTALE;
         goto out_pr_unlock;
+    }
+
+    {
+        unsigned int pause = xchg(&cetrafs_lock_open_pause_ms, 0);
+
+        if (pause)
+            msleep(pause); /* test-only: see the parameter */
     }
 
     /* Enforcement honors a lock that is actually PRESENT on disk, in BOTH
@@ -1751,7 +1808,7 @@ int cetrafs_lock_open(struct inode *inode, struct file *file)
              * ->release is NOT called for a failed open, so unwind every
              * count this open bumped.
              */
-            if (rret != -ETXTBSY) /* a writer got in first: an ordinary refusal */
+            if (rret != -ETXTBSY && rret != -ENOENT) /* a writer got in first, or the file was deleted: ordinary refusals */
                 pr_warn_ratelimited("ino=%llu could not publish this node as an opener: %d -- refusing the open\n",
                                     (unsigned long long) inode->i_ino, rret);
             atomic_dec(&ci->read_opener_count);
