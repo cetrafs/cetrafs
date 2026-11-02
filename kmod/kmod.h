@@ -172,6 +172,7 @@ int cetrafs_node_file_lock_mode_conflict(struct super_block *sb, const u8 *my_uu
  * registered? Closes the simultaneous-mount race the pre-registration gate
  * cannot (two racers can each pass it before the other's row exists). */
 int cetrafs_node_single_mounter_conflict(struct super_block *sb, const u8 *my_uuid, bool *out_conflict);
+int cetrafs_node_nocaw_peer_exists(struct super_block *sb, const u8 *my_uuid, bool *out_exists);
 extern unsigned int cetrafs_stale_secs;
 extern unsigned int cetrafs_hb_interval_secs;
 u64 cetrafs_sb_get_fence_epoch(struct super_block *sb);
@@ -208,6 +209,7 @@ void cetrafs_sb_set_hb_interval_secs(struct super_block *sb, unsigned int v);
 void cetrafs_sb_set_stale_secs(struct super_block *sb, unsigned int v);
 const struct cetrafs_caw_info *cetrafs_sb_caw(struct super_block *sb);
 bool cetrafs_sb_caw_available(struct super_block *sb);
+bool cetrafs_sb_mount_has_caw(struct super_block *sb);
 void cetrafs_sb_cas_lock(struct super_block *sb);
 void cetrafs_sb_cas_unlock(struct super_block *sb);
 void cetrafs_sb_alloc_lock(struct super_block *sb);

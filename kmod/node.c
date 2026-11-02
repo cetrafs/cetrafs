@@ -157,6 +157,18 @@ static void cetrafs_node_image_commit(void *image, unsigned int len, cetrafs_nod
 }
 
 /* Context + mutator for the CAS-based free-row claim below. */
+/*
+ * What this mount advertises in its row's caps: LIVE_GROW for any node on
+ * this code, and NO_CAW when it runs the no-CAW single-mounter fallback --
+ * which is what lets a CAW node joining later refuse instead of forming a
+ * cluster whose two halves exclude nothing from each other
+ * (cetrafs_node_nocaw_peer_exists()).
+ */
+static u32 cetrafs_node_my_caps(struct super_block *sb)
+{
+    return CETRAFS_NODE_CAP_LIVE_GROW | (cetrafs_sb_mount_has_caw(sb) ? 0 : CETRAFS_NODE_CAP_NO_CAW);
+}
+
 struct cetrafs_node_claim_ctx {
     const u8 *uuid;
     /* The mutator runs inside the compare-and-swap and has no super_block
@@ -165,6 +177,7 @@ struct cetrafs_node_claim_ctx {
     /* The cluster file-lock mode to advertise in our row (already resolved
      * by fill_super: adopted from the lead, or our own if we ARE the lead). */
     u32 file_lock_mode;
+    u32 caps; /* CETRAFS_NODE_CAP_* this mount advertises */
 };
 
 static int cetrafs_node_claim_mutate(void *image, unsigned int len, void *priv)
@@ -194,7 +207,7 @@ static int cetrafs_node_claim_mutate(void *image, unsigned int len, void *priv)
     /* Advertise what this build understands. A constant for the running
      * module -- any node on this code is live-grow-safe; a node without
      * it leaves 0 here and a grow excludes it. */
-    ne.caps = cetrafs_cpu_to_le32(CETRAFS_NODE_CAP_LIVE_GROW);
+    ne.caps = cetrafs_cpu_to_le32(ctx->caps);
     strscpy(ne.label, init_utsname()->nodename, sizeof(ne.label));
 
     cetrafs_node_image_commit(image, len, &ne);
@@ -223,6 +236,7 @@ struct cetrafs_node_reattach_ctx {
     const u8 *uuid;
     unsigned int hb_interval;
     u32 file_lock_mode;
+    u32 caps;        /* CETRAFS_NODE_CAP_* this mount advertises */
     u64 fence_epoch; /* out: the epoch in the image the swap committed */
     u64 hb_seq;      /* out: for the caller's log line */
 };
@@ -249,7 +263,7 @@ static int cetrafs_node_reattach_mutate(void *image, unsigned int len, void *pri
     ne.file_lock_mode = cetrafs_cpu_to_le32(ctx->file_lock_mode);
     /* And re-advertise this build's capabilities: an upgraded module
      * re-attaching to its old row must publish what it now supports. */
-    ne.caps = cetrafs_cpu_to_le32(CETRAFS_NODE_CAP_LIVE_GROW);
+    ne.caps = cetrafs_cpu_to_le32(ctx->caps);
 
     /* fence_epoch (and everything else) rides through untouched, and the
      * value reported back to the caller is the one in the image this swap
@@ -502,7 +516,8 @@ int cetrafs_node_register(struct super_block *sb,
             !memcmp(ne.node_uuid, my_uuid.b, CETRAFS_NODE_UUID_LEN)) {
             struct cetrafs_node_reattach_ctx ctx = {.uuid = my_uuid.b,
                                                     .hb_interval = cetrafs_heartbeat_interval_secs(sb),
-                                                    .file_lock_mode = file_lock_mode};
+                                                    .file_lock_mode = file_lock_mode,
+                                                    .caps = cetrafs_node_my_caps(sb)};
 
             /* Is the row ours because we LEFT it, or because another
              * machine with our identity is using it right now? A clean
@@ -573,7 +588,11 @@ int cetrafs_node_register(struct super_block *sb,
      * behavior (cluster mutex around a fresh read-modify-write). */
     for (idx = 0; idx < count; idx++) {
         struct cetrafs_node_claim_ctx ctx = {
-            .uuid = my_uuid.b, .hb_interval = cetrafs_heartbeat_interval_secs(sb), .file_lock_mode = file_lock_mode};
+            .uuid = my_uuid.b,
+            .hb_interval = cetrafs_heartbeat_interval_secs(sb),
+            .file_lock_mode = file_lock_mode,
+            .caps = cetrafs_node_my_caps(sb),
+        };
 
         ret = cetrafs_cas_record(sb, cetrafs_node_row_lba(sb, idx), cetrafs_node_claim_mutate, &ctx);
         if (ret == 0) {
@@ -1262,6 +1281,38 @@ int cetrafs_node_single_mounter_conflict(struct super_block *sb, const u8 *my_uu
     }
 
     return cetrafs_for_each_live_peer(sb, my_uuid, cetrafs_single_mounter_visit, out_conflict);
+}
+
+/*
+ * Is a LIVE peer running WITHOUT atomic CAW? Asked by a node that HAS it,
+ * before registering and again after (the same two-step as the file-lock
+ * mode: a peer mounting at the same instant is visible only to the second
+ * look).
+ *
+ * The no-CAW side refuses any live peer at mount, but only at ITS mount:
+ * a no-CAW node that mounted first -- alone, legitimately, or because a
+ * transient failure of the Block Limits VPD probe made a CAW-capable LUN
+ * look like one without -- was never seen by a CAW node joining later.
+ * The joiner swapped with real COMPARE AND WRITE while the first node did
+ * read-modify-write under a mutex only it could see, and every lock,
+ * claim and bitmap bit could be won by both. The first node advertises
+ * CETRAFS_NODE_CAP_NO_CAW in its row; this refuses on it.
+ */
+static int cetrafs_nocaw_peer_visit(u32 idx, const cetrafs_node_entry_t *ne, void *priv)
+{
+    bool *out = priv;
+
+    if (!(cetrafs_le32(ne->caps) & CETRAFS_NODE_CAP_NO_CAW))
+        return 0;
+    pr_err("node %u is mounted on this volume WITHOUT atomic CAW (single-mounter fallback)\n", idx);
+    *out = true;
+    return 1;
+}
+
+int cetrafs_node_nocaw_peer_exists(struct super_block *sb, const u8 *my_uuid, bool *out_exists)
+{
+    *out_exists = false;
+    return cetrafs_for_each_live_peer(sb, my_uuid, cetrafs_nocaw_peer_visit, out_exists);
 }
 
 /*

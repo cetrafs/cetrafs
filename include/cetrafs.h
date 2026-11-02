@@ -960,6 +960,14 @@ typedef struct {
 
 /* cetrafs_node_entry_t.caps bits. */
 #define CETRAFS_NODE_CAP_LIVE_GROW 0x1u /* understands layout_gen; safe to be live across a grow */
+/* Not a capability but its absence: this node mounted WITHOUT atomic CAW
+ * and runs the single-mounter fallback (cross-node exclusion is a
+ * node-local mutex). A node WITH CAW refuses to mount while a live peer
+ * advertises this -- its swaps are not exclusive against the peer's
+ * read-modify-writes. The no-CAW side already refuses any live peer; this
+ * is the other order (the no-CAW node mounted first). A row written
+ * before this bit existed reads 0, i.e. "has CAW". */
+#define CETRAFS_NODE_CAP_NO_CAW 0x2u
 
 /* Table ranges (derived helpers) */
 #define CETRAFS_ZG_TABLE_START(sb)      ((sb)->zg_table_start)

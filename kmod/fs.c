@@ -1283,7 +1283,24 @@ int cetrafs_fill_super(struct super_block *sb, struct fs_context *fc)
                 }
             }
 
-            if (!cetrafs_sb_caw_available(sb)) {
+            if (cetrafs_sb_mount_has_caw(sb)) {
+                /* The other order: WE have CAW, and a live peer may be
+                 * running the no-CAW fallback, which refused nobody when
+                 * it mounted alone. See cetrafs_node_nocaw_peer_exists(). */
+                bool nocaw = false;
+
+                rc = cetrafs_node_nocaw_peer_exists(sb, my_uuid, &nocaw);
+                if (rc || nocaw) {
+                    if (nocaw)
+                        pr_err("a live node runs this volume without atomic CAW -- refusing to mount "
+                               "(no registry row claimed); unmount it first\n");
+                    cetrafs_free_sb_info(sb);
+                    brelse(bh);
+                    return rc ? rc : -EBUSY;
+                }
+            }
+
+            if (!cetrafs_sb_mount_has_caw(sb)) {
                 bool foreign = false;
 
                 rc = cetrafs_node_live_peer_exists(sb, my_uuid, &foreign);
@@ -1585,7 +1602,23 @@ int cetrafs_fill_super(struct super_block *sb, struct fs_context *fc)
              * elects a winner -- but no interleaving lets both proceed (see
              * cetrafs_node_single_mounter_conflict()). Sequential mounts
              * never trip this: the gate already refused a live peer. */
-            if (!cetrafs_sb_caw_available(sb)) {
+            if (cetrafs_sb_mount_has_caw(sb)) {
+                /* And the no-CAW peer that registered while we did. */
+                bool nocaw = false;
+                int crc = cetrafs_node_nocaw_peer_exists(sb, sbi->node_uuid, &nocaw);
+
+                if (crc || nocaw) {
+                    if (nocaw)
+                        pr_err("mount: a node without atomic CAW registered on this volume while this "
+                               "mount was in flight -- refusing; retry once it is gone\n");
+                    else
+                        pr_err("mount: post-registration CAW-mode re-check failed: %d\n", crc);
+                    cetrafs_free_sb_info(sb);
+                    brelse(bh);
+                    return crc ? crc : -EBUSY;
+                }
+            }
+            if (!cetrafs_sb_mount_has_caw(sb)) {
                 bool foreign = false;
                 int crc = cetrafs_node_single_mounter_conflict(sb, sbi->node_uuid, &foreign);
 
@@ -2448,6 +2481,26 @@ const struct cetrafs_caw_info *cetrafs_sb_caw(struct super_block *sb)
 
 /* True when this mount can use atomic compare-and-swap for cluster
  * coordination; false means every claim path stays on the PR mutex. */
+/*
+ * TEST ONLY. Make the MOUNT decisions of a node with atomic CAW on a
+ * device without it: skip the single-mounter gate, advertise no
+ * CETRAFS_NODE_CAP_NO_CAW, and refuse a live peer that does advertise it.
+ * The swaps themselves still take the no-CAW fallback. On a shared device
+ * this lets two nodes mount with nothing arbitrating them -- it exists only
+ * so tests/kernel/caw_mixed_cluster.sh can reach the CAW side's check on a
+ * loop device.
+ */
+static bool cetrafs_mount_assume_caw;
+module_param_named(mount_assume_caw, cetrafs_mount_assume_caw, bool, 0644);
+MODULE_PARM_DESC(mount_assume_caw, "TEST ONLY: mount gating behaves as on a device with atomic CAW");
+
+/* The mount's view: does this node join the cluster as one with atomic
+ * CAW? Equal to cetrafs_sb_caw_available() outside tests. */
+bool cetrafs_sb_mount_has_caw(struct super_block *sb)
+{
+    return cetrafs_sb_caw_available(sb) || READ_ONCE(cetrafs_mount_assume_caw);
+}
+
 bool cetrafs_sb_caw_available(struct super_block *sb)
 {
     struct cetrafs_sb_info *sbi = sb->s_fs_info;
