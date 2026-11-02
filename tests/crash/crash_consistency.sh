@@ -54,6 +54,16 @@ if [ ! -x "$RESTAMP" ] || [ "$ROOT/tests/fuzz/fuzz_restamp.c" -nt "$RESTAMP" ] |
         -o "$RESTAMP" "$ROOT/tests/fuzz/fuzz_restamp.c" || fail "fuzz_restamp build failed"
 fi
 
+# A replayed image is, to the mount, a crash of this very machine: its
+# Node Registry row was not left cleanly, so registration watches that
+# row for two of its advertised heartbeat intervals + 5 s before
+# re-attaching (the twin-identity guard). At the default 15 s interval
+# that is 35 s a mount, and this rig mounts once per recorded barrier:
+# phase 1 alone took over two hours. Recording at a 1 s heartbeat makes
+# the rows advertise 1 s, so the guard still runs on every replay -- for
+# 7 s. The guard itself is kernel/node_uuid_twin.sh's to prove.
+ct_param_set hb_interval_secs 1
+
 SZ_MB=560
 SECTORS=$((SZ_MB * 1024 * 1024 / 512))
 MKFS_ARGS="-z 1 -b 512 -J 4 -M 4 -N 1024 -f"
