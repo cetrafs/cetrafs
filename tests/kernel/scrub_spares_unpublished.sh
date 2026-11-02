@@ -30,7 +30,14 @@ require_root
 require_module
 
 PROBE="$(ct_helper scrub_shadow_probe)"
-BLOCKS=20000 # ~78 MiB: big enough that the shadow cannot be published in passing
+IPOKE="$(ct_helper inode_block_poke)"
+# ~31 MiB: big enough that the shadow cannot be published in passing,
+# small enough that writeback leaves it alone. At 20000 blocks (~78 MiB)
+# a 2 GiB test box under memory pressure wrote the file back mid-window,
+# which publishes its record -- after that even the no-overlay scrub sees
+# the blocks referenced and the control "fails" for a reason that has
+# nothing to do with the overlay. The setup check below catches it.
+BLOCKS=8000
 HOLD=25      # the write, then comfortably more than two cycles of the fast scrub
 
 OUT="$(ct_tmp scrubshadow-out)"
@@ -69,6 +76,18 @@ run_probe() {
     local pid=$!
     wait_for 60 'grep -q "^written:" "'"$OUT"'"' ||
         fail "$label: the probe never finished writing"
+    # The situation this measures is "allocated, named by nothing on the
+    # device". Checked as the scrub is armed: if the record is already
+    # published, the scrub is right to keep the blocks and the run would
+    # measure nothing. Whether it STAYS unpublished long enough for a
+    # deciding pass is what the control arm proves -- same timing, and it
+    # must reclaim.
+    local ondisk
+    ondisk="$("$IPOKE" "$DEV" extents "$(stat -c '%i' "$MNT/live")" 2>&1 | head -1)"
+    case "$ondisk" in
+        *" entries=0 "*) ;;
+        *) fail "$label: setup: the file was already published when the scrub was armed ($ondisk) -- nothing would be measured" ;;
+    esac
     r0="$(reclaimed)"
     c0="$(cycles)"
     ct_param_set scrub 1
