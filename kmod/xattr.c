@@ -2,6 +2,7 @@
 #define pr_fmt(fmt) "cetrafs: " fmt
 
 #include <linux/buffer_head.h>
+#include <linux/delay.h>
 #include <linux/fs.h>
 #include <linux/stat.h>
 #include <linux/string.h>
@@ -135,6 +136,13 @@ static int cetrafs_xattr_get(struct inode *inode, const char *name, void *buffer
  * block (no chaining), so a block that's full returns -ENOSPC, same scope
  * limit as the external extent leaf block.
  */
+/* TEST ONLY, one-shot: pause right after a new xattr block is published in
+ * the record -- the instant a node dying would leave the device in
+ * (tests/kernel/xattr_block_bitmap_order.sh). Cleared by the pause. */
+static unsigned int cetrafs_xattr_pause_after_publish_ms;
+module_param_named(xattr_pause_after_publish_ms, cetrafs_xattr_pause_after_publish_ms, uint, 0644);
+MODULE_PARM_DESC(xattr_pause_after_publish_ms, "TEST ONLY: one-shot pause after a new xattr block is published");
+
 static int cetrafs_xattr_set_locked(struct inode *inode, const char *name, const void *value, size_t size, int flags)
 {
     struct super_block *sb = inode->i_sb;
@@ -250,6 +258,12 @@ static int cetrafs_xattr_set_locked(struct inode *inode, const char *name, const
         if (ret) {
             cetrafs_free_data_block(sb, lba);
             return ret;
+        }
+        {
+            unsigned int pause = xchg(&cetrafs_xattr_pause_after_publish_ms, 0);
+
+            if (pause)
+                msleep(pause); /* test-only: see the parameter */
         }
         return 0;
     }

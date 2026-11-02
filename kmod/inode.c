@@ -472,6 +472,22 @@ int cetrafs_inode_ns_cas(struct super_block *sb,
         return -EINVAL;
     if (cetrafs_sb_is_fenced(sb))
         return -EIO;
+    /*
+     * The allocation bits first, as in cetrafs_write_raw_inode() and for
+     * the same reason (rule 8): this swap reaches the device at once, and
+     * it can publish a block allocated moments ago -- setxattr's new
+     * xattr block -- whose bit is still only in this node's cache. A node
+     * dying in between left the record naming a block every allocator
+     * reads as FREE (tests/kernel/xattr_block_bitmap_order.sh). Here
+     * rather than at that one caller: every sector-0 publish passes
+     * through, and the flush costs nothing when nothing was allocated.
+     */
+    {
+        int fret = cetrafs_alloc_flush_bitmaps(sb);
+
+        if (fret)
+            return fret;
+    }
     {
         int ret =
             cetrafs_cas_record_seeded(sb, lba, seed, seed ? CETRAFS_INODE_NS_BYTES : 0, cetrafs_ns_cas_mutate, &ctx);
