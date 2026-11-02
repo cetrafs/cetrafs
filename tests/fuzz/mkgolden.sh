@@ -58,6 +58,22 @@ if libc.fallocate(fd, 0x03, ctypes.c_long(16 * 4096), ctypes.c_long(8 * 4096)) !
     raise OSError(ctypes.get_errno(), "fallocate punch failed")
 os.fsync(fd)
 os.close(fd)
+# frag: DENSE, in order, and physically fragmented -- the only shape the
+# defrag mover acts on. It declines holes and preallocated extents, which
+# is every other file here, and it judges "dense" over the extent array
+# as stored, so blocks written out of order are declined too: with none
+# of these the mover was unreachable from the fuzzer. Written front to
+# back, closing after each block so its speculative run is given back
+# and a spacer file takes the next block: 32 one-block extents.
+for i in range(32):
+    fd = os.open(m + "/frag", os.O_CREAT | os.O_WRONLY, 0o644)
+    os.pwrite(fd, bytes([65 + i % 26]) * 4096, i * 4096)
+    os.fsync(fd)
+    os.close(fd)
+    fd = os.open(m + "/fragspacer", os.O_CREAT | os.O_WRONLY | os.O_APPEND, 0o644)
+    os.write(fd, b"s" * 4096)
+    os.fsync(fd)
+    os.close(fd)
 PY
 umount "$MNT"
 

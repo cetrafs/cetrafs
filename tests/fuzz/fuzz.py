@@ -319,6 +319,120 @@ def t(fn):
         fn()
     except Exception:
         pass
+
+# Every path a hostile record can reach from a mounted volume, each
+# bounded by construction -- a capped read, a capped step count -- so a
+# TIMEOUT on this script means the kernel stopped making progress, not
+# that a legitimately large file took long.
+import fcntl, mmap, struct, errno
+FIEMAP = 0xC020660B
+CETRAFS_IOC_DEFRAG = 0x80184301   # _IOR('C', 0x01, struct cetrafs_defrag_stats)
+def names(d, cap=64):
+    out = []
+    try:
+        for e in os.scandir(m + d):
+            out.append((d + "/" + e.name, e))
+            if len(out) >= cap:
+                break
+    except Exception:
+        pass
+    return out
+def readback(p):                       # read the data back, not just stat it
+    with open(m + p, "rb", buffering=0) as f:
+        left = 1 << 20
+        while left > 0:
+            b = f.read(min(left, 65536))
+            if not b:
+                break
+            left -= len(b)
+def fiemap(p):
+    fd = os.open(m + p, os.O_RDONLY)
+    try:
+        start = 0
+        for _ in range(64):            # follow the mapping, 32 extents a call
+            buf = bytearray(struct.pack("=QQIIII", start, (1 << 64) - 1 - start, 0, 0, 32, 0) + bytes(32 * 56))
+            fcntl.ioctl(fd, FIEMAP, buf)
+            n = struct.unpack_from("=I", buf, 20)[0]
+            if n == 0:
+                break
+            last = struct.unpack_from("=QQQ", buf, 32 + (n - 1) * 56)
+            flags = struct.unpack_from("=I", buf, 32 + (n - 1) * 56 + 40)[0]
+            if flags & 1 or last[2] == 0:  # FIEMAP_EXTENT_LAST, or a zero length
+                break
+            start = last[0] + last[2]
+    finally:
+        os.close(fd)
+def seekwalk(p):
+    fd = os.open(m + p, os.O_RDONLY)
+    try:
+        off = 0
+        for _ in range(4096):
+            try:
+                d = os.lseek(fd, off, os.SEEK_DATA)
+                h = os.lseek(fd, d, os.SEEK_HOLE)
+            except OSError:
+                break
+            if h <= off:
+                break
+            off = h
+    finally:
+        os.close(fd)
+def mmapwrite(p):
+    fd = os.open(m + p, os.O_RDWR)
+    try:
+        if os.fstat(fd).st_size < 8192:
+            os.ftruncate(fd, 8192)
+        mm = mmap.mmap(fd, 8192, mmap.MAP_SHARED, mmap.PROT_READ | mmap.PROT_WRITE)
+        try:
+            mm[0:4] = b"MMAP"
+            mm[4096:4100] = b"PAGE"
+            mm.flush()
+        finally:
+            mm.close()
+    finally:
+        os.close(fd)
+def direct(p):
+    buf = mmap.mmap(-1, 4096)          # page-aligned, as O_DIRECT wants
+    buf.write(b"D" * 4096)
+    fd = os.open(m + p, os.O_RDWR | os.O_DIRECT)
+    try:
+        os.pwritev(fd, [buf], 0)
+        os.preadv(fd, [buf], 0)
+    finally:
+        os.close(fd)
+def defrag(p):
+    fd = os.open(m + p, os.O_RDWR)
+    try:
+        fcntl.ioctl(fd, CETRAFS_IOC_DEFRAG, bytearray(24))
+    finally:
+        os.close(fd)
+def falloc(p):
+    fd = os.open(m + p, os.O_RDWR)
+    try:
+        for mode, off, ln in ((0x00, 0, 16 * 4096),          # allocate
+                              (0x01, 64 * 4096, 8 * 4096),   # KEEP_SIZE past the end
+                              (0x10, 4096, 3 * 4096)):       # ZERO_RANGE
+            libc.fallocate(fd, mode, ctypes.c_long(off), ctypes.c_long(ln))
+    finally:
+        os.close(fd)
+def xattrs_read(p):
+    for n in os.listxattr(m + p, follow_symlinks=False)[:16]:
+        t(lambda n=n: os.getxattr(m + p, n, follow_symlinks=False))
+def xattrs(p):
+    xattrs_read(p)
+    t(lambda: os.removexattr(m + p, "user.fz", follow_symlinks=False))
+
+# First, everything that must see the tree AS FOUND: the write exercise
+# below punches and preallocates every file, and the defrag mover
+# declines a file with holes or uninit extents -- so run after it, it
+# never moved a block (measured: 48 of 51 files EOPNOTSUPP).
+for p, e in names("") + names("/d1"):
+    t(lambda p=p: xattrs_read(p))
+    if e.is_symlink():
+        t(lambda p=p: os.readlink(m + p))
+    elif e.is_file(follow_symlinks=False):
+        for op in (readback, fiemap, seekwalk, defrag, readback):
+            t(lambda op=op, p=p: op(p))
 def rw(p):
     fd = os.open(m + p, os.O_RDWR)
     try:
@@ -352,6 +466,22 @@ t(lambda: os.rename(m + "/f0", m + "/f0r"))
 t(lambda: os.setxattr(m + "/deep", "user.fz", b"x" * 64))
 t(lambda: os.unlink(m + "/hard"))
 t(lambda: [None for _ in os.scandir(m + "/d1")])
+
+# Then the paths that change the file, over the tree the writes left.
+everything = names("") + names("/d1")
+for p, e in everything:
+    t(lambda p=p: xattrs(p))
+    if e.is_symlink():
+        t(lambda p=p: os.readlink(m + p))
+    elif e.is_file(follow_symlinks=False):
+        for op in (falloc, mmapwrite, direct, readback, fiemap, seekwalk):
+            t(lambda op=op, p=p: op(p))
+        t(lambda p=p: os.link(m + p, m + p + ".ln"))
+    elif e.is_dir(follow_symlinks=False):
+        t(lambda p=p: [None for _ in os.scandir(m + p)])
+        t(lambda p=p: os.rmdir(m + p))
+t(lambda: os.rmdir(m + "/d1/nd"))
+t(lambda: os.statvfs(m))
 """
 
 
@@ -631,8 +761,9 @@ def run_loop(args, rng, mut, fd, loop, env, t0):
                 # exercise: every op bounded, failures are fine, hangs are not
                 for cmd in (["ls", "-laR", args.mnt], ["cat"] + [args.mnt + "/f0"],
                             ["touch", args.mnt + "/fz"], ["stat", "-f", args.mnt],
-                            ["python3", "-c", "import os,sys; os.listxattr(sys.argv[1])", args.mnt + "/f0"]):
-                    rc2, _ = run(cmd, 20)
+                            ["python3", "-c", "import os,sys; os.listxattr(sys.argv[1])", args.mnt + "/f0"],
+                            ["python3", "-c", MOUNT_EXERCISE, args.mnt]):
+                    rc2, _ = run(cmd, 30)
                     if rc2 == "TIMEOUT":
                         why = f"op hang: {cmd[0]}"
                         break

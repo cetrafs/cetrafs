@@ -10,7 +10,9 @@ open-ended rather than pass/fail regression assertions.
 
 - `mkgolden.sh <img>` — builds the golden image: mkfs'd AND populated
   through a real mount (directories, a depth-1 extent-leaf file,
-  symlink, hardlink, xattrs, a punched hole), then verified fsck-clean.
+  symlink, hardlink, xattrs, a punched hole, and a dense fragmented
+  file -- the one shape the defrag mover acts on), then verified
+  fsck-clean.
   A mkfs-only golden would leave most of both parsers untouched. Its
   fsck-clean gate is itself a check — it is what caught fsck not
   walking `xattr_block` (a live xattr block reported as a leak, and
@@ -33,13 +35,23 @@ open-ended rather than pass/fail regression assertions.
   allocation tests the OOM handling instead of aborting. A finding is a
   signal death, a sanitizer report, an unknown exit code, or a hang.
 - `fuzz_mount.sh [iters] [seed]` — the KERNEL side. Root only, run it
-  on a disposable machine. Mount, exercise (readdir, read, create,
-  statfs, listxattr — each bounded by a timeout), unmount; a finding is
+  on a disposable machine. Mount, exercise, unmount; a finding is
   a dmesg splat or any hang, and the run stops at the first one since
   the kernel's state is then suspect. The summary prints how many
   iterations actually MOUNTED: a refused mount proves only refusal, so
   "0 findings" with 0 mounts would be a run that tested nothing — the
   counter is what makes the green honest.
+
+  The exercise (`MOUNT_EXERCISE` in `fuzz.py`, shared by both mount
+  modes) reaches every path a hostile record feeds: first, over the tree
+  as found, data readback, FIEMAP, a SEEK_DATA/SEEK_HOLE walk, xattr
+  reads, readlink and the defrag ioctl; then writes, growth, truncation,
+  punch, fallocate (allocate, KEEP_SIZE, ZERO_RANGE), shared-mmap
+  writes, O_DIRECT, link, rmdir, rename, xattr set/remove and statfs.
+  Every step is capped (bytes read, steps walked), so its timeout means
+  the kernel stopped making progress. Order matters: defrag declines a
+  file with holes or preallocated extents, and run after the writes it
+  moved nothing at all.
 
 ### Stage 2 (field-aware)
 
