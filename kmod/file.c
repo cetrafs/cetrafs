@@ -3554,7 +3554,23 @@ static int __cetrafs_get_block(struct inode *inode,
 
     ret = cetrafs_tree_append(inode, &raw, (u32) iblock, lba, 1, /*uninit=*/false, &merged, &leaf_count);
     if (ret) {
-        cetrafs_free_data_block(sb, lba);
+        /*
+         * A DIRECTORY's tree blocks go out through the journal, and a
+         * failed append may already have published 'lba': a target write
+         * that failed leaves its entry LIVE for replay (journal.c), and a
+         * replay puts the leaf naming 'lba' on the device. Freeing it here
+         * handed the next allocation a block that leaf names. Kept
+         * allocated instead -- a block nothing ends up naming is a leak
+         * the scrub reclaims, the safe direction (rule 8: no free after a
+         * publish whose outcome is unknown).
+         * tests/kernel/dir_grow_fail_keeps_block.sh.
+         */
+        if (S_ISDIR(inode->i_mode))
+            pr_err("dir ino=%llu: growth failed after its tree may have named block %llu (%d) -- keeping it "
+                   "allocated\n",
+                   (unsigned long long) inode->i_ino, (unsigned long long) lba, ret);
+        else
+            cetrafs_free_data_block(sb, lba);
         return ret;
     }
 
@@ -3579,14 +3595,18 @@ static int __cetrafs_get_block(struct inode *inode,
      */
     if (S_ISDIR(inode->i_mode)) {
         ret = cetrafs_write_raw_inode(sb, inode->i_ino, &raw, /*sync=*/true);
+        if (ret) {
+            /* Same as above: the leaf (depth 1) is already on the device
+             * or in the journal naming 'lba', and a failed record write's
+             * own outcome is unknown. Keep the block. */
+            pr_err("dir ino=%llu: record write failed after its tree named block %llu (%d) -- keeping it "
+                   "allocated\n",
+                   (unsigned long long) inode->i_ino, (unsigned long long) lba, ret);
+            return ret;
+        }
     } else {
         cetrafs_inode_fd_stage(inode, &raw);
         mark_inode_dirty(inode);
-        ret = 0;
-    }
-    if (ret) {
-        cetrafs_free_data_block(sb, lba);
-        return ret;
     }
 
     inode->i_blocks = cetrafs_le64(raw.blocks);
