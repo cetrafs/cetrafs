@@ -1523,8 +1523,18 @@ struct buffer_head *cetrafs_read_tree_bh_for(struct inode *inode, u64 lba, u32 t
          * indexed with, so a hostile or damaged one is an out-of-bounds
          * access however exclusively we hold the file. One comparison,
          * and this is the per-block mapping path. */
-        struct buffer_head *bh = cetrafs_bread_retry(inode->i_sb, lba);
+        struct buffer_head *bh = sb_getblk(inode->i_sb, lba);
 
+        /* Trusting the cache is a statement about what is IN it. A block
+         * that is not there yet is coming off the device, and that read
+         * is where its tail checksum gets checked -- whoever is asking.
+         * Skipping it here let a reader that trusts its cache parse a
+         * corrupt leaf (blk_tail_checksum.sh), and had always let a
+         * writer do the same on a cache miss. */
+        if (bh && !buffer_uptodate(bh)) {
+            brelse(bh);
+            return cetrafs_blk_tail_bread(inode->i_sb, lba, tail_magic, what);
+        }
         if (bh && !cetrafs_blk_struct_ok_magic(bh, tail_magic)) {
             pr_err_ratelimited("ino=%llu: %s block %llu has an impossible entry count -- refusing it\n",
                                (unsigned long long) inode->i_ino, what, (unsigned long long) lba);
@@ -1588,9 +1598,14 @@ struct buffer_head *cetrafs_read_dir_leaf_bh(struct inode *inode, u64 lba, bool 
 
     if (!fresh) {
         /* Same as the file path above: unchanged-since-we-last-read is
-         * not the same as sane. */
-        struct buffer_head *bh = cetrafs_bread_retry(inode->i_sb, lba);
+         * not the same as sane, and a block not in the cache yet is
+         * coming off the device -- verify it there. */
+        struct buffer_head *bh = sb_getblk(inode->i_sb, lba);
 
+        if (bh && !buffer_uptodate(bh)) {
+            brelse(bh);
+            return cetrafs_blk_tail_bread(inode->i_sb, lba, CETRAFS_LEAF_TAIL_MAGIC, "extent leaf");
+        }
         if (bh && !cetrafs_blk_struct_ok_magic(bh, CETRAFS_LEAF_TAIL_MAGIC)) {
             pr_err_ratelimited("dir ino=%llu: extent leaf %llu has an impossible entry count -- refusing it\n",
                                (unsigned long long) inode->i_ino, (unsigned long long) lba);
