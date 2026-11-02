@@ -427,6 +427,28 @@ static int cetrafs_dir_extents_get(struct inode *dir, const cetrafs_inode_t *raw
     de->arr = NULL;
     de->entries = 0;
 
+    /*
+     * A directory a peer removed (nlink 0) or whose number was reused
+     * (new generation) has no blocks of its own any more: rmdir gave them
+     * back, and the allocator may already have handed them to another
+     * directory. Walking its old extents read that directory's entries --
+     * and unlink, rename and the '..' update rewrote them, with neither
+     * its namespace lock nor its dirent_seq. Only add_entry used to ask.
+     * Asked here because every reader of a directory's extents comes
+     * through, with a record it has just read fresh: lookup, readdir and
+     * verify_name_resolves via the walk, and add, remove, retarget and
+     * the '..' update directly. Costs no I/O.
+     * tests/kernel/dir_removed_by_peer.sh.
+     */
+    if (cetrafs_le32(raw->nlink) == 0 || cetrafs_le64(raw->generation) != cetrafs_inode_get_generation(dir)) {
+        pr_warn_ratelimited("dir ino=%llu is gone (nlink=%u, generation disk=%llu core=%llu) -- a peer removed or "
+                            "replaced it; not reading its old blocks\n",
+                            (unsigned long long) dir->i_ino, (unsigned int) cetrafs_le32(raw->nlink),
+                            (unsigned long long) cetrafs_le64(raw->generation),
+                            (unsigned long long) cetrafs_inode_get_generation(dir));
+        return -ENOENT;
+    }
+
     if (cetrafs_le16(raw->eh.eh_magic) != CETRAFS_EXT_MAGIC || cetrafs_le16(raw->eh.eh_depth) > 1) {
         pr_warn_ratelimited("dir ino=%llu: bad extent header (magic=0x%x depth=%u entries=%u)\n",
                             (unsigned long long) dir->i_ino, raw->eh.eh_magic, raw->eh.eh_depth, raw->eh.eh_entries);
