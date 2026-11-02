@@ -1591,10 +1591,11 @@ int cetrafs_lock_open(struct inode *inode, struct file *file)
                 "WITHOUT replaying its journal -- its metadata may be unrepaired\n",
                 (unsigned long long) inode->i_ino, raw.lock_owner_node);
         } else {
-            cetrafs_node_fence_peer(sb, cetrafs_le32(raw.lock_owner_node), "a file lock");
-            ret = cetrafs_journal_replay_node(sb, cetrafs_le32(raw.lock_owner_node), /*wait_for_claim=*/false);
+            ret = cetrafs_node_fence_peer(sb, cetrafs_le32(raw.lock_owner_node), "a file lock");
+            if (!ret)
+                ret = cetrafs_journal_replay_node(sb, cetrafs_le32(raw.lock_owner_node), /*wait_for_claim=*/false);
             if (ret) {
-                pr_err("lock: ino=%llu could not replay stale node %u's journal (%d), refusing open\n",
+                pr_err("lock: ino=%llu could not fence and replay stale node %u (%d), refusing open\n",
                        (unsigned long long) inode->i_ino, raw.lock_owner_node, ret);
                 goto out_pr_unlock;
             }
@@ -3225,10 +3226,11 @@ static int cetrafs_lock_explicit_acquire(struct inode *inode, struct file *file)
                 ret = -ETXTBSY; /* a live holder (or it just let go): keep waiting */
                 goto out;
             }
-            cetrafs_node_fence_peer(sb, owner, "a file lock (flock)");
-            ret = cetrafs_journal_replay_node(sb, owner, /*wait_for_claim=*/false);
+            ret = cetrafs_node_fence_peer(sb, owner, "a file lock (flock)");
+            if (!ret)
+                ret = cetrafs_journal_replay_node(sb, owner, /*wait_for_claim=*/false);
             if (ret) {
-                pr_err("flock: ino=%llu could not replay stale node %u's journal (%d) -- not taking its lock\n",
+                pr_err("flock: ino=%llu could not fence and replay stale node %u (%d) -- not taking its lock\n",
                        (unsigned long long) inode->i_ino, owner, ret);
                 goto out;
             }
@@ -3583,7 +3585,11 @@ static int cetrafs_foreign_reader_from_raw(struct super_block *sb,
                 .generation = cetrafs_le64(raw.generation),
                 .reader_op = CETRAFS_READER_CLEAR,
             };
-            cetrafs_node_fence_peer(sb, n, "a read-open reference");
+            if (cetrafs_node_fence_peer(sb, n, "a read-open reference")) {
+                /* Not revoked: it may still be reading. Count it. */
+                *out_exists = true;
+                return 0;
+            }
             if (cetrafs_cas_record(sb, cetrafs_inode_lba(sb, ino), cetrafs_lock_cas_mutate, &rctx) < 0)
                 pr_warn_ratelimited("ino=%llu could not clear stale node %u's reader bit\n", (unsigned long long) ino,
                                     n);
@@ -3693,7 +3699,9 @@ static int cetrafs_foreign_claim_from_raw(struct super_block *sb,
          * those blocks are freed/reused. Callers run inside dir.c's
          * ns-locked workers, so the cluster mutex is already held. */
         if (stale) {
-            cetrafs_node_fence_peer(sb, cetrafs_le32(raw.lock_owner_node), "a file lock");
+            ret = cetrafs_node_fence_peer(sb, cetrafs_le32(raw.lock_owner_node), "a file lock");
+            if (ret)
+                return ret;
             ret = cetrafs_journal_replay_node(sb, cetrafs_le32(raw.lock_owner_node), /*wait_for_claim=*/false);
             if (ret)
                 return ret;

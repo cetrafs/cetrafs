@@ -352,37 +352,63 @@ static int cetrafs_node_depart_mutate(void *image, unsigned int len, void *priv)
 }
 
 /*
+ * TEST ONLY: make revoking a peer's lease fail, as a device error on its
+ * registry row would. Nothing a single-node test can arrange makes that
+ * CAS fail on its own.
+ */
+static bool cetrafs_fence_peer_fail;
+module_param_named(fence_peer_fail, cetrafs_fence_peer_fail, bool, 0644);
+MODULE_PARM_DESC(fence_peer_fail, "TEST ONLY: revoking a stale peer's lease fails");
+
+/*
  * Revoke a stale peer's lease, because we are about to take something
  * that was his. Call this at the moment of reclaim, not merely on
  * noticing staleness -- a staleness CHECK is not a reclaim, and fencing
  * a node nobody has actually taken anything from would be wrong.
  *
- * Best-effort by design: a failure here must never block the reclaim
- * itself (the peer still times out of everything the ordinary stale
- * paths cover), so it is logged and swallowed.
+ * NOT best-effort. It used to be: the error was logged and swallowed and
+ * the caller went on to replay the peer's journal or take its lock or
+ * Zone Group -- the one moment the revocation exists for. A peer that is
+ * slow rather than dead then never learns it was declared dead, keeps
+ * writing, and the replay blind-writes its recorded images over blocks
+ * it is still working. Staleness alone is a guess; the lease is what
+ * makes it safe to act on. So a caller that is about to take something
+ * must stop when this fails, and try again later.
+ *
+ * 0 also when there is no lease left to revoke (the row is no longer
+ * REGISTERED: nobody holds it to keep writing under).
  */
-static void cetrafs_node_fence_peer_full(struct super_block *sb, u32 node_id, const char *what, bool mark_departed)
+static int cetrafs_node_fence_peer_full(struct super_block *sb, u32 node_id, const char *what, bool mark_departed)
 {
     struct cetrafs_node_fence_ctx ctx = {.mark_departed = mark_departed};
     const cetrafs_superblock_t *raw_sb = cetrafs_sb_raw(sb);
     int ret;
 
     if (!raw_sb || node_id >= le32_to_cpu(raw_sb->node_table_count))
-        return;
+        return -EINVAL;
 
     ret = cetrafs_cas_record(sb, cetrafs_node_row_lba(sb, node_id), cetrafs_node_fence_mutate, &ctx);
     if (ret < 0) {
-        pr_warn("fence: could not revoke stale node %u's lease while reclaiming %s: %d\n", node_id, what, ret);
-        return;
+        pr_err_ratelimited("fence: could not revoke stale node %u's lease (%d) -- not reclaiming %s\n", node_id, ret,
+                           what);
+        return ret;
     }
     if (ctx.seen_epoch)
         pr_info("fence: revoked stale node %u's lease (epoch %llu) while reclaiming %s\n", node_id,
                 (unsigned long long) ctx.seen_epoch, what);
+    return 0;
 }
 
-void cetrafs_node_fence_peer(struct super_block *sb, u32 node_id, const char *what)
+int cetrafs_node_fence_peer(struct super_block *sb, u32 node_id, const char *what)
 {
-    cetrafs_node_fence_peer_full(sb, node_id, what, false);
+    /* The reclaim paths only: the no-CAW mount gate's own verdict goes
+     * through _full() and is not what the knob is for. */
+    if (unlikely(cetrafs_fence_peer_fail)) {
+        pr_err_ratelimited("fence: could not revoke stale node %u's lease (%d) -- not reclaiming %s\n", node_id, -EIO,
+                           what);
+        return -EIO;
+    }
+    return cetrafs_node_fence_peer_full(sb, node_id, what, false);
 }
 
 /*
@@ -543,7 +569,7 @@ int cetrafs_node_register(struct super_block *sb,
             }
 
             if (cetrafs_reattach_race_bump) /* test knob, see its MODULE_PARM_DESC */
-                cetrafs_node_fence_peer(sb, idx, "a test-forced concurrent reclaim (reattach_race_bump)");
+                (void) cetrafs_node_fence_peer_full(sb, idx, "a test-forced concurrent reclaim (reattach_race_bump)", false);
 
             /* The take-back is a CAS, never a blind write of the row read
              * above -- see cetrafs_node_reattach_mutate() for the fence
@@ -1103,8 +1129,13 @@ int cetrafs_node_live_peer_exists(struct super_block *sb, const u8 *my_uuid, boo
          * path does, and records the verdict so the next mount does not
          * have to watch all over again. Without this a single crashed
          * peer costs every later mount of the volume a full window,
-         * forever: nothing else ever clears that row. */
-        cetrafs_node_fence_peer_full(sb, idx, "this volume (no atomic CAW: one mounter only)", true);
+         * forever: nothing else ever clears that row.
+         *
+         * A failure is only reported: this takes nothing from the peer
+         * by itself, and every path that later does (its Zone Groups,
+         * locks, journal) revokes the lease again and stops if it
+         * cannot. */
+        (void) cetrafs_node_fence_peer_full(sb, idx, "this volume (no atomic CAW: one mounter only)", true);
     }
 
 out:

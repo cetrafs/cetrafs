@@ -794,7 +794,9 @@ static int cetrafs_zg_try_claim_one(struct super_block *sb, u32 zg_id, u32 my_no
         /* Revoke the stale owner's lease first: from here on we are
          * taking its state, so if it is merely slow rather than dead it
          * must fence itself the moment it notices (node.c). */
-        cetrafs_node_fence_peer(sb, owner, "a zone group");
+        ret = cetrafs_node_fence_peer(sb, owner, "a zone group");
+        if (ret)
+            goto out_unlock;
 
         /* We hold no cluster mutex here any more -- replay claims the
          * area itself, which is what serializes concurrent replayers. */

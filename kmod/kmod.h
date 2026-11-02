@@ -699,7 +699,7 @@ int cetrafs_node_mark_offline(struct super_block *sb, u32 my_node_id);
 int cetrafs_node_renew_heartbeat(struct super_block *sb, u32 my_node_id);
 int cetrafs_node_is_stale(struct super_block *sb, u32 node_id, bool *out_stale);
 /* The fence lease -- see cetrafs_node_entry_t.fence_epoch. */
-void cetrafs_node_fence_peer(struct super_block *sb, u32 node_id, const char *what);
+int __must_check cetrafs_node_fence_peer(struct super_block *sb, u32 node_id, const char *what);
 int cetrafs_node_self_fence_check(struct super_block *sb, u32 my_node_id, bool *out_fenced);
 int cetrafs_node_get_entry(struct super_block *sb, u32 idx, cetrafs_node_entry_t *out);
 u64 cetrafs_node_row_lba(struct super_block *sb, u32 idx);

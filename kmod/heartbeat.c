@@ -329,7 +329,8 @@ static void cetrafs_heartbeat_maint(struct work_struct *work)
              * every tick would force a remount on a node that is slow
              * and doing nothing wrong. We fence when we take its state,
              * which is what the other callers do too. */
-            cetrafs_node_fence_peer(sb, n, "a stale node's dirty journal");
+            if (cetrafs_node_fence_peer(sb, n, "a stale node's dirty journal"))
+                continue; /* not revoked: replaying now is the hazard above; next tick tries again */
 
             ret = cetrafs_journal_replay_node(sb, n, /*wait_for_claim=*/false);
             if (ret)

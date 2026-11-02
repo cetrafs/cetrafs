@@ -332,7 +332,8 @@ static int cetrafs_nslock_try(struct inode *inode, u32 my_node_id)
 
         /* Dead holder: repair whatever it was mid-writing BEFORE taking
          * the lock, so nobody builds on a half-finished operation. */
-        cetrafs_node_fence_peer(sb, cetrafs_le32(raw.ns_lock_owner), "a namespace lock");
+        if (cetrafs_node_fence_peer(sb, cetrafs_le32(raw.ns_lock_owner), "a namespace lock"))
+            return -EBUSY; /* not revoked: wait and try again, as for a live holder */
         ret = cetrafs_journal_replay_node(sb, cetrafs_le32(raw.ns_lock_owner), /*wait_for_claim=*/false);
         if (ret)
             return ret;

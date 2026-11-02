@@ -322,7 +322,12 @@ static int cetrafs_journal_claim_replay(struct super_block *sb, u64 area_start, 
             return -EEXIST; /* live replayer, or we cannot tell: leave it */
         pr_warn("journal: taking over replay of area %llu from stale node %u\n", (unsigned long long) area_start,
                 owner);
-        cetrafs_node_fence_peer(sb, owner, "a journal replay claim");
+        {
+            int fret = cetrafs_node_fence_peer(sb, owner, "a journal replay claim");
+
+            if (fret)
+                return fret;
+        }
         ctx.steal = true;
         ctx.steal_from = owner;
     }
