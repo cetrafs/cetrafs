@@ -497,9 +497,16 @@ static void cetrafs_ns_apply_zero_nlink(cetrafs_inode_t *rec, void *arg)
  * stops this node's own scrub only. Both sides therefore CAS sector 0:
  *
  *   creator: bit CAS, read record R, BIRTH CLAIM = CAS(R -> R with
- *            ns_lock_owner=me). Miscompare, or a foreign ns_lock_owner
- *            in R: a reclaim holds this number -- abandon it, bit
- *            untouched, take another.
+ *            ns_lock_owner=me). Miscompare: a reclaim (or a second
+ *            creator) got there first -- abandon the number, bit
+ *            untouched, take another. A foreign ns_lock_owner in R: a
+ *            reclaim holds it, and may already have done its one clear
+ *            -- wait for its release, then a fresh bit read decides
+ *            (set: claim the released record; clear: walk away). Once
+ *            the claim is held, read the bit fresh again: a reclaim's
+ *            whole cycle can fit between our bit CAS and our read, and
+ *            then our claim landed on a number whose bit is clear --
+ *            give the claim back. See cetrafs_alloc_inode().
  *   reclaim: verdict on (bit set, record dead gen G, no lock), CLAIM =
  *            CAS(dead G, unlocked -> ns_lock_owner=me), clear the bit,
  *            RELEASE = CAS(exactly what the claim wrote -> unlocked).

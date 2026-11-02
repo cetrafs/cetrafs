@@ -1570,6 +1570,13 @@ static void cetrafs_new_inode_discard(struct inode *inode)
         (void) cetrafs_write_raw_inode(sb, inode->i_ino, &raw, /*sync=*/true);
     }
 
+    /* The birth is over: it failed. Eviction frees the number through
+     * cetrafs_free_inode_if_dead(), which refuses a number still in the
+     * birth registry -- there that means "a create of this node took it
+     * after the verdict", and a leftover entry of our own would make the
+     * discard free nothing at all. Nothing else can be born on this
+     * number meanwhile: its bit stays set until the free. */
+    cetrafs_sb_birth_end(sb, inode->i_ino);
     clear_nlink(inode);
     iput(inode);
 }

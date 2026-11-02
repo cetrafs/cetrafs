@@ -528,6 +528,111 @@ static int cetrafs_inode_bitmap_cas_free(struct super_block *sb, u64 bit)
 static unsigned int cetrafs_birth_gap_ms;
 module_param_named(birth_gap_ms, cetrafs_birth_gap_ms, uint, 0644);
 MODULE_PARM_DESC(birth_gap_ms, "test-only: delay between an inode allocation's bit CAS and its birth claim");
+/* Test-only: the same pause, but BEFORE the record is read -- the window
+ * in which a peer's whole claim-clear-release can land and leave the
+ * creator reading the RELEASED record. tests/kernel/scrub_birth_handover.sh. */
+static unsigned int cetrafs_birth_read_gap_ms;
+module_param_named(birth_read_gap_ms, cetrafs_birth_read_gap_ms, uint, 0644);
+MODULE_PARM_DESC(birth_read_gap_ms, "test-only: delay between an inode allocation's bit CAS and its record read");
+
+/* One forced-fresh read of an inode record, raw: see the comment at its
+ * first use in cetrafs_alloc_inode() for why not cetrafs_read_raw_inode().
+ * *have is whether the record verifies. */
+static int cetrafs_birth_read(struct super_block *sb, u64 ino, cetrafs_inode_t *raw, bool *have)
+{
+    struct buffer_head *bh;
+
+    cetrafs_invalidate_raw_inode(sb, ino);
+    bh = cetrafs_bread_retry(sb, cetrafs_inode_lba(sb, ino));
+    if (!bh)
+        return -EIO;
+    cetrafs_bh_copy_stable(bh, raw, sizeof(*raw));
+    brelse(bh);
+    *have = cetrafs_inode_crcs_ok(raw);
+    return 0;
+}
+
+/* Is inode number 'ino''s bit set ON THE DEVICE? A peer's clear never
+ * reaches this node's copy of the bitmap block, and the question below
+ * is precisely whether a peer cleared it. The block is never left dirty
+ * here (the inode bitmap is written by CAS only), so the drop sticks. */
+static int cetrafs_inode_is_allocated_fresh(struct super_block *sb, u64 ino, bool *out_set)
+{
+    const cetrafs_superblock_t *raw_sb = cetrafs_sb_raw(sb);
+
+    if (raw_sb && ino && ino <= le32_to_cpu(raw_sb->inodes_count))
+        cetrafs_invalidate_block(sb, le64_to_cpu(raw_sb->inode_bmap_start) + (ino - 1) / CETRAFS_BITS_PER_BLOCK);
+    return cetrafs_inode_is_allocated(sb, ino, out_set);
+}
+
+/*
+ * The creator took a number's bit and found a PEER's reclaim holding its
+ * record. A reclaim claims the record, clears the bit, then releases --
+ * so the bit this creator just set was clear, and there are two ways
+ * that happens:
+ *
+ *   a) the reclaim had ALREADY cleared it. Nobody will clear it again:
+ *      the reclaim clears once. Walking away here -- what this used to
+ *      do, "the bit belongs to the reclaim" -- left the number allocated
+ *      under a dead record whose extents name blocks the same scrub
+ *      cycle had just freed and the allocator then handed to other
+ *      files. fsck reported each as "referenced by more than one inode",
+ *      and an evict of that number would have freed live data. A
+ *      three-node hypervisor-storm run produced it twice in two runs.
+ *   b) the reclaim judged OUR freshly set bit an orphan (the window
+ *      between our bit CAS and our read) and will clear it, or has.
+ *
+ * The creator cannot tell the two apart while the claim is held, and
+ * after the release it does not need to: the reclaim's clear has then
+ * happened either way, so the bit on the device says who has it. Clear:
+ * (b), the number is free and not ours. Set: the bit is ours (a), or a
+ * second creator took it after the clear -- and then the birth claim the
+ * caller makes next, against the released record, picks exactly one of
+ * us. A reclaim claims for one bitmap CAS, so the wait is milliseconds;
+ * one that never releases (its node died mid-claim) runs the budget out
+ * and the number is left as before -- set, locked, for the next scrub
+ * and fsck -- which is logged, not silent.
+ *
+ * Returns 0 with *lost false and *raw the released record to claim
+ * against; 0 with *lost true to take another number; <0 on I/O error.
+ */
+#define CETRAFS_BIRTH_WAIT_MS 2000
+static int cetrafs_birth_await_release(struct super_block *sb, u64 ino, cetrafs_inode_t *raw, u32 me, bool *lost)
+{
+    unsigned int waited = 0, step = 1;
+
+    *lost = true;
+    while (waited < CETRAFS_BIRTH_WAIT_MS) {
+        bool have = false, set = false;
+        u32 owner;
+        int ret;
+
+        msleep(step);
+        waited += step;
+        step = min(step * 2, 64U);
+
+        ret = cetrafs_birth_read(sb, ino, raw, &have);
+        if (ret)
+            return ret;
+        if (!have)
+            continue; /* torn mid-swap: read it again */
+        owner = cetrafs_le32(raw->ns_lock_owner);
+        if (owner != CETRAFS_NODE_ID_NONE && owner != me)
+            continue; /* still held (or claimed again) */
+        if (cetrafs_le32(raw->nlink) != 0)
+            return 0; /* a second creator won it: not ours */
+        ret = cetrafs_inode_is_allocated_fresh(sb, ino, &set);
+        if (ret)
+            return ret;
+        if (set)
+            *lost = false; /* ours, or contested by a claim the caller makes */
+        return 0;
+    }
+    pr_warn_ratelimited("alloc_inode: ino=%llu is still held by node %u's reclaim after %u ms -- leaving the number "
+                        "allocated for the next scrub\n",
+                        (unsigned long long) ino, (unsigned int) cetrafs_le32(raw->ns_lock_owner), waited);
+    return 0;
+}
 
 int cetrafs_alloc_inode(struct super_block *sb, u64 *out_ino)
 {
@@ -551,7 +656,20 @@ int cetrafs_alloc_inode(struct super_block *sb, u64 *out_ino)
         u32 owner;
         int ret;
 
+        bool claimed = false;
+        unsigned int nofs;
+
+        /* Take the bit and enter the birth registry as one step against
+         * this node's own reclaims (cetrafs_sb_info.birth_rwsem). NOFS:
+         * the CAS allocates, and reclaim recursing into an evict here
+         * would take the same rwsem for write. */
+        nofs = memalloc_nofs_save();
+        cetrafs_sb_birth_gate(sb, false);
         bit = cetrafs_inode_bitmap_cas_alloc(sb);
+        if (bit >= 0)
+            cetrafs_sb_birth_begin(sb, (u64) bit + 1);
+        cetrafs_sb_birth_ungate(sb, false);
+        memalloc_nofs_restore(nofs);
         if (bit < 0)
             return (int) bit;
 
@@ -585,16 +703,12 @@ int cetrafs_alloc_inode(struct super_block *sb, u64 *out_ino)
          * use. This read is also the image the birth claim below is
          * compared against.
          */
-        {
-            struct buffer_head *bh;
-
-            cetrafs_invalidate_raw_inode(sb, *out_ino);
-            bh = cetrafs_bread_retry(sb, cetrafs_inode_lba(sb, *out_ino));
-            if (!bh)
-                return -EIO; /* the bit stays set: a leak, never a second owner */
-            cetrafs_bh_copy_stable(bh, &raw, sizeof(raw));
-            brelse(bh);
-            have = cetrafs_inode_crcs_ok(&raw);
+        if (cetrafs_birth_read_gap_ms)
+            msleep(cetrafs_birth_read_gap_ms); /* test-only; see the parameter */
+        if (cetrafs_birth_read(sb, *out_ino, &raw, &have)) {
+            cetrafs_sb_birth_end(sb, *out_ino);
+            *out_ino = 0;
+            return -EIO; /* the bit stays set: a leak, never a second owner */
         }
         if (cetrafs_birth_gap_ms)
             msleep(cetrafs_birth_gap_ms); /* test-only; see the parameter */
@@ -605,45 +719,83 @@ int cetrafs_alloc_inode(struct super_block *sb, u64 *out_ino)
                 (unsigned long long) *out_ino, (unsigned int) cetrafs_le32(raw.nlink),
                 (unsigned long long) cetrafs_le64(raw.generation), (unsigned int) cetrafs_le32(raw.mode),
                 (unsigned long long) cetrafs_le64(raw.size));
+            cetrafs_sb_birth_end(sb, *out_ino);
             *out_ino = 0;
             return -EIO;
         }
 
         /* A record a PEER holds the namespace lock of is mid-reclaim by
-         * its scrub (nothing else locks a dead number): the bit we just
-         * took is about to be cleared under us. Ours (a scrub of this
-         * node finished, or a create of ours failed after its claim) is
-         * safe to take over -- this node's own scrub never touches a
-         * number mid-birth here. */
+         * its scrub (nothing else locks a dead number). Whether the bit
+         * we just took is still ours is only knowable once that reclaim
+         * lets go -- see cetrafs_birth_await_release(). Ours (a scrub of
+         * this node finished, or a create of ours failed after its
+         * claim) is safe to take over -- this node's own scrub never
+         * touches a number mid-birth here. */
         owner = cetrafs_le32(raw.ns_lock_owner);
-        if (have && owner != CETRAFS_NODE_ID_NONE && owner != me)
-            lost = true;
-        else if (!memchr_inv(&raw, 0, CETRAFS_INODE_NS_BYTES))
-            ; /* virgin: no reclaim judges an unchecksummed record, so
-               * nothing to arbitrate -- and no extra write per first use */
-        else {
+        if (have && owner != CETRAFS_NODE_ID_NONE && owner != me) {
+            ret = cetrafs_birth_await_release(sb, *out_ino, &raw, me, &lost);
+            if (!ret && !lost) {
+                ret = cetrafs_inode_birth_claim(sb, *out_ino, &raw, &lost);
+                claimed = !ret && !lost;
+            }
+        } else if (!memchr_inv(&raw, 0, CETRAFS_INODE_NS_BYTES)) {
+            ret = 0; /* virgin: no reclaim judges an unchecksummed record,
+                      * so nothing to arbitrate -- and no extra write per
+                      * first use */
+        } else {
             ret = cetrafs_inode_birth_claim(sb, *out_ino, &raw, &lost);
+            claimed = !ret && !lost;
+        }
+        if (ret) {
+            cetrafs_sb_birth_end(sb, *out_ino);
+            *out_ino = 0;
+            return ret; /* bit left set: a leak the scrub reclaims */
+        }
+
+        /*
+         * Holding the birth claim, no reclaim can claim this record any
+         * more -- every one (scrub and evict alike) goes through
+         * cetrafs_free_inode_if_dead()'s claim, which needs it unlocked.
+         * So the bit read now is final, and it must still be set: a peer
+         * reclaim can judge our freshly set bit an orphan and run its
+         * whole claim-clear-release between our bit CAS and our record
+         * read, and then the record we claimed is the RELEASED one --
+         * the claim lands, on a number whose bit is clear and which the
+         * next allocator anywhere will take as well. Give the claim back
+         * and take another number.
+         */
+        if (claimed) {
+            bool set = false;
+
+            ret = cetrafs_inode_is_allocated_fresh(sb, *out_ino, &set);
             if (ret) {
+                cetrafs_sb_birth_end(sb, *out_ino);
                 *out_ino = 0;
-                return ret; /* bit left set: a leak the scrub reclaims */
+                return ret; /* claim and bit left as they are: fsck names it */
+            }
+            if (!set) {
+                (void) cetrafs_inode_reclaim_claim(sb, *out_ino, cetrafs_le64(raw.generation),
+                                                   CETRAFS_RECLAIM_BIRTH_ABORT, NULL);
+                lost = true;
             }
         }
         if (lost) {
-            /* Abandon: the bit belongs to the reclaim that beat us, and
-             * clearing it would clobber that arbitration. Count it used --
-             * it is set -- and take another number. */
+            /* Abandon. Whatever the bit says now is not ours to change:
+             * a reclaim cleared it, or a birth claim that beat ours owns
+             * it, and clearing it would clobber that arbitration. Count
+             * it used -- this node set it -- and take another number. */
             pr_info_ratelimited("alloc_inode: ino=%llu is being reclaimed by a scrub -- taking another number\n",
                                 (unsigned long long) *out_ino);
+            cetrafs_sb_birth_end(sb, *out_ino);
             cetrafs_sb_adjust_free_inodes(sb, -1);
             continue;
         }
 
-        /* Mark the number mid-birth BEFORE returning it: from here until
-         * the first name is published, the on-disk record cannot prove
-         * this node owns the number (the dead previous record is still
-         * what a scanner reads), so the orphan scrub keys off this
-         * registry instead. */
-        cetrafs_sb_birth_begin(sb, *out_ino);
+        /* The number stays in the birth registry (entered with the bit,
+         * above) until its first name is published: until then the
+         * on-disk record cannot prove this node owns it (the dead
+         * previous record is still what a scanner reads), so the orphan
+         * scrub keys off the registry instead. */
         cetrafs_sb_adjust_free_inodes(sb, -1);
         return 0;
     }
@@ -749,11 +901,21 @@ int cetrafs_free_inode_if_dead(struct super_block *sb, u64 ino, u64 generation)
      * or loses to it and abandons the number. See inode.c's
      * cetrafs_inode_birth_claim(). A re-read alone could not be adjacent
      * enough to the free; only this is. */
+    cetrafs_sb_birth_gate(sb, true);
     ret = cetrafs_inode_reclaim_claim(sb, ino, generation, CETRAFS_RECLAIM_CLAIM, &seq);
-    if (ret)
+    if (ret) {
+        cetrafs_sb_birth_ungate(sb, true);
         return ret; /* reborn, locked, or unreadable: free nothing */
+    }
 
-    ret = cetrafs_inode_bitmap_cas_free(sb, ino - 1);
+    /* A create of THIS node took the number after our verdict read --
+     * the bit we judged is its bit now. Under the gate the registry is
+     * exact (cetrafs_sb_info.birth_rwsem): give the record back and
+     * clear nothing. */
+    if (cetrafs_sb_birth_active(sb, ino))
+        ret = -EAGAIN;
+    else
+        ret = cetrafs_inode_bitmap_cas_free(sb, ino - 1);
     if (!ret)
         cetrafs_sb_adjust_free_inodes(sb, 1);
     {
@@ -765,6 +927,7 @@ int cetrafs_free_inode_if_dead(struct super_block *sb, u64 ino, u64 generation)
                 "until fsck\n",
                 (unsigned long long) ino, rret);
     }
+    cetrafs_sb_birth_ungate(sb, true);
     if (ret > 0)
         return 1;
     return ret;

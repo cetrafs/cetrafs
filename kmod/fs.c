@@ -398,6 +398,15 @@ struct cetrafs_sb_info {
      * a number 378us after its rebirth and two files ended up sharing
      * one inode (2026-10-29, full-probe churn tape). */
     unsigned long *inode_birth;
+    /* Orders this node's inode allocations against its own orphan
+     * reclaims. An allocation holds it shared from its bit CAS until the
+     * number is in inode_birth; a reclaim holds it exclusive from its
+     * claim through its release, and re-checks inode_birth inside. Without
+     * it a local reclaim could judge a bit this node had just set -- the
+     * registry entry not made yet -- and clear it after the creator's
+     * birth claim had already landed on its own claim (a peer's reclaim
+     * cannot: its claim needs an unlocked record). */
+    struct rw_semaphore birth_rwsem;
 
     /* Per-ZG pending-free backoff.
      *
@@ -1107,6 +1116,7 @@ int cetrafs_fill_super(struct super_block *sb, struct fs_context *fc)
         if (!sbi->peers)
             sbi->peer_count = 0;
         mutex_init(&sbi->alloc_mutex);
+        init_rwsem(&sbi->birth_rwsem);
         mutex_init(&sbi->cas_mutex);
 
         sbi->zg_pf_full_until = kcalloc(zg_cnt, sizeof(*sbi->zg_pf_full_until), GFP_KERNEL);
@@ -2330,6 +2340,27 @@ bool cetrafs_sb_birth_active(struct super_block *sb, u64 ino)
     struct cetrafs_sb_info *sbi = sb->s_fs_info;
 
     return sbi && sbi->inode_birth && test_bit((unsigned int) ino, sbi->inode_birth);
+}
+
+/* See cetrafs_sb_info.birth_rwsem. */
+void cetrafs_sb_birth_gate(struct super_block *sb, bool reclaim)
+{
+    struct cetrafs_sb_info *sbi = sb->s_fs_info;
+
+    if (reclaim)
+        down_write(&sbi->birth_rwsem);
+    else
+        down_read(&sbi->birth_rwsem);
+}
+
+void cetrafs_sb_birth_ungate(struct super_block *sb, bool reclaim)
+{
+    struct cetrafs_sb_info *sbi = sb->s_fs_info;
+
+    if (reclaim)
+        up_write(&sbi->birth_rwsem);
+    else
+        up_read(&sbi->birth_rwsem);
 }
 
 bool cetrafs_shadow_active(struct super_block *sb)

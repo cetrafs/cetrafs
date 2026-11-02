@@ -674,6 +674,8 @@ bool cetrafs_shadow_active(struct super_block *sb);
 void cetrafs_sb_birth_begin(struct super_block *sb, u64 ino);
 void cetrafs_sb_birth_end(struct super_block *sb, u64 ino);
 bool cetrafs_sb_birth_active(struct super_block *sb, u64 ino);
+void cetrafs_sb_birth_gate(struct super_block *sb, bool reclaim);
+void cetrafs_sb_birth_ungate(struct super_block *sb, bool reclaim);
 void cetrafs_shadow_clear(struct super_block *sb, u64 lba, u64 count, const char *who);
 
 // super_ops.c
