@@ -495,6 +495,15 @@ static bool cetrafs_journal_fail_entry_write;
 module_param_named(journal_fail_entry_write, cetrafs_journal_fail_entry_write, bool, 0644);
 MODULE_PARM_DESC(journal_fail_entry_write, "test-only: the journal entry's own write fails");
 
+/*
+ * Test-only: pause replay between its verdict on a target and the redo,
+ * logging the pause -- where a live writer's own write of the block can
+ * land (tests/kernel/journal_replay_live_writer.sh).
+ */
+static unsigned int cetrafs_journal_replay_apply_pause_ms;
+module_param_named(journal_replay_apply_pause_ms, cetrafs_journal_replay_apply_pause_ms, uint, 0644);
+MODULE_PARM_DESC(journal_replay_apply_pause_ms, "test-only: pause between replay's verdict and its redo");
+
 static bool cetrafs_journal_ignore_guard;
 module_param_named(journal_ignore_guard, cetrafs_journal_ignore_guard, bool, 0644);
 MODULE_PARM_DESC(journal_ignore_guard, "test-only: replay without the prev_checksum guard (reproduces the pre-fix bug)");
@@ -995,6 +1004,37 @@ static bool cetrafs_journal_target_intact(const struct buffer_head *bh)
     return cetrafs_le32(tail->crc) == ~crc32c(~0U, bh->b_data, CETRAFS_BLK_TAIL_OFF);
 }
 
+enum cetrafs_journal_verdict {
+    CETRAFS_JV_APPLY,           /* target still holds the before-image: redo */
+    CETRAFS_JV_APPLY_UNGUARDED, /* entry carries no before-image to check */
+    CETRAFS_JV_TORN,            /* target fails its own tail checksum */
+    CETRAFS_JV_LANDED,          /* target already holds the after-image */
+    CETRAFS_JV_CHANGED,         /* a complete image that is neither: rewritten since */
+    CETRAFS_JV_MOVING,          /* kept changing between verdict and redo */
+};
+
+/* Torn re-reads (10 ms doubling: ~2.5 s in all) and how often the block
+ * may move between the verdict and the redo before it is refused. */
+#define CETRAFS_JOURNAL_TORN_RETRIES 8
+#define CETRAFS_JOURNAL_MOVED_RETRIES 3
+
+static enum cetrafs_journal_verdict cetrafs_journal_judge(const struct cetrafs_journal_replay_entry *e,
+                                                          const struct buffer_head *tbh,
+                                                          u32 tcrc)
+{
+    if (cetrafs_journal_ignore_guard)
+        return CETRAFS_JV_APPLY;
+    if (tcrc == e->payload_checksum)
+        return CETRAFS_JV_LANDED; /* only the consume was lost */
+    if (!(e->flags & CETRAFS_JRNL_F_GUARDED))
+        return CETRAFS_JV_APPLY_UNGUARDED;
+    if (tcrc == e->prev_checksum)
+        return CETRAFS_JV_APPLY; /* the target write never landed */
+    if (!cetrafs_journal_ignore_torn && !cetrafs_journal_target_intact(tbh))
+        return CETRAFS_JV_TORN;
+    return CETRAFS_JV_CHANGED;
+}
+
 /*
  * Replay node #node_id's journal area: if its flag says DIRTY, scan its
  * slots for valid entries (header magic + header CRC + payload CRC all
@@ -1208,48 +1248,111 @@ int cetrafs_journal_replay_node(struct super_block *sb, u32 node_id, bool wait_f
          * to see what is on the DEVICE right now, including writes a
          * peer made that this node has never had reason to re-read.
          * A cached copy would answer the question we are not asking. */
-        tbh = cetrafs_bread_uncached_retry(sb, entries[s].target_lba);
-        if (!tbh) {
-            brelse(pbh);
-            ret = -EIO;
-            goto out_free;
-        }
-
+        tbh = NULL;
+        apply = false;
         {
-            u32 tcrc = ~crc32c(~0U, tbh->b_data, CETRAFS_BLOCK_SIZE);
+            enum cetrafs_journal_verdict v;
+            unsigned int torn_tries = 0, moved = 0;
+            u32 tcrc;
 
-            if (cetrafs_journal_ignore_guard) {
+            for (;;) {
+                if (!tbh) {
+                    tbh = cetrafs_bread_uncached_retry(sb, entries[s].target_lba);
+                    if (!tbh) {
+                        brelse(pbh);
+                        ret = -EIO;
+                        goto out_free;
+                    }
+                }
+                tcrc = ~crc32c(~0U, tbh->b_data, CETRAFS_BLOCK_SIZE);
+                v = cetrafs_journal_judge(&entries[s], tbh, tcrc);
+
+                /*
+                 * TORN is a crash's tear -- or a LIVE writer's write in
+                 * flight, which a forced-fresh read of a 4 KiB block can
+                 * catch half-landed. Under nofilelock a live node may be
+                 * writing the dead one's blocks (the VM was restarted
+                 * there), and redoing then puts the dead node's image over
+                 * the live write. A write in flight converges in
+                 * milliseconds and a crash's tear never does: re-read with
+                 * backoff (~2.5 s in all) before believing it.
+                 */
+                if (v == CETRAFS_JV_TORN && torn_tries < CETRAFS_JOURNAL_TORN_RETRIES) {
+                    if (!torn_tries)
+                        pr_info("journal replay: node %u txn %llu target block %llu reads torn -- re-reading in "
+                                "case a live writer is mid-write\n",
+                                node_id, (unsigned long long) entries[s].txn_id,
+                                (unsigned long long) entries[s].target_lba);
+                    brelse(tbh);
+                    tbh = NULL;
+                    msleep(10U << torn_tries);
+                    torn_tries++;
+                    continue;
+                }
+                if (v != CETRAFS_JV_APPLY && v != CETRAFS_JV_APPLY_UNGUARDED && v != CETRAFS_JV_TORN)
+                    break;
+
+                if (unlikely(cetrafs_journal_replay_apply_pause_ms)) {
+                    pr_info("journal replay: pausing %ums before redoing target %llu\n",
+                            cetrafs_journal_replay_apply_pause_ms, (unsigned long long) entries[s].target_lba);
+                    msleep(cetrafs_journal_replay_apply_pause_ms);
+                }
+
+                /* CLAUDE.md rule 15: the verdict is only as good as its
+                 * distance from the act. Re-read immediately before the
+                 * redo and require the block to be what was judged; if it
+                 * moved, somebody is writing it -- judge again. A block
+                 * that keeps moving is being written by a live node and is
+                 * refused. (This narrows the gap; a 4 KiB block has no CAS
+                 * to close it.) */
+                brelse(tbh);
+                tbh = cetrafs_bread_uncached_retry(sb, entries[s].target_lba);
+                if (!tbh) {
+                    brelse(pbh);
+                    ret = -EIO;
+                    goto out_free;
+                }
+                if (~crc32c(~0U, tbh->b_data, CETRAFS_BLOCK_SIZE) == tcrc)
+                    break;
+                if (++moved > CETRAFS_JOURNAL_MOVED_RETRIES) {
+                    v = CETRAFS_JV_MOVING;
+                    break;
+                }
+            }
+
+            switch (v) {
+            case CETRAFS_JV_APPLY:
                 apply = true;
-            } else if (tcrc == entries[s].payload_checksum) {
-                /* The target write landed before the crash; only the
-                 * consume was lost. Applying would be byte-identical,
-                 * so skip the I/O. */
-                apply = false;
-                atomic64_inc(&cetrafs_journal_replay_skipped);
-            } else if (!(entries[s].flags & CETRAFS_JRNL_F_GUARDED)) {
-                /* Written by a module that predates prev_checksum. It
-                 * carries no proof either way, so behave as that module
-                 * did -- apply -- but say so: during a rolling upgrade
-                 * this is the window where the old hazard still exists. */
+                break;
+            case CETRAFS_JV_APPLY_UNGUARDED:
                 apply = true;
                 pr_warn("journal replay: node %u txn %llu (target %llu) predates the replay guard -- "
                         "applying unverified\n",
                         node_id, (unsigned long long) entries[s].txn_id, (unsigned long long) entries[s].target_lba);
-            } else if (tcrc == entries[s].prev_checksum) {
-                /* Untouched since the entry was written: the target
-                 * write never landed, and redo is exactly right. */
-                apply = true;
-            } else if (!cetrafs_journal_ignore_torn && !cetrafs_journal_target_intact(tbh)) {
-                /* TORN. Not a peer's newer write -- not a whole block at
-                 * all. Redo it: this is the case the journal exists for,
-                 * and refusing here leaves the block unreadable forever. */
+                break;
+            case CETRAFS_JV_TORN:
+                /* Still torn after the re-reads: not a peer's newer
+                 * write -- not a whole block at all. Redo it: this is the
+                 * case the journal exists for, and refusing here leaves
+                 * the block unreadable forever. */
                 apply = true;
                 atomic64_inc(&cetrafs_journal_replay_torn);
                 pr_warn("journal replay: node %u txn %llu target block %llu is TORN (fails its own tail "
                         "checksum) -- redoing it\n",
                         node_id, (unsigned long long) entries[s].txn_id,
                         (unsigned long long) entries[s].target_lba);
-            } else {
+                break;
+            case CETRAFS_JV_LANDED:
+                atomic64_inc(&cetrafs_journal_replay_skipped);
+                break;
+            case CETRAFS_JV_MOVING:
+                atomic64_inc(&cetrafs_journal_replay_refused);
+                pr_err("journal replay: node %u txn %llu target block %llu kept changing while replay looked at "
+                       "it -- a live node is writing it; NOT applying the entry\n",
+                       node_id, (unsigned long long) entries[s].txn_id,
+                       (unsigned long long) entries[s].target_lba);
+                break;
+            case CETRAFS_JV_CHANGED:
                 /* A COMPLETE image that is neither the before nor the
                  * after. Somebody has legitimately written this block
                  * since -- under nofilelock, typically the node HA moved
@@ -1257,7 +1360,6 @@ int cetrafs_journal_replay_node(struct super_block *sb, u32 node_id, bool wait_f
                  * Applying here is the corruption this guard exists to
                  * stop: a valid, CRC-correct, WRONG extent leaf that
                  * fsck cannot see. */
-                apply = false;
                 atomic64_inc(&cetrafs_journal_replay_refused);
                 pr_err("journal replay: node %u txn %llu target block %llu has changed since the entry was "
                        "written (crc %08x, expected %08x before / %08x after) -- NOT applying it. The block "
@@ -1265,6 +1367,7 @@ int cetrafs_journal_replay_node(struct super_block *sb, u32 node_id, bool wait_f
                        "guard exists for), or by a later local operation whose consume was lost\n",
                        node_id, (unsigned long long) entries[s].txn_id, (unsigned long long) entries[s].target_lba,
                        tcrc, entries[s].prev_checksum, entries[s].payload_checksum);
+                break;
             }
         }
 
