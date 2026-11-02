@@ -1,3 +1,123 @@
+cetrafs (0.9.3) unstable; urgency=medium
+
+  * No format version change: volumes made or grown by 0.9.2 mount as
+    they are. One field is new in the inode record, carved from padding
+    that is zero on every existing record. Several fixes below change
+    how nodes arbitrate with each other and protect only nodes that run
+    them: upgrade every node, and do not mount one volume from 0.9.2
+    and 0.9.3 at once.
+
+  * Fixed: a write could be sent to an address read off the disk
+    without asking whether a file may live there. An extent naming the
+    inode table made an ordinary write(2) overwrite inode records --
+    on a shared LUN, for every node. Extent and tree-block addresses
+    are now checked against the data regions before any I/O.
+
+  * Fixed: punch and truncate on a file with more than 65535 extents
+    edited only (n mod 65536) of them, losing the rest of the tree or
+    leaving a punched hole holding data.
+
+  * Fixed: preallocated space. fallocate(2) reaching a new extent leaf
+    recorded that block as written, so reading it returned whatever a
+    deleted file had left there; and writing into the middle of a
+    preallocation in a full leaf dropped the rest of it, so a VM image
+    could later hit ENOSPC on space it had reserved.
+
+  * Fixed, crash ordering: several references could reach the device
+    before what they name. Extent-tree edits waited on nothing while
+    the allocation bits they rely on were only cached; a leaf split
+    could be written destination-first, so a crash left blocks named
+    twice; link and rename added the second name before raising the
+    count; the journal replay consumed an entry without flushing its
+    redo; a close published the record before its tree flush was known
+    to have landed. Each now writes in the order whose crash leaves a
+    leak, never a block shared by two files.
+
+  * Fixed: write errors reported as success. Several synchronous
+    record, bitmap and journal writes ignored their result, or judged
+    it from a buffer flag that concurrent fresh reads clear -- either
+    losing a failed write silently or failing one that had landed.
+    Every synchronous buffer write now reports its own result.
+
+  * Fixed, cluster: a node could free or reuse blocks a peer was using.
+    The scrub could act on a verdict older than a released reservation;
+    a node that took over a Zone Group kept a stale view of which Block
+    Groups it owned; a released Block Group could be handed over with
+    frees still cached; a freed metadata block's dirty buffer could be
+    written over a peer's data; and an inode number could be reclaimed
+    by a peer's scrub while being created. All are now arbitrated on
+    the device.
+
+  * Fixed, cluster: a create that drew an inode number at the moment a
+    peer's scrub was reclaiming it could leave the number allocated
+    under the deleted file's record, which still named blocks since
+    given to other files -- fsck reported them shared, and freeing that
+    record would have freed live data. The create now waits for the
+    reclaim to finish and lets the bitmap, read fresh, decide who owns
+    the number. Found by the three-node release run, which also gained
+    a real write as its "node is serving again" probe.
+
+  * Fixed, cluster: locks and metadata. A last close cleared the file
+    lock before publishing the file's size and extents; an open could
+    claim the lock on a reused inode number; a namespace-lock retry
+    could clear a lock a local operation held; size, link count and
+    times could be written back from a stale merge over newer values;
+    two nodes moving directories into each other at once could detach
+    both from the tree; and flock(LOCK_EX) waited forever on a holder
+    that had died.
+
+  * Fixed, cluster: defrag could relocate a file another node had open
+    for read, freeing blocks that reader was still mapping through.
+    Defrag now requires the file to be open nowhere else.
+
+  * Changed, cluster: a write-open is refused while another node has
+    the file open for read, as a read-open already was while another
+    node held it for write -- one writer and nobody else, or readers
+    and no writer. Both are checked inside the same atomic swap that
+    takes the lock or publishes the reader. A node handing a file over
+    with flock(LOCK_UN) is marked as a writer, so the destination can
+    still take it and readers stay out until it is done.
+
+  * Performance: a read-only open re-read the inode record from the
+    device for every 4 KiB it mapped, holes included -- about 18 MB/s
+    on a fast FC array, and a VM's qcow2 backing file or a base image
+    shared by linked clones is read exactly this way. A reader now
+    trusts its cached map between the file's change stamps, re-checked
+    once a second: read-only reads went from 18 to over 2000 MB/s.
+    Buffered reads also use readahead now, and an extent-tree block is
+    checksum-verified whenever it is loaded from the device.
+
+  * Changed: a node mounting after a crash watches its old registry
+    row for two heartbeats (about 35 s by default) before re-attaching,
+    and refuses the mount if another machine is using it. Machines
+    with duplicate DMI UUIDs (cloned VMs, placeholder firmware) need
+    the new cetrafs.node_uuid module parameter.
+
+  * Tools: mkfs -f, fsck -r and growfs could decide a live node was gone
+    -- a lagging clock, a slow heartbeat interval or a registry row
+    caught mid-update -- and run on a mounted volume. The probe now
+    waits out the peer's advertised interval, re-reads torn rows, and
+    an offline repair's claim is judged by its renewals, never by
+    clocks. fsck no longer repairs around journal entries a mount will
+    replay, reports a queued free for a block still in use, and checks
+    and repairs a directory's size. growfs refuses a superblock the
+    mount would refuse.
+
+  * Performance: a streaming file's speculative run grows up to 16 MiB
+    (alloc_run_max_blocks), keeping sequential writes at full speed;
+    fiemap, SEEK_HOLE/SEEK_DATA and hole punching no longer go
+    quadratic on files with many extents; readdir no longer re-reads a
+    directory from its first block on every call.
+
+  * The module builds against the kernel 7.2 buffer-head API, and its
+    version string carries a hash of its source, so nodes on different
+    kernel builds can show that they run the same code. The test gate
+    is 243 suites and 2257 assertions and has also run under KASAN;
+    the image fuzzer now drives every path a mounted volume offers a
+    hostile record, defrag, mmap and O_DIRECT included.
+
+ -- Massimo Cetra <mcetra@gmail.com>  Mon, 02 Nov 2026 15:51:21 +0000
+
 cetrafs (0.9.2) unstable; urgency=medium
 
   * Most of this release comes from a detailed external review of the
