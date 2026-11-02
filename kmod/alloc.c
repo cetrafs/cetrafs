@@ -1470,8 +1470,47 @@ static bool cetrafs_alloc_force_foreign;
 module_param_named(alloc_force_foreign, cetrafs_alloc_force_foreign, bool, 0644);
 MODULE_PARM_DESC(alloc_force_foreign, "test-only: treat every Block Group as owned by another node");
 
+/*
+ * TEST-ONLY, one-shot: sleep this many ms after the next allocation's
+ * ownership check and before it takes alloc_mutex -- the window in which
+ * a Block Group release can hand the chosen group away
+ * (tests/kernel/alloc_vs_bg_release.sh). Cleared by the pause it causes.
+ */
+static unsigned int cetrafs_alloc_pause_before_lock_ms;
+module_param_named(alloc_pause_before_lock_ms, cetrafs_alloc_pause_before_lock_ms, uint, 0644);
+MODULE_PARM_DESC(alloc_pause_before_lock_ms, "TEST ONLY: one-shot pause between an allocation's ownership check and alloc_mutex");
+
+/*
+ * Called with alloc_mutex held, before any bit is set: has this Block
+ * Group left owned_bgs since the caller chose it?
+ *
+ * The choice (cetrafs_alloc_pick_bg() and friends) and the ownership
+ * check above both run BEFORE alloc_mutex, so they are a verdict, not a
+ * guarantee. A Block Group release drains the group by clearing its
+ * owned_bgs bit under this same mutex and then scans, syncs and hands it
+ * back without holding it -- so an allocation that chose the group, then
+ * waited for the mutex (behind a long punch, a run search, a retried
+ * descriptor read, or simply preemption), used to set its bit in a group
+ * already given away: the next owner read that block FREE and handed it
+ * out again, and our later writeback put our bitmap block over theirs.
+ *
+ * Re-tested here, under the mutex the drain takes, the two are ordered:
+ * either the bit lands before the drain and the release's bitmap scan
+ * sees it, or the drain comes first and the allocation gets -EAGAIN and
+ * chooses again. One bit test, no I/O (PERFORMANCE.md rule 1).
+ * tests/kernel/alloc_vs_bg_release.sh.
+ */
+static bool cetrafs_alloc_bg_gone(struct super_block *sb, u32 bg_id)
+{
+    return !cetrafs_sb_bg_is_ours(sb, bg_id);
+}
+
 static int cetrafs_alloc_check_owned(struct super_block *sb, u32 bg_id, const struct cetrafs_bg_geom *bg)
 {
+    unsigned int pause = xchg(&cetrafs_alloc_pause_before_lock_ms, 0);
+
+    if (pause)
+        msleep(pause);
     if (cetrafs_alloc_force_foreign)
         goto not_ours;
     if (cetrafs_sb_zg_owned_cached(sb, bg->owner_zg))
@@ -1500,6 +1539,10 @@ int cetrafs_alloc_data_block(struct super_block *sb, u32 bg_id, u64 *out_lba)
         return ret;
 
     cetrafs_sb_alloc_lock(sb);
+    if (cetrafs_alloc_bg_gone(sb, bg_id)) {
+        cetrafs_sb_alloc_unlock(sb);
+        return -EAGAIN;
+    }
     /* Run-aware placement: try to start the new extent at
      * the head of a decent free run -- 4 MiB, then 1 MiB, then 128 KiB --
      * before degrading to plain first-fit. The contiguity hint
@@ -1585,6 +1628,8 @@ int cetrafs_alloc_block_anywhere(struct super_block *sb, u32 *out_bg, u64 *out_l
                 *out_bg = bg;
             return 0;
         }
+        if (ret == -EAGAIN) /* released since the pick: choose again, nothing to recount */
+            continue;
         if (ret != -ENOSPC)
             return ret;
 
@@ -1594,7 +1639,7 @@ int cetrafs_alloc_block_anywhere(struct super_block *sb, u32 *out_bg, u64 *out_l
         pr_warn_ratelimited("alloc: BG %u reported free space but its bitmap is full -- recounted (delta %lld)\n", bg,
                             (long long) delta);
     }
-    return ret;
+    return ret == -EAGAIN ? -ENOSPC : ret;
 }
 
 int cetrafs_alloc_data_block_near(struct super_block *sb, u32 bg_id, u64 preferred_lba, u64 *out_lba)
@@ -1617,6 +1662,10 @@ int cetrafs_alloc_data_block_near(struct super_block *sb, u32 bg_id, u64 preferr
             u64 bit = preferred_lba - bg.start_block - bg.off_data_region;
 
             cetrafs_sb_alloc_lock(sb);
+            if (cetrafs_alloc_bg_gone(sb, bg_id)) {
+                cetrafs_sb_alloc_unlock(sb);
+                return -EAGAIN;
+            }
             ret = cetrafs_bitmap_try_alloc_exact(sb, bg.start_block + bg.off_data_bmap,
                                                  bg.off_data_region - bg.off_data_bmap, bg.data_block_count, bit,
                                                  /*sync=*/false);
@@ -1687,6 +1736,10 @@ u32 cetrafs_alloc_run_after(struct super_block *sb, u32 bg_id, u64 start_lba, u3
     first_bit = start_lba - bg.start_block - bg.off_data_region;
 
     cetrafs_sb_alloc_lock(sb);
+    if (cetrafs_alloc_bg_gone(sb, bg_id)) {
+        cetrafs_sb_alloc_unlock(sb);
+        return 0; /* best effort: no run from a group we no longer own */
+    }
     while (got < max && first_bit + got < bg.data_block_count) {
         if (cetrafs_bitmap_try_alloc_exact(sb, bmap_lba, bmap_blocks, bg.data_block_count, first_bit + got,
                                            /*sync=*/false))
@@ -1746,6 +1799,10 @@ int cetrafs_alloc_data_run_resv(struct super_block *sb, u32 bg_id, u64 count, u6
     bmap_blocks = bg.off_data_region - bg.off_data_bmap;
 
     cetrafs_sb_alloc_lock(sb);
+    if (cetrafs_alloc_bg_gone(sb, bg_id)) {
+        ret = -EAGAIN;
+        goto out_unlock;
+    }
 
     for (bit = 0; bit < bg.data_block_count && !found; bit++) {
         bool set = false;
@@ -2638,9 +2695,12 @@ static int cetrafs_bg_release_mutate(void *image, unsigned int len, void *priv)
  * The node keeps the Zone Group and keeps allocating from it, so the
  * window this opens is its OWN allocator taking a block between the
  * emptiness check and the swap. That is same-node, and it is closed by
- * clearing the Block Group from owned_bgs BEFORE looking: the allocator
- * consults nothing else, so from that moment it cannot pick this Block
- * Group. If the release then fails, the bit goes back.
+ * clearing the Block Group from owned_bgs BEFORE looking. The allocator
+ * CHOOSES from owned_bgs outside alloc_mutex, so clearing the bit alone
+ * did not stop an allocation that had already chosen this group; what
+ * does is that every allocator re-tests the bit under alloc_mutex, the
+ * mutex the drain clears it under (cetrafs_alloc_bg_gone()). If the
+ * release then fails, the bit goes back.
  */
 /*
  * TEST-ONLY. Hand a Block Group back without confirming it is empty.

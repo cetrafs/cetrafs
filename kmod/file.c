@@ -3455,6 +3455,8 @@ static int __cetrafs_get_block(struct inode *inode,
                  * extent-leaf write (~38 ms on the real LUN).
                  * docs/PERFORMANCE.md */
                 ret = cetrafs_alloc_data_block_near(sb, bg_id, preferred_lba, &lba);
+                if (ret == -EAGAIN) /* the group was released after we chose it: choose again */
+                    continue;
                 if (ret != -ENOSPC)
                     break;
 
@@ -3473,6 +3475,8 @@ static int __cetrafs_get_block(struct inode *inode,
                     usleep_range(50, 200);
                 }
             }
+            if (ret == -EAGAIN) /* every attempt lost its group to a release: as out of retries */
+                ret = -ENOSPC;
             if (ret)
                 return ret;
 
@@ -3999,7 +4003,7 @@ static int cetrafs_do_allocate(struct inode *inode, loff_t offset, loff_t len, b
         if (ret)
             goto out;
         ret = cetrafs_alloc_data_block_near(sb, bg_id, hint, &lba);
-        if (ret == -ENOSPC) /* the BG's count may be lying -- see the helper */
+        if (ret == -ENOSPC || ret == -EAGAIN) /* count lying, or group released since the pick -- see the helper */
             ret = cetrafs_alloc_block_anywhere(sb, &bg_id, &lba);
         if (ret)
             goto out;

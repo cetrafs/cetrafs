@@ -1234,10 +1234,13 @@ static int cetrafs_zg_try_release_one(struct super_block *sb, u32 zg_id, u32 my_
 
     /*
      * Everything the per-Block-Group release does, for every member:
-     * take them out of the allocator's reach FIRST (the drain waits out
-     * an allocation already holding alloc_mutex, and none can start
-     * after), then let the counts -- now including our own deltas --
-     * and then the bitmaps decide, and make those bitmaps durable before
+     * take them out of the allocator's reach FIRST (the drain clears
+     * owned_bgs under alloc_mutex, and every allocator re-tests that bit
+     * under the same mutex before it sets one -- an allocation that
+     * chose a member before the drain gets -EAGAIN and chooses again;
+     * see cetrafs_alloc_bg_gone()), then let the counts -- now
+     * including our own deltas -- and then the bitmaps decide, and make
+     * those bitmaps durable before
      * the CAS hands them to the next owner, who reconciles from the
      * device. Without the drain an allocation could land between the
      * emptiness check and the CAS, in a Zone Group we no longer own;
@@ -2052,7 +2055,7 @@ int cetrafs_alloc_pick_run_resv(struct super_block *sb, u64 count, u64 *out_lba,
         ret = cetrafs_alloc_data_run_resv(sb, bgi, count, out_lba, span);
         if (ret == 0)
             return 0;
-        if (ret != -ENOSPC)
+        if (ret != -ENOSPC && ret != -EAGAIN) /* -EAGAIN: released since we looked, try the next */
             return ret;
     }
 
