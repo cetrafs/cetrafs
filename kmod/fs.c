@@ -2005,6 +2005,7 @@ bool cetrafs_sb_peer_progress_stale(struct super_block *sb, u32 node_id, u64 hb_
 void cetrafs_free_sb_info(struct super_block *sb)
 {
     struct cetrafs_sb_info *sbi = sb->s_fs_info;
+    int flush_err = 0, r;
 
     if (!sbi)
         return;
@@ -2040,7 +2041,14 @@ void cetrafs_free_sb_info(struct super_block *sb)
     /* Park the journal flag and push the accrued free-space counters
      * out BEFORE announcing the departure below. See the sync there. */
     cetrafs_journal_shutdown(sb);
-    cetrafs_flush_dirty_free_counts(sb);
+    /* Allocation bits first, then the counters that summarise them --
+     * the same order as sync_fs. sync_fs already ran in
+     * generic_shutdown_super(), but the VFS ignores its result there, so
+     * this is the only place a failure can still change anything. */
+    flush_err = cetrafs_alloc_flush_bitmaps(sb);
+    r = cetrafs_flush_dirty_free_counts(sb);
+    if (r && !flush_err)
+        flush_err = r;
     /* Everything this node had to say must be ON THE DEVICE before it
      * says it is gone.
      *
@@ -2053,8 +2061,11 @@ void cetrafs_free_sb_info(struct super_block *sb)
      *
      * Not reproducible on one kernel (the peer is the other half), so
      * this is reasoned rather than measured -- ctest owns the proof. */
-    if (sb->s_bdev)
-        sync_blockdev(sb->s_bdev);
+    if (sb->s_bdev) {
+        r = sync_blockdev(sb->s_bdev);
+        if (r && !flush_err)
+            flush_err = r;
+    }
     /* Signal this node's deliberate departure on the way out -- clean
      * unmount (or a later-failing mount attempt after registration
      * already succeeded) used to leave this node's row looking exactly
@@ -2072,7 +2083,17 @@ void cetrafs_free_sb_info(struct super_block *sb)
      * (generic_shutdown_super()) has no way to fail unmount over this,
      * and leaving the row to time out via the ordinary stale path is
      * still safe, just slower. */
-    if (sbi->node_registered && !READ_ONCE(sbi->fenced)) {
+    if (sbi->node_registered && !READ_ONCE(sbi->fenced) && flush_err) {
+        /* Something of ours did not reach the device, so this is not a
+         * clean departure and must not be announced as one: a peer
+         * would take our Zone Groups at once, reconciling from bitmaps
+         * that miss our allocations. Left un-announced, the row goes
+         * stale and peers reclaim it as a crashed node's -- fenced,
+         * journal replayed -- which is what it is. */
+        pr_err("unmount: final flush failed (%d) -- not announcing a clean departure; row %u will go stale and "
+               "be reclaimed as a crashed node's\n",
+               flush_err, sbi->node_id);
+    } else if (sbi->node_registered && !READ_ONCE(sbi->fenced)) {
         /* A fenced node writes NOTHING, its own row included -- peers
          * already treat it as dead, and the row is already stale from
          * the stopped heartbeat that got it fenced in the first place. */
