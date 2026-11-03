@@ -277,11 +277,20 @@ ct_summary() {
     fi
 }
 
+CT_DMESG_FAULT_RE='BUG:|Oops|Call trace|WARNING:|Busy inodes after unmount|blocked for more than|rcu.*stall|UBSAN:|general protection fault|Unable to handle kernel'
+
 ct_check_dmesg() {
     [ -n "${CT_QUIET:-}" ] && return 0
     [ -z "${CT_DMESG_MARK:-}" ] && return 0
     [ -n "${CT_ALLOW_DMESG_WARN:-}" ] && return 0
-    if dmesg_since "$CT_DMESG_MARK" | grep -qiE 'BUG:|Oops|Call trace|WARNING:'; then
+    # Not only the crash banners. "Busy inodes after unmount" is the VFS
+    # finding an inode still pinned when the superblock goes -- the one
+    # visible sign of async work outliving the mount, printed BEFORE that
+    # work Oopses on freed state, possibly seconds after the suite ended.
+    # It was missing here, and a field Oops on 0.9.3 was exactly that.
+    # Hung tasks, RCU stalls and UBSAN reports carry no BUG:/WARNING:
+    # banner either.
+    if dmesg_since "$CT_DMESG_MARK" | grep -qiE "$CT_DMESG_FAULT_RE"; then
         fail "dmesg shows a BUG/Oops/WARNING during this suite"
         # Print the FRAMES, not just the banner. Grepping for the
         # matching lines alone keeps "WARNING: ... at foo+0x138" and
@@ -290,7 +299,7 @@ ct_check_dmesg() {
         # that detects a fault and discards the evidence turns a
         # reproducible failure into a mystery, and these faults are
         # often load-dependent and do not reproduce on demand.
-        dmesg_since "$CT_DMESG_MARK" | grep -iE -A 30 'BUG:|Oops|WARNING:' | head -80
+        dmesg_since "$CT_DMESG_MARK" | grep -iE -A 30 "$CT_DMESG_FAULT_RE" | head -80
     else
         pass "no BUG/Oops/WARNING in dmesg during this suite"
     fi
