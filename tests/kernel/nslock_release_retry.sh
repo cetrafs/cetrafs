@@ -37,10 +37,15 @@ mkdir "$MNT/d"
 DINO="$(stat -c '%i' "$MNT/d")"
 sync
 
+: > "$MNT/d/f"
+sync
 MARK="$(dmesg_mark)"
-# A namespace operation whose release cannot commit.
+# A release with nothing STAGED: setattr on a file locks the file's own
+# record and writes it directly. A release that loses a staged update (a
+# create's directory dirent_seq/size/nlink) stops the mount instead --
+# tests/kernel/nslock_staged_publish_lost.sh.
 ct_param_set nslock_release_fail 1
-: > "$MNT/d/f" 2>/dev/null || true
+chmod 600 "$MNT/d/f" 2>/dev/null || true
 sync
 ct_param_set nslock_release_fail 0
 

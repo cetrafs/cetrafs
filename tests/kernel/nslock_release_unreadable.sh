@@ -34,15 +34,20 @@ ct_mount "$DEV" "$MNT"
 require_cetrafs_mount "$MNT"
 
 mkdir "$MNT/d"
-DINO="$(stat -c '%i' "$MNT/d")"
+: >"$MNT/d/f"
+DINO="$(stat -c '%i' "$MNT/d/f")" # the file's own lock: see below
 sync
 ns_owner() { "$LOCK_POKE" "$DEV" "$DINO" | sed -n 's/.*ns_owner=\([0-9]*\).*/\1/p'; }
-[ "$(ns_owner)" = "$NONE" ] && pass "setup: the directory's namespace lock starts free" ||
+[ "$(ns_owner)" = "$NONE" ] && pass "setup: the file's namespace lock starts free" ||
     { fail "setup: ns_owner=$(ns_owner) before anything ran"; ct_exit; }
 
 MARK="$(dmesg_mark)"
+# A release with nothing STAGED: setattr on a file locks the file's own
+# record and writes it directly. A release that loses a staged update (a
+# create's directory dirent_seq/size/nlink) stops the mount instead --
+# tests/kernel/nslock_staged_publish_lost.sh.
 ct_param_set nslock_release_read_fail 1
-: >"$MNT/d/f" 2>/dev/null || true
+chmod 600 "$MNT/d/f" 2>/dev/null || true
 ct_param_set nslock_release_read_fail 0
 if dmesg_since "$MARK" | grep -q "queued for retry"; then
     pass "setup: the release could not read the record and was queued"

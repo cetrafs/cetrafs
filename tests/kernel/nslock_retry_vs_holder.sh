@@ -38,13 +38,18 @@ ct_mount "$DEV" "$MNT"
 require_cetrafs_mount "$MNT"
 
 mkdir "$MNT/d"
-DINO="$(stat -c '%i' "$MNT/d")"
+: >"$MNT/d/f"
+DINO="$(stat -c '%i' "$MNT/d/f")" # the file's own lock: see below
 sync
 ns_owner() { sed -n 's/.* ns_owner=\([0-9]*\) .*/\1/p' <<<"$("$LPOKE" "$BACK" "$DINO")"; }
 
 MARK="$(dmesg_mark)"
+# A release with nothing STAGED: setattr on a file locks the file's own
+# record and writes it directly. A release that loses a staged update (a
+# create's directory dirent_seq/size/nlink) stops the mount instead --
+# tests/kernel/nslock_staged_publish_lost.sh.
 ct_param_set nslock_release_fail 1
-: >"$MNT/d/f" 2>/dev/null || true
+chmod 600 "$MNT/d/f" 2>/dev/null || true
 ME="$(ns_owner)"
 LOG="$(dmesg_since "$MARK")"
 if grep -q "queued for retry" <<<"$LOG" && [ -n "$ME" ] && [ "$ME" != 65535 ]; then
@@ -54,11 +59,11 @@ else
     ct_exit
 fi
 
-# A second operation on the same directory, holding the lock for 4 s.
+# A second operation on the same file, holding the lock for 4 s.
 # The release failure stays armed while it acquires, so the retry cannot
 # settle the entry first; then it is lifted and the next tick may commit.
 ct_param_set nslock_hold_ms 4000
-(: >"$MNT/d/g") &
+(chmod 640 "$MNT/d/f") &
 OP=$!
 sleep 0.5
 ct_param_set nslock_release_fail 0

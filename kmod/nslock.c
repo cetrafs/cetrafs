@@ -179,6 +179,19 @@ static int cetrafs_nslock_mutate(void *image, unsigned int len, void *priv)
         if (!free_now && !mine_already && !stealable)
             return -EBUSY;
 
+        /* Taken from a previous holder -- a dead peer, or a release of
+         * ours that never committed -- a DIRECTORY's entries may have
+         * changed under a dirent_seq that did not: that holder's journal
+         * just replayed, or its entries were written and its publish
+         * lost. Peers whose cached stamp still equals the record's would
+         * go on serving the old directory until somebody's next change
+         * to it. A fresh stamp makes every one of them read it again:
+         * the safe direction, one extra re-read. Directories only: on a
+         * file record the field is the reclaim claim's stamp
+         * (cetrafs_inode_reclaim_claim()). */
+        if (!free_now && ctx->sb && S_ISDIR(cetrafs_le32(rec.mode)))
+            rec.dirent_seq = cetrafs_cpu_to_le64(cetrafs_inode_new_generation(ctx->sb));
+
         rec.ns_lock_owner = cetrafs_cpu_to_le32(ctx->my_node_id);
     } else {
         if (cetrafs_le32(rec.ns_lock_owner) != ctx->my_node_id) {
@@ -303,7 +316,7 @@ out:
 static int cetrafs_nslock_try(struct inode *inode, u32 my_node_id)
 {
     struct super_block *sb = inode->i_sb;
-    struct cetrafs_nslock_ctx ctx = {.my_node_id = my_node_id, .acquire = true};
+    struct cetrafs_nslock_ctx ctx = {.my_node_id = my_node_id, .acquire = true, .sb = inode->i_sb};
     cetrafs_inode_t raw;
     int ret;
 
@@ -580,6 +593,17 @@ void cetrafs_nslock_release(struct inode *inode)
                 "took it\n",
                 (unsigned long long) inode->i_ino, ctx.clobbered);
     else if (ret < 0 && ret != -ESTALE) {
+        /* The staged update -- the directory's dirent_seq, size, nlink
+         * -- is lost with this swap: the deferred retry below only clears
+         * the lock. The entries are on the device and the record that
+         * describes them is not, so peers keep serving the old directory
+         * and a link count may be left low. Kind 3, like the
+         * out-of-memory case above (docs/internal/ERRORS.md); whoever
+         * breaks this lock afterwards stamps a fresh dirent_seq. */
+        if (have_staged)
+            cetrafs_sb_fatal(sb, "nslock: ino=%llu release: the swap that publishes its staged record update "
+                                 "did not commit after %d attempts (%d)",
+                             (unsigned long long) inode->i_ino, CETRAFS_NSLOCK_RELEASE_RETRIES, ret);
         /* Remember it and retry on the heartbeat. "Leaving it for
          * stale-reclaim" describes what used to happen accurately and
          * is a poor outcome: stale reclaim only fires for a node that
