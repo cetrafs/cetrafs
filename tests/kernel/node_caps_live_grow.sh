@@ -38,8 +38,11 @@ grep -q "(this node)" "$CLUSTER" &&
     fail "this node is not in the cluster view -- registration did not take"
 
 MYLINE="$(grep "(this node)" "$CLUSTER")"
-printf '%s\n' "$MYLINE" | grep -q "caps=0x1" &&
-    pass "this node advertises caps=0x1 (CETRAFS_NODE_CAP_LIVE_GROW)" ||
+# Test the bit, not the whole word: a loop device has no CAW, so the
+# row also carries CETRAFS_NODE_CAP_NO_CAW (0x2).
+MYCAPS="$(printf '%s\n' "$MYLINE" | grep -o "caps=0x[0-9a-f]*" | cut -d= -f2)"
+[ -n "$MYCAPS" ] && [ $((MYCAPS & 0x1)) -ne 0 ] &&
+    pass "this node advertises CETRAFS_NODE_CAP_LIVE_GROW (caps=$MYCAPS)" ||
     fail "this node's row does not advertise the live-grow cap: $MYLINE"
 
 grep -q "^live_grow_ready: yes" "$CLUSTER" &&
