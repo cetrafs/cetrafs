@@ -391,6 +391,15 @@ static int cetrafs_caw_scsi(struct scsi_device *sdev,
                 pr_err_ratelimited("CAW lba=%llu failed: sense key 0x%x asc=0x%02x ascq=0x%02x\n",
                                    (unsigned long long) lba, sshdr.sense_key, sshdr.asc, sshdr.ascq);
             }
+        } else if (ret > 0 && (ret & 0xff) == SAM_STAT_RESERVATION_CONFLICT) {
+            /* A STATUS, not sense data, so it used to land in the
+             * no-sense branch below and be reported as an UNKNOWN
+             * outcome. It is the opposite: the target refused the
+             * command without executing it (SAM), so the swap did not
+             * happen -- a definite failure, which the layers above may
+             * act on as one. */
+            pr_err_ratelimited("CAW lba=%llu refused: RESERVATION CONFLICT (not executed)\n",
+                               (unsigned long long) lba);
         } else {
             /*
              * No valid sense: the target never answered. A timeout says

@@ -1950,14 +1950,34 @@ int cetrafs_alloc_data_run_resv(struct super_block *sb, u32 bg_id, u64 count, u6
         ret = cetrafs_bitmap_try_alloc_exact(sb, bmap_lba, bmap_blocks, bg.data_block_count, run_start + b,
                                              /*sync=*/false);
         if (ret) {
-            /* can't happen while we hold the alloc mutex (sole local
-             * allocator, sole owner of the BG) -- but if it somehow
-             * does, roll back what we took and fail loudly. */
-            cetrafs_sb_fatal(sb, "defrag run alloc: bit %llu of a scanned-free run was taken under the alloc mutex",
-                             (unsigned long long) (run_start + b));
-            while (b--)
-                cetrafs_bitmap_free_bit(sb, bmap_lba, bmap_blocks, run_start + b, false);
-            ret = -ENOSPC;
+            int err = ret;
+
+            /* -ENOSPC: a bit this scan found free was taken. That cannot
+             * happen while we hold the alloc mutex (sole local allocator,
+             * sole owner of the BG), so memory and disk disagree: stop
+             * (docs/internal/ERRORS.md). Anything else is the device
+             * failing the read, which is the caller's error to see as it
+             * is -- it used to be stopped as the impossible case and
+             * reported as ENOSPC, sending the defragmenter to look for
+             * space instead of reporting a failing disk. */
+            if (err == -ENOSPC) {
+                cetrafs_sb_fatal(sb,
+                                 "defrag run alloc: bit %llu of a scanned-free run was taken under the alloc mutex",
+                                 (unsigned long long) (run_start + b));
+                err = -EIO;
+            }
+            /* Give back what we took. A give-back that fails leaves the
+             * bit set: a leak the scrub reclaims, never a block shared --
+             * but it is said, not swallowed. */
+            while (b--) {
+                int rc = cetrafs_bitmap_free_bit(sb, bmap_lba, bmap_blocks, run_start + b, false);
+
+                if (rc)
+                    pr_err_ratelimited("defrag run alloc: could not give back bit %llu of BG %u (%d) -- left "
+                                       "allocated for the scrub\n",
+                                       (unsigned long long) (run_start + b), bg_id, rc);
+            }
+            ret = err;
             goto out_unlock;
         }
     }
@@ -2404,6 +2424,20 @@ static int __cetrafs_free_data_extent(struct super_block *sb, u64 lba, u32 count
      * queue for and the direct free is correct (this is also what keeps
      * the loop harness on the fast path).
      */
+    /* A Block Group goes back to the unowned pool only once it is EMPTY
+     * (cetrafs_bg_release_empty()), so an extent that points into one
+     * describes blocks nobody allocated: damage, not a free. Its bitmap
+     * is nobody's to change -- the next claimer owns it -- and there is
+     * no queue to send it to. This used to fail inside the queue lookup
+     * with -EINVAL, unlogged, and every caller drops a free's error. */
+    if (bg.owner_zg == CETRAFS_BG_OWNER_FREE) {
+        pr_err_ratelimited("free: extent [%llu +%u) is in BG %u, which no Zone Group owns -- a reference to "
+                           "unallocated blocks; not freeing (fsck)\n",
+                           (unsigned long long) lba, count, bg_id);
+        cetrafs_sb_corrupt(sb, 0);
+        return -EUCLEAN;
+    }
+
     if (cetrafs_sb_caw_available(sb) || cetrafs_pf_force_foreign) {
         if (cetrafs_pf_force_foreign || !cetrafs_sb_zg_owned_cached(sb, bg.owner_zg)) {
             ret = cetrafs_zg_queue_foreign_free(sb, bg.owner_zg, lba, count);

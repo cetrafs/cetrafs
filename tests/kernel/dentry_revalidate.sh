@@ -48,6 +48,10 @@ if OUT="$(stat -c '%h' "$MNT/v" 2>&1)"; then
     fail "stat still resolved the cached dentry after the record went to nlink=0 (reported nlink=$OUT)"
 else
     pass "stat refuses a cached dentry whose record says nlink=0"
+    # The file is gone: ENOENT, not the NFS "Stale file handle" iget's
+    # -ESTALE used to reach userspace as.
+    grep -q "No such file or directory" <<<"$OUT" && pass "and says the file does not exist (ENOENT)" ||
+        fail "the refusal reads '$OUT', not ENOENT"
 fi
 if OUT="$(cat "$MNT/v" 2>&1)"; then
     fail "open/read still served the deleted file: '$OUT'"

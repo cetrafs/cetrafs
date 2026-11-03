@@ -137,8 +137,14 @@ static bool is_device_nonempty(int fd, u64 blocks_to_scan, u32 *found_magic)
     if (!buf)
         return true; /* conservative */
 
-    /* check block 0 for our magic */
-    if (pread(fd, buf, CETRAFS_BLOCK_SIZE, 0) == (ssize_t) CETRAFS_BLOCK_SIZE) {
+    /* check block 0 for our magic. A read that fails is not an empty
+     * device: it is one we cannot see, and this check is what stands
+     * between -f-less mkfs and an existing volume. */
+    if (pread(fd, buf, CETRAFS_BLOCK_SIZE, 0) != (ssize_t) CETRAFS_BLOCK_SIZE) {
+        free(buf);
+        return true; /* conservative */
+    }
+    {
         /* The magic is __le32 on the device. Reading it in NATIVE byte
          * order compares the wrong number on a big-endian host, where
          * an existing cetrafs volume would read as empty and this
@@ -168,8 +174,14 @@ static bool is_device_nonempty(int fd, u64 blocks_to_scan, u32 *found_magic)
 
     /* scan a few more blocks */
     for (u64 b = 1; b < blocks_to_scan; ++b) {
-        if (pread(fd, buf, CETRAFS_BLOCK_SIZE, (off_t) b * CETRAFS_BLOCK_SIZE) != (ssize_t) CETRAFS_BLOCK_SIZE)
-            break;
+        ssize_t got = pread(fd, buf, CETRAFS_BLOCK_SIZE, (off_t) b * CETRAFS_BLOCK_SIZE);
+
+        if (got < 0) {
+            free(buf);
+            return true; /* an I/O error: cannot tell, so not "empty" */
+        }
+        if (got != (ssize_t) CETRAFS_BLOCK_SIZE)
+            break; /* the end of a small device */
         for (size_t i = 0; i < CETRAFS_BLOCK_SIZE; ++i)
             if (buf[i] != 0) {
                 free(buf);

@@ -68,8 +68,14 @@ static inline int cetrafs_device_mounted(const char *dev, char *where, size_t wh
         return 0;
 
     f = fopen("/proc/self/mounts", "r");
-    if (!f)
-        return 0; /* can't tell -- fall through to the caller's own open-time errors */
+    if (!f) {
+        /* Cannot tell is not "not mounted": every caller is about to
+         * write the device, and the open-time errors it used to rely on
+         * do not fire for a block device a kernel has mounted. */
+        if (where && where_len)
+            snprintf(where, where_len, "(unknown: /proc/self/mounts unreadable: %s)", strerror(errno));
+        return 1;
+    }
 
     while (fscanf(f, "%4095s %4095s %*[^\n]", src, mnt) == 2) {
         if (stat(src, &st) != 0 || !S_ISBLK(st.st_mode))

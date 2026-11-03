@@ -1380,6 +1380,14 @@ static struct dentry *cetrafs_lookup(struct inode *dir, struct dentry *dentry, u
 
     if (ctx.ino) {
         inode = cetrafs_iget(dir->i_sb, ctx.ino);
+        /* -ESTALE out of iget means one thing: the name points at a
+         * record that says nlink=0 -- a file a peer has deleted while
+         * this directory view still names it, or a dangling entry fsck
+         * reports. The file does not exist; "Stale file handle" is an
+         * NFS answer to a question nobody asked, and the VFS spends a
+         * LOOKUP_REVAL retry on it first. iget has already logged it. */
+        if (inode == ERR_PTR(-ESTALE))
+            return ERR_PTR(-ENOENT);
         if (IS_ERR(inode))
             return ERR_CAST(inode);
     }

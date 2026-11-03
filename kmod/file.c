@@ -3804,12 +3804,38 @@ static int cetrafs_write_begin(const struct kiocb *iocb,
  * do_writepages() silently no-ops when .writepages is unset -- so data
  * would vanish on umount despite looking fine within the same mount.
  */
+/*
+ * Writeback maps with create=1 and holds neither inode_lock nor
+ * invalidate_lock -- so it must never be the one that allocates or
+ * converts: that would mutate the extent tree beside a fault or a write
+ * that holds the lock (CLAUDE.md rules 17-18). It never should be:
+ * write_begin and page_mkwrite allocate and convert every block of a
+ * page, under invalidate_lock, before the page can be dirty. Asserted
+ * here, not assumed. buffer_new() is set exactly when get_block
+ * allocated or converted; refusing at that point would be worse than
+ * going on (the block is already mapped, with undefined contents until
+ * this write lands), so it is reported -- loudly, and as a WARN, which
+ * fails every suite that reaches it.
+ */
+static int cetrafs_get_block_writeback(struct inode *inode, sector_t iblock, struct buffer_head *bh, int create)
+{
+    int ret = cetrafs_get_block(inode, iblock, bh, create);
+
+    if (!ret && buffer_new(bh)) {
+        pr_err_ratelimited("ino=%llu: writeback allocated/converted block %llu -- every block should be mapped "
+                           "before its page is dirtied\n",
+                           (unsigned long long) inode->i_ino, (unsigned long long) iblock);
+        WARN_ON_ONCE(1);
+    }
+    return ret;
+}
+
 static int cetrafs_writepages(struct address_space *mapping, struct writeback_control *wbc)
 {
     if (cetrafs_sb_is_fenced(mapping->host->i_sb))
         return -EIO; /* self-fenced: dirty data never reaches the device */
 
-    return mpage_writepages(mapping, wbc, cetrafs_get_block);
+    return mpage_writepages(mapping, wbc, cetrafs_get_block_writeback);
 }
 
 /*
@@ -4080,6 +4106,24 @@ static int cetrafs_zero_range(struct address_space *mapping, loff_t from, size_t
 
     if (!len)
         return 0;
+
+    /* A hole, or a block fallocate reserved and nobody wrote, already
+     * reads as zeroes, so there is nothing to zero -- and going through
+     * write_begin ALLOCATED (or converted) it to write zeroes into it:
+     * a punch, which only gives space back, failing with ENOSPC on a
+     * full volume (a TRIM from a guest, say). Same create=0 answer the
+     * read path serves; the caller holds invalidate_lock, so it cannot
+     * change underneath. */
+    {
+        struct inode *inode = mapping->host;
+        struct buffer_head probe = {.b_size = i_blocksize(inode)};
+
+        ret = cetrafs_get_block_read(inode, from >> inode->i_blkbits, &probe, 0);
+        if (ret)
+            return ret;
+        if (!buffer_mapped(&probe))
+            return 0;
+    }
 
     ret = cetrafs_write_begin_held(mapping, from, len, &folio); /* the punch holds invalidate_lock */
     if (ret)
