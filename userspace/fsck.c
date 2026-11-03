@@ -2707,8 +2707,28 @@ int main(int argc, char **argv)
             if (!cetrafs_inode_crcs_ok(&in))
                 continue; /* already reported above */
 
-            if (!is_dir[ino] || cetrafs_le16(in.eh.eh_magic) != CETRAFS_EXT_MAGIC || cetrafs_le16(in.eh.eh_depth) > 1)
+            if (!is_dir[ino])
                 continue;
+            /*
+             * A directory the walk cannot follow used to be skipped in
+             * silence. Its names are then invisible to the reference
+             * count: a child named only there reads as unreachable, one
+             * also named elsewhere has its nlink "repaired" DOWN -- the
+             * destructive direction, a later unlink of the other name
+             * freeing an inode this directory still names. The kernel
+             * refuses such a directory (directories never grow past
+             * depth 1), so it is a fault, and one this run cannot repair
+             * around.
+             */
+            if (cetrafs_le16(in.eh.eh_magic) != CETRAFS_EXT_MAGIC || cetrafs_le16(in.eh.eh_depth) > 1) {
+                fprintf(stderr,
+                        "ERR: directory inode %" PRIu64 " has an extent tree a directory cannot have (magic=0x%x "
+                        "depth=%u) -- its entries cannot be read\n",
+                        ino, cetrafs_le16(in.eh.eh_magic), cetrafs_le16(in.eh.eh_depth));
+                problems++;
+                repair_block("a directory's entries cannot be read, so no link count can be trusted");
+                continue;
+            }
             /* Its blocks are about to be walked, so '.'/'..' recorded
              * below are meaningful for it. A directory skipped above was
              * never looked at and must not be reported as missing them. */
