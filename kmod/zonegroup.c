@@ -138,6 +138,7 @@ static int cetrafs_read_zg(struct super_block *sb, u32 zg_id, cetrafs_zone_group
     }
 
     pr_err("ZG %u failed its checksum repeatedly -- corrupted, not just a torn concurrent read\n", zg_id);
+    cetrafs_sb_corrupt(sb, 0);
     return -EUCLEAN;
 }
 
@@ -1850,6 +1851,7 @@ static int cetrafs_zg_drain_one(struct super_block *sb, u32 zg_id)
                 if (cetrafs_le32(ent[e].magic) != CETRAFS_PENDING_FREE_MAGIC || cetrafs_le32(ent[e].count) == 0) {
                     pr_err("pending free: ZG %u queue block %u entry %u is garbage (magic=0x%x count=%u) -- dropping\n",
                            zg_id, qb, e, ent[e].magic, ent[e].count);
+                    cetrafs_sb_corrupt(sb, 0);
                     continue; /* the CAS below clears it */
                 }
                 ctx->done[ctx->n].lba = cetrafs_le64(ent[e].lba);

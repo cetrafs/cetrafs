@@ -180,6 +180,7 @@ static struct buffer_head *cetrafs_dirent_bread(struct super_block *sb, u64 lba)
 
     pr_err("dirent block %llu failed its tail checksum %d times -- corrupted, not just a torn concurrent read\n",
            (unsigned long long) lba, CETRAFS_DIRENT_READ_RETRIES);
+    cetrafs_sb_corrupt(sb, 0);
     return NULL;
 }
 
@@ -453,6 +454,7 @@ static int cetrafs_dir_extents_addr_ok(struct inode *dir, const struct cetrafs_d
             pr_err_ratelimited("dir ino=%llu: extent %u names blocks %llu+%u outside the data area -- refusing it "
                                "(fsck)\n",
                                (unsigned long long) dir->i_ino, i, (unsigned long long) phys, len);
+            cetrafs_sb_corrupt(dir->i_sb, dir->i_ino);
             return -EUCLEAN;
         }
     }

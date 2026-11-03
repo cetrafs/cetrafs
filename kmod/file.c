@@ -766,6 +766,7 @@ static int cetrafs_extents_sorted(struct inode *inode, const struct cetrafs_inod
             pr_err_ratelimited("ino=%llu: extent at block %llu has zero length -- skipping it (fsck)\n",
                                (unsigned long long) inode->i_ino,
                                (unsigned long long) cetrafs_le32(ex->arr[i].ee_block));
+            cetrafs_sb_corrupt(inode->i_sb, inode->i_ino);
             continue;
         }
         r[n].start = cetrafs_le32(ex->arr[i].ee_block);
@@ -1334,6 +1335,7 @@ static int cetrafs_leaf_array_convert(struct super_block *sb,
         if (len == 0 || (u64) eb + len > CETRAFS_MAX_FILE_BLOCKS || phys + len > total_blocks) {
             pr_err_ratelimited("extent [block %u +%u] at lba %llu does not fit the volume (%llu blocks) -- corrupt\n",
                                eb, len, (unsigned long long) phys, (unsigned long long) total_blocks);
+            cetrafs_sb_corrupt(sb, 0);
             return -EUCLEAN;
         }
 
@@ -2126,6 +2128,7 @@ static int cetrafs_tree_lookup(struct inode *inode,
         pr_err_ratelimited("ino=%llu: logical block %u maps to [%llu,+%u), which is not a data address -- refusing it (fsck)\n",
                            (unsigned long long) inode->i_ino, iblock, (unsigned long long) *out_lba,
                            out_run ? *out_run : 1);
+        cetrafs_sb_corrupt(inode->i_sb, inode->i_ino);
         *found = false;
         return -EUCLEAN;
     }
@@ -3014,6 +3017,7 @@ static int cetrafs_tree_append(struct inode *inode,
         if (entries == 0 || entries > ARRAY_SIZE(raw->et.idx)) {
             pr_err_ratelimited("ino=%llu: depth-2 tree with %u root slot(s) -- refusing to append\n",
                                (unsigned long long) inode->i_ino, entries);
+            cetrafs_sb_corrupt(inode->i_sb, inode->i_ino);
             return -EUCLEAN;
         }
         last = entries - 1;
@@ -3036,6 +3040,7 @@ static int cetrafs_tree_append(struct inode *inode,
         if (cetrafs_le16(ihdr->eh_entries) == 0) {
             pr_err_ratelimited("ino=%llu: interior %llu has no entries -- refusing to append\n",
                                (unsigned long long) inode->i_ino, (unsigned long long) ilba);
+            cetrafs_sb_corrupt(inode->i_sb, inode->i_ino);
             brelse(ibh);
             return -EUCLEAN;
         }

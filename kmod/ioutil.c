@@ -689,6 +689,7 @@ struct buffer_head *cetrafs_blk_tail_bread(struct super_block *sb, u64 lba, u32 
 
     pr_err("%s block %llu failed its tail checksum %d times -- corrupted, not just a torn concurrent read\n", what,
            (unsigned long long) lba, CETRAFS_BLK_TAIL_READ_RETRIES);
+    cetrafs_sb_corrupt(sb, 0);
     /* And do not leave it behind. The last attempt's buffer is still
      * cached and uptodate, and a reader that trusts its cache takes an
      * uptodate block as already verified -- so the read that this call

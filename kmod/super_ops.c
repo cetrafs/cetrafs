@@ -304,6 +304,13 @@ static void cetrafs_evict_inode(struct inode *inode)
                 pr_warn("evict_inode: ino=%llu still has %u name(s) on disk -- a peer named it since we dropped ours; freeing nothing\n",
                         (unsigned long long) inode->i_ino, (unsigned int) cetrafs_le32(raw.nlink));
                 ret = -EBUSY;
+            } else if (cetrafs_sb_ino_damaged(inode->i_sb, inode->i_ino)) {
+                /* Freeing walks the extent tree that was found damaged:
+                 * a bad address there frees someone else's blocks. Leave
+                 * it all for fsck (docs/internal/ERRORS.md). */
+                pr_err("evict_inode: ino=%llu has damaged metadata -- freeing nothing; fsck reclaims it\n",
+                       (unsigned long long) inode->i_ino);
+                ret = -EUCLEAN;
             }
         }
 
@@ -451,7 +458,7 @@ static void cetrafs_evict_inode(struct inode *inode)
                 pr_warn("evict_inode: ino=%llu changed under the verdict -- freeing nothing\n",
                         (unsigned long long) inode->i_ino);
 skip_free:;
-        } else if (ret != -ETXTBSY && ret != -ESTALE && ret != -EBUSY) {
+        } else if (ret != -ETXTBSY && ret != -ESTALE && ret != -EBUSY && ret != -EUCLEAN) {
             /* -ETXTBSY/-ESTALE/-EBUSY are the "somebody else still has
              * a claim on this" refusals above; each logs its own
              * reason. Only a genuine read failure belongs here. */
@@ -521,6 +528,8 @@ static int cetrafs_show_options(struct seq_file *m, struct dentry *root)
         seq_puts(m, ",nofilelock");
     if (cetrafs_sb_errors_panic(root->d_sb))
         seq_puts(m, ",errors=panic");
+    if (cetrafs_sb_corruption_stop(root->d_sb))
+        seq_puts(m, ",corruption=stop");
     return 0;
 }
 

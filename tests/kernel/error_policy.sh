@@ -17,10 +17,15 @@
 #   C. a metadata write the device refuses (meta_write_fail) stops the
 #      mount (kind 3); errors=panic is accepted and shown; there is no
 #      errors=continue.
+#   D. damaged metadata (an extent aimed at the inode table, valid CRC)
+#      is counted, and every later write to THAT inode is refused with
+#      EUCLEAN while the rest of the mount carries on (kind 2); with
+#      corruption=stop it stops the mount instead.
 #
 # DISCRIMINATION, measured in the same run: without the stop the same
 # operations change the image (A); with error_policy_off the refused
-# metadata write leaves the mount running (C).
+# metadata write leaves the mount running (C) and the damaged inode
+# accepts the write and the unlink (D).
 set -euo pipefail
 . "$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)/lib/harness.sh"
 require_root
@@ -28,6 +33,7 @@ require_module
 for k in meta_write_fail error_policy_off; do
     [ -w "/sys/module/cetrafs/parameters/$k" ] || { skip "$k is missing"; ct_exit; }
 done
+PPOKE="$(ct_helper extent_phys_poke)"
 
 IMG="$(ct_image 560 errpol)"
 DEV="$(ct_loop "$IMG")"
@@ -161,4 +167,53 @@ umount "$MNT"
 mount -t cetrafs -o errors=continue "$DEV" "$MNT" 2>/dev/null &&
     { fail "C: errors=continue was accepted"; umount "$MNT"; } || pass "C: there is no errors=continue"
 
+# ---------------------------------------------------------------- D
+damage() { # [mount options]: a volume whose 'victim' names the inode table
+    umount "$MNT" 2>/dev/null || true
+    ct_mkfs_small "$DEV" >/dev/null
+    mount -t cetrafs "$DEV" "$MNT"
+    dd if=/dev/zero of="$MNT/victim" bs=4096 count=4 status=none
+    echo ok >"$MNT/bystander"
+    sync
+    VINO="$(stat -c %i "$MNT/victim")"
+    umount "$MNT"
+    "$PPOKE" "$IMG" "$VINO" inode_table >/dev/null || { fail "setup: extent_phys_poke failed"; ct_exit; }
+    blockdev --flushbufs "$DEV"
+    if [ -n "${1:-}" ]; then mount -t cetrafs -o "$1" "$DEV" "$MNT"; else mount -t cetrafs "$DEV" "$MNT"; fi
+    cat "$MNT/victim" >/dev/null 2>&1 && { fail "setup: the damaged extent was read without complaint"; ct_exit; }
+    true
+}
+errno_of() { { "$@" 2>&1 >/dev/null || true; } | grep -o "Structure needs cleaning\|Input/output error" | head -1 || true; }
+
+log "D: damaged metadata isolates the inode"
+damage
+[ "$(info corruptions)" -ge 1 ] && pass "D: counted (corruptions: $(info corruptions))" ||
+    fail "D: corruptions: $(info corruptions)"
+[ "$(info fenced)" = no ] && pass "D: the mount keeps going" || fail "D: the mount stopped"
+E="$(errno_of dd if=/dev/zero of="$MNT/victim" bs=4096 seek=100 count=1 conv=notrunc status=none)"
+[ "$E" = "Structure needs cleaning" ] && pass "D: a write to the damaged inode is refused (EUCLEAN)" ||
+    fail "D: a write past the damage got: '${E:-success}'"
+E="$(errno_of rm -f "$MNT/victim")"
+[ "$E" = "Structure needs cleaning" ] && [ -e "$MNT/victim" ] &&
+    pass "D: so is unlinking it -- nothing is freed on the strength of a damaged tree" ||
+    fail "D: unlink got: '${E:-success}'"
+echo more >>"$MNT/bystander" && : >"$MNT/other" && pass "D: other files are writable" ||
+    fail "D: an undamaged file was refused"
+umount "$MNT"
+
+log "D control: error_policy_off"
+ct_param_set error_policy_off 1
+damage
+E="$(errno_of dd if=/dev/zero of="$MNT/victim" bs=4096 seek=100 count=1 conv=notrunc status=none)"
+[ -z "$E" ] && pass "D control: without the policy the same write goes through (the test discriminates)" ||
+    fail "D control: the write was refused anyway ('$E') -- D proves nothing"
+ct_param_set error_policy_off 0
+umount "$MNT"
+
+log "D: corruption=stop"
+damage corruption=stop
+[ "$(info stopped)" = corruption ] && pass "D: with corruption=stop it stops the mount" ||
+    fail "D: corruption=stop left stopped: $(info stopped)"
+grep -q "corruption=stop" /proc/mounts && pass "D: and the option is shown" || fail "D: corruption=stop not shown"
+umount "$MNT" || umount -l "$MNT"
 ct_exit

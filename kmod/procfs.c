@@ -114,9 +114,12 @@ static int cetrafs_proc_info_show(struct seq_file *m, void *v)
     seq_printf(m, "file_lock: %s\n", cetrafs_sb_file_lock_enabled(sb) ? "on" : "off");
     seq_printf(m, "fenced: %s\n", cetrafs_sb_is_fenced(sb) ? "yes" : "no");
     /* Why (docs/internal/ERRORS.md): none, fenced, lease, error,
-     * manual or device_gone. 'fenced: yes' for every one of
+     * corruption, manual or device_gone. 'fenced: yes' for every one of
      * them -- the state is the same, only the cause differs. */
     seq_printf(m, "stopped: %s\n", cetrafs_sb_stop_cause_name(sb));
+    /* Damaged metadata found by this mount, every retry included; any
+     * nonzero count means unmount everywhere and run fsck.cetra. */
+    seq_printf(m, "corruptions: %u\n", cetrafs_sb_corruptions(sb));
     /* The exact value fs.c's fill_super() stamped into sb->s_maxbytes --
      * see cetrafs_compute_max_file_size() (zonegroup.c) for the formula.
      * Read straight off the live super_block, not recomputed here, so

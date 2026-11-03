@@ -368,10 +368,10 @@ static int cetrafs_nslock_acquire_tries(struct inode *inode, int max_tries)
     u32 my_node_id;
     int attempt, ret;
 
-    /* Stopped: no namespace mutation at all (-EIO) -- every namespace
-     * and xattr mutation takes this lock on each inode it changes, so
-     * this is the one place that covers them all
-     * (docs/internal/ERRORS.md). */
+    /* Stopped: no namespace mutation at all (-EIO). Damaged metadata in
+     * this inode: none of it either (-EUCLEAN) -- every namespace and
+     * xattr mutation takes this lock on each inode it changes, so this
+     * is the one place that covers them all (docs/internal/ERRORS.md). */
     ret = cetrafs_write_gate(inode);
     if (ret)
         return ret;

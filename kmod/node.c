@@ -112,6 +112,7 @@ static int cetrafs_read_node_entry(struct super_block *sb, u32 idx, cetrafs_node
     }
 
     pr_err("node row %u failed its checksum repeatedly -- corrupted, not just a torn concurrent read\n", idx);
+    cetrafs_sb_corrupt(sb, 0);
     return -EUCLEAN;
 }
 

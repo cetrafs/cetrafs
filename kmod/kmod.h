@@ -198,6 +198,7 @@ enum cetrafs_stop_cause {
     CETRAFS_STOP_FENCED,      /* a peer revoked our Node Registry lease */
     CETRAFS_STOP_LEASE,       /* our own lease ran out before a renewal landed */
     CETRAFS_STOP_ERROR,       /* cetrafs_sb_fatal(): we no longer know what is on the device */
+    CETRAFS_STOP_CORRUPTION,  /* damaged metadata, under corruption=stop */
     CETRAFS_STOP_MANUAL,      /* FS_IOC_SHUTDOWN or procfs controls 'shutdown' */
     CETRAFS_STOP_DEVICE_GONE, /* the block device went away */
 };
@@ -206,7 +207,11 @@ void cetrafs_sb_fence(struct super_block *sb, const char *reason);
 bool cetrafs_sb_is_fenced(struct super_block *sb);
 const char *cetrafs_sb_stop_cause_name(struct super_block *sb);
 __printf(2, 3) void cetrafs_sb_fatal(struct super_block *sb, const char *fmt, ...);
+void cetrafs_sb_corrupt(struct super_block *sb, u64 ino);
+unsigned int cetrafs_sb_corruptions(struct super_block *sb);
+bool cetrafs_sb_ino_damaged(struct super_block *sb, u64 ino);
 bool cetrafs_sb_errors_panic(struct super_block *sb);
+bool cetrafs_sb_corruption_stop(struct super_block *sb);
 int cetrafs_read_gate(struct super_block *sb);
 int cetrafs_write_gate(struct inode *inode);
 /* Older uapi headers lack the generic name; ext4, XFS and f2fs used

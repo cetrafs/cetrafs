@@ -3128,7 +3128,8 @@ out:
  */
 int cetrafs_lock_write_gate(struct inode *inode)
 {
-    /* A stopped mount first (-EIO) -- docs/internal/ERRORS.md. */
+    /* A stopped mount (-EIO) or an inode with damaged metadata
+     * (-EUCLEAN) first -- docs/internal/ERRORS.md. */
     int ret = cetrafs_write_gate(inode);
 
     if (ret)

@@ -1056,6 +1056,7 @@ static int cetrafs_read_bg_geom(struct super_block *sb, u32 bg_id, struct cetraf
                                    (unsigned long long) cetrafs_le64(bg->length_blocks),
                                    cetrafs_le32(bg->off_data_bmap), cetrafs_le32(bg->off_data_region),
                                    (unsigned long long) cetrafs_le64(bg->data_block_count));
+                cetrafs_sb_corrupt(sb, 0);
                 brelse(bh);
                 return -EUCLEAN;
             }
@@ -2316,6 +2317,7 @@ static int __cetrafs_free_data_extent(struct super_block *sb, u64 lba, u32 count
     data_start = bg.start_block + bg.off_data_region;
     if (lba + count > data_start + bg.data_block_count) {
         pr_err("free extent [%llu +%u) crosses out of BG %u -- refusing\n", (unsigned long long) lba, count, bg_id);
+        cetrafs_sb_corrupt(sb, 0);
         return -EINVAL;
     }
 
@@ -2468,12 +2470,14 @@ int cetrafs_apply_pending_free(struct super_block *sb, u64 lba, u32 count, u32 e
     if (bg.owner_zg != expect_zg) {
         pr_err("pending free [%llu +%u) names BG %u (ZG %u), but came from ZG %u's queue -- skipping\n",
                (unsigned long long) lba, count, bg_id, bg.owner_zg, expect_zg);
+        cetrafs_sb_corrupt(sb, 0);
         return -EINVAL;
     }
 
     data_start = bg.start_block + bg.off_data_region;
     if (lba + count > data_start + bg.data_block_count) {
         pr_err("pending free [%llu +%u) crosses out of BG %u -- skipping\n", (unsigned long long) lba, count, bg_id);
+        cetrafs_sb_corrupt(sb, 0);
         return -EINVAL;
     }
 

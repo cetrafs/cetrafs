@@ -22,6 +22,7 @@
 #include <linux/spinlock.h>
 #include <linux/stddef.h>
 #include <linux/string.h>
+#include <linux/xarray.h>
 #include <linux/xattr.h>
 
 #include <linux/overflow.h>
@@ -215,9 +216,16 @@ struct cetrafs_sb_info {
      * locks the sweep takes. */
     struct work_struct stop_work;
 
-    /* errors= (mount option, fixed for the mount's life). See
-     * cetrafs_sb_fatal(). */
+    /* errors= and corruption= (mount options, fixed for the mount's
+     * life). See cetrafs_sb_fatal() and cetrafs_sb_corrupt(). */
     bool errors_panic;
+    bool corruption_stop;
+    /* Integrity errors seen on this mount (nonzero: the volume needs
+     * fsck), and the inode numbers they were found in: every write to
+     * one of those is refused until a remount. In memory only -- the
+     * on-disk format has no field for it. */
+    atomic_t corruptions;
+    struct xarray bad_inos;
 
     /*
      * The in-core lease: until when this node may keep writing on the
@@ -605,6 +613,7 @@ static void cetrafs_sb_stop_work(struct work_struct *w);
 struct cetrafs_fc_info {
     bool file_lock;
     bool errors_panic;    /* errors=panic */
+    bool corruption_stop; /* corruption=stop */
 };
 
 /*
@@ -1131,12 +1140,14 @@ int cetrafs_fill_super(struct super_block *sb, struct fs_context *fc)
          * neither. */
         sbi->defrag_enabled = true;
         sbi->auto_defrag_enabled = true;
+        xa_init(&sbi->bad_inos);
         sbi->sb = sb;
         INIT_WORK(&sbi->stop_work, cetrafs_sb_stop_work);
         {
             const struct cetrafs_fc_info *fci = fc ? fc->fs_private : NULL;
 
             sbi->errors_panic = fci ? fci->errors_panic : false;
+            sbi->corruption_stop = fci ? fci->corruption_stop : false;
 
             /* The operator's REQUESTED mode. May be overridden below by the
              * cluster's mode (the first mounter leads); the authoritative
@@ -2235,6 +2246,7 @@ void cetrafs_free_sb_info(struct super_block *sb)
         cancel_work_sync(&sbi->lease_work);
     }
     cancel_work_sync(&sbi->stop_work);
+    xa_destroy(&sbi->bad_inos);
     bitmap_free(sbi->owned_bgs);
     kfree(sbi->bg_owner_zg);
     kfree(sbi->bg_count_epoch);
@@ -2604,6 +2616,7 @@ static const char *const cetrafs_stop_cause_names[] = {
     [CETRAFS_STOP_FENCED] = "fenced",
     [CETRAFS_STOP_LEASE] = "lease",
     [CETRAFS_STOP_ERROR] = "error",
+    [CETRAFS_STOP_CORRUPTION] = "corruption",
     [CETRAFS_STOP_MANUAL] = "manual",
     [CETRAFS_STOP_DEVICE_GONE] = "device_gone",
 };
@@ -2692,7 +2705,7 @@ void cetrafs_sb_fence(struct super_block *sb, const char *reason)
  */
 static bool cetrafs_error_policy_off;
 module_param_named(error_policy_off, cetrafs_error_policy_off, bool, 0644);
-MODULE_PARM_DESC(error_policy_off, "TEST ONLY: log fatal errors without acting on them");
+MODULE_PARM_DESC(error_policy_off, "TEST ONLY: log fatal errors and corruption without acting on them");
 
 /*
  * Kind 3 of docs/internal/ERRORS.md: this node no longer knows what is
@@ -2721,6 +2734,67 @@ void cetrafs_sb_fatal(struct super_block *sb, const char *fmt, ...)
     cetrafs_sb_stop(sb, CETRAFS_STOP_ERROR, msg);
 }
 
+/*
+ * Kind 2 of docs/internal/ERRORS.md: a structure read off the device
+ * failed its checksum or its bounds, every retry included. Nothing was
+ * built from it -- the read that found it refused it -- so the damage
+ * has not spread, and stopping would not stop it: the block is on the
+ * shared device, and every node HA moves the work to would read it too.
+ *
+ * So, by default: count it (procfs `corruptions:`), say once that the
+ * volume needs fsck, and refuse every later WRITE to the inode it was
+ * found in, if one is known ('ino' 0: none) -- above all the ones that
+ * would FREE blocks on the strength of a damaged tree. Reads of that
+ * inode go on failing by themselves, on the bad block, and only there.
+ *
+ * corruption=stop makes it kind 3 instead.
+ */
+void cetrafs_sb_corrupt(struct super_block *sb, u64 ino)
+{
+    struct cetrafs_sb_info *sbi = sb->s_fs_info;
+
+    if (!sbi)
+        return;
+    if (cetrafs_error_policy_off) {
+        pr_err("%s: corruption in ino=%llu IGNORED (error_policy_off)\n", sb->s_id, (unsigned long long) ino);
+        return;
+    }
+    if (atomic_inc_return(&sbi->corruptions) == 1)
+        pr_err("%s: this volume has damaged metadata -- unmount it on every node and run fsck.cetra\n",
+               sb->s_id);
+    if (ino && ino <= ULONG_MAX && !xa_load(&sbi->bad_inos, (unsigned long) ino)) {
+        /* GFP_NOFS: found on read paths that may hold fs locks. If the
+         * entry cannot be stored the write gate cannot see it, so say
+         * so rather than imply a protection that is not there. */
+        if (xa_err(xa_store(&sbi->bad_inos, (unsigned long) ino, xa_mk_value(1), GFP_NOFS)))
+            pr_err("%s: ino=%llu is damaged but could not be recorded -- writes to it are NOT refused\n",
+                   sb->s_id, (unsigned long long) ino);
+        else
+            pr_err("%s: ino=%llu is damaged -- refusing every write to it until it is repaired\n", sb->s_id,
+                   (unsigned long long) ino);
+    }
+    if (sbi->corruption_stop) {
+        if (sbi->errors_panic)
+            panic("cetrafs %s: damaged metadata in ino=%llu (corruption=stop, errors=panic)\n", sb->s_id,
+                  (unsigned long long) ino);
+        cetrafs_sb_stop(sb, CETRAFS_STOP_CORRUPTION, "damaged metadata found (corruption=stop)");
+    }
+}
+
+unsigned int cetrafs_sb_corruptions(struct super_block *sb)
+{
+    struct cetrafs_sb_info *sbi = sb->s_fs_info;
+
+    return sbi ? (unsigned int) atomic_read(&sbi->corruptions) : 0;
+}
+
+bool cetrafs_sb_ino_damaged(struct super_block *sb, u64 ino)
+{
+    struct cetrafs_sb_info *sbi = sb->s_fs_info;
+
+    return sbi && ino <= ULONG_MAX && xa_load(&sbi->bad_inos, (unsigned long) ino);
+}
+
 bool cetrafs_sb_errors_panic(struct super_block *sb)
 {
     struct cetrafs_sb_info *sbi = sb->s_fs_info;
@@ -2728,6 +2802,21 @@ bool cetrafs_sb_errors_panic(struct super_block *sb)
     return sbi && sbi->errors_panic;
 }
 
+bool cetrafs_sb_corruption_stop(struct super_block *sb)
+{
+    struct cetrafs_sb_info *sbi = sb->s_fs_info;
+
+    return sbi && sbi->corruption_stop;
+}
+
+/*
+ * FS_IOC_SHUTDOWN, the call `xfs_io -x -c shutdown` and a cluster
+ * manager's software fence make: stop this mount now
+ * (cetrafs_sb_stop()). NOLOGFLUSH stops at once, as a crash would.
+ * DEFAULT and LOGFLUSH first sync the mount, the one moment its own
+ * writes are still trusted; cetrafs has no log separate from its
+ * metadata, so the two are the same.
+ */
 long cetrafs_shutdown_ioctl(struct super_block *sb, u32 __user *argp)
 {
     u32 flags;
@@ -2749,8 +2838,9 @@ long cetrafs_shutdown_ioctl(struct super_block *sb, u32 __user *argp)
 }
 
 /*
- * The VFS entry points' answers: a stopped mount refuses every access
- * with -EIO (docs/internal/ERRORS.md).
+ * The VFS entry points' answers. A stopped mount refuses every access
+ * (-EIO); a damaged inode refuses writes (-EUCLEAN, "structure needs
+ * cleaning", which is what it says).
  */
 int cetrafs_read_gate(struct super_block *sb)
 {
@@ -2759,7 +2849,11 @@ int cetrafs_read_gate(struct super_block *sb)
 
 int cetrafs_write_gate(struct inode *inode)
 {
-    return cetrafs_sb_is_fenced(inode->i_sb) ? -EIO : 0;
+    if (cetrafs_sb_is_fenced(inode->i_sb))
+        return -EIO;
+    if (cetrafs_sb_ino_damaged(inode->i_sb, inode->i_ino))
+        return -EUCLEAN;
+    return 0;
 }
 
 /*
@@ -3756,7 +3850,7 @@ int cetrafs_flush_dirty_free_counts(struct super_block *sb)
 
 /* ------ mount options ------ */
 
-enum cetrafs_param { Opt_nofilelock, Opt_errors };
+enum cetrafs_param { Opt_nofilelock, Opt_errors, Opt_corruption };
 
 /* errors=: what a fatal error does (docs/internal/ERRORS.md, kind 3).
  * There is deliberately no "continue". */
@@ -3765,12 +3859,19 @@ static const struct constant_table cetrafs_param_errors[] = {
     {"panic", 1},
     {}};
 
+/* corruption=: what damaged metadata does (kind 2). */
+static const struct constant_table cetrafs_param_corruption[] = {
+    {"isolate", 0},
+    {"stop", 1},
+    {}};
+
 static const struct fs_parameter_spec cetrafs_fs_parameters[] = {
     /* Turn the cross-node exclusive open lock off (default: on). Mount-time
      * only -- a remount cannot change it; see cetrafs_reconfigure(). */
     fsparam_flag("nofilelock", Opt_nofilelock),
-    /* Mount-time only, like nofilelock. */
+    /* Both mount-time only, like nofilelock. */
     fsparam_enum("errors", Opt_errors, cetrafs_param_errors),
+    fsparam_enum("corruption", Opt_corruption, cetrafs_param_corruption),
     {}};
 
 static int cetrafs_parse_param(struct fs_context *fc, struct fs_parameter *param)
@@ -3788,6 +3889,9 @@ static int cetrafs_parse_param(struct fs_context *fc, struct fs_parameter *param
         break;
     case Opt_errors:
         fci->errors_panic = result.uint_32 == 1;
+        break;
+    case Opt_corruption:
+        fci->corruption_stop = result.uint_32 == 1;
         break;
     }
     return 0;
