@@ -236,9 +236,11 @@ struct cetrafs_node_reattach_ctx {
     const u8 *uuid;
     unsigned int hb_interval;
     u32 file_lock_mode;
-    u32 caps;        /* CETRAFS_NODE_CAP_* this mount advertises */
-    u64 fence_epoch; /* out: the epoch in the image the swap committed */
-    u64 hb_seq;      /* out: for the caller's log line */
+    u32 caps;          /* CETRAFS_NODE_CAP_* this mount advertises */
+    u64 expect_hb_seq; /* the beat count the row had when it was judged ours */
+    bool twin;         /* out: the row beat since -- another machine took it */
+    u64 fence_epoch;   /* out: the epoch in the image the swap committed */
+    u64 hb_seq;        /* out: for the caller's log line */
 };
 
 static int cetrafs_node_reattach_mutate(void *image, unsigned int len, void *priv)
@@ -254,6 +256,17 @@ static int cetrafs_node_reattach_mutate(void *image, unsigned int len, void *pri
     if (cetrafs_le32(ne.state) != CETRAFS_NODE_STATE_REGISTERED ||
         memcmp(ne.node_uuid, ctx->uuid, CETRAFS_NODE_UUID_LEN) != 0)
         return -EEXIST;
+
+    /* And it must not have beaten since it was judged ours. Only the
+     * row's owner moves hb_seq (a peer's fence bump touches fence_epoch),
+     * and our previous incarnation is gone -- so a beat in between is a
+     * machine with our identity re-attaching or renewing first. Two
+     * clones of a cleanly unmounted VM both skip the watch (last_seen 0)
+     * and would otherwise both land here, on one row. */
+    if (cetrafs_le64(ne.hb_seq) != ctx->expect_hb_seq) {
+        ctx->twin = true;
+        return -EEXIST;
+    }
 
     ne.hb_seq = cetrafs_cpu_to_le64(cetrafs_le64(ne.hb_seq) + 1);
     ne.last_seen = cetrafs_cpu_to_le64(ktime_get_real_seconds());
@@ -475,6 +488,79 @@ static bool cetrafs_reattach_race_bump;
 module_param_named(reattach_race_bump, cetrafs_reattach_race_bump, bool, 0644);
 MODULE_PARM_DESC(reattach_race_bump, "TEST ONLY: bump our own fence_epoch mid re-attach, as a racing reclaimer would");
 
+/* TEST ONLY: play a second machine with this machine's identity mounting
+ * at the same instant -- its re-attach landing between our scan and our
+ * re-attach swap, or its claim of another free row landing just after
+ * ours. Two clones booting together cannot be timed from a script on one
+ * machine. Off in production. */
+static bool cetrafs_register_twin_race;
+module_param_named(register_twin_race, cetrafs_register_twin_race, bool, 0644);
+MODULE_PARM_DESC(register_twin_race, "TEST ONLY: a machine with our identity registers in the middle of our registration");
+
+static int cetrafs_node_test_beat_mutate(void *image, unsigned int len, void *priv)
+{
+    cetrafs_node_entry_t ne;
+
+    memcpy(&ne, image, sizeof(ne));
+    ne.hb_seq = cetrafs_cpu_to_le64(cetrafs_le64(ne.hb_seq) + 1);
+    ne.last_seen = cetrafs_cpu_to_le64(ktime_get_real_seconds());
+    cetrafs_node_image_commit(image, len, &ne);
+    return 0;
+}
+
+/* Give back a row this mount claimed moments ago and must not keep:
+ * only while it is still exactly the fresh claim (ours, never beaten). */
+static int cetrafs_node_unclaim_mutate(void *image, unsigned int len, void *priv)
+{
+    const u8 *uuid = priv;
+    cetrafs_node_entry_t ne;
+
+    memcpy(&ne, image, sizeof(ne));
+    if (cetrafs_le32(ne.state) != CETRAFS_NODE_STATE_REGISTERED ||
+        memcmp(ne.node_uuid, uuid, CETRAFS_NODE_UUID_LEN) != 0 || cetrafs_le64(ne.hb_seq) != 1)
+        return -EEXIST;
+    memset(image, 0, len);
+    return 0;
+}
+
+static void cetrafs_node_refuse_twin(u32 idx)
+{
+    pr_err("node registration: row %u carries this machine's identity and another machine is registering with "
+           "it -- a node with the same node UUID (a cloned VM, or firmware without a unique one). Refusing to "
+           "mount as the same node; give one of them its own with cetrafs.node_uuid=<uuid>\n",
+           idx);
+}
+
+/*
+ * After claiming a fresh row: is any OTHER row registered with our
+ * identity? Pass 1 re-attaches every such row it can see, so one found
+ * now appeared during this registration -- a twin that claimed its own
+ * row at the same time. Both claims are durable CASes before either scan,
+ * so of two twins at least the later scanner sees the other and refuses;
+ * if both see each other, both refuse. Loud and safe either way.
+ */
+static int cetrafs_node_twin_row(struct super_block *sb, u32 mine, const u8 *uuid, u32 *out_idx)
+{
+    const cetrafs_superblock_t *raw_sb = cetrafs_sb_raw(sb);
+    u32 count = le32_to_cpu(raw_sb->node_table_count), idx;
+    cetrafs_node_entry_t ne;
+    int ret;
+
+    for (idx = 0; idx < count; idx++) {
+        if (idx == mine)
+            continue;
+        ret = cetrafs_read_node_entry(sb, idx, &ne);
+        if (ret)
+            return ret;
+        if (cetrafs_le32(ne.state) == CETRAFS_NODE_STATE_REGISTERED &&
+            !memcmp(ne.node_uuid, uuid, CETRAFS_NODE_UUID_LEN)) {
+            *out_idx = idx;
+            return 1;
+        }
+    }
+    return 0;
+}
+
 /*
  * Watch row 'idx' (as read into 'ne') for long enough that a node
  * beating at its advertised interval must move hb_seq at least once:
@@ -552,7 +638,8 @@ int cetrafs_node_register(struct super_block *sb,
             struct cetrafs_node_reattach_ctx ctx = {.uuid = my_uuid.b,
                                                     .hb_interval = cetrafs_heartbeat_interval_secs(sb),
                                                     .file_lock_mode = file_lock_mode,
-                                                    .caps = cetrafs_node_my_caps(sb)};
+                                                    .caps = cetrafs_node_my_caps(sb),
+                                                    .expect_hb_seq = cetrafs_le64(ne.hb_seq)};
 
             /* Is the row ours because we LEFT it, or because another
              * machine with our identity is using it right now? A clean
@@ -577,6 +664,8 @@ int cetrafs_node_register(struct super_block *sb,
                     return ret;
             }
 
+            if (cetrafs_register_twin_race) /* test knob, see its MODULE_PARM_DESC */
+                (void) cetrafs_cas_record(sb, cetrafs_node_row_lba(sb, idx), cetrafs_node_test_beat_mutate, NULL);
             if (cetrafs_reattach_race_bump) /* test knob, see its MODULE_PARM_DESC */
                 (void) cetrafs_node_fence_peer_full(sb, idx, "a test-forced concurrent reclaim (reattach_race_bump)", false);
 
@@ -584,6 +673,10 @@ int cetrafs_node_register(struct super_block *sb,
              * above -- see cetrafs_node_reattach_mutate() for the fence
              * bump that blind write could silently revert. */
             ret = cetrafs_cas_record(sb, cetrafs_node_row_lba(sb, idx), cetrafs_node_reattach_mutate, &ctx);
+            if (ret == -EEXIST && ctx.twin) {
+                cetrafs_node_refuse_twin(idx);
+                return -EBUSY;
+            }
             if (ret == -EEXIST)
                 continue; /* stopped being ours between the read and the swap */
             if (ret)
@@ -631,6 +724,22 @@ int cetrafs_node_register(struct super_block *sb,
 
         ret = cetrafs_cas_record(sb, cetrafs_node_row_lba(sb, idx), cetrafs_node_claim_mutate, &ctx);
         if (ret == 0) {
+            u32 twin, j;
+            int tret;
+
+            if (cetrafs_register_twin_race) { /* test knob, see its MODULE_PARM_DESC */
+                for (j = idx + 1; j < count; j++)
+                    if (!cetrafs_cas_record(sb, cetrafs_node_row_lba(sb, j), cetrafs_node_claim_mutate, &ctx))
+                        break;
+            }
+            tret = cetrafs_node_twin_row(sb, idx, my_uuid.b, &twin);
+            if (tret) {
+                if (tret > 0)
+                    cetrafs_node_refuse_twin(twin);
+                if (cetrafs_cas_record(sb, cetrafs_node_row_lba(sb, idx), cetrafs_node_unclaim_mutate, my_uuid.b))
+                    pr_warn("node registration: could not give back row %u\n", idx);
+                return tret > 0 ? -EBUSY : tret;
+            }
             pr_info("node registration: claimed row %u (%s)\n", idx,
                     cetrafs_sb_caw_available(sb) ? "atomic CAS" : "no-CAW fallback");
             cetrafs_sb_set_fence_epoch(sb, 0); /* the mutator zeroes the row */
