@@ -49,8 +49,9 @@ int main(int argc, char **argv)
     if (argc < 4) {
         fprintf(stderr,
                 "usage: %s <image> leaf <ino>\n"
-                "       %s <image> setphys <ino> <entry> <new_phys>\n",
-                argv[0], argv[0]);
+                "       %s <image> setphys <ino> <entry> <new_phys>\n"
+                "       %s <image> setcount <ino> <n>\n",
+                argv[0], argv[0], argv[0]);
         return 2;
     }
 
@@ -76,6 +77,26 @@ int main(int argc, char **argv)
 
     if (strcmp(argv[2], "leaf") == 0) {
         printf("%" PRIu64 "\n", leaf_lba);
+        return 0;
+    }
+
+    if (strcmp(argv[2], "setcount") == 0) {
+        /* The leaf's entry count, restamped: integrity-perfect and past
+         * what a leaf block holds. */
+        uint8_t blk[CETRAFS_BLOCK_SIZE];
+        cetrafs_extent_hdr_t *hdr = (cetrafs_extent_hdr_t *) blk;
+        cetrafs_blk_tail_t *t = (cetrafs_blk_tail_t *) (blk + CETRAFS_BLK_TAIL_OFF);
+
+        if (argc != 5) {
+            fprintf(stderr, "setcount needs <n>\n");
+            return 2;
+        }
+        pread_all(blk, sizeof(blk), (off_t) leaf_lba * CETRAFS_BLOCK_SIZE);
+        hdr->eh_entries = cetrafs_cpu_to_le16((uint16_t) strtoul(argv[4], NULL, 0));
+        t->magic = cetrafs_cpu_to_le32(CETRAFS_LEAF_TAIL_MAGIC);
+        t->crc = cetrafs_cpu_to_le32(crc32c_update(0, blk, CETRAFS_BLK_TAIL_OFF));
+        pwrite_all(blk, sizeof(blk), (off_t) leaf_lba * CETRAFS_BLOCK_SIZE);
+        printf("leaf_poke: ino %" PRIu64 " leaf %" PRIu64 " entry count -> %s\n", ino, leaf_lba, argv[4]);
         return 0;
     }
 

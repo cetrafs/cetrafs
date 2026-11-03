@@ -598,51 +598,8 @@ void cetrafs_blk_tail_stamp(struct buffer_head *bh, u32 magic)
  */
 bool cetrafs_blk_struct_ok_magic(const struct buffer_head *bh, u32 magic)
 {
-    const void *p = bh->b_data;
-    unsigned int i;
-
-    switch (magic) {
-    case CETRAFS_DIRENT_TAIL_MAGIC: {
-        const cetrafs_dirent_t *de = (const cetrafs_dirent_t *) p;
-
-        for (i = 0; i < CETRAFS_DIRENTS_PER_BLOCK; i++)
-            if (cetrafs_le16(de[i].name_len) > CETRAFS_FILENAME_MAX)
-                return false;
-        return true;
-    }
-    case CETRAFS_XATTR_TAIL_MAGIC: {
-        const cetrafs_xattr_entry_t *xa = (const cetrafs_xattr_entry_t *) p;
-
-        /* As many as actually fit -- CETRAFS_MAX_XATTRS is the per-INODE
-         * limit, not the per-block one, and iterating that many would
-         * read past the end of the block. (xattr.c computes the same
-         * thing locally; this is the one place it is needed outside
-         * it.) */
-        const unsigned int per_block = CETRAFS_BLOCK_SIZE / sizeof(cetrafs_xattr_entry_t);
-
-        for (i = 0; i < per_block; i++) {
-            if (cetrafs_le16(xa[i].value_len) > CETRAFS_XATTR_VALUE_MAX)
-                return false;
-            /* The key is compared with strcmp() and measured with
-             * strlen(): it has to terminate inside its own field. */
-            if (!memchr(xa[i].key, '\0', CETRAFS_XATTR_KEY_MAX))
-                return false;
-        }
-        return true;
-    }
-    case CETRAFS_LEAF_TAIL_MAGIC: {
-        const cetrafs_extent_hdr_t *h = (const cetrafs_extent_hdr_t *) p;
-
-        return cetrafs_le16(h->eh_entries) <= CETRAFS_EXT_BLOCK_MAX_LEAVES;
-    }
-    case CETRAFS_INDEX_TAIL_MAGIC: {
-        const cetrafs_extent_hdr_t *h = (const cetrafs_extent_hdr_t *) p;
-
-        return cetrafs_le16(h->eh_entries) <= CETRAFS_EXT_BLOCK_MAX_IDX;
-    }
-    default:
-        return true;
-    }
+    /* The rules live in cetrafs.h, shared with fsck. */
+    return cetrafs_blk_struct_ok(bh->b_data, magic);
 }
 
 bool cetrafs_blk_tail_valid(const struct buffer_head *bh, u32 magic)

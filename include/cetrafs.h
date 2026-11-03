@@ -1465,6 +1465,55 @@ typedef struct {
     u8   value[CETRAFS_XATTR_VALUE_MAX];
 } CETRA_PACKED cetrafs_xattr_entry_t;
 
+/*
+ * Structure sanity of a tail-checked block, which is NOT what its
+ * checksum proves: the counts and lengths a reader indexes with. ONE
+ * definition for the kernel (cetrafs_blk_struct_ok_magic(), on every
+ * read) and fsck (on every block it walks), so the two cannot disagree
+ * about what a valid block is -- fsck clamped these counts in silence
+ * and called a volume clean whose blocks the kernel refuses.
+ *
+ * For an extent leaf or index this is one comparison (it runs on the
+ * per-block mapping path: docs/PERFORMANCE.md); dirent and xattr blocks
+ * are read by namespace operations only, so their entries are scanned.
+ */
+static inline int cetrafs_blk_struct_ok(const void *blk, u32 magic)
+{
+    unsigned int i;
+
+    switch (magic) {
+    case CETRAFS_DIRENT_TAIL_MAGIC: {
+        const cetrafs_dirent_t *de = (const cetrafs_dirent_t *) blk;
+
+        for (i = 0; i < CETRAFS_DIRENTS_PER_BLOCK; i++)
+            if (cetrafs_le16(de[i].name_len) > CETRAFS_FILENAME_MAX)
+                return 0;
+        return 1;
+    }
+    case CETRAFS_XATTR_TAIL_MAGIC: {
+        /* As many as fit in the block: CETRAFS_MAX_XATTRS is the
+         * per-INODE limit, and iterating that many would read past it. */
+        const cetrafs_xattr_entry_t *xa = (const cetrafs_xattr_entry_t *) blk;
+        const unsigned int per_block = CETRAFS_BLOCK_SIZE / sizeof(cetrafs_xattr_entry_t);
+
+        for (i = 0; i < per_block; i++) {
+            if (cetrafs_le16(xa[i].value_len) > CETRAFS_XATTR_VALUE_MAX)
+                return 0;
+            /* compared with strcmp() and measured with strlen() */
+            if (!memchr(xa[i].key, '\0', CETRAFS_XATTR_KEY_MAX))
+                return 0;
+        }
+        return 1;
+    }
+    case CETRAFS_LEAF_TAIL_MAGIC:
+        return cetrafs_le16(((const cetrafs_extent_hdr_t *) blk)->eh_entries) <= CETRAFS_EXT_BLOCK_MAX_LEAVES;
+    case CETRAFS_INDEX_TAIL_MAGIC:
+        return cetrafs_le16(((const cetrafs_extent_hdr_t *) blk)->eh_entries) <= CETRAFS_EXT_BLOCK_MAX_IDX;
+    default:
+        return 1;
+    }
+}
+
 /* ---- Feature bits ---- */
 #define CETRAFS_FEAT_COMPAT_NONE       0ULL
 

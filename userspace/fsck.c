@@ -949,7 +949,18 @@ static int fsck_check_tail(const uint8_t *blk, uint32_t magic)
 {
     const cetrafs_blk_tail_t *t = (const cetrafs_blk_tail_t *) (blk + CETRAFS_BLK_TAIL_OFF);
 
-    return (cetrafs_le32(t->magic) == magic && cetrafs_le32(t->crc) == crc32c_update(0, blk, CETRAFS_BLK_TAIL_OFF)) ? 0 : -1;
+    if (cetrafs_le32(t->magic) != magic || cetrafs_le32(t->crc) != crc32c_update(0, blk, CETRAFS_BLK_TAIL_OFF))
+        return -1;
+    /* Integrity, then sense -- the kernel's order and its definition
+     * (cetrafs_blk_struct_ok()). A count past what the block holds was
+     * clamped below in silence, and the volume called clean while the
+     * kernel refuses the block on every read. */
+    if (!cetrafs_blk_struct_ok(blk, magic)) {
+        fprintf(stderr, "ERR: block of kind 0x%08x passes its checksum but holds an impossible count or length\n",
+                magic);
+        return -1;
+    }
+    return 0;
 }
 
 int main(int argc, char **argv)
@@ -2203,6 +2214,18 @@ int main(int argc, char **argv)
             uint8_t leafblk[CETRAFS_BLOCK_SIZE];
             int tree_ok = 1;
 
+            /* The record's inline count indexes a 4-slot array. Clamped
+             * below in silence, which reported clean a record the kernel
+             * refuses to map through. Its blocks cannot be told from
+             * leaked ones either, so nothing is repaired around it. */
+            if (cetrafs_le16(in.eh.eh_entries) > 4) {
+                fprintf(stderr, "ERR: inode %" PRIu64 " claims %u inline extent entries; the record holds 4\n", ino,
+                        cetrafs_le16(in.eh.eh_entries));
+                problems++;
+                repair_block("a record's inline extent count is impossible, so the blocks the inode owns cannot "
+                             "be distinguished from leaked ones");
+            }
+
             if (in.eh.eh_depth == 0) {
                 uint32_t n = cetrafs_le16(in.eh.eh_entries) > 4 ? 4 : cetrafs_le16(in.eh.eh_entries);
 
@@ -2849,6 +2872,22 @@ int main(int argc, char **argv)
                             dwhole[ino] = 0;
                             continue;
                         }
+                    }
+                    /* A valid checksum over an impossible entry: the
+                     * kernel refuses this block on every read
+                     * (cetrafs_blk_struct_ok()), so for the namespace it
+                     * is as gone as one with a bad tail. Not repaired
+                     * around: a name_len past the field cannot be
+                     * trusted to say where the name ends. */
+                    if (!cetrafs_blk_struct_ok(db, CETRAFS_DIRENT_TAIL_MAGIC)) {
+                        fprintf(stderr,
+                                "ERR: directory inode %" PRIu64 " block %" PRIu64
+                                " passes its checksum but holds an entry with an impossible name length\n",
+                                ino, phys + k);
+                        problems++;
+                        note_bad_dirent_block(ino, phys + k, logical == 0);
+                        dwhole[ino] = 0;
+                        continue;
                     }
 
                     de = (cetrafs_dirent_t *) db;
