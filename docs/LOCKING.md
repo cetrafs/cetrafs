@@ -142,9 +142,13 @@ only** — directories are never lockable this way, see Mechanism 3.
   on two nodes cannot both pass. A dead reader's bit is cleared first and
   does not block.
 - A writer that suspended its lock for a handoff (`flock(LOCK_UN)`)
-  keeps writing with only a presence bit on the device; it marks that bit
-  in `suspended_writer_nodes`. The handoff's destination may claim past
-  it, and a reader may not open while it is there.
+  keeps the file open with only a presence bit on the device; it marks
+  that bit in `suspended_writer_nodes`. The handoff's destination may
+  claim past it, and a reader may not open while it is there. The
+  suspended node itself may not write: every local write path (write,
+  O_DIRECT, a store through a mapping, truncate, fallocate) fails with
+  `-ETXTBSY` (SIGBUS for the store) until `flock(LOCK_EX)` takes the
+  lock back, so the handoff never has two writers.
 - This node's own *local* open-for-write refcount (`lock_writer_count`, a
   private per-inode `atomic_t`) is what the lock actually releases against
   — the on-disk claim drops only when the *last* local write-opener

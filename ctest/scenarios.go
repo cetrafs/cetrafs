@@ -1363,7 +1363,7 @@ func RunLockSuspend(clients []*Client, path string) (bool, error) {
 	if err := callOK(holder, "unlock_file", UnlockFileArgs{Handle: hh}); err != nil {
 		return false, fmt.Errorf("%s: suspend (flock LOCK_UN): %w", holder.Name, err)
 	}
-	fmt.Printf("  %-12s SUSPENDED its automatic lock (fd still open, still writable)\n", holder.Name)
+	fmt.Printf("  %-12s SUSPENDED its automatic lock (fd still open, its writes refused until it resumes)\n", holder.Name)
 
 	// ------------------------------------------------------------ part 2
 	// THE invariant. The lock is gone, so presence is the only thing left

@@ -2625,6 +2625,12 @@ MODULE_PARM_DESC(lock_suspend_skip_publish,
                  "TEST ONLY: suspend without publishing presence (reproduces the invisible-writer bug: "
                  "a peer's unlink or scrub frees blocks under a live writer)");
 
+static bool cetrafs_lock_suspend_skip_gate;
+module_param_named(lock_suspend_skip_gate, cetrafs_lock_suspend_skip_gate, bool, 0644);
+MODULE_PARM_DESC(lock_suspend_skip_gate,
+                 "TEST ONLY: suspend without draining this node's writers, and let them keep writing "
+                 "(reproduces two writers after a handoff)");
+
 static bool cetrafs_lock_suspend_trust_cache;
 module_param_named(lock_suspend_trust_cache, cetrafs_lock_suspend_trust_cache, bool, 0644);
 MODULE_PARM_DESC(lock_suspend_trust_cache,
@@ -2985,6 +2991,7 @@ static int cetrafs_lock_suspend(struct inode *inode, struct file *file)
 {
     struct cetrafs_inode_info *ci = CETRAFS_I(inode);
     struct super_block *sb = inode->i_sb;
+    bool drain = false;
     int ret;
 
     if (sb_rdonly(sb))
@@ -3010,30 +3017,49 @@ static int cetrafs_lock_suspend(struct inode *inode, struct file *file)
     }
 
     /*
+     * Stop this node's own writers first. Once the lock is gone a peer
+     * may claim the file and write it, and two writers is exactly what
+     * the access rule forbids (docs/internal/BASICS.md) -- so from here
+     * until the lock is taken back, nothing on this node may change the
+     * file. Every write entry point checks lock_suspended under the lock
+     * it already holds (cetrafs_lock_write_gate()): write(2) and
+     * truncate/fallocate under inode_lock, a page fault under
+     * invalidate_lock. Holding both here drains whatever is in flight
+     * and keeps the next one out until the flag is set; direct I/O
+     * already submitted is waited for. The flush below then sees the
+     * file's final bytes.
+     *
+     * lock_mutex ranks above both: nothing takes it under either.
+     *
+     * This used to rely on lock_mutex alone, under a comment saying it
+     * excluded the other local writers. No write path takes lock_mutex,
+     * so a writer kept writing after the lock was handed over, while the
+     * peer it was handed to wrote too.
+     */
+    drain = !cetrafs_lock_suspend_skip_gate; /* read once: the unlock must match */
+    if (drain) {
+        inode_lock(inode);
+        filemap_invalidate_lock(inode->i_mapping);
+        inode_dio_wait(inode);
+    }
+
+    /*
      * The handoff durability boundary, and it must complete BEFORE the
      * lock goes: the peer that opens the instant after must not find a
      * short file, an extent tree naming unflushed blocks, or allocation
      * bits that have not reached the platter (rule 8 -- a reference may
      * not become durable before what it refers to; the lock-clear is a
      * CAS and reaches the device immediately). Same flushes the
-     * last-writer close performs.
-     *
-     * Under lock_mutex, exactly as cetrafs_lock_release() does it. That
-     * is not incidental: this node may have OTHER local writers on the
-     * same file, and flushing outside the mutex would let one of them
-     * dirty a page between the flush and the lock-clear below -- handing
-     * the peer a file whose newest bytes are still in our page cache.
-     * The close path has no such window only because it runs when the
-     * last writer is already gone. (Writeback re-entering
-     * cetrafs_get_block() is safe under this mutex: that path takes
-     * resv_lock, never this one -- see the resv_lock comment above.)
+     * last-writer close performs. (Writeback re-entering
+     * cetrafs_get_block() is safe under these locks: that path takes
+     * resv_lock and neither of them -- see the resv_lock comment above.)
      */
     ret = cetrafs_file_make_durable(file);
     if (ret)
-        goto out;
+        goto out_unlock;
     ret = cetrafs_flush_dirty_free_counts(sb);
     if (ret)
-        goto out;
+        goto out_unlock;
 
     /*
      * Presence FIRST, lock second. Between the two we hold both signals,
@@ -3044,13 +3070,13 @@ static int cetrafs_lock_suspend(struct inode *inode, struct file *file)
     if (!cetrafs_lock_suspend_skip_publish) {
         ret = cetrafs_lock_presence_get(inode);
         if (ret)
-            goto out;
+            goto out_unlock;
         /* ...as a WRITER: without the mark this presence reads as a
          * reader, and the destination's write-open would be refused. */
         ret = cetrafs_lock_suspend_mark(inode, true);
         if (ret) {
             cetrafs_lock_presence_put(inode);
-            goto out;
+            goto out_unlock;
         }
     }
 
@@ -3063,10 +3089,12 @@ static int cetrafs_lock_suspend(struct inode *inode, struct file *file)
             (void) cetrafs_lock_suspend_mark(inode, false);
             cetrafs_lock_presence_put(inode);
         }
-        goto out;
+        goto out_unlock;
     }
 
-    ci->lock_suspended = true;
+    /* Still under inode_lock and invalidate_lock: the next writer to
+     * take either sees the flag. */
+    WRITE_ONCE(ci->lock_suspended, true);
 
     /*
      * The freshness verdict is cached for up to a second
@@ -3079,9 +3107,30 @@ static int cetrafs_lock_suspend(struct inode *inode, struct file *file)
 
     atomic64_inc(&cetrafs_lock_suspends);
     ret = 0;
+out_unlock:
+    if (drain) {
+        filemap_invalidate_unlock(inode->i_mapping);
+        inode_unlock(inode);
+    }
 out:
     mutex_unlock(&ci->lock_mutex);
     return ret;
+}
+
+/*
+ * May this node change the file right now? Not while it has handed its
+ * automatic lock to a peer (cetrafs_lock_suspend()): the peer may be
+ * writing it, and one writer at a time is the rule. Called by every
+ * write entry point under the lock it already holds -- inode_lock for
+ * write(2), truncate and fallocate, invalidate_lock for a page fault --
+ * which is what makes the check exact against a suspend in progress.
+ * flock(LOCK_EX) takes the lock back and lets writes through again.
+ */
+int cetrafs_lock_write_gate(struct inode *inode)
+{
+    if (cetrafs_lock_suspend_skip_gate)
+        return 0;
+    return READ_ONCE(CETRAFS_I(inode)->lock_suspended) ? -ETXTBSY : 0;
 }
 
 /*

@@ -764,6 +764,7 @@ int cetrafs_lock_foreign_user_exists(struct super_block *sb,
                                      bool *out_writer,
                                      bool *out_reader);
 bool cetrafs_lock_held_for_write_locally(struct inode *inode);
+int cetrafs_lock_write_gate(struct inode *inode); /* -ETXTBSY while this node's lock is suspended */
 bool cetrafs_lock_read_cache_trusted(struct inode *inode);
 void cetrafs_inode_mark_tree_cold(struct inode *inode);
 bool cetrafs_lock_identity_cache_trusted(struct inode *inode);

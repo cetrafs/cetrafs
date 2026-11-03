@@ -130,7 +130,12 @@ static vm_fault_t cetrafs_page_mkwrite(struct vm_fault *vmf)
      * path needed and inode_lock could never give it.
      */
     filemap_invalidate_lock(inode->i_mapping);
-    ret = block_page_mkwrite(vma, vmf, cetrafs_get_block);
+    /* Not while this node has handed the file to a peer: a store
+     * through an old mapping is a write like any other
+     * (cetrafs_lock_write_gate()). */
+    ret = cetrafs_lock_write_gate(inode);
+    if (!ret)
+        ret = block_page_mkwrite(vma, vmf, cetrafs_get_block);
     filemap_invalidate_unlock(inode->i_mapping);
 
     sb_end_pagefault(inode->i_sb);
@@ -183,6 +188,35 @@ static int cetrafs_file_flush(struct file *file, fl_owner_t id)
     return file_write_and_wait(file);
 }
 
+/*
+ * generic_file_write_iter(), with the suspended-lock check inside its
+ * inode_lock: write(2), direct I/O and splice all come through here, and
+ * a check made before the lock could pass, lose to a suspend, and write
+ * after the file was handed to a peer (cetrafs_lock_write_gate()).
+ */
+static ssize_t cetrafs_file_write_iter(struct kiocb *iocb, struct iov_iter *from)
+{
+    struct inode *inode = file_inode(iocb->ki_filp);
+    ssize_t ret;
+
+    if (iocb->ki_flags & IOCB_NOWAIT) {
+        if (!inode_trylock(inode))
+            return -EAGAIN;
+    } else {
+        inode_lock(inode);
+    }
+    ret = cetrafs_lock_write_gate(inode);
+    if (!ret) {
+        ret = generic_write_checks(iocb, from);
+        if (ret > 0)
+            ret = __generic_file_write_iter(iocb, from);
+    }
+    inode_unlock(inode);
+    if (ret > 0)
+        ret = generic_write_sync(iocb, ret);
+    return ret;
+}
+
 const struct file_operations cetrafs_file_ops = {
     .owner = THIS_MODULE,
     .open = cetrafs_open,
@@ -190,7 +224,7 @@ const struct file_operations cetrafs_file_ops = {
     .release = cetrafs_release,
     .llseek = cetrafs_llseek,
     .read_iter = generic_file_read_iter,
-    .write_iter = generic_file_write_iter,
+    .write_iter = cetrafs_file_write_iter,
     .mmap = cetrafs_file_mmap,
     .fsync = cetrafs_fsync,
     .fallocate = cetrafs_fallocate,
@@ -4221,7 +4255,9 @@ static long cetrafs_fallocate(struct file *file, int mode, loff_t offset, loff_t
          * pay for it; not worth doing by simply moving the lock.
          */
         filemap_invalidate_lock(inode->i_mapping);
-        arc = cetrafs_sb_is_fenced(sb) ? -EIO : cetrafs_do_allocate(inode, offset, len, mode & FALLOC_FL_KEEP_SIZE);
+        arc = cetrafs_sb_is_fenced(sb) ? -EIO : cetrafs_lock_write_gate(inode);
+        if (!arc)
+            arc = cetrafs_do_allocate(inode, offset, len, mode & FALLOC_FL_KEEP_SIZE);
         filemap_invalidate_unlock(inode->i_mapping);
         inode_unlock(inode);
         kfree(recs);
@@ -4244,6 +4280,11 @@ static long cetrafs_fallocate(struct file *file, int mode, loff_t offset, loff_t
     /* Same reason as cetrafs_truncate_shrink(): a punch frees blocks,
      * and in-flight direct I/O is aimed at the physical ones. */
     inode_dio_wait(inode);
+
+    /* A punch changes the file: not while it is handed to a peer. */
+    ret = cetrafs_lock_write_gate(inode);
+    if (ret)
+        goto out;
 
     /*
      * And the same refusal truncate gives, for the same reason -- which
@@ -4625,10 +4666,15 @@ static int cetrafs_setattr_locked(struct mnt_idmap *idmap, struct dentry *dentry
          * faults allocating at once is the lost update that cost 56
          * blocks of a writer's data. */
         filemap_invalidate_lock(inode->i_mapping);
-        if (attr->ia_size < i_size_read(inode))
-            ret = cetrafs_truncate_shrink(inode, attr->ia_size);
-        else
-            truncate_setsize(inode, attr->ia_size);
+        /* Under inode_lock (the VFS holds it here): not while this node
+         * has handed the file to a peer -- cetrafs_lock_write_gate(). */
+        ret = cetrafs_lock_write_gate(inode);
+        if (!ret) {
+            if (attr->ia_size < i_size_read(inode))
+                ret = cetrafs_truncate_shrink(inode, attr->ia_size);
+            else
+                truncate_setsize(inode, attr->ia_size);
+        }
         filemap_invalidate_unlock(inode->i_mapping);
 
         if (ret)
