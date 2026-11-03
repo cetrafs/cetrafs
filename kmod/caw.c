@@ -156,6 +156,46 @@ MODULE_PARM_DESC(caw_timeout_lost_once, "TEST ONLY: next CAW does not execute an
  * and the caller retries -- and is then executed just before the CAW
  * after it, the way a command still queued on the array lands behind
  * the host's back. */
+/*
+ * The re-read that settles a command whose outcome is UNKNOWN. It has to
+ * be the DEVICE talking: the whole verdict is "is our image on the
+ * platter?". cetrafs_bread_uncached() deliberately keeps a DIRTY
+ * buffer's local bytes rather than reading over them (it would discard a
+ * write not yet issued), so for a dirty buffer it answers with this
+ * node's own copy -- which may hold the pre-image while the device holds
+ * the post-image, and then a swap that landed is taken as not landed and
+ * applied again. A dirty buffer cannot answer the question: refuse, and
+ * the caller reports the outcome as unknown (-EIO) rather than guess.
+ *
+ * TEST ONLY: cas_verify_dirty_once makes the next verify see a dirty
+ * buffer, which only a real CAW device reaches (the selftest's phase 5).
+ */
+static bool cetrafs_cas_verify_dirty_once;
+module_param_named(cas_verify_dirty_once, cetrafs_cas_verify_dirty_once, bool, 0644);
+MODULE_PARM_DESC(cas_verify_dirty_once, "TEST ONLY: the next unknown-outcome re-read finds a dirty buffer");
+
+static struct buffer_head *cetrafs_cas_verify_read(struct super_block *sb, u64 fs_lba)
+{
+    struct buffer_head *bh = cetrafs_bread_uncached_retry(sb, fs_lba);
+    bool dirty;
+
+    if (!bh)
+        return NULL;
+    dirty = buffer_dirty(bh);
+    if (cetrafs_cas_verify_dirty_once) {
+        cetrafs_cas_verify_dirty_once = false;
+        dirty = true;
+    }
+    if (dirty) {
+        pr_err("CAS lba=%llu: the re-read that decides an unknown outcome found this node's own DIRTY copy, not "
+               "the device's -- cannot tell whether the swap landed\n",
+               (unsigned long long) fs_lba);
+        brelse(bh);
+        return NULL;
+    }
+    return bh;
+}
+
 static bool cetrafs_caw_timeout_late_once;
 module_param_named(caw_timeout_late_once, cetrafs_caw_timeout_late_once, bool, 0644);
 MODULE_PARM_DESC(caw_timeout_late_once, "TEST ONLY: next CAW reports a timeout, then lands just before the next one");
@@ -1027,10 +1067,10 @@ static int cetrafs_cas_region_seeded_impl(struct super_block *sb,
              * happens. Closing it for good needs the record to carry
              * who wrote it, which is a format change.
              */
-            struct buffer_head *vbh = cetrafs_bread_uncached_retry(sb, fs_lba);
+            struct buffer_head *vbh = cetrafs_cas_verify_read(sb, fs_lba);
 
             if (!vbh) {
-                pr_err("CAS lba=%llu: outcome unknown and the region could not be re-read\n",
+                pr_err("CAS lba=%llu: outcome unknown and the region could not be re-read from the device\n",
                        (unsigned long long) fs_lba);
                 ret = -EIO;
                 goto out;
@@ -1086,7 +1126,7 @@ static int cetrafs_cas_region_seeded_impl(struct super_block *sb,
              * peer writing over our late landing, which cannot be told
              * apart from a peer that simply won -- refuse rather than
              * guess, as the timeout path above does. */
-            struct buffer_head *vbh = cetrafs_bread_uncached_retry(sb, fs_lba);
+            struct buffer_head *vbh = cetrafs_cas_verify_read(sb, fs_lba);
 
             if (vbh && !memcmp(vbh->b_data + off, unknown, region)) {
                 pr_warn("CAS lba=%llu: the timed-out command landed late -- taking it as done\n",
@@ -1454,6 +1494,47 @@ void cetrafs_cas_selftest(struct super_block *sb, u32 my_node_id)
             if (!ok)
                 break;
             pr_info("CAS selftest: a timed-out (%s) command applied the delta exactly once\n", what);
+        }
+    }
+
+    /*
+     * 2d. A timed-out command whose re-read can only see this node's own
+     * DIRTY copy: the outcome cannot be decided, so the swap must be
+     * reported as unknown (-EIO) and NOT repeated -- the command did land,
+     * and running the delta again would apply it twice. See
+     * cetrafs_cas_verify_read().
+     */
+    if (ok && have_caw) {
+        u8 base = 0x30;
+
+        ret = cetrafs_cas_record(sb, lba, cetrafs_cas_selftest_set, &base);
+        if (ret) {
+            pr_err("CAS selftest: could not set the dirty-verify baseline: %d\n", ret);
+            ok = false;
+        } else {
+            cetrafs_caw_timeout_landed_once = true;
+            cetrafs_cas_verify_dirty_once = true;
+            ret = cetrafs_cas_record(sb, lba, cetrafs_cas_selftest_inc, NULL);
+            cetrafs_caw_timeout_landed_once = false;
+            cetrafs_cas_verify_dirty_once = false;
+            if (ret != -EIO) {
+                pr_err("CAS selftest: an undecidable timeout returned %d, expected -EIO\n", ret);
+                ok = false;
+            }
+            bh = cetrafs_bread_uncached_retry(sb, lba);
+            if (!bh) {
+                pr_err("CAS selftest: could not read back the dirty-verify case\n");
+                ok = false;
+            } else {
+                if ((u8) bh->b_data[CETRAFS_CAS_SELFTEST_OFF] != (u8) (base + 1)) {
+                    pr_err("CAS selftest: an undecidable timeout left the delta applied %d time(s), expected once\n",
+                           (int) ((u8) bh->b_data[CETRAFS_CAS_SELFTEST_OFF] - base));
+                    ok = false;
+                }
+                brelse(bh);
+            }
+            if (ok)
+                pr_info("CAS selftest: a timeout only a dirty local copy could judge was refused, applied once\n");
         }
     }
 
