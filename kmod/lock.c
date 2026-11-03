@@ -1029,9 +1029,12 @@ bool cetrafs_inode_fd_dirty(struct inode *inode)
     return CETRAFS_I(inode)->fd_dirty;
 }
 
-void cetrafs_inode_ns_mutex_lock(struct inode *inode)
+/* Killable: the holder may be sleeping through a namespace-lock
+ * acquire's whole retry budget (seconds) against a peer, and a waiter
+ * here should not sit in D state for that. -EINTR on a fatal signal. */
+int cetrafs_inode_ns_mutex_lock(struct inode *inode)
 {
-    mutex_lock(&CETRAFS_I(inode)->ns_mutex);
+    return mutex_lock_killable(&CETRAFS_I(inode)->ns_mutex);
 }
 
 /* See ns_holder's comment in struct cetrafs_inode_info. */
@@ -1551,7 +1554,12 @@ int cetrafs_lock_open(struct inode *inode, struct file *file)
     if (want_write && cetrafs_sb_is_fenced(sb))
         return -EIO; /* self-fenced: no new write claims */
 
-    mutex_lock(&ci->lock_mutex);
+    /* Killable: another open of this file may hold it through a stale
+     * holder's fence and journal replay -- device I/O of unbounded
+     * length. Nothing is changed before this point. */
+    ret = mutex_lock_killable(&ci->lock_mutex);
+    if (ret)
+        return ret;
 
     /* No PR mutex here any more: the claim below is a single
      * atomic compare-and-swap, which supplies its own atomicity against

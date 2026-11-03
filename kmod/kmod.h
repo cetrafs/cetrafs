@@ -862,7 +862,7 @@ u32 cetrafs_inode_staged_nlink_base(struct inode *inode);
 void cetrafs_inode_drop_staged_record(struct inode *inode);
 bool cetrafs_inode_take_staged_record(struct inode *inode, cetrafs_inode_t *out, bool *out_fd_too);
 bool cetrafs_inode_peek_staged_record(struct inode *inode, cetrafs_inode_t *out);
-void cetrafs_inode_ns_mutex_lock(struct inode *inode);
+int cetrafs_inode_ns_mutex_lock(struct inode *inode);
 void cetrafs_inode_ns_mutex_unlock(struct inode *inode);
 void cetrafs_inode_ns_holder_set(struct inode *inode, bool held);
 void cetrafs_inode_fd_stage(struct inode *inode, const cetrafs_inode_t *raw);

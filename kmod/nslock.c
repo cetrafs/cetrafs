@@ -393,7 +393,9 @@ static int cetrafs_nslock_acquire_tries(struct inode *inode, int max_tries)
     if (ret)
         return ret;
 
-    cetrafs_inode_ns_mutex_lock(inode);
+    ret = cetrafs_inode_ns_mutex_lock(inode);
+    if (ret)
+        return ret; /* killed while another local operation held it */
     /* Before the acquire can make us the live holder: a deferred retry
      * of an earlier release of ours would clear the lock under us. */
     had_deferred = cetrafs_sb_nslock_forget(sb, inode->i_ino, &deferred_gen);
@@ -410,6 +412,12 @@ static int cetrafs_nslock_acquire_tries(struct inode *inode, int max_tries)
             if (ret)
                 goto fail;
             return ret;
+        }
+        /* The budget is seconds of sleeping against a peer's lock:
+         * let a fatal signal end it. Nothing has been changed yet. */
+        if (fatal_signal_pending(current)) {
+            ret = -EINTR;
+            goto fail;
         }
         msleep(CETRAFS_NSLOCK_SLEEP_MS);
     }
@@ -689,7 +697,9 @@ int cetrafs_nslock_acquire_set(struct inode **inodes, int n)
             cetrafs_nslock_release(ordered[i]);
 
         if (ret != -EBUSY)
-            return ret; /* a hard error (fenced, read failure) -- do not spin */
+            return ret; /* a hard error (fenced, read failure, killed) -- do not spin */
+        if (fatal_signal_pending(current))
+            return -EINTR;
 
         /* Contended: back off and retry the whole ordered set, holding
          * nothing in the meantime. */
