@@ -1216,11 +1216,17 @@ void cetrafs_free_vfs_inode(struct inode *inode)
 {
     struct cetrafs_inode_info *ci = CETRAFS_I(inode);
 
-    /* The reconcile worker holds an igrab reference, so it cannot still
-     * be running here -- but a cancel is the cheap proof of that rather
-     * than an assumption, and it also covers a queued-but-never-run item
-     * on an unmount race. */
-    cancel_work_sync(&ci->cold_work);
+    /* No cancel_work_sync() here: ->free_inode runs from an RCU callback,
+     * in softirq, where it may not sleep -- and a cancel would wait, if
+     * the reconcile whose final iput() freed this inode had not yet
+     * returned. Nor is one needed. The reconcile is only ever queued
+     * with an igrab() reference (cetrafs_sb_queue_cold()), so a PENDING
+     * one keeps the inode alive and cannot be found here; a RUNNING one
+     * touches nothing of ci after that iput(), and the workqueue core
+     * does not touch a work item once its function has returned. The
+     * unmount side is cetrafs_sb_cold_close(). What remains is checked,
+     * not assumed: */
+    WARN_ON_ONCE(work_pending(&ci->cold_work));
 
     /* ->evict_inode unconditionally drops the reservation, which
      * unpublishes this entry, so by here it must be off the mount's
