@@ -356,9 +356,12 @@ static int scrub_mark_candidates(struct super_block *sb, struct scrub_bg *b)
     if (!bmap)
         return -EIO;
     bitmap_zero(b->cand, (unsigned int) b->data_count);
-    for (bit = 0; bit < b->data_count; bit++)
+    for (bit = 0; bit < b->data_count; bit++) {
         if (scrub_bit_set(bmap, bit) && !test_bit((unsigned int) bit, b->ref))
             __set_bit((unsigned int) bit, b->cand);
+        if (!(bit & 0xffff))
+            cond_resched(); /* data_count is disk geometry: up to 2^32 */
+    }
     kvfree(bmap);
     return 0;
 }
@@ -377,6 +380,8 @@ static int scrub_free_confirmed(struct cetrafs_scrub *s, struct scrub_bg *b, u64
     for (bit = 0; bit < b->data_count; bit++) {
         if (s->draining)
             break;
+        if (!(bit & 0xffff))
+            cond_resched(); /* data_count is disk geometry: up to 2^32 */
         /*
          * Anything allocated in this Block Group since the evidence was
          * taken invalidates the whole verdict for it: the allocator
