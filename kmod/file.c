@@ -4178,6 +4178,7 @@ static long cetrafs_fallocate(struct file *file, int mode, loff_t offset, loff_t
     u32 new_n = 0;
     u64 meta_blocks = 0;
     u32 freed = 0, discard = 0;
+    bool published = false; /* the map changed: the tail of the punch updates blocks/ctime */
     int ret;
 
     recs = kmalloc(2 * sizeof(*recs), GFP_NOFS);
@@ -4413,13 +4414,19 @@ static long cetrafs_fallocate(struct file *file, int mode, loff_t offset, loff_t
      *
      * Checked by content, not just by the freed count, so a punch that
      * only RESHAPES the map (a split freeing nothing) still publishes.
+     *
+     * Nothing to PUBLISH is not nothing to DO: the boundary blocks
+     * partly inside the range still hold data that must read as zeros,
+     * and the map says nothing about them. Skipping their zeroing here
+     * left a hole reading back an older write
+     * (tests/kernel/punch_noop_zeroes_boundary.sh).
      */
     if (freed == 0 && new_n == old_n &&
         (old_n == 0 || !memcmp(new_flat, old_flat, (size_t) old_n * sizeof(*new_flat)))) {
         kvfree(new_flat);
         kvfree(old_flat);
         ret = 0;
-        goto out;
+        goto zero_boundaries;
     }
 
     /* Build the fresh tree; the old one stays intact until we publish. */
@@ -4478,12 +4485,15 @@ static long cetrafs_fallocate(struct file *file, int mode, loff_t offset, loff_t
     }
     kvfree(new_flat);
     kvfree(old_flat);
+    published = true;
 
+zero_boundaries:
     /* Boundary blocks only partly inside [offset, end) keep the data
      * outside the hole: zero just the in-hole half of each (the tail of
      * offset's block, the head of end's block), through the ordinary
      * write path so the zeroes reach the device. After the publish, so a
-     * failed punch never got here. */
+     * failed punch never got here -- and also after a punch that had no
+     * whole block to free, which still owes these zeroes. */
     if (offset & (CETRAFS_BLOCK_SIZE - 1)) {
         loff_t block_end = (loff_t) start_block * CETRAFS_BLOCK_SIZE;
 
@@ -4494,6 +4504,8 @@ static long cetrafs_fallocate(struct file *file, int mode, loff_t offset, loff_t
 
         ret = cetrafs_zero_range(inode->i_mapping, block_start, (size_t) (end - block_start));
     }
+    if (!published)
+        goto out; /* the map did not change: nothing below applies */
 
     inode->i_blocks = cetrafs_le64(raw.blocks);
     inode_set_ctime(inode, ktime_get_real_seconds(), 0);
