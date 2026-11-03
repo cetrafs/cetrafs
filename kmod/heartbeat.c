@@ -77,6 +77,12 @@ MODULE_PARM_DESC(
     hb_interval_secs,
     "seconds between heartbeat ticks (UNBOUNDED test knob; operator limits are on the per-mount controls file)");
 
+/* TEST ONLY: fail every heartbeat renewal without touching the device,
+ * as a hung or unreachable LUN would (tests/kernel/lease_expiry.sh). */
+static bool cetrafs_hb_renew_fail;
+module_param_named(hb_renew_fail, cetrafs_hb_renew_fail, bool, 0644);
+MODULE_PARM_DESC(hb_renew_fail, "TEST ONLY: fail every heartbeat renewal");
+
 static bool cetrafs_fence_skip_precheck;
 module_param_named(fence_skip_precheck, cetrafs_fence_skip_precheck, bool, 0644);
 MODULE_PARM_DESC(fence_skip_precheck,
@@ -116,6 +122,8 @@ static void cetrafs_heartbeat_tick(struct work_struct *work)
     struct cetrafs_heartbeat *hb = container_of(work, struct cetrafs_heartbeat, work.work);
     struct super_block *sb = hb->sb;
     u32 my_node_id;
+    unsigned long lease_t0;
+    unsigned int lease_interval;
     int ret;
 
     /*
@@ -175,7 +183,16 @@ static void cetrafs_heartbeat_tick(struct work_struct *work)
         }
     }
 
-    ret = cetrafs_node_renew_heartbeat(sb, my_node_id);
+    /* The lease is counted from BEFORE the renewal: a peer starts its
+     * watch no earlier than when the new hb_seq lands, which is later. */
+    lease_t0 = jiffies;
+    lease_interval = cetrafs_heartbeat_interval_secs(sb);
+    ret = cetrafs_hb_renew_fail ? -EIO /* test-only, see the parameter */
+                                : cetrafs_node_renew_heartbeat(sb, my_node_id);
+    if (ret == 0)
+        /* The smaller of the intervals before and after: the row
+         * advertises one of them, and controls may have moved it. */
+        cetrafs_sb_lease_renewed(sb, lease_t0, min(lease_interval, cetrafs_heartbeat_interval_secs(sb)));
     if (ret == -EPERM) {
         /* The renew itself found our lease revoked. This is the
          * authoritative detection -- the check above races, since a peer

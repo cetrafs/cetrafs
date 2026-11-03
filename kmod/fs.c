@@ -203,6 +203,31 @@ struct cetrafs_sb_info {
      * mutex attempt", it cannot make it zero without hardware fencing). */
     bool fenced;
 
+    /*
+     * The in-core lease: until when this node may keep writing on the
+     * strength of its last heartbeat renewal. A peer calls us dead only
+     * after watching our hb_seq sit still for at least four of our
+     * advertised intervals (cetrafs_sb_peer_progress_stale()); this
+     * expires one interval sooner, counted from when that renewal
+     * STARTED, so writes stop before anybody can have reclaimed what
+     * they write into.
+     *
+     * The fence above is only ever found by the heartbeat tick -- and a
+     * tick stuck behind a hung device finds nothing, while every other
+     * thread keeps writing the moment I/O returns. The lease needs no
+     * I/O to check: cetrafs_sb_is_fenced() compares jiffies, and on
+     * expiry latches lease_lost for good and has lease_work run the
+     * ordinary self-fence. Armed by the first successful renewal, and
+     * only on a mount that can have peers (CAW). See
+     * cetrafs_sb_lease_renewed().
+     */
+    struct super_block *sb; /* for lease_work */
+    bool lease_active;
+    unsigned long lease_until;
+    unsigned long lease_lost; /* bit 0: expired, latched */
+    struct work_struct lease_work;
+    bool lease_work_ready;
+
     /* Atomic COMPARE AND WRITE capability of the backing device,
      * discovered ONCE at mount (the SCSI path issues a VPD INQUIRY, so
      * it must not be re-probed per operation) and cached here. Decides
@@ -2177,6 +2202,15 @@ void cetrafs_free_sb_info(struct super_block *sb)
     cetrafs_dmpath_forget(sb->s_bdev); /* stop holding a path device open */
     kfree(sbi->raw_sb);
     kfree(sbi->bg_desc_lba);
+    /* The lease stays armed through the final flushes above -- the
+     * heartbeat stopped first, so they are exactly the writes it must
+     * bound. Disarm it only now, then wait out a fence it may have
+     * queued: nothing can queue another once lease_active is false. */
+    if (sbi->lease_work_ready) {
+        WRITE_ONCE(sbi->lease_active, false);
+        smp_mb();
+        cancel_work_sync(&sbi->lease_work);
+    }
     bitmap_free(sbi->owned_bgs);
     kfree(sbi->bg_owner_zg);
     kfree(sbi->bg_count_epoch);
@@ -2565,11 +2599,69 @@ void cetrafs_sb_fence(struct super_block *sb, const char *reason)
     }
 }
 
+/*
+ * TEST ONLY. Arm the lease on a mount without CAW, where no peer can
+ * exist and it is otherwise off -- the loop harness has no CAW, and this
+ * is how tests/kernel/lease_expiry.sh reaches it.
+ */
+static bool cetrafs_lease_force;
+module_param_named(lease_force, cetrafs_lease_force, bool, 0644);
+MODULE_PARM_DESC(lease_force, "TEST ONLY: arm the in-core lease on a mount without CAW");
+
+static void cetrafs_sb_lease_work(struct work_struct *w)
+{
+    struct cetrafs_sb_info *sbi = container_of(w, struct cetrafs_sb_info, lease_work);
+
+    cetrafs_sb_fence(sbi->sb,
+                     "this node's lease expired -- no heartbeat renewal reached the device in time, so peers may "
+                     "already treat it as dead");
+}
+
+/*
+ * A renewal that STARTED at jiffies 't0' advertising 'interval_secs'
+ * reached the device: extend the lease. The first one arms it. Nothing
+ * extends a lease that has lapsed -- by then a peer may have reclaimed
+ * from us, and the only way back is a remount.
+ */
+void cetrafs_sb_lease_renewed(struct super_block *sb, unsigned long t0, unsigned int interval_secs)
+{
+    struct cetrafs_sb_info *sbi = sb->s_fs_info;
+
+    if (!sbi || !interval_secs || test_bit(0, &sbi->lease_lost))
+        return;
+    if (!READ_ONCE(sbi->lease_active)) {
+        if (!cetrafs_sb_mount_has_caw(sb) && !cetrafs_lease_force)
+            return; /* no peer can exist, so nobody can reclaim from us */
+        if (!sbi->lease_work_ready) {
+            sbi->sb = sb;
+            INIT_WORK(&sbi->lease_work, cetrafs_sb_lease_work);
+            sbi->lease_work_ready = true;
+        }
+    }
+    WRITE_ONCE(sbi->lease_until, t0 + (unsigned long) interval_secs * 3 * HZ);
+    smp_wmb(); /* the deadline before the flag that makes it count */
+    WRITE_ONCE(sbi->lease_active, true);
+}
+
 bool cetrafs_sb_is_fenced(struct super_block *sb)
 {
     struct cetrafs_sb_info *sbi = sb->s_fs_info;
 
-    return sbi && READ_ONCE(sbi->fenced);
+    if (!sbi)
+        return false;
+    if (READ_ONCE(sbi->fenced) || test_bit(0, &sbi->lease_lost))
+        return true;
+    if (READ_ONCE(sbi->lease_active)) {
+        smp_rmb();
+        if (time_after(jiffies, READ_ONCE(sbi->lease_until))) {
+            /* One-way: a renewal that lands later must not reopen
+             * what a peer may already have reclaimed. */
+            if (!test_and_set_bit(0, &sbi->lease_lost))
+                schedule_work(&sbi->lease_work);
+            return true;
+        }
+    }
+    return false;
 }
 
 const struct cetrafs_caw_info *cetrafs_sb_caw(struct super_block *sb)

@@ -192,6 +192,7 @@ u32 cetrafs_sb_alloc_cursor(struct super_block *sb);
 void cetrafs_sb_set_alloc_cursor(struct super_block *sb, u32 bg_id);
 void cetrafs_sb_fence(struct super_block *sb, const char *reason);
 bool cetrafs_sb_is_fenced(struct super_block *sb);
+void cetrafs_sb_lease_renewed(struct super_block *sb, unsigned long t0, unsigned int interval_secs);
 bool cetrafs_sb_defrag_draining(struct super_block *sb);
 /* Per-mount defragmentation switches (procfs.c's 'controls' file).
  * _defrag_enabled() gates defragmentation entirely, the ioctl included;
