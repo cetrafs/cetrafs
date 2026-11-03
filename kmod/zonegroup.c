@@ -1739,8 +1739,10 @@ static int cetrafs_pf_drain_mutate(void *image, unsigned int len, void *priv)
         if (ent[e].lba == 0)
             continue;
 
-        /* Garbage is cleared on sight -- leaving it would wedge the
-         * queue forever, since nothing can ever apply it. */
+        /* Garbage is cleared on sight. Nothing can ever apply it, so
+         * leaving it would wedge that slot. A region holding ONLY garbage
+         * never reaches this swap (the drain skips it), so its garbage
+         * waits for a valid entry in the same region. */
         if (cetrafs_le32(ent[e].magic) != CETRAFS_PENDING_FREE_MAGIC || cetrafs_le32(ent[e].count) == 0) {
             memset(&ent[e], 0, sizeof(ent[e]));
             changed = true;
@@ -1852,7 +1854,7 @@ static int cetrafs_zg_drain_one(struct super_block *sb, u32 zg_id)
                     pr_err("pending free: ZG %u queue block %u entry %u is garbage (magic=0x%x count=%u) -- dropping\n",
                            zg_id, qb, e, ent[e].magic, ent[e].count);
                     cetrafs_sb_corrupt(sb, 0);
-                    continue; /* the CAS below clears it */
+                    continue; /* the CAS below clears it, but only if the region has valid entries */
                 }
                 ctx->done[ctx->n].lba = cetrafs_le64(ent[e].lba);
                 ctx->done[ctx->n].count = cetrafs_le32(ent[e].count);
@@ -1860,7 +1862,10 @@ static int cetrafs_zg_drain_one(struct super_block *sb, u32 zg_id)
             }
 
             if (!ctx->n)
-                continue; /* empty region (any garbage is cleared on the next pass with company) */
+                /* No valid entries: the CAS is skipped, so a garbage slot
+                 * here is NOT cleared. It stays until a valid entry lands
+                 * in this region and a CAS runs over it. */
+                continue;
             block_had_entries = true;
 
             /* CONSUME first. Only entries this swap actually removed from

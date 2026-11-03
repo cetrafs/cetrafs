@@ -41,7 +41,7 @@ ccflags-y += -Wframe-larger-than=1024
 # It does not relax anything for an ordinary build, and it is not a
 # licence to grow frames: a KASAN build that fails even at 2048 is
 # telling you something real (cetrafs_dm_collect(), which RECURSES four
-# deep, and cetrafs_defrag_inode()'s kilobyte record were both found
+# deep, and cetrafs_defrag_inode()'s 652-byte record were both found
 # exactly this way).
 ifeq ($(KASAN),1)
 ccflags-y += -Wframe-larger-than=2048

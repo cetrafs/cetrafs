@@ -360,10 +360,13 @@ static struct buffer_head *cetrafs_dirent_read(struct super_block *sb, u64 lba, 
  *
  * Only EQUALITY is ever asked of this value, never ordering, so it does
  * not need to count -- it needs to be unique per write. The generation
- * stamp already has that property (a nanosecond clock xor'd with the
- * node id), so any two writes by any two nodes differ, and a stale
- * revert differs from the reader's stamp too, which forces a fresh read:
- * the safe direction.
+ * stamp used here is a nanosecond wall-clock reading xor'd with the node
+ * id, so it is unique in PRACTICE, not by construction. Writes by two
+ * different nodes can collide only if their clock readings and node ids
+ * cancel out in the high byte. Two writes by one node repeat the value
+ * only if its clock returns the same nanosecond twice, or steps
+ * backwards. A repeat is the one case where a stale revert can carry the
+ * reader's own stamp, and then the reader is served from cache.
  */
 static u64 cetrafs_dirent_seq_new(struct super_block *sb)
 {

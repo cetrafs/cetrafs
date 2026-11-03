@@ -10,15 +10,14 @@
  * cetrafs_sb_info for later phases (ZG claiming stamps it into
  * cetrafs_zone_group_t.owner_node_id).
  *
- * The free-row claim is one atomic compare-and-swap of the row. A
- * silently lost race must never be accepted quietly (a filesystem does
- * not get to shrug at a narrow window), so beneath the CAS the claim
- * path also writes then reads back to confirm the write
- * stuck, treating a mismatch as a lost race and retrying the next free
- * row rather than letting two nodes silently share one identity. With PR
- * support this is a belt-and-suspenders second check on top of a real
- * mutex; without it, it's the only check there is, and still has its own
- * much smaller TOCTOU gap between the write and the verify-read.
+ * The free-row claim is one atomic compare-and-swap of the row: the
+ * mutator runs only on a FREE row, and the swap lands only if the sector
+ * is still byte-for-byte what the mutator was shown. A lost race is
+ * detected by the CAS itself (MISCOMPARE, re-read, the next free row is
+ * tried), so two nodes cannot share one row. There is no separate
+ * write-then-read-back. After the claim, cetrafs_node_twin_row() scans
+ * the other rows for this machine's UUID, so a clone that claimed a row
+ * at the same moment is refused rather than silently sharing identity.
  *
  * Also implements the node-liveness half: periodic
  * self-renewal (cetrafs_node_renew_heartbeat(), driven by heartbeat.c's
@@ -767,12 +766,11 @@ int cetrafs_node_register(struct super_block *sb,
  * delayed_work): bump our own row's hb_seq/last_seen so other nodes
  * watching it don't mistake a merely-slow node for a dead one.
  *
- * No PR lock here -- unlike the contested free-row claim above, nobody
- * else should ever be writing to our own row while we hold it, so this
- * isn't a race to arbitrate, just routine upkeep. The read-back
- * afterward is still worth doing (same "never trust a write silently"
- * posture as everywhere else in this codebase), but a mismatch here
- * would mean real corruption, not a lost race against another node.
+ * No separate lock here -- unlike the contested free-row claim above,
+ * nobody else should ever be writing to our own row while we hold it,
+ * so this is routine upkeep, not a race to arbitrate. It is one CAS of
+ * the row's sector, which fails (and the mutator refuses) if the row is
+ * no longer ours; there is no read-back after it.
  */
 struct cetrafs_node_renew_ctx {
     u64 expect_epoch; /* the lease we registered with */
@@ -1478,9 +1476,13 @@ int cetrafs_node_nocaw_peer_exists(struct super_block *sb, const u8 *my_uuid, bo
  * Checks EVERY REGISTERED row, not just the non-stale ones: a stale row
  * is a node that is merely paused (slow, swapped out, mid-reboot), and
  * if it is an OLD build it will resume on the old layout with no idea
- * the tables moved. A truly dead node's row is freed by stale-reclaim
- * and then stops blocking; a live old node correctly blocks the grow for
- * as long as it is mounted. Our own row is included and trivially passes
+ * the tables moved. Stale-reclaim does not free a row: no kernel path
+ * takes a REGISTERED row to FREE, so a truly dead node's row stays
+ * REGISTERED and keeps counting here until an operator clears it
+ * offline. A row that lacks the capability therefore blocks the grow
+ * for as long as it stays REGISTERED, dead or alive (a live old node
+ * blocks it for as long as it is mounted). Our own row is included and
+ * trivially passes
  * (we stamped it). Returns false on any read error -- unknown is unsafe.
  *
  * One record read per row, bounded by the table's mkfs capacity; called

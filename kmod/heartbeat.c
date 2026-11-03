@@ -129,7 +129,8 @@ static void cetrafs_heartbeat_tick(struct work_struct *work)
     /*
      * Re-arm BEFORE doing anything, not after.
      *
-     * A peer decides we are dead by how long ago we last renewed, so
+     * A peer decides we are dead by watching our hb_seq stop advancing
+     * for longer than its window (timed on the peer's own clock), so
      * the renewal's period is the only number that window is measured
      * against. Arming at the END of the tick made that period
      * "interval PLUS however long this tick took" -- and the tick also

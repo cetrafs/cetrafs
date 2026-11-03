@@ -1621,8 +1621,8 @@ int cetrafs_lock_open(struct inode *inode, struct file *file)
          * heartbeat has gone stale is reclaimable rather than a
          * permanent -ETXTBSY -- see node.c's cetrafs_node_is_stale()
          * for what "stale" means and its caveats. Only mutate the local
-         * copy here; nothing gets persisted unless this open goes on to
-         * actually claim it below (a mere read-open just gets to
+         * copy here; the lock is written back only if this open goes on
+         * to actually claim it below (a mere read-open just gets to
          * proceed, same as if it found the file genuinely unlocked). */
         ret = cetrafs_node_is_stale(sb, cetrafs_le32(raw.lock_owner_node), &stale);
         if (ret)
@@ -1638,12 +1638,10 @@ int cetrafs_lock_open(struct inode *inode, struct file *file)
          * this very file (e.g. mid-write of an extent-leaf block its
          * exclusive lock protected), that must be repaired before anyone
          * reads or builds on those blocks. One-shot (the dead node's
-         * flag goes clean on the first successful replay). Passing
-         * cluster_mutex_held per whether this open's own claim path
-         * already took it (write-opens do, read-only bypasses don't). */
-        /* We hold no cluster mutex here any more (the claim is a CAS), so
-         * replay takes its own -- which is also what serializes
-         * concurrent replayers of the same dead node. */
+         * flag goes clean on the first successful replay). */
+        /* We hold no cluster mutex here (the claim is a CAS), so the
+         * fence and replay below take their own claim -- which is also
+         * what serializes concurrent replayers of the same dead node. */
         /* ...unless this is a read-only mount, where both halves of
          * that are writes an observer must not make: fencing CASes the
          * peer's registry row, and replay writes into its data region.
@@ -1669,10 +1667,13 @@ int cetrafs_lock_open(struct inode *inode, struct file *file)
 
         pr_warn("lock: ino=%llu reclaiming a stale lock from node %u\n", (unsigned long long) inode->i_ino,
                 raw.lock_owner_node);
-        /* Record the verdict for the CAS below instead of editing the
-         * local copy: the swap must be told exactly whose claim it is
-         * allowed to displace, and a read-only open just proceeds
-         * without persisting anything at all. */
+        /* Record the verdict for the CAS below: the swap must be told
+         * exactly whose claim it may displace. The local copy is edited
+         * so this open sees the lock as free. A read-only open never
+         * reaches that CAS, so it writes no lock state. The fence and
+         * replay above are another matter: on a read-write mount they
+         * persist for ANY open, read-only or not, since they repair the
+         * dead node's state. */
         reclaim_from_stale = true;
         stale_owner = cetrafs_le32(raw.lock_owner_node);
         raw.lock_mode = CETRAFS_LOCK_NONE;

@@ -185,7 +185,8 @@
  * as the compare image.
  *
  * Which records this applies to, and why the others don't need it:
- *  - inode record (188 B) and Node Registry row (128 B): already alone
+ *  - inode record (1024 B on disk, a 652 B struct) and Node Registry row
+ *    (128 B): already alone
  *    at offset 0 of their own block since v0x0007, with a zero-filled
  *    remainder, so their first sector is already a deterministic,
  *    self-checksummed CAS unit. No layout change was needed.
@@ -756,9 +757,10 @@ typedef struct {
  * full) is a cetrafs_extent_hdr_t followed by as many cetrafs_extent_t
  * as fit in the rest of the block. Part of the on-disk format, so the
  * kernel and fsck must agree on it exactly. */
-/* One fewer than it used to hold (340 -> 339): the last 8 bytes are now
- * the tail checksum. An xattr block loses nothing -- 12 entries of 322
- * bytes leave 232 bytes of slack, and the tail fits inside it. */
+/* 254 entries: 4096 - 12 (header) - 8 (tail checksum) leaves 4076 bytes,
+ * which hold 254 whole 16-byte extents. An xattr block loses nothing
+ * -- 12 entries of 322 bytes leave 232 bytes of slack, and the tail fits
+ * inside it. */
 #define CETRAFS_EXT_BLOCK_MAX_LEAVES \
     ((CETRAFS_BLK_TAIL_OFF - sizeof(cetrafs_extent_hdr_t)) / sizeof(cetrafs_extent_t))
 
@@ -1122,8 +1124,10 @@ typedef struct {
     __le32 ee_len;             /* number of blocks (high bit for uninit opt).
                                 * v2 widened this from u16: at 15 length bits
                                 * one extent capped at 128 MiB, so one leaf
-                                * block's 339 entries capped a DENSE file at
-                                * ~42 GiB however much the volume held. 31
+                                * block's entries (339 before the tail
+                                * checksum, 254 now) capped a DENSE file at
+                                * ~42 GiB (~32 GiB now) however much the
+                                * volume held. 31
                                 * bits = up to 8 TiB per extent. */
     __le32 ee_start_lo;        /* low 32 bits of physical start */
     __le16 ee_start_hi;        /* high 16 bits of physical start */

@@ -1117,11 +1117,11 @@ static enum cetrafs_journal_verdict cetrafs_journal_judge(const struct cetrafs_j
  * suspenders), sort by txn_id, apply each (copy payload over
  * target_lba), consume them, and park the flag at CLEAN.
  *
- * Callers replaying a STALE node's area on a multi-node volume must hold
- * the cluster mutex (pass cluster_mutex_held=true if already holding it,
- * e.g. zonegroup.c's claim path; false to have this take and release it)
- * -- that plus the flag check serializes concurrent replayers, and
- * replaying twice is idempotent regardless. Reads of the flag and slot
+ * Replay serializes on the per-area replay claim (CAS), not a mutex:
+ * a node that loses the claim gets -EEXIST, and with wait_for_claim
+ * (our own area at mount-attach) it waits for the holder instead. That
+ * plus the flag check serializes concurrent replayers, and replaying
+ * twice is idempotent regardless. Reads of the flag and slot
  * headers are uncached: this area belongs to a different node whose
  * writes our cache has never seen.
  */

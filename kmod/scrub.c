@@ -10,13 +10,34 @@
  * Freeing a "leaked" block on a LIVE filesystem is safe only because:
  *
  *  1. SCOPE TO OWNED ZGs. Only a ZG's owner allocates from it, so the
- *     only in-flight allocations in a ZG this node owns are its own.
- *     Collectively the volume is still covered.
+ *     in-flight allocations in a ZG this node owns are its own, and
+ *     every free re-checks ownership (cached lookup) before it acts.
+ *     Collectively the volume is still covered. This does NOT cover a
+ *     previous owner that is alive but slow: its in-flight allocation
+ *     predates the transfer, and nothing in this node's counters sees
+ *     it. Adoption (zonegroup.c's cetrafs_zg_scrub_adopt_one_stale())
+ *     takes a ZG only once the registry says its owner is stale, and
+ *     that is a timing judgement, not a proof -- see the note after
+ *     this list.
  *
  *  2. TWO PASSES WITH A GAP. A block mid-allocation (bit durable,
- *     extent not yet) looks leaked. A real allocation commits its
- *     extent within one get_block() -- milliseconds -- so it is
- *     referenced by pass 2. The gap dwarfs any get_block().
+ *     extent not yet) looks leaked. The gap (scrub_gap_secs, 15 s by
+ *     default) lets an allocation commit its extent, so pass 2 sees it
+ *     as referenced. That is a margin, not a guarantee: it holds only
+ *     while the allocation commits within the gap. A real allocation
+ *     normally commits within one get_block(), but a stalled writer
+ *     can take longer, and the gap does not bound it.
+ *
+ * THE PREVIOUS OWNER. Points 1 and 2 leave one case open: an owner that
+ * is alive but slow, whose allocation is still in flight when its ZG is
+ * adopted. The protection there is the registry lease, not the gap. The
+ * peer is adopted only after its heartbeat has not advanced for the
+ * staleness window; the adoption bumps its fence_epoch, and it self-fences
+ * (refuses every metadata write) on its next tick, or once its own lease
+ * is three intervals old. Fencing is advisory: an I/O already queued at
+ * the device still lands, so a stalled owner's write can reach a block
+ * this scrub has freed. That residual window is bounded by the device
+ * queue, not by anything in this file.
  *
  *  3. LIVE RESERVATIONS ARE EXEMPT. Point 2 does not cover the
  *     speculative run behind the written block: lock.c claims a run

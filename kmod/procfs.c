@@ -13,8 +13,8 @@
  *  - info: topology + live usage -- block size, total/free blocks and
  *    inodes, ZG/BG counts and sizes, this node's own ZG/BG ownership.
  *  - properties: static format/feature info -- on-disk version, feature
- *    flags, and whether the underlying device actually supports SCSI PR
- *    (i.e. whether real clustering safety is available on this mount).
+ *    flags, and whether the underlying device supports atomic COMPARE
+ *    AND WRITE (CAW), which the cluster's claims are built on.
  *  - cluster: the live Node Registry -- every non-FREE row's UUID,
  *    state, hb_seq, last_seen, and whether this node currently considers
  *    it stale.
@@ -362,10 +362,9 @@ static int cetrafs_proc_properties_show(struct seq_file *m, void *v)
                        cetrafs_sb_caw_available(sb) ? "yes" : "no");
     }
 
-    /* The one dynamic fact here: whether *this* device's queue actually
-     * supports SCSI PR, which is what phase 10's ZG-claiming mutex (and
-     * phase 9's node-registration claim) needs to be more than a
-     * best-effort check -- see pr.c/zonegroup.c. */
+    /* The one dynamic fact here: whether *this* device supports atomic
+     * COMPARE AND WRITE. Every cross-node claim is a CAW on one record
+     * (see caw.c), and without it the no-CAW fallback applies. */
 
     return 0;
 }

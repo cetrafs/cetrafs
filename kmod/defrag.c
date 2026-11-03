@@ -403,8 +403,9 @@ int cetrafs_defrag_inode(struct inode *inode, struct cetrafs_defrag_stats *out_s
     struct cetrafs_defrag_stats stats = {0};
     /*
      * The record lives on the HEAP, like fallocate's pair and for the
-     * same reason: cetrafs_inode_t is a kilobyte, and a kilobyte of
-     * kernel stack in a function that then calls into the allocator,
+     * same reason: cetrafs_inode_t is a 652-byte struct (its on-disk
+     * record is 1 KiB), and 652 bytes of kernel stack in a function
+     * that then calls into the allocator,
      * the journal and the CAS layer is a lot to spend on one local. A
      * KASAN build puts the frame at 1296 bytes and refuses to compile
      * it, which is how this one surfaced.

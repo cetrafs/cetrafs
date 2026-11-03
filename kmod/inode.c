@@ -96,9 +96,9 @@ u64 cetrafs_inode_lba(struct super_block *sb, u64 ino)
 }
 
 /* Stamp a WHOLE record: identity echoes plus both sector CRCs. Only for
- * writers entitled to the whole record (create/free/journal-less paths
- * where nothing shares it) and for staged images later split across the
- * two-step publish. */
+ * writers entitled to the whole record (create/free/journal-less paths,
+ * and directory records under their namespace lock) and for staged
+ * images later split across the two-step publish. */
 void cetrafs_inode_stamp_crc(struct super_block *sb, cetrafs_inode_t *in)
 {
     in->ns_checksum = cetrafs_cpu_to_le64(cetrafs_inode_crc_ns(in));
@@ -381,9 +381,9 @@ void cetrafs_invalidate_raw_inode(struct super_block *sb, u64 ino)
  * write, no read-modify-write at all: this record is the only thing
  * living in its block, and every legitimate writer of a given record is
  * already serialized by that record's own protocol (the file's
- * exclusive lock for data growth/truncate, the namespace cluster mutex
- * for create/unlink/rename/xattr, the PR mutex + verify-readback for
- * lock claims), so there is nothing in the block to preserve and nobody
+ * exclusive lock for data growth/truncate, the namespace lock for
+ * create/unlink/rename/xattr, the lock.c CAS for lock claims), so there
+ * is nothing in the block to preserve and nobody
  * concurrent to merge with. That eliminates both halves of the packed-
  * block corruption: the unbounded-staleness and concurrent-RMW issues
  * are structurally inexpressible now -- and the uncached-read-before-
@@ -405,8 +405,13 @@ void cetrafs_invalidate_raw_inode(struct super_block *sb, u64 ino)
  * compose), and its file sector changes only through the fd publish
  * below (so the file hot path can never take the namespace sector
  * backwards). cetrafs_write_raw_inode() -- the whole-record buffered
- * write -- remains ONLY for records nothing shares: a just-allocated
- * number (create/mkdir/symlink and their unwinds) and offline tools.
+ * write -- remains for records whose writer is entitled to all of them:
+ * a just-allocated number (create/mkdir/symlink and their unwinds),
+ * offline tools, and a directory record that rename() rewrites ('..',
+ * or a retargeted name's dirent sequence). A directory record IS shared,
+ * so those callers hold the directory's namespace lock across the blind
+ * write, and read the record fresh inside it: the namespace lock is what
+ * stops a peer publishing either sector in between.
  */
 
 struct cetrafs_ns_cas_ctx {
@@ -544,8 +549,11 @@ static void cetrafs_ns_apply_zero_nlink(cetrafs_inode_t *rec, void *arg)
  * stamp (unused on a dead record otherwise), and that is what keeps the
  * arbitration free of ABA: a claim-clear-release that put back exactly
  * the bytes a creator read would let that creator's birth CAS land on a
- * number whose bit had been cleared under it. The stamp only ever moves
- * forward, so it never does.
+ * number whose bit had been cleared under it. Within one life of a
+ * number the stamp only moves forward. A new life starts over: the
+ * creator's whole-record write (create, mkdir, symlink) follows its
+ * birth claim and writes dirent_seq back to zero along with the rest of
+ * the record.
  *
  * NOT the generation: it is echoed into the file sector (fd_generation),
  * which none of these swaps writes, and a record whose two sectors

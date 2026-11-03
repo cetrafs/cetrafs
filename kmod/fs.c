@@ -597,9 +597,10 @@ struct cetrafs_sb_info {
      * and referenced by NO extent, held for as long as the file stays
      * open. That is bit-for-bit the scrub's definition of a leaked
      * block -- and the scrub's safety argument explicitly rests on
-     * "a real allocation commits its extent within one get_block(),
-     * so it is referenced by the second pass", which a reservation
-     * does not. Without this list the scrub frees a run out from under
+     * "a real allocation commits its extent within the two-pass gap,
+     * so it is referenced by the second pass" (scrub.c, point 2), which
+     * a reservation does not. Without this list the scrub frees a run
+     * out from under
      * its owner, the owner hands those blocks out anyway, and two files
      * end up sharing them.
      *
@@ -3936,11 +3937,20 @@ int cetrafs_flush_dirty_free_counts(struct super_block *sb)
          *
          * Dropping it is correct, not lossy: the member Block Groups'
          * own counters and bitmaps were updated while we still owned
-         * them and are durable by the loop above, and whoever claims the
-         * ZG next reconciles the aggregate from those bitmaps. Applying
-         * it on top of that reconciliation is what double-counts -- and
-         * this aggregate is what statfs reports and what
-         * cetrafs_zg_claim_one_more() ranks candidates on.
+         * them, and whoever claims the ZG next reconciles the aggregate
+         * from those bitmaps. Applying it on top of that reconciliation
+         * is what double-counts -- and this aggregate is what statfs
+         * reports and what cetrafs_zg_claim_one_more() ranks candidates
+         * on.
+         *
+         * A member BG whose apply failed above has its delta re-accrued
+         * and not yet durable, and this ZG delta is applied regardless,
+         * so the aggregate can briefly include changes a member's count
+         * does not. That is the better of the two states, not a hazard:
+         * the aggregate is judged against the BITMAPS (fsck, and the
+         * claim's reconcile, which recounts members and sums them
+         * absolutely), and the bitmaps already hold the change. Holding
+         * this delta back would leave both counts stale instead of one.
          */
         if (!cetrafs_sb_zg_owned_cached(sb, zg_id)) {
             pr_warn("ZG %u: dropping a free-count delta of %lld for a zone group this node no longer owns\n", zg_id,
