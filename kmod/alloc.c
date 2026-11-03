@@ -1632,12 +1632,20 @@ not_ours:
     return -EPERM;
 }
 
+/* TEST ONLY: the next data allocation reports ENOSPC once, which sends
+ * its caller down the recount path. */
+static bool cetrafs_alloc_force_enospc_once;
+module_param_named(alloc_force_enospc_once, cetrafs_alloc_force_enospc_once, bool, 0644);
+MODULE_PARM_DESC(alloc_force_enospc_once, "TEST ONLY: fail the next data allocation with ENOSPC, once");
+
 int cetrafs_alloc_data_block(struct super_block *sb, u32 bg_id, u64 *out_lba)
 {
     struct cetrafs_bg_geom bg;
     long bit;
     int ret;
 
+    if (READ_ONCE(cetrafs_alloc_force_enospc_once) && xchg(&cetrafs_alloc_force_enospc_once, false))
+        return -ENOSPC; /* test-only; see the parameter */
     if (cetrafs_sb_is_fenced(sb))
         return -EIO; /* self-fenced */
 
@@ -1757,6 +1765,8 @@ int cetrafs_alloc_data_block_near(struct super_block *sb, u32 bg_id, u64 preferr
     struct cetrafs_bg_geom bg;
     int ret;
 
+    if (READ_ONCE(cetrafs_alloc_force_enospc_once) && xchg(&cetrafs_alloc_force_enospc_once, false))
+        return -ENOSPC; /* test-only; see the parameter */
     if (cetrafs_sb_is_fenced(sb))
         return -EIO; /* self-fenced */
 
@@ -2618,19 +2628,45 @@ int cetrafs_count_free_inodes(struct super_block *sb, u64 *out_free)
  * *out_delta receives (truth - cached) so the caller can correct the
  * owning Zone Group's aggregate without scanning it a second time.
  */
+/* TEST ONLY: one-shot pause between a reconcile's recount and its write,
+ * so a free or an allocation can be driven into that window
+ * (tests/kernel/reconcile_vs_free.sh). */
+static unsigned int cetrafs_reconcile_pause_ms;
+module_param_named(reconcile_pause_ms, cetrafs_reconcile_pause_ms, uint, 0644);
+MODULE_PARM_DESC(reconcile_pause_ms, "TEST ONLY: one-shot pause between a free-count recount and its write");
+
+static int cetrafs_reconcile_locked(struct super_block *sb, u32 bg_id, s64 *out_delta);
+
 int cetrafs_bg_reconcile_free_count(struct super_block *sb, u32 bg_id, s64 *out_delta)
 {
     const cetrafs_superblock_t *raw_sb = cetrafs_sb_raw(sb);
-    struct cetrafs_bg_geom bg;
-    u64 bmap_lba, bmap_blocks;
-    long truth;
-    s64 delta;
     int ret;
 
     if (out_delta)
         *out_delta = 0;
     if (!raw_sb)
         return -EINVAL;
+
+    /* Under alloc_mutex, from the recount to the epoch reset. Every
+     * local bitmap change and the delta it accrues happen under it
+     * (cetrafs_bg_adjust_free_blocks()'s callers), and the epoch reset
+     * below DROPS whatever delta has accrued: an allocation landing
+     * between the recount and the reset was in neither, and the count
+     * stayed off by it for good. The callers run at ownership transfer
+     * and after an ENOSPC, never on the per-block path. */
+    cetrafs_sb_alloc_lock(sb);
+    ret = cetrafs_reconcile_locked(sb, bg_id, out_delta);
+    cetrafs_sb_alloc_unlock(sb);
+    return ret;
+}
+
+static int cetrafs_reconcile_locked(struct super_block *sb, u32 bg_id, s64 *out_delta)
+{
+    struct cetrafs_bg_geom bg;
+    u64 bmap_lba, bmap_blocks;
+    long truth;
+    s64 delta;
+    int ret;
 
     ret = cetrafs_read_bg_geom(sb, bg_id, &bg);
     if (ret)
@@ -2641,6 +2677,14 @@ int cetrafs_bg_reconcile_free_count(struct super_block *sb, u32 bg_id, s64 *out_
     truth = cetrafs_bitmap_count_free(sb, bmap_lba, bmap_blocks, bg.data_block_count);
     if (truth < 0)
         return (int) truth;
+    {
+        unsigned int pause = xchg(&cetrafs_reconcile_pause_ms, 0);
+
+        if (pause) {
+            pr_info("reconcile: BG %u recounted, pausing %u ms (test)\n", bg_id, pause);
+            msleep(pause); /* test-only; see the parameter */
+        }
+    }
 
     delta = (s64) truth - (s64) bg.free_data_blocks;
     if (delta)

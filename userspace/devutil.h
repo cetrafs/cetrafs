@@ -702,11 +702,22 @@ static inline int cetrafs_find_live_peer(const char *dev,
             close(fd);
             return -1;
         }
-        if (rc == 1) { /* 2: never verified, even re-read -- garbage */
+        if (rc == 1) {
             iscand[idx] = 1;
             ncand++;
             if (cetrafs_le32(first[idx].hb_interval_secs) > slowest)
                 slowest = cetrafs_le32(first[idx].hb_interval_secs);
+        } else if (rc == 2) {
+            /* REGISTERED but never verified, re-reads included. Most
+             * likely garbage -- but a live node's row that stayed torn
+             * longer than the settle budget was dropped here as "nobody"
+             * and the tool went ahead on a mounted volume (fails open,
+             * CLAUDE.md rule 3). Watch it through the probe window like
+             * any candidate: a row that turns VALID meanwhile was being
+             * written, which is a live node; one still garbage after it
+             * is garbage. It costs one window, never a refusal. */
+            iscand[idx] = 2;
+            ncand++;
         }
     }
     if (ncand == 0) {
@@ -761,12 +772,16 @@ static inline int cetrafs_find_live_peer(const char *dev,
         }
         if (!rc)
             continue; /* it left, or its row went away, during the probe */
+        if (iscand[idx] == 2 && rc == 2)
+            continue; /* garbage before the window and after it */
         /* rc == 2: verified at the first look, never since -- the row
          * CHANGED during the probe, which is a writer at work. */
-        if (rc == 1 && now_ne.hb_seq == first[idx].hb_seq)
+        /* A row unverifiable at the first look and valid now was written
+         * during the probe: that is a live node, whatever its hb_seq. */
+        if (iscand[idx] == 1 && rc == 1 && now_ne.hb_seq == first[idx].hb_seq)
             continue; /* registered, but not heartbeating: gone */
         if (rc == 2)
-            now_ne = first[idx]; /* report what we last could verify */
+            now_ne = first[idx]; /* report what we last could verify (iscand 1 only) */
 
         if (out_row)
             *out_row = idx;

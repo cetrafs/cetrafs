@@ -49,12 +49,43 @@ grep -q "is mounted by another node (registry row 1" <<<"$OUT" &&
     pass "fsck re-read the torn row, watched the node beat, and refused" ||
     fail "fsck did not refuse a volume a live node has mounted: $(tail -1 <<<"$OUT")"
 
+log "a row torn for longer than the settle budget, then beating, is still a live node"
+# The settle loop gives a row ~310 ms. A REGISTERED row still torn after
+# that was dropped as garbage before the probe window even started, so
+# a node whose row stayed torn a little longer counted as nobody. It is
+# now watched through the window, and a row that turns valid in it was
+# being written by somebody.
+"$NODE_POKE" "$DEV" 1 --beat >/dev/null
+"$NODE_POKE" "$DEV" 1 --badsum >/dev/null
+blockdev --flushbufs "$DEV"
+export CETRAFS_PEER_PROBE_SECS=3
+beat_late() {
+    sleep 1.5 # well past the 310 ms settle budget
+    for _ in $(seq 1 10); do
+        "$NODE_POKE" "$DEV" 1 --beat >/dev/null 2>&1 || true
+        sleep 1
+    done
+}
+beat_late &
+BEATER=$!
+OUT="$("$ROOT/userspace/fsck.cetra" "$DEV" 2>&1)" || true
+kill "$BEATER" 2>/dev/null || true
+wait "$BEATER" 2>/dev/null || true
+unset CETRAFS_PEER_PROBE_SECS
+grep -q "is mounted by another node (registry row 1" <<<"$OUT" &&
+    pass "a row torn past the settle budget that then beats is found, and fsck refuses" ||
+    fail "fsck went ahead although the row turned valid and beat during the probe: $(tail -1 <<<"$OUT")"
+
 log "a row that stays bad is garbage and must not block the tools"
 "$NODE_POKE" "$DEV" 1 --beat >/dev/null   # a valid row first: --badsum flips the checksum,
 "$NODE_POKE" "$DEV" 1 --badsum >/dev/null # so applied twice it would be valid again
 blockdev --flushbufs "$DEV"
+# It costs one probe window now (it might still turn valid), never a
+# refusal: with the window at 3 s, fsck must be done well inside 10.
+export CETRAFS_PEER_PROBE_SECS=3
 t0=$SECONDS
 OUT="$("$ROOT/userspace/fsck.cetra" "$DEV" 2>&1)" || true
+unset CETRAFS_PEER_PROBE_SECS
 # fsck then checks the volume and reports the bad slot as damage -- the
 # point is that it gets to.
 ! grep -q "is mounted by another node" <<<"$OUT" && grep -q "node slot 1 CRC mismatch" <<<"$OUT" &&
