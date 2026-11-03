@@ -2458,6 +2458,12 @@ static bool cetrafs_rename_dotdot_fail_once;
 module_param_named(rename_dotdot_fail_once, cetrafs_rename_dotdot_fail_once, bool, 0644);
 MODULE_PARM_DESC(rename_dotdot_fail_once, "TEST ONLY: the next rename's '..' rewrite fails with -EIO");
 
+/* TEST ONLY: the next rename's new-name write (add or retarget) fails,
+ * as a device error would -- after a directory's old name has gone. */
+static bool cetrafs_rename_name_fail_once;
+module_param_named(rename_name_fail_once, cetrafs_rename_name_fail_once, bool, 0644);
+MODULE_PARM_DESC(rename_name_fail_once, "TEST ONLY: the next rename's new-name write fails with -EIO");
+
 static int cetrafs_rename_dotdot(struct inode *dir, u64 parent_ino)
 {
     if (cetrafs_rename_dotdot_fail_once) {
@@ -2481,6 +2487,7 @@ static int cetrafs_rename_locked(struct mnt_idmap *idmap,
     u64 old_ino, discard_ino, old_gen;
     bool counted = false;
     bool dotdot_moved = false;
+    bool removed_first = false;
     u8 discard_file_type;
     u8 old_file_type;
     time64_t now;
@@ -2684,8 +2691,9 @@ static int cetrafs_rename_locked(struct mnt_idmap *idmap,
      * ctime swap at the end, once the old name is gone: at every
      * instant nlink >= names, the direction that can only leak.
      *
-     * Not for a directory: its nlink is not a name count, and a
-     * directory left with two names is the cycle problem, not this.
+     * Not for a directory: its nlink is not a name count, so no count
+     * can cover a second name -- a directory gets the opposite order
+     * instead (removed_first, below).
      */
     old_gen = cetrafs_inode_get_generation(old_inode);
     if (old_file_type != CETRAFS_FT_DIR) {
@@ -2714,6 +2722,36 @@ static int cetrafs_rename_locked(struct mnt_idmap *idmap,
         dotdot_moved = true;
     }
 
+    /*
+     * A DIRECTORY loses its old name before it gains the new one.
+     *
+     * The other order left it with two names between the two dirent
+     * writes, each durable on its own, and a crash there kept both. A
+     * directory with two names is not a leak a count can absorb, as it
+     * is for a file: rmdir through either name zeroes it and frees its
+     * number while the other name still points there, and the next file
+     * to take the number appears under that name -- a second name for a
+     * stranger, whose unlink then frees the stranger's blocks.
+     *
+     * Old name first, a crash in between leaves the directory with NO
+     * name: unreachable, its contents intact, and fsck links it into
+     * /lost+found. A failure in between gives the old name back
+     * (out_unremove).
+     */
+    removed_first = old_file_type == CETRAFS_FT_DIR;
+    if (removed_first) {
+        ret = cetrafs_dir_remove_entry(old_dir, &old_dentry->d_name, &discard_ino, &discard_file_type);
+        if (ret)
+            goto out_uncount;
+        if (cetrafs_ns_step_gap_ms)
+            msleep(cetrafs_ns_step_gap_ms); /* test-only, see the knob */
+    }
+    if (cetrafs_rename_name_fail_once) {
+        cetrafs_rename_name_fail_once = false;
+        ret = -EIO; /* test-only, see the knob */
+        goto out_unremove;
+    }
+
     if (new_inode) {
         u64 removed_ino;
         u8 removed_file_type;
@@ -2728,7 +2766,7 @@ static int cetrafs_rename_locked(struct mnt_idmap *idmap,
         ret = cetrafs_dir_retarget_entry(new_dir, &new_dentry->d_name, old_ino, old_file_type, &removed_ino,
                                          &removed_file_type);
         if (ret)
-            goto out_uncount;
+            goto out_unremove;
 
         /* Neither branch frees blocks/the inode number here -- just
          * persists the correct nlink (0 for a replaced directory, which
@@ -2788,16 +2826,18 @@ static int cetrafs_rename_locked(struct mnt_idmap *idmap,
          * old one, so a failure leaves the source intact. */
         ret = cetrafs_dir_add_entry(new_dir, &new_dentry->d_name, old_ino, old_file_type);
         if (ret)
-            goto out_uncount;
+            goto out_unremove;
     }
-    if (cetrafs_ns_step_gap_ms)
-        msleep(cetrafs_ns_step_gap_ms); /* test-only, see the knob */
+    if (!removed_first) {
+        if (cetrafs_ns_step_gap_ms)
+            msleep(cetrafs_ns_step_gap_ms); /* test-only, see the knob */
 
-    /* A failure from here on leaves the file with both names and the
-     * count that says so: consistent, so nothing is given back. */
-    ret = cetrafs_dir_remove_entry(old_dir, &old_dentry->d_name, &discard_ino, &discard_file_type);
-    if (ret)
-        goto out;
+        /* A failure from here on leaves the file with both names and the
+         * count that says so: consistent, so nothing is given back. */
+        ret = cetrafs_dir_remove_entry(old_dir, &old_dentry->d_name, &discard_ino, &discard_file_type);
+        if (ret)
+            goto out;
+    }
 
     /* POSIX: a successful rename updates the moved inode's ctime. This
      * used to touch only the in-core object, which nothing then wrote
@@ -2830,6 +2870,23 @@ static int cetrafs_rename_locked(struct mnt_idmap *idmap,
 out:
     return ret;
 
+out_unremove:
+    /* A directory's new name never landed after its old one went: give
+     * the old one back. Its slot was freed a moment ago, so this cannot
+     * need room the directory does not have; if it fails anyway the
+     * directory has no name at all, and says so -- fsck finds it and
+     * links it into /lost+found, contents intact. */
+    if (removed_first) {
+        int rret = cetrafs_dir_add_entry(old_dir, &old_dentry->d_name, old_ino, old_file_type);
+
+        if (rret) {
+            pr_err("rename: directory ino=%llu lost its name '%.*s' in ino=%llu and could neither take the new one "
+                   "(%d) nor get the old one back (%d) -- it is unnamed until fsck links it into /lost+found\n",
+                   (unsigned long long) old_ino, (int) old_dentry->d_name.len, old_dentry->d_name.name,
+                   (unsigned long long) old_dir->i_ino, ret, rret);
+            return ret;
+        }
+    }
 out_uncount:
     /* The new name never landed: give the count back, and the '..'. */
     if (counted)
