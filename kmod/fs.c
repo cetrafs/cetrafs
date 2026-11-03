@@ -1397,6 +1397,13 @@ int cetrafs_fill_super(struct super_block *sb, struct fs_context *fc)
              * each appended segment's header
              * (docs/internal/BG-OWNERSHIP-DESIGN.md).
              */
+            /* Every appended segment's [header, last descriptor] run,
+             * checked against the Block Groups once their descriptors
+             * have been read (below). */
+            struct {
+                u64 start, end;
+            } *segs = NULL;
+            u32 nsegs = 0;
             {
                 u64 first = le64_to_cpu(ondisk->bg_table_first_count);
                 u64 seg_lba = le64_to_cpu(ondisk->bg_table_next);
@@ -1424,6 +1431,7 @@ int cetrafs_fill_super(struct super_block *sb, struct fs_context *fc)
                     if (seg_lba >= le64_to_cpu(ondisk->total_blocks)) {
                         pr_err("BG table chain links to block %llu, past the end of the device (%llu)\n",
                                (unsigned long long) seg_lba, (unsigned long long) le64_to_cpu(ondisk->total_blocks));
+                        kfree(segs);
                         cetrafs_free_sb_info(sb);
                         brelse(bh);
                         return -EUCLEAN;
@@ -1437,11 +1445,13 @@ int cetrafs_fill_super(struct super_block *sb, struct fs_context *fc)
                     if (++guard > nbg + 1) {
                         pr_err("BG table chain does not terminate -- refusing\n");
                         brelse(sbh);
+                        kfree(segs);
                         cetrafs_free_sb_info(sb);
                         brelse(bh);
                         return -EUCLEAN;
                     }
                     if (!sbh) {
+                        kfree(segs);
                         cetrafs_free_sb_info(sb);
                         brelse(bh);
                         return -EIO;
@@ -1450,6 +1460,7 @@ int cetrafs_fill_super(struct super_block *sb, struct fs_context *fc)
                     if (le32_to_cpu(seg->magic) != CETRAFS_BGSEG_MAGIC) {
                         pr_err("BG table segment at %llu has no magic\n", (unsigned long long) seg_lba);
                         brelse(sbh);
+                        kfree(segs);
                         cetrafs_free_sb_info(sb);
                         brelse(bh);
                         return -EUCLEAN;
@@ -1468,6 +1479,7 @@ int cetrafs_fill_super(struct super_block *sb, struct fs_context *fc)
                     if (cetrafs_bgseg_crc(seg) != (u32) le64_to_cpu(seg->checksum)) {
                         pr_err("BG table segment at %llu fails its checksum\n", (unsigned long long) seg_lba);
                         brelse(sbh);
+                        kfree(segs);
                         cetrafs_free_sb_info(sb);
                         brelse(bh);
                         return -EUCLEAN;
@@ -1491,6 +1503,7 @@ int cetrafs_fill_super(struct super_block *sb, struct fs_context *fc)
                         pr_err("BG table segment at %llu claims %u descriptors; only %u are left of %u\n",
                                (unsigned long long) seg_lba, cnt, nbg - filled, nbg);
                         brelse(sbh);
+                        kfree(segs);
                         cetrafs_free_sb_info(sb);
                         brelse(bh);
                         return -EUCLEAN;
@@ -1504,9 +1517,48 @@ int cetrafs_fill_super(struct super_block *sb, struct fs_context *fc)
                         pr_err("BG table segment at %llu describes blocks past the end of the device (%llu)\n",
                                (unsigned long long) seg_lba, (unsigned long long) le64_to_cpu(ondisk->total_blocks));
                         brelse(sbh);
+                        kfree(segs);
                         cetrafs_free_sb_info(sb);
                         brelse(bh);
                         return -EUCLEAN;
+                    }
+                    /*
+                     * And WHERE it is. Only the first segment went through
+                     * cetrafs_validate_layout(); an appended one could sit
+                     * on the inode table and pass, and every descriptor
+                     * update after that -- a free-count CAS, an ownership
+                     * change -- is a write into whatever is really there.
+                     * A grow only ever puts a segment in a tail reserve,
+                     * past every fixed table, so nothing below
+                     * bg_regions_start is legal; overlap with a Block
+                     * Group is checked once their descriptors are read.
+                     * And a segment must continue the numbering exactly.
+                     */
+                    if (seg_lba < le64_to_cpu(ondisk->bg_regions_start) || le32_to_cpu(seg->first_bg_id) != filled) {
+                        pr_err("BG table segment at %llu (first_bg_id %u, expected %u) lies among the fixed tables "
+                               "below %llu or breaks the numbering -- refusing\n",
+                               (unsigned long long) seg_lba, le32_to_cpu(seg->first_bg_id), filled,
+                               (unsigned long long) le64_to_cpu(ondisk->bg_regions_start));
+                        brelse(sbh);
+                        kfree(segs);
+                        cetrafs_free_sb_info(sb);
+                        brelse(bh);
+                        return -EUCLEAN;
+                    }
+                    {
+                        void *n = krealloc(segs, (nsegs + 1) * sizeof(*segs), GFP_KERNEL);
+
+                        if (!n) {
+                            brelse(sbh);
+                            kfree(segs);
+                            cetrafs_free_sb_info(sb);
+                            brelse(bh);
+                            return -ENOMEM;
+                        }
+                        segs = n;
+                        segs[nsegs].start = seg_lba;
+                        segs[nsegs].end = seg_lba + 1 + cnt;
+                        nsegs++;
                     }
                     for (i = 0; i < cnt; i++, filled++)
                         sbi->bg_desc_lba[filled] = seg_lba + 1 + i;
@@ -1516,6 +1568,7 @@ int cetrafs_fill_super(struct super_block *sb, struct fs_context *fc)
 
                 if (filled != nbg) {
                     pr_err("BG table chain describes %u of %u Block Groups\n", filled, nbg);
+                    kfree(segs);
                     cetrafs_free_sb_info(sb);
                     brelse(bh);
                     return -EUCLEAN;
@@ -1531,7 +1584,21 @@ int cetrafs_fill_super(struct super_block *sb, struct fs_context *fc)
                 /* Same single pass now also records which Zone Group
                  * owns each Block Group, which is what lets ownership
                  * be answered from memory from here on. */
-                brc = cetrafs_bg_mount_info(sb, b, &t, &owner);
+                u64 bstart = 0, blen = 0;
+                u32 si;
+
+                brc = cetrafs_bg_mount_info(sb, b, &t, &owner, &bstart, &blen);
+                /* A descriptor segment inside a Block Group is a table
+                 * the allocator will write data over, and data a
+                 * descriptor update will write over. */
+                for (si = 0; !brc && si < nsegs; si++) {
+                    if (segs[si].start < bstart + blen && bstart < segs[si].end) {
+                        pr_err("BG table segment [%llu,%llu) overlaps Block Group %u [%llu,+%llu) -- refusing\n",
+                               (unsigned long long) segs[si].start, (unsigned long long) segs[si].end, b,
+                               (unsigned long long) bstart, (unsigned long long) blen);
+                        brc = -EUCLEAN;
+                    }
+                }
                 if (brc) {
                     /*
                      * The result used to be DISCARDED on failure, and
@@ -1550,6 +1617,7 @@ int cetrafs_fill_super(struct super_block *sb, struct fs_context *fc)
                      * the first time it could see this class at all.
                      */
                     pr_err("Block Group %u's descriptor does not verify (%d) -- refusing to mount\n", b, brc);
+                    kfree(segs);
                     cetrafs_free_sb_info(sb);
                     brelse(bh);
                     return brc == -EIO ? -EIO : -EUCLEAN;
@@ -1557,6 +1625,7 @@ int cetrafs_fill_super(struct super_block *sb, struct fs_context *fc)
                 sbi->total_data_blocks += t;
                 sbi->bg_owner_zg[b] = (u16) owner;
             }
+            kfree(segs);
         }
 
         /* an earlier phase: allocate this mount's journal state. It

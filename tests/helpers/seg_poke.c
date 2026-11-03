@@ -67,7 +67,7 @@ int main(int argc, char **argv)
     int fd;
 
     if (argc < 3) {
-        fprintf(stderr, "usage: %s <dev> loop|magic|crc|dangle <lba>|firstid <n>|count <n>|dump\n", argv[0]);
+        fprintf(stderr, "usage: %s <dev> loop|magic|crc|dangle <lba>|firstid <n>|count <n>|copyto <lba>|dump\n", argv[0]);
         return 2;
     }
     fd = open(argv[1], O_RDWR);
@@ -133,6 +133,28 @@ int main(int argc, char **argv)
         restamp(&seg);
         wr(fd, &seg, sizeof(seg), (off_t) head * CETRAFS_BLOCK_SIZE);
         printf("seg_poke: head %" PRIu64 " count -> %s (checksum restamped)\n", head, argv[3]);
+    } else if (!strcmp(argv[2], "copyto")) {
+        /* Copy the HEAD segment -- header and descriptors, checksums and
+         * all -- to <lba>. Pointing bg_table_next there (sb_poke) then
+         * gives a chain that verifies in every byte and lies only about
+         * where it is: the case a placement check exists for. */
+        uint8_t blk[CETRAFS_BLOCK_SIZE];
+        uint64_t to;
+        uint32_t n, i;
+
+        if (argc < 4)
+            die("copyto needs an lba");
+        to = strtoull(argv[3], NULL, 0);
+        rd(fd, &seg, sizeof(seg), (off_t) head * CETRAFS_BLOCK_SIZE);
+        n = cetrafs_le32(seg.count);
+        seg.next = 0;
+        restamp(&seg);
+        wr(fd, &seg, sizeof(seg), (off_t) to * CETRAFS_BLOCK_SIZE);
+        for (i = 0; i < n; i++) {
+            rd(fd, blk, sizeof(blk), (off_t) (head + 1 + i) * CETRAFS_BLOCK_SIZE);
+            wr(fd, blk, sizeof(blk), (off_t) (to + 1 + i) * CETRAFS_BLOCK_SIZE);
+        }
+        printf("seg_poke: head segment (%u descriptors) copied to %" PRIu64 "\n", n, to);
     } else if (!strcmp(argv[2], "firstid")) {
         if (argc < 4)
             die("firstid needs a value");

@@ -943,6 +943,7 @@ struct cetrafs_bg_geom {
     u32 off_data_bmap;
     u32 off_data_region;
     u64 data_block_count;
+    u64 length_blocks;
     u64 free_data_blocks; /* cached count, as of the last read */
     u64 reconcile_seq;    /* the count's ownership epoch, as of the last read */
     u32 owner_zg;         /* ZG this BG belongs to */
@@ -1062,6 +1063,7 @@ static int cetrafs_read_bg_geom(struct super_block *sb, u32 bg_id, struct cetraf
             out->off_data_bmap = cetrafs_le32(bg->off_data_bmap);
             out->off_data_region = cetrafs_le32(bg->off_data_region);
             out->data_block_count = cetrafs_le64(bg->data_block_count);
+            out->length_blocks = cetrafs_le64(bg->length_blocks);
             out->free_data_blocks = cetrafs_le64(bg->free_data_blocks);
             out->reconcile_seq = cetrafs_le64(bg->reconcile_seq);
             out->owner_zg = cetrafs_le16(bg->owner_zg);
@@ -3108,13 +3110,18 @@ int cetrafs_bg_claim_free(struct super_block *sb, u32 zg_id, u32 *out_bg_id)
     return -ENOSPC;
 }
 
-int cetrafs_bg_mount_info(struct super_block *sb, u32 bg_id, u64 *out_total, u32 *out_owner)
+int cetrafs_bg_mount_info(struct super_block *sb, u32 bg_id, u64 *out_total, u32 *out_owner, u64 *out_start,
+                          u64 *out_len)
 {
     struct cetrafs_bg_geom bg;
     int ret = cetrafs_read_bg_geom(sb, bg_id, &bg);
 
     if (ret)
         return ret;
+    if (out_start)
+        *out_start = bg.start_block;
+    if (out_len)
+        *out_len = bg.length_blocks;
     if (out_total)
         *out_total = bg.data_block_count;
     if (out_owner)

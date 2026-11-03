@@ -601,7 +601,8 @@ static inline int cetrafs_free_data_block(struct super_block *sb, u64 lba)
 int cetrafs_apply_pending_free(struct super_block *sb, u64 lba, u32 count, u32 expect_zg);
 int cetrafs_count_free_inodes(struct super_block *sb, u64 *out_free);
 int cetrafs_bg_data_block_stats(struct super_block *sb, u32 bg_id, u64 *out_total, u64 *out_free);
-int cetrafs_bg_mount_info(struct super_block *sb, u32 bg_id, u64 *out_total, u32 *out_owner);
+int cetrafs_bg_mount_info(struct super_block *sb, u32 bg_id, u64 *out_total, u32 *out_owner, u64 *out_start,
+                          u64 *out_len);
 
 /* Which Zone Group owns this Block Group, from the owners recorded at
  * mount -- no device read. CETRAFS_NODE_ID_NONE if out of range.
