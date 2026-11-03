@@ -2967,9 +2967,10 @@ int main(int argc, char **argv)
                          * that wrote the wrong one). */
                         if (is_dir[t]) {
                             subdirs[ino]++;
-                            /* First namer wins: a second one is already
-                             * reported by the nlink check, and picking
-                             * either gives the same verdict below. */
+                            /* First namer wins: a second one is reported
+                             * on its own ("named by N directory entries")
+                             * and blocks repair, and picking either gives
+                             * the same verdict below. */
                             if (dir_parent[t] == 0)
                                 dir_parent[t] = (uint32_t) ino;
                         }
@@ -2993,6 +2994,27 @@ int main(int argc, char **argv)
                     "ERR: directory inode %" PRIu64 " has size %" PRIu64 " but holds %u entries (expected %" PRIu64 ")\n",
                     ino, dsize[ino], dslots[ino], want_size);
             problems++;
+        }
+
+        /*
+         * A directory named more than once. This format has one '..' per
+         * directory, so a second name is never legitimate: it is a
+         * directory rename that crashed between adding the new name and
+         * removing the old, and removing a directory through either name
+         * frees what the other still names. Nothing else here says so --
+         * the parents' link counts each include it, and repairing those
+         * counts would only make the volume agree with itself around the
+         * fault. Checked before the loop below, which repairs as it goes.
+         */
+        for (uint64_t ino = 2; ino <= cetrafs_le32(sb.inodes_count); ++ino) {
+            uint64_t bit = ino - 1;
+
+            if (!(ibmap[bit / 8] & (1u << (bit % 8))) || !is_dir[ino] || refs[ino] <= 1)
+                continue;
+            fprintf(stderr, "ERR: directory inode %" PRIu64 " is named by %u directory entries -- a directory has one\n",
+                    ino, (unsigned) refs[ino]);
+            problems++;
+            repair_block("a directory has more than one name, so the link counts around it cannot be trusted");
         }
 
         for (uint64_t ino = 2; ino <= cetrafs_le32(sb.inodes_count); ++ino) {
