@@ -346,6 +346,135 @@ else
     fail "tail checksums: published without restamping at$STAMP_MISSES -- a lock-free reader will reject the block"
 fi
 
+# BUG-CLASSES.md class 18, async lifetime. A work item, timer or thread
+# that runs after what it touches is gone is a use-after-free -- the
+# 0.9.3 field Oops was a reconcile on the SYSTEM workqueue, which nothing
+# drains at unmount, whose iput() evicted a deleted file after put_super
+# had freed sb_info. Every async source must name the cancel that runs
+# before teardown, and a new one fails here until it does.
+log "checking every async work source names its drain (class 18)"
+# body <file> <function>: the function's body, from its definition line
+# to the closing brace in column 0.
+body() { awk -v f="$2" '$0 ~ ("^[a-z].*[ *]" f "\\(") && !/;$/ { on = 1 } on { print } on && /^}/ { exit }' "$1"; }
+FREE_SB="$(body "$K/fs.c" cetrafs_free_sb_info)"
+KILL_SB="$(body "$K/fs.c" cetrafs_kill_sb)"
+[ -n "$FREE_SB" ] && [ -n "$KILL_SB" ] ||
+    fail "async drains: cannot find cetrafs_free_sb_info/cetrafs_kill_sb bodies -- the check below would pass vacuously"
+
+# (a) Shared system workqueues: never drained for us. Each item queued on
+# one is listed with the cancel that stops it and the teardown call that
+# reaches that cancel from cetrafs_free_sb_info().
+#   file | queued item | cancel call (in that file) | called from free_sb_info
+SHARED_OK='
+fs.c|sbi->stop_work|cancel_work_sync(&sbi->stop_work)|cancel_work_sync(&sbi->stop_work)
+fs.c|sbi->lease_work|cancel_work_sync(&sbi->lease_work)|cancel_work_sync(&sbi->lease_work)
+scrub.c|s->work|cancel_delayed_work_sync(&s->work)|cetrafs_scrub_stop(
+heartbeat.c|hb->work|cancel_delayed_work_sync(&hb->work)|cetrafs_heartbeat_stop(
+heartbeat.c|hb->maint|cancel_delayed_work_sync(&hb->maint)|cetrafs_heartbeat_stop(
+'
+UNDRAINED=""
+SHARED_SEEN=""
+for f in "$K"/*.c; do
+    fn="$(basename "$f")"
+    while IFS= read -r item; do
+        [ -n "$item" ] || continue
+        SHARED_SEEN="$SHARED_SEEN $fn|$item|"
+        row="$(grep -F "$fn|$item|" <<<"$SHARED_OK" || true)"
+        if [ -z "$row" ]; then
+            UNDRAINED="$UNDRAINED $fn:$item(not-listed)"
+            continue
+        fi
+        cancel="$(cut -d'|' -f3 <<<"$row")"
+        caller="$(cut -d'|' -f4 <<<"$row")"
+        grep -qF "$cancel" "$f" || UNDRAINED="$UNDRAINED $fn:$item(no-$cancel)"
+        grep -qF "$caller" <<<"$FREE_SB" || UNDRAINED="$UNDRAINED $fn:$item(free_sb_info-never-calls-$caller)"
+    done < <(grep -v '^\s*\*' "$f" | grep -oE '(schedule_(delayed_)?work\(|queue_(delayed_)?work\(system_[a-z_]*wq, )&[a-z_>.-]+' |
+        sed -E 's/.*&//')
+done
+while IFS= read -r row; do
+    [ -n "$row" ] || continue
+    grep -qF "$(cut -d'|' -f1-2 <<<"$row")|" <<<"$SHARED_SEEN" || UNDRAINED="$UNDRAINED stale-entry:$(cut -d'|' -f1-2 <<<"$row")"
+done <<<"$SHARED_OK"
+[ -z "$UNDRAINED" ] && pass "async drains: every item on a shared workqueue is cancelled from free_sb_info" ||
+    fail "async drains: shared-workqueue items without a named drain:$UNDRAINED -- list each in SHARED_OK with its cancel, or use a per-mount queue"
+
+# (b) Private workqueues: whatever is queued on one must be destroyed
+# (destroy_workqueue drains), and the per-mount cold queue must also be
+# closed and flushed in kill_sb BEFORE kill_block_super(), which is where
+# the VFS evicts inodes the queued work may pin.
+NODESTROY=""
+for f in "$K"/*.c; do
+    while IFS= read -r wq; do
+        [ -n "$wq" ] || continue
+        grep -qF "destroy_workqueue($wq)" "$K"/*.c || NODESTROY="$NODESTROY $(basename "$f"):$wq"
+    done < <(grep -v '^\s*\*' "$f" | grep -oE 'queue_(delayed_)?work\([a-z_>.-]+,' | grep -v 'system_' |
+        sed -E 's/queue_(delayed_)?work\(//; s/,$//' | sort -u)
+done
+[ -z "$NODESTROY" ] && pass "async drains: every private workqueue that is queued on is destroyed" ||
+    fail "async drains: queued on but never destroyed:$NODESTROY"
+if awk '/cetrafs_sb_cold_close\(sb\)/ { c = NR } /kill_block_super\(sb\)/ { k = NR } END { exit !(c && k && c < k) }' <<<"$KILL_SB"; then
+    pass "async drains: kill_sb closes the cold queue before kill_block_super()"
+else
+    fail "async drains: cetrafs_kill_sb() does not close the cold queue before kill_block_super() -- a queued reconcile can pin an inode past evict_inodes()"
+fi
+
+# (c) References handed to async context, and threads/timers/RCU. Each
+# site is listed by its enclosing function with what releases it; a new
+# igrab()/ihold() or a first timer/call_rcu/kthread fails here until it
+# says what drains it.
+#   file | enclosing function | construct
+ASYNC_OK='
+lock.c|cetrafs_inode_mark_tree_cold|igrab
+lock.c|cetrafs_inode_note_stamp|igrab
+dir.c|cetrafs_link_locked|ihold
+caw.c|cetrafs_cas_stress|kthread_run
+'
+UNLISTED=""
+SEEN=""
+for f in "$K"/*.c; do
+    fn="$(basename "$f")"
+    while IFS='|' read -r func what; do
+        [ -n "$what" ] || continue
+        SEEN="$SEEN
+$fn|$func|$what"
+        grep -qxF "$fn|$func|$what" <<<"$ASYNC_OK" || UNLISTED="$UNLISTED $fn:$func:$what"
+    done < <(awk '
+        /^[a-z].*\(/ && !/;$/ { match($0, /[a-z_0-9]+\(/); fname = substr($0, RSTART, RLENGTH - 1) }
+        /^\s*\*/ || /^\s*\/\*/ { next }
+        match($0, /(igrab|ihold|kthread_run|kthread_create|call_rcu|timer_setup|mod_timer|add_timer)\(/) {
+            print fname "|" substr($0, RSTART, RLENGTH - 1)
+        }' "$f")
+done
+# An extraction that finds nothing would pass: every listed site must
+# have been seen, so the list cannot go stale and the awk cannot go blind
+# (it did once: 'func' is a gawk keyword).
+while IFS= read -r row; do
+    [ -n "$row" ] || continue
+    grep -qxF "$row" <<<"$SEEN" || UNLISTED="$UNLISTED stale-entry:$row"
+done <<<"$ASYNC_OK"
+[ -z "$UNLISTED" ] && pass "async refs: every igrab/ihold/thread/timer/RCU site is listed with its release" ||
+    fail "async refs: unlisted async constructs:$UNLISTED -- add each to ASYNC_OK only after naming what drains it (BUG-CLASSES.md class 18)"
+
+# BUG-CLASSES.md class 19, execution context. ->free_inode runs from an
+# RCU callback, in softirq: nothing in it may sleep. It held a
+# cancel_work_sync() until 2026-11-03.
+log "checking nothing that can sleep runs in ->free_inode (class 19)"
+FREE_FN="$(grep -oP '\.free_inode\s*=\s*\K[a-z_0-9]+' "$K/super_ops.c")"
+FREE_BODY=""
+for f in "$K"/*.c; do
+    b="$(body "$f" "$FREE_FN")"
+    [ -n "$b" ] && FREE_BODY="$b"
+done
+if [ -z "$FREE_FN" ] || [ -z "$FREE_BODY" ]; then
+    fail "free_inode context: cannot find the ->free_inode function ('$FREE_FN') -- nothing was checked"
+else
+    SLEEPERS="$(tail -n +2 <<<"$FREE_BODY" | grep -v '^\s*\*\|^\s*/\*' |
+        grep -oE '\b(cancel_[a-z_]*_sync|flush_[a-z_]+|mutex_lock[a-z_]*|down_[a-z_]+|down|msleep|usleep_range|ssleep|schedule[a-z_]*|wait_[a-z_]+|lock_buffer|[a-z_]*bread[a-z_]*|iput|synchronize_[a-z_]+|kv?[mz]alloc|kcalloc|vmalloc|cetrafs_[a-z_]+)\(' |
+        grep -vE '^(CETRAFS_I|cetrafs_inode_cache)\(' | sort -u | tr '\n' ' ' || true)"
+    [ -z "$SLEEPERS" ] && pass "free_inode context: $FREE_FN calls nothing that can sleep" ||
+        fail "free_inode context: $FREE_FN (RCU callback, softirq) calls: $SLEEPERS-- a sleep there is a BUG on a debug kernel and a stall without one"
+fi
+
 # The module must publish the filesystem alias get_fs_type() asks
 # modprobe for ("fs-<name>") when a mount names a type nothing has
 # registered. Without it, `mount -t cetrafs` on a host that has the
