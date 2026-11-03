@@ -230,6 +230,8 @@ int cetrafs_getattr(struct mnt_idmap *idmap, const struct path *path, struct kst
                     unsigned int query_flags);
 void cetrafs_sb_lease_renewed(struct super_block *sb, unsigned long t0, unsigned int interval_secs);
 bool cetrafs_sb_defrag_draining(struct super_block *sb);
+bool cetrafs_sb_queue_cold(struct super_block *sb, struct work_struct *w);
+void cetrafs_sb_cold_close(struct super_block *sb);
 /* Per-mount defragmentation switches (procfs.c's 'controls' file).
  * _defrag_enabled() gates defragmentation entirely, the ioctl included;
  * _auto_defrag_enabled() gates only the background janitor. */

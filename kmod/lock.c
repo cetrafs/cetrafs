@@ -2478,7 +2478,8 @@ MODULE_PARM_DESC(force_foreign_opener, "TEST ONLY: nofilelock metadata reads alw
 /*
  * Finish a reconcile the freshness gate could only flag.
  *
- * Runs on the system workqueue: no buffer is locked here and no folio is
+ * Runs on the mount's cold_wq (see cetrafs_sb_queue_cold()):
+ * no buffer is locked here and no folio is
  * held, which is the whole point -- cetrafs_invalidate_block() takes
  * lock_buffer() unconditionally, and doing that from the gate deadlocked
  * against a leaf the same call stack already held.
@@ -2546,7 +2547,7 @@ void cetrafs_inode_mark_tree_cold(struct inode *inode)
 
     cetrafs_tree_mark_cold_ci(ci);
     if (igrab(inode)) {
-        if (!schedule_work(&ci->cold_work))
+        if (!cetrafs_sb_queue_cold(inode->i_sb, &ci->cold_work))
             iput(inode);
     }
 }
@@ -2597,7 +2598,7 @@ static void cetrafs_inode_note_stamp(struct inode *inode, const cetrafs_inode_t 
              * the work is already queued, drop the reference we just
              * took so it stays balanced. */
             if (igrab(inode)) {
-                if (!schedule_work(&ci->cold_work))
+                if (!cetrafs_sb_queue_cold(inode->i_sb, &ci->cold_work))
                     iput(inode);
             }
         }

@@ -216,6 +216,18 @@ struct cetrafs_sb_info {
      * locks the sweep takes. */
     struct work_struct stop_work;
 
+    /* Where an inode's cold-tree reconcile runs (lock.c). The work holds
+     * an igrab() reference, so it must never outlive the mount: on the
+     * system workqueue it could still be queued when unmount's
+     * evict_inodes() skipped the inode it pinned, and its iput() then
+     * evicted -- and freed the blocks of -- a deleted file after
+     * put_super had torn this structure down. kill_sb closes the queue
+     * (cold_closing, under cold_lock) and flushes it while the mount is
+     * still whole; free_sb_info destroys it before anything else. */
+    struct workqueue_struct *cold_wq;
+    spinlock_t cold_lock;
+    bool cold_closing;
+
     /* errors= and corruption= (mount options, fixed for the mount's
      * life). See cetrafs_sb_fatal() and cetrafs_sb_corrupt(). */
     bool errors_panic;
@@ -1252,6 +1264,14 @@ int cetrafs_fill_super(struct super_block *sb, struct fs_context *fc)
         }
         sb->s_fs_info = sbi;
 
+        spin_lock_init(&sbi->cold_lock);
+        sbi->cold_wq = alloc_workqueue("cetrafs_cold", WQ_MEM_RECLAIM, 0);
+        if (!sbi->cold_wq) {
+            cetrafs_free_sb_info(sb);
+            brelse(bh);
+            return -ENOMEM;
+        }
+
         /* Probe the device's atomic COMPARE AND WRITE capability once
          *. Never fatal: a device without CAW simply
          * keeps using the PR mutex for every claim. */
@@ -2138,6 +2158,15 @@ void cetrafs_free_sb_info(struct super_block *sb)
     if (!sbi)
         return;
 
+    /* First, while everything below is still standing: a reconcile still
+     * queued (a failed mount never ran kill_sb's flush) may hold the last
+     * reference to an inode, and its iput() can evict it. */
+    cetrafs_sb_cold_close(sb);
+    if (sbi->cold_wq) {
+        destroy_workqueue(sbi->cold_wq);
+        sbi->cold_wq = NULL;
+    }
+
     cetrafs_proc_mount_exit(sbi->proc_mount);
     /* Stop the heartbeat *before* doing any of our own final flush work
      * below, not after: heartbeat.c's periodic tick calls zonegroup.c's
@@ -3006,6 +3035,42 @@ bool cetrafs_sb_caw_available(struct super_block *sb)
 
     return sbi && sbi->caw.max_caw_blocks > 0 && sbi->caw.logical_block_size > 0 &&
            CETRAFS_BLOCK_SIZE % sbi->caw.logical_block_size == 0;
+}
+
+/* Queue an inode's cold-tree reconcile. False when it was not queued --
+ * already pending, or the mount is closing -- and the caller then drops
+ * the reference it took for the work. */
+bool cetrafs_sb_queue_cold(struct super_block *sb, struct work_struct *w)
+{
+    struct cetrafs_sb_info *sbi = sb->s_fs_info;
+    bool queued = false;
+
+    if (!sbi)
+        return false;
+    spin_lock(&sbi->cold_lock);
+    if (!sbi->cold_closing && sbi->cold_wq)
+        queued = queue_work(sbi->cold_wq, w);
+    spin_unlock(&sbi->cold_lock);
+    return queued;
+}
+
+/* Stop queueing reconciles and run the ones already queued. After this
+ * no reconcile holds an inode reference. Called by kill_sb before the
+ * VFS evicts the inode cache, while the mount is still fully up, so an
+ * iput() here that evicts a deleted file does it with everything a free
+ * needs. A tree left cold stays untrusted, which only means forced-fresh
+ * reads for the rest of the unmount. */
+void cetrafs_sb_cold_close(struct super_block *sb)
+{
+    struct cetrafs_sb_info *sbi = sb->s_fs_info;
+
+    if (!sbi)
+        return;
+    spin_lock(&sbi->cold_lock);
+    sbi->cold_closing = true;
+    spin_unlock(&sbi->cold_lock);
+    if (sbi->cold_wq)
+        flush_workqueue(sbi->cold_wq);
 }
 
 bool cetrafs_sb_defrag_draining(struct super_block *sb)
@@ -4033,6 +4098,10 @@ int cetrafs_init_fs_context(struct fs_context *fc)
 void cetrafs_kill_sb(struct super_block *sb)
 {
     pr_debug("kill_sb()\n");
+    /* Before kill_block_super(): its evict_inodes() skips an inode a
+     * queued reconcile still pins, and that reconcile's iput() would
+     * then evict it after put_super. */
+    cetrafs_sb_cold_close(sb);
     /* kill_block_super() will invoke ->put_super() where we free sbi */
     kill_block_super(sb);
     pr_info("unmounted\n");
