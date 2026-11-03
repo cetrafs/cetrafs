@@ -2290,6 +2290,26 @@ int cetrafs_lock_release(struct inode *inode, struct file *file)
  * too (the generation check), and so does a lock that is no longer
  * ours. Anything else that fails goes back on the queue.
  */
+/*
+ * Clear our lock on a record we can no longer instantiate: the file was
+ * deleted (nlink 0) or its number reused. A deleted file's state needs
+ * no publishing, but its lock still has to go -- the orphan scrub skips
+ * any record carrying one, so a number whose evict did not free it
+ * would stay allocated for good. Keyed on the generation the entry was
+ * queued with: a reused number answers -ESTALE and is left alone, and a
+ * lock that is no longer ours is "nothing to do".
+ */
+static int cetrafs_lock_clear_raw(struct super_block *sb, u64 ino, u64 generation)
+{
+    struct cetrafs_lock_cas_ctx ctx = {.claim = false, .generation = generation};
+    int ret = cetrafs_sb_get_node_id(sb, &ctx.my_node_id);
+
+    if (ret)
+        return ret;
+    ret = cetrafs_cas_record_seeded(sb, cetrafs_inode_lba(sb, ino), NULL, 0, cetrafs_lock_cas_mutate, &ctx);
+    return ret < 0 ? ret : 0;
+}
+
 void cetrafs_lock_retry_deferred(struct super_block *sb)
 {
     struct cetrafs_nsrel_pending pend[CETRAFS_FLOCK_DEFERRED_MAX];
@@ -2313,8 +2333,16 @@ void cetrafs_lock_retry_deferred(struct super_block *sb)
         int ret;
 
         if (IS_ERR(inode)) {
-            if (PTR_ERR(inode) != -ESTALE && PTR_ERR(inode) != -ENOENT)
+            if (PTR_ERR(inode) != -ESTALE && PTR_ERR(inode) != -ENOENT) {
                 cetrafs_sb_flock_defer(sb, pend[i].ino, pend[i].generation);
+            } else {
+                ret = cetrafs_lock_clear_raw(sb, pend[i].ino, pend[i].generation);
+                if (ret && ret != -ESTALE)
+                    cetrafs_sb_flock_defer(sb, pend[i].ino, pend[i].generation);
+                else
+                    pr_info("lock release: ino=%llu is gone; its lock was cleared by the heartbeat\n",
+                            (unsigned long long) pend[i].ino);
+            }
             continue;
         }
         if (cetrafs_inode_get_generation(inode) != pend[i].generation || !S_ISREG(inode->i_mode)) {
@@ -3644,6 +3672,12 @@ out:
     return ret;
 }
 
+/* TEST ONLY: fail the next defrag_end's lock clear, as a device error
+ * would. tests/kernel/lock_clear_deferred.sh. */
+static bool cetrafs_defrag_clear_fail_once;
+module_param_named(defrag_clear_fail_once, cetrafs_defrag_clear_fail_once, bool, 0644);
+MODULE_PARM_DESC(defrag_clear_fail_once, "TEST ONLY: the next defrag_end lock clear fails with -EIO");
+
 void cetrafs_lock_defrag_end(struct inode *inode)
 {
     struct cetrafs_inode_info *ci = CETRAFS_I(inode);
@@ -3653,9 +3687,28 @@ void cetrafs_lock_defrag_end(struct inode *inode)
     /* If writers appeared during the move, release duty is theirs again
      * (their last close now takes the normal path). If none remain --
      * either there never were any, or they closed while we were pinned
-     * -- the on-disk lock is ours to put back. */
-    if (atomic_read(&ci->lock_writer_count) == 0)
-        cetrafs_lock_clear_on_disk(inode, /*stamp_stat=*/false);
+     * -- the on-disk lock is ours to put back.
+     *
+     * A clear that fails is queued for the heartbeat, like a close's.
+     * It used to be logged and forgotten: the lock stayed on the record
+     * of a node that keeps beating, which stale reclaim never touches,
+     * and every peer got -ETXTBSY until this node opened and closed the
+     * file again. */
+    if (atomic_read(&ci->lock_writer_count) == 0) {
+        int ret;
+
+        if (cetrafs_defrag_clear_fail_once) {
+            cetrafs_defrag_clear_fail_once = false; /* test-only */
+            ret = -EIO;
+        } else {
+            ret = cetrafs_lock_clear_on_disk(inode, /*stamp_stat=*/false);
+        }
+        if (ret) {
+            pr_err("lock: ino=%llu defrag could not give the lock back (%d) -- queued for retry\n",
+                   (unsigned long long) inode->i_ino, ret);
+            cetrafs_sb_flock_defer(inode->i_sb, inode->i_ino, cetrafs_inode_get_generation(inode));
+        }
+    }
     mutex_unlock(&ci->lock_mutex);
 }
 
