@@ -75,7 +75,19 @@ struct cetrafs_journal {
     u64 area_start;    /* this node's own slice's flag-block LBA; 0 = not attached / journaling off */
     u64 slots;
     u64 next_txn_id;
-    bool flag_dirty;     /* our on-disk flag's current state -- truthful, since we're its only writer */
+    /*
+     * Our on-disk flag's state as we last wrote it. NOT because we are
+     * its only writer: a peer replaying our area releases it CLEAN
+     * (cetrafs_journal_claim_mutate()). It stays truthful because a peer
+     * replays only after judging us stale, which takes at least four of
+     * our advertised heartbeat intervals without progress
+     * (cetrafs_sb_peer_progress_stale()), while our lease stops this
+     * mount after three (cetrafs_sb_lease_renewed()) -- so no entry of
+     * ours can be committed under a flag a peer has parked CLEAN. On a
+     * mount without CAW there is no peer. Re-derived at every attach,
+     * which replays our own area first.
+     */
+    bool flag_dirty;
     unsigned long *busy; /* logged-but-not-yet-consumed slots (in-flight operations) */
     /*
      * Slots held past their operation: a target write that failed keeps

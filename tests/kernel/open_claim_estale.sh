@@ -73,4 +73,36 @@ case "$after" in
 *) fail "the refused open LEFT a lock on the reused record: $after" ;;
 esac
 
+# The SAME file, deleted by a peer (nlink 0, generation unchanged) --
+# the other way the open-boundary refresh says -ESTALE after the claim.
+# The claim's own CAS refuses a record that is dead to this node
+# (cetrafs_lock_rec_dead_to_us()), so no claim may land on it at all.
+log "a write-open of a file a peer deleted (same generation, nlink 0)"
+echo data >"$MNT/g"
+sync
+GINO="$(stat -c %i "$MNT/g")"
+out="$(python3 - "$MNT/g" "$IPOKE" "$BACK" "$GINO" <<'PY'
+import errno, os, subprocess, sys
+path, ipoke, back, ino = sys.argv[1:]
+pfd = os.open(path, os.O_PATH)
+subprocess.run([ipoke, back, "nlink", ino, "0"], check=True, stderr=subprocess.DEVNULL)
+try:
+    fd = os.open("/proc/self/fd/%d" % pfd, os.O_WRONLY)
+    os.close(fd)
+    print("open=0")
+except OSError as e:
+    print("open=" + errno.errorcode.get(e.errno, str(e.errno)))
+sys.stdout.flush()
+PY
+)"
+log "$out"
+grep -qE '^open=(ESTALE|ENOENT)$' <<<"$out" &&
+    pass "the write-open of the deleted file failed ($out)" ||
+    fail "expected the open to fail, got '$out' -- the deletion was not seen by the open path"
+after="$("$LPOKE" "$BACK" "$GINO")"
+case "$after" in
+*" mode=0 "*) pass "and the deleted record carries no lock ($after)" ;;
+*) fail "the refused open LEFT a lock on the deleted record: $after" ;;
+esac
+
 ct_exit
