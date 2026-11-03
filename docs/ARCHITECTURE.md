@@ -409,7 +409,9 @@ device. Both are no-ops on normal/large devices and bypassed by passing `-b`/`-J
 Four passes: **structural** (SB/ZG/BG/root checksums and the region map, ZG↔BG
 ownership contiguity, Node Registry rows), **cluster metadata** (per-node
 journal flags and slots, pending-free queue entries), **content** (inode bitmap
-vs the extent trees in both directions, cross-file overlap, counts vs bitmaps),
+vs the extent trees in both directions, cross-file overlap, counts vs bitmaps;
+live records first, then deleted ones, whose stale extents are leftovers, not
+references),
 **namespace** (every directory's dirents and tails, nlink vs referring entries,
 `.`/`..`, reachability from the root). It refuses to run on a volume that is
 mounted locally or carries a live Node Registry row.

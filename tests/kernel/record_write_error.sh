@@ -168,12 +168,13 @@ fo="$(ct_fsck "$DEV" 2>&1)" || rc=$?
 # Each refused record write stopped the mount -- a crash at that
 # instant -- so the create's unwind never freed the number it had
 # claimed: its bit stays set over a record that never reached the
-# device. A leak (the number cannot be handed out again), the safe
-# direction, and the one finding allowed per stop.
-bad="$(grep '^ERR' <<<"$fo" | grep -v "is marked in use but its checksum is wrong" || true)"
-leaks="$(grep -c "is marked in use but its checksum is wrong" <<<"$fo" || true)"
-if [ -z "$bad" ] && [ "$leaks" -le 2 ]; then
-    pass "fsck: nothing but the stops' unwritten records ($leaks)"
+# device. A leak, the safe direction: fsck names it as a create stopped
+# before its record (WARN, not a fault). That -r frees the number is in
+# fsck_dead_record.sh: this volume has no free Node Registry row for -r.
+bad="$(grep '^ERR' <<<"$fo" || true)"
+leaks="$(grep -c "its record was never written" <<<"$fo" || true)"
+if [ "$rc" = 0 ] && [ -z "$bad" ] && [ "$leaks" -le 2 ]; then
+    pass "fsck: clean but for the stops' unwritten records, reported as such ($leaks)"
 else
     fail "fsck rc=$rc after the failed create: $(head -3 <<<"$bad") (unwritten records: $leaks)"
 fi

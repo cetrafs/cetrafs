@@ -35,7 +35,9 @@ pass "setup: the control volume is clean before the field is poked"
 # measures, and without it that assertion passes over an empty set: a
 # freshly-made volume has only the root, so "fsck still reports what it
 # could not reach" was green because there was nothing to reach.
-"$OPOKE" "$IMG" 2 1 0 >/dev/null 2>&1 ||
+# With a size: an EMPTY unnamed file is what an interrupted create
+# leaves, which fsck reports as a leftover rather than a lost name.
+"$OPOKE" "$IMG" 2 1 0 >/dev/null 2>&1 && "$IPOKE" "$IMG" setsize 2 4096 >/dev/null 2>&1 ||
     fail "setup: orphan_poke could not plant an unreferenced inode"
 
 # Inode 1 is the root directory, and extlen restamps the record's

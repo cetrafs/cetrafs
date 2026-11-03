@@ -381,8 +381,8 @@ while [ "$N" -le "$P5K" ]; do
     # `fsck | grep -q` under pipefail would hide the very match we look for (the
     # trap CLAUDE.md names). Plain grep, output discarded, reads to EOF.
     p5_fo="$("$ROOT/userspace/fsck.cetra" "$P5RL" 2>&1 || true)"
-    if printf '%s\n' "$p5_fo" | grep -E "tail checksum|overlap|marked FREE|two files|EUCLEAN" >/dev/null; then
-        echo "  N=$N: fsck corruption: $(printf '%s\n' "$p5_fo" | grep -E "tail checksum|overlap|marked FREE|two files" | head -1)"
+    if printf '%s\n' "$p5_fo" | grep -E "^ERR.*(tail checksum|overlap|marked FREE|two files)|EUCLEAN" >/dev/null; then
+        echo "  N=$N: fsck corruption: $(printf '%s\n' "$p5_fo" | grep -E "^ERR.*(tail checksum|overlap|marked FREE|two files)" | head -1)"
         p5_corrupt=$((p5_corrupt + 1))
     fi
     N=$((N + 1))
@@ -478,8 +478,8 @@ if [ -n "$p5_first_torn" ]; then
         fi
         umount "$MNT"; blockdev --flushbufs "$P5RL"
         p5b_fo="$("$ROOT/userspace/fsck.cetra" "$P5RL" 2>&1 || true)"
-        if printf '%s\n' "$p5b_fo" | grep -E "tail checksum|overlap|marked FREE|two files|EUCLEAN" >/dev/null; then
-            echo "  $label: fsck: $(printf '%s\n' "$p5b_fo" | grep -E "tail checksum|overlap|marked FREE|two files" | head -1)"
+        if printf '%s\n' "$p5b_fo" | grep -E "^ERR.*(tail checksum|overlap|marked FREE|two files)|EUCLEAN" >/dev/null; then
+            echo "  $label: fsck: $(printf '%s\n' "$p5b_fo" | grep -E "^ERR.*(tail checksum|overlap|marked FREE|two files)" | head -1)"
             p5b_case_bad=1
         fi
         p5b_bad=$((p5b_bad + p5b_case_bad))
@@ -546,7 +546,7 @@ dmsetup resume "$P6DM"
 blockdev --flushbufs "$P6FK" 2>/dev/null || true
 
 P6OUT="$("$ROOT/userspace/fsck.cetra" "$P6FK" 2>&1 || true)"
-if echo "$P6OUT" | grep -q "marked FREE"; then
+if echo "$P6OUT" | grep -q "^ERR.*marked FREE"; then
     echo "$P6OUT" | grep "marked FREE" | head -3
     fail "phase 6: blocks came back referenced by an inode but marked FREE -- an allocation was published before it was durable"
 elif echo "$P6OUT" | grep -q "^ERR"; then

@@ -37,6 +37,9 @@ grep -q "depth=1" <<<"$("$REC" "$IMG" extents 1 2>&1)" ||
 pass "setup: the root directory has an external leaf"
 
 "$ORPHAN" "$IMG" 1000 1 0 >/dev/null
+# With a size: an EMPTY unnamed file is an interrupted create, which
+# fsck frees rather than placing in lost+found.
+"$REC" "$IMG" setsize 1000 4096 >/dev/null 2>&1
 pass "setup: inode 1000 is an orphan that still claims a link"
 
 # Allocated inodes, counted off the inode bitmap itself.

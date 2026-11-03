@@ -166,8 +166,37 @@ static uint64_t repairs_made;
  * early -- and so a repaired one still makes the run report itself. */
 static uint64_t early_problems;
 
+/*
+ * Set while the content pass walks a DELETED record (nlink=0): its
+ * extents are not authoritative. Such a record is the residue of a
+ * delete whose reclaim has not run yet, and the reclaim frees only the
+ * number -- the blocks are long gone, or go through the leak reclaim,
+ * which keeps every block a live record names. So its extents may name
+ * blocks that are free, or another file's since: stale, not shared. What
+ * that record's walk finds is reported as WARN, and a fault that would
+ * otherwise disable repair only defers this run's leak clearing (the
+ * blocks the record hides might belong to a file whose nlink drifted to
+ * 0 while still named -- the namespace pass repairs that nlink, and the
+ * next run walks the record as a live one).
+ */
+static int fsck_dead_walk;
+static int fsck_dead_unwalkable;
+#define FSCK_SEV (fsck_dead_walk ? "WARN" : "ERR")
+
+static int fsck_all_zero(const uint8_t *p, size_t n)
+{
+    for (size_t i = 0; i < n; ++i)
+        if (p[i])
+            return 0;
+    return 1;
+}
+
 static void repair_block(const char *why)
 {
+    if (fsck_dead_walk) {
+        fsck_dead_unwalkable = 1;
+        return;
+    }
     if (!repair_blocked && repair_mode)
         fprintf(stderr, "NOTE: repair is disabled for this run: %s\n", why);
     repair_blocked = 1;
@@ -846,6 +875,8 @@ struct fsck_refctx {
     uint32_t nbg;
     uint64_t *problems;
     uint64_t *blocks_referenced;
+    uint8_t *weakd; /* referenced only by deleted records (fsck_dead_walk) */
+    uint64_t *stale; /* deleted records' blocks a live record also names */
 };
 
 /* Mark one physical run [phys, phys+len) as referenced by 'ino', flagging
@@ -899,9 +930,10 @@ static void fsck_mark_run(struct fsck_refctx *c, uint64_t phys, uint64_t len, ui
     found = fsck_run_bg(c->bg_start, c->bg_cnt, c->nbg, phys, len, &base);
     if (found < 0) {
         fprintf(stderr,
-                "ERR: inode %" PRIu64 " extent [%" PRIu64 ",+%" PRIu64 ") is outside every data region\n",
-                ino, phys, len);
-        (*c->problems)++;
+                "%s: inode %" PRIu64 " extent [%" PRIu64 ",+%" PRIu64 ") is outside every data region\n",
+                FSCK_SEV, ino, phys, len);
+        if (!fsck_dead_walk)
+            (*c->problems)++;
         repair_block("an extent points outside every data region, so the extent tree "
                      "cannot be trusted to say what is referenced");
         return;
@@ -911,7 +943,11 @@ static void fsck_mark_run(struct fsck_refctx *c, uint64_t phys, uint64_t len, ui
     for (uint64_t k = 0; k < len; ++k) {
         uint64_t idx = idx0 + k;
 
-        if (FSCK_GET(c->refd, idx)) {
+        if (FSCK_GET(c->refd, idx) && fsck_dead_walk) {
+            /* Live records were all walked first: whatever already
+             * holds this block outranks a deleted record's claim. */
+            (*c->stale)++;
+        } else if (FSCK_GET(c->refd, idx)) {
             FSCK_SET(c->dupd, idx); /* this block is double-claimed */
             /* Report the overlap once per run, not once per block -- a
              * fully-overlapping multi-hundred-MB extent is one finding,
@@ -938,6 +974,8 @@ static void fsck_mark_run(struct fsck_refctx *c, uint64_t phys, uint64_t len, ui
             if (getenv("CETRAFS_FSCK_DUMP_REFS"))
                 fprintf(stderr, "REF: lba=%" PRIu64 " ino=%" PRIu64 "\n", phys + k, ino);
             FSCK_SET(c->refd, idx);
+            if (fsck_dead_walk)
+                FSCK_SET(c->weakd, idx);
             (*c->blocks_referenced)++;
         }
     }
@@ -2122,6 +2160,8 @@ int main(int argc, char **argv)
         size_t bmwords = (total_data ? total_data : 1) / 8 + 1;
         uint8_t *refd = (uint8_t *) xcalloc(bmwords, 1);
         uint8_t *dupd = (uint8_t *) xcalloc(bmwords, 1);
+        uint8_t *weakd = (uint8_t *) xcalloc(bmwords, 1);
+        uint64_t stale_blocks = 0, stale_before = 0;
 /* FSCK_SET/FSCK_GET are defined globally above (guarded). */
         uint8_t *ibmap = (uint8_t *) xcalloc(cetrafs_le64(sb.inode_bmap_blocks), CETRAFS_BLOCK_SIZE);
         int ibmap_dirty = 0;
@@ -2138,6 +2178,10 @@ int main(int argc, char **argv)
          * an extent must never point at metadata). */
         /* (inline below; kept as a lambda-ish loop for clarity) */
 
+        /* Two passes: live records (nlink > 0) first, then deleted
+         * ones (fsck_dead_walk), so that a block a live record names is
+         * the live record's whatever the inode numbering. */
+        for (int dpass = 0; dpass < 2; ++dpass)
         for (uint64_t ino = 1; ino <= cetrafs_le32(sb.inodes_count); ++ino) {
             fsck_repair_heartbeat();
             uint64_t bit = ino - 1;
@@ -2149,6 +2193,21 @@ int main(int argc, char **argv)
             pread_all(fd, iblk, sizeof(iblk), (off_t) (cetrafs_le64(sb.inode_table_start) + ino - 1) * CETRAFS_BLOCK_SIZE);
             memcpy(&in, iblk, sizeof(in));
 
+            fsck_dead_walk = 0;
+            if (!cetrafs_inode_crcs_ok(&in) && dpass)
+                continue; /* reported by the first pass */
+            if (!cetrafs_inode_crcs_ok(&in) && fsck_all_zero(iblk, sizeof(iblk))) {
+                /* All zero: the number was taken and its record never
+                 * written -- a create stopped between the two (a crash,
+                 * or a write the device refused). It names nothing, so
+                 * it hides no blocks; the namespace pass frees the
+                 * number under -r like any unnamed deleted record. */
+                fprintf(stderr,
+                        "WARN: inode %" PRIu64 " is marked in use but its record was never written -- "
+                        "a create stopped before writing it\n",
+                        ino);
+                continue;
+            }
             if (!cetrafs_inode_crcs_ok(&in)) {
                 fprintf(stderr, "ERR: inode %" PRIu64 " is marked in use but its checksum is wrong\n", ino);
                 problems++;
@@ -2162,6 +2221,10 @@ int main(int argc, char **argv)
                     "distinguished from leaked ones");
                 continue;
             }
+            if ((in.nlink == 0) != (dpass == 1))
+                continue; /* the other pass's */
+            fsck_dead_walk = dpass;
+            stale_before = stale_blocks;
             inodes_seen++;
 
             /* An allocated nlink=0 inode is the designed residue of a
@@ -2180,8 +2243,8 @@ int main(int argc, char **argv)
                  * cries-wolf failure N5 is about. Only a header that is
                  * positively wrong hides blocks from the walk. */
                 if (in.eh.eh_magic != 0) {
-                    fprintf(stderr, "ERR: inode %" PRIu64 " has a bad extent header magic 0x%X\n", ino, in.eh.eh_magic);
-                    problems++;
+                    fprintf(stderr, "%s: inode %" PRIu64 " has a bad extent header magic 0x%X\n", FSCK_SEV, ino, in.eh.eh_magic);
+                    problems += !fsck_dead_walk;
                     repair_block(
                         "an inode's extent header is not valid, so the blocks it owns cannot be "
                         "distinguished from leaked ones");
@@ -2189,9 +2252,9 @@ int main(int argc, char **argv)
                 continue;
             }
             if (cetrafs_le16(in.eh.eh_depth) > CETRAFS_EXT_MAX_DEPTH) {
-                fprintf(stderr, "ERR: inode %" PRIu64 " has extent depth %u (only 0, 1 and 2 exist)\n", ino,
+                fprintf(stderr, "%s: inode %" PRIu64 " has extent depth %u (only 0, 1 and 2 exist)\n", FSCK_SEV, ino,
                         in.eh.eh_depth);
-                problems++;
+                problems += !fsck_dead_walk;
                 /* Same reason as the bad-magic case above, and it was
                  * missing here: a tree this walker cannot descend means
                  * that inode's blocks never get marked referenced, so
@@ -2209,7 +2272,8 @@ int main(int argc, char **argv)
              * leak. fsck_mark_run() is the shared depth-0 marking; the
              * depth-2 walk reuses it per leaf. */
             struct fsck_refctx rc = {refd,      dupd, bg_data_start, bg_data_cnt,
-                                     cetrafs_le32(sb.block_group_count), &problems, &blocks_referenced};
+                                     cetrafs_le32(sb.block_group_count), &problems, &blocks_referenced,
+                                     weakd,     &stale_blocks};
             uint64_t xattr_lba = cetrafs_le64(in.xattr_block);
             uint8_t leafblk[CETRAFS_BLOCK_SIZE];
             int tree_ok = 1;
@@ -2219,9 +2283,9 @@ int main(int argc, char **argv)
              * refuses to map through. Its blocks cannot be told from
              * leaked ones either, so nothing is repaired around it. */
             if (cetrafs_le16(in.eh.eh_entries) > 4) {
-                fprintf(stderr, "ERR: inode %" PRIu64 " claims %u inline extent entries; the record holds 4\n", ino,
+                fprintf(stderr, "%s: inode %" PRIu64 " claims %u inline extent entries; the record holds 4\n", FSCK_SEV, ino,
                         cetrafs_le16(in.eh.eh_entries));
-                problems++;
+                problems += !fsck_dead_walk;
                 repair_block("a record's inline extent count is impossible, so the blocks the inode owns cannot "
                              "be distinguished from leaked ones");
             }
@@ -2241,17 +2305,17 @@ int main(int argc, char **argv)
                 uint32_t n;
 
                 if (!fsck_lba_in_range(leaf_lba, cetrafs_le64(sb.total_blocks))) {
-                    fprintf(stderr, "ERR: inode %" PRIu64 "'s extent leaf (block %" PRIu64 ") is out of range\n",
-                            ino, leaf_lba);
-                    problems++;
+                    fprintf(stderr, "%s: inode %" PRIu64 "'s extent leaf (block %" PRIu64 ") is out of range\n",
+                            FSCK_SEV, ino, leaf_lba);
+                    problems += !fsck_dead_walk;
                     repair_block("an extent leaf lba is out of range, so the blocks the inode "
                                  "owns cannot be distinguished from leaked ones");
                     tree_ok = 0;
                 } else if (pread_all(fd, leafblk, sizeof(leafblk), (off_t) leaf_lba * CETRAFS_BLOCK_SIZE),
                            fsck_check_tail(leafblk, CETRAFS_LEAF_TAIL_MAGIC) != 0) {
-                    fprintf(stderr, "ERR: inode %" PRIu64 "'s extent leaf (block %" PRIu64 ") failed its tail checksum\n",
-                            ino, leaf_lba);
-                    problems++;
+                    fprintf(stderr, "%s: inode %" PRIu64 "'s extent leaf (block %" PRIu64 ") failed its tail checksum\n",
+                            FSCK_SEV, ino, leaf_lba);
+                    problems += !fsck_dead_walk;
                     repair_block("an extent leaf failed its tail checksum, so the blocks the inode "
                                  "owns cannot be distinguished from leaked ones");
                     tree_ok = 0;
@@ -2279,9 +2343,9 @@ int main(int argc, char **argv)
 
                     if (!fsck_lba_in_range(ilba, cetrafs_le64(sb.total_blocks))) {
                         fprintf(stderr,
-                                "ERR: inode %" PRIu64 "'s extent index (block %" PRIu64 ") is out of range\n",
-                                ino, ilba);
-                        problems++;
+                                "%s: inode %" PRIu64 "'s extent index (block %" PRIu64 ") is out of range\n",
+                                FSCK_SEV, ino, ilba);
+                        problems += !fsck_dead_walk;
                         repair_block("an extent index lba is out of range, so the blocks the inode "
                                      "owns cannot be distinguished from leaked ones");
                         tree_ok = 0;
@@ -2290,9 +2354,9 @@ int main(int argc, char **argv)
                     pread_all(fd, idxblk, sizeof(idxblk), (off_t) ilba * CETRAFS_BLOCK_SIZE);
                     if (fsck_check_tail(idxblk, CETRAFS_INDEX_TAIL_MAGIC) != 0) {
                         fprintf(stderr,
-                                "ERR: inode %" PRIu64 "'s extent index (block %" PRIu64 ") failed its tail checksum\n",
-                                ino, ilba);
-                        problems++;
+                                "%s: inode %" PRIu64 "'s extent index (block %" PRIu64 ") failed its tail checksum\n",
+                                FSCK_SEV, ino, ilba);
+                        problems += !fsck_dead_walk;
                         repair_block("an extent index failed its tail checksum, so the blocks the inode "
                                      "owns cannot be distinguished from leaked ones");
                         tree_ok = 0;
@@ -2310,9 +2374,9 @@ int main(int argc, char **argv)
 
                         if (!fsck_lba_in_range(llba, cetrafs_le64(sb.total_blocks))) {
                             fprintf(stderr,
-                                    "ERR: inode %" PRIu64 "'s extent leaf (block %" PRIu64 ") is out of range\n",
-                                    ino, llba);
-                            problems++;
+                                    "%s: inode %" PRIu64 "'s extent leaf (block %" PRIu64 ") is out of range\n",
+                                    FSCK_SEV, ino, llba);
+                            problems += !fsck_dead_walk;
                             repair_block("an extent leaf lba is out of range, so the blocks the inode "
                                          "owns cannot be distinguished from leaked ones");
                             tree_ok = 0;
@@ -2321,10 +2385,10 @@ int main(int argc, char **argv)
                         pread_all(fd, leafblk, sizeof(leafblk), (off_t) llba * CETRAFS_BLOCK_SIZE);
                         if (fsck_check_tail(leafblk, CETRAFS_LEAF_TAIL_MAGIC) != 0) {
                             fprintf(stderr,
-                                    "ERR: inode %" PRIu64 "'s extent leaf (block %" PRIu64
+                                    "%s: inode %" PRIu64 "'s extent leaf (block %" PRIu64
                                     ") failed its tail checksum\n",
-                                    ino, llba);
-                            problems++;
+                                    FSCK_SEV, ino, llba);
+                            problems += !fsck_dead_walk;
                             repair_block("an extent leaf failed its tail checksum, so the blocks the inode "
                                          "owns cannot be distinguished from leaked ones");
                             tree_ok = 0;
@@ -2352,21 +2416,28 @@ int main(int argc, char **argv)
              * the block is still this inode's, and freeing it would be the
              * same cross-link corruption again. */
             if (xattr_lba && !fsck_lba_in_range(xattr_lba, cetrafs_le64(sb.total_blocks))) {
-                fprintf(stderr, "ERR: inode %" PRIu64 "'s xattr block (block %" PRIu64 ") is out of range\n",
-                        ino, xattr_lba);
-                problems++;
+                fprintf(stderr, "%s: inode %" PRIu64 "'s xattr block (block %" PRIu64 ") is out of range\n",
+                        FSCK_SEV, ino, xattr_lba);
+                problems += !fsck_dead_walk;
             } else if (xattr_lba) {
                 uint8_t xblk[CETRAFS_BLOCK_SIZE];
 
                 pread_all(fd, xblk, sizeof(xblk), (off_t) xattr_lba * CETRAFS_BLOCK_SIZE);
                 if (fsck_check_tail(xblk, CETRAFS_XATTR_TAIL_MAGIC) != 0) {
-                    fprintf(stderr, "ERR: inode %" PRIu64 "'s xattr block (block %" PRIu64 ") failed its tail checksum\n",
-                            ino, xattr_lba);
-                    problems++;
+                    fprintf(stderr, "%s: inode %" PRIu64 "'s xattr block (block %" PRIu64 ") failed its tail checksum\n",
+                            FSCK_SEV, ino, xattr_lba);
+                    problems += !fsck_dead_walk;
                 }
                 fsck_mark_run(&rc, xattr_lba, 1, ino);
             }
+            if (fsck_dead_walk && stale_blocks > stale_before)
+                fprintf(stderr,
+                        "WARN: inode %" PRIu64 " (deleted, not yet reclaimed) still names %" PRIu64
+                        " block(s) another file now holds -- stale extents, dropped when the number is "
+                        "reclaimed\n",
+                        ino, stale_blocks - stale_before);
         }
+        fsck_dead_walk = 0;
 
         /* Blocks sitting in a per-ZG pending-free queue are marked used
          * and referenced by nothing -- legitimately so, until their
@@ -2410,7 +2481,10 @@ int main(int argc, char **argv)
                             for (uint32_t b = 0; b < cetrafs_le32(sb.block_group_count); ++b) {
                                 if (lba >= bg_data_start[b] && lba < bg_data_start[b] + bg_data_cnt[b]) {
                                     ix += lba - bg_data_start[b];
-                                    if (FSCK_GET(refd, ix) || FSCK_GET(queued, ix)) {
+                                    /* A deleted record's claim does not make a
+                                     * block live: freeing it is what the queue
+                                     * is for. */
+                                    if ((FSCK_GET(refd, ix) && !FSCK_GET(weakd, ix)) || FSCK_GET(queued, ix)) {
                                         live = 1;
                                         live_lba = lba;
                                     }
@@ -2462,7 +2536,7 @@ int main(int argc, char **argv)
         /* Reconcile what is referenced against what the bitmaps claim.
          * A block marked used but referenced by nothing is a leak; one
          * referenced but marked free will be handed out again. */
-        uint64_t leaked = 0, unmarked = 0, idx = 0, miscounted = 0;
+        uint64_t leaked = 0, unmarked = 0, idx = 0, miscounted = 0, stale_free = 0;
         for (uint32_t b = 0; b < cetrafs_le32(sb.block_group_count); ++b) {
             uint64_t bmap_blocks = (bg_data_cnt[b] + CETRAFS_BLOCK_SIZE * 8 - 1) / (CETRAFS_BLOCK_SIZE * 8);
             uint8_t *bmap = (uint8_t *) xcalloc(bmap_blocks ? bmap_blocks : 1, CETRAFS_BLOCK_SIZE);
@@ -2485,12 +2559,24 @@ int main(int argc, char **argv)
                      * lose anything -- the 128 MiB evict_inode class,
                      * which until now could only be recovered by
                      * reformatting. */
-                    if (repair_mode && !repair_blocked) {
+                    if (repair_mode && !repair_blocked && !fsck_dead_unwalkable) {
                         bmap[i / 8] &= (uint8_t) ~(1u << (i % 8));
                         bmap_dirty = 1;
                         marked = 0;
                         repairs_made++;
                     }
+                } else if (!marked && is_refd && FSCK_GET(weakd, idx)) {
+                    /* Named only by a deleted record: its previous
+                     * life's free already happened. Stale, not live, and
+                     * left free. Setting the bit would only leak it: an
+                     * unnamed deleted record is freed by this same run.
+                     * A record whose nlink drifted to 0 while a name
+                     * still points at it is the one case where the
+                     * block is wanted -- the namespace pass reports that
+                     * as ERR and repairs the nlink, and the next run
+                     * walks the record as live and sets the bit then.
+                     * Nothing allocates between two offline runs. */
+                    stale_free++;
                 } else if (!marked && is_refd) {
                     if (unmarked < 8)
                         fprintf(stderr,
@@ -2629,6 +2715,15 @@ int main(int argc, char **argv)
         if (leaked)
             fprintf(stderr, "WARN: %" PRIu64 " data block(s) marked in use but referenced by no inode (leaked)\n",
                     leaked);
+        if (leaked && repair_mode && !repair_blocked && fsck_dead_unwalkable)
+            fprintf(stderr, "NOTE: leaked blocks are not cleared this run: a deleted record's extent tree could "
+                            "not be walked, and the blocks it hides cannot be told from leaked ones -- run fsck "
+                            "-r again once the record is gone\n");
+        if (stale_free)
+            fprintf(stderr,
+                    "WARN: %" PRIu64 " block(s) named only by deleted, not yet reclaimed records are already free "
+                    "-- stale extents\n",
+                    stale_free);
         if (unmarked) {
             fprintf(stderr, "ERR: %" PRIu64 " data block(s) in use but marked free\n", unmarked);
             problems += unmarked;
@@ -2644,6 +2739,7 @@ int main(int argc, char **argv)
 
         free(refd);
         free(dupd);
+        free(weakd);
 #undef FSCK_SET
 #undef FSCK_GET
 
@@ -2667,6 +2763,11 @@ int main(int argc, char **argv)
         uint8_t *walked = (uint8_t *) xcalloc(cetrafs_le32(sb.inodes_count) + 1, 1);
         uint32_t *nlinks = (uint32_t *) xcalloc(cetrafs_le32(sb.inodes_count) + 1, sizeof(uint32_t));
         uint8_t *is_dir = (uint8_t *) xcalloc(cetrafs_le32(sb.inodes_count) + 1, 1);
+        /* A regular file that holds nothing at all: no size, no extent,
+         * no xattr block. Unnamed, it is what a create stopped between
+         * its record write and its directory entry leaves, and there is
+         * nothing in it to recover. */
+        uint8_t *empty = (uint8_t *) xcalloc(cetrafs_le32(sb.inodes_count) + 1, 1);
         /* How many SUBDIRECTORIES each directory contains. A directory's
          * link count is 2 (itself, plus its own '.') plus one per
          * subdirectory, contributed by that child's '..'. Nothing
@@ -2726,6 +2827,8 @@ int main(int argc, char **argv)
             nlinks[ino] = cetrafs_le32(in.nlink);
             is_dir[ino] = ((cetrafs_le32(in.mode) & 0170000u) == 0040000u);
             dsize[ino] = cetrafs_le64(in.size);
+            empty[ino] = (cetrafs_le32(in.mode) & 0170000u) == 0100000u && !cetrafs_le64(in.size) &&
+                         !cetrafs_le64(in.xattr_block) && (in.eh.eh_magic == 0 || !cetrafs_le16(in.eh.eh_entries));
         }
 
         /* Pass B: walk every directory's entries. */
@@ -3048,8 +3151,13 @@ int main(int argc, char **argv)
                 if (nlinks[ino] == 0) {
                     fprintf(stderr,
                             "WARN: inode %" PRIu64 " is allocated (nlink=0) with no directory entry -- "
-                            "deleted but not yet reclaimed (peer held it open at delete)\n",
+                            "deleted but not yet reclaimed\n",
                             ino);
+                } else if (empty[ino]) {
+                    fprintf(stderr,
+                            "WARN: inode %" PRIu64 " is an empty file (nlink=%u) that no directory entry names -- "
+                            "a create stopped before adding its name\n",
+                            ino, nlinks[ino]);
                 } else {
                     fprintf(stderr,
                             "ERR: inode %" PRIu64
@@ -3084,7 +3192,17 @@ int main(int argc, char **argv)
                  * above already reclaims -- on the NEXT run, since that
                  * pass has been and gone. Hence the note below.
                  */
-                if (nlinks[ino] == 0 && repair_mode && !repair_blocked) {
+                if (nlinks[ino] != 0 && empty[ino] && repair_mode && !repair_blocked) {
+                    /* Nothing to recover, so free it rather than give it
+                     * a /lost+found name. nlink first: the kernel's
+                     * allocator refuses a number whose record still
+                     * claims links (cetrafs_alloc_inode()). */
+                    repair_set_nlink(fd, &sb, ino, 0);
+                    ibmap[bit / 8] &= (uint8_t) ~(1u << (bit % 8));
+                    ibmap_dirty = 1;
+                    orphans_freed++;
+                    repairs_made++;
+                } else if (nlinks[ino] == 0 && repair_mode && !repair_blocked) {
                     ibmap[bit / 8] &= (uint8_t) ~(1u << (bit % 8));
                     ibmap_dirty = 1;
                     orphans_freed++;
@@ -3325,6 +3443,7 @@ int main(int argc, char **argv)
         free(refs);
         free(nlinks);
         free(is_dir);
+        free(empty);
         free(dot_tgt);
         free(dotdot_tgt);
         free(parent);

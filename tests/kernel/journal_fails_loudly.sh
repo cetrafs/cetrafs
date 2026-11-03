@@ -96,10 +96,17 @@ ct_umount "$MNT"
 # Part 1's refused entry write stopped the mount (docs/internal/ERRORS.md)
 # -- a crash at that instant, so the create's own unwind never ran and
 # the inode it had already written is left allocated with no name: a
-# leak, the safe direction, and the one finding allowed here.
-FO="$(ct_fsck "$DEV" 2>&1 || true)"
-BAD="$(grep '^ERR' <<<"$FO" | grep -v "is allocated (nlink=1) but NO directory entry names it" || true)"
-LEAKS="$(grep -c "is allocated (nlink=1) but NO directory entry names it" <<<"$FO" || true)"
-[ -z "$BAD" ] && [ "$LEAKS" -le 1 ] && pass "fsck: nothing but the stop's one unnamed inode ($LEAKS)" ||
-    fail "fsck: $(head -3 <<<"$BAD") (unnamed inodes: $LEAKS)"
+# leak, the safe direction. It holds nothing, so fsck names it as a
+# create stopped before its name (WARN, not a fault) and -r frees it.
+RC=0
+FO="$(ct_fsck "$DEV" 2>&1)" || RC=$?
+BAD="$(grep '^ERR' <<<"$FO" || true)"
+LEAKS="$(grep -c "a create stopped before adding its name" <<<"$FO" || true)"
+[ "$RC" = 0 ] && [ -z "$BAD" ] && [ "$LEAKS" -le 1 ] &&
+    pass "fsck: clean but for the stop's one unnamed empty inode, reported as such ($LEAKS)" ||
+    fail "fsck rc=$RC: $(head -3 <<<"$BAD") (unnamed inodes: $LEAKS)"
+"$ROOT/userspace/fsck.cetra" -r "$DEV" >/dev/null 2>&1 || true
+FO="$("$ROOT/userspace/fsck.cetra" "$DEV" 2>&1 || true)"
+grep -qE '^(ERR|WARN)' <<<"$FO" && fail "fsck -r left: $(grep -E '^(ERR|WARN)' <<<"$FO" | head -2)" ||
+    pass "fsck -r frees it: the next run is clean"
 ct_exit
