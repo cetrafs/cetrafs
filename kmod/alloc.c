@@ -82,7 +82,7 @@ static long cetrafs_bitmap_alloc_bit(struct super_block *sb, u64 bmap_lba, u64 n
     u64 blk;
 
     for (blk = 0; blk < nblocks; blk++) {
-        struct buffer_head *bh = sb_bread(sb, bmap_lba + blk);
+        struct buffer_head *bh = cetrafs_bread_retry(sb, bmap_lba + blk);
         unsigned int byte;
 
         if (!bh)
@@ -164,7 +164,7 @@ static long cetrafs_bitmap_alloc_run_start(struct super_block *sb,
         return cetrafs_bitmap_alloc_bit(sb, bmap_lba, nblocks, nbits, sync);
 
     for (blk = 0; blk < nblocks; blk++) {
-        struct buffer_head *bh = sb_bread(sb, bmap_lba + blk);
+        struct buffer_head *bh = cetrafs_bread_retry(sb, bmap_lba + blk);
         unsigned int byte;
 
         if (!bh)
@@ -247,7 +247,7 @@ static int cetrafs_bitmap_free_bit(struct super_block *sb, u64 bmap_lba, u64 nbl
     if (blk >= nblocks)
         return -EINVAL;
 
-    bh = sb_bread(sb, bmap_lba + blk);
+    bh = cetrafs_bread_retry(sb, bmap_lba + blk);
     if (!bh)
         return -EIO;
 
@@ -294,7 +294,7 @@ static int cetrafs_bitmap_try_alloc_exact(struct super_block *sb,
     if (bit >= nbits || blk >= nblocks)
         return -ENOSPC;
 
-    bh = sb_bread(sb, bmap_lba + blk);
+    bh = cetrafs_bread_retry(sb, bmap_lba + blk);
     if (!bh)
         return -EIO;
 
@@ -326,7 +326,7 @@ static long cetrafs_bitmap_count_free(struct super_block *sb, u64 bmap_lba, u64 
     u64 free = 0;
 
     for (blk = 0; blk < nblocks; blk++) {
-        struct buffer_head *bh = sb_bread(sb, bmap_lba + blk);
+        struct buffer_head *bh = cetrafs_bread_retry(sb, bmap_lba + blk);
         unsigned int byte;
 
         if (!bh)
@@ -1098,7 +1098,7 @@ static int cetrafs_read_bg_geom(struct super_block *sb, u32 bg_id, struct cetraf
         if (attempt > 0)
             cetrafs_invalidate_block(sb, blk);
 
-        bh = sb_bread(sb, blk);
+        bh = cetrafs_bread_retry(sb, blk);
         if (!bh)
             return -EIO;
 
@@ -1301,7 +1301,7 @@ static int cetrafs_bg_adjust_free_blocks(struct super_block *sb, u32 bg_id, s64 
     if (bg_id >= le32_to_cpu(raw_sb->block_group_count))
         return -EINVAL;
 
-    bh = sb_bread(sb, cetrafs_sb_bg_desc_lba(sb, bg_id));
+    bh = cetrafs_bread_retry(sb, cetrafs_sb_bg_desc_lba(sb, bg_id));
     if (!bh)
         return -EIO;
     bg = (const cetrafs_block_group_t *) bh->b_data;
@@ -1480,7 +1480,7 @@ int cetrafs_bg_apply_free_delta(struct super_block *sb, u32 bg_id, s64 delta)
      * reconcile landed, or the cache was simply cold -- just MISCOMPAREs
      * and the retry re-reads fresh, where the epoch guard decides. */
     {
-        struct buffer_head *bh = sb_bread(sb, cetrafs_sb_bg_desc_lba(sb, bg_id));
+        struct buffer_head *bh = cetrafs_bread_retry(sb, cetrafs_sb_bg_desc_lba(sb, bg_id));
 
         ret = cetrafs_cas_record_seeded(sb, cetrafs_sb_bg_desc_lba(sb, bg_id), bh ? bh->b_data : NULL,
                                         bh ? cetrafs_cas_region_size(sb) : 0, cetrafs_bg_count_mutate, &ctx);
@@ -2000,7 +2000,7 @@ void cetrafs_shadow_seed(struct super_block *sb)
         if (cetrafs_read_bg_geom(sb, bg_id, &bg))
             continue;
         for (blk = 0; blk < bg.off_data_region - bg.off_data_bmap; blk++) {
-            struct buffer_head *bh = sb_bread(sb, bg.start_block + bg.off_data_bmap + blk);
+            struct buffer_head *bh = cetrafs_bread_retry(sb, bg.start_block + bg.off_data_bmap + blk);
             u64 i;
 
             if (!bh)
@@ -3109,7 +3109,7 @@ int cetrafs_bg_claim_free(struct super_block *sb, u32 zg_id, u32 *out_bg_id)
 
         if (cetrafs_bg_claim_blind) {
             /* test-only: read, decide, write -- no exclusion at all */
-            struct buffer_head *wbh = sb_bread(sb, cetrafs_sb_bg_desc_lba(sb, b));
+            struct buffer_head *wbh = cetrafs_bread_retry(sb, cetrafs_sb_bg_desc_lba(sb, b));
 
             if (!wbh)
                 continue;

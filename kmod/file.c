@@ -495,7 +495,7 @@ fail:
 /* Walk one external leaf block's extents (read by LBA, plain cached). */
 static int cetrafs_scrub_walk_leaf(struct super_block *sb, u64 lba, void (*cb)(void *, u64, u32), void *ctx)
 {
-    struct buffer_head *bh = sb_bread(sb, lba);
+    struct buffer_head *bh = cetrafs_bread_retry(sb, lba);
     const cetrafs_extent_hdr_t *hdr;
     const cetrafs_extent_t *arr;
     u32 ln, i;
@@ -596,7 +596,7 @@ int cetrafs_raw_inode_for_each_owned_block(struct super_block *sb,
             if (ret)
                 return ret;
         } else {
-            struct buffer_head *ibh = sb_bread(sb, lba);
+            struct buffer_head *ibh = cetrafs_bread_retry(sb, lba);
             const cetrafs_extent_hdr_t *ihdr;
             const cetrafs_extent_idx_t *iarr;
             u32 li, iln;

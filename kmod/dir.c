@@ -330,7 +330,7 @@ static struct buffer_head *cetrafs_dirent_read(struct super_block *sb, u64 lba, 
     if (fresh)
         return cetrafs_dirent_bread(sb, lba);
 
-    bh = sb_bread(sb, lba);
+    bh = cetrafs_bread_retry(sb, lba);
     if (bh) {
         if (cetrafs_dirent_block_valid(bh))
             return bh;
@@ -923,7 +923,7 @@ int cetrafs_dir_add_entry(struct inode *dir, const struct qstr *name, u64 ino, u
          * the block is not an option any more, since the extent
          * referencing it is committed.
          */
-        bh = sb_bread(dir->i_sb, new_lba);
+        bh = cetrafs_bread_retry(dir->i_sb, new_lba);
         if (!bh) {
             pr_warn_ratelimited("dir ino=%llu: new dirent block %llu unreadable\n", (unsigned long long) dir->i_ino,
                                 (unsigned long long) new_lba);

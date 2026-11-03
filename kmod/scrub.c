@@ -330,7 +330,7 @@ static u8 *scrub_read_bitmap(struct super_block *sb, const struct scrub_bg *b)
     if (!buf)
         return NULL;
     for (i = 0; i < b->bmap_blocks; i++) {
-        struct buffer_head *bh = sb_bread(sb, b->bmap_lba + i);
+        struct buffer_head *bh = cetrafs_bread_retry(sb, b->bmap_lba + i);
 
         if (!bh) {
             kvfree(buf);

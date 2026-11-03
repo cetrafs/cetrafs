@@ -1452,7 +1452,7 @@ int cetrafs_journal_replay_node(struct super_block *sb, u32 node_id, bool wait_f
         brelse(pbh);
 
 consume:
-        hbh = sb_bread(sb, entries[s].header_lba);
+        hbh = cetrafs_bread_retry(sb, entries[s].header_lba);
         if (!hbh) {
             ret = -EIO;
             goto out_free;

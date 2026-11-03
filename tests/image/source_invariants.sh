@@ -75,6 +75,21 @@ else
     fail "buffer protocol: sync_dirty_buffer() (its result comes from BH_Uptodate) in: $(echo "$SDB" | xargs -n1 basename | tr '\n' ' ')"
 fi
 
+# A plain sb_bread() racing a cetrafs_invalidate_block() of the same
+# block comes back NULL with no device error (__bread_slow() re-checks
+# BH_Uptodate after its read completes). Caller after caller turned that
+# into -EIO, and one of those error paths left a birth claim on a dead
+# record: blocks then read as shared between two files (2026-11-03).
+# cetrafs_bread_retry() is the sanctioned reader; ioutil.c implements
+# it, and fs.c's two reads run in fill_super, before anything else can
+# reach the mount.
+SBR="$(code_hits '[^_]sb_bread\(' | grep -vE "/ioutil\.c:" | grep -vE "/fs\.c:" || true)"
+if [ -z "$SBR" ]; then
+    pass "block reads: no plain sb_bread() outside ioutil.c and fill_super"
+else
+    fail "block reads: plain sb_bread() (a racing invalidate reads as -EIO) at: $(echo "$SBR" | cut -d: -f1,2 | xargs -n1 basename | tr '\n' ' ')"
+fi
+
 log "checking every begin_update reaches exactly one end/abort"
 # P3's original question, kept because it is still worth asking -- just no
 # longer mistaken for the whole audit.
