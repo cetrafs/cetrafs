@@ -357,12 +357,21 @@ struct cetrafs_inode_info {
      * as dirent_seq_cached above. */
     u64 file_seq_cached;
 
-    /* Set when the gate sees a PEER's stamp: this inode's cached tree
-     * blocks may name the wrong physical blocks, so every tree read must
+    /* "Cold": the gate saw a PEER's stamp, so this inode's cached tree
+     * blocks may name the wrong physical blocks and every tree read must
      * go to the device until a safe context can reconcile. Sticky on
      * purpose -- a leaf nobody happens to re-read would otherwise stay
-     * cached and become trusted again the moment the gate goes quiet. */
-    bool tree_cache_cold;
+     * cached and become trusted again the moment the gate goes quiet.
+     *
+     * Two counters, not a flag. A reconcile used to clear a bool once it
+     * had dropped the tree -- and a mark landing DURING that reconcile,
+     * after its drop, was cleared with it: the newer peer change was
+     * then trusted from a cache nobody had dropped. Now each mark bumps
+     * tree_cold_marks, a reconcile records the count it started from in
+     * tree_cold_done, and the tree is cold while the two differ. See
+     * cetrafs_tree_is_cold(). */
+    atomic_t tree_cold_marks;
+    atomic_t tree_cold_done;
 
     /* cetrafs_lock_read_cache_trusted()'s once-a-second stamp check, the
      * reader's twin of foreign_open_valid/_checked. Kept apart from
@@ -371,8 +380,8 @@ struct cetrafs_inode_info {
     bool read_seq_valid;
     unsigned long read_seq_checked;
 
-    /* Clears tree_cache_cold from a context that holds no buffer lock.
-     * The gate itself runs on the per-block path and must not do the
+    /* Settles a cold tree (tree_cold_marks) from a context that holds
+     * no buffer lock. The gate itself runs on the per-block path and must not do the
      * work (it deadlocks there); waiting for the next open() instead
      * pinned a running VM's disk to a device round trip per tree read
      * for the life of the guest -- measured at 28068 forced-fresh reads
@@ -1046,6 +1055,48 @@ struct kmem_cache *cetrafs_inode_cache;
 /* Defined further down, next to the gate that schedules it. */
 static void cetrafs_inode_cold_work(struct work_struct *w);
 
+/* Is the cached extent tree untrusted? While any mark has not been
+ * covered by a finished reconcile. */
+static bool cetrafs_tree_is_cold(struct cetrafs_inode_info *ci)
+{
+    return atomic_read(&ci->tree_cold_marks) != atomic_read(&ci->tree_cold_done);
+}
+
+/* A reconcile's starting point: every mark up to here is covered once it
+ * has dropped the tree. Read BEFORE the drop, so a mark that lands
+ * during it stays outstanding. */
+static int cetrafs_tree_cold_begin(struct cetrafs_inode_info *ci)
+{
+    int g = atomic_read(&ci->tree_cold_marks);
+
+    smp_mb(); /* the snapshot before any of the reconcile's reads */
+    return g;
+}
+
+/* ...and its end. Only ever moves forward: the open path and the work
+ * item can reconcile at once, and the one that started earlier must not
+ * finish by re-marking what the later one settled -- nothing would be
+ * left scheduled to settle it again. */
+static void cetrafs_tree_cold_settle(struct cetrafs_inode_info *ci, int g)
+{
+    int cur = atomic_read(&ci->tree_cold_done);
+
+    smp_mb(); /* the reconcile's drops before the settle */
+    while ((int) (g - cur) > 0) {
+        int old = atomic_cmpxchg(&ci->tree_cold_done, cur, g);
+
+        if (old == cur)
+            break;
+        cur = old;
+    }
+}
+
+static void cetrafs_tree_mark_cold_ci(struct cetrafs_inode_info *ci)
+{
+    atomic_inc(&ci->tree_cold_marks);
+    smp_mb__after_atomic();
+}
+
 /*
  * Per-IDENTITY state: everything here describes the FILE this object
  * currently represents, so it must be re-initialized every time the
@@ -1065,7 +1116,7 @@ static void cetrafs_inode_cold_work(struct work_struct *w);
  * a full-gate trace on an 8-core node: the armed index-gate trigger hit
  * "decline latch" on a freshly-created file no one had ever queued
  * (2026-10-29). The freshness caches (foreign_open_*, *_seq_cached,
- * tree_cache_cold) are reset here for the same reason: inherited, they
+ * tree_cold_marks/_done) are reset here for the same reason: inherited, they
  * are not merely stale, they are the WRONG FILE's answers.
  */
 static void cetrafs_inode_identity_init_ci(struct cetrafs_inode_info *ci)
@@ -1087,7 +1138,8 @@ static void cetrafs_inode_identity_init_ci(struct cetrafs_inode_info *ci)
     ci->lock_suspended = false;
     ci->dirent_seq_cached = U64_MAX;
     ci->file_seq_cached = U64_MAX;
-    ci->tree_cache_cold = false;
+    atomic_set(&ci->tree_cold_marks, 0);
+    atomic_set(&ci->tree_cold_done, 0);
     ci->read_seq_valid = false;
     ci->read_seq_checked = 0;
     /* A slab object is recycled across identities; a remembered extent
@@ -1835,7 +1887,9 @@ int cetrafs_lock_open(struct inode *inode, struct file *file)
      * A peer rewrote this file's layout, so its cached DATA pages may be
      * the wrong blocks' contents. Clean pages only -- dirty ones are our
      * own unwritten data and are never dropped. */
-    if (READ_ONCE(ci->tree_cache_cold)) {
+    if (cetrafs_tree_is_cold(ci)) {
+        int g = cetrafs_tree_cold_begin(ci);
+
         /* Re-read: the tree we must stop believing in has to be walked
          * from the record as it stands NOW, not from whatever this open
          * validated itself against a moment ago.
@@ -1846,12 +1900,15 @@ int cetrafs_lock_open(struct inode *inode, struct file *file)
          * configured with CONFIG_FRAME_WARN=1024 (Proxmox's), while the
          * arm64 dev kernel's 2048 said nothing. */
         cetrafs_invalidate_raw_inode(sb, inode->i_ino);
-        if (cetrafs_read_raw_inode(sb, inode->i_ino, &raw) == 0)
+        if (cetrafs_read_raw_inode(sb, inode->i_ino, &raw) == 0) {
             cetrafs_tree_invalidate_cached(inode, &raw);
-        if (inode->i_mapping)
-            invalidate_mapping_pages(inode->i_mapping, 0, -1);
-        WRITE_ONCE(ci->tree_cache_cold, false);
-        atomic64_inc(&cetrafs_file_cache_reconciles);
+            if (inode->i_mapping)
+                invalidate_mapping_pages(inode->i_mapping, 0, -1);
+            /* Only a reconcile that dropped the tree settles it; an
+             * unreadable record leaves the inode cold, reading fresh. */
+            cetrafs_tree_cold_settle(ci, g);
+            atomic64_inc(&cetrafs_file_cache_reconciles);
+        }
     }
 
     ret = 0;
@@ -2395,28 +2452,48 @@ MODULE_PARM_DESC(force_foreign_opener, "TEST ONLY: nofilelock metadata reads alw
  * milliseconds, not "until someone reopens the file" -- a running VM never
  * reopens its disk.
  */
+/* TEST ONLY: hold the reconcile open, before it drops the tree and again
+ * before it settles, so a mark can be driven into each window
+ * (tests/kernel/cold_mark_during_reconcile.sh). */
+static unsigned int cetrafs_cold_work_stall_ms;
+module_param_named(cold_work_stall_ms, cetrafs_cold_work_stall_ms, uint, 0644);
+MODULE_PARM_DESC(cold_work_stall_ms, "TEST ONLY: stall the cold-tree reconcile before its drop and before its settle");
+
 static void cetrafs_inode_cold_work(struct work_struct *w)
 {
     struct cetrafs_inode_info *ci = container_of(w, struct cetrafs_inode_info, cold_work);
     struct inode *inode = &ci->vfs_inode;
     struct super_block *sb = inode->i_sb;
     cetrafs_inode_t *raw;
+    int g = cetrafs_tree_cold_begin(ci);
+    bool dropped = false;
 
+    if (cetrafs_cold_work_stall_ms)
+        msleep(cetrafs_cold_work_stall_ms); /* test-only; see the parameter */
     raw = kmalloc(sizeof(*raw), GFP_NOFS);
     if (raw) {
         cetrafs_invalidate_raw_inode(sb, inode->i_ino);
-        if (cetrafs_read_raw_inode(sb, inode->i_ino, raw) == 0)
+        if (cetrafs_read_raw_inode(sb, inode->i_ino, raw) == 0) {
             cetrafs_tree_invalidate_cached(inode, raw);
+            dropped = true;
+        }
         kfree(raw);
     }
     /* Clean pages only -- dirty ones are our own unwritten data. */
     if (inode->i_mapping)
         invalidate_mapping_pages(inode->i_mapping, 0, -1);
 
-    /* Only now is the cache known good again. Clearing earlier would
-     * re-bless leaf buffers nobody had re-read yet. */
-    WRITE_ONCE(ci->tree_cache_cold, false);
-    atomic64_inc(&cetrafs_file_cache_reconciles);
+    /* Only now is the cache known good again -- and only as of the
+     * marks counted at the start: one that landed since is still
+     * outstanding, and its own scheduling queued this work again. A
+     * reconcile that could not read the record dropped nothing and
+     * settles nothing. */
+    if (cetrafs_cold_work_stall_ms)
+        msleep(cetrafs_cold_work_stall_ms); /* test-only; see the parameter */
+    if (dropped) {
+        cetrafs_tree_cold_settle(ci, g);
+        atomic64_inc(&cetrafs_file_cache_reconciles);
+    }
     iput(inode);
 }
 
@@ -2431,7 +2508,7 @@ void cetrafs_inode_mark_tree_cold(struct inode *inode)
 {
     struct cetrafs_inode_info *ci = CETRAFS_I(inode);
 
-    WRITE_ONCE(ci->tree_cache_cold, true);
+    cetrafs_tree_mark_cold_ci(ci);
     if (igrab(inode)) {
         if (!schedule_work(&ci->cold_work))
             iput(inode);
@@ -2478,7 +2555,7 @@ static void cetrafs_inode_note_stamp(struct inode *inode, const cetrafs_inode_t 
              * this path at all. The page cache, which needs a real
              * sweep, is handled at open (a safe context). */
             atomic64_inc(&cetrafs_file_cache_drops);
-            WRITE_ONCE(ci->tree_cache_cold, true);
+            cetrafs_tree_mark_cold_ci(ci);
             /* Hand the actual dropping to a context that can take buffer
              * locks. igrab keeps the inode alive across the handoff; if
              * the work is already queued, drop the reference we just
@@ -2580,14 +2657,20 @@ bool cetrafs_lock_held_for_write_locally(struct inode *inode)
      * the record and a peer may be writing. Inferring ownership from the
      * writer count is exactly what stops being true there, so fall
      * through to the nofilelock logic, which asks the device. */
+    /* The writer's answer still asks whether the tree is cold. The open
+     * that made us the writer marks it when it applies a peer's record,
+     * and settles it before returning -- but a mark it did not cover
+     * (one landing during its reconcile) must not be trusted away just
+     * because we hold the lock now. Free when nothing is outstanding:
+     * two atomic reads. */
     if (cetrafs_sb_file_lock_enabled(inode->i_sb) &&
         (cetrafs_lock_suspend_trust_cache || !READ_ONCE(CETRAFS_I(inode)->lock_suspended)))
-        return atomic_read(&CETRAFS_I(inode)->lock_writer_count) > 0;
+        return atomic_read(&CETRAFS_I(inode)->lock_writer_count) > 0 && !cetrafs_tree_is_cold(CETRAFS_I(inode));
 
     if (cetrafs_inode_foreign_opener_cached(inode))
         return false;
     /* Checked AFTER the gate, which is what sets it. */
-    return !READ_ONCE(CETRAFS_I(inode)->tree_cache_cold);
+    return !cetrafs_tree_is_cold(CETRAFS_I(inode));
 }
 
 /*
@@ -2680,7 +2763,7 @@ bool cetrafs_lock_read_cache_trusted(struct inode *inode)
      * would only add a device read. */
     if (cetrafs_sb_file_lock_enabled(inode->i_sb) && !cetrafs_inode_read_stamp_check(inode))
         return false;
-    return !READ_ONCE(ci->tree_cache_cold);
+    return !cetrafs_tree_is_cold(ci);
 }
 
 /*
