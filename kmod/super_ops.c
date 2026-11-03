@@ -304,7 +304,7 @@ static void cetrafs_evict_inode(struct inode *inode)
                 pr_warn("evict_inode: ino=%llu still has %u name(s) on disk -- a peer named it since we dropped ours; freeing nothing\n",
                         (unsigned long long) inode->i_ino, (unsigned int) cetrafs_le32(raw.nlink));
                 ret = -EBUSY;
-            } else if (cetrafs_sb_ino_damaged(inode->i_sb, inode->i_ino)) {
+            } else if (cetrafs_sb_inode_damaged(inode)) {
                 /* Freeing walks the extent tree that was found damaged:
                  * a bad address there frees someone else's blocks. Leave
                  * it all for fsck (docs/internal/ERRORS.md). */

@@ -897,6 +897,12 @@ u64 cetrafs_inode_new_generation(struct super_block *sb)
     return gen ? gen : 1;
 }
 
+/* Test-only: fail the next N record reads of an iget fill with -EIO, as
+ * a device read error would. tests/kernel/free_inode_keeps_bit.sh. */
+static unsigned int cetrafs_iget_read_fail;
+module_param_named(iget_read_fail, cetrafs_iget_read_fail, uint, 0644);
+MODULE_PARM_DESC(iget_read_fail, "test-only: fail the next N record reads of an inode fill with -EIO");
+
 struct inode *cetrafs_iget(struct super_block *sb, u64 ino)
 {
     cetrafs_inode_t raw;
@@ -978,7 +984,12 @@ retry:
 
     cetrafs_invalidate_raw_inode(sb, ino);
 
-    ret = cetrafs_read_raw_inode(sb, ino, &raw);
+    if (cetrafs_iget_read_fail) {
+        cetrafs_iget_read_fail--; /* test-only; see the parameter */
+        ret = -EIO;
+    } else {
+        ret = cetrafs_read_raw_inode(sb, ino, &raw);
+    }
     if (ret) {
         iget_failed(inode);
         return ERR_PTR(ret);
@@ -1526,7 +1537,7 @@ struct buffer_head *cetrafs_read_tree_bh_for(struct inode *inode, u64 lba, u32 t
     if (!cetrafs_lba_run_is_data(inode->i_sb, lba, 1)) {
         pr_err_ratelimited("ino=%llu: %s block %llu is not a data address -- refusing it (fsck)\n",
                            (unsigned long long) inode->i_ino, what, (unsigned long long) lba);
-        cetrafs_sb_corrupt(inode->i_sb, inode->i_ino);
+        cetrafs_sb_corrupt_inode(inode);
         return NULL;
     }
 
@@ -1557,7 +1568,7 @@ struct buffer_head *cetrafs_read_tree_bh_for(struct inode *inode, u64 lba, u32 t
         if (bh && !cetrafs_blk_struct_ok_magic(bh, tail_magic)) {
             pr_err_ratelimited("ino=%llu: %s block %llu has an impossible entry count -- refusing it\n",
                                (unsigned long long) inode->i_ino, what, (unsigned long long) lba);
-            cetrafs_sb_corrupt(inode->i_sb, inode->i_ino);
+            cetrafs_sb_corrupt_inode(inode);
             brelse(bh);
             return NULL;
         }
@@ -1613,7 +1624,7 @@ struct buffer_head *cetrafs_read_dir_leaf_bh(struct inode *inode, u64 lba, bool 
     if (!cetrafs_lba_run_is_data(inode->i_sb, lba, 1)) {
         pr_err_ratelimited("dir ino=%llu: extent leaf %llu is not a data address -- refusing it (fsck)\n",
                            (unsigned long long) inode->i_ino, (unsigned long long) lba);
-        cetrafs_sb_corrupt(inode->i_sb, inode->i_ino);
+        cetrafs_sb_corrupt_inode(inode);
         return NULL;
     }
 
@@ -1630,7 +1641,7 @@ struct buffer_head *cetrafs_read_dir_leaf_bh(struct inode *inode, u64 lba, bool 
         if (bh && !cetrafs_blk_struct_ok_magic(bh, CETRAFS_LEAF_TAIL_MAGIC)) {
             pr_err_ratelimited("dir ino=%llu: extent leaf %llu has an impossible entry count -- refusing it\n",
                                (unsigned long long) inode->i_ino, (unsigned long long) lba);
-            cetrafs_sb_corrupt(inode->i_sb, inode->i_ino);
+            cetrafs_sb_corrupt_inode(inode);
             brelse(bh);
             return NULL;
         }
@@ -1766,7 +1777,7 @@ int cetrafs_apply_raw_to_vfs_inode(struct inode *inode, const cetrafs_inode_t *r
     if (((inode->i_mode ^ cetrafs_le32(raw->mode)) & S_IFMT) != 0) {
         pr_err("ino=%llu: refusing a refresh that would change its type (0%o -> 0%o) with the same generation\n",
                (unsigned long long) inode->i_ino, inode->i_mode & S_IFMT, cetrafs_le32(raw->mode) & S_IFMT);
-        cetrafs_sb_corrupt(inode->i_sb, inode->i_ino);
+        cetrafs_sb_corrupt_inode(inode);
         return -EUCLEAN;
     }
 

@@ -534,6 +534,12 @@ MODULE_PARM_DESC(birth_gap_ms, "test-only: delay between an inode allocation's b
 static unsigned int cetrafs_birth_read_gap_ms;
 module_param_named(birth_read_gap_ms, cetrafs_birth_read_gap_ms, uint, 0644);
 MODULE_PARM_DESC(birth_read_gap_ms, "test-only: delay between an inode allocation's bit CAS and its record read");
+/* Test-only: fail the next N record reads of cetrafs_free_inode(), as a
+ * device read error would. tests/kernel/free_inode_keeps_bit.sh. */
+static unsigned int cetrafs_free_inode_read_fail;
+module_param_named(free_inode_read_fail, cetrafs_free_inode_read_fail, uint, 0644);
+MODULE_PARM_DESC(free_inode_read_fail, "test-only: fail the next N record reads of an inode free with -EIO");
+
 /* Test-only: fail the next N post-claim bit checks of an inode allocation
  * with -EIO, as a device read error would, without reading.
  * tests/kernel/birth_check_error.sh. */
@@ -818,6 +824,7 @@ int cetrafs_alloc_inode(struct super_block *sb, u64 *out_ino)
          * previous record is still what a scanner reads), so the orphan
          * scrub keys off the registry instead. */
         cetrafs_sb_adjust_free_inodes(sb, -1);
+        cetrafs_sb_ino_reborn(sb, *out_ino);
         return 0;
     }
     *out_ino = 0;
@@ -849,27 +856,54 @@ int cetrafs_free_inode(struct super_block *sb, u64 ino)
      * inode from a dead one, and nothing could check that the bitmap
      * and the record agree before handing a number out.
      *
-     * A record that outlives its bit and still claims links is also
-     * what fsck reports as "allocated but NO directory entry names it"
-     * once the number is reused, so this makes the on-disk state honest
-     * as well as checkable.
+     * And the bit goes back ONLY once the record is dead. It used to be
+     * cleared whatever happened here: a record read that failed, or a
+     * zeroing CAS that did, put the bit back under a record still
+     * claiming links -- which the next allocator to draw it refuses with
+     * -EIO (a create failing for nothing) and then keeps, as an unnamed
+     * inode fsck can only call a lost name. Kept set instead, it is a
+     * leak, the safe direction.
+     *
+     * Read raw, as the allocator does (cetrafs_birth_read()): a create
+     * that failed before its record write leaves an all-zero record,
+     * which is the expected shape of a never-used number, not damage.
+     * cetrafs_read_raw_inode() burned its retries on it and reported it
+     * as corruption -- counted, logged "run fsck", and the number marked
+     * damaged; under corruption=stop, an ordinary ENOSPC mkdir stopped
+     * the mount.
      */
     {
         cetrafs_inode_t raw;
+        bool have = false, dead = false;
 
-        cetrafs_invalidate_raw_inode(sb, ino);
-        if (cetrafs_read_raw_inode(sb, ino, &raw) == 0) {
-            ctrace("INOFREE ino=%llu nlink_on_disk=%u size=%llu from=%pS\n", (unsigned long long) ino,
-                   (unsigned int) cetrafs_le32(raw.nlink), (unsigned long long) cetrafs_le64(raw.size),
-                   __builtin_return_address(0));
-            if (cetrafs_le32(raw.nlink) != 0)
-                (void) cetrafs_inode_ns_zero_nlink(sb, ino, &raw);
-            /* A create that failed before its record write still holds
-             * its birth claim: give it back, or every peer that later
-             * draws this number reads a foreign lock and abandons it. */
-            else if (mid_birth && cetrafs_le32(raw.ns_lock_owner) != CETRAFS_NODE_ID_NONE)
-                (void) cetrafs_inode_reclaim_claim(sb, ino, cetrafs_le64(raw.generation), CETRAFS_RECLAIM_BIRTH_ABORT,
-                                                   NULL);
+        if (cetrafs_free_inode_read_fail) {
+            cetrafs_free_inode_read_fail--; /* test-only; see the parameter */
+        } else if (cetrafs_birth_read(sb, ino, &raw, &have) == 0) {
+            ctrace("INOFREE ino=%llu have=%d nlink_on_disk=%u size=%llu from=%pS\n", (unsigned long long) ino, have,
+                   have ? (unsigned int) cetrafs_le32(raw.nlink) : 0U,
+                   have ? (unsigned long long) cetrafs_le64(raw.size) : 0ULL, __builtin_return_address(0));
+            if (!have) {
+                /* Never written: names nothing. Anything else that does
+                 * not verify cannot be judged, and keeps its bit. */
+                dead = !memchr_inv(&raw, 0, sizeof(raw));
+            } else if (cetrafs_le32(raw.nlink) != 0) {
+                dead = cetrafs_inode_ns_zero_nlink(sb, ino, &raw) == 0;
+            } else {
+                dead = true;
+                /* A create that failed before its record write still
+                 * holds its birth claim: give it back, or every peer
+                 * that later draws this number reads a foreign lock and
+                 * abandons it. */
+                if (mid_birth && cetrafs_le32(raw.ns_lock_owner) != CETRAFS_NODE_ID_NONE)
+                    (void) cetrafs_inode_reclaim_claim(sb, ino, cetrafs_le64(raw.generation),
+                                                       CETRAFS_RECLAIM_BIRTH_ABORT, NULL);
+            }
+        }
+        if (!dead) {
+            pr_warn_ratelimited("free_inode: ino=%llu: its record could not be made dead -- leaving the number "
+                                "allocated (fsck reports it)\n",
+                                (unsigned long long) ino);
+            return -EIO;
         }
     }
 

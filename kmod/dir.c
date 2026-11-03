@@ -454,7 +454,7 @@ static int cetrafs_dir_extents_addr_ok(struct inode *dir, const struct cetrafs_d
             pr_err_ratelimited("dir ino=%llu: extent %u names blocks %llu+%u outside the data area -- refusing it "
                                "(fsck)\n",
                                (unsigned long long) dir->i_ino, i, (unsigned long long) phys, len);
-            cetrafs_sb_corrupt(dir->i_sb, dir->i_ino);
+            cetrafs_sb_corrupt_inode(dir);
             return -EUCLEAN;
         }
     }

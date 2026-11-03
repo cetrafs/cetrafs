@@ -2748,8 +2748,38 @@ void cetrafs_sb_fatal(struct super_block *sb, const char *fmt, ...)
  * inode go on failing by themselves, on the bad block, and only there.
  *
  * corruption=stop makes it kind 3 instead.
+ *
+ * The mark is per INCARNATION, not per number (CLAUDE.md rule 2): inode
+ * numbers are reused, and a mark keyed by the number alone refused every
+ * write to whatever file was handed that number next. It carries the
+ * damaged record's generation when the caller has the inode
+ * (cetrafs_sb_corrupt_inode()); a bare number is stored as "generation
+ * unknown", which matches any incarnation. Either is dropped when this
+ * node allocates the number again (cetrafs_sb_ino_reborn()): the new
+ * record is written whole, so the damage was the old one's. An unknown
+ * mark on a number a PEER re-allocates stays until remount -- refusing a
+ * healthy file's writes, the conservative side, on a volume already
+ * reported as needing fsck.
  */
+#define CETRAFS_BAD_GEN_UNKNOWN 0UL
+static unsigned long cetrafs_bad_gen(u64 generation)
+{
+    return (unsigned long) (generation & LONG_MAX);
+}
+
+static void cetrafs_sb_corrupt_gen(struct super_block *sb, u64 ino, unsigned long gen);
+
 void cetrafs_sb_corrupt(struct super_block *sb, u64 ino)
+{
+    cetrafs_sb_corrupt_gen(sb, ino, CETRAFS_BAD_GEN_UNKNOWN);
+}
+
+void cetrafs_sb_corrupt_inode(struct inode *inode)
+{
+    cetrafs_sb_corrupt_gen(inode->i_sb, inode->i_ino, cetrafs_bad_gen(cetrafs_inode_get_generation(inode)));
+}
+
+static void cetrafs_sb_corrupt_gen(struct super_block *sb, u64 ino, unsigned long gen)
 {
     struct cetrafs_sb_info *sbi = sb->s_fs_info;
 
@@ -2766,7 +2796,7 @@ void cetrafs_sb_corrupt(struct super_block *sb, u64 ino)
         /* GFP_NOFS: found on read paths that may hold fs locks. If the
          * entry cannot be stored the write gate cannot see it, so say
          * so rather than imply a protection that is not there. */
-        if (xa_err(xa_store(&sbi->bad_inos, (unsigned long) ino, xa_mk_value(1), GFP_NOFS)))
+        if (xa_err(xa_store(&sbi->bad_inos, (unsigned long) ino, xa_mk_value(gen), GFP_NOFS)))
             pr_err("%s: ino=%llu is damaged but could not be recorded -- writes to it are NOT refused\n",
                    sb->s_id, (unsigned long long) ino);
         else
@@ -2788,11 +2818,31 @@ unsigned int cetrafs_sb_corruptions(struct super_block *sb)
     return sbi ? (unsigned int) atomic_read(&sbi->corruptions) : 0;
 }
 
-bool cetrafs_sb_ino_damaged(struct super_block *sb, u64 ino)
+/* Was damage found in THIS incarnation of the inode (or in one of its
+ * number whose generation was unknown)? */
+bool cetrafs_sb_inode_damaged(struct inode *inode)
+{
+    struct cetrafs_sb_info *sbi = inode->i_sb->s_fs_info;
+    unsigned long gen;
+    void *v;
+
+    if (!sbi || inode->i_ino > ULONG_MAX)
+        return false;
+    v = xa_load(&sbi->bad_inos, (unsigned long) inode->i_ino);
+    if (!v)
+        return false;
+    gen = xa_to_value(v);
+    return gen == CETRAFS_BAD_GEN_UNKNOWN || gen == cetrafs_bad_gen(cetrafs_inode_get_generation(inode));
+}
+
+/* This node is giving 'ino' a new record: whatever was damaged was the
+ * old incarnation's. */
+void cetrafs_sb_ino_reborn(struct super_block *sb, u64 ino)
 {
     struct cetrafs_sb_info *sbi = sb->s_fs_info;
 
-    return sbi && ino <= ULONG_MAX && xa_load(&sbi->bad_inos, (unsigned long) ino);
+    if (sbi && ino && ino <= ULONG_MAX)
+        xa_erase(&sbi->bad_inos, (unsigned long) ino);
 }
 
 bool cetrafs_sb_errors_panic(struct super_block *sb)
@@ -2851,7 +2901,7 @@ int cetrafs_write_gate(struct inode *inode)
 {
     if (cetrafs_sb_is_fenced(inode->i_sb))
         return -EIO;
-    if (cetrafs_sb_ino_damaged(inode->i_sb, inode->i_ino))
+    if (cetrafs_sb_inode_damaged(inode))
         return -EUCLEAN;
     return 0;
 }
