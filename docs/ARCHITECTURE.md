@@ -218,8 +218,8 @@ row's state and checksum.
 At mount (`kmod/node.c`'s `cetrafs_node_register()`, from `fs.c`'s
 `fill_super()`), the module parses its own UUID and scans the table: a row
 already carrying that UUID is re-attached (`hb_seq`/`last_seen` refreshed);
-otherwise the first `FREE` row is claimed by CAS, read back to confirm, and
-retried on a lost race. `kmod/heartbeat.c`'s periodic tick renews the row and
+otherwise the first `FREE` row is claimed by one CAS (the mutator runs only on
+a `FREE` row), and a lost race is retried on the next row. `kmod/heartbeat.c`'s periodic tick renews the row and
 checks the fence epoch; `cetrafs_node_is_stale()` is the single place that
 decides whether *another* node's row still counts as a live claim.
 

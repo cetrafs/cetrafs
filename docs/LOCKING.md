@@ -83,11 +83,13 @@ hard way:
   atomicity, with both writing the same records under incompatible
   exclusion.
 
-Every real on-disk claim still follows a **write-then-verify-readback**
+Lock and Zone Group claims still follow a **write-then-verify-readback**
 discipline on top of the CAS: claim, then read back and confirm it
 stuck. With CAW that is belt-and-suspenders; on the fallback it is a
 second check beneath the mutex. A readback mismatch is treated as a
-**lost race**, never silently accepted.
+**lost race**, never silently accepted. Node Registry row claims do not
+read back: the CAS mutator sees the row it replaces, and a lost race is
+reported by the CAS itself.
 
 ## Mechanism 1: Zone Group ownership (new-block allocation)
 

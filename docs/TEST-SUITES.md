@@ -283,7 +283,7 @@ it to 2048 for that build only. The module does not otherwise change.
 
 It earns its place: the same build is what surfaced
 `cetrafs_dm_collect()` recursing four deep with half a kilobyte per
-frame, and a kilobyte-sized record on `cetrafs_defrag_inode()`'s stack.
+frame, and a 652-byte record on `cetrafs_defrag_inode()`'s stack.
 A per-frame budget cannot see recursion.
 
 **What KASAN does NOT catch here, measured rather than assumed.** It
