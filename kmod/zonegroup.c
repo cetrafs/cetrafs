@@ -578,14 +578,14 @@ int cetrafs_compute_max_file_size(struct super_block *sb, loff_t *out_max)
 /*
  * Does any ZG already carry a claim belonging to a *live* node other
  * than 'my_node_id'? Used by fs.c's mount-time gate: on a device with
- * no PR support, a live foreign claim here means we have no mutex to
- * safely coexist with it, so the caller refuses the whole mount rather
- * than guessing. 'my_node_id' must be this node's real,
+ * no atomic CAW, a live foreign claim here means there is no cross-node
+ * exclusion to coexist with it under, so the caller refuses the whole
+ * mount rather than guessing. 'my_node_id' must be this node's real,
  * already-registered row index (not CETRAFS_NODE_ID_NONE).
  *
  * an earlier phase: a foreign claim from a node whose heartbeat has
  * gone stale does *not* count here -- there's no live owner to unsafely
- * coexist with, and treating it as one would mean a no-PR device could
+ * coexist with, and treating it as one would mean a no-CAW device could
  * never recover a ZG abandoned by a crashed peer without physically
  * re-partitioning the device, permanently defeating phase 13's whole
  * point for exactly the devices that need its reclaim path most (the

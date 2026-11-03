@@ -22,9 +22,10 @@
  * cetrafs_nslock_acquire_two() always takes the lower inode number
  * first, so no two nodes (or threads) can hold one and want the other in
  * opposite order. Lock ordering against the other cluster primitives is
- * "namespace lock first, cluster mutex second" -- journal replay and the
- * pending-free drain take the PR mutex while holding no namespace lock,
- * and nothing takes a namespace lock while holding the PR mutex.
+ * simple because the others are not held across one: journal replay
+ * serialises on its per-area claim and the pending-free drain on the
+ * queue region's CAS, neither while holding a namespace lock, and
+ * nothing takes a namespace lock while inside either.
  *
  * Crash recovery: this is a HELD lock, so a node that dies mid-operation
  * leaves it set. A waiter that finds the holder's Node Registry row

@@ -3,12 +3,13 @@
  * caw.c -- generic cross-transport COMPARE AND WRITE (atomic test-and-set)
  * primitive + capability discovery.
  *
- * STANDALONE: nothing in the filesystem calls these yet.
- * This is the foundation for a future move of the cluster-coordination
- * hot paths from the device-wide SCSI PR mutex to lock-free per-record
- * compare-and-swap. Built and probed now so the
- * primitive and the hardware capability are known before anything is
- * rebuilt on top of them.
+ * Every contested claim in the filesystem goes through it -- node
+ * registration, Zone Group ownership, the namespace and file locks, the
+ * inode bitmap, the pending-free queues: one fused compare-and-swap on
+ * one record (cetrafs_cas_record() and friends, below). It replaced the
+ * device-wide SCSI PR mutex the cluster was first built on. A device
+ * without CAW is mounted by one node only (fs.c's mount gate), and its
+ * CAS falls back to a node-local mutex (cetrafs_cas_nocaw()).
  *
  * Two backends behind one interface:
  *
@@ -726,10 +727,9 @@ int cetrafs_caw(struct block_device *bdev, u64 lba, unsigned int nblocks, const 
  * The bridge between the raw CAW primitive above and the filesystem's
  * on-disk records: read the record's CAS region fresh, let the caller
  * mutate a copy, atomically swap it in, and retry the whole cycle if
- * another node changed the region first. This is the replacement shape
- * for every "take the PR mutex, read-decide-write, release" claim in
- * the codebase -- same correctness, no device-wide
- * serialization, one round trip.
+ * another node changed the region first. It replaced the old "take the
+ * device-wide PR mutex, read-decide-write, release" shape of every claim
+ * -- same correctness, no device-wide serialization, one round trip.
  *
  * The CAS region is the FIRST LOGICAL BLOCK of the given filesystem
  * block: 512 bytes on a 512-logical device (the hot sector --

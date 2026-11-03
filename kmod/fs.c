@@ -1273,9 +1273,10 @@ int cetrafs_fill_super(struct super_block *sb, struct fs_context *fc)
             return -ENOMEM;
         }
 
-        /* Probe the device's atomic COMPARE AND WRITE capability once
-         *. Never fatal: a device without CAW simply
-         * keeps using the PR mutex for every claim. */
+        /* Probe the device's atomic COMPARE AND WRITE capability once.
+         * A device without CAW is still mountable, by one node: every
+         * claim then takes the node-local fallback (cetrafs_cas_nocaw())
+         * and the mount gate refuses a second node. */
         {
             int rc = cetrafs_caw_discover(sb->s_bdev, &sbi->caw);
 
@@ -3009,7 +3010,8 @@ const struct cetrafs_caw_info *cetrafs_sb_caw(struct super_block *sb)
 }
 
 /* True when this mount can use atomic compare-and-swap for cluster
- * coordination; false means every claim path stays on the PR mutex. */
+ * coordination; false means a single-node mount whose claims take the
+ * node-local fallback (cetrafs_cas_nocaw()). */
 /*
  * TEST ONLY. Make the MOUNT decisions of a node with atomic CAW on a
  * device without it: skip the single-mounter gate, advertise no

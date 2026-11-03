@@ -22,7 +22,7 @@ set -euo pipefail
 . "$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)/lib/harness.sh"
 require_root
 require_module
-LEAF=339 # CETRAFS_EXT_BLOCK_MAX_LEAVES
+LEAF=254 # CETRAFS_EXT_BLOCK_MAX_LEAVES (12-byte header, 16-byte extents, block tail)
 NB=$((2 * LEAF + 60)) # past two full leaves
 
 DEV="$(ct_dev 560 fnleaf)"

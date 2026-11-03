@@ -1632,6 +1632,13 @@ not_ours:
     return -EPERM;
 }
 
+/* TEST ONLY: the next contiguous-run allocation fails its SECOND bit with
+ * -EIO, as a bitmap read error would, so both the error path and the
+ * give-back of the first bit run (tests/kernel/run_alloc_io_error.sh). */
+static bool cetrafs_run_alloc_fail_once;
+module_param_named(run_alloc_fail_once, cetrafs_run_alloc_fail_once, bool, 0644);
+MODULE_PARM_DESC(run_alloc_fail_once, "TEST ONLY: fail the second bit of the next run allocation with -EIO, once");
+
 /* TEST ONLY: the next data allocation reports ENOSPC once, which sends
  * its caller down the recount path. */
 static bool cetrafs_alloc_force_enospc_once;
@@ -1947,8 +1954,11 @@ int cetrafs_alloc_data_run_resv(struct super_block *sb, u32 bg_id, u64 count, u6
     }
 
     for (b = 0; b < count; b++) {
-        ret = cetrafs_bitmap_try_alloc_exact(sb, bmap_lba, bmap_blocks, bg.data_block_count, run_start + b,
-                                             /*sync=*/false);
+        if (b == 1 && READ_ONCE(cetrafs_run_alloc_fail_once) && xchg(&cetrafs_run_alloc_fail_once, false))
+            ret = -EIO; /* test-only; see the parameter */
+        else
+            ret = cetrafs_bitmap_try_alloc_exact(sb, bmap_lba, bmap_blocks, bg.data_block_count, run_start + b,
+                                                 /*sync=*/false);
         if (ret) {
             int err = ret;
 

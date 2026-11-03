@@ -188,7 +188,7 @@ os.fsync(fd); os.close(fd)
 PY
 B1="$(c giveback_blocks)"
 BD=$((B1 - B0))
-# 3000 splits fill the first leaf (339 slots), so this reaches both
+# 3000 splits fill the first leaf (254 slots), so this reaches both
 # the one-slot case and the leaf-FULL case. The leaf-full case used to
 # keep the head and free the whole tail -- the rest of the 96 MiB
 # preallocation, ~24500 blocks -- without counting it, so this
