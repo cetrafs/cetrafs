@@ -2080,8 +2080,16 @@ static u64 cetrafs_tree_last_contig_lba(struct inode *inode, const cetrafs_inode
     if (cetrafs_le16(raw->eh.eh_depth) == 1) {
         llba = cetrafs_extent_phys_from_hilo(raw->et.idx[0].ei_leaf_hi, raw->et.idx[0].ei_leaf_lo);
     } else {
-        ilba = cetrafs_extent_phys_from_hilo(raw->et.idx[cetrafs_le16(raw->eh.eh_entries) - 1].ei_leaf_hi,
-                                             raw->et.idx[cetrafs_le16(raw->eh.eh_entries) - 1].ei_leaf_lo);
+        u16 n = cetrafs_le16(raw->eh.eh_entries);
+
+        /* A count read off the disk indexes a 4-slot array: bound it
+         * (rule 19). This is only an allocation hint, so a record that
+         * makes no sense gets none; the paths that act on the tree
+         * refuse it themselves. Nothing upstream checked it: fallocate
+         * reaches here without __cetrafs_get_block()'s record check. */
+        if (cetrafs_le16(raw->eh.eh_depth) != 2 || n > ARRAY_SIZE(raw->et.idx))
+            return 0;
+        ilba = cetrafs_extent_phys_from_hilo(raw->et.idx[n - 1].ei_leaf_hi, raw->et.idx[n - 1].ei_leaf_lo);
         ibh = cetrafs_read_index_bh(inode, ilba);
         if (!ibh)
             return 0;
@@ -2092,7 +2100,8 @@ static u64 cetrafs_tree_last_contig_lba(struct inode *inode, const cetrafs_inode
         }
         {
             const cetrafs_extent_idx_t *ia =
-                (const cetrafs_extent_idx_t *) (ibh->b_data + sizeof(*h)) + (cetrafs_le16(h->eh_entries) - 1);
+                (const cetrafs_extent_idx_t *) (ibh->b_data + sizeof(*h)) +
+                (min_t(u16, cetrafs_le16(h->eh_entries), CETRAFS_EXT_BLOCK_MAX_IDX) - 1);
             llba = cetrafs_extent_phys_from_hilo(ia->ei_leaf_hi, ia->ei_leaf_lo);
         }
         brelse(ibh);

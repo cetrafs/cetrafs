@@ -89,6 +89,7 @@ int main(int argc, char **argv)
         fprintf(stderr, "       %s <backing-file> growext <ino> <n>     (valid record a peer just extended)\n", argv[0]);
         fprintf(stderr, "       %s <backing-file> bumpgen <ino> <gen>   (reuse: generation only)\n", argv[0]);
         fprintf(stderr, "       %s <backing-file> setdepth <ino> <n>    (an extent depth the format lacks)\n", argv[0]);
+        fprintf(stderr, "       %s <backing-file> idxcount <ino> <n>    (inline index count past the 4 slots)\n", argv[0]);
         fprintf(stderr, "       %s <backing-file> plantrec <ino> <mode>  (a valid record at ANY slot, in range or not)\n",
                 argv[0]);
         fprintf(stderr, "       %s <backing-file> setsize <ino> <bytes> (as a PEER extending it would)\n", argv[0]);
@@ -375,6 +376,31 @@ int main(int argc, char **argv)
         cetrafs_inode_stamp_crcs_us(&rec);
         pwrite_all(fd, &rec, sizeof(rec), rec_off);
         fprintf(stderr, "inode_block_poke: ino %llu extent depth -> %llu\n", (unsigned long long) ino, d);
+    } else if (strcmp(mode, "idxcount") == 0) {
+        /* An inline index count past the 4 slots the record has, behind
+         * valid checksums. The unused slots in range repeat the first
+         * slot's interior under a one-block logical range nothing maps,
+         * so a lookup that honours the ranges skips them and anything
+         * else reads a valid block; only code that indexes by the count
+         * alone reads past the array. */
+        cetrafs_inode_t rec;
+        unsigned long long n = (argc > 4) ? strtoull(argv[4], NULL, 0) : 5;
+        unsigned i, had;
+
+        pread_all(fd, &rec, sizeof(rec), rec_off);
+        had = cetrafs_le16(rec.eh.eh_entries);
+        for (i = had; i < 4 && had > 0; i++) {
+            /* The first slot's own interior, so a path that reads every
+             * slot regardless of range reads a valid block. */
+            rec.et.idx[i] = rec.et.idx[0];
+            rec.et.idx[i].ei_block = cetrafs_cpu_to_le32(0xFFFFFFF0u);
+            rec.et.idx[i].ei_block_end = cetrafs_cpu_to_le32(0xFFFFFFF1u);
+        }
+        rec.eh.eh_entries = cetrafs_cpu_to_le16((uint16_t) n);
+        cetrafs_inode_stamp_crcs_us(&rec);
+        pwrite_all(fd, &rec, sizeof(rec), rec_off);
+        fprintf(stderr, "inode_block_poke: ino %llu depth %u index count %u -> %llu\n", (unsigned long long) ino,
+                cetrafs_le16(rec.eh.eh_depth), had, n);
     } else if (strcmp(mode, "bumpgen") == 0) {
         /* Change ONLY the generation, leaving type/size/extents alone:
          * the inode number was reused, but nothing else about the
