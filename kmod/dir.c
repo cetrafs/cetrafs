@@ -421,7 +421,52 @@ struct cetrafs_dir_extents {
     u16 entries;
 };
 
+/*
+ * Every extent a directory names must lie in the data area before any of
+ * its blocks is read or rewritten (rule 19). The regular-file path has
+ * always asked (cetrafs_lba_run_is_data() at get_block); directories
+ * only asked it of their depth-1 leaf address. The dirent tail check
+ * would refuse a global-table block in practice, but that is a checksum
+ * standing in for an address check -- and a dirent block's image copied
+ * anywhere still carries a valid one. Arithmetic only, no I/O.
+ */
+static int cetrafs_dir_extents_addr_ok(struct inode *dir, const struct cetrafs_dir_extents *de)
+{
+    u16 i;
+
+    for (i = 0; i < de->entries; i++) {
+        u64 phys = cetrafs_extent_phys_from_hilo(de->arr[i].ee_start_hi, de->arr[i].ee_start_lo);
+        u32 len = cetrafs_extent_len(de->arr[i].ee_len);
+
+        if (!cetrafs_lba_run_is_data(dir->i_sb, phys, len)) {
+            pr_err_ratelimited("dir ino=%llu: extent %u names blocks %llu+%u outside the data area -- refusing it "
+                               "(fsck)\n",
+                               (unsigned long long) dir->i_ino, i, (unsigned long long) phys, len);
+            return -EUCLEAN;
+        }
+    }
+    return 0;
+}
+
+static void cetrafs_dir_extents_put(struct cetrafs_dir_extents *de);
+
+static int cetrafs_dir_extents_get_unchecked(struct inode *dir, const cetrafs_inode_t *raw,
+                                             struct cetrafs_dir_extents *de);
+
 static int cetrafs_dir_extents_get(struct inode *dir, const cetrafs_inode_t *raw, struct cetrafs_dir_extents *de)
+{
+    int ret = cetrafs_dir_extents_get_unchecked(dir, raw, de);
+
+    if (ret)
+        return ret;
+    ret = cetrafs_dir_extents_addr_ok(dir, de);
+    if (ret)
+        cetrafs_dir_extents_put(de);
+    return ret;
+}
+
+static int cetrafs_dir_extents_get_unchecked(struct inode *dir, const cetrafs_inode_t *raw,
+                                             struct cetrafs_dir_extents *de)
 {
     de->leaf_bh = NULL;
     de->arr = NULL;
