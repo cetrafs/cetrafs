@@ -368,8 +368,13 @@ static int cetrafs_nslock_acquire_tries(struct inode *inode, int max_tries)
     u32 my_node_id;
     int attempt, ret;
 
-    if (cetrafs_sb_is_fenced(sb))
-        return -EIO; /* self-fenced: no namespace mutation at all */
+    /* Stopped: no namespace mutation at all (-EIO) -- every namespace
+     * and xattr mutation takes this lock on each inode it changes, so
+     * this is the one place that covers them all
+     * (docs/internal/ERRORS.md). */
+    ret = cetrafs_write_gate(inode);
+    if (ret)
+        return ret;
 
     ret = cetrafs_sb_get_node_id(sb, &my_node_id);
     if (ret)
@@ -451,8 +456,11 @@ void cetrafs_nslock_release(struct inode *inode)
          * dropped here rather than published by some later release. */
         cetrafs_inode_drop_staged_record(inode);
         cetrafs_sb_nslock_defer(sb, inode->i_ino, ctx.generation);
-        pr_err("nslock: ino=%llu release: out of memory -- staged update lost, lock queued for retry\n",
-               (unsigned long long) inode->i_ino);
+        /* The entries this operation wrote are on the device and the
+         * record that counts them is not: a link count left low is a
+         * file freed while still named. Kind 3 (docs/internal/ERRORS.md). */
+        cetrafs_sb_fatal(sb, "nslock: ino=%llu release: out of memory -- its staged record update is lost",
+                         (unsigned long long) inode->i_ino);
         cetrafs_inode_ns_mutex_unlock(inode);
         return;
     }
@@ -470,7 +478,8 @@ void cetrafs_nslock_release(struct inode *inode)
          * record now. The retry pass asks again before it writes; the
          * staged update is lost either way (see the OOM case above). */
         if (have_staged)
-            pr_err("nslock: ino=%llu release: staged update lost\n", (unsigned long long) inode->i_ino);
+            cetrafs_sb_fatal(sb, "nslock: ino=%llu release: no node id -- its staged record update is lost",
+                             (unsigned long long) inode->i_ino);
         cetrafs_sb_nslock_defer(sb, inode->i_ino, ctx.generation);
         pr_err("nslock: ino=%llu release: no node id (%d) -- queued for retry\n", (unsigned long long) inode->i_ino,
                ret);
@@ -509,9 +518,11 @@ void cetrafs_nslock_release(struct inode *inode)
             msleep(CETRAFS_NSLOCK_SLEEP_MS);
         }
         if (ret && ret != -ESTALE)
-            pr_err("nslock: ino=%llu staged file-sector publish failed %d times (%d) -- this directory's size is "
-                   "off by this operation's change until it is fixed by hand; no entry or extent is lost\n",
-                   (unsigned long long) inode->i_ino, CETRAFS_NSLOCK_RELEASE_RETRIES, ret);
+            /* Stopping here also keeps the sector-0 swap below -- the
+             * dirent_seq barrier -- from going out over a file sector
+             * that did not: on a stopped mount the swap is refused. */
+            cetrafs_sb_fatal(sb, "nslock: ino=%llu staged file-sector publish failed %d times (%d)",
+                             (unsigned long long) inode->i_ino, CETRAFS_NSLOCK_RELEASE_RETRIES, ret);
     }
 
     /*

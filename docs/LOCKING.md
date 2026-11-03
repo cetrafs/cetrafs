@@ -279,14 +279,15 @@ a planned phase.
 Two concrete shapes of that window, named so nobody rediscovers them
 (audit):
 
-- **Self-fencing does not stop background writeback.** The `-EIO` fence
-  blocks the filesystem's entry points; dirty buffers already in the page
-  cache are flushed by the block layer underneath it, so a wrongly-reclaimed
-  node's cached writes — its data-bitmap bit flips above all — can land
-  arbitrarily late, over bits the new owner has since set. (The free-COUNT
-  version of this was fixed in format v0x0004 by never leaving the BG
-  descriptor dirty in the cache — an epoch-guarded CAS instead; the bitmaps
-  are multi-block and per-bit hot, so the same cure does not apply to them.)
+- **Self-fencing narrows background writeback; it does not close it.**
+  A fenced (stopped) mount discards its dirty metadata without writing it
+  -- right after the stop, on every heartbeat tick, and in `sync_fs` just
+  before unmount's `sync_blockdev()` -- and the CAS primitive and the
+  metadata-write choke point refuse to write at all. What is left: a
+  metadata buffer dirtied by an operation already past every gate can be
+  written by the block layer's own writeback before the next sweep, and
+  I/O already queued on the device lands whenever it lands
+  (`docs/internal/ERRORS.md`, "What a stop does not reach").
 - **A stolen namespace lock drops the operation's staged record update.**
   The release CAS detects the steal, warns loudly, and discards rather than
   clobbers the thief's repair — correct, but the syscall it bracketed has

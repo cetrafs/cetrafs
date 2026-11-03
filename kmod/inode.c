@@ -352,7 +352,7 @@ void cetrafs_invalidate_raw_inode(struct super_block *sb, u64 ino)
             ctrace("DIRTYREC ino=%llu mode=0%o size=%llu -- syncing a DIRTY record at invalidate\n",
                    (unsigned long long) ino, (unsigned int) cetrafs_le32(_r->mode),
                    (unsigned long long) cetrafs_le64(_r->size));
-            if (cetrafs_sync_buffer(bh))
+            if (cetrafs_sync_buffer(sb, bh))
                 pr_err_ratelimited("ino=%llu: a dirty record could not be written back at invalidate\n",
                                    (unsigned long long) ino);
         }
@@ -863,7 +863,7 @@ int cetrafs_write_raw_inode(struct super_block *sb, u64 ino, const cetrafs_inode
          * dirent naming it, or a directory that had just grown keep a
          * name in a block its record never mapped: reported created,
          * gone after a remount (tests/kernel/record_write_error.sh). */
-        ret = cetrafs_sync_buffer(bh);
+        ret = cetrafs_sync_buffer(sb, bh);
     }
     brelse(bh);
 
@@ -1669,9 +1669,34 @@ struct buffer_head *cetrafs_read_index_bh_for(struct inode *inode, u64 lba, bool
  * which no longer writes the namespace sector, and the owner silently
  * stayed 0:0 (caught by unsupported_ops.sh the first run after the
  * split). */
+/*
+ * A stopped mount answers no question about a file -- its cached
+ * attributes describe a file a peer may own by now
+ * (docs/internal/ERRORS.md). Unmount does not ask, so it still works.
+ */
+int cetrafs_getattr(struct mnt_idmap *idmap, const struct path *path, struct kstat *stat, u32 request_mask,
+                    unsigned int query_flags)
+{
+    struct inode *inode = d_inode(path->dentry);
+
+    (void) query_flags;
+    if (cetrafs_sb_is_fenced(inode->i_sb))
+        return -EIO;
+    generic_fillattr(idmap, request_mask, inode, stat);
+    return 0;
+}
+
+static const char *cetrafs_get_link(struct dentry *dentry, struct inode *inode, struct delayed_call *done)
+{
+    if (cetrafs_sb_is_fenced(inode->i_sb))
+        return ERR_PTR(-EIO);
+    return page_get_link(dentry, inode, done);
+}
+
 const struct inode_operations cetrafs_symlink_iops = {
-    .get_link = page_get_link,
+    .get_link = cetrafs_get_link,
     .setattr = cetrafs_setattr,
+    .getattr = cetrafs_getattr,
 };
 
 /* TEST ONLY: stall a refresh between its "no local changes" verdict and

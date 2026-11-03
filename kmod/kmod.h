@@ -190,8 +190,37 @@ bool cetrafs_sb_owns_any_zg(struct super_block *sb);
 bool cetrafs_sb_bg_is_ours(struct super_block *sb, u32 bg_id);
 u32 cetrafs_sb_alloc_cursor(struct super_block *sb);
 void cetrafs_sb_set_alloc_cursor(struct super_block *sb, u32 bg_id);
+/* fs.c: the error policy -- docs/internal/ERRORS.md. A stopped mount
+ * (any cause) does no I/O and refuses every VFS access; cetrafs_sb_is_fenced()
+ * is true for every cause, not only a peer's fence. */
+enum cetrafs_stop_cause {
+    CETRAFS_STOP_NONE = 0,
+    CETRAFS_STOP_FENCED,      /* a peer revoked our Node Registry lease */
+    CETRAFS_STOP_LEASE,       /* our own lease ran out before a renewal landed */
+    CETRAFS_STOP_ERROR,       /* cetrafs_sb_fatal(): we no longer know what is on the device */
+    CETRAFS_STOP_MANUAL,      /* FS_IOC_SHUTDOWN or procfs controls 'shutdown' */
+    CETRAFS_STOP_DEVICE_GONE, /* the block device went away */
+};
+void cetrafs_sb_stop(struct super_block *sb, enum cetrafs_stop_cause cause, const char *reason);
 void cetrafs_sb_fence(struct super_block *sb, const char *reason);
 bool cetrafs_sb_is_fenced(struct super_block *sb);
+const char *cetrafs_sb_stop_cause_name(struct super_block *sb);
+__printf(2, 3) void cetrafs_sb_fatal(struct super_block *sb, const char *fmt, ...);
+bool cetrafs_sb_errors_panic(struct super_block *sb);
+int cetrafs_read_gate(struct super_block *sb);
+int cetrafs_write_gate(struct inode *inode);
+/* Older uapi headers lack the generic name; ext4, XFS and f2fs used
+ * this same number before it was one. */
+#ifndef FS_IOC_SHUTDOWN
+#define FS_IOC_SHUTDOWN _IOR('X', 125, __u32)
+#define FS_SHUTDOWN_FLAGS_DEFAULT 0x0
+#define FS_SHUTDOWN_FLAGS_LOGFLUSH 0x1
+#define FS_SHUTDOWN_FLAGS_NOLOGFLUSH 0x2
+#endif
+long cetrafs_shutdown_ioctl(struct super_block *sb, u32 __user *argp);
+/* inode.c */
+int cetrafs_getattr(struct mnt_idmap *idmap, const struct path *path, struct kstat *stat, u32 request_mask,
+                    unsigned int query_flags);
 void cetrafs_sb_lease_renewed(struct super_block *sb, unsigned long t0, unsigned int interval_secs);
 bool cetrafs_sb_defrag_draining(struct super_block *sb);
 /* Per-mount defragmentation switches (procfs.c's 'controls' file).
@@ -412,8 +441,8 @@ struct buffer_head *cetrafs_getblk_overwrite(struct super_block *sb, sector_t bl
 void cetrafs_bh_end_update(struct buffer_head *bh);
 /* Synchronous write whose result is TRUE, unlike sync_dirty_buffer()'s
  * here -- see ioutil.c. _keep never discards the cached bytes on error. */
-int cetrafs_sync_buffer(struct buffer_head *bh);
-int cetrafs_sync_buffer_keep(struct buffer_head *bh);
+int cetrafs_sync_buffer(struct super_block *sb, struct buffer_head *bh);
+int cetrafs_sync_buffer_keep(struct super_block *sb, struct buffer_head *bh);
 bool cetrafs_bh_test_stable(struct buffer_head *bh, bool (*test)(const void *data, void *arg), void *arg);
 void cetrafs_bh_copy_stable(struct buffer_head *bh, void *out, size_t len);
 void cetrafs_bh_abort_update(struct buffer_head *bh);

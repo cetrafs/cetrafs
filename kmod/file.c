@@ -142,9 +142,31 @@ static vm_fault_t cetrafs_page_mkwrite(struct vm_fault *vmf)
     return vmf_fs_error(ret); /* 0 -> VM_FAULT_LOCKED, -ENOSPC -> SIGBUS */
 }
 
+/*
+ * Read faults on a stopped mount fail (SIGBUS), cached pages included:
+ * once a peer has reclaimed this node's files it may be writing them.
+ * map_pages maps cached pages without calling .fault, so it maps
+ * nothing and leaves the fault to .fault. Pages ALREADY mapped stay
+ * readable until unmapped -- the one read a stop does not reach
+ * (docs/internal/ERRORS.md).
+ */
+static vm_fault_t cetrafs_filemap_fault(struct vm_fault *vmf)
+{
+    if (cetrafs_sb_is_fenced(file_inode(vmf->vma->vm_file)->i_sb))
+        return VM_FAULT_SIGBUS;
+    return filemap_fault(vmf);
+}
+
+static vm_fault_t cetrafs_filemap_map_pages(struct vm_fault *vmf, pgoff_t start_pgoff, pgoff_t end_pgoff)
+{
+    if (cetrafs_sb_is_fenced(file_inode(vmf->vma->vm_file)->i_sb))
+        return 0;
+    return filemap_map_pages(vmf, start_pgoff, end_pgoff);
+}
+
 static const struct vm_operations_struct cetrafs_file_vm_ops = {
-    .fault = filemap_fault,
-    .map_pages = filemap_map_pages,
+    .fault = cetrafs_filemap_fault,
+    .map_pages = cetrafs_filemap_map_pages,
     .page_mkwrite = cetrafs_page_mkwrite,
 };
 
@@ -217,13 +239,21 @@ static ssize_t cetrafs_file_write_iter(struct kiocb *iocb, struct iov_iter *from
     return ret;
 }
 
+/* Cached pages included: see cetrafs_filemap_fault(). */
+static ssize_t cetrafs_file_read_iter(struct kiocb *iocb, struct iov_iter *to)
+{
+    if (cetrafs_sb_is_fenced(file_inode(iocb->ki_filp)->i_sb))
+        return -EIO;
+    return generic_file_read_iter(iocb, to);
+}
+
 const struct file_operations cetrafs_file_ops = {
     .owner = THIS_MODULE,
     .open = cetrafs_open,
     .flush = cetrafs_file_flush,
     .release = cetrafs_release,
     .llseek = cetrafs_llseek,
-    .read_iter = generic_file_read_iter,
+    .read_iter = cetrafs_file_read_iter,
     .write_iter = cetrafs_file_write_iter,
     .mmap = cetrafs_file_mmap,
     .fsync = cetrafs_fsync,
@@ -858,6 +888,9 @@ int cetrafs_fiemap(struct inode *inode, struct fiemap_extent_info *fi, u64 start
     u32 nruns, i;
     int ret;
 
+    if (cetrafs_sb_is_fenced(inode->i_sb))
+        return -EIO;
+
     ret = fiemap_prep(inode, fi, start, &len, 0);
     if (ret)
         return ret;
@@ -937,6 +970,8 @@ out:
 
 static loff_t cetrafs_llseek(struct file *file, loff_t offset, int whence)
 {
+    if ((whence == SEEK_DATA || whence == SEEK_HOLE) && cetrafs_sb_is_fenced(file_inode(file)->i_sb))
+        return -EIO;
     if (whence == SEEK_DATA || whence == SEEK_HOLE)
         return cetrafs_seek_hole_data(file, offset, whence);
     return generic_file_llseek(file, offset, whence);
@@ -2515,7 +2550,7 @@ static bool cetrafs_leaf_bh_holds_uninit(struct buffer_head *lbh, u32 iblock)
  */
 static int cetrafs_convert_source_durable(struct inode *inode, struct buffer_head *lbh)
 {
-    int ret = cetrafs_sync_buffer_keep(lbh);
+    int ret = cetrafs_sync_buffer_keep(inode->i_sb, lbh);
 
     if (ret)
         pr_err_ratelimited("ino=%llu: extent leaf %llu could not be written before its split moved on (%d)\n",
@@ -3696,6 +3731,11 @@ static int cetrafs_get_block_read(struct inode *inode, sector_t iblock, struct b
 
 static int cetrafs_read_folio(struct file *file, struct folio *folio)
 {
+    /* A stopped mount reads nothing (docs/internal/ERRORS.md). */
+    if (cetrafs_sb_is_fenced(folio->mapping->host->i_sb)) {
+        folio_unlock(folio);
+        return -EIO;
+    }
     return block_read_full_folio(folio, cetrafs_get_block_read);
 }
 
@@ -3703,6 +3743,10 @@ static int cetrafs_read_folio(struct file *file, struct folio *folio)
  * and a sequential reader could not get past one request in flight. */
 static void cetrafs_readahead(struct readahead_control *rac)
 {
+    /* Stopped: read nothing ahead; whatever is then actually needed
+     * comes through read_folio and fails there. */
+    if (cetrafs_sb_is_fenced(rac->mapping->host->i_sb))
+        return;
     mpage_readahead(rac, cetrafs_get_block_read);
 }
 
@@ -4781,7 +4825,7 @@ static int cetrafs_fsync_one_block(struct super_block *sb, u64 lba)
 
     if (bh) {
         if (buffer_dirty(bh))
-            ret = cetrafs_sync_buffer(bh);
+            ret = cetrafs_sync_buffer(sb, bh);
         brelse(bh);
     }
     return ret;
@@ -4948,7 +4992,11 @@ int cetrafs_file_make_durable(struct file *file)
 
 static int cetrafs_open(struct inode *inode, struct file *file)
 {
-    int ret = generic_file_open(inode, file);
+    int ret = cetrafs_read_gate(inode->i_sb);
+
+    if (ret)
+        return ret;
+    ret = generic_file_open(inode, file);
 
     if (ret)
         return ret;
@@ -5039,6 +5087,8 @@ static long cetrafs_ioctl(struct file *file, unsigned int cmd, unsigned long arg
     switch (cmd) {
     case CETRAFS_IOC_DEFRAG:
         return cetrafs_defrag_ioctl(file, (struct cetrafs_defrag_stats __user *) arg);
+    case FS_IOC_SHUTDOWN:
+        return cetrafs_shutdown_ioctl(file_inode(file)->i_sb, (u32 __user *) arg);
     default:
         return -ENOTTY;
     }

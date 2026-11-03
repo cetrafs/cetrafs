@@ -112,7 +112,7 @@ static long cetrafs_bitmap_alloc_bit(struct super_block *sb, u64 bmap_lba, u64 n
                     *b |= (u8) (1u << bit);
                     cetrafs_bh_end_update(bh);
                     if (sync) /* no caller passes true today */
-                        (void) cetrafs_sync_buffer(bh);
+                        (void) cetrafs_sync_buffer(sb, bh);
                     brelse(bh);
                     return (long) idx;
                 }
@@ -262,7 +262,7 @@ static int cetrafs_bitmap_free_bit(struct super_block *sb, u64 bmap_lba, u64 nbl
     *((u8 *) bh->b_data + byte) &= (u8) ~(1u << bit_in_byte);
     cetrafs_bh_end_update(bh);
     if (sync) /* no caller passes true today */
-        (void) cetrafs_sync_buffer(bh);
+        (void) cetrafs_sync_buffer(sb, bh);
     brelse(bh);
 
     return 0;
@@ -308,7 +308,7 @@ static int cetrafs_bitmap_try_alloc_exact(struct super_block *sb,
     *b |= (u8) (1u << bit_in_byte);
     cetrafs_bh_end_update(bh);
     if (sync) /* no caller passes true today */
-        (void) cetrafs_sync_buffer(bh);
+        (void) cetrafs_sync_buffer(sb, bh);
     brelse(bh);
 
     return 0;
@@ -1262,8 +1262,16 @@ static int cetrafs_bg_adjust_free_blocks(struct super_block *sb, u32 bg_id, s64 
      * from a Block Group it has not claimed, which is a bug worth
      * saying out loud rather than papering over. */
     if (owner_zg == CETRAFS_BG_OWNER_FREE) {
-        pr_err("BG %u free-count adjust: the Block Group is owned by nobody -- allocated from unclaimed space\n",
-               bg_id);
+        /* An ALLOCATION here took blocks from space nobody owns, which a
+         * peer may claim and allocate from too: what this node believes
+         * it owns and what the device says disagree (kind 3,
+         * docs/internal/ERRORS.md). A free into it is the separate,
+         * known leak. */
+        if (delta < 0)
+            cetrafs_sb_fatal(sb, "BG %u: allocated from a Block Group no Zone Group owns", bg_id);
+        else
+            pr_err("BG %u free-count adjust: the Block Group is owned by nobody -- freed into unclaimed space\n",
+                   bg_id);
         return 0;
     }
 
@@ -1879,8 +1887,8 @@ int cetrafs_alloc_data_run_resv(struct super_block *sb, u32 bg_id, u64 count, u6
             /* can't happen while we hold the alloc mutex (sole local
              * allocator, sole owner of the BG) -- but if it somehow
              * does, roll back what we took and fail loudly. */
-            pr_err("defrag run alloc: bit %llu of a scanned-free run was taken?!\n",
-                   (unsigned long long) (run_start + b));
+            cetrafs_sb_fatal(sb, "defrag run alloc: bit %llu of a scanned-free run was taken under the alloc mutex",
+                             (unsigned long long) (run_start + b));
             while (b--)
                 cetrafs_bitmap_free_bit(sb, bmap_lba, bmap_blocks, run_start + b, false);
             ret = -ENOSPC;
@@ -2151,7 +2159,7 @@ static int cetrafs_sync_one_block(struct super_block *sb, u64 lba)
     }
     /* _keep: on a failed write these bytes are the only record of the
      * bits that did not land -- see ioutil.c. */
-    ret = cetrafs_sync_buffer_keep(bh);
+    ret = cetrafs_sync_buffer_keep(sb, bh);
     brelse(bh);
     return ret;
 }
@@ -3051,7 +3059,7 @@ int cetrafs_bg_claim_free(struct super_block *sb, u32 zg_id, u32 *out_bg_id)
             cetrafs_bh_begin_update(wbh);
             cetrafs_bg_claim_mutate(wbh->b_data, CETRAFS_BLOCK_SIZE, &ctx);
             cetrafs_bh_end_update(wbh);
-            (void) cetrafs_sync_buffer(wbh); /* test-only path */
+            (void) cetrafs_sync_buffer(sb, wbh); /* test-only path */
             brelse(wbh);
             ret = 0;
         } else {

@@ -64,6 +64,15 @@ static int cetrafs_dir_fsync(struct file *file, loff_t start, loff_t end, int da
     return ret ? ret : ret2;
 }
 
+/* FS_IOC_SHUTDOWN works on a directory too -- the mount point is what
+ * an operator or `xfs_io -x -c shutdown` opens. */
+static long cetrafs_dir_ioctl(struct file *file, unsigned int cmd, unsigned long arg)
+{
+    if (cmd == FS_IOC_SHUTDOWN)
+        return cetrafs_shutdown_ioctl(file_inode(file)->i_sb, (u32 __user *) arg);
+    return -ENOTTY;
+}
+
 /* Directory file operations */
 const struct file_operations cetrafs_dir_ops = {
     .owner = THIS_MODULE,
@@ -75,6 +84,8 @@ const struct file_operations cetrafs_dir_ops = {
     .llseek = generic_file_llseek,
     .iterate_shared = cetrafs_readdir,
     .fsync = cetrafs_dir_fsync,
+    .unlocked_ioctl = cetrafs_dir_ioctl,
+    .compat_ioctl = compat_ptr_ioctl,
 };
 
 /*
@@ -293,7 +304,7 @@ int cetrafs_dirent_block_init(struct super_block *sb, u64 lba)
     memset(bh->b_data, 0, CETRAFS_BLOCK_SIZE);
     cetrafs_dirent_block_stamp(bh);
     cetrafs_bh_end_update(bh);
-    ret = cetrafs_sync_buffer(bh); /* on the device before its extent: a failure is the caller's */
+    ret = cetrafs_sync_buffer(sb, bh); /* on the device before its extent: a failure is the caller's */
     brelse(bh);
     return ret;
 }
@@ -1350,7 +1361,10 @@ static struct dentry *cetrafs_lookup(struct inode *dir, struct dentry *dentry, u
 {
     struct cetrafs_lookup_ctx ctx = {.name = &dentry->d_name, .ino = 0};
     struct inode *inode = NULL;
-    int ret;
+    int ret = cetrafs_read_gate(dir->i_sb);
+
+    if (ret)
+        return ERR_PTR(ret);
 
     fs_debug(info, "lookup '%.*s' in ino=%llu", (int) dentry->d_name.len, dentry->d_name.name,
              (unsigned long long) dir->i_ino);
@@ -1538,7 +1552,10 @@ static int cetrafs_readdir_visit(void *priv, const cetrafs_dirent_t *de, loff_t 
 static int cetrafs_readdir(struct file *file, struct dir_context *dctx)
 {
     struct cetrafs_readdir_ctx ctx = {.dctx = dctx};
+    int ret = cetrafs_read_gate(file_inode(file)->i_sb);
 
+    if (ret)
+        return ret;
     return cetrafs_walk_dirents_from(file_inode(file), cetrafs_readdir_visit, &ctx, dctx->pos);
 }
 
@@ -1880,7 +1897,7 @@ static struct dentry *cetrafs_mkdir_locked(struct mnt_idmap *idmap,
      * consume) and on the real LUN a write is ~38 ms. */
     cetrafs_dirent_block_stamp(bh);
     cetrafs_bh_end_update(bh);
-    ret = cetrafs_sync_buffer(bh);
+    ret = cetrafs_sync_buffer(sb, bh);
     brelse(bh);
     if (ret) {
         cetrafs_free_data_block(sb, lba);
@@ -3401,4 +3418,5 @@ const struct inode_operations cetrafs_inode_ops = {
     .link = cetrafs_link,
     .symlink = cetrafs_symlink,
     .listxattr = cetrafs_listxattr,
+    .getattr = cetrafs_getattr,
 };

@@ -3128,6 +3128,11 @@ out:
  */
 int cetrafs_lock_write_gate(struct inode *inode)
 {
+    /* A stopped mount first (-EIO) -- docs/internal/ERRORS.md. */
+    int ret = cetrafs_write_gate(inode);
+
+    if (ret)
+        return ret;
     if (cetrafs_lock_suspend_skip_gate)
         return 0;
     return READ_ONCE(CETRAFS_I(inode)->lock_suspended) ? -ETXTBSY : 0;

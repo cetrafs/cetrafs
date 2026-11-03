@@ -155,10 +155,22 @@ static void cetrafs_heartbeat_tick(struct work_struct *work)
     /* Self-fence latch: a fenced node's tick does NOTHING
      * -- renewing our row would make us look alive again and fight the
      * very reclaim that fenced us; claims/drains/releases are writes we
-     * no longer have any right to make. Keep rescheduling only so the
-     * log reminder below stays alive in long-running setups. */
-    if (cetrafs_sb_is_fenced(sb))
+     * no longer have any right to make.
+     *
+     * It does one thing with no I/O: discard metadata dirtied since the
+     * stop by an operation that had already passed its gate, before the
+     * block device's own writeback gets to it (30 s by default; a tick
+     * is at most 15). sync_fs does the same at unmount. */
+    if (cetrafs_sb_is_fenced(sb)) {
+        if (sb->s_bdev) {
+            unsigned long n = cetrafs_drop_dirty_metadata(sb);
+
+            if (n)
+                pr_err("%s: stopped mount: discarded %lu metadata buffer(s) dirtied after the stop\n", sb->s_id,
+                       n);
+        }
         goto reschedule;
+    }
 
     ret = cetrafs_sb_get_node_id(sb, &my_node_id);
     if (ret) {

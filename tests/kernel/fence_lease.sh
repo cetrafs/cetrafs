@@ -85,10 +85,14 @@ if touch "$LOCK_MNT/fence-probe-2" 2>/dev/null; then
 else
     pass "fence: mutations are refused once fenced"
 fi
-# Reads keep working by design -- fencing stops writes, not access.
-[ -e "$LOCK_MNT/fence-probe-1" ] &&
-    pass "fence: reads still work while fenced" ||
-    fail "fence: reads broke while fenced"
+# Reads are refused too (docs/internal/ERRORS.md): once a peer has
+# reclaimed this node's files it may be writing them, and the cache of
+# them is no longer a copy of anything.
+if grep -q "Input/output error" <<<"$(stat "$LOCK_MNT/fence-probe-1" 2>&1 || true)"; then
+    pass "fence: reads are refused while fenced (EIO)"
+else
+    fail "fence: a fenced mount still answered a stat: $(stat -c %n "$LOCK_MNT/fence-probe-1" 2>&1)"
+fi
 
 grep -q "fenced: yes" "/proc/fs/cetrafs/$(basename "$LOCK_LOOPDEV")/info" &&
     pass "fence: procfs reports the fenced state" ||

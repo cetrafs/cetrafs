@@ -93,6 +93,13 @@ done
 [ "$DOOMED" = 0 ] && pass "and no superseded entry was redone over them" ||
     fail "$DOOMED superseded entries were replayed over later writes"
 ct_umount "$MNT"
-ct_fsck "$DEV" >/dev/null 2>&1 && pass "fsck clean" ||
-    fail "fsck: $(ct_fsck "$DEV" 2>&1 | grep -i err | head -2)"
+# Part 1's refused entry write stopped the mount (docs/internal/ERRORS.md)
+# -- a crash at that instant, so the create's own unwind never ran and
+# the inode it had already written is left allocated with no name: a
+# leak, the safe direction, and the one finding allowed here.
+FO="$(ct_fsck "$DEV" 2>&1 || true)"
+BAD="$(grep '^ERR' <<<"$FO" | grep -v "is allocated (nlink=1) but NO directory entry names it" || true)"
+LEAKS="$(grep -c "is allocated (nlink=1) but NO directory entry names it" <<<"$FO" || true)"
+[ -z "$BAD" ] && [ "$LEAKS" -le 1 ] && pass "fsck: nothing but the stop's one unnamed inode ($LEAKS)" ||
+    fail "fsck: $(head -3 <<<"$BAD") (unnamed inodes: $LEAKS)"
 ct_exit

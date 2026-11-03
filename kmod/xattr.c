@@ -472,6 +472,9 @@ ssize_t cetrafs_listxattr(struct dentry *dentry, char *list, size_t size)
     const cetrafs_xattr_entry_t *arr;
     size_t total = 0;
     unsigned int i;
+
+    if (cetrafs_sb_is_fenced(inode->i_sb))
+        return -EIO;
     void *blk;
     int ret;
 
@@ -510,6 +513,8 @@ static int cetrafs_xattr_handler_get(const struct xattr_handler *handler,
                                      void *buffer,
                                      size_t size)
 {
+    if (cetrafs_sb_is_fenced(inode->i_sb))
+        return -EIO;
     return cetrafs_xattr_get(inode, xattr_full_name(handler, name), buffer, size);
 }
 

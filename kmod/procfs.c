@@ -113,6 +113,10 @@ static int cetrafs_proc_info_show(struct seq_file *m, void *v)
      * lock and refuses no open (nofilelock; set at mount, fixed for life). */
     seq_printf(m, "file_lock: %s\n", cetrafs_sb_file_lock_enabled(sb) ? "on" : "off");
     seq_printf(m, "fenced: %s\n", cetrafs_sb_is_fenced(sb) ? "yes" : "no");
+    /* Why (docs/internal/ERRORS.md): none, fenced, lease, error,
+     * manual or device_gone. 'fenced: yes' for every one of
+     * them -- the state is the same, only the cause differs. */
+    seq_printf(m, "stopped: %s\n", cetrafs_sb_stop_cause_name(sb));
     /* The exact value fs.c's fill_super() stamped into sb->s_maxbytes --
      * see cetrafs_compute_max_file_size() (zonegroup.c) for the formula.
      * Read straight off the live super_block, not recomputed here, so
@@ -462,6 +466,7 @@ static int cetrafs_proc_controls_show(struct seq_file *m, void *v)
     seq_printf(m, "auto_defrag: %s\n", cetrafs_sb_auto_defrag_enabled(sb) ? "on" : "off");
     seq_printf(m, "hb_interval_secs: %u\n", cetrafs_sb_hb_interval_secs(sb));
     seq_printf(m, "stale_secs: %u\n", cetrafs_sb_stale_secs(sb));
+    seq_printf(m, "shutdown: %s\n", cetrafs_sb_is_fenced(sb) ? "yes" : "no");
     return 0;
 }
 
@@ -594,6 +599,18 @@ static ssize_t cetrafs_proc_controls_write(struct file *file, const char __user 
 timing_out:
         mutex_unlock(&cetrafs_controls_lock);
         return trc;
+    }
+
+    /* shutdown=now: stop this mount at once, as a crash would
+     * (cetrafs_sb_stop()) -- the software fence a cluster manager uses
+     * before it reaches for power. Same as FS_IOC_SHUTDOWN with
+     * NOLOGFLUSH, for whoever has a shell and no ioctl tool. One way:
+     * the only way back is unmount and mount. */
+    if (!strcmp(key, "shutdown")) {
+        if (strcmp(val, "now"))
+            return -EINVAL;
+        cetrafs_sb_stop(sb, CETRAFS_STOP_MANUAL, "shutdown requested through procfs");
+        return len;
     }
 
     if (cetrafs_proc_parse_bool(val, &on))

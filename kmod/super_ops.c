@@ -95,6 +95,16 @@ static int cetrafs_write_inode(struct inode *inode, struct writeback_control *wb
 static int cetrafs_sync_fs(struct super_block *sb, int wait)
 {
     fs_debug(info, "cetrafs_sync_fs wait=%d", wait);
+    /* A stopped mount writes nothing, and sync_filesystem() -- at unmount
+     * above all -- calls sync_blockdev() right after this, which would
+     * write whatever metadata an operation already past its gate dirtied
+     * after the stop's own sweep. Sweep again, here, where it is the last
+     * thing before that write. */
+    if (cetrafs_sb_is_fenced(sb)) {
+        if (sb->s_bdev)
+            cetrafs_drop_dirty_metadata(sb);
+        return -EIO;
+    }
     /* Allocation bits before the counters: the counters are a cache and
      * a stale one is a lying df, while an un-durable allocation bit is
      * a block two files can end up sharing. */
@@ -509,10 +519,24 @@ static int cetrafs_show_options(struct seq_file *m, struct dentry *root)
 {
     if (!cetrafs_sb_file_lock_enabled(root->d_sb))
         seq_puts(m, ",nofilelock");
+    if (cetrafs_sb_errors_panic(root->d_sb))
+        seq_puts(m, ",errors=panic");
     return 0;
 }
 
+/*
+ * The block device went away (hot removal, a dm table torn down). Every
+ * later I/O would fail one by one, each error path writing what it
+ * could not; stop at once instead (docs/internal/ERRORS.md). A failed
+ * path under dm-multipath does not get here -- the dm device stays.
+ */
+static void cetrafs_shutdown(struct super_block *sb)
+{
+    cetrafs_sb_stop(sb, CETRAFS_STOP_DEVICE_GONE, "the block device was removed");
+}
+
 const struct super_operations cetrafs_super_ops = {
+    .shutdown = cetrafs_shutdown,
     .alloc_inode = cetrafs_alloc_vfs_inode,
     .free_inode = cetrafs_free_vfs_inode,
     .put_super = cetrafs_put_super,

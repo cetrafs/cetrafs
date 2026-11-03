@@ -193,15 +193,31 @@ struct cetrafs_sb_info {
      * (and removed its registration) and has already
      * begun reclaiming its ZGs/locks. From that instant this node has
      * no legitimate claim to write ANYTHING: every mutating path checks
-     * this and fails with -EIO, reads limp on, and the admin recovers
+     * this and fails with -EIO (reads too, see below), and the admin recovers
      * by unmounting and remounting (which re-registers and re-joins the
      * cluster fresh). Plain bool + READ_ONCE/WRITE_ONCE: it only ever
      * transitions false->true, and a racing reader seeing the old value
      * for one more operation is within the unavoidable residual window
      * anyway (see heartbeat.c's split-brain note -- this fence shrinks
      * that window from "forever" to "until the zombie's next tick or
-     * mutex attempt", it cannot make it zero without hardware fencing). */
+     * mutex attempt", it cannot make it zero without hardware fencing).
+     *
+     * The same latch is the STOPPED state of the error policy
+     * (cetrafs_sb_stop(), docs/internal/ERRORS.md): a node that can no
+     * longer trust what it knows about the volume stops exactly the way
+     * a fenced one does, and since then reads are refused too -- once a
+     * peer has reclaimed this node's files it may be writing them, and
+     * our cache of them is no longer a copy of anything. */
     bool fenced;
+    int stop_cause; /* enum cetrafs_stop_cause, set once just before 'fenced' */
+    /* The stop's sweep of dirty metadata. Deferred: cetrafs_sb_stop() is
+     * called from inside failing operations that hold buffer and folio
+     * locks the sweep takes. */
+    struct work_struct stop_work;
+
+    /* errors= (mount option, fixed for the mount's life). See
+     * cetrafs_sb_fatal(). */
+    bool errors_panic;
 
     /*
      * The in-core lease: until when this node may keep writing on the
@@ -584,8 +600,11 @@ struct cetrafs_sb_info {
 
 /* Mount-option state, carried on fc->fs_private from parse time to
  * fill_super(). Only one option so far: file_lock (default on). */
+static void cetrafs_sb_stop_work(struct work_struct *w);
+
 struct cetrafs_fc_info {
     bool file_lock;
+    bool errors_panic;    /* errors=panic */
 };
 
 /*
@@ -1112,8 +1131,12 @@ int cetrafs_fill_super(struct super_block *sb, struct fs_context *fc)
          * neither. */
         sbi->defrag_enabled = true;
         sbi->auto_defrag_enabled = true;
+        sbi->sb = sb;
+        INIT_WORK(&sbi->stop_work, cetrafs_sb_stop_work);
         {
             const struct cetrafs_fc_info *fci = fc ? fc->fs_private : NULL;
+
+            sbi->errors_panic = fci ? fci->errors_panic : false;
 
             /* The operator's REQUESTED mode. May be overridden below by the
              * cluster's mode (the first mounter leads); the authoritative
@@ -2211,6 +2234,7 @@ void cetrafs_free_sb_info(struct super_block *sb)
         smp_mb();
         cancel_work_sync(&sbi->lease_work);
     }
+    cancel_work_sync(&sbi->stop_work);
     bitmap_free(sbi->owned_bgs);
     kfree(sbi->bg_owner_zg);
     kfree(sbi->bg_count_epoch);
@@ -2575,28 +2599,167 @@ void cetrafs_sb_cas_unlock(struct super_block *sb)
     mutex_unlock(&sbi->cas_mutex);
 }
 
-void cetrafs_sb_fence(struct super_block *sb, const char *reason)
+static const char *const cetrafs_stop_cause_names[] = {
+    [CETRAFS_STOP_NONE] = "none",
+    [CETRAFS_STOP_FENCED] = "fenced",
+    [CETRAFS_STOP_LEASE] = "lease",
+    [CETRAFS_STOP_ERROR] = "error",
+    [CETRAFS_STOP_MANUAL] = "manual",
+    [CETRAFS_STOP_DEVICE_GONE] = "device_gone",
+};
+
+const char *cetrafs_sb_stop_cause_name(struct super_block *sb)
+{
+    struct cetrafs_sb_info *sbi = sb->s_fs_info;
+    int c;
+
+    if (!sbi)
+        return "none";
+    /* The lease latches before its work item runs the stop. */
+    if (!READ_ONCE(sbi->fenced))
+        return test_bit(0, &sbi->lease_lost) ? "lease" : "none";
+    c = READ_ONCE(sbi->stop_cause);
+    if (c < 0 || c >= ARRAY_SIZE(cetrafs_stop_cause_names) || !cetrafs_stop_cause_names[c])
+        return "?";
+    return cetrafs_stop_cause_names[c];
+}
+
+/*
+ * Stop this mount: from here on it writes nothing and reads nothing,
+ * and its heartbeat no longer renews, so after the staleness window its
+ * peers do what they do for a node that crashed -- replay its journal,
+ * take its Zone Groups, break its locks. The way back is unmount and
+ * mount.
+ *
+ * Every cause ends in the same state on purpose. A crash is the case
+ * the cluster is built to recover from, and the only one tested
+ * end-to-end; a node that keeps going after it stopped knowing what is
+ * on the device is a writer acting on guesses.
+ *
+ * Nothing here does I/O, and nothing may: the dirty metadata is DROPPED,
+ * not written (the blocks may already belong to a peer, or be the very
+ * write that failed). Callable from any context that may sleep.
+ */
+void cetrafs_sb_stop(struct super_block *sb, enum cetrafs_stop_cause cause, const char *reason)
 {
     struct cetrafs_sb_info *sbi = sb->s_fs_info;
 
-    if (READ_ONCE(sbi->fenced))
+    if (!sbi || READ_ONCE(sbi->fenced))
         return;
-
+    if (cmpxchg(&sbi->stop_cause, CETRAFS_STOP_NONE, cause) != CETRAFS_STOP_NONE)
+        return; /* another cause got here first; it does the rest */
+    smp_wmb(); /* the cause before the flag that publishes it */
     WRITE_ONCE(sbi->fenced, true);
-    pr_err(
-        "SELF-FENCED: %s -- a peer has declared this node dead and reclaimed its claims; "
-        "all writes now fail with EIO. Unmount and remount to rejoin the cluster.\n",
-        reason);
+
+    if (cause == CETRAFS_STOP_FENCED || cause == CETRAFS_STOP_LEASE)
+        pr_err("%s: SELF-FENCED: %s -- a peer has declared this node dead or may do so at any moment; "
+               "all I/O on this mount now fails with EIO. Unmount and remount to rejoin the cluster.\n",
+               sb->s_id, reason);
+    else
+        pr_err("%s: STOPPED (%s): %s -- all I/O on this mount now fails with EIO and the heartbeat no "
+               "longer renews, so peers recover this node's work as after a crash. Unmount, check the "
+               "volume, and mount again.\n",
+               sb->s_id, cetrafs_stop_cause_names[cause], reason);
     /* After the flag, so nothing re-dirties behind the sweep through an
      * entry point that already checks it. */
-    if (sb->s_bdev) {
+    schedule_work(&sbi->stop_work);
+}
+
+static void cetrafs_sb_stop_work(struct work_struct *w)
+{
+    struct cetrafs_sb_info *sbi = container_of(w, struct cetrafs_sb_info, stop_work);
+    struct super_block *sb = sbi->sb;
+
+    if (sb && sb->s_bdev) {
         unsigned long n = cetrafs_drop_dirty_metadata(sb);
 
         if (n)
-            pr_err("SELF-FENCED: discarded %lu dirty metadata buffer(s) without writing them -- the blocks "
-                   "they describe belong to the peer that fenced us\n",
-                   n);
+            pr_err("%s: SELF-FENCED: discarded %lu dirty metadata buffer(s) without writing them -- the "
+                   "blocks they describe may already belong to a peer\n",
+                   sb->s_id, n);
     }
+}
+
+void cetrafs_sb_fence(struct super_block *sb, const char *reason)
+{
+    cetrafs_sb_stop(sb, CETRAFS_STOP_FENCED, reason);
+}
+
+/*
+ * TEST ONLY. Report a fatal error and carry on, as before the error
+ * policy existed -- the negative control of every suite that proves a
+ * fatal error stops the mount.
+ */
+static bool cetrafs_error_policy_off;
+module_param_named(error_policy_off, cetrafs_error_policy_off, bool, 0644);
+MODULE_PARM_DESC(error_policy_off, "TEST ONLY: log fatal errors without acting on them");
+
+/*
+ * Kind 3 of docs/internal/ERRORS.md: this node no longer knows what is
+ * on the device -- a metadata write the device refused, a swap whose
+ * outcome cannot be decided, a contradiction between what it holds and
+ * what it reads. Every write after this would be built on a guess, so
+ * the mount stops (errors=stop, the default) or the machine panics
+ * (errors=panic, for a cluster that reboots a node by watchdog).
+ */
+void cetrafs_sb_fatal(struct super_block *sb, const char *fmt, ...)
+{
+    struct cetrafs_sb_info *sbi = sb->s_fs_info;
+    char msg[192];
+    va_list args;
+
+    va_start(args, fmt);
+    vsnprintf(msg, sizeof(msg), fmt, args);
+    va_end(args);
+
+    if (cetrafs_error_policy_off) {
+        pr_err("%s: fatal error IGNORED (error_policy_off): %s\n", sb->s_id, msg);
+        return;
+    }
+    if (sbi && sbi->errors_panic)
+        panic("cetrafs %s: %s (errors=panic)\n", sb->s_id, msg);
+    cetrafs_sb_stop(sb, CETRAFS_STOP_ERROR, msg);
+}
+
+bool cetrafs_sb_errors_panic(struct super_block *sb)
+{
+    struct cetrafs_sb_info *sbi = sb->s_fs_info;
+
+    return sbi && sbi->errors_panic;
+}
+
+long cetrafs_shutdown_ioctl(struct super_block *sb, u32 __user *argp)
+{
+    u32 flags;
+
+    if (!capable(CAP_SYS_ADMIN))
+        return -EPERM;
+    if (get_user(flags, argp))
+        return -EFAULT;
+    if (flags > FS_SHUTDOWN_FLAGS_NOLOGFLUSH)
+        return -EINVAL;
+    if (flags != FS_SHUTDOWN_FLAGS_NOLOGFLUSH && !cetrafs_sb_is_fenced(sb)) {
+        down_read(&sb->s_umount);
+        sync_filesystem(sb);
+        up_read(&sb->s_umount);
+    }
+    cetrafs_sb_stop(sb, CETRAFS_STOP_MANUAL,
+                    flags == FS_SHUTDOWN_FLAGS_NOLOGFLUSH ? "FS_IOC_SHUTDOWN (no flush)" : "FS_IOC_SHUTDOWN");
+    return 0;
+}
+
+/*
+ * The VFS entry points' answers: a stopped mount refuses every access
+ * with -EIO (docs/internal/ERRORS.md).
+ */
+int cetrafs_read_gate(struct super_block *sb)
+{
+    return cetrafs_sb_is_fenced(sb) ? -EIO : 0;
+}
+
+int cetrafs_write_gate(struct inode *inode)
+{
+    return cetrafs_sb_is_fenced(inode->i_sb) ? -EIO : 0;
 }
 
 /*
@@ -2612,9 +2775,9 @@ static void cetrafs_sb_lease_work(struct work_struct *w)
 {
     struct cetrafs_sb_info *sbi = container_of(w, struct cetrafs_sb_info, lease_work);
 
-    cetrafs_sb_fence(sbi->sb,
-                     "this node's lease expired -- no heartbeat renewal reached the device in time, so peers may "
-                     "already treat it as dead");
+    cetrafs_sb_stop(sbi->sb, CETRAFS_STOP_LEASE,
+                    "this node's lease expired -- no heartbeat renewal reached the device in time, so peers may "
+                    "already treat it as dead");
 }
 
 /*
@@ -3593,12 +3756,21 @@ int cetrafs_flush_dirty_free_counts(struct super_block *sb)
 
 /* ------ mount options ------ */
 
-enum cetrafs_param { Opt_nofilelock };
+enum cetrafs_param { Opt_nofilelock, Opt_errors };
+
+/* errors=: what a fatal error does (docs/internal/ERRORS.md, kind 3).
+ * There is deliberately no "continue". */
+static const struct constant_table cetrafs_param_errors[] = {
+    {"stop", 0},
+    {"panic", 1},
+    {}};
 
 static const struct fs_parameter_spec cetrafs_fs_parameters[] = {
     /* Turn the cross-node exclusive open lock off (default: on). Mount-time
      * only -- a remount cannot change it; see cetrafs_reconfigure(). */
     fsparam_flag("nofilelock", Opt_nofilelock),
+    /* Mount-time only, like nofilelock. */
+    fsparam_enum("errors", Opt_errors, cetrafs_param_errors),
     {}};
 
 static int cetrafs_parse_param(struct fs_context *fc, struct fs_parameter *param)
@@ -3613,6 +3785,9 @@ static int cetrafs_parse_param(struct fs_context *fc, struct fs_parameter *param
     switch (opt) {
     case Opt_nofilelock:
         fci->file_lock = false;
+        break;
+    case Opt_errors:
+        fci->errors_panic = result.uint_32 == 1;
         break;
     }
     return 0;

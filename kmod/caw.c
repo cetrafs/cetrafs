@@ -740,7 +740,7 @@ static int cetrafs_cas_flush_block(struct super_block *sb, u64 fs_lba)
     /* A failed flush discards the pending write (clean, !uptodate): the
      * CAS must not go ahead as if it had landed. */
     if (buffer_dirty(bh))
-        ret = cetrafs_sync_buffer(bh);
+        ret = cetrafs_sync_buffer(sb, bh);
     brelse(bh);
     return ret;
 }
@@ -851,7 +851,7 @@ static int cetrafs_cas_nocaw(struct super_block *sb,
      * leaves the buffer clean and !uptodate, the new image is gone, and
      * reporting success there told a namespace-lock acquire, an inode
      * bitmap claim or a record publish that it had happened. */
-    ret = cetrafs_sync_buffer(bh);
+    ret = cetrafs_sync_buffer(sb, bh);
     brelse(bh);
     return ret;
 }
@@ -898,6 +898,12 @@ static int cetrafs_cas_region_seeded_impl(struct super_block *sb,
 
     if (!mutate || off + region > CETRAFS_BLOCK_SIZE)
         return -EINVAL;
+    /* A stopped mount writes nothing (docs/internal/ERRORS.md). The
+     * callers' own gates come first; this is the one every claim,
+     * release and publish shares, so an operation that passed its gate
+     * just before the stop is caught here instead of on the device. */
+    if (cetrafs_sb_is_fenced(sb))
+        return -EIO;
 
     cetrafs_cas_op_counted();
 
@@ -1070,8 +1076,8 @@ static int cetrafs_cas_region_seeded_impl(struct super_block *sb,
             struct buffer_head *vbh = cetrafs_cas_verify_read(sb, fs_lba);
 
             if (!vbh) {
-                pr_err("CAS lba=%llu: outcome unknown and the region could not be re-read from the device\n",
-                       (unsigned long long) fs_lba);
+                cetrafs_sb_fatal(sb, "CAS lba=%llu: outcome unknown and the region could not be re-read",
+                                 (unsigned long long) fs_lba);
                 ret = -EIO;
                 goto out;
             }
@@ -1105,9 +1111,9 @@ static int cetrafs_cas_region_seeded_impl(struct super_block *sb,
                 continue;
             }
             brelse(vbh);
-            pr_err("CAS lba=%llu: command timed out and the region has changed since -- cannot tell whether "
-                   "the swap landed, refusing to repeat it\n",
-                   (unsigned long long) fs_lba);
+            cetrafs_sb_fatal(sb, "CAS lba=%llu: timed out and the region changed since -- cannot tell whether "
+                                 "the swap landed",
+                             (unsigned long long) fs_lba);
             ret = -EIO;
             goto out;
         }
@@ -1141,9 +1147,9 @@ static int cetrafs_cas_region_seeded_impl(struct super_block *sb,
             }
             if (vbh)
                 brelse(vbh);
-            pr_err("CAS lba=%llu: the region changed after a timed-out command -- cannot tell whether it "
-                   "landed, refusing to repeat it\n",
-                   (unsigned long long) fs_lba);
+            cetrafs_sb_fatal(sb, "CAS lba=%llu: the region changed after a timed-out command -- cannot tell "
+                                 "whether it landed",
+                             (unsigned long long) fs_lba);
             ret = -EIO;
             goto out;
         }

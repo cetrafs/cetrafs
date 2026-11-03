@@ -28,6 +28,7 @@
 #include <linux/version.h>
 #include <linux/delay.h>
 #include <linux/fs.h>
+#include <linux/module.h>
 #include <linux/pagemap.h>
 /* struct folio_batch moved out of pagevec.h; build against either. */
 #if __has_include(<linux/folio_batch.h>)
@@ -224,7 +225,7 @@ void cetrafs_bh_end_update(struct buffer_head *bh)
  * Not dirty: nothing to write, 0 -- after waiting out a write already in
  * flight (the buffer lock), whose own caller owns its result.
  */
-int cetrafs_sync_buffer(struct buffer_head *bh)
+static int __cetrafs_sync_buffer(struct buffer_head *bh)
 {
     lock_buffer(bh);
     if (!test_clear_buffer_dirty(bh)) {
@@ -280,7 +281,7 @@ static void cetrafs_end_write_keep(struct buffer_head *bh, int uptodate)
  * whose completion does clear BH_Uptodate): while the bit is still clear
  * nobody has re-read the block over our bytes, so they are put back.
  */
-int cetrafs_sync_buffer_keep(struct buffer_head *bh)
+static int __cetrafs_sync_buffer_keep(struct buffer_head *bh)
 {
     lock_buffer(bh); /* also waits out a writeback already in flight */
     if (buffer_write_io_error(bh)) {
@@ -308,6 +309,51 @@ int cetrafs_sync_buffer_keep(struct buffer_head *bh)
         return -EIO;
     }
     return 0;
+}
+
+/*
+ * A metadata write the device refused is fatal to the mount
+ * (docs/internal/ERRORS.md, kind 3). The caller has usually written
+ * other blocks of the same operation already, and its unwind -- more
+ * metadata writes -- would go to the device that just failed one; what
+ * is on the device from here on is something this node can only guess
+ * at. Stopping turns it into a crash at this point, which the journal
+ * and the peers' reclaim already recover from. dm-multipath retries a
+ * failed path before an error gets this far.
+ *
+ * The callers still see -EIO and unwind as before; on a stopped mount
+ * every write they attempt is refused at its own gate, without I/O.
+ */
+static unsigned int cetrafs_meta_write_fail;
+module_param_named(meta_write_fail, cetrafs_meta_write_fail, uint, 0644);
+MODULE_PARM_DESC(meta_write_fail, "TEST ONLY: fail the next N synchronous metadata writes as the device would");
+
+static int cetrafs_meta_write_result(struct super_block *sb, struct buffer_head *bh, int ret)
+{
+    if (!ret && cetrafs_meta_write_fail) {
+        cetrafs_meta_write_fail--;
+        ret = -EIO;
+    }
+    if (ret)
+        cetrafs_sb_fatal(sb, "the device refused a metadata write (block %llu, %d)",
+                         (unsigned long long) bh->b_blocknr, ret);
+    return ret;
+}
+
+/* On a stopped mount nothing is written: the dirt stays for the next
+ * sweep (cetrafs_drop_dirty_metadata()) to discard. */
+int cetrafs_sync_buffer(struct super_block *sb, struct buffer_head *bh)
+{
+    if (cetrafs_sb_is_fenced(sb))
+        return -EIO;
+    return cetrafs_meta_write_result(sb, bh, __cetrafs_sync_buffer(bh));
+}
+
+int cetrafs_sync_buffer_keep(struct super_block *sb, struct buffer_head *bh)
+{
+    if (cetrafs_sb_is_fenced(sb))
+        return -EIO;
+    return cetrafs_meta_write_result(sb, bh, __cetrafs_sync_buffer_keep(bh));
 }
 
 /*

@@ -177,7 +177,7 @@ static int cetrafs_journal_write_flag(struct super_block *sb, u64 area_start, bo
      * of this area skips them, so a failed write here must reach the
      * caller. Both callers already check -- it was this function that
      * reported success unconditionally. */
-    ret = cetrafs_sync_buffer(bh);
+    ret = cetrafs_sync_buffer(sb, bh);
     if (ret)
         pr_err("journal: could not write the %s flag at %llu (%d)\n", dirty ? "DIRTY" : "CLEAN",
                (unsigned long long) area_start, ret);
@@ -533,7 +533,7 @@ static int cetrafs_journal_zero_header(struct super_block *sb, u64 header_lba)
         return -EIO;
     memset(jbh->b_data, 0, CETRAFS_BLOCK_SIZE);
     cetrafs_bh_end_update(jbh);
-    ret = cetrafs_sync_buffer(jbh);
+    ret = cetrafs_sync_buffer(sb, jbh);
     brelse(jbh);
     return ret;
 }
@@ -575,6 +575,7 @@ static int cetrafs_journal_write_block_flags(struct super_block *sb, struct buff
     struct buffer_head *pbh, *hbh;
     cetrafs_journal_header_t *hdr;
     bool journaled = false;
+    bool entry_refused = false; /* the device refused the entry write itself */
 
     /*
      * On a journaling volume, a block the journal cannot protect is NOT
@@ -710,8 +711,10 @@ static int cetrafs_journal_write_block_flags(struct super_block *sb, struct buff
             ok = buffer_uptodate(pbh) && buffer_uptodate(hbh) && !cetrafs_journal_fail_entry_write;
             brelse(pbh);
             brelse(hbh);
-            if (!ok)
+            if (!ok) {
+                entry_refused = true;
                 goto journal_failed;
+            }
         }
 
         journaled = true;
@@ -748,8 +751,22 @@ static int cetrafs_journal_write_block_flags(struct super_block *sb, struct buff
         return 0;
     }
 
-    if (journaled)
-        blkdev_issue_flush(sb->s_bdev);
+    if (journaled) {
+        int ferr = blkdev_issue_flush(sb->s_bdev);
+
+        if (ferr) {
+            /* The entry may still be in a volatile cache: writing the
+             * target now is the torn-target-with-no-redo the flush
+             * exists to prevent. Stop instead; the entry stays live. */
+            cetrafs_sb_fatal(sb, "journal: cache flush before the write of block %llu failed (%d)",
+                             (unsigned long long) bh->b_blocknr, ferr);
+            cetrafs_bh_abort_update(bh);
+            mutex_lock(&j->lock);
+            cetrafs_journal_hold_slot(j, slot, bh->b_blocknr);
+            mutex_unlock(&j->lock);
+            return ferr;
+        }
+    }
     /* end_update marks it dirty and releases it; the sync must follow,
      * never precede, because sync_dirty_buffer() takes the buffer lock. */
     if (cetrafs_journal_fail_target_write) {
@@ -783,7 +800,7 @@ static int cetrafs_journal_write_block_flags(struct super_block *sb, struct buff
          * until the next write of the same block, which takes the slot
          * over (see the slot search above).
          */
-        int werr = cetrafs_sync_buffer(bh);
+        int werr = cetrafs_sync_buffer(sb, bh);
 
         if (werr) {
             if (journaled) {
@@ -821,9 +838,14 @@ static int cetrafs_journal_write_block_flags(struct super_block *sb, struct buff
          * only completed the target write. Flush so it is durable BEFORE the
          * entry is consumed -- otherwise a reordering cache could persist the
          * consume (zeroed header) but lose the torn target, erasing the one
-         * entry that could have redone it. */
-        blkdev_issue_flush(sb->s_bdev);
-        if (cetrafs_journal_zero_header(sb, header_lba)) {
+         * entry that could have redone it. A failed flush stops the mount
+         * (the cache's contents are unknown) and keeps the entry. */
+        int ferr = blkdev_issue_flush(sb->s_bdev);
+
+        if (ferr)
+            cetrafs_sb_fatal(sb, "journal: cache flush after the write of block %llu failed (%d)",
+                             (unsigned long long) bh->b_blocknr, ferr);
+        if (ferr || cetrafs_journal_zero_header(sb, header_lba)) {
             /* Not consumed: the entry stays live, which the replay guard
              * makes harmless -- the target is durable, so a replay finds
              * the after-image (or, once the block has legitimately changed
@@ -869,6 +891,15 @@ journal_failed:
     }
     pr_err_ratelimited("journal: could not write an entry for block %llu -- refusing to write it unjournaled\n",
                        (unsigned long long) bh->b_blocknr);
+    /* A refused entry write is kind 3 of docs/internal/ERRORS.md -- the
+     * entry may be on the device complete, torn, or not at all. Stop
+     * only now, AFTER the retire above: the caller is told the
+     * operation did not happen, and a stop first would refuse the
+     * zeroing write too, leaving a complete entry for the next mount's
+     * replay to redo (tests/kernel/journal_fails_loudly.sh, part 1). */
+    if (entry_refused)
+        cetrafs_sb_fatal(sb, "journal: the device refused the entry for block %llu",
+                         (unsigned long long) bh->b_blocknr);
     return -EIO;
 }
 
@@ -928,7 +959,7 @@ int cetrafs_journal_write_new_block(struct super_block *sb, struct buffer_head *
     cetrafs_bh_end_update(bh);
     /* The result from the write itself, never from BH_Uptodate -- a
      * forced-fresh reader may clear that concurrently (ioutil.c). */
-    return cetrafs_sync_buffer(bh);
+    return cetrafs_sync_buffer(sb, bh);
 }
 
 /*
@@ -1381,7 +1412,7 @@ int cetrafs_journal_replay_node(struct super_block *sb, u32 node_id, bool wait_f
             cetrafs_bh_begin_update(tbh);
             memcpy(tbh->b_data, pbh->b_data, CETRAFS_BLOCK_SIZE);
             cetrafs_bh_end_update(tbh);
-            werr = cetrafs_sync_buffer(tbh);
+            werr = cetrafs_sync_buffer(sb, tbh);
             if (werr) {
                 /* Do NOT consume this entry and do NOT park the area
                  * CLEAN: the redo did not land, and the entry is the
@@ -1429,7 +1460,7 @@ consume:
         cetrafs_bh_begin_update(hbh);
         memset(hbh->b_data, 0, CETRAFS_BLOCK_SIZE);
         cetrafs_bh_end_update(hbh);
-        if (cetrafs_sync_buffer(hbh))
+        if (cetrafs_sync_buffer(sb, hbh))
             /* Safe, just loud, and the same reasoning as the write
              * path's consume: the entry stays live and replay verifies
              * prev_checksum before applying anything, so a re-apply

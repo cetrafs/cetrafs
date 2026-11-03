@@ -96,6 +96,17 @@ esac
 # whose sync result was dropped the same way), and a create that grows
 # the directory publishes the new dirent block's extent with a sync
 # write of that record. Every create that reports success must survive.
+# A record write the device refused stops the mount
+# (docs/internal/ERRORS.md): this node no longer knows what that create
+# left on the device. Recover the way an operator does -- remount.
+PROC="$(ct_procdir "$DEV")"
+[ "$(sed -n 's/^stopped: //p' "$PROC/info")" = error ] &&
+    pass "the refused record write stopped the mount" ||
+    fail "the mount kept going after a refused record write (stopped: $(sed -n 's/^stopped: //p' "$PROC/info"))"
+umount "$MNT" || umount -l "$MNT"
+ct_mount "$DEV" "$MNT"
+require_cetrafs_mount "$MNT"
+
 mkdir "$MNT/d"
 sync
 D="$(stat -c %i "$MNT/d")"
@@ -129,7 +140,7 @@ else
     fail "no I/O error was logged for block $DBLK -- the fault never fired"
 fi
 
-ct_umount "$MNT"
+umount "$MNT" || umount -l "$MNT" # stopped by the first refused write, like the first case
 ct_mount "$DEV" "$MNT"
 require_cetrafs_mount "$MNT"
 # With the fix every create here fails (the namespace-lock CAS on the
@@ -154,10 +165,17 @@ ct_umount "$MNT"
 
 rc=0
 fo="$(ct_fsck "$DEV" 2>&1)" || rc=$?
-if [ "$rc" -eq 0 ] && ! grep -q '^ERR' <<<"$fo"; then
-    pass "fsck clean after the failed create"
+# Each refused record write stopped the mount -- a crash at that
+# instant -- so the create's unwind never freed the number it had
+# claimed: its bit stays set over a record that never reached the
+# device. A leak (the number cannot be handed out again), the safe
+# direction, and the one finding allowed per stop.
+bad="$(grep '^ERR' <<<"$fo" | grep -v "is marked in use but its checksum is wrong" || true)"
+leaks="$(grep -c "is marked in use but its checksum is wrong" <<<"$fo" || true)"
+if [ -z "$bad" ] && [ "$leaks" -le 2 ]; then
+    pass "fsck: nothing but the stops' unwritten records ($leaks)"
 else
-    fail "fsck rc=$rc after the failed create: $(grep '^ERR' <<<"$fo" | head -3)"
+    fail "fsck rc=$rc after the failed create: $(head -3 <<<"$bad") (unwritten records: $leaks)"
 fi
 
 ct_exit
