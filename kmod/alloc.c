@@ -534,6 +534,12 @@ MODULE_PARM_DESC(birth_gap_ms, "test-only: delay between an inode allocation's b
 static unsigned int cetrafs_birth_read_gap_ms;
 module_param_named(birth_read_gap_ms, cetrafs_birth_read_gap_ms, uint, 0644);
 MODULE_PARM_DESC(birth_read_gap_ms, "test-only: delay between an inode allocation's bit CAS and its record read");
+/* Test-only: fail the next N post-claim bit checks of an inode allocation
+ * with -EIO, as a device read error would, without reading.
+ * tests/kernel/birth_check_error.sh. */
+static unsigned int cetrafs_birth_check_fail;
+module_param_named(birth_check_fail, cetrafs_birth_check_fail, uint, 0644);
+MODULE_PARM_DESC(birth_check_fail, "test-only: fail the next N post-claim inode-bit checks with -EIO");
 
 /* One forced-fresh read of an inode record, raw: see the comment at its
  * first use in cetrafs_alloc_inode() for why not cetrafs_read_raw_inode().
@@ -767,11 +773,26 @@ int cetrafs_alloc_inode(struct super_block *sb, u64 *out_ino)
         if (claimed) {
             bool set = false;
 
-            ret = cetrafs_inode_is_allocated_fresh(sb, *out_ino, &set);
+            if (READ_ONCE(cetrafs_birth_check_fail)) {
+                WRITE_ONCE(cetrafs_birth_check_fail, cetrafs_birth_check_fail - 1);
+                ret = -EIO; /* test-only; see the parameter */
+            } else {
+                ret = cetrafs_inode_is_allocated_fresh(sb, *out_ino, &set);
+            }
             if (ret) {
+                /* Give the claim back. Kept, it made the number nobody's
+                 * forever: bit set, record dead and locked by this node,
+                 * so every scrub skipped it, while its extents still
+                 * named the blocks the previous life's evict had freed
+                 * -- fsck read those as shared with whichever files got
+                 * them next. Released, the record is an ordinary dead
+                 * one: the scrub reclaims the number if the bit is set,
+                 * and if a peer cleared it the number is simply free. */
+                (void) cetrafs_inode_reclaim_claim(sb, *out_ino, cetrafs_le64(raw.generation),
+                                                   CETRAFS_RECLAIM_BIRTH_ABORT, NULL);
                 cetrafs_sb_birth_end(sb, *out_ino);
                 *out_ino = 0;
-                return ret; /* claim and bit left as they are: fsck names it */
+                return ret;
             }
             if (!set) {
                 (void) cetrafs_inode_reclaim_claim(sb, *out_ino, cetrafs_le64(raw.generation),
@@ -2066,7 +2087,11 @@ static int cetrafs_bitmap_test_bit(struct super_block *sb, u64 bmap_lba, u64 nbl
     if (blk >= nblocks)
         return -EINVAL;
 
-    bh = sb_bread(sb, bmap_lba + blk);
+    /* Retrying: cetrafs_inode_is_allocated_fresh() drops this block
+     * before every read, and with several creators doing that at once a
+     * plain sb_bread() racing another's drop comes back NULL -- a
+     * spurious -EIO (see cetrafs_bread_retry()). */
+    bh = cetrafs_bread_retry(sb, bmap_lba + blk);
     if (!bh)
         return -EIO;
 
