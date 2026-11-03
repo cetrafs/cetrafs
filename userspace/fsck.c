@@ -2208,6 +2208,19 @@ int main(int argc, char **argv)
                         ino);
                 continue;
             }
+            if (cetrafs_inode_crcs_ok(&in) && cetrafs_le64(in.ino) != ino) {
+                if (dpass)
+                    continue; /* reported by the first pass */
+                /* A valid record in the wrong slot: whose blocks its
+                 * extents name cannot be known, exactly as for a bad
+                 * checksum below. */
+                fprintf(stderr, "ERR: inode %" PRIu64 "'s slot holds a valid record for inode %" PRIu64 "\n", ino,
+                        (uint64_t) cetrafs_le64(in.ino));
+                problems++;
+                repair_block("an inode slot holds another inode's record, so the blocks it names cannot be "
+                             "attributed");
+                continue;
+            }
             if (!cetrafs_inode_crcs_ok(&in)) {
                 fprintf(stderr, "ERR: inode %" PRIu64 " is marked in use but its checksum is wrong\n", ino);
                 problems++;

@@ -206,8 +206,20 @@ int cetrafs_read_raw_inode(struct super_block *sb, u64 ino, cetrafs_inode_t *out
         cetrafs_bh_copy_stable(bh, out, sizeof(*out));
         brelse(bh);
 
-        if (cetrafs_inode_crcs_ok(out))
+        if (cetrafs_inode_crcs_ok(out)) {
+            /* A valid record in the wrong slot -- a misdirected write,
+             * or a record copied to where it does not belong -- is not
+             * a torn read, and re-reading will not change it. Without
+             * this, every caller took the other inode's mode, size and
+             * EXTENTS as this one's. */
+            if (cetrafs_le64(out->ino) != ino) {
+                pr_err("ino=%llu: its slot holds a valid record for ino=%llu -- misplaced, refusing it\n",
+                       (unsigned long long) ino, (unsigned long long) cetrafs_le64(out->ino));
+                cetrafs_sb_corrupt(sb, ino);
+                return -EUCLEAN;
+            }
             return 0;
+        }
 
         /* Back off between attempts. A mismatch here is a peer's
          * in-flight record write seen torn, and a peer's write takes
