@@ -174,6 +174,16 @@ static bool cetrafs_cas_verify_dirty_once;
 module_param_named(cas_verify_dirty_once, cetrafs_cas_verify_dirty_once, bool, 0644);
 MODULE_PARM_DESC(cas_verify_dirty_once, "TEST ONLY: the next unknown-outcome re-read finds a dirty buffer");
 
+/* The mount whose CAS selftest is driving the undecidable-outcome case
+ * (phase 2d) right now, and whether that case reached its stop. That
+ * stop is the correct answer in production (docs/internal/ERRORS.md),
+ * and taken at mount it failed the selftest's own restore and with it
+ * every CAW mount that armed cas_selftest. For that one mount, during
+ * that one injected call, the stop is recorded instead of taken -- and
+ * the selftest asserts it was reached. */
+static struct super_block *cetrafs_cas_selftest_sb;
+static bool cetrafs_cas_selftest_stop_seen;
+
 static struct buffer_head *cetrafs_cas_verify_read(struct super_block *sb, u64 fs_lba)
 {
     struct buffer_head *bh = cetrafs_bread_uncached_retry(sb, fs_lba);
@@ -1085,8 +1095,14 @@ static int cetrafs_cas_region_seeded_impl(struct super_block *sb,
             struct buffer_head *vbh = cetrafs_cas_verify_read(sb, fs_lba);
 
             if (!vbh) {
-                cetrafs_sb_fatal(sb, "CAS lba=%llu: outcome unknown and the region could not be re-read",
-                                 (unsigned long long) fs_lba);
+                if (READ_ONCE(cetrafs_cas_selftest_sb) == sb) {
+                    pr_info("CAS selftest: lba=%llu would stop the mount here (outcome undecidable)\n",
+                            (unsigned long long) fs_lba);
+                    WRITE_ONCE(cetrafs_cas_selftest_stop_seen, true);
+                } else {
+                    cetrafs_sb_fatal(sb, "CAS lba=%llu: outcome unknown and the region could not be re-read",
+                                     (unsigned long long) fs_lba);
+                }
                 ret = -EIO;
                 goto out;
             }
@@ -1527,11 +1543,18 @@ void cetrafs_cas_selftest(struct super_block *sb, u32 my_node_id)
             pr_err("CAS selftest: could not set the dirty-verify baseline: %d\n", ret);
             ok = false;
         } else {
+            WRITE_ONCE(cetrafs_cas_selftest_stop_seen, false);
+            WRITE_ONCE(cetrafs_cas_selftest_sb, sb);
             cetrafs_caw_timeout_landed_once = true;
             cetrafs_cas_verify_dirty_once = true;
             ret = cetrafs_cas_record(sb, lba, cetrafs_cas_selftest_inc, NULL);
             cetrafs_caw_timeout_landed_once = false;
             cetrafs_cas_verify_dirty_once = false;
+            WRITE_ONCE(cetrafs_cas_selftest_sb, NULL);
+            if (!READ_ONCE(cetrafs_cas_selftest_stop_seen)) {
+                pr_err("CAS selftest: an undecidable timeout did not reach the mount stop\n");
+                ok = false;
+            }
             if (ret != -EIO) {
                 pr_err("CAS selftest: an undecidable timeout returned %d, expected -EIO\n", ret);
                 ok = false;

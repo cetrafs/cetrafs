@@ -132,7 +132,9 @@ _dmesg_since_raw() {
 CT_REG="$(mktemp /tmp/cetrafs-reg-XXXXXX)"
 CT_MODULE_LOADED=0
 
-# ct_track <mnt|loop|dir|file> <path>
+# ct_track <mnt|cmd|loop|dir|file> <path>
+#   cmd: a teardown COMMAND line, run after the mounts and before the
+#   block devices (e.g. an LIO target exported over a loop file).
 ct_track() { echo "$1 $2" >>"$CT_REG"; }
 
 ct_cleanup() {
@@ -162,7 +164,7 @@ ct_cleanup() {
     local try
     # dm devices sit between the mount and the loop device backing their
     # COW, so they unwind in that order.
-    for kind in mnt dm loop; do
+    for kind in mnt cmd dm loop; do
         while read -r k path; do
             [ "$k" = "$kind" ] || continue
             # 3 tries at 1s was not enough. After a suite writes to a
@@ -179,6 +181,9 @@ ct_cleanup() {
                 mnt)
                     mountpoint -q "$path" 2>/dev/null || break
                     umount "$path" 2>/dev/null && break
+                    ;;
+                cmd)
+                    eval "$path" >/dev/null 2>&1 && break
                     ;;
                 loop)
                     losetup -d "$path" 2>/dev/null && break
@@ -279,6 +284,24 @@ ct_summary() {
 
 CT_DMESG_FAULT_RE='BUG:|Oops|Call trace|WARNING:|Busy inodes after unmount|blocked for more than|rcu.*stall|UBSAN:|general protection fault|Unable to handle kernel'
 
+# The suite's dmesg minus one named EXTERNAL warning, whole: a suite
+# that drives some other subsystem into a WARN of its own (the LIO
+# target warns when it fails a COMPARE AND WRITE) sets
+# CT_DMESG_IGNORE_WARN to a regex matching that WARNING's banner line,
+# and that block -- banner through its "end trace" line -- is dropped.
+# Narrow by construction: one named source, everything else still counts.
+ct_dmesg_checked() {
+    if [ -n "${CT_DMESG_IGNORE_WARN:-}" ]; then
+        dmesg_since "$CT_DMESG_MARK" | awk -v re="$CT_DMESG_IGNORE_WARN" '
+            skip && /---\[ end trace/ { skip = 0; next }
+            skip { next }
+            $0 ~ re { skip = 1; next }
+            { print }'
+    else
+        dmesg_since "$CT_DMESG_MARK"
+    fi
+}
+
 ct_check_dmesg() {
     [ -n "${CT_QUIET:-}" ] && return 0
     [ -z "${CT_DMESG_MARK:-}" ] && return 0
@@ -290,7 +313,7 @@ ct_check_dmesg() {
     # It was missing here, and a field Oops on 0.9.3 was exactly that.
     # Hung tasks, RCU stalls and UBSAN reports carry no BUG:/WARNING:
     # banner either.
-    if dmesg_since "$CT_DMESG_MARK" | grep -qiE "$CT_DMESG_FAULT_RE"; then
+    if ct_dmesg_checked | grep -qiE "$CT_DMESG_FAULT_RE"; then
         fail "dmesg shows a BUG/Oops/WARNING during this suite"
         # Print the FRAMES, not just the banner. Grepping for the
         # matching lines alone keeps "WARNING: ... at foo+0x138" and
@@ -299,7 +322,7 @@ ct_check_dmesg() {
         # that detects a fault and discards the evidence turns a
         # reproducible failure into a mystery, and these faults are
         # often load-dependent and do not reproduce on demand.
-        dmesg_since "$CT_DMESG_MARK" | grep -iE -A 30 "$CT_DMESG_FAULT_RE" | head -80
+        ct_dmesg_checked | grep -iE -A 30 "$CT_DMESG_FAULT_RE" | head -80
     else
         pass "no BUG/Oops/WARNING in dmesg during this suite"
     fi
