@@ -676,6 +676,19 @@ struct buffer_head *cetrafs_blk_tail_bread(struct super_block *sb, u64 lba, u32 
 {
     int attempt;
 
+    /* Every block read here -- extent leaf, interior index, xattr -- is
+     * reached through an address read off the device, and the xattr and
+     * leaf writers journal and write back what they read. The tree
+     * readers checked theirs before calling (inode.c); an inode's
+     * xattr_block went straight here unchecked (rule 19's asymmetry), so
+     * the one check now sits where all of them pass. */
+    if (!cetrafs_lba_run_is_data(sb, lba, 1)) {
+        pr_err_ratelimited("%s block %llu is not a data address -- refusing it (fsck)\n", what,
+                           (unsigned long long) lba);
+        cetrafs_sb_corrupt(sb, 0);
+        return NULL;
+    }
+
     for (attempt = 0; attempt < CETRAFS_BLK_TAIL_READ_RETRIES; attempt++) {
         struct buffer_head *bh = cetrafs_bread_uncached(sb, lba);
 
