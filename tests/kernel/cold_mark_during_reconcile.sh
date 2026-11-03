@@ -84,6 +84,7 @@ stat "$MNT/v" >/dev/null # mark 2, during W1: W2 queued behind it
 sleep 3                  # past W1's settle (~6s), inside W2's first hold
 go 2
 wait "$READER" 2>/dev/null || true
+rm -f "$STEP".[0-9] # the harness tracks $STEP only
 ct_param_set cold_work_stall_ms 0
 # Let W2 finish before anything else touches the file.
 sleep $((S * 2 / 1000 + 1))
