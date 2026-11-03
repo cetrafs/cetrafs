@@ -1138,6 +1138,56 @@ int main(int argc, char **argv)
     }
 
     /*
+     * The field checks fs.c's fill_super() makes before it looks at the
+     * region map, same order. fsck had only some of them, so a volume
+     * the kernel refuses to mount -- no Zone Groups, a Block Group too
+     * small to hold its own bitmap, more inodes than records -- was
+     * walked by code that divides by, indexes with and loops over these
+     * very counts, and could be reported CLEAN.
+     */
+    {
+        uint64_t zg = cetrafs_le32(sb.zone_group_count), bgs = cetrafs_le32(sb.block_group_count);
+        uint64_t bgsz = cetrafs_le64(sb.bg_size_blocks), inodes = cetrafs_le32(sb.inodes_count);
+
+        if (!zg || zg > CETRAFS_MAX_ZONE_GROUPS) {
+            fprintf(stderr, "ERR: zone_group_count %" PRIu64 " (1..%u) -- it will not mount\n", zg,
+                    CETRAFS_MAX_ZONE_GROUPS);
+            return 1;
+        }
+        if (!bgs) {
+            fprintf(stderr, "ERR: block_group_count 0 -- it will not mount\n");
+            return 1;
+        }
+        if (bgsz < 64 || bgsz > CETRAFS_MAX_BG_SIZE_BLOCKS) {
+            fprintf(stderr, "ERR: bg_size_blocks %" PRIu64 " (64..%llu) -- it will not mount\n", bgsz,
+                    (unsigned long long) CETRAFS_MAX_BG_SIZE_BLOCKS);
+            return 1;
+        }
+        if (!cetrafs_le64(sb.inode_bmap_blocks) || !cetrafs_le64(sb.inode_table_blocks)) {
+            fprintf(stderr, "ERR: inode bitmap or inode table has no blocks (inode_bmap_blocks %" PRIu64
+                            ", inode_table_blocks %" PRIu64 ") -- it will not mount\n",
+                    (uint64_t) cetrafs_le64(sb.inode_bmap_blocks), (uint64_t) cetrafs_le64(sb.inode_table_blocks));
+            return 1;
+        }
+        if (!inodes || inodes >= UINT32_MAX || inodes > cetrafs_le64(sb.inode_table_blocks)) {
+            fprintf(stderr, "ERR: inodes_count %" PRIu64 " does not fit its table (%" PRIu64
+                            " blocks, one record each) -- it will not mount\n",
+                    inodes, (uint64_t) cetrafs_le64(sb.inode_table_blocks));
+            return 1;
+        }
+        if (!cetrafs_le32(sb.node_table_count) || cetrafs_le32(sb.node_table_count) > cetrafs_le64(sb.node_table_blocks)) {
+            fprintf(stderr, "ERR: node_table_count %u does not fit node_table_blocks %" PRIu64 " -- it will not mount\n",
+                    cetrafs_le32(sb.node_table_count), (uint64_t) cetrafs_le64(sb.node_table_blocks));
+            return 1;
+        }
+        if (cetrafs_le32(sb.node_entry_size) < sizeof(cetrafs_node_entry_t)) {
+            fprintf(stderr, "ERR: node_entry_size %u < %zu -- it will not mount\n", cetrafs_le32(sb.node_entry_size),
+                    sizeof(cetrafs_node_entry_t));
+            return 1;
+        }
+    }
+
+    /*
      * The region MAP, not just the bytes that describe it.
      *
      * A checksum proves the superblock was written intact; it says

@@ -74,6 +74,19 @@ expect_caught "more inodes than the table holds" "inodes_count|bitmap|table|fit"
 expect_caught "more node rows than the table"    "node_table_count|fit|layout"              node_table_count 99999
 expect_caught "a cluster wider than the mask"    "node_table_count|64|reader"               node_table_count 65
 
+log "geometry the kernel refuses at mount"
+# fsck has to refuse what the mount refuses, or an operator is left with
+# a volume that will not mount and a checker that calls it sound.
+expect_caught "no Zone Groups"                   "zone_group_count|Zone Group"              zone_group_count 0
+expect_caught "more Zone Groups than exist"      "zone_group_count|Zone Group"              zone_group_count 256
+expect_caught "no Block Groups"                  "block_group_count|Block Group"            block_group_count 0
+expect_caught "a Block Group too small"          "bg_size_blocks|Block Group size"          bg_size_blocks 32
+expect_caught "a Block Group too large to index" "bg_size_blocks|Block Group size"          bg_size_blocks 1099511627776
+expect_caught "an empty inode bitmap"            "inode_bmap_blocks|inode bitmap"           inode_bmap_blocks 0
+expect_caught "more inodes than table blocks"    "inodes_count|table"                       inodes_count 4000
+expect_caught "no node rows"                     "node_table_count"                         node_table_count 0
+expect_caught "a node row smaller than a row"    "node_entry_size"                          node_entry_size 16
+
 log "the fields a reader trusts blindly"
 expect_caught "wrong sb_bytes"                   "sb_bytes"                                 sb_bytes 123
 expect_caught "wrong inode_size"                 "inode_size|layout"                        inode_size 99
