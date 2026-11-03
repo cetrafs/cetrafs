@@ -110,6 +110,9 @@ int main(int argc, char **argv)
         fprintf(stderr, "usage: %s <image> <bg_id> <free_data_blocks> [sync-zg|fill-bitmap]\n", argv[0]);
         fprintf(stderr, "       %s <image> <bg_id> --dump | --bumpseq\n", argv[0]);
         fprintf(stderr, "       %s <image> <bg_id> --owner <zg_id>\n", argv[0]);
+        fprintf(stderr, "       %s <image> <bg_id> --geom=<field> <value>   (start_block, length_blocks, "
+                        "off_data_bmap, off_data_region, data_block_count)\n",
+                argv[0]);
         return 2;
     }
 
@@ -146,7 +149,9 @@ int main(int argc, char **argv)
 
     uint32_t bg_id = (uint32_t) strtoul(argv[2], NULL, 0);
     uint64_t free_blocks =
-        (dump || bumpseq || (argc == 5 && strcmp(argv[3], "--owner") == 0)) ? 0 : (uint64_t) strtoull(argv[3], NULL, 0);
+        (dump || bumpseq || (argc == 5 && (strcmp(argv[3], "--owner") == 0 || strncmp(argv[3], "--geom=", 7) == 0)))
+            ? 0
+            : (uint64_t) strtoull(argv[3], NULL, 0);
 
     int fd = open(path, O_RDWR);
     if (fd < 0) {
@@ -163,6 +168,7 @@ int main(int argc, char **argv)
     }
 
     bool fill_bitmap = (argc == 5 && strcmp(argv[4], "fill-bitmap") == 0);
+    bool set_geom = (argc == 5 && strncmp(argv[3], "--geom=", 7) == 0);
     bool set_owner = (argc == 5 && strcmp(argv[3], "--owner") == 0);
 
     off_t bg_off = (off_t) (cetrafs_le64(sb.bg_table_start) + bg_id) * CETRAFS_BLOCK_SIZE;
@@ -170,8 +176,13 @@ int main(int argc, char **argv)
     pread_all(fd, &bg, sizeof(bg), bg_off);
 
     if (dump) {
-        printf("free_data_blocks=%llu reconcile_seq=%llu\n", (unsigned long long) cetrafs_le64(bg.free_data_blocks),
-               (unsigned long long) cetrafs_le64(bg.reconcile_seq));
+        printf("free_data_blocks=%llu reconcile_seq=%llu start_block=%llu length_blocks=%llu off_data_bmap=%u "
+               "off_data_region=%u data_block_count=%llu inode_table_start=%llu\n",
+               (unsigned long long) cetrafs_le64(bg.free_data_blocks),
+               (unsigned long long) cetrafs_le64(bg.reconcile_seq), (unsigned long long) cetrafs_le64(bg.start_block),
+               (unsigned long long) cetrafs_le64(bg.length_blocks), cetrafs_le32(bg.off_data_bmap),
+               cetrafs_le32(bg.off_data_region), (unsigned long long) cetrafs_le64(bg.data_block_count),
+               (unsigned long long) cetrafs_le64(sb.inode_table_start));
         close(fd);
         return 0;
     }
@@ -214,6 +225,36 @@ int main(int argc, char **argv)
         pwrite_all(fd, &bg, sizeof(bg), bg_off);
         close(fd);
         printf("bg_poke: BG%u owner_zg -> %u\n", bg_id, newz);
+        return 0;
+    }
+
+    /* --geom=<field> <value>: a geometry field a hostile or broken image
+     * could carry, with the checksum restamped so only the kernel's
+     * geometry check stands between it and the I/O it aims. */
+    if (set_geom) {
+        const char *f = argv[3] + 7;
+        uint64_t v = (uint64_t) strtoull(argv[4], NULL, 0);
+
+        if (!strcmp(f, "start_block"))
+            bg.start_block = cetrafs_cpu_to_le64(v);
+        else if (!strcmp(f, "length_blocks"))
+            bg.length_blocks = cetrafs_cpu_to_le64(v);
+        else if (!strcmp(f, "off_data_bmap"))
+            bg.off_data_bmap = cetrafs_cpu_to_le32((uint32_t) v);
+        else if (!strcmp(f, "off_data_region"))
+            bg.off_data_region = cetrafs_cpu_to_le32((uint32_t) v);
+        else if (!strcmp(f, "data_block_count"))
+            bg.data_block_count = cetrafs_cpu_to_le64(v);
+        else {
+            fprintf(stderr, "unknown geometry field %s\n", f);
+            return 2;
+        }
+        bg.checksum = 0;
+        bg.checksum = cetrafs_cpu_to_le64(
+            crc32c_struct(&bg, sizeof(bg), offsetof(cetrafs_block_group_t, checksum), sizeof(cetrafs_le64(bg.checksum))));
+        pwrite_all(fd, &bg, sizeof(bg), bg_off);
+        close(fd);
+        printf("bg_poke: BG%u %s -> %llu\n", bg_id, f, (unsigned long long) v);
         return 0;
     }
 

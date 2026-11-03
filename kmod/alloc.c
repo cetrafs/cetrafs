@@ -983,6 +983,40 @@ u64 cetrafs_bg_geom_read_count(void)
  * owner_zg) can observe the owning node's in-flight counter write torn.
  * Verify + retry with a forced-fresh re-read, same shape as every other
  * checksummed-record reader; only a persistent mismatch is -EUCLEAN. */
+/*
+ * A descriptor whose checksum passes still has to describe a Block Group
+ * that can exist (rule 19). Its offsets AIM I/O: the allocator and the
+ * bitmap flush address bitmap blocks from start_block + off_data_bmap,
+ * the flush walks off_data_region - off_data_bmap of them in u32 (an
+ * inverted pair wrapped to ~4 billion blocks under sync(2)), and the
+ * scrub sizes its buffer from data_block_count. cetrafs.h said these
+ * were "checked when read"; until now only the checksum was.
+ *
+ * Every field is checked against the superblock's data area, never
+ * against a computed position: a grown volume's Block Groups are not
+ * contiguous (cetrafs_superblock_t.bg_data_end).
+ */
+static bool cetrafs_bg_geom_sane(const cetrafs_superblock_t *raw_sb, u32 bg_id, const cetrafs_block_group_t *bg)
+{
+    u64 regions = le64_to_cpu(raw_sb->bg_regions_start);
+    u64 data_end = le64_to_cpu(raw_sb->bg_data_end);
+    u64 total = le64_to_cpu(raw_sb->total_blocks);
+    u64 start = cetrafs_le64(bg->start_block);
+    u64 len = cetrafs_le64(bg->length_blocks);
+    u64 bmap = cetrafs_le32(bg->off_data_bmap);
+    u64 region = cetrafs_le32(bg->off_data_region);
+    u64 count = cetrafs_le64(bg->data_block_count);
+
+    if (!data_end)
+        data_end = regions + (u64) le32_to_cpu(raw_sb->block_group_count) * le64_to_cpu(raw_sb->bg_size_blocks);
+    if (data_end > total)
+        data_end = total;
+
+    return cetrafs_le32(bg->bg_id) == bg_id && start >= regions && len && len <= data_end - regions &&
+           start <= data_end - len && bmap >= 1 && bmap < region && region <= len && count <= len - region &&
+           count <= (region - bmap) * CETRAFS_BLOCK_SIZE * 8;
+}
+
 static int cetrafs_read_bg_geom(struct super_block *sb, u32 bg_id, struct cetrafs_bg_geom *out)
 {
     atomic64_inc(&cetrafs_bg_geom_reads);
@@ -1014,6 +1048,16 @@ static int cetrafs_read_bg_geom(struct super_block *sb, u32 bg_id, struct cetraf
 
         bg = (const cetrafs_block_group_t *) bh->b_data;
         if (cetrafs_bg_crc_verify(bh->b_data) == (u32) cetrafs_le64(bg->checksum)) {
+            if (!cetrafs_bg_geom_sane(raw_sb, bg_id, bg)) {
+                pr_err_ratelimited("BG %u descriptor describes an impossible Block Group (start %llu len %llu "
+                                   "bitmap +%u data +%u count %llu) -- refusing it (fsck)\n",
+                                   bg_id, (unsigned long long) cetrafs_le64(bg->start_block),
+                                   (unsigned long long) cetrafs_le64(bg->length_blocks),
+                                   cetrafs_le32(bg->off_data_bmap), cetrafs_le32(bg->off_data_region),
+                                   (unsigned long long) cetrafs_le64(bg->data_block_count));
+                brelse(bh);
+                return -EUCLEAN;
+            }
             out->start_block = cetrafs_le64(bg->start_block);
             out->off_data_bmap = cetrafs_le32(bg->off_data_bmap);
             out->off_data_region = cetrafs_le32(bg->off_data_region);
