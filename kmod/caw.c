@@ -151,6 +151,27 @@ static bool cetrafs_caw_timeout_lost_once;
 module_param_named(caw_timeout_lost_once, cetrafs_caw_timeout_lost_once, bool, 0644);
 MODULE_PARM_DESC(caw_timeout_lost_once, "TEST ONLY: next CAW does not execute and reports a timeout");
 
+/* TEST ONLY: the late-landing half of a timeout. The next CAW is NOT
+ * issued and reported as timed out -- so the re-read finds the pre-image
+ * and the caller retries -- and is then executed just before the CAW
+ * after it, the way a command still queued on the array lands behind
+ * the host's back. */
+static bool cetrafs_caw_timeout_late_once;
+module_param_named(caw_timeout_late_once, cetrafs_caw_timeout_late_once, bool, 0644);
+MODULE_PARM_DESC(caw_timeout_late_once, "TEST ONLY: next CAW reports a timeout, then lands just before the next one");
+
+/* TEST ONLY: the next CAW over a dm path executes and then reports a
+ * failure with sense (a MEDIUM or HARDWARE ERROR after the write). */
+static bool cetrafs_caw_eio_landed_once;
+module_param_named(caw_eio_landed_once, cetrafs_caw_eio_landed_once, bool, 0644);
+MODULE_PARM_DESC(caw_eio_landed_once, "TEST ONLY: next CAW over a dm path executes, then reports -EIO");
+
+static struct {
+    u8 *compare, *write_data;
+    u64 lba;
+    unsigned int nblocks;
+} cetrafs_caw_late;
+
 static bool cetrafs_caw_fail_discover;
 module_param_named(caw_fail_discover, cetrafs_caw_fail_discover, bool, 0644);
 MODULE_PARM_DESC(caw_fail_discover, "test-only: force CAW capability discovery to fail");
@@ -499,6 +520,35 @@ int cetrafs_caw(struct block_device *bdev, u64 lba, unsigned int nblocks, const 
     if (nblocks == 0)
         return -EINVAL;
 
+    if (cetrafs_caw_late.compare) { /* test knob caw_timeout_late_once: land it now */
+        u8 *c = cetrafs_caw_late.compare, *w = cetrafs_caw_late.write_data;
+
+        cetrafs_caw_late.compare = NULL;
+        cetrafs_caw_late.write_data = NULL;
+        pr_warn("CAW lba=%llu: TEST caw_timeout_late_once -- the timed-out command lands now\n",
+                (unsigned long long) cetrafs_caw_late.lba);
+        (void) cetrafs_caw(bdev, cetrafs_caw_late.lba, cetrafs_caw_late.nblocks, c, w);
+        kfree(c);
+        kfree(w);
+    }
+    if (cetrafs_caw_timeout_late_once && bdev_logical_block_size(bdev)) {
+        size_t half = (size_t) nblocks * bdev_logical_block_size(bdev);
+
+        cetrafs_caw_timeout_late_once = false;
+        cetrafs_caw_late.compare = kmemdup(compare, half, GFP_KERNEL);
+        cetrafs_caw_late.write_data = kmemdup(write_data, half, GFP_KERNEL);
+        if (!cetrafs_caw_late.compare || !cetrafs_caw_late.write_data) {
+            kfree(cetrafs_caw_late.compare);
+            kfree(cetrafs_caw_late.write_data);
+            cetrafs_caw_late.compare = NULL;
+            cetrafs_caw_late.write_data = NULL;
+        }
+        cetrafs_caw_late.lba = lba;
+        cetrafs_caw_late.nblocks = nblocks;
+        pr_warn("CAW lba=%llu: TEST caw_timeout_late_once -- held back, reporting a timeout\n",
+                (unsigned long long) lba);
+        return -ETIMEDOUT;
+    }
     if (cetrafs_caw_timeout_lost_once) {
         /* Test-only: never issued, reported as timed out. */
         cetrafs_caw_timeout_lost_once = false;
@@ -577,6 +627,12 @@ int cetrafs_caw(struct block_device *bdev, u64 lba, unsigned int nblocks, const 
                             (unsigned long long) lba);
                     ret = -ETIMEDOUT;
                 }
+                if (ret == 0 && cetrafs_caw_eio_landed_once) {
+                    cetrafs_caw_eio_landed_once = false;
+                    pr_warn("CAW lba=%llu: TEST caw_eio_landed_once -- executed, reporting -EIO anyway\n",
+                            (unsigned long long) lba);
+                    ret = -EIO;
+                }
             }
 
             if (ret != -EIO && ret != -ETIMEDOUT) { /* success, or MISCOMPARE, or a non-path error */
@@ -587,8 +643,14 @@ int cetrafs_caw(struct block_device *bdev, u64 lba, unsigned int nblocks, const 
             cetrafs_dmpath_failed(bdev, sdev);
             scsi_device_put(sdev);
 
-            if (ret == -ETIMEDOUT) /* outcome unknown: the caller re-reads and decides */
-                return ret;
+            /* Outcome unknown: the caller re-reads and decides. -EIO
+             * too: it carries sense, but a MEDIUM or HARDWARE ERROR on a
+             * COMPARE AND WRITE does not say the write did not happen,
+             * and re-issuing the same compare on the next path after one
+             * that landed MISCOMPAREs -- which the layer above reads as a
+             * lost race and answers by running the mutator again. */
+            if (ret == -ETIMEDOUT || ret == -EIO)
+                return -ETIMEDOUT;
         }
         if (ret != -EOPNOTSUPP)
             return ret;
@@ -791,6 +853,7 @@ static int cetrafs_cas_region_seeded_impl(struct super_block *sb,
     unsigned int off = region_idx * region;
     u64 dev_lba = have_caw ? fs_lba * (CETRAFS_BLOCK_SIZE / caw->logical_block_size) + region_idx : 0;
     u8 *old, *new;
+    u8 *unknown = NULL; /* the post-image of a swap whose outcome was unknown */
     int attempt, ret;
 
     if (!mutate || off + region > CETRAFS_BLOCK_SIZE)
@@ -984,9 +1047,21 @@ static int cetrafs_cas_region_seeded_impl(struct super_block *sb,
                 goto out;
             }
             if (!memcmp(vbh->b_data + off, old, region)) {
-                pr_warn("CAS lba=%llu: command timed out and did NOT land -- retrying on another path\n",
+                /* Not on the device NOW. A timed-out command can still be
+                 * queued on the array and land behind our back, after
+                 * this re-read; keep its image, so that if the retry
+                 * then MISCOMPAREs we can tell "ours landed late" from
+                 * "a peer won" instead of applying the mutator again. */
+                pr_warn("CAS lba=%llu: command timed out and has not landed -- retrying on another path\n",
                         (unsigned long long) fs_lba);
                 brelse(vbh);
+                if (!unknown)
+                    unknown = kmalloc(region, GFP_KERNEL);
+                if (!unknown) {
+                    ret = -ENOMEM;
+                    goto out;
+                }
+                memcpy(unknown, new, region);
                 continue;
             }
             brelse(vbh);
@@ -1001,6 +1076,37 @@ static int cetrafs_cas_region_seeded_impl(struct super_block *sb,
             goto out; /* real transport error */
 
         atomic64_inc(&cetrafs_cas_miscompares);
+
+        if (unknown) {
+            /* A MISCOMPARE after a swap whose outcome was unknown: the
+             * region moved since the re-read that found the pre-image.
+             * If it now holds that swap's post-image, the timed-out
+             * command landed late and is our success; running the
+             * mutator again would apply it twice. Anything else may be a
+             * peer writing over our late landing, which cannot be told
+             * apart from a peer that simply won -- refuse rather than
+             * guess, as the timeout path above does. */
+            struct buffer_head *vbh = cetrafs_bread_uncached_retry(sb, fs_lba);
+
+            if (vbh && !memcmp(vbh->b_data + off, unknown, region)) {
+                pr_warn("CAS lba=%llu: the timed-out command landed late -- taking it as done\n",
+                        (unsigned long long) fs_lba);
+                brelse(vbh);
+                if (sole_region)
+                    cetrafs_cache_region_after_cas(sb, fs_lba, off, unknown, region);
+                else
+                    cetrafs_invalidate_block(sb, fs_lba);
+                ret = 0;
+                goto out;
+            }
+            if (vbh)
+                brelse(vbh);
+            pr_err("CAS lba=%llu: the region changed after a timed-out command -- cannot tell whether it "
+                   "landed, refusing to repeat it\n",
+                   (unsigned long long) fs_lba);
+            ret = -EIO;
+            goto out;
+        }
 
         /* MISCOMPARE: someone else won. Re-read and re-decide.
          *
@@ -1018,6 +1124,7 @@ static int cetrafs_cas_region_seeded_impl(struct super_block *sb,
     ret = -EBUSY;
 
 out:
+    kfree(unknown);
     kfree(old);
     kfree(new);
     return ret;
@@ -1293,8 +1400,11 @@ void cetrafs_cas_selftest(struct super_block *sb, u32 my_node_id)
         u8 base = 0x10;
         unsigned int phase;
 
-        for (phase = 0; phase < 2; phase++) {
-            const char *what = phase ? "landed" : "lost";
+        static const char *const whats[] = {"lost", "landed", "landed late", "-EIO after landing"};
+
+        for (phase = 0; phase < ARRAY_SIZE(whats); phase++) {
+            const char *what = whats[phase];
+            bool fired;
 
             ret = cetrafs_cas_record(sb, lba, cetrafs_cas_selftest_set, &base);
             if (ret) {
@@ -1303,14 +1413,23 @@ void cetrafs_cas_selftest(struct super_block *sb, u32 my_node_id)
                 break;
             }
 
-            if (phase)
-                cetrafs_caw_timeout_landed_once = true;
-            else
-                cetrafs_caw_timeout_lost_once = true;
+            cetrafs_caw_timeout_lost_once = phase == 0;
+            cetrafs_caw_timeout_landed_once = phase == 1;
+            cetrafs_caw_timeout_late_once = phase == 2;
+            cetrafs_caw_eio_landed_once = phase == 3;
 
             ret = cetrafs_cas_record(sb, lba, cetrafs_cas_selftest_inc, NULL);
+            /* The -EIO knob only fires on a dm path; say so rather than
+             * report a case that never ran as passed. */
+            fired = !cetrafs_caw_eio_landed_once;
             cetrafs_caw_timeout_landed_once = false;
             cetrafs_caw_timeout_lost_once = false;
+            cetrafs_caw_timeout_late_once = false;
+            cetrafs_caw_eio_landed_once = false;
+            if (!fired) {
+                pr_info("CAS selftest: the %s case needs a dm path -- not exercised here\n", what);
+                continue;
+            }
 
             if (ret) {
                 pr_err("CAS selftest: increment across a timed-out (%s) command failed: %d\n", what, ret);

@@ -99,7 +99,16 @@ if mount -t cetrafs /dev/mapper/cawid "$MNT" 2>/dev/null; then
         fail "mounted on dm but CAW reads unavailable"
     dmesg | grep -q "CAS selftest: PASSED" &&
         pass "a real compare-and-swap completed over the dm node" ||
-        fail "the CAS selftest did not pass over dm: $(dmesg | grep -i selftest | tail -1)"
+        fail "the CAS selftest did not pass over dm: $(dmesg | grep -i selftest | grep -v PASSED | tail -3)"
+    # A command reported failed may still have executed: a timeout that
+    # lands late, an -EIO with sense after the write. Each must leave a
+    # delta mutator applied once, not re-issued on another path or re-run
+    # after the MISCOMPARE its own landing causes.
+    for c in "landed late" "-EIO after landing"; do
+        dmesg | grep -q -- "a timed-out ($c) command applied the delta exactly once" &&
+            pass "selftest: the '$c' case applied a delta exactly once" ||
+            fail "selftest: the '$c' case did not run or applied the delta twice"
+    done
     [ "$(cat "$MNT/probe-file" 2>/dev/null)" = hello ] &&
         pass "ordinary file I/O works (data path still goes through dm)" ||
         fail "file I/O through the dm-mounted volume failed"
