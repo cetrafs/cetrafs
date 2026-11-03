@@ -4321,24 +4321,24 @@ static long cetrafs_fallocate(struct file *file, int mode, loff_t offset, loff_t
         goto out;
     }
 
-    /* Boundary blocks that are only partially inside [offset, end) must
-     * keep the data outside the hole: zero just the in-hole half of
-     * each (the tail of offset's block, the head of end's block) before
-     * anything below decides whole blocks are free to drop. */
-    if (offset & (CETRAFS_BLOCK_SIZE - 1)) {
-        loff_t block_end = (loff_t) start_block * CETRAFS_BLOCK_SIZE;
-
-        ret = cetrafs_zero_range(inode->i_mapping, offset, (size_t) (block_end - offset));
-        if (ret)
-            goto out;
-    }
-    if (end & (CETRAFS_BLOCK_SIZE - 1)) {
-        loff_t block_start = (loff_t) end_block * CETRAFS_BLOCK_SIZE;
-
-        ret = cetrafs_zero_range(inode->i_mapping, block_start, (size_t) (end - block_start));
-        if (ret)
-            goto out;
-    }
+    /*
+     * Nothing in core changes before the record is published: the same
+     * order as truncate (cetrafs_truncate_shrink()). The page-cache drop
+     * and the boundary zeroing used to come first, so a punch whose
+     * record write failed had already thrown away dirty data inside the
+     * hole -- the blocks stayed mapped and read back their older on-disk
+     * contents, neither the data nor the zeroes -- and zeroed the
+     * boundary halves through the ordinary write path, where writeback
+     * made them durable. A failed punch must leave the file as it was.
+     *
+     * So write the range back first (ext4 does the same before a punch):
+     * the dirty data then is the on-disk data, and a failure leaves the
+     * file exactly as the caller last wrote it. Free when the range is
+     * clean, which is what a discard over a sparse image mostly is.
+     */
+    ret = filemap_write_and_wait_range(inode->i_mapping, offset, end - 1);
+    if (ret)
+        goto out;
 
     ret = cetrafs_read_raw_inode_overlaid(sb, inode, &raw); /* torn-read-safe vs a concurrent publish */
     if (ret)
@@ -4413,18 +4413,6 @@ static long cetrafs_fallocate(struct file *file, int mode, loff_t offset, loff_t
         goto out;
     }
 
-    /* Only now that the punch is known to change something: drop the
-     * cached folios over the hole. The blocks behind them are about to
-     * be freed, and a stale cached copy would let a later read return
-     * old data instead of the zero a hole must read as. Deliberately
-     * after the no-op check above -- evicting a live file's page cache
-     * on every no-op punch is both pointless and a throughput loss in
-     * its own right. */
-    truncate_pagecache_range(inode, offset, end - 1);
-
-    if (cetrafs_punch_pagecache_delay_ms)
-        msleep(cetrafs_punch_pagecache_delay_ms); /* test-only; see the parameter */
-
     /* Build the fresh tree; the old one stays intact until we publish. */
     ret = cetrafs_tree_build(inode, new_flat, new_n, &raw, &meta_blocks);
     if (ret) {
@@ -4454,9 +4442,23 @@ static long cetrafs_fallocate(struct file *file, int mode, loff_t offset, loff_t
         goto out;
     }
 
-    /* Published. Free the OLD tree's meta, then the punched DATA blocks
-     * (a do_free pass over the old flat array) -- same two-pass,
-     * publish-before-free shape as cetrafs_truncate_shrink(). */
+    /* Published. Only now drop the cached folios over the hole: the
+     * blocks behind them are about to be freed, and a stale cached copy
+     * would let a later read return old data instead of the zero a hole
+     * must read as. Still before the free, and invalidate_lock (held
+     * for the whole call) keeps a fault from re-instantiating one in
+     * between. This also zeroes the cached halves of the boundary
+     * blocks. Deliberately after the no-op check above -- evicting a
+     * live file's page cache on every no-op punch is both pointless and
+     * a throughput loss in its own right. */
+    truncate_pagecache_range(inode, offset, end - 1);
+
+    if (cetrafs_punch_pagecache_delay_ms)
+        msleep(cetrafs_punch_pagecache_delay_ms); /* test-only; see the parameter */
+
+    /* Free the OLD tree's meta, then the punched DATA blocks (a do_free
+     * pass over the old flat array) -- same two-pass, publish-before-free
+     * shape as cetrafs_truncate_shrink(). */
     cetrafs_tree_free_meta(inode, &old_raw);
     {
         u32 discard_entries = old_n;
@@ -4468,15 +4470,36 @@ static long cetrafs_fallocate(struct file *file, int mode, loff_t offset, loff_t
     kvfree(new_flat);
     kvfree(old_flat);
 
+    /* Boundary blocks only partly inside [offset, end) keep the data
+     * outside the hole: zero just the in-hole half of each (the tail of
+     * offset's block, the head of end's block), through the ordinary
+     * write path so the zeroes reach the device. After the publish, so a
+     * failed punch never got here. */
+    if (offset & (CETRAFS_BLOCK_SIZE - 1)) {
+        loff_t block_end = (loff_t) start_block * CETRAFS_BLOCK_SIZE;
+
+        ret = cetrafs_zero_range(inode->i_mapping, offset, (size_t) (block_end - offset));
+    }
+    if (!ret && (end & (CETRAFS_BLOCK_SIZE - 1))) {
+        loff_t block_start = (loff_t) end_block * CETRAFS_BLOCK_SIZE;
+
+        ret = cetrafs_zero_range(inode->i_mapping, block_start, (size_t) (end - block_start));
+    }
+
     inode->i_blocks = cetrafs_le64(raw.blocks);
     inode_set_ctime(inode, ktime_get_real_seconds(), 0);
     mark_inode_dirty(inode);
     /* The direct write persists it; the VFS call then clears the dirty
      * state so the inode can still accept cross-node refreshes. Both
      * halves are needed -- see cetrafs_setattr_locked()'s comment. */
-    ret = cetrafs_write_vfs_inode(inode);
-    if (!ret)
-        ret = sync_inode_metadata(inode, 1);
+    {
+        int wret = cetrafs_write_vfs_inode(inode);
+
+        if (!wret)
+            wret = sync_inode_metadata(inode, 1);
+        if (!ret)
+            ret = wret;
+    }
 
 out:
     filemap_invalidate_unlock(inode->i_mapping);
