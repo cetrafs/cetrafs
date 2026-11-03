@@ -529,6 +529,10 @@ static bool cetrafs_journal_ignore_torn;
 module_param_named(journal_ignore_torn, cetrafs_journal_ignore_torn, bool, 0644);
 MODULE_PARM_DESC(journal_ignore_torn, "test-only: refuse to redo a torn target (reproduces the 0.7.3 bug)");
 
+static bool cetrafs_journal_ignore_kind;
+module_param_named(journal_ignore_kind, cetrafs_journal_ignore_kind, bool, 0644);
+MODULE_PARM_DESC(journal_ignore_kind, "test-only: redo a 'torn' target even when it is no longer a block of the entry's kind");
+
 static u64 cetrafs_journal_header_lba(const struct cetrafs_journal *j, u64 slot)
 {
     return j->area_start + 1 + slot * CETRAFS_JOURNAL_SLOT_BLOCKS;
@@ -1053,6 +1057,7 @@ enum cetrafs_journal_verdict {
     CETRAFS_JV_TORN,            /* target fails its own tail checksum */
     CETRAFS_JV_LANDED,          /* target already holds the after-image */
     CETRAFS_JV_CHANGED,         /* a complete image that is neither: rewritten since */
+    CETRAFS_JV_REUSED,          /* not a block of the entry's kind at all: freed and reused */
     CETRAFS_JV_MOVING,          /* kept changing between verdict and redo */
 };
 
@@ -1061,8 +1066,29 @@ enum cetrafs_journal_verdict {
 #define CETRAFS_JOURNAL_TORN_RETRIES 8
 #define CETRAFS_JOURNAL_MOVED_RETRIES 3
 
+/*
+ * Is the target still a block of the entry's KIND? A guarded entry is
+ * only ever written for a block that was read and modified in place, so
+ * its before- and after-images carry the same tail magic, and a tear --
+ * old sectors and new ones -- leaves that magic in the tail sector
+ * whichever of the two it holds. A block whose tail magic is anything
+ * else was freed and reused (as file data, as zeroes after a discard, as
+ * another kind of metadata), and "fails its tail checksum" says nothing
+ * about a tear there: data has no tail at all. Judged TORN, it was
+ * overwritten with the dead node's metadata image -- a peer's file data
+ * replaced silently, and fsck has no checksum on data to notice.
+ */
+static bool cetrafs_journal_same_kind(const struct buffer_head *tbh, const struct buffer_head *pbh)
+{
+    const cetrafs_blk_tail_t *tt = (const cetrafs_blk_tail_t *) (tbh->b_data + CETRAFS_BLK_TAIL_OFF);
+    const cetrafs_blk_tail_t *pt = (const cetrafs_blk_tail_t *) (pbh->b_data + CETRAFS_BLK_TAIL_OFF);
+
+    return tt->magic == pt->magic;
+}
+
 static enum cetrafs_journal_verdict cetrafs_journal_judge(const struct cetrafs_journal_replay_entry *e,
                                                           const struct buffer_head *tbh,
+                                                          const struct buffer_head *pbh,
                                                           u32 tcrc)
 {
     if (cetrafs_journal_ignore_guard)
@@ -1073,8 +1099,11 @@ static enum cetrafs_journal_verdict cetrafs_journal_judge(const struct cetrafs_j
         return CETRAFS_JV_APPLY_UNGUARDED;
     if (tcrc == e->prev_checksum)
         return CETRAFS_JV_APPLY; /* the target write never landed */
-    if (!cetrafs_journal_ignore_torn && !cetrafs_journal_target_intact(tbh))
+    if (!cetrafs_journal_ignore_torn && !cetrafs_journal_target_intact(tbh)) {
+        if (!cetrafs_journal_ignore_kind && !cetrafs_journal_same_kind(tbh, pbh))
+            return CETRAFS_JV_REUSED;
         return CETRAFS_JV_TORN;
+    }
     return CETRAFS_JV_CHANGED;
 }
 
@@ -1308,7 +1337,7 @@ int cetrafs_journal_replay_node(struct super_block *sb, u32 node_id, bool wait_f
                     }
                 }
                 tcrc = ~crc32c(~0U, tbh->b_data, CETRAFS_BLOCK_SIZE);
-                v = cetrafs_journal_judge(&entries[s], tbh, tcrc);
+                v = cetrafs_journal_judge(&entries[s], tbh, pbh, tcrc);
 
                 /*
                  * TORN is a crash's tear -- or a LIVE writer's write in
@@ -1387,6 +1416,13 @@ int cetrafs_journal_replay_node(struct super_block *sb, u32 node_id, bool wait_f
                 break;
             case CETRAFS_JV_LANDED:
                 atomic64_inc(&cetrafs_journal_replay_skipped);
+                break;
+            case CETRAFS_JV_REUSED:
+                atomic64_inc(&cetrafs_journal_replay_refused);
+                pr_err("journal replay: node %u txn %llu target block %llu is no longer a block of the entry's "
+                       "kind -- freed and reused since; NOT applying the entry\n",
+                       node_id, (unsigned long long) entries[s].txn_id,
+                       (unsigned long long) entries[s].target_lba);
                 break;
             case CETRAFS_JV_MOVING:
                 atomic64_inc(&cetrafs_journal_replay_refused);
