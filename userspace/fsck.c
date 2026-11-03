@@ -713,7 +713,19 @@ static uint64_t fsck_lost_found(int fd,
      * regular file called lost+found is a fault of its own, not
      * somewhere to graft orphans. */
     fsck_read_inode(fd, sb, lf->root_ino, &root);
-    if (root.eh.eh_depth == 0) {
+    /*
+     * This tool reads and links only a depth-0 directory. A root that
+     * has spilled into an external leaf (more than 4 extents) used to
+     * skip the lookup, allocate a NEW lost+found -- an inode and a
+     * block -- and then fail to link it, leaking both on every -r run.
+     * Refuse before allocating anything; the orphans stay reported.
+     */
+    if (root.eh.eh_depth != 0) {
+        fprintf(stderr, "ERR: the root directory has spilled into an extent leaf; this fsck can neither find nor "
+                        "create /lost+found there -- orphans are reported, not relinked\n");
+        return 0;
+    }
+    {
         nblocks = fsck_dir_nblocks(&root, cetrafs_le64(sb->total_blocks));
         for (uint32_t n = 0; n < nblocks; ++n) {
             const cetrafs_dirent_t *de;
