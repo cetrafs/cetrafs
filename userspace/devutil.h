@@ -595,6 +595,12 @@ static inline int cetrafs_repair_renew(int fd, const cetrafs_superblock_t *sb, u
     memcpy(blk, &ne, sizeof(ne));
     if (pwrite(fd, blk, sizeof(blk), cetrafs_node_row_off(sb, row)) != (ssize_t) sizeof(blk))
         return -1;
+    /* A renewal is what a mounting node on another host watches for,
+     * and it reads the device: one left in our page cache until
+     * writeback (~30 s) is no renewal inside its probe window. Async
+     * -signal-safe, so it may run from the timer below. */
+    if (fdatasync(fd) != 0)
+        return -1;
     return 0;
 }
 
@@ -603,8 +609,8 @@ static inline int cetrafs_repair_renew(int fd, const cetrafs_superblock_t *sb, u
  * whatever phase the repair is in. Renewing from the work loops left
  * every other phase -- and the whole of growfs, which never renewed --
  * without a heartbeat, so a long one let the lease lapse mid-repair and
- * a node mount under it. pread/pwrite and the checksum are all the
- * handler does, which is safe in a signal handler; the row is written
+ * a node mount under it. pread/pwrite/fdatasync and the checksum are
+ * all the handler does, which is safe in a signal handler; the row is written
  * by nobody else while the timer runs. A renewal that finds the row
  * taken sets cetrafs_repair_lost for the work loop to stop on.
  */
