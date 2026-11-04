@@ -121,12 +121,17 @@ const cetrafs_superblock_t *cetrafs_sb_raw(struct super_block *sb);
  * region". The block about to be FREED was validated; the block about
  * to be WRITTEN was not.
  *
- * O(1) and no I/O, which is what lets it sit on the per-block mapping
- * path (docs/PERFORMANCE.md invariant 1) next to the generation compare
- * already there. Everything below bg_regions_start is a global table --
+ * No I/O, and O(1) on a never-grown volume, which is what lets it sit
+ * on the per-block mapping path (docs/PERFORMANCE.md invariant 1) next
+ * to the generation compare already there. Everything below bg_regions_start is a global table --
  * superblock, ZG and BG tables, inode bitmap, inode table, Node
  * Registry, journals, pending-free queues -- so one pair of comparisons
  * fences a file's blocks away from all of them.
+ *
+ * On a grown volume the box is [bg_regions_start, bg_data_end), and the
+ * Block Group table segments earlier grows left in holes inside it are
+ * refused by name (cetrafs_sb_lba_run_hits_bg_table(): a loop over the
+ * grows, zero iterations on a volume never grown).
  *
  * What it does NOT catch, stated rather than implied: a block inside
  * the BG regions but pointing at some OTHER BG's header or bitmap,
@@ -135,19 +140,29 @@ const cetrafs_superblock_t *cetrafs_sb_raw(struct super_block *sb);
  * cannot be afforded here. They damage one Block Group's bookkeeping,
  * not the whole volume, and fsck names them.
  */
+bool cetrafs_sb_lba_run_hits_bg_table(struct super_block *sb, u64 lba, u64 count);
 static inline bool cetrafs_lba_run_is_data(struct super_block *sb, u64 lba, u64 count)
 {
     const cetrafs_superblock_t *raw_sb = cetrafs_sb_raw(sb);
-    u64 lo, hi;
+    u64 lo, hi, data_end;
 
     if (!raw_sb)
         return false;
     lo = le64_to_cpu(raw_sb->bg_regions_start);
     hi = le64_to_cpu(raw_sb->total_blocks);
+    /* A grown volume's data area ends at bg_data_end; past it is the
+     * current reserve, holding the newest table segment. */
+    data_end = le64_to_cpu(raw_sb->bg_data_end);
+    if (data_end && data_end < hi)
+        hi = data_end;
 
     if (!count || count > hi)
         return false;
-    return lba >= lo && lba <= hi - count;
+    if (lba < lo || lba > hi - count)
+        return false;
+    /* And the holes earlier grows left inside it, which hold the older
+     * segments. */
+    return !cetrafs_sb_lba_run_hits_bg_table(sb, lba, count);
 }
 int cetrafs_sb_adjust_free_inodes(struct super_block *sb, s64 delta);
 int cetrafs_sb_get_free_inodes(struct super_block *sb, u64 *out);

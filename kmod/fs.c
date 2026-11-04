@@ -45,6 +45,10 @@ void cetrafs_sb_set_bg_owner(struct super_block *sb, u32 bg_id, u32 zg_id);
 void cetrafs_sb_owned_bgs(struct super_block *sb, const unsigned long **out_bits, u32 *out_nbits);
 
 /* ------ private superblock info kept in s_fs_info ------ */
+struct cetrafs_lba_range {
+    u64 start, end; /* [start, end) */
+};
+
 struct cetrafs_sb_info {
     u32 block_size;   /* bytes (expected 4096) */
     u64 total_blocks; /* from SB; sanity-checked against device */
@@ -414,6 +418,18 @@ struct cetrafs_sb_info {
      * 64 TiB volume, which buys an O(1) answer with no device read.
      */
     u64 *bg_desc_lba;
+
+    /*
+     * Every APPENDED Block Group table segment, [header, last
+     * descriptor], kept from the mount's chain walk. A grow puts each in
+     * a reserve past the data area, and the next grow leaves that
+     * reserve as a hole INSIDE [bg_regions_start, bg_data_end): live
+     * descriptors the address guard must refuse
+     * (cetrafs_sb_lba_run_hits_bg_table()). Empty on a never-grown
+     * volume; growing is offline, so it never changes while mounted.
+     */
+    struct cetrafs_lba_range *bg_segs;
+    u32 bg_nsegs;
 
     /*
      * BGs whose DATA BITMAP carries allocation bits this node has not
@@ -1481,9 +1497,7 @@ int cetrafs_fill_super(struct super_block *sb, struct fs_context *fc)
             /* Every appended segment's [header, last descriptor] run,
              * checked against the Block Groups once their descriptors
              * have been read (below). */
-            struct {
-                u64 start, end;
-            } *segs = NULL;
+            struct cetrafs_lba_range *segs = NULL;
             u32 nsegs = 0;
             {
                 u64 first = le64_to_cpu(ondisk->bg_table_first_count);
@@ -1706,7 +1720,8 @@ int cetrafs_fill_super(struct super_block *sb, struct fs_context *fc)
                 sbi->total_data_blocks += t;
                 sbi->bg_owner_zg[b] = (u16) owner;
             }
-            kfree(segs);
+            sbi->bg_segs = segs;
+            sbi->bg_nsegs = nsegs;
         }
 
         /* an earlier phase: allocate this mount's journal state. It
@@ -2267,6 +2282,7 @@ void cetrafs_free_sb_info(struct super_block *sb)
     cetrafs_dmpath_forget(sb->s_bdev); /* stop holding a path device open */
     kfree(sbi->raw_sb);
     kfree(sbi->bg_desc_lba);
+    kfree(sbi->bg_segs);
     /* The lease stays armed through the final flushes above -- the
      * heartbeat stopped first, so they are exactly the writes it must
      * bound. Disarm it only now, then wait out a fence it may have
@@ -2360,6 +2376,24 @@ bool cetrafs_sb_zg_pf_take_drops(struct super_block *sb, u32 zg_id, u64 *runs, u
 /* Exposes the exact on-disk superblock image to other files (inode.c) that
  * need its layout fields, without exposing the private cetrafs_sb_info
  * struct itself. */
+/*
+ * Does [lba, lba+count) touch an appended Block Group table segment?
+ * The half of cetrafs_lba_run_is_data() that needs the mount's chain
+ * walk. O(grows) with no I/O; zero iterations on a never-grown volume.
+ */
+bool cetrafs_sb_lba_run_hits_bg_table(struct super_block *sb, u64 lba, u64 count)
+{
+    struct cetrafs_sb_info *sbi = sb->s_fs_info;
+    u32 i;
+
+    if (!sbi)
+        return true;
+    for (i = 0; i < sbi->bg_nsegs; i++)
+        if (lba < sbi->bg_segs[i].end && sbi->bg_segs[i].start < lba + count)
+            return true;
+    return false;
+}
+
 const cetrafs_superblock_t *cetrafs_sb_raw(struct super_block *sb)
 {
     struct cetrafs_sb_info *sbi = sb->s_fs_info;

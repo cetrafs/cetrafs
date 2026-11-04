@@ -51,7 +51,7 @@ static void wr(int fd, const void *b, size_t n, off_t o)
 int main(int argc, char **argv)
 {
     if (argc != 4) {
-        fprintf(stderr, "usage: %s <backing-file> <ino> <phys-lba|inode_table|sb_table>\n", argv[0]);
+        fprintf(stderr, "usage: %s <backing-file> <ino> <phys-lba|inode_table|sb_table|bg_seg_first|bg_seg_tail|device_end>\n", argv[0]);
         fprintf(stderr, "       points inode <ino>'s inline extent 0 at that physical block\n");
         return 2;
     }
@@ -72,7 +72,33 @@ int main(int argc, char **argv)
         target = cetrafs_le64(sb.inode_table_start);
     else if (strcmp(argv[3], "sb_table") == 0)
         target = cetrafs_le64(sb.zg_table_start);
-    else
+    else if (strcmp(argv[3], "bg_seg_first") == 0 || strcmp(argv[3], "bg_seg_tail") == 0) {
+        /* An appended Block Group table segment's header (a grown
+         * volume): the FIRST one, which a second grow leaves in a hole
+         * INSIDE the data area, or the TAIL one, in the current reserve
+         * past bg_data_end. Live descriptors every node CASes. */
+        uint64_t cur = cetrafs_le64(sb.bg_table_next);
+        cetrafs_bg_segment_t seg;
+
+        if (!cur) {
+            fprintf(stderr, "the volume has no appended BG table segment -- it was never grown\n");
+            return 3;
+        }
+        target = cur;
+        if (strcmp(argv[3], "bg_seg_tail") == 0) {
+            for (int guard = 0; guard < 1024; guard++) {
+                rd(fd, &seg, sizeof(seg), (off_t) cur * cetrafs_le32(sb.block_size));
+                if (!cetrafs_le64(seg.next))
+                    break;
+                cur = cetrafs_le64(seg.next);
+            }
+            target = cur;
+        }
+    } else if (strcmp(argv[3], "device_end") == 0) {
+        /* The last block of the device: past bg_data_end on a grown
+         * volume, so no Block Group's data. */
+        target = cetrafs_le64(sb.total_blocks) - 1;
+    } else
         target = strtoull(argv[3], NULL, 0);
 
     if (!ino || ino > cetrafs_le32(sb.inodes_count)) {
