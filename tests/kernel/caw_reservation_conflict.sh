@@ -80,6 +80,7 @@ ct_mkfs_small "$A" >/dev/null
 log "1: a plain mount over this target uses real CAW"
 MARK="$(dmesg_mark)"
 ct_mount "$A" "$MNT"
+require_cetrafs_mount "$MNT"
 dmesg_since "$MARK" | grep -q "CAW: class=scsi .* max_caw_blocks=[1-9].* -> atomic CAS available" &&
     pass "1: setup: the LIO disk is mounted with atomic CAW" ||
     { fail "1: setup: CAW was not discovered: $(dmesg_since "$MARK" | grep 'CAW:' | tail -1)"; ct_exit; }

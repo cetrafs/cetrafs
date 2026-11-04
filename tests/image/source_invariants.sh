@@ -440,7 +440,10 @@ $fn|$func|$what"
         grep -qxF "$fn|$func|$what" <<<"$ASYNC_OK" || UNLISTED="$UNLISTED $fn:$func:$what"
     done < <(awk '
         /^[a-z].*\(/ && !/;$/ { match($0, /[a-z_0-9]+\(/); fname = substr($0, RSTART, RLENGTH - 1) }
-        /^\s*\*/ || /^\s*\/\*/ { next }
+        # POSIX classes, not a backslash-s: mawk, the default awk on Debian,
+        # has none, so comment lines were not skipped and a comment naming
+        # igrab() was reported as a call site on every box without gawk.
+        /^[[:space:]]*\*/ || /^[[:space:]]*\/\*/ { next }
         match($0, /(igrab|ihold|kthread_run|kthread_create|call_rcu|timer_setup|mod_timer|add_timer)\(/) {
             print fname "|" substr($0, RSTART, RLENGTH - 1)
         }' "$f")

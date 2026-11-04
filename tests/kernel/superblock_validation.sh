@@ -90,10 +90,11 @@ check inode_table_blocks 400000 "the inode table would extend past total_blocks"
 # CETRAFS_VERSION_MIN may itself be the token CETRAFS_VERSION, which is
 # what a closed window looks like in the source.
 hdrdef() { sed -n "s/^#define $1  *//p" "$ROOT/include/cetrafs.h" | head -1 | awk '{print $1}'; }
-FMT_CUR="$(awk -v v="$(hdrdef CETRAFS_VERSION)" 'BEGIN{print strtonum(v)}')"
+# Shell arithmetic, not awk's strtonum() (gawk-only; mawk aborted here).
+FMT_CUR="$(($(hdrdef CETRAFS_VERSION)))"
 FMT_MINTOK="$(hdrdef CETRAFS_VERSION_MIN)"
 [ "$FMT_MINTOK" = "CETRAFS_VERSION" ] && FMT_MINTOK="$(hdrdef CETRAFS_VERSION)"
-FMT_MIN="$(awk -v v="$FMT_MINTOK" 'BEGIN{print strtonum(v)}')"
+FMT_MIN="$((FMT_MINTOK))"
 [ "${FMT_MIN:-0}" -gt 0 ] && [ "${FMT_CUR:-0}" -ge "$FMT_MIN" ] ||
     fail "could not resolve the supported format range from include/cetrafs.h (got '$FMT_MIN'..'$FMT_CUR')"
 

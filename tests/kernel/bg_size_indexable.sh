@@ -26,8 +26,10 @@ SB_POKE="$(ct_helper sb_poke)"
 
 # The cap, read from the header rather than written out -- the number is
 # a property of the kernel's bitmap API, not of this test.
+# Shell arithmetic, not awk's strtonum() (gawk-only; mawk aborted here).
 MAXBLK="$(sed -n 's/^#define CETRAFS_MAX_BG_SIZE_BLOCKS  *//p' "$ROOT/include/cetrafs.h" | head -1 |
-    awk '{gsub(/ULL/,""); print strtonum($1)}')"
+    awk '{sub(/U?L?L$/, "", $1); print $1}')"
+MAXBLK="$((MAXBLK))"
 [ "${MAXBLK:-0}" -gt 0 ] || fail "could not read CETRAFS_MAX_BG_SIZE_BLOCKS"
 MAXMIB=$((MAXBLK / 256))   # blocks * 4096 / 1048576
 log "cap: $MAXBLK blocks per Block Group ($MAXMIB MiB)"

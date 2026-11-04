@@ -70,8 +70,10 @@ hdrdef() { sed -n "s/^#define $1  *//p" "$2" | head -1 | awk '{print $1}'; }
 CURFMT="$(hdrdef CETRAFS_VERSION "$ROOT/include/cetrafs.h")"
 MINTOK="$(hdrdef CETRAFS_VERSION_MIN "$ROOT/include/cetrafs.h")"
 [ "$MINTOK" = "CETRAFS_VERSION" ] && MINTOK="$CURFMT"
-MINVER="$(awk -v v="$MINTOK" 'BEGIN{print strtonum(v)}')"
-CURFMT="$(awk -v v="$CURFMT" 'BEGIN{print strtonum(v)}')"   # decimal, as the poke tool reports it
+# Shell arithmetic, not awk's strtonum(): that is gawk-only, and mawk (the
+# default awk on Debian) aborted the suite on it.
+MINVER="$((MINTOK))"
+CURFMT="$((CURFMT))"   # decimal, as the poke tool reports it
 [ "${MINVER:-0}" -gt 0 ] || fail "could not resolve CETRAFS_VERSION_MIN (read '$MINTOK')"
 
 # This tree's own version never counts as the previous release, however
@@ -82,8 +84,9 @@ CURVER="$(sed -n '1s/^cetrafs (\([^)]*\)).*/\1/p' "$ROOT/debian/changelog")"
 PREV=""
 for TAG in $(git -C "$ROOT" tag --sort=-v:refname 2>/dev/null | grep -v / | grep -vx "$CURVER"); do
     TAGVER="$(git -C "$ROOT" show "$TAG:include/cetrafs.h" 2>/dev/null |
-        sed -n 's/^#define CETRAFS_VERSION  *//p' | head -1 | awk '{print strtonum($1)}')"
+        sed -n 's/^#define CETRAFS_VERSION  *//p' | head -1 | awk '{print $1}')"
     [ -n "$TAGVER" ] || continue
+    TAGVER="$((TAGVER))"
     if [ "$TAGVER" = "$MINVER" ]; then
         PREV="$TAG"
         break
