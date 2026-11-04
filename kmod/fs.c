@@ -2614,6 +2614,14 @@ void cetrafs_sb_alloc_unlock(struct super_block *sb)
  * (cetrafs_file_seq_before()): a step back made a newer publish look
  * superseded and a needed refresh was declined. Anchored to the real
  * clock so a remount does not restart near values it handed out before.
+ *
+ * Monotonic per MOUNT only. Each mount re-anchors to the real clock, so
+ * a backward step between an unmount and the next mount -- larger than
+ * half the 48-bit wrap, ~1.6 days, for file_seq ordering to invert --
+ * puts new stamps behind old ones on the device. The ordering compare
+ * only ever runs against a note taken in the current mount, so that
+ * needs one of this mount's publishes to have been lost as well. Not
+ * guarded; nothing tests it.
  */
 u64 cetrafs_sb_stamp_ns(struct super_block *sb)
 {
