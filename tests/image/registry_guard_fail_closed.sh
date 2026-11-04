@@ -39,6 +39,7 @@ $SECT_START $SECT_COUNT error
 $((SECT_START + SECT_COUNT)) $((TOTAL - SECT_START - SECT_COUNT)) linear $DEV $((SECT_START + SECT_COUNT))
 EOF
 MDEV=/dev/mapper/$DM
+ct_track cmd "dmsetup remove --retry $DM 2>/dev/null"
 
 log "mkfs against a volume whose registry reads EIO"
 set +e
@@ -47,7 +48,11 @@ MK_RC=$?
 FS_OUT="$("$ROOT/userspace/fsck.cetra" "$MDEV" 2>&1)"
 FS_RC=$?
 set -e
-dmsetup remove "$DM"
+# udev is still probing the new mapper device when the tools close it:
+# a bare remove raced it and died EBUSY under set -e, before any
+# assertion ran.
+udevadm settle 2>/dev/null || true
+dmsetup remove --retry "$DM"
 
 [ "$MK_RC" = 3 ] && echo "$MK_OUT" | grep -q "cannot read its Node Registry" &&
     pass "mkfs refuses up front: cannot prove no peer is mounted (exit 3)" ||
