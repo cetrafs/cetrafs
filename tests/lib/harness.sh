@@ -672,6 +672,60 @@ ct_umount() { umount "$1"; }
 
 # The standard small test volume: one ZG, one 512 MiB BG, no journal,
 # 1024 inodes. Most suites want exactly this.
+# ct_lio_disks <image> <nexuses> -> one /dev/sdX per nexus, all over ONE
+# fileio backstore on <image>: a real SCSI target with COMPARE AND WRITE,
+# on any box with the LIO loopback fabric (tcm_loop). A loop device has
+# no CAW, so this is the only way a kernel suite reaches the real
+# primitive. Torn down by the harness after the unmounts. Returns 1 with
+# the reason on stderr when LIO is unavailable -- the caller skips.
+ct_lio_disks() {
+    local img="$1" n="$2" cf=/sys/kernel/config/target tag hba bs i t a d td
+    modprobe target_core_mod 2>/dev/null && modprobe target_core_file 2>/dev/null &&
+        modprobe tcm_loop 2>/dev/null || { echo "the LIO loopback target (tcm_loop) is not available" >&2; return 1; }
+    # The fabric registers when its directory is made; until something
+    # does, it is absent, and testing for it alone skipped everywhere.
+    mkdir -p "$cf/loopback" 2>/dev/null || true
+    [ -d "$cf/loopback" ] || { echo "configfs target/loopback is missing" >&2; return 1; }
+    tag="$(( ($$ * 131 + RANDOM) % 9000000 ))"
+    hba="$cf/core/fileio_$((7000 + tag % 1000))"
+    bs="$hba/ct$tag"
+    td="$(ct_tmp lio-teardown)"
+    {
+        for i in $(seq 1 "$n"); do
+            t="$cf/loopback/$(printf 'naa.5001405%07x%02x' "$tag" "$i")"
+            echo "rm -f '$t/tpgt_1/lun/lun_0/ct$tag'"
+            echo "rmdir '$t/tpgt_1/lun/lun_0' '$t/tpgt_1' '$t' 2>/dev/null"
+        done
+        echo "rmdir '$bs' '$hba' 2>/dev/null"
+        echo "[ ! -d '$bs' ]"
+    } >"$td"
+    ct_track cmd "bash $td"
+    mkdir -p "$bs"
+    echo "fd_dev_name=$img,fd_dev_size=$(stat -c %s "$img")" >"$bs/control"
+    echo "ct$tag" >"$bs/wwn/vpd_unit_serial" # without it LIO lists no VPD pages: no CAW
+    echo 1 >"$bs/enable"
+    for i in $(seq 1 "$n"); do
+        t="$cf/loopback/$(printf 'naa.5001405%07x%02x' "$tag" "$i")"
+        mkdir -p "$t/tpgt_1/lun/lun_0"
+        printf 'naa.5001405%07x%02x' "$tag" "$((i + 10))" >"$t/tpgt_1/nexus"
+        ln -s "$bs" "$t/tpgt_1/lun/lun_0/ct$tag"
+    done
+    for i in $(seq 1 "$n"); do
+        a="$(cat "$cf/loopback/$(printf 'naa.5001405%07x%02x' "$tag" "$i")/tpgt_1/address")"
+        d=""
+        for _ in $(seq 1 50); do
+            [ -d "/sys/class/scsi_device/$a:0/device/block" ] && { d="/dev/$(ls "/sys/class/scsi_device/$a:0/device/block")"; break; }
+            sleep 0.1
+        done
+        [ -n "$d" ] || { echo "nexus $i gave no disk" >&2; return 1; }
+        # The node appears before the disk finishes attaching; until
+        # then an open is ENXIO.
+        for _ in $(seq 1 50); do blockdev --getsize64 "$d" >/dev/null 2>&1 && break; sleep 0.1; done
+        echo "$d"
+    done
+    udevadm settle 2>/dev/null || true
+}
+
 ct_mkfs_small() { ct_mkfs "$1" -z 1 -b 512 -J 0 -N 1024 -f "${@:2}"; }
 
 # -------------------------------------------------------- preconditions

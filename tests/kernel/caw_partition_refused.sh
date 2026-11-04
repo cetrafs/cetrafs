@@ -9,8 +9,7 @@
 # wrong block of a shared LUN. The dm branch already refused a path with
 # an offset; the plain-SCSI branch did not.
 #
-# Staged on a real CAW target built on this host -- the LIO loopback
-# fabric over a fileio backstore, as caw_reservation_conflict.sh does.
+# Staged on a real CAW target built on this host (ct_lio_disks).
 # The whole disk must report CAW available (otherwise the partition
 # result proves nothing); its partition must report it unavailable, so
 # the volume falls under the one-mounter gate.
@@ -22,56 +21,18 @@ set -euo pipefail
 require_root
 require_module
 command -v sfdisk >/dev/null || { skip "sfdisk is missing"; ct_exit; }
-modprobe target_core_mod 2>/dev/null && modprobe target_core_file 2>/dev/null && modprobe tcm_loop 2>/dev/null ||
-    { skip "the LIO loopback target (tcm_loop) is not available"; ct_exit; }
-CF=/sys/kernel/config/target
-# The fabric registers when its directory is made; until something does,
-# it is absent. Testing for it alone made this suite skip on every box
-# where nothing else had created it.
-mkdir -p "$CF/loopback" 2>/dev/null || true
-[ -d "$CF/loopback" ] || { skip "configfs target/loopback is missing"; ct_exit; }
-
 IMG="$(ct_image 700 cawpart)"
 MNT="$(ct_mnt cawpart)"
-TAG="$$"
-HBA="$CF/core/fileio_$((7000 + TAG % 1000))"
-BS="$HBA/ctpt$TAG"
-NAA="$(printf 'naa.5001405%07x%02x' "$TAG" 1)"
-TEARDOWN="$(ct_tmp cawpart-teardown)"
-cat >"$TEARDOWN" <<EOT
-t="$CF/loopback/$NAA"
-rm -f "\$t/tpgt_1/lun/lun_0/ctpt$TAG"
-rmdir "\$t/tpgt_1/lun/lun_0" "\$t/tpgt_1" "\$t" 2>/dev/null
-rmdir "$BS" "$HBA" 2>/dev/null
-[ ! -d "$BS" ]
-EOT
-ct_track cmd "bash $TEARDOWN"
-
-mkdir -p "$BS"
-echo "fd_dev_name=$IMG,fd_dev_size=$((700 * 1024 * 1024))" >"$BS/control"
-echo "ctpt$TAG" >"$BS/wwn/vpd_unit_serial" # without it LIO lists no VPD pages: no CAW
-echo 1 >"$BS/enable"
-mkdir -p "$CF/loopback/$NAA/tpgt_1/lun/lun_0"
-printf 'naa.5001405%07x%02x' "$TAG" 11 >"$CF/loopback/$NAA/tpgt_1/nexus"
-ln -s "$BS" "$CF/loopback/$NAA/tpgt_1/lun/lun_0/ctpt$TAG"
-A="$(cat "$CF/loopback/$NAA/tpgt_1/address")"
-DISK=""
-for _ in $(seq 1 50); do
-    [ -d "/sys/class/scsi_device/$A:0/device/block" ] && { DISK="$(ls "/sys/class/scsi_device/$A:0/device/block")"; break; }
-    sleep 0.1
-done
-[ -n "$DISK" ] && [ -b "/dev/$DISK" ] || { fail "setup: the loopback nexus gave no disk"; ct_exit; }
-# The node appears before the disk finishes attaching; until then an
-# open is ENXIO.
-for _ in $(seq 1 50); do blockdev --getsize64 "/dev/$DISK" >/dev/null 2>&1 && break; sleep 0.1; done
-udevadm settle 2>/dev/null || true
+WHY="$(ct_tmp cawpart-why)"
+DISK="$(ct_lio_disks "$IMG" 1 2>"$WHY")" || { skip "$(cat "$WHY")"; ct_exit; }
+DISK="${DISK#/dev/}"
 ct_track mnt "$MNT"
 
 caw_line() { grep '^caw:' "$(ct_procdir "$1")/properties"; }
 
 # The whole disk first: it must drive CAW, or nothing below tells the
 # fix from a device without it.
-MO="$(ct_mkfs_small "/dev/$DISK" 2>&1)" || { fail "setup: mkfs "/dev/$DISK": $(tail -3 <<<"$MO")"; ct_exit; }
+MO="$(ct_mkfs_small "/dev/$DISK" 2>&1)" || { fail "setup: mkfs /dev/$DISK: $(tail -3 <<<"$MO")"; ct_exit; }
 ct_mount "/dev/$DISK" "$MNT"
 require_cetrafs_mount "$MNT"
 WHOLE="$(caw_line "/dev/$DISK")"
@@ -90,7 +51,7 @@ for _ in $(seq 1 50); do [ -b "$PART" ] && break; sleep 0.1; done
 [ "$(cat "/sys/class/block/${DISK}1/start")" -gt 0 ] ||
     { fail "setup: the partition starts at sector 0 -- an offset is what this is about"; ct_exit; }
 
-MO="$(ct_mkfs_small "$PART" 2>&1)" || { fail "setup: mkfs "$PART": $(tail -3 <<<"$MO")"; ct_exit; }
+MO="$(ct_mkfs_small "$PART" 2>&1)" || { fail "setup: mkfs $PART: $(tail -3 <<<"$MO")"; ct_exit; }
 MARK="$(dmesg_mark)"
 ct_mount "$PART" "$MNT"
 require_cetrafs_mount "$MNT"

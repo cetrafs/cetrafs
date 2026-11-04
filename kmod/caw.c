@@ -225,6 +225,13 @@ MODULE_PARM_DESC(caw_timeout_late_preread_once,
 
 /* TEST ONLY: the next CAW over a dm path executes and then reports a
  * failure with sense (a MEDIUM or HARDWARE ERROR after the write). */
+/* TEST ONLY: the next CAW on a plain SCSI device executes, then reports
+ * this sense key -- what a MEDIUM ERROR or ABORTED COMMAND after the
+ * write landed looks like. 0 = off. */
+static int cetrafs_caw_sense_landed_once;
+module_param_named(caw_sense_landed_once, cetrafs_caw_sense_landed_once, int, 0644);
+MODULE_PARM_DESC(caw_sense_landed_once, "TEST ONLY: next sd CAW executes, then reports this sense key");
+
 static bool cetrafs_caw_eio_landed_once;
 module_param_named(caw_eio_landed_once, cetrafs_caw_eio_landed_once, bool, 0644);
 MODULE_PARM_DESC(caw_eio_landed_once, "TEST ONLY: next CAW over a dm path executes, then reports -EIO");
@@ -344,7 +351,8 @@ struct scsi_device *cetrafs_caw_get_sdev(struct block_device *bdev)
 
 /* Issue one SCSI COMPARE AND WRITE. 'half' buffers are each
  * nblocks * logical_block_size bytes. Returns 0 on success, -EBUSY on
- * MISCOMPARE (another writer changed the region), -EIO on other failure. */
+ * MISCOMPARE (another writer changed the region), -EIO when the target
+ * says it did not execute, -ETIMEDOUT when nothing says that. */
 static int cetrafs_caw_scsi(struct scsi_device *sdev,
                             u64 lba,
                             unsigned int nblocks,
@@ -385,85 +393,94 @@ static int cetrafs_caw_scsi(struct scsi_device *sdev,
     /*
      * scsi_execute_cmd()'s own retry count stays 0 -- a MISCOMPARE must
      * surface to the caller, never be silently retried with the same
-     * (now-stale) compare image. The retries below are ours, and only
-     * for conditions where the target states the command was NOT
-     * executed:
+     * (now-stale) compare image. Every result is sorted by WHO says the
+     * command did not execute (BUG-CLASSES class 30):
      *
-     *  - UNIT ATTENTION: a one-shot notification, cleared by the act of
-     *    reporting it, and the command it aborted never ran. On a
-     *    two-node cluster these are routine rather than exceptional:
-     *    ASC 0x2A covers RESERVATIONS PREEMPTED / RESERVATIONS RELEASED
-     *    / REGISTRATIONS PREEMPTED, i.e. exactly what the OTHER node's
-     *    PR and CAW traffic generates ("sd 30:0:0:1: Parameters
-     *    changed" in dmesg). Treating one as -EIO failed a plain
-     *    create() with EIO on real two-node hardware.
-     *  - ABORTED COMMAND: the standard retryable transport error.
-     *
-     * Retrying is safe for CAW specifically because the command did not
-     * execute: the compare image is still the image we decided against,
-     * so a retry is the same atomic compare-and-swap, not a blind
-     * re-write. Anything else -- a real medium error, a reservation
-     * conflict -- still fails immediately.
+     *  - MISCOMPARE: the compare failed, nothing was written (-EBUSY).
+     *  - UNIT ATTENTION: SAM -- the command that receives one was not
+     *    processed. Routine on a two-node cluster (ASC 0x2A: the OTHER
+     *    node's PR and CAW traffic, "Parameters changed" in dmesg), so
+     *    it is retried here: the same compare image, the same atomic
+     *    swap, not a blind re-write.
+     *  - RESERVATION CONFLICT status, DATA PROTECT, and ILLEGAL REQUEST
+     *    against the CDB itself (ASC 0x20 opcode, 0x24 field in CDB):
+     *    refused before any medium access -- a definite -EIO.
+     *  - Anything else -- ABORTED COMMAND, MEDIUM ERROR, HARDWARE
+     *    ERROR, NOT READY, ILLEGAL REQUEST in the parameter data, no
+     *    sense at all: nothing promises the write did not happen. That
+     *    is UNKNOWN (-ETIMEDOUT), which cetrafs_cas_region_seeded_impl()
+     *    settles by reading the region back. ABORTED COMMAND used to be
+     *    retried here as "not executed"; if it had landed, the retry
+     *    MISCOMPAREd and the caller re-ran its mutator on its own
+     *    post-image -- a delta applied twice. The dm branch already read
+     *    these as unknown; this branch now agrees with it.
      */
     for (attempt = 0; attempt <= CETRAFS_CAW_RETRIES; attempt++) {
+        bool valid;
+
         memset(sense, 0, SCSI_SENSE_BUFFERSIZE);
         memset(&sshdr, 0, sizeof(sshdr));
 
-                if (lba >= 16512 && lba < 16520)
-            ctrace("CAWPATH lba=%llu via %s\n", (unsigned long long) lba,
-                    dev_name(&sdev->sdev_gendev));
         ret = scsi_execute_cmd(sdev, cdb, REQ_OP_DRV_OUT, buf, half * 2, CETRAFS_CAW_TIMEOUT_JIFFIES, 0, &args);
+        valid = scsi_sense_valid(&sshdr);
+        if (!ret && cetrafs_caw_sense_landed_once) {
+            /* TEST ONLY: it executed; report a sense key anyway. */
+            memset(&sshdr, 0, sizeof(sshdr));
+            sshdr.response_code = 0x70;
+            sshdr.sense_key = (u8) cetrafs_caw_sense_landed_once;
+            cetrafs_caw_sense_landed_once = 0;
+            pr_warn("CAW lba=%llu: TEST caw_sense_landed_once -- executed, reporting sense key 0x%x\n",
+                    (unsigned long long) lba, sshdr.sense_key);
+            ret = SAM_STAT_CHECK_CONDITION;
+            valid = true;
+        }
         if (!ret)
             break;
 
-        if (scsi_sense_valid(&sshdr)) {
+        if (valid) {
             if (sshdr.sense_key == MISCOMPARE) {
                 ret = -EBUSY;
                 break;
             }
-            if (sshdr.sense_key == UNIT_ATTENTION || sshdr.sense_key == ABORTED_COMMAND) {
+            if (sshdr.sense_key == UNIT_ATTENTION) {
                 if (attempt < CETRAFS_CAW_RETRIES) {
-                    pr_info_ratelimited("CAW lba=%llu retrying after sense key 0x%x asc=0x%02x ascq=0x%02x\n",
-                                        (unsigned long long) lba, sshdr.sense_key, sshdr.asc, sshdr.ascq);
+                    pr_info_ratelimited("CAW lba=%llu retrying after unit attention asc=0x%02x ascq=0x%02x\n",
+                                        (unsigned long long) lba, sshdr.asc, sshdr.ascq);
                     continue;
                 }
-                pr_err("CAW lba=%llu still failing after %d retries (sense key 0x%x asc=0x%02x ascq=0x%02x)\n",
-                       (unsigned long long) lba, CETRAFS_CAW_RETRIES, sshdr.sense_key, sshdr.asc, sshdr.ascq);
-            } else {
-                /* Anything else -- RESERVATION CONFLICT, a medium
-                 * error, ILLEGAL REQUEST -- is fatal to this swap. Say
-                 * what the target actually reported: without this the
-                 * caller sees a bare -EIO (which surfaces as EIO from an
-                 * ordinary create()) and there is nothing anywhere to
-                 * debug it from. */
-                pr_err_ratelimited("CAW lba=%llu failed: sense key 0x%x asc=0x%02x ascq=0x%02x\n",
-                                   (unsigned long long) lba, sshdr.sense_key, sshdr.asc, sshdr.ascq);
+                pr_err("CAW lba=%llu still failing after %d retries (unit attention asc=0x%02x ascq=0x%02x)\n",
+                       (unsigned long long) lba, CETRAFS_CAW_RETRIES, sshdr.asc, sshdr.ascq);
+                ret = -EIO;
+                break;
             }
-        } else if (ret > 0 && (ret & 0xff) == SAM_STAT_RESERVATION_CONFLICT) {
-            /* A STATUS, not sense data, so it used to land in the
-             * no-sense branch below and be reported as an UNKNOWN
-             * outcome. It is the opposite: the target refused the
-             * command without executing it (SAM), so the swap did not
-             * happen -- a definite failure, which the layers above may
-             * act on as one. */
-            pr_err_ratelimited("CAW lba=%llu refused: RESERVATION CONFLICT (not executed)\n",
-                               (unsigned long long) lba);
-        } else {
-            /*
-             * No valid sense: the target never answered. A timeout says
-             * the HOST stopped waiting, not that the command was not
-             * executed -- the swap may well have landed. Report that
-             * ambiguity as its own thing instead of folding it into
-             * -EIO, which the layers above read as "definitely did not
-             * happen" and used to resolve by simply issuing it again.
-             */
-            pr_err_ratelimited("CAW lba=%llu failed with no valid sense (scsi_execute_cmd returned %d) -- "
-                               "outcome UNKNOWN\n",
-                               (unsigned long long) lba, ret);
+            if (sshdr.sense_key == DATA_PROTECT ||
+                (sshdr.sense_key == ILLEGAL_REQUEST && (sshdr.asc == 0x20 || sshdr.asc == 0x24))) {
+                pr_err_ratelimited("CAW lba=%llu refused (not executed): sense key 0x%x asc=0x%02x ascq=0x%02x\n",
+                                   (unsigned long long) lba, sshdr.sense_key, sshdr.asc, sshdr.ascq);
+                ret = -EIO;
+                break;
+            }
+            /* Say what the target actually reported: without this there
+             * is nothing anywhere to debug a failed swap from. */
+            pr_err_ratelimited("CAW lba=%llu failed: sense key 0x%x asc=0x%02x ascq=0x%02x -- outcome UNKNOWN\n",
+                               (unsigned long long) lba, sshdr.sense_key, sshdr.asc, sshdr.ascq);
             ret = -ETIMEDOUT;
             break;
         }
-        ret = -EIO;
+        if (ret > 0 && (ret & 0xff) == SAM_STAT_RESERVATION_CONFLICT) {
+            /* A STATUS, not sense data: the target refused the command
+             * without executing it (SAM) -- a definite failure. */
+            pr_err_ratelimited("CAW lba=%llu refused: RESERVATION CONFLICT (not executed)\n",
+                               (unsigned long long) lba);
+            ret = -EIO;
+            break;
+        }
+        /* No valid sense: the target never answered. A timeout says the
+         * HOST stopped waiting, not that the command was not executed. */
+        pr_err_ratelimited("CAW lba=%llu failed with no valid sense (scsi_execute_cmd returned %d) -- "
+                           "outcome UNKNOWN\n",
+                           (unsigned long long) lba, ret);
+        ret = -ETIMEDOUT;
         break;
     }
 
@@ -1571,8 +1588,13 @@ void cetrafs_cas_selftest(struct super_block *sb, u32 my_node_id)
         u8 base = 0x10;
         unsigned int phase;
 
-        static const char *const whats[] = {"lost", "landed", "landed late", "-EIO after landing",
-                                            "landed before the re-read"};
+        static const char *const whats[] = {"lost",
+                                            "landed",
+                                            "landed late",
+                                            "-EIO after landing",
+                                            "landed before the re-read",
+                                            "MEDIUM ERROR after landing",
+                                            "ABORTED COMMAND after landing"};
 
         for (phase = 0; phase < ARRAY_SIZE(whats); phase++) {
             const char *what = whats[phase];
@@ -1590,18 +1612,21 @@ void cetrafs_cas_selftest(struct super_block *sb, u32 my_node_id)
             cetrafs_caw_timeout_late_once = phase == 2;
             cetrafs_caw_eio_landed_once = phase == 3;
             cetrafs_caw_timeout_late_preread_once = phase == 4;
+            cetrafs_caw_sense_landed_once = phase == 5 ? MEDIUM_ERROR : phase == 6 ? ABORTED_COMMAND : 0;
 
             ret = cetrafs_cas_record(sb, lba, cetrafs_cas_selftest_inc, NULL);
             /* The -EIO knob only fires on a dm path; say so rather than
              * report a case that never ran as passed. */
-            fired = !cetrafs_caw_eio_landed_once;
+            fired = !cetrafs_caw_eio_landed_once && !cetrafs_caw_sense_landed_once;
             cetrafs_caw_timeout_landed_once = false;
             cetrafs_caw_timeout_lost_once = false;
             cetrafs_caw_timeout_late_once = false;
             cetrafs_caw_eio_landed_once = false;
             cetrafs_caw_timeout_late_preread_once = false;
+            cetrafs_caw_sense_landed_once = 0;
             if (!fired) {
-                pr_info("CAS selftest: the %s case needs a dm path -- not exercised here\n", what);
+                pr_info("CAS selftest: the %s case needs a %s path -- not exercised here\n", what,
+                        phase == 3 ? "dm" : "SCSI");
                 continue;
             }
 
