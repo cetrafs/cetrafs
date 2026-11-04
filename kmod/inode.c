@@ -1742,6 +1742,34 @@ static unsigned int cetrafs_apply_refresh_stall_ms;
 module_param_named(apply_refresh_stall_ms, cetrafs_apply_refresh_stall_ms, uint, 0644);
 MODULE_PARM_DESC(apply_refresh_stall_ms, "TEST ONLY: widen a refresh's dirty-check-to-store window");
 
+/*
+ * Does this node hold state for the inode that the device does not have
+ * yet? An extent shadow not yet published, or a file-domain stat field
+ * that differs from the baseline -- the record as this node last read
+ * or stamped it. No baseline means no answer, which counts as yes.
+ *
+ * The fields are exactly the ones writeback's own "nothing to publish"
+ * test compares (cetrafs_write_vfs_inode()): size, blocks, atime and
+ * mtime are what a dirty inode can carry unpublished. The namespace
+ * fields are not deferred -- chmod, chown and link-count changes write
+ * their sector before they return -- and the baseline is installed from
+ * the file-sector image, where they read as zero.
+ *
+ * Called with inode_lock and invalidate_lock held, which every local
+ * writer of these fields holds too.
+ */
+static bool cetrafs_inode_has_unpublished_state(struct inode *inode)
+{
+    struct cetrafs_stat_baseline b;
+
+    if (cetrafs_inode_fd_dirty(inode))
+        return true;
+    if (!cetrafs_inode_stat_baseline_get(inode, &b))
+        return true;
+    return b.size != (u64) i_size_read(inode) || b.blocks != (u64) inode->i_blocks ||
+           b.atime != (u64) inode_get_atime_sec(inode) || b.mtime != (u64) inode_get_mtime_sec(inode);
+}
+
 int cetrafs_apply_raw_to_vfs_inode(struct inode *inode, const cetrafs_inode_t *raw)
 {
     int ret;
@@ -1847,6 +1875,20 @@ int cetrafs_apply_raw_to_vfs_inode(struct inode *inode, const cetrafs_inode_t *r
     spin_lock(&inode->i_lock);
     dirty = (inode_state_read(inode) & I_DIRTY_ALL) != 0;
     spin_unlock(&inode->i_lock);
+    /*
+     * The VFS dirty flag alone over-answers. Close publishes the record
+     * through a CAS of its own and leaves the flag set until writeback's
+     * ->write_inode runs, ~30 s later -- so a peer that opened, extended
+     * and closed inside that window was declined here, silently, and
+     * this node reopened holding its own old i_size and cached tree. An
+     * append then landed at the stale end of file over the peer's data
+     * (tests/kernel/refresh_after_own_close.sh). What the guard is for is
+     * state this node has NOT published: an extent shadow still staged,
+     * or a stat field that differs from what this node last saw on the
+     * device or put there (the stat baseline).
+     */
+    if (dirty && !cetrafs_inode_has_unpublished_state(inode))
+        dirty = false;
     if (dirty) {
         up_write(&inode->i_mapping->invalidate_lock);
         inode_unlock(inode);
