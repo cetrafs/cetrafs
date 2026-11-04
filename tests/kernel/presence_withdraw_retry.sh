@@ -18,8 +18,12 @@
 # Round C: the retry must leave a bit a new local opener needs -- the
 # destructive direction, which would let a peer delete the file under it.
 #
+# Round D: round A on a read-only mount, whose maintenance pass used to
+# return before the retry.
+#
 # DISCRIMINATION: without the deferral (cetrafs_lock_presence_withdraw()
-# only logging) both bits are still set 15 s on.
+# only logging) both bits are still set 15 s on; without the read-only
+# retry, round D's is.
 set -euo pipefail
 . "$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)/lib/harness.sh"
 require_root
@@ -97,6 +101,24 @@ knob_spent || fail "C: setup: the first close's withdraw was not the one that fa
 [ "$RES" = "readers=0x1" ] && pass "C: the retry left the bit of a file opened again ($RES throughout)" ||
     fail "C: while the file was open again the bit read: $RES -- the retry withdrew presence a local opener needed"
 wait_clear c C
+
+# --- D: a read-only mount. It publishes presence on every read-open, so
+# it owes the same retry -- but its maintenance pass returned at once,
+# and nothing else runs the retry there.
+echo d >"$MNT/d"; sync
+ct_umount "$MNT"
+mount -t cetrafs -o ro "$DEV" "$MNT"
+require_cetrafs_mount "$MNT"
+python3 - "$MNT/d" <<'PY'
+import os, sys
+fd = os.open(sys.argv[1], os.O_RDONLY)
+open("/sys/module/cetrafs/parameters/presence_withdraw_fail", "w").write("1")
+os.close(fd)
+PY
+knob_spent || fail "D: setup: the read-only close's withdraw was not the one that failed"
+log "D: after the failed withdraw: $(dump d)"
+dump d | grep -q 'readers=0x0$' && fail "D: setup: the bit was not left set by the failed withdraw"
+wait_clear d "D (read-only mount)"
 
 ct_umount "$MNT"
 ct_exit

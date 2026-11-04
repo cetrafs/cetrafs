@@ -221,17 +221,9 @@ static void cetrafs_heartbeat_tick(struct work_struct *work)
     if (ret)
         pr_warn("heartbeat: failed to renew our own row: %d\n", ret);
 
-    /* Everything past the renewal WRITES to shared state: it claims and
-     * releases Zone Groups, applies peers' queued frees to their
-     * bitmaps, and replays dead peers' journals into their data
-     * regions. A read-only mount does none of it -- it renews its own
-     * registry row (so peers see it as alive and honour the read-
-     * presence bits it publishes) and nothing else. */
-    if (sb_rdonly(sb))
-        goto reschedule;
-
     /* The heavy half runs as its OWN work item -- see
-     * cetrafs_heartbeat_maint(). */
+     * cetrafs_heartbeat_maint(). A read-only mount queues it too, for
+     * the one retry it owes: see there. */
     queue_delayed_work(system_long_wq, &hb->maint, 0);
 
 reschedule:
@@ -263,8 +255,22 @@ static void cetrafs_heartbeat_maint(struct work_struct *work)
     /* Re-checked here, not inherited from the renewal that queued us:
      * a peer may have fenced us in between, and these are all writes we
      * would no longer have any right to make. */
-    if (cetrafs_sb_is_fenced(sb) || sb_rdonly(sb))
+    if (cetrafs_sb_is_fenced(sb))
         return;
+
+    /* Everything below WRITES to shared state: it claims and releases
+     * Zone Groups, applies peers' queued frees to their bitmaps, and
+     * replays dead peers' journals into their data regions. A read-only
+     * mount does none of it. It does publish read-presence bits, though
+     * -- that is what stops a peer destroying a file it is reading --
+     * and a withdraw that failed is cleared by nobody else while this
+     * node beats: every peer write-open, unlink and truncate of that file
+     * got ETXTBSY for the life of the observer mount. So that retry, and
+     * nothing else. */
+    if (sb_rdonly(sb)) {
+        cetrafs_lock_retry_presence(sb);
+        return;
+    }
 
     if (cetrafs_sb_get_node_id(sb, &my_node_id))
         return;
