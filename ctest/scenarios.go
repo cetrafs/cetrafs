@@ -5384,6 +5384,34 @@ func RunReplayRace(clients []*Client, baseDir string) (bool, error) {
 	// Checked on all three, the revived node included: the damage was
 	// found by a node that had not taken part in the replay at all, and
 	// a check that only asked the survivors would have missed it.
+	//
+	// The revived node fenced itself when its lease ran out, and a fenced
+	// mount refuses reads as well as writes (its view of the device can
+	// no longer be trusted), so it reads only after rejoining by remount
+	// -- which also makes its read come from the device, not its cache.
+	fenced := false
+	for i := 0; i < 60 && !fenced; i++ {
+		var s ProcSnapshotResult
+		resp, err := c.Call("proc_snapshot", ProcSnapshotArgs{Device: c.Device})
+		if decodeResult(c.Name, resp, err, &s) == nil && s.Fenced {
+			fenced = true
+		} else {
+			time.Sleep(time.Second)
+		}
+	}
+	check(&ok, fmt.Sprintf("%s fenced itself while it was gone", c.Name), fenced,
+		"a node whose lease ran out went on as if it still held the file")
+	if heldHandle != 0 {
+		if _, err := c.Call("close", CloseArgs{Handle: heldHandle}); err == nil {
+			heldHandle = 0
+		}
+	}
+	if resp, err := c.Call("unmount", UnmountArgs{}); decodeResult(c.Name, resp, err, nil) != nil {
+		return false, fmt.Errorf("%s could not unmount after fencing", c.Name)
+	}
+	if resp, err := c.Call("mount", MountArgs{}); decodeResult(c.Name, resp, err, nil) != nil {
+		return false, fmt.Errorf("%s could not remount after fencing", c.Name)
+	}
 	for _, cl := range []*Client{a, b, c} {
 		var rd ReaddirResult
 		resp, err := cl.Call("readdir", ReaddirArgs{Path: dir})
