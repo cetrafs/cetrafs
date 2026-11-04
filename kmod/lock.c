@@ -184,15 +184,20 @@ struct cetrafs_inode_info {
      * the extent the previous lookup just resolved, so remembering one
      * extent answers them with no walk at all.
      *
-     * KEYED ON THE RECORD IT CAME FROM (depth, entries, blocks). Every
-     * caller of cetrafs_tree_lookup() passes a freshly-read record, so
-     * a mutation that changed the map -- an append, a split, a truncate,
-     * a punch -- changes the key and the entry simply misses. That is
-     * what makes this safe WITHOUT having to find and annotate every
-     * writer: there is no "did someone forget to invalidate" to get
-     * wrong. The one mutation that can leave all three identical is a
-     * relocation (defrag) that moves an extent without changing its
-     * length, and that drops the entry explicitly.
+     * KEYED ON THE RECORD IT CAME FROM: file_seq, depth, entries,
+     * blocks. Every caller of cetrafs_tree_lookup() passes a freshly-read
+     * record (overlaid with the shadow, which carries the file_seq it was
+     * staged from), so a mutation that changed the map changes the key
+     * and the entry simply misses. The counts alone were not enough:
+     * they RECUR -- for a spilled tree the root entry count barely moves,
+     * so a punch of k blocks and a later allocation of k brought the key
+     * back over a different map, and safety rested on every rewrite
+     * dropping the entry inside its exclusion. file_seq is restamped by
+     * every publish -- punch, truncate, a defrag relocation -- and never
+     * returns, so an entry from before a publish misses forever after
+     * it whatever the drops do (rule 10: a change stamp, not a summary).
+     * The drops stay, for the shadow-only changes between publishes,
+     * which only append and convert uninit to init (never cached).
      *
      * Only consulted while cetrafs_lock_held_for_write_locally() holds
      * -- the same predicate that decides a CACHED leaf block may be
@@ -205,6 +210,7 @@ struct cetrafs_inode_info {
     u16 ext_key_depth;
     u16 ext_key_entries;
     u64 ext_key_blocks;
+    u64 ext_key_seq; /* the record's file_seq: the change stamp */
     u32 ext_block; /* first file-relative block the extent covers */
     u32 ext_len;   /* how many blocks it covers */
     u64 ext_lba;   /* device block ext_block lives at */
@@ -587,7 +593,7 @@ u64 cetrafs_ext_cache_miss_count(void)
  * why these three, and for the one mutation they cannot catch. */
 static bool cetrafs_ext_key_matches(const struct cetrafs_inode_info *ci, const cetrafs_inode_t *raw)
 {
-    return ci->ext_key_depth == cetrafs_le16(raw->eh.eh_depth) &&
+    return ci->ext_key_seq == cetrafs_le64(raw->file_seq) && ci->ext_key_depth == cetrafs_le16(raw->eh.eh_depth) &&
            ci->ext_key_entries == cetrafs_le16(raw->eh.eh_entries) && ci->ext_key_blocks == cetrafs_le64(raw->blocks);
 }
 
@@ -645,6 +651,7 @@ void cetrafs_inode_ext_cache_store(struct inode *inode,
     ci->ext_key_depth = cetrafs_le16(raw->eh.eh_depth);
     ci->ext_key_entries = cetrafs_le16(raw->eh.eh_entries);
     ci->ext_key_blocks = cetrafs_le64(raw->blocks);
+    ci->ext_key_seq = cetrafs_le64(raw->file_seq);
     ci->ext_block = ext_block;
     ci->ext_len = ext_len;
     ci->ext_lba = ext_lba;
@@ -656,18 +663,23 @@ void cetrafs_inode_ext_cache_store(struct inode *inode,
 /*
  * Forget it.
  *
- * The key catches every mutation that changes depth, entry count or
- * block count. A RELOCATION changes none of them -- same extent, same
- * length, different device blocks -- so defrag drops the entry by hand,
- * and so does the open-time handoff that drops the cached tree blocks
- * this entry was derived from.
+ * The key (file_seq above all) catches every mutation that publishes,
+ * a relocation included; the drops cover what changes between
+ * publishes, and the open-time handoff that drops the cached tree
+ * blocks this entry was derived from.
  */
+/* TEST ONLY: make every drop a no-op, so the key is the sole guard
+ * (tests/kernel/ext_cache_punch_refill.sh). */
+static bool cetrafs_ext_cache_skip_drop;
+module_param_named(ext_cache_skip_drop, cetrafs_ext_cache_skip_drop, bool, 0644);
+MODULE_PARM_DESC(ext_cache_skip_drop, "TEST ONLY: extent-cache drops do nothing; the key alone must catch a change");
+
 void cetrafs_inode_ext_cache_drop(struct inode *inode)
 {
     struct cetrafs_inode_info *ci = CETRAFS_I(inode);
 
-    if (cetrafs_ext_cache_trust_stale)
-        return; /* test-only, see the knob */
+    if (cetrafs_ext_cache_trust_stale || cetrafs_ext_cache_skip_drop)
+        return; /* test-only, see the knobs */
 
     spin_lock(&ci->resv_lock);
     ci->ext_valid = false;
