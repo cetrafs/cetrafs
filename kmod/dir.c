@@ -2517,6 +2517,51 @@ static bool cetrafs_rename_name_fail_once;
 module_param_named(rename_name_fail_once, cetrafs_rename_name_fail_once, bool, 0644);
 MODULE_PARM_DESC(rename_name_fail_once, "TEST ONLY: the next rename's new-name write fails with -EIO");
 
+/* TEST ONLY: fail the next N link-count swaps of a rename (the replaced
+ * target's -1, the moved file's final -1) with -EIO, as a device refusal
+ * would (tests/kernel/rename_nlink_fail.sh). */
+static unsigned int cetrafs_rename_nlink_fail;
+module_param_named(rename_nlink_fail, cetrafs_rename_nlink_fail, uint, 0644);
+MODULE_PARM_DESC(rename_nlink_fail, "TEST ONLY: fail the next N rename link-count swaps with -EIO");
+
+/*
+ * A rename's link-count swap on a record whose NAME has already moved:
+ * nothing can be undone by then, and the rename has happened. A count
+ * left one high is the safe direction -- evict reads the device and
+ * frees nothing -- but the inode is then unreachable and keeps its
+ * blocks, and the scrub reclaims only nlink 0, so it is a leak until
+ * fsck. A failure used to be dropped without a word, and its error lost
+ * in a 'ret' the next step overwrote. So: retry a refused swap from a
+ * fresh read (a definite refusal did not apply; an undecidable one has
+ * already stopped the mount in caw.c), and say plainly what is left if
+ * it still does not land. The moved file's own final -1 has the same
+ * shape: it keeps its name, but its last unlink then frees nothing. Returns the swap's result; 'd->out_nlink' is
+ * valid on 0.
+ */
+static int cetrafs_rename_ns_delta(struct super_block *sb, u64 ino, struct cetrafs_ns_delta *d, const char *what)
+{
+    cetrafs_inode_t raw;
+    int ret = -EIO, attempt;
+
+    for (attempt = 0; attempt < 3; attempt++) {
+        cetrafs_invalidate_raw_inode(sb, ino);
+        ret = cetrafs_read_raw_inode(sb, ino, &raw);
+        if (!ret && READ_ONCE(cetrafs_rename_nlink_fail)) {
+            WRITE_ONCE(cetrafs_rename_nlink_fail, cetrafs_rename_nlink_fail - 1);
+            ret = -EIO;
+        } else if (!ret) {
+            ret = cetrafs_inode_ns_cas(sb, ino, cetrafs_le64(raw.generation), &raw, cetrafs_ns_apply_delta, d);
+        }
+        if (!ret || ret == -ESTALE || ret == -EUCLEAN || cetrafs_sb_is_fenced(sb))
+            break;
+    }
+    if (ret && d->nlink_delta)
+        pr_err("rename: %s ino=%llu kept a link count one too high (%d) -- it will not be freed when its last name "
+               "goes; fsck -r corrects the count\n",
+               what, (unsigned long long) ino, ret);
+    return ret;
+}
+
 static int cetrafs_rename_dotdot(struct inode *dir, u64 parent_ino)
 {
     if (cetrafs_rename_dotdot_fail_once) {
@@ -2857,11 +2902,7 @@ static int cetrafs_rename_locked(struct mnt_idmap *idmap,
         } else {
             struct cetrafs_ns_delta d = {.nlink_delta = -1, .ctime = (u64) now};
 
-            cetrafs_invalidate_raw_inode(new_dir->i_sb, removed_ino);
-            ret = cetrafs_read_raw_inode(new_dir->i_sb, removed_ino, &raw);
-            if (!ret)
-                ret = cetrafs_inode_ns_cas(new_dir->i_sb, removed_ino, cetrafs_le64(raw.generation), &raw,
-                                           cetrafs_ns_apply_delta, &d);
+            ret = cetrafs_rename_ns_delta(new_dir->i_sb, removed_ino, &d, "replaced file");
             /* In-core absolute from the value the swap landed, not a
              * relative drop off a possibly stale cached count --
              * evict_inode() gates the free on the replaced target's
@@ -2897,25 +2938,19 @@ static int cetrafs_rename_locked(struct mnt_idmap *idmap,
      * out (inode_set_ctime() does not dirty the inode), so the on-disk
      * value never moved. Same omission N6 found in unlink. */
     {
-        cetrafs_inode_t oraw;
-
         /* The moved inode's on-disk ctime, by namespace-sector CAS: it
          * cannot touch the file sector, so renaming a file a peer is
          * actively WRITING is safe again (v0x0005) -- the old blind
          * whole-record rewrite here had to be skipped under a foreign
-         * opener to avoid racing its deferred record state. */
-        cetrafs_invalidate_raw_inode(old_dir->i_sb, old_ino);
-        if (!cetrafs_read_raw_inode(old_dir->i_sb, old_ino, &oraw)) {
-            /* ...carrying the -1 that matches the +1 above, now that
-             * the old name is gone. If it does not land the count stays
-             * one high: a leak, never a free. */
-            struct cetrafs_ns_delta d = {.ctime = (u64) now, .nlink_delta = counted ? -1 : 0};
+         * opener to avoid racing its deferred record state.
+         *
+         * ...carrying the -1 that matches the +1 above, now that the old
+         * name is gone. If it does not land the count stays one high: a
+         * leak, never a free -- and said so (cetrafs_rename_ns_delta()). */
+        struct cetrafs_ns_delta d = {.ctime = (u64) now, .nlink_delta = counted ? -1 : 0};
 
-            if (!cetrafs_inode_ns_cas(old_dir->i_sb, old_ino, cetrafs_le64(oraw.generation), &oraw,
-                                      cetrafs_ns_apply_delta, &d) &&
-                counted)
-                set_nlink(old_inode, d.out_nlink);
-        }
+        if (!cetrafs_rename_ns_delta(old_dir->i_sb, old_ino, &d, "moved file") && counted)
+            set_nlink(old_inode, d.out_nlink);
     }
     inode_set_ctime(old_inode, now, 0);
     ret = 0;
