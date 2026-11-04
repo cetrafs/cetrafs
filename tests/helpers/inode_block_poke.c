@@ -106,6 +106,7 @@ int main(int argc, char **argv)
         fprintf(stderr, "       %s <backing-file> dirtytail <ino>      (garbage past the record)\n", argv[0]);
         fprintf(stderr, "       %s <backing-file> tailzero <ino>       (prints yes/no)\n", argv[0]);
         fprintf(stderr, "       %s <backing-file> peerseq <ino> <node> (file_seq as a peer's publish)\n", argv[0]);
+        fprintf(stderr, "       %s <backing-file> seq <ino> (print file_seq and its node)\n", argv[0]);
         fprintf(stderr, "       %s <backing-file> extset <ino> <i> block|len|uninit <v> (inline extent i's logical field)\n",
                 argv[0]);
         fprintf(stderr, "       %s <backing-file> ehset <ino> magic|entries|depth <v> (the inline extent header)\n",
@@ -541,6 +542,13 @@ int main(int argc, char **argv)
         cetrafs_inode_stamp_crcs_us(&rec); /* v0x0005 */
         pwrite_all(fd, &rec, sizeof(rec), rec_off);
         fprintf(stderr, "inode_block_poke: ino %llu size -> %llu\n", (unsigned long long) ino, sz);
+    } else if (strcmp(mode, "seq") == 0) {
+        /* Print the record's file_seq, and the node that stamped it. */
+        cetrafs_inode_t rec;
+
+        pread_all(fd, &rec, sizeof(rec), rec_off);
+        printf("%llx %u\n", (unsigned long long) cetrafs_le64(rec.file_seq),
+               (unsigned) CETRAFS_FILE_SEQ_NODE(cetrafs_le64(rec.file_seq)));
     } else if (strcmp(mode, "size") == 0) {
         cetrafs_inode_t rec;
 

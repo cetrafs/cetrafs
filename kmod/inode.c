@@ -1211,7 +1211,18 @@ struct cetrafs_vfs_stat_cas_ctx {
      * these, never from inside the CAS. Index: CETRAFS_FD_F_*. */
     u64 ours[4];
     u64 merged[4];
+    u32 me;
+    /* The image the swap landed on carried another node's stamp this
+     * node had never seen -- see the end of the mutator. */
+    bool overstamped;
+    u64 overstamped_seq;
 };
+
+/* TEST ONLY: a stat publish forgets the peer stamp it overwrote (the
+ * pre-fix behaviour). tests/kernel/stat_publish_peer_stamp.sh. */
+static bool cetrafs_stat_publish_ignore_overstamp;
+module_param_named(stat_publish_ignore_overstamp, cetrafs_stat_publish_ignore_overstamp, bool, 0644);
+MODULE_PARM_DESC(stat_publish_ignore_overstamp, "TEST ONLY: a stat publish forgets the peer stamp it overwrote");
 
 enum { CETRAFS_FD_F_SIZE, CETRAFS_FD_F_BLOCKS, CETRAFS_FD_F_ATIME, CETRAFS_FD_F_MTIME };
 
@@ -1314,6 +1325,22 @@ static int cetrafs_vfs_stat_cas_mutate(void *image, unsigned int len, void *priv
      * smoke test of the split). */
     rec.ino = ctx->ino_le;
     rec.generation = cetrafs_cpu_to_le64(ctx->generation);
+    /* The restamp below replaces whatever stamp the device carries with
+     * this node's. If that was ANOTHER node's, and not one this node
+     * has seen, it was the only record of a change this node's caches
+     * have not caught up with -- and afterwards every gate decoding
+     * "stamp is mine" reads "my cache is current" over it (CLAUDE.md
+     * rule 10). A stat-only publish reached from an fd, with no lookup
+     * to re-read the record first, did exactly that: a reader held on
+     * to a map a peer had changed. Remembered here, acted on once the
+     * swap has landed. */
+    {
+        u64 dev = cetrafs_le64(rec.file_seq);
+
+        ctx->overstamped = dev != cetrafs_inode_local_file_seq(inode) &&
+                           CETRAFS_FILE_SEQ_NODE(dev) != (ctx->me & 0xFFFFu);
+        ctx->overstamped_seq = dev;
+    }
     cetrafs_inode_stamp_crc_fd(inode->i_sb, &rec);
     memcpy(ctx->written, &rec, sizeof(rec));
     cetrafs_inode_fd_to_image(image, &rec);
@@ -1550,6 +1577,7 @@ int cetrafs_write_vfs_inode(struct inode *inode)
         goto out_pub;
     }
 
+    ctx->me = my_node_id;
     ret = cetrafs_cas_record_fd_seeded(sb, cetrafs_inode_lba(sb, inode->i_ino),
                                        (const u8 *) &bufs[0] + CETRAFS_INODE_FD_OFF, CETRAFS_INODE_FD_LIVE,
                                        cetrafs_vfs_stat_cas_mutate, ctx);
@@ -1573,6 +1601,16 @@ int cetrafs_write_vfs_inode(struct inode *inode)
          * the cached value exact so the common path never even has to
          * ask. */
         cetrafs_inode_note_local_file_seq(inode, cetrafs_le64(ctx->written->file_seq));
+        /* ...unless it overwrote a peer's change we never saw: then do
+         * what seeing it would have done, after the adopt above so the
+         * cold mark is the last word. */
+        if (ctx->overstamped && !cetrafs_stat_publish_ignore_overstamp) {
+            pr_info_ratelimited("cetrafs: inode %llu: stat publish overwrote stamp %llx from node %u -- "
+                                "refetching this node's extent map\n",
+                                (unsigned long long) inode->i_ino, (unsigned long long) ctx->overstamped_seq,
+                                (unsigned) CETRAFS_FILE_SEQ_NODE(ctx->overstamped_seq));
+            cetrafs_inode_mark_tree_cold(inode);
+        }
     }
     /* A failed publish needs no re-stage: take no longer clears the
      * shadow, so the pending state simply stays dirty for the next
