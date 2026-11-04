@@ -1483,6 +1483,53 @@ static int cetrafs_lock_clear_on_disk(struct inode *inode, bool stamp_stat);
 static void cetrafs_lock_presence_put(struct inode *inode);
 static int cetrafs_lock_suspend_mark(struct inode *inode, bool set);
 
+/* TEST ONLY: fail the next presence withdraw, as a CAS the device
+ * refused would (tests/kernel/presence_withdraw_retry.sh). */
+static bool cetrafs_presence_withdraw_fail_once;
+module_param_named(presence_withdraw_fail_once, cetrafs_presence_withdraw_fail_once, bool, 0644);
+MODULE_PARM_DESC(presence_withdraw_fail_once, "TEST ONLY: fail the next presence withdraw with -EIO");
+
+/*
+ * Withdraw this node's bit from the file's read_open_nodes. The caller
+ * took read_opener_count to zero under lock_mutex.
+ *
+ * A failure leaves the bit set, and that is NOT self-healing: nobody
+ * reclaims a live node's bit, so every peer reads this file as open
+ * here -- write-open, unlink, rename-replace, truncate, punch, defrag
+ * and the orphan scrub all refuse -- until this node opens and closes
+ * it again. It used to be logged and left so. Now the heartbeat retries
+ * it (cetrafs_lock_retry_presence()).
+ */
+static void cetrafs_lock_presence_withdraw(struct inode *inode)
+{
+    struct super_block *sb = inode->i_sb;
+    cetrafs_inode_t raw;
+    u32 my_node_id;
+    int ret;
+
+    ret = cetrafs_sb_get_node_id(sb, &my_node_id);
+    if (!ret)
+        ret = cetrafs_read_raw_inode(sb, inode->i_ino, &raw);
+    if (!ret && READ_ONCE(cetrafs_presence_withdraw_fail_once) &&
+        xchg(&cetrafs_presence_withdraw_fail_once, false))
+        ret = -EIO; /* test-only */
+    else if (!ret) {
+        struct cetrafs_lock_cas_ctx rctx = {
+            .my_node_id = my_node_id,
+            .generation = cetrafs_le64(raw.generation),
+            .reader_op = CETRAFS_READER_CLEAR,
+        };
+
+        ret = cetrafs_lock_cas(inode, &rctx, &raw);
+    }
+    if (ret < 0 && ret != -ESTALE) {
+        pr_warn_ratelimited("ino=%llu could not withdraw this node from the opener set: %d -- retrying from the "
+                            "heartbeat\n",
+                            (unsigned long long) inode->i_ino, ret);
+        cetrafs_sb_presence_defer(sb, inode->i_ino, cetrafs_inode_get_generation(inode));
+    }
+}
+
 
 /*
  * ->open: called for every open() of a regular file, read-only opens
@@ -2131,27 +2178,10 @@ int cetrafs_lock_release(struct inode *inode, struct file *file)
     /* Withdraw this node from the file's open-presence set, mirroring
      * lock_open's publish: read-closes always; write-closes too under
      * nofilelock (where the open published presence). One CAW on the last
-     * local opener (1->0). If it fails the bit is left set -- the SAFE
-     * direction: a peer merely keeps reading metadata fresh a little
-     * longer, and the next reclaim of this node's row (or its next
-     * open/close cycle) clears it. */
-    if (!(want_write && lock_on) && atomic_dec_return(&ci->read_opener_count) == 0) {
-        u32 my_node_id;
-        cetrafs_inode_t raw;
-
-        if (cetrafs_sb_get_node_id(sb, &my_node_id) == 0 && cetrafs_read_raw_inode(sb, inode->i_ino, &raw) == 0) {
-            struct cetrafs_lock_cas_ctx rctx = {
-                .my_node_id = my_node_id,
-                .generation = cetrafs_le64(raw.generation),
-                .reader_op = CETRAFS_READER_CLEAR,
-            };
-            int rret = cetrafs_lock_cas(inode, &rctx, &raw);
-
-            if (rret < 0)
-                pr_warn_ratelimited("ino=%llu could not withdraw this node from the opener set: %d\n",
-                                    (unsigned long long) inode->i_ino, rret);
-        }
-    }
+     * local opener (1->0); a failure is retried by the heartbeat
+     * (cetrafs_lock_presence_withdraw()). */
+    if (!(want_write && lock_on) && atomic_dec_return(&ci->read_opener_count) == 0)
+        cetrafs_lock_presence_withdraw(inode);
 
     if (!want_write) {
         mutex_unlock(&ci->lock_mutex);
@@ -3046,27 +3076,65 @@ static int cetrafs_lock_suspend_mark(struct inode *inode, bool set)
 static void cetrafs_lock_presence_put(struct inode *inode)
 {
     struct cetrafs_inode_info *ci = CETRAFS_I(inode);
-    struct super_block *sb = inode->i_sb;
-    cetrafs_inode_t raw;
-    u32 my_node_id;
 
     if (atomic_dec_return(&ci->read_opener_count) != 0)
         return; /* a local opener still needs the bit */
+    cetrafs_lock_presence_withdraw(inode);
+}
 
-    if (cetrafs_sb_get_node_id(sb, &my_node_id) != 0 || cetrafs_read_raw_inode(sb, inode->i_ino, &raw) != 0)
-        return; /* bit left set: the safe direction, peers merely stay cautious */
+/*
+ * The heartbeat's pass over presence bits this node could not withdraw
+ * (cetrafs_lock_presence_withdraw()). Each is withdrawn again if no
+ * local opener needs it now -- under lock_mutex, which every publish
+ * and withdraw of the bit takes -- or dropped if one does (its own last
+ * close withdraws it). A file deleted or its number reused is cleared
+ * on the record by generation, or found to be another file's and left.
+ */
+void cetrafs_lock_retry_presence(struct super_block *sb)
+{
+    struct cetrafs_nsrel_pending pend[CETRAFS_PRESENCE_DEFERRED_MAX];
+    u32 n, i, my_node_id;
 
-    {
-        struct cetrafs_lock_cas_ctx rctx = {
-            .my_node_id = my_node_id,
-            .generation = cetrafs_le64(raw.generation),
-            .reader_op = CETRAFS_READER_CLEAR,
-        };
-        int ret = cetrafs_lock_cas(inode, &rctx, &raw);
+    n = cetrafs_sb_presence_take_deferred(sb, pend, ARRAY_SIZE(pend));
+    if (!n)
+        return;
+    if (cetrafs_sb_get_node_id(sb, &my_node_id)) {
+        for (i = 0; i < n; i++)
+            cetrafs_sb_presence_defer(sb, pend[i].ino, pend[i].generation);
+        return;
+    }
+    for (i = 0; i < n; i++) {
+        struct inode *inode = cetrafs_iget(sb, pend[i].ino);
+        struct cetrafs_inode_info *ci;
 
-        if (ret < 0)
-            pr_warn_ratelimited("ino=%llu could not withdraw presence after resume: %d\n",
-                                (unsigned long long) inode->i_ino, ret);
+        if (IS_ERR(inode)) {
+            struct cetrafs_lock_cas_ctx rctx = {
+                .my_node_id = my_node_id,
+                .generation = pend[i].generation,
+                .reader_op = CETRAFS_READER_CLEAR,
+            };
+            int ret;
+
+            if (PTR_ERR(inode) != -ESTALE && PTR_ERR(inode) != -ENOENT) {
+                cetrafs_sb_presence_defer(sb, pend[i].ino, pend[i].generation);
+                continue;
+            }
+            ret = cetrafs_cas_record_seeded(sb, cetrafs_inode_lba(sb, pend[i].ino), NULL, 0, cetrafs_lock_cas_mutate,
+                                            &rctx);
+            if (ret < 0 && ret != -ESTALE)
+                cetrafs_sb_presence_defer(sb, pend[i].ino, pend[i].generation);
+            continue;
+        }
+        if (cetrafs_inode_get_generation(inode) != pend[i].generation) {
+            iput(inode);
+            continue;
+        }
+        ci = CETRAFS_I(inode);
+        mutex_lock(&ci->lock_mutex);
+        if (atomic_read(&ci->read_opener_count) == 0)
+            cetrafs_lock_presence_withdraw(inode); /* re-queues itself on failure */
+        mutex_unlock(&ci->lock_mutex);
+        iput(inode);
     }
 }
 

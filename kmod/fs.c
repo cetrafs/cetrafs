@@ -582,6 +582,13 @@ struct cetrafs_sb_info {
     u32 flrel_count;
     struct cetrafs_nsrel_pending flrel[CETRAFS_FLOCK_DEFERRED_MAX];
 
+    /* This node's presence bits whose withdraw did not land (see
+     * cetrafs_lock_retry_presence()). Same shape and reason as flrel:
+     * nobody reclaims a live node's bit. Under prrel_lock. */
+    spinlock_t prrel_lock;
+    u32 prrel_count;
+    struct cetrafs_nsrel_pending prrel[CETRAFS_PRESENCE_DEFERRED_MAX];
+
     /* Each BG count's ownership epoch (cetrafs_block_group_t.
      * reconcile_seq) as of OUR reconcile -- the epoch our accrued
      * deltas were born under. The delta-apply CAS refuses an image
@@ -1204,6 +1211,7 @@ int cetrafs_fill_super(struct super_block *sb, struct fs_context *fc)
         spin_lock_init(&sbi->resv_list_lock);
         spin_lock_init(&sbi->nsrel_lock);
         spin_lock_init(&sbi->flrel_lock);
+        spin_lock_init(&sbi->prrel_lock);
         mutex_init(&sbi->nsrel_mutex);
         INIT_LIST_HEAD(&sbi->resv_list);
 
@@ -3780,6 +3788,51 @@ void cetrafs_sb_flock_defer(struct super_block *sb, u64 ino, u64 generation)
     sbi->flrel[sbi->flrel_count].generation = generation;
     sbi->flrel_count++;
     spin_unlock(&sbi->flrel_lock);
+}
+
+/* Remember a presence bit whose withdraw did not land, for the heartbeat.
+ * See cetrafs_lock_retry_presence(). */
+void cetrafs_sb_presence_defer(struct super_block *sb, u64 ino, u64 generation)
+{
+    struct cetrafs_sb_info *sbi = sb->s_fs_info;
+    u32 i;
+
+    if (!sbi)
+        return;
+    spin_lock(&sbi->prrel_lock);
+    for (i = 0; i < sbi->prrel_count; i++)
+        if (sbi->prrel[i].ino == ino) {
+            sbi->prrel[i].generation = generation;
+            spin_unlock(&sbi->prrel_lock);
+            return;
+        }
+    if (sbi->prrel_count == CETRAFS_PRESENCE_DEFERRED_MAX) {
+        spin_unlock(&sbi->prrel_lock);
+        pr_err("presence: ino=%llu withdraw could not be queued for retry -- %u already pending; peers see this "
+               "node as an opener until it opens and closes the file again, or unmounts\n",
+               (unsigned long long) ino, (unsigned int) CETRAFS_PRESENCE_DEFERRED_MAX);
+        return;
+    }
+    sbi->prrel[sbi->prrel_count].ino = ino;
+    sbi->prrel[sbi->prrel_count].generation = generation;
+    sbi->prrel_count++;
+    spin_unlock(&sbi->prrel_lock);
+}
+
+u32 cetrafs_sb_presence_take_deferred(struct super_block *sb, struct cetrafs_nsrel_pending *out, u32 max)
+{
+    struct cetrafs_sb_info *sbi = sb->s_fs_info;
+    u32 n;
+
+    if (!sbi)
+        return 0;
+    spin_lock(&sbi->prrel_lock);
+    n = min(sbi->prrel_count, max);
+    memcpy(out, sbi->prrel, n * sizeof(*out));
+    memmove(sbi->prrel, sbi->prrel + n, (sbi->prrel_count - n) * sizeof(*out));
+    sbi->prrel_count -= n;
+    spin_unlock(&sbi->prrel_lock);
+    return n;
 }
 
 u32 cetrafs_sb_flock_take_deferred(struct super_block *sb, struct cetrafs_nsrel_pending *out, u32 max)
