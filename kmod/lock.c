@@ -2481,6 +2481,24 @@ void cetrafs_lock_retry_deferred(struct super_block *sb)
             iput(inode);
             continue;
         }
+        if (ci->lock_suspended && !ci->explicit_lock_file && !READ_ONCE(ci->defrag_pinned)) {
+            /* A suspended file carries no lock of ours by definition --
+             * suspend cleared it for the peer. One that does is a resume
+             * that claimed, failed, and could not give it back; the
+             * writer is still open, so the close below never comes, and
+             * a suspended writer's close does not clear either. Clear
+             * only: nothing was written under that claim. lock_mutex
+             * keeps a resume out meanwhile. */
+            ret = cetrafs_lock_clear_on_disk(inode, /*stamp_stat=*/false);
+            mutex_unlock(&ci->lock_mutex);
+            if (ret)
+                cetrafs_sb_flock_defer(sb, pend[i].ino, pend[i].generation);
+            else
+                pr_info("lock release: ino=%llu a failed resume's lock was given back by the heartbeat\n",
+                        (unsigned long long) inode->i_ino);
+            iput(inode);
+            continue;
+        }
         if (atomic_read(&ci->lock_writer_count) > 0 || ci->lock_suspended || ci->explicit_lock_file ||
             READ_ONCE(ci->defrag_pinned)) {
             mutex_unlock(&ci->lock_mutex);
@@ -3486,6 +3504,23 @@ static unsigned int cetrafs_lock_resume_stall_ms;
 module_param_named(lock_resume_stall_ms, cetrafs_lock_resume_stall_ms, uint, 0644);
 MODULE_PARM_DESC(lock_resume_stall_ms, "TEST ONLY: pause flock(LOCK_EX)'s resume before its cache reconcile");
 
+/* Defined with the flock code below. A resume that took the lock and
+ * then fails gives it back through it, so a give-back that does not land
+ * is queued for the heartbeat rather than dropped. */
+static void cetrafs_lock_give_back(struct inode *inode, int (*give)(struct inode *, void *), void *arg,
+                                   const char *who);
+static int cetrafs_give_back_clear(struct inode *inode, void *arg)
+{
+    (void) arg;
+    return cetrafs_lock_clear_on_disk(inode, /*stamp_stat=*/false);
+}
+
+/* TEST ONLY: the next resume's re-read of the record fails, as a device
+ * read error would (tests/kernel/lock_giveback_fails.sh, round C). */
+static bool cetrafs_lock_resume_reread_fail_once;
+module_param_named(lock_resume_reread_fail_once, cetrafs_lock_resume_reread_fail_once, bool, 0644);
+MODULE_PARM_DESC(lock_resume_reread_fail_once, "TEST ONLY: the next lock resume's record re-read fails with -EIO");
+
 /*
  * flock(fd, LOCK_EX) on a default mount: take the automatic lock back.
  *
@@ -3585,10 +3620,13 @@ static int cetrafs_lock_resume(struct inode *inode)
     if (!cetrafs_lock_suspend_trust_cache) {
         cetrafs_invalidate_raw_inode(sb, inode->i_ino);
         ret = cetrafs_read_raw_inode(sb, inode->i_ino, &raw);
+        if (!ret && READ_ONCE(cetrafs_lock_resume_reread_fail_once) &&
+            xchg(&cetrafs_lock_resume_reread_fail_once, false))
+            ret = -EIO; /* TEST ONLY */
         if (ret) {
             pr_err("lock: ino=%llu resume could not re-read the record (%d) -- giving the lock back\n",
                    (unsigned long long) inode->i_ino, ret);
-            (void) cetrafs_lock_clear_on_disk(inode, /*stamp_stat=*/false);
+            cetrafs_lock_give_back(inode, cetrafs_give_back_clear, NULL, "resume");
             goto out;
         }
         cetrafs_tree_invalidate_cached(inode, &raw);
@@ -3618,7 +3656,7 @@ static int cetrafs_lock_resume(struct inode *inode)
             if (ret) {
                 pr_warn("lock: ino=%llu resume could not apply the peer's record (%d) -- giving the lock back\n",
                         (unsigned long long) inode->i_ino, ret);
-                (void) cetrafs_lock_clear_on_disk(inode, /*stamp_stat=*/false);
+                cetrafs_lock_give_back(inode, cetrafs_give_back_clear, NULL, "resume");
                 if (ret != -ESTALE && ret != -EINTR)
                     ret = -ETXTBSY; /* a blocking LOCK_EX tries again */
                 goto out;
@@ -3693,11 +3731,6 @@ static void cetrafs_lock_give_back(struct inode *inode, int (*give)(struct inode
 static int cetrafs_give_back_cas(struct inode *inode, void *arg)
 {
     return cetrafs_lock_cas(inode, arg, NULL);
-}
-
-static int cetrafs_give_back_clear(struct inode *inode, void *arg)
-{
-    return cetrafs_lock_clear_on_disk(inode, /*stamp_stat=*/false);
 }
 
 /*

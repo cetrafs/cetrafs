@@ -14,11 +14,15 @@
 # A: nofilelock, flock's back-out (the reader check made to fail).
 # B: default mount, the background defrag pass's back-out (a live peer
 #    holds the file open for read).
+# C: default mount, a flock(LOCK_EX) resume that claimed and then failed
+#    its re-read, with the writer still open and the clear failing
+#    (flock_clear_fail_once).
 # Each with the give-back failing once (lock_giveback_fail_once): the
 # lock must be on the device right after, and gone a few beats later.
 #
 # DISCRIMINATION: with the give-back's result dropped, the lock is still
-# on the device when the wait ends, in both rounds.
+# on the device when the wait ends, in every round; round C also fails
+# if the heartbeat retry skips a suspended inode.
 set -euo pipefail
 . "$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)/lib/harness.sh"
 require_root
@@ -123,4 +127,47 @@ wait "$BEATER" 2>/dev/null || true
 ct_param_set lock_ignore_readers 0
 ct_umount "$MNT"
 "$NODE_POKE" "$DEV" "$PEER" 0 cc 0 >/dev/null
+
+# --- C: a resume. A writer hands its lock over (flock LOCK_UN) and takes
+# it back (LOCK_EX); the resume claims, its re-read fails, and the give
+# -back fails too. The writer stays OPEN through the wait: the retry used
+# to skip a suspended inode with a writer, and the writer's eventual
+# close does not clear a suspended lock either -- nothing ever would.
+[ -w /sys/module/cetrafs/parameters/lock_resume_reread_fail_once ] || { skip "C: lock_resume_reread_fail_once is missing"; ct_exit; }
+IMG="$(ct_image 560 gbresume)"
+DEV="$(ct_loop "$IMG")"
+MNT="$(ct_mnt gbresume)"
+ct_mkfs_small "$DEV" >/dev/null
+ct_mount "$DEV" "$MNT"
+require_cetrafs_mount "$MNT"
+echo image >"$MNT/vm.img"
+INO="$(stat -c %i "$MNT/vm.img")"
+sync
+GO="$(ct_tmp gbresume-go)"; rm -f "$GO"
+RESF="$(ct_tmp gbresume-res)"
+python3 - "$MNT/vm.img" "$GO" >"$RESF" <<'PY' &
+import fcntl, os, sys, time
+fd = os.open(sys.argv[1], os.O_RDWR)
+fcntl.flock(fd, fcntl.LOCK_UN)                 # suspend: the lock goes to NONE
+open("/sys/module/cetrafs/parameters/lock_resume_reread_fail_once", "w").write("1")
+open("/sys/module/cetrafs/parameters/flock_clear_fail_once", "w").write("1")
+try:
+    fcntl.flock(fd, fcntl.LOCK_EX | fcntl.LOCK_NB); r = "ok"
+except OSError as e:
+    r = "errno%d" % e.errno
+print(r, flush=True)
+while not os.path.exists(sys.argv[2]):         # the writer stays open
+    time.sleep(0.2)
+os.close(fd)
+PY
+HOLDER=$!
+for _ in $(seq 1 50); do [ -s "$RESF" ] && break; sleep 0.1; done
+[ "$(cat "$RESF")" != ok ] || fail "C: setup: LOCK_EX succeeded -- the resume did not fail"
+[ "$(cat /sys/module/cetrafs/parameters/lock_resume_reread_fail_once)" = N ] ||
+    fail "C: setup: the resume never re-read the record"
+[ "$(cat /sys/module/cetrafs/parameters/flock_clear_fail_once)" = N ] ||
+    fail "C: setup: the resume never tried to give the lock back"
+wait_clear "$IMG" "$INO" "C (resume, writer still open)"
+touch "$GO"; wait "$HOLDER" || true
+ct_umount "$MNT"
 ct_exit
