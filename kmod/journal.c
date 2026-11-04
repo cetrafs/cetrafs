@@ -1136,6 +1136,10 @@ int cetrafs_journal_replay_node(struct super_block *sb, u32 node_id, bool wait_f
     bool dirty = false, claimed = false;
     int ret;
 
+    /* No such row, so no such journal: nothing to replay
+     * (cetrafs_node_fence_peer_full()). */
+    if (cetrafs_sb_raw(sb) && node_id >= le32_to_cpu(cetrafs_sb_raw(sb)->node_table_count))
+        return 0;
     ret = cetrafs_journal_node_area(sb, node_id, &area_start, &slots);
     if (ret)
         return ret;

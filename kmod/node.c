@@ -397,8 +397,19 @@ static int cetrafs_node_fence_peer_full(struct super_block *sb, u32 node_id, con
     const cetrafs_superblock_t *raw_sb = cetrafs_sb_raw(sb);
     int ret;
 
-    if (!raw_sb || node_id >= le32_to_cpu(raw_sb->node_table_count))
+    if (!raw_sb)
         return -EINVAL;
+    /* An id past the registry was never handed out (cetrafs_node_is_stale()
+     * already calls it stale): there is no lease to revoke, and nothing
+     * that could still be using what it names. Refusing here made every
+     * caller read "not revoked" and keep the claim for good -- a lock, a
+     * presence bit, a ZG nothing could ever take back. */
+    if (node_id >= le32_to_cpu(raw_sb->node_table_count)) {
+        pr_warn_ratelimited("fence: a claim names node %u, outside the registry (%u rows) -- nothing to revoke, "
+                            "reclaiming %s\n",
+                            node_id, le32_to_cpu(raw_sb->node_table_count), what);
+        return 0;
+    }
 
     ret = cetrafs_cas_record(sb, cetrafs_node_row_lba(sb, node_id), cetrafs_node_fence_mutate, &ctx);
     if (ret < 0) {
