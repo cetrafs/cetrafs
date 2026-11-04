@@ -180,6 +180,10 @@ struct cetrafs_sb_info {
      * alloc/free go through cetrafs_cas_record(), which serialises
      * local threads itself -- see cas_mutex below. */
     struct mutex alloc_mutex;
+    /* cetrafs_sb_stamp_ns(): the real clock at mount, minus the
+     * monotonic clock then, and the last value handed out. */
+    s64 stamp_base;
+    atomic64_t stamp_last;
     /* Set by cetrafs_sb_alloc_lock(), for the holder only: the NOFS
      * scope it opened and who holds it (cetrafs_sb_in_reclaim_lock()). */
     unsigned int alloc_nofs;
@@ -1210,6 +1214,8 @@ int cetrafs_fill_super(struct super_block *sb, struct fs_context *fc)
         if (!sbi->peers)
             sbi->peer_count = 0;
         mutex_init(&sbi->alloc_mutex);
+        sbi->stamp_base = (s64) ktime_get_real_ns() - (s64) ktime_get_ns();
+        atomic64_set(&sbi->stamp_last, 0);
         init_rwsem(&sbi->birth_rwsem);
         mutex_init(&sbi->cas_mutex);
 
@@ -2590,6 +2596,30 @@ void cetrafs_sb_alloc_unlock(struct super_block *sb)
     WRITE_ONCE(sbi->alloc_owner, NULL);
     memalloc_nofs_restore(sbi->alloc_nofs);
     mutex_unlock(&sbi->alloc_mutex);
+}
+
+/*
+ * A nanosecond stamp for file_seq and inode generations: the real clock
+ * as it read at mount, advanced by the MONOTONIC clock, and strictly
+ * increasing per mount. The real clock alone can step backward (NTP, an
+ * operator), and a node's own stamps are ORDERED, not just compared
+ * (cetrafs_file_seq_before()): a step back made a newer publish look
+ * superseded and a needed refresh was declined. Anchored to the real
+ * clock so a remount does not restart near values it handed out before.
+ */
+u64 cetrafs_sb_stamp_ns(struct super_block *sb)
+{
+    struct cetrafs_sb_info *sbi = sb ? sb->s_fs_info : NULL;
+    s64 now, old, next;
+
+    if (!sbi)
+        return ktime_get_real_ns();
+    now = sbi->stamp_base + (s64) ktime_get_ns();
+    old = atomic64_read(&sbi->stamp_last);
+    do {
+        next = now > old ? now : old + 1;
+    } while (!atomic64_try_cmpxchg(&sbi->stamp_last, &old, next));
+    return (u64) next;
 }
 
 /* Does the current task hold alloc_mutex (through the wrappers) or

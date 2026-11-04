@@ -126,13 +126,23 @@ void cetrafs_inode_stamp_crc_ns(cetrafs_inode_t *in)
  * cetrafs_inode_new_generation() xors the id into the high byte, which
  * is fine for a value only ever compared for equality but cannot be
  * decoded back. */
+/* TEST ONLY: stamp every file_seq with this value (low 48 bits) instead
+ * of the clock -- the top of the range, to stage the wrap
+ * (tests/kernel/file_seq_wrap.sh). 0 = off. */
+static unsigned long long cetrafs_file_seq_force_val;
+module_param_named(file_seq_force_val, cetrafs_file_seq_force_val, ullong, 0644);
+MODULE_PARM_DESC(file_seq_force_val, "TEST ONLY: stamp file_seq with this value instead of the clock (0 = off)");
+
 u64 cetrafs_file_seq_new(struct super_block *sb)
 {
     u32 node_id = 0;
     u64 val;
 
     (void) cetrafs_sb_get_node_id(sb, &node_id);
-    val = (u64) ktime_get_real_ns() & CETRAFS_FILE_SEQ_VAL_MASK;
+    val = READ_ONCE(cetrafs_file_seq_force_val);
+    if (!val)
+        val = cetrafs_sb_stamp_ns(sb);
+    val &= CETRAFS_FILE_SEQ_VAL_MASK;
     if (!val)
         val = 1;
     return ((u64) (node_id & 0xFFFFu) << CETRAFS_FILE_SEQ_NODE_SHIFT) | val;
@@ -901,8 +911,9 @@ int cetrafs_write_raw_inode(struct super_block *sb, u64 ino, const cetrafs_inode
  * A fresh generation for a newly-ALLOCATED inode (v0x0008; see
  * cetrafs.h's field comment for the cross-node reuse type-confusion this
  * detects). Only needs to differ between successive lives of the same
- * inode number: wall-clock nanoseconds XOR'd with the allocating node's
- * id comfortably provides that (allocation is cluster-mutexed and
+ * inode number: wall-clock nanoseconds (cetrafs_sb_stamp_ns(), which
+ * never steps backward) XOR'd with the allocating node's id comfortably
+ * provides that (allocation is cluster-mutexed and
  * multi-nanosecond, so two lives can't share a timestamp; the node id
  * guards the pathological clock-skew case). Never returns 0 -- that's
  * the reserved "unset" value.
@@ -913,7 +924,7 @@ u64 cetrafs_inode_new_generation(struct super_block *sb)
     u64 gen;
 
     (void) cetrafs_sb_get_node_id(sb, &node_id);
-    gen = ktime_get_real_ns() ^ ((u64) node_id << 56);
+    gen = cetrafs_sb_stamp_ns(sb) ^ ((u64) node_id << 56);
     return gen ? gen : 1;
 }
 
@@ -2117,9 +2128,13 @@ int cetrafs_refresh_vfs_inode_if_newer(struct inode *inode)
         u64 cached = cetrafs_inode_local_file_seq(inode);
 
         /* Same-node seqs embed the same clock's nanoseconds in the low
-         * 48 bits (~3 days before wrap), so for OUR OWN stamps "older
-         * than the publish we noted" is decidable -- and that is the
-         * only read that must be refused. A NEWER self-stamp means a
+         * 48 bits, which never step backward within a mount
+         * (cetrafs_sb_stamp_ns()) and wrap every ~3.26 days -- so they
+         * are ordered modulo the wrap (cetrafs_file_seq_before()), and
+         * for OUR OWN stamps "older than the publish we noted" is
+         * decidable -- and that is the only read that must be refused.
+         * (A plain '<' called every stamp after a wrap older than the
+         * note, and declined the refresh.) A NEWER self-stamp means a
          * local publisher ran after our note (background defrag, a
          * staged release, writeback) and in-core is the stale side:
          * applying is then the fix, not the bug. The first cut refused
@@ -2129,7 +2144,7 @@ int cetrafs_refresh_vfs_inode_if_newer(struct inode *inode)
         if (cached != U64_MAX && cetrafs_sb_get_node_id(sb, &my_node_id) == 0 &&
             CETRAFS_FILE_SEQ_NODE(cetrafs_le64(raw.file_seq)) == (u32) (my_node_id & 0xFFFFu) &&
             CETRAFS_FILE_SEQ_NODE(cached) == (u32) (my_node_id & 0xFFFFu) &&
-            (cetrafs_le64(raw.file_seq) & CETRAFS_FILE_SEQ_VAL_MASK) < (cached & CETRAFS_FILE_SEQ_VAL_MASK)) {
+            cetrafs_file_seq_before(cetrafs_le64(raw.file_seq), cached)) {
             ctrace("FDREFRESH ino=%llu verdict=superseded rawseq=%llx cached=%llx rawsize=%llu coresize=%llu\n",
                    (unsigned long long) inode->i_ino, (unsigned long long) cetrafs_le64(raw.file_seq),
                    (unsigned long long) cached, (unsigned long long) cetrafs_le64(raw.size),

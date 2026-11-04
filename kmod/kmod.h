@@ -270,6 +270,7 @@ void cetrafs_sb_cas_unlock(struct super_block *sb);
 void cetrafs_sb_alloc_lock(struct super_block *sb);
 void cetrafs_sb_alloc_unlock(struct super_block *sb);
 bool cetrafs_sb_in_reclaim_lock(struct super_block *sb);
+u64 cetrafs_sb_stamp_ns(struct super_block *sb);
 /* Live speculative-run registry: lock.c publishes, scrub.c reads. A
  * reserved run is bitmap-set and referenced by no extent, which is
  * exactly what the scrub frees -- see cetrafs_sb_info.resv_list.
@@ -564,6 +565,15 @@ void cetrafs_inode_stamp_crc(struct super_block *sb, cetrafs_inode_t *in); /* wh
 void cetrafs_inode_stamp_crc_ns(cetrafs_inode_t *in);                      /* sector 0 only (the CAS mutates) */
 void cetrafs_inode_stamp_crc_fd(struct super_block *sb, cetrafs_inode_t *in);
 u64 cetrafs_file_seq_new(struct super_block *sb); /* sector 1 only (the file-path publish) */
+/* Is this node's file_seq value 'a' older than its 'b'? The low 48 bits
+ * are nanoseconds and wrap every ~3.26 days, so ordered modulo 2^48: a
+ * is older when b is less than half the range ahead of it. */
+static inline bool cetrafs_file_seq_before(u64 a, u64 b)
+{
+    u64 d = (b - a) & CETRAFS_FILE_SEQ_VAL_MASK;
+
+    return d && d <= (CETRAFS_FILE_SEQ_VAL_MASK >> 1);
+}
 int cetrafs_apply_raw_to_vfs_inode(struct inode *inode, const cetrafs_inode_t *raw);
 int cetrafs_apply_raw_to_vfs_inode_sure(struct inode *inode, const cetrafs_inode_t *raw);
 int cetrafs_refresh_vfs_inode_if_newer(struct inode *inode);
