@@ -2420,6 +2420,27 @@ static int __cetrafs_free_data_extent(struct super_block *sb, u64 lba, u32 count
         return ret;
     }
 
+    /*
+     * Both verdicts below are destructive -- FREE is declared damage,
+     * and a foreign owner gets the extent on its queue -- and both read
+     * the owner from a descriptor that is cached on the first attempt.
+     * A Block Group this node last saw FREE (a statfs sweep), then
+     * claimed and filled by a peer, read FREE here and a live file's
+     * free was refused as corruption, under corruption=stop stopping
+     * the mount. Re-read before either: a rare path, and
+     * cetrafs_bg_desc_refresh_foreign() never touches a BG this node
+     * owns (docs/PERFORMANCE.md, invariant 3).
+     */
+    if (bg.owner_zg == CETRAFS_BG_OWNER_FREE || !cetrafs_sb_zg_owned_cached(sb, bg.owner_zg)) {
+        cetrafs_bg_desc_refresh_foreign(sb, bg_id);
+        ret = cetrafs_read_bg_geom(sb, bg_id, &bg);
+        if (ret) {
+            pr_err_ratelimited("free: extent [%llu +%u): BG %u geometry unreadable (%d) -- leaked\n",
+                               (unsigned long long) lba, count, bg_id, ret);
+            return ret;
+        }
+    }
+
     data_start = bg.start_block + bg.off_data_region;
     if (lba + count > data_start + bg.data_block_count) {
         pr_err("free extent [%llu +%u) crosses out of BG %u -- refusing\n", (unsigned long long) lba, count, bg_id);
