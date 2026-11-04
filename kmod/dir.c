@@ -604,18 +604,31 @@ static int cetrafs_walk_dirents_from(struct inode *dir, cetrafs_dirent_visit_fn 
         const cetrafs_extent_t *ext = &dx.arr[i];
         u64 phys = cetrafs_extent_phys_from_hilo(ext->ee_start_hi, ext->ee_start_lo);
         u32 len = cetrafs_extent_len(ext->ee_len);
-        u32 b;
+        u64 first = min_pos > 0 ? (u64) min_pos / CETRAFS_BLOCK_SIZE : 0; /* first block not wholly below min_pos */
+        u32 b = 0;
 
-        for (b = 0; b < len; b++) {
+        /*
+         * Skip the blocks below min_pos by arithmetic, not one at a time.
+         * The per-block skip ran before the cond_resched() below, so a
+         * corrupt length (up to 2^31) and a user lseek() made it billions
+         * of silent iterations with nothing to reschedule (class 13).
+         * Same set as "skip while base_pos + BLOCK_SIZE <= min_pos".
+         */
+        if (first > cetrafs_le32(ext->ee_block)) {
+            u64 s = first - cetrafs_le32(ext->ee_block);
+
+            skipped = true;
+            if (s >= len)
+                continue;
+            b = (u32) s;
+        }
+
+        for (; b < len; b++) {
             loff_t base_pos = ((loff_t) cetrafs_le32(ext->ee_block) + b) * CETRAFS_BLOCK_SIZE;
             struct buffer_head *bh;
             const cetrafs_dirent_t *de;
             unsigned int e;
 
-            if (base_pos + CETRAFS_BLOCK_SIZE <= min_pos) {
-                skipped = true;
-                continue;
-            }
             cond_resched(); /* O(blocks) per pass, whatever their content */
             bh = cetrafs_dirent_read(dir->i_sb, phys + b, fresh);
             if (!bh) {
