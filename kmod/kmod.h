@@ -926,6 +926,12 @@ void cetrafs_inode_fd_published(struct inode *inode, u64 seq);
 u64 cetrafs_inode_fd_seq(struct inode *inode);
 void cetrafs_inode_fd_pub_lock(struct inode *inode);
 void cetrafs_inode_fd_pub_unlock(struct inode *inode);
+/* inode.c: a record's size, bounded by what the format can address. */
+#define CETRAFS_MAX_FILE_BYTES (CETRAFS_MAX_FILE_BLOCKS * (u64) CETRAFS_BLOCK_SIZE)
+static inline bool cetrafs_size_sane(u64 size)
+{
+    return size <= CETRAFS_MAX_FILE_BYTES;
+}
 int cetrafs_inode_ns_cas(struct super_block *sb,
                          u64 ino,
                          u64 generation,

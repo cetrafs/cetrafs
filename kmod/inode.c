@@ -228,6 +228,18 @@ int cetrafs_read_raw_inode(struct super_block *sb, u64 ino, cetrafs_inode_t *out
                 cetrafs_sb_corrupt(sb, ino);
                 return -EUCLEAN;
             }
+            /* The size is a length read off the device and becomes
+             * i_size, a signed loff_t: past the format ceiling it names
+             * blocks no extent can address, and past 2^63 it is
+             * negative to every VFS path that reads it. A checksum
+             * proves neither. */
+            if (!cetrafs_size_sane(cetrafs_le64(out->size))) {
+                pr_err("ino=%llu: its record's size %llu is past the format's %llu-byte ceiling -- refusing it\n",
+                       (unsigned long long) ino, (unsigned long long) cetrafs_le64(out->size),
+                       (unsigned long long) CETRAFS_MAX_FILE_BYTES);
+                cetrafs_sb_corrupt(sb, ino);
+                return -EUCLEAN;
+            }
             return 0;
         }
 
@@ -1290,7 +1302,10 @@ static void cetrafs_vfs_stat_adopt(struct inode *inode, struct cetrafs_vfs_stat_
         have_inval = down_write_trylock(&inode->i_mapping->invalidate_lock);
 
     if (ctx->merged[CETRAFS_FD_F_SIZE] != ctx->ours[CETRAFS_FD_F_SIZE]) {
-        if (have_ilock && (u64) i_size_read(inode) == ctx->ours[CETRAFS_FD_F_SIZE])
+        /* Merged from a swap's image, not through the record reader's
+         * size check -- so it is checked here too. */
+        if (have_ilock && (u64) i_size_read(inode) == ctx->ours[CETRAFS_FD_F_SIZE] &&
+            cetrafs_size_sane(ctx->merged[CETRAFS_FD_F_SIZE]))
             i_size_write(inode, (loff_t) ctx->merged[CETRAFS_FD_F_SIZE]);
         else
             w->size = cetrafs_cpu_to_le64(ctx->ours[CETRAFS_FD_F_SIZE]);

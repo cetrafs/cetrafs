@@ -1650,10 +1650,4 @@ static inline void cetrafs_extent_phys_to_hilo(u64 phys, __le16 *hi, __le32 *lo)
      (bg).off_data_bmap >= CETRAFS_BG_HEADER_BLOCKS && \
      (bg).off_data_region > (bg).off_data_bmap)
 
-/* ---- Sanity-check helpers (signatures; implement in .c) ---- */
-int cetrafs_sb_sane(const cetrafs_superblock_t *sb);
-int cetrafs_zg_sane(const cetrafs_zone_group_t *zg);
-int cetrafs_bg_sane(const cetrafs_block_group_t *bg);
-int cetrafs_inode_sane(const cetrafs_inode_t *in);
-
 #endif /* CETRAFS_LAYOUT_H */
