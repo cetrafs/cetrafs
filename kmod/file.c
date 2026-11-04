@@ -48,6 +48,91 @@
 
 static int cetrafs_get_block(struct inode *inode, sector_t iblock, struct buffer_head *bh_result, int create);
 static int cetrafs_get_block_read(struct inode *inode, sector_t iblock, struct buffer_head *bh_result, int create);
+
+/*
+ * What __cetrafs_get_block() does with a block it is asked to WRITE.
+ *
+ * PLAIN is every page-cache path: a preallocated block is converted and
+ * a hole allocated as written data on the spot, because the folio that
+ * will be written there is already in hand and nothing can read the
+ * block before it.
+ *
+ * DIO is an O_DIRECT write. Its data reaches the device only when the
+ * bio completes, so a block it maps must not read as data before then:
+ * a preallocated block is mapped AS IS, and a hole inside i_size is
+ * allocated PREALLOCATED. Either way a reader, a peer, or a crash sees
+ * zeros until CONVERT -- run from the DIO's completion, after the data
+ * has landed -- marks the range written. That is what lets such a write
+ * stay direct instead of falling back to a buffered write plus a
+ * synchronous flush under inode_lock, which serialised every write into
+ * a sparse or preallocated file to one at a time (tests/kernel/
+ * dio_no_fallback.sh).
+ *
+ * CONVERT never allocates: by the time it runs, the write it completes
+ * mapped every block of its range, and truncate and punch wait for it
+ * (inode_dio_wait()) before freeing any of them.
+ */
+enum cetrafs_gb_mode {
+    CETRAFS_GB_PLAIN = 0,
+    CETRAFS_GB_DIO,
+    CETRAFS_GB_CONVERT,
+};
+
+/* b_private of a DIO mapping that left preallocated blocks for the
+ * completion to convert. The DIO code copies b_private into the dio
+ * after EVERY get_block call and never clears it, so once one segment
+ * sets it, the completion sees it. */
+#define CETRAFS_DIO_CONVERT_MARK ((void *) 1)
+
+/* Escape hatch and A/B control: off restores DIO_SKIP_HOLES, i.e. the
+ * buffered fallback for every O_DIRECT write that is not an overwrite. */
+static bool cetrafs_dio_fill_holes = true;
+module_param_named(dio_fill_holes, cetrafs_dio_fill_holes, bool, 0644);
+MODULE_PARM_DESC(dio_fill_holes,
+                 "O_DIRECT writes into holes and preallocated space stay direct (default on; off = buffered fallback)");
+
+/* Test-only: complete such a write without converting its range. The
+ * data is on the device but the blocks still read as zeros -- what
+ * dio_no_fallback.sh must catch, proving the conversion is what makes
+ * the write visible. */
+static bool cetrafs_dio_skip_convert;
+module_param_named(dio_skip_convert, cetrafs_dio_skip_convert, bool, 0644);
+MODULE_PARM_DESC(dio_skip_convert, "TEST ONLY: leave an O_DIRECT write's preallocated blocks unconverted");
+
+static atomic64_t cetrafs_dio_fallbacks = ATOMIC64_INIT(0);
+static atomic64_t cetrafs_dio_converts = ATOMIC64_INIT(0);
+
+/* O_DIRECT writes the DIO code handed back to the buffered path. */
+u64 cetrafs_dio_fallback_count(void)
+{
+    return (u64) atomic64_read(&cetrafs_dio_fallbacks);
+}
+
+/* O_DIRECT write completions that converted preallocated blocks. */
+u64 cetrafs_dio_convert_count(void)
+{
+    return (u64) atomic64_read(&cetrafs_dio_converts);
+}
+
+/* A DIO mapping whose blocks read as zeros until the completion converts
+ * them. buffer_new makes the DIO code zero whatever part of a block the
+ * write does not cover (the block's old contents become reachable the
+ * moment it is converted); defer_completion runs the completion from a
+ * workqueue, since converting takes locks and does I/O. */
+static void cetrafs_dio_mark_convert(struct buffer_head *bh)
+{
+    set_buffer_new(bh);
+    set_buffer_defer_completion(bh);
+    bh->b_private = CETRAFS_DIO_CONVERT_MARK;
+}
+
+static int __cetrafs_get_block(struct inode *inode,
+                               sector_t iblock,
+                               struct buffer_head *bh_result,
+                               int create,
+                               bool reader,
+                               enum cetrafs_gb_mode mode);
+
 static int cetrafs_read_folio(struct file *file, struct folio *folio);
 static void cetrafs_readahead(struct readahead_control *rac);
 static int cetrafs_write_begin(const struct kiocb *iocb,
@@ -321,8 +406,71 @@ static int cetrafs_dio_get_block(struct inode *inode, sector_t iblock, struct bu
     if (!create)
         return cetrafs_get_block_read(inode, iblock, bh_result, 0);
     filemap_invalidate_lock(inode->i_mapping);
-    ret = cetrafs_get_block(inode, iblock, bh_result, create);
+    ret = __cetrafs_get_block(inode, iblock, bh_result, create, false, CETRAFS_GB_DIO);
     filemap_invalidate_unlock(inode->i_mapping);
+    return ret;
+}
+
+/*
+ * Completion of an O_DIRECT write that mapped preallocated blocks:
+ * every byte of [offset, offset + size) is now on the device, so the
+ * blocks under it may read as data. Converted a run at a time through
+ * the same path a buffered write converts with.
+ *
+ * Context: the submitter's (a synchronous DIO, under inode_lock), or the
+ * superblock's DIO workqueue (cetrafs_dio_mark_convert() set
+ * defer_completion), never interrupt context. invalidate_lock is taken
+ * EXCLUSIVELY because this mutates the extent tree (CLAUDE.md rule 18).
+ * It also means no path may wait for direct I/O while holding
+ * invalidate_lock -- this would wait for it in turn. Truncate, punch,
+ * defrag and the lock suspend all drain direct I/O BEFORE taking it.
+ *
+ * The DIO code calls inode_dio_end() only after this returns, so
+ * truncate and punch, which inode_dio_wait(), cannot free these blocks
+ * while it runs. It also invalidates the page cache over the range only
+ * after this returns, so a buffered reader that cached zeros from the
+ * preallocated blocks meanwhile loses them.
+ *
+ * A failure is the write's failure: its data is on the device but the
+ * map still says preallocated, so the range reads as zeros, and the
+ * caller is told.
+ */
+static int cetrafs_dio_end_io(struct kiocb *iocb, loff_t offset, ssize_t size, void *private)
+{
+    struct inode *inode = file_inode(iocb->ki_filp);
+    unsigned int bits = inode->i_blkbits;
+    sector_t b, last;
+    int ret = 0;
+
+    if (private != CETRAFS_DIO_CONVERT_MARK || size <= 0)
+        return 0;
+    if (cetrafs_dio_skip_convert)
+        return 0; /* test-only, see the knob */
+
+    b = offset >> bits;
+    last = (offset + size - 1) >> bits;
+    filemap_invalidate_lock(inode->i_mapping);
+    while (b <= last) {
+        struct buffer_head map = { 0 };
+        u64 n;
+
+        map.b_size = (size_t) min_t(u64, last - b + 1, (u64) U32_MAX >> bits) << bits;
+        ret = __cetrafs_get_block(inode, b, &map, 1, false, CETRAFS_GB_CONVERT);
+        if (ret)
+            break;
+        /* Never trust the answer for progress (rule 14): at least one
+         * block, at most what was asked. */
+        n = clamp_t(u64, map.b_size >> bits, 1, last - b + 1);
+        b += n;
+    }
+    filemap_invalidate_unlock(inode->i_mapping);
+
+    if (ret)
+        pr_err_ratelimited("ino=%llu: O_DIRECT write at %lld+%zd landed but block %llu could not be marked written "
+                           "(%d) -- it reads as zeros, the write fails\n",
+                           (unsigned long long) inode->i_ino, (long long) offset, size, (unsigned long long) b, ret);
+    else
+        atomic64_inc(&cetrafs_dio_converts);
     return ret;
 }
 
@@ -330,10 +478,18 @@ static ssize_t cetrafs_direct_IO(struct kiocb *iocb, struct iov_iter *iter)
 {
     struct inode *inode = iocb->ki_filp->f_mapping->host;
 
-    if (iov_iter_rw(iter) == WRITE && cetrafs_sb_is_fenced(inode->i_sb))
+    if (iov_iter_rw(iter) == READ)
+        return blockdev_direct_IO(iocb, inode, iter, cetrafs_dio_get_block);
+
+    if (cetrafs_sb_is_fenced(inode->i_sb))
         return -EIO; /* self-fenced: no new writes */
 
-    return blockdev_direct_IO(iocb, inode, iter, cetrafs_dio_get_block);
+    /* Without DIO_SKIP_HOLES a write into a hole or preallocated space
+     * maps with create == 1 and stays direct (enum cetrafs_gb_mode). */
+    if (!READ_ONCE(cetrafs_dio_fill_holes))
+        return blockdev_direct_IO(iocb, inode, iter, cetrafs_dio_get_block);
+    return __blockdev_direct_IO(iocb, inode, inode->i_sb->s_bdev, iter, cetrafs_dio_get_block, cetrafs_dio_end_io,
+                                DIO_LOCKING);
 }
 
 /*
@@ -1281,6 +1437,78 @@ u64 cetrafs_convert_leaf_full_count(void)
  * they are not there, so the caller can fall back rather than leave a
  * half-split array: nothing is modified until the room is known.
  */
+/*
+ * Find the WRITTEN extents a just-converted run [iblock, +count) at 'lba'
+ * would continue: 'pred' ends exactly where it starts, 'succ' starts
+ * exactly where it ends, both logically AND physically. -1 = none.
+ *
+ * cetrafs_leaf_array_insert() merges only into the LAST entry, which is
+ * right for a file written in order. A preallocated range converted out
+ * of order -- O_DIRECT completions arrive in any order, sixteen 1 MiB
+ * writes into one hole at a time -- left every piece its own extent:
+ * a sequential fill of a 256 MiB hole ended at 232 extents where the
+ * buffered path left 1, and the later overwrites paid for it.
+ */
+static void cetrafs_leaf_array_neighbours(const cetrafs_extent_t *arr,
+                                          u16 n,
+                                          u32 iblock,
+                                          u64 lba,
+                                          u32 count,
+                                          int *pred,
+                                          int *succ)
+{
+    u16 j;
+
+    *pred = -1;
+    *succ = -1;
+    for (j = 0; j < n; j++) {
+        u32 eb = cetrafs_le32(arr[j].ee_block);
+        u32 len = cetrafs_extent_len(arr[j].ee_len);
+        u64 phys = cetrafs_extent_phys_from_hilo(arr[j].ee_start_hi, arr[j].ee_start_lo);
+
+        if (cetrafs_extent_is_uninit(arr[j].ee_len) || !len)
+            continue;
+        if ((u64) eb + len == iblock && phys + len == lba && (u64) len + count <= CETRAFS_EXT_LEN_MASK)
+            *pred = j;
+        else if ((u64) iblock + count == eb && lba + count == phys && (u64) len + count <= CETRAFS_EXT_LEN_MASK)
+            *succ = j;
+    }
+}
+
+/*
+ * Record the converted run by growing a neighbour instead of adding an
+ * entry: no slot needed, nothing leaves this leaf. Returns false (array
+ * untouched) when there is no neighbour to grow.
+ */
+static bool cetrafs_leaf_array_coalesce(cetrafs_extent_t *arr, u16 *np, u32 iblock, u64 lba, u32 count)
+{
+    int p, q;
+
+    cetrafs_leaf_array_neighbours(arr, *np, iblock, lba, count, &p, &q);
+    if (p >= 0) {
+        u32 plen = cetrafs_extent_len(arr[p].ee_len) + count;
+
+        if (q >= 0 && (u64) plen + cetrafs_extent_len(arr[q].ee_len) <= CETRAFS_EXT_LEN_MASK) {
+            /* Bridges the two: one extent, and the successor's slot goes.
+             * The array is unordered, so the last entry fills the gap. */
+            plen += cetrafs_extent_len(arr[q].ee_len);
+            arr[p].ee_len = cetrafs_extent_pack_len(plen, false);
+            arr[q] = arr[*np - 1];
+            (*np)--;
+            return true;
+        }
+        arr[p].ee_len = cetrafs_extent_pack_len(plen, false);
+        return true;
+    }
+    if (q >= 0) {
+        arr[q].ee_block = cetrafs_cpu_to_le32(iblock);
+        arr[q].ee_len = cetrafs_extent_pack_len(cetrafs_extent_len(arr[q].ee_len) + count, false);
+        cetrafs_extent_phys_to_hilo(lba, &arr[q].ee_start_hi, &arr[q].ee_start_lo);
+        return true;
+    }
+    return false;
+}
+
 /* A preallocated remainder a full leaf could not keep: the caller
  * appends it through the tree as an uninit extent. len 0 = none. */
 struct cetrafs_convert_tail {
@@ -1312,7 +1540,7 @@ static int cetrafs_leaf_array_convert(struct super_block *sb,
         u32 eb = cetrafs_le32(arr[i].ee_block);
         u32 count;
         u64 phys = cetrafs_extent_phys_from_hilo(arr[i].ee_start_hi, arr[i].ee_start_lo);
-        bool middle;
+        bool middle, in_place;
 
         if (!cetrafs_extent_is_uninit(arr[i].ee_len) || iblock < eb || iblock >= (u64) eb + len)
             continue;
@@ -1356,6 +1584,14 @@ static int cetrafs_leaf_array_convert(struct super_block *sb,
             count = 1;
 
         middle = (iblock > eb) && ((u64) iblock + count < (u64) eb + len);
+        /* Needs no slot at all: the whole extent converts in place, or
+         * an edge converts into a written neighbour that just grows. */
+        {
+            int p, q;
+
+            cetrafs_leaf_array_neighbours(arr, n, iblock, lba, count, &p, &q);
+            in_place = !middle && (count == len || p >= 0 || q >= 0);
+        }
 
         /*
          * Room check BEFORE any mutation.
@@ -1369,7 +1605,7 @@ static int cetrafs_leaf_array_convert(struct super_block *sb,
          * kretprobe, after the allocator had been exonerated twice
          * over. What happens now is below.
          */
-        if (n + 1 > max) {
+        if (n + 1 > max && !in_place) {
             /*
              * Leaf full. Earlier this failed the write outright with a
              * silent -ENOSPC (the VM-pauses-on-nospace bug), and then
@@ -1483,6 +1719,15 @@ static int cetrafs_leaf_array_convert(struct super_block *sb,
         }
 
         *done = count;
+        if (cetrafs_leaf_array_coalesce(arr, &n, iblock, lba, count)) {
+            *entries = cetrafs_cpu_to_le16(n);
+            return 0;
+        }
+        /* in_place promised no slot was needed; the neighbour it saw is
+         * judged on content the shrink above does not touch, so it must
+         * still be there. If not, the array is already edited and has no
+         * room: say so loudly rather than let the insert fail quietly. */
+        WARN_ON_ONCE(in_place && count != len && n >= max);
         return cetrafs_leaf_array_insert(arr, entries, max, iblock, lba, count, /*uninit=*/false);
     }
 
@@ -2545,8 +2790,13 @@ static bool cetrafs_leaf_bh_holds_uninit(struct buffer_head *lbh, u32 iblock)
  * (tests/kernel/convert_leaf_order.sh). So this leaf goes to the device
  * NOW, before anything else names what it gave up: a crash in between
  * leaves those blocks named by nothing, a leak the scrub reclaims (the
- * safe direction, rule 8). One write per split of a FULL leaf -- a rare
- * path, never per block.
+ * safe direction, rule 8). One synchronous write per split of a FULL
+ * leaf -- and that is NOT rare: random writes into a fallocated file fill
+ * the leaf that holds the preallocated extent (each middle split adds two
+ * entries) and nothing ever empties it, so from then on nearly every
+ * conversion lands here. Measured at 60-77% of 4 KiB writes into
+ * fallocated space, which is what caps that case at device latency per
+ * write (docs/PERFORMANCE.md 14). Not fixed yet.
  *
  * Kept dirty on failure: the cached leaf is the only copy of the shrunk
  * state, and the caller then appends nothing.
@@ -3299,7 +3549,8 @@ static int __cetrafs_get_block(struct inode *inode,
                                sector_t iblock,
                                struct buffer_head *bh_result,
                                int create,
-                               bool reader)
+                               bool reader,
+                               enum cetrafs_gb_mode mode)
 {
     u32 want = 1, converted = 1;
     struct super_block *sb = inode->i_sb;
@@ -3308,6 +3559,7 @@ static int __cetrafs_get_block(struct inode *inode,
     u32 bg_id;
     u32 run = 1; /* contiguous blocks mappable from iblock (see below) */
     bool found, merged, uninit = false;
+    bool dio_prealloc = false;
     u32 leaf_count;
     int ret;
 
@@ -3418,6 +3670,20 @@ static int __cetrafs_get_block(struct inode *inode,
          */
         return 0;
     }
+    if (found && uninit && mode == CETRAFS_GB_DIO) {
+        /* Mapped as it is; the completion converts it once the data is
+         * on the device (enum cetrafs_gb_mode). Widened to the rest of
+         * the preallocated extent like any other mapping. */
+        u64 w = bh_result->b_size >> inode->i_blkbits;
+
+        map_bh(bh_result, sb, lba);
+        if (w > 1 && run > 1)
+            bh_result->b_size = (size_t) min_t(u64, w, run) << inode->i_blkbits;
+        cetrafs_dio_mark_convert(bh_result);
+        atomic64_inc(&cetrafs_map_calls);
+        atomic64_add(bh_result->b_size >> inode->i_blkbits, &cetrafs_map_blocks);
+        return 0;
+    }
     if (found && uninit) {
         /*
          * First write into a block fallocate(ALLOCATE) reserved. The
@@ -3506,11 +3772,48 @@ static int __cetrafs_get_block(struct inode *inode,
     }
     if (!create)
         return 0; /* hole: leave unmapped, reader sees zeros */
+    if (mode == CETRAFS_GB_CONVERT) {
+        /* The write being completed mapped this block, and nothing may
+         * free it while that write is in flight. A hole here means the
+         * map changed under an in-flight DIO: report it, never paper
+         * over it by allocating. */
+        pr_err_ratelimited("ino=%llu: block %llu of a completing O_DIRECT write is a hole -- not converting\n",
+                           (unsigned long long) inode->i_ino, (unsigned long long) iblock);
+        return -EIO;
+    }
+    /* An O_DIRECT write into a hole INSIDE i_size allocates preallocated
+     * (enum cetrafs_gb_mode). Past i_size it still allocates written data,
+     * exactly as before this mode existed: such a write is synchronous
+     * (the DIO code never runs an extending write async) and i_size moves
+     * only after it completes. Whether a crash in that window can expose
+     * the block through a later truncate-up is the same question it was
+     * for the buffered path, and is not answered here. */
+    dio_prealloc = mode == CETRAFS_GB_DIO && ((loff_t) iblock << inode->i_blkbits) < i_size_read(inode);
 
     {
         ktime_t t0 = ktime_get();
         s64 us;
-        u64 preferred_lba = cetrafs_tree_last_contig_lba(inode, &raw);
+        /*
+         * An O_DIRECT write takes NO hint: the next block of the file's
+         * reserved run, whatever it is. Submissions allocate in file
+         * order under inode_lock, so a sequential writer still gets
+         * consecutive blocks from the run; a random one gets them too,
+         * which is what keeps it from claiming a run per write.
+         *
+         * The buffered hint -- the physical end of the LAST array entry --
+         * assumes the array grows in file order. Completions convert out
+         * of order and conversion reorders the array (a dropped entry is
+         * replaced by the last one), so under concurrent direct writes it
+         * pointed somewhere arbitrary: cetrafs_inode_take_reserved()
+         * refused the run, a new one was claimed and the old remainder
+         * given back, and the next tree edit flushed the bitmap
+         * synchronously under invalidate_lock -- one write in four, on a
+         * delay device; a sequential fill fragmented (~190 extents per
+         * 256 MiB). A hint taken from the block LOGICALLY before fixed
+         * that too, but cost a tree lookup per allocation, and a lookup
+         * that misses walks every leaf of a randomly filled file.
+         */
+        u64 preferred_lba = mode == CETRAFS_GB_DIO ? 0 : cetrafs_tree_last_contig_lba(inode, &raw);
 
         /*
          * Speculative run first. __block_write_begin() asks for exactly
@@ -3635,7 +3938,7 @@ static int __cetrafs_get_block(struct inode *inode,
         }
     }
 
-    ret = cetrafs_tree_append(inode, &raw, (u32) iblock, lba, 1, /*uninit=*/false, &merged, &leaf_count);
+    ret = cetrafs_tree_append(inode, &raw, (u32) iblock, lba, 1, dio_prealloc, &merged, &leaf_count);
     if (ret) {
         /*
          * A DIRECTORY's tree blocks go out through the journal, and a
@@ -3697,13 +4000,15 @@ static int __cetrafs_get_block(struct inode *inode,
            (unsigned long long) iblock, (unsigned long long) lba, (int) merged);
     map_bh(bh_result, sb, lba);
     set_buffer_new(bh_result);
+    if (dio_prealloc)
+        cetrafs_dio_mark_convert(bh_result);
 
     /* A growing OPEN regular file that just added a NEW extent (not a
      * merge) to its external tree is the moment fragmentation happens;
      * nudge the background defragmenter so always-open files (VM images)
      * get healed in flight, not only at close. The frag-index gate is in
      * consider(); it recomputes the exact index under lock. */
-    if (!merged && leaf_count && S_ISREG(inode->i_mode))
+    if (!merged && leaf_count && S_ISREG(inode->i_mode) && !cetrafs_lock_defrag_quiet(inode))
         cetrafs_defrag_consider(inode, leaf_count, (u64) iblock + 1);
 
     return 0;
@@ -3711,7 +4016,7 @@ static int __cetrafs_get_block(struct inode *inode,
 
 static int cetrafs_get_block(struct inode *inode, sector_t iblock, struct buffer_head *bh_result, int create)
 {
-    return __cetrafs_get_block(inode, iblock, bh_result, create, false);
+    return __cetrafs_get_block(inode, iblock, bh_result, create, false, CETRAFS_GB_PLAIN);
 }
 
 /*
@@ -3731,7 +4036,7 @@ static int cetrafs_get_block_read(struct inode *inode, sector_t iblock, struct b
 {
     if (WARN_ON_ONCE(create))
         return -EIO;
-    return __cetrafs_get_block(inode, iblock, bh_result, 0, true);
+    return __cetrafs_get_block(inode, iblock, bh_result, 0, true, CETRAFS_GB_PLAIN);
 }
 
 static int cetrafs_read_folio(struct file *file, struct folio *folio)
@@ -3785,6 +4090,11 @@ static int cetrafs_write_begin(const struct kiocb *iocb,
                                void **fsdata)
 {
     int ret;
+
+    /* An O_DIRECT write the DIO code could not take: it is finishing it
+     * through the page cache, one synchronous flush per call. */
+    if (iocb && (iocb->ki_flags & IOCB_DIRECT))
+        atomic64_inc(&cetrafs_dio_fallbacks);
 
     /* block_write_begin() allocates through cetrafs_get_block(). The
      * caller holds inode_lock, which excludes the other write paths but
@@ -4363,6 +4673,13 @@ static long cetrafs_fallocate(struct file *file, int mode, loff_t offset, loff_t
     }
 
     inode_lock(inode);
+    /* Same reason as cetrafs_truncate_shrink(): a punch frees blocks,
+     * and in-flight direct I/O is aimed at the physical ones. Drained
+     * BEFORE invalidate_lock: an O_DIRECT write's completion takes it to
+     * convert what it wrote (cetrafs_dio_end_io()), so waiting for that
+     * completion while holding it deadlocks. inode_lock, held from here
+     * on, keeps a new direct write from starting after the drain. */
+    inode_dio_wait(inode);
     /* And the same reason again for page faults, which hold no
      * inode_lock at all: this excludes them from the window between
      * dropping the cached folios below and freeing the blocks behind
@@ -4370,9 +4687,6 @@ static long cetrafs_fallocate(struct file *file, int mode, loff_t offset, loff_t
      * an uncontended rwsem is nothing next to the tree walk that
      * follows, and one exit point cannot forget to drop it. */
     filemap_invalidate_lock(inode->i_mapping);
-    /* Same reason as cetrafs_truncate_shrink(): a punch frees blocks,
-     * and in-flight direct I/O is aimed at the physical ones. */
-    inode_dio_wait(inode);
 
     /* A punch changes the file: not while it is handed to a peer. */
     ret = cetrafs_lock_write_gate(inode);

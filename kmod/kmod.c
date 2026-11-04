@@ -39,6 +39,13 @@ module_param_named(auto_defrag_min_pct, cetrafs_auto_defrag_min_pct, uint, 0644)
 MODULE_PARM_DESC(auto_defrag_min_pct,
                  "fragmentation index %% (100 = contiguous) at/above which a file auto-defrags (default 200)");
 
+/* After a decline (sparse, or no run to move into), how long the
+ * per-extent append trigger leaves the file alone -- see
+ * cetrafs_lock_defrag_quiet(). 0 = re-queue on every new extent. */
+unsigned int cetrafs_auto_defrag_quiet_secs = 10;
+module_param_named(auto_defrag_quiet_secs, cetrafs_auto_defrag_quiet_secs, uint, 0644);
+MODULE_PARM_DESC(auto_defrag_quiet_secs, "seconds the append trigger skips a file the janitor just declined (default 10)");
+
 unsigned int cetrafs_auto_defrag_min_extents = 4;
 module_param_named(auto_defrag_min_extents, cetrafs_auto_defrag_min_extents, uint, 0644);
 MODULE_PARM_DESC(

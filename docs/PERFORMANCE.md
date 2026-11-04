@@ -329,6 +329,86 @@ cold read-only pass, a held read-only fd keeping its map, a peer's stamp
 still sending it fresh, and defrag refusing a file a peer has open; each
 with the knob that breaks it.
 
+## 14. An O_DIRECT write into a hole or preallocated space stays direct
+
+`blockdev_direct_IO()` passes `DIO_SKIP_HOLES`, which maps a write inside
+i_size with `create == 0`. A hole or a preallocated block came back
+unmapped, the DIO code gave up on it (`-ENOTBLK`) and the VFS finished
+the write through the page cache plus a synchronous flush -- under
+`inode_lock`, so every such write ran at queue depth 1 whatever the
+caller asked for. That is the first write to every block of a sparse
+or fallocated VM image, and the `rand-write-4k-sparse` line of the
+2026-11-03 host benchmarks: 1,232-1,510 IOPS against ~22,000 for
+overwrites on the same arrays.
+
+`cetrafs_direct_IO()` now passes `DIO_LOCKING` only, and a DIO write maps
+with `create == 1`: a preallocated block as it is, a hole allocated
+PREALLOCATED; the write's completion (`cetrafs_dio_end_io()`, deferred to
+the DIO workqueue) converts the range once the data is on the device.
+Until then the blocks read as zeros, so nothing -- a reader, a peer, a
+crash -- can see what they held before. Three things came with it,
+each found by measuring:
+
+- **No allocation hint for a direct write**: it takes the next block of
+  the file's reserved run. The buffered hint (end of the last array
+  entry) went arbitrary once completions reordered the array; the run
+  was refused, a new one claimed, and the next tree edit flushed the
+  bitmap synchronously under `invalidate_lock` -- one write in four. A
+  hint from the LOGICAL predecessor fixed that but cost a tree lookup
+  per allocation, which on a randomly filled file is a walk of every
+  leaf (below).
+- **In-leaf coalescing** (`cetrafs_leaf_array_coalesce()`): a converted
+  run grows an adjacent written extent instead of adding one. Without it
+  a sequential fill converted out of order fragmented (4-5 extents per
+  256 MiB, ~190 with the old hint as well); with it, 1.
+- **Auto-defrag quiet period** (`auto_defrag_quiet_secs`): a declined
+  file was re-queued on every new extent, i.e. on every random write
+  into a hole -- 0.6 forced record reads per write.
+
+`dio_fill_holes=0` restores the fallback (A/B and escape hatch);
+`dio_fallbacks` in procfs `info` counts O_DIRECT writes that still go
+through the page cache, and should stay at zero.
+
+**Measured** on a 2 ms dm-delay device (loop-backed, 256 MiB file):
+
+| 4 KiB O_DIRECT writes, QD32 | fallback | direct |
+|---|---|---|
+| random, into a hole | 243 IOPS | **5,688** |
+| sequential, into a hole | 247 IOPS | **7,798** (1 extent) |
+| random, into fallocated space | 143 IOPS | 288 |
+| random overwrite (reference) | 7,907 | 7,907 |
+
+**Measured** on a 1 Gbit iSCSI node (143 GB LUN, 8 GiB file, QD as
+fio's `rand-write-4k-sparse`; two runs each, same module, A/B by knob):
+
+| O_DIRECT writes | fallback | direct |
+|---|---|---|
+| random 4 KiB into a hole, QD32 | 1,357-1,371 IOPS | 1,578-1,597 |
+| sequential 1 MiB into a hole, QD16 | 72 MiB/s | 94-95 (link-bound) |
+| random 4 KiB into fallocated space, QD32 | 960-965 IOPS | 1,291-1,296 |
+| random 4 KiB overwrite (reference) | | 21,019-21,226 |
+
+Random writes into a hole on a real file stay bounded by the extent
+tree, not the device: a file filled in random order has leaves whose
+index ranges all span the whole file, so the lookup of a hole visits
+most of them -- ~89 leaf reads per 4 KiB write at 62k extents (ftrace
+profile on the 1 Gbit iSCSI node), with the submitting thread at 94%
+system CPU. That cost predates this change (the buffered path did the
+same lookup); making a missed lookup sub-linear is a design change.
+
+Fallocated space stays slow: a conversion inside a FULL extent leaf
+moves the converted block to another leaf, and the source leaf must
+reach the device first (`cetrafs_convert_source_durable()`), once per
+write. Not fixed yet: the fixes that keep it safe either move written
+extents between leaves (which needs a multi-block atomic write) or
+change what a crash may lose.
+
+**Guarded by:** `tests/kernel/dio_no_fallback.sh` -- the fallback
+counter, QD16 against QD1 on a 3 ms device, a sequential fill's extent
+count, fio verify at QD32, and punches beside in-flight writes; with
+`dio_fill_holes=0`, `dio_skip_convert=1` and the coalescing removed as
+controls.
+
 ## Measured baseline
 
 On the reference hardware -- an enterprise FC array over 32GFC multipath (two

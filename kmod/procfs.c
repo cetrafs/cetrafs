@@ -233,6 +233,11 @@ static int cetrafs_proc_info_show(struct seq_file *m, void *v)
      * cetrafs_get_block() is answering with contiguous runs. */
     seq_printf(m, "map_calls: %llu\n", cetrafs_map_call_count());
     seq_printf(m, "map_blocks: %llu\n", cetrafs_map_block_count());
+    /* O_DIRECT writes finished through the page cache (each one a
+     * synchronous flush under inode_lock), and O_DIRECT completions that
+     * converted preallocated blocks. The first should stay at zero. */
+    seq_printf(m, "dio_fallbacks: %llu\n", cetrafs_dio_fallback_count());
+    seq_printf(m, "dio_converts: %llu\n", cetrafs_dio_convert_count());
     seq_printf(m, "zg_pending_deltas: %u\n", cetrafs_sb_pending_zg_deltas(sb));
     seq_printf(m, "journal_replays: %llu\n", cetrafs_journal_replay_count());
     seq_printf(m, "journal_replay_declines: %llu\n", cetrafs_journal_replay_decline_count());

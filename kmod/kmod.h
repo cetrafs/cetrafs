@@ -80,6 +80,7 @@ static inline pgoff_t cetrafs_blk_end_pgoff(u64 blk)
  * params (kmod.c): auto_defrag=0 disables, auto_defrag_extents tunes. */
 extern bool cetrafs_auto_defrag;
 extern unsigned int cetrafs_auto_defrag_min_pct;
+extern unsigned int cetrafs_auto_defrag_quiet_secs;
 extern unsigned int cetrafs_auto_defrag_min_extents;
 
 /* Fragmentation index (defrag.c): extents expressed as a percentage of
@@ -709,6 +710,8 @@ u64 cetrafs_bg_pick_cursor_count(void);
 u64 cetrafs_bg_pick_scan_count(void);
 u64 cetrafs_map_call_count(void);
 u64 cetrafs_map_block_count(void);
+u64 cetrafs_dio_fallback_count(void);
+u64 cetrafs_dio_convert_count(void);
 int cetrafs_bg_owner_zg_for_lba(struct super_block *sb, u64 lba, u32 *out_zg_id);
 int cetrafs_bg_invalidate_cache(struct super_block *sb, u32 bg_id);
 extern bool cetrafs_alloc_shadow_enabled;
@@ -905,6 +908,8 @@ int cetrafs_lock_defrag_begin(struct inode *inode);
 void cetrafs_lock_defrag_end(struct inode *inode);
 bool cetrafs_lock_defrag_try_queue(struct inode *inode);
 void cetrafs_lock_defrag_unqueue(struct inode *inode);
+void cetrafs_lock_defrag_quiet_for(struct inode *inode, unsigned int secs);
+bool cetrafs_lock_defrag_quiet(struct inode *inode);
 void cetrafs_inode_identity_init(struct inode *inode);
 extern struct kmem_cache *cetrafs_inode_cache;
 

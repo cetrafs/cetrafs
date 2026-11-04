@@ -460,6 +460,26 @@ ct_failable_dev() {
     echo "/dev/mapper/$base"
 }
 
+# ct_delay_dev <size_mb> <ms> [name] -> a loop-backed device whose every
+# I/O takes <ms> (dm-delay), or the empty string if dm-delay is missing.
+#
+# A loop device answers in microseconds, so anything that turns parallel
+# I/O into serial I/O costs nothing measurable on it. A fixed latency
+# makes queue depth visible: N requests in flight finish in one latency,
+# N serialised ones in N.
+ct_delay_dev() {
+    local mb="$1" ms="$2" name="${3:-delay}" base sectors img loopdev
+    command -v dmsetup >/dev/null 2>&1 || return 0
+    modprobe dm-delay 2>/dev/null || true
+    img="$(ct_image "$mb" "$name")"
+    loopdev="$(ct_loop "$img")"
+    sectors=$(blockdev --getsz "$loopdev")
+    base="ctd${name}$$"
+    dmsetup create "$base" --table "0 $sectors delay $loopdev 0 $ms" 2>/dev/null || return 0
+    ct_track dm "$base"
+    echo "/dev/mapper/$base"
+}
+
 # ct_dev_fail <dev> / ct_dev_restore <dev>: make every I/O to a
 # ct_failable_dev device fail, and put it back.
 #

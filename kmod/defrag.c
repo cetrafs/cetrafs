@@ -155,6 +155,26 @@ static void cetrafs_defrag_inode_lock(struct inode *inode)
     filemap_invalidate_lock(inode->i_mapping);
 }
 
+/*
+ * The same pair, for a step that FREES blocks: the mover frees the old
+ * physical blocks once the new run is committed, and O_DIRECT bypasses
+ * the page cache -- so an already-submitted DIO is aimed straight at
+ * those blocks and inode_lock does not exclude it. Drained here, BEFORE
+ * invalidate_lock: an O_DIRECT write's completion takes that lock to
+ * convert what it wrote (cetrafs_dio_end_io()), so waiting for it while
+ * holding the lock deadlocks. inode_lock keeps a new direct write from
+ * starting until the pair is dropped.
+ *
+ * Only where blocks are freed: draining stops a writer's whole queue,
+ * and the analysis pass that usually ends in a decline has no reason to.
+ */
+static void cetrafs_defrag_inode_lock_drained(struct inode *inode)
+{
+    inode_lock(inode);
+    inode_dio_wait(inode);
+    filemap_invalidate_lock(inode->i_mapping);
+}
+
 static void cetrafs_defrag_inode_unlock(struct inode *inode)
 {
     filemap_invalidate_unlock(inode->i_mapping);
@@ -516,13 +536,8 @@ int cetrafs_defrag_inode(struct inode *inode, struct cetrafs_defrag_stats *out_s
         if (cetrafs_defrag_step_delay_ms)
             msleep(cetrafs_defrag_step_delay_ms); /* test-only: the lock is NOT held here, which is the point */
 
-        cetrafs_defrag_inode_lock(inode);
-        /* The step below frees the old physical blocks once the new run
-         * is committed, and O_DIRECT bypasses the page cache -- so an
-         * already-submitted DIO is aimed straight at those blocks and
-         * inode_lock does not exclude it. Wait for it, as the truncate
-         * and punch paths do. */
-        inode_dio_wait(inode);
+        /* The step below frees the old physical blocks. */
+        cetrafs_defrag_inode_lock_drained(inode);
 
         /* Re-read and revalidate: same file (generation), same shape
          * (length + dense), still long enough. Anything else -- a
@@ -862,6 +877,10 @@ static void cetrafs_defrag_worker(struct work_struct *work)
             struct cetrafs_defrag_stats stats = {0};
 
             ret = cetrafs_defrag_inode(inode, &stats);
+            /* Declined: it would be declined again. Keep the append
+             * trigger quiet for a while (cetrafs_lock_defrag_quiet()). */
+            if (ret == -EOPNOTSUPP || ret == -ENOSPC)
+                cetrafs_lock_defrag_quiet_for(inode, cetrafs_auto_defrag_quiet_secs);
             if (ret == 0 && stats.blocks_moved)
                 pr_debug("auto-defrag: ino=%llu extents %llu -> %llu (%llu blocks moved)\n",
                          (unsigned long long) inode->i_ino, (unsigned long long) stats.extents_before,

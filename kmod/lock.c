@@ -237,6 +237,9 @@ struct cetrafs_inode_info {
      * when there were none). */
     bool defrag_pinned;
     atomic_t defrag_queued; /* dedup: one pending background request per inode */
+    /* jiffies before which an APPEND does not re-queue this file: set
+     * when the janitor declined it (cetrafs_lock_defrag_quiet()). */
+    unsigned long defrag_quiet_until;
 
     /* Userspace-driven explicit whole-file lock (flock(2), cetrafs_flock).
      * Option A / fd-scoped: the fd that acquired the lock, NULL when this
@@ -1137,6 +1140,7 @@ static void cetrafs_inode_identity_init_ci(struct cetrafs_inode_info *ci)
     ci->foreign_open_checked = 0;
     ci->defrag_pinned = false;
     atomic_set(&ci->defrag_queued, 0);
+    ci->defrag_quiet_until = jiffies;
     ci->explicit_lock_file = NULL;
     ci->lock_suspended = false;
     ci->dirent_seq_cached = U64_MAX;
@@ -3083,8 +3087,11 @@ static int cetrafs_lock_suspend(struct inode *inode, struct file *file)
     drain = !cetrafs_lock_suspend_skip_gate; /* read once: the unlock must match */
     if (drain) {
         inode_lock(inode);
-        filemap_invalidate_lock(inode->i_mapping);
+        /* Before invalidate_lock, not under it: an O_DIRECT write's
+         * completion takes that lock (cetrafs_dio_end_io()). inode_lock
+         * keeps a new one from starting after the drain. */
         inode_dio_wait(inode);
+        filemap_invalidate_lock(inode->i_mapping);
     }
 
     /*
@@ -3737,6 +3744,27 @@ bool cetrafs_lock_defrag_try_queue(struct inode *inode)
 void cetrafs_lock_defrag_unqueue(struct inode *inode)
 {
     atomic_set(&CETRAFS_I(inode)->defrag_queued, 0);
+}
+
+/*
+ * A file the janitor just declined (sparse, or no run to move it into)
+ * is declined again by the next attempt, and the per-extent trigger in
+ * the append path re-queued it on EVERY new extent: a file filled in
+ * random order makes one per write, so the worker cycled flat out --
+ * iget, a forced record read, the analysis under inode_lock -- at the
+ * rate the file was written, competing with that write for the device
+ * (0.6 forced reads per 4 KiB write, measured on a delay device). After
+ * a decline the APPEND trigger stays quiet for a while; the close-time
+ * trigger and the cancel hand-back do not consult this.
+ */
+void cetrafs_lock_defrag_quiet_for(struct inode *inode, unsigned int secs)
+{
+    WRITE_ONCE(CETRAFS_I(inode)->defrag_quiet_until, jiffies + secs * HZ);
+}
+
+bool cetrafs_lock_defrag_quiet(struct inode *inode)
+{
+    return time_before(jiffies, READ_ONCE(CETRAFS_I(inode)->defrag_quiet_until));
 }
 
 /*
