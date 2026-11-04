@@ -248,6 +248,34 @@ static void growfs_release_claim(int fd)
     }
 }
 
+/*
+ * Refuse a volume a node has mounted: the device itself is asked, by
+ * watching every registered row's heartbeat over a probe window.
+ */
+static void growfs_refuse_live_peer(const char *dev)
+{
+    char label[CETRAFS_NODE_LABEL_LEN + 1] = {0};
+    long long age = 0;
+    uint32_t row = 0;
+    int lp = cetrafs_find_live_peer(dev, &row, label, sizeof(label), &age);
+
+    if (lp < 0)
+        die_dev(
+            "%s: cannot read its Node Registry (I/O error) -- so it is impossible to prove\n"
+            "       no other node has this volume mounted, and growing a volume out from\n"
+            "       under a running node relocates the tables it is still writing to.\n"
+            "       Fix the device and retry.",
+            dev);
+    if (lp)
+        die_dev(
+            "%s is mounted by another node (registry row %u%s%s) -- it is still heartbeating.\n"
+            "       Growing relocates the descriptor tables that node has cached, which would\n"
+            "       send its allocator writes to superseded blocks. Unmount it there, then\n"
+            "       retry. (row's own last_seen reads %llds ago by this machine's clock,\n"
+            "       which means nothing if the two disagree.)",
+            dev, row, label[0] ? ", " : "", label[0] ? label : "", age);
+}
+
 int main(int argc, char **argv)
 {
     if (argc < 2) {
@@ -290,28 +318,12 @@ int main(int argc, char **argv)
         if (cetrafs_device_mounted(dev, where, sizeof(where)))
             die_dev("%s is mounted on %s -- unmount it first (growing is offline in this build)", dev, where);
     }
-    {
-        char label[CETRAFS_NODE_LABEL_LEN + 1] = {0};
-        long long age = 0;
-        uint32_t row = 0;
-        int lp = cetrafs_find_live_peer(dev, &row, label, sizeof(label), &age);
-
-        if (lp < 0)
-            die_dev(
-                "%s: cannot read its Node Registry (I/O error) -- so it is impossible to prove\n"
-                "       no other node has this volume mounted, and growing a volume out from\n"
-                "       under a running node relocates the tables it is still writing to.\n"
-                "       Fix the device and retry.",
-                dev);
-        if (lp)
-            die_dev(
-                "%s is mounted by another node (registry row %u%s%s) -- it is still heartbeating.\n"
-                "       Growing relocates the descriptor tables that node has cached, which would\n"
-                "       send its allocator writes to superseded blocks. Unmount it there, then\n"
-                "       retry. (row's own last_seen reads %llds ago by this machine's clock,\n"
-                "       which means nothing if the two disagree.)",
-                dev, row, label[0] ? ", " : "", label[0] ? label : "", age);
-    }
+    /* The device-side half: a dry run asks now (it claims nothing);
+     * a real grow asks once its claim is down, below -- asked before
+     * the claim, a node that mounted in between passed every check of
+     * its own (there was no claim yet) and was never looked for again. */
+    if (dry_run)
+        growfs_refuse_live_peer(dev);
 
     int fd = open(dev, dry_run ? (O_RDONLY | O_CLOEXEC) : (O_RDWR | O_CLOEXEC));
 
@@ -708,6 +720,11 @@ int main(int argc, char **argv)
         grow_repair_sb = sb;
         atexit(growfs_repair_release_atexit);
         printf("  claimed registry row %d for the duration of this grow\n", grow_repair_row);
+        fflush(stdout);
+        /* Claim first, then look: a node mounting from here on sees the
+         * claim and refuses, and one that got in before it is found
+         * here. The other order left the gap between them open. */
+        growfs_refuse_live_peer(dev);
     }
 
     /* ---------------------------------------------------------------

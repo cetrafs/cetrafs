@@ -9,6 +9,7 @@
 #include <linux/buffer_head.h>
 #include <linux/byteorder/generic.h>
 #include <linux/crc32c.h>
+#include <linux/delay.h>
 #include <linux/dcache.h>
 #include <linux/errno.h>
 #include <linux/fs.h>
@@ -947,6 +948,13 @@ struct cetrafs_defrag *cetrafs_sb_get_defrag(struct super_block *sb)
 
 /* ------ fill_super (mount-time verification) ------ */
 
+/* TEST ONLY, one-shot: hold a mount between its pre-registration gate and
+ * its registration, where an offline repairer can claim the volume
+ * (tests/kernel/repair_claim_mid_mount.sh). */
+static unsigned int cetrafs_mount_register_stall_ms;
+module_param_named(mount_register_stall_ms, cetrafs_mount_register_stall_ms, uint, 0644);
+MODULE_PARM_DESC(mount_register_stall_ms, "TEST ONLY: one-shot pause between the mount gate and registration");
+
 /* TEST ONLY: pretend the kernel runs with this page size, so the
  * refusal below can be reached on the 4 KiB hosts this project has
  * (tests/kernel/page_size_report.sh). 0: the real PAGE_SIZE. */
@@ -1788,6 +1796,9 @@ int cetrafs_fill_super(struct super_block *sb, struct fs_context *fc)
             }
         }
 
+        if (cetrafs_mount_register_stall_ms) /* TEST ONLY, one-shot */
+            msleep(xchg(&cetrafs_mount_register_stall_ms, 0));
+
         /* Find/claim this node's Node Registry row. */
         {
             u8 node_uuid[CETRAFS_NODE_UUID_LEN];
@@ -1845,6 +1856,34 @@ int cetrafs_fill_super(struct super_block *sb, struct fs_context *fc)
                             "may mount it. Refusing; retry the mount.\n");
                     else
                         pr_err("mount: post-registration single-mounter re-check failed: %d\n", crc);
+                    cetrafs_free_sb_info(sb);
+                    brelse(bh);
+                    return crc ? crc : -EBUSY;
+                }
+            }
+
+            /* Post-registration repair-claim re-check. The gate above
+             * looked for an offline repairer BEFORE registering -- it
+             * must, a refused node may not write -- and that check can
+             * take seconds of registry and bitmap reads to reach this
+             * point. fsck -r or growfs claiming in between saw no
+             * registered node (ours did not exist yet) and went ahead;
+             * this mount then came up allocating out of the structures
+             * the repair was rewriting. Our row is committed now, so a
+             * repairer that starts after this sees it and refuses, and
+             * one that started before is visible here. */
+            {
+                bool repairing = false;
+                char who[CETRAFS_NODE_LABEL_LEN] = {0};
+                int crc = cetrafs_node_repair_claim_exists(sb, &repairing, who, sizeof(who));
+
+                if (crc || repairing) {
+                    if (repairing)
+                        pr_err("%s: a repair (%s) started while this mount was in flight -- refusing to mount; "
+                               "wait for it to finish\n",
+                               sb->s_id, who[0] ? who : "an offline tool");
+                    else
+                        pr_err("mount: post-registration repair-claim re-check failed: %d\n", crc);
                     cetrafs_free_sb_info(sb);
                     brelse(bh);
                     return crc ? crc : -EBUSY;
