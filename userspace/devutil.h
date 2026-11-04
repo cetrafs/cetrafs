@@ -371,10 +371,9 @@ static inline int cetrafs_find_repair_claim(int fd,
 static unsigned char cetrafs_repair_saved[CETRAFS_BLOCK_SIZE];
 static int cetrafs_repair_borrowed;
 
-/* How long a liveness probe watches hb_seq, before the watched rows
- * have their say (cetrafs_probe_window()). CETRAFS_PEER_PROBE_SECS is a
- * test knob only: the suite cannot afford a real heartbeat interval per
- * assertion. Unset in every normal invocation. */
+/* CETRAFS_PEER_PROBE_SECS is a test knob only: the suites cannot afford
+ * a real stale window per assertion. Returns 0 when unset, which is
+ * every normal invocation. */
 static inline unsigned cetrafs_peer_probe_secs(void)
 {
     const char *env = getenv("CETRAFS_PEER_PROBE_SECS");
@@ -385,27 +384,37 @@ static inline unsigned cetrafs_peer_probe_secs(void)
         if (v > 0)
             return (unsigned) v;
     }
-    return CETRAFS_PEER_PROBE_SECS;
+    return 0;
 }
 
 /*
- * The probe window for a set of rows: long enough for the SLOWEST of
- * them to beat, twice. A node advertises its own interval in its row
- * (hb_interval_secs, up to CETRAFS_HB_INTERVAL_MAX_SECS) and the fixed
- * window (one default interval + 5 s = 20 s) was shorter than a legal
- * 30 s one: a live node beating that slowly could pass a whole probe
- * unseen and be declared gone -- by mkfs -f, by fsck -r. Clamped to the
- * legal maximum, so a hostile row cannot make us sleep for days; 0 is a
- * row that predates the field and leaves the base window. The kernel's
- * own probe (node.c) floors on four beats; this one blocks a human at a
- * prompt and is paid only when some row looks live, so two.
+ * How long a tool watches a row that looks mounted before calling its
+ * node gone: exactly as long as a mounted peer would -- the stale
+ * window, floored at four of the row's own advertised beats
+ * (cetrafs_node_is_stale(), and the kernel's own mount probe).
+ *
+ * It was two beats plus 5 s, 20 s at the default interval. But the
+ * stale window is 120 s for a reason that has nothing to do with
+ * heartbeats (cetrafs.h, CETRAFS_NODE_STALE_SECS): a node whose paths
+ * have all failed has its I/O QUEUED by multipath for up to 90 s, its
+ * heartbeat included, and then it all lands. A tool that waited 20 s
+ * formatted or repaired a volume such a node was about to write to --
+ * the inversion that window was raised to prevent, re-opened by the
+ * one caller that blocks a human at a prompt. Paid only when some row
+ * looks live. Clamped to the legal maximum interval, so a hostile row
+ * cannot make us sleep for days; 0 is a row that predates the field.
  */
 static inline unsigned cetrafs_probe_window(uint32_t max_advertised)
 {
-    unsigned base = cetrafs_peer_probe_secs();
+    unsigned knob = cetrafs_peer_probe_secs();
     uint32_t pi = max_advertised < CETRAFS_HB_INTERVAL_MAX_SECS ? max_advertised : CETRAFS_HB_INTERVAL_MAX_SECS;
+    unsigned window = CETRAFS_NODE_STALE_SECS;
 
-    return pi && 2 * pi + 5 > base ? 2 * pi + 5 : base;
+    if (knob) /* tests: the old two-beat rule over a compressed base */
+        return pi && 2 * pi + 5 > knob ? 2 * pi + 5 : knob;
+    if (pi && 4 * pi > window)
+        window = 4 * pi;
+    return window;
 }
 
 static inline void cetrafs_repair_timer(int fd, const cetrafs_superblock_t *sb, uint32_t row, int on);

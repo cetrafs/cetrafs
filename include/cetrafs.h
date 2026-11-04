@@ -853,15 +853,6 @@ typedef struct {
 #define CETRAFS_STALE_MAX_SECS       240
 #define CETRAFS_STALE_MIN_BEATS      3 /* stale_secs >= this * hb_interval_secs */
 
-/* The BASE of how long a userspace tool (mkfs/fsck/growfs) watches a
- * Node Registry row before concluding nobody is heartbeating on it --
- * enough for one DEFAULT interval with margin. It is only a floor: a
- * node may run a slower interval (up to CETRAFS_HB_INTERVAL_MAX_SECS)
- * and advertises it in its row, and the window grows to cover that
- * (devutil.h's cetrafs_probe_window()). The kernel does not use this: a
- * mounted node watches its peers continuously and has no reason to
- * block. */
-#define CETRAFS_PEER_PROBE_SECS (CETRAFS_HEARTBEAT_INTERVAL_SECS + 5)
 
 /* An offline repairer's registry claim (CETRAFS_NODE_STATE_REPAIR) is
  * renewed -- hb_seq bumped -- on a timer this often, whatever phase the
