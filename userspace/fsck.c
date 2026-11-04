@@ -2217,6 +2217,10 @@ int main(int argc, char **argv)
         uint8_t *refd = (uint8_t *) xcalloc(bmwords, 1);
         uint8_t *dupd = (uint8_t *) xcalloc(bmwords, 1);
         uint8_t *weakd = (uint8_t *) xcalloc(bmwords, 1);
+        /* Leaked blocks to clear once the namespace pass has run: see
+         * the reconcile loop below. */
+        uint8_t *leakd = (uint8_t *) xcalloc(bmwords, 1);
+        uint64_t leak_deferred = 0;
         uint64_t stale_blocks = 0, stale_before = 0;
 /* FSCK_SET/FSCK_GET are defined globally above (guarded). */
         uint8_t *ibmap = (uint8_t *) xcalloc(cetrafs_le64(sb.inode_bmap_blocks), CETRAFS_BLOCK_SIZE);
@@ -2624,15 +2628,20 @@ int main(int argc, char **argv)
                      * (who allocated it, who should have freed it). */
                     if (getenv("CETRAFS_FSCK_DUMP_LEAKS"))
                         fprintf(stderr, "LEAK: lba=%" PRIu64 "\n", bg_data_start[b] + i);
-                    /* Nothing references it, so clearing the bit cannot
-                     * lose anything -- the 128 MiB evict_inode class,
-                     * which until now could only be recovered by
-                     * reformatting. */
+                    /* Nothing ALLOCATED references it -- the 128 MiB
+                     * evict_inode class, which until now could only be
+                     * recovered by reformatting. But this pass sees only
+                     * records whose bit is set: a file a directory still
+                     * names, whose inode bit is clear, owns blocks that
+                     * look exactly like these, and only the namespace
+                     * pass (later) finds that dirent and stops repairs.
+                     * Clearing here freed that file's data first. So the
+                     * clear waits for the namespace pass, and happens
+                     * only if nothing there blocked repair; the bit
+                     * stays counted as used until then. */
                     if (repair_mode && !repair_blocked && !fsck_dead_unwalkable) {
-                        bmap[i / 8] &= (uint8_t) ~(1u << (i % 8));
-                        bmap_dirty = 1;
-                        marked = 0;
-                        repairs_made++;
+                        FSCK_SET(leakd, idx);
+                        leak_deferred++;
                     }
                 } else if (!marked && is_refd && FSCK_GET(weakd, idx)) {
                     /* Named only by a deleted record: its previous
@@ -3500,6 +3509,75 @@ int main(int argc, char **argv)
         bad_dirent_block_count = bad_dirent_block_cap = 0;
 
         printf("  namespace: %" PRIu64 " directory entries across the tree\n", dirents_seen);
+        /* The leaked blocks the content pass set aside, now that the
+         * namespace has been walked and nothing in it stopped repair. */
+        if (leak_deferred && repair_blocked) {
+            fprintf(stderr, "NOTE: %" PRIu64 " leaked block(s) not cleared: the namespace pass found a fault "
+                            "that makes them indistinguishable from a live file's\n",
+                    leak_deferred);
+        } else if (leak_deferred) {
+            uint64_t ix = 0, cleared = 0;
+
+            for (uint32_t b = 0; b < cetrafs_le32(sb.block_group_count); ++b) {
+                uint64_t bmap_blocks = (bg_data_cnt[b] + CETRAFS_BLOCK_SIZE * 8 - 1) / (CETRAFS_BLOCK_SIZE * 8);
+                uint8_t *bmap = (uint8_t *) xcalloc(bmap_blocks ? bmap_blocks : 1, CETRAFS_BLOCK_SIZE);
+                int dirty = 0;
+                uint64_t bg_before = cleared;
+
+                pread_all(fd, bmap, (size_t) bmap_blocks * CETRAFS_BLOCK_SIZE,
+                          (off_t) bg_bmap_lba[b] * CETRAFS_BLOCK_SIZE);
+                for (uint64_t i = 0; i < bg_data_cnt[b]; ++i, ++ix) {
+                    if (!((leakd[ix / 8] >> (ix % 8)) & 1u) || !(bmap[i / 8] & (1u << (i % 8))))
+                        continue;
+                    bmap[i / 8] &= (uint8_t) ~(1u << (i % 8));
+                    dirty = 1;
+                    cleared++;
+                }
+                if (dirty) {
+                    uint64_t n = cleared - bg_before;
+                    uint8_t blk[CETRAFS_BLOCK_SIZE] = {0};
+                    cetrafs_block_group_t bgd;
+                    cetrafs_zone_group_t zg;
+                    uint32_t z = bg_owner_expected[b];
+                    int pool = z == CETRAFS_BG_OWNER_FREE;
+
+                    /* The bits first, then the counters that credit
+                     * them: stopped in between, the counts are low,
+                     * which is the direction a reconcile only raises. */
+                    pwrite_all(fd, bmap, (size_t) bmap_blocks * CETRAFS_BLOCK_SIZE,
+                               (off_t) bg_bmap_lba[b] * CETRAFS_BLOCK_SIZE);
+
+                    pread_all(fd, blk, sizeof(blk), (off_t) bg_desc_lba[b] * CETRAFS_BLOCK_SIZE);
+                    memcpy(&bgd, blk, sizeof(bgd));
+                    bgd.free_data_blocks = cetrafs_cpu_to_le64(cetrafs_le64(bgd.free_data_blocks) + n);
+                    bgd.checksum = 0;
+                    bgd.checksum = cetrafs_cpu_to_le64(crc32c_struct(
+                        &bgd, sizeof(bgd), offsetof(cetrafs_block_group_t, checksum), sizeof(bgd.checksum)));
+                    memcpy(blk, &bgd, sizeof(bgd));
+                    pwrite_all(fd, blk, sizeof(blk), (off_t) bg_desc_lba[b] * CETRAFS_BLOCK_SIZE);
+
+                    if (pool)
+                        z = b % cetrafs_le32(sb.zone_group_count);
+                    memset(blk, 0, sizeof(blk));
+                    pread_all(fd, blk, sizeof(blk), (off_t) (cetrafs_le64(sb.zg_table_start) + z) * CETRAFS_BLOCK_SIZE);
+                    memcpy(&zg, blk, sizeof(zg));
+                    if (pool)
+                        zg.pool_free_blocks = cetrafs_cpu_to_le64(cetrafs_le64(zg.pool_free_blocks) + n);
+                    else
+                        zg.free_data_blocks = cetrafs_cpu_to_le64(cetrafs_le64(zg.free_data_blocks) + n);
+                    zg.hot_checksum = 0;
+                    zg.hot_checksum = cetrafs_cpu_to_le64((uint64_t) crc32c_struct(
+                        (const uint8_t *) &zg + CETRAFS_ZG_HOT_OFF, CETRAFS_ZG_HOT_LEN,
+                        offsetof(cetrafs_zone_group_t, hot_checksum) - CETRAFS_ZG_HOT_OFF, sizeof(zg.hot_checksum)));
+                    memcpy(blk, &zg, sizeof(zg));
+                    pwrite_all(fd, blk, sizeof(blk), (off_t) (cetrafs_le64(sb.zg_table_start) + z) * CETRAFS_BLOCK_SIZE);
+                }
+                free(bmap);
+            }
+            repairs_made += cleared;
+            printf("  cleared %" PRIu64 " leaked block(s)\n", cleared);
+        }
+        free(leakd);
         if (ibmap_dirty)
             pwrite_all(fd, ibmap, (size_t) cetrafs_le64(sb.inode_bmap_blocks) * CETRAFS_BLOCK_SIZE,
                        (off_t) cetrafs_le64(sb.inode_bmap_start) * CETRAFS_BLOCK_SIZE);
