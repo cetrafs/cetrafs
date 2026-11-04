@@ -3607,6 +3607,11 @@ static bool cetrafs_defrag_ignore_readers;
 module_param_named(defrag_ignore_readers, cetrafs_defrag_ignore_readers, bool, 0644);
 MODULE_PARM_DESC(defrag_ignore_readers, "TEST ONLY: defrag a file a peer has open for read");
 
+/* TEST ONLY: pause the defrag pin just before it takes lock_mutex. */
+static unsigned int cetrafs_defrag_begin_stall_ms;
+module_param_named(defrag_begin_stall_ms, cetrafs_defrag_begin_stall_ms, uint, 0644);
+MODULE_PARM_DESC(defrag_begin_stall_ms, "TEST ONLY: pause the defrag pin before it takes lock_mutex");
+
 /*
  * Defrag needs the file to itself, and the exclusive lock alone does not
  * say that: a peer that opened the file for READ holds no lock, it is
@@ -3652,18 +3657,28 @@ int cetrafs_lock_defrag_begin(struct inode *inode)
     if (!cetrafs_sb_file_lock_enabled(sb))
         return -EOPNOTSUPP;
 
-    /* Suspended: the lock this pass would pin is not ours right now, and
-     * "local writers exist, so it is already ours" -- the premise the pin
-     * below is built on -- is false. A peer may be writing the very
-     * blocks the mover would relocate. */
-    if (READ_ONCE(CETRAFS_I(inode)->lock_suspended))
-        return -EBUSY;
-
     ret = cetrafs_sb_get_node_id(sb, &my_node_id);
     if (ret)
         return ret;
 
+    if (cetrafs_defrag_begin_stall_ms)
+        msleep(cetrafs_defrag_begin_stall_ms); /* TEST ONLY */
     mutex_lock(&ci->lock_mutex);
+
+    /* Suspended: the lock this pass would pin is not ours right now, and
+     * "local writers exist, so it is already ours" -- the premise the pin
+     * below is built on -- is false. A peer may be writing the very
+     * blocks the mover would relocate.
+     *
+     * Under lock_mutex, which the suspend sets the flag under and which
+     * makes it refuse a pinned file: checked before taking it, a suspend
+     * that landed in between went unseen, and the mover pinned and
+     * relocated a file just handed to a peer
+     * (tests/kernel/defrag_vs_suspend.sh). */
+    if (ci->lock_suspended) {
+        ret = -EBUSY;
+        goto out;
+    }
 
     if (ci->defrag_pinned) {
         ret = -EBUSY; /* another pass is already pinned on this inode */
