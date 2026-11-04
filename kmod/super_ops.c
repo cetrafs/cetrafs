@@ -86,11 +86,15 @@ static int cetrafs_write_inode(struct inode *inode, struct writeback_control *wb
  * with nothing an administrator could do to force them out.
  *
  * Unmount was unaffected (generic_shutdown_super() syncs and then calls
- * ->put_super, which flushes). What was affected is the case this
- * filesystem is actually built for: fsfreeze before a SAN snapshot of a
- * VM-image datastore. freeze_super() reaches durability through
- * sync_filesystem() -> ->sync_fs, so the snapshot captured free-space
+ * ->put_super, which flushes). What was affected is sync(2)/syncfs(2):
+ * an administrator flushing before a SAN snapshot got free-space
  * counters that did not match the bitmaps they summarise.
+ *
+ * fsfreeze is NOT supported: there is no .freeze_fs, so FIFREEZE fails
+ * with EOPNOTSUPP. Supporting it needs every writer the VFS does not
+ * gate held off while frozen -- the defrag pass, the scrub, pending-free
+ * apply, and the lock and presence swaps that open and close make --
+ * and is an open item, not something this function provides.
  */
 static int cetrafs_sync_fs(struct super_block *sb, int wait)
 {
