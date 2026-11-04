@@ -4526,7 +4526,8 @@ static int __cetrafs_truncate_shrink(struct inode *inode, loff_t new_size)
         raw.mtime = cetrafs_cpu_to_le64((u64) inode_get_mtime_sec(inode));
         fd_seq = cetrafs_inode_fd_seq(inode);
         ret = unlikely(cetrafs_fail_extent_record_write) ? -EIO
-                                                         : cetrafs_write_raw_inode_fd(sb, inode->i_ino, &raw, inode);
+                                                         : cetrafs_write_raw_inode_fd_planned(sb, inode->i_ino, &raw, inode,
+                                                                                              cetrafs_le64(old_raw.file_seq));
         if (!ret) {
             cetrafs_inode_fd_published(inode, fd_seq); /* this publish supersedes the overlaid shadow */
             i_size_write(inode, new_size);
@@ -5174,7 +5175,8 @@ static long cetrafs_fallocate(struct file *file, int mode, loff_t offset, loff_t
         cetrafs_inode_fd_pub_lock(inode);
         fd_seq = cetrafs_inode_fd_seq(inode);
         ret = unlikely(cetrafs_fail_extent_record_write) ? -EIO
-                                                         : cetrafs_write_raw_inode_fd(sb, inode->i_ino, &raw, inode);
+                                                         : cetrafs_write_raw_inode_fd_planned(sb, inode->i_ino, &raw, inode,
+                                                                                              cetrafs_le64(old_raw.file_seq));
         if (!ret)
             cetrafs_inode_fd_published(inode, fd_seq); /* this publish supersedes the overlaid shadow */
         cetrafs_inode_fd_pub_unlock(inode);

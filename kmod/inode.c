@@ -728,7 +728,17 @@ struct cetrafs_fd_write_ctx {
     const cetrafs_inode_t *src;
     struct super_block *sb;
     u64 stamped_seq; /* what we wrote, so the caller can keep its own cache valid */
+    bool check_plan;  /* refuse if a PEER stamped the sector since plan_seq */
+    u64 plan_seq;     /* the file_seq of the record the caller's plan was built from */
+    u32 me;
+    u64 found_seq;    /* on a refusal: the peer's stamp found on the device */
 };
+
+/* TEST ONLY: publish a planned rebuild without its stamp check -- the
+ * negative control for tests/kernel/rebuild_peer_stamp.sh. */
+static bool cetrafs_rebuild_plan_unchecked;
+module_param_named(rebuild_plan_unchecked, cetrafs_rebuild_plan_unchecked, bool, 0644);
+MODULE_PARM_DESC(rebuild_plan_unchecked, "TEST ONLY: skip the truncate/punch publish's file_seq check");
 
 static int cetrafs_fd_write_mutate(void *image, unsigned int len, void *priv)
 {
@@ -746,6 +756,20 @@ static int cetrafs_fd_write_mutate(void *image, unsigned int len, void *priv)
      * writing would stamp a dead file's extents over a stranger's. */
     if (rec.fd_generation != ctx->src->generation || rec.fd_ino != ctx->src->ino)
         return -ESTALE;
+
+    /* The plan's stamp (CLAUDE.md rule 10). A rebuild -- truncate,
+     * punch -- built its new tree from a record read seconds ago, and
+     * its "is a peer open now?" recheck is presence, not change: a peer
+     * session that opened, appended and CLOSED inside that window left
+     * nobody open and a different tree on the device. Publishing would
+     * put the pre-peer tree back over the peer's extents and erase its
+     * stamp. A stamp that moved and is not ours is that peer; our own
+     * publishes in the window are serialised with this one locally. */
+    if (ctx->check_plan && cetrafs_le64(rec.file_seq) != ctx->plan_seq &&
+        CETRAFS_FILE_SEQ_NODE(cetrafs_le64(rec.file_seq)) != (ctx->me & 0xFFFFu)) {
+        ctx->found_seq = cetrafs_le64(rec.file_seq);
+        return -ETXTBSY;
+    }
 
     cetrafs_inode_fd_copy(&rec, ctx->src);
     rec.ino = ctx->src->ino; /* for the echo stamp below */
@@ -765,7 +789,8 @@ static int cetrafs_fd_write_mutate(void *image, unsigned int len, void *priv)
  * so a reuse of the number can never be written over, and so the
  * namespace sector is physically untouched.
  */
-int cetrafs_write_raw_inode_fd(struct super_block *sb, u64 ino, const cetrafs_inode_t *src, struct inode *self)
+static int __cetrafs_write_raw_inode_fd(struct super_block *sb, u64 ino, const cetrafs_inode_t *src,
+                                       struct inode *self, const u64 *plan_seq)
 {
     struct cetrafs_fd_write_ctx ctx = {.src = src, .sb = sb};
     u64 lba = cetrafs_inode_lba(sb, ino);
@@ -774,6 +799,14 @@ int cetrafs_write_raw_inode_fd(struct super_block *sb, u64 ino, const cetrafs_in
         return -EINVAL;
     if (cetrafs_sb_is_fenced(sb))
         return -EIO;
+    if (plan_seq) {
+        int ret = cetrafs_sb_get_node_id(sb, &ctx.me);
+
+        if (ret)
+            return ret;
+        ctx.check_plan = !cetrafs_rebuild_plan_unchecked;
+        ctx.plan_seq = *plan_seq;
+    }
     /* The fd sector publishes extents: the blocks they name must be
      * durably allocated first (rule 8's choke point, same as the whole
      * -record writer's). If they are not, publish NOTHING: the shadow
@@ -804,9 +837,28 @@ int cetrafs_write_raw_inode_fd(struct super_block *sb, u64 ino, const cetrafs_in
              * (tests/kernel/defrag_final_blocks.sh). */
             if (self)
                 cetrafs_inode_stat_baseline_set(self, src);
+        } else if (ret == -ETXTBSY && ctx.check_plan) {
+            pr_warn_ratelimited("cetrafs: inode %llu: another node changed the file while this rebuild was "
+                                "planned (stamp %llx, planned from %llx) -- refusing\n",
+                                (unsigned long long) ino, (unsigned long long) ctx.found_seq,
+                                (unsigned long long) ctx.plan_seq);
         }
         return ret;
     }
+}
+
+int cetrafs_write_raw_inode_fd(struct super_block *sb, u64 ino, const cetrafs_inode_t *src, struct inode *self)
+{
+    return __cetrafs_write_raw_inode_fd(sb, ino, src, self, NULL);
+}
+
+/* The same publish, refused with -ETXTBSY if another node stamped the
+ * file sector since 'plan_seq' -- for a caller that built what it
+ * publishes from a record read earlier (truncate, punch). */
+int cetrafs_write_raw_inode_fd_planned(struct super_block *sb, u64 ino, const cetrafs_inode_t *src,
+                                       struct inode *self, u64 plan_seq)
+{
+    return __cetrafs_write_raw_inode_fd(sb, ino, src, self, &plan_seq);
 }
 
 int cetrafs_write_raw_inode(struct super_block *sb, u64 ino, const cetrafs_inode_t *in, bool sync)

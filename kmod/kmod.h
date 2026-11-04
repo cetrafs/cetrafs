@@ -955,6 +955,8 @@ int cetrafs_inode_ns_cas(struct super_block *sb,
                          void (*apply)(cetrafs_inode_t *rec, void *arg),
                          void *arg);
 int cetrafs_write_raw_inode_fd(struct super_block *sb, u64 ino, const cetrafs_inode_t *src, struct inode *self);
+int cetrafs_write_raw_inode_fd_planned(struct super_block *sb, u64 ino, const cetrafs_inode_t *src,
+                                       struct inode *self, u64 plan_seq);
 int cetrafs_inode_ns_zero_nlink(struct super_block *sb, u64 ino, const cetrafs_inode_t *seed);
 /* Inode-number arbitration between a creator and an orphan scrub, on the
  * record itself -- see inode.c. */
