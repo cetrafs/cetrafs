@@ -105,10 +105,9 @@ In this repo:
   every arm64 one. The filesystem block is fixed at 4 KiB, so on a 4K
   page the block index and the page-cache index are the same number;
   arm64 built with 16K or 64K pages (`CONFIG_ARM64_16K_PAGES`) makes
-  them differ by 4x or 16x. The module converts between them and
-  asserts the relationship at build time, but it has only ever been
-  exercised at 4K -- `/proc/fs/cetrafs/<dev>/properties` reports
-  `kernel_page_size` so any result says which it came from.
+  them differ by 4x or 16x. Such a kernel builds the module but is
+  refused at mount: the larger-page cases are known to be unhandled in
+  places and have never been run.
 - **For clustering:** a shared block device whose LUN supports atomic
   COMPARE AND WRITE (SCSI ATS). Probe a candidate without mounting it:
   `modprobe cetrafs caw_probe=<dev>` and check `dmesg` for

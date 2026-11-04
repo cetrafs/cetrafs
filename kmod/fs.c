@@ -947,6 +947,13 @@ struct cetrafs_defrag *cetrafs_sb_get_defrag(struct super_block *sb)
 
 /* ------ fill_super (mount-time verification) ------ */
 
+/* TEST ONLY: pretend the kernel runs with this page size, so the
+ * refusal below can be reached on the 4 KiB hosts this project has
+ * (tests/kernel/page_size_report.sh). 0: the real PAGE_SIZE. */
+static unsigned int cetrafs_assume_page_size;
+module_param_named(assume_page_size, cetrafs_assume_page_size, uint, 0644);
+MODULE_PARM_DESC(assume_page_size, "TEST ONLY: the page size the mount-time check sees (0 = real)");
+
 int cetrafs_fill_super(struct super_block *sb, struct fs_context *fc)
 {
     struct buffer_head *bh = NULL;
@@ -956,6 +963,26 @@ int cetrafs_fill_super(struct super_block *sb, struct fs_context *fc)
     u64 features_incompat;
 
     pr_debug("fill_super()\n");
+
+    /*
+     * One page, one block. The code converts between block and page
+     * indices in places that are only right when the two are the same
+     * size, and the size-extension and punch paths do not handle a block
+     * smaller than its folio (no pagecache_isize_extended(); a block-
+     * aligned punch that is not folio-aligned). None of it can be tested
+     * on the hosts this project runs on, and on a 16K or 64K kernel it
+     * would fail silently -- so it is refused, loudly, until it can be.
+     */
+    {
+        unsigned long page = cetrafs_assume_page_size ? cetrafs_assume_page_size : PAGE_SIZE;
+
+        if (page != CETRAFS_BLOCK_SIZE) {
+            pr_err("refusing to mount: this kernel's page size is %lu bytes, and cetrafs supports only "
+                   "%u-byte pages (one page per block) -- larger pages are untested and not safe yet\n",
+                   page, CETRAFS_BLOCK_SIZE);
+            return -EINVAL;
+        }
+    }
 
     /* We use fixed 4 KiB on-disk blocks; reject devices that can't do this. */
     if (!sb_set_blocksize(sb, CETRAFS_BLOCK_SIZE)) {
