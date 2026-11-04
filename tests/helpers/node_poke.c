@@ -82,8 +82,25 @@ int main(int argc, char **argv)
         return 1;
     }
 
+    /* NODE_POKE_SB=<file>: take the geometry from a saved copy of the
+     * superblock instead of block 0. A mounted node keeps beating off
+     * the geometry it read at mount, block 0 or no block 0 -- and mkfs
+     * zeroes block 0 before it watches for exactly such a node. */
     cetrafs_superblock_t sb;
-    pread_all(fd, &sb, sizeof(sb), 0);
+    const char *sbfile = getenv("NODE_POKE_SB");
+
+    if (sbfile) {
+        int sfd = open(sbfile, O_RDONLY);
+
+        if (sfd < 0) {
+            perror("NODE_POKE_SB");
+            return 1;
+        }
+        pread_all(sfd, &sb, sizeof(sb), 0);
+        close(sfd);
+    } else {
+        pread_all(fd, &sb, sizeof(sb), 0);
+    }
 
     if (row >= cetrafs_le32(sb.node_table_count)) {
         fprintf(stderr, "row %u out of range (node_table_count=%u)\n", row, sb.node_table_count);

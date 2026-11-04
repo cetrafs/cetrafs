@@ -1894,6 +1894,34 @@ int cetrafs_fill_super(struct super_block *sb, struct fs_context *fc)
                 }
             }
 
+            /* Post-registration superblock re-check. mkfs zeroes block 0
+             * first, then watches the registry for a live node: a mount
+             * that read the old superblock before the zero and registers
+             * only after mkfs stopped watching would come up on a volume
+             * being formatted under it. Its row is committed now, so a
+             * still-watching mkfs sees it; and if block 0 is no longer
+             * the superblock this mount validated, nobody is watching
+             * any more. Nothing writes block 0 under a mount (growfs is
+             * offline and holds a repair claim), so any difference is
+             * a rewrite. */
+            if (sbi->raw_sb) {
+                struct buffer_head *sbh = cetrafs_bread_uncached(sb, CETRAFS_SB_BLOCK_NR);
+
+                if (!sbh || memcmp(sbh->b_data, sbi->raw_sb, sizeof(*sbi->raw_sb)) != 0) {
+                    if (sbh)
+                        pr_err("%s: the superblock was rewritten while this mount was in flight (mkfs?) -- "
+                               "refusing to mount\n",
+                               sb->s_id);
+                    else
+                        pr_err("mount: post-registration superblock re-read failed\n");
+                    brelse(sbh);
+                    cetrafs_free_sb_info(sb);
+                    brelse(bh);
+                    return sbh ? -EBUSY : -EIO;
+                }
+                brelse(sbh);
+            }
+
             /* Post-registration file-lock-mode re-check. The inherit/refuse
              * decision above read committed rows BEFORE we registered, so a
              * node mounting at the same instant could have been invisible to

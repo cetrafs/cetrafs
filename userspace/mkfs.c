@@ -309,6 +309,67 @@ static u64 cetrafs_solve_bg_count(u64 total_blocks, u64 fixed_wo_B, u64 bg_size_
 }
 
 /* ---------- main mkfs ---------- */
+/*
+ * Make the old filesystem unmountable BEFORE anything else is written,
+ * then look for anyone still using it.
+ *
+ * The superblock used to be the LAST write, so for the whole run a
+ * node mounting -- or the next mount after an interrupted mkfs -f --
+ * found a valid superblock over half-zeroed tables. And the live-node
+ * probe ran before the first write, leaving the gap between verdict
+ * and act open; it also ignored repair claims, so mkfs ran over a
+ * live fsck -r or growfs.
+ *
+ * Zeroing block 0 is the claim: from the fsync on, no mount can start
+ * and no tool will touch the volume. A mount that read the old
+ * superblock before it and registers later refuses on its own (fill_
+ * super re-reads block 0 once its row is committed); one already
+ * mounted shows up beating in the registry, which is still intact and
+ * is probed off the copy kept here. If anyone is found the superblock
+ * goes back -- but only over our own zeros: a growfs publish that
+ * landed meanwhile is not ours to overwrite.
+ */
+static void mkfs_retire_old_superblock(int fd, const char *dev)
+{
+    unsigned char old[CETRAFS_BLOCK_SIZE], zero[CETRAFS_BLOCK_SIZE], now[CETRAFS_BLOCK_SIZE];
+    cetrafs_superblock_t sb;
+    char label[CETRAFS_NODE_LABEL_LEN + 1] = {0};
+    long long age = 0;
+    uint32_t row = 0;
+    int lp, rc;
+
+    if (pread(fd, old, sizeof(old), 0) != (ssize_t) sizeof(old))
+        die_dev("%s: cannot read block 0: %s", dev, strerror(errno));
+    memcpy(&sb, old, sizeof(sb));
+    memset(zero, 0, sizeof(zero));
+    if (pwrite(fd, zero, sizeof(zero), 0) != (ssize_t) sizeof(zero) || fsync(fd) != 0)
+        die_dev("%s: cannot clear the old superblock: %s", dev, strerror(errno));
+    if (cetrafs_le32(sb.magic) != CETRAFS_MAGIC)
+        return; /* not a cetrafs volume: nobody can be mounting it as one */
+
+    lp = cetrafs_find_live_peer_on(fd, dev, &sb, &row, label, sizeof(label), &age);
+    rc = lp ? 0 : cetrafs_find_repair_claim(fd, &sb, &row, label, sizeof(label));
+    if (!lp && !rc)
+        return;
+
+    if (pread(fd, now, sizeof(now), 0) == (ssize_t) sizeof(now) && memcmp(now, zero, sizeof(now)) == 0 &&
+        (pwrite(fd, old, sizeof(old), 0) != (ssize_t) sizeof(old) || fsync(fd) != 0))
+        fprintf(stderr, "%s: could not put the old superblock back: %s\n", dev, strerror(errno));
+    if (lp < 0 || rc < 0)
+        die_dev("%s: cannot read its Node Registry (I/O error) -- so it is impossible to\n"
+                "       prove no other node has this volume mounted, and formatting on a guess\n"
+                "       destroys a live cluster's volume. Fix the device and retry.",
+                dev);
+    if (lp)
+        die_dev("%s is mounted by another node (registry row %u%s%s) -- it is still heartbeating\n"
+                "       -- formatting it now would destroy a live cluster's volume.\n"
+                "       Unmount it there, then retry. (row's own last_seen reads %llds ago by this\n"
+                "       machine's clock, which means nothing if the two disagree.)",
+                dev, row, label[0] ? ", " : "", label[0] ? label : "", age);
+    die_dev("%s is being repaired (%s, registry row %u) -- wait for it to finish", dev,
+            label[0] ? label : "an offline tool", row);
+}
+
 int main(int argc, char **argv)
 {
     if (argc < 2) {
@@ -456,8 +517,13 @@ int main(int argc, char **argv)
      * asked. Refused even with -f and even in dry-run, for the same
      * reason: -f overwrites data, it does not license formatting a
      * volume out from under a running cluster. Waiting out the peer's
-     * stale window is the escape hatch if it really is gone. */
-    {
+     * stale window is the escape hatch if it really is gone.
+     *
+     * A real run does this AFTER block 0 is zeroed, just before the
+     * first structural write (mkfs_retire_old_superblock()): probing
+     * here left the gap between the verdict and the act open. A dry run writes
+     * nothing, so it probes here. */
+    if (dry_run) {
         char label[CETRAFS_NODE_LABEL_LEN + 1] = {0};
         long long age = 0;
         uint32_t row = 0;
@@ -480,6 +546,7 @@ int main(int argc, char **argv)
     int fd = open(dev, dry_run ? (O_RDONLY | O_CLOEXEC) : (O_RDWR | O_CLOEXEC));
     if (fd < 0)
         die_dev("open(%s): %s", dev, strerror(errno));
+
 
     unsigned long long dev_bytes = 0ULL;
     if (ioctl(fd, BLKGETSIZE64, &dev_bytes) < 0)
@@ -762,6 +829,11 @@ int main(int argc, char **argv)
     u8 *sb_blk = (u8 *) xcalloc(1, CETRAFS_BLOCK_SIZE);
     u8 *blk = (u8 *) xcalloc(1, CETRAFS_BLOCK_SIZE);
     memcpy(sb_blk, &sb, sizeof(sb));
+
+    /* Every refusal above is behind us and the first write is below:
+     * the old filesystem stops being mountable here, and not before. */
+    if (!dry_run)
+        mkfs_retire_old_superblock(fd, dev);
 
     /* --------------------------- */
     /* --- ZG table & journals --- */

@@ -731,25 +731,21 @@ static inline int cetrafs_scan_node_caps(const char *dev,
     return (int) n;
 }
 
-static inline int cetrafs_find_live_peer(const char *dev,
-                                         uint32_t *out_row,
-                                         char *out_label,
-                                         size_t label_sz,
-                                         long long *out_age_secs)
+/* The probe itself, on a device already open and a superblock already
+ * read -- mkfs runs it AFTER zeroing block 0, off the copy it kept. */
+static inline int cetrafs_find_live_peer_on(int fd,
+                                            const char *dev,
+                                            const cetrafs_superblock_t *sbp,
+                                            uint32_t *out_row,
+                                            char *out_label,
+                                            size_t label_sz,
+                                            long long *out_age_secs)
 {
-    cetrafs_superblock_t sb;
+    cetrafs_superblock_t sb = *sbp;
     cetrafs_node_entry_t *first = NULL;
     uint32_t count, idx, ncand = 0, slowest = 0;
     unsigned budget = CETRAFS_ROW_SETTLE_BUDGET_MS;
-    int fd, found = 0;
-
-    fd = open(dev, O_RDONLY | O_CLOEXEC);
-    if (fd < 0)
-        return 0;
-    if (pread(fd, &sb, sizeof(sb), 0) != (ssize_t) sizeof(sb) || cetrafs_le32(sb.magic) != CETRAFS_MAGIC) {
-        close(fd);
-        return 0; /* not a cetrafs volume: nothing can be mounting it as one */
-    }
+    int found = 0;
 
     count = cetrafs_le32(sb.node_table_count);
     /* Same trust boundary: a garbage count must not size an allocation.
@@ -757,12 +753,10 @@ static inline int cetrafs_find_live_peer(const char *dev,
      * mkfs-enforced); 4096 is comfortably past any future format and
      * still a trivial calloc. */
     if (!count || count > 4096) {
-        close(fd);
         return 0;
     }
     first = (cetrafs_node_entry_t *) calloc(count, sizeof(*first));
     if (!first) {
-        close(fd);
         return -1; /* cannot verify is not "nobody" -- see the contract */
     }
 
@@ -770,7 +764,6 @@ static inline int cetrafs_find_live_peer(const char *dev,
     unsigned char *iscand = (unsigned char *) calloc(count, 1);
     if (!iscand) {
         free(first);
-        close(fd);
         return -1;
     }
     for (idx = 0; idx < count; idx++) {
@@ -779,8 +772,7 @@ static inline int cetrafs_find_live_peer(const char *dev,
         if (rc < 0) { /* an unreadable row fails the whole verdict closed */
             free(iscand);
             free(first);
-            close(fd);
-            return -1;
+                return -1;
         }
         if (rc == 1) {
             iscand[idx] = 1;
@@ -803,7 +795,6 @@ static inline int cetrafs_find_live_peer(const char *dev,
     if (ncand == 0) {
         free(iscand);
         free(first);
-        close(fd);
         return 0; /* nobody to wait for */
     }
 
@@ -847,8 +838,7 @@ static inline int cetrafs_find_live_peer(const char *dev,
         if (rc < 0) { /* unreadable mid-probe: fail closed, same as pass 1 */
             free(iscand);
             free(first);
-            close(fd);
-            return -1;
+                return -1;
         }
         if (!rc)
             continue; /* it left, or its row went away, during the probe */
@@ -879,6 +869,26 @@ static inline int cetrafs_find_live_peer(const char *dev,
 
     free(iscand);
     free(first);
+    return found;
+}
+
+static inline int cetrafs_find_live_peer(const char *dev,
+                                         uint32_t *out_row,
+                                         char *out_label,
+                                         size_t label_sz,
+                                         long long *out_age_secs)
+{
+    cetrafs_superblock_t sb;
+    int fd, found;
+
+    fd = open(dev, O_RDONLY | O_CLOEXEC);
+    if (fd < 0)
+        return 0;
+    if (pread(fd, &sb, sizeof(sb), 0) != (ssize_t) sizeof(sb) || cetrafs_le32(sb.magic) != CETRAFS_MAGIC) {
+        close(fd);
+        return 0; /* not a cetrafs volume: nothing can be mounting it as one */
+    }
+    found = cetrafs_find_live_peer_on(fd, dev, &sb, out_row, out_label, label_sz, out_age_secs);
     close(fd);
     return found;
 }
