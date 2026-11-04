@@ -1360,6 +1360,16 @@ static int cetrafs_lock_cas_mutate(void *image, unsigned int len, void *priv)
     memset(&rec, 0, sizeof(rec));
     memcpy(&rec, image, CETRAFS_INODE_NS_BYTES);
 
+    /* Every branch below keeps the fields it does not change and stamps
+     * a fresh checksum: over a sector that fails its own, that turns a
+     * tear or damage into a record every checker accepts. Same refusal
+     * as inode.c's namespace mutator. */
+    if (cetrafs_inode_crc_ns(&rec) != (u32) cetrafs_le64(rec.ns_checksum)) {
+        pr_warn_ratelimited("lock CAS: the namespace sector on the device fails its checksum -- refusing to "
+                            "stamp a fresh one\n");
+        return -EUCLEAN;
+    }
+
     if (cetrafs_le64(rec.generation) != ctx->generation)
         return -ESTALE; /* number reused for a different file */
 
@@ -3159,6 +3169,8 @@ static int cetrafs_own_claims_mutate(void *image, unsigned int len, void *priv)
         return -EINVAL;
     memset(&rec, 0, sizeof(rec));
     memcpy(&rec, image, CETRAFS_INODE_NS_BYTES);
+    if (cetrafs_inode_crc_ns(&rec) != (u32) cetrafs_le64(rec.ns_checksum))
+        return -EUCLEAN; /* restamping it would bless the damage (cetrafs_lock_cas_mutate()) */
     if (cetrafs_le64(rec.generation) != ctx->generation)
         return -ESTALE;
     if (cetrafs_le32(rec.lock_owner_node) == ctx->me && cetrafs_le32(rec.lock_mode) != CETRAFS_LOCK_NONE) {

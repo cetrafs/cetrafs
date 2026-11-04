@@ -1185,6 +1185,15 @@ static int cetrafs_vfs_stat_cas_mutate(void *image, unsigned int len, void *priv
     /* The fd sector's identity echo is this sector's reuse guard. */
     if (cetrafs_le64(rec.fd_generation) != ctx->generation || rec.fd_ino != ctx->ino_le)
         return -ESTALE;
+    /* The merge below keeps the image's fields where ours did not move:
+     * over a sector that fails its checksum, restamping blesses them
+     * (the namespace mutator's refusal, cetrafs_ns_cas_mutate()). */
+    if (cetrafs_inode_crc_fd(&rec) != (u32) cetrafs_le64(rec.fd_checksum)) {
+        pr_warn_ratelimited("stat publish on ino=%llu: the file sector on the device fails its checksum -- "
+                            "refusing to stamp a fresh one\n",
+                            (unsigned long long) inode->i_ino);
+        return -EUCLEAN;
+    }
 
     /* The hot path's pending extent state supersedes the device's: it is
      * strictly newer (this node is the file's writer). */

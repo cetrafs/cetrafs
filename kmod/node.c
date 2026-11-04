@@ -180,6 +180,23 @@ struct cetrafs_node_claim_ctx {
     u32 caps; /* CETRAFS_NODE_CAP_* this mount advertises */
 };
 
+/*
+ * Every mutator below except the claim (which takes only a FREE row and
+ * rewrites all of it) and the unclaim (which zeroes it) keeps fields from
+ * the image and stamps a fresh checksum over them. Over a row that fails
+ * its own, that blesses a tear or damage as a valid row -- a revoked
+ * lease's fence_epoch, say, rewritten as whatever the bad bytes say.
+ * Checked after each mutator's state test, so a FREE row (never stamped)
+ * still answers "nothing to do".
+ */
+static bool cetrafs_node_image_ok(const cetrafs_node_entry_t *ne)
+{
+    if (cetrafs_node_crc(ne) == (u32) cetrafs_le64(ne->checksum))
+        return true;
+    pr_warn_ratelimited("node registry: a row on the device fails its checksum -- refusing to stamp a fresh one\n");
+    return false;
+}
+
 static int cetrafs_node_claim_mutate(void *image, unsigned int len, void *priv)
 {
     struct cetrafs_node_claim_ctx *ctx = priv;
@@ -256,6 +273,8 @@ static int cetrafs_node_reattach_mutate(void *image, unsigned int len, void *pri
     if (cetrafs_le32(ne.state) != CETRAFS_NODE_STATE_REGISTERED ||
         memcmp(ne.node_uuid, ctx->uuid, CETRAFS_NODE_UUID_LEN) != 0)
         return -EEXIST;
+    if (!cetrafs_node_image_ok(&ne))
+        return -EUCLEAN;
 
     /* And it must not have beaten since it was judged ours. Only the
      * row's owner moves hb_seq (a peer's fence bump touches fence_epoch),
@@ -311,6 +330,8 @@ static int cetrafs_node_fence_mutate(void *image, unsigned int len, void *priv)
      * has already gone FREE has no owner left to fence. */
     if (cetrafs_le32(ne.state) != CETRAFS_NODE_STATE_REGISTERED)
         return 1; /* nothing to do -- not an error */
+    if (!cetrafs_node_image_ok(&ne))
+        return -EUCLEAN;
 
     ne.fence_epoch = cetrafs_cpu_to_le64(cetrafs_le64(ne.fence_epoch) + 1);
     ctx->seen_epoch = cetrafs_le64(ne.fence_epoch);
@@ -358,6 +379,8 @@ static int cetrafs_node_depart_mutate(void *image, unsigned int len, void *priv)
         return 1; /* already gone: nothing to do, and not an error */
     if (ne.last_seen == 0)
         return 1; /* somebody already recorded our departure */
+    if (!cetrafs_node_image_ok(&ne))
+        return -EUCLEAN;
 
     ne.last_seen = 0;
     cetrafs_node_image_commit(image, len, &ne);
@@ -513,6 +536,8 @@ static int cetrafs_node_test_beat_mutate(void *image, unsigned int len, void *pr
     cetrafs_node_entry_t ne;
 
     memcpy(&ne, image, sizeof(ne));
+    if (!cetrafs_node_image_ok(&ne))
+        return -EUCLEAN;
     ne.hb_seq = cetrafs_cpu_to_le64(cetrafs_le64(ne.hb_seq) + 1);
     ne.last_seen = cetrafs_cpu_to_le64(ktime_get_real_seconds());
     cetrafs_node_image_commit(image, len, &ne);
@@ -819,6 +844,11 @@ static int cetrafs_node_renew_mutate(void *image, unsigned int len, void *priv)
         ctx->lost = true;
         return 1; /* write nothing */
     }
+    /* Our own row, damaged: renewing would bless the bad bytes, the
+     * fence_epoch below among them. A failed renewal is the honest
+     * answer -- the lease then runs out and this node stops. */
+    if (!cetrafs_node_image_ok(&ne))
+        return -EUCLEAN;
 
     /* The whole point of doing this as a compare-and-swap: renewing used
      * to be read / modify / blind-write-the-whole-row, so a peer that

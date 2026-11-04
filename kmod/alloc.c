@@ -1366,6 +1366,19 @@ static u32 cetrafs_bg_image_crc(const void *image, unsigned int len)
     return ~crc;
 }
 
+/* The three descriptor mutators keep the fields they do not change and
+ * stamp a fresh checksum: over an image that fails its own, that blesses
+ * a tear or damage (inode.c's namespace mutator has the same refusal). */
+static bool cetrafs_bg_image_ok(const void *image, unsigned int len)
+{
+    const cetrafs_block_group_t *bg = image;
+
+    if (cetrafs_bg_image_crc(image, len) == (u32) cetrafs_le64(bg->checksum))
+        return true;
+    pr_warn_ratelimited("BG CAS: the descriptor on the device fails its checksum -- refusing to stamp a fresh one\n");
+    return false;
+}
+
 struct cetrafs_bg_count_ctx {
     bool absolute;  /* reconcile: count = value and the epoch advances */
     s64 value;      /* the delta, or (absolute) the bitmap truth */
@@ -1385,6 +1398,8 @@ static int cetrafs_bg_count_mutate(void *image, unsigned int len, void *priv)
      * a fresh image, so a verdict from the previous attempt must not
      * survive into this one. */
     ctx->refused = false;
+    if (!cetrafs_bg_image_ok(image, len))
+        return -EUCLEAN;
 
     if (ctx->absolute) {
         /* A reconcile: the new owner writing the bitmap truth. Advances
@@ -2827,6 +2842,8 @@ static int cetrafs_bg_claim_mutate(void *image, unsigned int len, void *priv)
     struct cetrafs_bg_claim_ctx *ctx = priv;
     cetrafs_block_group_t *bg = (cetrafs_block_group_t *) image;
 
+    if (!cetrafs_bg_image_ok(image, len))
+        return -EUCLEAN;
     /* Re-read inside the swap. Between the scan that picked this Block
      * Group and this callback, a peer may have claimed it -- the whole
      * point of doing this as one compare-and-swap rather than a
@@ -2890,6 +2907,8 @@ static int cetrafs_bg_release_mutate(void *image, unsigned int len, void *priv)
     struct cetrafs_bg_release_ctx *ctx = priv;
     cetrafs_block_group_t *bg = (cetrafs_block_group_t *) image;
 
+    if (!cetrafs_bg_image_ok(image, len))
+        return -EUCLEAN;
     /*
      * Both conditions re-checked INSIDE the swap, against the image the
      * device is about to compare.
