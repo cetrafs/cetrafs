@@ -1059,86 +1059,11 @@ int main(int argc, char **argv)
         return 1;
     }
 
-    /*
-     * Claim the volume before anything is written to it.
-     *
-     * The check below refuses to run against a volume a NODE has
-     * mounted. This is the other direction, which nothing covered: a
-     * node mounting halfway through `-r` finds structures being
-     * rewritten under it by minutes of blind full-block writes. The
-     * claim is a Node Registry row in CETRAFS_NODE_STATE_REPAIR, which
-     * fill_super() refuses to mount past, and it is a lease -- renewed
-     * as the passes run, expiring on its own if this process dies.
-     *
-     * BEFORE the live-peer check, not after, and the order is the
-     * whole point: check-then-claim leaves the window between them
-     * open, and a node mounting inside it sees no claim and is let in.
-     * Claiming first means such a node is refused, and the check that
-     * follows catches the peer that was already there -- in which case
-     * this run bails and the row is released on the way out.
-     */
-    if (repair_mode) {
-        uint32_t other_row = 0;
-        char other[CETRAFS_NODE_LABEL_LEN + 1] = {0};
-        int busy = cetrafs_find_repair_claim(fd, &sb, &other_row, other, sizeof(other));
-
-        if (busy < 0) {
-            fprintf(stderr, "ERR: %s: cannot read its Node Registry -- refusing to repair blind\n", dev);
-            return FSCK_EXIT_NOEXAM;
-        }
-        if (busy) {
-            fprintf(stderr, "ERR: %s is already being repaired (registry row %u%s%s)\n", dev, other_row,
-                    other[0] ? ", " : "", other[0] ? other : "");
-            return FSCK_EXIT_NOEXAM;
-        }
-
-        repair_row = cetrafs_repair_claim(fd, &sb, "fsck -r");
-        if (repair_row < 0) {
-            fprintf(stderr,
-                    "ERR: %s: no free Node Registry row to claim for the repair -- refusing to\n"
-                    "     write while a node could still mount it\n",
-                    dev);
-            return FSCK_EXIT_NOEXAM;
-        }
-        repair_fd = fd;
-        repair_sb = sb;
-        atexit(fsck_repair_release_atexit);
-        printf("  claimed registry row %d for the duration of this repair\n", repair_row);
-        fflush(stdout);
-        /* Test knob only: a phase that does no inode work for this long,
-         * so a suite can see the claim renew on its timer regardless.
-         * Unset in every normal invocation. */
-        if (getenv("CETRAFS_TEST_REPAIR_HOLD_SECS"))
-            cetrafs_sleep_full((unsigned) atoi(getenv("CETRAFS_TEST_REPAIR_HOLD_SECS")));
-    }
-
-    {
-        char label[CETRAFS_NODE_LABEL_LEN + 1] = {0};
-        long long age = 0;
-        uint32_t row = 0;
-
-        /* Same reasoning one level out: a peer mutating this volume
-         * while we walk it produces invented "errors", and a clean
-         * result would be just as meaningless. See devutil.h. */
-        int lp = cetrafs_find_live_peer(dev, &row, label, sizeof(label), &age);
-
-        if (lp < 0) {
-            fprintf(stderr,
-                    "ERR: %s: cannot read its Node Registry (I/O error) -- unable to prove no\n"
-                    "     other node has it mounted, so neither a verdict nor a repair would\n"
-                    "     mean anything. Fix the device and retry.\n",
-                    dev);
-            return 3; /* could not examine, same class as an unopenable device */
-        }
-        if (lp) {
-            fprintf(stderr,
-                    "ERR: %s is mounted by another node (registry row %u%s%s, last seen %llds ago)\n"
-                    "     -- its structures are being modified as we read them. Unmount it there;\n"
-                    "     its row goes stale after %ds.\n",
-                    dev, row, label[0] ? ", " : "", label[0] ? label : "", age, CETRAFS_NODE_STALE_SECS);
-            return 1;
-        }
-    }
+    /* The repair claim and the live-peer check come AFTER the
+     * superblock is proven sound (below the layout checks): both read
+     * and write registry rows at node_table_start + row, straight off
+     * this superblock, and a claim aimed by a damaged one wrote a row --
+     * and on exit a row of zeros -- into whatever the field named. */
     if (cetrafs_le32(sb.block_size) != (uint32_t) CETRAFS_BLOCK_SIZE) {
         fprintf(stderr, "ERR: block_size != %u\n", CETRAFS_BLOCK_SIZE);
         return 1;
@@ -1398,6 +1323,92 @@ int main(int argc, char **argv)
                     "ERR: layout: node_table_count %u exceeds CETRAFS_MAX_READER_NODES (%u) -- row %u would "
                     "alias row 0 in the read-presence mask\n",
                     sb.node_table_count, CETRAFS_MAX_READER_NODES, CETRAFS_MAX_READER_NODES);
+            return 1;
+        }
+    }
+
+    /*
+     * Claim the volume before anything is written to it -- and only
+     * once the superblock that says WHERE the claim goes has passed every
+     * check above (CRC, fields, layout). The claim writes a row at
+     * node_table_start + row and its release zeroes it; claimed from an
+     * unchecked superblock, one flipped bit in node_table_start put both
+     * into file data on exactly the damaged volume fsck was run on.
+     *
+     * The check below refuses to run against a volume a NODE has
+     * mounted. This is the other direction, which nothing covered: a
+     * node mounting halfway through `-r` finds structures being
+     * rewritten under it by minutes of blind full-block writes. The
+     * claim is a Node Registry row in CETRAFS_NODE_STATE_REPAIR, which
+     * fill_super() refuses to mount past, and it is a lease -- renewed
+     * as the passes run, expiring on its own if this process dies.
+     *
+     * BEFORE the live-peer check, not after, and the order is the
+     * whole point: check-then-claim leaves the window between them
+     * open, and a node mounting inside it sees no claim and is let in.
+     * Claiming first means such a node is refused, and the check that
+     * follows catches the peer that was already there -- in which case
+     * this run bails and the row is released on the way out.
+     */
+    if (repair_mode) {
+        uint32_t other_row = 0;
+        char other[CETRAFS_NODE_LABEL_LEN + 1] = {0};
+        int busy = cetrafs_find_repair_claim(fd, &sb, &other_row, other, sizeof(other));
+
+        if (busy < 0) {
+            fprintf(stderr, "ERR: %s: cannot read its Node Registry -- refusing to repair blind\n", dev);
+            return FSCK_EXIT_NOEXAM;
+        }
+        if (busy) {
+            fprintf(stderr, "ERR: %s is already being repaired (registry row %u%s%s)\n", dev, other_row,
+                    other[0] ? ", " : "", other[0] ? other : "");
+            return FSCK_EXIT_NOEXAM;
+        }
+
+        repair_row = cetrafs_repair_claim(fd, &sb, "fsck -r");
+        if (repair_row < 0) {
+            fprintf(stderr,
+                    "ERR: %s: no free Node Registry row to claim for the repair -- refusing to\n"
+                    "     write while a node could still mount it\n",
+                    dev);
+            return FSCK_EXIT_NOEXAM;
+        }
+        repair_fd = fd;
+        repair_sb = sb;
+        atexit(fsck_repair_release_atexit);
+        printf("  claimed registry row %d for the duration of this repair\n", repair_row);
+        fflush(stdout);
+        /* Test knob only: a phase that does no inode work for this long,
+         * so a suite can see the claim renew on its timer regardless.
+         * Unset in every normal invocation. */
+        if (getenv("CETRAFS_TEST_REPAIR_HOLD_SECS"))
+            cetrafs_sleep_full((unsigned) atoi(getenv("CETRAFS_TEST_REPAIR_HOLD_SECS")));
+    }
+
+    {
+        char label[CETRAFS_NODE_LABEL_LEN + 1] = {0};
+        long long age = 0;
+        uint32_t row = 0;
+
+        /* Same reasoning one level out: a peer mutating this volume
+         * while we walk it produces invented "errors", and a clean
+         * result would be just as meaningless. See devutil.h. */
+        int lp = cetrafs_find_live_peer(dev, &row, label, sizeof(label), &age);
+
+        if (lp < 0) {
+            fprintf(stderr,
+                    "ERR: %s: cannot read its Node Registry (I/O error) -- unable to prove no\n"
+                    "     other node has it mounted, so neither a verdict nor a repair would\n"
+                    "     mean anything. Fix the device and retry.\n",
+                    dev);
+            return 3; /* could not examine, same class as an unopenable device */
+        }
+        if (lp) {
+            fprintf(stderr,
+                    "ERR: %s is mounted by another node (registry row %u%s%s, last seen %llds ago)\n"
+                    "     -- its structures are being modified as we read them. Unmount it there;\n"
+                    "     its row goes stale after %ds.\n",
+                    dev, row, label[0] ? ", " : "", label[0] ? label : "", age, CETRAFS_NODE_STALE_SECS);
             return 1;
         }
     }

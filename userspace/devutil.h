@@ -32,6 +32,8 @@
 #include <stdio.h>
 #include <stdlib.h>
 #include <string.h>
+#include <linux/fs.h> /* BLKGETSIZE64 */
+#include <sys/ioctl.h>
 #include <sys/stat.h>
 #include <sys/time.h>
 #include <sys/types.h>
@@ -408,6 +410,67 @@ static inline unsigned cetrafs_probe_window(uint32_t max_advertised)
 
 static inline void cetrafs_repair_timer(int fd, const cetrafs_superblock_t *sb, uint32_t row, int on);
 
+/*
+ * May a repairer write registry rows where this superblock says the
+ * registry is? Every claim, renewal and release writes at
+ * node_table_start + row, straight off the superblock, and the release
+ * writes a row of zeros -- so a superblock with a damaged
+ * node_table_start aimed both at file data, on exactly the damaged
+ * volume fsck was asked to repair. fsck now validates the whole layout
+ * before claiming; growfs checks only the geometry it computes with.
+ * This is the one place both pass through: the superblock must be the
+ * one written (CRC) and the registry must lie inside the device,
+ * clear of every other region the superblock names.
+ */
+static inline int cetrafs_node_table_placed_ok(int fd, const cetrafs_superblock_t *sb)
+{
+    unsigned long long dev_bytes = 0;
+    uint64_t start = cetrafs_le64(sb->node_table_start), nblk = cetrafs_le64(sb->node_table_blocks);
+    uint64_t total = cetrafs_le64(sb->total_blocks), zg = cetrafs_le32(sb->zone_group_count);
+    uint64_t bg = cetrafs_le32(sb->block_group_count), first = cetrafs_le64(sb->bg_table_first_count);
+    uint64_t data_end = cetrafs_le64(sb->bg_data_end);
+    struct {
+        uint64_t start, count;
+    } r[8];
+    unsigned i, n = 0;
+
+    if ((uint32_t) cetrafs_le64(sb->checksum) !=
+        crc32c_struct(sb, sizeof(*sb), offsetof(cetrafs_superblock_t, checksum), sizeof(sb->checksum)))
+        return 0;
+    if (ioctl(fd, BLKGETSIZE64, &dev_bytes) < 0) {
+        struct stat st;
+
+        if (fstat(fd, &st) < 0)
+            return 0;
+        dev_bytes = (unsigned long long) st.st_size;
+    }
+    if (total > dev_bytes / CETRAFS_BLOCK_SIZE)
+        return 0;
+    if (!cetrafs_le32(sb->node_table_count) || cetrafs_le32(sb->node_table_count) > nblk)
+        return 0;
+    if (!start || nblk > total || start > total - nblk)
+        return 0;
+
+    if (!first || first > bg)
+        first = bg;
+    if (!data_end)
+        data_end = cetrafs_le64(sb->bg_regions_start) + bg * cetrafs_le64(sb->bg_size_blocks);
+    r[n].start = 0, r[n++].count = 1;
+    r[n].start = cetrafs_le64(sb->zg_table_start), r[n++].count = zg;
+    r[n].start = cetrafs_le64(sb->bg_table_start), r[n++].count = first;
+    r[n].start = cetrafs_le64(sb->inode_bmap_start), r[n++].count = cetrafs_le64(sb->inode_bmap_blocks);
+    r[n].start = cetrafs_le64(sb->inode_table_start), r[n++].count = cetrafs_le64(sb->inode_table_blocks);
+    r[n].start = cetrafs_le64(sb->pending_free_start), r[n++].count = zg * cetrafs_le32(sb->pending_free_blocks_per_zg);
+    r[n].start = cetrafs_le64(sb->node_journal_start),
+    r[n++].count = (uint64_t) cetrafs_le32(sb->node_table_count) * cetrafs_le32(sb->node_journal_blocks);
+    r[n].start = cetrafs_le64(sb->bg_regions_start),
+    r[n++].count = data_end > cetrafs_le64(sb->bg_regions_start) ? data_end - cetrafs_le64(sb->bg_regions_start) : 0;
+    for (i = 0; i < n; i++)
+        if (r[i].count && start < r[i].start + r[i].count && r[i].start < start + nblk)
+            return 0;
+    return 1;
+}
+
 /* Claim a row for this repairer. Returns the row, or -1 if none could
  * be taken (or the write failed) -- in which case the caller must not
  * proceed: an unclaimed repair is the thing being fixed. */
@@ -419,6 +482,11 @@ static inline int cetrafs_repair_claim(int fd, const cetrafs_superblock_t *sb, c
 
     if (!count || count > 4096)
         return -1;
+    if (!cetrafs_node_table_placed_ok(fd, sb)) {
+        fprintf(stderr, "ERR: the superblock places the Node Registry where it cannot be -- refusing to write a "
+                        "repair claim there\n");
+        return -1;
+    }
 
     /*
      * Pass 0 takes a free row; pass 1 borrows a cleanly departed one
