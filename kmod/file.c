@@ -732,7 +732,12 @@ static struct buffer_head *cetrafs_scrub_tree_bread(struct super_block *sb, u64 
         struct buffer_head *bh = cetrafs_bread_uncached(sb, lba);
 
         if (bh) {
-            if (cetrafs_blk_tail_valid(bh, magic))
+            bool ok;
+
+            cetrafs_bh_read_lock(bh);
+            ok = cetrafs_blk_tail_valid(bh, magic);
+            cetrafs_bh_read_unlock(bh);
+            if (ok)
                 return bh;
             brelse(bh);
         }
@@ -772,10 +777,19 @@ cetrafs_scrub_walk_leaf(struct super_block *sb, u64 lba, void (*cb)(void *, u64,
     cb(ctx, lba, 1);
     hdr = (const cetrafs_extent_hdr_t *) bh->b_data;
     arr = (const cetrafs_extent_t *) (bh->b_data + sizeof(*hdr));
+    /*
+     * Under the buffer lock. Cached or freshly re-read, this is the
+     * memory this node's extent-tree writers edit in place
+     * (cetrafs_tree_lookup_unchecked()), and a half-done edit can name
+     * a shifted range -- leaving a live block unreported, which is
+     * exactly what this walk's caller frees.
+     */
+    cetrafs_bh_read_lock(bh);
     ln = min_t(u32, cetrafs_le16(hdr->eh_entries), CETRAFS_EXT_BLOCK_MAX_LEAVES);
     for (i = 0; i < ln; i++)
         cb(ctx, cetrafs_extent_phys_from_hilo(arr[i].ee_start_hi, arr[i].ee_start_lo),
            cetrafs_extent_len(arr[i].ee_len));
+    cetrafs_bh_read_unlock(bh);
     brelse(bh);
     return 0;
 }
@@ -858,9 +872,17 @@ int cetrafs_raw_inode_for_each_owned_block(struct super_block *sb,
             cb(ctx, lba, 1); /* the interior block itself -- see above */
             ihdr = (const cetrafs_extent_hdr_t *) ibh->b_data;
             iarr = (const cetrafs_extent_idx_t *) (ibh->b_data + sizeof(*ihdr));
-            iln = min_t(u32, cetrafs_le16(ihdr->eh_entries), CETRAFS_EXT_BLOCK_MAX_IDX);
-            for (li = 0; li < iln; li++) {
-                u64 llba = cetrafs_extent_phys_from_hilo(iarr[li].ei_leaf_hi, iarr[li].ei_leaf_lo);
+            for (li = 0;; li++) {
+                u64 llba;
+
+                /* One entry at a time under the buffer lock, released
+                 * before the leaf's is taken (as in the lookup). */
+                cetrafs_bh_read_lock(ibh);
+                iln = min_t(u32, cetrafs_le16(ihdr->eh_entries), CETRAFS_EXT_BLOCK_MAX_IDX);
+                llba = li < iln ? cetrafs_extent_phys_from_hilo(iarr[li].ei_leaf_hi, iarr[li].ei_leaf_lo) : 0;
+                cetrafs_bh_read_unlock(ibh);
+                if (li >= iln)
+                    break;
 
                 ret = cetrafs_scrub_walk_leaf(sb, llba, cb, ctx, fresh);
                 if (ret) {

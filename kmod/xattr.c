@@ -141,7 +141,11 @@ static int cetrafs_xattr_read_block(struct inode *inode, void **out)
                 goto out;
             }
         }
+        /* A whole image: this node's own xattr writers edit the cached
+         * block in place under the buffer lock (cetrafs_bh_read_lock()). */
+        cetrafs_bh_read_lock(bh);
         memcpy(copy, bh->b_data, CETRAFS_BLOCK_SIZE);
+        cetrafs_bh_read_unlock(bh);
         brelse(bh);
 
         cetrafs_invalidate_raw_inode(sb, inode->i_ino);
