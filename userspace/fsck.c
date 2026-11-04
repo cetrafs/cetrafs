@@ -1963,9 +1963,19 @@ int main(int argc, char **argv)
 
                     uint32_t hc = crc32c_struct(&hdr, sizeof(hdr), offsetof(cetrafs_journal_header_t, header_checksum),
                                                 sizeof(hdr.header_checksum));
+                    /* A torn slot -- header or payload failing its CRC
+                     * -- is an entry that never committed, the normal
+                     * residue of a crash mid-journal-write, and replay
+                     * skips it (journal.c). It was ERR here: the volume
+                     * failed every check after such a crash, with no
+                     * repair to offer, for an entry nothing will ever
+                     * apply. If the operation it covered had begun on
+                     * its target, that block's own checksum says so. */
                     if ((uint32_t) cetrafs_le32(hdr.header_checksum) != hc) {
-                        fprintf(stderr, "ERR: node %u journal slot %" PRIu64 " header CRC mismatch\n", n, sl);
-                        cl_problems++;
+                        fprintf(stderr,
+                                "WARN: node %u journal slot %" PRIu64
+                                " header CRC mismatch -- a torn, uncommitted entry; replay skips it\n",
+                                n, sl);
                         continue;
                     }
 
@@ -1987,11 +1997,10 @@ int main(int argc, char **argv)
                     pread_all(fd, pay, sizeof(pay), (off_t) (hlba + 1) * CETRAFS_BLOCK_SIZE);
                     if ((uint32_t) cetrafs_le32(hdr.payload_checksum) != crc32c_update(0, pay, sizeof(pay))) {
                         fprintf(stderr,
-                                "ERR: node %u journal slot %" PRIu64
-                                " payload CRC mismatch -- it would be applied "
-                                "over block %" PRIu64 "\n",
+                                "WARN: node %u journal slot %" PRIu64
+                                " payload CRC mismatch (target block %" PRIu64
+                                ") -- a torn entry; replay skips it\n",
                                 n, sl, (uint64_t) cetrafs_le64(hdr.target_lba));
-                        cl_problems++;
                     } else if (!(cetrafs_le32(hdr.flags) & CETRAFS_JRNL_F_FRESH)) {
                         /* A whole, valid entry. If its target already
                          * holds the payload, only the consume was lost

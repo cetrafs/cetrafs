@@ -136,8 +136,10 @@ expect_caught "outside every BG data region" \
     "journal: an entry targeting block 0 is reported as out of range"
 
 # --- journal: a slot whose payload does not match its checksum --------
-# Replay verifies payload checksums; a mismatch means the entry would be
-# refused there, but offline it is still a corrupt journal worth naming.
+# Replay verifies payload checksums and SKIPS a torn entry: it never
+# committed, and nothing will apply it. fsck names it as a WARN and does
+# not fail the volume for it -- it used to, and a crash mid-journal-write
+# then left a volume that failed every check with nothing to repair.
 log "journal: payload CRC mismatch"
 mkfs_fresh
 # Target a real data block so the entry passes the range check and the
@@ -159,8 +161,26 @@ if [ -n "$PAY_LBA" ]; then
     ORIG_BYTE="$(dd if="$LOOPDEV" bs=4096 skip="$PAY_LBA" count=1 2>/dev/null | head -c1 | od -An -tu1 | tr -d ' ')"
     printf "$(printf '\\%03o' $(((ORIG_BYTE ^ 0xff) & 0xff)))" |
         dd of="$LOOPDEV" bs=4096 seek="$PAY_LBA" conv=notrunc 2>/dev/null
-    expect_caught "payload CRC mismatch" \
-        "journal: an entry whose payload was altered is reported"
+    run_fsck
+    if [ "$FSCK_RC" = 0 ] && echo "$FSCK_OUT" | grep -q "WARN: .*payload CRC mismatch.*replay skips it"; then
+        pass "journal: a torn entry is reported, as a warning, and does not fail the volume"
+    else
+        fail "journal: a torn entry -- rc=$FSCK_RC: $(echo "$FSCK_OUT" | grep -E '^(ERR|WARN)' | head -2)"
+    fi
+    # And a torn HEADER: one byte past the magic, so the slot still
+    # reads as an entry and only its checksum can tell.
+    mkfs_fresh
+    JP_OUT="$("$JOURNAL_POKE" "$LOOPDEV" 0 0 $((BG_START + 1000)) "$PAYLOAD")"
+    HDR_LBA=$(($(grep -oP 'payload_lba=\K[0-9]+' <<<"$JP_OUT") - 1))
+    ORIG_BYTE="$(dd if="$LOOPDEV" bs=1 skip=$((HDR_LBA * 4096 + 8)) count=1 2>/dev/null | od -An -tu1 | tr -d ' ')"
+    printf "$(printf '\\%03o' $(((ORIG_BYTE ^ 0xff) & 0xff)))" |
+        dd of="$LOOPDEV" bs=1 seek=$((HDR_LBA * 4096 + 8)) conv=notrunc 2>/dev/null
+    run_fsck
+    if [ "$FSCK_RC" = 0 ] && echo "$FSCK_OUT" | grep -q "WARN: .*header CRC mismatch.*replay skips it"; then
+        pass "journal: a torn header is reported, as a warning, and does not fail the volume"
+    else
+        fail "journal: a torn header -- rc=$FSCK_RC: $(echo "$FSCK_OUT" | grep -E '^(ERR|WARN)' | head -2)"
+    fi
 else
     fail "journal: journal_poke did not report payload_lba"
 fi
