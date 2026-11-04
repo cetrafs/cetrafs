@@ -341,6 +341,21 @@ void cetrafs_lock_retry_deferred(struct super_block *sb);
 #define CETRAFS_PRESENCE_DEFERRED_MAX 32
 void cetrafs_sb_presence_defer(struct super_block *sb, u64 ino, u64 generation);
 u32 cetrafs_sb_presence_take_deferred(struct super_block *sb, struct cetrafs_nsrel_pending *out, u32 max);
+/* An inode-number reclaim claim (RELEASE, or a create's BIRTH_ABORT)
+ * whose give-back did not land. Kept: the record stays locked by this
+ * node, every scrub skips it, peers abandon the number -- for good, while
+ * this node beats. Retried by the heartbeat (cetrafs_alloc_retry_reclaim()).
+ * 'seq' is the claim's stamp, which a RELEASE must still match. */
+struct cetrafs_reclaim_pending {
+    u64 ino;
+    u64 generation;
+    u64 seq;
+    int mode;
+};
+#define CETRAFS_RECLAIM_DEFERRED_MAX 32
+void cetrafs_sb_reclaim_defer(struct super_block *sb, const struct cetrafs_reclaim_pending *p);
+u32 cetrafs_sb_reclaim_take_deferred(struct super_block *sb, struct cetrafs_reclaim_pending *out, u32 max);
+void cetrafs_alloc_retry_reclaim(struct super_block *sb); /* alloc.c */
 void cetrafs_lock_retry_presence(struct super_block *sb);
 s64 cetrafs_sb_take_zg_free_delta(struct super_block *sb, u32 zg_id);
 int cetrafs_flush_dirty_free_counts(struct super_block *sb);

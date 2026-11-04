@@ -518,6 +518,61 @@ static int cetrafs_inode_bitmap_cas_free(struct super_block *sb, u64 bit)
     return ret;
 }
 
+/* Test-only: fail the next N reclaim-claim give-backs (RELEASE or
+ * BIRTH_ABORT) with -EIO, as a CAS the device refused would.
+ * tests/kernel/reclaim_giveback_retry.sh. */
+static unsigned int cetrafs_reclaim_giveback_fail;
+module_param_named(reclaim_giveback_fail, cetrafs_reclaim_giveback_fail, uint, 0644);
+MODULE_PARM_DESC(reclaim_giveback_fail, "test-only: fail the next N inode reclaim-claim give-backs with -EIO");
+
+/*
+ * Give back an inode-number reclaim claim -- a RELEASE after a reclaim,
+ * or a failed create's BIRTH_ABORT. Kept, the record stays locked by
+ * this node: every scrub skips it and every peer that draws the number
+ * abandons it, and nothing reclaims a live node's claim. So a give-back
+ * that does not land is queued for the heartbeat, never forgotten.
+ * -ESTALE means the record is no longer what we claimed (reborn, or a
+ * creator's birth claim moved its stamp): nothing of ours to give back.
+ */
+static void cetrafs_reclaim_give_back(struct super_block *sb, u64 ino, u64 generation, int mode, u64 seq)
+{
+    struct cetrafs_reclaim_pending p = {.ino = ino, .generation = generation, .seq = seq, .mode = mode};
+    int ret;
+
+    if (READ_ONCE(cetrafs_reclaim_giveback_fail)) {
+        WRITE_ONCE(cetrafs_reclaim_giveback_fail, cetrafs_reclaim_giveback_fail - 1);
+        ret = -EIO;
+    } else {
+        ret = cetrafs_inode_reclaim_claim(sb, ino, generation, mode, &seq);
+    }
+    if (ret && ret != -ESTALE) {
+        pr_warn_ratelimited("inode ino=%llu: reclaim claim not given back (%d) -- queued for the heartbeat\n",
+                            (unsigned long long) ino, ret);
+        cetrafs_sb_reclaim_defer(sb, &p);
+    }
+}
+
+/* The heartbeat's half of cetrafs_reclaim_give_back(). */
+void cetrafs_alloc_retry_reclaim(struct super_block *sb)
+{
+    /* Up to eight per heartbeat: the whole queue is too big for a kernel
+     * stack frame, and an entry that fails again goes to the back. */
+    struct cetrafs_reclaim_pending pend[8];
+    u32 n, i;
+
+    n = cetrafs_sb_reclaim_take_deferred(sb, pend, ARRAY_SIZE(pend));
+    for (i = 0; i < n; i++) {
+        u64 seq = pend[i].seq;
+        int ret = cetrafs_inode_reclaim_claim(sb, pend[i].ino, pend[i].generation, pend[i].mode, &seq);
+
+        if (!ret || ret == -ESTALE)
+            pr_info("inode ino=%llu: reclaim claim given back by the heartbeat%s\n",
+                    (unsigned long long) pend[i].ino, ret ? " (no longer ours)" : "");
+        else
+            cetrafs_sb_reclaim_defer(sb, &pend[i]);
+    }
+}
+
 /* Allocate a free inode number (1-based) from the global inode bitmap. */
 /*
  * Test-only: pause an inode allocation between taking the bit and
@@ -792,15 +847,15 @@ int cetrafs_alloc_inode(struct super_block *sb, u64 *out_ino)
                  * them next. Released, the record is an ordinary dead
                  * one: the scrub reclaims the number if the bit is set,
                  * and if a peer cleared it the number is simply free. */
-                (void) cetrafs_inode_reclaim_claim(sb, *out_ino, cetrafs_le64(raw.generation),
-                                                   CETRAFS_RECLAIM_BIRTH_ABORT, NULL);
+                cetrafs_reclaim_give_back(sb, *out_ino, cetrafs_le64(raw.generation), CETRAFS_RECLAIM_BIRTH_ABORT,
+                                          0);
                 cetrafs_sb_birth_end(sb, *out_ino);
                 *out_ino = 0;
                 return ret;
             }
             if (!set) {
-                (void) cetrafs_inode_reclaim_claim(sb, *out_ino, cetrafs_le64(raw.generation),
-                                                   CETRAFS_RECLAIM_BIRTH_ABORT, NULL);
+                cetrafs_reclaim_give_back(sb, *out_ino, cetrafs_le64(raw.generation), CETRAFS_RECLAIM_BIRTH_ABORT,
+                                          0);
                 lost = true;
             }
         }
@@ -893,8 +948,7 @@ int cetrafs_free_inode(struct super_block *sb, u64 ino)
                  * that later draws this number reads a foreign lock and
                  * abandons it. */
                 if (mid_birth && cetrafs_le32(raw.ns_lock_owner) != CETRAFS_NODE_ID_NONE)
-                    (void) cetrafs_inode_reclaim_claim(sb, ino, cetrafs_le64(raw.generation),
-                                                       CETRAFS_RECLAIM_BIRTH_ABORT, NULL);
+                    cetrafs_reclaim_give_back(sb, ino, cetrafs_le64(raw.generation), CETRAFS_RECLAIM_BIRTH_ABORT, 0);
             }
         }
         if (!dead) {
@@ -972,15 +1026,7 @@ int cetrafs_free_inode_if_dead(struct super_block *sb, u64 ino, u64 generation)
         ret = cetrafs_inode_bitmap_cas_free(sb, ino - 1);
     if (!ret)
         cetrafs_sb_adjust_free_inodes(sb, 1);
-    {
-        int rret = cetrafs_inode_reclaim_claim(sb, ino, generation, CETRAFS_RECLAIM_RELEASE, &seq);
-
-        if (rret)
-            pr_warn_ratelimited(
-                "scrub: ino=%llu reclaim lock not released (%d) -- the number stays unusable "
-                "until fsck\n",
-                (unsigned long long) ino, rret);
-    }
+    cetrafs_reclaim_give_back(sb, ino, generation, CETRAFS_RECLAIM_RELEASE, seq);
     cetrafs_sb_birth_ungate(sb, true, nofs);
     if (ret > 0)
         return 1;

@@ -598,6 +598,12 @@ struct cetrafs_sb_info {
     u32 prrel_count;
     struct cetrafs_nsrel_pending prrel[CETRAFS_PRESENCE_DEFERRED_MAX];
 
+    /* Inode-number reclaim claims whose give-back did not land (see
+     * cetrafs_reclaim_pending in kmod.h). Under rcrel_lock. */
+    spinlock_t rcrel_lock;
+    u32 rcrel_count;
+    struct cetrafs_reclaim_pending rcrel[CETRAFS_RECLAIM_DEFERRED_MAX];
+
     /* Each BG count's ownership epoch (cetrafs_block_group_t.
      * reconcile_seq) as of OUR reconcile -- the epoch our accrued
      * deltas were born under. The delta-apply CAS refuses an image
@@ -1255,6 +1261,7 @@ int cetrafs_fill_super(struct super_block *sb, struct fs_context *fc)
         spin_lock_init(&sbi->nsrel_lock);
         spin_lock_init(&sbi->flrel_lock);
         spin_lock_init(&sbi->prrel_lock);
+        spin_lock_init(&sbi->rcrel_lock);
         mutex_init(&sbi->nsrel_mutex);
         INIT_LIST_HEAD(&sbi->resv_list);
 
@@ -4050,6 +4057,45 @@ u32 cetrafs_sb_presence_take_deferred(struct super_block *sb, struct cetrafs_nsr
     memmove(sbi->prrel, sbi->prrel + n, (sbi->prrel_count - n) * sizeof(*out));
     sbi->prrel_count -= n;
     spin_unlock(&sbi->prrel_lock);
+    return n;
+}
+
+void cetrafs_sb_reclaim_defer(struct super_block *sb, const struct cetrafs_reclaim_pending *p)
+{
+    struct cetrafs_sb_info *sbi = sb->s_fs_info;
+    u32 i;
+
+    if (!sbi)
+        return;
+    spin_lock(&sbi->rcrel_lock);
+    for (i = 0; i < sbi->rcrel_count; i++)
+        if (sbi->rcrel[i].ino == p->ino) {
+            sbi->rcrel[i] = *p;
+            spin_unlock(&sbi->rcrel_lock);
+            return;
+        }
+    if (sbi->rcrel_count == CETRAFS_RECLAIM_DEFERRED_MAX) {
+        spin_unlock(&sbi->rcrel_lock);
+        cetrafs_sb_defer_overflow(sb, "inode reclaim claim", p->ino, CETRAFS_RECLAIM_DEFERRED_MAX);
+        return;
+    }
+    sbi->rcrel[sbi->rcrel_count++] = *p;
+    spin_unlock(&sbi->rcrel_lock);
+}
+
+u32 cetrafs_sb_reclaim_take_deferred(struct super_block *sb, struct cetrafs_reclaim_pending *out, u32 max)
+{
+    struct cetrafs_sb_info *sbi = sb->s_fs_info;
+    u32 n;
+
+    if (!sbi)
+        return 0;
+    spin_lock(&sbi->rcrel_lock);
+    n = min(sbi->rcrel_count, max);
+    memcpy(out, sbi->rcrel, n * sizeof(*out));
+    memmove(sbi->rcrel, sbi->rcrel + n, (sbi->rcrel_count - n) * sizeof(*out));
+    sbi->rcrel_count -= n;
+    spin_unlock(&sbi->rcrel_lock);
     return n;
 }
 
