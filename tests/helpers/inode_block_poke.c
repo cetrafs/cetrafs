@@ -106,6 +106,12 @@ int main(int argc, char **argv)
         fprintf(stderr, "       %s <backing-file> dirtytail <ino>      (garbage past the record)\n", argv[0]);
         fprintf(stderr, "       %s <backing-file> tailzero <ino>       (prints yes/no)\n", argv[0]);
         fprintf(stderr, "       %s <backing-file> peerseq <ino> <node> (file_seq as a peer's publish)\n", argv[0]);
+        fprintf(stderr, "       %s <backing-file> extset <ino> <i> block|len <v> (inline extent i's logical field)\n",
+                argv[0]);
+        fprintf(stderr, "       %s <backing-file> ehset <ino> magic|entries|depth <v> (the inline extent header)\n",
+                argv[0]);
+        fprintf(stderr, "       %s <backing-file> idxrange <ino> <e> <lo> <hi> (depth 2: interior entry's range)\n",
+                argv[0]);
         return 2;
     }
 
@@ -305,6 +311,78 @@ int main(int argc, char **argv)
             printf("depth=1 leaf_lba=%llu leaf_entries=%u leaf_blocks=%llu\n", (unsigned long long) lba,
                    lh->eh_entries, (unsigned long long) blocks);
         }
+    } else if (strcmp(mode, "extset") == 0 && argc == 7) {
+        /* One LOGICAL field of one inline extent, nothing else, CRCs
+         * restamped: the physical run stays legal, so only a check of
+         * the logical fields can see it. */
+        cetrafs_inode_t rec;
+        unsigned i = (unsigned) strtoul(argv[4], NULL, 0);
+        uint32_t v = (uint32_t) strtoul(argv[6], NULL, 0);
+
+        pread_all(fd, &rec, sizeof(rec), rec_off);
+        if (i >= 4) {
+            fprintf(stderr, "extent index %u out of range\n", i);
+            return 2;
+        }
+        if (strcmp(argv[5], "block") == 0)
+            rec.et.leaf[i].ee_block = cetrafs_cpu_to_le32(v);
+        else if (strcmp(argv[5], "len") == 0)
+            rec.et.leaf[i].ee_len = cetrafs_cpu_to_le32(
+                (cetrafs_le32(rec.et.leaf[i].ee_len) & ~(uint32_t) CETRAFS_EXT_LEN_MASK) | (v & CETRAFS_EXT_LEN_MASK));
+        else {
+            fprintf(stderr, "unknown extent field %s\n", argv[5]);
+            return 2;
+        }
+        cetrafs_inode_stamp_crcs_us(&rec);
+        pwrite_all(fd, &rec, sizeof(rec), rec_off);
+        fprintf(stderr, "inode_block_poke: ino %llu extent %u %s -> %u\n", (unsigned long long) ino, i, argv[5], v);
+    } else if (strcmp(mode, "idxrange") == 0 && argc == 7) {
+        /* Depth 2: set interior entry <e> (under root slot 0) to cover
+         * [lo, hi), tail checksum restamped. */
+        cetrafs_inode_t rec;
+        uint8_t blk[CETRAFS_BLOCK_SIZE];
+        unsigned e = (unsigned) strtoul(argv[4], NULL, 0);
+        cetrafs_extent_idx_t *ie;
+        cetrafs_blk_tail_t *t;
+        uint64_t ilba;
+
+        pread_all(fd, &rec, sizeof(rec), rec_off);
+        if (cetrafs_le16(rec.eh.eh_depth) != 2) {
+            fprintf(stderr, "idxrange: ino %llu is not depth 2\n", (unsigned long long) ino);
+            return 1;
+        }
+        ilba = ((uint64_t) cetrafs_le16(rec.et.idx[0].ei_leaf_hi) << 32) | cetrafs_le32(rec.et.idx[0].ei_leaf_lo);
+        pread_all(fd, blk, sizeof(blk), (off_t) ilba * CETRAFS_BLOCK_SIZE);
+        if (e >= cetrafs_le16(((cetrafs_extent_hdr_t *) blk)->eh_entries)) {
+            fprintf(stderr, "idxrange: interior has no entry %u\n", e);
+            return 1;
+        }
+        ie = (cetrafs_extent_idx_t *) (blk + sizeof(cetrafs_extent_hdr_t)) + e;
+        ie->ei_block = cetrafs_cpu_to_le32((uint32_t) strtoul(argv[5], NULL, 0));
+        ie->ei_block_end = cetrafs_cpu_to_le32((uint32_t) strtoul(argv[6], NULL, 0));
+        t = (cetrafs_blk_tail_t *) (blk + CETRAFS_BLK_TAIL_OFF);
+        t->crc = cetrafs_cpu_to_le32(crc32c_update(0, blk, CETRAFS_BLK_TAIL_OFF));
+        pwrite_all(fd, blk, sizeof(blk), (off_t) ilba * CETRAFS_BLOCK_SIZE);
+        fprintf(stderr, "inode_block_poke: ino %llu interior entry %u range -> [%s,%s)\n", (unsigned long long) ino, e,
+                argv[5], argv[6]);
+    } else if (strcmp(mode, "ehset") == 0 && argc == 6) {
+        cetrafs_inode_t rec;
+        uint16_t v = (uint16_t) strtoul(argv[5], NULL, 0);
+
+        pread_all(fd, &rec, sizeof(rec), rec_off);
+        if (strcmp(argv[4], "magic") == 0)
+            rec.eh.eh_magic = cetrafs_cpu_to_le16(v);
+        else if (strcmp(argv[4], "entries") == 0)
+            rec.eh.eh_entries = cetrafs_cpu_to_le16(v);
+        else if (strcmp(argv[4], "depth") == 0)
+            rec.eh.eh_depth = cetrafs_cpu_to_le16(v);
+        else {
+            fprintf(stderr, "unknown header field %s\n", argv[4]);
+            return 2;
+        }
+        cetrafs_inode_stamp_crcs_us(&rec);
+        pwrite_all(fd, &rec, sizeof(rec), rec_off);
+        fprintf(stderr, "inode_block_poke: ino %llu eh %s -> %u\n", (unsigned long long) ino, argv[4], v);
     } else if (strcmp(mode, "extlen") == 0) {
         /* Set inline extent 0's length to an arbitrary value and mark it
          * PREALLOCATED, restamping the checksum so the record stays

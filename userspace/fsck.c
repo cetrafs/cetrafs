@@ -957,6 +957,40 @@ static int fsck_run_bg(const uint64_t *bg_start, const uint64_t *bg_cnt, uint32_
     return -1;
 }
 
+/* An extent's LOGICAL fields, which fsck_mark_run() (physical) never
+ * looked at. Each is something the kernel refuses or silently loses:
+ * a zero length (seek/fiemap and the unwritten convert call the volume
+ * corrupt), an end past the largest file (the convert refuses it), and
+ * at depth 2 an extent outside the [ei_block, ei_block_end) range its
+ * index entries advertise -- the lookup skips a child on that range, so
+ * the block reads as a hole and the next write allocates over it. lo/hi
+ * is the narrowest advertised range, hi == 0 for "none". Reported, not
+ * repaired: none of these hides a block from the walk. */
+static int fsck_extent_logical(uint64_t ino, const cetrafs_extent_t *x, uint64_t lo, uint64_t hi)
+{
+    uint64_t eb = cetrafs_le32(x->ee_block);
+    uint64_t len = cetrafs_le32(x->ee_len) & CETRAFS_EXT_LEN_MASK;
+
+    if (len == 0) {
+        fprintf(stderr, "%s: inode %" PRIu64 " has an extent of length 0 at logical block %" PRIu64 "\n", FSCK_SEV,
+                ino, eb);
+        return 1;
+    }
+    if (eb + len > CETRAFS_MAX_FILE_BLOCKS) {
+        fprintf(stderr, "%s: inode %" PRIu64 " has an extent [%" PRIu64 ",+%" PRIu64 ") past the largest file\n",
+                FSCK_SEV, ino, eb, len);
+        return 1;
+    }
+    if (hi && (eb < lo || eb + len > hi)) {
+        fprintf(stderr,
+                "%s: inode %" PRIu64 " has an extent [%" PRIu64 ",+%" PRIu64 ") outside the range [%" PRIu64
+                ",%" PRIu64 ") its index advertises -- the kernel's lookup skips it\n",
+                FSCK_SEV, ino, eb, len, lo, hi);
+        return 1;
+    }
+    return 0;
+}
+
 static void fsck_mark_run(struct fsck_refctx *c, uint64_t phys, uint64_t len, uint64_t ino)
 {
     uint64_t base = 0, idx0;
@@ -2341,12 +2375,38 @@ int main(int argc, char **argv)
             if (in.nlink == 0)
                 fprintf(stderr, "WARN: inode %" PRIu64 " is allocated but has nlink=0 (orphan)\n", ino);
 
+            /* A type the kernel cannot instantiate: iget refuses it
+             * (-EUCLEAN), so the file is unreachable on every node. Its
+             * blocks are still walked below. */
+            {
+                uint32_t fmt = cetrafs_le32(in.mode) & 0170000u;
+
+                if (in.nlink != 0 && fmt != 0100000u && fmt != 0040000u && fmt != 0120000u) {
+                    fprintf(stderr, "ERR: inode %" PRIu64 " has mode 0%o, a type the kernel refuses to open\n", ino,
+                            cetrafs_le32(in.mode));
+                    problems++;
+                }
+            }
             if (cetrafs_le16(in.eh.eh_magic) != CETRAFS_EXT_MAGIC) {
                 /* magic == 0 is a legitimate "no extents yet" record and
                  * is NOT an error -- blocking repair on it would disable
                  * repair on every healthy volume, which is the
                  * cries-wolf failure N5 is about. Only a header that is
                  * positively wrong hides blocks from the walk. */
+                if (in.eh.eh_magic == 0 && in.nlink != 0 && fsck_all_zero((const uint8_t *) &in.et, sizeof(in.et))) {
+                    /* Nothing hidden (no extent bytes at all), but every
+                     * creator stamps the magic, and the kernel refuses to
+                     * map through a record without it (-EIO on the first
+                     * read or write). */
+                    fprintf(stderr,
+                            "ERR: inode %" PRIu64 " has no extent header; the kernel refuses to map it\n", ino);
+                    problems++;
+                } else if (in.eh.eh_magic == 0 && in.nlink != 0) {
+                    fprintf(stderr, "ERR: inode %" PRIu64 " has extent entries under a missing header\n", ino);
+                    problems++;
+                    repair_block("an inode's extent header is missing over extent data, so the blocks it owns "
+                                 "cannot be distinguished from leaked ones");
+                }
                 if (in.eh.eh_magic != 0) {
                     fprintf(stderr, "%s: inode %" PRIu64 " has a bad extent header magic 0x%X\n", FSCK_SEV, ino, in.eh.eh_magic);
                     problems += !fsck_dead_walk;
@@ -2402,6 +2462,7 @@ int main(int argc, char **argv)
                     uint64_t phys = ((uint64_t) cetrafs_le16(in.et.leaf[e].ee_start_hi) << 32) | cetrafs_le32(in.et.leaf[e].ee_start_lo);
 
                     fsck_mark_run(&rc, phys, cetrafs_le32(in.et.leaf[e].ee_len) & CETRAFS_EXT_LEN_MASK, ino);
+                    problems += fsck_extent_logical(ino, &in.et.leaf[e], 0, 0) && !fsck_dead_walk;
                     extents_seen++;
                 }
             } else if (cetrafs_le16(in.eh.eh_depth) == 1) {
@@ -2432,6 +2493,7 @@ int main(int argc, char **argv)
                         uint64_t phys = ((uint64_t) cetrafs_le16(x->ee_start_hi) << 32) | cetrafs_le32(x->ee_start_lo);
 
                         fsck_mark_run(&rc, phys, cetrafs_le32(x->ee_len) & CETRAFS_EXT_LEN_MASK, ino);
+                        problems += fsck_extent_logical(ino, x, 0, 0) && !fsck_dead_walk;
                         extents_seen++;
                     }
                     fsck_mark_run(&rc, leaf_lba, 1, ino); /* the leaf block itself */
@@ -2440,6 +2502,17 @@ int main(int argc, char **argv)
                 /* depth 2: interiors -> leaves -> extents */
                 uint8_t idxblk[CETRAFS_BLOCK_SIZE];
                 uint32_t ni = cetrafs_le16(in.eh.eh_entries) > 4 ? 4 : cetrafs_le16(in.eh.eh_entries);
+
+                /* An empty depth-2 node is refused by the kernel's append
+                 * (-EUCLEAN): a tree is only ever deepened with entries. */
+                if (ni == 0) {
+                    fprintf(stderr, "%s: inode %" PRIu64 " has a depth-2 extent tree with no entries\n", FSCK_SEV, ino);
+                    problems += !fsck_dead_walk;
+                    /* And a count rotted to 0 hides the whole tree from
+                     * this walk: its blocks would read as leaked. */
+                    repair_block("a depth-2 extent tree claims no entries, so the blocks the inode owns cannot be "
+                                 "distinguished from leaked ones");
+                }
 
                 for (uint32_t i = 0; i < ni && tree_ok; ++i) {
                     uint64_t ilba = ((uint64_t) cetrafs_le16(in.et.idx[i].ei_leaf_hi) << 32) | cetrafs_le32(in.et.idx[i].ei_leaf_lo);
@@ -2470,12 +2543,35 @@ int main(int argc, char **argv)
                     fsck_mark_run(&rc, ilba, 1, ino); /* the interior block itself */
                     ih = (cetrafs_extent_hdr_t *) idxblk;
                     iln = cetrafs_le16(ih->eh_entries) > CETRAFS_EXT_BLOCK_MAX_IDX ? CETRAFS_EXT_BLOCK_MAX_IDX : cetrafs_le16(ih->eh_entries);
+                    if (iln == 0) {
+                        fprintf(stderr, "%s: inode %" PRIu64 "'s extent index (block %" PRIu64 ") has no entries\n",
+                                FSCK_SEV, ino, ilba);
+                        problems += !fsck_dead_walk;
+                        repair_block("an extent index claims no entries, so the blocks the inode owns cannot be "
+                                     "distinguished from leaked ones");
+                    }
 
                     for (uint32_t li = 0; li < iln && tree_ok; ++li) {
                         const cetrafs_extent_idx_t *ie = (const cetrafs_extent_idx_t *) (idxblk + sizeof(*ih)) + li;
                         uint64_t llba = ((uint64_t) cetrafs_le16(ie->ei_leaf_hi) << 32) | cetrafs_le32(ie->ei_leaf_lo);
                         cetrafs_extent_hdr_t *lh;
                         uint32_t n;
+                        /* The narrowest range the lookup filters this
+                         * leaf by: the root slot's and the interior
+                         * entry's (cetrafs_idx_may_hold(); end 0 means
+                         * no filter). */
+                        uint64_t rlo = 0, rhi = 0;
+
+                        if (cetrafs_le32(in.et.idx[i].ei_block_end)) {
+                            rlo = cetrafs_le32(in.et.idx[i].ei_block);
+                            rhi = cetrafs_le32(in.et.idx[i].ei_block_end);
+                        }
+                        if (cetrafs_le32(ie->ei_block_end)) {
+                            if (!rhi || cetrafs_le32(ie->ei_block) > rlo)
+                                rlo = cetrafs_le32(ie->ei_block);
+                            if (!rhi || cetrafs_le32(ie->ei_block_end) < rhi)
+                                rhi = cetrafs_le32(ie->ei_block_end);
+                        }
 
                         if (!fsck_lba_in_range(llba, cetrafs_le64(sb.total_blocks))) {
                             fprintf(stderr,
@@ -2507,6 +2603,7 @@ int main(int argc, char **argv)
                             uint64_t phys = ((uint64_t) cetrafs_le16(x->ee_start_hi) << 32) | cetrafs_le32(x->ee_start_lo);
 
                             fsck_mark_run(&rc, phys, cetrafs_le32(x->ee_len) & CETRAFS_EXT_LEN_MASK, ino);
+                            problems += fsck_extent_logical(ino, x, rlo, rhi) && !fsck_dead_walk;
                             extents_seen++;
                         }
                     }

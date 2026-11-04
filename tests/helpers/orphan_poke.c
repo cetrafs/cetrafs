@@ -67,6 +67,10 @@ int main(int argc, char **argv)
     in.mode = cetrafs_cpu_to_le32(0100644);
     in.nlink = cetrafs_cpu_to_le32(nlink);
     in.generation = cetrafs_cpu_to_le64(0x0DDBA11ULL + ino);
+    /* Every kernel creator stamps an empty extent header; a record
+     * without one is refused at the first map (and fsck says so). */
+    in.eh.eh_magic = cetrafs_cpu_to_le16(CETRAFS_EXT_MAGIC);
+    in.eh.eh_max = cetrafs_cpu_to_le16(4);
     in.read_open_nodes = cetrafs_cpu_to_le64(mask);
     in.ns_lock_owner = cetrafs_cpu_to_le32(CETRAFS_NODE_ID_NONE);
     cetrafs_inode_stamp_crcs_us(&in); /* v0x0005: echoes + both sector CRCs */
