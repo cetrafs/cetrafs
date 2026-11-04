@@ -41,9 +41,13 @@ PEER_LOOPDEV="$(losetup --find --show "$PEER_IMG")"
 # live node means actually bumping the counter while they watch.
 export CETRAFS_PEER_PROBE_SECS=4
 "$NODE_POKE" "$PEER_LOOPDEV" 1 1 cc "$(date +%s)" >/dev/null
+# Beats off a saved superblock, as a mounted node does off the one it
+# read at mount: mkfs zeroes block 0 before it watches the registry.
+PEER_SB="$PEER_IMG.sb"
+dd if="$PEER_LOOPDEV" of="$PEER_SB" bs=4096 count=1 status=none
 beat_peer_during_probe() {
     for _ in 1 2 3 4 5 6 7 8; do
-        "$NODE_POKE" "$PEER_LOOPDEV" 1 --beat >/dev/null 2>&1 || true
+        NODE_POKE_SB="$PEER_SB" "$NODE_POKE" "$PEER_LOOPDEV" 1 --beat >/dev/null 2>&1 || true
         sleep 1
     done
 }
@@ -89,7 +93,7 @@ wait "$BEATER" 2>/dev/null || true
 unset CETRAFS_PEER_PROBE_SECS
 
 losetup -d "$PEER_LOOPDEV"
-rm -f "$PEER_IMG"
+rm -f "$PEER_IMG" "$PEER_IMG.sb"
 
 
 ct_exit
