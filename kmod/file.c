@@ -4266,6 +4266,56 @@ static unsigned int cetrafs_punch_pagecache_delay_ms;
 module_param_named(punch_pagecache_delay_ms, cetrafs_punch_pagecache_delay_ms, uint, 0644);
 MODULE_PARM_DESC(punch_pagecache_delay_ms, "TEST ONLY: pause inside punch between the page-cache drop and the free");
 
+/* TEST ONLY: pause a punch or truncate just before (_pre) or just after
+ * (_post) its last "is a peer using this file?" check before the
+ * publish. tests/kernel/punch_peer_late.sh. */
+static unsigned int cetrafs_rebuild_stall_pre_ms, cetrafs_rebuild_stall_post_ms;
+module_param_named(rebuild_stall_pre_ms, cetrafs_rebuild_stall_pre_ms, uint, 0644);
+MODULE_PARM_DESC(rebuild_stall_pre_ms, "TEST ONLY: pause a punch/truncate before its pre-publish peer check");
+module_param_named(rebuild_stall_post_ms, cetrafs_rebuild_stall_post_ms, uint, 0644);
+MODULE_PARM_DESC(rebuild_stall_post_ms, "TEST ONLY: pause a punch/truncate after its pre-publish peer check");
+
+/*
+ * Has a peer started using this file? The answer punch and truncate act
+ * on (CLAUDE.md rule 15): they decide "nobody else has it open" at the
+ * start, then build a whole new tree -- record reads, journalled leaf
+ * writes, a bitmap flush, seconds on a large file -- and publish it
+ * last-writer-wins and free what it dropped. A peer that opened in that
+ * gap, under nofilelock, had its new extents published over and its
+ * blocks freed. Asked again right before the publish (refuse) and right
+ * after it (free nothing). The two checks are not one atomic act with
+ * the publish -- presence lives in the other sector of the record -- so
+ * the second one is what makes a peer arriving between them safe: what
+ * it may still name is left allocated, a leak the scrub reclaims once
+ * nothing names it. An error asking counts as yes.
+ */
+static bool cetrafs_rebuild_peer_present(struct inode *inode)
+{
+    struct super_block *sb = inode->i_sb;
+    bool blocked = false, reader = false;
+    u32 my_node_id;
+
+    if (cetrafs_sb_get_node_id(sb, &my_node_id) ||
+        cetrafs_lock_foreign_user_exists(sb, inode->i_ino, my_node_id, &blocked, &reader))
+        return true;
+    return blocked || reader;
+}
+
+/* The pre-publish half: -ETXTBSY if a peer has arrived since the start. */
+static int cetrafs_rebuild_recheck(struct inode *inode, const char *what)
+{
+    if (cetrafs_rebuild_stall_pre_ms)
+        msleep(cetrafs_rebuild_stall_pre_ms); /* TEST ONLY */
+    if (cetrafs_rebuild_peer_present(inode)) {
+        pr_warn_ratelimited("%s: ino=%llu was opened on another node meanwhile -- refusing\n", what,
+                            (unsigned long long) inode->i_ino);
+        return -ETXTBSY;
+    }
+    if (cetrafs_rebuild_stall_post_ms)
+        msleep(cetrafs_rebuild_stall_post_ms); /* TEST ONLY */
+    return 0;
+}
+
 static bool cetrafs_fail_extent_record_write;
 module_param_named(fail_extent_record_write, cetrafs_fail_extent_record_write, bool, 0644);
 MODULE_PARM_DESC(fail_extent_record_write, "TEST ONLY: fail the record write in truncate/punch-hole");
@@ -4358,7 +4408,8 @@ static int __cetrafs_truncate_shrink(struct inode *inode, loff_t new_size)
     /* The injection stands IN PLACE OF the write: a record that never
      * reached the device. On failure, free the NEW tree we just built
      * (the old one is still the durable truth) and bail. */
-    {
+    ret = cetrafs_rebuild_recheck(inode, "truncate");
+    if (!ret) {
         u64 fd_seq;
 
         cetrafs_inode_fd_pub_lock(inode);
@@ -4412,8 +4463,16 @@ static int __cetrafs_truncate_shrink(struct inode *inode, loff_t new_size)
      * new tree still names. A crash after publish but before freeing is a
      * leaked block fsck names -- the trade made everywhere here.
      */
-    cetrafs_tree_free_meta(inode, &old_raw);
-    cetrafs_leaf_array_trim(sb, old_flat, old_n, new_block_count, &discard, /*do_free=*/true);
+    if (cetrafs_rebuild_peer_present(inode)) {
+        /* A peer arrived after the last check: it may hold the old tree.
+         * Free nothing it might still name (cetrafs_rebuild_recheck()). */
+        pr_warn("truncate: ino=%llu was opened on another node during the publish -- leaving the dropped blocks "
+                "allocated for the scrub\n",
+                (unsigned long long) inode->i_ino);
+    } else {
+        cetrafs_tree_free_meta(inode, &old_raw);
+        cetrafs_leaf_array_trim(sb, old_flat, old_n, new_block_count, &discard, /*do_free=*/true);
+    }
 
     kvfree(new_flat);
     kvfree(old_flat);
@@ -5006,7 +5065,8 @@ static long cetrafs_fallocate(struct file *file, int mode, loff_t offset, loff_t
     raw.blocks =
         cetrafs_cpu_to_le64((cetrafs_flat_data_blocks(new_flat, new_n) + meta_blocks) * (CETRAFS_BLOCK_SIZE / 512));
 
-    {
+    ret = cetrafs_rebuild_recheck(inode, "punch");
+    if (!ret) {
         u64 fd_seq;
 
         cetrafs_inode_fd_pub_lock(inode);
@@ -5041,10 +5101,17 @@ static long cetrafs_fallocate(struct file *file, int mode, loff_t offset, loff_t
     /* Free the OLD tree's meta, then the punched DATA blocks (a do_free
      * pass over the old flat array) -- same two-pass, publish-before-free
      * shape as cetrafs_truncate_shrink(). */
-    cetrafs_tree_free_meta(inode, &old_raw);
-    {
+    if (cetrafs_rebuild_peer_present(inode)) {
+        /* As in truncate: a peer arrived after the last check. */
+        pr_warn("punch: ino=%llu was opened on another node during the publish -- leaving the punched blocks "
+                "allocated for the scrub\n",
+                (unsigned long long) inode->i_ino);
+    } else {
         u32 discard_entries = old_n;
-        int fret = cetrafs_leaf_array_punch(sb, old_flat, &discard_entries, old_n + 2, start_block, end_block, &discard,
+        int fret;
+
+        cetrafs_tree_free_meta(inode, &old_raw);
+        fret = cetrafs_leaf_array_punch(sb, old_flat, &discard_entries, old_n + 2, start_block, end_block, &discard,
                                             /*do_free=*/true);
         if (fret)
             pr_err("punch: freeing the old blocks failed (%d) -- %u block(s) may have leaked\n", fret, freed);
