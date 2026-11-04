@@ -28,6 +28,9 @@ set -euo pipefail
 require_root
 require_module
 NPOKE="$(ct_helper node_poke)"
+# A dead repair claim is watched for the whole stale window (120 s by
+# default) before a mount goes past it; step 3 pays that once.
+ct_param_set stale_secs 20
 
 IMG="$(ct_image 560 repairclaim)"
 DEV="$(ct_loop "$IMG")"

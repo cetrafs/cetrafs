@@ -856,9 +856,11 @@ typedef struct {
 
 /* An offline repairer's registry claim (CETRAFS_NODE_STATE_REPAIR) is
  * renewed -- hb_seq bumped -- on a timer this often, whatever phase the
- * repair is in, and an observer judges it live by watching hb_seq move
- * over CETRAFS_REPAIR_PROBE_SECS: three renewals, never a comparison of
- * last_seen with the observer's own clock. */
+ * repair is in, and an observer judges it live by watching hb_seq move,
+ * never by comparing last_seen with its own clock. The kernel watches
+ * for up to the node stale window (the renewal queues behind dead paths
+ * exactly as a heartbeat does), and never less than
+ * CETRAFS_REPAIR_PROBE_SECS. */
 #define CETRAFS_REPAIR_RENEW_SECS 5
 #define CETRAFS_REPAIR_PROBE_SECS (3 * CETRAFS_REPAIR_RENEW_SECS)
 

@@ -1195,7 +1195,7 @@ int cetrafs_node_repair_claim_exists(struct super_block *sb, bool *out_exists, c
     const cetrafs_superblock_t *raw_sb = cetrafs_sb_raw(sb);
     cetrafs_node_entry_t ne;
     u64 *seq_before;
-    u32 count, idx, claims = 0;
+    u32 count, idx, claims = 0, window, waited;
     int ret = 0;
 
     *out_exists = false;
@@ -1232,29 +1232,50 @@ int cetrafs_node_repair_claim_exists(struct super_block *sb, bool *out_exists, c
     if (!claims)
         goto out;
 
-    pr_info("a repair claim is registered on this volume -- watching it %us to see whether its repairer is alive\n",
-            (unsigned int) CETRAFS_REPAIR_PROBE_SECS);
-    if (msleep_interruptible(CETRAFS_REPAIR_PROBE_SECS * 1000)) {
-        ret = -EINTR;
-        goto out;
-    }
-    for (idx = 0; idx < count; idx++) {
-        if (!seq_before[idx])
-            continue;
-        int r = cetrafs_node_get_entry(sb, idx, &ne);
-
-        if (r == -EIO) {
-            ret = r;
+    /*
+     * How long: the NODE stale window, not three renewals. The renewal
+     * is a pwrite + fdatasync from a timer in the tool, queued behind
+     * the same multipath no_path_retry as a node's heartbeat (see
+     * CETRAFS_NODE_STALE_SECS) -- so a repairer whose host lost its
+     * paths for 15..90 s used to be judged dead by a mounting node on a
+     * healthy host, which then mounted while the repair's blind writes
+     * were still queued to land. A claim that moves is live and ends the
+     * watch at once; only a dead claim costs the whole window, and only
+     * while it is on the device.
+     */
+    window = max_t(u32, cetrafs_sb_stale_secs(sb), CETRAFS_REPAIR_PROBE_SECS);
+    pr_info("a repair claim is registered on this volume -- watching it up to %us to see whether its repairer is "
+            "alive\n",
+            window);
+    for (waited = 0; waited < window && !*out_exists; waited++) {
+        if (msleep_interruptible(1000)) {
+            ret = -EINTR;
             goto out;
         }
-        if (r || cetrafs_le32(ne.state) != CETRAFS_NODE_STATE_REPAIR || cetrafs_le64(ne.hb_seq) + 1 == seq_before[idx])
-            continue; /* released, or not renewed: its repairer is gone */
-        if (out_label && label_sz) {
-            strscpy(out_label, ne.label, min(label_sz, sizeof(ne.label)));
-            out_label[label_sz - 1] = 0;
+        for (idx = 0; idx < count; idx++) {
+            if (!seq_before[idx])
+                continue;
+            int r = cetrafs_node_get_entry(sb, idx, &ne);
+
+            if (r == -EIO) {
+                ret = r;
+                goto out;
+            }
+            if (r)
+                continue;
+            if (cetrafs_le32(ne.state) != CETRAFS_NODE_STATE_REPAIR) {
+                seq_before[idx] = 0; /* released */
+                continue;
+            }
+            if (cetrafs_le64(ne.hb_seq) + 1 == seq_before[idx])
+                continue; /* not renewed yet */
+            if (out_label && label_sz) {
+                strscpy(out_label, ne.label, min(label_sz, sizeof(ne.label)));
+                out_label[label_sz - 1] = 0;
+            }
+            *out_exists = true;
+            break;
         }
-        *out_exists = true;
-        break;
     }
 out:
     kfree(seq_before);
