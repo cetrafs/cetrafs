@@ -43,6 +43,11 @@ ct_umount "$MNT"
 set_stale_window "$TEST_STALE_SECS"
 poke_dead_peer "$DEV" 1 aa
 "$ZG_POKE" "$DEV" 0 1 >/dev/null
+# Those pokes went through the device's page cache and are still dirty
+# there: written back later, they put hb_seq back over the re-assert
+# poked into the backing file below, and the steal then rightly lands.
+# Failed 3 runs in 5 that way before this flush.
+blockdev --flushbufs "$DEV"
 ct_param_set zg_steal_stall_ms 6000
 
 MARK="$(dmesg_mark)"

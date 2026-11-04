@@ -190,6 +190,17 @@ and failed across consecutive runs ... this suite has always had the
 same exposure and passed on cache luck".  Keep the file poke wherever
 the invisibility is the point.
 
+The mismatch runs the other way too.  A WRITE through the device sits
+dirty in its page cache, and writeback can land it on the backing file
+at any later moment -- over a file poke made after it.
+`kernel/zg_steal_vs_reattach.sh` set a Zone Group's owner through the
+device, then played the owner's re-assert into the file; the stale
+dirty page was written back over the re-assert, and the suite failed 3
+runs in 5 with nothing wrong in the kernel.  Flush the device
+(`blockdev --flushbufs`) between a device write and any later file
+poke.  `lint_poke_target` cannot see this one: it cannot tell a helper
+that writes the device from one that only dumps it.
+
 **Capture, then match -- never `producer | grep -q` as a condition.**
 Under `set -o pipefail` a pipeline carries the *producer's* exit status,
 and several producers here exit non-zero BY DESIGN: `fsck` on a bad
