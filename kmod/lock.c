@@ -1530,6 +1530,35 @@ static int cetrafs_foreign_reader_from_raw(struct super_block *sb,
                                            u64 ignore,
                                            bool *out_exists);
 
+
+/*
+ * The heavy half of a reconcile, for a tree marked cold: re-read the
+ * record and drop the cached tree and clean data pages it described.
+ * Only where no buffer is locked and no folio held -- an open, or the
+ * defrag pin. 'scratch' is caller storage, overwritten (a second
+ * cetrafs_inode_t in the open path's frame broke the build on a kernel
+ * with CONFIG_FRAME_WARN=1024).
+ */
+static void cetrafs_lock_reconcile_cold(struct inode *inode, cetrafs_inode_t *scratch)
+{
+    struct super_block *sb = inode->i_sb;
+    struct cetrafs_inode_info *ci = CETRAFS_I(inode);
+    int g = cetrafs_tree_cold_begin(ci);
+
+    /* Re-read: the tree we must stop believing in has to be walked from
+     * the record as it stands NOW. */
+    cetrafs_invalidate_raw_inode(sb, inode->i_ino);
+    if (cetrafs_read_raw_inode(sb, inode->i_ino, scratch) == 0) {
+        cetrafs_tree_invalidate_cached(inode, scratch);
+        if (inode->i_mapping)
+            invalidate_mapping_pages(inode->i_mapping, 0, -1);
+        /* Only a reconcile that dropped the tree settles it; an
+         * unreadable record leaves the inode cold, reading fresh. */
+        cetrafs_tree_cold_settle(ci, g);
+        atomic64_inc(&cetrafs_file_cache_reconciles);
+    }
+}
+
 /* TEST ONLY, one-shot: pause the next open between its fresh read of the
  * record and the swaps that publish it -- where a peer's unlink can land
  * (tests/kernel/open_vs_evict.sh). Cleared by the pause it causes. */
@@ -1906,29 +1935,8 @@ int cetrafs_lock_open(struct inode *inode, struct file *file)
      * A peer rewrote this file's layout, so its cached DATA pages may be
      * the wrong blocks' contents. Clean pages only -- dirty ones are our
      * own unwritten data and are never dropped. */
-    if (cetrafs_tree_is_cold(ci)) {
-        int g = cetrafs_tree_cold_begin(ci);
-
-        /* Re-read: the tree we must stop believing in has to be walked
-         * from the record as it stands NOW, not from whatever this open
-         * validated itself against a moment ago.
-         *
-         * Into 'raw', deliberately -- nothing reads it past this point,
-         * and a second cetrafs_inode_t here is 652 more bytes of stack.
-         * That took this frame to 1384 and broke the build on a kernel
-         * configured with CONFIG_FRAME_WARN=1024 (Proxmox's), while the
-         * arm64 dev kernel's 2048 said nothing. */
-        cetrafs_invalidate_raw_inode(sb, inode->i_ino);
-        if (cetrafs_read_raw_inode(sb, inode->i_ino, &raw) == 0) {
-            cetrafs_tree_invalidate_cached(inode, &raw);
-            if (inode->i_mapping)
-                invalidate_mapping_pages(inode->i_mapping, 0, -1);
-            /* Only a reconcile that dropped the tree settles it; an
-             * unreadable record leaves the inode cold, reading fresh. */
-            cetrafs_tree_cold_settle(ci, g);
-            atomic64_inc(&cetrafs_file_cache_reconciles);
-        }
-    }
+    if (cetrafs_tree_is_cold(ci))
+        cetrafs_lock_reconcile_cold(inode, &raw); /* 'raw' is not read past here */
 
     ret = 0;
 
@@ -3686,6 +3694,29 @@ int cetrafs_lock_defrag_begin(struct inode *inode)
         cetrafs_lock_clear_on_disk(inode, /*stamp_stat=*/false);
         goto out;
     }
+
+    /*
+     * What an open does at this boundary, and the pin is one: the file
+     * was idle, so a peer may have written and closed it since this node
+     * last looked. The move plans from this node's view and its final
+     * publish takes size and times from the in-core inode, so a stale
+     * one put the peer's file back to this node's last size -- and a
+     * leaf cached before the peer's in-place append dropped its extents
+     * (tests/kernel/defrag_fresh_leaf.sh). Same rule as the open: a
+     * record last stamped by a peer is applied, and a tree that is
+     * then cold is dropped here, where no buffer or folio is held.
+     */
+    if (CETRAFS_FILE_SEQ_NODE(cetrafs_le64(raw.file_seq)) != (u32) (my_node_id & 0xFFFFu)) {
+        int aret = cetrafs_apply_raw_to_vfs_inode(inode, &raw);
+
+        if (aret == -ESTALE) {
+            cetrafs_lock_clear_on_disk(inode, /*stamp_stat=*/false);
+            ret = -ESTALE;
+            goto out;
+        }
+    }
+    if (cetrafs_tree_is_cold(ci))
+        cetrafs_lock_reconcile_cold(inode, &raw);
 
     ci->defrag_pinned = true;
     ret = 0;

@@ -113,6 +113,15 @@ static unsigned int cetrafs_defrag_step_delay_ms;
 module_param_named(defrag_step_delay_ms, cetrafs_defrag_step_delay_ms, uint, 0644);
 MODULE_PARM_DESC(defrag_step_delay_ms, "TEST ONLY: pause between defrag steps, with inode_lock dropped");
 
+/* TEST ONLY: pause the background pass between being queued and pinning
+ * the file. The trigger is a close, and a close's open has just
+ * refreshed this node's view of the file; what a peer writes AFTER it
+ * is what the pass has to see, and in production that window is the
+ * workqueue's latency. tests/kernel/defrag_fresh_leaf.sh. */
+static unsigned int cetrafs_auto_defrag_begin_delay_ms;
+module_param_named(auto_defrag_begin_delay_ms, cetrafs_auto_defrag_begin_delay_ms, uint, 0644);
+MODULE_PARM_DESC(auto_defrag_begin_delay_ms, "TEST ONLY: pause a queued background defrag before it pins the file");
+
 /* TEST ONLY: pause after the last step, locks dropped, before the pass
  * finishes its bookkeeping. */
 static unsigned int cetrafs_defrag_final_stall_ms;
@@ -203,6 +212,21 @@ struct cetrafs_ext_list {
  * churned for many minutes; it still works). */
 #define CETRAFS_DEFRAG_MAX_EXTENTS 65536u
 
+/*
+ * The record the move is planned from. Fresh unless this node is the
+ * file's local writer: the defrag pin taken on an idle file runs none of
+ * the open path's change-stamp check, so a record this node cached
+ * before a peer wrote and closed the file would otherwise be the plan --
+ * and the commit publishes a whole new tree built from it. Overlaid, so
+ * this node's own unpublished shadow still wins.
+ */
+static int cetrafs_defrag_read_raw(struct super_block *sb, struct inode *inode, cetrafs_inode_t *raw)
+{
+    if (!cetrafs_lock_held_for_write_locally(inode))
+        cetrafs_invalidate_raw_inode(sb, inode->i_ino);
+    return cetrafs_read_raw_inode_overlaid(sb, inode, raw); /* torn-read-safe vs a concurrent publish */
+}
+
 static int cetrafs_defrag_read_extents(struct inode *inode, const cetrafs_inode_t *raw, struct cetrafs_ext_list *el)
 {
     struct super_block *sb = inode->i_sb;
@@ -223,9 +247,18 @@ static int cetrafs_defrag_read_extents(struct inode *inode, const cetrafs_inode_
         const cetrafs_extent_hdr_t *hdr;
 
         el->leaf_lba = cetrafs_extent_phys_from_hilo(raw->et.idx[0].ei_leaf_hi, raw->et.idx[0].ei_leaf_lo);
-        /* defrag pins the file's exclusive write lock for the whole
-         * move, so no peer can be rewriting this leaf: cached is correct. */
-        bh = cetrafs_bread_retry(sb, el->leaf_lba);
+        /* Through the tree reader, which reads fresh unless this node
+         * is the file's local writer, and checks the address. It was a
+         * plain cached read under "defrag pins the file's exclusive write
+         * lock, so no peer can be rewriting this leaf: cached is
+         * correct" -- true of the move, false of the cache: the pin
+         * stops a peer from writing NEXT, not from having written since
+         * this node cached the leaf. A peer that appended to it in place
+         * and closed left this node a leaf naming fewer extents; defrag
+         * rebuilt the file from it and published, and the peer's extents
+         * were gone (tests/kernel/defrag_fresh_leaf.sh). Depth 2 already
+         * went through cetrafs_tree_flatten(), which reads this way. */
+        bh = cetrafs_read_leaf_bh(inode, el->leaf_lba);
         if (!bh)
             return -EIO;
         hdr = (const cetrafs_extent_hdr_t *) bh->b_data;
@@ -257,6 +290,17 @@ static int cetrafs_defrag_read_extents(struct inode *inode, const cetrafs_inode_
     el->dense = true;
     el->has_uninit = false;
     for (i = 0; i < el->count; i++) {
+        /* Defrag copies these blocks and FREES them: an address read off
+         * the device is checked before either (rule 19, as the free path
+         * and the data path do). */
+        if (!cetrafs_lba_run_is_data(sb,
+                                     cetrafs_extent_phys_from_hilo(el->arr[i].ee_start_hi, el->arr[i].ee_start_lo),
+                                     cetrafs_extent_len(el->arr[i].ee_len))) {
+            pr_err_ratelimited("defrag: ino=%llu extent %u is not a data address -- refusing it (fsck)\n",
+                               (unsigned long long) inode->i_ino, i);
+            cetrafs_sb_corrupt_inode(inode);
+            return -EUCLEAN;
+        }
         if (cetrafs_le32(el->arr[i].ee_block) != expect)
             el->dense = false;
         /* cetrafs_extent_len() MASKS the uninit bit off, so a
@@ -463,7 +507,7 @@ int cetrafs_defrag_inode(struct inode *inode, struct cetrafs_defrag_stats *out_s
     }
 
     cetrafs_defrag_inode_lock(inode);
-    ret = cetrafs_read_raw_inode_overlaid(sb, inode, &raw); /* torn-read-safe vs a concurrent publish */
+    ret = cetrafs_defrag_read_raw(sb, inode, &raw);
     if (ret)
         goto out_unlock;
     if (!S_ISREG(inode->i_mode)) {
@@ -544,7 +588,7 @@ int cetrafs_defrag_inode(struct inode *inode, struct cetrafs_defrag_stats *out_s
          * truncate, a hole punch, a spill that changed the layout, inode
          * reuse -- aborts cleanly; the committed prefix is already the
          * file's real data and the suffix still points at valid blocks. */
-        ret = cetrafs_read_raw_inode_overlaid(sb, inode, &raw); /* torn-read-safe vs a concurrent publish */
+        ret = cetrafs_defrag_read_raw(sb, inode, &raw);
         if (ret || cetrafs_le64(raw.generation) != cetrafs_inode_get_generation(inode)) {
             ret = ret ? ret : -ESTALE;
             cetrafs_defrag_inode_unlock(inode);
@@ -871,6 +915,8 @@ static void cetrafs_defrag_worker(struct work_struct *work)
      * work can legitimately re-arm. */
     cetrafs_lock_defrag_unqueue(inode);
 
+    if (cetrafs_auto_defrag_begin_delay_ms)
+        msleep(cetrafs_auto_defrag_begin_delay_ms); /* TEST ONLY */
     if (S_ISREG(inode->i_mode) && inode->i_nlink > 0) {
         ret = cetrafs_lock_defrag_begin(inode);
         if (ret == 0) {
