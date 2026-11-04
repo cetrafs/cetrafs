@@ -1028,6 +1028,7 @@ void cetrafs_journal_shutdown(struct super_block *sb);
 int cetrafs_journal_replay_node(struct super_block *sb, u32 node_id, bool wait_for_claim);
 int cetrafs_journal_node_is_dirty(struct super_block *sb, u32 node_id, bool *out_dirty);
 void cetrafs_journal_retry_release(struct super_block *sb);
+bool cetrafs_journal_release_pending(struct super_block *sb);
 
 // procfs.c
 struct cetrafs_proc_mount; /* opaque; owned entirely by procfs.c */

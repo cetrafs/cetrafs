@@ -2370,6 +2370,7 @@ void cetrafs_free_sb_info(struct super_block *sb)
 {
     struct cetrafs_sb_info *sbi = sb->s_fs_info;
     int flush_err = 0, r;
+    u32 unreleased;
 
     if (!sbi)
         return;
@@ -2456,7 +2457,22 @@ void cetrafs_free_sb_info(struct super_block *sb)
      * (generic_shutdown_super()) has no way to fail unmount over this,
      * and leaving the row to time out via the ordinary stale path is
      * still safe, just slower. */
-    if (sbi->node_registered && !READ_ONCE(sbi->fenced) && flush_err) {
+    /* Claims still queued for the heartbeat's retry -- a namespace or
+     * file lock, a presence bit, an inode-number claim, a peer's replay
+     * claim -- are on the device under our id, and the heartbeat that
+     * would have released them has stopped. A departure announced over
+     * them tells the next mount of this node that there is nothing of
+     * its previous life to sweep (a row with last_seen 0 is a clean
+     * one), and the claims read live again the moment it beats. Left
+     * unannounced, the row goes stale: peers reclaim them as a dead
+     * node's, and the next mount sweeps whatever is left. */
+    unreleased = READ_ONCE(sbi->nsrel_count) + READ_ONCE(sbi->flrel_count) + READ_ONCE(sbi->prrel_count) +
+                 READ_ONCE(sbi->rcrel_count) + (cetrafs_journal_release_pending(sb) ? 1 : 0);
+    if (sbi->node_registered && !READ_ONCE(sbi->fenced) && !flush_err && unreleased) {
+        pr_err("unmount: %u claim release(s) still queued -- not announcing a clean departure; row %u will go "
+               "stale and the next mount sweeps them\n",
+               unreleased, sbi->node_id);
+    } else if (sbi->node_registered && !READ_ONCE(sbi->fenced) && flush_err) {
         /* Something of ours did not reach the device, so this is not a
          * clean departure and must not be announced as one: a peer
          * would take our Zone Groups at once, reconciling from bitmaps

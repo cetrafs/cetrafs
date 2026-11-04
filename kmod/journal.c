@@ -398,6 +398,14 @@ static void cetrafs_journal_release_replay(struct super_block *sb, u32 node_id, 
     }
 }
 
+/* Replay claims on peers' areas this node still holds for a retry. */
+bool cetrafs_journal_release_pending(struct super_block *sb)
+{
+    struct cetrafs_journal *j = cetrafs_sb_get_journal(sb);
+
+    return j && !bitmap_empty(j->rel_pending, 64);
+}
+
 /* The heartbeat's half of cetrafs_journal_release_replay(). The release
  * mutator hands back only a claim that is still ours, so a retry after
  * someone else took the area over is a no-op. */
