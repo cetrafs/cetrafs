@@ -17,6 +17,7 @@
 struct cetrafs_xattr_ns_update {
     __le64 xattr_block;
     bool set_flag;
+    u64 ctime;
 };
 
 static void cetrafs_ns_apply_xattr(cetrafs_inode_t *rec, void *arg)
@@ -28,6 +29,17 @@ static void cetrafs_ns_apply_xattr(cetrafs_inode_t *rec, void *arg)
         rec->flags = cetrafs_cpu_to_le32(cetrafs_le32(rec->flags) | CETRAFS_INODE_XATTR);
     else
         rec->flags = cetrafs_cpu_to_le32(cetrafs_le32(rec->flags) & ~CETRAFS_INODE_XATTR);
+    if (u->ctime)
+        rec->ctime = cetrafs_cpu_to_le64(u->ctime);
+}
+
+/* An xattr change is a change of the inode: POSIX moves ctime, and
+ * backup and sync tools (rsync -X, tar --xattrs, incremental dumps)
+ * find changed files by it. A change that rewrote the xattr block in
+ * place touched no record at all, so it moved nothing. */
+static void cetrafs_ns_apply_ctime(cetrafs_inode_t *rec, void *arg)
+{
+    rec->ctime = cetrafs_cpu_to_le64(*(u64 *) arg);
 }
 
 /*
@@ -229,7 +241,9 @@ static unsigned int cetrafs_xattr_pause_after_publish_ms;
 module_param_named(xattr_pause_after_publish_ms, cetrafs_xattr_pause_after_publish_ms, uint, 0644);
 MODULE_PARM_DESC(xattr_pause_after_publish_ms, "TEST ONLY: one-shot pause after a new xattr block is published");
 
-static int cetrafs_xattr_set_locked(struct inode *inode, const char *name, const void *value, size_t size, int flags)
+/* 'now': the ctime to stamp, in seconds; 0 stamps none. */
+static int cetrafs_xattr_set_locked(struct inode *inode, const char *name, const void *value, size_t size, int flags,
+                                    u64 now)
 {
     struct super_block *sb = inode->i_sb;
     cetrafs_inode_t raw;
@@ -336,7 +350,8 @@ static int cetrafs_xattr_set_locked(struct inode *inode, const char *name, const
         }
 
         {
-            struct cetrafs_xattr_ns_update u = {.xattr_block = cetrafs_cpu_to_le64(lba), .set_flag = true};
+            struct cetrafs_xattr_ns_update u = {
+                .xattr_block = cetrafs_cpu_to_le64(lba), .set_flag = true, .ctime = now};
 
             ret = cetrafs_inode_ns_cas(sb, inode->i_ino, cetrafs_le64(raw.generation), &raw,
                                        cetrafs_ns_apply_xattr, &u);
@@ -424,7 +439,7 @@ static int cetrafs_xattr_set_locked(struct inode *inode, const char *name, const
         cetrafs_bh_abort_update(bh);
         brelse(bh);
         {
-            struct cetrafs_xattr_ns_update u = {.xattr_block = 0, .set_flag = false};
+            struct cetrafs_xattr_ns_update u = {.xattr_block = 0, .set_flag = false, .ctime = now};
 
             ret = cetrafs_inode_ns_cas(sb, inode->i_ino, cetrafs_le64(raw.generation), &raw,
                                        cetrafs_ns_apply_xattr, &u);
@@ -438,7 +453,9 @@ static int cetrafs_xattr_set_locked(struct inode *inode, const char *name, const
     cetrafs_blk_tail_stamp(bh, CETRAFS_XATTR_TAIL_MAGIC);
     ret = cetrafs_journal_write_block(sb, bh, prev_crc);
     brelse(bh);
-    return ret;
+    if (ret || !now)
+        return ret;
+    return cetrafs_inode_ns_cas(sb, inode->i_ino, cetrafs_le64(raw.generation), &raw, cetrafs_ns_apply_ctime, &now);
 }
 
 /*
@@ -551,7 +568,13 @@ static int cetrafs_xattr_set(struct inode *inode, const char *name, const void *
     if (ret)
         return ret;
 
-    ret = cetrafs_xattr_set_locked(inode, name, value, size, flags);
+    {
+        u64 now = (u64) ktime_get_real_seconds();
+
+        ret = cetrafs_xattr_set_locked(inode, name, value, size, flags, now);
+        if (!ret)
+            inode_set_ctime(inode, (time64_t) now, 0);
+    }
     cetrafs_nslock_release_set(set, ARRAY_SIZE(set));
     return ret;
 }
@@ -656,7 +679,9 @@ static int cetrafs_initxattrs(struct inode *inode, const struct xattr *xattr_arr
 
         if (snprintf(name, sizeof(name), "%s%s", XATTR_SECURITY_PREFIX, xattr->name) >= (int) sizeof(name))
             return -ERANGE;
-        ret = cetrafs_xattr_set_locked(inode, name, xattr->value, xattr->value_len, 0);
+        /* now = 0: a new inode's ctime is already its creation time,
+         * and stamping it again would cost a swap per label. */
+        ret = cetrafs_xattr_set_locked(inode, name, xattr->value, xattr->value_len, 0, 0);
         if (ret)
             break;
     }
