@@ -1661,7 +1661,7 @@ int cetrafs_lock_open(struct inode *inode, struct file *file)
         } else {
             ret = cetrafs_node_fence_peer(sb, cetrafs_le32(raw.lock_owner_node), "a file lock");
             if (!ret)
-                ret = cetrafs_journal_replay_node(sb, cetrafs_le32(raw.lock_owner_node), /*wait_for_claim=*/false);
+                ret = cetrafs_journal_replay_node(sb, cetrafs_le32(raw.lock_owner_node), /*wait_for_claim=*/true);
             if (ret) {
                 pr_err("lock: ino=%llu could not fence and replay stale node %u (%d), refusing open\n",
                        (unsigned long long) inode->i_ino, raw.lock_owner_node, ret);
@@ -3417,7 +3417,7 @@ static int cetrafs_lock_explicit_acquire(struct inode *inode, struct file *file)
             }
             ret = cetrafs_node_fence_peer(sb, owner, "a file lock (flock)");
             if (!ret)
-                ret = cetrafs_journal_replay_node(sb, owner, /*wait_for_claim=*/false);
+                ret = cetrafs_journal_replay_node(sb, owner, /*wait_for_claim=*/true);
             if (ret) {
                 pr_err("flock: ino=%llu could not fence and replay stale node %u (%d) -- not taking its lock\n",
                        (unsigned long long) inode->i_ino, owner, ret);
@@ -3937,7 +3937,7 @@ static int cetrafs_foreign_claim_from_raw(struct super_block *sb,
             ret = cetrafs_node_fence_peer(sb, cetrafs_le32(raw.lock_owner_node), "a file lock");
             if (ret)
                 return ret;
-            ret = cetrafs_journal_replay_node(sb, cetrafs_le32(raw.lock_owner_node), /*wait_for_claim=*/false);
+            ret = cetrafs_journal_replay_node(sb, cetrafs_le32(raw.lock_owner_node), /*wait_for_claim=*/true);
             if (ret)
                 return ret;
             if (out_repaired)

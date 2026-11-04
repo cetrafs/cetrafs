@@ -1118,8 +1118,11 @@ static enum cetrafs_journal_verdict cetrafs_journal_judge(const struct cetrafs_j
  * target_lba), consume them, and park the flag at CLEAN.
  *
  * Replay serializes on the per-area replay claim (CAS), not a mutex:
- * a node that loses the claim gets -EEXIST, and with wait_for_claim
- * (our own area at mount-attach) it waits for the holder instead. That
+ * a node that loses the claim gets -EEXIST. With wait_for_claim it waits
+ * for the holder to finish instead, and every caller that goes on to
+ * TAKE something from the dead node must pass it: its own area at
+ * mount-attach, and every lock, namespace-lock and Zone Group reclaim.
+ * Only the heartbeat sweep, which takes nothing, may walk away. That
  * plus the flag check serializes concurrent replayers, and replaying
  * twice is idempotent regardless. Reads of the flag and slot
  * headers are uncached: this area belongs to a different node whose
@@ -1156,36 +1159,45 @@ int cetrafs_journal_replay_node(struct super_block *sb, u32 node_id, bool wait_f
         return -EIO;
 
     /* Claim the right to replay this area. -EEXIST means another node is
-     * already on it (or beat us to it entirely) -- not an error: whoever
-     * holds the claim finishes the job, exactly as the contended mutex
-     * used to mean. */
+     * already on it (or beat us to it entirely). */
     ret = cetrafs_journal_claim_replay(sb, area_start, my_node_id);
     if (ret == -EEXIST && wait_for_claim) {
-        /* OUR OWN area, at mount-attach, with a live peer mid-replaying
-         * our previous session's leftovers (it declared us dead and is
-         * reclaiming). "Whoever holds the claim finishes the job" is the
-         * right answer for a THIRD node's area, but walking away from our
-         * own would let this mount start writing while the replayer is
-         * still working it: new entries into slots whose headers its
-         * consume pass is about to zero (destroying their write-ahead
-         * protection), and new data over blocks it is about to blindly
-         * rewrite with our old images. Wait it out instead -- the claim
-         * clears in seconds (the area is a fixed handful of slots), or
-         * the replayer itself goes stale and the re-claim below steals
-         * it. Bounded so a wedged claim fails the mount loudly rather
-         * than hanging it forever. */
+        /*
+         * A live peer is mid-replay, and this caller is about to build
+         * on the result -- so it waits for the result.
+         *
+         * Our OWN area at mount-attach: walking away would let this
+         * mount start writing while the replayer is still working it --
+         * new entries into slots whose headers its consume pass is about
+         * to zero, new data over blocks it is about to rewrite with our
+         * old images.
+         *
+         * A dead node's area, from a caller about to take its lock, its
+         * namespace lock or its Zone Group: walking away used to return
+         * success here, and the caller then stole the claim and wrote
+         * the very blocks the replayer was judging. Its verdict on an
+         * entry is then wrong either way: it refuses the entry as
+         * changed (a half-done rename stays half done) or, having judged
+         * it already, writes the old image over the caller's.
+         *
+         * The claim clears in seconds (the area is a handful of slots),
+         * or the replayer itself goes stale and the re-claim below
+         * steals it. Bounded so a wedged claim fails loudly rather than
+         * hangs, and killable.
+         */
         unsigned int waited_ms = 0;
         const unsigned int cap_ms = (cetrafs_sb_stale_secs(sb) * 3 + 30) * 1000;
 
-        pr_info("journal: a peer is replaying this node's own area %llu -- waiting for it to finish\n",
+        pr_info("journal: a peer is replaying node %u's area %llu -- waiting for it to finish\n", node_id,
                 (unsigned long long) area_start);
         while (ret == -EEXIST) {
             if (waited_ms >= cap_ms) {
-                pr_err("journal: replay claim on our own area %llu still held after %ums -- refusing the mount\n",
+                pr_err("journal: replay claim on node %u's area %llu still held after %ums -- refusing\n", node_id,
                        (unsigned long long) area_start, waited_ms);
                 return -EBUSY;
             }
-            msleep(500);
+            if (msleep_interruptible(500) && fatal_signal_pending(current))
+                return -EINTR;
             waited_ms += 500;
             ret = cetrafs_journal_read_flag(sb, area_start, &dirty);
             if (ret)
@@ -1197,9 +1209,10 @@ int cetrafs_journal_replay_node(struct super_block *sb, u32 node_id, bool wait_f
     }
     if (ret) {
         if (ret == -EEXIST) {
-            /* Counted, not just tolerated: this is the loser of the
-             * race walking away, and it is the only evidence that the
-             * race happened at all. */
+            /* The heartbeat sweep, which takes nothing from the dead
+             * node, walking away from a replay a peer is doing. Counted,
+             * not just tolerated: it is the only evidence that the race
+             * happened at all. */
             atomic64_inc(&cetrafs_journal_replay_declines);
             return 0;
         }

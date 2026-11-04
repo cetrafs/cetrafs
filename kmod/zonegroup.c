@@ -801,7 +801,7 @@ static int cetrafs_zg_try_claim_one(struct super_block *sb, u32 zg_id, u32 my_no
 
         /* We hold no cluster mutex here any more -- replay claims the
          * area itself, which is what serializes concurrent replayers. */
-        ret = cetrafs_journal_replay_node(sb, owner, /*wait_for_claim=*/false);
+        ret = cetrafs_journal_replay_node(sb, owner, /*wait_for_claim=*/true);
         if (ret) {
             pr_err("ZG claim: replaying stale node %u's journal failed (%d), not claiming ZG %u\n", owner, ret, zg_id);
             goto out_unlock;
