@@ -153,7 +153,7 @@ static bool cetrafs_dirent_block_valid(const struct buffer_head *bh)
 
 static struct buffer_head *cetrafs_dirent_bread(struct super_block *sb, u64 lba)
 {
-    int attempt;
+    int attempt, nbad = 0;
 
     for (attempt = 0; attempt < CETRAFS_DIRENT_READ_RETRIES; attempt++) {
         struct buffer_head *bh = cetrafs_bread_uncached(sb, lba);
@@ -162,6 +162,7 @@ static struct buffer_head *cetrafs_dirent_bread(struct super_block *sb, u64 lba)
             if (cetrafs_dirent_block_valid(bh))
                 return bh;
             brelse(bh);
+            nbad++;
         }
 
         /* Back off between attempts rather than spinning. A mismatch
@@ -178,6 +179,14 @@ static struct buffer_head *cetrafs_dirent_bread(struct super_block *sb, u64 lba)
         usleep_range(100, 400);
     }
 
+    /* Corrupt only if every attempt read the block and failed: a read
+     * that failed is the device's error (cetrafs_blk_tail_bread()). */
+    if (nbad < CETRAFS_DIRENT_READ_RETRIES) {
+        pr_err_ratelimited("dirent block %llu could not be read (%d of %d attempts failed) -- I/O error\n",
+                           (unsigned long long) lba, CETRAFS_DIRENT_READ_RETRIES - nbad,
+                           CETRAFS_DIRENT_READ_RETRIES);
+        return NULL;
+    }
     pr_err("dirent block %llu failed its tail checksum %d times -- corrupted, not just a torn concurrent read\n",
            (unsigned long long) lba, CETRAFS_DIRENT_READ_RETRIES);
     cetrafs_sb_corrupt(sb, 0);

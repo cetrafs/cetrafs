@@ -694,7 +694,7 @@ bool cetrafs_blk_tail_valid(const struct buffer_head *bh, u32 magic)
  */
 struct buffer_head *cetrafs_blk_tail_bread(struct super_block *sb, u64 lba, u32 magic, const char *what)
 {
-    int attempt;
+    int attempt, nbad = 0;
 
     /* Every block read here -- extent leaf, interior index, xattr -- is
      * reached through an address read off the device, and the xattr and
@@ -716,10 +716,21 @@ struct buffer_head *cetrafs_blk_tail_bread(struct super_block *sb, u64 lba, u32 
             if (cetrafs_blk_tail_valid(bh, magic))
                 return bh;
             brelse(bh);
+            nbad++;
         }
         usleep_range(100, 400);
     }
 
+    /* Corrupt only if every attempt READ the block and every one failed
+     * its checks. A read that failed is the device's error, not the
+     * block's: counting it made a transient path error "run fsck" and,
+     * under corruption=stop, a stopped mount (ERRORS.md kind 1). */
+    if (nbad < CETRAFS_BLK_TAIL_READ_RETRIES) {
+        pr_err_ratelimited("%s block %llu could not be read (%d of %d attempts failed) -- I/O error\n", what,
+                           (unsigned long long) lba, CETRAFS_BLK_TAIL_READ_RETRIES - nbad,
+                           CETRAFS_BLK_TAIL_READ_RETRIES);
+        return NULL;
+    }
     pr_err("%s block %llu failed its tail checksum %d times -- corrupted, not just a torn concurrent read\n", what,
            (unsigned long long) lba, CETRAFS_BLK_TAIL_READ_RETRIES);
     cetrafs_sb_corrupt(sb, 0);
