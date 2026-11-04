@@ -3,6 +3,7 @@
 // Tested against Linux 7.1+ headers (fs_context-only mount API)
 #define pr_fmt(fmt) "cetrafs: " fmt
 
+#include <linux/sched/mm.h>
 #include <linux/bitmap.h>
 #include <linux/blkdev.h>
 #include <linux/buffer_head.h>
@@ -179,6 +180,10 @@ struct cetrafs_sb_info {
      * alloc/free go through cetrafs_cas_record(), which serialises
      * local threads itself -- see cas_mutex below. */
     struct mutex alloc_mutex;
+    /* Set by cetrafs_sb_alloc_lock(), for the holder only: the NOFS
+     * scope it opened and who holds it (cetrafs_sb_in_reclaim_lock()). */
+    unsigned int alloc_nofs;
+    struct task_struct *alloc_owner;
 
     /* Node-LOCAL serialization of cetrafs_cas_region()'s no-CAW
      * fallback. On a device with atomic COMPARE AND WRITE this is never
@@ -484,6 +489,7 @@ struct cetrafs_sb_info {
      * birth claim had already landed on its own claim (a peer's reclaim
      * cannot: its claim needs an unlocked record). */
     struct rw_semaphore birth_rwsem;
+    struct task_struct *birth_writer; /* the reclaim holding it for write */
 
     /* Per-ZG pending-free backoff.
      *
@@ -2558,18 +2564,41 @@ bool cetrafs_resv_covers(struct super_block *sb, u64 lba)
     return hit;
 }
 
+/*
+ * alloc_mutex and birth_rwsem are both taken on the way to freeing:
+ * evict of an unlinked inode frees its blocks under alloc_mutex and
+ * its number under birth_rwsem for write. Direct reclaim prunes this
+ * filesystem's unreferenced inodes, so an allocation that enters
+ * reclaim while holding either can wait on itself. Each holder runs in
+ * a NOFS scope, opened here so no caller has to remember it; the CAS
+ * allocator WARNs if it finds a holder outside one
+ * (cetrafs_sb_in_reclaim_lock()).
+ */
 void cetrafs_sb_alloc_lock(struct super_block *sb)
 {
     struct cetrafs_sb_info *sbi = sb->s_fs_info;
 
     mutex_lock(&sbi->alloc_mutex);
+    sbi->alloc_nofs = memalloc_nofs_save();
+    WRITE_ONCE(sbi->alloc_owner, current);
 }
 
 void cetrafs_sb_alloc_unlock(struct super_block *sb)
 {
     struct cetrafs_sb_info *sbi = sb->s_fs_info;
 
+    WRITE_ONCE(sbi->alloc_owner, NULL);
+    memalloc_nofs_restore(sbi->alloc_nofs);
     mutex_unlock(&sbi->alloc_mutex);
+}
+
+/* Does the current task hold alloc_mutex (through the wrappers) or
+ * birth_rwsem for write? The read side is not tracked. */
+bool cetrafs_sb_in_reclaim_lock(struct super_block *sb)
+{
+    struct cetrafs_sb_info *sbi = sb ? sb->s_fs_info : NULL;
+
+    return sbi && (READ_ONCE(sbi->alloc_owner) == current || READ_ONCE(sbi->birth_writer) == current);
 }
 
 /* TEST ONLY -- see cetrafs_sb_info.alloc_shadow. */
@@ -2601,20 +2630,31 @@ bool cetrafs_sb_birth_active(struct super_block *sb, u64 ino)
 }
 
 /* See cetrafs_sb_info.birth_rwsem. */
-void cetrafs_sb_birth_gate(struct super_block *sb, bool reclaim)
+/* Returns the NOFS scope it opened (see cetrafs_sb_alloc_lock()), for
+ * cetrafs_sb_birth_ungate(): either side, a reader included, can be
+ * waited on by an evict that reclaim started. */
+unsigned int cetrafs_sb_birth_gate(struct super_block *sb, bool reclaim)
 {
     struct cetrafs_sb_info *sbi = sb->s_fs_info;
+    unsigned int nofs;
 
     if (reclaim)
         down_write(&sbi->birth_rwsem);
     else
         down_read(&sbi->birth_rwsem);
+    nofs = memalloc_nofs_save();
+    if (reclaim)
+        WRITE_ONCE(sbi->birth_writer, current);
+    return nofs;
 }
 
-void cetrafs_sb_birth_ungate(struct super_block *sb, bool reclaim)
+void cetrafs_sb_birth_ungate(struct super_block *sb, bool reclaim, unsigned int nofs)
 {
     struct cetrafs_sb_info *sbi = sb->s_fs_info;
 
+    if (reclaim)
+        WRITE_ONCE(sbi->birth_writer, NULL);
+    memalloc_nofs_restore(nofs);
     if (reclaim)
         up_write(&sbi->birth_rwsem);
     else

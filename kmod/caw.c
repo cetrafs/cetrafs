@@ -39,6 +39,7 @@
  */
 #define pr_fmt(fmt) "cetrafs: " fmt
 
+#include <linux/sched/mm.h>
 #include <linux/blkdev.h>
 #include <linux/buffer_head.h>
 #include <linux/delay.h>
@@ -944,6 +945,12 @@ static int cetrafs_cas_region_seeded_impl(struct super_block *sb,
         return -EIO;
 
     cetrafs_cas_op_counted();
+
+    /* An allocation under alloc_mutex or birth_rwsem outside a NOFS
+     * scope can recurse through reclaim into an evict that waits on the
+     * same lock (cetrafs_sb_alloc_lock()). Loud, so every suite that
+     * gets here checks it. */
+    WARN_ON_ONCE(cetrafs_sb_in_reclaim_lock(sb) && !(current->flags & PF_MEMALLOC_NOFS));
 
     old = kmalloc(region, GFP_KERNEL);
     new = kmalloc(region, GFP_KERNEL);

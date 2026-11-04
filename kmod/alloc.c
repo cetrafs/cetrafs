@@ -672,16 +672,14 @@ int cetrafs_alloc_inode(struct super_block *sb, u64 *out_ino)
         unsigned int nofs;
 
         /* Take the bit and enter the birth registry as one step against
-         * this node's own reclaims (cetrafs_sb_info.birth_rwsem). NOFS:
-         * the CAS allocates, and reclaim recursing into an evict here
-         * would take the same rwsem for write. */
-        nofs = memalloc_nofs_save();
-        cetrafs_sb_birth_gate(sb, false);
+         * this node's own reclaims (cetrafs_sb_info.birth_rwsem). The
+         * gate is a NOFS scope: the CAS allocates, and reclaim recursing
+         * into an evict here would take the same rwsem for write. */
+        nofs = cetrafs_sb_birth_gate(sb, false);
         bit = cetrafs_inode_bitmap_cas_alloc(sb);
         if (bit >= 0)
             cetrafs_sb_birth_begin(sb, (u64) bit + 1);
-        cetrafs_sb_birth_ungate(sb, false);
-        memalloc_nofs_restore(nofs);
+        cetrafs_sb_birth_ungate(sb, false, nofs);
         if (bit < 0)
             return (int) bit;
 
@@ -941,6 +939,7 @@ int cetrafs_free_inode(struct super_block *sb, u64 ino)
 int cetrafs_free_inode_if_dead(struct super_block *sb, u64 ino, u64 generation)
 {
     u64 seq = 0;
+    unsigned int nofs;
     int ret;
 
     if (cetrafs_sb_is_fenced(sb))
@@ -956,10 +955,10 @@ int cetrafs_free_inode_if_dead(struct super_block *sb, u64 ino, u64 generation)
      * or loses to it and abandons the number. See inode.c's
      * cetrafs_inode_birth_claim(). A re-read alone could not be adjacent
      * enough to the free; only this is. */
-    cetrafs_sb_birth_gate(sb, true);
+    nofs = cetrafs_sb_birth_gate(sb, true);
     ret = cetrafs_inode_reclaim_claim(sb, ino, generation, CETRAFS_RECLAIM_CLAIM, &seq);
     if (ret) {
-        cetrafs_sb_birth_ungate(sb, true);
+        cetrafs_sb_birth_ungate(sb, true, nofs);
         return ret; /* reborn, locked, or unreadable: free nothing */
     }
 
@@ -982,7 +981,7 @@ int cetrafs_free_inode_if_dead(struct super_block *sb, u64 ino, u64 generation)
                 "until fsck\n",
                 (unsigned long long) ino, rret);
     }
-    cetrafs_sb_birth_ungate(sb, true);
+    cetrafs_sb_birth_ungate(sb, true, nofs);
     if (ret > 0)
         return 1;
     return ret;

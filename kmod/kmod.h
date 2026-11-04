@@ -269,6 +269,7 @@ void cetrafs_sb_cas_lock(struct super_block *sb);
 void cetrafs_sb_cas_unlock(struct super_block *sb);
 void cetrafs_sb_alloc_lock(struct super_block *sb);
 void cetrafs_sb_alloc_unlock(struct super_block *sb);
+bool cetrafs_sb_in_reclaim_lock(struct super_block *sb);
 /* Live speculative-run registry: lock.c publishes, scrub.c reads. A
  * reserved run is bitmap-set and referenced by no extent, which is
  * exactly what the scrub frees -- see cetrafs_sb_info.resv_list.
@@ -739,8 +740,8 @@ bool cetrafs_shadow_active(struct super_block *sb);
 void cetrafs_sb_birth_begin(struct super_block *sb, u64 ino);
 void cetrafs_sb_birth_end(struct super_block *sb, u64 ino);
 bool cetrafs_sb_birth_active(struct super_block *sb, u64 ino);
-void cetrafs_sb_birth_gate(struct super_block *sb, bool reclaim);
-void cetrafs_sb_birth_ungate(struct super_block *sb, bool reclaim);
+unsigned int cetrafs_sb_birth_gate(struct super_block *sb, bool reclaim);
+void cetrafs_sb_birth_ungate(struct super_block *sb, bool reclaim, unsigned int nofs);
 void cetrafs_shadow_clear(struct super_block *sb, u64 lba, u64 count, const char *who);
 
 // super_ops.c
