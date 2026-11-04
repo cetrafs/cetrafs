@@ -403,6 +403,14 @@ write. Not fixed yet: the fixes that keep it safe either move written
 extents between leaves (which needs a multi-block atomic write) or
 change what a crash may lose.
 
+A direct write that does not cover whole blocks (a 512-byte guest
+sector, say) is serialised: it waits for the file's in-flight direct
+I/O before it starts and for its own before it returns, as in ext4.
+Into a new block it must -- the DIO code zeroes the rest of that block,
+and two such writes in flight zero each other's data
+(`tests/kernel/dio_unaligned_race.sh`). Block-aligned writes, all that
+a 4 KiB guest issues, keep their queue depth.
+
 **Guarded by:** `tests/kernel/dio_no_fallback.sh` -- the fallback
 counter, QD16 against QD1 on a 3 ms device, a sequential fill's extent
 count, fio verify at QD32, and punches beside in-flight writes; with

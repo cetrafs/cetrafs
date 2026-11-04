@@ -301,6 +301,31 @@ static int cetrafs_file_flush(struct file *file, fl_owner_t id)
  * a check made before the lock could pass, lose to a suspend, and write
  * after the file was handed to a peer (cetrafs_lock_write_gate()).
  */
+/*
+ * An O_DIRECT write that does not cover whole blocks.
+ *
+ * Into a preallocated block, or a hole, the DIO code zeroes the part of
+ * the block the write does not cover (cetrafs_dio_mark_convert() sets
+ * buffer_new), and the block stays preallocated until the completion
+ * converts it -- so a second such write to the same block, submitted
+ * before the first completes, maps it as new too, and each one's zeros
+ * land over the other's data. inode_lock serialises SUBMISSION only: an
+ * async write (io_uring, Linux AIO; qemu's aio=native) drops it with the
+ * bio in flight. Two 512-byte writes to the halves of one fresh block
+ * lost one half (tests/kernel/dio_unaligned_race.sh).
+ *
+ * ext4 and XFS answer this the same way: an unaligned direct write
+ * drains direct I/O before it starts and completes before inode_lock
+ * goes, so no two of them -- nor one and any other direct write -- are
+ * ever in flight against the same block. That serialises unaligned
+ * direct writes on this inode; block-aligned ones, everything a 4 KiB
+ * guest issues, are untouched.
+ */
+static bool cetrafs_dio_unaligned(const struct inode *inode, const struct kiocb *iocb, const struct iov_iter *from)
+{
+    return (iocb->ki_flags & IOCB_DIRECT) && ((iocb->ki_pos | iov_iter_count(from)) & (i_blocksize(inode) - 1));
+}
+
 static ssize_t cetrafs_file_write_iter(struct kiocb *iocb, struct iov_iter *from)
 {
     struct inode *inode = file_inode(iocb->ki_filp);
@@ -315,8 +340,21 @@ static ssize_t cetrafs_file_write_iter(struct kiocb *iocb, struct iov_iter *from
     ret = cetrafs_lock_write_gate(inode);
     if (!ret) {
         ret = generic_write_checks(iocb, from);
-        if (ret > 0)
+        if (ret > 0 && cetrafs_dio_unaligned(inode, iocb, from)) {
+            /* Both drains below may sleep on I/O. */
+            if (iocb->ki_flags & IOCB_NOWAIT) {
+                ret = -EAGAIN;
+            } else {
+                inode_dio_wait(inode);
+                ret = __generic_file_write_iter(iocb, from);
+                /* An async submission returned with its bio in flight
+                 * (-EIOCBQUEUED); it completes, converting, before the
+                 * next writer can map the block. */
+                inode_dio_wait(inode);
+            }
+        } else if (ret > 0) {
             ret = __generic_file_write_iter(iocb, from);
+        }
     }
     inode_unlock(inode);
     if (ret > 0)
@@ -1695,7 +1733,19 @@ static int cetrafs_leaf_array_convert(struct super_block *sb,
                  * leaf full splitting a preallocated extent", and it
                  * never stopped, because giving the tail back does
                  * nothing to free the SLOT the next split needs.
+                 *
+                 * Single-block, like the leaf-full branch above: the
+                 * caller appends exactly ONE block
+                 * (cetrafs_tree_convert_append()). This used to keep
+                 * the run's count, report all of it done, and append
+                 * one -- an O_DIRECT completion converts a whole run at
+                 * once, and every block of it after the first ended up
+                 * in no extent: its data on the device, the file
+                 * reading zeros there (tests/kernel/dio_convert_split.sh).
+                 * The rest of the run is left in the tail, still
+                 * preallocated, for the caller's next call.
                  */
+                count = 1;
                 arr[n].ee_block = cetrafs_cpu_to_le32(iblock + count);
                 arr[n].ee_len = cetrafs_extent_pack_len(len - head - count, true);
                 cetrafs_extent_phys_to_hilo(phys + head + count, &arr[n].ee_start_hi, &arr[n].ee_start_lo);
@@ -4340,13 +4390,15 @@ static int cetrafs_truncate_shrink(struct inode *inode, loff_t new_size)
     int ret;
 
     /*
-     * Wait for any direct I/O already in flight against this inode before
-     * a single block is freed: O_DIRECT bypasses the page cache, so
-     * inode_lock does not exclude an already-submitted DIO whose bio is
-     * aimed at a physical block this is about to hand back. (ext4 does
-     * the same in ext4_setattr().)
+     * Direct I/O already in flight against this inode was drained by the
+     * caller, before invalidate_lock (cetrafs_setattr_locked()): O_DIRECT
+     * bypasses the page cache, so inode_lock does not exclude an
+     * already-submitted DIO whose bio is aimed at a physical block this
+     * is about to hand back. Waiting here, under invalidate_lock, is the
+     * deadlock against cetrafs_dio_end_io(). (ext4 drains in
+     * ext4_setattr() too.)
      */
-    inode_dio_wait(inode);
+    lockdep_assert_held(&inode->i_rwsem);
 
     /*
      * Nothing in core changes before the record write below succeeds:
@@ -5071,7 +5123,17 @@ static int cetrafs_setattr_locked(struct mnt_idmap *idmap, struct dentry *dentry
          * cetrafs_page_mkwrite(), which takes this EXCLUSIVELY. Shared
          * would exclude these two and not another fault, and two
          * faults allocating at once is the lost update that cost 56
-         * blocks of a writer's data. */
+         * blocks of a writer's data.
+         *
+         * A shrink first drains direct I/O, and must do it HERE, before
+         * invalidate_lock: an O_DIRECT write's completion takes that
+         * lock to convert what it wrote (cetrafs_dio_end_io()) before
+         * its in-flight count drops, so waiting for it under the lock
+         * hangs both sides uninterruptibly
+         * (tests/kernel/dio_truncate_drain.sh). inode_lock, held by the
+         * VFS, keeps a new direct write from starting after the drain. */
+        if (attr->ia_size < i_size_read(inode))
+            inode_dio_wait(inode);
         filemap_invalidate_lock(inode->i_mapping);
         /* Under inode_lock (the VFS holds it here): not while this node
          * has handed the file to a peer -- cetrafs_lock_write_gate(). */

@@ -463,32 +463,62 @@ done <<<"$ASYNC_OK"
 # wrote (cetrafs_dio_end_io()); inode_dio_wait() waits for that
 # completion. Called with invalidate_lock held, the two sleep on each
 # other uninterruptibly. Punch, the defrag step and the lock suspend all
-# did exactly that until 2026-11-03.
+# did exactly that until 2026-11-03, and truncate, one call down, until
+# 2026-11-04.
 log "checking nothing waits for direct I/O while holding invalidate_lock (class 22)"
-# dio_wait_under_lock <file>...: file:line of every inode_dio_wait() reached
+# dio_waiters <file>...: an ERE of inode_dio_wait and every function that
+# reaches it, transitively. Truncate waited in cetrafs_truncate_shrink(),
+# whose CALLER held the lock, and a per-function scan saw a wait with no
+# lock and a lock with no wait (2026-11-04). Coarse on purpose: a
+# function counts from its column-0 signature to its closing brace, and
+# an over-match can only add waiters, never hide one.
+dio_waiters() {
+    local pat='inode_dio_wait' prev='' names
+    while [ "$pat" != "$prev" ]; do
+        prev="$pat"
+        names="$(awk -v pat="$pat" '
+            /^[a-z]/ && /\(/ && !/;[[:space:]]*$/ { fn = $0; sub(/\(.*/, "", fn); sub(/.*[ *]/, "", fn); next }
+            /^}/ { fn = "" }
+            /^[[:space:]]*\*/ || /^[[:space:]]*\/\*/ { next }
+            fn != "" && $0 ~ ("(^|[^a-z_0-9])(" pat ")\\(") { print fn }
+        ' "$@" | sort -u | tr '\n' '|')"
+        pat="inode_dio_wait${names:+|${names%|}}"
+    done
+    echo "$pat"
+}
+# dio_wait_under_lock <file>...: file:line of every call to a waiter made
 # with invalidate_lock (or a wrapper that takes it) held, per function.
 dio_wait_under_lock() {
-    awk '
+    local pat
+    pat="$(dio_waiters "$@")"
+    awk -v pat="$pat" '
         FNR == 1 { held = 0 }
         /^[[:space:]]*\*/ || /^[[:space:]]*\/\*/ { next }
         /^}/ { held = 0 }
+        /^[a-z]/ { next }
         /filemap_invalidate_unlock(_shared)?\(|cetrafs_defrag_inode_unlock\(/ { held = 0 }
-        /inode_dio_wait\(/ && held { print FILENAME ":" FNR }
+        held && $0 ~ ("(^|[^a-z_0-9])(" pat ")\\(") { print FILENAME ":" FNR }
         /filemap_invalidate_lock(_shared)?\(|cetrafs_defrag_inode_lock(_drained)?\(inode\)/ { held = 1 }
     ' "$@"
 }
-# Not blind: a known-bad body must be caught, and the fixed order passed.
+# Not blind: known-bad bodies must be caught -- a wait under the lock,
+# and a wait one call down from a caller that holds it -- and the fixed
+# orders passed.
 SAMPLE="$(ct_tmp dio-wait-sample)"
 printf '%s\n' 'static void bad(struct inode *inode)' '{' '    filemap_invalidate_lock(inode->i_mapping);' \
     '    inode_dio_wait(inode);' '}' 'static void good(struct inode *inode)' '{' '    inode_dio_wait(inode);' \
-    '    filemap_invalidate_lock(inode->i_mapping);' '}' >"$SAMPLE"
-[ "$(dio_wait_under_lock "$SAMPLE")" = "$SAMPLE:4" ] ||
-    fail "dio wait under lock: the check does not flag a known-bad sample (got '$(dio_wait_under_lock "$SAMPLE")')"
+    '    filemap_invalidate_lock(inode->i_mapping);' '}' 'static int shrink(struct inode *inode)' '{' \
+    '    inode_dio_wait(inode);' '    return 0;' '}' 'static int bad_caller(struct inode *inode)' '{' \
+    '    filemap_invalidate_lock(inode->i_mapping);' '    return shrink(inode);' '}' \
+    'static int good_caller(struct inode *inode)' '{' '    int r = shrink(inode);' \
+    '    filemap_invalidate_lock(inode->i_mapping);' '    return r;' '}' >"$SAMPLE"
+[ "$(dio_wait_under_lock "$SAMPLE" | tr '\n' ' ')" = "$SAMPLE:4 $SAMPLE:19 " ] ||
+    fail "dio wait under lock: the check does not flag the known-bad samples (got '$(dio_wait_under_lock "$SAMPLE" | tr '\n' ' ')')"
 HITS="$(dio_wait_under_lock "$K"/*.c | sed "s|$K/||")"
 NWAITS="$(grep -c 'inode_dio_wait(' "$K"/*.c | awk -F: '{ n += $2 } END { print n }')"
 [ "$NWAITS" -ge 4 ] || fail "dio wait under lock: found only $NWAITS inode_dio_wait() calls -- the scan is not seeing the tree"
-[ -z "$HITS" ] && pass "dio wait under lock: none of $NWAITS inode_dio_wait() calls holds invalidate_lock" ||
-    fail "dio wait under lock: inode_dio_wait() with invalidate_lock held at: $(echo $HITS) -- drain BEFORE taking it (cetrafs_dio_end_io() needs it)"
+[ -z "$HITS" ] && pass "dio wait under lock: none of $NWAITS inode_dio_wait() calls, nor any function reaching one, runs under invalidate_lock" ||
+    fail "dio wait under lock: a wait for direct I/O with invalidate_lock held at: $(echo $HITS) -- drain BEFORE taking it (cetrafs_dio_end_io() needs it)"
 
 # BUG-CLASSES.md class 19, execution context. ->free_inode runs from an
 # RCU callback, in softirq: nothing in it may sleep. It held a
