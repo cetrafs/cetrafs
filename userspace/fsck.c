@@ -1565,6 +1565,11 @@ int main(int argc, char **argv)
      * short chain is corruption and is reported as such.
      */
     uint64_t *bg_desc_lba = (uint64_t *) xcalloc(cetrafs_le32(sb.block_group_count), sizeof(uint64_t));
+    /* Each appended segment's [header, last descriptor], checked against
+     * the Block Groups once their descriptors are read (as fs.c does). */
+    uint64_t *seg_lo = (uint64_t *) xcalloc(cetrafs_le32(sb.block_group_count) + 1, sizeof(uint64_t));
+    uint64_t *seg_hi = (uint64_t *) xcalloc(cetrafs_le32(sb.block_group_count) + 1, sizeof(uint64_t));
+    uint32_t nsegs = 0;
     {
         uint32_t nbg = cetrafs_le32(sb.block_group_count), filled = 0, guard = 0;
         uint64_t first = cetrafs_le64(sb.bg_table_first_count);
@@ -1643,6 +1648,8 @@ int main(int argc, char **argv)
             }
             for (uint32_t i = 0; i < cetrafs_le32(seg.count); i++, filled++)
                 bg_desc_lba[filled] = seg_lba + 1 + i;
+            seg_lo[nsegs] = seg_lba;
+            seg_hi[nsegs++] = seg_lba + 1 + cetrafs_le32(seg.count);
             seg_lba = cetrafs_le64(seg.next);
         }
         if (filled != nbg) {
@@ -1699,6 +1706,19 @@ int main(int argc, char **argv)
                         (size_t) b, (uint64_t) cetrafs_le64(bg.start_block), (uint64_t) cetrafs_le64(bg.length_blocks),
                         (uint64_t) cetrafs_le64(sb.bg_regions_start), data_end);
                 return 1;
+            }
+            /* A segment inside a Block Group: every descriptor update
+             * then writes over that group's header, bitmap or data. The
+             * mount refuses it; fsck walked past it. */
+            for (uint32_t si = 0; si < nsegs; si++) {
+                if (seg_lo[si] < bg_end && cetrafs_le64(bg.start_block) < seg_hi[si]) {
+                    fprintf(stderr,
+                            "ERR: Block Group table segment [%" PRIu64 ",%" PRIu64 ") overlaps BG%zu [%" PRIu64
+                            ",+%" PRIu64 ")\n",
+                            seg_lo[si], seg_hi[si], (size_t) b, (uint64_t) cetrafs_le64(bg.start_block),
+                            (uint64_t) cetrafs_le64(bg.length_blocks));
+                    return 1;
+                }
             }
         }
         if (bg.off_bg_header != 0) {

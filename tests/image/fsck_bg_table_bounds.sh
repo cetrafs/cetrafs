@@ -14,7 +14,7 @@
 # Each case is one fault on a grown volume, CRC restamped so only the
 # check under test can see it.
 #
-# DISCRIMINATION: without the new checks, A and C read clean and B
+# DISCRIMINATION: without the new checks, A, C and D read clean and B
 # spins for seconds before it fails.
 set -euo pipefail
 . "$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)/lib/harness.sh"
@@ -53,4 +53,12 @@ ITS="$("$BGP" "$DEV" 0 --dump | grep -oP 'inode_table_start=\K[0-9]+')"
 "$SEG" "$DEV" copyto $((ITS + 900)) >/dev/null
 "$SBP" "$DEV" bg_table_next $((ITS + 900)) >/dev/null
 expect "C: the segment on the inode table" 'among the fixed tables'
+
+grown
+B0="$("$BGP" "$DEV" 0 --dump)"
+S0="$(grep -oP 'start_block=\K[0-9]+' <<<"$B0")"
+R0="$(grep -oP 'off_data_region=\K[0-9]+' <<<"$B0")"
+"$SEG" "$DEV" copyto $((S0 + R0 + 5000)) >/dev/null
+"$SBP" "$DEV" bg_table_next $((S0 + R0 + 5000)) >/dev/null
+expect "D: the segment inside Block Group 0" 'overlaps BG0'
 ct_exit
