@@ -59,8 +59,8 @@ static int cetrafs_get_block_read(struct inode *inode, sector_t iblock, struct b
  *
  * DIO is an O_DIRECT write. Its data reaches the device only when the
  * bio completes, so a block it maps must not read as data before then:
- * a preallocated block is mapped AS IS, and a hole inside i_size is
- * allocated PREALLOCATED. Either way a reader, a peer, or a crash sees
+ * a preallocated block is mapped AS IS, and a hole -- inside i_size or
+ * past it -- is allocated PREALLOCATED. Either way a reader, a peer, or a crash sees
  * zeros until CONVERT -- run from the DIO's completion, after the data
  * has landed -- marks the range written. That is what lets such a write
  * stay direct instead of falling back to a buffered write plus a
@@ -98,6 +98,12 @@ MODULE_PARM_DESC(dio_fill_holes,
 static bool cetrafs_dio_skip_convert;
 module_param_named(dio_skip_convert, cetrafs_dio_skip_convert, bool, 0644);
 MODULE_PARM_DESC(dio_skip_convert, "TEST ONLY: leave an O_DIRECT write's preallocated blocks unconverted");
+
+/* Test-only: fail an O_DIRECT write right after it allocated a block
+ * (cetrafs_dio_get_block()), leaving that block allocated and unwritten. */
+static bool cetrafs_dio_fail_after_alloc_once;
+module_param_named(dio_fail_after_alloc_once, cetrafs_dio_fail_after_alloc_once, bool, 0644);
+MODULE_PARM_DESC(dio_fail_after_alloc_once, "TEST ONLY: fail the next O_DIRECT write after it allocates a block");
 
 static atomic64_t cetrafs_dio_fallbacks = ATOMIC64_INIT(0);
 static atomic64_t cetrafs_dio_converts = ATOMIC64_INIT(0);
@@ -446,6 +452,11 @@ static int cetrafs_dio_get_block(struct inode *inode, sector_t iblock, struct bu
     filemap_invalidate_lock(inode->i_mapping);
     ret = __cetrafs_get_block(inode, iblock, bh_result, create, false, CETRAFS_GB_DIO);
     filemap_invalidate_unlock(inode->i_mapping);
+    /* TEST ONLY: the write fails with this block allocated and never
+     * written (tests/kernel/dio_extend_fail.sh). */
+    if (!ret && buffer_new(bh_result) && READ_ONCE(cetrafs_dio_fail_after_alloc_once) &&
+        xchg(&cetrafs_dio_fail_after_alloc_once, false))
+        ret = -EIO;
     return ret;
 }
 
@@ -523,11 +534,12 @@ static ssize_t cetrafs_direct_IO(struct kiocb *iocb, struct iov_iter *iter)
         return -EIO; /* self-fenced: no new writes */
 
     /* Without DIO_SKIP_HOLES a write into a hole or preallocated space
-     * maps with create == 1 and stays direct (enum cetrafs_gb_mode). */
-    if (!READ_ONCE(cetrafs_dio_fill_holes))
-        return blockdev_direct_IO(iocb, inode, iter, cetrafs_dio_get_block);
+     * maps with create == 1 and stays direct (enum cetrafs_gb_mode).
+     * With it, those inside i_size fall back to buffered -- but a write
+     * past i_size still maps here, preallocated like any other, so the
+     * completion that converts it is passed either way. */
     return __blockdev_direct_IO(iocb, inode, inode->i_sb->s_bdev, iter, cetrafs_dio_get_block, cetrafs_dio_end_io,
-                                DIO_LOCKING);
+                                DIO_LOCKING | (READ_ONCE(cetrafs_dio_fill_holes) ? 0 : DIO_SKIP_HOLES));
 }
 
 /*
@@ -3871,14 +3883,15 @@ static int __cetrafs_get_block(struct inode *inode,
                            (unsigned long long) inode->i_ino, (unsigned long long) iblock);
         return -EIO;
     }
-    /* An O_DIRECT write into a hole INSIDE i_size allocates preallocated
-     * (enum cetrafs_gb_mode). Past i_size it still allocates written data,
-     * exactly as before this mode existed: such a write is synchronous
-     * (the DIO code never runs an extending write async) and i_size moves
-     * only after it completes. Whether a crash in that window can expose
-     * the block through a later truncate-up is the same question it was
-     * for the buffered path, and is not answered here. */
-    dio_prealloc = mode == CETRAFS_GB_DIO && ((loff_t) iblock << inode->i_blkbits) < i_size_read(inode);
+    /* An O_DIRECT write allocates PREALLOCATED, inside i_size and past
+     * it alike (enum cetrafs_gb_mode); its completion converts what
+     * landed. Past i_size it used to allocate written data, on the
+     * grounds that i_size moves only after the write completes -- but a
+     * write that FAILS leaves i_size where it was and the block in the
+     * tree as data, holding the previous owner's bytes, for a later
+     * truncate-up or a write further out to expose. Preallocated, it
+     * reads as zeros until something writes it. */
+    dio_prealloc = mode == CETRAFS_GB_DIO;
 
     {
         ktime_t t0 = ktime_get();
