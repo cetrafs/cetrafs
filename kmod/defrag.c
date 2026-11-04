@@ -576,6 +576,16 @@ int cetrafs_defrag_inode(struct inode *inode, struct cetrafs_defrag_stats *out_s
             ret = -ECANCELED;
             goto out_free_tail;
         }
+        /* defrag.cetra on a VM image runs for minutes and pins the file
+         * (every peer open refused) while it does; SIGKILL must stop it.
+         * Between steps is the clean point: the committed prefix is the
+         * file's data and the suffix still names valid blocks, exactly
+         * as for -ECANCELED. The background worker has no signals, so
+         * this is the ioctl's alone. */
+        if (fatal_signal_pending(current)) {
+            ret = -EINTR;
+            goto out_free_tail;
+        }
 
         if (cetrafs_defrag_step_delay_ms)
             msleep(cetrafs_defrag_step_delay_ms); /* test-only: the lock is NOT held here, which is the point */
