@@ -13,7 +13,10 @@
 # What a read-only mount IS allowed to write is its own Node Registry
 # row -- it registers and heartbeats so peers see it as alive and honour
 # the read-presence bits it publishes, which is what stops a peer
-# unlinking a file it is reading. Everything else is skipped.
+# unlinking a file it is reading -- and, as ext4 and XFS do, its OWN
+# recovery: replaying this node's journal and sweeping the claims its
+# previous incarnation left (ro_reattach_recovers.sh). Everything else
+# is skipped.
 #
 # The second half: .reconfigure was NULL, so `mount -o remount,ro` just
 # flipped the flag with the filesystem never finding out -- a mount that
@@ -145,13 +148,15 @@ LS="$(ls "$MNT" | sort | tr '\n' ' ')"
 [ "$LS" = "adir payload " ] && pass "ro mount: readdir works" || fail "ro mount: ls shows '$LS'"
 umount "$MNT"
 
-# ------------------------------------------- a ro mount does not replay
+# ----------------------------------- a ro mount replays its own journal
 #
-# Replay WRITES -- into whichever data region the entry names. The
-# recipe is journal.sh's: log a real entry, wipe the target block to
-# simulate "the real write never landed", then mount. A read-write mount
-# repairs it; a read-only mount must leave it exactly as it found it.
-log "a read-only mount must not replay the journal"
+# As ext4 and XFS recover their logs on a read-only mount: read-only is
+# what the mount offers its users, not a promise that mounting never
+# writes. Skipping it left this node's claims live and its half-done
+# operations half done for as long as it stayed mounted. The recipe is
+# journal.sh's: log a real entry, wipe the target block to simulate
+# "the real write never landed", then mount read-only.
+log "a read-only mount replays this node's own journal"
 JIMG="$(ct_image 560 rojournal)"
 JDEV="$(ct_loop "$JIMG")"
 JMNT="$(ct_mnt rojournal)"
@@ -176,28 +181,12 @@ RO_REPLAY_LOG="$(dmesg_since "$RMARK" | grep 'journal replay:' || true)"
 umount "$JMNT"
 AFTER_RO="$(dd if="$JDEV" bs=4096 skip="$TARGET_LBA" count=1 status=none | md5sum)"
 
-[ -z "$RO_REPLAY_LOG" ] &&
-    pass "ro mount: no journal replay ran" ||
-    fail "ro mount: replay ran on a read-only mount: $RO_REPLAY_LOG"
-[ "$AFTER_RO" = "$ZEROED" ] &&
-    pass "ro mount: the target block is byte-for-byte as the read-only mount found it" ||
-    fail "ro mount: the target block changed under a read-only mount"
-
-# The control that gives the two assertions above their meaning: the
-# same image, the same outstanding entry, mounted read-WRITE, really is
-# repaired. Without it "nothing happened" could just mean the entry was
-# never valid.
-WMARK="$(dmesg_mark)"
-mount -t cetrafs "$JDEV" "$JMNT"
-W_REPLAY_LOG="$(dmesg_since "$WMARK" | grep 'journal replay:' || true)"
-umount "$JMNT"
-AFTER_RW="$(dd if="$JDEV" bs=4096 skip="$TARGET_LBA" count=1 status=none | md5sum)"
-echo "$W_REPLAY_LOG" | grep -q 'replayed 1 valid entry' &&
-    pass "control: the same entry IS replayed by a read-write mount" ||
-    fail "control: a read-write mount did not replay the entry: $W_REPLAY_LOG"
-[ "$AFTER_RW" != "$ZEROED" ] &&
-    pass "control: the read-write mount restored the target block" ||
-    fail "control: the target block is still zeroed after a read-write mount"
+echo "$RO_REPLAY_LOG" | grep -q 'replayed 1 valid entry' &&
+    pass "ro mount: this node's journal entry was replayed" ||
+    fail "ro mount: the outstanding entry was not replayed: $RO_REPLAY_LOG"
+[ "$AFTER_RO" != "$ZEROED" ] &&
+    pass "ro mount: the target block was restored" ||
+    fail "ro mount: the target block is still zeroed after the read-only mount"
 
 reset_stale_window
 ct_exit

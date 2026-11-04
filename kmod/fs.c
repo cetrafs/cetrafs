@@ -1808,6 +1808,19 @@ int cetrafs_fill_super(struct super_block *sb, struct fs_context *fc)
         if (cetrafs_mount_register_stall_ms) /* TEST ONLY, one-shot */
             msleep(xchg(&cetrafs_mount_register_stall_ms, 0));
 
+        /* A device that cannot be written cannot carry this node's
+         * membership: registering, the heartbeat and recovery all write
+         * it. ext4 refuses a read-only device that needs recovery the
+         * same way ("write access unavailable"). */
+        if (bdev_read_only(sb->s_bdev)) {
+            pr_err("%s: the device is read-only -- a cetrafs mount, read-only included, writes its registry row, "
+                   "heartbeat and recovery to it; refusing\n",
+                   sb->s_id);
+            cetrafs_free_sb_info(sb);
+            brelse(bh);
+            return -EACCES;
+        }
+
         /* Find/claim this node's Node Registry row. */
         {
             u8 node_uuid[CETRAFS_NODE_UUID_LEN];
@@ -1995,26 +2008,42 @@ int cetrafs_fill_super(struct super_block *sb, struct fs_context *fc)
              * mount: writing on top of unrecovered state is exactly
              * what the journal exists to prevent.
              *
-             * A read-only mount skips this entirely: replay WRITES, and
-             * an observer must not. The journal stays detached, which
-             * makes every cetrafs_journal_write_block() a no-op -- also
-             * correct, since nothing on a read-only mount logs. Our own
-             * leftovers stay outstanding until this node (or a peer
-             * reclaiming our ZGs) mounts somewhere it can write. */
-            if (!sb_rdonly(sb)) {
-                rc = cetrafs_journal_attach_node(sb, sbi->node_id);
-                if (rc) {
-                    pr_err("own journal replay/attach failed: %d\n", rc);
-                    cetrafs_free_sb_info(sb);
-                    brelse(bh);
-                    return rc;
-                }
-            } else {
-                pr_info("read-only mount: not replaying this node's journal\n");
+             * A read-only mount does this too, as ext4 and XFS recover
+             * their logs on a read-only mount: read-only is what the
+             * mount offers its users, not a promise that mounting never
+             * writes -- it registers, heartbeats and publishes presence
+             * already. It used to skip replay ("an observer must not
+             * write"), and with it the claim sweep below, which needs
+             * the replay first: a node that crashed and came back
+             * read-only re-attached its row and beat, and every claim of
+             * its previous incarnation read live for as long as it stayed
+             * mounted -- ETXTBSY on that node's files everywhere else.
+             *
+             * Except where this build cannot vouch for what it would
+             * write: an unknown RO_COMPAT feature is mountable read-only
+             * precisely because this build must not write the volume, so
+             * replaying into it is refused -- with a node that left
+             * cleanly there is nothing to replay and it mounts. */
+            if (sb_rdonly(sb) && (le64_to_cpu(ondisk->features_ro_compat) & ~CETRAFS_KNOWN_RO_COMPAT) &&
+                cetrafs_sb_unclean_reattach(sb)) {
+                pr_err("%s: this node went down with work outstanding, and this build does not know every "
+                       "feature of the volume (RO_COMPAT 0x%llx), so it cannot recover it -- mount with a build "
+                       "that does\n",
+                       sb->s_id, (unsigned long long) le64_to_cpu(ondisk->features_ro_compat));
+                cetrafs_free_sb_info(sb);
+                brelse(bh);
+                return -EOPNOTSUPP;
+            }
+            rc = cetrafs_journal_attach_node(sb, sbi->node_id);
+            if (rc) {
+                pr_err("own journal replay/attach failed: %d\n", rc);
+                cetrafs_free_sb_info(sb);
+                brelse(bh);
+                return rc;
             }
             /* After the replay, which repairs what those claims were
              * protecting, and before anything here can open a file. */
-            if (!sb_rdonly(sb) && cetrafs_sb_unclean_reattach(sb)) {
+            if (cetrafs_sb_unclean_reattach(sb)) {
                 rc = cetrafs_lock_sweep_own_claims(sb, sbi->node_id);
                 if (rc) {
                     pr_err("could not clear the claims this node held before it went down: %d\n", rc);
