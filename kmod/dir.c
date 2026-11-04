@@ -1616,10 +1616,11 @@ static int cetrafs_readdir(struct file *file, struct dir_context *dctx)
  * out with the creator's gid instead of the directory's, and a
  * subdirectory came out 755 instead of 2755.
  *
- * And the mnt_idmap argument was accepted and ignored, so on an
- * idmapped mount -- a container's view of the filesystem, the normal
- * case under Proxmox -- new files were stamped with the raw caller's
- * ids rather than the mapped ones.
+ * The mnt_idmap argument is honoured here, but cetrafs does NOT support
+ * idmapped mounts: FS_ALLOW_IDMAP is not set (kmod.c), so the kernel
+ * refuses to create one and 'idmap' is always nop_mnt_idmap today.
+ * Setting that flag needs every setattr, getattr and permission path
+ * audited for the idmap first, not just this one.
  *
  * On-disk ids are init_user_ns values, matching what
  * cetrafs_write_vfs_inode() writes and what i_uid_write() reads back.
