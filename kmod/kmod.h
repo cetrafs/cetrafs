@@ -549,6 +549,7 @@ void cetrafs_inode_stamp_crc_ns(cetrafs_inode_t *in);                      /* se
 void cetrafs_inode_stamp_crc_fd(struct super_block *sb, cetrafs_inode_t *in);
 u64 cetrafs_file_seq_new(struct super_block *sb); /* sector 1 only (the file-path publish) */
 int cetrafs_apply_raw_to_vfs_inode(struct inode *inode, const cetrafs_inode_t *raw);
+int cetrafs_apply_raw_to_vfs_inode_sure(struct inode *inode, const cetrafs_inode_t *raw);
 int cetrafs_refresh_vfs_inode_if_newer(struct inode *inode);
 u64 cetrafs_inode_new_generation(struct super_block *sb);
 

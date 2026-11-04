@@ -1843,13 +1843,18 @@ int cetrafs_lock_open(struct inode *inode, struct file *file)
          * allocator may already have given to somebody else. Fail the
          * open; the next lookup resolves it correctly or reports it
          * gone. */
-        int rret = cetrafs_apply_raw_to_vfs_inode(inode, &raw);
+        int rret = cetrafs_apply_raw_to_vfs_inode_sure(inode, &raw);
 
         if (rret)
             pr_warn_ratelimited("ino=%llu open-boundary refresh refused: %d\n", (unsigned long long) inode->i_ino,
                                 rret);
-        if (rret == -ESTALE) {
-            ret = -ESTALE;
+        /* A peer's record this open could not apply -- a contended lock
+         * past the retries, or local state the device lacks -- is not a
+         * view to open on: the open would trust a cache the record says
+         * is stale. Fail it; a retry finds the locks free. -EUCLEAN
+         * (a type change) stays logged-and-ignored, as before. */
+        if (rret == -ESTALE || rret == -EBUSY || rret == -EINTR) {
+            ret = rret;
             goto out_pr_unlock;
         }
     }
@@ -3326,8 +3331,21 @@ static int cetrafs_lock_resume(struct inode *inode)
          * ours, so this correctly keeps our newer state; and
          * cetrafs_apply_raw_to_vfs_inode() refuses unpublished local
          * state anyway, so unflushed local work is never clobbered. */
-        if (CETRAFS_FILE_SEQ_NODE(cetrafs_le64(raw.file_seq)) != (u32) (my_node_id & 0xFFFFu))
-            (void) cetrafs_apply_raw_to_vfs_inode(inode, &raw);
+        if (CETRAFS_FILE_SEQ_NODE(cetrafs_le64(raw.file_seq)) != (u32) (my_node_id & 0xFFFFu)) {
+            /* And it must have APPLIED: a silent decline left the old
+             * i_size in core with the gate about to open. Still
+             * suspended, so failing gives the lock back and leaves the
+             * file exactly as it was. */
+            ret = cetrafs_apply_raw_to_vfs_inode_sure(inode, &raw);
+            if (ret) {
+                pr_warn("lock: ino=%llu resume could not apply the peer's record (%d) -- giving the lock back\n",
+                        (unsigned long long) inode->i_ino, ret);
+                (void) cetrafs_lock_clear_on_disk(inode, /*stamp_stat=*/false);
+                if (ret != -ESTALE && ret != -EINTR)
+                    ret = -ETXTBSY; /* a blocking LOCK_EX tries again */
+                goto out;
+            }
+        }
         ci->file_seq_cached = U64_MAX;
         ci->foreign_open_cached = true;
         ci->foreign_open_valid = false;
@@ -3747,11 +3765,14 @@ int cetrafs_lock_defrag_begin(struct inode *inode)
      * then cold is dropped here, where no buffer or folio is held.
      */
     if (CETRAFS_FILE_SEQ_NODE(cetrafs_le64(raw.file_seq)) != (u32) (my_node_id & 0xFFFFu)) {
-        int aret = cetrafs_apply_raw_to_vfs_inode(inode, &raw);
+        /* Applied, or no pass: the final publish takes size and times
+         * from core (defrag.c), and a silent decline left the old ones
+         * there. */
+        int aret = cetrafs_apply_raw_to_vfs_inode_sure(inode, &raw);
 
-        if (aret == -ESTALE) {
+        if (aret) {
             cetrafs_lock_clear_on_disk(inode, /*stamp_stat=*/false);
-            ret = -ESTALE;
+            ret = aret == -ESTALE ? -ESTALE : -EBUSY;
             goto out;
         }
     }

@@ -1770,10 +1770,73 @@ static bool cetrafs_inode_has_unpublished_state(struct inode *inode)
            b.atime != (u64) inode_get_atime_sec(inode) || b.mtime != (u64) inode_get_mtime_sec(inode);
 }
 
+/* TEST ONLY: the next apply loses its inode_lock trylock, as it does to
+ * a local writer retrying -ETXTBSY. tests/kernel/lock_resume_reconcile.sh. */
+static bool cetrafs_apply_trylock_fail_once;
+module_param_named(apply_trylock_fail_once, cetrafs_apply_trylock_fail_once, bool, 0644);
+MODULE_PARM_DESC(apply_trylock_fail_once, "TEST ONLY: the next refresh apply finds the inode lock contended");
+
+/* Why an apply that returned 0 applied nothing. */
+enum cetrafs_apply_decline {
+    CETRAFS_APPLY_DONE = 0,
+    CETRAFS_APPLY_CONTENDED, /* a trylock failed: someone held the lock for a moment */
+    CETRAFS_APPLY_LOCAL,     /* this node holds state the device does not have */
+};
+
+static int __cetrafs_apply_raw_to_vfs_inode(struct inode *inode, const cetrafs_inode_t *raw,
+                                            enum cetrafs_apply_decline *why);
+
 int cetrafs_apply_raw_to_vfs_inode(struct inode *inode, const cetrafs_inode_t *raw)
+{
+    enum cetrafs_apply_decline why;
+
+    return __cetrafs_apply_raw_to_vfs_inode(inode, raw, &why);
+}
+
+/*
+ * The apply for a boundary that must NOT proceed on the old view: an
+ * open that found a peer's record, a lock resume, the defrag pin. The
+ * plain apply declines in silence when it loses a trylock -- right for
+ * d_revalidate, which asks again on the next lookup, and wrong here,
+ * where the caller goes on to trust its cache. A resume's own local
+ * writer, retrying -ETXTBSY, takes inode_lock for a moment on every
+ * retry, so losing that trylock is not rare; and the caller then let
+ * the writer in on the pre-handoff i_size.
+ *
+ * So a contended apply is retried, bounded and killable; a decline for
+ * local state the device does not have is -EBUSY, and so is running out
+ * of retries. The caller fails the boundary rather than proceeding.
+ */
+int cetrafs_apply_raw_to_vfs_inode_sure(struct inode *inode, const cetrafs_inode_t *raw)
+{
+    int attempt;
+
+    for (attempt = 0; attempt < 400; attempt++) {
+        enum cetrafs_apply_decline why;
+        int ret = __cetrafs_apply_raw_to_vfs_inode(inode, raw, &why);
+
+        if (ret)
+            return ret;
+        if (why == CETRAFS_APPLY_DONE)
+            return 0;
+        if (why == CETRAFS_APPLY_LOCAL)
+            return -EBUSY;
+        if (fatal_signal_pending(current))
+            return -EINTR;
+        usleep_range(200, 500);
+    }
+    pr_warn_ratelimited("ino=%llu: refresh could not take the inode's locks -- refusing\n",
+                        (unsigned long long) inode->i_ino);
+    return -EBUSY;
+}
+
+static int __cetrafs_apply_raw_to_vfs_inode(struct inode *inode, const cetrafs_inode_t *raw,
+                                            enum cetrafs_apply_decline *why)
 {
     int ret;
     bool dirty;
+
+    *why = CETRAFS_APPLY_DONE;
 
     /*
      * Not a DIFFERENT FILE. Inode numbers are reused, and stamping a new
@@ -1866,10 +1929,18 @@ int cetrafs_apply_raw_to_vfs_inode(struct inode *inode, const cetrafs_inode_t *r
      * both -- and a lock someone holds means a local writer is active:
      * decline, exactly as for a dirty inode.
      */
-    if (!inode_trylock(inode))
+    if (cetrafs_apply_trylock_fail_once) {
+        cetrafs_apply_trylock_fail_once = false; /* TEST ONLY */
+        *why = CETRAFS_APPLY_CONTENDED;
         return 0;
+    }
+    if (!inode_trylock(inode)) {
+        *why = CETRAFS_APPLY_CONTENDED;
+        return 0;
+    }
     if (!down_write_trylock(&inode->i_mapping->invalidate_lock)) {
         inode_unlock(inode);
+        *why = CETRAFS_APPLY_CONTENDED;
         return 0;
     }
     spin_lock(&inode->i_lock);
@@ -1892,6 +1963,7 @@ int cetrafs_apply_raw_to_vfs_inode(struct inode *inode, const cetrafs_inode_t *r
     if (dirty) {
         up_write(&inode->i_mapping->invalidate_lock);
         inode_unlock(inode);
+        *why = CETRAFS_APPLY_LOCAL;
         return 0;
     }
     if (cetrafs_apply_refresh_stall_ms && S_ISREG(inode->i_mode))

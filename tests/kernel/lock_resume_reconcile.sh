@@ -19,8 +19,15 @@
 # resumes; lock_resume_stall_ms holds the resume just before its
 # reconcile. The append must land at the peer's end of file.
 #
+# And the reconcile must have APPLIED the peer's size, not declined: the
+# apply takes inode_lock with a trylock, and the retrying writer holds
+# it for a moment on every retry. A lost trylock used to be a silent
+# success. The second round makes it lose once (apply_trylock_fail_once).
+#
 # DISCRIMINATION: with ci->lock_suspended cleared before the reconcile
-# (the old order), the append lands at 8 KiB and the file ends 12 KiB.
+# (the old order), the first round's append lands at the old end of
+# file; with the resume calling the plain cetrafs_apply_raw_to_vfs_inode()
+# again, the second round's does.
 set -euo pipefail
 . "$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)/lib/harness.sh"
 require_root
@@ -38,10 +45,14 @@ NODE="$(sed -n 's/^this_node_id: //p' "$(ct_procdir "$DEV")/info")"
 PEER=$(((${NODE:-0} + 1) % 4))
 ct_param_set lock_resume_stall_ms 1500
 
-F="$MNT/f"
-GATE="$(ct_tmp lresume-gate)"
-rm -f "$GATE" "$GATE.done"
-python3 - "$F" "$GATE" <<'PY' &
+# round <name> <contended>: one handoff and resume. contended=1 makes
+# the resume's apply lose its inode_lock trylock once, as it does to the
+# writer retrying -ETXTBSY a few microseconds at a time.
+round() {
+    local name="$1" contended="$2" F="$MNT/f.$1" GATE INO PY_PID SZ TAIL
+    GATE="$(ct_tmp "lresume-gate-$1")"
+    rm -f "$GATE" "$GATE.done" "$GATE.resume"
+    python3 - "$F" "$GATE" <<'PY' &
 import os, sys, fcntl, errno, threading, time
 path, gate = sys.argv[1], sys.argv[2]
 fd = os.open(path, os.O_WRONLY | os.O_CREAT | os.O_APPEND, 0o644)
@@ -62,25 +73,36 @@ def writer():
             time.sleep(0.01)
 t = threading.Thread(target=writer); t.start()
 time.sleep(0.3)
+open(gate + ".resume", "w").close()
+while os.path.exists(gate + ".resume"):        # the knob is armed
+    time.sleep(0.02)
 fcntl.flock(fd, fcntl.LOCK_EX)                 # resume
 t.join(); os.fsync(fd); os.close(fd)
 print("writer", res)
 PY
-PY_PID=$!
-for _ in $(seq 1 100); do [ -e "$GATE" ] && break; sleep 0.1; done
-INO="$(stat -c %i "$F")"
-"$POKE" "$IMG" setsize "$INO" 16384 2>/dev/null
-"$POKE" "$IMG" peerseq "$INO" "$PEER" 2>/dev/null
-touch "$GATE.done"
-wait "$PY_PID" || fail "the writer process failed"
+    PY_PID=$!
+    for _ in $(seq 1 100); do [ -e "$GATE" ] && break; sleep 0.1; done
+    INO="$(stat -c %i "$F")"
+    "$POKE" "$IMG" setsize "$INO" 16384 2>/dev/null
+    "$POKE" "$IMG" peerseq "$INO" "$PEER" 2>/dev/null
+    touch "$GATE.done"
+    for _ in $(seq 1 100); do [ -e "$GATE.resume" ] && break; sleep 0.05; done
+    [ "$contended" = 1 ] && ct_param_set apply_trylock_fail_once 1
+    rm -f "$GATE.resume"
+    wait "$PY_PID" || fail "$name: the writer process failed"
+    ct_param_set apply_trylock_fail_once 0
 
-ct_umount "$MNT"
-ct_mount "$DEV" "$MNT"
-SZ="$(stat -c %s "$F")"
-TAIL="$(python3 -c 'import sys; d=open(sys.argv[1],"rb").read(); print(d[16384:16388])' "$F")"
-[ "$SZ" = 20480 ] && [ "$TAIL" = "b'WWWW'" ] &&
-    pass "the append landed at the peer's end of file (size $SZ)" ||
-    fail "the append did not land at the peer's end of file: size $SZ, bytes at 16 KiB $TAIL -- the writer used the pre-handoff size"
+    ct_umount "$MNT"
+    ct_mount "$DEV" "$MNT"
+    SZ="$(stat -c %s "$F")"
+    TAIL="$(python3 -c 'import sys; d=open(sys.argv[1],"rb").read(); print(d[16384:16388])' "$F")"
+    [ "$SZ" = 20480 ] && [ "$TAIL" = "b'WWWW'" ] &&
+        pass "$name: the append landed at the peer's end of file (size $SZ)" ||
+        fail "$name: the append did not land at the peer's end of file: size $SZ, bytes at 16 KiB $TAIL -- the writer used the pre-handoff size"
+}
+
+round plain 0
+round contended 1
 
 ct_umount "$MNT"
 ct_exit
