@@ -1629,6 +1629,13 @@ static bool cetrafs_lock_ignore_readers;
 module_param_named(lock_ignore_readers, cetrafs_lock_ignore_readers, bool, 0644);
 MODULE_PARM_DESC(lock_ignore_readers, "TEST ONLY: drop the readers-exclude-a-writer half of the access rule");
 
+/* TEST ONLY: the next write-open's open-boundary refresh fails with
+ * -EBUSY, as a contended or locally-dirty refresh does
+ * (tests/kernel/open_fail_gives_back_lock.sh). */
+static bool cetrafs_open_refresh_fail_once;
+module_param_named(open_refresh_fail_once, cetrafs_open_refresh_fail_once, bool, 0644);
+MODULE_PARM_DESC(open_refresh_fail_once, "TEST ONLY: the next write-open's refresh fails with -EBUSY");
+
 int cetrafs_lock_open(struct inode *inode, struct file *file)
 {
     struct cetrafs_inode_info *ci = CETRAFS_I(inode);
@@ -1642,6 +1649,7 @@ int cetrafs_lock_open(struct inode *inode, struct file *file)
     cetrafs_inode_t raw;
     u32 my_node_id;
     bool reclaim_from_stale = false;
+    bool claimed = false; /* this open took the exclusive lock */
     u32 stale_owner = CETRAFS_NODE_ID_NONE;
     int ret;
 
@@ -1836,6 +1844,7 @@ int cetrafs_lock_open(struct inode *inode, struct file *file)
                 pr_warn("lock: ino=%llu lost the race claiming the write lock\n", (unsigned long long) inode->i_ino);
             goto out_pr_unlock;
         }
+        claimed = true;
     }
 
     /* nofilelock: we honor a present lock (above) but never auto-claim one,
@@ -1914,12 +1923,18 @@ int cetrafs_lock_open(struct inode *inode, struct file *file)
         /* A peer's record this open could not apply -- a contended lock
          * past the retries, or local state the device lacks -- is not a
          * view to open on: the open would trust a cache the record says
-         * is stale. Fail it; a retry finds the locks free. -EUCLEAN
+         * is stale. Fail it, and give back a lock this open took
+         * (out_give_back) -- or a retry finds it held by us. -EUCLEAN
          * (a type change) stays logged-and-ignored, as before. */
         if (rret == -ESTALE || rret == -EBUSY || rret == -EINTR) {
             ret = rret;
-            goto out_pr_unlock;
+            goto out_give_back;
         }
+    }
+    if (want_write && READ_ONCE(cetrafs_open_refresh_fail_once) && xchg(&cetrafs_open_refresh_fail_once, false)) {
+        pr_warn("ino=%llu open-boundary refresh refused: -16 (test injection)\n", (unsigned long long) inode->i_ino);
+        ret = -EBUSY;
+        goto out_give_back;
     }
     atomic_inc(&ci->lock_local_open_count);
 
@@ -2007,6 +2022,20 @@ int cetrafs_lock_open(struct inode *inode, struct file *file)
         cetrafs_lock_reconcile_cold(inode, &raw); /* 'raw' is not read past here */
 
     ret = 0;
+    goto out_pr_unlock;
+
+out_give_back:
+    /* The open fails after this open took the exclusive lock. ->release
+     * is not called for a failed open and no count was raised, so nothing
+     * else will ever clear it, and this node keeps beating, so no peer
+     * reclaims it either: every peer write-open would get ETXTBSY until
+     * this node happened to open and close the file again. Nothing was
+     * written under the claim, so there is nothing to publish -- clear
+     * it, and hand a clear that did not land to the heartbeat
+     * (cetrafs_lock_retry_deferred()), as close does. lock_mutex has
+     * been held since the claim, so no local opener relies on it. */
+    if (claimed && cetrafs_lock_clear_on_disk(inode, /*stamp_stat=*/false))
+        cetrafs_sb_flock_defer(sb, inode->i_ino, cetrafs_inode_get_generation(inode));
 
 out_pr_unlock:
     mutex_unlock(&ci->lock_mutex);
