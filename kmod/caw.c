@@ -917,6 +917,28 @@ static int cetrafs_cas_nocaw(struct super_block *sb,
  * {record bytes, then zeros} is byte-exact. If that ever stops being
  * true the CAW simply miscompares and we fall back to a re-read.
  */
+/*
+ * A mutator refused its image: the sector on the device fails its own
+ * checksum. Every mutator that returns -EUCLEAN means exactly that, and
+ * the loop has already re-read through any tear (a miscompare re-runs
+ * the mutator), so the bytes really are wrong: damaged metadata found
+ * on read, kind 2 (docs/internal/ERRORS.md). It used to be logged and
+ * nothing else -- counted nowhere, no write refused, corruption=stop
+ * not consulted. An inode record marks that inode; anything else (a
+ * node row, a Zone Group, a Block Group descriptor) the volume.
+ */
+static void cetrafs_cas_refused_damage(struct super_block *sb, u64 fs_lba)
+{
+    const cetrafs_superblock_t *raw = cetrafs_sb_raw(sb);
+    u64 itab = raw ? le64_to_cpu(raw->inode_table_start) : 0;
+    u64 icount = raw ? le32_to_cpu(raw->inodes_count) : 0;
+
+    if (raw && fs_lba >= itab && fs_lba < itab + icount)
+        cetrafs_sb_corrupt(sb, fs_lba - itab + 1);
+    else
+        cetrafs_sb_corrupt(sb, 0);
+}
+
 static int cetrafs_cas_region_seeded_impl(struct super_block *sb,
                                           u64 fs_lba,
                                           unsigned int region_idx,
@@ -1257,6 +1279,8 @@ static int cetrafs_cas_region_seeded_impl(struct super_block *sb,
     ret = -EBUSY;
 
 out:
+    if (ret == -EUCLEAN)
+        cetrafs_cas_refused_damage(sb, fs_lba);
     kfree(unknown);
     kfree(old);
     kfree(new);

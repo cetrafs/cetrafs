@@ -35,6 +35,8 @@ echo x >"$MNT/f"
 sync
 INO="$(stat -c %i "$MNT/f")"
 [ -w /sys/module/cetrafs/parameters/lock_open_pause_ms ] || { skip "lock_open_pause_ms missing"; ct_exit; }
+corr() { sed -n 's/^corruptions: //p' "$(ct_procdir "$DEV")/info"; }
+C0="$(corr)"
 MARK="$(dmesg_mark)"
 ct_param_set lock_open_pause_ms 2000
 RES="$(python3 - "$MNT/f" "$IPOKE" "$IMG" "$INO" <<'PY'
@@ -56,6 +58,12 @@ sleep 1
 dmesg_since "$MARK" | grep -q "lock CAS: the namespace sector on the device fails its checksum" &&
     pass "the lock swap met the damaged sector and refused it" ||
     log "(the lock swap logged no refusal)"
+# And the refusal is damage found on read -- kind 2, counted -- not a
+# log line and nothing else (docs/internal/ERRORS.md).
+C1="$(corr)"
+[ -n "$C0" ] && [ -n "$C1" ] && [ "$C1" -gt "$C0" ] &&
+    pass "the refusal was counted as damage (corruptions $C0 -> $C1)" ||
+    fail "the refused swap was only logged: corruptions $C0 -> $C1"
 ct_umount "$MNT" || umount -l "$MNT"
 OUT="$(ct_fsck "$DEV" 2>&1 || true)"
 if grep -qiE "ino(de)?[ =]$INO\b.*(checksum|crc)|(checksum|crc).*ino(de)?[ =]$INO\b" <<<"$OUT"; then
