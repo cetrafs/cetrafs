@@ -390,6 +390,19 @@ const struct file_operations cetrafs_file_ops = {
     .llseek = cetrafs_llseek,
     .read_iter = cetrafs_file_read_iter,
     .write_iter = cetrafs_file_write_iter,
+    /*
+     * sendfile(2), splice(2) and copy_file_range()'s fallback. Without
+     * both, since 6.5 they fail with EINVAL. The read side goes through
+     * ->read_iter (copy_splice_read) rather than straight to the page
+     * cache (filemap_splice_read), so that every check a read makes --
+     * today the fenced/stopped refusal in cetrafs_file_read_iter() --
+     * lives on one path. Not a known hole: a stop also drops the page
+     * cache, and tests/kernel/splice_ops.sh measured filemap_splice_read
+     * refusing a stopped mount as well. The write side already ends in
+     * ->write_iter.
+     */
+    .splice_read = copy_splice_read,
+    .splice_write = iter_file_splice_write,
     .mmap = cetrafs_file_mmap,
     .fsync = cetrafs_fsync,
     .fallocate = cetrafs_fallocate,
