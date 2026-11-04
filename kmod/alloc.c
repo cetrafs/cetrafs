@@ -1933,6 +1933,8 @@ int cetrafs_alloc_data_run_resv(struct super_block *sb, u32 bg_id, u64 count, u6
     for (bit = 0; bit < bg.data_block_count && !found; bit++) {
         bool set = false;
 
+        if (!(bit & 4095))
+            cond_resched(); /* up to 2^32 bits, under the mutex (class 13) */
         ret = cetrafs_bitmap_test_bit(sb, bmap_lba, bmap_blocks, bit, &set);
         if (ret)
             goto out_unlock;
@@ -1953,6 +1955,8 @@ int cetrafs_alloc_data_run_resv(struct super_block *sb, u32 bg_id, u64 count, u6
     }
 
     for (b = 0; b < count; b++) {
+        if (!(b & 4095))
+            cond_resched(); /* class 13 */
         if (b == 1 && READ_ONCE(cetrafs_run_alloc_fail_once) && xchg(&cetrafs_run_alloc_fail_once, false))
             ret = -EIO; /* test-only; see the parameter */
         else
@@ -1979,7 +1983,11 @@ int cetrafs_alloc_data_run_resv(struct super_block *sb, u32 bg_id, u64 count, u6
              * bit set: a leak the scrub reclaims, never a block shared --
              * but it is said, not swallowed. */
             while (b--) {
-                int rc = cetrafs_bitmap_free_bit(sb, bmap_lba, bmap_blocks, run_start + b, false);
+                int rc;
+
+                if (!(b & 4095))
+                    cond_resched();
+                rc = cetrafs_bitmap_free_bit(sb, bmap_lba, bmap_blocks, run_start + b, false);
 
                 if (rc)
                     pr_err_ratelimited("defrag run alloc: could not give back bit %llu of BG %u (%d) -- left "
@@ -2501,6 +2509,8 @@ static int __cetrafs_free_data_extent(struct super_block *sb, u64 lba, u32 count
     for (b = 0; b < count; b++) {
         bool set = false;
 
+        if (!(b & 4095))
+            cond_resched(); /* an extent is up to 2^31 blocks (class 13) */
         if (resv_seq && cetrafs_resv_covers(sb, lba + b))
             continue; /* a live reservation claimed it since the caller decided -- not ours to free */
         /* Not covered NOW -- but a run released since the verdict was
@@ -2599,6 +2609,8 @@ int cetrafs_apply_pending_free(struct super_block *sb, u64 lba, u32 count, u32 e
     for (b = 0; b < count; b++) {
         bool set = false;
 
+        if (!(b & 4095))
+            cond_resched(); /* class 13 */
         ret = cetrafs_bitmap_test_bit(sb, bg.start_block + bg.off_data_bmap, bg.off_data_region - bg.off_data_bmap,
                                       bit + b, &set);
         if (ret)

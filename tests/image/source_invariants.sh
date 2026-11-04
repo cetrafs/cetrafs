@@ -520,6 +520,47 @@ NWAITS="$(grep -c 'inode_dio_wait(' "$K"/*.c | awk -F: '{ n += $2 } END { print 
 [ -z "$HITS" ] && pass "dio wait under lock: none of $NWAITS inode_dio_wait() calls, nor any function reaching one, runs under invalidate_lock" ||
     fail "dio wait under lock: a wait for direct I/O with invalidate_lock held at: $(echo $HITS) -- drain BEFORE taking it (cetrafs_dio_end_io() needs it)"
 
+# BUG-CLASSES.md class 13, loop rescheduling. A loop inside an
+# alloc_mutex section walks bits: a Block Group's (up to 2^32) or an
+# extent's (up to 2^31), one bitmap test each, holding a mutex every
+# allocator on the node waits for. None rescheduled until 2026-11-04.
+log "checking every loop under alloc_mutex reschedules (class 13)"
+# alloc_loops_without_resched <file>...: file:line of each for/while
+# loop opened inside a cetrafs_sb_alloc_lock() section whose body has
+# no cond_resched(). Braces are counted per line; a loop body is from
+# its header to the line its depth closes.
+alloc_loops_without_resched() {
+    awk '
+        FNR == 1 { held = 0; depth = 0; nl = 0 }
+        /^[[:space:]]*\*/ || /^[[:space:]]*\/\*/ { next }
+        /cetrafs_sb_alloc_unlock\(/ { held = 0 }
+        held && /^[[:space:]]*(for|while) \(/ && !/;[[:space:]]*$/ { nl++; ld[nl] = depth; ll[nl] = FNR; lr[nl] = 0 }
+        /cond_resched\(/ { for (i = 1; i <= nl; i++) lr[i] = 1 }
+        {
+            o = gsub(/\{/, "{"); c = gsub(/\}/, "}"); depth += o - c
+            while (nl > 0 && depth <= ld[nl] && FNR > ll[nl]) {
+                if (!lr[nl]) print FILENAME ":" ll[nl]
+                nl--
+            }
+        }
+        /cetrafs_sb_alloc_lock\(/ { held = 1 }
+    ' "$@"
+}
+# Not blind: a loop with no reschedule under the lock is caught, one with
+# it, or outside the lock, is not.
+SAMPLE="$(ct_tmp alloc-loop-sample)"
+printf '%s\n' 'static void f(struct super_block *sb, u64 count)' '{' '    u64 b;' '' \
+    '    cetrafs_sb_alloc_lock(sb);' '    for (b = 0; b < count; b++) {' '        test(b);' '    }' \
+    '    for (b = 0; b < count; b++) {' '        if (!(b & 4095))' '            cond_resched();' '        test(b);' '    }' \
+    '    cetrafs_sb_alloc_unlock(sb);' '    for (b = 0; b < count; b++) {' '        test(b);' '    }' '}' >"$SAMPLE"
+[ "$(alloc_loops_without_resched "$SAMPLE" | tr '\n' ' ')" = "$SAMPLE:6 " ] ||
+    fail "alloc loops: the check does not flag the known-bad sample (got '$(alloc_loops_without_resched "$SAMPLE" | tr '\n' ' ')')"
+NLOCK="$(grep -c 'cetrafs_sb_alloc_lock(sb);' "$K/alloc.c")"
+[ "$NLOCK" -ge 5 ] || fail "alloc loops: found only $NLOCK alloc_mutex sections in alloc.c -- the scan is not seeing the tree"
+HITS="$(alloc_loops_without_resched "$K"/*.c | sed "s|$K/||")"
+[ -z "$HITS" ] && pass "alloc loops: every loop in the $NLOCK alloc_mutex sections reschedules" ||
+    fail "alloc loops: a loop under alloc_mutex never reschedules, at: $(echo $HITS) -- add a periodic cond_resched() (class 13)"
+
 # BUG-CLASSES.md class 19, execution context. ->free_inode runs from an
 # RCU callback, in softirq: nothing in it may sleep. It held a
 # cancel_work_sync() until 2026-11-03.
