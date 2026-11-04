@@ -23,6 +23,12 @@
 //       Prints "submitted inflight=<0|1>" before the truncate (1: the
 //       write had not completed yet, so the truncate really raced it),
 //       then "trunc_ms=<n> trunc=<rc> write=<res>".
+//
+//   dio_aio readmid <file> <off> <len> <delay_ms> <read_blk>
+//       Submit ONE async write of <len> bytes of 'D' at <off>, wait
+//       <delay_ms>, then read block <read_blk> O_DIRECT while the write
+//       may still be completing. Prints "inflight=<0|1> read=<n>
+//       first=<c>" (c: the block's first byte, '0' for NUL), then reaps.
 #define _GNU_SOURCE
 #include <errno.h>
 #include <fcntl.h>
@@ -174,6 +180,38 @@ static int do_trunc(const char *path, long long off, size_t len, long long newsi
     return 0;
 }
 
+static int do_readmid(const char *path, long long off, size_t len, long delay_ms, long long rblk)
+{
+    aio_context_t ctx = 0;
+    int fd = open(path, O_RDWR | O_DIRECT);
+    char *buf = abuf(len), *r = abuf(4096);
+    struct iocb c, *cbs[1] = { &c };
+    struct io_event ev;
+    struct timespec zero = { 0, 0 };
+    long n;
+    ssize_t got;
+
+    if (fd < 0 || io_setup(4, &ctx) < 0) {
+        perror("open/io_setup");
+        return 2;
+    }
+    memset(buf, 'D', len);
+    prep(&c, fd, buf, len, off);
+    if (io_submit(ctx, 1, cbs) != 1) {
+        perror("io_submit");
+        return 2;
+    }
+    usleep(delay_ms * 1000);
+    int inflight = io_getevents(ctx, 0, 1, &ev, &zero) == 0;
+
+    got = pread(fd, r, 4096, rblk * 4096LL);
+    printf("inflight=%d read=%zd first=%c\n", inflight, got, got > 0 ? (r[0] ? r[0] : '0') : '-');
+    if (inflight)
+        while ((n = io_getevents(ctx, 1, 1, &ev, NULL)) < 0 && errno == EINTR)
+            ;
+    return 0;
+}
+
 int main(int argc, char **argv)
 {
     if (argc == 5 && strcmp(argv[1], "pair") == 0) {
@@ -187,9 +225,13 @@ int main(int argc, char **argv)
     }
     if (argc == 6 && strcmp(argv[1], "trunc") == 0)
         return do_trunc(argv[2], strtoll(argv[3], NULL, 0), strtoul(argv[4], NULL, 0), strtoll(argv[5], NULL, 0));
+    if (argc == 7 && strcmp(argv[1], "readmid") == 0)
+        return do_readmid(argv[2], strtoll(argv[3], NULL, 0), strtoul(argv[4], NULL, 0), strtol(argv[5], NULL, 0),
+                          strtoll(argv[6], NULL, 0));
     fprintf(stderr,
             "usage: %s pair <file> <nblocks> <half>\n"
-            "       %s trunc <file> <off> <len> <newsize>\n",
-            argv[0], argv[0]);
+            "       %s trunc <file> <off> <len> <newsize>\n"
+            "       %s readmid <file> <off> <len> <delay_ms> <read_blk>\n",
+            argv[0], argv[0], argv[0]);
     return 2;
 }
