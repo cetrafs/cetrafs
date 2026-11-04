@@ -2934,6 +2934,11 @@ static unsigned long cetrafs_bad_gen(u64 generation)
 
 static void cetrafs_sb_corrupt_gen(struct super_block *sb, u64 ino, unsigned long gen);
 
+static bool cetrafs_bad_mark_covers(void *stored, unsigned long gen)
+{
+    return stored && (xa_to_value(stored) == CETRAFS_BAD_GEN_UNKNOWN || xa_to_value(stored) == gen);
+}
+
 void cetrafs_sb_corrupt(struct super_block *sb, u64 ino)
 {
     cetrafs_sb_corrupt_gen(sb, ino, CETRAFS_BAD_GEN_UNKNOWN);
@@ -2957,7 +2962,14 @@ static void cetrafs_sb_corrupt_gen(struct super_block *sb, u64 ino, unsigned lon
     if (atomic_inc_return(&sbi->corruptions) == 1)
         pr_err("%s: this volume has damaged metadata -- unmount it on every node and run fsck.cetra\n",
                sb->s_id);
-    if (ino && ino <= ULONG_MAX && !xa_load(&sbi->bad_inos, (unsigned long) ino)) {
+    /* Stored unless the mark already there covers this incarnation: an
+     * unknown generation covers every one, a known one only itself. A
+     * mark left by an earlier incarnation -- a peer deleted the file and
+     * reused the number, which this node never allocates so
+     * cetrafs_sb_ino_reborn() never erased it -- is replaced; keeping it
+     * let unlink, truncate and evict through on a file just found
+     * damaged. */
+    if (ino && ino <= ULONG_MAX && !cetrafs_bad_mark_covers(xa_load(&sbi->bad_inos, (unsigned long) ino), gen)) {
         /* GFP_NOFS: found on read paths that may hold fs locks. If the
          * entry cannot be stored the write gate cannot see it, so say
          * so rather than imply a protection that is not there. */
