@@ -203,13 +203,38 @@ static void repair_block(const char *why)
 }
 
 /* Write len bytes at off, or die: a partial repair write is worse than
- * none, and there is nothing sensible to do but stop. */
+ * none, and there is nothing sensible to do but stop.
+ *
+ * And durable before the next one. Repairs depend on each other in
+ * program order -- an inode's bit before its record, its record before
+ * the dirent naming it -- and a buffered write promises no order on
+ * the device: a crash then keeps the dirent and loses the bit, and the
+ * kernel hands the number out again. A write that fails only at
+ * writeback was also reported "repaired". So every repair write is
+ * synced, and a failed sync is exit 3 like a failed write. fsck -r is
+ * offline and rare; correctness is the whole budget. */
 static void pwrite_all(int fd, const void *buf, size_t len, off_t off)
 {
+    static long stop_after = -1;
+
     if (pwrite(fd, buf, len, off) != (ssize_t) len) {
         perror("pwrite (repair)");
         exit(FSCK_EXIT_NOEXAM);
     }
+    if (fdatasync(fd) != 0) {
+        perror("fdatasync (repair)");
+        exit(FSCK_EXIT_NOEXAM);
+    }
+    /* Test knob only: stop dead after the Nth repair write, as a crash
+     * would -- no atexit, no release -- so a suite can check that every
+     * prefix of a repair is a consistent volume. Unset normally. */
+    if (stop_after < 0) {
+        const char *e = getenv("CETRAFS_TEST_FSCK_STOP_AFTER_WRITES");
+
+        stop_after = e ? atol(e) : 0;
+    }
+    if (stop_after > 0 && --stop_after == 0)
+        _exit(99);
 }
 
 /* Rewrite one inode record's nlink, restamping the record checksum the
@@ -453,17 +478,23 @@ static void fsck_stamp_dirent_block(uint8_t *blk)
     memcpy(blk + CETRAFS_DIRENT_TAIL_OFF, &tail, sizeof(tail));
 }
 
-/* Claim a free inode number from the in-memory bitmap the namespace
- * pass already holds; the caller writes it back once. */
-static int fsck_alloc_inode(const cetrafs_superblock_t *sb, uint8_t *ibmap, int *dirty, uint64_t *out_ino)
+/* Claim a free inode number in the in-memory bitmap the namespace pass
+ * holds, AND on the device, before the caller writes the record or any
+ * dirent naming it. It used to wait for the one write-back at the end
+ * of the pass: a crash before that left a dirent naming an inode whose
+ * bit was clear, which the kernel allocates again. */
+static int fsck_alloc_inode(int fd, const cetrafs_superblock_t *sb, uint8_t *ibmap, int *dirty, uint64_t *out_ino)
 {
     for (uint64_t ino = 2; ino <= cetrafs_le32(sb->inodes_count); ++ino) {
         uint64_t bit = ino - 1;
+        uint64_t blk = (bit / 8) / CETRAFS_BLOCK_SIZE;
 
         if (ibmap[bit / 8] & (1u << (bit % 8)))
             continue;
         ibmap[bit / 8] |= (uint8_t) (1u << (bit % 8));
         *dirty = 1;
+        pwrite_all(fd, ibmap + blk * CETRAFS_BLOCK_SIZE, CETRAFS_BLOCK_SIZE,
+                   (off_t) (cetrafs_le64(sb->inode_bmap_start) + blk) * CETRAFS_BLOCK_SIZE);
         *out_ino = ino;
         return 0;
     }
@@ -793,7 +824,7 @@ static uint64_t fsck_lost_found(int fd,
         }
     }
 
-    if (fsck_alloc_inode(sb, ibmap, ibmap_dirty, &ino)) {
+    if (fsck_alloc_inode(fd, sb, ibmap, ibmap_dirty, &ino)) {
         fprintf(stderr, "ERR: no free inode for /lost+found\n");
         return 0;
     }
@@ -804,9 +835,17 @@ static uint64_t fsck_lost_found(int fd,
          * behind it -- which the next run reads as "inode marked in use
          * but its checksum is wrong" and blocks every repair over.
          * fsck -r must never manufacture the fault that stops fsck -r.
-         * (ibmap_dirty stays latched: rewriting an unchanged bitmap is
-         * harmless, and other passes may have dirtied it for real.) */
-        ibmap[(ino - 1) / 8] &= (uint8_t) ~(1u << ((ino - 1) % 8));
+         * The bit is on the device already (fsck_alloc_inode()), so the
+         * give-back goes there too, at once. (ibmap_dirty stays latched:
+         * rewriting an unchanged bitmap is harmless, and other passes
+         * may have dirtied it for real.) */
+        {
+            uint64_t bb = ((ino - 1) / 8) / CETRAFS_BLOCK_SIZE;
+
+            ibmap[(ino - 1) / 8] &= (uint8_t) ~(1u << ((ino - 1) % 8));
+            pwrite_all(fd, ibmap + bb * CETRAFS_BLOCK_SIZE, CETRAFS_BLOCK_SIZE,
+                       (off_t) (cetrafs_le64(sb->inode_bmap_start) + bb) * CETRAFS_BLOCK_SIZE);
+        }
         fprintf(stderr, "ERR: no free block for /lost+found\n");
         return 0;
     }
