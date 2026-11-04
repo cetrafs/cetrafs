@@ -1748,6 +1748,10 @@ int cetrafs_lock_open(struct inode *inode, struct file *file)
                 (unsigned long long) inode->i_ino, raw.lock_owner_node);
         } else {
             ret = cetrafs_node_fence_peer(sb, cetrafs_le32(raw.lock_owner_node), "a file lock");
+            if (ret == -EBUSY) {
+                ret = -ETXTBSY; /* its owner came back: a live holder (cetrafs_node_fence_mutate()) */
+                goto out_pr_unlock;
+            }
             if (!ret)
                 ret = cetrafs_journal_replay_node(sb, cetrafs_le32(raw.lock_owner_node), /*wait_for_claim=*/true);
             if (ret) {
@@ -3757,6 +3761,10 @@ static int cetrafs_lock_explicit_acquire(struct inode *inode, struct file *file)
                 goto out;
             }
             ret = cetrafs_node_fence_peer(sb, owner, "a file lock (flock)");
+            if (ret == -EBUSY) {
+                ret = -ETXTBSY; /* its owner came back: a live holder */
+                goto out;
+            }
             if (!ret)
                 ret = cetrafs_journal_replay_node(sb, owner, /*wait_for_claim=*/true);
             if (ret) {
@@ -4326,6 +4334,8 @@ static int cetrafs_foreign_claim_from_raw(struct super_block *sb,
          * ns-locked workers, so the cluster mutex is already held. */
         if (stale) {
             ret = cetrafs_node_fence_peer(sb, cetrafs_le32(raw.lock_owner_node), "a file lock");
+            if (ret == -EBUSY)
+                return -ETXTBSY; /* its owner came back: a live holder */
             if (ret)
                 return ret;
             ret = cetrafs_journal_replay_node(sb, cetrafs_le32(raw.lock_owner_node), /*wait_for_claim=*/true);

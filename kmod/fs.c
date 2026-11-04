@@ -116,6 +116,11 @@ struct cetrafs_sb_info {
         u64 hb_seq;            /* last hb_seq we saw on this row */
         unsigned long seen_at; /* local jiffies when it last CHANGED */
         bool valid;            /* have we ever sampled this row? */
+        /* The hb_seq of the last STALE verdict: what a reclaim acting
+         * on that verdict must still find (the fence, node.c). Not
+         * hb_seq above, which the next tick re-samples. */
+        u64 judged_seq;
+        bool judged;
     } *peers;
     u32 peer_count;
 
@@ -2294,9 +2299,35 @@ bool cetrafs_sb_peer_progress_stale(struct super_block *sb, u32 node_id, u64 hb_
         if (pi && peer_floor > window)
             window = peer_floor;
         stale = time_after(now, w->seen_at + window);
+        if (stale) {
+            w->judged_seq = hb_seq;
+            w->judged = true;
+        }
     }
     spin_unlock(&sbi->peer_lock);
     return stale;
+}
+
+/* The hb_seq of the last stale verdict on a peer's row, or false if it
+ * was never judged stale by progress. For the fence (node.c), which must
+ * refuse to act on a verdict about an incarnation that has since
+ * re-attached. The judged value, not the last sample: a tick between
+ * the verdict and the fence re-samples the moved row, and comparing
+ * against that let the fence through (fence_vs_reattach.sh). */
+bool cetrafs_sb_peer_watched_seq(struct super_block *sb, u32 node_id, u64 *out)
+{
+    struct cetrafs_sb_info *sbi = sb->s_fs_info;
+    bool valid = false;
+
+    if (!sbi || !sbi->peers || node_id >= sbi->peer_count)
+        return false;
+    spin_lock(&sbi->peer_lock);
+    if (sbi->peers[node_id].judged) {
+        *out = sbi->peers[node_id].judged_seq;
+        valid = true;
+    }
+    spin_unlock(&sbi->peer_lock);
+    return valid;
 }
 
 void cetrafs_free_sb_info(struct super_block *sb)

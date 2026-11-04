@@ -171,6 +171,7 @@ int cetrafs_sb_get_node_id(struct super_block *sb, u32 *out);
  * for longer than CETRAFS_NODE_STALE_SECS of OUR clock? Uses no
  * cross-node timestamp, so clock skew cannot affect it. */
 bool cetrafs_sb_peer_progress_stale(struct super_block *sb, u32 node_id, u64 hb_seq, u32 peer_hb_interval);
+bool cetrafs_sb_peer_watched_seq(struct super_block *sb, u32 node_id, u64 *out);
 void cetrafs_node_report_clock_skew(struct super_block *sb);
 void cetrafs_node_seed_peer_watch(struct super_block *sb);
 bool cetrafs_cluster_all_advertise(struct super_block *sb, u32 cap);

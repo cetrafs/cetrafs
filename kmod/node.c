@@ -317,6 +317,12 @@ static int cetrafs_node_reattach_mutate(void *image, unsigned int len, void *pri
 struct cetrafs_node_fence_ctx {
     u64 seen_epoch;     /* out: the epoch after the bump */
     bool mark_departed; /* also stamp the clean-departure sentinel */
+    /* The reclaim paths: the verdict must still hold for THIS
+     * incarnation of the row (cetrafs_node_fence_peer()). */
+    bool check_verdict;
+    bool have_seq;  /* the watch sampled the row: seq is what it judged */
+    u64 seq;
+    bool reattached; /* out: refused, the row's owner came back */
 };
 
 static int cetrafs_node_fence_mutate(void *image, unsigned int len, void *priv)
@@ -332,6 +338,24 @@ static int cetrafs_node_fence_mutate(void *image, unsigned int len, void *priv)
         return 1; /* nothing to do -- not an error */
     if (!cetrafs_node_image_ok(&ne))
         return -EUCLEAN;
+
+    /*
+     * Is the verdict still about this row's CURRENT incarnation? A
+     * stale verdict rests on one of two things: the departed sentinel
+     * (last_seen == 0), or the watch seeing hb_seq stand still. A node
+     * that remounted between the verdict and here re-attached to the
+     * same row -- same id -- and wrote last_seen and moved hb_seq on.
+     * Fencing it then revoked a LIVE node's lease, and the caller went
+     * on to take what the new incarnation holds. The row is the
+     * judge: departed still means departed (the watch is not updated
+     * for a departed row, so its seq says nothing then); otherwise the
+     * seq must be the one judged.
+     */
+    if (ctx->check_verdict && ne.last_seen != 0 &&
+        (!ctx->have_seq || cetrafs_le64(ne.hb_seq) != ctx->seq)) {
+        ctx->reattached = true;
+        return 1; /* write nothing */
+    }
 
     ne.fence_epoch = cetrafs_cpu_to_le64(cetrafs_le64(ne.fence_epoch) + 1);
     ctx->seen_epoch = cetrafs_le64(ne.fence_epoch);
@@ -392,6 +416,13 @@ static int cetrafs_node_depart_mutate(void *image, unsigned int len, void *priv)
  * registry row would. Nothing a single-node test can arrange makes that
  * CAS fail on its own.
  */
+/* TEST ONLY: one-shot stall between a reclaim's stale verdict and its
+ * fence, the window a node remounting inside it re-attaches in
+ * (tests/kernel/fence_vs_reattach.sh). 0 = off. */
+static unsigned int cetrafs_fence_stall_ms;
+module_param_named(fence_stall_ms, cetrafs_fence_stall_ms, uint, 0644);
+MODULE_PARM_DESC(fence_stall_ms, "TEST ONLY: one-shot stall before a reclaim's fence (0 = off)");
+
 static bool cetrafs_fence_peer_fail;
 module_param_named(fence_peer_fail, cetrafs_fence_peer_fail, bool, 0644);
 MODULE_PARM_DESC(fence_peer_fail, "TEST ONLY: revoking a stale peer's lease fails");
@@ -414,9 +445,10 @@ MODULE_PARM_DESC(fence_peer_fail, "TEST ONLY: revoking a stale peer's lease fail
  * 0 also when there is no lease left to revoke (the row is no longer
  * REGISTERED: nobody holds it to keep writing under).
  */
-static int cetrafs_node_fence_peer_full(struct super_block *sb, u32 node_id, const char *what, bool mark_departed)
+static int cetrafs_node_fence_peer_full(struct super_block *sb, u32 node_id, const char *what, bool mark_departed,
+                                        bool check_verdict)
 {
-    struct cetrafs_node_fence_ctx ctx = {.mark_departed = mark_departed};
+    struct cetrafs_node_fence_ctx ctx = {.mark_departed = mark_departed, .check_verdict = check_verdict};
     const cetrafs_superblock_t *raw_sb = cetrafs_sb_raw(sb);
     int ret;
 
@@ -434,7 +466,14 @@ static int cetrafs_node_fence_peer_full(struct super_block *sb, u32 node_id, con
         return 0;
     }
 
+    if (check_verdict)
+        ctx.have_seq = cetrafs_sb_peer_watched_seq(sb, node_id, &ctx.seq);
     ret = cetrafs_cas_record(sb, cetrafs_node_row_lba(sb, node_id), cetrafs_node_fence_mutate, &ctx);
+    if (ret == 0 && ctx.reattached) {
+        pr_info("fence: node %u came back since it was judged stale -- not revoking, not reclaiming %s\n", node_id,
+                what);
+        return -EBUSY; /* held by a live node after all */
+    }
     if (ret < 0) {
         pr_err_ratelimited("fence: could not revoke stale node %u's lease (%d) -- not reclaiming %s\n", node_id, ret,
                            what);
@@ -464,7 +503,13 @@ int cetrafs_node_fence_peer(struct super_block *sb, u32 node_id, const char *wha
                            what);
         return -EIO;
     }
-    return cetrafs_node_fence_peer_full(sb, node_id, what, false);
+    {
+        unsigned int stall = xchg(&cetrafs_fence_stall_ms, 0);
+
+        if (stall)
+            msleep(stall); /* TEST ONLY: see the parameter */
+    }
+    return cetrafs_node_fence_peer_full(sb, node_id, what, false, true);
 }
 
 /*
@@ -703,7 +748,7 @@ int cetrafs_node_register(struct super_block *sb,
             if (cetrafs_register_twin_race) /* test knob, see its MODULE_PARM_DESC */
                 (void) cetrafs_cas_record(sb, cetrafs_node_row_lba(sb, idx), cetrafs_node_test_beat_mutate, NULL);
             if (cetrafs_reattach_race_bump) /* test knob, see its MODULE_PARM_DESC */
-                (void) cetrafs_node_fence_peer_full(sb, idx, "a test-forced concurrent reclaim (reattach_race_bump)", false);
+                (void) cetrafs_node_fence_peer_full(sb, idx, "a test-forced concurrent reclaim (reattach_race_bump)", false, false);
 
             /* The take-back is a CAS, never a blind write of the row read
              * above -- see cetrafs_node_reattach_mutate() for the fence
@@ -1300,7 +1345,7 @@ int cetrafs_node_live_peer_exists(struct super_block *sb, const u8 *my_uuid, boo
          * by itself, and every path that later does (its Zone Groups,
          * locks, journal) revokes the lease again and stops if it
          * cannot. */
-        (void) cetrafs_node_fence_peer_full(sb, idx, "this volume (no atomic CAW: one mounter only)", true);
+        (void) cetrafs_node_fence_peer_full(sb, idx, "this volume (no atomic CAW: one mounter only)", true, false);
     }
 
 out:
