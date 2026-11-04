@@ -2356,7 +2356,8 @@ static bool cetrafs_idx_may_hold(const cetrafs_extent_idx_t *e, u32 iblock)
  * last entry over a dropped one, so an unlocked scan could match a
  * logical range against another extent's physical address and read or
  * WRITE the wrong blocks. The buffer lock, not invalidate_lock:
- * writeback can run inside a task already holding that one. */
+ * writeback can run inside a task already holding that one
+ * (cetrafs_bh_read_lock()). */
 static int cetrafs_tree_lookup_unchecked(struct inode *inode,
                                          const cetrafs_inode_t *raw,
                                          u32 iblock,
@@ -2411,11 +2412,11 @@ static int cetrafs_tree_lookup_unchecked(struct inode *inode,
             return -EIO;
         lhdr = (const cetrafs_extent_hdr_t *) lbh->b_data;
         /* Under the buffer lock: see cetrafs_tree_lookup_unchecked(). */
-        lock_buffer(lbh);
+        cetrafs_bh_read_lock(lbh);
         *found = cetrafs_leaf_array_lookup((const cetrafs_extent_t *) (lbh->b_data + sizeof(*lhdr)),
                                            min_t(u16, cetrafs_le16(lhdr->eh_entries), CETRAFS_EXT_BLOCK_MAX_LEAVES),
                                            iblock, out_lba, out_run, out_uninit, &span);
-        unlock_buffer(lbh);
+        cetrafs_bh_read_unlock(lbh);
         brelse(lbh);
         if (*found)
             cetrafs_tree_remember(inode, raw, &span);
@@ -2448,11 +2449,11 @@ static int cetrafs_tree_lookup_unchecked(struct inode *inode,
 
             /* One entry at a time, copied under the buffer lock and
              * released before the leaf is locked: never two at once. */
-            lock_buffer(ibh);
+            cetrafs_bh_read_lock(ibh);
             iln = min_t(u32, cetrafs_le16(ihdr->eh_entries), CETRAFS_EXT_BLOCK_MAX_IDX);
             if (li < iln)
                 ie = iarr[li];
-            unlock_buffer(ibh);
+            cetrafs_bh_read_unlock(ibh);
             if (li >= iln)
                 break;
 
@@ -2470,11 +2471,11 @@ static int cetrafs_tree_lookup_unchecked(struct inode *inode,
                 return -EIO;
             }
             lhdr = (const cetrafs_extent_hdr_t *) lbh->b_data;
-            lock_buffer(lbh);
+            cetrafs_bh_read_lock(lbh);
             *found = cetrafs_leaf_array_lookup((const cetrafs_extent_t *) (lbh->b_data + sizeof(*lhdr)),
                                                min_t(u16, cetrafs_le16(lhdr->eh_entries), CETRAFS_EXT_BLOCK_MAX_LEAVES),
                                                iblock, out_lba, out_run, out_uninit, &span);
-            unlock_buffer(lbh);
+            cetrafs_bh_read_unlock(lbh);
             brelse(lbh);
             if (*found) {
                 brelse(ibh);

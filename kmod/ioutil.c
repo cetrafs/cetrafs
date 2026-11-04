@@ -199,6 +199,26 @@ u32 cetrafs_bh_begin_update_crc(struct buffer_head *bh)
     return ~crc32c(~0U, bh->b_data, CETRAFS_BLOCK_SIZE);
 }
 
+/*
+ * Read a cached block's bytes while no in-place update is half done.
+ *
+ * The update protocol above holds the buffer lock across
+ * modify-and-restamp, and a cached read verifies no checksum, so a
+ * reader that holds none of the writer's other locks (writeback, an
+ * O_DIRECT read: cetrafs_tree_lookup_unchecked()) takes the same lock
+ * to see a whole image. Hold it only to COPY what is needed: an
+ * update holds it across a journal round trip.
+ */
+void cetrafs_bh_read_lock(struct buffer_head *bh)
+{
+    lock_buffer(bh);
+}
+
+void cetrafs_bh_read_unlock(struct buffer_head *bh)
+{
+    unlock_buffer(bh);
+}
+
 /* Publish a buffer modified under cetrafs_bh_begin_update(): it is a
  * complete, correctly-checksummed image from here on. */
 void cetrafs_bh_end_update(struct buffer_head *bh)
