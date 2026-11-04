@@ -71,6 +71,9 @@ sleep 6 # one more scrub cycle after the claims went: the reclaim itself
 ct_umount "$MNT"
 kill "$BEATER" 2>/dev/null || true
 wait "$BEATER" 2>/dev/null || true
+# The beats went through the backing file; drop the device's cached
+# pages so fsck reads what is on it (tests/image/lint_poke_target.sh).
+blockdev --flushbufs "$DEV"
 "$NODE_POKE" "$DEV" 3 0 cc 0 >/dev/null
 log "$(dmesg_since "$MARK" | grep -E 'scrub|stale' | head -8)"
 

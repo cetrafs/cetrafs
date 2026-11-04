@@ -96,6 +96,9 @@ REC="$(($(orphans_reclaimed) - BASE))"
 ct_umount "$MNT"
 kill "$BEATER" 2>/dev/null || true
 wait "$BEATER" 2>/dev/null || true
+# The beats went through the backing file; drop the device's cached
+# pages so fsck reads what is on it (tests/image/lint_poke_target.sh).
+blockdev --flushbufs "$DEV"
 "$NODE_POKE" "$DEV" 2 0 bb 0 >/dev/null
 
 FSCK_OUT="$(ct_fsck "$DEV" 2>&1 || true)"
