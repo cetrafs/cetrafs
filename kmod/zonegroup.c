@@ -182,7 +182,9 @@ struct cetrafs_zg_cas_ctx {
     u32 my_node_id;
     bool claim; /* true: take ownership; false: give it back */
     bool allow_steal;
-    u32 steal_from; /* meaningful only when allow_steal */
+    u32 steal_from;  /* meaningful only when allow_steal */
+    u64 steal_seq;   /* ...and the hb_seq the stale verdict was made against */
+    bool reassert;   /* a mount re-asserting a ZG it still owns: bump hb_seq */
 };
 
 /*
@@ -220,9 +222,16 @@ static int cetrafs_zg_cas_mutate(void *image, unsigned int len, void *priv)
 
     (void) len;
 
-    if (ctx->claim) {
+    if (ctx->reassert) {
+        if (owner != (u16) ctx->my_node_id)
+            return -EBUSY; /* a peer took it while we were away */
+    } else if (ctx->claim) {
         bool unowned = (owner == CETRAFS_NODE_ID_NONE);
-        bool stealable = ctx->allow_steal && owner == (u16) ctx->steal_from;
+        /* The owner id alone names a ROW, not an incarnation: the owner
+         * remounting after the stale verdict re-asserts its ownership by
+         * bumping hb_seq, and a steal must not land on top of that. */
+        bool stealable =
+            ctx->allow_steal && owner == (u16) ctx->steal_from && le64_to_cpu(zg->hb_seq) == ctx->steal_seq;
 
         if (owner == (u16) ctx->my_node_id)
             return 1; /* already ours -- nothing to swap */
@@ -715,6 +724,12 @@ static int cetrafs_zg_reconcile_free_counts(struct super_block *sb, u32 zg_id)
     }
 }
 
+/* TEST ONLY: pause between a stale-owner verdict and the steal's swap
+ * (tests/kernel/zg_steal_vs_reattach.sh). */
+static unsigned int cetrafs_zg_steal_stall_ms;
+module_param_named(zg_steal_stall_ms, cetrafs_zg_steal_stall_ms, uint, 0644);
+MODULE_PARM_DESC(zg_steal_stall_ms, "TEST ONLY: pause before stealing a stale owner's zone group");
+
 static int cetrafs_zg_try_claim_one(struct super_block *sb, u32 zg_id, u32 my_node_id, bool at_mount, bool *out_claimed)
 {
     cetrafs_zone_group_t *zg; /* heap, not stack -- see the comment above */
@@ -740,6 +755,27 @@ static int cetrafs_zg_try_claim_one(struct super_block *sb, u32 zg_id, u32 my_no
         goto out_unlock;
 
     owner = le16_to_cpu(zg->owner_node_id);
+    if (owner == (u16) my_node_id && at_mount) {
+        /*
+         * Still ours on the device -- but this node was away, and a peer
+         * may have judged it stale and be about to steal this ZG: its
+         * swap compares the owner id, which is ours again the moment we
+         * re-attach. Re-assert the ownership with a swap of our own that
+         * moves hb_seq on, so a steal judged before it cannot land after
+         * it (cetrafs_zg_cas_mutate()); one that landed first makes this
+         * fail, and the ZG is not ours.
+         */
+        struct cetrafs_zg_cas_ctx rctx = {.my_node_id = my_node_id, .claim = true, .reassert = true};
+
+        ret = cetrafs_zg_cas(sb, zg_id, &rctx);
+        if (ret == -EBUSY) {
+            pr_warn("ZG claim: ZG %u was taken by a peer while this node was away\n", zg_id);
+            ret = 0;
+            goto out_unlock;
+        }
+        if (ret)
+            goto out_unlock;
+    }
     if (owner == (u16) my_node_id) {
         /* re-attaching to a ZG we already owned */
         bool was_cached = cetrafs_sb_zg_owned_cached(sb, zg_id);
@@ -808,12 +844,15 @@ static int cetrafs_zg_try_claim_one(struct super_block *sb, u32 zg_id, u32 my_no
         }
     }
 
+    if (owner != CETRAFS_NODE_ID_NONE && READ_ONCE(cetrafs_zg_steal_stall_ms))
+        msleep(READ_ONCE(cetrafs_zg_steal_stall_ms)); /* TEST ONLY */
     {
         struct cetrafs_zg_cas_ctx ctx = {
             .my_node_id = my_node_id,
             .claim = true,
             .allow_steal = (owner != CETRAFS_NODE_ID_NONE),
             .steal_from = owner,
+            .steal_seq = le64_to_cpu(zg->hb_seq),
         };
 
         ret = cetrafs_zg_cas(sb, zg_id, &ctx);

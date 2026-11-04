@@ -54,6 +54,8 @@ int main(int argc, char **argv)
         fprintf(stderr, "usage: %s <image> <zg_id> [<owner_node_id>]\n", argv[0]);
         fprintf(stderr, "       %s <image> <zg_id> free <blocks>   (set the aggregate)\n", argv[0]);
         fprintf(stderr, "       %s <image> <zg_id> badsum           (invalidate the hot checksum)\n", argv[0]);
+        fprintf(stderr, "       %s <image> <zg_id> bumpseq          (advance hb_seq: the owner re-asserting)\n", argv[0]);
+        fprintf(stderr, "       %s <image> <zg_id> seq              (print hb_seq)\n", argv[0]);
         return 2;
     }
 
@@ -61,7 +63,9 @@ int main(int argc, char **argv)
     uint32_t zg_id = (uint32_t) strtoul(argv[2], NULL, 0);
     bool free_mode = (argc == 5 && !strcmp(argv[3], "free"));
     bool badsum_mode = (argc == 4 && !strcmp(argv[3], "badsum"));
-    bool write_mode = (argc == 4) || free_mode;
+    bool bumpseq_mode = (argc == 4 && !strcmp(argv[3], "bumpseq"));
+    bool seq_mode = (argc == 4 && !strcmp(argv[3], "seq"));
+    bool write_mode = ((argc == 4) || free_mode) && !seq_mode;
     uint16_t owner = (argc == 4) ? (uint16_t) strtoul(argv[3], NULL, 0) : 0;
     uint64_t set_free = free_mode ? strtoull(argv[4], NULL, 0) : 0;
 
@@ -83,10 +87,30 @@ int main(int argc, char **argv)
     cetrafs_zone_group_t zg;
     pread_all(fd, &zg, sizeof(zg), zg_off);
 
+    if (seq_mode) {
+        printf("%llu\n", (unsigned long long) cetrafs_le64(zg.hb_seq));
+        close(fd);
+        return 0;
+    }
     if (!write_mode) {
         printf("owner_node_id=%u free_data_blocks=%llu\n", (unsigned) cetrafs_le16(zg.owner_node_id),
                (unsigned long long) cetrafs_le64(zg.free_data_blocks));
         close(fd);
+        return 0;
+    }
+
+    if (bumpseq_mode) {
+        /* Advance hb_seq and nothing else, as the owner re-asserting its
+         * ownership does (a remount): a steal judged before it must not
+         * land after it. */
+        zg.hb_seq = cetrafs_cpu_to_le64(cetrafs_le64(zg.hb_seq) + 1);
+        zg.hot_checksum = 0;
+        zg.hot_checksum = cetrafs_cpu_to_le64((uint64_t) crc32c_struct((const uint8_t *) &zg + CETRAFS_ZG_HOT_OFF, CETRAFS_ZG_HOT_LEN,
+                                                   offsetof(cetrafs_zone_group_t, hot_checksum) - CETRAFS_ZG_HOT_OFF,
+                                                   sizeof(zg.hot_checksum)));
+        pwrite_all(fd, &zg, sizeof(zg), zg_off);
+        close(fd);
+        printf("zg_poke: ZG%u hb_seq -> %llu\n", zg_id, (unsigned long long) cetrafs_le64(zg.hb_seq));
         return 0;
     }
 
