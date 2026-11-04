@@ -1581,18 +1581,34 @@ int main(int argc, char **argv)
                         seg_lba, cetrafs_le32(seg.first_bg_id), filled);
                 return 1;
             }
-            for (uint32_t i = 0; i < cetrafs_le32(seg.count); i++, filled++)
-                if (filled < nbg)
-                    bg_desc_lba[filled] = seg_lba + 1 + i;
-            if (filled > nbg) {
-                fprintf(stderr, "ERR: Block Group table chain describes %u Block Groups, more than the %u recorded\n",
-                        filled, nbg);
-                /* A whole segment past the count is what a second grow
-                 * that died before its publish leaves: say so. */
+            /* The kernel's bounds (fs.c), BEFORE the count drives a
+             * loop: a segment claiming 2^32 descriptors walked that
+             * many times and wrapped `filled` -- the mount refuses it in
+             * a millisecond, fsck spun on it. And where the segment and
+             * its descriptors sit: a grow puts them past every fixed
+             * table, inside the device. */
+            if (seg_lba < cetrafs_le64(sb.bg_regions_start)) {
+                fprintf(stderr, "ERR: Block Group table segment at %" PRIu64 " lies among the fixed tables "
+                                "(before block %" PRIu64 ")\n",
+                        seg_lba, (uint64_t) cetrafs_le64(sb.bg_regions_start));
+                return 1;
+            }
+            if (cetrafs_le32(seg.count) > nbg - filled) {
+                fprintf(stderr, "ERR: Block Group table chain describes more than the %u Block Groups recorded "
+                                "(segment at %" PRIu64 " claims %u, %u left)\n",
+                        nbg, seg_lba, cetrafs_le32(seg.count), nbg - filled);
                 if (cetrafs_le32(seg.first_bg_id) == nbg)
                     fprintf(stderr, "ERR: (a grow was interrupted before it published -- re-run growfs.cetra)\n");
                 return 1;
             }
+            if (seg_lba + 1 + cetrafs_le32(seg.count) > total_blocks) {
+                fprintf(stderr, "ERR: Block Group table segment at %" PRIu64 " describes blocks past the end of "
+                                "the volume\n",
+                        seg_lba);
+                return 1;
+            }
+            for (uint32_t i = 0; i < cetrafs_le32(seg.count); i++, filled++)
+                bg_desc_lba[filled] = seg_lba + 1 + i;
             seg_lba = cetrafs_le64(seg.next);
         }
         if (filled != nbg) {
@@ -1623,6 +1639,13 @@ int main(int argc, char **argv)
          * What actually has to hold is that no two BGs overlap and none
          * escapes the data area, and that is what is checked now.
          */
+        /* Its own id, against its place in the table: the kernel
+         * refuses a descriptor that names another Block Group
+         * (cetrafs_bg_geom_sane()); only the header's id was checked. */
+        if (cetrafs_le32(bg.bg_id) != (uint32_t) b) {
+            fprintf(stderr, "ERR: BG%zu descriptor says it is Block Group %u\n", (size_t) b, cetrafs_le32(bg.bg_id));
+            return 1;
+        }
         if (cetrafs_le64(bg.start_block) < next) {
             fprintf(stderr,
                     "ERR: BG%zu start %" PRIu64 " overlaps the previous Block Group (which ends at %" PRIu64 ")\n",

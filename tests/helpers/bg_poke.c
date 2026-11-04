@@ -111,7 +111,7 @@ int main(int argc, char **argv)
         fprintf(stderr, "       %s <image> <bg_id> --dump | --bumpseq\n", argv[0]);
         fprintf(stderr, "       %s <image> <bg_id> --owner <zg_id>\n", argv[0]);
         fprintf(stderr, "       %s <image> <bg_id> --geom=<field> <value>   (start_block, length_blocks, "
-                        "off_data_bmap, off_data_region, data_block_count)\n",
+                        "off_data_bmap, off_data_region, data_block_count, bg_id)\n",
                 argv[0]);
         return 2;
     }
@@ -245,6 +245,8 @@ int main(int argc, char **argv)
             bg.off_data_region = cetrafs_cpu_to_le32((uint32_t) v);
         else if (!strcmp(f, "data_block_count"))
             bg.data_block_count = cetrafs_cpu_to_le64(v);
+        else if (!strcmp(f, "bg_id"))
+            bg.bg_id = cetrafs_cpu_to_le32((uint32_t) v);
         else {
             fprintf(stderr, "unknown geometry field %s\n", f);
             return 2;
