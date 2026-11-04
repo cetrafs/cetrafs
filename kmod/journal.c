@@ -88,6 +88,23 @@ struct cetrafs_journal {
      * which replays our own area first.
      */
     bool flag_dirty;
+    /*
+     * Dead peers' areas whose replay-claim release did not land, by node
+     * id, and whether that release was to park the flag CLEAN. Retried
+     * every heartbeat (cetrafs_journal_retry_release()). Not left to the
+     * dead-peer sweep: it re-enters only while that node is STALE, and a
+     * node that came back meanwhile finds our claim live, waits it out,
+     * fails its mount -- and, beating again, is never swept.
+     */
+    DECLARE_BITMAP(rel_pending, 64);
+    DECLARE_BITMAP(rel_clean, 64);
+    /* Replays of each node's area running on this node now. A retry must
+     * not release a claim one of them re-entered (owner == me) and is
+     * still applying under. rel_mutex orders the two: the retry holds it
+     * across its check and release, a replay takes it only to count
+     * itself in. */
+    struct mutex rel_mutex;
+    atomic_t replaying[64];
     unsigned long *busy; /* logged-but-not-yet-consumed slots (in-flight operations) */
     /*
      * Slots held past their operation: a target write that failed keeps
@@ -347,13 +364,63 @@ static int cetrafs_journal_claim_replay(struct super_block *sb, u64 area_start, 
     return cetrafs_cas_record(sb, area_start, cetrafs_journal_claim_mutate, &ctx);
 }
 
-static void cetrafs_journal_release_replay(struct super_block *sb, u64 area_start, u32 my_node_id, bool set_clean)
-{
-    struct cetrafs_journal_claim_ctx ctx = {.my_node_id = my_node_id, .release = true, .set_clean = set_clean};
-    int ret = cetrafs_cas_record(sb, area_start, cetrafs_journal_claim_mutate, &ctx);
+/* TEST ONLY: fail the next replay-claim release, as a CAS the device
+ * refused would (tests/kernel/journal_release_retry.sh). */
+static bool cetrafs_journal_release_fail_once;
+module_param_named(journal_release_fail_once, cetrafs_journal_release_fail_once, bool, 0644);
+MODULE_PARM_DESC(journal_release_fail_once, "TEST ONLY: fail the next journal replay-claim release with -EIO");
 
-    if (ret < 0)
-        pr_err("journal: failed to release the replay claim on area %llu: %d\n", (unsigned long long) area_start, ret);
+static void cetrafs_journal_release_replay(struct super_block *sb, u32 node_id, u64 area_start, u32 my_node_id,
+                                           bool set_clean)
+{
+    struct cetrafs_journal *j = cetrafs_sb_get_journal(sb);
+    struct cetrafs_journal_claim_ctx ctx = {.my_node_id = my_node_id, .release = true, .set_clean = set_clean};
+    int ret;
+
+    if (READ_ONCE(cetrafs_journal_release_fail_once) && xchg(&cetrafs_journal_release_fail_once, false))
+        ret = -EIO;
+    else
+        ret = cetrafs_cas_record(sb, area_start, cetrafs_journal_claim_mutate, &ctx);
+
+    if (ret < 0) {
+        pr_err("journal: failed to release the replay claim on area %llu (node %u): %d -- queued for the "
+               "heartbeat\n",
+               (unsigned long long) area_start, node_id, ret);
+        if (j && node_id < 64) {
+            if (set_clean)
+                set_bit(node_id, j->rel_clean);
+            else
+                clear_bit(node_id, j->rel_clean);
+            set_bit(node_id, j->rel_pending);
+        }
+    } else if (j && node_id < 64) {
+        clear_bit(node_id, j->rel_pending);
+    }
+}
+
+/* The heartbeat's half of cetrafs_journal_release_replay(). The release
+ * mutator hands back only a claim that is still ours, so a retry after
+ * someone else took the area over is a no-op. */
+void cetrafs_journal_retry_release(struct super_block *sb)
+{
+    struct cetrafs_journal *j = cetrafs_sb_get_journal(sb);
+    u64 area_start, slots;
+    u32 my_node_id;
+    unsigned int n;
+
+    if (!j || bitmap_empty(j->rel_pending, 64) || cetrafs_sb_get_node_id(sb, &my_node_id))
+        return;
+    mutex_lock(&j->rel_mutex);
+    for_each_set_bit(n, j->rel_pending, 64) {
+        if (atomic_read(&j->replaying[n]))
+            continue; /* that replay releases for itself */
+        if (cetrafs_journal_node_area(sb, n, &area_start, &slots) || !area_start) {
+            clear_bit(n, j->rel_pending);
+            continue;
+        }
+        cetrafs_journal_release_replay(sb, n, area_start, my_node_id, test_bit(n, j->rel_clean));
+    }
+    mutex_unlock(&j->rel_mutex);
 }
 
 int cetrafs_journal_init(struct super_block *sb, struct cetrafs_journal **out_j)
@@ -364,6 +431,7 @@ int cetrafs_journal_init(struct super_block *sb, struct cetrafs_journal **out_j)
         return -ENOMEM;
 
     mutex_init(&j->lock);
+    mutex_init(&j->rel_mutex);
     init_waitqueue_head(&j->slot_wq);
     /* area_start/slots stay 0 until cetrafs_journal_attach_node() --
      * fill_super() calls cetrafs_journal_init() before node registration
@@ -1128,7 +1196,24 @@ static enum cetrafs_journal_verdict cetrafs_journal_judge(const struct cetrafs_j
  * headers are uncached: this area belongs to a different node whose
  * writes our cache has never seen.
  */
+static int __cetrafs_journal_replay_node(struct super_block *sb, u32 node_id, bool wait_for_claim);
+
 int cetrafs_journal_replay_node(struct super_block *sb, u32 node_id, bool wait_for_claim)
+{
+    struct cetrafs_journal *j = cetrafs_sb_get_journal(sb);
+    int ret;
+
+    if (!j || node_id >= 64)
+        return __cetrafs_journal_replay_node(sb, node_id, wait_for_claim);
+    mutex_lock(&j->rel_mutex);
+    atomic_inc(&j->replaying[node_id]);
+    mutex_unlock(&j->rel_mutex);
+    ret = __cetrafs_journal_replay_node(sb, node_id, wait_for_claim);
+    atomic_dec(&j->replaying[node_id]);
+    return ret;
+}
+
+static int __cetrafs_journal_replay_node(struct super_block *sb, u32 node_id, bool wait_for_claim)
 {
     u64 area_start, slots, s;
     struct cetrafs_journal_replay_entry *entries;
@@ -1539,20 +1624,20 @@ consume:
 
     /* Park the flag at CLEAN and drop the claim in ONE compare-and-swap:
      * leaving it DIRTY-but-unclaimed, or CLEAN-but-still-claimed, would
-     * each strand the area for a tick. A failed park is tolerated by
-     * design -- the claim's owner==me re-entry lets the next trigger
-     * re-claim and re-park an idempotent redo -- but it must not be
+     * each strand the area for a tick. A failed park is queued for the
+     * heartbeat (cetrafs_journal_retry_release()) -- it must not wait
+     * for a trigger that may never come -- and it must not be
      * SILENT: a three-node run counted the resulting same-node double
      * replay as two writers and a release scenario failed on it before
      * anyone knew parks could fail at all (2026-10-29). */
-    cetrafs_journal_release_replay(sb, area_start, my_node_id, /*set_clean=*/true);
+    cetrafs_journal_release_replay(sb, node_id, area_start, my_node_id, /*set_clean=*/true);
     claimed = false;
 
 out_free:
     kfree(entries);
 out_release:
     if (claimed)
-        cetrafs_journal_release_replay(sb, area_start, my_node_id, /*set_clean=*/false);
+        cetrafs_journal_release_replay(sb, node_id, area_start, my_node_id, /*set_clean=*/false);
     return ret;
 }
 

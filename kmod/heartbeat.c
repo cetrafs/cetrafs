@@ -299,6 +299,9 @@ static void cetrafs_heartbeat_maint(struct work_struct *work)
     cetrafs_lock_retry_presence(sb);
     /* And inode-number reclaim claims, for the same reason. */
     cetrafs_alloc_retry_reclaim(sb);
+    /* And dead peers' journal areas whose replay claim we could not
+     * release: their owner cannot mount past a live replayer. */
+    cetrafs_journal_retry_release(sb);
 
     ret = cetrafs_zg_drain_pending_frees(sb);
     if (ret)
