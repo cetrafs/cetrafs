@@ -4591,6 +4591,11 @@ static int cetrafs_do_allocate(struct inode *inode, loff_t offset, loff_t len, b
             return ret;
     }
 
+    /* The record this whole call appends to and then publishes: fresh
+     * unless the cache is provably this node's, the gate get_block()
+     * and truncate apply (CLAUDE.md rule 1). */
+    if (!cetrafs_lock_held_for_write_locally(inode))
+        cetrafs_invalidate_raw_inode(sb, inode->i_ino);
     ret = cetrafs_read_raw_inode_overlaid(sb, inode, &raw); /* torn-read-safe vs a concurrent publish */
     if (ret)
         return ret;
@@ -4751,6 +4756,27 @@ static long cetrafs_fallocate(struct file *file, int mode, loff_t offset, loff_t
          */
         filemap_invalidate_lock(inode->i_mapping);
         arc = cetrafs_sb_is_fenced(sb) ? -EIO : cetrafs_lock_write_gate(inode);
+        /*
+         * The third operation with truncate's and punch's hazard (rule
+         * 16): preallocation rewrites the extent map and publishes the
+         * whole file sector, last writer wins, so under nofilelock a peer
+         * writing the file meanwhile has its new extents published over.
+         * Same refusal, same reason: a peer with the file open is
+         * -ETXTBSY (tests/kernel/fallocate_foreign_open.sh).
+         */
+        if (!arc) {
+            u32 my_node_id;
+            bool blocked = false, reader = false;
+
+            arc = cetrafs_sb_get_node_id(sb, &my_node_id);
+            if (!arc)
+                arc = cetrafs_lock_foreign_user_exists(sb, inode->i_ino, my_node_id, &blocked, &reader);
+            if (!arc && (blocked || reader)) {
+                pr_warn_ratelimited("fallocate: ino=%llu is open on another node -- refusing to rewrite its map\n",
+                                    (unsigned long long) inode->i_ino);
+                arc = -ETXTBSY;
+            }
+        }
         if (!arc)
             arc = cetrafs_do_allocate(inode, offset, len, mode & FALLOC_FL_KEEP_SIZE);
         filemap_invalidate_unlock(inode->i_mapping);
