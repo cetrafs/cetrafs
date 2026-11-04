@@ -56,5 +56,6 @@ fi
 "$NPOKE" "$IMG" "$ROW" 0 00 0 >/dev/null
 blockdev --flushbufs "$DEV"
 ct_mount "$DEV" "$MNT" && pass "with the repair gone the volume mounts" || fail "the volume did not mount afterwards"
+require_cetrafs_mount "$MNT"
 ct_umount "$MNT"
 ct_exit

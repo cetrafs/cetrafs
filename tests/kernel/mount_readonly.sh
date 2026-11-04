@@ -5,9 +5,9 @@
 # A read-only mount of a shared LUN is what an admin does to inspect a
 # volume without perturbing the nodes that are live on it. cetrafs used
 # to accept -o ro and then immediately write to it: it claimed a Zone
-# Group (taking write capacity away from the live nodes), replayed its
-# own journal into the data region, and started the defrag janitor,
-# which relocates other people's file data in the background. The VFS
+# Group (taking write capacity away from the live nodes) and started
+# the defrag janitor, which relocates other people's file data in the
+# background. The VFS
 # blocked user writes, so from the outside it looked read-only.
 #
 # What a read-only mount IS allowed to write is its own Node Registry

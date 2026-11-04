@@ -51,7 +51,7 @@ round() {
     out="$(ct_growfs "$DEV" -s "$retry" 2>&1)" || { fail "$tag: the retry failed: $(tail -1 <<<"$out")"; return; }
     out="$(ct_fsck "$DEV" 2>&1)" && pass "$tag: after re-running growfs (-s $retry) fsck is clean" ||
         { fail "$tag: after the retry fsck reports $(grep -m1 ERR <<<"$out")"; return; }
-    ct_mount "$DEV" "$MNT" && { pass "$tag: and it mounts"; echo x >"$MNT/f"; ct_umount "$MNT"; } ||
+    ct_mount "$DEV" "$MNT" && { pass "$tag: and it mounts"; require_cetrafs_mount "$MNT"; echo x >"$MNT/f"; ct_umount "$MNT"; } ||
         fail "$tag: the finished grow does not mount"
 }
 

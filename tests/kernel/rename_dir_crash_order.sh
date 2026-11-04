@@ -27,6 +27,11 @@ set -euo pipefail
 . "$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)/lib/harness.sh"
 require_root
 require_module
+# fsck runs on crash snapshots -- copies of a mounted device -- whose
+# registry row looks live and that nothing will ever beat. The tools
+# watch such a row for the kernel's whole stale window (120 s), several
+# times over per suite; the test knob shortens the watch to two beats.
+export CETRAFS_PEER_PROBE_SECS=1
 for k in ns_step_gap_ms rename_name_fail_once; do
     [ -w "/sys/module/cetrafs/parameters/$k" ] || { skip "$k is missing"; ct_exit; }
 done

@@ -26,6 +26,10 @@ set -euo pipefail
 . "$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)/lib/harness.sh"
 require_root
 require_module
+# mkfs watches each row for the kernel's stale window (120 s), several
+# times here; the test knob gives two beats (35 s), still inside the
+# beater's 45 s.
+export CETRAFS_PEER_PROBE_SECS=4
 NPOKE="$(ct_helper node_poke)"
 
 IMG="$(ct_image 560 mkfsretire)"
@@ -100,5 +104,5 @@ else
 fi
 dd if="$IMG.sb" of="$IMG" bs=4096 count=1 conv=notrunc,fsync status=none
 blockdev --flushbufs "$DEV"
-ct_mount "$DEV" "$MNT" && { pass "control: the restored volume mounts"; ct_umount "$MNT"; } || fail "control: no mount"
+ct_mount "$DEV" "$MNT" && { pass "control: the restored volume mounts"; require_cetrafs_mount "$MNT"; ct_umount "$MNT"; } || fail "control: no mount"
 ct_exit
