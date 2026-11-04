@@ -561,6 +561,26 @@ HITS="$(alloc_loops_without_resched "$K"/*.c | sed "s|$K/||")"
 [ -z "$HITS" ] && pass "alloc loops: every loop in the $NLOCK alloc_mutex sections reschedules" ||
     fail "alloc loops: a loop under alloc_mutex never reschedules, at: $(echo $HITS) -- add a periodic cond_resched() (class 13)"
 
+log "checking no give-back of a claim discards its result (class 31)"
+# A claim given back with its result cast away is a claim kept for good
+# when the give-back fails: the holder keeps beating, so nothing else
+# ever clears it. Three of the four 2026-11-04 instances had exactly
+# this shape. The suspend-mark clears are the open R20 instance (TODO),
+# allowlisted by count so a fourth cannot hide behind them.
+discarded_giveback() {
+    grep -nE '\(void\) *cetrafs_(lock_clear_on_disk|inode_reclaim_claim|lock_cas|nslock_release[a-z_]*|lock_suspend_mark)\(' "$@" || true
+}
+SAMPLE="$(ct_tmp giveback-sample)"
+printf '%s\n' '    (void) cetrafs_lock_clear_on_disk(inode, false);' '    ret = cetrafs_lock_clear_on_disk(inode, false);' >"$SAMPLE"
+[ "$(discarded_giveback "$SAMPLE" | cut -d: -f1)" = 1 ] ||
+    fail "give-backs: the check does not flag the known-bad sample"
+HITS="$(discarded_giveback "$K"/*.c | sed "s|$K/||")"
+OPEN="$(grep -c 'cetrafs_lock_suspend_mark(inode, false)' <<<"$HITS" || true)"
+OTHER="$(grep -v 'cetrafs_lock_suspend_mark(inode, false)' <<<"$HITS" || true)"
+[ -z "$OTHER" ] && [ "$OPEN" -le 3 ] &&
+    pass "give-backs: none discards its result (beyond the $OPEN known suspend-mark clears, R20)" ||
+    fail "give-backs: a claim's give-back result is discarded at: $(echo $OTHER) ($OPEN suspend-mark sites) -- queue it for the heartbeat (class 31)"
+
 # BUG-CLASSES.md class 19, execution context. ->free_inode runs from an
 # RCU callback, in softirq: nothing in it may sleep. It held a
 # cancel_work_sync() until 2026-11-03.
