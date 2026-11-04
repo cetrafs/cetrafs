@@ -47,6 +47,9 @@ type Slave struct {
 
 	handleSeq atomic.Uint64
 	handles   sync.Map // uint64 -> *os.File
+
+	jobSeq atomic.Uint64
+	jobs   sync.Map // uint64 -> *dioJob (background dio_write)
 }
 
 func runSlave(addr, device, mountPoint, mkfsPath string) error {
@@ -596,6 +599,49 @@ func (s *Slave) dispatch(req Request) Response {
 			return errResp(req.ID, err)
 		}
 		res, err := doModParam(a)
+		if err != nil {
+			return errResp(req.ID, err)
+		}
+		return okResp(req.ID, res)
+
+	case "fallocate":
+		var a FallocateArgs
+		if err := unmarshalInto(&a); err != nil {
+			return errResp(req.ID, err)
+		}
+		if err := s.doFallocate(a); err != nil {
+			return errResp(req.ID, err)
+		}
+		return okResp(req.ID, struct{}{})
+
+	case "dio_write":
+		var a DioWriteArgs
+		if err := unmarshalInto(&a); err != nil {
+			return errResp(req.ID, err)
+		}
+		res, err := s.doDioWrite(a)
+		if err != nil {
+			return errResp(req.ID, err)
+		}
+		return okResp(req.ID, res)
+
+	case "dio_wait":
+		var a DioWaitArgs
+		if err := unmarshalInto(&a); err != nil {
+			return errResp(req.ID, err)
+		}
+		res, err := s.doDioWait(a)
+		if err != nil {
+			return errResp(req.ID, err)
+		}
+		return okResp(req.ID, res)
+
+	case "verify_blocks":
+		var a VerifyBlocksArgs
+		if err := unmarshalInto(&a); err != nil {
+			return errResp(req.ID, err)
+		}
+		res, err := s.doVerifyBlocks(a)
 		if err != nil {
 			return errResp(req.ID, err)
 		}
@@ -1534,8 +1580,11 @@ var settableModParams = map[string]bool{
 	"lock_suspend_skip_publish": true,
 	"lock_suspend_trust_cache":  true,
 	"caw_fail_discover":         true,
-	"hb_interval_secs":          true,
-	"stale_secs":                true,
+	// direct-write's negative control: completions stop converting, so
+	// the peer must see those blocks missing.
+	"dio_skip_convert": true,
+	"hb_interval_secs": true,
+	"stale_secs":       true,
 	// The background scrub's cadence. A scenario that has to watch the
 	// scrub make (or decline) a decision cannot wait out the 30-minute
 	// default, and these must be set BEFORE the mount: scrub_start()

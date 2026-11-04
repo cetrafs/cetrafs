@@ -56,7 +56,7 @@ func main() {
 	scenario := flag.String("scenario", "", "lock-race | lock-sequential | lock-hold | explicit-lock | lock-suspend | cluster-lock-mode | nocaw-mount-race | symlink-publish | zg-fairness | diag | module-info | xattrs | "+
 		"cross-node-visibility | concurrent-create | concurrent-unlink | concurrent-mkdir | concurrent-mkdir-storm | concurrent-rename | "+
 		"read-presence | inode-reuse | dirent-cache | extent-leaf-staleness | record-write-race | "+
-		"dirent-torn | caw | pending-free | scrub-transit | hypervisor-storm | space-accounting | dir-storm | sparse-bigfile | "+
+		"dirent-torn | caw | pending-free | scrub-transit | direct-write | hypervisor-storm | space-accounting | dir-storm | sparse-bigfile | "+
 		"ns-fuzz | mkfs-guard | full-suite")
 	lockPath := flag.String("lock-path", "ctest-lockfile", "path (relative to mountpoint) used by the lock-* scenarios")
 	// "" (the default) means "pick a fresh, timestamped directory for
@@ -357,7 +357,7 @@ func runMaster(cfg masterConfig) (bool, error) {
 		"concurrent-rename", "read-presence", "inode-reuse", "link-stale-reuse", "inode-unique", "dirent-cache", "extent-leaf-staleness",
 		"record-write-race", "dirent-torn", "caw", "pending-free", "scrub-transit", "hypervisor-storm", "ns-fuzz",
 		"create-visibility",
-		"fence-reclaim", "replay-race",
+		"fence-reclaim", "replay-race", "direct-write",
 		"space-accounting",
 		"sparse-bigfile",
 		"full-suite":
@@ -442,6 +442,8 @@ func dispatchScenario(cfg masterConfig, clients []*Client) (bool, error) {
 		return RunReadPresence(clients, cfg.testDir)
 	case "fence-reclaim":
 		return RunFenceReclaim(clients, cfg.testDir)
+	case "direct-write":
+		return RunDirectWrite(clients, cfg.testDir)
 	case "replay-race":
 		return RunReplayRace(clients, cfg.testDir)
 	case "inode-reuse":

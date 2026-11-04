@@ -184,6 +184,16 @@ are exempt, since those are the tools for diagnosing the mismatch.
   block leaked) and every attribute must land; finally a same-key race,
   where any single written value is a valid winner but a torn/mixed
   value or cross-node disagreement is a failure.
+- **`direct-write`** (needs >= 2 clients): O_DIRECT writes into holes and
+  preallocated space stay unwritten until their completion converts them.
+  A's direct writes must read back exactly on B (buffered and direct),
+  zeros elsewhere, and B's in turn on A; a control with the conversion
+  skipped must show up as missing blocks. Then A is cut off with direct
+  writes in flight: B takes the file over, every block must be zeros or a
+  whole write with the fsynced ones intact, B writes into what A left,
+  A fences itself, and fsck finds no damage. Free space is seeded with a
+  marker first; a block holding it is a deleted file's data (no control
+  can show that check able to fail).
 - **`scrub-transit`** (needs >= 2 clients): the background scrub must not
   reclaim a block that is IN TRANSIT between nodes. B deletes a file whose
   blocks live in A's zone group, so B cannot touch A's bitmap and queues

@@ -668,3 +668,78 @@ type ModuleInfoResult struct {
 	KoSHA256  string `json:"ko_sha256,omitempty"`
 	KoModTime string `json:"ko_mod_time,omitempty"`
 }
+
+// FallocateArgs: fallocate(2) mode 0 over [Offset, Offset+Length), so a
+// file can carry preallocated (unwritten) blocks for a direct write to
+// land in.
+type FallocateArgs struct {
+	Path   string `json:"path"`
+	Offset int64  `json:"offset"`
+	Length int64  `json:"length"`
+}
+
+// DioWriteArgs: O_DIRECT writes of whole 4 KiB blocks, Par at a time.
+// Each block holds blockStamp(Stamp, offset), so a reader can tell
+// which writer put it there and that it sits at the offset it was
+// written to. The offsets are Offsets, or -- for streams too long to
+// send -- Count offsets drawn from [Lo, Hi) by a PRNG seeded with Seed.
+// Background returns at once with a job id for dio_wait: it is how a
+// scenario cuts a node off while its writes are in flight.
+type DioWriteArgs struct {
+	Path       string  `json:"path"`
+	Offsets    []int64 `json:"offsets,omitempty"`
+	Count      int     `json:"count,omitempty"`
+	Lo         int64   `json:"lo,omitempty"`
+	Hi         int64   `json:"hi,omitempty"`
+	Seed       int64   `json:"seed,omitempty"`
+	Stamp      string  `json:"stamp"`
+	Par        int     `json:"par"`
+	Create     bool    `json:"create,omitempty"`
+	Fsync      bool    `json:"fsync,omitempty"`
+	Background bool    `json:"background,omitempty"`
+}
+
+type DioWriteResult struct {
+	Job        uint64 `json:"job,omitempty"`
+	Done       bool   `json:"done"`
+	Written    int    `json:"written"`
+	Failed     int    `json:"failed"`
+	FirstError string `json:"first_error,omitempty"`
+}
+
+// DioWaitArgs: wait up to TimeoutSecs for a background dio_write; Done
+// in the result says whether it finished.
+type DioWaitArgs struct {
+	Job         uint64 `json:"job"`
+	TimeoutSecs int    `json:"timeout_secs"`
+}
+
+// DioMust: blocks that must read back as Stamp's.
+type DioMust struct {
+	Stamp   string  `json:"stamp"`
+	Offsets []int64 `json:"offsets"`
+}
+
+// VerifyBlocksArgs: read [0, Size) in 4 KiB blocks (O_DIRECT when Direct)
+// and classify every block: all zeros, a valid block of one of Stamps at
+// its own offset, one containing Forbidden (data a deleted file left on
+// the device), or garbage. Must lists blocks that have to be valid with
+// a given stamp.
+type VerifyBlocksArgs struct {
+	Path      string    `json:"path"`
+	Size      int64     `json:"size"`
+	Direct    bool      `json:"direct,omitempty"`
+	Stamps    []string  `json:"stamps"`
+	Forbidden string    `json:"forbidden"`
+	Must      []DioMust `json:"must,omitempty"`
+}
+
+type VerifyBlocksResult struct {
+	Blocks    int            `json:"blocks"`
+	Zero      int            `json:"zero"`
+	Valid     map[string]int `json:"valid"`
+	Forbidden int            `json:"forbidden"`
+	Garbage   int            `json:"garbage"`
+	Missing   int            `json:"missing"` // Must blocks that did not read back as their stamp
+	Details   []string       `json:"details,omitempty"`
+}
