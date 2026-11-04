@@ -211,6 +211,17 @@ static bool cetrafs_caw_timeout_late_once;
 module_param_named(caw_timeout_late_once, cetrafs_caw_timeout_late_once, bool, 0644);
 MODULE_PARM_DESC(caw_timeout_late_once, "TEST ONLY: next CAW reports a timeout, then lands just before the next one");
 
+/* TEST ONLY: the same, landing EARLIER -- after the re-read that found
+ * the pre-image, but before the retry reads the region again. That retry
+ * then reads the post-image as its starting point, and without the check
+ * in cetrafs_cas_region_seeded_impl() it applied the mutator on top of
+ * it: an increment landed twice. caw_timeout_late_once lands after that
+ * read, so it only ever exercised the interleaving already handled. */
+static bool cetrafs_caw_timeout_late_preread_once;
+module_param_named(caw_timeout_late_preread_once, cetrafs_caw_timeout_late_preread_once, bool, 0644);
+MODULE_PARM_DESC(caw_timeout_late_preread_once,
+                 "TEST ONLY: next CAW reports a timeout, then lands just before the retry re-reads the region");
+
 /* TEST ONLY: the next CAW over a dm path executes and then reports a
  * failure with sense (a MEDIUM or HARDWARE ERROR after the write). */
 static bool cetrafs_caw_eio_landed_once;
@@ -221,7 +232,22 @@ static struct {
     u8 *compare, *write_data;
     u64 lba;
     unsigned int nblocks;
+    bool before_read; /* caw_timeout_late_preread_once: land at the CAS layer's re-read */
 } cetrafs_caw_late;
+
+/* Execute the held-back command now (the test knobs above). */
+static void cetrafs_caw_land_held(struct block_device *bdev)
+{
+    u8 *c = cetrafs_caw_late.compare, *w = cetrafs_caw_late.write_data;
+
+    cetrafs_caw_late.compare = NULL;
+    cetrafs_caw_late.write_data = NULL;
+    pr_warn("CAW lba=%llu: TEST late landing -- the timed-out command lands now\n",
+            (unsigned long long) cetrafs_caw_late.lba);
+    (void) cetrafs_caw(bdev, cetrafs_caw_late.lba, cetrafs_caw_late.nblocks, c, w);
+    kfree(c);
+    kfree(w);
+}
 
 static bool cetrafs_caw_fail_discover;
 module_param_named(caw_fail_discover, cetrafs_caw_fail_discover, bool, 0644);
@@ -580,21 +606,14 @@ int cetrafs_caw(struct block_device *bdev, u64 lba, unsigned int nblocks, const 
     if (nblocks == 0)
         return -EINVAL;
 
-    if (cetrafs_caw_late.compare) { /* test knob caw_timeout_late_once: land it now */
-        u8 *c = cetrafs_caw_late.compare, *w = cetrafs_caw_late.write_data;
-
-        cetrafs_caw_late.compare = NULL;
-        cetrafs_caw_late.write_data = NULL;
-        pr_warn("CAW lba=%llu: TEST caw_timeout_late_once -- the timed-out command lands now\n",
-                (unsigned long long) cetrafs_caw_late.lba);
-        (void) cetrafs_caw(bdev, cetrafs_caw_late.lba, cetrafs_caw_late.nblocks, c, w);
-        kfree(c);
-        kfree(w);
-    }
-    if (cetrafs_caw_timeout_late_once && bdev_logical_block_size(bdev)) {
+    if (cetrafs_caw_late.compare) /* test knobs: a held command lands at the latest here */
+        cetrafs_caw_land_held(bdev);
+    if ((cetrafs_caw_timeout_late_once || cetrafs_caw_timeout_late_preread_once) && bdev_logical_block_size(bdev)) {
         size_t half = (size_t) nblocks * bdev_logical_block_size(bdev);
 
+        cetrafs_caw_late.before_read = cetrafs_caw_timeout_late_preread_once;
         cetrafs_caw_timeout_late_once = false;
+        cetrafs_caw_timeout_late_preread_once = false;
         cetrafs_caw_late.compare = kmemdup(compare, half, GFP_KERNEL);
         cetrafs_caw_late.write_data = kmemdup(write_data, half, GFP_KERNEL);
         if (!cetrafs_caw_late.compare || !cetrafs_caw_late.write_data) {
@@ -912,7 +931,7 @@ static int cetrafs_cas_region_seeded_impl(struct super_block *sb,
     unsigned int off = region_idx * region;
     u64 dev_lba = have_caw ? fs_lba * (CETRAFS_BLOCK_SIZE / caw->logical_block_size) + region_idx : 0;
     u8 *old, *new;
-    u8 *unknown = NULL; /* the post-image of a swap whose outcome was unknown */
+    u8 *unknown = NULL; /* a swap whose outcome was unknown: its post-image, then its pre-image */
     int attempt, ret;
 
     if (!mutate || off + region > CETRAFS_BLOCK_SIZE)
@@ -1012,6 +1031,8 @@ static int cetrafs_cas_region_seeded_impl(struct super_block *sb,
              */
             memcpy(old, seed, region);
         } else {
+            if (cetrafs_caw_late.compare && cetrafs_caw_late.before_read)
+                cetrafs_caw_land_held(sb->s_bdev); /* TEST ONLY */
             bh = cetrafs_bread_uncached_retry(sb, fs_lba); /* see the no-CAW path above */
             if (!bh) {
                 ret = -EIO;
@@ -1019,6 +1040,39 @@ static int cetrafs_cas_region_seeded_impl(struct super_block *sb,
             }
             memcpy(old, bh->b_data + off, region);
             brelse(bh);
+        }
+
+        /*
+         * After a swap whose outcome was unknown, this read is a verdict
+         * too, not just a starting point. The command can land between
+         * the re-read that found the pre-image and this one -- and then
+         * this read IS its post-image. Running the mutator on it applies
+         * the mutation a second time, and the CAW below even succeeds,
+         * since its compare image is what the device holds: a delta
+         * mutator (a ZG aggregate, a BG count, a pending-free append)
+         * counted twice. So: our post-image means it landed; the
+         * pre-image means it still has not; anything else is a peer
+         * writing after a landing we cannot rule out -- the same verdict
+         * the MISCOMPARE check below gives.
+         */
+        if (unknown) {
+            if (!memcmp(old, unknown, region)) {
+                pr_warn("CAS lba=%llu: the timed-out command landed late -- taking it as done\n",
+                        (unsigned long long) fs_lba);
+                if (sole_region)
+                    cetrafs_cache_region_after_cas(sb, fs_lba, off, unknown, region);
+                else
+                    cetrafs_invalidate_block(sb, fs_lba);
+                ret = 0;
+                goto out;
+            }
+            if (memcmp(old, unknown + region, region)) {
+                cetrafs_sb_fatal(sb, "CAS lba=%llu: the region changed after a timed-out command -- cannot "
+                                     "tell whether it landed",
+                                 (unsigned long long) fs_lba);
+                ret = -EIO;
+                goto out;
+            }
         }
 
         memcpy(new, old, region);
@@ -1127,12 +1181,13 @@ static int cetrafs_cas_region_seeded_impl(struct super_block *sb,
                         (unsigned long long) fs_lba);
                 brelse(vbh);
                 if (!unknown)
-                    unknown = kmalloc(region, GFP_KERNEL);
+                    unknown = kmalloc(2 * region, GFP_KERNEL);
                 if (!unknown) {
                     ret = -ENOMEM;
                     goto out;
                 }
-                memcpy(unknown, new, region);
+                memcpy(unknown, new, region);          /* its post-image */
+                memcpy(unknown + region, old, region); /* and the image it compared */
                 continue;
             }
             brelse(vbh);
@@ -1471,7 +1526,8 @@ void cetrafs_cas_selftest(struct super_block *sb, u32 my_node_id)
         u8 base = 0x10;
         unsigned int phase;
 
-        static const char *const whats[] = {"lost", "landed", "landed late", "-EIO after landing"};
+        static const char *const whats[] = {"lost", "landed", "landed late", "-EIO after landing",
+                                            "landed before the re-read"};
 
         for (phase = 0; phase < ARRAY_SIZE(whats); phase++) {
             const char *what = whats[phase];
@@ -1488,6 +1544,7 @@ void cetrafs_cas_selftest(struct super_block *sb, u32 my_node_id)
             cetrafs_caw_timeout_landed_once = phase == 1;
             cetrafs_caw_timeout_late_once = phase == 2;
             cetrafs_caw_eio_landed_once = phase == 3;
+            cetrafs_caw_timeout_late_preread_once = phase == 4;
 
             ret = cetrafs_cas_record(sb, lba, cetrafs_cas_selftest_inc, NULL);
             /* The -EIO knob only fires on a dm path; say so rather than
@@ -1497,6 +1554,7 @@ void cetrafs_cas_selftest(struct super_block *sb, u32 my_node_id)
             cetrafs_caw_timeout_lost_once = false;
             cetrafs_caw_timeout_late_once = false;
             cetrafs_caw_eio_landed_once = false;
+            cetrafs_caw_timeout_late_preread_once = false;
             if (!fired) {
                 pr_info("CAS selftest: the %s case needs a dm path -- not exercised here\n", what);
                 continue;
