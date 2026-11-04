@@ -686,10 +686,48 @@ fail:
     return ret;
 }
 
-/* Walk one external leaf block's extents (read by LBA, plain cached). */
-static int cetrafs_scrub_walk_leaf(struct super_block *sb, u64 lba, void (*cb)(void *, u64, u32), void *ctx)
+/*
+ * The scrub's read of an external tree block.
+ *
+ * On the deciding pass ('fresh') this is a device read, tail-checked and
+ * retried like every lockless reader's: the scrub FREES what the walk
+ * does not report, so an older leaf -- a peer appended extents to it in
+ * place after this node cached it -- makes live blocks look leaked
+ * (CLAUDE.md rule 6, the 2026-10-18 scrub bug one level down). The
+ * record was already read fresh; the tree under it was not.
+ * cetrafs_bread_uncached() keeps a DIRTY buffer, so a leaf this node is
+ * itself still extending is read as this node has it, which is newer.
+ *
+ * A block that will not verify is "unknown", not corruption: the record
+ * naming it may be a dead file whose leaf was since reused, which is
+ * nobody's damage. The caller frees nothing on NULL.
+ */
+static struct buffer_head *cetrafs_scrub_tree_bread(struct super_block *sb, u64 lba, u32 magic, bool fresh)
 {
-    struct buffer_head *bh = cetrafs_bread_retry(sb, lba);
+    int attempt;
+
+    if (!cetrafs_lba_run_is_data(sb, lba, 1))
+        return NULL;
+    if (!fresh)
+        return cetrafs_bread_retry(sb, lba); /* pass 1 only proposes candidates */
+    for (attempt = 0; attempt < CETRAFS_BLK_TAIL_READ_RETRIES; attempt++) {
+        struct buffer_head *bh = cetrafs_bread_uncached(sb, lba);
+
+        if (bh) {
+            if (cetrafs_blk_tail_valid(bh, magic))
+                return bh;
+            brelse(bh);
+        }
+        usleep_range(100, 400);
+    }
+    return NULL;
+}
+
+/* Walk one external leaf block's extents (read by LBA). */
+static int
+cetrafs_scrub_walk_leaf(struct super_block *sb, u64 lba, void (*cb)(void *, u64, u32), void *ctx, bool fresh)
+{
+    struct buffer_head *bh = cetrafs_scrub_tree_bread(sb, lba, CETRAFS_LEAF_TAIL_MAGIC, fresh);
     const cetrafs_extent_hdr_t *hdr;
     const cetrafs_extent_t *arr;
     u32 ln, i;
@@ -727,9 +765,10 @@ static int cetrafs_scrub_walk_leaf(struct super_block *sb, u64 lba, void (*cb)(v
 /*
  * Report EVERY data-region block this inode owns: its data extents, the
  * extent tree's own external leaf and interior index blocks, and its
- * xattr block. Reads external tree blocks by LBA with plain cached
- * reads -- the background scrub (scrub.c, the only caller) holds no
- * struct inode and reads conservatively. Returns -EIO on any
+ * xattr block. Reads external tree blocks by LBA -- cached on the
+ * scrub's proposing pass, forced fresh on its deciding one ('fresh'),
+ * see cetrafs_scrub_tree_bread(). The background scrub (scrub.c, the
+ * only caller) holds no struct inode. Returns -EIO on any
  * unreadable/invalid tree block so the caller treats this inode's
  * references as UNKNOWN and frees nothing (it must never risk a live
  * block over a bad read).
@@ -755,7 +794,8 @@ static int cetrafs_scrub_walk_leaf(struct super_block *sb, u64 lba, void (*cb)(v
 int cetrafs_raw_inode_for_each_owned_block(struct super_block *sb,
                                            const cetrafs_inode_t *raw,
                                            void (*cb)(void *ctx, u64 phys, u32 len),
-                                           void *ctx)
+                                           void *ctx,
+                                           bool fresh)
 {
     u16 depth;
     u32 i, n;
@@ -786,11 +826,11 @@ int cetrafs_raw_inode_for_each_owned_block(struct super_block *sb,
         int ret;
 
         if (depth == 1) {
-            ret = cetrafs_scrub_walk_leaf(sb, lba, cb, ctx);
+            ret = cetrafs_scrub_walk_leaf(sb, lba, cb, ctx, fresh);
             if (ret)
                 return ret;
         } else {
-            struct buffer_head *ibh = cetrafs_bread_retry(sb, lba);
+            struct buffer_head *ibh = cetrafs_scrub_tree_bread(sb, lba, CETRAFS_INDEX_TAIL_MAGIC, fresh);
             const cetrafs_extent_hdr_t *ihdr;
             const cetrafs_extent_idx_t *iarr;
             u32 li, iln;
@@ -804,7 +844,7 @@ int cetrafs_raw_inode_for_each_owned_block(struct super_block *sb,
             for (li = 0; li < iln; li++) {
                 u64 llba = cetrafs_extent_phys_from_hilo(iarr[li].ei_leaf_hi, iarr[li].ei_leaf_lo);
 
-                ret = cetrafs_scrub_walk_leaf(sb, llba, cb, ctx);
+                ret = cetrafs_scrub_walk_leaf(sb, llba, cb, ctx, fresh);
                 if (ret) {
                     brelse(ibh);
                     return ret;

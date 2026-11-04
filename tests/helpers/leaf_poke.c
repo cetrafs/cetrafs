@@ -11,6 +11,9 @@
  * Usage:
  *   leaf_poke <image> leaf <ino>                       -- print leaf LBA
  *   leaf_poke <image> setphys <ino> <entry> <new_phys> -- rewrite one entry
+ *   leaf_poke <image> show <ino>                       -- one line per entry
+ *   leaf_poke <image> growlen <ino> <entry> <n>        -- entry covers n more
+ *       blocks, as a peer appending in place leaves it (restamped)
  *
  * Leaf blocks carry no checksum (cetrafs_extent_hdr_t + packed
  * cetrafs_extent_t array only), so no restamping is needed.
@@ -50,8 +53,10 @@ int main(int argc, char **argv)
         fprintf(stderr,
                 "usage: %s <image> leaf <ino>\n"
                 "       %s <image> setphys <ino> <entry> <new_phys>\n"
-                "       %s <image> setcount <ino> <n>\n",
-                argv[0], argv[0], argv[0]);
+                "       %s <image> setcount <ino> <n>\n"
+                "       %s <image> show <ino>\n"
+                "       %s <image> growlen <ino> <entry> <n>\n",
+                argv[0], argv[0], argv[0], argv[0], argv[0]);
         return 2;
     }
 
@@ -97,6 +102,49 @@ int main(int argc, char **argv)
         t->crc = cetrafs_cpu_to_le32(crc32c_update(0, blk, CETRAFS_BLK_TAIL_OFF));
         pwrite_all(blk, sizeof(blk), (off_t) leaf_lba * CETRAFS_BLOCK_SIZE);
         printf("leaf_poke: ino %" PRIu64 " leaf %" PRIu64 " entry count -> %s\n", ino, leaf_lba, argv[4]);
+        return 0;
+    }
+
+    if (strcmp(argv[2], "show") == 0 || strcmp(argv[2], "growlen") == 0) {
+        uint8_t blk[CETRAFS_BLOCK_SIZE];
+        cetrafs_extent_hdr_t *hdr = (cetrafs_extent_hdr_t *) blk;
+        cetrafs_extent_t *leaves = (cetrafs_extent_t *) (blk + sizeof(*hdr));
+        unsigned n, i;
+
+        pread_all(blk, sizeof(blk), (off_t) leaf_lba * CETRAFS_BLOCK_SIZE);
+        n = cetrafs_le16(hdr->eh_entries);
+        if (cetrafs_le16(hdr->eh_magic) != CETRAFS_EXT_MAGIC || n > CETRAFS_EXT_BLOCK_MAX_LEAVES) {
+            fprintf(stderr, "leaf block %" PRIu64 " is not a valid leaf\n", leaf_lba);
+            return 1;
+        }
+        if (argv[2][0] == 's') {
+            for (i = 0; i < n; i++)
+                printf("ent %u block=%u phys=%" PRIu64 " len=%u uninit=%d\n", i,
+                       (unsigned) cetrafs_le32(leaves[i].ee_block),
+                       cetrafs_extent_phys_from_hilo(leaves[i].ee_start_hi, leaves[i].ee_start_lo),
+                       (unsigned) cetrafs_extent_len(leaves[i].ee_len), cetrafs_extent_is_uninit(leaves[i].ee_len));
+            return 0;
+        }
+        if (argc != 6) {
+            fprintf(stderr, "growlen needs <entry> <n>\n");
+            return 2;
+        }
+        i = (unsigned) strtoul(argv[4], NULL, 0);
+        if (i >= n) {
+            fprintf(stderr, "entry %u out of range (entries=%u)\n", i, n);
+            return 1;
+        }
+        leaves[i].ee_len = cetrafs_extent_pack_len(cetrafs_extent_len(leaves[i].ee_len) + (uint32_t) strtoul(argv[5], NULL, 0),
+                                                   cetrafs_extent_is_uninit(leaves[i].ee_len));
+        {
+            cetrafs_blk_tail_t *t = (cetrafs_blk_tail_t *) (blk + CETRAFS_BLK_TAIL_OFF);
+
+            t->magic = cetrafs_cpu_to_le32(CETRAFS_LEAF_TAIL_MAGIC);
+            t->crc = cetrafs_cpu_to_le32(crc32c_update(0, blk, CETRAFS_BLK_TAIL_OFF));
+        }
+        pwrite_all(blk, sizeof(blk), (off_t) leaf_lba * CETRAFS_BLOCK_SIZE);
+        printf("leaf_poke: ino %" PRIu64 " leaf %" PRIu64 " entry %u len -> %u\n", ino, leaf_lba, i,
+               (unsigned) cetrafs_extent_len(leaves[i].ee_len));
         return 0;
     }
 

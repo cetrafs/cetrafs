@@ -299,7 +299,7 @@ static int scrub_build_refset(struct cetrafs_scrub *s, struct scrub_ctx *ctx, bo
             ret = cetrafs_read_raw_inode(sb, ino, &raw);
         }
         if (!ret)
-            ret = cetrafs_raw_inode_for_each_owned_block(sb, &raw, scrub_mark_ref, ctx);
+            ret = cetrafs_raw_inode_for_each_owned_block(sb, &raw, scrub_mark_ref, ctx, fresh);
         /* One exit for the ilookup() reference: the record-read failure
          * below returns too, and dropping it only on the success path
          * pinned an inode for the life of the mount. */

@@ -937,7 +937,8 @@ u64 cetrafs_scrub_last_duration_ms(void);
 int cetrafs_raw_inode_for_each_owned_block(struct super_block *sb,
                                            const cetrafs_inode_t *raw,
                                            void (*cb)(void *ctx, u64 phys, u32 len),
-                                           void *ctx);
+                                           void *ctx,
+                                           bool fresh);
 int cetrafs_bg_data_layout(struct super_block *sb,
                            u32 bg_id,
                            u64 *out_data_start,
