@@ -2118,7 +2118,11 @@ int cetrafs_lock_release(struct inode *inode, struct file *file)
      * never released it via flock(LOCK_UN), its close releases it --
      * the fd-scoped lifetime (Option A) that bounds a crashing holder. */
     if (ci->explicit_lock_file == file) {
-        (void) cetrafs_lock_clear_on_disk(inode, /*stamp_stat=*/false);
+        /* The fd is going, so the holder goes with it; a clear that did
+         * not land is the heartbeat's to finish
+         * (cetrafs_lock_retry_deferred()), never dropped. */
+        if (cetrafs_lock_clear_on_disk(inode, /*stamp_stat=*/false))
+            cetrafs_sb_flock_defer(sb, inode->i_ino, cetrafs_inode_get_generation(inode));
         ci->explicit_lock_file = NULL;
     }
 
@@ -2383,6 +2387,25 @@ void cetrafs_lock_retry_deferred(struct super_block *sb)
         }
         ci = CETRAFS_I(inode);
         mutex_lock(&ci->lock_mutex);
+        if (!cetrafs_sb_file_lock_enabled(sb)) {
+            /* nofilelock: the only lock a record can carry is a flock
+             * holder's, and the entry is a holder's close whose clear did
+             * not land. Writers do not claim here, so one still open --
+             * the VM a LOCK_UN handed over -- neither does this work nor
+             * may it stop it. A new local holder does: its own release
+             * clears. Nothing to publish; only the lock. */
+            if (!ci->explicit_lock_file) {
+                ret = cetrafs_lock_clear_on_disk(inode, /*stamp_stat=*/false);
+                if (ret)
+                    cetrafs_sb_flock_defer(sb, pend[i].ino, pend[i].generation);
+                else
+                    pr_info("lock release: ino=%llu flock clear finished by the heartbeat\n",
+                            (unsigned long long) inode->i_ino);
+            }
+            mutex_unlock(&ci->lock_mutex);
+            iput(inode);
+            continue;
+        }
         if (atomic_read(&ci->lock_writer_count) > 0 || ci->lock_suspended || ci->explicit_lock_file ||
             READ_ONCE(ci->defrag_pinned)) {
             mutex_unlock(&ci->lock_mutex);
@@ -2891,6 +2914,12 @@ bool cetrafs_lock_identity_cache_trusted(struct inode *inode)
  * clears a record that still shows OUR exclusive claim, so a lock that
  * was meanwhile reclaimed from us (stale-peer steal) is left alone
  * instead of being blindly stomped. Caller holds ci->lock_mutex. */
+/* TEST ONLY: fail the next lock clear, as a CAS the device refused
+ * would (tests/kernel/flock_clear_fails.sh). */
+static bool cetrafs_flock_clear_fail_once;
+module_param_named(flock_clear_fail_once, cetrafs_flock_clear_fail_once, bool, 0644);
+MODULE_PARM_DESC(flock_clear_fail_once, "TEST ONLY: fail the next on-disk lock clear with -EIO");
+
 static int cetrafs_lock_clear_on_disk(struct inode *inode, bool stamp_stat)
 {
     struct super_block *sb = inode->i_sb;
@@ -2900,6 +2929,10 @@ static int cetrafs_lock_clear_on_disk(struct inode *inode, bool stamp_stat)
     cetrafs_inode_t raw;
     int ret;
 
+    if (READ_ONCE(cetrafs_flock_clear_fail_once) && xchg(&cetrafs_flock_clear_fail_once, false)) {
+        pr_err("lock clear: ino=%llu failed: -5 (test injection)\n", (unsigned long long) inode->i_ino);
+        return -EIO;
+    }
     ret = cetrafs_sb_get_node_id(sb, &ctx.my_node_id);
     if (!ret)
         ret = cetrafs_read_raw_inode(sb, inode->i_ino, &raw);
@@ -3540,9 +3573,15 @@ static int cetrafs_lock_explicit_release(struct inode *inode, struct file *file)
     if (ci->explicit_lock_file != file) {
         ret = -EINVAL; /* this fd does not hold the explicit lock */
     } else {
-        (void) cetrafs_lock_clear_on_disk(inode, /*stamp_stat=*/false);
-        ci->explicit_lock_file = NULL;
-        ret = 0;
+        /* Only a clear that landed releases the holder. One that failed
+         * used to be dropped and the holder forgotten: the lock stayed on
+         * the device, ours and heartbeating, every peer open refused, and
+         * this node's own LOCK_EX answered -ETXTBSY to itself for ever.
+         * Failing, this fd still holds it: the orchestrator sees the
+         * error, a LOCK_UN retries, and the close retries too. */
+        ret = cetrafs_lock_clear_on_disk(inode, /*stamp_stat=*/false);
+        if (!ret)
+            ci->explicit_lock_file = NULL;
     }
     mutex_unlock(&ci->lock_mutex);
     return ret;
@@ -3584,8 +3623,11 @@ int cetrafs_flock(struct file *file, int cmd, struct file_lock *fl)
          * no-op success in both, per flock(2). */
         if (lock_on)
             return cetrafs_lock_suspend(inode, file);
-        cetrafs_lock_explicit_release(inode, file);
-        return 0;
+        /* -EINVAL is "this fd holds nothing": the no-op. Any other
+         * error is a release that did not happen, and this fd still
+         * holds the lock (cetrafs_lock_explicit_release()). */
+        ret = cetrafs_lock_explicit_release(inode, file);
+        return ret == -EINVAL ? 0 : ret;
     }
     if (!lock_is_write(fl))
         return -EOPNOTSUPP; /* exclusive-only: no shared (LOCK_SH) lock */
