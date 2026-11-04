@@ -62,7 +62,10 @@ image the caller already read, so the common claim costs one round trip
 rather than two.
 
 Not every device supports CAW (a loop device, this project's own test
-harness, does not). There, `cetrafs_cas_region()` falls back to a plain
+harness, does not), and a **partition** is treated as having none: the
+SCSI device behind it numbers blocks from the start of the whole disk,
+so a CAW computed on the partition would land on the wrong block. A
+shared volume goes on the whole LUN. There, `cetrafs_cas_region()` falls back to a plain
 forced-fresh read / mutate / write under a **node-local** mutex — which
 is correct only because `fs.c`'s mount-time gate refuses to mount such a
 volume at all when any *live* peer already has it mounted, making a

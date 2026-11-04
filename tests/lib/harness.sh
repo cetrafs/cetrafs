@@ -282,7 +282,10 @@ ct_summary() {
     fi
 }
 
-CT_DMESG_FAULT_RE='BUG:|Oops|Call trace|WARNING:|Busy inodes after unmount|blocked for more than|rcu.*stall|UBSAN:|general protection fault|Unable to handle kernel'
+CT_DMESG_FAULT_RE='(^|[^[:alnum:]_])BUG:|Oops|Call trace|WARNING:|Busy inodes after unmount|blocked for more than|rcu.*stall|UBSAN:|general protection fault|Unable to handle kernel'
+
+# BUG: is anchored on a non-word character because the match is
+# case-insensitive: scsi_debug logs "scsi_debug:sdebug_driver_probe".
 
 # The suite's dmesg minus one named EXTERNAL warning, whole: a suite
 # that drives some other subsystem into a WARN of its own (the LIO

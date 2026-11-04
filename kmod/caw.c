@@ -321,6 +321,16 @@ struct scsi_device *cetrafs_caw_get_sdev(struct block_device *bdev)
 
     if (!bdev || !bdev->bd_disk)
         return NULL;
+    /* A partition's gendisk is the WHOLE disk's, so the device found
+     * below is the whole disk's -- and a COMPARE AND WRITE sent to it at
+     * a partition-relative LBA lands bd_start_sect earlier. A compare of
+     * zeros against zeros there succeeds and writes the wrong block.
+     * dmpath.c refuses a path with an offset for the same reason
+     * (cetrafs_dmpath_identical()); this is the plain-SCSI half. No
+     * device here means no atomic CAW, and the mount gate then allows
+     * one mounter only. */
+    if (bdev_is_partition(bdev))
+        return NULL;
 
     ddev = disk_to_dev(bdev->bd_disk);
     if (!ddev || !ddev->parent || !scsi_is_sdev_device(ddev->parent))
@@ -504,6 +514,10 @@ int cetrafs_caw_discover(struct block_device *bdev, struct cetrafs_caw_info *out
     }
     out->logical_block_size = bdev_logical_block_size(bdev);
 
+    if (bdev_is_partition(bdev))
+        pr_warn("CAW: %pg is a partition -- COMPARE AND WRITE would address the whole disk; treating as no "
+                "atomic CAW (one mounter only). Use the whole LUN for a shared volume.\n",
+                bdev);
     sdev = cetrafs_caw_get_sdev(bdev);
     if (!sdev)
         sdev = cetrafs_dmpath_sdev(bdev); /* dm (multipath): probe via a path -- see dmpath.c */

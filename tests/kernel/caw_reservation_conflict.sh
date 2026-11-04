@@ -33,6 +33,10 @@ CF=/sys/kernel/config/target
 # The target itself WARNs when it fails a COMPARE AND WRITE this way
 # (target_core_sbc.c, compare_and_write_callback): its code, not ours.
 CT_DMESG_IGNORE_WARN='WARNING: drivers/target/target_core_sbc.c:[0-9]+ at compare_and_write_callback'
+# The fabric registers when its directory is made; until something does,
+# it is absent. Testing for it alone made this suite skip on every box
+# where nothing else had created it.
+mkdir -p "$CF/loopback" 2>/dev/null || true
 [ -d "$CF/loopback" ] || { skip "configfs target/loopback is missing"; ct_exit; }
 
 IMG="$(ct_image 560 cawrc)"

@@ -486,7 +486,9 @@ struct scsi_device *cetrafs_dmpath_sdev(struct block_device *bdev)
     bool resolved, waited = false;
     unsigned int i;
 
-    if (!bdev || !bdev->bd_disk)
+    /* A partition addresses from bd_start_sect; every path below
+     * addresses from 0 (see cetrafs_caw_get_sdev()). */
+    if (!bdev || !bdev->bd_disk || bdev_is_partition(bdev))
         return NULL;
 
 retry:
