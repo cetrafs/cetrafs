@@ -1745,6 +1745,10 @@ const struct inode_operations cetrafs_symlink_iops = {
     .get_link = cetrafs_get_link,
     .setattr = cetrafs_setattr,
     .getattr = cetrafs_getattr,
+    /* A link carries xattrs too (trusted.*, security.*). Without this the
+     * VFS lists only the security module's, and cp -a / rsync -X, which
+     * list before they copy, dropped the rest. */
+    .listxattr = cetrafs_listxattr,
 };
 
 /* TEST ONLY: stall a refresh between its "no local changes" verdict and
