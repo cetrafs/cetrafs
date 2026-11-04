@@ -115,8 +115,23 @@ static int cetrafs_sync_fs(struct super_block *sb, int wait)
     {
         int bret = cetrafs_alloc_flush_bitmaps(sb);
         int cret = cetrafs_flush_dirty_free_counts(sb);
+        int ret = bret ? bret : cret;
 
-        return bret ? bret : cret;
+        /* sync(2), syncfs(2) and unmount promise the data is durable,
+         * and a deployment LUN's write cache may well be volatile: a
+         * write that completed is not one that survives power loss. The
+         * VFS writes the block device out only AFTER this call, so do it
+         * here, then flush the cache. fsync already did this per file;
+         * nothing did it for the filesystem. On a device without a
+         * volatile cache the block layer makes the flush a no-op. */
+        if (wait && sb->s_bdev) {
+            int sret = sync_blockdev(sb->s_bdev);
+            int fret = blkdev_issue_flush(sb->s_bdev);
+
+            if (!ret)
+                ret = sret ? sret : fret;
+        }
+        return ret;
     }
 }
 

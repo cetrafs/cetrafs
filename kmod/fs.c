@@ -2439,6 +2439,13 @@ void cetrafs_free_sb_info(struct super_block *sb)
         r = sync_blockdev(sb->s_bdev);
         if (r && !flush_err)
             flush_err = r;
+        /* ...and out of the device's write cache: "on the device" for a
+         * peer means durable, and a volatile cache keeps what a power cut
+         * loses. sync_fs flushed already; this covers what put_super
+         * itself wrote since (the journal park, the free counts). */
+        r = blkdev_issue_flush(sb->s_bdev);
+        if (r && !flush_err)
+            flush_err = r;
     }
     /* Signal this node's deliberate departure on the way out -- clean
      * unmount (or a later-failing mount attempt after registration
