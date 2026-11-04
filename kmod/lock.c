@@ -3140,6 +3140,136 @@ void cetrafs_lock_retry_presence(struct super_block *sb)
     }
 }
 
+struct cetrafs_own_claims_ctx {
+    u32 me;
+    u64 generation;
+};
+
+/* Clear every claim 'me' holds in one record: the file lock, the
+ * presence and suspended-writer bits, the namespace lock (which also
+ * carries a create's birth claim and a scrub's reclaim claim). */
+static int cetrafs_own_claims_mutate(void *image, unsigned int len, void *priv)
+{
+    struct cetrafs_own_claims_ctx *ctx = priv;
+    u64 bit = 1ULL << (ctx->me % CETRAFS_MAX_READER_NODES);
+    cetrafs_inode_t rec;
+    bool changed = false;
+
+    if (len < CETRAFS_INODE_NS_BYTES)
+        return -EINVAL;
+    memset(&rec, 0, sizeof(rec));
+    memcpy(&rec, image, CETRAFS_INODE_NS_BYTES);
+    if (cetrafs_le64(rec.generation) != ctx->generation)
+        return -ESTALE;
+    if (cetrafs_le32(rec.lock_owner_node) == ctx->me && cetrafs_le32(rec.lock_mode) != CETRAFS_LOCK_NONE) {
+        rec.lock_owner_node = cetrafs_cpu_to_le32(CETRAFS_NODE_ID_NONE);
+        rec.lock_mode = cetrafs_cpu_to_le32(CETRAFS_LOCK_NONE);
+        changed = true;
+    }
+    if (cetrafs_le64(rec.read_open_nodes) & bit) {
+        rec.read_open_nodes = cetrafs_cpu_to_le64(cetrafs_le64(rec.read_open_nodes) & ~bit);
+        changed = true;
+    }
+    if (cetrafs_le64(rec.suspended_writer_nodes) & bit) {
+        rec.suspended_writer_nodes = cetrafs_cpu_to_le64(cetrafs_le64(rec.suspended_writer_nodes) & ~bit);
+        changed = true;
+    }
+    if (cetrafs_le32(rec.ns_lock_owner) == ctx->me) {
+        rec.ns_lock_owner = cetrafs_cpu_to_le32(CETRAFS_NODE_ID_NONE);
+        cetrafs_ns_stamp_advance(&rec); /* as a peer's steal of a dead holder's lock does */
+        changed = true;
+    }
+    if (!changed)
+        return 1;
+    cetrafs_inode_stamp_crc_ns(&rec);
+    memcpy(image, &rec, CETRAFS_INODE_NS_BYTES);
+    return 0;
+}
+
+/*
+ * A mount that re-attached a row its previous incarnation left without
+ * unmounting (a crash, a power cut, a fence) must give back every claim
+ * that incarnation stamped with the row: file locks, presence and
+ * suspended-writer bits, namespace locks. Peers reclaim a DEAD node's
+ * claims lazily, when they meet them, by finding its row stale; a node
+ * that comes back inside the stale window makes the row beat again and
+ * every claim not yet met reads as live -- held by a node with no memory
+ * of it. HA starting the VM elsewhere then got ETXTBSY until this node
+ * happened to open and close that file.
+ *
+ * Runs once at mount, after this node's own journal replay (which
+ * repairs what the namespace locks protected) and before anything here
+ * can open a file, so every such claim is stale by construction. One
+ * record read per allocated inode; paid only after an unclean departure.
+ * A record the device will not return fails the mount: running on with
+ * a claim nobody can account for is the state this exists to prevent. A
+ * damaged one is counted and skipped, as everywhere else.
+ */
+int cetrafs_lock_sweep_own_claims(struct super_block *sb, u32 my_node_id)
+{
+    const cetrafs_superblock_t *raw_sb = cetrafs_sb_raw(sb);
+    u64 bmap, nbmap, ninodes, blk, seen = 0, cleared = 0;
+    u64 bit = 1ULL << (my_node_id % CETRAFS_MAX_READER_NODES);
+    int ret = 0;
+
+    if (!raw_sb)
+        return -EINVAL;
+    bmap = le64_to_cpu(raw_sb->inode_bmap_start);
+    nbmap = le64_to_cpu(raw_sb->inode_bmap_blocks);
+    ninodes = le32_to_cpu(raw_sb->inodes_count);
+
+    for (blk = 0; blk < nbmap && !ret; blk++) {
+        struct buffer_head *bh = cetrafs_bread_retry(sb, bmap + blk);
+        u64 i;
+
+        if (!bh)
+            return -EIO;
+        for (i = 0; i < CETRAFS_BLOCK_SIZE * 8; i++) {
+            u64 ino = blk * CETRAFS_BLOCK_SIZE * 8 + i + 1;
+            cetrafs_inode_t raw;
+            struct cetrafs_own_claims_ctx ctx = {.me = my_node_id};
+
+            if (ino > ninodes)
+                break;
+            if (!(i & 1023))
+                cond_resched();
+            if (!(bh->b_data[i >> 3] & (1 << (i & 7))))
+                continue;
+            seen++;
+            ret = cetrafs_read_raw_inode(sb, ino, &raw);
+            if (ret == -EUCLEAN) {
+                /* Damaged (kind 2): counted and left to fsck, like any
+                 * other read of it; it cannot carry a claim we could
+                 * clear anyway. */
+                cetrafs_sb_corrupt(sb, ino);
+                ret = 0;
+                continue;
+            }
+            if (ret)
+                break;
+            if (!(cetrafs_le32(raw.lock_owner_node) == my_node_id && cetrafs_le32(raw.lock_mode) != CETRAFS_LOCK_NONE) &&
+                !(cetrafs_le64(raw.read_open_nodes) & bit) && !(cetrafs_le64(raw.suspended_writer_nodes) & bit) &&
+                cetrafs_le32(raw.ns_lock_owner) != my_node_id)
+                continue;
+            ctx.generation = cetrafs_le64(raw.generation);
+            ret = cetrafs_cas_record(sb, cetrafs_inode_lba(sb, ino), cetrafs_own_claims_mutate, &ctx);
+            if (ret == -ESTALE)
+                ret = 0; /* reborn meanwhile: a peer's now, not ours */
+            else if (!ret)
+                cleared++;
+            if (ret) {
+                pr_err("mount: ino=%llu still carries this node's claims and they could not be cleared: %d\n",
+                       (unsigned long long) ino, ret);
+                break;
+            }
+        }
+        brelse(bh);
+    }
+    pr_info("mount: re-attached after an unclean departure -- cleared the claims of %llu of %llu inode(s)\n",
+            (unsigned long long) cleared, (unsigned long long) seen);
+    return ret;
+}
+
 /*
  * flock(fd, LOCK_UN) on a default mount: give this inode's automatic lock
  * back while keeping it open.

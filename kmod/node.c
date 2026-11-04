@@ -683,6 +683,13 @@ int cetrafs_node_register(struct super_block *sb,
                 return ret;
 
             pr_info("node registration: re-attached row %u (hb_seq=%llu)\n", idx, (unsigned long long) ctx.hb_seq);
+            /* Left without unmounting: every claim the previous
+             * incarnation stamped with this row is still on the device,
+             * and re-attaching makes them read as LIVE again -- nobody
+             * reclaims from a node that beats. The mount sweeps them
+             * (cetrafs_lock_sweep_own_claims()). */
+            if (ne.last_seen != 0)
+                cetrafs_sb_note_unclean_reattach(sb);
             /* Baseline the fence lease at the epoch in the image the swap
              * COMMITTED -- including epochs bumped while we were away (a
              * previous incarnation being fenced must not fence this fresh

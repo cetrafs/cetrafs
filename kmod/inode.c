@@ -575,7 +575,7 @@ static void cetrafs_ns_apply_zero_nlink(cetrafs_inode_t *rec, void *arg)
  * no birth claim: no reclaim judges a record that fails its checksum.
  * tests/kernel/scrub_vs_birth.sh.
  */
-static void cetrafs_ns_stamp_advance(cetrafs_inode_t *rec)
+void cetrafs_ns_stamp_advance(cetrafs_inode_t *rec)
 {
     rec->dirent_seq = cetrafs_cpu_to_le64(cetrafs_le64(rec->dirent_seq) + 1);
 }

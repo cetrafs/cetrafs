@@ -223,6 +223,9 @@ struct cetrafs_sb_info {
      * peer has reclaimed this node's files it may be writing them, and
      * our cache of them is no longer a copy of anything. */
     bool fenced;
+    /* Registration re-attached a row its previous incarnation left
+     * without unmounting (cetrafs_lock_sweep_own_claims()). */
+    bool reattached_unclean;
     int stop_cause; /* enum cetrafs_stop_cause, set once just before 'fenced' */
     /* The stop's sweep of dirty metadata. Deferred: cetrafs_sb_stop() is
      * called from inside failing operations that hold buffer and folio
@@ -1906,6 +1909,17 @@ int cetrafs_fill_super(struct super_block *sb, struct fs_context *fc)
             } else {
                 pr_info("read-only mount: not replaying this node's journal\n");
             }
+            /* After the replay, which repairs what those claims were
+             * protecting, and before anything here can open a file. */
+            if (!sb_rdonly(sb) && cetrafs_sb_unclean_reattach(sb)) {
+                rc = cetrafs_lock_sweep_own_claims(sb, sbi->node_id);
+                if (rc) {
+                    pr_err("could not clear the claims this node held before it went down: %d\n", rc);
+                    cetrafs_free_sb_info(sb);
+                    brelse(bh);
+                    return rc;
+                }
+            }
             CETRAFS_MOUNT_FAIL_POINT(3);
 
             /* Our own journal was
@@ -3099,6 +3113,21 @@ void cetrafs_sb_lease_renewed(struct super_block *sb, unsigned long t0, unsigned
     WRITE_ONCE(sbi->lease_until, t0 + (unsigned long) interval_secs * 3 * HZ);
     smp_wmb(); /* the deadline before the flag that makes it count */
     WRITE_ONCE(sbi->lease_active, true);
+}
+
+void cetrafs_sb_note_unclean_reattach(struct super_block *sb)
+{
+    struct cetrafs_sb_info *sbi = sb->s_fs_info;
+
+    if (sbi)
+        sbi->reattached_unclean = true;
+}
+
+bool cetrafs_sb_unclean_reattach(struct super_block *sb)
+{
+    struct cetrafs_sb_info *sbi = sb->s_fs_info;
+
+    return sbi && sbi->reattached_unclean;
 }
 
 bool cetrafs_sb_is_fenced(struct super_block *sb)

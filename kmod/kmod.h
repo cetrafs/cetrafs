@@ -271,6 +271,12 @@ void cetrafs_sb_alloc_lock(struct super_block *sb);
 void cetrafs_sb_alloc_unlock(struct super_block *sb);
 bool cetrafs_sb_in_reclaim_lock(struct super_block *sb);
 u64 cetrafs_sb_stamp_ns(struct super_block *sb);
+void cetrafs_sb_note_unclean_reattach(struct super_block *sb);
+bool cetrafs_sb_unclean_reattach(struct super_block *sb);
+/* inode.c: advance a record's namespace stamp (dirent_seq) */
+void cetrafs_ns_stamp_advance(cetrafs_inode_t *rec);
+/* lock.c: clear every claim a previous incarnation of this node left */
+int cetrafs_lock_sweep_own_claims(struct super_block *sb, u32 my_node_id);
 /* Live speculative-run registry: lock.c publishes, scrub.c reads. A
  * reserved run is bitmap-set and referenced by no extent, which is
  * exactly what the scrub frees -- see cetrafs_sb_info.resv_list.
