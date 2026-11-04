@@ -3198,6 +3198,11 @@ int cetrafs_lock_write_gate(struct inode *inode)
     return READ_ONCE(CETRAFS_I(inode)->lock_suspended) ? -ETXTBSY : 0;
 }
 
+/* TEST ONLY: pause a resume just before it reconciles the cache. */
+static unsigned int cetrafs_lock_resume_stall_ms;
+module_param_named(lock_resume_stall_ms, cetrafs_lock_resume_stall_ms, uint, 0644);
+MODULE_PARM_DESC(lock_resume_stall_ms, "TEST ONLY: pause flock(LOCK_EX)'s resume before its cache reconcile");
+
 /*
  * flock(fd, LOCK_EX) on a default mount: take the automatic lock back.
  *
@@ -3268,6 +3273,68 @@ static int cetrafs_lock_resume(struct inode *inode)
         ret = 0;
     }
 
+    /*
+     * A peer may have rewritten this file while we were out, and once the
+     * lock is ours again both cache predicates go back to saying "trust
+     * the cache" -- so the reconcile has to happen HERE, not lazily. Same
+     * work the open path does for an arriving handoff: re-read the record
+     * fresh, drop the cached extent tree built from the old one, and drop
+     * clean data pages that may now name the wrong physical blocks.
+     *
+     * And BEFORE the write gate reopens (lock_suspended below). It used
+     * to run after, under lock_mutex alone, which no write path takes: a
+     * local writer retrying its -ETXTBSY passed the gate in between,
+     * found the lock held locally, trusted its cache, and wrote through
+     * the pre-handoff tree and i_size -- over the peer's data
+     * (tests/kernel/lock_resume_reconcile.sh). While still suspended
+     * every local write path is refused, so nothing writes under us.
+     *
+     * A record that cannot be re-read reconciles nothing, so the resume
+     * fails and gives the lock back: the file stays suspended, every
+     * signal on the device as it was. It used to return 0 holding the
+     * old tree.
+     *
+     * 'raw' is reused rather than declaring a second cetrafs_inode_t --
+     * see the open path's note about CONFIG_FRAME_WARN=1024.
+     */
+    if (cetrafs_lock_resume_stall_ms)
+        msleep(cetrafs_lock_resume_stall_ms); /* TEST ONLY */
+    if (!cetrafs_lock_suspend_trust_cache) {
+        cetrafs_invalidate_raw_inode(sb, inode->i_ino);
+        ret = cetrafs_read_raw_inode(sb, inode->i_ino, &raw);
+        if (ret) {
+            pr_err("lock: ino=%llu resume could not re-read the record (%d) -- giving the lock back\n",
+                   (unsigned long long) inode->i_ino, ret);
+            (void) cetrafs_lock_clear_on_disk(inode, /*stamp_stat=*/false);
+            goto out;
+        }
+        cetrafs_tree_invalidate_cached(inode, &raw);
+
+        /* Whose publish is this record carrying? Ask file_seq, which
+         * names the node that stamped it -- NOT mtime.
+         *
+         * mtime has one-second granularity, and a handoff completes
+         * well inside one second on real hardware: the peer's write
+         * then carries the SAME mtime as our pre-window state, a
+         * strictly-newer test is false, and we resume holding a
+         * stale i_size -- the peer's data beyond it reads as a hole.
+         * That is not hypothetical. It passed on slow hardware and
+         * failed on a three-node run, which is the only reason it
+         * was caught before release.
+         *
+         * If we ourselves wrote during the window the last stamp is
+         * ours, so this correctly keeps our newer state; and
+         * cetrafs_apply_raw_to_vfs_inode() refuses unpublished local
+         * state anyway, so unflushed local work is never clobbered. */
+        if (CETRAFS_FILE_SEQ_NODE(cetrafs_le64(raw.file_seq)) != (u32) (my_node_id & 0xFFFFu))
+            (void) cetrafs_apply_raw_to_vfs_inode(inode, &raw);
+        ci->file_seq_cached = U64_MAX;
+        ci->foreign_open_cached = true;
+        ci->foreign_open_valid = false;
+        if (inode->i_mapping)
+            invalidate_mapping_pages(inode->i_mapping, 0, -1);
+    }
+
     /* Lock first, presence second -- the mirror of suspend, and for the
      * same reason: never a moment with neither signal on the device. The
      * writer mark goes explicitly: presence_put clears it only with the
@@ -3277,48 +3344,6 @@ static int cetrafs_lock_resume(struct inode *inode)
         cetrafs_lock_presence_put(inode);
     }
     ci->lock_suspended = false;
-
-    /*
-     * A peer may have rewritten this file while we were out, and once the
-     * lock is ours again both cache predicates go back to saying "trust
-     * the cache" -- so the reconcile has to happen HERE, not lazily. Same
-     * work the open path does for an arriving handoff: re-read the record
-     * fresh, drop the cached extent tree built from the old one, and drop
-     * clean data pages that may now name the wrong physical blocks.
-     *
-     * 'raw' is reused rather than declaring a second cetrafs_inode_t --
-     * see the open path's note about CONFIG_FRAME_WARN=1024.
-     */
-    if (!cetrafs_lock_suspend_trust_cache) {
-        cetrafs_invalidate_raw_inode(sb, inode->i_ino);
-        if (cetrafs_read_raw_inode(sb, inode->i_ino, &raw) == 0) {
-            cetrafs_tree_invalidate_cached(inode, &raw);
-
-            /* Whose publish is this record carrying? Ask file_seq, which
-             * names the node that stamped it -- NOT mtime.
-             *
-             * mtime has one-second granularity, and a handoff completes
-             * well inside one second on real hardware: the peer's write
-             * then carries the SAME mtime as our pre-window state, a
-             * strictly-newer test is false, and we resume holding a
-             * stale i_size -- the peer's data beyond it reads as a hole.
-             * That is not hypothetical. It passed on slow hardware and
-             * failed on a three-node run, which is the only reason it
-             * was caught before release.
-             *
-             * If we ourselves wrote during the window the last stamp is
-             * ours, so this correctly keeps our newer state; and
-             * cetrafs_apply_raw_to_vfs_inode() refuses a dirty inode
-             * anyway, so unflushed local work is never clobbered. */
-            if (CETRAFS_FILE_SEQ_NODE(cetrafs_le64(raw.file_seq)) != (u32) (my_node_id & 0xFFFFu))
-                (void) cetrafs_apply_raw_to_vfs_inode(inode, &raw);
-        }
-        ci->file_seq_cached = U64_MAX;
-        ci->foreign_open_cached = true;
-        ci->foreign_open_valid = false;
-        if (inode->i_mapping)
-            invalidate_mapping_pages(inode->i_mapping, 0, -1);
-    }
 
     atomic64_inc(&cetrafs_lock_resumes);
 out:
