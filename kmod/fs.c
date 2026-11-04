@@ -1584,6 +1584,8 @@ int cetrafs_fill_super(struct super_block *sb, struct fs_context *fc)
                     if (seg_lba >= le64_to_cpu(ondisk->total_blocks)) {
                         pr_err("BG table chain links to block %llu, past the end of the device (%llu)\n",
                                (unsigned long long) seg_lba, (unsigned long long) le64_to_cpu(ondisk->total_blocks));
+                        if (filled == nbg) /* what a grow that died before its publish leaves */
+                            pr_err("a grow was interrupted before it published -- re-run growfs.cetra\n");
                         kfree(segs);
                         cetrafs_free_sb_info(sb);
                         brelse(bh);
@@ -1655,6 +1657,8 @@ int cetrafs_fill_super(struct super_block *sb, struct fs_context *fc)
                     if (cnt > nbg - filled) {
                         pr_err("BG table segment at %llu claims %u descriptors; only %u are left of %u\n",
                                (unsigned long long) seg_lba, cnt, nbg - filled, nbg);
+                        if (filled == nbg) /* what a grow that died before its publish leaves */
+                            pr_err("a grow was interrupted before it published -- re-run growfs.cetra\n");
                         brelse(sbh);
                         kfree(segs);
                         cetrafs_free_sb_info(sb);

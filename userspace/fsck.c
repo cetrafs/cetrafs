@@ -1520,6 +1520,8 @@ int main(int argc, char **argv)
             if (seg_lba >= total_blocks) {
                 fprintf(stderr, "ERR: Block Group table segment at %" PRIu64 " is past the end of the volume\n",
                         seg_lba);
+                if (filled == nbg)
+                    fprintf(stderr, "ERR: (a grow was interrupted before it published -- re-run growfs.cetra)\n");
                 return 1;
             }
             pread_all(fd, &seg, sizeof(seg), (off_t) seg_lba * CETRAFS_BLOCK_SIZE);
@@ -1546,6 +1548,10 @@ int main(int argc, char **argv)
             if (filled > nbg) {
                 fprintf(stderr, "ERR: Block Group table chain describes %u Block Groups, more than the %u recorded\n",
                         filled, nbg);
+                /* A whole segment past the count is what a second grow
+                 * that died before its publish leaves: say so. */
+                if (cetrafs_le32(seg.first_bg_id) == nbg)
+                    fprintf(stderr, "ERR: (a grow was interrupted before it published -- re-run growfs.cetra)\n");
                 return 1;
             }
             seg_lba = cetrafs_le64(seg.next);

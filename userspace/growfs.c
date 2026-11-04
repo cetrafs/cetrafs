@@ -912,9 +912,14 @@ int main(int argc, char **argv)
      * STEP 3: publish.
      *
      * One superblock write, and the volume is the new size. Every
-     * structure it names was fsync'd above, so a crash before this point
-     * leaves the OLD filesystem intact and fully consistent -- the new
-     * BGs and tables are simply unreferenced bytes past the end.
+     * structure it names was fsync'd above. On a FIRST grow a crash
+     * before this point leaves the old filesystem intact -- the new BGs
+     * and tables are unreferenced bytes past the end. On a second or
+     * later grow it does not quite: the old tail's link below is
+     * written first, and the chain then describes more Block Groups
+     * than the old superblock counts, which mount and fsck refuse.
+     * Nothing is lost and nothing is shared; re-running growfs finishes
+     * the grow (the tail walk replaces that link).
      *
      * A plain write is sufficient ONLY because of the offline premise
      * enforced at the top of this function: no node is mounted, so there
@@ -939,23 +944,41 @@ int main(int argc, char **argv)
         /*
          * Second and later grows link from the TAIL segment, not from
          * here -- one compare-and-swap on one record, which is what the
-         * live path will do. Walk to the tail, bounded: a chain that
-         * does not terminate is corruption, and looping forever while
-         * holding a volume open is a worse answer than refusing.
+         * live path will do.
+         *
+         * The tail is the segment the SUPERBLOCK's count ends in, found
+         * by counting descriptors, never "the one whose next is 0". This
+         * link reaches the device before the publish below, so a grow
+         * that died in between left the tail pointing at a segment the
+         * old superblock does not count -- and a retry, which computes
+         * the same segment address, rewrote that segment with next=0,
+         * walked to it as the tail and linked it to ITSELF. Counting
+         * stops at the real tail and overwrites the stale link instead.
+         * Bounded: a chain that does not reach old_b is corruption, and
+         * looping while holding a volume open is worse than refusing.
          */
         u64 cur = cetrafs_le64(sb.bg_table_next);
+        u64 filled = cetrafs_le64(sb.bg_table_first_count);
         unsigned guard = 0;
 
+        if (!filled || filled > old_b)
+            die("%s: bg_table_first_count %" PRIu64 " does not fit %" PRIu64 " Block Groups", dev, filled, old_b);
         for (;;) {
             cetrafs_bg_segment_t seg;
 
-            if (++guard > new_b + 2)
-                die("%s: the Block Group table chain does not terminate", dev);
+            if (!cur || ++guard > old_b + 2)
+                die("%s: the Block Group table chain does not reach Block Group %" PRIu64, dev, old_b);
             read_block(fd, cur, blk);
             memcpy(&seg, blk, sizeof(seg));
             if (cetrafs_le32(seg.magic) != CETRAFS_BGSEG_MAGIC)
                 die("%s: Block Group table segment at %" PRIu64 " has no magic", dev, cur);
-            if (cetrafs_le64(seg.next) == 0) {
+            if (cetrafs_le32(seg.first_bg_id) != filled || cetrafs_le32(seg.count) > old_b - filled)
+                die("%s: Block Group table segment at %" PRIu64 " does not continue the chain", dev, cur);
+            filled += cetrafs_le32(seg.count);
+            if (filled == old_b) {
+                if (cetrafs_le64(seg.next) != 0)
+                    fprintf(stderr, "growfs.cetra: replacing the link an interrupted grow left at block %" PRIu64 "\n",
+                            cur);
                 seg.next = cetrafs_cpu_to_le64(seg_header_lba);
                 seg.checksum = 0;
                 seg.checksum = cetrafs_cpu_to_le64((u64) crc32c_struct(&seg, sizeof(seg),
