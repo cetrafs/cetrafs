@@ -4729,11 +4729,16 @@ MODULE_PARM_DESC(fallocate_block_delay_us, "TEST ONLY: microseconds to spend per
 static int cetrafs_do_allocate(struct inode *inode, loff_t offset, loff_t len, bool keep_size)
 {
     struct super_block *sb = inode->i_sb;
-    cetrafs_inode_t raw;
+    cetrafs_inode_t *recs; /* [0]=raw, [1]=old_raw -- off the stack */
+#define raw (recs[0])
+#define old_raw (recs[1])
     u64 b, start_block, end_block, hint = 0;
-    u64 added = 0;
+    u64 added = 0, meta_blocks = 0, plan_seq;
     loff_t end = offset + len;
-    int ret;
+    cetrafs_extent_t *add = NULL, *flat = NULL;
+    u32 add_n = 0, add_cap = 0, flat_n = 0;
+    bool built = false;
+    int ret, loop_ret = 0;
 
     start_block = (u64) offset / CETRAFS_BLOCK_SIZE;
     end_block = CETRAFS_DIV_ROUND_UP((u64) end, CETRAFS_BLOCK_SIZE);
@@ -4753,22 +4758,39 @@ static int cetrafs_do_allocate(struct inode *inode, loff_t offset, loff_t len, b
             return ret;
     }
 
-    /* The record this whole call appends to and then publishes: fresh
-     * unless the cache is provably this node's, the gate get_block()
-     * and truncate apply (CLAUDE.md rule 1). */
+    /*
+     * The record this call plans from: fresh unless the cache is
+     * provably this node's, the gate get_block() and truncate apply
+     * (CLAUDE.md rule 1). Its file_seq is the plan's stamp.
+     *
+     * Built into a COPY, as truncate and punch are: the new extents go
+     * into a flat array, a fresh tree is built from old + new, and it
+     * is published only if no other node has stamped the file since the
+     * read -- otherwise every block this call allocated is freed and it
+     * fails ETXTBSY, with the old tree untouched. Appending in place
+     * edited live leaves through a loop measured at 11 s, so a peer
+     * that opened the file in that window (nofilelock) had its extents
+     * published over, with nothing left to refuse at the publish.
+     */
+    recs = kmalloc(2 * sizeof(*recs), GFP_NOFS);
+    if (!recs)
+        return -ENOMEM;
     if (!cetrafs_lock_held_for_write_locally(inode))
         cetrafs_invalidate_raw_inode(sb, inode->i_ino);
     ret = cetrafs_read_raw_inode_overlaid(sb, inode, &raw); /* torn-read-safe vs a concurrent publish */
     if (ret)
-        return ret;
-    if (cetrafs_le16(raw.eh.eh_magic) != CETRAFS_EXT_MAGIC)
-        return -EIO;
+        goto out_free;
+    if (cetrafs_le16(raw.eh.eh_magic) != CETRAFS_EXT_MAGIC) {
+        ret = -EIO;
+        goto out_free;
+    }
+    plan_seq = cetrafs_le64(raw.file_seq);
+    old_raw = raw; /* its eh/et name the OLD tree, freed after the publish */
 
     for (b = start_block; b < end_block; b++) {
         bool found = false, un = false;
         u32 bg_id;
         u64 lba;
-        bool merged;
 
         /*
          * One block per iteration, up to CETRAFS_MAX_FILE_BLOCKS of
@@ -4779,61 +4801,141 @@ static int cetrafs_do_allocate(struct inode *inode, loff_t offset, loff_t len, b
          * the inode.
          *
          * Stopping early leaves the range PARTIALLY preallocated,
-         * which is allowed and is what the other filesystems do: the
-         * blocks already added are real, recorded and freeable. Losing
-         * them silently would be the worse answer.
+         * which is allowed and is what the other filesystems do: what
+         * was allocated so far is still built and published below.
          */
         if (fatal_signal_pending(current)) {
-            ret = -EINTR;
-            goto out;
+            loop_ret = -EINTR;
+            break;
         }
         cond_resched();
         if (cetrafs_fallocate_block_delay_us)
             usleep_range(cetrafs_fallocate_block_delay_us, cetrafs_fallocate_block_delay_us * 2);
-        u32 leaf_count;
 
-        ret = cetrafs_tree_lookup(inode, &raw, (u32) b, &lba, NULL, &un, &found, false);
-        if (ret)
-            goto out;
+        /* Looked up in the OLD tree, which nothing here changes. */
+        loop_ret = cetrafs_tree_lookup(inode, &raw, (u32) b, &lba, NULL, &un, &found, false);
+        if (loop_ret)
+            break;
         if (found)
             continue; /* already backed (written or preallocated) */
 
         if (!hint)
             hint = cetrafs_tree_last_contig_lba(inode, &raw);
 
-        ret = cetrafs_alloc_pick_bg(sb, &bg_id);
-        if (ret)
-            goto out;
-        ret = cetrafs_alloc_data_block_near(sb, bg_id, hint, &lba);
-        if (ret == -ENOSPC || ret == -EAGAIN) /* count lying, or group released since the pick -- see the helper */
-            ret = cetrafs_alloc_block_anywhere(sb, &bg_id, &lba);
-        if (ret)
-            goto out;
+        loop_ret = cetrafs_alloc_pick_bg(sb, &bg_id);
+        if (loop_ret)
+            break;
+        loop_ret = cetrafs_alloc_data_block_near(sb, bg_id, hint, &lba);
+        if (loop_ret == -ENOSPC || loop_ret == -EAGAIN) /* count lying, or group released since the pick -- see the helper */
+            loop_ret = cetrafs_alloc_block_anywhere(sb, &bg_id, &lba);
+        if (loop_ret)
+            break;
 
-        ret = cetrafs_tree_append(inode, &raw, (u32) b, lba, 1, /*uninit=*/true, &merged, &leaf_count);
-        if (ret) {
-            cetrafs_free_data_block(sb, lba);
-            goto out;
+        /* Extend the last new extent when both runs continue, else
+         * start one. */
+        if (add_n && cetrafs_le32(add[add_n - 1].ee_block) + cetrafs_extent_len(add[add_n - 1].ee_len) == b &&
+            cetrafs_extent_phys_from_hilo(add[add_n - 1].ee_start_hi, add[add_n - 1].ee_start_lo) +
+                    cetrafs_extent_len(add[add_n - 1].ee_len) ==
+                lba &&
+            cetrafs_extent_len(add[add_n - 1].ee_len) < CETRAFS_EXT_LEN_MASK) {
+            add[add_n - 1].ee_len = cetrafs_extent_pack_len(cetrafs_extent_len(add[add_n - 1].ee_len) + 1, 1);
+        } else {
+            if (add_n == add_cap) {
+                u32 ncap = add_cap ? add_cap * 2 : 16;
+                cetrafs_extent_t *na = kvmalloc_array(ncap, sizeof(*na), GFP_NOFS);
+
+                if (!na) {
+                    cetrafs_free_data_block(sb, lba);
+                    loop_ret = -ENOMEM;
+                    break;
+                }
+                if (add_n)
+                    memcpy(na, add, (size_t) add_n * sizeof(*na));
+                kvfree(add);
+                add = na;
+                add_cap = ncap;
+            }
+            memset(&add[add_n], 0, sizeof(add[add_n]));
+            add[add_n].ee_block = cetrafs_cpu_to_le32((u32) b);
+            add[add_n].ee_len = cetrafs_extent_pack_len(1, 1);
+            cetrafs_extent_phys_to_hilo(lba, &add[add_n].ee_start_hi, &add[add_n].ee_start_lo);
+            add_n++;
         }
-        raw.blocks = cetrafs_cpu_to_le64(cetrafs_le64(raw.blocks) + (CETRAFS_BLOCK_SIZE / 512));
         hint = lba + 1; /* keep the run contiguous so it stays ONE extent */
         added++;
+    }
+
+    /* Nothing allocated and nothing to grow: nothing to publish. */
+    if (!added && (keep_size || end <= i_size_read(inode))) {
+        ret = loop_ret;
+        goto out_free;
+    }
+
+    if (added) {
+        struct cetrafs_inode_extents ex;
+        u32 old_n;
+
+        ret = cetrafs_inode_extents_get(inode, &raw, &ex);
+        if (ret)
+            goto out_free_added;
+        old_n = ex.entries;
+        if ((u64) old_n + add_n > U32_MAX) {
+            cetrafs_inode_extents_put(&ex);
+            ret = -EFBIG;
+            goto out_free_added;
+        }
+        flat = kvmalloc_array((size_t) old_n + add_n, sizeof(*flat), GFP_NOFS);
+        if (!flat) {
+            cetrafs_inode_extents_put(&ex);
+            ret = -ENOMEM;
+            goto out_free_added;
+        }
+        if (old_n)
+            memcpy(flat, ex.arr, (size_t) old_n * sizeof(*flat));
+        cetrafs_inode_extents_put(&ex);
+        memcpy(flat + old_n, add, (size_t) add_n * sizeof(*flat));
+        flat_n = old_n + add_n;
+
+        /* The fresh tree; the old one stays intact until the publish. */
+        ret = cetrafs_tree_build(inode, flat, flat_n, &raw, &meta_blocks);
+        if (ret)
+            goto out_free_added;
+        built = true;
+        raw.blocks = cetrafs_cpu_to_le64((cetrafs_flat_data_blocks(flat, flat_n) + meta_blocks) *
+                                         (CETRAFS_BLOCK_SIZE / 512));
     }
 
     if (!keep_size && end > i_size_read(inode))
         raw.size = cetrafs_cpu_to_le64((u64) end);
 
-    cetrafs_inode_fd_pub_lock(inode);
-    {
-        u64 fd_seq = cetrafs_inode_fd_seq(inode);
+    ret = cetrafs_rebuild_recheck(inode, "fallocate");
+    if (!ret) {
+        u64 fd_seq;
 
-        ret = cetrafs_write_raw_inode_fd(sb, inode->i_ino, &raw, inode);
+        cetrafs_inode_fd_pub_lock(inode);
+        fd_seq = cetrafs_inode_fd_seq(inode);
+        ret = cetrafs_write_raw_inode_fd_planned(sb, inode->i_ino, &raw, inode, plan_seq);
         if (!ret)
             cetrafs_inode_fd_published(inode, fd_seq); /* this publish supersedes the overlaid shadow */
+        cetrafs_inode_fd_pub_unlock(inode);
     }
-    cetrafs_inode_fd_pub_unlock(inode);
-    if (ret)
-        goto out;
+    if (ret) {
+        if (built)
+            cetrafs_tree_free_meta(inode, &raw);
+        goto out_free_added;
+    }
+
+    /* Published: the old tree's meta goes back -- unless a peer arrived
+     * after the last check, as in truncate and punch, when what it may
+     * still name is left for the scrub. */
+    if (built) {
+        if (cetrafs_rebuild_peer_present(inode))
+            pr_warn("fallocate: ino=%llu was opened on another node during the publish -- leaving the old "
+                    "map's blocks allocated for the scrub\n",
+                    (unsigned long long) inode->i_ino);
+        else
+            cetrafs_tree_free_meta(inode, &old_raw);
+    }
 
     inode->i_blocks = cetrafs_le64(raw.blocks);
     if (!keep_size && end > i_size_read(inode))
@@ -4841,22 +4943,30 @@ static int cetrafs_do_allocate(struct inode *inode, loff_t offset, loff_t len, b
     inode_set_ctime(inode, ktime_get_real_seconds(), 0);
     inode_set_mtime_to_ts(inode, inode_get_ctime(inode));
     mark_inode_dirty(inode);
-    return 0;
+    ret = loop_ret; /* a stop part-way (signal, ENOSPC) still reports why */
+    goto out_free;
 
-out:
-    /* Partial progress stays: the blocks added so far are real, on the
-     * bitmap and referenced by the record we publish here. Leaving them
-     * unpublished would leak every one of them. */
-    if (added) {
-        u64 fd_seq;
+out_free_added:
+    /* Never published, so nothing names them: give every block this
+     * call allocated back. */
+    {
+        u32 i;
 
-        cetrafs_inode_fd_pub_lock(inode);
-        fd_seq = cetrafs_inode_fd_seq(inode);
-        if (cetrafs_write_raw_inode_fd(sb, inode->i_ino, &raw, inode) == 0)
-            cetrafs_inode_fd_published(inode, fd_seq);
-        cetrafs_inode_fd_pub_unlock(inode);
+        for (i = 0; i < add_n; i++) {
+            u64 p = cetrafs_extent_phys_from_hilo(add[i].ee_start_hi, add[i].ee_start_lo);
+            u32 l = cetrafs_extent_len(add[i].ee_len), k;
+
+            for (k = 0; k < l; k++)
+                cetrafs_free_data_block(sb, p + k);
+        }
     }
+out_free:
+    kvfree(flat);
+    kvfree(add);
+    kfree(recs);
     return ret;
+#undef raw
+#undef old_raw
 }
 
 static long cetrafs_fallocate(struct file *file, int mode, loff_t offset, loff_t len)

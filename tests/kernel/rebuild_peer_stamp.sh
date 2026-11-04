@@ -19,9 +19,13 @@
 # while the operation is held by rebuild_stall_pre_ms, with no presence
 # bit, so the existing recheck has nothing to see.
 #
-# DISCRIMINATION: with rebuild_plan_unchecked=1 (the old publish), both
-# rounds publish over the peer: the size goes back to the planned one
-# and the dropped blocks are freed.
+# fallocate used to append into the live leaves in place, so it had no
+# publish to refuse; it now builds into a copy like the other two, and a
+# refusal gives back every block it allocated.
+#
+# DISCRIMINATION: with rebuild_plan_unchecked=1 (the old publish), every
+# round publishes over the peer: the size goes back to the planned one,
+# and the free count moves.
 set -euo pipefail
 . "$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)/lib/harness.sh"
 require_root
@@ -40,9 +44,10 @@ INFO="$(ct_procdir "$DEV")/info"
 freeb() { sed -n 's/^free_data_blocks: //p' "$INFO"; }
 PEER_SIZE=$((80 * 4096))
 
-# round <name> <op>: truncate the 64-block file to 8 blocks by PATH, or
-# punch 16 blocks out of it through an fd; a peer's session lands
-# during the stall.
+# round <name> <op>: truncate the 64-block file to 8 blocks by PATH,
+# punch 16 blocks out of it through an fd, or preallocate 8 blocks past
+# its end (to 72, short of the peer's 80); a peer's session lands during
+# the stall.
 round() {
     local name="$1" op="$2" F="$MNT/file.$1" INO FREE0 RES OUT RC ERR SIZE
     RES="$(ct_tmp "rbstamp-$name")"
@@ -57,6 +62,11 @@ libc = ctypes.CDLL("libc.so.6", use_errno=True)
 if sys.argv[2] == "punch":
     f = os.open(sys.argv[1], os.O_RDWR)
     r = libc.fallocate(f, 0x02 | 0x01, ctypes.c_long(8 * 4096), ctypes.c_long(16 * 4096))
+    e = ctypes.get_errno()
+    os.close(f)
+elif sys.argv[2] == "fallocate":
+    f = os.open(sys.argv[1], os.O_RDWR)
+    r = libc.fallocate(f, 0, ctypes.c_long(64 * 4096), ctypes.c_long(8 * 4096))
     e = ctypes.get_errno()
     os.close(f)
 else:
@@ -84,11 +94,12 @@ PY
         fail "$name: the record's size is $SIZE, not the peer's $PEER_SIZE: published over"
     [ "$(freeb)" = "$FREE0" ] &&
         pass "$name: nothing went back to the allocator" ||
-        fail "$name: free_data_blocks moved $FREE0 -> $(freeb): blocks the peer's tree names were freed"
+        fail "$name: free_data_blocks moved $FREE0 -> $(freeb): the refused operation changed the allocation"
 }
 
 round trunc truncate
 round punch punch
+round falloc fallocate
 
 ct_umount "$MNT"
 ct_exit
