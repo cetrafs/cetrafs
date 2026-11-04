@@ -61,7 +61,7 @@ echo "$FSCK_OUT" | grep -q "inode $ORPHAN is allocated" \
     || fail "the orphan vanished with the scrub disabled -- this test proves nothing"
 
 log "enable a fast scrub; one cycle must reclaim ino=$ORPHAN and spare ino=$HELD"
-ct_param_set scrub 1
+ct_param_set scrub 0
 ct_param_set scrub_interval_secs 2
 ct_param_set scrub_gap_secs 1
 # DELTA, not absolute: the counter is module-global and suites in one
@@ -72,6 +72,16 @@ ct_param_set scrub_gap_secs 1
 # suite's scrub ever ran.
 mount -t cetrafs "$DEV" "$MNT"
 require_cetrafs_mount "$MNT"
+# Bit 0x4 is node 2, and it must be a LIVE peer: the scrub clears a dead
+# holder's claims and reclaims past them (scrub_dead_claims.sh). Planted
+# after the mount -- a loop device has no CAW, so the mount gate refuses
+# a volume with a live peer -- kept beating, and only then the scrub on.
+NODE_POKE="$(ct_helper node_poke)"
+"$NODE_POKE" "$IMG" 2 1 bb "$(date +%s)" >/dev/null
+( while :; do "$NODE_POKE" "$IMG" 2 --beat >/dev/null 2>&1 || true; sleep 1; done ) &
+BEATER=$!
+ct_track cmd "kill $BEATER"
+ct_param_set scrub 1
 # (read right after mount: procfs needs the mount, and the first scrub
 # cycle cannot fire before scrub_interval_secs from now)
 BASE="$(orphans_reclaimed)"
@@ -84,6 +94,9 @@ REC="$(($(orphans_reclaimed) - BASE))"
     && pass "the scrub reclaimed exactly one orphan inode (delta=$REC)" \
     || fail "scrub_orphan_inodes_reclaimed delta=$REC, expected 1 (0 = missed the orphan, >1 = over-freed)"
 ct_umount "$MNT"
+kill "$BEATER" 2>/dev/null || true
+wait "$BEATER" 2>/dev/null || true
+"$NODE_POKE" "$DEV" 2 0 bb 0 >/dev/null
 
 FSCK_OUT="$(ct_fsck "$DEV" 2>&1 || true)"
 echo "$FSCK_OUT" | grep -q "inode $ORPHAN is allocated" \

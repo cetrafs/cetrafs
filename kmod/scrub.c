@@ -603,8 +603,9 @@ static void scrub_reclaim_orphan_inodes(struct cetrafs_scrub *s)
     struct super_block *sb = s->sb;
     const cetrafs_superblock_t *raw_sb = cetrafs_sb_raw(sb);
     u64 ninodes, ino, freed = 0;
+    u32 my_node_id;
 
-    if (!raw_sb)
+    if (!raw_sb || cetrafs_sb_get_node_id(sb, &my_node_id))
         return;
     ninodes = le32_to_cpu(raw_sb->inodes_count);
 
@@ -633,10 +634,17 @@ static void scrub_reclaim_orphan_inodes(struct cetrafs_scrub *s)
 
         if (cetrafs_le32(raw.nlink) != 0)
             continue; /* live file */
-        if (cetrafs_le64(raw.read_open_nodes) != 0)
-            continue; /* a peer still reads the dead file -- its close converges */
-        if (cetrafs_le32(raw.lock_mode) != CETRAFS_LOCK_NONE)
-            continue; /* writer lock still present (holder or stale) -- not ours to judge */
+        if (cetrafs_le64(raw.read_open_nodes) != 0 || cetrafs_le32(raw.lock_mode) != CETRAFS_LOCK_NONE) {
+            /* A live opener's close converges; a DEAD one's never does
+             * -- its bit or lock stayed and the file leaked for good.
+             * Clear the dead ones, then judge the record afresh. */
+            if (cetrafs_lock_clear_dead_claims(sb, ino, my_node_id))
+                continue;
+            cetrafs_invalidate_raw_inode(sb, ino);
+            if (cetrafs_read_raw_inode(sb, ino, &raw) != 0 || cetrafs_le32(raw.nlink) != 0 ||
+                cetrafs_le64(raw.read_open_nodes) != 0 || cetrafs_le32(raw.lock_mode) != CETRAFS_LOCK_NONE)
+                continue;
+        }
         if (cetrafs_le32(raw.ns_lock_owner) != CETRAFS_NODE_ID_NONE)
             continue; /* a namespace operation is mid-flight on this record */
 

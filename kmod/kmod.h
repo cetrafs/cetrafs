@@ -277,6 +277,8 @@ bool cetrafs_sb_unclean_reattach(struct super_block *sb);
 void cetrafs_ns_stamp_advance(cetrafs_inode_t *rec);
 /* lock.c: clear every claim a previous incarnation of this node left */
 int cetrafs_lock_sweep_own_claims(struct super_block *sb, u32 my_node_id);
+/* lock.c: clear a dead node's claims on a deleted record (the orphan scrub) */
+int cetrafs_lock_clear_dead_claims(struct super_block *sb, u64 ino, u32 my_node_id);
 /* Live speculative-run registry: lock.c publishes, scrub.c reads. A
  * reserved run is bitmap-set and referenced by no extent, which is
  * exactly what the scrub frees -- see cetrafs_sb_info.resv_list.

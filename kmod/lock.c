@@ -4284,6 +4284,62 @@ static int cetrafs_foreign_claim_from_raw(struct super_block *sb,
     return 0;
 }
 
+/*
+ * The orphan scrub's question about a DEAD record (nlink 0) that still
+ * carries claims: does any belong to a node that is alive? Each dead
+ * holder is fenced and its journal replayed, its presence bit cleared
+ * (cetrafs_lock_foreign_user_exists()) and its lock cleared here. 0
+ * when the record now carries no claim at all; -EBUSY when a live one,
+ * or this node's own, remains -- this node's are its retry queues'
+ * (cetrafs_lock_retry_presence(), cetrafs_lock_retry_deferred()).
+ *
+ * The scrub used to skip any such record for good: a peer that died
+ * holding a deleted file open left its bit, and the number and every
+ * block of the file leaked until fsck.
+ */
+int cetrafs_lock_clear_dead_claims(struct super_block *sb, u64 ino, u32 my_node_id)
+{
+    u64 bit = 1ULL << (my_node_id % CETRAFS_MAX_READER_NODES);
+    bool writer = false, reader = false;
+    cetrafs_inode_t raw;
+    int ret;
+
+    ret = cetrafs_lock_foreign_user_exists(sb, ino, my_node_id, &writer, &reader);
+    if (ret)
+        return ret;
+    if (writer || reader)
+        return -EBUSY;
+
+    cetrafs_invalidate_raw_inode(sb, ino);
+    ret = cetrafs_read_raw_inode(sb, ino, &raw);
+    if (ret)
+        return ret;
+    if (cetrafs_le64(raw.read_open_nodes) & bit)
+        return -EBUSY;
+    if (cetrafs_le32(raw.lock_mode) == CETRAFS_LOCK_EXCLUSIVE) {
+        u32 owner = cetrafs_le32(raw.lock_owner_node);
+        struct cetrafs_lock_cas_ctx ctx = {
+            .generation = cetrafs_le64(raw.generation),
+            .steal_release = true,
+            .steal_from = owner,
+        };
+
+        if (owner == my_node_id)
+            return -EBUSY;
+        /* Judged stale, fenced and replayed by the check above. */
+        ret = cetrafs_cas_record(sb, cetrafs_inode_lba(sb, ino), cetrafs_lock_cas_mutate, &ctx);
+        if (ret < 0)
+            return ret;
+        pr_info("scrub: ino=%llu cleared dead node %u's lock on a deleted file\n", (unsigned long long) ino, owner);
+    }
+
+    cetrafs_invalidate_raw_inode(sb, ino);
+    ret = cetrafs_read_raw_inode(sb, ino, &raw);
+    if (ret)
+        return ret;
+    return (cetrafs_le64(raw.read_open_nodes) || cetrafs_le32(raw.lock_mode) != CETRAFS_LOCK_NONE) ? -EBUSY : 0;
+}
+
 int cetrafs_lock_foreign_claim_exists(struct super_block *sb, u64 ino, u32 my_node_id, bool *out_exists)
 {
     cetrafs_inode_t raw;
