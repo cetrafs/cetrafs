@@ -1484,10 +1484,11 @@ static void cetrafs_lock_presence_put(struct inode *inode);
 static int cetrafs_lock_suspend_mark(struct inode *inode, bool set);
 
 /* TEST ONLY: fail the next presence withdraw, as a CAS the device
- * refused would (tests/kernel/presence_withdraw_retry.sh). */
-static bool cetrafs_presence_withdraw_fail_once;
-module_param_named(presence_withdraw_fail_once, cetrafs_presence_withdraw_fail_once, bool, 0644);
-MODULE_PARM_DESC(presence_withdraw_fail_once, "TEST ONLY: fail the next presence withdraw with -EIO");
+ * refused would (tests/kernel/presence_withdraw_retry.sh,
+ * release_queue_full.sh). */
+static unsigned int cetrafs_presence_withdraw_fail;
+module_param_named(presence_withdraw_fail, cetrafs_presence_withdraw_fail, uint, 0644);
+MODULE_PARM_DESC(presence_withdraw_fail, "TEST ONLY: fail the next N presence withdraws with -EIO");
 
 /*
  * Withdraw this node's bit from the file's read_open_nodes. The caller
@@ -1510,9 +1511,10 @@ static void cetrafs_lock_presence_withdraw(struct inode *inode)
     ret = cetrafs_sb_get_node_id(sb, &my_node_id);
     if (!ret)
         ret = cetrafs_read_raw_inode(sb, inode->i_ino, &raw);
-    if (!ret && READ_ONCE(cetrafs_presence_withdraw_fail_once) &&
-        xchg(&cetrafs_presence_withdraw_fail_once, false))
+    if (!ret && READ_ONCE(cetrafs_presence_withdraw_fail)) {
+        WRITE_ONCE(cetrafs_presence_withdraw_fail, cetrafs_presence_withdraw_fail - 1);
         ret = -EIO; /* test-only */
+    }
     else if (!ret) {
         struct cetrafs_lock_cas_ctx rctx = {
             .my_node_id = my_node_id,

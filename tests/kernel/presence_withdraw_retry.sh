@@ -24,7 +24,7 @@ set -euo pipefail
 . "$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)/lib/harness.sh"
 require_root
 require_module
-[ -w /sys/module/cetrafs/parameters/presence_withdraw_fail_once ] || { skip "presence_withdraw_fail_once is missing"; ct_exit; }
+[ -w /sys/module/cetrafs/parameters/presence_withdraw_fail ] || { skip "presence_withdraw_fail is missing"; ct_exit; }
 LOCK_POKE="$(ct_helper inode_lock_poke)"
 
 DEV="$(ct_dev 560 presretry)"
@@ -38,7 +38,7 @@ echo a >"$MNT/a"
 echo b >"$MNT/b"
 sync
 dump() { "$LOCK_POKE" "$DEV" "$(stat -c %i "$MNT/$1")"; }
-knob_spent() { [ "$(cat /sys/module/cetrafs/parameters/presence_withdraw_fail_once)" = N ]; }
+knob_spent() { [ "$(cat /sys/module/cetrafs/parameters/presence_withdraw_fail)" = 0 ]; }
 
 # wait_clear <file> <round>
 wait_clear() {
@@ -52,7 +52,7 @@ wait_clear() {
 python3 - "$MNT/a" <<'PY'
 import os, sys
 fd = os.open(sys.argv[1], os.O_RDONLY)
-open("/sys/module/cetrafs/parameters/presence_withdraw_fail_once", "w").write("1")
+open("/sys/module/cetrafs/parameters/presence_withdraw_fail", "w").write("1")
 os.close(fd)
 PY
 knob_spent || fail "A: setup: the close's withdraw was not the one that failed"
@@ -65,7 +65,7 @@ python3 - "$MNT/b" <<'PY'
 import fcntl, os, sys
 fd = os.open(sys.argv[1], os.O_RDWR)
 fcntl.flock(fd, fcntl.LOCK_UN)       # hand the lock over: presence published
-open("/sys/module/cetrafs/parameters/presence_withdraw_fail_once", "w").write("1")
+open("/sys/module/cetrafs/parameters/presence_withdraw_fail", "w").write("1")
 fcntl.flock(fd, fcntl.LOCK_EX)       # take it back: presence withdrawn -- fails
 os.close(fd)
 PY
@@ -82,7 +82,7 @@ RES="$(python3 - "$MNT/c" "$LOCK_POKE" "$DEV" "$(stat -c %i "$MNT/c")" <<'PY'
 import os, subprocess, sys, time
 p, poke, dev, ino = sys.argv[1:5]
 fd = os.open(p, os.O_RDONLY)
-open("/sys/module/cetrafs/parameters/presence_withdraw_fail_once", "w").write("1")
+open("/sys/module/cetrafs/parameters/presence_withdraw_fail", "w").write("1")
 os.close(fd)
 fd = os.open(p, os.O_RDONLY)        # a new opener, before the retry
 seen = set()

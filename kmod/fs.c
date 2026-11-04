@@ -3731,6 +3731,23 @@ void cetrafs_sb_set_bg_epoch(struct super_block *sb, u32 bg_id, u64 seq)
  * adjust_free_blocks(). */
 /* Accrue a pending change to a ZG's free-block aggregate. Applied to the
  * record by cetrafs_flush_dirty_free_counts() below, as one CAS. */
+/*
+ * A release queue is full: this node holds a claim on the device -- a
+ * namespace lock, a file lock, a presence bit -- that it could not give
+ * back and can no longer remember to. Nobody reclaims a live node's
+ * claims, so dropping the entry left it held until something here
+ * happened to touch that file again: every peer refused, indefinitely.
+ * The queues hold 32 each; filling one means the device is refusing
+ * swaps broadly. End in the state a crash leaves (docs/internal/
+ * ERRORS.md): stop, so the lease lapses and the peers' stale reclaim
+ * clears every claim this node held.
+ */
+static void cetrafs_sb_defer_overflow(struct super_block *sb, const char *what, u64 ino, unsigned int max)
+{
+    cetrafs_sb_fatal(sb, "%s release for ino=%llu could not be queued: %u already pending", what,
+                     (unsigned long long) ino, max);
+}
+
 /* Remember a namespace lock whose release did not commit, for the
  * heartbeat to retry. See cetrafs_sb_info.nsrel. */
 void cetrafs_sb_nslock_defer(struct super_block *sb, u64 ino, u64 generation)
@@ -3750,9 +3767,7 @@ void cetrafs_sb_nslock_defer(struct super_block *sb, u64 ino, u64 generation)
         }
     if (sbi->nsrel_count == CETRAFS_NSLOCK_DEFERRED_MAX) {
         spin_unlock(&sbi->nsrel_lock);
-        pr_err("nslock: ino=%llu release deferral dropped -- %u already pending, so this one is left for "
-               "stale-reclaim\n",
-               (unsigned long long) ino, (unsigned int) CETRAFS_NSLOCK_DEFERRED_MAX);
+        cetrafs_sb_defer_overflow(sb, "namespace lock", ino, CETRAFS_NSLOCK_DEFERRED_MAX);
         return;
     }
     sbi->nsrel[sbi->nsrel_count].ino = ino;
@@ -3779,9 +3794,7 @@ void cetrafs_sb_flock_defer(struct super_block *sb, u64 ino, u64 generation)
         }
     if (sbi->flrel_count == CETRAFS_FLOCK_DEFERRED_MAX) {
         spin_unlock(&sbi->flrel_lock);
-        pr_err("lock release: ino=%llu could not be queued for retry -- %u already pending; the lock stays held "
-               "until this file is opened and closed here again, or this node unmounts\n",
-               (unsigned long long) ino, (unsigned int) CETRAFS_FLOCK_DEFERRED_MAX);
+        cetrafs_sb_defer_overflow(sb, "file lock", ino, CETRAFS_FLOCK_DEFERRED_MAX);
         return;
     }
     sbi->flrel[sbi->flrel_count].ino = ino;
@@ -3808,9 +3821,7 @@ void cetrafs_sb_presence_defer(struct super_block *sb, u64 ino, u64 generation)
         }
     if (sbi->prrel_count == CETRAFS_PRESENCE_DEFERRED_MAX) {
         spin_unlock(&sbi->prrel_lock);
-        pr_err("presence: ino=%llu withdraw could not be queued for retry -- %u already pending; peers see this "
-               "node as an opener until it opens and closes the file again, or unmounts\n",
-               (unsigned long long) ino, (unsigned int) CETRAFS_PRESENCE_DEFERRED_MAX);
+        cetrafs_sb_defer_overflow(sb, "presence", ino, CETRAFS_PRESENCE_DEFERRED_MAX);
         return;
     }
     sbi->prrel[sbi->prrel_count].ino = ino;
