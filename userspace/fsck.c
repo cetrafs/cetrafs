@@ -966,10 +966,70 @@ static int fsck_run_bg(const uint64_t *bg_start, const uint64_t *bg_cnt, uint32_
  * the block reads as a hole and the next write allocates over it. lo/hi
  * is the narrowest advertised range, hi == 0 for "none". Reported, not
  * repaired: none of these hides a block from the walk. */
+/* The current inode's logical runs, for the overlap check after its
+ * walk, and its file type, for the uninit check. */
+struct fsck_lrun {
+    uint64_t lo, hi;
+};
+static struct fsck_lrun *fsck_lruns;
+static size_t fsck_nlruns, fsck_lruns_cap;
+static uint32_t fsck_cur_fmt;
+
+static int fsck_lrun_cmp(const void *a, const void *b)
+{
+    const struct fsck_lrun *x = a, *y = b;
+
+    return x->lo < y->lo ? -1 : x->lo > y->lo;
+}
+
+/* Two extents of one file covering the same logical block: the
+ * kernel's lookup takes whichever it meets first (file.c tolerates it
+ * as "a damaged tree"), so the other's blocks are data nobody can
+ * read, and which one wins depends on the array's order. */
+static int fsck_lruns_overlap(uint64_t ino)
+{
+    if (fsck_nlruns < 2)
+        return 0;
+    qsort(fsck_lruns, fsck_nlruns, sizeof(*fsck_lruns), fsck_lrun_cmp);
+    for (size_t i = 1; i < fsck_nlruns; i++) {
+        if (fsck_lruns[i].lo < fsck_lruns[i - 1].hi) {
+            fprintf(stderr,
+                    "%s: inode %" PRIu64 " maps logical block %" PRIu64
+                    " in two extents -- the kernel reads one and the other's blocks are lost to it\n",
+                    FSCK_SEV, ino, fsck_lruns[i].lo);
+            return 1;
+        }
+    }
+    return 0;
+}
+
 static int fsck_extent_logical(uint64_t ino, const cetrafs_extent_t *x, uint64_t lo, uint64_t hi)
 {
     uint64_t eb = cetrafs_le32(x->ee_block);
     uint64_t len = cetrafs_le32(x->ee_len) & CETRAFS_EXT_LEN_MASK;
+
+    if (len) {
+        if (fsck_nlruns == fsck_lruns_cap) {
+            fsck_lruns_cap = fsck_lruns_cap ? fsck_lruns_cap * 2 : 64;
+            fsck_lruns = (struct fsck_lrun *) realloc(fsck_lruns, fsck_lruns_cap * sizeof(*fsck_lruns));
+            if (!fsck_lruns) {
+                perror("realloc");
+                exit(FSCK_EXIT_NOEXAM);
+            }
+        }
+        fsck_lruns[fsck_nlruns].lo = eb;
+        fsck_lruns[fsck_nlruns++].hi = eb + len;
+    }
+    /* Preallocated space exists only in regular files (fallocate is a
+     * file operation). In a symlink it reads as zeros through
+     * get_block; in a directory dir.c ignores the flag. Either way it
+     * is a state no kernel path creates. */
+    if (cetrafs_extent_is_uninit(x->ee_len) && fsck_cur_fmt != 0100000u) {
+        fprintf(stderr, "%s: inode %" PRIu64 " (not a regular file) has a preallocated extent at logical block %" PRIu64
+                        "\n",
+                FSCK_SEV, ino, eb);
+        return 1;
+    }
 
     if (len == 0) {
         fprintf(stderr, "%s: inode %" PRIu64 " has an extent of length 0 at logical block %" PRIu64 "\n", FSCK_SEV,
@@ -2456,6 +2516,8 @@ int main(int argc, char **argv)
              * data block too and must be accounted for, or it reads as a
              * leak. fsck_mark_run() is the shared depth-0 marking; the
              * depth-2 walk reuses it per leaf. */
+            fsck_nlruns = 0;
+            fsck_cur_fmt = cetrafs_le32(in.mode) & 0170000u;
             struct fsck_refctx rc = {refd,      dupd, bg_data_start, bg_data_cnt,
                                      cetrafs_le32(sb.block_group_count), &problems, &blocks_referenced,
                                      weakd,     &stale_blocks};
@@ -2632,6 +2694,7 @@ int main(int argc, char **argv)
 
             if (!tree_ok)
                 continue; /* a bad tail already reported; its blocks look leaked, repair refused */
+            problems += fsck_lruns_overlap(ino) && !fsck_dead_walk;
 
             /* The xattr block is a referenced data block too (all depths).
              * Verify its tail; counted referenced even with a bad tail --

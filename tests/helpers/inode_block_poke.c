@@ -106,7 +106,7 @@ int main(int argc, char **argv)
         fprintf(stderr, "       %s <backing-file> dirtytail <ino>      (garbage past the record)\n", argv[0]);
         fprintf(stderr, "       %s <backing-file> tailzero <ino>       (prints yes/no)\n", argv[0]);
         fprintf(stderr, "       %s <backing-file> peerseq <ino> <node> (file_seq as a peer's publish)\n", argv[0]);
-        fprintf(stderr, "       %s <backing-file> extset <ino> <i> block|len <v> (inline extent i's logical field)\n",
+        fprintf(stderr, "       %s <backing-file> extset <ino> <i> block|len|uninit <v> (inline extent i's logical field)\n",
                 argv[0]);
         fprintf(stderr, "       %s <backing-file> ehset <ino> magic|entries|depth <v> (the inline extent header)\n",
                 argv[0]);
@@ -326,6 +326,8 @@ int main(int argc, char **argv)
         }
         if (strcmp(argv[5], "block") == 0)
             rec.et.leaf[i].ee_block = cetrafs_cpu_to_le32(v);
+        else if (strcmp(argv[5], "uninit") == 0)
+            rec.et.leaf[i].ee_len = cetrafs_extent_pack_len(cetrafs_le32(rec.et.leaf[i].ee_len) & CETRAFS_EXT_LEN_MASK, v != 0);
         else if (strcmp(argv[5], "len") == 0)
             rec.et.leaf[i].ee_len = cetrafs_cpu_to_le32(
                 (cetrafs_le32(rec.et.leaf[i].ee_len) & ~(uint32_t) CETRAFS_EXT_LEN_MASK) | (v & CETRAFS_EXT_LEN_MASK));

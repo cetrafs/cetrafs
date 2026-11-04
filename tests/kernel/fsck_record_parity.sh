@@ -6,9 +6,11 @@
 # accept: a type iget refuses, a live record with no extent header (the
 # first map is -EIO), an extent of length 0 or ending past the largest
 # file (seek/fiemap and the unwritten convert call the volume corrupt),
-# and a depth-2 extent outside the range its index entry advertises --
+# a depth-2 extent outside the range its index entry advertises --
 # the lookup skips that leaf, the block reads as a hole and the next
-# write allocates over it.
+# write allocates over it -- two extents mapping one logical block (the
+# lookup reads whichever it meets first), and a preallocated extent in
+# a directory, which no kernel path creates.
 #
 # One fault per case on a fresh copy of the same image, CRCs restamped.
 #
@@ -28,6 +30,9 @@ ct_mount "$DEV" "$MNT"
 require_cetrafs_mount "$MNT"
 dd if=/dev/urandom of="$MNT/data" bs=4096 count=4 status=none
 : >"$MNT/empty"
+# Two extents, logical [0,4) and [10,14), with a hole between.
+dd if=/dev/urandom of="$MNT/two" bs=4096 count=4 status=none
+dd if=/dev/urandom of="$MNT/two" bs=4096 count=4 seek=10 conv=notrunc status=none
 python3 -I - "$MNT/deep" <<'PY'
 import os, sys
 fd = os.open(sys.argv[1], os.O_CREAT | os.O_RDWR, 0o644)
@@ -36,10 +41,11 @@ for i in range(300):
 os.fsync(fd)
 os.close(fd)
 PY
-DI="$(stat -c %i "$MNT/data")"; EI="$(stat -c %i "$MNT/empty")"; PI="$(stat -c %i "$MNT/deep")"
+DI="$(stat -c %i "$MNT/data")"; EI="$(stat -c %i "$MNT/empty")"; PI="$(stat -c %i "$MNT/deep")"; TI="$(stat -c %i "$MNT/two")"; RI="$(stat -c %i "$MNT")"
 ct_umount "$MNT"
 blockdev --flushbufs "$DEV"
 grep -q depth=2 <<<"$("$POKE" "$IMG" extents "$PI" 2>&1)" || { fail "setup: 'deep' did not reach depth 2"; ct_exit; }
+grep -q "depth=0 entries=2" <<<"$("$POKE" "$IMG" extents "$TI" 2>&1)" || { fail "setup: 'two' is not two inline extents"; ct_exit; }
 ct_fsck "$DEV" >/dev/null 2>&1 || { fail "setup: the volume is not clean before any poke"; ct_exit; }
 TPL="$IMG.tpl"; ct_track file "$TPL"
 cp --sparse=always "$IMG" "$TPL"
@@ -67,5 +73,7 @@ dd if="$TPL" of="$IMG" bs=1M conv=notrunc,sparse status=none
 OUT="$("$ROOT/userspace/fsck.cetra" -r "$DEV" 2>&1 || true)"
 grep -q "nothing repaired" <<<"$OUT" && pass "an empty depth-2 root blocks -r (its blocks look leaked)" ||
     fail "fsck -r repaired around an empty depth-2 root: $(grep -E 'cleared|repaired' <<<"$OUT" | head -2)"
+case_ "two extents over one logical block" "maps logical block 2 in two extents" extset "$TI" 1 block 2
+case_ "a preallocated extent in a directory" "not a regular file.*preallocated" extset "$RI" 0 uninit 1
 case_ "outside its index range" "outside the range .* its index advertises" idxrange "$PI" 0 100000 100001
 ct_exit
