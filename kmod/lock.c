@@ -3610,6 +3610,51 @@ static bool cetrafs_flock_reader_check_fail_once;
 module_param_named(flock_reader_check_fail_once, cetrafs_flock_reader_check_fail_once, bool, 0644);
 MODULE_PARM_DESC(flock_reader_check_fail_once, "TEST ONLY: the next flock reader check fails with -EIO");
 
+/* TEST ONLY: fail the next give-back of a lock taken for nothing (a
+ * flock or defrag claim backing out), as a device error would.
+ * tests/kernel/lock_giveback_fails.sh. */
+static bool cetrafs_lock_giveback_fail_once;
+module_param_named(lock_giveback_fail_once, cetrafs_lock_giveback_fail_once, bool, 0644);
+MODULE_PARM_DESC(lock_giveback_fail_once, "TEST ONLY: the next flock/defrag lock give-back fails with -EIO");
+
+/*
+ * A claim that backs out -- a flock or defrag pin that found the file
+ * not its own after all -- gives the lock back here. No local holder
+ * exists to release it later, so a give-back that fails is queued for
+ * the heartbeat (cetrafs_lock_retry_deferred()), as a close's is. It
+ * used to be dropped: the lock stayed on the record of a node that keeps
+ * beating, which stale reclaim never touches, and every peer got
+ * -ETXTBSY until this node happened to open and close the file.
+ * Caller holds ci->lock_mutex.
+ */
+static void cetrafs_lock_give_back(struct inode *inode, int (*give)(struct inode *, void *), void *arg,
+                                   const char *who)
+{
+    int ret;
+
+    if (cetrafs_lock_giveback_fail_once) {
+        cetrafs_lock_giveback_fail_once = false;
+        ret = -EIO;
+    } else {
+        ret = give(inode, arg);
+    }
+    if (ret) {
+        pr_err("lock: ino=%llu %s could not give the lock back (%d) -- queued for retry\n",
+               (unsigned long long) inode->i_ino, who, ret);
+        cetrafs_sb_flock_defer(inode->i_sb, inode->i_ino, cetrafs_inode_get_generation(inode));
+    }
+}
+
+static int cetrafs_give_back_cas(struct inode *inode, void *arg)
+{
+    return cetrafs_lock_cas(inode, arg, NULL);
+}
+
+static int cetrafs_give_back_clear(struct inode *inode, void *arg)
+{
+    return cetrafs_lock_clear_on_disk(inode, /*stamp_stat=*/false);
+}
+
 /*
  * The non-blocking claim behind flock(fd, LOCK_EX) (cetrafs_flock below).
  * Claims the whole-file exclusive lock for this node: the on-disk lock it
@@ -3744,7 +3789,7 @@ static int cetrafs_lock_explicit_acquire(struct inode *inode, struct file *file)
             .claim = false,
         };
 
-        cetrafs_lock_cas(inode, &rel, NULL); /* give the lock back */
+        cetrafs_lock_give_back(inode, cetrafs_give_back_cas, &rel, "flock");
         if (!ret)
             ret = -EBUSY;
         goto out;
@@ -3991,7 +4036,7 @@ int cetrafs_lock_defrag_begin(struct inode *inode)
     if (ret) {
         /* Give back the lock we took for nothing: no local writer
          * exists to release it later. */
-        cetrafs_lock_clear_on_disk(inode, /*stamp_stat=*/false);
+        cetrafs_lock_give_back(inode, cetrafs_give_back_clear, NULL, "defrag");
         goto out;
     }
 
@@ -4013,7 +4058,7 @@ int cetrafs_lock_defrag_begin(struct inode *inode)
         int aret = cetrafs_apply_raw_to_vfs_inode_sure(inode, &raw);
 
         if (aret) {
-            cetrafs_lock_clear_on_disk(inode, /*stamp_stat=*/false);
+            cetrafs_lock_give_back(inode, cetrafs_give_back_clear, NULL, "defrag");
             ret = aret == -ESTALE ? -ESTALE : -EBUSY;
             goto out;
         }
