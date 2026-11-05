@@ -1435,10 +1435,13 @@ struct cetrafs_lock_cas_ctx {
                          * we are bypassing rather than claiming (we never
                          * auto-claim there). Independent of claim/release. */
     u32 steal_from;     /* meaningful when allow_steal or steal_release */
-    /* Out, claim: the swap that landed took the lock FROM steal_from
-     * rather than finding it free. Only a displacement has anything to
-     * give back (cetrafs_lock_undo_steal()). steal_release needs no such
-     * flag: it lands only by displacing. */
+    /* Out, per attempt: the image that landed took something away --
+     * the claim took the lock FROM steal_from rather than finding it
+     * free; steal_release cleared steal_from's lock rather than finding
+     * it gone; a reader CLEAR cleared a bit that was set. Only a
+     * displacement has anything to give back (cetrafs_lock_undo_steal()).
+     * Every one of them also has a "nothing to do" outcome that the CAS
+     * wrapper folds into success, which is why this is recorded. */
     bool displaced;
     /* Undo a reclaim that raced a re-attach (cetrafs_lock_undo_steal()):
      * put the lock back to give_back_to, only while it is still what the
@@ -1541,6 +1544,12 @@ static int cetrafs_lock_cas_mutate(void *image, unsigned int len, void *priv)
         u64 bit = 1ULL << (ctx->my_node_id % CETRAFS_MAX_READER_NODES);
         u64 want;
 
+        /* Per attempt, as the lock claim's: did THIS image clear a bit
+         * that was set? A CLEAR finding the bit already clear returns 1,
+         * which the CAS wrapper folds into 0 -- indistinguishable from a
+         * clear that landed, unless recorded here. */
+        ctx->displaced = false;
+
         if (ctx->reader_op == CETRAFS_SUSPEND_SET || ctx->reader_op == CETRAFS_SUSPEND_CLEAR) {
             u64 sw = cetrafs_le64(rec.suspended_writer_nodes);
             u64 nsw = (ctx->reader_op == CETRAFS_SUSPEND_SET) ? (sw | bit) : (sw & ~bit);
@@ -1576,6 +1585,7 @@ static int cetrafs_lock_cas_mutate(void *image, unsigned int len, void *priv)
             /* Gone entirely: a suspended writer's mark goes with its
              * presence (last close while suspended, or a dead node's
              * bits being cleared). */
+            ctx->displaced = (cetrafs_le64(rec.read_open_nodes) & bit) != 0;
             rec.suspended_writer_nodes = cetrafs_cpu_to_le64(cetrafs_le64(rec.suspended_writer_nodes) & ~bit);
             rec.read_open_nodes = cetrafs_cpu_to_le64(want);
             cetrafs_inode_stamp_crc_ns(&rec);
@@ -1585,6 +1595,7 @@ static int cetrafs_lock_cas_mutate(void *image, unsigned int len, void *priv)
 
         if (want == cetrafs_le64(rec.read_open_nodes))
             return 1; /* already in the desired state -- nothing to do */
+        ctx->displaced = ctx->reader_op == CETRAFS_READER_CLEAR;
         rec.read_open_nodes = cetrafs_cpu_to_le64(want);
         cetrafs_inode_stamp_crc_ns(&rec);
         memcpy(image, &rec, CETRAFS_INODE_NS_BYTES);
@@ -1609,10 +1620,14 @@ static int cetrafs_lock_cas_mutate(void *image, unsigned int len, void *priv)
     if (ctx->steal_release) {
         /* Clear a foreign lock to NONE (no new owner). Only lands if the
          * record still shows the exact stale owner we decided to displace,
-         * so a live re-lock or a reclaim by someone else is left alone. */
+         * so a live re-lock or a reclaim by someone else is left alone.
+         * "Nothing to clear" returns 1, which the CAS wrapper folds into
+         * 0: record which one this was, per attempt, for the give-back. */
+        ctx->displaced = false;
         if (cetrafs_le32(rec.lock_mode) != CETRAFS_LOCK_EXCLUSIVE ||
             cetrafs_le32(rec.lock_owner_node) != ctx->steal_from)
             return 1; /* not that owner any more -- nothing to clear */
+        ctx->displaced = true;
         rec.lock_owner_node = cetrafs_cpu_to_le32(CETRAFS_NODE_ID_NONE);
         rec.lock_mode = CETRAFS_LOCK_NONE;
         cetrafs_inode_stamp_crc_ns(&rec);
@@ -2138,7 +2153,8 @@ int cetrafs_lock_open(struct inode *inode, struct file *file)
         if (cret < 0)
             pr_warn_ratelimited("lock: ino=%llu could not clear stale foreign lock from node %u: %d\n",
                                 (unsigned long long) inode->i_ino, stale_owner, cret);
-        else if (cret == 0 && cetrafs_lock_undo_steal(sb, inode->i_ino, cetrafs_le64(raw.generation), stale_owner,
+        else if (cret == 0 && cctx.displaced &&
+                 cetrafs_lock_undo_steal(sb, inode->i_ino, cetrafs_le64(raw.generation), stale_owner,
                                                       CETRAFS_NODE_ID_NONE, "open")) {
             ret = -ETXTBSY; /* an explicit lock of a live node: honoured, as above */
             goto out_pr_unlock;
@@ -4678,17 +4694,37 @@ static int cetrafs_foreign_reader_from_raw(struct super_block *sb,
                 *out_exists = true;
                 return 0;
             }
+            cetrafs_node_test_stall_before_swap();
             ret = cetrafs_cas_record(sb, cetrafs_inode_lba(sb, ino), cetrafs_lock_cas_mutate, &rctx);
             if (ret < 0)
                 pr_warn_ratelimited("ino=%llu could not clear stale node %u's reader bit\n", (unsigned long long) ino,
                                     n);
-            else if (ret == 0 && cetrafs_node_reattached_since_fence(sb, n)) {
+            else if (ret == 0 && rctx.displaced && cetrafs_node_reattached_since_fence(sb, n)) {
                 /* It came back, and the bit just cleared may be its new
                  * open's (cetrafs_lock_undo_steal() for the reasoning).
-                 * Put it back, and count a live reader either way. */
+                 * Put it back, and count a live reader either way.
+                 *
+                 * Only a bit this clear actually took (rctx.displaced).
+                 * A clear that found it already clear -- the node's
+                 * re-attach sweep got there first -- took nothing, and
+                 * "giving back" a bit nobody's open owns would refuse
+                 * every write-open of the file, cluster-wide, until that
+                 * node next opened and closed it for read.
+                 *
+                 * And never under a writer this caller did not expect
+                 * (refuse_foreign_lock): one claimed while the bit was
+                 * clear is not stopped by putting it back, and a reader
+                 * bit published under a foreign exclusive lock is a
+                 * record that says both. */
                 rctx.reader_op = CETRAFS_READER_SET;
+                rctx.refuse_foreign_lock = true;
+                rctx.lock_owner_ok = my_node_id;
                 ret = cetrafs_cas_record(sb, cetrafs_inode_lba(sb, ino), cetrafs_lock_cas_mutate, &rctx);
-                if (ret < 0 && ret != -ENOENT) /* -ENOENT: the file is gone, nothing to protect */
+                if (ret == -ETXTBSY)
+                    pr_err("ino=%llu: node %u came back while its reader bit was being cleared, and a writer "
+                           "claimed the file in between -- not putting the bit back under it\n",
+                           (unsigned long long) ino, n);
+                else if (ret < 0 && ret != -ENOENT) /* -ENOENT: the file is gone, nothing to protect */
                     cetrafs_sb_fatal(sb, "ino=%llu: node %u came back while its reader bit was being cleared, and the "
                                      "bit could not be put back (%d)",
                                      (unsigned long long) ino, n, ret);
@@ -4872,7 +4908,8 @@ int cetrafs_lock_clear_dead_claims(struct super_block *sb, u64 ino, u32 my_node_
         ret = cetrafs_cas_record(sb, cetrafs_inode_lba(sb, ino), cetrafs_lock_cas_mutate, &ctx);
         if (ret < 0)
             return ret;
-        if (ret == 0 && cetrafs_lock_undo_steal(sb, ino, ctx.generation, owner, CETRAFS_NODE_ID_NONE, "scrub"))
+        if (ret == 0 && ctx.displaced &&
+            cetrafs_lock_undo_steal(sb, ino, ctx.generation, owner, CETRAFS_NODE_ID_NONE, "scrub"))
             return -EBUSY;
         pr_info("scrub: ino=%llu cleared dead node %u's lock on a deleted file\n", (unsigned long long) ino, owner);
     }

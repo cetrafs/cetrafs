@@ -664,6 +664,32 @@ done)"
 [ -z "$WIN" ] && pass "liveness windows: every one is floored at the stale window" ||
     fail "liveness windows: shorter than the stale window, or not derived from it, at: $(echo $WIN)"
 
+# A give-back after a reclaim undoes what the reclaim TOOK. Every CAS
+# that takes -- the lock claim, steal_release, the reader-bit CLEAR, the
+# namespace-lock steal, the journal replay claim -- has a "nothing to
+# do" outcome the CAS wrapper folds into success, and giving that back
+# hands a live node a lock or a presence bit no open of its holds
+# (classes 28/21: the lock give-back, then the reader bit, then the two
+# steal_release sites, each found one at a time). So every give-back --
+# a call of cetrafs_lock_undo_steal(), or a re-attach test on the
+# success of a CAS (`ret == 0 && ... reattached_since_fence`) -- must
+# test `displaced` on its line or the line before. Negative control:
+# drop `rctx.displaced &&` from the reader-bit give-back -- fails.
+log "checking every reclaim give-back is gated on a recorded displacement"
+GB="$(for f in "$K"/*.c; do
+    awk -v F="$(basename "$f")" '
+        /^[[:space:]]*(\*|\/\*|\/\/)/ { prev = $0; next }
+        /^static bool cetrafs_lock_undo_steal/ { prev = $0; next }
+        /cetrafs_lock_undo_steal\(/ || (/ret == 0/ && /reattached_since_fence\(/) {
+            if ($0 !~ /displaced/ && prev !~ /displaced/) print F ":" NR
+        }
+        { prev = $0 }' "$f"
+done)"
+NGB="$(cat "$K"/*.c | grep -c 'cetrafs_lock_undo_steal(\|reattached_since_fence(' || true)"
+[ "$NGB" -ge 5 ] || fail "give-back gate: found only $NGB give-back sites -- the check sees nothing"
+[ -z "$GB" ] && pass "give-back gate: every reclaim give-back tests displaced" ||
+    fail "give-back gate: a give-back not gated on displaced at: $(echo $GB)"
+
 # The dm path resolution allocates and does I/O. Reached from a CAS,
 # which evict needs, it must run inside a NOFS scope: a GFP_KERNEL
 # allocation entering reclaim evicts an inode of this volume, needs a

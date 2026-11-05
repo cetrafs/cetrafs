@@ -88,7 +88,7 @@ int main(int argc, char **argv)
 
     if (argc != 3 && argc != 5 && !(argc == 4 && has_rec)) {
         fprintf(stderr,
-                "usage: %s <image> <ino> [<owner_node_id> <lock_mode> | --ns <id> | --reader <node_id> | --suspended <node_id> | --mark-only <node_id>]\n",
+                "usage: %s <image> <ino> [<owner_node_id> <lock_mode> | --ns <id> | --reader <node_id> | --unreader <node_id> | --suspended <node_id> | --mark-only <node_id>]\n",
                 argv[0]);
         return 2;
     }
@@ -153,9 +153,18 @@ int main(int argc, char **argv)
     bool reader_mode = (strcmp(argv[3], "--reader") == 0);
     bool suspended_mode = (strcmp(argv[3], "--suspended") == 0);
     bool mark_only = (strcmp(argv[3], "--mark-only") == 0);
+    bool unreader = (strcmp(argv[3], "--unreader") == 0);
     uint32_t owner = 0, lock_mode = 0;
 
-    if (mark_only) {
+    if (unreader) {
+        /* A peer withdrawing its presence bit (its close, or its
+         * re-attach sweep): clear the bit and its writer mark. */
+        uint64_t bit = 1ULL << (strtoul(argv[4], NULL, 0) % 64);
+
+        in.read_open_nodes = cetrafs_cpu_to_le64(cetrafs_le64(in.read_open_nodes) & ~bit);
+        in.suspended_writer_nodes = cetrafs_cpu_to_le64(cetrafs_le64(in.suspended_writer_nodes) & ~bit);
+        reader_mode = true; /* same report below */
+    } else if (mark_only) {
         /* A writer mark with NO presence bit under it: the state fsck
          * must report (the mark is always a subset of the mask). */
         in.suspended_writer_nodes =
