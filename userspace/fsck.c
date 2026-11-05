@@ -2565,6 +2565,20 @@ int main(int argc, char **argv)
                         "no node can open it for write\n",
                         ino, cetrafs_le32(in.lock_mode));
 
+            /* A suspended-writer mark is always a subset of the
+             * presence mask: the mark says which presence bits are a
+             * writer handing over rather than a reader. A mark with no
+             * presence bit under it reads, to the access rule's masks,
+             * as a writer no node is -- and nothing ever clears it.
+             * Reported, not repaired: whether the mark or the presence
+             * is the stale half is the live node's to know. */
+            if (cetrafs_le64(in.suspended_writer_nodes) & ~cetrafs_le64(in.read_open_nodes))
+                fprintf(stderr,
+                        "WARN: inode %" PRIu64 " marks node(s) 0x%" PRIx64 " as suspended writers without the "
+                        "presence bit the mark qualifies\n",
+                        ino,
+                        (uint64_t) (cetrafs_le64(in.suspended_writer_nodes) & ~cetrafs_le64(in.read_open_nodes)));
+
             /* An allocated nlink=0 inode is left when a delete could
              * not free it -- a peer's open racing the unlink's check, an
              * opener that died holding it, an I/O error mid-free --
