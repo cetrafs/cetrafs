@@ -3060,6 +3060,11 @@ static unsigned int cetrafs_cold_work_stall_ms;
 cetrafs_test_param(cold_work_stall_ms, cetrafs_cold_work_stall_ms, uint, 0644);
 MODULE_PARM_DESC(cold_work_stall_ms, "TEST ONLY: stall the cold-tree reconcile before its drop and before its settle");
 
+/* TEST ONLY: the next N reconciles fail their record read. */
+static unsigned int cetrafs_cold_read_fail;
+cetrafs_test_param(cold_read_fail, cetrafs_cold_read_fail, uint, 0644);
+MODULE_PARM_DESC(cold_read_fail, "TEST ONLY: the next N cold-tree reconciles cannot read the record");
+
 static void cetrafs_inode_cold_work(struct work_struct *w)
 {
     struct cetrafs_inode_info *ci = container_of(w, struct cetrafs_inode_info, cold_work);
@@ -3068,13 +3073,20 @@ static void cetrafs_inode_cold_work(struct work_struct *w)
     cetrafs_inode_t *raw;
     int g = cetrafs_tree_cold_begin(ci);
     bool dropped = false;
+    int rret = -ENOMEM;
 
     if (cetrafs_cold_work_stall_ms)
         msleep(cetrafs_cold_work_stall_ms); /* test-only; see the parameter */
     raw = kmalloc(sizeof(*raw), GFP_NOFS);
+    if (raw && cetrafs_cold_read_fail) {
+        cetrafs_cold_read_fail--; /* test-only; see the parameter */
+        kfree(raw);
+        raw = NULL;
+    }
     if (raw) {
         cetrafs_invalidate_raw_inode(sb, inode->i_ino);
-        if (cetrafs_read_raw_inode(sb, inode->i_ino, raw) == 0) {
+        rret = cetrafs_read_raw_inode(sb, inode->i_ino, raw);
+        if (rret == 0) {
             cetrafs_tree_invalidate_cached(inode, raw);
             dropped = true;
         }
@@ -3094,6 +3106,23 @@ static void cetrafs_inode_cold_work(struct work_struct *w)
     if (dropped) {
         cetrafs_tree_cold_settle(ci, g);
         atomic64_inc(&cetrafs_file_cache_reconciles);
+    } else if ((rret == -ENOMEM || rret == -EIO) && !cetrafs_sb_is_fenced(sb)) {
+        /*
+         * Nothing was read, so nothing settles -- and nothing else will
+         * queue this again: only a NEW mark does, and a running VM never
+         * reopens its disk. The tree stayed cold, every tree read
+         * forced-fresh, for the life of the open (audit 2026-11-05,
+         * section 3; tests/kernel/cold_reconcile_retries.sh). Try again
+         * shortly, handing our reference to the next run -- for the
+         * failures that pass: no memory, or an I/O error short of a stop.
+         * A stopped mount refuses every read and a record that is another
+         * file now (-ESTALE) or damaged (-EUCLEAN) will not read better,
+         * so those stay cold; an unmount closes the queue, which refuses
+         * this and drops the reference below.
+         */
+        msleep(100);
+        if (cetrafs_sb_queue_cold(sb, &ci->cold_work))
+            return;
     }
     iput(inode);
 }
