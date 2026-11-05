@@ -460,8 +460,8 @@ int main(int argc, char **argv)
                 die_arg("-J invalid");
             /* Same overflow bound as -b; a journal slice has no business
              * anywhere near it either. */
-            if (mib > (1LL << 30))
-                die_arg("-J too large (max 1 PiB)");
+            if (mib > (long long) CETRAFS_JOURNAL_MAX_BLOCKS / (1024 * 1024 / CETRAFS_BLOCK_SIZE))
+                die_arg("-J too large (max 16384 MiB per node)");
             j_per_node_bytes = (u64) mib * 1024ULL * 1024ULL;
             if (j_per_node_bytes % CETRAFS_BLOCK_SIZE)
                 die_arg("-J must be multiple of 4KiB");

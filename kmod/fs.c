@@ -808,6 +808,11 @@ static int cetrafs_validate_layout(const cetrafs_superblock_t *sb, u64 total_blo
         pr_err("superblock: the pending-free queue has zero blocks per Zone Group\n");
         return -EINVAL;
     }
+    if (le32_to_cpu(sb->node_journal_blocks) > CETRAFS_JOURNAL_MAX_BLOCKS) {
+        pr_err("superblock: per-node journal of %u blocks exceeds the format's %u\n",
+               le32_to_cpu(sb->node_journal_blocks), CETRAFS_JOURNAL_MAX_BLOCKS);
+        return -EINVAL;
+    }
 
     r[n++] = (struct cetrafs_region) {"superblock", 0, 1};
     r[n++] = (struct cetrafs_region) {"zone group table", le64_to_cpu(sb->zg_table_start), zg_cnt};

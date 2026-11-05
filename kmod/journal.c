@@ -150,6 +150,8 @@ static int cetrafs_journal_node_area(struct super_block *sb, u32 node_id, u64 *o
         *out_slots = 0;
         return 0;
     }
+    if (per_node > CETRAFS_JOURNAL_MAX_BLOCKS)
+        return -EINVAL; /* refused at mount too; the per-slot arrays are sized from it */
 
     *out_start = start + (u64) node_id * per_node;
     *out_slots = (per_node - 1) / CETRAFS_JOURNAL_SLOT_BLOCKS;
@@ -511,8 +513,8 @@ void cetrafs_journal_free(struct cetrafs_journal *j)
 {
     if (!j)
         return;
-    kfree(j->busy);
-    kfree(j->stuck_lba);
+    kvfree(j->busy);
+    kvfree(j->stuck_lba);
     kfree(j);
 }
 
@@ -597,11 +599,11 @@ int cetrafs_journal_attach_node(struct super_block *sb, u32 node_id)
     if (cetrafs_journal_slots_max && j->slots > cetrafs_journal_slots_max)
         j->slots = cetrafs_journal_slots_max; /* test-only: this mount writes fewer; replay still reads them all */
 
-    j->busy = kcalloc(BITS_TO_LONGS(j->slots), sizeof(unsigned long), GFP_KERNEL);
-    j->stuck_lba = kcalloc(j->slots, sizeof(*j->stuck_lba), GFP_KERNEL);
+    j->busy = kvcalloc(BITS_TO_LONGS(j->slots), sizeof(unsigned long), GFP_KERNEL);
+    j->stuck_lba = kvcalloc(j->slots, sizeof(*j->stuck_lba), GFP_KERNEL);
     if (!j->busy || !j->stuck_lba) {
-        kfree(j->busy);
-        kfree(j->stuck_lba);
+        kvfree(j->busy);
+        kvfree(j->stuck_lba);
         j->busy = NULL;
         j->stuck_lba = NULL;
         j->area_start = 0;
@@ -1503,7 +1505,7 @@ static int __cetrafs_journal_replay_node(struct super_block *sb, u32 node_id, bo
     if (ret || !dirty)
         goto out_release;
 
-    entries = kmalloc_array(slots, sizeof(*entries), GFP_KERNEL);
+    entries = kvmalloc_array(slots, sizeof(*entries), GFP_KERNEL);
     if (!entries) {
         ret = -ENOMEM;
         goto out_release;
@@ -1864,7 +1866,7 @@ consume:
     claimed = false;
 
 out_free:
-    kfree(entries);
+    kvfree(entries);
 out_release:
     if (claimed)
         cetrafs_journal_release_replay(sb, node_id, area_start, my_node_id, /*set_clean=*/false);

@@ -1341,6 +1341,13 @@ int main(int argc, char **argv)
      * tool an operator asks whether a volume is sound. Same checks,
      * same order, so both agree about what is mountable.
      */
+    /* Before the regions, as the mount does: the bound is the format's
+     * (cetrafs.h), not this device's. */
+    if (cetrafs_le32(sb.node_journal_blocks) > CETRAFS_JOURNAL_MAX_BLOCKS) {
+        fprintf(stderr, "ERR: per-node journal of %u blocks exceeds the format's %u\n",
+                cetrafs_le32(sb.node_journal_blocks), CETRAFS_JOURNAL_MAX_BLOCKS);
+        return 1;
+    }
     {
         struct {
             const char *name;

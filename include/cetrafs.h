@@ -669,6 +669,14 @@ typedef struct {
  * kmod/journal.c -- fsck walks these slots too. */
 #define CETRAFS_JOURNAL_SLOT_BLOCKS 2
 
+/* The largest per-node journal area a volume may declare: 16 GiB, about
+ * two million slots -- four orders of magnitude past the 2 MiB default.
+ * The kernel sizes per-slot arrays from it at mount and at every replay,
+ * so an unbounded value (a large -J, or a hostile image) was an
+ * allocation the size of the device. mkfs refuses past it, and the mount
+ * and fsck refuse a superblock past it (audit 2026-11-05, class 13/12). */
+#define CETRAFS_JOURNAL_MAX_BLOCKS (4u * 1024u * 1024u)
+
 /* ---- Node Registry (global table; dense packed entries, like the inode
  * table -- NOT one block per entry like the ZG/BG tables, since there are
  * far fewer nodes than BGs and a whole block each would be wasteful) ----
