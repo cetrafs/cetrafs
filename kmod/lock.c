@@ -365,6 +365,7 @@ struct cetrafs_inode_info {
      * one always mismatches and reads fresh -- same cold-start posture
      * as dirent_seq_cached above. */
     u64 file_seq_cached;
+    u64 file_seq_noted_at; /* this mount's stamp clock when file_seq_cached was noted */
 
     /* "Cold": the gate saw a PEER's stamp, so this inode's cached tree
      * blocks may name the wrong physical blocks and every tree read must
@@ -773,7 +774,14 @@ void cetrafs_inode_note_local_file_seq(struct inode *inode, u64 seq)
 {
     if (cetrafs_file_seq_skip_note)
         return;
+    CETRAFS_I(inode)->file_seq_noted_at = cetrafs_sb_stamp_now(inode->i_sb);
     CETRAFS_I(inode)->file_seq_cached = seq;
+}
+
+/* When the note above was taken, on this mount's stamp clock. */
+u64 cetrafs_inode_local_file_seq_at(struct inode *inode)
+{
+    return CETRAFS_I(inode)->file_seq_noted_at;
 }
 
 /* The seq our last file-sector publish stamped (U64_MAX: none noted for

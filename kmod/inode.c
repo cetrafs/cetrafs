@@ -132,6 +132,11 @@ void cetrafs_inode_stamp_crc_ns(cetrafs_inode_t *in)
 static unsigned long long cetrafs_file_seq_force_val;
 cetrafs_test_param(file_seq_force_val, cetrafs_file_seq_force_val, ullong, 0644);
 MODULE_PARM_DESC(file_seq_force_val, "TEST ONLY: stamp file_seq with this value instead of the clock (0 = off)");
+/* TEST ONLY: stamp file_seq this many ns in the past of the clock -- a
+ * publish noted long ago (tests/kernel/file_seq_wrap.sh). 0 = off. */
+static unsigned long long cetrafs_file_seq_force_age_ns;
+cetrafs_test_param(file_seq_force_age_ns, cetrafs_file_seq_force_age_ns, ullong, 0644);
+MODULE_PARM_DESC(file_seq_force_age_ns, "TEST ONLY: stamp file_seq this many ns in the past (0 = off)");
 
 u64 cetrafs_file_seq_new(struct super_block *sb)
 {
@@ -141,7 +146,7 @@ u64 cetrafs_file_seq_new(struct super_block *sb)
     (void) cetrafs_sb_get_node_id(sb, &node_id);
     val = READ_ONCE(cetrafs_file_seq_force_val);
     if (!val)
-        val = cetrafs_sb_stamp_ns(sb);
+        val = cetrafs_sb_stamp_ns(sb) - READ_ONCE(cetrafs_file_seq_force_age_ns);
     val &= CETRAFS_FILE_SEQ_VAL_MASK;
     if (!val)
         val = 1;
@@ -2271,7 +2276,8 @@ int cetrafs_refresh_vfs_inode_if_newer(struct inode *inode)
         /* Same-node seqs embed the same clock's nanoseconds in the low
          * 48 bits, which never step backward within a mount
          * (cetrafs_sb_stamp_ns()) and wrap every ~3.26 days -- so they
-         * are ordered modulo the wrap (cetrafs_file_seq_before()), and
+         * are ordered by their age against that clock
+         * (cetrafs_sb_own_seq_older()), and
          * for OUR OWN stamps "older than the publish we noted" is
          * decidable -- and that is the only read that must be refused.
          * (A plain '<' called every stamp after a wrap older than the
@@ -2285,7 +2291,8 @@ int cetrafs_refresh_vfs_inode_if_newer(struct inode *inode)
         if (cached != U64_MAX && cetrafs_sb_get_node_id(sb, &my_node_id) == 0 &&
             CETRAFS_FILE_SEQ_NODE(cetrafs_le64(raw.file_seq)) == (u32) (my_node_id & 0xFFFFu) &&
             CETRAFS_FILE_SEQ_NODE(cached) == (u32) (my_node_id & 0xFFFFu) &&
-            cetrafs_file_seq_before(cetrafs_le64(raw.file_seq), cached)) {
+            cetrafs_sb_own_seq_older(sb, cetrafs_le64(raw.file_seq), cached,
+                                     cetrafs_inode_local_file_seq_at(inode))) {
             ctrace("FDREFRESH ino=%llu verdict=superseded rawseq=%llx cached=%llx rawsize=%llu coresize=%llu\n",
                    (unsigned long long) inode->i_ino, (unsigned long long) cetrafs_le64(raw.file_seq),
                    (unsigned long long) cached, (unsigned long long) cetrafs_le64(raw.size),

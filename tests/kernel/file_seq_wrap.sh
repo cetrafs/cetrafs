@@ -20,6 +20,14 @@
 # DISCRIMINATION: with the compare back to a plain '<', the stat shows
 # the old size.
 #
+# And ordering modulo the wrap is right only while two stamps are less
+# than HALF a wrap apart: a publish noted ~1.63 days before a newer
+# local one had the newer one judged older (audit L25). The last round
+# notes a publish stamped more than half a wrap ago
+# (file_seq_force_age_ns), then a local publisher that does not note
+# (file_seq_skip_note) stamps a newer one; the device's size is moved on
+# under it. Against the half-wrap compare the stat shows the old size.
+#
 # NOT COVERED: the backward step itself (cetrafs_sb_stamp_ns()). Staging
 # it means stepping the test box's real clock under everything else
 # running there; the per-mount clock is monotonic by construction, and
@@ -61,6 +69,25 @@ round() {
 round plain 1000
 # At the top: the next stamp wraps to 0.
 round wrap 281474976710655
+
+# More than half a wrap between our note and a newer own stamp.
+F="$MNT/f.halfwrap"
+ct_param_set file_seq_force_age_ns $(( (1 << 47) + 1000000000000 ))
+dd if=/dev/zero of="$F" bs=4096 count=2 conv=fsync status=none
+sync
+ct_param_set file_seq_force_age_ns 0
+ct_param_set file_seq_skip_note 1
+truncate -s 12288 "$F"
+sync
+ct_param_set file_seq_skip_note 0
+INO="$(stat -c %i "$F")"
+SEQ="$("$POKE" "$IMG" seq "$INO" 2>&1 | head -1)"
+"$POKE" "$IMG" setsize "$INO" 16384 2>/dev/null
+SZ="$(stat -c %s "$F")"
+log "halfwrap: record after the un-noted publish: $SEQ"
+[ "$SZ" = 16384 ] &&
+    pass "halfwrap: an own stamp newer by more than half a wrap was applied (size $SZ)" ||
+    fail "halfwrap: an own stamp newer by more than half a wrap was refused as superseded (size $SZ, want 16384)"
 
 ct_umount "$MNT"
 ct_exit

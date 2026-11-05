@@ -2871,7 +2871,7 @@ void cetrafs_sb_alloc_unlock(struct super_block *sb)
  * as it read at mount, advanced by the MONOTONIC clock, and strictly
  * increasing per mount. The real clock alone can step backward (NTP, an
  * operator), and a node's own stamps are ORDERED, not just compared
- * (cetrafs_file_seq_before()): a step back made a newer publish look
+ * (cetrafs_sb_own_seq_older()): a step back made a newer publish look
  * superseded and a needed refresh was declined. Anchored to the real
  * clock so a remount does not restart near values it handed out before.
  *
@@ -2896,6 +2896,41 @@ u64 cetrafs_sb_stamp_ns(struct super_block *sb)
         next = now > old ? now : old + 1;
     } while (!atomic64_try_cmpxchg(&sbi->stamp_last, &old, next));
     return (u64) next;
+}
+
+/* This mount's stamp clock now: never below a stamp already issued. */
+u64 cetrafs_sb_stamp_now(struct super_block *sb)
+{
+    struct cetrafs_sb_info *sbi = sb ? sb->s_fs_info : NULL;
+    s64 now, last;
+
+    if (!sbi)
+        return ktime_get_real_ns();
+    now = sbi->stamp_base + (s64) ktime_get_ns();
+    last = atomic64_read(&sbi->stamp_last);
+    return (u64) (now > last ? now : last);
+}
+
+/*
+ * Is own file_seq stamp `a` older than own stamp `b`? Both carry this
+ * mount's stamp clock in their low 48 bits, which wrap every ~3.26
+ * days. Ordering them modulo the wrap alone (as this used to) is right
+ * only while they are less than HALF a wrap apart: a file
+ * whose last noted publish was ~1.63 days before a newer local one had
+ * the newer one judged older and refused, and its in-core state went
+ * stale until close (audit L25) -- a VM image stays open that long.
+ * Both stamps are in the past of this clock, so each is unwrapped as
+ * its age against now, which orders any two inside a FULL wrap; a note
+ * older than that cannot be placed, and is not trusted to refuse
+ * anything (`noted_at` is the clock when it was taken).
+ */
+bool cetrafs_sb_own_seq_older(struct super_block *sb, u64 a, u64 b, u64 noted_at)
+{
+    u64 now = cetrafs_sb_stamp_now(sb);
+
+    if (now - noted_at >= CETRAFS_FILE_SEQ_VAL_MASK)
+        return false;
+    return ((now - a) & CETRAFS_FILE_SEQ_VAL_MASK) > ((now - b) & CETRAFS_FILE_SEQ_VAL_MASK);
 }
 
 /* Does the current task hold alloc_mutex (through the wrappers) or

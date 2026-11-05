@@ -1315,10 +1315,12 @@ typedef struct {
      * it perfectly. Exactly the bug dirent_seq was added
      * for; regular files were left on the old predicate.
      *
-     * Like dirent_seq this is a STAMP, not a counter: only equality is
-     * ever asked, so it needs to be unique per write rather than
-     * ordered -- two nodes incrementing from the same base would both
-     * write the same value for different content. Same generator.
+     * Like dirent_seq this is a STAMP, not a counter: it must be unique
+     * per write -- two nodes incrementing from the same base would both
+     * write the same value for different content. Across nodes only
+     * equality is asked. A node's OWN stamps are also ordered, by their
+     * age against its stamp clock (kmod's cetrafs_sb_own_seq_older()),
+     * which places any two inside the 48-bit wrap (~3.26 days).
      */
     __le64 file_seq;
 /* file_seq layout: the publishing node's registry row in the top 16
