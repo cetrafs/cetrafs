@@ -2244,6 +2244,11 @@ int cetrafs_fill_super(struct super_block *sb, struct fs_context *fc)
      * close. Falling back to a cap that is merely too generous for this
      * volume's capacity is fine -- the allocator returns -ENOSPC. */
     sb->s_maxbytes = min_t(loff_t, MAX_LFS_FILESIZE, (loff_t) (CETRAFS_MAX_FILE_BLOCKS * CETRAFS_BLOCK_SIZE));
+    /* link() and mkdir() refuse past this (EMLINK). Far below the u32
+     * the record stores, so links added by peers at once -- each checked
+     * against its own in-core count -- still cannot reach the wrap; the
+     * apply saturates as well (cetrafs_ns_apply_delta()). */
+    sb->s_max_links = CETRAFS_MAX_LINKS;
     {
         loff_t max_file_size;
         int rc = cetrafs_compute_max_file_size(sb, &max_file_size);

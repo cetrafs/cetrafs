@@ -217,6 +217,8 @@ int cetrafs_node_single_mounter_conflict(struct super_block *sb, const u8 *my_uu
 int cetrafs_node_nocaw_peer_exists(struct super_block *sb, const u8 *my_uuid, bool *out_exists);
 extern unsigned int cetrafs_stale_secs;
 extern unsigned int cetrafs_hb_interval_secs;
+/* sb->s_max_links: half the u32 nlink field, see fs.c */
+#define CETRAFS_MAX_LINKS 0x7fffffffu
 /* fs.c: the two above as a mount may take them -- bounded */
 unsigned int cetrafs_param_hb_interval_secs(void);
 unsigned int cetrafs_param_stale_secs(void);

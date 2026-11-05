@@ -2163,6 +2163,14 @@ static void cetrafs_ns_apply_delta(cetrafs_inode_t *rec, void *arg)
 
     if (live < 0)
         live = 0;
+    /* Saturate, never wrap: 2^32 links stored as (u32) read as 0 -- a
+     * dead inode, freed with its names still pointing at it. Peers add
+     * links without seeing each other's in-core count, so the VFS's
+     * s_max_links check alone cannot promise this (audit 2026-11-05,
+     * section 3; tests/kernel/nlink_saturates.sh). A count stuck high
+     * leaks; one that wrapped would free. */
+    if (live > U32_MAX)
+        live = U32_MAX;
     if (d->set_nlink_zero)
         live = 0;
     rec->nlink = cetrafs_cpu_to_le32((u32) live);
@@ -3236,6 +3244,12 @@ static int cetrafs_rename(struct mnt_idmap *idmap,
  * matching POSIX and how this filesystem has no way to represent a
  * directory with multiple parents.
  */
+/* TEST ONLY: pause a link between its fresh read and its +1, where a
+ * peer's links can land (tests/kernel/nlink_saturates.sh). */
+static unsigned int cetrafs_link_step_stall_ms;
+cetrafs_test_param(link_step_stall_ms, cetrafs_link_step_stall_ms, uint, 0644);
+MODULE_PARM_DESC(link_step_stall_ms, "TEST ONLY: pause a link between its record read and its nlink step");
+
 static int cetrafs_link_locked(struct dentry *old_dentry, struct inode *dir, struct dentry *dentry)
 {
     struct inode *inode = d_inode(old_dentry);
@@ -3332,6 +3346,8 @@ static int cetrafs_link_locked(struct dentry *old_dentry, struct inode *dir, str
      * the forced-fresh read that just verified the identity.
      */
     now = ktime_get_real_seconds();
+    if (cetrafs_link_step_stall_ms)
+        msleep(cetrafs_link_step_stall_ms); /* test-only, see the knob */
     ret = cetrafs_nlink_step(dir->i_sb, inode, cetrafs_le64(raw.generation), &raw, 1, now);
     if (ret)
         return ret;
