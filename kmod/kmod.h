@@ -216,6 +216,9 @@ int cetrafs_node_single_mounter_conflict(struct super_block *sb, const u8 *my_uu
 int cetrafs_node_nocaw_peer_exists(struct super_block *sb, const u8 *my_uuid, bool *out_exists);
 extern unsigned int cetrafs_stale_secs;
 extern unsigned int cetrafs_hb_interval_secs;
+/* fs.c: the two above as a mount may take them -- bounded */
+unsigned int cetrafs_param_hb_interval_secs(void);
+unsigned int cetrafs_param_stale_secs(void);
 u64 cetrafs_sb_get_fence_epoch(struct super_block *sb);
 void cetrafs_sb_set_fence_epoch(struct super_block *sb, u64 epoch);
 int cetrafs_sb_get_node_uuid(struct super_block *sb, u8 out[CETRAFS_NODE_UUID_LEN]);

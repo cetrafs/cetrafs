@@ -1292,8 +1292,8 @@ int cetrafs_fill_super(struct super_block *sb, struct fs_context *fc)
             sbi->file_lock_enabled = fci ? fci->file_lock : true;
             sbi->file_lock_requested = sbi->file_lock_enabled;
         }
-        sbi->hb_interval_secs = cetrafs_hb_interval_secs;
-        sbi->stale_secs = cetrafs_stale_secs;
+        sbi->hb_interval_secs = cetrafs_param_hb_interval_secs();
+        sbi->stale_secs = cetrafs_param_stale_secs();
 
         /* Per-peer liveness watch (see the struct's own comment). One
          * entry per Node Registry row. Its allocation failing used to be
@@ -3639,6 +3639,32 @@ void cetrafs_sb_set_auto_defrag_enabled(struct super_block *sb, bool on)
         WRITE_ONCE(sbi->auto_defrag_enabled, on);
 }
 
+/*
+ * The module-wide defaults, as a mount may take them. The parameters are
+ * TEST ONLY knobs -- suites compress the timing far below what the
+ * controls file allows an operator (5 s beat, 15 s window) -- but no
+ * value written to them may reach a mount unbounded: a stale window of
+ * 0 judged every peer dead at the floor of its advertised interval (a
+ * split-brain lever), and a large beat overflowed `secs * 1000` and
+ * `secs * 3 * HZ` (audit 2026-11-05, N5). The bounds are wide enough
+ * for every suite (a 1 s beat and 3 s window; a 3600 s beat to keep a
+ * tick out of a test) and nowhere near an overflow.
+ */
+#define CETRAFS_PARAM_HB_MAX_SECS    3600u
+#define CETRAFS_PARAM_STALE_MIN_SECS 3u
+#define CETRAFS_PARAM_STALE_MAX_SECS 86400u
+
+unsigned int cetrafs_param_hb_interval_secs(void)
+{
+    return clamp_t(unsigned int, READ_ONCE(cetrafs_hb_interval_secs), 1u, CETRAFS_PARAM_HB_MAX_SECS);
+}
+
+unsigned int cetrafs_param_stale_secs(void)
+{
+    return clamp_t(unsigned int, READ_ONCE(cetrafs_stale_secs), CETRAFS_PARAM_STALE_MIN_SECS,
+                   CETRAFS_PARAM_STALE_MAX_SECS);
+}
+
 /* This mount's heartbeat period and staleness window. Both fall back to
  * the module-wide default when the mount is gone or the value is zero,
  * so no caller has to handle a nonsense interval. */
@@ -3647,7 +3673,7 @@ unsigned int cetrafs_sb_hb_interval_secs(struct super_block *sb)
     struct cetrafs_sb_info *sbi = sb ? sb->s_fs_info : NULL;
     unsigned int v = sbi ? READ_ONCE(sbi->hb_interval_secs) : 0;
 
-    return v ? v : (cetrafs_hb_interval_secs ? cetrafs_hb_interval_secs : 1);
+    return v ? v : cetrafs_param_hb_interval_secs();
 }
 
 unsigned int cetrafs_sb_stale_secs(struct super_block *sb)
@@ -3655,7 +3681,7 @@ unsigned int cetrafs_sb_stale_secs(struct super_block *sb)
     struct cetrafs_sb_info *sbi = sb ? sb->s_fs_info : NULL;
     unsigned int v = sbi ? READ_ONCE(sbi->stale_secs) : 0;
 
-    return v ? v : cetrafs_stale_secs;
+    return v ? v : cetrafs_param_stale_secs();
 }
 
 void cetrafs_sb_set_hb_interval_secs(struct super_block *sb, unsigned int v)

@@ -72,10 +72,10 @@
  * starts looking like a dead node.
  */
 unsigned int cetrafs_hb_interval_secs = CETRAFS_HEARTBEAT_INTERVAL_SECS;
-module_param_named(hb_interval_secs, cetrafs_hb_interval_secs, uint, 0644);
-MODULE_PARM_DESC(
-    hb_interval_secs,
-    "seconds between heartbeat ticks (UNBOUNDED test knob; operator limits are on the per-mount controls file)");
+cetrafs_test_param(hb_interval_secs, cetrafs_hb_interval_secs, uint, 0644);
+MODULE_PARM_DESC(hb_interval_secs,
+                 "TEST ONLY: seconds between heartbeat ticks for mounts made after a write (clamped to 1..3600); "
+                 "operators use the per-mount controls file, which enforces the safe range");
 
 /* TEST ONLY: fail every heartbeat renewal without touching the device,
  * as a hung or unreachable LUN would (tests/kernel/lease_expiry.sh). */

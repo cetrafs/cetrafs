@@ -324,6 +324,43 @@ HITS="$(untraced_test_params "$K"/*.c | sed "s|$K/||")"
 [ -z "$HITS" ] && pass "test params: all $NTP TEST ONLY knobs log and taint on write" ||
     fail "test params: TEST ONLY knob declared without cetrafs_test_param() (no log, no taint): $(echo $HITS)"
 
+# N5 (audit 2026-11-05): hb_interval_secs and stale_secs were plain
+# module params whose descriptions said "UNBOUNDED test knob" -- words
+# the check above keys on neither -- and reached every mount unclamped: a
+# stale window of 0 is a split-brain lever, untraced and untainted. The
+# rule: a parameter is either a TEST ONLY knob (traced above) or listed
+# here with what it tunes and why no safety decision reads it. A new
+# plain parameter fails until someone has answered that.
+log "checking every plain module parameter is a listed tuning knob (N5)"
+PLAIN_OK='caw_probe:load-time only (0444): forces a CAW backend choice, refused if the device lacks it
+cas_selftest:runs the mount-time CAS self-test; off only skips a check that refuses nothing it would not
+dio_fill_holes:selects the O_DIRECT hole-fill path; both paths are the supported ones
+alloc_run_blocks:allocation run length (performance); next_run_len bounds it
+alloc_run_max_blocks:allocation run cap (performance)
+auto_defrag:background defrag on/off (performance)
+auto_defrag_min_pct:defrag trigger threshold (performance)
+auto_defrag_quiet_secs:defrag quiet period (performance)
+auto_defrag_min_extents:defrag trigger threshold (performance)
+bg_sweep_min_secs:rate limit of a statistics sweep (performance)
+ext_cache:extent-tree cache on/off; off reads the device every time
+scrub:background leak scrub on/off; off leaks until fsck, never frees
+scrub_interval_secs:scrub period (0 means the default)
+scrub_gap_secs:scrub pacing (0 means the default)
+node_uuid:load-time only (0444): this node identity
+pf_full_backoff_ms:pending-free queue backoff (latency)
+pf_drain_min_ms:pending-free drain rate limit (latency)'
+plain_params() { grep -hoE '^module_param(_named)?\([a-z_0-9]+' "$@" | sed -E 's/^module_param(_named)?\(//' | sort -u; }
+UNLISTED="$(plain_params "$K"/*.c | while read -r n; do grep -q "^$n:" <<<"$PLAIN_OK" || echo "$n"; done)"
+NPLAIN="$(plain_params "$K"/*.c | wc -l)"
+[ "$NPLAIN" -ge 10 ] || fail "plain params: found only $NPLAIN -- the scan is not seeing the tree"
+[ -z "$UNLISTED" ] && pass "plain params: all $NPLAIN plain module parameters are listed tuning knobs" ||
+    fail "plain params: not TEST ONLY and not listed (bound it or trace it): $(echo $UNLISTED)"
+SAMPLE="$(ct_tmp plainparam-sample).c"
+printf '%s\n' 'module_param_named(stale_secs, cetrafs_stale_secs, uint, 0644);' >"$SAMPLE"
+[ "$(plain_params "$SAMPLE")" = stale_secs ] && ! grep -q "^stale_secs:" <<<"$PLAIN_OK" &&
+    pass "plain params: control -- the old plain stale_secs would be flagged" ||
+    fail "plain params: control -- the old plain stale_secs would not be flagged"
+
 # Every site that MODIFIES a tail-checksummed block must restamp it.
 #
 # v0x000F gave extent-leaf and xattr blocks the tail that dirent blocks

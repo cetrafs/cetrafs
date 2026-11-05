@@ -1147,10 +1147,10 @@ int cetrafs_node_mark_offline(struct super_block *sb, u32 my_node_id)
  * and an ordinarily slow node gets reclaimed out from under itself.
  */
 unsigned int cetrafs_stale_secs = CETRAFS_NODE_STALE_SECS;
-module_param_named(stale_secs, cetrafs_stale_secs, uint, 0644);
+cetrafs_test_param(stale_secs, cetrafs_stale_secs, uint, 0644);
 MODULE_PARM_DESC(stale_secs,
-                 "seconds a peer may stall before treated as dead (UNBOUNDED test knob; operator limits are on the "
-                 "per-mount controls file)");
+                 "TEST ONLY: seconds a peer may stall before treated as dead, for mounts made after a write (clamped "
+                 "to 3..86400); operators use the per-mount controls file, which enforces the safe range");
 
 /* TEST ONLY: make the no-CAW mount gate's live-peer check report a live
  * foreign peer unconditionally, skipping the heartbeat watch. On the loop
