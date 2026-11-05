@@ -121,6 +121,11 @@ struct cetrafs_sb_info {
          * hb_seq above, which the next tick re-samples. */
         u64 judged_seq;
         bool judged;
+        /* The hb_seq the last fence of this row landed on: what every
+         * reclaim CAS that follows the fence must still find on the row
+         * AFTER it lands (cetrafs_node_reattached_since_fence()). */
+        u64 fenced_seq;
+        bool fenced;
     } *peers;
     u32 peer_count;
 
@@ -2360,6 +2365,35 @@ bool cetrafs_sb_peer_watched_seq(struct super_block *sb, u32 node_id, u64 *out)
     spin_lock(&sbi->peer_lock);
     if (sbi->peers[node_id].judged) {
         *out = sbi->peers[node_id].judged_seq;
+        valid = true;
+    }
+    spin_unlock(&sbi->peer_lock);
+    return valid;
+}
+
+/* Record / fetch the hb_seq a fence of this peer's row landed on. */
+void cetrafs_sb_peer_note_fenced(struct super_block *sb, u32 node_id, u64 seq)
+{
+    struct cetrafs_sb_info *sbi = sb->s_fs_info;
+
+    if (!sbi || !sbi->peers || node_id >= sbi->peer_count)
+        return;
+    spin_lock(&sbi->peer_lock);
+    sbi->peers[node_id].fenced_seq = seq;
+    sbi->peers[node_id].fenced = true;
+    spin_unlock(&sbi->peer_lock);
+}
+
+bool cetrafs_sb_peer_fenced_seq(struct super_block *sb, u32 node_id, u64 *out)
+{
+    struct cetrafs_sb_info *sbi = sb->s_fs_info;
+    bool valid = false;
+
+    if (!sbi || !sbi->peers || node_id >= sbi->peer_count)
+        return false;
+    spin_lock(&sbi->peer_lock);
+    if (sbi->peers[node_id].fenced) {
+        *out = sbi->peers[node_id].fenced_seq;
         valid = true;
     }
     spin_unlock(&sbi->peer_lock);

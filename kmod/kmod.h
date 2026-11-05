@@ -172,6 +172,8 @@ int cetrafs_sb_get_node_id(struct super_block *sb, u32 *out);
  * cross-node timestamp, so clock skew cannot affect it. */
 bool cetrafs_sb_peer_progress_stale(struct super_block *sb, u32 node_id, u64 hb_seq, u32 peer_hb_interval);
 bool cetrafs_sb_peer_watched_seq(struct super_block *sb, u32 node_id, u64 *out);
+void cetrafs_sb_peer_note_fenced(struct super_block *sb, u32 node_id, u64 seq);
+bool cetrafs_sb_peer_fenced_seq(struct super_block *sb, u32 node_id, u64 *out);
 void cetrafs_node_report_clock_skew(struct super_block *sb);
 void cetrafs_node_seed_peer_watch(struct super_block *sb);
 bool cetrafs_cluster_all_advertise(struct super_block *sb, u32 cap);
@@ -803,6 +805,7 @@ int cetrafs_node_renew_heartbeat(struct super_block *sb, u32 my_node_id);
 int cetrafs_node_is_stale(struct super_block *sb, u32 node_id, bool *out_stale);
 /* The fence lease -- see cetrafs_node_entry_t.fence_epoch. */
 int __must_check cetrafs_node_fence_peer(struct super_block *sb, u32 node_id, const char *what);
+bool cetrafs_node_reattached_since_fence(struct super_block *sb, u32 node_id);
 int cetrafs_node_self_fence_check(struct super_block *sb, u32 my_node_id, bool *out_fenced);
 int cetrafs_node_get_entry(struct super_block *sb, u32 idx, cetrafs_node_entry_t *out);
 u64 cetrafs_node_row_lba(struct super_block *sb, u32 idx);

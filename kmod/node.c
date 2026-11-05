@@ -323,6 +323,7 @@ struct cetrafs_node_fence_ctx {
     bool have_seq;  /* the watch sampled the row: seq is what it judged */
     u64 seq;
     bool reattached; /* out: refused, the row's owner came back */
+    u64 landed_seq;  /* out: the row's hb_seq in the image the fence committed */
 };
 
 static int cetrafs_node_fence_mutate(void *image, unsigned int len, void *priv)
@@ -359,6 +360,7 @@ static int cetrafs_node_fence_mutate(void *image, unsigned int len, void *priv)
 
     ne.fence_epoch = cetrafs_cpu_to_le64(cetrafs_le64(ne.fence_epoch) + 1);
     ctx->seen_epoch = cetrafs_le64(ne.fence_epoch);
+    ctx->landed_seq = cetrafs_le64(ne.hb_seq);
     /* Record the verdict as well as revoking the lease: last_seen = 0 is
      * this format's "left deliberately" sentinel, and writing it means
      * the next observer costs one block read instead of another full
@@ -479,11 +481,64 @@ static int cetrafs_node_fence_peer_full(struct super_block *sb, u32 node_id, con
                            what);
         return ret;
     }
-    if (ctx.seen_epoch)
+    if (ctx.seen_epoch) {
         pr_info("fence: revoked stale node %u's lease (epoch %llu) while reclaiming %s\n", node_id,
                 (unsigned long long) ctx.seen_epoch, what);
+        cetrafs_sb_peer_note_fenced(sb, node_id, ctx.landed_seq);
+    }
     return 0;
 }
+
+/* TEST ONLY: report every reclaim as racing a re-attach (the steal is
+ * given back), or never (the pre-fix behaviour). -1 = off. */
+static int cetrafs_reattach_after_fence_force = -1;
+module_param_named(reattach_after_fence_force, cetrafs_reattach_after_fence_force, int, 0644);
+MODULE_PARM_DESC(reattach_after_fence_force, "TEST ONLY: 1 = every reclaim sees a re-attach, 0 = none, -1 = real");
+
+/*
+ * After a reclaim CAS on a claim 'node_id' held -- a lock steal, a
+ * reader bit cleared, a namespace lock broken: was the row still the
+ * incarnation the fence revoked when the CAS landed?
+ *
+ * The fence is the reclaim's first act and is bound to the incarnation
+ * judged stale; the CAS comes after a journal replay and more reads, and
+ * compares only the row NUMBER on the claim. A node that re-attached in
+ * between, swept its own leftover claims and took the same one again
+ * wrote the very bytes the CAS compares -- so the CAS took a live
+ * node's lock, or its reader bit, and neither side could tell.
+ *
+ * Re-attaching moves hb_seq, and a re-attach always precedes the re-claim
+ * it would take; so a row whose hb_seq is still the one the fence landed
+ * on, read AFTER the CAS, proves the CAS took nothing live. Anything
+ * else -- moved, unreadable, never fenced -- answers true, and the
+ * caller gives the claim back.
+ */
+bool cetrafs_node_reattached_since_fence(struct super_block *sb, u32 node_id)
+{
+    const cetrafs_superblock_t *raw_sb = cetrafs_sb_raw(sb);
+    cetrafs_node_entry_t ne;
+    u64 fenced;
+
+    if (cetrafs_reattach_after_fence_force >= 0)
+        return cetrafs_reattach_after_fence_force > 0;
+    if (!raw_sb || node_id >= le32_to_cpu(raw_sb->node_table_count))
+        return false; /* never handed out: nobody to come back */
+    if (cetrafs_read_node_entry(sb, node_id, &ne))
+        return true;
+    if (cetrafs_le32(ne.state) != CETRAFS_NODE_STATE_REGISTERED)
+        return false; /* nobody holds the row: nothing live to have taken */
+    if (!cetrafs_sb_peer_fenced_seq(sb, node_id, &fenced))
+        return true;
+    return cetrafs_le64(ne.hb_seq) != fenced;
+}
+
+/* TEST ONLY, one-shot: hold the gap between a reclaim's fence and the
+ * CAS that takes the claim, where the holder re-attaching is the race
+ * cetrafs_node_reattached_since_fence() settles
+ * (tests/kernel/reclaim_vs_reattach.sh). */
+static unsigned int cetrafs_reclaim_stall_after_fence_ms;
+module_param_named(reclaim_stall_after_fence_ms, cetrafs_reclaim_stall_after_fence_ms, uint, 0644);
+MODULE_PARM_DESC(reclaim_stall_after_fence_ms, "TEST ONLY: pause once between a reclaim's fence and its CAS");
 
 int cetrafs_node_fence_peer(struct super_block *sb, u32 node_id, const char *what)
 {
@@ -509,7 +564,14 @@ int cetrafs_node_fence_peer(struct super_block *sb, u32 node_id, const char *wha
         if (stall)
             msleep(stall); /* TEST ONLY: see the parameter */
     }
-    return cetrafs_node_fence_peer_full(sb, node_id, what, false, true);
+    {
+        int ret = cetrafs_node_fence_peer_full(sb, node_id, what, false, true);
+        unsigned int stall = ret ? 0 : xchg(&cetrafs_reclaim_stall_after_fence_ms, 0);
+
+        if (stall)
+            msleep(stall); /* TEST ONLY: see the parameter */
+        return ret;
+    }
 }
 
 /*

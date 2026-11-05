@@ -312,6 +312,34 @@ out:
 }
 
 
+/* Put a broken namespace lock back to the holder it was taken from,
+ * only while it is still ours (cetrafs_nslock_try()). */
+struct cetrafs_nslock_giveback_ctx {
+    u64 generation;
+    u32 from, to;
+};
+
+static int cetrafs_nslock_giveback_mutate(void *image, unsigned int len, void *priv)
+{
+    struct cetrafs_nslock_giveback_ctx *g = priv;
+    cetrafs_inode_t rec;
+
+    if (len < CETRAFS_INODE_NS_BYTES)
+        return -EINVAL;
+    memset(&rec, 0, sizeof(rec));
+    memcpy(&rec, image, CETRAFS_INODE_NS_BYTES);
+    if (cetrafs_inode_crc_ns(&rec) != (u32) cetrafs_le64(rec.ns_checksum))
+        return -EUCLEAN;
+    if (cetrafs_le64(rec.generation) != g->generation)
+        return -ESTALE;
+    if (cetrafs_le32(rec.ns_lock_owner) != g->from)
+        return 1; /* moved on: nothing of ours to undo */
+    rec.ns_lock_owner = cetrafs_cpu_to_le32(g->to);
+    cetrafs_inode_stamp_crc_ns(&rec);
+    memcpy(image, &rec, CETRAFS_INODE_NS_BYTES);
+    return 0;
+}
+
 /* One acquire attempt. Returns 0 on success, -EBUSY if a live peer holds
  * it, or another errno. */
 static int cetrafs_nslock_try(struct inode *inode, u32 my_node_id)
@@ -362,8 +390,35 @@ static int cetrafs_nslock_try(struct inode *inode, u32 my_node_id)
      * exactly the state this decision was made against. */
     /* Seeded with the copy just read above -- saves re-reading the
      * same record inside the CAS (cetrafs_cas_region_seeded()). */
-    return cetrafs_cas_record_seeded(sb, cetrafs_inode_lba(sb, inode->i_ino), &raw, CETRAFS_INODE_NS_BYTES, cetrafs_nslock_mutate,
-                                     &ctx);
+    ret = cetrafs_cas_record_seeded(sb, cetrafs_inode_lba(sb, inode->i_ino), &raw, CETRAFS_INODE_NS_BYTES,
+                                    cetrafs_nslock_mutate, &ctx);
+    /*
+     * A broken lock: was its holder still the incarnation the fence
+     * revoked? The swap compares the holder's row NUMBER only, after a
+     * fence and a journal replay; a holder that re-attached, swept and
+     * took this lock again in that time wrote the very bytes it compares
+     * (lock.c's cetrafs_lock_undo_steal() has the full account). Give it
+     * back and wait, as for any live holder; a give-back that does not
+     * land would leave two namespace writers, so the mount stops.
+     */
+    if (ret == 0 && ctx.steal && cetrafs_node_reattached_since_fence(sb, ctx.steal_from)) {
+        struct cetrafs_nslock_giveback_ctx g = {
+            .generation = ctx.generation,
+            .from = my_node_id,
+            .to = ctx.steal_from,
+        };
+        int gret = cetrafs_cas_record(sb, cetrafs_inode_lba(sb, inode->i_ino), cetrafs_nslock_giveback_mutate, &g);
+
+        if (gret < 0)
+            cetrafs_sb_fatal(sb, "nslock: ino=%llu: node %u came back while its namespace lock was being broken, and "
+                             "the lock could not be given back (%d)",
+                             (unsigned long long) inode->i_ino, ctx.steal_from, gret);
+        else
+            pr_warn("nslock: ino=%llu: node %u came back while its namespace lock was being broken -- gave it back\n",
+                    (unsigned long long) inode->i_ino, ctx.steal_from);
+        return -EBUSY;
+    }
+    return ret;
 }
 
 /*
