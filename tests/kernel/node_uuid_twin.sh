@@ -19,7 +19,9 @@
 #  A. the row beats (a twin is mounted): the mount is refused, naming
 #     cetrafs.node_uuid;
 #  B. the row is a crash leftover that does not beat: re-attached;
-#  C. the row was left cleanly: re-attached without waiting.
+#  C. the row was left cleanly: re-attached without waiting;
+#  D. the twin is silent longer than two beats but less than the stale
+#     window a peer waits: still refused (audit L1).
 #
 # DISCRIMINATION: proven 2026-11-05 with the watch removed from
 # cetrafs_node_register() (cetrafs_node_row_quiet() not called): A mounts
@@ -75,5 +77,25 @@ require_cetrafs_mount "$MNT"
 grep -q "watching it" <<<"$(dmesg_since "$MARK")" && fail "C: it waited on a row it had left cleanly" ||
     pass "C: re-attached at once"
 ct_umount "$MNT"
+
+log "D: a twin whose paths stall longer than two beats, inside the stale window"
+# A peer calls a row dead only after the stale window; a live twin can
+# be silent that long (queued multipath I/O) and still be live. The
+# watch was two advertised beats + 5 s (7 s here) and re-attached over
+# it (audit L1). Stale window 20 s; the twin beats once, at 12 s.
+ct_param_set stale_secs 20
+"$NODE_POKE" "$DEV" 0 --beat >/dev/null
+( sleep 12; "$NODE_POKE" "$DEV" 0 --beat >/dev/null 2>&1 || true ) &
+TWIN=$!
+MARK="$(dmesg_mark)"
+rc=0
+mount -t cetrafs "$DEV" "$MNT" 2>/dev/null || rc=$?
+wait "$TWIN" 2>/dev/null || true
+if [ "$rc" != 0 ] && grep -q "same node UUID" <<<"$(dmesg_since "$MARK")"; then
+    pass "D: the mount waited out the stale window and saw the stalled twin beat"
+else
+    [ "$rc" = 0 ] && umount "$MNT"
+    fail "D: mount rc=$rc -- it took a row whose twin was silent less than the stale window"
+fi
 
 ct_exit

@@ -56,13 +56,14 @@ fi
 
 # A replayed image is, to the mount, a crash of this very machine: its
 # Node Registry row was not left cleanly, so registration watches that
-# row for two of its advertised heartbeat intervals + 5 s before
-# re-attaching (the twin-identity guard). At the default 15 s interval
-# that is 35 s a mount, and this rig mounts once per recorded barrier:
-# phase 1 alone took over two hours. Recording at a 1 s heartbeat makes
-# the rows advertise 1 s, so the guard still runs on every replay -- for
-# 7 s. The guard itself is kernel/node_uuid_twin.sh's to prove.
+# row for the stale window (at least four advertised intervals) before
+# re-attaching -- the twin-identity guard. At the defaults that is 120 s
+# a mount, and this rig mounts once per recorded barrier. This host runs
+# no peer, so the window is shrunk: a 1 s heartbeat and a 4 s stale
+# window, and the guard still runs on every replay -- for 4 s. The guard
+# itself is kernel/node_uuid_twin.sh's to prove.
 ct_param_set hb_interval_secs 1
+ct_param_set stale_secs 4
 
 SZ_MB=560
 SECTORS=$((SZ_MB * 1024 * 1024 / 512))

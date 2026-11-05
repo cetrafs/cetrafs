@@ -39,7 +39,8 @@ mkdir -p "$CT_BUILD"
 if [ ! -x "$REPLAY" ] || [ "$ROOT/tests/crash/replay-log.c" -nt "$REPLAY" ]; then
     cc -O2 -std=gnu99 -Wall -o "$REPLAY" "$ROOT/tests/crash/replay-log.c" || { fail "replay-log build failed"; ct_exit; }
 fi
-ct_param_set hb_interval_secs 1 # a replayed image's mount waits two intervals (see crash_consistency.sh)
+ct_param_set hb_interval_secs 1 # a replayed image's mount watches its row (see crash_consistency.sh)
+ct_param_set stale_secs 4
 
 SZ_MB=560
 SECTORS=$((SZ_MB * 1024 * 1024 / 512))

@@ -721,12 +721,10 @@ static int cetrafs_node_twin_row(struct super_block *sb, u32 mine, const u8 *uui
 }
 
 /*
- * Watch row 'idx' (as read into 'ne') for long enough that a node
- * beating at its advertised interval must move hb_seq at least once:
- * 0 if it did not, -EBUSY if it did. Two beats plus margin, the same
- * window the userspace tools use (devutil.h's cetrafs_probe_window());
- * the advertised interval is clamped so a corrupt row cannot park the
- * mount for days.
+ * Watch row 'idx' (as read into 'ne') for as long as a peer would wait
+ * before calling it dead: 0 if it did not beat, -EBUSY if it did. The
+ * advertised interval is clamped so a corrupt row cannot park the mount
+ * for days.
  */
 static int cetrafs_node_row_quiet(struct super_block *sb, u32 idx, const cetrafs_node_entry_t *ne)
 {
@@ -737,7 +735,14 @@ static int cetrafs_node_row_quiet(struct super_block *sb, u32 idx, const cetrafs
 
     if (!pi)
         pi = CETRAFS_HEARTBEAT_INTERVAL_SECS;
-    window = 2 * pi + 5;
+    /* The window every peer waits before it calls a row dead, and the
+     * tools' probe uses (devutil.h's cetrafs_probe_window()): a live twin
+     * whose paths stall for less than that must not read as gone. Two
+     * beats plus margin was 35 s against a 120 s stale window -- a twin
+     * stalled in between had its row taken (audit L1). The cost is an
+     * unclean re-attach waiting the stale window; a clean one waits not
+     * at all. */
+    window = max_t(u32, cetrafs_sb_stale_secs(sb), 4 * pi);
     pr_info(
         "node registration: row %u carries this machine's identity and was not left cleanly -- watching it "
         "%us to be sure no other machine is using it\n",
