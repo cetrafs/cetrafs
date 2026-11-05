@@ -1505,6 +1505,15 @@ int main(int argc, char **argv)
         }
 
         repair_row = cetrafs_repair_claim(fd, &sb, "fsck -r");
+        if (repair_row == -2) {
+            fprintf(stderr, "ERR: %s: another repair claimed this volume at the same time -- stopping\n", dev);
+            return FSCK_EXIT_NOEXAM;
+        }
+        if (repair_row == -3) {
+            fprintf(stderr, "ERR: %s: the superblock changed while this repair claimed the volume -- run it again\n",
+                    dev);
+            return FSCK_EXIT_NOEXAM;
+        }
         if (repair_row < 0) {
             fprintf(stderr,
                     "ERR: %s: no free Node Registry row to claim for the repair -- refusing to\n"

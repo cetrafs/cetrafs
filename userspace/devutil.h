@@ -279,6 +279,15 @@ static inline unsigned cetrafs_peer_probe_secs(void);
  * most of that window and still have writes queued to land. Watching
  * three renewals (15 s) let a second repair start under them.
  */
+/* How long a new repair claim settles before it looks for a concurrent
+ * claimant (cetrafs_repair_claim()): longer than the gap between any
+ * repairer's read of a free row and its write of the claim. */
+#define CETRAFS_REPAIR_SETTLE_SECS 2u
+static inline unsigned cetrafs_repair_settle_secs(void)
+{
+    return CETRAFS_REPAIR_SETTLE_SECS;
+}
+
 static inline unsigned cetrafs_repair_watch_secs(void)
 {
     unsigned knob = cetrafs_peer_probe_secs();
@@ -432,6 +441,36 @@ static inline int cetrafs_find_repair_claim(int fd,
  */
 static unsigned char cetrafs_repair_saved[CETRAFS_BLOCK_SIZE];
 static int cetrafs_repair_borrowed;
+/* This claim's identity, in the row's node_uuid (unused on a REPAIR
+ * row): a claim is OURS only while the row carries it. */
+static uint8_t cetrafs_repair_nonce[CETRAFS_NODE_UUID_LEN];
+
+/* Is the row at 'idx' still our claim? Async-signal-safe (pread). */
+static inline int cetrafs_repair_row_is_ours(int fd, const cetrafs_superblock_t *sb, uint32_t idx)
+{
+    cetrafs_node_entry_t ne;
+
+    if (pread(fd, &ne, sizeof(ne), cetrafs_node_row_off(sb, idx)) != (ssize_t) sizeof(ne))
+        return 0;
+    return cetrafs_le32(ne.state) == CETRAFS_NODE_STATE_REPAIR &&
+           !memcmp(ne.node_uuid, cetrafs_repair_nonce, sizeof(cetrafs_repair_nonce));
+}
+
+static inline void cetrafs_repair_new_nonce(void)
+{
+    int rfd = open("/dev/urandom", O_RDONLY | O_CLOEXEC);
+    struct timespec ts;
+    unsigned i;
+
+    if (rfd < 0 || read(rfd, cetrafs_repair_nonce, sizeof(cetrafs_repair_nonce)) !=
+                       (ssize_t) sizeof(cetrafs_repair_nonce)) {
+        clock_gettime(CLOCK_REALTIME, &ts);
+        for (i = 0; i < sizeof(cetrafs_repair_nonce); i++)
+            cetrafs_repair_nonce[i] = (uint8_t) ((ts.tv_nsec >> (i % 4 * 8)) ^ (getpid() >> (i % 2 * 8)) ^ i);
+    }
+    if (rfd >= 0)
+        close(rfd);
+}
 
 /* CETRAFS_PEER_PROBE_SECS is a test knob only: the suites cannot afford
  * a real stale window per assertion. Returns 0 when unset, which is
@@ -480,6 +519,7 @@ static inline unsigned cetrafs_probe_window(uint32_t max_advertised)
 }
 
 static inline void cetrafs_repair_timer(int fd, const cetrafs_superblock_t *sb, uint32_t row, int on);
+static inline void cetrafs_repair_release(int fd, const cetrafs_superblock_t *sb, uint32_t row);
 
 /*
  * May a repairer write registry rows where this superblock says the
@@ -542,8 +582,10 @@ static inline int cetrafs_node_table_placed_ok(int fd, const cetrafs_superblock_
     return 1;
 }
 
-/* Claim a row for this repairer. Returns the row, or -1 if none could
- * be taken (or the write failed) -- in which case the caller must not
+/* Claim a row for this repairer. Returns the row, -1 if none could be
+ * taken (or the write failed), -2 if another repairer claimed the
+ * volume at the same time, or -3 if the superblock changed between the
+ * caller's read and the claim -- in every failure the caller must not
  * proceed: an unclaimed repair is the thing being fixed. */
 static inline int cetrafs_repair_claim(int fd, const cetrafs_superblock_t *sb, const char *label)
 {
@@ -558,6 +600,12 @@ static inline int cetrafs_repair_claim(int fd, const cetrafs_superblock_t *sb, c
                         "repair claim there\n");
         return -1;
     }
+    /* Test hook only: hold between the caller's "is anyone repairing?"
+     * check and the claim, so a suite can start two repairers that both
+     * passed it (tests/kernel/repair_claim_concurrent.sh). */
+    if (getenv("CETRAFS_TEST_REPAIR_CLAIM_DELAY_SECS"))
+        cetrafs_sleep_full((unsigned) atoi(getenv("CETRAFS_TEST_REPAIR_CLAIM_DELAY_SECS")));
+    posix_fadvise(fd, 0, 0, POSIX_FADV_DONTNEED); /* the rows as the device has them, not our cache */
 
     /*
      * Pass 0 takes a free row; pass 1 borrows a cleanly departed one
@@ -629,6 +677,8 @@ static inline int cetrafs_repair_claim(int fd, const cetrafs_superblock_t *sb, c
             ne.state = cetrafs_cpu_to_le32(CETRAFS_NODE_STATE_REPAIR);
             ne.last_seen = cetrafs_cpu_to_le64((uint64_t) time(NULL));
             ne.hb_seq = cetrafs_cpu_to_le64(1);
+            cetrafs_repair_new_nonce();
+            memcpy(ne.node_uuid, cetrafs_repair_nonce, sizeof(ne.node_uuid));
             snprintf(ne.label, sizeof(ne.label), "%s", label);
             cetrafs_node_row_stamp(&ne);
 
@@ -647,6 +697,52 @@ static inline int cetrafs_repair_claim(int fd, const cetrafs_superblock_t *sb, c
             if (fsync(fd) != 0)
                 return -1;
             cetrafs_repair_timer(fd, sb, idx, 1); /* renewals from here until the release */
+            /* The claim is a blind write (the tools have no COMPARE AND
+             * WRITE), so two repairers starting together could each
+             * find the volume unclaimed and each claim it -- the same
+             * row, the last write winning, or two rows -- and repair it
+             * at once (audit L34). Settle, then look again past our
+             * page cache: a row that no longer carries our nonce was
+             * taken by the other one (not ours to release); a second
+             * REPAIR row is a concurrent claimant, and both yield --
+             * each repairer that sees the other stops, so the worst
+             * case is both stopping, never both writing. A claim landing
+             * after this look sees ours at its own and yields. */
+            {
+                uint32_t other;
+
+                cetrafs_sleep_full(cetrafs_repair_settle_secs());
+                posix_fadvise(fd, 0, 0, POSIX_FADV_DONTNEED);
+                if (!cetrafs_repair_row_is_ours(fd, sb, idx)) {
+                    cetrafs_repair_timer(fd, sb, idx, 0);
+                    cetrafs_repair_borrowed = 0;
+                    return -2;
+                }
+                for (other = 0; other < count; other++) {
+                    cetrafs_node_entry_t o;
+
+                    if (other == idx ||
+                        pread(fd, &o, sizeof(o), cetrafs_node_row_off(sb, other)) != (ssize_t) sizeof(o))
+                        continue;
+                    if (cetrafs_le32(o.state) == CETRAFS_NODE_STATE_REPAIR) {
+                        cetrafs_repair_release(fd, sb, idx);
+                        return -2;
+                    }
+                }
+            }
+            /* And the superblock the caller is about to act on was read
+             * BEFORE the claim: anything that changed it in between (a
+             * grow that finished, a mkfs) is now under our claim but not
+             * in our copy. Read it again, past the cache. */
+            {
+                unsigned char sblk[CETRAFS_BLOCK_SIZE];
+
+                if (pread(fd, sblk, sizeof(sblk), 0) != (ssize_t) sizeof(sblk) ||
+                    memcmp(sblk, sb, sizeof(*sb)) != 0) {
+                    cetrafs_repair_release(fd, sb, idx);
+                    return -3;
+                }
+            }
             return (int) idx;
         }
     }
@@ -664,7 +760,8 @@ static inline int cetrafs_repair_renew(int fd, const cetrafs_superblock_t *sb, u
     if (pread(fd, blk, sizeof(blk), cetrafs_node_row_off(sb, row)) != (ssize_t) sizeof(blk))
         return -1;
     memcpy(&ne, blk, sizeof(ne));
-    if (cetrafs_le32(ne.state) != CETRAFS_NODE_STATE_REPAIR)
+    if (cetrafs_le32(ne.state) != CETRAFS_NODE_STATE_REPAIR ||
+        memcmp(ne.node_uuid, cetrafs_repair_nonce, sizeof(cetrafs_repair_nonce)))
         return -1; /* somebody took our row: say so rather than fight */
     ne.last_seen = cetrafs_cpu_to_le64((uint64_t) time(NULL));
     ne.hb_seq = cetrafs_cpu_to_le64(cetrafs_le64(ne.hb_seq) + 1);
@@ -823,6 +920,10 @@ static inline void cetrafs_repair_release(int fd, const cetrafs_superblock_t *sb
     unsigned char blk[CETRAFS_BLOCK_SIZE];
 
     cetrafs_repair_timer(fd, sb, row, 0); /* no renewal may land after the release */
+    if (!cetrafs_repair_row_is_ours(fd, sb, row)) {
+        cetrafs_repair_borrowed = 0;
+        return; /* another repairer's claim now: not ours to give back */
+    }
     if (cetrafs_repair_borrowed) {
         memcpy(blk, cetrafs_repair_saved, sizeof(blk)); /* put the registration back */
         cetrafs_repair_borrowed = 0;

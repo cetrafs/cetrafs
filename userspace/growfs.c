@@ -718,6 +718,10 @@ int main(int argc, char **argv)
                     other[0] ? ", " : "", other[0] ? other : "");
 
         grow_repair_row = cetrafs_repair_claim(fd, &sb, "growfs");
+        if (grow_repair_row == -2)
+            die_dev("%s: another repair or grow claimed this volume at the same time -- stopping", dev);
+        if (grow_repair_row == -3)
+            die_dev("%s: the superblock changed while this grow claimed the volume -- run it again", dev);
         if (grow_repair_row < 0)
             die_dev("%s: no free Node Registry row to claim for the grow -- refusing to write while a node could "
                     "still mount it",
