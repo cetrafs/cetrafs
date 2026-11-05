@@ -649,10 +649,14 @@ int main(int argc, char **argv)
      * pending-free-queue reservation per ZG), which is itself one input
      * to solving B -- so a Zone Group count larger than the Block Group
      * count the device can actually back can't be caught until B comes
-     * out of this very computation. At most two passes are ever needed:
-     * pass 2 only ever *shrinks* zg_count, which can only free up more
-     * room for B, never less, so pass 2's own B can never again
-     * undershoot pass 2's (already-shrunk) zg_count. */
+     * out of this very computation. So it iterates until B backs every
+     * Zone Group. This used to stop after two passes on the argument
+     * that a shrunk zg_count only frees room for B -- but the smaller
+     * footprint can also flip the auto-tuned BG size back to 1 GiB, and
+     * a larger BG size means FEWER of them: pass 2's B could undershoot
+     * its own zg_count (audit L17). Each pass strictly shrinks zg_count,
+     * so the loop ends; the guard is for a solver that ever stops
+     * converging. */
     /* Per-ZG pending-free queue size. The target is a queue big enough
      * to absorb one large image's worth of freed extents (see the
      * header), but on a small device that reservation is a large
@@ -671,7 +675,9 @@ int main(int argc, char **argv)
      * a safeguard, it is dead code that reads like one. */
     const u32 pending_per_zg = CETRAFS_PENDING_FREE_BLOCKS_PER_ZG;
 
-    for (int pass = 0; pass < 2; pass++) {
+    for (int pass = 0;; pass++) {
+        if (pass >= 64)
+            die("internal calc error: the Zone Group / Block Group solve did not converge");
         zg_blocks = zg_count; /* 1 block each */
         pending_total_blk = (u64) pending_per_zg * zg_count;
         fixed_wo_B = sb_blocks + zg_blocks + i_bmap_blk + i_tbl_blk + node_tbl_blk + pending_total_blk + j_total_blk;

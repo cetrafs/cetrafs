@@ -543,7 +543,7 @@ u32 cetrafs_inode_next_run_len(struct inode *inode, u32 base, u32 max)
     if (!ci->resv_run || ci->resv_remaining)
         ci->resv_run = base;
     else
-        ci->resv_run = min_t(u32, ci->resv_run * 2, max);
+        ci->resv_run = (u32) min_t(u64, (u64) ci->resv_run * 2, max);
     len = ci->resv_run;
     spin_unlock(&ci->resv_lock);
     return len;
@@ -636,7 +636,7 @@ bool cetrafs_inode_ext_cache_lookup(struct inode *inode,
 
     spin_lock(&ci->resv_lock);
     if (ci->ext_valid && (cetrafs_ext_cache_trust_stale || cetrafs_ext_key_matches(ci, raw)) &&
-        iblock >= ci->ext_block && iblock < ci->ext_block + ci->ext_len) {
+        iblock >= ci->ext_block && (u64) iblock < (u64) ci->ext_block + ci->ext_len) {
         *out_lba = ci->ext_lba + (iblock - ci->ext_block);
         if (out_run)
             *out_run = ci->ext_len - (iblock - ci->ext_block);
