@@ -561,12 +561,36 @@ HITS="$(alloc_loops_without_resched "$K"/*.c | sed "s|$K/||")"
 [ -z "$HITS" ] && pass "alloc loops: every loop in the $NLOCK alloc_mutex sections reschedules" ||
     fail "alloc loops: a loop under alloc_mutex never reschedules, at: $(echo $HITS) -- add a periodic cond_resched() (class 13)"
 
+log "checking every whole-bitmap walk in alloc.c reschedules (class 13)"
+# The inline check above sees only loops written between alloc_lock and
+# alloc_unlock; the bitmap scans are static HELPERS called from inside
+# those sections, and were invisible to it (audit R18). Any function in
+# alloc.c that walks a bitmap block by block must reschedule in that loop.
+bitmap_walks_without_resched() {
+    awk '
+        /^[a-z].*\(/ && !/;$/ { fn = $0; sub(/\(.*/, "", fn); sub(/.*[ *]/, "", fn) }
+        /for \(blk = 0; blk < [a-z_.()> -]+; blk\+\+\)/ { inloop = 1; depth = 0; seen = 0; start = FNR }
+        inloop {
+            n = gsub(/\{/, "{"); m = gsub(/\}/, "}"); depth += n - m
+            if ($0 ~ /cond_resched\(\)/) seen = 1
+            if (depth <= 0 && FNR > start) { if (!seen) print FILENAME ":" start ":" fn; inloop = 0 }
+        }' "$@"
+}
+SAMPLE="$(ct_tmp bitmap-walk-sample)"
+printf '%s\n' 'static long scan(void)' '{' '    for (blk = 0; blk < nblocks; blk++) {' '        test(blk);' '    }' '}' >"$SAMPLE"
+[ -n "$(bitmap_walks_without_resched "$SAMPLE")" ] ||
+    fail "bitmap walks: the check does not flag the known-bad sample"
+NWALK="$(grep -cE 'for \(blk = 0; blk < ' "$K/alloc.c")"
+[ "$NWALK" -ge 4 ] || fail "bitmap walks: found only $NWALK block walks in alloc.c -- the scan is not seeing the tree"
+HITS="$(bitmap_walks_without_resched "$K/alloc.c" | sed "s|$K/||")"
+[ -z "$HITS" ] && pass "bitmap walks: all $NWALK block-by-block walks in alloc.c reschedule" ||
+    fail "bitmap walks: no cond_resched() in the walk at: $(echo $HITS) (class 13, audit R18)"
+
 log "checking no give-back of a claim discards its result (class 31)"
 # A claim given back with its result cast away is a claim kept for good
 # when the give-back fails: the holder keeps beating, so nothing else
 # ever clears it. Three of the four 2026-11-04 instances had exactly
-# this shape. The suspend-mark clears are the open R20 instance (TODO),
-# allowlisted by count so a fourth cannot hide behind them.
+# this shape, and the suspend-mark clears (R20) were the fourth.
 discarded_giveback() {
     grep -nE '\(void\) *cetrafs_(lock_clear_on_disk|inode_reclaim_claim|lock_cas|nslock_release[a-z_]*|lock_suspend_mark)\(' "$@" || true
 }
@@ -575,11 +599,8 @@ printf '%s\n' '    (void) cetrafs_lock_clear_on_disk(inode, false);' '    ret = 
 [ "$(discarded_giveback "$SAMPLE" | cut -d: -f1)" = 1 ] ||
     fail "give-backs: the check does not flag the known-bad sample"
 HITS="$(discarded_giveback "$K"/*.c | sed "s|$K/||")"
-OPEN="$(grep -c 'cetrafs_lock_suspend_mark(inode, false)' <<<"$HITS" || true)"
-OTHER="$(grep -v 'cetrafs_lock_suspend_mark(inode, false)' <<<"$HITS" || true)"
-[ -z "$OTHER" ] && [ "$OPEN" -le 3 ] &&
-    pass "give-backs: none discards its result (beyond the $OPEN known suspend-mark clears, R20)" ||
-    fail "give-backs: a claim's give-back result is discarded at: $(echo $OTHER) ($OPEN suspend-mark sites) -- queue it for the heartbeat (class 31)"
+[ -z "$HITS" ] && pass "give-backs: none discards its result" ||
+    fail "give-backs: a claim's give-back result is discarded at: $(echo $HITS) -- queue it for the heartbeat (class 31)"
 
 # BUG-CLASSES.md class 19, execution context. ->free_inode runs from an
 # RCU callback, in softirq: nothing in it may sleep. It held a

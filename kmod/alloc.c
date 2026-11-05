@@ -82,7 +82,12 @@ static long cetrafs_bitmap_alloc_bit(struct super_block *sb, u64 bmap_lba, u64 n
     u64 blk;
 
     for (blk = 0; blk < nblocks; blk++) {
-        struct buffer_head *bh = cetrafs_bread_retry(sb, bmap_lba + blk);
+        struct buffer_head *bh;
+
+        /* A whole-bitmap walk, under alloc_mutex: on a large Block
+         * Group that is seconds of CPU per pass (audit R18). */
+        cond_resched();
+        bh = cetrafs_bread_retry(sb, bmap_lba + blk);
         unsigned int byte;
 
         if (!bh)
@@ -164,7 +169,12 @@ static long cetrafs_bitmap_alloc_run_start(struct super_block *sb,
         return cetrafs_bitmap_alloc_bit(sb, bmap_lba, nblocks, nbits, sync);
 
     for (blk = 0; blk < nblocks; blk++) {
-        struct buffer_head *bh = cetrafs_bread_retry(sb, bmap_lba + blk);
+        struct buffer_head *bh;
+
+        /* A whole-bitmap walk, under alloc_mutex: on a large Block
+         * Group that is seconds of CPU per pass (audit R18). */
+        cond_resched();
+        bh = cetrafs_bread_retry(sb, bmap_lba + blk);
         unsigned int byte;
 
         if (!bh)
@@ -326,7 +336,12 @@ static long cetrafs_bitmap_count_free(struct super_block *sb, u64 bmap_lba, u64 
     u64 free = 0;
 
     for (blk = 0; blk < nblocks; blk++) {
-        struct buffer_head *bh = cetrafs_bread_retry(sb, bmap_lba + blk);
+        struct buffer_head *bh;
+
+        /* A whole-bitmap walk, under alloc_mutex: on a large Block
+         * Group that is seconds of CPU per pass (audit R18). */
+        cond_resched();
+        bh = cetrafs_bread_retry(sb, bmap_lba + blk);
         unsigned int byte;
 
         if (!bh)
@@ -448,6 +463,7 @@ static long cetrafs_inode_bitmap_cas_alloc(struct super_block *sb)
     u64 blk;
 
     for (blk = 0; blk < nblocks; blk++) {
+        cond_resched();
         unsigned int r;
 
         for (r = 0; r < regions_per_block; r++) {
@@ -1286,8 +1302,10 @@ int cetrafs_bg_invalidate_cache(struct super_block *sb, u32 bg_id)
 
     bmap_lba = bg.start_block + bg.off_data_bmap;
     bmap_blocks = bg.off_data_region - bg.off_data_bmap;
-    for (blk = 0; blk < bmap_blocks; blk++)
+    for (blk = 0; blk < bmap_blocks; blk++) {
+        cond_resched();
         cetrafs_invalidate_block(sb, bmap_lba + blk);
+    }
 
     return 0;
 }
@@ -2108,9 +2126,11 @@ void cetrafs_shadow_seed(struct super_block *sb)
         if (cetrafs_read_bg_geom(sb, bg_id, &bg))
             continue;
         for (blk = 0; blk < bg.off_data_region - bg.off_data_bmap; blk++) {
-            struct buffer_head *bh = cetrafs_bread_retry(sb, bg.start_block + bg.off_data_bmap + blk);
+            struct buffer_head *bh;
             u64 i;
 
+            cond_resched();
+            bh = cetrafs_bread_retry(sb, bg.start_block + bg.off_data_bmap + blk);
             if (!bh)
                 break;
             for (i = 0; i < CETRAFS_BLOCK_SIZE * 8 && bit < bg.data_block_count; i++, bit++)
@@ -3069,6 +3089,7 @@ int cetrafs_bg_release_bitmap_ready(struct super_block *sb, u32 b)
         }
     }
     for (blk = 0; blk < nblocks; blk++) {
+        cond_resched();
         ret = cetrafs_sync_one_block(sb, lba + blk);
         if (ret)
             return ret;
@@ -3086,8 +3107,10 @@ void cetrafs_bg_release_drop_bitmap(struct super_block *sb, u32 b)
 
     if (cetrafs_read_bg_geom(sb, b, &bg) || bg.off_data_region <= bg.off_data_bmap)
         return;
-    for (blk = 0; blk < (u64) bg.off_data_region - bg.off_data_bmap; blk++)
+    for (blk = 0; blk < (u64) bg.off_data_region - bg.off_data_bmap; blk++) {
+        cond_resched();
         cetrafs_invalidate_block(sb, bg.start_block + bg.off_data_bmap + blk);
+    }
 }
 
 /*
