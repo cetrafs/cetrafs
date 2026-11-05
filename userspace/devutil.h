@@ -987,7 +987,7 @@ static inline int cetrafs_repair_claim(int fd, const cetrafs_superblock_t *sb, c
 
 /* Refresh the lease. Cheap enough to call often; the caller decides how
  * often, and "too rarely" means a mount can slip in mid-repair. */
-static inline int cetrafs_repair_renew(int fd, const cetrafs_superblock_t *sb, uint32_t row)
+static inline int __cetrafs_repair_renew(int fd, const cetrafs_superblock_t *sb, uint32_t row)
 {
     unsigned char blk[CETRAFS_BLOCK_SIZE];
     cetrafs_node_entry_t ne;
@@ -1020,6 +1020,30 @@ static inline int cetrafs_repair_renew(int fd, const cetrafs_superblock_t *sb, u
     if (fdatasync(fd) != 0)
         return -1;
     return 0;
+}
+
+/*
+ * The SIGALRM timer below renews the same row through the same function
+ * and the same static CAW buffer, and the tools also renew from their
+ * work loops. A tick landing between a main-line renewal's read and its
+ * CAW changed the row under it: the CAW miscompared, and fsck -r stopped
+ * with "this repair's registry claim was taken away" when nothing had
+ * taken it (audit 2026-11-05, N7). So the tick is held off for the
+ * length of a renewal. sigprocmask() is async-signal-safe, and inside
+ * the handler SIGALRM is already blocked, so the timer's own call is
+ * unchanged.
+ */
+static inline int cetrafs_repair_renew(int fd, const cetrafs_superblock_t *sb, uint32_t row)
+{
+    sigset_t alrm, old;
+    int ret;
+
+    sigemptyset(&alrm);
+    sigaddset(&alrm, SIGALRM);
+    sigprocmask(SIG_BLOCK, &alrm, &old);
+    ret = __cetrafs_repair_renew(fd, sb, row);
+    sigprocmask(SIG_SETMASK, &old, NULL);
+    return ret;
 }
 
 /*
