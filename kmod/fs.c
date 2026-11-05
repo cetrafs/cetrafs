@@ -801,6 +801,14 @@ static int cetrafs_validate_layout(const cetrafs_superblock_t *sb, u64 total_blo
     u64 zg_cnt = le32_to_cpu(sb->zone_group_count);
     u64 bg_cnt = le32_to_cpu(sb->block_group_count);
 
+    /* A zero-sized pending-free queue gives every cross-node free
+     * nowhere to go: each one leaks. fsck refuses the volume for it; the
+     * mount used to accept it (audit L11). */
+    if (!le32_to_cpu(sb->pending_free_blocks_per_zg)) {
+        pr_err("superblock: the pending-free queue has zero blocks per Zone Group\n");
+        return -EINVAL;
+    }
+
     r[n++] = (struct cetrafs_region) {"superblock", 0, 1};
     r[n++] = (struct cetrafs_region) {"zone group table", le64_to_cpu(sb->zg_table_start), zg_cnt};
     /* the FIRST SEGMENT only. The Block Group table is a chain: the run at

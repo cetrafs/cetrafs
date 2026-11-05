@@ -71,6 +71,7 @@ check inode_bmap_start 6 "the inode bitmap would overlap the inode table"
 check pending_free_start 6 "the pending-free queues would overlap the inode table"
 check node_table_start 1 "the Node Registry would sit on the Zone Group table"
 check zg_table_start 0 "the Zone Group table would sit on the superblock"
+check pending_free_blocks_per_zg 0 "every cross-node free would have nowhere to go, and leak (fsck refuses it too)"
 
 log "a region that runs off the end of the device is refused"
 check bg_regions_start 300000 "the Block Group data regions would extend past total_blocks"
