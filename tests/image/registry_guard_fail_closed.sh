@@ -26,8 +26,8 @@ IMG="$(ct_image 560 guardio)"
 DEV="$(ct_loop "$IMG")"
 ct_mkfs "$DEV" -z 1 -b 512 -J 0 -N 1024 -f >/dev/null
 
-NT_START="$("$SB_POKE" "$DEV" | grep -oP "^node_table_start=\K[0-9]+")"
-NT_BLOCKS="$("$SB_POKE" "$DEV" | grep -oP "^node_table_blocks=\K[0-9]+")"
+NT_START="$("$SB_POKE" "$DEV" | sed -n "s/^node_table_start=\([0-9][0-9]*\).*/\1/p")"
+NT_BLOCKS="$("$SB_POKE" "$DEV" | sed -n "s/^node_table_blocks=\([0-9][0-9]*\).*/\1/p")"
 SECT_START=$((NT_START * 8)) # 4KiB blocks -> 512B sectors
 SECT_COUNT=$((NT_BLOCKS * 8))
 TOTAL=$(blockdev --getsz "$DEV")

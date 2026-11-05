@@ -29,7 +29,7 @@ IMG="$(ct_image 560 countconv)"
 DEV="$(ct_loop "$IMG")"
 ct_mkfs "$DEV" -z 1 -b 512 -J 1 -M 4 -N 1024 -f >/dev/null
 
-BASE="$("$BG_POKE" "$DEV" 0 --dump | grep -oP 'free_data_blocks=\K[0-9]+')"
+BASE="$("$BG_POKE" "$DEV" 0 --dump | sed -n 's/.*free_data_blocks=\([0-9][0-9]*\).*/\1/p')"
 
 log "the crash state: BG count moved, ZG aggregate not (two caches disagree)"
 # Drift the BG count only (no sync-zg): BG != bitmap AND BG-sum != ZG --
@@ -50,7 +50,7 @@ if ct_fsck "$DEV" >/dev/null 2>&1; then
 else
     fail "no convergence -- fsck still unhappy after -r: $(ct_fsck "$DEV" 2>&1 | grep -i err | head -3)"
 fi
-[ "$("$BG_POKE" "$DEV" 0 --dump | grep -oP 'free_data_blocks=\K[0-9]+')" = "$BASE" ] &&
+[ "$("$BG_POKE" "$DEV" 0 --dump | sed -n 's/.*free_data_blocks=\([0-9][0-9]*\).*/\1/p')" = "$BASE" ] &&
     pass "the repaired count equals the bitmap truth it was derived from" ||
     fail "repair wrote $("$BG_POKE" "$DEV" 0 --dump), expected free_data_blocks=$BASE"
 

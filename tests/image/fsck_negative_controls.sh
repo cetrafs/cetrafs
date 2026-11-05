@@ -148,9 +148,9 @@ mkfs_fresh
 # +1000 clears BG0's header and bitmap so this lands in its DATA region:
 # the bare region start is the BG header, which is correctly not a legal
 # journal target and would fire the range check instead of this one.
-BG_START="$(grep -oP 'BG regions start: LBA \K[0-9]+' <<<"$MKFS_OUT")"
+BG_START="$(sed -n 's/.*BG regions start: LBA \([0-9][0-9]*\).*/\1/p' <<<"$MKFS_OUT")"
 JP_OUT="$("$JOURNAL_POKE" "$LOOPDEV" 0 0 $((BG_START + 1000)) "$PAYLOAD")"
-PAY_LBA="$(grep -oP 'payload_lba=\K[0-9]+' <<<"$JP_OUT")"
+PAY_LBA="$(sed -n 's/.*payload_lba=\([0-9][0-9]*\).*/\1/p' <<<"$JP_OUT")"
 if [ -n "$PAY_LBA" ]; then
     # Alter the payload, leaving the header's checksum of the ORIGINAL
     # payload in place. FLIP the first byte rather than writing a
@@ -171,7 +171,7 @@ if [ -n "$PAY_LBA" ]; then
     # reads as an entry and only its checksum can tell.
     mkfs_fresh
     JP_OUT="$("$JOURNAL_POKE" "$LOOPDEV" 0 0 $((BG_START + 1000)) "$PAYLOAD")"
-    HDR_LBA=$(($(grep -oP 'payload_lba=\K[0-9]+' <<<"$JP_OUT") - 1))
+    HDR_LBA=$(($(sed -n 's/.*payload_lba=\([0-9][0-9]*\).*/\1/p' <<<"$JP_OUT") - 1))
     ORIG_BYTE="$(dd if="$LOOPDEV" bs=1 skip=$((HDR_LBA * 4096 + 8)) count=1 2>/dev/null | od -An -tu1 | tr -d ' ')"
     printf "$(printf '\\%03o' $(((ORIG_BYTE ^ 0xff) & 0xff)))" |
         dd of="$LOOPDEV" bs=1 seek=$((HDR_LBA * 4096 + 8)) conv=notrunc 2>/dev/null
@@ -197,10 +197,10 @@ expect_caught "outside every BG data region" \
 # owner would clear bits in somebody else's bitmap on its next drain.
 log "pending-free: entry belonging to another ZG"
 mkfs_fresh
-ZGS="$(grep -oP '^\s*ZGs: \K[0-9]+' <<<"$MKFS_OUT")"
-BGS="$(grep -oP '^\s*ZGs: [0-9]+, BGs: \K[0-9]+' <<<"$MKFS_OUT")"
-BGSZ="$(grep -oP 'BG size: \K[0-9]+' <<<"$MKFS_OUT")"
-BG_START="$(grep -oP 'BG regions start: LBA \K[0-9]+' <<<"$MKFS_OUT")"
+ZGS="$(sed -n 's/^[[:space:]]*ZGs: \([0-9][0-9]*\).*/\1/p' <<<"$MKFS_OUT")"
+BGS="$(sed -n 's/^[[:space:]]*ZGs: [0-9][0-9]*, BGs: \([0-9][0-9]*\).*/\1/p' <<<"$MKFS_OUT")"
+BGSZ="$(sed -n 's/.*BG size: \([0-9][0-9]*\).*/\1/p' <<<"$MKFS_OUT")"
+BG_START="$(sed -n 's/.*BG regions start: LBA \([0-9][0-9]*\).*/\1/p' <<<"$MKFS_OUT")"
 if [ -n "$ZGS" ] && [ -n "$BGS" ] && [ -n "$BGSZ" ] && [ -n "$BG_START" ] &&
    [ "$BGS" -gt 1 ] && [ "$ZGS" -gt 1 ]; then
     # mkfs assigns Block Groups ROUND-ROBIN, so Block Group b belongs to

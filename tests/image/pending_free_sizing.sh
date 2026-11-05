@@ -25,12 +25,12 @@ set -euo pipefail
 require_root
 suite "pending-free queue sizing"
 
-TARGET="$(grep -oP '#define CETRAFS_PENDING_FREE_BLOCKS_PER_ZG\s+\K[0-9]+' "$ROOT/include/cetrafs.h")"
+TARGET="$(sed -n 's/^#define CETRAFS_PENDING_FREE_BLOCKS_PER_ZG[[:space:]][[:space:]]*\([0-9][0-9]*\).*/\1/p' "$ROOT/include/cetrafs.h")"
 log "target=$TARGET blocks/ZG = $((TARGET * 256)) queued extents per Zone Group"
 
 SBP="$(ct_helper sb_poke)"
 
-field() { "$SBP" "$1" | grep -oP "$2=\K[0-9]+"; }
+field() { "$SBP" "$1" | sed -n "s/.*$2=\([0-9][0-9]*\).*/\1/p"; }
 
 # Sets PER/ZGS/PCT_USED. NOT a command substitution: fail() inside
 # $(...) runs in a subshell, so its failures never reach the suite's

@@ -52,7 +52,7 @@ MKFS_OUT="$("$ROOT/userspace/mkfs.cetra" "$CORRUPT_LOOPDEV" -z 1 -b 512 -J 0 -N 
 # the fixed-metadata layout (inode table, Node Registry, ...) changes
 # size. Flip a
 # byte in the header's pad[] region.
-BG_REGIONS_LBA="$(echo "$MKFS_OUT" | grep -oP 'BG regions start: LBA \K[0-9]+')"
+BG_REGIONS_LBA="$(echo "$MKFS_OUT" | sed -n 's/.*BG regions start: LBA \([0-9][0-9]*\).*/\1/p')"
 printf '\xFF' | dd of="$CORRUPT_LOOPDEV" bs=1 seek=$((BG_REGIONS_LBA * 4096 + 200)) count=1 conv=notrunc status=none
 if "$ROOT/userspace/fsck.cetra" "$CORRUPT_LOOPDEV" >/dev/null 2>&1; then
     fail "fsck did not detect a corrupted BG header pad byte"
@@ -68,7 +68,7 @@ MKFS_OUT="$("$ROOT/userspace/mkfs.cetra" "$CORRUPT_LOOPDEV" -z 1 -b 512 -J 0 -N 
 # BG-header test above for why). Root inode (#1) is the first record in
 # it. Flip a byte in 'reserved' (offset 68), a field no code reads or
 # writes, so only the new inode checksum can catch it.
-INODE_TABLE_LBA="$(echo "$MKFS_OUT" | grep -oP 'inode_table: LBA \K[0-9]+')"
+INODE_TABLE_LBA="$(echo "$MKFS_OUT" | sed -n 's/.*inode_table: LBA \([0-9][0-9]*\).*/\1/p')"
 printf '\xFF' | dd of="$CORRUPT_LOOPDEV" bs=1 seek=$((INODE_TABLE_LBA * 4096 + 68)) count=1 conv=notrunc status=none
 if "$ROOT/userspace/fsck.cetra" "$CORRUPT_LOOPDEV" >/dev/null 2>&1; then
     fail "fsck did not detect a corrupted root inode reserved byte"
@@ -106,7 +106,7 @@ truncate -s 5G "$SMALL_IMG"
 SMALL_LOOPDEV="$(losetup --find --show "$SMALL_IMG")"
 SMALL_MKFS_OUT="$("$ROOT/userspace/mkfs.cetra" "$SMALL_LOOPDEV" -z 2 -N 4096 -f)"
 
-SMALL_BG_MIB="$(echo "$SMALL_MKFS_OUT" | grep -oP '\(\K[0-9]+(?= MiB\))')"
+SMALL_BG_MIB="$(echo "$SMALL_MKFS_OUT" | sed -n 's/.*(\([0-9][0-9]*\) MiB).*/\1/p')"
 [ "$SMALL_BG_MIB" = "512" ] && pass "mkfs auto-tuned a 5G device down to a 512 MiB BG size (from the 1024 MiB default)" ||
     fail "mkfs picked a $SMALL_BG_MIB MiB BG size on a 5G device, expected 512"
 
@@ -136,7 +136,7 @@ fi
 # node_uuid; flipping it away from CETRAFS_NODE_STATE_FREE (0) without a
 # matching checksum exercises the same CRC path a real corrupted/half-
 # written registration would hit.
-NODE_TABLE_LBA="$(echo "$MKFS_OUT" | grep -oP '^  node_table: LBA \K[0-9]+')"
+NODE_TABLE_LBA="$(echo "$MKFS_OUT" | sed -n 's/^  node_table: LBA \([0-9][0-9]*\).*/\1/p')"
 printf '\x63\x00\x00\x00' | dd of="$CORRUPT_LOOPDEV" bs=1 seek=$((NODE_TABLE_LBA * 4096 + 16)) count=4 conv=notrunc status=none
 if "$ROOT/userspace/fsck.cetra" "$CORRUPT_LOOPDEV" >/dev/null 2>&1; then
     fail "fsck did not detect a corrupted Node Registry slot"
