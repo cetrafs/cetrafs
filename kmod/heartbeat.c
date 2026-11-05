@@ -120,6 +120,12 @@ static atomic64_t cetrafs_hb_sweeps = ATOMIC64_INIT(0);
 cetrafs_test_param(hb_maint_delay_ms, cetrafs_hb_maint_delay_ms, uint, 0644);
 MODULE_PARM_DESC(hb_maint_delay_ms, "TEST ONLY: milliseconds the heartbeat's maintenance pass takes");
 
+/* TEST ONLY: pause a tick right after it re-arms, where a controls
+ * write can move the interval under it. */
+static unsigned int cetrafs_hb_tick_stall_ms;
+cetrafs_test_param(hb_tick_stall_ms, cetrafs_hb_tick_stall_ms, uint, 0644);
+MODULE_PARM_DESC(hb_tick_stall_ms, "TEST ONLY: pause the next heartbeat tick after its re-arm");
+
 static void cetrafs_heartbeat_tick(struct work_struct *work)
 {
     struct cetrafs_heartbeat *hb = container_of(work, struct cetrafs_heartbeat, work.work);
@@ -127,6 +133,14 @@ static void cetrafs_heartbeat_tick(struct work_struct *work)
     u32 my_node_id;
     unsigned long lease_t0;
     unsigned int lease_interval;
+    /* The interval this tick ARMS the next one with -- read once. The
+     * lease below is bounded by it too: the controls file can move the
+     * interval while this tick runs (there is a device read before the
+     * renewal), and a lease of 3 x the new, shorter interval against a
+     * next tick armed at the old, longer one self-fenced a healthy node
+     * (hb 30 -> 5: fenced at +15 s, next renewal at +30). Audit
+     * 2026-11-05, N6; tests/kernel/heartbeat_interval_moves_mid_tick.sh. */
+    unsigned int armed = cetrafs_sb_hb_interval_secs(sb);
     int ret;
 
     /*
@@ -146,7 +160,13 @@ static void cetrafs_heartbeat_tick(struct work_struct *work)
      * nothing when a tick overruns: the next one simply starts as soon
      * as this returns.
      */
-    queue_delayed_work(system_long_wq, &hb->work, msecs_to_jiffies(cetrafs_sb_hb_interval_secs(sb) * 1000));
+    queue_delayed_work(system_long_wq, &hb->work, msecs_to_jiffies(armed * 1000));
+    if (READ_ONCE(cetrafs_hb_tick_stall_ms)) {
+        unsigned int ms = xchg(&cetrafs_hb_tick_stall_ms, 0); /* test-only, one tick */
+
+        if (ms)
+            msleep(ms);
+    }
 
     if (cetrafs_test_uncache_zg >= 0) {
         u32 zg = (u32) cetrafs_test_uncache_zg;
@@ -205,10 +225,19 @@ static void cetrafs_heartbeat_tick(struct work_struct *work)
     lease_interval = cetrafs_heartbeat_interval_secs(sb);
     ret = cetrafs_hb_renew_fail ? -EIO /* test-only, see the parameter */
                                 : cetrafs_node_renew_heartbeat(sb, my_node_id);
-    if (ret == 0)
-        /* The smaller of the intervals before and after: the row
-         * advertises one of them, and controls may have moved it. */
-        cetrafs_sb_lease_renewed(sb, lease_t0, min(lease_interval, cetrafs_heartbeat_interval_secs(sb)));
+    if (ret == 0) {
+        /* The smallest of the intervals before and after the renewal --
+         * the row advertises one of them, and peers floor their window
+         * at it -- and the one the next tick is armed with. If that
+         * makes the lease shorter than the armed wait, the next tick
+         * comes sooner instead: the lease must always outlive the gap to
+         * the next renewal. */
+        unsigned int lease = min3(lease_interval, cetrafs_heartbeat_interval_secs(sb), armed);
+
+        cetrafs_sb_lease_renewed(sb, lease_t0, lease);
+        if (lease < armed)
+            mod_delayed_work(system_long_wq, &hb->work, msecs_to_jiffies(lease * 1000));
+    }
     if (ret == -EPERM) {
         /* The renew itself found our lease revoked. This is the
          * authoritative detection -- the check above races, since a peer
