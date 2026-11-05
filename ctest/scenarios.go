@@ -5755,23 +5755,16 @@ func RunScrubTransit(clients []*Client, baseDir string) (bool, error) {
 // Treating the whole of fsck's output as fatal would make this scenario
 // fail on its own failure injection, which is worse than useless: it
 // would train everyone to ignore it.
+// stormFsckFatal returns fsck's ERR lines: all of them. ERR means
+// damage in a live record (fsck prints the dead-record walk, leaks and
+// orphans -- the residue an injected failure legitimately leaves -- as
+// WARN). This used to be an allow-list of eight phrases, so every ERR
+// kind added to fsck later counted as "repairable residue": 252 extents
+// hidden behind a stale index range passed the storm that way.
 func stormFsckFatal(out string) []string {
 	var fatal []string
 	for _, ln := range strings.Split(out, "\n") {
-		l := strings.TrimSpace(ln)
-		if !strings.HasPrefix(l, "ERR") {
-			continue
-		}
-		low := strings.ToLower(l)
-		switch {
-		case strings.Contains(low, "marked free"),
-			strings.Contains(low, "referenced by") && strings.Contains(low, "inodes"),
-			strings.Contains(low, "overlap"),
-			strings.Contains(low, "cross"),
-			strings.Contains(low, "checksum"),
-			strings.Contains(low, "magic"),
-			strings.Contains(low, "no '.'"),
-			strings.Contains(low, "no '..'"):
+		if l := strings.TrimSpace(ln); strings.HasPrefix(l, "ERR") {
 			fatal = append(fatal, l)
 		}
 	}
@@ -6363,7 +6356,7 @@ func RunHypervisorStorm(clients []*Client, baseDir string, dur time.Duration, se
 				// leave exactly this.
 				n := 0
 				for _, ln := range strings.Split(fr.Output, "\n") {
-					if strings.HasPrefix(strings.TrimSpace(ln), "ERR") {
+					if strings.HasPrefix(strings.TrimSpace(ln), "WARN") {
 						n++
 					}
 				}
