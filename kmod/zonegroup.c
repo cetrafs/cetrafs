@@ -388,6 +388,9 @@ static int cetrafs_zg_delta_mutate(void *image, unsigned int len, void *priv)
                 (unsigned) le16_to_cpu(zg->owner_node_id));
         return 1;
     }
+    /* class 34: the owner check above is the only writer of deltas --
+     * a peer's frees are queued, not credited here -- so no other
+     * actor's inverse move sits between two of ours. */
     if (want < 0) {
         /* The aggregate is a count, never negative. Getting here means
          * the deltas and the member BGs have already diverged, which
@@ -445,6 +448,12 @@ static int cetrafs_zg_pool_mutate(void *image, unsigned int len, void *priv)
 
     if (!ctx->delta)
         return 1; /* nothing to do */
+    /* class 34: the pool is credited by a BG release and debited by a
+     * claim, on different nodes. The release credits BEFORE the group
+     * reads FREE and a claim debits only AFTER it took a group that
+     * reads FREE (cetrafs_bg_release(), bg_release_pool_order.sh), so a
+     * debit always follows the credit it consumes and the shard never
+     * legally passes through zero. */
     if (want < 0) {
         /* A count, never negative. Divergence is fsck's to report;
          * refuse rather than write a wrapped u64. */

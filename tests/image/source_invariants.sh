@@ -627,7 +627,7 @@ HITS="$(discarded_giveback "$K"/*.c | sed "s|$K/||")"
 # RCU callback, in softirq: nothing in it may sleep. It held a
 # cancel_work_sync() until 2026-11-03.
 log "checking nothing that can sleep runs in ->free_inode (class 19)"
-FREE_FN="$(grep -oP '\.free_inode\s*=\s*\K[a-z_0-9]+' "$K/super_ops.c")"
+FREE_FN="$(sed -n 's/.*\.free_inode[[:space:]]*=[[:space:]]*\([a-z_0-9][a-z_0-9]*\).*/\1/p' "$K/super_ops.c")"
 FREE_BODY=""
 for f in "$K"/*.c; do
     b="$(body "$f" "$FREE_FN")"
@@ -690,6 +690,211 @@ NGB="$(cat "$K"/*.c | grep -c 'cetrafs_lock_undo_steal(\|reattached_since_fence(
 [ -z "$GB" ] && pass "give-back gate: every reclaim give-back tests displaced" ||
     fail "give-back gate: a give-back not gated on displaced at: $(echo $GB)"
 
+# The image suites need no kernel, so nothing in them may need GNU
+# grep's -P: on a host without it the suite stopped at the first one
+# (audit, section 4). POSIX sed/awk instead.
+log "checking the image suites and the harness avoid GNU-only grep (-P)"
+GP="$(grep -n 'grep -[a-zA-Z]*P' "$ROOT"/tests/image/*.sh "$ROOT"/tests/lib/*.sh |
+    grep -vE '^[^:]*:[0-9]+:[[:space:]]*#|GP=|GNU-only grep|portability' | sed "s|$ROOT/||" || true)"
+[ -z "$GP" ] && pass "portability: no grep -P in tests/image or tests/lib" ||
+    fail "portability: grep -P (GNU only) at: $(echo "$GP" | cut -d: -f1,2 | tr '\n' ' ')"
+
+# callgraph <file>...: "caller callee" for every call, inside a column-0
+# function body, of a name that is itself defined at column 0 in the
+# files. Coarse, as dio_waiters: a body runs from its signature to the
+# column-0 closing brace.
+callgraph() {
+    awk '
+        FNR == 1 { fn = "" }
+        /^[[:space:]]*\*/ || /^[[:space:]]*\/\*/ { next }
+        /^[a-z]/ && /\(/ && !/;[[:space:]]*$/ { f = $0; sub(/\(.*/, "", f); sub(/.*[ *]/, "", f); fn = f; def[f] = 1; next }
+        /^}/ { fn = ""; next }
+        fn != "" {
+            line = $0
+            while (match(line, /[a-z_][a-z_0-9]*\(/)) {
+                c = substr(line, RSTART, RLENGTH - 1)
+                n++; caller[n] = fn; callee[n] = c
+                line = substr(line, RSTART + RLENGTH)
+            }
+        }
+        END { for (i = 1; i <= n; i++) if (callee[i] in def) print caller[i], callee[i] }
+    ' "$@" | sort -u
+}
+# forward <edges-file> <root>: every function reachable from root.
+forward() {
+    local seen="$2" frontier="$2" next
+    while [ -n "$frontier" ]; do
+        next="$(for f in $frontier; do awk -v f="$f" '$1 == f { print $2 }' "$1"; done | sort -u)"
+        frontier=""
+        for f in $next; do
+            case " $seen " in *" $f "*) ;; *) seen="$seen $f"; frontier="$frontier $f" ;; esac
+        done
+    done
+    echo "$seen"
+}
+
+CG="$(ct_tmp callgraph)"
+callgraph "$K"/*.c >"$CG"
+[ "$(wc -l <"$CG")" -ge 1000 ] || fail "call graph: only $(wc -l <"$CG") edges -- the extraction went blind"
+# takes <fn> <ERE>: does fn's own body match ERE (comments skipped)?
+body_matches() {
+    awk -v f="$1" -v re="$2" '
+        /^[[:space:]]*\*/ || /^[[:space:]]*\/\*/ { next }
+        /^[a-z]/ && /\(/ && !/;[[:space:]]*$/ { g = $0; sub(/\(.*/, "", g); sub(/.*[ *]/, "", g); in_ = (g == f); next }
+        /^}/ { in_ = 0 }
+        in_ && $0 ~ re { print FILENAME ":" FNR; exit }' "${@:3}"
+}
+
+# Class 22, the second half: the O_DIRECT completion
+# (cetrafs_dio_end_io()) runs while the submitter -- or truncate, punch,
+# defrag, suspend, which all drain direct I/O -- may hold i_rwsem, and
+# lock_mutex or ns_mutex above it. Nothing it reaches may take one of
+# them, or the drain and the completion wait on each other. Checked
+# over the transitive callee set (coarse: may-call, so it can only
+# over-report). Negative control: the sample below, an end_io whose
+# helper takes inode_lock, must be flagged.
+log "checking nothing the DIO completion reaches takes i_rwsem, lock_mutex or ns_mutex (class 22)"
+# [(], not a backslash: awk -v processes escapes, and mawk turns \( into
+# an unbalanced ( -- a regex that matches nothing, silently.
+C22RE='(inode_lock(_shared)?[(]|lock_mutex|ns_mutex)'
+c22_scan() { # <edges> <root> <files>...
+    local e="$1" r="$2" f hits=""
+    shift 2
+    for f in $(forward "$e" "$r"); do
+        h="$(body_matches "$f" "$C22RE" "$@")"
+        [ -n "$h" ] && hits="$hits $f@$h"
+    done
+    echo "$hits"
+}
+S22="$(ct_tmp c22-sample).c"
+printf '%s\n' 'static int helper(struct inode *inode)' '{' '    inode_lock(inode);' '    return 0;' '}' \
+    'static int sample_end_io(struct kiocb *iocb)' '{' '    return helper(NULL);' '}' >"$S22"
+E22="$(ct_tmp c22-edges)"
+callgraph "$S22" >"$E22"
+[ -n "$(c22_scan "$E22" sample_end_io "$S22")" ] ||
+    fail "class 22 completion: the known-bad sample (end_io -> helper -> inode_lock) is not flagged -- the check is blind"
+N22="$(forward "$CG" cetrafs_dio_end_io | wc -w)"
+[ "$N22" -ge 10 ] || fail "class 22 completion: cetrafs_dio_end_io reaches only $N22 functions -- the graph lost it"
+H22="$(c22_scan "$CG" cetrafs_dio_end_io "$K"/*.c | sed "s|$K/||g")"
+[ -z "$H22" ] && pass "class 22 completion: none of the $N22 functions the DIO completion may reach takes i_rwsem, lock_mutex or ns_mutex" ||
+    fail "class 22 completion: reached from cetrafs_dio_end_io and takes a lock its drainers hold:$H22"
+
+# Class 5 (audit N3): every durability boundary a user or a peer relies
+# on -- sync_fs, put_super, ->flush at close, fsync (files and
+# directories), the last writer's release -- must reach a device cache
+# flush. MAY-reach over the call graph, so it catches a boundary that
+# lost every path to a flush, not one that skips it on some branch; the
+# flush counters (sync_flushes_cache, publish_flushes_cache) are the
+# instrument for that. Negative control: the sample boundary below,
+# which flushes nothing, must be flagged.
+log "checking every durability boundary reaches a device cache flush (class 5)"
+FLRE='(blkdev_issue_flush|sync_blockdev)[(]'
+c5_flushers() { # <files>...
+    awk -v re="$FLRE" '
+        /^[[:space:]]*\*/ || /^[[:space:]]*\/\*/ { next }
+        /^[a-z]/ && /\(/ && !/;[[:space:]]*$/ { g = $0; sub(/\(.*/, "", g); sub(/.*[ *]/, "", g); next }
+        /^}/ { g = "" }
+        g != "" && $0 ~ re { print g }' "$@" | sort -u
+}
+c5_reaches() { # <edges> <boundary> <flushers...>: prints the flusher reached, if any
+    local e="$1" b="$2" r f
+    shift 2
+    r=" $(forward "$e" "$b") "
+    for f in "$@"; do case "$r" in *" $f "*) echo "$f"; return ;; esac; done
+}
+S5="$(ct_tmp c5-sample).c"
+printf '%s\n' 'static int flushes(void)' '{' '    return blkdev_issue_flush(NULL);' '}' \
+    'static int sample_sync(void)' '{' '    return 0;' '}' >"$S5"
+E5="$(ct_tmp c5-edges)"
+callgraph "$S5" >"$E5"
+[ -z "$(c5_reaches "$E5" sample_sync $(c5_flushers "$S5"))" ] && [ -n "$(c5_flushers "$S5")" ] ||
+    fail "class 5: the sample boundary that flushes nothing is not flagged -- the check is blind"
+FLUSHERS="$(c5_flushers "$K"/*.c)"
+MISS5=""
+for b in cetrafs_sync_fs cetrafs_put_super cetrafs_file_flush __cetrafs_fsync cetrafs_dir_fsync cetrafs_lock_release; do
+    grep -q "^$b " "$CG" || body_matches "$b" . "$K"/*.c | grep -q . || { MISS5="$MISS5 $b(gone?)"; continue; }
+    [ -n "$(c5_reaches "$CG" "$b" $FLUSHERS)" ] || MISS5="$MISS5 $b"
+done
+[ -z "$MISS5" ] && pass "class 5: every durability boundary reaches a device cache flush" ||
+    fail "class 5: no path to a device flush from:$MISS5"
+
+# Class 32: a slot claimed by an identity needs a path back to free.
+# Each free/none sentinel the format defines must be WRITTEN somewhere
+# outside the tests -- an assignment, or a memset whose comment names it
+# (the registry row's FREE is all-zero) -- or the state is only ever
+# tested for, and a slot that leaves it never returns (audit R10: no
+# path retired a departed registry row). And a tool that BORROWS a row
+# must keep the original on the device: the saved-row offset must be
+# both written by the tools and read back by the kernel's reap.
+# Negative control: drop the memset comment in devutil.h -- fails.
+log "checking every free/none sentinel has a writer, and a borrowed row is saved on the device"
+SENT="$(sed -n 's/^#define \(CETRAFS_[A-Z_]*\(STATE_FREE\|OWNER_FREE\|ID_NONE\|LOCK_NONE\)\)[[:space:]].*/\1/p' "$ROOT/include/cetrafs.h")"
+[ "$(echo $SENT | wc -w)" -ge 4 ] || fail "class 32: found only '$SENT' -- the sentinel list went blind"
+MISS=""
+for c in $SENT; do
+    cat "$K"/*.c "$ROOT"/userspace/*.c "$ROOT"/userspace/*.h |
+        grep -E "(=[^=]*\b$c\b|memset.*\b$c\b)" | grep -vqE "(==|!=)[^=]*\b$c\b" && continue
+    cat "$K"/*.c "$ROOT"/userspace/*.c "$ROOT"/userspace/*.h | grep -E "memset.*\b$c\b" -q || MISS="$MISS $c"
+done
+[ -z "$MISS" ] && pass "class 32: every free/none sentinel is written somewhere ($(echo $SENT))" ||
+    fail "class 32: tested but never written:$MISS"
+grep -q 'memcpy(blk + CETRAFS_REPAIR_SAVED_OFF' "$ROOT/userspace/devutil.h" &&
+    grep -q 'CETRAFS_REPAIR_SAVED_OFF' "$K/node.c" &&
+    pass "class 32: a borrowed registry row is saved in the claim block and read back by the reap" ||
+    fail "class 32: the borrowed row's on-device copy is not both written (devutil.h) and read (node.c)"
+
+# Class 35: a mount option ACCEPTED and then not in force. A second
+# mount of a mounted device got the first superblock and dropped its own
+# nofilelock/errors=/corruption= without a word (audit L29). Every
+# option in the spec must, in its parse case, set a value AND a _set
+# flag; the value must be applied to the superblock (fill_super), and
+# the flag compared on a second mount (cetrafs_opts_unmet()). A new
+# option that skips either is accepted and silently not in force.
+# Negative control: drop the corruption line from cetrafs_opts_unmet()
+# -- fails.
+log "checking every mount option is applied, and refused on a second mount that differs (class 35)"
+FS="$K/fs.c"
+OPTS="$(sed -n 's/.*fsparam_[a-z_0-9]*("\([a-z_]*\)", \(Opt_[a-z_]*\).*/\2/p' "$FS")"
+[ "$(echo $OPTS | wc -w)" -ge 3 ] || fail "class 35: found options '$OPTS' -- the spec scan went blind"
+UNMET="$(awk '/^static bool cetrafs_opts_unmet\(/ { f = 1 } f { print } f && /^}/ { exit }' "$FS")"
+[ -n "$UNMET" ] || fail "class 35: cetrafs_opts_unmet() is gone -- nothing compares a second mount's options"
+BAD35=""
+for o in $OPTS; do
+    CASE="$(awk -v o="case $o:" '$0 ~ o { f = 1; next } f && /break;|case Opt_/ { exit } f { print }' "$FS")"
+    SETF="$(sed -n 's/.*fci->\([a-z_]*\)_set = true.*/\1/p' <<<"$CASE")"
+    VALF="$(sed -n 's/.*fci->\([a-z_]*\) = .*/\1/p' <<<"$CASE" | grep -v '_set$' | head -1)"
+    [ -n "$SETF" ] && [ -n "$VALF" ] || { BAD35="$BAD35 $o(no value or _set in its case)"; continue; }
+    grep -q "fci->${SETF}_set" <<<"$UNMET" || BAD35="$BAD35 $o(not compared on a second mount)"
+    grep -E "sbi->[a-z_]+ = .*fci->$VALF\b" "$FS" | grep -q . || BAD35="$BAD35 $o(never applied to the superblock)"
+done
+[ -z "$BAD35" ] && pass "class 35: every mount option ($(echo $OPTS)) is applied and checked on a second mount" ||
+    fail "class 35: accepted and not in force:$BAD35"
+
+# Class 34: a CAS mutator that REFUSES a negative count is safe only if
+# no other actor's inverse move can sit between two of ours -- a credit
+# landing after the debit it pays for reads, in between, as below zero,
+# and the refusal drops a legal move with no later repair (audit R25:
+# the BG release credited the pool after the group read FREE). Each such
+# refusal must say, in a "class 34:" comment just above it, why no
+# interleaving passes through zero. Negative control: delete the
+# annotation above cetrafs_zg_pool_mutate()'s guard -- fails.
+log "checking every negative-count refusal in a CAS mutator names its ordering"
+C34="$(for f in "$K"/*.c; do
+    awk -v F="$(basename "$f")" '
+        /^static int [a-z_]*_mutate\(/ { inf = 1; last34 = -100 }
+        inf && /^}/ { inf = 0 }
+        inf && /class 34:/ { last34 = NR }
+        inf && /[a-z_]+ < 0\)/ && !/ret < 0|err < 0/ { cand = NR }
+        inf && cand && NR - cand <= 12 && /return -E/ {
+            if (cand - last34 > 14) print F ":" cand
+            cand = 0
+        }' "$f"
+done)"
+N34="$(cat "$K"/*.c | grep -c 'class 34:' || true)"
+[ "$N34" -ge 3 ] || fail "class 34: found $N34 annotations -- the check sees nothing"
+[ -z "$C34" ] && pass "class 34: every negative-count refusal in a mutator names why no inverse move interleaves" ||
+    fail "class 34: a negative-count refusal with no ordering argument at: $(echo $C34)"
+
 # The dm path resolution allocates and does I/O. Reached from a CAS,
 # which evict needs, it must run inside a NOFS scope: a GFP_KERNEL
 # allocation entering reclaim evicts an inode of this volume, needs a
@@ -730,7 +935,7 @@ log "checking the module publishes its mount-time autoload alias"
 KO="$ROOT/kmod/cetrafs.ko"
 if [ ! -f "$KO" ]; then
     skip "kmod/cetrafs.ko is not built"
-elif modinfo "$KO" 2>/dev/null | grep -qx "alias: *fs-$(grep -oP '#define CETRAFS_NAME\s+"\K[a-z]+' "$ROOT/include/cetrafs.h")"; then
+elif modinfo "$KO" 2>/dev/null | grep -qx "alias: *fs-$(sed -n 's/^#define CETRAFS_NAME[[:space:]][[:space:]]*"\([a-z][a-z]*\)".*/\1/p' "$ROOT/include/cetrafs.h")"; then
     pass "module alias: the built module declares fs-cetrafs, so mount -t autoloads it"
 else
     fail "module alias: no fs-cetrafs alias in the built module (MODULE_ALIAS_FS gone?) -- \`mount -t cetrafs\` will fail with 'unknown filesystem type' unless something loaded it first. modinfo says: $(modinfo "$KO" 2>&1 | grep -E '^alias' || echo '(no alias at all)')"

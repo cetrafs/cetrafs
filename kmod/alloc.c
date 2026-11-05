@@ -1507,6 +1507,12 @@ static int cetrafs_bg_count_mutate(void *image, unsigned int len, void *priv)
             return 1; /* dropped, loudly -- not an error */
         }
         want = (s64) cetrafs_le64(bg->free_data_blocks) + ctx->value;
+        /* class 34: no other actor moves this count. Only the owner
+         * applies deltas (a peer's frees reach it through the
+         * pending-free queue, applied by the owner), and a new owner
+         * reconciles under a new epoch that refuses the old one's
+         * deltas above -- so no legal interleaving passes through
+         * zero, and a refusal here is divergence, not a race. */
         if (want < 0) {
             /* A count, never negative -- same refusal as the ZG
              * aggregate's mutator: fsck cross-checks these.
