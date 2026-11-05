@@ -20,8 +20,8 @@
 # bytes are already in place -- the re-claim the CAS cannot tell apart.
 #
 # DISCRIMINATION: reattach_after_fence_force=0 (never detect) -- the
-# open succeeds over the lock, the reader bit is gone, the namespace
-# lock is ours.
+# open succeeds over the lock (run as the last section), the reader bit
+# is gone, the namespace lock is ours.
 set -euo pipefail
 . "$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)/lib/harness.sh"
 require_root
@@ -106,6 +106,20 @@ grep -q "ns_owner=1 " <<<"$L" && pass "nslock: the namespace lock is the holder'
 
 dmesg | tail -40 | grep -q "came back while its" && pass "and the give-backs were logged" ||
     fail "no give-back message in dmesg"
+
+# CONTROL: the file lock again, with the re-attach never detected
+# (reattach_after_fence_force=0, the pre-fix behaviour): the write-open
+# must go through over the holder -- or the stall did not stage the race.
+"$NPOKE" "$IMG" 1 1 bb 0 >/dev/null 2>&1
+"$LPOKE" "$IMG" "$I_LOCK" 1 1 >/dev/null
+ct_param_set reattach_after_fence_force 0
+RC="$(reattach_during python3 -c 'import os,sys; os.close(os.open(sys.argv[1], os.O_RDWR))' "$MNT/lockf")"
+ct_param_set reattach_after_fence_force -1
+L="$(lockf "$I_LOCK")"
+log "control: open rc=$RC; $L"
+[ "$RC" = 0 ] && ! grep -q "owner=1 mode=1" <<<"$L" &&
+    pass "control: undetected, the write-open takes the re-attached holder's lock -- the staging reaches the race" ||
+    fail "setup: even undetected the open did not take the lock (rc=$RC, $L) -- section 1 proves nothing"
 
 # Clean up: row 1 leaves, its claims go with it.
 "$NPOKE" "$IMG" 1 0 00 0 >/dev/null 2>&1 || true

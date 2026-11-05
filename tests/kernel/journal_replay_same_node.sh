@@ -16,7 +16,10 @@
 # about to apply); a write-open of the file starts the second replay.
 #
 # DISCRIMINATION: without the per-area mutex both replays apply the
-# entry -- two "pausing" lines.
+# entry -- two "pausing" lines. Proven 2026-11-05 by removing the mutex
+# from cetrafs_journal_replay_node(): "2 replays applied node 1's entry".
+# (A code edit, not a knob: a knob that turns off the serialisation of
+# replay would be a way to corrupt a volume.)
 set -euo pipefail
 . "$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)/lib/harness.sh"
 require_root

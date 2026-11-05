@@ -19,7 +19,9 @@
 # With the CAS the bump survives (fence_epoch reads 1 afterwards) and is
 # inherited as a pre-join bump (the node comes up writable, not fenced);
 # with the old blind write it read 0 -- the fence signal destroyed -- which
-# is exactly the assertion below, so this suite discriminates.
+# is exactly the assertion below. Proven 2026-11-05 with the re-attach
+# swap made to write fence_epoch back to the value read before the bump:
+# "fence_epoch=0 after the raced re-attach".
 set -euo pipefail
 . "$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)/lib/harness.sh"
 require_root

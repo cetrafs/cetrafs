@@ -16,7 +16,8 @@
 # and journal. The race is played by register_twin_race, which lands the
 # twin's re-attach or claim inside this mount's registration.
 #
-# DISCRIMINATION (measured on the old code): both D and E mount.
+# DISCRIMINATION: proven 2026-11-05 with the re-attach's hb_seq check and
+# the post-claim twin scan removed: both D and E mount.
 set -euo pipefail
 . "$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)/lib/harness.sh"
 require_root

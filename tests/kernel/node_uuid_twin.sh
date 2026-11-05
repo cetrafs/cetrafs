@@ -21,7 +21,9 @@
 #  B. the row is a crash leftover that does not beat: re-attached;
 #  C. the row was left cleanly: re-attached without waiting.
 #
-# DISCRIMINATION (measured on the unfixed code): A mounts.
+# DISCRIMINATION: proven 2026-11-05 with the watch removed from
+# cetrafs_node_register() (cetrafs_node_row_quiet() not called): A mounts
+# over the beating row, and B re-attaches without watching.
 set -euo pipefail
 . "$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)/lib/harness.sh"
 require_root

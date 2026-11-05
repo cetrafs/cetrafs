@@ -17,8 +17,9 @@
 # the dentry, re-read the record and note the stamp first), publishes
 # stat only, and the held reader reads block 0 again.
 #
-# DISCRIMINATION: with stat_publish_ignore_overstamp=1 the publish does
-# not note what it overstamped, and the reader reads the old block.
+# DISCRIMINATION, run at the end: with stat_publish_ignore_overstamp=1 the
+# publish does not note what it overstamped, and the reader reads the old
+# block.
 set -euo pipefail
 . "$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)/lib/harness.sh"
 require_root
@@ -88,6 +89,16 @@ log "read1=$READ1 read2=$READ2 mtime=$MTIME stamp-node-after-publish=$SEQ_NODE"
 [ "$READ2" = DONORDONOR ] &&
     pass "the held reader re-mapped block 0 after the peer's change, through this node's stat publish" ||
     fail "the reader read '$READ2' through a map the peer had changed: the stat publish erased the peer's stamp"
+
+# CONTROL: the same, with the publish not noting what it overstamped.
+ct_param_set stat_publish_ignore_overstamp 1
+build_victim v2
+probe v2
+ct_param_set stat_publish_ignore_overstamp 0
+log "control: read1=$READ1 read2=$READ2"
+[ "$READ2" = VICTIM0000 ] &&
+    pass "control: with the overstamp ignored the reader keeps the old map -- the staging reaches the race" ||
+    fail "setup: even with stat_publish_ignore_overstamp=1 the reader re-mapped ($READ2) -- this suite proves nothing"
 
 ct_umount "$MNT"
 ct_exit

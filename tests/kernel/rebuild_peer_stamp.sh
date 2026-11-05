@@ -23,8 +23,8 @@
 # publish to refuse; it now builds into a copy like the other two, and a
 # refusal gives back every block it allocated.
 #
-# DISCRIMINATION: with rebuild_plan_unchecked=1 (the old publish), every
-# round publishes over the peer: the size goes back to the planned one,
+# DISCRIMINATION, run as the last round: with rebuild_plan_unchecked=1
+# (the old publish) the truncate publishes over the peer: the size goes back to the planned one,
 # and the free count moves.
 set -euo pipefail
 . "$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)/lib/harness.sh"
@@ -86,6 +86,12 @@ PY
     RC="${OUT% *}"; ERR="${OUT#* }"
     SIZE="$("$IPOKE" "$IMG" size "$INO")"
     log "$name: $op -> rc=$RC errno=$ERR; record size $SIZE; free $FREE0 -> $(freeb)"
+    if [ "${3:-}" = control ]; then
+        [ "$RC" = 0 ] && [ "$SIZE" != "$PEER_SIZE" ] &&
+            pass "control: with the plan unchecked the $op publishes over the peer (size $SIZE) -- the staging reaches the race" ||
+            fail "setup: even with rebuild_plan_unchecked=1 the $op did not publish over the peer (rc=$RC size $SIZE) -- this suite proves nothing"
+        return
+    fi
     [ "$RC" != 0 ] && [ "$ERR" = 26 ] &&
         pass "$name: the $op refused (ETXTBSY): a peer stamped the file since it was planned" ||
         fail "$name: the $op returned rc=$RC errno=$ERR over a peer's session it never saw"
@@ -100,6 +106,9 @@ PY
 round trunc truncate
 round punch punch
 round falloc fallocate
+ct_param_set rebuild_plan_unchecked 1
+round ctrl truncate control
+ct_param_set rebuild_plan_unchecked 0
 
 ct_umount "$MNT"
 ct_exit
