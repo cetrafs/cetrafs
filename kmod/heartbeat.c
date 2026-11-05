@@ -114,6 +114,9 @@ MODULE_PARM_DESC(test_uncache_zg, "TEST ONLY: forget owning this zone group, so 
  * much. See tests/kernel/heartbeat_renew_cadence.sh.
  */
 static unsigned int cetrafs_hb_maint_delay_ms;
+/* Completed stale-journal sweeps (the end of the maintenance pass): a
+ * pass parked behind a lock stops this counter. */
+static atomic64_t cetrafs_hb_sweeps = ATOMIC64_INIT(0);
 cetrafs_test_param(hb_maint_delay_ms, cetrafs_hb_maint_delay_ms, uint, 0644);
 MODULE_PARM_DESC(hb_maint_delay_ms, "TEST ONLY: milliseconds the heartbeat's maintenance pass takes");
 
@@ -376,11 +379,16 @@ static void cetrafs_heartbeat_maint(struct work_struct *work)
                 continue; /* not revoked: replaying now is the hazard above; next tick tries again */
 
             ret = cetrafs_journal_replay_node(sb, n, /*wait_for_claim=*/false);
-            if (ret)
+            if (ret && ret != -EEXIST) /* -EEXIST: another replay is at it; next tick */
                 pr_warn("heartbeat: replay of stale node %u's journal failed: %d\n", n, ret);
         }
     }
+    atomic64_inc(&cetrafs_hb_sweeps);
+}
 
+u64 cetrafs_hb_sweep_count(void)
+{
+    return (u64) atomic64_read(&cetrafs_hb_sweeps);
 }
 
 /* This node's heartbeat period, for publishing in its registry row so

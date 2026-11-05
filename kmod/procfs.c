@@ -231,6 +231,8 @@ static int cetrafs_proc_info_show(struct seq_file *m, void *v)
     /* Descriptor reads by the LBA -> Block Group lookup once its
      * arithmetic missed (a grown volume, or an LBA in no region). */
     seq_printf(m, "bg_lookup_reads: %llu\n", cetrafs_bg_lookup_reads_count());
+    /* Heartbeat maintenance passes that reached their end. */
+    seq_printf(m, "hb_sweeps: %llu\n", cetrafs_hb_sweep_count());
     /* Existing-block mappings vs the blocks they covered. Equal means
      * every caller is coming back per 4 KiB; blocks > calls means
      * cetrafs_get_block() is answering with contiguous runs. */

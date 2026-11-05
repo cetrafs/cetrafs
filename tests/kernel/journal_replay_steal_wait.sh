@@ -23,7 +23,9 @@
 # claim is released.
 #
 # DISCRIMINATION: with nslock.c passing wait_for_claim=false again, the
-# create completes at once and node 1's lock is already gone.
+# create completes at once and node 1's lock is already gone. With the
+# replay mutex taken unconditionally again (journal.c), the heartbeat
+# stalls behind the waiting create (completed sweeps 4 -> 4).
 set -euo pipefail
 . "$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)/lib/harness.sh"
 require_root
@@ -55,15 +57,29 @@ ct_mount "$DEV" "$MNT"
 require_cetrafs_mount "$MNT"
 wait_out_stale_window
 
+NID="$(sed -n 's/^this_node_id: //p' "$(ct_procdir "$DEV")/info")"
+hbseq() { sed -n 's/^hb_sweeps: //p' "$(ct_procdir "$DEV")/info"; }
 touch "$MNT/d/created" &
 TPID=$!
-sleep 3
+sleep 1
+S0="$(hbseq)"
+sleep 6
+S1="$(hbseq)"
 if kill -0 "$TPID" 2>/dev/null; then
-    pass "3s in, the create is still waiting out the live replay of the dead holder's journal"
+    pass "7s in, the create is still waiting out the live replay of the dead holder's journal"
 else
     wait "$TPID" && fail "the create COMPLETED while a live peer was still replaying the dead holder's journal" ||
         fail "the create failed instead of waiting (exit=$?)"
 fi
+# The heartbeat's maintenance pass reaches the same dead node's journal
+# every tick and used to queue on the replay mutex the create holds
+# while it waits -- no maintenance (retry queues, Zone Group upkeep,
+# other peers' replays) for as long as the wait, up to the claim cap
+# (audit F9). Completed passes are counted in info.
+log "completed heartbeat sweeps while the create waited: $S0 -> $S1"
+[ -n "$S0" ] && [ -n "$S1" ] && [ "$S1" -gt "$S0" ] &&
+    pass "the heartbeat's sweep kept completing while the create held the dead node's replay" ||
+    fail "the heartbeat's sweep stalled behind the create's replay (passes $S0 -> $S1)"
 OWNER="$("$LPOKE" "$DEV" "$DINO" | sed -n 's/.*ns_owner=\([0-9]*\).*/\1/p')"
 [ "$OWNER" = 1 ] && pass "and the dead node's namespace lock was not taken meanwhile" ||
     fail "the namespace lock moved to node $OWNER while the dead holder's journal was still being replayed"

@@ -1323,8 +1323,20 @@ int cetrafs_journal_replay_node(struct super_block *sb, u32 node_id, bool wait_f
 
     if (!j || node_id >= 64)
         return __cetrafs_journal_replay_node(sb, node_id, wait_for_claim);
-    if (mutex_lock_killable(&j->replay_mutex[node_id]))
+    /*
+     * A caller that does not wait for a replay claim does not wait for
+     * this mutex either: its holder is a local replay of the same area,
+     * which may run for the claim cap (several stale windows) behind a
+     * peer's. That caller is the heartbeat sweep, which takes nothing
+     * from the dead node and whose tick must not stall behind an open's
+     * replay (audit F9). -EEXIST is its "someone is at it" already.
+     */
+    if (!wait_for_claim) {
+        if (!mutex_trylock(&j->replay_mutex[node_id]))
+            return -EEXIST;
+    } else if (mutex_lock_killable(&j->replay_mutex[node_id])) {
         return -EINTR;
+    }
     mutex_lock(&j->rel_mutex);
     atomic_inc(&j->replaying[node_id]);
     mutex_unlock(&j->rel_mutex);
