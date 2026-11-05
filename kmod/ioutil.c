@@ -243,15 +243,33 @@ void cetrafs_bh_end_update(struct buffer_head *bh)
  * the write's own completion and nothing else clears it, so it is the
  * one honest witness.
  *
- * Not dirty: nothing to write, 0 -- after waiting out a write already in
- * flight (the buffer lock), whose own caller owns its result.
+ * Not dirty: nothing to write -- after waiting out a write already in
+ * flight (the buffer lock). That write carried OUR update too, and when
+ * it was writeback's nobody else will ever look at its result: a failure
+ * it left behind (BH_Write_EIO) is this caller's lost update and is
+ * reported as one, exactly as __cetrafs_sync_buffer_keep() does (audit
+ * 2026-11-05, class 16; tests/kernel/sync_buffer_sees_writeback_eio.sh).
  */
+static unsigned int cetrafs_sync_writeback_eio;
+cetrafs_test_param(sync_writeback_eio, cetrafs_sync_writeback_eio, uint, 0644);
+MODULE_PARM_DESC(sync_writeback_eio,
+                 "TEST ONLY: the next N synchronous metadata writes find the buffer written and failed by writeback");
+
 static int __cetrafs_sync_buffer(struct buffer_head *bh)
 {
     lock_buffer(bh);
+    if (cetrafs_sync_writeback_eio && buffer_dirty(bh)) {
+        /* what a failed flusher write leaves: clean, BH_Write_EIO */
+        cetrafs_sync_writeback_eio--;
+        clear_buffer_dirty(bh);
+        set_buffer_write_io_error(bh);
+    }
     if (!test_clear_buffer_dirty(bh)) {
+        int ret = buffer_write_io_error(bh) ? -EIO : 0;
+
+        clear_buffer_write_io_error(bh); /* reported once: the mount stops */
         unlock_buffer(bh);
-        return 0;
+        return ret;
     }
     clear_buffer_write_io_error(bh);
 #if LINUX_VERSION_CODE >= KERNEL_VERSION(7, 2, 0)
