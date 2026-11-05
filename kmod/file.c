@@ -6006,6 +6006,7 @@ out:
 
 struct cetrafs_setattr_ns {
     unsigned int ia_valid; /* which of mode/uid/gid this setattr changes */
+    u32 kill;              /* S_ISUID/S_ISGID a privilege kill drops, else 0 */
     __le32 mode;
     __le32 uid;
     __le32 gid;
@@ -6024,8 +6025,18 @@ static void cetrafs_ns_apply_setattr(cetrafs_inode_t *rec, void *arg)
      * since this node last read the record. The rest stays as the
      * fresh image has it. ctime moves on every setattr.
      * tests/kernel/setattr_keeps_peer_mode.sh.
+     *
+     * A privilege kill is a change TO the mode, not a mode: a write,
+     * fallocate or chown by an unprivileged caller asks to drop
+     * setuid/setgid, and notify_change() turns that into ATTR_MODE with
+     * the CACHED mode minus the bits. Written whole, it put back every
+     * other bit a peer's chmod had changed -- a chmod o-rwx undone by
+     * the next write. Only the dropped bits are cleared in the fresh
+     * record.
      */
-    if (u->ia_valid & ATTR_MODE)
+    if (u->kill)
+        rec->mode = cetrafs_cpu_to_le32(cetrafs_le32(rec->mode) & ~u->kill);
+    else if (u->ia_valid & ATTR_MODE)
         rec->mode = u->mode;
     if (u->ia_valid & ATTR_UID)
         rec->uid = u->uid;
@@ -6211,6 +6222,12 @@ static int cetrafs_setattr_locked(struct mnt_idmap *idmap, struct dentry *dentry
     {
         struct cetrafs_setattr_ns u = {
             .ia_valid = attr->ia_valid,
+            /* ATTR_KILL_* survive notify_change()'s conversion, so they
+             * tell a kill from a chmod; what it dropped is the
+             * difference setattr_copy() just made. */
+            .kill = (attr->ia_valid & (ATTR_KILL_SUID | ATTR_KILL_SGID)) && (attr->ia_valid & ATTR_MODE)
+                        ? (u32) (saved.mode & ~inode->i_mode & (S_ISUID | S_ISGID))
+                        : 0,
             .mode = cetrafs_cpu_to_le32(inode->i_mode),
             .uid = cetrafs_cpu_to_le32(i_uid_read(inode)),
             .gid = cetrafs_cpu_to_le32(i_gid_read(inode)),
