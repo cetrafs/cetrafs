@@ -4279,33 +4279,38 @@ void cetrafs_sb_nslock_retry_end(struct super_block *sb)
  * flight now, nothing for 'ino' can appear until we release. Otherwise
  * wait out any pass in flight, then remove the entry.
  *
- * Returns true and fills *generation if an entry was dropped: if the
+ * Returns 1 and fills *generation if an entry was dropped: if the
  * acquire then fails, the caller must put it back
  * (cetrafs_sb_nslock_defer()), or the leftover lock is retried by
- * nobody.
+ * nobody. 0 if there was none. -EINTR if the caller was killed waiting
+ * out a retry pass -- which can run 32 CASes on a failing device while
+ * this caller holds the inode's ns_mutex and the VFS directory lock
+ * (audit R21); nothing was dropped then.
  */
-bool cetrafs_sb_nslock_forget(struct super_block *sb, u64 ino, u64 *generation)
+int cetrafs_sb_nslock_forget(struct super_block *sb, u64 ino, u64 *generation)
 {
     struct cetrafs_sb_info *sbi = sb->s_fs_info;
-    bool busy, found = false;
+    bool busy;
+    int found = 0;
     u32 i;
 
     if (!sbi)
-        return false;
+        return 0;
 
     spin_lock(&sbi->nsrel_lock);
     busy = sbi->nsrel_count || sbi->nsrel_active;
     spin_unlock(&sbi->nsrel_lock);
     if (!busy)
-        return false;
+        return 0;
 
-    mutex_lock(&sbi->nsrel_mutex);
+    if (mutex_lock_killable(&sbi->nsrel_mutex))
+        return -EINTR;
     spin_lock(&sbi->nsrel_lock);
     for (i = 0; i < sbi->nsrel_count; i++)
         if (sbi->nsrel[i].ino == ino) {
             *generation = sbi->nsrel[i].generation;
             sbi->nsrel[i] = sbi->nsrel[--sbi->nsrel_count];
-            found = true;
+            found = 1;
             break;
         }
     spin_unlock(&sbi->nsrel_lock);

@@ -127,6 +127,12 @@ static bool cetrafs_nslock_release_read_fail;
 cetrafs_test_param(nslock_release_read_fail, cetrafs_nslock_release_read_fail, bool, 0644);
 MODULE_PARM_DESC(nslock_release_read_fail, "TEST ONLY: a namespace-lock release cannot read the record");
 
+/* TEST ONLY: hold a deferred-release retry pass this long inside its
+ * bracket, so a local acquire waits on it (tests/kernel/retry_and_claim_waits.sh). */
+static unsigned int cetrafs_nslock_retry_stall_ms;
+cetrafs_test_param(nslock_retry_stall_ms, cetrafs_nslock_retry_stall_ms, uint, 0644);
+MODULE_PARM_DESC(nslock_retry_stall_ms, "TEST ONLY: stall a namespace-lock release retry pass while it holds its bracket");
+
 static unsigned int cetrafs_nslock_hold_ms;
 cetrafs_test_param(nslock_hold_ms, cetrafs_nslock_hold_ms, uint, 0644);
 MODULE_PARM_DESC(nslock_hold_ms, "TEST ONLY: sleep this long holding each namespace lock just acquired");
@@ -271,6 +277,10 @@ void cetrafs_nslock_retry_deferred(struct super_block *sb)
     n = cetrafs_sb_nslock_take_deferred(sb, pend, ARRAY_SIZE(pend));
     if (!n)
         goto out;
+    if (cetrafs_nslock_retry_stall_ms) {
+        pr_info("nslock: release retry pass stalled %u ms (test)\n", cetrafs_nslock_retry_stall_ms);
+        msleep(cetrafs_nslock_retry_stall_ms); /* test-only; see the parameter */
+    }
     if (cetrafs_sb_is_fenced(sb) || cetrafs_sb_get_node_id(sb, &my_node_id) != 0) {
         /* Nothing we may write right now; keep them for later. */
         for (i = 0; i < n; i++)
@@ -454,7 +464,12 @@ static int cetrafs_nslock_acquire_tries(struct inode *inode, int max_tries)
         return ret; /* killed while another local operation held it */
     /* Before the acquire can make us the live holder: a deferred retry
      * of an earlier release of ours would clear the lock under us. */
-    had_deferred = cetrafs_sb_nslock_forget(sb, inode->i_ino, &deferred_gen);
+    ret = cetrafs_sb_nslock_forget(sb, inode->i_ino, &deferred_gen);
+    if (ret < 0) {
+        cetrafs_inode_ns_mutex_unlock(inode);
+        return ret; /* killed waiting out a release-retry pass */
+    }
+    had_deferred = ret;
 
     for (attempt = 0; attempt < max_tries; attempt++) {
         ret = cetrafs_nslock_try(inode, my_node_id);

@@ -1366,20 +1366,27 @@ static int __cetrafs_journal_replay_node(struct super_block *sb, u32 node_id, bo
          * steals it. Bounded so a wedged claim fails loudly rather than
          * hangs, and killable.
          */
-        unsigned int waited_ms = 0;
-        const unsigned int cap_ms = (cetrafs_sb_stale_secs(sb) * 3 + 30) * 1000;
+        /* Elapsed time by the clock, not by counting sleeps: any
+         * pending NON-fatal signal makes msleep_interruptible() return
+         * at once, and a count of 500 ms per pass burned the whole cap
+         * in a burst of claim CASes and refused with a false "still
+         * held after 210000 ms" (audit R21). */
+        const unsigned long t0 = jiffies;
+        const unsigned long cap = (unsigned long) (cetrafs_sb_stale_secs(sb) * 3 + 30) * HZ;
 
         pr_info("journal: a peer is replaying node %u's area %llu -- waiting for it to finish\n", node_id,
                 (unsigned long long) area_start);
         while (ret == -EEXIST) {
-            if (waited_ms >= cap_ms) {
+            if (time_after_eq(jiffies, t0 + cap)) {
                 pr_err("journal: replay claim on node %u's area %llu still held after %ums -- refusing\n", node_id,
-                       (unsigned long long) area_start, waited_ms);
+                       (unsigned long long) area_start, jiffies_to_msecs(jiffies - t0));
                 return -EBUSY;
             }
-            if (msleep_interruptible(500) && fatal_signal_pending(current))
+            /* Killable, not interruptible: a pending non-fatal signal
+             * must not turn the sleep into a spin. */
+            schedule_timeout_killable(msecs_to_jiffies(500));
+            if (fatal_signal_pending(current))
                 return -EINTR;
-            waited_ms += 500;
             /* A mount waiting here has no heartbeat yet: beat, or every
              * peer judges it stale while it waits (audit R19). */
             ret = cetrafs_sb_mount_beat(sb);

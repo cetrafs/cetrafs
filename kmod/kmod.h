@@ -352,7 +352,7 @@ void cetrafs_sb_nslock_defer(struct super_block *sb, u64 ino, u64 generation);
 u32 cetrafs_sb_nslock_take_deferred(struct super_block *sb, struct cetrafs_nsrel_pending *out, u32 max);
 void cetrafs_sb_nslock_retry_begin(struct super_block *sb);
 void cetrafs_sb_nslock_retry_end(struct super_block *sb);
-bool cetrafs_sb_nslock_forget(struct super_block *sb, u64 ino, u64 *generation);
+int cetrafs_sb_nslock_forget(struct super_block *sb, u64 ino, u64 *generation);
 /* nslock.c: one retry pass over them, called from the heartbeat tick. */
 void cetrafs_nslock_retry_deferred(struct super_block *sb);
 /* fs.c + lock.c: last-writer closes whose publish or lock clear failed,
