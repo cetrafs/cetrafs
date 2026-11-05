@@ -14,6 +14,7 @@
 #include <linux/minmax.h>
 #include <linux/mpage.h>
 #include <linux/pagemap.h>
+#include <linux/pagevec.h>
 #include <linux/slab.h>
 #include <linux/string.h>
 #include <linux/uaccess.h>
@@ -985,33 +986,12 @@ void cetrafs_inode_extents_put(struct cetrafs_inode_extents *ex)
  * **The extent array is NOT sorted.** cetrafs_leaf_array_insert()
  * appends and only ever merges with the LAST entry, so a file written
  * at descending offsets has its extents in the order they were created,
- * not in logical order. SEEK_DATA's single pass therefore considers
- * every entry rather than stopping at the first match, and SEEK_HOLE --
- * which must follow runs that abut -- works on a sorted copy
- * (cetrafs_extents_sorted() below). Assuming order in the array itself
+ * not in logical order. Both walks therefore work on a sorted copy
+ * (cetrafs_extents_sorted() below), which also drops zero-length
+ * (damaged) entries SEEK_DATA used to report as data. Assuming order in the array itself
  * would give confidently wrong answers on exactly the files (randomly
  * written VM images) this exists to serve.
  */
-/* First mapped block at or after `from`, or U64_MAX if there is none. */
-static u64 cetrafs_next_data_block(const struct cetrafs_inode_extents *ex, u64 from)
-{
-    u64 best = U64_MAX;
-    u32 i;
-
-    for (i = 0; i < ex->entries; i++) {
-        u64 start = cetrafs_le32(ex->arr[i].ee_block);
-        u64 end = start + cetrafs_extent_len(ex->arr[i].ee_len);
-
-        if (end <= from)
-            continue; /* entirely behind us */
-        if (start < from)
-            return from; /* `from` itself is mapped -- cannot do better */
-        if (start < best)
-            best = start;
-    }
-    return best;
-}
-
 /*
  * The extent array in logical order, for the two walks that need it.
  *
@@ -1068,19 +1048,133 @@ static int cetrafs_extents_sorted(struct inode *inode, const struct cetrafs_inod
     return 0;
 }
 
-/* First unmapped block at or after `from`, over the sorted runs: one
- * pass, extending `from` across every run that covers it (runs may
- * overlap on a damaged tree, hence the max). */
-static u64 cetrafs_next_hole_block(const struct cetrafs_ext_run *r, u32 n, u64 from, u64 nblocks)
+/*
+ * PREALLOCATED extents (fallocate, `qemu-img create -o
+ * preallocation=falloc`) read as zeros until written, so they are holes
+ * to SEEK_DATA/SEEK_HOLE -- as on ext4 and XFS -- or a preallocated VM
+ * image looks fully allocated to every sparse-aware copy (audit R22).
+ *
+ * Except where the page cache holds data for them. Calling DATA a hole
+ * is the destructive direction: `cp --sparse` skips the range and the
+ * copy loses it. So any cached folio over an uninit block makes that
+ * block data -- even a clean one holding zeros (a needless copy, never a
+ * lost one) -- and a tree whose runs overlap (damage; fsck) is answered
+ * with every run treated as data, as before. A block converted by a
+ * write is no longer uninit in the overlaid record we walk.
+ */
+#define CETRAFS_BLKS_PER_PAGE_SHIFT (PAGE_SHIFT - 12) /* CETRAFS_BLOCK_SIZE == 4096 */
+
+/* First block in [from, end) whose page is in the page cache, or `end`. */
+static noinline_for_stack u64 cetrafs_cached_first(struct address_space *m, u64 from, u64 end)
+{
+    pgoff_t idx = (pgoff_t) (from >> CETRAFS_BLKS_PER_PAGE_SHIFT);
+    pgoff_t last = (pgoff_t) ((end - 1) >> CETRAFS_BLKS_PER_PAGE_SHIFT);
+    struct folio_batch fb;
+    u64 b = end;
+
+    folio_batch_init(&fb);
+    if (filemap_get_folios(m, &idx, last, &fb)) {
+        b = max_t(u64, from, (u64) folio_pos(fb.folios[0]) / CETRAFS_BLOCK_SIZE);
+        folio_batch_release(&fb);
+    }
+    return min(b, end);
+}
+
+/* First block in [from, end) whose page is NOT in the page cache, or `end`.
+ * Walked by hand: page_cache_next_miss() returns 0 for "wrapped", which
+ * is also the answer for a present page at index 0. */
+static noinline_for_stack u64 cetrafs_cached_first_miss(struct address_space *m, u64 from, u64 end)
+{
+    pgoff_t idx = (pgoff_t) (from >> CETRAFS_BLKS_PER_PAGE_SHIFT);
+    pgoff_t last = (pgoff_t) ((end - 1) >> CETRAFS_BLKS_PER_PAGE_SHIFT);
+    pgoff_t want = idx;
+    struct folio_batch fb;
+    unsigned int n, i;
+
+    folio_batch_init(&fb);
+    while (want <= last && (n = filemap_get_folios(m, &idx, last, &fb))) {
+        for (i = 0; i < n; i++) {
+            struct folio *f = fb.folios[i];
+
+            if (f->index > want)
+                break; /* a gap before this folio */
+            want = max_t(pgoff_t, want, f->index + folio_nr_pages(f));
+        }
+        folio_batch_release(&fb);
+        if (i < n)
+            break;
+        cond_resched();
+    }
+    if (want > last)
+        return end; /* every page in the range is cached */
+    return min(max_t(u64, from, (u64) want << CETRAFS_BLKS_PER_PAGE_SHIFT), end);
+}
+
+/* Do any of the sorted runs overlap? (A damaged tree.) */
+static bool cetrafs_runs_overlap(const struct cetrafs_ext_run *r, u32 n)
+{
+    u64 reach = 0;
+    u32 i;
+
+    for (i = 0; i < n; i++) {
+        if (i && r[i].start < reach)
+            return true;
+        reach = max(reach, r[i].start + r[i].len);
+    }
+    return false;
+}
+
+/* First data block at or after `from`, over the sorted runs, or U64_MAX
+ * if there is none. Disjoint and sorted, so the first answer is the
+ * least; on overlapping runs `as_data` holds and the first run reaching
+ * past `from` has the least start. */
+static u64 cetrafs_next_data_block(struct address_space *m, const struct cetrafs_ext_run *r, u32 n, u64 from,
+                                   bool as_data)
+{
+    u32 i;
+
+    for (i = 0; i < n; i++) {
+        u64 end = r[i].start + r[i].len, s, c;
+
+        if (end <= from)
+            continue; /* entirely behind us */
+        s = max(r[i].start, from);
+        if (!r[i].uninit || as_data)
+            return s;
+        c = cetrafs_cached_first(m, s, end);
+        if (c < end)
+            return c;
+        cond_resched();
+    }
+    return U64_MAX;
+}
+
+/* First hole block at or after `from`, over the sorted runs: one pass,
+ * extending `from` across every run that covers it (runs may overlap on
+ * a damaged tree, hence the max -- and `as_data`, so an uninit run's
+ * cached tail is never skipped by an overlapping neighbour). */
+static u64 cetrafs_next_hole_block(struct address_space *m, const struct cetrafs_ext_run *r, u32 n, u64 from,
+                                   u64 nblocks, bool as_data)
 {
     u32 i;
 
     for (i = 0; i < n && from < nblocks; i++) {
-        if (r[i].start + r[i].len <= from)
+        u64 end = r[i].start + r[i].len;
+
+        if (end <= from)
             continue; /* entirely behind us */
         if (r[i].start > from)
             break; /* a gap before the next run: `from` is the hole */
-        from = r[i].start + r[i].len;
+        if (r[i].uninit && !as_data) {
+            u64 h = cetrafs_cached_first_miss(m, from, end);
+
+            if (h < end) {
+                from = h; /* runs are disjoint: nothing else covers it */
+                break;
+            }
+        }
+        from = max(from, end);
+        cond_resched();
     }
     return from < nblocks ? from : nblocks; /* EOF itself is the hole */
 }
@@ -1090,6 +1184,9 @@ static loff_t cetrafs_seek_hole_data(struct file *file, loff_t offset, int whenc
     struct inode *inode = file->f_mapping->host;
     struct cetrafs_inode_extents ex;
     cetrafs_inode_t raw;
+    struct cetrafs_ext_run *runs;
+    u32 nruns;
+    bool as_data;
     loff_t isize, ret;
     u64 iblock, found, nblocks;
 
@@ -1119,9 +1216,18 @@ static loff_t cetrafs_seek_hole_data(struct file *file, loff_t offset, int whenc
     iblock = (u64) offset / CETRAFS_BLOCK_SIZE;
     nblocks = ((u64) isize + CETRAFS_BLOCK_SIZE - 1) / CETRAFS_BLOCK_SIZE;
 
+    ret = cetrafs_extents_sorted(inode, &ex, &runs, &nruns);
+    if (ret) {
+        cetrafs_inode_extents_put(&ex);
+        filemap_invalidate_unlock_shared(inode->i_mapping);
+        goto out;
+    }
+    as_data = cetrafs_runs_overlap(runs, nruns);
+
     if (whence == SEEK_DATA) {
-        found = cetrafs_next_data_block(&ex, iblock);
+        found = cetrafs_next_data_block(inode->i_mapping, runs, nruns, iblock, as_data);
         if (found == U64_MAX || found >= nblocks) {
+            kvfree(runs);
             cetrafs_inode_extents_put(&ex);
             filemap_invalidate_unlock_shared(inode->i_mapping);
             ret = -ENXIO; /* nothing but hole between here and EOF */
@@ -1131,21 +1237,12 @@ static loff_t cetrafs_seek_hole_data(struct file *file, loff_t offset, int whenc
          * is the caller's own offset, not the block boundary below it. */
         ret = (found == iblock) ? offset : (loff_t) (found * CETRAFS_BLOCK_SIZE);
     } else {
-        struct cetrafs_ext_run *runs;
-        u32 nruns;
-
-        ret = cetrafs_extents_sorted(inode, &ex, &runs, &nruns);
-        if (ret) {
-            cetrafs_inode_extents_put(&ex);
-            filemap_invalidate_unlock_shared(inode->i_mapping);
-            goto out;
-        }
-        found = cetrafs_next_hole_block(runs, nruns, iblock, nblocks);
-        kvfree(runs);
+        found = cetrafs_next_hole_block(inode->i_mapping, runs, nruns, iblock, nblocks, as_data);
         ret = (found == iblock) ? offset : (loff_t) (found * CETRAFS_BLOCK_SIZE);
         if (ret > isize)
             ret = isize; /* EOF is a hole, but never report past it */
     }
+    kvfree(runs);
 
     cetrafs_inode_extents_put(&ex);
     filemap_invalidate_unlock_shared(inode->i_mapping);

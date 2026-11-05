@@ -61,7 +61,34 @@ elif shape == "descending":
     for i in (6, 4, 2, 0):
         os.pwrite(fd, blk, i * 4096)
     os.ftruncate(fd, 8 * 4096)
-os.fsync(fd)
+elif shape == "prealloc":
+    # fallocate(ALLOCATE): blocks reserved, never written -- a hole to
+    # every sparse-aware copy, or a preallocated VM image copies whole
+    os.posix_fallocate(fd, 0, 8 * 4096)
+elif shape == "prealloc-written":
+    os.posix_fallocate(fd, 0, 8 * 4096)
+    os.pwrite(fd, blk, 2 * 4096)
+    os.pwrite(fd, blk * 2, 5 * 4096)
+elif shape == "prealloc-dirty":
+    # written and NOT yet flushed: data, never a hole
+    os.posix_fallocate(fd, 0, 8 * 4096)
+    os.pwrite(fd, blk, 3 * 4096)
+elif shape == "prealloc-read":
+    # read back: the page cache now holds (zero) pages over blocks that
+    # are still preallocated
+    os.posix_fallocate(fd, 0, 8 * 4096)
+    os.fsync(fd)
+    os.pread(fd, 8 * 4096, 0)
+elif shape == "prealloc-partread":
+    # only blocks 2..3 cached (no readahead): data inside a preallocated
+    # run, a hole on either side of it
+    os.posix_fallocate(fd, 0, 8 * 4096)
+    os.fsync(fd)
+    os.posix_fadvise(fd, 0, 0, os.POSIX_FADV_DONTNEED)
+    os.posix_fadvise(fd, 0, 0, os.POSIX_FADV_RANDOM)
+    os.pread(fd, 2 * 4096, 2 * 4096)
+if shape not in ("prealloc-dirty", "prealloc-read", "prealloc-partread"):
+    os.fsync(fd)
 size = os.fstat(fd).st_size
 out = []
 for off in range(0, size + 4096, 2048):
@@ -75,7 +102,7 @@ print("\n".join(out))
 PY
 }
 
-for shape in dense sparse hole-first descending; do
+for shape in dense sparse hole-first descending prealloc prealloc-written prealloc-dirty prealloc-read prealloc-partread; do
     log "shape: $shape"
     C="$(probe "$MNT" "$shape")"
     E="$(probe "$EXT4_MNT" "$shape")"
@@ -104,6 +131,14 @@ echo "$S" | grep -q "^     0 HOLE -> 4096" &&
 echo "$S" | grep -qE "^ *(2[0-9]{4}|3[0-9]{4}) DATA -> ENXIO" &&
     pass "SEEK_DATA past the last data returns ENXIO" ||
     fail "no ENXIO for SEEK_DATA past the last data"
+S="$(probe "$MNT" prealloc)"
+echo "$S" | grep -q "^     0 DATA -> ENXIO" && echo "$S" | grep -q "^     0 HOLE -> 0$" &&
+    pass "a preallocated, never-written file is all hole" ||
+    fail "a preallocated file reads as data: $(echo "$S" | grep '^     0 ')"
+S="$(probe "$MNT" prealloc-partread)"
+echo "$S" | grep -q "^     0 DATA -> 8192" && echo "$S" | grep -q "^  8192 HOLE -> 16384" &&
+    pass "inside a preallocated run, the cached blocks are data and the rest hole" ||
+    fail "partly cached preallocated run: $(echo "$S" | grep -E '^ +(0|8192) ' | tr '\n' ';')"
 
 log "a file whose extents spilled to the external leaf"
 # Depth 1 exercises the other half of cetrafs_inode_extents_get(). Built
