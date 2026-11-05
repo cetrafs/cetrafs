@@ -632,6 +632,9 @@ int cetrafs_convert_pending_locked(struct inode *inode)
             n = buffer_mapped(&map) ? clamp_t(u64, map.b_size >> bits, 1, (u64) last - cur + 1) : 1;
             cur += n;
         }
+        /* The flips above visible before the set lets go of them: a
+         * mapper that misses in the set looks again (__cetrafs_get_block()). */
+        smp_wmb();
         cetrafs_pending_clear(inode, first, last);
         from = (u64) last + 1;
         cond_resched();
@@ -641,8 +644,10 @@ int cetrafs_convert_pending_locked(struct inode *inode)
 fail:
     /* What was converted is out of the set; the rest stays pending, for
      * the next boundary to try again. */
-    if (cur > first)
+    if (cur > first) {
+        smp_wmb();
         cetrafs_pending_clear(inode, first, (u32) (cur - 1));
+    }
     pr_err_ratelimited("ino=%llu: could not mark buffered block %llu written (%d) -- it reads as zeros until a later "
                        "fsync or close converts it\n",
                        (unsigned long long) inode->i_ino, (unsigned long long) cur, ret);
@@ -3999,6 +4004,13 @@ static unsigned int cetrafs_alloc_run_max_blocks = 4096;
 module_param_named(alloc_run_max_blocks, cetrafs_alloc_run_max_blocks, uint, 0644);
 MODULE_PARM_DESC(alloc_run_max_blocks, "largest speculative run a streaming file grows to, in blocks");
 
+/* TEST ONLY: stall a mapping that found an unwritten block between the
+ * tree read and its verdict, so a conversion lands in between
+ * (tests/kernel/buffered_pending_race.sh). */
+static unsigned int cetrafs_pending_race_delay_ms;
+cetrafs_test_param(pending_race_delay_ms, cetrafs_pending_race_delay_ms, uint, 0644);
+MODULE_PARM_DESC(pending_race_delay_ms, "TEST ONLY: stall get_block after the tree says unwritten");
+
 static int __cetrafs_get_block(struct inode *inode,
                                sector_t iblock,
                                struct buffer_head *bh_result,
@@ -4014,6 +4026,8 @@ static int __cetrafs_get_block(struct inode *inode,
     u32 run = 1; /* contiguous blocks mappable from iblock (see below) */
     bool found, merged, uninit = false;
     bool dio_prealloc = false;
+    u32 prun = 0; /* pending blocks from iblock (see the lookup below) */
+    bool relooked = false;
     u32 leaf_count;
     int ret;
 
@@ -4056,6 +4070,7 @@ static int __cetrafs_get_block(struct inode *inode,
         !(reader ? cetrafs_lock_read_cache_trusted(inode) : cetrafs_lock_held_for_write_locally(inode)))
         cetrafs_invalidate_raw_inode(sb, inode->i_ino);
 
+relookup:
     ret = cetrafs_read_raw_inode_overlaid(sb, inode, &raw); /* torn-read-safe vs a concurrent publish */
     if (ret)
         return ret;
@@ -4118,11 +4133,31 @@ static int __cetrafs_get_block(struct inode *inode,
      * write into the block -- and never re-zeroed as new. */
     if (found && uninit && mode != CETRAFS_GB_CONVERT && mode != CETRAFS_GB_CONVERT_PENDING &&
         S_ISREG(inode->i_mode)) {
-        u32 prun = cetrafs_pending_run(inode, (u32) iblock);
-
+        if (unlikely(cetrafs_pending_race_delay_ms))
+            msleep(cetrafs_pending_race_delay_ms);
+        prun = cetrafs_pending_run(inode, (u32) iblock);
         if (prun) {
             uninit = false;
             run = min_t(u32, run ? run : 1, prun);
+        } else if (!relooked) {
+            /*
+             * Conversion marks the block written, THEN drops it from
+             * the set (cetrafs_convert_pending_locked()). Landing
+             * between the tree read above and this miss, it leaves
+             * "unwritten" and "not pending" -- zeros over written
+             * data. A miss caused by the conversion's clear is ordered
+             * after its flip, so one more lookup sees the block
+             * written. Only an unwritten block pays for it.
+             *
+             * Not reachable today -- every mapper is serialised
+             * against conversion: O_DIRECT reads by i_rwsem, buffered
+             * reads and faults by invalidate_lock, writeback by the
+             * conversion's own flush (buffered_pending_race.sh shows
+             * the first three). Here for the first one that is not.
+             */
+            relooked = true;
+            smp_rmb(); /* pairs with the smp_wmb() before cetrafs_pending_clear() */
+            goto relookup;
         }
     }
     if (found && uninit && !create) {
