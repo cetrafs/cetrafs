@@ -110,7 +110,7 @@ struct cetrafs_nslock_ctx {
  * a lock nobody else can take -- is not otherwise reachable.
  */
 static bool cetrafs_nslock_release_fail;
-module_param_named(nslock_release_fail, cetrafs_nslock_release_fail, bool, 0644);
+cetrafs_test_param(nslock_release_fail, cetrafs_nslock_release_fail, bool, 0644);
 MODULE_PARM_DESC(nslock_release_fail, "TEST ONLY: namespace-lock releases do not commit");
 
 /*
@@ -124,11 +124,11 @@ MODULE_PARM_DESC(nslock_release_fail, "TEST ONLY: namespace-lock releases do not
  * release knew before it read anything.
  */
 static bool cetrafs_nslock_release_read_fail;
-module_param_named(nslock_release_read_fail, cetrafs_nslock_release_read_fail, bool, 0644);
+cetrafs_test_param(nslock_release_read_fail, cetrafs_nslock_release_read_fail, bool, 0644);
 MODULE_PARM_DESC(nslock_release_read_fail, "TEST ONLY: a namespace-lock release cannot read the record");
 
 static unsigned int cetrafs_nslock_hold_ms;
-module_param_named(nslock_hold_ms, cetrafs_nslock_hold_ms, uint, 0644);
+cetrafs_test_param(nslock_hold_ms, cetrafs_nslock_hold_ms, uint, 0644);
 MODULE_PARM_DESC(nslock_hold_ms, "TEST ONLY: sleep this long holding each namespace lock just acquired");
 
 static int cetrafs_nslock_mutate(void *image, unsigned int len, void *priv)
@@ -505,7 +505,7 @@ int cetrafs_nslock_acquire(struct inode *inode)
 /* TEST ONLY: fail this many staged file-sector publishes at release, as
  * a device error would. */
 static unsigned int cetrafs_nslock_fd_publish_fail;
-module_param_named(nslock_fd_publish_fail, cetrafs_nslock_fd_publish_fail, uint, 0644);
+cetrafs_test_param(nslock_fd_publish_fail, cetrafs_nslock_fd_publish_fail, uint, 0644);
 MODULE_PARM_DESC(nslock_fd_publish_fail, "TEST ONLY: fail the next N staged file-sector publishes at release");
 
 void cetrafs_nslock_release(struct inode *inode)

@@ -335,7 +335,7 @@ u64 cetrafs_journal_replay_applied_count(void)
  * the "owner is alive -- leave it" verdict to prove the attach-time wait
  * actually waits. Off in production. */
 static bool cetrafs_force_live_replay_claim;
-module_param_named(force_live_replay_claim, cetrafs_force_live_replay_claim, bool, 0644);
+cetrafs_test_param(force_live_replay_claim, cetrafs_force_live_replay_claim, bool, 0644);
 MODULE_PARM_DESC(force_live_replay_claim, "TEST ONLY: a foreign journal replay claim always reads as live");
 
 /* 0 = claimed, -EEXIST = someone else is handling it (or nothing to do). */
@@ -378,7 +378,7 @@ static int cetrafs_journal_claim_replay(struct super_block *sb, u64 area_start, 
 /* TEST ONLY: fail the next replay-claim release, as a CAS the device
  * refused would (tests/kernel/journal_release_retry.sh). */
 static bool cetrafs_journal_release_fail_once;
-module_param_named(journal_release_fail_once, cetrafs_journal_release_fail_once, bool, 0644);
+cetrafs_test_param(journal_release_fail_once, cetrafs_journal_release_fail_once, bool, 0644);
 MODULE_PARM_DESC(journal_release_fail_once, "TEST ONLY: fail the next journal replay-claim release with -EIO");
 
 static void cetrafs_journal_release_replay(struct super_block *sb, u32 node_id, u64 area_start, u32 my_node_id,
@@ -550,7 +550,7 @@ int cetrafs_journal_attach_node(struct super_block *sb, u32 node_id)
  * hazard it exposes (a peer replaying the entry after someone else has
  * rewritten the target) is the real code path either way. */
 static bool cetrafs_journal_skip_consume;
-module_param_named(journal_skip_consume, cetrafs_journal_skip_consume, bool, 0644);
+cetrafs_test_param(journal_skip_consume, cetrafs_journal_skip_consume, bool, 0644);
 MODULE_PARM_DESC(journal_skip_consume, "test-only: do not consume journal entries after the target write");
 
 /* Test-only: replay as it behaved BEFORE the prev_checksum guard --
@@ -565,7 +565,7 @@ MODULE_PARM_DESC(journal_skip_consume, "test-only: do not consume journal entrie
  * device), proving the guard still repairs what it is supposed to
  * repair rather than merely refusing everything. */
 static bool cetrafs_journal_skip_target_write;
-module_param_named(journal_skip_target_write, cetrafs_journal_skip_target_write, bool, 0644);
+cetrafs_test_param(journal_skip_target_write, cetrafs_journal_skip_target_write, bool, 0644);
 MODULE_PARM_DESC(journal_skip_target_write, "test-only: journal the entry but do not write the target in place");
 
 /*
@@ -584,7 +584,7 @@ MODULE_PARM_DESC(journal_skip_target_write, "test-only: journal the entry but do
  * nothing about whether it was usable.
  */
 static bool cetrafs_journal_fail_target_write;
-module_param_named(journal_fail_target_write, cetrafs_journal_fail_target_write, bool, 0644);
+cetrafs_test_param(journal_fail_target_write, cetrafs_journal_fail_target_write, bool, 0644);
 MODULE_PARM_DESC(journal_fail_target_write, "test-only: the target's write fails (the entry must stay live)");
 
 /*
@@ -594,7 +594,7 @@ MODULE_PARM_DESC(journal_fail_target_write, "test-only: the target's write fails
  * it cannot be protected: it must fail, never go out unjournaled.
  */
 static bool cetrafs_journal_fail_entry_write;
-module_param_named(journal_fail_entry_write, cetrafs_journal_fail_entry_write, bool, 0644);
+cetrafs_test_param(journal_fail_entry_write, cetrafs_journal_fail_entry_write, bool, 0644);
 MODULE_PARM_DESC(journal_fail_entry_write, "test-only: the journal entry's own write fails");
 
 /*
@@ -603,11 +603,11 @@ MODULE_PARM_DESC(journal_fail_entry_write, "test-only: the journal entry's own w
  * land (tests/kernel/journal_replay_live_writer.sh).
  */
 static unsigned int cetrafs_journal_replay_apply_pause_ms;
-module_param_named(journal_replay_apply_pause_ms, cetrafs_journal_replay_apply_pause_ms, uint, 0644);
+cetrafs_test_param(journal_replay_apply_pause_ms, cetrafs_journal_replay_apply_pause_ms, uint, 0644);
 MODULE_PARM_DESC(journal_replay_apply_pause_ms, "test-only: pause between replay's verdict and its redo");
 
 static bool cetrafs_journal_ignore_guard;
-module_param_named(journal_ignore_guard, cetrafs_journal_ignore_guard, bool, 0644);
+cetrafs_test_param(journal_ignore_guard, cetrafs_journal_ignore_guard, bool, 0644);
 MODULE_PARM_DESC(journal_ignore_guard, "test-only: replay without the prev_checksum guard (reproduces the pre-fix bug)");
 
 /* Test-only: treat a TORN target as "changed since" and refuse it -- the
@@ -616,11 +616,11 @@ MODULE_PARM_DESC(journal_ignore_guard, "test-only: replay without the prev_check
  * after-image. This is the negative control for the torn branch: with it
  * set, the crash rig's phase 5 must FAIL. Never set in production. */
 static bool cetrafs_journal_ignore_torn;
-module_param_named(journal_ignore_torn, cetrafs_journal_ignore_torn, bool, 0644);
+cetrafs_test_param(journal_ignore_torn, cetrafs_journal_ignore_torn, bool, 0644);
 MODULE_PARM_DESC(journal_ignore_torn, "test-only: refuse to redo a torn target (reproduces the 0.7.3 bug)");
 
 static bool cetrafs_journal_ignore_kind;
-module_param_named(journal_ignore_kind, cetrafs_journal_ignore_kind, bool, 0644);
+cetrafs_test_param(journal_ignore_kind, cetrafs_journal_ignore_kind, bool, 0644);
 MODULE_PARM_DESC(journal_ignore_kind, "test-only: redo a 'torn' target even when it is no longer a block of the entry's kind");
 
 static u64 cetrafs_journal_header_lba(const struct cetrafs_journal *j, u64 slot)

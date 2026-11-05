@@ -49,7 +49,7 @@ u64 cetrafs_bg_recount_count(void)
  * pending-free queue and its drop handling can be exercised on a single
  * node. A real foreign free needs a second node owning the ZG. */
 bool cetrafs_pf_force_foreign;
-module_param_named(pf_force_foreign, cetrafs_pf_force_foreign, bool, 0644);
+cetrafs_test_param(pf_force_foreign, cetrafs_pf_force_foreign, bool, 0644);
 MODULE_PARM_DESC(pf_force_foreign, "test-only: route every block free through the foreign pending-free queue");
 
 /*
@@ -538,7 +538,7 @@ static int cetrafs_inode_bitmap_cas_free(struct super_block *sb, u64 bit)
  * BIRTH_ABORT) with -EIO, as a CAS the device refused would.
  * tests/kernel/reclaim_giveback_retry.sh. */
 static unsigned int cetrafs_reclaim_giveback_fail;
-module_param_named(reclaim_giveback_fail, cetrafs_reclaim_giveback_fail, uint, 0644);
+cetrafs_test_param(reclaim_giveback_fail, cetrafs_reclaim_giveback_fail, uint, 0644);
 MODULE_PARM_DESC(reclaim_giveback_fail, "test-only: fail the next N inode reclaim-claim give-backs with -EIO");
 
 /*
@@ -597,25 +597,25 @@ void cetrafs_alloc_retry_reclaim(struct super_block *sb)
  * see. tests/kernel/scrub_vs_birth.sh plays that scrub inside it.
  */
 static unsigned int cetrafs_birth_gap_ms;
-module_param_named(birth_gap_ms, cetrafs_birth_gap_ms, uint, 0644);
+cetrafs_test_param(birth_gap_ms, cetrafs_birth_gap_ms, uint, 0644);
 MODULE_PARM_DESC(birth_gap_ms, "test-only: delay between an inode allocation's bit CAS and its birth claim");
 /* Test-only: the same pause, but BEFORE the record is read -- the window
  * in which a peer's whole claim-clear-release can land and leave the
  * creator reading the RELEASED record. tests/kernel/scrub_birth_handover.sh. */
 static unsigned int cetrafs_birth_read_gap_ms;
-module_param_named(birth_read_gap_ms, cetrafs_birth_read_gap_ms, uint, 0644);
+cetrafs_test_param(birth_read_gap_ms, cetrafs_birth_read_gap_ms, uint, 0644);
 MODULE_PARM_DESC(birth_read_gap_ms, "test-only: delay between an inode allocation's bit CAS and its record read");
 /* Test-only: fail the next N record reads of cetrafs_free_inode(), as a
  * device read error would. tests/kernel/free_inode_keeps_bit.sh. */
 static unsigned int cetrafs_free_inode_read_fail;
-module_param_named(free_inode_read_fail, cetrafs_free_inode_read_fail, uint, 0644);
+cetrafs_test_param(free_inode_read_fail, cetrafs_free_inode_read_fail, uint, 0644);
 MODULE_PARM_DESC(free_inode_read_fail, "test-only: fail the next N record reads of an inode free with -EIO");
 
 /* Test-only: fail the next N post-claim bit checks of an inode allocation
  * with -EIO, as a device read error would, without reading.
  * tests/kernel/birth_check_error.sh. */
 static unsigned int cetrafs_birth_check_fail;
-module_param_named(birth_check_fail, cetrafs_birth_check_fail, uint, 0644);
+cetrafs_test_param(birth_check_fail, cetrafs_birth_check_fail, uint, 0644);
 MODULE_PARM_DESC(birth_check_fail, "test-only: fail the next N post-claim inode-bit checks with -EIO");
 
 /* One forced-fresh read of an inode record, raw: see the comment at its
@@ -1536,10 +1536,10 @@ static int cetrafs_bg_count_mutate(void *image, unsigned int len, void *priv)
  * (tests/kernel/bg_seed_torn.sh), and take that copy without the buffer
  * lock as the code used to (its negative control). */
 static unsigned int cetrafs_bg_seed_copy_stall_ms;
-module_param_named(bg_seed_copy_stall_ms, cetrafs_bg_seed_copy_stall_ms, uint, 0644);
+cetrafs_test_param(bg_seed_copy_stall_ms, cetrafs_bg_seed_copy_stall_ms, uint, 0644);
 MODULE_PARM_DESC(bg_seed_copy_stall_ms, "TEST ONLY: pause halfway through copying the BG free-delta seed");
 static bool cetrafs_bg_seed_unlocked;
-module_param_named(bg_seed_unlocked, cetrafs_bg_seed_unlocked, bool, 0644);
+cetrafs_test_param(bg_seed_unlocked, cetrafs_bg_seed_unlocked, bool, 0644);
 MODULE_PARM_DESC(bg_seed_unlocked, "TEST ONLY: copy the BG free-delta seed without the buffer lock");
 
 int cetrafs_bg_apply_free_delta(struct super_block *sb, u32 bg_id, s64 delta)
@@ -1685,7 +1685,7 @@ int cetrafs_bg_seed_count_epochs(struct super_block *sb, u32 zg_id)
  * test -- and a guard nothing ever runs is a guard nobody knows works.
  */
 static bool cetrafs_alloc_force_foreign;
-module_param_named(alloc_force_foreign, cetrafs_alloc_force_foreign, bool, 0644);
+cetrafs_test_param(alloc_force_foreign, cetrafs_alloc_force_foreign, bool, 0644);
 MODULE_PARM_DESC(alloc_force_foreign, "test-only: treat every Block Group as owned by another node");
 
 /*
@@ -1695,7 +1695,7 @@ MODULE_PARM_DESC(alloc_force_foreign, "test-only: treat every Block Group as own
  * (tests/kernel/alloc_vs_bg_release.sh). Cleared by the pause it causes.
  */
 static unsigned int cetrafs_alloc_pause_before_lock_ms;
-module_param_named(alloc_pause_before_lock_ms, cetrafs_alloc_pause_before_lock_ms, uint, 0644);
+cetrafs_test_param(alloc_pause_before_lock_ms, cetrafs_alloc_pause_before_lock_ms, uint, 0644);
 MODULE_PARM_DESC(alloc_pause_before_lock_ms, "TEST ONLY: one-shot pause between an allocation's ownership check and alloc_mutex");
 
 /*
@@ -1744,13 +1744,13 @@ not_ours:
  * -EIO, as a bitmap read error would, so both the error path and the
  * give-back of the first bit run (tests/kernel/run_alloc_io_error.sh). */
 static bool cetrafs_run_alloc_fail_once;
-module_param_named(run_alloc_fail_once, cetrafs_run_alloc_fail_once, bool, 0644);
+cetrafs_test_param(run_alloc_fail_once, cetrafs_run_alloc_fail_once, bool, 0644);
 MODULE_PARM_DESC(run_alloc_fail_once, "TEST ONLY: fail the second bit of the next run allocation with -EIO, once");
 
 /* TEST ONLY: the next data allocation reports ENOSPC once, which sends
  * its caller down the recount path. */
 static bool cetrafs_alloc_force_enospc_once;
-module_param_named(alloc_force_enospc_once, cetrafs_alloc_force_enospc_once, bool, 0644);
+cetrafs_test_param(alloc_force_enospc_once, cetrafs_alloc_force_enospc_once, bool, 0644);
 MODULE_PARM_DESC(alloc_force_enospc_once, "TEST ONLY: fail the next data allocation with ENOSPC, once");
 
 int cetrafs_alloc_data_block(struct super_block *sb, u32 bg_id, u64 *out_lba)
@@ -2357,7 +2357,7 @@ int cetrafs_inode_is_allocated(struct super_block *sb, u64 ino, bool *out_set)
  * retry to be possible at all. tests/kernel/bitmap_flush_error.sh.
  */
 static bool cetrafs_alloc_flush_fail;
-module_param_named(alloc_flush_fail, cetrafs_alloc_flush_fail, bool, 0644);
+cetrafs_test_param(alloc_flush_fail, cetrafs_alloc_flush_fail, bool, 0644);
 MODULE_PARM_DESC(alloc_flush_fail, "test-only: fail allocation-bitmap syncs at durability boundaries with -EIO");
 
 static int cetrafs_sync_one_block(struct super_block *sb, u64 lba)
@@ -2819,7 +2819,7 @@ int cetrafs_count_free_inodes(struct super_block *sb, u64 *out_free)
  * so a free or an allocation can be driven into that window
  * (tests/kernel/reconcile_vs_free.sh). */
 static unsigned int cetrafs_reconcile_pause_ms;
-module_param_named(reconcile_pause_ms, cetrafs_reconcile_pause_ms, uint, 0644);
+cetrafs_test_param(reconcile_pause_ms, cetrafs_reconcile_pause_ms, uint, 0644);
 MODULE_PARM_DESC(reconcile_pause_ms, "TEST ONLY: one-shot pause between a free-count recount and its write");
 
 static int cetrafs_reconcile_locked(struct super_block *sb, u32 bg_id, s64 *out_delta);
@@ -2988,7 +2988,7 @@ static int cetrafs_bg_claim_mutate(void *image, unsigned int len, void *priv)
  * (tests/README.md).
  */
 bool cetrafs_bg_claim_blind;
-module_param_named(bg_claim_blind, cetrafs_bg_claim_blind, bool, 0644);
+cetrafs_test_param(bg_claim_blind, cetrafs_bg_claim_blind, bool, 0644);
 MODULE_PARM_DESC(bg_claim_blind, "test-only: claim a free Block Group with a blind write, not a compare-and-swap");
 
 extern bool cetrafs_bg_release_skip_empty_check;
@@ -3065,7 +3065,7 @@ static int cetrafs_bg_release_mutate(void *image, unsigned int len, void *priv)
  * nobody has measured.
  */
 bool cetrafs_bg_release_skip_empty_check;
-module_param_named(bg_release_skip_empty_check, cetrafs_bg_release_skip_empty_check, bool, 0644);
+cetrafs_test_param(bg_release_skip_empty_check, cetrafs_bg_release_skip_empty_check, bool, 0644);
 MODULE_PARM_DESC(bg_release_skip_empty_check, "test-only: hand back a Block Group without checking it is empty");
 
 /*
@@ -3075,7 +3075,7 @@ MODULE_PARM_DESC(bg_release_skip_empty_check, "test-only: hand back a Block Grou
  * only the count checks).
  */
 static bool cetrafs_bg_release_skip_bitmap_scan;
-module_param_named(bg_release_skip_bitmap_scan, cetrafs_bg_release_skip_bitmap_scan, bool, 0644);
+cetrafs_test_param(bg_release_skip_bitmap_scan, cetrafs_bg_release_skip_bitmap_scan, bool, 0644);
 MODULE_PARM_DESC(bg_release_skip_bitmap_scan, "test-only: hand back a Block Group without scanning its bitmap");
 
 /*
@@ -3150,7 +3150,7 @@ void cetrafs_bg_release_drop_bitmap(struct super_block *sb, u32 b)
  * a test only with this off (bg_release_safety.sh, part C).
  */
 static bool cetrafs_bg_release_off;
-module_param_named(bg_release_off, cetrafs_bg_release_off, bool, 0644);
+cetrafs_test_param(bg_release_off, cetrafs_bg_release_off, bool, 0644);
 MODULE_PARM_DESC(bg_release_off, "test-only: never hand back individual Block Groups");
 
 int cetrafs_bg_release_empty(struct super_block *sb, u32 zg_id, u32 *out_released)

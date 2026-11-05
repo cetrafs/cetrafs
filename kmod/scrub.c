@@ -96,7 +96,7 @@ MODULE_PARM_DESC(scrub_gap_secs, "two-pass confirmation gap in seconds (must exc
  * With it the scrub frees blocks out from under a file that is being
  * written, which is what it used to do unconditionally. */
 static bool cetrafs_scrub_ignore_shadow;
-module_param_named(scrub_ignore_shadow, cetrafs_scrub_ignore_shadow, bool, 0644);
+cetrafs_test_param(scrub_ignore_shadow, cetrafs_scrub_ignore_shadow, bool, 0644);
 MODULE_PARM_DESC(scrub_ignore_shadow,
                  "TEST ONLY: build the scrub reference set from the on-disk records only (frees live blocks)");
 
@@ -108,11 +108,11 @@ MODULE_PARM_DESC(scrub_ignore_shadow,
 /* TEST ONLY: hold the scrub between its verdict (pass 2) and its frees,
  * so a test can release a run inside that window. */
 static unsigned int cetrafs_scrub_verdict_stall_ms;
-module_param_named(scrub_verdict_stall_ms, cetrafs_scrub_verdict_stall_ms, uint, 0644);
+cetrafs_test_param(scrub_verdict_stall_ms, cetrafs_scrub_verdict_stall_ms, uint, 0644);
 MODULE_PARM_DESC(scrub_verdict_stall_ms, "TEST ONLY: ms to hold between the scrub's verdict and its frees");
 
 static bool cetrafs_scrub_ignore_alloc_seq;
-module_param_named(scrub_ignore_alloc_seq, cetrafs_scrub_ignore_alloc_seq, bool, 0644);
+cetrafs_test_param(scrub_ignore_alloc_seq, cetrafs_scrub_ignore_alloc_seq, bool, 0644);
 MODULE_PARM_DESC(scrub_ignore_alloc_seq,
                  "TEST ONLY: free on a verdict older than the last allocation in the Block Group");
 

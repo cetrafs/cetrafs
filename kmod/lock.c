@@ -564,7 +564,7 @@ void cetrafs_inode_stat_baseline_set(struct inode *inode, const cetrafs_inode_t 
  * nothing. Flip this and the content assertions must FAIL.
  */
 static bool cetrafs_ext_cache_trust_stale;
-module_param_named(ext_cache_trust_stale, cetrafs_ext_cache_trust_stale, bool, 0644);
+cetrafs_test_param(ext_cache_trust_stale, cetrafs_ext_cache_trust_stale, bool, 0644);
 MODULE_PARM_DESC(ext_cache_trust_stale,
                  "TEST ONLY: keep a remembered extent after the map changed (reproduces a stale "
                  "extent mapping: reads land on the wrong blocks)");
@@ -671,7 +671,7 @@ void cetrafs_inode_ext_cache_store(struct inode *inode,
 /* TEST ONLY: make every drop a no-op, so the key is the sole guard
  * (tests/kernel/ext_cache_punch_refill.sh). */
 static bool cetrafs_ext_cache_skip_drop;
-module_param_named(ext_cache_skip_drop, cetrafs_ext_cache_skip_drop, bool, 0644);
+cetrafs_test_param(ext_cache_skip_drop, cetrafs_ext_cache_skip_drop, bool, 0644);
 MODULE_PARM_DESC(ext_cache_skip_drop, "TEST ONLY: extent-cache drops do nothing; the key alone must catch a change");
 
 void cetrafs_inode_ext_cache_drop(struct inode *inode)
@@ -756,7 +756,7 @@ void cetrafs_inode_set_dirent_seq_cached(struct inode *inode, u64 seq)
  * standing between a local write loop and a self-invalidation storm,
  * which is the property file_local_write_cache.sh needs to test. */
 static bool cetrafs_file_seq_skip_note;
-module_param_named(file_seq_skip_note, cetrafs_file_seq_skip_note, bool, 0644);
+cetrafs_test_param(file_seq_skip_note, cetrafs_file_seq_skip_note, bool, 0644);
 MODULE_PARM_DESC(file_seq_skip_note, "TEST ONLY: do not record our own file_seq publishes");
 
 /*
@@ -954,7 +954,7 @@ int cetrafs_inode_fd_overlay_checked(struct inode *inode, cetrafs_inode_t *raw, 
  * regression; nothing in production sets it.
  */
 static bool cetrafs_fd_take_clears_dirty;
-module_param_named(fd_take_clears_dirty, cetrafs_fd_take_clears_dirty, bool, 0644);
+cetrafs_test_param(fd_take_clears_dirty, cetrafs_fd_take_clears_dirty, bool, 0644);
 MODULE_PARM_DESC(fd_take_clears_dirty, "TEST ONLY: restore the shadow lost-update leak");
 
 /* Snapshot the shadow for publishing. Returns false when there is
@@ -1573,7 +1573,7 @@ static int cetrafs_lock_suspend_mark(struct inode *inode, bool set);
  * refused would (tests/kernel/presence_withdraw_retry.sh,
  * release_queue_full.sh). */
 static unsigned int cetrafs_presence_withdraw_fail;
-module_param_named(presence_withdraw_fail, cetrafs_presence_withdraw_fail, uint, 0644);
+cetrafs_test_param(presence_withdraw_fail, cetrafs_presence_withdraw_fail, uint, 0644);
 MODULE_PARM_DESC(presence_withdraw_fail, "TEST ONLY: fail the next N presence withdraws with -EIO");
 
 /*
@@ -1643,7 +1643,7 @@ static void cetrafs_lock_presence_withdraw(struct inode *inode)
  * invisible until long afterwards.
  */
 static bool cetrafs_lock_fail_reader_publish;
-module_param_named(lock_fail_reader_publish, cetrafs_lock_fail_reader_publish, bool, 0644);
+cetrafs_test_param(lock_fail_reader_publish, cetrafs_lock_fail_reader_publish, bool, 0644);
 MODULE_PARM_DESC(lock_fail_reader_publish, "test-only: force the reader-set publish to fail");
 
 /*
@@ -1653,7 +1653,7 @@ MODULE_PARM_DESC(lock_fail_reader_publish, "test-only: force the reader-set publ
  * gap. tests/kernel/close_publish_order.sh.
  */
 static unsigned int cetrafs_release_step_gap_ms;
-module_param_named(release_step_gap_ms, cetrafs_release_step_gap_ms, uint, 0644);
+cetrafs_test_param(release_step_gap_ms, cetrafs_release_step_gap_ms, uint, 0644);
 MODULE_PARM_DESC(release_step_gap_ms, "test-only: delay between the close's lock clear and state publish");
 
 /* Defined below, next to the public wrapper it came from. 'ignore':
@@ -1698,18 +1698,18 @@ static void cetrafs_lock_reconcile_cold(struct inode *inode, cetrafs_inode_t *sc
  * record and the swaps that publish it -- where a peer's unlink can land
  * (tests/kernel/open_vs_evict.sh). Cleared by the pause it causes. */
 static unsigned int cetrafs_lock_open_pause_ms;
-module_param_named(lock_open_pause_ms, cetrafs_lock_open_pause_ms, uint, 0644);
+cetrafs_test_param(lock_open_pause_ms, cetrafs_lock_open_pause_ms, uint, 0644);
 MODULE_PARM_DESC(lock_open_pause_ms, "TEST ONLY: one-shot pause between an open's record read and its swaps");
 
 static bool cetrafs_lock_ignore_readers;
-module_param_named(lock_ignore_readers, cetrafs_lock_ignore_readers, bool, 0644);
+cetrafs_test_param(lock_ignore_readers, cetrafs_lock_ignore_readers, bool, 0644);
 MODULE_PARM_DESC(lock_ignore_readers, "TEST ONLY: drop the readers-exclude-a-writer half of the access rule");
 
 /* TEST ONLY: the next write-open's open-boundary refresh fails with
  * -EBUSY, as a contended or locally-dirty refresh does
  * (tests/kernel/open_fail_gives_back_lock.sh). */
 static bool cetrafs_open_refresh_fail_once;
-module_param_named(open_refresh_fail_once, cetrafs_open_refresh_fail_once, bool, 0644);
+cetrafs_test_param(open_refresh_fail_once, cetrafs_open_refresh_fail_once, bool, 0644);
 MODULE_PARM_DESC(open_refresh_fail_once, "TEST ONLY: the next write-open's refresh fails with -EBUSY");
 
 int cetrafs_lock_open(struct inode *inode, struct file *file)
@@ -2131,7 +2131,7 @@ out_pr_unlock:
 /* TEST ONLY: fail the next last-writer close's lock-clear CAS, as a
  * device error would. */
 static bool cetrafs_lock_clear_fail_once;
-module_param_named(lock_clear_fail_once, cetrafs_lock_clear_fail_once, bool, 0644);
+cetrafs_test_param(lock_clear_fail_once, cetrafs_lock_clear_fail_once, bool, 0644);
 MODULE_PARM_DESC(lock_clear_fail_once, "TEST ONLY: the next last-writer close's lock clear fails with -EIO");
 
 /*
@@ -2698,15 +2698,15 @@ u64 cetrafs_file_cache_drop_count(void)
  * file_local_write_cache.sh -- with it set, a purely local write
  * workload must start dropping its own cache. */
 static bool cetrafs_file_seq_ignore_owner;
-module_param_named(file_seq_ignore_owner, cetrafs_file_seq_ignore_owner, bool, 0644);
+cetrafs_test_param(file_seq_ignore_owner, cetrafs_file_seq_ignore_owner, bool, 0644);
 MODULE_PARM_DESC(file_seq_ignore_owner, "TEST ONLY: treat our own file_seq publishes as a peer's");
 
 static bool cetrafs_file_seq_ignore;
-module_param_named(file_seq_ignore, cetrafs_file_seq_ignore, bool, 0644);
+cetrafs_test_param(file_seq_ignore, cetrafs_file_seq_ignore, bool, 0644);
 MODULE_PARM_DESC(file_seq_ignore, "TEST ONLY: ignore file_seq freshness (reproduces the stale-cache bug)");
 
 static bool cetrafs_force_foreign_opener;
-module_param_named(force_foreign_opener, cetrafs_force_foreign_opener, bool, 0644);
+cetrafs_test_param(force_foreign_opener, cetrafs_force_foreign_opener, bool, 0644);
 MODULE_PARM_DESC(force_foreign_opener, "TEST ONLY: nofilelock metadata reads always treat a peer as present (fresh)");
 
 /*
@@ -2747,7 +2747,7 @@ MODULE_PARM_DESC(force_foreign_opener, "TEST ONLY: nofilelock metadata reads alw
  * before it settles, so a mark can be driven into each window
  * (tests/kernel/cold_mark_during_reconcile.sh). */
 static unsigned int cetrafs_cold_work_stall_ms;
-module_param_named(cold_work_stall_ms, cetrafs_cold_work_stall_ms, uint, 0644);
+cetrafs_test_param(cold_work_stall_ms, cetrafs_cold_work_stall_ms, uint, 0644);
 MODULE_PARM_DESC(cold_work_stall_ms, "TEST ONLY: stall the cold-tree reconcile before its drop and before its settle");
 
 static void cetrafs_inode_cold_work(struct work_struct *w)
@@ -2911,19 +2911,19 @@ bool cetrafs_inode_foreign_opener_cached(struct inode *inode)
  * flip the knob and the test must fail.
  */
 static bool cetrafs_lock_suspend_skip_publish;
-module_param_named(lock_suspend_skip_publish, cetrafs_lock_suspend_skip_publish, bool, 0644);
+cetrafs_test_param(lock_suspend_skip_publish, cetrafs_lock_suspend_skip_publish, bool, 0644);
 MODULE_PARM_DESC(lock_suspend_skip_publish,
                  "TEST ONLY: suspend without publishing presence (reproduces the invisible-writer bug: "
                  "a peer's unlink or scrub frees blocks under a live writer)");
 
 static bool cetrafs_lock_suspend_skip_gate;
-module_param_named(lock_suspend_skip_gate, cetrafs_lock_suspend_skip_gate, bool, 0644);
+cetrafs_test_param(lock_suspend_skip_gate, cetrafs_lock_suspend_skip_gate, bool, 0644);
 MODULE_PARM_DESC(lock_suspend_skip_gate,
                  "TEST ONLY: suspend without draining this node's writers, and let them keep writing "
                  "(reproduces two writers after a handoff)");
 
 static bool cetrafs_lock_suspend_trust_cache;
-module_param_named(lock_suspend_trust_cache, cetrafs_lock_suspend_trust_cache, bool, 0644);
+cetrafs_test_param(lock_suspend_trust_cache, cetrafs_lock_suspend_trust_cache, bool, 0644);
 MODULE_PARM_DESC(lock_suspend_trust_cache,
                  "TEST ONLY: keep trusting cached metadata while suspended (reproduces the frozen "
                  "extent-tree bug)");
@@ -3005,11 +3005,11 @@ bool cetrafs_lock_held_for_write_locally(struct inode *inode)
  * cetrafs_get_block_read()).
  */
 static bool cetrafs_read_trust_off;
-module_param_named(read_trust_off, cetrafs_read_trust_off, bool, 0644);
+cetrafs_test_param(read_trust_off, cetrafs_read_trust_off, bool, 0644);
 MODULE_PARM_DESC(read_trust_off, "TEST ONLY: readers re-read the record per block (the pre-fix behaviour)");
 
 static bool cetrafs_read_trust_ignore_stamp;
-module_param_named(read_trust_ignore_stamp, cetrafs_read_trust_ignore_stamp, bool, 0644);
+cetrafs_test_param(read_trust_ignore_stamp, cetrafs_read_trust_ignore_stamp, bool, 0644);
 MODULE_PARM_DESC(read_trust_ignore_stamp, "TEST ONLY: readers trust their cache without the file_seq check");
 
 /* false: the record could not be read, so nothing is known -- the
@@ -3124,7 +3124,7 @@ bool cetrafs_lock_identity_cache_trusted(struct inode *inode)
 /* TEST ONLY: fail the next lock clear, as a CAS the device refused
  * would (tests/kernel/flock_clear_fails.sh). */
 static bool cetrafs_flock_clear_fail_once;
-module_param_named(flock_clear_fail_once, cetrafs_flock_clear_fail_once, bool, 0644);
+cetrafs_test_param(flock_clear_fail_once, cetrafs_flock_clear_fail_once, bool, 0644);
 MODULE_PARM_DESC(flock_clear_fail_once, "TEST ONLY: fail the next on-disk lock clear with -EIO");
 
 static int cetrafs_lock_clear_on_disk(struct inode *inode, bool stamp_stat)
@@ -3229,7 +3229,7 @@ static int cetrafs_lock_presence_get(struct inode *inode)
 /* TEST ONLY, one-shot: the next clear of this node's suspended-writer
  * mark fails (tests/kernel/suspend_mark_retry.sh). */
 static bool cetrafs_suspend_unmark_fail_once;
-module_param_named(suspend_unmark_fail_once, cetrafs_suspend_unmark_fail_once, bool, 0644);
+cetrafs_test_param(suspend_unmark_fail_once, cetrafs_suspend_unmark_fail_once, bool, 0644);
 MODULE_PARM_DESC(suspend_unmark_fail_once, "TEST ONLY: fail the next clear of the suspended-writer mark");
 
 static int cetrafs_lock_suspend_mark(struct inode *inode, bool set)
@@ -3630,7 +3630,7 @@ int cetrafs_lock_write_gate(struct inode *inode)
 
 /* TEST ONLY: pause a resume just before it reconciles the cache. */
 static unsigned int cetrafs_lock_resume_stall_ms;
-module_param_named(lock_resume_stall_ms, cetrafs_lock_resume_stall_ms, uint, 0644);
+cetrafs_test_param(lock_resume_stall_ms, cetrafs_lock_resume_stall_ms, uint, 0644);
 MODULE_PARM_DESC(lock_resume_stall_ms, "TEST ONLY: pause flock(LOCK_EX)'s resume before its cache reconcile");
 
 /* Defined with the flock code below. A resume that took the lock and
@@ -3647,7 +3647,7 @@ static int cetrafs_give_back_clear(struct inode *inode, void *arg)
 /* TEST ONLY: the next resume's re-read of the record fails, as a device
  * read error would (tests/kernel/lock_giveback_fails.sh, round C). */
 static bool cetrafs_lock_resume_reread_fail_once;
-module_param_named(lock_resume_reread_fail_once, cetrafs_lock_resume_reread_fail_once, bool, 0644);
+cetrafs_test_param(lock_resume_reread_fail_once, cetrafs_lock_resume_reread_fail_once, bool, 0644);
 MODULE_PARM_DESC(lock_resume_reread_fail_once, "TEST ONLY: the next lock resume's record re-read fails with -EIO");
 
 /*
@@ -3819,14 +3819,14 @@ out:
  * a device error reading the record would.
  */
 static bool cetrafs_flock_reader_check_fail_once;
-module_param_named(flock_reader_check_fail_once, cetrafs_flock_reader_check_fail_once, bool, 0644);
+cetrafs_test_param(flock_reader_check_fail_once, cetrafs_flock_reader_check_fail_once, bool, 0644);
 MODULE_PARM_DESC(flock_reader_check_fail_once, "TEST ONLY: the next flock reader check fails with -EIO");
 
 /* TEST ONLY: fail the next give-back of a lock taken for nothing (a
  * flock or defrag claim backing out), as a device error would.
  * tests/kernel/lock_giveback_fails.sh. */
 static bool cetrafs_lock_giveback_fail_once;
-module_param_named(lock_giveback_fail_once, cetrafs_lock_giveback_fail_once, bool, 0644);
+cetrafs_test_param(lock_giveback_fail_once, cetrafs_lock_giveback_fail_once, bool, 0644);
 MODULE_PARM_DESC(lock_giveback_fail_once, "TEST ONLY: the next flock/defrag lock give-back fails with -EIO");
 
 /*
@@ -4122,12 +4122,12 @@ int cetrafs_flock(struct file *file, int cmd, struct file_lock *fl)
  * this node); its close then simply hands release duty back here.
  */
 static bool cetrafs_defrag_ignore_readers;
-module_param_named(defrag_ignore_readers, cetrafs_defrag_ignore_readers, bool, 0644);
+cetrafs_test_param(defrag_ignore_readers, cetrafs_defrag_ignore_readers, bool, 0644);
 MODULE_PARM_DESC(defrag_ignore_readers, "TEST ONLY: defrag a file a peer has open for read");
 
 /* TEST ONLY: pause the defrag pin just before it takes lock_mutex. */
 static unsigned int cetrafs_defrag_begin_stall_ms;
-module_param_named(defrag_begin_stall_ms, cetrafs_defrag_begin_stall_ms, uint, 0644);
+cetrafs_test_param(defrag_begin_stall_ms, cetrafs_defrag_begin_stall_ms, uint, 0644);
 MODULE_PARM_DESC(defrag_begin_stall_ms, "TEST ONLY: pause the defrag pin before it takes lock_mutex");
 
 /*
@@ -4290,7 +4290,7 @@ out:
 /* TEST ONLY: fail the next defrag_end's lock clear, as a device error
  * would. tests/kernel/lock_clear_deferred.sh. */
 static bool cetrafs_defrag_clear_fail_once;
-module_param_named(defrag_clear_fail_once, cetrafs_defrag_clear_fail_once, bool, 0644);
+cetrafs_test_param(defrag_clear_fail_once, cetrafs_defrag_clear_fail_once, bool, 0644);
 MODULE_PARM_DESC(defrag_clear_fail_once, "TEST ONLY: the next defrag_end lock clear fails with -EIO");
 
 void cetrafs_lock_defrag_end(struct inode *inode)

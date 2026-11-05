@@ -78,17 +78,17 @@
  * the registration is what stops the scrub reclaiming a move in
  * progress. */
 static bool cetrafs_defrag_skip_resv;
-module_param_named(defrag_skip_resv, cetrafs_defrag_skip_resv, bool, 0644);
+cetrafs_test_param(defrag_skip_resv, cetrafs_defrag_skip_resv, bool, 0644);
 MODULE_PARM_DESC(defrag_skip_resv,
                  "TEST ONLY: do not register the defrag destination run (the scrub may reclaim it mid-move)");
 
 static bool cetrafs_defrag_ignore_uninit;
-module_param_named(defrag_ignore_uninit, cetrafs_defrag_ignore_uninit, bool, 0644);
+cetrafs_test_param(defrag_ignore_uninit, cetrafs_defrag_ignore_uninit, bool, 0644);
 MODULE_PARM_DESC(defrag_ignore_uninit,
                  "TEST ONLY: defrag a file with preallocated extents anyway (publishes their stale blocks)");
 
 static bool cetrafs_defrag_fail_invalidate;
-module_param_named(defrag_fail_invalidate, cetrafs_defrag_fail_invalidate, bool, 0644);
+cetrafs_test_param(defrag_fail_invalidate, cetrafs_defrag_fail_invalidate, bool, 0644);
 MODULE_PARM_DESC(defrag_fail_invalidate,
                  "TEST ONLY: make the post-commit page drop fail, exercising the forced-drop path");
 
@@ -98,7 +98,7 @@ MODULE_PARM_DESC(defrag_fail_invalidate,
  * wrote the region meanwhile).
  */
 static bool cetrafs_defrag_publish_lost_ack;
-module_param_named(defrag_publish_lost_ack, cetrafs_defrag_publish_lost_ack, bool, 0644);
+cetrafs_test_param(defrag_publish_lost_ack, cetrafs_defrag_publish_lost_ack, bool, 0644);
 MODULE_PARM_DESC(defrag_publish_lost_ack, "TEST ONLY: the next defrag tree publish lands but reports -EIO");
 
 /*
@@ -110,7 +110,7 @@ MODULE_PARM_DESC(defrag_publish_lost_ack, "TEST ONLY: the next defrag tree publi
  * held open.
  */
 static unsigned int cetrafs_defrag_step_delay_ms;
-module_param_named(defrag_step_delay_ms, cetrafs_defrag_step_delay_ms, uint, 0644);
+cetrafs_test_param(defrag_step_delay_ms, cetrafs_defrag_step_delay_ms, uint, 0644);
 MODULE_PARM_DESC(defrag_step_delay_ms, "TEST ONLY: pause between defrag steps, with inode_lock dropped");
 
 /* TEST ONLY: pause the background pass between being queued and pinning
@@ -119,13 +119,13 @@ MODULE_PARM_DESC(defrag_step_delay_ms, "TEST ONLY: pause between defrag steps, w
  * is what the pass has to see, and in production that window is the
  * workqueue's latency. tests/kernel/defrag_fresh_leaf.sh. */
 static unsigned int cetrafs_auto_defrag_begin_delay_ms;
-module_param_named(auto_defrag_begin_delay_ms, cetrafs_auto_defrag_begin_delay_ms, uint, 0644);
+cetrafs_test_param(auto_defrag_begin_delay_ms, cetrafs_auto_defrag_begin_delay_ms, uint, 0644);
 MODULE_PARM_DESC(auto_defrag_begin_delay_ms, "TEST ONLY: pause a queued background defrag before it pins the file");
 
 /* TEST ONLY: pause after the last step, locks dropped, before the pass
  * finishes its bookkeeping. */
 static unsigned int cetrafs_defrag_final_stall_ms;
-module_param_named(defrag_final_stall_ms, cetrafs_defrag_final_stall_ms, uint, 0644);
+cetrafs_test_param(defrag_final_stall_ms, cetrafs_defrag_final_stall_ms, uint, 0644);
 MODULE_PARM_DESC(defrag_final_stall_ms, "TEST ONLY: pause after the last defrag step, with inode_lock dropped");
 
 /* The per-step shape re-check (length + density) happens to catch a
@@ -136,7 +136,7 @@ MODULE_PARM_DESC(defrag_final_stall_ms, "TEST ONLY: pause after the last defrag 
  * the walk the sole guard and prove it works: with it set and the walk
  * removed, the rewritten bytes are lost and 16 blocks leak. */
 static bool cetrafs_defrag_skip_dense_recheck;
-module_param_named(defrag_skip_dense_recheck, cetrafs_defrag_skip_dense_recheck, bool, 0644);
+cetrafs_test_param(defrag_skip_dense_recheck, cetrafs_defrag_skip_dense_recheck, bool, 0644);
 MODULE_PARM_DESC(defrag_skip_dense_recheck,
                  "TEST ONLY: skip the per-step density re-check, leaving the prefix walk alone");
 

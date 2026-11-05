@@ -289,7 +289,7 @@ for f in "$K"/*.c; do
     while read -r name; do
         [ -n "$name" ] || continue
         desc="$(awk -v n="$name" '
-            $0 ~ ("module_param_named\\(" n ",") { hit = 1 }
+            $0 ~ ("(module_param_named|cetrafs_test_param)\\(" n ",") { hit = 1 }
             hit && /MODULE_PARM_DESC/ { grab = 1 }
             grab { printf "%s", $0; if (/\\);/) exit }
         ' "$f")"
@@ -298,10 +298,31 @@ for f in "$K"/*.c; do
         *"TEST ONLY"*) ;;
         *) MISSING="$MISSING $(basename "$f"):$name" ;;
         esac
-    done < <(grep -oE 'module_param_named\((fail|force)[a-z_]*|module_param_named\([a-z_]*(fail|force|stress|selftest|skip_precheck)[a-z_]*|module_param_named\([a-z_]*_at' "$f" | sed 's/module_param_named(//')
+    done < <(grep -oE '(module_param_named|cetrafs_test_param)\((fail|force)[a-z_]*|(module_param_named|cetrafs_test_param)\([a-z_]*(fail|force|stress|selftest|skip_precheck)[a-z_]*|(module_param_named|cetrafs_test_param)\([a-z_]*_at' "$f" | sed -E 's/(module_param_named|cetrafs_test_param)\(//')
 done
+NINJ="$(grep -ohE '(module_param_named|cetrafs_test_param)\((fail|force)[a-z_]*' "$K"/*.c | wc -l)"
+[ "$NINJ" -ge 5 ] || fail "injection params: found only $NINJ fail/force knobs -- the scan is not seeing the tree"
 [ -z "$MISSING" ] && pass "injection params: every failure-injection knob is labelled test-only" ||
     fail "injection params: not labelled test-only:$MISSING"
+
+# Audit R23: a TEST ONLY knob bends a safety check for every mount, and
+# root can flip it at run time. Declared through cetrafs_test_param(), a
+# write is logged and taints the kernel; declared with plain
+# module_param_named() it leaves no trace. Enumerated by description.
+untraced_test_params() {
+    awk '
+        /module_param_named\(/ { n = $0; sub(/.*module_param_named\(/, "", n); sub(/,.*/, "", n); decl[n] = FILENAME ":" FNR }
+        /MODULE_PARM_DESC\(/ { d = $0; sub(/.*MODULE_PARM_DESC\(/, "", d); nm = d; sub(/,.*/, "", nm)
+                               if (nm in decl && tolower($0) ~ /test[- ]only/) print decl[nm] ":" nm }' "$@"
+}
+SAMPLE="$(ct_tmp testparam-sample)"
+printf '%s\n' 'module_param_named(x_knob, x, bool, 0644);' 'MODULE_PARM_DESC(x_knob, "TEST ONLY: bends a check");' >"$SAMPLE"
+[ -n "$(untraced_test_params "$SAMPLE")" ] || fail "test params: the check does not flag the known-bad sample"
+NTP="$(grep -c 'cetrafs_test_param(' "$K"/*.c | awk -F: '{ s += $2 } END { print s }')"
+[ "$NTP" -ge 100 ] || fail "test params: only $NTP traced knobs found -- the scan is not seeing the tree"
+HITS="$(untraced_test_params "$K"/*.c | sed "s|$K/||")"
+[ -z "$HITS" ] && pass "test params: all $NTP TEST ONLY knobs log and taint on write" ||
+    fail "test params: TEST ONLY knob declared without cetrafs_test_param() (no log, no taint): $(echo $HITS)"
 
 # Every site that MODIFIES a tail-checksummed block must restamp it.
 #

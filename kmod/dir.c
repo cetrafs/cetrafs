@@ -1457,7 +1457,7 @@ static struct dentry *cetrafs_lookup(struct inode *dir, struct dentry *dentry, u
  * demand.
  */
 static bool cetrafs_revalidate_fail_once;
-module_param_named(revalidate_fail_once, cetrafs_revalidate_fail_once, bool, 0644);
+cetrafs_test_param(revalidate_fail_once, cetrafs_revalidate_fail_once, bool, 0644);
 MODULE_PARM_DESC(revalidate_fail_once, "TEST ONLY: the next dentry revalidation cannot determine validity");
 
 static int cetrafs_d_revalidate(struct inode *dir, const struct qstr *name, struct dentry *dentry, unsigned int flags)
@@ -2405,7 +2405,7 @@ static int cetrafs_rmdir(struct inode *dir, struct dentry *dentry)
  * device there and check which way the record and the names disagree.
  */
 static unsigned int cetrafs_ns_step_gap_ms;
-module_param_named(ns_step_gap_ms, cetrafs_ns_step_gap_ms, uint, 0644);
+cetrafs_test_param(ns_step_gap_ms, cetrafs_ns_step_gap_ms, uint, 0644);
 MODULE_PARM_DESC(ns_step_gap_ms, "TEST ONLY: sleep between link/rename's count change and its name change");
 
 /*
@@ -2494,7 +2494,7 @@ static int cetrafs_nlink_step(struct super_block *sb,
  * itself -- so without this knob the loop is exercised by nothing.
  */
 static unsigned int cetrafs_rename_force_retry;
-module_param_named(rename_force_retry, cetrafs_rename_force_retry, uint, 0644);
+cetrafs_test_param(rename_force_retry, cetrafs_rename_force_retry, uint, 0644);
 MODULE_PARM_DESC(rename_force_retry, "test only: report a lost destination race on the next N renames");
 
 /*
@@ -2502,26 +2502,26 @@ MODULE_PARM_DESC(rename_force_retry, "test only: report a lost destination race 
  * target's record, as a device error would.
  */
 static bool cetrafs_rename_recheck_read_fail;
-module_param_named(rename_recheck_read_fail, cetrafs_rename_recheck_read_fail, bool, 0644);
+cetrafs_test_param(rename_recheck_read_fail, cetrafs_rename_recheck_read_fail, bool, 0644);
 MODULE_PARM_DESC(rename_recheck_read_fail, "test only: the next rename target re-check cannot read the record");
 
 /* TEST ONLY: the next '..' rewrite of a directory changing parent fails,
  * as a device error would. */
 static bool cetrafs_rename_dotdot_fail_once;
-module_param_named(rename_dotdot_fail_once, cetrafs_rename_dotdot_fail_once, bool, 0644);
+cetrafs_test_param(rename_dotdot_fail_once, cetrafs_rename_dotdot_fail_once, bool, 0644);
 MODULE_PARM_DESC(rename_dotdot_fail_once, "TEST ONLY: the next rename's '..' rewrite fails with -EIO");
 
 /* TEST ONLY: the next rename's new-name write (add or retarget) fails,
  * as a device error would -- after a directory's old name has gone. */
 static bool cetrafs_rename_name_fail_once;
-module_param_named(rename_name_fail_once, cetrafs_rename_name_fail_once, bool, 0644);
+cetrafs_test_param(rename_name_fail_once, cetrafs_rename_name_fail_once, bool, 0644);
 MODULE_PARM_DESC(rename_name_fail_once, "TEST ONLY: the next rename's new-name write fails with -EIO");
 
 /* TEST ONLY: fail the next N link-count swaps of a rename (the replaced
  * target's -1, the moved file's final -1) with -EIO, as a device refusal
  * would (tests/kernel/rename_nlink_fail.sh). */
 static unsigned int cetrafs_rename_nlink_fail;
-module_param_named(rename_nlink_fail, cetrafs_rename_nlink_fail, uint, 0644);
+cetrafs_test_param(rename_nlink_fail, cetrafs_rename_nlink_fail, uint, 0644);
 MODULE_PARM_DESC(rename_nlink_fail, "TEST ONLY: fail the next N rename link-count swaps with -EIO");
 
 /*
@@ -3071,7 +3071,7 @@ static int cetrafs_rename_dest_under_source(struct inode *new_dir, u64 moved_ino
 /* TEST ONLY: stall a rename after the VFS's lookups and before its
  * namespace locks, where a peer's rename lands in the real race. */
 static unsigned int cetrafs_rename_prelock_stall_ms;
-module_param_named(rename_prelock_stall_ms, cetrafs_rename_prelock_stall_ms, uint, 0644);
+cetrafs_test_param(rename_prelock_stall_ms, cetrafs_rename_prelock_stall_ms, uint, 0644);
 MODULE_PARM_DESC(rename_prelock_stall_ms, "TEST ONLY: pause a rename between its lookups and its namespace locks");
 
 static int cetrafs_rename(struct mnt_idmap *idmap,
@@ -3341,7 +3341,7 @@ static int cetrafs_link(struct dentry *old_dentry, struct inode *dir, struct den
  * and the only one no input a test can supply will ever reach.
  */
 static bool cetrafs_symlink_fail_after_write;
-module_param_named(symlink_fail_after_write, cetrafs_symlink_fail_after_write, bool, 0644);
+cetrafs_test_param(symlink_fail_after_write, cetrafs_symlink_fail_after_write, bool, 0644);
 MODULE_PARM_DESC(symlink_fail_after_write, "TEST ONLY: fail symlink() once its target block is written");
 
 static int cetrafs_symlink_locked(struct mnt_idmap *idmap,

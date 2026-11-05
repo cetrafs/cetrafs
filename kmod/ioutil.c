@@ -346,7 +346,7 @@ static int __cetrafs_sync_buffer_keep(struct buffer_head *bh)
  * every write they attempt is refused at its own gate, without I/O.
  */
 static unsigned int cetrafs_meta_write_fail;
-module_param_named(meta_write_fail, cetrafs_meta_write_fail, uint, 0644);
+cetrafs_test_param(meta_write_fail, cetrafs_meta_write_fail, uint, 0644);
 MODULE_PARM_DESC(meta_write_fail, "TEST ONLY: fail the next N synchronous metadata writes as the device would");
 
 static int cetrafs_meta_write_result(struct super_block *sb, struct buffer_head *bh, int ret)
@@ -748,7 +748,7 @@ struct buffer_head *cetrafs_blk_tail_bread(struct super_block *sb, u64 lba, u32 
  * pre-fix behaviour). tests/kernel/publish_flushes_cache.sh.
  */
 static bool cetrafs_publish_flush_skip;
-module_param_named(publish_flush_skip, cetrafs_publish_flush_skip, bool, 0644);
+cetrafs_test_param(publish_flush_skip, cetrafs_publish_flush_skip, bool, 0644);
 MODULE_PARM_DESC(publish_flush_skip, "TEST ONLY: skip the device cache flush at publish points");
 
 /*

@@ -727,7 +727,7 @@ static int cetrafs_zg_reconcile_free_counts(struct super_block *sb, u32 zg_id)
 /* TEST ONLY: pause between a stale-owner verdict and the steal's swap
  * (tests/kernel/zg_steal_vs_reattach.sh). */
 static unsigned int cetrafs_zg_steal_stall_ms;
-module_param_named(zg_steal_stall_ms, cetrafs_zg_steal_stall_ms, uint, 0644);
+cetrafs_test_param(zg_steal_stall_ms, cetrafs_zg_steal_stall_ms, uint, 0644);
 MODULE_PARM_DESC(zg_steal_stall_ms, "TEST ONLY: pause before stealing a stale owner's zone group");
 
 static int cetrafs_zg_try_claim_one(struct super_block *sb, u32 zg_id, u32 my_node_id, bool at_mount, bool *out_claimed)
@@ -1610,7 +1610,7 @@ MODULE_PARM_DESC(pf_full_backoff_ms, "ms to skip scanning a pending-free queue k
 /* Test-only: behave as if every foreign queue were full, so the drop
  * path can be exercised without a second node filling the queue. */
 static bool cetrafs_pf_force_queue_full;
-module_param_named(pf_force_queue_full, cetrafs_pf_force_queue_full, bool, 0644);
+cetrafs_test_param(pf_force_queue_full, cetrafs_pf_force_queue_full, bool, 0644);
 MODULE_PARM_DESC(pf_force_queue_full, "test-only: treat every pending-free queue as full");
 
 static atomic64_t cetrafs_pf_full_scans = ATOMIC64_INIT(0);

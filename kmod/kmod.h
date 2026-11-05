@@ -5,6 +5,28 @@
 
 #include "cetrafs.h"
 
+#include <linux/moduleparam.h>
+
+/*
+ * A TEST ONLY module parameter (audit R23). Each one removes or bends a
+ * safety check -- the reader rule, the journal guard, the fence -- for
+ * every mount of the module, and they are root-writable at run time
+ * because the test suites flip them on a live mount. Declared through
+ * this instead of module_param_named(), a write logs the knob and the
+ * value it was given and taints the kernel (TAINT_USER), so a volume
+ * damaged on a host where one was touched says so in dmesg and in every
+ * later oops. tests/image/source_invariants.sh fails on a parameter
+ * described as test-only and declared any other way.
+ */
+extern const struct kernel_param_ops cetrafs_test_param_ops_bool;
+extern const struct kernel_param_ops cetrafs_test_param_ops_uint;
+extern const struct kernel_param_ops cetrafs_test_param_ops_int;
+extern const struct kernel_param_ops cetrafs_test_param_ops_ullong;
+#define cetrafs_test_param(name, value, type, perm)                                                            \
+    param_check_##type(name, &(value));                                                                        \
+    module_param_cb(name, &cetrafs_test_param_ops_##type, &(value), perm);                                     \
+    __MODULE_PARM_TYPE(name, #type)
+
 /*
  * Blocks are not pages, and on the hardware this is usually built for
  * they happen to be the same size -- which is exactly what makes the

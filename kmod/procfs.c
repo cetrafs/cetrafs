@@ -489,7 +489,7 @@ static DEFINE_MUTEX(cetrafs_controls_lock);
  * was. See tests/kernel/controls_timing_race.sh.
  */
 static unsigned int cetrafs_controls_delay_ms;
-module_param_named(controls_delay_ms, cetrafs_controls_delay_ms, uint, 0644);
+cetrafs_test_param(controls_delay_ms, cetrafs_controls_delay_ms, uint, 0644);
 MODULE_PARM_DESC(controls_delay_ms, "TEST ONLY: pause inside a controls timing write");
 
 static int cetrafs_proc_controls_open(struct inode *inode, struct file *file)

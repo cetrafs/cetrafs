@@ -78,7 +78,7 @@ static int cetrafs_xattr_find_slot(const cetrafs_xattr_entry_t *arr, const char 
  * (tests/kernel/xattr_read_vs_reuse.sh).
  */
 static unsigned int cetrafs_xattr_read_pause_ms;
-module_param_named(xattr_read_pause_ms, cetrafs_xattr_read_pause_ms, uint, 0644);
+cetrafs_test_param(xattr_read_pause_ms, cetrafs_xattr_read_pause_ms, uint, 0644);
 MODULE_PARM_DESC(xattr_read_pause_ms, "TEST ONLY: pause between an xattr read's record read and its block read");
 
 static void cetrafs_xattr_read_pause(u64 ino)
@@ -238,7 +238,7 @@ out:
  * the record -- the instant a node dying would leave the device in
  * (tests/kernel/xattr_block_bitmap_order.sh). Cleared by the pause. */
 static unsigned int cetrafs_xattr_pause_after_publish_ms;
-module_param_named(xattr_pause_after_publish_ms, cetrafs_xattr_pause_after_publish_ms, uint, 0644);
+cetrafs_test_param(xattr_pause_after_publish_ms, cetrafs_xattr_pause_after_publish_ms, uint, 0644);
 MODULE_PARM_DESC(xattr_pause_after_publish_ms, "TEST ONLY: one-shot pause after a new xattr block is published");
 
 /* 'now': the ctime to stamp, in seconds; 0 stamps none. */

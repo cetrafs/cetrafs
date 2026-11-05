@@ -96,19 +96,19 @@ MODULE_PARM_DESC(dio_fill_holes,
  * dio_no_fallback.sh must catch, proving the conversion is what makes
  * the write visible. */
 static bool cetrafs_dio_skip_convert;
-module_param_named(dio_skip_convert, cetrafs_dio_skip_convert, bool, 0644);
+cetrafs_test_param(dio_skip_convert, cetrafs_dio_skip_convert, bool, 0644);
 MODULE_PARM_DESC(dio_skip_convert, "TEST ONLY: leave an O_DIRECT write's preallocated blocks unconverted");
 
 /* Test-only: fail an O_DIRECT write right after it allocated a block
  * (cetrafs_dio_get_block()), leaving that block allocated and unwritten. */
 static bool cetrafs_dio_fail_after_alloc_once;
-module_param_named(dio_fail_after_alloc_once, cetrafs_dio_fail_after_alloc_once, bool, 0644);
+cetrafs_test_param(dio_fail_after_alloc_once, cetrafs_dio_fail_after_alloc_once, bool, 0644);
 MODULE_PARM_DESC(dio_fail_after_alloc_once, "TEST ONLY: fail the next O_DIRECT write after it allocates a block");
 
 /* TEST ONLY: stall halfway through the copy that drops a fully
  * converted preallocated extent from an extent array. */
 static unsigned int cetrafs_leaf_drop_copy_stall_ms;
-module_param_named(leaf_drop_copy_stall_ms, cetrafs_leaf_drop_copy_stall_ms, uint, 0644);
+cetrafs_test_param(leaf_drop_copy_stall_ms, cetrafs_leaf_drop_copy_stall_ms, uint, 0644);
 MODULE_PARM_DESC(leaf_drop_copy_stall_ms, "TEST ONLY: stall halfway through an extent-array drop copy");
 
 static atomic64_t cetrafs_dio_fallbacks = ATOMIC64_INIT(0);
@@ -918,7 +918,7 @@ int cetrafs_raw_inode_for_each_owned_block(struct super_block *sb,
  * allocated and unnamed) is permanent, so it needs to be reachable.
  */
 static bool cetrafs_extents_fetch_fail_once;
-module_param_named(extents_fetch_fail_once, cetrafs_extents_fetch_fail_once, bool, 0644);
+cetrafs_test_param(extents_fetch_fail_once, cetrafs_extents_fetch_fail_once, bool, 0644);
 MODULE_PARM_DESC(extents_fetch_fail_once, "TEST ONLY: the next extent-list fetch fails");
 
 int cetrafs_inode_extents_get(struct inode *inode, const cetrafs_inode_t *raw, struct cetrafs_inode_extents *ex)
@@ -2367,7 +2367,7 @@ static u32 cetrafs_idx_end(u32 iblock, u32 count)
  * lookup-cost assertion -- with it set that assertion MUST fail, which
  * is the only thing proving it measures anything. */
 static bool cetrafs_idx_range_ignore;
-module_param_named(idx_range_ignore, cetrafs_idx_range_ignore, bool, 0644);
+cetrafs_test_param(idx_range_ignore, cetrafs_idx_range_ignore, bool, 0644);
 MODULE_PARM_DESC(idx_range_ignore, "TEST ONLY: ignore extent-index range bounds (restores the full scan)");
 
 static bool cetrafs_idx_may_hold(const cetrafs_extent_idx_t *e, u32 iblock)
@@ -4365,16 +4365,16 @@ static int cetrafs_writepages(struct address_space *mapping, struct writeback_co
  * it every time. See tests/kernel/mmap_vs_punch.sh.
  */
 static unsigned int cetrafs_punch_pagecache_delay_ms;
-module_param_named(punch_pagecache_delay_ms, cetrafs_punch_pagecache_delay_ms, uint, 0644);
+cetrafs_test_param(punch_pagecache_delay_ms, cetrafs_punch_pagecache_delay_ms, uint, 0644);
 MODULE_PARM_DESC(punch_pagecache_delay_ms, "TEST ONLY: pause inside punch between the page-cache drop and the free");
 
 /* TEST ONLY: pause a punch or truncate just before (_pre) or just after
  * (_post) its last "is a peer using this file?" check before the
  * publish. tests/kernel/punch_peer_late.sh. */
 static unsigned int cetrafs_rebuild_stall_pre_ms, cetrafs_rebuild_stall_post_ms;
-module_param_named(rebuild_stall_pre_ms, cetrafs_rebuild_stall_pre_ms, uint, 0644);
+cetrafs_test_param(rebuild_stall_pre_ms, cetrafs_rebuild_stall_pre_ms, uint, 0644);
 MODULE_PARM_DESC(rebuild_stall_pre_ms, "TEST ONLY: pause a punch/truncate before its pre-publish peer check");
-module_param_named(rebuild_stall_post_ms, cetrafs_rebuild_stall_post_ms, uint, 0644);
+cetrafs_test_param(rebuild_stall_post_ms, cetrafs_rebuild_stall_post_ms, uint, 0644);
 MODULE_PARM_DESC(rebuild_stall_post_ms, "TEST ONLY: pause a punch/truncate after its pre-publish peer check");
 
 /*
@@ -4419,7 +4419,7 @@ static int cetrafs_rebuild_recheck(struct inode *inode, const char *what)
 }
 
 static bool cetrafs_fail_extent_record_write;
-module_param_named(fail_extent_record_write, cetrafs_fail_extent_record_write, bool, 0644);
+cetrafs_test_param(fail_extent_record_write, cetrafs_fail_extent_record_write, bool, 0644);
 MODULE_PARM_DESC(fail_extent_record_write, "TEST ONLY: fail the record write in truncate/punch-hole");
 
 static int __cetrafs_truncate_shrink(struct inode *inode, loff_t new_size)
@@ -4723,7 +4723,7 @@ static int cetrafs_zero_range(struct address_space *mapping, loff_t from, size_t
  * big, so a SIGKILL has something to land in.
  */
 static unsigned int cetrafs_fallocate_block_delay_us;
-module_param_named(fallocate_block_delay_us, cetrafs_fallocate_block_delay_us, uint, 0644);
+cetrafs_test_param(fallocate_block_delay_us, cetrafs_fallocate_block_delay_us, uint, 0644);
 MODULE_PARM_DESC(fallocate_block_delay_us, "TEST ONLY: microseconds to spend per preallocated block");
 
 static int cetrafs_do_allocate(struct inode *inode, loff_t offset, loff_t len, bool keep_size)
@@ -5610,7 +5610,7 @@ static int cetrafs_fsync_one_block(struct super_block *sb, u64 lba)
  * on a leaf would.
  */
 static bool cetrafs_tree_flush_fail_once;
-module_param_named(tree_flush_fail_once, cetrafs_tree_flush_fail_once, bool, 0644);
+cetrafs_test_param(tree_flush_fail_once, cetrafs_tree_flush_fail_once, bool, 0644);
 MODULE_PARM_DESC(tree_flush_fail_once, "TEST ONLY: the next extent-tree block flush fails with -EIO");
 
 int cetrafs_flush_tree_blocks(struct inode *inode, const cetrafs_inode_t *raw)

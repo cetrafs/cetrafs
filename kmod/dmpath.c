@@ -425,7 +425,7 @@ static int cetrafs_dmpath_try(struct block_device *dm_bdev, dev_t path_dev, stru
  * manufactured. See tests/device/dmpath_no_global_stall.sh.
  */
 static unsigned int cetrafs_dmpath_resolve_delay_ms;
-module_param_named(dmpath_resolve_delay_ms, cetrafs_dmpath_resolve_delay_ms, uint, 0644);
+cetrafs_test_param(dmpath_resolve_delay_ms, cetrafs_dmpath_resolve_delay_ms, uint, 0644);
 MODULE_PARM_DESC(dmpath_resolve_delay_ms, "TEST ONLY: milliseconds a path resolution takes");
 
 /*

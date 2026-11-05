@@ -80,11 +80,11 @@ MODULE_PARM_DESC(
 /* TEST ONLY: fail every heartbeat renewal without touching the device,
  * as a hung or unreachable LUN would (tests/kernel/lease_expiry.sh). */
 static bool cetrafs_hb_renew_fail;
-module_param_named(hb_renew_fail, cetrafs_hb_renew_fail, bool, 0644);
+cetrafs_test_param(hb_renew_fail, cetrafs_hb_renew_fail, bool, 0644);
 MODULE_PARM_DESC(hb_renew_fail, "TEST ONLY: fail every heartbeat renewal");
 
 static bool cetrafs_fence_skip_precheck;
-module_param_named(fence_skip_precheck, cetrafs_fence_skip_precheck, bool, 0644);
+cetrafs_test_param(fence_skip_precheck, cetrafs_fence_skip_precheck, bool, 0644);
 MODULE_PARM_DESC(fence_skip_precheck,
                  "test-only: skip the heartbeat's fence pre-check so the renew alone detects a revoked lease");
 
@@ -101,7 +101,7 @@ MODULE_PARM_DESC(fence_skip_precheck,
  * arms exactly one re-attach.
  */
 static int cetrafs_test_uncache_zg = -1;
-module_param_named(test_uncache_zg, cetrafs_test_uncache_zg, int, 0644);
+cetrafs_test_param(test_uncache_zg, cetrafs_test_uncache_zg, int, 0644);
 MODULE_PARM_DESC(test_uncache_zg, "TEST ONLY: forget owning this zone group, so the next tick re-attaches to it");
 
 /*
@@ -114,7 +114,7 @@ MODULE_PARM_DESC(test_uncache_zg, "TEST ONLY: forget owning this zone group, so 
  * much. See tests/kernel/heartbeat_renew_cadence.sh.
  */
 static unsigned int cetrafs_hb_maint_delay_ms;
-module_param_named(hb_maint_delay_ms, cetrafs_hb_maint_delay_ms, uint, 0644);
+cetrafs_test_param(hb_maint_delay_ms, cetrafs_hb_maint_delay_ms, uint, 0644);
 MODULE_PARM_DESC(hb_maint_delay_ms, "TEST ONLY: milliseconds the heartbeat's maintenance pass takes");
 
 static void cetrafs_heartbeat_tick(struct work_struct *work)

@@ -8,6 +8,36 @@
 
 #include "kmod.h"
 
+/* The ops behind cetrafs_test_param() (kmod.h). */
+static int cetrafs_test_param_set(const char *val, const struct kernel_param *kp,
+                                  int (*set)(const char *, const struct kernel_param *))
+{
+    int ret = set(val, kp);
+
+    if (!ret) {
+        pr_warn("cetrafs: TEST ONLY parameter %s set to '%.*s' -- it bends a safety check; not for production\n",
+                kp->name, val ? (int)strcspn(val, "\n") : 0, val ? val : "");
+        add_taint(TAINT_USER, LOCKDEP_STILL_OK);
+    }
+    return ret;
+}
+
+#define CETRAFS_TEST_PARAM_OPS(type, fl)                                                                       \
+    static int cetrafs_test_param_set_##type(const char *val, const struct kernel_param *kp)                  \
+    {                                                                                                          \
+        return cetrafs_test_param_set(val, kp, param_set_##type);                                              \
+    }                                                                                                          \
+    const struct kernel_param_ops cetrafs_test_param_ops_##type = {                                            \
+        .flags = (fl),                                                                                         \
+        .set = cetrafs_test_param_set_##type,                                                                  \
+        .get = param_get_##type,                                                                               \
+    }
+
+CETRAFS_TEST_PARAM_OPS(bool, KERNEL_PARAM_OPS_FL_NOARG);
+CETRAFS_TEST_PARAM_OPS(uint, 0);
+CETRAFS_TEST_PARAM_OPS(int, 0);
+CETRAFS_TEST_PARAM_OPS(ullong, 0);
+
 /* The Makefile stamps this from `git describe` (printed at load, exposed
  * as MODULE_VERSION). Fall back if the module was built without our
  * Makefile, so the symbol always resolves. */

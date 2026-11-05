@@ -422,11 +422,11 @@ static int cetrafs_node_depart_mutate(void *image, unsigned int len, void *priv)
  * fence, the window a node remounting inside it re-attaches in
  * (tests/kernel/fence_vs_reattach.sh). 0 = off. */
 static unsigned int cetrafs_fence_stall_ms;
-module_param_named(fence_stall_ms, cetrafs_fence_stall_ms, uint, 0644);
+cetrafs_test_param(fence_stall_ms, cetrafs_fence_stall_ms, uint, 0644);
 MODULE_PARM_DESC(fence_stall_ms, "TEST ONLY: one-shot stall before a reclaim's fence (0 = off)");
 
 static bool cetrafs_fence_peer_fail;
-module_param_named(fence_peer_fail, cetrafs_fence_peer_fail, bool, 0644);
+cetrafs_test_param(fence_peer_fail, cetrafs_fence_peer_fail, bool, 0644);
 MODULE_PARM_DESC(fence_peer_fail, "TEST ONLY: revoking a stale peer's lease fails");
 
 /*
@@ -492,7 +492,7 @@ static int cetrafs_node_fence_peer_full(struct super_block *sb, u32 node_id, con
 /* TEST ONLY: report every reclaim as racing a re-attach (the steal is
  * given back), or never (the pre-fix behaviour). -1 = off. */
 static int cetrafs_reattach_after_fence_force = -1;
-module_param_named(reattach_after_fence_force, cetrafs_reattach_after_fence_force, int, 0644);
+cetrafs_test_param(reattach_after_fence_force, cetrafs_reattach_after_fence_force, int, 0644);
 MODULE_PARM_DESC(reattach_after_fence_force, "TEST ONLY: 1 = every reclaim sees a re-attach, 0 = none, -1 = real");
 
 /*
@@ -537,7 +537,7 @@ bool cetrafs_node_reattached_since_fence(struct super_block *sb, u32 node_id)
  * cetrafs_node_reattached_since_fence() settles
  * (tests/kernel/reclaim_vs_reattach.sh). */
 static unsigned int cetrafs_reclaim_stall_after_fence_ms;
-module_param_named(reclaim_stall_after_fence_ms, cetrafs_reclaim_stall_after_fence_ms, uint, 0644);
+cetrafs_test_param(reclaim_stall_after_fence_ms, cetrafs_reclaim_stall_after_fence_ms, uint, 0644);
 MODULE_PARM_DESC(reclaim_stall_after_fence_ms, "TEST ONLY: pause once between a reclaim's fence and its CAS");
 
 int cetrafs_node_fence_peer(struct super_block *sb, u32 node_id, const char *what)
@@ -626,7 +626,7 @@ int cetrafs_node_self_fence_check(struct super_block *sb, u32 my_node_id, bool *
  * script, same reasoning as every other force knob here. Off in
  * production. */
 static bool cetrafs_reattach_race_bump;
-module_param_named(reattach_race_bump, cetrafs_reattach_race_bump, bool, 0644);
+cetrafs_test_param(reattach_race_bump, cetrafs_reattach_race_bump, bool, 0644);
 MODULE_PARM_DESC(reattach_race_bump, "TEST ONLY: bump our own fence_epoch mid re-attach, as a racing reclaimer would");
 
 /* TEST ONLY: play a second machine with this machine's identity mounting
@@ -635,7 +635,7 @@ MODULE_PARM_DESC(reattach_race_bump, "TEST ONLY: bump our own fence_epoch mid re
  * ours. Two clones booting together cannot be timed from a script on one
  * machine. Off in production. */
 static bool cetrafs_register_twin_race;
-module_param_named(register_twin_race, cetrafs_register_twin_race, bool, 0644);
+cetrafs_test_param(register_twin_race, cetrafs_register_twin_race, bool, 0644);
 MODULE_PARM_DESC(register_twin_race, "TEST ONLY: a machine with our identity registers in the middle of our registration");
 
 static int cetrafs_node_test_beat_mutate(void *image, unsigned int len, void *priv)
@@ -1056,7 +1056,7 @@ int cetrafs_node_renew_heartbeat(struct super_block *sb, u32 my_node_id)
  * tests/kernel/node_offline_fence.sh.
  */
 static unsigned int cetrafs_node_offline_delay_ms;
-module_param_named(node_offline_delay_ms, cetrafs_node_offline_delay_ms, uint, 0644);
+cetrafs_test_param(node_offline_delay_ms, cetrafs_node_offline_delay_ms, uint, 0644);
 MODULE_PARM_DESC(node_offline_delay_ms, "TEST ONLY: pause inside mark-offline before recording the departure");
 
 int cetrafs_node_mark_offline(struct super_block *sb, u32 my_node_id)
@@ -1138,13 +1138,13 @@ MODULE_PARM_DESC(stale_secs,
  * forces the verdict so nocaw_mount_gate.sh can assert deterministically
  * that a refused mount claims no row. Off in production. */
 static bool cetrafs_nocaw_force_live_peer;
-module_param_named(nocaw_force_live_peer, cetrafs_nocaw_force_live_peer, bool, 0644);
+cetrafs_test_param(nocaw_force_live_peer, cetrafs_nocaw_force_live_peer, bool, 0644);
 MODULE_PARM_DESC(nocaw_force_live_peer, "TEST ONLY: no-CAW gate always sees a live peer");
 
 /* TEST ONLY: force the observed cluster file-lock mode, -1 = off (real
  * scan). See cetrafs_node_cluster_file_lock_mode(). */
 static int cetrafs_force_cluster_flock_mode = -1;
-module_param_named(force_cluster_flock_mode, cetrafs_force_cluster_flock_mode, int, 0644);
+cetrafs_test_param(force_cluster_flock_mode, cetrafs_force_cluster_flock_mode, int, 0644);
 MODULE_PARM_DESC(force_cluster_flock_mode,
                  "TEST ONLY: force cluster file-lock mode (0 unset,1 on,2 off; -1 real scan)");
 
@@ -1153,7 +1153,7 @@ MODULE_PARM_DESC(force_cluster_flock_mode,
  * (a real divergent peer cannot be made to appear on a loop device). See
  * cetrafs_node_file_lock_mode_conflict(). */
 static bool cetrafs_force_mode_conflict;
-module_param_named(force_mode_conflict, cetrafs_force_mode_conflict, bool, 0644);
+cetrafs_test_param(force_mode_conflict, cetrafs_force_mode_conflict, bool, 0644);
 MODULE_PARM_DESC(force_mode_conflict, "TEST ONLY: post-registration mode re-scan always reports a conflict");
 
 /* TEST ONLY: make the post-registration no-CAW single-mounter re-check
@@ -1163,7 +1163,7 @@ MODULE_PARM_DESC(force_mode_conflict, "TEST ONLY: post-registration mode re-scan
  * prove the re-check refuses, unwinds, and leaves the volume mountable.
  * Off in production. */
 static bool cetrafs_nocaw_force_postreg_peer;
-module_param_named(nocaw_force_postreg_peer, cetrafs_nocaw_force_postreg_peer, bool, 0644);
+cetrafs_test_param(nocaw_force_postreg_peer, cetrafs_nocaw_force_postreg_peer, bool, 0644);
 MODULE_PARM_DESC(nocaw_force_postreg_peer, "TEST ONLY: no-CAW post-registration re-check always sees a live peer");
 
 /*

@@ -130,7 +130,7 @@ void cetrafs_inode_stamp_crc_ns(cetrafs_inode_t *in)
  * of the clock -- the top of the range, to stage the wrap
  * (tests/kernel/file_seq_wrap.sh). 0 = off. */
 static unsigned long long cetrafs_file_seq_force_val;
-module_param_named(file_seq_force_val, cetrafs_file_seq_force_val, ullong, 0644);
+cetrafs_test_param(file_seq_force_val, cetrafs_file_seq_force_val, ullong, 0644);
 MODULE_PARM_DESC(file_seq_force_val, "TEST ONLY: stamp file_seq with this value instead of the clock (0 = off)");
 
 u64 cetrafs_file_seq_new(struct super_block *sb)
@@ -277,7 +277,7 @@ int cetrafs_read_raw_inode(struct super_block *sb, u64 ino, cetrafs_inode_t *out
  * overlay to a size a test can reliably hit -- the race below needs a
  * writeback publish inside a few-instruction gap otherwise. */
 static unsigned int cetrafs_fd_overlay_stall_ms;
-module_param_named(fd_overlay_stall_ms, cetrafs_fd_overlay_stall_ms, uint, 0644);
+cetrafs_test_param(fd_overlay_stall_ms, cetrafs_fd_overlay_stall_ms, uint, 0644);
 MODULE_PARM_DESC(fd_overlay_stall_ms, "TEST ONLY: widen the record-read-to-overlay window to make the torn-read race hittable");
 
 /*
@@ -737,7 +737,7 @@ struct cetrafs_fd_write_ctx {
 /* TEST ONLY: publish a planned rebuild without its stamp check -- the
  * negative control for tests/kernel/rebuild_peer_stamp.sh. */
 static bool cetrafs_rebuild_plan_unchecked;
-module_param_named(rebuild_plan_unchecked, cetrafs_rebuild_plan_unchecked, bool, 0644);
+cetrafs_test_param(rebuild_plan_unchecked, cetrafs_rebuild_plan_unchecked, bool, 0644);
 MODULE_PARM_DESC(rebuild_plan_unchecked, "TEST ONLY: skip the truncate/punch publish's file_seq check");
 
 static int cetrafs_fd_write_mutate(void *image, unsigned int len, void *priv)
@@ -1014,7 +1014,7 @@ u64 cetrafs_inode_new_generation(struct super_block *sb)
 /* Test-only: fail the next N record reads of an iget fill with -EIO, as
  * a device read error would. tests/kernel/free_inode_keeps_bit.sh. */
 static unsigned int cetrafs_iget_read_fail;
-module_param_named(iget_read_fail, cetrafs_iget_read_fail, uint, 0644);
+cetrafs_test_param(iget_read_fail, cetrafs_iget_read_fail, uint, 0644);
 MODULE_PARM_DESC(iget_read_fail, "test-only: fail the next N record reads of an inode fill with -EIO");
 
 struct inode *cetrafs_iget(struct super_block *sb, u64 ino)
@@ -1214,7 +1214,7 @@ retry:
  * size and acting on it, so a test can land a local extending write in
  * that gap. */
 static unsigned int cetrafs_fd_merge_stall_ms;
-module_param_named(fd_merge_stall_ms, cetrafs_fd_merge_stall_ms, uint, 0644);
+cetrafs_test_param(fd_merge_stall_ms, cetrafs_fd_merge_stall_ms, uint, 0644);
 MODULE_PARM_DESC(fd_merge_stall_ms, "TEST ONLY: widen the stat publish's read-to-merge window on i_size");
 
 struct cetrafs_vfs_stat_cas_ctx {
@@ -1240,7 +1240,7 @@ struct cetrafs_vfs_stat_cas_ctx {
 /* TEST ONLY: a stat publish forgets the peer stamp it overwrote (the
  * pre-fix behaviour). tests/kernel/stat_publish_peer_stamp.sh. */
 static bool cetrafs_stat_publish_ignore_overstamp;
-module_param_named(stat_publish_ignore_overstamp, cetrafs_stat_publish_ignore_overstamp, bool, 0644);
+cetrafs_test_param(stat_publish_ignore_overstamp, cetrafs_stat_publish_ignore_overstamp, bool, 0644);
 MODULE_PARM_DESC(stat_publish_ignore_overstamp, "TEST ONLY: a stat publish forgets the peer stamp it overwrote");
 
 enum { CETRAFS_FD_F_SIZE, CETRAFS_FD_F_BLOCKS, CETRAFS_FD_F_ATIME, CETRAFS_FD_F_MTIME };
@@ -1458,7 +1458,7 @@ static void cetrafs_vfs_stat_adopt(struct inode *inode, struct cetrafs_vfs_stat_
 /* TEST ONLY: stall writeback's publish between its fresh record read and
  * everything it does with it. */
 static unsigned int cetrafs_write_inode_read_stall_ms;
-module_param_named(write_inode_read_stall_ms, cetrafs_write_inode_read_stall_ms, uint, 0644);
+cetrafs_test_param(write_inode_read_stall_ms, cetrafs_write_inode_read_stall_ms, uint, 0644);
 MODULE_PARM_DESC(write_inode_read_stall_ms, "TEST ONLY: widen the stat publish's read-to-adopt window");
 
 int cetrafs_write_vfs_inode(struct inode *inode)
@@ -1891,7 +1891,7 @@ const struct inode_operations cetrafs_symlink_iops = {
 /* TEST ONLY: stall a refresh between its "no local changes" verdict and
  * the stores that act on it, so a test can land a local write there. */
 static unsigned int cetrafs_apply_refresh_stall_ms;
-module_param_named(apply_refresh_stall_ms, cetrafs_apply_refresh_stall_ms, uint, 0644);
+cetrafs_test_param(apply_refresh_stall_ms, cetrafs_apply_refresh_stall_ms, uint, 0644);
 MODULE_PARM_DESC(apply_refresh_stall_ms, "TEST ONLY: widen a refresh's dirty-check-to-store window");
 
 /*
@@ -1925,7 +1925,7 @@ static bool cetrafs_inode_has_unpublished_state(struct inode *inode)
 /* TEST ONLY: the next apply loses its inode_lock trylock, as it does to
  * a local writer retrying -ETXTBSY. tests/kernel/lock_resume_reconcile.sh. */
 static bool cetrafs_apply_trylock_fail_once;
-module_param_named(apply_trylock_fail_once, cetrafs_apply_trylock_fail_once, bool, 0644);
+cetrafs_test_param(apply_trylock_fail_once, cetrafs_apply_trylock_fail_once, bool, 0644);
 MODULE_PARM_DESC(apply_trylock_fail_once, "TEST ONLY: the next refresh apply finds the inode lock contended");
 
 /* Why an apply that returned 0 applied nothing. */

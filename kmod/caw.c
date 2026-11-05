@@ -130,7 +130,7 @@ MODULE_PARM_DESC(caw_probe, "device to run a read-only ATS/CAW capability probe 
  * retry on a re-resolved path, not surface to the caller. Off in
  * production. */
 static bool cetrafs_caw_fail_path_once;
-module_param_named(caw_fail_path_once, cetrafs_caw_fail_path_once, bool, 0644);
+cetrafs_test_param(caw_fail_path_once, cetrafs_caw_fail_path_once, bool, 0644);
 MODULE_PARM_DESC(caw_fail_path_once, "TEST ONLY: fail the next CAW issued over a dm path, once");
 
 /*
@@ -146,11 +146,11 @@ MODULE_PARM_DESC(caw_fail_path_once, "TEST ONLY: fail the next CAW issued over a
  * mutator that adds a delta is the one that can tell the difference.
  */
 static bool cetrafs_caw_timeout_landed_once;
-module_param_named(caw_timeout_landed_once, cetrafs_caw_timeout_landed_once, bool, 0644);
+cetrafs_test_param(caw_timeout_landed_once, cetrafs_caw_timeout_landed_once, bool, 0644);
 MODULE_PARM_DESC(caw_timeout_landed_once, "TEST ONLY: next CAW executes, then reports a timeout");
 
 static bool cetrafs_caw_timeout_lost_once;
-module_param_named(caw_timeout_lost_once, cetrafs_caw_timeout_lost_once, bool, 0644);
+cetrafs_test_param(caw_timeout_lost_once, cetrafs_caw_timeout_lost_once, bool, 0644);
 MODULE_PARM_DESC(caw_timeout_lost_once, "TEST ONLY: next CAW does not execute and reports a timeout");
 
 /* TEST ONLY: the late-landing half of a timeout. The next CAW is NOT
@@ -173,7 +173,7 @@ MODULE_PARM_DESC(caw_timeout_lost_once, "TEST ONLY: next CAW does not execute an
  * buffer, which only a real CAW device reaches (the selftest's phase 5).
  */
 static bool cetrafs_cas_verify_dirty_once;
-module_param_named(cas_verify_dirty_once, cetrafs_cas_verify_dirty_once, bool, 0644);
+cetrafs_test_param(cas_verify_dirty_once, cetrafs_cas_verify_dirty_once, bool, 0644);
 MODULE_PARM_DESC(cas_verify_dirty_once, "TEST ONLY: the next unknown-outcome re-read finds a dirty buffer");
 
 /* The mount whose CAS selftest is driving the undecidable-outcome case
@@ -209,7 +209,7 @@ static struct buffer_head *cetrafs_cas_verify_read(struct super_block *sb, u64 f
 }
 
 static bool cetrafs_caw_timeout_late_once;
-module_param_named(caw_timeout_late_once, cetrafs_caw_timeout_late_once, bool, 0644);
+cetrafs_test_param(caw_timeout_late_once, cetrafs_caw_timeout_late_once, bool, 0644);
 MODULE_PARM_DESC(caw_timeout_late_once, "TEST ONLY: next CAW reports a timeout, then lands just before the next one");
 
 /* TEST ONLY: the same, landing EARLIER -- after the re-read that found
@@ -219,7 +219,7 @@ MODULE_PARM_DESC(caw_timeout_late_once, "TEST ONLY: next CAW reports a timeout, 
  * it: an increment landed twice. caw_timeout_late_once lands after that
  * read, so it only ever exercised the interleaving already handled. */
 static bool cetrafs_caw_timeout_late_preread_once;
-module_param_named(caw_timeout_late_preread_once, cetrafs_caw_timeout_late_preread_once, bool, 0644);
+cetrafs_test_param(caw_timeout_late_preread_once, cetrafs_caw_timeout_late_preread_once, bool, 0644);
 MODULE_PARM_DESC(caw_timeout_late_preread_once,
                  "TEST ONLY: next CAW reports a timeout, then lands just before the retry re-reads the region");
 
@@ -229,11 +229,11 @@ MODULE_PARM_DESC(caw_timeout_late_preread_once,
  * this sense key -- what a MEDIUM ERROR or ABORTED COMMAND after the
  * write landed looks like. 0 = off. */
 static int cetrafs_caw_sense_landed_once;
-module_param_named(caw_sense_landed_once, cetrafs_caw_sense_landed_once, int, 0644);
+cetrafs_test_param(caw_sense_landed_once, cetrafs_caw_sense_landed_once, int, 0644);
 MODULE_PARM_DESC(caw_sense_landed_once, "TEST ONLY: next sd CAW executes, then reports this sense key");
 
 static bool cetrafs_caw_eio_landed_once;
-module_param_named(caw_eio_landed_once, cetrafs_caw_eio_landed_once, bool, 0644);
+cetrafs_test_param(caw_eio_landed_once, cetrafs_caw_eio_landed_once, bool, 0644);
 MODULE_PARM_DESC(caw_eio_landed_once, "TEST ONLY: next CAW over a dm path executes, then reports -EIO");
 
 static struct {
@@ -258,7 +258,7 @@ static void cetrafs_caw_land_held(struct block_device *bdev)
 }
 
 static bool cetrafs_caw_fail_discover;
-module_param_named(caw_fail_discover, cetrafs_caw_fail_discover, bool, 0644);
+cetrafs_test_param(caw_fail_discover, cetrafs_caw_fail_discover, bool, 0644);
 MODULE_PARM_DESC(caw_fail_discover, "test-only: force CAW capability discovery to fail");
 
 void cetrafs_caw_probe_at_load(void)
@@ -844,7 +844,7 @@ static int cetrafs_cas_flush_block(struct super_block *sb, u64 fs_lba)
  * the part under test.
  */
 static unsigned int cetrafs_cas_region_force;
-module_param_named(cas_region_force, cetrafs_cas_region_force, uint, 0644);
+cetrafs_test_param(cas_region_force, cetrafs_cas_region_force, uint, 0644);
 MODULE_PARM_DESC(cas_region_force,
                  "TEST ONLY: CAS region width to assume on a device with no CAW (power of two, "
                  "512..4096; 0 = the format's hot-sector rule). Reaches the wide-region paths a "
@@ -1752,12 +1752,12 @@ void cetrafs_cas_selftest(struct super_block *sb, u32 my_node_id)
  * asserted as one, whatever the device can do.
  */
 static unsigned int cetrafs_cas_stress_threads;
-module_param_named(cas_stress, cetrafs_cas_stress_threads, uint, 0644);
+cetrafs_test_param(cas_stress, cetrafs_cas_stress_threads, uint, 0644);
 MODULE_PARM_DESC(cas_stress,
                  "test-only: run N threads racing to increment one record through CAS at mount (diagnostic)");
 
 static unsigned int cetrafs_cas_stress_iters = 50;
-module_param_named(cas_stress_iters, cetrafs_cas_stress_iters, uint, 0644);
+cetrafs_test_param(cas_stress_iters, cetrafs_cas_stress_iters, uint, 0644);
 MODULE_PARM_DESC(cas_stress_iters, "test-only: increments per cas_stress thread (default 50)");
 
 struct cetrafs_cas_stress_ctx {

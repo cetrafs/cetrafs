@@ -708,7 +708,7 @@ struct cetrafs_fc_info {
  * Inert at 0, which is what production always runs.
  */
 static unsigned int cetrafs_mount_fail_at;
-module_param_named(mount_fail_at, cetrafs_mount_fail_at, uint, 0644);
+cetrafs_test_param(mount_fail_at, cetrafs_mount_fail_at, uint, 0644);
 MODULE_PARM_DESC(mount_fail_at,
                  "TEST ONLY: fail the mount after stage N (1=register 2=gate 3=journal 4=zg-claim "
                  "5=heartbeat 6=defrag 7=root-dentry 8=procfs); 0 disables");
@@ -978,14 +978,14 @@ struct cetrafs_defrag *cetrafs_sb_get_defrag(struct super_block *sb)
  * its registration, where an offline repairer can claim the volume
  * (tests/kernel/repair_claim_mid_mount.sh). */
 static unsigned int cetrafs_mount_register_stall_ms;
-module_param_named(mount_register_stall_ms, cetrafs_mount_register_stall_ms, uint, 0644);
+cetrafs_test_param(mount_register_stall_ms, cetrafs_mount_register_stall_ms, uint, 0644);
 MODULE_PARM_DESC(mount_register_stall_ms, "TEST ONLY: one-shot pause between the mount gate and registration");
 
 /* TEST ONLY: pretend the kernel runs with this page size, so the
  * refusal below can be reached on the 4 KiB hosts this project has
  * (tests/kernel/page_size_report.sh). 0: the real PAGE_SIZE. */
 static unsigned int cetrafs_assume_page_size;
-module_param_named(assume_page_size, cetrafs_assume_page_size, uint, 0644);
+cetrafs_test_param(assume_page_size, cetrafs_assume_page_size, uint, 0644);
 MODULE_PARM_DESC(assume_page_size, "TEST ONLY: the page size the mount-time check sees (0 = real)");
 
 int cetrafs_fill_super(struct super_block *sb, struct fs_context *fc)
@@ -2895,7 +2895,7 @@ bool cetrafs_sb_in_reclaim_lock(struct super_block *sb)
 
 /* TEST ONLY -- see cetrafs_sb_info.alloc_shadow. */
 bool cetrafs_alloc_shadow_enabled;
-module_param_named(alloc_shadow, cetrafs_alloc_shadow_enabled, bool, 0644);
+cetrafs_test_param(alloc_shadow, cetrafs_alloc_shadow_enabled, bool, 0644);
 MODULE_PARM_DESC(alloc_shadow, "TEST ONLY: shadow-track every data alloc/free; scream on double alloc");
 
 void cetrafs_sb_birth_begin(struct super_block *sb, u64 ino)
@@ -3101,7 +3101,7 @@ void cetrafs_sb_fence(struct super_block *sb, const char *reason)
  * fatal error stops the mount.
  */
 static bool cetrafs_error_policy_off;
-module_param_named(error_policy_off, cetrafs_error_policy_off, bool, 0644);
+cetrafs_test_param(error_policy_off, cetrafs_error_policy_off, bool, 0644);
 MODULE_PARM_DESC(error_policy_off, "TEST ONLY: log fatal errors and corruption without acting on them");
 
 /*
@@ -3321,7 +3321,7 @@ int cetrafs_write_gate(struct inode *inode)
  * is how tests/kernel/lease_expiry.sh reaches it.
  */
 static bool cetrafs_lease_force;
-module_param_named(lease_force, cetrafs_lease_force, bool, 0644);
+cetrafs_test_param(lease_force, cetrafs_lease_force, bool, 0644);
 MODULE_PARM_DESC(lease_force, "TEST ONLY: arm the in-core lease on a mount without CAW");
 
 static void cetrafs_sb_lease_work(struct work_struct *w)
@@ -3415,7 +3415,7 @@ const struct cetrafs_caw_info *cetrafs_sb_caw(struct super_block *sb)
  * loop device.
  */
 static bool cetrafs_mount_assume_caw;
-module_param_named(mount_assume_caw, cetrafs_mount_assume_caw, bool, 0644);
+cetrafs_test_param(mount_assume_caw, cetrafs_mount_assume_caw, bool, 0644);
 MODULE_PARM_DESC(mount_assume_caw, "TEST ONLY: mount gating behaves as on a device with atomic CAW");
 
 /* The mount's view: does this node join the cluster as one with atomic

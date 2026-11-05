@@ -21,7 +21,7 @@
  * something can be driven into it.
  */
 static unsigned int cetrafs_evict_stall_before_free_ms;
-module_param_named(evict_stall_before_free_ms, cetrafs_evict_stall_before_free_ms, uint, 0644);
+cetrafs_test_param(evict_stall_before_free_ms, cetrafs_evict_stall_before_free_ms, uint, 0644);
 MODULE_PARM_DESC(evict_stall_before_free_ms, "TEST ONLY: pause between evict's verdict and its free");
 
 static void cetrafs_put_super(struct super_block *sb)
