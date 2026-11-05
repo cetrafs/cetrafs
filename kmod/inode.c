@@ -1307,7 +1307,11 @@ static int cetrafs_vfs_stat_cas_mutate(void *image, unsigned int len, void *priv
      * "SIZE MISMATCH", 2026-11-01; tests/kernel/stat_publish_size_race.sh).
      * cetrafs_vfs_stat_adopt() does it after the CAS lands, under the
      * lock each field's local writers hold. */
-#define CETRAFS_FD_MERGE64(idx, field, ours_expr)  \
+/* Times are signed seconds on disk: a time before 1970 is negative, and
+ * as a u64 it won every max() -- "the later" was the earliest (audit
+ * 2026-11-05, section 3; tests/kernel/merge_times_signed.sh). Sizes and
+ * block counts compare unsigned. */
+#define CETRAFS_FD_MERGE64(idx, field, ours_expr, is_time) \
     do {                                           \
         u64 ours = (u64) (ours_expr);              \
         u64 theirs, b, v;                          \
@@ -1318,7 +1322,7 @@ static int cetrafs_vfs_stat_cas_mutate(void *image, unsigned int len, void *priv
         b = (u64) (ctx->base.field);               \
         v = theirs;                                \
         if (ours != b && theirs != b)              \
-            v = max(ours, theirs);                 \
+            v = (is_time) ? ((s64) ours > (s64) theirs ? ours : theirs) : max(ours, theirs); \
         else if (ours != b)                        \
             v = ours;                              \
         rec.field = cetrafs_cpu_to_le64(v);        \
@@ -1326,10 +1330,10 @@ static int cetrafs_vfs_stat_cas_mutate(void *image, unsigned int len, void *priv
         ctx->merged[idx] = v;                      \
     } while (0)
 
-    CETRAFS_FD_MERGE64(CETRAFS_FD_F_SIZE, size, i_size_read(inode));
-    CETRAFS_FD_MERGE64(CETRAFS_FD_F_BLOCKS, blocks, inode->i_blocks);
-    CETRAFS_FD_MERGE64(CETRAFS_FD_F_ATIME, atime, inode_get_atime_sec(inode));
-    CETRAFS_FD_MERGE64(CETRAFS_FD_F_MTIME, mtime, inode_get_mtime_sec(inode));
+    CETRAFS_FD_MERGE64(CETRAFS_FD_F_SIZE, size, i_size_read(inode), false);
+    CETRAFS_FD_MERGE64(CETRAFS_FD_F_BLOCKS, blocks, inode->i_blocks, false);
+    CETRAFS_FD_MERGE64(CETRAFS_FD_F_ATIME, atime, inode_get_atime_sec(inode), true);
+    CETRAFS_FD_MERGE64(CETRAFS_FD_F_MTIME, mtime, inode_get_mtime_sec(inode), true);
 
 #undef CETRAFS_FD_MERGE64
 

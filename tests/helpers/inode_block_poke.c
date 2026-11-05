@@ -286,6 +286,17 @@ int main(int argc, char **argv)
         cetrafs_inode_stamp_crcs_us(&rec); /* v0x0005 */
         pwrite_all(fd, &rec, sizeof(rec), rec_off);
         fprintf(stderr, "inode_block_poke: ino %llu mode -> 0%o\n", (unsigned long long) ino, m);
+    } else if (strcmp(mode, "setmtime") == 0) {
+        /* Set mtime (signed seconds; before 1970 is negative), as a
+         * peer's publish would leave it. */
+        cetrafs_inode_t rec;
+        int64_t t = (argc > 4) ? (int64_t) strtoll(argv[4], NULL, 0) : 0;
+
+        pread_all(fd, &rec, sizeof(rec), rec_off);
+        rec.mtime = cetrafs_cpu_to_le64((uint64_t) t);
+        cetrafs_inode_stamp_crcs_us(&rec);
+        pwrite_all(fd, &rec, sizeof(rec), rec_off);
+        fprintf(stderr, "inode_block_poke: ino %llu mtime -> %lld\n", (unsigned long long) ino, (long long) t);
     } else if (strcmp(mode, "leaf") == 0) {
         /* Follow a depth-1 inode's index to its external extent leaf and
          * print what is ON THE DEVICE there. The point is to compare the
