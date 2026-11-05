@@ -643,6 +643,27 @@ else
         fail "free_inode context: $FREE_FN (RCU callback, softirq) calls: $SLEEPERS-- a sleep there is a BUG on a debug kernel and a stall without one"
 fi
 
+# Every liveness window must be at least the stale window a peer waits
+# before calling a node dead: that window exists for multipath queueing,
+# and any watch shorter than it reads a node whose paths stall in between
+# as gone. Two did not -- the kernel's repair-claim judgement (15 s, audit
+# R4) and the twin watch at re-attach (35 s, L1) -- against a 120 s base.
+# A liveness window is a variable named window; each assignment must name
+# the stale window (cetrafs_sb_stale_secs / CETRAFS_NODE_STALE_SECS), or
+# be a raise-only branch (its condition compares "> window"). Negative
+# control: replace node.c's twin-watch floor with "2 * pi + 5" -- fails.
+log "checking every liveness window derives from the stale window"
+WIN="$(for f in "$K/node.c" "$K/fs.c" "$ROOT/userspace/devutil.h"; do
+    awk -v F="$(basename "$f")" '
+        /^[[:space:]]*(\*|\/\*|\/\/)/ { next }
+        /(^|[^_[:alnum:]])window[[:space:]]*=[^=]/ {
+            if ($0 !~ /stale|STALE/ && prev !~ /> *window/) print F ":" NR
+        }
+        NF { prev = $0 }' "$f"
+done)"
+[ -z "$WIN" ] && pass "liveness windows: every one is floored at the stale window" ||
+    fail "liveness windows: shorter than the stale window, or not derived from it, at: $(echo $WIN)"
+
 # The module must publish the filesystem alias get_fs_type() asks
 # modprobe for ("fs-<name>") when a mount names a type nothing has
 # registered. Without it, `mount -t cetrafs` on a host that has the
