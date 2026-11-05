@@ -124,7 +124,10 @@ func RunDirectWrite(clients []*Client, baseDir string) (bool, error) {
 
 	// dioWrite runs one foreground batch and checks the module took the
 	// direct path for every block of it.
-	dioWrite := func(c *Client, path, stamp string, offs []int64, label string) bool {
+	// minConv: conversions the write must cause. Every block of a write
+	// into holes or preallocated space converts; one landing on a block
+	// already written does not.
+	dioWrite := func(c *Client, path, stamp string, offs []int64, minConv int, label string) bool {
 		f0, c0, err := counters(c)
 		if err != nil {
 			check(&ok, label+": counters readable", false, err.Error())
@@ -143,8 +146,9 @@ func RunDirectWrite(clients []*Client, baseDir string) (bool, error) {
 		}
 		check(&ok, label+": every block stayed direct", f1 == f0,
 			fmt.Sprintf("dio_fallbacks %d -> %d: some went through the page cache", f0, f1))
-		check(&ok, label+": and was converted on completion", c1-c0 >= int64(len(offs)),
-			fmt.Sprintf("dio_converts %d -> %d for %d blocks -- the setup did not take the path under test", c0, c1, len(offs)))
+		check(&ok, label+": and was converted on completion", c1-c0 >= int64(minConv),
+			fmt.Sprintf("dio_converts %d -> %d for %d blocks (at least %d expected) -- the setup did not take the path under test",
+				c0, c1, len(offs), minConv))
 		return true
 	}
 
@@ -194,14 +198,14 @@ func RunDirectWrite(clients []*Client, baseDir string) (bool, error) {
 	if resp, err := a.Call("fallocate", FallocateArgs{Path: img, Offset: 16 * mib, Length: 16 * mib}); decodeResult(a.Name, resp, err, nil) != nil {
 		return false, fmt.Errorf("%s: fallocate %s", a.Name, img)
 	}
-	if !dioWrite(a, img, "ALPHA", alpha, fmt.Sprintf("%s writes %d blocks directly", a.Name, len(alpha))) {
+	if !dioWrite(a, img, "ALPHA", alpha, len(alpha), fmt.Sprintf("%s writes %d blocks directly", a.Name, len(alpha))) {
 		return ok, nil
 	}
 	mustA := DioMust{Stamp: "ALPHA", Offsets: alpha}
 	verifyExact(b, img, imgSize, []DioMust{mustA}, fmt.Sprintf("%s sees exactly %s's direct writes, zeros elsewhere", b.Name, a.Name))
 
 	// --- 2. b takes the file over and writes into it directly ---
-	if !dioWrite(b, img, "BRAVO", bravo, fmt.Sprintf("%s writes %d more blocks directly", b.Name, len(bravo))) {
+	if !dioWrite(b, img, "BRAVO", bravo, len(bravo), fmt.Sprintf("%s writes %d more blocks directly", b.Name, len(bravo))) {
 		return ok, nil
 	}
 	mustB := DioMust{Stamp: "BRAVO", Offsets: bravo}
@@ -259,7 +263,7 @@ func RunDirectWrite(clients []*Client, baseDir string) (bool, error) {
 	}
 	delta := pick(0, split, 256)
 	foxtrot := pick(split, img2Size, 256)
-	if !dioWrite(a, img2, "DELTA", delta, fmt.Sprintf("%s writes %d durable blocks", a.Name, len(delta))) {
+	if !dioWrite(a, img2, "DELTA", delta, len(delta), fmt.Sprintf("%s writes %d durable blocks", a.Name, len(delta))) {
 		return ok, nil
 	}
 
@@ -362,7 +366,13 @@ func RunDirectWrite(clients []*Client, baseDir string) (bool, error) {
 			}
 		}
 		// b writes into the dead node's file, holes and unconverted blocks alike.
-		if dioWrite(b, img2, "FOXTROT", foxtrot, fmt.Sprintf("%s writes %d blocks into it directly", b.Name, len(foxtrot))) {
+		// Some FOXTROT offsets may land on blocks ECHO wrote before the
+		// cut: those are overwrites, and convert nothing. Requiring all
+		// 256 to convert held only while those ECHO extents were HIDDEN
+		// behind a stale index range -- the bug this scenario exposed --
+		// so every block looked like a hole. At least one proves the
+		// direct-fill path ran; what was written is checked below.
+		if dioWrite(b, img2, "FOXTROT", foxtrot, 1, fmt.Sprintf("%s writes %d blocks into it directly", b.Name, len(foxtrot))) {
 			v, err := verify(b, img2, img2Size, false, []string{"DELTA", "ECHO", "FOXTROT"},
 				[]DioMust{mustD, {Stamp: "FOXTROT", Offsets: foxtrot}})
 			check(&ok, "and they read back, with nothing else disturbed",
