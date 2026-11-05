@@ -1532,6 +1532,16 @@ static int cetrafs_bg_count_mutate(void *image, unsigned int len, void *priv)
  * and a negative errno only for real I/O trouble, where the caller
  * re-accrues the delta rather than losing it.
  */
+/* TEST ONLY: hold the copy of the free-delta CAS's seed open halfway
+ * (tests/kernel/bg_seed_torn.sh), and take that copy without the buffer
+ * lock as the code used to (its negative control). */
+static unsigned int cetrafs_bg_seed_copy_stall_ms;
+module_param_named(bg_seed_copy_stall_ms, cetrafs_bg_seed_copy_stall_ms, uint, 0644);
+MODULE_PARM_DESC(bg_seed_copy_stall_ms, "TEST ONLY: pause halfway through copying the BG free-delta seed");
+static bool cetrafs_bg_seed_unlocked;
+module_param_named(bg_seed_unlocked, cetrafs_bg_seed_unlocked, bool, 0644);
+MODULE_PARM_DESC(bg_seed_unlocked, "TEST ONLY: copy the BG free-delta seed without the buffer lock");
+
 int cetrafs_bg_apply_free_delta(struct super_block *sb, u32 bg_id, s64 delta)
 {
     const cetrafs_superblock_t *raw_sb = cetrafs_sb_raw(sb);
@@ -1557,11 +1567,31 @@ int cetrafs_bg_apply_free_delta(struct super_block *sb, u32 bg_id, s64 delta)
      * close boundary of a two-node suite run. A stale seed -- a thief's
      * reconcile landed, or the cache was simply cold -- just MISCOMPAREs
      * and the retry re-reads fresh, where the epoch guard decides. */
+    /*
+     * The seed is a SNAPSHOT, taken under the buffer lock. Handing the
+     * CAS bh->b_data itself let it memcpy the live cached block while
+     * another thread of this node -- a close, an fsync, a drain, all of
+     * which flush this descriptor with no node-local serialisation --
+     * patched it after its own landed CAS (cetrafs_cache_region_after_cas(),
+     * under lock_buffer). A half-old, half-new seed fails the mutator's
+     * checksum guard, the CAW is never sent, and the refusal is counted
+     * as damage: a spurious "corruptions:" and, under corruption=stop, a
+     * stopped node, for a race inside one node (audit R15). A stale but
+     * WHOLE seed is fine: it miscompares and the retry reads fresh.
+     */
     {
+        unsigned int region = cetrafs_cas_region_size(sb);
         struct buffer_head *bh = cetrafs_bread_retry(sb, cetrafs_sb_bg_desc_lba(sb, bg_id));
+        u8 *seed = bh ? kmalloc(region, GFP_NOFS) : NULL;
 
-        ret = cetrafs_cas_record_seeded(sb, cetrafs_sb_bg_desc_lba(sb, bg_id), bh ? bh->b_data : NULL,
-                                        bh ? cetrafs_cas_region_size(sb) : 0, cetrafs_bg_count_mutate, &ctx);
+        /* Split between the count and the checksum that covers it, so
+         * the test stall can hold a tear open there. */
+        if (seed)
+            cetrafs_bh_snapshot(bh, seed, region, offsetof(cetrafs_block_group_t, checksum),
+                                READ_ONCE(cetrafs_bg_seed_copy_stall_ms), READ_ONCE(cetrafs_bg_seed_unlocked));
+        ret = cetrafs_cas_record_seeded(sb, cetrafs_sb_bg_desc_lba(sb, bg_id), seed, seed ? region : 0,
+                                        cetrafs_bg_count_mutate, &ctx);
+        kfree(seed);
         if (bh)
             brelse(bh);
     }

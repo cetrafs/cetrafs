@@ -770,3 +770,27 @@ int cetrafs_publish_flush(struct super_block *sb)
         return 0;
     return blkdev_issue_flush(sb->s_bdev);
 }
+
+/*
+ * Copy 'len' bytes of a cached block out WHOLE: under the buffer lock,
+ * which every in-place patch of a cached block takes
+ * (cetrafs_cache_region_after_cas(), the update protocol). A plain
+ * memcpy of b_data can interleave with such a patch and produce an
+ * image that never existed. 'split', 'stall_ms' and 'unlocked' are for
+ * tests: copy in two pieces with a pause between them, and optionally
+ * without the lock (the pre-fix behaviour), so a tear can be held open.
+ */
+void cetrafs_bh_snapshot(struct buffer_head *bh, void *dst, unsigned int len, unsigned int split,
+                         unsigned int stall_ms, bool unlocked)
+{
+    if (split > len)
+        split = len;
+    if (!unlocked)
+        lock_buffer(bh);
+    memcpy(dst, bh->b_data, split);
+    if (stall_ms)
+        msleep(stall_ms);
+    memcpy((u8 *) dst + split, bh->b_data + split, len - split);
+    if (!unlocked)
+        unlock_buffer(bh);
+}
