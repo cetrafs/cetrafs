@@ -268,7 +268,7 @@ static int scrub_build_refset(struct cetrafs_scrub *s, struct scrub_ctx *ctx, bo
         bool allocated = false;
         int ret;
 
-        if (s->draining)
+        if (READ_ONCE(s->draining))
             return -EINTR;
         if ((ino & 127) == 1) {
             u64 k;
@@ -427,7 +427,7 @@ static int scrub_free_confirmed(struct cetrafs_scrub *s, struct scrub_bg *b, u64
     if (!bmap)
         return -EIO;
     for (bit = 0; bit < b->data_count; bit++) {
-        if (s->draining)
+        if (READ_ONCE(s->draining))
             break;
         if (!(bit & 0xffff))
             cond_resched(); /* data_count is disk geometry: up to 2^32 */
@@ -648,7 +648,7 @@ static void scrub_reclaim_orphan_inodes(struct cetrafs_scrub *s)
         struct inode *local;
         bool allocated = false;
 
-        if (s->draining)
+        if (READ_ONCE(s->draining))
             return;
         if ((ino & 255) == 0)
             cond_resched();
@@ -743,9 +743,9 @@ static void cetrafs_scrub_cycle(struct cetrafs_scrub *s)
     /* The gap: let any in-flight allocation commit its extent. Bail early
      * if unmounting. */
     gap = cetrafs_scrub_gap_secs ? cetrafs_scrub_gap_secs : 1;
-    for (i = 0; i < gap * 10 && !s->draining; i++)
+    for (i = 0; i < gap * 10 && !READ_ONCE(s->draining); i++)
         msleep(100);
-    if (s->draining)
+    if (READ_ONCE(s->draining))
         goto done;
 
     /* Snapshot each BG's allocation count BEFORE the evidence is
@@ -767,11 +767,11 @@ static void cetrafs_scrub_cycle(struct cetrafs_scrub *s)
         unsigned int ms;
 
         pr_info("scrub: holding the verdict %u ms (test)\n", cetrafs_scrub_verdict_stall_ms);
-        for (ms = 0; ms < cetrafs_scrub_verdict_stall_ms && !s->draining; ms += 100)
+        for (ms = 0; ms < cetrafs_scrub_verdict_stall_ms && !READ_ONCE(s->draining); ms += 100)
             msleep(100);
         pr_info("scrub: verdict released (test)\n");
     }
-    for (i = 0; i < ctx.nbgs && !s->draining; i++)
+    for (i = 0; i < ctx.nbgs && !READ_ONCE(s->draining); i++)
         if (scrub_free_confirmed(s, &ctx.bgs[i], &freed) != 0)
             break;
 
@@ -789,10 +789,10 @@ static void cetrafs_scrub_work(struct work_struct *w)
 {
     struct cetrafs_scrub *s = container_of(to_delayed_work(w), struct cetrafs_scrub, work);
 
-    if (!s->draining && cetrafs_scrub_enabled)
+    if (!READ_ONCE(s->draining) && cetrafs_scrub_enabled)
         cetrafs_scrub_cycle(s);
 
-    if (!s->draining) {
+    if (!READ_ONCE(s->draining)) {
         unsigned int secs = cetrafs_scrub_interval_secs ? cetrafs_scrub_interval_secs : 1800;
 
         queue_delayed_work(system_long_wq, &s->work, msecs_to_jiffies((unsigned long) secs * 1000));
@@ -807,7 +807,7 @@ int cetrafs_scrub_start(struct super_block *sb, struct cetrafs_scrub **out_s)
     if (!s)
         return -ENOMEM;
     s->sb = sb;
-    s->draining = false;
+    WRITE_ONCE(s->draining, false);
     INIT_DELAYED_WORK(&s->work, cetrafs_scrub_work);
     /* First cycle one interval out, not at mount: a fresh mount has nothing
      * to reclaim and this keeps the mount path cheap. */
@@ -821,7 +821,7 @@ void cetrafs_scrub_stop(struct cetrafs_scrub *s)
 {
     if (!s)
         return;
-    s->draining = true;
+    WRITE_ONCE(s->draining, true); /* read by a running cycle, which stops at its next check */
     cancel_delayed_work_sync(&s->work);
     kfree(s);
 }

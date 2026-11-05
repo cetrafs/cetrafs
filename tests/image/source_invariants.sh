@@ -1024,6 +1024,20 @@ printf '#include <linux/fs.h>\n#include <linux/pagevec.h>\n' >"$SAMPLE"
 [ -n "$(pagevec_unguarded "$SAMPLE")" ] && pass "pagevec: control -- an unguarded include is caught" ||
     fail "pagevec: control -- an unguarded include is not caught"
 
+# Flags one thread sets to stop a loop another is running are read with
+# READ_ONCE and set with WRITE_ONCE: a plain bool re-read in a loop may be
+# hoisted out of it, and KCSAN flags it (audit 2026-11-05, section 3,
+# scrub->draining). KCSAN is not in the rig, so the rule is checked here.
+log "checking cross-thread stop flags are marked accesses"
+plain_flag() { grep -nE '[a-z_]+->(draining|defrag_draining)\b' "$@" | grep -vE 'READ_ONCE\(|WRITE_ONCE\(|^\S+:[0-9]+:\s*(bool|\*|/\*)' || true; }
+PF="$(plain_flag "$K"/scrub.c "$K"/fs.c | sed "s|$K/||")"
+[ -z "$PF" ] && pass "stop flags: every access to draining/defrag_draining is READ_ONCE/WRITE_ONCE" ||
+    fail "stop flags: plain access at: $(echo "$PF" | cut -d: -f1,2 | tr '\n' ' ')"
+SAMPLE="$(ct_tmp flag-sample).c"
+printf '    if (s->draining)\n        return;\n' >"$SAMPLE"
+[ -n "$(plain_flag "$SAMPLE")" ] && pass "stop flags: control -- a plain read is caught" ||
+    fail "stop flags: control -- a plain read is not caught"
+
 # The module must publish the filesystem alias get_fs_type() asks
 # modprobe for ("fs-<name>") when a mount names a type nothing has
 # registered. Without it, `mount -t cetrafs` on a host that has the
