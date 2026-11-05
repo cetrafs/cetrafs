@@ -249,6 +249,7 @@ static int cetrafs_proc_info_show(struct seq_file *m, void *v)
     seq_printf(m, "journal_replays: %llu\n", cetrafs_journal_replay_count());
     seq_printf(m, "journal_replay_declines: %llu\n", cetrafs_journal_replay_decline_count());
     seq_printf(m, "file_cache_drops: %llu\n", cetrafs_file_cache_drop_count());
+    seq_printf(m, "verdict_fills: %llu\n", cetrafs_verdict_fill_count());
     seq_printf(m, "journal_writes: %llu\n", cetrafs_journal_write_count());
     /* Slots held by entries a failed write kept for replay. Nonzero is a
      * device that refused writes; at the slot count, journaled writes

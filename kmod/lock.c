@@ -59,6 +59,7 @@
  * stays silent. That shipped once; file_cache_drops is how a test sees
  * it. */
 static atomic64_t cetrafs_file_cache_drops = ATOMIC64_INIT(0);
+static atomic64_t cetrafs_verdict_fills = ATOMIC64_INIT(0); /* foreign-opener verdicts read from the device */
 
 /* Reconciles COMPLETED by the deferred worker. Every drop must be
  * followed by one: until it lands the inode reads every tree block
@@ -245,9 +246,15 @@ struct cetrafs_inode_info {
      * verdict cached between, so steady-state I/O by the sole opener pays
      * nothing. Only consulted under nofilelock; the default lock uses
      * lock_writer_count. */
-    bool foreign_open_cached;           /* last verdict: a peer also has it open */
-    bool foreign_open_valid;            /* checked at least once this object's life */
+    unsigned long foreign_open_word;    /* cetrafs_verdict_word(): generation, valid, verdict */
     unsigned long foreign_open_checked; /* jiffies of the last presence read */
+    /* Bumped by every invalidation of the two verdict caches (this one
+     * and read_seq_word below). A fill publishes the generation it read
+     * BEFORE its device read, and a verdict is trusted only while that
+     * is still the current one -- so a fill that began before an
+     * invalidation can never land after it as current (audit
+     * 2026-11-05, N8; cetrafs_lock_expire_verdicts()). */
+    atomic_t verdict_gen;
 
     /* Defrag pin (defrag.c, incremental mover): while set, the mover is
      * relying on this node's on-disk exclusive lock staying held, so the
@@ -400,10 +407,10 @@ struct cetrafs_inode_info {
     atomic_t tree_cold_done;
 
     /* cetrafs_lock_read_cache_trusted()'s once-a-second stamp check, the
-     * reader's twin of foreign_open_valid/_checked. Kept apart from
+     * reader's twin of foreign_open_word/_checked. Kept apart from
      * those because it asks only "did the file change?", never "who
      * has it open?". */
-    bool read_seq_valid;
+    unsigned long read_seq_word; /* cetrafs_verdict_word(), verdict bit unused */
     unsigned long read_seq_checked;
 
     /* Settles a cold tree (tree_cold_marks) from a context that holds
@@ -417,6 +424,8 @@ struct cetrafs_inode_info {
 
     struct inode vfs_inode;
 };
+
+static void cetrafs_verdicts_invalidate(struct cetrafs_inode_info *ci); /* see cetrafs_verdict_word() */
 
 /*
  * Give back whatever is left of this inode's speculative run.
@@ -1171,9 +1180,9 @@ static void cetrafs_inode_identity_init_ci(struct cetrafs_inode_info *ci)
     ci->stat_baseline.valid = false;
     ci->resv_span.start = 0;
     ci->resv_span.count = 0;
-    ci->foreign_open_cached = true; /* safe default: read fresh until proven sole opener */
-    ci->foreign_open_valid = false;
+    ci->foreign_open_word = 0; /* not valid: read fresh until proven sole opener */
     ci->foreign_open_checked = 0;
+    atomic_set(&ci->verdict_gen, 0);
     ci->defrag_pinned = false;
     atomic_set(&ci->defrag_queued, 0);
     ci->defrag_quiet_until = jiffies;
@@ -1183,7 +1192,7 @@ static void cetrafs_inode_identity_init_ci(struct cetrafs_inode_info *ci)
     ci->file_seq_cached = U64_MAX;
     atomic_set(&ci->tree_cold_marks, 0);
     atomic_set(&ci->tree_cold_done, 0);
-    ci->read_seq_valid = false;
+    ci->read_seq_word = 0;
     ci->read_seq_checked = 0;
     /* A slab object is recycled across identities; a remembered extent
      * carried over would map the PREVIOUS file's blocks. */
@@ -2340,8 +2349,7 @@ int cetrafs_lock_open(struct inode *inode, struct file *file)
      * it to -- and it is the one moment a second of staleness is not a
      * rounding error but the difference between a disk that opens and
      * one that does not. */
-    ci->foreign_open_valid = false;
-    ci->read_seq_valid = false;
+    cetrafs_verdicts_invalidate(ci);
 
     /* The one safe place to do the heavy half of a reconcile: no buffer
      * is locked here and no folio is held, unlike the per-block gate.
@@ -2984,6 +2992,11 @@ void cetrafs_lock_retry_deferred(struct super_block *sb)
  * control for the staleness tests: with it set they MUST fail, which is
  * the only thing proving they test anything. Never set in production. */
 
+u64 cetrafs_verdict_fill_count(void)
+{
+    return (u64) atomic64_read(&cetrafs_verdict_fills);
+}
+
 u64 cetrafs_file_cache_drop_count(void)
 {
     return (u64) atomic64_read(&cetrafs_file_cache_drops);
@@ -3183,6 +3196,43 @@ static bool cetrafs_inode_has_foreign_opener(struct inode *inode)
 }
 
 /*
+ * The two once-a-second verdict caches (the foreign-opener verdict and
+ * the reader's stamp check) publish one word each: the generation the
+ * fill read before going to the device, a valid bit, and the verdict.
+ * One release store, so nothing can see "valid" ahead of the verdict it
+ * belongs to (arm64 reorders plain stores), and one generation, so a fill
+ * that read the device before an invalidation is never current after it.
+ * They used to be separate plain bools, cleared by the invalidation and
+ * set by the fill, and a fill already in flight set them again with a
+ * verdict read before it -- for evict, truncate and punch, whose
+ * decisions free blocks (audit 2026-11-05, N8;
+ * tests/kernel/verdict_expiry_fences_fill.sh).
+ */
+static unsigned int cetrafs_verdict_fill_stall_ms;
+cetrafs_test_param(verdict_fill_stall_ms, cetrafs_verdict_fill_stall_ms, uint, 0644);
+MODULE_PARM_DESC(verdict_fill_stall_ms,
+                 "TEST ONLY: pause the next foreign-opener verdict fill between its device read and its publish");
+
+#define CETRAFS_VERDICT_GEN_MASK (ULONG_MAX >> 2)
+
+static unsigned long cetrafs_verdict_word(unsigned int gen, bool verdict)
+{
+    return (((unsigned long) gen & CETRAFS_VERDICT_GEN_MASK) << 2) | 2UL | (verdict ? 1UL : 0UL);
+}
+
+static bool cetrafs_verdict_current(struct cetrafs_inode_info *ci, unsigned long word)
+{
+    return (word & 2UL) &&
+           (word >> 2) == ((unsigned long) (unsigned int) atomic_read(&ci->verdict_gen) & CETRAFS_VERDICT_GEN_MASK);
+}
+
+static void cetrafs_verdicts_invalidate(struct cetrafs_inode_info *ci)
+{
+    atomic_inc(&ci->verdict_gen);
+    smp_mb__after_atomic(); /* ordered before whatever the invalidator reads next */
+}
+
+/*
  * Forget the cached verdicts below, so the next freshness check reads the
  * record from the device -- and notes a peer's file_seq, which marks the
  * tree cold and sends the leaf reads fresh (CLAUDE.md rule 10).
@@ -3197,10 +3247,7 @@ static bool cetrafs_inode_has_foreign_opener(struct inode *inode)
  */
 void cetrafs_lock_expire_verdicts(struct inode *inode)
 {
-    struct cetrafs_inode_info *ci = CETRAFS_I(inode);
-
-    WRITE_ONCE(ci->foreign_open_valid, false);
-    WRITE_ONCE(ci->read_seq_valid, false);
+    cetrafs_verdicts_invalidate(CETRAFS_I(inode));
 }
 
 /*
@@ -3214,13 +3261,24 @@ bool cetrafs_inode_foreign_opener_cached(struct inode *inode)
 {
     struct cetrafs_inode_info *ci = CETRAFS_I(inode);
     unsigned long now = jiffies;
+    unsigned long word = smp_load_acquire(&ci->foreign_open_word);
+    unsigned int gen;
+    bool v;
 
-    if (!ci->foreign_open_valid || time_after(now, ci->foreign_open_checked + HZ)) {
-        ci->foreign_open_cached = cetrafs_inode_has_foreign_opener(inode);
-        ci->foreign_open_checked = now;
-        ci->foreign_open_valid = true;
+    if (cetrafs_verdict_current(ci, word) && !time_after(now, READ_ONCE(ci->foreign_open_checked) + HZ))
+        return word & 1;
+    gen = atomic_read_acquire(&ci->verdict_gen); /* BEFORE the device read */
+    v = cetrafs_inode_has_foreign_opener(inode);
+    atomic64_inc(&cetrafs_verdict_fills);
+    if (READ_ONCE(cetrafs_verdict_fill_stall_ms)) {
+        unsigned int ms = xchg(&cetrafs_verdict_fill_stall_ms, 0); /* test-only, one fill */
+
+        if (ms)
+            msleep(ms);
     }
-    return ci->foreign_open_cached;
+    WRITE_ONCE(ci->foreign_open_checked, now);
+    smp_store_release(&ci->foreign_open_word, cetrafs_verdict_word(gen, v));
+    return v;
 }
 
 /*
@@ -3344,17 +3402,20 @@ static bool cetrafs_inode_read_stamp_check(struct inode *inode)
 
     if (cetrafs_read_trust_ignore_stamp)
         return true;
-    if (READ_ONCE(ci->read_seq_valid) && !time_after(now, READ_ONCE(ci->read_seq_checked) + HZ))
+    if (cetrafs_verdict_current(ci, smp_load_acquire(&ci->read_seq_word)) &&
+        !time_after(now, READ_ONCE(ci->read_seq_checked) + HZ))
         return true;
     /* Off the stack: this is reached from deep in the read path, and
      * the record is 652 bytes (see the open path's FRAME_WARN note). */
     raw = kmalloc(sizeof(*raw), GFP_NOFS);
     if (raw && cetrafs_sb_get_node_id(sb, &my_node_id) == 0) {
+        unsigned int gen = atomic_read_acquire(&ci->verdict_gen); /* BEFORE the device read */
+
         cetrafs_invalidate_raw_inode(sb, inode->i_ino);
         if (cetrafs_read_raw_inode(sb, inode->i_ino, raw) == 0) {
             cetrafs_inode_note_stamp(inode, raw, my_node_id);
             WRITE_ONCE(ci->read_seq_checked, now);
-            WRITE_ONCE(ci->read_seq_valid, true);
+            smp_store_release(&ci->read_seq_word, cetrafs_verdict_word(gen, false));
             ok = true;
         }
     }
@@ -3918,8 +3979,7 @@ static int cetrafs_lock_suspend(struct inode *inode, struct file *file)
      * (cetrafs_inode_foreign_opener_cached). Without this we would keep
      * trusting the cache for that long after giving the lock away.
      */
-    ci->foreign_open_cached = true;
-    ci->foreign_open_valid = false;
+    cetrafs_verdicts_invalidate(ci);
     ci->file_seq_cached = U64_MAX;
 
     atomic64_inc(&cetrafs_lock_suspends);
@@ -4123,8 +4183,7 @@ static int cetrafs_lock_resume(struct inode *inode)
             }
         }
         ci->file_seq_cached = U64_MAX;
-        ci->foreign_open_cached = true;
-        ci->foreign_open_valid = false;
+        cetrafs_verdicts_invalidate(ci);
         if (inode->i_mapping)
             invalidate_mapping_pages(inode->i_mapping, 0, -1);
     }

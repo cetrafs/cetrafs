@@ -953,6 +953,7 @@ void cetrafs_inode_note_local_file_seq(struct inode *inode, u64 seq);
 u64 cetrafs_inode_local_file_seq(struct inode *inode);
 u64 cetrafs_inode_local_file_seq_at(struct inode *inode);
 u64 cetrafs_file_cache_drop_count(void);
+u64 cetrafs_verdict_fill_count(void);
 u64 cetrafs_journal_write_count(void);
 u64 cetrafs_journal_held_slots(struct super_block *sb); /* journal.c: slots held by kept entries */
 u64 cetrafs_bg_geom_read_count(void);
