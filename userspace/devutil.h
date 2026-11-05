@@ -691,10 +691,60 @@ static inline int cetrafs_repair_renew(int fd, const cetrafs_superblock_t *sb, u
  * by nobody else while the timer runs. A renewal that finds the row
  * taken sets cetrafs_repair_lost for the work loop to stop on.
  */
-static volatile sig_atomic_t cetrafs_repair_lost;
+static volatile sig_atomic_t cetrafs_repair_lost; /* 1: our row was taken; 2: a node is live */
 static int cetrafs_renew_fd = -1;
 static cetrafs_superblock_t cetrafs_renew_sb;
 static uint32_t cetrafs_renew_row;
+
+/*
+ * Every other row's hb_seq as it stood when the claim was taken, so each
+ * renewal can look for a node that is beating under the repair (audit
+ * R4, tool half). The probe before the claim refuses a live node and the
+ * kernel's mount gate refuses a mount under a live claim -- but only
+ * while the claim LOOKS live, and a repairer whose own I/O is queued
+ * behind dead paths does not. A refused mount never writes its row, so
+ * a REGISTERED row whose hb_seq moved is a node that got in: stop before
+ * writing more. Rows past the cap are not watched (registries are far
+ * smaller).
+ */
+#define CETRAFS_REPAIR_WATCH_ROWS 256
+static uint64_t cetrafs_renew_seen[CETRAFS_REPAIR_WATCH_ROWS];
+
+static inline int cetrafs_repair_row_seq(int fd, const cetrafs_superblock_t *sb, uint32_t idx, uint32_t *state,
+                                         uint64_t *seq)
+{
+    cetrafs_node_entry_t ne;
+
+    if (pread(fd, &ne, sizeof(ne), cetrafs_node_row_off(sb, idx)) != (ssize_t) sizeof(ne))
+        return -1;
+    *state = cetrafs_le32(ne.state);
+    *seq = cetrafs_le64(ne.hb_seq);
+    return 0;
+}
+
+static inline void cetrafs_repair_watch_arm(int fd, const cetrafs_superblock_t *sb, uint32_t row)
+{
+    uint32_t count = cetrafs_le32(sb->node_table_count), idx, state;
+    uint64_t seq;
+
+    for (idx = 0; idx < count && idx < CETRAFS_REPAIR_WATCH_ROWS; idx++)
+        cetrafs_renew_seen[idx] = (idx != row && cetrafs_repair_row_seq(fd, sb, idx, &state, &seq) == 0) ? seq : 0;
+}
+
+/* Async-signal-safe: pread only. 1 if some other REGISTERED row beat. */
+static inline int cetrafs_repair_node_beat(int fd, const cetrafs_superblock_t *sb, uint32_t row)
+{
+    uint32_t count = cetrafs_le32(sb->node_table_count), idx, state;
+    uint64_t seq;
+
+    for (idx = 0; idx < count && idx < CETRAFS_REPAIR_WATCH_ROWS; idx++) {
+        if (idx == row || cetrafs_repair_row_seq(fd, sb, idx, &state, &seq) != 0)
+            continue;
+        if (state == CETRAFS_NODE_STATE_REGISTERED && seq != cetrafs_renew_seen[idx])
+            return 1;
+    }
+    return 0;
+}
 
 static void cetrafs_repair_tick(int sig)
 {
@@ -703,6 +753,9 @@ static void cetrafs_repair_tick(int sig)
     (void) sig;
     if (cetrafs_renew_fd >= 0 && cetrafs_repair_renew(cetrafs_renew_fd, &cetrafs_renew_sb, cetrafs_renew_row) != 0)
         cetrafs_repair_lost = 1;
+    else if (cetrafs_renew_fd >= 0 && !cetrafs_repair_lost &&
+             cetrafs_repair_node_beat(cetrafs_renew_fd, &cetrafs_renew_sb, cetrafs_renew_row))
+        cetrafs_repair_lost = 2;
     errno = saved;
 }
 
@@ -745,6 +798,7 @@ static inline void cetrafs_repair_timer(int fd, const cetrafs_superblock_t *sb, 
     }
     cetrafs_renew_sb = *sb;
     cetrafs_renew_row = row;
+    cetrafs_repair_watch_arm(fd, sb, row);
     cetrafs_renew_fd = fd;
     sa.sa_handler = cetrafs_repair_tick;
     sa.sa_flags = SA_RESTART;

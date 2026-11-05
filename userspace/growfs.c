@@ -126,6 +126,12 @@ static void write_block(int fd, u64 lba, const void *data, bool do_write)
 {
     if (!do_write)
         return;
+    /* The claim's timer found our row taken, or a node beating under it
+     * (devutil.h): writing on would relocate tables under a live mount. */
+    if (cetrafs_repair_lost)
+        die("%s -- stopping before writing more",
+            cetrafs_repair_lost == 2 ? "a node is mounted on this volume while it is being grown"
+                                     : "this grow's registry claim was taken away");
     pwrite_all(fd, data, CETRAFS_BLOCK_SIZE, (off_t) lba * CETRAFS_BLOCK_SIZE);
 }
 
@@ -721,6 +727,10 @@ int main(int argc, char **argv)
         atexit(growfs_repair_release_atexit);
         printf("  claimed registry row %d for the duration of this grow\n", grow_repair_row);
         fflush(stdout);
+        /* Test knob only, as in fsck: hold the claim before any work, so
+         * a suite can act on the volume while it is held. */
+        if (getenv("CETRAFS_TEST_REPAIR_HOLD_SECS"))
+            cetrafs_sleep_full((unsigned) atoi(getenv("CETRAFS_TEST_REPAIR_HOLD_SECS")));
         /* Claim first, then look: a node mounting from here on sees the
          * claim and refuses, and one that got in before it is found
          * here. The other order left the gap between them open. */

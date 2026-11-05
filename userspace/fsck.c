@@ -134,6 +134,12 @@ static void fsck_repair_heartbeat(void)
 
     if (repair_row < 0 || repair_fd < 0)
         return;
+    if (cetrafs_repair_lost == 2) {
+        /* The timer saw a node beating under the claim (devutil.h). */
+        fprintf(stderr, "ERR: a node is mounted on this volume while it is being repaired -- stopping before "
+                        "writing more\n");
+        exit(FSCK_EXIT_NOEXAM);
+    }
     if (cetrafs_repair_lost) {
         /* The timer's renewal found the row taken (devutil.h). */
         fprintf(stderr, "ERR: this repair's registry claim was taken away -- stopping before writing more\n");
