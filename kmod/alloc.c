@@ -1174,7 +1174,7 @@ static int cetrafs_read_bg_geom(struct super_block *sb, u32 bg_id, struct cetraf
         bg = (const cetrafs_block_group_t *) bh->b_data;
         /* Under the buffer lock, as cetrafs_read_zg(): the free count is
          * patched in place on this very buffer (audit L15). */
-        lock_buffer(bh);
+        cetrafs_bh_read_lock(bh);
         if (cetrafs_bg_crc_verify(bh->b_data) == (u32) cetrafs_le64(bg->checksum)) {
             if (!cetrafs_bg_geom_sane(raw_sb, bg_id, bg)) {
                 pr_err_ratelimited("BG %u descriptor describes an impossible Block Group (start %llu len %llu "
@@ -1183,7 +1183,7 @@ static int cetrafs_read_bg_geom(struct super_block *sb, u32 bg_id, struct cetraf
                                    (unsigned long long) cetrafs_le64(bg->length_blocks),
                                    cetrafs_le32(bg->off_data_bmap), cetrafs_le32(bg->off_data_region),
                                    (unsigned long long) cetrafs_le64(bg->data_block_count));
-                unlock_buffer(bh);
+                cetrafs_bh_read_unlock(bh);
                 cetrafs_sb_corrupt(sb, 0);
                 brelse(bh);
                 return -EUCLEAN;
@@ -1196,11 +1196,11 @@ static int cetrafs_read_bg_geom(struct super_block *sb, u32 bg_id, struct cetraf
             out->free_data_blocks = cetrafs_le64(bg->free_data_blocks);
             out->reconcile_seq = cetrafs_le64(bg->reconcile_seq);
             out->owner_zg = cetrafs_le16(bg->owner_zg);
-            unlock_buffer(bh);
+            cetrafs_bh_read_unlock(bh);
             brelse(bh);
             return 0;
         }
-        unlock_buffer(bh);
+        cetrafs_bh_read_unlock(bh);
         brelse(bh);
 
         /* Back off, like every other checksummed-record reader: a

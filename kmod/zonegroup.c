@@ -121,7 +121,7 @@ static int cetrafs_read_zg(struct super_block *sb, u32 zg_id, cetrafs_zone_group
              * in-place patch of a cached block takes: checked on the
              * live buffer and copied after, a patch landing in between
              * handed out an image the checksum never saw (audit L15). */
-            lock_buffer(bh);
+            cetrafs_bh_read_lock(bh);
             want = (u32) le64_to_cpu(zg->hot_checksum);
             got = cetrafs_zg_hot_crc(bh->b_data);
             if (got == want && (u32) le64_to_cpu(zg->cold_checksum) == cetrafs_zg_cold_crc(bh->b_data)) {
@@ -129,11 +129,11 @@ static int cetrafs_read_zg(struct super_block *sb, u32 zg_id, cetrafs_zone_group
 
                 if (id_ok)
                     memcpy(out, zg, sizeof(*out));
-                unlock_buffer(bh);
+                cetrafs_bh_read_unlock(bh);
                 brelse(bh);
                 return id_ok ? 0 : -EINVAL;
             }
-            unlock_buffer(bh);
+            cetrafs_bh_read_unlock(bh);
             brelse(bh);
 
             /* Same backoff as the inode-record and node-row readers: a
