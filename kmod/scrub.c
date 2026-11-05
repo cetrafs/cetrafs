@@ -184,6 +184,9 @@ struct scrub_bg {
 struct scrub_ctx {
     struct scrub_bg *bgs;
     u32 nbgs;
+    /* bgs[] data ranges strictly ascending and disjoint, checked when
+     * the list is built: scrub_mark_ref() may then binary-search it. */
+    bool ordered;
 };
 
 /* The for_each_extent callback: mark every block of [phys, phys+len) that
@@ -191,15 +194,40 @@ struct scrub_ctx {
 static void scrub_mark_ref(void *ctxp, u64 phys, u32 len)
 {
     struct scrub_ctx *ctx = ctxp;
-    u32 i;
+    u32 i = 0;
 
     if (!len)
         return;
-    for (i = 0; i < ctx->nbgs; i++) {
+    /*
+     * Once per extent of every allocated inode: a scan of every owned
+     * Block Group here made the walk O(extents x BGs) (audit L19). On an
+     * ordered list, start at the first BG whose data does not end at or
+     * before phys. The order is CHECKED, not assumed (cetrafs_scrub
+     * collects by bg_id, and a hostile descriptor table need not ascend):
+     * a reference this misses is a block the scrub frees while a file
+     * names it, so an unordered list keeps the full scan.
+     */
+    if (ctx->ordered) {
+        u32 lo = 0, hi = ctx->nbgs;
+
+        while (lo < hi) {
+            u32 mid = lo + (hi - lo) / 2;
+            struct scrub_bg *b = &ctx->bgs[mid];
+
+            if (b->data_start + b->data_count <= phys)
+                lo = mid + 1;
+            else
+                hi = mid;
+        }
+        i = lo;
+    }
+    for (; i < ctx->nbgs; i++) {
         struct scrub_bg *b = &ctx->bgs[i];
         u64 lo = max(phys, b->data_start);
         u64 hi = min(phys + len, b->data_start + b->data_count);
 
+        if (ctx->ordered && b->data_start >= phys + len)
+            break;
         if (lo < hi)
             bitmap_set(b->ref, (unsigned int) (lo - b->data_start), (unsigned int) (hi - lo));
     }
@@ -543,6 +571,10 @@ static int scrub_collect_targets(struct super_block *sb, struct scrub_ctx *ctx)
     }
     ctx->bgs = bgs;
     ctx->nbgs = n;
+    ctx->ordered = true;
+    for (u32 k = 1; k < n; k++)
+        if (bgs[k].data_start < bgs[k - 1].data_start + bgs[k - 1].data_count)
+            ctx->ordered = false;
     return 0;
 oom:
     while (n--) {

@@ -3787,36 +3787,77 @@ int main(int argc, char **argv)
          * than thousands naming its contents, and the contents are
          * unreachable for exactly one reason. */
         {
-            uint8_t *seen = (uint8_t *) xcalloc(cetrafs_le32(sb.inodes_count) + 1, 1);
-            uint64_t detached = 0;
+            /*
+             * Each directory's verdict is memoised on every directory its
+             * walk passes through: a walk stops at the first one already
+             * decided and inherits its answer. Walking every chain from
+             * scratch -- and clearing an inodes_count-sized `seen` per
+             * directory -- was quadratic: a deep tree, or just many
+             * directories on a large inode table, and fsck ran for hours
+             * (audit L19). Now every directory is walked once.
+             *
+             * res: 0 undecided, 1 reaches the root, 2 leads into a cycle,
+             * 3 stops at stopat[] (an inode nothing names, or out of
+             * range). visit[] holds the id of the walk that marked it, so
+             * a walk meeting its own mark is a cycle.
+             */
+            const uint64_t ninodes = cetrafs_le32(sb.inodes_count);
+            uint8_t *res = (uint8_t *) xcalloc(ninodes + 1, 1);
+            uint64_t *stopat = (uint64_t *) xcalloc(ninodes + 1, sizeof(uint64_t));
+            uint64_t *visit = (uint64_t *) xcalloc(ninodes + 1, sizeof(uint64_t));
+            uint64_t detached = 0, ndirs = 0, steps = 0;
 
-            for (uint64_t ino = 2; ino <= cetrafs_le32(sb.inodes_count); ++ino) {
+            for (uint64_t ino = 2; ino <= ninodes; ++ino) {
                 uint64_t bit = ino - 1;
-                uint64_t cur;
-                uint64_t steps = 0;
-                int cycle = 0;
+                uint64_t cur, c;
+                uint8_t r;
+                int cycle;
 
                 if (!(ibmap[bit / 8] & (1u << (bit % 8))) || !is_dir[ino])
                     continue;
 
-                /* Walk up, marking as we go. The step limit is a
-                 * backstop: a cycle is normally caught by `seen`, but a
-                 * corrupt parent map must not be able to hang the
-                 * tool. */
-                memset(seen, 0, cetrafs_le32(sb.inodes_count) + 1);
+                /* Walk up to the root, a decided directory, a break in
+                 * the chain, or this walk's own mark. Terminates: every
+                 * step either stops or marks a new inode. */
+                ndirs++;
                 cur = ino;
-                while (cur != CETRAFS_ROOT_INO && steps++ <= cetrafs_le32(sb.inodes_count)) {
-                    if (cur == 0 || cur > cetrafs_le32(sb.inodes_count))
-                        break;
-                    if (seen[cur]) {
-                        cycle = 1;
+                stopat[0] = 0;
+                for (;;) {
+                    if (cur == CETRAFS_ROOT_INO) {
+                        r = 1;
                         break;
                     }
-                    seen[cur] = 1;
+                    if (cur == 0 || cur > ninodes) {
+                        r = 3;
+                        stopat[0] = cur; /* scratch: carried below */
+                        break;
+                    }
+                    if (res[cur]) {
+                        r = res[cur];
+                        stopat[0] = stopat[cur];
+                        break;
+                    }
+                    if (visit[cur] == ino) {
+                        r = 2;
+                        break;
+                    }
+                    visit[cur] = ino;
                     cur = dir_parent[cur];
+                    steps++;
                 }
+                {
+                    uint64_t stop = stopat[0];
 
-                if (cur == CETRAFS_ROOT_INO)
+                    /* Publish the verdict along the path just walked. */
+                    for (c = ino; c != CETRAFS_ROOT_INO && c != 0 && c <= ninodes && !res[c]; c = dir_parent[c]) {
+                        res[c] = r;
+                        stopat[c] = stop;
+                    }
+                    cur = stop;
+                }
+                cycle = (r == 2);
+
+                if (r == 1)
                     continue; /* reached the root: fine */
 
                 /* Report the TOP of the detached part only: if this
@@ -3840,9 +3881,13 @@ int main(int argc, char **argv)
                 problems++;
                 detached++;
             }
-            free(seen);
+            free(res);
+            free(stopat);
+            free(visit);
             if (detached == 0)
-                printf("  namespace: every directory is reachable from the root\n");
+                printf("  namespace: every directory is reachable from the root (%" PRIu64 " walk steps, %" PRIu64
+                       " directories)\n",
+                       steps, ndirs);
         }
 
         /*
