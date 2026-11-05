@@ -1713,6 +1713,30 @@ static bool cetrafs_lock_ignore_readers;
 cetrafs_test_param(lock_ignore_readers, cetrafs_lock_ignore_readers, bool, 0644);
 MODULE_PARM_DESC(lock_ignore_readers, "TEST ONLY: drop the readers-exclude-a-writer half of the access rule");
 
+/* TEST ONLY: hold an open (or the defrag pin) between its read of the
+ * record and its claim CAS, so a peer's whole session can land in
+ * between (tests/kernel/open_claim_stale_size.sh). */
+static unsigned int cetrafs_lock_claim_gap_ms;
+cetrafs_test_param(lock_claim_gap_ms, cetrafs_lock_claim_gap_ms, uint, 0644);
+MODULE_PARM_DESC(lock_claim_gap_ms, "TEST ONLY: stall an open between its record read and its claim");
+
+/* After a successful claim: the record as it is now, both sectors.
+ * Generation is held to the one the claim was made against. */
+static int cetrafs_lock_reread_claimed(struct inode *inode, cetrafs_inode_t *raw)
+{
+    cetrafs_inode_t now;
+    int ret;
+
+    cetrafs_invalidate_raw_inode(inode->i_sb, inode->i_ino);
+    ret = cetrafs_read_raw_inode(inode->i_sb, inode->i_ino, &now);
+    if (ret)
+        return ret;
+    if (now.generation != raw->generation)
+        return -ESTALE;
+    *raw = now;
+    return 0;
+}
+
 /* TEST ONLY: the next write-open's open-boundary refresh fails with
  * -EBUSY, as a contended or locally-dirty refresh does
  * (tests/kernel/open_fail_gives_back_lock.sh). */
@@ -1765,6 +1789,11 @@ int cetrafs_lock_open(struct inode *inode, struct file *file)
     cetrafs_invalidate_raw_inode(sb, inode->i_ino);
 
     ret = cetrafs_read_raw_inode(sb, inode->i_ino, &raw);
+    if (!ret && want_write && cetrafs_lock_claim_gap_ms) {
+        pr_info("lock: ino=%llu open stalled %u ms between its read and its claim (test)\n",
+                (unsigned long long) inode->i_ino, cetrafs_lock_claim_gap_ms);
+        msleep(cetrafs_lock_claim_gap_ms); /* test-only; see the parameter */
+    }
     if (ret)
         goto out_pr_unlock;
 
@@ -1934,6 +1963,15 @@ int cetrafs_lock_open(struct inode *inode, struct file *file)
             goto out_pr_unlock;
         }
         claimed = true;
+        /* The claim compared sector 0 only, so the FILE sector in `raw`
+         * is still the one read before it -- and a peer's whole session
+         * (claim, write, publish, release) fits in between, ending with
+         * sector 0 back as we read it. The refresh below would then set
+         * a stale size and tree (audit L28). We hold the lock now: one
+         * read from here is the file as it is. */
+        ret = cetrafs_lock_reread_claimed(inode, &raw);
+        if (ret)
+            goto out_give_back;
     }
 
     /* nofilelock: we honor a present lock (above) but never auto-claim one,
@@ -4249,6 +4287,12 @@ int cetrafs_lock_defrag_begin(struct inode *inode)
         ret = cetrafs_lock_cas(inode, &ctx, &raw);
         if (ret) {
             ret = (ret == -ETXTBSY) ? -EBUSY : ret;
+            goto out;
+        }
+        /* As the open: the file sector in `raw` predates the claim. */
+        ret = cetrafs_lock_reread_claimed(inode, &raw);
+        if (ret) {
+            cetrafs_lock_give_back(inode, cetrafs_give_back_clear, NULL, "defrag");
             goto out;
         }
     }
