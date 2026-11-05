@@ -17,7 +17,7 @@
 # (POSIX_FADV_DONTNEED) without an fsync, which would convert.
 #
 # DISCRIMINATION: without the pending lookup in get_block the evicted
-# block reads as zeros; without the punch's clear, the re-preallocated
+# block reads as zeros (the mmap case through a read fault); without the punch's clear, the re-preallocated
 # block reads the punched data.
 set -euo pipefail
 . "$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)/lib/harness.sh"
@@ -107,13 +107,24 @@ if libc.fallocate(fd, FALLOC_FL_KEEP_SIZE, ctypes.c_longlong(50 * BS), ctypes.c_
     print("SETUP re-allocate after truncate failed", ctypes.get_errno()); sys.exit(0)
 os.posix_fadvise(fd, 0, 0, os.POSIX_FADV_DONTNEED)
 say("truncate-forgets", rd(fd, 50) == bytes(BS), rd(fd, 50)[:8])
-# a store through a mapping -- last: Python's mmap holds a dup of the fd,
-# and closing it is a close(2) (->flush converts the whole set)
-m = mmap.mmap(fd, 16 * BS)
-m[9 * BS:10 * BS] = b"M" * BS
-m.close()
+# a store through a mapping, read back through a fault on a fresh
+# mapping once the page is gone -- both on a block still pending. libc's
+# mmap, not Python's: that one holds a dup of the fd, and closing it is
+# a close(2) (->flush converts the whole set before the read).
+libc.mmap.restype = ctypes.c_void_p
+libc.mmap.argtypes = [ctypes.c_void_p, ctypes.c_size_t, ctypes.c_int, ctypes.c_int, ctypes.c_int, ctypes.c_longlong]
+libc.munmap.argtypes = [ctypes.c_void_p, ctypes.c_size_t]
+PROT_RW, MAP_SHARED = 3, 1
+a = libc.mmap(None, 16 * BS, PROT_RW, MAP_SHARED, fd, 0)
+if a in (None, ctypes.c_void_p(-1).value):
+    print("SETUP mmap failed", ctypes.get_errno()); sys.exit(0)
+ctypes.memmove(a + 9 * BS, b"M" * BS, BS)
+libc.munmap(a, 16 * BS)
 evict(fd)
-say("mmap", rd(fd, 9) == b"M" * BS, rd(fd, 9)[:8])
+a = libc.mmap(None, 16 * BS, 1, MAP_SHARED, fd, 0)
+got = ctypes.string_at(a + 9 * BS, BS)
+libc.munmap(a, 16 * BS)
+say("mmap", got == b"M" * BS, got[:8])
 
 os.close(fd)
 
