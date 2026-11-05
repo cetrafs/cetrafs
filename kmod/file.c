@@ -3123,6 +3123,11 @@ int cetrafs_tree_build(struct inode *inode, const cetrafs_extent_t *flat, u32 n,
                     u32 lo, hi;
 
                     cetrafs_leaf_array_range(flat + fe, (u16) cnt_in_leaf, &lo, &hi);
+                    /* The tree's last leaf is the one appends go to:
+                     * unknown, never a range a later append must widen
+                     * (cetrafs_tree_append()). */
+                    if (lf == nleaves - 1)
+                        lo = hi = 0;
                     cetrafs_idx_set(&idx[j], lo, hi, blk[lf]);
                 }
             }
@@ -3719,7 +3724,7 @@ static int cetrafs_tree_append(struct inode *inode,
             /* The existing leaf's array is not in hand here, so leave it
              * UNKNOWN -- correct, just unskippable until a rebuild. */
             cetrafs_idx_set(&idx[0], 0, 0, llba);
-            cetrafs_idx_set(&idx[1], iblock, cetrafs_idx_end(iblock, count), new_leaf);
+            cetrafs_idx_set(&idx[1], 0, 0 /* the appended-to leaf: unknown */, new_leaf);
             ret = cetrafs_write_new_index(sb, new_idx, idx, 2);
             if (ret)
                 goto d1_fail;
@@ -3768,6 +3773,7 @@ static int cetrafs_tree_append(struct inode *inode,
         cetrafs_extent_hdr_t *lhdr;
         cetrafs_extent_t *larr;
         u16 before;
+        u32 full_lo = 0, full_hi = 0; /* the full last leaf's range, if it is replaced */
 
         if (!ibh)
             return -EIO;
@@ -3816,13 +3822,46 @@ static int cetrafs_tree_append(struct inode *inode,
                              !cetrafs_idx_end(iblock, count))) {
                     const u32 iprev = cetrafs_bh_begin_update_crc(ibh);
 
-                    cetrafs_idx_widen(&iarr[ient - 1], iblock, cetrafs_idx_end(iblock, count));
-                    cetrafs_blk_tail_stamp(ibh, CETRAFS_INDEX_TAIL_MAGIC);
                     if (S_ISREG(inode->i_mode)) {
-                        cetrafs_bh_end_update(ibh);
-                    } else {
-                        int iw = cetrafs_journal_write_block(sb, ibh, iprev);
+                        /*
+                         * A regular file's leaf and interior are both
+                         * left dirty for writeback, which orders
+                         * nothing: the leaf can reach the device with
+                         * this extent while the interior still holds
+                         * the old range, and a node dying in between
+                         * leaves an extent every lookup skips -- the
+                         * block reads as a hole, is written again under
+                         * a second extent, and the first resurfaces if
+                         * the range ever widens. Two-node hypervisor
+                         * storm, a node's device pulled mid-write: 251
+                         * such extents in one image.
+                         *
+                         * So the leaf appends go to never carries a
+                         * range at all (cetrafs_tree_append() creates
+                         * it UNKNOWN), and one that still does -- a
+                         * volume written before this, or a rebuild --
+                         * becomes UNKNOWN here, on the device BEFORE
+                         * the leaf can be: once per leaf, not per
+                         * block.
+                         */
+                        int iw;
 
+                        iarr[ient - 1].ei_block_end = 0;
+                        cetrafs_blk_tail_stamp(ibh, CETRAFS_INDEX_TAIL_MAGIC);
+                        cetrafs_bh_end_update(ibh);
+                        iw = cetrafs_sync_buffer(sb, ibh);
+                        if (iw) {
+                            cetrafs_bh_abort_update(lbh);
+                            brelse(lbh);
+                            brelse(ibh);
+                            return iw;
+                        }
+                    } else {
+                        int iw;
+
+                        cetrafs_idx_widen(&iarr[ient - 1], iblock, cetrafs_idx_end(iblock, count));
+                        cetrafs_blk_tail_stamp(ibh, CETRAFS_INDEX_TAIL_MAGIC);
+                        iw = cetrafs_journal_write_block(sb, ibh, iprev);
                         if (iw) {
                             cetrafs_bh_abort_update(lbh);
                             brelse(lbh);
@@ -3859,6 +3898,10 @@ static int cetrafs_tree_append(struct inode *inode,
             brelse(ibh);
             return ret;
         }
+        /* The full leaf's range, while its array is in hand: it stops
+         * taking appends below, so it can be given an exact one. */
+        cetrafs_leaf_array_range(larr, min_t(u16, cetrafs_le16(lhdr->eh_entries), CETRAFS_EXT_BLOCK_MAX_LEAVES),
+                                 &full_lo, &full_hi);
         cetrafs_bh_abort_update(lbh);
         brelse(lbh);
         if (ret != -ENOSPC) {
@@ -3901,8 +3944,18 @@ static int cetrafs_tree_append(struct inode *inode,
             if (cetrafs_le16(ihdr->eh_entries) < CETRAFS_EXT_BLOCK_MAX_IDX) {
                 /* room in the last interior for one more leaf pointer */
                 const u32 prev_crc = cetrafs_bh_begin_update_crc(ibh);
-                cetrafs_idx_set(&iarr[cetrafs_le16(ihdr->eh_entries)], iblock, cetrafs_idx_end(iblock, count),
-                                new_leaf);
+                u16 ient = cetrafs_le16(ihdr->eh_entries);
+
+                /* The new leaf is the one appends go to: UNKNOWN (see the
+                 * last-leaf path above). The full one it replaces stops
+                 * growing, so it gets its exact range -- computed from
+                 * this node's copy, which is everything the device's can
+                 * hold, so the range can only over-advertise. */
+                if (S_ISREG(inode->i_mode) && ient) {
+                    iarr[ient - 1].ei_block = cetrafs_cpu_to_le32(full_lo);
+                    iarr[ient - 1].ei_block_end = cetrafs_cpu_to_le32(full_hi);
+                }
+                cetrafs_idx_set(&iarr[ient], 0, 0 /* the appended-to leaf: unknown */, new_leaf);
                 ihdr->eh_entries = cetrafs_cpu_to_le16(cetrafs_le16(ihdr->eh_entries) + 1);
                 cetrafs_blk_tail_stamp(ibh, CETRAFS_INDEX_TAIL_MAGIC);
                 /* Same trade as the convert path: a regular file's leaf is republished
@@ -3943,7 +3996,10 @@ static int cetrafs_tree_append(struct inode *inode,
                     cetrafs_free_data_block(sb, new_leaf);
                     return ret;
                 }
-                cetrafs_idx_set(&idx1, iblock, cetrafs_idx_end(iblock, count), new_leaf);
+                /* The appended-to leaf: unknown. The previous interior's
+                 * last leaf keeps the unknown it had (at most three such
+                 * across the root's four interiors). */
+                cetrafs_idx_set(&idx1, 0, 0, new_leaf);
                 ret = cetrafs_write_new_index(sb, new_idx, &idx1, 1);
                 if (ret) {
                     cetrafs_free_data_block(sb, new_idx);
