@@ -1300,8 +1300,14 @@ int cetrafs_pending_add(struct inode *inode, u32 first, u32 count)
     if (!count)
         return 0;
     lockdep_assert_held_write(&inode->i_mapping->invalidate_lock);
+    /* The RAW cursor, not errseq_sample(): that returns 0 while an
+     * earlier error is still unseen (nobody fsync'd since), and a cursor
+     * of 0 then reads that OLD error as this set's -- every block in it
+     * dropped, its good data reading as zeros. "Since now" is the
+     * current value, compared with the seen bit ignored
+     * (cetrafs_pending_wb_failed()). */
     if (mtree_empty(&ci->pending))
-        ci->pending_wb_err = errseq_sample(&inode->i_mapping->wb_err);
+        ci->pending_wb_err = READ_ONCE(inode->i_mapping->wb_err);
     mtree_lock(&ci->pending);
     if (s > 0) {
         mas_set(&mas, s - 1);
@@ -1370,7 +1376,18 @@ bool cetrafs_pending_any(struct inode *inode)
 /* A writeback error since the set was started: see the field. */
 bool cetrafs_pending_wb_failed(struct inode *inode)
 {
-    return errseq_check(&inode->i_mapping->wb_err, CETRAFS_I(inode)->pending_wb_err) != 0;
+    /*
+     * Not errseq_check(): it compares EXACTLY, the seen bit included,
+     * and the cursor is the raw value (see cetrafs_pending_add()) -- an
+     * fsync marking the old error seen would then read as a new one.
+     * A new error is a change in the counter or the errno; the seen bit
+     * is lib/errseq.c's ERRSEQ_SEEN, the bit above MAX_ERRNO, which
+     * errseq.h does not export.
+     */
+    const errseq_t seen = (errseq_t) 1 << ilog2(MAX_ERRNO + 1);
+    errseq_t cur = READ_ONCE(inode->i_mapping->wb_err);
+
+    return (cur | seen) != (CETRAFS_I(inode)->pending_wb_err | seen);
 }
 
 /* Remove [first, last]. Must not fail: a stale entry would later make a
@@ -1392,8 +1409,15 @@ void cetrafs_pending_drop_all(struct inode *inode)
 {
     struct cetrafs_inode_info *ci = CETRAFS_I(inode);
 
+    /* Erase, not mtree_destroy(): destroy re-initialises the tree's
+     * flags from what it finds, and this object is recycled by the slab
+     * constructor (cetrafs_inode_init_once()), which alone sets
+     * MT_FLAGS_USE_RCU -- the mode the lockless readers above rely on to
+     * have the nodes they walk freed after a grace period. A store of
+     * NULL over everything frees the same nodes, through RCU, and leaves
+     * the flags as the constructor made them. */
     if (!mtree_empty(&ci->pending))
-        mtree_destroy(&ci->pending);
+        mtree_store_range(&ci->pending, 0, ULONG_MAX, NULL, GFP_NOFS | __GFP_NOFAIL);
 }
 
 /* ---- on-disk lock field as an atomic compare-and-swap --------------

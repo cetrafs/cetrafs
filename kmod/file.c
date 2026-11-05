@@ -623,9 +623,21 @@ int cetrafs_convert_pending_locked(struct inode *inode)
     if (!S_ISREG(inode->i_mode) || !cetrafs_pending_any(inode))
         return 0;
 
-    ret = filemap_write_and_wait(m);
-    if (!ret && cetrafs_pending_wb_failed(inode))
-        ret = -EIO;
+    /*
+     * The verdict is the set's own errseq cursor, nothing else.
+     * filemap_write_and_wait() also reports the mapping's legacy AS_EIO
+     * flag -- set by ANY earlier failed writeback of this file, one the
+     * set never touched -- and acting on it dropped blocks whose data
+     * had reached the device (audit F8). So: start the writeback (its
+     * own submission error is ours), wait without consuming the flags
+     * (they stay for fsync/close to report), and judge by the cursor.
+     */
+    ret = filemap_fdatawrite(m);
+    if (!ret) {
+        (void) filemap_fdatawait_keep_errors(m);
+        if (cetrafs_pending_wb_failed(inode))
+            ret = -EIO;
+    }
     if (!ret)
         ret = cetrafs_publish_flush(inode->i_sb);
     if (ret) {

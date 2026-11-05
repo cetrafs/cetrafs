@@ -417,6 +417,27 @@ count, fio verify at QD32, and punches beside in-flight writes; with
 `dio_fill_holes=0`, `dio_skip_convert=1` and the coalescing removed as
 controls.
 
+## 15. Buffered writes into preallocated space pay at fsync and close
+
+**Cost, NOT MEASURED.** A buffered write into a preallocated extent
+leaves the block "reads as zeros" on disk until its data is there
+(rule 8); the blocks wait in the inode's pending set. At every fsync
+and every close with a non-empty set, `cetrafs_convert_pending_locked()`
+writes back the WHOLE file (not the fsync's range -- which blocks the
+set holds is not tied to the range), waits for it, and issues one
+device cache flush before the first conversion. A file with an empty
+set -- every O_DIRECT writer, and any file not fallocated -- pays one
+emptiness check and nothing else.
+
+What this costs a workload that fsyncs a large, buffered, fallocated
+file often has not been measured on real hardware; a loop device makes
+the flush free. If it shows up, the knob is the range: tracking the
+set's span would let an fsync of a small range skip the whole-file
+writeback, and is not a format change.
+
+**Guarded by:** `tests/kernel/buffered_pending_reads.sh`,
+`pending_wb_cursor.sh` (correctness only).
+
 ## Measured baseline
 
 On the reference hardware -- an enterprise FC array over 32GFC multipath (two
