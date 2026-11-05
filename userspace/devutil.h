@@ -32,9 +32,11 @@
 #include <stdio.h>
 #include <stdlib.h>
 #include <string.h>
-#include <linux/fs.h> /* BLKGETSIZE64 */
+#include <linux/fs.h> /* BLKGETSIZE64, BLKSSZGET */
+#include <scsi/sg.h>
 #include <sys/ioctl.h>
 #include <sys/stat.h>
+#include <sys/sysmacros.h>
 #include <sys/time.h>
 #include <sys/types.h>
 #include <time.h>
@@ -267,6 +269,192 @@ static inline void cetrafs_node_row_stamp(cetrafs_node_entry_t *ne)
         crc32c_struct(ne, sizeof(*ne), offsetof(cetrafs_node_entry_t, checksum), sizeof(ne->checksum)));
 }
 
+/*
+ * COMPARE AND WRITE from userspace, for the registry row a repair claims.
+ *
+ * The kernel takes every contested record with one SCSI COMPARE AND
+ * WRITE; the tools used to write their claim, renewals, release and
+ * reaps blind and lean on a settle delay to notice a collision. A
+ * second repairer that read a FREE row, stalled, then wrote, landed on
+ * top of a claim that had already settled and looked -- and both went
+ * on repairing (audit, reviewer's finding on L34). Through SG_IO the
+ * same primitive is available here: the write lands only on the image
+ * it was decided against.
+ *
+ * Used when the device says it has the command (Block Limits VPD,
+ * MAXIMUM COMPARE AND WRITE LENGTH >= 1, as the kernel reads it) and is
+ * a whole disk: on a partition the command's LBA addresses the disk, not
+ * the partition. Otherwise the tools keep the blind write and the settle
+ * -- a device with no CAW can only ever be mounted by one node.
+ *
+ * The CAW covers one logical block, the one holding the row record. On a
+ * 512-byte-sector device the rest of the row block (the displaced row a
+ * borrowing claim keeps at CETRAFS_REPAIR_SAVED_OFF) is written first,
+ * with WRITE(16) on the same path and flushed -- never through the page cache,
+ * whose writeback would write the record's sector back with it.
+ *
+ * Async-signal-safe: static buffers, syscalls only (the renewal runs
+ * from a timer).
+ */
+static int cetrafs_caw_mode = -1; /* -1: not probed, 0: no CAW, 1: CAW */
+static unsigned cetrafs_caw_lbs;
+/* Page-aligned: SG_IO maps a suitably aligned user buffer straight into
+ * the request, and a LIO target's COMPARE AND WRITE wrote garbage from a
+ * buffer that started mid-page (found by tests/kernel/repair_claim_caw.sh;
+ * sg3_utils, page-aligned, did not). */
+static unsigned char cetrafs_caw_buf[2 * CETRAFS_BLOCK_SIZE] __attribute__((aligned(4096)));
+
+/* One SCSI command. Returns 0 GOOD, 1 MISCOMPARE, 2 UNIT ATTENTION,
+ * -1 refused before execution, -2 outcome unknown. */
+static inline int cetrafs_sg_cmd(int fd, unsigned char *cdb, unsigned char cdb_len, int dir, void *buf, unsigned len)
+{
+    unsigned char sense[64];
+    sg_io_hdr_t io;
+    unsigned char key;
+
+    memset(&io, 0, sizeof(io));
+    memset(sense, 0, sizeof(sense));
+    io.interface_id = 'S';
+    io.cmd_len = cdb_len;
+    io.cmdp = cdb;
+    io.dxfer_direction = dir;
+    io.dxferp = buf;
+    io.dxfer_len = len;
+    io.sbp = sense;
+    io.mx_sb_len = sizeof(sense);
+    io.timeout = 30000;
+    if (ioctl(fd, SG_IO, &io) < 0)
+        return -2;
+    if (io.status == 0 && io.host_status == 0 && (io.driver_status & 0x0f) == 0)
+        return 0;
+    if (io.status == 0x18) /* RESERVATION CONFLICT: not executed */
+        return -1;
+    if (io.sb_len_wr < 3)
+        return -2;
+    key = (sense[0] & 0x7f) >= 0x72 ? (sense[1] & 0x0f) : (sense[2] & 0x0f);
+    if (key == 0x0e)
+        return 1;
+    if (key == 0x06)
+        return 2;
+    if (key == 0x05 || key == 0x07) /* ILLEGAL REQUEST, DATA PROTECT */
+        return -1;
+    return -2;
+}
+
+/* On the platter, whatever cache the device has: a claim is what a
+ * mounting node reads. SYNCHRONIZE CACHE rather than FUA, which a
+ * device without FUA support refuses as an invalid CDB field. A device
+ * with no cache to flush may refuse the command too; it has nothing to
+ * flush. */
+static inline int cetrafs_sg_sync_cache(int fd)
+{
+    unsigned char cdb[10] = {0x35, 0, 0, 0, 0, 0, 0, 0, 0, 0};
+    int i, r = -2;
+
+    for (i = 0; i < 3; i++)
+        if ((r = cetrafs_sg_cmd(fd, cdb, sizeof(cdb), SG_DXFER_NONE, NULL, 0)) != 2)
+            break;
+    return r == 0 || r == -1 ? 0 : -1;
+}
+
+static inline int cetrafs_caw_probe(int fd)
+{
+    struct stat st;
+    char path[96];
+    unsigned char cdb[6] = {0x12, 0x01, 0xb0, 0, 64, 0}, vpd[64];
+    int lbs = 0;
+
+    if (cetrafs_caw_mode >= 0)
+        return cetrafs_caw_mode;
+    cetrafs_caw_mode = 0;
+    if (getenv("CETRAFS_TEST_TOOLS_NO_CAW")) /* the fallback, for its own suites */
+        return 0;
+    if (fstat(fd, &st) != 0 || !S_ISBLK(st.st_mode))
+        return 0;
+    snprintf(path, sizeof(path), "/sys/dev/block/%u:%u/partition", major(st.st_rdev), minor(st.st_rdev));
+    if (access(path, F_OK) == 0)
+        return 0; /* the command addresses the whole disk */
+    if (ioctl(fd, BLKSSZGET, &lbs) != 0 || lbs < 512 || (unsigned) lbs > CETRAFS_BLOCK_SIZE)
+        return 0;
+    memset(vpd, 0, sizeof(vpd));
+    if (cetrafs_sg_cmd(fd, cdb, sizeof(cdb), SG_DXFER_FROM_DEV, vpd, sizeof(vpd)) != 0)
+        return 0;
+    if (vpd[1] != 0xb0 || vpd[5] < 1)
+        return 0;
+    cetrafs_caw_lbs = (unsigned) lbs;
+    cetrafs_caw_mode = 1;
+    return 1;
+}
+
+static inline void cetrafs_row_drop_cache(int fd, const cetrafs_superblock_t *sb, uint32_t idx)
+{
+    posix_fadvise(fd, cetrafs_node_row_off(sb, idx), CETRAFS_BLOCK_SIZE, POSIX_FADV_DONTNEED);
+}
+
+/*
+ * Swap the row block's first logical block from old_blk to new_blk (both
+ * whole row blocks; only the first lbs bytes are compared). The tail of
+ * new_blk is written first when the row spans several logical blocks.
+ * Returns 0 landed, 1 the row was not old_blk (nothing written to the
+ * record), -1 failed (and, when unknown, read back: not landed).
+ */
+static inline int cetrafs_row_caw(int fd, const cetrafs_superblock_t *sb, uint32_t idx, const unsigned char *old_blk,
+                                  const unsigned char *new_blk)
+{
+    unsigned lbs = cetrafs_caw_lbs;
+    uint64_t lba = (uint64_t) cetrafs_node_row_off(sb, idx) / lbs;
+    unsigned char cdb[16];
+    int i, r = -2;
+
+    if (lbs < CETRAFS_BLOCK_SIZE) {
+        unsigned n = CETRAFS_BLOCK_SIZE / lbs - 1;
+
+        memset(cdb, 0, sizeof(cdb));
+        cdb[0] = 0x8a; /* WRITE(16); no FUA -- not every device takes it (see below) */
+        for (i = 0; i < 8; i++)
+            cdb[2 + i] = (unsigned char) ((lba + 1) >> (56 - 8 * i));
+        cdb[10] = (unsigned char) (n >> 24);
+        cdb[11] = (unsigned char) (n >> 16);
+        cdb[12] = (unsigned char) (n >> 8);
+        cdb[13] = (unsigned char) n;
+        memcpy(cetrafs_caw_buf, new_blk + lbs, CETRAFS_BLOCK_SIZE - lbs);
+        for (i = 0; i < 3; i++)
+            if ((r = cetrafs_sg_cmd(fd, cdb, sizeof(cdb), SG_DXFER_TO_DEV, cetrafs_caw_buf,
+                                    CETRAFS_BLOCK_SIZE - lbs)) != 2)
+                break;
+        /* Durable before the record that makes it meaningful: a reaper
+         * restores the registration from here. */
+        if (r != 0 || cetrafs_sg_sync_cache(fd) != 0)
+            return -1;
+    }
+    memset(cdb, 0, sizeof(cdb));
+    cdb[0] = 0x89; /* COMPARE AND WRITE */
+    for (i = 0; i < 8; i++)
+        cdb[2 + i] = (unsigned char) (lba >> (56 - 8 * i));
+    cdb[13] = 1;
+    memcpy(cetrafs_caw_buf, old_blk, lbs);
+    memcpy(cetrafs_caw_buf + lbs, new_blk, lbs);
+    /* UNIT ATTENTION: not processed (SAM), the same swap again. */
+    for (i = 0; i < 3; i++)
+        if ((r = cetrafs_sg_cmd(fd, cdb, sizeof(cdb), SG_DXFER_TO_DEV, cetrafs_caw_buf, 2 * lbs)) != 2)
+            break;
+    cetrafs_row_drop_cache(fd, sb, idx);
+    if (r == 0)
+        return cetrafs_sg_sync_cache(fd) == 0 ? 0 : -1;
+    if (r == 1)
+        return r;
+    if (r == -2) {
+        /* Nothing says it did not execute: the device decides. */
+        unsigned char rb[CETRAFS_BLOCK_SIZE];
+
+        if (pread(fd, rb, sizeof(rb), cetrafs_node_row_off(sb, idx)) == (ssize_t) sizeof(rb) &&
+            !memcmp(rb, new_blk, lbs))
+            return 0;
+    }
+    return -1;
+}
+
+
 /* CETRAFS_PEER_PROBE_SECS is a test knob only (see below). */
 static inline unsigned cetrafs_peer_probe_secs(void);
 
@@ -321,7 +509,19 @@ static inline void cetrafs_repair_reap(int fd, const cetrafs_superblock_t *sb, u
     memset(out, 0, sizeof(out));
     if (cetrafs_le32(saved.state) == CETRAFS_NODE_STATE_REGISTERED && cetrafs_node_row_crc_ok(&saved))
         memcpy(out, &saved, sizeof(saved));
-    if (pwrite(fd, out, sizeof(out), cetrafs_node_row_off(sb, idx)) != (ssize_t) sizeof(out) || fsync(fd) != 0) {
+    if (cetrafs_caw_probe(fd)) {
+        /* Only over the claim as judged: one that renewed since, or was
+         * reaped by someone else, miscompares and is left alone. */
+        int r = cetrafs_row_caw(fd, sb, idx, blk, out);
+
+        if (r == 1)
+            return;
+        if (r != 0) {
+            fprintf(stderr, "WARN: registry row %u: the dead repair claim could not be reaped\n", idx);
+            return;
+        }
+    } else if (pwrite(fd, out, sizeof(out), cetrafs_node_row_off(sb, idx)) != (ssize_t) sizeof(out) ||
+               fsync(fd) != 0) {
         fprintf(stderr, "WARN: registry row %u: the dead repair claim could not be reaped\n", idx);
         return;
     }
@@ -590,8 +790,8 @@ static inline int cetrafs_node_table_placed_ok(int fd, const cetrafs_superblock_
 static inline int cetrafs_repair_claim(int fd, const cetrafs_superblock_t *sb, const char *label)
 {
     uint32_t count = cetrafs_le32(sb->node_table_count), idx, slowest = 0;
-    unsigned char *seen = NULL;
-    int pass;
+    unsigned char *seen = NULL, cur[CETRAFS_BLOCK_SIZE];
+    int pass, caw;
 
     if (!count || count > 4096)
         return -1;
@@ -606,6 +806,7 @@ static inline int cetrafs_repair_claim(int fd, const cetrafs_superblock_t *sb, c
     if (getenv("CETRAFS_TEST_REPAIR_CLAIM_DELAY_SECS"))
         cetrafs_sleep_full((unsigned) atoi(getenv("CETRAFS_TEST_REPAIR_CLAIM_DELAY_SECS")));
     posix_fadvise(fd, 0, 0, POSIX_FADV_DONTNEED); /* the rows as the device has them, not our cache */
+    caw = cetrafs_caw_probe(fd);
 
     /*
      * Pass 0 takes a free row; pass 1 borrows a cleanly departed one
@@ -672,6 +873,7 @@ static inline int cetrafs_repair_claim(int fd, const cetrafs_superblock_t *sb, c
             }
             free(seen);
             seen = NULL;
+            memcpy(cur, blk, sizeof(cur)); /* the image this claim is decided against */
 
             memset(&ne, 0, sizeof(ne));
             ne.state = cetrafs_cpu_to_le32(CETRAFS_NODE_STATE_REPAIR);
@@ -690,15 +892,36 @@ static inline int cetrafs_repair_claim(int fd, const cetrafs_superblock_t *sb, c
              * registration back from here (CETRAFS_REPAIR_SAVED_OFF). */
             if (cetrafs_repair_borrowed)
                 memcpy(blk + CETRAFS_REPAIR_SAVED_OFF, cetrafs_repair_saved, sizeof(cetrafs_node_entry_t));
-            if (pwrite(fd, blk, sizeof(blk), cetrafs_node_row_off(sb, idx)) != (ssize_t) sizeof(blk))
-                return -1;
-            /* On the platter before the first structural write, or the
-             * claim does not exist as far as a mounting node is concerned. */
-            if (fsync(fd) != 0)
-                return -1;
+            /* Test hook only: hold between the row read above and the
+             * claim, so a suite can land another claim in between
+             * (tests/kernel/repair_claim_caw.sh). */
+            if (getenv("CETRAFS_TEST_REPAIR_CLAIM_GAP_SECS"))
+                cetrafs_sleep_full((unsigned) atoi(getenv("CETRAFS_TEST_REPAIR_CLAIM_GAP_SECS")));
+            if (caw) {
+                /* Lands only on the row as read: a claim that got there
+                 * first makes this one miscompare, and that is another
+                 * repairer -- the caller stops. Flushed: on the platter. */
+                int r = cetrafs_row_caw(fd, sb, idx, cur, blk);
+
+                if (r == 1) {
+                    cetrafs_repair_borrowed = 0;
+                    return -2;
+                }
+                if (r != 0)
+                    return -1;
+            } else {
+                if (pwrite(fd, blk, sizeof(blk), cetrafs_node_row_off(sb, idx)) != (ssize_t) sizeof(blk))
+                    return -1;
+                /* On the platter before the first structural write, or the
+                 * claim does not exist as far as a mounting node is concerned. */
+                if (fsync(fd) != 0)
+                    return -1;
+            }
+            printf("  registry claim written by %s\n", caw ? "COMPARE AND WRITE" : "a plain write (no CAW on this device)");
+            fflush(stdout);
             cetrafs_repair_timer(fd, sb, idx, 1); /* renewals from here until the release */
-            /* The claim is a blind write (the tools have no COMPARE AND
-             * WRITE), so two repairers starting together could each
+            /* Without CAW the claim is a blind write, so two repairers
+             * starting together could each
              * find the volume unclaimed and each claim it -- the same
              * row, the last write winning, or two rows -- and repair it
              * at once (audit L34). Settle, then look again past our
@@ -711,7 +934,11 @@ static inline int cetrafs_repair_claim(int fd, const cetrafs_superblock_t *sb, c
             {
                 uint32_t other;
 
-                cetrafs_sleep_full(cetrafs_repair_settle_secs());
+                /* With CAW a claim is on the device when it returns: a
+                 * concurrent one landed either before ours (seen now) or
+                 * after (sees ours). No settle to wait out. */
+                if (!caw)
+                    cetrafs_sleep_full(cetrafs_repair_settle_secs());
                 posix_fadvise(fd, 0, 0, POSIX_FADV_DONTNEED);
                 if (!cetrafs_repair_row_is_ours(fd, sb, idx)) {
                     cetrafs_repair_timer(fd, sb, idx, 0);
@@ -766,6 +993,15 @@ static inline int cetrafs_repair_renew(int fd, const cetrafs_superblock_t *sb, u
     ne.last_seen = cetrafs_cpu_to_le64((uint64_t) time(NULL));
     ne.hb_seq = cetrafs_cpu_to_le64(cetrafs_le64(ne.hb_seq) + 1);
     cetrafs_node_row_stamp(&ne);
+    if (cetrafs_caw_mode == 1) {
+        /* Over the claim as we hold it: a row taken since miscompares
+         * instead of being written back over. */
+        static unsigned char nb[CETRAFS_BLOCK_SIZE];
+
+        memcpy(nb, blk, sizeof(nb));
+        memcpy(nb, &ne, sizeof(ne));
+        return cetrafs_row_caw(fd, sb, row, blk, nb) == 0 ? 0 : -1;
+    }
     memcpy(blk, &ne, sizeof(ne));
     if (pwrite(fd, blk, sizeof(blk), cetrafs_node_row_off(sb, row)) != (ssize_t) sizeof(blk))
         return -1;
@@ -919,8 +1155,13 @@ static inline void cetrafs_repair_release(int fd, const cetrafs_superblock_t *sb
 {
     unsigned char blk[CETRAFS_BLOCK_SIZE];
 
+    unsigned char cur[CETRAFS_BLOCK_SIZE];
+
     cetrafs_repair_timer(fd, sb, row, 0); /* no renewal may land after the release */
-    if (!cetrafs_repair_row_is_ours(fd, sb, row)) {
+    if (cetrafs_caw_mode == 1)
+        cetrafs_row_drop_cache(fd, sb, row);
+    if (!cetrafs_repair_row_is_ours(fd, sb, row) ||
+        pread(fd, cur, sizeof(cur), cetrafs_node_row_off(sb, row)) != (ssize_t) sizeof(cur)) {
         cetrafs_repair_borrowed = 0;
         return; /* another repairer's claim now: not ours to give back */
     }
@@ -929,6 +1170,10 @@ static inline void cetrafs_repair_release(int fd, const cetrafs_superblock_t *sb
         cetrafs_repair_borrowed = 0;
     } else {
         memset(blk, 0, sizeof(blk)); /* all-zero is CETRAFS_NODE_STATE_FREE */
+    }
+    if (cetrafs_caw_mode == 1) {
+        (void) cetrafs_row_caw(fd, sb, row, cur, blk); /* only over our own claim */
+        return;
     }
     if (pwrite(fd, blk, sizeof(blk), cetrafs_node_row_off(sb, row)) == (ssize_t) sizeof(blk))
         (void) fsync(fd);
