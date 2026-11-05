@@ -2151,6 +2151,23 @@ MODULE_PARM_DESC(lock_clear_fail_once, "TEST ONLY: the next last-writer close's 
  * until something on this node opened and closed the file again. The
  * caller queues it for the heartbeat instead.
  */
+/*
+ * This node stops being a suspended WRITER of the file: clear its mark in
+ * suspended_writer_nodes. The presence withdraw clears the mark too, but
+ * only together with the presence bit -- and a local reader keeps the
+ * bit. A clear that failed used to be dropped with (void): the mark then
+ * outlived the writer, and the access rule's masks read this node as a
+ * writer handing over rather than a reader -- a peer's write-open passed
+ * this node's live reader, and a peer's read-open was refused, for as
+ * long as the local opener lived (audit R20). Queued for the heartbeat's
+ * presence retry instead (cetrafs_lock_retry_presence()).
+ */
+static void cetrafs_lock_drop_suspend_mark(struct inode *inode)
+{
+    if (cetrafs_lock_suspend_mark(inode, false))
+        cetrafs_sb_presence_defer(inode->i_sb, inode->i_ino, cetrafs_inode_get_generation(inode));
+}
+
 static int cetrafs_lock_publish_and_clear(struct inode *inode, cetrafs_inode_t *raw, bool may_clear,
                                           bool *lock_cleared)
 {
@@ -2427,7 +2444,7 @@ int cetrafs_lock_release(struct inode *inode, struct file *file)
         if (was_suspended) {
             /* Not writing any more: drop the writer mark even if a local
              * reader keeps the presence bit. */
-            (void) cetrafs_lock_suspend_mark(inode, false);
+            cetrafs_lock_drop_suspend_mark(inode);
             cetrafs_lock_presence_put(inode);
             ci->lock_suspended = false;
         }
@@ -3209,6 +3226,12 @@ static int cetrafs_lock_presence_get(struct inode *inode)
  * a reader by it: the destination may claim past the first, never past
  * the second. Caller holds lock_mutex; the presence bit is already set.
  */
+/* TEST ONLY, one-shot: the next clear of this node's suspended-writer
+ * mark fails (tests/kernel/suspend_mark_retry.sh). */
+static bool cetrafs_suspend_unmark_fail_once;
+module_param_named(suspend_unmark_fail_once, cetrafs_suspend_unmark_fail_once, bool, 0644);
+MODULE_PARM_DESC(suspend_unmark_fail_once, "TEST ONLY: fail the next clear of the suspended-writer mark");
+
 static int cetrafs_lock_suspend_mark(struct inode *inode, bool set)
 {
     struct super_block *sb = inode->i_sb;
@@ -3216,6 +3239,10 @@ static int cetrafs_lock_suspend_mark(struct inode *inode, bool set)
     u32 my_node_id;
     int ret;
 
+    if (!set && cetrafs_suspend_unmark_fail_once) {
+        cetrafs_suspend_unmark_fail_once = false;
+        return -EIO;
+    }
     ret = cetrafs_sb_get_node_id(sb, &my_node_id);
     if (!ret)
         ret = cetrafs_read_raw_inode(sb, inode->i_ino, &raw);
@@ -3293,6 +3320,11 @@ void cetrafs_lock_retry_presence(struct super_block *sb)
         mutex_lock(&ci->lock_mutex);
         if (atomic_read(&ci->read_opener_count) == 0)
             cetrafs_lock_presence_withdraw(inode); /* re-queues itself on failure */
+        else if (!READ_ONCE(ci->lock_suspended) && cetrafs_lock_suspend_mark(inode, false))
+            /* A local reader keeps the bit, so the withdraw is not what
+             * clears the writer mark: a suspend or resume whose own clear
+             * failed queued it here (cetrafs_lock_drop_suspend_mark()). */
+            cetrafs_sb_presence_defer(sb, pend[i].ino, pend[i].generation);
         mutex_unlock(&ci->lock_mutex);
         iput(inode);
     }
@@ -3543,7 +3575,7 @@ static int cetrafs_lock_suspend(struct inode *inode, struct file *file)
          * report, rather than leaving the record saying EXCLUSIVE while
          * we believe we surrendered it. */
         if (!cetrafs_lock_suspend_skip_publish) {
-            (void) cetrafs_lock_suspend_mark(inode, false);
+            cetrafs_lock_drop_suspend_mark(inode);
             cetrafs_lock_presence_put(inode);
         }
         goto out_unlock;
@@ -3771,7 +3803,7 @@ static int cetrafs_lock_resume(struct inode *inode)
      * writer mark goes explicitly: presence_put clears it only with the
      * bit, and a local reader may be keeping the bit. */
     if (!cetrafs_lock_suspend_skip_publish) {
-        (void) cetrafs_lock_suspend_mark(inode, false);
+        cetrafs_lock_drop_suspend_mark(inode);
         cetrafs_lock_presence_put(inode);
     }
     ci->lock_suspended = false;
