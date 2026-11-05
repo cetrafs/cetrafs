@@ -1834,14 +1834,23 @@ static void cetrafs_ns_report(const char *op, struct inode *dir, const struct qs
                         name ? (const char *) name->name : "", (unsigned long long) dir->i_ino, ret);
 }
 
+/* TEST ONLY: stall a create between the VFS's lookup and the namespace
+ * lock, so a suite can land a "peer's" name there. */
+static unsigned int cetrafs_create_prelock_stall_ms;
+cetrafs_test_param(create_prelock_stall_ms, cetrafs_create_prelock_stall_ms, uint, 0644);
+MODULE_PARM_DESC(create_prelock_stall_ms, "TEST ONLY: widen the window between a create's lookup and its namespace lock");
+
 static int cetrafs_create(struct mnt_idmap *idmap, struct inode *dir, struct dentry *dentry, umode_t mode, bool excl)
 {
     /* Only the parent: the child's record is freshly allocated, and its
      * inode-bitmap bit was claimed by an atomic CAS, so no other node
      * can be looking at it yet. */
     struct inode *set[] = {dir};
-    int ret = cetrafs_nslock_acquire_set(set, ARRAY_SIZE(set));
+    int ret;
 
+    if (cetrafs_create_prelock_stall_ms)
+        msleep(cetrafs_create_prelock_stall_ms);
+    ret = cetrafs_nslock_acquire_set(set, ARRAY_SIZE(set));
     if (ret) {
         cetrafs_ns_report("create (lock)", dir, &dentry->d_name, ret);
         return ret;
@@ -1851,6 +1860,22 @@ static int cetrafs_create(struct mnt_idmap *idmap, struct inode *dir, struct den
     cetrafs_ns_report("create", dir, &dentry->d_name, ret);
 
     cetrafs_nslock_release_set(set, ARRAY_SIZE(set));
+
+    /*
+     * The VFS looked the name up negative before this call reached the
+     * namespace lock, and a peer may have created it in between. For
+     * O_EXCL (and mknod) EEXIST is the answer. For a plain O_CREAT it
+     * is not one open(2) may give: the file exists, so the open should
+     * open it -- the lesson rename learned (see cetrafs_rename()), here
+     * for create (audit 2026-11-05, N4). -ESTALE makes do_filp_open()
+     * walk again with LOOKUP_REVAL; our negative dentry never survives
+     * d_revalidate, so that walk looks the name up fresh, finds the
+     * peer's file and opens it with the ordinary permission checks and
+     * O_TRUNC. A second lost race in a row returns ESTALE.
+     * tests/kernel/create_race_opens_peer_file.sh.
+     */
+    if (ret == -EEXIST && !excl)
+        ret = -ESTALE;
     return ret;
 }
 

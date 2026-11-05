@@ -1,11 +1,12 @@
 // SPDX-License-Identifier: GPL-2.0-or-later
 /*
- * dir_move_poke -- test-only helper: move a DIRECTORY from one parent to
- * another directly on a cetrafs image, the way a PEER node's completed
- * rename leaves the device: the name leaves the old parent's dirent
- * block and appears in the new parent's, the child's '..' is rewritten,
- * both parents' link counts and sizes move, and every directory touched
- * gets a new dirent_seq -- all with valid checksums.
+ * dir_move_poke -- test-only helper: move a directory or a regular file
+ * from one parent to another directly on a cetrafs image, the way a PEER
+ * node's completed rename leaves the device: the name leaves the old
+ * parent's dirent block and appears in the new parent's; for a directory
+ * the child's '..' is rewritten and both parents' link counts move; both
+ * parents' sizes move and every directory touched gets a new dirent_seq
+ * -- all with valid checksums.
  *
  * A live mount on this host does not see it in its caches until its own
  * forced-fresh reads (the dirent_seq gate) look, which is exactly what a
@@ -103,6 +104,7 @@ int main(int argc, char **argv)
     size_t nlen;
     cetrafs_dirent_t *de = (cetrafs_dirent_t *) blk;
     unsigned int e;
+    uint8_t ftype = 0;
 
     if (argc != 5) {
         fprintf(stderr, "usage: %s <image> <from_dir_ino> <name> <to_dir_ino>\n", argv[0]);
@@ -124,10 +126,11 @@ int main(int argc, char **argv)
     rd(blk, sizeof(blk), (off_t) b * CETRAFS_BLOCK_SIZE);
     for (e = 0; e < CETRAFS_DIRENTS_PER_BLOCK; e++)
         if (cetrafs_le64(de[e].inode) && cetrafs_le16(de[e].name_len) == nlen && !memcmp(de[e].name, name, nlen)) {
-            if (de[e].file_type != CETRAFS_FT_DIR) {
-                fprintf(stderr, "'%s' is not a directory\n", name);
+            if (de[e].file_type != CETRAFS_FT_DIR && de[e].file_type != CETRAFS_FT_REG) {
+                fprintf(stderr, "'%s' is neither a directory nor a regular file\n", name);
                 return 2;
             }
+            ftype = de[e].file_type;
             child = cetrafs_le64(de[e].inode);
             memset(&de[e], 0, sizeof(de[e]));
             break;
@@ -152,10 +155,18 @@ int main(int argc, char **argv)
     memset(&de[e], 0, sizeof(de[e]));
     de[e].inode = cetrafs_cpu_to_le64(child);
     de[e].name_len = cetrafs_cpu_to_le16((uint16_t) nlen);
-    de[e].file_type = CETRAFS_FT_DIR;
+    de[e].file_type = ftype;
     memcpy(de[e].name, name, nlen);
     blk_stamp(blk);
     wr(blk, sizeof(blk), (off_t) b * CETRAFS_BLOCK_SIZE);
+
+    if (ftype != CETRAFS_FT_DIR) { /* a file: no '..', no link counts */
+        dir_touch(from, 0, -(int64_t) sizeof(cetrafs_dirent_t));
+        dir_touch(to, 0, (int64_t) sizeof(cetrafs_dirent_t));
+        fsync(fd);
+        printf("%" PRIu64 "\n", child);
+        return 0;
+    }
 
     /* 3. The child's '..'. */
     b = dir_block(child);
