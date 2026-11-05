@@ -2323,6 +2323,20 @@ static int cetrafs_dir_nondot_visit(void *priv, const cetrafs_dirent_t *de, loff
  * cetrafs_dir_remove_entry()), then free its data block(s) and inode bit --
  * directories can't be hardlinked, so this is always a free, unlike unlink().
  */
+/* TEST ONLY: fail rmdir's next read of the victim's record, as a device
+ * error would (tests/kernel/rmdir_read_error.sh). */
+static bool cetrafs_rmdir_victim_read_fail;
+cetrafs_test_param(rmdir_victim_read_fail, cetrafs_rmdir_victim_read_fail, bool, 0644);
+MODULE_PARM_DESC(rmdir_victim_read_fail, "TEST ONLY: fail rmdir's next read of the victim's record with -EIO");
+
+static int cetrafs_rmdir_read_victim(struct super_block *sb, u64 ino, cetrafs_inode_t *raw)
+{
+    if (READ_ONCE(cetrafs_rmdir_victim_read_fail) && xchg(&cetrafs_rmdir_victim_read_fail, false))
+        return -EIO; /* test-only; see the parameter */
+    cetrafs_invalidate_raw_inode(sb, ino);
+    return cetrafs_read_raw_inode(sb, ino, raw);
+}
+
 static int cetrafs_rmdir_locked(struct inode *dir, struct dentry *dentry)
 {
     struct inode *inode = d_inode(dentry);
@@ -2349,14 +2363,22 @@ static int cetrafs_rmdir_locked(struct inode *dir, struct dentry *dentry)
         return -ENOTEMPTY;
 
 
-    ret = cetrafs_dir_remove_entry(dir, &dentry->d_name, &ino, &file_type);
+    /* The victim's record BEFORE its name goes: read after, a read
+     * error returned EIO with the directory already unnamed -- gone
+     * from the namespace, nlink still 2, reachable by nobody (audit
+     * L4). The name was verified to resolve to this inode above. */
+    ret = cetrafs_rmdir_read_victim(dir->i_sb, inode->i_ino, &raw);
     if (ret)
         return ret;
 
-    cetrafs_invalidate_raw_inode(dir->i_sb, ino);
-    ret = cetrafs_read_raw_inode(dir->i_sb, ino, &raw);
+    ret = cetrafs_dir_remove_entry(dir, &dentry->d_name, &ino, &file_type);
     if (ret)
         return ret;
+    if (ino != inode->i_ino) {
+        ret = cetrafs_rmdir_read_victim(dir->i_sb, ino, &raw);
+        if (ret)
+            return ret;
+    }
 
     /* Persist nlink=0 but never free blocks/the inode number here -- see
      * super_ops.c's cetrafs_evict_inode() for why that's deferred to
