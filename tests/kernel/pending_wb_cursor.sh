@@ -1,23 +1,30 @@
 #!/usr/bin/env bash
 # SPDX-License-Identifier: GPL-2.0-or-later
-# an old, unseen writeback error does not cost a later buffered write its data
+# a buffered write into preallocated space is judged by its own writeback, not another's
 #
 # Buffered writes into preallocated space stay "reads as zeros" until
-# fsync/close converts them, and a writeback error since the pending set
-# began drops the whole set (its blocks keep reading as zeros; the error
-# is reported). "Since" was sampled with errseq_sample(), which returns 0
-# while an earlier error is still UNSEEN -- so an old error on another
-# block of the file, one nobody had fsync'd yet, read as this set's, and
-# a write that reached the device was thrown away (audit F8).
+# fsync/close converts them; a writeback error since the pending set
+# began drops the set (its blocks keep reading as zeros; the error is
+# reported). "Since" has two wrong answers, one each way:
+#  - errseq_sample() is 0 while an older error on the file is UNSEEN,
+#    so that old error read as the set's own and good data was dropped
+#    (audit F8);
+#  - the raw value: errseq_set() moves the counter only after the old
+#    error was seen, so the set's own failure with the same errno left
+#    the value unchanged, read as clean, and the set was CONVERTED over
+#    blocks whose data never landed -- they read back whatever the
+#    device held (audit F11).
+# The set now consumes the unseen state into its cursor at its start.
 #
-# Staged on a dm device: block 0 written and its writeback failed (no
-# fsync, so the error stays unseen); the device healed; then a buffered
-# write into a preallocated block and an fsync. That block must read
-# back as written.
+# Each case on a fresh file, with an unseen EIO on its block 0 first
+# (a writeback started and never waited on):
+#  A:  the device heals, then the set's write lands: it must read back.
+#  A2: the device still fails the set's block too: it must read as
+#      zeros, not as the 'S' planted under it.
+#  B:  no older error; the set's own write fails: zeros, not 'S'.
 #
-# DISCRIMINATION: the setup check requires the writeback of block 0 to
-# have failed. The reverted-fix control (errseq_sample() restored in
-# cetrafs_pending_add()) has not been run.
+# DISCRIMINATION: A fails with errseq_sample() as the cursor (block
+# dropped); A2 fails with the raw value as the cursor (the 'S' is read).
 set -euo pipefail
 . "$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)/lib/harness.sh"
 require_root
@@ -36,101 +43,110 @@ ct_mount "$DEV" "$MNT"
 require_cetrafs_mount "$MNT"
 ct_param_set auto_defrag 0
 
-dd if=/dev/urandom of="$MNT/f" bs=4096 count=1 conv=fsync status=none
-fallocate -o $((16 * 4096)) -l $((16 * 4096)) "$MNT/f"
-sync
-P0="$(filefrag -v -b4096 "$MNT/f" | awk -F: '$1 ~ /^ *0$/ { split($3, a, "[.]+"); print a[1] + 0 }')"
-[ -n "$P0" ] && [ "$P0" -gt 0 ] || { fail "setup: no physical block for block 0"; ct_exit; }
-X=$((P0 * 8))
-log "block 0 is at fs block $P0 (sector $X)"
-
 dm_set() {
     dmsetup suspend --noflush --nolockfs "$NAME"
     dmsetup load "$NAME" --table "$1"
     dmsetup resume "$NAME"
 }
-OUT="$(ct_tmp pwbc-out)"
-GO="$(ct_tmp pwbc-go)"; rm -f "$GO"
-READY="$(ct_tmp pwbc-ready)"; rm -f "$READY"
-ct_track file "$GO.2"; ct_track file "$READY.2"
-python3 - "$MNT/f" "$GO" "$READY" >"$OUT" 2>&1 <<'PY' &
+heal() { dm_set "0 $SECTORS linear $LOOP 0"; }
+# fail_blocks <fs block>...: writes to those 4 KiB blocks fail.
+fail_blocks() {
+    local t="" at=0 b x
+    for b in $(printf '%s\n' "$@" | sort -n); do
+        x=$((b * 8))
+        [ "$x" -gt "$at" ] && t="$t$at $((x - at)) linear $LOOP $at
+"
+        t="$t$x 8 flakey $LOOP $x 0 3600 1 error_writes
+"
+        at=$((x + 8))
+    done
+    t="$t$at $((SECTORS - at)) linear $LOOP $at"
+    dm_set "$t"
+}
+phys() { filefrag -v -b4096 "$1" | awk -F: -v l="$2" '$1 ~ /^ *[0-9]+$/ { split($2, a, "[.]+"); split($3, p, "[.]+"); if (l >= a[1] && l <= a[2]) print p[1] + l - a[1] }'; }
+
+# run_case <name> <old error: 0|1> <set fails: 0|1>: prints what block 16 reads as.
+run_case() {
+    local f="$MNT/$1" p0 p16 out go ready
+    if [ "$2" = 1 ]; then dd if=/dev/urandom of="$f" bs=4096 count=1 conv=fsync status=none; fi
+    fallocate -o $((16 * 4096)) -l 4096 "$f"
+    sync
+    p16="$(phys "$f" 16)"
+    [ -n "$p16" ] || { echo "SETUP no physical block for block 16"; return; }
+    head -c 4096 /dev/zero | tr '\0' S | dd of="$DEV" bs=4096 seek="$p16" count=1 conv=fsync status=none
+    p0=""
+    [ "$2" = 1 ] && p0="$(phys "$f" 0)"
+    out="$(ct_tmp pwbc-out)"; go="$(ct_tmp pwbc-go)"; ready="$(ct_tmp pwbc-ready)"
+    rm -f "$go" "$ready"
+    python3 - "$f" "$go" "$ready" "$2" >"$out" 2>&1 <<'PY' &
 import ctypes, os, sys, time
 libc = ctypes.CDLL(None, use_errno=True)
-f, go, ready = sys.argv[1:4]
+f, go, ready, old = sys.argv[1], sys.argv[2], sys.argv[3], sys.argv[4] == "1"
+def wait(p):
+    while not os.path.exists(p):
+        time.sleep(0.05)
 fd = os.open(f, os.O_RDWR)
-os.pwrite(fd, b"N" * 4096, 0)                      # block 0, overwrite
-open(ready, "w").close()
-while not os.path.exists(go):
-    time.sleep(0.05)
-# Write block 0 back while the device fails it; no fsync: the error
-# stays unseen in the mapping's cursor.
-# sync_file_range(WRITE) = 2: start the writeback and do NOT wait --
-# waiting (or fsync) reports the error and marks it seen, and an error
-# seen is exactly the case the old sampling already handled.
-r = libc.sync_file_range(fd, ctypes.c_longlong(0), ctypes.c_longlong(4096), 2)
-time.sleep(2)
-print("SFR", "ok" if r == 0 else ctypes.get_errno(), flush=True)
-open(ready + ".2", "w").close()
-while not os.path.exists(go + ".2"):
-    time.sleep(0.05)
-os.pwrite(fd, b"P" * 4096, 16 * 4096)              # into preallocated space
+if old:
+    os.pwrite(fd, b"N" * 4096, 0)
+open(ready, "w").close(); wait(go)
+if old:
+    # sync_file_range(WRITE) = 2: start it, never wait -- the error
+    # stays UNSEEN (a wait or an fsync would report and mark it).
+    libc.sync_file_range(fd, ctypes.c_longlong(0), ctypes.c_longlong(4096), 2)
+    time.sleep(2)
+open(ready + "1", "w").close(); wait(go + "1")
+os.pwrite(fd, b"P" * 4096, 16 * 4096)          # the set begins here
 try:
-    os.fsync(fd)
-    print("FSYNC ok")
+    os.fsync(fd); print("FSYNC ok")
 except OSError as e:
     print("FSYNC", e.errno)
-os.close(fd)
-PY
-PY_PID=$!
-wait_for 10 '[ -e "$READY" ]' || { fail "setup: the writer never started"; ct_exit; }
-dm_set "0 $X linear $LOOP 0
-$X 8 flakey $LOOP $X 0 3600 1 error_writes
-$((X + 8)) $((SECTORS - X - 8)) linear $LOOP $((X + 8))"
-touch "$GO"
-wait_for 20 '[ -e "$READY.2" ]' || { fail "setup: the writeback of block 0 never returned: $(cat "$OUT")"; ct_exit; }
-dm_set "0 $SECTORS linear $LOOP 0"
-touch "$GO.2"
-wait "$PY_PID" || true
-log "writer: $(tr '\n' ';' <"$OUT")"
-# The old error must have stayed unseen until the fsync, which then
-# reports it: an fsync that says ok means it was seen (or never there).
-grep -q "^FSYNC 5" "$OUT" ||
-    { fail "setup: the fsync did not report block 0's failed writeback ($(tr '\n' ' ' <"$OUT")) -- nothing was unseen"; ct_exit; }
-
-echo 3 >/proc/sys/vm/drop_caches
-B16="$(dd if="$MNT/f" bs=4096 skip=16 count=1 status=none | tr -d 'P' | wc -c)"
-[ "$B16" = 0 ] && pass "the buffered write into preallocated space survived an older unseen error" ||
-    fail "the block written after the old error reads back wrong ($B16 bytes not 'P') -- dropped as if the error were its own"
-
-# B: the set's OWN write fails. Nothing in the set may be converted: the
-# block keeps reading as zeros -- not as whatever the device held under
-# it, which is planted as 'S' so a wrong conversion shows.
-fallocate -o $((64 * 4096)) -l 4096 "$MNT/g"
-sync
-P64="$(filefrag -v -b4096 "$MNT/g" | awk -F: '$1 ~ /^ *0$/ { split($3, a, "[.]+"); print a[1] + 0 }')"
-[ -n "$P64" ] && [ "$P64" -gt 0 ] || { fail "setup: no physical block for g's preallocated block"; ct_exit; }
-head -c 4096 /dev/zero | tr '\0' S | dd of="$DEV" bs=4096 seek="$P64" count=1 conv=fsync status=none 2>/dev/null
-Y=$((P64 * 8))
-dm_set "0 $Y linear $LOOP 0
-$Y 8 flakey $LOOP $Y 0 3600 1 error_writes
-$((Y + 8)) $((SECTORS - Y - 8)) linear $LOOP $((Y + 8))"
-RCB="$(python3 -c 'import os,sys
-fd = os.open(sys.argv[1], os.O_RDWR)
-os.pwrite(fd, b"Q" * 4096, 64 * 4096)
-try:
-    os.fsync(fd); print("ok")
-except OSError as e:
-    print(e.errno)
+# The device heals before close converts: dm-flakey fails the empty
+# FLUSH bio too, and a failed cache flush drops the set by itself --
+# which would decide the case instead of the cursor.
+open(ready + "2", "w").close(); wait(go + "2")
 try:
     os.close(fd)
 except OSError:
-    pass' "$MNT/g")"
-dm_set "0 $SECTORS linear $LOOP 0"
-echo 3 >/proc/sys/vm/drop_caches
-G="$(dd if="$MNT/g" bs=4096 skip=64 count=1 status=none | tr -d '\0' | head -c 8)"
-log "B: fsync=$RCB; the block reads '${G:-<zeros>}'"
-[ "$RCB" = 5 ] || { fail "setup: the set's own write did not fail (fsync $RCB)"; ct_exit; }
-[ -z "$G" ] && pass "B: a set whose own write failed is not converted -- the block reads as zeros" ||
-    fail "B: a set whose own write failed was converted: the block reads '$G'"
+    pass
+PY
+    local py=$!
+    ct_track file "$go"1; ct_track file "$ready"1; ct_track file "$go"2; ct_track file "$ready"2
+    wait_for 10 '[ -e "$ready" ]' || { echo "SETUP writer did not start"; kill -9 $py; return; }
+    if [ "$2" = 1 ] && [ "$3" = 1 ]; then fail_blocks "$p0" "$p16"
+    elif [ "$2" = 1 ]; then fail_blocks "$p0"
+    else fail_blocks "$p16"; fi
+    touch "$go"
+    wait_for 20 '[ -e "${ready}1" ]' || { echo "SETUP no return from the writeback"; kill -9 $py; heal; return; }
+    [ "$3" = 1 ] || heal
+    touch "$go"1
+    wait_for 20 '[ -e "${ready}2" ]' || { echo "SETUP the fsync never returned"; kill -9 $py; heal; return; }
+    heal
+    touch "$go"2
+    wait "$py" || true
+    echo 3 >/proc/sys/vm/drop_caches
+    echo "WRITER $(tr '\n' ' ' <"$out")"
+    echo "READS $(dd if="$f" bs=4096 skip=16 count=1 status=none | tr -d '\0' | head -c 1)"
+}
+
+judge() { # <name> <output> <expect: P|zeros>
+    local w r
+    grep -q '^SETUP' <<<"$2" && { fail "setup ($1): $(grep '^SETUP' <<<"$2")"; return; }
+    w="$(sed -n 's/^WRITER //p' <<<"$2")"
+    r="$(sed -n 's/^READS //p' <<<"$2")"
+    log "$1: writer: $w; block 16 reads '${r:-<zeros>}'"
+    case "$1" in A*) grep -q "FSYNC 5" <<<"$w" ||
+        { fail "setup ($1): fsync did not report the older unseen error -- nothing was unseen ($w)"; return; } ;; esac
+    if [ "$3" = P ]; then
+        [ "$r" = P ] && pass "$1: the set's write landed and reads back, an older unseen error notwithstanding" ||
+            fail "$1: a write that reached the device was dropped (reads '${r:-<zeros>}')"
+    else
+        [ -z "$r" ] && pass "$1: the set's own write failed, and its block reads as zeros" ||
+            fail "$1: the set was converted over a block whose write failed -- it reads '$r'"
+    fi
+}
+
+judge A "$(run_case fa 1 0)" P
+judge A2 "$(run_case fb 1 1)" zeros
+judge B "$(run_case fc 0 1)" zeros
 ct_umount "$MNT"
 ct_exit
