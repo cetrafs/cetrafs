@@ -568,13 +568,15 @@ static void scrub_free_targets(struct scrub_ctx *ctx)
 
 /*
  * Reclaim ORPHAN INODES: allocated in the global bitmap, nlink=0 on a
- * forced-fresh read, and in use by nobody. This is the designed residue of
- * a cross-node delete -- cetrafs_evict_inode() refuses to free an inode a
- * peer still holds open (its read-presence bit), and that peer's own
- * eviction cannot know the file died under it (its cached i_nlink never
- * learns of a deletion it did not perform) -- so the number and its blocks
- * stay allocated with nothing left to free them. fsck reports exactly this
- * as "allocated (nlink=0) ... deleted but not yet reclaimed".
+ * forced-fresh read, and in use by nobody. NOT the normal result of a
+ * cross-node delete: unlink refuses a file any live peer has open
+ * (-ETXTBSY, cetrafs_lock_foreign_user_exists()). It arises when that
+ * check and a peer's open raced, when the opener that blocked the free
+ * died with it open, or when a read or CAS error left the free undone --
+ * cetrafs_evict_inode() then refuses to free an inode a peer still holds
+ * (its read-presence bit), and the number and its blocks stay allocated
+ * with nothing left to free them. fsck reports exactly this as
+ * "allocated (nlink=0) ... deleted but not yet reclaimed".
  *
  * Only the inode NUMBER is freed here (one bitmap CAS). The orphan's data
  * blocks are then no longer protected by an allocated record, so the

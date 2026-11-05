@@ -2551,12 +2551,12 @@ int main(int argc, char **argv)
                         "no node can open it for write\n",
                         ino, cetrafs_le32(in.lock_mode));
 
-            /* An allocated nlink=0 inode is the designed residue of a
-             * cross-node delete whose destroyer could not free it (a
-             * peer held it open) -- bounded, reclaimable (-r, or the
-             * online scrub), and reported, but NOT a corruption this
-             * tool should fail the volume on. See the unreachable-inode
-             * pass for the full account. */
+            /* An allocated nlink=0 inode is left when a delete could
+             * not free it -- a peer's open racing the unlink's check, an
+             * opener that died holding it, an I/O error mid-free --
+             * bounded, reclaimable (-r, or the online scrub), and
+             * reported, but NOT a corruption this tool should fail the
+             * volume on. See the unreachable-inode pass. */
             if (in.nlink == 0)
                 fprintf(stderr, "WARN: inode %" PRIu64 " is allocated but has nlink=0 (orphan)\n", ino);
 
@@ -3531,14 +3531,17 @@ int main(int argc, char **argv)
                 continue;
             if (refs[ino] == 0) {
                 /*
-                 * Severity depends on nlink. nlink=0 and unnamed is the
-                 * DESIGNED residue of cross-node deletion: eviction
-                 * refuses to free an inode a peer still has open (the
-                 * read-presence bit), and a reader-only peer's own evict
-                 * cannot know the file died under it -- so the number
-                 * and its blocks stay allocated, bounded and reclaimable
-                 * (fsck -r here; the online scrub on a live volume).
-                 * That is a leak to report, not a corruption to fail on.
+                 * Severity depends on nlink. nlink=0 and unnamed is what
+                 * a delete leaves when it could not free the inode.
+                 * Unlink refuses a file a live peer has open, so it is
+                 * not the normal cross-node result: it needs that check
+                 * to race a peer's open, an opener that died holding it
+                 * (eviction refuses to free an inode a peer has open,
+                 * and a reader-only peer cannot know the file died under
+                 * it), or an I/O error mid-free. The number and its
+                 * blocks stay allocated, bounded and reclaimable (fsck
+                 * -r here; the online scrub on a live volume). That is a
+                 * leak to report, not a corruption to fail on.
                  * nlink>0 and unnamed is a different animal entirely --
                  * a LOST NAME, data still wanted with no way to reach it
                  * -- and stays a hard ERR.

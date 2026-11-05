@@ -209,7 +209,6 @@
 
 #define CETRAFS_XATTR_KEY_MAX        64
 #define CETRAFS_XATTR_VALUE_MAX      256
-#define CETRAFS_MAX_XATTRS           16
 
 #define CETRAFS_MAX_ZONE_GROUPS      255U
 
@@ -1500,8 +1499,9 @@ static inline int cetrafs_blk_struct_ok(const void *blk, u32 magic)
         return 1;
     }
     case CETRAFS_XATTR_TAIL_MAGIC: {
-        /* As many as fit in the block: CETRAFS_MAX_XATTRS is the
-         * per-INODE limit, and iterating that many would read past it. */
+        /* As many entries as fit in the block. (A CETRAFS_MAX_XATTRS of
+         * 16 used to sit beside this, enforced by nothing and wrong
+         * about the block, which holds 12.) */
         const cetrafs_xattr_entry_t *xa = (const cetrafs_xattr_entry_t *) blk;
         const unsigned int per_block = CETRAFS_BLOCK_SIZE / sizeof(cetrafs_xattr_entry_t);
 
