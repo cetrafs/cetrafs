@@ -1348,13 +1348,19 @@ int cetrafs_journal_replay_node(struct super_block *sb, u32 node_id, bool wait_f
     return ret;
 }
 
+/* TEST ONLY: fail the next replay consume (the header zeroing), as a
+ * write the device refused would (tests/kernel/journal_consume_fail.sh). */
+static bool cetrafs_journal_consume_fail_once;
+cetrafs_test_param(journal_consume_fail_once, cetrafs_journal_consume_fail_once, bool, 0644);
+MODULE_PARM_DESC(journal_consume_fail_once, "TEST ONLY: fail the next journal replay consume with -EIO");
+
 static int __cetrafs_journal_replay_node(struct super_block *sb, u32 node_id, bool wait_for_claim)
 {
     u64 area_start, slots, s;
     struct cetrafs_journal_replay_entry *entries;
     u32 count = 0, applied = 0, my_node_id = 0;
     bool dirty = false, claimed = false;
-    int ret;
+    int ret, werr_consume;
 
     /* No such row, so no such journal: nothing to replay
      * (cetrafs_node_fence_peer_full()). */
@@ -1754,17 +1760,33 @@ consume:
             ret = -EIO;
             goto out_free;
         }
-        cetrafs_bh_begin_update(hbh);
-        memset(hbh->b_data, 0, CETRAFS_BLOCK_SIZE);
-        cetrafs_bh_end_update(hbh);
-        if (cetrafs_sync_buffer(sb, hbh))
-            /* Safe, just loud, and the same reasoning as the write
-             * path's consume: the entry stays live and replay verifies
-             * prev_checksum before applying anything, so a re-apply
-             * that is no longer valid is skipped. */
-            pr_err("journal replay: node %u could not consume txn %llu (entry stays; a re-apply is checked)\n",
-                   node_id, (unsigned long long) entries[s].txn_id);
+        if (READ_ONCE(cetrafs_journal_consume_fail_once) && xchg(&cetrafs_journal_consume_fail_once, false)) {
+            werr_consume = -EIO; /* TEST ONLY: as a header write the device refused */
+        } else {
+            cetrafs_bh_begin_update(hbh);
+            memset(hbh->b_data, 0, CETRAFS_BLOCK_SIZE);
+            cetrafs_bh_end_update(hbh);
+            werr_consume = cetrafs_sync_buffer(sb, hbh);
+        }
         brelse(hbh);
+        if (werr_consume) {
+            /*
+             * The entry stays, and so must the area's DIRTY flag. Parked
+             * CLEAN, the leftover header is no longer anybody's to
+             * replay: it waits in its slot to be judged by a 32-bit CRC
+             * alone, which a later header can legitimately recur (audit
+             * L8). Left DIRTY, the next replay meets it, finds the redo
+             * already on the target and skips it. A replay that cannot
+             * consume fails like one that cannot redo: this node's own
+             * area at mount fails the mount, a peer's waits for the next
+             * sweep.
+             */
+            pr_err("journal replay: node %u could not consume txn %llu (%d) -- entry kept, area stays dirty "
+                   "for a later attempt\n",
+                   node_id, (unsigned long long) entries[s].txn_id, werr_consume);
+            ret = werr_consume;
+            goto out_free;
+        }
     }
 
     pr_info("journal replay: node %u replayed %u valid entr%s\n", node_id, applied, applied == 1 ? "y" : "ies");
