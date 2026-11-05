@@ -158,6 +158,9 @@ struct cetrafs_sb_info {
      * earlier failure path through cetrafs_free_sb_info() is safe. */
     struct cetrafs_heartbeat *hb;
 
+    /* jiffies before which cetrafs_sb_mount_beat() need not renew. */
+    unsigned long mount_beat_next;
+
     /* Per-ZG journal state: opaque to fs.c, owned
      * entirely by journal.c. NULL until cetrafs_journal_init() succeeds;
      * cetrafs_journal_free() tolerates NULL the same way cetrafs_
@@ -2056,6 +2059,17 @@ int cetrafs_fill_super(struct super_block *sb, struct fs_context *fc)
                 brelse(bh);
                 return -EOPNOTSUPP;
             }
+            /* Before replaying anything: a replay claim naming this row
+             * is the previous incarnation's, and would read live now. */
+            if (cetrafs_sb_unclean_reattach(sb)) {
+                rc = cetrafs_journal_sweep_own_claims(sb, sbi->node_id);
+                if (rc) {
+                    pr_err("could not hand back the replay claims this node held before it went down: %d\n", rc);
+                    cetrafs_free_sb_info(sb);
+                    brelse(bh);
+                    return rc;
+                }
+            }
             rc = cetrafs_journal_attach_node(sb, sbi->node_id);
             if (rc) {
                 pr_err("own journal replay/attach failed: %d\n", rc);
@@ -3357,6 +3371,42 @@ void cetrafs_sb_lease_renewed(struct super_block *sb, unsigned long t0, unsigned
     WRITE_ONCE(sbi->lease_until, t0 + (unsigned long) interval_secs * 3 * HZ);
     smp_wmb(); /* the deadline before the flag that makes it count */
     WRITE_ONCE(sbi->lease_active, true);
+}
+
+/*
+ * Renew this node's row from a long phase of the MOUNT, before the
+ * heartbeat exists (audit R19). Registration lands one beat and the
+ * heartbeat's first tick is the next, and between the two the mount can
+ * wait minutes for a peer's replay claim to clear -- long enough for
+ * every peer to judge this node stale and fence it before it has done
+ * anything at all. Called from those waits; renews at most once per
+ * heartbeat interval. The lease is not armed here: a mount phase that
+ * stalls elsewhere must not stop itself, it is still beating no later
+ * than a tick would.
+ *
+ * Returns -EPERM / -EOWNERDEAD if the row says this node was fenced or
+ * displaced meanwhile: the mount must fail, not go on.
+ */
+int cetrafs_sb_mount_beat(struct super_block *sb)
+{
+    struct cetrafs_sb_info *sbi = sb->s_fs_info;
+    int ret;
+
+    if (!sbi || !sbi->node_registered || sbi->hb)
+        return 0; /* not registered yet, or the heartbeat beats for us */
+    if (sbi->mount_beat_next && time_before(jiffies, sbi->mount_beat_next))
+        return 0;
+    sbi->mount_beat_next = jiffies + (unsigned long) cetrafs_heartbeat_interval_secs(sb) * HZ;
+    if (!sbi->mount_beat_next)
+        sbi->mount_beat_next = 1;
+    ret = cetrafs_node_renew_heartbeat(sb, sbi->node_id);
+    if (ret == -EPERM || ret == -EOWNERDEAD) {
+        pr_err("%s: this node was fenced while it was still mounting -- refusing the mount\n", sb->s_id);
+        return ret;
+    }
+    if (ret)
+        pr_warn("%s: could not renew this node's row while mounting: %d\n", sb->s_id, ret);
+    return 0;
 }
 
 void cetrafs_sb_note_unclean_reattach(struct super_block *sb)

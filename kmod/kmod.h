@@ -270,6 +270,7 @@ long cetrafs_shutdown_ioctl(struct super_block *sb, u32 __user *argp);
 int cetrafs_getattr(struct mnt_idmap *idmap, const struct path *path, struct kstat *stat, u32 request_mask,
                     unsigned int query_flags);
 void cetrafs_sb_lease_renewed(struct super_block *sb, unsigned long t0, unsigned int interval_secs);
+int cetrafs_sb_mount_beat(struct super_block *sb);
 bool cetrafs_sb_defrag_draining(struct super_block *sb);
 bool cetrafs_sb_queue_cold(struct super_block *sb, struct work_struct *w);
 void cetrafs_sb_cold_close(struct super_block *sb);
@@ -1052,6 +1053,7 @@ struct cetrafs_journal; /* opaque; owned entirely by journal.c */
 int cetrafs_journal_init(struct super_block *sb, struct cetrafs_journal **out_j);
 void cetrafs_journal_free(struct cetrafs_journal *j);
 int cetrafs_journal_attach_node(struct super_block *sb, u32 node_id);
+int cetrafs_journal_sweep_own_claims(struct super_block *sb, u32 my_node_id);
 int cetrafs_journal_write_block(struct super_block *sb, struct buffer_head *bh, u32 prev_crc);
 int cetrafs_journal_write_new_block(struct super_block *sb, struct buffer_head *bh);
 void cetrafs_journal_shutdown(struct super_block *sb);

@@ -338,6 +338,12 @@ static bool cetrafs_force_live_replay_claim;
 cetrafs_test_param(force_live_replay_claim, cetrafs_force_live_replay_claim, bool, 0644);
 MODULE_PARM_DESC(force_live_replay_claim, "TEST ONLY: a foreign journal replay claim always reads as live");
 
+/* TEST ONLY: skip cetrafs_journal_sweep_own_claims() (the control of
+ * tests/kernel/replay_claim_reattach.sh). */
+static bool cetrafs_journal_sweep_skip;
+cetrafs_test_param(journal_sweep_skip, cetrafs_journal_sweep_skip, bool, 0644);
+MODULE_PARM_DESC(journal_sweep_skip, "TEST ONLY: leave the replay claims a previous incarnation held");
+
 /* 0 = claimed, -EEXIST = someone else is handling it (or nothing to do). */
 static int cetrafs_journal_claim_replay(struct super_block *sb, u64 area_start, u32 my_node_id)
 {
@@ -470,6 +476,53 @@ void cetrafs_journal_free(struct cetrafs_journal *j)
     kfree(j->busy);
     kfree(j->stuck_lba);
     kfree(j);
+}
+
+/*
+ * Hand back every replay claim our previous incarnation left on the
+ * device (audit R19). A node that crashed mid-replay and re-attached
+ * holds no claim in memory -- it has not replayed anything yet -- but
+ * the area still names its row, and a row that beats again reads as a
+ * LIVE replayer: the area's owner then waited 3*stale+30 s on a claim
+ * nobody would ever release, and its mount failed -EBUSY. Called at an
+ * unclean re-attach, before this mount replays anything, so every claim
+ * naming us is a dead incarnation's. The area stays DIRTY: the replay
+ * it protected may be half done, and whoever claims it next redoes it.
+ */
+int cetrafs_journal_sweep_own_claims(struct super_block *sb, u32 my_node_id)
+{
+    const cetrafs_superblock_t *raw_sb = cetrafs_sb_raw(sb);
+    struct cetrafs_journal_claim_ctx ctx = {.my_node_id = my_node_id, .release = true};
+    u32 n, count;
+
+    if (!raw_sb)
+        return -EINVAL;
+    count = le32_to_cpu(raw_sb->node_table_count);
+    for (n = 0; n < count; n++) {
+        u64 area_start, slots;
+        struct buffer_head *bh;
+        u32 owner;
+        bool magic;
+        int ret;
+
+        if (cetrafs_journal_node_area(sb, n, &area_start, &slots) || !area_start)
+            continue;
+        bh = cetrafs_bread_uncached_retry(sb, area_start);
+        if (!bh)
+            return -EIO;
+        magic = cetrafs_le32(((const cetrafs_node_journal_hdr_t *) bh->b_data)->magic) == CETRAFS_NODE_JOURNAL_MAGIC;
+        owner = cetrafs_le32(((const cetrafs_node_journal_hdr_t *) bh->b_data)->replay_owner);
+        brelse(bh);
+        if (!magic || owner != my_node_id || cetrafs_journal_sweep_skip)
+            continue;
+        ret = cetrafs_cas_record(sb, area_start, cetrafs_journal_claim_mutate, &ctx);
+        if (ret < 0)
+            return ret;
+        if (ret == 0)
+            pr_info("journal: handed back the replay claim on node %u's area our previous incarnation held\n", n);
+        cond_resched();
+    }
+    return 0;
 }
 
 /*
@@ -1327,6 +1380,11 @@ static int __cetrafs_journal_replay_node(struct super_block *sb, u32 node_id, bo
             if (msleep_interruptible(500) && fatal_signal_pending(current))
                 return -EINTR;
             waited_ms += 500;
+            /* A mount waiting here has no heartbeat yet: beat, or every
+             * peer judges it stale while it waits (audit R19). */
+            ret = cetrafs_sb_mount_beat(sb);
+            if (ret)
+                return ret;
             ret = cetrafs_journal_read_flag(sb, area_start, &dirty);
             if (ret)
                 return ret;
