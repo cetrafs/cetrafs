@@ -47,8 +47,12 @@
  * write); a stale node's at reclaim (zonegroup.c before stealing a ZG,
  * lock.c/dir.c before taking its file lock); and a stale node's from
  * heartbeat.c's sweep, which catches a crashed node holding neither.
- * All go through cetrafs_journal_replay_node(), serialized by the
- * cluster mutex and the per-area flag; replaying twice is idempotent.
+ * All go through cetrafs_journal_replay_node(): across nodes the replay
+ * claim (a CAS on the area's header) serialises them, and on one node a
+ * per-area mutex does, because the claim accepts its own owner
+ * re-entering. A replayer that waited checks the node has not come back
+ * since its fence. Replaying a CLEAN area twice is a no-op; replaying a
+ * live node's area is not, which is what those two guard.
  */
 #define pr_fmt(fmt) "cetrafs: " fmt
 
@@ -105,6 +109,13 @@ struct cetrafs_journal {
      * itself in. */
     struct mutex rel_mutex;
     atomic_t replaying[64];
+    /* One replay of each node's area at a time on this node. The claim
+     * accepts its owner re-entering (replay_owner == me), so two local
+     * contexts -- an open's lock reclaim and the heartbeat sweep, say --
+     * could both replay one dead node's area: the first parks it CLEAN
+     * and releases, the node remounts and logs again, and the second is
+     * still applying entries by slot (audit R14). */
+    struct mutex replay_mutex[64];
     unsigned long *busy; /* logged-but-not-yet-consumed slots (in-flight operations) */
     /*
      * Slots held past their operation: a target write that failed keeps
@@ -434,12 +445,15 @@ void cetrafs_journal_retry_release(struct super_block *sb)
 int cetrafs_journal_init(struct super_block *sb, struct cetrafs_journal **out_j)
 {
     struct cetrafs_journal *j = kzalloc(sizeof(*j), GFP_KERNEL);
+    unsigned int i;
 
     if (!j)
         return -ENOMEM;
 
     mutex_init(&j->lock);
     mutex_init(&j->rel_mutex);
+    for (i = 0; i < ARRAY_SIZE(j->replay_mutex); i++)
+        mutex_init(&j->replay_mutex[i]);
     init_waitqueue_head(&j->slot_wq);
     /* area_start/slots stay 0 until cetrafs_journal_attach_node() --
      * fill_super() calls cetrafs_journal_init() before node registration
@@ -1213,11 +1227,28 @@ int cetrafs_journal_replay_node(struct super_block *sb, u32 node_id, bool wait_f
 
     if (!j || node_id >= 64)
         return __cetrafs_journal_replay_node(sb, node_id, wait_for_claim);
+    if (mutex_lock_killable(&j->replay_mutex[node_id]))
+        return -EINTR;
     mutex_lock(&j->rel_mutex);
     atomic_inc(&j->replaying[node_id]);
     mutex_unlock(&j->rel_mutex);
-    ret = __cetrafs_journal_replay_node(sb, node_id, wait_for_claim);
+    /* Waited behind another replay of the same area: the node it was
+     * fenced as may have come back meanwhile, and its journal is then a
+     * live one. Only a reclaim fences, so only a reclaim is asked; this
+     * node replaying its own area at mount has no fence on record. */
+    {
+        u64 fenced;
+
+        if (cetrafs_sb_peer_fenced_seq(sb, node_id, &fenced) && cetrafs_node_reattached_since_fence(sb, node_id)) {
+            pr_info("journal: node %u came back while its journal waited to be replayed -- not replaying it\n",
+                    node_id);
+            ret = -EBUSY;
+        } else {
+            ret = __cetrafs_journal_replay_node(sb, node_id, wait_for_claim);
+        }
+    }
     atomic_dec(&j->replaying[node_id]);
+    mutex_unlock(&j->replay_mutex[node_id]);
     return ret;
 }
 
