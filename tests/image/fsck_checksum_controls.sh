@@ -20,6 +20,10 @@
 # poke corrupts one, fsck must report THAT fault.
 set -euo pipefail
 . "$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)/lib/harness.sh"
+# A registered row here looks live to the tools, which then watch it for
+# the longest stale window a node may use (240 s, devutil.h) -- not what
+# this suite tests; tool_probe_stale_window.sh tests that.
+export CETRAFS_PEER_PROBE_SECS=3
 require_root
 POKE="$(ct_helper csum_poke)"
 

@@ -28,8 +28,16 @@
 # accepts the write and the unlink (D).
 set -euo pipefail
 . "$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)/lib/harness.sh"
+# A registered row here looks live to the tools, which then watch it for
+# the longest stale window a node may use (240 s, devutil.h) -- not what
+# this suite tests; tool_probe_stale_window.sh tests that.
+export CETRAFS_PEER_PROBE_SECS=3
 require_root
 require_module
+# And every remount after a stop is an unclean re-attach, which waits the
+# stale window for a twin (cetrafs_node_row_quiet()): compressed, or the
+# suite spends minutes in it.
+compress_timing
 for k in meta_write_fail error_policy_off; do
     [ -w "/sys/module/cetrafs/parameters/$k" ] || { skip "$k is missing"; ct_exit; }
 done
@@ -93,7 +101,7 @@ sleep 5 # two heartbeat ticks: a stopped mount's tick writes nothing
 umount "$MNT" && pass "A: a stopped mount unmounts" || { fail "A: umount failed"; umount -l "$MNT" || true; }
 [ "$(img_hash)" = "$H0" ] && pass "A: nothing reached the device from the stop through the unmount" ||
     fail "A: the image changed after the stop"
-ct_param_set hb_interval_secs 15
+ct_param_set hb_interval_secs "$TEST_HB_SECS"
 mount -t cetrafs "$DEV" "$MNT" && [ "$(cat "$MNT/d/f")" = before ] && [ "$(info fenced)" = no ] &&
     pass "A: a remount rejoins, with the data written before the stop" ||
     fail "A: the remount did not come back clean"
