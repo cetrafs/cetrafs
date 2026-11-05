@@ -1750,6 +1750,15 @@ static bool cetrafs_lock_undo_steal(struct super_block *sb, u64 ino, u64 generat
  * read). */
 static int cetrafs_lock_cas(struct inode *inode, struct cetrafs_lock_cas_ctx *ctx, const cetrafs_inode_t *seed)
 {
+    /* Callers edit their copy to describe the decision they made (the
+     * stale-lock reclaim clears the lock so the open sees it free)
+     * without restamping it. Such a copy is not the device's image: it
+     * can only miscompare, and the mutator would refuse its checksum and
+     * log damage that is not there. Seed only an unedited copy;
+     * cetrafs_cas_region_seeded_impl() falls back to a fresh read for
+     * any other seed regardless. */
+    if (seed && cetrafs_inode_crc_ns(seed) != (u32) cetrafs_le64(seed->ns_checksum))
+        seed = NULL;
     return cetrafs_cas_record_seeded(inode->i_sb, cetrafs_inode_lba(inode->i_sb, inode->i_ino), seed,
                                      seed ? CETRAFS_INODE_NS_BYTES : 0, cetrafs_lock_cas_mutate, ctx);
 }

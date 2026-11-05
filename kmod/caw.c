@@ -986,6 +986,7 @@ static int cetrafs_cas_region_seeded_impl(struct super_block *sb,
     u64 dev_lba = have_caw ? fs_lba * (CETRAFS_BLOCK_SIZE / caw->logical_block_size) + region_idx : 0;
     u8 *old, *new;
     u8 *unknown = NULL; /* a swap whose outcome was unknown: its post-image, then its pre-image */
+    bool seeded = false; /* this attempt's image is the caller's seed, not the device's */
     int attempt, ret;
 
     if (!mutate || off + region > CETRAFS_BLOCK_SIZE)
@@ -1090,7 +1091,9 @@ static int cetrafs_cas_region_seeded_impl(struct super_block *sb,
              * through to the read is strictly cheaper.
              */
             memcpy(old, seed, region);
+            seeded = true;
         } else {
+            seeded = false;
             if (cetrafs_caw_late.compare && cetrafs_caw_late.before_read)
                 cetrafs_caw_land_held(sb->s_bdev); /* TEST ONLY */
             bh = cetrafs_bread_uncached_retry(sb, fs_lba); /* see the no-CAW path above */
@@ -1137,6 +1140,18 @@ static int cetrafs_cas_region_seeded_impl(struct super_block *sb,
 
         memcpy(new, old, region);
         ret = mutate(new, region, priv);
+        /*
+         * A seed is the caller's copy, and callers edit theirs: the
+         * stale-lock reclaim clears the lock fields of its own copy so
+         * the open sees the lock free, without restamping it. "A stale
+         * seed just fails the CAW" held only while mutators ignored the
+         * image's checksum; once they refuse one that fails it (EUCLEAN),
+         * a seed must never be what they refuse -- that verdict is about
+         * the DEVICE. Read it fresh and ask again (a two-node reclaim of
+         * a dead node's lock was refused every time otherwise).
+         */
+        if (ret == -EUCLEAN && seeded)
+            continue;
         if (ret) {
             ret = (ret > 0) ? 0 : ret; /* >0 == "nothing to do", success --
                                         * same TRAP as the real-CAW path
