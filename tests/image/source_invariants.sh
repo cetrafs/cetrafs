@@ -916,6 +916,61 @@ CALLS="$(grep -c 'cetrafs_dmpath_resolve(bdev' "$K/dmpath.c" || true)"
 [ -z "$NOFS" ] && pass "dm path NOFS: every resolution runs inside memalloc_nofs_save()" ||
     fail "dm path NOFS: a resolution outside a NOFS scope at: $(echo $NOFS)"
 
+# N3 (audit 2026-11-05): defrag freed with kfree() the array
+# cetrafs_tree_flatten() grows with kvrealloc(). Past one page that can be
+# vmalloc memory, and kfree() of a vmalloc address is an oops or slab
+# corruption -- under memory fragmentation only, so no runtime test sees
+# it on demand. The question is mechanical: of every pointer filled by a
+# kv*/vmalloc allocator, directly or through an out-parameter of a
+# function that hands such memory out, is any freed with kfree()?
+# KV_OUT names those functions; the check below refuses a new one that
+# returns kv memory through an out-parameter without being listed.
+log "checking nothing kv/vmalloc-allocated is freed with kfree() (N3)"
+KV_OUT='cetrafs_tree_flatten'
+kv_kfree() { # <files>... -- prints file:line of a kfree() of kv memory
+    awk -v kvout="$KV_OUT" '
+        BEGIN { n = split(kvout, f, "|"); for (i = 1; i <= n; i++) out[f[i]] = 1 }
+        FNR == 1 { delete kv }
+        /^[[:space:]]*(\*|\/\*|\/\/)/ { next }
+        /^[a-z].*\(/ && !/;[[:space:]]*$/ { delete kv }
+        {
+            line = $0
+            while (match(line, /[A-Za-z_][A-Za-z0-9_>.-]*[[:space:]]*=[[:space:]]*(kvmalloc|kvzalloc|kvcalloc|kvmalloc_array|kvrealloc|vmalloc|vzalloc|vcalloc|vmalloc_array)\(/)) {
+                v = substr(line, RSTART, RLENGTH); sub(/[[:space:]]*=.*/, "", v); kv[v] = 1
+                line = substr(line, RSTART + RLENGTH)
+            }
+            for (fn in out) if (index($0, fn "(")) {
+                line = substr($0, index($0, fn "("))
+                while (match(line, /&[A-Za-z_][A-Za-z0-9_>.-]*/)) {
+                    kv[substr(line, RSTART + 1, RLENGTH - 1)] = 1; line = substr(line, RSTART + RLENGTH)
+                }
+            }
+            line = $0
+            while (match(line, /[^v]kfree\([A-Za-z_][A-Za-z0-9_>.-]*\)/)) {
+                v = substr(line, RSTART + 7, RLENGTH - 8)
+                if (v in kv) print FILENAME ":" FNR ": kfree(" v ")"
+                line = substr(line, RSTART + RLENGTH)
+            }
+        }' "$@"
+}
+KVF="$(kv_kfree "$K"/*.c)"
+[ -z "$KVF" ] && pass "allocator family: no kv/vmalloc pointer is freed with kfree()" ||
+    fail "allocator family: kfree() of kv/vmalloc memory at: $(echo "$KVF" | sed "s|$K/||" | tr '\n' ' ')"
+# Every function that returns kv memory through an out-parameter is in
+# KV_OUT, or the check above cannot see its callers.
+UNLISTED="$(awk '
+    /^[a-z].*\(/ && !/;[[:space:]]*$/ { fn = $0; sub(/\(.*/, "", fn); sub(/.*[ *]/, "", fn); kvfn = 0 }
+    /(kvmalloc|kvzalloc|kvcalloc|kvrealloc|vmalloc|vzalloc)\(/ { kvfn = 1 }
+    kvfn && /^[[:space:]]*\*[a-z_]+[[:space:]]*=[[:space:]]*[a-z_]+;/ { print fn }' "$K"/*.c | sort -u |
+    grep -vxE "$KV_OUT" || true)"
+[ -z "$UNLISTED" ] && pass "allocator family: every function handing out kv memory by out-parameter is listed ($KV_OUT)" ||
+    fail "allocator family: these hand out kv memory by out-parameter and are not in KV_OUT: $(echo $UNLISTED)"
+# Negative control: the check must catch the shape it exists for.
+NEGSRC="$(ct_tmp kvneg).c"
+printf 'static int f(void)\n{\n    cetrafs_extent_t *flat = NULL;\n    int r = cetrafs_tree_flatten(inode, raw, &flat, &n);\n    kfree(flat);\n}\nstatic int g(void)\n{\n    p = kvmalloc_array(n, 8, GFP_NOFS);\n    kfree(p);\n}\n' >"$NEGSRC"
+[ "$(kv_kfree "$NEGSRC" | wc -l)" = 2 ] && pass "allocator family: control -- both planted kfree()s of kv memory are caught" ||
+    fail "allocator family: control -- the check caught $(kv_kfree "$NEGSRC" | wc -l) of 2 planted kfree()s"
+
 # The module must publish the filesystem alias get_fs_type() asks
 # modprobe for ("fs-<name>") when a mount names a type nothing has
 # registered. Without it, `mount -t cetrafs` on a host that has the

@@ -276,7 +276,7 @@ static int cetrafs_defrag_read_extents(struct inode *inode, const cetrafs_inode_
         if (fret)
             return fret;
         if (n > el->cap) {
-            kfree(flat);
+            kvfree(flat);
             pr_debug("defrag: ino=%llu has %u extents (> cap %u) -- declined\n", (unsigned long long) inode->i_ino, n,
                      el->cap);
             return -EOPNOTSUPP;
@@ -284,7 +284,7 @@ static int cetrafs_defrag_read_extents(struct inode *inode, const cetrafs_inode_
         el->count = n;
         if (n)
             memcpy(el->arr, flat, (size_t) n * sizeof(el->arr[0]));
-        kfree(flat);
+        kvfree(flat);
     }
 
     el->dense = true;
