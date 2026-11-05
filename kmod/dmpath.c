@@ -44,6 +44,7 @@
 #include <linux/string.h>
 #include <linux/cred.h>
 #include <linux/fs_struct.h>
+#include <linux/sched/mm.h>
 #include <linux/sched/task.h>
 
 #include <linux/delay.h>
@@ -595,7 +596,19 @@ retry:
     mutex_unlock(&cetrafs_dmpath_mutex);
 
 resolve:
-    resolved = cetrafs_dmpath_resolve(bdev, avoid, &tmp) == 0;
+    /*
+     * NOFS for the whole resolution (audit L23): it allocates, and a
+     * GFP_KERNEL allocation may enter reclaim, evict an inode of this
+     * very volume, and need a compare-and-swap -- which comes back here
+     * and waits CETRAFS_DMPATH_RESOLVE_WAIT on the resolving flag this
+     * call itself set.
+     */
+    {
+        unsigned int nofs = memalloc_nofs_save();
+
+        resolved = cetrafs_dmpath_resolve(bdev, avoid, &tmp) == 0;
+        memalloc_nofs_restore(nofs);
+    }
 
     mutex_lock(&cetrafs_dmpath_mutex);
     if (!slot) {

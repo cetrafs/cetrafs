@@ -664,6 +664,27 @@ done)"
 [ -z "$WIN" ] && pass "liveness windows: every one is floored at the stale window" ||
     fail "liveness windows: shorter than the stale window, or not derived from it, at: $(echo $WIN)"
 
+# The dm path resolution allocates and does I/O. Reached from a CAS,
+# which evict needs, it must run inside a NOFS scope: a GFP_KERNEL
+# allocation entering reclaim evicts an inode of this volume, needs a
+# CAS, and waits on the very resolving flag its caller set (audit L23).
+# Every call of cetrafs_dmpath_resolve() must have memalloc_nofs_save()
+# within the three lines above it. Negative control: drop the scope in
+# cetrafs_dmpath_sdev() -- fails.
+log "checking the dm path resolution runs in a NOFS scope"
+NOFS="$(awk '
+    /^[[:space:]]*(\*|\/\*|\/\/)/ { next }
+    /cetrafs_dmpath_resolve\(/ && !/^static/ {
+        ok = 0
+        for (i = 1; i <= 3; i++) if (h[(NR - i) % 4] ~ /memalloc_nofs_save/) ok = 1
+        if (!ok) print "dmpath.c:" NR
+    }
+    { h[NR % 4] = $0 }' "$K/dmpath.c")"
+CALLS="$(grep -c 'cetrafs_dmpath_resolve(bdev' "$K/dmpath.c" || true)"
+[ "$CALLS" -ge 1 ] || fail "dm path NOFS: found no call of cetrafs_dmpath_resolve() -- the check sees nothing"
+[ -z "$NOFS" ] && pass "dm path NOFS: every resolution runs inside memalloc_nofs_save()" ||
+    fail "dm path NOFS: a resolution outside a NOFS scope at: $(echo $NOFS)"
+
 # The module must publish the filesystem alias get_fs_type() asks
 # modprobe for ("fs-<name>") when a mount names a type nothing has
 # registered. Without it, `mount -t cetrafs` on a host that has the
