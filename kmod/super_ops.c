@@ -24,6 +24,13 @@ static unsigned int cetrafs_evict_stall_before_free_ms;
 cetrafs_test_param(evict_stall_before_free_ms, cetrafs_evict_stall_before_free_ms, uint, 0644);
 MODULE_PARM_DESC(evict_stall_before_free_ms, "TEST ONLY: pause between evict's verdict and its free");
 
+/* TEST ONLY: the next N evictions find their "is another node using it?"
+ * check failing, as a failed forced-fresh read would
+ * (tests/kernel/evict_check_fails_closed.sh). */
+static unsigned int cetrafs_evict_check_fail;
+cetrafs_test_param(evict_check_fail, cetrafs_evict_check_fail, uint, 0644);
+MODULE_PARM_DESC(evict_check_fail, "TEST ONLY: fail the next N evictions' foreign-user check");
+
 static void cetrafs_put_super(struct super_block *sb)
 {
     fs_debug(info, "cetrafs_put_super");
@@ -401,16 +408,35 @@ static void cetrafs_evict_inode(struct inode *inode)
          * alternative is freeing blocks out from under a peer that is
          * still reading or writing them through an open fd.
          */
-        if (!ret && cetrafs_sb_get_node_id(sb, &my_node_id) == 0) {
+        /*
+         * A check that could not be ASKED is not a "no". Every error --
+         * no node id, the forced-fresh read failing, a stale holder's
+         * fence or replay failing, the holder coming back -- refuses the
+         * free exactly as a live foreign user does: a bounded leak fsck
+         * names, never blocks freed under a peer's open fd. Nothing
+         * downstream re-asks: the reclaim CAS checks nlink, generation
+         * and the namespace lock only. tests/kernel/evict_check_fails_closed.sh.
+         */
+        if (!ret) {
             bool blocked = false;
-
             bool reader = false;
+            int crc = cetrafs_sb_get_node_id(sb, &my_node_id);
 
             /* One forced-fresh read for both questions:
              * this used to be two, each invalidating and re-reading the
              * same record. */
-            if (cetrafs_lock_foreign_user_exists(sb, inode->i_ino, my_node_id, &blocked, &reader) == 0 &&
-                (blocked || reader)) {
+            if (!crc)
+                crc = cetrafs_lock_foreign_user_exists(sb, inode->i_ino, my_node_id, &blocked, &reader);
+            if (!crc && cetrafs_evict_check_fail) {
+                cetrafs_evict_check_fail--;
+                crc = -EIO; /* test-only; see the parameter */
+            }
+            if (crc) {
+                pr_err("evict_inode: ino=%llu could not ask whether another node still uses it (%d) -- leaving "
+                       "its inode number and data blocks allocated\n",
+                       (unsigned long long) inode->i_ino, crc);
+                ret = crc;
+            } else if (blocked || reader) {
                 pr_err(
                     "evict_inode: ino=%llu is still open on another node -- leaving its inode number and data "
                     "blocks allocated rather than freeing them underneath it\n",
