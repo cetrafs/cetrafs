@@ -838,6 +838,7 @@ int cetrafs_zg_claim_unowned(struct super_block *sb,
                              const u8 my_uuid[CETRAFS_NODE_UUID_LEN],
                              bool at_mount);
 int cetrafs_zg_release_surplus(struct super_block *sb, u32 my_node_id);
+int cetrafs_zg_release_all_rdonly(struct super_block *sb, u32 my_node_id);
 int cetrafs_zg_scrub_adopt_one_stale(struct super_block *sb, bool *out_adopted);
 int cetrafs_zg_queue_foreign_free(struct super_block *sb, u32 zg_id, u64 lba, u32 count);
 int cetrafs_zg_drain_pending_frees(struct super_block *sb);

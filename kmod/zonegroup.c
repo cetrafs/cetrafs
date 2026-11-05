@@ -1464,6 +1464,57 @@ int cetrafs_zg_release_surplus(struct super_block *sb, u32 my_node_id)
     return 0;
 }
 
+/*
+ * A READ-ONLY mount hands back every Zone Group its row still owns.
+ *
+ * Unmount leaves a node's Zone Groups owned by its departed row, for a
+ * peer to take; a crash leaves them owned by a dead one. Either way the
+ * row comes back live when this node registers again -- and a read-only
+ * mount then neither allocates from them nor drains the frees peers
+ * queue against them, while no peer can take them from a live row. The
+ * capacity was gone from the cluster for as long as the observer stayed
+ * mounted, and the queues only filled (audit L35).
+ *
+ * Safe to give back as they stand: this node's own journal was replayed
+ * above, it allocated nothing in this incarnation, and whoever claims an
+ * unowned Zone Group reconciles its counts from the bitmaps and drains
+ * its queue. Each release is the ordinary owner-guarded CAS, so a Zone
+ * Group a peer reclaimed meanwhile is left alone.
+ */
+int cetrafs_zg_release_all_rdonly(struct super_block *sb, u32 my_node_id)
+{
+    const cetrafs_superblock_t *raw_sb = cetrafs_sb_raw(sb);
+    cetrafs_zone_group_t *zg;
+    u32 z, n = 0;
+    int ret = 0;
+
+    if (!raw_sb)
+        return -EINVAL;
+    zg = kmalloc(sizeof(*zg), GFP_KERNEL);
+    if (!zg)
+        return -ENOMEM;
+    for (z = 0; z < le32_to_cpu(raw_sb->zone_group_count); z++) {
+        struct cetrafs_zg_cas_ctx ctx = {.my_node_id = my_node_id, .claim = false};
+
+        ret = cetrafs_read_zg(sb, z, zg);
+        if (ret)
+            break;
+        if (le16_to_cpu(zg->owner_node_id) != (u16) my_node_id)
+            continue;
+        ret = cetrafs_zg_cas(sb, z, &ctx);
+        if (ret) {
+            pr_err("read-only mount: could not hand back Zone Group %u (%d)\n", z, ret);
+            break;
+        }
+        cetrafs_sb_uncache_zg_ownership(sb, z);
+        n++;
+    }
+    kfree(zg);
+    if (n)
+        pr_info("read-only mount: handed back %u Zone Group(s) this node owned before\n", n);
+    return ret;
+}
+
 /* --- Pending-free queues ---------------------
  *
  * A node freeing a data block whose BG belongs to someone else's ZG (or

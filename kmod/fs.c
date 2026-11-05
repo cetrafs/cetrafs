@@ -2141,6 +2141,15 @@ int cetrafs_fill_super(struct super_block *sb, struct fs_context *fc)
                 rc = cetrafs_zg_drain_pending_frees(sb);
                 if (rc)
                     pr_warn("pending-free drain at mount failed (heartbeat will retry): %d\n", rc);
+            } else {
+                /* ...and an observer gives back what its row still owns
+                 * from before (cetrafs_zg_release_all_rdonly()). */
+                rc = cetrafs_zg_release_all_rdonly(sb, sbi->node_id);
+                if (rc) {
+                    cetrafs_free_sb_info(sb);
+                    brelse(bh);
+                    return rc;
+                }
             }
             CETRAFS_MOUNT_FAIL_POINT(4);
 
