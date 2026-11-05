@@ -23,6 +23,12 @@
 #      zeros, not as the 'S' planted under it.
 #  B:  no older error; the set's own write fails: zeros, not 'S'.
 #
+# Every write that is meant to fail is started (sync_file_range) and
+# left to fail, then the device heals BEFORE fsync and close: dm-flakey
+# fails the empty FLUSH bio too, and a failed flush in the conversion
+# drops the set on its own, so only a healed device leaves the verdict
+# to the cursor.
+#
 # DISCRIMINATION: A fails with errseq_sample() as the cursor (block
 # dropped); A2 fails with the raw value as the cursor (the 'S' is read).
 set -euo pipefail
@@ -78,10 +84,10 @@ run_case() {
     [ "$2" = 1 ] && p0="$(phys "$f" 0)"
     out="$(ct_tmp pwbc-out)"; go="$(ct_tmp pwbc-go)"; ready="$(ct_tmp pwbc-ready)"
     rm -f "$go" "$ready"
-    python3 - "$f" "$go" "$ready" "$2" >"$out" 2>&1 <<'PY' &
+    python3 - "$f" "$go" "$ready" "$2" "$3" >"$out" 2>&1 <<'PY' &
 import ctypes, os, sys, time
 libc = ctypes.CDLL(None, use_errno=True)
-f, go, ready, old = sys.argv[1], sys.argv[2], sys.argv[3], sys.argv[4] == "1"
+f, go, ready, old, setfail = sys.argv[1], sys.argv[2], sys.argv[3], sys.argv[4] == "1", sys.argv[5] == "1"
 def wait(p):
     while not os.path.exists(p):
         time.sleep(0.05)
@@ -96,14 +102,21 @@ if old:
     time.sleep(2)
 open(ready + "1", "w").close(); wait(go + "1")
 os.pwrite(fd, b"P" * 4096, 16 * 4096)          # the set begins here
+if setfail:
+    # The set's own writeback, failed while the device still fails it,
+    # and NOT waited on -- as block 0's above. The folio ends writeback
+    # clean on the error, so the fsync below has nothing left to send.
+    libc.sync_file_range(fd, ctypes.c_longlong(16 * 4096), ctypes.c_longlong(4096), 2)
+    time.sleep(2)
+# The device heals before anything converts: dm-flakey fails the empty
+# FLUSH bio too, and a conversion whose cache flush fails drops the set
+# by itself -- which would decide the case instead of the cursor,
+# wherever the conversion runs (fsync or close).
+open(ready + "2", "w").close(); wait(go + "2")
 try:
     os.fsync(fd); print("FSYNC ok")
 except OSError as e:
     print("FSYNC", e.errno)
-# The device heals before close converts: dm-flakey fails the empty
-# FLUSH bio too, and a failed cache flush drops the set by itself --
-# which would decide the case instead of the cursor.
-open(ready + "2", "w").close(); wait(go + "2")
 try:
     os.close(fd)
 except OSError:
@@ -119,7 +132,7 @@ PY
     wait_for 20 '[ -e "${ready}1" ]' || { echo "SETUP no return from the writeback"; kill -9 $py; heal; return; }
     [ "$3" = 1 ] || heal
     touch "$go"1
-    wait_for 20 '[ -e "${ready}2" ]' || { echo "SETUP the fsync never returned"; kill -9 $py; heal; return; }
+    wait_for 20 '[ -e "${ready}2" ]' || { echo "SETUP the set's writeback never returned"; kill -9 $py; heal; return; }
     heal
     touch "$go"2
     wait "$py" || true
