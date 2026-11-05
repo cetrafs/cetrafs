@@ -3153,6 +3153,33 @@ static bool cetrafs_bg_release_off;
 cetrafs_test_param(bg_release_off, cetrafs_bg_release_off, bool, 0644);
 MODULE_PARM_DESC(bg_release_off, "test-only: never hand back individual Block Groups");
 
+/*
+ * Test-only: hold a release after the Block Group reads FREE (on the
+ * device and in-core) and before it returns -- the window a claimant's
+ * pool debit lands in (bg_release_pool_order.sh). bg_release_credit_late
+ * restores the old order, counters moved only after that window, as the
+ * suite's control.
+ */
+static unsigned int cetrafs_bg_release_stall_ms;
+cetrafs_test_param(bg_release_stall_ms, cetrafs_bg_release_stall_ms, uint, 0644);
+MODULE_PARM_DESC(bg_release_stall_ms, "test-only: stall a Block Group release after it reads FREE");
+static bool cetrafs_bg_release_credit_late;
+cetrafs_test_param(bg_release_credit_late, cetrafs_bg_release_credit_late, bool, 0644);
+MODULE_PARM_DESC(bg_release_credit_late, "test-only: move the release's counters after the BG reads FREE (old order)");
+
+/* The release's two counter moves: the owner's aggregate debit and the
+ * unowned pool's credit, each by immediate CAS. `sign` -1 undoes them. */
+static void cetrafs_bg_release_counters(struct super_block *sb, u32 zg_id, u32 b, u64 total, int sign)
+{
+    s64 d = sign * (s64) total;
+
+    if (cetrafs_zg_apply_free_delta(sb, zg_id, -d))
+        cetrafs_zg_adjust_free_blocks(sb, zg_id, -d); /* lazy fallback: never lose the move */
+    if (cetrafs_zg_adjust_pool_blocks(sb, b, d))
+        pr_warn("BG %u: pool shard %s failed -- df will %s until fsck\n", b, sign > 0 ? "credit" : "undo",
+                sign > 0 ? "understate" : "overstate");
+}
+
 int cetrafs_bg_release_empty(struct super_block *sb, u32 zg_id, u32 *out_released)
 {
     const cetrafs_superblock_t *raw_sb = cetrafs_sb_raw(sb);
@@ -3226,8 +3253,32 @@ int cetrafs_bg_release_empty(struct super_block *sb, u32 zg_id, u32 *out_release
             continue;
         }
 
+        /*
+         * Both counter moves, by immediate CAS, BEFORE the descriptor
+         * reads FREE. The pool write is cluster-visible the moment it
+         * lands, so pairing it with a LAZY local accrual let every
+         * peer's statfs see one half of the move until this node's next
+         * durability boundary (the cross-node xattrs scenario,
+         * 2026-10-29).
+         *
+         * And before, not after: a peer may claim the Block Group the
+         * instant it reads FREE, and its claim debits the pool shard. A
+         * credit still in flight then is refused as "below zero", the
+         * credit lands afterwards, and the shard overstates by a whole
+         * Block Group for good -- an ERR for fsck from two legal moves
+         * (audit R25). Credited first, a claimant's debit always finds
+         * it there. The aggregate goes first of the two, so a crash
+         * anywhere before the CAS leaves it UNDERSTATING (the next
+         * ownership reconcile recounts it); the pool can overstate by
+         * one Block Group only for a crash between its credit and the
+         * CAS, never for an interleaving. A refused CAS takes both back.
+         */
+        if (!cetrafs_bg_release_credit_late)
+            cetrafs_bg_release_counters(sb, zg_id, b, total, +1);
         ret = cetrafs_cas_record(sb, cetrafs_sb_bg_desc_lba(sb, b), cetrafs_bg_release_mutate, &ctx);
         if (ret) {
+            if (!cetrafs_bg_release_credit_late)
+                cetrafs_bg_release_counters(sb, zg_id, b, total, -1);
             cetrafs_sb_undrain_bg(sb, b);
             continue; /* somebody changed it under us; leave it alone */
         }
@@ -3235,18 +3286,12 @@ int cetrafs_bg_release_empty(struct super_block *sb, u32 zg_id, u32 *out_release
         cetrafs_bg_release_drop_bitmap(sb, b);
         cetrafs_bg_invalidate_cache(sb, b);
         cetrafs_sb_set_bg_owner(sb, b, CETRAFS_BG_OWNER_FREE);
-        /* BOTH counter moves go by immediate CAS, debit before credit.
-         * The pool write is cluster-visible the moment it lands, so
-         * pairing it with a LAZY local accrual let every peer's statfs
-         * see one half of the move until this node's next durability
-         * boundary -- a df dip/bump of a whole Block Group, caught by
-         * the cross-node xattrs scenario (2026-10-29). Claim and
-         * release are heartbeat-paced; one CAS each is nothing. The
-         * debit-first order keeps any crash window UNDERSTATING. */
-        if (cetrafs_zg_apply_free_delta(sb, zg_id, -(s64) total))
-            cetrafs_zg_adjust_free_blocks(sb, zg_id, -(s64) total); /* lazy fallback: never lose the move */
-        if (cetrafs_zg_adjust_pool_blocks(sb, b, (s64) total))
-            pr_warn("BG %u: released but its pool shard credit failed -- df will understate until fsck\n", b);
+        if (cetrafs_bg_release_stall_ms) {
+            pr_info("BG %u: release stalled %u ms after it reads FREE (test)\n", b, cetrafs_bg_release_stall_ms);
+            msleep(cetrafs_bg_release_stall_ms); /* test-only; see the parameter */
+        }
+        if (cetrafs_bg_release_credit_late)
+            cetrafs_bg_release_counters(sb, zg_id, b, total, +1); /* test-only: the old order */
         released++;
         pr_info("BG %u handed back from ZG %u (empty, %llu blocks)\n", b, zg_id, (unsigned long long) total);
     }
@@ -3403,7 +3448,9 @@ int cetrafs_bg_claim_free(struct super_block *sb, u32 zg_id, u32 *out_bg_id)
                  * immediate CAS -- see the release path for why a lazy
                  * accrual here made peers' statfs dip by this whole
                  * Block Group, and why debit-first keeps a crash window
-                 * understating rather than inventing space. */
+                 * understating rather than inventing space. The release
+                 * credits the pool before the descriptor reads FREE, so
+                 * a refusal here means drift, never a credit in flight. */
                 if (cetrafs_zg_adjust_pool_blocks(sb, b, -(s64) free))
                     pr_warn("BG %u: claimed but its pool shard debit failed -- df will overstate until fsck\n", b);
                 if (cetrafs_zg_apply_free_delta(sb, zg_id, (s64) free))
