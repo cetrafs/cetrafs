@@ -2067,7 +2067,8 @@ int main(int argc, char **argv)
      * the repair claim (no node can mount meanwhile), it has refused to
      * run beside a live peer, and it can read every record. A departed row
      * is freed only if no Zone Group, no exclusive or namespace lock, no
-     * read or suspended-writer bit, and no dirty journal names it. Only
+     * read or suspended-writer bit, no dirty journal and no journal
+     * replay claim names it. Only
      * when no FREE row is left; otherwise the node may still come back to
      * its own row.
      */
@@ -2086,9 +2087,16 @@ int main(int argc, char **argv)
             if (!cetrafs_le32(sb.node_journal_blocks))
                 break;
             pread_all(fd, &flag, sizeof(flag), (off_t) area * CETRAFS_BLOCK_SIZE);
-            if (cetrafs_le32(flag.magic) == CETRAFS_NODE_JOURNAL_MAGIC &&
-                cetrafs_le32(flag.state) == CETRAFS_NODE_JOURNAL_DIRTY)
+            if (cetrafs_le32(flag.magic) != CETRAFS_NODE_JOURNAL_MAGIC)
+                continue;
+            if (cetrafs_le32(flag.state) == CETRAFS_NODE_JOURNAL_DIRTY)
                 node_ref[n] = 1;
+            /* A replay claim names its REPLAYER's row, on another
+             * node's area: a new node on that row would read as a live
+             * replayer mid-replay, and the area's owner would wait on a
+             * claim nobody releases. */
+            if (cetrafs_le32(flag.replay_owner) < nrows)
+                node_ref[cetrafs_le32(flag.replay_owner)] = 1;
         }
         for (uint64_t ino = 1; ino <= cetrafs_le32(sb.inodes_count); ++ino) {
             cetrafs_inode_t in;
