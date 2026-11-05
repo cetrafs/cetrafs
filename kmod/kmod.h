@@ -192,7 +192,8 @@ int cetrafs_sb_get_node_id(struct super_block *sb, u32 *out);
 /* Observer-local peer liveness: has this row's hb_seq stopped advancing
  * for longer than CETRAFS_NODE_STALE_SECS of OUR clock? Uses no
  * cross-node timestamp, so clock skew cannot affect it. */
-bool cetrafs_sb_peer_progress_stale(struct super_block *sb, u32 node_id, u64 hb_seq, u32 peer_hb_interval);
+bool cetrafs_sb_peer_progress_stale(struct super_block *sb, u32 node_id, const cetrafs_node_entry_t *ne);
+void cetrafs_sb_peer_watch_forget(struct super_block *sb, u32 node_id);
 bool cetrafs_sb_peer_watched_seq(struct super_block *sb, u32 node_id, u64 *out);
 void cetrafs_sb_peer_note_fenced(struct super_block *sb, u32 node_id, u64 seq);
 bool cetrafs_sb_peer_fenced_seq(struct super_block *sb, u32 node_id, u64 *out);

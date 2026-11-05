@@ -114,6 +114,14 @@ struct cetrafs_sb_info {
     spinlock_t peer_lock;
     struct cetrafs_peer_watch {
         u64 hb_seq;            /* last hb_seq we saw on this row */
+        /* Which machine that hb_seq belongs to. hb_seq restarts at 1 when
+         * a row is registered afresh, so on its own an old sample could
+         * match a NEW node's first beats -- and a live, just-registered
+         * node was judged stale at once, from a sample of its predecessor
+         * (audit 2026-11-05, class 28). Not the fence_epoch: our own
+         * reclaim bumps it, and a watch reset there would call the peer
+         * alive again between its fence and the reclaims that follow. */
+        u8 uuid[CETRAFS_NODE_UUID_LEN];
         unsigned long seen_at; /* local jiffies when it last CHANGED */
         bool valid;            /* have we ever sampled this row? */
         /* The hb_seq of the last STALE verdict: what a reclaim acting
@@ -2356,11 +2364,13 @@ int cetrafs_fill_super(struct super_block *sb, struct fs_context *fc)
  * we mounted is only declared stale CETRAFS_NODE_STALE_SECS after we
  * first look at it, rather than immediately.
  */
-bool cetrafs_sb_peer_progress_stale(struct super_block *sb, u32 node_id, u64 hb_seq, u32 peer_hb_interval)
+bool cetrafs_sb_peer_progress_stale(struct super_block *sb, u32 node_id, const cetrafs_node_entry_t *ne)
 {
     struct cetrafs_sb_info *sbi = sb->s_fs_info;
     struct cetrafs_peer_watch *w;
     unsigned long now = jiffies;
+    u64 hb_seq = cetrafs_le64(ne->hb_seq);
+    u32 peer_hb_interval = cetrafs_le32(ne->hb_interval_secs);
     bool stale;
 
     if (!sbi || !sbi->peers || node_id >= sbi->peer_count)
@@ -2368,9 +2378,16 @@ bool cetrafs_sb_peer_progress_stale(struct super_block *sb, u32 node_id, u64 hb_
 
     spin_lock(&sbi->peer_lock);
     w = &sbi->peers[node_id];
-    if (!w->valid || w->hb_seq != hb_seq) {
+    /* A new sample whenever the counter moved OR another machine holds
+     * the row. The safe direction -- a reset only delays a verdict. A row
+     * seen not REGISTERED is forgotten (cetrafs_sb_peer_watch_forget()).
+     * Not covered without a format change: the SAME machine re-registering
+     * a retired row we never saw retired, at exactly the hb_seq we last
+     * sampled -- a registration nonce in the row (docs/internal/TODO.md). */
+    if (!w->valid || w->hb_seq != hb_seq || memcmp(w->uuid, ne->node_uuid, CETRAFS_NODE_UUID_LEN) != 0) {
         w->valid = true;
         w->hb_seq = hb_seq;
+        memcpy(w->uuid, ne->node_uuid, CETRAFS_NODE_UUID_LEN);
         w->seen_at = now;
         stale = false;
     } else {
@@ -2410,6 +2427,19 @@ bool cetrafs_sb_peer_progress_stale(struct super_block *sb, u32 node_id, u64 hb_
     }
     spin_unlock(&sbi->peer_lock);
     return stale;
+}
+
+/* The row is not REGISTERED: whatever we sampled was a previous
+ * incarnation, and the next one starts a new watch. */
+void cetrafs_sb_peer_watch_forget(struct super_block *sb, u32 node_id)
+{
+    struct cetrafs_sb_info *sbi = sb->s_fs_info;
+
+    if (!sbi || !sbi->peers || node_id >= sbi->peer_count)
+        return;
+    spin_lock(&sbi->peer_lock);
+    sbi->peers[node_id].valid = false;
+    spin_unlock(&sbi->peer_lock);
 }
 
 /* The hb_seq of the last stale verdict on a peer's row, or false if it

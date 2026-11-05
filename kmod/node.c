@@ -1809,7 +1809,7 @@ void cetrafs_node_seed_peer_watch(struct super_block *sb)
             continue;
         /* Discard the verdict: the point is only to record "this is what
          * its counter read at mount time, and this is when we looked". */
-        (void) cetrafs_sb_peer_progress_stale(sb, idx, cetrafs_le64(ne.hb_seq), cetrafs_le32(ne.hb_interval_secs));
+        (void) cetrafs_sb_peer_progress_stale(sb, idx, &ne);
     }
 }
 
@@ -1892,7 +1892,8 @@ int cetrafs_node_is_stale(struct super_block *sb, u32 node_id, bool *out_stale)
         return ret;
 
     if (cetrafs_le32(ne.state) != CETRAFS_NODE_STATE_REGISTERED) {
-        *out_stale = true; /* not a live claim at all */
+        cetrafs_sb_peer_watch_forget(sb, node_id); /* the next registration is a new watch */
+        *out_stale = true;                         /* not a live claim at all */
         return 0;
     }
 
@@ -1922,7 +1923,6 @@ int cetrafs_node_is_stale(struct super_block *sb, u32 node_id, bool *out_stale)
      * of 200 entries in one run. last_seen is still written and still
      * shown in procfs, but nothing decides anything with it any more.
      */
-    *out_stale =
-        cetrafs_sb_peer_progress_stale(sb, node_id, cetrafs_le64(ne.hb_seq), cetrafs_le32(ne.hb_interval_secs));
+    *out_stale = cetrafs_sb_peer_progress_stale(sb, node_id, &ne);
     return 0;
 }
