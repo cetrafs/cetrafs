@@ -186,7 +186,13 @@ ct_cleanup() {
                     eval "$path" >/dev/null 2>&1 && break
                     ;;
                 loop)
-                    losetup -d "$path" 2>/dev/null && break
+                    # Not "&& break": on a device something still holds
+                    # open (that udev scan), LOOP_CLR_FD only sets
+                    # autoclear and SUCCEEDS, so the device is still
+                    # listed when the check below runs -- a release run
+                    # failed image/mkfs_partial_size that way in 0s. Wait
+                    # for it to actually go.
+                    losetup -d "$path" 2>/dev/null
                     losetup -a 2>/dev/null | grep -q "^$path:" || break
                     ;;
                 dm)
