@@ -5845,6 +5845,7 @@ out:
 }
 
 struct cetrafs_setattr_ns {
+    unsigned int ia_valid; /* which of mode/uid/gid this setattr changes */
     __le32 mode;
     __le32 uid;
     __le32 gid;
@@ -5855,9 +5856,21 @@ static void cetrafs_ns_apply_setattr(cetrafs_inode_t *rec, void *arg)
 {
     struct cetrafs_setattr_ns *u = arg;
 
-    rec->mode = u->mode;
-    rec->uid = u->uid;
-    rec->gid = u->gid;
+    /*
+     * Only what THIS setattr changes. The values come from the in-core
+     * inode, which nothing refreshes once the namespace lock is held
+     * (an fd-based futimens/ftruncate never even looks the file up):
+     * writing all three back reverted a peer's chmod/chown committed
+     * since this node last read the record. The rest stays as the
+     * fresh image has it. ctime moves on every setattr.
+     * tests/kernel/setattr_keeps_peer_mode.sh.
+     */
+    if (u->ia_valid & ATTR_MODE)
+        rec->mode = u->mode;
+    if (u->ia_valid & ATTR_UID)
+        rec->uid = u->uid;
+    if (u->ia_valid & ATTR_GID)
+        rec->gid = u->gid;
     rec->ctime = u->ctime;
 }
 
@@ -6035,6 +6048,7 @@ static int cetrafs_setattr_locked(struct mnt_idmap *idmap, struct dentry *dentry
      * on writeback lost 1-2 chmods per 1200. */
     {
         struct cetrafs_setattr_ns u = {
+            .ia_valid = attr->ia_valid,
             .mode = cetrafs_cpu_to_le32(inode->i_mode),
             .uid = cetrafs_cpu_to_le32(i_uid_read(inode)),
             .gid = cetrafs_cpu_to_le32(i_gid_read(inode)),
