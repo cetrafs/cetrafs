@@ -5413,6 +5413,21 @@ out_free:
 #undef old_raw
 }
 
+/*
+ * fallocate changes the file the way a write does, so it drops the
+ * setuid/setgid bits and moves mtime/ctime the way a write does:
+ * file_modified(), as ext4 and XFS call it. It was called nowhere in
+ * the module, so a group-writable setuid file kept its bit after its
+ * contents were punched (audit 2026-11-05, class 23;
+ * tests/kernel/fallocate_strips_suid.sh). Under inode_lock, which
+ * file_remove_privs() requires, and BEFORE invalidate_lock: removing the
+ * bits is a notify_change() into cetrafs_setattr().
+ */
+static int cetrafs_fallocate_modified(struct file *file)
+{
+    return file_modified(file);
+}
+
 static long cetrafs_fallocate(struct file *file, int mode, loff_t offset, loff_t len)
 {
     struct inode *inode = file_inode(file);
@@ -5450,6 +5465,14 @@ static long cetrafs_fallocate(struct file *file, int mode, loff_t offset, loff_t
         long arc;
 
         inode_lock(inode);
+        /* Strip setuid/setgid and move the times, as every write does --
+         * see cetrafs_fallocate_modified(). */
+        arc = cetrafs_fallocate_modified(file);
+        if (arc) {
+            inode_unlock(inode);
+            kfree(recs);
+            return arc;
+        }
         /*
          * Preallocation appends extents over what are holes right now,
          * and a write fault allocating the same offset would append a
@@ -5508,6 +5531,12 @@ static long cetrafs_fallocate(struct file *file, int mode, loff_t offset, loff_t
     }
 
     inode_lock(inode);
+    ret = cetrafs_fallocate_modified(file);
+    if (ret) {
+        inode_unlock(inode);
+        kfree(recs);
+        return ret;
+    }
     /* Same reason as cetrafs_truncate_shrink(): a punch frees blocks,
      * and in-flight direct I/O is aimed at the physical ones. Drained
      * BEFORE invalidate_lock: an O_DIRECT write's completion takes it to
