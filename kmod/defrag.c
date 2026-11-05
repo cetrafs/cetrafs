@@ -901,10 +901,18 @@ struct cetrafs_defrag {
     struct workqueue_struct *wq;
 };
 
+/* Requests that found their inode number reused by another file. */
+static atomic64_t cetrafs_defrag_stale_reqs = ATOMIC64_INIT(0);
+u64 cetrafs_defrag_stale_req_count(void)
+{
+    return (u64) atomic64_read(&cetrafs_defrag_stale_reqs);
+}
+
 struct cetrafs_defrag_req {
     struct work_struct work;
     struct super_block *sb;
     u64 ino;
+    u64 gen; /* the file the request is about: a number gets reused */
 };
 
 static void cetrafs_defrag_worker(struct work_struct *work)
@@ -914,12 +922,34 @@ static void cetrafs_defrag_worker(struct work_struct *work)
     struct inode *inode;
     int ret;
 
-    if (cetrafs_sb_is_fenced(sb) || cetrafs_sb_defrag_draining(sb))
+    if (cetrafs_sb_is_fenced(sb) || cetrafs_sb_defrag_draining(sb)) {
+        /* Bailing before the iget below must still clear the dedup
+         * latch, or every later consider() of the file reads "already
+         * queued" for as long as its inode stays cached (audit L22).
+         * ilookup: no I/O, and only the object the latch is on. */
+        inode = ilookup(sb, req->ino);
+        if (inode) {
+            if (cetrafs_inode_get_generation(inode) == req->gen)
+                cetrafs_lock_defrag_unqueue(inode);
+            iput(inode);
+        }
         goto out_free;
+    }
 
     inode = cetrafs_iget(sb, req->ino);
     if (IS_ERR(inode))
         goto out_free;
+    /* The file was deleted and its number given to another since the
+     * request was queued: not the file anyone asked about (audit L2).
+     * Its own latch is its own; leave it alone. */
+    if (cetrafs_inode_get_generation(inode) != req->gen) {
+        pr_debug("auto-defrag: ino=%llu is a different file now (generation %llu, queued for %llu) -- skipped\n",
+                 (unsigned long long) req->ino, (unsigned long long) cetrafs_inode_get_generation(inode),
+                 (unsigned long long) req->gen);
+        atomic64_inc(&cetrafs_defrag_stale_reqs);
+        iput(inode);
+        goto out_free;
+    }
 
     /* Clear the dedup latch first: a close/append that lands while we
      * work can legitimately re-arm. */
@@ -1069,6 +1099,7 @@ void cetrafs_defrag_consider(struct inode *inode, u32 extents, u64 nblocks)
 
     req->sb = sb;
     req->ino = inode->i_ino;
+    req->gen = cetrafs_inode_get_generation(inode);
     INIT_WORK(&req->work, cetrafs_defrag_worker);
     queue_work(d->wq, &req->work);
 }

@@ -647,6 +647,7 @@ int cetrafs_defrag_inode(struct inode *inode, struct cetrafs_defrag_stats *out_s
 int cetrafs_defrag_init(struct super_block *sb, struct cetrafs_defrag **out_d);
 void cetrafs_defrag_stop(struct cetrafs_defrag *d);
 void cetrafs_defrag_consider(struct inode *inode, u32 extents, u64 nblocks);
+u64 cetrafs_defrag_stale_req_count(void);
 
 // nslock.c -- the per-inode namespace lock
 int cetrafs_nslock_acquire(struct inode *inode);
