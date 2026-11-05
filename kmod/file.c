@@ -5492,8 +5492,20 @@ static void cetrafs_ns_apply_setattr(cetrafs_inode_t *rec, void *arg)
     rec->ctime = u->ctime;
 }
 
+/* TEST ONLY: refuse setattr's next namespace publish, as a CAS the
+ * device refused would (tests/kernel/setattr_rollback.sh). */
+static bool cetrafs_setattr_ns_fail_once;
+cetrafs_test_param(setattr_ns_fail_once, cetrafs_setattr_ns_fail_once, bool, 0644);
+MODULE_PARM_DESC(setattr_ns_fail_once, "TEST ONLY: fail setattr's next namespace-sector publish with -EIO");
+
 static int cetrafs_setattr_locked(struct mnt_idmap *idmap, struct dentry *dentry, struct iattr *attr)
 {
+    struct {
+        umode_t mode;
+        kuid_t uid;
+        kgid_t gid;
+        struct timespec64 atime, mtime, ctime;
+    } saved;
     struct inode *inode = d_inode(dentry);
     int ret;
 
@@ -5594,6 +5606,18 @@ static int cetrafs_setattr_locked(struct mnt_idmap *idmap, struct dentry *dentry
             return ret;
     }
 
+    /* What setattr_copy() is about to change in-core, kept so a refused
+     * publish can put it back: left in place, a chmod that FAILED stays
+     * in the inode, and the next setattr of anything else publishes it
+     * (audit L36). */
+    {
+        saved.mode = inode->i_mode;
+        saved.uid = inode->i_uid;
+        saved.gid = inode->i_gid;
+        saved.atime = inode_get_atime(inode);
+        saved.mtime = inode_get_mtime(inode);
+        saved.ctime = inode_get_ctime(inode);
+    }
     setattr_copy(idmap, inode, attr);
     mark_inode_dirty(inode);
 
@@ -5651,11 +5675,20 @@ static int cetrafs_setattr_locked(struct mnt_idmap *idmap, struct dentry *dentry
 
         cetrafs_invalidate_raw_inode(inode->i_sb, inode->i_ino);
         ret = cetrafs_read_raw_inode(inode->i_sb, inode->i_ino, &nsraw);
+        if (!ret && READ_ONCE(cetrafs_setattr_ns_fail_once) && xchg(&cetrafs_setattr_ns_fail_once, false))
+            ret = -EIO; /* test-only; see the parameter */
         if (!ret)
             ret = cetrafs_inode_ns_cas(inode->i_sb, inode->i_ino, cetrafs_le64(nsraw.generation), &nsraw,
                                        cetrafs_ns_apply_setattr, &u);
-        if (ret)
+        if (ret) {
+            inode->i_mode = saved.mode;
+            inode->i_uid = saved.uid;
+            inode->i_gid = saved.gid;
+            inode_set_atime_to_ts(inode, saved.atime);
+            inode_set_mtime_to_ts(inode, saved.mtime);
+            inode_set_ctime_to_ts(inode, saved.ctime);
             return ret;
+        }
     }
 
     ret = cetrafs_write_vfs_inode(inode);
