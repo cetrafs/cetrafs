@@ -12,11 +12,15 @@
 #
 # Now a write is logged as a TEST ONLY knob, and a mount takes the value
 # clamped: 0/0 becomes a 1 s beat and a 3 s window; an overflowing beat
-# and window become 3600 s and 86400 s.
+# and window become 3600 s and 86400 s. And the pair is held to the
+# controls file's rule, stale >= 3 beats: a 3600 s beat with a 120 s
+# window had peers call the node dead after two minutes while its own
+# lease ran three hours -- the window is raised to 10800.
 #
 # DISCRIMINATION: proven 2026-11-05 with the old plain parameters and
 # unclamped seeding: no TEST ONLY line, and the mount reports
-# stale_secs 0 and the overflowing beat as written.
+# stale_secs 0 and the overflowing beat as written; with the per-value
+# clamp alone, 3600/120 reaches the mount as 120.
 set -euo pipefail
 . "$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)/lib/harness.sh"
 require_root
@@ -51,5 +55,13 @@ ct_mount "$DEV" "$MNT"
     fail "hb_interval_secs=4294967 reached the mount as $(info hb_interval_secs)"
 [ "$(info stale_secs)" = 86400 ] && pass "an enormous stale_secs is capped at 86400" ||
     fail "stale_secs=4294967295 reached the mount as $(info stale_secs)"
+ct_umount "$MNT"
+
+ct_param_set stale_secs 120
+ct_param_set hb_interval_secs 3600
+ct_mount "$DEV" "$MNT"
+[ "$(info hb_interval_secs)" = 3600 ] || fail "setup: hb_interval_secs=3600 reached the mount as $(info hb_interval_secs)"
+[ "$(info stale_secs)" = 10800 ] && pass "a window under three beats is raised to fit them (3600/120 -> 10800)" ||
+    fail "hb_interval_secs=3600 with stale_secs=120 reached the mount as a $(info stale_secs) s window"
 ct_umount "$MNT"
 ct_exit

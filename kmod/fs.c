@@ -3699,10 +3699,18 @@ unsigned int cetrafs_param_hb_interval_secs(void)
     return clamp_t(unsigned int, READ_ONCE(cetrafs_hb_interval_secs), 1u, CETRAFS_PARAM_HB_MAX_SECS);
 }
 
+/* Bounded alone AND against the beat, as the controls file bounds an
+ * operator's write: a window under CETRAFS_STALE_MIN_BEATS beats has
+ * peers call this node dead while it still holds a lease of three beats
+ * (hb_interval_secs=3600 with the default 120 s window: dead after two
+ * minutes, leased for three hours). The window is raised to fit the beat;
+ * 3 x CETRAFS_PARAM_HB_MAX_SECS is still under the cap. */
 unsigned int cetrafs_param_stale_secs(void)
 {
-    return clamp_t(unsigned int, READ_ONCE(cetrafs_stale_secs), CETRAFS_PARAM_STALE_MIN_SECS,
-                   CETRAFS_PARAM_STALE_MAX_SECS);
+    unsigned int v = clamp_t(unsigned int, READ_ONCE(cetrafs_stale_secs), CETRAFS_PARAM_STALE_MIN_SECS,
+                             CETRAFS_PARAM_STALE_MAX_SECS);
+
+    return max_t(unsigned int, v, CETRAFS_STALE_MIN_BEATS * cetrafs_param_hb_interval_secs());
 }
 
 /* This mount's heartbeat period and staleness window. Both fall back to
