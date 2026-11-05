@@ -5761,12 +5761,23 @@ func RunScrubTransit(clients []*Client, baseDir string) (bool, error) {
 // WARN). This used to be an allow-list of eight phrases, so every ERR
 // kind added to fsck later counted as "repairable residue": 252 extents
 // hidden behind a stale index range passed the storm that way.
+//
+// One ERR kind is residue, not damage: a free-count CACHE that disagrees
+// with its bitmap. Free counts accrue in memory and reach the device at
+// durability boundaries; a node cut in between loses its delta, and the
+// count is reconciled from the bitmap when the Zone Group changes owner
+// (fsck -r also repairs it). The bitmap is the truth and is not in doubt.
 func stormFsckFatal(out string) []string {
 	var fatal []string
 	for _, ln := range strings.Split(out, "\n") {
-		if l := strings.TrimSpace(ln); strings.HasPrefix(l, "ERR") {
-			fatal = append(fatal, l)
+		l := strings.TrimSpace(ln)
+		if !strings.HasPrefix(l, "ERR") {
+			continue
 		}
+		if strings.Contains(l, "free_data_blocks") && strings.Contains(l, "actually free") {
+			continue
+		}
+		fatal = append(fatal, l)
 	}
 	return fatal
 }
