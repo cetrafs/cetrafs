@@ -284,6 +284,8 @@ static void growfs_refuse_live_peer(const char *dev)
 
 int main(int argc, char **argv)
 {
+    int grow_rc = 0; /* a Zone Group row left unstamped after the publish (audit L14) */
+
     if (argc < 2) {
         usage(argv[0]);
         return 2;
@@ -986,6 +988,11 @@ int main(int argc, char **argv)
             memcpy(&seg, blk, sizeof(seg));
             if (cetrafs_le32(seg.magic) != CETRAFS_BGSEG_MAGIC)
                 die("%s: Block Group table segment at %" PRIu64 " has no magic", dev, cur);
+            /* Verified before it is restamped: a restamp would make a
+             * damaged header valid (audit L14). */
+            if ((u32) cetrafs_le64(seg.checksum) != crc32c_struct(&seg, sizeof(seg), offsetof(cetrafs_bg_segment_t, checksum),
+                                                                  sizeof(seg.checksum)))
+                die("%s: Block Group table segment at %" PRIu64 " fails its checksum -- run fsck", dev, cur);
             if (cetrafs_le32(seg.first_bg_id) != filled || cetrafs_le32(seg.count) > old_b - filled)
                 die("%s: Block Group table segment at %" PRIu64 " does not continue the chain", dev, cur);
             filled += cetrafs_le32(seg.count);
@@ -1083,6 +1090,19 @@ int main(int argc, char **argv)
             continue;
         read_block(fd, cetrafs_le64(sb.zg_table_start) + z, blk);
         memcpy(&zg, blk, sizeof(zg));
+        /* As the segment above: restamping a damaged hot sector would
+         * hide the damage under a valid checksum (audit L14). The grow
+         * is already published, so this one is reported, not fatal: the
+         * aggregate is a cache and the row is left for fsck. */
+        if ((u32) cetrafs_le64(zg.hot_checksum) !=
+            crc32c_struct((const u8 *) &zg + CETRAFS_ZG_HOT_OFF, CETRAFS_ZG_HOT_LEN,
+                          offsetof(cetrafs_zone_group_t, hot_checksum) - CETRAFS_ZG_HOT_OFF, sizeof(zg.hot_checksum))) {
+            fprintf(stderr, "growfs.cetra: Zone Group %u fails its checksum -- its free count was not updated; run "
+                            "fsck\n",
+                    z);
+            grow_rc = 1;
+            continue;
+        }
         zg.free_data_blocks = cetrafs_cpu_to_le64(cetrafs_le64(zg.free_data_blocks) + zg_added[z] * data_cnt);
         zg.hot_checksum = 0;
         zg.hot_checksum = cetrafs_cpu_to_le64((u64) crc32c_struct(
@@ -1104,5 +1124,5 @@ int main(int argc, char **argv)
 
     fprintf(stdout, "cetrafs growfs: completed (layout_gen %" PRIu64 ") -- run fsck.cetra to verify\n",
             cetrafs_le64(sb.layout_gen));
-    return 0;
+    return grow_rc;
 }
