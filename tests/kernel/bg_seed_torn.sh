@@ -16,8 +16,13 @@
 # checksum; two writers allocating in the same Block Group flush it
 # concurrently.
 #
-# The control (last, as it damages the count): bg_seed_unlocked=1 copies
-# without the lock, and the same load must count corruption.
+# Since a seed the mutator refuses is read fresh instead (caw.c), a torn
+# seed no longer counts as damage; it costs a wasted read, counted as
+# cas_seed_refused. That counter is what this suite watches: zero under
+# the locked copy, and nonzero -- with still no damage -- in the control.
+#
+# The control (last): bg_seed_unlocked=1 copies without the lock, and the
+# same load must tear seeds.
 set -euo pipefail
 . "$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)/lib/harness.sh"
 require_root
@@ -39,6 +44,7 @@ grep -q 'available=yes' "$(ct_procdir "$DEV")/properties" ||
 ct_param_set auto_defrag 0
 INFO="$(ct_procdir "$DEV")/info"
 corrupt() { sed -n 's/^corruptions: //p' "$INFO"; }
+refused() { sed -n 's/^cas_seed_refused: //p' "$INFO"; }
 
 load() { # <tag>: two writers, each allocating and closing (a flush) in a loop
     local tag="$1" w
@@ -51,13 +57,18 @@ load() { # <tag>: two writers, each allocating and closing (a flush) in a loop
 }
 
 C0="$(corrupt)"
+R0="$(refused)"
+[ -n "$R0" ] || { fail "setup: procfs info has no cas_seed_refused counter"; ct_exit; }
 ct_param_set bg_seed_copy_stall_ms 150
 load locked
 ct_param_set bg_seed_copy_stall_ms 0
 C1="$(corrupt)"
-log "corruptions: $C0 -> $C1 under the locked seed"
-[ "$C1" = "$C0" ] && pass "concurrent flushes of one Block Group counted no damage" ||
-    fail "concurrent flushes of one Block Group counted $((C1 - C0)) corruption(s) -- a torn seed"
+R1="$(refused)"
+log "under the locked seed: corruptions $C0 -> $C1, refused seeds $R0 -> $R1"
+[ "$R1" = "$R0" ] && pass "concurrent flushes of one Block Group never tore a seed" ||
+    fail "concurrent flushes of one Block Group tore $((R1 - R0)) seed(s)"
+[ "$C1" = "$C0" ] && pass "and counted no damage" ||
+    fail "concurrent flushes of one Block Group counted $((C1 - C0)) corruption(s)"
 
 ct_param_set bg_seed_unlocked 1
 ct_param_set bg_seed_copy_stall_ms 150
@@ -65,9 +76,12 @@ load unlocked
 ct_param_set bg_seed_copy_stall_ms 0
 ct_param_set bg_seed_unlocked 0
 C2="$(corrupt)"
-log "corruptions: $C1 -> $C2 with the seed copied unlocked"
-[ "$C2" -gt "$C1" ] && pass "control: copied without the lock, the same load counts damage ($((C2 - C1)))" ||
-    fail "control: the unlocked copy counted no damage either -- the load never tore a seed, this suite proves nothing"
+R2="$(refused)"
+log "with the seed copied unlocked: corruptions $C1 -> $C2, refused seeds $R1 -> $R2"
+[ "$R2" -gt "$R1" ] && pass "control: copied without the lock, the same load tears seeds ($((R2 - R1)))" ||
+    fail "control: the unlocked copy tore no seed either -- the load never raced, this suite proves nothing"
+[ "$C2" = "$C1" ] && pass "and a torn seed is read fresh, not counted as damage" ||
+    fail "a torn seed was counted as damage ($((C2 - C1))) -- it must be re-read, it is not the device's image"
 
 ct_umount "$MNT"
 ct_exit

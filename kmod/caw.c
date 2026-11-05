@@ -970,6 +970,16 @@ static void cetrafs_cas_refused_damage(struct super_block *sb, u64 fs_lba)
         cetrafs_sb_corrupt(sb, 0);
 }
 
+/* Seeds a mutator refused (a torn or edited caller copy), each costing
+ * a fresh read. Nonzero means some caller seeded with a copy that was not
+ * the device's image -- tests/kernel/bg_seed_torn.sh. */
+static atomic64_t cetrafs_cas_seed_refused = ATOMIC64_INIT(0);
+
+u64 cetrafs_cas_seed_refused_count(void)
+{
+    return (u64) atomic64_read(&cetrafs_cas_seed_refused);
+}
+
 static int cetrafs_cas_region_seeded_impl(struct super_block *sb,
                                           u64 fs_lba,
                                           unsigned int region_idx,
@@ -1150,8 +1160,10 @@ static int cetrafs_cas_region_seeded_impl(struct super_block *sb,
          * the DEVICE. Read it fresh and ask again (a two-node reclaim of
          * a dead node's lock was refused every time otherwise).
          */
-        if (ret == -EUCLEAN && seeded)
+        if (ret == -EUCLEAN && seeded) {
+            atomic64_inc(&cetrafs_cas_seed_refused);
             continue;
+        }
         if (ret) {
             ret = (ret > 0) ? 0 : ret; /* >0 == "nothing to do", success --
                                         * same TRAP as the real-CAW path
