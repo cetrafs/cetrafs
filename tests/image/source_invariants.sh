@@ -1038,6 +1038,140 @@ printf '    if (s->draining)\n        return;\n' >"$SAMPLE"
 [ -n "$(plain_flag "$SAMPLE")" ] && pass "stop flags: control -- a plain read is caught" ||
     fail "stop flags: control -- a plain read is not caught"
 
+# Class 36 (fail-open guards). A check written `X(..., &out) == 0 && out`
+# reads "no error and the answer is yes" -- and an ERROR falls into the
+# other branch with the answer. Harmless where the true branch is the
+# one that ACTS (an error then does nothing); a hole where the true
+# branch is the one that REFUSES: evict asked "does another node still
+# use this file?" that way, and every failure of the question freed the
+# number and the blocks under a peer's open fd (audit 2026-11-05, N1).
+# Every site of the shape is listed with the direction that makes it
+# safe; a new one fails until someone has judged it. The split form
+# (`rc = X(&out); if (!rc && out)`) is not seen -- a gap the entry records.
+log "checking every 'no error && answer' guard has its direction judged"
+FAILOPEN_OK='alloc.c:cetrafs_read_bg_geom:pre-filter; the claim re-checks under its own CAS
+alloc.c:cetrafs_bg_data_block_stats:acts (debits the pool) only on success
+defrag.c:cetrafs_read_raw_inode_overlaid:advisory re-queue only
+dir.c:cetrafs_read_raw_inode:acts (zeroes nlink) only on success; an error leaks
+dir.c:cetrafs_rename_ns_delta:acts (set_nlink) only on success; an error leaves the count high
+dir.c:cetrafs_walk_dirents:target discovery; the locked re-check decides
+heartbeat.c:cetrafs_node_self_fence_check:pre-check; the renewal compares fence_epoch itself
+inode.c:cetrafs_sb_get_node_id:true branch skips a refresh; an error applies it, the default
+lock.c:cetrafs_node_is_stale:acts (reclaims a reader bit) only on success; an error counts the reader
+node.c:cetrafs_node_is_stale:true branch skips a peer; an error counts it as live
+scrub.c:cetrafs_zg_scrub_adopt_one_stale:log only
+xattr.c:cetrafs_xattr_slot_free:returns bool, not an error
+zonegroup.c:cetrafs_bg_release_empty:log only
+zonegroup.c:cetrafs_zg_try_claim_one:acts (counts a claim) only on success
+zonegroup.c:cetrafs_bg_data_block_stats:fast-path pick; an error falls to the full scan'
+failopen_sites() {
+    for f in "$@"; do
+        grep -nE '(cetrafs_[a-z0-9_]+\([^;]*&[^;]*\)[[:space:]]*==[[:space:]]*0[[:space:]]*&&)|(![[:space:]]*cetrafs_[a-z0-9_]+\([^;]*&[^;]*\)[[:space:]]*&&)' "$f" |
+            while IFS= read -r l; do
+                c="$(sed -nE 's/.*(^|[^a-z0-9_])(cetrafs_[a-z0-9_]+)\([^;]*&[^;]*\)[[:space:]]*==[[:space:]]*0[[:space:]]*&&.*/\2/p' <<<"$l")"
+                [ -n "$c" ] || c="$(sed -nE 's/.*![[:space:]]*(cetrafs_[a-z0-9_]+)\(.*/\1/p' <<<"$l")"
+                echo "$(basename "$f"):$c"
+            done
+    done | sort -u
+}
+FO="$(failopen_sites "$K"/*.c)"
+NFO="$(grep -c . <<<"$FO" || true)"
+[ "$NFO" -ge 10 ] || fail "fail-open guards: found only $NFO sites -- the scan is not seeing the tree"
+UNJ="$(while read -r k; do [ -n "$k" ] && ! grep -q "^$k:" <<<"$FAILOPEN_OK" && echo "$k"; done <<<"$FO" || true)"
+[ -z "$UNJ" ] && pass "fail-open guards: all $NFO 'no error && answer' sites have a judged direction" ||
+    fail "fail-open guards: judge the error direction of (an error must not reach the permissive branch): $(echo $UNJ)"
+SAMPLE="$(ct_tmp failopen-sample).c"
+printf '    if (cetrafs_lock_foreign_user_exists(sb, ino, me, &blocked, &reader) == 0 &&\n        (blocked || reader))\n        ret = -ETXTBSY;\n' >"$SAMPLE"
+[ "$(failopen_sites "$SAMPLE")" = "$(basename "$SAMPLE"):cetrafs_lock_foreign_user_exists" ] &&
+    pass "fail-open guards: control -- the old evict guard is caught" ||
+    fail "fail-open guards: control -- the old evict guard is not caught ($(failopen_sites "$SAMPLE"))"
+
+# Class 37 (a wait made true without a wake). wait_event() re-tests its
+# condition only when its queue is woken; a store that makes the
+# condition true and wakes nobody leaves the waiter asleep for good. The
+# journal held a slot past its operation that way: the waiter's "or
+# every slot is held" became true and nobody said so, so the writer
+# slept uninterruptibly, holding a buffer's update lock (audit
+# 2026-11-05, N2). Per waited queue: the stores that can make its
+# condition true, and the wake every function doing one must contain.
+# The count of wait sites is pinned, so a new wait fails here until its
+# queue is specified below.
+log "checking every store that can satisfy a wait wakes its queue"
+# file|function exempt from the rule (or -)|store regex|wake regex
+WAKE_SPEC='journal.c|cetrafs_journal_write_block_flags|clear_bit\([^,]*, *j->busy\)|j->held\+\+|\+\+j->held|wake_up(_all)?\(&j->slot_wq\)
+dmpath.c|-|->resolving = false|wake_up(_all)?\(&cetrafs_dmpath_wq\)
+caw.c|-|atomic_dec[a-z_]*\(&ctx->running\)|wake_up(_all)?\(&ctx->done\)'
+# The first spec line's exemption is the waiter itself: it clears a held
+# slot's bit and re-sets it under the same j->lock hold, so nothing
+# becomes free (journal.c, "re-set below").
+unwoken() { # <file> <exempt fn> <store re> <wake re>: functions storing without waking
+    # Through the environment: awk -v would eat the regexes' backslashes.
+    WEX="$2" WST="$3" WWK="$4" awk '
+        BEGIN { ex = ENVIRON["WEX"]; st = ENVIRON["WST"]; wk = ENVIRON["WWK"] }
+        /^[a-z].*\(/ && !/;[[:space:]]*$/ { fn = $0; sub(/\(.*/, "", fn); sub(/.*[ *]/, "", fn); stored = 0; woke = 0 }
+        fn != "" && $0 ~ st && $0 !~ /^[[:space:]]*(\*|\/\*)/ { stored = 1 }
+        fn != "" && $0 ~ wk { woke = 1 }
+        /^}/ { if (fn != "" && fn != ex && stored && !woke) print FILENAME ":" fn; fn = "" }' "$1"
+}
+WSITES="$(grep -cE '^[^*/]*\bwait_event[a-z_]*\(' "$K"/*.c | awk -F: '{ n += $2 } END { print n + 0 }')"
+[ "$WSITES" = 4 ] && pass "wait wakes: 4 wait_event sites, each queue specified" ||
+    fail "wait wakes: $WSITES wait_event sites (specified for 4) -- add the new queue's stores and wake to WAKE_SPEC"
+UW=""
+while IFS= read -r line; do
+    f="${line%%|*}"; rest="${line#*|}"; ex="${rest%%|*}"; rest="${rest#*|}"
+    wk="${rest##*|}"; st="${rest%|*}"
+    UW="$UW$(unwoken "$K/$f" "$ex" "$st" "$wk" | sed "s|$K/||") "
+done <<<"$WAKE_SPEC"
+[ -z "${UW// /}" ] && pass "wait wakes: every function that can satisfy a wait wakes its queue" ||
+    fail "wait wakes: a store that can satisfy a wait, with no wake, in: $UW"
+SAMPLE="$(ct_tmp wake-sample).c"
+printf 'static void cetrafs_journal_hold_slot(struct cetrafs_journal *j, u32 slot)\n{\n    j->held++;\n}\n' >"$SAMPLE"
+[ -n "$(unwoken "$SAMPLE" - 'j->held\+\+' 'wake_up(_all)?\(&j->slot_wq\)')" ] &&
+    pass "wait wakes: control -- the old hold_slot (held++ and no wake) is caught" ||
+    fail "wait wakes: control -- the old hold_slot is not caught"
+
+# Class 40 (main line and signal handler in the same code). The repair
+# tools renew their claim from a SIGALRM handler, and fsck renewed the
+# same row from its main line with the same static buffers and SIGALRM
+# unmasked: a tick between the main call's read and its CAW made the
+# CAW miscompare and the tool exit "claim taken away" (audit 2026-11-05,
+# N7). Every function a handler calls is listed with what keeps the
+# main line from interleaving with it, and that is checked in its body.
+log "checking what the signal handlers call is safe against the main line"
+U="$ROOT/userspace"
+HANDLERS="$(grep -hoE 'sa_handler = cetrafs_[a-z0-9_]+' "$U"/*.c "$U"/*.h | sed 's/.*= //' | sort -u | tr '\n' ' ')"
+[ "$HANDLERS" = "cetrafs_repair_stop cetrafs_repair_tick " ] && pass "signal handlers: the two known handlers, and no new one" ||
+    fail "signal handlers: installed handlers are now '$HANDLERS' -- list what each calls below"
+fn_body() { # <file> <fn>: the body of a function defined in it
+    awk -v f="$2" '$0 ~ "^static.*[ *]" f "\\(" && !/;[[:space:]]*$/ { on = 1 } on { print } on && /^}/ { exit }' "$1"
+}
+handler_calls() { # <file> <handler...>: cetrafs_* functions the handlers call
+    local h="$1"; shift
+    for x in "$@"; do fn_body "$h" "$x" | tail -n +2 | grep -oE 'cetrafs_[a-z0-9_]+\(' | tr -d '('; done | sort -u
+}
+SIGSAFE_OK='cetrafs_repair_renew:masks SIGALRM around the renewal (sigprocmask)
+cetrafs_repair_node_beat:called from the tick handler only
+cetrafs_repair_release:disarms the timer before any I/O'
+CALLED="$(handler_calls "$U/devutil.h" cetrafs_repair_tick cetrafs_repair_stop)"
+UNL="$(while read -r c; do [ -n "$c" ] && ! grep -q "^$c:" <<<"$SIGSAFE_OK" && echo "$c"; done <<<"$CALLED" || true)"
+[ -n "$CALLED" ] || fail "signal handlers: found nothing the handlers call -- the scan is not seeing them"
+[ -z "$UNL" ] && pass "signal handlers: everything they call is listed with what keeps the main line out" ||
+    fail "signal handlers: they call, unjudged: $(echo $UNL)"
+fn_body "$U/devutil.h" cetrafs_repair_renew | grep -q 'sigprocmask(SIG_BLOCK' &&
+    pass "signal handlers: cetrafs_repair_renew masks SIGALRM" ||
+    fail "signal handlers: cetrafs_repair_renew no longer masks SIGALRM around the renewal"
+fn_body "$U/devutil.h" cetrafs_repair_release | tail -n +2 | grep -m1 -E 'cetrafs_|pread|pwrite' | grep -q 'cetrafs_repair_timer(fd, sb, row, 0)' &&
+    pass "signal handlers: cetrafs_repair_release disarms the timer first" ||
+    fail "signal handlers: cetrafs_repair_release does I/O before disarming the timer"
+NB="$(grep -nE 'cetrafs_repair_node_beat\(' "$U"/*.c "$U"/*.h | grep -vE 'static inline int cetrafs_repair_node_beat|cetrafs_renew_fd' || true)"
+[ -z "$NB" ] && pass "signal handlers: cetrafs_repair_node_beat has no main-line caller" ||
+    fail "signal handlers: cetrafs_repair_node_beat called from the main line at: $(echo "$NB" | cut -d: -f1,2)"
+SAMPLE="$(ct_tmp sig-sample).h"
+printf 'static void cetrafs_repair_tick(int sig)\n{\n    cetrafs_write_row(fd);\n}\n' >"$SAMPLE"
+[ "$(handler_calls "$SAMPLE" cetrafs_repair_tick)" = cetrafs_write_row ] &&
+    pass "signal handlers: control -- an unlisted call in a handler is seen" ||
+    fail "signal handlers: control -- a planted handler call is not seen"
+
 # The module must publish the filesystem alias get_fs_type() asks
 # modprobe for ("fs-<name>") when a mount names a type nothing has
 # registered. Without it, `mount -t cetrafs` on a host that has the
