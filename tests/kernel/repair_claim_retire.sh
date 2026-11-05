@@ -70,6 +70,17 @@ S="$(state "$ROW")"
 [ "$S" = 1 ] && pass "A: SIGTERM -- the borrowed row $ROW is a registration again" ||
     fail "A: SIGTERM left row $ROW in state $S (2 = still a repair claim)"
 
+# A2. SIGPIPE and SIGABRT (a reader gone from `fsck -r | head`; an abort
+# mid-repair) released nothing either (audit F9).
+for SIG in PIPE ABRT; do
+    read -r PID ROW < <(start_repair)
+    [ "$(state "$ROW")" = 2 ] || fail "setup: row $ROW is not a repair claim while fsck holds it"
+    kill -"$SIG" "$PID"; wait "$PID" 2>/dev/null || true
+    S="$(state "$ROW")"
+    [ "$S" = 1 ] && pass "A2: SIG$SIG -- the borrowed row $ROW is a registration again" ||
+        fail "A2: SIG$SIG left row $ROW in state $S (2 = still a repair claim)"
+done
+
 # B. SIGKILL: nothing in the tool runs; the kernel's mount gate watches
 # the dead claim for the stale window and gives the row back.
 read -r PID ROW < <(start_repair)

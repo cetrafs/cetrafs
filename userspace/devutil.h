@@ -709,7 +709,15 @@ static inline unsigned cetrafs_probe_window(uint32_t max_advertised)
 {
     unsigned knob = cetrafs_peer_probe_secs();
     uint32_t pi = max_advertised < CETRAFS_HB_INTERVAL_MAX_SECS ? max_advertised : CETRAFS_HB_INTERVAL_MAX_SECS;
-    unsigned window = CETRAFS_NODE_STALE_SECS;
+    /*
+     * The LONGEST stale window a node may run, not the default: each
+     * mount's stale_secs is an operator control (15..240 s, OPERATIONS.md
+     * section 5) and is not on the device, so a tool cannot know which a
+     * live node chose -- and one that waited the default 120 s called a
+     * node gone that its peers, at 240 s, still waited for (audit F9).
+     * Paid only when some row looks live.
+     */
+    unsigned window = CETRAFS_STALE_MAX_SECS;
 
     if (knob) /* tests: the old two-beat rule over a compressed base */
         return pi && 2 * pi + 5 > knob ? 2 * pi + 5 : knob;
@@ -1102,7 +1110,10 @@ static inline void cetrafs_repair_release(int fd, const cetrafs_superblock_t *sb
  * and so is everything the release does), then the signal is re-raised
  * with its default action, so the exit status still says what happened.
  */
-static const int cetrafs_repair_stop_sigs[] = {SIGINT, SIGTERM, SIGHUP, SIGQUIT};
+/* SIGPIPE: `fsck -r ... | head`, the reader gone. SIGABRT: an assert or
+ * a libc abort mid-repair. Both killed the tool with the claim held
+ * (audit F9). SIGKILL cannot be caught: that one is the reap's. */
+static const int cetrafs_repair_stop_sigs[] = {SIGINT, SIGTERM, SIGHUP, SIGQUIT, SIGPIPE, SIGABRT};
 
 static void cetrafs_repair_stop(int sig)
 {

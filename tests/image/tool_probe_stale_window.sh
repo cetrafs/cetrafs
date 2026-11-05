@@ -9,12 +9,17 @@
 # plus 5 s, 35 s at a 15 s interval, then formatted or repaired a
 # volume such a node was about to write to.
 #
-# Staged: a registered row (15 s interval) whose beats stop for 45 s and
-# then resume, as a node's would when its paths come back. mkfs -f must
-# see it and refuse.
+# And a node's stale window is an operator control (stale_secs, up to
+# CETRAFS_STALE_MAX_SECS = 240 s) that is not on the device, so a tool
+# waits the longest any node may use (audit F9).
 #
-# DISCRIMINATION: with the two-beat window, mkfs gives up watching at
-# 35 s and formats the volume.
+# Staged: a registered row (15 s interval) whose beats stop for 150 s
+# -- past the 120 s default, inside the 240 s maximum -- and then
+# resume, as a node's would when its paths come back. mkfs -f must see
+# it and refuse.
+#
+# DISCRIMINATION: with the two-beat window mkfs gives up at 35 s, and
+# with the default window at 120 s; both format the volume.
 set -euo pipefail
 . "$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)/lib/harness.sh"
 require_root
@@ -32,12 +37,12 @@ OLD="$(sha256sum <"$SB")"
 "$NPOKE" "$IMG" 1 1 bb "$(date +%s)" 15 >/dev/null
 grep -q 'state=1 .*hb_interval=15' <<<"$("$NPOKE" "$IMG" 1)" ||
     { fail "setup: the registered row was not planted: $("$NPOKE" "$IMG" 1)"; ct_exit; }
-# Its paths are down for 45 s, then its queued beats land. Geometry off
+# Its paths are down for 150 s, then its queued beats land. Geometry off
 # the saved superblock: mkfs has zeroed block 0 by then.
-( sleep 45; for _ in $(seq 1 20); do NODE_POKE_SB="$SB" "$NPOKE" "$IMG" 1 --beat >/dev/null 2>&1 || true; sleep 1; done ) &
+( sleep 150; for _ in $(seq 1 20); do NODE_POKE_SB="$SB" "$NPOKE" "$IMG" 1 --beat >/dev/null 2>&1 || true; sleep 1; done ) &
 BEATER=$!
 blockdev --flushbufs "$DEV"
-pass "setup: a node registered at a 15 s interval, silent for 45 s"
+pass "setup: a node registered at a 15 s interval, silent for 150 s"
 
 T0="$(date +%s)"
 OUT="$("$ROOT/userspace/mkfs.cetra" "$DEV" -z 1 -b 512 -J 0 -N 1024 -f 2>&1)" && RC=0 || RC=$?
