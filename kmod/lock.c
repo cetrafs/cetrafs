@@ -4410,6 +4410,20 @@ int cetrafs_flock(struct file *file, int cmd, struct file_lock *fl)
     if (!(fl->c.flc_flags & FL_FLOCK))
         return -ENOLCK; /* only real flock(2), not emulated posix/OFD */
 
+    /*
+     * On an ordinary filesystem flock(2) is advisory and open to any fd.
+     * Here it drives a MANDATORY, cluster-wide lock: LOCK_EX under
+     * nofilelock refuses every peer open of the file, and LOCK_UN on the
+     * default mount suspends this node's lock, so the file's real writer
+     * gets ETXTBSY on every write. So both need what a writer has -- a fd
+     * open for writing -- or CAP_SYS_ADMIN; a read-only fd gets EBADF, as
+     * a write lock through one does under fcntl(2) (audit 2026-11-05,
+     * section 4; docs/internal/OPERATIONS.md;
+     * tests/kernel/flock_needs_writable_fd.sh).
+     */
+    if (!(file->f_mode & FMODE_WRITE) && !capable(CAP_SYS_ADMIN))
+        return -EBADF;
+
     if (lock_is_unlock(fl)) {
         /* Default mount: give the automatic lock back for this inode,
          * keeping the file open -- the handoff window. Elsewhere: drop
