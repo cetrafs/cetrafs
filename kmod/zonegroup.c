@@ -2252,11 +2252,12 @@ retry_scan:
      * went unnoticed there; on real iSCSI hardware it meant every block
      * of a write paying for zone_group_count real network round trips,
      * reported directly as the whole filesystem being "extremely slow".
-     * Ownership of a ZG this node holds cannot change out from under it
-     * while it stays alive and mounted (a peer only ever reclaims a
-     * *stale* owner's ZG), so cetrafs_sb_zg_owned_cached() -- populated
-     * once, at the moment zonegroup.c's claim path actually confirms
-     * ownership -- is always safe here and costs zero disk I/O. */
+     * cetrafs_sb_zg_owned_cached() -- populated at the moment the claim
+     * path confirms ownership -- costs zero disk I/O. It is not proof
+     * that ownership cannot have moved: a peer that judged this node
+     * stale can take a ZG under it, and the lease is what bounds the
+     * damage (fs.c, owned_zgs: this node fences no later than its next
+     * tick). */
     {
         u32 best_bg = 0;
         u64 best_free = 0;

@@ -361,12 +361,20 @@ struct cetrafs_sb_info {
      * loop-device test harness that's nearly free, so it went unnoticed;
      * on real iSCSI hardware it meant every block of a write paying for
      * zone_group_count real network round trips, reported as the whole
-     * filesystem being "extremely slow". Ownership of a ZG this node
-     * holds cannot change out from under it while it stays alive and
-     * mounted (a peer only ever reclaims a *stale* owner's ZG) -- so
-     * once this node has confirmed ownership via the claim path, caching
-     * that fact (and the ZG's static, mkfs-time-fixed first_bg_id/
-     * bg_count) is always safe, not just an optimistic guess. */
+     * filesystem being "extremely slow".
+     *
+     * What makes the cache safe is the LEASE, not that ownership cannot
+     * move. A peer takes a ZG only from an owner it has judged stale,
+     * and it bumps that owner's fence_epoch first. A live owner whose
+     * renewals keep landing is never judged stale; one whose renewals
+     * stop self-fences after three intervals, before the stale window
+     * a peer must wait out (cetrafs_sb_lease_renewed()); and one that
+     * WAS judged stale -- wrongly or not -- sees its epoch move on its
+     * next heartbeat tick and fences. So a ZG can be taken from under
+     * this cache, and this node can go on allocating from it until that
+     * tick at the latest; every write after it is refused
+     * (tests/kernel/zg_steal_victim_fences.sh). Nothing here re-reads
+     * the ZG record: that would be a device round trip per block. */
     DECLARE_BITMAP(owned_zgs, CETRAFS_MAX_ZONE_GROUPS);
 
 
@@ -390,10 +398,12 @@ struct cetrafs_sb_info {
      * fragmenting into a leaf update (and a journalled write) per block.
      *
      * Advisory, so it needs no lock: a torn or stale read just yields a
-     * BG that the scan would not have picked. Every real guarantee is
-     * downstream and unchanged -- cetrafs_sb_bg_is_ours() re-checks
-     * ownership, cetrafs_alloc_check_owned() re-checks it against the
-     * descriptor, and a full BG simply falls through to the scan.
+     * BG that the scan would not have picked. What it must not do is
+     * name a BG we gave up, and cetrafs_sb_bg_is_ours() and
+     * cetrafs_alloc_check_owned() both catch that -- against this
+     * node's CACHED ownership, the same belief as everything else on
+     * the per-block path (see owned_zgs above for why that is safe and
+     * what bounds it). A full BG simply falls through to the scan.
      * Needs no "unset" sentinel: zero-initialised it names BG 0, which
      * is either ours and usable (a perfectly good hint) or not ours and
      * rejected by the first check.
