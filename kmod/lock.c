@@ -2781,7 +2781,14 @@ void cetrafs_lock_retry_deferred(struct super_block *sb)
             continue;
         }
         ci = CETRAFS_I(inode);
-        mutex_lock(&ci->lock_mutex);
+        /* Not behind an open: one can hold lock_mutex across a fence and
+         * a replay (~210 s), and this pass is the heartbeat's (audit
+         * R21). Busy -> next pass. */
+        if (!mutex_trylock(&ci->lock_mutex)) {
+            cetrafs_sb_flock_defer(sb, pend[i].ino, pend[i].generation);
+            iput(inode);
+            continue;
+        }
         if (!cetrafs_sb_file_lock_enabled(sb)) {
             /* nofilelock: the only lock a record can carry is a flock
              * holder's, and the entry is a holder's close whose clear did
@@ -3544,7 +3551,14 @@ void cetrafs_lock_retry_presence(struct super_block *sb)
             continue;
         }
         ci = CETRAFS_I(inode);
-        mutex_lock(&ci->lock_mutex);
+        /* Not behind an open: one can hold lock_mutex across a fence and
+         * a replay (~210 s), and this pass is the heartbeat's (audit
+         * R21). Busy -> next pass. */
+        if (!mutex_trylock(&ci->lock_mutex)) {
+            cetrafs_sb_presence_defer(sb, pend[i].ino, pend[i].generation);
+            iput(inode);
+            continue;
+        }
         if (atomic_read(&ci->read_opener_count) == 0)
             cetrafs_lock_presence_withdraw(inode); /* re-queues itself on failure */
         else if (!READ_ONCE(ci->lock_suspended) && cetrafs_lock_suspend_mark(inode, false))
@@ -3712,7 +3726,10 @@ static int cetrafs_lock_suspend(struct inode *inode, struct file *file)
     if (cetrafs_sb_is_fenced(sb))
         return -EIO;
 
-    mutex_lock(&ci->lock_mutex);
+    /* Killable (audit R21): an open can hold lock_mutex across a fence
+     * and a replay (~210 s); a syscall queued behind it must still die. */
+    if (mutex_lock_killable(&ci->lock_mutex))
+        return -EINTR;
 
     if (ci->lock_suspended) {
         ret = 0;
@@ -3902,7 +3919,10 @@ static int cetrafs_lock_resume(struct inode *inode)
     if (cetrafs_sb_is_fenced(sb))
         return -EIO;
 
-    mutex_lock(&ci->lock_mutex);
+    /* Killable (audit R21): an open can hold lock_mutex across a fence
+     * and a replay (~210 s); a syscall queued behind it must still die. */
+    if (mutex_lock_killable(&ci->lock_mutex))
+        return -EINTR;
 
     if (!ci->lock_suspended) {
         /*
@@ -4127,7 +4147,10 @@ static int cetrafs_lock_explicit_acquire(struct inode *inode, struct file *file)
     if (ret)
         return ret;
 
-    mutex_lock(&ci->lock_mutex);
+    /* Killable (audit R21): an open can hold lock_mutex across a fence
+     * and a replay (~210 s); a syscall queued behind it must still die. */
+    if (mutex_lock_killable(&ci->lock_mutex))
+        return -EINTR;
 
     if (ci->explicit_lock_file == file) {
         ret = 0; /* idempotent: this fd already holds it */
@@ -4410,7 +4433,10 @@ int cetrafs_lock_defrag_begin(struct inode *inode)
 
     if (cetrafs_defrag_begin_stall_ms)
         msleep(cetrafs_defrag_begin_stall_ms); /* TEST ONLY */
-    mutex_lock(&ci->lock_mutex);
+    /* Killable (audit R21): an open can hold lock_mutex across a fence
+     * and a replay (~210 s); a syscall queued behind it must still die. */
+    if (mutex_lock_killable(&ci->lock_mutex))
+        return -EINTR;
 
     /* Suspended: the lock this pass would pin is not ours right now, and
      * "local writers exist, so it is already ours" -- the premise the pin
