@@ -864,6 +864,16 @@ typedef struct {
 #define CETRAFS_REPAIR_RENEW_SECS 5
 #define CETRAFS_REPAIR_PROBE_SECS (3 * CETRAFS_REPAIR_RENEW_SECS)
 
+/* A repair claim that BORROWED a registered row (no FREE row was left)
+ * keeps the row it displaced in its own block, at this byte offset --
+ * past the 128-byte entry and out of reach of the row CAS, which writes
+ * the first sector only. The release puts it back; so does whoever
+ * reaps the claim of a repairer that died. A copy whose state is not
+ * REGISTERED or whose checksum fails means "nothing was borrowed": the
+ * row is reaped to FREE. Zero on a volume mkfs wrote, and on every claim
+ * that took a FREE row. */
+#define CETRAFS_REPAIR_SAVED_OFF 2048
+
 /* Hard cap on registry rows, set by cetrafs_inode_t.read_open_nodes being
  * a 64-bit presence mask. Enforced by mkfs on -M, so the mask can never
  * silently fail to represent a reader. Far beyond the handful of hosts

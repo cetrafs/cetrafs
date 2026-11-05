@@ -119,17 +119,34 @@ for r in $(seq 0 $((ROWS - 1))); do
     "$NPOKE" "$IMG" "$r" 1 "b$r" 0 >/dev/null 2>&1 || true   # REGISTERED, departed
 done
 blockdev --flushbufs "$DEV" 2>/dev/null || true
-BEFORE_ROWS="$(dd if="$IMG" bs=4096 skip="$(( $("$(ct_helper sb_poke)" "$IMG" | sed -n 's/^node_table_start[^0-9]*\([0-9]*\).*/\1/p' | head -1) ))" count="$ROWS" 2>/dev/null | md5sum)"
+NT_START="$("$(ct_helper sb_poke)" "$IMG" | sed -n 's/^node_table_start[^0-9]*\([0-9]*\).*/\1/p' | head -1)"
+row_md5() { dd if="$IMG" bs=4096 skip=$((NT_START + $1)) count=1 2>/dev/null | md5sum; }
+declare -A BEFORE
+for r in $(seq 0 $((ROWS - 1))); do BEFORE[$r]="$(row_md5 "$r")"; done
+ZERO_MD5="$(head -c 4096 /dev/zero | md5sum)"
 
 OUT="$("$ROOT/userspace/fsck.cetra" -r "$DEV" 2>&1 || true)"
 echo "$OUT" | grep -q "claimed registry row" &&
     pass "fsck -r borrows a departed row when none is free" ||
     fail "fsck -r could not claim anything on a full registry: $(echo "$OUT" | grep -i registry | head -1)"
+BORROWED="$(sed -n 's/^  claimed registry row \([0-9]*\) .*/\1/p' <<<"$OUT")"
 
+# The borrowed row comes back byte for byte. The others may have been
+# RETIRED -- a full registry of departed rows that nothing references
+# is what fsck -r now clears (repair_claim_retire.sh) -- but nothing in
+# between: each is either untouched or free, and fsck said which.
 blockdev --flushbufs "$DEV" 2>/dev/null || true
-AFTER_ROWS="$(dd if="$IMG" bs=4096 skip="$(( $("$(ct_helper sb_poke)" "$IMG" | sed -n 's/^node_table_start[^0-9]*\([0-9]*\).*/\1/p' | head -1) ))" count="$ROWS" 2>/dev/null | md5sum)"
-[ "$AFTER_ROWS" = "$BEFORE_ROWS" ] &&
-    pass "and puts the registration back, byte for byte" ||
-    fail "the borrowed registration was not restored -- a node would lose its row"
+BAD=""
+for r in $(seq 0 $((ROWS - 1))); do
+    A="$(row_md5 "$r")"
+    if [ "$r" = "$BORROWED" ]; then
+        [ "$A" = "${BEFORE[$r]}" ] || BAD="$BAD borrowed-row-$r"
+    elif [ "$A" != "${BEFORE[$r]}" ]; then
+        [ "$A" = "$ZERO_MD5" ] && grep -q "retired node slot $r," <<<"$OUT" || BAD="$BAD row-$r"
+    fi
+done
+[ -n "$BORROWED" ] && [ -z "$BAD" ] &&
+    pass "and puts the borrowed registration (row $BORROWED) back, byte for byte; the rest are untouched or retired" ||
+    fail "the registry was not left as it should be:$BAD (borrowed row '$BORROWED')"
 
 ct_exit

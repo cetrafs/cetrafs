@@ -1938,12 +1938,16 @@ int main(int argc, char **argv)
         return 1;
     }
     uint8_t *node_registered = (uint8_t *) xcalloc(cetrafs_le32(sb.node_table_count) ? cetrafs_le32(sb.node_table_count) : 1, 1);
+    uint8_t *node_departed = (uint8_t *) xcalloc(cetrafs_le32(sb.node_table_count) ? cetrafs_le32(sb.node_table_count) : 1, 1);
+    uint32_t node_free_rows = 0, node_departed_rows = 0;
     for (uint32_t n = 0; n < cetrafs_le32(sb.node_table_count); ++n) {
         cetrafs_node_entry_t ne;
         /* one row per block as of v0x0007 */
         pread_all(fd, &ne, sizeof(ne), (off_t) (cetrafs_le64(sb.node_table_start) + n) * CETRAFS_BLOCK_SIZE);
-        if (ne.state == CETRAFS_NODE_STATE_FREE)
+        if (ne.state == CETRAFS_NODE_STATE_FREE) {
+            node_free_rows++;
             continue;
+        }
         if (cetrafs_le32(ne.state) == CETRAFS_NODE_STATE_REPAIR) {
             /* An offline repairer holding the volume -- including this
              * process, which claimed a row above. It is not a node and
@@ -1969,6 +1973,10 @@ int main(int argc, char **argv)
             return 1;
         }
         node_registered[n] = 1;
+        if (ne.last_seen == 0) {
+            node_departed[n] = 1;
+            node_departed_rows++;
+        }
         /* A row that registered and then stopped. fsck cannot judge
          * liveness -- it has no second sample and must never compare
          * last_seen against ITS OWN clock, which is the mistake the
@@ -2011,6 +2019,86 @@ int main(int argc, char **argv)
                     "WARN: ZG%u is owned by node slot %u, which is not REGISTERED -- the zone group is orphaned and "
                     "its space unusable until some node reclaims it\n",
                     z, zg_owner[z]);
+    }
+
+    /*
+     * Retire departed rows when the registry is full.
+     *
+     * Nothing in the kernel ever writes a row back to FREE: a node that
+     * leaves keeps its row (last_seen 0) so it can re-attach by UUID. A
+     * volume that has seen as many distinct node identities as it has
+     * rows -- reinstalled hosts, new machine-ids -- refuses the next one
+     * with "registry full", and only mkfs used to clear it.
+     *
+     * The kernel cannot retire such a row at registration: a lock, a
+     * presence bit and a Zone Group name their holder by row number only,
+     * so a new node on a departed row would silently inherit whatever the
+     * old one still held. fsck -r can check that nothing does: it holds
+     * the repair claim (no node can mount meanwhile), it has refused to
+     * run beside a live peer, and it can read every record. A departed row
+     * is freed only if no Zone Group, no exclusive or namespace lock, no
+     * read or suspended-writer bit, and no dirty journal names it. Only
+     * when no FREE row is left; otherwise the node may still come back to
+     * its own row.
+     */
+    if (repair_mode && !repair_blocked && node_free_rows == 0 && node_departed_rows > 0) {
+        uint32_t nrows = cetrafs_le32(sb.node_table_count);
+        uint8_t *node_ref = (uint8_t *) xcalloc(nrows, 1);
+        uint32_t retired = 0;
+
+        for (uint32_t z = 0; z < cetrafs_le32(sb.zone_group_count); ++z)
+            if (zg_owner[z] < nrows)
+                node_ref[zg_owner[z]] = 1;
+        for (uint32_t n = 0; n < nrows; ++n) {
+            uint64_t area = cetrafs_le64(sb.node_journal_start) + (uint64_t) n * cetrafs_le32(sb.node_journal_blocks);
+            cetrafs_node_journal_hdr_t flag;
+
+            if (!cetrafs_le32(sb.node_journal_blocks))
+                break;
+            pread_all(fd, &flag, sizeof(flag), (off_t) area * CETRAFS_BLOCK_SIZE);
+            if (cetrafs_le32(flag.magic) == CETRAFS_NODE_JOURNAL_MAGIC &&
+                cetrafs_le32(flag.state) == CETRAFS_NODE_JOURNAL_DIRTY)
+                node_ref[n] = 1;
+        }
+        for (uint64_t ino = 1; ino <= cetrafs_le32(sb.inodes_count); ++ino) {
+            cetrafs_inode_t in;
+            uint64_t bits;
+
+            fsck_repair_heartbeat();
+            pread_all(fd, &in, sizeof(in), (off_t) (cetrafs_le64(sb.inode_table_start) + ino - 1) * CETRAFS_BLOCK_SIZE);
+            if (!in.ino && !in.generation)
+                continue; /* never written */
+            if (cetrafs_le32(in.lock_mode) == CETRAFS_LOCK_EXCLUSIVE && cetrafs_le32(in.lock_owner_node) < nrows)
+                node_ref[cetrafs_le32(in.lock_owner_node)] = 1;
+            if (cetrafs_le32(in.ns_lock_owner) < nrows)
+                node_ref[cetrafs_le32(in.ns_lock_owner)] = 1;
+            bits = cetrafs_le64(in.read_open_nodes) | cetrafs_le64(in.suspended_writer_nodes);
+            for (uint32_t n = 0; n < nrows && n < 64; ++n)
+                if (bits & (1ULL << n))
+                    node_ref[n] = 1;
+        }
+        for (uint32_t n = 0; n < nrows; ++n) {
+            uint8_t zero[CETRAFS_BLOCK_SIZE];
+
+            if (!node_departed[n] || node_ref[n] || (int) n == repair_row)
+                continue;
+            memset(zero, 0, sizeof(zero));
+            pwrite_all(fd, zero, sizeof(zero), (off_t) (cetrafs_le64(sb.node_table_start) + n) * CETRAFS_BLOCK_SIZE);
+            node_registered[n] = 0;
+            retired++;
+            repairs_made++;
+            printf("  registry full: retired node slot %u, which departed cleanly and is referenced by nothing\n", n);
+        }
+        if (retired)
+            fsync(fd);
+        else
+            fprintf(stderr, "WARN: the Node Registry is full and every departed row is still referenced -- no "
+                            "row could be retired\n");
+        free(node_ref);
+    } else if (node_free_rows == 0 && node_departed_rows > 0 && !repair_mode) {
+        fprintf(stderr, "WARN: the Node Registry is full; %u row(s) belong to nodes that departed cleanly -- "
+                        "fsck -r retires those that nothing references\n",
+                node_departed_rows);
     }
 
     /*
@@ -2445,6 +2533,17 @@ int main(int argc, char **argv)
             fsck_dead_walk = dpass;
             stale_before = stale_blocks;
             inodes_seen++;
+
+            /* A lock_mode no code writes: the kernel treats it as
+             * neither free nor stealable, so the file could never be
+             * opened for write again, and nothing used to say so.
+             * Reported, not repaired: there is no basis for choosing
+             * which mode was meant. */
+            if (cetrafs_le32(in.lock_mode) != CETRAFS_LOCK_NONE && cetrafs_le32(in.lock_mode) != CETRAFS_LOCK_EXCLUSIVE)
+                fprintf(stderr,
+                        "WARN: inode %" PRIu64 " has lock_mode %u, which is neither unlocked nor exclusive -- "
+                        "no node can open it for write\n",
+                        ino, cetrafs_le32(in.lock_mode));
 
             /* An allocated nlink=0 inode is the designed residue of a
              * cross-node delete whose destroyer could not free it (a

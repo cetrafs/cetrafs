@@ -1171,6 +1171,66 @@ int cetrafs_node_my_uuid(u8 out[CETRAFS_NODE_UUID_LEN])
  * passes its own UUID too, which excludes the row it just claimed just the
  * same.) */
 /*
+ * Reap the claim of a repairer judged dead: put back the row it
+ * borrowed, or free the row. Without this a killed `fsck -r` or growfs
+ * left its row in REPAIR for good -- not a claim (it no longer moves),
+ * but never anything else either: on a full registry the borrowed
+ * node could not mount again, and only mkfs cleared it.
+ *
+ * Only while the row is still exactly the claim that was watched (REPAIR,
+ * same hb_seq): a repairer that came back and renewed keeps its claim.
+ * One that comes back after this finds its row taken and stops
+ * (cetrafs_repair_lost in the tools).
+ */
+struct cetrafs_node_reap_ctx {
+    u64 judged_seq;
+    const cetrafs_node_entry_t *restore; /* NULL: free the row */
+};
+
+static int cetrafs_node_reap_mutate(void *image, unsigned int len, void *priv)
+{
+    struct cetrafs_node_reap_ctx *ctx = priv;
+    cetrafs_node_entry_t ne;
+
+    memcpy(&ne, image, sizeof(ne));
+    if (cetrafs_le32(ne.state) != CETRAFS_NODE_STATE_REPAIR || cetrafs_le64(ne.hb_seq) != ctx->judged_seq)
+        return -EEXIST;
+    memset(image, 0, len);
+    if (ctx->restore)
+        memcpy(image, ctx->restore, sizeof(*ctx->restore)); /* its own checksum, verified by the caller */
+    return 0;
+}
+
+static void cetrafs_node_reap_repair_claim(struct super_block *sb, u32 idx, u64 judged_seq)
+{
+    u64 lba = cetrafs_node_row_lba(sb, idx);
+    cetrafs_node_entry_t saved;
+    struct cetrafs_node_reap_ctx ctx = {.judged_seq = judged_seq};
+    struct buffer_head *bh;
+    int ret;
+
+    if (!lba)
+        return;
+    bh = cetrafs_bread_uncached(sb, lba);
+    if (!bh)
+        return; /* cannot read what it borrowed: leave it, never guess */
+    memcpy(&saved, bh->b_data + CETRAFS_REPAIR_SAVED_OFF, sizeof(saved));
+    brelse(bh);
+    if (cetrafs_le32(saved.state) == CETRAFS_NODE_STATE_REGISTERED &&
+        cetrafs_node_crc(&saved) == (u32) cetrafs_le64(saved.checksum))
+        ctx.restore = &saved;
+    ret = cetrafs_cas_record(sb, lba, cetrafs_node_reap_mutate, &ctx);
+    if (ret)
+        pr_warn("node registry: the dead repair claim on row %u could not be reaped (%d)\n", idx, ret);
+    else if (ctx.restore)
+        pr_warn("node registry: reaped the dead repair claim on row %u and gave the row back to the node it "
+                "borrowed it from (%.*s)\n",
+                idx, (int) sizeof(saved.label), saved.label);
+    else
+        pr_warn("node registry: reaped the dead repair claim on row %u -- the row is free again\n", idx);
+}
+
+/*
  * Is an offline repairer holding this volume?
  *
  * `fsck -r` and growfs refuse to touch a volume a node has mounted, but
@@ -1277,6 +1337,12 @@ int cetrafs_node_repair_claim_exists(struct super_block *sb, bool *out_exists, c
             break;
         }
     }
+    /* Watched for the whole window and never moved: dead. Give the row
+     * back rather than leave it REPAIR forever. */
+    if (!ret && !*out_exists)
+        for (idx = 0; idx < count; idx++)
+            if (seq_before[idx])
+                cetrafs_node_reap_repair_claim(sb, idx, seq_before[idx] - 1);
 out:
     kfree(seq_before);
     return ret;
