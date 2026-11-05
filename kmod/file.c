@@ -387,6 +387,70 @@ static bool cetrafs_dio_unaligned(const struct inode *inode, const struct kiocb 
     return (iocb->ki_flags & IOCB_DIRECT) && ((iocb->ki_pos | iov_iter_count(from)) & (i_blocksize(inode) - 1));
 }
 
+/*
+ * Zero what lies past the old EOF in its folio, before the size grows
+ * over it.
+ *
+ * A store through a shared mapping may land anywhere in the folio that
+ * holds EOF, past EOF included; the kernel keeps it, and writeback
+ * zeroes it only while it still lies past i_size. Grow the size first
+ * and it becomes file contents: ftruncate, fallocate, or a write that
+ * starts past EOF published bytes nobody ever wrote to the file -- and
+ * on a shared LUN wrote them to the device for every node
+ * (tests/kernel/mmap_eof_extend.sh; ext4 returns zeros).
+ * pagecache_isize_extended() does nothing for a block the size of a
+ * page, so it is no help here.
+ *
+ * Caller holds invalidate_lock EXCLUSIVELY, and moves the size before
+ * dropping it. The folio's mappings are zapped first, so a later store
+ * faults, and the fault's page_mkwrite waits on that lock -- by when the
+ * size has moved and the store is a write inside the file. A store that
+ * finished before this call is erased; one that races it is ordered
+ * after the extension, which a concurrent caller cannot tell apart.
+ *
+ * Only a non-zero tail is dirtied: those bytes came from a store that
+ * went through page_mkwrite, so the block behind them is allocated and
+ * writeback has nothing to allocate.
+ */
+static void cetrafs_zero_post_eof(struct inode *inode, loff_t old_size, loff_t new_size)
+{
+    struct address_space *mapping = inode->i_mapping;
+    struct folio *folio;
+    size_t from, to;
+
+    lockdep_assert_held_write(&mapping->invalidate_lock);
+    if (new_size <= old_size || !(old_size & (PAGE_SIZE - 1)))
+        return;
+    if (cetrafs_sb_is_fenced(inode->i_sb))
+        return; /* stopped: nothing new reaches the device */
+
+    folio = filemap_lock_folio(mapping, old_size >> PAGE_SHIFT);
+    if (IS_ERR(folio))
+        return; /* not cached: writeback zeroed the tail on its way out */
+    folio_unlock(folio);
+    if (folio_mapped(folio))
+        unmap_mapping_range(mapping, folio_pos(folio), folio_size(folio), 0);
+    folio_lock(folio);
+    if (folio->mapping == mapping) {
+        from = offset_in_folio(folio, old_size);
+        to = folio_size(folio);
+        if (new_size - folio_pos(folio) < (loff_t) to)
+            to = (size_t) (new_size - folio_pos(folio));
+        if (from < to) {
+            void *kaddr = kmap_local_folio(folio, from);
+            bool dirty = memchr_inv(kaddr, 0, to - from) != NULL;
+
+            kunmap_local(kaddr);
+            if (dirty) {
+                folio_zero_segment(folio, from, to);
+                folio_mark_dirty(folio);
+            }
+        }
+    }
+    folio_unlock(folio);
+    folio_put(folio);
+}
+
 static ssize_t cetrafs_file_write_iter(struct kiocb *iocb, struct iov_iter *from)
 {
     struct inode *inode = file_inode(iocb->ki_filp);
@@ -401,6 +465,23 @@ static ssize_t cetrafs_file_write_iter(struct kiocb *iocb, struct iov_iter *from
     ret = cetrafs_lock_write_gate(inode);
     if (!ret) {
         ret = generic_write_checks(iocb, from);
+        /* A write starting past EOF grows the size over the old EOF
+         * folio's tail: zero it first (cetrafs_zero_post_eof()). The
+         * size moves in write_end, after the lock is dropped -- a store
+         * faulting in between is concurrent with this write and may be
+         * ordered after it; one made before is gone. */
+        if (ret > 0 && iocb->ki_pos > i_size_read(inode)) {
+            if (iocb->ki_flags & IOCB_NOWAIT) {
+                if (!down_write_trylock(&inode->i_mapping->invalidate_lock))
+                    ret = -EAGAIN;
+            } else {
+                filemap_invalidate_lock(inode->i_mapping);
+            }
+            if (ret > 0) {
+                cetrafs_zero_post_eof(inode, i_size_read(inode), iocb->ki_pos);
+                filemap_invalidate_unlock(inode->i_mapping);
+            }
+        }
         if (ret > 0 && cetrafs_dio_unaligned(inode, iocb, from)) {
             /* Both drains below may sleep on I/O. */
             if (iocb->ki_flags & IOCB_NOWAIT) {
@@ -5397,8 +5478,10 @@ static int cetrafs_do_allocate(struct inode *inode, loff_t offset, loff_t len, b
                                          (CETRAFS_BLOCK_SIZE / 512));
     }
 
-    if (!keep_size && end > i_size_read(inode))
+    if (!keep_size && end > i_size_read(inode)) {
+        cetrafs_zero_post_eof(inode, i_size_read(inode), end); /* invalidate_lock: the caller's */
         raw.size = cetrafs_cpu_to_le64((u64) end);
+    }
 
     ret = cetrafs_rebuild_recheck(inode, "fallocate");
     if (!ret) {
@@ -6056,8 +6139,10 @@ static int cetrafs_setattr_locked(struct mnt_idmap *idmap, struct dentry *dentry
         if (!ret) {
             if (attr->ia_size < i_size_read(inode))
                 ret = cetrafs_truncate_shrink(inode, attr->ia_size);
-            else
+            else {
+                cetrafs_zero_post_eof(inode, i_size_read(inode), attr->ia_size);
                 truncate_setsize(inode, attr->ia_size);
+            }
         }
         filemap_invalidate_unlock(inode->i_mapping);
 
