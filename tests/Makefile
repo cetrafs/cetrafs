@@ -58,6 +58,7 @@ sparse:
 
 crash:
 	./crash/crash_consistency.sh
+	./crash/buffered_extent_order.sh
 
 soak:
 	./stress/soak.sh $(ROUNDS)

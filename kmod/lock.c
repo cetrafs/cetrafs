@@ -43,6 +43,7 @@
 #include <linux/fs.h>
 #include <linux/kernel.h>
 #include <linux/ktime.h>
+#include <linux/maple_tree.h>
 #include <linux/mutex.h>
 #include <linux/pagemap.h>
 #include <linux/slab.h>
@@ -160,6 +161,21 @@ struct cetrafs_inode_info {
      * anyway.
      */
     struct cetrafs_resv_span resv_span;
+
+    /*
+     * Blocks a BUFFERED write mapped over preallocated (uninit) extents
+     * and has not yet converted (file.c, CETRAFS_GB_BUF). The tree says
+     * "reads as zeros" until the data is on the device; this set is what
+     * lets THIS node read its own data meanwhile. A maple tree of merged
+     * logical-block ranges, all valued xa_mk_value(1). Written only under
+     * invalidate_lock held exclusively; read locklessly (RCU mode).
+     * pending_wb_err is the mapping's writeback error cursor sampled when
+     * the set went from empty to non-empty: a writeback error since then
+     * means some of its blocks may never have received their data, and
+     * nothing in the set may then be converted.
+     */
+    struct maple_tree pending;
+    errseq_t pending_wb_err;
 
     /* The record's stat fields as this node last saw them, under
      * resv_lock (it is the inode's general-purpose short spinlock; this
@@ -1200,6 +1216,7 @@ static void cetrafs_inode_init_once(void *foo)
     atomic_set(&ci->lock_local_open_count, 0);
     mutex_init(&ci->ns_mutex);
     INIT_WORK(&ci->cold_work, cetrafs_inode_cold_work);
+    mt_init_flags(&ci->pending, MT_FLAGS_USE_RCU);
     cetrafs_inode_identity_init_ci(ci);
     inode_init_once(&ci->vfs_inode);
 }
@@ -1259,8 +1276,124 @@ void cetrafs_free_vfs_inode(struct inode *inode)
      * a recycled object with an empty link, so this also proves the
      * recycle invariant rather than assuming it. */
     WARN_ON_ONCE(!list_empty(&ci->resv_span.link));
+    /* ->evict_inode empties it (cetrafs_pending_drop_all()); a recycled
+     * object must not carry another file's pending blocks. */
+    WARN_ON_ONCE(!mtree_empty(&ci->pending));
 
     kmem_cache_free(cetrafs_inode_cache, ci);
+}
+
+/* ---- buffered-write pending set (see cetrafs_inode_info.pending) ---- */
+
+/* Add [first, first + count) -- merged with any range it touches.
+ * Caller holds invalidate_lock exclusively, which serialises every
+ * writer of the set, so the neighbours read here cannot move before the
+ * store. */
+int cetrafs_pending_add(struct inode *inode, u32 first, u32 count)
+{
+    struct cetrafs_inode_info *ci = CETRAFS_I(inode);
+    unsigned long s = first, e = (unsigned long) first + count - 1;
+    MA_STATE(mas, &ci->pending, 0, 0);
+    void *entry;
+    int ret;
+
+    if (!count)
+        return 0;
+    lockdep_assert_held_write(&inode->i_mapping->invalidate_lock);
+    if (mtree_empty(&ci->pending))
+        ci->pending_wb_err = errseq_sample(&inode->i_mapping->wb_err);
+    mtree_lock(&ci->pending);
+    if (s > 0) {
+        mas_set(&mas, s - 1);
+        entry = mas_walk(&mas);
+        if (entry)
+            s = mas.index;
+    }
+    mas_set(&mas, e + 1);
+    entry = mas_walk(&mas);
+    if (entry)
+        e = mas.last;
+    mas_set_range(&mas, s, e);
+    ret = mas_store_gfp(&mas, xa_mk_value(1), GFP_NOFS);
+    mtree_unlock(&ci->pending);
+    return ret;
+}
+
+/* Blocks from `block` to the end of its pending range, 0 if not pending.
+ * Lockless. */
+u32 cetrafs_pending_run(struct inode *inode, u32 block)
+{
+    struct cetrafs_inode_info *ci = CETRAFS_I(inode);
+    MA_STATE(mas, &ci->pending, block, block);
+    unsigned long last = 0;
+    void *entry;
+
+    if (mtree_empty(&ci->pending))
+        return 0;
+    rcu_read_lock();
+    entry = mas_walk(&mas);
+    if (entry)
+        last = mas.last;
+    rcu_read_unlock();
+    if (!entry)
+        return 0;
+    return (u32) min_t(u64, (u64) last - block + 1, U32_MAX);
+}
+
+/* The first pending range ending at or after `from`: *first (clamped to
+ * `from`) and *last. -ENOENT if there is none. Lockless. */
+int cetrafs_pending_next(struct inode *inode, u32 from, u32 *first, u32 *last)
+{
+    struct cetrafs_inode_info *ci = CETRAFS_I(inode);
+    MA_STATE(mas, &ci->pending, from, from);
+    void *entry;
+    int ret = -ENOENT;
+
+    if (mtree_empty(&ci->pending))
+        return -ENOENT;
+    rcu_read_lock();
+    entry = mas_find(&mas, U32_MAX);
+    if (entry) {
+        *first = (u32) max_t(unsigned long, mas.index, from);
+        *last = (u32) min_t(unsigned long, mas.last, U32_MAX);
+        ret = 0;
+    }
+    rcu_read_unlock();
+    return ret;
+}
+
+bool cetrafs_pending_any(struct inode *inode)
+{
+    return !mtree_empty(&CETRAFS_I(inode)->pending);
+}
+
+/* A writeback error since the set was started: see the field. */
+bool cetrafs_pending_wb_failed(struct inode *inode)
+{
+    return errseq_check(&inode->i_mapping->wb_err, CETRAFS_I(inode)->pending_wb_err) != 0;
+}
+
+/* Remove [first, last]. Must not fail: a stale entry would later make a
+ * NEW preallocated block at that offset read as data -- whatever its
+ * previous owner left there. Caller holds invalidate_lock exclusively. */
+void cetrafs_pending_clear(struct inode *inode, u32 first, u32 last)
+{
+    struct cetrafs_inode_info *ci = CETRAFS_I(inode);
+
+    if (mtree_empty(&ci->pending) || first > last)
+        return;
+    lockdep_assert_held_write(&inode->i_mapping->invalidate_lock);
+    mtree_store_range(&ci->pending, first, last, NULL, GFP_NOFS | __GFP_NOFAIL);
+}
+
+/* Forget every pending block, converting none: they keep reading as
+ * zeros. For eviction and for a writeback that failed. */
+void cetrafs_pending_drop_all(struct inode *inode)
+{
+    struct cetrafs_inode_info *ci = CETRAFS_I(inode);
+
+    if (!mtree_empty(&ci->pending))
+        mtree_destroy(&ci->pending);
 }
 
 /* ---- on-disk lock field as an atomic compare-and-swap --------------
@@ -2431,6 +2564,21 @@ int cetrafs_lock_release(struct inode *inode, struct file *file)
         ret = filemap_write_and_wait(inode->i_mapping);
         if (ret)
             pr_err("lock release: ino=%llu failed to flush dirty data: %d\n", (unsigned long long) inode->i_ino, ret);
+        /* The buffered blocks this session wrote are marked written
+         * only now that their data is down (file.c, enum
+         * cetrafs_gb_mode). ->flush normally did it already; a store
+         * through a mapping that outlived the last close(2) did not.
+         * A failure leaves them reading as zeros, and is logged there.
+         * Then the set goes, converted or not: once the last writer is
+         * gone a peer may write the file, and an entry left behind would
+         * make THIS node read a block the peer preallocated at that
+         * offset as data -- whatever it held before. */
+        (void) cetrafs_convert_pending(inode);
+        if (cetrafs_pending_any(inode)) {
+            filemap_invalidate_lock(inode->i_mapping);
+            cetrafs_pending_drop_all(inode);
+            filemap_invalidate_unlock(inode->i_mapping);
+        }
         t_data = ktime_get();
 
         /*
@@ -3589,7 +3737,7 @@ static int cetrafs_lock_suspend(struct inode *inode, struct file *file)
      * cetrafs_get_block() is safe under these locks: that path takes
      * resv_lock and neither of them -- see the resv_lock comment above.)
      */
-    ret = cetrafs_file_make_durable(file);
+    ret = cetrafs_file_make_durable(file, drain);
     if (ret)
         goto out_unlock;
     ret = cetrafs_flush_dirty_free_counts(sb);

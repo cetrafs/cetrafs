@@ -73,11 +73,37 @@ static int cetrafs_get_block_read(struct inode *inode, sector_t iblock, struct b
  * mapped every block of its range, and truncate and punch wait for it
  * (inode_dio_wait()) before freeing any of them.
  */
+/*
+ * BUF is a BUFFERED write into a regular file (write_begin, page_mkwrite,
+ * and the partial-block zeroing that goes through them), and it is DIO's
+ * rule for the same reason. The data sits in this file's page cache; the
+ * extent edit sits in a block-device buffer (a leaf) or the record's
+ * shadow -- two address spaces, two writeback queues, no order between
+ * them. Mapped as written data, a block could have its extent durable
+ * first, and a crash in between left a file reading its previous owner's
+ * bytes (audit R12). So BUF maps a preallocated block as it is and
+ * allocates a hole PREALLOCATED, exactly as DIO does, and adds the block
+ * to the inode's pending set (cetrafs_pending_add()); every lookup on
+ * this node maps a pending block as data, so the writer reads what it
+ * wrote. CONVERT_PENDING marks the set written at the durability
+ * boundaries -- fsync, close, sync -- after its data is on the device
+ * (cetrafs_convert_pending_locked()); unlike CONVERT it accepts a hole,
+ * which a racing punch cannot leave behind but costs nothing to allow.
+ */
 enum cetrafs_gb_mode {
     CETRAFS_GB_PLAIN = 0,
     CETRAFS_GB_DIO,
     CETRAFS_GB_CONVERT,
+    CETRAFS_GB_BUF,
+    CETRAFS_GB_CONVERT_PENDING,
 };
+
+/* TEST ONLY, and the negative control of the above: a buffered write
+ * marks its blocks written at once, as it used to
+ * (tests/crash/buffered_extent_order.sh). */
+static bool cetrafs_buf_convert_early;
+cetrafs_test_param(buf_convert_early, cetrafs_buf_convert_early, bool, 0644);
+MODULE_PARM_DESC(buf_convert_early, "TEST ONLY: buffered writes mark their extents written at write time");
 
 /* b_private of a DIO mapping that left preallocated blocks for the
  * completion to convert. The DIO code copies b_private into the dio
@@ -303,9 +329,15 @@ static int cetrafs_file_mmap(struct file *file, struct vm_area_struct *vma)
 static int cetrafs_file_flush(struct file *file, fl_owner_t id)
 {
     (void) id;
+    int ret, ret2;
+
     if (!(file->f_mode & FMODE_WRITE))
         return 0;
-    return file_write_and_wait(file);
+    ret = file_write_and_wait(file);
+    /* And the blocks those writes went to, so close(2) hears it if they
+     * cannot be marked written (enum cetrafs_gb_mode, BUF). */
+    ret2 = cetrafs_convert_pending(file_inode(file));
+    return ret ? ret : ret2;
 }
 
 /*
@@ -540,6 +572,94 @@ static int cetrafs_dio_end_io(struct kiocb *iocb, loff_t offset, ssize_t size, v
                            (unsigned long long) inode->i_ino, (long long) offset, size, (unsigned long long) b, ret);
     else
         atomic64_inc(&cetrafs_dio_converts);
+    return ret;
+}
+
+/*
+ * Mark a regular file's pending buffered-write blocks written (enum
+ * cetrafs_gb_mode, BUF). Rule 8 is the whole job: the extent that says
+ * "written" may not become durable before the data -- so the data is
+ * written back, the writeback checked for errors, and the device cache
+ * flushed BEFORE the first conversion dirties a leaf or the shadow.
+ *
+ * A writeback error since the set began means some of its blocks may
+ * never have received their data, and which ones is not recorded: none
+ * is converted, the set is dropped, and those blocks keep reading as
+ * zeros -- a loss the caller reports, never a disclosure.
+ *
+ * Caller holds invalidate_lock EXCLUSIVELY (the set's writers, and the
+ * tree's mutators, rule 18) and keeps write(2) out -- inode_lock, or by
+ * construction (the last writer's close). A write between its
+ * write_begin and write_end holds neither invalidate_lock nor a dirty
+ * page, so the writeback below would miss it and the conversion would
+ * declare a block whose data has not even been copied yet.
+ */
+int cetrafs_convert_pending_locked(struct inode *inode)
+{
+    struct address_space *m = inode->i_mapping;
+    unsigned int bits = inode->i_blkbits;
+    u32 first, last;
+    u64 from = 0, cur = 0;
+    int ret;
+
+    lockdep_assert_held_write(&m->invalidate_lock);
+    if (!S_ISREG(inode->i_mode) || !cetrafs_pending_any(inode))
+        return 0;
+
+    ret = filemap_write_and_wait(m);
+    if (!ret && cetrafs_pending_wb_failed(inode))
+        ret = -EIO;
+    if (!ret)
+        ret = cetrafs_publish_flush(inode->i_sb);
+    if (ret) {
+        pr_err_ratelimited("ino=%llu: buffered data did not reach the device (%d) -- the blocks it was written to "
+                           "stay unwritten and read as zeros\n",
+                           (unsigned long long) inode->i_ino, ret);
+        cetrafs_pending_drop_all(inode);
+        return ret;
+    }
+
+    while (from <= U32_MAX && !cetrafs_pending_next(inode, (u32) from, &first, &last)) {
+        for (cur = first; cur <= last;) {
+            struct buffer_head map = {0};
+            u64 n;
+
+            map.b_size = (size_t) min_t(u64, (u64) last - cur + 1, (u64) U32_MAX >> bits) << bits;
+            ret = __cetrafs_get_block(inode, (sector_t) cur, &map, 1, false, CETRAFS_GB_CONVERT_PENDING);
+            if (ret)
+                goto fail;
+            /* Never trust the answer for progress (rule 14). */
+            n = buffer_mapped(&map) ? clamp_t(u64, map.b_size >> bits, 1, (u64) last - cur + 1) : 1;
+            cur += n;
+        }
+        cetrafs_pending_clear(inode, first, last);
+        from = (u64) last + 1;
+        cond_resched();
+    }
+    return 0;
+
+fail:
+    /* What was converted is out of the set; the rest stays pending, for
+     * the next boundary to try again. */
+    if (cur > first)
+        cetrafs_pending_clear(inode, first, (u32) (cur - 1));
+    pr_err_ratelimited("ino=%llu: could not mark buffered block %llu written (%d) -- it reads as zeros until a later "
+                       "fsync or close converts it\n",
+                       (unsigned long long) inode->i_ino, (unsigned long long) cur, ret);
+    return ret;
+}
+
+int cetrafs_convert_pending(struct inode *inode)
+{
+    int ret;
+
+    if (!S_ISREG(inode->i_mode) || !cetrafs_pending_any(inode))
+        return 0;
+    inode_lock(inode);
+    filemap_invalidate_lock(inode->i_mapping);
+    ret = cetrafs_convert_pending_locked(inode);
+    filemap_invalidate_unlock(inode->i_mapping);
+    inode_unlock(inode);
     return ret;
 }
 
@@ -1110,6 +1230,37 @@ static noinline_for_stack u64 cetrafs_cached_first_miss(struct address_space *m,
     return min(max_t(u64, from, (u64) want << CETRAFS_BLKS_PER_PAGE_SHIFT), end);
 }
 
+/* First block in [from, end) in the pending set -- a buffered write's,
+ * data though the tree still says preallocated (enum cetrafs_gb_mode)
+ * -- or `end`. */
+static u64 cetrafs_pending_first(struct inode *inode, u64 from, u64 end)
+{
+    u32 f, l;
+
+    if (from > U32_MAX || cetrafs_pending_next(inode, (u32) from, &f, &l))
+        return end;
+    return min_t(u64, f, end);
+}
+
+/* First block in [from, end) that is neither cached nor pending, or `end`. */
+static u64 cetrafs_unwritten_first(struct address_space *m, u64 from, u64 end)
+{
+    u64 h = from;
+
+    for (;;) {
+        u32 prun;
+
+        h = cetrafs_cached_first_miss(m, h, end);
+        if (h >= end || h > U32_MAX)
+            return min(h, end);
+        prun = cetrafs_pending_run(m->host, (u32) h);
+        if (!prun)
+            return h;
+        h += prun; /* at least one: progress whatever the set says */
+        cond_resched();
+    }
+}
+
 /* Do any of the sorted runs overlap? (A damaged tree.) */
 static bool cetrafs_runs_overlap(const struct cetrafs_ext_run *r, u32 n)
 {
@@ -1141,7 +1292,7 @@ static u64 cetrafs_next_data_block(struct address_space *m, const struct cetrafs
         s = max(r[i].start, from);
         if (!r[i].uninit || as_data)
             return s;
-        c = cetrafs_cached_first(m, s, end);
+        c = min(cetrafs_cached_first(m, s, end), cetrafs_pending_first(m->host, s, end));
         if (c < end)
             return c;
         cond_resched();
@@ -1166,7 +1317,7 @@ static u64 cetrafs_next_hole_block(struct address_space *m, const struct cetrafs
         if (r[i].start > from)
             break; /* a gap before the next run: `from` is the hole */
         if (r[i].uninit && !as_data) {
-            u64 h = cetrafs_cached_first_miss(m, from, end);
+            u64 h = cetrafs_unwritten_first(m, from, end);
 
             if (h < end) {
                 from = h; /* runs are disjoint: nothing else covers it */
@@ -1347,8 +1498,8 @@ int cetrafs_fiemap(struct inode *inode, struct fiemap_extent_info *fi, u64 start
             flags |= FIEMAP_EXTENT_LAST;
         /* Preallocated and never written: the blocks are real and
          * mapped, the CONTENT is not there yet. */
-        if (r->uninit)
-            flags |= FIEMAP_EXTENT_UNWRITTEN;
+        if (r->uninit && cetrafs_pending_first(inode, r->start, r->start + r->len) >= r->start + r->len)
+            flags |= FIEMAP_EXTENT_UNWRITTEN; /* a pending block in it: report data, never a hole */
 
         ret = fiemap_fill_next_extent(fi, logical, phys, blen, flags);
         if (ret) {
@@ -1958,6 +2109,21 @@ static int cetrafs_leaf_array_convert(struct super_block *sb,
                 return CETRAFS_CONVERT_APPEND;
             }
         } else if (iblock == eb) {
+            int p, q;
+
+            cetrafs_leaf_array_neighbours(arr, n, iblock, lba, count, &p, &q);
+            if (len == count && p < 0 && q < 0) {
+                /* The whole extent, and no written neighbour to grow:
+                 * flip the flag where it stands. Dropping it and
+                 * appending the written run moved the last entry into
+                 * its slot -- and a buffered write converts every
+                 * extent it made this way at the next fsync or close,
+                 * so a file written in order came out of it scrambled,
+                 * which the defrag mover reads as holes and declines. */
+                arr[i].ee_len = cetrafs_extent_pack_len(len, false);
+                *done = count;
+                return 0;
+            }
             if (len == count) {
                 /* The run covered the whole extent: drop it. The array
                  * is unordered, so the last entry fills the gap. */
@@ -3947,6 +4113,18 @@ static int __cetrafs_get_block(struct inode *inode,
     ret = cetrafs_tree_lookup(inode, &raw, (u32) iblock, &lba, &run, &uninit, &found, reader);
     if (ret)
         return ret;
+    /* A buffered write's block, not yet converted: data to this node
+     * (enum cetrafs_gb_mode) -- to a reader, a DIO, writeback, a second
+     * write into the block -- and never re-zeroed as new. */
+    if (found && uninit && mode != CETRAFS_GB_CONVERT && mode != CETRAFS_GB_CONVERT_PENDING &&
+        S_ISREG(inode->i_mode)) {
+        u32 prun = cetrafs_pending_run(inode, (u32) iblock);
+
+        if (prun) {
+            uninit = false;
+            run = min_t(u32, run ? run : 1, prun);
+        }
+    }
     if (found && uninit && !create) {
         /*
          * Preallocated by fallocate(ALLOCATE) and never written: the
@@ -3970,6 +4148,23 @@ static int __cetrafs_get_block(struct inode *inode,
         cetrafs_dio_mark_convert(bh_result);
         atomic64_inc(&cetrafs_map_calls);
         atomic64_add(bh_result->b_size >> inode->i_blkbits, &cetrafs_map_blocks);
+        return 0;
+    }
+    if (found && uninit && mode == CETRAFS_GB_BUF) {
+        /* Mapped as it is and remembered; converted at the next
+         * durability boundary, once its data is on the device. New:
+         * whatever the write does not cover is zeroed in the page. */
+        u64 w = bh_result->b_size >> inode->i_blkbits;
+        u32 n = (u32) ((w > 1 && run > 1) ? min_t(u64, w, run) : 1);
+
+        ret = cetrafs_pending_add(inode, (u32) iblock, n);
+        if (ret)
+            return ret;
+        map_bh(bh_result, sb, lba);
+        bh_result->b_size = (size_t) n << inode->i_blkbits;
+        set_buffer_new(bh_result);
+        atomic64_inc(&cetrafs_map_calls);
+        atomic64_add(n, &cetrafs_map_blocks);
         return 0;
     }
     if (found && uninit) {
@@ -4060,6 +4255,8 @@ static int __cetrafs_get_block(struct inode *inode,
     }
     if (!create)
         return 0; /* hole: leave unmapped, reader sees zeros */
+    if (mode == CETRAFS_GB_CONVERT_PENDING)
+        return 0; /* nothing left to convert; the caller steps one block */
     if (mode == CETRAFS_GB_CONVERT) {
         /* The write being completed mapped this block, and nothing may
          * free it while that write is in flight. A hole here means the
@@ -4077,7 +4274,7 @@ static int __cetrafs_get_block(struct inode *inode,
      * tree as data, holding the previous owner's bytes, for a later
      * truncate-up or a write further out to expose. Preallocated, it
      * reads as zeros until something writes it. */
-    dio_prealloc = mode == CETRAFS_GB_DIO;
+    dio_prealloc = mode == CETRAFS_GB_DIO || mode == CETRAFS_GB_BUF;
 
     {
         ktime_t t0 = ktime_get();
@@ -4287,9 +4484,16 @@ static int __cetrafs_get_block(struct inode *inode,
     inode->i_blocks = cetrafs_le64(raw.blocks);
     ctrace("MAP ino=%llu lblk=%llu lba=%llu merged=%d\n", (unsigned long long) inode->i_ino,
            (unsigned long long) iblock, (unsigned long long) lba, (int) merged);
+    /* After the stage above, so a failure leaves the block where the
+     * tree says it is: preallocated, reading as zeros. */
+    if (mode == CETRAFS_GB_BUF) {
+        ret = cetrafs_pending_add(inode, (u32) iblock, 1);
+        if (ret)
+            return ret;
+    }
     map_bh(bh_result, sb, lba);
     set_buffer_new(bh_result);
-    if (dio_prealloc)
+    if (mode == CETRAFS_GB_DIO)
         cetrafs_dio_mark_convert(bh_result);
 
     /* A growing OPEN regular file that just added a NEW extent (not a
@@ -4303,9 +4507,15 @@ static int __cetrafs_get_block(struct inode *inode,
     return 0;
 }
 
+/* A regular file's buffered write is BUF (enum cetrafs_gb_mode); a
+ * directory or a symlink keeps PLAIN -- its blocks are written
+ * synchronously, under the lock that publishes them. */
 static int cetrafs_get_block(struct inode *inode, sector_t iblock, struct buffer_head *bh_result, int create)
 {
-    return __cetrafs_get_block(inode, iblock, bh_result, create, false, CETRAFS_GB_PLAIN);
+    enum cetrafs_gb_mode mode =
+        S_ISREG(inode->i_mode) && !READ_ONCE(cetrafs_buf_convert_early) ? CETRAFS_GB_BUF : CETRAFS_GB_PLAIN;
+
+    return __cetrafs_get_block(inode, iblock, bh_result, create, false, mode);
 }
 
 /*
@@ -4418,7 +4628,9 @@ static int cetrafs_write_begin(const struct kiocb *iocb,
  */
 static int cetrafs_get_block_writeback(struct inode *inode, sector_t iblock, struct buffer_head *bh, int create)
 {
-    int ret = cetrafs_get_block(inode, iblock, bh, create);
+    /* PLAIN: writeback holds no invalidate_lock, so it may not add to
+     * the pending set. It never maps anything new anyway (below). */
+    int ret = __cetrafs_get_block(inode, iblock, bh, create, false, CETRAFS_GB_PLAIN);
 
     if (!ret && buffer_new(bh)) {
         pr_err_ratelimited("ino=%llu: writeback allocated/converted block %llu -- every block should be mapped "
@@ -4652,6 +4864,15 @@ static int __cetrafs_truncate_shrink(struct inode *inode, loff_t new_size)
         pr_warn_ratelimited("cetrafs: inode %llu: truncated to %lld but its tail was not zeroed (%d)\n",
                             (unsigned long long) inode->i_ino, (long long) new_size, zret);
     truncate_pagecache(inode, new_size);
+    /* The dropped blocks leave the pending set with the tree: a stale
+     * entry would make a NEW preallocated block at that offset read as
+     * data (enum cetrafs_gb_mode). */
+    {
+        u64 keep = CETRAFS_DIV_ROUND_UP((u64) new_size, CETRAFS_BLOCK_SIZE);
+
+        if (keep <= U32_MAX)
+            cetrafs_pending_clear(inode, (u32) keep, U32_MAX);
+    }
 
     /*
      * Only now does anything go back to the allocator: the OLD
@@ -5405,6 +5626,9 @@ static long cetrafs_fallocate(struct file *file, int mode, loff_t offset, loff_t
      * live file's page cache on every no-op punch is both pointless and
      * a throughput loss in its own right. */
     truncate_pagecache_range(inode, offset, end - 1);
+    /* As truncate: the punched blocks leave the pending set. */
+    if (start_block <= U32_MAX)
+        cetrafs_pending_clear(inode, (u32) start_block, (u32) min_t(u64, end_block - 1, U32_MAX));
 
     if (cetrafs_punch_pagecache_delay_ms)
         msleep(cetrafs_punch_pagecache_delay_ms); /* test-only; see the parameter */
@@ -5806,18 +6030,22 @@ int cetrafs_flush_tree_blocks(struct inode *inode, const cetrafs_inode_t *raw)
  * reads correctly; the other order leaves a size that claims data the
  * extents cannot map.
  */
-static int cetrafs_fsync(struct file *file, loff_t start, loff_t end, int datasync)
+/*
+ * Everything of fsync past the data writeback of its range: the pending
+ * buffered blocks, then the allocation bits, the tree blocks, the record
+ * and the device cache. `locked`: the caller already holds inode_lock and
+ * invalidate_lock (exclusively) -- the lock suspension does.
+ */
+static int cetrafs_fsync_meta(struct inode *inode, int ret, bool locked)
 {
-    struct inode *inode = file_inode(file);
     struct super_block *sb = inode->i_sb;
     cetrafs_inode_t raw;
-    int ret, ret2;
+    int ret2;
 
-    (void) datasync; /* the extents are needed to FIND the data either way */
-
-    ret = file_write_and_wait_range(file, start, end);
-    if (ret)
-        return ret;
+    /* Before the bitmaps: converting can split a leaf, which allocates. */
+    ret2 = locked ? cetrafs_convert_pending_locked(inode) : cetrafs_convert_pending(inode);
+    if (ret2 && !ret)
+        ret = ret2;
 
     /*
      * A spilled file's extent map lives in external leaf (and, at depth
@@ -5880,6 +6108,31 @@ static int cetrafs_fsync(struct file *file, loff_t start, loff_t end, int datasy
     return ret;
 }
 
+static int __cetrafs_fsync(struct file *file, loff_t start, loff_t end, bool locked)
+{
+    int ret = file_write_and_wait_range(file, start, end);
+
+    if (ret)
+        return ret;
+    return cetrafs_fsync_meta(file_inode(file), 0, locked);
+}
+
+static int cetrafs_fsync(struct file *file, loff_t start, loff_t end, int datasync)
+{
+    (void) datasync; /* the extents are needed to FIND the data either way */
+    return __cetrafs_fsync(file, start, end, false);
+}
+
+/* sync(2)/syncfs(2): what fsync would do, for an inode with buffered
+ * blocks still to mark written (super_ops.c's cetrafs_sync_fs()). Its
+ * data was written back before ->sync_fs(wait) runs. */
+int cetrafs_inode_sync_pending(struct inode *inode)
+{
+    if (!cetrafs_pending_any(inode))
+        return 0;
+    return cetrafs_fsync_meta(inode, 0, false);
+}
+
 /*
  * Everything the last-writer close makes durable, for a file that is
  * STAYING open. lock.c's suspension path calls it before handing this
@@ -5887,9 +6140,9 @@ static int cetrafs_fsync(struct file *file, loff_t start, loff_t end, int datasy
  * bitmaps and the record must all be on the device before the peer can
  * open, exactly as at close.
  */
-int cetrafs_file_make_durable(struct file *file)
+int cetrafs_file_make_durable(struct file *file, bool locked)
 {
-    return cetrafs_fsync(file, 0, LLONG_MAX, /*datasync=*/0);
+    return __cetrafs_fsync(file, 0, LLONG_MAX, locked);
 }
 
 static int cetrafs_open(struct inode *inode, struct file *file)

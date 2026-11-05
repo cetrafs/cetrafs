@@ -41,15 +41,19 @@ ct_mount "$DEV" "$MNT"
 require_cetrafs_mount "$MNT"
 F="$MNT/victim"
 
-# Preallocated [100,102) first, then blocks 0..5 written one at a time,
+# Preallocated [100,102) first (after its written neighbour 99), then blocks 0..5 written one at a time,
 # each separated from the last by a spacer block: seven entries.
 python3 - "$MNT" <<'PY'
 import ctypes, os, sys
 libc = ctypes.CDLL("libc.so.6", use_errno=True)
 v = os.open(sys.argv[1] + "/victim", os.O_RDWR | os.O_CREAT, 0o644)
 s = os.open(sys.argv[1] + "/spacer", os.O_WRONLY | os.O_CREAT, 0o644)
-if libc.fallocate(v, 0, ctypes.c_long(100 * 4096), ctypes.c_long(2 * 4096)):
+if libc.fallocate(v, 0, ctypes.c_long(99 * 4096), ctypes.c_long(3 * 4096)):
     sys.exit("fallocate failed: %d" % ctypes.get_errno())
+# Block 99 written: the preallocated [100,102) then has a written
+# neighbour, which is what makes its whole-extent conversion DROP the
+# entry (and grow the neighbour) rather than flip it in place.
+os.pwrite(v, b"N" * 4096, 99 * 4096); os.fsync(v)
 for i in range(6):
     os.pwrite(s, b"s" * 4096, i * 4096); os.fsync(s)
     os.pwrite(v, (b"%d" % i) * 4096, i * 4096); os.fsync(v)
@@ -84,6 +88,7 @@ import sys
 d = open(sys.argv[1], "rb").read()
 bad = [i for i in range(6) if d[i*4096:(i+1)*4096] != (b"%d" % i) * 4096]
 bad += [b for b in (100, 101) if d[b*4096:(b+1)*4096] != b"D" * 4096]
+bad += [99] if d[99*4096:100*4096] != b"N" * 4096 else []
 print("ok" if not bad else "bad blocks %s" % bad)
 PY
 )"

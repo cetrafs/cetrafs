@@ -895,7 +895,19 @@ bool cetrafs_lock_identity_cache_trusted(struct inode *inode);
 u64 cetrafs_lock_suspend_count(void);
 u64 cetrafs_lock_resume_count(void);
 /* file.c: the close-equivalent durability boundary for a file staying open. */
-int cetrafs_file_make_durable(struct file *file);
+int cetrafs_file_make_durable(struct file *file, bool locked);
+/* file.c: buffered-write blocks not yet marked written (enum cetrafs_gb_mode). */
+int cetrafs_convert_pending_locked(struct inode *inode);
+int cetrafs_convert_pending(struct inode *inode);
+int cetrafs_inode_sync_pending(struct inode *inode);
+/* lock.c: the per-inode set those blocks live in. */
+int cetrafs_pending_add(struct inode *inode, u32 first, u32 count);
+u32 cetrafs_pending_run(struct inode *inode, u32 block);
+int cetrafs_pending_next(struct inode *inode, u32 from, u32 *first, u32 *last);
+bool cetrafs_pending_any(struct inode *inode);
+bool cetrafs_pending_wb_failed(struct inode *inode);
+void cetrafs_pending_clear(struct inode *inode, u32 first, u32 last);
+void cetrafs_pending_drop_all(struct inode *inode);
 bool cetrafs_inode_foreign_opener_cached(struct inode *inode);
 void cetrafs_inode_set_generation(struct inode *inode, u64 gen);
 

@@ -96,6 +96,44 @@ static int cetrafs_write_inode(struct inode *inode, struct writeback_control *wb
  * apply, and the lock and presence swaps that open and close make --
  * and is an open item, not something this function provides.
  */
+/*
+ * sync(2) promises the data, and a buffered write's blocks read as zeros
+ * until something marks them written (file.c, enum cetrafs_gb_mode) --
+ * fsync and close do, sync must too. Their data is already on the device
+ * when ->sync_fs(wait) runs; each such inode gets fsync's metadata half.
+ * The walk is drop_pagecache_sb()'s: pin, drop the list lock, work.
+ */
+static int cetrafs_sync_fs_pending(struct super_block *sb)
+{
+    struct inode *inode, *toput = NULL;
+    int ret = 0, r;
+
+    spin_lock(&sb->s_inode_list_lock);
+    list_for_each_entry(inode, &sb->s_inodes, i_sb_list) {
+        spin_lock(&inode->i_lock);
+        if ((inode_state_read(inode) & (I_FREEING | I_WILL_FREE | I_NEW)) || !S_ISREG(inode->i_mode) ||
+            !cetrafs_pending_any(inode)) {
+            spin_unlock(&inode->i_lock);
+            continue;
+        }
+        __iget(inode);
+        spin_unlock(&inode->i_lock);
+        spin_unlock(&sb->s_inode_list_lock);
+
+        iput(toput);
+        r = cetrafs_inode_sync_pending(inode);
+        if (r && !ret)
+            ret = r;
+        toput = inode;
+
+        cond_resched();
+        spin_lock(&sb->s_inode_list_lock);
+    }
+    spin_unlock(&sb->s_inode_list_lock);
+    iput(toput);
+    return ret;
+}
+
 static int cetrafs_sync_fs(struct super_block *sb, int wait)
 {
     fs_debug(info, "cetrafs_sync_fs wait=%d", wait);
@@ -113,9 +151,10 @@ static int cetrafs_sync_fs(struct super_block *sb, int wait)
      * a stale one is a lying df, while an un-durable allocation bit is
      * a block two files can end up sharing. */
     {
+        int pret = wait ? cetrafs_sync_fs_pending(sb) : 0;
         int bret = cetrafs_alloc_flush_bitmaps(sb);
         int cret = cetrafs_flush_dirty_free_counts(sb);
-        int ret = bret ? bret : cret;
+        int ret = pret ? pret : bret ? bret : cret;
 
         /* sync(2), syncfs(2) and unmount promise the data is durable,
          * and a deployment LUN's write cache may well be volatile: a
@@ -274,6 +313,17 @@ static void cetrafs_evict_inode(struct inode *inode)
      * leaks every one of them. Idempotent, so the common double call is
      * free. */
     cetrafs_inode_drop_reservation(inode);
+
+    /* Buffered blocks never marked written: every close and fsync tries,
+     * so one left here is one those reported failing. The page cache is
+     * gone, so nothing can say their data landed -- they stay unwritten,
+     * reading as zeros (file.c, enum cetrafs_gb_mode). */
+    if (cetrafs_pending_any(inode)) {
+        if (inode->i_nlink)
+            pr_warn_ratelimited("ino=%llu: evicted with buffered blocks never marked written -- they read as zeros\n",
+                                (unsigned long long) inode->i_ino);
+        cetrafs_pending_drop_all(inode);
+    }
 
     if (!inode->i_nlink) {
         cetrafs_inode_t raw;
