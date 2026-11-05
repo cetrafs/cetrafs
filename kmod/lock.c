@@ -2412,6 +2412,11 @@ static void cetrafs_lock_drop_suspend_mark(struct inode *inode)
         cetrafs_sb_presence_defer(inode->i_sb, inode->i_ino, cetrafs_inode_get_generation(inode));
 }
 
+/* TEST ONLY: the next N close publishes fail without writing anything. */
+static unsigned int cetrafs_close_publish_fail;
+cetrafs_test_param(close_publish_fail, cetrafs_close_publish_fail, uint, 0644);
+MODULE_PARM_DESC(close_publish_fail, "TEST ONLY: the next N close-boundary record publishes fail with -EAGAIN");
+
 static int cetrafs_lock_publish_and_clear(struct inode *inode, cetrafs_inode_t *raw, bool may_clear,
                                           bool *lock_cleared)
 {
@@ -2477,7 +2482,14 @@ static int cetrafs_lock_publish_and_clear(struct inode *inode, cetrafs_inode_t *
                    "unpublished and keeping the lock\n",
                    (unsigned long long) inode->i_ino, tree_ret);
     }
-    pub_ret = tree_ret ? tree_ret : cetrafs_write_vfs_inode(inode);
+    if (tree_ret) {
+        pub_ret = tree_ret;
+    } else if (cetrafs_close_publish_fail) {
+        cetrafs_close_publish_fail--; /* test-only: the record CAS lost, as contention would */
+        pub_ret = -EAGAIN;
+    } else {
+        pub_ret = cetrafs_write_vfs_inode(inode);
+    }
     if (pub_ret && !tree_ret)
         pr_err("lock release: ino=%llu failed to persist inode state: %d -- keeping the lock\n",
                (unsigned long long) inode->i_ino, pub_ret);
@@ -2487,7 +2499,13 @@ static int cetrafs_lock_publish_and_clear(struct inode *inode, cetrafs_inode_t *
     if (!may_clear) {
         /* Suspended (lock_mode is NONE by our own doing) or a
          * nofilelock mount (this open never claimed it): nothing to
-         * clear, and not an error. */
+         * clear. But a publish that failed is still this close's
+         * unfinished work -- nofilelock is the datastore mode, and the
+         * last writer's close before a migration is where it lands.
+         * Returned, so the caller queues it for the heartbeat
+         * (cetrafs_lock_retry_deferred()) like any other (audit
+         * 2026-11-05, class 21; tests/kernel/close_publish_retry.sh). */
+        return pub_ret;
     } else if (pub_ret) {
         /* What this writer did is not on the device. Handing the
          * file over now would give the next opener a record without
@@ -2844,18 +2862,31 @@ void cetrafs_lock_retry_deferred(struct super_block *sb)
         }
         if (!cetrafs_sb_file_lock_enabled(sb)) {
             /* nofilelock: the only lock a record can carry is a flock
-             * holder's, and the entry is a holder's close whose clear did
-             * not land. Writers do not claim here, so one still open --
-             * the VM a LOCK_UN handed over -- neither does this work nor
-             * may it stop it. A new local holder does: its own release
-             * clears. Nothing to publish; only the lock. */
+             * holder's, and an entry is either a holder's close whose
+             * clear did not land or a writer's close whose publish did
+             * not. Writers do not claim here, so one still open -- the
+             * VM a LOCK_UN handed over -- neither does this work nor may
+             * it stop it: a writer still open publishes at its own last
+             * close. With none left the publish is retried here first,
+             * then the lock. A new local holder ends the entry: its own
+             * release clears. */
             if (!ci->explicit_lock_file) {
-                ret = cetrafs_lock_clear_on_disk(inode, /*stamp_stat=*/false);
+                ret = 0;
+                bool published = atomic_read(&ci->lock_writer_count) == 0;
+
+                if (published) {
+                    if (filemap_write_and_wait(inode->i_mapping) || cetrafs_flush_dirty_free_counts(sb))
+                        pr_err("lock release retry: ino=%llu data or free counts not flushed\n",
+                               (unsigned long long) inode->i_ino);
+                    ret = cetrafs_lock_publish_and_clear(inode, raw, false, &cleared);
+                }
+                if (!ret)
+                    ret = cetrafs_lock_clear_on_disk(inode, /*stamp_stat=*/false);
                 if (ret)
                     cetrafs_sb_flock_defer(sb, pend[i].ino, pend[i].generation);
                 else
-                    pr_info("lock release: ino=%llu flock clear finished by the heartbeat\n",
-                            (unsigned long long) inode->i_ino);
+                    pr_info("lock release: ino=%llu %s finished by the heartbeat\n", (unsigned long long) inode->i_ino,
+                            published ? "close publish and flock clear" : "flock clear");
             }
             mutex_unlock(&ci->lock_mutex);
             iput(inode);
