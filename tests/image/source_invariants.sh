@@ -1008,6 +1008,22 @@ printf 'static int f(void)\n{\n    cetrafs_extent_t *flat = NULL;\n    int r = c
 [ "$(kv_kfree "$NEGSRC" | wc -l)" = 2 ] && pass "allocator family: control -- both planted kfree()s of kv memory are caught" ||
     fail "allocator family: control -- the check caught $(kv_kfree "$NEGSRC" | wc -l) of 2 planted kfree()s"
 
+# struct folio_batch moved out of <linux/pagevec.h> (kernel 7.1). A file
+# that includes pagevec.h for it unguarded stops building there; file.c
+# did, while ioutil.c had the guard (audit 2026-11-05, section 3).
+log "checking every pagevec.h include falls back from folio_batch.h"
+pagevec_unguarded() {
+    awk '/__has_include\(<linux\/folio_batch\.h>\)/ { g = NR }
+         /^#include <linux\/pagevec\.h>/ && !(g && NR - g <= 3) { print FILENAME ":" FNR }' "$@"
+}
+PV="$(for f in "$K"/*.c "$K"/*.h; do pagevec_unguarded "$f"; done | sed "s|$K/||")"
+[ -z "$PV" ] && pass "pagevec: every include of it is the fallback of a folio_batch.h check" ||
+    fail "pagevec: unguarded #include <linux/pagevec.h> at: $(echo $PV)"
+SAMPLE="$(ct_tmp pagevec-sample).c"
+printf '#include <linux/fs.h>\n#include <linux/pagevec.h>\n' >"$SAMPLE"
+[ -n "$(pagevec_unguarded "$SAMPLE")" ] && pass "pagevec: control -- an unguarded include is caught" ||
+    fail "pagevec: control -- an unguarded include is not caught"
+
 # The module must publish the filesystem alias get_fs_type() asks
 # modprobe for ("fs-<name>") when a mount names a type nothing has
 # registered. Without it, `mount -t cetrafs` on a host that has the

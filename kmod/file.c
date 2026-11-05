@@ -14,7 +14,13 @@
 #include <linux/minmax.h>
 #include <linux/mpage.h>
 #include <linux/pagemap.h>
+/* struct folio_batch moved out of pagevec.h (7.1); build against either,
+ * as ioutil.c does. */
+#if __has_include(<linux/folio_batch.h>)
+#include <linux/folio_batch.h>
+#else
 #include <linux/pagevec.h>
+#endif
 #include <linux/slab.h>
 #include <linux/string.h>
 #include <linux/uaccess.h>
