@@ -124,16 +124,12 @@ static cetrafs_superblock_t repair_sb;
  * give the volume back. A missed release is not fatal (the lease
  * expires) but it leaves the volume unmountable for the staleness
  * window, which an operator would rightly call a bug. */
-/* Refresh the claim while the passes run. Rate-limited to one write a
- * few seconds apart: a repair walks millions of inodes and the lease
- * only has to outlive the staleness window, not every iteration. */
-static void fsck_repair_heartbeat(void)
+/* The claim's timer found our row taken, or a node beating under it
+ * (devutil.h): stop before another write. Every repair write asks
+ * (pwrite_all()), not only the loops that beat -- whole write phases run
+ * between beats. */
+static void fsck_repair_lost_check(void)
 {
-    static time_t last;
-    time_t now;
-
-    if (repair_row < 0 || repair_fd < 0)
-        return;
     if (cetrafs_repair_lost == 2) {
         /* The timer saw a node beating under the claim (devutil.h). */
         fprintf(stderr, "ERR: a node is mounted on this volume while it is being repaired -- stopping before "
@@ -145,6 +141,19 @@ static void fsck_repair_heartbeat(void)
         fprintf(stderr, "ERR: this repair's registry claim was taken away -- stopping before writing more\n");
         exit(FSCK_EXIT_NOEXAM);
     }
+}
+
+/* Refresh the claim while the passes run. Rate-limited to one write a
+ * few seconds apart: a repair walks millions of inodes and the lease
+ * only has to outlive the staleness window, not every iteration. */
+static void fsck_repair_heartbeat(void)
+{
+    static time_t last;
+    time_t now;
+
+    if (repair_row < 0 || repair_fd < 0)
+        return;
+    fsck_repair_lost_check();
     now = time(NULL);
     if (last && now - last < 5)
         return;
@@ -223,6 +232,7 @@ static void pwrite_all(int fd, const void *buf, size_t len, off_t off)
 {
     static long stop_after = -1;
 
+    fsck_repair_lost_check();
     if (pwrite(fd, buf, len, off) != (ssize_t) len) {
         perror("pwrite (repair)");
         exit(FSCK_EXIT_NOEXAM);
@@ -2955,6 +2965,14 @@ int main(int argc, char **argv)
          * A block marked used but referenced by nothing is a leak; one
          * referenced but marked free will be handed out again. */
         uint64_t leaked = 0, unmarked = 0, idx = 0, miscounted = 0, stale_free = 0;
+        /* Test knob only: a pause between the last heartbeat and this
+         * pass's writes, so a suite can have a node appear there
+         * (tests/kernel/fsck_write_after_lost_claim.sh). Unset normally. */
+        if (repair_mode && getenv("CETRAFS_TEST_FSCK_HOLD_BEFORE_BG_PASS_SECS")) {
+            printf("  holding before the block group pass (test)\n");
+            fflush(stdout);
+            cetrafs_sleep_full((unsigned) atoi(getenv("CETRAFS_TEST_FSCK_HOLD_BEFORE_BG_PASS_SECS")));
+        }
         for (uint32_t b = 0; b < cetrafs_le32(sb.block_group_count); ++b) {
             uint64_t bmap_blocks = (bg_data_cnt[b] + CETRAFS_BLOCK_SIZE * 8 - 1) / (CETRAFS_BLOCK_SIZE * 8);
             uint8_t *bmap = (uint8_t *) xcalloc(bmap_blocks ? bmap_blocks : 1, CETRAFS_BLOCK_SIZE);
