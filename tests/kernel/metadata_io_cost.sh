@@ -103,8 +103,12 @@ assert_lt "mkdir does not journal the child dirent block nothing can reach" "$DI
 # numbers, so about half the creates measured here reuse one: +0.5 on
 # average (create 12.1 -> 12.6). It buys this: a peer's orphan scrub can
 # no longer reclaim a number mid-birth.
-assert_lt "mkdir device writes stay bounded" "$MKDIR_W" 14.8
-assert_lt "create device writes stay bounded" "$CREATE_W" 13.1
+# The publish cache flushes (cetrafs_publish_flush(): one before a
+# publish that names new blocks, one after a publish a free may follow)
+# add flushes to the close publish and the parent release: measured
+# create 12.65 -> 15.65, mkdir 14.25 -> 16.25 across that change.
+assert_lt "mkdir device writes stay bounded" "$MKDIR_W" 16.8
+assert_lt "create device writes stay bounded" "$CREATE_W" 16.1
 
 # The content must still be right: a blind write that skipped the read
 # publishes uninitialised memory if any byte goes unwritten.
