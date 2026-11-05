@@ -52,6 +52,7 @@ dm_set() {
 OUT="$(ct_tmp pwbc-out)"
 GO="$(ct_tmp pwbc-go)"; rm -f "$GO"
 READY="$(ct_tmp pwbc-ready)"; rm -f "$READY"
+ct_track file "$GO.2"; ct_track file "$READY.2"
 python3 - "$MNT/f" "$GO" "$READY" >"$OUT" 2>&1 <<'PY' &
 import ctypes, os, sys, time
 libc = ctypes.CDLL(None, use_errno=True)

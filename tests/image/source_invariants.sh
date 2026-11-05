@@ -766,7 +766,7 @@ c22_scan() { # <edges> <root> <files>...
     done
     echo "$hits"
 }
-S22="$(ct_tmp c22-sample).c"
+S22="$(ct_tmp c22-sample).c"; ct_track file "$S22"
 printf '%s\n' 'static int helper(struct inode *inode)' '{' '    inode_lock(inode);' '    return 0;' '}' \
     'static int sample_end_io(struct kiocb *iocb)' '{' '    return helper(NULL);' '}' >"$S22"
 E22="$(ct_tmp c22-edges)"
@@ -802,7 +802,7 @@ c5_reaches() { # <edges> <boundary> <flushers...>: prints the flusher reached, i
     r=" $(forward "$e" "$b") "
     for f in "$@"; do case "$r" in *" $f "*) echo "$f"; return ;; esac; done
 }
-S5="$(ct_tmp c5-sample).c"
+S5="$(ct_tmp c5-sample).c"; ct_track file "$S5"
 printf '%s\n' 'static int flushes(void)' '{' '    return blkdev_issue_flush(NULL);' '}' \
     'static int sample_sync(void)' '{' '    return 0;' '}' >"$S5"
 E5="$(ct_tmp c5-edges)"
