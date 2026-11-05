@@ -239,6 +239,8 @@ struct cetrafs_journal_claim_ctx {
     bool set_clean; /* release: also park the flag at CLEAN */
     bool steal;     /* claim: allowed to displace steal_from */
     u32 steal_from;
+    bool displaced; /* claim, out: the swap took it FROM steal_from */
+    bool give_back; /* hand a claim we just took back to steal_from */
 };
 
 static int cetrafs_journal_claim_mutate(void *image, unsigned int len, void *priv)
@@ -250,6 +252,13 @@ static int cetrafs_journal_claim_mutate(void *image, unsigned int len, void *pri
 
     if (cetrafs_le32(hdr->magic) != CETRAFS_NODE_JOURNAL_MAGIC)
         return -EEXIST; /* never written, or not ours to touch */
+
+    if (ctx->give_back) {
+        if (cetrafs_le32(hdr->replay_owner) != ctx->my_node_id)
+            return 1; /* moved on since: nothing of ours to undo */
+        hdr->replay_owner = cetrafs_cpu_to_le32(ctx->steal_from);
+        return 0;
+    }
 
     if (ctx->release) {
         if (cetrafs_le32(hdr->replay_owner) != ctx->my_node_id)
@@ -268,6 +277,8 @@ static int cetrafs_journal_claim_mutate(void *image, unsigned int len, void *pri
         !(ctx->steal && cetrafs_le32(hdr->replay_owner) == ctx->steal_from))
         return -EEXIST; /* a live replayer owns it */
 
+    /* Per attempt: the image that lands is the last one mutated. */
+    ctx->displaced = ctx->steal && cetrafs_le32(hdr->replay_owner) == ctx->steal_from;
     hdr->replay_owner = cetrafs_cpu_to_le32(ctx->my_node_id);
     hdr->replay_claimed = cetrafs_cpu_to_le64((u64) ktime_get_real_seconds());
     return 0;
@@ -351,6 +362,7 @@ static int cetrafs_journal_claim_replay(struct super_block *sb, u64 area_start, 
     struct buffer_head *bh;
     const cetrafs_node_journal_hdr_t *hdr;
     u32 owner;
+    int ret;
 
     bh = cetrafs_bread_uncached_retry(sb, area_start);
     if (!bh)
@@ -376,9 +388,35 @@ static int cetrafs_journal_claim_replay(struct super_block *sb, u64 area_start, 
         }
         ctx.steal = true;
         ctx.steal_from = owner;
+        cetrafs_node_test_stall_before_swap();
     }
 
-    return cetrafs_cas_record(sb, area_start, cetrafs_journal_claim_mutate, &ctx);
+    ret = cetrafs_cas_record(sb, area_start, cetrafs_journal_claim_mutate, &ctx);
+    /*
+     * Was the replayer we displaced still the incarnation the fence
+     * revoked? The swap compares its row NUMBER only, and a replayer that
+     * re-attached and took this claim again wrote the very bytes it
+     * compares -- two replayers of one area, which is what the claim
+     * exists to prevent. Give it back and leave the area to it, as for
+     * any live replayer; a give-back that does not land leaves two, so
+     * the mount stops. Only a displacement is undone: a claim the
+     * re-attach's sweep had already handed back was free to take
+     * (lock.c's cetrafs_lock_undo_steal() has the full account).
+     */
+    if (ret == 0 && ctx.displaced && cetrafs_node_reattached_since_fence(sb, owner)) {
+        struct cetrafs_journal_claim_ctx g = {.my_node_id = my_node_id, .give_back = true, .steal_from = owner};
+        int gret = cetrafs_cas_record(sb, area_start, cetrafs_journal_claim_mutate, &g);
+
+        if (gret < 0)
+            cetrafs_sb_fatal(sb, "journal: area %llu: node %u came back while its replay claim was being taken, "
+                             "and the claim could not be given back (%d)",
+                             (unsigned long long) area_start, owner, gret);
+        else
+            pr_warn("journal: area %llu: node %u came back while its replay claim was being taken -- gave it back\n",
+                    (unsigned long long) area_start, owner);
+        return -EEXIST;
+    }
+    return ret;
 }
 
 /* TEST ONLY: fail the next replay-claim release, as a CAS the device
