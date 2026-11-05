@@ -4786,6 +4786,9 @@ static int __cetrafs_truncate_shrink(struct inode *inode, loff_t new_size)
     recs = kmalloc(2 * sizeof(*recs), GFP_NOFS);
     if (!recs)
         return -ENOMEM;
+    /* The leaves read below decide what is freed: not through a verdict
+     * cached a second ago (cetrafs_lock_expire_verdicts(), audit L6). */
+    cetrafs_lock_expire_verdicts(inode);
 
     /*
      * Forced fresh, not cached. This runs under the inode's namespace
@@ -5435,6 +5438,9 @@ static long cetrafs_fallocate(struct file *file, int mode, loff_t offset, loff_t
      * follows, and one exit point cannot forget to drop it. */
     filemap_invalidate_lock(inode->i_mapping);
 
+    /* The leaves the punch walks decide what is freed: not through a
+     * verdict cached a second ago (cetrafs_lock_expire_verdicts()). */
+    cetrafs_lock_expire_verdicts(inode);
     /* A punch changes the file: not while it is handed to a peer. */
     ret = cetrafs_lock_write_gate(inode);
     if (ret)

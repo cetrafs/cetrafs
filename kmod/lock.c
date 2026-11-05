@@ -3092,6 +3092,27 @@ static bool cetrafs_inode_has_foreign_opener(struct inode *inode)
 }
 
 /*
+ * Forget the cached verdicts below, so the next freshness check reads the
+ * record from the device -- and notes a peer's file_seq, which marks the
+ * tree cold and sends the leaf reads fresh (CLAUDE.md rule 10).
+ *
+ * For the paths whose decision is DESTRUCTIVE: evict, truncate and punch
+ * free the blocks their extent leaves name. A second-old "no peer has it
+ * open" is fine for mapping a read; for freeing it is the wrong sign of
+ * staleness (rule 6) -- a peer's session inside that second can have
+ * changed a leaf this node still has cached, and freeing from the old
+ * leaf frees blocks that are not this file's any more (audit L6). One
+ * record read per operation, never per block.
+ */
+void cetrafs_lock_expire_verdicts(struct inode *inode)
+{
+    struct cetrafs_inode_info *ci = CETRAFS_I(inode);
+
+    WRITE_ONCE(ci->foreign_open_valid, false);
+    WRITE_ONCE(ci->read_seq_valid, false);
+}
+
+/*
  * Rate-limited wrapper: re-read the presence mask at most once per second
  * per inode and cache the verdict. The hot path (metadata read per I/O)
  * then costs a jiffies compare and a cached bool, not a device read --

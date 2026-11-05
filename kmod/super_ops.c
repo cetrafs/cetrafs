@@ -494,6 +494,9 @@ static void cetrafs_evict_inode(struct inode *inode)
              * from an I/O error on a leaf or an allocation failure
              * flattening a large tree.
              */
+            /* What is freed below is what these leaves name: not
+             * through a verdict cached a second ago (audit L6). */
+            cetrafs_lock_expire_verdicts(inode);
             if (cetrafs_inode_extents_get(inode, &raw, &ex) != 0) {
                 pr_err("evict_inode: ino=%llu: its extent tree cannot be read -- freeing NEITHER the number nor the "
                        "blocks, so fsck can still name them\n",

@@ -912,6 +912,7 @@ bool cetrafs_pending_wb_failed(struct inode *inode);
 void cetrafs_pending_clear(struct inode *inode, u32 first, u32 last);
 void cetrafs_pending_drop_all(struct inode *inode);
 bool cetrafs_inode_foreign_opener_cached(struct inode *inode);
+void cetrafs_lock_expire_verdicts(struct inode *inode);
 void cetrafs_inode_set_generation(struct inode *inode, u64 gen);
 
 /*
