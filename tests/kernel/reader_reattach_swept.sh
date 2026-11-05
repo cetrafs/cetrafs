@@ -19,7 +19,8 @@
 #
 # DISCRIMINATION: the setup checks require the fence and the withdrawn
 # bit. Proven by removing the rctx.displaced test: the bit is put back
-# and the file is refused to writers.
+# and the file is refused to writers. Case 2 by adding
+# refuse_foreign_lock to the give-back: the bit is not restored.
 set -euo pipefail
 . "$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)/lib/harness.sh"
 require_root
@@ -64,6 +65,32 @@ grep -q "readers=0x2\|readers=0x3" <<<"$L" &&
 RC2=0
 python3 -c 'import os,sys; os.close(os.open(sys.argv[1], os.O_RDWR))' "$MNT/f" 2>/dev/null || RC2=$?
 [ "$RC2" = 0 ] && pass "the file opens for writing" || fail "the file is refused to writers (rc=$RC2, first open rc=$RC)"
+ct_umount "$MNT"
+
+# 2. The interleaving the give-back exists for: row 1 comes back and is
+# READING (no sweep of its bit), and a third node claims the file's lock
+# in the gap. The bit goes back regardless -- it is the true state, and
+# how that writer's truncate or unlink learns of the reader. Refusing
+# under the foreign lock dropped a live reader's presence (audit F12).
+"$NPOKE" "$IMG" 1 1 bb 0 >/dev/null 2>&1
+"$LPOKE" "$IMG" "$INO" --reader 1 >/dev/null
+ct_mount "$DEV" "$MNT"
+ct_param_set reclaim_stall_before_swap_ms 2000
+( sleep 0.8; "$NPOKE" "$IMG" 1 --beat >/dev/null 2>&1; "$LPOKE" "$IMG" "$INO" 2 1 >/dev/null 2>&1 ) &
+B=$!
+python3 -c 'import os,sys; os.close(os.open(sys.argv[1], os.O_RDWR))' "$MNT/f" 2>/dev/null || true
+wait "$B" || true
+LEFT="$(cat /sys/module/cetrafs/parameters/reclaim_stall_before_swap_ms)"
+ct_param_set reclaim_stall_before_swap_ms 0
+L="$("$LPOKE" "$IMG" "$INO")"
+log "2: $L"
+[ "$LEFT" = 0 ] || { fail "setup (2): the stall was never consumed"; ct_exit; }
+grep -q "owner=2 mode=1" <<<"$L" || { fail "setup (2): the third node's lock is not on the record: $L"; ct_exit; }
+grep -qE "readers=0x[0-9a-f]*[2367abef]$" <<<"$L" &&
+    pass "2: the returning reader's bit was put back under the third node's lock ($L)" ||
+    fail "2: a live reader's presence was dropped because a writer claimed the file in the gap ($L)"
+"$LPOKE" "$IMG" "$INO" 65535 0 >/dev/null 2>&1
+"$LPOKE" "$IMG" "$INO" --unreader 1 >/dev/null 2>&1
 "$NPOKE" "$IMG" 1 0 bb 0 >/dev/null 2>&1
 ct_umount "$MNT"
 ct_exit

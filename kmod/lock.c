@@ -4735,20 +4735,15 @@ static int cetrafs_foreign_reader_from_raw(struct super_block *sb,
                  * every write-open of the file, cluster-wide, until that
                  * node next opened and closed it for read.
                  *
-                 * And never under a writer this caller did not expect
-                 * (refuse_foreign_lock): one claimed while the bit was
-                 * clear is not stopped by putting it back, and a reader
-                 * bit published under a foreign exclusive lock is a
-                 * record that says both. */
+                 * Put back even under a writer that claimed the file in
+                 * the gap. The node IS reading it -- that is what came
+                 * back -- and the bit is how that writer's truncate or
+                 * unlink finds out. Refusing would drop a live reader's
+                 * presence to keep the record tidy; restoring it is the
+                 * true state. */
                 rctx.reader_op = CETRAFS_READER_SET;
-                rctx.refuse_foreign_lock = true;
-                rctx.lock_owner_ok = my_node_id;
                 ret = cetrafs_cas_record(sb, cetrafs_inode_lba(sb, ino), cetrafs_lock_cas_mutate, &rctx);
-                if (ret == -ETXTBSY)
-                    pr_err("ino=%llu: node %u came back while its reader bit was being cleared, and a writer "
-                           "claimed the file in between -- not putting the bit back under it\n",
-                           (unsigned long long) ino, n);
-                else if (ret < 0 && ret != -ENOENT) /* -ENOENT: the file is gone, nothing to protect */
+                if (ret < 0 && ret != -ENOENT) /* -ENOENT: the file is gone, nothing to protect */
                     cetrafs_sb_fatal(sb, "ino=%llu: node %u came back while its reader bit was being cleared, and the "
                                      "bit could not be put back (%d)",
                                      (unsigned long long) ino, n, ret);
