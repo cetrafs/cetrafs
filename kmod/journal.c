@@ -1565,6 +1565,33 @@ static int __cetrafs_journal_replay_node(struct super_block *sb, u32 node_id, bo
             goto consume;
         }
 
+        /* A target freed since the entry was written is nobody's block:
+         * nothing published names it (a reference is never durable
+         * before its bit), so there is nothing to repair -- and writing
+         * it lands on a block the allocator may be handing out. The
+         * prev_checksum guard cannot see this: freeing changes no byte
+         * of the block (audit L9). Read fresh unless the BG is ours
+         * (cetrafs_data_block_is_allocated()). A block allocated to
+         * somebody else after this look is either written by its new
+         * owner -- which the guard below then refuses -- or written
+         * over by it whatever the redo put there. */
+        if (!cetrafs_journal_ignore_guard) {
+            bool live = true;
+            int aret = cetrafs_data_block_is_allocated(sb, entries[s].target_lba, &live);
+
+            if (aret == -EIO) {
+                ret = aret;
+                goto out_free;
+            }
+            if (!aret && !live) {
+                atomic64_inc(&cetrafs_journal_replay_skipped);
+                pr_info("journal replay: node %u txn %llu target block %llu has been freed since -- nothing to "
+                        "repair, not writing it\n",
+                        node_id, (unsigned long long) entries[s].txn_id, (unsigned long long) entries[s].target_lba);
+                goto consume;
+            }
+        }
+
         pbh = cetrafs_bread_uncached_retry(sb, entries[s].payload_lba);
         if (!pbh) {
             ret = -EIO;

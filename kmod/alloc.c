@@ -2349,6 +2349,45 @@ int cetrafs_inode_is_allocated(struct super_block *sb, u64 ino, bool *out_set)
 }
 
 /*
+ * Is data block 'lba' allocated in its Block Group's bitmap, as the
+ * device has it? For journal replay (audit L9): a redo onto a block
+ * that has been freed since repairs nothing -- nothing published refers
+ * to it, because a reference never becomes durable before its bit
+ * (CLAUDE.md rule 8) -- and writing it lands on a block the allocator
+ * may be handing out.
+ *
+ * Staleness direction (rule 6): "free" is the verdict that SKIPS a
+ * redo, so a stale copy saying free about a block the dead node did
+ * allocate would leave a torn block unrepaired. The bitmap block is
+ * therefore read fresh -- unless this node owns the Block Group, where
+ * the cache is the only up-to-date copy and dropping it is not allowed
+ * (docs/PERFORMANCE.md, invariant 3; a dirty block is never dropped).
+ * -EINVAL: the LBA is in no data region.
+ */
+int cetrafs_data_block_is_allocated(struct super_block *sb, u64 lba, bool *out_set)
+{
+    struct cetrafs_bg_geom bg;
+    u64 data_start, bit, nblocks;
+    u32 bg_id;
+    int ret;
+
+    ret = cetrafs_bg_id_for_lba(sb, lba, &bg_id);
+    if (ret)
+        return ret;
+    ret = cetrafs_read_bg_geom(sb, bg_id, &bg);
+    if (ret)
+        return ret;
+    data_start = bg.start_block + bg.off_data_region;
+    if (lba < data_start || lba >= data_start + bg.data_block_count)
+        return -EINVAL;
+    bit = lba - data_start;
+    nblocks = bg.off_data_region - bg.off_data_bmap;
+    if (bg.owner_zg == CETRAFS_BG_OWNER_FREE || !cetrafs_sb_zg_owned_cached(sb, bg.owner_zg))
+        cetrafs_invalidate_block(sb, bg.start_block + bg.off_data_bmap + bit / CETRAFS_BITS_PER_BLOCK);
+    return cetrafs_bitmap_test_bit(sb, bg.start_block + bg.off_data_bmap, nblocks, bit, out_set);
+}
+
+/*
  * Make this node's allocation bits durable.
  *
  * Called at every durability boundary BEFORE the write that publishes a

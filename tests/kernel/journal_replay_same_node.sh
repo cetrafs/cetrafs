@@ -28,6 +28,7 @@ require_module
 NODEPOKE="$(ct_helper node_poke)"
 JPOKE="$(ct_helper journal_poke)"
 LPOKE="$(ct_helper inode_lock_poke)"
+EPOKE="$(ct_helper pending_poke)"
 ct_param_set hb_interval_secs 2
 
 IMG="$(ct_image 560 jsame)"
@@ -42,6 +43,10 @@ PEER=$(((NID + 1) % 4))
 dd if=/dev/zero of="$MNT/f" bs=4096 count=2 conv=fsync status=none
 INO="$(stat -c %i "$MNT/f")"
 ct_umount "$MNT"
+# An ALLOCATED target: replay skips a block freed since its entry
+# (journal_replay_freed_target.sh), so a free one would test nothing.
+TARGET="$("$EPOKE" "$IMG" extent "$INO" | cut -d' ' -f1)"
+[ -n "$TARGET" ] && [ "$TARGET" -gt 0 ] || { fail "setup: no data block for f ($TARGET)"; ct_exit; }
 "$LPOKE" "$IMG" "$INO" "$PEER" 1 >/dev/null
 ct_mount "$DEV" "$MNT"
 
@@ -49,7 +54,7 @@ ct_param_set journal_replay_apply_pause_ms 3000
 PAY="$(ct_tmp jsame-pay)"; head -c 4096 /dev/urandom >"$PAY" # differs from the target, so replay must redo it
 MARK="$(dmesg_mark)"
 "$NODEPOKE" "$IMG" "$PEER" 1 ee 0 >/dev/null 2>&1   # REGISTERED, last_seen=0: stale at once
-"$JPOKE" "$IMG" "$PEER" 0 60001 "$PAY" >/dev/null 2>&1
+"$JPOKE" "$IMG" "$PEER" 0 "$TARGET" "$PAY" >/dev/null 2>&1
 for _ in $(seq 1 100); do
     dmesg_since "$MARK" | grep -q "journal replay: pausing" && break
     sleep 0.1
