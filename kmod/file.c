@@ -252,8 +252,18 @@ static vm_fault_t cetrafs_page_mkwrite(struct vm_fault *vmf)
      * punch/truncate/fallocate paths makes invalidate_lock the one
      * thing serialising extent-tree mutation, which is what the fault
      * path needed and inode_lock could never give it.
+     *
+     * Killable: the holder may be a punch or truncate doing device I/O
+     * for seconds, and a store that cannot be killed behind it pins the
+     * process in D state (audit L21). A fatal signal fails the fault
+     * with SIGBUS -- the task is dying, and a kernel-mode access (a
+     * copy_from_user into this mapping) gets -EFAULT instead of a fault
+     * retried forever.
      */
-    filemap_invalidate_lock(inode->i_mapping);
+    if (down_write_killable(&inode->i_mapping->invalidate_lock)) {
+        sb_end_pagefault(inode->i_sb);
+        return VM_FAULT_SIGBUS;
+    }
     /* Not while this node has handed the file to a peer: a store
      * through an old mapping is a write like any other
      * (cetrafs_lock_write_gate()). */
@@ -501,7 +511,14 @@ static int cetrafs_dio_get_block(struct inode *inode, sector_t iblock, struct bu
 
     if (!create)
         return cetrafs_get_block_read(inode, iblock, bh_result, 0);
-    filemap_invalidate_lock(inode->i_mapping);
+    /* Killable, as page_mkwrite (audit L21): this runs in the
+     * submitter's context and may queue behind a fault or the defrag
+     * mover doing device I/O. A fatal signal fails the write before
+     * this block is mapped -- nothing is allocated. The completion
+     * (cetrafs_dio_end_io()) stays uninterruptible: its data is on the
+     * device, and giving up there leaves it reading as zeros. */
+    if (down_write_killable(&inode->i_mapping->invalidate_lock))
+        return -EINTR;
     ret = __cetrafs_get_block(inode, iblock, bh_result, create, false, CETRAFS_GB_DIO);
     filemap_invalidate_unlock(inode->i_mapping);
     /* TEST ONLY: the write fails with this block allocated and never
