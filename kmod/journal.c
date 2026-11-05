@@ -571,6 +571,16 @@ int cetrafs_journal_sweep_own_claims(struct super_block *sb, u32 my_node_id)
  * replay fails the mount: writing on top of unrecovered state is exactly
  * what the journal exists to prevent.
  */
+/* TEST ONLY: mounts made while set use at most this many of their area's
+ * slots, so a suite can fill them; and a journaled write pauses between
+ * its entry and its target write, holding its slot. */
+static unsigned int cetrafs_journal_slots_max;
+cetrafs_test_param(journal_slots_max, cetrafs_journal_slots_max, uint, 0644);
+MODULE_PARM_DESC(journal_slots_max, "TEST ONLY: cap the journal slots a mount made while set uses");
+static unsigned int cetrafs_journal_target_stall_ms;
+cetrafs_test_param(journal_target_stall_ms, cetrafs_journal_target_stall_ms, uint, 0644);
+MODULE_PARM_DESC(journal_target_stall_ms, "TEST ONLY: pause a journaled write between its entry and its target write");
+
 int cetrafs_journal_attach_node(struct super_block *sb, u32 node_id)
 {
     struct cetrafs_journal *j = cetrafs_sb_get_journal(sb);
@@ -584,6 +594,8 @@ int cetrafs_journal_attach_node(struct super_block *sb, u32 node_id)
         return ret;
     if (!j->area_start)
         return 0; /* journaling disabled volume-wide (mkfs -J 0) */
+    if (cetrafs_journal_slots_max && j->slots > cetrafs_journal_slots_max)
+        j->slots = cetrafs_journal_slots_max; /* test-only: this mount writes fewer; replay still reads them all */
 
     j->busy = kcalloc(BITS_TO_LONGS(j->slots), sizeof(unsigned long), GFP_KERNEL);
     j->stuck_lba = kcalloc(j->slots, sizeof(*j->stuck_lba), GFP_KERNEL);
@@ -736,11 +748,19 @@ static int cetrafs_journal_zero_header(struct super_block *sb, u64 header_lba)
 }
 
 /* Hold 'slot' past its operation. Called with j->lock held. A nonzero
- * 'lba' names the target whose next write takes the slot over. */
+ * 'lba' names the target whose next write takes the slot over.
+ *
+ * Wakes the slot waiters: their condition is "a slot is free OR every
+ * slot is held", and this is the write that can make the second half
+ * true. Without the wake, a writer waiting when the last in-flight slot
+ * became held slept for ever, uninterruptibly and holding its buffer's
+ * update lock, instead of getting the -EIO the condition exists to
+ * deliver (audit 2026-11-05, N2; tests/kernel/journal_slot_held_wakes.sh). */
 static void cetrafs_journal_hold_slot(struct cetrafs_journal *j, u64 slot, u64 lba)
 {
     j->stuck_lba[slot] = lba;
     j->held++;
+    wake_up(&j->slot_wq);
 }
 
 /* Lockless: only a wake-up condition, re-checked under j->lock. */
@@ -964,6 +984,8 @@ static int cetrafs_journal_write_block_flags(struct super_block *sb, struct buff
             return ferr;
         }
     }
+    if (journaled && cetrafs_journal_target_stall_ms)
+        msleep(cetrafs_journal_target_stall_ms); /* test-only; see the parameter */
     /* end_update marks it dirty and releases it; the sync must follow,
      * never precede, because sync_dirty_buffer() takes the buffer lock. */
     if (cetrafs_journal_fail_target_write) {
