@@ -5098,7 +5098,10 @@ static int cetrafs_do_allocate(struct inode *inode, loff_t offset, loff_t len, b
     ret = cetrafs_read_raw_inode_overlaid(sb, inode, &raw); /* torn-read-safe vs a concurrent publish */
     if (ret)
         goto out_free;
-    if (cetrafs_le16(raw.eh.eh_magic) != CETRAFS_EXT_MAGIC) {
+    /* The same three bounds get_block applies before it indexes the
+     * inline array by eh_entries (audit L12). */
+    if (cetrafs_le16(raw.eh.eh_magic) != CETRAFS_EXT_MAGIC || cetrafs_le16(raw.eh.eh_depth) > CETRAFS_EXT_MAX_DEPTH ||
+        cetrafs_le16(raw.eh.eh_entries) > ARRAY_SIZE(raw.et.leaf)) {
         ret = -EIO;
         goto out_free;
     }

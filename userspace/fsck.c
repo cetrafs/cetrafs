@@ -1775,6 +1775,11 @@ int main(int argc, char **argv)
             if (!data_end)
                 data_end = cetrafs_le64(sb.bg_regions_start) +
                            (uint64_t) cetrafs_le32(sb.block_group_count) * cetrafs_le64(sb.bg_size_blocks);
+            if (cetrafs_le64(bg.length_blocks) > CETRAFS_MAX_BG_SIZE_BLOCKS) {
+                fprintf(stderr, "ERR: BG%zu length %" PRIu64 " exceeds the format's limit of %llu blocks\n", (size_t) b,
+                        (uint64_t) cetrafs_le64(bg.length_blocks), (unsigned long long) CETRAFS_MAX_BG_SIZE_BLOCKS);
+                return 1;
+            }
             if (bg_end > data_end || cetrafs_le64(bg.start_block) < cetrafs_le64(sb.bg_regions_start)) {
                 fprintf(stderr,
                         "ERR: BG%zu [%" PRIu64 ",+%" PRIu64 ") falls outside the data area [%" PRIu64 ",%" PRIu64 ")\n",

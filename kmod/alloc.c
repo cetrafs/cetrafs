@@ -1129,7 +1129,10 @@ static bool cetrafs_bg_geom_sane(const cetrafs_superblock_t *raw_sb, u32 bg_id, 
     if (data_end > total)
         data_end = total;
 
-    return cetrafs_le32(bg->bg_id) == bg_id && start >= regions && len && len <= data_end - regions &&
+    /* len is also bounded by the format's ceiling, not only by the data
+     * area: a block offset inside a BG is a u32 (audit L10). */
+    return cetrafs_le32(bg->bg_id) == bg_id && start >= regions && len && len <= CETRAFS_MAX_BG_SIZE_BLOCKS &&
+           len <= data_end - regions &&
            start <= data_end - len && bmap >= 1 && bmap < region && region <= len && count <= len - region &&
            count <= (region - bmap) * CETRAFS_BLOCK_SIZE * 8;
 }
