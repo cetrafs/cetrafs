@@ -690,6 +690,7 @@ extern const struct xattr_handler *const cetrafs_xattr_handlers[];
 int cetrafs_init_security(struct inode *inode, struct inode *dir, const struct qstr *qstr);
 
 // alloc.c
+u64 cetrafs_bg_lookup_reads_count(void);
 int cetrafs_alloc_inode(struct super_block *sb, u64 *out_ino);
 int cetrafs_free_inode(struct super_block *sb, u64 ino);
 /* The scrub's conditioned variant: frees ONLY if a fresh read still shows

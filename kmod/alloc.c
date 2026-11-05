@@ -2185,6 +2185,15 @@ void cetrafs_shadow_seed(struct super_block *sb)
     }
 }
 
+/* Descriptor reads made by cetrafs_bg_id_for_lba() after its arithmetic
+ * missed: O(log BGs) per miss now, a whole table before (audit L20). */
+static atomic64_t cetrafs_bg_lookup_reads = ATOMIC64_INIT(0);
+
+u64 cetrafs_bg_lookup_reads_count(void)
+{
+    return (u64) atomic64_read(&cetrafs_bg_lookup_reads);
+}
+
 static int cetrafs_bg_id_for_lba(struct super_block *sb, u64 lba, u32 *out_bg_id)
 {
     const cetrafs_superblock_t *raw_sb = cetrafs_sb_raw(sb);
@@ -2210,9 +2219,19 @@ static int cetrafs_bg_id_for_lba(struct super_block *sb, u64 lba, u32 *out_bg_id
      * per owned BG per block saturates a core; this did the whole
      * table.
      *
-     * The fallback stays for anything the arithmetic cannot predict (a
-     * short last BG, a layout that is not uniform): correct, just slow,
-     * and it should never run.
+     * The arithmetic misses on a grown volume: each grow leaves a hole
+     * where the previous tail reserve was (cetrafs.h, bg_data_end), so
+     * every Block Group past it starts later than b * bg_size_blocks
+     * predicts. It also misses for an LBA in no data region at all --
+     * an extent on a hostile image. Both used to fall back to a walk of
+     * the whole table, one walk per freed extent (audit L20). Starts are
+     * ordered (mkfs and growfs append, fsck refuses a descriptor that
+     * overlaps its predecessor), so the fallback is a binary search on
+     * start_block: O(log n) descriptor reads, and the answer is verified
+     * against the descriptor like the arithmetic one. A hostile table
+     * that is not ordered can only make the search miss, and a miss is
+     * -EINVAL: the caller refuses the free, which leaks (scrub, fsck)
+     * and never shares a block.
      */
     {
         u64 regions_start = le64_to_cpu(raw_sb->bg_regions_start);
@@ -2234,20 +2253,37 @@ static int cetrafs_bg_id_for_lba(struct super_block *sb, u64 lba, u32 *out_bg_id
                 }
             }
         }
+        if (lba < regions_start)
+            return -EINVAL;
     }
 
-    for (bg_id = 0; bg_id < bg_count; bg_id++) {
+    {
+        u32 lo = 0, hi = bg_count; /* the answer, if any, is in [lo, hi) */
         struct cetrafs_bg_geom bg;
-        u64 data_start, data_end;
-        int ret = cetrafs_read_bg_geom(sb, bg_id, &bg);
+        u64 data_start;
+        int ret;
 
+        if (!bg_count)
+            return -EINVAL;
+        while (hi - lo > 1) {
+            u32 mid = lo + (hi - lo) / 2;
+
+            atomic64_inc(&cetrafs_bg_lookup_reads);
+            ret = cetrafs_read_bg_geom(sb, mid, &bg);
+            if (ret)
+                return ret;
+            if (bg.start_block <= lba)
+                lo = mid;
+            else
+                hi = mid;
+        }
+        bg_id = lo;
+        atomic64_inc(&cetrafs_bg_lookup_reads);
+        ret = cetrafs_read_bg_geom(sb, bg_id, &bg);
         if (ret)
             return ret;
-
         data_start = bg.start_block + bg.off_data_region;
-        data_end = data_start + bg.data_block_count;
-
-        if (lba >= data_start && lba < data_end) {
+        if (lba >= data_start && lba < data_start + bg.data_block_count) {
             *out_bg_id = bg_id;
             return 0;
         }

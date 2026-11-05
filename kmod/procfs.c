@@ -228,6 +228,9 @@ static int cetrafs_proc_info_show(struct seq_file *m, void *v)
      * reading (and CRC-ing) every owned BG descriptor again. */
     seq_printf(m, "bg_pick_cursor: %llu\n", cetrafs_bg_pick_cursor_count());
     seq_printf(m, "bg_pick_scan: %llu\n", cetrafs_bg_pick_scan_count());
+    /* Descriptor reads by the LBA -> Block Group lookup once its
+     * arithmetic missed (a grown volume, or an LBA in no region). */
+    seq_printf(m, "bg_lookup_reads: %llu\n", cetrafs_bg_lookup_reads_count());
     /* Existing-block mappings vs the blocks they covered. Equal means
      * every caller is coming back per 4 KiB; blocks > calls means
      * cetrafs_get_block() is answering with contiguous runs. */
