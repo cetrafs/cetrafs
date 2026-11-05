@@ -1,3 +1,196 @@
+cetrafs (0.9.4) unstable; urgency=medium
+
+  * No format version change: volumes made or grown by 0.9.3 mount as
+    they are. Several fixes below change how nodes arbitrate with each
+    other and protect only nodes that run them: upgrade every node, and
+    do not mount one volume from 0.9.3 and 0.9.4 at once.
+
+  * Fixed: an Oops at unmount. A pending background reconcile held a
+    reference to a deleted file, unmount went ahead without waiting for
+    it, and the reconcile then evicted the file through a superblock
+    already freed. Reconciles now run on a per-mount queue that unmount
+    drains first. An inode free no longer sleeps in RCU context.
+
+  * Fixed, fencing: a node cut off from its peers went on writing until
+    a peer noticed. It now stops writing once its heartbeat lease runs
+    out, before any peer can call it stale; a fenced node discards its
+    dirty metadata instead of writing it back; a self-fenced node no
+    longer fences peers or replays their journals; and a node takes
+    nothing from a stale peer whose lease it has not revoked.
+
+  * Fixed, journal: a replay could write a dead node's extent leaf over
+    a block a live writer was changing, or over a block reused since as
+    file data. Both are now checked on the device before the redo. A
+    write the journal cannot protect fails instead of going unprotected.
+
+  * Fixed, cluster arbitration: a compare-and-write whose outcome was
+    unknown was judged from a cached buffer, and one reported failed
+    that had in fact landed could be applied twice. Both are now
+    decided from the device. Two machines with one node identity
+    registering at once no longer become one node, and a node refuses
+    to join a volume a live peer runs without compare-and-write.
+
+  * Changed: every serious error ends in the state a crash leaves. A
+    metadata write the device refused, or a contradiction between
+    memory and disk, stops the mount; an inode found with damaged
+    metadata refuses writes (EUCLEAN) instead of building on it; a
+    failed data write is reported by close(2).
+
+  * Fixed: records and blocks read off the disk are checked before use.
+    A Block Group descriptor with impossible geometry, a directory or
+    tree block outside the data regions (including, on a grown volume,
+    the relocated Block Group table), a valid inode record found in
+    another inode's slot, and an index count beyond its block are all
+    refused instead of followed.
+
+  * Fixed, namespace: rename of a directory added the new name before
+    removing the old one; a directory a peer removed could still be
+    walked; an open could succeed on a file that had lost its last
+    name; and a lockless xattr read could return another file's xattr
+    block.
+
+  * Fixed, allocation: a free could be lost by a free-count recount, an
+    inode number could be handed out again before its record was dead,
+    a create that failed after claiming a number kept it, and Block
+    Group ownership was not re-checked under the allocator's lock.
+    Truncate and punch change nothing in memory until their record is
+    written, and a punch smaller than a block still zeroes its range.
+
+  * Fixed, file data across nodes: an open, the background defrag pass
+    and a flock handoff could keep this node's old size and extent map
+    over a file a peer had extended and closed, and the next write
+    landed over the peer's data. Truncate, punch and preallocation
+    re-check for a peer that has the file open before they publish and
+    free; defrag no longer moves a file just handed to a peer; and the
+    scrub decides what is leaked from extent blocks read off the
+    device, not from cache.
+
+  * Fixed, cleanup after a dead node: a deleted file a dead node still
+    held open or locked is reclaimed by the scrub instead of leaking
+    until fsck; a claim naming a node outside the registry can be
+    reclaimed; a node that crashed and remounted before its peers
+    noticed gives back what its previous run held; a Zone Group steal
+    decided before its owner came back no longer lands after it, which
+    let two nodes allocate the same blocks; and a node about to take a
+    dead node's lock waits for a peer already replaying its journal.
+
+  * Fixed, releases: a lock, read presence or claim whose release
+    fails is retried by the heartbeat instead of being forgotten, and a
+    retry queue that fills stops the mount rather than dropping one.
+    flock(LOCK_UN) now returns the error when its release did not reach
+    the device, and the descriptor keeps the lock until one does.
+
+  * Fixed, same node: extent, scrub and xattr reads take a cached
+    block's buffer lock, so they no longer see an in-place update torn;
+    file change stamps keep their order across the counter's wrap; no
+    allocation under the allocator's locks can recurse into reclaim; a
+    timed-out compare-and-write that landed late is not applied twice;
+    and a direct write past end of file that fails leaves no block
+    holding old data behind it.
+
+  * Fixed: waits on a peer's lock now end on a fatal signal, and so do
+    a store through a mapping, an O_DIRECT allocation and a flock that
+    wait behind a punch or a reclaim; the heartbeat's maintenance pass
+    no longer stalls behind an open's journal replay; the scrub and the
+    allocator yield the CPU inside long bitmap scans; readdir resuming
+    deep in a damaged directory no longer spins. Freeing a block on a
+    grown volume, the scrub's reference walk and fsck's reachability
+    check no longer scale with the square of what they walk.
+
+  * Fixed, multipath: the path used for compare-and-write is found
+    from the system's /sys, not the mounting process's, so a mount from
+    a container or a chroot no longer probes as having no
+    compare-and-write; and finding it cannot recurse into memory
+    reclaim.
+
+  * Fixed, data after a node dies: a node dying while extending a large
+    file could leave extents its index did not advertise. Those blocks
+    read as holes, were written again under a second extent, and the
+    first could resurface later. Present since 0.9.1; fsck now reports
+    such a file. The extent-tree leaf that takes new extents no longer
+    carries a range that has to keep up with them.
+
+  * Fixed: an earlier, unreported write error on one block of a file no
+    longer makes fsync or close discard buffered writes into
+    preallocated space that did reach the device.
+
+  * fsck refuses the superblock fields, counts and lengths the mount
+    refuses, reports a directory with more than one name or one it
+    cannot walk (and repairs nothing around it), and treats a deleted
+    record's stale extents as leftovers, not corruption.
+
+  * Fixed, durability: sync(2), syncfs(2) and unmount now flush the
+    device's write cache, and every publish is ordered against the data
+    it names, and against the free that follows it, by a cache flush
+    rather than by completion. A buffered write's extent could reach
+    the device before its data, and a crash in between left the file
+    reading what the block held before -- another file's deleted data.
+    Buffered writes now leave their blocks unwritten until fsync, close
+    or sync has the data on the device.
+
+  * Fixed, devices: a partition is never driven with compare-and-write
+    (the command addresses the whole disk), and sense data after a
+    write that may have landed is treated as an unknown outcome, not a
+    failure.
+
+  * Fixed, offline tools: fsck -r and growfs watch a live-looking node
+    for the longest stale window a node may be configured with, and
+    keep watching the registry while they run; on a device with
+    compare-and-write they claim the registry with it, as the kernel
+    does, so two repairs started together can no longer both proceed;
+    a repair that lost its claim stops writing; a killed repair's claim
+    (SIGPIPE and SIGABRT included) is released or reaped and the row it
+    borrowed given back; and fsck -r retires departed registry rows
+    nothing references -- including a row a journal replay still
+    names -- when the registry is full. growfs no longer restamps a
+    damaged record.
+
+  * Fixed, after a node comes back: a reclaim that raced a node's
+    return gives back only what it actually took, so a returning node
+    is no longer handed a lock or a read-presence mark no open of its
+    holds (which refused every write-open of the file, cluster-wide).
+    A node that crashed and comes back waits the full stale window for
+    a twin with its identity before it re-attaches. A journal replay
+    whose consume fails leaves the area dirty, and a replay skips a
+    block that has been freed since its entry was written.
+
+  * Fixed, mount: a second mount of a mounted volume that asks for
+    different nofilelock, errors= or corruption= settings is refused
+    instead of silently getting the first mount's; a remount asking to
+    change them says it did not. A read-only mount recovers this node's
+    own journal and claims, as ext4 does, and gives back the Zone Groups
+    its previous run owned. A mount refuses a kernel whose page is not
+    one block.
+
+  * Fixed: SEEK_DATA/SEEK_HOLE report preallocated space as a hole, as
+    ext4 and XFS do; a hole punch moves mtime; an xattr change moves
+    ctime; a symlink's xattrs can be listed; splice is supported; rmdir
+    reads the directory before removing its name; a failed chmod or
+    chown on an open file no longer leaves the new mode in memory.
+
+  * Changed: setting a module parameter marked TEST ONLY is logged and
+    taints the kernel. File names and node labels read off the disk are
+    escaped in kernel messages and /proc.
+
+  * Performance: an O_DIRECT write into a hole or preallocated space
+    no longer falls back to a buffered write plus a synchronous flush,
+    which ran any queue depth at one. The blocks stay unwritten until
+    the write completes, so nothing reads them early. This is what qemu
+    with cache=none does to a thin VM image: random 4 KiB writes into a
+    sparse file are 35-40% faster on an FC array. Direct writes smaller
+    than a block wait for each other, as on ext4. The module parameter
+    dio_fill_holes=0 restores the old path.
+
+  * Documented: a mount can legitimately wait minutes after a crash;
+    systemd's default 90 s mount timeout is shorter, and cetrafs mounts
+    want x-systemd.mount-timeout.
+
+  * The test gate is 387 suites and 3282 assertions; the two-node suite
+    gained a direct-write scenario, including a node cut off with
+    direct writes in flight.
+
+ -- Massimo Cetra <mcetra@gmail.com>  Thu, 05 Nov 2026 19:06:10 +0000
+
 cetrafs (0.9.3) unstable; urgency=medium
 
   * No format version change: volumes made or grown by 0.9.2 mount as
