@@ -462,6 +462,19 @@ static void cetrafs_evict_inode(struct inode *inode)
 
             ctrace("EVICTFREE ino=%llu fret=%d gen=%llu\n", (unsigned long long) inode->i_ino, fret,
                    (unsigned long long) cetrafs_inode_get_generation(inode));
+            /* The unlink that made this file dead -- dirent gone, nlink
+             * 0 -- and the arbitration just won are publishes; the frees
+             * below must not reach the device ahead of them (rule 21),
+             * and on a volatile cache only a flush orders that. If the
+             * device refuses one, leak: a block left allocated is the
+             * scrub's, a block freed under a record that may come back
+             * is two files' (cetrafs_publish_flush()). */
+            if (fret == 0 && cetrafs_publish_flush(sb) != 0) {
+                pr_err("evict_inode: ino=%llu: the device refused a cache flush -- leaving its blocks allocated "
+                       "for the scrub\n",
+                       (unsigned long long) inode->i_ino);
+                fret = 1;
+            }
             if (fret == 0) {
                 cetrafs_free_fetched_extents(inode, &raw, &ex);
                 if (raw.xattr_block)

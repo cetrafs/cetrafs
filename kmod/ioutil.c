@@ -24,6 +24,7 @@
  */
 #define pr_fmt(fmt) "cetrafs: " fmt
 
+#include <linux/blkdev.h>
 #include <linux/buffer_head.h>
 #include <linux/version.h>
 #include <linux/delay.h>
@@ -740,4 +741,32 @@ struct buffer_head *cetrafs_blk_tail_bread(struct super_block *sb, u64 lba, u32 
      * just refused would be served, unchecked, by the next one. */
     cetrafs_invalidate_block(sb, lba);
     return NULL;
+}
+
+/*
+ * TEST ONLY: the publish-point cache flushes below become no-ops (the
+ * pre-fix behaviour). tests/kernel/publish_flushes_cache.sh.
+ */
+static bool cetrafs_publish_flush_skip;
+module_param_named(publish_flush_skip, cetrafs_publish_flush_skip, bool, 0644);
+MODULE_PARM_DESC(publish_flush_skip, "TEST ONLY: skip the device cache flush at publish points");
+
+/*
+ * Make every write that has COMPLETED so far durable: a cache flush.
+ *
+ * Completed is not durable. On a volatile write cache -- and a
+ * deployment LUN may well be write-back -- two writes that completed in
+ * order can survive a power cut in either order, or one without the
+ * other. Every publish is an ordering claim of that kind: the record
+ * names blocks whose data, leaves and bitmap bits were written first
+ * (rule 8), and a free that follows a publish relies on the publish
+ * having reached the device (rule 21). Both halves need a flush between
+ * them, not a completion. On a device without a volatile cache the block
+ * layer completes the flush at once.
+ */
+int cetrafs_publish_flush(struct super_block *sb)
+{
+    if (READ_ONCE(cetrafs_publish_flush_skip) || !sb->s_bdev)
+        return 0;
+    return blkdev_issue_flush(sb->s_bdev);
 }

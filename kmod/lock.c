@@ -2130,7 +2130,18 @@ static int cetrafs_lock_publish_and_clear(struct inode *inode, cetrafs_inode_t *
     /* Not over a tree whose leaves did not reach the device: the
      * record CAS is durable at once, and a peer opening after the
      * lock clear would map the file through the on-disk leaves --
-     * without this writer's extents (rule 8). */
+     * without this writer's extents (rule 8). "Reached" meaning
+     * durable: the data the caller wrote back, the leaves and the
+     * bitmap bits above all completed, and on a volatile cache only a
+     * flush makes them survive a power cut ahead of the record that
+     * names them. Once per close. */
+    if (!tree_ret && !bmap_ret) {
+        tree_ret = cetrafs_publish_flush(sb);
+        if (tree_ret)
+            pr_err("lock release: ino=%llu the device refused a cache flush (%d) -- leaving the record "
+                   "unpublished and keeping the lock\n",
+                   (unsigned long long) inode->i_ino, tree_ret);
+    }
     pub_ret = tree_ret ? tree_ret : cetrafs_write_vfs_inode(inode);
     if (pub_ret && !tree_ret)
         pr_err("lock release: ino=%llu failed to persist inode state: %d -- keeping the lock\n",

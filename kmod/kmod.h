@@ -478,6 +478,7 @@ extern bool cetrafs_cas_selftest_enabled;
 
 // ioutil.c
 struct buffer_head *cetrafs_bread_uncached(struct super_block *sb, sector_t block);
+int cetrafs_publish_flush(struct super_block *sb);
 void cetrafs_invalidate_block(struct super_block *sb, sector_t block);
 void cetrafs_forget_block(struct super_block *sb, sector_t block);
 unsigned long cetrafs_drop_dirty_metadata(struct super_block *sb);

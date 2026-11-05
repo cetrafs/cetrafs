@@ -814,11 +814,30 @@ static int __cetrafs_write_raw_inode_fd(struct super_block *sb, u64 ino, const c
     {
         int ret = cetrafs_alloc_flush_bitmaps(sb);
 
+        /* ...and durably: the bitmap bits, the new tree's leaves, the
+         * data a rebuild copied -- completed, every one, but completed
+         * is not durable (cetrafs_publish_flush()). */
+        if (!ret)
+            ret = cetrafs_publish_flush(sb);
         if (ret)
             return ret;
         ret = cetrafs_cas_record_fd_seeded(sb, lba, NULL, 0, cetrafs_fd_write_mutate, &ctx);
 
         if (ret == 0) {
+            int fret;
+
+            /* Every caller frees something once this returns -- the old
+             * tree's meta, the blocks a truncate or punch dropped, a
+             * defrag's source run (rule 21). That free must not reach
+             * the device before this publish does, and on a volatile
+             * cache only a flush orders them. A flush the device refuses
+             * here leaves the publish landed and its durability unknown:
+             * the free that would follow is what must not happen, so the
+             * mount stops (docs/internal/ERRORS.md) and refuses it. */
+            fret = cetrafs_publish_flush(sb);
+            if (fret)
+                cetrafs_sb_fatal(sb, "inode %llu: the device refused a cache flush after a publish (%d)",
+                                 (unsigned long long) ino, fret);
             cetrafs_record_write_counted();
             /* Our own stamp: adopt it, or the freshness gate would read
              * the change we just made as a peer's and throw away a cache
@@ -1562,6 +1581,10 @@ int cetrafs_write_vfs_inode(struct inode *inode)
      * so refusing leaves it pending for the next boundary. */
     if (ctx->have_shadow) {
         ret = cetrafs_alloc_flush_bitmaps(sb);
+        /* Durably, before the extents that name them are published --
+         * writeback reaches here with no close or fsync around it. */
+        if (!ret)
+            ret = cetrafs_publish_flush(sb);
         if (ret)
             goto out_pub;
     }
