@@ -341,6 +341,10 @@ struct cetrafs_sb_info {
      * lock, so relocating a file nobody is locked out of could corrupt a
      * peer's concurrent write. */
     bool file_lock_enabled;
+    /* What THIS mount asked for (before the cluster's mode was adopted):
+     * a second mount of the device is compared against it, not against
+     * the adopted value (cetrafs_get_tree()). */
+    bool file_lock_requested;
 
     /* Cluster timing, per MOUNT, written through procfs like the defrag
      * switches above. The module params are the defaults.
@@ -693,7 +697,16 @@ struct cetrafs_fc_info {
     bool file_lock;
     bool errors_panic;    /* errors=panic */
     bool corruption_stop; /* corruption=stop */
+    /* Which of the above were STATED, rather than defaulted: only a
+     * stated option can be "asked for and not in force". */
+    bool file_lock_set, errors_set, corruption_set;
+    bool filled; /* fill_super ran: a new mount, not a second one of a mounted device */
 };
+
+/* TEST ONLY: fail the per-peer liveness allocation (audit L30). */
+static bool cetrafs_fill_fail_peers_alloc;
+cetrafs_test_param(fill_fail_peers_alloc, cetrafs_fill_fail_peers_alloc, bool, 0644);
+MODULE_PARM_DESC(fill_fail_peers_alloc, "TEST ONLY: the mount's per-peer liveness allocation fails");
 
 /*
  * TEST ONLY: fail fill_super() at a chosen stage, so each unwind path
@@ -1000,6 +1013,8 @@ int cetrafs_fill_super(struct super_block *sb, struct fs_context *fc)
     u64 features_incompat;
 
     pr_debug("fill_super()\n");
+    if (fc && fc->fs_private)
+        ((struct cetrafs_fc_info *) fc->fs_private)->filled = true;
 
     /*
      * One page, one block. The code converts between block and page
@@ -1267,14 +1282,17 @@ int cetrafs_fill_super(struct super_block *sb, struct fs_context *fc)
              * announcement is emitted there, once the effective mode is
              * known. */
             sbi->file_lock_enabled = fci ? fci->file_lock : true;
+            sbi->file_lock_requested = sbi->file_lock_enabled;
         }
         sbi->hb_interval_secs = cetrafs_hb_interval_secs;
         sbi->stale_secs = cetrafs_stale_secs;
 
         /* Per-peer liveness watch (see the struct's own comment). One
-         * entry per Node Registry row; a failure here is not fatal --
-         * cetrafs_node_is_stale() falls back to "cannot judge, assume
-         * alive", which errs toward never reclaiming from a live node. */
+         * entry per Node Registry row. Its allocation failing used to be
+         * accepted: cetrafs_node_is_stale() then answers "cannot judge,
+         * assume alive" for every peer, for the life of the mount -- no
+         * dead peer's Zone Groups, locks or journal ever reclaimed, and
+         * nothing said why (audit L30). Refused with the rest below. */
         spin_lock_init(&sbi->resv_list_lock);
         spin_lock_init(&sbi->nsrel_lock);
         spin_lock_init(&sbi->flrel_lock);
@@ -1287,8 +1305,6 @@ int cetrafs_fill_super(struct super_block *sb, struct fs_context *fc)
         sbi->peer_count = le32_to_cpu(ondisk->node_table_count);
         if (sbi->peer_count)
             sbi->peers = kcalloc(sbi->peer_count, sizeof(*sbi->peers), GFP_KERNEL);
-        if (!sbi->peers)
-            sbi->peer_count = 0;
         mutex_init(&sbi->alloc_mutex);
         sbi->stamp_base = (s64) ktime_get_real_ns() - (s64) ktime_get_ns();
         atomic64_set(&sbi->stamp_last, 0);
@@ -1298,7 +1314,8 @@ int cetrafs_fill_super(struct super_block *sb, struct fs_context *fc)
         sbi->zg_pf_full_until = kcalloc(zg_cnt, sizeof(*sbi->zg_pf_full_until), GFP_KERNEL);
         sbi->zg_pf_drop_runs = kcalloc(zg_cnt, sizeof(*sbi->zg_pf_drop_runs), GFP_KERNEL);
         sbi->zg_pf_drop_blocks = kcalloc(zg_cnt, sizeof(*sbi->zg_pf_drop_blocks), GFP_KERNEL);
-        if (!sbi->zg_pf_full_until || !sbi->zg_pf_drop_runs || !sbi->zg_pf_drop_blocks) {
+        if (!sbi->zg_pf_full_until || !sbi->zg_pf_drop_runs || !sbi->zg_pf_drop_blocks ||
+            (sbi->peer_count && !sbi->peers) || cetrafs_fill_fail_peers_alloc) {
             kfree(sbi->zg_pf_drop_blocks);
             kfree(sbi->zg_pf_drop_runs);
             kfree(sbi->zg_pf_full_until);
@@ -1347,7 +1364,7 @@ int cetrafs_fill_super(struct super_block *sb, struct fs_context *fc)
             return -ENOMEM;
         }
 
-        sbi->raw_sb = kmemdup(ondisk, sizeof(*ondisk), GFP_KERNEL); /* optional debug */
+        sbi->raw_sb = kmemdup(ondisk, sizeof(*ondisk), GFP_KERNEL); /* every path reads it (cetrafs_sb_raw()) */
         if (!sbi->raw_sb) {
             kfree(sbi->bg_desc_lba);
             bitmap_free(sbi->owned_bgs);
@@ -4591,12 +4608,15 @@ static int cetrafs_parse_param(struct fs_context *fc, struct fs_parameter *param
     switch (opt) {
     case Opt_nofilelock:
         fci->file_lock = false;
+        fci->file_lock_set = true;
         break;
     case Opt_errors:
         fci->errors_panic = result.uint_32 == 1;
+        fci->errors_set = true;
         break;
     case Opt_corruption:
         fci->corruption_stop = result.uint_32 == 1;
+        fci->corruption_set = true;
         break;
     }
     return 0;
@@ -4609,10 +4629,55 @@ static void cetrafs_free_fc(struct fs_context *fc)
 
 /* ------ exported mount/umount entry points (used by kmod.c) ------ */
 
+/*
+ * Does a mount request STATE an option the superblock does not have?
+ * Fills `what` with the first one. A defaulted option asks for nothing.
+ */
+static bool cetrafs_opts_unmet(const struct cetrafs_fc_info *fci, const struct cetrafs_sb_info *sbi, const char **what)
+{
+    if (fci->file_lock_set && fci->file_lock != sbi->file_lock_requested)
+        *what = "nofilelock";
+    else if (fci->errors_set && fci->errors_panic != sbi->errors_panic)
+        *what = fci->errors_panic ? "errors=panic" : "errors=stop";
+    else if (fci->corruption_set && fci->corruption_stop != sbi->corruption_stop)
+        *what = fci->corruption_stop ? "corruption=stop" : "corruption=isolate";
+    else
+        return false;
+    return true;
+}
+
+/*
+ * A second mount of a device that is already mounted gets the existing
+ * superblock, and its options were dropped without a word: `nofilelock`,
+ * `errors=` and `corruption=` all accepted and none in force (audit
+ * L29). The VFS refuses a second mount that disagrees about read-only;
+ * these change the mount's safety as much, so one that STATES a value
+ * the mount does not have is refused the same way. Compared against
+ * what the first mount ASKED for, since its effective file-lock mode may
+ * be the cluster's.
+ */
+static int cetrafs_check_second_mount(struct fs_context *fc)
+{
+    const struct cetrafs_fc_info *fci = fc->fs_private;
+    struct super_block *sb = fc->root->d_sb;
+    const struct cetrafs_sb_info *sbi = sb->s_fs_info;
+    const char *what;
+
+    if (!fci || fci->filled || !sbi || !cetrafs_opts_unmet(fci, sbi, &what))
+        return 0;
+    pr_err("%s is already mounted without %s -- refusing a second mount that asks for it\n", sb->s_id, what);
+    dput(fc->root);
+    fc->root = NULL;
+    deactivate_locked_super(sb);
+    return -EBUSY;
+}
+
 static int cetrafs_get_tree(struct fs_context *fc)
 {
     int ret = get_tree_bdev(fc, cetrafs_fill_super);
 
+    if (!ret)
+        ret = cetrafs_check_second_mount(fc);
     if (ret)
         pr_err("'%s' mount failure: %d\n", fc->source ?: "<?>", ret);
     else
@@ -4651,6 +4716,16 @@ static int cetrafs_get_tree(struct fs_context *fc)
 static int cetrafs_reconfigure(struct fs_context *fc)
 {
     struct super_block *sb = fc->root->d_sb;
+    const struct cetrafs_fc_info *fci = fc->fs_private;
+    const char *what;
+
+    /* Mount-time only, so a remount cannot apply them -- but it must not
+     * accept one in silence either (audit L29). Warned, not refused: a
+     * remount that restates the options it was given carries no change,
+     * and tooling replays a mount's options on every remount. */
+    if (fci && sb->s_fs_info && cetrafs_opts_unmet(fci, sb->s_fs_info, &what))
+        pr_warn("%s: remount asked for %s, which is fixed at mount time -- NOT applied; unmount and mount again\n",
+                sb->s_id, what);
 
     if (!!(fc->sb_flags & SB_RDONLY) != !!sb_rdonly(sb)) {
         pr_err(
