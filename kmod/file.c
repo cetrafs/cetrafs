@@ -3019,6 +3019,28 @@ u64 cetrafs_flat_data_blocks(const cetrafs_extent_t *flat, u32 n)
  * old). *out_meta is the number of leaf+interior blocks allocated, for
  * the caller's raw->blocks recompute. n==0 and n<=4 need no meta.
  */
+/*
+ * The most extents the depth-2 tree can hold: the inode's root slots,
+ * each an interior block of leaf pointers, each leaf full. One number for
+ * the builder that refuses past it and the planner that must stop before
+ * it (cetrafs_do_allocate()). TEST ONLY tree_extent_cap lowers it, so a
+ * suite can reach it on a loop device a fraction of the size.
+ */
+static unsigned int cetrafs_tree_extent_cap;
+cetrafs_test_param(tree_extent_cap, cetrafs_tree_extent_cap, uint, 0644);
+MODULE_PARM_DESC(tree_extent_cap, "TEST ONLY: treat the extent tree as full at this many extents");
+
+static u32 cetrafs_tree_max_extents(void)
+{
+    u64 cap = (u64) ARRAY_SIZE(((cetrafs_inode_t *) NULL)->et.idx) * CETRAFS_EXT_BLOCK_MAX_IDX *
+              CETRAFS_EXT_BLOCK_MAX_LEAVES;
+    unsigned int knob = READ_ONCE(cetrafs_tree_extent_cap);
+
+    if (knob && knob < cap)
+        cap = knob;
+    return (u32) min_t(u64, cap, U32_MAX);
+}
+
 int cetrafs_tree_build(struct inode *inode, const cetrafs_extent_t *flat, u32 n, cetrafs_inode_t *raw, u64 *out_meta)
 {
     /* The whole map is being rewritten. This is also the choke point
@@ -3034,6 +3056,8 @@ int cetrafs_tree_build(struct inode *inode, const cetrafs_extent_t *flat, u32 n,
     int ret;
 
     *out_meta = 0;
+    if (n > cetrafs_tree_max_extents())
+        return -ENOSPC;
 
     if (n <= ARRAY_SIZE(raw->et.leaf)) {
         memset(&raw->et, 0, sizeof(raw->et));
@@ -5178,6 +5202,7 @@ static int cetrafs_do_allocate(struct inode *inode, loff_t offset, loff_t len, b
     loff_t end = offset + len;
     cetrafs_extent_t *add = NULL, *flat = NULL;
     u32 add_n = 0, add_cap = 0, flat_n = 0;
+    u32 tree_have, tree_cap;
     bool built = false;
     int ret, loop_ret = 0;
 
@@ -5230,6 +5255,18 @@ static int cetrafs_do_allocate(struct inode *inode, loff_t offset, loff_t len, b
     }
     plan_seq = cetrafs_le64(raw.file_seq);
     old_raw = raw; /* its eh/et name the OLD tree, freed after the publish */
+    /*
+     * The tree holds a bounded number of extents, and on a fragmented
+     * volume every block of a preallocation can be one. The plan used to
+     * run to the end of the range regardless -- allocating, and growing
+     * 'add' -- and only cetrafs_tree_build() refused, after all of it,
+     * throwing the whole preallocation away (audit 2026-11-05, class
+     * 13/12). Stop planning where the tree is full instead: what fits is
+     * published and the call reports -ENOSPC, as a stop part-way does.
+     * tests/kernel/fallocate_tree_full.sh.
+     */
+    tree_have = cetrafs_tree_extent_count(inode, &raw);
+    tree_cap = cetrafs_tree_max_extents();
 
     for (b = start_block; b < end_block; b++) {
         bool found = false, un = false;
@@ -5284,6 +5321,11 @@ static int cetrafs_do_allocate(struct inode *inode, loff_t offset, loff_t len, b
             cetrafs_extent_len(add[add_n - 1].ee_len) < CETRAFS_EXT_LEN_MASK) {
             add[add_n - 1].ee_len = cetrafs_extent_pack_len(cetrafs_extent_len(add[add_n - 1].ee_len) + 1, 1);
         } else {
+            if ((u64) tree_have + add_n + 1 > tree_cap) {
+                cetrafs_free_data_block(sb, lba);
+                loop_ret = -ENOSPC; /* the tree is full: publish what fits */
+                break;
+            }
             if (add_n == add_cap) {
                 u32 ncap = add_cap ? add_cap * 2 : 16;
                 cetrafs_extent_t *na = kvmalloc_array(ncap, sizeof(*na), GFP_NOFS);
