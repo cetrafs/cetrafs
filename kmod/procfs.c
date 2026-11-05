@@ -414,8 +414,9 @@ static int cetrafs_proc_cluster_show(struct seq_file *m, void *v)
              * because it is why mounts are being refused, and an
              * operator reading this file is usually asking exactly
              * that. */
-            seq_printf(m, "row=%u REPAIR-IN-PROGRESS last_seen=%llu label=%.*s\n", idx,
-                       (unsigned long long) cetrafs_le64(ne.last_seen), (int) sizeof(ne.label), ne.label);
+            seq_printf(m, "row=%u REPAIR-IN-PROGRESS last_seen=%llu label=%*pE\n", idx,
+                       (unsigned long long) cetrafs_le64(ne.last_seen), (int) strnlen(ne.label, sizeof(ne.label)),
+                       ne.label);
             continue;
         }
 
@@ -426,10 +427,10 @@ static int cetrafs_proc_cluster_show(struct seq_file *m, void *v)
         u = ne.node_uuid;
         seq_printf(m,
                    "node %u: state=%s uuid=%02x%02x%02x%02x-%02x%02x-%02x%02x-%02x%02x-%02x%02x%02x%02x%02x%02x "
-                   "hb_seq=%llu last_seen=%llu label=%.*s caps=0x%x stale=%s%s\n",
+                   "hb_seq=%llu last_seen=%llu label=%*pE caps=0x%x stale=%s%s\n",
                    idx, cetrafs_le32(ne.state) == CETRAFS_NODE_STATE_REGISTERED ? "REGISTERED" : "UNKNOWN", u[0], u[1], u[2], u[3],
                    u[4], u[5], u[6], u[7], u[8], u[9], u[10], u[11], u[12], u[13], u[14], u[15],
-                   (unsigned long long) cetrafs_le64(ne.hb_seq), (unsigned long long) cetrafs_le64(ne.last_seen), (int) sizeof(ne.label), ne.label,
+                   (unsigned long long) cetrafs_le64(ne.hb_seq), (unsigned long long) cetrafs_le64(ne.last_seen), (int) strnlen(ne.label, sizeof(ne.label)), ne.label,
                    cetrafs_le32(ne.caps), stale ? "yes" : "no",
                    idx == my_node_id ? " (this node)" : "");
     }

@@ -1286,8 +1286,8 @@ static void cetrafs_node_reap_repair_claim(struct super_block *sb, u32 idx, u64 
         pr_warn("node registry: the dead repair claim on row %u could not be reaped (%d)\n", idx, ret);
     else if (ctx.restore)
         pr_warn("node registry: reaped the dead repair claim on row %u and gave the row back to the node it "
-                "borrowed it from (%.*s)\n",
-                idx, (int) sizeof(saved.label), saved.label);
+                "borrowed it from (%*pE)\n",
+                idx, (int) strnlen(saved.label, sizeof(saved.label)), saved.label);
     else
         pr_warn("node registry: reaped the dead repair claim on row %u -- the row is free again\n", idx);
 }

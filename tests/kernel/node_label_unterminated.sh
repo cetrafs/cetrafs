@@ -41,6 +41,19 @@ grep -q '^Q\{32\}' <<<"$lab" && pass "setup: the unterminated label reached the 
 [ "${#lab}" = 32 ] && pass "the label printed is exactly its 32-byte field" ||
     fail "the label printed ran to ${#lab} bytes out of a 32-byte field: $(printf '%q' "$lab")"
 
+# A label of control bytes reaches a terminal or a log reader escaped,
+# never raw (audit L32): every peer and offline tool writes this field.
+"$NPOKE" "$DEV" 1 --label "$(printf '\033')" >/dev/null
+line="$(grep -aE '^node 1:' "$CL" || true)"
+if printf '%s' "$line" | grep -q "$(printf '\033')"; then
+    fail "a control byte in a peer's label reached the cluster file raw"
+elif grep -qF 'label=\e\e' <<<"$line"; then
+    pass "a control byte in a peer's label is printed escaped"
+else
+    fail "the escaped label is not in the cluster file: $(printf '%q' "$line")"
+fi
+"$NPOKE" "$DEV" 1 --label Q >/dev/null
+
 # The offline repairer's form of the same row.
 "$NPOKE" "$DEV" 1 2 cd "$(date +%s)" >/dev/null
 "$NPOKE" "$DEV" 1 --label Q >/dev/null

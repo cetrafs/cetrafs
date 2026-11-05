@@ -1484,9 +1484,9 @@ int cetrafs_fill_super(struct super_block *sb, struct fs_context *fc)
                     return rc;
                 }
                 if (repairing) {
-                    pr_err("%s is being repaired right now (%s) -- refusing to mount; wait for it to finish, "
+                    pr_err("%s is being repaired right now (%*pE) -- refusing to mount; wait for it to finish, "
                            "or for its lease to expire if it died\n",
-                           sb->s_id, who[0] ? who : "an offline tool");
+                           sb->s_id, who[0] ? (int) strlen(who) : 17, who[0] ? who : "an offline tool");
                     cetrafs_free_sb_info(sb);
                     brelse(bh);
                     return -EBUSY;
@@ -1951,9 +1951,9 @@ int cetrafs_fill_super(struct super_block *sb, struct fs_context *fc)
 
                 if (crc || repairing) {
                     if (repairing)
-                        pr_err("%s: a repair (%s) started while this mount was in flight -- refusing to mount; "
-                               "wait for it to finish\n",
-                               sb->s_id, who[0] ? who : "an offline tool");
+                        pr_err("%s: a repair (%*pE) started while this mount was in flight -- refusing to "
+                               "mount; wait for it to finish\n",
+                               sb->s_id, who[0] ? (int) strlen(who) : 17, who[0] ? who : "an offline tool");
                     else
                         pr_err("mount: post-registration repair-claim re-check failed: %d\n", crc);
                     cetrafs_free_sb_info(sb);

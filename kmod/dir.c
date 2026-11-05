@@ -855,7 +855,7 @@ int cetrafs_dir_add_entry(struct inode *dir, const struct qstr *name, u64 ino, u
      * companion for the other direction -- the number recycled into a
      * DIFFERENT object since we resolved it. */
     if (cetrafs_le32(raw.nlink) == 0 || cetrafs_le64(raw.generation) != cetrafs_inode_get_generation(dir)) {
-        pr_warn_ratelimited("refusing to add '%.*s' to dir ino=%llu: it is gone (nlink=%u, generation disk=%llu core=%llu) -- a peer removed or replaced it\n",
+        pr_warn_ratelimited("refusing to add '%*pE' to dir ino=%llu: it is gone (nlink=%u, generation disk=%llu core=%llu) -- a peer removed or replaced it\n",
                             (int) name->len, name->name, (unsigned long long) dir->i_ino,
                             (unsigned int) cetrafs_le32(raw.nlink),
                             (unsigned long long) cetrafs_le64(raw.generation),
@@ -1830,7 +1830,7 @@ static void cetrafs_ns_report(const char *op, struct inode *dir, const struct qs
 {
     if (!ret || ret == -ENOENT || ret == -EEXIST || ret == -ENOTEMPTY || ret == -ENOTDIR || ret == -EISDIR)
         return; /* ordinary, expected answers -- not failures */
-    pr_warn_ratelimited("%s '%.*s' in dir ino=%llu failed: %d\n", op, name ? (int) name->len : 0,
+    pr_warn_ratelimited("%s '%*pE' in dir ino=%llu failed: %d\n", op, name ? (int) name->len : 0,
                         name ? (const char *) name->name : "", (unsigned long long) dir->i_ino, ret);
 }
 
@@ -2109,7 +2109,7 @@ static int cetrafs_verify_name_resolves(struct inode *dir, const struct qstr *na
             return ret;
         if (cetrafs_le64(raw.generation) != cetrafs_inode_get_generation(inode)) {
             pr_warn_ratelimited(
-                "'%.*s' in dir ino=%llu still names ino=%llu, but that is a DIFFERENT file now "
+                "'%*pE' in dir ino=%llu still names ino=%llu, but that is a DIFFERENT file now "
                 "(generation %llu on disk, %llu in core) -- refusing to act on a reused inode number\n",
                 (int) name->len, name->name, (unsigned long long) dir->i_ino, (unsigned long long) ctx.ino,
                 (unsigned long long) cetrafs_le64(raw.generation),
@@ -2685,7 +2685,7 @@ static int cetrafs_rename_locked(struct mnt_idmap *idmap,
             }
             if (cetrafs_le64(tr->generation) != cetrafs_inode_get_generation(new_inode)) {
                 pr_warn_ratelimited(
-                    "rename: '%.*s' in dir ino=%llu still names ino=%llu, but that is a DIFFERENT file now "
+                    "rename: '%*pE' in dir ino=%llu still names ino=%llu, but that is a DIFFERENT file now "
                     "(generation %llu on disk, %llu in core) -- retrying rather than renaming over it\n",
                     (int) new_dentry->d_name.len, new_dentry->d_name.name, (unsigned long long) new_dir->i_ino,
                     (unsigned long long) ctx.ino, (unsigned long long) cetrafs_le64(tr->generation),
@@ -2990,7 +2990,7 @@ out_unremove:
         int rret = cetrafs_dir_add_entry(old_dir, &old_dentry->d_name, old_ino, old_file_type);
 
         if (rret) {
-            pr_err("rename: directory ino=%llu lost its name '%.*s' in ino=%llu and could neither take the new one "
+            pr_err("rename: directory ino=%llu lost its name '%*pE' in ino=%llu and could neither take the new one "
                    "(%d) nor get the old one back (%d) -- it is unnamed until fsck links it into /lost+found\n",
                    (unsigned long long) old_ino, (int) old_dentry->d_name.len, old_dentry->d_name.name,
                    (unsigned long long) old_dir->i_ino, ret, rret);
@@ -3198,7 +3198,7 @@ static int cetrafs_rename(struct mnt_idmap *idmap,
             return ret;
     }
 
-    pr_warn_ratelimited("rename: '%.*s' in dir ino=%llu changed under us %u times running -- giving up\n",
+    pr_warn_ratelimited("rename: '%*pE' in dir ino=%llu changed under us %u times running -- giving up\n",
                         (int) new_dentry->d_name.len, new_dentry->d_name.name, (unsigned long long) new_dir->i_ino,
                         CETRAFS_RENAME_MAX_ATTEMPTS);
     return ret;
@@ -3277,14 +3277,14 @@ static int cetrafs_link_locked(struct dentry *old_dentry, struct inode *dir, str
     if (ret)
         return ret;
     if (cetrafs_le64(raw.generation) != cetrafs_inode_get_generation(inode)) {
-        pr_warn_ratelimited("refusing to link '%.*s' -> ino=%llu: that number is a DIFFERENT file now (generation disk=%llu core=%llu)\n",
+        pr_warn_ratelimited("refusing to link '%*pE' -> ino=%llu: that number is a DIFFERENT file now (generation disk=%llu core=%llu)\n",
                             (int) dentry->d_name.len, dentry->d_name.name, (unsigned long long) inode->i_ino,
                             (unsigned long long) cetrafs_le64(raw.generation),
                             (unsigned long long) cetrafs_inode_get_generation(inode));
         return -ESTALE;
     }
     if (cetrafs_le32(raw.nlink) == 0) {
-        pr_warn_ratelimited("refusing to link '%.*s' -> ino=%llu: it has no names left (nlink=0)\n",
+        pr_warn_ratelimited("refusing to link '%*pE' -> ino=%llu: it has no names left (nlink=0)\n",
                             (int) dentry->d_name.len, dentry->d_name.name, (unsigned long long) inode->i_ino);
         return -ENOENT;
     }
