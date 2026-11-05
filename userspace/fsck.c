@@ -47,16 +47,24 @@ static void diex(const char *m)
     perror(m);
     exit(FSCK_EXIT_NOEXAM);
 }
+/* Short reads are continued and EINTR retried, as growfs does; a read
+ * that makes no progress is an EOF, not something to spin on. */
 static void pread_all(int fd, void *buf, size_t len, off_t off)
 {
     uint8_t *p = buf;
     while (len) {
         ssize_t r = pread(fd, p, len, off);
-        if (r <= 0)
+        if (r < 0 && errno == EINTR)
+            continue;
+        if (r < 0)
             diex("pread");
+        if (r == 0) {
+            fprintf(stderr, "pread: unexpected end of device at offset %lld\n", (long long) off);
+            exit(FSCK_EXIT_NOEXAM);
+        }
         p += r;
         off += r;
-        len -= r;
+        len -= (size_t) r;
     }
 }
 static void *xcalloc(size_t n, size_t s)
@@ -232,10 +240,27 @@ static void pwrite_all(int fd, const void *buf, size_t len, off_t off)
 {
     static long stop_after = -1;
 
+    const uint8_t *p = buf;
+    size_t left = len;
+    off_t at = off;
+
     fsck_repair_lost_check();
-    if (pwrite(fd, buf, len, off) != (ssize_t) len) {
-        perror("pwrite (repair)");
-        exit(FSCK_EXIT_NOEXAM);
+    /* A short write is continued and EINTR retried (tests/image/
+     * fsck_io_partial.sh): one pwrite that wrote part of a block used to
+     * end the repair with that block half-written. No progress at all
+     * is an error, not something to spin on. */
+    while (left) {
+        ssize_t w = pwrite(fd, p, left, at);
+
+        if (w < 0 && errno == EINTR)
+            continue;
+        if (w <= 0) {
+            perror("pwrite (repair)");
+            exit(FSCK_EXIT_NOEXAM);
+        }
+        p += w;
+        at += w;
+        left -= (size_t) w;
     }
     if (fdatasync(fd) != 0) {
         perror("fdatasync (repair)");

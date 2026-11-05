@@ -93,6 +93,8 @@ static void pwrite_all(int fd, const void *buf, size_t len, off_t off)
     const char *p = (const char *) buf;
     while (len) {
         ssize_t w = pwrite(fd, p, len, off);
+        if (w < 0 && errno == EINTR)
+            continue;
         if (w < 0)
             die("pwrite failed: %s", strerror(errno));
         /* pwrite(2) returning 0 for a nonzero count means it is making
