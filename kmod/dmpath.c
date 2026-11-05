@@ -147,18 +147,33 @@ static int cetrafs_dm_collect(const char *disk_name, dev_t *out, unsigned int ma
  * multipath map) and is worth descending into. */
 static bool cetrafs_dm_has_slaves(const char *disk_name)
 {
-    struct cetrafs_slave_dir d = {.ctx.actor = cetrafs_slave_actor};
+    /* On the heap like cetrafs_dm_collect()'s, and for the same reason:
+     * the struct is half a kilobyte, and this is called from inside that
+     * recursion, one level per stacked device (audit 2026-11-05,
+     * section 3). Without memory, descend anyway: walking a device with
+     * no slaves finds nothing, while "no" could lose the path to CAW. */
+    struct cetrafs_slave_dir *d = kzalloc(sizeof(*d), GFP_KERNEL);
     char path[96];
     struct file *f;
+    bool any;
 
-    if (snprintf(path, sizeof(path), "/sys/block/%s/slaves", disk_name) >= (int) sizeof(path))
+    if (!d)
+        return true;
+    d->ctx.actor = cetrafs_slave_actor;
+    if (snprintf(path, sizeof(path), "/sys/block/%s/slaves", disk_name) >= (int) sizeof(path)) {
+        kfree(d);
         return false;
+    }
     f = cetrafs_sysfs_open(path, O_RDONLY | O_DIRECTORY);
-    if (IS_ERR(f))
+    if (IS_ERR(f)) {
+        kfree(d);
         return false;
-    iterate_dir(f, &d.ctx);
+    }
+    iterate_dir(f, &d->ctx);
     filp_close(f, NULL);
-    return d.n > 0;
+    any = d->n > 0;
+    kfree(d);
+    return any;
 }
 
 /*

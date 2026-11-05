@@ -342,15 +342,24 @@ static int cetrafs_defrag_commit(struct inode *inode,
 {
     struct super_block *sb = inode->i_sb;
     cetrafs_extent_t *out;
-    cetrafs_inode_t old = *raw; /* names the OLD tree, freed after publish */
+    /* Names the OLD tree, freed after the publish. Off the stack: a
+     * record is 652 bytes, and this runs under the defrag worker's own
+     * frame -- its caller heap-allocates the same type for this reason
+     * (audit 2026-11-05, section 3). */
+    cetrafs_inode_t *old;
     u32 n = 0, i, cap = suffix_count + 8;
     u64 off, meta = 0;
     bool verdict_old = false; /* a failed publish proven NOT to have landed */
     int ret;
 
     out = kvmalloc_array(cap, sizeof(*out), GFP_KERNEL);
-    if (!out)
+    old = kmalloc(sizeof(*old), GFP_KERNEL);
+    if (!out || !old) {
+        kvfree(out);
+        kfree(old);
         return -ENOMEM;
+    }
+    *old = *raw;
 
     /* Prefix: [0, moved) as contiguous run entries, split at the length cap. */
     for (off = 0; off < moved && n < cap;) {
@@ -369,7 +378,7 @@ static int cetrafs_defrag_commit(struct inode *inode,
 
     ret = cetrafs_tree_build(inode, out, n, raw, &meta);
     if (ret) {
-        *raw = old;
+        *raw = *old;
         goto out;
     }
     raw->blocks = cetrafs_cpu_to_le64((nblocks + meta) * (CETRAFS_BLOCK_SIZE / 512));
@@ -424,8 +433,8 @@ static int cetrafs_defrag_commit(struct inode *inode,
                 pr_warn("defrag: ino=%llu publish reported %d but the record names the new tree -- keeping it\n",
                         (unsigned long long) inode->i_ino, ret);
                 ret = 0;
-            } else if (!vret && !memcmp(&now->eh, &old.eh, sizeof(now->eh)) &&
-                       !memcmp(&now->et, &old.et, sizeof(now->et))) {
+            } else if (!vret && !memcmp(&now->eh, &old->eh, sizeof(now->eh)) &&
+                       !memcmp(&now->et, &old->et, sizeof(now->et))) {
                 verdict_old = true;
             } else {
                 pr_err("defrag: ino=%llu publish failed (%d) and the record names neither tree (%d) -- freeing "
@@ -441,17 +450,18 @@ static int cetrafs_defrag_commit(struct inode *inode,
     if (ret) {
         if (verdict_old) {
             cetrafs_tree_free_meta(inode, raw); /* provably unreferenced: undo the fresh tree */
-            *raw = old;
+            *raw = *old;
             goto out;
         }
-        *raw = old;
+        *raw = *old;
         ret = -ENOTRECOVERABLE; /* outcome unknown: the caller must free no destination block */
         goto out;
     }
-    cetrafs_tree_free_meta(inode, &old); /* the old tree's meta is now unreferenced */
+    cetrafs_tree_free_meta(inode, old); /* the old tree's meta is now unreferenced */
 
 out:
     kvfree(out);
+    kfree(old);
     return ret;
 }
 
