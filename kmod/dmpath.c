@@ -42,6 +42,9 @@
 #include <linux/fs.h>
 #include <linux/kernel.h>
 #include <linux/string.h>
+#include <linux/cred.h>
+#include <linux/fs_struct.h>
+#include <linux/sched/task.h>
 
 #include <linux/delay.h>
 #include "kmod.h"
@@ -80,6 +83,36 @@ static bool cetrafs_slave_actor(struct dir_context *ctx, const char *name, int n
     return true;
 }
 
+/*
+ * Open a sysfs path the same way whoever triggered the resolution.
+ *
+ * filp_open() resolves against the CURRENT task's root, mount namespace
+ * and credentials, and the resolution runs from whatever task first
+ * needs a compare-and-swap: a mount from a container with its own /sys
+ * (or none), a chrooted caller, a task whose credentials cannot read
+ * sysfs. The answer -- which SCSI path carries this LUN's CAW -- must
+ * not depend on any of that (audit L31). So the lookup starts at init's
+ * root, under kernel credentials.
+ */
+static struct file *cetrafs_sysfs_open(const char *path, int flags)
+{
+    struct path root;
+    struct cred *kcred;
+    const struct cred *old;
+    struct file *f;
+
+    kcred = prepare_kernel_cred(&init_task);
+    if (!kcred)
+        return ERR_PTR(-ENOMEM);
+    get_fs_root(init_task.fs, &root);
+    old = override_creds(kcred);
+    f = file_open_root(&root, path, flags, 0);
+    revert_creds(old);
+    path_put(&root);
+    put_cred(kcred);
+    return f;
+}
+
 /* Read a sysfs "dev" attribute ("8:0\n") into a dev_t. */
 static int cetrafs_sysfs_devt(const char *path, dev_t *out)
 {
@@ -89,7 +122,7 @@ static int cetrafs_sysfs_devt(const char *path, dev_t *out)
     ssize_t n;
     unsigned int maj, min;
 
-    f = filp_open(path, O_RDONLY, 0);
+    f = cetrafs_sysfs_open(path, O_RDONLY);
     if (IS_ERR(f))
         return PTR_ERR(f);
 
@@ -119,7 +152,7 @@ static bool cetrafs_dm_has_slaves(const char *disk_name)
 
     if (snprintf(path, sizeof(path), "/sys/block/%s/slaves", disk_name) >= (int) sizeof(path))
         return false;
-    f = filp_open(path, O_RDONLY | O_DIRECTORY, 0);
+    f = cetrafs_sysfs_open(path, O_RDONLY | O_DIRECTORY);
     if (IS_ERR(f))
         return false;
     iterate_dir(f, &d.ctx);
@@ -166,7 +199,7 @@ static int cetrafs_dm_collect(const char *disk_name, dev_t *out, unsigned int ma
         return -ENOMEM;
     d->ctx.actor = cetrafs_slave_actor;
 
-    f = filp_open(path, O_RDONLY | O_DIRECTORY, 0);
+    f = cetrafs_sysfs_open(path, O_RDONLY | O_DIRECTORY);
     if (IS_ERR(f)) {
         ret = PTR_ERR(f); /* not a stacked device: nothing under it */
         goto out_free;
