@@ -27,6 +27,7 @@
 #include <linux/fs.h>
 #include <linux/kernel.h>
 #include <linux/moduleparam.h>
+#include <linux/sched/signal.h>
 
 #include "kmod.h"
 
@@ -690,7 +691,11 @@ static int cetrafs_birth_await_release(struct super_block *sb, u64 ino, cetrafs_
         u32 owner;
         int ret;
 
-        msleep(step);
+        /* Killable (audit L21): a create stuck behind a peer's reclaim
+         * may be abandoned. The caller leaves the bit set on an error --
+         * a leak the scrub reclaims, never a number handed out twice. */
+        if (schedule_timeout_killable(msecs_to_jiffies(step)) && fatal_signal_pending(current))
+            return -EINTR;
         waited += step;
         step = min(step * 2, 64U);
 
