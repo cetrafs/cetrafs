@@ -540,6 +540,22 @@ static unsigned int cetrafs_reclaim_stall_after_fence_ms;
 cetrafs_test_param(reclaim_stall_after_fence_ms, cetrafs_reclaim_stall_after_fence_ms, uint, 0644);
 MODULE_PARM_DESC(reclaim_stall_after_fence_ms, "TEST ONLY: pause once between a reclaim's fence and its CAS");
 
+/* TEST ONLY, one-shot: hold the gap between a reclaim's journal replay
+ * and the swap that takes the claim -- after the replay's own re-attach
+ * check, so a holder that re-attaches and sweeps here reaches the swap
+ * (tests/kernel/reclaim_reattach_swept.sh). */
+static unsigned int cetrafs_reclaim_stall_before_swap_ms;
+cetrafs_test_param(reclaim_stall_before_swap_ms, cetrafs_reclaim_stall_before_swap_ms, uint, 0644);
+MODULE_PARM_DESC(reclaim_stall_before_swap_ms, "TEST ONLY: pause once between a reclaim's replay and its CAS");
+
+void cetrafs_node_test_stall_before_swap(void)
+{
+    unsigned int stall = xchg(&cetrafs_reclaim_stall_before_swap_ms, 0);
+
+    if (unlikely(stall))
+        msleep(stall); /* TEST ONLY: see the parameter */
+}
+
 int cetrafs_node_fence_peer(struct super_block *sb, u32 node_id, const char *what)
 {
     /*

@@ -1435,6 +1435,11 @@ struct cetrafs_lock_cas_ctx {
                          * we are bypassing rather than claiming (we never
                          * auto-claim there). Independent of claim/release. */
     u32 steal_from;     /* meaningful when allow_steal or steal_release */
+    /* Out, claim: the swap that landed took the lock FROM steal_from
+     * rather than finding it free. Only a displacement has anything to
+     * give back (cetrafs_lock_undo_steal()). steal_release needs no such
+     * flag: it lands only by displacing. */
+    bool displaced;
     /* Undo a reclaim that raced a re-attach (cetrafs_lock_undo_steal()):
      * put the lock back to give_back_to, only while it is still what the
      * reclaim left -- held by give_back_from, or free when that is NONE. */
@@ -1628,6 +1633,7 @@ static int cetrafs_lock_cas_mutate(void *image, unsigned int len, void *priv)
                                     ~(1ULL << (ctx->my_node_id % CETRAFS_MAX_READER_NODES))))
             return -ETXTBSY; /* another node is reading it */
 
+        ctx->displaced = !free_now; /* per attempt: the image that lands is the last one mutated */
         rec.lock_owner_node = cetrafs_cpu_to_le32(ctx->my_node_id);
         rec.lock_mode = cetrafs_cpu_to_le32(CETRAFS_LOCK_EXCLUSIVE);
     } else {
@@ -1660,7 +1666,11 @@ static int cetrafs_lock_cas_mutate(void *image, unsigned int len, void *priv)
  * cetrafs_node_reattached_since_fence() read after the steal settles it.
  *
  * If it did: put the lock back to the owner, and the caller treats the
- * file as held by a live node. A give-back that does not land leaves
+ * file as held by a live node. A claim calls this only when its swap
+ * DISPLACED the owner (ctx.displaced): an owner that re-attached and
+ * swept first left the lock free, the claim took a free lock, and
+ * "giving it back" would hand a live node a lock no open of its holds
+ * -- nothing would ever release it. A give-back that does not land leaves
  * this node holding a live peer's lock -- the mount stops rather than
  * write under it (docs/internal/ERRORS.md).
  *
@@ -2084,13 +2094,15 @@ int cetrafs_lock_open(struct inode *inode, struct file *file)
             .refuse_readers = !cetrafs_lock_ignore_readers,
         };
 
+        if (reclaim_from_stale)
+            cetrafs_node_test_stall_before_swap();
         ret = cetrafs_lock_cas(inode, &ctx, &raw);
         if (ret) {
             if (ret == -ETXTBSY)
                 pr_warn("lock: ino=%llu lost the race claiming the write lock\n", (unsigned long long) inode->i_ino);
             goto out_pr_unlock;
         }
-        if (reclaim_from_stale &&
+        if (reclaim_from_stale && ctx.displaced &&
             cetrafs_lock_undo_steal(sb, inode->i_ino, cetrafs_le64(raw.generation), stale_owner, my_node_id, "open")) {
             ret = -ETXTBSY; /* its holder is alive after all */
             goto out_pr_unlock;
@@ -4166,8 +4178,10 @@ static int cetrafs_lock_explicit_acquire(struct inode *inode, struct file *file)
             ctx.generation = cetrafs_le64(raw.generation);
             ctx.allow_steal = true;
             ctx.steal_from = owner;
+            cetrafs_node_test_stall_before_swap();
             ret = cetrafs_lock_cas(inode, &ctx, &raw);
-            if (!ret && cetrafs_lock_undo_steal(sb, inode->i_ino, ctx.generation, owner, my_node_id, "flock"))
+            if (!ret && ctx.displaced &&
+                cetrafs_lock_undo_steal(sb, inode->i_ino, ctx.generation, owner, my_node_id, "flock"))
                 ret = -ETXTBSY; /* a live holder after all: keep waiting */
         }
         if (ret)

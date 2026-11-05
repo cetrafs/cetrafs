@@ -89,6 +89,9 @@ struct cetrafs_nslock_ctx {
     bool acquire;
     bool steal; /* acquire: allowed to displace steal_from */
     u32 steal_from;
+    bool displaced; /* acquire: the swap that landed took it FROM steal_from,
+                     * not a lock already free -- only then is there
+                     * anything to give back */
     u32 clobbered; /* release: who held it, when it was no longer ours */
     bool not_ours; /* release: it was no longer ours -- the verdict. Not
                     * clobbered != NONE: a lock found CLEARED has
@@ -199,6 +202,8 @@ static int cetrafs_nslock_mutate(void *image, unsigned int len, void *priv)
         if (!free_now && ctx->sb && S_ISDIR(cetrafs_le32(rec.mode)))
             rec.dirent_seq = cetrafs_cpu_to_le64(cetrafs_inode_new_generation(ctx->sb));
 
+        /* Per attempt: the image that lands is the last one mutated. */
+        ctx->displaced = !free_now && !mine_already;
         rec.ns_lock_owner = cetrafs_cpu_to_le32(ctx->my_node_id);
     } else {
         if (cetrafs_le32(rec.ns_lock_owner) != ctx->my_node_id) {
@@ -400,6 +405,8 @@ static int cetrafs_nslock_try(struct inode *inode, u32 my_node_id)
      * exactly the state this decision was made against. */
     /* Seeded with the copy just read above -- saves re-reading the
      * same record inside the CAS (cetrafs_cas_region_seeded()). */
+    if (ctx.steal)
+        cetrafs_node_test_stall_before_swap();
     ret = cetrafs_cas_record_seeded(sb, cetrafs_inode_lba(sb, inode->i_ino), &raw, CETRAFS_INODE_NS_BYTES,
                                     cetrafs_nslock_mutate, &ctx);
     /*
@@ -410,8 +417,13 @@ static int cetrafs_nslock_try(struct inode *inode, u32 my_node_id)
      * (lock.c's cetrafs_lock_undo_steal() has the full account). Give it
      * back and wait, as for any live holder; a give-back that does not
      * land would leave two namespace writers, so the mount stops.
+     *
+     * Only if the swap DISPLACED it. A holder that re-attached and swept
+     * its leftover claims first left the lock free, and the swap took a
+     * free lock: giving that one "back" hands a live node a lock it does
+     * not know it holds, which nothing on it ever releases.
      */
-    if (ret == 0 && ctx.steal && cetrafs_node_reattached_since_fence(sb, ctx.steal_from)) {
+    if (ret == 0 && ctx.steal && ctx.displaced && cetrafs_node_reattached_since_fence(sb, ctx.steal_from)) {
         struct cetrafs_nslock_giveback_ctx g = {
             .generation = ctx.generation,
             .from = my_node_id,

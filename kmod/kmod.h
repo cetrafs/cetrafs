@@ -825,6 +825,7 @@ int cetrafs_node_is_stale(struct super_block *sb, u32 node_id, bool *out_stale);
 /* The fence lease -- see cetrafs_node_entry_t.fence_epoch. */
 int __must_check cetrafs_node_fence_peer(struct super_block *sb, u32 node_id, const char *what);
 bool cetrafs_node_reattached_since_fence(struct super_block *sb, u32 node_id);
+void cetrafs_node_test_stall_before_swap(void);
 int cetrafs_node_self_fence_check(struct super_block *sb, u32 my_node_id, bool *out_fenced);
 int cetrafs_node_get_entry(struct super_block *sb, u32 idx, cetrafs_node_entry_t *out);
 u64 cetrafs_node_row_lba(struct super_block *sb, u32 idx);
