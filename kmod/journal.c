@@ -1196,7 +1196,7 @@ static bool cetrafs_journal_target_intact(const struct buffer_head *bh)
 
 enum cetrafs_journal_verdict {
     CETRAFS_JV_APPLY,           /* target still holds the before-image: redo */
-    CETRAFS_JV_APPLY_UNGUARDED, /* entry carries no before-image to check */
+    CETRAFS_JV_UNGUARDED,       /* entry carries no before-image to check: refused */
     CETRAFS_JV_TORN,            /* target fails its own tail checksum */
     CETRAFS_JV_LANDED,          /* target already holds the after-image */
     CETRAFS_JV_CHANGED,         /* a complete image that is neither: rewritten since */
@@ -1238,8 +1238,13 @@ static enum cetrafs_journal_verdict cetrafs_journal_judge(const struct cetrafs_j
         return CETRAFS_JV_APPLY;
     if (tcrc == e->payload_checksum)
         return CETRAFS_JV_LANDED; /* only the consume was lost */
+    /* Every entry this format writes is GUARDED (or FRESH, skipped
+     * before here). One that is neither was written by a module that
+     * predates the guard -- which cannot mount this format -- or is
+     * damaged or crafted, and its redo would be a blind 4 KiB write
+     * nothing can check (audit L7). */
     if (!(e->flags & CETRAFS_JRNL_F_GUARDED))
-        return CETRAFS_JV_APPLY_UNGUARDED;
+        return CETRAFS_JV_UNGUARDED;
     if (tcrc == e->prev_checksum)
         return CETRAFS_JV_APPLY; /* the target write never landed */
     if (!cetrafs_journal_ignore_torn && !cetrafs_journal_target_intact(tbh)) {
@@ -1567,7 +1572,7 @@ static int __cetrafs_journal_replay_node(struct super_block *sb, u32 node_id, bo
                     torn_tries++;
                     continue;
                 }
-                if (v != CETRAFS_JV_APPLY && v != CETRAFS_JV_APPLY_UNGUARDED && v != CETRAFS_JV_TORN)
+                if (v != CETRAFS_JV_APPLY && v != CETRAFS_JV_TORN)
                     break;
 
                 if (unlikely(cetrafs_journal_replay_apply_pause_ms)) {
@@ -1602,11 +1607,11 @@ static int __cetrafs_journal_replay_node(struct super_block *sb, u32 node_id, bo
             case CETRAFS_JV_APPLY:
                 apply = true;
                 break;
-            case CETRAFS_JV_APPLY_UNGUARDED:
-                apply = true;
-                pr_warn("journal replay: node %u txn %llu (target %llu) predates the replay guard -- "
-                        "applying unverified\n",
-                        node_id, (unsigned long long) entries[s].txn_id, (unsigned long long) entries[s].target_lba);
+            case CETRAFS_JV_UNGUARDED:
+                atomic64_inc(&cetrafs_journal_replay_refused);
+                pr_err("journal replay: node %u txn %llu (target %llu) carries no replay guard, which no writer of "
+                       "this format emits -- NOT applying it\n",
+                       node_id, (unsigned long long) entries[s].txn_id, (unsigned long long) entries[s].target_lba);
                 break;
             case CETRAFS_JV_TORN:
                 /* Still torn after the re-reads: not a peer's newer

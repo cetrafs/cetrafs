@@ -15,14 +15,15 @@
  * theirs.
  *
  * Usage: journal_poke <image> <node_id> <slot> <target_lba> <payload_file>
- *            [--guard-current | --guard-stale | --fresh]
+ *            [--guard-current | --guard-stale | --fresh | --unguarded]
  * <payload_file> must be exactly CETRAFS_BLOCK_SIZE bytes.
  *
  * The optional last argument sets the entry's replay-guard fields
- * (cetrafs_journal_header_t.flags / prev_checksum); with none of them the
- * entry is written the way a module predating the guard wrote it (flags
- * == 0), which replay still applies unverified -- that is the rolling-
- * upgrade path, and journal.sh covers it.
+ * (cetrafs_journal_header_t.flags / prev_checksum). The default is
+ * --guard-current, which is how every entry this format writes looks.
+ *   --unguarded      flags == 0, as a module predating the guard wrote
+ *                    it. No writer of this format emits one, so replay
+ *                    REFUSES it: it can only be crafted or damaged.
  *   --guard-current  F_GUARDED, prev_checksum = CRC of target_lba as it
  *                    reads RIGHT NOW. Replay must APPLY it.
  *   --guard-stale    F_GUARDED, prev_checksum = a value the target
@@ -76,13 +77,16 @@ int main(int argc, char **argv)
     if (argc != 6 && argc != 7 && !dump && !claim) {
         fprintf(stderr,
                 "usage: %s <image> <node_id> <slot> <target_lba> <payload_file> "
-                "[--guard-current|--guard-stale|--fresh]\n"
+                "[--guard-current|--guard-stale|--fresh|--unguarded]\n"
                 "       %s <image> <node_id> --dump\n"
                 "       %s <image> <node_id> --claim <replay_owner|release>\n",
                 argv[0], argv[0], argv[0]);
         return 2;
     }
-    if (guard && strcmp(guard, "--guard-current") && strcmp(guard, "--guard-stale") && strcmp(guard, "--fresh")) {
+    if (!guard && !dump && !claim)
+        guard = "--guard-current";
+    if (guard && strcmp(guard, "--guard-current") && strcmp(guard, "--guard-stale") && strcmp(guard, "--fresh") &&
+        strcmp(guard, "--unguarded")) {
         fprintf(stderr, "unknown guard mode '%s'\n", guard);
         return 2;
     }
@@ -172,6 +176,8 @@ int main(int argc, char **argv)
     hdr.payload_checksum = cetrafs_cpu_to_le32(crc32c_update(0, payload, sizeof(payload)));
     if (guard && !strcmp(guard, "--fresh")) {
         hdr.flags = cetrafs_cpu_to_le32(CETRAFS_JRNL_F_FRESH);
+    } else if (guard && !strcmp(guard, "--unguarded")) {
+        hdr.flags = 0;
     } else if (guard) {
         uint8_t cur[CETRAFS_BLOCK_SIZE];
         uint32_t prev;

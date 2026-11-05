@@ -105,6 +105,22 @@ ct_umount "$MNT"
 [ "$SKIP" -gt "$S_PREV" ] && pass "guard: journal_replay_skipped counts it ($S_PREV -> $SKIP)" ||
     fail "guard: journal_replay_skipped did not move ($S_PREV -> $SKIP)"
 
+# --------------------------------------------------------------- case 4
+log "an entry with NO guard is REFUSED (no writer of this format emits one)"
+# State B on the device, an unguarded entry carrying state A. It used to
+# be applied unverified -- a blind 4 KiB write from any header with a
+# valid CRC (audit L7).
+"$JPOKE" "$DEV" 0 0 "$TARGET_LBA" "$BLK_A" --unguarded >/dev/null
+MARK4="$(dmesg_mark)"
+mount -t cetrafs "$DEV" "$MNT"
+LS="$(ls "$MNT" | sort | tr '\n' ' ')"; U_PREV=$REF; sample
+ct_umount "$MNT"
+[ "$LS" = "alpha beta " ] && pass "guard: an unguarded entry left the block alone ($LS)" ||
+    fail "guard: an unguarded entry was applied (expected 'alpha beta ', got '$LS')"
+dmesg_since "$MARK4" | grep -q "carries no replay guard" && [ "$REF" -gt "$U_PREV" ] &&
+    pass "guard: the unguarded entry is refused, logged and counted ($U_PREV -> $REF)" ||
+    fail "guard: the unguarded entry's refusal was not logged or counted ($U_PREV -> $REF)"
+
 # ----------------------------------------------------- negative control
 # Without this, all of the above would pass just as well against code
 # that never replays anything at all. journal_ignore_guard restores the
