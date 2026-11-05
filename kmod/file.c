@@ -5303,6 +5303,7 @@ static long cetrafs_fallocate(struct file *file, int mode, loff_t offset, loff_t
     u64 meta_blocks = 0;
     u32 freed = 0, discard = 0;
     bool published = false; /* the map changed: the tail of the punch updates blocks/ctime */
+    bool zeroed = false;    /* a boundary block was partly zeroed: the contents changed */
     int ret;
 
     recs = kmalloc(2 * sizeof(*recs), GFP_NOFS);
@@ -5483,6 +5484,10 @@ static long cetrafs_fallocate(struct file *file, int mode, loff_t offset, loff_t
             ret = cetrafs_zero_range(inode->i_mapping, offset, (size_t) (split - offset));
             if (!ret)
                 ret = cetrafs_zero_range(inode->i_mapping, split, (size_t) (end - split));
+        }
+        if (!ret) { /* the contents changed: mtime with ctime (audit L24) */
+            inode_set_mtime_to_ts(inode, inode_set_ctime_current(inode));
+            mark_inode_dirty(inode);
         }
         goto out;
     }
@@ -5666,17 +5671,28 @@ zero_boundaries:
         loff_t block_end = (loff_t) start_block * CETRAFS_BLOCK_SIZE;
 
         ret = cetrafs_zero_range(inode->i_mapping, offset, (size_t) (block_end - offset));
+        zeroed = true;
     }
     if (!ret && (end & (CETRAFS_BLOCK_SIZE - 1))) {
         loff_t block_start = (loff_t) end_block * CETRAFS_BLOCK_SIZE;
 
         ret = cetrafs_zero_range(inode->i_mapping, block_start, (size_t) (end - block_start));
+        zeroed = true;
     }
-    if (!published)
+    /* A punch changes the file's contents: mtime moves with ctime, as
+     * on ext4 and XFS (audit L24) -- a backup or sync tool that trusts
+     * mtime otherwise never sees the hole. */
+    if (!published) {
+        if (zeroed) {
+            inode_set_mtime_to_ts(inode, inode_set_ctime_current(inode));
+            mark_inode_dirty(inode);
+        }
         goto out; /* the map did not change: nothing below applies */
+    }
 
     inode->i_blocks = cetrafs_le64(raw.blocks);
     inode_set_ctime(inode, ktime_get_real_seconds(), 0);
+    inode_set_mtime_to_ts(inode, inode_get_ctime(inode));
     mark_inode_dirty(inode);
     /* The direct write persists it; the VFS call then clears the dirty
      * state so the inode can still accept cross-node refreshes. Both
