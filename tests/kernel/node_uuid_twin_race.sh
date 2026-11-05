@@ -20,6 +20,11 @@
 # the post-claim twin scan removed: both D and E mount.
 set -euo pipefail
 . "$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)/lib/harness.sh"
+# The twin left row 1 registered in E; the control's mkfs then sees a
+# live-looking row and watches it for the longest stale window a node may
+# use (240 s, devutil.h) -- not what this suite tests;
+# tool_probe_stale_window.sh tests that.
+export CETRAFS_PEER_PROBE_SECS=3
 require_root
 require_module
 [ -w /sys/module/cetrafs/parameters/register_twin_race ] || { skip "register_twin_race is missing"; ct_exit; }
