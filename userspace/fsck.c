@@ -2754,17 +2754,27 @@ int main(int argc, char **argv)
                     problems++;
                 }
             }
-            if (cetrafs_le16(in.eh.eh_magic) != CETRAFS_EXT_MAGIC) {
+            if (cetrafs_le16(in.eh.eh_magic) != CETRAFS_EXT_MAGIC && in.eh.eh_magic == 0 && in.nlink != 0 &&
+                fsck_all_zero((const uint8_t *) &in.et, sizeof(in.et)) && in.eh.eh_entries == 0 &&
+                in.eh.eh_depth == 0) {
+                /* Nothing hidden (no extent bytes at all), but every
+                 * creator stamps the magic, and the kernel refuses to
+                 * map through a record without it (-EIO on the first
+                 * read or write). Repair stays on, so the record goes
+                 * on through the walk below: its extents mark nothing
+                 * and its xattr block must still be marked, or a repair
+                 * clears it as leaked (audit 2026-11-06 L23). */
+                fprintf(stderr, "ERR: inode %" PRIu64 " has no extent header; the kernel refuses to map it\n", ino);
+                problems++;
+            } else if (cetrafs_le16(in.eh.eh_magic) != CETRAFS_EXT_MAGIC) {
                 /* magic == 0 is a legitimate "no extents yet" record and
                  * is NOT an error -- blocking repair on it would disable
                  * repair on every healthy volume, which is the
                  * cries-wolf failure N5 is about. Only a header that is
                  * positively wrong hides blocks from the walk. */
                 if (in.eh.eh_magic == 0 && in.nlink != 0 && fsck_all_zero((const uint8_t *) &in.et, sizeof(in.et))) {
-                    /* Nothing hidden (no extent bytes at all), but every
-                     * creator stamps the magic, and the kernel refuses to
-                     * map through a record without it (-EIO on the first
-                     * read or write). */
+                    /* No extent bytes, but a count or depth in the
+                     * header: nothing the walk could follow either. */
                     fprintf(stderr,
                             "ERR: inode %" PRIu64 " has no extent header; the kernel refuses to map it\n", ino);
                     problems++;
