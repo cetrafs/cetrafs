@@ -489,26 +489,6 @@ static int cetrafs_node_fence_peer_full(struct super_block *sb, u32 node_id, con
     return 0;
 }
 
-/*
- * Record a watched-dead verdict on a row nobody has reclaimed yet: bump
- * its lease and stamp the departure sentinel, so the next observer reads
- * it as gone instead of watching it all over again. Only while the row
- * still carries the hb_seq that was watched standing still -- a node that
- * beat, or re-attached, since the watch is left alone.
- */
-static void cetrafs_node_stamp_watched_dead(struct super_block *sb, u32 node_id, u64 watched_seq)
-{
-    struct cetrafs_node_fence_ctx ctx = {
-        .mark_departed = true, .check_verdict = true, .have_seq = true, .seq = watched_seq};
-    int ret = cetrafs_cas_record(sb, cetrafs_node_row_lba(sb, node_id), cetrafs_node_fence_mutate, &ctx);
-
-    if (ret < 0)
-        pr_warn("node %u: could not record it as departed (%d) -- the next mount watches it again\n", node_id, ret);
-    else if (ctx.seen_epoch)
-        pr_info("node %u: watched dead, recorded as departed (epoch %llu)\n", node_id,
-                (unsigned long long) ctx.seen_epoch);
-}
-
 /* TEST ONLY: report every reclaim as racing a re-attach (the steal is
  * given back), or never (the pre-fix behaviour). -1 = off. */
 static int cetrafs_reattach_after_fence_force = -1;
@@ -1559,8 +1539,7 @@ out:
  * to the next default mount. So each wanted row is watched for the
  * window the mount gate uses (our stale_secs, floored at four of the
  * row's own beats): a live node beats within one interval and is
- * visited then; one that never moves is dead, imposes nothing, and is
- * recorded as departed so the next mount reads it in one block. Only
+ * visited then; one that never moves is dead and imposes nothing. Only
  * rows the caller's decision depends on are watched, so a healthy
  * cluster pays at most one peer interval, and usually nothing.
  *
@@ -1647,8 +1626,12 @@ static int cetrafs_for_each_live_peer(struct super_block *sb,
                 continue;
             }
             if (expired) {
-                /* Watched for the whole window and never moved: dead. */
-                cetrafs_node_stamp_watched_dead(sb, idx, seq[idx] - 1);
+                /* Watched for the whole window and never moved: dead,
+                 * and skipped. NOT stamped departed, as the no-CAW gate
+                 * stamps it: a node that comes back to a departed row
+                 * re-attaches as if it had left cleanly and skips its
+                 * own-claim sweeps (TODO.md, L3). The next mount that
+                 * depends on this row watches it again. */
                 seq[idx] = 0;
                 candidates--;
             }

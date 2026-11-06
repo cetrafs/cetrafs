@@ -14,7 +14,8 @@
 #   (C) a crashed nofilelock cluster handed its mode to the next default
 #       mount.
 # Each wanted row is now watched until it beats or the window ends; one
-# that never moves is dead, imposes nothing, and is recorded as departed.
+# that never moves is dead and imposes nothing -- skipped, not stamped
+# departed (a node returning to a departed row skips its own-claim sweeps).
 #
 # Staged on a CAW-assumed mount (the no-CAW gate watches every row on its
 # own, which would hide the fault): row 1 is planted REGISTERED with a
@@ -59,8 +60,10 @@ MARK="$(dmesg_mark)"
 if try_mount; then
     pass "(A) a dead no-CAW row did not block a CAW mount"
     ct_umount "$MNT"
-    grep -q 'last_seen=0 ' <<<"$(row1)" && pass "(A) the dead row was recorded as departed" ||
-        fail "(A) the dead row was not recorded as departed: $(row1)"
+    # Skipped, never stamped departed: a node returning to a departed row
+    # skips its own-claim sweeps (TODO.md, L3).
+    grep -q 'last_seen=0 ' <<<"$(row1)" && fail "(A) the watch stamped the dead row departed: $(row1)" ||
+        pass "(A) the dead row was skipped, not stamped departed"
 else
     fail "(A) a dead no-CAW row blocked the mount: $(dmesg_since "$MARK" | grep -m1 -i 'cetrafs.*\(refus\|without\)')"
 fi
