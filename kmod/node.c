@@ -447,8 +447,10 @@ MODULE_PARM_DESC(fence_peer_fail, "TEST ONLY: revoking a stale peer's lease fail
  * 0 also when there is no lease left to revoke (the row is no longer
  * REGISTERED: nobody holds it to keep writing under).
  */
+/* 'judged': the hb_seq the caller itself watched stand still, when it
+ * has one (the no-CAW mount gate); NULL takes the peer watch's. */
 static int cetrafs_node_fence_peer_full(struct super_block *sb, u32 node_id, const char *what, bool mark_departed,
-                                        bool check_verdict)
+                                        bool check_verdict, const u64 *judged)
 {
     struct cetrafs_node_fence_ctx ctx = {.mark_departed = mark_departed, .check_verdict = check_verdict};
     const cetrafs_superblock_t *raw_sb = cetrafs_sb_raw(sb);
@@ -468,8 +470,12 @@ static int cetrafs_node_fence_peer_full(struct super_block *sb, u32 node_id, con
         return 0;
     }
 
-    if (check_verdict)
+    if (check_verdict && judged) {
+        ctx.have_seq = true;
+        ctx.seq = *judged;
+    } else if (check_verdict) {
         ctx.have_seq = cetrafs_sb_peer_watched_seq(sb, node_id, &ctx.seq);
+    }
     ret = cetrafs_cas_record(sb, cetrafs_node_row_lba(sb, node_id), cetrafs_node_fence_mutate, &ctx);
     if (ret == 0 && ctx.reattached) {
         pr_info("fence: node %u came back since it was judged stale -- not revoking, not reclaiming %s\n", node_id,
@@ -581,7 +587,7 @@ int cetrafs_node_fence_peer(struct super_block *sb, u32 node_id, const char *wha
             msleep(stall); /* TEST ONLY: see the parameter */
     }
     {
-        int ret = cetrafs_node_fence_peer_full(sb, node_id, what, false, true);
+        int ret = cetrafs_node_fence_peer_full(sb, node_id, what, false, true, NULL);
         unsigned int stall = ret ? 0 : xchg(&cetrafs_reclaim_stall_after_fence_ms, 0);
 
         if (stall)
@@ -831,7 +837,8 @@ int cetrafs_node_register(struct super_block *sb,
             if (cetrafs_register_twin_race) /* test knob, see its MODULE_PARM_DESC */
                 (void) cetrafs_cas_record(sb, cetrafs_node_row_lba(sb, idx), cetrafs_node_test_beat_mutate, NULL);
             if (cetrafs_reattach_race_bump) /* test knob, see its MODULE_PARM_DESC */
-                (void) cetrafs_node_fence_peer_full(sb, idx, "a test-forced concurrent reclaim (reattach_race_bump)", false, false);
+                (void) cetrafs_node_fence_peer_full(sb, idx, "a test-forced concurrent reclaim (reattach_race_bump)", false, false,
+                                                    NULL);
 
             /* The take-back is a CAS, never a blind write of the row read
              * above -- see cetrafs_node_reattach_mutate() for the fence
@@ -1431,6 +1438,12 @@ out:
     return ret;
 }
 
+/* TEST ONLY: pause between the no-CAW gate's last re-read of a row and
+ * its fence (tests/kernel/nocaw_fence_incarnation.sh). */
+static unsigned int cetrafs_nocaw_fence_stall_ms;
+cetrafs_test_param(nocaw_fence_stall_ms, cetrafs_nocaw_fence_stall_ms, uint, 0644);
+MODULE_PARM_DESC(nocaw_fence_stall_ms, "TEST ONLY: pause before the no-CAW mount gate fences a row it judged dead");
+
 int cetrafs_node_live_peer_exists(struct super_block *sb, const u8 *my_uuid, bool *out_exists)
 {
     const cetrafs_superblock_t *raw_sb = cetrafs_sb_raw(sb);
@@ -1530,7 +1543,26 @@ int cetrafs_node_live_peer_exists(struct super_block *sb, const u8 *my_uuid, boo
          * by itself, and every path that later does (its Zone Groups,
          * locks, journal) revokes the lease again and stops if it
          * cannot. */
-        (void) cetrafs_node_fence_peer_full(sb, idx, "this volume (no atomic CAW: one mounter only)", true, false);
+        /* Bound to the hb_seq this watch judged: a node re-attaching
+         * between the re-read above and this fence moves it on, and
+         * marking THAT incarnation departed let it keep writing until
+         * its next tick while this mount went ahead (audit 2026-11-06
+         * L8). The fence then writes nothing, and this mount refuses. */
+        {
+            u64 judged = cetrafs_le64(ne.hb_seq);
+            int fret;
+
+            if (READ_ONCE(cetrafs_nocaw_fence_stall_ms))
+                msleep(READ_ONCE(cetrafs_nocaw_fence_stall_ms)); /* TEST ONLY */
+            fret = cetrafs_node_fence_peer_full(sb, idx, "this volume (no atomic CAW: one mounter only)", true, true,
+                                                &judged);
+            if (fret == -EBUSY) {
+                pr_err("node %u came back while this mount watched it -- it is alive and mounted on this volume\n",
+                       idx);
+                *out_exists = true;
+                break;
+            }
+        }
     }
 
 out:
