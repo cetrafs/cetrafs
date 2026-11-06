@@ -2849,8 +2849,13 @@ void cetrafs_resv_publish(struct super_block *sb, struct cetrafs_resv_span *span
         return;
 
     spin_lock(&sbi->resv_list_lock);
-    if (!list_empty(&span->link) && (span->start != start || span->count != count))
-        sbi->resv_seq++; /* re-pointed: the old run's blocks left the registry */
+    /* Re-pointed: the old run's blocks left the registry -- unless the
+     * new run contains the old one, as a span that only grows does
+     * (fallocate's, cetrafs_do_allocate()): then nothing left, and a
+     * bump would only stop every scrub free for as long as it grows. */
+    if (!list_empty(&span->link) &&
+        !(start <= span->start && start + count >= span->start + span->count))
+        sbi->resv_seq++;
     span->start = start;
     span->count = count;
     if (list_empty(&span->link))

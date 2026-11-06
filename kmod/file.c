@@ -5278,8 +5278,94 @@ static unsigned int cetrafs_fallocate_block_delay_us;
 cetrafs_test_param(fallocate_block_delay_us, cetrafs_fallocate_block_delay_us, uint, 0644);
 MODULE_PARM_DESC(fallocate_block_delay_us, "TEST ONLY: microseconds to spend per preallocated block");
 
+/*
+ * The blocks a preallocation holds before its one publish, registered
+ * with the scrub (cetrafs_resv_publish()). Until the publish they are
+ * bitmap-allocated and named by nothing on the device -- exactly what
+ * the scrub frees -- and a large fallocate holds them for many seconds,
+ * far past the two-pass gap the scrub's argument rests on. A Block
+ * Group the call has finished with keeps a still allocation count, so
+ * nothing else stopped the scrub freeing them; the allocator then
+ * handed them to another file and the publish named them too (audit
+ * 2026-11-06 H2; tests/kernel/fallocate_scrub_spares.sh).
+ *
+ * One span per Block Group touched, widened to cover each block as it
+ * is allocated (plus some slack, so it is not re-published per block).
+ * A span may cover blocks that are not ours; the scrub only keeps those
+ * longer. A group is at most U32_MAX blocks, so a span's count fits.
+ * Spans are allocated one by one: a published span's link must not move.
+ */
+#define CETRAFS_FALLOC_RESV_SLACK 1024u
+struct cetrafs_falloc_span {
+    struct cetrafs_resv_span span;
+    u32 bg_id;
+};
+struct cetrafs_falloc_resv {
+    struct cetrafs_falloc_span **v;
+    u32 n, cap;
+};
+
+static int cetrafs_falloc_resv_cover(struct super_block *sb, struct cetrafs_falloc_resv *r, u32 bg_id, u64 lba)
+{
+    struct cetrafs_falloc_span *fs = NULL;
+    u64 start, end;
+    u32 i;
+
+    for (i = r->n; i-- > 0;)
+        if (r->v[i]->bg_id == bg_id) {
+            fs = r->v[i];
+            break;
+        }
+    if (!fs) {
+        if (r->n == r->cap) {
+            u32 ncap = r->cap ? r->cap * 2 : 8;
+            struct cetrafs_falloc_span **nv = kvmalloc_array(ncap, sizeof(*nv), GFP_NOFS);
+
+            if (!nv)
+                return -ENOMEM;
+            if (r->n)
+                memcpy(nv, r->v, (size_t) r->n * sizeof(*nv));
+            kvfree(r->v);
+            r->v = nv;
+            r->cap = ncap;
+        }
+        fs = kmalloc(sizeof(*fs), GFP_NOFS);
+        if (!fs)
+            return -ENOMEM;
+        INIT_LIST_HEAD(&fs->span.link);
+        fs->span.start = 0;
+        fs->span.count = 0;
+        fs->bg_id = bg_id;
+        r->v[r->n++] = fs;
+    }
+    if (fs->span.count && lba >= fs->span.start && lba < fs->span.start + fs->span.count)
+        return 0;
+    start = fs->span.count ? min(fs->span.start, lba) : lba;
+    end = fs->span.count ? max(fs->span.start + fs->span.count, lba + 1) : lba + 1;
+    end = max(end, lba + 1 + CETRAFS_FALLOC_RESV_SLACK);
+    if (end - start > U32_MAX)
+        end = start + U32_MAX; /* still covers lba: one group is <= U32_MAX blocks */
+    cetrafs_resv_publish(sb, &fs->span, start, (u32) (end - start));
+    return 0;
+}
+
+/* After the publish, or after the blocks were given back. */
+static void cetrafs_falloc_resv_drop(struct super_block *sb, struct cetrafs_falloc_resv *r)
+{
+    u32 i;
+
+    for (i = 0; i < r->n; i++) {
+        cetrafs_resv_unpublish(sb, &r->v[i]->span);
+        kfree(r->v[i]);
+    }
+    kvfree(r->v);
+    r->v = NULL;
+    r->n = r->cap = 0;
+}
+
 static int cetrafs_do_allocate(struct inode *inode, loff_t offset, loff_t len, bool keep_size)
 {
+    struct cetrafs_falloc_resv resv = {};
     struct super_block *sb = inode->i_sb;
     cetrafs_inode_t *recs; /* [0]=raw, [1]=old_raw -- off the stack */
 #define raw (recs[0])
@@ -5398,6 +5484,13 @@ static int cetrafs_do_allocate(struct inode *inode, loff_t offset, loff_t len, b
             loop_ret = cetrafs_alloc_block_anywhere(sb, &bg_id, &lba);
         if (loop_ret)
             break;
+        /* Before anything else can take long: from here until the
+         * publish, the registry is all that tells the scrub it is ours. */
+        loop_ret = cetrafs_falloc_resv_cover(sb, &resv, bg_id, lba);
+        if (loop_ret) {
+            cetrafs_free_data_block(sb, lba);
+            break;
+        }
 
         /* Extend the last new extent when both runs continue, else
          * start one. */
@@ -5536,6 +5629,9 @@ out_free_added:
         }
     }
 out_free:
+    /* Published (the record names them) or given back (above): either
+     * way the registry has nothing left to hold for the scrub. */
+    cetrafs_falloc_resv_drop(sb, &resv);
     kvfree(flat);
     kvfree(add);
     kfree(recs);
