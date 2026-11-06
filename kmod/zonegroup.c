@@ -1474,7 +1474,21 @@ out_unlock:
  * has no equivalent fairness risk, and releasing sooner is strictly
  * better for a peer that actually needs the capacity.
  */
+static int cetrafs_zg_release_surplus_locked(struct super_block *sb, u32 my_node_id);
+
+/* Under release_rwsem for write: every drain this pass makes is undone
+ * or completed before the allocator is told to look again. */
 int cetrafs_zg_release_surplus(struct super_block *sb, u32 my_node_id)
+{
+    int ret;
+
+    cetrafs_sb_release_lock(sb);
+    ret = cetrafs_zg_release_surplus_locked(sb, my_node_id);
+    cetrafs_sb_release_unlock(sb);
+    return ret;
+}
+
+static int cetrafs_zg_release_surplus_locked(struct super_block *sb, u32 my_node_id)
 {
     const cetrafs_superblock_t *raw_sb = cetrafs_sb_raw(sb);
     u32 zg_count, z, owned_count = 0;
@@ -2318,7 +2332,7 @@ int cetrafs_alloc_pick_bg(struct super_block *sb, u32 *out_bg_id)
 {
     const cetrafs_superblock_t *raw_sb = cetrafs_sb_raw(sb);
     u32 my_node_id, zg_count;
-    bool tried_claim_more = false, tried_claim_bg = false;
+    bool tried_claim_more = false, tried_claim_bg = false, waited_release = false;
     int ret;
 
     if (!raw_sb)
@@ -2508,6 +2522,18 @@ retry_scan:
             if (ret != -ENOSPC)
                 return ret;
         }
+    }
+
+    /* A surplus release may have had the space this needs drained out
+     * of reach while it decided (cetrafs_zg_release_surplus()). That is
+     * not an answer: wait for it once and look again, claims included,
+     * since what it gave back may be claimable now. */
+    if (!waited_release) {
+        waited_release = true;
+        cetrafs_sb_release_wait(sb);
+        tried_claim_more = false;
+        tried_claim_bg = false;
+        goto retry_scan;
     }
 
     /* Either this node owns no ZGs and none were claimable just now, or

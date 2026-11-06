@@ -3440,6 +3440,12 @@ static void cetrafs_bg_release_counters(struct super_block *sb, u32 zg_id, u32 b
                 sign > 0 ? "understate" : "overstate");
 }
 
+/* TEST ONLY: one release pauses with its Block Group drained, before it
+ * decides (tests/kernel/release_drain_no_enospc.sh). */
+static unsigned int cetrafs_bg_release_drain_stall_ms;
+cetrafs_test_param(bg_release_drain_stall_ms, cetrafs_bg_release_drain_stall_ms, uint, 0644);
+MODULE_PARM_DESC(bg_release_drain_stall_ms, "test-only: pause one Block Group release while it is drained");
+
 int cetrafs_bg_release_empty(struct super_block *sb, u32 zg_id, u32 *out_released)
 {
     const cetrafs_superblock_t *raw_sb = cetrafs_sb_raw(sb);
@@ -3496,6 +3502,14 @@ int cetrafs_bg_release_empty(struct super_block *sb, u32 zg_id, u32 *out_release
          * other order leaves a window in which this node allocates into
          * a Block Group it is in the middle of giving away. */
         cetrafs_sb_drain_bg(sb, b);
+        {
+            unsigned int pause = xchg(&cetrafs_bg_release_drain_stall_ms, 0);
+
+            if (pause) {
+                pr_info("BG %u release: drained, pausing %u ms (test)\n", b, pause);
+                msleep(pause); /* test-only; see the parameter */
+            }
+        }
 
         /* Our own accrued delta has to reach the descriptor before its
          * free count can be believed -- otherwise "empty" is a count

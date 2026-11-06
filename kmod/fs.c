@@ -215,6 +215,11 @@ struct cetrafs_sb_info {
      * another thread is still recounting (audit 2026-11-06 M4). */
     struct mutex zg_claim_mutex;
     struct task_struct *zg_claim_owner;
+    /* Held for write by the surplus release while it has Block Groups
+     * drained out of the allocator's reach; an allocator that found no
+     * space waits on it once before saying ENOSPC
+     * (cetrafs_sb_release_wait()). */
+    struct rw_semaphore release_rwsem;
 
     /* Node-LOCAL serialization of cetrafs_cas_region()'s no-CAW
      * fallback. On a device with atomic COMPARE AND WRITE this is never
@@ -1343,6 +1348,7 @@ int cetrafs_fill_super(struct super_block *sb, struct fs_context *fc)
             sbi->peers = kcalloc(sbi->peer_count, sizeof(*sbi->peers), GFP_KERNEL);
         mutex_init(&sbi->alloc_mutex);
         mutex_init(&sbi->zg_claim_mutex);
+        init_rwsem(&sbi->release_rwsem);
         sbi->stamp_base = (s64) ktime_get_real_ns() - (s64) ktime_get_ns();
         atomic64_set(&sbi->stamp_last, 0);
         init_rwsem(&sbi->birth_rwsem);
@@ -3056,6 +3062,30 @@ void cetrafs_sb_zg_claim_unlock(struct super_block *sb, unsigned int nofs)
     WRITE_ONCE(sbi->zg_claim_owner, NULL);
     mutex_unlock(&sbi->zg_claim_mutex);
     memalloc_nofs_restore(nofs);
+}
+
+/*
+ * The surplus release takes space out of reach while it decides whether
+ * to give it back. That is a moment, not an answer: an allocator that
+ * finds nothing while it runs must wait for it and look again, not
+ * report ENOSPC for space that comes back an instant later.
+ */
+void cetrafs_sb_release_lock(struct super_block *sb)
+{
+    down_write(&((struct cetrafs_sb_info *) sb->s_fs_info)->release_rwsem);
+}
+
+void cetrafs_sb_release_unlock(struct super_block *sb)
+{
+    up_write(&((struct cetrafs_sb_info *) sb->s_fs_info)->release_rwsem);
+}
+
+void cetrafs_sb_release_wait(struct super_block *sb)
+{
+    struct cetrafs_sb_info *sbi = sb->s_fs_info;
+
+    down_read(&sbi->release_rwsem);
+    up_read(&sbi->release_rwsem);
 }
 
 /*

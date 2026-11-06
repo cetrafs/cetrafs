@@ -33,8 +33,8 @@
 # the recount, fsck reports the aggregate below its Block Groups.
 # NOT COVERED: the claim mutex's other half -- a heartbeat re-attach
 # caching the Zone Group mid-recount. A tick inside the stall also runs
-# the surplus release, whose drain is a separate fault (the heartbeat is
-# slowed here so neither runs).
+# the surplus release, whose drain has its own suite
+# (release_drain_no_enospc); the heartbeat is slowed here so neither runs.
 set -euo pipefail
 . "$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)/lib/harness.sh"
 require_root
