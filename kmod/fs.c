@@ -5181,7 +5181,12 @@ static int cetrafs_reconfigure(struct fs_context *fc)
         pr_warn("%s: remount asked for %s, which is fixed at mount time -- NOT applied; unmount and mount again\n",
                 sb->s_id, what);
 
-    if (!!(fc->sb_flags & SB_RDONLY) != !!sb_rdonly(sb)) {
+    /* Only a flag the reconfigure names can change: the VFS applies
+     * sb_flags under sb_flags_mask. fspick(2) builds the context with
+     * both zero, so a new-API reconfigure that never mentions ro or rw
+     * carries no SB_RDONLY -- and read, unmasked, as a flip to
+     * read-write on a read-only mount (audit 2026-11-06 L26). */
+    if ((fc->sb_flags_mask & SB_RDONLY) && !!(fc->sb_flags & SB_RDONLY) != !!sb_rdonly(sb)) {
         pr_err(
             "remount %s is not supported: cluster participation (journal replay, "
             "Zone Group ownership, the defrag janitor) is established at mount time. "
