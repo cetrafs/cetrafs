@@ -259,6 +259,12 @@ static int cetrafs_statfs(struct dentry *dentry, struct kstatfs *stat)
 
     if (!raw_sb)
         return -EINVAL;
+    /* A stopped mount refuses every access, df included: its counts are
+     * the frozen view of a node a peer may already have taken over
+     * (audit 2026-11-06 L17). */
+    ret = cetrafs_read_gate(sb);
+    if (ret)
+        return ret;
 
     /*
      * Free space comes from the ZONE GROUP aggregates, not a sweep of
@@ -306,6 +312,16 @@ static int cetrafs_statfs(struct dentry *dentry, struct kstatfs *stat)
     ret = cetrafs_sb_get_free_inodes(sb, &free_inodes);
     if (ret)
         return ret;
+    /* Both are caches, and a cache can be wrong: an aggregate a crashed
+     * owner left high, a node-local inode count driven below zero (a
+     * signed counter, read back as u64 it was 2^64 - n). Never report
+     * more free than exists (audit 2026-11-06 L17). */
+    if (free_blocks > total_blocks)
+        free_blocks = total_blocks;
+    if ((s64) free_inodes < 0)
+        free_inodes = 0;
+    if (free_inodes > le32_to_cpu(raw_sb->inodes_count))
+        free_inodes = le32_to_cpu(raw_sb->inodes_count);
 
     stat->f_type = CETRAFS_MAGIC;
     stat->f_bsize = sb->s_blocksize;
