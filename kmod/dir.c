@@ -250,7 +250,15 @@ static bool cetrafs_dirent_owner_slot_zero(struct super_block *sb, u64 ino)
     return zero;
 }
 
-static int cetrafs_dirent_block_live_owner(struct super_block *sb, u64 lba)
+/*
+ * 'mine' is an inode number the caller has just allocated and is about
+ * to build in this block (mkdir), or 0. A '.' naming it is that number's
+ * PREVIOUS life: the bit is ours, so whatever its slot still says -- a
+ * record left by an earlier mkfs, or by a free that never cleared it --
+ * is not a live owner. Refusing on it failed mkdir with EUCLEAN on a
+ * re-made volume whose new directory got the old one's number and block.
+ */
+static int cetrafs_dirent_block_live_owner(struct super_block *sb, u64 lba, u64 mine)
 {
     struct buffer_head *bh = cetrafs_bread_uncached(sb, lba);
     const cetrafs_dirent_t *d;
@@ -271,8 +279,8 @@ static int cetrafs_dirent_block_live_owner(struct super_block *sb, u64 lba)
     self = cetrafs_le64(d[0].inode);
     brelse(bh);
 
-    if (!self)
-        return 0; /* names no inode at all */
+    if (!self || self == mine)
+        return 0; /* names no inode at all, or the number we hold */
     cetrafs_invalidate_raw_inode(sb, self);
     /* A record that cannot be read decides nothing: answering "not
      * owned" here zeroed a live directory's block whenever its owner's
@@ -341,7 +349,7 @@ int cetrafs_dirent_block_init(struct super_block *sb, u64 lba, bool *keep)
     int ret;
 
     *keep = false;
-    ret = cetrafs_dirent_block_live_owner(sb, lba);
+    ret = cetrafs_dirent_block_live_owner(sb, lba, 0);
     if (ret) {
         *keep = true;
         return ret;
@@ -1971,7 +1979,7 @@ static struct dentry *cetrafs_mkdir_locked(struct mnt_idmap *idmap,
      * handed out a block a live directory still lists, or one whose
      * owner cannot be read, it stays allocated and untouched (audit
      * 2026-11-06 L1 -- mkdir overwrote it unchecked). */
-    ret = cetrafs_dirent_block_live_owner(sb, lba);
+    ret = cetrafs_dirent_block_live_owner(sb, lba, ino);
     if (ret) {
         cetrafs_free_inode(sb, ino);
         return ERR_PTR(ret);
