@@ -2213,6 +2213,7 @@ struct cetrafs_ns_delta {
     bool set_nlink_zero;/* rmdir/rename-over-dir: unconditional 0 */
     u64 ctime;          /* stamped when nonzero */
     u32 out_nlink;      /* the value the winning swap landed */
+    u64 gen;            /* nonzero: only on this generation (cetrafs_rename_ns_delta()) */
 };
 
 static void cetrafs_ns_apply_delta(cetrafs_inode_t *rec, void *arg)
@@ -2663,6 +2664,8 @@ static int cetrafs_rename_ns_delta(struct super_block *sb, u64 ino, struct cetra
         if (!ret && READ_ONCE(cetrafs_rename_nlink_fail)) {
             WRITE_ONCE(cetrafs_rename_nlink_fail, cetrafs_rename_nlink_fail - 1);
             ret = -EIO;
+        } else if (!ret && d->gen && cetrafs_le64(raw.generation) != d->gen) {
+            ret = -ESTALE; /* the number is another file's now: not ours to move */
         } else if (!ret) {
             ret = cetrafs_inode_ns_cas(sb, ino, cetrafs_le64(raw.generation), &raw, cetrafs_ns_apply_delta, d);
         }
@@ -2670,10 +2673,26 @@ static int cetrafs_rename_ns_delta(struct super_block *sb, u64 ino, struct cetra
             break;
     }
     if (ret && d->nlink_delta)
-        pr_err("rename: %s ino=%llu kept a link count one too high (%d) -- it will not be freed when its last name "
+        pr_err("%s ino=%llu kept a link count one too high (%d) -- it will not be freed when its last name "
                "goes; fsck -r corrects the count\n",
                what, (unsigned long long) ino, ret);
     return ret;
+}
+
+/*
+ * Give back the +1 a link or rename took for a name that never landed.
+ * One swap whose result nobody read left the count one high on any
+ * refusal, silently: the file then never freed (audit 2026-11-06 L4).
+ * Same retry and report as the rename's own -1, on the generation the
+ * +1 was taken on.
+ */
+static void cetrafs_nlink_giveback(struct super_block *sb, struct inode *inode, u64 gen, time64_t now,
+                                   const char *what)
+{
+    struct cetrafs_ns_delta d = {.ctime = (u64) now, .nlink_delta = -1, .gen = gen};
+
+    if (!cetrafs_rename_ns_delta(sb, inode->i_ino, &d, what))
+        set_nlink(inode, d.out_nlink);
 }
 
 static int cetrafs_rename_dotdot(struct inode *dir, u64 parent_ino)
@@ -3016,7 +3035,7 @@ static int cetrafs_rename_locked(struct mnt_idmap *idmap,
         } else {
             struct cetrafs_ns_delta d = {.nlink_delta = -1, .ctime = (u64) now};
 
-            ret = cetrafs_rename_ns_delta(new_dir->i_sb, removed_ino, &d, "replaced file");
+            ret = cetrafs_rename_ns_delta(new_dir->i_sb, removed_ino, &d, "rename: replaced file");
             /* In-core absolute from the value the swap landed, not a
              * relative drop off a possibly stale cached count --
              * evict_inode() gates the free on the replaced target's
@@ -3063,7 +3082,7 @@ static int cetrafs_rename_locked(struct mnt_idmap *idmap,
          * leak, never a free -- and said so (cetrafs_rename_ns_delta()). */
         struct cetrafs_ns_delta d = {.ctime = (u64) now, .nlink_delta = counted ? -1 : 0};
 
-        if (!cetrafs_rename_ns_delta(old_dir->i_sb, old_ino, &d, "moved file") && counted)
+        if (!cetrafs_rename_ns_delta(old_dir->i_sb, old_ino, &d, "rename: moved file") && counted)
             set_nlink(old_inode, d.out_nlink);
     }
     inode_set_ctime(old_inode, now, 0);
@@ -3092,7 +3111,7 @@ out_unremove:
 out_uncount:
     /* The new name never landed: give the count back, and the '..'. */
     if (counted)
-        cetrafs_nlink_step(old_dir->i_sb, old_inode, old_gen, NULL, -1, now);
+        cetrafs_nlink_giveback(old_dir->i_sb, old_inode, old_gen, now, "rename: un-moved file");
     if (dotdot_moved) {
         int dret = cetrafs_dir_update_dotdot(old_inode, old_dir->i_ino);
 
@@ -3307,6 +3326,11 @@ static int cetrafs_rename(struct mnt_idmap *idmap,
  * peer's links can land (tests/kernel/nlink_saturates.sh). */
 static unsigned int cetrafs_link_step_stall_ms;
 cetrafs_test_param(link_step_stall_ms, cetrafs_link_step_stall_ms, uint, 0644);
+/* TEST ONLY: the next link's name write fails, after its +1 landed
+ * (tests/kernel/nlink_giveback_retry.sh). */
+static bool cetrafs_link_name_fail_once;
+cetrafs_test_param(link_name_fail_once, cetrafs_link_name_fail_once, bool, 0644);
+MODULE_PARM_DESC(link_name_fail_once, "TEST ONLY: the next link's name write fails with -EIO");
 MODULE_PARM_DESC(link_step_stall_ms, "TEST ONLY: pause a link between its record read and its nlink step");
 
 static int cetrafs_link_locked(struct dentry *old_dentry, struct inode *dir, struct dentry *dentry)
@@ -3413,11 +3437,16 @@ static int cetrafs_link_locked(struct dentry *old_dentry, struct inode *dir, str
     if (cetrafs_ns_step_gap_ms)
         msleep(cetrafs_ns_step_gap_ms); /* test-only, see the knob */
 
-    ret = cetrafs_dir_add_entry(dir, &dentry->d_name, inode->i_ino, cetrafs_dirent_type(inode));
+    if (cetrafs_link_name_fail_once) {
+        cetrafs_link_name_fail_once = false;
+        ret = -EIO; /* test-only, see the knob */
+    } else {
+        ret = cetrafs_dir_add_entry(dir, &dentry->d_name, inode->i_ino, cetrafs_dirent_type(inode));
+    }
     if (ret) {
         /* No name was added: give the count back. If even that fails
          * the count stays one high -- the safe direction. */
-        cetrafs_nlink_step(dir->i_sb, inode, cetrafs_le64(raw.generation), NULL, -1, now);
+        cetrafs_nlink_giveback(dir->i_sb, inode, cetrafs_le64(raw.generation), now, "link: un-linked file");
         return ret;
     }
     inode_set_ctime(inode, now, 0);
