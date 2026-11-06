@@ -51,12 +51,14 @@ int main(int argc, char **argv)
         case EOPNOTSUPP:
             /* The kernel returns this both for a sparse file (interior
              * holes, which cannot be moved block-for-block) and for a
-             * mount with defragmentation turned off -- it does not tell
-             * them apart, so neither do we. */
+             * mount with defragmentation turned off or impossible (a
+             * nofilelock mount has no file lock to pin) -- it does not
+             * tell them apart, so neither do we; the controls file does
+             * (defrag, defrag_available). */
             fprintf(stderr,
                     "%s: defragmentation not supported here -- the file is sparse (has interior\n"
-                    "       holes), or defrag is disabled on this mount "
-                    "(/proc/fs/cetrafs/<dev>/controls).\n",
+                    "       holes), or defrag is disabled on this mount, or the volume is mounted\n"
+                    "       nofilelock (/proc/fs/cetrafs/<dev>/controls: defrag, defrag_available).\n",
                     argv[1]);
             break;
         case EBADF:

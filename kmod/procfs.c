@@ -471,6 +471,8 @@ static int cetrafs_proc_cluster_show(struct seq_file *m, void *v)
  *                this mount pins that lock for an optimisation.
  *   auto_defrag  off stops the background janitor alone; a deliberate
  *                defrag.cetra run still works.
+ *   defrag_available  read-only: "no" on a nofilelock mount, where
+ *                every defrag is refused whatever the switches say.
  *
  * Per MOUNT, deliberately: the module params are module-wide, and one
  * node may own the images on this volume while another only reads them.
@@ -483,6 +485,12 @@ static int cetrafs_proc_controls_show(struct seq_file *m, void *v)
 
     seq_printf(m, "defrag: %s\n", cetrafs_sb_defrag_enabled(sb) ? "on" : "off");
     seq_printf(m, "auto_defrag: %s\n", cetrafs_sb_auto_defrag_enabled(sb) ? "on" : "off");
+    /* Read-only, beside the switch: under nofilelock there is no file
+     * lock to pin and every defrag is refused (cetrafs_lock_defrag_begin()),
+     * whatever the switch says. "defrag: on" alone told an operator it
+     * would run (audit 2026-11-06 L26). */
+    seq_printf(m, "defrag_available: %s\n",
+               cetrafs_sb_file_lock_enabled(sb) ? "yes" : "no (nofilelock: no file lock to pin)");
     seq_printf(m, "hb_interval_secs: %u\n", cetrafs_sb_hb_interval_secs(sb));
     seq_printf(m, "stale_secs: %u\n", cetrafs_sb_stale_secs(sb));
     seq_printf(m, "shutdown: %s\n", cetrafs_sb_is_fenced(sb) ? "yes" : "no");
