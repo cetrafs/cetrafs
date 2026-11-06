@@ -570,6 +570,59 @@ static int fsck_alloc_inode(int fd, const cetrafs_superblock_t *sb, uint8_t *ibm
 }
 
 /* Claim a free data block from the first Block Group that has one. */
+/* Where the descriptors live, for fsck_alloc_block()'s count debit: set
+ * once the Block Group table has been walked, NULL before (nothing
+ * allocates that early). */
+static const cetrafs_superblock_t *fsck_g_sb;
+static const uint64_t *fsck_g_bg_desc_lba;
+
+/* Debit one block from BG b's cached free count and its owner's (or the
+ * pool's) aggregate, restamped the way the leak repair credits them. The
+ * count checks ran earlier in the pass, so a block taken now without this
+ * left both one high on disk and the next run reporting it (audit
+ * 2026-11-06 L10, its sibling). */
+static void fsck_debit_bg_counts(int fd, uint32_t b)
+{
+    const cetrafs_superblock_t *sb = fsck_g_sb;
+    uint8_t blk[CETRAFS_BLOCK_SIZE] = {0};
+    cetrafs_block_group_t bgd;
+    cetrafs_zone_group_t zg;
+    uint32_t z;
+    int pool;
+
+    if (!sb || !fsck_g_bg_desc_lba)
+        return;
+    pread_all(fd, blk, sizeof(blk), (off_t) fsck_g_bg_desc_lba[b] * CETRAFS_BLOCK_SIZE);
+    memcpy(&bgd, blk, sizeof(bgd));
+    if (cetrafs_le64(bgd.free_data_blocks))
+        bgd.free_data_blocks = cetrafs_cpu_to_le64(cetrafs_le64(bgd.free_data_blocks) - 1);
+    bgd.checksum = 0;
+    bgd.checksum = cetrafs_cpu_to_le64(
+        crc32c_struct(&bgd, sizeof(bgd), offsetof(cetrafs_block_group_t, checksum), sizeof(bgd.checksum)));
+    memcpy(blk, &bgd, sizeof(bgd));
+    pwrite_all(fd, blk, sizeof(blk), (off_t) fsck_g_bg_desc_lba[b] * CETRAFS_BLOCK_SIZE);
+
+    z = cetrafs_le16(bgd.owner_zg);
+    pool = z == CETRAFS_BG_OWNER_FREE;
+    if (pool)
+        z = b % cetrafs_le32(sb->zone_group_count);
+    memset(blk, 0, sizeof(blk));
+    pread_all(fd, blk, sizeof(blk), (off_t) (cetrafs_le64(sb->zg_table_start) + z) * CETRAFS_BLOCK_SIZE);
+    memcpy(&zg, blk, sizeof(zg));
+    if (pool && cetrafs_le64(zg.pool_free_blocks))
+        zg.pool_free_blocks = cetrafs_cpu_to_le64(cetrafs_le64(zg.pool_free_blocks) - 1);
+    else if (!pool && cetrafs_le64(zg.free_data_blocks))
+        zg.free_data_blocks = cetrafs_cpu_to_le64(cetrafs_le64(zg.free_data_blocks) - 1);
+    zg.hot_checksum = 0;
+    zg.hot_checksum = cetrafs_cpu_to_le64((uint64_t) crc32c_struct((const uint8_t *) &zg + CETRAFS_ZG_HOT_OFF,
+                                                                   CETRAFS_ZG_HOT_LEN,
+                                                                   offsetof(cetrafs_zone_group_t, hot_checksum) -
+                                                                       CETRAFS_ZG_HOT_OFF,
+                                                                   sizeof(zg.hot_checksum)));
+    memcpy(blk, &zg, sizeof(zg));
+    pwrite_all(fd, blk, sizeof(blk), (off_t) (cetrafs_le64(sb->zg_table_start) + z) * CETRAFS_BLOCK_SIZE);
+}
+
 static int fsck_alloc_block(int fd,
                             uint32_t bg_count,
                             const uint64_t *bg_data_start,
@@ -596,6 +649,7 @@ static int fsck_alloc_block(int fd,
             bmap[i / 8] |= (uint8_t) (1u << (i % 8));
             pwrite_all(fd, bmap, (size_t) bmap_blocks * CETRAFS_BLOCK_SIZE,
                        (off_t) bg_bmap_lba[b] * CETRAFS_BLOCK_SIZE);
+            fsck_debit_bg_counts(fd, b); /* the bit first: stopped between, a count reads one high -- the next run fixes it */
             *out_lba = bg_data_start[b] + i;
             free(bmap);
             return 0;
@@ -679,6 +733,7 @@ struct fsck_lf {
     uint64_t ino;      /* 0 until resolved/created */
     uint64_t root_ino; /* where it lives */
     int tried;         /* resolution already attempted and failed */
+    int created;       /* this run made it: root gained a subdirectory */
 };
 
 /* Add one entry to a depth-0 directory, growing it by a block if every
@@ -964,6 +1019,7 @@ static uint64_t fsck_lost_found(int fd,
     }
     printf("  created /lost+found (inode %" PRIu64 ")\n", ino);
     lf->ino = ino;
+    lf->created = 1;
     return ino;
 }
 
@@ -1709,6 +1765,8 @@ int main(int argc, char **argv)
      * short chain is corruption and is reported as such.
      */
     uint64_t *bg_desc_lba = (uint64_t *) xcalloc(cetrafs_le32(sb.block_group_count), sizeof(uint64_t));
+    fsck_g_sb = &sb;
+    fsck_g_bg_desc_lba = bg_desc_lba;
     /* Each appended segment's [header, last descriptor], checked against
      * the Block Groups once their descriptors are read (as fs.c does). */
     uint64_t *seg_lo = (uint64_t *) xcalloc(cetrafs_le32(sb.block_group_count) + 1, sizeof(uint64_t));
@@ -2577,7 +2635,7 @@ int main(int argc, char **argv)
         int ibmap_dirty = 0;
         uint64_t orphans_freed = 0;
         uint64_t orphans_linked = 0;
-        struct fsck_lf lf = {0, cetrafs_le64(sb.root_ino), 0};
+        struct fsck_lf lf = {0, cetrafs_le64(sb.root_ino), 0, 0};
         uint64_t problems = 0, inodes_seen = 0, extents_seen = 0, blocks_referenced = 0;
 
         pread_all(fd, ibmap, (size_t) cetrafs_le64(sb.inode_bmap_blocks) * CETRAFS_BLOCK_SIZE,
@@ -3305,6 +3363,12 @@ int main(int argc, char **argv)
          * add_entry/remove_entry maintains it and several of this
          * review's findings touched that bookkeeping. */
         uint32_t *subdirs = (uint32_t *) xcalloc(cetrafs_le32(sb.inodes_count) + 1, sizeof(uint32_t));
+        /* Subdirectories this run linked in after the tally was taken
+         * (lost+found into root, an orphan directory into lost+found):
+         * on disk the parent's nlink already counts each, and the
+         * checks below must too, or a repair of a count that was wrong
+         * anyway writes one that leaves them out (audit 2026-11-06 L10). */
+        uint32_t *dir_gain = (uint32_t *) xcalloc(cetrafs_le32(sb.inodes_count) + 1, sizeof(uint32_t));
         /* Which directory names each DIRECTORY, for the reachability
          * walk below. One slot is enough because this format cannot
          * represent a directory with two parents: '..' is a single
@@ -3756,8 +3820,11 @@ int main(int argc, char **argv)
                          * disagrees with itself and the next run says so.
                          * fsck_dir_link() has already bumped
                          * lost+found's nlink for it. */
-                        if (is_dir[ino])
+                        if (is_dir[ino]) {
                             fsck_set_dotdot(fd, &sb, ino, lfino);
+                            if (lfino <= cetrafs_le32(sb.inodes_count))
+                                dir_gain[lfino]++;
+                        }
                         orphans_linked++;
                         repairs_made++;
                     }
@@ -3796,16 +3863,19 @@ int main(int argc, char **argv)
 
                 /* 2 for itself and its own '.', plus one per
                  * subdirectory (each child's '..' names it). */
-                if (nlinks[ino] != subdirs[ino] + 2) {
+                if (nlinks[ino] + dir_gain[ino] != subdirs[ino] + dir_gain[ino] + 2) {
+                    uint32_t want_n = subdirs[ino] + dir_gain[ino] + 2;
+
                     if (repair_mode && !repair_blocked) {
-                        repair_set_nlink(fd, &sb, ino, subdirs[ino] + 2);
+                        repair_set_nlink(fd, &sb, ino, want_n);
                         repairs_made++;
                     }
                     fprintf(stderr,
                             "ERR: directory inode %" PRIu64
                             " has nlink=%u but contains %u subdirector%s "
                             "(expected %u)\n",
-                            ino, nlinks[ino], subdirs[ino], subdirs[ino] == 1 ? "y" : "ies", subdirs[ino] + 2);
+                            ino, nlinks[ino] + dir_gain[ino], subdirs[ino] + dir_gain[ino],
+                            subdirs[ino] + dir_gain[ino] == 1 ? "y" : "ies", want_n);
                     problems++;
                 }
 
@@ -3831,14 +3901,18 @@ int main(int argc, char **argv)
          * check would fire on every healthy volume) -- but its link
          * count is as checkable as any other directory's, and it is the
          * one directory every mkdir and rmdir at the top level touches. */
-        if (walked[CETRAFS_ROOT_INO] && nlinks[CETRAFS_ROOT_INO] != subdirs[CETRAFS_ROOT_INO] + 2) {
+        if (lf.created)
+            dir_gain[CETRAFS_ROOT_INO]++; /* lost+found, made above: its root nlink is already on disk */
+        if (walked[CETRAFS_ROOT_INO] &&
+            nlinks[CETRAFS_ROOT_INO] + dir_gain[CETRAFS_ROOT_INO] != subdirs[CETRAFS_ROOT_INO] + dir_gain[CETRAFS_ROOT_INO] + 2) {
+            uint32_t rsub = subdirs[CETRAFS_ROOT_INO] + dir_gain[CETRAFS_ROOT_INO];
+
             if (repair_mode && !repair_blocked) {
-                repair_set_nlink(fd, &sb, CETRAFS_ROOT_INO, subdirs[CETRAFS_ROOT_INO] + 2);
+                repair_set_nlink(fd, &sb, CETRAFS_ROOT_INO, rsub + 2);
                 repairs_made++;
             }
             fprintf(stderr, "ERR: root directory has nlink=%u but contains %u subdirector%s (expected %u)\n",
-                    nlinks[CETRAFS_ROOT_INO], subdirs[CETRAFS_ROOT_INO], subdirs[CETRAFS_ROOT_INO] == 1 ? "y" : "ies",
-                    subdirs[CETRAFS_ROOT_INO] + 2);
+                    nlinks[CETRAFS_ROOT_INO] + dir_gain[CETRAFS_ROOT_INO], rsub, rsub == 1 ? "y" : "ies", rsub + 2);
             problems++;
         }
 
@@ -4093,6 +4167,7 @@ int main(int argc, char **argv)
         free(parent);
         free(walked);
         free(subdirs);
+        free(dir_gain);
         free(dir_parent);
         free(dsize);
         free(dslots);
