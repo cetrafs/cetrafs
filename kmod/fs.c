@@ -2515,6 +2515,7 @@ void cetrafs_free_sb_info(struct super_block *sb)
     struct cetrafs_sb_info *sbi = sb->s_fs_info;
     int flush_err = 0, r;
     u32 unreleased;
+    bool stopped;
 
     if (!sbi)
         return;
@@ -2556,6 +2557,31 @@ void cetrafs_free_sb_info(struct super_block *sb)
     sbi->scrub = NULL;
 
     cetrafs_heartbeat_stop(sbi->hb);
+    /*
+     * A stopped mount -- fenced, its lease lost, a fatal error -- writes
+     * NOTHING on the way out (docs/internal/ERRORS.md). The journal park
+     * below dirtied the header block, its own sync was refused under the
+     * fence and left it dirty, and the two sync_blockdev()s then wrote it
+     * anyway: a blind whole-block write of this node's journal header as
+     * CLEAN, after a peer may have claimed the area and be replaying it.
+     * Anything else dirtied after the stop sweep went out the same way
+     * (audit 2026-11-06 M1; tests/kernel/stopped_unmount_writes_nothing.sh).
+     * Drop it instead, as the stop sweep does.
+     */
+    stopped = cetrafs_sb_is_fenced(sb);
+    if (stopped) {
+        cancel_work_sync(&sbi->stop_work); /* its sweep, finished; ours covers what came after */
+        if (sb->s_bdev) {
+            unsigned long n = cetrafs_drop_dirty_metadata(sb);
+
+            if (n)
+                pr_err("%s: unmount of a stopped mount: discarded %lu dirty metadata buffer(s) without "
+                       "writing them\n",
+                       sb->s_id, n);
+        }
+        flush_err = -EIO;
+        goto departed;
+    }
     /* Park the journal flag and push the accrued free-space counters
      * out BEFORE announcing the departure below. See the sync there. */
     cetrafs_journal_shutdown(sb);
@@ -2591,6 +2617,7 @@ void cetrafs_free_sb_info(struct super_block *sb)
         if (r && !flush_err)
             flush_err = r;
     }
+departed:
     /* Signal this node's deliberate departure on the way out -- clean
      * unmount (or a later-failing mount attempt after registration
      * already succeeded) used to leave this node's row looking exactly

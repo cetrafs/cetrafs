@@ -39,15 +39,25 @@ MODULE_PARM_DESC(evict_check_fail, "TEST ONLY: fail the next N evictions' foreig
 
 static void cetrafs_put_super(struct super_block *sb)
 {
+    /* Asked before sb_info goes: a stopped mount writes nothing, not
+     * even what is still dirty in the block device's cache
+     * (cetrafs_free_sb_info(); audit 2026-11-06 M1). */
+    bool stopped = cetrafs_sb_is_fenced(sb);
+
     fs_debug(info, "cetrafs_put_super");
     /* cetrafs_free_sb_info() stops the heartbeat tick synchronously
      * before freeing anything -- deliberately done
      * *before* sync/invalidate below, so no tick can race with tearing
      * down the backing device. */
     cetrafs_free_sb_info(sb);
-    /* Flush and invalidate backing device */
+    /* Flush and invalidate backing device -- or, stopped, drop what is
+     * dirty: invalidate_bdev() keeps dirty pages, and writeback would
+     * write them after the unmount. */
     if (sb->s_bdev) {
-        sync_blockdev(sb->s_bdev);
+        if (stopped)
+            cetrafs_drop_dirty_metadata(sb);
+        else
+            sync_blockdev(sb->s_bdev);
         invalidate_bdev(sb->s_bdev);
     }
 }
