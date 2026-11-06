@@ -870,6 +870,7 @@ unsigned int cetrafs_cas_region_size(struct super_block *sb)
  * region 0 (the hot sector); bitmaps use every region of their blocks,
  * which is why this is indexed rather than fixed at the start.
  */
+
 /*
  * The no-CAW half of cetrafs_cas_region_seeded(), split out so its
  * several exit paths cannot forget to drop the serialising mutex its
@@ -890,7 +891,7 @@ static int cetrafs_cas_nocaw(struct super_block *sb,
 
     if (!bh)
         return -EIO;
-    memcpy(old, bh->b_data + off, region);
+    cetrafs_bh_copy_stable_at(bh, off, old, region);
     memcpy(new, old, region);
     brelse(bh);
 
@@ -1111,7 +1112,7 @@ static int cetrafs_cas_region_seeded_impl(struct super_block *sb,
                 ret = -EIO;
                 goto out;
             }
-            memcpy(old, bh->b_data + off, region);
+                    cetrafs_bh_copy_stable_at(bh, off, old, region);
             brelse(bh);
         }
 
@@ -1247,7 +1248,7 @@ static int cetrafs_cas_region_seeded_impl(struct super_block *sb,
                 ret = -EIO;
                 goto out;
             }
-            if (!memcmp(vbh->b_data + off, new, region)) {
+            if (!cetrafs_bh_memcmp_stable_at(vbh, off, new, region)) {
                 pr_warn("CAS lba=%llu: command timed out but the swap IS on the device -- taking it as done\n",
                         (unsigned long long) fs_lba);
                 brelse(vbh);
@@ -1258,7 +1259,7 @@ static int cetrafs_cas_region_seeded_impl(struct super_block *sb,
                 ret = 0;
                 goto out;
             }
-            if (!memcmp(vbh->b_data + off, old, region)) {
+            if (!cetrafs_bh_memcmp_stable_at(vbh, off, old, region)) {
                 /* Not on the device NOW. A timed-out command can still be
                  * queued on the array and land behind our back, after
                  * this re-read; keep its image, so that if the retry
@@ -1301,7 +1302,7 @@ static int cetrafs_cas_region_seeded_impl(struct super_block *sb,
              * guess, as the timeout path above does. */
             struct buffer_head *vbh = cetrafs_cas_verify_read(sb, fs_lba);
 
-            if (vbh && !memcmp(vbh->b_data + off, unknown, region)) {
+            if (vbh && !cetrafs_bh_memcmp_stable_at(vbh, off, unknown, region)) {
                 pr_warn("CAS lba=%llu: the timed-out command landed late -- taking it as done\n",
                         (unsigned long long) fs_lba);
                 brelse(vbh);
@@ -1575,7 +1576,7 @@ void cetrafs_cas_selftest(struct super_block *sb, u32 my_node_id)
                 if (bh) {
                     u8 want2 = 0xC3;
 
-                    memcpy(seed, bh->b_data, region);
+                    cetrafs_bh_copy_stable_at(bh, 0, seed, region);
                     brelse(bh);
                     ret = cetrafs_cas_record_seeded(sb, lba, seed, region, cetrafs_cas_selftest_set, &want2);
                     if (ret) {

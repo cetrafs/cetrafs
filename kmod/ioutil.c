@@ -405,9 +405,29 @@ int cetrafs_sync_buffer_keep(struct super_block *sb, struct buffer_head *bh)
  */
 void cetrafs_bh_copy_stable(struct buffer_head *bh, void *out, size_t len)
 {
+    cetrafs_bh_copy_stable_at(bh, 0, out, len);
+}
+
+/* The same, from an offset into the block: the CAS layer copies and
+ * compares one record's region, and cetrafs_cache_region_after_cas()
+ * patches exactly those bytes under the buffer lock -- a local CAS on the
+ * same record could otherwise tear another's compare image into a false
+ * checksum failure, recorded as damage (audit 2026-11-06 M13). */
+void cetrafs_bh_copy_stable_at(struct buffer_head *bh, unsigned int off, void *out, size_t len)
+{
     lock_buffer(bh);
-    memcpy(out, bh->b_data, len);
+    memcpy(out, bh->b_data + off, len);
     unlock_buffer(bh);
+}
+
+int cetrafs_bh_memcmp_stable_at(struct buffer_head *bh, unsigned int off, const void *buf, size_t len)
+{
+    int r;
+
+    lock_buffer(bh);
+    r = memcmp(bh->b_data + off, buf, len);
+    unlock_buffer(bh);
+    return r;
 }
 
 /*

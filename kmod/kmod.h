@@ -558,6 +558,8 @@ int cetrafs_sync_buffer(struct super_block *sb, struct buffer_head *bh);
 int cetrafs_sync_buffer_keep(struct super_block *sb, struct buffer_head *bh);
 bool cetrafs_bh_test_stable(struct buffer_head *bh, bool (*test)(const void *data, void *arg), void *arg);
 void cetrafs_bh_copy_stable(struct buffer_head *bh, void *out, size_t len);
+void cetrafs_bh_copy_stable_at(struct buffer_head *bh, unsigned int off, void *out, size_t len);
+int cetrafs_bh_memcmp_stable_at(struct buffer_head *bh, unsigned int off, const void *buf, size_t len);
 void cetrafs_bh_abort_update(struct buffer_head *bh);
 /* sb_bread() that tolerates a concurrent invalidation of the same block
  * -- use for anything cetrafs_invalidate_block() can target. */

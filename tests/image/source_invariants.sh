@@ -1217,6 +1217,30 @@ printf '    inode->i_mode = cetrafs_le32(bufs[0].mode);\n' >"$SAMPLE"
     pass "adopted mode: control -- a direct assignment is caught" ||
     fail "adopted mode: control -- a direct assignment is not caught"
 
+# Class 27 (same-node torn reads), the CAS layer. A CAS copies its
+# compare image out of a buffer that cetrafs_cache_region_after_cas()
+# patches under the buffer lock after another local CAS on the same
+# record; an unlocked memcpy/memcmp can see half a patch, which a
+# checksummed mutator refuses as damage (audit 2026-11-06 M13). Every
+# read of b_data in caw.c goes through cetrafs_bh_copy_stable_at() /
+# cetrafs_bh_memcmp_stable_at(); the writes under the update protocol and
+# the selftest's quiescent read-back are listed.
+log "checking the CAS layer reads buffer bytes only under the buffer lock (class 27)"
+CAW_OK='memcpy(bh->b_data + off, new, region);:a WRITE, inside cetrafs_bh_begin_update()/end_update()
+memcpy(&final, bh->b_data + CETRAFS_CAS_SELFTEST_OFF, sizeof(final));:selftest read-back after every worker has finished'
+caw_raw() { grep -hE '(memcpy|memcmp)\([^;]*b_data' "$@" | grep -vE '^[[:space:]]*(\*|/\*)' | sed -E 's/^[[:space:]]+//'; }
+CR="$(caw_raw "$K/caw.c")"
+UNC="$(while IFS= read -r l; do [ -n "$l" ] && ! grep -qF "$l:" <<<"$CAW_OK" && echo "$l"; done <<<"$CR" || true)"
+[ -z "$UNC" ] && pass "class 27: caw.c reads buffer bytes only through the locked helpers" ||
+    fail "class 27: unlocked b_data read in caw.c (use cetrafs_bh_copy_stable_at/_memcmp_stable_at): $UNC"
+grep -q 'lock_buffer' <<<"$(sed -n '/^void cetrafs_bh_copy_stable_at/,/^}/p' "$K/ioutil.c")" &&
+    grep -q 'lock_buffer' <<<"$(sed -n '/^int cetrafs_bh_memcmp_stable_at/,/^}/p' "$K/ioutil.c")" &&
+    pass "class 27: both helpers take the buffer lock" || fail "class 27: a stable-read helper no longer takes the buffer lock"
+SAMPLE="$(ct_tmp caw-sample).c"
+printf '            memcpy(old, bh->b_data + off, region);\n' >"$SAMPLE"
+[ "$(caw_raw "$SAMPLE")" = "memcpy(old, bh->b_data + off, region);" ] &&
+    pass "class 27: control -- a planted unlocked copy is found" || fail "class 27: control -- a planted unlocked copy is not found"
+
 # Class 44 ("alive" as the unsafe default). A liveness predicate's first
 # look at a row answers "alive" -- right for a reclaim, which then keeps
 # its hands off, and wrong for a caller that REFUSES or INHERITS on it
