@@ -5531,10 +5531,27 @@ static int cetrafs_do_allocate(struct inode *inode, loff_t offset, loff_t len, b
         added++;
     }
 
-    /* Nothing allocated and nothing to grow: nothing to publish. */
-    if (!added && (keep_size || end <= i_size_read(inode))) {
+    /* Nothing allocated and nothing to grow -- or nothing allocated and
+     * the loop stopped on an error: nothing to publish. A plain
+     * fallocate that failed before its first block published the new
+     * size anyway and then returned the error (audit 2026-11-06 M14). */
+    if (!added && (keep_size || end <= i_size_read(inode) || loop_ret)) {
         ret = loop_ret;
         goto out_free;
+    }
+    /* Stopped part-way: grow the size only over what was allocated. */
+    if (loop_ret) {
+        loff_t got = 0;
+        u32 k;
+
+        for (k = 0; k < add_n; k++) {
+            loff_t e = ((loff_t) cetrafs_le32(add[k].ee_block) + cetrafs_extent_len(add[k].ee_len)) * CETRAFS_BLOCK_SIZE;
+
+            if (e > got)
+                got = e;
+        }
+        if (got < end)
+            end = got;
     }
 
     if (added) {
