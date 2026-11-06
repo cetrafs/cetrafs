@@ -49,5 +49,6 @@ fi
 "$BG_POKE" "$IMG" 0 --geom=length_blocks "$L0" >/dev/null
 ct_mount "$DEV" "$MNT" && pass "control: the same image with the length restored mounts" ||
     fail "control: the restored image does not mount -- the refusal above proves nothing"
+require_cetrafs_mount "$MNT"
 ct_umount "$MNT"
 ct_exit

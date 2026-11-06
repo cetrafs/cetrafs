@@ -23,6 +23,12 @@
 #   4. a number taken by a create stopped before its record write: the
 #      bit is set over an all-zero record. WARN, and -r frees it.
 #
+# The kernel no longer leaves such a record behind -- a freed number's
+# record names nothing since evict clears it first -- but a volume
+# written before that, or a crash in the middle of it, still can. So 1
+# and 2 plant it: the record as it was while the file lived, put back
+# over the dead number with nlink 0.
+#
 # DISCRIMINATION: 1 and 2 fail against the previous fsck (ERR, exit 1).
 # 3 fails if the deleted-record walk stops deferring leak repair: the
 # first -r then clears the live file's blocks.
@@ -65,6 +71,17 @@ failed_create() {
     fi
     ct_param_set birth_check_fail 0
 }
+SBPOKE="$(ct_helper sb_poke)"
+rec_at() { # <ino>: the byte offset of its record (one per block)
+    echo $((($("$SBPOKE" "$DEV" | sed -n 's/^inode_table_start=//p') + $1 - 1) * 4096))
+}
+save_rec() { dd if="$IMG" bs=1 skip="$(rec_at "$1")" count=4096 status=none >"$2"; }
+# The record of the file's last life, back over its dead number, nlink 0.
+plant_dead_rec() { # <ino> <saved>
+    dd if="$2" of="$IMG" bs=1 seek="$(rec_at "$1")" count=4096 conv=notrunc,fsync status=none
+    "$IPOKE" "$IMG" nlink "$1" 0 >/dev/null
+    blockdev --flushbufs "$DEV"
+}
 check() { # <label>: fsck must exit 0 with no ERR; prints its output
     local rc=0 out
     out="$("$FSCK" "$DEV" 2>&1)" || rc=$?
@@ -89,12 +106,18 @@ fresh
 dd if=/dev/urandom of="$MNT/old" bs=4096 count=16 status=none
 sync
 N="$(stat -c %i "$MNT/old")"
+ct_umount "$MNT"
+REC="$(ct_tmp deadrec-1)"
+save_rec "$N" "$REC"
+ct_mount "$DEV" "$MNT"
+require_cetrafs_mount "$MNT"
 rm "$MNT/old"
 sync
 failed_create
 dd if=/dev/urandom of="$MNT/taker" bs=4096 count=64 status=none
 SUM="$(sha256sum <"$MNT/taker")"
 ct_umount "$MNT"
+plant_dead_rec "$N" "$REC"
 check "1"
 grep -q "inode $N (deleted, not yet reclaimed) still names .* another file now holds" <<<"$FSCK_OUT" &&
     pass "1: set up -- ino $N's stale extents overlap a live file, and fsck says so" ||
@@ -112,10 +135,16 @@ frag "$MNT/old"
 N="$(stat -c %i "$MNT/old")"
 [ "$("$IPOKE" "$IMG" extents "$N" | grep -o 'depth=[01]')" = "depth=1" ] ||
     { fail "2: setup: the file did not spill to depth 1"; ct_exit; }
+ct_umount "$MNT"
+REC="$(ct_tmp deadrec-2)"
+save_rec "$N" "$REC"
+ct_mount "$DEV" "$MNT"
+require_cetrafs_mount "$MNT"
 rm "$MNT/old"
 sync
 failed_create
 ct_umount "$MNT"
+plant_dead_rec "$N" "$REC"
 "$TPOKE" "$IMG" leaf "$N" corrupt >/dev/null
 check "2"
 grep -q "WARN: inode $N's extent leaf .* failed its tail checksum" <<<"$FSCK_OUT" &&
