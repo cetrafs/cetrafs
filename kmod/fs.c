@@ -1623,6 +1623,7 @@ int cetrafs_fill_super(struct super_block *sb, struct fs_context *fc)
          * aggregates (they carry free, not total). It never changes. */
         {
             u32 nbg = le32_to_cpu(ondisk->block_group_count), b;
+            u64 prev_end; /* where the previous Block Group ended */
 
             /*
              * Resolve every Block Group's descriptor address BEFORE
@@ -1812,7 +1813,30 @@ int cetrafs_fill_super(struct super_block *sb, struct fs_context *fc)
                 }
             }
 
+            /*
+             * Two table segments over one block: each descriptor update
+             * then writes the other's. Checked against the fixed tables
+             * and the Block Groups only, never each other (audit
+             * 2026-11-06 M2).
+             */
+            {
+                u32 a, c;
+
+                for (a = 0; a < nsegs; a++)
+                    for (c = a + 1; c < nsegs; c++)
+                        if (segs[a].start < segs[c].end && segs[c].start < segs[a].end) {
+                            pr_err("BG table segments [%llu,%llu) and [%llu,%llu) overlap -- refusing\n",
+                                   (unsigned long long) segs[a].start, (unsigned long long) segs[a].end,
+                                   (unsigned long long) segs[c].start, (unsigned long long) segs[c].end);
+                            kfree(segs);
+                            cetrafs_free_sb_info(sb);
+                            brelse(bh);
+                            return -EUCLEAN;
+                        }
+            }
+
             sbi->total_data_blocks = 0;
+            prev_end = 0;
             for (b = 0; b < nbg; b++) {
                 u64 t = 0;
                 u32 owner = CETRAFS_NODE_ID_NONE;
@@ -1825,6 +1849,22 @@ int cetrafs_fill_super(struct super_block *sb, struct fs_context *fc)
                 u32 si;
 
                 brc = cetrafs_bg_mount_info(sb, b, &t, &owner, &bstart, &blen);
+                /*
+                 * Block Groups in order, none over the one before. Each
+                 * descriptor was checked alone, so two checksum-valid
+                 * descriptors naming the same blocks mounted, and both
+                 * bitmaps handed those blocks out -- two files on one
+                 * block. fsck refuses exactly this; the mount did not
+                 * (audit 2026-11-06 M2; tests/kernel/bg_overlap_refused.sh).
+                 */
+                if (!brc && bstart < prev_end) {
+                    pr_err("Block Group %u [%llu,+%llu) starts before the previous one ends (%llu) -- refusing\n",
+                           b, (unsigned long long) bstart, (unsigned long long) blen,
+                           (unsigned long long) prev_end);
+                    brc = -EUCLEAN;
+                }
+                if (!brc)
+                    prev_end = bstart + blen;
                 /* A descriptor segment inside a Block Group is a table
                  * the allocator will write data over, and data a
                  * descriptor update will write over. */
