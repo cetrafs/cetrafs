@@ -615,7 +615,13 @@ int cetrafs_defrag_inode(struct inode *inode, struct cetrafs_defrag_stats *out_s
             goto out_free_tail;
         }
         ret = cetrafs_defrag_read_extents(inode, &raw, &el);
-        if (ret || el.nblocks != nblocks || (!el.dense && !cetrafs_defrag_skip_dense_recheck)) {
+        /* has_uninit too, not only at the start: a punch and a fallocate
+         * between two steps restore the count and the density while
+         * mapping never-written blocks, and the next step would copy
+         * their stale bytes and publish them as data (audit 2026-11-06
+         * M8; tests/kernel/defrag_uninit_between_steps.sh). */
+        if (ret || el.nblocks != nblocks || (!el.dense && !cetrafs_defrag_skip_dense_recheck) ||
+            (el.has_uninit && !cetrafs_defrag_ignore_uninit)) {
             ret = ret ? ret : -ECANCELED;
             cetrafs_defrag_inode_unlock(inode);
             goto out_free_tail;
