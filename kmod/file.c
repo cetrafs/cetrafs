@@ -854,6 +854,11 @@ void cetrafs_tree_invalidate_cached(struct inode *inode, const cetrafs_inode_t *
     for (ni = 0; ni < cetrafs_le16(raw->eh.eh_entries) && ni < ARRAY_SIZE(raw->et.idx); ni++) {
         u64 ilba = cetrafs_extent_phys_from_hilo(raw->et.idx[ni].ei_leaf_hi, raw->et.idx[ni].ei_leaf_lo);
 
+        /* Disk-read addresses (rule 19): a damaged root aims neither a
+         * forced read nor an invalidation outside the data regions. The
+         * tree's real readers refuse the same block. */
+        if (!cetrafs_lba_run_is_data(sb, ilba, 1))
+            continue;
         if (depth == 1) {
             cetrafs_invalidate_block(sb, ilba); /* root slots are leaves */
             continue;
@@ -867,9 +872,12 @@ void cetrafs_tree_invalidate_cached(struct inode *inode, const cetrafs_inode_t *
                 u32 iln = min_t(u32, cetrafs_le16(ihdr->eh_entries), CETRAFS_EXT_BLOCK_MAX_IDX);
                 u32 li;
 
-                for (li = 0; li < iln; li++)
-                    cetrafs_invalidate_block(sb,
-                                             cetrafs_extent_phys_from_hilo(iarr[li].ei_leaf_hi, iarr[li].ei_leaf_lo));
+                for (li = 0; li < iln; li++) {
+                    u64 llba = cetrafs_extent_phys_from_hilo(iarr[li].ei_leaf_hi, iarr[li].ei_leaf_lo);
+
+                    if (cetrafs_lba_run_is_data(sb, llba, 1))
+                        cetrafs_invalidate_block(sb, llba);
+                }
                 brelse(ibh);
             }
             cetrafs_invalidate_block(sb, ilba);

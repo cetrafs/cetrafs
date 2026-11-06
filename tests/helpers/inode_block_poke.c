@@ -111,6 +111,8 @@ int main(int argc, char **argv)
                 argv[0]);
         fprintf(stderr, "       %s <backing-file> ehset <ino> magic|entries|depth <v> (the inline extent header)\n",
                 argv[0]);
+        fprintf(stderr, "       %s <backing-file> idxaddr <ino> <slot> <lba> (depth 2: a root slot's interior address)\n",
+                argv[0]);
         fprintf(stderr, "       %s <backing-file> idxrange <ino> <e> <lo> <hi> (depth 2: interior entry's range)\n",
                 argv[0]);
         return 2;
@@ -527,6 +529,27 @@ int main(int argc, char **argv)
         pwrite_all(fd, &rec, sizeof(rec), rec_off);
         fprintf(stderr, "inode_block_poke: ino %llu reused by node %llu: generation -> %llu\n",
                 (unsigned long long) ino, node, g);
+    } else if (strcmp(mode, "idxaddr") == 0 && argc == 6) {
+        /* A depth-2 root whose slot <slot> names interior <lba>, behind
+         * valid checksums: an address only an address check can see. */
+        cetrafs_inode_t rec;
+        unsigned slot = (unsigned) strtoul(argv[4], NULL, 0);
+        uint64_t lba = strtoull(argv[5], NULL, 0);
+
+        if (slot >= 4) {
+            fprintf(stderr, "idxaddr: slot %u out of range\n", slot);
+            return 2;
+        }
+        pread_all(fd, &rec, sizeof(rec), rec_off);
+        rec.eh.eh_depth = cetrafs_cpu_to_le16(2);
+        if (cetrafs_le16(rec.eh.eh_entries) <= slot)
+            rec.eh.eh_entries = cetrafs_cpu_to_le16((uint16_t) (slot + 1));
+        rec.et.idx[slot].ei_leaf_hi = cetrafs_cpu_to_le16((uint16_t) (lba >> 32));
+        rec.et.idx[slot].ei_leaf_lo = cetrafs_cpu_to_le32((uint32_t) lba);
+        cetrafs_inode_stamp_crcs_us(&rec);
+        pwrite_all(fd, &rec, sizeof(rec), rec_off);
+        fprintf(stderr, "inode_block_poke: ino %llu depth 2, root slot %u -> %llu\n", (unsigned long long) ino, slot,
+                (unsigned long long) lba);
     } else if (strcmp(mode, "peerseq") == 0) {
         /* Move file_seq on as a PEER's publish would, stamped with that
          * peer's node id and nothing else changed: the change stamp a
