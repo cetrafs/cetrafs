@@ -41,6 +41,21 @@ grep -q "loaded module:" <<<"$OUT" &&
     pass "and it reports the module loaded on this machine" ||
     fail "growfs did not report the local module"
 
+# ---------------- every row, not just the first (audit 2026-11-06 L9)
+# Rows are one per block; the scan read them at a 128-byte stride, so it
+# saw row 0 and then the inside of row 0's block. A registered row 2
+# (caps 0: an old module) must be named. Departed cleanly (last_seen 0),
+# so growfs's live-peer probe does not wait on it: it is still a
+# registered node whose module has to mount the grown volume.
+"$(ct_helper node_poke)" "$DEV" 2 1 bb 0 >/dev/null
+blockdev --flushbufs "$DEV"
+OUT3="$("$ROOT/userspace/growfs.cetra" "$DEV" -n 2>&1)"
+grep -qE "row 2 .*NOT READY" <<<"$OUT3" &&
+    pass "a registered node past row 0 is named too" ||
+    fail "growfs did not list registered row 2: $(grep -E '^ +row ' <<<"$OUT3" | tr '\n' ' ')"
+"$(ct_helper node_poke)" "$DEV" 2 0 00 0 >/dev/null # free again: the control below is about row 0 alone
+blockdev --flushbufs "$DEV"
+
 # ---------------- the control: a node whose module predates the grow
 log "clearing row 0's advertised capabilities -- a node still on an older module"
 python3 - "$IMG" <<'PY'

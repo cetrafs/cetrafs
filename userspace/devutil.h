@@ -1256,7 +1256,11 @@ static inline int cetrafs_scan_node_caps(const char *dev,
         return -1;
     }
     for (idx = 0; idx < count && n < max; idx++) {
-        off_t off = (off_t) cetrafs_le64(sb.node_table_start) * CETRAFS_BLOCK_SIZE + (off_t) idx * sizeof(e);
+        /* One row per block, like every other registry reader: a
+         * 128-byte stride read row 0 and then garbage from inside its
+         * block, so every node past the first was missing from the
+         * readiness notice (audit 2026-11-06 L9). */
+        off_t off = cetrafs_node_row_off(&sb, idx);
 
         if (pread(fd, &e, sizeof(e), off) != (ssize_t) sizeof(e)) {
             close(fd);
