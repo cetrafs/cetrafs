@@ -3703,7 +3703,15 @@ int cetrafs_bg_claim_free(struct super_block *sb, u32 zg_id, u32 *out_bg_id)
          * a stale FREE here is exactly the read that makes two nodes
          * reach for the same Block Group (rule 1). The swap would still
          * refuse, but scanning on fresh data finds a real candidate
-         * sooner. */
+         * sooner.
+         *
+         * Not ours, though: a Block Group this node owns is never FREE,
+         * and its descriptor is the one the allocator reads per block --
+         * dropping it on every claim attempt (each ENOSPC on a full
+         * volume makes one) is PERFORMANCE.md invariant 3 broken (audit
+         * 2026-11-06 L26). */
+        if (cetrafs_sb_bg_is_ours(sb, b))
+            continue;
         cetrafs_invalidate_block(sb, cetrafs_sb_bg_desc_lba(sb, b));
         if (cetrafs_read_bg_geom(sb, b, &geom) != 0)
             continue;
