@@ -489,6 +489,26 @@ static int cetrafs_node_fence_peer_full(struct super_block *sb, u32 node_id, con
     return 0;
 }
 
+/*
+ * Record a watched-dead verdict on a row nobody has reclaimed yet: bump
+ * its lease and stamp the departure sentinel, so the next observer reads
+ * it as gone instead of watching it all over again. Only while the row
+ * still carries the hb_seq that was watched standing still -- a node that
+ * beat, or re-attached, since the watch is left alone.
+ */
+static void cetrafs_node_stamp_watched_dead(struct super_block *sb, u32 node_id, u64 watched_seq)
+{
+    struct cetrafs_node_fence_ctx ctx = {
+        .mark_departed = true, .check_verdict = true, .have_seq = true, .seq = watched_seq};
+    int ret = cetrafs_cas_record(sb, cetrafs_node_row_lba(sb, node_id), cetrafs_node_fence_mutate, &ctx);
+
+    if (ret < 0)
+        pr_warn("node %u: could not record it as departed (%d) -- the next mount watches it again\n", node_id, ret);
+    else if (ctx.seen_epoch)
+        pr_info("node %u: watched dead, recorded as departed (epoch %llu)\n", node_id,
+                (unsigned long long) ctx.seen_epoch);
+}
+
 /* TEST ONLY: report every reclaim as racing a re-attach (the steal is
  * given back), or never (the pre-fix behaviour). -1 = off. */
 static int cetrafs_reattach_after_fence_force = -1;
@@ -1524,47 +1544,119 @@ out:
 }
 
 /*
- * Call 'visit' for every LIVE foreign Node Registry row: REGISTERED, not
- * cleanly departed (last_seen != 0), not ours (by UUID -- a caller may have
- * no row index yet, and excluding by UUID also skips the row it just
- * claimed), and not stale. "Live" is the ordinary lazy staleness check
- * (cetrafs_node_is_stale), never fencing and never sleeping -- NOT the
- * mount gate's blocking watch-a-window verdict, which stays its own code
- * (cetrafs_node_live_peer_exists()) because it must sleep and fence.
+ * Call 'visit' for every LIVE foreign Node Registry row that 'wants'
+ * selects: REGISTERED, not cleanly departed (last_seen != 0), not ours
+ * (by UUID -- a caller may have no row index yet, and excluding by UUID
+ * also skips the row it just claimed), and PROVEN live by its hb_seq
+ * moving while we watch.
  *
- * 'visit' returns 0 to keep scanning, >0 to stop (not an error), <0 to
+ * Proven, not assumed (audit 2026-11-06 M5). These run at mount, where
+ * the staleness watch has no history: its first sample of any row
+ * answers "alive", and a refused mount frees it, so a row left by a node
+ * that crashed read as live on every retry, forever -- a crashed no-CAW
+ * node blocked every CAW mount, a crashed lock-on cluster refused
+ * nofilelock for good, a crashed nofilelock one silently handed its mode
+ * to the next default mount. So each wanted row is watched for the
+ * window the mount gate uses (our stale_secs, floored at four of the
+ * row's own beats): a live node beats within one interval and is
+ * visited then; one that never moves is dead, imposes nothing, and is
+ * recorded as departed so the next mount reads it in one block. Only
+ * rows the caller's decision depends on are watched, so a healthy
+ * cluster pays at most one peer interval, and usually nothing.
+ *
+ * 'visit' returns 0 to keep going, >0 to stop (not an error), <0 to
  * abort with that error -- the same contract as dir.c's dirent walker.
  */
 static int cetrafs_for_each_live_peer(struct super_block *sb,
                                       const u8 *my_uuid,
+                                      bool (*wants)(const cetrafs_node_entry_t *ne, void *priv),
                                       int (*visit)(u32 idx, const cetrafs_node_entry_t *ne, void *priv),
                                       void *priv)
 {
     const cetrafs_superblock_t *raw_sb = cetrafs_sb_raw(sb);
     cetrafs_node_entry_t ne;
-    u32 count, idx;
+    u32 count, idx, candidates = 0, window = cetrafs_sb_stale_secs(sb);
+    unsigned long deadline;
+    u64 *seq; /* the hb_seq watched, +1 so 0 means "not a candidate" */
+    int ret = 0;
 
     if (!raw_sb)
         return -EINVAL;
 
     count = le32_to_cpu(raw_sb->node_table_count);
-    for (idx = 0; idx < count; idx++) {
-        bool stale = false;
-        int ret = cetrafs_read_node_entry(sb, idx, &ne);
+    seq = kcalloc(count, sizeof(*seq), GFP_KERNEL);
+    if (!seq)
+        return -ENOMEM;
 
+    for (idx = 0; idx < count; idx++) {
+        ret = cetrafs_read_node_entry(sb, idx, &ne);
         if (ret)
-            return ret;
+            goto out;
         if (cetrafs_le32(ne.state) != CETRAFS_NODE_STATE_REGISTERED || cetrafs_le64(ne.last_seen) == 0)
             continue; /* FREE, or cleanly departed */
         if (my_uuid && !memcmp(ne.node_uuid, my_uuid, CETRAFS_NODE_UUID_LEN))
             continue; /* our own row / a prior incarnation of us */
-        if (cetrafs_node_is_stale(sb, idx, &stale) == 0 && stale)
-            continue; /* dead but not yet reclaimed -- imposes nothing */
-        ret = visit(idx, &ne, priv);
-        if (ret)
-            return ret < 0 ? ret : 0;
+        if (wants && !wants(&ne, priv))
+            continue; /* the caller's answer does not depend on it */
+        seq[idx] = cetrafs_le64(ne.hb_seq) + 1;
+        candidates++;
+        {
+            /* Clamped, as the gate does: a checksum-valid row can
+             * advertise any interval. */
+            u32 pi = min_t(u32, cetrafs_le32(ne.hb_interval_secs), CETRAFS_HB_INTERVAL_MAX_SECS);
+
+            if (pi && pi * 4 > window)
+                window = pi * 4;
+        }
     }
-    return 0;
+    if (!candidates)
+        goto out;
+
+    pr_info("watching %u registry row(s) for up to %us to tell a live node from a dead one\n", candidates, window);
+    deadline = jiffies + (unsigned long) window * HZ;
+    while (candidates) {
+        bool expired;
+
+        msleep(1000);
+        if (fatal_signal_pending(current)) {
+            ret = -EINTR;
+            goto out;
+        }
+        expired = time_after_eq(jiffies, deadline);
+        for (idx = 0; idx < count && candidates; idx++) {
+            if (!seq[idx])
+                continue;
+            ret = cetrafs_read_node_entry(sb, idx, &ne);
+            if (ret)
+                goto out;
+            if (cetrafs_le32(ne.state) != CETRAFS_NODE_STATE_REGISTERED || cetrafs_le64(ne.last_seen) == 0) {
+                seq[idx] = 0; /* left, or was freed, while we watched */
+                candidates--;
+                continue;
+            }
+            if (cetrafs_le64(ne.hb_seq) + 1 != seq[idx]) {
+                seq[idx] = 0;
+                candidates--;
+                if (wants && !wants(&ne, priv))
+                    continue; /* changed its answer while we watched */
+                ret = visit(idx, &ne, priv);
+                if (ret) {
+                    ret = ret < 0 ? ret : 0;
+                    goto out;
+                }
+                continue;
+            }
+            if (expired) {
+                /* Watched for the whole window and never moved: dead. */
+                cetrafs_node_stamp_watched_dead(sb, idx, seq[idx] - 1);
+                seq[idx] = 0;
+                candidates--;
+            }
+        }
+    }
+out:
+    kfree(seq);
+    return ret;
 }
 
 /*
@@ -1587,8 +1679,32 @@ static int cetrafs_cluster_mode_visit(u32 idx, const cetrafs_node_entry_t *ne, v
     return 1;
 }
 
-int cetrafs_node_cluster_file_lock_mode(struct super_block *sb, const u8 *my_uuid, u32 *out_mode)
+/* Only a peer whose mode differs from ours changes this mount's answer:
+ * leading with our own mode and inheriting the same one are one outcome. */
+static bool cetrafs_mode_differs_wants(const cetrafs_node_entry_t *ne, void *priv)
 {
+    const u32 *my_mode = priv;
+    u32 mode = cetrafs_le32(ne->file_lock_mode);
+
+    return (mode == CETRAFS_FLOCK_MODE_ON || mode == CETRAFS_FLOCK_MODE_OFF) && mode != *my_mode;
+}
+
+struct cetrafs_cluster_mode_ctx {
+    u32 my_mode; /* first: cetrafs_mode_differs_wants() reads it */
+    u32 *out_mode;
+};
+
+static int cetrafs_cluster_mode_ctx_visit(u32 idx, const cetrafs_node_entry_t *ne, void *priv)
+{
+    struct cetrafs_cluster_mode_ctx *ctx = priv;
+
+    return cetrafs_cluster_mode_visit(idx, ne, ctx->out_mode);
+}
+
+int cetrafs_node_cluster_file_lock_mode(struct super_block *sb, const u8 *my_uuid, u32 my_mode, u32 *out_mode)
+{
+    struct cetrafs_cluster_mode_ctx ctx = {.my_mode = my_mode, .out_mode = out_mode};
+
     *out_mode = CETRAFS_FLOCK_MODE_UNSET;
 
     /* Test knob: on a no-CAW loop device the mount gate refuses a live
@@ -1601,7 +1717,7 @@ int cetrafs_node_cluster_file_lock_mode(struct super_block *sb, const u8 *my_uui
         return 0;
     }
 
-    return cetrafs_for_each_live_peer(sb, my_uuid, cetrafs_cluster_mode_visit, out_mode);
+    return cetrafs_for_each_live_peer(sb, my_uuid, cetrafs_mode_differs_wants, cetrafs_cluster_mode_ctx_visit, &ctx);
 }
 
 /*
@@ -1619,7 +1735,7 @@ int cetrafs_node_cluster_file_lock_mode(struct super_block *sb, const u8 *my_uui
  * another disagree. Excludes our own row(s) by UUID.
  */
 struct cetrafs_mode_conflict_ctx {
-    u32 my_mode;
+    u32 my_mode; /* first: cetrafs_mode_differs_wants() reads it */
     bool conflict;
 };
 
@@ -1649,7 +1765,7 @@ int cetrafs_node_file_lock_mode_conflict(struct super_block *sb, const u8 *my_uu
         return 0;
     }
 
-    ret = cetrafs_for_each_live_peer(sb, my_uuid, cetrafs_mode_conflict_visit, &ctx);
+    ret = cetrafs_for_each_live_peer(sb, my_uuid, cetrafs_mode_differs_wants, cetrafs_mode_conflict_visit, &ctx);
     *out_conflict = ctx.conflict;
     return ret;
 }
@@ -1691,7 +1807,7 @@ int cetrafs_node_single_mounter_conflict(struct super_block *sb, const u8 *my_uu
         return 0;
     }
 
-    return cetrafs_for_each_live_peer(sb, my_uuid, cetrafs_single_mounter_visit, out_conflict);
+    return cetrafs_for_each_live_peer(sb, my_uuid, NULL, cetrafs_single_mounter_visit, out_conflict);
 }
 
 /*
@@ -1720,10 +1836,16 @@ static int cetrafs_nocaw_peer_visit(u32 idx, const cetrafs_node_entry_t *ne, voi
     return 1;
 }
 
+static bool cetrafs_nocaw_peer_wants(const cetrafs_node_entry_t *ne, void *priv)
+{
+    (void) priv;
+    return cetrafs_le32(ne->caps) & CETRAFS_NODE_CAP_NO_CAW;
+}
+
 int cetrafs_node_nocaw_peer_exists(struct super_block *sb, const u8 *my_uuid, bool *out_exists)
 {
     *out_exists = false;
-    return cetrafs_for_each_live_peer(sb, my_uuid, cetrafs_nocaw_peer_visit, out_exists);
+    return cetrafs_for_each_live_peer(sb, my_uuid, cetrafs_nocaw_peer_wants, cetrafs_nocaw_peer_visit, out_exists);
 }
 
 /*

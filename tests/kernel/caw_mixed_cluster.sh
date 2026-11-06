@@ -15,7 +15,7 @@
 # row, and a CAW node refuses to mount while a live peer advertises it.
 # A loop device has no CAW, so mount_assume_caw makes this node take the
 # CAW side's mount decisions; the peer is a registry row posed by
-# node_poke.
+# node_poke and kept beating (ct_beat_row).
 #
 # DISCRIMINATION (measured with the refusal removed): the CAW-side mount
 # succeeds next to the live no-CAW peer.
@@ -42,6 +42,8 @@ umount "$MNT"
 # A live peer in row 1, running without CAW.
 "$NODE_POKE" "$DEV" 1 1 cc "$(date +%s)" >/dev/null
 "$NODE_POKE" "$DEV" 1 --caps 0x3 >/dev/null
+# Beating: a mount takes a row as live only once its hb_seq moves.
+ct_beat_row "$DEV" 1
 
 log "a node with CAW mounting next to it"
 ct_param_set mount_assume_caw 1
@@ -69,6 +71,7 @@ else
     fail "control: the CAW node could not mount next to a CAW peer -- the refusal above proves nothing"
 fi
 ct_param_set mount_assume_caw 0
+ct_unbeat
 
 "$NODE_POKE" "$DEV" 1 0 cc 0 >/dev/null 2>&1 || true
 ct_exit

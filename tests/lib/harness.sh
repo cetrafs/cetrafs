@@ -649,6 +649,28 @@ wait_for() { # <seconds> <shell-expression>
     return 1
 }
 
+# ct_beat_row <device> <row> -- make a planted registry row beat like a
+# live node: its hb_seq advances every second, in the background, until
+# ct_unbeat (or cleanup). The mount-time peer checks prove a row live by
+# watching hb_seq move (audit 2026-11-06 M5), so a row that only LOOKS
+# live -- REGISTERED with a recent last_seen -- is now judged dead there.
+ct_beat_row() { # <device> <row>
+    local np
+    np="$(ct_helper node_poke)"
+    (while :; do
+        "$np" "$1" "$2" --beat >/dev/null 2>&1
+        sleep 1
+    done) &
+    CT_BEAT_PID=$!
+    ct_track cmd "kill $CT_BEAT_PID 2>/dev/null; true"
+}
+ct_unbeat() {
+    [ -n "${CT_BEAT_PID:-}" ] || return 0
+    kill "$CT_BEAT_PID" 2>/dev/null || true
+    wait "$CT_BEAT_PID" 2>/dev/null || true
+    CT_BEAT_PID=""
+}
+
 # ct_bgs_of_zg <device> <zg_id> -> the Block Group ids that Zone Group
 # owns, one per line.
 #

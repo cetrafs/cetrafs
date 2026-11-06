@@ -206,7 +206,7 @@ int cetrafs_node_repair_claim_exists(struct super_block *sb, bool *out_exists, c
 /* The file-lock mode a LIVE peer advertises (the first mounter's choice),
  * or CETRAFS_FLOCK_MODE_UNSET if no live peer -- so a joining node inherits
  * the cluster's mode and the first mounter leads. See node.c. */
-int cetrafs_node_cluster_file_lock_mode(struct super_block *sb, const u8 *my_uuid, u32 *out_mode);
+int cetrafs_node_cluster_file_lock_mode(struct super_block *sb, const u8 *my_uuid, u32 my_mode, u32 *out_mode);
 /* Post-registration re-check: does any live peer now disagree with our mode?
  * Closes the simultaneous-mount race the pre-registration scan cannot. */
 int cetrafs_node_file_lock_mode_conflict(struct super_block *sb, const u8 *my_uuid, u32 my_mode, bool *out_conflict);

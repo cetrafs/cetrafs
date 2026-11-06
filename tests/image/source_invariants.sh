@@ -1217,6 +1217,53 @@ printf '    inode->i_mode = cetrafs_le32(bufs[0].mode);\n' >"$SAMPLE"
     pass "adopted mode: control -- a direct assignment is caught" ||
     fail "adopted mode: control -- a direct assignment is not caught"
 
+# Class 44 ("alive" as the unsafe default). A liveness predicate's first
+# look at a row answers "alive" -- right for a reclaim, which then keeps
+# its hands off, and wrong for a caller that REFUSES or INHERITS on it
+# with no earlier look to compare against: the mount-time peer checks
+# judged a crashed node's row live forever (audit 2026-11-06 M5). Every
+# function that asks is listed with what it does on "alive"; a new one
+# fails here until someone has said which way its answer is safe.
+log "checking every caller of a liveness predicate names its safe direction (class 44)"
+LIVE_OK='fs.c:cetrafs_sb_peer_progress_stale:the predicate itself
+node.c:cetrafs_node_is_stale:the predicate itself
+node.c:cetrafs_for_each_live_peer:mount-time walk -- proves alive by watching hb_seq move, never by one sample
+node.c:cetrafs_node_cluster_file_lock_mode:the walk
+node.c:cetrafs_node_file_lock_mode_conflict:the walk
+node.c:cetrafs_node_nocaw_peer_exists:the walk
+node.c:cetrafs_node_single_mounter_conflict:the walk
+node.c:cetrafs_node_seed_peer_watch:seeds the watch, decides nothing
+heartbeat.c:cetrafs_heartbeat_maint:alive -> leave its journal alone (keep)
+inode.c:cetrafs_write_vfs_inode:alive -> drop our own dirt (keep the record)
+journal.c:cetrafs_journal_claim_replay:alive -> leave the replay to it (keep)
+lock.c:cetrafs_foreign_claim_from_raw:alive -> a live claim (keep)
+lock.c:cetrafs_foreign_reader_from_raw:alive -> keep its reader bit
+lock.c:cetrafs_lock_explicit_acquire:alive -> keep waiting; the runtime watch converges
+lock.c:cetrafs_lock_open:alive -> refuse this open; the runtime watch converges on retry
+nslock.c:cetrafs_nslock_try:alive -> wait and retry
+procfs.c:cetrafs_proc_cluster_show:display only
+scrub.c:scrub_reclaim_orphan_inodes:alive -> skip (keep)
+zonegroup.c:cetrafs_zg_claim_one_more_locked:alive -> not a candidate (keep)
+zonegroup.c:cetrafs_zg_log_foreign_free_leak:log only
+zonegroup.c:cetrafs_zg_scrub_adopt_one_stale:alive -> skip (keep)
+zonegroup.c:__cetrafs_zg_try_claim_one:alive -> leave the Zone Group (keep)'
+live_callers() {
+    for f in "$@"; do
+        awk -v F="$(basename "$f")" '
+            /^[a-z_][a-z0-9_ *]*\(/ && !/;$/ { fn = $0; sub(/\(.*/, "", fn); n = split(fn, a, " "); fn = a[n]; sub(/^\*+/, "", fn) }
+            /cetrafs_node_is_stale\(|cetrafs_sb_peer_progress_stale\(|cetrafs_for_each_live_peer\(/ && !/^[[:space:]]*\*/ && !/^[[:space:]]*\/\*/ { print F ":" fn }' "$f"
+    done | sort -u
+}
+LC="$(live_callers "$K"/*.c)"
+[ "$(grep -c . <<<"$LC")" -ge 15 ] || fail "class 44: found only $(grep -c . <<<"$LC") callers -- the scan is not seeing the tree"
+UNL="$(while IFS= read -r l; do [ -n "$l" ] && ! grep -qF "$l:" <<<"$LIVE_OK" && echo "$l"; done <<<"$LC" || true)"
+[ -z "$UNL" ] && pass "class 44: every caller of a liveness predicate names what it does on 'alive'" ||
+    fail "class 44: unclassified liveness callers (is 'alive' the safe answer there?): $(echo $UNL)"
+SAMPLE="$(ct_tmp live-sample).c"
+printf 'static int cetrafs_new_refuser(struct super_block *sb)\n{\n    return cetrafs_node_is_stale(sb, 1, &s);\n}\n' >"$SAMPLE"
+[ "$(live_callers "$SAMPLE")" = "$(basename "$SAMPLE"):cetrafs_new_refuser" ] &&
+    pass "class 44: control -- a planted caller is found" || fail "class 44: control -- a planted caller is not found"
+
 # The module must publish the filesystem alias get_fs_type() asks
 # modprobe for ("fs-<name>") when a mount names a type nothing has
 # registered. Without it, `mount -t cetrafs` on a host that has the

@@ -1576,7 +1576,8 @@ int cetrafs_fill_super(struct super_block *sb, struct fs_context *fc)
                 u32 cluster_mode = CETRAFS_FLOCK_MODE_UNSET;
                 bool local_off = !sbi->file_lock_enabled; /* operator passed nofilelock */
 
-                rc = cetrafs_node_cluster_file_lock_mode(sb, my_uuid, &cluster_mode);
+                rc = cetrafs_node_cluster_file_lock_mode(
+                    sb, my_uuid, local_off ? CETRAFS_FLOCK_MODE_OFF : CETRAFS_FLOCK_MODE_ON, &cluster_mode);
                 if (rc) {
                     cetrafs_free_sb_info(sb);
                     brelse(bh);
