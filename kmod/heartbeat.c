@@ -316,6 +316,9 @@ static void cetrafs_heartbeat_maint(struct work_struct *work)
     ret = cetrafs_zg_claim_unowned(sb, my_node_id, my_uuid, /*at_mount=*/false);
     if (ret)
         pr_warn("heartbeat: stale ZG reclaim pass failed: %d\n", ret);
+    /* Zone Groups a free found full under a dead owner (M6): taken
+     * over here, not in the freeing thread. */
+    cetrafs_zg_adopt_wanted(sb, my_node_id);
 
     /* Apply any frees other nodes queued against ZGs we own
      * before the release-surplus pass below, so a ZG these frees

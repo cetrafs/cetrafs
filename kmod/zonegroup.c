@@ -1181,6 +1181,30 @@ static int cetrafs_zg_claim_one_more_locked(struct super_block *sb, u32 count, u
  * here carries. Doing at most one per scrub cycle (30 min apart by default)
  * keeps the scrub from aggressively fencing a peer that is just slow.
  */
+/*
+ * Adopt the Zone Groups a free found full (cetrafs_zg_queue_foreign_free()'s
+ * queue-full path), from the heartbeat tick. cetrafs_zg_try_claim_one()
+ * only steals from a stale or absent owner, so a full queue whose owner
+ * is alive and merely behind is left alone here too.
+ */
+void cetrafs_zg_adopt_wanted(struct super_block *sb, u32 my_node_id)
+{
+    const cetrafs_superblock_t *raw_sb = cetrafs_sb_raw(sb);
+    u32 z, count;
+
+    if (!raw_sb)
+        return;
+    count = min_t(u32, le32_to_cpu(raw_sb->zone_group_count), CETRAFS_MAX_ZONE_GROUPS);
+    for (z = 0; z < count; z++) {
+        bool claimed = false;
+
+        if (!cetrafs_sb_zg_take_adopt(sb, z) || cetrafs_sb_zg_owned_cached(sb, z))
+            continue;
+        if (cetrafs_zg_try_claim_one(sb, z, my_node_id, /*at_mount=*/false, &claimed) == 0 && claimed)
+            pr_info("ZG %u: adopted from its stale owner -- a free found its queue full\n", z);
+    }
+}
+
 int cetrafs_zg_scrub_adopt_one_stale(struct super_block *sb, bool *out_adopted)
 {
     const cetrafs_superblock_t *raw_sb = cetrafs_sb_raw(sb);
@@ -1867,30 +1891,21 @@ queue_full:
      * STALE (offline/crashed -- its queue will never drain) or a delete
      * burst briefly outran the 15 s drain.
      *
-     * If the owner is stale, reclaim the ZG: cetrafs_zg_try_claim_one()
-     * only steals a stale (or unowned) owner's ZG, so this is a no-op
-     * against a live owner. Reclaiming makes this node the owner, so the
-     * backlog drains on our next tick and the caller can free DIRECTLY
-     * (we signal that with -EAGAIN). This is exactly the case that bit a
-     * real cluster: an owner powered off, a peer deleted its files, and
-     * every free past the first 1024 leaked for the whole outage.
+     * A stale owner's Zone Group has to be taken over, or every free
+     * past the queue's capacity leaks for the whole outage (a real
+     * cluster: an owner powered off, a peer deleted its files). But NOT
+     * here. This runs inside the free: truncate and punch hold
+     * inode_lock and invalidate_lock, evict can be the inode shrinker,
+     * a directory free holds the namespace lock -- and a steal fences,
+     * replays the dead node's whole journal with its wait loop, and
+     * recounts every member bitmap. A guest discard stalled its VM and
+     * every reader of the image behind invalidate_lock for the replay
+     * budget (audit 2026-11-06 M6). So this free takes the leak path
+     * below and asks the heartbeat to adopt the Zone Group, which it
+     * does on its next tick with none of those locks held; the scrub of
+     * the adopted Zone Group then reclaims what was dropped here.
      */
-    {
-        u32 my_node_id;
-        bool claimed = false;
-
-        /* pf_force_queue_full models the PRODUCTION case: a full queue
-         * whose owner is alive and simply has not drained yet. The
-         * reclaim below only succeeds against a stale or unowned ZG --
-         * which on a single-node harness is always -- so without this
-         * the drop path is unreachable and the test silently measures
-         * the direct free instead. */
-        if (!cetrafs_pf_force_queue_full && cetrafs_sb_get_node_id(sb, &my_node_id) == 0) {
-            cetrafs_zg_try_claim_one(sb, zg_id, my_node_id, /*at_mount=*/false, &claimed);
-            if (cetrafs_sb_zg_owned_cached(sb, zg_id))
-                return -EAGAIN; /* reclaimed -- caller frees directly */
-        }
-    }
+    cetrafs_sb_zg_want_adopt(sb, zg_id);
 
     /*
      * Owner is alive but not draining fast enough (a burst). A loud,

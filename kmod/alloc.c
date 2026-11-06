@@ -2853,11 +2853,9 @@ static int __cetrafs_free_data_extent(struct super_block *sb, u64 lba, u32 count
             ctrace("BLKQUEUE lba=%llu count=%u zg=%u ret=%d from=%pS\n", (unsigned long long) lba, count,
                    (unsigned int) bg.owner_zg, ret, __builtin_return_address(0));
             /*
-             * -EAGAIN: the queue was full and the owner had gone stale, so
-             * queue_foreign_free() reclaimed the ZG for us. It is ours now
-             * -- fall through to the direct free below.
-             *
-             * -ENOSPC: the queue was full and the owner is ALIVE, so the
+             * -ENOSPC: the queue was full -- its owner behind, or dead and
+             * flagged for the heartbeat to adopt (never adopted here: this
+             * runs inside the caller's locks; audit 2026-11-06 M6) -- so the
              * extent was deliberately LEAKED (logged, reclaimed later by
              * the scrub or fsck -r). That is a bounded, recoverable loss
              * of SPACE -- it is not a failure of the caller's operation,
@@ -2872,8 +2870,7 @@ static int __cetrafs_free_data_extent(struct super_block *sb, u64 lba, u32 count
                 atomic64_inc(&cetrafs_foreign_free_leaks);
                 return 0;
             }
-            if (ret != -EAGAIN)
-                return ret;
+            return ret;
         }
     }
 

@@ -411,6 +411,10 @@ struct cetrafs_sb_info {
      * (tests/kernel/zg_steal_victim_fences.sh). Nothing here re-reads
      * the ZG record: that would be a device round trip per block. */
     DECLARE_BITMAP(owned_zgs, CETRAFS_MAX_ZONE_GROUPS);
+    /* Zone Groups a free found full under a dead owner: the heartbeat
+     * adopts them (cetrafs_zg_adopt_wanted()), never the freeing thread,
+     * which may hold inode_lock/invalidate_lock or run from reclaim. */
+    DECLARE_BITMAP(zg_adopt_wanted, CETRAFS_MAX_ZONE_GROUPS);
 
 
     /*
@@ -3063,6 +3067,21 @@ void cetrafs_sb_zg_claim_unlock(struct super_block *sb, unsigned int nofs)
     WRITE_ONCE(sbi->zg_claim_owner, NULL);
     mutex_unlock(&sbi->zg_claim_mutex);
     memalloc_nofs_restore(nofs);
+}
+
+void cetrafs_sb_zg_want_adopt(struct super_block *sb, u32 zg_id)
+{
+    struct cetrafs_sb_info *sbi = sb->s_fs_info;
+
+    if (sbi && zg_id < CETRAFS_MAX_ZONE_GROUPS)
+        set_bit(zg_id, sbi->zg_adopt_wanted);
+}
+
+bool cetrafs_sb_zg_take_adopt(struct super_block *sb, u32 zg_id)
+{
+    struct cetrafs_sb_info *sbi = sb->s_fs_info;
+
+    return sbi && zg_id < CETRAFS_MAX_ZONE_GROUPS && test_and_clear_bit(zg_id, sbi->zg_adopt_wanted);
 }
 
 /*
