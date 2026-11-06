@@ -632,6 +632,12 @@ MODULE_PARM_DESC(birth_check_fail, "test-only: fail the next N post-claim inode-
 /* One forced-fresh read of an inode record, raw: see the comment at its
  * first use in cetrafs_alloc_inode() for why not cetrafs_read_raw_inode().
  * *have is whether the record verifies. */
+/* TEST ONLY: the next birth claim's seed reads torn once, as a peer's
+ * record write caught mid-flight would (tests/kernel/birth_seed_checked.sh). */
+static bool cetrafs_birth_seed_tear_once;
+cetrafs_test_param(birth_seed_tear_once, cetrafs_birth_seed_tear_once, bool, 0644);
+MODULE_PARM_DESC(birth_seed_tear_once, "TEST ONLY: the next birth claim's seed reads torn once");
+
 static int cetrafs_birth_read(struct super_block *sb, u64 ino, cetrafs_inode_t *raw, bool *have)
 {
     struct buffer_head *bh;
@@ -839,8 +845,37 @@ int cetrafs_alloc_inode(struct super_block *sb, u64 *out_ino)
                       * so nothing to arbitrate -- and no extra write per
                       * first use */
         } else {
-            ret = cetrafs_inode_birth_claim(sb, *out_ino, &raw, &lost);
-            claimed = !ret && !lost;
+            /* The claim's seed must be a checksummed record: the claim
+             * stamps a fresh checksum over whatever it is handed, so a
+             * damaged one came out VALID (audit 2026-11-06 L11). A peer's
+             * write seen torn converges on a re-read; one that does not
+             * is damage, and this number is not handed out. */
+            int tries;
+
+            ret = 0;
+            if (READ_ONCE(cetrafs_birth_seed_tear_once) && xchg(&cetrafs_birth_seed_tear_once, false))
+                raw.mode ^= cetrafs_cpu_to_le32(1); /* TEST ONLY: see the parameter */
+            for (tries = 0; tries < 5 && cetrafs_inode_crc_ns(&raw) != (u32) cetrafs_le64(raw.ns_checksum); tries++) {
+                usleep_range(200, 800);
+                if (cetrafs_birth_read(sb, *out_ino, &raw, &have)) {
+                    ret = -EIO;
+                    break;
+                }
+            }
+            if (!ret && cetrafs_inode_crc_ns(&raw) != (u32) cetrafs_le64(raw.ns_checksum)) {
+                /* Kept set, like a number lost to a reclaim: a leak fsck
+                 * names, and the create takes another number. */
+                pr_err("alloc_inode: ino=%llu is free but its record fails its checksum -- leaving it allocated "
+                       "for fsck and taking another number\n",
+                       (unsigned long long) *out_ino);
+                cetrafs_sb_birth_end(sb, *out_ino);
+                cetrafs_sb_adjust_free_inodes(sb, -1);
+                continue;
+            }
+            if (!ret) {
+                ret = cetrafs_inode_birth_claim(sb, *out_ino, &raw, &lost);
+                claimed = !ret && !lost;
+            }
         }
         if (ret) {
             cetrafs_sb_birth_end(sb, *out_ino);
