@@ -62,6 +62,12 @@ static void cetrafs_put_super(struct super_block *sb)
     }
 }
 
+/* TEST ONLY: the next writeback publish fails
+ * (tests/kernel/sync_reports_failed_publish.sh). */
+static bool cetrafs_write_inode_fail_once;
+cetrafs_test_param(write_inode_fail_once, cetrafs_write_inode_fail_once, bool, 0644);
+MODULE_PARM_DESC(write_inode_fail_once, "TEST ONLY: the next writeback record publish fails with -EIO");
+
 static int cetrafs_write_inode(struct inode *inode, struct writeback_control *wbc)
 {
     int ret;
@@ -90,9 +96,25 @@ static int cetrafs_write_inode(struct inode *inode, struct writeback_control *wb
 
     fs_debug(info, "cetrafs_write_inode ino=%llu", (unsigned long long) inode->i_ino);
 
-    ret = cetrafs_write_vfs_inode(inode);
-    if (ret)
+    if (READ_ONCE(cetrafs_write_inode_fail_once) && xchg(&cetrafs_write_inode_fail_once, false))
+        ret = -EIO; /* TEST ONLY: see the parameter */
+    else
+        ret = cetrafs_write_vfs_inode(inode);
+    /*
+     * A failed publish used to be dropped here: the VFS had already
+     * cleared the inode's dirt, nothing re-dirtied it, and sync_fs walks
+     * only inodes with pending blocks -- so syncfs(2) reported success
+     * with the record unpublished (audit 2026-11-06 L16). Re-dirty it,
+     * and mark it for sync_fs, which retries and reports. -ESTALE is a
+     * dead object for a reused number: nothing of ours to publish.
+     */
+    if (ret && ret != -ESTALE && !cetrafs_sb_is_fenced(inode->i_sb)) {
         fs_debug(info, "cetrafs_write_inode ino=%llu failed: %d", (unsigned long long) inode->i_ino, ret);
+        cetrafs_inode_set_wb_failed(inode, true);
+        mark_inode_dirty_sync(inode);
+    } else if (!ret) {
+        cetrafs_inode_set_wb_failed(inode, false);
+    }
 
     return ret;
 }
@@ -135,7 +157,7 @@ static int cetrafs_sync_fs_pending(struct super_block *sb)
     list_for_each_entry(inode, &sb->s_inodes, i_sb_list) {
         spin_lock(&inode->i_lock);
         if ((inode_state_read(inode) & (I_FREEING | I_WILL_FREE | I_NEW)) || !S_ISREG(inode->i_mode) ||
-            !cetrafs_pending_any(inode)) {
+            (!cetrafs_pending_any(inode) && !cetrafs_inode_wb_failed(inode))) {
             spin_unlock(&inode->i_lock);
             continue;
         }
@@ -144,7 +166,16 @@ static int cetrafs_sync_fs_pending(struct super_block *sb)
         spin_unlock(&sb->s_inode_list_lock);
 
         iput(toput);
-        r = cetrafs_inode_sync_pending(inode);
+        r = cetrafs_pending_any(inode) ? cetrafs_inode_sync_pending(inode) : 0;
+        /* A record whose writeback publish failed: retried here, and a
+         * second failure is this sync's error, not a silent success. */
+        if (!r && cetrafs_inode_wb_failed(inode)) {
+            r = cetrafs_write_vfs_inode(inode);
+            if (!r || r == -ESTALE) {
+                cetrafs_inode_set_wb_failed(inode, false);
+                r = 0;
+            }
+        }
         if (r && !ret)
             ret = r;
         toput = inode;

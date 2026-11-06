@@ -324,6 +324,8 @@ bool cetrafs_sb_zg_adopt_wait(struct super_block *sb, u32 zg_id);
 void cetrafs_zg_adopt_wanted(struct super_block *sb, u32 my_node_id);
 bool cetrafs_sb_in_reclaim_lock(struct super_block *sb);
 bool cetrafs_sb_ro_refuses(struct super_block *sb, const char *what);
+void cetrafs_inode_set_wb_failed(struct inode *inode, bool failed);
+bool cetrafs_inode_wb_failed(struct inode *inode);
 u64 cetrafs_sb_stamp_ns(struct super_block *sb);
 u64 cetrafs_sb_stamp_now(struct super_block *sb);
 bool cetrafs_sb_own_seq_older(struct super_block *sb, u64 a, u64 b, u64 noted_at);

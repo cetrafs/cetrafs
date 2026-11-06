@@ -131,9 +131,10 @@ int main(int argc, char **argv)
     pread_all(fd, &in, sizeof(in), ino_off);
 
     if (rec_dump) {
-        printf("size=%" PRIu64 " nlink=%u dirent_seq=%" PRIu64 " generation=%" PRIu64 "\n",
+        printf("size=%" PRIu64 " nlink=%u dirent_seq=%" PRIu64 " generation=%" PRIu64 " mtime=%" PRIu64 "\n",
                (uint64_t) cetrafs_le64(in.size), cetrafs_le32(in.nlink),
-               (uint64_t) cetrafs_le64(in.dirent_seq), (uint64_t) cetrafs_le64(in.generation));
+               (uint64_t) cetrafs_le64(in.dirent_seq), (uint64_t) cetrafs_le64(in.generation),
+               (uint64_t) cetrafs_le64(in.mtime));
         close(fd);
         return 0;
     }

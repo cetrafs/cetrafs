@@ -265,6 +265,9 @@ struct cetrafs_inode_info {
      * way (pre-held by local writers, or claimed by the mover itself
      * when there were none). */
     bool defrag_pinned;
+    /* The last writeback publish of this record failed: sync_fs retries it
+     * and reports it (audit 2026-11-06 L16). */
+    bool wb_publish_failed;
     atomic_t defrag_queued; /* dedup: one pending background request per inode */
     /* jiffies before which an APPEND does not re-queue this file: set
      * when the janitor declined it (cetrafs_lock_defrag_quiet()). */
@@ -485,6 +488,16 @@ void cetrafs_inode_drop_reservation(struct inode *inode)
 static inline struct cetrafs_inode_info *CETRAFS_I(struct inode *inode)
 {
     return container_of(inode, struct cetrafs_inode_info, vfs_inode);
+}
+
+void cetrafs_inode_set_wb_failed(struct inode *inode, bool failed)
+{
+    WRITE_ONCE(CETRAFS_I(inode)->wb_publish_failed, failed);
+}
+
+bool cetrafs_inode_wb_failed(struct inode *inode)
+{
+    return READ_ONCE(CETRAFS_I(inode)->wb_publish_failed);
 }
 
 /*
