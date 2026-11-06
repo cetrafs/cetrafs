@@ -530,6 +530,12 @@ int cetrafs_defrag_inode(struct inode *inode, struct cetrafs_defrag_stats *out_s
     }
 
     cetrafs_defrag_inode_lock(inode);
+    /* The write gate, not just the fence: a damaged inode refuses every
+     * write, and relocation rewrites its record and moves every block
+     * (audit 2026-11-06 L21). Both the ioctl and the worker come here. */
+    ret = cetrafs_write_gate(inode);
+    if (ret)
+        goto out_unlock;
     ret = cetrafs_defrag_read_raw(sb, inode, &raw);
     if (ret)
         goto out_unlock;
@@ -599,6 +605,9 @@ int cetrafs_defrag_inode(struct inode *inode, struct cetrafs_defrag_stats *out_s
             ret = -ECANCELED;
             goto out_free_tail;
         }
+        ret = cetrafs_write_gate(inode); /* damage found mid-move */
+        if (ret)
+            goto out_free_tail;
         /* defrag.cetra on a VM image runs for minutes and pins the file
          * (every peer open refused) while it does; SIGKILL must stop it.
          * Between steps is the clean point: the committed prefix is the

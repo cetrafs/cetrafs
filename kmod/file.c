@@ -6739,6 +6739,13 @@ static int cetrafs_release(struct inode *inode, struct file *file)
 /* The defrag core lives in defrag.c (per-file relocation + the automatic
  * background worker); this file only owns the ioctl entry point, since
  * the fd-based trigger is file-ops territory. */
+/* TEST ONLY: mark this inode damaged as the defrag ioctl starts, the
+ * way a read that found damage while the fd was open would have
+ * (tests/kernel/defrag_damaged_refused.sh). */
+static unsigned long long cetrafs_defrag_damage_ino;
+cetrafs_test_param(defrag_damage_ino, cetrafs_defrag_damage_ino, ullong, 0644);
+MODULE_PARM_DESC(defrag_damage_ino, "TEST ONLY: mark this inode damaged as a defrag ioctl on it starts");
+
 static long cetrafs_defrag_ioctl(struct file *file, struct cetrafs_defrag_stats __user *uarg)
 {
     struct inode *inode = file_inode(file);
@@ -6747,6 +6754,10 @@ static long cetrafs_defrag_ioctl(struct file *file, struct cetrafs_defrag_stats 
 
     if (!(file->f_mode & FMODE_WRITE))
         return -EBADF; /* the write-open IS the cross-node exclusivity */
+    if (READ_ONCE(cetrafs_defrag_damage_ino) && cetrafs_defrag_damage_ino == inode->i_ino) {
+        WRITE_ONCE(cetrafs_defrag_damage_ino, 0);
+        cetrafs_sb_corrupt_inode(inode); /* TEST ONLY */
+    }
 
     /*
      * An ioctl that writes has to ask the MOUNT for permission, not
