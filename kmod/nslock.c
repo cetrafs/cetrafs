@@ -371,7 +371,20 @@ static int cetrafs_nslock_try(struct inode *inode, u32 my_node_id)
     if (ret)
         return ret;
 
-    ctx.generation = cetrafs_le64(raw.generation);
+    /*
+     * The generation THIS object is, not the record's: a stale in-core
+     * object for a reused number -- kept alive by an open fd -- has its
+     * own local mutex, so "the lock is already ours" can be the fresh
+     * object's operation holding it. Taking the record's generation let
+     * the stale one adopt that lock, fail its own generation check and
+     * release it under the operation (audit 2026-11-06 L5). Bound to
+     * ours, the swap refuses it (-ESTALE) before looking at the owner.
+     */
+    ctx.generation = cetrafs_inode_get_generation(inode);
+    if (!ctx.generation)
+        ctx.generation = cetrafs_le64(raw.generation);
+    if (cetrafs_le64(raw.generation) != ctx.generation)
+        return -ESTALE;
 
     if (cetrafs_le32(raw.ns_lock_owner) != CETRAFS_NODE_ID_NONE && cetrafs_le32(raw.ns_lock_owner) != my_node_id) {
         bool stale = false;
