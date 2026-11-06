@@ -3625,6 +3625,13 @@ void cetrafs_bg_refresh_owner_map(struct super_block *sb)
         pr_info("%u Block Group(s) changed owner since this node last looked\n", moved);
 }
 
+/* TEST ONLY: one claim pauses once the Block Group is allocatable, so a
+ * concurrent writer allocates from it while the claim is still in
+ * flight (tests/kernel/zg_aggregate_drift.sh). */
+static unsigned int cetrafs_bg_claim_stall_ms;
+cetrafs_test_param(bg_claim_stall_ms, cetrafs_bg_claim_stall_ms, uint, 0644);
+MODULE_PARM_DESC(bg_claim_stall_ms, "test-only: pause one Block Group claim once the group is allocatable");
+
 int cetrafs_bg_claim_free(struct super_block *sb, u32 zg_id, u32 *out_bg_id)
 {
     const cetrafs_superblock_t *raw_sb = cetrafs_sb_raw(sb);
@@ -3637,6 +3644,7 @@ int cetrafs_bg_claim_free(struct super_block *sb, u32 zg_id, u32 *out_bg_id)
     for (b = 0; b < nbg; b++) {
         struct cetrafs_bg_claim_ctx ctx = {.zg_id = zg_id, .bg_id = b};
         struct cetrafs_bg_geom geom;
+        u64 total = 0, free = 0;
         int ret;
 
         /* Forced fresh: the cached copy can predate a peer's claim, and
@@ -3690,8 +3698,6 @@ int cetrafs_bg_claim_free(struct super_block *sb, u32 zg_id, u32 *out_bg_id)
          * (tests/kernel/bg_claim_epoch.sh). The ZG claim reconciles and
          * the re-attach seeds; this path did neither. */
         cetrafs_sb_set_bg_epoch(sb, b, ctx.seq);
-        cetrafs_sb_set_bg_owner(sb, b, zg_id);
-
         /*
          * The Zone Group just gained this Block Group's free space, and
          * its aggregate has to say so -- fsck cross-checks "a Zone
@@ -3699,26 +3705,40 @@ int cetrafs_bg_claim_free(struct super_block *sb, u32 zg_id, u32 *out_bg_id)
          * the allocator ranks Zone Groups by it. Read fresh: the
          * descriptor was just invalidated above precisely because the
          * cached copy is the pre-claim one.
+         *
+         * Read AND credited before set_bg_owner() makes the group
+         * allocatable (audit 2026-11-06 M4). Read after, an allocation
+         * in between both lowered the count read here and accrued its
+         * own debit: counted twice. Credited after, the debits of
+         * allocations made in between could reach the device first, on
+         * an aggregate that did not hold this group yet -- below zero,
+         * refused, and dropped (cetrafs_zg_apply_free_delta()).
          */
+        if (cetrafs_bg_data_block_stats(sb, b, &total, &free) == 0 && free) {
+            /* Debit the pool BEFORE crediting the aggregate, both by
+             * immediate CAS -- see the release path for why a lazy
+             * accrual here made peers' statfs dip by this whole Block
+             * Group, and why debit-first keeps a crash window
+             * understating rather than inventing space. The release
+             * credits the pool before the descriptor reads FREE, so a
+             * refusal here means drift, never a credit in flight. */
+            if (cetrafs_zg_adjust_pool_blocks(sb, b, -(s64) free))
+                pr_warn("BG %u: claimed but its pool shard debit failed -- df will overstate until fsck\n", b);
+            if (cetrafs_zg_apply_free_delta(sb, zg_id, (s64) free))
+                cetrafs_zg_adjust_free_blocks(sb, zg_id, (s64) free); /* lazy fallback: never lose the move */
+        }
+        cetrafs_sb_set_bg_owner(sb, b, zg_id);
         {
-            u64 total = 0, free = 0;
+            unsigned int pause = xchg(&cetrafs_bg_claim_stall_ms, 0);
 
-            if (cetrafs_bg_data_block_stats(sb, b, &total, &free) == 0 && free) {
-                /* Debit the pool BEFORE crediting the aggregate, both by
-                 * immediate CAS -- see the release path for why a lazy
-                 * accrual here made peers' statfs dip by this whole
-                 * Block Group, and why debit-first keeps a crash window
-                 * understating rather than inventing space. The release
-                 * credits the pool before the descriptor reads FREE, so
-                 * a refusal here means drift, never a credit in flight. */
-                if (cetrafs_zg_adjust_pool_blocks(sb, b, -(s64) free))
-                    pr_warn("BG %u: claimed but its pool shard debit failed -- df will overstate until fsck\n", b);
-                if (cetrafs_zg_apply_free_delta(sb, zg_id, (s64) free))
-                    cetrafs_zg_adjust_free_blocks(sb, zg_id, (s64) free); /* lazy fallback: never lose the move */
+            if (pause) {
+                pr_info("BG %u claim: allocatable, pausing %u ms (test)\n", b, pause);
+                msleep(pause); /* test-only; see the parameter */
             }
         }
 
-        pr_info("BG %u claimed into ZG %u (was owned by nobody, %llu blocks free)\n", b, zg_id, (unsigned long long) 0);
+        pr_info("BG %u claimed into ZG %u (was owned by nobody, %llu blocks free)\n", b, zg_id,
+                (unsigned long long) free);
         if (out_bg_id)
             *out_bg_id = b;
         return 0;

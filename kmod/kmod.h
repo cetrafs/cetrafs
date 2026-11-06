@@ -311,6 +311,8 @@ void cetrafs_sb_cas_lock(struct super_block *sb);
 void cetrafs_sb_cas_unlock(struct super_block *sb);
 void cetrafs_sb_alloc_lock(struct super_block *sb);
 void cetrafs_sb_alloc_unlock(struct super_block *sb);
+bool cetrafs_sb_zg_claim_lock(struct super_block *sb, unsigned int *nofs);
+void cetrafs_sb_zg_claim_unlock(struct super_block *sb, unsigned int nofs);
 bool cetrafs_sb_in_reclaim_lock(struct super_block *sb);
 u64 cetrafs_sb_stamp_ns(struct super_block *sb);
 u64 cetrafs_sb_stamp_now(struct super_block *sb);

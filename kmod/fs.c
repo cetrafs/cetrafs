@@ -210,6 +210,11 @@ struct cetrafs_sb_info {
      * scope it opened and who holds it (cetrafs_sb_in_reclaim_lock()). */
     unsigned int alloc_nofs;
     struct task_struct *alloc_owner;
+    /* cetrafs_sb_zg_claim_lock(): one Zone Group claim or re-attach at a
+     * time on this node, so a tick's re-attach cannot cache a Zone Group
+     * another thread is still recounting (audit 2026-11-06 M4). */
+    struct mutex zg_claim_mutex;
+    struct task_struct *zg_claim_owner;
 
     /* Node-LOCAL serialization of cetrafs_cas_region()'s no-CAW
      * fallback. On a device with atomic COMPARE AND WRITE this is never
@@ -1337,6 +1342,7 @@ int cetrafs_fill_super(struct super_block *sb, struct fs_context *fc)
         if (sbi->peer_count)
             sbi->peers = kcalloc(sbi->peer_count, sizeof(*sbi->peers), GFP_KERNEL);
         mutex_init(&sbi->alloc_mutex);
+        mutex_init(&sbi->zg_claim_mutex);
         sbi->stamp_base = (s64) ktime_get_real_ns() - (s64) ktime_get_ns();
         atomic64_set(&sbi->stamp_last, 0);
         init_rwsem(&sbi->birth_rwsem);
@@ -3022,6 +3028,34 @@ void cetrafs_sb_alloc_unlock(struct super_block *sb)
     WRITE_ONCE(sbi->alloc_owner, NULL);
     memalloc_nofs_restore(sbi->alloc_nofs);
     mutex_unlock(&sbi->alloc_mutex);
+}
+
+/*
+ * Serialise this node's Zone Group claims and re-attaches. Returns false
+ * when the caller already holds it -- a claim whose steal frees into a
+ * full queue reaches the claim again -- and the caller then must not
+ * unlock. NOFS for the same reason as alloc_mutex: an evict under
+ * memory reclaim can free into a full queue, which claims.
+ */
+bool cetrafs_sb_zg_claim_lock(struct super_block *sb, unsigned int *nofs)
+{
+    struct cetrafs_sb_info *sbi = sb->s_fs_info;
+
+    if (READ_ONCE(sbi->zg_claim_owner) == current)
+        return false;
+    *nofs = memalloc_nofs_save();
+    mutex_lock(&sbi->zg_claim_mutex);
+    WRITE_ONCE(sbi->zg_claim_owner, current);
+    return true;
+}
+
+void cetrafs_sb_zg_claim_unlock(struct super_block *sb, unsigned int nofs)
+{
+    struct cetrafs_sb_info *sbi = sb->s_fs_info;
+
+    WRITE_ONCE(sbi->zg_claim_owner, NULL);
+    mutex_unlock(&sbi->zg_claim_mutex);
+    memalloc_nofs_restore(nofs);
 }
 
 /*

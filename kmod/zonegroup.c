@@ -346,6 +346,7 @@ int cetrafs_zg_adjust_free_blocks(struct super_block *sb, u32 zg_id, s64 delta)
 struct cetrafs_zg_delta_ctx {
     s64 delta;
     u32 my_node_id;
+    bool refused; /* the aggregate cannot take it (underflow) */
 };
 
 static int cetrafs_zg_delta_mutate(void *image, unsigned int len, void *priv)
@@ -362,6 +363,7 @@ static int cetrafs_zg_delta_mutate(void *image, unsigned int len, void *priv)
 
     (void) len;
 
+    ctx->refused = false;
     if (!ctx->delta)
         return 1; /* nothing to do */
 
@@ -388,9 +390,12 @@ static int cetrafs_zg_delta_mutate(void *image, unsigned int len, void *priv)
                 (unsigned) le16_to_cpu(zg->owner_node_id));
         return 1;
     }
-    /* class 34: the owner check above is the only writer of deltas --
-     * a peer's frees are queued, not credited here -- so no other
-     * actor's inverse move sits between two of ours. */
+    /* class 34: the owner check above makes this node the only writer
+     * of deltas -- a peer's frees are queued, not credited here. Its
+     * own two inverse moves are ordered: a Block Group claim credits
+     * the aggregate BEFORE the group is allocatable, so no debit for it
+     * can land first (cetrafs_bg_claim_free(); M4 found it after), and
+     * a Zone Group claim recounts before anything can allocate. */
     if (want < 0) {
         /* The aggregate is a count, never negative. Getting here means
          * the deltas and the member BGs have already diverged, which
@@ -398,6 +403,7 @@ static int cetrafs_zg_delta_mutate(void *image, unsigned int len, void *priv)
          * u64 that would read as ~16 exabytes free. */
         pr_err("ZG free delta %lld would take the aggregate below zero (%lld)\n", (long long) ctx->delta,
                (long long) cur);
+        ctx->refused = true;
         return -EINVAL;
     }
 
@@ -493,7 +499,22 @@ int cetrafs_zg_apply_free_delta(struct super_block *sb, u32 zg_id, s64 delta)
     if (ret)
         return ret;
 
-    return cetrafs_cas_record(sb, le64_to_cpu(raw_sb->zg_table_start) + zg_id, cetrafs_zg_delta_mutate, &ctx);
+    ret = cetrafs_cas_record(sb, le64_to_cpu(raw_sb->zg_table_start) + zg_id, cetrafs_zg_delta_mutate, &ctx);
+    /* A delta the aggregate cannot take is CONSUMED, as the Block Group
+     * side does (cetrafs_bg_apply_free_delta()): no retry turns it into
+     * a fit, and every caller re-accrues a failed delta, so returning
+     * the error made the flush fail on every tick for good -- sync_fs
+     * erroring, the flock suspend refused, the surplus release never
+     * completing (audit 2026-11-06 M4). The aggregate is out of step
+     * with its members; the next claim of this Zone Group recounts it
+     * from them, and fsck reports it meanwhile. */
+    if (ctx.refused) {
+        pr_err("ZG %u: dropping the delta -- the aggregate is out of step with its Block Groups, which the next "
+               "claim (or fsck) repairs\n",
+               zg_id);
+        return 0;
+    }
+    return ret;
 }
 
 /*
@@ -676,6 +697,12 @@ int cetrafs_compute_max_file_size(struct super_block *sb, loff_t *out_max)
  * here rather than applied on top of it. The BG half of the same
  * discard lives in cetrafs_sb_set_bg_epoch().
  */
+/* TEST ONLY: one Zone Group reconcile pauses between dropping the
+ * accrued delta and the recount (tests/kernel/zg_aggregate_drift.sh). */
+static unsigned int cetrafs_zg_reconcile_stall_ms;
+cetrafs_test_param(zg_reconcile_stall_ms, cetrafs_zg_reconcile_stall_ms, uint, 0644);
+MODULE_PARM_DESC(zg_reconcile_stall_ms, "test-only: pause one Zone Group reconcile before its recount");
+
 static int cetrafs_zg_reconcile_free_counts(struct super_block *sb, u32 zg_id)
 {
     const cetrafs_superblock_t *raw_sb = cetrafs_sb_raw(sb);
@@ -696,6 +723,14 @@ static int cetrafs_zg_reconcile_free_counts(struct super_block *sb, u32 zg_id)
         if (stale)
             pr_warn("ZG %u: dropping an accrued aggregate delta of %lld -- this claim recounts the members\n", zg_id,
                     (long long) stale);
+    }
+    {
+        unsigned int pause = xchg(&cetrafs_zg_reconcile_stall_ms, 0);
+
+        if (pause) {
+            pr_info("ZG %u reconcile: delta dropped, pausing %u ms (test)\n", zg_id, pause);
+            msleep(pause); /* test-only; see the parameter */
+        }
     }
 
     /* The members are asked of the Block Groups, not of a range
@@ -745,7 +780,32 @@ static unsigned int cetrafs_zg_steal_stall_ms;
 cetrafs_test_param(zg_steal_stall_ms, cetrafs_zg_steal_stall_ms, uint, 0644);
 MODULE_PARM_DESC(zg_steal_stall_ms, "TEST ONLY: pause before stealing a stale owner's zone group");
 
+static int __cetrafs_zg_try_claim_one(struct super_block *sb,
+                                      u32 zg_id,
+                                      u32 my_node_id,
+                                      bool at_mount,
+                                      bool *out_claimed);
+
+/* Under the node's claim mutex: a claim recounts the Zone Group before
+ * caching it as ours, and a concurrent tick's re-attach -- which sees
+ * the device already naming this node -- would otherwise cache it in
+ * the middle of that recount (audit 2026-11-06 M4). */
 static int cetrafs_zg_try_claim_one(struct super_block *sb, u32 zg_id, u32 my_node_id, bool at_mount, bool *out_claimed)
+{
+    unsigned int nofs = 0;
+    bool locked = cetrafs_sb_zg_claim_lock(sb, &nofs);
+    int ret = __cetrafs_zg_try_claim_one(sb, zg_id, my_node_id, at_mount, out_claimed);
+
+    if (locked)
+        cetrafs_sb_zg_claim_unlock(sb, nofs);
+    return ret;
+}
+
+static int __cetrafs_zg_try_claim_one(struct super_block *sb,
+                                      u32 zg_id,
+                                      u32 my_node_id,
+                                      bool at_mount,
+                                      bool *out_claimed)
 {
     cetrafs_zone_group_t *zg; /* heap, not stack -- see the comment above */
     u16 owner;
@@ -904,8 +964,6 @@ static int cetrafs_zg_try_claim_one(struct super_block *sb, u32 zg_id, u32 my_no
             if (cetrafs_sb_bg_owner(sb, b) == zg_id)
                 cetrafs_bg_invalidate_cache(sb, b);
 
-        cetrafs_sb_cache_zg_ownership(sb, zg_id);
-
         /* Ownership has just transferred, which is the one moment this
          * ZG's bitmaps are provably ours and provably quiet -- so it is
          * the only correct moment to check the cached free counts
@@ -915,6 +973,15 @@ static int cetrafs_zg_try_claim_one(struct super_block *sb, u32 zg_id, u32 my_no
          * After the invalidate above, deliberately, so the scan reads
          * the device rather than this node's stale cache. */
         cetrafs_zg_reconcile_free_counts(sb, zg_id);
+
+        /* Only now allocatable. Cached first, an allocation could land
+         * while the recount ran: its aggregate delta accrued before the
+         * reconcile dropped the accrued total and its bit set after a
+         * member was counted, so it was in neither -- or accrued after
+         * the drop on top of a recount that already held it (audit
+         * 2026-11-06 M4). Nothing allocates from a Zone Group this
+         * node has not cached, so the recount runs quiet. */
+        cetrafs_sb_cache_zg_ownership(sb, zg_id);
     }
 
 out_unlock:
@@ -973,18 +1040,38 @@ out_unlock:
  * cluster-wide exhaustion actually is, instead of "succeeding" at a
  * claim that solves nothing.
  */
+static int cetrafs_zg_claim_one_more_locked(struct super_block *sb, u32 count, u32 my_node_id, bool *out_claimed);
+
 static int cetrafs_zg_claim_one_more(struct super_block *sb,
                                      const cetrafs_superblock_t *raw_sb,
                                      u32 my_node_id,
                                      bool *out_claimed)
 {
-    u32 count, z, best_z = 0;
-    u64 best_free = 0;
-    bool have_best = false;
+    u32 count;
+    unsigned int nofs = 0;
+    bool locked;
     int ret;
 
     *out_claimed = false;
     count = le32_to_cpu(raw_sb->zone_group_count);
+
+    /* The whole pick under the claim mutex, not only the claim: a writer
+     * that ran out while another thread's claim is still recounting
+     * waits for it here, then finds the result in the cache and passes
+     * over it as "already ours" -- the caller rescans either way. */
+    locked = cetrafs_sb_zg_claim_lock(sb, &nofs);
+    ret = cetrafs_zg_claim_one_more_locked(sb, count, my_node_id, out_claimed);
+    if (locked)
+        cetrafs_sb_zg_claim_unlock(sb, nofs);
+    return ret;
+}
+
+static int cetrafs_zg_claim_one_more_locked(struct super_block *sb, u32 count, u32 my_node_id, bool *out_claimed)
+{
+    u32 z, best_z = 0;
+    u64 best_free = 0;
+    bool have_best = false;
+    int ret;
 
     for (z = 0; z < count; z++) {
         struct cetrafs_zg_info info;
@@ -2388,8 +2475,11 @@ retry_scan:
              * since they may be exactly the free space this allocation
              * is here looking for. */
             cetrafs_zg_drain_pending_frees(sb);
-            goto retry_scan;
         }
+        /* Rescan even without a claim of our own: another thread's may
+         * have finished while this one waited for the claim mutex. Once
+         * per allocation (tried_claim_more). */
+        goto retry_scan;
     }
 
     /*
