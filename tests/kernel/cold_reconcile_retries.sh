@@ -19,12 +19,15 @@
 # the tree. Asserted: (1) one failure is retried on a beat and settles
 # (file_cache_reconciles moves); (2) an unreadable record is tried 1 + 8
 # times and no more, a beat apart (not 10 a second), and is reported;
-# (3) an unmount with a reconcile parked leaves no busy inode and no
-# warning (the harness checks dmesg).
+# (3) a new mark that runs a parked reconcile which fails again does not
+# park it twice; (4) an unmount with a reconcile parked leaves no busy
+# inode and no warning (the harness checks dmesg).
 #
 # DISCRIMINATION: proven 2026-11-05 without the retry: the counter does
 # not move and the tree stays cold. With the 100 ms sleep-and-requeue,
-# (2) consumes the whole knob within seconds and never gives up.
+# (2) consumes the whole knob within seconds and never gives up. With
+# cetrafs_sb_cold_park() not refusing an entry already parked, (3) reads
+# two entries for one inode.
 set -euo pipefail
 . "$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)/lib/harness.sh"
 require_root
@@ -82,6 +85,32 @@ dmesg_since "$MARK" | grep -q "record still unreadable .* after 8 tries" &&
 [ "$USED" = 9 ] && pass "the reconcile was tried 1 + 8 times and then left alone" ||
     fail "the reconcile was tried $USED times (want 9: one run, eight retries)"
 [ "$(rec)" = "$R0" ] || fail "setup: a reconcile settled although every read failed ($R0 -> $(rec))"
+
+# a new mark while parked: the park's work is not pending, so the mark
+# runs it again; when that run fails too it must not park the inode a
+# second time (a corrupt list and one leaked reference). A tick inside
+# the window would take the entry itself, so a round counts only when
+# exactly one run -- the mark's -- happened in it.
+parked() { sed -n 's/^file_cache_cold_parked: //p' "$INFO"; }
+[ -n "$(parked)" ] || { fail "setup: procfs info has no file_cache_cold_parked"; ct_exit; }
+ct_param_set cold_read_fail 50
+stat "$MNT/v" >/dev/null
+DONE=
+for _ in 1 2 3 4 5; do
+    for _ in $(seq 1 30); do [ "$(parked)" = 1 ] && break; sleep 0.1; done
+    [ "$(parked)" = 1 ] || continue
+    K0="$(knob)"
+    stat "$MNT/v" >/dev/null
+    sleep 0.3
+    N="$(parked)"
+    [ $((K0 - $(knob))) = 1 ] || continue
+    DONE=1
+    break
+done
+[ -n "$DONE" ] || { fail "setup: never ran a fresh mark against a parked reconcile in isolation"; ct_exit; }
+[ "$N" = 1 ] && pass "a failed run of a parked inode does not park it again (parked: $N)" ||
+    fail "a failed run of a parked inode parked it again (parked: $N, want 1)"
+ct_param_set cold_read_fail 0
 
 # unmount while one is parked: its reference must be dropped, not leaked
 ct_param_set cold_read_fail 50

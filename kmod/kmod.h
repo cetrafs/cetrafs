@@ -285,9 +285,11 @@ bool cetrafs_sb_cold_park(struct super_block *sb, struct list_head *e);
 bool cetrafs_sb_cold_retry_begin(struct super_block *sb);
 void cetrafs_sb_cold_retry_end(struct super_block *sb);
 void cetrafs_sb_cold_take(struct super_block *sb, struct list_head *out);
+void cetrafs_sb_cold_unpark(struct super_block *sb, struct list_head *e);
+unsigned int cetrafs_sb_cold_parked_count(struct super_block *sb);
 /* lock.c */
 void cetrafs_lock_retry_cold(struct super_block *sb);
-void cetrafs_lock_cold_drop_parked(struct list_head *parked);
+void cetrafs_lock_cold_drop_parked(struct super_block *sb, struct list_head *parked);
 /* Per-mount defragmentation switches (procfs.c's 'controls' file).
  * _defrag_enabled() gates defragmentation entirely, the ioctl included;
  * _auto_defrag_enabled() gates only the background janitor. */

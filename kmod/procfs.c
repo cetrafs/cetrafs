@@ -272,6 +272,7 @@ static int cetrafs_proc_info_show(struct seq_file *m, void *v)
     seq_printf(m, "ext_cache_hits: %llu\n", cetrafs_ext_cache_hit_count());
     seq_printf(m, "ext_cache_misses: %llu\n", cetrafs_ext_cache_miss_count());
     seq_printf(m, "file_cache_reconciles: %llu\n", cetrafs_file_cache_reconcile_count());
+    seq_printf(m, "file_cache_cold_parked: %u\n", cetrafs_sb_cold_parked_count(sb));
     seq_printf(m, "lock_suspends: %llu\n", cetrafs_lock_suspend_count());
     seq_printf(m, "lock_resumes: %llu\n", cetrafs_lock_resume_count());
     seq_printf(m, "journal_replay_applied: %llu\n", cetrafs_journal_replay_applied_count());

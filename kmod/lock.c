@@ -3161,7 +3161,7 @@ void cetrafs_lock_retry_cold(struct super_block *sb)
         return;
     cetrafs_sb_cold_take(sb, &parked);
     list_for_each_entry_safe(ci, tmp, &parked, cold_park) {
-        list_del_init(&ci->cold_park);
+        cetrafs_sb_cold_unpark(sb, &ci->cold_park);
         /* Already pending: a new mark queued it with a reference of its
          * own, so this one is surplus. Closing: nothing runs again. */
         if (!cetrafs_sb_queue_cold(sb, &ci->cold_work))
@@ -3171,12 +3171,12 @@ void cetrafs_lock_retry_cold(struct super_block *sb)
 }
 
 /* Unmount: drop the references the park holds (cetrafs_sb_cold_close()). */
-void cetrafs_lock_cold_drop_parked(struct list_head *parked)
+void cetrafs_lock_cold_drop_parked(struct super_block *sb, struct list_head *parked)
 {
     struct cetrafs_inode_info *ci, *tmp;
 
     list_for_each_entry_safe(ci, tmp, parked, cold_park) {
-        list_del_init(&ci->cold_park);
+        cetrafs_sb_cold_unpark(sb, &ci->cold_park);
         iput(&ci->vfs_inode);
     }
 }
