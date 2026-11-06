@@ -798,8 +798,8 @@ int main(int argc, char **argv)
     /*
      * Who owns each Block Group.
      *
-     * Existing ones keep their owner, read from the Block Group's own
-     * record -- a Zone Group no longer carries a member list. New ones
+     * Existing ones keep their owner in their own record, untouched -- a
+     * Zone Group no longer carries a member list. New ones
      * are spread ROUND-ROBIN across every existing Zone Group, which is
      * what makes grown capacity reach every node at once instead of
      * landing on whichever one happens to own the tail. No Zone Group
@@ -810,13 +810,11 @@ int main(int argc, char **argv)
     u32 *bg_owner = (u32 *) xcalloc(new_b, sizeof(u32));
     u64 *zg_added = (u64 *) xcalloc(new_z, sizeof(u64));
 
-    for (u64 b = 0; b < old_b; ++b) {
-        cetrafs_block_group_t obg;
-
-        read_block(fd, cetrafs_le64(sb.bg_table_start) + b, blk);
-        memcpy(&obg, blk, sizeof(obg));
-        bg_owner[b] = cetrafs_le16(obg.owner_zg);
-    }
+    /* Only the NEW Block Groups' owners are decided or used here. The
+     * existing ones are never read: on a grown volume their descriptors
+     * are not at bg_table_start + b, and a loop that read them there
+     * fetched the wrong blocks into a result nothing used (audit
+     * 2026-11-06 L26). */
     for (u64 b = old_b; b < new_b; ++b) {
         bg_owner[b] = (u32) (b % old_z);
         zg_added[bg_owner[b]]++;
