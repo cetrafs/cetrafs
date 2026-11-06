@@ -996,6 +996,26 @@ int cetrafs_write_raw_inode(struct super_block *sb, u64 ino, const cetrafs_inode
  * from it.
  */
 /*
+ * Take mode, owner and group from a record into an existing in-core
+ * inode. Caller holds inode_lock and has checked generation and type.
+ *
+ * Clears S_NOSEC every time. The VFS sets it after a write finds no
+ * setuid/setgid and no security xattr, and from then on skips the
+ * privilege kill without looking; only its own notify_change() clears
+ * it. A peer's chmod +s or security.capability arrives here instead,
+ * so with the flag left set an unprivileged write kept the bit a peer
+ * had just set (tests/kernel/setattr_kill_fresh_mode.sh). Cleared, the
+ * next write asks once and sets it again if there is still nothing.
+ */
+void cetrafs_inode_adopt_identity(struct inode *inode, const cetrafs_inode_t *raw)
+{
+    inode->i_mode = (umode_t) cetrafs_le32(raw->mode);
+    i_uid_write(inode, cetrafs_le32(raw->uid));
+    i_gid_write(inode, cetrafs_le32(raw->gid));
+    inode->i_flags &= ~S_NOSEC;
+}
+
+/*
  * A fresh generation for a newly-ALLOCATED inode (v0x0008; see
  * cetrafs.h's field comment for the cross-node reuse type-confusion this
  * detects). Only needs to differ between successive lives of the same
@@ -1528,9 +1548,7 @@ int cetrafs_write_vfs_inode(struct inode *inode)
     if (ilocked) {
         if (((inode->i_mode ^ cetrafs_le32(bufs[0].mode)) & S_IFMT) == 0) {
             set_nlink(inode, cetrafs_le32(bufs[0].nlink));
-            inode->i_mode = (umode_t) cetrafs_le32(bufs[0].mode);
-            i_uid_write(inode, cetrafs_le32(bufs[0].uid));
-            i_gid_write(inode, cetrafs_le32(bufs[0].gid));
+            cetrafs_inode_adopt_identity(inode, &bufs[0]);
         }
         inode_unlock(inode);
         ilocked = false;
@@ -2130,9 +2148,7 @@ static int __cetrafs_apply_raw_to_vfs_inode(struct inode *inode, const cetrafs_i
     if (cetrafs_apply_refresh_stall_ms && S_ISREG(inode->i_mode))
         msleep(cetrafs_apply_refresh_stall_ms);
 
-    inode->i_mode = cetrafs_le32(raw->mode);
-    i_uid_write(inode, cetrafs_le32(raw->uid));
-    i_gid_write(inode, cetrafs_le32(raw->gid));
+    cetrafs_inode_adopt_identity(inode, raw);
     set_nlink(inode, cetrafs_le32(raw->nlink));
     i_size_write(inode, cetrafs_le64(raw->size));
     inode->i_blocks = cetrafs_le64(raw->blocks);

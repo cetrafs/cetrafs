@@ -6007,6 +6007,13 @@ out:
 struct cetrafs_setattr_ns {
     unsigned int ia_valid; /* which of mode/uid/gid this setattr changes */
     u32 kill;              /* S_ISUID/S_ISGID a privilege kill drops, else 0 */
+    /* Regular files: what the foreign-user check judged, and whether the
+     * swap found someone it did not (then nothing is applied). */
+    bool guard;
+    u32 my_node_id;
+    u32 judged_owner;
+    u64 judged_readers;
+    bool refused;
     __le32 mode;
     __le32 uid;
     __le32 gid;
@@ -6016,6 +6023,30 @@ struct cetrafs_setattr_ns {
 static void cetrafs_ns_apply_setattr(cetrafs_inode_t *rec, void *arg)
 {
     struct cetrafs_setattr_ns *u = arg;
+
+    /*
+     * The foreign-user check ran before this swap, and a peer can open
+     * the file in between: its lock or presence lands, it reads the
+     * record for its cached mode, and this chmod lands after -- the peer
+     * then writes with a mode that has lost the setuid bit set here, and
+     * the kill its write owes never happens (or, the other way, keeps a
+     * bit this call dropped). Both live in this sector, so they are
+     * re-asked inside the swap: a lock or presence the check did not
+     * judge refuses the whole setattr. Per attempt -- a retry re-reads.
+     */
+    u->refused = false;
+    if (u->guard) {
+        u64 mine = 1ULL << (u->my_node_id % CETRAFS_MAX_READER_NODES);
+        u32 owner = cetrafs_le32(rec->lock_owner_node);
+
+        if (cetrafs_le32(rec->lock_mode) == CETRAFS_LOCK_EXCLUSIVE && owner != u->my_node_id &&
+            owner != u->judged_owner)
+            u->refused = true;
+        if (cetrafs_le64(rec->read_open_nodes) & ~mine & ~u->judged_readers)
+            u->refused = true;
+        if (u->refused)
+            return; /* nothing of ours: the image goes back as it is */
+    }
 
     /*
      * Only what THIS setattr changes. The values come from the in-core
@@ -6045,6 +6076,13 @@ static void cetrafs_ns_apply_setattr(cetrafs_inode_t *rec, void *arg)
     rec->ctime = u->ctime;
 }
 
+/* TEST ONLY: pause a regular file's setattr between its foreign-user
+ * check and its swap, where a peer's open can land
+ * (tests/kernel/setattr_kill_fresh_mode.sh). */
+static unsigned int cetrafs_setattr_guard_stall_ms;
+cetrafs_test_param(setattr_guard_stall_ms, cetrafs_setattr_guard_stall_ms, uint, 0644);
+MODULE_PARM_DESC(setattr_guard_stall_ms, "TEST ONLY: pause a setattr between its foreign-user check and its swap");
+
 /* TEST ONLY: refuse setattr's next namespace publish, as a CAS the
  * device refused would (tests/kernel/setattr_rollback.sh). */
 static bool cetrafs_setattr_ns_fail_once;
@@ -6060,6 +6098,9 @@ static int cetrafs_setattr_locked(struct mnt_idmap *idmap, struct dentry *dentry
         struct timespec64 atime, mtime, ctime;
     } saved;
     struct inode *inode = d_inode(dentry);
+    u32 judged_owner = CETRAFS_NODE_ID_NONE, guard_node = 0;
+    u64 judged_readers = 0;
+    bool guard = false;
     int ret;
 
     ret = setattr_prepare(idmap, dentry, attr);
@@ -6114,15 +6155,22 @@ static int cetrafs_setattr_locked(struct mnt_idmap *idmap, struct dentry *dentry
              * SUSPENDED this file's automatic lock (lock.c, the handoff
              * window) is still writing it and is published only as
              * presence, so the lock alone no longer answers "is a live
-             * writer here?". chmod/chown rewrite the record. */
+             * writer here?". chmod/chown rewrite the record. What it
+             * judged is re-asked inside the swap below
+             * (cetrafs_ns_apply_setattr()). Not for a size change: its
+             * shrink has published before that swap, and refusing there
+             * would report a truncate that happened as failed. */
             bool reader = false;
 
-            ret = cetrafs_lock_foreign_user_exists(inode->i_sb, inode->i_ino, my_node_id, &blocked, &reader);
+            ret = cetrafs_lock_foreign_user_judged(inode->i_sb, inode->i_ino, my_node_id, &blocked, &reader,
+                                                   &judged_owner, &judged_readers);
             if (ret)
                 return ret;
             if (blocked || reader)
                 return -ETXTBSY;
+            guard = true;
         }
+        guard_node = my_node_id;
     }
 
     if ((attr->ia_valid & ATTR_SIZE) && attr->ia_size != i_size_read(inode)) {
@@ -6228,6 +6276,10 @@ static int cetrafs_setattr_locked(struct mnt_idmap *idmap, struct dentry *dentry
             .kill = (attr->ia_valid & (ATTR_KILL_SUID | ATTR_KILL_SGID)) && (attr->ia_valid & ATTR_MODE)
                         ? (u32) (saved.mode & ~inode->i_mode & (S_ISUID | S_ISGID))
                         : 0,
+            .guard = guard,
+            .my_node_id = guard_node,
+            .judged_owner = judged_owner,
+            .judged_readers = judged_readers,
             .mode = cetrafs_cpu_to_le32(inode->i_mode),
             .uid = cetrafs_cpu_to_le32(i_uid_read(inode)),
             .gid = cetrafs_cpu_to_le32(i_gid_read(inode)),
@@ -6239,9 +6291,16 @@ static int cetrafs_setattr_locked(struct mnt_idmap *idmap, struct dentry *dentry
         ret = cetrafs_read_raw_inode(inode->i_sb, inode->i_ino, &nsraw);
         if (!ret && READ_ONCE(cetrafs_setattr_ns_fail_once) && xchg(&cetrafs_setattr_ns_fail_once, false))
             ret = -EIO; /* test-only; see the parameter */
+        if (!ret && cetrafs_setattr_guard_stall_ms && guard) {
+            msleep(cetrafs_setattr_guard_stall_ms); /* test-only; see the parameter */
+            cetrafs_invalidate_raw_inode(inode->i_sb, inode->i_ino);
+            ret = cetrafs_read_raw_inode(inode->i_sb, inode->i_ino, &nsraw);
+        }
         if (!ret)
             ret = cetrafs_inode_ns_cas(inode->i_sb, inode->i_ino, cetrafs_le64(nsraw.generation), &nsraw,
                                        cetrafs_ns_apply_setattr, &u);
+        if (!ret && u.refused)
+            ret = -ETXTBSY; /* a peer opened it since the check */
         if (ret) {
             inode->i_mode = saved.mode;
             inode->i_uid = saved.uid;
@@ -6483,6 +6542,45 @@ int cetrafs_file_make_durable(struct file *file, bool locked)
     return __cetrafs_fsync(file, 0, LLONG_MAX, locked);
 }
 
+/* TEST ONLY: pause a regular file's write-open before it publishes its
+ * lock or presence -- after the lookup refreshed the inode, where a
+ * peer's chmod can land (tests/kernel/setattr_kill_fresh_mode.sh). */
+static unsigned int cetrafs_open_publish_stall_ms;
+cetrafs_test_param(open_publish_stall_ms, cetrafs_open_publish_stall_ms, uint, 0644);
+MODULE_PARM_DESC(open_publish_stall_ms, "TEST ONLY: pause a write-open before it publishes its lock or presence");
+
+/*
+ * A write-open adopts the record's mode, owner and group as they are
+ * AFTER its lock or presence is on the device.
+ *
+ * The VFS decides a write's setuid/setgid kill from the in-core mode,
+ * and nothing refreshes that while the file is open -- a peer's chmod
+ * is refused from then on (cetrafs_setattr_locked() and the re-check in
+ * its swap). What is left is the chmod that landed BEFORE the publish
+ * and after the lookup's refresh: a peer's chmod +s there left this
+ * node's mode without the bit, and an unprivileged write here kept it.
+ * Read after the publish, under inode_lock so no local setattr is half
+ * applied, the record has it.
+ */
+static int cetrafs_open_adopt_identity(struct inode *inode)
+{
+    cetrafs_inode_t *raw = kmalloc(sizeof(*raw), GFP_NOFS);
+    int ret;
+
+    if (!raw)
+        return -ENOMEM;
+    inode_lock(inode);
+    cetrafs_invalidate_raw_inode(inode->i_sb, inode->i_ino);
+    ret = cetrafs_read_raw_inode(inode->i_sb, inode->i_ino, raw);
+    if (!ret && cetrafs_le64(raw->generation) != cetrafs_inode_get_generation(inode))
+        ret = -ESTALE; /* the number is another file's now */
+    if (!ret && ((inode->i_mode ^ cetrafs_le32(raw->mode)) & S_IFMT) == 0)
+        cetrafs_inode_adopt_identity(inode, raw);
+    inode_unlock(inode);
+    kfree(raw);
+    return ret;
+}
+
 static int cetrafs_open(struct inode *inode, struct file *file)
 {
     int ret = cetrafs_read_gate(inode->i_sb);
@@ -6493,7 +6591,15 @@ static int cetrafs_open(struct inode *inode, struct file *file)
 
     if (ret)
         return ret;
-    return cetrafs_lock_open(inode, file);
+    if (S_ISREG(inode->i_mode) && (file->f_mode & FMODE_WRITE) && READ_ONCE(cetrafs_open_publish_stall_ms))
+        msleep(xchg(&cetrafs_open_publish_stall_ms, 0)); /* test-only, one-shot; see the parameter */
+    ret = cetrafs_lock_open(inode, file);
+    if (ret || !S_ISREG(inode->i_mode) || !(file->f_mode & FMODE_WRITE))
+        return ret;
+    ret = cetrafs_open_adopt_identity(inode);
+    if (ret)
+        cetrafs_release(inode, file); /* ->release is not called for a failed open */
+    return ret;
 }
 
 static int cetrafs_release(struct inode *inode, struct file *file)

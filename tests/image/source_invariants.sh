@@ -1192,6 +1192,31 @@ printf 'const struct file_operations cetrafs_dir_ops = {\n    .owner = THIS_MODU
 [ "$(dir_ops_hooks "$SAMPLE")" = "open " ] && pass "directory records: control -- a planted .open is caught" ||
     fail "directory records: control -- a planted .open is not caught"
 
+# Class 42 (VFS state derived from a field a peer changes). The VFS
+# caches S_NOSEC -- "no setuid/setgid, no security xattr" -- after one
+# write finds nothing to kill, and clears it only in its own
+# notify_change(). A mode adopted from the device left it set, so a
+# peer's chmod +s was never killed by an unprivileged write here. Every
+# in-core mode assignment goes through cetrafs_inode_adopt_identity(),
+# which clears it; the two others are listed with their reason.
+log "checking every adopted mode clears the VFS's derived S_NOSEC"
+MODE_OK='inode.c:inode->i_mode = (umode_t) cetrafs_le32(raw->mode);:the helper itself
+inode.c:inode->i_mode = cetrafs_le32(raw.mode);:iget of a NEW inode -- no flag to clear yet
+file.c:inode->i_mode = saved.mode;:setattr rollback to this node own previous mode'
+mode_sites() { grep -HE '^\s*inode->i_mode = ' "$@" | grep -vE '^\S+:\s*\*' | sed -E "s|^.*/||; s|:\s+|:|"; }
+MS="$(mode_sites "$K"/*.c)"
+[ "$(grep -c . <<<"$MS")" -ge 3 ] || fail "adopted mode: found only $(grep -c . <<<"$MS") i_mode assignments -- the scan is not seeing the tree"
+UNM="$(while IFS= read -r l; do [ -n "$l" ] && ! grep -qF "$l:" <<<"$MODE_OK" && echo "$l"; done <<<"$MS" || true)"
+[ -z "$UNM" ] && pass "adopted mode: every i_mode assignment is the helper or a listed exception" ||
+    fail "adopted mode: set i_mode through cetrafs_inode_adopt_identity() (it clears S_NOSEC): $UNM"
+grep -A6 '^void cetrafs_inode_adopt_identity' "$K/inode.c" | grep -q 'i_flags &= ~S_NOSEC' &&
+    pass "adopted mode: the helper clears S_NOSEC" || fail "adopted mode: cetrafs_inode_adopt_identity() no longer clears S_NOSEC"
+SAMPLE="$(ct_tmp mode-sample).c"
+printf '    inode->i_mode = cetrafs_le32(bufs[0].mode);\n' >"$SAMPLE"
+[ -n "$(mode_sites "$SAMPLE" | while IFS= read -r l; do grep -qF "$l:" <<<"$MODE_OK" || echo "$l"; done)" ] &&
+    pass "adopted mode: control -- a direct assignment is caught" ||
+    fail "adopted mode: control -- a direct assignment is not caught"
+
 # The module must publish the filesystem alias get_fs_type() asks
 # modprobe for ("fs-<name>") when a mount names a type nothing has
 # registered. Without it, `mount -t cetrafs` on a host that has the

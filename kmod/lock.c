@@ -4994,11 +4994,13 @@ int cetrafs_lock_foreign_reader_exists(struct super_block *sb, u64 ino, u32 my_n
  * So on that branch, and only on it, the record is re-read before the
  * reader question is asked of it.
  */
-int cetrafs_lock_foreign_user_exists(struct super_block *sb,
+int cetrafs_lock_foreign_user_judged(struct super_block *sb,
                                      u64 ino,
                                      u32 my_node_id,
                                      bool *out_writer,
-                                     bool *out_reader)
+                                     bool *out_reader,
+                                     u32 *judged_owner,
+                                     u64 *judged_readers)
 {
     cetrafs_inode_t raw;
     bool repaired = false;
@@ -5023,7 +5025,26 @@ int cetrafs_lock_foreign_user_exists(struct super_block *sb,
             return ret;
     }
 
+    /* What was judged: a lock still here belongs to a holder found
+     * stale (a live one returned above), and every presence bit is
+     * either judged live below or cleared by it. */
+    if (judged_owner)
+        *judged_owner = (cetrafs_le32(raw.lock_mode) == CETRAFS_LOCK_EXCLUSIVE &&
+                         cetrafs_le32(raw.lock_owner_node) != my_node_id)
+                            ? cetrafs_le32(raw.lock_owner_node)
+                            : CETRAFS_NODE_ID_NONE;
+    if (judged_readers)
+        *judged_readers = cetrafs_le64(raw.read_open_nodes) & ~(1ULL << (my_node_id % CETRAFS_MAX_READER_NODES));
     return cetrafs_foreign_reader_from_raw(sb, ino, &raw, my_node_id, 0, out_reader);
+}
+
+int cetrafs_lock_foreign_user_exists(struct super_block *sb,
+                                     u64 ino,
+                                     u32 my_node_id,
+                                     bool *out_writer,
+                                     bool *out_reader)
+{
+    return cetrafs_lock_foreign_user_judged(sb, ino, my_node_id, out_writer, out_reader, NULL, NULL);
 }
 
 /* The decision half of cetrafs_lock_foreign_claim_exists(), working

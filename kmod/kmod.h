@@ -906,6 +906,16 @@ int cetrafs_lock_foreign_user_exists(struct super_block *sb,
                                      u32 my_node_id,
                                      bool *out_writer,
                                      bool *out_reader);
+/* The same, also returning what it judged: the foreign lock owner it
+ * read (CETRAFS_NODE_ID_NONE: none) and the foreign presence bits. A
+ * later CAS can then refuse anything that appeared since. */
+int cetrafs_lock_foreign_user_judged(struct super_block *sb,
+                                     u64 ino,
+                                     u32 my_node_id,
+                                     bool *out_writer,
+                                     bool *out_reader,
+                                     u32 *judged_owner,
+                                     u64 *judged_readers);
 bool cetrafs_lock_held_for_write_locally(struct inode *inode);
 int cetrafs_lock_write_gate(struct inode *inode); /* -ETXTBSY while this node's lock is suspended */
 bool cetrafs_lock_read_cache_trusted(struct inode *inode);
@@ -958,6 +968,7 @@ bool cetrafs_inode_stat_baseline_get(struct inode *inode, struct cetrafs_stat_ba
 void cetrafs_inode_stat_baseline_from_incore(struct inode *inode);
 /* inode.c: the three-way merge itself (declared here, after the struct). */
 u64 cetrafs_inode_get_generation(struct inode *inode);
+void cetrafs_inode_adopt_identity(struct inode *inode, const cetrafs_inode_t *raw); /* clears S_NOSEC */
 u64 cetrafs_inode_dirent_seq_cached(struct inode *inode);
 void cetrafs_inode_set_dirent_seq_cached(struct inode *inode, u64 seq);
 void cetrafs_inode_note_local_file_seq(struct inode *inode, u64 seq);
