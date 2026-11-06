@@ -334,6 +334,9 @@ static void cetrafs_heartbeat_maint(struct work_struct *work)
     /* And dead peers' journal areas whose replay claim we could not
      * release: their owner cannot mount past a live replayer. */
     cetrafs_journal_retry_release(sb);
+    /* And cold-tree reconciles that could not read their record: a beat
+     * is their backoff (cetrafs_lock_retry_cold()). */
+    cetrafs_lock_retry_cold(sb);
 
     ret = cetrafs_zg_drain_pending_frees(sb);
     if (ret)

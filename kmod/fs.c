@@ -265,6 +265,12 @@ struct cetrafs_sb_info {
     struct workqueue_struct *cold_wq;
     spinlock_t cold_lock;
     bool cold_closing;
+    /* Reconciles that could not read their record, each holding its
+     * inode reference, waiting for the heartbeat tick (under cold_lock).
+     * cold_retry_mutex brackets a tick's pass, so close can wait out a
+     * pass that has taken entries off the list. */
+    struct list_head cold_parked;
+    struct mutex cold_retry_mutex;
 
     /* errors= and corruption= (mount options, fixed for the mount's
      * life). See cetrafs_sb_fatal() and cetrafs_sb_corrupt(). */
@@ -1408,6 +1414,8 @@ int cetrafs_fill_super(struct super_block *sb, struct fs_context *fc)
         sb->s_fs_info = sbi;
 
         spin_lock_init(&sbi->cold_lock);
+        INIT_LIST_HEAD(&sbi->cold_parked);
+        mutex_init(&sbi->cold_retry_mutex);
         sbi->cold_wq = alloc_workqueue("cetrafs_cold", WQ_MEM_RECLAIM, 0);
         if (!sbi->cold_wq) {
             cetrafs_free_sb_info(sb);
@@ -3618,14 +3626,69 @@ bool cetrafs_sb_queue_cold(struct super_block *sb, struct work_struct *w)
 void cetrafs_sb_cold_close(struct super_block *sb)
 {
     struct cetrafs_sb_info *sbi = sb->s_fs_info;
+    LIST_HEAD(parked);
 
     if (!sbi)
         return;
     spin_lock(&sbi->cold_lock);
     sbi->cold_closing = true;
     spin_unlock(&sbi->cold_lock);
+    /* A tick's pass may hold entries it took off the park: let it finish
+     * (its queueing is refused now, and it drops those references). Then
+     * nothing can park again, and what is parked is ours to drop. */
+    mutex_lock(&sbi->cold_retry_mutex);
+    spin_lock(&sbi->cold_lock);
+    list_splice_init(&sbi->cold_parked, &parked);
+    spin_unlock(&sbi->cold_lock);
+    mutex_unlock(&sbi->cold_retry_mutex);
+    cetrafs_lock_cold_drop_parked(&parked);
     if (sbi->cold_wq)
         flush_workqueue(sbi->cold_wq);
+}
+
+/* Park a reconcile that could not read its record, with its reference,
+ * for the heartbeat tick. False when the mount is closing: the caller
+ * drops the reference. */
+bool cetrafs_sb_cold_park(struct super_block *sb, struct list_head *e)
+{
+    struct cetrafs_sb_info *sbi = sb->s_fs_info;
+    bool parked = false;
+
+    if (!sbi)
+        return false;
+    spin_lock(&sbi->cold_lock);
+    if (!sbi->cold_closing) {
+        list_add_tail(e, &sbi->cold_parked);
+        parked = true;
+    }
+    spin_unlock(&sbi->cold_lock);
+    return parked;
+}
+
+/* False when there is nothing to do (no mount, or nothing parked). */
+bool cetrafs_sb_cold_retry_begin(struct super_block *sb)
+{
+    struct cetrafs_sb_info *sbi = sb->s_fs_info;
+
+    if (!sbi || list_empty_careful(&sbi->cold_parked))
+        return false;
+    mutex_lock(&sbi->cold_retry_mutex);
+    return true;
+}
+
+void cetrafs_sb_cold_retry_end(struct super_block *sb)
+{
+    mutex_unlock(&((struct cetrafs_sb_info *) sb->s_fs_info)->cold_retry_mutex);
+}
+
+/* The whole park, for one pass between _retry_begin() and _end(). */
+void cetrafs_sb_cold_take(struct super_block *sb, struct list_head *out)
+{
+    struct cetrafs_sb_info *sbi = sb->s_fs_info;
+
+    spin_lock(&sbi->cold_lock);
+    list_splice_init(&sbi->cold_parked, out);
+    spin_unlock(&sbi->cold_lock);
 }
 
 bool cetrafs_sb_defrag_draining(struct super_block *sb)

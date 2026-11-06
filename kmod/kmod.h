@@ -280,6 +280,14 @@ int cetrafs_sb_mount_beat(struct super_block *sb);
 bool cetrafs_sb_defrag_draining(struct super_block *sb);
 bool cetrafs_sb_queue_cold(struct super_block *sb, struct work_struct *w);
 void cetrafs_sb_cold_close(struct super_block *sb);
+#define CETRAFS_COLD_RETRIES_MAX 8u /* heartbeat ticks a failed reconcile is retried for */
+bool cetrafs_sb_cold_park(struct super_block *sb, struct list_head *e);
+bool cetrafs_sb_cold_retry_begin(struct super_block *sb);
+void cetrafs_sb_cold_retry_end(struct super_block *sb);
+void cetrafs_sb_cold_take(struct super_block *sb, struct list_head *out);
+/* lock.c */
+void cetrafs_lock_retry_cold(struct super_block *sb);
+void cetrafs_lock_cold_drop_parked(struct list_head *parked);
 /* Per-mount defragmentation switches (procfs.c's 'controls' file).
  * _defrag_enabled() gates defragmentation entirely, the ioctl included;
  * _auto_defrag_enabled() gates only the background janitor. */

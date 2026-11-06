@@ -10,11 +10,21 @@
 # reopens its disk: forced-fresh reads for the life of the open (audit
 # 2026-11-05, section 3).
 #
-# cold_read_fail fails the next reconcile's record read; a stat marks the
-# tree. The reconcile must still complete (file_cache_reconciles moves).
+# A failed reconcile is parked with its reference and the heartbeat tick
+# queues it again -- not a sleep on the queue's worker every 100 ms --
+# for at most CETRAFS_COLD_RETRIES_MAX (8) tries, then it is left cold
+# with a warning. Unmount drops what is parked.
+#
+# cold_read_fail fails the next N reconciles' record reads; a stat marks
+# the tree. Asserted: (1) one failure is retried on a beat and settles
+# (file_cache_reconciles moves); (2) an unreadable record is tried 1 + 8
+# times and no more, a beat apart (not 10 a second), and is reported;
+# (3) an unmount with a reconcile parked leaves no busy inode and no
+# warning (the harness checks dmesg).
 #
 # DISCRIMINATION: proven 2026-11-05 without the retry: the counter does
-# not move and the tree stays cold.
+# not move and the tree stays cold. With the 100 ms sleep-and-requeue,
+# (2) consumes the whole knob within seconds and never gives up.
 set -euo pipefail
 . "$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)/lib/harness.sh"
 require_root
@@ -25,6 +35,7 @@ DEV="$(ct_dev 560 coldre)"
 MNT="$(ct_mnt coldre)"
 ct_track mnt "$MNT"
 ct_mkfs_small "$DEV" >/dev/null
+ct_param_set hb_interval_secs 2 # the retry rides the beat
 ct_mount "$DEV" "$MNT"
 require_cetrafs_mount "$MNT"
 ct_param_set auto_defrag 0
@@ -42,12 +53,42 @@ sleep 0.5
 R0="$(rec)"
 ct_param_set cold_read_fail 1
 stat "$MNT/v" >/dev/null
-sleep 2
+sleep 6 # within three beats
 LEFT="$(cat /sys/module/cetrafs/parameters/cold_read_fail)"
 ct_param_set cold_read_fail 0
 [ "$LEFT" = 0 ] || { fail "setup: no reconcile ran into the failure (knob still $LEFT)"; ct_exit; }
 R1="$(rec)"
 [ "$R1" -gt "$R0" ] && pass "a reconcile whose read failed was retried and settled ($R0 -> $R1)" ||
     fail "a reconcile whose read failed was never retried: the tree stays cold ($R0 -> $R1)"
+knob() { cat /sys/module/cetrafs/parameters/cold_read_fail; }
+R0="$(rec)"
+MARK="$(dmesg_mark)"
+ct_param_set cold_read_fail 50
+stat "$MNT/v" >/dev/null
+sleep 1.5
+EARLY=$((50 - $(knob)))
+[ "$EARLY" -ge 1 ] || { fail "setup: no reconcile ran into the failure"; ct_exit; }
+[ "$EARLY" -le 2 ] && pass "an unreadable record is not re-read in a tight loop ($EARLY tries in 1.5 s)" ||
+    fail "an unreadable record was tried $EARLY times in 1.5 s -- a retry loop, not a backoff"
+for _ in $(seq 1 40); do
+    dmesg_since "$MARK" | grep -q "after 8 tries" && break
+    sleep 1
+done
+sleep 5 # two more beats: nothing may follow the give-up
+USED=$((50 - $(knob)))
+ct_param_set cold_read_fail 0
+dmesg_since "$MARK" | grep -q "record still unreadable .* after 8 tries" &&
+    pass "the give-up is reported" || fail "no report after the retries ran out"
+[ "$USED" = 9 ] && pass "the reconcile was tried 1 + 8 times and then left alone" ||
+    fail "the reconcile was tried $USED times (want 9: one run, eight retries)"
+[ "$(rec)" = "$R0" ] || fail "setup: a reconcile settled although every read failed ($R0 -> $(rec))"
+
+# unmount while one is parked: its reference must be dropped, not leaked
+ct_param_set cold_read_fail 50
+stat "$MNT/v" >/dev/null
+sleep 0.5
+[ "$(knob)" -lt 50 ] || { fail "setup: the reconcile did not fail before the unmount"; ct_exit; }
 ct_umount "$MNT"
+ct_param_set cold_read_fail 0
+pass "an unmount with a reconcile parked completed (busy inodes are checked from dmesg)"
 ct_exit

@@ -421,6 +421,11 @@ struct cetrafs_inode_info {
      * to 229 cached in five seconds, while a plain dd to the same
      * filesystem ran at 600 MB/s. */
     struct work_struct cold_work;
+    /* A reconcile that could not read the record waits here for the
+     * heartbeat tick, holding its reference, instead of sleeping on the
+     * queue's worker (cetrafs_lock_retry_cold()); cold_retries caps it. */
+    struct list_head cold_park;
+    unsigned int cold_retries;
 
     struct inode vfs_inode;
 };
@@ -1192,6 +1197,7 @@ static void cetrafs_inode_identity_init_ci(struct cetrafs_inode_info *ci)
     ci->file_seq_cached = U64_MAX;
     atomic_set(&ci->tree_cold_marks, 0);
     atomic_set(&ci->tree_cold_done, 0);
+    ci->cold_retries = 0;
     ci->read_seq_word = 0;
     ci->read_seq_checked = 0;
     /* A slab object is recycled across identities; a remembered extent
@@ -1225,6 +1231,7 @@ static void cetrafs_inode_init_once(void *foo)
     atomic_set(&ci->lock_local_open_count, 0);
     mutex_init(&ci->ns_mutex);
     INIT_WORK(&ci->cold_work, cetrafs_inode_cold_work);
+    INIT_LIST_HEAD(&ci->cold_park);
     mt_init_flags(&ci->pending, MT_FLAGS_USE_RCU);
     cetrafs_inode_identity_init_ci(ci);
     inode_init_once(&ci->vfs_inode);
@@ -1277,6 +1284,7 @@ void cetrafs_free_vfs_inode(struct inode *inode)
      * unmount side is cetrafs_sb_cold_close(). What remains is checked,
      * not assumed: */
     WARN_ON_ONCE(work_pending(&ci->cold_work));
+    WARN_ON_ONCE(!list_empty(&ci->cold_park)); /* parked holds a reference */
 
     /* ->evict_inode unconditionally drops the reservation, which
      * unpublishes this entry, so by here it must be off the mount's
@@ -3104,6 +3112,7 @@ static void cetrafs_inode_cold_work(struct work_struct *w)
     if (cetrafs_cold_work_stall_ms)
         msleep(cetrafs_cold_work_stall_ms); /* test-only; see the parameter */
     if (dropped) {
+        ci->cold_retries = 0;
         cetrafs_tree_cold_settle(ci, g);
         atomic64_inc(&cetrafs_file_cache_reconciles);
     } else if ((rret == -ENOMEM || rret == -EIO) && !cetrafs_sb_is_fenced(sb)) {
@@ -3117,14 +3126,59 @@ static void cetrafs_inode_cold_work(struct work_struct *w)
          * failures that pass: no memory, or an I/O error short of a stop.
          * A stopped mount refuses every read and a record that is another
          * file now (-ESTALE) or damaged (-EUCLEAN) will not read better,
-         * so those stay cold; an unmount closes the queue, which refuses
-         * this and drops the reference below.
+         * so those stay cold.
+         *
+         * Not by sleeping here: that held the queue's worker -- the
+         * rescuer, under the memory pressure -ENOMEM means -- and retried
+         * every 100 ms for as long as the record stayed unreadable. The
+         * inode is parked with its reference, the heartbeat tick queues
+         * it again (one beat of backoff), and after
+         * CETRAFS_COLD_RETRIES_MAX tries it is left cold, said once. An
+         * unmount closes the park and drops what is on it.
          */
-        msleep(100);
-        if (cetrafs_sb_queue_cold(sb, &ci->cold_work))
-            return;
+        if (++ci->cold_retries <= CETRAFS_COLD_RETRIES_MAX) {
+            if (cetrafs_sb_cold_park(sb, &ci->cold_park))
+                return;
+        } else {
+            pr_warn("cold reconcile: ino=%llu record still unreadable (%d) after %u tries -- its extent tree "
+                    "stays uncached (every map reads the device) until the next change\n",
+                    (unsigned long long) inode->i_ino, rret, CETRAFS_COLD_RETRIES_MAX);
+            ci->cold_retries = 0;
+        }
     }
     iput(inode);
+}
+
+/* Heartbeat tick: queue the parked reconciles again. Runs inside
+ * cetrafs_sb_cold_retry_begin()/_end(), which unmount waits on, so no
+ * reference taken from the park is dropped after the mount closed it. */
+void cetrafs_lock_retry_cold(struct super_block *sb)
+{
+    LIST_HEAD(parked);
+    struct cetrafs_inode_info *ci, *tmp;
+
+    if (!cetrafs_sb_cold_retry_begin(sb))
+        return;
+    cetrafs_sb_cold_take(sb, &parked);
+    list_for_each_entry_safe(ci, tmp, &parked, cold_park) {
+        list_del_init(&ci->cold_park);
+        /* Already pending: a new mark queued it with a reference of its
+         * own, so this one is surplus. Closing: nothing runs again. */
+        if (!cetrafs_sb_queue_cold(sb, &ci->cold_work))
+            iput(&ci->vfs_inode);
+    }
+    cetrafs_sb_cold_retry_end(sb);
+}
+
+/* Unmount: drop the references the park holds (cetrafs_sb_cold_close()). */
+void cetrafs_lock_cold_drop_parked(struct list_head *parked)
+{
+    struct cetrafs_inode_info *ci, *tmp;
+
+    list_for_each_entry_safe(ci, tmp, parked, cold_park) {
+        list_del_init(&ci->cold_park);
+        iput(&ci->vfs_inode);
+    }
 }
 
 /*
