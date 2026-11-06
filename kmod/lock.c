@@ -1525,6 +1525,10 @@ struct cetrafs_lock_cas_ctx {
      *    lock_owner_ok, a holder the caller judged stale and reads past. */
     bool refuse_readers;
     bool refuse_foreign_lock;
+    /*  - refuse_foreign_excl: the exclusive-lock half of the above alone,
+     *    for a nofilelock write-open (a suspended writer is a handoff to
+     *    it, not a conflict). */
+    bool refuse_foreign_excl;
     u32 lock_owner_ok;
 
     /* Release path only: also stamp this inode's in-core stat fields
@@ -1628,13 +1632,13 @@ static int cetrafs_lock_cas_mutate(void *image, unsigned int len, void *priv)
         if (ctx->reader_op == CETRAFS_READER_SET && cetrafs_lock_rec_dead_to_us(&rec, ctx->my_node_id))
             return -ENOENT; /* deleted since our read: see the helper */
 
-        if (ctx->reader_op == CETRAFS_READER_SET && ctx->refuse_foreign_lock) {
+        if (ctx->reader_op == CETRAFS_READER_SET && (ctx->refuse_foreign_lock || ctx->refuse_foreign_excl)) {
             u32 owner = cetrafs_le32(rec.lock_owner_node);
 
             if (cetrafs_le32(rec.lock_mode) == CETRAFS_LOCK_EXCLUSIVE && owner != ctx->my_node_id &&
                 owner != ctx->lock_owner_ok)
                 return -ETXTBSY; /* a writer claimed it since our check */
-            if (cetrafs_le64(rec.suspended_writer_nodes) & ~bit)
+            if (ctx->refuse_foreign_lock && (cetrafs_le64(rec.suspended_writer_nodes) & ~bit))
                 return -ETXTBSY; /* a writer handing it over still writes */
         }
 
@@ -1969,6 +1973,12 @@ static int cetrafs_lock_reread_claimed(struct inode *inode, cetrafs_inode_t *raw
 static bool cetrafs_open_refresh_fail_once;
 cetrafs_test_param(open_refresh_fail_once, cetrafs_open_refresh_fail_once, bool, 0644);
 MODULE_PARM_DESC(open_refresh_fail_once, "TEST ONLY: the next write-open's refresh fails with -EBUSY");
+
+/* TEST ONLY: one open pauses between its checks and its presence swap,
+ * so a peer's lock can land in between (tests/kernel/nofilelock_open_vs_flock.sh). */
+static unsigned int cetrafs_open_presence_stall_ms;
+cetrafs_test_param(open_presence_stall_ms, cetrafs_open_presence_stall_ms, uint, 0644);
+MODULE_PARM_DESC(open_presence_stall_ms, "TEST ONLY: pause one open before its presence swap");
 
 int cetrafs_lock_open(struct inode *inode, struct file *file)
 {
@@ -2322,14 +2332,25 @@ int cetrafs_lock_open(struct inode *inode, struct file *file)
             .generation = cetrafs_le64(raw.generation),
             .reader_op = CETRAFS_READER_SET,
             /* The checks above ran before this swap; a peer may have
-             * claimed the file since. Re-asked inside it. Only for a
-             * READ-open: a nofilelock writer publishes here too, and the
-             * rule does not hold there. A stale holder this open already
+             * claimed the file since. Re-asked inside it. A READ-open
+             * refuses both a foreign exclusive lock and a peer's
+             * suspended writer. A nofilelock WRITE-open publishes here
+             * too and refuses the exclusive lock -- the pre-check above
+             * honours one, and a peer's flock(LOCK_EX) landing between
+             * that check and this swap otherwise held the file exclusive
+             * beside an open writer (audit 2026-11-06 M7) -- but not a
+             * suspended writer: that is a migration handing the file to
+             * exactly this open. A stale holder this open already
              * decided to read past is still allowed. */
             .refuse_foreign_lock = !want_write && !cetrafs_lock_ignore_readers,
+            .refuse_foreign_excl = want_write,
             .lock_owner_ok = stale_owner,
         };
-        int rret = cetrafs_lock_fail_reader_publish ? -EIO : cetrafs_lock_cas(inode, &rctx, &raw);
+        int rret;
+
+        if (READ_ONCE(cetrafs_open_presence_stall_ms))
+            msleep(xchg(&cetrafs_open_presence_stall_ms, 0)); /* test-only, one-shot; see the parameter */
+        rret = cetrafs_lock_fail_reader_publish ? -EIO : cetrafs_lock_cas(inode, &rctx, &raw);
 
         if (rret < 0) {
             /*
@@ -4563,13 +4584,15 @@ static int cetrafs_lock_explicit_acquire(struct inode *inode, struct file *file)
             goto out;
     }
 
-    /* We now hold the on-disk lock, so no NEW peer can open the file
-     * (enforcement rejects them). But a peer that opened it just before our
-     * claim is still in, and the lock's whole promise is "no one else is
-     * using it" -- so detect a pre-existing peer opener and back out rather
-     * than assert a false exclusivity. Checking AFTER the claim (not before)
-     * means the set of possible openers is frozen: only a peer already
-     * present can be found, never a new one racing in. */
+    /* We now hold the on-disk lock, so no NEW peer can open the file:
+     * every opener's presence swap refuses a foreign exclusive lock --
+     * a nofilelock WRITER's too, which it once did not (audit 2026-11-06
+     * M7; tests/kernel/nofilelock_open_vs_flock.sh). But a peer that
+     * opened it just before our claim is still in, and the lock's whole
+     * promise is "no one else is using it" -- so detect a pre-existing
+     * peer opener and back out rather than assert a false exclusivity.
+     * Checking AFTER the claim (not before) means the set of possible
+     * openers is frozen: only a peer already present can be found. */
     ret = cetrafs_lock_foreign_reader_exists(sb, inode->i_ino, my_node_id, &present);
     if (cetrafs_flock_reader_check_fail_once) {
         cetrafs_flock_reader_check_fail_once = false;
