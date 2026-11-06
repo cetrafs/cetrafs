@@ -583,6 +583,60 @@ static unsigned int cetrafs_journal_target_stall_ms;
 cetrafs_test_param(journal_target_stall_ms, cetrafs_journal_target_stall_ms, uint, 0644);
 MODULE_PARM_DESC(journal_target_stall_ms, "TEST ONLY: pause a journaled write between its entry and its target write");
 
+static int cetrafs_journal_zero_header(struct super_block *sb, u64 header_lba);
+
+/* TEST ONLY: attach leaves leftover entries in place, as it did before
+ * cetrafs_journal_retire_leftovers() (tests/kernel/journal_attach_retires.sh). */
+static bool cetrafs_journal_keep_leftovers;
+cetrafs_test_param(journal_keep_leftovers, cetrafs_journal_keep_leftovers, bool, 0644);
+MODULE_PARM_DESC(journal_keep_leftovers, "TEST ONLY: attach keeps entries found under a clean flag");
+
+/*
+ * Retire every live entry in our own area, whatever its flag says. Run at
+ * attach, after the replay the flag asked for (or none, if CLEAN).
+ *
+ * A clean flag says nothing about the slots. A node wedged by a storage
+ * outage can have an entry write queued past its fence; a peer judges it
+ * stale, replays, parks the area CLEAN -- and then the entry lands.
+ * Attach and replay skip the slot scan on a CLEAN area, so it waits there:
+ * the node remounts, journals something (DIRTY), crashes, and the next
+ * replay finds the old entry, whose guard still matches because its
+ * target write was refused -- a dirent for an operation that returned
+ * -EIO comes back (audit 2026-11-06 M10). Nothing this mount writes can
+ * be in a slot yet, so every live header here is such a leftover.
+ *
+ * Reads every header fresh; writes only the live ones, so a cleanly
+ * parked area costs reads alone.
+ */
+static int cetrafs_journal_retire_leftovers(struct super_block *sb, u64 area_start, u64 slots)
+{
+    u64 s, n = 0;
+
+    for (s = 0; s < slots; s++) {
+        u64 header_lba = area_start + 1 + s * CETRAFS_JOURNAL_SLOT_BLOCKS;
+        struct buffer_head *hbh = cetrafs_bread_uncached_retry(sb, header_lba);
+        bool live;
+        int ret;
+
+        if (!hbh)
+            return -EIO;
+        live = cetrafs_le32(((const cetrafs_journal_header_t *) hbh->b_data)->magic) == CETRAFS_JOURNAL_MAGIC;
+        brelse(hbh);
+        if (!live)
+            continue;
+        ret = cetrafs_journal_zero_header(sb, header_lba);
+        if (ret)
+            return ret;
+        n++;
+        if ((s & 255) == 255)
+            cond_resched();
+    }
+    if (n)
+        pr_warn("journal: retired %llu entr%s left in this node's area under a clean flag\n",
+                (unsigned long long) n, n == 1 ? "y" : "ies");
+    return 0;
+}
+
 int cetrafs_journal_attach_node(struct super_block *sb, u32 node_id)
 {
     struct cetrafs_journal *j = cetrafs_sb_get_journal(sb);
@@ -614,6 +668,16 @@ int cetrafs_journal_attach_node(struct super_block *sb, u32 node_id)
     ret = cetrafs_journal_replay_node(sb, node_id, /*wait_for_claim=*/true);
     if (ret)
         return ret;
+    {
+        u64 area, all;
+
+        /* Every slot the area has, not this mount's journal_slots_max. */
+        ret = cetrafs_journal_node_area(sb, node_id, &area, &all);
+        if (!ret && !cetrafs_journal_keep_leftovers)
+            ret = cetrafs_journal_retire_leftovers(sb, area, all);
+        if (ret)
+            return ret;
+    }
 
     j->flag_dirty = false; /* replay always ends with the flag clean */
     j->next_txn_id = 0;
@@ -864,6 +928,16 @@ static int cetrafs_journal_write_block_flags(struct super_block *sb, struct buff
             j->flag_dirty = true;
         }
 
+        /* Again here: the slot wait and the flag write above can block
+         * for as long as the device does, and a fence landing meanwhile
+         * must stop the entry, not let it commit after a peer parked our
+         * area (audit 2026-11-06 M10). I/O already queued still lands;
+         * the attach-time retire covers what gets past this. */
+        if (cetrafs_sb_is_fenced(sb)) {
+            mutex_unlock(&j->lock);
+            cetrafs_bh_abort_update(bh);
+            return -EIO;
+        }
         set_bit(slot, j->busy);
         txn_id = ++j->next_txn_id;
         mutex_unlock(&j->lock);
