@@ -1312,11 +1312,11 @@ int cetrafs_fill_super(struct super_block *sb, struct fs_context *fc)
         }
     }
     if (READ_ONCE(cetrafs_sb_scribble_once) && xchg(&cetrafs_sb_scribble_once, false)) {
-        /* TEST ONLY: the buffer replaced after validation, as a re-read
-         * would -- clean, so nothing writes it back. */
-        lock_buffer(bh);
+        /* TEST ONLY: the buffer changed after validation, as a re-read
+         * would change it -- left clean, so nothing writes it back. No
+         * lock: fill_super is this buffer's only user here, and the
+         * buffer protocol keeps lock_buffer() to ioutil.c. */
         ((cetrafs_superblock_t *) bh->b_data)->root_ino = 0;
-        unlock_buffer(bh);
     }
 
     /* Allocate private SB info and stash things we need */
