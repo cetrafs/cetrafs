@@ -288,6 +288,24 @@ static void pwrite_all(int fd, const void *buf, size_t len, off_t off)
  * with the checksum field zeroed). Records are one per block since
  * v0x0007, so this is a whole-block read-modify-write of a block that
  * holds nothing else. */
+/*
+ * Only a valid record OF THIS NUMBER may be field-patched and restamped.
+ * Restamping restores the checksums over whatever the slot holds, so on
+ * a never-written (all-zero) record it minted a checksum-valid record
+ * for inode 0, mode 0 -- which the next run read as "a valid record for
+ * another inode" and blocked every repair over (audit 2026-11-06 M12).
+ * Such a slot is left for what reports it; this says why nothing was
+ * written.
+ */
+static int fsck_record_restampable(const cetrafs_inode_t *in, uint64_t ino)
+{
+    if (cetrafs_inode_crcs_ok(in) && cetrafs_le64(in->ino) == ino)
+        return 1;
+    fprintf(stderr,
+            "WARN: inode %" PRIu64 "'s record is not a valid record of that number -- not restamping it\n", ino);
+    return 0;
+}
+
 static void repair_set_nlink(int fd, const cetrafs_superblock_t *sb, uint64_t ino, uint32_t nlink)
 {
     uint8_t blk[CETRAFS_BLOCK_SIZE] = {0};
@@ -296,6 +314,8 @@ static void repair_set_nlink(int fd, const cetrafs_superblock_t *sb, uint64_t in
 
     pread_all(fd, blk, sizeof(blk), off);
     memcpy(&in, blk, sizeof(in));
+    if (!fsck_record_restampable(&in, ino))
+        return;
     in.nlink = cetrafs_cpu_to_le32(nlink);
     cetrafs_inode_stamp_crcs_us(&in);
     memcpy(blk, &in, sizeof(in));
@@ -312,6 +332,8 @@ static void repair_set_dir_size(int fd, const cetrafs_superblock_t *sb, uint64_t
 
     pread_all(fd, blk, sizeof(blk), off);
     memcpy(&in, blk, sizeof(in));
+    if (!fsck_record_restampable(&in, ino))
+        return;
     in.size = cetrafs_cpu_to_le64(size);
     cetrafs_inode_stamp_crcs_us(&in);
     memcpy(blk, &in, sizeof(in));
