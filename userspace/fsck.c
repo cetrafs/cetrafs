@@ -1347,6 +1347,13 @@ int main(int argc, char **argv)
                 (uint64_t) cetrafs_le64(sb.total_blocks), total_blocks);
         return 1;
     }
+    /* From here on the VOLUME bounds the layout, as it does at mount
+     * (cetrafs_validate_layout()) and on every I/O
+     * (cetrafs_lba_run_is_data()). A device larger than its volume is
+     * normal -- grown, not yet grown into -- and bounding by the device
+     * passed a layout running past total_blocks that the mount refuses
+     * (audit 2026-11-06 L25). */
+    total_blocks = cetrafs_le64(sb.total_blocks);
     /*
      * fsck checked every structure in this filesystem except which
      * VERSION of the filesystem it was looking at. A build handed a
