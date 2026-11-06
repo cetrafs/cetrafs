@@ -78,6 +78,12 @@ static int cetrafs_xattr_find_slot(const cetrafs_xattr_entry_t *arr, const char 
  * (tests/kernel/xattr_read_vs_reuse.sh).
  */
 static unsigned int cetrafs_xattr_read_pause_ms;
+/* TEST ONLY: tear the next private copy of an xattr block, as a forced
+ * -fresh re-read between the validation and the copy would
+ * (tests/kernel/xattr_copy_revalidated.sh). */
+static bool cetrafs_xattr_tear_copy_once;
+cetrafs_test_param(xattr_tear_copy_once, cetrafs_xattr_tear_copy_once, bool, 0644);
+MODULE_PARM_DESC(xattr_tear_copy_once, "TEST ONLY: tear the next private copy of an xattr block");
 cetrafs_test_param(xattr_read_pause_ms, cetrafs_xattr_read_pause_ms, uint, 0644);
 MODULE_PARM_DESC(xattr_read_pause_ms, "TEST ONLY: pause between an xattr read's record read and its block read");
 
@@ -159,6 +165,17 @@ static int cetrafs_xattr_read_block(struct inode *inode, void **out)
         memcpy(copy, bh->b_data, CETRAFS_BLOCK_SIZE);
         cetrafs_bh_read_unlock(bh);
         brelse(bh);
+        /* The buffer was validated, then copied: another reader's
+         * forced-fresh re-read of the same block can land in between and
+         * put a peer's half-written image in the buffer. The copy is
+         * what gets parsed, so the copy is what is checked (audit
+         * 2026-11-06 L3); a torn one is retried like any other tear. */
+        if (unlikely(cetrafs_xattr_tear_copy_once) && xchg(&cetrafs_xattr_tear_copy_once, false))
+            ((u8 *) copy)[offsetof(cetrafs_xattr_entry_t, value)] ^= 0xff; /* TEST ONLY: see the parameter */
+        if (!cetrafs_blk_image_valid(copy, CETRAFS_XATTR_TAIL_MAGIC)) {
+            usleep_range(100, 400);
+            continue;
+        }
 
         cetrafs_invalidate_raw_inode(sb, inode->i_ino);
         ret = cetrafs_read_raw_inode(sb, inode->i_ino, &raw);

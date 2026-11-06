@@ -707,18 +707,26 @@ bool cetrafs_blk_struct_ok_magic(const struct buffer_head *bh, u32 magic)
     return cetrafs_blk_struct_ok(bh->b_data, magic);
 }
 
-bool cetrafs_blk_tail_valid(const struct buffer_head *bh, u32 magic)
+/* The same test over a private copy of a block: what a reader that
+ * copied the buffer must re-check, since the buffer it validated can be
+ * re-read under it before the copy is taken. */
+bool cetrafs_blk_image_valid(const void *img, u32 magic)
 {
-    const cetrafs_blk_tail_t *tail = (const cetrafs_blk_tail_t *) (bh->b_data + CETRAFS_BLK_TAIL_OFF);
+    const cetrafs_blk_tail_t *tail = (const cetrafs_blk_tail_t *) ((const u8 *) img + CETRAFS_BLK_TAIL_OFF);
 
     if (cetrafs_le32(tail->magic) != magic)
         return false;
-    if (cetrafs_le32(tail->crc) != ~crc32c(~0U, bh->b_data, CETRAFS_BLK_TAIL_OFF))
+    if (cetrafs_le32(tail->crc) != ~crc32c(~0U, img, CETRAFS_BLK_TAIL_OFF))
         return false;
     /* Integrity first, then sense. Both failures take the same route --
      * retry fresh, then -EUCLEAN -- because a lockless reader can catch
      * a writer mid-update and see either. */
-    return cetrafs_blk_struct_ok_magic(bh, magic);
+    return cetrafs_blk_struct_ok(img, magic);
+}
+
+bool cetrafs_blk_tail_valid(const struct buffer_head *bh, u32 magic)
+{
+    return cetrafs_blk_image_valid(bh->b_data, magic);
 }
 
 /*

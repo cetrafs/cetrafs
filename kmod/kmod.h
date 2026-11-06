@@ -499,6 +499,7 @@ bool cetrafs_blk_tail_valid(const struct buffer_head *bh, u32 magic);
  * tail verification: a block nobody else can be writing is still not
  * necessarily a block that makes sense. */
 bool cetrafs_blk_struct_ok_magic(const struct buffer_head *bh, u32 magic);
+bool cetrafs_blk_image_valid(const void *img, u32 magic);
 struct buffer_head *cetrafs_blk_tail_bread(struct super_block *sb, u64 lba, u32 magic, const char *what);
 int cetrafs_cas_region(struct super_block *sb, u64 fs_lba, unsigned int region_idx, cetrafs_cas_fn mutate, void *priv);
 /* Seeded variants: pass the caller's already-fresh image of the region to
