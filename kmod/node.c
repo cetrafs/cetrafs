@@ -1488,7 +1488,22 @@ int cetrafs_node_live_peer_exists(struct super_block *sb, const u8 *my_uuid, boo
         "waiting %us to see whether %u other node(s) are still heartbeating "
         "(this device has no atomic CAW, so only one node may mount it)\n",
         window, candidates);
-    ssleep(window);
+    /* Killable: an operator giving up on a mount that waits out a dead
+     * peer's window must be able to, as every other registry watch
+     * allows -- ssleep() held the mount for all of it (audit 2026-11-06
+     * L6). A mount stopped here concludes nothing about the peers. */
+    {
+        unsigned long until = jiffies + (unsigned long) window * HZ;
+
+        while (time_before(jiffies, until)) {
+            if (fatal_signal_pending(current)) {
+                pr_info("mount: interrupted while watching for live peers -- not mounting\n");
+                ret = -EINTR;
+                goto out;
+            }
+            msleep_interruptible(min_t(unsigned long, 500, jiffies_to_msecs(until - jiffies) + 1));
+        }
+    }
 
     for (idx = 0; idx < count; idx++) {
         if (!hb_before[idx])
