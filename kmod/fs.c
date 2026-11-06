@@ -997,6 +997,12 @@ static int cetrafs_validate_layout(const cetrafs_superblock_t *sb, u64 total_blo
 }
 
 /* ------ helpers ------ */
+/* TEST ONLY: once the mount has validated the superblock, change the
+ * live buffer under it (tests/kernel/sb_copy_validated.sh). */
+static bool cetrafs_sb_scribble_once;
+cetrafs_test_param(sb_scribble_once, cetrafs_sb_scribble_once, bool, 0644);
+MODULE_PARM_DESC(sb_scribble_once, "TEST ONLY: zero the cached superblock's root_ino after the mount validated it");
+
 static int cetrafs_check_sb_crc(const void *buf, size_t len, __le64 stored)
 {
     u32 want = (u32) le64_to_cpu(stored);
@@ -1056,6 +1062,7 @@ int cetrafs_fill_super(struct super_block *sb, struct fs_context *fc)
 {
     struct buffer_head *bh = NULL;
     cetrafs_superblock_t *ondisk;
+    cetrafs_superblock_t sb_copy;
     u64 dev_bytes, dev_blocks;
     u64 zg_cnt, bg_cnt, bg_regions_start, bg_size_blocks;
     u64 features_incompat;
@@ -1096,7 +1103,16 @@ int cetrafs_fill_super(struct super_block *sb, struct fs_context *fc)
         return -EIO;
     }
 
-    ondisk = (cetrafs_superblock_t *) bh->b_data;
+    /*
+     * One private copy, taken under the buffer lock, is what every check
+     * below validates and every later step reads. Validated in the live
+     * buffer and copied afterwards (into raw_sb), the copy was never
+     * checked, and the reads after that still went to the buffer --
+     * which a forced-fresh re-read, or a peer's growfs, can replace
+     * between any two of them (audit 2026-11-06 L14).
+     */
+    cetrafs_bh_copy_stable(bh, &sb_copy, sizeof(sb_copy));
+    ondisk = &sb_copy;
 
     /* Basic identity checks (LE on disk) */
     if (le32_to_cpu(ondisk->magic) != CETRAFS_MAGIC) {
@@ -1293,6 +1309,13 @@ int cetrafs_fill_super(struct super_block *sb, struct fs_context *fc)
             brelse(bh);
             return rc;
         }
+    }
+    if (READ_ONCE(cetrafs_sb_scribble_once) && xchg(&cetrafs_sb_scribble_once, false)) {
+        /* TEST ONLY: the buffer replaced after validation, as a re-read
+         * would -- clean, so nothing writes it back. */
+        lock_buffer(bh);
+        ((cetrafs_superblock_t *) bh->b_data)->root_ino = 0;
+        unlock_buffer(bh);
     }
 
     /* Allocate private SB info and stash things we need */
