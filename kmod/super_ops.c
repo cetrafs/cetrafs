@@ -502,8 +502,12 @@ static void cetrafs_evict_inode(struct inode *inode)
          * fence or replay failing, the holder coming back -- refuses the
          * free exactly as a live foreign user does: a bounded leak fsck
          * names, never blocks freed under a peer's open fd. Nothing
-         * downstream re-asks: the reclaim CAS checks nlink, generation
-         * and the namespace lock only. tests/kernel/evict_check_fails_closed.sh.
+         * downstream re-asks THIS question: the claim that acts on the
+         * verdict (cetrafs_free_inode_begin()) lands only on the dead,
+         * unlocked record of the generation and namespace stamp
+         * (dirent_seq) the verdict read, and a claimed record refuses
+         * the rest -- it never looks at who has the file open.
+         * tests/kernel/evict_check_fails_closed.sh.
          */
         if (!ret) {
             bool blocked = false;
