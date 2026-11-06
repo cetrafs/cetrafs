@@ -61,4 +61,10 @@ R0="$(sed -n 's/.*off_data_region=\([0-9][0-9]*\).*/\1/p' <<<"$B0")"
 "$SEG" "$DEV" copyto $((S0 + R0 + 5000)) >/dev/null
 "$SBP" "$DEV" bg_table_next $((S0 + R0 + 5000)) >/dev/null
 expect "D: the segment inside Block Group 0" 'overlaps BG0'
+
+# A start so close to 2^64 that start + length wraps to a small end
+# inside the data area: tested as a sum, it passed (audit 2026-11-06 L26).
+grown
+"$BGP" "$DEV" 0 --geom=start_block 18446744073709550616 >/dev/null
+expect "E: a Block Group start whose end wraps past 2^64" 'BG0 .* falls outside the data area'
 ct_exit

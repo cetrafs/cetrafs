@@ -1976,7 +1976,12 @@ int main(int argc, char **argv)
                         (uint64_t) cetrafs_le64(bg.length_blocks), (unsigned long long) CETRAFS_MAX_BG_SIZE_BLOCKS);
                 return 1;
             }
-            if (bg_end > data_end || cetrafs_le64(bg.start_block) < cetrafs_le64(sb.bg_regions_start)) {
+            /* No sum in the test: start and length are both off the disk,
+             * and a start near 2^64 wraps start + length to a small
+             * bg_end that passes (audit 2026-11-06 L26). */
+            if (cetrafs_le64(bg.start_block) > data_end ||
+                cetrafs_le64(bg.length_blocks) > data_end - cetrafs_le64(bg.start_block) ||
+                cetrafs_le64(bg.start_block) < cetrafs_le64(sb.bg_regions_start)) {
                 fprintf(stderr,
                         "ERR: BG%zu [%" PRIu64 ",+%" PRIu64 ") falls outside the data area [%" PRIu64 ",%" PRIu64 ")\n",
                         (size_t) b, (uint64_t) cetrafs_le64(bg.start_block), (uint64_t) cetrafs_le64(bg.length_blocks),
