@@ -549,7 +549,8 @@ static void cetrafs_evict_inode(struct inode *inode)
              * (cetrafs_free_inode_begin()): with the number freed first,
              * the blocks not yet freed were named by nothing the scrub
              * walks, for as long as thousands of frees take. */
-            fret = cetrafs_free_inode_begin(sb, inode->i_ino, cetrafs_inode_get_generation(inode), &fseq);
+            fret = cetrafs_free_inode_begin(sb, inode->i_ino, cetrafs_inode_get_generation(inode),
+                                            cetrafs_le64(raw.dirent_seq), &fseq);
 
             ctrace("EVICTFREE ino=%llu fret=%d gen=%llu\n", (unsigned long long) inode->i_ino, fret,
                    (unsigned long long) cetrafs_inode_get_generation(inode));
