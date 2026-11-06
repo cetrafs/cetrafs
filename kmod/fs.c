@@ -4746,7 +4746,13 @@ u32 cetrafs_sb_nslock_take_deferred(struct super_block *sb, struct cetrafs_nsrel
     spin_lock(&sbi->nsrel_lock);
     n = min(sbi->nsrel_count, max);
     memcpy(out, sbi->nsrel, n * sizeof(*out));
-    sbi->nsrel_count = 0;
+    /* What was not taken stays queued, as the flock and rcrel takes
+     * keep it: zeroing the count dropped every entry past 'max' -- a
+     * namespace lock nobody would ever release. Unreachable while the
+     * one caller's buffer is CETRAFS_NSLOCK_DEFERRED_MAX long (audit
+     * 2026-11-06 L26). */
+    memmove(sbi->nsrel, sbi->nsrel + n, (sbi->nsrel_count - n) * sizeof(*out));
+    sbi->nsrel_count -= n;
     sbi->nsrel_active = n != 0;
     spin_unlock(&sbi->nsrel_lock);
     return n;
