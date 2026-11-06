@@ -323,6 +323,14 @@ static int cetrafs_statfs(struct dentry *dentry, struct kstatfs *stat)
  * cross-node open counting; neither exists here, and it is documented
  * as a limitation rather than left looking more fixed than it is.
  */
+/* TEST ONLY: evict inode N as if this node had seen it die. Nothing on a
+ * read-only mount drops a count to 0 today (unlink and writeback are the
+ * only paths, and neither runs there), so this stands in for the next
+ * path that does (tests/kernel/ro_evict_frees_nothing.sh). */
+static unsigned long long cetrafs_evict_drop_nlink_ino;
+cetrafs_test_param(evict_drop_nlink_ino, cetrafs_evict_drop_nlink_ino, ullong, 0644);
+MODULE_PARM_DESC(evict_drop_nlink_ino, "TEST ONLY: evict this inode number with its in-core link count dropped to 0");
+
 static void cetrafs_evict_inode(struct inode *inode)
 {
     struct super_block *sb = inode->i_sb;
@@ -348,6 +356,10 @@ static void cetrafs_evict_inode(struct inode *inode)
         cetrafs_pending_drop_all(inode);
     }
 
+    if (READ_ONCE(cetrafs_evict_drop_nlink_ino) && cetrafs_evict_drop_nlink_ino == inode->i_ino) {
+        WRITE_ONCE(cetrafs_evict_drop_nlink_ino, 0);
+        clear_nlink(inode); /* TEST ONLY: see the parameter */
+    }
     if (!inode->i_nlink) {
         cetrafs_inode_t raw;
         u32 my_node_id = CETRAFS_NODE_ID_NONE;
@@ -403,6 +415,19 @@ static void cetrafs_evict_inode(struct inode *inode)
                 pr_err("evict_inode: ino=%llu has damaged metadata -- freeing nothing; fsck reclaims it\n",
                        (unsigned long long) inode->i_ino);
                 ret = -EUCLEAN;
+            } else if (sb_rdonly(sb)) {
+                /* A read-only mount writes nothing: not this number's
+                 * bit, not its blocks' bits, not a peer's pending-free
+                 * queue. It used to free all three here when it was the
+                 * last holder of a file a peer deleted -- including on
+                 * a mount accepted read-only BECAUSE this build must not
+                 * write the volume (unknown RO_COMPAT; audit 2026-11-06
+                 * L15). A writer's orphan scrub reclaims the number, and
+                 * its block scrub the blocks. */
+                pr_info("evict_inode: ino=%llu deleted elsewhere: read-only mount, freeing nothing -- a writer's "
+                        "scrub reclaims it\n",
+                        (unsigned long long) inode->i_ino);
+                ret = -EROFS;
             }
         }
 
@@ -606,9 +631,9 @@ static void cetrafs_evict_inode(struct inode *inode)
                 pr_warn("evict_inode: ino=%llu changed under the verdict -- freeing nothing\n",
                         (unsigned long long) inode->i_ino);
 skip_free:;
-        } else if (ret != -ETXTBSY && ret != -ESTALE && ret != -EBUSY && ret != -EUCLEAN) {
-            /* -ETXTBSY/-ESTALE/-EBUSY are the "somebody else still has
-             * a claim on this" refusals above; each logs its own
+        } else if (ret != -ETXTBSY && ret != -ESTALE && ret != -EBUSY && ret != -EUCLEAN && ret != -EROFS) {
+            /* -ETXTBSY/-ESTALE/-EBUSY/-EUCLEAN/-EROFS: refusals above that
+             * each log their own
              * reason. Only a genuine read failure belongs here. */
             pr_err(
                 "evict_inode: ino=%llu raw-inode read failed (%d), leaving its inode number and data blocks "

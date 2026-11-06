@@ -959,6 +959,8 @@ int cetrafs_free_inode(struct super_block *sb, u64 ino)
 
     if (cetrafs_sb_is_fenced(sb))
         return -EIO; /* self-fenced */
+    if (cetrafs_sb_ro_refuses(sb, "an inode number free"))
+        return -EROFS;
     if (!raw_sb || !ino)
         return -EINVAL;
 
@@ -1107,6 +1109,8 @@ int cetrafs_free_inode_begin(struct super_block *sb, u64 ino, u64 generation, u6
 
     if (cetrafs_sb_is_fenced(sb))
         return -EIO;
+    if (cetrafs_sb_ro_refuses(sb, "an inode number free"))
+        return -EROFS;
     if (!ino)
         return -EINVAL;
 
@@ -2808,6 +2812,8 @@ static int __cetrafs_free_data_extent(struct super_block *sb, u64 lba, u32 count
 
     if (!count)
         return 0;
+    if (cetrafs_sb_ro_refuses(sb, "a data block free"))
+        return -EROFS;
 
     if (cetrafs_sb_is_fenced(sb))
         return -EIO; /* self-fenced */

@@ -3756,6 +3756,20 @@ bool cetrafs_sb_unclean_reattach(struct super_block *sb)
     return sbi && sbi->reattached_unclean;
 }
 
+/*
+ * A read-only mount writes nothing to the volume through the free path:
+ * no bitmap bit, no peer's pending-free queue (audit 2026-11-06 L15).
+ * The deciders say so first (evict); this is the backstop at the choke
+ * points, so a path nobody thought of fails loudly instead of writing.
+ */
+bool cetrafs_sb_ro_refuses(struct super_block *sb, const char *what)
+{
+    if (!sb_rdonly(sb))
+        return false;
+    pr_err_ratelimited("%s: read-only mount -- refusing %s; a read-only mount writes nothing\n", sb->s_id, what);
+    return true;
+}
+
 bool cetrafs_sb_is_fenced(struct super_block *sb)
 {
     struct cetrafs_sb_info *sbi = sb->s_fs_info;
