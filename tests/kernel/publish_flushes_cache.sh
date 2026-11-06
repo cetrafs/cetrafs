@@ -95,6 +95,27 @@ C="$(op_flushes rm -f "$MNT/u2")"
 ct_param_set publish_flush_skip 0
 check "unlink" "$N" 1 "$C"
 
+# setxattr into a file with no xattr block: one before the record names
+# the new block. removexattr of the last key: one between the clear and
+# the free (audit 2026-11-06 L2).
+touch "$MNT/x1" "$MNT/x2"
+xset() { python3 -c 'import os,sys; os.setxattr(sys.argv[1], "user.k", b"v")' "$1"; }
+xdel() { python3 -c 'import os,sys; os.removexattr(sys.argv[1], "user.k")' "$1"; }
+sync
+N="$(op_flushes xset "$MNT/x1")"
+ct_param_set publish_flush_skip 1
+C="$(op_flushes xset "$MNT/x2")"
+ct_param_set publish_flush_skip 0
+check "setxattr into a new block" "$N" 1 "$C"
+sync
+N="$(op_flushes xdel "$MNT/x1")"
+ct_param_set publish_flush_skip 1
+C="$(op_flushes xdel "$MNT/x2")"
+ct_param_set publish_flush_skip 0
+check "removexattr of the last key" "$N" 1 "$C"
+getfattr_ok="$(python3 -c 'import os,sys; print(len(os.listxattr(sys.argv[1])))' "$MNT/x1")"
+[ "$getfattr_ok" = 0 ] || fail "setup: x1 still has $getfattr_ok xattr(s) after the removal"
+
 ct_umount "$MNT"
 OUT="$(ct_fsck "$DEV" 2>&1 || true)"
 grep -qE '^ERR' <<<"$OUT" && fail "fsck: $(grep '^ERR' <<<"$OUT" | head -3)" || pass "fsck clean"

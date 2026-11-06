@@ -344,6 +344,12 @@ static int cetrafs_xattr_set_locked(struct inode *inode, const char *name, const
         cetrafs_blk_tail_stamp(bh, CETRAFS_XATTR_TAIL_MAGIC);
         ret = cetrafs_journal_write_new_block(sb, bh);
         brelse(bh);
+        /* Written is not durable: on a volatile cache the record naming
+         * this block could survive a power cut without it (rule 8; audit
+         * 2026-11-06 L2). Nothing names it yet, so a refused flush gives
+         * it back. */
+        if (!ret)
+            ret = cetrafs_publish_flush(sb);
         if (ret) {
             cetrafs_free_data_block(sb, lba);
             return ret;
@@ -446,6 +452,16 @@ static int cetrafs_xattr_set_locked(struct inode *inode, const char *name, const
         }
         if (ret)
             return ret;
+        /* The free must not reach the device ahead of the clear that
+         * stopped naming the block (rule 21; audit 2026-11-06 L2). A
+         * refused flush leaks it to the scrub rather than freeing a
+         * block the durable record may still name. */
+        if (cetrafs_publish_flush(sb)) {
+            pr_err("removexattr: ino=%llu: the device refused a cache flush -- leaving xattr block %llu allocated "
+                   "for the scrub\n",
+                   (unsigned long long) inode->i_ino, (unsigned long long) old_lba);
+            return 0;
+        }
         cetrafs_free_data_block(sb, old_lba);
         return 0;
     }
