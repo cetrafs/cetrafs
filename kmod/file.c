@@ -409,8 +409,8 @@ static bool cetrafs_dio_unaligned(const struct inode *inode, const struct kiocb 
  * after the extension, which a concurrent caller cannot tell apart.
  *
  * Only a non-zero tail is dirtied: those bytes came from a store that
- * went through page_mkwrite, so the block behind them is allocated and
- * writeback has nothing to allocate.
+ * went through page_mkwrite, or from the device, so the block behind
+ * them is allocated and writeback has nothing to allocate.
  */
 static void cetrafs_zero_post_eof(struct inode *inode, loff_t old_size, loff_t new_size)
 {
@@ -425,9 +425,19 @@ static void cetrafs_zero_post_eof(struct inode *inode, loff_t old_size, loff_t n
         return; /* stopped: nothing new reaches the device */
 
     folio = filemap_lock_folio(mapping, old_size >> PAGE_SHIFT);
-    if (IS_ERR(folio))
-        return; /* not cached: writeback zeroed the tail on its way out */
-    folio_unlock(folio);
+    if (!IS_ERR(folio)) {
+        folio_unlock(folio);
+    } else {
+        /* Not cached. Writeback zeroes a tail on its way out, but the
+         * DEVICE can still hold one: truncate publishes the smaller size
+         * before it zeroes, and a crash between leaves the file's old
+         * bytes there (audit 2026-11-06 L22). Read it and zero it like a
+         * cached one; a hole or unwritten block reads as zeros and is
+         * left alone. A read that fails leaves it, as before. */
+        folio = read_mapping_folio(mapping, old_size >> PAGE_SHIFT, NULL);
+        if (IS_ERR(folio))
+            return;
+    }
     if (folio_mapped(folio))
         unmap_mapping_range(mapping, folio_pos(folio), folio_size(folio), 0);
     folio_lock(folio);
