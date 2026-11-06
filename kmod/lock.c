@@ -278,6 +278,18 @@ struct cetrafs_inode_info {
      * lock_mutex. */
     struct file *explicit_lock_file;
 
+    /* A last writer's close whose publish failed still owes what it
+     * would have withdrawn after it: the presence bit (one
+     * read_opener_count reference kept per such close -- a count, as a
+     * later writer's close can owe another before any lands) and, for a suspended
+     * writer, its mark in suspended_writer_nodes. Withdrawing them over
+     * an unpublished record told a peer the file was free while this
+     * node's shadow tree could still land over the peer's changes
+     * (audit 2026-11-06 H3). Settled by the first publish that lands
+     * (cetrafs_lock_settle_close()). Guarded by lock_mutex. */
+    unsigned int close_owes_presence;
+    bool close_owes_suspend_mark;
+
     /* DEFAULT mount only: this node has surrendered this inode's
      * automatic lock on request (flock(LOCK_UN)) while still holding it
      * open for write. The lock is gone from the record, so a peer may
@@ -1192,6 +1204,8 @@ static void cetrafs_inode_identity_init_ci(struct cetrafs_inode_info *ci)
     atomic_set(&ci->defrag_queued, 0);
     ci->defrag_quiet_until = jiffies;
     ci->explicit_lock_file = NULL;
+    ci->close_owes_presence = 0;
+    ci->close_owes_suspend_mark = false;
     ci->lock_suspended = false;
     ci->dirent_seq_cached = U64_MAX;
     ci->file_seq_cached = U64_MAX;
@@ -2428,6 +2442,34 @@ static void cetrafs_lock_drop_suspend_mark(struct inode *inode)
         cetrafs_sb_presence_defer(inode->i_sb, inode->i_ino, cetrafs_inode_get_generation(inode));
 }
 
+/*
+ * A last writer's publish has landed: withdraw what its close kept back
+ * (see close_owes_presence). 'orphaned' is the heartbeat's retry: there,
+ * with nothing owed and nothing open here, a presence bit or suspend
+ * mark still set is one whose owing state went with an evicted in-core
+ * inode -- the record is published now, so it goes too (both CASes are
+ * no-ops on a clear record). Not on a close: a default-mode writer owes
+ * neither, and two CASes per close would be pure cost. Caller holds
+ * lock_mutex.
+ */
+static void cetrafs_lock_settle_close(struct inode *inode, bool orphaned)
+{
+    struct cetrafs_inode_info *ci = CETRAFS_I(inode);
+    bool owed = ci->close_owes_presence || ci->close_owes_suspend_mark;
+
+    orphaned = orphaned && !owed;
+    if (ci->close_owes_suspend_mark || (orphaned && !atomic_read(&ci->lock_writer_count))) {
+        ci->close_owes_suspend_mark = false;
+        cetrafs_lock_drop_suspend_mark(inode);
+    }
+    if (ci->close_owes_presence) {
+        for (; ci->close_owes_presence; ci->close_owes_presence--)
+            cetrafs_lock_presence_put(inode);
+    } else if (orphaned && !atomic_read(&ci->read_opener_count)) {
+        cetrafs_lock_presence_withdraw(inode);
+    }
+}
+
 /* TEST ONLY: the next N close publishes fail without writing anything. */
 static unsigned int cetrafs_close_publish_fail;
 cetrafs_test_param(close_publish_fail, cetrafs_close_publish_fail, uint, 0644);
@@ -2595,13 +2637,23 @@ int cetrafs_lock_release(struct inode *inode, struct file *file)
     struct super_block *sb = inode->i_sb;
     bool want_write = (file->f_mode & FMODE_WRITE) != 0;
     bool lock_on = cetrafs_sb_file_lock_enabled(sb);
+    bool last_writer;
 
     mutex_lock(&ci->lock_mutex);
+    /* The last writer publishes below, and nothing that tells a peer the
+     * file is free -- its explicit lock, its presence bit -- may go
+     * before that publish has landed: a peer's punch in between is
+     * overwritten by this node's shadow tree, and the blocks it freed
+     * are referenced again (audit 2026-11-06 H3;
+     * tests/kernel/close_presence_after_publish.sh). lock_writer_count
+     * moves only under lock_mutex. */
+    last_writer = want_write && atomic_read(&ci->lock_writer_count) == 1;
 
     /* If this fd held the userspace explicit lock (flock(LOCK_EX)) and
      * never released it via flock(LOCK_UN), its close releases it --
-     * the fd-scoped lifetime (Option A) that bounds a crashing holder. */
-    if (ci->explicit_lock_file == file) {
+     * the fd-scoped lifetime (Option A) that bounds a crashing holder.
+     * The last writer's is released after its publish, below. */
+    if (ci->explicit_lock_file == file && !last_writer) {
         /* The fd is going, so the holder goes with it; a clear that did
          * not land is the heartbeat's to finish
          * (cetrafs_lock_retry_deferred()), never dropped. */
@@ -2617,7 +2669,7 @@ int cetrafs_lock_release(struct inode *inode, struct file *file)
      * nofilelock (where the open published presence). One CAW on the last
      * local opener (1->0); a failure is retried by the heartbeat
      * (cetrafs_lock_presence_withdraw()). */
-    if (!(want_write && lock_on) && atomic_dec_return(&ci->read_opener_count) == 0)
+    if (!(want_write && lock_on) && !last_writer && atomic_dec_return(&ci->read_opener_count) == 0)
         cetrafs_lock_presence_withdraw(inode);
 
     if (!want_write) {
@@ -2734,14 +2786,27 @@ int cetrafs_lock_release(struct inode *inode, struct file *file)
         lock_cleared = false;
         retry = cetrafs_lock_publish_and_clear(inode, &raw, lock_on && !was_suspended, &lock_cleared);
         t_leaf = ktime_get();
-        if (was_suspended) {
-            /* Not writing any more: drop the writer mark even if a local
-             * reader keeps the presence bit. */
-            cetrafs_lock_drop_suspend_mark(inode);
-            cetrafs_lock_presence_put(inode);
-            ci->lock_suspended = false;
+        /* Only now may the file read as free. A suspended writer's mark
+         * and bit, a nofilelock writer's bit and its explicit lock were
+         * the only things telling peers it is in use here. A publish that
+         * failed keeps them all: the heartbeat finishes the close
+         * (cetrafs_lock_retry_deferred()) and settles them then. */
+        if (was_suspended || !lock_on) {
+            ci->close_owes_presence++; /* the reference this open published with */
+            ci->close_owes_suspend_mark = ci->close_owes_suspend_mark || was_suspended;
         }
-        if (retry)
+        ci->lock_suspended = false;
+        if (ci->explicit_lock_file == file) {
+            /* The fd goes either way. A clear that cannot run now (the
+             * publish failed) or did not land is the heartbeat's: it
+             * publishes first and clears after. */
+            ci->explicit_lock_file = NULL;
+            if (retry || cetrafs_lock_clear_on_disk(inode, /*stamp_stat=*/false))
+                retry = retry ? retry : -EAGAIN;
+        }
+        if (!retry)
+            cetrafs_lock_settle_close(inode, false);
+        else
             cetrafs_sb_flock_defer(sb, inode->i_ino, cetrafs_inode_get_generation(inode));
 
         /*
@@ -2898,6 +2963,8 @@ void cetrafs_lock_retry_deferred(struct super_block *sb)
                 }
                 if (!ret)
                     ret = cetrafs_lock_clear_on_disk(inode, /*stamp_stat=*/false);
+                if (!ret && published)
+                    cetrafs_lock_settle_close(inode, true); /* the close's bit, after its publish */
                 if (ret)
                     cetrafs_sb_flock_defer(sb, pend[i].ino, pend[i].generation);
                 else
@@ -2940,7 +3007,11 @@ void cetrafs_lock_retry_deferred(struct super_block *sb)
         if (ret)
             pr_err("lock release retry: ino=%llu failed to flush BG/ZG free counts: %d\n",
                    (unsigned long long) inode->i_ino, ret);
-        ret = cetrafs_lock_publish_and_clear(inode, raw, true, &cleared);
+        /* A suspended writer's close gave its lock to the peer: nothing
+         * of ours to clear, only its mark and bit to settle. */
+        ret = cetrafs_lock_publish_and_clear(inode, raw, !ci->close_owes_suspend_mark, &cleared);
+        if (!ret)
+            cetrafs_lock_settle_close(inode, true);
         mutex_unlock(&ci->lock_mutex);
         if (ret)
             cetrafs_sb_flock_defer(sb, pend[i].ino, pend[i].generation);
