@@ -3708,6 +3708,8 @@ void cetrafs_sb_cold_unpark(struct super_block *sb, struct list_head *e)
 {
     struct cetrafs_sb_info *sbi = sb->s_fs_info;
 
+    if (!sbi)
+        return;
     spin_lock(&sbi->cold_lock);
     list_del_init(e);
     spin_unlock(&sbi->cold_lock);
@@ -3718,6 +3720,8 @@ unsigned int cetrafs_sb_cold_parked_count(struct super_block *sb)
     struct cetrafs_sb_info *sbi = sb->s_fs_info;
     unsigned int n;
 
+    if (!sbi)
+        return 0;
     spin_lock(&sbi->cold_lock);
     n = sbi->cold_parked_n;
     spin_unlock(&sbi->cold_lock);
