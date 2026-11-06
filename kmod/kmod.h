@@ -714,8 +714,9 @@ int cetrafs_free_inode(struct super_block *sb, u64 ino);
 /* The scrub's conditioned variant: frees ONLY if a fresh read still shows
  * the record dead (nlink==0) and unchanged (same generation as the
  * caller's verdict read). -ESTALE means the number was reborn. */
-int cetrafs_free_inode_if_dead(struct super_block *sb, u64 ino, u64 generation);
-int cetrafs_free_inode_begin(struct super_block *sb, u64 ino, u64 generation, u64 *seq);
+int cetrafs_free_inode_if_dead(struct super_block *sb, u64 ino, u64 generation, u64 verdict_seq);
+int cetrafs_free_inode_begin(struct super_block *sb, u64 ino, u64 generation, u64 verdict_seq, u64 *seq);
+int cetrafs_free_inode_steal(struct super_block *sb, u64 ino, u64 generation, u64 verdict_seq, u32 from);
 int cetrafs_free_inode_finish(struct super_block *sb, u64 ino, u64 generation, u64 seq);
 void cetrafs_free_inode_abort(struct super_block *sb, u64 ino, u64 generation, u64 seq);
 int cetrafs_free_inode_number_claimed(struct super_block *sb, u64 ino);
@@ -1042,7 +1043,15 @@ int cetrafs_inode_birth_claim(struct super_block *sb, u64 ino, const cetrafs_ino
  * number could not be cleared -- clear it, THEN release (alloc.c,
  * cetrafs_free_inode_finish()). */
 #define CETRAFS_RECLAIM_FINISH 3
+/* Record mutations of a held free claim (inode.c, cetrafs_reclaim_mutate()):
+ * take over a stale claimant's claim, and drop the xattr pointer of a
+ * record whose number is about to be freed. */
+#define CETRAFS_RECLAIM_STEAL 4
+#define CETRAFS_RECLAIM_FORGET 5
 int cetrafs_inode_reclaim_claim(struct super_block *sb, u64 ino, u64 generation, int mode, u64 *seq);
+int cetrafs_inode_reclaim_claim_at(struct super_block *sb, u64 ino, u64 generation, int mode, u64 *seq, u64 expect,
+                                   u32 from);
+int cetrafs_inode_forget_tree(struct super_block *sb, u64 ino, u64 generation, u64 *seq);
 bool cetrafs_inode_ns_held_by_current(struct inode *inode);
 /* ->flock: the standard flock(2) interface onto the userspace-driven
  * whole-file exclusive lock, meaningful only under nofilelock. Fd-scoped

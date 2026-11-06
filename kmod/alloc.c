@@ -1021,10 +1021,10 @@ int cetrafs_free_inode(struct super_block *sb, u64 ino)
  * "re-read" is a claim CAS on the record, which a creator's own birth
  * claim excludes; see cetrafs_inode_birth_claim().
  */
-int cetrafs_free_inode_if_dead(struct super_block *sb, u64 ino, u64 generation)
+int cetrafs_free_inode_if_dead(struct super_block *sb, u64 ino, u64 generation, u64 verdict_seq)
 {
     u64 seq = 0;
-    int ret = cetrafs_free_inode_begin(sb, ino, generation, &seq);
+    int ret = cetrafs_free_inode_begin(sb, ino, generation, verdict_seq, &seq);
 
     return ret ? ret : cetrafs_free_inode_finish(sb, ino, generation, seq);
 }
@@ -1050,8 +1050,13 @@ int cetrafs_free_inode_if_dead(struct super_block *sb, u64 ino, u64 generation)
  * referenced until the last free has landed.
  *
  * The claim is what arbitrates: a second evict, the orphan scrub and a
- * create all refuse a claimed record, and once _finish() has run a
- * later claim finds the bit free (1). A crash with the claim held leaves
+ * create all refuse a claimed record, and a claim must match the
+ * namespace stamp its verdict read ('verdict_seq', the record's
+ * dirent_seq), which every claim and release advances -- so a verdict
+ * taken before another free of this record never acts after it. Before
+ * the number goes, _finish() also empties the record of every block
+ * reference (cetrafs_inode_forget_tree()): a verdict read after that
+ * free finds nothing to give back. A crash with the claim held leaves
  * an allocated, dead, claimed record naming blocks some of which are
  * free: the claimant's own-claim sweep at re-attach releases it, the
  * orphan scrub then frees the number only (never blocks), and the block
@@ -1059,7 +1064,7 @@ int cetrafs_free_inode_if_dead(struct super_block *sb, u64 ino, u64 generation)
  * record's references below any live one's and leaves the blocks only
  * it names free.
  */
-int cetrafs_free_inode_begin(struct super_block *sb, u64 ino, u64 generation, u64 *seq)
+int cetrafs_free_inode_begin(struct super_block *sb, u64 ino, u64 generation, u64 verdict_seq, u64 *seq)
 {
     unsigned int nofs;
     bool set = false;
@@ -1079,7 +1084,8 @@ int cetrafs_free_inode_begin(struct super_block *sb, u64 ino, u64 generation, u6
      * enough to the free; only this is. */
     nofs = cetrafs_sb_birth_gate(sb, true);
     *seq = 0;
-    ret = cetrafs_inode_reclaim_claim(sb, ino, generation, CETRAFS_RECLAIM_CLAIM, seq);
+    ret = cetrafs_inode_reclaim_claim_at(sb, ino, generation, CETRAFS_RECLAIM_CLAIM, seq, verdict_seq,
+                                         CETRAFS_NODE_ID_NONE);
     if (ret) {
         cetrafs_sb_birth_ungate(sb, true, nofs);
         return ret; /* reborn, locked, or unreadable: free nothing */
@@ -1144,6 +1150,18 @@ int cetrafs_free_inode_finish(struct super_block *sb, u64 ino, u64 generation, u
 
     if (cetrafs_sb_is_fenced(sb))
         return -EIO;
+    /* Every block reference out of the record first, then the number:
+     * after the bit is clear nothing may find blocks to free in it. */
+    ret = cetrafs_inode_forget_tree(sb, ino, generation, &seq);
+    if (ret < 0) {
+        p.seq = seq;
+        pr_warn_ratelimited("inode ino=%llu: its record's block references could not be dropped (%d) -- the "
+                            "heartbeat finishes the free\n",
+                            (unsigned long long) ino, ret);
+        cetrafs_sb_reclaim_defer(sb, &p);
+        return ret;
+    }
+    p.seq = seq;
     if (READ_ONCE(cetrafs_evict_number_free_fail)) {
         WRITE_ONCE(cetrafs_evict_number_free_fail, cetrafs_evict_number_free_fail - 1);
         ret = -EIO; /* test-only */
@@ -1158,6 +1176,40 @@ int cetrafs_free_inode_finish(struct super_block *sb, u64 ino, u64 generation, u
     }
     cetrafs_reclaim_give_back(sb, ino, generation, CETRAFS_RECLAIM_RELEASE, seq);
     return ret;
+}
+
+/*
+ * The orphan scrub's half for a free whose claimant went stale holding
+ * it: 'from' has been judged stale and fenced, and its journal replayed,
+ * by the caller; 'verdict_seq' is the stamp the judgement read. Take the
+ * claim over and finish the free -- the number only, and the record's
+ * block references dropped first: some of the blocks it names may be
+ * free or another file's by now, and the rest are the block scrub's.
+ * Otherwise the number and those blocks stayed allocated until the
+ * claimant came back, and for good if it never did.
+ */
+int cetrafs_free_inode_steal(struct super_block *sb, u64 ino, u64 generation, u64 verdict_seq, u32 from)
+{
+    unsigned int nofs;
+    bool set = false;
+    u64 seq = 0;
+    int ret;
+
+    if (cetrafs_sb_is_fenced(sb))
+        return -EIO;
+    nofs = cetrafs_sb_birth_gate(sb, true);
+    ret = cetrafs_inode_reclaim_claim_at(sb, ino, generation, CETRAFS_RECLAIM_STEAL, &seq, verdict_seq, from);
+    if (!ret) {
+        /* Under a claim the bit cannot change; one read clear means the
+         * claimant's own free got that far before it stopped. */
+        ret = cetrafs_inode_is_allocated_fresh(sb, ino, &set);
+        if (!ret && !set)
+            ret = 1;
+        if (ret)
+            cetrafs_reclaim_give_back(sb, ino, generation, CETRAFS_RECLAIM_RELEASE, seq);
+    }
+    cetrafs_sb_birth_ungate(sb, true, nofs);
+    return ret ? ret : cetrafs_free_inode_finish(sb, ino, generation, seq);
 }
 
 /* Give the claim back and leave the number allocated: a dead, unclaimed

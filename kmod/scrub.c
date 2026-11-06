@@ -679,8 +679,41 @@ static void scrub_reclaim_orphan_inodes(struct cetrafs_scrub *s)
                 cetrafs_le64(raw.read_open_nodes) != 0 || cetrafs_le32(raw.lock_mode) != CETRAFS_LOCK_NONE)
                 continue;
         }
-        if (cetrafs_le32(raw.ns_lock_owner) != CETRAFS_NODE_ID_NONE)
-            continue; /* a namespace operation is mid-flight on this record */
+        if (cetrafs_le32(raw.ns_lock_owner) != CETRAFS_NODE_ID_NONE) {
+            u32 from = cetrafs_le32(raw.ns_lock_owner);
+            bool stale = false;
+
+            /*
+             * A namespace operation or a free is mid-flight on this
+             * record -- or was, on a node that stopped. An evict holds
+             * its claim from before its first block free until after the
+             * number's (cetrafs_free_inode_begin()), so a claimant that
+             * died there left the number and the blocks not yet freed
+             * allocated until it came back, and for good if it never
+             * did. Ours are this node's own retry queue's. A stale one's
+             * is taken over -- after the fence and the replay, as a
+             * namespace lock's is (cetrafs_nslock_try()) -- and the free
+             * finished: the number only, the blocks to the block scrub.
+             */
+            if (from == my_node_id || cetrafs_node_is_stale(sb, from, &stale) || !stale)
+                continue;
+            if (cetrafs_node_fence_peer(sb, from, "an unfinished inode free") ||
+                cetrafs_journal_replay_node(sb, from, /*wait_for_claim=*/true))
+                continue;
+            cetrafs_invalidate_raw_inode(sb, ino);
+            if (cetrafs_read_raw_inode(sb, ino, &raw) != 0 || cetrafs_le32(raw.nlink) != 0 ||
+                cetrafs_le32(raw.ns_lock_owner) != from || cetrafs_le64(raw.read_open_nodes) != 0 ||
+                cetrafs_le32(raw.lock_mode) != CETRAFS_LOCK_NONE)
+                continue;
+            if (cetrafs_free_inode_steal(sb, ino, cetrafs_le64(raw.generation), cetrafs_le64(raw.dirent_seq), from) ==
+                0) {
+                pr_info("scrub: ino=%llu: finished a free stale node %u had claimed\n", (unsigned long long) ino,
+                        from);
+                freed++;
+                atomic64_inc(&cetrafs_scrub_orphans);
+            }
+            continue;
+        }
 
         local = ilookup(sb, ino);
         if (local) {
@@ -688,7 +721,7 @@ static void scrub_reclaim_orphan_inodes(struct cetrafs_scrub *s)
             continue; /* our own object is live -- its eviction owns the free */
         }
 
-        if (cetrafs_free_inode_if_dead(sb, ino, cetrafs_le64(raw.generation)) == 0) {
+        if (cetrafs_free_inode_if_dead(sb, ino, cetrafs_le64(raw.generation), cetrafs_le64(raw.dirent_seq)) == 0) {
             freed++;
             atomic64_inc(&cetrafs_scrub_orphans);
         }

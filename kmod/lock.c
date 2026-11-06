@@ -4003,7 +4003,11 @@ int cetrafs_lock_sweep_own_claims(struct super_block *sb, u32 my_node_id)
                 !(cetrafs_le64(raw.read_open_nodes) & ~bit) &&
                 (cetrafs_le32(raw.lock_mode) == CETRAFS_LOCK_NONE ||
                  cetrafs_le32(raw.lock_owner_node) == my_node_id)) {
-                ret = cetrafs_free_inode_number_claimed(sb, ino);
+                u64 fseq = cetrafs_le64(raw.dirent_seq);
+
+                ret = cetrafs_inode_forget_tree(sb, ino, ctx.generation, &fseq);
+                if (!ret)
+                    ret = cetrafs_free_inode_number_claimed(sb, ino);
                 if (ret < 0) {
                     pr_err("mount: ino=%llu is a free this node did not finish and its number could not be "
                            "cleared: %d\n",

@@ -650,7 +650,9 @@ int cetrafs_inode_birth_claim(struct super_block *sb, u64 ino, const cetrafs_ino
 struct cetrafs_reclaim_ctx {
     u64 generation;
     u64 seq; /* claim: out, the stamp it wrote; release: in, the stamp required */
+    u64 expect_seq; /* claim, steal: the stamp the verdict read */
     u32 me;
+    u32 steal_from; /* steal: the claimant judged stale and fenced */
     int mode;
 };
 
@@ -670,10 +672,32 @@ static int cetrafs_reclaim_mutate(void *image, unsigned int len, void *priv)
 
     switch (ctx->mode) {
     case CETRAFS_RECLAIM_CLAIM:
-        /* Still exactly the dead, unlocked record judged. */
-        if (cetrafs_le32(rec.nlink) != 0 || cetrafs_le32(rec.ns_lock_owner) != CETRAFS_NODE_ID_NONE)
+        /* Still exactly the dead, unlocked record judged -- the same
+         * namespace stamp included. Without the stamp a verdict read
+         * before another free of this record (a peer's evict of its own
+         * copy of the file, or the orphan scrub) matched the record
+         * after it: dead, same generation, unclaimed again. If a peer's
+         * create then held the number, the bit read set and the blocks
+         * that free had given back were freed a second time. */
+        if (cetrafs_le32(rec.nlink) != 0 || cetrafs_le32(rec.ns_lock_owner) != CETRAFS_NODE_ID_NONE ||
+            cetrafs_le64(rec.dirent_seq) != ctx->expect_seq)
             return -ESTALE;
         rec.ns_lock_owner = cetrafs_cpu_to_le32(ctx->me);
+        break;
+    case CETRAFS_RECLAIM_STEAL:
+        /* A free whose claimant went stale holding it, judged at this
+         * stamp; the claimant has been fenced. */
+        if (cetrafs_le32(rec.nlink) != 0 || cetrafs_le32(rec.ns_lock_owner) != ctx->steal_from ||
+            cetrafs_le64(rec.dirent_seq) != ctx->expect_seq)
+            return -ESTALE;
+        rec.ns_lock_owner = cetrafs_cpu_to_le32(ctx->me);
+        break;
+    case CETRAFS_RECLAIM_FORGET:
+        /* Our claim, as we left it: the record's last reference to a
+         * block goes before its number does (cetrafs_inode_forget_tree()). */
+        if (cetrafs_le32(rec.ns_lock_owner) != ctx->me || cetrafs_le64(rec.dirent_seq) != ctx->seq)
+            return -ESTALE;
+        rec.xattr_block = 0;
         break;
     case CETRAFS_RECLAIM_RELEASE:
         /* Exactly what our claim wrote: a creator's birth claim on the
@@ -702,7 +726,16 @@ static int cetrafs_reclaim_mutate(void *image, unsigned int len, void *priv)
  * release. */
 int cetrafs_inode_reclaim_claim(struct super_block *sb, u64 ino, u64 generation, int mode, u64 *seq)
 {
-    struct cetrafs_reclaim_ctx ctx = {.generation = generation, .mode = mode, .seq = seq ? *seq : 0};
+    return cetrafs_inode_reclaim_claim_at(sb, ino, generation, mode, seq, seq ? *seq : 0, CETRAFS_NODE_ID_NONE);
+}
+
+/* The same, for the modes that judge a stamp (claim, steal): 'expect' is
+ * the dirent_seq the verdict read, 'from' the stale claimant (steal). */
+int cetrafs_inode_reclaim_claim_at(struct super_block *sb, u64 ino, u64 generation, int mode, u64 *seq, u64 expect,
+                                   u32 from)
+{
+    struct cetrafs_reclaim_ctx ctx = {.generation = generation, .mode = mode, .seq = seq ? *seq : 0,
+                                      .expect_seq = expect, .steal_from = from};
     u64 lba = cetrafs_inode_lba(sb, ino);
     int ret;
 
@@ -875,6 +908,58 @@ int cetrafs_write_raw_inode_fd(struct super_block *sb, u64 ino, const cetrafs_in
 {
     return __cetrafs_write_raw_inode_fd(sb, ino, src, self, NULL);
 }
+
+/*
+ * A dead record whose number this node holds claimed and is about to
+ * free: drop every block reference it still carries -- the extent root,
+ * size and block count (file sector), the xattr pointer (namespace
+ * sector, through the claim; *seq follows the stamp). Once the number is
+ * free nothing may free those blocks again, and the record is what the
+ * next evict of the same file -- a peer's stale in-core copy -- would
+ * free them from: with a peer's create holding the bit at that moment it
+ * found the number "still allocated" and freed them a second time.
+ * Idempotent; the blocks themselves are already freed, or left to the
+ * block scrub as a leak.
+ */
+int cetrafs_inode_forget_tree(struct super_block *sb, u64 ino, u64 generation, u64 *seq)
+{
+    cetrafs_inode_t *raw = kmalloc(sizeof(*raw), GFP_NOFS);
+    int ret;
+
+    if (!raw)
+        return -ENOMEM;
+    cetrafs_invalidate_raw_inode(sb, ino);
+    ret = cetrafs_read_raw_inode(sb, ino, raw);
+    if (!ret && (cetrafs_le64(raw->generation) != generation || cetrafs_le32(raw->nlink) != 0))
+        ret = -ESTALE;
+    if (!ret && (cetrafs_le16(raw->eh.eh_entries) || cetrafs_le16(raw->eh.eh_depth) || raw->size || raw->blocks)) {
+        raw->eh.eh_entries = 0;
+        raw->eh.eh_depth = 0;
+        memset(&raw->et, 0, sizeof(raw->et));
+        raw->size = 0;
+        raw->blocks = 0;
+        /* Not cetrafs_write_raw_inode_fd(): this publishes no extent,
+         * so its bitmap and cache flushes ahead of the swap buy nothing.
+         * The flush after it does: the number free that follows must not
+         * reach the device first. A refused one is returned, and the
+         * caller keeps its claim for a retry. */
+        {
+            struct cetrafs_fd_write_ctx ctx = {.src = raw, .sb = sb};
+
+            ret = cetrafs_cas_record_fd_seeded(sb, cetrafs_inode_lba(sb, ino), NULL, 0, cetrafs_fd_write_mutate,
+                                               &ctx);
+            if (!ret) {
+                cetrafs_record_write_counted();
+                ret = cetrafs_publish_flush(sb);
+            }
+        }
+    }
+    if (!ret && raw->xattr_block)
+        ret = cetrafs_inode_reclaim_claim(sb, ino, generation, CETRAFS_RECLAIM_FORGET, seq);
+    kfree(raw);
+    return ret;
+}
+
 
 /* The same publish, refused with -ETXTBSY if another node stamped the
  * file sector since 'plan_seq' -- for a caller that built what it
