@@ -357,17 +357,26 @@ static int scrub_build_refset(struct cetrafs_scrub *s, struct scrub_ctx *ctx, bo
      * the extent first -- so the block was still referenced at pass 1
      * and never became a candidate at all. The two cases are disjoint.
      *
-     * One queue read per owned ZG per pass; targets are collected
-     * ZG-major, so tracking the last one is enough to visit each once.
+     * One queue read per owned ZG per pass. Targets are collected in
+     * Block Group order, and ownership is round-robin (BG b of ZG
+     * b % Z), so consecutive targets alternate Zone Groups: "same as the
+     * last" re-read a queue for every owned BG (audit 2026-11-06 L26).
+     * A set of the ZGs already read, then -- the reads all happen here,
+     * back to back, before any free, so one per queue loses nothing.
      */
     {
-        u32 last_zg = U32_MAX;
+        DECLARE_BITMAP(seen, CETRAFS_MAX_ZONE_GROUPS);
 
+        bitmap_zero(seen, CETRAFS_MAX_ZONE_GROUPS);
         for (i = 0; i < ctx->nbgs; i++) {
-            if (ctx->bgs[i].zg_id == last_zg)
-                continue;
-            last_zg = ctx->bgs[i].zg_id;
-            if (cetrafs_zg_pending_free_for_each(sb, last_zg, scrub_mark_ref, ctx) != 0)
+            u32 z = ctx->bgs[i].zg_id;
+
+            if (z < CETRAFS_MAX_ZONE_GROUPS) {
+                if (test_bit(z, seen))
+                    continue;
+                __set_bit(z, seen);
+            }
+            if (cetrafs_zg_pending_free_for_each(sb, z, scrub_mark_ref, ctx) != 0)
                 return -EIO; /* queue unreadable -> cannot vouch -> free nothing */
         }
     }
