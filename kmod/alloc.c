@@ -2806,7 +2806,7 @@ int cetrafs_free_data_extent_unless_reserved(struct super_block *sb, u64 lba, u3
 static int __cetrafs_free_data_extent(struct super_block *sb, u64 lba, u32 count, const u64 *resv_seq)
 {
     struct cetrafs_bg_geom bg;
-    u64 data_start, bit, b, freed = 0;
+    u64 data_start, bit, b, freed = 0, credited = 0;
     u32 bg_id;
     int ret;
 
@@ -2939,8 +2939,25 @@ static int __cetrafs_free_data_extent(struct super_block *sb, u64 lba, u32 count
     for (b = 0; b < count; b++) {
         bool set = false;
 
-        if (!(b & 4095))
-            cond_resched(); /* an extent is up to 2^31 blocks (class 13) */
+        /* An extent is up to a whole Block Group -- 2^32 blocks at the
+         * format's limit -- and holding alloc_mutex across all of it
+         * stopped every allocation on this node for the duration: about
+         * a tenth of a second per default 1 GiB group, minutes at the
+         * limit (audit 2026-11-06 L26). Let go between chunks, the
+         * chunk's credit taken first. Nothing here relies on the extent
+         * going in one hold: the bits not yet freed stay set, so no
+         * allocation can reach them and the group cannot be released
+         * (that needs its bitmap empty), and the reservation checks
+         * below are per block, under the lock, as before. */
+        if (b && !(b & 4095)) {
+            if (freed > credited) {
+                cetrafs_bg_adjust_free_blocks(sb, bg_id, (s64) (freed - credited));
+                credited = freed;
+            }
+            cetrafs_sb_alloc_unlock(sb);
+            cond_resched();
+            cetrafs_sb_alloc_lock(sb);
+        }
         if (resv_seq && cetrafs_resv_covers(sb, lba + b))
             continue; /* a live reservation claimed it since the caller decided -- not ours to free */
         /* Not covered NOW -- but a run released since the verdict was
@@ -2969,8 +2986,8 @@ static int __cetrafs_free_data_extent(struct super_block *sb, u64 lba, u32 count
         cetrafs_shadow_clear(sb, lba + b, 1, "free_data_extent");
         freed++;
     }
-    if (freed)
-        cetrafs_bg_adjust_free_blocks(sb, bg_id, (s64) freed);
+    if (freed > credited)
+        cetrafs_bg_adjust_free_blocks(sb, bg_id, (s64) (freed - credited));
     cetrafs_sb_alloc_unlock(sb);
 
     /*

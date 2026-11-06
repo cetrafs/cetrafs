@@ -41,6 +41,9 @@ D0="$(drops)"
 "$IBP" "$IMG" idxaddr "$INO" 0 "$BAD" 2>/dev/null
 "$IBP" "$IMG" peerseq "$INO" 1 2>/dev/null
 T=/sys/kernel/tracing
+# A kprobe records nothing with tracing switched off, which would read as
+# "no hits": say so instead of passing.
+[ "$(cat "$T/tracing_on" 2>/dev/null)" = 1 ] || { skip "tracing is off (tracing_on != 1): a kprobe would record nothing"; ct_exit; }
 EV=cetrafs_l20_$$
 kp_off() {
     echo 0 >"$T/events/kprobes/$EV/enable" 2>/dev/null || true

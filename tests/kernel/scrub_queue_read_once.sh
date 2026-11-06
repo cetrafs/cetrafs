@@ -44,6 +44,9 @@ dd if=/dev/zero of="$MNT/fill" bs=1M count=1100 conv=fsync status=none 2>/dev/nu
 sync
 
 T=/sys/kernel/tracing
+# A kprobe records nothing with tracing switched off, which would read as
+# "no hits": say so instead of passing.
+[ "$(cat "$T/tracing_on" 2>/dev/null)" = 1 ] || { skip "tracing is off (tracing_on != 1): a kprobe would record nothing"; ct_exit; }
 EV=cetrafs_scrq_$$
 kp_off() {
     echo 0 >"$T/events/kprobes/$EV/enable" 2>/dev/null || true

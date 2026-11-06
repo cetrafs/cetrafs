@@ -41,6 +41,9 @@ OWNER0="$("$MAP" "$DEV" | awk '/^bg 1 /{split($3,a,"="); print a[2]}')"
 [ "$OWNER0" = 65535 ] || { fail "setup: BG 1 is not FREE before the fill (owner $OWNER0)"; ct_umount "$MNT"; ct_exit; }
 
 T=/sys/kernel/tracing
+# A kprobe records nothing with tracing switched off, which would read as
+# "no hits": say so instead of passing.
+[ "$(cat "$T/tracing_on" 2>/dev/null)" = 1 ] || { skip "tracing is off (tracing_on != 1): a kprobe would record nothing"; ct_exit; }
 EV=cetrafs_bgck_$$
 kp_off() {
     echo 0 >"$T/events/kprobes/$EV/enable" 2>/dev/null || true
