@@ -283,6 +283,7 @@ static int cetrafs_proc_info_show(struct seq_file *m, void *v)
     seq_printf(m, "journal_replay_refused: %llu\n", cetrafs_journal_replay_refused_count());
     seq_printf(m, "journal_replay_torn: %llu\n", cetrafs_journal_replay_torn_count());
     seq_printf(m, "defrag_stale_requests: %llu\n", cetrafs_defrag_stale_req_count());
+    seq_printf(m, "defrag_max_step_blocks: %llu\n", cetrafs_defrag_max_step_blocks());
 
     seq_puts(m, "\nzone_groups:\n");
     for (z = 0; z < zg_count; z++) {

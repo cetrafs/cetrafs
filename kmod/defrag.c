@@ -11,18 +11,19 @@
  * move" design would leave exactly those always-open files unreachable,
  * which is the whole point of doing it this way.
  *
- * Each step moves one or more WHOLE original extents from the front of
- * the still-unmoved region into their final contiguous position, then
- * rewrites the extent tree to: [already-moved prefix, as one contiguous
- * run] + [not-yet-moved suffix, still its ORIGINAL extents]. Moving on
- * whole-extent boundaries is not cosmetic -- it's what bounds the
- * intermediate entry count. With k front extents consumed (spanning B
- * blocks, each extent <= CETRAFS_EXT_LEN_MASK), the prefix needs
- * ceil(B/MASK) <= k run entries and the suffix drops k, so the combined
- * tree is always <= the original entry count and can never overflow the
- * single external leaf block. (A naive fixed-block chunk could split a
- * boundary extent and transiently need origcount+1 entries -- which has
- * nowhere to go, since this format chains no further leaf blocks.)
+ * Each step moves at most CETRAFS_DEFRAG_STEP_BLOCKS blocks from the
+ * front of the still-unmoved region into their final contiguous
+ * position, then rewrites the extent tree to: [already-moved prefix, as
+ * one contiguous run] + [not-yet-moved suffix, its ORIGINAL extents]. An
+ * extent that reaches past the cap is split at it, its remainder heading
+ * the suffix (audit 2026-11-06 M9: whole-extent steps made a 100 GiB
+ * extent one lock hold). Entry count: the prefix needs ceil(moved/MASK)
+ * run entries and the suffix drops every extent wholly consumed, so the
+ * tree grows past the original count by at most one, and only on a step
+ * that consumed no whole extent. cetrafs_defrag_commit() builds a fresh
+ * tree at whatever depth that needs; if it cannot (a file already at the
+ * format's entry ceiling) the commit fails before publishing and the
+ * pass stops, leaving the file as the last step left it.
  *
  * The tree is valid and consistent at EVERY step boundary: the suffix
  * still points at its untouched original blocks, the prefix at the new
@@ -140,11 +141,23 @@ cetrafs_test_param(defrag_skip_dense_recheck, cetrafs_defrag_skip_dense_recheck,
 MODULE_PARM_DESC(defrag_skip_dense_recheck,
                  "TEST ONLY: skip the per-step density re-check, leaving the prefix walk alone");
 
-/* Soft cap on blocks relocated per inode_lock hold -- rounded UP to the
- * next whole original extent (always at least one), so a step never
- * splits an extent. Small enough that a VM write rarely waits long for
- * the lock. */
+/* Cap on blocks relocated per inode_lock hold. A HARD cap: an extent
+ * that reaches past it is split at it, the rest left in place for the
+ * next step. Rounding up to the next whole extent made a 100 GiB extent
+ * one step, under inode_lock and invalidate_lock, with no interruption
+ * point -- every guest write, DIO and fault waited out the whole copy
+ * (audit 2026-11-06 M9). Small enough that a VM write rarely waits long
+ * for the lock. */
 #define CETRAFS_DEFRAG_STEP_BLOCKS 128
+
+/* The most blocks any one step has moved under the locks since the
+ * module loaded -- procfs info's defrag_max_step_blocks, which is what
+ * shows the cap holding (tests/kernel/defrag_step_bounded.sh). */
+static atomic64_t cetrafs_defrag_max_step = ATOMIC64_INIT(0);
+u64 cetrafs_defrag_max_step_blocks(void)
+{
+    return (u64) atomic64_read(&cetrafs_defrag_max_step);
+}
 
 /*
  * The mover mutates the extent tree and frees the blocks it moved off.
@@ -580,7 +593,7 @@ int cetrafs_defrag_inode(struct inode *inode, struct cetrafs_defrag_stats *out_s
     while (moved < nblocks) {
         struct blk_plug plug;
         u64 step_end, b;
-        u32 si, suffix_start;
+        u32 si, suffix_start, split_off;
 
         if (cetrafs_sb_defrag_draining(sb) || cetrafs_sb_is_fenced(sb)) {
             ret = -ECANCELED;
@@ -681,9 +694,12 @@ int cetrafs_defrag_inode(struct inode *inode, struct cetrafs_defrag_stats *out_s
             }
         }
 
-        /* Choose this step's end: advance by >= one whole original
-         * extent, up to the soft block cap, always landing on an extent
-         * boundary (so the committed tree never splits one). */
+        /* Choose this step's end: up to the block cap. An extent that
+         * runs past the cap is split there: [its start, step_end) moves
+         * now, and the suffix handed to the commit starts with the rest
+         * of it (split_off blocks in). Extents behind 'moved' were
+         * committed earlier and the prefix walk above proved it. */
+        split_off = 0;
         {
             u64 off = 0;
 
@@ -697,6 +713,11 @@ int cetrafs_defrag_inode(struct inode *inode, struct cetrafs_defrag_stats *out_s
                     continue;
                 }
                 /* this extent starts at or past 'moved' */
+                if (off + len - moved > CETRAFS_DEFRAG_STEP_BLOCKS) {
+                    step_end = moved + CETRAFS_DEFRAG_STEP_BLOCKS;
+                    split_off = (u32) (step_end - off); /* within this extent, > 0 */
+                    break;                              /* si: the split extent heads the suffix */
+                }
                 step_end = off + len;
                 off += len;
                 if (step_end - moved >= CETRAFS_DEFRAG_STEP_BLOCKS) {
@@ -704,7 +725,14 @@ int cetrafs_defrag_inode(struct inode *inode, struct cetrafs_defrag_stats *out_s
                     break;
                 }
             }
-            suffix_start = si; /* first extent fully past step_end */
+            suffix_start = si; /* first extent past step_end (trimmed by split_off) */
+        }
+        {
+            s64 seen = atomic64_read(&cetrafs_defrag_max_step);
+
+            while ((s64) (step_end - moved) > seen &&
+                   !atomic64_try_cmpxchg(&cetrafs_defrag_max_step, &seen, (s64) (step_end - moved)))
+                ;
         }
 
         /* Flush this step's page range so the writer's dirty pages reach
@@ -727,6 +755,16 @@ int cetrafs_defrag_inode(struct inode *inode, struct cetrafs_defrag_stats *out_s
             u64 src = 0, o = 0;
             struct buffer_head *sbh, *dbh;
             u32 e;
+
+            /* Inside the step too: a step is bounded, but an unmount, a
+             * fence or SIGKILL should not wait out even that (M9).
+             * Nothing is committed yet, so stopping here is the same
+             * clean abort as between steps. */
+            if (((b - moved) & 31) == 0 &&
+                (cetrafs_sb_defrag_draining(sb) || cetrafs_sb_is_fenced(sb) || fatal_signal_pending(current))) {
+                ret = fatal_signal_pending(current) ? -EINTR : -ECANCELED;
+                break;
+            }
 
             for (e = 0; e < el.count; e++) {
                 u32 len = cetrafs_extent_len(el.arr[e].ee_len);
@@ -777,7 +815,24 @@ int cetrafs_defrag_inode(struct inode *inode, struct cetrafs_defrag_stats *out_s
             u32 suffix_count = el.count - suffix_start;
             u64 freed_from = moved;
 
+            /* The split extent's remainder heads the suffix for the
+             * commit only: the free loop below maps the old blocks by
+             * walking el.arr's lengths, so the entry is restored before
+             * anything else reads it. */
+            cetrafs_extent_t whole = {0};
+
+            if (split_off) {
+                u32 len = cetrafs_extent_len(suffix[0].ee_len);
+                u64 phys = cetrafs_extent_phys_from_hilo(suffix[0].ee_start_hi, suffix[0].ee_start_lo);
+
+                whole = suffix[0];
+                suffix[0].ee_block = cetrafs_cpu_to_le32(cetrafs_le32(whole.ee_block) + split_off);
+                suffix[0].ee_len = cetrafs_extent_pack_len(len - split_off, cetrafs_extent_is_uninit(whole.ee_len));
+                cetrafs_extent_phys_to_hilo(phys + split_off, &suffix[0].ee_start_hi, &suffix[0].ee_start_lo);
+            }
             ret = cetrafs_defrag_commit(inode, &raw, dst_base, step_end, nblocks, suffix, suffix_count);
+            if (split_off)
+                suffix[0] = whole;
             if (ret == -ENOTRECOVERABLE) {
                 /* The record may name the new run: free none of it. */
                 cetrafs_defrag_inode_unlock(inode);
