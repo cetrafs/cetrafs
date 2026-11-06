@@ -1242,6 +1242,33 @@ printf '            memcpy(old, bh->b_data + off, region);\n' >"$SAMPLE"
 [ "$(caw_raw "$SAMPLE")" = "memcpy(old, bh->b_data + off, region);" ] &&
     pass "class 27: control -- a planted unlocked copy is found" || fail "class 27: control -- a planted unlocked copy is not found"
 
+# Class 30 (a transport result classified as definite), the CAS loop. A
+# swap that timed out may still land, so once one is in flight every way
+# out of cetrafs_cas_region_seeded_impl() must either have confirmed it
+# or stop the mount; a plain error lets the caller re-accrue its delta
+# under a command that then lands too (audit 2026-11-06 L12). Checked
+# structurally: the buffer that holds the in-flight swap is allocated
+# before the loop (no -ENOMEM mid-flight), nothing inside the loop returns
+# except through 'out:', and 'out:' stops the mount for an undecided swap.
+log "checking every exit of the CAS loop settles a timed-out swap (class 30)"
+cas_body() { sed -n '/^static int cetrafs_cas_region_seeded_impl(/,/^}/p' "$1"; }
+cas_check() { # <file>: prints what is wrong, nothing when it holds
+    local b; b="$(cas_body "$1")"
+    [ -n "$b" ] || { echo "no cetrafs_cas_region_seeded_impl"; return; }
+    [ "$(grep -c 'unknown = kmalloc' <<<"$b")" = 1 ] || echo "the in-flight buffer is allocated $(grep -c 'unknown = kmalloc' <<<"$b") times"
+    awk '/unknown = kmalloc/{a=NR} /for [(]attempt = 0;/{if(!f){f=NR}} END{if(!a||!f||a>f) print "the in-flight buffer is not allocated before the loop"}' <<<"$b"
+    awk '/for [(]attempt = 0;/{on=1} /^out:/{on=0} on && /^[[:space:]]+return /{print "a return inside the loop skips out: -- " $0}' <<<"$b"
+    sed -n '/^out:/,/kfree(unknown)/p' <<<"$b" | grep -q 'if (undecided && ret' || echo "out: does not stop the mount for an undecided swap"
+}
+CC="$(cas_check "$K/caw.c")"
+[ -z "$CC" ] && pass "class 30: every exit of the CAS loop confirms a timed-out swap or stops the mount" ||
+    fail "class 30: $CC"
+SAMPLE="$(ct_tmp cas-sample).c"
+printf 'static int cetrafs_cas_region_seeded_impl(void)\n{\n    unknown = kmalloc(2, GFP_KERNEL);\n    for (attempt = 0; attempt < 3; attempt++) {\n        if (x)\n            return -EIO;\n    }\nout:\n    if (undecided && ret)\n        stop();\n    kfree(unknown);\n}\n' >"$SAMPLE"
+grep -q "a return inside the loop" <<<"$(cas_check "$SAMPLE")" &&
+    pass "class 30: control -- a plain return from inside the loop is caught" ||
+    fail "class 30: control -- a plain return from inside the loop is not caught"
+
 # Class 44 ("alive" as the unsafe default). A liveness predicate's first
 # look at a row answers "alive" -- right for a reclaim, which then keeps
 # its hands off, and wrong for a caller that REFUSES or INHERITS on it

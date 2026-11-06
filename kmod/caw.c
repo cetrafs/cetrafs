@@ -997,6 +997,7 @@ static int cetrafs_cas_region_seeded_impl(struct super_block *sb,
     u64 dev_lba = have_caw ? fs_lba * (CETRAFS_BLOCK_SIZE / caw->logical_block_size) + region_idx : 0;
     u8 *old, *new;
     u8 *unknown = NULL; /* a swap whose outcome was unknown: its post-image, then its pre-image */
+    bool undecided = false; /* 'unknown' holds a swap that may still land */
     bool seeded = false; /* this attempt's image is the caller's seed, not the device's */
     int attempt, ret;
 
@@ -1019,9 +1020,13 @@ static int cetrafs_cas_region_seeded_impl(struct super_block *sb,
 
     old = kmalloc(region, GFP_KERNEL);
     new = kmalloc(region, GFP_KERNEL);
-    if (!old || !new) {
+    /* Up front: allocated after a timeout, a failure returned -ENOMEM
+     * for a swap that may still land (audit 2026-11-06 L12). */
+    unknown = kmalloc(2 * region, GFP_KERNEL);
+    if (!old || !new || !unknown) {
         kfree(old);
         kfree(new);
+        kfree(unknown);
         return -ENOMEM;
     }
 
@@ -1071,6 +1076,14 @@ static int cetrafs_cas_region_seeded_impl(struct super_block *sb,
 
     for (attempt = 0; attempt < CETRAFS_CAS_RETRIES; attempt++) {
         struct buffer_head *bh;
+
+        /* Per attempt, not per call: a fence landing during sixteen
+         * contended rounds must stop the next swap, not the next call's
+         * (audit 2026-11-06 L12). */
+        if (attempt && cetrafs_sb_is_fenced(sb)) {
+            ret = -EIO;
+            goto out;
+        }
 
         /* The flush is NOT optional, even when seeding. A CAW compares
          * against what is physically on the DEVICE, and this block may
@@ -1129,7 +1142,7 @@ static int cetrafs_cas_region_seeded_impl(struct super_block *sb,
          * writing after a landing we cannot rule out -- the same verdict
          * the MISCOMPARE check below gives.
          */
-        if (unknown) {
+        if (undecided) {
             if (!memcmp(old, unknown, region)) {
                 pr_warn("CAS lba=%llu: the timed-out command landed late -- taking it as done\n",
                         (unsigned long long) fs_lba);
@@ -1268,14 +1281,9 @@ static int cetrafs_cas_region_seeded_impl(struct super_block *sb,
                 pr_warn("CAS lba=%llu: command timed out and has not landed -- retrying on another path\n",
                         (unsigned long long) fs_lba);
                 brelse(vbh);
-                if (!unknown)
-                    unknown = kmalloc(2 * region, GFP_KERNEL);
-                if (!unknown) {
-                    ret = -ENOMEM;
-                    goto out;
-                }
                 memcpy(unknown, new, region);          /* its post-image */
                 memcpy(unknown + region, old, region); /* and the image it compared */
+                undecided = true;
                 continue;
             }
             brelse(vbh);
@@ -1291,7 +1299,7 @@ static int cetrafs_cas_region_seeded_impl(struct super_block *sb,
 
         atomic64_inc(&cetrafs_cas_miscompares);
 
-        if (unknown) {
+        if (undecided) {
             /* A MISCOMPARE after a swap whose outcome was unknown: the
              * region moved since the re-read that found the pre-image.
              * If it now holds that swap's post-image, the timed-out
@@ -1338,6 +1346,27 @@ static int cetrafs_cas_region_seeded_impl(struct super_block *sb,
     ret = -EBUSY;
 
 out:
+    /*
+     * A swap whose outcome was unknown, and no answer: this exit is
+     * neither a "done" nor a "not done". A re-read that failed, a
+     * transport error on the retry, the retry budget or a fence -- each
+     * used to return a plain error, the caller took it as not applied
+     * and re-accrued its delta, and the timed-out command could then
+     * land too: a BG count moved twice (audit 2026-11-06 L12). Every
+     * undecidable outcome stops the mount (docs/internal/ERRORS.md);
+     * the paths that already said so are stopped by now.
+     */
+    if (undecided && ret && !cetrafs_sb_is_fenced(sb)) {
+        if (READ_ONCE(cetrafs_cas_selftest_sb) == sb) {
+            pr_info("CAS selftest: lba=%llu would stop the mount here (outcome undecidable, %d)\n",
+                    (unsigned long long) fs_lba, ret);
+            WRITE_ONCE(cetrafs_cas_selftest_stop_seen, true);
+        } else {
+            cetrafs_sb_fatal(sb, "CAS lba=%llu: a timed-out swap is still undecided and this call ended (%d)",
+                             (unsigned long long) fs_lba, ret);
+        }
+        ret = -EIO;
+    }
     if (ret == -EUCLEAN)
         cetrafs_cas_refused_damage(sb, fs_lba);
     kfree(unknown);
