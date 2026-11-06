@@ -1318,7 +1318,18 @@ static int cetrafs_dir_retarget_entry(struct inode *dir,
     raw.dirent_seq = cetrafs_cpu_to_le64(cetrafs_dirent_seq_new(dir->i_sb)); /* this directory's blocks just changed */
     raw.mtime = cetrafs_cpu_to_le64((u64) now);
     raw.ctime = cetrafs_cpu_to_le64((u64) now);
-    /* size and nlink unchanged: one entry became a different entry. */
+    /* size and nlink unchanged: one entry became a different entry.
+     *
+     * A whole-record write from a fresh read, which rule 5 allows only
+     * where nothing else writes the record meanwhile. For a directory
+     * that holds: its namespace lock is ours, and the fields other
+     * writers move WITHOUT it -- the file lock and read presence -- are
+     * never set on a directory, because cetrafs_dir_ops has no .open,
+     * .release, .flock or .lock (tests/image/source_invariants.sh,
+     * "directory records"). In a same-directory rename the record
+     * remove_entry staged is not read here: it is published at the
+     * release, nlink as a delta against the device, so this write
+     * reverts nothing of it (audit 2026-11-05, ruled out). */
 
     ctrace("RETGT dir=%llu name='%.*s' new_ino=%llu removed_ino=%llu\n",
             (unsigned long long) dir->i_ino, (int) name->len, name->name,

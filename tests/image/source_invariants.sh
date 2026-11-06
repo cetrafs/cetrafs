@@ -1172,6 +1172,26 @@ printf 'static void cetrafs_repair_tick(int sig)\n{\n    cetrafs_write_row(fd);\
     pass "signal handlers: control -- an unlisted call in a handler is seen" ||
     fail "signal handlers: control -- a planted handler call is not seen"
 
+# Directory records are written whole from a fresh read in several dir.c
+# paths (rename's retarget, the '..' rewrite), which is only safe while
+# no field of a directory's record has a writer outside its namespace
+# lock. The ones that do on a regular file -- the file lock and read
+# presence -- are set by .open/.release/.flock/.lock; a directory
+# file_operations with any of them would arm every such write as a
+# lost update (audit 2026-11-05, the rename retarget question).
+log "checking directory records have no writer outside the namespace lock"
+dir_ops_hooks() { awk '/^const struct file_operations cetrafs_dir_ops = \{/ { on = 1 } on { print } on && /^\};/ { exit }' "$1" |
+    { grep -oE '^\s*\.(open|release|flock|lock)\s*=' || true; } | tr -d ' .=' | sort -u | tr '\n' ' '; }
+DH="$(dir_ops_hooks "$K/dir.c")"
+DOPS="$(awk '/^const struct file_operations cetrafs_dir_ops = \{/ { on = 1 } on { n++ } on && /^\};/ { print n; exit }' "$K/dir.c")"
+[ "${DOPS:-0}" -ge 3 ] || fail "directory records: cetrafs_dir_ops not found in dir.c -- the scan is not seeing it"
+[ -z "$DH" ] && pass "directory records: cetrafs_dir_ops has no open/release/flock/lock hook" ||
+    fail "directory records: cetrafs_dir_ops now has $DH-- dir.c's whole-record writes are no longer exclusive"
+SAMPLE="$(ct_tmp dirops-sample).c"
+printf 'const struct file_operations cetrafs_dir_ops = {\n    .owner = THIS_MODULE,\n    .open = cetrafs_open,\n};\n' >"$SAMPLE"
+[ "$(dir_ops_hooks "$SAMPLE")" = "open " ] && pass "directory records: control -- a planted .open is caught" ||
+    fail "directory records: control -- a planted .open is not caught"
+
 # The module must publish the filesystem alias get_fs_type() asks
 # modprobe for ("fs-<name>") when a mount names a type nothing has
 # registered. Without it, `mount -t cetrafs` on a host that has the
