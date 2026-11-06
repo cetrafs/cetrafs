@@ -1100,7 +1100,8 @@ log "checking every store that can satisfy a wait wakes its queue"
 # file|function exempt from the rule (or -)|store regex|wake regex
 WAKE_SPEC='journal.c|cetrafs_journal_write_block_flags|clear_bit\([^,]*, *j->busy\)|j->held\+\+|\+\+j->held|wake_up(_all)?\(&j->slot_wq\)
 dmpath.c|-|->resolving = false|wake_up(_all)?\(&cetrafs_dmpath_wq\)
-caw.c|-|atomic_dec[a-z_]*\(&ctx->running\)|wake_up(_all)?\(&ctx->done\)'
+caw.c|-|atomic_dec[a-z_]*\(&ctx->running\)|wake_up(_all)?\(&ctx->done\)
+fs.c|-|clear_bit\([^,]*, *sbi->zg_adopt_wanted\)|wake_up(_all)?\(&sbi->zg_adopt_wq\)'
 # The first spec line's exemption is the waiter itself: it clears a held
 # slot's bit and re-sets it under the same j->lock hold, so nothing
 # becomes free (journal.c, "re-set below").
@@ -1114,8 +1115,8 @@ unwoken() { # <file> <exempt fn> <store re> <wake re>: functions storing without
         /^}/ { if (fn != "" && fn != ex && stored && !woke) print FILENAME ":" fn; fn = "" }' "$1"
 }
 WSITES="$(grep -cE '^[^*/]*\bwait_event[a-z_]*\(' "$K"/*.c | awk -F: '{ n += $2 } END { print n + 0 }')"
-[ "$WSITES" = 4 ] && pass "wait wakes: 4 wait_event sites, each queue specified" ||
-    fail "wait wakes: $WSITES wait_event sites (specified for 4) -- add the new queue's stores and wake to WAKE_SPEC"
+[ "$WSITES" = 5 ] && pass "wait wakes: 5 wait_event sites, each queue specified" ||
+    fail "wait wakes: $WSITES wait_event sites (specified for 5) -- add the new queue's stores and wake to WAKE_SPEC"
 UW=""
 while IFS= read -r line; do
     f="${line%%|*}"; rest="${line#*|}"; ex="${rest%%|*}"; rest="${rest#*|}"

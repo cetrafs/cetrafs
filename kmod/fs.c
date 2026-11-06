@@ -415,6 +415,9 @@ struct cetrafs_sb_info {
      * adopts them (cetrafs_zg_adopt_wanted()), never the freeing thread,
      * which may hold inode_lock/invalidate_lock or run from reclaim. */
     DECLARE_BITMAP(zg_adopt_wanted, CETRAFS_MAX_ZONE_GROUPS);
+    /* Woken when the heartbeat has tried one of zg_adopt_wanted: an
+     * allocator that deferred a steal waits here (cetrafs_sb_zg_adopt_wait()). */
+    wait_queue_head_t zg_adopt_wq;
 
 
     /*
@@ -1353,6 +1356,7 @@ int cetrafs_fill_super(struct super_block *sb, struct fs_context *fc)
         mutex_init(&sbi->alloc_mutex);
         mutex_init(&sbi->zg_claim_mutex);
         init_rwsem(&sbi->release_rwsem);
+        init_waitqueue_head(&sbi->zg_adopt_wq);
         sbi->stamp_base = (s64) ktime_get_real_ns() - (s64) ktime_get_ns();
         atomic64_set(&sbi->stamp_last, 0);
         init_rwsem(&sbi->birth_rwsem);
@@ -3077,11 +3081,62 @@ void cetrafs_sb_zg_want_adopt(struct super_block *sb, u32 zg_id)
         set_bit(zg_id, sbi->zg_adopt_wanted);
 }
 
-bool cetrafs_sb_zg_take_adopt(struct super_block *sb, u32 zg_id)
+bool cetrafs_sb_zg_adopt_is_wanted(struct super_block *sb, u32 zg_id)
 {
     struct cetrafs_sb_info *sbi = sb->s_fs_info;
 
-    return sbi && zg_id < CETRAFS_MAX_ZONE_GROUPS && test_and_clear_bit(zg_id, sbi->zg_adopt_wanted);
+    return sbi && zg_id < CETRAFS_MAX_ZONE_GROUPS && test_bit(zg_id, sbi->zg_adopt_wanted);
+}
+
+/* The heartbeat has made its attempt at zg_id, whatever the outcome. */
+void cetrafs_sb_zg_adopt_done(struct super_block *sb, u32 zg_id)
+{
+    struct cetrafs_sb_info *sbi = sb->s_fs_info;
+
+    if (!sbi || zg_id >= CETRAFS_MAX_ZONE_GROUPS)
+        return;
+    clear_bit(zg_id, sbi->zg_adopt_wanted);
+    wake_up_all(&sbi->zg_adopt_wq);
+}
+
+/* Is there a heartbeat to hand a takeover to? Not before fill_super()
+ * starts it: a claim made during mount runs in the mount, which holds no
+ * file's locks and may take a dead owner's Zone Group itself. */
+bool cetrafs_sb_has_heartbeat(struct super_block *sb)
+{
+    struct cetrafs_sb_info *sbi = sb->s_fs_info;
+
+    return sbi && READ_ONCE(sbi->hb);
+}
+
+/*
+ * An allocator that found its only space in a dead peer's Zone Group
+ * asks the heartbeat to take it over now rather than on its next tick,
+ * and waits for the attempt. Killable, and bounded by the takeover's
+ * own worst case (the journal replay's claim wait, plus the recount);
+ * a fence ends it too, since a fenced mount's maintenance pass does
+ * nothing. Returns true once the attempt was made, false otherwise.
+ * The heartbeat is stopped only in put_super, after every writer that
+ * could allocate is gone.
+ */
+bool cetrafs_sb_zg_adopt_wait(struct super_block *sb, u32 zg_id)
+{
+    struct cetrafs_sb_info *sbi = sb->s_fs_info;
+    struct cetrafs_heartbeat *hb = sbi ? READ_ONCE(sbi->hb) : NULL;
+    unsigned long t0 = jiffies, cap;
+
+    if (!hb)
+        return false;
+    mod_delayed_work(system_long_wq, &hb->maint, 0);
+    cap = (unsigned long) (cetrafs_sb_stale_secs(sb) * 3 + 60) * HZ;
+    /* In one-second slices: a fence wakes nobody here. */
+    while (test_bit(zg_id, sbi->zg_adopt_wanted)) {
+        if (cetrafs_sb_is_fenced(sb) || fatal_signal_pending(current) || time_after(jiffies, t0 + cap))
+            return false;
+        if (wait_event_killable_timeout(sbi->zg_adopt_wq, !test_bit(zg_id, sbi->zg_adopt_wanted), HZ) < 0)
+            return false;
+    }
+    return true;
 }
 
 /*

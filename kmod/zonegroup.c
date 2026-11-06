@@ -1040,12 +1040,27 @@ out_unlock:
  * cluster-wide exhaustion actually is, instead of "succeeding" at a
  * claim that solves nothing.
  */
-static int cetrafs_zg_claim_one_more_locked(struct super_block *sb, u32 count, u32 my_node_id, bool *out_claimed);
+static int cetrafs_zg_claim_one_more_locked(struct super_block *sb, u32 count, u32 my_node_id, bool may_steal,
+                                            bool *out_claimed, s64 *out_defer);
 
+/*
+ * may_steal: whether this caller may take a dead owner's Zone Group
+ * itself. The mount and the heartbeat may. An allocator may not: it
+ * runs inside write(2), fallocate or a page fault, holding inode_lock,
+ * invalidate_lock or mmap_lock, and a steal fences the dead node,
+ * replays its whole journal with its claim wait and recounts every
+ * member bitmap -- the same stall audit M6 moved off the free path,
+ * reached through a write. Such a caller claims an UNOWNED group only;
+ * if a dead owner's group is all there is, it is flagged for the
+ * heartbeat and returned in *out_defer (-1: nothing deferred) for the
+ * caller to wait on (cetrafs_sb_zg_adopt_wait()).
+ */
 static int cetrafs_zg_claim_one_more(struct super_block *sb,
                                      const cetrafs_superblock_t *raw_sb,
                                      u32 my_node_id,
-                                     bool *out_claimed)
+                                     bool may_steal,
+                                     bool *out_claimed,
+                                     s64 *out_defer)
 {
     u32 count;
     unsigned int nofs = 0;
@@ -1053,6 +1068,7 @@ static int cetrafs_zg_claim_one_more(struct super_block *sb,
     int ret;
 
     *out_claimed = false;
+    *out_defer = -1;
     count = le32_to_cpu(raw_sb->zone_group_count);
 
     /* The whole pick under the claim mutex, not only the claim: a writer
@@ -1060,17 +1076,18 @@ static int cetrafs_zg_claim_one_more(struct super_block *sb,
      * waits for it here, then finds the result in the cache and passes
      * over it as "already ours" -- the caller rescans either way. */
     locked = cetrafs_sb_zg_claim_lock(sb, &nofs);
-    ret = cetrafs_zg_claim_one_more_locked(sb, count, my_node_id, out_claimed);
+    ret = cetrafs_zg_claim_one_more_locked(sb, count, my_node_id, may_steal, out_claimed, out_defer);
     if (locked)
         cetrafs_sb_zg_claim_unlock(sb, nofs);
     return ret;
 }
 
-static int cetrafs_zg_claim_one_more_locked(struct super_block *sb, u32 count, u32 my_node_id, bool *out_claimed)
+static int cetrafs_zg_claim_one_more_locked(struct super_block *sb, u32 count, u32 my_node_id, bool may_steal,
+                                            bool *out_claimed, s64 *out_defer)
 {
-    u32 z, best_z = 0;
-    u64 best_free = 0;
-    bool have_best = false;
+    u32 z, best_z = 0, stale_z = 0;
+    u64 best_free = 0, stale_free = 0;
+    bool have_best = false, have_stale = false;
     int ret;
 
     for (z = 0; z < count; z++) {
@@ -1090,6 +1107,16 @@ static int cetrafs_zg_claim_one_more_locked(struct super_block *sb, u32 count, u
                 return ret;
             if (!stale)
                 continue; /* live foreign owner: not eligible */
+            if (!may_steal) {
+                /* Not ours to take here: remember the roomiest, for
+                 * the heartbeat, in case nothing unowned turns up. */
+                if (!have_stale || info.free_data_blocks > stale_free) {
+                    stale_z = z;
+                    stale_free = info.free_data_blocks;
+                    have_stale = true;
+                }
+                continue;
+            }
         }
 
         /*
@@ -1117,8 +1144,13 @@ static int cetrafs_zg_claim_one_more_locked(struct super_block *sb, u32 count, u
         }
     }
 
-    if (!have_best)
+    if (!have_best) {
+        if (have_stale) {
+            cetrafs_sb_zg_want_adopt(sb, stale_z);
+            *out_defer = stale_z;
+        }
         return 0;
+    }
 
     return cetrafs_zg_try_claim_one(sb, best_z, my_node_id, /*at_mount=*/false, out_claimed);
 }
@@ -1183,7 +1215,8 @@ static int cetrafs_zg_claim_one_more_locked(struct super_block *sb, u32 count, u
  */
 /*
  * Adopt the Zone Groups a free found full (cetrafs_zg_queue_foreign_free()'s
- * queue-full path), from the heartbeat tick. cetrafs_zg_try_claim_one()
+ * queue-full path) or an allocator found to be its only space
+ * (cetrafs_zg_claim_one_more()), from the heartbeat tick. cetrafs_zg_try_claim_one()
  * only steals from a stale or absent owner, so a full queue whose owner
  * is alive and merely behind is left alone here too.
  */
@@ -1198,10 +1231,14 @@ void cetrafs_zg_adopt_wanted(struct super_block *sb, u32 my_node_id)
     for (z = 0; z < count; z++) {
         bool claimed = false;
 
-        if (!cetrafs_sb_zg_take_adopt(sb, z) || cetrafs_sb_zg_owned_cached(sb, z))
+        if (!cetrafs_sb_zg_adopt_is_wanted(sb, z))
             continue;
-        if (cetrafs_zg_try_claim_one(sb, z, my_node_id, /*at_mount=*/false, &claimed) == 0 && claimed)
-            pr_info("ZG %u: adopted from its stale owner -- a free found its queue full\n", z);
+        if (!cetrafs_sb_zg_owned_cached(sb, z) &&
+            cetrafs_zg_try_claim_one(sb, z, my_node_id, /*at_mount=*/false, &claimed) == 0 && claimed)
+            pr_info("ZG %u: adopted from its stale owner\n", z);
+        /* Cleared only now, after the attempt: an allocator waiting on
+         * it (cetrafs_sb_zg_adopt_wait()) rescans when it wakes. */
+        cetrafs_sb_zg_adopt_done(sb, z);
     }
 }
 
@@ -1302,8 +1339,9 @@ int cetrafs_zg_claim_unowned(struct super_block *sb,
     /* Pass 2: only if we own nothing at all yet, claim exactly one. */
     if (owned == 0) {
         bool did_claim = false;
+        s64 defer;
 
-        ret = cetrafs_zg_claim_one_more(sb, raw_sb, my_node_id, &did_claim);
+        ret = cetrafs_zg_claim_one_more(sb, raw_sb, my_node_id, /*may_steal=*/true, &did_claim, &defer);
         if (ret)
             goto out;
         if (did_claim)
@@ -2347,7 +2385,7 @@ int cetrafs_alloc_pick_bg(struct super_block *sb, u32 *out_bg_id)
 {
     const cetrafs_superblock_t *raw_sb = cetrafs_sb_raw(sb);
     u32 my_node_id, zg_count;
-    bool tried_claim_more = false, tried_claim_bg = false, waited_release = false;
+    bool tried_claim_more = false, tried_claim_bg = false, waited_release = false, waited_adopt = false;
     int ret;
 
     if (!raw_sb)
@@ -2490,12 +2528,28 @@ retry_scan:
 
     if (!tried_claim_more) {
         bool did_claim = false;
+        s64 defer = -1;
 
         tried_claim_more = true;
 
-        ret = cetrafs_zg_claim_one_more(sb, raw_sb, my_node_id, &did_claim);
+        /* A dead owner's group is the heartbeat's to take, not ours from
+         * inside the caller's locks; wait for its attempt once, then look
+         * again (cetrafs_zg_claim_one_more()). */
+        ret = cetrafs_zg_claim_one_more(sb, raw_sb, my_node_id, !cetrafs_sb_has_heartbeat(sb), &did_claim, &defer);
         if (ret)
             return ret;
+        if (defer >= 0 && !waited_adopt) {
+            waited_adopt = true;
+            if (fatal_signal_pending(current))
+                return -EINTR;
+            if (cetrafs_sb_zg_adopt_wait(sb, (u32) defer))
+                pr_info("alloc: the heartbeat took over zone group %lld for this allocation\n", (long long) defer);
+            if (fatal_signal_pending(current))
+                return -EINTR;
+            if (cetrafs_sb_is_fenced(sb))
+                return -EIO;
+            goto retry_scan;
+        }
 
         if (did_claim) {
             pr_info("alloc: ran out of space in owned zone group(s), claimed one more\n");
