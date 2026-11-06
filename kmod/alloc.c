@@ -580,7 +580,17 @@ void cetrafs_alloc_retry_reclaim(struct super_block *sb)
     n = cetrafs_sb_reclaim_take_deferred(sb, pend, ARRAY_SIZE(pend));
     for (i = 0; i < n; i++) {
         u64 seq = pend[i].seq;
-        int ret = cetrafs_inode_reclaim_claim(sb, pend[i].ino, pend[i].generation, pend[i].mode, &seq);
+        int ret;
+
+        if (pend[i].mode == CETRAFS_RECLAIM_FINISH) {
+            /* The number first, the claim after -- never the reverse
+             * (cetrafs_free_inode_finish()). It requeues itself. */
+            if (cetrafs_free_inode_finish(sb, pend[i].ino, pend[i].generation, seq) >= 0)
+                pr_info("inode ino=%llu: an evict's number free finished by the heartbeat\n",
+                        (unsigned long long) pend[i].ino);
+            continue;
+        }
+        ret = cetrafs_inode_reclaim_claim(sb, pend[i].ino, pend[i].generation, pend[i].mode, &seq);
 
         if (!ret || ret == -ESTALE)
             pr_info("inode ino=%llu: reclaim claim given back by the heartbeat%s\n",
@@ -1014,7 +1024,45 @@ int cetrafs_free_inode(struct super_block *sb, u64 ino)
 int cetrafs_free_inode_if_dead(struct super_block *sb, u64 ino, u64 generation)
 {
     u64 seq = 0;
+    int ret = cetrafs_free_inode_begin(sb, ino, generation, &seq);
+
+    return ret ? ret : cetrafs_free_inode_finish(sb, ino, generation, seq);
+}
+
+/*
+ * The two halves of the free, for a caller with blocks to give back in
+ * between (evict). _begin() claims the dead record and checks, under the
+ * claim, that the number is still allocated: 0 means this caller owns
+ * the free, and the number STAYS allocated, the claim held, until
+ * _finish() clears the bit and releases it -- or _abort() releases it
+ * and leaves the number for the orphan scrub.
+ *
+ * Why the number is freed last. Evict used to free it FIRST and the
+ * extents after, one by one -- for a fragmented image tens of thousands
+ * of frees and seconds to minutes. In that window the record was a freed
+ * slot, which the block scrub does not walk ("its stale record must NOT
+ * protect blocks"), and the extents not yet freed were set and named by
+ * nothing: candidates. The owner's scrub freed them, its allocator
+ * reused them, and the evict's own free (or its queued one, for a
+ * foreign owner) then cleared the bit under the new file (audit
+ * 2026-11-06 H1; tests/kernel/scrub_vs_evict_free.sh). With the number
+ * allocated and the record intact the scrub reads every extent as
+ * referenced until the last free has landed.
+ *
+ * The claim is what arbitrates: a second evict, the orphan scrub and a
+ * create all refuse a claimed record, and once _finish() has run a
+ * later claim finds the bit free (1). A crash with the claim held leaves
+ * an allocated, dead, claimed record naming blocks some of which are
+ * free: the claimant's own-claim sweep at re-attach releases it, the
+ * orphan scrub then frees the number only (never blocks), and the block
+ * scrub reclaims what was still set. fsck already ranks a deleted
+ * record's references below any live one's and leaves the blocks only
+ * it names free.
+ */
+int cetrafs_free_inode_begin(struct super_block *sb, u64 ino, u64 generation, u64 *seq)
+{
     unsigned int nofs;
+    bool set = false;
     int ret;
 
     if (cetrafs_sb_is_fenced(sb))
@@ -1024,14 +1072,14 @@ int cetrafs_free_inode_if_dead(struct super_block *sb, u64 ino, u64 generation)
 
     /* The verdict is acted on through the record itself: claim it --
      * a CAS that lands only on the dead, unlocked record of generation
-     * 'generation' the verdict saw -- clear the bit, release it under a
-     * new generation. A creator that took the bit meanwhile either beat
-     * the claim (its own birth claim changed the record: ours refuses)
-     * or loses to it and abandons the number. See inode.c's
+     * 'generation' the verdict saw. A creator that took the bit meanwhile
+     * either beat the claim (its own birth claim changed the record: ours
+     * refuses) or loses to it and abandons the number. See inode.c's
      * cetrafs_inode_birth_claim(). A re-read alone could not be adjacent
      * enough to the free; only this is. */
     nofs = cetrafs_sb_birth_gate(sb, true);
-    ret = cetrafs_inode_reclaim_claim(sb, ino, generation, CETRAFS_RECLAIM_CLAIM, &seq);
+    *seq = 0;
+    ret = cetrafs_inode_reclaim_claim(sb, ino, generation, CETRAFS_RECLAIM_CLAIM, seq);
     if (ret) {
         cetrafs_sb_birth_ungate(sb, true, nofs);
         return ret; /* reborn, locked, or unreadable: free nothing */
@@ -1039,19 +1087,84 @@ int cetrafs_free_inode_if_dead(struct super_block *sb, u64 ino, u64 generation)
 
     /* A create of THIS node took the number after our verdict read --
      * the bit we judged is its bit now. Under the gate the registry is
-     * exact (cetrafs_sb_info.birth_rwsem): give the record back and
-     * clear nothing. */
+     * exact (cetrafs_sb_info.birth_rwsem): give the record back and free
+     * nothing. Otherwise the bit, read fresh under the claim: nothing can
+     * clear it while we hold the claim, so "free" means an earlier free
+     * of this same file has already run -- its blocks are gone too. */
     if (cetrafs_sb_birth_active(sb, ino))
         ret = -EAGAIN;
-    else
-        ret = cetrafs_inode_bitmap_cas_free(sb, ino - 1);
+    else if (!(ret = cetrafs_inode_is_allocated_fresh(sb, ino, &set)) && !set)
+        ret = 1;
+    if (ret)
+        cetrafs_reclaim_give_back(sb, ino, generation, CETRAFS_RECLAIM_RELEASE, *seq);
+    cetrafs_sb_birth_ungate(sb, true, nofs);
+    return ret;
+}
+
+/* Clear the bit of a number whose dead record this node holds claimed
+ * (an evict's free, or a claim found at re-attach). 0 when this call
+ * cleared it, 1 when it was already clear. */
+int cetrafs_free_inode_number_claimed(struct super_block *sb, u64 ino)
+{
+    unsigned int nofs = cetrafs_sb_birth_gate(sb, true);
+    int ret;
+
+    /* The bit has been ours since the claim: no create can have taken
+     * it, so the birth registry has nothing to say about it. */
+    ret = cetrafs_inode_bitmap_cas_free(sb, ino - 1);
     if (!ret)
         cetrafs_sb_adjust_free_inodes(sb, 1);
-    cetrafs_reclaim_give_back(sb, ino, generation, CETRAFS_RECLAIM_RELEASE, seq);
     cetrafs_sb_birth_ungate(sb, true, nofs);
-    if (ret > 0)
-        return 1;
+    return ret > 0 ? 1 : ret;
+}
+
+/*
+ * The bit, then the claim. 0 when this call cleared the bit.
+ *
+ * Never the claim without the bit: once blocks have been freed, a
+ * released claim over a still-allocated number lets the next evict of
+ * the same file -- a peer's in-core copy of it -- win the claim, find the
+ * bit set and free the same blocks again, after their owner may have
+ * handed them to another file. A bit that could not be cleared keeps the
+ * claim and goes to the heartbeat (CETRAFS_RECLAIM_FINISH); a fenced
+ * mount keeps it for the own-claim sweep at re-attach, which completes
+ * the free the same way (cetrafs_lock_sweep_own_claims()).
+ */
+/* TEST ONLY: the next N evict number frees fail as a refused bitmap CAS
+ * would (tests/kernel/evict_free_keeps_claim.sh). */
+static unsigned int cetrafs_evict_number_free_fail;
+cetrafs_test_param(evict_number_free_fail, cetrafs_evict_number_free_fail, uint, 0644);
+MODULE_PARM_DESC(evict_number_free_fail, "TEST ONLY: fail the next N evict number frees with -EIO");
+
+int cetrafs_free_inode_finish(struct super_block *sb, u64 ino, u64 generation, u64 seq)
+{
+    struct cetrafs_reclaim_pending p = {.ino = ino, .generation = generation, .seq = seq,
+                                        .mode = CETRAFS_RECLAIM_FINISH};
+    int ret;
+
+    if (cetrafs_sb_is_fenced(sb))
+        return -EIO;
+    if (READ_ONCE(cetrafs_evict_number_free_fail)) {
+        WRITE_ONCE(cetrafs_evict_number_free_fail, cetrafs_evict_number_free_fail - 1);
+        ret = -EIO; /* test-only */
+    } else {
+        ret = cetrafs_free_inode_number_claimed(sb, ino);
+    }
+    if (ret < 0) {
+        pr_warn_ratelimited("inode ino=%llu: blocks freed, number not (%d) -- the heartbeat finishes it\n",
+                            (unsigned long long) ino, ret);
+        cetrafs_sb_reclaim_defer(sb, &p);
+        return ret;
+    }
+    cetrafs_reclaim_give_back(sb, ino, generation, CETRAFS_RECLAIM_RELEASE, seq);
     return ret;
+}
+
+/* Give the claim back and leave the number allocated: a dead, unclaimed
+ * record, which the orphan scrub frees (number only). */
+void cetrafs_free_inode_abort(struct super_block *sb, u64 ino, u64 generation, u64 seq)
+{
+    cetrafs_reclaim_give_back(sb, ino, generation, CETRAFS_RECLAIM_RELEASE, seq);
 }
 
 /* The on-disk cetrafs_block_group_t is ~4KB, almost all reserved padding;

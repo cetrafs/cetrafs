@@ -715,6 +715,10 @@ int cetrafs_free_inode(struct super_block *sb, u64 ino);
  * the record dead (nlink==0) and unchanged (same generation as the
  * caller's verdict read). -ESTALE means the number was reborn. */
 int cetrafs_free_inode_if_dead(struct super_block *sb, u64 ino, u64 generation);
+int cetrafs_free_inode_begin(struct super_block *sb, u64 ino, u64 generation, u64 *seq);
+int cetrafs_free_inode_finish(struct super_block *sb, u64 ino, u64 generation, u64 seq);
+void cetrafs_free_inode_abort(struct super_block *sb, u64 ino, u64 generation, u64 seq);
+int cetrafs_free_inode_number_claimed(struct super_block *sb, u64 ino);
 int cetrafs_alloc_data_block(struct super_block *sb, u32 bg_id, u64 *out_lba);
 int cetrafs_alloc_data_block_near(struct super_block *sb, u32 bg_id, u64 preferred_lba, u64 *out_lba);
 int cetrafs_alloc_block_anywhere(struct super_block *sb, u32 *out_bg, u64 *out_lba);
@@ -1034,6 +1038,10 @@ int cetrafs_inode_birth_claim(struct super_block *sb, u64 ino, const cetrafs_ino
 #define CETRAFS_RECLAIM_CLAIM 0
 #define CETRAFS_RECLAIM_RELEASE 1
 #define CETRAFS_RECLAIM_BIRTH_ABORT 2
+/* Deferred queue only, never a record mutation: an evict's free whose
+ * number could not be cleared -- clear it, THEN release (alloc.c,
+ * cetrafs_free_inode_finish()). */
+#define CETRAFS_RECLAIM_FINISH 3
 int cetrafs_inode_reclaim_claim(struct super_block *sb, u64 ino, u64 generation, int mode, u64 *seq);
 bool cetrafs_inode_ns_held_by_current(struct inode *inode);
 /* ->flock: the standard flock(2) interface onto the userspace-driven

@@ -3984,6 +3984,36 @@ int cetrafs_lock_sweep_own_claims(struct super_block *sb, u32 my_node_id)
                 cetrafs_le32(raw.ns_lock_owner) != my_node_id)
                 continue;
             ctx.generation = cetrafs_le64(raw.generation);
+            /*
+             * A dead record we still claim is a free we did not finish:
+             * an evict holds the claim from before its first block free
+             * until after the number's (cetrafs_free_inode_begin()), so
+             * some of the blocks it names may be free now, or another
+             * file's. Released as it stands, the next evict of the same
+             * file -- a peer's in-core copy -- would win the claim, find
+             * the number set and free them again. Free the number first,
+             * then release: the blocks still set become the block
+             * scrub's. Not with another node on the record: an evict
+             * never claims one, so that is a namespace operation's
+             * claim, released as before for its file's users to settle.
+             * A create's birth claim, the other dead record we claim,
+             * comes out the same way -- the create never finished.
+             */
+            if (cetrafs_le32(raw.nlink) == 0 && cetrafs_le32(raw.ns_lock_owner) == my_node_id &&
+                !(cetrafs_le64(raw.read_open_nodes) & ~bit) &&
+                (cetrafs_le32(raw.lock_mode) == CETRAFS_LOCK_NONE ||
+                 cetrafs_le32(raw.lock_owner_node) == my_node_id)) {
+                ret = cetrafs_free_inode_number_claimed(sb, ino);
+                if (ret < 0) {
+                    pr_err("mount: ino=%llu is a free this node did not finish and its number could not be "
+                           "cleared: %d\n",
+                           (unsigned long long) ino, ret);
+                    break;
+                }
+                if (!ret)
+                    pr_info("mount: ino=%llu: finished a free this node had claimed before its departure\n",
+                            (unsigned long long) ino);
+            }
             ret = cetrafs_cas_record(sb, cetrafs_inode_lba(sb, ino), cetrafs_own_claims_mutate, &ctx);
             if (ret == -ESTALE)
                 ret = 0; /* reborn meanwhile: a peer's now, not ours */

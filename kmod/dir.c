@@ -1702,7 +1702,7 @@ static void cetrafs_new_inode_discard(struct inode *inode)
     }
 
     /* The birth is over: it failed. Eviction frees the number through
-     * cetrafs_free_inode_if_dead(), which refuses a number still in the
+     * cetrafs_free_inode_begin(), which refuses a number still in the
      * birth registry -- there that means "a create of this node took it
      * after the verdict", and a leftover entry of our own would make the
      * discard free nothing at all. Nothing else can be born on this

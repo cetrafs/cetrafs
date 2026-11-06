@@ -23,6 +23,12 @@
 static unsigned int cetrafs_evict_stall_before_free_ms;
 cetrafs_test_param(evict_stall_before_free_ms, cetrafs_evict_stall_before_free_ms, uint, 0644);
 MODULE_PARM_DESC(evict_stall_before_free_ms, "TEST ONLY: pause between evict's verdict and its free");
+/* TEST ONLY: hold an evict between owning the free and its first block
+ * free -- the window a fragmented file's thousands of frees open in
+ * production (tests/kernel/scrub_vs_evict_free.sh). */
+static unsigned int cetrafs_evict_free_stall_ms;
+cetrafs_test_param(evict_free_stall_ms, cetrafs_evict_free_stall_ms, uint, 0644);
+MODULE_PARM_DESC(evict_free_stall_ms, "TEST ONLY: pause between evict owning the free and freeing the blocks");
 
 /* TEST ONLY: the next N evictions find their "is another node using it?"
  * check failing, as a failed forced-fresh read would
@@ -502,6 +508,7 @@ static void cetrafs_evict_inode(struct inode *inode)
              * below: free nothing, leave it diagnosable.
              */
             int fret;
+            u64 fseq = 0;
             struct cetrafs_inode_extents ex;
 
             /*
@@ -537,27 +544,46 @@ static void cetrafs_evict_inode(struct inode *inode)
                  * only makes it addressable. */
                 msleep(cetrafs_evict_stall_before_free_ms);
 
-            fret = cetrafs_free_inode_if_dead(sb, inode->i_ino, cetrafs_inode_get_generation(inode));
+            /* Own the free -- the record claimed, the number still
+             * allocated -- free the blocks, and only then the number
+             * (cetrafs_free_inode_begin()): with the number freed first,
+             * the blocks not yet freed were named by nothing the scrub
+             * walks, for as long as thousands of frees take. */
+            fret = cetrafs_free_inode_begin(sb, inode->i_ino, cetrafs_inode_get_generation(inode), &fseq);
 
             ctrace("EVICTFREE ino=%llu fret=%d gen=%llu\n", (unsigned long long) inode->i_ino, fret,
                    (unsigned long long) cetrafs_inode_get_generation(inode));
             /* The unlink that made this file dead -- dirent gone, nlink
-             * 0 -- and the arbitration just won are publishes; the frees
+             * 0 -- and the claim just won are publishes; the frees
              * below must not reach the device ahead of them (rule 21),
              * and on a volatile cache only a flush orders that. If the
-             * device refuses one, leak: a block left allocated is the
-             * scrub's, a block freed under a record that may come back
-             * is two files' (cetrafs_publish_flush()). */
+             * device refuses one, free nothing: the number and blocks
+             * stay allocated under a dead, unclaimed record, which the
+             * orphan scrub frees -- the number only, the blocks then
+             * leak to the block scrub (cetrafs_publish_flush()). */
             if (fret == 0 && cetrafs_publish_flush(sb) != 0) {
-                pr_err("evict_inode: ino=%llu: the device refused a cache flush -- leaving its blocks allocated "
-                       "for the scrub\n",
+                pr_err("evict_inode: ino=%llu: the device refused a cache flush -- leaving its number and blocks "
+                       "allocated for the scrub\n",
                        (unsigned long long) inode->i_ino);
+                cetrafs_free_inode_abort(sb, inode->i_ino, cetrafs_inode_get_generation(inode), fseq);
                 fret = 1;
             }
             if (fret == 0) {
+                int nret;
+
+                if (cetrafs_evict_free_stall_ms)
+                    msleep(cetrafs_evict_free_stall_ms); /* test-only; see the parameter */
                 cetrafs_free_fetched_extents(inode, &raw, &ex);
                 if (raw.xattr_block)
                     cetrafs_free_data_block(sb, cetrafs_le64(raw.xattr_block));
+                /* A failure leaves the number allocated and its record
+                 * dead, claimed or not: either way only the number is
+                 * freed later, never the blocks again. */
+                nret = cetrafs_free_inode_finish(sb, inode->i_ino, cetrafs_inode_get_generation(inode), fseq);
+                if (nret)
+                    pr_warn("evict_inode: ino=%llu: its blocks are freed but the number could not be (%d) -- "
+                            "left for the orphan scrub\n",
+                            (unsigned long long) inode->i_ino, nret);
             }
             cetrafs_inode_extents_put(&ex);
             /* fret == 1: a peer's evict or the scrub won -- the blocks
