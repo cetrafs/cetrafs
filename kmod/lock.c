@@ -2496,6 +2496,12 @@ static unsigned int cetrafs_close_publish_fail;
 cetrafs_test_param(close_publish_fail, cetrafs_close_publish_fail, uint, 0644);
 MODULE_PARM_DESC(close_publish_fail, "TEST ONLY: the next N close-boundary record publishes fail with -EAGAIN");
 
+/* TEST ONLY: the next close publish's record read fails
+ * (tests/kernel/close_record_read_fail.sh). */
+static bool cetrafs_close_record_read_fail;
+cetrafs_test_param(close_record_read_fail, cetrafs_close_record_read_fail, bool, 0644);
+MODULE_PARM_DESC(close_record_read_fail, "TEST ONLY: the next close publish's record read fails with -EIO");
+
 static int cetrafs_lock_publish_and_clear(struct inode *inode, cetrafs_inode_t *raw, bool may_clear,
                                           bool *lock_cleared)
 {
@@ -2520,11 +2526,22 @@ static int cetrafs_lock_publish_and_clear(struct inode *inode, cetrafs_inode_t *
      * (Combined read+overlay: torn-read-safe vs a concurrent
      * publish -- see cetrafs_read_raw_inode_overlaid().)
      */
-    ret = cetrafs_read_raw_inode_overlaid(sb, inode, raw);
+    if (cetrafs_close_record_read_fail) {
+        cetrafs_close_record_read_fail = false;
+        ret = -EIO; /* test-only, see the knob */
+    } else {
+        ret = cetrafs_read_raw_inode_overlaid(sb, inode, raw);
+    }
 
     tree_ret = 0;
-    if (!ret && !bmap_ret && cetrafs_le16(raw->eh.eh_magic) == CETRAFS_EXT_MAGIC &&
-        cetrafs_le16(raw->eh.eh_depth) >= 1)
+    /* Unread, the tree could not be flushed -- and the publish below
+     * would then name leaves that never reached the device. It used to
+     * go ahead anyway, and on a close with no lock to clear the error
+     * went nowhere (audit 2026-11-06 L7). Same answer as a leaf flush
+     * that failed: publish nothing, keep the lock, retry later. */
+    if (ret)
+        tree_ret = ret;
+    else if (!bmap_ret && cetrafs_le16(raw->eh.eh_magic) == CETRAFS_EXT_MAGIC && cetrafs_le16(raw->eh.eh_depth) >= 1)
         tree_ret = cetrafs_flush_tree_blocks(inode, raw);
     if (tree_ret)
         pr_err("lock release: ino=%llu extent-tree blocks not durable (%d) -- leaving the record unpublished "
