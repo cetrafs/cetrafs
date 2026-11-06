@@ -91,8 +91,10 @@ poke_dead_peer "$DEV" 1 aa
 CINO=40
 "$ORPHAN_POKE" "$DEV" "$CINO" 0 0 >/dev/null
 "$LOCK_POKE" "$DEV" "$CINO" --ns 1 >/dev/null
-OUT="$(ct_fsck "$DEV" 2>&1 || true)"
-grep -q "inode $CINO is allocated" <<<"$OUT" && grep -q 'ns_owner=1 ' <<<"$("$LOCK_POKE" "$DEV" "$CINO")" ||
+# Read directly, not through fsck: the tools wait out a live-looking
+# row's stale window (up to 240 s), and the planted peer is one.
+grep -q '^size=0 nlink=0 ' <<<"$("$LOCK_POKE" "$DEV" "$CINO" --rec)" &&
+    grep -q 'ns_owner=1 ' <<<"$("$LOCK_POKE" "$DEV" "$CINO")" ||
     { fail "setup: the dead peer's claimed record is not on the device"; ct_exit; }
 ct_param_set scrub_interval_secs 2
 ct_param_set scrub_gap_secs 1
@@ -106,11 +108,16 @@ for _ in $(seq 1 $((TEST_STALE_SECS * 4 + 40))); do
     sleep 1
 done
 ct_param_set scrub 0
-[ -n "$GOT" ] && pass "the orphan scrub finished a dead claimant's free" ||
-    fail "nobody finished the free a dead node had claimed"
+O="$("$LOCK_POKE" "$DEV" "$CINO" | sed -n 's/.*ns_owner=\([0-9]*\).*/\1/p')"
+[ -n "$GOT" ] && [ "$O" = 65535 ] && pass "the orphan scrub finished a dead claimant's free and released it" ||
+    fail "nobody finished the free a dead node had claimed (ns_owner $O)"
 ct_umount "$MNT"
-OUT="$(ct_fsck "$DEV" 2>&1 || true)"
-grep -q "inode $CINO is allocated" <<<"$OUT" && fail "the dead claimant's number is still allocated" ||
-    pass "its number is free on the device"
-grep -q '^ERR' <<<"$OUT" && fail "fsck: $(grep '^ERR' <<<"$OUT" | head -3)" || pass "fsck clean"
+# fsck only once the peer is fenced: unfenced, its live-looking row
+# makes the tool wait out the stale window
+if [ -n "$GOT" ]; then
+    OUT="$(ct_fsck "$DEV" 2>&1 || true)"
+    grep -q "inode $CINO is allocated" <<<"$OUT" && fail "the dead claimant's number is still allocated" ||
+        pass "its number is free on the device"
+    grep -q '^ERR' <<<"$OUT" && fail "fsck: $(grep '^ERR' <<<"$OUT" | head -3)" || pass "fsck clean"
+fi
 ct_exit
