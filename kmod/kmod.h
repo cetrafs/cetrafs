@@ -824,6 +824,7 @@ int cetrafs_bg_seed_count_epochs(struct super_block *sb, u32 zg_id);
 
 unsigned long cetrafs_sb_pf_drain_last(struct super_block *sb);
 void cetrafs_sb_set_pf_drain_last(struct super_block *sb, unsigned long when);
+struct mutex *cetrafs_sb_pf_drain_mutex(struct super_block *sb);
 unsigned long cetrafs_sb_bg_sweep_last(struct super_block *sb);
 void cetrafs_sb_set_bg_sweep_last(struct super_block *sb, unsigned long when);
 void cetrafs_bg_desc_refresh_foreign(struct super_block *sb, u32 bg_id);

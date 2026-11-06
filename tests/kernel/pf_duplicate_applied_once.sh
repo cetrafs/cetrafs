@@ -17,9 +17,14 @@
 # resumes, L must stay that writer's, and the first writer must get a
 # different block.
 #
+# Twice: both copies in one CAS region of the queue, and in two (the
+# drain consumes and applies region by region, so a check scoped to one
+# region sees only the first case).
+#
 # DISCRIMINATION: applying every consumed entry, the second copy frees
 # L under the second writer and the first writer is handed L as well --
-# two files share one block.
+# two files share one block. Deduplicating per region fails the
+# cross-region case alone.
 set -euo pipefail
 . "$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)/lib/harness.sh"
 require_root
@@ -38,37 +43,51 @@ ct_param_set auto_defrag 0
 ct_param_set scrub 0
 ext() { "$PP" "$IMG" extent "$(stat -c %i "$1")" | awk '{ print $1 }'; }
 
-dd if=/dev/urandom of="$MNT/f1" bs=4096 count=1 conv=fsync status=none
-sync
-L="$(ext "$MNT/f1")"
-[ -n "$L" ] || { fail "setup: no extent for f1"; ct_exit; }
-rm -f "$MNT/f1"
-sync
-"$PP" "$IMG" add 0 "$L" 1 >/dev/null
-"$PP" "$IMG" add 0 "$L" 1 >/dev/null
-log "block $L freed and queued twice"
+# race <tag> <fillers>: free one block L, queue it, <fillers> already-free
+# blocks after it, and L again -- with 31 fillers the second copy is slot
+# 32, the first slot of the queue's second CAS region. Then the writers.
+race() {
+    local tag="$1" nfill="$2" L F2 G i
+    dd if=/dev/urandom of="$MNT/f1$tag" bs=4096 count=1 conv=fsync status=none
+    sync
+    L="$(ext "$MNT/f1$tag")"
+    [ -n "$L" ] || { fail "$tag setup: no extent for f1"; return; }
+    rm -f "$MNT/f1$tag"
+    sync
+    "$PP" "$IMG" add 0 "$L" 1 >/dev/null
+    for i in $(seq 1 "$nfill"); do "$PP" "$IMG" add 0 $((L + 4000 + i)) 1 >/dev/null; done
+    "$PP" "$IMG" add 0 "$L" 1 >/dev/null
+    [ "$("$PP" "$IMG" dump 0 | sed -n "$((nfill + 2))p")" = "$L 1" ] ||
+        { fail "$tag setup: the second copy is not at slot $((nfill + 1))"; return; }
+    log "$tag: block $L freed and queued at slots 0 and $((nfill + 1))"
 
-MARK="$(dmesg_mark)"
-ct_param_set pf_drain_min_ms 0
-ct_param_set pf_apply_stall_ms 4000
-dd if=/dev/urandom of="$MNT/g" bs=4096 count=1 conv=fsync status=none &
-GPID=$!
-sleep 1
-ct_param_set pf_drain_min_ms 600000 # the second writer must not drain itself
-dd if=/dev/urandom of="$MNT/f2" bs=4096 count=1 conv=fsync status=none
-wait "$GPID"
-ct_param_set pf_apply_stall_ms 0
-sync
-F2="$(ext "$MNT/f2")"
-G="$(ext "$MNT/g")"
-log "f2 at $F2, g at $G"
-[ "$F2" = "$L" ] || { fail "setup: the second writer got block $F2, not the freed block $L"; ct_umount "$MNT"; ct_exit; }
-pass "setup: the second writer allocated the queued block $L inside the drain"
-[ "$G" != "$L" ] && pass "the first writer got another block ($G): the duplicate did not free $L again" ||
-    fail "the first writer was handed $L too -- the duplicate entry freed the second writer's block"
-dmesg_since "$MARK" | grep -q "queued lba=$L count=1 twice" && pass "and the duplicate was reported" ||
-    fail "the duplicate entry was not reported"
-[ -z "$("$PP" "$IMG" dump 0)" ] && pass "both entries were consumed" || fail "entries left: $("$PP" "$IMG" dump 0)"
+    MARK="$(dmesg_mark)"
+    ct_param_set pf_drain_min_ms 0
+    ct_param_set pf_apply_stall_ms 4000 # one-shot: after the first apply
+    dd if=/dev/urandom of="$MNT/g$tag" bs=4096 count=1 conv=fsync status=none &
+    GPID=$!
+    sleep 1
+    ct_param_set pf_drain_min_ms 600000 # the second writer must not drain itself
+    dd if=/dev/urandom of="$MNT/f2$tag" bs=4096 count=1 conv=fsync status=none
+    wait "$GPID"
+    ct_param_set pf_apply_stall_ms 0
+    sync
+    F2="$(ext "$MNT/f2$tag")"
+    G="$(ext "$MNT/g$tag")"
+    log "$tag: f2 at $F2, g at $G"
+    [ "$F2" = "$L" ] || { fail "$tag setup: the second writer got block $F2, not the freed block $L"; return; }
+    pass "$tag setup: the second writer allocated the queued block $L inside the drain"
+    [ "$G" != "$L" ] && pass "$tag: the first writer got another block ($G): the copy did not free $L again" ||
+        fail "$tag: the first writer was handed $L too -- the second copy freed the second writer's block"
+    dmesg_since "$MARK" | grep -q "lba=$L count=1 overlaps a free this drain already applied" &&
+        pass "$tag: and the copy was reported" || fail "$tag: the second copy was not reported"
+    [ -z "$("$PP" "$IMG" dump 0)" ] && pass "$tag: every entry was consumed" ||
+        fail "$tag: entries left: $("$PP" "$IMG" dump 0 | head -3)"
+}
+
+race same-region 0
+race cross-region 31
+
 ct_umount "$MNT"
 OUT="$(ct_fsck "$DEV" 2>&1 || true)"
 grep -qE '^ERR' <<<"$OUT" && fail "fsck: $(grep '^ERR' <<<"$OUT" | head -3)" || pass "fsck clean"

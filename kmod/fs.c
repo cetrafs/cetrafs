@@ -612,6 +612,7 @@ struct cetrafs_sb_info {
     atomic64_t *bg_alloc_seq;
     unsigned long bg_sweep_last; /* jiffies of the last foreign-descriptor sweep */
     unsigned long pf_drain_last; /* jiffies of the last on-demand pending-free drain */
+    struct mutex pf_drain_mutex; /* one pending-free drain at a time (cetrafs_zg_drain_pending_frees()) */
 
     /*
      * Namespace locks this node took and could not give back.
@@ -1377,6 +1378,7 @@ int cetrafs_fill_super(struct super_block *sb, struct fs_context *fc)
         if (sbi->peer_count)
             sbi->peers = kcalloc(sbi->peer_count, sizeof(*sbi->peers), GFP_KERNEL);
         mutex_init(&sbi->alloc_mutex);
+        mutex_init(&sbi->pf_drain_mutex);
         mutex_init(&sbi->zg_claim_mutex);
         init_rwsem(&sbi->release_rwsem);
         init_waitqueue_head(&sbi->zg_adopt_wq);
@@ -4462,6 +4464,13 @@ unsigned long cetrafs_sb_pf_drain_last(struct super_block *sb)
     struct cetrafs_sb_info *sbi = sb->s_fs_info;
 
     return sbi ? READ_ONCE(sbi->pf_drain_last) : 0;
+}
+
+struct mutex *cetrafs_sb_pf_drain_mutex(struct super_block *sb)
+{
+    struct cetrafs_sb_info *sbi = sb->s_fs_info;
+
+    return sbi ? &sbi->pf_drain_mutex : NULL;
 }
 
 void cetrafs_sb_set_pf_drain_last(struct super_block *sb, unsigned long when)

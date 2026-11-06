@@ -32,6 +32,7 @@
  */
 #define pr_fmt(fmt) "cetrafs: " fmt
 
+#include <linux/maple_tree.h>
 #include <linux/buffer_head.h>
 #include <linux/crc32c.h>
 #include <linux/delay.h>
@@ -2064,10 +2065,13 @@ static int cetrafs_zg_drain_one(struct super_block *sb, u32 zg_id)
     unsigned int regions = CETRAFS_BLOCK_SIZE / region_sz;
     unsigned int slots = region_sz / sizeof(cetrafs_pending_free_t);
     struct cetrafs_pf_drain_ctx *ctx;
+    /* Every range this drain has applied, across all its regions. */
+    struct maple_tree done_mt;
     u64 qstart;
     u32 qblocks, qb, applied = 0, empty_run = 0;
     int ret;
 
+    mt_init(&done_mt);
     ret = cetrafs_zg_queue_span(sb, zg_id, &qstart, &qblocks);
     if (ret)
         return ret;
@@ -2156,28 +2160,48 @@ static int cetrafs_zg_drain_one(struct super_block *sb, u32 zg_id)
              * blocks bitmap-set and unreferenced -- a leak the scrub
              * reclaims, never a double free. */
             for (e = 0; e < ctx->n; e++) {
-                unsigned int d;
-                bool dup = false;
-                int aret;
+                u64 first = ctx->done[e].lba, last = first + ctx->done[e].count - 1;
+                unsigned int ms;
+                int aret, mret;
 
                 ctrace("PFDRAIN zg=%u lba=%llu count=%u consumed=%d\n", zg_id,
                        (unsigned long long) ctx->done[e].lba, ctx->done[e].count, (int) ctx->consumed[e]);
                 if (!ctx->consumed[e])
                     continue;
-                if (applied && READ_ONCE(cetrafs_pf_apply_stall_ms))
-                    msleep(READ_ONCE(cetrafs_pf_apply_stall_ms)); /* TEST ONLY */
-                /* The same free queued twice is a double free already;
-                 * applied twice, under separate alloc_mutex holds, the
-                 * second clears whatever this node allocated there in
-                 * between -- a live file's block (audit 2026-11-06 L19).
-                 * Applied once; the copy is consumed and reported. */
-                for (d = 0; d < e && !dup; d++)
-                    dup = ctx->consumed[d] && ctx->done[d].lba == ctx->done[e].lba &&
-                          ctx->done[d].count == ctx->done[e].count;
-                if (dup) {
-                    pr_warn_ratelimited("pending free: ZG %u queued lba=%llu count=%u twice -- applying it once\n",
-                                        zg_id, (unsigned long long) ctx->done[e].lba, ctx->done[e].count);
-                    applied++; /* drained: consumed, and its one apply done */
+                if (applied && (ms = xchg(&cetrafs_pf_apply_stall_ms, 0)))
+                    msleep(ms); /* TEST ONLY, one-shot */
+                /* A block freed twice in one batch is a double free
+                 * already; applied twice, under separate alloc_mutex
+                 * holds, the second clears whatever this node allocated
+                 * there in between -- a live file's block (audit
+                 * 2026-11-06 L19). So no range is applied over one this
+                 * drain has applied, in any region: an entry overlapping
+                 * one is skipped WHOLE. Skipping errs toward a leak (the
+                 * scrub reclaims what it leaves set), and so does a
+                 * failure to track the range.
+                 *
+                 * Not covered: a copy this drain never reached (a busy
+                 * region, past the empty run), applied by a LATER drain
+                 * after a reallocation. Entries carry no stamp that
+                 * tells a stale copy from a genuine re-free, and a
+                 * longer memory would skip the genuine ones too. */
+                if (last < first) {
+                    mret = -ERANGE;
+                } else {
+                    mret = mtree_insert_range(&done_mt, (unsigned long) first, (unsigned long) last, xa_mk_value(1),
+                                              GFP_NOFS);
+                }
+                if (mret == -EEXIST) {
+                    pr_warn_ratelimited("pending free: ZG %u lba=%llu count=%u overlaps a free this drain already "
+                                        "applied (queued twice) -- skipping it\n",
+                                        zg_id, (unsigned long long) first, ctx->done[e].count);
+                    applied++; /* drained: consumed, its blocks already applied once */
+                    continue;
+                }
+                if (mret) {
+                    pr_warn_ratelimited("pending free: ZG %u could not track lba=%llu count=%u (%d) -- skipping it, "
+                                        "left for the scrub\n",
+                                        zg_id, (unsigned long long) first, ctx->done[e].count, mret);
                     continue;
                 }
                 aret = cetrafs_apply_pending_free(sb, ctx->done[e].lba, ctx->done[e].count, zg_id);
@@ -2202,6 +2226,7 @@ static int cetrafs_zg_drain_one(struct super_block *sb, u32 zg_id)
     }
 
     kfree(ctx);
+    mtree_destroy(&done_mt);
 
     if (applied) {
         pr_debug("pending free: ZG %u drained %u entr%s\n", zg_id, applied, applied == 1 ? "y" : "ies");
@@ -2298,11 +2323,18 @@ int cetrafs_zg_drain_pending_frees(struct super_block *sb)
 {
     atomic64_inc(&cetrafs_pf_drains);
     const cetrafs_superblock_t *raw_sb = cetrafs_sb_raw(sb);
+    struct mutex *m = cetrafs_sb_pf_drain_mutex(sb);
     u32 zg_count, z;
     int ret = 0;
 
-    if (!raw_sb)
+    if (!raw_sb || !m)
         return -EINVAL;
+    /* One drain at a time: two would split one batch between them, and
+     * each would apply its half without seeing what the other applied
+     * (the dedupe above is per drain). One already running does this
+     * work; anything it leaves is the next tick's. */
+    if (!mutex_trylock(m))
+        return 0;
 
     zg_count = le32_to_cpu(raw_sb->zone_group_count);
     for (z = 0; z < zg_count; z++) {
@@ -2316,6 +2348,7 @@ int cetrafs_zg_drain_pending_frees(struct super_block *sb)
             ret = rc;
     }
 
+    mutex_unlock(m);
     return ret;
 }
 
