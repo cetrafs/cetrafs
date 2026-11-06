@@ -2052,6 +2052,12 @@ static int cetrafs_pf_drain_mutate(void *image, unsigned int len, void *priv)
  * rule 8's safe direction. A lost consume CAS now simply applies
  * nothing and leaves the entries for the next pass.
  */
+/* TEST ONLY: pause between two applies of one drain batch
+ * (tests/kernel/pf_duplicate_applied_once.sh). */
+static unsigned int cetrafs_pf_apply_stall_ms;
+cetrafs_test_param(pf_apply_stall_ms, cetrafs_pf_apply_stall_ms, uint, 0644);
+MODULE_PARM_DESC(pf_apply_stall_ms, "TEST ONLY: pause between the applies of one pending-free drain batch");
+
 static int cetrafs_zg_drain_one(struct super_block *sb, u32 zg_id)
 {
     unsigned int region_sz = cetrafs_cas_region_size(sb);
@@ -2150,11 +2156,40 @@ static int cetrafs_zg_drain_one(struct super_block *sb, u32 zg_id)
              * blocks bitmap-set and unreferenced -- a leak the scrub
              * reclaims, never a double free. */
             for (e = 0; e < ctx->n; e++) {
+                unsigned int d;
+                bool dup = false;
+                int aret;
+
                 ctrace("PFDRAIN zg=%u lba=%llu count=%u consumed=%d\n", zg_id,
                        (unsigned long long) ctx->done[e].lba, ctx->done[e].count, (int) ctx->consumed[e]);
-                if (ctx->consumed[e] &&
-                    cetrafs_apply_pending_free(sb, ctx->done[e].lba, ctx->done[e].count, zg_id) == 0)
+                if (!ctx->consumed[e])
+                    continue;
+                if (applied && READ_ONCE(cetrafs_pf_apply_stall_ms))
+                    msleep(READ_ONCE(cetrafs_pf_apply_stall_ms)); /* TEST ONLY */
+                /* The same free queued twice is a double free already;
+                 * applied twice, under separate alloc_mutex holds, the
+                 * second clears whatever this node allocated there in
+                 * between -- a live file's block (audit 2026-11-06 L19).
+                 * Applied once; the copy is consumed and reported. */
+                for (d = 0; d < e && !dup; d++)
+                    dup = ctx->consumed[d] && ctx->done[d].lba == ctx->done[e].lba &&
+                          ctx->done[d].count == ctx->done[e].count;
+                if (dup) {
+                    pr_warn_ratelimited("pending free: ZG %u queued lba=%llu count=%u twice -- applying it once\n",
+                                        zg_id, (unsigned long long) ctx->done[e].lba, ctx->done[e].count);
+                    applied++; /* drained: consumed, and its one apply done */
+                    continue;
+                }
+                aret = cetrafs_apply_pending_free(sb, ctx->done[e].lba, ctx->done[e].count, zg_id);
+                if (!aret)
                     applied++;
+                else
+                    /* Consumed, so not retried: the blocks stay set and
+                     * unreferenced, a leak the scrub reclaims. Said, not
+                     * dropped. */
+                    pr_warn_ratelimited("pending free: ZG %u could not apply lba=%llu count=%u (%d) -- left for the "
+                                        "scrub\n",
+                                        zg_id, (unsigned long long) ctx->done[e].lba, ctx->done[e].count, aret);
             }
         }
 
