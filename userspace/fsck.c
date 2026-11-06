@@ -665,6 +665,29 @@ static int fsck_alloc_block(int fd,
     return -1;
 }
 
+/* The dirent file_type for a raw mode -- the kernel's
+ * cetrafs_dirent_type(). readdir hands it out as d_type, and `find -type
+ * l`, fts, rsync and tar trust it without a stat. */
+static uint8_t fsck_ft_for_mode(uint32_t mode)
+{
+    switch (mode & 0170000u) {
+    case 0040000u:
+        return CETRAFS_FT_DIR;
+    case 0120000u:
+        return CETRAFS_FT_LNK;
+    case 0020000u:
+        return CETRAFS_FT_CHR;
+    case 0060000u:
+        return CETRAFS_FT_BLK;
+    case 0010000u:
+        return CETRAFS_FT_FIFO;
+    case 0140000u:
+        return CETRAFS_FT_SOCK;
+    default:
+        return CETRAFS_FT_REG;
+    }
+}
+
 /* Give back a block fsck_alloc_block() handed out and nothing came to
  * reference: its bit cleared, its counts credited. */
 static void fsck_unalloc_block(int fd,
@@ -3866,11 +3889,22 @@ int main(int argc, char **argv)
                     uint64_t lfino = fsck_lost_found(fd, &sb, cetrafs_le32(sb.block_group_count), bg_data_start, bg_data_cnt,
                                                      bg_bmap_lba, ibmap, &ibmap_dirty, &lf);
                     char nm[32];
+                    cetrafs_inode_t oin;
+                    uint8_t ft;
 
+                    /* The type from the record, not DIR-or-REG: a
+                     * recovered symlink typed as a regular file is
+                     * missed by everything that trusts d_type (audit
+                     * 2026-11-06 L26). is_dir[] stays the authority for
+                     * directories, which the walk already decided. */
+                    fsck_read_inode(fd, &sb, ino, &oin);
+                    ft = is_dir[ino] ? CETRAFS_FT_DIR : fsck_ft_for_mode(cetrafs_le32(oin.mode));
+                    if (ft == CETRAFS_FT_DIR && !is_dir[ino])
+                        ft = CETRAFS_FT_REG;
                     snprintf(nm, sizeof(nm), "#%" PRIu64, ino);
                     if (lfino &&
                         !fsck_dir_link(fd, &sb, cetrafs_le32(sb.block_group_count), bg_data_start, bg_data_cnt, bg_bmap_lba, lfino,
-                                       nm, ino, is_dir[ino] ? CETRAFS_FT_DIR : CETRAFS_FT_REG)) {
+                                       nm, ino, ft)) {
                         /* A recovered DIRECTORY's '..' must name its new
                          * parent, or the tree it has been grafted into
                          * disagrees with itself and the next run says so.
