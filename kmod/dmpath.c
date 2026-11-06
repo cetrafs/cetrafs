@@ -321,13 +321,24 @@ static DECLARE_WAIT_QUEUE_HEAD(cetrafs_dmpath_wq);
 /* Same generous ceiling caw.c uses: one small synchronous command. */
 #define CETRAFS_DMPATH_TIMEOUT_JIFFIES (10 * HZ)
 
+/* TEST ONLY: the next identity READ reports a UNIT ATTENTION without
+ * executing, as a path just reset or re-zoned does
+ * (tests/device/caw_dm_path.sh). */
+static bool cetrafs_dmpath_ua_once;
+cetrafs_test_param(dmpath_ua_once, cetrafs_dmpath_ua_once, bool, 0644);
+MODULE_PARM_DESC(dmpath_ua_once, "TEST ONLY: the next dm path identity READ reports a UNIT ATTENTION");
+
+/* How many UNIT ATTENTIONs one identity READ absorbs: the same budget the
+ * CAW itself gives them (caw.c). */
+#define CETRAFS_DMPATH_UA_RETRIES 5
+
 static int cetrafs_dmpath_read(struct scsi_device *sdev, u64 lba, unsigned int nblocks, void *buf, unsigned int lbs)
 {
     unsigned char cdb[16] = {0};
     struct scsi_sense_hdr sshdr;
     struct scsi_exec_args args;
+    int attempt, ret = -EIO;
     u8 *sense;
-    int ret;
 
     sense = kzalloc(SCSI_SENSE_BUFFERSIZE, GFP_KERNEL);
     if (!sense)
@@ -337,13 +348,37 @@ static int cetrafs_dmpath_read(struct scsi_device *sdev, u64 lba, unsigned int n
     put_unaligned_be64(lba, &cdb[2]);
     put_unaligned_be32(nblocks, &cdb[10]);
 
-    memset(&args, 0, sizeof(args));
-    args.sense = sense;
-    args.sense_len = SCSI_SENSE_BUFFERSIZE;
-    args.sshdr = &sshdr;
+    /*
+     * A UNIT ATTENTION reports a state change on the path (a reset, a
+     * LUN inventory change), not a refusal of this READ: retry it, as
+     * the CAW does. Taken as -EIO it rejected the path, and on a
+     * single-path map the CAS that wanted it then failed -EOPNOTSUPP
+     * (audit 2026-11-06 L13). A READ has no side effect, so retrying
+     * it decides nothing twice.
+     */
+    for (attempt = 0; attempt <= CETRAFS_DMPATH_UA_RETRIES; attempt++) {
+        memset(&args, 0, sizeof(args));
+        memset(&sshdr, 0, sizeof(sshdr));
+        args.sense = sense;
+        args.sense_len = SCSI_SENSE_BUFFERSIZE;
+        args.sshdr = &sshdr;
 
-    ret = scsi_execute_cmd(sdev, cdb, REQ_OP_DRV_IN, buf, (size_t) nblocks * lbs, CETRAFS_DMPATH_TIMEOUT_JIFFIES, 0,
-                           &args);
+        if (READ_ONCE(cetrafs_dmpath_ua_once) && xchg(&cetrafs_dmpath_ua_once, false)) {
+            sshdr.response_code = 0x70; /* TEST ONLY: see the parameter */
+            sshdr.sense_key = UNIT_ATTENTION;
+            ret = SAM_STAT_CHECK_CONDITION;
+            pr_warn("dm path: TEST dmpath_ua_once -- identity READ reports a unit attention\n");
+        } else {
+            ret = scsi_execute_cmd(sdev, cdb, REQ_OP_DRV_IN, buf, (size_t) nblocks * lbs,
+                                   CETRAFS_DMPATH_TIMEOUT_JIFFIES, 0, &args);
+        }
+        if (!ret)
+            break;
+        if (!scsi_sense_valid(&sshdr) || sshdr.sense_key != UNIT_ATTENTION)
+            break;
+        pr_info_ratelimited("dm path: identity READ retrying after unit attention asc=0x%02x ascq=0x%02x\n",
+                            sshdr.asc, sshdr.ascq);
+    }
     kfree(sense);
     return ret ? -EIO : 0;
 }

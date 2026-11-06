@@ -118,6 +118,26 @@ else
 fi
 rmmod cetrafs 2>/dev/null
 
+echo "== a unit attention on the identity READ must not reject the path"
+# The identity guard's READ(16) took a UNIT ATTENTION -- a reset or an
+# inventory change on the path, not a refusal -- as a failure and dropped
+# the path; on a single-path map the CAS then had none (audit 2026-11-06
+# L13). dmpath_ua_once makes the next identity READ report one.
+unload && insmod "$ROOT/kmod/cetrafs.ko" 2>/dev/null
+dmesg -C >/dev/null 2>&1
+echo 1 >/sys/module/cetrafs/parameters/dmpath_ua_once 2>/dev/null
+if mount -t cetrafs /dev/mapper/cawid "$MNT" 2>/dev/null; then
+    dmesg | grep -q "identity READ reports a unit attention" ||
+        fail "setup: the injected unit attention never reached an identity READ"
+    grep -q "available=yes" /proc/fs/cetrafs/*/properties 2>/dev/null &&
+        pass "a unit attention on the identity READ was retried: CAW still available" ||
+        fail "a unit attention on the identity READ rejected the path"
+    umount "$MNT"
+else
+    fail "could not mount cetrafs on the dm node after a unit attention"
+fi
+rmmod cetrafs 2>/dev/null
+
 echo "== a path failure must be ABSORBED, not surfaced"
 # A second real path to one LUN cannot be fabricated here, so the
 # transport error is injected (caw_fail_path_once). What matters is the
