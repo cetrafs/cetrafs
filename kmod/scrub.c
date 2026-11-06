@@ -113,6 +113,12 @@ MODULE_PARM_DESC(scrub_verdict_stall_ms, "TEST ONLY: ms to hold between the scru
 
 static bool cetrafs_scrub_ignore_alloc_seq;
 cetrafs_test_param(scrub_ignore_alloc_seq, cetrafs_scrub_ignore_alloc_seq, bool, 0644);
+/* TEST ONLY: at the next free's ownership check, the Block Group reads as
+ * released to the pool, as a mid-cycle release leaves it
+ * (tests/kernel/scrub_bg_moved.sh). */
+static bool cetrafs_scrub_bg_moved_once;
+cetrafs_test_param(scrub_bg_moved_once, cetrafs_scrub_bg_moved_once, bool, 0644);
+MODULE_PARM_DESC(scrub_bg_moved_once, "TEST ONLY: the scrub's next free finds its Block Group released");
 MODULE_PARM_DESC(scrub_ignore_alloc_seq,
                  "TEST ONLY: free on a verdict older than the last allocation in the Block Group");
 
@@ -467,6 +473,16 @@ static int scrub_free_confirmed(struct cetrafs_scrub *s, struct scrub_bg *b, u64
          */
         if (!cetrafs_sb_zg_owned_cached(sb, b->zg_id)) {
             pr_info("scrub: ZG %u stopped being ours mid-cycle -- abandoning BG %u\n", b->zg_id, b->bg_id);
+            break;
+        }
+        /* ...and the Block Group still the Zone Group's: groups are
+         * released and claimed one at a time, so the ZG can stay ours
+         * while this BG went back to the pool and on to a peer -- the
+         * same silent foreign free (audit 2026-11-06 L18). */
+        if (READ_ONCE(cetrafs_scrub_bg_moved_once) && xchg(&cetrafs_scrub_bg_moved_once, false))
+            cetrafs_sb_set_bg_owner(sb, b->bg_id, CETRAFS_BG_OWNER_FREE); /* TEST ONLY: see the parameter */
+        if (cetrafs_sb_bg_owner(sb, b->bg_id) != b->zg_id) {
+            pr_info("scrub: BG %u left ZG %u mid-cycle -- abandoning it\n", b->bg_id, b->zg_id);
             break;
         }
         if (scrub_bit_set(bmap, bit) && !test_bit((unsigned int) bit, b->ref)) {
