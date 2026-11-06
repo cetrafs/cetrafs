@@ -664,7 +664,7 @@ u64 cetrafs_inode_new_generation(struct super_block *sb);
 // dir.c
 int cetrafs_dir_add_entry(struct inode *dir, const struct qstr *name, u64 ino, u8 file_type);
 int cetrafs_dir_remove_entry(struct inode *dir, const struct qstr *name, u64 *out_ino, u8 *out_file_type);
-int cetrafs_dirent_block_init(struct super_block *sb, u64 lba);
+int cetrafs_dirent_block_init(struct super_block *sb, u64 lba, bool *keep);
 int cetrafs_dir_update_dotdot(struct inode *dir, u64 new_parent_ino);
 extern const struct inode_operations cetrafs_inode_ops;
 extern const struct file_operations cetrafs_dir_ops;

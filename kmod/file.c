@@ -4644,11 +4644,14 @@ relookup:
          * same inode, which is write-locked to one node.
          */
         if (S_ISDIR(inode->i_mode)) {
-            ret = cetrafs_dirent_block_init(sb, lba);
+            bool keep;
+
+            ret = cetrafs_dirent_block_init(sb, lba, &keep);
             if (ret) {
-                /* -EUCLEAN: a live directory still lists it, so the bit
-                 * we just set is the truth -- keep it. */
-                if (ret != -EUCLEAN)
+                /* keep: a live directory still lists it, or its owner
+                 * could not be read -- the bit we just set may be the
+                 * truth, so it stays set (a leak, never a share). */
+                if (!keep)
                     cetrafs_free_data_block(sb, lba);
                 return ret;
             }

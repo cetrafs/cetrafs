@@ -232,6 +232,24 @@ static struct buffer_head *cetrafs_dirent_bread(struct super_block *sb, u64 lba)
  * pointer in the format), so a later block is not covered: this is a
  * check behind the allocator, which stays the authority.
  */
+/* Is inode slot 'ino' all zeros on the device -- a number never written,
+ * as opposed to a record that failed its checksum? */
+static bool cetrafs_dirent_owner_slot_zero(struct super_block *sb, u64 ino)
+{
+    const cetrafs_superblock_t *raw_sb = cetrafs_sb_raw(sb);
+    struct buffer_head *bh;
+    bool zero;
+
+    if (!raw_sb)
+        return false;
+    bh = cetrafs_bread_uncached(sb, le64_to_cpu(raw_sb->inode_table_start) + (ino - 1));
+    if (!bh)
+        return false;
+    zero = !memchr_inv(bh->b_data, 0, CETRAFS_BLOCK_SIZE);
+    brelse(bh);
+    return zero;
+}
+
 static int cetrafs_dirent_block_live_owner(struct super_block *sb, u64 lba)
 {
     struct buffer_head *bh = cetrafs_bread_uncached(sb, lba);
@@ -253,9 +271,25 @@ static int cetrafs_dirent_block_live_owner(struct super_block *sb, u64 lba)
     self = cetrafs_le64(d[0].inode);
     brelse(bh);
 
+    if (!self)
+        return 0; /* names no inode at all */
     cetrafs_invalidate_raw_inode(sb, self);
-    if (!self || cetrafs_read_raw_inode(sb, self, &r) || !cetrafs_le32(r.nlink) || !S_ISDIR(cetrafs_le32(r.mode)) ||
-        cetrafs_le16(r.eh.eh_magic) != CETRAFS_EXT_MAGIC)
+    /* A record that cannot be read decides nothing: answering "not
+     * owned" here zeroed a live directory's block whenever its owner's
+     * record had a read error or a tear (audit 2026-11-06 L1). Only a
+     * never-written (all-zero) record is "no owner". */
+    ret = cetrafs_read_raw_inode(sb, self, &r);
+    if (ret == -EINVAL)
+        return 0; /* past the inode table: names no inode at all */
+    if (ret) {
+        if (cetrafs_dirent_owner_slot_zero(sb, self))
+            return 0;
+        pr_err("dirent_block_init: block %llu names directory ino=%llu, whose record cannot be read (%d) -- "
+               "not zeroing it, the block stays allocated\n",
+               (unsigned long long) lba, (unsigned long long) self, ret);
+        return -EIO;
+    }
+    if (!cetrafs_le32(r.nlink) || !S_ISDIR(cetrafs_le32(r.mode)) || cetrafs_le16(r.eh.eh_magic) != CETRAFS_EXT_MAGIC)
         return 0;
 
     if (cetrafs_le16(r.eh.eh_depth) == 0) {
@@ -293,20 +327,25 @@ static int cetrafs_dirent_block_live_owner(struct super_block *sb, u64 lba)
 }
 
 /*
- * Returns -EUCLEAN when the block still belongs to a live directory: it
- * is then left untouched AND must stay allocated -- the caller must not
- * free it. The bitmap read FREE for a block an extent references, and
+ * Returns -EUCLEAN when the block still belongs to a live directory, and
+ * -EIO when that could not be decided: either way the block is left
+ * untouched AND must stay allocated (*keep) -- the caller must not free
+ * it. *keep false: the failure was the zeroing write's own, the block
+ * is the caller's to give back. The bitmap read FREE for a block an extent references, and
  * keeping the bit set is the repair, in the safe direction: at worst a
  * block the scrub reclaims later, never one shared by two directories.
  */
-int cetrafs_dirent_block_init(struct super_block *sb, u64 lba)
+int cetrafs_dirent_block_init(struct super_block *sb, u64 lba, bool *keep)
 {
     struct buffer_head *bh;
     int ret;
 
+    *keep = false;
     ret = cetrafs_dirent_block_live_owner(sb, lba);
-    if (ret)
+    if (ret) {
+        *keep = true;
         return ret;
+    }
 
     bh = cetrafs_getblk_overwrite(sb, lba);
     if (!bh)
@@ -1928,6 +1967,15 @@ static struct dentry *cetrafs_mkdir_locked(struct mnt_idmap *idmap,
     fs_debug(info, "mkdir '%.*s': allocated data block lba=%llu in bg=%u", (int) dentry->d_name.len,
              dentry->d_name.name, (unsigned long long) lba, bg_id);
 
+    /* The same guard a growing directory's block gets: if the allocator
+     * handed out a block a live directory still lists, or one whose
+     * owner cannot be read, it stays allocated and untouched (audit
+     * 2026-11-06 L1 -- mkdir overwrote it unchecked). */
+    ret = cetrafs_dirent_block_live_owner(sb, lba);
+    if (ret) {
+        cetrafs_free_inode(sb, ino);
+        return ERR_PTR(ret);
+    }
     /* Claimed without reading: every byte is overwritten below. */
     bh = cetrafs_getblk_overwrite(sb, lba);
     if (!bh) {
