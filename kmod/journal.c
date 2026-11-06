@@ -1205,6 +1205,12 @@ void cetrafs_journal_shutdown(struct super_block *sb)
     mutex_unlock(&j->lock);
 }
 
+/* TEST ONLY: the next N replay target lookups fail as an unreadable
+ * descriptor would (tests/kernel/journal_replay_lookup_error.sh). */
+static unsigned int cetrafs_journal_replay_lookup_fail;
+cetrafs_test_param(journal_replay_lookup_fail, cetrafs_journal_replay_lookup_fail, uint, 0644);
+MODULE_PARM_DESC(journal_replay_lookup_fail, "TEST ONLY: fail the next N journal replay target lookups with -EIO");
+
 struct cetrafs_journal_replay_entry {
     u64 txn_id;
     u64 target_lba;
@@ -1559,16 +1565,40 @@ static int __cetrafs_journal_replay_node(struct super_block *sb, u32 node_id, bo
          * Refuse loudly instead; the entry is dropped with the rest of
          * the area when the flag is parked clean.
          */
+        /*
+         * "Outside every data region" is one answer the lookup gives
+         * (-EINVAL); a descriptor it could not read is another, and it
+         * was taken for the first: a cold descriptor read failing during
+         * a path failover dropped a valid entry, and the area was then
+         * parked CLEAN over it -- the torn block it would have repaired
+         * stayed torn for good (audit 2026-11-06 M3;
+         * tests/kernel/journal_replay_lookup_error.sh). Not knowing
+         * aborts with the area DIRTY, as a payload read failure does;
+         * the next replay asks again.
+         */
         {
             u32 tgt_zg;
+            int lret = cetrafs_bg_owner_zg_for_lba(sb, cetrafs_le64(hdr->target_lba), &tgt_zg);
 
-            if (cetrafs_bg_owner_zg_for_lba(sb, cetrafs_le64(hdr->target_lba), &tgt_zg) != 0) {
+            if (!lret && READ_ONCE(cetrafs_journal_replay_lookup_fail)) {
+                WRITE_ONCE(cetrafs_journal_replay_lookup_fail, cetrafs_journal_replay_lookup_fail - 1);
+                lret = -EIO; /* test-only */
+            }
+            if (lret == -EINVAL) {
                 pr_err(
                     "journal replay: node %u slot %llu names target block %llu, which is outside every BG data "
                     "region -- refusing to apply it\n",
                     node_id, (unsigned long long) s, (unsigned long long) cetrafs_le64(hdr->target_lba));
                 brelse(hbh);
                 continue;
+            }
+            if (lret) {
+                pr_err("journal replay: node %u slot %llu: could not tell where target block %llu lies (%d) -- "
+                       "leaving the area dirty for the next replay\n",
+                       node_id, (unsigned long long) s, (unsigned long long) cetrafs_le64(hdr->target_lba), lret);
+                brelse(hbh);
+                ret = lret;
+                goto out_free;
             }
         }
 
