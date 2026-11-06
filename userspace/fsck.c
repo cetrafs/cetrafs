@@ -581,7 +581,7 @@ static const uint64_t *fsck_g_bg_desc_lba;
  * count checks ran earlier in the pass, so a block taken now without this
  * left both one high on disk and the next run reporting it (audit
  * 2026-11-06 L10, its sibling). */
-static void fsck_debit_bg_counts(int fd, uint32_t b)
+static void fsck_adjust_bg_counts(int fd, uint32_t b, int credit)
 {
     const cetrafs_superblock_t *sb = fsck_g_sb;
     uint8_t blk[CETRAFS_BLOCK_SIZE] = {0};
@@ -594,7 +594,9 @@ static void fsck_debit_bg_counts(int fd, uint32_t b)
         return;
     pread_all(fd, blk, sizeof(blk), (off_t) fsck_g_bg_desc_lba[b] * CETRAFS_BLOCK_SIZE);
     memcpy(&bgd, blk, sizeof(bgd));
-    if (cetrafs_le64(bgd.free_data_blocks))
+    if (credit)
+        bgd.free_data_blocks = cetrafs_cpu_to_le64(cetrafs_le64(bgd.free_data_blocks) + 1);
+    else if (cetrafs_le64(bgd.free_data_blocks))
         bgd.free_data_blocks = cetrafs_cpu_to_le64(cetrafs_le64(bgd.free_data_blocks) - 1);
     bgd.checksum = 0;
     bgd.checksum = cetrafs_cpu_to_le64(
@@ -609,7 +611,11 @@ static void fsck_debit_bg_counts(int fd, uint32_t b)
     memset(blk, 0, sizeof(blk));
     pread_all(fd, blk, sizeof(blk), (off_t) (cetrafs_le64(sb->zg_table_start) + z) * CETRAFS_BLOCK_SIZE);
     memcpy(&zg, blk, sizeof(zg));
-    if (pool && cetrafs_le64(zg.pool_free_blocks))
+    if (credit && pool)
+        zg.pool_free_blocks = cetrafs_cpu_to_le64(cetrafs_le64(zg.pool_free_blocks) + 1);
+    else if (credit)
+        zg.free_data_blocks = cetrafs_cpu_to_le64(cetrafs_le64(zg.free_data_blocks) + 1);
+    else if (pool && cetrafs_le64(zg.pool_free_blocks))
         zg.pool_free_blocks = cetrafs_cpu_to_le64(cetrafs_le64(zg.pool_free_blocks) - 1);
     else if (!pool && cetrafs_le64(zg.free_data_blocks))
         zg.free_data_blocks = cetrafs_cpu_to_le64(cetrafs_le64(zg.free_data_blocks) - 1);
@@ -649,7 +655,7 @@ static int fsck_alloc_block(int fd,
             bmap[i / 8] |= (uint8_t) (1u << (i % 8));
             pwrite_all(fd, bmap, (size_t) bmap_blocks * CETRAFS_BLOCK_SIZE,
                        (off_t) bg_bmap_lba[b] * CETRAFS_BLOCK_SIZE);
-            fsck_debit_bg_counts(fd, b); /* the bit first: stopped between, a count reads one high -- the next run fixes it */
+            fsck_adjust_bg_counts(fd, b, 0); /* the bit first: stopped between, a count reads one high -- the next run fixes it */
             *out_lba = bg_data_start[b] + i;
             free(bmap);
             return 0;
@@ -657,6 +663,34 @@ static int fsck_alloc_block(int fd,
         free(bmap);
     }
     return -1;
+}
+
+/* Give back a block fsck_alloc_block() handed out and nothing came to
+ * reference: its bit cleared, its counts credited. */
+static void fsck_unalloc_block(int fd,
+                               uint32_t bg_count,
+                               const uint64_t *bg_data_start,
+                               const uint64_t *bg_data_cnt,
+                               const uint64_t *bg_bmap_lba,
+                               uint64_t lba)
+{
+    for (uint32_t b = 0; b < bg_count; ++b) {
+        uint64_t i;
+        uint8_t byte;
+        off_t at;
+
+        if (lba < bg_data_start[b] || lba - bg_data_start[b] >= bg_data_cnt[b])
+            continue;
+        i = lba - bg_data_start[b];
+        at = (off_t) bg_bmap_lba[b] * CETRAFS_BLOCK_SIZE + (off_t) (i / 8);
+        pread_all(fd, &byte, 1, at);
+        if (!(byte & (1u << (i % 8))))
+            return;
+        byte &= (uint8_t) ~(1u << (i % 8));
+        pwrite_all(fd, &byte, 1, at);
+        fsck_adjust_bg_counts(fd, b, 1);
+        return;
+    }
 }
 
 /* The physical block holding logical block 'n' of a depth-0 directory.
@@ -823,8 +857,13 @@ static int fsck_dir_link(int fd,
                 goto grown;
             }
         }
-        if (e >= 4)
+        if (e >= 4) {
+            /* No slot for it: the block taken above goes back rather
+             * than being left set and referenced by nothing (audit
+             * 2026-11-06 L26). */
+            fsck_unalloc_block(fd, bg_count, bg_data_start, bg_data_cnt, bg_bmap_lba, nlba);
             return -1;
+        }
         dir.et.leaf[e].ee_block = cetrafs_cpu_to_le32(nblocks);
         dir.et.leaf[e].ee_len = cetrafs_extent_pack_len(1, 0);
         dir.et.leaf[e].ee_start_lo = cetrafs_cpu_to_le32((uint32_t) (nlba & 0xFFFFFFFFu));
@@ -3844,6 +3883,10 @@ int main(int argc, char **argv)
                         }
                         orphans_linked++;
                         repairs_made++;
+                    } else {
+                        fprintf(stderr,
+                                "WARN: inode %" PRIu64 " could not be linked into /lost+found (%s) -- left unnamed\n",
+                                ino, lfino ? "no room in it" : "no lost+found");
                     }
                 }
             } else if (!is_dir[ino] && refs[ino] != nlinks[ino]) {
