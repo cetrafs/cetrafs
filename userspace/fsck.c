@@ -2460,10 +2460,29 @@ int main(int argc, char **argv)
              * into /lost+found exactly as they would for any other
              * directory.
              */
-            if (repair_mode && !repair_blocked) {
+            /* A torn TAIL over an intact entry table is the common case
+             * (a crash mid-write of the tail sector), and every other
+             * directory gets a re-stamp for it, keeping its names. The
+             * root went straight to the rebuild: every top-level name
+             * gone, before this run even knew whether repair was safe --
+             * and if a later pass blocked repair, nothing linked the
+             * orphans back (audit 2026-11-06 M11). A re-stamp writes the
+             * same entries, so it is safe whatever the run finds later.
+             * Only an incoherent table is rebuilt. */
+            if (fsck_dirent_block_coherent(dirblk, &sb, 1, CETRAFS_ROOT_INO)) {
+                if (repair_mode && !repair_blocked) {
+                    fsck_stamp_dirent_block(dirblk);
+                    pwrite_all(fd, dirblk, sizeof(dirblk), (off_t) root_lba * CETRAFS_BLOCK_SIZE);
+                    repairs_made++;
+                    printf("  re-stamped the root directory's dirent tail -- every entry in it is intact\n");
+                } else {
+                    printf("  the root directory's entry table is intact: -r would re-stamp its tail\n");
+                    return 1;
+                }
+            } else if (repair_mode && !repair_blocked) {
                 repair_reinit_dirent_block(fd, root_lba, CETRAFS_ROOT_INO, CETRAFS_ROOT_INO, true);
                 repairs_made++;
-                printf("  rebuilt the root directory's dirent block (with '.' and '..')\n");
+                printf("  rebuilt the root directory's dirent block (with '.' and '..') -- its entries were damaged\n");
                 pread_all(fd, dirblk, sizeof(dirblk), (off_t) root_lba * CETRAFS_BLOCK_SIZE);
             } else {
                 return 1;
