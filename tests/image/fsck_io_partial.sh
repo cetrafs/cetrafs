@@ -15,7 +15,8 @@
 #
 # DISCRIMINATION: proven 2026-11-05 against the old helpers: the shimmed
 # repair stops at its first BG table read (EINTR) -- and, with the read
-# fixed, at its first partial write.
+# fixed, at its first partial write. The zero-progress case printed
+# "pwrite (repair): Success".
 set -euo pipefail
 . "$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)/lib/harness.sh"
 require_root
@@ -57,4 +58,17 @@ ct_fsck "$DEV" >/dev/null 2>&1 && pass "and the volume is clean afterwards" ||
 [ "$("$BG_POKE" "$DEV" 0 --dump | sed -n 's/.*free_data_blocks=\([0-9][0-9]*\).*/\1/p')" = "$BASE" ] &&
     pass "the repaired count is whole, not half-written" ||
     fail "the repaired descriptor reads $("$BG_POKE" "$DEV" 0 --dump)"
+
+# A write that makes no progress and sets no errno: the repair must stop
+# and say what happened, not print "pwrite (repair): Success".
+"$BG_POKE" "$DEV" 0 $((BASE - 64)) >/dev/null
+blockdev --flushbufs "$DEV"
+OUT="$(SHIM_ZERO_W=1 SHIM_LO=$LO SHIM_HI=$HI LD_PRELOAD="$SHIM" "$ROOT/userspace/fsck.cetra" -r "$DEV" 2>&1)" && RC=0 || RC=$?
+log "zero-progress fsck -r: rc=$RC; $(grep -iE 'pwrite' <<<"$OUT" | tr '\n' ';')"
+grep -q "pwrite (repair)" <<<"$OUT" || { fail "setup: the repair never reached the zero-progress write (rc $RC)"; ct_exit; }
+[ "$RC" -gt 1 ] && pass "a write that wrote nothing stops the repair (rc $RC)" ||
+    fail "a write that wrote nothing was accepted (rc $RC)"
+grep -q "pwrite (repair): wrote nothing at offset" <<<"$OUT" && ! grep -q "Success" <<<"$OUT" &&
+    pass "and it is reported as no progress, not \"Success\"" ||
+    fail "a zero-progress write was reported as: $(grep 'pwrite (repair)' <<<"$OUT" | head -1)"
 ct_exit

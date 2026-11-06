@@ -7,6 +7,10 @@
  * half of what was asked. A tool whose I/O helpers loop and retry does
  * the same work; one that treats either as fatal stops.
  *
+ * SHIM_ZERO_W=1 instead makes every pwrite in the window return 0 with
+ * errno 0: no error and no progress, which a tool must name rather than
+ * report through perror() (it prints "Success").
+ *
  * Built by the suite (cc -shared -fPIC ... -ldl), not by ct_helper. At
  * exit it prints "io_shim: eintr_r=N eintr_w=N split_r=N split_w=N" to
  * stderr so the suite can show the shim actually fired.
@@ -59,6 +63,7 @@ __attribute__((destructor)) static void report(void)
         static ssize_t (*real)(int, const void *, size_t, off_t);                \
         if (!real)                                                               \
             real = (ssize_t (*)(int, const void *, size_t, off_t)) dlsym(RTLD_NEXT, #name); \
+        if (in(off) && getenv("SHIM_ZERO_W")) { errno = 0; return 0; }           \
         if (in(off) && n > 1) {                                                  \
             if (!eintr_w) { eintr_w = 1; errno = EINTR; return -1; }             \
             split_w++;                                                           \

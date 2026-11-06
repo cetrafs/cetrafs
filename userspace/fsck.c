@@ -254,8 +254,13 @@ static void pwrite_all(int fd, const void *buf, size_t len, off_t off)
 
         if (w < 0 && errno == EINTR)
             continue;
-        if (w <= 0) {
+        if (w < 0) {
             perror("pwrite (repair)");
+            exit(FSCK_EXIT_NOEXAM);
+        }
+        if (w == 0) { /* no errno to report: perror would say "Success" */
+            fprintf(stderr, "pwrite (repair): wrote nothing at offset %lld with %zu bytes left\n", (long long) at,
+                    left);
             exit(FSCK_EXIT_NOEXAM);
         }
         p += w;
