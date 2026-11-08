@@ -226,6 +226,7 @@ u64 cetrafs_sb_get_fence_epoch(struct super_block *sb);
 void cetrafs_sb_set_fence_epoch(struct super_block *sb, u64 epoch);
 int cetrafs_sb_get_node_uuid(struct super_block *sb, u8 out[CETRAFS_NODE_UUID_LEN]);
 struct cetrafs_journal *cetrafs_sb_get_journal(struct super_block *sb);
+struct xarray *cetrafs_sb_deferred(struct super_block *sb);
 struct cetrafs_defrag *cetrafs_sb_get_defrag(struct super_block *sb);
 void cetrafs_sb_cache_zg_ownership(struct super_block *sb, u32 zg_id);
 void cetrafs_sb_uncache_zg_ownership(struct super_block *sb, u32 zg_id);
@@ -606,7 +607,7 @@ struct buffer_head *cetrafs_read_index_bh(struct inode *inode, u64 lba);
 struct buffer_head *cetrafs_read_tree_bh_for(struct inode *inode, u64 lba, u32 tail_magic, const char *what, bool reader);
 struct buffer_head *cetrafs_read_leaf_bh_for(struct inode *inode, u64 lba, bool reader);
 struct buffer_head *cetrafs_read_index_bh_for(struct inode *inode, u64 lba, bool reader);
-int cetrafs_flush_tree_blocks(struct inode *inode, const cetrafs_inode_t *raw);
+int cetrafs_flush_tree_blocks(struct inode *inode, const cetrafs_inode_t *raw, bool mapping_locked);
 void cetrafs_tree_invalidate_cached(struct inode *inode, const cetrafs_inode_t *raw);
 int cetrafs_tree_flatten(struct inode *inode, const cetrafs_inode_t *raw, cetrafs_extent_t **out_arr, u32 *out_n);
 int cetrafs_tree_build(struct inode *inode, const cetrafs_extent_t *flat, u32 n, cetrafs_inode_t *raw, u64 *out_meta);
@@ -1146,6 +1147,31 @@ void cetrafs_journal_free(struct cetrafs_journal *j);
 int cetrafs_journal_attach_node(struct super_block *sb, u32 node_id);
 int cetrafs_journal_sweep_own_claims(struct super_block *sb, u32 my_node_id);
 int cetrafs_journal_write_block(struct super_block *sb, struct buffer_head *bh, u32 prev_crc);
+int cetrafs_journal_write_deferred(struct super_block *sb, struct buffer_head **bhs, const u32 *disk_crc,
+                                   unsigned int n, bool *written);
+
+/* leafdefer.c: a regular file's tree blocks, held back from the device
+ * until a boundary and then journaled in one batch. A deferred buffer is
+ * NOT dirty -- writeback must never write it -- so it carries its own
+ * bit, and every "does this buffer hold a write the device has not seen?"
+ * asks cetrafs_bh_pending(). */
+#include <linux/buffer_head.h>
+enum { BH_CetraDeferred = BH_PrivateStart };
+BUFFER_FNS(CetraDeferred, cetra_deferred)
+static inline bool cetrafs_bh_pending(const struct buffer_head *bh)
+{
+    return buffer_dirty(bh) || buffer_cetra_deferred(bh);
+}
+int cetrafs_bh_defer_update(struct inode *inode, struct buffer_head *bh, u32 prev_crc);
+int cetrafs_write_deferred_target(struct super_block *sb, struct buffer_head *bh);
+void cetrafs_bh_end_update_deferred(struct buffer_head *bh);
+void cetrafs_bh_undefer(struct buffer_head *bh, bool drop);
+u32 cetrafs_deferred_disk_crc(struct super_block *sb, struct buffer_head *bh, u32 fallback);
+void cetrafs_deferred_clear(struct super_block *sb, struct buffer_head *bh);
+void cetrafs_deferred_forget_range(struct super_block *sb, u64 lba, u32 count);
+int cetrafs_deferred_flush_inode(struct inode *inode, bool mapping_locked);
+int cetrafs_deferred_flush_all(struct super_block *sb);
+unsigned long cetrafs_deferred_drop_all(struct super_block *sb);
 int cetrafs_journal_write_new_block(struct super_block *sb, struct buffer_head *bh);
 void cetrafs_journal_shutdown(struct super_block *sb);
 int cetrafs_journal_replay_node(struct super_block *sb, u32 node_id, bool wait_for_claim);

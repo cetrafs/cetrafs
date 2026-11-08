@@ -65,7 +65,9 @@ struct buffer_head *cetrafs_bread_uncached(struct super_block *sb, sector_t bloc
      * uptodate and return immediately without touching it.
      */
     lock_buffer(bh);
-    if (buffer_uptodate(bh) && !buffer_dirty(bh))
+    /* ...or deferred (leafdefer.c): the same pending write, kept out of
+     * writeback rather than dirty. */
+    if (buffer_uptodate(bh) && !cetrafs_bh_pending(bh))
         clear_buffer_uptodate(bh);
     unlock_buffer(bh);
 
@@ -396,6 +398,71 @@ int cetrafs_sync_buffer_keep(struct super_block *sb, struct buffer_head *bh)
 }
 
 /*
+ * End an update WITHOUT dirtying the buffer: the edit is held back for
+ * the next boundary (leafdefer.c), which writes it through the journal.
+ * The first time, the buffer is pinned and marked; the caller has listed
+ * it already. Writeback never sees it.
+ */
+void cetrafs_bh_end_update_deferred(struct buffer_head *bh)
+{
+    if (!buffer_cetra_deferred(bh)) {
+        get_bh(bh); /* the pin, dropped by cetrafs_bh_undefer()'s caller */
+        set_buffer_cetra_deferred(bh);
+    }
+    unlock_buffer(bh);
+}
+
+/* No longer held back: written, freed or dropped. 'drop' also forgets
+ * the cached image (a freed block, or a stopped mount's unwritten
+ * change). The bit goes under the buffer lock, the same lock
+ * cetrafs_write_deferred_target() tests it under. */
+void cetrafs_bh_undefer(struct buffer_head *bh, bool drop)
+{
+    lock_buffer(bh);
+    clear_buffer_cetra_deferred(bh);
+    if (drop) {
+        clear_buffer_dirty(bh);
+        clear_buffer_uptodate(bh);
+    }
+    unlock_buffer(bh);
+}
+
+/*
+ * Write a held-back extent-tree block (leafdefer.c) in place -- but only
+ * while it is still held back. The check and the submit are under one
+ * buffer lock, and so is a free's drop (cetrafs_deferred_forget_range()),
+ * so a block freed meanwhile -- an inode evicted while sync_fs flushes
+ * its blocks -- is never written over its next owner. On failure the
+ * cached image stays uptodate: it is the only copy of the edit.
+ * 1: no longer held back, nothing written.
+ */
+int cetrafs_write_deferred_target(struct super_block *sb, struct buffer_head *bh)
+{
+    if (cetrafs_sb_is_fenced(sb))
+        return -EIO;
+    lock_buffer(bh);
+    if (!buffer_cetra_deferred(bh)) {
+        unlock_buffer(bh);
+        return 1;
+    }
+    clear_buffer_write_io_error(bh);
+    clear_buffer_dirty(bh);
+#if LINUX_VERSION_CODE >= KERNEL_VERSION(7, 2, 0)
+    bh_submit(bh, REQ_OP_WRITE | REQ_SYNC, cetrafs_end_write_keep);
+#else
+    get_bh(bh);
+    bh->b_end_io = cetrafs_end_write_keep;
+    submit_bh(REQ_OP_WRITE | REQ_SYNC, bh);
+#endif
+    wait_on_buffer(bh);
+    if (buffer_write_io_error(bh)) {
+        clear_buffer_write_io_error(bh);
+        return cetrafs_meta_write_result(sb, bh, -EIO);
+    }
+    return cetrafs_meta_write_result(sb, bh, 0);
+}
+
+/*
  * Copy bytes out of a buffer a writer may be modifying RIGHT NOW under
  * the update protocol above. An unlocked memcpy can copy mid-
  * modification: a torn in-memory view that fails its checksum even
@@ -466,7 +533,7 @@ void cetrafs_bh_abort_update(struct buffer_head *bh)
      * out uninitialised memory as the block's real image. For a buffer
      * that really was read the clear is merely a wasted re-read on the
      * next access, and these are rare error paths. */
-    if (!buffer_dirty(bh))
+    if (!cetrafs_bh_pending(bh))
         clear_buffer_uptodate(bh);
     unlock_buffer(bh);
 }
@@ -563,7 +630,7 @@ void cetrafs_invalidate_block(struct super_block *sb, sector_t block)
         return;
 
     lock_buffer(bh);
-    if (buffer_uptodate(bh) && !buffer_dirty(bh))
+    if (buffer_uptodate(bh) && !cetrafs_bh_pending(bh))
         clear_buffer_uptodate(bh);
     unlock_buffer(bh);
 

@@ -296,6 +296,9 @@ struct cetrafs_sb_info {
      * on-disk format has no field for it. */
     atomic_t corruptions;
     struct xarray bad_inos;
+    /* A regular file's extent-tree blocks held back from writeback until
+     * a durability boundary, by LBA (leafdefer.c). */
+    struct xarray deferred;
 
     /*
      * The in-core lease: until when this node may keep writing on the
@@ -1352,6 +1355,7 @@ int cetrafs_fill_super(struct super_block *sb, struct fs_context *fc)
         sbi->defrag_enabled = true;
         sbi->auto_defrag_enabled = true;
         xa_init(&sbi->bad_inos);
+        xa_init(&sbi->deferred);
         sbi->sb = sb;
         INIT_WORK(&sbi->stop_work, cetrafs_sb_stop_work);
         {
@@ -2670,7 +2674,7 @@ void cetrafs_free_sb_info(struct super_block *sb)
     if (stopped) {
         cancel_work_sync(&sbi->stop_work); /* its sweep, finished; ours covers what came after */
         if (sb->s_bdev) {
-            unsigned long n = cetrafs_drop_dirty_metadata(sb);
+            unsigned long n = cetrafs_drop_dirty_metadata(sb) + cetrafs_deferred_drop_all(sb);
 
             if (n)
                 pr_err("%s: unmount of a stopped mount: discarded %lu dirty metadata buffer(s) without "
@@ -2679,6 +2683,14 @@ void cetrafs_free_sb_info(struct super_block *sb)
         }
         flush_err = -EIO;
         goto departed;
+    }
+    /* Tree blocks still held back -- a mapping written through after
+     * the last close, a boundary that failed -- go through the journal
+     * while it is still attached. */
+    r = cetrafs_deferred_flush_all(sb);
+    if (r) {
+        pr_err("%s: unmount: deferred extent-tree blocks could not be written (%d)\n", sb->s_id, r);
+        flush_err = r;
     }
     /* Park the journal flag and push the accrued free-space counters
      * out BEFORE announcing the departure below. See the sync there. */
@@ -2784,6 +2796,15 @@ departed:
         cancel_work_sync(&sbi->lease_work);
     }
     cancel_work_sync(&sbi->stop_work);
+    {
+        /* Nothing may stay pinned past the mount (rule 20): whatever a
+         * failed flush left is released, unwritten. */
+        unsigned long n = cetrafs_deferred_drop_all(sb);
+
+        if (n)
+            pr_err("%s: released %lu extent-tree block(s) that never reached the device\n", sb->s_id, n);
+    }
+    xa_destroy(&sbi->deferred);
     xa_destroy(&sbi->bad_inos);
     bitmap_free(sbi->owned_bgs);
     kfree(sbi->bg_owner_zg);
@@ -2952,6 +2973,13 @@ struct cetrafs_journal *cetrafs_sb_get_journal(struct super_block *sb)
     struct cetrafs_sb_info *sbi = sb->s_fs_info;
 
     return sbi ? sbi->journal : NULL;
+}
+
+struct xarray *cetrafs_sb_deferred(struct super_block *sb)
+{
+    struct cetrafs_sb_info *sbi = sb->s_fs_info;
+
+    return sbi ? &sbi->deferred : NULL;
 }
 
 /*
@@ -3582,7 +3610,7 @@ static void cetrafs_sb_stop_work(struct work_struct *w)
     struct super_block *sb = sbi->sb;
 
     if (sb && sb->s_bdev) {
-        unsigned long n = cetrafs_drop_dirty_metadata(sb);
+        unsigned long n = cetrafs_drop_dirty_metadata(sb) + cetrafs_deferred_drop_all(sb);
 
         if (n)
             pr_err("%s: SELF-FENCED: discarded %lu dirty metadata buffer(s) without writing them -- the "

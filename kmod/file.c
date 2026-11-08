@@ -3423,9 +3423,29 @@ static bool cetrafs_leaf_bh_holds_uninit(struct buffer_head *lbh, u32 iblock)
  * Kept dirty on failure: the cached leaf is the only copy of the shrunk
  * state, and the caller then appends nothing.
  */
+/*
+ * A regular file's extent-tree block, edited under its update lock, is
+ * held back for the next durability boundary (leafdefer.c) instead of
+ * being dirtied: writeback must never write it in place, and the
+ * boundary writes it through the journal. Unlocks the buffer.
+ */
+static int cetrafs_tree_hold_back(struct inode *inode, struct buffer_head *bh, u32 prev_crc)
+{
+    if (!cetrafs_bh_defer_update(inode, bh, prev_crc))
+        return 0;
+    return cetrafs_journal_write_block(inode->i_sb, bh, prev_crc); /* no registry: the mount is going */
+}
+
+/*
+ * A split moved part of this leaf elsewhere: the leaf as it now stands
+ * must be on the device before the moved piece is appended anywhere.
+ * Every block of this inode held back so far goes with it, in one
+ * journal batch -- a leaf may never reach the device ahead of the index
+ * that ranges over it. The caller holds invalidate_lock.
+ */
 static int cetrafs_convert_source_durable(struct inode *inode, struct buffer_head *lbh)
 {
-    int ret = cetrafs_sync_buffer_keep(inode->i_sb, lbh);
+    int ret = cetrafs_deferred_flush_inode(inode, true);
 
     if (ret)
         pr_err_ratelimited("ino=%llu: extent leaf %llu could not be written before its split moved on (%d)\n",
@@ -3492,27 +3512,18 @@ static int cetrafs_tree_convert_inner(struct inode *inode,
          */
         cetrafs_blk_tail_stamp(lbh, CETRAFS_LEAF_TAIL_MAGIC);
         if (S_ISREG(inode->i_mode)) {
-            cetrafs_bh_end_update(lbh);
-            if (ret == CETRAFS_CONVERT_APPEND) {
-                int wret = cetrafs_convert_source_durable(inode, lbh);
+            int wret = cetrafs_tree_hold_back(inode, lbh, prev_crc);
 
-                if (wret) {
-                    brelse(lbh);
-                    return wret;
-                }
+            if (!wret && ret == CETRAFS_CONVERT_APPEND)
+                wret = cetrafs_convert_source_durable(inode, lbh);
+            if (wret) {
+                brelse(lbh);
+                return wret;
             }
             brelse(lbh);
         } else {
-            int wret;
-
-            /* Regular file: defer to the durability boundary (see above). */
-            if (S_ISREG(inode->i_mode)) {
-                cetrafs_blk_tail_stamp(lbh, CETRAFS_LEAF_TAIL_MAGIC);
-                cetrafs_bh_end_update(lbh);
-                wret = 0;
-            } else {
-                wret = cetrafs_journal_write_block(sb, lbh, prev_crc);
-            }
+            /* A directory: no boundary, so journaled now. */
+            int wret = cetrafs_journal_write_block(sb, lbh, prev_crc);
 
             brelse(lbh);
             if (wret)
@@ -3587,7 +3598,13 @@ static int cetrafs_tree_convert_inner(struct inode *inode,
             /* Same trade as the depth-1 site above. */
             cetrafs_blk_tail_stamp(lbh, CETRAFS_LEAF_TAIL_MAGIC);
             if (S_ISREG(inode->i_mode)) {
-                cetrafs_bh_end_update(lbh);
+                int hret = cetrafs_tree_hold_back(inode, lbh, prev_crc);
+
+                if (hret) {
+                    brelse(lbh);
+                    brelse(ibh);
+                    return hret;
+                }
                 if (ret == CETRAFS_CONVERT_APPEND) {
                     int wret = cetrafs_convert_source_durable(inode, lbh);
 
@@ -3619,26 +3636,26 @@ static int cetrafs_tree_convert_inner(struct inode *inode,
                                                  min_t(u16, cetrafs_le16(lhdr->eh_entries), CETRAFS_EXT_BLOCK_MAX_LEAVES), &lo,
                                                  &hi);
                         if (hi && (lo != cetrafs_le32(iarr[li].ei_block) || hi != cetrafs_le32(iarr[li].ei_block_end))) {
-                            (void) cetrafs_bh_begin_update_crc(ibh);
+                            const u32 nprev = cetrafs_bh_begin_update_crc(ibh);
+                            int nret;
+
                             iarr[li].ei_block = cetrafs_cpu_to_le32(lo);
                             iarr[li].ei_block_end = cetrafs_cpu_to_le32(hi);
                             cetrafs_blk_tail_stamp(ibh, CETRAFS_INDEX_TAIL_MAGIC);
-                            cetrafs_bh_end_update(ibh);
+                            nret = cetrafs_tree_hold_back(inode, ibh, nprev);
+                            if (nret) {
+                                brelse(lbh);
+                                brelse(ibh);
+                                return nret;
+                            }
                         }
                     }
                 }
                 brelse(lbh);
                 brelse(ibh);
             } else {
-                int wret;
-
-                /* Regular file: defer to the durability boundary (see above). */
-                if (S_ISREG(inode->i_mode)) {
-                    cetrafs_bh_end_update(lbh);
-                    wret = 0;
-                } else {
-                    wret = cetrafs_journal_write_block(sb, lbh, prev_crc);
-                }
+                /* Depth 2 is regular files only; journaled as everywhere else. */
+                int wret = cetrafs_journal_write_block(sb, lbh, prev_crc);
 
                 brelse(lbh);
                 brelse(ibh);
@@ -3797,9 +3814,9 @@ static int cetrafs_tree_append(struct inode *inode,
                  * journal-wrote the short image, erasing the merge
                  *. So only S_ISREG may defer; directories
                  * fall through to the journal write below. */
-                cetrafs_bh_end_update(lbh);
+                ret = cetrafs_tree_hold_back(inode, lbh, prev_crc);
                 brelse(lbh);
-                return 0;
+                return ret;
             }
             /* Same trade as the convert path: a regular file's leaf is republished
              * at the next durability boundary (close, fsync, writeback), so it does
@@ -3809,8 +3826,7 @@ static int cetrafs_tree_append(struct inode *inode,
              * writes -- the splits land in tree_append, not tree_convert. */
             if (S_ISREG(inode->i_mode)) {
                 cetrafs_blk_tail_stamp(lbh, CETRAFS_LEAF_TAIL_MAGIC);
-                cetrafs_bh_end_update(lbh);
-                ret = 0;
+                ret = cetrafs_tree_hold_back(inode, lbh, prev_crc);
             } else {
                 ret = cetrafs_journal_write_block(sb, lbh, prev_crc);
             }
@@ -3977,8 +3993,11 @@ static int cetrafs_tree_append(struct inode *inode,
 
                         iarr[ient - 1].ei_block_end = 0;
                         cetrafs_blk_tail_stamp(ibh, CETRAFS_INDEX_TAIL_MAGIC);
-                        cetrafs_bh_end_update(ibh);
-                        iw = cetrafs_sync_buffer(sb, ibh);
+                        /* Held back with the leaf: one boundary batch
+                         * writes both, entries first, so neither can
+                         * reach the device without the other being
+                         * redoable (leafdefer.c). */
+                        iw = cetrafs_tree_hold_back(inode, ibh, iprev);
                         if (iw) {
                             cetrafs_bh_abort_update(lbh);
                             brelse(lbh);
@@ -4005,10 +4024,10 @@ static int cetrafs_tree_append(struct inode *inode,
             *leaf_count = cetrafs_le16(lhdr->eh_entries);
             cetrafs_blk_tail_stamp(lbh, CETRAFS_LEAF_TAIL_MAGIC);
             if (*merged) {
-                cetrafs_bh_end_update(lbh);
+                ret = cetrafs_tree_hold_back(inode, lbh, prev_crc);
                 brelse(lbh);
                 brelse(ibh);
-                return 0;
+                return ret;
             }
             /* Same trade as the convert path: a regular file's leaf is republished
              * at the next durability boundary (close, fsync, writeback), so it does
@@ -4018,8 +4037,7 @@ static int cetrafs_tree_append(struct inode *inode,
              * writes -- the splits land in tree_append, not tree_convert. */
             if (S_ISREG(inode->i_mode)) {
                 cetrafs_blk_tail_stamp(lbh, CETRAFS_LEAF_TAIL_MAGIC);
-                cetrafs_bh_end_update(lbh);
-                ret = 0;
+                ret = cetrafs_tree_hold_back(inode, lbh, prev_crc);
             } else {
                 ret = cetrafs_journal_write_block(sb, lbh, prev_crc);
             }
@@ -4095,8 +4113,7 @@ static int cetrafs_tree_append(struct inode *inode,
                  * writes -- the splits land in tree_append, not tree_convert. */
                 if (S_ISREG(inode->i_mode)) {
                     cetrafs_blk_tail_stamp(ibh, CETRAFS_INDEX_TAIL_MAGIC);
-                    cetrafs_bh_end_update(ibh);
-                    ret = 0;
+                    ret = cetrafs_tree_hold_back(inode, ibh, prev_crc);
                 } else {
                     ret = cetrafs_journal_write_block(sb, ibh, prev_crc);
                 }
@@ -6503,71 +6520,18 @@ int cetrafs_setattr(struct mnt_idmap *idmap, struct dentry *dentry, struct iattr
 
 /* generic_file_open() first (standard large-file/maxbytes check), then
  * the cross-node exclusive lock gate (lock.c, an earlier phase). */
-/* Sync one tree block if it is dirty in the buffer cache. */
-static int cetrafs_fsync_one_block(struct super_block *sb, u64 lba)
-{
-    struct buffer_head *bh = sb_find_get_block(sb, lba);
-    int ret = 0;
-
-    if (bh) {
-        if (buffer_dirty(bh))
-            ret = cetrafs_sync_buffer(sb, bh);
-        brelse(bh);
-    }
-    return ret;
-}
-
-/* Flush every dirty leaf (depth 1) or leaf+interior (depth 2) block of a
- * file's extent tree. */
 /*
- * Test-only: the next extent-tree flush fails, as a device write error
- * on a leaf would.
+ * The tree blocks of a regular file wait in core for the boundary
+ * (leafdefer.c) and are written here, through the journal, in one batch.
+ * 'mapping_locked': the caller already holds invalidate_lock. 'raw' is
+ * no longer walked -- the deferred-block registry knows which blocks are
+ * this inode's -- and stays in the signature for the callers that
+ * already read it.
  */
-static bool cetrafs_tree_flush_fail_once;
-cetrafs_test_param(tree_flush_fail_once, cetrafs_tree_flush_fail_once, bool, 0644);
-MODULE_PARM_DESC(tree_flush_fail_once, "TEST ONLY: the next extent-tree block flush fails with -EIO");
-
-int cetrafs_flush_tree_blocks(struct inode *inode, const cetrafs_inode_t *raw)
+int cetrafs_flush_tree_blocks(struct inode *inode, const cetrafs_inode_t *raw, bool mapping_locked)
 {
-    struct super_block *sb = inode->i_sb;
-    int ret = 0, r;
-    u32 ni;
-
-    if (cetrafs_tree_flush_fail_once) {
-        cetrafs_tree_flush_fail_once = false;
-        return -EIO; /* test-only, see the knob */
-    }
-
-    if (cetrafs_le16(raw->eh.eh_depth) == 1)
-        return cetrafs_fsync_one_block(
-            sb, cetrafs_extent_phys_from_hilo(raw->et.idx[0].ei_leaf_hi, raw->et.idx[0].ei_leaf_lo));
-
-    for (ni = 0; ni < cetrafs_le16(raw->eh.eh_entries) && ni < ARRAY_SIZE(raw->et.idx); ni++) {
-        u64 ilba = cetrafs_extent_phys_from_hilo(raw->et.idx[ni].ei_leaf_hi, raw->et.idx[ni].ei_leaf_lo);
-        struct buffer_head *ibh = cetrafs_read_index_bh(inode, ilba);
-
-        if (ibh) {
-            const cetrafs_extent_hdr_t *h = (const cetrafs_extent_hdr_t *) ibh->b_data;
-            const cetrafs_extent_idx_t *ia = (const cetrafs_extent_idx_t *) (ibh->b_data + sizeof(*h));
-            u32 li, n = min_t(u32, cetrafs_le16(h->eh_entries), CETRAFS_EXT_BLOCK_MAX_IDX);
-
-            for (li = 0; li < n; li++) {
-                r = cetrafs_fsync_one_block(sb, cetrafs_extent_phys_from_hilo(ia[li].ei_leaf_hi, ia[li].ei_leaf_lo));
-                if (r && !ret)
-                    ret = r;
-            }
-            brelse(ibh);
-        } else if (!ret) {
-            /* Its leaves cannot be found, so they cannot be flushed:
-             * say so, or the caller publishes a record over leaves that
-             * may never have reached the device. */
-            ret = -EIO;
-        }
-        r = cetrafs_fsync_one_block(sb, ilba);
-        if (r && !ret)
-            ret = r;
-    }
-    return ret;
+    (void) raw;
+    return cetrafs_deferred_flush_inode(inode, mapping_locked);
 }
 
 /*
@@ -6627,7 +6591,7 @@ static int cetrafs_fsync_meta(struct inode *inode, int ret, bool locked)
      * read names leaves that cannot be flushed: an error, not a skip. */
     ret2 = cetrafs_read_raw_inode_overlaid(sb, inode, &raw);
     if (!ret2 && cetrafs_le16(raw.eh.eh_magic) == CETRAFS_EXT_MAGIC && cetrafs_le16(raw.eh.eh_depth) >= 1)
-        ret2 = cetrafs_flush_tree_blocks(inode, &raw);
+        ret2 = cetrafs_flush_tree_blocks(inode, &raw, locked);
     if (ret2 && !ret)
         ret = ret2;
 

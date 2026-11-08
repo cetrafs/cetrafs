@@ -2818,6 +2818,13 @@ static int __cetrafs_free_data_extent(struct super_block *sb, u64 lba, u32 count
     if (cetrafs_sb_is_fenced(sb))
         return -EIO; /* self-fenced */
 
+    /* A tree block of ours held back for a boundary (leafdefer.c) and
+     * freed before it: its edit belongs to a tree that no longer names
+     * it, and written later it would land on the block's next owner.
+     * Every caller has stopped naming these blocks, so the edit goes,
+     * whatever the free below decides. */
+    cetrafs_deferred_forget_range(sb, lba, count);
+
     ret = cetrafs_bg_id_for_lba(sb, lba, &bg_id);
     if (ret) {
         pr_err_ratelimited("free: extent [%llu +%u): no BG for the LBA (%d) -- leaked\n", (unsigned long long) lba,

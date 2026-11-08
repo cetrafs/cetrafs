@@ -842,6 +842,95 @@ u64 cetrafs_journal_held_slots(struct super_block *sb)
     return (j && j->area_start) ? READ_ONCE(j->held) : 0;
 }
 
+/*
+ * Take a free journal slot for an entry about to be written for 'lba'
+ * (a slot a failed write of the same block kept is taken over), marking
+ * our area DIRTY first if this is the session's first entry. On success
+ * the slot is busy and *txn_id is its sequence number.
+ *
+ * nowait: return -EAGAIN instead of waiting when every slot is in
+ * flight -- for a caller that already holds slots, which must not wait
+ * for one while holding others (cetrafs_journal_write_deferred()).
+ */
+static int cetrafs_journal_take_slot(struct super_block *sb, struct cetrafs_journal *j, u64 lba, bool nowait,
+                                     u64 *out_slot, u64 *txn_id)
+{
+    u64 slot;
+
+    mutex_lock(&j->lock);
+
+    for (;;) {
+        /* An entry a failed write of THIS block kept is superseded by
+         * the one about to be written -- built from the block as it
+         * was re-read after that failure -- so its slot is ours to
+         * reuse. Without this, a full set of kept entries refused the
+         * very write that would have retired them. */
+        if (j->held) {
+            for (slot = 0; slot < j->slots; slot++)
+                if (j->stuck_lba[slot] == lba)
+                    break;
+            if (slot < j->slots) {
+                j->stuck_lba[slot] = 0;
+                j->held--;
+                clear_bit(slot, j->busy); /* re-set below, still under j->lock */
+                break;
+            }
+        }
+        slot = find_first_zero_bit(j->busy, j->slots);
+        if (slot < j->slots)
+            break;
+        if (j->held >= j->slots) {
+            /* Nothing in flight will free one: every slot is held
+             * by an entry a failed write kept. */
+            mutex_unlock(&j->lock);
+            pr_err_ratelimited("journal: all %llu slots are held by kept entries -- refusing to write block "
+                               "%llu unjournaled\n",
+                               (unsigned long long) j->slots, (unsigned long long) lba);
+            return -EIO;
+        }
+        if (nowait) {
+            mutex_unlock(&j->lock);
+            return -EAGAIN;
+        }
+        /* Every free slot is in flight: those operations hold no lock
+         * we hold and only do their own I/O, so one comes back. */
+        mutex_unlock(&j->lock);
+        wait_event(j->slot_wq, cetrafs_journal_slot_or_none(j));
+        mutex_lock(&j->lock);
+    }
+
+    /* First entry of this session: durably flip our flag to DIRTY
+     * *before* committing anything, so a crash after the commit is
+     * guaranteed to be caught by the next replay of our area. */
+    if (!j->flag_dirty) {
+        int ret = cetrafs_journal_write_flag(sb, j->area_start, true);
+
+        if (ret) {
+            mutex_unlock(&j->lock);
+            pr_err_ratelimited("journal: could not mark our area dirty (%d) -- refusing to write block %llu "
+                               "unjournaled\n",
+                               ret, (unsigned long long) lba);
+            return ret;
+        }
+        j->flag_dirty = true;
+    }
+
+    /* Again here: the slot wait and the flag write above can block
+     * for as long as the device does, and a fence landing meanwhile
+     * must stop the entry, not let it commit after a peer parked our
+     * area (audit 2026-11-06 M10). I/O already queued still lands;
+     * the attach-time retire covers what gets past this. */
+    if (cetrafs_sb_is_fenced(sb)) {
+        mutex_unlock(&j->lock);
+        return -EIO;
+    }
+    set_bit(slot, j->busy);
+    *txn_id = ++j->next_txn_id;
+    mutex_unlock(&j->lock);
+    *out_slot = slot;
+    return 0;
+}
+
 static int cetrafs_journal_write_block_flags(struct super_block *sb, struct buffer_head *bh, u32 flags, u32 prev_crc)
 {
     struct cetrafs_journal *j = cetrafs_sb_get_journal(sb);
@@ -859,6 +948,14 @@ static int cetrafs_journal_write_block_flags(struct super_block *sb, struct buff
     cetrafs_journal_header_t *hdr;
     bool journaled = false;
     bool entry_refused = false; /* the device refused the entry write itself */
+    /* A held-back tree block (leafdefer.c) is written at its boundary,
+     * in a batch whose first step makes what it names durable; nothing
+     * should journal one here. If something does, its guard is the
+     * DEVICE's image, and once written it is held back no longer. */
+    bool was_deferred = buffer_cetra_deferred(bh);
+
+    if (WARN_ON_ONCE(was_deferred) && (flags & CETRAFS_JRNL_F_GUARDED))
+        prev_crc = cetrafs_deferred_disk_crc(sb, bh, prev_crc);
 
     /*
      * On a journaling volume, a block the journal cannot protect is NOT
@@ -872,75 +969,12 @@ static int cetrafs_journal_write_block_flags(struct super_block *sb, struct buff
      * mkfs -J 0 is a different thing: no journal at all, by choice.
      */
     if (j && j->area_start) {
-        mutex_lock(&j->lock);
+        int tret = cetrafs_journal_take_slot(sb, j, bh->b_blocknr, false, &slot, &txn_id);
 
-        for (;;) {
-            /* An entry a failed write of THIS block kept is superseded by
-             * the one about to be written -- built from the block as it
-             * was re-read after that failure -- so its slot is ours to
-             * reuse. Without this, a full set of kept entries refused the
-             * very write that would have retired them. */
-            if (j->held) {
-                for (slot = 0; slot < j->slots; slot++)
-                    if (j->stuck_lba[slot] == bh->b_blocknr)
-                        break;
-                if (slot < j->slots) {
-                    j->stuck_lba[slot] = 0;
-                    j->held--;
-                    clear_bit(slot, j->busy); /* re-set below, still under j->lock */
-                    break;
-                }
-            }
-            slot = find_first_zero_bit(j->busy, j->slots);
-            if (slot < j->slots)
-                break;
-            if (j->held >= j->slots) {
-                /* Nothing in flight will free one: every slot is held
-                 * by an entry a failed write kept. */
-                mutex_unlock(&j->lock);
-                pr_err_ratelimited("journal: all %llu slots are held by kept entries -- refusing to write block "
-                                   "%llu unjournaled\n",
-                                   (unsigned long long) j->slots, (unsigned long long) bh->b_blocknr);
-                cetrafs_bh_abort_update(bh);
-                return -EIO;
-            }
-            /* Every free slot is in flight: those operations hold no lock
-             * we hold and only do their own I/O, so one comes back. */
-            mutex_unlock(&j->lock);
-            wait_event(j->slot_wq, cetrafs_journal_slot_or_none(j));
-            mutex_lock(&j->lock);
-        }
-
-        /* First entry of this session: durably flip our flag to DIRTY
-         * *before* committing anything, so a crash after the commit is
-         * guaranteed to be caught by the next replay of our area. */
-        if (!j->flag_dirty) {
-            int ret = cetrafs_journal_write_flag(sb, j->area_start, true);
-
-            if (ret) {
-                mutex_unlock(&j->lock);
-                pr_err_ratelimited("journal: could not mark our area dirty (%d) -- refusing to write block %llu "
-                                   "unjournaled\n",
-                                   ret, (unsigned long long) bh->b_blocknr);
-                cetrafs_bh_abort_update(bh);
-                return ret;
-            }
-            j->flag_dirty = true;
-        }
-
-        /* Again here: the slot wait and the flag write above can block
-         * for as long as the device does, and a fence landing meanwhile
-         * must stop the entry, not let it commit after a peer parked our
-         * area (audit 2026-11-06 M10). I/O already queued still lands;
-         * the attach-time retire covers what gets past this. */
-        if (cetrafs_sb_is_fenced(sb)) {
-            mutex_unlock(&j->lock);
+        if (tret) {
             cetrafs_bh_abort_update(bh);
-            return -EIO;
+            return tret;
         }
-        set_bit(slot, j->busy);
-        txn_id = ++j->next_txn_id;
-        mutex_unlock(&j->lock);
 
         header_lba = cetrafs_journal_header_lba(j, slot);
         payload_lba = header_lba + 1;
@@ -1097,6 +1131,8 @@ static int cetrafs_journal_write_block_flags(struct super_block *sb, struct buff
          */
         int werr = cetrafs_sync_buffer(sb, bh);
 
+        if (!werr && was_deferred)
+            cetrafs_deferred_clear(sb, bh);
         if (werr) {
             if (journaled) {
                 mutex_lock(&j->lock);
@@ -1196,6 +1232,285 @@ journal_failed:
         cetrafs_sb_fatal(sb, "journal: the device refused the entry for block %llu",
                          (unsigned long long) bh->b_blocknr);
     return -EIO;
+}
+
+/*
+ * TEST ONLY: the next deferred batch stops the mount the moment its
+ * entries are durable, before any target is written -- a crash at the
+ * worst point of the boundary, with the journal holding the only copy
+ * of the new tree blocks (tests/kernel/leaf_boundary_journaled.sh).
+ */
+static bool cetrafs_journal_batch_crash_before_targets;
+cetrafs_test_param(journal_batch_crash_before_targets, cetrafs_journal_batch_crash_before_targets, bool, 0644);
+MODULE_PARM_DESC(journal_batch_crash_before_targets,
+                 "TEST ONLY: the next deferred tree-block batch stops the mount after its entries, before its targets");
+
+/* Write a deferred block's current image to its own LBA and wait. A
+ * block freed since it was collected is skipped (and counts as done: its
+ * entry is spent with the rest). */
+static int cetrafs_deferred_write_target(struct super_block *sb, struct buffer_head *bh)
+{
+    int ret = cetrafs_write_deferred_target(sb, bh);
+
+    return ret > 0 ? 0 : ret;
+}
+
+/* Give a batch's slots back after its entries were retired (or hold the
+ * ones whose retire could not be shown, as a kept entry's are held). */
+static void cetrafs_journal_batch_retire(struct super_block *sb, struct cetrafs_journal *j, const u64 *slots,
+                                         struct buffer_head **bhs, unsigned int k)
+{
+    unsigned int i;
+
+    for (i = 0; i < k; i++) {
+        bool zero_failed = cetrafs_journal_zero_header(sb, cetrafs_journal_header_lba(j, slots[i])) != 0;
+
+        mutex_lock(&j->lock);
+        if (zero_failed)
+            cetrafs_journal_hold_slot(j, slots[i], bhs[i]->b_blocknr);
+        else
+            clear_bit(slots[i], j->busy);
+        mutex_unlock(&j->lock);
+    }
+    wake_up(&j->slot_wq);
+}
+
+#define CETRAFS_JRNL_BATCH 16
+
+/* One chunk of a deferred batch: k entries in k slots already taken. */
+static int cetrafs_journal_batch_chunk(struct super_block *sb, struct cetrafs_journal *j,
+                                       struct buffer_head **bhs, const u32 *disk_crc, unsigned int k,
+                                       const u64 *slots, const u64 *txn, bool *written)
+{
+    struct buffer_head *pb[CETRAFS_JRNL_BATCH] = {}, *hb[CETRAFS_JRNL_BATCH] = {};
+    unsigned int i, nw = 0;
+    bool ok = true;
+    int ret = 0, ferr;
+
+    /* 1. Every entry: payload and header, all out together, waited for
+     * once. Each payload is the block's current image, copied under its
+     * lock; nothing modifies it meanwhile (the caller's invalidate_lock). */
+    for (i = 0; i < k; i++) {
+        u64 hlba = cetrafs_journal_header_lba(j, slots[i]);
+        cetrafs_journal_header_t *hdr;
+        u32 pcrc;
+
+        pb[i] = cetrafs_getblk_overwrite(sb, hlba + 1);
+        hb[i] = pb[i] ? cetrafs_getblk_overwrite(sb, hlba) : NULL;
+        if (!pb[i] || !hb[i]) {
+            if (pb[i])
+                cetrafs_bh_abort_update(pb[i]);
+            ok = false;
+            break;
+        }
+        cetrafs_bh_copy_stable(bhs[i], pb[i]->b_data, CETRAFS_BLOCK_SIZE);
+        pcrc = ~crc32c(~0U, pb[i]->b_data, CETRAFS_BLOCK_SIZE);
+        cetrafs_bh_end_update(pb[i]);
+
+        memset(hb[i]->b_data, 0, CETRAFS_BLOCK_SIZE);
+        hdr = (cetrafs_journal_header_t *) hb[i]->b_data;
+        hdr->magic = cetrafs_cpu_to_le32(CETRAFS_JOURNAL_MAGIC);
+        hdr->flags = cetrafs_cpu_to_le32(CETRAFS_JRNL_F_GUARDED);
+        hdr->txn_id = cetrafs_cpu_to_le64(txn[i]);
+        hdr->target_lba = cetrafs_cpu_to_le64(bhs[i]->b_blocknr);
+        /* The DEVICE's image, recorded when the block was first held back
+         * -- not the in-core one before the last edit, which never
+         * reached the device and which a replay would never find. */
+        hdr->prev_checksum = cetrafs_cpu_to_le32(disk_crc[i]);
+        hdr->payload_checksum = cetrafs_cpu_to_le32(pcrc);
+        hdr->header_checksum = cetrafs_cpu_to_le32(cetrafs_journal_header_crc(hb[i]->b_data));
+        cetrafs_bh_end_update(hb[i]);
+    }
+    if (ok) {
+        struct blk_plug plug;
+
+        blk_start_plug(&plug);
+        for (i = 0; i < k; i++) {
+            write_dirty_buffer(pb[i], REQ_SYNC);
+            write_dirty_buffer(hb[i], REQ_SYNC);
+        }
+        blk_finish_plug(&plug);
+    }
+    for (i = 0; i < k; i++) {
+        if (pb[i]) {
+            wait_on_buffer(pb[i]);
+            if (ok && !buffer_uptodate(pb[i]))
+                ok = false;
+            brelse(pb[i]);
+        }
+        if (hb[i]) {
+            wait_on_buffer(hb[i]);
+            if (ok && !buffer_uptodate(hb[i]))
+                ok = false;
+            brelse(hb[i]);
+        }
+    }
+    if (!ok) {
+        /* As the single write's journal_failed: retire what may have
+         * landed, refuse, and stop -- the entries' state is unknown. */
+        cetrafs_journal_batch_retire(sb, j, slots, bhs, k);
+        cetrafs_sb_fatal(sb, "journal: the device refused a batch of %u tree-block entries", k);
+        return -EIO;
+    }
+    atomic64_add(k, &cetrafs_journal_writes);
+
+    /* 2. The entries on the platter before any target can be. */
+    ferr = blkdev_issue_flush(sb->s_bdev);
+    if (ferr) {
+        cetrafs_sb_fatal(sb, "journal: cache flush after a batch of %u entries failed (%d)", k, ferr);
+        mutex_lock(&j->lock);
+        for (i = 0; i < k; i++)
+            cetrafs_journal_hold_slot(j, slots[i], bhs[i]->b_blocknr);
+        mutex_unlock(&j->lock);
+        return ferr;
+    }
+    if (cetrafs_journal_batch_crash_before_targets) {
+        cetrafs_journal_batch_crash_before_targets = false;
+        mutex_lock(&j->lock);
+        for (i = 0; i < k; i++)
+            cetrafs_journal_hold_slot(j, slots[i], 0); /* kept on purpose: the replay's */
+        mutex_unlock(&j->lock);
+        cetrafs_sb_fatal(sb, "journal: TEST stop after %u entries, before their targets", k);
+        return -EIO;
+    }
+
+    /* 3. The targets. One that fails keeps its entry live for replay. */
+    for (i = 0; i < k; i++) {
+        int werr = cetrafs_deferred_write_target(sb, bhs[i]);
+
+        if (werr) {
+            mutex_lock(&j->lock);
+            cetrafs_journal_hold_slot(j, slots[i], bhs[i]->b_blocknr);
+            mutex_unlock(&j->lock);
+            pr_err("journal: tree block %llu failed to write (%d) -- its entry stays live for replay\n",
+                   (unsigned long long) bhs[i]->b_blocknr, werr);
+            if (!ret)
+                ret = werr;
+            continue;
+        }
+        written[i] = true;
+        nw++;
+    }
+    if (!nw)
+        return ret;
+
+    /* 4. The targets on the platter before their entries are spent. */
+    ferr = blkdev_issue_flush(sb->s_bdev);
+    if (ferr) {
+        cetrafs_sb_fatal(sb, "journal: cache flush after a batch of %u tree-block writes failed (%d)", nw, ferr);
+        mutex_lock(&j->lock);
+        for (i = 0; i < k; i++)
+            if (written[i])
+                cetrafs_journal_hold_slot(j, slots[i], bhs[i]->b_blocknr);
+        mutex_unlock(&j->lock);
+        for (i = 0; i < k; i++)
+            written[i] = false; /* not shown durable: stays held back */
+        return ferr;
+    }
+
+    /* 5. Consume. */
+    for (i = 0; i < k; i++) {
+        if (!written[i])
+            continue;
+        if (cetrafs_journal_zero_header(sb, cetrafs_journal_header_lba(j, slots[i]))) {
+            mutex_lock(&j->lock);
+            cetrafs_journal_hold_slot(j, slots[i], bhs[i]->b_blocknr); /* live and harmless: see the single write */
+            mutex_unlock(&j->lock);
+        } else {
+            mutex_lock(&j->lock);
+            clear_bit(slots[i], j->busy);
+            mutex_unlock(&j->lock);
+        }
+    }
+    wake_up(&j->slot_wq);
+    return ret;
+}
+
+/*
+ * Write a set of deferred extent-tree blocks (leafdefer.c) through the
+ * journal: the boundary of CRASH-CONSISTENCY C1 and C2.
+ *
+ *  0. What the blocks name reaches the device first: the allocation bits
+ *     (cetrafs_alloc_flush_bitmaps()) and a cache flush, which also makes
+ *     the data written back so far durable. A leaf marking a block
+ *     written must never be durable ahead of that block's data or bit --
+ *     and once its entry is, replay would publish it (C2).
+ *  1. One entry per block (one slot each, the format's), all written at
+ *     once; prev_checksum is the device's image of the block.
+ *  2. Flush: every entry durable before any target is touched.
+ *  3. The targets, in place. A crash here leaves each one old, new or
+ *     torn, and replay redoes the torn and the old (C1).
+ *  4. Flush, then 5. consume.
+ *
+ * Three flushes per boundary, whatever the number of blocks -- not per
+ * block, which is what made per-write journaling unusable. In chunks of
+ * CETRAFS_JRNL_BATCH slots, taken without waiting once one is held (no
+ * hold-and-wait between two batches).
+ *
+ * The caller guarantees nobody modifies the blocks meanwhile. written[i]
+ * says which reached the device; the rest stay held back for a retry.
+ * mkfs -J 0 has no journal: step 0, then the targets in place.
+ */
+int cetrafs_journal_write_deferred(struct super_block *sb, struct buffer_head **bhs, const u32 *disk_crc,
+                                   unsigned int n, bool *written)
+{
+    struct cetrafs_journal *j = cetrafs_sb_get_journal(sb);
+    unsigned int i, done = 0;
+    int ret;
+
+    for (i = 0; i < n; i++)
+        written[i] = false;
+    if (!n)
+        return 0;
+    if (cetrafs_sb_is_fenced(sb))
+        return -EIO;
+
+    ret = cetrafs_alloc_flush_bitmaps(sb);
+    if (ret)
+        return ret;
+    ret = blkdev_issue_flush(sb->s_bdev);
+    if (ret)
+        return ret; /* nothing written: the blocks stay held back */
+
+    if (!j || !j->area_start) {
+        for (i = 0; i < n; i++) {
+            int werr = cetrafs_deferred_write_target(sb, bhs[i]);
+
+            if (!werr)
+                written[i] = true;
+            else if (!ret)
+                ret = werr;
+        }
+        return ret;
+    }
+
+    while (done < n) {
+        u64 slots[CETRAFS_JRNL_BATCH], txn[CETRAFS_JRNL_BATCH];
+        unsigned int k = 0;
+
+        while (k < CETRAFS_JRNL_BATCH && done + k < n) {
+            int t = cetrafs_journal_take_slot(sb, j, bhs[done + k]->b_blocknr, k > 0, &slots[k], &txn[k]);
+
+            if (t == -EAGAIN)
+                break; /* all in flight: go with what we hold */
+            if (t) {
+                if (k) {
+                    mutex_lock(&j->lock);
+                    for (i = 0; i < k; i++)
+                        clear_bit(slots[i], j->busy);
+                    mutex_unlock(&j->lock);
+                    wake_up(&j->slot_wq);
+                }
+                return t;
+            }
+            k++;
+        }
+        ret = cetrafs_journal_batch_chunk(sb, j, bhs + done, disk_crc + done, k, slots, txn, written + done);
+        if (ret)
+            return ret;
+        done += k;
+    }
+    return 0;
 }
 
 /*

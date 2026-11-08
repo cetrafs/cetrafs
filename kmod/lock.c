@@ -2555,7 +2555,7 @@ static int cetrafs_lock_publish_and_clear(struct inode *inode, cetrafs_inode_t *
     if (ret)
         tree_ret = ret;
     else if (!bmap_ret && cetrafs_le16(raw->eh.eh_magic) == CETRAFS_EXT_MAGIC && cetrafs_le16(raw->eh.eh_depth) >= 1)
-        tree_ret = cetrafs_flush_tree_blocks(inode, raw);
+        tree_ret = cetrafs_flush_tree_blocks(inode, raw, false);
     if (tree_ret)
         pr_err("lock release: ino=%llu extent-tree blocks not durable (%d) -- leaving the record unpublished "
                "and keeping the lock\n",

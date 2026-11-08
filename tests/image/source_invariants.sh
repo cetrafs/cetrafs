@@ -118,7 +118,9 @@ for f in "$K"/*.c; do
         # an exemption: the buffer stays locked across the journal commit
         # so writeback cannot publish the target before the entry is
         # durable.
-        inreg && /cetrafs_bh_end_update\(|cetrafs_bh_abort_update\(|cetrafs_journal_write_(new_)?block\(/ { inreg=0; next }
+        # cetrafs_tree_hold_back() likewise: it ends the update itself,
+        # held back for the boundary or journaled now (file.c).
+        inreg && /cetrafs_bh_end_update\(|cetrafs_bh_abort_update\(|cetrafs_journal_write_(new_)?block\(|cetrafs_tree_hold_back\(/ { inreg=0; next }
         # The NULL check belonging to the claim is not a leak: there is no
         # buffer to release yet. Only the few lines right after the claim.
         inreg && NR <= start + 6 && /^[[:space:]]*(return|goto) / { next }
@@ -1098,7 +1100,7 @@ printf '    if (cetrafs_lock_foreign_user_exists(sb, ino, me, &blocked, &reader)
 # queue is specified below.
 log "checking every store that can satisfy a wait wakes its queue"
 # file|function exempt from the rule (or -)|store regex|wake regex
-WAKE_SPEC='journal.c|cetrafs_journal_write_block_flags|clear_bit\([^,]*, *j->busy\)|j->held\+\+|\+\+j->held|wake_up(_all)?\(&j->slot_wq\)
+WAKE_SPEC='journal.c|cetrafs_journal_take_slot|clear_bit\([^,]*, *j->busy\)|j->held\+\+|\+\+j->held|wake_up(_all)?\(&j->slot_wq\)
 dmpath.c|-|->resolving = false|wake_up(_all)?\(&cetrafs_dmpath_wq\)
 caw.c|-|atomic_dec[a-z_]*\(&ctx->running\)|wake_up(_all)?\(&ctx->done\)
 fs.c|-|clear_bit\([^,]*, *sbi->zg_adopt_wanted\)|wake_up(_all)?\(&sbi->zg_adopt_wq\)'
@@ -1268,6 +1270,28 @@ printf 'static int cetrafs_cas_region_seeded_impl(void)\n{\n    unknown = kmallo
 grep -q "a return inside the loop" <<<"$(cas_check "$SAMPLE")" &&
     pass "class 30: control -- a plain return from inside the loop is caught" ||
     fail "class 30: control -- a plain return from inside the loop is not caught"
+
+# Classes 4 and 5: a regular file's extent-tree block is never left
+# DIRTY. Block-device writeback is a writer with no lock, no order and no
+# journal: it wrote held-back leaves in place, torn by a power cut with
+# nothing to redo them, ahead of the data and bits they name, and after
+# their block was freed (CRASH-CONSISTENCY C1/C2, 2026-11-08). A leaf or
+# index edit ends in cetrafs_tree_hold_back() or a journal write, never in
+# a bare end_update; and every free drops a held-back copy at the choke
+# point.
+log "checking no extent-tree block edit is left dirty for writeback (classes 4, 5)"
+tree_dirtiers() { grep -nE 'cetrafs_bh_end_update\((lbh|ibh|nbh)\)' "$@" || true; }
+TD="$(tree_dirtiers "$K"/*.c)"
+[ -z "$TD" ] && pass "classes 4/5: every leaf/index edit is held back or journaled, none left dirty" ||
+    fail "classes 4/5: a leaf/index edit ends in a bare end_update (dirty, for writeback): $(echo $TD)"
+SAMPLE="$(ct_tmp tree-dirty).c"
+printf '    cetrafs_bh_end_update(lbh);\n' >"$SAMPLE"
+[ -n "$(tree_dirtiers "$SAMPLE")" ] && pass "classes 4/5: control -- a planted dirty leaf edit is found" ||
+    fail "classes 4/5: control -- a planted dirty leaf edit is not found"
+FDE="$(awk '/^static int __cetrafs_free_data_extent\(.*\)$/ { on = 1 } on; on && /^}/ { on = 0 }' "$K/alloc.c")"
+grep -q 'cetrafs_deferred_forget_range(sb, lba, count)' <<<"$FDE" &&
+    pass "classes 4/5: the free choke point drops a held-back copy of the freed blocks" ||
+    fail "classes 4/5: __cetrafs_free_data_extent() no longer drops held-back tree blocks it frees"
 
 # Class 44 ("alive" as the unsafe default). A liveness predicate's first
 # look at a row answers "alive" -- right for a reclaim, which then keeps

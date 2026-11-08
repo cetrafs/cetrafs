@@ -197,8 +197,10 @@ static int cetrafs_sync_fs(struct super_block *sb, int wait)
      * after the stop's own sweep. Sweep again, here, where it is the last
      * thing before that write. */
     if (cetrafs_sb_is_fenced(sb)) {
-        if (sb->s_bdev)
+        if (sb->s_bdev) {
             cetrafs_drop_dirty_metadata(sb);
+            cetrafs_deferred_drop_all(sb);
+        }
         return -EIO;
     }
     /* Allocation bits before the counters: the counters are a cache and
@@ -208,7 +210,11 @@ static int cetrafs_sync_fs(struct super_block *sb, int wait)
         int pret = wait ? cetrafs_sync_fs_pending(sb) : 0;
         int bret = cetrafs_alloc_flush_bitmaps(sb);
         int cret = cetrafs_flush_dirty_free_counts(sb);
-        int ret = pret ? pret : bret ? bret : cret;
+        /* Extent-tree blocks held back from writeback (leafdefer.c):
+         * sync_blockdev() below no longer sees them, so they go here,
+         * through the journal. */
+        int dret = wait ? cetrafs_deferred_flush_all(sb) : 0;
+        int ret = pret ? pret : bret ? bret : cret ? cret : dret;
 
         /* sync(2), syncfs(2) and unmount promise the data is durable,
          * and a deployment LUN's write cache may well be volatile: a

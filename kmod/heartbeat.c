@@ -187,7 +187,7 @@ static void cetrafs_heartbeat_tick(struct work_struct *work)
      * is at most 15). sync_fs does the same at unmount. */
     if (cetrafs_sb_is_fenced(sb)) {
         if (sb->s_bdev) {
-            unsigned long n = cetrafs_drop_dirty_metadata(sb);
+            unsigned long n = cetrafs_drop_dirty_metadata(sb) + cetrafs_deferred_drop_all(sb);
 
             if (n)
                 pr_err("%s: stopped mount: discarded %lu metadata buffer(s) dirtied after the stop\n", sb->s_id,
