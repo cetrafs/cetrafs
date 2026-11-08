@@ -395,9 +395,10 @@ static int cetrafs_xattr_set_locked(struct inode *inode, const char *name, const
     bh = cetrafs_blk_tail_bread(sb, cetrafs_le64(raw.xattr_block), CETRAFS_XATTR_TAIL_MAGIC, "xattr");
     if (!bh)
         return -EIO;
-    /* Claim it before touching any entry -- see ioutil.c. (On the
-     * -EEXIST path below nothing is modified and the buffer is simply
-     * rewritten with identical content, which is harmless.) */
+    /* Claim it before touching any entry -- see ioutil.c. Every early
+     * exit below (-EEXIST, -ENODATA, -ENOSPC) has modified nothing and
+     * gives the claim up with cetrafs_bh_abort_update(): nothing is
+     * written. */
     const u32 prev_crc = cetrafs_bh_begin_update_crc(bh);
     arr = (cetrafs_xattr_entry_t *) bh->b_data;
 

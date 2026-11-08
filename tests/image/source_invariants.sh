@@ -682,6 +682,48 @@ else
         fail "free_inode context: $FREE_FN (RCU callback, softirq) calls: $SLEEPERS-- a sleep there is a BUG on a debug kernel and a stall without one"
 fi
 
+# Class 19's other half: nothing that can sleep runs with a spinlock
+# held. Every code line between a spin/rw/xa lock and its unlock (per
+# function, comments stripped) is scanned for the sleeping primitives,
+# and every cetrafs_* function called there is pinned to a list of ones
+# read and found not to sleep -- a new callee fails until someone has
+# read it. A helper that sleeps only on a path it never takes under the
+# lock still has to be split or listed; that is the point.
+log "checking nothing that can sleep runs under a spinlock (class 19)"
+spin_lines() { # <files...>: file:line:code for every line run with a spinlock held
+    awk '{
+        line = $0; out = ""
+        while (line != "") {
+            if (incom) { i = index(line, "*/"); if (!i) { line = ""; break } line = substr(line, i + 2); incom = 0 }
+            else { i = index(line, "/*"); if (!i) { out = out line; line = ""; break }
+                   out = out substr(line, 1, i - 1); line = substr(line, i + 2); incom = 1 }
+        }
+        sub(/\/\/.*/, "", out)
+        if (out ~ /^[a-z].*\(/ && out !~ /;/) depth = 0
+        if (depth > 0 && out ~ /[^[:space:]]/) print FILENAME ":" FNR ":" out
+        n = gsub(/(^|[^a-z0-9_])(spin_lock|spin_lock_irq|spin_lock_irqsave|spin_lock_bh|read_lock|write_lock|xa_lock|xa_lock_irq)\(/, "&", out)
+        m = gsub(/(^|[^a-z0-9_])(spin_unlock|spin_unlock_irq|spin_unlock_irqrestore|spin_unlock_bh|read_unlock|write_unlock|xa_unlock|xa_unlock_irq)\(/, "&", out)
+        depth += n - m; if (depth < 0) depth = 0
+    }' "$@"
+}
+SPIN_SLEEPERS_RE='\b(msleep|usleep_range|ssleep|mutex_lock[a-z_]*|down|down_[a-z_]+|wait_event[a-z_]*|wait_for_[a-z_]+|schedule[a-z_]*|cond_resched|lock_buffer|wait_on_buffer|[a-z_]*bread[a-z_]*|submit_bh|sync_dirty_buffer|iput|brelse|vmalloc|kvmalloc|copy_(to|from)_user|cancel_[a-z_]*_sync|flush_[a-z_]+|synchronize_[a-z_]+)\('
+SPIN_OK='cetrafs_ext_key_matches cetrafs_inode_deferred cetrafs_inode_fd_copy cetrafs_inode_wb_failed cetrafs_le16 cetrafs_le32 cetrafs_le64 cetrafs_pending_any cetrafs_sb_stale_secs'
+SL="$(spin_lines "$K"/*.c)"
+[ "$(wc -l <<<"$SL")" -gt 100 ] || fail "class 19 spinlock: setup -- only $(wc -l <<<"$SL") lines found under a spinlock (the scan no longer matches)"
+SPIN_BAD="$(grep -E "$SPIN_SLEEPERS_RE" <<<"$SL" | grep -vE 'GFP_ATOMIC|GFP_NOWAIT' | head -5 || true)"
+SPIN_GFP="$(grep -E '(GFP_KERNEL|GFP_NOFS|GFP_NOIO)' <<<"$SL" | head -5 || true)"
+SPIN_NEW="$(comm -23 <(cut -d: -f3- <<<"$SL" | grep -oE '\bcetrafs_[a-z0-9_]+\(' | tr -d '(' | sort -u) <(tr ' ' '\n' <<<"$SPIN_OK" | sort -u) | tr '\n' ' ')"
+[ -z "$SPIN_BAD$SPIN_GFP" ] && pass "class 19 spinlock: no sleeping primitive under a spinlock ($(wc -l <<<"$SL") lines)" ||
+    fail "class 19 spinlock: can sleep under a spinlock: $SPIN_BAD $SPIN_GFP"
+[ -z "${SPIN_NEW// /}" ] && pass "class 19 spinlock: every cetrafs_* call under a spinlock is a listed non-sleeper" ||
+    fail "class 19 spinlock: unlisted callee(s) under a spinlock: $SPIN_NEW-- read each for a sleep, then add it to SPIN_OK"
+SPIN_SAMPLE="$(ct_tmp spin).c"
+printf 'void cetrafs_x(struct inode *inode)\n{\n    /* spin_unlock( in a comment */\n    spin_lock(&ci->lock);\n    msleep(1);\n    cetrafs_y(inode);\n    spin_unlock(&ci->lock);\n    msleep(2);\n}\n' >"$SPIN_SAMPLE"
+SPIN_C="$(spin_lines "$SPIN_SAMPLE")"
+grep -qE "$SPIN_SLEEPERS_RE" <<<"$SPIN_C" && grep -q 'cetrafs_y(' <<<"$SPIN_C" && ! grep -q 'msleep(2)' <<<"$SPIN_C" &&
+    pass "class 19 spinlock: control -- a planted sleep and callee under a lock are found, the one after it is not" ||
+    fail "class 19 spinlock: control -- the scan missed the planted sleep ($SPIN_C)"
+
 # Every liveness window must be at least the stale window a peer waits
 # before calling a node dead: that window exists for multipath queueing,
 # and any watch shorter than it reads a node whose paths stall in between
@@ -1097,7 +1139,9 @@ printf '    if (cetrafs_lock_foreign_user_exists(sb, ino, me, &blocked, &reader)
 # 2026-11-05, N2). Per waited queue: the stores that can make its
 # condition true, and the wake every function doing one must contain.
 # The count of wait sites is pinned, so a new wait fails here until its
-# queue is specified below.
+# queue is specified below. (dmpath.c has two waits on its one queue:
+# the killable one a CAS uses and the plain one for the probe and the
+# give-backs, 2026-11-08.)
 log "checking every store that can satisfy a wait wakes its queue"
 # file|function exempt from the rule (or -)|store regex|wake regex
 WAKE_SPEC='journal.c|cetrafs_journal_take_slot|clear_bit\([^,]*, *j->busy\)|j->held\+\+|\+\+j->held|wake_up(_all)?\(&j->slot_wq\)
@@ -1117,8 +1161,8 @@ unwoken() { # <file> <exempt fn> <store re> <wake re>: functions storing without
         /^}/ { if (fn != "" && fn != ex && stored && !woke) print FILENAME ":" fn; fn = "" }' "$1"
 }
 WSITES="$(grep -cE '^[^*/]*\bwait_event[a-z_]*\(' "$K"/*.c | awk -F: '{ n += $2 } END { print n + 0 }')"
-[ "$WSITES" = 5 ] && pass "wait wakes: 5 wait_event sites, each queue specified" ||
-    fail "wait wakes: $WSITES wait_event sites (specified for 5) -- add the new queue's stores and wake to WAKE_SPEC"
+[ "$WSITES" = 6 ] && pass "wait wakes: 6 wait_event sites, each queue specified" ||
+    fail "wait wakes: $WSITES wait_event sites (specified for 6) -- add the new queue's stores and wake to WAKE_SPEC"
 UW=""
 while IFS= read -r line; do
     f="${line%%|*}"; rest="${line#*|}"; ex="${rest%%|*}"; rest="${rest#*|}"
@@ -1275,7 +1319,7 @@ grep -q "a return inside the loop" <<<"$(cas_check "$SAMPLE")" &&
 # DIRTY. Block-device writeback is a writer with no lock, no order and no
 # journal: it wrote held-back leaves in place, torn by a power cut with
 # nothing to redo them, ahead of the data and bits they name, and after
-# their block was freed (CRASH-CONSISTENCY C1/C2, 2026-11-08). A leaf or
+# their block was freed (crash review 2026-11-08, C1/C2). A leaf or
 # index edit ends in cetrafs_tree_hold_back() or a journal write, never in
 # a bare end_update; and every free drops a held-back copy at the choke
 # point.
@@ -1292,6 +1336,110 @@ FDE="$(awk '/^static int __cetrafs_free_data_extent\(.*\)$/ { on = 1 } on; on &&
 grep -q 'cetrafs_deferred_forget_range(sb, lba, count)' <<<"$FDE" &&
     pass "classes 4/5: the free choke point drops a held-back copy of the freed blocks" ||
     fail "classes 4/5: __cetrafs_free_data_extent() no longer drops held-back tree blocks it frees"
+
+# Class 9 (change stamps): the file sector's publishers. A file-sector
+# CAS writes size, blocks and the extent root; one that does not compare
+# the record's file_seq with the stamp it planned from publishes over a
+# peer's newer write with a valid checksum. Every mutator handed to
+# cetrafs_cas_record_fd_seeded() reads file_seq off the image it is
+# given and compares it (audit 2026-11-04; check added 2026-11-08).
+log "checking every file-sector CAS mutator compares file_seq (class 9)"
+fd_mutators() { # <files...>: names of the mutators passed to the fd CAS
+    # One line per file: a call's arguments often span several.
+    for f in "$@"; do tr '\n' ' ' <"$f"; echo; done | grep -oE 'cetrafs_cas_record_fd_seeded\([^;]*' |
+        grep -v 'struct super_block' | grep -oE 'cetrafs_[a-z_]*_mutate' | sort -u
+}
+fd_unchecked() { # <file> <mutator...>: the ones whose body never compares file_seq
+    local f="$1"; shift
+    for fn in "$@"; do
+        awk -v fn="$fn" '$0 ~ "^static int " fn "\\(" { on = 1 } on && /file_seq/ && /(!=|==)/ { hit = 1 }
+            on && /^}/ { on = 0 } END { exit !hit }' "$f" || echo "$fn"
+    done
+}
+FDM="$(fd_mutators "$K"/*.c)"
+[ -n "$FDM" ] || fail "class 9: setup -- no file-sector CAS mutator found (the grep no longer matches the call)"
+FDU=""
+for fn in $FDM; do
+    src="$(grep -lE "^static int $fn\\(" "$K"/*.c | head -1)"
+    [ -n "$src" ] && FDU="$FDU$(fd_unchecked "$src" "$fn") " || FDU="$FDU$fn(no-body) "
+done
+[ "$(echo $FDM | wc -w)" = 2 ] || fail "class 9: $(echo $FDM | wc -w) file-sector CAS mutators (pinned at 2: $(echo $FDM)) -- review the new one and update the pin"
+[ -z "${FDU// /}" ] && pass "class 9: every file-sector CAS mutator compares file_seq ($(echo $FDM))" ||
+    fail "class 9: a file-sector CAS mutator never compares file_seq: $FDU"
+SAMPLE="$(ct_tmp fdmut).c"
+printf 'static int cetrafs_bad_mutate(void *image, unsigned int len, void *priv)\n{\n    rec.size = 0;\n    return 0;\n}\n    ret = cetrafs_cas_record_fd_seeded(sb, lba, NULL, 0, cetrafs_bad_mutate, &ctx);\n' >"$SAMPLE"
+[ "$(fd_mutators "$SAMPLE")" = cetrafs_bad_mutate ] && [ "$(fd_unchecked "$SAMPLE" cetrafs_bad_mutate)" = cetrafs_bad_mutate ] &&
+    pass "class 9: control -- a planted mutator without the comparison is found" ||
+    fail "class 9: control -- the planted mutator was not found ($(fd_mutators "$SAMPLE") / $(fd_unchecked "$SAMPLE" cetrafs_bad_mutate))"
+
+# Class 41 (an invalidation that does not fence a fill in flight).
+# Clearing a valid bit does not stop a fill already between its device
+# read and its store; the store lands after the drop with a value from
+# before it. Every function that drops, expires, forgets or invalidates
+# cached state is listed here with what fences a fill across it, and a
+# new one fails until someone has said which (leafdefer/crash reviews
+# 2026-11-08; the extent cache was the one that had nothing).
+#   gen:<field>:<store>   the drop moves <field>; <store> compares it
+#   buffer                the buffer cache: the drop takes lock_buffer,
+#                         which a read in flight holds until it completes
+#   wait                  the drop waits out a fill in flight itself
+#   safe:<why>            a straddling fill errs in the safe direction
+#   none:<why>            not a cache a fill can race
+log "checking every cache invalidate names what fences a fill in flight (class 41)"
+C41_REG='cetrafs_inode_ext_cache_drop gen:ext_gen:cetrafs_inode_ext_cache_store
+cetrafs_verdicts_invalidate gen:verdict_gen:cetrafs_verdict_current
+cetrafs_lock_expire_verdicts calls:cetrafs_verdicts_invalidate
+cetrafs_tree_invalidate_cached calls:cetrafs_inode_ext_cache_drop
+cetrafs_invalidate_block buffer
+cetrafs_forget_block buffer
+cetrafs_invalidate_raw_inode calls:cetrafs_invalidate_block
+cetrafs_bg_invalidate_cache calls:cetrafs_invalidate_block
+cetrafs_dmpath_forget wait
+cetrafs_sb_peer_watch_forget safe:a-straddling-sample-re-arms-the-watch-at-now-which-only-delays-a-verdict
+cetrafs_deferred_forget_range none:the-held-back-set-changes-under-the-buffer-lock
+cetrafs_inode_forget_tree none:an-on-disk-record-not-a-cache
+cetrafs_sb_nslock_forget none:a-release-queue-entry-not-a-cache
+cetrafs_file_cache_drop_count none:a-counter'
+c41_names() { # <files...>: every function whose name says it drops cached state
+    grep -hoE '^(static )?(inline )?(void|bool|int|u32|u64) \*?cetrafs_[a-z0-9_]*(cache_drop|expire|invalidate|forget)[a-z0-9_]*\(' "$@" |
+        grep -oE 'cetrafs_[a-z0-9_]*' | sort -u
+}
+c41_body() { # <fn>: its body, from whichever kmod file defines it
+    local src
+    src="$(grep -lE "^(static )?(inline )?[a-z0-9_]+ \*?$1\\(" "$K"/*.c | head -1)"
+    [ -n "$src" ] && awk -v f="$1" '$0 ~ ("^[a-z].*[ *]" f "\\(") && !/\);/ { on = 1 } on { print } on && /^}/ { exit }' "$src"
+}
+c41_bad() { # <fn> <kind>: prints why the fence is missing, nothing if present
+    local fn="$1" kind="$2" field store
+    case "$kind" in
+    gen:*)
+        field="$(cut -d: -f2 <<<"$kind")"
+        store="$(cut -d: -f3 <<<"$kind")"
+        c41_body "$fn" | grep -qE "$field\\+\\+|atomic_inc\\(&[a-z]+->$field\\)" || echo "$fn: does not move $field"
+        c41_body "$store" | grep -E "$field" | grep -qE '!=|==' || echo "$store: never compares $field"
+        ;;
+    calls:*) c41_body "$fn" | grep -q "${kind#calls:}(" || echo "$fn: no longer calls ${kind#calls:}" ;;
+    buffer) c41_body "$fn" | grep -q 'lock_buffer(' || echo "$fn: takes no buffer lock" ;;
+    wait) c41_body "$fn" | grep -qE 'wait_event|resolving' || echo "$fn: waits for nothing" ;;
+    safe:* | none:*) ;;
+    *) echo "$fn: unknown kind $kind" ;;
+    esac
+}
+C41_FOUND="$(c41_names "$K"/*.c)"
+[ -n "$C41_FOUND" ] || fail "class 41: setup -- no invalidate found (the grep no longer matches)"
+C41_NEW="$(comm -23 <(echo "$C41_FOUND") <(cut -d' ' -f1 <<<"$C41_REG" | sort -u))"
+C41_GONE="$(comm -13 <(echo "$C41_FOUND") <(cut -d' ' -f1 <<<"$C41_REG" | sort -u))"
+C41_BAD="$(while read -r fn kind; do c41_bad "$fn" "$kind"; done <<<"$C41_REG")"
+[ -z "$C41_NEW" ] && [ -z "$C41_GONE" ] && [ -z "$C41_BAD" ] &&
+    pass "class 41: every cache invalidate names its fence ($(echo $C41_FOUND | wc -w))" ||
+    fail "class 41: unlisted: $(echo $C41_NEW); listed but gone: $(echo $C41_GONE); unfenced: $C41_BAD"
+# Control: a store that stops comparing the generation, and a new drop.
+C41_SAMPLE="$(ct_tmp c41).c"
+printf 'void cetrafs_thing_cache_drop(struct inode *inode)\n{\n    ci->valid = false;\n}\n' >"$C41_SAMPLE"
+[ "$(c41_names "$C41_SAMPLE")" = cetrafs_thing_cache_drop ] &&
+    [ -n "$(K="$(dirname "$C41_SAMPLE")" c41_bad cetrafs_thing_cache_drop gen:thing_gen:cetrafs_thing_cache_drop)" ] &&
+    pass "class 41: control -- a planted drop is found, and one that moves no generation is refused" ||
+    fail "class 41: control -- the planted drop was not caught"
 
 # Class 44 ("alive" as the unsafe default). A liveness predicate's first
 # look at a row answers "alive" -- right for a reclaim, which then keeps

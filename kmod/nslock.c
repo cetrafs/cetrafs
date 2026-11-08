@@ -442,7 +442,7 @@ static int cetrafs_nslock_try(struct inode *inode, u32 my_node_id)
             .from = my_node_id,
             .to = ctx.steal_from,
         };
-        int gret = cetrafs_cas_record(sb, cetrafs_inode_lba(sb, inode->i_ino), cetrafs_nslock_giveback_mutate, &g);
+        int gret = cetrafs_cas_record_nointr(sb, cetrafs_inode_lba(sb, inode->i_ino), cetrafs_nslock_giveback_mutate, &g);
 
         if (gret < 0)
             cetrafs_sb_fatal(sb, "nslock: ino=%llu: node %u came back while its namespace lock was being broken, and "

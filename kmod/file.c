@@ -729,11 +729,30 @@ int cetrafs_convert_pending_locked(struct inode *inode)
      * own submission error is ours), wait without consuming the flags
      * (they stay for fsync/close to report), and judge by the cursor.
      */
-    ret = filemap_fdatawrite(m);
-    if (!ret) {
-        (void) filemap_fdatawait_keep_errors(m);
-        if (cetrafs_pending_wb_failed(inode))
-            ret = -EIO;
+    /*
+     * Only the set's span needs its data down before the conversion: its
+     * blocks are what the flips declare written. The rest of the file's
+     * dirty pages are each caller's own business, and every caller writes
+     * them first (->flush, the last close, fsync's range) -- a whole-file
+     * writeback here made an fsync of one small range pay for every dirty
+     * page of a large image.
+     */
+    {
+        u64 lo = U64_MAX, hi = 0, at = 0;
+
+        while (at <= U32_MAX && !cetrafs_pending_next(inode, (u32) at, &first, &last)) {
+            lo = min_t(u64, lo, first);
+            hi = max_t(u64, hi, last);
+            at = (u64) last + 1;
+        }
+        if (lo == U64_MAX)
+            return 0;
+        ret = filemap_fdatawrite_range(m, (loff_t) (lo << bits), (loff_t) (((hi + 1) << bits) - 1));
+        if (!ret) {
+            (void) filemap_fdatawait_range_keep_errors(m, (loff_t) (lo << bits), (loff_t) (((hi + 1) << bits) - 1));
+            if (cetrafs_pending_wb_failed(inode))
+                ret = -EIO;
+        }
     }
     if (!ret)
         ret = cetrafs_publish_flush(inode->i_sb);
@@ -1830,11 +1849,23 @@ void cetrafs_free_inline_extents(struct inode *dir, const cetrafs_inode_t *raw)
  * reader a deleted file's contents), and preallocated extents are rare
  * enough that skipping them costs nothing.
  */
-static void cetrafs_tree_remember(struct inode *inode, const cetrafs_inode_t *raw, const struct cetrafs_ext_span *span)
+/* TEST ONLY: hold a walk between its leaf read and its store, so a suite
+ * can drop the cache there (tests/kernel/ext_cache_fill_fenced.sh). */
+static unsigned int cetrafs_ext_fill_stall_ms;
+cetrafs_test_param(ext_fill_stall_ms, cetrafs_ext_fill_stall_ms, uint, 0644);
+MODULE_PARM_DESC(ext_fill_stall_ms, "TEST ONLY: pause an extent walk between its leaf read and its cache store");
+
+static void cetrafs_tree_remember(struct inode *inode, const cetrafs_inode_t *raw, const struct cetrafs_ext_span *span,
+                                  u32 gen)
 {
     if (span->uninit || !span->len)
         return;
-    cetrafs_inode_ext_cache_store(inode, raw, span->block, span->len, span->lba, false);
+    if (unlikely(cetrafs_ext_fill_stall_ms)) {
+        pr_info("ino=%llu: TEST pause of %ums before an extent-cache store\n", (unsigned long long) inode->i_ino,
+                cetrafs_ext_fill_stall_ms);
+        msleep(cetrafs_ext_fill_stall_ms);
+    }
+    cetrafs_inode_ext_cache_store(inode, raw, span->block, span->len, span->lba, false, gen);
 }
 
 /* Find the extent covering 'iblock' in a leaf array (inline or external),
@@ -2805,7 +2836,7 @@ static int cetrafs_tree_lookup_unchecked(struct inode *inode,
                                          bool reader)
 {
     struct cetrafs_ext_span span = {0};
-    u32 ni;
+    u32 ni, egen;
 
     *found = false;
     if (out_uninit)
@@ -2839,6 +2870,9 @@ static int cetrafs_tree_lookup_unchecked(struct inode *inode,
         *found = true;
         return 0;
     }
+    /* Sampled before the tree is read: a drop from here on refuses the
+     * store below (class 41). */
+    egen = cetrafs_inode_ext_cache_gen(inode);
 
     if (cetrafs_le16(raw->eh.eh_depth) == 1) {
         u64 llba = cetrafs_extent_phys_from_hilo(raw->et.idx[0].ei_leaf_hi, raw->et.idx[0].ei_leaf_lo);
@@ -2856,7 +2890,7 @@ static int cetrafs_tree_lookup_unchecked(struct inode *inode,
         cetrafs_bh_read_unlock(lbh);
         brelse(lbh);
         if (*found)
-            cetrafs_tree_remember(inode, raw, &span);
+            cetrafs_tree_remember(inode, raw, &span, egen);
         return 0;
     }
 
@@ -2916,7 +2950,7 @@ static int cetrafs_tree_lookup_unchecked(struct inode *inode,
             brelse(lbh);
             if (*found) {
                 brelse(ibh);
-                cetrafs_tree_remember(inode, raw, &span);
+                cetrafs_tree_remember(inode, raw, &span, egen);
                 return 0;
             }
         }
@@ -3402,28 +3436,6 @@ static bool cetrafs_leaf_bh_holds_uninit(struct buffer_head *lbh, u32 iblock)
 }
 
 /*
- * A split that hands part of an extent to ANOTHER leaf (the converted
- * block, the preallocated tail) shrank it here first, and both leaves
- * are regular-file tree blocks left dirty for the close/fsync boundary.
- * The block device writes dirty buffers in any order: the destination
- * reaching the device without this one leaves the device's tree naming
- * the moved blocks TWICE, and a later delete frees them twice -- the
- * second time from under whichever file was given them in between
- * (tests/kernel/convert_leaf_order.sh). So this leaf goes to the device
- * NOW, before anything else names what it gave up: a crash in between
- * leaves those blocks named by nothing, a leak the scrub reclaims (the
- * safe direction, rule 8). One synchronous write per split of a FULL
- * leaf -- and that is NOT rare: random writes into a fallocated file fill
- * the leaf that holds the preallocated extent (each middle split adds two
- * entries) and nothing ever empties it, so from then on nearly every
- * conversion lands here. Measured at 60-77% of 4 KiB writes into
- * fallocated space, which is what caps that case at device latency per
- * write (docs/PERFORMANCE.md 14). Not fixed yet.
- *
- * Kept dirty on failure: the cached leaf is the only copy of the shrunk
- * state, and the caller then appends nothing.
- */
-/*
  * A regular file's extent-tree block, edited under its update lock, is
  * held back for the next durability boundary (leafdefer.c) instead of
  * being dirtied: writeback must never write it in place, and the
@@ -3437,11 +3449,36 @@ static int cetrafs_tree_hold_back(struct inode *inode, struct buffer_head *bh, u
 }
 
 /*
- * A split moved part of this leaf elsewhere: the leaf as it now stands
- * must be on the device before the moved piece is appended anywhere.
- * Every block of this inode held back so far goes with it, in one
- * journal batch -- a leaf may never reach the device ahead of the index
- * that ranges over it. The caller holds invalidate_lock.
+ * A split that hands part of an extent to ANOTHER leaf (the converted
+ * block, the preallocated tail) shrank this leaf first. The destination
+ * reaching the device without this one leaves the device's tree naming
+ * the moved blocks TWICE, and a later delete frees them twice -- the
+ * second time from under whichever file was given them in between
+ * (tests/kernel/convert_leaf_order.sh). The other order is safe: a crash
+ * between leaves those blocks named by nothing, a leak the scrub
+ * reclaims (rule 8).
+ *
+ * Held-back blocks reach the device only in a boundary's journal batch,
+ * and within one chunk of it that is atomic: every entry is durable
+ * before any target. Across chunks it is NOT -- chunk 1 is applied and
+ * consumed before chunk 2's entries exist, a batch is chunked at 16
+ * blocks or whenever slots are busy, and blocks go in LBA order, so the
+ * destination can land a chunk ahead of this leaf. That is what this
+ * call still prevents: everything held back so far, this leaf included,
+ * goes NOW, before the moved piece is appended anywhere. Every block of
+ * the inode goes with it -- a leaf may never reach the device ahead of
+ * the index that ranges over it.
+ *
+ * The cost is a whole batch (three cache flushes) per split of a FULL
+ * leaf, and that is not rare: random writes into a fallocated file fill
+ * the leaf holding the preallocated extent and nothing empties it, so
+ * nearly every conversion lands here (docs/PERFORMANCE.md 14). The way
+ * out is a batch whose entries are ALL durable before any target, across
+ * chunks (docs/internal/TODO.md, Performance); then this call can go.
+ *
+ * The caller holds invalidate_lock. On failure the blocks stay held
+ * back -- the cached leaf is the only copy of the shrunk state -- and
+ * the caller appends nothing.
  */
 static int cetrafs_convert_source_durable(struct inode *inode, struct buffer_head *lbh)
 {

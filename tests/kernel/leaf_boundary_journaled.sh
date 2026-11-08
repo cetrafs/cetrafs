@@ -3,7 +3,7 @@
 # a regular file's extent leaves reach the device only at a boundary, through the journal
 #
 # A regular file's leaf edits wait in core for close/fsync/sync. They used
-# to wait as DIRTY buffers, and so (CRASH-CONSISTENCY C1, C2):
+# to wait as DIRTY buffers, and so (crash review 2026-11-08, C1, C2):
 #   - the boundary wrote them in place, unjournaled: a leaf torn by a
 #     power cut lost the old map with the new one, every read of the range
 #     returned EIO, and fsck could not repair it -- an image that neither
@@ -20,8 +20,8 @@
 #       the journal (journal_writes moves).
 #   (2) the worst crash: journal_batch_crash_before_targets stops the
 #       mount the moment the batch's entries are durable. The leaf on the
-#       device is then TORN by hand (its second half zeroed: the tail
-#       checksum fails, as a power cut mid-write leaves it). The remount
+#       device is then TORN by hand (its first half new, its second half
+#       old: the tail checksum fails, as a power cut mid-write leaves it). The remount
 #       replays our own area, redoes the torn leaf (journal_replay_torn),
 #       and every block written before the fsync reads back -- no EIO.
 #   (3) freed while held back: a truncate frees a leaf with edits still in
@@ -51,7 +51,7 @@ DEV="$(ct_loop "$IMG")"
 MNT="$(ct_mnt lbj)"
 # A journal: ct_mkfs_small makes none (-J 0), and the batch then writes
 # in place -- the unjournaled path this suite exists to rule out.
-ct_mkfs "$DEV" -z 1 -b 512 -J 4 -N 1024 -f >/dev/null
+ct_mkfs "$DEV" -z 1 -b 512 -J 4 -M 4 -N 1024 -f >/dev/null
 ct_track mnt "$MNT"
 ct_mount "$DEV" "$MNT"
 require_cetrafs_mount "$MNT"
@@ -138,9 +138,16 @@ dmesg_since "$MARK" | grep -q 'TEST stop after [0-9]* entries, before their targ
 [ "$(dev_blk "$L")" = "$H1" ] && pass "(2) setup: the mount stopped with the leaf's entry durable and the leaf untouched" ||
     { fail "(2) setup: the leaf reached the device before the stop"; ct_exit; }
 T0="$(ctr journal_replay_torn)" # module-global: sampled while mounted
+NEW="$(ct_tmp lbj-new)"
+dd if="$DEV" of="$NEW" bs=4096 skip="$L" count=1 status=none # the edit, from the cache
 ct_umount "$MNT"
-# The power cut tore the leaf: its second half never landed.
-dd if=/dev/zero of="$IMG" bs=2048 seek=$((L * 2 + 1)) count=1 conv=notrunc status=none
+# The power cut tore the leaf: its first half landed, its second half
+# still holds the old image -- what a disk leaves, not zeroes. (Zeroes
+# would wipe the tail's magic, and replay rightly refuses a block that is
+# no longer of its entry's kind: freed and reused, as far as it can tell.)
+dd if="$NEW" of="$IMG" bs=2048 count=1 seek=$((L * 2)) conv=notrunc status=none
+[ "$(dev_blk "$L")" != "$H1" ] && [ "$(dev_blk "$L")" != "$(sha1sum <"$NEW" | cut -c1-16)" ] ||
+    { fail "(2) setup: the leaf on the device is not torn"; ct_exit; }
 ct_mount "$DEV" "$MNT"
 PROC="$(ct_procdir "$DEV")"
 [ "$(ctr journal_replay_torn)" -gt "$T0" ] &&

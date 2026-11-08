@@ -252,7 +252,7 @@ static void cetrafs_caw_land_held(struct block_device *bdev)
     cetrafs_caw_late.write_data = NULL;
     pr_warn("CAW lba=%llu: TEST late landing -- the timed-out command lands now\n",
             (unsigned long long) cetrafs_caw_late.lba);
-    (void) cetrafs_caw(bdev, cetrafs_caw_late.lba, cetrafs_caw_late.nblocks, c, w);
+    (void) cetrafs_caw(bdev, cetrafs_caw_late.lba, cetrafs_caw_late.nblocks, c, w, false);
     kfree(c);
     kfree(w);
 }
@@ -537,7 +537,7 @@ int cetrafs_caw_discover(struct block_device *bdev, struct cetrafs_caw_info *out
                 bdev);
     sdev = cetrafs_caw_get_sdev(bdev);
     if (!sdev)
-        sdev = cetrafs_dmpath_sdev(bdev); /* dm (multipath): probe via a path -- see dmpath.c */
+        sdev = cetrafs_dmpath_sdev(bdev, false); /* dm (multipath): probe via a path -- see dmpath.c */
     if (sdev) {
         unsigned char *vpd = kzalloc(64, GFP_KERNEL);
         int rc;
@@ -628,7 +628,8 @@ int cetrafs_caw_discover(struct block_device *bdev, struct cetrafs_caw_info *out
  * cetrafs_caw_discover() result (the device will also reject an
  * over-length request on its own).
  */
-int cetrafs_caw(struct block_device *bdev, u64 lba, unsigned int nblocks, const void *compare, const void *write_data)
+int cetrafs_caw(struct block_device *bdev, u64 lba, unsigned int nblocks, const void *compare, const void *write_data,
+                bool killable)
 {
     struct scsi_device *sdev;
     unsigned int lbs;
@@ -723,7 +724,9 @@ int cetrafs_caw(struct block_device *bdev, u64 lba, unsigned int nblocks, const 
         int ret = -EOPNOTSUPP;
 
         for (attempt = 0; attempt < 2; attempt++) {
-            sdev = cetrafs_dmpath_sdev(bdev);
+            sdev = cetrafs_dmpath_sdev(bdev, killable);
+            if (IS_ERR(sdev))
+                return PTR_ERR(sdev); /* -EINTR: interrupted waiting for a path, nothing issued */
             if (!sdev)
                 break;
 
@@ -988,7 +991,8 @@ static int cetrafs_cas_region_seeded_impl(struct super_block *sb,
                                           unsigned int seed_len,
                                           cetrafs_cas_fn mutate,
                                           void *priv,
-                                          bool sole_region)
+                                          bool sole_region,
+                                          bool killable)
 {
     const struct cetrafs_caw_info *caw = cetrafs_sb_caw(sb);
     bool have_caw = cetrafs_sb_caw_available(sb);
@@ -1190,7 +1194,7 @@ static int cetrafs_cas_region_seeded_impl(struct super_block *sb,
             goto out;
         }
 
-        ret = cetrafs_caw(sb->s_bdev, dev_lba, 1, old, new);
+        ret = cetrafs_caw(sb->s_bdev, dev_lba, 1, old, new, killable);
         {
             /* DEBUG: every inode-bitmap CAS, with everything needed to
              * compare two nodes' wins for one bit: the exact device
@@ -1394,7 +1398,7 @@ int cetrafs_cas_region_seeded(struct super_block *sb,
      * content is known, so the cached copy of the OTHERS may already be
      * stale and the whole block has to be dropped. */
     return cetrafs_cas_region_seeded_impl(sb, fs_lba, region_idx, seed, seed_len, mutate, priv,
-                                          /*sole_region=*/false);
+                                          /*sole_region=*/false, /*killable=*/true);
 }
 
 /* cetrafs_cas_record() with the caller's own fresh image as the first
@@ -1414,7 +1418,8 @@ int cetrafs_cas_record_seeded(struct super_block *sb,
      * cached record read (freshness-gated where it matters). These are
      * also the blocks most worth keeping: the record a namespace
      * operation just updated is the record the next lookup reads. */
-    return cetrafs_cas_region_seeded_impl(sb, fs_lba, 0, seed, seed_len, mutate, priv, /*sole_region=*/true);
+    return cetrafs_cas_region_seeded_impl(sb, fs_lba, 0, seed, seed_len, mutate, priv, /*sole_region=*/true,
+                                          /*killable=*/true);
 }
 
 /* On a device whose atomic unit is wider than the namespace sector (4Kn:
@@ -1461,9 +1466,10 @@ int cetrafs_cas_record_fd_seeded(struct super_block *sb,
         struct cetrafs_cas_fd_slice_ctx s = {.mutate = mutate, .priv = priv};
 
         return cetrafs_cas_region_seeded_impl(sb, fs_lba, 0, NULL, 0, cetrafs_cas_fd_slice_mutate, &s,
-                                              /*sole_region=*/true);
+                                              /*sole_region=*/true, /*killable=*/true);
     }
-    return cetrafs_cas_region_seeded_impl(sb, fs_lba, 1, seed, seed_len, mutate, priv, /*sole_region=*/true);
+    return cetrafs_cas_region_seeded_impl(sb, fs_lba, 1, seed, seed_len, mutate, priv, /*sole_region=*/true,
+                                          /*killable=*/true);
 }
 
 /* ---- self-test ------------------------------------------------------
@@ -1553,7 +1559,7 @@ void cetrafs_cas_selftest(struct super_block *sb, u32 my_node_id)
             u64 dev_lba = lba * (CETRAFS_BLOCK_SIZE / region);
 
             wrong[CETRAFS_CAS_SELFTEST_OFF] = 0x5A; /* != what we just wrote */
-            ret = cetrafs_caw(sb->s_bdev, dev_lba, 1, wrong, newer);
+            ret = cetrafs_caw(sb->s_bdev, dev_lba, 1, wrong, newer, false);
             if (ret != -EBUSY) {
                 pr_err("CAS selftest: stale compare returned %d, expected -EBUSY (MISCOMPARE)\n", ret);
                 ok = false;
@@ -1986,4 +1992,17 @@ void cetrafs_cas_stress(struct super_block *sb, u32 my_node_id)
 int cetrafs_cas_record(struct super_block *sb, u64 fs_lba, cetrafs_cas_fn mutate, void *priv)
 {
     return cetrafs_cas_region_seeded(sb, fs_lba, 0, NULL, 0, mutate, priv);
+}
+
+/*
+ * cetrafs_cas_record() for a swap nothing may abandon: a give-back that
+ * undoes a reclaim which raced its owner's return, and whose failure
+ * stops the mount. Every other CAS may be interrupted by a fatal signal
+ * while it waits for a multipath path to be resolved (-EINTR, nothing
+ * issued); this one waits that resolution out, bounded as before.
+ */
+int cetrafs_cas_record_nointr(struct super_block *sb, u64 fs_lba, cetrafs_cas_fn mutate, void *priv)
+{
+    return cetrafs_cas_region_seeded_impl(sb, fs_lba, 0, NULL, 0, mutate, priv, /*sole_region=*/false,
+                                          /*killable=*/false);
 }

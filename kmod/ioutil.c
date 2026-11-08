@@ -406,24 +406,36 @@ int cetrafs_sync_buffer_keep(struct super_block *sb, struct buffer_head *bh)
 void cetrafs_bh_end_update_deferred(struct buffer_head *bh)
 {
     if (!buffer_cetra_deferred(bh)) {
-        get_bh(bh); /* the pin, dropped by cetrafs_bh_undefer()'s caller */
+        get_bh(bh); /* the pin, dropped when the block is unlisted */
         set_buffer_cetra_deferred(bh);
     }
     unlock_buffer(bh);
 }
 
-/* No longer held back: written, freed or dropped. 'drop' also forgets
- * the cached image (a freed block, or a stopped mount's unwritten
- * change). The bit goes under the buffer lock, the same lock
- * cetrafs_write_deferred_target() tests it under. */
-void cetrafs_bh_undefer(struct buffer_head *bh, bool drop)
+/*
+ * A held-back block's bit and its listing change together, under the
+ * buffer lock every update holds: an update that finds the bit can then
+ * trust it is listed (leafdefer review 2026-11-08, item 1). These are the two ways a
+ * listing ends.
+ *
+ * Unlist: the block was freed, or the mount stopped ('drop' also forgets
+ * the cached image), or a single journal write wrote it. The caller holds
+ * its own reference.
+ */
+void cetrafs_bh_deferred_unlist(struct super_block *sb, struct buffer_head *bh, bool drop)
 {
     lock_buffer(bh);
-    clear_buffer_cetra_deferred(bh);
-    if (drop) {
-        clear_buffer_dirty(bh);
-        clear_buffer_uptodate(bh);
-    }
+    cetrafs_deferred_unlist_locked(sb, bh, drop);
+    unlock_buffer(bh);
+}
+
+/* Settle: a boundary wrote the image whose checksum is 'written_crc'.
+ * Unlisted if that is still the image in core; an edit made since stays
+ * listed, against the image now on the device. */
+void cetrafs_bh_deferred_settle(struct super_block *sb, struct buffer_head *bh, u32 written_crc)
+{
+    lock_buffer(bh);
+    cetrafs_deferred_settle_locked(sb, bh, written_crc);
     unlock_buffer(bh);
 }
 
@@ -436,7 +448,7 @@ void cetrafs_bh_undefer(struct buffer_head *bh, bool drop)
  * cached image stays uptodate: it is the only copy of the edit.
  * 1: no longer held back, nothing written.
  */
-int cetrafs_write_deferred_target(struct super_block *sb, struct buffer_head *bh)
+int cetrafs_write_deferred_target(struct super_block *sb, struct buffer_head *bh, u32 *wcrc)
 {
     if (cetrafs_sb_is_fenced(sb))
         return -EIO;
@@ -445,6 +457,9 @@ int cetrafs_write_deferred_target(struct super_block *sb, struct buffer_head *bh
         unlock_buffer(bh);
         return 1;
     }
+    /* What this write puts on the device: the settle afterwards compares
+     * the image in core with it, under the same lock. */
+    *wcrc = ~crc32c(~0U, bh->b_data, CETRAFS_BLOCK_SIZE);
     clear_buffer_write_io_error(bh);
     clear_buffer_dirty(bh);
 #if LINUX_VERSION_CODE >= KERNEL_VERSION(7, 2, 0)

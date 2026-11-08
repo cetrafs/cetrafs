@@ -562,7 +562,7 @@ static int cetrafs_dmpath_resolve(struct block_device *bdev, dev_t avoid, struct
  * link -- is handled by cetrafs_dmpath_failed() below, which caw.c calls
  * on a transport error so the rotation is driven by the failure itself.
  */
-struct scsi_device *cetrafs_dmpath_sdev(struct block_device *bdev)
+struct scsi_device *cetrafs_dmpath_sdev(struct block_device *bdev, bool killable)
 {
     struct cetrafs_dmpath_entry *slot = NULL, *free_slot = NULL, tmp = {0};
     struct scsi_device *sdev = NULL;
@@ -605,7 +605,17 @@ retry:
         mutex_unlock(&cetrafs_dmpath_mutex);
         if (!waited) {
             waited = true;
-            wait_event_timeout(cetrafs_dmpath_wq, !READ_ONCE(busy->resolving), CETRAFS_DMPATH_RESOLVE_WAIT);
+            /* Killable for a caller that can give up: a CAS that has
+             * issued nothing, whose -EINTR its caller handles as any
+             * command that did not happen. Not the probe at mount, and
+             * not a give-back, which nothing may abandon. */
+            if (killable) {
+                if (wait_event_killable_timeout(cetrafs_dmpath_wq, !READ_ONCE(busy->resolving),
+                                                CETRAFS_DMPATH_RESOLVE_WAIT) < 0)
+                    return ERR_PTR(-EINTR);
+            } else {
+                wait_event_timeout(cetrafs_dmpath_wq, !READ_ONCE(busy->resolving), CETRAFS_DMPATH_RESOLVE_WAIT);
+            }
             goto retry;
         }
         pr_warn_ratelimited("dm path: %s has had a path resolution in flight for %us -- resolving separately\n",

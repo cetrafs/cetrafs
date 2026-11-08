@@ -3030,14 +3030,18 @@ static int cetrafs_rename_locked(struct mnt_idmap *idmap,
              * it must not pass in SILENCE: the record then still claims
              * a live link while nothing names it, evict's re-read
              * refuses to free an inode that is not dead, and the number
-             * stays allocated until fsck or the scrub notices. Saying
+             * stays allocated until fsck notices. Saying
              * so is the difference between a known orphan and a
              * mystery. The sibling branch below has always reported it.
+             * Nothing online reclaims it: the scrub's orphan pass takes
+             * only records whose count is already 0
+             * (scrub_reclaim_orphan_inodes()), so this one waits for
+             * fsck -r, which links it into /lost+found.
              */
             if (nret)
                 pr_warn_ratelimited(
                     "rename: replaced directory ino=%llu kept a live link count (%d) -- it is unreachable and "
-                    "will be reclaimed as an orphan\n",
+                    "stays allocated until fsck -r links it into /lost+found\n",
                     (unsigned long long) removed_ino, nret);
             clear_nlink(new_inode);
         } else {

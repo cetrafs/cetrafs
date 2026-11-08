@@ -299,6 +299,9 @@ struct cetrafs_sb_info {
     /* A regular file's extent-tree blocks held back from writeback until
      * a durability boundary, by LBA (leafdefer.c). */
     struct xarray deferred;
+    /* Held-back blocks of inodes evicted with blocks still listed; under
+     * the deferred xarray's lock (leafdefer.c). */
+    struct list_head deferred_orphans;
 
     /*
      * The in-core lease: until when this node may keep writing on the
@@ -1356,6 +1359,7 @@ int cetrafs_fill_super(struct super_block *sb, struct fs_context *fc)
         sbi->auto_defrag_enabled = true;
         xa_init(&sbi->bad_inos);
         xa_init(&sbi->deferred);
+        INIT_LIST_HEAD(&sbi->deferred_orphans);
         sbi->sb = sb;
         INIT_WORK(&sbi->stop_work, cetrafs_sb_stop_work);
         {
@@ -2973,6 +2977,13 @@ struct cetrafs_journal *cetrafs_sb_get_journal(struct super_block *sb)
     struct cetrafs_sb_info *sbi = sb->s_fs_info;
 
     return sbi ? sbi->journal : NULL;
+}
+
+struct list_head *cetrafs_sb_deferred_orphans(struct super_block *sb)
+{
+    struct cetrafs_sb_info *sbi = sb->s_fs_info;
+
+    return sbi ? &sbi->deferred_orphans : NULL;
 }
 
 struct xarray *cetrafs_sb_deferred(struct super_block *sb)

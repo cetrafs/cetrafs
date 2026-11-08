@@ -97,6 +97,7 @@ int main(int argc, char **argv)
         fprintf(stderr, "       %s <backing-file> size <ino>           (print the on-disk size)\n", argv[0]);
         fprintf(stderr, "       %s <backing-file> bumpseq <ino>        (advance dirent_seq, as a peer would)\n", argv[0]);
         fprintf(stderr, "       %s <backing-file> extents <ino>       (prints depth/entries/blocks)\n", argv[0]);
+        fprintf(stderr, "       %s <backing-file> setctime <ino> <secs>  (as a peer's setxattr leaves it)\n", argv[0]);
         fprintf(stderr, "       %s <backing-file> setmode <ino> <octal> (set the raw mode, e.g. 020600 for a chardev)\n",
                 argv[0]);
         fprintf(stderr, "       %s <backing-file> nlink <ino> <n>      (set nlink; 0 = a deleted file's record)\n",
@@ -299,6 +300,16 @@ int main(int argc, char **argv)
         cetrafs_inode_stamp_crcs_us(&rec);
         pwrite_all(fd, &rec, sizeof(rec), rec_off);
         fprintf(stderr, "inode_block_poke: ino %llu mtime -> %lld\n", (unsigned long long) ino, (long long) t);
+    } else if (strcmp(mode, "setctime") == 0) {
+        /* Set ctime (seconds), as a peer's setxattr or chmod leaves it. */
+        cetrafs_inode_t rec;
+        int64_t t = (argc > 4) ? (int64_t) strtoll(argv[4], NULL, 0) : 0;
+
+        pread_all(fd, &rec, sizeof(rec), rec_off);
+        rec.ctime = cetrafs_cpu_to_le64((uint64_t) t);
+        cetrafs_inode_stamp_crcs_us(&rec);
+        pwrite_all(fd, &rec, sizeof(rec), rec_off);
+        fprintf(stderr, "inode_block_poke: ino %llu ctime -> %lld\n", (unsigned long long) ino, (long long) t);
     } else if (strcmp(mode, "leaf") == 0) {
         /* Follow a depth-1 inode's index to its external extent leaf and
          * print what is ON THE DEVICE there. The point is to compare the

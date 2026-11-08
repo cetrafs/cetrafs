@@ -717,6 +717,10 @@ skip_free:;
         cetrafs_flush_dirty_free_counts(sb);
     }
 
+    /* Held-back tree blocks of a file leaving the cache (its frees
+     * above dropped those of a deleted one): sync_fs and unmount write
+     * them from the mount's orphan list. */
+    cetrafs_deferred_evict(inode);
     clear_inode(inode);
 }
 

@@ -407,7 +407,7 @@ static int cetrafs_journal_claim_replay(struct super_block *sb, u64 area_start, 
      */
     if (ret == 0 && ctx.displaced && cetrafs_node_reattached_since_fence(sb, owner)) {
         struct cetrafs_journal_claim_ctx g = {.my_node_id = my_node_id, .give_back = true, .steal_from = owner};
-        int gret = cetrafs_cas_record(sb, area_start, cetrafs_journal_claim_mutate, &g);
+        int gret = cetrafs_cas_record_nointr(sb, area_start, cetrafs_journal_claim_mutate, &g);
 
         if (gret < 0)
             cetrafs_sb_fatal(sb, "journal: area %llu: node %u came back while its replay claim was being taken, "
@@ -829,6 +829,21 @@ static void cetrafs_journal_hold_slot(struct cetrafs_journal *j, u64 slot, u64 l
     wake_up(&j->slot_wq);
 }
 
+/*
+ * A take that reused a kept entry's slot and then gave up before writing
+ * anything: the kept entry is still live on the device -- it is for a
+ * target whose write failed, the one entry replay would need -- so its
+ * slot is held again. Released instead, the next entry would take the
+ * slot and overwrite it (leafdefer review 2026-11-08, item 4). j->lock held.
+ */
+static void cetrafs_journal_untake_kept(struct cetrafs_journal *j, u64 slot, u64 lba, bool reused)
+{
+    if (!reused)
+        return;
+    set_bit(slot, j->busy);
+    cetrafs_journal_hold_slot(j, slot, lba);
+}
+
 /* Lockless: only a wake-up condition, re-checked under j->lock. */
 static bool cetrafs_journal_slot_or_none(struct cetrafs_journal *j)
 {
@@ -852,9 +867,16 @@ u64 cetrafs_journal_held_slots(struct super_block *sb)
  * flight -- for a caller that already holds slots, which must not wait
  * for one while holding others (cetrafs_journal_write_deferred()).
  */
+/* TEST ONLY: the next slot take finds the mount fenced at its last
+ * check, after the slot was chosen (tests/kernel/journal_kept_slot_kept.sh). */
+static bool cetrafs_journal_take_fenced_once;
+cetrafs_test_param(journal_take_fenced_once, cetrafs_journal_take_fenced_once, bool, 0644);
+MODULE_PARM_DESC(journal_take_fenced_once, "TEST ONLY: the next journal slot take fails its fence check");
+
 static int cetrafs_journal_take_slot(struct super_block *sb, struct cetrafs_journal *j, u64 lba, bool nowait,
                                      u64 *out_slot, u64 *txn_id)
 {
+    bool reused = false;
     u64 slot;
 
     mutex_lock(&j->lock);
@@ -873,6 +895,7 @@ static int cetrafs_journal_take_slot(struct super_block *sb, struct cetrafs_jour
                 j->stuck_lba[slot] = 0;
                 j->held--;
                 clear_bit(slot, j->busy); /* re-set below, still under j->lock */
+                reused = true;
                 break;
             }
         }
@@ -906,6 +929,7 @@ static int cetrafs_journal_take_slot(struct super_block *sb, struct cetrafs_jour
         int ret = cetrafs_journal_write_flag(sb, j->area_start, true);
 
         if (ret) {
+            cetrafs_journal_untake_kept(j, slot, lba, reused);
             mutex_unlock(&j->lock);
             pr_err_ratelimited("journal: could not mark our area dirty (%d) -- refusing to write block %llu "
                                "unjournaled\n",
@@ -920,7 +944,9 @@ static int cetrafs_journal_take_slot(struct super_block *sb, struct cetrafs_jour
      * must stop the entry, not let it commit after a peer parked our
      * area (audit 2026-11-06 M10). I/O already queued still lands;
      * the attach-time retire covers what gets past this. */
-    if (cetrafs_sb_is_fenced(sb)) {
+    if (cetrafs_sb_is_fenced(sb) ||
+        (READ_ONCE(cetrafs_journal_take_fenced_once) && xchg(&cetrafs_journal_take_fenced_once, false))) {
+        cetrafs_journal_untake_kept(j, slot, lba, reused);
         mutex_unlock(&j->lock);
         return -EIO;
     }
@@ -1132,7 +1158,7 @@ static int cetrafs_journal_write_block_flags(struct super_block *sb, struct buff
         int werr = cetrafs_sync_buffer(sb, bh);
 
         if (!werr && was_deferred)
-            cetrafs_deferred_clear(sb, bh);
+            cetrafs_bh_deferred_unlist(sb, bh, false);
         if (werr) {
             if (journaled) {
                 mutex_lock(&j->lock);
@@ -1248,9 +1274,9 @@ MODULE_PARM_DESC(journal_batch_crash_before_targets,
 /* Write a deferred block's current image to its own LBA and wait. A
  * block freed since it was collected is skipped (and counts as done: its
  * entry is spent with the rest). */
-static int cetrafs_deferred_write_target(struct super_block *sb, struct buffer_head *bh)
+static int cetrafs_deferred_write_target(struct super_block *sb, struct buffer_head *bh, u32 *wcrc)
 {
-    int ret = cetrafs_write_deferred_target(sb, bh);
+    int ret = cetrafs_write_deferred_target(sb, bh, wcrc);
 
     return ret > 0 ? 0 : ret;
 }
@@ -1280,7 +1306,7 @@ static void cetrafs_journal_batch_retire(struct super_block *sb, struct cetrafs_
 /* One chunk of a deferred batch: k entries in k slots already taken. */
 static int cetrafs_journal_batch_chunk(struct super_block *sb, struct cetrafs_journal *j,
                                        struct buffer_head **bhs, const u32 *disk_crc, unsigned int k,
-                                       const u64 *slots, const u64 *txn, bool *written)
+                                       const u64 *slots, const u64 *txn, bool *written, u32 *wcrc)
 {
     struct buffer_head *pb[CETRAFS_JRNL_BATCH] = {}, *hb[CETRAFS_JRNL_BATCH] = {};
     unsigned int i, nw = 0;
@@ -1376,7 +1402,7 @@ static int cetrafs_journal_batch_chunk(struct super_block *sb, struct cetrafs_jo
 
     /* 3. The targets. One that fails keeps its entry live for replay. */
     for (i = 0; i < k; i++) {
-        int werr = cetrafs_deferred_write_target(sb, bhs[i]);
+        int werr = cetrafs_deferred_write_target(sb, bhs[i], &wcrc[i]);
 
         if (werr) {
             mutex_lock(&j->lock);
@@ -1428,7 +1454,7 @@ static int cetrafs_journal_batch_chunk(struct super_block *sb, struct cetrafs_jo
 
 /*
  * Write a set of deferred extent-tree blocks (leafdefer.c) through the
- * journal: the boundary of CRASH-CONSISTENCY C1 and C2.
+ * journal (crash review 2026-11-08, C1 and C2).
  *
  *  0. What the blocks name reaches the device first: the allocation bits
  *     (cetrafs_alloc_flush_bitmaps()) and a cache flush, which also makes
@@ -1452,7 +1478,7 @@ static int cetrafs_journal_batch_chunk(struct super_block *sb, struct cetrafs_jo
  * mkfs -J 0 has no journal: step 0, then the targets in place.
  */
 int cetrafs_journal_write_deferred(struct super_block *sb, struct buffer_head **bhs, const u32 *disk_crc,
-                                   unsigned int n, bool *written)
+                                   unsigned int n, bool *written, u32 *wcrc)
 {
     struct cetrafs_journal *j = cetrafs_sb_get_journal(sb);
     unsigned int i, done = 0;
@@ -1474,7 +1500,7 @@ int cetrafs_journal_write_deferred(struct super_block *sb, struct buffer_head **
 
     if (!j || !j->area_start) {
         for (i = 0; i < n; i++) {
-            int werr = cetrafs_deferred_write_target(sb, bhs[i]);
+            int werr = cetrafs_deferred_write_target(sb, bhs[i], &wcrc[i]);
 
             if (!werr)
                 written[i] = true;
@@ -1505,7 +1531,8 @@ int cetrafs_journal_write_deferred(struct super_block *sb, struct buffer_head **
             }
             k++;
         }
-        ret = cetrafs_journal_batch_chunk(sb, j, bhs + done, disk_crc + done, k, slots, txn, written + done);
+        ret = cetrafs_journal_batch_chunk(sb, j, bhs + done, disk_crc + done, k, slots, txn, written + done,
+                                          wcrc + done);
         if (ret)
             return ret;
         done += k;

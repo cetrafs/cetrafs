@@ -5,6 +5,7 @@
 #include <linux/crc32c.h>
 #include <linux/delay.h>
 #include <linux/fs.h>
+#include <linux/security.h>
 #include <linux/kernel.h>
 #include <linux/ktime.h>
 #include <linux/minmax.h>
@@ -2050,6 +2051,35 @@ enum cetrafs_apply_decline {
 static int __cetrafs_apply_raw_to_vfs_inode(struct inode *inode, const cetrafs_inode_t *raw,
                                             enum cetrafs_apply_decline *why);
 
+/*
+ * An LSM's cached inode label (class 42's sibling of S_NOSEC). A peer's
+ * setxattr of security.* reaches this node as a record refresh, which
+ * goes through none of the VFS paths that tell the LSM, so the label it
+ * cached -- and enforces -- stayed the old one. The record has no xattr
+ * stamp; a setxattr moves ctime, in SECONDS. So the label is dropped
+ * when ctime moved, and also once more after a refresh made while
+ * ctime's second could still produce a change (seen no later than
+ * ctime + 1): a second change in the same second leaves ctime equal.
+ * Caller holds inode_lock.
+ */
+static atomic64_t cetrafs_label_invalidations = ATOMIC64_INIT(0);
+
+u64 cetrafs_label_invalidation_count(void)
+{
+    return (u64) atomic64_read(&cetrafs_label_invalidations);
+}
+
+static bool cetrafs_inode_label_may_be_stale(struct inode *inode, const cetrafs_inode_t *raw)
+{
+    time64_t ctime = (time64_t) cetrafs_le64(raw->ctime);
+    time64_t now = ktime_get_real_seconds();
+    time64_t *seen_at = cetrafs_inode_label_seen_at(inode);
+    bool stale = inode_get_ctime(inode).tv_sec != ctime || *seen_at <= ctime + 1;
+
+    *seen_at = now;
+    return stale;
+}
+
 int cetrafs_apply_raw_to_vfs_inode(struct inode *inode, const cetrafs_inode_t *raw)
 {
     enum cetrafs_apply_decline why;
@@ -2097,6 +2127,7 @@ int cetrafs_apply_raw_to_vfs_inode_sure(struct inode *inode, const cetrafs_inode
 static int __cetrafs_apply_raw_to_vfs_inode(struct inode *inode, const cetrafs_inode_t *raw,
                                             enum cetrafs_apply_decline *why)
 {
+    bool label_stale;
     int ret;
     bool dirty;
 
@@ -2233,6 +2264,7 @@ static int __cetrafs_apply_raw_to_vfs_inode(struct inode *inode, const cetrafs_i
     if (cetrafs_apply_refresh_stall_ms && S_ISREG(inode->i_mode))
         msleep(cetrafs_apply_refresh_stall_ms);
 
+    label_stale = cetrafs_inode_label_may_be_stale(inode, raw);
     cetrafs_inode_adopt_identity(inode, raw);
     set_nlink(inode, cetrafs_le32(raw->nlink));
     i_size_write(inode, cetrafs_le64(raw->size));
@@ -2243,6 +2275,12 @@ static int __cetrafs_apply_raw_to_vfs_inode(struct inode *inode, const cetrafs_i
     cetrafs_inode_stat_baseline_set(inode, raw);
     up_write(&inode->i_mapping->invalidate_lock);
     inode_unlock(inode);
+    if (label_stale) {
+        /* A labelling LSM (SELinux, Smack) re-reads security.* on next
+         * use; with none, the hook does nothing. */
+        security_inode_invalidate_secctx(inode);
+        atomic64_inc(&cetrafs_label_invalidations);
+    }
 
     /* Dropping the page cache below forces the
      * next read back through cetrafs_get_block() -- but for a depth-1

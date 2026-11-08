@@ -104,6 +104,13 @@ u64 cetrafs_lock_resume_count(void)
  * themselves, not this mutex -- it has no reach outside this node.
  */
 struct cetrafs_inode_info {
+    /* When this node last adopted the record's identity (seconds);
+     * cetrafs_inode_label_may_be_stale(). Under inode_lock. */
+    time64_t label_seen_at;
+    /* This inode's held-back tree blocks (leafdefer.c), so a boundary
+     * walks its own and not the mount's. Under the mount's deferred
+     * xarray lock; emptied at eviction. */
+    struct list_head deferred;
     struct mutex lock_mutex;
     atomic_t lock_writer_count;     /* this node's local open-for-write refcount */
     atomic_t read_opener_count;     /* this node's local open-for-READ refcount:
@@ -228,6 +235,10 @@ struct cetrafs_inode_info {
     u16 ext_key_entries;
     u64 ext_key_blocks;
     u64 ext_key_seq; /* the record's file_seq: the change stamp */
+    /* Bumped by every drop: a walk samples it before reading the tree
+     * and its store is refused if it moved, so a fill that read before
+     * a drop never lands after it (class 41). */
+    u32 ext_gen;
     u32 ext_block; /* first file-relative block the extent covers */
     u32 ext_len;   /* how many blocks it covers */
     u64 ext_lba;   /* device block ext_block lives at */
@@ -691,12 +702,38 @@ bool cetrafs_inode_ext_cache_lookup(struct inode *inode,
 
 /* Remember the extent a walk just resolved, against the record it was
  * resolved from. */
+/* TEST ONLY: the store ignores the generation -- the negative control of
+ * tests/kernel/ext_cache_fill_fenced.sh. */
+static bool cetrafs_ext_cache_ignore_gen;
+cetrafs_test_param(ext_cache_ignore_gen, cetrafs_ext_cache_ignore_gen, bool, 0644);
+MODULE_PARM_DESC(ext_cache_ignore_gen, "TEST ONLY: an extent-cache store ignores drops made since its walk began");
+
+static atomic64_t cetrafs_ext_cache_stale_refused = ATOMIC64_INIT(0);
+
+u64 cetrafs_ext_cache_stale_refused_count(void)
+{
+    return (u64) atomic64_read(&cetrafs_ext_cache_stale_refused);
+}
+
+/* The generation a walk samples before it reads the tree. */
+u32 cetrafs_inode_ext_cache_gen(struct inode *inode)
+{
+    struct cetrafs_inode_info *ci = CETRAFS_I(inode);
+    u32 gen;
+
+    spin_lock(&ci->resv_lock);
+    gen = ci->ext_gen;
+    spin_unlock(&ci->resv_lock);
+    return gen;
+}
+
 void cetrafs_inode_ext_cache_store(struct inode *inode,
                                    const cetrafs_inode_t *raw,
                                    u32 ext_block,
                                    u32 ext_len,
                                    u64 ext_lba,
-                                   bool uninit)
+                                   bool uninit,
+                                   u32 gen)
 {
     struct cetrafs_inode_info *ci = CETRAFS_I(inode);
 
@@ -704,6 +741,13 @@ void cetrafs_inode_ext_cache_store(struct inode *inode,
         return;
 
     spin_lock(&ci->resv_lock);
+    if (ci->ext_gen != gen && !cetrafs_ext_cache_ignore_gen) {
+        /* A drop since the walk read the tree: what it found may be
+         * what the drop was about. */
+        spin_unlock(&ci->resv_lock);
+        atomic64_inc(&cetrafs_ext_cache_stale_refused);
+        return;
+    }
     ci->ext_key_depth = cetrafs_le16(raw->eh.eh_depth);
     ci->ext_key_entries = cetrafs_le16(raw->eh.eh_entries);
     ci->ext_key_blocks = cetrafs_le64(raw->blocks);
@@ -739,6 +783,7 @@ void cetrafs_inode_ext_cache_drop(struct inode *inode)
 
     spin_lock(&ci->resv_lock);
     ci->ext_valid = false;
+    ci->ext_gen++;
     spin_unlock(&ci->resv_lock);
 }
 
@@ -1248,6 +1293,7 @@ static void cetrafs_inode_init_once(void *foo)
 {
     struct cetrafs_inode_info *ci = foo;
 
+    INIT_LIST_HEAD(&ci->deferred);
     mutex_init(&ci->lock_mutex);
     spin_lock_init(&ci->resv_lock);
     spin_lock_init(&ci->fd_lock);
@@ -1293,6 +1339,7 @@ struct inode *cetrafs_alloc_vfs_inode(struct super_block *sb)
 
     if (!ci)
         return NULL;
+    ci->label_seen_at = 0; /* a recycled object keeps another file's */
     return &ci->vfs_inode;
 }
 
@@ -1323,8 +1370,22 @@ void cetrafs_free_vfs_inode(struct inode *inode)
     /* ->evict_inode empties it (cetrafs_pending_drop_all()); a recycled
      * object must not carry another file's pending blocks. */
     WARN_ON_ONCE(!mtree_empty(&ci->pending));
+    /* ->evict_inode moves any held-back blocks to the mount's orphan
+     * list (cetrafs_deferred_evict()); one left here would be freed
+     * while the registry still links it. */
+    WARN_ON_ONCE(!list_empty(&ci->deferred));
 
     kmem_cache_free(cetrafs_inode_cache, ci);
+}
+
+time64_t *cetrafs_inode_label_seen_at(struct inode *inode)
+{
+    return &CETRAFS_I(inode)->label_seen_at;
+}
+
+struct list_head *cetrafs_inode_deferred(struct inode *inode)
+{
+    return &CETRAFS_I(inode)->deferred;
 }
 
 /* ---- buffered-write pending set (see cetrafs_inode_info.pending) ---- */
@@ -1781,7 +1842,7 @@ static bool cetrafs_lock_undo_steal(struct super_block *sb, u64 ino, u64 generat
 
     if (!cetrafs_node_reattached_since_fence(sb, owner))
         return false;
-    ret = cetrafs_cas_record(sb, cetrafs_inode_lba(sb, ino), cetrafs_lock_cas_mutate, &g);
+    ret = cetrafs_cas_record_nointr(sb, cetrafs_inode_lba(sb, ino), cetrafs_lock_cas_mutate, &g);
     if (ret < 0)
         cetrafs_sb_fatal(sb, "%s: ino=%llu: node %u came back while its lock was being reclaimed, and the lock "
                          "could not be given back (%d)",
@@ -5124,7 +5185,7 @@ static int cetrafs_foreign_reader_from_raw(struct super_block *sb,
                  * presence to keep the record tidy; restoring it is the
                  * true state. */
                 rctx.reader_op = CETRAFS_READER_SET;
-                ret = cetrafs_cas_record(sb, cetrafs_inode_lba(sb, ino), cetrafs_lock_cas_mutate, &rctx);
+                ret = cetrafs_cas_record_nointr(sb, cetrafs_inode_lba(sb, ino), cetrafs_lock_cas_mutate, &rctx);
                 if (ret < 0 && ret != -ENOENT) /* -ENOENT: the file is gone, nothing to protect */
                     cetrafs_sb_fatal(sb, "ino=%llu: node %u came back while its reader bit was being cleared, and the "
                                      "bit could not be put back (%d)",

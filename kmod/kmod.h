@@ -449,7 +449,7 @@ int cetrafs_dm_underlying(struct block_device *bdev, dev_t *out, unsigned int ma
 struct scsi_device;
 /* A referenced scsi_device to send 'bdev's passthrough commands to when
  * bdev itself is not SCSI; NULL if none is usable. caller scsi_device_put()s. */
-struct scsi_device *cetrafs_dmpath_sdev(struct block_device *bdev);
+struct scsi_device *cetrafs_dmpath_sdev(struct block_device *bdev, bool killable);
 void cetrafs_dmpath_forget(struct block_device *bdev);
 /* Report that a path just failed a command with a TRANSPORT error, so the
  * next resolution picks a different one. Never called for a MISCOMPARE. */
@@ -462,6 +462,7 @@ struct scsi_device *cetrafs_caw_get_sdev(struct block_device *bdev);
  * once -- a lost race re-reads and re-invokes it with the new image. */
 typedef int (*cetrafs_cas_fn)(void *image, unsigned int len, void *priv);
 int cetrafs_cas_record(struct super_block *sb, u64 fs_lba, cetrafs_cas_fn mutate, void *priv);
+int cetrafs_cas_record_nointr(struct super_block *sb, u64 fs_lba, cetrafs_cas_fn mutate, void *priv);
 unsigned int cetrafs_cas_region_size(struct super_block *sb);
 u64 cetrafs_cas_miscompare_count(void);
 /* Device round trips an operation costs, made countable because neither
@@ -528,7 +529,8 @@ int cetrafs_cas_region_seeded(struct super_block *sb,
                               unsigned int seed_len,
                               cetrafs_cas_fn mutate,
                               void *priv);
-int cetrafs_caw(struct block_device *bdev, u64 lba, unsigned int nblocks, const void *compare, const void *write_data);
+int cetrafs_caw(struct block_device *bdev, u64 lba, unsigned int nblocks, const void *compare, const void *write_data,
+                bool killable);
 const char *cetrafs_caw_class_name(enum cetrafs_caw_class klass);
 void cetrafs_caw_probe_at_load(void);
 void cetrafs_cas_selftest(struct super_block *sb, u32 my_node_id);
@@ -597,7 +599,10 @@ void cetrafs_inode_ext_cache_store(struct inode *inode,
                                    u32 ext_block,
                                    u32 ext_len,
                                    u64 ext_lba,
-                                   bool uninit);
+                                   bool uninit,
+                                   u32 gen);
+u32 cetrafs_inode_ext_cache_gen(struct inode *inode);
+u64 cetrafs_ext_cache_stale_refused_count(void);
 void cetrafs_inode_ext_cache_drop(struct inode *inode);
 u64 cetrafs_ext_cache_hit_count(void);
 u64 cetrafs_ext_cache_miss_count(void);
@@ -1148,7 +1153,7 @@ int cetrafs_journal_attach_node(struct super_block *sb, u32 node_id);
 int cetrafs_journal_sweep_own_claims(struct super_block *sb, u32 my_node_id);
 int cetrafs_journal_write_block(struct super_block *sb, struct buffer_head *bh, u32 prev_crc);
 int cetrafs_journal_write_deferred(struct super_block *sb, struct buffer_head **bhs, const u32 *disk_crc,
-                                   unsigned int n, bool *written);
+                                   unsigned int n, bool *written, u32 *wcrc);
 
 /* leafdefer.c: a regular file's tree blocks, held back from the device
  * until a boundary and then journaled in one batch. A deferred buffer is
@@ -1163,12 +1168,19 @@ static inline bool cetrafs_bh_pending(const struct buffer_head *bh)
     return buffer_dirty(bh) || buffer_cetra_deferred(bh);
 }
 int cetrafs_bh_defer_update(struct inode *inode, struct buffer_head *bh, u32 prev_crc);
-int cetrafs_write_deferred_target(struct super_block *sb, struct buffer_head *bh);
+int cetrafs_write_deferred_target(struct super_block *sb, struct buffer_head *bh, u32 *wcrc);
 void cetrafs_bh_end_update_deferred(struct buffer_head *bh);
-void cetrafs_bh_undefer(struct buffer_head *bh, bool drop);
+void cetrafs_bh_deferred_unlist(struct super_block *sb, struct buffer_head *bh, bool drop);
+void cetrafs_bh_deferred_settle(struct super_block *sb, struct buffer_head *bh, u32 written_crc);
+void cetrafs_deferred_unlist_locked(struct super_block *sb, struct buffer_head *bh, bool drop);
+void cetrafs_deferred_settle_locked(struct super_block *sb, struct buffer_head *bh, u32 written_crc);
 u32 cetrafs_deferred_disk_crc(struct super_block *sb, struct buffer_head *bh, u32 fallback);
-void cetrafs_deferred_clear(struct super_block *sb, struct buffer_head *bh);
 void cetrafs_deferred_forget_range(struct super_block *sb, u64 lba, u32 count);
+void cetrafs_deferred_evict(struct inode *inode);
+struct list_head *cetrafs_inode_deferred(struct inode *inode);
+time64_t *cetrafs_inode_label_seen_at(struct inode *inode);
+u64 cetrafs_label_invalidation_count(void);
+struct list_head *cetrafs_sb_deferred_orphans(struct super_block *sb);
 int cetrafs_deferred_flush_inode(struct inode *inode, bool mapping_locked);
 int cetrafs_deferred_flush_all(struct super_block *sb);
 unsigned long cetrafs_deferred_drop_all(struct super_block *sb);
