@@ -320,17 +320,25 @@ int main(int argc, char **argv)
      * that printed a plan derived from a live cluster's moving geometry
      * would be worse than no plan.
      */
-    {
-        char where[4096];
+    /*
+     * LIVE when this host has the volume mounted: the grow is then
+     * published by the kernel (CETRAFS_IOC_GROW on the mount), which
+     * compare-and-swaps what the mounted nodes also swap and catches
+     * every node up through layout_gen. Peers being mounted is then
+     * expected rather than refused -- but only a host that has it
+     * mounted can grow it live: from anywhere else there is no kernel
+     * to publish through, and a plain write would race the nodes.
+     */
+    char live_where[4096] = {0};
+    const bool live = cetrafs_device_mounted(dev, live_where, sizeof(live_where)) != 0;
 
-        if (cetrafs_device_mounted(dev, where, sizeof(where)))
-            die_dev("%s is mounted on %s -- unmount it first (growing is offline in this build)", dev, where);
-    }
+    if (live)
+        printf("cetrafs growfs: %s is mounted on %s -- growing it live\n", dev, live_where);
     /* The device-side half: a dry run asks now (it claims nothing);
      * a real grow asks once its claim is down, below -- asked before
      * the claim, a node that mounted in between passed every check of
      * its own (there was no claim yet) and was never looked for again. */
-    if (dry_run)
+    if (dry_run && !live)
         growfs_refuse_live_peer(dev);
 
     int fd = open(dev, dry_run ? (O_RDONLY | O_CLOEXEC) : (O_RDWR | O_CLOEXEC));
@@ -739,8 +747,11 @@ int main(int argc, char **argv)
             cetrafs_sleep_full((unsigned) atoi(getenv("CETRAFS_TEST_REPAIR_HOLD_SECS")));
         /* Claim first, then look: a node mounting from here on sees the
          * claim and refuses, and one that got in before it is found
-         * here. The other order left the gap between them open. */
-        growfs_refuse_live_peer(dev);
+         * here. The other order left the gap between them open. A live
+         * grow expects mounted nodes; what the claim buys it is that no
+         * other grower or repairer works on the volume meanwhile. */
+        if (!live)
+            growfs_refuse_live_peer(dev);
     }
 
     /* ---------------------------------------------------------------
@@ -760,7 +771,8 @@ int main(int argc, char **argv)
 
             memset(&bh, 0, sizeof(bh));
             bh.bg_id = cetrafs_cpu_to_le32((u32) b);
-            bh.owner_zg = cetrafs_cpu_to_le16(0); /* fixed up by the ZG pass below */
+            /* Offline: fixed up by the ZG pass below. Live: the pool. */
+            bh.owner_zg = cetrafs_cpu_to_le16(live ? CETRAFS_BG_OWNER_FREE : 0);
             bh.flags = cetrafs_cpu_to_le16(0);
             bh.length_blocks = cetrafs_cpu_to_le64(bg_size);
             bh.off_data_bmap = cetrafs_cpu_to_le32(off_bmap32);
@@ -815,7 +827,16 @@ int main(int argc, char **argv)
      * are not at bg_table_start + b, and a loop that read them there
      * fetched the wrong blocks into a result nothing used (audit
      * 2026-11-06 L26). */
+    /* A live grow puts every new Block Group in the unowned POOL, and
+     * the kernel credits the pool shards when it publishes: a Zone
+     * Group's free aggregate is accrued in memory by whichever node
+     * owns it, so this tool must not write it under a mounted node.
+     * The capacity reaches nodes through the ordinary claim path. */
     for (u64 b = old_b; b < new_b; ++b) {
+        if (live) {
+            bg_owner[b] = CETRAFS_BG_OWNER_FREE;
+            continue;
+        }
         bg_owner[b] = (u32) (b % old_z);
         zg_added[bg_owner[b]]++;
     }
@@ -954,6 +975,9 @@ int main(int argc, char **argv)
      * from the first, not from here. */
     if (cetrafs_le64(sb.bg_table_next) == 0) {
         sb.bg_table_next = cetrafs_cpu_to_le64(seg_header_lba);
+    } else if (live) {
+        /* The kernel links it, by compare-and-swap, once it has checked
+         * everything this grow wrote (kmod/grow.c). */
     } else {
         /*
          * Second and later grows link from the TAIL segment, not from
@@ -1050,6 +1074,43 @@ int main(int argc, char **argv)
         growfs_release_claim(fd);
         close(fd);
         free(blk);
+        return 0;
+    }
+
+    if (live) {
+        /*
+         * The kernel publishes: it re-walks the layout this superblock
+         * describes -- the segment, every new descriptor, every overlap
+         * -- and only then credits the pool, links the segment and swaps
+         * block 0. It refuses rather than publishes anything it would
+         * not mount.
+         */
+        int dfd = open(live_where, O_RDONLY | O_DIRECTORY | O_CLOEXEC);
+
+        if (dfd < 0)
+            die_dev("open(%s): %s", live_where, strerror(errno));
+        if (ioctl(dfd, CETRAFS_IOC_GROW, &sb) < 0) {
+            int e = errno;
+
+            close(dfd);
+            growfs_release_claim(fd);
+            if (e == ESTALE)
+                die_dev("%s: the volume changed while this grow ran -- nothing was published; run it again", dev);
+            if (e == EOPNOTSUPP)
+                die_dev("%s: a node in the cluster cannot follow a live grow -- upgrade it, or grow offline", dev);
+            die_dev("%s: the kernel refused to publish the grow: %s -- see dmesg; nothing was published unless\n"
+                    "       it says the outcome is unknown",
+                    dev, strerror(e));
+        }
+        close(dfd);
+        free(zg_added);
+        growfs_release_claim(fd);
+        close(fd);
+        free(blk);
+        fprintf(stdout,
+                "cetrafs growfs: completed live (layout_gen %" PRIu64
+                "); every node picks up the new space on its next heartbeat\n",
+                cetrafs_le64(sb.layout_gen));
         return 0;
     }
 

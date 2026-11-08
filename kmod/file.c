@@ -2123,6 +2123,13 @@ static int cetrafs_leaf_array_convert(struct super_block *sb,
          * does not fit the volume is garbage whichever branch we take,
          * and splitting it would publish that garbage.
          */
+        /* Past the end THIS node knows of is first a question for the
+         * layout: a peer may have grown the volume and allocated there
+         * (cetrafs_sb_layout_refresh()). */
+        if (len && phys + len > total_blocks && cetrafs_sb_layout_refresh(sb) == 1) {
+            raw_sb = cetrafs_sb_raw(sb);
+            total_blocks = le64_to_cpu(raw_sb->total_blocks);
+        }
         if (len == 0 || (u64) eb + len > CETRAFS_MAX_FILE_BLOCKS || phys + len > total_blocks) {
             pr_err_ratelimited("extent [block %u +%u] at lba %llu does not fit the volume (%llu blocks) -- corrupt\n",
                                eb, len, (unsigned long long) phys, (unsigned long long) total_blocks);

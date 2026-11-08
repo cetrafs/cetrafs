@@ -113,7 +113,7 @@ MODULE_PARM_DESC(scrub_ignore_shadow,
 
 /* TEST ONLY: act on the verdict even though the Block Group has been
  * allocated from since the evidence was gathered -- the negative control
- * for cetrafs_sb_info.bg_alloc_seq. With it, a concurrent workload gets
+ * for cetrafs_bg_chunk.bg_alloc_seq. With it, a concurrent workload gets
  * blocks freed out from under files that were just given them.
  * tests/kernel/churn_oracle.sh is what measures the difference. */
 /* TEST ONLY: hold the scrub between its verdict (pass 2) and its frees,
@@ -577,17 +577,11 @@ static int scrub_collect_targets(struct super_block *sb, struct scrub_ctx *ctx)
      * Group.
      */
     {
-        const unsigned long *owned = NULL;
-        u32 nbg = 0, bgid;
+        u32 bgid;
 
-        cetrafs_sb_owned_bgs(sb, &owned, &nbg);
-        if (!owned)
-            nbg = 0;
-        for (bgid = 0; owned && bgid < nbg; bgid++) {
+        for (bgid = cetrafs_sb_next_owned_bg(sb, 0); bgid != U32_MAX;
+             bgid = cetrafs_sb_next_owned_bg(sb, bgid + 1)) {
             struct scrub_bg *b;
-
-            if (!test_bit(bgid, owned))
-                continue;
 
             if (n == cap) {
                 u32 ncap = cap ? cap * 2 : 16;

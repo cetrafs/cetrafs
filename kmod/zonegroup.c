@@ -2372,21 +2372,13 @@ int cetrafs_alloc_pick_run(struct super_block *sb, u64 count, u64 *out_lba)
  * cetrafs_alloc_data_run_resv(). */
 int cetrafs_alloc_pick_run_resv(struct super_block *sb, u64 count, u64 *out_lba, struct cetrafs_resv_span *span)
 {
-    const unsigned long *owned = NULL;
-    u32 nbg = 0, bgi;
-
-    cetrafs_sb_owned_bgs(sb, &owned, &nbg);
-    if (!owned)
-        return -ENOSPC;
+    u32 bgi;
 
     /* Flat over the Block Groups this node owns. The nested walk this
      * replaces visited the same set only while a Zone Group's members
      * were a contiguous range (docs/internal/BG-OWNERSHIP-DESIGN.md). */
-    for (bgi = 0; bgi < nbg; bgi++) {
+    for (bgi = cetrafs_sb_next_owned_bg(sb, 0); bgi != U32_MAX; bgi = cetrafs_sb_next_owned_bg(sb, bgi + 1)) {
         int ret;
-
-        if (!test_bit(bgi, owned))
-            continue;
 
         ret = cetrafs_alloc_data_run_resv(sb, bgi, count, out_lba, span);
         if (ret == 0)
@@ -2563,15 +2555,10 @@ retry_scan:
          * when it owned nothing, this skips unowned Block Groups a word
          * at a time. */
         {
-            const unsigned long *owned = NULL;
-            u32 nbg = 0, bg;
+            u32 bg;
 
-            cetrafs_sb_owned_bgs(sb, &owned, &nbg);
-            for (bg = 0; owned && bg < nbg; bg++) {
+            for (bg = cetrafs_sb_next_owned_bg(sb, 0); bg != U32_MAX; bg = cetrafs_sb_next_owned_bg(sb, bg + 1)) {
                 u64 total, free;
-
-                if (!test_bit(bg, owned))
-                    continue;
 
                 ret = cetrafs_bg_data_block_stats(sb, bg, &total, &free);
                 if (ret)

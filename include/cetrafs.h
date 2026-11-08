@@ -516,6 +516,16 @@ struct cetrafs_defrag_stats {
 #define CETRAFS_IOC_DEFRAG _IOR('C', 0x01, struct cetrafs_defrag_stats)
 
 /*
+ * Grow a MOUNTED volume: the superblock growfs.cetra would have written,
+ * issued on any directory of the mount. The new Block Groups and their
+ * table segment must already be on the device, past the published end;
+ * the kernel checks everything the superblock describes, then publishes
+ * it (kmod/grow.c). Needs CAP_SYS_ADMIN and the volume's repair claim
+ * held by the caller for the whole grow.
+ */
+#define CETRAFS_IOC_GROW _IOW('C', 0x02, cetrafs_superblock_t)
+
+/*
  * The userspace-driven whole-file exclusive lock is the standard flock(2)
  * interface (file_operations.flock, kmod/lock.c), not a custom ioctl --
  * flock(LOCK_EX)/flock(LOCK_UN) IS a whole-file advisory exclusive lock

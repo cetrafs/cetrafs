@@ -1346,19 +1346,24 @@ static bool cetrafs_bg_geom_sane(const cetrafs_superblock_t *raw_sb, u32 bg_id, 
            count <= (region - bmap) * CETRAFS_BLOCK_SIZE * 8;
 }
 
-static int cetrafs_read_bg_geom(struct super_block *sb, u32 bg_id, struct cetrafs_bg_geom *out)
+/*
+ * Read and check one descriptor against an EXPLICIT layout: the
+ * superblock copy it is judged by and the address it lives at. The
+ * mount and a live layout refresh call this with a layout that is not
+ * published yet -- the published one does not know these Block Groups
+ * -- and 'fresh' forces even the first read past the cache, since a
+ * refresh is the first look at blocks a peer has just written.
+ */
+static int cetrafs_read_bg_geom_at(struct super_block *sb, const cetrafs_superblock_t *raw_sb, u32 bg_id, u64 blk,
+                                   bool fresh, struct cetrafs_bg_geom *out)
 {
-    atomic64_inc(&cetrafs_bg_geom_reads);
-    const cetrafs_superblock_t *raw_sb = cetrafs_sb_raw(sb);
-    u64 blk;
     int attempt;
 
-    if (!raw_sb)
+    atomic64_inc(&cetrafs_bg_geom_reads);
+    if (!raw_sb || !blk)
         return -EINVAL;
     if (bg_id >= le32_to_cpu(raw_sb->block_group_count))
         return -EINVAL;
-
-    blk = cetrafs_sb_bg_desc_lba(sb, bg_id);
 
     for (attempt = 0; attempt < 5; attempt++) {
         const cetrafs_block_group_t *bg;
@@ -1368,7 +1373,7 @@ static int cetrafs_read_bg_geom(struct super_block *sb, u32 bg_id, struct cetraf
          * per-allocation hot path for a BG's own owner, whose cache is
          * authoritative); retries force a real re-read. */
         /* PERF(6): attempt 0 stays cached -- docs/PERFORMANCE.md */
-        if (attempt > 0)
+        if (attempt > 0 || fresh)
             cetrafs_invalidate_block(sb, blk);
 
         bh = cetrafs_bread_retry(sb, blk);
@@ -1418,6 +1423,17 @@ static int cetrafs_read_bg_geom(struct super_block *sb, u32 bg_id, struct cetraf
 
     pr_err("BG %u failed its descriptor checksum repeatedly -- corrupted, not just a torn concurrent read\n", bg_id);
     return -EUCLEAN;
+}
+
+static int cetrafs_read_bg_geom(struct super_block *sb, u32 bg_id, struct cetrafs_bg_geom *out)
+{
+    /* One snapshot for both: the copy the descriptor is judged by and
+     * the address map are the same published layout (fs.c). */
+    const cetrafs_superblock_t *raw_sb = cetrafs_sb_raw(sb);
+
+    if (!raw_sb || bg_id >= le32_to_cpu(raw_sb->block_group_count))
+        return -EINVAL;
+    return cetrafs_read_bg_geom_at(sb, raw_sb, bg_id, cetrafs_sb_bg_desc_lba(sb, bg_id), false, out);
 }
 
 /*
@@ -2641,7 +2657,7 @@ int cetrafs_data_block_is_allocated(struct super_block *sb, u64 lba, bool *out_s
  * stamp, fsync, sync_fs. Without it the reference reaches the device
  * while the allocation does not, and a node that dies in between leaves
  * blocks referenced by an inode but reading FREE to everyone, including
- * the allocator that hands them out next (see cetrafs_sb_info's
+ * the allocator that hands them out next (see cetrafs_bg_chunk's
  * bmap_alloc_dirty for the full account).
  *
  * Costs one bitmap write per BG allocated from since the last boundary,
@@ -3830,11 +3846,11 @@ int cetrafs_bg_claim_free(struct super_block *sb, u32 zg_id, u32 *out_bg_id)
     return -ENOSPC;
 }
 
-int cetrafs_bg_mount_info(struct super_block *sb, u32 bg_id, u64 *out_total, u32 *out_owner, u64 *out_start,
-                          u64 *out_len)
+int cetrafs_bg_mount_info(struct super_block *sb, const cetrafs_superblock_t *raw_sb, u32 bg_id, u64 desc_lba,
+                          bool fresh, u64 *out_total, u32 *out_owner, u64 *out_start, u64 *out_len)
 {
     struct cetrafs_bg_geom bg;
-    int ret = cetrafs_read_bg_geom(sb, bg_id, &bg);
+    int ret = cetrafs_read_bg_geom_at(sb, raw_sb, bg_id, desc_lba, fresh, &bg);
 
     if (ret)
         return ret;

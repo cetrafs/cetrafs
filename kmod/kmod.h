@@ -163,6 +163,7 @@ const cetrafs_superblock_t *cetrafs_sb_raw(struct super_block *sb);
  * not the whole volume, and fsck names them.
  */
 bool cetrafs_sb_lba_run_hits_bg_table(struct super_block *sb, u64 lba, u64 count);
+bool cetrafs_lba_run_past_end(struct super_block *sb, u64 lba, u64 count);
 static inline bool cetrafs_lba_run_is_data(struct super_block *sb, u64 lba, u64 count)
 {
     const cetrafs_superblock_t *raw_sb = cetrafs_sb_raw(sb);
@@ -178,10 +179,14 @@ static inline bool cetrafs_lba_run_is_data(struct super_block *sb, u64 lba, u64 
     if (data_end && data_end < hi)
         hi = data_end;
 
-    if (!count || count > hi)
+    if (!count || lba < lo)
         return false;
-    if (lba < lo || lba > hi - count)
-        return false;
+    /* Past the end this node knows of: refused only once the layout is
+     * known to be current -- a peer may have grown the volume and
+     * allocated in the new space before our heartbeat caught up. Off
+     * the per-block budget: a valid address never gets here. */
+    if (count > hi || lba > hi - count)
+        return cetrafs_lba_run_past_end(sb, lba, count);
     /* And the holes earlier grows left inside it, which hold the older
      * segments. */
     return !cetrafs_sb_lba_run_hits_bg_table(sb, lba, count);
@@ -365,7 +370,7 @@ bool cetrafs_resv_covers(struct super_block *sb, u64 lba);
  * stealing peer's fresh reconcile). See fs.c's bg_free_delta comment. */
 /* Un-durable data-bitmap allocations: marked by the allocator, drained
  * at every durability boundary BEFORE the reference is published. See
- * cetrafs_sb_info.bmap_alloc_dirty. */
+ * cetrafs_bg_chunk.bmap_alloc_dirty. */
 void cetrafs_sb_note_bmap_alloc(struct super_block *sb, u32 bg_id);
 bool cetrafs_sb_take_bmap_alloc_dirty(struct super_block *sb, u32 bg_id);
 int cetrafs_alloc_flush_bitmaps(struct super_block *sb);
@@ -774,8 +779,8 @@ static inline int cetrafs_free_data_block(struct super_block *sb, u64 lba)
 int cetrafs_apply_pending_free(struct super_block *sb, u64 lba, u32 count, u32 expect_zg);
 int cetrafs_count_free_inodes(struct super_block *sb, u64 *out_free);
 int cetrafs_bg_data_block_stats(struct super_block *sb, u32 bg_id, u64 *out_total, u64 *out_free);
-int cetrafs_bg_mount_info(struct super_block *sb, u32 bg_id, u64 *out_total, u32 *out_owner, u64 *out_start,
-                          u64 *out_len);
+int cetrafs_bg_mount_info(struct super_block *sb, const cetrafs_superblock_t *raw_sb, u32 bg_id, u64 desc_lba,
+                          bool fresh, u64 *out_total, u32 *out_owner, u64 *out_start, u64 *out_len);
 
 /* Which Zone Group owns this Block Group, from the owners recorded at
  * mount -- no device read. CETRAFS_NODE_ID_NONE if out of range.
@@ -800,7 +805,29 @@ void cetrafs_sb_undrain_bg(struct super_block *sb, u32 bg_id);
 /* Iterate every Block Group this node may allocate from. Flat: it does
  * not care which Zone Group each one belongs to, or whether a Zone
  * Group's members are contiguous. */
-void cetrafs_sb_owned_bgs(struct super_block *sb, const unsigned long **out_bits, u32 *out_nbits);
+u32 cetrafs_sb_next_owned_bg(struct super_block *sb, u32 from);
+/* Live grow: catch up with a grown superblock (fs.c). 1 = published a
+ * new layout, 0 = nothing to do, negative = kept the current one. */
+int cetrafs_sb_layout_refresh(struct super_block *sb);
+
+/* Live grow (grow.c, fs.c). The plan is filled in by fs.c's layout walk
+ * -- which checks everything the grow describes before anything is
+ * written -- and carried out by cetrafs_grow_commit(). */
+struct cetrafs_grow_plan {
+    const cetrafs_superblock_t *cur; /* the published superblock, as on the device */
+    const cetrafs_superblock_t *nw;  /* the one the grow publishes */
+    u32 old_count, new_count;        /* Block Groups before and after */
+    u64 new_seg_lba;                 /* the table segment the grow adds */
+    u64 tail_lba;                    /* the segment that links to it; 0 = the superblock does (first grow) */
+    u32 nshards;                     /* pool shards: one per Zone Group */
+    u64 *shard_credit;               /* capacity each shard gains */
+};
+int cetrafs_sb_layout_grow(struct super_block *sb, const cetrafs_superblock_t *nw);
+int cetrafs_grow_commit(struct super_block *sb, const struct cetrafs_grow_plan *plan);
+long cetrafs_grow_ioctl(struct file *file, const cetrafs_superblock_t __user *arg);
+u32 cetrafs_bgseg_crc(const cetrafs_bg_segment_t *seg);
+u64 cetrafs_layout_refresh_count(void);
+u64 cetrafs_layout_refresh_refused_count(void);
 /* Recompute a BG's cached free count from its bitmap and correct it
  *. *out_delta is (truth - cached), for the caller to fix
  * the owning ZG's aggregate with. Only meaningful at a moment when this
@@ -925,7 +952,7 @@ struct cetrafs_zg_info {
     u64 pool_free_blocks; /* capacity of unowned BGs sharded here */
     /* No member list: a Zone Group no longer describes which Block
      * Groups belong to it. Ask the Block Group -- cetrafs_sb_bg_owner()
-     * -- or walk cetrafs_sb_owned_bgs() for the ones this node may use.
+     * -- or walk cetrafs_sb_next_owned_bg() for the ones this node may use.
      * docs/internal/BG-OWNERSHIP-DESIGN.md */
 };
 int cetrafs_zg_get_info(struct super_block *sb, u32 zg_id, struct cetrafs_zg_info *out);

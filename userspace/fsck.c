@@ -2056,11 +2056,37 @@ int main(int argc, char **argv)
                 fprintf(stderr, "ERR: Block Group table chain does not terminate\n");
                 return 1;
             }
+            /*
+             * Every Block Group counted and still a link: the segment a
+             * grow LINKED but has not PUBLISHED. growfs writes the
+             * segment, then the old tail's next, then the superblock; a
+             * live grow is in exactly this state between its last two
+             * writes, and one that died there stays in it. It is not
+             * damage when the segment is what the next grow would have
+             * written -- intact, continuing the numbering where the
+             * count stops, the end of the chain, past the published end
+             * and on the device -- and
+             * the kernel mounts it on the same terms
+             * (cetrafs_layout_pending_link()). Anything else is.
+             */
+            if (filled == nbg && seg_lba >= cetrafs_le64(sb.total_blocks) && seg_lba < total_blocks) {
+                pread_all(fd, &seg, sizeof(seg), (off_t) seg_lba * CETRAFS_BLOCK_SIZE);
+                if (cetrafs_le32(seg.magic) == CETRAFS_BGSEG_MAGIC &&
+                    (uint32_t) cetrafs_le64(seg.checksum) == crc32c_struct(&seg, sizeof(seg),
+                                                                           offsetof(cetrafs_bg_segment_t, checksum),
+                                                                           sizeof(seg.checksum)) &&
+                    cetrafs_le32(seg.first_bg_id) == nbg && cetrafs_le32(seg.count) &&
+                    seg_lba + 1 + cetrafs_le32(seg.count) <= total_blocks && !cetrafs_le64(seg.next)) {
+                    printf("note: the Block Group table links a segment at %" PRIu64
+                           " for Block Groups %u.. the superblock does not count yet -- a grow in progress, or one\n"
+                           "      that was interrupted before it published (re-run growfs.cetra to finish it)\n",
+                           seg_lba, nbg);
+                    break;
+                }
+            }
             if (seg_lba >= total_blocks) {
                 fprintf(stderr, "ERR: Block Group table segment at %" PRIu64 " is past the end of the volume\n",
                         seg_lba);
-                if (filled == nbg)
-                    fprintf(stderr, "ERR: (a grow was interrupted before it published -- re-run growfs.cetra)\n");
                 return 1;
             }
             pread_all(fd, &seg, sizeof(seg), (off_t) seg_lba * CETRAFS_BLOCK_SIZE);
@@ -2097,8 +2123,6 @@ int main(int argc, char **argv)
                 fprintf(stderr, "ERR: Block Group table chain describes more than the %u Block Groups recorded "
                                 "(segment at %" PRIu64 " claims %u, %u left)\n",
                         nbg, seg_lba, cetrafs_le32(seg.count), nbg - filled);
-                if (cetrafs_le32(seg.first_bg_id) == nbg)
-                    fprintf(stderr, "ERR: (a grow was interrupted before it published -- re-run growfs.cetra)\n");
                 return 1;
             }
             if (seg_lba + 1 + cetrafs_le32(seg.count) > total_blocks) {

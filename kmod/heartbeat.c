@@ -290,6 +290,14 @@ static void cetrafs_heartbeat_maint(struct work_struct *work)
     if (cetrafs_sb_is_fenced(sb))
         return;
 
+    /* A grow somewhere in the cluster: catch up with the Block Groups
+     * it added. One forced read of block 0 per tick, compared and
+     * dropped when layout_gen has not moved -- never the BG table
+     * (PERFORMANCE.md rule 5); only an actual grow walks the new
+     * descriptors, once. Read-only mounts too: they read the new
+     * space as soon as a peer writes there. */
+    cetrafs_sb_layout_refresh(sb);
+
     /* Everything below WRITES to shared state: it claims and releases
      * Zone Groups, applies peers' queued frees to their bitmaps, and
      * replays dead peers' journals into their data regions. A read-only

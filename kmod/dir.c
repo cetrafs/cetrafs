@@ -70,6 +70,8 @@ static long cetrafs_dir_ioctl(struct file *file, unsigned int cmd, unsigned long
 {
     if (cmd == FS_IOC_SHUTDOWN)
         return cetrafs_shutdown_ioctl(file_inode(file)->i_sb, (u32 __user *) arg);
+    if (cmd == CETRAFS_IOC_GROW)
+        return cetrafs_grow_ioctl(file, (const cetrafs_superblock_t __user *) arg);
     return -ENOTTY;
 }
 

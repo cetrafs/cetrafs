@@ -2,7 +2,7 @@
 .PHONY: all clean mod endian-check
 
 obj-m += cetrafs.o
-cetrafs-objs := kmod.o fs.o caw.o dmpath.o nslock.o defrag.o ioutil.o inode.o dir.o file.o xattr.o alloc.o super_ops.o uuid.o node.o zonegroup.o lock.o heartbeat.o journal.o procfs.o scrub.o leafdefer.o
+cetrafs-objs := kmod.o fs.o caw.o dmpath.o nslock.o defrag.o ioutil.o inode.o dir.o file.o xattr.o alloc.o super_ops.o uuid.o node.o zonegroup.o lock.o heartbeat.o journal.o procfs.o scrub.o leafdefer.o grow.o
 ccflags-y := -I$(src)/../include
 
 # A warning is a build failure. This is a filesystem: the warnings that

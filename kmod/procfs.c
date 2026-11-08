@@ -130,6 +130,7 @@ static int cetrafs_proc_info_show(struct seq_file *m, void *v)
     seq_printf(m, "total_blocks: %llu\n", (unsigned long long) le64_to_cpu(raw_sb->total_blocks));
     seq_printf(m, "zone_group_count: %u\n", zg_count);
     seq_printf(m, "block_group_count: %u\n", bg_count);
+    seq_printf(m, "layout_gen: %llu\n", (unsigned long long) le64_to_cpu(raw_sb->layout_gen));
     seq_printf(m, "bg_size_blocks: %llu\n", (unsigned long long) le64_to_cpu(raw_sb->bg_size_blocks));
 
     seq_printf(m, "inodes_count: %u\n", le32_to_cpu(raw_sb->inodes_count));
@@ -255,6 +256,8 @@ static int cetrafs_proc_info_show(struct seq_file *m, void *v)
     seq_printf(m, "label_invalidations: %llu\n", cetrafs_label_invalidation_count());
     seq_printf(m, "ext_cache_stale_refused: %llu\n", cetrafs_ext_cache_stale_refused_count());
     seq_printf(m, "late_claims_cleared: %llu\n", cetrafs_late_claims_cleared_count());
+    seq_printf(m, "layout_refreshes: %llu\n", cetrafs_layout_refresh_count());
+    seq_printf(m, "layout_refresh_refused: %llu\n", cetrafs_layout_refresh_refused_count());
     seq_printf(m, "deferred_orphaned: %llu\n", cetrafs_deferred_orphaned_count());
     seq_printf(m, "deferred_adopted: %llu\n", cetrafs_deferred_adopted_count());
     /* Slots held by entries a failed write kept for replay. Nonzero is a
