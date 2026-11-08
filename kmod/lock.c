@@ -4173,6 +4173,195 @@ int cetrafs_lock_sweep_own_claims(struct super_block *sb, u32 my_node_id)
 }
 
 /*
+ * The late pass of the own-claim sweep (TODO.md F10, the non-format
+ * half).
+ *
+ * The mount-time sweep above clears every claim of the previous
+ * incarnation, but it cannot see one given back AFTER it passed: a peer
+ * that displaced this node's lock while it was down, then found the row
+ * re-attached and undid its steal (cetrafs_lock_undo_steal()), hands
+ * the lock to an incarnation that never opened the file. Nothing local
+ * holds it, so nothing local releases it, and the row is live, so no
+ * peer reclaims it -- the file is refused to writers until this node
+ * happens to open and close it. The give-back follows the steal by at
+ * most a fence and a replay, so one more pass well after that catches
+ * what the first could not.
+ *
+ * Unlike the mount sweep, files can be open here. A claim is cleared
+ * only on an inode instantiated and judged under its lock_mutex -- the
+ * mutex every open, close, flock, suspend and defrag pin takes to change
+ * these claims -- with nothing local using it at all. A busy mutex is
+ * local activity: skipped. Namespace locks are left alone (they belong
+ * to operations, which release them), and so are dead records (the
+ * orphan scrub's), and anything not a regular file.
+ */
+static bool cetrafs_lock_resweep_ignore_local; /* TEST ONLY: the control */
+cetrafs_test_param(lock_resweep_ignore_local, cetrafs_lock_resweep_ignore_local, bool, 0644);
+MODULE_PARM_DESC(lock_resweep_ignore_local, "TEST ONLY: the late own-claim sweep ignores local users");
+
+static atomic64_t cetrafs_late_claims_cleared = ATOMIC64_INIT(0);
+u64 cetrafs_late_claims_cleared_count(void)
+{
+    return (u64) atomic64_read(&cetrafs_late_claims_cleared);
+}
+
+struct cetrafs_late_claims_ctx {
+    u32 me;
+    u64 generation;
+};
+
+/* The file lock, presence and suspended-writer claims of 'me' -- not the
+ * namespace lock. */
+static int cetrafs_late_claims_mutate(void *image, unsigned int len, void *priv)
+{
+    struct cetrafs_late_claims_ctx *ctx = priv;
+    u64 bit = 1ULL << (ctx->me % CETRAFS_MAX_READER_NODES);
+    cetrafs_inode_t rec;
+    bool changed = false;
+
+    if (len < CETRAFS_INODE_NS_BYTES)
+        return -EINVAL;
+    memset(&rec, 0, sizeof(rec));
+    memcpy(&rec, image, CETRAFS_INODE_NS_BYTES);
+    if (cetrafs_inode_crc_ns(&rec) != (u32) cetrafs_le64(rec.ns_checksum))
+        return -EUCLEAN;
+    if (cetrafs_le64(rec.generation) != ctx->generation || cetrafs_le32(rec.nlink) == 0)
+        return -ESTALE;
+    if (cetrafs_le32(rec.lock_owner_node) == ctx->me && cetrafs_le32(rec.lock_mode) != CETRAFS_LOCK_NONE) {
+        rec.lock_owner_node = cetrafs_cpu_to_le32(CETRAFS_NODE_ID_NONE);
+        rec.lock_mode = cetrafs_cpu_to_le32(CETRAFS_LOCK_NONE);
+        changed = true;
+    }
+    if (cetrafs_le64(rec.read_open_nodes) & bit) {
+        rec.read_open_nodes = cetrafs_cpu_to_le64(cetrafs_le64(rec.read_open_nodes) & ~bit);
+        changed = true;
+    }
+    if (cetrafs_le64(rec.suspended_writer_nodes) & bit) {
+        rec.suspended_writer_nodes = cetrafs_cpu_to_le64(cetrafs_le64(rec.suspended_writer_nodes) & ~bit);
+        changed = true;
+    }
+    if (!changed)
+        return 1;
+    cetrafs_inode_stamp_crc_ns(&rec);
+    memcpy(image, &rec, CETRAFS_INODE_NS_BYTES);
+    return 0;
+}
+
+/* Nothing on this node uses the inode: no opener of any kind, no
+ * explicit lock, no defrag pin, no suspension, nothing a failed close
+ * still owes. Under lock_mutex. */
+static bool cetrafs_lock_locally_idle(struct cetrafs_inode_info *ci)
+{
+    if (cetrafs_lock_resweep_ignore_local)
+        return true; /* test-only, see the knob */
+    return atomic_read(&ci->lock_writer_count) == 0 && atomic_read(&ci->read_opener_count) == 0 &&
+           atomic_read(&ci->lock_local_open_count) == 0 && !ci->explicit_lock_file && !READ_ONCE(ci->defrag_pinned) &&
+           !READ_ONCE(ci->lock_suspended) && ci->close_owes_presence == 0 && !ci->close_owes_suspend_mark;
+}
+
+/* One record: true when this node's claims on it were cleared. */
+static int cetrafs_lock_resweep_one(struct super_block *sb, u64 ino, u32 me)
+{
+    struct cetrafs_late_claims_ctx ctx = {.me = me};
+    struct cetrafs_inode_info *ci;
+    struct inode *inode;
+    cetrafs_inode_t raw;
+    int ret;
+
+    inode = cetrafs_iget(sb, ino);
+    if (IS_ERR(inode))
+        return 0; /* gone, reborn or unreadable: nothing of ours to judge here */
+    if (!S_ISREG(inode->i_mode)) {
+        iput(inode);
+        return 0;
+    }
+    ci = CETRAFS_I(inode);
+    if (!mutex_trylock(&ci->lock_mutex)) {
+        iput(inode);
+        return 0; /* local activity: whatever it is settles its own claims */
+    }
+    ret = 0;
+    if (cetrafs_lock_locally_idle(ci)) {
+        cetrafs_invalidate_raw_inode(sb, ino);
+        if (cetrafs_read_raw_inode(sb, ino, &raw) == 0 &&
+            cetrafs_le64(raw.generation) == cetrafs_inode_get_generation(inode)) {
+            ctx.generation = cetrafs_le64(raw.generation);
+            ret = cetrafs_cas_record(sb, cetrafs_inode_lba(sb, ino), cetrafs_late_claims_mutate, &ctx);
+            if (ret == 0) {
+                pr_info("ino=%llu: cleared a claim of this node that nothing here holds (given back after the "
+                        "re-attach sweep)\n",
+                        (unsigned long long) ino);
+                atomic64_inc(&cetrafs_late_claims_cleared);
+                ret = 1;
+            } else if (ret == 1 || ret == -ESTALE) {
+                ret = 0;
+            }
+        }
+        /* The cached verdicts were about the claims just changed. */
+        cetrafs_lock_expire_verdicts(inode);
+    }
+    mutex_unlock(&ci->lock_mutex);
+    iput(inode);
+    return ret;
+}
+
+/* Walk the inode bitmap for records naming this node; 'stop' ends it
+ * early (unmount). Returns how many records were cleared, or <0. */
+int cetrafs_lock_resweep_own_claims(struct super_block *sb, u32 my_node_id, bool (*stop)(struct super_block *))
+{
+    const cetrafs_superblock_t *raw_sb = cetrafs_sb_raw(sb);
+    u64 bmap, nbmap, ninodes, blk;
+    u64 bit = 1ULL << (my_node_id % CETRAFS_MAX_READER_NODES);
+    int cleared = 0;
+
+    if (!raw_sb)
+        return -EINVAL;
+    bmap = le64_to_cpu(raw_sb->inode_bmap_start);
+    nbmap = le64_to_cpu(raw_sb->inode_bmap_blocks);
+    ninodes = le32_to_cpu(raw_sb->inodes_count);
+
+    for (blk = 0; blk < nbmap; blk++) {
+        struct buffer_head *bh = cetrafs_bread_retry(sb, bmap + blk);
+        u64 i;
+
+        if (!bh)
+            return -EIO;
+        for (i = 0; i < CETRAFS_BLOCK_SIZE * 8; i++) {
+            u64 ino = blk * CETRAFS_BLOCK_SIZE * 8 + i + 1;
+            cetrafs_inode_t raw;
+            int r;
+
+            if (ino > ninodes)
+                break;
+            if (!(i & 1023)) {
+                cond_resched();
+                if (stop(sb) || cetrafs_sb_is_fenced(sb) || sb_rdonly(sb)) {
+                    brelse(bh);
+                    return cleared;
+                }
+            }
+            if (!(bh->b_data[i >> 3] & (1 << (i & 7))))
+                continue;
+            /* A cheap look first: one record in thousands names us. */
+            cetrafs_invalidate_raw_inode(sb, ino);
+            if (cetrafs_read_raw_inode(sb, ino, &raw) != 0 || cetrafs_le32(raw.nlink) == 0)
+                continue;
+            if (!(cetrafs_le32(raw.lock_owner_node) == my_node_id && cetrafs_le32(raw.lock_mode) != CETRAFS_LOCK_NONE) &&
+                !(cetrafs_le64(raw.read_open_nodes) & bit) && !(cetrafs_le64(raw.suspended_writer_nodes) & bit))
+                continue;
+            r = cetrafs_lock_resweep_one(sb, ino, my_node_id);
+            if (r > 0)
+                cleared++;
+            else if (r < 0)
+                pr_warn("ino=%llu: a claim of this node could not be cleared by the late sweep: %d\n",
+                        (unsigned long long) ino, r);
+        }
+        brelse(bh);
+    }
+    return cleared;
+}
+
+/*
  * flock(fd, LOCK_UN) on a default mount: give this inode's automatic lock
  * back while keeping it open.
  *

@@ -254,6 +254,9 @@ static int cetrafs_proc_info_show(struct seq_file *m, void *v)
     seq_printf(m, "journal_writes: %llu\n", cetrafs_journal_write_count());
     seq_printf(m, "label_invalidations: %llu\n", cetrafs_label_invalidation_count());
     seq_printf(m, "ext_cache_stale_refused: %llu\n", cetrafs_ext_cache_stale_refused_count());
+    seq_printf(m, "late_claims_cleared: %llu\n", cetrafs_late_claims_cleared_count());
+    seq_printf(m, "deferred_orphaned: %llu\n", cetrafs_deferred_orphaned_count());
+    seq_printf(m, "deferred_adopted: %llu\n", cetrafs_deferred_adopted_count());
     /* Slots held by entries a failed write kept for replay. Nonzero is a
      * device that refused writes; at the slot count, journaled writes
      * fail until a rewrite of those blocks (or a remount) frees them. */

@@ -70,6 +70,23 @@ struct cetrafs_deferred {
  * the buffer is STILL LOCKED -- the caller writes it now instead, through
  * cetrafs_journal_write_block() with the same prev_crc.
  */
+/* Blocks handed to the orphan list by an eviction, and orphans an edit
+ * brought back to their inode's list (procfs). */
+static atomic64_t cetrafs_deferred_orphaned = ATOMIC64_INIT(0);
+static atomic64_t cetrafs_deferred_adopted = ATOMIC64_INIT(0);
+
+/* Is 'd' on 'head'? Under the xarray lock. Only for the adoption count:
+ * an inode's list is its own handful of blocks. */
+static bool cetrafs_deferred_on_list(struct cetrafs_deferred *d, struct list_head *head)
+{
+    struct cetrafs_deferred *e;
+
+    list_for_each_entry(e, head, node)
+        if (e == d)
+            return true;
+    return false;
+}
+
 int cetrafs_bh_defer_update(struct inode *inode, struct buffer_head *bh, u32 prev_crc)
 {
     struct xarray *xa = cetrafs_sb_deferred(inode->i_sb);
@@ -87,6 +104,19 @@ int cetrafs_bh_defer_update(struct inode *inode, struct buffer_head *bh, u32 pre
         xa_lock(xa);
         old = xa_load(xa, bh->b_blocknr);
         listed = old && old->bh == bh;
+        /* ...and listed on THIS inode's list. An entry its inode's
+         * eviction moved to the mount's orphans (a boundary that failed)
+         * is written only at sync_fs or unmount, so this edit would miss
+         * the reopened file's own fsync and close, and a split's shrunk
+         * source leaf would miss the batch its destination goes in
+         * (cetrafs_convert_source_durable()). Bring it home: unlist and
+         * settle find it through the xarray from either list. */
+        if (listed) {
+            if (old->ino != inode->i_ino || !cetrafs_deferred_on_list(old, cetrafs_inode_deferred(inode)))
+                atomic64_inc(&cetrafs_deferred_adopted);
+            list_move_tail(&old->node, cetrafs_inode_deferred(inode));
+            old->ino = inode->i_ino;
+        }
         xa_unlock(xa);
         if (!WARN_ON_ONCE(!listed)) {
             cetrafs_bh_end_update_deferred(bh);
@@ -306,6 +336,16 @@ static int cetrafs_deferred_collect(struct xarray *xa, struct list_head *head, s
     return 0;
 }
 
+u64 cetrafs_deferred_orphaned_count(void)
+{
+    return (u64) atomic64_read(&cetrafs_deferred_orphaned);
+}
+
+u64 cetrafs_deferred_adopted_count(void)
+{
+    return (u64) atomic64_read(&cetrafs_deferred_adopted);
+}
+
 /* An inode leaves the cache with blocks still held back (a boundary that
  * failed): they move to the mount's orphan list, which sync_fs and
  * unmount write. */
@@ -313,12 +353,18 @@ void cetrafs_deferred_evict(struct inode *inode)
 {
     struct xarray *xa = cetrafs_sb_deferred(inode->i_sb);
     struct list_head *orphans = cetrafs_sb_deferred_orphans(inode->i_sb);
+    struct cetrafs_deferred *d;
+    u64 n = 0;
 
     if (!xa || !orphans)
         return;
     xa_lock(xa);
+    list_for_each_entry(d, cetrafs_inode_deferred(inode), node)
+        n++;
     list_splice_tail_init(cetrafs_inode_deferred(inode), orphans);
     xa_unlock(xa);
+    if (n)
+        atomic64_add(n, &cetrafs_deferred_orphaned);
 }
 
 /* TEST ONLY: hold a batch between its target writes and the settle, so a
@@ -363,6 +409,15 @@ static int cetrafs_deferred_write_set(struct super_block *sb, struct buffer_head
     return ret;
 }
 
+/* TEST ONLY: an inode flush writes nothing and reports success, so its
+ * close lets the inode go with blocks still held back and an eviction
+ * orphans them (tests/kernel/deferred_orphan_adopted.sh). A failed flush
+ * cannot stage that: the close that failed pins the inode until a retry
+ * has flushed the tree. */
+static bool cetrafs_tree_flush_skip_all;
+cetrafs_test_param(tree_flush_skip_all, cetrafs_tree_flush_skip_all, bool, 0644);
+MODULE_PARM_DESC(tree_flush_skip_all, "TEST ONLY: extent-tree block flushes of an inode write nothing");
+
 /* TEST ONLY: the next inode flush fails as a device error would. */
 static bool cetrafs_tree_flush_fail_once;
 cetrafs_test_param(tree_flush_fail_once, cetrafs_tree_flush_fail_once, bool, 0644);
@@ -388,6 +443,8 @@ int cetrafs_deferred_flush_inode(struct inode *inode, bool mapping_locked)
         cetrafs_tree_flush_fail_once = false;
         return -EIO; /* test-only, see the knob */
     }
+    if (cetrafs_tree_flush_skip_all)
+        return 0; /* test-only, see the knob */
     if (!xa || xa_empty(xa))
         return 0;
     if (!mapping_locked)

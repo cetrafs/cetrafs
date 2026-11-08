@@ -3462,12 +3462,12 @@ static int cetrafs_tree_hold_back(struct inode *inode, struct buffer_head *bh, u
  * and within one chunk of it that is atomic: every entry is durable
  * before any target. Across chunks it is NOT -- chunk 1 is applied and
  * consumed before chunk 2's entries exist, a batch is chunked at 16
- * blocks or whenever slots are busy, and blocks go in LBA order, so the
- * destination can land a chunk ahead of this leaf. That is what this
- * call still prevents: everything held back so far, this leaf included,
- * goes NOW, before the moved piece is appended anywhere. Every block of
- * the inode goes with it -- a leaf may never reach the device ahead of
- * the index that ranges over it.
+ * blocks or whenever slots are busy, and blocks go in the order they were
+ * first held back, so the destination can land a chunk ahead of this
+ * leaf. That is what this call still prevents: everything held back so
+ * far, this leaf included, goes NOW, before the moved piece is appended
+ * anywhere. Every block of the inode goes with it -- a leaf may never
+ * reach the device ahead of the index that ranges over it.
  *
  * The cost is a whole batch (three cache flushes) per split of a FULL
  * leaf, and that is not rare: random writes into a fallocated file fill

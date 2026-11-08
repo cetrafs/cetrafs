@@ -350,7 +350,8 @@ scrub_interval_secs:scrub period (0 means the default)
 scrub_gap_secs:scrub pacing (0 means the default)
 node_uuid:load-time only (0444): this node identity
 pf_full_backoff_ms:pending-free queue backoff (latency)
-pf_drain_min_ms:pending-free drain rate limit (latency)'
+pf_drain_min_ms:pending-free drain rate limit (latency)
+own_claim_resweep_secs:delay of the late own-claim sweep; every clear is judged under the inode lock_mutex, 0 (off) leaves stray claims as they were'
 plain_params() { grep -hoE '^module_param(_named)?\([a-z_0-9]+' "$@" | sed -E 's/^module_param(_named)?\(//' | sort -u; }
 UNLISTED="$(plain_params "$K"/*.c | while read -r n; do grep -q "^$n:" <<<"$PLAIN_OK" || echo "$n"; done)"
 NPLAIN="$(plain_params "$K"/*.c | wc -l)"
@@ -707,7 +708,7 @@ spin_lines() { # <files...>: file:line:code for every line run with a spinlock h
     }' "$@"
 }
 SPIN_SLEEPERS_RE='\b(msleep|usleep_range|ssleep|mutex_lock[a-z_]*|down|down_[a-z_]+|wait_event[a-z_]*|wait_for_[a-z_]+|schedule[a-z_]*|cond_resched|lock_buffer|wait_on_buffer|[a-z_]*bread[a-z_]*|submit_bh|sync_dirty_buffer|iput|brelse|vmalloc|kvmalloc|copy_(to|from)_user|cancel_[a-z_]*_sync|flush_[a-z_]+|synchronize_[a-z_]+)\('
-SPIN_OK='cetrafs_ext_key_matches cetrafs_inode_deferred cetrafs_inode_fd_copy cetrafs_inode_wb_failed cetrafs_le16 cetrafs_le32 cetrafs_le64 cetrafs_pending_any cetrafs_sb_stale_secs'
+SPIN_OK='cetrafs_deferred_on_list cetrafs_ext_key_matches cetrafs_inode_deferred cetrafs_inode_fd_copy cetrafs_inode_wb_failed cetrafs_le16 cetrafs_le32 cetrafs_le64 cetrafs_pending_any cetrafs_sb_stale_secs'
 SL="$(spin_lines "$K"/*.c)"
 [ "$(wc -l <<<"$SL")" -gt 100 ] || fail "class 19 spinlock: setup -- only $(wc -l <<<"$SL") lines found under a spinlock (the scan no longer matches)"
 SPIN_BAD="$(grep -E "$SPIN_SLEEPERS_RE" <<<"$SL" | grep -vE 'GFP_ATOMIC|GFP_NOWAIT' | head -5 || true)"
@@ -1102,6 +1103,7 @@ dir.c:cetrafs_walk_dirents:target discovery; the locked re-check decides
 heartbeat.c:cetrafs_node_self_fence_check:pre-check; the renewal compares fence_epoch itself
 inode.c:cetrafs_sb_get_node_id:true branch skips a refresh; an error applies it, the default
 lock.c:cetrafs_node_is_stale:acts (reclaims a reader bit) only on success; an error counts the reader
+lock.c:cetrafs_read_raw_inode:acts (the late sweep clears claims) only on success; an error clears nothing
 node.c:cetrafs_node_is_stale:true branch skips a peer; an error counts it as live
 scrub.c:cetrafs_zg_scrub_adopt_one_stale:log only
 xattr.c:cetrafs_xattr_slot_free:returns bool, not an error

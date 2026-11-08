@@ -32,6 +32,8 @@
 
 /* Forward decls for exported symbols to silence -Wmissing-prototypes */
 int cetrafs_init_fs_context(struct fs_context *fc);
+static void cetrafs_sb_resweep_work(struct work_struct *w);
+static unsigned int cetrafs_own_claim_resweep_secs;
 void cetrafs_kill_sb(struct super_block *sb);
 void cetrafs_free_sb_info(struct super_block *sb);
 const cetrafs_superblock_t *cetrafs_sb_raw(struct super_block *sb);
@@ -275,6 +277,12 @@ struct cetrafs_sb_info {
     struct workqueue_struct *cold_wq;
     spinlock_t cold_lock;
     bool cold_closing;
+    /* The late pass of the own-claim sweep after an unclean re-attach
+     * (cetrafs_lock_resweep_own_claims()). On cold_wq and cancelled by
+     * cetrafs_sb_cold_close() with it: it igets and iputs inodes, so it
+     * must be gone before unmount's evict_inodes(), and a delayed work
+     * whose timer has not fired is not flushed by destroying the queue. */
+    struct delayed_work resweep_work;
     /* Reconciles that could not read their record, each holding its
      * inode reference, waiting for the heartbeat tick (under cold_lock).
      * cold_retry_mutex brackets a tick's pass, so close can wait out a
@@ -1485,6 +1493,7 @@ int cetrafs_fill_super(struct super_block *sb, struct fs_context *fc)
         spin_lock_init(&sbi->cold_lock);
         INIT_LIST_HEAD(&sbi->cold_parked);
         mutex_init(&sbi->cold_retry_mutex);
+        INIT_DELAYED_WORK(&sbi->resweep_work, cetrafs_sb_resweep_work);
         sbi->cold_wq = alloc_workqueue("cetrafs_cold", WQ_MEM_RECLAIM, 0);
         if (!sbi->cold_wq) {
             cetrafs_free_sb_info(sb);
@@ -2448,6 +2457,17 @@ int cetrafs_fill_super(struct super_block *sb, struct fs_context *fc)
      * bitmaps, so a remount mid-test keeps double-alloc detection armed
      * against pre-mount owners instead of restarting blind. */
     cetrafs_shadow_seed(sb);
+
+    /* Last, after every failure point: a re-attach after an unclean
+     * departure sweeps its claims once more, after any reclaim that
+     * displaced them has had time to give them back. */
+    if (cetrafs_sb_unclean_reattach(sb) && !sb_rdonly(sb) && cetrafs_own_claim_resweep_secs) {
+        spin_lock(&sbi->cold_lock);
+        if (!sbi->cold_closing)
+            queue_delayed_work(sbi->cold_wq, &sbi->resweep_work,
+                               (unsigned long) cetrafs_own_claim_resweep_secs * HZ);
+        spin_unlock(&sbi->cold_lock);
+    }
 
     brelse(bh);
     pr_info("mounted OK: Z=%u, B=%u, bg_size=%llu blocks, data@%llu, node_id=%u\n", sbi->zg_count, sbi->bg_count,
@@ -4033,6 +4053,34 @@ bool cetrafs_sb_caw_available(struct super_block *sb)
            CETRAFS_BLOCK_SIZE % sbi->caw.logical_block_size == 0;
 }
 
+/* Seconds after an unclean re-attach before the own-claim sweep runs a
+ * second time; 0 turns it off. Past the longest steal-to-give-back a
+ * peer's reclaim can take (a fence and a journal replay). */
+static unsigned int cetrafs_own_claim_resweep_secs = 600;
+module_param_named(own_claim_resweep_secs, cetrafs_own_claim_resweep_secs, uint, 0644);
+MODULE_PARM_DESC(own_claim_resweep_secs,
+                 "seconds after an unclean re-attach before this node's claims are swept again (0 = off, default 600)");
+
+static bool cetrafs_sb_resweep_stop(struct super_block *sb)
+{
+    struct cetrafs_sb_info *sbi = sb->s_fs_info;
+
+    return READ_ONCE(sbi->cold_closing);
+}
+
+static void cetrafs_sb_resweep_work(struct work_struct *w)
+{
+    struct cetrafs_sb_info *sbi = container_of(to_delayed_work(w), struct cetrafs_sb_info, resweep_work);
+    struct super_block *sb = sbi->sb;
+    int n;
+
+    n = cetrafs_lock_resweep_own_claims(sb, sbi->node_id, cetrafs_sb_resweep_stop);
+    if (n < 0)
+        pr_warn("the late sweep of this node's claims could not finish: %d\n", n);
+    else
+        pr_info("late sweep of this node's claims: %d cleared\n", n);
+}
+
 /* Queue an inode's cold-tree reconcile. False when it was not queued --
  * already pending, or the mount is closing -- and the caller then drops
  * the reference it took for the work. */
@@ -4066,6 +4114,10 @@ void cetrafs_sb_cold_close(struct super_block *sb)
     spin_lock(&sbi->cold_lock);
     sbi->cold_closing = true;
     spin_unlock(&sbi->cold_lock);
+    /* Nothing queues it after cold_closing (fill_super checks under
+     * cold_lock); a pass in progress sees cold_closing and stops early. */
+    if (sbi->cold_wq)
+        cancel_delayed_work_sync(&sbi->resweep_work);
     /* A tick's pass may hold entries it took off the park: let it finish
      * (its queueing is refused now, and it drops those references). Then
      * nothing can park again, and what is parked is ours to drop. */
