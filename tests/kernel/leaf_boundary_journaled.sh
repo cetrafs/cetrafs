@@ -49,7 +49,9 @@ LP="$(ct_helper leaf_poke)"
 IMG="$(ct_image 560 lbj)"
 DEV="$(ct_loop "$IMG")"
 MNT="$(ct_mnt lbj)"
-ct_mkfs_small "$DEV" >/dev/null
+# A journal: ct_mkfs_small makes none (-J 0), and the batch then writes
+# in place -- the unjournaled path this suite exists to rule out.
+ct_mkfs "$DEV" -z 1 -b 512 -J 4 -N 1024 -f >/dev/null
 ct_track mnt "$MNT"
 ct_mount "$DEV" "$MNT"
 require_cetrafs_mount "$MNT"
@@ -59,6 +61,12 @@ PROC="$(ct_procdir "$DEV")"
 ctr() { sed -n "s/^$1: //p" "$PROC/info"; }
 dev_blk() { dd if="$IMG" bs=4096 skip="$1" count=1 status=none | sha1sum | cut -c1-16; } # the device
 mem_blk() { dd if="$DEV" bs=4096 skip="$1" count=1 status=none | sha1sum | cut -c1-16; } # the cache
+
+# Setup: the journal is attached. A directory entry is always journaled.
+JW0="$(ctr journal_writes)"
+mkdir "$MNT/jprobe" && sync
+[ "$(ctr journal_writes)" -gt "$JW0" ] ||
+    { fail "setup: no journal write for a directory entry -- the volume has no journal"; ct_exit; }
 
 # Force the block device's writeback: what it can write, it writes now.
 EXP0="$(cat /proc/sys/vm/dirty_expire_centisecs)"
