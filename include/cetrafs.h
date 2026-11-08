@@ -962,7 +962,24 @@ typedef struct {
      * its cached, lockless table offsets. */
     __le32  caps;
 
-    u8   reserved[32];
+    /* Frees in flight. Truncate, punch, the defrag mover and xattr
+     * removal publish a record that drops blocks and only THEN free them
+     * (rule 21); in between the blocks are bitmap-set and named by
+     * nothing, which is the scrub's definition of a leak -- and when a
+     * peer owns them the frees are one queue CAS per extent, long enough
+     * for the owner's scrub to free them first and its drain to free them
+     * again later (audit 2026-11-06, N2 sweep finding A).
+     *
+     * So a node sets frees_inflight here, durably, before such a publish,
+     * and clears it on a heartbeat tick once none is left; frees_seq goes
+     * up each time it is set. A scrub abandons its cycle while any live
+     * row is set, or if any row's frees_seq moved during the cycle.
+     * Carved from the zero-filled reserved area like the fields above:
+     * 0/0 is a row that predates it or has never had a free in flight. */
+    __le32  frees_inflight;
+    __le32  frees_seq;
+
+    u8   reserved[24];
 } CETRA_PACKED cetrafs_node_entry_t; /* 128 bytes */
 
 /* cetrafs_node_entry_t.file_lock_mode values. */

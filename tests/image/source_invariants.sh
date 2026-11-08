@@ -1285,6 +1285,7 @@ node.c:cetrafs_node_file_lock_mode_conflict:the walk
 node.c:cetrafs_node_nocaw_peer_exists:the walk
 node.c:cetrafs_node_single_mounter_conflict:the walk
 node.c:cetrafs_node_seed_peer_watch:seeds the watch, decides nothing
+node.c:cetrafs_node_frees_snapshot:alive -> frees in flight, the scrub skips its cycle (keep)
 heartbeat.c:cetrafs_heartbeat_maint:alive -> leave its journal alone (keep)
 inode.c:cetrafs_write_vfs_inode:alive -> drop our own dirt (keep the record)
 journal.c:cetrafs_journal_claim_replay:alive -> leave the replay to it (keep)
@@ -1370,6 +1371,58 @@ SAMPLE="$(ct_tmp fsck-early).c"
 printf 'int main(void)\n{\n    if (repair_mode && !repair_blocked)\n        fix();\n    repair_block("late");\n}\n' >"$SAMPLE"
 [ "$(early_gates "$SAMPLE")" = "3" ] && pass "class 45: control -- a planted untagged early gate is found" ||
     fail "class 45: control -- a planted untagged early gate is not found"
+
+# Class 46 (judging the midpoint of a peer's multi-step operation). An
+# operation that publishes a record dropping blocks and only then frees
+# them leaves the blocks named by nothing and not yet free -- the scrub's
+# definition of a leak -- and when a peer owns them the frees are queue
+# CASes that can run past the scrub's gap: the owner freed them first and
+# its drain freed them again (audit 2026-11-06, N2 sweep finding A). Every
+# function that frees blocks either brackets the window with
+# cetrafs_frees_begin(), or is listed with what covers it instead.
+log "checking every block free is announced to the scrub or names what covers it (class 46)"
+FREE_OK='alloc.c:__cetrafs_free_data_extent:the primitive
+alloc.c:cetrafs_free_data_extent:the primitive
+alloc.c:cetrafs_free_data_extent_unless_reserved:the primitive (the scrub'"'"'s)
+file.c:cetrafs_free_fetched_extents:primitive -- evict'"'"'s, whose record names the blocks until forget_tree
+file.c:cetrafs_free_inline_extents:primitive
+file.c:cetrafs_free_leaf_array:primitive
+file.c:cetrafs_leaf_array_punch:primitive -- its do_free callers are checked
+file.c:cetrafs_leaf_array_trim:primitive -- its do_free callers are checked
+file.c:cetrafs_tree_free_meta:primitive -- its callers are checked
+defrag.c:cetrafs_defrag_commit:inside its only caller'"'"'s bracket (cetrafs_defrag_inode)
+super_ops.c:cetrafs_evict_inode:the claimed dead record names every block until forget_tree (H1)
+scrub.c:scrub_free_confirmed:the judge itself
+file.c:cetrafs_do_allocate:blocks never published, held in the reservation registry until given back (H2)
+file.c:__cetrafs_get_block:a block it allocated and never published
+file.c:cetrafs_tree_append:a leaf or index it allocated and never published
+file.c:cetrafs_tree_build:a tree it built and never published
+dir.c:cetrafs_mkdir_locked:a dirent block it allocated and never published
+lock.c:cetrafs_inode_set_reservation:a reservation run, never published
+lock.c:cetrafs_inode_drop_reservation:the unused rest of a reservation run, never published'
+free_callers() {
+    for f in "$@"; do
+        awk -v F="$(basename "$f")" '
+            /^[a-z_][a-z0-9_ *]*\(/ && !/;$/ { if (fn != "" && hit && !beg) print F ":" fn; fn = $0; sub(/\(.*/, "", fn); n = split(fn, a, " "); fn = a[n]; sub(/^\*+/, "", fn); hit = 0; beg = 0 }
+            /(cetrafs_free_data_block|cetrafs_free_data_extent|cetrafs_free_data_extent_unless_reserved|cetrafs_zg_queue_foreign_free|cetrafs_tree_free_meta|cetrafs_free_fetched_extents|cetrafs_free_leaf_array|cetrafs_free_inline_extents|cetrafs_leaf_array_trim|cetrafs_leaf_array_punch)\(/ && !/^[a-z_]/ && !/^[[:space:]]*\*/ && !/^[[:space:]]*\/\*/ { hit = 1 }
+            /cetrafs_frees_begin\(/ && !/^[a-z_]/ { beg = 1 }
+            END { if (fn != "" && hit && !beg) print F ":" fn }' "$f"
+    done | sort -u
+}
+FC="$(free_callers "$K"/*.c)"
+[ "$(grep -c . <<<"$FC")" -ge 15 ] || fail "class 46: found only $(grep -c . <<<"$FC") unbracketed freeing functions -- the scan is not seeing the tree"
+for b in __cetrafs_truncate_shrink cetrafs_defrag_inode cetrafs_xattr_set_locked cetrafs_fallocate; do
+    grep -q "cetrafs_frees_begin" <<<"$(awk "/^[a-z_].*[ *]$b\\(/,/^}/" "$K"/*.c)" ||
+        fail "class 46: $b no longer brackets its post-publish frees with cetrafs_frees_begin()"
+done
+UNF="$(while IFS= read -r l; do [ -n "$l" ] && ! grep -qF "$l:" <<<"$FREE_OK" && echo "$l"; done <<<"$FC" || true)"
+[ -z "$UNF" ] && pass "class 46: every function that frees blocks announces it or names what covers the window" ||
+    fail "class 46: frees with no cetrafs_frees_begin() and no stated cover (can a scrub judge the midpoint?): $(echo $UNF)"
+SAMPLE="$(ct_tmp free-sample).c"
+printf 'static int cetrafs_new_dropper(struct super_block *sb)\n{\n    publish(sb);\n    cetrafs_free_data_block(sb, 5);\n}\n' >"$SAMPLE"
+[ "$(free_callers "$SAMPLE")" = "$(basename "$SAMPLE"):cetrafs_new_dropper" ] &&
+    pass "class 46: control -- a planted unannounced free is found" ||
+    fail "class 46: control -- a planted unannounced free is not found"
 
 # The module must publish the filesystem alias get_fs_type() asks
 # modprobe for ("fs-<name>") when a mount names a type nothing has

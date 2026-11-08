@@ -864,6 +864,9 @@ int cetrafs_node_register(struct super_block *sb,
                           u8 out_uuid[CETRAFS_NODE_UUID_LEN]);
 int cetrafs_node_mark_offline(struct super_block *sb, u32 my_node_id);
 int cetrafs_node_renew_heartbeat(struct super_block *sb, u32 my_node_id);
+int cetrafs_node_set_frees(struct super_block *sb, u32 my_node_id, bool on);
+int cetrafs_node_frees_snapshot(struct super_block *sb, u32 my_node_id, bool self_from_row,
+                                u32 seqs[CETRAFS_MAX_READER_NODES], bool *busy);
 int cetrafs_node_is_stale(struct super_block *sb, u32 node_id, bool *out_stale);
 /* The fence lease -- see cetrafs_node_entry_t.fence_epoch. */
 int __must_check cetrafs_node_fence_peer(struct super_block *sb, u32 node_id, const char *what);
@@ -897,6 +900,15 @@ int cetrafs_alloc_data_run_resv(struct super_block *sb, u32 bg_id, u64 count, u6
                                 struct cetrafs_resv_span *span);
 int cetrafs_free_data_extent_unless_reserved(struct super_block *sb, u64 lba, u32 count, u64 resv_seq);
 u64 cetrafs_sb_resv_seq(struct super_block *sb);
+/* fs.c: frees in flight between a publish and its frees (cetrafs_frees_begin()). */
+struct cetrafs_frees_snap {
+    u64 local;
+    u32 seqs[CETRAFS_MAX_READER_NODES];
+};
+int cetrafs_frees_begin(struct super_block *sb);
+void cetrafs_frees_end(struct super_block *sb);
+void cetrafs_frees_heartbeat(struct super_block *sb);
+int cetrafs_frees_quiet(struct super_block *sb, struct cetrafs_frees_snap *snap, bool compare);
 struct cetrafs_zg_info {
     u32 owner_node_id; /* CETRAFS_NODE_ID_NONE if unclaimed */
     u64 free_data_blocks;
@@ -1101,6 +1113,7 @@ struct cetrafs_scrub; /* opaque; owned entirely by scrub.c */
 int cetrafs_scrub_start(struct super_block *sb, struct cetrafs_scrub **out_s);
 void cetrafs_scrub_stop(struct cetrafs_scrub *s);
 u64 cetrafs_scrub_reclaimed_count(void);
+u64 cetrafs_scrub_inflight_skip_count(void);
 u64 cetrafs_scrub_orphans_count(void);
 u64 cetrafs_scrub_cycle_count(void);
 u64 cetrafs_scrub_last_start_unix(void);

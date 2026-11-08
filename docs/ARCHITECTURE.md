@@ -208,6 +208,7 @@ and the inode lock fields store elsewhere.
 | fence_epoch | the node's lease: bumped by whoever reclaims this row's claims; the owner self-fences when it changes |
 | hb_interval_secs | this node's own tick rate, so a peer judges staleness against the rate the node actually beats at, not the observer's setting |
 | caps | `__le32` bitmask of node capabilities (e.g., `CETRAFS_NODE_CAP_LIVE_GROW`), set by the node at registration. Gates features that require understanding new on-disk structures or sematics; a 0.8.x node without the bit cannot mount during a live grow |
+| frees_inflight, frees_seq | set (and the seq bumped) before a publish that drops blocks the node then frees -- truncate, punch, a defrag step, xattr removal -- and cleared by its heartbeat once none is left; any node's scrub skips its cycle while a live row is set or a seq moved during it, since the dropped blocks are named by nothing until freed |
 
 `CETRAFS_NODE_ID_NONE` (`0xFFFF`) is the "no node" sentinel, capping real
 registrations at 0xFFFE rows — but the read-presence bitmask (below) caps a

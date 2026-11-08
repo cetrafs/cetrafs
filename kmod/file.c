@@ -4932,6 +4932,9 @@ MODULE_PARM_DESC(punch_pagecache_delay_ms, "TEST ONLY: pause inside punch betwee
 /* TEST ONLY: pause a punch or truncate just before (_pre) or just after
  * (_post) its last "is a peer using this file?" check before the
  * publish. tests/kernel/punch_peer_late.sh. */
+static unsigned int cetrafs_truncate_free_stall_ms;
+cetrafs_test_param(truncate_free_stall_ms, cetrafs_truncate_free_stall_ms, uint, 0644);
+MODULE_PARM_DESC(truncate_free_stall_ms, "TEST ONLY: pause a truncate between its publish and its frees");
 static unsigned int cetrafs_rebuild_stall_pre_ms, cetrafs_rebuild_stall_post_ms;
 cetrafs_test_param(rebuild_stall_pre_ms, cetrafs_rebuild_stall_pre_ms, uint, 0644);
 MODULE_PARM_DESC(rebuild_stall_pre_ms, "TEST ONLY: pause a punch/truncate before its pre-publish peer check");
@@ -5073,7 +5076,19 @@ static int __cetrafs_truncate_shrink(struct inode *inode, loff_t new_size)
 
     /* The injection stands IN PLACE OF the write: a record that never
      * reached the device. On failure, free the NEW tree we just built
-     * (the old one is still the durable truth) and bail. */
+     * (the old one is still the durable truth) and bail.
+     *
+     * From the publish until the frees below the dropped blocks are named
+     * by nothing and not yet free: announced first, so no scrub -- ours
+     * or the owning peer's -- takes them for leaked (cetrafs_frees_begin()). */
+    ret = cetrafs_frees_begin(sb);
+    if (ret) {
+        cetrafs_tree_free_meta(inode, &raw);
+        kvfree(new_flat);
+        kvfree(old_flat);
+        kfree(recs);
+        return ret;
+    }
     ret = cetrafs_rebuild_recheck(inode, "truncate");
     if (!ret) {
         u64 fd_seq;
@@ -5099,6 +5114,7 @@ static int __cetrafs_truncate_shrink(struct inode *inode, loff_t new_size)
         cetrafs_inode_fd_pub_unlock(inode);
     }
     if (ret) {
+        cetrafs_frees_end(sb);
         cetrafs_tree_free_meta(inode, &raw);
         kvfree(new_flat);
         kvfree(old_flat);
@@ -5128,6 +5144,8 @@ static int __cetrafs_truncate_shrink(struct inode *inode, loff_t new_size)
         if (keep <= U32_MAX)
             cetrafs_pending_clear(inode, (u32) keep, U32_MAX);
     }
+    if (cetrafs_truncate_free_stall_ms)
+        msleep(cetrafs_truncate_free_stall_ms); /* TEST ONLY: see the parameter */
 
     /*
      * Only now does anything go back to the allocator: the OLD
@@ -5149,6 +5167,7 @@ static int __cetrafs_truncate_shrink(struct inode *inode, loff_t new_size)
         cetrafs_tree_free_meta(inode, &old_raw);
         cetrafs_leaf_array_trim(sb, old_flat, old_n, new_block_count, &discard, /*do_free=*/true);
     }
+    cetrafs_frees_end(sb);
 
     kvfree(new_flat);
     kvfree(old_flat);
@@ -6024,6 +6043,14 @@ static long cetrafs_fallocate(struct file *file, int mode, loff_t offset, loff_t
     raw.blocks =
         cetrafs_cpu_to_le64((cetrafs_flat_data_blocks(new_flat, new_n) + meta_blocks) * (CETRAFS_BLOCK_SIZE / 512));
 
+    /* As truncate: announced before the publish, ended after the frees. */
+    ret = cetrafs_frees_begin(sb);
+    if (ret) {
+        cetrafs_tree_free_meta(inode, &raw);
+        kvfree(new_flat);
+        kvfree(old_flat);
+        goto out;
+    }
     ret = cetrafs_rebuild_recheck(inode, "punch");
     if (!ret) {
         u64 fd_seq;
@@ -6038,6 +6065,7 @@ static long cetrafs_fallocate(struct file *file, int mode, loff_t offset, loff_t
         cetrafs_inode_fd_pub_unlock(inode);
     }
     if (ret) {
+        cetrafs_frees_end(sb);
         cetrafs_tree_free_meta(inode, &raw);
         kvfree(new_flat);
         kvfree(old_flat);
@@ -6079,6 +6107,7 @@ static long cetrafs_fallocate(struct file *file, int mode, loff_t offset, loff_t
         if (fret)
             pr_err("punch: freeing the old blocks failed (%d) -- %u block(s) may have leaked\n", fret, freed);
     }
+    cetrafs_frees_end(sb);
     kvfree(new_flat);
     kvfree(old_flat);
     published = true;

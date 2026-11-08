@@ -214,6 +214,7 @@ static int cetrafs_proc_info_show(struct seq_file *m, void *v)
     seq_printf(m, "scrub_reclaimed: %llu\n", cetrafs_scrub_reclaimed_count());
     seq_printf(m, "scrub_orphan_inodes_reclaimed: %llu\n", cetrafs_scrub_orphans_count());
     seq_printf(m, "scrub_cycles: %llu\n", cetrafs_scrub_cycle_count());
+    seq_printf(m, "scrub_inflight_skips: %llu\n", cetrafs_scrub_inflight_skip_count());
     seq_printf(m, "scrub_last_run_unix: %llu\n", cetrafs_scrub_last_start_unix());
     seq_printf(m, "scrub_last_run_ms: %llu\n", cetrafs_scrub_last_duration_ms());
     /* Descriptor sweeps that LEFT this node's own BG descriptors cached

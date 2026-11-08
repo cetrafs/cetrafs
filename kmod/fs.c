@@ -723,6 +723,17 @@ struct cetrafs_sb_info {
      * defrag), so a scrub verdict taken before the release may not free
      * on it -- see cetrafs_sb_resv_seq(). */
     u64 resv_seq;
+
+    /* Frees in flight: operations between a publish that dropped blocks
+     * and the frees of those blocks (cetrafs_frees_begin()). The count
+     * and seq are what this node's own scrub asks; frees_row_flag is
+     * whether our registry row says so to everyone else's. All three
+     * under frees_mutex, which is held across the row CAS so a begin
+     * cannot be overtaken by the heartbeat's clear. */
+    struct mutex frees_mutex;
+    unsigned int frees_count;
+    bool frees_row_flag;
+    u64 frees_local_seq;
 };
 
 /* Mount-option state, carried on fc->fs_private from parse time to
@@ -1371,6 +1382,7 @@ int cetrafs_fill_super(struct super_block *sb, struct fs_context *fc)
         spin_lock_init(&sbi->prrel_lock);
         spin_lock_init(&sbi->rcrel_lock);
         mutex_init(&sbi->nsrel_mutex);
+        mutex_init(&sbi->frees_mutex);
         INIT_LIST_HEAD(&sbi->resv_list);
 
         spin_lock_init(&sbi->peer_lock);
@@ -3019,6 +3031,124 @@ u64 cetrafs_sb_resv_seq(struct super_block *sb)
     v = sbi->resv_seq;
     spin_unlock(&sbi->resv_list_lock);
     return v;
+}
+
+/*
+ * Frees in flight (cetrafs_node_entry_t.frees_inflight; audit 2026-11-06,
+ * N2 sweep finding A).
+ *
+ * cetrafs_frees_begin() goes BEFORE a publish that drops blocks this
+ * operation then frees, cetrafs_frees_end() after the last of those
+ * frees (or after deciding to leave them to the scrub). Between the two
+ * the blocks are named by nothing and not yet free, and the scrub -- this
+ * node's, and above all the owning peer's -- must not judge them leaked.
+ * The row flag is written durably before begin returns; a node that
+ * cannot write it (fenced, its row lost) must not publish at all, so the
+ * error goes back to the operation. The flag is cleared lazily, by the
+ * heartbeat, once nothing is in flight.
+ */
+int cetrafs_frees_begin(struct super_block *sb)
+{
+    struct cetrafs_sb_info *sbi = sb->s_fs_info;
+    int ret = 0;
+
+    if (!sbi)
+        return -EINVAL;
+    mutex_lock(&sbi->frees_mutex);
+    if (!sbi->frees_row_flag) {
+        ret = cetrafs_node_set_frees(sb, sbi->node_id, true);
+        if (ret) {
+            mutex_unlock(&sbi->frees_mutex);
+            pr_err_ratelimited("could not announce frees in flight in our registry row (%d) -- refusing the "
+                               "operation before its publish\n",
+                               ret);
+            return ret == -EPERM || ret == -EOWNERDEAD ? -EIO : ret;
+        }
+        sbi->frees_row_flag = true;
+    }
+    sbi->frees_count++;
+    sbi->frees_local_seq++;
+    mutex_unlock(&sbi->frees_mutex);
+    return 0;
+}
+
+void cetrafs_frees_end(struct super_block *sb)
+{
+    struct cetrafs_sb_info *sbi = sb->s_fs_info;
+
+    if (!sbi)
+        return;
+    mutex_lock(&sbi->frees_mutex);
+    if (!WARN_ON_ONCE(!sbi->frees_count))
+        sbi->frees_count--;
+    mutex_unlock(&sbi->frees_mutex);
+}
+
+/* Heartbeat tick: clear our row's flag once nothing is in flight. A
+ * failure leaves it set -- peers' scrubs keep waiting, which is safe. */
+void cetrafs_frees_heartbeat(struct super_block *sb)
+{
+    struct cetrafs_sb_info *sbi = sb->s_fs_info;
+
+    if (!sbi)
+        return;
+    mutex_lock(&sbi->frees_mutex);
+    if (!sbi->frees_count && sbi->frees_row_flag && !cetrafs_node_set_frees(sb, sbi->node_id, false))
+        sbi->frees_row_flag = false;
+    mutex_unlock(&sbi->frees_mutex);
+}
+
+/* TEST ONLY: the scrub ignores this node's in-memory count and reads its
+ * own registry row instead, as a PEER's scrub does -- so one node can
+ * show that the row alone keeps the blocks. */
+static bool cetrafs_scrub_ignore_local_frees;
+cetrafs_test_param(scrub_ignore_local_frees, cetrafs_scrub_ignore_local_frees, bool, 0644);
+MODULE_PARM_DESC(scrub_ignore_local_frees,
+                 "TEST ONLY: the scrub judges this node's frees in flight from its registry row only");
+
+/*
+ * The scrub's question, asked twice per cycle: before its deciding pass
+ * (compare=false, fills *snap) and again before it frees (compare=true).
+ * 0 when no node had frees in flight at either moment and no node began
+ * any in between; -EBUSY otherwise. Why both: an operation that
+ * published before pass 1 and has not finished freeing is in flight at
+ * the first look; one that publishes after the first look dropped blocks
+ * pass 1 still saw named, which are never candidates -- unless it also
+ * finishes before the second, which the seq catches. One that begins
+ * after the second look dropped blocks the deciding pass saw named.
+ */
+int cetrafs_frees_quiet(struct super_block *sb, struct cetrafs_frees_snap *snap, bool compare)
+{
+    struct cetrafs_sb_info *sbi = sb->s_fs_info;
+    bool self_row = READ_ONCE(cetrafs_scrub_ignore_local_frees);
+    u32 seqs[CETRAFS_MAX_READER_NODES];
+    bool busy = false;
+    u64 local;
+    int ret;
+
+    if (!sbi)
+        return -EINVAL;
+    mutex_lock(&sbi->frees_mutex);
+    if (sbi->frees_count && !self_row)
+        busy = true;
+    local = self_row ? 0 : sbi->frees_local_seq;
+    mutex_unlock(&sbi->frees_mutex);
+
+    {
+        bool rows_busy = false;
+
+        ret = cetrafs_node_frees_snapshot(sb, sbi->node_id, self_row, seqs, &rows_busy);
+        if (ret)
+            return ret;
+        busy |= rows_busy;
+    }
+    if (busy)
+        return -EBUSY;
+    if (compare)
+        return snap->local == local && !memcmp(snap->seqs, seqs, sizeof(seqs)) ? 0 : -EBUSY;
+    snap->local = local;
+    memcpy(snap->seqs, seqs, sizeof(seqs));
+    return 0;
 }
 
 bool cetrafs_resv_covers(struct super_block *sb, u64 lba)

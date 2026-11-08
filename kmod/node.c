@@ -296,6 +296,10 @@ static int cetrafs_node_reattach_mutate(void *image, unsigned int len, void *pri
     /* And re-advertise this build's capabilities: an upgraded module
      * re-attaching to its old row must publish what it now supports. */
     ne.caps = cetrafs_cpu_to_le32(ctx->caps);
+    /* No frees of ours are in flight: the incarnation that set the flag
+     * is gone, and so is anything it was going to free. frees_seq keeps
+     * counting, so a scrub that saw the old value still sees a change. */
+    ne.frees_inflight = 0;
 
     /* fence_epoch (and everything else) rides through untouched, and the
      * value reported back to the caller is the one in the image this swap
@@ -1033,6 +1037,107 @@ int cetrafs_node_renew_heartbeat(struct super_block *sb, u32 my_node_id)
     if (ctx.fenced)
         return -EPERM;
     return ret < 0 ? ret : 0;
+}
+
+/*
+ * Frees in flight (cetrafs_node_entry_t.frees_inflight): set or clear
+ * this node's flag in its own row. Same guards as a renewal -- our row,
+ * undamaged, and our lease: a fenced node must not announce anything.
+ */
+struct cetrafs_node_frees_ctx {
+    u64 expect_epoch;
+    u8 my_uuid[CETRAFS_NODE_UUID_LEN];
+    bool on;
+    bool fenced, lost;
+};
+
+static int cetrafs_node_frees_mutate(void *image, unsigned int len, void *priv)
+{
+    struct cetrafs_node_frees_ctx *ctx = priv;
+    cetrafs_node_entry_t ne;
+
+    memcpy(&ne, image, sizeof(ne));
+    if (cetrafs_le32(ne.state) != CETRAFS_NODE_STATE_REGISTERED ||
+        memcmp(ne.node_uuid, ctx->my_uuid, CETRAFS_NODE_UUID_LEN) != 0) {
+        ctx->lost = true;
+        return 1;
+    }
+    if (!cetrafs_node_image_ok(&ne))
+        return -EUCLEAN;
+    if (cetrafs_le64(ne.fence_epoch) != ctx->expect_epoch) {
+        ctx->fenced = true;
+        return 1;
+    }
+    if (ctx->on) {
+        ne.frees_inflight = cetrafs_cpu_to_le32(1);
+        ne.frees_seq = cetrafs_cpu_to_le32(cetrafs_le32(ne.frees_seq) + 1);
+    } else {
+        ne.frees_inflight = 0;
+    }
+    cetrafs_node_image_commit(image, len, &ne);
+    return 0;
+}
+
+int cetrafs_node_set_frees(struct super_block *sb, u32 my_node_id, bool on)
+{
+    struct cetrafs_node_frees_ctx ctx = {.expect_epoch = cetrafs_sb_get_fence_epoch(sb), .on = on};
+    int ret = cetrafs_sb_get_node_uuid(sb, ctx.my_uuid);
+
+    if (ret)
+        return ret;
+    ret = cetrafs_cas_record(sb, cetrafs_node_row_lba(sb, my_node_id), cetrafs_node_frees_mutate, &ctx);
+    if (ctx.lost)
+        return -EOWNERDEAD;
+    if (ctx.fenced)
+        return -EPERM;
+    return ret < 0 ? ret : 0;
+}
+
+/*
+ * The scrub's half: read every row fresh -- a stale read here says
+ * "quiet" about a peer that is not, which is the destructive direction
+ * (rule 6) -- and report each row's frees_seq and whether any LIVE row
+ * has frees in flight. Our own row counts only when 'self_from_row'
+ * (the caller otherwise asks our in-memory count, which is exact).
+ * A row judged alive is busy (class 44: the scrub then keeps).
+ */
+int cetrafs_node_frees_snapshot(struct super_block *sb, u32 my_node_id, bool self_from_row,
+                                u32 seqs[CETRAFS_MAX_READER_NODES], bool *busy)
+{
+    const cetrafs_superblock_t *raw_sb = cetrafs_sb_raw(sb);
+    u32 n, i;
+
+    if (!raw_sb)
+        return -EINVAL;
+    *busy = false;
+    n = min_t(u32, le32_to_cpu(raw_sb->node_table_count), CETRAFS_MAX_READER_NODES);
+    for (i = 0; i < CETRAFS_MAX_READER_NODES; i++)
+        seqs[i] = 0;
+    for (i = 0; i < n; i++) {
+        cetrafs_node_entry_t ne;
+        bool stale = false;
+        int ret = cetrafs_read_node_entry(sb, i, &ne);
+
+        if (ret)
+            return ret;
+        if (cetrafs_le32(ne.state) != CETRAFS_NODE_STATE_REGISTERED)
+            continue;
+        seqs[i] = cetrafs_le32(ne.frees_seq);
+        if (!cetrafs_le32(ne.frees_inflight) || (i == my_node_id && !self_from_row))
+            continue;
+        if (i != my_node_id) {
+            ret = cetrafs_node_is_stale(sb, i, &stale);
+            if (ret)
+                return ret;
+        }
+        if (!stale)
+            *busy = true;
+        /* A stale row's frees never land: its node stopped writing when
+         * its lease ran out, three intervals before any peer can judge
+         * it stale (cetrafs_sb_lease_renewed()). I/O it had already
+         * queued is the advisory fence's known residue. */
+    }
+    return 0;
 }
 
 /*

@@ -839,7 +839,15 @@ int cetrafs_defrag_inode(struct inode *inode, struct cetrafs_defrag_stats *out_s
                 suffix[0].ee_len = cetrafs_extent_pack_len(len - split_off, cetrafs_extent_is_uninit(whole.ee_len));
                 cetrafs_extent_phys_to_hilo(phys + split_off, &suffix[0].ee_start_hi, &suffix[0].ee_start_lo);
             }
-            ret = cetrafs_defrag_commit(inode, &raw, dst_base, step_end, nblocks, suffix, suffix_count);
+            /* The commit publishes the step and frees the old tree's
+             * meta; the old data blocks follow below. From the publish
+             * until those frees, announced (cetrafs_frees_begin()). */
+            ret = cetrafs_frees_begin(sb);
+            if (!ret) {
+                ret = cetrafs_defrag_commit(inode, &raw, dst_base, step_end, nblocks, suffix, suffix_count);
+                if (ret)
+                    cetrafs_frees_end(sb);
+            }
             if (split_off)
                 suffix[0] = whole;
             if (ret == -ENOTRECOVERABLE) {
@@ -920,6 +928,7 @@ int cetrafs_defrag_inode(struct inode *inode, struct cetrafs_defrag_stats *out_s
                 if (src != dst_base + b)
                     cetrafs_free_data_block(sb, src);
             }
+            cetrafs_frees_end(sb);
         }
 
         cetrafs_defrag_inode_unlock(inode);

@@ -461,14 +461,21 @@ static int cetrafs_xattr_set_locked(struct inode *inode, const char *name, const
          * publishing -- just give up the claim. */
         cetrafs_bh_abort_update(bh);
         brelse(bh);
+        /* Between the clear and the free the block is named by nothing
+         * and not yet free: announced first (cetrafs_frees_begin()). */
+        ret = cetrafs_frees_begin(sb);
+        if (ret)
+            return ret;
         {
             struct cetrafs_xattr_ns_update u = {.xattr_block = 0, .set_flag = false, .ctime = now};
 
             ret = cetrafs_inode_ns_cas(sb, inode->i_ino, cetrafs_le64(raw.generation), &raw,
                                        cetrafs_ns_apply_xattr, &u);
         }
-        if (ret)
+        if (ret) {
+            cetrafs_frees_end(sb);
             return ret;
+        }
         /* The free must not reach the device ahead of the clear that
          * stopped naming the block (rule 21; audit 2026-11-06 L2). A
          * refused flush leaks it to the scrub rather than freeing a
@@ -477,9 +484,11 @@ static int cetrafs_xattr_set_locked(struct inode *inode, const char *name, const
             pr_err("removexattr: ino=%llu: the device refused a cache flush -- leaving xattr block %llu allocated "
                    "for the scrub\n",
                    (unsigned long long) inode->i_ino, (unsigned long long) old_lba);
+            cetrafs_frees_end(sb);
             return 0;
         }
         cetrafs_free_data_block(sb, old_lba);
+        cetrafs_frees_end(sb);
         return 0;
     }
 

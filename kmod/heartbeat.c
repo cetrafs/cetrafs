@@ -313,6 +313,10 @@ static void cetrafs_heartbeat_maint(struct work_struct *work)
         return;
     }
 
+    /* Our row's frees-in-flight flag goes back down once nothing is in
+     * flight (cetrafs_frees_begin()); peers' scrubs wait while it is up. */
+    cetrafs_frees_heartbeat(sb);
+
     ret = cetrafs_zg_claim_unowned(sb, my_node_id, my_uuid, /*at_mount=*/false);
     if (ret)
         pr_warn("heartbeat: stale ZG reclaim pass failed: %d\n", ret);

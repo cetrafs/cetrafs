@@ -49,6 +49,17 @@
  *     anything that leaves a block bitmap-allocated for longer than one
  *     get_block() without committing an extent MUST appear there.
  *
+ *  4. FREES IN FLIGHT ARE EXEMPT. Truncate, punch, a defrag step and
+ *     xattr removal publish a record that drops blocks and free them
+ *     after (rule 21), and in between the blocks look exactly like
+ *     point 3's runs. When a peer owns them the frees are one queue CAS
+ *     per extent -- seconds to minutes for a fragmented image -- so a
+ *     cycle could free them first and the drain free them again. Each
+ *     such operation announces itself in its registry row first
+ *     (cetrafs_frees_begin()), and a cycle in which any live node had
+ *     frees in flight, or began some, frees nothing
+ *     (cetrafs_frees_quiet(); tests/kernel/scrub_spares_inflight_free.sh).
+ *
  * The reference set is built from ALLOCATED inodes only. cetrafs_free_
  * inode() leaves a freed record's extents in place, so a deleted file's
  * stale record still names the blocks its delete leaked; walking only
@@ -148,6 +159,16 @@ static atomic64_t cetrafs_scrub_cycles = ATOMIC64_INIT(0);
 u64 cetrafs_scrub_cycle_count(void)
 {
     return (u64) atomic64_read(&cetrafs_scrub_cycles);
+}
+
+/* Cycles that stopped before freeing anything because some node had
+ * frees in flight (cetrafs_frees_quiet()). A cycle that reclaims
+ * nothing for this reason is not one that looked and found nothing --
+ * the suites need to tell the two apart. */
+static atomic64_t cetrafs_scrub_inflight_skips = ATOMIC64_INIT(0);
+u64 cetrafs_scrub_inflight_skip_count(void)
+{
+    return (u64) atomic64_read(&cetrafs_scrub_inflight_skips);
 }
 
 /* When the last cycle STARTED (unix seconds, 0 = never since module
@@ -761,6 +782,7 @@ static void cetrafs_scrub_cycle(struct cetrafs_scrub *s)
 {
     struct super_block *sb = s->sb;
     struct scrub_ctx ctx = {0};
+    struct cetrafs_frees_snap frees;
     u64 freed = 0;
     u32 i, gap;
     int ret;
@@ -816,6 +838,17 @@ static void cetrafs_scrub_cycle(struct cetrafs_scrub *s)
         ctx.bgs[i].resv_seq = cetrafs_sb_resv_seq(sb);
     }
 
+    /* Frees in flight anywhere (cetrafs_frees_quiet()): a block an
+     * operation has published away and not yet freed -- here, or as a
+     * queue append still to come from a peer -- reads leaked to both
+     * passes, and freeing it means it is freed twice. Asked again just
+     * before the frees. */
+    if (cetrafs_frees_quiet(sb, &frees, false)) {
+        pr_debug("scrub: frees in flight on some node -- skipping this cycle\n");
+        atomic64_inc(&cetrafs_scrub_inflight_skips);
+        goto done;
+    }
+
     /* Pass 2: rebuild the reference set FRESH, confirm, free. This is
      * the verdict that frees blocks, so it may not rest on a cached view
      * of a table other nodes write. */
@@ -828,6 +861,11 @@ static void cetrafs_scrub_cycle(struct cetrafs_scrub *s)
         for (ms = 0; ms < cetrafs_scrub_verdict_stall_ms && !READ_ONCE(s->draining); ms += 100)
             msleep(100);
         pr_info("scrub: verdict released (test)\n");
+    }
+    if (cetrafs_frees_quiet(sb, &frees, true)) {
+        pr_debug("scrub: frees began or were in flight during the verdict -- skipping this cycle\n");
+        atomic64_inc(&cetrafs_scrub_inflight_skips);
+        goto done;
     }
     for (i = 0; i < ctx.nbgs && !READ_ONCE(s->draining); i++)
         if (scrub_free_confirmed(s, &ctx.bgs[i], &freed) != 0)
