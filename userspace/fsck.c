@@ -1095,6 +1095,7 @@ static uint64_t fsck_lost_found(int fd,
 #ifndef FSCK_SET
 #define FSCK_SET(bm, i) ((bm)[(i) / 8] |= (uint8_t) (1u << ((i) % 8)))
 #define FSCK_GET(bm, i) (((bm)[(i) / 8] >> ((i) % 8)) & 1u)
+#define FSCK_CLR(bm, i) ((bm)[(i) / 8] &= (uint8_t) ~(1u << ((i) % 8)))
 #endif
 
 /* Context for fsck_mark_run(): the content pass's reachability bitmaps,
@@ -1325,6 +1326,188 @@ static int fsck_check_tail(const uint8_t *blk, uint32_t magic)
         return -1;
     }
     return 0;
+}
+
+/*
+ * Salvage of a torn regular-file extent leaf (crash review 2026-11-08, C1).
+ *
+ * A crash can no longer tear one -- every leaf write is a journal target
+ * and replay redoes it -- but media damage can, and a leaf that fails its
+ * tail took the whole file with it: every read of its range -EIO, and
+ * repair refused because its blocks could not be told from leaked ones.
+ *
+ * A leaf is a candidate when it is still a leaf (its tail magic and its
+ * extent header magic are intact: a block reused as something else is
+ * not salvaged, it is reported). Its entries are each judged on their
+ * own, after the namespace pass, and kept only when ALL of these hold:
+ *   - the run lies in one data region;
+ *   - every block's bit is set and nothing else names it (the deferred
+ *     leak set: the same evidence the leak clear acts on, so a kept
+ *     block is one the clear would otherwise have freed);
+ *   - the logical range is inside the range the index advertises, and
+ *     overlaps neither the file's other extents nor an entry kept before;
+ *   - the entry lies inside one 512-byte sector (one that crosses a
+ *     boundary can be half of each of two images, every field plausible).
+ * Anything else becomes a hole. A wrong keep can at worst hand the file
+ * a block nobody owns; it can never share one. The salvage runs only
+ * when nothing blocked repair -- an unreplayed journal entry included,
+ * so a leaf a mount would redo is never touched.
+ */
+struct fsck_salvage {
+    uint64_t ino, lba, rlo, rhi;
+    struct fsck_lrun *lruns; /* the file's other logical runs */
+    size_t nlruns;
+    int has_lruns;
+};
+static struct fsck_salvage *fsck_salv;
+static size_t fsck_nsalv, fsck_salv_cap;
+
+static int fsck_leaf_salvageable(const uint8_t *blk)
+{
+    const cetrafs_blk_tail_t *t = (const cetrafs_blk_tail_t *) (blk + CETRAFS_BLK_TAIL_OFF);
+    const cetrafs_extent_hdr_t *h = (const cetrafs_extent_hdr_t *) blk;
+
+    return cetrafs_le32(t->magic) == CETRAFS_LEAF_TAIL_MAGIC && cetrafs_le16(h->eh_magic) == CETRAFS_EXT_MAGIC;
+}
+
+/* Only with -r, only a live regular file, only a block still a leaf. */
+static int fsck_salvage_candidate(const cetrafs_inode_t *in, const uint8_t *blk)
+{
+    return repair_mode && !fsck_dead_walk && in->nlink && (cetrafs_le32(in->mode) & 0170000u) == 0100000u &&
+           fsck_leaf_salvageable(blk);
+}
+
+static void fsck_salvage_note(uint64_t ino, uint64_t lba, uint64_t rlo, uint64_t rhi)
+{
+    if (fsck_nsalv == fsck_salv_cap) {
+        fsck_salv_cap = fsck_salv_cap ? fsck_salv_cap * 2 : 8;
+        fsck_salv = (struct fsck_salvage *) realloc(fsck_salv, fsck_salv_cap * sizeof(*fsck_salv));
+        if (!fsck_salv) {
+            perror("realloc");
+            exit(FSCK_EXIT_NOEXAM);
+        }
+    }
+    fsck_salv[fsck_nsalv++] = (struct fsck_salvage) {ino, lba, rlo, rhi, NULL, 0, 0};
+}
+
+/* At the end of an inode's walk: its candidates learn its other runs. */
+static void fsck_salvage_attach_lruns(uint64_t ino)
+{
+    for (size_t s = 0; s < fsck_nsalv; s++) {
+        if (fsck_salv[s].ino != ino || fsck_salv[s].has_lruns)
+            continue;
+        fsck_salv[s].has_lruns = 1;
+        if (!fsck_nlruns)
+            continue;
+        fsck_salv[s].lruns = (struct fsck_lrun *) malloc(fsck_nlruns * sizeof(*fsck_lruns));
+        if (!fsck_salv[s].lruns) {
+            perror("malloc");
+            exit(FSCK_EXIT_NOEXAM);
+        }
+        memcpy(fsck_salv[s].lruns, fsck_lruns, fsck_nlruns * sizeof(*fsck_lruns));
+        fsck_salv[s].nlruns = fsck_nlruns;
+    }
+}
+
+static int fsck_lrange_overlaps(const struct fsck_lrun *r, size_t n, uint64_t lo, uint64_t hi)
+{
+    for (size_t i = 0; i < n; i++)
+        if (lo < r[i].hi && r[i].lo < hi)
+            return 1;
+    return 0;
+}
+
+/* Returns the number of leaves rewritten. 'leakd' loses the blocks kept. */
+static uint64_t fsck_salvage_leaves(int fd, const uint64_t *bg_start, const uint64_t *bg_cnt, uint32_t nbg,
+                                    uint8_t *leakd, uint64_t *leak_deferred)
+{
+    uint64_t rewritten = 0;
+
+    for (size_t s = 0; s < fsck_nsalv; s++) {
+        struct fsck_salvage *c = &fsck_salv[s];
+        uint8_t blk[CETRAFS_BLOCK_SIZE];
+        cetrafs_extent_hdr_t *h = (cetrafs_extent_hdr_t *) blk;
+        cetrafs_extent_t *arr = (cetrafs_extent_t *) (blk + sizeof(*h));
+        cetrafs_extent_t kept[CETRAFS_EXT_BLOCK_MAX_LEAVES];
+        struct fsck_lrun kr[CETRAFS_EXT_BLOCK_MAX_LEAVES];
+        cetrafs_blk_tail_t tail;
+        uint32_t n, nk = 0;
+        uint64_t holes = 0;
+
+        pread_all(fd, blk, sizeof(blk), (off_t) c->lba * CETRAFS_BLOCK_SIZE);
+        if (!fsck_leaf_salvageable(blk) || fsck_check_tail(blk, CETRAFS_LEAF_TAIL_MAGIC) == 0)
+            continue; /* changed since the walk: nothing else writes offline, so never expected */
+        n = cetrafs_le16(h->eh_entries) > CETRAFS_EXT_BLOCK_MAX_LEAVES ? CETRAFS_EXT_BLOCK_MAX_LEAVES
+                                                                       : cetrafs_le16(h->eh_entries);
+        for (uint32_t e = 0; e < n; e++) {
+            const cetrafs_extent_t *x = &arr[e];
+            uint64_t phys = ((uint64_t) cetrafs_le16(x->ee_start_hi) << 32) | cetrafs_le32(x->ee_start_lo);
+            uint64_t len = cetrafs_le32(x->ee_len) & CETRAFS_EXT_LEN_MASK;
+            uint64_t eb = cetrafs_le32(x->ee_block), base = 0, idx0;
+            /* An entry that crosses a 512-byte sector boundary can be
+             * half one image and half another -- a tear, or one damaged
+             * sector -- and each half looks valid: a logical block from
+             * one sector and a physical run from the next made the
+             * salvaged file read block 188's bytes at offset 0. Every
+             * other entry lies in one sector, so it is wholly old or
+             * wholly new, and a real extent either way. */
+            size_t off = sizeof(*h) + (size_t) e * sizeof(*x);
+            int straddles = off / 512 != (off + sizeof(*x) - 1) / 512;
+            int ok = !straddles && len && eb + len <= CETRAFS_MAX_FILE_BLOCKS &&
+                     (!c->rhi || (eb >= c->rlo && eb + len <= c->rhi));
+            int b = ok ? fsck_run_bg(bg_start, bg_cnt, nbg, phys, len, &base) : -1;
+
+            if (b >= 0) {
+                idx0 = base + (phys - bg_start[b]);
+                for (uint64_t k = 0; k < len && ok; k++)
+                    ok = FSCK_GET(leakd, idx0 + k) != 0;
+            } else {
+                ok = 0;
+            }
+            if (ok && (fsck_lrange_overlaps(c->lruns, c->nlruns, eb, eb + len) ||
+                       fsck_lrange_overlaps(kr, nk, eb, eb + len)))
+                ok = 0;
+            if (!ok) {
+                if (len && len <= CETRAFS_MAX_FILE_BLOCKS)
+                    holes += len;
+                continue;
+            }
+            for (uint64_t k = 0; k < len; k++)
+                FSCK_CLR(leakd, idx0 + k);
+            *leak_deferred -= len;
+            kept[nk] = *x;
+            kr[nk].lo = eb;
+            kr[nk].hi = eb + len;
+            nk++;
+        }
+
+        memset(blk + sizeof(*h), 0, CETRAFS_BLK_TAIL_OFF - sizeof(*h));
+        memcpy(arr, kept, nk * sizeof(*kept));
+        h->eh_entries = cetrafs_cpu_to_le16((uint16_t) nk);
+        tail.magic = cetrafs_cpu_to_le32(CETRAFS_LEAF_TAIL_MAGIC);
+        tail.crc = cetrafs_cpu_to_le32(crc32c_update(0, blk, CETRAFS_BLK_TAIL_OFF));
+        memcpy(blk + CETRAFS_BLK_TAIL_OFF, &tail, sizeof(tail));
+        if (fsck_check_tail(blk, CETRAFS_LEAF_TAIL_MAGIC) != 0) {
+            fprintf(stderr, "ERR: inode %" PRIu64 "'s salvaged leaf (block %" PRIu64 ") would not verify -- left as is\n",
+                    c->ino, c->lba);
+            continue;
+        }
+        pwrite_all(fd, blk, sizeof(blk), (off_t) c->lba * CETRAFS_BLOCK_SIZE);
+        rewritten++;
+        printf("  salvaged inode %" PRIu64 "'s extent leaf (block %" PRIu64 "): kept %u of %u extent(s); %" PRIu64
+               " logical block(s) of it now read as holes\n",
+               c->ino, c->lba, nk, n, holes);
+    }
+    return rewritten;
+}
+
+static void fsck_salvage_free(void)
+{
+    for (size_t s = 0; s < fsck_nsalv; s++)
+        free(fsck_salv[s].lruns);
+    free(fsck_salv);
+    fsck_salv = NULL;
+    fsck_nsalv = fsck_salv_cap = 0;
 }
 
 int main(int argc, char **argv)
@@ -2947,9 +3130,20 @@ int main(int argc, char **argv)
                     fprintf(stderr, "%s: inode %" PRIu64 "'s extent leaf (block %" PRIu64 ") failed its tail checksum\n",
                             FSCK_SEV, ino, leaf_lba);
                     problems += !fsck_dead_walk;
-                    repair_block("an extent leaf failed its tail checksum, so the blocks the inode "
-                                 "owns cannot be distinguished from leaked ones");
-                    tree_ok = 0;
+                    if (fsck_salvage_candidate(&in, leafblk)) {
+                        uint64_t rlo = 0, rhi = 0;
+
+                        if (cetrafs_le32(in.et.idx[0].ei_block_end)) {
+                            rlo = cetrafs_le32(in.et.idx[0].ei_block);
+                            rhi = cetrafs_le32(in.et.idx[0].ei_block_end);
+                        }
+                        fsck_salvage_note(ino, leaf_lba, rlo, rhi);
+                        fsck_mark_run(&rc, leaf_lba, 1, ino); /* the leaf block itself */
+                    } else {
+                        repair_block("an extent leaf failed its tail checksum, so the blocks the inode "
+                                     "owns cannot be distinguished from leaked ones");
+                        tree_ok = 0;
+                    }
                 } else {
                     lh = (cetrafs_extent_hdr_t *) leafblk;
                     n = cetrafs_le16(lh->eh_entries) > CETRAFS_EXT_BLOCK_MAX_LEAVES ? CETRAFS_EXT_BLOCK_MAX_LEAVES : cetrafs_le16(lh->eh_entries);
@@ -3055,6 +3249,14 @@ int main(int argc, char **argv)
                                     ") failed its tail checksum\n",
                                     FSCK_SEV, ino, llba);
                             problems += !fsck_dead_walk;
+                            if (fsck_salvage_candidate(&in, leafblk)) {
+                                /* Salvaged after the namespace pass; the
+                                 * rest of the tree is still walked, or
+                                 * its blocks would read as leaked. */
+                                fsck_salvage_note(ino, llba, rlo, rhi);
+                                fsck_mark_run(&rc, llba, 1, ino);
+                                continue;
+                            }
                             repair_block("an extent leaf failed its tail checksum, so the blocks the inode "
                                          "owns cannot be distinguished from leaked ones");
                             tree_ok = 0;
@@ -3078,6 +3280,7 @@ int main(int argc, char **argv)
             if (!tree_ok)
                 continue; /* a bad tail already reported; its blocks look leaked, repair refused */
             problems += fsck_lruns_overlap(ino) && !fsck_dead_walk;
+            fsck_salvage_attach_lruns(ino);
 
             /* The xattr block is a referenced data block too (all depths).
              * Verify its tail; counted referenced even with a bad tail --
@@ -4201,6 +4404,19 @@ int main(int argc, char **argv)
         printf("  namespace: %" PRIu64 " directory entries across the tree\n", dirents_seen);
         /* The leaked blocks the content pass set aside, now that the
          * namespace has been walked and nothing in it stopped repair. */
+        /* Torn leaves of live files, now that nothing else can claim
+         * their blocks (see fsck_salvage_leaves()). Before the leak
+         * clear: a kept block leaves the leak set. */
+        if (fsck_nsalv && (repair_blocked || fsck_dead_unwalkable)) {
+            fprintf(stderr, "NOTE: %zu torn extent leaf/leaves not salvaged: %s\n", fsck_nsalv,
+                    repair_blocked ? "another fault blocks repair (see above)" : "a deleted record could not be walked");
+        } else if (fsck_nsalv) {
+            uint64_t nsalv = fsck_salvage_leaves(fd, bg_data_start, bg_data_cnt, cetrafs_le32(sb.block_group_count),
+                                                 leakd, &leak_deferred);
+
+            repairs_made += nsalv;
+        }
+        fsck_salvage_free();
         if (leak_deferred && repair_blocked) {
             fprintf(stderr, "NOTE: %" PRIu64 " leaked block(s) not cleared: the namespace pass found a fault "
                             "that makes them indistinguishable from a live file's\n",
