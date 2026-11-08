@@ -15,8 +15,9 @@
 # killed; it must be gone long before the punch lets go.
 #
 # DISCRIMINATION: the setup check requires the store to be blocked (D)
-# behind the held lock before the kill. The reverted-fix control
-# (filemap_invalidate_lock() restored in page_mkwrite) has not been run.
+# behind the held lock before the kill. With filemap_invalidate_lock()
+# restored in page_mkwrite the store outlives its SIGKILL until the
+# punch lets go (run 2026-11-08: killed after 5.7 s).
 set -euo pipefail
 . "$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)/lib/harness.sh"
 require_root

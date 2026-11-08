@@ -16,8 +16,9 @@
 # the same file, queues behind A and is killed.
 #
 # DISCRIMINATION: the setup check requires B to be blocked (D) while A
-# still holds the stall. The reverted-fix control (plain mutex_lock in
-# cetrafs_lock_explicit_acquire()) has not been run.
+# still holds the stall. With a plain mutex_lock in
+# cetrafs_lock_explicit_acquire() B is still waiting 1 s after SIGKILL
+# (run 2026-11-08).
 set -euo pipefail
 . "$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)/lib/harness.sh"
 require_root

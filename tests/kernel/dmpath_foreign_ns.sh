@@ -14,8 +14,8 @@
 # them, mounted from a private mount namespace with /sys unmounted.
 #
 # DISCRIMINATION: the setup check requires the host-namespace mount to
-# resolve a path first. The reverted-fix control (filp_open() restored)
-# has not been run.
+# resolve a path first. With filp_open() restored the namespace mount
+# resolves no CAW path (run 2026-11-08).
 set -euo pipefail
 . "$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)/lib/harness.sh"
 require_root
