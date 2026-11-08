@@ -1316,6 +1316,61 @@ printf 'static int cetrafs_new_refuser(struct super_block *sb)\n{\n    return ce
 [ "$(live_callers "$SAMPLE")" = "$(basename "$SAMPLE"):cetrafs_new_refuser" ] &&
     pass "class 44: control -- a planted caller is found" || fail "class 44: control -- a planted caller is not found"
 
+# Class 45 (repair before the verdict, repair of the ambiguous). fsck -r
+# wrote repairs while a later pass could still find the fault that
+# disables repair, and restamped records it had not shown to be valid
+# records of that number (audit 2026-11-06 M11, M12).
+#  (a) every function that restamps an inode record calls
+#      fsck_record_restampable(), or is listed (it builds a NEW record);
+#  (b) every repair gate before the last repair_block() in main() carries
+#      a "class 45:" note naming why it is safe whatever the run decides
+#      later -- keep, set, recount, lossless, deferred, or allowed.
+log "checking fsck restamps only valid records and justifies every early repair (class 45)"
+FSCK_C="$ROOT/userspace/fsck.c"
+RESTAMP_OK='fsck_write_inode:the writer itself
+fsck_lost_found:writes the new record it built'
+restampers() { # <file> -> fn names that restamp a record without the check
+    awk '
+        /^[a-z_][a-z0-9_ *]*\(/ && !/;$/ { if (fn != "" && hit && !chk) print fn; fn = $0; sub(/\(.*/, "", fn); n = split(fn, a, " "); fn = a[n]; sub(/^\*+/, "", fn); hit = 0; chk = 0 }
+        /cetrafs_inode_stamp_crcs_us\(|fsck_write_inode\(/ && !/^[a-z_]/ && !/^[[:space:]]*\*/ { hit = 1 }
+        /fsck_record_restampable\(/ && !/^[a-z_]/ { chk = 1 }
+        END { if (fn != "" && hit && !chk) print fn }' "$1" | sort -u
+}
+RS="$(restampers "$FSCK_C")"
+RSU="$(while IFS= read -r l; do [ -n "$l" ] && ! grep -q "^$l:" <<<"$RESTAMP_OK" && echo "$l"; done <<<"$RS" || true)"
+[ -z "$RSU" ] && pass "class 45: every fsck restamp checks the record is a valid record of that number" ||
+    fail "class 45: fsck restamps without fsck_record_restampable(): $(echo $RSU)"
+grep -q "^fsck_lost_found$" <<<"$RS" || fail "class 45: the restamp scan no longer sees fsck_lost_found's write -- is it seeing the file?"
+SAMPLE="$(ct_tmp fsck-restamp).c"
+printf 'static void fsck_new_fixer(int fd)\n{\n    fsck_write_inode(fd, sb, 5, &in);\n}\n' >"$SAMPLE"
+[ "$(restampers "$SAMPLE")" = "fsck_new_fixer" ] &&
+    pass "class 45: control -- a planted unchecked restamp is found" ||
+    fail "class 45: control -- a planted unchecked restamp is not found"
+early_gates() { # <file> -> line numbers of untagged gates before main's last repair_block()
+    awk '
+        /^int main\(/ { inmain = 1 }
+        { line[NR] = $0 }
+        inmain && /repair_block\(/ && !/^[[:space:]]*\*/ && !/static void repair_block/ { last = NR }
+        inmain && /repair_mode && !repair_blocked/ { g[++ng] = NR }
+        END {
+            for (i = 1; i <= ng; i++) {
+                n = g[i]
+                if (n > last) continue
+                if (line[n] ~ /class 45:/ || line[n - 1] ~ /class 45:/ || line[n + 1] ~ /class 45:/) continue
+                print n
+            }
+        }' "$1"
+}
+EG="$(early_gates "$FSCK_C")"
+NG="$(awk '/^int main\(/{m=1} m && /repair_mode && !repair_blocked/' "$FSCK_C" | grep -c .)"
+[ "$NG" -ge 15 ] || fail "class 45: found only $NG repair gates in main() -- the scan is not seeing the file"
+[ -z "$EG" ] && pass "class 45: every repair ahead of fsck's last repair_block() names why it is safe" ||
+    fail "class 45: repairs before the verdict is final, with no class 45 note (fsck.c lines): $(echo $EG)"
+SAMPLE="$(ct_tmp fsck-early).c"
+printf 'int main(void)\n{\n    if (repair_mode && !repair_blocked)\n        fix();\n    repair_block("late");\n}\n' >"$SAMPLE"
+[ "$(early_gates "$SAMPLE")" = "3" ] && pass "class 45: control -- a planted untagged early gate is found" ||
+    fail "class 45: control -- a planted untagged early gate is not found"
+
 # The module must publish the filesystem alias get_fs_type() asks
 # modprobe for ("fs-<name>") when a mount names a type nothing has
 # registered. Without it, `mount -t cetrafs` on a host that has the

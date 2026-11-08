@@ -814,6 +814,10 @@ static int fsck_dir_link(int fd,
     uint64_t lba = 0;
 
     fsck_read_inode(fd, sb, dir_ino, &dir);
+    /* The record is rewritten below: only a valid record of this number
+     * may be (class 45). The caller's earlier check is not this one. */
+    if (!fsck_record_restampable(&dir, dir_ino))
+        return -1;
     if (dir.eh.eh_depth != 0)
         return -1;
     nblocks = fsck_dir_nblocks(&dir, cetrafs_le64(sb->total_blocks));
@@ -919,6 +923,9 @@ static void fsck_set_dotdot(int fd, const cetrafs_superblock_t *sb, uint64_t dir
     uint64_t lba = 0;
 
     fsck_read_inode(fd, sb, dir_ino, &in);
+    /* Its record is restamped below (class 45). */
+    if (!fsck_record_restampable(&in, dir_ino))
+        return;
     if (fsck_dir_block(&in, 0, cetrafs_le64(sb->total_blocks), &lba))
         return;
     pread_all(fd, blk, sizeof(blk), (off_t) lba * CETRAFS_BLOCK_SIZE);
@@ -2263,6 +2270,7 @@ int main(int argc, char **argv)
      * when no FREE row is left; otherwise the node may still come back to
      * its own row.
      */
+    /* class 45: retires a row only when nothing on the volume names it */
     if (repair_mode && !repair_blocked && node_free_rows == 0 && node_departed_rows > 0) {
         uint32_t nrows = cetrafs_le32(sb.node_table_count);
         uint8_t *node_ref = (uint8_t *) xcalloc(nrows, 1);
@@ -2624,6 +2632,7 @@ int main(int argc, char **argv)
              * same entries, so it is safe whatever the run finds later.
              * Only an incoherent table is rebuilt. */
             if (fsck_dirent_block_coherent(dirblk, &sb, 1, CETRAFS_ROOT_INO)) {
+                /* class 45: lossless -- the same entries, re-stamped */
                 if (repair_mode && !repair_blocked) {
                     fsck_stamp_dirent_block(dirblk);
                     pwrite_all(fd, dirblk, sizeof(dirblk), (off_t) root_lba * CETRAFS_BLOCK_SIZE);
@@ -2634,6 +2643,9 @@ int main(int argc, char **argv)
                     return 1;
                 }
             } else if (repair_mode && !repair_blocked) {
+                /* class 45: destructive before the verdict, and allowed --
+                 * no pass runs without a root, the names lost were
+                 * unreadable, and the orphans keep their records. */
                 repair_reinit_dirent_block(fd, root_lba, CETRAFS_ROOT_INO, CETRAFS_ROOT_INO, true);
                 repairs_made++;
                 printf("  rebuilt the root directory's dirent block (with '.' and '..') -- its entries were damaged\n");
@@ -3157,6 +3169,7 @@ int main(int argc, char **argv)
                                         live_lba, z, (uint64_t) cetrafs_le64(pe.lba), cetrafs_le32(pe.count));
                             queued_live++;
                             problems++;
+                            /* class 45: keep -- a dropped queue entry leaks the block, never frees it */
                             if (repair_mode && !repair_blocked) {
                                 memset(q + e * sizeof(pe), 0, sizeof(pe));
                                 q_dirty = 1;
@@ -3230,6 +3243,7 @@ int main(int argc, char **argv)
                      * clear waits for the namespace pass, and happens
                      * only if nothing there blocked repair; the bit
                      * stays counted as used until then. */
+                    /* class 45: deferred -- this only marks; the clear runs after the namespace pass */
                     if (repair_mode && !repair_blocked && !fsck_dead_unwalkable) {
                         FSCK_SET(leakd, idx);
                         leak_deferred++;
@@ -3257,6 +3271,7 @@ int main(int argc, char **argv)
                     /* A live extent names it, so the bit must be set:
                      * leaving it clear means the allocator hands the
                      * same block to a second file. */
+                    /* class 45: set -- marking a named block in use can only leak */
                     if (repair_mode && !repair_blocked) {
                         bmap[i / 8] |= (uint8_t) (1u << (i % 8));
                         bmap_dirty = 1;
@@ -3295,6 +3310,7 @@ int main(int argc, char **argv)
                  * above, corrected), so there is exactly one right
                  * answer. Rewrite the descriptor with its checksum
                  * restamped the same way mkfs does. */
+                /* class 45: recount -- the count from the bitmap just walked */
                 if (repair_mode && !repair_blocked) {
                     uint8_t blk[CETRAFS_BLOCK_SIZE] = {0};
                     cetrafs_block_group_t bgd;
@@ -3363,6 +3379,7 @@ int main(int argc, char **argv)
                         z, (uint64_t) cetrafs_le64(zg.free_data_blocks), zg_free_truth[z]);
                 problems++;
             }
+            /* class 45: recount -- the aggregate from its Block Groups */
             if (repair_mode && !repair_blocked) {
                 zg.free_data_blocks = cetrafs_cpu_to_le64(zg_free_truth[z]);
                 zg.pool_free_blocks = cetrafs_cpu_to_le64(zg_pool_truth[z]);
@@ -3384,6 +3401,7 @@ int main(int argc, char **argv)
         if (leaked)
             fprintf(stderr, "WARN: %" PRIu64 " data block(s) marked in use but referenced by no inode (leaked)\n",
                     leaked);
+        /* class 45: a message, not a repair */
         if (leaked && repair_mode && !repair_blocked && fsck_dead_unwalkable)
             fprintf(stderr, "NOTE: leaked blocks are not cleared this run: a deleted record's extent tree could "
                             "not be walked, and the blocks it hides cannot be told from leaked ones -- run fsck "
@@ -3628,6 +3646,7 @@ int main(int argc, char **argv)
                          * directory all of its names for nothing. See
                          * fsck_dirent_block_coherent(). */
                         if (fsck_dirent_block_coherent(db, &sb, logical == 0, ino)) {
+                            /* class 45: lossless -- the same entries, re-stamped */
                             if (repair_mode && !repair_blocked) {
                                 fsck_stamp_dirent_block(db);
                                 pwrite_all(fd, db, sizeof(db), (off_t) (phys + k) * CETRAFS_BLOCK_SIZE);
@@ -3764,6 +3783,7 @@ int main(int argc, char **argv)
 
             if (!is_dir[ino] || !walked[ino] || !dwhole[ino] || dsize[ino] == want_size)
                 continue;
+            /* class 45: recount -- the size from the entries this walk counted */
             if (repair_mode && !repair_blocked) {
                 repair_set_dir_size(fd, &sb, ino, want_size);
                 repairs_made++;
