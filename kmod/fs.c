@@ -3090,6 +3090,16 @@ int cetrafs_frees_begin(struct super_block *sb)
             pr_err_ratelimited("could not announce frees in flight in our registry row (%d) -- refusing the "
                                "operation before its publish\n",
                                ret);
+            /* The same two answers the heartbeat's renewal fences on: a
+             * peer revoked our lease, or the row is no longer ours. They
+             * are the fence's signal whoever reads them first; refusing
+             * this one operation and writing on until the next tick
+             * would leave the mount allocating from Zone Groups it may
+             * no longer own (zg_steal_victim_fences). */
+            if (ret == -EPERM)
+                cetrafs_sb_fence(sb, "our Node Registry lease was revoked, found while announcing frees in flight");
+            else if (ret == -EOWNERDEAD)
+                cetrafs_sb_fence(sb, "our Node Registry row is no longer ours, found while announcing frees in flight");
             return ret == -EPERM || ret == -EOWNERDEAD ? -EIO : ret;
         }
         sbi->frees_row_flag = true;
