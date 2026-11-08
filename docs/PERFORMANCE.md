@@ -423,20 +423,23 @@ controls.
 leaves the block "reads as zeros" on disk until its data is there
 (rule 8); the blocks wait in the inode's pending set. At every fsync
 and every close with a non-empty set, `cetrafs_convert_pending_locked()`
-writes back the WHOLE file (not the fsync's range -- which blocks the
-set holds is not tied to the range), waits for it, and issues one
-device cache flush before the first conversion. A file with an empty
-set -- every O_DIRECT writer, and any file not fallocated -- pays one
-emptiness check and nothing else.
+writes back the set's SPAN -- its first to its last pending block --
+waits for it, and issues one device cache flush before the first
+conversion. Until 2026-11-08 it wrote back the whole file, so an
+O_DSYNC write of one block paid for every dirty page of a large image;
+every caller already writes its own range back first (->flush, the last
+close, fsync's range). A file with an empty set -- every O_DIRECT
+writer, and any file not fallocated -- pays one emptiness check and
+nothing else.
 
 What this costs a workload that fsyncs a large, buffered, fallocated
 file often has not been measured on real hardware; a loop device makes
-the flush free. If it shows up, the knob is the range: tracking the
-set's span would let an fsync of a small range skip the whole-file
-writeback, and is not a format change.
+the flush free. A set whose span covers most of the file still writes
+most of it back.
 
 **Guarded by:** `tests/kernel/buffered_pending_reads.sh`,
-`pending_wb_cursor.sh` (correctness only).
+`pending_wb_cursor.sh` (correctness), `pending_convert_span.sh` (the
+span: an O_DSYNC write leaves unrelated dirty pages alone).
 
 ## Measured baseline
 
