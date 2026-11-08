@@ -17,10 +17,21 @@
 #   (2) an allocated, dead record claimed by this node's row is planted
 #       on the image and the row made to look crashed: the remount frees
 #       the number as well as clearing the claim.
+#   (3) the same, with a DEAD node's presence bit on the record (a row
+#       never registered): evict's opener check passes over such a bit,
+#       so the free may have run under it, and the remount must finish
+#       it -- tree forgotten, number freed -- not merely release.
 #
 # DISCRIMINATION: releasing the claim on a failed number free, (1) reads
 # the record unclaimed with the number still set; with the sweep only
-# releasing, (2) leaves the number allocated.
+# releasing, (2) leaves the number allocated; with the sweep refusing
+# every record that carries another node's bit (the code before audit
+# 2026-11-06's H1 hardening), (3) does.
+#
+# NOT COVERED: the other half of (3), a LIVE node's bit, which must keep
+# the old release-only answer. A loop device has no CAW, and the no-CAW
+# mount gate refuses to mount beside a live peer, so that state cannot
+# be arranged here.
 set -euo pipefail
 . "$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)/lib/harness.sh"
 require_root
@@ -90,4 +101,27 @@ orphaned "$PINO" && fail "the re-attach released the claim and left the number a
     pass "the re-attach freed the number before releasing the claim"
 OUT="$(ct_fsck "$DEV" 2>&1)" && ! grep -q '^ERR' <<<"$OUT" && pass "fsck clean" ||
     fail "fsck: $(grep '^ERR' <<<"$OUT" | head -3)"
+
+# (3) ...and finishes it under a dead node's leftover presence bit
+PINO=201
+DEADROW=5 # never registered on this image: stale by definition
+"$ORPHAN_POKE" "$DEV" "$PINO" 0 0 >/dev/null
+"$LOCK_POKE" "$DEV" "$PINO" --ns "$NID" >/dev/null
+"$LOCK_POKE" "$DEV" "$PINO" --reader "$DEADROW" >/dev/null
+RD="$("$LOCK_POKE" "$DEV" "$PINO" | sed -n 's/.*readers=\(0x[0-9a-f]*\).*/\1/p')"
+[ "$(nsowner "$PINO")" = "$NID" ] && [ $((RD & (1 << DEADROW))) -ne 0 ] && orphaned "$PINO" ||
+    { fail "setup: the planted claimed dead record with a dead node's bit is not on the device (readers=$RD)"; ct_exit; }
+"$NODE_POKE" "$DEV" "$NID" --beat >/dev/null
+MARK="$(dmesg_mark)"
+ct_mount "$DEV" "$MNT"
+dmesg_since "$MARK" | grep -q "re-attached row $NID" ||
+    { fail "setup: the remount did not re-attach row $NID"; ct_umount "$MNT"; ct_exit; }
+ct_umount "$MNT"
+O="$(nsowner "$PINO")"
+[ "$O" = 65535 ] && pass "the re-attach released the claim under a dead node's bit" ||
+    fail "the claim under a dead node's bit is still held (ns_owner $O)"
+orphaned "$PINO" && fail "a dead node's leftover bit kept the re-attach from finishing the free (number still allocated)" ||
+    pass "a dead node's leftover bit did not stop the re-attach finishing the free"
+OUT="$(ct_fsck "$DEV" 2>&1)" && ! grep -q '^ERR' <<<"$OUT" && pass "fsck clean after (3)" ||
+    fail "fsck after (3): $(grep '^ERR' <<<"$OUT" | head -3)"
 ct_exit

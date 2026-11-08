@@ -4044,16 +4044,39 @@ int cetrafs_lock_sweep_own_claims(struct super_block *sb, u32 my_node_id)
              * file -- a peer's in-core copy -- would win the claim, find
              * the number set and free them again. Free the number first,
              * then release: the blocks still set become the block
-             * scrub's. Not with another node on the record: an evict
+             * scrub's. Not with a LIVE node on the record: an evict
              * never claims one, so that is a namespace operation's
              * claim, released as before for its file's users to settle.
+             * A DEAD node's bit or lock is no such user: evict's own
+             * opener check passes over it, so an evict may well have
+             * freed blocks under it, and leaving the record naming them
+             * is the double free above. Judged as evict judges it --
+             * "alive" keeps the old answer, which frees nothing.
              * A create's birth claim, the other dead record we claim,
              * comes out the same way -- the create never finished.
              */
             if (cetrafs_le32(raw.nlink) == 0 && cetrafs_le32(raw.ns_lock_owner) == my_node_id &&
-                !(cetrafs_le64(raw.read_open_nodes) & ~bit) &&
-                (cetrafs_le32(raw.lock_mode) == CETRAFS_LOCK_NONE ||
-                 cetrafs_le32(raw.lock_owner_node) == my_node_id)) {
+                ((cetrafs_le64(raw.read_open_nodes) & ~bit) ||
+                 (cetrafs_le32(raw.lock_mode) != CETRAFS_LOCK_NONE &&
+                  cetrafs_le32(raw.lock_owner_node) != my_node_id))) {
+                bool w = false, r = false;
+
+                ret = cetrafs_lock_foreign_user_exists(sb, ino, my_node_id, &w, &r);
+                if (!ret) {
+                    /* The judgement may have cleared the dead node's bit,
+                     * which advances the stamp forget_tree checks. */
+                    cetrafs_invalidate_raw_inode(sb, ino);
+                    ret = cetrafs_read_raw_inode(sb, ino, &raw);
+                }
+                if (ret) {
+                    pr_err("mount: ino=%llu: could not judge the other node on a free this node claimed: %d\n",
+                           (unsigned long long) ino, ret);
+                    break;
+                }
+                if (w || r || cetrafs_le64(raw.generation) != ctx.generation)
+                    goto release; /* a live user's, or reborn: not ours to finish */
+            }
+            if (cetrafs_le32(raw.nlink) == 0 && cetrafs_le32(raw.ns_lock_owner) == my_node_id) {
                 u64 fseq = cetrafs_le64(raw.dirent_seq);
 
                 ret = cetrafs_inode_forget_tree(sb, ino, ctx.generation, &fseq);
@@ -4069,6 +4092,7 @@ int cetrafs_lock_sweep_own_claims(struct super_block *sb, u32 my_node_id)
                     pr_info("mount: ino=%llu: finished a free this node had claimed before its departure\n",
                             (unsigned long long) ino);
             }
+        release:
             ret = cetrafs_cas_record(sb, cetrafs_inode_lba(sb, ino), cetrafs_own_claims_mutate, &ctx);
             if (ret == -ESTALE)
                 ret = 0; /* reborn meanwhile: a peer's now, not ours */
