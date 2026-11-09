@@ -87,6 +87,18 @@ static bool cetrafs_deferred_on_list(struct cetrafs_deferred *d, struct list_hea
     return false;
 }
 
+/* TEST ONLY: decline every NEW deferral, so the caller writes the block
+ * through the journal at once -- a tree edit reaches the device at
+ * update time, as before deferral existed. Lets
+ * tests/crash/buffered_extent_order.sh stage the old write order (an
+ * extent marked written on the device before its data) and test the
+ * buffered-write fix on its own, without this file's protection in the
+ * way. A block already deferred stays deferred: declining it would
+ * write it twice. */
+static bool cetrafs_leaf_defer_off;
+cetrafs_test_param(leaf_defer_off, cetrafs_leaf_defer_off, bool, 0644);
+MODULE_PARM_DESC(leaf_defer_off, "TEST ONLY: write tree-block edits through the journal at update time instead of deferring them");
+
 int cetrafs_bh_defer_update(struct inode *inode, struct buffer_head *bh, u32 prev_crc)
 {
     struct xarray *xa = cetrafs_sb_deferred(inode->i_sb);
@@ -94,6 +106,8 @@ int cetrafs_bh_defer_update(struct inode *inode, struct buffer_head *bh, u32 pre
 
     if (!xa)
         return -EINVAL;
+    if (READ_ONCE(cetrafs_leaf_defer_off) && !buffer_cetra_deferred(bh))
+        return -EAGAIN; /* test-only; see the parameter */
     if (buffer_cetra_deferred(bh)) {
         bool listed;
 

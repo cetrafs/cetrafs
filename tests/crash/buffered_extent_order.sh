@@ -20,10 +20,22 @@
 # replay to the cut must read zeros or the new data, never the marker;
 # a replay past the file's fsync must read the new data.
 #
-# DISCRIMINATION: built in. The first round records with
-# buf_convert_early=1 (blocks marked written at write time, as before)
-# and must read the marker at the cut -- proving the recording really
-# arranged leaf-before-data. The second round, the fix, must not.
+# Two things now keep that order: this fix, and leafdefer.c (since
+# 48a8fbe a regular file's leaf edits are held back and written through
+# the journal at the boundary, after the data -- a block-device fsync
+# cannot push them out at all). With deferral on, even the old order
+# exposes nothing, and the control below could no longer be arranged
+# (release matrix 2026-11-09: "ZERO/ZERO"). leaf_defer_off makes each
+# tree edit go to the device through the journal at update time, as
+# before deferral, so each protection is tested on its own:
+#
+#   1. control: buf_convert_early=1, leaf_defer_off=1 -- the old order,
+#      nothing else in the way: must read the marker at the cut;
+#   2. the fix alone: buf_convert_early=0, leaf_defer_off=1: must not;
+#   3. as shipped: both off: must not.
+#
+# DISCRIMINATION: built in (round 1). Round 1 failing to expose the
+# marker is a setup failure, not a pass.
 #
 # Opt-in like the rest of tests/crash (make check-crash).
 set -euo pipefail
@@ -73,22 +85,24 @@ else: print("OTHER")
 PY
 }
 
-# round <early>: record the workload, then replay to the cut and past
-# the fsync. Prints "<blk100-at-cut> <blk200-at-cut> <blk100-synced> <blk200-synced>".
+# round <early> <defer_off>: record the workload, then replay to the cut
+# and past the fsync. Prints "<blk100-at-cut> <blk200-at-cut>
+# <blk100-synced> <blk200-synced>".
 round() {
-    local early="$1" data log rimg dm lw r100 r200 s100 s200
-    data="$(ct_image "$SZ_MB" "bufext-d$early")"
-    log="$(ct_image 512 "bufext-l$early")"
-    rimg="$(ct_image "$SZ_MB" "bufext-r$early")"
+    local early="$1" doff="$2" data log rimg dm lw r100 r200 s100 s200
+    data="$(ct_image "$SZ_MB" "bufext-d$early$doff")"
+    log="$(ct_image 512 "bufext-l$early$doff")"
+    rimg="$(ct_image "$SZ_MB" "bufext-r$early$doff")"
     fill "$data"
     data="$(ct_loop "$data")"
     log="$(ct_loop "$log")"
-    dm="bufext_${early}_$$"
+    dm="bufext_${early}${doff}_$$"
     dmsetup create "$dm" --table "0 $SECTORS log-writes $data $log"
     ct_track dm "$dm"
     lw="/dev/mapper/$dm"
 
     ct_param_set buf_convert_early "$early"
+    ct_param_set leaf_defer_off "$doff"
     ct_mkfs "$lw" -z 1 -b 512 -J 4 -M 4 -N 1024 -f >/dev/null
     ct_mount "$lw" "$MNT"
     python3 - "$MNT/vm" <<'PY'
@@ -117,6 +131,7 @@ os.close(fd)
 PY
     ct_umount "$MNT"
     ct_param_set buf_convert_early 0
+    ct_param_set leaf_defer_off 0
     dmsetup remove "$dm"
     blockdev --flushbufs "$log"
 
@@ -136,18 +151,27 @@ PY
     echo "$r100 $r200 $s100 $s200"
 }
 
-read -r C100 C200 _ _ < <(round 1)
-log "control (marked written at write time): at the cut block 100=$C100, block 200=$C200"
+read -r C100 C200 _ _ < <(round 1 1)
+log "control (marked written at write time, no deferral): at the cut block 100=$C100, block 200=$C200"
 [ "$C100" = STALE ] || [ "$C200" = STALE ] &&
     pass "control: with the old order the cut exposes the previous contents -- the recording arranged leaf-before-data" ||
     { fail "setup: even the old order exposed nothing at the cut ($C100/$C200) -- this suite proves nothing"; ct_exit; }
 
-read -r R100 R200 S100 S200 < <(round 0)
-log "fixed: at the cut block 100=$R100, block 200=$R200; after fsync $S100 / $S200"
-case "$R100" in NEW | ZERO) pass "preallocated block: $R100 at the cut, never the previous contents" ;;
-*) fail "preallocated block read $R100 at the cut -- its extent reached the device before its data" ;; esac
-case "$R200" in HOLE | ZERO) pass "hole inside i_size: $R200 at the cut, never the previous contents" ;;
-*) fail "hole block read $R200 at the cut -- its extent reached the device before its data" ;; esac
-[ "$S100" = NEW ] && [ "$S200" = HOLE ] && pass "after the fsync both writes are there" ||
-    fail "after the fsync: block 100=$S100, block 200=$S200 -- fsync lost a buffered write"
+# check <label> <r100> <r200> <s100> <s200>
+check() {
+    case "$2" in NEW | ZERO) pass "$1: preallocated block: $2 at the cut, never the previous contents" ;;
+    *) fail "$1: preallocated block read $2 at the cut -- its extent reached the device before its data" ;; esac
+    case "$3" in HOLE | ZERO) pass "$1: hole inside i_size: $3 at the cut, never the previous contents" ;;
+    *) fail "$1: hole block read $3 at the cut -- its extent reached the device before its data" ;; esac
+    [ "$4" = NEW ] && [ "$5" = HOLE ] && pass "$1: after the fsync both writes are there" ||
+        fail "$1: after the fsync: block 100=$4, block 200=$5 -- fsync lost a buffered write"
+}
+
+read -r R100 R200 S100 S200 < <(round 0 1)
+log "the fix alone (no deferral): at the cut block 100=$R100, block 200=$R200; after fsync $S100 / $S200"
+check "fix alone" "$R100" "$R200" "$S100" "$S200"
+
+read -r R100 R200 S100 S200 < <(round 0 0)
+log "as shipped: at the cut block 100=$R100, block 200=$R200; after fsync $S100 / $S200"
+check "as shipped" "$R100" "$R200" "$S100" "$S200"
 ct_exit
