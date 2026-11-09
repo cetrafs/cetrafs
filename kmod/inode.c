@@ -1807,6 +1807,8 @@ u64 cetrafs_tree_read_count(void)
  */
 struct buffer_head *cetrafs_read_tree_bh_for(struct inode *inode, u64 lba, u32 tail_magic, const char *what, bool reader)
 {
+    int chk;
+
     atomic64_inc(&cetrafs_tree_reads);
 
     /* ei_leaf_hi/lo is an address read off the device, exactly like the
@@ -1815,7 +1817,10 @@ struct buffer_head *cetrafs_read_tree_bh_for(struct inode *inode, u64 lba, u32 t
      * and write them back, so a leaf pointer aimed at the inode table
      * puts a tree update there. Checked at the one place both the leaf
      * and the interior reader funnel through. */
-    if (!cetrafs_lba_run_is_data(inode->i_sb, lba, 1)) {
+    chk = cetrafs_lba_run_check(inode->i_sb, lba, 1);
+    if (chk == -EAGAIN)
+        return NULL; /* past a layout this node cannot catch up with: refused, not damage */
+    if (chk) {
         pr_err_ratelimited("ino=%llu: %s block %llu is not a data address -- refusing it (fsck)\n",
                            (unsigned long long) inode->i_ino, what, (unsigned long long) lba);
         cetrafs_sb_corrupt_inode(inode);
@@ -1902,7 +1907,11 @@ struct buffer_head *cetrafs_read_dir_leaf_bh(struct inode *inode, u64 lba, bool 
      * cetrafs_read_tree_bh(), so the address check has to be repeated:
      * a subsystem with its own reader is exactly how a check added at
      * "the" choke point misses the blocks it was written for. */
-    if (!cetrafs_lba_run_is_data(inode->i_sb, lba, 1)) {
+    int chk = cetrafs_lba_run_check(inode->i_sb, lba, 1);
+
+    if (chk == -EAGAIN)
+        return NULL; /* past a layout this node cannot catch up with: refused, not damage */
+    if (chk) {
         pr_err_ratelimited("dir ino=%llu: extent leaf %llu is not a data address -- refusing it (fsck)\n",
                            (unsigned long long) inode->i_ino, (unsigned long long) lba);
         cetrafs_sb_corrupt_inode(inode);

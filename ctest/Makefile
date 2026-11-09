@@ -10,7 +10,7 @@ embed:
 	@mkdir -p embedded
 	@cp ../tests/helpers/*.c embedded/
 	@cp ../include/cetrafs.h ../userspace/crc32c.h ../userspace/devutil.h embedded/
-	@cp ../userspace/fsck.c ../userspace/mkfs.c embedded/
+	@cp ../userspace/fsck.c ../userspace/mkfs.c ../userspace/growfs.c embedded/
 
 build: embed
 	go build -o ctest .

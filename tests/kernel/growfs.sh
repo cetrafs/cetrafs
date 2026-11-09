@@ -80,15 +80,25 @@ else
 fi
 leaked_before="$(printf '%s' "$out" | grep -oE '[0-9]+ leaked' | grep -oE '^[0-9]+' || echo 0)"
 
-# ------------------------------------------------- negative: live mount
+# ------------------------------------ a dry run on a mounted volume
+# Growing a MOUNTED volume is live growing, which has its own suite
+# (grow_live.sh); this one is the offline path. What it still owns here:
+# a dry run against a mounted volume plans a live grow and writes
+# nothing -- the volume is the size it was, and so is its superblock.
 ct_mount "$DEV" "$MNT"
-if out="$(ct_growfs "$DEV" 2>&1)"; then
-    fail "growfs grew a MOUNTED volume -- the offline premise is the whole mutual-exclusion argument"
-elif grep -qi 'mounted' <<<"$out"; then
-    pass "growfs refuses a mounted volume, and says so"
+sb_before="$(dd if="$DEV" bs=4096 count=1 status=none | md5sum)"
+if out="$(ct_growfs "$DEV" -n 2>&1)"; then
+    grep -q 'growing it live' <<<"$out" && pass "a dry run on a mounted volume plans a LIVE grow" ||
+        fail "a dry run on a mounted volume did not say it would grow live: $(head -2 <<<"$out")"
 else
-    pass "growfs refused a mounted volume (for an unstated reason: $out)"
+    fail "a dry run on a mounted volume failed: $out"
 fi
+[ "$(dd if="$DEV" bs=4096 count=1 status=none | md5sum)" = "$sb_before" ] &&
+    pass "and wrote nothing: the superblock is unchanged" ||
+    fail "a DRY RUN changed the superblock of a mounted volume"
+size_dry="$(df -B1 --output=size "$MNT" | tail -1 | tr -d ' ')"
+[ "$size_dry" = "$size_before" ] && pass "the mounted volume still reports its old size" ||
+    fail "the mounted volume changed size after a dry run: $size_before -> $size_dry"
 ct_umount "$MNT"
 
 # ------------------------------------------------ negative: past the end

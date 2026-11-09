@@ -727,6 +727,7 @@ int main(int argc, char **argv)
             die_dev("%s is being repaired right now (registry row %u%s%s) -- wait for it to finish", dev, other_row,
                     other[0] ? ", " : "", other[0] ? other : "");
 
+        cetrafs_repair_peers_expected = live; /* before the claim arms its timer */
         grow_repair_row = cetrafs_repair_claim(fd, &sb, "growfs");
         if (grow_repair_row == -2)
             die_dev("%s: another repair or grow claimed this volume at the same time -- stopping", dev);
@@ -1087,8 +1088,27 @@ int main(int argc, char **argv)
          */
         int dfd = open(live_where, O_RDONLY | O_DIRECTORY | O_CLOEXEC);
 
+        /* TEST-ONLY: hand the kernel a superblock that skips a
+         * generation, as a grower working from a superblock someone else
+         * had already superseded would. The kernel must refuse it
+         * (-ESTALE) with nothing written (tests/kernel/grow_live_race.sh). */
+        if (getenv("CETRAFS_GROWFS_TEST_GEN_SKIP")) {
+            fprintf(stderr, "growfs.cetra: TEST MODE: submitting layout_gen + 1 too far\n");
+            sb.layout_gen = cetrafs_cpu_to_le64(cetrafs_le64(sb.layout_gen) + 1);
+            sb.checksum = 0;
+            sb.checksum = cetrafs_cpu_to_le64(
+                (u64) crc32c_struct(&sb, sizeof(sb), offsetof(cetrafs_superblock_t, checksum), sizeof(sb.checksum)));
+        }
+
         if (dfd < 0)
             die_dev("open(%s): %s", live_where, strerror(errno));
+        /* TEST-ONLY: give the claim up before asking the kernel to
+         * publish, as a program calling the ioctl without growfs's claim
+         * would. The kernel must refuse (-EBUSY; grow_live_race.sh E). */
+        if (getenv("CETRAFS_GROWFS_TEST_UNCLAIMED")) {
+            fprintf(stderr, "growfs.cetra: TEST MODE: releasing the claim before the publish\n");
+            growfs_release_claim(fd);
+        }
         if (ioctl(dfd, CETRAFS_IOC_GROW, &sb) < 0) {
             int e = errno;
 
@@ -1098,6 +1118,8 @@ int main(int argc, char **argv)
                 die_dev("%s: the volume changed while this grow ran -- nothing was published; run it again", dev);
             if (e == EOPNOTSUPP)
                 die_dev("%s: a node in the cluster cannot follow a live grow -- upgrade it, or grow offline", dev);
+            if (e == EBUSY)
+                die_dev("%s: the kernel found no growfs claim on the volume -- nothing was published", dev);
             die_dev("%s: the kernel refused to publish the grow: %s -- see dmesg; nothing was published unless\n"
                     "       it says the outcome is unknown",
                     dev, strerror(e));

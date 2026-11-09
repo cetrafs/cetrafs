@@ -163,14 +163,24 @@ const cetrafs_superblock_t *cetrafs_sb_raw(struct super_block *sb);
  * not the whole volume, and fsck names them.
  */
 bool cetrafs_sb_lba_run_hits_bg_table(struct super_block *sb, u64 lba, u64 count);
-bool cetrafs_lba_run_past_end(struct super_block *sb, u64 lba, u64 count);
-static inline bool cetrafs_lba_run_is_data(struct super_block *sb, u64 lba, u64 count)
+int cetrafs_lba_run_past_end(struct super_block *sb, u64 lba, u64 count);
+/*
+ * 0: [lba, lba+count) is data. -EUCLEAN: it is not, against a layout
+ * known to be current -- damage, and the caller marks it so. -EAGAIN:
+ * it lies past the end of the layout this node has, and this node could
+ * not learn whether a grow put it there (the device smaller than the
+ * grown volume until it is rescanned, block 0 unreadable or refused).
+ * That is not damage: the caller refuses the I/O (-EIO) and marks
+ * nothing, because a mark is sticky and the address may be valid on
+ * every node that caught up (GROWFS-LIVE-REVIEW H2).
+ */
+static inline int cetrafs_lba_run_check(struct super_block *sb, u64 lba, u64 count)
 {
     const cetrafs_superblock_t *raw_sb = cetrafs_sb_raw(sb);
     u64 lo, hi, data_end;
 
     if (!raw_sb)
-        return false;
+        return -EUCLEAN;
     lo = le64_to_cpu(raw_sb->bg_regions_start);
     hi = le64_to_cpu(raw_sb->total_blocks);
     /* A grown volume's data area ends at bg_data_end; past it is the
@@ -180,7 +190,7 @@ static inline bool cetrafs_lba_run_is_data(struct super_block *sb, u64 lba, u64 
         hi = data_end;
 
     if (!count || lba < lo)
-        return false;
+        return -EUCLEAN;
     /* Past the end this node knows of: refused only once the layout is
      * known to be current -- a peer may have grown the volume and
      * allocated in the new space before our heartbeat caught up. Off
@@ -189,7 +199,15 @@ static inline bool cetrafs_lba_run_is_data(struct super_block *sb, u64 lba, u64 
         return cetrafs_lba_run_past_end(sb, lba, count);
     /* And the holes earlier grows left inside it, which hold the older
      * segments. */
-    return !cetrafs_sb_lba_run_hits_bg_table(sb, lba, count);
+    return cetrafs_sb_lba_run_hits_bg_table(sb, lba, count) ? -EUCLEAN : 0;
+}
+/* For callers whose refusal is not destructive and marks nothing (a
+ * skipped invalidation, a scrub candidate dropped): "not known to be
+ * data" is enough. A caller that marks damage, or that DECIDES something
+ * from "this is not data", uses cetrafs_lba_run_check(). */
+static inline bool cetrafs_lba_run_is_data(struct super_block *sb, u64 lba, u64 count)
+{
+    return cetrafs_lba_run_check(sb, lba, count) == 0;
 }
 int cetrafs_sb_adjust_free_inodes(struct super_block *sb, s64 delta);
 int cetrafs_sb_get_free_inodes(struct super_block *sb, u64 *out);
@@ -826,6 +844,7 @@ int cetrafs_sb_layout_grow(struct super_block *sb, const cetrafs_superblock_t *n
 int cetrafs_grow_commit(struct super_block *sb, const struct cetrafs_grow_plan *plan);
 long cetrafs_grow_ioctl(struct file *file, const cetrafs_superblock_t __user *arg);
 u32 cetrafs_bgseg_crc(const cetrafs_bg_segment_t *seg);
+u32 cetrafs_bgseg_crc_prefix(const void *img, unsigned int len);
 u64 cetrafs_layout_refresh_count(void);
 u64 cetrafs_layout_refresh_refused_count(void);
 /* Recompute a BG's cached free count from its bitmap and correct it

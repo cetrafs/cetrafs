@@ -306,9 +306,12 @@ static int cetrafs_defrag_read_extents(struct inode *inode, const cetrafs_inode_
         /* Defrag copies these blocks and FREES them: an address read off
          * the device is checked before either (rule 19, as the free path
          * and the data path do). */
-        if (!cetrafs_lba_run_is_data(sb,
-                                     cetrafs_extent_phys_from_hilo(el->arr[i].ee_start_hi, el->arr[i].ee_start_lo),
-                                     cetrafs_extent_len(el->arr[i].ee_len))) {
+        int chk = cetrafs_lba_run_check(sb, cetrafs_extent_phys_from_hilo(el->arr[i].ee_start_hi, el->arr[i].ee_start_lo),
+                                        cetrafs_extent_len(el->arr[i].ee_len));
+
+        if (chk == -EAGAIN)
+            return -EIO; /* past a layout this node cannot catch up with: not damage */
+        if (chk) {
             pr_err_ratelimited("defrag: ino=%llu extent %u is not a data address -- refusing it (fsck)\n",
                                (unsigned long long) inode->i_ino, i);
             cetrafs_sb_corrupt_inode(inode);

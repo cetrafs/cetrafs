@@ -1073,6 +1073,13 @@ static inline int cetrafs_repair_renew(int fd, const cetrafs_superblock_t *sb, u
  * taken sets cetrafs_repair_lost for the work loop to stop on.
  */
 static volatile sig_atomic_t cetrafs_repair_lost; /* 1: our row was taken; 2: a node is live */
+/* Set by a tool that works on a MOUNTED volume through the kernel (a
+ * live grow): mounted nodes beating under its claim are expected, not a
+ * node that got in, so the watch for them is off. Losing its own row
+ * still stops it (1). Before this, every live grow longer than one
+ * renewal died on the first write after a peer's heartbeat
+ * (GROWFS-LIVE-REVIEW M1). */
+static volatile sig_atomic_t cetrafs_repair_peers_expected;
 static int cetrafs_renew_fd = -1;
 static cetrafs_superblock_t cetrafs_renew_sb;
 static uint32_t cetrafs_renew_row;
@@ -1134,7 +1141,7 @@ static void cetrafs_repair_tick(int sig)
     (void) sig;
     if (cetrafs_renew_fd >= 0 && cetrafs_repair_renew(cetrafs_renew_fd, &cetrafs_renew_sb, cetrafs_renew_row) != 0)
         cetrafs_repair_lost = 1;
-    else if (cetrafs_renew_fd >= 0 && !cetrafs_repair_lost &&
+    else if (cetrafs_renew_fd >= 0 && !cetrafs_repair_lost && !cetrafs_repair_peers_expected &&
              cetrafs_repair_node_beat(cetrafs_renew_fd, &cetrafs_renew_sb, cetrafs_renew_row))
         cetrafs_repair_lost = 2;
     errno = saved;

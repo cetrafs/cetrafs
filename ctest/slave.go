@@ -223,6 +223,17 @@ func (s *Slave) dispatch(req Request) Response {
 		}
 		return okResp(req.ID, res)
 
+	case "growfs":
+		var a GrowfsArgs
+		if err := unmarshalInto(&a); err != nil {
+			return errResp(req.ID, err)
+		}
+		res, err := s.doGrowfs(a)
+		if err != nil {
+			return errResp(req.ID, err)
+		}
+		return okResp(req.ID, res)
+
 	case "write":
 		var a WriteArgs
 		if err := unmarshalInto(&a); err != nil {
@@ -857,6 +868,38 @@ func (s *Slave) doUnmount(a UnmountArgs) error {
 	s.mounted = false
 	s.mu.Unlock()
 	return nil
+}
+
+// doGrowfs runs the embedded growfs.cetra against this slave's device,
+// mounted or not. Like mkfs, a nonzero exit is REPORTED, not raised: a
+// refused grow is an outcome scenarios assert on.
+func (s *Slave) doGrowfs(a GrowfsArgs) (MkfsResult, error) {
+	bin, err := buildEmbeddedHelper("growfs")
+	if err != nil {
+		return MkfsResult{}, fmt.Errorf("embedded growfs unavailable: %w", err)
+	}
+	args := []string{s.device}
+	if a.Size != "" {
+		args = append(args, "-s", a.Size)
+	}
+	if a.DryRun {
+		args = append(args, "-n")
+	}
+	cmd := exec.Command(bin, args...)
+	var stdout, stderr bytes.Buffer
+	cmd.Stdout = &stdout
+	cmd.Stderr = &stderr
+	err = cmd.Run()
+	res := MkfsResult{Stdout: stdout.String(), Stderr: stderr.String()}
+	if err == nil {
+		return res, nil
+	}
+	var ee *exec.ExitError
+	if errors.As(err, &ee) {
+		res.ExitCode = ee.ExitCode()
+		return res, nil
+	}
+	return res, fmt.Errorf("running %s: %w", bin, err)
 }
 
 // doMkfs runs mkfs.cetra against this slave's own device. A nonzero exit

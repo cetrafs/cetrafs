@@ -251,6 +251,9 @@ struct cetrafs_sb_info {
      * cetrafs_sb_layout_publish() under layout_mutex. */
     struct cetrafs_bg_layout *layout;
     struct mutex layout_mutex; /* one refresh at a time */
+    /* jiffies (|1) of the last refresh that found the volume grown past
+     * this node's device; 0 when not behind. Written under layout_mutex. */
+    unsigned long layout_behind_at;
     spinlock_t owned_lock;     /* owned_bgs derivation vs a publish (cetrafs_sb_owned_bgs_derive()) */
 
     /* In-memory-only cached free-inode count: there is no on-disk field
@@ -1449,6 +1452,34 @@ struct cetrafs_region {
 /* CRC32C over a BG table segment header with its checksum field treated
  * as zero -- the convention growfs stamps with and fsck verifies, three
  * segments like alloc.c's cetrafs_bg_crc_verify(). */
+/*
+ * The same CRC over a PREFIX of the header -- the CAS region a swap hands
+ * its mutator (kmod/grow.c) -- with the rest of the block taken as the
+ * zeros it holds: everything past the first 32 bytes is padding, written
+ * zero, and the one-sector assertion in cetrafs.h keeps every field
+ * inside the region. A prefix whose stored checksum verifies this way
+ * therefore came from a block whose padding really is zero.
+ */
+u32 cetrafs_bgseg_crc_prefix(const void *img, unsigned int len)
+{
+    static const u8 zero[256] = {0};
+    size_t off = offsetof(cetrafs_bg_segment_t, checksum);
+    size_t clen = sizeof(((cetrafs_bg_segment_t *) NULL)->checksum);
+    size_t left;
+    u32 crc = ~0U;
+
+    if (len > sizeof(cetrafs_bg_segment_t))
+        len = sizeof(cetrafs_bg_segment_t);
+    if (len < off + clen)
+        return 0; /* cannot hold the fields; never matches a real checksum by design of the caller */
+    crc = crc32c(crc, img, off);
+    crc = crc32c(crc, zero, clen);
+    crc = crc32c(crc, (const u8 *) img + off + clen, len - off - clen);
+    for (left = sizeof(cetrafs_bg_segment_t) - len; left; left -= min_t(size_t, left, sizeof(zero)))
+        crc = crc32c(crc, zero, min_t(size_t, left, sizeof(zero)));
+    return ~crc;
+}
+
 u32 cetrafs_bgseg_crc(const cetrafs_bg_segment_t *seg)
 {
     static const u8 zero[8] = {0};
@@ -1695,6 +1726,20 @@ static bool cetrafs_layout_refresh_fail_once;
 cetrafs_test_param(layout_refresh_fail_once, cetrafs_layout_refresh_fail_once, bool, 0644);
 MODULE_PARM_DESC(layout_refresh_fail_once, "TEST ONLY: discard the next refreshed layout as if it did not verify");
 
+/* TEST ONLY: the next live grow commits to the device but this node does
+ * not switch to the new layout -- it is then exactly a peer that has not
+ * caught up, which is the only way one host can exercise the refresh
+ * paths (tests/kernel/grow_live_refresh.sh). */
+static bool cetrafs_grow_skip_local_publish;
+cetrafs_test_param(grow_skip_local_publish, cetrafs_grow_skip_local_publish, bool, 0644);
+MODULE_PARM_DESC(grow_skip_local_publish, "TEST ONLY: the next live grow is not published to this node's own layout");
+
+/* TEST ONLY: an address past the known end is refused without first
+ * catching up -- the negative control for the on-demand refresh. */
+static bool cetrafs_layout_past_end_no_refresh;
+cetrafs_test_param(layout_past_end_no_refresh, cetrafs_layout_past_end_no_refresh, bool, 0644);
+MODULE_PARM_DESC(layout_past_end_no_refresh, "TEST ONLY: refuse past-the-end addresses without refreshing the layout");
+
 static atomic64_t cetrafs_layout_refreshes = ATOMIC64_INIT(0);
 static atomic64_t cetrafs_layout_refresh_refused = ATOMIC64_INIT(0);
 
@@ -1761,6 +1806,46 @@ static void cetrafs_layout_publish(struct super_block *sb, struct cetrafs_bg_lay
             (unsigned long long) le64_to_cpu(cur->raw.total_blocks), (unsigned long long) le64_to_cpu(nl->raw.layout_gen));
 }
 
+/*
+ * The bounds a grown superblock must keep, beyond what the walk checks
+ * Block Group by Block Group (GROWFS-LIVE-REVIEW L1). The mount runs
+ * cetrafs_validate_layout() over the whole superblock; a refresh and a
+ * live grow adopt a new one too, and checked only the chain. Every
+ * address check on the data path (cetrafs_lba_run_check()) trusts
+ * bg_data_end and total_blocks, so they are checked before they are
+ * published, not after:
+ *   - the regions still do not overlap (cetrafs_validate_layout());
+ *   - every Block Group ends inside the data box: last_bg_end <=
+ *     bg_data_end <= total_blocks;
+ *   - the tail reserve lies between the box and the end of the volume.
+ * 'nl' has been walked.
+ */
+static int cetrafs_layout_bounds_check(struct super_block *sb, const struct cetrafs_bg_layout *nl)
+{
+    const cetrafs_superblock_t *raw = &nl->raw;
+    u64 total = le64_to_cpu(raw->total_blocks);
+    u64 data_end = le64_to_cpu(raw->bg_data_end);
+    u64 ts = le64_to_cpu(raw->tail_reserve_start), tb = le64_to_cpu(raw->tail_reserve_blocks), te;
+
+    if (cetrafs_validate_layout(raw, total))
+        return -EUCLEAN;
+    if (data_end && (nl->last_bg_end > data_end || data_end > total)) {
+        pr_err("%s: layout_gen %llu: data box ends at %llu, but its Block Groups end at %llu and the volume at "
+               "%llu\n",
+               sb->s_id, (unsigned long long) le64_to_cpu(raw->layout_gen), (unsigned long long) data_end,
+               (unsigned long long) nl->last_bg_end, (unsigned long long) total);
+        return -EUCLEAN;
+    }
+    if (ts && (check_add_overflow(ts, tb, &te) || ts < (data_end ? data_end : nl->last_bg_end) || te > total)) {
+        pr_err("%s: layout_gen %llu: tail reserve [%llu +%llu) is not between the data area and the end of the "
+               "volume (%llu)\n",
+               sb->s_id, (unsigned long long) le64_to_cpu(raw->layout_gen), (unsigned long long) ts,
+               (unsigned long long) tb, (unsigned long long) total);
+        return -EUCLEAN;
+    }
+    return 0;
+}
+
 /* cetrafs_sb_layout_refresh() with layout_mutex held. */
 static int cetrafs_layout_refresh_locked(struct super_block *sb)
 {
@@ -1781,8 +1866,10 @@ static int cetrafs_layout_refresh_locked(struct super_block *sb)
         }
         memcpy(raw, bh->b_data, sizeof(*raw));
         brelse(bh);
-        if (raw->layout_gen == cur->raw.layout_gen)
-            goto out; /* the common case: nothing moved */
+        if (raw->layout_gen == cur->raw.layout_gen) {
+            rc = 0; /* even after a torn read: what is there now is ours */
+            goto up_to_date; /* the common case: nothing moved */
+        }
         rc = cetrafs_check_sb_crc(raw, sizeof(*raw), raw->checksum);
         if (rc != -EUCLEAN)
             break;
@@ -1795,20 +1882,29 @@ static int cetrafs_layout_refresh_locked(struct super_block *sb)
         goto refused;
     }
     if (le32_to_cpu(raw->magic) != CETRAFS_MAGIC || !cetrafs_layout_is_grow_of(&cur->raw, raw)) {
-        pr_err_ratelimited("%s: the superblock changed (layout_gen %llu -> %llu) in a way a grow does not -- "
-                           "keeping the current layout\n",
-                           sb->s_id, (unsigned long long) le64_to_cpu(cur->raw.layout_gen),
-                           (unsigned long long) le64_to_cpu(raw->layout_gen));
+        /* Not torn (the checksum verifies), not ours, not a grow: the
+         * volume this node holds is no longer the one on the device --
+         * mkfs under a mount, a tool writing block 0 behind every
+         * claim. Every further write would land on a layout nobody else
+         * has. Kind 3 of docs/internal/ERRORS.md, the state a crash
+         * leaves (GROWFS-LIVE-REVIEW L5): it used to log and carry on. */
+        cetrafs_sb_fatal(sb, "the superblock changed (layout_gen %llu -> %llu) in a way a grow does not",
+                         (unsigned long long) le64_to_cpu(cur->raw.layout_gen),
+                         (unsigned long long) le64_to_cpu(raw->layout_gen));
         rc = -EUCLEAN;
         goto refused;
     }
     if (le64_to_cpu(raw->total_blocks) > bdev_nr_bytes(sb->s_bdev) / CETRAFS_BLOCK_SIZE) {
         /* The LUN was resized on the grower's host and not (yet) on
-         * ours. Not corruption: retried on the next tick. */
-        pr_warn_ratelimited("%s: the volume grew to %llu blocks but this node's device has %llu -- rescan it; "
-                            "keeping the current layout until then\n",
-                            sb->s_id, (unsigned long long) le64_to_cpu(raw->total_blocks),
-                            (unsigned long long) (bdev_nr_bytes(sb->s_bdev) / CETRAFS_BLOCK_SIZE));
+         * ours. Not corruption: retried on the next tick, and every
+         * address past our end is "cannot tell" until then
+         * (cetrafs_lba_run_check()). Said once per episode. */
+        if (!sbi->layout_behind_at)
+            pr_warn("%s: the volume grew to %llu blocks but this node's device has %llu -- rescan it; keeping "
+                    "the current layout until then, and refusing I/O past it without calling it damage\n",
+                    sb->s_id, (unsigned long long) le64_to_cpu(raw->total_blocks),
+                    (unsigned long long) (bdev_nr_bytes(sb->s_bdev) / CETRAFS_BLOCK_SIZE));
+        WRITE_ONCE(sbi->layout_behind_at, jiffies | 1);
         rc = -EAGAIN;
         goto out;
     }
@@ -1819,6 +1915,8 @@ static int cetrafs_layout_refresh_locked(struct super_block *sb)
         goto out;
     }
     rc = cetrafs_layout_walk(sb, nl, cur, NULL);
+    if (!rc)
+        rc = cetrafs_layout_bounds_check(sb, nl);
     if (!rc && xchg(&cetrafs_layout_refresh_fail_once, false))
         rc = -EUCLEAN; /* test-only; see the parameter */
     if (rc) {
@@ -1827,6 +1925,11 @@ static int cetrafs_layout_refresh_locked(struct super_block *sb)
     }
     cetrafs_layout_publish(sb, cur, nl);
     rc = 1;
+up_to_date:
+    if (sbi->layout_behind_at) {
+        pr_info("%s: this node's device now holds the published volume\n", sb->s_id);
+        WRITE_ONCE(sbi->layout_behind_at, 0);
+    }
     goto out;
 refused:
     atomic64_inc(&cetrafs_layout_refresh_refused);
@@ -1931,6 +2034,8 @@ int cetrafs_sb_layout_grow(struct super_block *sb, const cetrafs_superblock_t *n
     rc = cetrafs_layout_walk(sb, nl, cur, &plan);
     if (!rc && cur->bg_nsegs && !plan.tail_lba)
         rc = -EUCLEAN; /* cannot happen: the walk ends short without the override */
+    if (!rc)
+        rc = cetrafs_layout_bounds_check(sb, nl);
     if (rc) {
         pr_err("%s: grow refused -- the layout it describes does not verify (%d); nothing was written\n", sb->s_id,
                rc);
@@ -1939,6 +2044,10 @@ int cetrafs_sb_layout_grow(struct super_block *sb, const cetrafs_superblock_t *n
     rc = cetrafs_grow_commit(sb, &plan);
     if (rc)
         goto out;
+    if (xchg(&cetrafs_grow_skip_local_publish, false)) {
+        pr_info("%s: grow committed; not switching this node's layout (test)\n", sb->s_id);
+        goto out; /* test-only; see the parameter */
+    }
     cetrafs_layout_publish(sb, cur, nl);
     nl = NULL;
 out:
@@ -2710,26 +2819,53 @@ int cetrafs_fill_super(struct super_block *sb, struct fs_context *fc)
              * being formatted under it. Its row is committed now, so a
              * still-watching mkfs sees it; and if block 0 is no longer
              * the superblock this mount validated, nobody is watching
-             * any more. Nothing writes block 0 under a mount (growfs is
-             * offline and holds a repair claim), so any difference is
-             * a rewrite. */
+             * any more.
+             *
+             * One rewrite is legitimate under mounts: a live grow
+             * (grow.c), which can publish between our first read and
+             * here -- its claim is gone by now, so the check above did
+             * not see it. That one is adopted through the same refresh
+             * every mounted node runs; anything else is still refused
+             * (GROWFS-LIVE-REVIEW L2). */
             {
                 const cetrafs_superblock_t *mine = cetrafs_sb_raw(sb);
                 struct buffer_head *sbh = cetrafs_bread_uncached(sb, CETRAFS_SB_BLOCK_NR);
+                int why = sbh ? 0 : -EIO;
 
-                if (!sbh || memcmp(sbh->b_data, mine, sizeof(*mine)) != 0) {
-                    if (sbh)
+                if (sbh && memcmp(sbh->b_data, mine, sizeof(*mine)) != 0) {
+                    const cetrafs_superblock_t *ns = (const cetrafs_superblock_t *) sbh->b_data;
+                    bool grow = !cetrafs_check_sb_crc(ns, sizeof(*ns), ns->checksum) &&
+                                le32_to_cpu(ns->magic) == CETRAFS_MAGIC && cetrafs_layout_is_grow_of(mine, ns);
+
+                    why = -EBUSY;
+                    if (grow) {
+                        int r = cetrafs_sb_layout_refresh(sb);
+
+                        if (r == 1) {
+                            pr_info("%s: the volume was grown live while this mount was in flight -- mounting "
+                                    "at layout_gen %llu\n",
+                                    sb->s_id, (unsigned long long) le64_to_cpu(cetrafs_sb_raw(sb)->layout_gen));
+                            why = 0;
+                        } else {
+                            pr_err("%s: the volume was grown while this mount was in flight, and this node "
+                                   "cannot adopt the grow (%d) -- refusing to mount; retry\n",
+                                   sb->s_id, r);
+                            why = r < 0 ? r : -EBUSY;
+                        }
+                    } else {
                         pr_err("%s: the superblock was rewritten while this mount was in flight (mkfs?) -- "
                                "refusing to mount\n",
                                sb->s_id);
-                    else
-                        pr_err("mount: post-registration superblock re-read failed\n");
-                    brelse(sbh);
-                    cetrafs_free_sb_info(sb);
-                    brelse(bh);
-                    return sbh ? -EBUSY : -EIO;
+                    }
+                } else if (!sbh) {
+                    pr_err("mount: post-registration superblock re-read failed\n");
                 }
                 brelse(sbh);
+                if (why) {
+                    cetrafs_free_sb_info(sb);
+                    brelse(bh);
+                    return why;
+                }
             }
 
             /* Post-registration file-lock-mode re-check. The inherit/refuse
@@ -3521,9 +3657,33 @@ bool cetrafs_sb_zg_pf_take_drops(struct super_block *sb, u32 zg_id, u64 *runs, u
  * Costs one forced read of block 0 when the address really is bad --
  * the path that refuses a corrupt extent, not a hot one.
  */
-bool cetrafs_lba_run_past_end(struct super_block *sb, u64 lba, u64 count)
+int cetrafs_lba_run_past_end(struct super_block *sb, u64 lba, u64 count)
 {
-    return cetrafs_sb_layout_refresh(sb) == 1 && cetrafs_lba_run_is_data(sb, lba, count);
+    struct cetrafs_sb_info *sbi = sb->s_fs_info;
+    unsigned long behind;
+    int r;
+
+    might_sleep(); /* a forced read and layout_mutex (GROWFS-LIVE-REVIEW L3) */
+    if (READ_ONCE(cetrafs_layout_past_end_no_refresh))
+        return -EUCLEAN; /* test-only; see the parameter */
+    /* Behind the device as of less than a second ago: still "cannot
+     * tell", without another read of block 0 for every block a file
+     * in the new space is asked about. Only the answer that marks
+     * NOTHING is reused this way -- reusing "current" would turn a grow
+     * published within that second into damage (L4). */
+    behind = READ_ONCE(sbi->layout_behind_at);
+    if (behind && time_before(jiffies, behind + HZ))
+        return -EAGAIN;
+    r = cetrafs_sb_layout_refresh(sb);
+    if (r == 1)
+        return cetrafs_lba_run_check(sb, lba, count);
+    if (r < 0) {
+        pr_warn_ratelimited("%s: blocks %llu+%llu lie past this node's layout, and it cannot learn whether a "
+                            "grow put them there (%d) -- refusing the I/O, marking nothing\n",
+                            sb->s_id, (unsigned long long) lba, (unsigned long long) count, r);
+        return -EAGAIN;
+    }
+    return -EUCLEAN;
 }
 
 /*

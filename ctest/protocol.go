@@ -143,6 +143,14 @@ type MkfsArgs struct {
 	Extra []string `json:"extra,omitempty"`
 }
 
+// GrowfsArgs: run growfs.cetra against the slave's device -- live when
+// the slave has it mounted, which is the point. Size is growfs's -s
+// ("" = the whole device); DryRun is -n.
+type GrowfsArgs struct {
+	Size   string `json:"size,omitempty"`
+	DryRun bool   `json:"dry_run,omitempty"`
+}
+
 type MkfsResult struct {
 	ExitCode int    `json:"exit_code"`
 	Stdout   string `json:"stdout"`

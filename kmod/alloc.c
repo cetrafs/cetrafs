@@ -2420,7 +2420,7 @@ u64 cetrafs_bg_lookup_reads_count(void)
     return (u64) atomic64_read(&cetrafs_bg_lookup_reads);
 }
 
-static int cetrafs_bg_id_for_lba(struct super_block *sb, u64 lba, u32 *out_bg_id)
+static int cetrafs_bg_id_for_lba_once(struct super_block *sb, u64 lba, u32 *out_bg_id)
 {
     const cetrafs_superblock_t *raw_sb = cetrafs_sb_raw(sb);
     u32 bg_count, bg_id;
@@ -2516,6 +2516,50 @@ static int cetrafs_bg_id_for_lba(struct super_block *sb, u64 lba, u32 *out_bg_id
     }
 
     return -EINVAL;
+}
+
+/*
+ * The Block Group holding 'lba', or:
+ *   -EINVAL  it is in no data region -- of a layout KNOWN to be current;
+ *   -EAGAIN  it lies past the end of this node's layout and this node
+ *            could not learn whether a grow put it there (the
+ *            superblock unreadable, refused, or bigger than our device);
+ *   other    a descriptor could not be read.
+ *
+ * "Past the end of the layout I have" is not "outside every data
+ * region" on a volume another node may have grown live: a peer can
+ * publish a grow, allocate in the new space, journal a write there and
+ * die, all before this node's next heartbeat. Before the refresh below,
+ * a replay here skipped that entry as a bad target and parked the area
+ * CLEAN over it, and a free there leaked (GROWFS-LIVE-REVIEW H1, M3).
+ * A grow only ever appends past the published total_blocks, so an LBA
+ * below it is answered definitively without the device; only one past
+ * it costs a read of block 0, and only when the cheap lookup missed.
+ * Callers that act destructively on -EINVAL must not act on -EAGAIN:
+ * not knowing leaks or waits, it never drops.
+ */
+static int cetrafs_bg_id_for_lba(struct super_block *sb, u64 lba, u32 *out_bg_id)
+{
+    int ret, tries;
+
+    for (tries = 0; tries < 4; tries++) {
+        const cetrafs_superblock_t *raw_sb;
+        int r;
+
+        ret = cetrafs_bg_id_for_lba_once(sb, lba, out_bg_id);
+        if (ret != -EINVAL)
+            return ret;
+        raw_sb = cetrafs_sb_raw(sb);
+        if (!raw_sb || lba < le64_to_cpu(raw_sb->total_blocks))
+            return -EINVAL; /* inside the published volume: no grow can change the answer */
+        r = cetrafs_sb_layout_refresh(sb);
+        if (r < 0)
+            return -EAGAIN;
+        if (r == 0)
+            return -EINVAL; /* the layout is current, and the LBA is past its end */
+        /* r == 1: a grow was published; ask again against it */
+    }
+    return -EAGAIN;
 }
 
 /*

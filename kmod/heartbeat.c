@@ -104,6 +104,12 @@ static int cetrafs_test_uncache_zg = -1;
 cetrafs_test_param(test_uncache_zg, cetrafs_test_uncache_zg, int, 0644);
 MODULE_PARM_DESC(test_uncache_zg, "TEST ONLY: forget owning this zone group, so the next tick re-attaches to it");
 
+/* TEST ONLY: the heartbeat does not catch up with a grow, so the
+ * on-demand refresh is the sole path (tests/kernel/grow_live_refresh.sh). */
+static bool cetrafs_layout_refresh_hb_off;
+cetrafs_test_param(layout_refresh_hb_off, cetrafs_layout_refresh_hb_off, bool, 0644);
+MODULE_PARM_DESC(layout_refresh_hb_off, "TEST ONLY: the heartbeat does not refresh the layout");
+
 /*
  * TEST ONLY: make the maintenance pass take this long.
  *
@@ -296,7 +302,8 @@ static void cetrafs_heartbeat_maint(struct work_struct *work)
      * (PERFORMANCE.md rule 5); only an actual grow walks the new
      * descriptors, once. Read-only mounts too: they read the new
      * space as soon as a peer writes there. */
-    cetrafs_sb_layout_refresh(sb);
+    if (!READ_ONCE(cetrafs_layout_refresh_hb_off)) /* test-only; see the parameter */
+        cetrafs_sb_layout_refresh(sb);
 
     /* Everything below WRITES to shared state: it claims and releases
      * Zone Groups, applies peers' queued frees to their bitmaps, and

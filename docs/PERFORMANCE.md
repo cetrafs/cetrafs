@@ -104,7 +104,7 @@ every BG ever touched makes it quadratic over a long write.
 ## 4b. Allocation bitmap bits sync at the BOUNDARY, never per allocation
 
 `cetrafs_bitmap_alloc_bit()` keeps `sync=false`; the BG is marked in
-`sbi->bmap_alloc_dirty` and `cetrafs_alloc_flush_bitmaps()` writes those
+`bmap_alloc_dirty` (per-BG state in `struct cetrafs_bg_chunk`) and `cetrafs_alloc_flush_bitmaps()` writes those
 bitmap blocks at the same durability boundaries as invariant 4 (close,
 fsync, sync_fs, and `cetrafs_write_raw_inode(sync=true)`). One bitmap
 write per BG allocated from since the last boundary, NOT one per block —
@@ -150,6 +150,12 @@ path depends on. Measured as a ~40% loss of streaming write bandwidth.
 
 Same mechanism as 3, different trigger. Anything that runs per tick and
 touches the BG table is in this category.
+
+The live-grow layout check (`cetrafs_sb_layout_refresh()`, called from
+the heartbeat) is the one per-tick read of a global structure: block 0,
+forced fresh, compared and dropped unless `layout_gen` moved. It never
+touches the BG table on a tick where nothing grew; only an actual grow
+reads the NEW Block Groups' descriptors, once.
 
 ## 5b. Zone Group claim/release updates both halves with immediate paired CAS
 
@@ -440,6 +446,19 @@ most of it back.
 **Guarded by:** `tests/kernel/buffered_pending_reads.sh`,
 `pending_wb_cursor.sh` (correctness), `pending_convert_span.sh` (the
 span: an O_DSYNC write leaves unrelated dirty pages alone).
+
+## 16. Per-BG state is reached through the published layout, with no lock
+
+Every per-BG accessor (`cetrafs_bgc()` in fs.c) does two acquire loads
+-- the layout pointer and its count come from one snapshot -- and one
+extra pointer step into a fixed chunk. That is the whole cost a live
+grow adds to the per-block path. Do not put a lock, an RCU read
+section or a reference count there: the layout is replaced by pointer
+and old ones live until unmount precisely so readers need none. And an
+address the validator would refuse as past the end refreshes the layout
+first (`cetrafs_lba_run_past_end()`) -- off the per-block budget only
+because a valid address never gets there; never call the refresh on a
+path that valid I/O takes.
 
 ## Measured baseline
 

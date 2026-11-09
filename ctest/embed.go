@@ -52,7 +52,7 @@ func buildEmbeddedHelper(name string) (string, error) {
 	// so a scenario could not check the volume from the node it was
 	// standing on, and mkfs-guard could not run at all. They need one
 	// extra header the pokes do not.
-	if name == "fsck" || name == "mkfs" {
+	if name == "fsck" || name == "mkfs" || name == "growfs" {
 		want["devutil.h"] = "embedded/devutil.h"
 	}
 	for out, src := range want {

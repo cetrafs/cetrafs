@@ -56,7 +56,7 @@ func main() {
 	scenario := flag.String("scenario", "", "lock-race | lock-sequential | lock-hold | explicit-lock | lock-suspend | cluster-lock-mode | nocaw-mount-race | symlink-publish | zg-fairness | diag | module-info | xattrs | "+
 		"cross-node-visibility | concurrent-create | concurrent-unlink | concurrent-mkdir | concurrent-mkdir-storm | concurrent-rename | "+
 		"read-presence | inode-reuse | dirent-cache | extent-leaf-staleness | record-write-race | "+
-		"dirent-torn | caw | pending-free | scrub-transit | direct-write | hypervisor-storm | space-accounting | dir-storm | sparse-bigfile | "+
+		"dirent-torn | caw | pending-free | scrub-transit | direct-write | hypervisor-storm | space-accounting | dir-storm | sparse-bigfile | grow-live | "+
 		"ns-fuzz | mkfs-guard | full-suite")
 	lockPath := flag.String("lock-path", "ctest-lockfile", "path (relative to mountpoint) used by the lock-* scenarios")
 	// "" (the default) means "pick a fresh, timestamped directory for
@@ -360,6 +360,7 @@ func runMaster(cfg masterConfig) (bool, error) {
 		"fence-reclaim", "replay-race", "direct-write",
 		"space-accounting",
 		"sparse-bigfile",
+		"grow-live",
 		"full-suite":
 		fmt.Printf("(using test-dir %q)\n", cfg.testDir)
 	}
@@ -475,6 +476,8 @@ func dispatchScenario(cfg masterConfig, clients []*Client) (bool, error) {
 	case "dir-storm":
 		return RunDirStorm(clients, cfg.testDir,
 			cfg.dirStormFiles, cfg.dirStormMaxBytes, cfg.dirStormPar, cfg.dirStormSeed)
+	case "grow-live":
+		return RunGrowLive(clients, cfg.testDir+"/grow-live")
 	case "sparse-bigfile":
 		return RunSparseBigFile(clients, cfg.testDir+"/sparse-bigfile")
 	case "mkfs-guard":

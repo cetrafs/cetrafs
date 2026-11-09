@@ -2069,14 +2069,14 @@ int main(int argc, char **argv)
              * the kernel mounts it on the same terms
              * (cetrafs_layout_pending_link()). Anything else is.
              */
-            if (filled == nbg && seg_lba >= cetrafs_le64(sb.total_blocks) && seg_lba < total_blocks) {
+            if (filled == nbg && seg_lba >= cetrafs_le64(sb.total_blocks) && seg_lba < dev_bytes / CETRAFS_BLOCK_SIZE) {
                 pread_all(fd, &seg, sizeof(seg), (off_t) seg_lba * CETRAFS_BLOCK_SIZE);
                 if (cetrafs_le32(seg.magic) == CETRAFS_BGSEG_MAGIC &&
                     (uint32_t) cetrafs_le64(seg.checksum) == crc32c_struct(&seg, sizeof(seg),
                                                                            offsetof(cetrafs_bg_segment_t, checksum),
                                                                            sizeof(seg.checksum)) &&
                     cetrafs_le32(seg.first_bg_id) == nbg && cetrafs_le32(seg.count) &&
-                    seg_lba + 1 + cetrafs_le32(seg.count) <= total_blocks && !cetrafs_le64(seg.next)) {
+                    seg_lba + 1 + cetrafs_le32(seg.count) <= dev_bytes / CETRAFS_BLOCK_SIZE && !cetrafs_le64(seg.next)) {
                     printf("note: the Block Group table links a segment at %" PRIu64
                            " for Block Groups %u.. the superblock does not count yet -- a grow in progress, or one\n"
                            "      that was interrupted before it published (re-run growfs.cetra to finish it)\n",

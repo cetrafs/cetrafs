@@ -708,7 +708,7 @@ spin_lines() { # <files...>: file:line:code for every line run with a spinlock h
     }' "$@"
 }
 SPIN_SLEEPERS_RE='\b(msleep|usleep_range|ssleep|mutex_lock[a-z_]*|down|down_[a-z_]+|wait_event[a-z_]*|wait_for_[a-z_]+|schedule[a-z_]*|cond_resched|lock_buffer|wait_on_buffer|[a-z_]*bread[a-z_]*|submit_bh|sync_dirty_buffer|iput|brelse|vmalloc|kvmalloc|copy_(to|from)_user|cancel_[a-z_]*_sync|flush_[a-z_]+|synchronize_[a-z_]+)\('
-SPIN_OK='cetrafs_deferred_on_list cetrafs_ext_key_matches cetrafs_inode_deferred cetrafs_inode_fd_copy cetrafs_inode_wb_failed cetrafs_le16 cetrafs_le32 cetrafs_le64 cetrafs_pending_any cetrafs_sb_stale_secs'
+SPIN_OK='cetrafs_deferred_on_list cetrafs_ext_key_matches cetrafs_inode_deferred cetrafs_inode_fd_copy cetrafs_inode_wb_failed cetrafs_le16 cetrafs_le32 cetrafs_le64 cetrafs_pending_any cetrafs_sb_layout_of cetrafs_sb_stale_secs'
 SL="$(spin_lines "$K"/*.c)"
 [ "$(wc -l <<<"$SL")" -gt 100 ] || fail "class 19 spinlock: setup -- only $(wc -l <<<"$SL") lines found under a spinlock (the scan no longer matches)"
 SPIN_BAD="$(grep -E "$SPIN_SLEEPERS_RE" <<<"$SL" | grep -vE 'GFP_ATOMIC|GFP_NOWAIT' | head -5 || true)"
@@ -1597,6 +1597,85 @@ printf 'static int cetrafs_new_dropper(struct super_block *sb)\n{\n    publish(s
 [ "$(free_callers "$SAMPLE")" = "$(basename "$SAMPLE"):cetrafs_new_dropper" ] &&
     pass "class 46: control -- a planted unannounced free is found" ||
     fail "class 46: control -- a planted unannounced free is not found"
+
+# Every compare-and-swap mutator is handed ONE region of its block --
+# the first sector, on most devices -- not the block. A record whose
+# checksum covers the whole block must be restamped by a helper that
+# folds the rest in as the zeros it holds (cetrafs_bg_image_crc(),
+# cetrafs_bgseg_crc_prefix()). A whole-block helper reads past the
+# region buffer and stamps a checksum over bytes that are not the
+# device's: the first live-grow link failed every time for exactly
+# that, and a record whose verify did not catch it would have been
+# restamped from heap garbage (class 47).
+log "checking no CAS mutator checksums past the region it is handed (class 47)"
+WHOLE_BLOCK_CRC='cetrafs_bg_crc_verify|cetrafs_bgseg_crc|cetrafs_journal_header_crc'
+cas_mutators() { cat "$@" | tr '\n' ' ' | grep -oE 'cetrafs_cas_[a-z_]+\([^;]*' | grep -oE 'cetrafs_[a-z0-9_]+_mutate' | sort -u; }
+mutator_whole_crc() { # <files>: mutator:helper for each whole-block checksum a CAS mutator calls
+    local m f
+    for m in $(cas_mutators "$@"); do
+        for f in "$@"; do
+            fn_body "$f" "$m" | grep -oE "\b($WHOLE_BLOCK_CRC)\(" | tr -d '(' | sed "s/^/$m:/" || true
+        done
+    done | sort -u
+}
+NMUT="$(cas_mutators "$K"/*.c | grep -c .)"
+[ "$NMUT" -ge 25 ] || fail "class 47: setup -- found only $NMUT CAS mutators (the scan no longer matches)"
+MW="$(mutator_whole_crc "$K"/*.c)"
+[ -z "$MW" ] && pass "class 47: none of $NMUT CAS mutators checksums a whole block from its region" ||
+    fail "class 47: a CAS mutator computes a whole-block checksum over its one-region image: $(echo $MW)"
+SAMPLE="$(ct_tmp cas-sample).c"
+printf 'static int cetrafs_x_mutate(void *image, unsigned int len, void *priv)\n{\n    return cetrafs_bgseg_crc(image);\n}\nstatic int f(void)\n{\n    return cetrafs_cas_record(sb, 1,\n        cetrafs_x_mutate, NULL);\n}\n' >"$SAMPLE"
+[ "$(mutator_whole_crc "$SAMPLE")" = "cetrafs_x_mutate:cetrafs_bgseg_crc" ] &&
+    pass "class 47: control -- a planted whole-block checksum in a mutator is found" ||
+    fail "class 47: control -- a planted whole-block checksum in a mutator is not found"
+
+# "Not in the layout I have" is not "not in the volume" once the volume
+# can grow under a mount. A check that answers "out of range" against a
+# layout another node may already have outgrown must refresh first, and
+# when it still cannot tell, say so (-EAGAIN) to callers that then
+# neither drop, mark nor zero anything (class 48): replay dropped a
+# dead peer's entry into new Block Groups and parked its area clean, a
+# node whose LUN was not yet rescanned marked healthy files damaged, and
+# a directory leaf in new space read as "no owner" and was zeroed.
+log "checking range verdicts against a growable layout can say 'cannot tell' (class 48)"
+fns_with() { # <regex> <files...>: file:fn for every function whose body matches
+    local re="$1"; shift
+    for f in "$@"; do
+        awk -v F="$(basename "$f")" -v RE="$re" '
+            /^[a-z_][a-z0-9_ *]*\(/ && !/;$/ { if (fn != "" && hit) print F ":" fn; fn = $0; sub(/\(.*/, "", fn); n = split(fn, a, " "); fn = a[n]; sub(/^\*+/, "", fn); hit = 0 }
+            $0 ~ RE && !/^[a-z_]/ && !/^[[:space:]]*\*/ && !/^[[:space:]]*\/\*/ { hit = 1 }
+            END { if (fn != "" && hit) print F ":" fn }' "$f"
+    done | sort -u
+}
+any_fn_body() { # <file> <fn>: fn_body, for static and exported functions alike
+    awk -v f="$2" '$0 ~ "^[a-z_].*[ *]" f "[(]" && !/;[[:space:]]*$/ { on = 1 } on { print } on && /^}/ { exit }' "$1"
+}
+unhandled_check() { # <files...>: callers of cetrafs_lba_run_check() that never mention -EAGAIN
+    local c
+    for c in $(fns_with 'cetrafs_lba_run_check[(]' "$@"); do
+        any_fn_body "$(dirname "$1")/${c%%:*}" "${c#*:}" | grep -q -- '-EAGAIN' || echo "$c"
+    done
+}
+CK="$(fns_with 'cetrafs_lba_run_check[(]' "$K"/*.c)"
+[ "$(grep -c . <<<"$CK")" -ge 7 ] || fail "class 48: setup -- found only $(grep -c . <<<"$CK") callers of cetrafs_lba_run_check()"
+UH="$(unhandled_check "$K"/*.c)"
+[ -z "$UH" ] && pass "class 48: every one of $(grep -c . <<<"$CK") cetrafs_lba_run_check() callers handles 'cannot tell'" ||
+    fail "class 48: a caller of cetrafs_lba_run_check() never handles -EAGAIN: $(echo $UH)"
+# The boolean form folds "cannot tell" into "not data": only for callers
+# whose refusal decides nothing. A new one is a decision to review.
+BOOL_OK='file.c:cetrafs_scrub_tree_bread file.c:cetrafs_tree_invalidate_cached'
+BC="$(fns_with 'cetrafs_lba_run_is_data[(]' "$K"/*.c | tr '\n' ' ' | sed 's/ $//')"
+[ "$BC" = "$BOOL_OK" ] && pass "class 48: the boolean address check is used only where 'not data' decides nothing" ||
+    fail "class 48: cetrafs_lba_run_is_data() callers changed: '$BC' (reviewed: '$BOOL_OK') -- a caller that marks, drops or zeroes on 'not data' must use cetrafs_lba_run_check()"
+any_fn_body "$K/alloc.c" cetrafs_bg_id_for_lba | grep -q 'cetrafs_sb_layout_refresh' &&
+    any_fn_body "$K/alloc.c" cetrafs_bg_id_for_lba | grep -q -- '-EAGAIN' &&
+    pass "class 48: the Block Group lookup refreshes before it answers 'outside every region'" ||
+    fail "class 48: cetrafs_bg_id_for_lba() no longer refreshes the layout or answers -EAGAIN"
+SAMPLE="$(ct_tmp c48-sample).c"
+printf 'static int cetrafs_new_reader(struct super_block *sb)\n{\n    if (cetrafs_lba_run_check(sb, 5, 1))\n        cetrafs_sb_corrupt(sb, 0);\n    return 0;\n}\n' >"$SAMPLE"
+[ "$(unhandled_check "$SAMPLE")" = "$(basename "$SAMPLE"):cetrafs_new_reader" ] &&
+    pass "class 48: control -- a planted caller that marks on 'cannot tell' is found" ||
+    fail "class 48: control -- a planted caller that marks on 'cannot tell' is not found"
 
 # The module must publish the filesystem alias get_fs_type() asks
 # modprobe for ("fs-<name>") when a mount names a type nothing has

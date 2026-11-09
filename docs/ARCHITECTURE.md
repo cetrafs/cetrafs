@@ -27,7 +27,7 @@ and `docs/` the long-form detail.
 | Introspection | Functional | `/proc/fs/cetrafs/<device>/{info,properties,cluster,controls}` (`controls` is writable: per-mount defrag toggles and bounded cluster timing) |
 | Sparse-file APIs | Functional | `SEEK_HOLE`/`SEEK_DATA` and `FS_IOC_FIEMAP`, so `cp --sparse=auto`, `tar -S`, `qemu-img convert` and `filefrag` all work on a thin image |
 | Discard / `UNMAP` | **Not built** | No `FITRIM`, no `discard` mount option. Space freed in the filesystem stays mapped in a thin pool for the life of the volume. Designed, not implemented: `docs/DISCARD-DESIGN.md` |
-| Growing a volume | Functional, **OFFLINE only** | `growfs.cetra` extends the Block Group chain into space the device already has. It refuses while the volume is mounted anywhere, and that refusal is load-bearing: the tool relocates the Block Group table, which every mounted node reads from its cached superblock on the allocation path with no lock held. Growing without unmounting needs an RCU'd superblock swap, a `layout_gen` check on the heartbeat, and a node-registry capability gate; the registry half is in place (`live_grow_ready` in procfs), the other two are not |
+| Growing a volume | Functional, **online or offline** | `growfs.cetra` extends the Block Group chain into space the device already has. On a host that has the volume mounted it grows it LIVE: it writes the new Block Groups and their table segment past the published end under the volume's repair claim, then hands the new superblock to `CETRAFS_IOC_GROW`, and the kernel re-checks the whole layout before it credits the pool, links the segment and swaps block 0 (`kmod/grow.c`). New Block Groups go to the unowned pool. Every node catches up through `layout_gen` on its heartbeat, or at once when it meets an address past the end it knows; the layout is one object published by pointer (`struct cetrafs_bg_layout`, `kmod/fs.c`). Unmounted, it grows offline as before. Two-node coverage is `ctest/` |
 | Not built | — | Multi-extent (spanned-across-LUNs) volumes, snapshot/clone resignaturing, VAAI-style offload beyond ATS (no `XCOPY`, no `WRITE SAME`), special files (`mknod`), `O_TMPFILE`, POSIX ACLs |
 
 What is deferred and why -- along with the deployment requirements a
@@ -157,7 +157,7 @@ and must be accessed through `cetrafs_le*()`/`cetrafs_cpu_to_le*()`; see
 | pending_free_blocks_per_zg | `__le32` | queue blocks per ZG (`CETRAFS_PENDING_FREE_BLOCKS_PER_ZG`) |
 | node_journal_start | `__le64` | LBA of the per-node journal area |
 | node_journal_blocks | `__le32` | blocks per node (flag block + slots) |
-| layout_gen | `__le64` | layout generation counter: incremented each time `growfs` relocates on-disk structures. Gates which nodes may mount a live volume during a grow (only nodes that understand `layout_gen` via `CETRAFS_NODE_CAP_LIVE_GROW`) |
+| layout_gen | `__le64` | layout generation counter: incremented by every grow. Mounted nodes compare it on each heartbeat and rebuild their in-core layout when it moves; a live grow requires every registered node to advertise `CETRAFS_NODE_CAP_LIVE_GROW` |
 | features_compat/incompat/ro_compat | `__le64` | feature bitmasks |
 | checksum | `__le64` | CRC32C over the struct with this field zeroed (low 32 bits used) |
 | uuid[16] | `u8[]` | filesystem UUID |

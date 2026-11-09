@@ -1991,6 +1991,13 @@ static int __cetrafs_journal_replay_node(struct super_block *sb, u32 node_id, bo
          * tests/kernel/journal_replay_lookup_error.sh). Not knowing
          * aborts with the area DIRTY, as a payload read failure does;
          * the next replay asks again.
+         *
+         * A target past the end of THIS node's layout is the same "not
+         * knowing" on a volume grown live: a peer can grow, write there
+         * and die before our next heartbeat. The lookup refreshes the
+         * layout first and answers -EINVAL only against a current one;
+         * when it cannot tell (-EAGAIN) the area stays DIRTY too
+         * (GROWFS-LIVE-REVIEW H1; tests/kernel/grow_live_replay.sh).
          */
         {
             u32 tgt_zg;
@@ -2061,8 +2068,8 @@ static int __cetrafs_journal_replay_node(struct super_block *sb, u32 node_id, bo
             bool live = true;
             int aret = cetrafs_data_block_is_allocated(sb, entries[s].target_lba, &live);
 
-            if (aret == -EIO) {
-                ret = aret;
+            if (aret == -EIO || aret == -EAGAIN) {
+                ret = -EIO;
                 goto out_free;
             }
             if (!aret && !live) {

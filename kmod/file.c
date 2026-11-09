@@ -2126,9 +2126,20 @@ static int cetrafs_leaf_array_convert(struct super_block *sb,
         /* Past the end THIS node knows of is first a question for the
          * layout: a peer may have grown the volume and allocated there
          * (cetrafs_sb_layout_refresh()). */
-        if (len && phys + len > total_blocks && cetrafs_sb_layout_refresh(sb) == 1) {
-            raw_sb = cetrafs_sb_raw(sb);
-            total_blocks = le64_to_cpu(raw_sb->total_blocks);
+        if (len && phys + len > total_blocks) {
+            int r = cetrafs_sb_layout_refresh(sb);
+
+            if (r < 0 && (u64) eb + len <= CETRAFS_MAX_FILE_BLOCKS) {
+                /* Cannot tell (GROWFS-LIVE-REVIEW H2): refused, not marked. */
+                pr_warn_ratelimited("extent [block %u +%u] at lba %llu lies past this node's layout, which it "
+                                    "cannot bring up to date (%d) -- refusing it, marking nothing\n",
+                                    eb, len, (unsigned long long) phys, r);
+                return -EIO;
+            }
+            if (r == 1) {
+                raw_sb = cetrafs_sb_raw(sb);
+                total_blocks = le64_to_cpu(raw_sb->total_blocks);
+            }
         }
         if (len == 0 || (u64) eb + len > CETRAFS_MAX_FILE_BLOCKS || phys + len > total_blocks) {
             pr_err_ratelimited("extent [block %u +%u] at lba %llu does not fit the volume (%llu blocks) -- corrupt\n",
@@ -3003,7 +3014,12 @@ static int cetrafs_tree_lookup(struct inode *inode,
     if (ret || !*found)
         return ret;
 
-    if (!cetrafs_lba_run_is_data(inode->i_sb, *out_lba, out_run ? *out_run : 1)) {
+    ret = cetrafs_lba_run_check(inode->i_sb, *out_lba, out_run ? *out_run : 1);
+    if (ret == -EAGAIN) {
+        *found = false;
+        return -EIO; /* past a layout this node cannot catch up with: not damage */
+    }
+    if (ret) {
         pr_err_ratelimited("ino=%llu: logical block %u maps to [%llu,+%u), which is not a data address -- refusing it (fsck)\n",
                            (unsigned long long) inode->i_ino, iblock, (unsigned long long) *out_lba,
                            out_run ? *out_run : 1);

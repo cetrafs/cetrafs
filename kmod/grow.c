@@ -74,16 +74,20 @@ struct cetrafs_grow_link_ctx {
 /* The old tail's next, pointed at the new segment. Re-checked on the
  * image the swap compares against: it must still be the tail of the
  * Block Groups the published superblock counts. A next that is already
- * set can only be an interrupted grow's link (mount and fsck accept it
- * as such), and is replaced, as offline growfs replaces it. */
+ * set is replaced, as offline growfs replaces it: with a growfs claim
+ * held (cetrafs_grow_claim_held(), checked before anything here) no
+ * other grower can be between its link and its publish, so it can only
+ * be an interrupted grow's link -- which mount and fsck accept as such
+ * (cetrafs_layout_pending_link()). */
 static int cetrafs_grow_link_mutate(void *image, unsigned int len, void *priv)
 {
     struct cetrafs_grow_link_ctx *ctx = priv;
-    cetrafs_bg_segment_t *seg = image;
+    cetrafs_bg_segment_t *seg = image; /* the first CAS region of the block only: every field, no padding */
 
-    if (len < sizeof(*seg))
+    if (len < offsetof(cetrafs_bg_segment_t, pad))
         return -EINVAL;
-    if (le32_to_cpu(seg->magic) != CETRAFS_BGSEG_MAGIC || cetrafs_bgseg_crc(seg) != (u32) le64_to_cpu(seg->checksum))
+    if (le32_to_cpu(seg->magic) != CETRAFS_BGSEG_MAGIC ||
+        cetrafs_bgseg_crc_prefix(image, len) != (u32) le64_to_cpu(seg->checksum))
         return -EUCLEAN;
     if ((u64) le32_to_cpu(seg->first_bg_id) + le32_to_cpu(seg->count) != ctx->old_count)
         return -ESTALE;
@@ -91,7 +95,7 @@ static int cetrafs_grow_link_mutate(void *image, unsigned int len, void *priv)
         return 1; /* already linked: an earlier attempt landed */
     seg->next = cpu_to_le64(ctx->new_seg_lba);
     seg->checksum = cpu_to_le64(0);
-    seg->checksum = cpu_to_le64((u64) cetrafs_bgseg_crc(seg));
+    seg->checksum = cpu_to_le64((u64) cetrafs_bgseg_crc_prefix(image, len));
     return 0;
 }
 
@@ -202,6 +206,43 @@ int cetrafs_grow_commit(struct super_block *sb, const struct cetrafs_grow_plan *
     return 0;
 }
 
+/*
+ * Is a growfs claim -- a Node Registry row in REPAIR labelled "growfs"
+ * -- on the device? 0 if so, -EBUSY if not, -EIO if the registry cannot
+ * be read (not knowing is not "none").
+ *
+ * PRESENCE, not liveness: the mount gate's check
+ * (cetrafs_node_repair_claim_exists()) watches the claim's heartbeat
+ * move, sleeping up to a stale window, and the caller here is the very
+ * process whose renewal timer moves it -- its SIGALRM interrupted that
+ * sleep and every grow failed with EINTR. A grower that loses its row
+ * stops itself (its timer finds the row taken); what this adds is that
+ * nothing publishes while NO growfs claim is held. A dead growfs's row
+ * would satisfy it, and also blocks every mount until it goes stale.
+ */
+static int cetrafs_grow_claim_held(struct super_block *sb)
+{
+    const cetrafs_superblock_t *raw_sb = cetrafs_sb_raw(sb);
+    cetrafs_node_entry_t ne;
+    u32 count, idx;
+
+    if (!raw_sb)
+        return -EIO;
+    count = le32_to_cpu(raw_sb->node_table_count);
+    for (idx = 0; idx < count && idx < CETRAFS_MAX_READER_NODES; idx++) {
+        int r = cetrafs_node_get_entry(sb, idx, &ne);
+
+        if (r == -EIO)
+            return -EIO;
+        if (r || le32_to_cpu(ne.state) != CETRAFS_NODE_STATE_REPAIR)
+            continue; /* a bad row is not a claim */
+        if (!strncmp(ne.label, "growfs", sizeof(ne.label)))
+            return 0;
+    }
+    pr_err("grow: no growfs claim on the volume -- refusing to publish\n");
+    return -EBUSY;
+}
+
 long cetrafs_grow_ioctl(struct file *file, const cetrafs_superblock_t __user *arg)
 {
     struct super_block *sb = file_inode(file)->i_sb;
@@ -224,6 +265,17 @@ long cetrafs_grow_ioctl(struct file *file, const cetrafs_superblock_t __user *ar
         pr_err("grow: a registered node does not advertise live-grow support -- grow it offline\n");
         return -EOPNOTSUPP;
     }
+    /*
+     * The claim is what keeps two growers' Block Group writes apart, and
+     * what makes the link below safe to overwrite an existing next (only
+     * an interrupted grow under an earlier claim can have set it). That
+     * was a premise about the CALLER -- growfs takes it -- and nothing
+     * here checked it, so any CAP_SYS_ADMIN program could publish a
+     * superblock with no claim held (GROWFS-LIVE-REVIEW M2).
+     */
+    rc = cetrafs_grow_claim_held(sb);
+    if (rc)
+        return rc;
     nw = memdup_user(arg, sizeof(*nw));
     if (IS_ERR(nw))
         return PTR_ERR(nw);

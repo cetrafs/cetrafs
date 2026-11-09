@@ -80,7 +80,7 @@ Roughly by area:
 
 | area | what it covers |
 |---|---|
-| mount / superblock | validation, refusal of damaged or foreign volumes, remount, the Block Group table chain a grown volume carries, and the claim an offline `fsck -r`/`growfs` holds while it works |
+| mount / superblock | validation, refusal of damaged or foreign volumes, remount, the Block Group table chain a grown volume carries, and the claim `fsck -r`/`growfs` holds while it works |
 | inode / dirent / dir | the namespace, directory growth past inline extents, cross-node reuse |
 | file / extent / punch | the extent tree at depth 0/1/2, truncate, hole punch, sparse files, `fiemap`/`SEEK` |
 | addresses read off the disk | an extent whose physical block names the inode table is refused before anything maps it -- the checksum cannot catch it (the record is restamped and merely says something impossible), and following it made an ordinary `write(2)` destroy the global tables |
@@ -92,7 +92,7 @@ Roughly by area:
 | lock / nslock | the whole-file exclusive lock, `flock(2)`, the per-inode namespace lock |
 | journal | redo journalling and replay, including a dead node's journal |
 | scrub / defrag | the background reclaim and the online defragmenter |
-| growfs | growing a live volume |
+| growfs | growing a volume offline, and live (`grow_live*`): the publish, a node catching up with a grow it did not make (staged with `grow_skip_local_publish`; the real peer is ctest's `grow-live`), the crash points between a live grow's writes, racing growers and an unclaimed publish, a node whose device is behind the grow (`grow_live_behind`), journal replay into new Block Groups (`grow_live_replay`), and a grow landing during a mount (`grow_mid_mount`) |
 | xattr | `user.*` / `trusted.*` / `security.*` and LSM labelling |
 
 ---

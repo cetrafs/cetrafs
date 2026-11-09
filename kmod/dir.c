@@ -308,7 +308,14 @@ static int cetrafs_dirent_block_live_owner(struct super_block *sb, u64 lba, u64 
     } else if (cetrafs_le16(r.eh.eh_depth) == 1) {
         u64 leaf_lba = cetrafs_extent_phys_from_hilo(r.et.idx[0].ei_leaf_hi, r.et.idx[0].ei_leaf_lo);
 
-        if (!cetrafs_lba_run_is_data(sb, leaf_lba, 1))
+        int chk = cetrafs_lba_run_check(sb, leaf_lba, 1);
+
+        /* "Past a layout this node cannot catch up with" is not "names
+         * nothing": a peer may have grown the volume and put this
+         * directory's leaf there, and answering 0 zeroes its block. */
+        if (chk == -EAGAIN)
+            return -EIO;
+        if (chk)
             return 0; /* not a tree that can list anything */
         leaf = cetrafs_blk_tail_bread(sb, leaf_lba, CETRAFS_LEAF_TAIL_MAGIC, "extent leaf");
         if (!leaf)
@@ -510,8 +517,11 @@ static int cetrafs_dir_extents_addr_ok(struct inode *dir, const struct cetrafs_d
     for (i = 0; i < de->entries; i++) {
         u64 phys = cetrafs_extent_phys_from_hilo(de->arr[i].ee_start_hi, de->arr[i].ee_start_lo);
         u32 len = cetrafs_extent_len(de->arr[i].ee_len);
+        int chk = cetrafs_lba_run_check(dir->i_sb, phys, len);
 
-        if (!cetrafs_lba_run_is_data(dir->i_sb, phys, len)) {
+        if (chk == -EAGAIN)
+            return -EIO; /* past a layout this node cannot catch up with: not damage */
+        if (chk) {
             pr_err_ratelimited("dir ino=%llu: extent %u names blocks %llu+%u outside the data area -- refusing it "
                                "(fsck)\n",
                                (unsigned long long) dir->i_ino, i, (unsigned long long) phys, len);

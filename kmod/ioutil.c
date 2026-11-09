@@ -823,7 +823,7 @@ bool cetrafs_blk_tail_valid(const struct buffer_head *bh, u32 magic)
  */
 struct buffer_head *cetrafs_blk_tail_bread(struct super_block *sb, u64 lba, u32 magic, const char *what)
 {
-    int attempt, nbad = 0;
+    int attempt, nbad = 0, chk;
 
     /* Every block read here -- extent leaf, interior index, xattr -- is
      * reached through an address read off the device, and the xattr and
@@ -831,7 +831,10 @@ struct buffer_head *cetrafs_blk_tail_bread(struct super_block *sb, u64 lba, u32 
      * readers checked theirs before calling (inode.c); an inode's
      * xattr_block went straight here unchecked (rule 19's asymmetry), so
      * the one check now sits where all of them pass. */
-    if (!cetrafs_lba_run_is_data(sb, lba, 1)) {
+    chk = cetrafs_lba_run_check(sb, lba, 1);
+    if (chk == -EAGAIN)
+        return NULL; /* past a layout this node cannot catch up with: refused, not damage */
+    if (chk) {
         pr_err_ratelimited("%s block %llu is not a data address -- refusing it (fsck)\n", what,
                            (unsigned long long) lba);
         cetrafs_sb_corrupt(sb, 0);
