@@ -11,21 +11,15 @@ It is an out-of-tree kernel module (`kmod/`) plus the userspace tools
 coordinate through the storage itself — one atomic SCSI COMPARE AND WRITE
 per contested claim, the same idea as VMFS's ATS — not over a network.
 
+> **Found it useful?** A **star** on
+> [GitHub](https://github.com/cetrafs/cetrafs) helps the project reach
+> the people it is built for — and tells me it is working as expected,
+> which is hard to learn any other way.
+
 **[cetrafs.com](https://cetrafs.com/)** &nbsp;·&nbsp;
 [Documentation](https://cetrafs.com/docs/) &nbsp;·&nbsp;
 [Quick install](https://cetrafs.com/docs/how-tos/install-packages/) &nbsp;·&nbsp;
 [Project status](https://cetrafs.com/docs/intro/status/)
-
-> **Status: young, pre-1.0.** Heavily reviewed, fuzzed and crash-tested,
-> but not production-aged the way VMFS or ext4 are. Built and tested on
-> Linux `7.0.14` and `7.1.8+deb13` (Debian, arm64), on
-> little-endian hosts (arm64, amd64). Keep independent backups.
->
-> **Before deploying anything, read
-> [Project status](https://cetrafs.com/docs/intro/status/).** It is the
-> honest account of what is verified, what is not, and what a trial
-> should check first. If you read one page about this project, read that
-> one.
 
 ## What you get
 
@@ -52,6 +46,20 @@ per contested claim, the same idea as VMFS's ATS — not over a network.
   that reclaims leaked blocks, and an `fsck.cetra` that repairs the
   mechanically-derivable faults and refuses the ambiguous ones.
 
+## Status
+
+**Young, pre-1.0.** Heavily reviewed, fuzzed and crash-tested, but not
+production-aged the way VMFS or ext4 are. Built and tested on Linux
+`7.0.14` and `7.1.8+deb13` (Debian, arm64), on little-endian hosts
+(arm64, amd64). Keep independent backups.
+
+**Before deploying anything, read
+[Project status](https://cetrafs.com/docs/intro/status/).** It is the
+honest account of what is verified, what is not, and what a trial should
+check first — the first thing worth knowing about software this young.
+If you read one page about this project, read that one; nothing else in
+the docs replaces it.
+
 ## Feedback
 
 cetrafs is early, and the fastest way to improve it is to hear from
@@ -63,9 +71,10 @@ bug so far.
   [open an issue](https://github.com/cetrafs/cetrafs/issues). Kernel,
   array, node count and what you expected are usually enough to make a
   report actionable.
-- **Used it, or just have an opinion on the design?** Mail
-  **<mcetra@gmail.com>** — feedback is genuinely wanted, including the
-  unflattering kind.
+- **Used it, or just have an opinion on the design?** Start a thread in
+  [GitHub Discussions](https://github.com/cetrafs/cetrafs/discussions) —
+  that is where feedback belongs, where others can see it and add to it.
+  It is genuinely wanted, including the unflattering kind.
 - **Found it useful?** A **star** on
   [GitHub](https://github.com/cetrafs/cetrafs) helps the project reach
   the people it is built for — and tells me it is working as expected,
@@ -76,11 +85,6 @@ bug so far.
 - **Project site** — <https://cetrafs.com/>
 - **Documentation** — <https://cetrafs.com/docs/>: deployment
   requirements, the operator runbook and the feature matrix.
-
-**Start with [Project status](https://cetrafs.com/docs/intro/status/).**
-It sets out what is actually verified and what is not, which is the first
-thing worth knowing about software this young. Nothing else in the docs
-replaces reading it.
 
 In this repo:
 
