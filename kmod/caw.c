@@ -24,12 +24,20 @@
  *  - NVMe fused Compare(0x05)+Write(0x01): NVMe's COMPARE is compare-ONLY,
  *    so an atomic CAS needs a FUSED command pair (FUSE=01b then 10b)
  *    submitted as one linked unit in a single submission queue. The
- *    kernel exposes NO module-callable API for fused NVMe passthrough
- *    (nvme_submit_sync_cmd and friends are internal to the nvme driver,
- *    unexported, and generic passthrough cannot express the fused
- *    linkage). So the NVMe backend is a deliberate, documented stub
- *    returning -EOPNOTSUPP -- implementing it needs either an nvme-driver
- *    change to export a fused primitive or an in-tree home for this code.
+ *    kernel exposes NO module-callable API for fused NVMe passthrough:
+ *    nvme_submit_sync_cmd() is exported, but it issues ONE command per
+ *    request, and nothing in blk-mq keeps two requests adjacent in one
+ *    queue under a single doorbell, which is what the spec requires of
+ *    a fused pair. The user passthrough paths (ioctl, io_uring) refuse
+ *    any nonzero command flags, the field FUSE lives in, with -EINVAL;
+ *    and the in-kernel target (nvmet) rejects fused commands outright,
+ *    so a Linux-served namespace has none to offer either (all checked
+ *    against the 7.2 source). So the NVMe backend is a deliberate,
+ *    documented stub returning -EOPNOTSUPP -- implementing it needs
+ *    either an nvme-driver change to export a fused primitive or an
+ *    in-tree home for this code. Fused-capable targets do exist (SPDK's
+ *    NVMe-oF target, arrays that back VMFS over NVMe-oF); the missing
+ *    piece is the Linux initiator.
  *    The real deployment target (an FC/iSCSI LUN) presents SCSI anyway.
  *
  * Block size: the atomic unit is one LOGICAL block (bdev_logical_block_
