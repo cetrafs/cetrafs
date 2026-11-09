@@ -4,16 +4,22 @@
  * has (an enlarged LUN, or capacity a `mkfs.cetra -s` deliberately left
  * unformatted).
  *
- * OFFLINE ONLY. This build refuses to run while any node has the volume
- * mounted, and that refusal is load-bearing, not caution: every mounted
- * node caches the superblock and reads bg_table_start off it on the
- * per-block allocation path with no lock held. This tool RELOCATES that
- * table, so a peer running across a grow would keep compare-and-swapping
- * descriptors at the superseded LBAs -- divergent ownership, divergent
- * free counts, then double allocation. The live path needs an RCU'd
- * superblock swap, a layout_gen check on the heartbeat, and a node-
- * registry capability gate; until all three exist, "nobody is mounted"
- * is the entire mutual-exclusion argument and it must hold absolutely.
+ * Two modes, chosen by where it runs:
+ *
+ *  - LIVE, on a host that has the volume mounted. The tool writes the
+ *    new Block Groups and their table segment past the current end,
+ *    where nothing can reach them yet, then hands the new superblock to
+ *    the kernel (CETRAFS_IOC_GROW). The kernel checks it, credits the
+ *    unowned pool, links the segment and publishes the superblock by
+ *    compare-and-swap (kmod/grow.c); every other node catches up
+ *    through layout_gen. Every registered node must advertise live-grow
+ *    support, or the grow is refused.
+ *  - OFFLINE, when no node has it mounted: the tool writes everything
+ *    itself, and refuses if any node is still heartbeating.
+ *
+ * Either way nothing that exists moves -- the new space is appended --
+ * and the tool holds the volume's repair claim throughout, so no second
+ * grower, repair or (offline) mount runs alongside it.
  *
  * Design, and why no format bump is needed:
  * docs/internal/EXTENDFS-DESIGN.md.
@@ -169,9 +175,10 @@ static void usage(const char *argv0)
             "      K/M/G/T suffix; a bare number is MiB, like mkfs.cetra\n"
             "  -n: dry-run (compute & print, no writes)\n"
             "\n"
-            "  The volume must be unmounted on EVERY node. Growing is not a\n"
-            "  live operation in this build and the tool refuses rather than\n"
-            "  risking it.\n",
+            "  Run it on a node that has the volume mounted to grow it live; every\n"
+            "  node must run a build that supports live grow, and each node's device\n"
+            "  must already show the new size (rescan the LUN on every node first).\n"
+            "  With the volume unmounted on every node, it grows it offline.\n",
             argv0);
 }
 
@@ -275,10 +282,10 @@ static void growfs_refuse_live_peer(const char *dev)
     if (lp)
         die_dev(
             "%s is mounted by another node (registry row %u%s%s) -- it is still heartbeating.\n"
-            "       Growing relocates the descriptor tables that node has cached, which would\n"
-            "       send its allocator writes to superseded blocks. Unmount it there, then\n"
-            "       retry. (row's own last_seen reads %llds ago by this machine's clock,\n"
-            "       which means nothing if the two disagree.)",
+            "       Run growfs.cetra on a node that has the volume mounted to grow it live,\n"
+            "       or unmount it on every node to grow it offline. (row's own last_seen\n"
+            "       reads %llds ago by this machine's clock, which means nothing if the two\n"
+            "       disagree.)",
             dev, row, label[0] ? ", " : "", label[0] ? label : "", age);
 }
 
@@ -957,13 +964,14 @@ int main(int argc, char **argv)
      * Nothing is lost and nothing is shared; re-running growfs finishes
      * the grow (the tail walk replaces that link).
      *
-     * A plain write is sufficient ONLY because of the offline premise
+     * Offline, a plain write is sufficient ONLY because of the premise
      * enforced at the top of this function: no node is mounted, so there
-     * is no peer to exclude and no concurrent writer of block 0. The
+     * is no peer to exclude and no concurrent writer of block 0. Live,
+     * this tool writes neither the superblock nor the link: it hands the
+     * superblock to the kernel, which publishes the same change by
+     * compare-and-swap (cetrafs_grow_commit(), kmod/grow.c). The
      * superblock is 424 bytes and its checksum sits at offset 200, so it
-     * is entirely inside sector 0 -- which is what will let the live
-     * path publish this exact same change with one atomic
-     * cetrafs_cas_region(sb, 0, 0, ...) instead, when it exists.
+     * is entirely inside sector 0 -- one swap carries all of it.
      * --------------------------------------------------------------- */
     sb.total_blocks = cetrafs_cpu_to_le64(target_blocks);
     sb.zone_group_count = cetrafs_cpu_to_le32(new_z);
