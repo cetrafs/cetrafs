@@ -135,7 +135,16 @@ In this repo:
   That sets the boot-time default on every mount. To change it on a live
   mount without a reload, write `stale_secs=<n>` to
   `/proc/fs/cetrafs/<dev>/controls` (bounded 15-240 s, and at least 3x
-  `hb_interval_secs`). See the operations guide at <https://cetrafs.com/docs/>.
+  `hb_interval_secs`).
+
+  A `controls` change lasts until the volume is unmounted; the next mount
+  takes the module option again. The module option is read when a volume
+  is mounted, so changing it (in modprobe.d or
+  `/sys/module/cetrafs/parameters/`) does not affect volumes already
+  mounted. It accepts a wider range than `controls`, for the test suites:
+  keep production values inside the same bounds. `hb_interval_secs` works
+  the same way (5-30 s through `controls`). See the operations guide at
+  <https://cetrafs.com/docs/>.
 - The on-disk format is little-endian but portable across host byte order; tested on little-endian hosts (arm64, amd64).
 
 ## Build and test
