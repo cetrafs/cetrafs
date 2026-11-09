@@ -1,3 +1,71 @@
+cetrafs (0.9.5) unstable; urgency=medium
+
+  * No format version change: volumes made by 0.9.4 mount as they are.
+    Upgrade every node; do not mount one volume from 0.9.4 and 0.9.5 at
+    once.
+
+  * New: grow a MOUNTED volume. Resize the LUN, rescan it on every node,
+    then run growfs.cetra on any node that has the volume mounted. The
+    kernel checks and publishes the grow; every other node picks up the
+    new size on its next heartbeat or when it first meets the new space.
+    The new Block Groups start unowned and are claimed as nodes need
+    them. A node whose device has not been rescanned yet refuses I/O to
+    the new space with EIO until it is, and marks nothing damaged. A
+    grow interrupted at any point leaves a volume that mounts at the old
+    size; running growfs.cetra again finishes it. Growing an unmounted
+    volume works as before.
+
+  * Fixed, delete: freeing a deleted file now frees its blocks before
+    its inode number, re-checks the record immediately before the free,
+    and a read-only mount frees nothing. A dead node's half-finished
+    free is completed by the node that reclaims it.
+
+  * Fixed, close and attributes: a close whose publish fails is retried
+    instead of lost; chmod, chown and truncate publish only the fields
+    they change; a setuid/setgid kill is applied on the current record,
+    so it no longer drops a peer's change; fallocate strips setuid and
+    setgid and moves the times; growing a file zeroes the tail of its
+    old last block.
+
+  * Fixed, frees and the scrub: a free queued twice for another node's
+    Zone Group is applied once; the scrub frees only while a Block Group
+    still belongs to the Zone Group it scanned, and skips a cycle while
+    any node has frees in flight; held-back blocks orphaned by a crash
+    are adopted instead of leaked.
+
+  * Fixed, journal: regular files' extent leaves are journaled at the
+    durability boundary, so a crash cannot tear them; a replay that
+    cannot read where its target lies keeps the entry for the next
+    replay instead of dropping it.
+
+  * Fixed, cluster arbitration: a compare-and-write that timed out is
+    confirmed before anything acts on it, or the mount stops; a mount
+    treats a peer's registry row as live only once it beats, so a
+    crashed node no longer blocks mounts; a dead peer's Zone Group is
+    taken over by the heartbeat rather than by whichever writer hits
+    it; a write during a Zone Group release waits instead of failing
+    with ENOSPC.
+
+  * Fixed, mount: Block Groups that overlap are refused; the superblock
+    is validated and read from one private copy; the unmount of a
+    stopped mount writes nothing; statfs refuses on a stopped mount and
+    never reports more free space than exists.
+
+  * Fixed, fsck: a regular file's extent leaf torn by media damage is
+    salvaged; repairs restamp only records that are valid; an orphan
+    recovered into lost+found keeps its file type; short reads and
+    writes are continued.
+
+  * Fixed: defrag refuses every preallocated extent, not only the
+    first, and bounds each step; flock needs a writable descriptor or
+    CAP_SYS_ADMIN; a hard link count is capped at the filesystem's
+    maximum.
+
+  * The test gate is 474 suites and 3933 assertions; the two-node suite
+    gained a live-grow scenario.
+
+ -- Massimo Cetra <mcetra@gmail.com>  Mon, 09 Nov 2026 10:10:28 +0000
+
 cetrafs (0.9.4) unstable; urgency=medium
 
   * No format version change: volumes made or grown by 0.9.3 mount as
