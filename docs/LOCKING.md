@@ -335,8 +335,10 @@ and requires `stale_secs >= CETRAFS_STALE_MIN_BEATS x hb_interval_secs` (≥3
 beats, so one missed tick is never fatal). The ceiling matters as much as the
 floor: a window of many minutes would leave a genuinely crashed node's claims
 locked up far longer than a VM datastore can tolerate. The `hb_interval_secs`/
-`stale_secs` *module params* are deliberately unbounded — they are test knobs
-the loop suites use to compress timing, not an operator interface. An observer
+`stale_secs` *module params* are the persistent defaults for new mounts
+(modprobe.d) and are bounded more loosely -- 1–3600 s and 3–86400 s, the
+window always at least three beats -- because the loop suites use them to
+compress timing below the `controls` range. An observer
 additionally floors its window at four of a peer's *own advertised* beat, so a
 differently-tuned peer is never misjudged (see `cetrafs_node_is_stale()`).
 

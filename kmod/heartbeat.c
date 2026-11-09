@@ -65,17 +65,19 @@
  * Off by default; nothing in normal operation touches it.
  */
 /*
- * Heartbeat period. A module param for the same reason stale_secs is
- * (node.c): staleness assertions otherwise cost a real minute each, and
- * a reclaim only happens on a tick. Keep it well below stale_secs --
- * several ticks must fit inside the stale window, or ordinary jitter
- * starts looking like a dead node.
+ * Heartbeat period: the default for mounts made after a write, so it
+ * can be set persistently (modprobe.d) as well as per mount (the
+ * controls file). The suites also use it to compress timing. A mount
+ * takes it clamped to 1..3600 s, and stale_secs is raised to at least
+ * three beats (cetrafs_param_stale_secs()). Keep it well below
+ * stale_secs -- several ticks must fit inside the stale window, or
+ * ordinary jitter starts looking like a dead node.
  */
 unsigned int cetrafs_hb_interval_secs = CETRAFS_HEARTBEAT_INTERVAL_SECS;
-cetrafs_test_param(hb_interval_secs, cetrafs_hb_interval_secs, uint, 0644);
+module_param_named(hb_interval_secs, cetrafs_hb_interval_secs, uint, 0644);
 MODULE_PARM_DESC(hb_interval_secs,
-                 "TEST ONLY: seconds between heartbeat ticks for mounts made after a write (clamped to 1..3600); "
-                 "operators use the per-mount controls file, which enforces the safe range");
+                 "seconds between heartbeat ticks, for mounts made after a write (default 15; clamped to 1..3600). "
+                 "The controls file sets it per mount within 5..30");
 
 /* TEST ONLY: fail every heartbeat renewal without touching the device,
  * as a hung or unreachable LUN would (tests/kernel/lease_expiry.sh). */

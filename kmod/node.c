@@ -1250,19 +1250,20 @@ int cetrafs_node_mark_offline(struct super_block *sb, u32 my_node_id)
  * cluster manager's job, not the filesystem's (see docs/LOCKING.md).
  */
 /*
- * How long a peer's hb_seq may sit unchanged before we call it dead.
- *
- * A module param purely so tests can compress it: the default is four
- * heartbeat intervals, and a test that had to wait a real minute for
- * every staleness assertion would not get written. Changing it on a live
- * cluster is a way to cause split brain, not a tuning knob -- too small
- * and an ordinarily slow node gets reclaimed out from under itself.
+ * How long a peer's hb_seq may sit unchanged before we call it dead:
+ * the default for mounts made after a write, so a site whose multipath
+ * queues I/O longer than the default window can raise it persistently
+ * (modprobe.d, README). The suites also use it to compress timing. A
+ * mount takes it clamped to 3..86400 s and to at least three heartbeat
+ * intervals (cetrafs_param_stale_secs()). Too small and an ordinarily
+ * slow node gets reclaimed out from under itself -- the controls file
+ * keeps a live change within 15..240.
  */
 unsigned int cetrafs_stale_secs = CETRAFS_NODE_STALE_SECS;
-cetrafs_test_param(stale_secs, cetrafs_stale_secs, uint, 0644);
+module_param_named(stale_secs, cetrafs_stale_secs, uint, 0644);
 MODULE_PARM_DESC(stale_secs,
-                 "TEST ONLY: seconds a peer may stall before treated as dead, for mounts made after a write (clamped "
-                 "to 3..86400); operators use the per-mount controls file, which enforces the safe range");
+                 "seconds a peer may stall before it is treated as dead, for mounts made after a write (default 120; "
+                 "clamped to 3..86400 and to at least 3 heartbeats). The controls file sets it per mount within 15..240");
 
 /* TEST ONLY: make the no-CAW mount gate's live-peer check report a live
  * foreign peer unconditionally, skipping the heartbeat watch. On the loop

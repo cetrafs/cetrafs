@@ -348,6 +348,8 @@ ext_cache:extent-tree cache on/off; off reads the device every time
 scrub:background leak scrub on/off; off leaks until fsck, never frees
 scrub_interval_secs:scrub period (0 means the default)
 scrub_gap_secs:scrub pacing (0 means the default)
+hb_interval_secs:heartbeat period for new mounts; clamped 1..3600 (cetrafs_param_hb_interval_secs)
+stale_secs:stale window for new mounts; clamped 3..86400 and to >= 3 beats (cetrafs_param_stale_secs)
 node_uuid:load-time only (0444): this node identity
 pf_full_backoff_ms:pending-free queue backoff (latency)
 pf_drain_min_ms:pending-free drain rate limit (latency)
@@ -359,10 +361,10 @@ NPLAIN="$(plain_params "$K"/*.c | wc -l)"
 [ -z "$UNLISTED" ] && pass "plain params: all $NPLAIN plain module parameters are listed tuning knobs" ||
     fail "plain params: not TEST ONLY and not listed (bound it or trace it): $(echo $UNLISTED)"
 SAMPLE="$(ct_tmp plainparam-sample).c"
-printf '%s\n' 'module_param_named(stale_secs, cetrafs_stale_secs, uint, 0644);' >"$SAMPLE"
-[ "$(plain_params "$SAMPLE")" = stale_secs ] && ! grep -q "^stale_secs:" <<<"$PLAIN_OK" &&
-    pass "plain params: control -- the old plain stale_secs would be flagged" ||
-    fail "plain params: control -- the old plain stale_secs would not be flagged"
+printf '%s\n' 'module_param_named(x_window_secs, cetrafs_x_window_secs, uint, 0644);' >"$SAMPLE"
+[ "$(plain_params "$SAMPLE")" = x_window_secs ] && ! grep -q "^x_window_secs:" <<<"$PLAIN_OK" &&
+    pass "plain params: control -- an unlisted plain parameter is flagged" ||
+    fail "plain params: control -- an unlisted plain parameter is not flagged"
 
 # Every site that MODIFIES a tail-checksummed block must restamp it.
 #
