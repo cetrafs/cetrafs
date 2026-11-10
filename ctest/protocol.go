@@ -429,8 +429,13 @@ type NodeInfo struct {
 	HBSeq    uint64 `json:"hb_seq"`
 	LastSeen uint64 `json:"last_seen"`
 	Label    string `json:"label"`
-	Stale    bool   `json:"stale"`
-	ThisNode bool   `json:"this_node"`
+	// StaleSecs is the stale window the node advertises; Departure is
+	// "none", "clean" (its own unmount) or "dead" (a peer's verdict) --
+	// format 0x000A, where last_seen stopped meaning anything but time.
+	StaleSecs uint32 `json:"stale_secs"`
+	Departure string `json:"departure"`
+	Stale     bool   `json:"stale"`
+	ThisNode  bool   `json:"this_node"`
 }
 
 type ProcSnapshotResult struct {

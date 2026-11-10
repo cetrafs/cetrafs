@@ -54,8 +54,13 @@ var (
 	// empty, and every staleness-driven scenario waited forever on a
 	// peer that was in fact long stale. Same lesson as reZGLine above:
 	// this parser must track the emitter, and silence is the failure.
+	// It happened again with format 0x000A (stale_secs= and departure=
+	// between caps= and stale=), so reNodePrefix now makes a node line
+	// this pattern cannot read an error, as reZGPrefix does for zg lines.
 	reNodeLine = regexp.MustCompile(
-		`^node (\d+): state=(\S+) uuid=(\S+) hb_seq=(\d+) last_seen=(\d+) label=(\S+) caps=(\S+) stale=(\S+)`)
+		`^node (\d+): state=(\S+) uuid=(\S+) hb_seq=(\d+) last_seen=(\d+) label=(\S+) caps=(\S+) ` +
+			`stale_secs=(\d+) departure=(\S+) stale=(\S+)`)
+	reNodePrefix = regexp.MustCompile(`^node \d+: state=`)
 )
 
 func readProcSnapshot(device string) (ProcSnapshotResult, error) {
@@ -180,20 +185,29 @@ func parseClusterFile(path string, out *ProcSnapshotResult) error {
 		line := sc.Text()
 		m := reNodeLine.FindStringSubmatch(line)
 		if m == nil {
+			// A node line this parser could not read is a FAILURE: an
+			// empty Nodes reads as "no peer is stale", and every
+			// staleness-driven scenario then waits out its timeout.
+			if reNodePrefix.MatchString(line) {
+				return fmt.Errorf("unparsable node line (the cluster format changed?): %q", line)
+			}
 			continue
 		}
 		id, _ := strconv.Atoi(m[1])
 		hbSeq, _ := strconv.ParseUint(m[4], 10, 64)
 		lastSeen, _ := strconv.ParseUint(m[5], 10, 64)
+		staleSecs, _ := strconv.ParseUint(m[8], 10, 32)
 		out.Nodes = append(out.Nodes, NodeInfo{
-			ID:       id,
-			State:    m[2],
-			UUID:     m[3],
-			HBSeq:    hbSeq,
-			LastSeen: lastSeen,
-			Label:    m[6],
-			Stale:    m[8] == "yes",
-			ThisNode: strings.Contains(line, "(this node)"),
+			ID:        id,
+			State:     m[2],
+			UUID:      m[3],
+			HBSeq:     hbSeq,
+			LastSeen:  lastSeen,
+			Label:     m[6],
+			StaleSecs: uint32(staleSecs),
+			Departure: m[9],
+			Stale:     m[10] == "yes",
+			ThisNode:  strings.Contains(line, "(this node)"),
 		})
 	}
 	return sc.Err()
