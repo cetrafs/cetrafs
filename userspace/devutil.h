@@ -165,6 +165,21 @@ static inline int cetrafs_node_row_crc_ok(const cetrafs_node_entry_t *ne)
     return crc32c_struct(&c, sizeof(c), offsetof(cetrafs_node_entry_t, checksum), sizeof(c.checksum)) == want;
 }
 
+/*
+ * Is row 'now' the same beat by the same holder as 'then'? hb_seq alone
+ * is not: it restarts at 1 when a row is registered afresh, so a row
+ * retired and re-registered while we watched could read the very value
+ * we sampled and look like a node that stopped. node_uuid names the
+ * machine (for a REPAIR claim, its per-claim nonce) and incarnation the
+ * mount session, drawn anew at every registration and re-attach (format
+ * 0x000A) -- the kernel's struct cetrafs_row_mark, the same three.
+ */
+static inline int cetrafs_row_same_beat(const cetrafs_node_entry_t *then, const cetrafs_node_entry_t *now)
+{
+    return then->hb_seq == now->hb_seq && then->incarnation == now->incarnation &&
+           !memcmp(then->node_uuid, now->node_uuid, sizeof(then->node_uuid));
+}
+
 static inline ssize_t cetrafs_node_row_pread_settled(int fd, unsigned char *blk, off_t off, unsigned *budget_ms)
 {
     unsigned delay = 10;
@@ -494,8 +509,8 @@ static inline void cetrafs_repair_reap(int fd, const cetrafs_superblock_t *sb, u
     if (pread(fd, blk, sizeof(blk), cetrafs_node_row_off(sb, idx)) != (ssize_t) sizeof(blk))
         return;
     memcpy(&ne, blk, sizeof(ne));
-    if (cetrafs_le32(ne.state) != CETRAFS_NODE_STATE_REPAIR || ne.hb_seq != judged->hb_seq)
-        return;
+    if (cetrafs_le32(ne.state) != CETRAFS_NODE_STATE_REPAIR || !cetrafs_row_same_beat(judged, &ne))
+        return; /* renewed since, or another claim (another nonce) */
     memcpy(&saved, blk + CETRAFS_REPAIR_SAVED_OFF, sizeof(saved));
     memset(out, 0, sizeof(out));
     if (cetrafs_le32(saved.state) == CETRAFS_NODE_STATE_REGISTERED && cetrafs_node_row_crc_ok(&saved))
@@ -607,7 +622,7 @@ static inline int cetrafs_find_repair_claim(int fd,
             }
             if (cetrafs_le32(first[idx].state) != CETRAFS_NODE_STATE_REPAIR)
                 continue; /* not seen before */
-            if (!changed && ne.hb_seq == first[idx].hb_seq) {
+            if (!changed && cetrafs_row_same_beat(&first[idx], &ne)) {
                 /* Not renewed over the whole window: its repairer is
                  * gone. Give the row back, or it stays REPAIR forever. */
                 cetrafs_repair_reap(fd, sb, idx, &first[idx]);
@@ -1092,39 +1107,37 @@ static uint32_t cetrafs_renew_row;
  * smaller).
  */
 #define CETRAFS_REPAIR_WATCH_ROWS 256
-static uint64_t cetrafs_renew_seen[CETRAFS_REPAIR_WATCH_ROWS];
+/* Each row as it stood (zeroed if unreadable): a beat is any change of
+ * hb_seq, machine or mount session (cetrafs_row_same_beat()) -- a node
+ * that re-registered a row and reached the old hb_seq again got in too. */
+static cetrafs_node_entry_t cetrafs_renew_seen[CETRAFS_REPAIR_WATCH_ROWS];
 
-static inline int cetrafs_repair_row_seq(int fd, const cetrafs_superblock_t *sb, uint32_t idx, uint32_t *state,
-                                         uint64_t *seq)
+static inline int cetrafs_repair_row_read(int fd, const cetrafs_superblock_t *sb, uint32_t idx, cetrafs_node_entry_t *ne)
 {
-    cetrafs_node_entry_t ne;
-
-    if (pread(fd, &ne, sizeof(ne), cetrafs_node_row_off(sb, idx)) != (ssize_t) sizeof(ne))
+    if (pread(fd, ne, sizeof(*ne), cetrafs_node_row_off(sb, idx)) != (ssize_t) sizeof(*ne))
         return -1;
-    *state = cetrafs_le32(ne.state);
-    *seq = cetrafs_le64(ne.hb_seq);
     return 0;
 }
 
 static inline void cetrafs_repair_watch_arm(int fd, const cetrafs_superblock_t *sb, uint32_t row)
 {
-    uint32_t count = cetrafs_le32(sb->node_table_count), idx, state;
-    uint64_t seq;
+    uint32_t count = cetrafs_le32(sb->node_table_count), idx;
 
     for (idx = 0; idx < count && idx < CETRAFS_REPAIR_WATCH_ROWS; idx++)
-        cetrafs_renew_seen[idx] = (idx != row && cetrafs_repair_row_seq(fd, sb, idx, &state, &seq) == 0) ? seq : 0;
+        if (idx == row || cetrafs_repair_row_read(fd, sb, idx, &cetrafs_renew_seen[idx]) != 0)
+            memset(&cetrafs_renew_seen[idx], 0, sizeof(cetrafs_renew_seen[idx]));
 }
 
 /* Async-signal-safe: pread only. 1 if some other REGISTERED row beat. */
 static inline int cetrafs_repair_node_beat(int fd, const cetrafs_superblock_t *sb, uint32_t row)
 {
-    uint32_t count = cetrafs_le32(sb->node_table_count), idx, state;
-    uint64_t seq;
+    uint32_t count = cetrafs_le32(sb->node_table_count), idx;
+    cetrafs_node_entry_t ne;
 
     for (idx = 0; idx < count && idx < CETRAFS_REPAIR_WATCH_ROWS; idx++) {
-        if (idx == row || cetrafs_repair_row_seq(fd, sb, idx, &state, &seq) != 0)
+        if (idx == row || cetrafs_repair_row_read(fd, sb, idx, &ne) != 0)
             continue;
-        if (state == CETRAFS_NODE_STATE_REGISTERED && seq != cetrafs_renew_seen[idx])
+        if (cetrafs_le32(ne.state) == CETRAFS_NODE_STATE_REGISTERED && !cetrafs_row_same_beat(&cetrafs_renew_seen[idx], &ne))
             return 1;
     }
     return 0;
@@ -1417,7 +1430,7 @@ static inline int cetrafs_find_live_peer_on(int fd,
          * CHANGED during the probe, which is a writer at work. */
         /* A row unverifiable at the first look and valid now was written
          * during the probe: that is a live node, whatever its hb_seq. */
-        if (iscand[idx] == 1 && rc == 1 && now_ne.hb_seq == first[idx].hb_seq)
+        if (iscand[idx] == 1 && rc == 1 && cetrafs_row_same_beat(&first[idx], &now_ne))
             continue; /* registered, but not heartbeating: gone */
         if (rc == 2)
             now_ne = first[idx]; /* report what we last could verify (iscand 1 only) */

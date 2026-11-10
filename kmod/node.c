@@ -276,7 +276,7 @@ struct cetrafs_node_reattach_ctx {
     unsigned int stale_secs;
     u32 file_lock_mode;
     u32 caps;          /* CETRAFS_NODE_CAP_* this mount advertises */
-    u64 expect_hb_seq; /* the beat count the row had when it was judged ours */
+    struct cetrafs_row_mark expect; /* the row as it was judged ours: beat, machine, session */
     bool twin;         /* out: the row beat since -- another machine took it */
     u64 fence_epoch;   /* out: the epoch in the image the swap committed */
     u64 hb_seq;        /* out: for the caller's log line */
@@ -303,9 +303,9 @@ static int cetrafs_node_reattach_mutate(void *image, unsigned int len, void *pri
      * row's owner moves hb_seq (a peer's fence bump touches fence_epoch),
      * and our previous incarnation is gone -- so a beat in between is a
      * machine with our identity re-attaching or renewing first. Two
-     * clones of a cleanly unmounted VM both skip the watch (last_seen 0)
+     * clones of a cleanly unmounted VM both skip the watch (departure CLEAN)
      * and would otherwise both land here, on one row. */
-    if (cetrafs_le64(ne.hb_seq) != ctx->expect_hb_seq) {
+    if (!cetrafs_row_mark_same(&ctx->expect, &ne)) {
         ctx->twin = true;
         return -EEXIST;
     }
@@ -348,16 +348,23 @@ static int cetrafs_node_reattach_mutate(void *image, unsigned int len, void *pri
  * peer's fence_epoch; the peer notices on its next heartbeat tick and
  * fences itself. See cetrafs_node_entry_t.fence_epoch.
  */
+/* One row of a bounded watch (the no-CAW mount gate, the repair-claim
+ * watch): whether it is being watched, and as what. */
+struct cetrafs_row_watch {
+    bool watched;
+    struct cetrafs_row_mark mark;
+};
+
 struct cetrafs_node_fence_ctx {
     u64 seen_epoch;     /* out: the epoch after the bump */
     bool mark_departed; /* also stamp the clean-departure sentinel */
     /* The reclaim paths: the verdict must still hold for THIS
      * incarnation of the row (cetrafs_node_fence_peer()). */
     bool check_verdict;
-    bool have_seq;  /* the watch sampled the row: seq is what it judged */
-    u64 seq;
-    bool reattached; /* out: refused, the row's owner came back */
-    u64 landed_seq;  /* out: the row's hb_seq in the image the fence committed */
+    bool have_mark;                 /* the watch sampled the row: mark is what it judged */
+    struct cetrafs_row_mark mark;
+    bool reattached;                /* out: refused, the row's owner came back */
+    struct cetrafs_row_mark landed; /* out: the row as the fence committed it */
 };
 
 static int cetrafs_node_fence_mutate(void *image, unsigned int len, void *priv)
@@ -384,18 +391,21 @@ static int cetrafs_node_fence_mutate(void *image, unsigned int len, void *priv)
      * Fencing it then revoked a LIVE node's lease, and the caller went
      * on to take what the new incarnation holds. The row is the
      * judge: departed still means departed (the watch is not updated
-     * for a departed row, so its seq says nothing then); otherwise the
-     * seq must be the one judged.
+     * for a departed row, so its mark says nothing then); otherwise the
+     * row must still be the one judged -- the same beat by the same
+     * machine in the same mount session (cetrafs_row_mark): a row
+     * registered afresh restarts hb_seq and can reach the judged value
+     * again.
      */
     if (ctx->check_verdict && cetrafs_le32(ne.departure) == CETRAFS_NODE_DEPART_NONE &&
-        (!ctx->have_seq || cetrafs_le64(ne.hb_seq) != ctx->seq)) {
+        (!ctx->have_mark || !cetrafs_row_mark_same(&ctx->mark, &ne))) {
         ctx->reattached = true;
         return 1; /* write nothing */
     }
 
     ne.fence_epoch = cetrafs_cpu_to_le64(cetrafs_le64(ne.fence_epoch) + 1);
     ctx->seen_epoch = cetrafs_le64(ne.fence_epoch);
-    ctx->landed_seq = cetrafs_le64(ne.hb_seq);
+    cetrafs_row_mark_of(&ctx->landed, &ne); /* the fence moves neither hb_seq nor the incarnation */
     /* Record the verdict as well as revoking the lease: departure = DEAD
      * means the next observer costs one block read instead of another
      * full watch window. Only the mount gate asks for this, because only
@@ -483,10 +493,10 @@ MODULE_PARM_DESC(fence_peer_fail, "TEST ONLY: revoking a stale peer's lease fail
  * 0 also when there is no lease left to revoke (the row is no longer
  * REGISTERED: nobody holds it to keep writing under).
  */
-/* 'judged': the hb_seq the caller itself watched stand still, when it
- * has one (the no-CAW mount gate); NULL takes the peer watch's. */
+/* 'judged': the row the caller itself watched stand still, when it has
+ * one (the no-CAW mount gate); NULL takes the peer watch's. */
 static int cetrafs_node_fence_peer_full(struct super_block *sb, u32 node_id, const char *what, bool mark_departed,
-                                        bool check_verdict, const u64 *judged)
+                                        bool check_verdict, const struct cetrafs_row_mark *judged)
 {
     struct cetrafs_node_fence_ctx ctx = {.mark_departed = mark_departed, .check_verdict = check_verdict};
     const cetrafs_superblock_t *raw_sb = cetrafs_sb_raw(sb);
@@ -507,10 +517,10 @@ static int cetrafs_node_fence_peer_full(struct super_block *sb, u32 node_id, con
     }
 
     if (check_verdict && judged) {
-        ctx.have_seq = true;
-        ctx.seq = *judged;
+        ctx.have_mark = true;
+        ctx.mark = *judged;
     } else if (check_verdict) {
-        ctx.have_seq = cetrafs_sb_peer_watched_seq(sb, node_id, &ctx.seq);
+        ctx.have_mark = cetrafs_sb_peer_judged_mark(sb, node_id, &ctx.mark);
     }
     ret = cetrafs_cas_record(sb, cetrafs_node_row_lba(sb, node_id), cetrafs_node_fence_mutate, &ctx);
     if (ret == 0 && ctx.reattached) {
@@ -526,7 +536,7 @@ static int cetrafs_node_fence_peer_full(struct super_block *sb, u32 node_id, con
     if (ctx.seen_epoch) {
         pr_info("fence: revoked stale node %u's lease (epoch %llu) while reclaiming %s\n", node_id,
                 (unsigned long long) ctx.seen_epoch, what);
-        cetrafs_sb_peer_note_fenced(sb, node_id, ctx.landed_seq);
+        cetrafs_sb_peer_note_fenced(sb, node_id, &ctx.landed);
         /* And close its journal session, so a DIRTY flip or an entry it
          * had queued past the fence is from before a park (M10). Not
          * parked, the reclaim waits: what it is about to take could be
@@ -556,9 +566,12 @@ MODULE_PARM_DESC(reattach_after_fence_force, "TEST ONLY: 1 = every reclaim sees 
  * wrote the very bytes the CAS compares -- so the CAS took a live
  * node's lock, or its reader bit, and neither side could tell.
  *
- * Re-attaching moves hb_seq, and a re-attach always precedes the re-claim
- * it would take; so a row whose hb_seq is still the one the fence landed
- * on, read AFTER the CAS, proves the CAS took nothing live. Anything
+ * Re-attaching moves hb_seq and draws a new incarnation, and a re-attach
+ * always precedes the re-claim it would take; so a row that is still the
+ * one the fence landed on (cetrafs_row_mark: beat, machine, session),
+ * read AFTER the CAS, proves the CAS took nothing live. hb_seq alone was
+ * not enough: a row registered afresh restarts it and can reach the
+ * fenced value again. Anything
  * else -- moved, unreadable, never fenced -- answers true, and the
  * caller gives the claim back.
  */
@@ -566,7 +579,7 @@ bool cetrafs_node_reattached_since_fence(struct super_block *sb, u32 node_id)
 {
     const cetrafs_superblock_t *raw_sb = cetrafs_sb_raw(sb);
     cetrafs_node_entry_t ne;
-    u64 fenced;
+    struct cetrafs_row_mark fenced;
 
     if (cetrafs_reattach_after_fence_force >= 0)
         return cetrafs_reattach_after_fence_force > 0;
@@ -576,9 +589,9 @@ bool cetrafs_node_reattached_since_fence(struct super_block *sb, u32 node_id)
         return true;
     if (cetrafs_le32(ne.state) != CETRAFS_NODE_STATE_REGISTERED)
         return false; /* nobody holds the row: nothing live to have taken */
-    if (!cetrafs_sb_peer_fenced_seq(sb, node_id, &fenced))
+    if (!cetrafs_sb_peer_fenced_mark(sb, node_id, &fenced))
         return true;
-    return cetrafs_le64(ne.hb_seq) != fenced;
+    return !cetrafs_row_mark_same(&fenced, &ne);
 }
 
 /* TEST ONLY, one-shot: hold the gap between a reclaim's fence and the
@@ -801,7 +814,14 @@ static int cetrafs_node_row_quiet(struct super_block *sb, u32 idx, const cetrafs
     ret = cetrafs_read_node_entry(sb, idx, &now);
     if (ret)
         return ret;
-    return now.hb_seq == ne->hb_seq ? 0 : -EBUSY;
+    {
+        struct cetrafs_row_mark then;
+
+        /* Not hb_seq alone: a twin that re-registered the row restarts
+         * it and can stand at the value we sampled (cetrafs_row_mark). */
+        cetrafs_row_mark_of(&then, ne);
+        return cetrafs_row_mark_same(&then, &now) ? 0 : -EBUSY;
+    }
 }
 
 int cetrafs_node_register(struct super_block *sb,
@@ -852,8 +872,9 @@ int cetrafs_node_register(struct super_block *sb,
                                                     .hb_interval = cetrafs_heartbeat_interval_secs(sb),
                                                     .stale_secs = cetrafs_sb_stale_secs(sb),
                                                     .file_lock_mode = file_lock_mode,
-                                                    .caps = cetrafs_node_my_caps(sb),
-                                                    .expect_hb_seq = cetrafs_le64(ne.hb_seq)};
+                                                    .caps = cetrafs_node_my_caps(sb)};
+
+            cetrafs_row_mark_of(&ctx.expect, &ne);
 
             /* Is the row ours because we LEFT it, or because another
              * machine with our identity is using it right now? A clean
@@ -1421,12 +1442,14 @@ int cetrafs_node_my_uuid(u8 out[CETRAFS_NODE_UUID_LEN])
  * node could not mount again, and only mkfs cleared it.
  *
  * Only while the row is still exactly the claim that was watched (REPAIR,
- * same hb_seq): a repairer that came back and renewed keeps its claim.
+ * same hb_seq, same per-claim nonce in node_uuid): a repairer that came
+ * back and renewed keeps its claim, and so does a NEW claim whose
+ * counter restarted at the watched value.
  * One that comes back after this finds its row taken and stops
  * (cetrafs_repair_lost in the tools).
  */
 struct cetrafs_node_reap_ctx {
-    u64 judged_seq;
+    struct cetrafs_row_mark judged; /* the claim as watched: beat and per-claim nonce */
     bool restored;              /* out: the borrowed row was put back */
     cetrafs_node_entry_t saved; /* out: what was put back */
 };
@@ -1446,7 +1469,7 @@ static int cetrafs_node_reap_mutate(void *image, unsigned int len, void *priv)
     if (len < CETRAFS_REPAIR_SAVED_OFF + sizeof(ctx->saved))
         return -EINVAL;
     memcpy(&ne, image, sizeof(ne));
-    if (cetrafs_le32(ne.state) != CETRAFS_NODE_STATE_REPAIR || cetrafs_le64(ne.hb_seq) != ctx->judged_seq)
+    if (cetrafs_le32(ne.state) != CETRAFS_NODE_STATE_REPAIR || !cetrafs_row_mark_same(&ctx->judged, &ne))
         return -EEXIST;
     memcpy(&ctx->saved, (u8 *) image + CETRAFS_REPAIR_SAVED_OFF, sizeof(ctx->saved));
     memset(image, 0, len);
@@ -1458,10 +1481,10 @@ static int cetrafs_node_reap_mutate(void *image, unsigned int len, void *priv)
     return 0;
 }
 
-static void cetrafs_node_reap_repair_claim(struct super_block *sb, u32 idx, u64 judged_seq)
+static void cetrafs_node_reap_repair_claim(struct super_block *sb, u32 idx, const struct cetrafs_row_mark *judged)
 {
     u64 lba = cetrafs_node_row_lba(sb, idx);
-    struct cetrafs_node_reap_ctx ctx = {.judged_seq = judged_seq};
+    struct cetrafs_node_reap_ctx ctx = {.judged = *judged};
     int ret;
 
     if (!lba)
@@ -1501,7 +1524,7 @@ int cetrafs_node_repair_claim_exists(struct super_block *sb, bool *out_exists, c
 {
     const cetrafs_superblock_t *raw_sb = cetrafs_sb_raw(sb);
     cetrafs_node_entry_t ne;
-    u64 *seq_before;
+    struct cetrafs_row_watch *before;
     u32 count, idx, claims = 0, window, waited;
     int ret = 0;
 
@@ -1511,8 +1534,8 @@ int cetrafs_node_repair_claim_exists(struct super_block *sb, bool *out_exists, c
     count = cetrafs_le32(raw_sb->node_table_count);
     if (!count || count > CETRAFS_MAX_READER_NODES)
         return 0;
-    seq_before = kcalloc(count, sizeof(*seq_before), GFP_KERNEL);
-    if (!seq_before)
+    before = kcalloc(count, sizeof(*before), GFP_KERNEL);
+    if (!before)
         return -ENOMEM;
 
     /*
@@ -1532,8 +1555,9 @@ int cetrafs_node_repair_claim_exists(struct super_block *sb, bool *out_exists, c
             goto out; /* cannot verify: see the contract above */
         }
         if (r || cetrafs_le32(ne.state) != CETRAFS_NODE_STATE_REPAIR)
-            continue;                                  /* a bad row is not a claim */
-        seq_before[idx] = cetrafs_le64(ne.hb_seq) + 1; /* 0 means "not a claim" */
+            continue; /* a bad row is not a claim */
+        before[idx].watched = true;
+        cetrafs_row_mark_of(&before[idx].mark, &ne);
         claims++;
     }
     if (!claims)
@@ -1560,7 +1584,7 @@ int cetrafs_node_repair_claim_exists(struct super_block *sb, bool *out_exists, c
             goto out;
         }
         for (idx = 0; idx < count; idx++) {
-            if (!seq_before[idx])
+            if (!before[idx].watched)
                 continue;
             int r = cetrafs_node_get_entry(sb, idx, &ne);
 
@@ -1571,11 +1595,11 @@ int cetrafs_node_repair_claim_exists(struct super_block *sb, bool *out_exists, c
             if (r)
                 continue;
             if (cetrafs_le32(ne.state) != CETRAFS_NODE_STATE_REPAIR) {
-                seq_before[idx] = 0; /* released */
+                before[idx].watched = false; /* released */
                 continue;
             }
-            if (cetrafs_le64(ne.hb_seq) + 1 == seq_before[idx])
-                continue; /* not renewed yet */
+            if (cetrafs_row_mark_same(&before[idx].mark, &ne))
+                continue; /* not renewed yet, and still the same claim */
             if (out_label && label_sz) {
                 strscpy(out_label, ne.label, min(label_sz, sizeof(ne.label)));
                 out_label[label_sz - 1] = 0;
@@ -1588,10 +1612,10 @@ int cetrafs_node_repair_claim_exists(struct super_block *sb, bool *out_exists, c
      * back rather than leave it REPAIR forever. */
     if (!ret && !*out_exists)
         for (idx = 0; idx < count; idx++)
-            if (seq_before[idx])
-                cetrafs_node_reap_repair_claim(sb, idx, seq_before[idx] - 1);
+            if (before[idx].watched)
+                cetrafs_node_reap_repair_claim(sb, idx, &before[idx].mark);
 out:
-    kfree(seq_before);
+    kfree(before);
     return ret;
 }
 
@@ -1605,7 +1629,7 @@ int cetrafs_node_live_peer_exists(struct super_block *sb, const u8 *my_uuid, boo
 {
     const cetrafs_superblock_t *raw_sb = cetrafs_sb_raw(sb);
     cetrafs_node_entry_t ne;
-    u64 *hb_before;
+    struct cetrafs_row_watch *before;
     u32 count, idx, candidates = 0, window = cetrafs_sb_stale_secs(sb);
     int ret = 0;
 
@@ -1619,8 +1643,8 @@ int cetrafs_node_live_peer_exists(struct super_block *sb, const u8 *my_uuid, boo
     }
 
     count = le32_to_cpu(raw_sb->node_table_count);
-    hb_before = kcalloc(count, sizeof(*hb_before), GFP_KERNEL);
-    if (!hb_before)
+    before = kcalloc(count, sizeof(*before), GFP_KERNEL);
+    if (!before)
         return -ENOMEM;
 
     /* Snapshot. A row that is FREE, or REGISTERED with a recorded departure
@@ -1639,7 +1663,8 @@ int cetrafs_node_live_peer_exists(struct super_block *sb, const u8 *my_uuid, boo
          * itself over. */
         if (my_uuid && !memcmp(ne.node_uuid, my_uuid, CETRAFS_NODE_UUID_LEN))
             continue;
-        hb_before[idx] = cetrafs_le64(ne.hb_seq) ? cetrafs_le64(ne.hb_seq) : 1; /* 0 means "not a candidate" */
+        before[idx].watched = true;
+        cetrafs_row_mark_of(&before[idx].mark, &ne);
         candidates++;
         /* Clamp the peer's advertised interval before flooring the wait on
          * it -- a hostile/corrupt (checksum-valid) row with a huge
@@ -1676,14 +1701,16 @@ int cetrafs_node_live_peer_exists(struct super_block *sb, const u8 *my_uuid, boo
     }
 
     for (idx = 0; idx < count; idx++) {
-        if (!hb_before[idx])
+        if (!before[idx].watched)
             continue;
         ret = cetrafs_read_node_entry(sb, idx, &ne);
         if (ret)
             goto out;
         if (cetrafs_le32(ne.state) != CETRAFS_NODE_STATE_REGISTERED || cetrafs_le32(ne.departure) != CETRAFS_NODE_DEPART_NONE)
             continue; /* left, or was freed, while we watched */
-        if (cetrafs_le64(ne.hb_seq) != hb_before[idx]) {
+        /* Moved, or another holder (a re-registration restarts hb_seq
+         * and can reach the watched value again): alive either way. */
+        if (!cetrafs_row_mark_same(&before[idx].mark, &ne)) {
             pr_err("node %u is alive and mounted on this volume\n", idx);
             *out_exists = true;
             break;
@@ -1700,14 +1727,16 @@ int cetrafs_node_live_peer_exists(struct super_block *sb, const u8 *my_uuid, boo
          * by itself, and every path that later does (its Zone Groups,
          * locks, journal) revokes the lease again and stops if it
          * cannot. */
-        /* Bound to the hb_seq this watch judged: a node re-attaching
+        /* Bound to the row this watch judged: a node re-attaching
          * between the re-read above and this fence moves it on, and
          * marking THAT incarnation departed let it keep writing until
          * its next tick while this mount went ahead (audit 2026-11-06
          * L8). The fence then writes nothing, and this mount refuses. */
         {
-            u64 judged = cetrafs_le64(ne.hb_seq);
+            struct cetrafs_row_mark judged;
             int fret;
+
+            cetrafs_row_mark_of(&judged, &ne);
 
             if (READ_ONCE(cetrafs_nocaw_fence_stall_ms))
                 msleep(READ_ONCE(cetrafs_nocaw_fence_stall_ms)); /* TEST ONLY */
@@ -1723,7 +1752,7 @@ int cetrafs_node_live_peer_exists(struct super_block *sb, const u8 *my_uuid, boo
     }
 
 out:
-    kfree(hb_before);
+    kfree(before);
     return ret;
 }
 

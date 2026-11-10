@@ -303,26 +303,29 @@ struct cetrafs_sb_info {
      */
     spinlock_t peer_lock;
     struct cetrafs_peer_watch {
-        u64 hb_seq;            /* last hb_seq we saw on this row */
-        /* Which machine that hb_seq belongs to. hb_seq restarts at 1 when
-         * a row is registered afresh, so on its own an old sample could
-         * match a NEW node's first beats -- and a live, just-registered
-         * node was judged stale at once, from a sample of its predecessor
-         * (audit 2026-11-05, class 28). Not the fence_epoch: our own
-         * reclaim bumps it, and a watch reset there would call the peer
-         * alive again between its fence and the reclaims that follow. */
-        u8 uuid[CETRAFS_NODE_UUID_LEN];
+        /* The last sample of this row: its hb_seq, and which machine
+         * (node_uuid) and which mount session (incarnation) beat it.
+         * hb_seq restarts at 1 when a row is registered afresh, so on
+         * its own an old sample could match a NEW holder's beats -- and
+         * a live, just-registered node was judged stale at once, from a
+         * sample of its predecessor (audit 2026-11-05, class 28). The
+         * uuid closed that for another machine; the incarnation closes
+         * it for the SAME machine re-registering a row we never saw
+         * retired. Not the fence_epoch: our own reclaim bumps it, and a
+         * watch reset there would call the peer alive again between its
+         * fence and the reclaims that follow. */
+        struct cetrafs_row_mark mark;
         unsigned long seen_at; /* local jiffies when it last CHANGED */
         bool valid;            /* have we ever sampled this row? */
-        /* The hb_seq of the last STALE verdict: what a reclaim acting
-         * on that verdict must still find (the fence, node.c). Not
-         * hb_seq above, which the next tick re-samples. */
-        u64 judged_seq;
+        /* The mark of the last STALE verdict: what a reclaim acting on
+         * that verdict must still find (the fence, node.c). Not mark
+         * above, which the next tick re-samples. */
+        struct cetrafs_row_mark judged_mark;
         bool judged;
-        /* The hb_seq the last fence of this row landed on: what every
+        /* The mark the last fence of this row landed on: what every
          * reclaim CAS that follows the fence must still find on the row
          * AFTER it lands (cetrafs_node_reattached_since_fence()). */
-        u64 fenced_seq;
+        struct cetrafs_row_mark fenced_mark;
         bool fenced;
     } *peers;
     u32 peer_count;
@@ -3332,7 +3335,6 @@ bool cetrafs_sb_peer_progress_stale(struct super_block *sb, u32 node_id, const c
     struct cetrafs_sb_info *sbi = sb->s_fs_info;
     struct cetrafs_peer_watch *w;
     unsigned long now = jiffies;
-    u64 hb_seq = cetrafs_le64(ne->hb_seq);
     u32 peer_hb_interval = cetrafs_le32(ne->hb_interval_secs);
     bool stale;
 
@@ -3341,16 +3343,14 @@ bool cetrafs_sb_peer_progress_stale(struct super_block *sb, u32 node_id, const c
 
     spin_lock(&sbi->peer_lock);
     w = &sbi->peers[node_id];
-    /* A new sample whenever the counter moved OR another machine holds
-     * the row. The safe direction -- a reset only delays a verdict. A row
-     * seen not REGISTERED is forgotten (cetrafs_sb_peer_watch_forget()).
-     * Not covered without a format change: the SAME machine re-registering
-     * a retired row we never saw retired, at exactly the hb_seq we last
-     * sampled -- a registration nonce in the row (docs/internal/TODO.md). */
-    if (!w->valid || w->hb_seq != hb_seq || memcmp(w->uuid, ne->node_uuid, CETRAFS_NODE_UUID_LEN) != 0) {
+    /* A new sample whenever the counter moved, another machine holds
+     * the row, or the same machine holds it in another mount session
+     * (cetrafs_row_mark). The safe direction -- a reset only delays a
+     * verdict. A row seen not REGISTERED is forgotten as well
+     * (cetrafs_sb_peer_watch_forget()). */
+    if (!w->valid || !cetrafs_row_mark_same(&w->mark, ne)) {
         w->valid = true;
-        w->hb_seq = hb_seq;
-        memcpy(w->uuid, ne->node_uuid, CETRAFS_NODE_UUID_LEN);
+        cetrafs_row_mark_of(&w->mark, ne);
         w->seen_at = now;
         stale = false;
     } else {
@@ -3384,7 +3384,7 @@ bool cetrafs_sb_peer_progress_stale(struct super_block *sb, u32 node_id, const c
             window = peer_floor;
         stale = time_after(now, w->seen_at + window);
         if (stale) {
-            w->judged_seq = hb_seq;
+            w->judged_mark = w->mark;
             w->judged = true;
         }
     }
@@ -3405,13 +3405,13 @@ void cetrafs_sb_peer_watch_forget(struct super_block *sb, u32 node_id)
     spin_unlock(&sbi->peer_lock);
 }
 
-/* The hb_seq of the last stale verdict on a peer's row, or false if it
+/* The mark of the last stale verdict on a peer's row, or false if it
  * was never judged stale by progress. For the fence (node.c), which must
- * refuse to act on a verdict about an incarnation that has since
- * re-attached. The judged value, not the last sample: a tick between
- * the verdict and the fence re-samples the moved row, and comparing
- * against that let the fence through (fence_vs_reattach.sh). */
-bool cetrafs_sb_peer_watched_seq(struct super_block *sb, u32 node_id, u64 *out)
+ * refuse to act on a verdict about a holder that has since re-attached
+ * or re-registered. The judged value, not the last sample: a tick
+ * between the verdict and the fence re-samples the moved row, and
+ * comparing against that let the fence through (fence_vs_reattach.sh). */
+bool cetrafs_sb_peer_judged_mark(struct super_block *sb, u32 node_id, struct cetrafs_row_mark *out)
 {
     struct cetrafs_sb_info *sbi = sb->s_fs_info;
     bool valid = false;
@@ -3420,27 +3420,27 @@ bool cetrafs_sb_peer_watched_seq(struct super_block *sb, u32 node_id, u64 *out)
         return false;
     spin_lock(&sbi->peer_lock);
     if (sbi->peers[node_id].judged) {
-        *out = sbi->peers[node_id].judged_seq;
+        *out = sbi->peers[node_id].judged_mark;
         valid = true;
     }
     spin_unlock(&sbi->peer_lock);
     return valid;
 }
 
-/* Record / fetch the hb_seq a fence of this peer's row landed on. */
-void cetrafs_sb_peer_note_fenced(struct super_block *sb, u32 node_id, u64 seq)
+/* Record / fetch the mark a fence of this peer's row landed on. */
+void cetrafs_sb_peer_note_fenced(struct super_block *sb, u32 node_id, const struct cetrafs_row_mark *m)
 {
     struct cetrafs_sb_info *sbi = sb->s_fs_info;
 
     if (!sbi || !sbi->peers || node_id >= sbi->peer_count)
         return;
     spin_lock(&sbi->peer_lock);
-    sbi->peers[node_id].fenced_seq = seq;
+    sbi->peers[node_id].fenced_mark = *m;
     sbi->peers[node_id].fenced = true;
     spin_unlock(&sbi->peer_lock);
 }
 
-bool cetrafs_sb_peer_fenced_seq(struct super_block *sb, u32 node_id, u64 *out)
+bool cetrafs_sb_peer_fenced_mark(struct super_block *sb, u32 node_id, struct cetrafs_row_mark *out)
 {
     struct cetrafs_sb_info *sbi = sb->s_fs_info;
     bool valid = false;
@@ -3449,7 +3449,7 @@ bool cetrafs_sb_peer_fenced_seq(struct super_block *sb, u32 node_id, u64 *out)
         return false;
     spin_lock(&sbi->peer_lock);
     if (sbi->peers[node_id].fenced) {
-        *out = sbi->peers[node_id].fenced_seq;
+        *out = sbi->peers[node_id].fenced_mark;
         valid = true;
     }
     spin_unlock(&sbi->peer_lock);

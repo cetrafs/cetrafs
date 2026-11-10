@@ -212,14 +212,44 @@ static inline bool cetrafs_lba_run_is_data(struct super_block *sb, u64 lba, u64 
 int cetrafs_sb_adjust_free_inodes(struct super_block *sb, s64 delta);
 int cetrafs_sb_get_free_inodes(struct super_block *sb, u64 *out);
 int cetrafs_sb_get_node_id(struct super_block *sb, u32 *out);
-/* Observer-local peer liveness: has this row's hb_seq stopped advancing
- * for longer than CETRAFS_NODE_STALE_SECS of OUR clock? Uses no
- * cross-node timestamp, so clock skew cannot affect it. */
+/*
+ * What a watch of a registry row remembers: the beat, and WHO beat it.
+ * hb_seq alone restarts at 1 when a row is registered afresh, so a
+ * sample of one holder could match another's beat and read "has not
+ * moved". node_uuid names the machine (for a REPAIR claim, its per-claim
+ * nonce); incarnation names the mount session, drawn anew at every
+ * registration and re-attach (format 0x000A). A row is "the same as
+ * sampled" only when all three match. A fresh registration can redraw
+ * the old incarnation by chance: 1 in 2^32, and only together with an
+ * exact hb_seq collision.
+ */
+struct cetrafs_row_mark {
+    u64 hb_seq;
+    u32 incarnation;
+    u8 uuid[CETRAFS_NODE_UUID_LEN];
+};
+
+static inline void cetrafs_row_mark_of(struct cetrafs_row_mark *m, const cetrafs_node_entry_t *ne)
+{
+    m->hb_seq = cetrafs_le64(ne->hb_seq);
+    m->incarnation = cetrafs_le32(ne->incarnation);
+    memcpy(m->uuid, ne->node_uuid, CETRAFS_NODE_UUID_LEN);
+}
+
+static inline bool cetrafs_row_mark_same(const struct cetrafs_row_mark *m, const cetrafs_node_entry_t *ne)
+{
+    return m->hb_seq == cetrafs_le64(ne->hb_seq) && m->incarnation == cetrafs_le32(ne->incarnation) &&
+           !memcmp(m->uuid, ne->node_uuid, CETRAFS_NODE_UUID_LEN);
+}
+
+/* Observer-local peer liveness: has this row stood still (same mark)
+ * for longer than its stale window of OUR clock? Uses no cross-node
+ * timestamp, so clock skew cannot affect it. */
 bool cetrafs_sb_peer_progress_stale(struct super_block *sb, u32 node_id, const cetrafs_node_entry_t *ne);
 void cetrafs_sb_peer_watch_forget(struct super_block *sb, u32 node_id);
-bool cetrafs_sb_peer_watched_seq(struct super_block *sb, u32 node_id, u64 *out);
-void cetrafs_sb_peer_note_fenced(struct super_block *sb, u32 node_id, u64 seq);
-bool cetrafs_sb_peer_fenced_seq(struct super_block *sb, u32 node_id, u64 *out);
+bool cetrafs_sb_peer_judged_mark(struct super_block *sb, u32 node_id, struct cetrafs_row_mark *out);
+void cetrafs_sb_peer_note_fenced(struct super_block *sb, u32 node_id, const struct cetrafs_row_mark *m);
+bool cetrafs_sb_peer_fenced_mark(struct super_block *sb, u32 node_id, struct cetrafs_row_mark *out);
 void cetrafs_sb_set_incarnation(struct super_block *sb, u32 inc);
 u32 cetrafs_sb_incarnation(struct super_block *sb);
 void cetrafs_node_report_clock_skew(struct super_block *sb);

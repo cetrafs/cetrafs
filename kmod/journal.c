@@ -1956,9 +1956,9 @@ int cetrafs_journal_replay_node(struct super_block *sb, u32 node_id, bool wait_f
      * live one. Only a reclaim fences, so only a reclaim is asked; this
      * node replaying its own area at mount has no fence on record. */
     {
-        u64 fenced;
+        struct cetrafs_row_mark fenced;
 
-        if (cetrafs_sb_peer_fenced_seq(sb, node_id, &fenced) && cetrafs_node_reattached_since_fence(sb, node_id)) {
+        if (cetrafs_sb_peer_fenced_mark(sb, node_id, &fenced) && cetrafs_node_reattached_since_fence(sb, node_id)) {
             pr_info("journal: node %u came back while its journal waited to be replayed -- not replaying it\n",
                     node_id);
             ret = -EBUSY;
