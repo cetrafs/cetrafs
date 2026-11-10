@@ -3278,8 +3278,9 @@ int cetrafs_fill_super(struct super_block *sb, struct fs_context *fc)
     cetrafs_shadow_seed(sb);
 
     /* Last, after every failure point: a re-attach after an unclean
-     * departure sweeps its claims once more, after any reclaim that
-     * displaced them has had time to give them back. */
+     * departure sweeps its claims once more, after any claim the old
+     * incarnation queued past its fence has had time to land
+     * (cetrafs_lock_resweep_own_claims()). */
     if (cetrafs_sb_unclean_reattach(sb) && !sb_rdonly(sb) && cetrafs_own_claim_resweep_secs) {
         spin_lock(&sbi->cold_lock);
         if (!sbi->cold_closing)

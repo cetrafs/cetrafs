@@ -35,15 +35,17 @@ MNT="$(ct_mnt nocawrace)"
 ct_mkfs_small "$DEV" -M 4 >/dev/null
 
 # Any registry row a later mount's gate would WAIT on: REGISTERED with
-# last_seen != 0. A clean unwind leaves none (the released row keeps
-# state=REGISTERED but backdates last_seen to 0, the departure sentinel).
+# no departure recorded. A clean unwind leaves none (the released row
+# keeps state=REGISTERED and records departure=1, CLEAN -- format
+# 0x000A; last_seen keeps the time of its last beat).
 live_rows() {
-    local n=0 r line st ls
+    local n=0 r line st dep
     for r in 0 1 2 3; do
         line="$("$POKE" "$DEV" "$r" 2>/dev/null)" || continue
         st="$(sed -n 's/^state=\([0-9]*\).*/\1/p' <<<"$line")"
-        ls="$(sed -n 's/.*last_seen=\([0-9]*\).*/\1/p' <<<"$line")"
-        [ "${st:-0}" != 0 ] && [ "${ls:-0}" != 0 ] && n=$((n + 1))
+        dep="$(sed -n 's/.* departure=\([0-9]*\).*/\1/p' <<<"$line")"
+        [ -n "$dep" ] || { echo "no-departure-field"; return; }
+        [ "${st:-0}" != 0 ] && [ "$dep" = 0 ] && n=$((n + 1))
     done
     echo "$n"
 }
@@ -62,9 +64,10 @@ mountpoint -q "$MNT" && fail "something is still mounted on $MNT after the refus
     pass "nothing left mounted after the refusal"
 
 # THE unwind assertion: the refused mount released the row it claimed. A
-# row left REGISTERED with a fresh last_seen would make every later mount's
+# row left REGISTERED with no departure would make every later mount's
 # gate watch a full staleness window for a node that was never really there.
 LIVE="$(live_rows)"
+[ "$LIVE" != no-departure-field ] || { fail "setup: node_poke prints no departure field"; ct_exit; }
 [ "$LIVE" = 0 ] && pass "the refused mount left no live registry row (clean unwind)" ||
     fail "the refused mount left $LIVE live row(s) -- the unwind did not release its registration"
 

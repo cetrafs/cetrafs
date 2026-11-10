@@ -152,14 +152,15 @@ leaked_after="$(printf '%s' "$out" | grep -oE '[0-9]+ leaked' | grep -oE '^[0-9]
     fail "the grow leaked blocks: ${leaked_before} before, ${leaked_after} after"
 
 # A volume this build formatted is already at the current version, so
-# the grow leaves it there. The 8 -> 9 transition is covered by
-# growfs_compat.sh, which formats with the previous release.
+# the grow leaves it there. A transition from the previous version is
+# growfs_compat.sh's, which formats with the previous release.
 POKE="$(ct_helper sb_poke)"
 VDUMP="$(ct_tmp growfsver)"
 "$POKE" "$DEV" > "$VDUMP" 2>/dev/null || true
+CUR_VER="$(printf '%d' "$(sed -n 's/^#define CETRAFS_VERSION[[:space:]]\{1,\}\(0x[0-9A-Fa-f]\{1,\}\).*/\1/p' "$ROOT/include/cetrafs.h")")"
 gv="$(sed -n 's/^version=//p' "$VDUMP" | head -1)"
-[ "$gv" = "9" ] && pass "the grown volume carries the current format version ($gv)" ||
-    fail "the grown volume carries format version '$gv', expected 9"
+[ "$gv" = "$CUR_VER" ] && pass "the grown volume carries the current format version ($gv)" ||
+    fail "the grown volume carries format version '$gv', expected $CUR_VER (include/cetrafs.h)"
 
 # ------------------------------------------------- negative: already full
 if out="$(ct_growfs "$DEV" 2>&1)" && grep -qi 'nothing to do' <<<"$out"; then

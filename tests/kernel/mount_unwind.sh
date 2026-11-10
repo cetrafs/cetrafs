@@ -17,7 +17,7 @@
 # be observed.
 #
 # What is asserted after each one: the mount failed, the row is left
-# saying "cleanly departed" (last_seen = 0, so a peer reclaims
+# saying "cleanly departed" (departure CLEAN, so a peer reclaims
 # immediately instead of waiting out the window), no mount is left
 # behind, the volume is still fsck-clean, and the very next ordinary
 # mount succeeds and re-attaches to the same row.
@@ -78,11 +78,12 @@ for stage in 1 2 3 4 5 6 7 8; do
         umount "$MNT" 2>/dev/null || true
     fi
 
-    # The row is the shared-state half. mark-offline backdates last_seen
-    # to 0, which cetrafs_node_is_stale() reads as "left deliberately" --
-    # without it a peer sees a row that merely stopped beating and waits
-    # out the whole staleness window before touching anything it owns.
-    if [ "$(row_field last_seen)" = "0" ] && [ "$(row_field state)" = "1" ]; then
+    # The row is the shared-state half. mark-offline records a CLEAN
+    # departure (departure=1, format 0x000A), which
+    # cetrafs_node_is_stale() reads as "left deliberately" -- without it
+    # a peer sees a row that merely stopped beating and waits out the
+    # whole staleness window before touching anything it owns.
+    if [ "$(row_field departure)" = "1" ] && [ "$(row_field state)" = "1" ]; then
         pass "stage $stage ($what): the registry row is left REGISTERED but marked departed"
     else
         fail "stage $stage ($what): row reads $("$NODE_POKE" "$DEV" 0) -- a peer would wait out the stale window"

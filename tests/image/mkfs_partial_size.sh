@@ -59,9 +59,10 @@ ct_fsck "$DEV" >/dev/null 2>&1 && pass "an undersized volume is clean" ||
 "$POKE" "$DEV" > "$DUMP" 2>/dev/null || true
 sbval() { sed -n "s/^$1=//p" "$DUMP" | head -1; }
 
+CUR_VER="$(printf '%d' "$(sed -n 's/^#define CETRAFS_VERSION[[:space:]]\{1,\}\(0x[0-9A-Fa-f]\{1,\}\).*/\1/p' "$ROOT/include/cetrafs.h")")"
 v="$(sbval version)"
-[ "$v" = "9" ] && pass "mkfs stamps the current format version (9)" ||
-    fail "mkfs stamped format version '$v', expected 9"
+[ "$v" = "$CUR_VER" ] && pass "mkfs stamps the current format version ($CUR_VER)" ||
+    fail "mkfs stamped format version '$v', expected $CUR_VER (include/cetrafs.h)"
 
 tb="$(sbval total_blocks)"
 [ "$tb" = "153600" ] && pass "superblock total_blocks is the -s size, not the device size ($tb)" ||

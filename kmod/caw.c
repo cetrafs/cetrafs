@@ -2003,11 +2003,13 @@ int cetrafs_cas_record(struct super_block *sb, u64 fs_lba, cetrafs_cas_fn mutate
 }
 
 /*
- * cetrafs_cas_record() for a swap nothing may abandon: a give-back that
- * undoes a reclaim which raced its owner's return, and whose failure
- * stops the mount. Every other CAS may be interrupted by a fatal signal
- * while it waits for a multipath path to be resolved (-EINTR, nothing
- * issued); this one waits that resolution out, bounded as before.
+ * cetrafs_cas_record() for a swap nothing may abandon: the journal
+ * flag's flip (entries committed while it still reads CLEAN are skipped
+ * by the next replay) and the park that follows a fence (it is what
+ * makes the fenced node's late DIRTY flip miscompare). Every other CAS
+ * may be interrupted by a fatal signal while it waits for a multipath
+ * path to be resolved (-EINTR, nothing issued); this one waits that
+ * resolution out, bounded as before.
  */
 int cetrafs_cas_record_nointr(struct super_block *sb, u64 fs_lba, cetrafs_cas_fn mutate, void *priv)
 {

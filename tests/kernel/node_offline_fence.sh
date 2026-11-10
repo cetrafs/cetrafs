@@ -2,8 +2,8 @@
 # SPDX-License-Identifier: GPL-2.0-or-later
 # leaving must not undo a peer's fence
 #
-# At unmount a node records its departure by clearing last_seen in its
-# own Node Registry row. That was a read / modify / BLIND WRITE of the
+# At unmount a node records its departure (departure=CLEAN, format
+# 0x000A; it used to clear last_seen) in its own Node Registry row. That was a read / modify / BLIND WRITE of the
 # whole row -- and the row is the one thing a peer writes to when it
 # decides this node is dead: fence_epoch, the lease that tells a node
 # to stop writing.
@@ -68,9 +68,9 @@ echo "fence_epoch: $BEFORE before, $BUMPED after the peer's bump, $AFTER after t
     pass "the departure left the peer's fence epoch standing" ||
     fail "the unmount reverted the fence epoch ($BUMPED -> $AFTER) -- the peer's revocation is gone"
 
-DEPARTED="$("$NPOKE" "$IMG" 0 2>&1 | sed -n 's/.*last_seen=\([0-9]*\).*/\1/p' | head -1)"
-[ "$DEPARTED" = "0" ] &&
-    pass "and still recorded the departure (last_seen cleared)" ||
-    fail "the departure was not recorded: last_seen=$DEPARTED"
+DEPARTED="$("$NPOKE" "$IMG" 0 2>&1 | sed -n 's/.* departure=\([0-9]*\).*/\1/p' | head -1)"
+[ "$DEPARTED" = "1" ] &&
+    pass "and still recorded the departure (departure=1, CLEAN)" ||
+    fail "the departure was not recorded: departure='$DEPARTED'"
 
 ct_exit

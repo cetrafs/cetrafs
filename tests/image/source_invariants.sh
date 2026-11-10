@@ -710,7 +710,7 @@ spin_lines() { # <files...>: file:line:code for every line run with a spinlock h
     }' "$@"
 }
 SPIN_SLEEPERS_RE='\b(msleep|usleep_range|ssleep|mutex_lock[a-z_]*|down|down_[a-z_]+|wait_event[a-z_]*|wait_for_[a-z_]+|schedule[a-z_]*|cond_resched|lock_buffer|wait_on_buffer|[a-z_]*bread[a-z_]*|submit_bh|sync_dirty_buffer|iput|brelse|vmalloc|kvmalloc|copy_(to|from)_user|cancel_[a-z_]*_sync|flush_[a-z_]+|synchronize_[a-z_]+)\('
-SPIN_OK='cetrafs_deferred_on_list cetrafs_ext_key_matches cetrafs_inode_deferred cetrafs_inode_fd_copy cetrafs_inode_wb_failed cetrafs_le16 cetrafs_le32 cetrafs_le64 cetrafs_pending_any cetrafs_sb_layout_of cetrafs_sb_stale_secs'
+SPIN_OK='cetrafs_deferred_on_list cetrafs_ext_key_matches cetrafs_inode_deferred cetrafs_inode_fd_copy cetrafs_inode_get_generation cetrafs_inode_wb_failed cetrafs_le16 cetrafs_le32 cetrafs_le64 cetrafs_pending_any cetrafs_sb_layout_of cetrafs_sb_stale_secs'
 SL="$(spin_lines "$K"/*.c)"
 [ "$(wc -l <<<"$SL")" -gt 100 ] || fail "class 19 spinlock: setup -- only $(wc -l <<<"$SL") lines found under a spinlock (the scan no longer matches)"
 SPIN_BAD="$(grep -E "$SPIN_SLEEPERS_RE" <<<"$SL" | grep -vE 'GFP_ATOMIC|GFP_NOWAIT' | head -5 || true)"
@@ -748,31 +748,40 @@ done)"
 [ -z "$WIN" ] && pass "liveness windows: every one is floored at the stale window" ||
     fail "liveness windows: shorter than the stale window, or not derived from it, at: $(echo $WIN)"
 
-# A give-back after a reclaim undoes what the reclaim TOOK. Every CAS
-# that takes -- the lock claim, steal_release, the reader-bit CLEAR, the
-# namespace-lock steal, the journal replay claim -- has a "nothing to
-# do" outcome the CAS wrapper folds into success, and giving that back
-# hands a live node a lock or a presence bit no open of its holds
-# (classes 28/21: the lock give-back, then the reader bit, then the two
-# steal_release sites, each found one at a time). So every give-back --
-# a call of cetrafs_lock_undo_steal(), or a re-attach test on the
-# success of a CAS (`ret == 0 && ... reattached_since_fence`) -- must
-# test `displaced` on its line or the line before. Negative control:
-# drop `rctx.displaced &&` from the reader-bit give-back -- fails.
-log "checking every reclaim give-back is gated on a recorded displacement"
-GB="$(for f in "$K"/*.c; do
-    awk -v F="$(basename "$f")" '
-        /^[[:space:]]*(\*|\/\*|\/\/)/ { prev = $0; next }
-        /^static bool cetrafs_lock_undo_steal/ { prev = $0; next }
-        /cetrafs_lock_undo_steal\(/ || (/ret == 0/ && /reattached_since_fence\(/) {
-            if ($0 !~ /displaced/ && prev !~ /displaced/) print F ":" NR
-        }
-        { prev = $0 }' "$f"
-done)"
-NGB="$(cat "$K"/*.c | grep -c 'cetrafs_lock_undo_steal(\|reattached_since_fence(' || true)"
-[ "$NGB" -ge 5 ] || fail "give-back gate: found only $NGB give-back sites -- the check sees nothing"
-[ -z "$GB" ] && pass "give-back gate: every reclaim give-back tests displaced" ||
-    fail "give-back gate: a give-back not gated on displaced at: $(echo $GB)"
+# A reclaim takes a claim its holder's row has gone stale on. The row
+# id alone cannot say whether the claim is still the dead session's: a
+# holder that re-attached, swept and took it again writes the very bytes
+# compared (class 28). The old cure -- take it, then give it back if the
+# holder came back -- was an undo that had to know what it had DONE, and
+# five sites got that wrong one at a time. Format 0x000A stamps every
+# claim with the incarnation of the mount that took it, and every
+# reclaim's swap requires the claim to still carry the incarnation it
+# judged, so a re-taken claim is never taken and there is nothing to
+# give back. So: each claim kind's mutator compares its record's
+# incarnation with ctx->steal_incarnation, and no give-back of a steal
+# exists. Negative control: drop the comparison from nslock.c's
+# stealable test -- fails.
+log "checking every reclaim compares the claim's incarnation (class 28)"
+steal_inc_cmp() { # <file> <record field>: does a mutator compare it with the judged incarnation?
+    grep -qE "$2(\[[a-z_]+\])?\)? *(==|!=) *ctx->steal_incarnation" "$1"
+}
+SI=""
+for fc in lock.c:lock_owner_incarnation lock.c:read_open_incarnation nslock.c:ns_lock_incarnation \
+          journal.c:replay_incarnation; do
+    steal_inc_cmp "$K/${fc%%:*}" "${fc#*:}" || SI="$SI$fc "
+done
+[ -z "$SI" ] && pass "class 28: the lock, reader-bit, namespace-lock and replay-claim steals compare the incarnation" ||
+    fail "class 28: a steal no longer compares the claim's incarnation: $SI"
+GB="$(grep -nE 'cetrafs_lock_undo_steal\(|ret == 0 &&.*reattached_since_fence\(' "$K"/*.c || true)"
+[ -z "$GB" ] && pass "class 28: no reclaim gives a stolen claim back" ||
+    fail "class 28: a give-back of a steal is back -- it must know what it took (see the class): $(echo $GB)"
+SAMPLE="$(ct_tmp stealinc).c"
+printf '    stealable = cetrafs_le32(rec.ns_lock_holder) == ctx->steal_from;\n' >"$SAMPLE"
+! steal_inc_cmp "$SAMPLE" ns_lock_incarnation &&
+    printf '    stealable = stealable && cetrafs_le32(rec.ns_lock_incarnation) == ctx->steal_incarnation;\n' >"$SAMPLE" &&
+    steal_inc_cmp "$SAMPLE" ns_lock_incarnation &&
+    pass "class 28: control -- a steal without the comparison is caught, one with it is not" ||
+    fail "class 28: control -- the incarnation comparison scan does not discriminate"
 
 # The image suites need no kernel, so nothing in them may need GNU
 # grep's -P: on a host without it the suite stopped at the first one
@@ -1360,21 +1369,39 @@ fd_unchecked() { # <file> <mutator...>: the ones whose body never compares file_
             on && /^}/ { on = 0 } END { exit !hit }' "$f" || echo "$fn"
     done
 }
+fd_publishes() { # <file> <mutator>: does its body write anything but a new stamp?
+    # A stamp-only mutator (the replay's change-stamp advance) rewrites
+    # the swap's own image with a new file_seq and nothing else: it
+    # cannot publish over a peer's write, it announces one. Anything
+    # else -- a field other than the identity copy, a memcpy into the
+    # record -- is a publish and must compare file_seq.
+    awk -v fn="$2" '$0 ~ "^static int " fn "\\(" { on = 1 }
+        on && (/rec\.[a-z_]+(\[[^]]*\])? *=[^=]/ && !/rec\.(ino|generation) *= *rec\.fd_(ino|generation);/ ||
+               /memcpy\(&rec/) { hit = 1 }
+        on && /^}/ { on = 0 } END { exit !hit }' "$1"
+}
 FDM="$(fd_mutators "$K"/*.c)"
 [ -n "$FDM" ] || fail "class 9: setup -- no file-sector CAS mutator found (the grep no longer matches the call)"
 FDU=""
+FDS=""
 for fn in $FDM; do
     src="$(grep -lE "^static int $fn\\(" "$K"/*.c | head -1)"
-    [ -n "$src" ] && FDU="$FDU$(fd_unchecked "$src" "$fn") " || FDU="$FDU$fn(no-body) "
+    [ -n "$src" ] || { FDU="$FDU$fn(no-body) "; continue; }
+    u="$(fd_unchecked "$src" "$fn")"
+    if [ -n "$u" ] && ! fd_publishes "$src" "$fn"; then FDS="$FDS$fn "; else FDU="$FDU$u "; fi
 done
-[ "$(echo $FDM | wc -w)" = 2 ] || fail "class 9: $(echo $FDM | wc -w) file-sector CAS mutators (pinned at 2: $(echo $FDM)) -- review the new one and update the pin"
-[ -z "${FDU// /}" ] && pass "class 9: every file-sector CAS mutator compares file_seq ($(echo $FDM))" ||
-    fail "class 9: a file-sector CAS mutator never compares file_seq: $FDU"
+[ "$(echo $FDM | wc -w)" = 3 ] || fail "class 9: $(echo $FDM | wc -w) file-sector CAS mutators (pinned at 3: $(echo $FDM)) -- review the new one and update the pin"
+[ -z "${FDU// /}" ] && pass "class 9: every file-sector CAS mutator that publishes compares file_seq ($(echo $FDM); stamp-only: $(echo $FDS))" ||
+    fail "class 9: a file-sector CAS mutator publishes without comparing file_seq: $FDU"
 SAMPLE="$(ct_tmp fdmut).c"
 printf 'static int cetrafs_bad_mutate(void *image, unsigned int len, void *priv)\n{\n    rec.size = 0;\n    return 0;\n}\n    ret = cetrafs_cas_record_fd_seeded(sb, lba, NULL, 0, cetrafs_bad_mutate, &ctx);\n' >"$SAMPLE"
 [ "$(fd_mutators "$SAMPLE")" = cetrafs_bad_mutate ] && [ "$(fd_unchecked "$SAMPLE" cetrafs_bad_mutate)" = cetrafs_bad_mutate ] &&
-    pass "class 9: control -- a planted mutator without the comparison is found" ||
+    fd_publishes "$SAMPLE" cetrafs_bad_mutate &&
+    pass "class 9: control -- a planted publishing mutator without the comparison is found" ||
     fail "class 9: control -- the planted mutator was not found ($(fd_mutators "$SAMPLE") / $(fd_unchecked "$SAMPLE" cetrafs_bad_mutate))"
+printf 'static int cetrafs_ok_mutate(void *image, unsigned int len, void *priv)\n{\n    rec.ino = rec.fd_ino;\n    rec.generation = rec.fd_generation;\n    return 0;\n}\n' >"$SAMPLE"
+! fd_publishes "$SAMPLE" cetrafs_ok_mutate && pass "class 9: control -- a stamp-only mutator is told apart" ||
+    fail "class 9: control -- a stamp-only mutator reads as a publish"
 
 # Class 41 (an invalidation that does not fence a fill in flight).
 # Clearing a valid bit does not stop a fill already between its device
@@ -1698,7 +1725,11 @@ log "checking the module publishes its mount-time autoload alias"
 KO="$ROOT/kmod/cetrafs.ko"
 if [ ! -f "$KO" ]; then
     skip "kmod/cetrafs.ko is not built"
-elif modinfo "$KO" 2>/dev/null | grep -qx "alias: *fs-$(sed -n 's/^#define CETRAFS_NAME[[:space:]][[:space:]]*"\([a-z][a-z]*\)".*/\1/p' "$ROOT/include/cetrafs.h")"; then
+# modinfo's output is captured first: piped into grep -q under pipefail,
+# grep exits at the match and modinfo, still printing the parameters
+# that follow it, dies of SIGPIPE -- a failure that depends on how many
+# parameters there are.
+elif MI="$(modinfo "$KO" 2>/dev/null)" && grep -qx "alias: *fs-$(sed -n 's/^#define CETRAFS_NAME[[:space:]][[:space:]]*"\([a-z][a-z]*\)".*/\1/p' "$ROOT/include/cetrafs.h")" <<<"$MI"; then
     pass "module alias: the built module declares fs-cetrafs, so mount -t autoloads it"
 else
     fail "module alias: no fs-cetrafs alias in the built module (MODULE_ALIAS_FS gone?) -- \`mount -t cetrafs\` will fail with 'unknown filesystem type' unless something loaded it first. modinfo says: $(modinfo "$KO" 2>&1 | grep -E '^alias' || echo '(no alias at all)')"

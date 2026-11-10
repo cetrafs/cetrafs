@@ -1568,15 +1568,6 @@ struct cetrafs_lock_cas_ctx {
                          * we are bypassing rather than claiming (we never
                          * auto-claim there). Independent of claim/release. */
     u32 steal_from;     /* meaningful when allow_steal or steal_release */
-    /* Out, per attempt: the image that landed took something away --
-     * the claim took the lock FROM steal_from rather than finding it
-     * free; steal_release cleared steal_from's lock rather than finding
-     * it gone; a reader CLEAR cleared a bit that was set. Only a
-     * displacement took a claim away.
-     * Every one of them also has a "nothing to do" outcome that the CAS
-     * wrapper folds into success, which is why this is recorded. */
-    bool displaced;
-
     /* Incarnations (cetrafs_node_entry_t.incarnation, format 0x000A).
      * my_incarnation: what a claim or a presence SET stamps -- this
      * mount's (cetrafs_lock_cas() fills it in). steal_incarnation: the
@@ -1696,7 +1687,6 @@ static int cetrafs_lock_cas_mutate(void *image, unsigned int len, void *priv)
          * clear that landed, unless recorded here. */
         u32 slot = ctx->my_node_id % CETRAFS_MAX_READER_NODES;
 
-        ctx->displaced = false;
         ctx->moved = false;
 
         if (ctx->reader_op == CETRAFS_SUSPEND_SET || ctx->reader_op == CETRAFS_SUSPEND_CLEAR) {
@@ -1744,7 +1734,6 @@ static int cetrafs_lock_cas_mutate(void *image, unsigned int len, void *priv)
             /* Gone entirely: a suspended writer's mark goes with its
              * presence (last close while suspended, or a dead node's
              * bits being cleared). */
-            ctx->displaced = (cetrafs_le64(rec.read_open_nodes) & bit) != 0;
             rec.suspended_writer_nodes = cetrafs_cpu_to_le64(cetrafs_le64(rec.suspended_writer_nodes) & ~bit);
             rec.read_open_nodes = cetrafs_cpu_to_le64(want);
             rec.read_open_incarnation[slot] = cetrafs_cpu_to_le32(0);
@@ -1757,7 +1746,6 @@ static int cetrafs_lock_cas_mutate(void *image, unsigned int len, void *priv)
             (ctx->reader_op != CETRAFS_READER_SET ||
              cetrafs_le32(rec.read_open_incarnation[slot]) == ctx->my_incarnation))
             return 1; /* already in the desired state -- nothing to do */
-        ctx->displaced = ctx->reader_op == CETRAFS_READER_CLEAR;
         rec.read_open_nodes = cetrafs_cpu_to_le64(want);
         /* SET stamps this mount's incarnation -- over a leftover bit of an
          * earlier one too: the bit is this mount's open now. */
@@ -1773,8 +1761,7 @@ static int cetrafs_lock_cas_mutate(void *image, unsigned int len, void *priv)
          * record still shows the exact stale owner we decided to displace,
          * so a live re-lock or a reclaim by someone else is left alone.
          * "Nothing to clear" returns 1, which the CAS wrapper folds into
-         * 0: record which one this was, per attempt, for the give-back. */
-        ctx->displaced = false;
+         * 0; 'moved' records the one case the caller must hear about. */
         ctx->moved = false;
         if (cetrafs_le32(rec.lock_mode) != CETRAFS_LOCK_EXCLUSIVE ||
             cetrafs_le32(rec.lock_owner_node) != ctx->steal_from)
@@ -1783,7 +1770,6 @@ static int cetrafs_lock_cas_mutate(void *image, unsigned int len, void *priv)
             ctx->moved = true; /* that node took it again since: a live lock (F10) */
             return 1;
         }
-        ctx->displaced = true;
         rec.lock_owner_node = cetrafs_cpu_to_le32(CETRAFS_NODE_ID_NONE);
         rec.lock_owner_incarnation = cetrafs_cpu_to_le32(0);
         rec.lock_mode = CETRAFS_LOCK_NONE;
@@ -1810,7 +1796,6 @@ static int cetrafs_lock_cas_mutate(void *image, unsigned int len, void *priv)
                                     ~(1ULL << (ctx->my_node_id % CETRAFS_MAX_READER_NODES))))
             return -ETXTBSY; /* another node is reading it */
 
-        ctx->displaced = !free_now; /* per attempt: the image that lands is the last one mutated */
         rec.lock_owner_node = cetrafs_cpu_to_le32(ctx->my_node_id);
         rec.lock_owner_incarnation = cetrafs_cpu_to_le32(ctx->my_incarnation);
         rec.lock_mode = cetrafs_cpu_to_le32(CETRAFS_LOCK_EXCLUSIVE);
