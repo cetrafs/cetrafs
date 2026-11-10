@@ -550,6 +550,8 @@ u64 cetrafs_journal_replay_torn_count(void);
 extern bool cetrafs_pf_force_foreign;
 u64 cetrafs_pf_full_scans_count(void);
 u64 cetrafs_pf_drain_blocks_count(void);
+u64 cetrafs_pf_drain_sweeps_count(void);
+u64 cetrafs_pf_drain_held_count(void);
 u64 cetrafs_bg_recount_count(void);
 u64 cetrafs_pf_drop_runs_count(void);
 u64 cetrafs_pf_drop_blocks_count(void);
@@ -639,6 +641,7 @@ void cetrafs_bh_abort_update(struct buffer_head *bh);
 #define CETRAFS_BREAD_RETRIES 12
 struct buffer_head *cetrafs_bread_retry(struct super_block *sb, sector_t block);
 struct buffer_head *cetrafs_bread_uncached_retry(struct super_block *sb, sector_t block);
+int cetrafs_bread_uncached_batch(struct super_block *sb, sector_t start, u32 n, struct buffer_head **bhs);
 /* inode.c -- read an inode's external extent-leaf block at the right
  * freshness for who currently owns the file. */
 struct buffer_head *cetrafs_read_leaf_bh(struct inode *inode, u64 lba);

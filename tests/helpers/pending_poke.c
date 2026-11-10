@@ -47,9 +47,10 @@ int main(int argc, char **argv)
     if (argc < 4) {
         fprintf(stderr,
                 "usage: %s <image> add <zg_id> <lba> <count>\n"
+                "       %s <image> put <zg_id> <block> <slot> <lba> <count>   (at that queue block/slot exactly)\n"
                 "       %s <image> dump <zg_id>\n"
                 "       %s <image> extent <ino>\n",
-                argv[0], argv[0], argv[0]);
+                argv[0], argv[0], argv[0], argv[0]);
         return 2;
     }
 
@@ -129,6 +130,33 @@ int main(int argc, char **argv)
         }
         fprintf(stderr, "ZG%u queue is full\n", zg_id);
         return 1;
+    }
+
+    /* put: an entry at an exact place -- past an empty run, or in a
+     * chosen CAS region -- which 'add' (first free slot) cannot make. */
+    if (strcmp(argv[2], "put") == 0) {
+        if (argc != 8) {
+            fprintf(stderr, "put needs <block> <slot> <lba> <count>\n");
+            return 2;
+        }
+        uint32_t qb = (uint32_t) strtoul(argv[4], NULL, 0);
+        unsigned slot = (unsigned) strtoul(argv[5], NULL, 0);
+        uint64_t lba = strtoull(argv[6], NULL, 0);
+        uint32_t count = (uint32_t) strtoul(argv[7], NULL, 0);
+        cetrafs_pending_free_t ents[CETRAFS_BLOCK_SIZE / sizeof(cetrafs_pending_free_t)];
+        off_t off = (off_t) (qstart + qb) * CETRAFS_BLOCK_SIZE;
+
+        if (qb >= cetrafs_le32(sb.pending_free_blocks_per_zg) || slot >= per_block) {
+            fprintf(stderr, "block %u slot %u is outside ZG%u's queue\n", qb, slot, zg_id);
+            return 1;
+        }
+        pread_all(ents, sizeof(ents), off);
+        ents[slot].lba = cetrafs_cpu_to_le64(lba);
+        ents[slot].count = cetrafs_cpu_to_le32(count);
+        ents[slot].magic = cetrafs_cpu_to_le32(CETRAFS_PENDING_FREE_MAGIC);
+        pwrite_all(ents, sizeof(ents), off);
+        printf("pending_poke: ZG%u block %u slot %u holds free [%" PRIu64 " +%u)\n", zg_id, qb, slot, lba, count);
+        return 0;
     }
 
     fprintf(stderr, "unknown mode '%s'\n", argv[2]);

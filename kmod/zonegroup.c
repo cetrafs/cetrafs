@@ -1966,35 +1966,37 @@ queue_full:
     return -ENOSPC;
 }
 
-/* What one drain pass is consuming from a single region. 'consumed[i]'
- * is filled by the mutate -- reset on every attempt, so after the CAS
- * lands it reflects what the WINNING swap actually removed from the
- * queue: only those entries may be applied. (The CAS impl maps a
- * mutate's "nothing to do" to plain success, so the return value cannot
- * distinguish "I consumed these" from "another drain beat me to them" --
- * and applying the latter is the double-apply this ordering exists to
- * prevent.) */
+/* One queue entry as a drain handles it. */
+struct cetrafs_pf_ent {
+    u64 lba;
+    u32 count;
+};
+
+/* What one consume swap of a single region took. Rebuilt from the image
+ * on every attempt, so once the CAS lands it is exactly what the WINNING
+ * swap removed from the queue -- and that is EVERY valid entry the image
+ * held, not only what an earlier read listed: an entry a peer appended
+ * between that read and this swap is consumed and applied by this drain
+ * rather than left behind for a later one (L19). On -EBUSY it is what the
+ * last attempt found still queued. (The CAS impl maps a mutate's "nothing
+ * to do" to plain success, so the return value cannot say what was
+ * consumed; this can.) */
 struct cetrafs_pf_drain_ctx {
     u32 n;
-    struct {
-        u64 lba;
-        u32 count;
-    } done[CETRAFS_PENDING_FREE_PER_BLOCK];
-    bool consumed[CETRAFS_PENDING_FREE_PER_BLOCK];
+    struct cetrafs_pf_ent seen[CETRAFS_PENDING_FREE_PER_BLOCK];
 };
 
 static int cetrafs_pf_drain_mutate(void *image, unsigned int len, void *priv)
 {
     struct cetrafs_pf_drain_ctx *ctx = priv;
     cetrafs_pending_free_t *ent = image;
-    unsigned int slots = len / sizeof(*ent);
-    unsigned int e, i;
+    unsigned int slots = min_t(unsigned int, len / sizeof(*ent), ARRAY_SIZE(ctx->seen));
+    unsigned int e;
     bool changed = false;
 
     /* Reset per attempt: a retry runs on a FRESH image, and what this
      * swap consumes is only what it finds there. */
-    memset(ctx->consumed, 0, sizeof(ctx->consumed));
-
+    ctx->n = 0;
     for (e = 0; e < slots; e++) {
         if (ent[e].lba == 0)
             continue;
@@ -2009,22 +2011,14 @@ static int cetrafs_pf_drain_mutate(void *image, unsigned int len, void *priv)
             continue;
         }
 
-        /* Clear only what this pass set out to consume. An entry a PEER
-         * appended between our read and this CAS is left completely
-         * alone -- consuming it here would lose a free outright. Each
-         * ctx entry pairs with at most ONE image slot (skip the already
-         * -consumed), so DUPLICATE queue entries -- same lba, same count,
-         * legal and produced by double frees this layer tolerates -- each
-         * consume their own slot and each get their (idempotent) apply. */
-        for (i = 0; i < ctx->n; i++) {
-            if (!ctx->consumed[i] && ctx->done[i].lba == cetrafs_le64(ent[e].lba) &&
-                ctx->done[i].count == cetrafs_le32(ent[e].count)) {
-                memset(&ent[e], 0, sizeof(ent[e]));
-                ctx->consumed[i] = true;
-                changed = true;
-                break;
-            }
-        }
+        /* Every valid entry, duplicates included: each copy consumes its
+         * own slot, and the drain applies a range once however many
+         * copies it consumed. */
+        ctx->seen[ctx->n].lba = cetrafs_le64(ent[e].lba);
+        ctx->seen[ctx->n].count = cetrafs_le32(ent[e].count);
+        ctx->n++;
+        memset(&ent[e], 0, sizeof(ent[e]));
+        changed = true;
     }
 
     return changed ? 0 : 1; /* 1 = nothing to do, not an error */
@@ -2050,8 +2044,9 @@ static int cetrafs_pf_drain_mutate(void *image, unsigned int len, void *priv)
  * Consume-first makes the failure mode a LEAK instead: a crash (or a
  * lost CAS) between consuming and applying leaves the blocks bitmap-set
  * and referenced by nothing, which the background scrub reclaims --
- * rule 8's safe direction. A lost consume CAS now simply applies
- * nothing and leaves the entries for the next pass.
+ * rule 8's safe direction. A consume that keeps losing applies nothing
+ * from its region, and the ranges it still holds are held back from
+ * every other copy this drain consumed (cetrafs_zg_drain_one()).
  */
 /* TEST ONLY: pause between two applies of one drain batch
  * (tests/kernel/pf_duplicate_applied_once.sh). */
@@ -2059,174 +2054,328 @@ static unsigned int cetrafs_pf_apply_stall_ms;
 cetrafs_test_param(pf_apply_stall_ms, cetrafs_pf_apply_stall_ms, uint, 0644);
 MODULE_PARM_DESC(pf_apply_stall_ms, "TEST ONLY: pause between the applies of one pending-free drain batch");
 
+/* TEST ONLY: report this queue region's consume as busy, every time
+ * (region index = queue block * regions-per-block + region; value is
+ * index + 1, 0 = off) -- concurrent appenders winning every race, which
+ * one node cannot arrange (tests/kernel/pf_stale_copy_later_drain.sh). */
+static unsigned int cetrafs_pf_drain_busy_region;
+cetrafs_test_param(pf_drain_busy_region, cetrafs_pf_drain_busy_region, uint, 0644);
+MODULE_PARM_DESC(pf_drain_busy_region, "TEST ONLY: a drain finds this queue region (index+1, 0 = off) always busy");
+
+/* TEST ONLY, one-shot: pause between a drain's read of the whole queue
+ * and its consume swaps, the window a peer's append lands in
+ * (tests/kernel/pf_stale_copy_later_drain.sh). 0 = off. */
+static unsigned int cetrafs_pf_drain_consume_stall_ms;
+cetrafs_test_param(pf_drain_consume_stall_ms, cetrafs_pf_drain_consume_stall_ms, uint, 0644);
+MODULE_PARM_DESC(pf_drain_consume_stall_ms, "TEST ONLY: one-shot pause between a drain's queue read and its consumes");
+
+static atomic64_t cetrafs_pf_drain_sweeps = ATOMIC64_INIT(0);
+static atomic64_t cetrafs_pf_drain_held = ATOMIC64_INIT(0);
+
+u64 cetrafs_pf_drain_sweeps_count(void)
+{
+    return (u64) atomic64_read(&cetrafs_pf_drain_sweeps);
+}
+
+u64 cetrafs_pf_drain_held_count(void)
+{
+    return (u64) atomic64_read(&cetrafs_pf_drain_held);
+}
+
+/* A busy region's consume is retried this many times, backing off 1, 2,
+ * 4 ... ms (about a quarter of a second in all) before the drain gives
+ * up on it for this pass. Bounded: a drain runs on the heartbeat, and an
+ * unbounded wait on appenders would be a tick that never ends. */
+#define CETRAFS_PF_BUSY_RETRIES 8
+
+/* Does this region hold any entry at all (valid or garbage)? */
+static bool cetrafs_pf_region_used(const cetrafs_pending_free_t *ent, unsigned int slots)
+{
+    unsigned int e;
+
+    for (e = 0; e < slots; e++)
+        if (ent[e].lba)
+            return true;
+    return false;
+}
+
+/* Grow a drain's list of consumed entries to hold 'need'. */
+static int cetrafs_pf_got_reserve(struct cetrafs_pf_ent **got, u32 *cap, u32 need)
+{
+    struct cetrafs_pf_ent *n;
+    u32 ncap;
+
+    if (need <= *cap)
+        return 0;
+    ncap = max_t(u32, need, *cap ? *cap * 2 : 256);
+    n = kvmalloc_array(ncap, sizeof(*n), GFP_NOFS);
+    if (!n)
+        return -ENOMEM;
+    if (*got)
+        memcpy(n, *got, (size_t) *cap * sizeof(*n));
+    kvfree(*got);
+    *got = n;
+    *cap = ncap;
+    return 0;
+}
+
+/* Record a range a region still holds after this drain: no consumed copy
+ * of any part of it may be applied (see cetrafs_zg_drain_one()). A store,
+ * not an insert, so overlapping ranges keep their union covered. */
+static int cetrafs_pf_hold_range(struct maple_tree *mt, u64 lba, u32 count)
+{
+    if (!count || lba + count - 1 < lba)
+        return 0; /* garbage: nothing will ever apply it */
+    return mtree_store_range(mt, (unsigned long) lba, (unsigned long) (lba + count - 1), xa_mk_value(1), GFP_NOFS);
+}
+
+/*
+ * Drain one ZG's queue: consume every entry it holds, then apply what the
+ * swaps consumed.
+ *
+ * The rule that makes this safe against copies (L19): A RANGE IS APPLIED
+ * ONLY IF NO COPY OF IT IS STILL QUEUED WHEN THIS DRAIN HAS FINISHED
+ * CONSUMING. A free queued twice (a tolerated double free, an append
+ * retried after it had in fact landed) was applied by one drain and its
+ * other copy by a LATER one -- a copy that drain never reached, because
+ * its region was busy or it sat past the empty run where the scan
+ * stopped -- after the block had been handed to a new file: a live block
+ * freed. Telling a stale copy from a genuine re-free needs the block's
+ * history, which nothing records; so instead no drain ever leaves a copy
+ * behind a range it applied:
+ *
+ *  1. On a quiet tick cost follows occupancy: appends fill from the
+ *     front, so a scan from block 0 that meets CETRAFS_PF_DRAIN_EMPTY_RUN
+ *     empty blocks first has nothing to do (PERFORMANCE.md invariant 5).
+ *  2. Otherwise the WHOLE queue is read, in one batched forced-fresh
+ *     read (cetrafs_bread_uncached_batch(): about one I/O, not one per
+ *     block), so every copy present is seen -- including one past an
+ *     empty run.
+ *  3. Every region holding an entry is consumed, all of it
+ *     (cetrafs_pf_drain_mutate()). A busy region is retried, bounded; one
+ *     still busy keeps its entries, and their ranges are HELD.
+ *  4. Then the applies: a range already applied by this drain is a copy
+ *     and is skipped; a range overlapping a held one is skipped too. Its
+ *     blocks stay allocated -- bitmap-set, so nothing can be allocated
+ *     there -- and the copy still queued completes the free when a later
+ *     drain consumes it. That is the whole point: a held copy can only be
+ *     applied to blocks that were never handed out again.
+ *
+ * Consume before apply, never the reverse: a crash (or a lost CAS)
+ * between the two leaves blocks set and unreferenced, a leak the scrub
+ * reclaims -- rule 8's safe direction; applied-but-unconsumed entries
+ * survived into the next drain and freed reallocated blocks (ns-fuzz on
+ * three nodes). And one drain at a time (pf_drain_mutex), or two would
+ * split the queue and each apply its half blind to the other's.
+ *
+ * Not covered: a copy APPENDED after this drain consumed its region,
+ * which a later drain applies -- a double free arriving late, which the
+ * direct free path could not catch either.
+ */
 static int cetrafs_zg_drain_one(struct super_block *sb, u32 zg_id)
 {
     unsigned int region_sz = cetrafs_cas_region_size(sb);
     unsigned int regions = CETRAFS_BLOCK_SIZE / region_sz;
     unsigned int slots = region_sz / sizeof(cetrafs_pending_free_t);
-    struct cetrafs_pf_drain_ctx *ctx;
-    /* Every range this drain has applied, across all its regions. */
-    struct maple_tree done_mt;
+    struct cetrafs_pf_drain_ctx *ctx = NULL;
+    struct buffer_head **bhs = NULL;
+    struct cetrafs_pf_ent *got = NULL;
+    struct maple_tree done_mt, held_mt;
+    bool any = false, hold_all = false, stop = false;
+    u32 qblocks, qb, ngot = 0, capgot = 0, applied = 0, empty_run = 0;
     u64 qstart;
-    u32 qblocks, qb, applied = 0, empty_run = 0;
+    u32 e;
     int ret;
 
-    mt_init(&done_mt);
     ret = cetrafs_zg_queue_span(sb, zg_id, &qstart, &qblocks);
     if (ret)
         return ret;
 
-    ctx = kmalloc(sizeof(*ctx), GFP_NOFS);
-    if (!ctx)
-        return -ENOMEM;
-
-    /* Cost must follow OCCUPANCY, not capacity. This runs on every
-     * heartbeat tick for every owned ZG, and the queue is large enough
-     * to absorb a whole image's worth of frees -- scanning all of it
-     * every tick is the per-tick whole-table sweep PERFORMANCE.md
-     * invariant 5 forbids, and it starves the rest of the tick.
-     *
-     * Appends fill from the front (cetrafs_zg_queue_foreign_free scans
-     * block 0 upward for the first free slot), so occupancy is
-     * front-loaded and a run of empty blocks means the rest is empty
-     * too. Stop after CETRAFS_PF_DRAIN_EMPTY_RUN of them. An entry
-     * appended behind the stop point, or missed because a region was
-     * busy, is drained on the next tick -- a delay, never a lost free.
-     */
-    for (qb = 0; qb < qblocks && !ret; qb++) {
-        struct buffer_head *bh;
-        bool block_had_entries = false;
+    /* 1. Anything at all? */
+    for (qb = 0; qb < qblocks; qb++) {
+        struct buffer_head *bh = cetrafs_bread_uncached_retry(sb, qstart + qb);
         unsigned int r;
 
-        /* ONE forced read per block, not one per region: the block was
-         * being re-read `regions` times over, so the whole queue cost
-         * qblocks * regions device round trips per tick. The CAS below
-         * re-reads the region itself anyway -- this read only decides
-         * whether a region is worth a swap. */
-        bh = cetrafs_bread_uncached_retry(sb, qstart + qb);
         atomic64_inc(&cetrafs_pf_drain_blocks);
-        if (!bh) {
-            ret = -EIO;
+        if (!bh)
+            return -EIO;
+        for (r = 0; r < regions && !any; r++)
+            any = cetrafs_pf_region_used((const cetrafs_pending_free_t *) (bh->b_data + r * region_sz), slots);
+        brelse(bh);
+        if (any)
             break;
-        }
+        if (++empty_run >= CETRAFS_PF_DRAIN_EMPTY_RUN)
+            break;
+    }
+    if (!any)
+        return 0;
+
+    /* 2. The whole queue. */
+    mt_init(&done_mt);
+    mt_init(&held_mt);
+    ctx = kmalloc(sizeof(*ctx), GFP_NOFS);
+    bhs = kvmalloc_array(qblocks, sizeof(*bhs), GFP_NOFS);
+    if (!ctx || !bhs) {
+        ret = -ENOMEM;
+        goto out;
+    }
+    ret = cetrafs_bread_uncached_batch(sb, qstart, qblocks, bhs);
+    if (ret)
+        goto out;
+    atomic64_add(qblocks, &cetrafs_pf_drain_blocks);
+    atomic64_inc(&cetrafs_pf_drain_sweeps);
+    {
+        unsigned int ms = xchg(&cetrafs_pf_drain_consume_stall_ms, 0);
+
+        if (ms)
+            msleep(ms); /* TEST ONLY: see the parameter */
+    }
+
+    /* 3. Consume. */
+    for (qb = 0; qb < qblocks; qb++) {
+        unsigned int r;
 
         for (r = 0; r < regions; r++) {
-            const cetrafs_pending_free_t *ent;
-            unsigned int e;
+            const cetrafs_pending_free_t *ent = (const cetrafs_pending_free_t *) (bhs[qb]->b_data + r * region_sz);
+            unsigned int idx = qb * regions + r, valid = 0, try;
 
-            ent = (const cetrafs_pending_free_t *) (bh->b_data + r * region_sz);
-            ctx->n = 0;
             for (e = 0; e < slots; e++) {
                 if (ent[e].lba == 0)
                     continue;
                 if (cetrafs_le32(ent[e].magic) != CETRAFS_PENDING_FREE_MAGIC || cetrafs_le32(ent[e].count) == 0) {
                     pr_err("pending free: ZG %u queue block %u entry %u is garbage (magic=0x%x count=%u) -- dropping\n",
-                           zg_id, qb, e, ent[e].magic, ent[e].count);
+                           zg_id, qb, r * slots + e, ent[e].magic, ent[e].count);
                     cetrafs_sb_corrupt(sb, 0);
-                    continue; /* the CAS below clears it, but only if the region has valid entries */
+                    continue; /* the swap clears it, but only if the region has valid entries */
                 }
-                ctx->done[ctx->n].lba = cetrafs_le64(ent[e].lba);
-                ctx->done[ctx->n].count = cetrafs_le32(ent[e].count);
-                ctx->n++;
+                valid++;
+            }
+            if (!valid)
+                continue; /* garbage alone is not swapped for: it waits for a valid entry */
+
+            /* A region this drain will not consume -- it stopped on an
+             * error, or cannot track what it consumes -- keeps all of its
+             * entries, so every range in it is held. */
+            if (!stop && cetrafs_pf_got_reserve(&got, &capgot, ngot + slots))
+                stop = true;
+            if (stop) {
+                for (e = 0; e < slots; e++)
+                    if (ent[e].lba && cetrafs_pf_hold_range(&held_mt, cetrafs_le64(ent[e].lba),
+                                                            cetrafs_le32(ent[e].count)))
+                        hold_all = true;
+                continue;
             }
 
-            if (!ctx->n)
-                /* No valid entries: the CAS is skipped, so a garbage slot
-                 * here is NOT cleared. It stays until a valid entry lands
-                 * in this region and a CAS runs over it. */
-                continue;
-            block_had_entries = true;
-
-            /* CONSUME first. Only entries this swap actually removed from
-             * the queue may be applied -- see the function comment. */
-            ret = cetrafs_cas_region(sb, qstart + qb, r, cetrafs_pf_drain_mutate, ctx);
+            for (try = 0;; try++) {
+                if (cetrafs_pf_drain_busy_region && cetrafs_pf_drain_busy_region == idx + 1) {
+                    ctx->n = 0; /* TEST ONLY: as if every swap lost */
+                    ret = -EBUSY;
+                } else {
+                    ret = cetrafs_cas_region(sb, qstart + qb, r, cetrafs_pf_drain_mutate, ctx);
+                }
+                if (ret != -EBUSY || try >= CETRAFS_PF_BUSY_RETRIES)
+                    break;
+                msleep(1u << try);
+            }
             if (ret == -EBUSY) {
-                /* Lost the consume race repeatedly (concurrent appenders).
-                 * NOTHING was applied, so the entries simply stay queued
-                 * for the next tick -- no lost free, no double free. */
-                pr_debug("pending free: ZG %u queue block %u region %u busy, leaving %u entr%s for the next pass\n",
-                         zg_id, qb, r, ctx->n, ctx->n == 1 ? "y" : "ies");
+                /* Still losing to appenders: nothing consumed here. What
+                 * the region holds -- as our read found it, and as the
+                 * last attempt found it -- is held. */
+                for (e = 0; e < slots; e++)
+                    if (ent[e].lba && cetrafs_pf_hold_range(&held_mt, cetrafs_le64(ent[e].lba),
+                                                            cetrafs_le32(ent[e].count)))
+                        hold_all = true;
+                for (e = 0; e < ctx->n; e++)
+                    if (cetrafs_pf_hold_range(&held_mt, ctx->seen[e].lba, ctx->seen[e].count))
+                        hold_all = true;
+                pr_debug("pending free: ZG %u queue block %u region %u busy -- its entries wait for the next pass\n",
+                         zg_id, qb, r);
                 ret = 0;
                 continue;
             }
-            if (ret)
-                break;
-
-            /* Apply ONLY what the winning swap consumed (ctx->consumed,
-             * set by the mutate's final run). An entry that vanished
-             * before our swap was another drain's to apply -- applying it
-             * here would be the double-apply this ordering prevents. One
-             * that cannot be applied (wrong ZG, torn count) leaves its
-             * blocks bitmap-set and unreferenced -- a leak the scrub
-             * reclaims, never a double free. */
-            for (e = 0; e < ctx->n; e++) {
-                u64 first = ctx->done[e].lba, last = first + ctx->done[e].count - 1;
-                unsigned int ms;
-                int aret, mret;
-
-                ctrace("PFDRAIN zg=%u lba=%llu count=%u consumed=%d\n", zg_id,
-                       (unsigned long long) ctx->done[e].lba, ctx->done[e].count, (int) ctx->consumed[e]);
-                if (!ctx->consumed[e])
-                    continue;
-                if (applied && (ms = xchg(&cetrafs_pf_apply_stall_ms, 0)))
-                    msleep(ms); /* TEST ONLY, one-shot */
-                /* A block freed twice in one batch is a double free
-                 * already; applied twice, under separate alloc_mutex
-                 * holds, the second clears whatever this node allocated
-                 * there in between -- a live file's block (audit
-                 * 2026-11-06 L19). So no range is applied over one this
-                 * drain has applied, in any region: an entry overlapping
-                 * one is skipped WHOLE. Skipping errs toward a leak (the
-                 * scrub reclaims what it leaves set), and so does a
-                 * failure to track the range.
-                 *
-                 * Not covered: a copy this drain never reached (a busy
-                 * region, past the empty run), applied by a LATER drain
-                 * after a reallocation. Entries carry no stamp that
-                 * tells a stale copy from a genuine re-free, and a
-                 * longer memory would skip the genuine ones too. */
-                if (last < first) {
-                    mret = -ERANGE;
-                } else {
-                    mret = mtree_insert_range(&done_mt, (unsigned long) first, (unsigned long) last, xa_mk_value(1),
-                                              GFP_NOFS);
-                }
-                if (mret == -EEXIST) {
-                    pr_warn_ratelimited("pending free: ZG %u lba=%llu count=%u overlaps a free this drain already "
-                                        "applied (queued twice) -- skipping it\n",
-                                        zg_id, (unsigned long long) first, ctx->done[e].count);
-                    applied++; /* drained: consumed, its blocks already applied once */
-                    continue;
-                }
-                if (mret) {
-                    pr_warn_ratelimited("pending free: ZG %u could not track lba=%llu count=%u (%d) -- skipping it, "
-                                        "left for the scrub\n",
-                                        zg_id, (unsigned long long) first, ctx->done[e].count, mret);
-                    continue;
-                }
-                aret = cetrafs_apply_pending_free(sb, ctx->done[e].lba, ctx->done[e].count, zg_id);
-                if (!aret)
-                    applied++;
-                else
-                    /* Consumed, so not retried: the blocks stay set and
-                     * unreferenced, a leak the scrub reclaims. Said, not
-                     * dropped. */
-                    pr_warn_ratelimited("pending free: ZG %u could not apply lba=%llu count=%u (%d) -- left for the "
-                                        "scrub\n",
-                                        zg_id, (unsigned long long) ctx->done[e].lba, ctx->done[e].count, aret);
+            if (ret) {
+                /* Unknown whether the swap landed. Treated as not having
+                 * happened for everything destructive (rule 21): nothing
+                 * from it is applied, its entries -- if still there -- are
+                 * held, and the rest of the queue is left alone. */
+                for (e = 0; e < slots; e++)
+                    if (ent[e].lba && cetrafs_pf_hold_range(&held_mt, cetrafs_le64(ent[e].lba),
+                                                            cetrafs_le32(ent[e].count)))
+                        hold_all = true;
+                stop = true;
+                continue;
             }
+            memcpy(&got[ngot], ctx->seen, ctx->n * sizeof(ctx->seen[0]));
+            ngot += ctx->n;
         }
-
-        brelse(bh);
-
-        if (block_had_entries)
-            empty_run = 0;
-        else if (++empty_run >= CETRAFS_PF_DRAIN_EMPTY_RUN)
-            break;
     }
 
+    /* 4. Apply. */
+    for (e = 0; e < ngot; e++) {
+        u64 first = got[e].lba, last = first + got[e].count - 1;
+        unsigned long index = (unsigned long) first;
+        unsigned int ms;
+        int aret, mret;
+
+        ctrace("PFDRAIN zg=%u lba=%llu count=%u\n", zg_id, (unsigned long long) first, got[e].count);
+        if (applied && (ms = xchg(&cetrafs_pf_apply_stall_ms, 0)))
+            msleep(ms); /* TEST ONLY, one-shot */
+        if (last < first) {
+            pr_warn_ratelimited("pending free: ZG %u lba=%llu count=%u wraps -- skipping it, left for the scrub\n",
+                                zg_id, (unsigned long long) first, got[e].count);
+            continue;
+        }
+        /* Another copy still queued: leave these blocks allocated. The
+         * copy completes the free when a later drain consumes it -- and
+         * since nothing can be allocated on them meanwhile, that copy
+         * can only free what was never handed out again. */
+        if (hold_all || mt_find(&held_mt, &index, (unsigned long) last)) {
+            atomic64_inc(&cetrafs_pf_drain_held);
+            pr_info_ratelimited("pending free: ZG %u lba=%llu count=%u has a copy still queued -- left for the drain "
+                                "that consumes it\n",
+                                zg_id, (unsigned long long) first, got[e].count);
+            continue;
+        }
+        /* A copy this drain already applied (consumed in this or another
+         * region): applying it again would clear whatever was allocated
+         * there in between (audit 2026-11-06 L19). Skipped WHOLE --
+         * errs toward a leak, as does a failure to track the range. */
+        mret = mtree_insert_range(&done_mt, (unsigned long) first, (unsigned long) last, xa_mk_value(1), GFP_NOFS);
+        if (mret == -EEXIST) {
+            pr_warn_ratelimited("pending free: ZG %u lba=%llu count=%u overlaps a free this drain already "
+                                "applied (queued twice) -- skipping it\n",
+                                zg_id, (unsigned long long) first, got[e].count);
+            applied++; /* drained: consumed, its blocks already applied once */
+            continue;
+        }
+        if (mret) {
+            pr_warn_ratelimited("pending free: ZG %u could not track lba=%llu count=%u (%d) -- skipping it, "
+                                "left for the scrub\n",
+                                zg_id, (unsigned long long) first, got[e].count, mret);
+            continue;
+        }
+        aret = cetrafs_apply_pending_free(sb, first, got[e].count, zg_id);
+        if (!aret)
+            applied++;
+        else
+            /* Consumed, so not retried: the blocks stay set and
+             * unreferenced, a leak the scrub reclaims. Said, not
+             * dropped. */
+            pr_warn_ratelimited("pending free: ZG %u could not apply lba=%llu count=%u (%d) -- left for the "
+                                "scrub\n",
+                                zg_id, (unsigned long long) first, got[e].count, aret);
+    }
+
+out:
+    if (bhs) {
+        for (qb = 0; qb < qblocks; qb++)
+            brelse(bhs[qb]);
+        kvfree(bhs);
+    }
+    kvfree(got);
     kfree(ctx);
     mtree_destroy(&done_mt);
+    mtree_destroy(&held_mt);
 
     if (applied) {
         pr_debug("pending free: ZG %u drained %u entr%s\n", zg_id, applied, applied == 1 ? "y" : "ies");

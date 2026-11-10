@@ -460,6 +460,42 @@ first (`cetrafs_lba_run_past_end()`) -- off the per-block budget only
 because a valid address never gets there; never call the refresh on a
 path that valid I/O takes.
 
+## 17. A pending-free drain sweeps its whole queue only when it has work, and in one read
+
+A drain runs on every heartbeat tick for every owned Zone Group, and
+rate limited from the allocation path. On a quiet tick it must cost what
+the queue's occupancy costs: appends fill from the front, so it reads
+from block 0 and stops at `CETRAFS_PF_DRAIN_EMPTY_RUN` (2) empty blocks
+-- two uncached reads. Only a drain that finds an entry reads the whole
+queue (`CETRAFS_PENDING_FREE_BLOCKS_PER_ZG`, 256 blocks, 1 MiB), which
+correctness needs: a copy of a free past an empty run, left behind by a
+drain that applied the other copy, freed a reallocated block (L19,
+`cetrafs_zg_drain_one()`).
+
+That sweep must be ONE batched read (`cetrafs_bread_uncached_batch()`:
+every forced-fresh read submitted under one plug, then waited for), not
+256 serial ones. Measured on the deployment array (2026-11-10, two nodes,
+one owned Zone Group, one node deleting the other's files; three
+interleaved runs of each build, drain passes timed with ftrace):
+
+| | before | after |
+|---|---|---|
+| quiet tick, median pass | 0.44 -- 0.52 ms | 0.37 -- 0.49 ms |
+| the 1 MiB sweep read | -- | 1.09 -- 1.21 ms median, 2.0 ms max |
+| 2000-file delete: all drain passes | 167 -- 185 ms | 223 -- 242 ms |
+| the deleting node's 2000 `rm`s | 135 -- 151 s | 147 -- 157 s (noise) |
+
+One serial uncached read costs ~0.25 ms there, so an unbatched sweep is
+~64 ms per owned Zone Group per pass with work -- on every tick, once
+UNMAP makes foreign frees continuous. Per owned Zone Group that has
+entries, the batched sweep adds about 1.2 ms per pass; quiet ones add
+nothing.
+
+**Guarded by:** procfs `pf_drain_blocks` / `pf_drain_sweeps` (a quiet
+volume's blocks per drain stay ~2 per owned ZG and its sweeps 0);
+`tests/kernel/pf_stale_copy_later_drain.sh` (correctness). Neither
+measures time -- a loop device serves the reads from the page cache.
+
 ## Measured baseline
 
 On the reference hardware -- an enterprise FC array over 32GFC multipath (two

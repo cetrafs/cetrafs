@@ -285,8 +285,16 @@ extent leaf/interior blocks); the global tables are not.
 A fixed-slot array per ZG (at `pending_free_start`). When a node frees a block
 that lives in **another** node's ZG, it does not touch that ZG's bitmap; it
 appends a `{lba, count, magic}` entry (one per extent) by CAS, and the owner
-drains and applies it (idempotently) at mount, on every heartbeat tick, and
-after an on-demand claim. Append and drain are both lock-free compare-and-swap.
+drains it at mount, on every heartbeat tick, after an on-demand claim and, rate
+limited, from the allocation path. Append and drain are both lock-free
+compare-and-swap. A drain CONSUMES entries (zeroes them by CAS) before it
+applies them, and applying is NOT idempotent: by a second apply the block may
+belong to a new file. So a free queued twice must never be applied by two
+drains: a drain that finds any entry reads the whole queue (one batched read),
+consumes every entry each swap finds, applies a range once however many copies
+it consumed, and holds back a range while any copy of it is still queued (a
+region it could not consume) -- the held blocks stay allocated, so the copy
+that completes the free later frees nothing anyone was given.
 
 ### Block Group Descriptor — `cetrafs_block_group_t` (1 block per BG, in the BG table)
 

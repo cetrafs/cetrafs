@@ -148,6 +148,69 @@ struct buffer_head *cetrafs_bread_uncached_retry(struct super_block *sb, sector_
 }
 
 /*
+ * cetrafs_bread_uncached() over a run of n contiguous blocks, as ONE
+ * batch: each clean cached copy is dropped exactly as there (a dirty or
+ * held-back buffer is a write of ours still in flight, kept), every read
+ * is submitted under one plug so the block layer can merge the run into
+ * a few large requests, and only then is each waited for. n serial
+ * round trips become about one. A block whose batched read did not come
+ * back uptodate -- a device error, or a concurrent forced-fresh reader
+ * clearing the bit after the read landed (see cetrafs_bread_retry()) --
+ * is read again alone through cetrafs_bread_uncached_retry().
+ *
+ * Fills bhs[0..n) with referenced buffers. On failure every buffer is
+ * released, bhs[] is zeroed and -EIO is returned.
+ */
+int cetrafs_bread_uncached_batch(struct super_block *sb, sector_t start, u32 n, struct buffer_head **bhs)
+{
+    struct blk_plug plug;
+    u32 i;
+
+    memset(bhs, 0, n * sizeof(*bhs)); /* the failure path releases every slot */
+    for (i = 0; i < n; i++) {
+        bhs[i] = sb_getblk(sb, start + i);
+        if (!bhs[i])
+            goto fail;
+    }
+
+    blk_start_plug(&plug);
+    for (i = 0; i < n; i++) {
+        struct buffer_head *bh = bhs[i];
+
+        lock_buffer(bh);
+        if (buffer_uptodate(bh) && !cetrafs_bh_pending(bh))
+            clear_buffer_uptodate(bh);
+        if (buffer_uptodate(bh)) {
+            unlock_buffer(bh); /* our own pending write: what bh_read() would return too */
+            continue;
+        }
+        /* As __bh_read(): the completion unlocks and drops this ref. */
+        get_bh(bh);
+        bh->b_end_io = end_buffer_read_sync;
+        submit_bh(REQ_OP_READ, bh);
+    }
+    blk_finish_plug(&plug);
+
+    for (i = 0; i < n; i++) {
+        wait_on_buffer(bhs[i]);
+        if (buffer_uptodate(bhs[i]))
+            continue;
+        brelse(bhs[i]);
+        bhs[i] = cetrafs_bread_uncached_retry(sb, start + i);
+        if (!bhs[i])
+            goto fail;
+    }
+    return 0;
+
+fail:
+    for (i = 0; i < n; i++) {
+        brelse(bhs[i]); /* NULL-safe */
+        bhs[i] = NULL;
+    }
+    return -EIO;
+}
+
+/*
  * Claim a cached buffer for modification; cetrafs_bh_end_update()
  * publishes the result. Only the buffer LOCK excludes both hazards:
  *
