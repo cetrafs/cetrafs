@@ -10,18 +10,23 @@
 # CAS took a LIVE node's file lock, its reader bit, or its namespace
 # lock, and neither side could tell (audit R8).
 #
-# Now every such CAS is followed by a re-read of the holder's row: if
-# its hb_seq moved past the one the fence landed on, the claim is given
-# back and the holder treated as live.
+# The file lock and presence bits now carry the incarnation that took
+# them (format 0x000A), and the swap compares it: a claim the holder
+# took again after re-attaching carries its new incarnation and cannot
+# be displaced (reclaim_incarnation covers the other half, a re-attach
+# that did not re-take). The namespace lock is still followed by a
+# re-read of the holder's row: if its hb_seq moved past the one the
+# fence landed on, the claim is given back.
 #
 # The holder is registry row 1, a departed node (stale at once); its
-# re-attach is a beat poked onto its row while the reclaim is held
-# between fence and CAS (reclaim_stall_after_fence_ms). Its claim's
-# bytes are already in place -- the re-claim the CAS cannot tell apart.
+# re-attach is a beat and a new incarnation poked onto its row while the
+# reclaim is held between fence and CAS (reclaim_stall_after_fence_ms),
+# and its re-claim is stamped with that incarnation, as a real open's is.
 #
-# DISCRIMINATION: reattach_after_fence_force=0 (never detect) -- the
-# open succeeds over the lock (run as the last section), the reader bit
-# is gone, the namespace lock is ours.
+# DISCRIMINATION: reattach_after_fence_force=0 (never detect) with a
+# re-attach that did NOT re-take the lock -- the open goes through, so
+# the staging reaches the swap (run as the last section); without the
+# incarnation compare the lock and reader sections lose their claim.
 set -euo pipefail
 . "$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)/lib/harness.sh"
 require_root
@@ -44,19 +49,25 @@ I_READ="$(stat -c %i "$MNT/readf")"
 I_DIR="$(stat -c %i "$MNT/d")"
 ct_umount "$MNT"
 
-# Row 1: a node that departed cleanly -- stale at once, no watch.
+# Row 1: a node that departed cleanly -- stale at once, no watch -- at
+# incarnation 100, holding claims stamped with it.
 "$NPOKE" "$IMG" 1 1 bb 0 >/dev/null 2>&1 || fail "setup: could not register row 1"
-"$LPOKE" "$IMG" "$I_LOCK" 1 1 >/dev/null
-"$LPOKE" "$IMG" "$I_READ" --reader 1 >/dev/null
+"$NPOKE" "$IMG" 1 --inc 100 >/dev/null
+INODE_LOCK_POKE_INC=100 "$LPOKE" "$IMG" "$I_LOCK" 1 1 >/dev/null
+INODE_LOCK_POKE_INC=100 "$LPOKE" "$IMG" "$I_READ" --reader 1 >/dev/null
 "$LPOKE" "$IMG" "$I_DIR" --ns 1 >/dev/null
 ct_mount "$DEV" "$MNT"
 
-# reattach_during <cmd...>: run <cmd> with the reclaim held after its
-# fence while row 1 beats (re-attaches); prints "<rc>".
+# reattach_during <retake> <cmd...>: run <cmd> with the reclaim held
+# after its fence while row 1 re-attaches (a beat, incarnation 200) and
+# runs <retake> -- its re-claim, stamped with 200 -- or "true" for none;
+# prints "<rc>".
 reattach_during() {
-    local rc=0
+    local rc=0 retake="$1"
+    shift
     ct_param_set reclaim_stall_after_fence_ms 2000
-    ( sleep 0.8; "$NPOKE" "$IMG" 1 --beat >/dev/null 2>&1 ) &
+    ( sleep 0.8; "$NPOKE" "$IMG" 1 --beat >/dev/null 2>&1; "$NPOKE" "$IMG" 1 --inc 200 >/dev/null 2>&1
+      eval "INODE_LOCK_POKE_INC=200 $retake" >/dev/null 2>&1 ) &
     local B=$!
     "$@" 2>/dev/null || rc=$?
     wait "$B" || true
@@ -66,7 +77,7 @@ reattach_during() {
 lockf() { "$LPOKE" "$IMG" "$1"; }
 
 # 1. The file lock: a write-open steals it.
-RC="$(reattach_during python3 -c 'import os,sys; os.close(os.open(sys.argv[1], os.O_RDWR))' "$MNT/lockf")"
+RC="$(reattach_during '"$LPOKE" "$IMG" "$I_LOCK" 1 1' python3 -c 'import os,sys; os.close(os.open(sys.argv[1], os.O_RDWR))' "$MNT/lockf")"
 L="$(lockf "$I_LOCK")"
 log "lock: open rc=$RC; $L"
 [ "$RC" != 0 ] && pass "lock: the write-open was refused -- the holder came back" ||
@@ -76,9 +87,10 @@ grep -q "owner=1 mode=1" <<<"$L" && pass "lock: the lock is the holder's again (
 
 # Row 1 departs again, so the next reclaim is legitimate to start.
 "$NPOKE" "$IMG" 1 1 bb 0 >/dev/null 2>&1
+"$NPOKE" "$IMG" 1 --inc 100 >/dev/null
 
 # 2. A reader bit: a write-open clears a stale reader first.
-RC="$(reattach_during python3 -c 'import os,sys; os.close(os.open(sys.argv[1], os.O_RDWR))' "$MNT/readf")"
+RC="$(reattach_during '"$LPOKE" "$IMG" "$I_READ" --reader 1' python3 -c 'import os,sys; os.close(os.open(sys.argv[1], os.O_RDWR))' "$MNT/readf")"
 L="$(lockf "$I_READ")"
 log "reader: open rc=$RC; $L"
 [ "$RC" != 0 ] && pass "reader: the write-open was refused -- a live reader came back" ||
@@ -111,14 +123,15 @@ dmesg | tail -40 | grep -q "came back while its" && pass "and the give-backs wer
 # (reattach_after_fence_force=0, the pre-fix behaviour): the write-open
 # must go through over the holder -- or the stall did not stage the race.
 "$NPOKE" "$IMG" 1 1 bb 0 >/dev/null 2>&1
-"$LPOKE" "$IMG" "$I_LOCK" 1 1 >/dev/null
+"$NPOKE" "$IMG" 1 --inc 100 >/dev/null
+INODE_LOCK_POKE_INC=100 "$LPOKE" "$IMG" "$I_LOCK" 1 1 >/dev/null
 ct_param_set reattach_after_fence_force 0
-RC="$(reattach_during python3 -c 'import os,sys; os.close(os.open(sys.argv[1], os.O_RDWR))' "$MNT/lockf")"
+RC="$(reattach_during true python3 -c 'import os,sys; os.close(os.open(sys.argv[1], os.O_RDWR))' "$MNT/lockf")"
 ct_param_set reattach_after_fence_force -1
 L="$(lockf "$I_LOCK")"
 log "control: open rc=$RC; $L"
 [ "$RC" = 0 ] && ! grep -q "owner=1 mode=1" <<<"$L" &&
-    pass "control: undetected, the write-open takes the re-attached holder's lock -- the staging reaches the race" ||
+    pass "control: undetected and not re-taken, the write-open takes the lock -- the staging reaches the swap" ||
     fail "setup: even undetected the open did not take the lock (rc=$RC, $L) -- section 1 proves nothing"
 
 # Clean up: row 1 leaves, its claims go with it.

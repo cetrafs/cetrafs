@@ -1035,7 +1035,17 @@ typedef struct {
      * (L3). last_seen is now only the time of the last beat. */
     __le32  departure;
 
-    u8   reserved[16];
+    /* Which mount of this node the row is now (format 0x000A): a random
+     * nonzero value drawn afresh at every registration and re-attach,
+     * never equal to the one before. Every claim the node stamps in a
+     * record carries it beside the row number (the file lock, each
+     * presence bit), so a claim names an INCARNATION, not just a row: a
+     * reclaim's swap compares both, and cannot displace a claim the node
+     * took again after coming back -- the row number alone read the same
+     * for the dead incarnation's claim and the live one's (F10). */
+    __le32  incarnation;
+
+    u8   reserved[12];
 } CETRA_PACKED cetrafs_node_entry_t; /* 128 bytes */
 
 /* cetrafs_node_entry_t.departure values. */
@@ -1371,7 +1381,17 @@ typedef struct {
      * every record ever written and inside ns_checksum's range already,
      * so an older volume reads "none" and nothing moves. */
     __le64 suspended_writer_nodes;
-    u8 ns_pad[CETRAFS_INODE_NS_BYTES - 104];
+
+    /* The incarnation (cetrafs_node_entry_t.incarnation) behind each
+     * claim above, format 0x000A: the file lock's holder, and each set
+     * bit of read_open_nodes (a suspended writer is a presence bit too).
+     * 0 where there is no claim. A reclaim takes a dead node's claim
+     * only while it still carries the incarnation that was judged; a
+     * claim the node re-took after re-attaching carries a new one and
+     * is left alone (F10). */
+    __le32 lock_owner_incarnation;
+    __le32 read_open_incarnation[CETRAFS_MAX_READER_NODES];
+    u8 ns_pad[CETRAFS_INODE_NS_BYTES - 108 - 4 * CETRAFS_MAX_READER_NODES];
 
     /* ===== SECTOR 1: the FILE DOMAIN ===== */
     __le64 fd_ino;                /* identity echo of .ino */

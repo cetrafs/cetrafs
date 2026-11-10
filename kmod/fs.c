@@ -333,6 +333,7 @@ struct cetrafs_sb_info {
      * something of ours, so we must fence (this is the replacement for the
      * old SCSI PR registration lease). */
     u64 fence_epoch;
+    u32 incarnation; /* this mount's, as stamped in the row (cetrafs_sb_incarnation()) */
 
     /* True only once cetrafs_node_register() has actually succeeded for
      * this mount -- node_id alone can't tell cetrafs_free_sb_info()
@@ -2121,6 +2122,23 @@ void cetrafs_sb_set_fence_epoch(struct super_block *sb, u64 epoch)
 
     if (sbi)
         sbi->fence_epoch = epoch;
+}
+
+/* This mount's incarnation (cetrafs_node_entry_t.incarnation): what every
+ * claim it stamps carries. Set once, at registration. */
+void cetrafs_sb_set_incarnation(struct super_block *sb, u32 inc)
+{
+    struct cetrafs_sb_info *sbi = sb->s_fs_info;
+
+    if (sbi)
+        WRITE_ONCE(sbi->incarnation, inc);
+}
+
+u32 cetrafs_sb_incarnation(struct super_block *sb)
+{
+    struct cetrafs_sb_info *sbi = sb->s_fs_info;
+
+    return sbi ? READ_ONCE(sbi->incarnation) : 0;
 }
 
 struct cetrafs_defrag *cetrafs_sb_get_defrag(struct super_block *sb)

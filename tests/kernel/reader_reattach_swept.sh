@@ -72,11 +72,16 @@ ct_umount "$MNT"
 # in the gap. The bit goes back regardless -- it is the true state, and
 # how that writer's truncate or unlink learns of the reader. Refusing
 # under the foreign lock dropped a live reader's presence (audit F12).
+# Coming back READING means opening it again: since format 0x000A the
+# bit then carries row 1's new incarnation, and the clear (which may
+# only take the incarnation it judged) leaves it alone.
 "$NPOKE" "$IMG" 1 1 bb 0 >/dev/null 2>&1
-"$LPOKE" "$IMG" "$INO" --reader 1 >/dev/null
+"$NPOKE" "$IMG" 1 --inc 100 >/dev/null
+INODE_LOCK_POKE_INC=100 "$LPOKE" "$IMG" "$INO" --reader 1 >/dev/null
 ct_mount "$DEV" "$MNT"
 ct_param_set reclaim_stall_before_swap_ms 2000
-( sleep 0.8; "$NPOKE" "$IMG" 1 --beat >/dev/null 2>&1; "$LPOKE" "$IMG" "$INO" 2 1 >/dev/null 2>&1 ) &
+( sleep 0.8; "$NPOKE" "$IMG" 1 --beat >/dev/null 2>&1; "$NPOKE" "$IMG" 1 --inc 201 >/dev/null 2>&1
+  INODE_LOCK_POKE_INC=201 "$LPOKE" "$IMG" "$INO" --reader 1 >/dev/null 2>&1; "$LPOKE" "$IMG" "$INO" 2 1 >/dev/null 2>&1 ) &
 B=$!
 python3 -c 'import os,sys; os.close(os.open(sys.argv[1], os.O_RDWR))' "$MNT/f" 2>/dev/null || true
 wait "$B" || true
@@ -87,7 +92,7 @@ log "2: $L"
 [ "$LEFT" = 0 ] || { fail "setup (2): the stall was never consumed"; ct_exit; }
 grep -q "owner=2 mode=1" <<<"$L" || { fail "setup (2): the third node's lock is not on the record: $L"; ct_exit; }
 grep -qE "readers=0x[0-9a-f]*[2367abef]$" <<<"$L" &&
-    pass "2: the returning reader's bit was put back under the third node's lock ($L)" ||
+    pass "2: the returning reader's bit survived under the third node's lock ($L)" ||
     fail "2: a live reader's presence was dropped because a writer claimed the file in the gap ($L)"
 "$LPOKE" "$IMG" "$INO" 65535 0 >/dev/null 2>&1
 "$LPOKE" "$IMG" "$INO" --unreader 1 >/dev/null 2>&1

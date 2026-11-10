@@ -1572,16 +1572,25 @@ struct cetrafs_lock_cas_ctx {
      * the claim took the lock FROM steal_from rather than finding it
      * free; steal_release cleared steal_from's lock rather than finding
      * it gone; a reader CLEAR cleared a bit that was set. Only a
-     * displacement has anything to give back (cetrafs_lock_undo_steal()).
+     * displacement took a claim away.
      * Every one of them also has a "nothing to do" outcome that the CAS
      * wrapper folds into success, which is why this is recorded. */
     bool displaced;
-    /* Undo a reclaim that raced a re-attach (cetrafs_lock_undo_steal()):
-     * put the lock back to give_back_to, only while it is still what the
-     * reclaim left -- held by give_back_from, or free when that is NONE. */
-    bool give_back;
-    u32 give_back_to;
-    u32 give_back_from;
+
+    /* Incarnations (cetrafs_node_entry_t.incarnation, format 0x000A).
+     * my_incarnation: what a claim or a presence SET stamps -- this
+     * mount's (cetrafs_lock_cas() fills it in). steal_incarnation: the
+     * incarnation of the claim a reclaim judged (allow_steal,
+     * steal_release, or a reader CLEAR of another node's bit with
+     * check_incarnation): the swap takes that claim only while it still
+     * carries it. A claim the node took again after re-attaching carries
+     * a new one, so a reclaim cannot displace it, and there is nothing
+     * to give back afterwards (F10). 'moved' (out, per attempt): the
+     * claim was there under another incarnation -- a live one. */
+    u32 my_incarnation;
+    u32 steal_incarnation;
+    bool check_incarnation;
+    bool moved;
 
     /* Reader presence. When set, this CAS is purely about
      * read_open_nodes and leaves the write lock alone -- the two are
@@ -1685,7 +1694,10 @@ static int cetrafs_lock_cas_mutate(void *image, unsigned int len, void *priv)
          * that was set? A CLEAR finding the bit already clear returns 1,
          * which the CAS wrapper folds into 0 -- indistinguishable from a
          * clear that landed, unless recorded here. */
+        u32 slot = ctx->my_node_id % CETRAFS_MAX_READER_NODES;
+
         ctx->displaced = false;
+        ctx->moved = false;
 
         if (ctx->reader_op == CETRAFS_SUSPEND_SET || ctx->reader_op == CETRAFS_SUSPEND_CLEAR) {
             u64 sw = cetrafs_le64(rec.suspended_writer_nodes);
@@ -1716,6 +1728,16 @@ static int cetrafs_lock_cas_mutate(void *image, unsigned int len, void *priv)
                 return -ETXTBSY; /* a writer handing it over still writes */
         }
 
+        /* A reclaim clears another node's bit only while it is still the
+         * incarnation that was judged: one stamped since is that node's
+         * new open, a live reader (F10). */
+        if (ctx->reader_op == CETRAFS_READER_CLEAR && ctx->check_incarnation &&
+            (cetrafs_le64(rec.read_open_nodes) & bit) &&
+            cetrafs_le32(rec.read_open_incarnation[slot]) != ctx->steal_incarnation) {
+            ctx->moved = true;
+            return 1;
+        }
+
         want = (ctx->reader_op == CETRAFS_READER_SET) ? (cetrafs_le64(rec.read_open_nodes) | bit)
                                                       : (cetrafs_le64(rec.read_open_nodes) & ~bit);
         if (ctx->reader_op == CETRAFS_READER_CLEAR && (cetrafs_le64(rec.suspended_writer_nodes) & bit)) {
@@ -1725,30 +1747,22 @@ static int cetrafs_lock_cas_mutate(void *image, unsigned int len, void *priv)
             ctx->displaced = (cetrafs_le64(rec.read_open_nodes) & bit) != 0;
             rec.suspended_writer_nodes = cetrafs_cpu_to_le64(cetrafs_le64(rec.suspended_writer_nodes) & ~bit);
             rec.read_open_nodes = cetrafs_cpu_to_le64(want);
+            rec.read_open_incarnation[slot] = cetrafs_cpu_to_le32(0);
             cetrafs_inode_stamp_crc_ns(&rec);
             memcpy(image, &rec, CETRAFS_INODE_NS_BYTES);
             return 0;
         }
 
-        if (want == cetrafs_le64(rec.read_open_nodes))
+        if (want == cetrafs_le64(rec.read_open_nodes) &&
+            (ctx->reader_op != CETRAFS_READER_SET ||
+             cetrafs_le32(rec.read_open_incarnation[slot]) == ctx->my_incarnation))
             return 1; /* already in the desired state -- nothing to do */
         ctx->displaced = ctx->reader_op == CETRAFS_READER_CLEAR;
         rec.read_open_nodes = cetrafs_cpu_to_le64(want);
-        cetrafs_inode_stamp_crc_ns(&rec);
-        memcpy(image, &rec, CETRAFS_INODE_NS_BYTES);
-        return 0;
-    }
-
-    if (ctx->give_back) {
-        bool as_left = ctx->give_back_from == CETRAFS_NODE_ID_NONE
-                           ? cetrafs_le32(rec.lock_mode) == CETRAFS_LOCK_NONE
-                           : cetrafs_le32(rec.lock_mode) == CETRAFS_LOCK_EXCLUSIVE &&
-                                 cetrafs_le32(rec.lock_owner_node) == ctx->give_back_from;
-
-        if (!as_left)
-            return 1; /* moved on since the reclaim: nothing of ours to undo */
-        rec.lock_owner_node = cetrafs_cpu_to_le32(ctx->give_back_to);
-        rec.lock_mode = cetrafs_cpu_to_le32(CETRAFS_LOCK_EXCLUSIVE);
+        /* SET stamps this mount's incarnation -- over a leftover bit of an
+         * earlier one too: the bit is this mount's open now. */
+        rec.read_open_incarnation[slot] =
+            cetrafs_cpu_to_le32(ctx->reader_op == CETRAFS_READER_SET ? ctx->my_incarnation : 0);
         cetrafs_inode_stamp_crc_ns(&rec);
         memcpy(image, &rec, CETRAFS_INODE_NS_BYTES);
         return 0;
@@ -1761,11 +1775,17 @@ static int cetrafs_lock_cas_mutate(void *image, unsigned int len, void *priv)
          * "Nothing to clear" returns 1, which the CAS wrapper folds into
          * 0: record which one this was, per attempt, for the give-back. */
         ctx->displaced = false;
+        ctx->moved = false;
         if (cetrafs_le32(rec.lock_mode) != CETRAFS_LOCK_EXCLUSIVE ||
             cetrafs_le32(rec.lock_owner_node) != ctx->steal_from)
             return 1; /* not that owner any more -- nothing to clear */
+        if (cetrafs_le32(rec.lock_owner_incarnation) != ctx->steal_incarnation) {
+            ctx->moved = true; /* that node took it again since: a live lock (F10) */
+            return 1;
+        }
         ctx->displaced = true;
         rec.lock_owner_node = cetrafs_cpu_to_le32(CETRAFS_NODE_ID_NONE);
+        rec.lock_owner_incarnation = cetrafs_cpu_to_le32(0);
         rec.lock_mode = CETRAFS_LOCK_NONE;
         cetrafs_inode_stamp_crc_ns(&rec);
         memcpy(image, &rec, CETRAFS_INODE_NS_BYTES);
@@ -1774,8 +1794,13 @@ static int cetrafs_lock_cas_mutate(void *image, unsigned int len, void *priv)
 
     if (ctx->claim) {
         bool free_now = (rec.lock_mode == CETRAFS_LOCK_NONE);
+        /* A steal takes the judged claim only: the stale owner's row AND
+         * the incarnation that stamped it. A lock that node took again
+         * after re-attaching carries a new incarnation and is a live
+         * holder's (F10). */
         bool stealable = ctx->allow_steal && cetrafs_le32(rec.lock_mode) == CETRAFS_LOCK_EXCLUSIVE &&
-                         cetrafs_le32(rec.lock_owner_node) == ctx->steal_from;
+                         cetrafs_le32(rec.lock_owner_node) == ctx->steal_from &&
+                         cetrafs_le32(rec.lock_owner_incarnation) == ctx->steal_incarnation;
 
         if (!free_now && !stealable)
             return -ETXTBSY; /* held by someone else, or taken since we looked */
@@ -1787,6 +1812,7 @@ static int cetrafs_lock_cas_mutate(void *image, unsigned int len, void *priv)
 
         ctx->displaced = !free_now; /* per attempt: the image that lands is the last one mutated */
         rec.lock_owner_node = cetrafs_cpu_to_le32(ctx->my_node_id);
+        rec.lock_owner_incarnation = cetrafs_cpu_to_le32(ctx->my_incarnation);
         rec.lock_mode = cetrafs_cpu_to_le32(CETRAFS_LOCK_EXCLUSIVE);
     } else {
         if (cetrafs_le32(rec.lock_mode) != CETRAFS_LOCK_EXCLUSIVE ||
@@ -1794,6 +1820,7 @@ static int cetrafs_lock_cas_mutate(void *image, unsigned int len, void *priv)
             return 1; /* not ours any more -- nothing to release, not an error */
 
         rec.lock_owner_node = cetrafs_cpu_to_le32(CETRAFS_NODE_ID_NONE);
+        rec.lock_owner_incarnation = cetrafs_cpu_to_le32(0);
         rec.lock_mode = CETRAFS_LOCK_NONE;
         /* v0x0005: the stat fields live in the FILE sector now and are
          * published by cetrafs_write_vfs_inode()'s own sector-1 CAS at
@@ -1804,53 +1831,6 @@ static int cetrafs_lock_cas_mutate(void *image, unsigned int len, void *priv)
     cetrafs_inode_stamp_crc_ns(&rec);
     memcpy(image, &rec, CETRAFS_INODE_NS_BYTES);
     return 0;
-}
-
-/*
- * A lock reclaim has landed: did it take a LIVE claim?
- *
- * The steal compares the owner's row NUMBER only, and runs after the
- * fence, a journal replay and more reads. An owner that re-attached in
- * that time, swept its leftover claims and took this lock again wrote
- * exactly the bytes the steal compares -- two writers, and the owner's
- * release later reads "not ours" and says nothing (audit R8). A
- * re-attach moves the row's hb_seq, and must precede any re-claim, so
- * cetrafs_node_reattached_since_fence() read after the steal settles it.
- *
- * If it did: put the lock back to the owner, and the caller treats the
- * file as held by a live node. A claim calls this only when its swap
- * DISPLACED the owner (ctx.displaced): an owner that re-attached and
- * swept first left the lock free, the claim took a free lock, and
- * "giving it back" would hand a live node a lock no open of its holds
- * -- nothing would ever release it. A give-back that does not land leaves
- * this node holding a live peer's lock -- the mount stops rather than
- * write under it (docs/internal/ERRORS.md).
- *
- * 'now_owner' is what the reclaim left: this node for a steal-to-self,
- * CETRAFS_NODE_ID_NONE for a steal-to-NONE. Returns true if it undid.
- */
-static bool cetrafs_lock_undo_steal(struct super_block *sb, u64 ino, u64 generation, u32 owner, u32 now_owner,
-                                    const char *what)
-{
-    struct cetrafs_lock_cas_ctx g = {
-        .generation = generation,
-        .give_back = true,
-        .give_back_to = owner,
-        .give_back_from = now_owner,
-    };
-    int ret;
-
-    if (!cetrafs_node_reattached_since_fence(sb, owner))
-        return false;
-    ret = cetrafs_cas_record_nointr(sb, cetrafs_inode_lba(sb, ino), cetrafs_lock_cas_mutate, &g);
-    if (ret < 0)
-        cetrafs_sb_fatal(sb, "%s: ino=%llu: node %u came back while its lock was being reclaimed, and the lock "
-                         "could not be given back (%d)",
-                         what, (unsigned long long) ino, owner, ret);
-    else
-        pr_warn("%s: ino=%llu: node %u came back while its lock was being reclaimed -- gave it back\n", what,
-                (unsigned long long) ino, owner);
-    return true;
 }
 
 /* 'seed' is the caller's own freshly-read copy of this record, handed to
@@ -1868,6 +1848,7 @@ static int cetrafs_lock_cas(struct inode *inode, struct cetrafs_lock_cas_ctx *ct
      * any other seed regardless. */
     if (seed && cetrafs_inode_crc_ns(seed) != (u32) cetrafs_le64(seed->ns_checksum))
         seed = NULL;
+    ctx->my_incarnation = cetrafs_sb_incarnation(inode->i_sb);
     return cetrafs_cas_record_seeded(inode->i_sb, cetrafs_inode_lba(inode->i_sb, inode->i_ino), seed,
                                      seed ? CETRAFS_INODE_NS_BYTES : 0, cetrafs_lock_cas_mutate, ctx);
 }
@@ -2069,6 +2050,7 @@ int cetrafs_lock_open(struct inode *inode, struct file *file)
     bool reclaim_from_stale = false;
     bool claimed = false; /* this open took the exclusive lock */
     u32 stale_owner = CETRAFS_NODE_ID_NONE;
+    u32 stale_incarnation = 0; /* the incarnation behind the judged stale lock */
     int ret;
 
     ret = cetrafs_sb_get_node_id(sb, &my_node_id);
@@ -2203,6 +2185,7 @@ int cetrafs_lock_open(struct inode *inode, struct file *file)
          * dead node's state. */
         reclaim_from_stale = true;
         stale_owner = cetrafs_le32(raw.lock_owner_node);
+        stale_incarnation = cetrafs_le32(raw.lock_owner_incarnation);
         raw.lock_mode = CETRAFS_LOCK_NONE;
         raw.lock_owner_node = cetrafs_cpu_to_le32(CETRAFS_NODE_ID_NONE);
     }
@@ -2258,6 +2241,7 @@ int cetrafs_lock_open(struct inode *inode, struct file *file)
             .claim = true,
             .allow_steal = reclaim_from_stale,
             .steal_from = stale_owner,
+            .steal_incarnation = stale_incarnation,
             .refuse_readers = !cetrafs_lock_ignore_readers,
         };
 
@@ -2267,11 +2251,6 @@ int cetrafs_lock_open(struct inode *inode, struct file *file)
         if (ret) {
             if (ret == -ETXTBSY)
                 pr_warn("lock: ino=%llu lost the race claiming the write lock\n", (unsigned long long) inode->i_ino);
-            goto out_pr_unlock;
-        }
-        if (reclaim_from_stale && ctx.displaced &&
-            cetrafs_lock_undo_steal(sb, inode->i_ino, cetrafs_le64(raw.generation), stale_owner, my_node_id, "open")) {
-            ret = -ETXTBSY; /* its holder is alive after all */
             goto out_pr_unlock;
         }
         claimed = true;
@@ -2299,16 +2278,15 @@ int cetrafs_lock_open(struct inode *inode, struct file *file)
             .generation = cetrafs_le64(raw.generation),
             .steal_release = true,
             .steal_from = stale_owner,
+            .steal_incarnation = stale_incarnation,
         };
         int cret = cetrafs_lock_cas(inode, &cctx, &raw);
 
         if (cret < 0)
             pr_warn_ratelimited("lock: ino=%llu could not clear stale foreign lock from node %u: %d\n",
                                 (unsigned long long) inode->i_ino, stale_owner, cret);
-        else if (cret == 0 && cctx.displaced &&
-                 cetrafs_lock_undo_steal(sb, inode->i_ino, cetrafs_le64(raw.generation), stale_owner,
-                                                      CETRAFS_NODE_ID_NONE, "open")) {
-            ret = -ETXTBSY; /* an explicit lock of a live node: honoured, as above */
+        else if (cret == 0 && cctx.moved) {
+            ret = -ETXTBSY; /* its node took it again since: an explicit lock of a live node */
             goto out_pr_unlock;
         }
     }
@@ -3984,6 +3962,7 @@ void cetrafs_lock_retry_presence(struct super_block *sb)
 
 struct cetrafs_own_claims_ctx {
     u32 me;
+    u32 my_incarnation; /* claims stamped with it are this mount's: never swept */
     u64 generation;
 };
 
@@ -4005,16 +3984,24 @@ static int cetrafs_own_claims_mutate(void *image, unsigned int len, void *priv)
         return -EUCLEAN; /* restamping it would bless the damage (cetrafs_lock_cas_mutate()) */
     if (cetrafs_le64(rec.generation) != ctx->generation)
         return -ESTALE;
-    if (cetrafs_le32(rec.lock_owner_node) == ctx->me && cetrafs_le32(rec.lock_mode) != CETRAFS_LOCK_NONE) {
+    /* Only an earlier incarnation's claims: one stamped by this mount is
+     * its own open's, whatever the sweep's other tests say (F10). */
+    if (cetrafs_le32(rec.lock_owner_node) == ctx->me && cetrafs_le32(rec.lock_mode) != CETRAFS_LOCK_NONE &&
+        cetrafs_le32(rec.lock_owner_incarnation) != ctx->my_incarnation) {
         rec.lock_owner_node = cetrafs_cpu_to_le32(CETRAFS_NODE_ID_NONE);
+        rec.lock_owner_incarnation = cetrafs_cpu_to_le32(0);
         rec.lock_mode = cetrafs_cpu_to_le32(CETRAFS_LOCK_NONE);
         changed = true;
     }
-    if (cetrafs_le64(rec.read_open_nodes) & bit) {
+    if ((cetrafs_le64(rec.read_open_nodes) & bit) &&
+        cetrafs_le32(rec.read_open_incarnation[ctx->me % CETRAFS_MAX_READER_NODES]) != ctx->my_incarnation) {
         rec.read_open_nodes = cetrafs_cpu_to_le64(cetrafs_le64(rec.read_open_nodes) & ~bit);
+        rec.suspended_writer_nodes = cetrafs_cpu_to_le64(cetrafs_le64(rec.suspended_writer_nodes) & ~bit);
+        rec.read_open_incarnation[ctx->me % CETRAFS_MAX_READER_NODES] = cetrafs_cpu_to_le32(0);
         changed = true;
     }
-    if (cetrafs_le64(rec.suspended_writer_nodes) & bit) {
+    if ((cetrafs_le64(rec.suspended_writer_nodes) & bit) && !(cetrafs_le64(rec.read_open_nodes) & bit)) {
+        /* A mark without the presence it must ride on: no open has it. */
         rec.suspended_writer_nodes = cetrafs_cpu_to_le64(cetrafs_le64(rec.suspended_writer_nodes) & ~bit);
         changed = true;
     }
@@ -4071,7 +4058,7 @@ int cetrafs_lock_sweep_own_claims(struct super_block *sb, u32 my_node_id)
         for (i = 0; i < CETRAFS_BLOCK_SIZE * 8; i++) {
             u64 ino = blk * CETRAFS_BLOCK_SIZE * 8 + i + 1;
             cetrafs_inode_t raw;
-            struct cetrafs_own_claims_ctx ctx = {.me = my_node_id};
+            struct cetrafs_own_claims_ctx ctx = {.me = my_node_id, .my_incarnation = cetrafs_sb_incarnation(sb)};
 
             if (ino > ninodes)
                 break;
@@ -4179,7 +4166,8 @@ int cetrafs_lock_sweep_own_claims(struct super_block *sb, u32 my_node_id)
  * The mount-time sweep above clears every claim of the previous
  * incarnation, but it cannot see one given back AFTER it passed: a peer
  * that displaced this node's lock while it was down, then found the row
- * re-attached and undid its steal (cetrafs_lock_undo_steal()), hands
+ * re-attached and undid its steal (the give-back that format 0x000A's
+ * incarnations retired for locks and presence bits), hands
  * the lock to an incarnation that never opened the file. Nothing local
  * holds it, so nothing local releases it, and the row is live, so no
  * peer reclaims it -- the file is refused to writers until this node
@@ -4198,6 +4186,10 @@ int cetrafs_lock_sweep_own_claims(struct super_block *sb, u32 my_node_id)
 static bool cetrafs_lock_resweep_ignore_local; /* TEST ONLY: the control */
 cetrafs_test_param(lock_resweep_ignore_local, cetrafs_lock_resweep_ignore_local, bool, 0644);
 MODULE_PARM_DESC(lock_resweep_ignore_local, "TEST ONLY: the late own-claim sweep ignores local users");
+static bool cetrafs_lock_resweep_ignore_incarnation; /* TEST ONLY: the control's other half */
+cetrafs_test_param(lock_resweep_ignore_incarnation, cetrafs_lock_resweep_ignore_incarnation, bool, 0644);
+MODULE_PARM_DESC(lock_resweep_ignore_incarnation,
+                 "TEST ONLY: the late own-claim sweep clears this mount's own incarnation's claims too");
 
 static atomic64_t cetrafs_late_claims_cleared = ATOMIC64_INIT(0);
 u64 cetrafs_late_claims_cleared_count(void)
@@ -4207,6 +4199,7 @@ u64 cetrafs_late_claims_cleared_count(void)
 
 struct cetrafs_late_claims_ctx {
     u32 me;
+    u32 my_incarnation; /* claims stamped with it are this mount's: never swept */
     u64 generation;
 };
 
@@ -4227,16 +4220,24 @@ static int cetrafs_late_claims_mutate(void *image, unsigned int len, void *priv)
         return -EUCLEAN;
     if (cetrafs_le64(rec.generation) != ctx->generation || cetrafs_le32(rec.nlink) == 0)
         return -ESTALE;
-    if (cetrafs_le32(rec.lock_owner_node) == ctx->me && cetrafs_le32(rec.lock_mode) != CETRAFS_LOCK_NONE) {
+    /* Only an earlier incarnation's claims: one stamped by this mount is
+     * its own open's, whatever the sweep's other tests say (F10). */
+    if (cetrafs_le32(rec.lock_owner_node) == ctx->me && cetrafs_le32(rec.lock_mode) != CETRAFS_LOCK_NONE &&
+        cetrafs_le32(rec.lock_owner_incarnation) != ctx->my_incarnation) {
         rec.lock_owner_node = cetrafs_cpu_to_le32(CETRAFS_NODE_ID_NONE);
+        rec.lock_owner_incarnation = cetrafs_cpu_to_le32(0);
         rec.lock_mode = cetrafs_cpu_to_le32(CETRAFS_LOCK_NONE);
         changed = true;
     }
-    if (cetrafs_le64(rec.read_open_nodes) & bit) {
+    if ((cetrafs_le64(rec.read_open_nodes) & bit) &&
+        cetrafs_le32(rec.read_open_incarnation[ctx->me % CETRAFS_MAX_READER_NODES]) != ctx->my_incarnation) {
         rec.read_open_nodes = cetrafs_cpu_to_le64(cetrafs_le64(rec.read_open_nodes) & ~bit);
+        rec.suspended_writer_nodes = cetrafs_cpu_to_le64(cetrafs_le64(rec.suspended_writer_nodes) & ~bit);
+        rec.read_open_incarnation[ctx->me % CETRAFS_MAX_READER_NODES] = cetrafs_cpu_to_le32(0);
         changed = true;
     }
-    if (cetrafs_le64(rec.suspended_writer_nodes) & bit) {
+    if ((cetrafs_le64(rec.suspended_writer_nodes) & bit) && !(cetrafs_le64(rec.read_open_nodes) & bit)) {
+        /* A mark without the presence it must ride on: no open has it. */
         rec.suspended_writer_nodes = cetrafs_cpu_to_le64(cetrafs_le64(rec.suspended_writer_nodes) & ~bit);
         changed = true;
     }
@@ -4262,7 +4263,12 @@ static bool cetrafs_lock_locally_idle(struct cetrafs_inode_info *ci)
 /* One record: true when this node's claims on it were cleared. */
 static int cetrafs_lock_resweep_one(struct super_block *sb, u64 ino, u32 me)
 {
-    struct cetrafs_late_claims_ctx ctx = {.me = me};
+    struct cetrafs_late_claims_ctx ctx = {
+        .me = me,
+        /* 0 is never an incarnation: with the test knob on, every claim of
+         * this node reads as an earlier incarnation's. */
+        .my_incarnation = READ_ONCE(cetrafs_lock_resweep_ignore_incarnation) ? 0 : cetrafs_sb_incarnation(sb),
+    };
     struct cetrafs_inode_info *ci;
     struct inode *inode;
     cetrafs_inode_t raw;
@@ -4878,11 +4884,14 @@ static int cetrafs_lock_explicit_acquire(struct inode *inode, struct file *file)
             ctx.generation = cetrafs_le64(raw.generation);
             ctx.allow_steal = true;
             ctx.steal_from = owner;
+            /* The incarnation judged stale: a lock its node took again
+             * after re-attaching is not stealable (F10), and the swap
+             * answers -ETXTBSY -- a live holder, keep waiting. */
+            ctx.steal_incarnation = cetrafs_le32(raw.lock_owner_incarnation);
+            if (cetrafs_le32(raw.lock_owner_node) != owner)
+                ctx.steal_incarnation = 0; /* moved on: the swap finds it free or someone else's */
             cetrafs_node_test_stall_before_swap();
             ret = cetrafs_lock_cas(inode, &ctx, &raw);
-            if (!ret && ctx.displaced &&
-                cetrafs_lock_undo_steal(sb, inode->i_ino, ctx.generation, owner, my_node_id, "flock"))
-                ret = -ETXTBSY; /* a live holder after all: keep waiting */
         }
         if (ret)
             goto out;
@@ -5344,6 +5353,10 @@ static int cetrafs_foreign_reader_from_raw(struct super_block *sb,
                 .my_node_id = n, /* clear THAT node's bit, not ours */
                 .generation = cetrafs_le64(raw.generation),
                 .reader_op = CETRAFS_READER_CLEAR,
+                /* Only the incarnation judged: a bit that node stamped
+                 * again after re-attaching is a live reader (F10). */
+                .check_incarnation = true,
+                .steal_incarnation = cetrafs_le32(raw.read_open_incarnation[n % CETRAFS_MAX_READER_NODES]),
             };
             if (cetrafs_node_fence_peer(sb, n, "a read-open reference")) {
                 /* Not revoked: it may still be reading. Count it. */
@@ -5355,33 +5368,9 @@ static int cetrafs_foreign_reader_from_raw(struct super_block *sb,
             if (ret < 0)
                 pr_warn_ratelimited("ino=%llu could not clear stale node %u's reader bit\n", (unsigned long long) ino,
                                     n);
-            else if (ret == 0 && rctx.displaced && cetrafs_node_reattached_since_fence(sb, n)) {
-                /* It came back, and the bit just cleared may be its new
-                 * open's (cetrafs_lock_undo_steal() for the reasoning).
-                 * Put it back, and count a live reader either way.
-                 *
-                 * Only a bit this clear actually took (rctx.displaced).
-                 * A clear that found it already clear -- the node's
-                 * re-attach sweep got there first -- took nothing, and
-                 * "giving back" a bit nobody's open owns would refuse
-                 * every write-open of the file, cluster-wide, until that
-                 * node next opened and closed it for read.
-                 *
-                 * Put back even under a writer that claimed the file in
-                 * the gap. The node IS reading it -- that is what came
-                 * back -- and the bit is how that writer's truncate or
-                 * unlink finds out. Refusing would drop a live reader's
-                 * presence to keep the record tidy; restoring it is the
-                 * true state. */
-                rctx.reader_op = CETRAFS_READER_SET;
-                ret = cetrafs_cas_record_nointr(sb, cetrafs_inode_lba(sb, ino), cetrafs_lock_cas_mutate, &rctx);
-                if (ret < 0 && ret != -ENOENT) /* -ENOENT: the file is gone, nothing to protect */
-                    cetrafs_sb_fatal(sb, "ino=%llu: node %u came back while its reader bit was being cleared, and the "
-                                     "bit could not be put back (%d)",
-                                     (unsigned long long) ino, n, ret);
-                else
-                    pr_warn("ino=%llu: node %u came back while its reader bit was being cleared -- put it back\n",
-                            (unsigned long long) ino, n);
+            else if (ret == 0 && rctx.moved) {
+                /* It came back and opened the file again: its bit carries
+                 * the new incarnation, and the swap left it alone. */
                 *out_exists = true;
                 return 0;
             }
@@ -5523,9 +5512,21 @@ static int cetrafs_foreign_claim_from_raw(struct super_block *sb,
             if (out_repaired)
                 *out_repaired = true;
             /* The caller frees on "no live claim": not if the holder
-             * re-attached during the replay (cetrafs_lock_undo_steal()). */
-            if (cetrafs_node_reattached_since_fence(sb, cetrafs_le32(raw.lock_owner_node)))
-                stale = false;
+             * took this lock again after re-attaching. That lock carries
+             * a new incarnation (F10), so read the record again and
+             * require the claim still be the one judged. */
+            {
+                cetrafs_inode_t now;
+
+                cetrafs_invalidate_raw_inode(sb, cetrafs_le64(raw.ino));
+                ret = cetrafs_read_raw_inode(sb, cetrafs_le64(raw.ino), &now);
+                if (ret)
+                    return ret;
+                if (cetrafs_le32(now.lock_mode) == CETRAFS_LOCK_EXCLUSIVE &&
+                    (cetrafs_le32(now.lock_owner_node) != cetrafs_le32(raw.lock_owner_node) ||
+                     cetrafs_le32(now.lock_owner_incarnation) != cetrafs_le32(raw.lock_owner_incarnation)))
+                    stale = false; /* taken since, by a live incarnation */
+            }
         }
 
         *out_exists = !stale;
@@ -5572,6 +5573,7 @@ int cetrafs_lock_clear_dead_claims(struct super_block *sb, u64 ino, u32 my_node_
             .generation = cetrafs_le64(raw.generation),
             .steal_release = true,
             .steal_from = owner,
+            .steal_incarnation = cetrafs_le32(raw.lock_owner_incarnation),
         };
 
         if (owner == my_node_id)
@@ -5580,9 +5582,8 @@ int cetrafs_lock_clear_dead_claims(struct super_block *sb, u64 ino, u32 my_node_
         ret = cetrafs_cas_record(sb, cetrafs_inode_lba(sb, ino), cetrafs_lock_cas_mutate, &ctx);
         if (ret < 0)
             return ret;
-        if (ret == 0 && ctx.displaced &&
-            cetrafs_lock_undo_steal(sb, ino, ctx.generation, owner, CETRAFS_NODE_ID_NONE, "scrub"))
-            return -EBUSY;
+        if (ret == 0 && ctx.moved)
+            return -EBUSY; /* its node took it again since: live (F10) */
         pr_info("scrub: ino=%llu cleared dead node %u's lock on a deleted file\n", (unsigned long long) ino, owner);
     }
 

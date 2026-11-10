@@ -1,17 +1,18 @@
 #!/usr/bin/env bash
 # SPDX-License-Identifier: GPL-2.0-or-later
-# a claim given back after the re-attach sweep is swept again; a held one is not
+# a claim of an earlier incarnation that lands after the re-attach sweep is swept again; a held one is not
 #
 # A node back from a crash sweeps the claims its previous incarnation
-# left (reattach_sweeps_claims). A peer that displaced one of them while
-# the node was down, and then found the row re-attached, undoes its
-# steal (cetrafs_lock_undo_steal()) -- and if the sweep has already
-# passed that record, the lock lands on an incarnation that never opened
-# the file. Nothing local releases it and the row is live, so nothing
-# remote reclaims it: the file is refused to writers (TODO.md F10). A
-# second pass, own_claim_resweep_secs after the mount, clears claims of
-# this node that nothing here holds -- judged per inode under its
-# lock_mutex -- and must never clear one a local open does hold.
+# left (reattach_sweeps_claims). One that lands on the device after the
+# sweep has passed its record -- the last writes of the dead incarnation,
+# queued on a path that came back late -- names an incarnation that never
+# opened the file here: nothing local releases it and the row is live, so
+# nothing remote reclaims it. (A peer's give-back after a reclaim used to
+# leave the same thing; since format 0x000A claims carry incarnations and
+# a reclaim gives nothing back -- F10, reclaim_incarnation.) A second
+# pass, own_claim_resweep_secs after the mount, clears claims of this
+# node stamped by an earlier incarnation that nothing here holds -- judged
+# per inode under its lock_mutex -- and never one a local open holds.
 #
 # Staged: a crashed-looking row is re-attached with the late pass a few
 # seconds out. Before it runs, one file is opened for write here (its
@@ -21,8 +22,10 @@
 #
 # DISCRIMINATION: the planted lock is checked still held just before the
 # pass is due and gone after it, so it is the pass that clears it; with
-# lock_resweep_ignore_local=1 (the predicate ignoring local users) the
-# held file's lock is cleared too, which the held-lock check catches.
+# both guards of a held lock off -- lock_resweep_ignore_local=1 (local
+# users) and lock_resweep_ignore_incarnation=1 (this mount's own
+# incarnation) -- the held file's lock is cleared too, which the
+# held-lock check catches.
 # Each round re-attaches after an unclean departure, which waits out the
 # stale window (120 s) before registering: two rounds, hence the limit.
 # ct-timeout: 480
@@ -30,7 +33,7 @@ set -euo pipefail
 . "$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)/lib/harness.sh"
 require_root
 require_module
-for p in own_claim_resweep_secs lock_resweep_ignore_local; do
+for p in own_claim_resweep_secs lock_resweep_ignore_local lock_resweep_ignore_incarnation; do
     [ -w "/sys/module/cetrafs/parameters/$p" ] || { skip "$p is missing"; ct_exit; }
 done
 LOCK_POKE="$(ct_helper inode_lock_poke)"
@@ -57,6 +60,7 @@ run() {
 
     ct_param_set own_claim_resweep_secs "$1"
     ct_param_set lock_resweep_ignore_local "$2"
+    ct_param_set lock_resweep_ignore_incarnation "$2"
     MARK="$(dmesg_mark)"
     ct_mount "$DEV" "$MNT"
     PROC="$(ct_procdir "$DEV")"
@@ -87,6 +91,7 @@ run() {
     echo more >&7 && WROTE=1 || WROTE=0
     exec 7>&-
     ct_param_set lock_resweep_ignore_local 0
+    ct_param_set lock_resweep_ignore_incarnation 0
     ct_param_set own_claim_resweep_secs 600
     ct_umount "$MNT"
     # No fsck: the planted claims were cleared by the pass, or are
@@ -105,8 +110,8 @@ grep -q "owner=$NID mode=1" <<<"$HELD" && pass "the lock a local writer holds wa
 [ "$NCLR" -eq 2 ] && pass "exactly two records were cleared" || fail "late_claims_cleared moved by $NCLR, expected 2"
 [ "$WROTE" = 1 ] && pass "the held file still takes writes" || fail "the held file's writer failed after the pass"
 
-# Control: ignoring local users, the held lock goes.
+# Control: ignoring local users and this mount's incarnation, the held lock goes.
 run 8 1
-grep -q 'mode=0' <<<"$HELD" && pass "control: a predicate ignoring local users clears the held lock -- the check above discriminates" ||
-    fail "control: even ignoring local users the held lock survived ($HELD) -- the check does not discriminate"
+grep -q 'mode=0' <<<"$HELD" && pass "control: with both guards off the held lock is cleared -- the check above discriminates" ||
+    fail "control: even with both guards off the held lock survived ($HELD) -- the check does not discriminate"
 ct_exit

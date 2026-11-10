@@ -220,6 +220,8 @@ void cetrafs_sb_peer_watch_forget(struct super_block *sb, u32 node_id);
 bool cetrafs_sb_peer_watched_seq(struct super_block *sb, u32 node_id, u64 *out);
 void cetrafs_sb_peer_note_fenced(struct super_block *sb, u32 node_id, u64 seq);
 bool cetrafs_sb_peer_fenced_seq(struct super_block *sb, u32 node_id, u64 *out);
+void cetrafs_sb_set_incarnation(struct super_block *sb, u32 inc);
+u32 cetrafs_sb_incarnation(struct super_block *sb);
 void cetrafs_node_report_clock_skew(struct super_block *sb);
 void cetrafs_node_seed_peer_watch(struct super_block *sb);
 bool cetrafs_cluster_all_advertise(struct super_block *sb, u32 cap);

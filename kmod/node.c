@@ -28,6 +28,7 @@
 
 #include <linux/buffer_head.h>
 #include <linux/crc32c.h>
+#include <linux/random.h>
 #include <linux/delay.h>
 #include <linux/fs.h>
 #include <linux/kernel.h>
@@ -179,7 +180,23 @@ struct cetrafs_node_claim_ctx {
      * by fill_super: adopted from the lead, or our own if we ARE the lead). */
     u32 file_lock_mode;
     u32 caps; /* CETRAFS_NODE_CAP_* this mount advertises */
+    u32 incarnation; /* this mount's (cetrafs_node_new_incarnation()) */
 };
+
+/*
+ * A new incarnation for a row (cetrafs_node_entry_t.incarnation): random,
+ * nonzero, and never the value the row held before -- a claim stamped by
+ * the previous mount must never read as this one's.
+ */
+static u32 cetrafs_node_new_incarnation(u32 prev)
+{
+    u32 v;
+
+    do {
+        v = get_random_u32();
+    } while (!v || v == prev);
+    return v;
+}
 
 /*
  * Every mutator below except the claim (which takes only a FREE row and
@@ -218,6 +235,7 @@ static int cetrafs_node_claim_mutate(void *image, unsigned int len, void *priv)
     ne.hb_seq = cetrafs_cpu_to_le64(1);
     ne.last_seen = cetrafs_cpu_to_le64(ktime_get_real_seconds());
     ne.departure = cetrafs_cpu_to_le32(CETRAFS_NODE_DEPART_NONE);
+    ne.incarnation = cetrafs_cpu_to_le32(ctx->incarnation);
     /* Advertise our tick rate so peers can floor their staleness window
      * at several of OUR beats, rather than at whatever they happen to be
      * configured with. */
@@ -262,6 +280,7 @@ struct cetrafs_node_reattach_ctx {
     bool twin;         /* out: the row beat since -- another machine took it */
     u64 fence_epoch;   /* out: the epoch in the image the swap committed */
     u64 hb_seq;        /* out: for the caller's log line */
+    u32 incarnation;   /* out: the one this re-attach drew */
 };
 
 static int cetrafs_node_reattach_mutate(void *image, unsigned int len, void *priv)
@@ -294,6 +313,11 @@ static int cetrafs_node_reattach_mutate(void *image, unsigned int len, void *pri
     ne.hb_seq = cetrafs_cpu_to_le64(cetrafs_le64(ne.hb_seq) + 1);
     ne.last_seen = cetrafs_cpu_to_le64(ktime_get_real_seconds());
     ne.departure = cetrafs_cpu_to_le32(CETRAFS_NODE_DEPART_NONE); /* mounted again */
+    /* A new mount is a new incarnation: claims the previous one left
+     * carry the old value, and a reclaim may take them while this one's
+     * own claims stay out of its reach (F10). */
+    ctx->incarnation = cetrafs_node_new_incarnation(cetrafs_le32(ne.incarnation));
+    ne.incarnation = cetrafs_cpu_to_le32(ctx->incarnation);
     ne.hb_interval_secs = cetrafs_cpu_to_le32(ctx->hb_interval);
     ne.stale_secs = cetrafs_cpu_to_le32(ctx->stale_secs);
     /* Re-stamp the cluster file-lock mode: a returning node conforms to
@@ -881,6 +905,7 @@ int cetrafs_node_register(struct super_block *sb,
              * retry re-reads and preserves it). A bump landing after the
              * swap is the ordinary case the next heartbeat check catches. */
             cetrafs_sb_set_fence_epoch(sb, ctx.fence_epoch);
+            cetrafs_sb_set_incarnation(sb, ctx.incarnation);
             *out_node_id = idx;
             return 0;
         }
@@ -912,6 +937,7 @@ int cetrafs_node_register(struct super_block *sb,
             .stale_secs = cetrafs_sb_stale_secs(sb),
             .file_lock_mode = file_lock_mode,
             .caps = cetrafs_node_my_caps(sb),
+            .incarnation = cetrafs_node_new_incarnation(0),
         };
 
         ret = cetrafs_cas_record(sb, cetrafs_node_row_lba(sb, idx), cetrafs_node_claim_mutate, &ctx);
@@ -935,6 +961,7 @@ int cetrafs_node_register(struct super_block *sb,
             pr_info("node registration: claimed row %u (%s)\n", idx,
                     cetrafs_sb_caw_available(sb) ? "atomic CAS" : "no-CAW fallback");
             cetrafs_sb_set_fence_epoch(sb, 0); /* the mutator zeroes the row */
+            cetrafs_sb_set_incarnation(sb, ctx.incarnation);
             *out_node_id = idx;
             return 0;
         }

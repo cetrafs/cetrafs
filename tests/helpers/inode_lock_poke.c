@@ -62,10 +62,16 @@ int main(int argc, char **argv)
 {
     /* --rec may arrive in either position: the ctest slave prepends
      * its fixed prefix before the caller's argument. */
-    bool has_rec = false;
-    for (int ai = 2; ai < argc; ai++)
+    bool has_rec = false, has_incs = false;
+    for (int ai = 2; ai < argc; ai++) {
         if (strcmp(argv[ai], "--rec") == 0)
             has_rec = true;
+        if (strcmp(argv[ai], "--incs") == 0)
+            has_incs = true;
+    }
+    /* Incarnation a write stamps on the claim it plants (lock owner, or a
+     * presence bit), format 0x000A: INODE_LOCK_POKE_INC=<n>, default 0. */
+    uint32_t plant_inc = getenv("INODE_LOCK_POKE_INC") ? (uint32_t) strtoul(getenv("INODE_LOCK_POKE_INC"), NULL, 0) : 0;
 
     /* --sw <ino>: print suspended_writer_nodes alone (access_rule.sh). */
     if (argc == 4 && strcmp(argv[2], "--sw") == 0) {
@@ -86,7 +92,7 @@ int main(int argc, char **argv)
         return 0;
     }
 
-    if (argc != 3 && argc != 5 && !(argc == 4 && has_rec)) {
+    if (argc != 3 && argc != 5 && !(argc == 4 && (has_rec || has_incs))) {
         fprintf(stderr,
                 "usage: %s <image> <ino> [<owner_node_id> <lock_mode> | --ns <id> | --reader <node_id> | --unreader <node_id> | --suspended <node_id> | --mark-only <node_id>]\n",
                 argv[0]);
@@ -105,7 +111,8 @@ int main(int argc, char **argv)
      * Separate from the plain dump because the kernel suites compare
      * that line byte for byte. */
     bool rec_dump = (argc == 4 && has_rec);
-    bool dump_only = (argc == 3) || rec_dump;
+    bool incs_dump = (argc == 4 && has_incs);
+    bool dump_only = (argc == 3) || rec_dump || incs_dump;
 
     int fd = open(path, dump_only ? O_RDONLY : O_RDWR);
     if (fd < 0) {
@@ -129,6 +136,19 @@ int main(int argc, char **argv)
 
     cetrafs_inode_t in;
     pread_all(fd, &in, sizeof(in), ino_off);
+
+    if (incs_dump) {
+        /* The incarnation behind each claim: "lock_inc=<n> reader_inc=<bit>:<n>,..." */
+        uint64_t m = cetrafs_le64(in.read_open_nodes);
+
+        printf("lock_inc=%u reader_inc=", cetrafs_le32(in.lock_owner_incarnation));
+        for (unsigned b = 0; b < 64; b++)
+            if (m & (1ULL << b))
+                printf("%u:%u,", b, cetrafs_le32(in.read_open_incarnation[b]));
+        printf("\n");
+        close(fd);
+        return 0;
+    }
 
     if (rec_dump) {
         printf("size=%" PRIu64 " nlink=%u dirent_seq=%" PRIu64 " generation=%" PRIu64 " mtime=%" PRIu64 "\n",
@@ -164,6 +184,7 @@ int main(int argc, char **argv)
 
         in.read_open_nodes = cetrafs_cpu_to_le64(cetrafs_le64(in.read_open_nodes) & ~bit);
         in.suspended_writer_nodes = cetrafs_cpu_to_le64(cetrafs_le64(in.suspended_writer_nodes) & ~bit);
+        in.read_open_incarnation[strtoul(argv[4], NULL, 0) % 64] = cetrafs_cpu_to_le32(0);
         reader_mode = true; /* same report below */
     } else if (mark_only) {
         /* A writer mark with NO presence bit under it: the state fsck
@@ -178,10 +199,12 @@ int main(int argc, char **argv)
 
         in.read_open_nodes = cetrafs_cpu_to_le64(cetrafs_le64(in.read_open_nodes) | bit);
         in.suspended_writer_nodes = cetrafs_cpu_to_le64(cetrafs_le64(in.suspended_writer_nodes) | bit);
+        in.read_open_incarnation[strtoul(argv[4], NULL, 0) % 64] = cetrafs_cpu_to_le32(plant_inc);
     } else if (reader_mode) {
         /* Simulate a PEER holding this file open for read: set its bit
          * in the presence mask. */
         in.read_open_nodes = cetrafs_cpu_to_le64(cetrafs_le64(in.read_open_nodes) | (1ULL << (strtoul(argv[4], NULL, 0) % 64)));
+        in.read_open_incarnation[strtoul(argv[4], NULL, 0) % 64] = cetrafs_cpu_to_le32(plant_inc);
     } else if (ns_mode) {
         in.ns_lock_owner = cetrafs_cpu_to_le32((uint32_t) strtoul(argv[4], NULL, 0));
     } else {
@@ -189,6 +212,7 @@ int main(int argc, char **argv)
         lock_mode = (uint32_t) strtoul(argv[4], NULL, 0);
         in.lock_owner_node = cetrafs_cpu_to_le32(owner);
         in.lock_mode = cetrafs_cpu_to_le32(lock_mode);
+        in.lock_owner_incarnation = cetrafs_cpu_to_le32(lock_mode ? plant_inc : 0);
     }
     cetrafs_inode_stamp_crcs_us(&in); /* v0x0005 */
 
