@@ -1059,6 +1059,31 @@ static int cetrafs_journal_take_slot(struct super_block *sb, struct cetrafs_jour
     return 0;
 }
 
+/*
+ * Fill an entry header -- the ONE place one is written, for the
+ * single-block path and the deferred batch alike. The batch once filled
+ * its own and missed a field added here (the park stamp): its entries
+ * read as from another park and replay discarded them, a torn leaf left
+ * unrepaired (CLAUDE.md rule 12). A field every entry needs goes here.
+ */
+static void cetrafs_journal_stamp_header(struct cetrafs_journal *j, struct buffer_head *hbh, u32 flags, u64 txn_id,
+                                         u64 target_lba, u32 prev_crc, u32 payload_crc)
+{
+    cetrafs_journal_header_t *hdr = (cetrafs_journal_header_t *) hbh->b_data;
+
+    memset(hbh->b_data, 0, CETRAFS_BLOCK_SIZE);
+    hdr->magic = cetrafs_cpu_to_le32(CETRAFS_JOURNAL_MAGIC);
+    hdr->flags = cetrafs_cpu_to_le32(flags);
+    hdr->txn_id = cetrafs_cpu_to_le64(txn_id);
+    hdr->target_lba = cetrafs_cpu_to_le64(target_lba);
+    hdr->prev_checksum = cetrafs_cpu_to_le32(prev_crc);
+    /* The session this entry belongs to: replay discards it once the
+     * area has been parked since (cetrafs_node_journal_hdr_t). */
+    hdr->park_seq = cetrafs_cpu_to_le64(READ_ONCE(j->park_seq));
+    hdr->payload_checksum = cetrafs_cpu_to_le32(payload_crc);
+    hdr->header_checksum = cetrafs_cpu_to_le32(cetrafs_journal_header_crc(hbh->b_data));
+}
+
 static int cetrafs_journal_write_block_flags(struct super_block *sb, struct buffer_head *bh, u32 flags, u32 prev_crc)
 {
     struct cetrafs_journal *j = cetrafs_sb_get_journal(sb);
@@ -1073,7 +1098,6 @@ static int cetrafs_journal_write_block_flags(struct super_block *sb, struct buff
 
     u64 slot, txn_id, header_lba, payload_lba;
     struct buffer_head *pbh, *hbh;
-    cetrafs_journal_header_t *hdr;
     bool journaled = false;
     bool entry_refused = false; /* the device refused the entry write itself */
     /* A held-back tree block (leafdefer.c) is written at its boundary,
@@ -1134,24 +1158,13 @@ static int cetrafs_journal_write_block_flags(struct super_block *sb, struct buff
             brelse(pbh);
             goto journal_failed;
         }
-        memset(hbh->b_data, 0, CETRAFS_BLOCK_SIZE);
-        hdr = (cetrafs_journal_header_t *) hbh->b_data;
-        hdr->magic = cetrafs_cpu_to_le32(CETRAFS_JOURNAL_MAGIC);
-        hdr->flags = cetrafs_cpu_to_le32(flags);
-        hdr->txn_id = cetrafs_cpu_to_le64(txn_id);
-        hdr->target_lba = cetrafs_cpu_to_le64(bh->b_blocknr);
-        /* What the target held BEFORE this modification. Replay compares
+        /* What the target held BEFORE this modification: replay compares
          * it against the device to prove nobody else has written the
-         * block since -- without it, redo silently reverts a peer's
-         * newer write (see cetrafs_journal_header_t). */
-        hdr->prev_checksum = cetrafs_cpu_to_le32(prev_crc);
-        /* The session this entry belongs to: replay skips it once the
-         * area has been parked since (cetrafs_node_journal_hdr_t). */
-        hdr->park_seq = cetrafs_cpu_to_le64(READ_ONCE(j->park_seq));
-        /* Over the caller's buffer, which is the image just copied into
+         * block since (see cetrafs_journal_header_t). The payload CRC is
+         * over the caller's buffer, which is the image just copied into
          * the payload block and cannot change meanwhile: it is locked. */
-        hdr->payload_checksum = cetrafs_cpu_to_le32(~crc32c(~0U, bh->b_data, CETRAFS_BLOCK_SIZE));
-        hdr->header_checksum = cetrafs_cpu_to_le32(cetrafs_journal_header_crc(hbh->b_data));
+        cetrafs_journal_stamp_header(j, hbh, flags, txn_id, bh->b_blocknr, prev_crc,
+                                     ~crc32c(~0U, bh->b_data, CETRAFS_BLOCK_SIZE));
         cetrafs_bh_end_update(hbh);
 
         {
@@ -1423,7 +1436,6 @@ static int cetrafs_journal_batch_chunk(struct super_block *sb, struct cetrafs_jo
      * lock; nothing modifies it meanwhile (the caller's invalidate_lock). */
     for (i = 0; i < k; i++) {
         u64 hlba = cetrafs_journal_header_lba(j, slots[i]);
-        cetrafs_journal_header_t *hdr;
         u32 pcrc;
 
         pb[i] = cetrafs_getblk_overwrite(sb, hlba + 1);
@@ -1438,18 +1450,10 @@ static int cetrafs_journal_batch_chunk(struct super_block *sb, struct cetrafs_jo
         pcrc = ~crc32c(~0U, pb[i]->b_data, CETRAFS_BLOCK_SIZE);
         cetrafs_bh_end_update(pb[i]);
 
-        memset(hb[i]->b_data, 0, CETRAFS_BLOCK_SIZE);
-        hdr = (cetrafs_journal_header_t *) hb[i]->b_data;
-        hdr->magic = cetrafs_cpu_to_le32(CETRAFS_JOURNAL_MAGIC);
-        hdr->flags = cetrafs_cpu_to_le32(CETRAFS_JRNL_F_GUARDED);
-        hdr->txn_id = cetrafs_cpu_to_le64(txn[i]);
-        hdr->target_lba = cetrafs_cpu_to_le64(bhs[i]->b_blocknr);
-        /* The DEVICE's image, recorded when the block was first held back
-         * -- not the in-core one before the last edit, which never
+        /* prev: the DEVICE's image, recorded when the block was first held
+         * back -- not the in-core one before the last edit, which never
          * reached the device and which a replay would never find. */
-        hdr->prev_checksum = cetrafs_cpu_to_le32(disk_crc[i]);
-        hdr->payload_checksum = cetrafs_cpu_to_le32(pcrc);
-        hdr->header_checksum = cetrafs_cpu_to_le32(cetrafs_journal_header_crc(hb[i]->b_data));
+        cetrafs_journal_stamp_header(j, hb[i], CETRAFS_JRNL_F_GUARDED, txn[i], bhs[i]->b_blocknr, disk_crc[i], pcrc);
         cetrafs_bh_end_update(hb[i]);
     }
     if (ok) {

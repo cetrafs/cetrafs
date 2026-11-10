@@ -24,6 +24,9 @@
 #       old: the tail checksum fails, as a power cut mid-write leaves it). The remount
 #       replays our own area, redoes the torn leaf (journal_replay_torn),
 #       and every block written before the fsync reads back -- no EIO.
+#       The area has been parked before (an unmount after a journaled
+#       mkdir), so the batch's entries must carry the session's park
+#       stamp: entries from another park are discarded (format 0x000A).
 #   (3) freed while held back: a truncate frees a leaf with edits still in
 #       core, sync and writeback run, and the freed block on the device
 #       has not moved.
@@ -37,7 +40,9 @@
 # DISCRIMINATION: with the old dirty-buffer deferral, (1) fails (the leaf
 # moves under writeback); with the batch writing in place without the
 # journal, (2) fails (the torn leaf is not repaired and reads EIO); with
-# the free not dropping the held-back block, (3) fails (sync writes it).
+# the free not dropping the held-back block, (3) fails (sync writes it);
+# with the batch's headers missing the park stamp, (2) fails (the entry
+# reads as from another park and the torn leaf is not redone).
 set -euo pipefail
 . "$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)/lib/harness.sh"
 require_root
@@ -45,6 +50,7 @@ require_module
 [ -w /sys/module/cetrafs/parameters/journal_batch_crash_before_targets ] ||
     { skip "journal_batch_crash_before_targets is missing"; ct_exit; }
 LP="$(ct_helper leaf_poke)"
+JPOKE="$(ct_helper journal_poke)"
 
 IMG="$(ct_image 560 lbj)"
 DEV="$(ct_loop "$IMG")"
@@ -67,6 +73,14 @@ JW0="$(ctr journal_writes)"
 mkdir "$MNT/jprobe" && sync
 [ "$(ctr journal_writes)" -gt "$JW0" ] ||
     { fail "setup: no journal write for a directory entry -- the volume has no journal"; ct_exit; }
+# Park the area once (the unmount after a journaled session), so this
+# session's entries carry a park stamp other than mkfs's 0.
+NID="$(sed -n 's/^this_node_id: //p' "$PROC/info")"
+ct_umount "$MNT"
+ct_mount "$DEV" "$MNT"
+PROC="$(ct_procdir "$DEV")"
+PARK="$("$JPOKE" "$IMG" "$NID" --dump | sed -n 's/.* park=\([0-9]*\)$/\1/p')"
+[ -n "$PARK" ] && [ "$PARK" -ge 1 ] || { fail "setup: the area was not parked by the unmount (park '$PARK')"; ct_exit; }
 
 # Force the block device's writeback: what it can write, it writes now.
 EXP0="$(cat /proc/sys/vm/dirty_expire_centisecs)"
