@@ -493,8 +493,19 @@ typedef struct {
      * live replayer (F10). */
     __le32 replay_incarnation;
     __le64 replay_claimed; /* unix seconds, for forensics */
+    /* Bumped by every park -- each transition to CLEAN, the owner's at
+     * unmount and a replayer's at release -- and by a fence that finds
+     * the area already CLEAN (format 0x000A). The owner's flip to DIRTY
+     * is a compare-and-write requiring the park_seq it learned, so one
+     * queued past its fence cannot land on a parked area, and every
+     * entry carries the park_seq of its session: replay skips one from
+     * before the last park. A fenced node's entry write can still land
+     * after a peer parked its area, with a guard that still matches
+     * because the fence refused its target write; without the stamp the
+     * next replay redid an operation that had returned -EIO (M10). */
+    __le64 park_seq;
 
-    u8  pad[CETRAFS_BLOCK_SIZE - 24];
+    u8  pad[CETRAFS_BLOCK_SIZE - 32];
 } CETRA_PACKED cetrafs_node_journal_hdr_t;
 
 /* Cross-node mutual exclusion is atomic COMPARE AND WRITE, full stop
@@ -668,7 +679,11 @@ typedef struct {
     __le32 prev_checksum;         /* CRC32C of target_lba as it read BEFORE the modification --
                                    * replay's proof that nothing else has written the block
                                    * since. Meaningful only with CETRAFS_JRNL_F_GUARDED. */
-    u8  pad[CETRAFS_BLOCK_SIZE - 36];
+    __le32 pad0;                  /* alignment, 0 */
+    __le64 park_seq;              /* the area's park_seq when this entry's session began
+                                   * (cetrafs_node_journal_hdr_t.park_seq); replay skips an
+                                   * entry from before the last park (format 0x000A) */
+    u8  pad[CETRAFS_BLOCK_SIZE - 48];
 } CETRA_PACKED cetrafs_journal_header_t;
 
 /* Both new fields live in what used to be `reserved32` and the head of

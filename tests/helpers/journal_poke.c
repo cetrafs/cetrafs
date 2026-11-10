@@ -38,6 +38,13 @@
  * area cannot be produced by any single-node sequence of mounts):
  *   journal_poke <image> <node_id> --dump            -- print state/replay_owner
  *   journal_poke <image> <node_id> --claim <owner|release> -- force the flag: DIRTY+owner, or CLEAN+none
+ *
+ * Park stamps (format 0x000A, cetrafs_node_journal_hdr_t.park_seq): every
+ * form that rewrites the flag keeps the park_seq it finds, and stamps a
+ * written entry with it -- the shape of a live session's entry.
+ * JOURNAL_POKE_PARK=<n> sets the flag's park_seq instead, and
+ * JOURNAL_POKE_ENTRY_PARK=<n> stamps the entry with <n> (an entry from
+ * another park).
  */
 #include <fcntl.h>
 #include <inttypes.h>
@@ -66,6 +73,17 @@ static void pwrite_all(int fd, const void *buf, size_t len, off_t off)
         perror("pwrite");
         exit(1);
     }
+}
+
+/* The park_seq a rewritten flag carries: JOURNAL_POKE_PARK, else the one there. */
+static uint64_t flag_park(int fd, uint64_t area_start)
+{
+    cetrafs_node_journal_hdr_t old;
+
+    if (getenv("JOURNAL_POKE_PARK"))
+        return strtoull(getenv("JOURNAL_POKE_PARK"), NULL, 0);
+    pread_all(fd, &old, sizeof(old), (off_t) area_start * CETRAFS_BLOCK_SIZE);
+    return cetrafs_le32(old.magic) == CETRAFS_NODE_JOURNAL_MAGIC ? cetrafs_le64(old.park_seq) : 0;
 }
 
 int main(int argc, char **argv)
@@ -122,16 +140,20 @@ int main(int argc, char **argv)
         cetrafs_node_journal_hdr_t flag;
         pread_all(fd, &flag, sizeof(flag), (off_t) area_start * CETRAFS_BLOCK_SIZE);
         close(fd);
-        printf("state=%u replay_owner=%u claimed=%" PRIu64 " incarnation=%u\n", cetrafs_le32(flag.state),
-               cetrafs_le32(flag.replay_owner), (uint64_t) cetrafs_le64(flag.replay_claimed),
-               cetrafs_le32(flag.replay_incarnation));
+        printf("state=%u replay_owner=%u claimed=%" PRIu64 " incarnation=%u park=%" PRIu64 "\n",
+               cetrafs_le32(flag.state), cetrafs_le32(flag.replay_owner), (uint64_t) cetrafs_le64(flag.replay_claimed),
+               cetrafs_le32(flag.replay_incarnation),
+               cetrafs_le32(flag.magic) == CETRAFS_NODE_JOURNAL_MAGIC ? (uint64_t) cetrafs_le64(flag.park_seq) : 0);
         return 0;
     }
 
     if (claim) {
         cetrafs_node_journal_hdr_t flag;
+        uint64_t park = flag_park(fd, area_start);
+
         memset(&flag, 0, sizeof(flag));
         flag.magic = cetrafs_cpu_to_le32(CETRAFS_NODE_JOURNAL_MAGIC);
+        flag.park_seq = cetrafs_cpu_to_le64(park);
         if (!strcmp(argv[4], "release")) {
             flag.state = cetrafs_cpu_to_le32(CETRAFS_NODE_JOURNAL_CLEAN);
             flag.replay_owner = cetrafs_cpu_to_le32(CETRAFS_NODE_ID_NONE);
@@ -172,12 +194,16 @@ int main(int argc, char **argv)
 
     pwrite_all(fd, payload, sizeof(payload), (off_t) payload_lba * CETRAFS_BLOCK_SIZE);
 
+    uint64_t park = flag_park(fd, area_start);
     cetrafs_journal_header_t hdr;
     memset(&hdr, 0, sizeof(hdr));
     hdr.magic = cetrafs_cpu_to_le32(CETRAFS_JOURNAL_MAGIC);
     hdr.txn_id = cetrafs_cpu_to_le64(1);
     hdr.target_lba = cetrafs_cpu_to_le64(target_lba);
     hdr.payload_checksum = cetrafs_cpu_to_le32(crc32c_update(0, payload, sizeof(payload)));
+    hdr.park_seq = cetrafs_cpu_to_le64(getenv("JOURNAL_POKE_ENTRY_PARK")
+                                           ? strtoull(getenv("JOURNAL_POKE_ENTRY_PARK"), NULL, 0)
+                                           : park);
     if (guard && !strcmp(guard, "--fresh")) {
         hdr.flags = cetrafs_cpu_to_le32(CETRAFS_JRNL_F_FRESH);
     } else if (guard && !strcmp(guard, "--unguarded")) {
@@ -205,6 +231,7 @@ int main(int argc, char **argv)
     memset(&flag, 0, sizeof(flag));
     flag.magic = cetrafs_cpu_to_le32(CETRAFS_NODE_JOURNAL_MAGIC);
     flag.state = cetrafs_cpu_to_le32(CETRAFS_NODE_JOURNAL_DIRTY);
+    flag.park_seq = cetrafs_cpu_to_le64(park);
     pwrite_all(fd, &flag, sizeof(flag), (off_t) area_start * CETRAFS_BLOCK_SIZE);
 
     close(fd);

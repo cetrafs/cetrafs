@@ -235,7 +235,11 @@ Each Node Registry row owns a private journal slice at
 `cetrafs_node_journal_hdr_t` flag block (its `state` is CLEAN/DIRTY, and
 `replay_owner` is CAS-claimed so exactly one node replays a dead peer's area,
 and `replay_incarnation` names the claimant's incarnation: a stale replayer's
-claim is taken only while it is the incarnation judged)
+claim is taken only while it is the incarnation judged; `park_seq` counts the
+parks -- every transition to CLEAN, and a fence finding the area CLEAN -- and
+every entry carries the park_seq of its session, so replay discards an entry
+from before the last park and the owner's DIRTY flip, a compare-and-write on
+its session's park_seq, cannot land on an area a peer has parked)
 followed by 2-block slots. Because a node only ever logs to its own slice, each
 area is single-writer by construction.
 

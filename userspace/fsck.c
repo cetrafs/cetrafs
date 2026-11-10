@@ -2656,6 +2656,18 @@ int main(int argc, char **argv)
                         continue;
                     }
 
+                    /* From a session the area was parked after (format
+                     * 0x000A): settled by that park, and replay consumes
+                     * it without applying it. */
+                    if (cetrafs_le32(flag.magic) == CETRAFS_NODE_JOURNAL_MAGIC &&
+                        cetrafs_le64(hdr.park_seq) != cetrafs_le64(flag.park_seq)) {
+                        fprintf(stderr,
+                                "WARN: node %u journal slot %" PRIu64 " is from park %" PRIu64
+                                ", the area is at park %" PRIu64 " -- replay discards it\n",
+                                n, sl, (uint64_t) cetrafs_le64(hdr.park_seq), (uint64_t) cetrafs_le64(flag.park_seq));
+                        continue;
+                    }
+
                     /* The check journal.c gained after review: an entry
                      * naming a block outside every data region would be
                      * applied blindly at mount, and pointed at block 0

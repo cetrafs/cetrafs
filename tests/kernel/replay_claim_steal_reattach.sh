@@ -53,7 +53,7 @@ plant() {
     "$NPOKE" "$DEV" "$PEER" --inc 111 >/dev/null
     JOURNAL_POKE_INC=111 "$JPOKE" "$DEV" "$NID" --claim "$PEER" >/dev/null
     blockdev --flushbufs "$DEV"
-    grep -q "replay_owner=$PEER .* incarnation=111$" <<<"$("$JPOKE" "$DEV" "$NID" --dump)" ||
+    grep -q "replay_owner=$PEER .* incarnation=111 " <<<"$("$JPOKE" "$DEV" "$NID" --dump)" ||
         { fail "setup: the planted claim is not on the device"; ct_exit; }
 }
 
@@ -77,7 +77,7 @@ mountpoint -q "$MNT" && MOUNTED=1
 log "A: 4.8 s in: mounted=$MOUNTED; $D"
 dmesg_since "$MARK" | grep -q "revoked stale node $PEER" ||
     { kill "$B" 2>/dev/null; fail "A: setup: the attach never tried to take the claim over"; }
-grep -q "replay_owner=$PEER .* incarnation=222$" <<<"$D" && [ "$MOUNTED" = 0 ] &&
+grep -q "replay_owner=$PEER .* incarnation=222 " <<<"$D" && [ "$MOUNTED" = 0 ] &&
     pass "A: the re-taken claim is still the replayer's, and the mount waits on it" ||
     fail "A: the claim of a replayer that re-attached and re-claimed was taken (mounted=$MOUNTED): $D"
 kill "$B" 2>/dev/null || true; wait "$B" 2>/dev/null || true

@@ -527,6 +527,13 @@ static int cetrafs_node_fence_peer_full(struct super_block *sb, u32 node_id, con
         pr_info("fence: revoked stale node %u's lease (epoch %llu) while reclaiming %s\n", node_id,
                 (unsigned long long) ctx.seen_epoch, what);
         cetrafs_sb_peer_note_fenced(sb, node_id, ctx.landed_seq);
+        /* And close its journal session, so a DIRTY flip or an entry it
+         * had queued past the fence is from before a park (M10). Not
+         * parked, the reclaim waits: what it is about to take could be
+         * repaired backwards by that entry later. */
+        ret = cetrafs_journal_fence_park(sb, node_id);
+        if (ret)
+            return ret;
     }
     return 0;
 }

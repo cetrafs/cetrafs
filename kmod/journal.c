@@ -92,6 +92,9 @@ struct cetrafs_journal {
      * which replays our own area first.
      */
     bool flag_dirty;
+    /* The area's park_seq this session's entries belong to: read at
+     * attach, advanced by our own park (cetrafs_node_journal_hdr_t). */
+    u64 park_seq;
     /*
      * Dead peers' areas whose replay-claim release did not land, by node
      * id, and whether that release was to park the flag CLEAN. Retried
@@ -181,7 +184,7 @@ static u32 cetrafs_journal_header_crc(const void *raw)
 
 /* Read a node's flag block (always uncached -- another node may have
  * replayed/cleaned it) and report whether it says DIRTY. */
-static int cetrafs_journal_read_flag(struct super_block *sb, u64 area_start, bool *out_dirty)
+static int cetrafs_journal_read_flag_seq(struct super_block *sb, u64 area_start, bool *out_dirty, u64 *out_seq)
 {
     struct buffer_head *bh = cetrafs_bread_uncached_retry(sb, area_start);
     const cetrafs_node_journal_hdr_t *hdr;
@@ -195,36 +198,140 @@ static int cetrafs_journal_read_flag(struct super_block *sb, u64 area_start, boo
      * flips this to DIRTY before committing its first entry. */
     *out_dirty = (cetrafs_le32(hdr->magic) == CETRAFS_NODE_JOURNAL_MAGIC &&
                   cetrafs_le32(hdr->state) == CETRAFS_NODE_JOURNAL_DIRTY);
+    if (out_seq)
+        *out_seq = cetrafs_le32(hdr->magic) == CETRAFS_NODE_JOURNAL_MAGIC ? cetrafs_le64(hdr->park_seq) : 0;
     brelse(bh);
     return 0;
 }
 
-static int cetrafs_journal_write_flag(struct super_block *sb, u64 area_start, bool dirty)
+static int cetrafs_journal_read_flag(struct super_block *sb, u64 area_start, bool *out_dirty)
 {
-    struct buffer_head *bh = cetrafs_getblk_overwrite(sb, area_start);
-    cetrafs_node_journal_hdr_t *hdr;
+    return cetrafs_journal_read_flag_seq(sb, area_start, out_dirty, NULL);
+}
+
+/*
+ * The owner's own flag flips, by compare-and-write. DIRTY requires the
+ * area CLEAN, unclaimed and still at the park_seq this session learned;
+ * CLEAN (our unmount) requires it DIRTY at that park_seq, and parks it:
+ * park_seq + 1. Either one finding anything else means a peer has
+ * parked our area since -- it fenced us -- and the flip must not land:
+ * a DIRTY landing over that park would make the next replay scan
+ * entries of a session already settled (M10). A blind write queued past
+ * the fence could not be refused; the device's compare can.
+ */
+struct cetrafs_journal_flag_ctx {
+    bool dirty;
+    u64 expect_seq;
+    u64 new_seq; /* out */
+};
+
+static int cetrafs_journal_flag_mutate(void *image, unsigned int len, void *priv)
+{
+    struct cetrafs_journal_flag_ctx *ctx = priv;
+    cetrafs_node_journal_hdr_t *hdr = image;
+    bool magic = cetrafs_le32(hdr->magic) == CETRAFS_NODE_JOURNAL_MAGIC;
+    u32 state = magic ? cetrafs_le32(hdr->state) : CETRAFS_NODE_JOURNAL_CLEAN;
+    u32 owner = magic ? cetrafs_le32(hdr->replay_owner) : CETRAFS_NODE_ID_NONE;
+    u64 seq = magic ? cetrafs_le64(hdr->park_seq) : 0;
+
+    (void) len;
+    if (!magic && cetrafs_le32(hdr->magic) != 0)
+        return -EUCLEAN; /* neither zero-filled nor ours: not a flag block */
+    if (seq != ctx->expect_seq || owner != CETRAFS_NODE_ID_NONE ||
+        state != (ctx->dirty ? CETRAFS_NODE_JOURNAL_CLEAN : CETRAFS_NODE_JOURNAL_DIRTY))
+        return -ESTALE;
+    if (!magic) {
+        memset(hdr, 0, len < sizeof(*hdr) ? len : sizeof(*hdr));
+        hdr->magic = cetrafs_cpu_to_le32(CETRAFS_NODE_JOURNAL_MAGIC);
+    }
+    hdr->state = cetrafs_cpu_to_le32(ctx->dirty ? CETRAFS_NODE_JOURNAL_DIRTY : CETRAFS_NODE_JOURNAL_CLEAN);
+    hdr->replay_owner = cetrafs_cpu_to_le32(CETRAFS_NODE_ID_NONE); /* 0 is a real node id -- be explicit */
+    hdr->replay_incarnation = 0;
+    ctx->new_seq = ctx->dirty ? seq : seq + 1;
+    hdr->park_seq = cetrafs_cpu_to_le64(ctx->new_seq);
+    return 0;
+}
+
+static int cetrafs_journal_write_flag(struct super_block *sb, struct cetrafs_journal *j, bool dirty)
+{
+    struct cetrafs_journal_flag_ctx ctx = {.dirty = dirty, .expect_seq = j->park_seq};
     int ret;
 
-    if (!bh)
-        return -EIO;
-
-    memset(bh->b_data, 0, CETRAFS_BLOCK_SIZE);
-    hdr = (cetrafs_node_journal_hdr_t *) bh->b_data;
-    hdr->magic = cetrafs_cpu_to_le32(CETRAFS_NODE_JOURNAL_MAGIC);
-    hdr->state = cetrafs_cpu_to_le32(dirty ? CETRAFS_NODE_JOURNAL_DIRTY : CETRAFS_NODE_JOURNAL_CLEAN);
-    hdr->replay_owner = cetrafs_cpu_to_le32(CETRAFS_NODE_ID_NONE); /* 0 is a real node id -- be explicit */
-    cetrafs_bh_end_update(bh);
     /* The flag is the whole point of this block: committing entries
      * while the on-disk state still reads CLEAN means the next replay
      * of this area skips them, so a failed write here must reach the
-     * caller. Both callers already check -- it was this function that
-     * reported success unconditionally. */
-    ret = cetrafs_sync_buffer(sb, bh);
-    if (ret)
+     * caller. */
+    ret = cetrafs_cas_record_nointr(sb, j->area_start, cetrafs_journal_flag_mutate, &ctx);
+    if (ret > 0)
+        ret = -ESTALE;
+    if (ret == -ESTALE)
+        pr_err("journal: our area at %llu was parked by a peer since this session began (park_seq %llu) -- "
+               "refusing to mark it %s\n",
+               (unsigned long long) j->area_start, (unsigned long long) j->park_seq, dirty ? "DIRTY" : "CLEAN");
+    else if (ret)
         pr_err("journal: could not write the %s flag at %llu (%d)\n", dirty ? "DIRTY" : "CLEAN",
-               (unsigned long long) area_start, ret);
-    brelse(bh);
+               (unsigned long long) j->area_start, ret);
+    else
+        j->park_seq = ctx.new_seq;
     return ret;
+}
+
+/*
+ * A fence closes the fenced incarnation's journal session: a CLEAN area
+ * is parked again (park_seq + 1), so a DIRTY flip it had queued to the
+ * device past the fence miscompares and never lands, and an entry that
+ * lands anyway is from before the park. A DIRTY area is left alone --
+ * the replay that every reclaim runs next parks it when it is done.
+ */
+struct cetrafs_journal_fence_park_ctx {
+    bool parked; /* out */
+};
+
+static int cetrafs_journal_fence_park_mutate(void *image, unsigned int len, void *priv)
+{
+    struct cetrafs_journal_fence_park_ctx *ctx = priv;
+    cetrafs_node_journal_hdr_t *hdr = image;
+    bool magic = cetrafs_le32(hdr->magic) == CETRAFS_NODE_JOURNAL_MAGIC;
+
+    ctx->parked = false;
+    if (!magic && cetrafs_le32(hdr->magic) != 0)
+        return -EUCLEAN;
+    if (magic && cetrafs_le32(hdr->state) == CETRAFS_NODE_JOURNAL_DIRTY)
+        return 1; /* the replay parks it */
+    if (!magic) {
+        memset(hdr, 0, len < sizeof(*hdr) ? len : sizeof(*hdr));
+        hdr->magic = cetrafs_cpu_to_le32(CETRAFS_NODE_JOURNAL_MAGIC);
+        hdr->state = cetrafs_cpu_to_le32(CETRAFS_NODE_JOURNAL_CLEAN);
+        hdr->replay_owner = cetrafs_cpu_to_le32(CETRAFS_NODE_ID_NONE);
+    }
+    hdr->park_seq = cetrafs_cpu_to_le64(cetrafs_le64(hdr->park_seq) + 1);
+    ctx->parked = true;
+    return 0;
+}
+
+/* TEST ONLY: a fence leaves the fenced node's area as it was (the
+ * control of tests/kernel/journal_park_stamp.sh). */
+static bool cetrafs_journal_fence_park_skip;
+cetrafs_test_param(journal_fence_park_skip, cetrafs_journal_fence_park_skip, bool, 0644);
+MODULE_PARM_DESC(journal_fence_park_skip, "TEST ONLY: a fence does not park the fenced node's journal area");
+
+int cetrafs_journal_fence_park(struct super_block *sb, u32 node_id)
+{
+    struct cetrafs_journal_fence_park_ctx ctx = {};
+    u64 area_start, slots;
+    int ret;
+
+    if (cetrafs_journal_fence_park_skip)
+        return 0;
+    ret = cetrafs_journal_node_area(sb, node_id, &area_start, &slots);
+    if (ret || !area_start)
+        return ret; /* journaling off: nothing to park */
+    ret = cetrafs_cas_record_nointr(sb, area_start, cetrafs_journal_fence_park_mutate, &ctx);
+    if (ret < 0) {
+        pr_err_ratelimited("journal: could not park fenced node %u's area (%d)\n", node_id, ret);
+        return ret;
+    }
+    return 0;
 }
 
 /* --- replay claim (replaces the cluster mutex) -------
@@ -264,8 +371,12 @@ static int cetrafs_journal_claim_mutate(void *image, unsigned int len, void *pri
         hdr->replay_owner = cetrafs_cpu_to_le32(CETRAFS_NODE_ID_NONE);
         hdr->replay_incarnation = 0;
         hdr->replay_claimed = 0;
-        if (ctx->set_clean)
+        if (ctx->set_clean) {
+            /* A park: entries still in the slots, or landing late, are
+             * from before it (cetrafs_node_journal_hdr_t.park_seq). */
             hdr->state = CETRAFS_NODE_JOURNAL_CLEAN;
+            hdr->park_seq = cetrafs_cpu_to_le64(cetrafs_le64(hdr->park_seq) + 1);
+        }
         return 0;
     }
 
@@ -664,6 +775,14 @@ int cetrafs_journal_attach_node(struct super_block *sb, u32 node_id)
 
     j->flag_dirty = false; /* replay always ends with the flag clean */
     j->next_txn_id = 0;
+    {
+        bool dirty;
+
+        /* The park this session's entries will belong to. */
+        ret = cetrafs_journal_read_flag_seq(sb, j->area_start, &dirty, &j->park_seq);
+        if (ret)
+            return ret;
+    }
     return 0;
 }
 
@@ -909,7 +1028,7 @@ static int cetrafs_journal_take_slot(struct super_block *sb, struct cetrafs_jour
      * *before* committing anything, so a crash after the commit is
      * guaranteed to be caught by the next replay of our area. */
     if (!j->flag_dirty) {
-        int ret = cetrafs_journal_write_flag(sb, j->area_start, true);
+        int ret = cetrafs_journal_write_flag(sb, j, true);
 
         if (ret) {
             cetrafs_journal_untake_kept(j, slot, lba, reused);
@@ -1026,6 +1145,9 @@ static int cetrafs_journal_write_block_flags(struct super_block *sb, struct buff
          * block since -- without it, redo silently reverts a peer's
          * newer write (see cetrafs_journal_header_t). */
         hdr->prev_checksum = cetrafs_cpu_to_le32(prev_crc);
+        /* The session this entry belongs to: replay skips it once the
+         * area has been parked since (cetrafs_node_journal_hdr_t). */
+        hdr->park_seq = cetrafs_cpu_to_le64(READ_ONCE(j->park_seq));
         /* Over the caller's buffer, which is the image just copied into
          * the payload block and cannot change meanwhile: it is locked. */
         hdr->payload_checksum = cetrafs_cpu_to_le32(~crc32c(~0U, bh->b_data, CETRAFS_BLOCK_SIZE));
@@ -1598,7 +1720,7 @@ void cetrafs_journal_shutdown(struct super_block *sb)
     if (j->flag_dirty) {
         if (!bitmap_empty(j->busy, j->slots))
             pr_err("journal: shutdown with in-flight slots still busy -- leaving flag dirty\n");
-        else if (cetrafs_journal_write_flag(sb, j->area_start, false) == 0)
+        else if (cetrafs_journal_write_flag(sb, j, false) == 0)
             j->flag_dirty = false;
     }
     mutex_unlock(&j->lock);
@@ -1618,6 +1740,7 @@ struct cetrafs_journal_replay_entry {
     u32 flags;
     u32 prev_checksum;
     u32 payload_checksum;
+    bool before_park; /* from a session the area was parked after */
 };
 
 static int cetrafs_journal_replay_cmp(const void *a, const void *b)
@@ -1797,7 +1920,7 @@ MODULE_PARM_DESC(journal_consume_fail_once, "TEST ONLY: fail the next journal re
 
 static int __cetrafs_journal_replay_node(struct super_block *sb, u32 node_id, bool wait_for_claim)
 {
-    u64 area_start, slots, s;
+    u64 area_start, slots, s, park_seq = 0;
     struct cetrafs_journal_replay_entry *entries;
     u32 count = 0, applied = 0, my_node_id = 0;
     bool dirty = false, claimed = false;
@@ -1905,8 +2028,9 @@ static int __cetrafs_journal_replay_node(struct super_block *sb, u32 node_id, bo
     atomic64_inc(&cetrafs_journal_replays);
 
     /* Re-read under the claim: the pre-check above was unsynchronised,
-     * so a peer may have replayed the whole area in between. */
-    ret = cetrafs_journal_read_flag(sb, area_start, &dirty);
+     * so a peer may have replayed the whole area in between. Its
+     * park_seq is the session every entry worth redoing belongs to. */
+    ret = cetrafs_journal_read_flag_seq(sb, area_start, &dirty, &park_seq);
     if (ret || !dirty)
         goto out_release;
 
@@ -1931,6 +2055,24 @@ static int __cetrafs_journal_replay_node(struct super_block *sb, u32 node_id, bo
 
         if (cetrafs_le32(hdr->magic) != CETRAFS_JOURNAL_MAGIC ||
             cetrafs_journal_header_crc(hbh->b_data) != cetrafs_le32(hdr->header_checksum)) {
+            brelse(hbh);
+            continue;
+        }
+
+        /* From a session the area was parked after: its operation was
+         * settled by that park -- replayed, or failed on a fenced node
+         * whose entry write landed late. Consumed, never applied (M10). */
+        if (cetrafs_le64(hdr->park_seq) != park_seq) {
+            memset(&entries[count], 0, sizeof(entries[count]));
+            entries[count].txn_id = cetrafs_le64(hdr->txn_id);
+            entries[count].target_lba = cetrafs_le64(hdr->target_lba);
+            entries[count].header_lba = header_lba;
+            entries[count].before_park = true;
+            pr_warn("journal replay: node %u slot %llu (txn %llu) is from park %llu, the area is at park %llu -- "
+                    "not applying it\n",
+                    node_id, (unsigned long long) s, (unsigned long long) cetrafs_le64(hdr->txn_id),
+                    (unsigned long long) cetrafs_le64(hdr->park_seq), (unsigned long long) park_seq);
+            count++;
             brelse(hbh);
             continue;
         }
@@ -2015,6 +2157,7 @@ static int __cetrafs_journal_replay_node(struct super_block *sb, u32 node_id, bo
         entries[count].flags = cetrafs_le32(hdr->flags);
         entries[count].prev_checksum = cetrafs_le32(hdr->prev_checksum);
         entries[count].payload_checksum = cetrafs_le32(hdr->payload_checksum);
+        entries[count].before_park = false;
         count++;
         brelse(hbh);
     }
@@ -2025,6 +2168,11 @@ static int __cetrafs_journal_replay_node(struct super_block *sb, u32 node_id, bo
     for (s = 0; s < count; s++) {
         struct buffer_head *pbh, *tbh, *hbh;
         bool apply;
+
+        if (entries[s].before_park) {
+            atomic64_inc(&cetrafs_journal_replay_skipped);
+            goto consume;
+        }
 
         /* A freshly-allocated block's entry: nothing referenced the
          * block when its writer died, so there is nothing to repair --
