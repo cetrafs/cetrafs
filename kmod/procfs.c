@@ -120,6 +120,15 @@ static int cetrafs_proc_info_show(struct seq_file *m, void *v)
     /* Damaged metadata found by this mount, every retry included; any
      * nonzero count means unmount everywhere and run fsck.cetra. */
     seq_printf(m, "corruptions: %u\n", cetrafs_sb_corruptions(sb));
+    {
+        u32 fnode = 0;
+        u64 fsince = cetrafs_sb_fsck_needed(sb, &fnode);
+
+        if (fsince)
+            seq_printf(m, "fsck_needed: since %llu by row %u\n", (unsigned long long) fsince, fnode);
+        else
+            seq_printf(m, "fsck_needed: no\n");
+    }
     /* The exact value fs.c's fill_super() stamped into sb->s_maxbytes --
      * see cetrafs_compute_max_file_size() (zonegroup.c) for the formula.
      * Read straight off the live super_block, not recomputed here, so

@@ -198,6 +198,13 @@ ct_mount "$DEV" "$MNT"
 ct_umount "$MNT"
 "$PPOKE" "$IMG" "$INO1" "$WAS1" >/dev/null && "$PPOKE" "$IMG" "$INO2" "$WAS2" >/dev/null ||
     fail "cleanup: could not put the extents back"
+# C's control made the node call an address in the new space corrupt
+# (the false verdict, on purpose), and a node records the damage it
+# finds in the superblock's needs-fsck mark. Clear it the way an
+# operator would: fsck -r clears it only on a volume it finds clean.
+out="$("$ROOT/userspace/fsck.cetra" -r "$DEV" 2>&1)" || true
+grep -q "cleared the needs-fsck mark" <<<"$out" && pass "C's false verdict left the needs-fsck mark, and fsck -r cleared it" ||
+    fail "fsck -r did not clear a needs-fsck mark: $(grep -m3 -E 'ERR|mark' <<<"$out" | tr '\n' ' ')"
 out="$(ct_fsck "$DEV" 2>&1)" && pass "fsck is clean after three grows this node learned of second-hand" ||
     fail "fsck: $(grep -m3 ERR <<<"$out" | tr '\n' ' ')"
 ct_exit

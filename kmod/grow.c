@@ -52,6 +52,7 @@
  * the owner's own flush. Capacity in the pool reaches every node through
  * the ordinary claim path.
  */
+#include <linux/crc32c.h>
 #include <linux/capability.h>
 #include <linux/fs.h>
 #include <linux/kernel.h>
@@ -106,17 +107,35 @@ struct cetrafs_grow_sb_ctx {
 /* Block 0: replaced only if it is still byte for byte the superblock
  * this grow was checked against. The bytes past the structure are left
  * as they are. */
+static void cetrafs_grow_sb_restamp(cetrafs_superblock_t *s)
+{
+    s->checksum = cpu_to_le64(0);
+    s->checksum = cpu_to_le64((u64) ~crc32c(~0U, s, sizeof(*s)));
+}
+
 static int cetrafs_grow_sb_mutate(void *image, unsigned int len, void *priv)
 {
     struct cetrafs_grow_sb_ctx *ctx = priv;
 
+    cetrafs_superblock_t want_cur, want_nw;
+
     if (len < sizeof(*ctx->nw))
         return -EINVAL;
-    if (!memcmp(image, ctx->nw, sizeof(*ctx->nw)))
+    /* Compared around the needs-fsck mark, which a peer may set at any
+     * time and which is status, not layout: a grow keeps whatever mark
+     * the device has (cetrafs_sb_copy_status()). Both images are
+     * restamped with it, so the comparison is byte for byte otherwise. */
+    want_cur = *ctx->cur;
+    want_nw = *ctx->nw;
+    cetrafs_sb_copy_status(&want_cur, image);
+    cetrafs_sb_copy_status(&want_nw, image);
+    cetrafs_grow_sb_restamp(&want_cur);
+    cetrafs_grow_sb_restamp(&want_nw);
+    if (!memcmp(image, &want_nw, sizeof(want_nw)))
         return 1; /* already published: an earlier attempt landed */
-    if (memcmp(image, ctx->cur, sizeof(*ctx->cur)))
+    if (memcmp(image, &want_cur, sizeof(want_cur)))
         return -ESTALE;
-    memcpy(image, ctx->nw, sizeof(*ctx->nw));
+    memcpy(image, &want_nw, sizeof(want_nw));
     return 0;
 }
 

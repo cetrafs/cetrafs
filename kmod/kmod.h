@@ -281,6 +281,9 @@ __printf(2, 3) void cetrafs_sb_fatal(struct super_block *sb, const char *fmt, ..
 void cetrafs_sb_corrupt(struct super_block *sb, u64 ino);
 void cetrafs_sb_corrupt_inode(struct inode *inode);
 unsigned int cetrafs_sb_corruptions(struct super_block *sb);
+void cetrafs_sb_record_damage(struct super_block *sb);
+u64 cetrafs_sb_fsck_needed(struct super_block *sb, u32 *out_node);
+void cetrafs_sb_copy_status(cetrafs_superblock_t *dst, const cetrafs_superblock_t *src);
 bool cetrafs_sb_inode_damaged(struct inode *inode);
 void cetrafs_sb_ino_reborn(struct super_block *sb, u64 ino);
 bool cetrafs_sb_errors_panic(struct super_block *sb);

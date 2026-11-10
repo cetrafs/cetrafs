@@ -307,6 +307,11 @@ static void cetrafs_heartbeat_maint(struct work_struct *work)
     if (!READ_ONCE(cetrafs_layout_refresh_hb_off)) /* test-only; see the parameter */
         cetrafs_sb_layout_refresh(sb);
 
+    /* Damage this mount found goes on the device once, so it outlives a
+     * remount (cetrafs_superblock_t.fsck_needed_since). Read-only mounts
+     * too: the mark is the volume's status, not a change to its data. */
+    cetrafs_sb_record_damage(sb);
+
     /* Everything below WRITES to shared state: it claims and releases
      * Zone Groups, applies peers' queued frees to their bitmaps, and
      * replays dead peers' journals into their data regions. A read-only

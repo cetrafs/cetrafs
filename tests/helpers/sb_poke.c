@@ -74,6 +74,8 @@ static const struct {
      * the chain walk went unexercised for so long. */
     {"bg_table_next", offsetof(cetrafs_superblock_t, bg_table_next), 8},
     {"bg_table_first_count", offsetof(cetrafs_superblock_t, bg_table_first_count), 8},
+    {"fsck_needed_since", offsetof(cetrafs_superblock_t, fsck_needed_since), 8},
+    {"fsck_needed_node", offsetof(cetrafs_superblock_t, fsck_needed_node), 4},
 };
 
 static uint64_t field_get(const cetrafs_superblock_t *sb, int i)

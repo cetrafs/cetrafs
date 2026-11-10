@@ -161,7 +161,8 @@ and must be accessed through `cetrafs_le*()`/`cetrafs_cpu_to_le*()`; see
 | features_compat/incompat/ro_compat | `__le64` | feature bitmasks |
 | checksum | `__le64` | CRC32C over the struct with this field zeroed (low 32 bits used) |
 | uuid[16] | `u8[]` | filesystem UUID |
-| reserved[144] | `u8[]` | padding to keep the struct growable |
+| fsck_needed_since, fsck_needed_node | `__le64`, `__le32` | the lasting "needs fsck" mark (0x000A): when, and by which registry row, damaged metadata was first found at runtime; 0 = none. Set once by compare-and-write from the finding node's heartbeat, cleared by `fsck -r` after a clean pass. Status, not layout: the checks that block 0 still describes the mounted volume (grow, mount, refresh) compare around it, and a grow keeps it |
+| reserved[128] | `u8[]` | padding to keep the struct growable |
 
 ### Zone Group Descriptor — `cetrafs_zone_group_t` (1 block per ZG)
 

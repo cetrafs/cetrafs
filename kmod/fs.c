@@ -488,10 +488,17 @@ struct cetrafs_sb_info {
     bool corruption_stop;
     /* Integrity errors seen on this mount (nonzero: the volume needs
      * fsck), and the inode numbers they were found in: every write to
-     * one of those is refused until a remount. In memory only -- the
-     * on-disk format has no field for it. */
+     * one of those is refused until a remount. The SET is in memory
+     * only; that the volume needs fsck goes on the device too
+     * (fsck_needed_since below). */
     atomic_t corruptions;
     struct xarray bad_inos;
+    /* The superblock's lasting "needs fsck" mark as this node last read
+     * it (mount, every heartbeat's block-0 read), and whether this mount
+     * has put its own damage there yet (cetrafs_sb_record_damage()). */
+    u64 fsck_needed_since;
+    u32 fsck_needed_node;
+    bool damage_recorded;
     /* A regular file's extent-tree blocks held back from writeback until
      * a durability boundary, by LBA (leafdefer.c). */
     struct xarray deferred;
@@ -1686,6 +1693,43 @@ static int cetrafs_check_sb_crc(const void *buf, size_t len, __le64 stored)
     return (crc == want) ? 0 : -EUCLEAN;
 }
 
+/* Restamp a superblock image's checksum after editing it. */
+static void cetrafs_sb_restamp(cetrafs_superblock_t *s)
+{
+    s->checksum = cpu_to_le64(0);
+    s->checksum = cpu_to_le64((u64) ~crc32c(~0U, s, sizeof(*s)));
+}
+
+/*
+ * The superblock's STATUS fields -- the lasting "needs fsck" mark --
+ * from 'src' into 'dst'. Neither says where anything is, so every check
+ * that block 0 still describes the volume a node mounted compares
+ * around them, and a grow publishes over whatever mark the device has.
+ */
+void cetrafs_sb_copy_status(cetrafs_superblock_t *dst, const cetrafs_superblock_t *src)
+{
+    dst->fsck_needed_since = src->fsck_needed_since;
+    dst->fsck_needed_node = src->fsck_needed_node;
+    dst->fsck_needed_pad = src->fsck_needed_pad;
+}
+
+/* Do 'a' and 'b' describe the same volume, status fields aside? */
+static bool cetrafs_sb_same_layout(const cetrafs_superblock_t *a, const cetrafs_superblock_t *b)
+{
+    cetrafs_superblock_t x = *a, y = *b;
+
+    cetrafs_sb_copy_status(&y, &x);
+    y.checksum = x.checksum;
+    return !memcmp(&x, &y, sizeof(x));
+}
+
+/* Remember the mark as last read off the device. */
+static void cetrafs_sb_note_status(struct cetrafs_sb_info *sbi, const cetrafs_superblock_t *s)
+{
+    WRITE_ONCE(sbi->fsck_needed_node, le32_to_cpu(s->fsck_needed_node));
+    WRITE_ONCE(sbi->fsck_needed_since, le64_to_cpu(s->fsck_needed_since));
+}
+
 /*
  * Is 'nw' a grow of 'cur' and nothing else?
  *
@@ -1716,6 +1760,7 @@ static bool cetrafs_layout_is_grow_of(const cetrafs_superblock_t *cur, const cet
     b.bg_table_next = a.bg_table_next;
     b.bg_table_first_count = a.bg_table_first_count;
     b.checksum = a.checksum;
+    cetrafs_sb_copy_status(&b, &a); /* status, not layout: a mark may come and go */
     return !memcmp(&a, &b, sizeof(a));
 }
 
@@ -1867,6 +1912,10 @@ static int cetrafs_layout_refresh_locked(struct super_block *sb)
         memcpy(raw, bh->b_data, sizeof(*raw));
         brelse(bh);
         if (raw->layout_gen == cur->raw.layout_gen) {
+            /* The mark only from a read that verifies: a torn one is
+             * re-read on the next beat. */
+            if (!cetrafs_check_sb_crc(raw, sizeof(*raw), raw->checksum))
+                cetrafs_sb_note_status(sbi, raw);
             rc = 0; /* even after a torn read: what is there now is ours */
             goto up_to_date; /* the common case: nothing moved */
         }
@@ -2398,6 +2447,15 @@ int cetrafs_fill_super(struct super_block *sb, struct fs_context *fc)
         sbi->hb_interval_secs = cetrafs_param_hb_interval_secs();
         sbi->stale_secs = cetrafs_param_stale_secs();
 
+        /* The lasting needs-fsck mark: say it at every mount until fsck
+         * clears it. The mount goes ahead -- damage refuses writes where
+         * it is found, it does not take the volume down. */
+        cetrafs_sb_note_status(sbi, ondisk);
+        if (sbi->fsck_needed_since)
+            pr_err("%s: this volume needs fsck: damaged metadata was found by registry row %u at %llu (unix "
+                   "time) -- unmount it on every node and run fsck.cetra -r\n",
+                   sb->s_id, sbi->fsck_needed_node, (unsigned long long) sbi->fsck_needed_since);
+
         /* Per-peer liveness watch (see the struct's own comment). One
          * entry per Node Registry row. Its allocation failing used to be
          * accepted: cetrafs_node_is_stale() then answers "cannot judge,
@@ -2832,7 +2890,12 @@ int cetrafs_fill_super(struct super_block *sb, struct fs_context *fc)
                 struct buffer_head *sbh = cetrafs_bread_uncached(sb, CETRAFS_SB_BLOCK_NR);
                 int why = sbh ? 0 : -EIO;
 
-                if (sbh && memcmp(sbh->b_data, mine, sizeof(*mine)) != 0) {
+                if (sbh && memcmp(sbh->b_data, mine, sizeof(*mine)) != 0 &&
+                    !(!cetrafs_check_sb_crc(sbh->b_data, sizeof(*mine),
+                                            ((const cetrafs_superblock_t *) sbh->b_data)->checksum) &&
+                      cetrafs_sb_same_layout(mine, (const cetrafs_superblock_t *) sbh->b_data))) {
+                    /* Only the needs-fsck mark moving is not a rewrite: a
+                     * peer that found damage records it while we mount. */
                     const cetrafs_superblock_t *ns = (const cetrafs_superblock_t *) sbh->b_data;
                     bool grow = !cetrafs_check_sb_crc(ns, sizeof(*ns), ns->checksum) &&
                                 le32_to_cpu(ns->magic) == CETRAFS_MAGIC && cetrafs_layout_is_grow_of(mine, ns);
@@ -4571,6 +4634,90 @@ unsigned int cetrafs_sb_corruptions(struct super_block *sb)
     struct cetrafs_sb_info *sbi = sb->s_fs_info;
 
     return sbi ? (unsigned int) atomic_read(&sbi->corruptions) : 0;
+}
+
+/* TEST ONLY: the heartbeat does not put this mount's damage on the device
+ * -- the negative control for the lasting mark. */
+static bool cetrafs_damage_record_off;
+cetrafs_test_param(damage_record_off, cetrafs_damage_record_off, bool, 0644);
+MODULE_PARM_DESC(damage_record_off, "TEST ONLY: never record damage in the superblock's needs-fsck mark");
+
+struct cetrafs_damage_ctx {
+    u64 now;
+    u32 node;
+    bool already;
+};
+
+static int cetrafs_damage_mutate(void *image, unsigned int len, void *priv)
+{
+    struct cetrafs_damage_ctx *c = priv;
+    cetrafs_superblock_t *s = image;
+
+    if (len < sizeof(*s))
+        return -EINVAL;
+    /* Edit only a superblock that verifies: anything else is torn (the
+     * next beat tries again) or not ours to stamp. */
+    if (le32_to_cpu(s->magic) != CETRAFS_MAGIC || cetrafs_check_sb_crc(s, sizeof(*s), s->checksum))
+        return -EUCLEAN;
+    if (s->fsck_needed_since) {
+        c->already = true;
+        return 1; /* somebody recorded damage first; theirs stands */
+    }
+    s->fsck_needed_since = cpu_to_le64(c->now);
+    s->fsck_needed_node = cpu_to_le32(c->node);
+    cetrafs_sb_restamp(s);
+    return 0;
+}
+
+/*
+ * Put this mount's damage on the device, once: the lasting "needs fsck"
+ * mark in the superblock (cetrafs_superblock_t.fsck_needed_since). Called
+ * by the heartbeat, which is sleepable, drained at unmount and the one
+ * place every mount already reads block 0 from -- never from
+ * cetrafs_sb_corrupt() itself, which runs on read paths holding fs locks
+ * and inside compare-and-write mutators. A failed swap is tried again on
+ * the next beat. A mount that STOPS on damage (corruption=stop) writes
+ * nothing after the stop, so the mark comes from whichever node meets
+ * the damage next, or from fsck.
+ */
+void cetrafs_sb_record_damage(struct super_block *sb)
+{
+    struct cetrafs_sb_info *sbi = sb->s_fs_info;
+    struct cetrafs_damage_ctx ctx = {.now = (u64) ktime_get_real_seconds()};
+    int rc;
+
+    if (!sbi || READ_ONCE(sbi->damage_recorded) || !atomic_read(&sbi->corruptions) ||
+        READ_ONCE(cetrafs_damage_record_off) || cetrafs_sb_is_fenced(sb))
+        return;
+    if (cetrafs_sb_get_node_id(sb, &ctx.node))
+        return;
+    rc = cetrafs_cas_record(sb, CETRAFS_SB_BLOCK_NR, cetrafs_damage_mutate, &ctx);
+    if (rc) {
+        pr_warn_ratelimited("%s: could not record on the volume that it needs fsck (%d) -- trying again on the "
+                            "next heartbeat\n",
+                            sb->s_id, rc);
+        return;
+    }
+    WRITE_ONCE(sbi->damage_recorded, true);
+    if (ctx.already)
+        return;
+    WRITE_ONCE(sbi->fsck_needed_node, ctx.node);
+    WRITE_ONCE(sbi->fsck_needed_since, ctx.now);
+    pr_err("%s: recorded on the volume that it needs fsck -- every node will report it until fsck.cetra -r "
+           "finds it clean\n",
+           sb->s_id);
+}
+
+/* The lasting mark as this node last read it: 0 = none. */
+u64 cetrafs_sb_fsck_needed(struct super_block *sb, u32 *out_node)
+{
+    struct cetrafs_sb_info *sbi = sb->s_fs_info;
+
+    if (!sbi)
+        return 0;
+    if (out_node)
+        *out_node = READ_ONCE(sbi->fsck_needed_node);
+    return READ_ONCE(sbi->fsck_needed_since);
 }
 
 /* Was damage found in THIS incarnation of the inode (or in one of its

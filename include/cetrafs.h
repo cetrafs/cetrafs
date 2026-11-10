@@ -374,7 +374,27 @@ typedef struct {
     __le64 bg_table_next;        /* LBA of the first appended segment, 0 = none */
     __le64 bg_table_first_count; /* descriptors in the implicit first segment */
 
-    u8  reserved[144];
+    /* The lasting "needs fsck" mark (format 0x000A).
+     *
+     * A mount that finds damaged metadata counts it, refuses writes to
+     * the inode it was found in and says so -- all in memory, which a
+     * remount forgets, and a remount is exactly what an operator does
+     * next. So the first node to find damage also records it here:
+     * when (unix seconds) and which registry row. Set once, by
+     * compare-and-write on block 0 from that node's heartbeat
+     * (cetrafs_sb_record_damage()); a mark already present is left as
+     * it is. Cleared only by fsck -r, at the end of a pass that found
+     * the volume clean. 0 = no damage recorded.
+     *
+     * STATUS, not layout: neither field says where anything is, so the
+     * checks that block 0 still describes the volume a node mounted
+     * (a grow of it, or the same one) ignore them, and a grow keeps
+     * whatever mark is on the device. */
+    __le64 fsck_needed_since;
+    __le32 fsck_needed_node;
+    __le32 fsck_needed_pad;
+
+    u8  reserved[128];
 } CETRA_PACKED cetrafs_superblock_t;
 
 /*
