@@ -134,6 +134,7 @@ verdict() {
 
 # A block well past anything these cases allocate, free, for the fillers.
 ct_mount "$DEV" "$MNT"
+require_cetrafs_mount "$MNT"
 dd if=/dev/urandom of="$MNT/probe" bs=4096 count=1 conv=fsync status=none
 FILLER=$(($(ext "$MNT/probe") + 3000))
 rm -f "$MNT/probe"
