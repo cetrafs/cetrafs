@@ -601,6 +601,7 @@ void cetrafs_ns_stamp_advance(cetrafs_inode_t *rec)
 struct cetrafs_birth_ctx {
     const u8 *seed; /* sector 0 as the creator judged it */
     u32 me;
+    u32 my_incarnation;
     bool lost; /* the verdict travels here: a >0 mutate return is flattened to success */
 };
 
@@ -618,6 +619,7 @@ static int cetrafs_birth_claim_mutate(void *image, unsigned int len, void *priv)
     memset(&rec, 0, sizeof(rec));
     memcpy(&rec, image, CETRAFS_INODE_NS_BYTES);
     rec.ns_lock_owner = cetrafs_cpu_to_le32(ctx->me);
+    rec.ns_lock_incarnation = cetrafs_cpu_to_le32(ctx->my_incarnation);
     cetrafs_ns_stamp_advance(&rec);
     cetrafs_inode_stamp_crc_ns(&rec);
     memcpy(image, &rec, CETRAFS_INODE_NS_BYTES);
@@ -629,7 +631,7 @@ static int cetrafs_birth_claim_mutate(void *image, unsigned int len, void *priv)
  * *out_lost when a reclaim got to the record first. */
 int cetrafs_inode_birth_claim(struct super_block *sb, u64 ino, const cetrafs_inode_t *seed, bool *out_lost)
 {
-    struct cetrafs_birth_ctx ctx = {.seed = (const u8 *) seed};
+    struct cetrafs_birth_ctx ctx = {.seed = (const u8 *) seed, .my_incarnation = cetrafs_sb_incarnation(sb)};
     u64 lba = cetrafs_inode_lba(sb, ino);
     int ret;
 
@@ -653,6 +655,7 @@ struct cetrafs_reclaim_ctx {
     u64 seq; /* claim: out, the stamp it wrote; release: in, the stamp required */
     u64 expect_seq; /* claim, steal: the stamp the verdict read */
     u32 me;
+    u32 my_incarnation;
     u32 steal_from; /* steal: the claimant judged stale and fenced */
     int mode;
 };
@@ -684,6 +687,7 @@ static int cetrafs_reclaim_mutate(void *image, unsigned int len, void *priv)
             cetrafs_le64(rec.dirent_seq) != ctx->expect_seq)
             return -ESTALE;
         rec.ns_lock_owner = cetrafs_cpu_to_le32(ctx->me);
+        rec.ns_lock_incarnation = cetrafs_cpu_to_le32(ctx->my_incarnation);
         break;
     case CETRAFS_RECLAIM_STEAL:
         /* A free whose claimant went stale holding it, judged at this
@@ -692,6 +696,7 @@ static int cetrafs_reclaim_mutate(void *image, unsigned int len, void *priv)
             cetrafs_le64(rec.dirent_seq) != ctx->expect_seq)
             return -ESTALE;
         rec.ns_lock_owner = cetrafs_cpu_to_le32(ctx->me);
+        rec.ns_lock_incarnation = cetrafs_cpu_to_le32(ctx->my_incarnation);
         break;
     case CETRAFS_RECLAIM_FORGET:
         /* Our claim, as we left it: the record's last reference to a
@@ -707,11 +712,13 @@ static int cetrafs_reclaim_mutate(void *image, unsigned int len, void *priv)
         if (cetrafs_le32(rec.ns_lock_owner) != ctx->me || cetrafs_le64(rec.dirent_seq) != ctx->seq)
             return -ESTALE;
         rec.ns_lock_owner = cetrafs_cpu_to_le32(CETRAFS_NODE_ID_NONE);
+        rec.ns_lock_incarnation = cetrafs_cpu_to_le32(0);
         break;
     default: /* CETRAFS_RECLAIM_BIRTH_ABORT: a create that claimed and failed */
         if (cetrafs_le32(rec.ns_lock_owner) != ctx->me || cetrafs_le32(rec.nlink) != 0)
             return -ESTALE;
         rec.ns_lock_owner = cetrafs_cpu_to_le32(CETRAFS_NODE_ID_NONE);
+        rec.ns_lock_incarnation = cetrafs_cpu_to_le32(0);
         break;
     }
     cetrafs_ns_stamp_advance(&rec);
@@ -736,7 +743,8 @@ int cetrafs_inode_reclaim_claim_at(struct super_block *sb, u64 ino, u64 generati
                                    u32 from)
 {
     struct cetrafs_reclaim_ctx ctx = {.generation = generation, .mode = mode, .seq = seq ? *seq : 0,
-                                      .expect_seq = expect, .steal_from = from};
+                                      .expect_seq = expect, .steal_from = from,
+                                      .my_incarnation = cetrafs_sb_incarnation(sb)};
     u64 lba = cetrafs_inode_lba(sb, ino);
     int ret;
 

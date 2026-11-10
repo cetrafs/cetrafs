@@ -122,8 +122,9 @@ int main(int argc, char **argv)
         cetrafs_node_journal_hdr_t flag;
         pread_all(fd, &flag, sizeof(flag), (off_t) area_start * CETRAFS_BLOCK_SIZE);
         close(fd);
-        printf("state=%u replay_owner=%u claimed=%" PRIu64 "\n", cetrafs_le32(flag.state),
-               cetrafs_le32(flag.replay_owner), (uint64_t) cetrafs_le64(flag.replay_claimed));
+        printf("state=%u replay_owner=%u claimed=%" PRIu64 " incarnation=%u\n", cetrafs_le32(flag.state),
+               cetrafs_le32(flag.replay_owner), (uint64_t) cetrafs_le64(flag.replay_claimed),
+               cetrafs_le32(flag.replay_incarnation));
         return 0;
     }
 
@@ -138,6 +139,9 @@ int main(int argc, char **argv)
             flag.state = cetrafs_cpu_to_le32(CETRAFS_NODE_JOURNAL_DIRTY);
             flag.replay_owner = cetrafs_cpu_to_le32((uint32_t) strtoul(argv[4], NULL, 0));
             flag.replay_claimed = cetrafs_cpu_to_le64(1); /* nonzero, forensics only */
+            /* The claimant's incarnation, format 0x000A: JOURNAL_POKE_INC=<n>, default 0. */
+            flag.replay_incarnation = cetrafs_cpu_to_le32(
+                getenv("JOURNAL_POKE_INC") ? (uint32_t) strtoul(getenv("JOURNAL_POKE_INC"), NULL, 0) : 0);
         }
         pwrite_all(fd, &flag, sizeof(flag), (off_t) area_start * CETRAFS_BLOCK_SIZE);
         close(fd);

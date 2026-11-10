@@ -23,10 +23,14 @@
 #  B. presence: the same for a reader bit.
 #  C. control: row 1 re-attaches AND re-takes the lock (new incarnation)
 #     -- the write-open is refused and the lock stays row 1's.
+#  D. namespace lock: row 1 re-attaches without re-taking a directory's
+#     namespace lock -- a create there takes it and completes, and row 1
+#     is not handed it back. (reclaim_vs_reattach covers the re-take.)
 #
 # DISCRIMINATION: with the swap comparing the row only and the
-# hb_seq-based give-back (the code before 0x000A), A and B fail: the
-# open is refused and the claim handed back to row 1.
+# hb_seq-based give-back (the code before 0x000A), A, B and D fail: the
+# open is refused, the create waits out the stale window, and the claim
+# is handed back to row 1.
 set -euo pipefail
 . "$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)/lib/harness.sh"
 require_root
@@ -43,7 +47,8 @@ ct_track mnt "$MNT"
 ct_mount "$DEV" "$MNT"
 require_cetrafs_mount "$MNT"
 for f in a b c; do dd if=/dev/zero of="$MNT/$f" bs=4096 count=2 conv=fsync status=none; done
-IA="$(stat -c %i "$MNT/a")"; IB="$(stat -c %i "$MNT/b")"; IC="$(stat -c %i "$MNT/c")"
+mkdir "$MNT/d"
+IA="$(stat -c %i "$MNT/a")"; IB="$(stat -c %i "$MNT/b")"; IC="$(stat -c %i "$MNT/c")"; ID="$(stat -c %i "$MNT/d")"
 ME="$(sed -n "s/^this_node_id: //p" "$(ct_procdir "$DEV")/info")"
 ct_umount "$MNT"
 
@@ -53,7 +58,9 @@ ct_umount "$MNT"
 INODE_LOCK_POKE_INC=111 "$LPOKE" "$IMG" "$IA" 1 1 >/dev/null
 INODE_LOCK_POKE_INC=111 "$LPOKE" "$IMG" "$IB" --reader 1 >/dev/null
 INODE_LOCK_POKE_INC=111 "$LPOKE" "$IMG" "$IC" 1 1 >/dev/null
-grep -q "lock_inc=111 " <<<"$("$LPOKE" "$IMG" "$IA" --incs)" && grep -q "reader_inc=1:111," <<<"$("$LPOKE" "$IMG" "$IB" --incs)" ||
+INODE_LOCK_POKE_INC=111 "$LPOKE" "$IMG" "$ID" --ns 1 >/dev/null
+grep -q "lock_inc=111 " <<<"$("$LPOKE" "$IMG" "$IA" --incs)" && grep -q "reader_inc=1:111," <<<"$("$LPOKE" "$IMG" "$IB" --incs)" &&
+    grep -q " ns_inc=111 " <<<"$("$LPOKE" "$IMG" "$ID" --incs)" ||
     { fail "setup: the claims of incarnation 111 are not on the device"; ct_exit; }
 ct_mount "$DEV" "$MNT"
 
@@ -109,8 +116,23 @@ L="$("$LPOKE" "$IMG" "$IC")"
     fail "C: the write-open took a lock row 1 holds at its new incarnation"
 grep -q "owner=1 mode=1" <<<"$L" && grep -q "lock_inc=444 " <<<"$("$LPOKE" "$IMG" "$IC" --incs)" &&
     pass "C: and the lock is still row 1's, incarnation 444" || fail "C: the re-taken lock was disturbed: $L"
-
 "$LPOKE" "$IMG" "$IC" 0xFFFF 0 >/dev/null
+"$NPOKE" "$IMG" 1 1 bb 0 >/dev/null; "$NPOKE" "$IMG" 1 --inc 111 >/dev/null
+
+# ------------------------------------------------------------------- D
+log "D: row 1 re-attaches without re-taking a directory's namespace lock"
+ct_param_set reclaim_stall_before_swap_ms 2000
+reattach 555 true
+B=$!
+RC=0; timeout 10 touch "$MNT/d/new" 2>/dev/null || RC=$?
+wait "$B" || true
+ct_param_set reclaim_stall_before_swap_ms 0
+L="$("$LPOKE" "$IMG" "$ID")"
+[ "$RC" = 0 ] && pass "D: the create took the dead incarnation's namespace lock" ||
+    fail "D: the create did not complete in 10 s (rc=$RC): $L"
+grep -q "ns_owner=1 " <<<"$L" && fail "D: the namespace lock was handed back to row 1, which never re-took it: $L" ||
+    pass "D: row 1 was not handed a namespace lock no operation of its holds"
+
 "$NPOKE" "$IMG" 1 0 00 0 >/dev/null
 ct_umount "$MNT"
 ct_exit

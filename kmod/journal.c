@@ -241,8 +241,9 @@ struct cetrafs_journal_claim_ctx {
     bool set_clean; /* release: also park the flag at CLEAN */
     bool steal;     /* claim: allowed to displace steal_from */
     u32 steal_from;
-    bool displaced; /* claim, out: the swap took it FROM steal_from */
-    bool give_back; /* hand a claim we just took back to steal_from */
+    u32 steal_incarnation; /* claim: ... at the incarnation judged (F10) */
+    u32 my_incarnation;    /* claim: stamped; release: old_only compares */
+    bool old_only;         /* release: only an EARLIER incarnation's claim */
 };
 
 static int cetrafs_journal_claim_mutate(void *image, unsigned int len, void *priv)
@@ -255,17 +256,13 @@ static int cetrafs_journal_claim_mutate(void *image, unsigned int len, void *pri
     if (cetrafs_le32(hdr->magic) != CETRAFS_NODE_JOURNAL_MAGIC)
         return -EEXIST; /* never written, or not ours to touch */
 
-    if (ctx->give_back) {
-        if (cetrafs_le32(hdr->replay_owner) != ctx->my_node_id)
-            return 1; /* moved on since: nothing of ours to undo */
-        hdr->replay_owner = cetrafs_cpu_to_le32(ctx->steal_from);
-        return 0;
-    }
-
     if (ctx->release) {
         if (cetrafs_le32(hdr->replay_owner) != ctx->my_node_id)
             return 1; /* not ours any more -- nothing to hand back */
+        if (ctx->old_only && cetrafs_le32(hdr->replay_incarnation) == ctx->my_incarnation)
+            return 1; /* this mount's own replay's */
         hdr->replay_owner = cetrafs_cpu_to_le32(CETRAFS_NODE_ID_NONE);
+        hdr->replay_incarnation = 0;
         hdr->replay_claimed = 0;
         if (ctx->set_clean)
             hdr->state = CETRAFS_NODE_JOURNAL_CLEAN;
@@ -276,12 +273,12 @@ static int cetrafs_journal_claim_mutate(void *image, unsigned int len, void *pri
         return -EEXIST; /* someone replayed it out from under us */
 
     if (cetrafs_le32(hdr->replay_owner) != CETRAFS_NODE_ID_NONE && cetrafs_le32(hdr->replay_owner) != ctx->my_node_id &&
-        !(ctx->steal && cetrafs_le32(hdr->replay_owner) == ctx->steal_from))
-        return -EEXIST; /* a live replayer owns it */
+        !(ctx->steal && cetrafs_le32(hdr->replay_owner) == ctx->steal_from &&
+          cetrafs_le32(hdr->replay_incarnation) == ctx->steal_incarnation))
+        return -EEXIST; /* a live replayer owns it (or the judged one came back and re-took it) */
 
-    /* Per attempt: the image that lands is the last one mutated. */
-    ctx->displaced = ctx->steal && cetrafs_le32(hdr->replay_owner) == ctx->steal_from;
     hdr->replay_owner = cetrafs_cpu_to_le32(ctx->my_node_id);
+    hdr->replay_incarnation = cetrafs_cpu_to_le32(ctx->my_incarnation);
     hdr->replay_claimed = cetrafs_cpu_to_le64((u64) ktime_get_real_seconds());
     return 0;
 }
@@ -360,10 +357,10 @@ MODULE_PARM_DESC(journal_sweep_skip, "TEST ONLY: leave the replay claims a previ
 /* 0 = claimed, -EEXIST = someone else is handling it (or nothing to do). */
 static int cetrafs_journal_claim_replay(struct super_block *sb, u64 area_start, u32 my_node_id)
 {
-    struct cetrafs_journal_claim_ctx ctx = {.my_node_id = my_node_id};
+    struct cetrafs_journal_claim_ctx ctx = {.my_node_id = my_node_id, .my_incarnation = cetrafs_sb_incarnation(sb)};
     struct buffer_head *bh;
     const cetrafs_node_journal_hdr_t *hdr;
-    u32 owner;
+    u32 owner, owner_inc;
     int ret;
 
     bh = cetrafs_bread_uncached_retry(sb, area_start);
@@ -371,6 +368,7 @@ static int cetrafs_journal_claim_replay(struct super_block *sb, u64 area_start, 
         return -EIO;
     hdr = (const cetrafs_node_journal_hdr_t *) bh->b_data;
     owner = cetrafs_le32(hdr->replay_owner);
+    owner_inc = cetrafs_le32(hdr->replay_incarnation);
     brelse(bh);
 
     if (owner != CETRAFS_NODE_ID_NONE && owner != my_node_id) {
@@ -390,34 +388,14 @@ static int cetrafs_journal_claim_replay(struct super_block *sb, u64 area_start, 
         }
         ctx.steal = true;
         ctx.steal_from = owner;
+        ctx.steal_incarnation = owner_inc;
         cetrafs_node_test_stall_before_swap();
     }
 
     ret = cetrafs_cas_record(sb, area_start, cetrafs_journal_claim_mutate, &ctx);
-    /*
-     * Was the replayer we displaced still the incarnation the fence
-     * revoked? The swap compares its row NUMBER only, and a replayer that
-     * re-attached and took this claim again wrote the very bytes it
-     * compares -- two replayers of one area, which is what the claim
-     * exists to prevent. Give it back and leave the area to it, as for
-     * any live replayer; a give-back that does not land leaves two, so
-     * the mount stops. Only a displacement is undone: a claim the
-     * re-attach's sweep had already handed back was free to take
-     * (lock.c's cetrafs_lock_undo_steal() has the full account).
-     */
-    if (ret == 0 && ctx.displaced && cetrafs_node_reattached_since_fence(sb, owner)) {
-        struct cetrafs_journal_claim_ctx g = {.my_node_id = my_node_id, .give_back = true, .steal_from = owner};
-        int gret = cetrafs_cas_record_nointr(sb, area_start, cetrafs_journal_claim_mutate, &g);
-
-        if (gret < 0)
-            cetrafs_sb_fatal(sb, "journal: area %llu: node %u came back while its replay claim was being taken, "
-                             "and the claim could not be given back (%d)",
-                             (unsigned long long) area_start, owner, gret);
-        else
-            pr_warn("journal: area %llu: node %u came back while its replay claim was being taken -- gave it back\n",
-                    (unsigned long long) area_start, owner);
-        return -EEXIST;
-    }
+    /* The swap compares the replayer's incarnation as well as its row:
+     * one that re-attached and claimed the area again is live, and the
+     * claim answers -EEXIST, leaving the area to it (F10). */
     return ret;
 }
 
@@ -532,7 +510,12 @@ void cetrafs_journal_free(struct cetrafs_journal *j)
 int cetrafs_journal_sweep_own_claims(struct super_block *sb, u32 my_node_id)
 {
     const cetrafs_superblock_t *raw_sb = cetrafs_sb_raw(sb);
-    struct cetrafs_journal_claim_ctx ctx = {.my_node_id = my_node_id, .release = true};
+    struct cetrafs_journal_claim_ctx ctx = {
+        .my_node_id = my_node_id,
+        .release = true,
+        .old_only = true,
+        .my_incarnation = cetrafs_sb_incarnation(sb),
+    };
     u32 n, count;
 
     if (!raw_sb)

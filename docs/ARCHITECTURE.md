@@ -233,7 +233,9 @@ decides whether *another* node's row still counts as a live claim.
 Each Node Registry row owns a private journal slice at
 `node_journal_start + node_id * node_journal_blocks`: one
 `cetrafs_node_journal_hdr_t` flag block (its `state` is CLEAN/DIRTY, and
-`replay_owner` is CAS-claimed so exactly one node replays a dead peer's area)
+`replay_owner` is CAS-claimed so exactly one node replays a dead peer's area,
+and `replay_incarnation` names the claimant's incarnation: a stale replayer's
+claim is taken only while it is the incarnation judged)
 followed by 2-block slots. Because a node only ever logs to its own slice, each
 area is single-writer by construction.
 
@@ -309,6 +311,7 @@ CRC32C, computed by `mkfs` and verified by `fsck`.
 | xattr_block | external xattr block, or 0. Lazily allocated by `kmod/xattr.c` on the first set; freed and reset to 0 when the last entry is removed. One block, no chaining |
 | lock_owner_node, lock_mode | whole-file cross-node exclusive open lock (`kmod/lock.c`): `lock_owner_node` is a Node Registry row index (`CETRAFS_NODE_ID_NONE` while unlocked), `lock_mode` is `_NONE`/`_EXCLUSIVE`. A write-open claims it; any open from a *live* different node while locked gets `-ETXTBSY`; a stale holder's lock is reclaimed. Whole-file (VMFS-style), not POSIX byte-range. Reclaim keys off the owner's Node Registry row, so a long-held write-open never ages out on its own |
 | ns_lock_owner | per-inode namespace lock (`kmod/nslock.c`): a *held* cross-node mutex scoping one namespace operation to the record(s) it mutates, CAS'd on the inode's own hot sector. `CETRAFS_NODE_ID_NONE` when unlocked (note: `0xFFFF`, not 0 — every creation site sets it explicitly) |
+| ns_lock_incarnation | the holder's incarnation behind `ns_lock_owner`, 0 while unlocked (0x000A). A dead holder's namespace lock is broken only while it still carries the incarnation judged (F10) |
 | read_open_nodes | presence bitmask (bit N = Node Registry row N has it open for read); set by CAS on a node's first read-open, cleared on its last. Lets unlink/rename refuse to destroy a file a live peer is still reading (`-ETXTBSY`). Caps the cluster at `CETRAFS_MAX_READER_NODES` |
 | lock_owner_incarnation, read_open_incarnation[64] | the incarnation (the holder row's `incarnation`) behind the file lock and behind each set presence bit, 0 where there is no claim (0x000A). A reclaim takes a dead holder's claim only while it still carries the incarnation it judged: one the node took again after re-attaching carries a new one and is left alone, and nothing is given back afterwards (F10). The own-claim sweeps clear only an earlier incarnation's claims |
 | suspended_writer_nodes | which `read_open_nodes` bits are a WRITER that suspended its automatic lock for a handoff (`flock(LOCK_UN)` on a default mount) rather than a reader; always a subset of `read_open_nodes`. Lets the handoff's destination claim the lock past the source while a real reader still keeps a writer out (docs/internal/BASICS.md). Carved from the sector's zero padding: an older record reads "none" |

@@ -486,7 +486,12 @@ typedef struct {
      * while state == DIRTY; a zero-filled (never-written) flag block
      * reads as CLEAN, so the 0 there is never mistaken for node 0. */
     __le32 replay_owner;
-    u32 pad_a;
+    /* The incarnation (cetrafs_node_entry_t.incarnation) of replay_owner
+     * that took the claim; 0 while unclaimed (format 0x000A). A stale
+     * replayer's claim is taken only while it still carries the
+     * incarnation judged: one that re-attached and claimed again is a
+     * live replayer (F10). */
+    __le32 replay_incarnation;
     __le64 replay_claimed; /* unix seconds, for forensics */
 
     u8  pad[CETRAFS_BLOCK_SIZE - 24];
@@ -1351,7 +1356,11 @@ typedef struct {
      * a waiter that finds its registry row stale (journal replayed
      * first). CETRAFS_NODE_ID_NONE (0xFFFF, NOT 0) means unlocked. */
     __le32 ns_lock_owner;
-    u32 ns_lock_reserved;         /* alignment, keep 0 */
+    /* The incarnation (cetrafs_node_entry_t.incarnation) of ns_lock_owner
+     * that took the namespace lock; 0 while unlocked (format 0x000A). A
+     * dead holder's lock is broken only while it still carries the
+     * incarnation judged (F10, as for lock_owner_incarnation below). */
+    __le32 ns_lock_incarnation;
 
     /* Which nodes hold this file open FOR READ (bit N = registry row N).
      * One CAW on a node's first read-open / last read-close; what stops

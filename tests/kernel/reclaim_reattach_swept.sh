@@ -10,7 +10,8 @@
 # owner. Giving back a lock the swap found FREE handed the live node a
 # lock no open of its holds: nothing ever released it, and every open of
 # the file, or every create in the directory, was refused until that
-# node unmounted. A claim now gives back only what it displaced.
+# node unmounted. Since format 0x000A nothing is given back at all: the
+# swap compares the incarnation that took the claim (reclaim_incarnation).
 #
 # Staged as reclaim_vs_reattach.sh stages it: registry row 1 is a
 # departed node holding the file lock and a directory's namespace lock;
@@ -19,8 +20,8 @@
 # cleared -- the re-attach and its sweep. (Earlier, between fence and
 # replay, the replay itself sees the re-attach and refuses.)
 #
-# DISCRIMINATION: proven by removing the displacement test from the
-# give-back conditions (lock.c open and flock, nslock.c): the write-open
+# DISCRIMINATION: proven (before 0x000A) by removing the displacement
+# test from the give-back conditions (lock.c open and flock, nslock.c): the write-open
 # is refused and the lock left with row 1; the create times out under a
 # namespace lock row 1 does not know it holds.
 set -euo pipefail

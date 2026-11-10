@@ -89,9 +89,8 @@ struct cetrafs_nslock_ctx {
     bool acquire;
     bool steal; /* acquire: allowed to displace steal_from */
     u32 steal_from;
-    bool displaced; /* acquire: the swap that landed took it FROM steal_from,
-                     * not a lock already free -- only then is there
-                     * anything to give back */
+    u32 steal_incarnation; /* acquire: ... at the incarnation judged (F10) */
+    u32 my_incarnation;    /* acquire: what the lock is stamped with */
     u32 clobbered; /* release: who held it, when it was no longer ours */
     bool not_ours; /* release: it was no longer ours -- the verdict. Not
                     * clobbered != NONE: a lock found CLEARED has
@@ -174,7 +173,10 @@ static int cetrafs_nslock_mutate(void *image, unsigned int len, void *priv)
     if (ctx->acquire) {
         bool free_now = (cetrafs_le32(rec.ns_lock_owner) == CETRAFS_NODE_ID_NONE);
         bool mine_already = (cetrafs_le32(rec.ns_lock_owner) == ctx->my_node_id);
-        bool stealable = ctx->steal && cetrafs_le32(rec.ns_lock_owner) == ctx->steal_from;
+        /* The judged holder at the judged incarnation: a lock it took
+         * again after re-attaching is a live holder's (F10). */
+        bool stealable = ctx->steal && cetrafs_le32(rec.ns_lock_owner) == ctx->steal_from &&
+                         cetrafs_le32(rec.ns_lock_incarnation) == ctx->steal_incarnation;
 
         /* "Already ours" is leftover state: from a previous
          * incarnation of this node (we crashed holding it and remounted
@@ -202,9 +204,8 @@ static int cetrafs_nslock_mutate(void *image, unsigned int len, void *priv)
         if (!free_now && ctx->sb && S_ISDIR(cetrafs_le32(rec.mode)))
             rec.dirent_seq = cetrafs_cpu_to_le64(cetrafs_inode_new_generation(ctx->sb));
 
-        /* Per attempt: the image that lands is the last one mutated. */
-        ctx->displaced = !free_now && !mine_already;
         rec.ns_lock_owner = cetrafs_cpu_to_le32(ctx->my_node_id);
+        rec.ns_lock_incarnation = cetrafs_cpu_to_le32(ctx->my_incarnation);
     } else {
         if (cetrafs_le32(rec.ns_lock_owner) != ctx->my_node_id) {
             /* Anomalous: the generation still matches, so this is the
@@ -249,6 +250,7 @@ static int cetrafs_nslock_mutate(void *image, unsigned int len, void *priv)
             rec.nlink = cetrafs_cpu_to_le32((u32) live);
         }
         rec.ns_lock_owner = cetrafs_cpu_to_le32(CETRAFS_NODE_ID_NONE);
+        rec.ns_lock_incarnation = cetrafs_cpu_to_le32(0);
     }
 
     cetrafs_inode_stamp_crc_ns(&rec);
@@ -327,40 +329,17 @@ out:
 }
 
 
-/* Put a broken namespace lock back to the holder it was taken from,
- * only while it is still ours (cetrafs_nslock_try()). */
-struct cetrafs_nslock_giveback_ctx {
-    u64 generation;
-    u32 from, to;
-};
-
-static int cetrafs_nslock_giveback_mutate(void *image, unsigned int len, void *priv)
-{
-    struct cetrafs_nslock_giveback_ctx *g = priv;
-    cetrafs_inode_t rec;
-
-    if (len < CETRAFS_INODE_NS_BYTES)
-        return -EINVAL;
-    memset(&rec, 0, sizeof(rec));
-    memcpy(&rec, image, CETRAFS_INODE_NS_BYTES);
-    if (cetrafs_inode_crc_ns(&rec) != (u32) cetrafs_le64(rec.ns_checksum))
-        return -EUCLEAN;
-    if (cetrafs_le64(rec.generation) != g->generation)
-        return -ESTALE;
-    if (cetrafs_le32(rec.ns_lock_owner) != g->from)
-        return 1; /* moved on: nothing of ours to undo */
-    rec.ns_lock_owner = cetrafs_cpu_to_le32(g->to);
-    cetrafs_inode_stamp_crc_ns(&rec);
-    memcpy(image, &rec, CETRAFS_INODE_NS_BYTES);
-    return 0;
-}
-
 /* One acquire attempt. Returns 0 on success, -EBUSY if a live peer holds
  * it, or another errno. */
 static int cetrafs_nslock_try(struct inode *inode, u32 my_node_id)
 {
     struct super_block *sb = inode->i_sb;
-    struct cetrafs_nslock_ctx ctx = {.my_node_id = my_node_id, .acquire = true, .sb = inode->i_sb};
+    struct cetrafs_nslock_ctx ctx = {
+        .my_node_id = my_node_id,
+        .my_incarnation = cetrafs_sb_incarnation(inode->i_sb),
+        .acquire = true,
+        .sb = inode->i_sb,
+    };
     cetrafs_inode_t raw;
     int ret;
 
@@ -412,6 +391,7 @@ static int cetrafs_nslock_try(struct inode *inode, u32 my_node_id)
                 raw.ns_lock_owner);
         ctx.steal = true;
         ctx.steal_from = cetrafs_le32(raw.ns_lock_owner);
+        ctx.steal_incarnation = cetrafs_le32(raw.ns_lock_incarnation);
     }
 
     /* The CAS is the acquire: it only lands if the record still shows
@@ -422,37 +402,10 @@ static int cetrafs_nslock_try(struct inode *inode, u32 my_node_id)
         cetrafs_node_test_stall_before_swap();
     ret = cetrafs_cas_record_seeded(sb, cetrafs_inode_lba(sb, inode->i_ino), &raw, CETRAFS_INODE_NS_BYTES,
                                     cetrafs_nslock_mutate, &ctx);
-    /*
-     * A broken lock: was its holder still the incarnation the fence
-     * revoked? The swap compares the holder's row NUMBER only, after a
-     * fence and a journal replay; a holder that re-attached, swept and
-     * took this lock again in that time wrote the very bytes it compares
-     * (lock.c's cetrafs_lock_undo_steal() has the full account). Give it
-     * back and wait, as for any live holder; a give-back that does not
-     * land would leave two namespace writers, so the mount stops.
-     *
-     * Only if the swap DISPLACED it. A holder that re-attached and swept
-     * its leftover claims first left the lock free, and the swap took a
-     * free lock: giving that one "back" hands a live node a lock it does
-     * not know it holds, which nothing on it ever releases.
-     */
-    if (ret == 0 && ctx.steal && ctx.displaced && cetrafs_node_reattached_since_fence(sb, ctx.steal_from)) {
-        struct cetrafs_nslock_giveback_ctx g = {
-            .generation = ctx.generation,
-            .from = my_node_id,
-            .to = ctx.steal_from,
-        };
-        int gret = cetrafs_cas_record_nointr(sb, cetrafs_inode_lba(sb, inode->i_ino), cetrafs_nslock_giveback_mutate, &g);
-
-        if (gret < 0)
-            cetrafs_sb_fatal(sb, "nslock: ino=%llu: node %u came back while its namespace lock was being broken, and "
-                             "the lock could not be given back (%d)",
-                             (unsigned long long) inode->i_ino, ctx.steal_from, gret);
-        else
-            pr_warn("nslock: ino=%llu: node %u came back while its namespace lock was being broken -- gave it back\n",
-                    (unsigned long long) inode->i_ino, ctx.steal_from);
-        return -EBUSY;
-    }
+    /* A broken lock is the judged incarnation's or nothing: the swap
+     * compares the holder's incarnation, so one that re-attached and
+     * took this lock again answers -EBUSY above, a live holder, and
+     * there is nothing to give back (F10). */
     return ret;
 }
 

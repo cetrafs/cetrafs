@@ -4005,8 +4005,10 @@ static int cetrafs_own_claims_mutate(void *image, unsigned int len, void *priv)
         rec.suspended_writer_nodes = cetrafs_cpu_to_le64(cetrafs_le64(rec.suspended_writer_nodes) & ~bit);
         changed = true;
     }
-    if (cetrafs_le32(rec.ns_lock_owner) == ctx->me) {
+    if (cetrafs_le32(rec.ns_lock_owner) == ctx->me &&
+        cetrafs_le32(rec.ns_lock_incarnation) != ctx->my_incarnation) {
         rec.ns_lock_owner = cetrafs_cpu_to_le32(CETRAFS_NODE_ID_NONE);
+        rec.ns_lock_incarnation = cetrafs_cpu_to_le32(0);
         cetrafs_ns_stamp_advance(&rec); /* as a peer's steal of a dead holder's lock does */
         changed = true;
     }
@@ -4166,9 +4168,12 @@ int cetrafs_lock_sweep_own_claims(struct super_block *sb, u32 my_node_id)
  * The mount-time sweep above clears every claim of the previous
  * incarnation, but it cannot see one given back AFTER it passed: a peer
  * that displaced this node's lock while it was down, then found the row
- * re-attached and undid its steal (the give-back that format 0x000A's
- * incarnations retired for locks and presence bits), hands
- * the lock to an incarnation that never opened the file. Nothing local
+ * re-attached and undid its steal, handed the lock to an incarnation
+ * that never opened the file. Format 0x000A's incarnations retired that
+ * give-back for every claim kind (locks, presence bits, namespace locks,
+ * replay claims); this pass stays as the backstop for a claim the old
+ * incarnation had queued to the device past its fence, which lands
+ * after the mount sweep with that incarnation's stamp. Nothing local
  * holds it, so nothing local releases it, and the row is live, so no
  * peer reclaims it -- the file is refused to writers until this node
  * happens to open and close it. The give-back follows the steal by at

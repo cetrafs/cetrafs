@@ -141,7 +141,8 @@ int main(int argc, char **argv)
         /* The incarnation behind each claim: "lock_inc=<n> reader_inc=<bit>:<n>,..." */
         uint64_t m = cetrafs_le64(in.read_open_nodes);
 
-        printf("lock_inc=%u reader_inc=", cetrafs_le32(in.lock_owner_incarnation));
+        printf("lock_inc=%u ns_inc=%u reader_inc=", cetrafs_le32(in.lock_owner_incarnation),
+               cetrafs_le32(in.ns_lock_incarnation));
         for (unsigned b = 0; b < 64; b++)
             if (m & (1ULL << b))
                 printf("%u:%u,", b, cetrafs_le32(in.read_open_incarnation[b]));
@@ -207,6 +208,8 @@ int main(int argc, char **argv)
         in.read_open_incarnation[strtoul(argv[4], NULL, 0) % 64] = cetrafs_cpu_to_le32(plant_inc);
     } else if (ns_mode) {
         in.ns_lock_owner = cetrafs_cpu_to_le32((uint32_t) strtoul(argv[4], NULL, 0));
+        in.ns_lock_incarnation =
+            cetrafs_cpu_to_le32(cetrafs_le32(in.ns_lock_owner) == CETRAFS_NODE_ID_NONE ? 0 : plant_inc);
     } else {
         owner = (uint32_t) strtoul(argv[3], NULL, 0);
         lock_mode = (uint32_t) strtoul(argv[4], NULL, 0);

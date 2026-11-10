@@ -1,6 +1,6 @@
 #!/usr/bin/env bash
 # SPDX-License-Identifier: GPL-2.0-or-later
-# a reclaim that races its holder's re-attach gives the claim back
+# a reclaim that races its holder's re-attach leaves a re-taken claim alone
 #
 # Reclaiming a dead node's claim is: judge its row stale, fence it
 # (bound to the incarnation judged), replay its journal, then CAS the
@@ -10,13 +10,11 @@
 # CAS took a LIVE node's file lock, its reader bit, or its namespace
 # lock, and neither side could tell (audit R8).
 #
-# The file lock and presence bits now carry the incarnation that took
-# them (format 0x000A), and the swap compares it: a claim the holder
-# took again after re-attaching carries its new incarnation and cannot
-# be displaced (reclaim_incarnation covers the other half, a re-attach
-# that did not re-take). The namespace lock is still followed by a
-# re-read of the holder's row: if its hb_seq moved past the one the
-# fence landed on, the claim is given back.
+# The file lock, presence bits and namespace lock now carry the
+# incarnation that took them (format 0x000A), and the swap compares it:
+# a claim the holder took again after re-attaching carries its new
+# incarnation and cannot be displaced (reclaim_incarnation covers the
+# other half, a re-attach that did not re-take).
 #
 # The holder is registry row 1, a departed node (stale at once); its
 # re-attach is a beat and a new incarnation poked onto its row while the
@@ -55,7 +53,7 @@ ct_umount "$MNT"
 "$NPOKE" "$IMG" 1 --inc 100 >/dev/null
 INODE_LOCK_POKE_INC=100 "$LPOKE" "$IMG" "$I_LOCK" 1 1 >/dev/null
 INODE_LOCK_POKE_INC=100 "$LPOKE" "$IMG" "$I_READ" --reader 1 >/dev/null
-"$LPOKE" "$IMG" "$I_DIR" --ns 1 >/dev/null
+INODE_LOCK_POKE_INC=100 "$LPOKE" "$IMG" "$I_DIR" --ns 1 >/dev/null
 ct_mount "$DEV" "$MNT"
 
 # reattach_during <retake> <cmd...>: run <cmd> with the reclaim held
@@ -103,21 +101,23 @@ grep -q "readers=0x2" <<<"$L" && pass "reader: its bit is set again ($L)" ||
 # 3. A directory's namespace lock: a create breaks it. Bounded: the
 # acquire keeps trying while the holder looks live.
 ct_param_set reclaim_stall_after_fence_ms 2000
-( sleep 0.8; "$NPOKE" "$IMG" 1 --beat >/dev/null 2>&1; for _ in $(seq 1 30); do sleep 1; "$NPOKE" "$IMG" 1 --beat >/dev/null 2>&1; done ) &
+( sleep 0.8; "$NPOKE" "$IMG" 1 --beat >/dev/null 2>&1; "$NPOKE" "$IMG" 1 --inc 200 >/dev/null 2>&1
+  INODE_LOCK_POKE_INC=200 "$LPOKE" "$IMG" "$I_DIR" --ns 1 >/dev/null 2>&1
+  for _ in $(seq 1 30); do sleep 1; "$NPOKE" "$IMG" 1 --beat >/dev/null 2>&1; done ) &
 B=$!
 RC=0
 timeout 25 touch "$MNT/d/new" 2>/dev/null || RC=$?
-kill "$B" 2>/dev/null; wait "$B" 2>/dev/null || true
+kill "$B" 2>/dev/null || true; wait "$B" 2>/dev/null || true
 ct_param_set reclaim_stall_after_fence_ms 0
 L="$(lockf "$I_DIR")"
 log "nslock: create rc=$RC; $L"
-grep -q "ns_owner=1 " <<<"$L" && pass "nslock: the namespace lock is the holder's again ($L)" ||
+grep -q "ns_owner=1 " <<<"$L" && grep -q " ns_inc=200 " <<<"$("$LPOKE" "$IMG" "$I_DIR" --incs)" &&
+    pass "nslock: the namespace lock is still the holder's, incarnation 200 ($L)" ||
     fail "nslock: the re-attached holder's namespace lock was taken: $L"
 [ "$RC" != 0 ] && pass "nslock: the create did not go through under a live holder" ||
     fail "nslock: the create completed under a namespace lock a live node holds"
 
-dmesg | tail -40 | grep -q "came back while its" && pass "and the give-backs were logged" ||
-    fail "no give-back message in dmesg"
+INODE_LOCK_POKE_INC=0 "$LPOKE" "$IMG" "$I_DIR" --ns 0xFFFF >/dev/null
 
 # CONTROL: the file lock again, with the re-attach never detected
 # (reattach_after_fence_force=0, the pre-fix behaviour): the write-open
