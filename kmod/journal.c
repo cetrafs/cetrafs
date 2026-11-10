@@ -893,6 +893,12 @@ MODULE_PARM_DESC(journal_ignore_torn, "test-only: refuse to redo a torn target (
 static bool cetrafs_journal_ignore_kind;
 cetrafs_test_param(journal_ignore_kind, cetrafs_journal_ignore_kind, bool, 0644);
 MODULE_PARM_DESC(journal_ignore_kind, "test-only: redo a 'torn' target even when it is no longer a block of the entry's kind");
+/* TEST ONLY: redo without the owner check and without advancing the
+ * owner's change stamp -- the behaviour before L9 (the control of
+ * tests/kernel/journal_replay_owner.sh). */
+static bool cetrafs_journal_ignore_owner;
+cetrafs_test_param(journal_ignore_owner, cetrafs_journal_ignore_owner, bool, 0644);
+MODULE_PARM_DESC(journal_ignore_owner, "test-only: replay neither checks an entry's owner nor advances its stamp");
 
 static u64 cetrafs_journal_header_lba(const struct cetrafs_journal *j, u64 slot)
 {
@@ -1067,7 +1073,8 @@ static int cetrafs_journal_take_slot(struct super_block *sb, struct cetrafs_jour
  * unrepaired (CLAUDE.md rule 12). A field every entry needs goes here.
  */
 static void cetrafs_journal_stamp_header(struct cetrafs_journal *j, struct buffer_head *hbh, u32 flags, u64 txn_id,
-                                         u64 target_lba, u32 prev_crc, u32 payload_crc)
+                                         u64 target_lba, u32 prev_crc, u32 payload_crc,
+                                         struct cetrafs_journal_owner owner)
 {
     cetrafs_journal_header_t *hdr = (cetrafs_journal_header_t *) hbh->b_data;
 
@@ -1080,11 +1087,15 @@ static void cetrafs_journal_stamp_header(struct cetrafs_journal *j, struct buffe
     /* The session this entry belongs to: replay discards it once the
      * area has been parked since (cetrafs_node_journal_hdr_t). */
     hdr->park_seq = cetrafs_cpu_to_le64(READ_ONCE(j->park_seq));
+    /* Whose block it is: replay requires it still to be theirs (L9). */
+    hdr->owner_ino = cetrafs_cpu_to_le64(owner.ino);
+    hdr->owner_generation = cetrafs_cpu_to_le64(owner.generation);
     hdr->payload_checksum = cetrafs_cpu_to_le32(payload_crc);
     hdr->header_checksum = cetrafs_cpu_to_le32(cetrafs_journal_header_crc(hbh->b_data));
 }
 
-static int cetrafs_journal_write_block_flags(struct super_block *sb, struct buffer_head *bh, u32 flags, u32 prev_crc)
+static int cetrafs_journal_write_block_flags(struct super_block *sb, struct buffer_head *bh, u32 flags, u32 prev_crc,
+                                             struct cetrafs_journal_owner owner)
 {
     struct cetrafs_journal *j = cetrafs_sb_get_journal(sb);
 
@@ -1164,7 +1175,7 @@ static int cetrafs_journal_write_block_flags(struct super_block *sb, struct buff
          * over the caller's buffer, which is the image just copied into
          * the payload block and cannot change meanwhile: it is locked. */
         cetrafs_journal_stamp_header(j, hbh, flags, txn_id, bh->b_blocknr, prev_crc,
-                                     ~crc32c(~0U, bh->b_data, CETRAFS_BLOCK_SIZE));
+                                     ~crc32c(~0U, bh->b_data, CETRAFS_BLOCK_SIZE), owner);
         cetrafs_bh_end_update(hbh);
 
         {
@@ -1423,7 +1434,8 @@ static void cetrafs_journal_batch_retire(struct super_block *sb, struct cetrafs_
 
 /* One chunk of a deferred batch: k entries in k slots already taken. */
 static int cetrafs_journal_batch_chunk(struct super_block *sb, struct cetrafs_journal *j,
-                                       struct buffer_head **bhs, const u32 *disk_crc, unsigned int k,
+                                       struct buffer_head **bhs, const struct cetrafs_journal_owner *owners,
+                                       const u32 *disk_crc, unsigned int k,
                                        const u64 *slots, const u64 *txn, bool *written, u32 *wcrc)
 {
     struct buffer_head *pb[CETRAFS_JRNL_BATCH] = {}, *hb[CETRAFS_JRNL_BATCH] = {};
@@ -1453,7 +1465,8 @@ static int cetrafs_journal_batch_chunk(struct super_block *sb, struct cetrafs_jo
         /* prev: the DEVICE's image, recorded when the block was first held
          * back -- not the in-core one before the last edit, which never
          * reached the device and which a replay would never find. */
-        cetrafs_journal_stamp_header(j, hb[i], CETRAFS_JRNL_F_GUARDED, txn[i], bhs[i]->b_blocknr, disk_crc[i], pcrc);
+        cetrafs_journal_stamp_header(j, hb[i], CETRAFS_JRNL_F_GUARDED, txn[i], bhs[i]->b_blocknr, disk_crc[i], pcrc,
+                                     owners[i]);
         cetrafs_bh_end_update(hb[i]);
     }
     if (ok) {
@@ -1586,8 +1599,9 @@ static int cetrafs_journal_batch_chunk(struct super_block *sb, struct cetrafs_jo
  * says which reached the device; the rest stay held back for a retry.
  * mkfs -J 0 has no journal: step 0, then the targets in place.
  */
-int cetrafs_journal_write_deferred(struct super_block *sb, struct buffer_head **bhs, const u32 *disk_crc,
-                                   unsigned int n, bool *written, u32 *wcrc)
+int cetrafs_journal_write_deferred(struct super_block *sb, struct buffer_head **bhs,
+                                   const struct cetrafs_journal_owner *owners, const u32 *disk_crc, unsigned int n,
+                                   bool *written, u32 *wcrc)
 {
     struct cetrafs_journal *j = cetrafs_sb_get_journal(sb);
     unsigned int i, done = 0;
@@ -1640,8 +1654,8 @@ int cetrafs_journal_write_deferred(struct super_block *sb, struct buffer_head **
             }
             k++;
         }
-        ret = cetrafs_journal_batch_chunk(sb, j, bhs + done, disk_crc + done, k, slots, txn, written + done,
-                                          wcrc + done);
+        ret = cetrafs_journal_batch_chunk(sb, j, bhs + done, owners + done, disk_crc + done, k, slots, txn,
+                                          written + done, wcrc + done);
         if (ret)
             return ret;
         done += k;
@@ -1655,9 +1669,17 @@ int cetrafs_journal_write_deferred(struct super_block *sb, struct buffer_head **
  * cetrafs_bh_begin_update_crc(), which locks the buffer and snapshots it
  * in one call so the two cannot drift apart.
  */
-int cetrafs_journal_write_block(struct super_block *sb, struct buffer_head *bh, u32 prev_crc)
+int cetrafs_journal_write_block(struct super_block *sb, struct cetrafs_journal_owner owner, struct buffer_head *bh,
+                                u32 prev_crc)
 {
-    return cetrafs_journal_write_block_flags(sb, bh, CETRAFS_JRNL_F_GUARDED, prev_crc);
+    return cetrafs_journal_write_block_flags(sb, bh, CETRAFS_JRNL_F_GUARDED, prev_crc, owner);
+}
+
+struct cetrafs_journal_owner cetrafs_journal_owner_of(struct inode *inode)
+{
+    struct cetrafs_journal_owner o = {.ino = inode->i_ino, .generation = cetrafs_inode_get_generation(inode)};
+
+    return o;
 }
 
 /*
@@ -1745,7 +1767,40 @@ struct cetrafs_journal_replay_entry {
     u32 prev_checksum;
     u32 payload_checksum;
     bool before_park; /* from a session the area was parked after */
+    u64 owner_ino, owner_generation; /* whose block the target is (L9) */
 };
+
+/*
+ * Is the entry's target still a metadata block of the inode it was
+ * written for? Read fresh, immediately before the redo (rule 15). 1:
+ * yes; 0: no -- the owner is gone, reused, or no longer references the
+ * block, which has been freed and reallocated since with bytes that
+ * happen to pass the guard; -EIO: its record or tree could not be read.
+ * '*is_dir' is set whenever the record was read.
+ */
+static int cetrafs_journal_owner_holds(struct super_block *sb, const struct cetrafs_journal_replay_entry *e,
+                                       bool *is_dir)
+{
+    const cetrafs_superblock_t *raw_sb = cetrafs_sb_raw(sb);
+    cetrafs_inode_t raw;
+    bool held = false;
+    int ret;
+
+    *is_dir = false;
+    if (!e->owner_ino || !raw_sb || e->owner_ino > le32_to_cpu(raw_sb->inodes_count))
+        return 0; /* no writer of this format names no owner */
+    cetrafs_invalidate_raw_inode(sb, e->owner_ino);
+    ret = cetrafs_read_raw_inode(sb, e->owner_ino, &raw);
+    if (ret)
+        return -EIO;
+    *is_dir = S_ISDIR(cetrafs_le32(raw.mode));
+    if (cetrafs_le64(raw.generation) != e->owner_generation)
+        return 0; /* the number belongs to another file now */
+    ret = cetrafs_raw_inode_holds_meta_block(sb, &raw, e->target_lba, &held);
+    if (ret)
+        return -EIO;
+    return held ? 1 : 0;
+}
 
 static int cetrafs_journal_replay_cmp(const void *a, const void *b)
 {
@@ -2162,6 +2217,8 @@ static int __cetrafs_journal_replay_node(struct super_block *sb, u32 node_id, bo
         entries[count].prev_checksum = cetrafs_le32(hdr->prev_checksum);
         entries[count].payload_checksum = cetrafs_le32(hdr->payload_checksum);
         entries[count].before_park = false;
+        entries[count].owner_ino = cetrafs_le64(hdr->owner_ino);
+        entries[count].owner_generation = cetrafs_le64(hdr->owner_generation);
         count++;
         brelse(hbh);
     }
@@ -2171,7 +2228,7 @@ static int __cetrafs_journal_replay_node(struct super_block *sb, u32 node_id, bo
 
     for (s = 0; s < count; s++) {
         struct buffer_head *pbh, *tbh, *hbh;
-        bool apply;
+        bool apply, owner_dir = false, owner_known = false;
 
         if (entries[s].before_park) {
             atomic64_inc(&cetrafs_journal_replay_skipped);
@@ -2356,6 +2413,34 @@ static int __cetrafs_journal_replay_node(struct super_block *sb, u32 node_id, bo
             }
         }
 
+        /* The owner check, the last read before the write (rule 15):
+         * the bytes passed the guard, but a block freed and reallocated
+         * since can carry the same bytes -- an empty dirent block looks
+         * like any other. It must still be the entry's owner's (L9). An
+         * owner whose record or tree cannot be read leaves the verdict
+         * to the guard, as before the check existed: refusing would
+         * leave a torn block unrepaired on a read error elsewhere. */
+        owner_dir = false;
+        owner_known = false;
+        if (apply && !cetrafs_journal_ignore_owner) {
+            int held = cetrafs_journal_owner_holds(sb, &entries[s], &owner_dir);
+
+            owner_known = held >= 0;
+            if (held == 0) {
+                apply = false;
+                atomic64_inc(&cetrafs_journal_replay_refused);
+                pr_err("journal replay: node %u txn %llu target block %llu is no longer a block of its owner "
+                       "(ino %llu, generation %llu) -- freed and reused since; NOT applying the entry\n",
+                       node_id, (unsigned long long) entries[s].txn_id, (unsigned long long) entries[s].target_lba,
+                       (unsigned long long) entries[s].owner_ino, (unsigned long long) entries[s].owner_generation);
+            } else if (held < 0) {
+                pr_warn("journal replay: node %u txn %llu: could not read owner ino %llu to confirm target block "
+                        "%llu is still its -- judging by the guard alone\n",
+                        node_id, (unsigned long long) entries[s].txn_id, (unsigned long long) entries[s].owner_ino,
+                        (unsigned long long) entries[s].target_lba);
+            }
+        }
+
         if (apply) {
             int werr;
 
@@ -2401,6 +2486,22 @@ static int __cetrafs_journal_replay_node(struct super_block *sb, u32 node_id, bo
             }
             atomic64_inc(&cetrafs_journal_replay_applied);
             applied++;
+            /* A redo changed bytes no stamp announced: advance the
+             * owner's, so a node caching the block reads it again (L9).
+             * Failing leaves peers on the old copy until the owner's
+             * next change -- said, not fatal: the block itself is
+             * right. */
+            if (owner_known && !cetrafs_journal_ignore_owner) {
+                int tret = cetrafs_inode_advance_change_stamp(sb, entries[s].owner_ino,
+                                                              entries[s].owner_generation, owner_dir);
+
+                if (tret)
+                    pr_warn("journal replay: node %u txn %llu: could not advance ino %llu's change stamp after "
+                            "the redo (%d) -- peers may keep a cached copy of block %llu\n",
+                            node_id, (unsigned long long) entries[s].txn_id,
+                            (unsigned long long) entries[s].owner_ino, tret,
+                            (unsigned long long) entries[s].target_lba);
+            }
         }
         brelse(tbh);
         brelse(pbh);

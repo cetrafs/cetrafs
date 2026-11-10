@@ -1188,6 +1188,103 @@ int cetrafs_raw_inode_for_each_owned_block(struct super_block *sb,
     return 0;
 }
 
+struct cetrafs_holds_ctx {
+    u64 lba;
+    bool found;
+};
+
+static void cetrafs_holds_cb(void *p, u64 phys, u32 len)
+{
+    struct cetrafs_holds_ctx *h = p;
+
+    if (h->lba >= phys && h->lba - phys < len)
+        h->found = true;
+}
+
+/*
+ * Does this record still reference 'lba' as one of its metadata blocks
+ * -- its xattr block, an extent-tree leaf or index block, or (a
+ * directory) a dirent block? The journal replay's owner check (L9): an
+ * entry is redone only onto a block its owner still holds.
+ *
+ * Tree-block addresses are matched from the PARENT, before anything
+ * reads the block: the target may be the torn leaf the replay exists to
+ * repair, which no validating read would return. Interior blocks and a
+ * directory's leaves are read forced-fresh. 0 with *held set or clear;
+ * -EIO when a block on the way could not be read and the answer is not
+ * known.
+ */
+int cetrafs_raw_inode_holds_meta_block(struct super_block *sb, const cetrafs_inode_t *raw, u64 lba, bool *held)
+{
+    struct cetrafs_holds_ctx h = {.lba = lba};
+    bool unknown = false;
+    u16 depth;
+    u32 i, n;
+
+    *held = false;
+    if (raw->xattr_block && cetrafs_le64(raw->xattr_block) == lba) {
+        *held = true;
+        return 0;
+    }
+    if (cetrafs_le16(raw->eh.eh_magic) != CETRAFS_EXT_MAGIC)
+        return -EIO;
+    depth = cetrafs_le16(raw->eh.eh_depth);
+    if (depth > CETRAFS_EXT_MAX_DEPTH)
+        return -EIO;
+
+    if (depth >= 1) {
+        n = min_t(u32, cetrafs_le16(raw->eh.eh_entries), ARRAY_SIZE(raw->et.idx));
+        for (i = 0; i < n; i++) {
+            u64 child = cetrafs_extent_phys_from_hilo(raw->et.idx[i].ei_leaf_hi, raw->et.idx[i].ei_leaf_lo);
+            struct buffer_head *ibh;
+            const cetrafs_extent_hdr_t *ihdr;
+            const cetrafs_extent_idx_t *iarr;
+            u32 li, iln;
+
+            if (child == lba) {
+                *held = true;
+                return 0;
+            }
+            if (depth < 2)
+                continue;
+            ibh = cetrafs_scrub_tree_bread(sb, child, CETRAFS_INDEX_TAIL_MAGIC, true);
+            if (!ibh) {
+                unknown = true;
+                continue;
+            }
+            ihdr = (const cetrafs_extent_hdr_t *) ibh->b_data;
+            iarr = (const cetrafs_extent_idx_t *) (ibh->b_data + sizeof(*ihdr));
+            cetrafs_bh_read_lock(ibh);
+            iln = min_t(u32, cetrafs_le16(ihdr->eh_entries), CETRAFS_EXT_BLOCK_MAX_IDX);
+            for (li = 0; li < iln; li++)
+                if (cetrafs_extent_phys_from_hilo(iarr[li].ei_leaf_hi, iarr[li].ei_leaf_lo) == lba)
+                    h.found = true;
+            cetrafs_bh_read_unlock(ibh);
+            brelse(ibh);
+            if (h.found) {
+                *held = true;
+                return 0;
+            }
+            cond_resched();
+        }
+    }
+
+    /* A directory's dirent blocks are its data: walk its extents (a
+     * directory's tree is at most one level deep). A regular file's
+     * data is never journaled, so its extents are not looked at. */
+    if (S_ISDIR(cetrafs_le32(raw->mode))) {
+        int ret = cetrafs_raw_inode_for_each_owned_block(sb, raw, cetrafs_holds_cb, &h, true);
+
+        if (h.found) {
+            *held = true;
+            return 0;
+        }
+        if (ret)
+            unknown = true;
+    }
+    return unknown ? -EIO : 0;
+}
+
 /*
  * Test-only: make the extent-list fetch fail once.
  *
@@ -3468,7 +3565,7 @@ static int cetrafs_tree_hold_back(struct inode *inode, struct buffer_head *bh, u
 {
     if (!cetrafs_bh_defer_update(inode, bh, prev_crc))
         return 0;
-    return cetrafs_journal_write_block(inode->i_sb, bh, prev_crc); /* no registry: the mount is going */
+    return cetrafs_journal_write_block(inode->i_sb, cetrafs_journal_owner_of(inode), bh, prev_crc); /* no registry: the mount is going */
 }
 
 /*
@@ -3583,7 +3680,7 @@ static int cetrafs_tree_convert_inner(struct inode *inode,
             brelse(lbh);
         } else {
             /* A directory: no boundary, so journaled now. */
-            int wret = cetrafs_journal_write_block(sb, lbh, prev_crc);
+            int wret = cetrafs_journal_write_block(sb, cetrafs_journal_owner_of(inode), lbh, prev_crc);
 
             brelse(lbh);
             if (wret)
@@ -3715,7 +3812,7 @@ static int cetrafs_tree_convert_inner(struct inode *inode,
                 brelse(ibh);
             } else {
                 /* Depth 2 is regular files only; journaled as everywhere else. */
-                int wret = cetrafs_journal_write_block(sb, lbh, prev_crc);
+                int wret = cetrafs_journal_write_block(sb, cetrafs_journal_owner_of(inode), lbh, prev_crc);
 
                 brelse(lbh);
                 brelse(ibh);
@@ -3888,7 +3985,7 @@ static int cetrafs_tree_append(struct inode *inode,
                 cetrafs_blk_tail_stamp(lbh, CETRAFS_LEAF_TAIL_MAGIC);
                 ret = cetrafs_tree_hold_back(inode, lbh, prev_crc);
             } else {
-                ret = cetrafs_journal_write_block(sb, lbh, prev_crc);
+                ret = cetrafs_journal_write_block(sb, cetrafs_journal_owner_of(inode), lbh, prev_crc);
             }
             brelse(lbh);
             return ret;
@@ -4069,7 +4166,7 @@ static int cetrafs_tree_append(struct inode *inode,
 
                         cetrafs_idx_widen(&iarr[ient - 1], iblock, cetrafs_idx_end(iblock, count));
                         cetrafs_blk_tail_stamp(ibh, CETRAFS_INDEX_TAIL_MAGIC);
-                        iw = cetrafs_journal_write_block(sb, ibh, iprev);
+                        iw = cetrafs_journal_write_block(sb, cetrafs_journal_owner_of(inode), ibh, iprev);
                         if (iw) {
                             cetrafs_bh_abort_update(lbh);
                             brelse(lbh);
@@ -4099,7 +4196,7 @@ static int cetrafs_tree_append(struct inode *inode,
                 cetrafs_blk_tail_stamp(lbh, CETRAFS_LEAF_TAIL_MAGIC);
                 ret = cetrafs_tree_hold_back(inode, lbh, prev_crc);
             } else {
-                ret = cetrafs_journal_write_block(sb, lbh, prev_crc);
+                ret = cetrafs_journal_write_block(sb, cetrafs_journal_owner_of(inode), lbh, prev_crc);
             }
             brelse(lbh);
             brelse(ibh);
@@ -4175,7 +4272,7 @@ static int cetrafs_tree_append(struct inode *inode,
                     cetrafs_blk_tail_stamp(ibh, CETRAFS_INDEX_TAIL_MAGIC);
                     ret = cetrafs_tree_hold_back(inode, ibh, prev_crc);
                 } else {
-                    ret = cetrafs_journal_write_block(sb, ibh, prev_crc);
+                    ret = cetrafs_journal_write_block(sb, cetrafs_journal_owner_of(inode), ibh, prev_crc);
                 }
                 brelse(ibh);
                 if (ret) {

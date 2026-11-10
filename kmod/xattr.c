@@ -494,7 +494,7 @@ static int cetrafs_xattr_set_locked(struct inode *inode, const char *name, const
     }
 
     cetrafs_blk_tail_stamp(bh, CETRAFS_XATTR_TAIL_MAGIC);
-    ret = cetrafs_journal_write_block(sb, bh, prev_crc);
+    ret = cetrafs_journal_write_block(sb, cetrafs_journal_owner_of(inode), bh, prev_crc);
     brelse(bh);
     if (ret || !now)
         return ret;

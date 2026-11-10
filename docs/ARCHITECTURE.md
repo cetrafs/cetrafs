@@ -239,7 +239,11 @@ claim is taken only while it is the incarnation judged; `park_seq` counts the
 parks -- every transition to CLEAN, and a fence finding the area CLEAN -- and
 every entry carries the park_seq of its session, so replay discards an entry
 from before the last park and the owner's DIRTY flip, a compare-and-write on
-its session's park_seq, cannot land on an area a peer has parked)
+its session's park_seq, cannot land on an area a peer has parked).
+Every entry also names its owner -- the inode whose dirent, extent-tree or
+xattr block the target is, with its generation -- and replay redoes a target
+only while that inode still references it, then advances the owner's
+`dirent_seq` / `file_seq` so a peer caching the block reads it again
 followed by 2-block slots. Because a node only ever logs to its own slice, each
 area is single-writer by construction.
 

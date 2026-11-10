@@ -771,6 +771,61 @@ int cetrafs_inode_ns_zero_nlink(struct super_block *sb, u64 ino, const cetrafs_i
     return cetrafs_inode_ns_cas(sb, ino, cetrafs_le64(seed->generation), seed, cetrafs_ns_apply_zero_nlink, NULL);
 }
 
+/*
+ * After a journal replay rewrote one of this inode's metadata blocks,
+ * advance its change stamp -- dirent_seq for a directory, file_seq for
+ * anything else -- so a node caching the block (its dirents, its extent
+ * tree) reads it again. A redo changes bytes no stamp announced: without
+ * this, a peer that had cached the block before the writer died went on
+ * trusting its copy (L9). Only the stamp moves, on the record the swap
+ * finds, and only while the record is still the generation the entry
+ * named.
+ */
+static void cetrafs_ns_apply_advance(cetrafs_inode_t *rec, void *arg)
+{
+    (void) arg;
+    cetrafs_ns_stamp_advance(rec);
+}
+
+struct cetrafs_fd_touch_ctx {
+    struct super_block *sb;
+    u64 ino, generation;
+};
+
+static int cetrafs_fd_touch_mutate(void *image, unsigned int len, void *priv)
+{
+    struct cetrafs_fd_touch_ctx *ctx = priv;
+    cetrafs_inode_t rec;
+
+    if (len < CETRAFS_INODE_FD_BYTES)
+        return -EINVAL;
+    memset(&rec, 0, sizeof(rec));
+    cetrafs_inode_fd_from_image(&rec, image);
+    if (cetrafs_le64(rec.fd_ino) != ctx->ino || cetrafs_le64(rec.fd_generation) != ctx->generation)
+        return -ESTALE; /* the number was reused: not the entry's file */
+    if (cetrafs_inode_crc_fd(&rec) != (u32) cetrafs_le64(rec.fd_checksum))
+        return -EUCLEAN; /* restamping would bless the damage */
+    rec.ino = rec.fd_ino;
+    rec.generation = rec.fd_generation;
+    cetrafs_inode_stamp_crc_fd(ctx->sb, &rec); /* a new file_seq, and the CRC over it */
+    cetrafs_inode_fd_to_image(image, &rec);
+    return 0;
+}
+
+int cetrafs_inode_advance_change_stamp(struct super_block *sb, u64 ino, u64 generation, bool dir)
+{
+    struct cetrafs_fd_touch_ctx ctx = {.sb = sb, .ino = ino, .generation = generation};
+    u64 lba = cetrafs_inode_lba(sb, ino);
+
+    if (!lba)
+        return -EINVAL;
+    if (cetrafs_sb_is_fenced(sb))
+        return -EIO;
+    if (dir)
+        return cetrafs_inode_ns_cas(sb, ino, generation, NULL, cetrafs_ns_apply_advance, NULL);
+    return cetrafs_cas_record_fd_seeded(sb, lba, NULL, 0, cetrafs_fd_touch_mutate, &ctx);
+}
+
 struct cetrafs_fd_write_ctx {
     const cetrafs_inode_t *src;
     struct super_block *sb;

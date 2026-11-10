@@ -47,6 +47,10 @@ head -c 4096 /dev/urandom >"$PAY" # differs from the target, so only the redo ca
 WANT="$(sha256sum <"$PAY" | cut -d' ' -f1)"
 
 ct_mount "$DEV" "$MNT"
+# Its entries aim at a file's DATA block, which no writer journals, so the
+# owner check (L9) would refuse them before the path under test is
+# reached: switched off to isolate that path.
+ct_param_set journal_ignore_owner 1
 ct_param_set journal_replay_lookup_fail 1
 MARK="$(dmesg_mark)"
 "$NODEPOKE" "$IMG" "$PEER" 1 ee 0 >/dev/null 2>&1 # REGISTERED, last_seen=0: stale at once

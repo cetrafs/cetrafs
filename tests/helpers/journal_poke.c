@@ -45,6 +45,14 @@
  * JOURNAL_POKE_PARK=<n> sets the flag's park_seq instead, and
  * JOURNAL_POKE_ENTRY_PARK=<n> stamps the entry with <n> (an entry from
  * another park).
+ *
+ * Owner (format 0x000A, cetrafs_journal_header_t.owner_ino): a written
+ * entry names the inode that holds target_lba as metadata -- found by
+ * scanning the inode table (its xattr block, a tree block, a directory's
+ * dirent block), as the kernel's writer would have named it.
+ * JOURNAL_POKE_OWNER=<ino> names that inode instead (its generation read
+ * from its record), and JOURNAL_POKE_OWNER_GEN=<n> overrides the
+ * generation.
  */
 #include <fcntl.h>
 #include <inttypes.h>
@@ -53,6 +61,7 @@
 #include <stdio.h>
 #include <stdlib.h>
 #include <string.h>
+#include <sys/stat.h>
 #include <sys/types.h>
 #include <unistd.h>
 
@@ -73,6 +82,81 @@ static void pwrite_all(int fd, const void *buf, size_t len, off_t off)
         perror("pwrite");
         exit(1);
     }
+}
+
+/* Does this record hold 'lba' as metadata (see the header comment)? */
+static int holds_meta(int fd, const cetrafs_inode_t *in, uint64_t lba)
+{
+    uint16_t depth = cetrafs_le16(in->eh.eh_depth);
+    uint16_t n = cetrafs_le16(in->eh.eh_entries);
+    int dir = S_ISDIR(cetrafs_le32(in->mode));
+
+    if (in->xattr_block && cetrafs_le64(in->xattr_block) == lba)
+        return 1;
+    if (cetrafs_le16(in->eh.eh_magic) != CETRAFS_EXT_MAGIC || depth > CETRAFS_EXT_MAX_DEPTH)
+        return 0;
+    if (depth == 0) {
+        for (uint16_t i = 0; dir && i < n && i < 4; i++) {
+            uint64_t p = cetrafs_extent_phys_from_hilo(in->et.leaf[i].ee_start_hi, in->et.leaf[i].ee_start_lo);
+            if (lba >= p && lba < p + cetrafs_extent_len(in->et.leaf[i].ee_len))
+                return 1;
+        }
+        return 0;
+    }
+    for (uint16_t i = 0; i < n && i < 4; i++) {
+        uint64_t child = cetrafs_extent_phys_from_hilo(in->et.idx[i].ei_leaf_hi, in->et.idx[i].ei_leaf_lo);
+        uint8_t blk[CETRAFS_BLOCK_SIZE];
+        const cetrafs_extent_hdr_t *h = (const cetrafs_extent_hdr_t *) blk;
+
+        if (child == lba)
+            return 1;
+        pread_all(fd, blk, sizeof(blk), (off_t) child * CETRAFS_BLOCK_SIZE);
+        if (depth == 2) {
+            const cetrafs_extent_idx_t *ia = (const cetrafs_extent_idx_t *) (blk + sizeof(*h));
+            for (uint16_t k = 0; k < cetrafs_le16(h->eh_entries) && k < CETRAFS_EXT_BLOCK_MAX_IDX; k++)
+                if (cetrafs_extent_phys_from_hilo(ia[k].ei_leaf_hi, ia[k].ei_leaf_lo) == lba)
+                    return 1;
+        } else if (dir) {
+            const cetrafs_extent_t *la = (const cetrafs_extent_t *) (blk + sizeof(*h));
+            for (uint16_t k = 0; k < cetrafs_le16(h->eh_entries) && k < CETRAFS_EXT_BLOCK_MAX_LEAVES; k++) {
+                uint64_t p = cetrafs_extent_phys_from_hilo(la[k].ee_start_hi, la[k].ee_start_lo);
+                if (lba >= p && lba < p + cetrafs_extent_len(la[k].ee_len))
+                    return 1;
+            }
+        }
+    }
+    return 0;
+}
+
+/* The owner a written entry names (see the header comment); 0/0 if none. */
+static void entry_owner(int fd, const cetrafs_superblock_t *sb, uint64_t lba, uint64_t *ino, uint64_t *gen)
+{
+    uint64_t its = cetrafs_le64(sb->inode_table_start);
+    uint32_t count = cetrafs_le32(sb->inodes_count);
+    cetrafs_inode_t in;
+
+    *ino = 0;
+    *gen = 0;
+    if (getenv("JOURNAL_POKE_OWNER") && *getenv("JOURNAL_POKE_OWNER")) {
+        *ino = strtoull(getenv("JOURNAL_POKE_OWNER"), NULL, 0);
+        if (*ino >= 1 && *ino <= count) {
+            pread_all(fd, &in, sizeof(in), (off_t) (its + *ino - 1) * CETRAFS_BLOCK_SIZE);
+            *gen = cetrafs_le64(in.generation);
+        }
+    } else {
+        for (uint64_t i = 1; i <= count; i++) {
+            pread_all(fd, &in, sizeof(in), (off_t) (its + i - 1) * CETRAFS_BLOCK_SIZE);
+            if (!in.generation || cetrafs_le64(in.ino) != i)
+                continue;
+            if (holds_meta(fd, &in, lba)) {
+                *ino = i;
+                *gen = cetrafs_le64(in.generation);
+                break;
+            }
+        }
+    }
+    if (getenv("JOURNAL_POKE_OWNER_GEN") && *getenv("JOURNAL_POKE_OWNER_GEN"))
+        *gen = strtoull(getenv("JOURNAL_POKE_OWNER_GEN"), NULL, 0);
 }
 
 /* The park_seq a rewritten flag carries: JOURNAL_POKE_PARK, else the one there. */
@@ -201,6 +285,13 @@ int main(int argc, char **argv)
     hdr.txn_id = cetrafs_cpu_to_le64(1);
     hdr.target_lba = cetrafs_cpu_to_le64(target_lba);
     hdr.payload_checksum = cetrafs_cpu_to_le32(crc32c_update(0, payload, sizeof(payload)));
+    {
+        uint64_t oino, ogen;
+
+        entry_owner(fd, &sb, target_lba, &oino, &ogen);
+        hdr.owner_ino = cetrafs_cpu_to_le64(oino);
+        hdr.owner_generation = cetrafs_cpu_to_le64(ogen);
+    }
     hdr.park_seq = cetrafs_cpu_to_le64(getenv("JOURNAL_POKE_ENTRY_PARK")
                                            ? strtoull(getenv("JOURNAL_POKE_ENTRY_PARK"), NULL, 0)
                                            : park);
@@ -236,8 +327,9 @@ int main(int argc, char **argv)
 
     close(fd);
 
-    printf("journal_poke: node %u slot %" PRIu64 " -> target_lba=%" PRIu64 ", flags=0x%x, flag forced DIRTY\n",
-           node_id, slot, target_lba, cetrafs_le32(hdr.flags));
+    printf("journal_poke: node %u slot %" PRIu64 " -> target_lba=%" PRIu64 ", flags=0x%x, owner=%" PRIu64
+           ", flag forced DIRTY\n",
+           node_id, slot, target_lba, cetrafs_le32(hdr.flags), (uint64_t) cetrafs_le64(hdr.owner_ino));
     /* Printed so a caller can corrupt the payload without re-deriving
      * the journal geometry itself. */
     printf("header_lba=%" PRIu64 " payload_lba=%" PRIu64 "\n", header_lba, header_lba + 1);

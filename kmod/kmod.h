@@ -362,6 +362,7 @@ void cetrafs_sb_note_unclean_reattach(struct super_block *sb);
 bool cetrafs_sb_unclean_reattach(struct super_block *sb);
 /* inode.c: advance a record's namespace stamp (dirent_seq) */
 void cetrafs_ns_stamp_advance(cetrafs_inode_t *rec);
+int cetrafs_inode_advance_change_stamp(struct super_block *sb, u64 ino, u64 generation, bool dir);
 /* lock.c: clear every claim a previous incarnation of this node left */
 int cetrafs_lock_sweep_own_claims(struct super_block *sb, u32 my_node_id);
 u64 cetrafs_deferred_orphaned_count(void);
@@ -1181,6 +1182,7 @@ u64 cetrafs_scrub_last_start_unix(void);
 u64 cetrafs_scrub_last_duration_ms(void);
 /* raw-record extent walk (file.c) + BG data/bitmap geometry (alloc.c), both
  * consumed by the scrub. */
+int cetrafs_raw_inode_holds_meta_block(struct super_block *sb, const cetrafs_inode_t *raw, u64 lba, bool *held);
 int cetrafs_raw_inode_for_each_owned_block(struct super_block *sb,
                                            const cetrafs_inode_t *raw,
                                            void (*cb)(void *ctx, u64 phys, u32 len),
@@ -1206,9 +1208,17 @@ int cetrafs_journal_init(struct super_block *sb, struct cetrafs_journal **out_j)
 void cetrafs_journal_free(struct cetrafs_journal *j);
 int cetrafs_journal_attach_node(struct super_block *sb, u32 node_id);
 int cetrafs_journal_sweep_own_claims(struct super_block *sb, u32 my_node_id);
-int cetrafs_journal_write_block(struct super_block *sb, struct buffer_head *bh, u32 prev_crc);
-int cetrafs_journal_write_deferred(struct super_block *sb, struct buffer_head **bhs, const u32 *disk_crc,
-                                   unsigned int n, bool *written, u32 *wcrc);
+/* The inode a journaled block belongs to (cetrafs_journal_header_t.owner_ino). */
+struct cetrafs_journal_owner {
+    u64 ino;
+    u64 generation;
+};
+struct cetrafs_journal_owner cetrafs_journal_owner_of(struct inode *inode);
+int cetrafs_journal_write_block(struct super_block *sb, struct cetrafs_journal_owner owner, struct buffer_head *bh,
+                                u32 prev_crc);
+int cetrafs_journal_write_deferred(struct super_block *sb, struct buffer_head **bhs,
+                                   const struct cetrafs_journal_owner *owners, const u32 *disk_crc, unsigned int n,
+                                   bool *written, u32 *wcrc);
 
 /* leafdefer.c: a regular file's tree blocks, held back from the device
  * until a boundary and then journaled in one batch. A deferred buffer is

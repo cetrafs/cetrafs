@@ -42,6 +42,10 @@ PD="$(basename "$DEV")"
 DIRENT="$(ct_tmp jreused-dirent)"
 ct_mkfs "$DEV" -z 1 -b 512 -J 4 -M 4 -N 1024 -f >/dev/null
 ctr() { sed -n "s/^$1: //p" "/proc/fs/cetrafs/$PD/info"; }
+# Its entries aim at a file's DATA block, which no writer journals, so the
+# owner check (L9) would refuse them before the path under test is
+# reached: switched off to isolate that path.
+ct_param_set journal_ignore_owner 1
 
 mount -t cetrafs "$DEV" "$MNT"
 require_cetrafs_mount "$MNT"

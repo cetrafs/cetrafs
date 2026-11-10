@@ -1037,7 +1037,7 @@ int cetrafs_dir_add_entry(struct inode *dir, const struct qstr *name, u64 ino, u
      * journal.c's cetrafs_journal_write_block() owns the whole sequence
      * so no call site can reorder it. */
     cetrafs_dirent_block_stamp(bh);
-    ret = cetrafs_journal_write_block(dir->i_sb, bh, prev_crc);
+    ret = cetrafs_journal_write_block(dir->i_sb, cetrafs_journal_owner_of(dir), bh, prev_crc);
     brelse(bh);
     if (ret)
         return ret; /* a grown block stays as a valid empty one -- see above */
@@ -1156,7 +1156,7 @@ int cetrafs_dir_remove_entry(struct inode *dir, const struct qstr *name, u64 *ou
     memset(slot, 0, sizeof(*slot));
 
     cetrafs_dirent_block_stamp(bh);
-    ret = cetrafs_journal_write_block(dir->i_sb, bh, prev_crc);
+    ret = cetrafs_journal_write_block(dir->i_sb, cetrafs_journal_owner_of(dir), bh, prev_crc);
     brelse(bh);
     if (ret)
         return ret;
@@ -1242,7 +1242,7 @@ int cetrafs_dir_update_dotdot(struct inode *dir, u64 new_parent_ino)
                     const u32 prev_crc = cetrafs_bh_begin_update_crc(bh);
                     de[e].inode = cetrafs_cpu_to_le64(new_parent_ino);
                     cetrafs_dirent_block_stamp(bh);
-                    ret = cetrafs_journal_write_block(dir->i_sb, bh, prev_crc);
+                    ret = cetrafs_journal_write_block(dir->i_sb, cetrafs_journal_owner_of(dir), bh, prev_crc);
                     brelse(bh);
                     cetrafs_dir_extents_put(&dx);
                     if (ret)
@@ -1368,7 +1368,7 @@ static int cetrafs_dir_retarget_entry(struct inode *dir,
     slot->inode = cetrafs_cpu_to_le64(new_ino);
     slot->file_type = new_file_type;
     cetrafs_dirent_block_stamp(bh);
-    ret = cetrafs_journal_write_block(dir->i_sb, bh, prev_crc);
+    ret = cetrafs_journal_write_block(dir->i_sb, cetrafs_journal_owner_of(dir), bh, prev_crc);
     brelse(bh);
     if (ret)
         return ret;

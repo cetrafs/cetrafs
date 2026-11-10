@@ -88,6 +88,10 @@ head -c 4096 /dev/urandom >"$PAY"
 WANT="$(sha256sum <"$PAY" | cut -d' ' -f1)"
 [ "$(blk "$TARGET")" != "$WANT" ] || { fail "A: setup: the target already holds the payload"; ct_exit; }
 ct_param_set journal_ignore_guard 1
+# Its entries aim at a file's DATA block, which no writer journals, so the
+# owner check (L9) would refuse them before the path under test is
+# reached: switched off to isolate that path.
+ct_param_set journal_ignore_owner 1
 ct_param_set layout_refresh_fail_once 1
 MARK="$(dmesg_mark)"
 "$NODEPOKE" "$IMG" "$PEER" 1 ee 0 >/dev/null 2>&1 # REGISTERED, last_seen=0: stale at once

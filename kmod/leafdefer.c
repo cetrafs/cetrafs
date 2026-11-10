@@ -53,6 +53,7 @@
 struct cetrafs_deferred {
     struct buffer_head *bh; /* pinned: one reference held while listed */
     u64 ino;
+    u64 generation; /* with ino: the journal entry's owner (L9) */
     u32 disk_crc; /* CRC32C of the block as it reads on the device */
     /* On its inode's list, or on the mount's orphan list once the inode
      * was evicted; under the xarray's lock. A boundary walks only its
@@ -130,6 +131,7 @@ int cetrafs_bh_defer_update(struct inode *inode, struct buffer_head *bh, u32 pre
                 atomic64_inc(&cetrafs_deferred_adopted);
             list_move_tail(&old->node, cetrafs_inode_deferred(inode));
             old->ino = inode->i_ino;
+            old->generation = cetrafs_inode_get_generation(inode);
         }
         xa_unlock(xa);
         if (!WARN_ON_ONCE(!listed)) {
@@ -150,6 +152,7 @@ int cetrafs_bh_defer_update(struct inode *inode, struct buffer_head *bh, u32 pre
     d = kmalloc(sizeof(*d), GFP_NOFS | __GFP_NOFAIL);
     d->bh = bh;
     d->ino = inode->i_ino;
+    d->generation = cetrafs_inode_get_generation(inode);
     d->disk_crc = prev_crc;
     INIT_LIST_HEAD(&d->node);
     old = xa_store(xa, bh->b_blocknr, d, GFP_NOFS | __GFP_NOFAIL);
@@ -313,13 +316,14 @@ void cetrafs_deferred_forget_range(struct super_block *sb, u64 lba, u32 count)
  * with a reference each. *out is kvmalloc'd; the caller brelse()s and
  * kvfree()s. */
 static int cetrafs_deferred_collect(struct xarray *xa, struct list_head *head, struct buffer_head ***out,
-                                    u32 **crcs, unsigned int *n)
+                                    u32 **crcs, struct cetrafs_journal_owner **owners, unsigned int *n)
 {
     struct cetrafs_deferred *d;
     unsigned int cnt = 0, i = 0;
 
     *out = NULL;
     *crcs = NULL;
+    *owners = NULL;
     *n = 0;
     xa_lock(xa);
     list_for_each_entry(d, head, node)
@@ -329,11 +333,14 @@ static int cetrafs_deferred_collect(struct xarray *xa, struct list_head *head, s
         return 0;
     *out = kvmalloc_array(cnt, sizeof(**out), GFP_NOFS);
     *crcs = kvmalloc_array(cnt, sizeof(**crcs), GFP_NOFS);
-    if (!*out || !*crcs) {
+    *owners = kvmalloc_array(cnt, sizeof(**owners), GFP_NOFS);
+    if (!*out || !*crcs || !*owners) {
         kvfree(*out);
         kvfree(*crcs);
+        kvfree(*owners);
         *out = NULL;
         *crcs = NULL;
+        *owners = NULL;
         return -ENOMEM;
     }
     xa_lock(xa);
@@ -343,6 +350,8 @@ static int cetrafs_deferred_collect(struct xarray *xa, struct list_head *head, s
         get_bh(d->bh);
         (*out)[i] = d->bh;
         (*crcs)[i] = d->disk_crc;
+        (*owners)[i].ino = d->ino;
+        (*owners)[i].generation = d->generation;
         i++;
     }
     xa_unlock(xa);
@@ -394,8 +403,8 @@ static bool cetrafs_deferred_flush_no_inode;
 cetrafs_test_param(deferred_flush_no_inode, cetrafs_deferred_flush_no_inode, bool, 0644);
 MODULE_PARM_DESC(deferred_flush_no_inode, "TEST ONLY: flush held-back blocks without looking up their inode");
 
-static int cetrafs_deferred_write_set(struct super_block *sb, struct buffer_head **bhs, u32 *crcs, unsigned int n,
-                                      bool no_inode)
+static int cetrafs_deferred_write_set(struct super_block *sb, struct buffer_head **bhs, u32 *crcs,
+                                      const struct cetrafs_journal_owner *owners, unsigned int n, bool no_inode)
 {
     bool *written;
     u32 *wcrc;
@@ -409,7 +418,7 @@ static int cetrafs_deferred_write_set(struct super_block *sb, struct buffer_head
         kvfree(wcrc);
         return -ENOMEM;
     }
-    ret = cetrafs_journal_write_deferred(sb, bhs, crcs, n, written, wcrc);
+    ret = cetrafs_journal_write_deferred(sb, bhs, owners, crcs, n, written, wcrc);
     if (unlikely(cetrafs_deferred_settle_stall_ms) && no_inode) {
         pr_info("deferred: TEST pause of %ums between the target writes and the settle (inode not in core)\n",
                 cetrafs_deferred_settle_stall_ms);
@@ -449,6 +458,7 @@ int cetrafs_deferred_flush_inode(struct inode *inode, bool mapping_locked)
     struct super_block *sb = inode->i_sb;
     struct xarray *xa = cetrafs_sb_deferred(sb);
     struct buffer_head **bhs;
+    struct cetrafs_journal_owner *owners;
     unsigned int n, i;
     u32 *crcs;
     int ret;
@@ -463,32 +473,35 @@ int cetrafs_deferred_flush_inode(struct inode *inode, bool mapping_locked)
         return 0;
     if (!mapping_locked)
         filemap_invalidate_lock_shared(inode->i_mapping);
-    ret = cetrafs_deferred_collect(xa, cetrafs_inode_deferred(inode), &bhs, &crcs, &n);
+    ret = cetrafs_deferred_collect(xa, cetrafs_inode_deferred(inode), &bhs, &crcs, &owners, &n);
     if (!ret && n)
-        ret = cetrafs_deferred_write_set(sb, bhs, crcs, n, false);
+        ret = cetrafs_deferred_write_set(sb, bhs, crcs, owners, n, false);
     if (!mapping_locked)
         filemap_invalidate_unlock_shared(inode->i_mapping);
     for (i = 0; i < n; i++)
         brelse(bhs[i]);
     kvfree(bhs);
     kvfree(crcs);
+    kvfree(owners);
     return ret;
 }
 
 static int cetrafs_deferred_flush_list(struct super_block *sb, struct list_head *head, bool no_inode)
 {
     struct buffer_head **bhs;
+    struct cetrafs_journal_owner *owners;
     unsigned int n, i;
     u32 *crcs;
     int r;
 
-    r = cetrafs_deferred_collect(cetrafs_sb_deferred(sb), head, &bhs, &crcs, &n);
+    r = cetrafs_deferred_collect(cetrafs_sb_deferred(sb), head, &bhs, &crcs, &owners, &n);
     if (!r && n)
-        r = cetrafs_deferred_write_set(sb, bhs, crcs, n, no_inode);
+        r = cetrafs_deferred_write_set(sb, bhs, crcs, owners, n, no_inode);
     for (i = 0; i < n; i++)
         brelse(bhs[i]);
     kvfree(bhs);
     kvfree(crcs);
+    kvfree(owners);
     return r;
 }
 

@@ -683,7 +683,18 @@ typedef struct {
     __le64 park_seq;              /* the area's park_seq when this entry's session began
                                    * (cetrafs_node_journal_hdr_t.park_seq); replay skips an
                                    * entry from before the last park (format 0x000A) */
-    u8  pad[CETRAFS_BLOCK_SIZE - 48];
+    /* The inode whose metadata target_lba is -- a directory's dirent
+     * block, a file's extent leaf or index block, an inode's xattr block
+     * -- and its generation (format 0x000A). The guard proves the
+     * block's BYTES are what the entry was written against; a block freed
+     * and reallocated since can hold those same bytes (an empty dirent
+     * block looks like any other), so replay also requires the owner to
+     * still be this file and to still reference the block, and after a
+     * redo advances its change stamp (dirent_seq / file_seq), so a peer
+     * caching the block reads it again (L9). */
+    __le64 owner_ino;
+    __le64 owner_generation;
+    u8  pad[CETRAFS_BLOCK_SIZE - 64];
 } CETRA_PACKED cetrafs_journal_header_t;
 
 /* Both new fields live in what used to be `reserved32` and the head of
