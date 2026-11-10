@@ -44,8 +44,8 @@ grep -q "loaded module:" <<<"$OUT" &&
 # ---------------- every row, not just the first (audit 2026-11-06 L9)
 # Rows are one per block; the scan read them at a 128-byte stride, so it
 # saw row 0 and then the inside of row 0's block. A registered row 2
-# (caps 0: an old module) must be named. Departed cleanly (last_seen 0),
-# so growfs's live-peer probe does not wait on it: it is still a
+# (caps 0: an old module) must be named. Silent since the epoch
+# (last_seen 0), so growfs's live-peer probe does not wait on it: it is still a
 # registered node whose module has to mount the grown volume.
 "$(ct_helper node_poke)" "$DEV" 2 1 bb 0 >/dev/null
 blockdev --flushbufs "$DEV"
@@ -58,18 +58,13 @@ blockdev --flushbufs "$DEV"
 
 # ---------------- the control: a node whose module predates the grow
 log "clearing row 0's advertised capabilities -- a node still on an older module"
-python3 - "$IMG" <<'PY'
-import struct, sys
-# node_table_start is a superblock field; caps sits at a fixed offset in
-# the 128-byte row. Both come from include/cetrafs.h, not from guessing.
-f = open(sys.argv[1], "r+b")
-sb = f.read(4096)
-nts = struct.unpack_from("<Q", sb, 0x78)[0]   # offsetof(superblock, node_table_start)
-CAPS = 92
-f.seek(nts * 4096 + CAPS)
-f.write(struct.pack("<I", 0))
-f.close()
-PY
+# By field name, through the helper: a byte offset written here went
+# stale the moment the row's layout changed (format 0x000A), and the
+# suite then cleared bytes that were not caps.
+"$(ct_helper node_poke)" "$IMG" 0 --caps 0 >/dev/null
+[ "$("$(ct_helper node_poke)" "$IMG" 0 | sed -n 's/.* caps=\([^ ]*\) .*/\1/p')" = 0x0 ] ||
+    { fail "setup: row 0's caps did not read 0 after clearing them: $("$(ct_helper node_poke)" "$IMG" 0)"; ct_exit; }
+blockdev --flushbufs "$DEV"
 OUT2="$("$ROOT/userspace/growfs.cetra" "$DEV" -n 2>&1)"
 grep -q "NOT READY" <<<"$OUT2" &&
     pass "a node whose module predates the grow is named as NOT READY" ||
