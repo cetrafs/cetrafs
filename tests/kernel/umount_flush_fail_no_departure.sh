@@ -14,7 +14,7 @@
 # block device sync still writes the buffer, so the volume stays
 # consistent; what the test reads is the row's departure sentinel.
 #
-# DISCRIMINATION (measured on the old code): the row reads last_seen=0.
+# DISCRIMINATION (measured on the old code): the row reads departed (departure=1).
 set -euo pipefail
 . "$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)/lib/harness.sh"
 require_root
@@ -32,7 +32,7 @@ ct_mount "$DEV" "$MNT"
 require_cetrafs_mount "$MNT"
 dd if=/dev/urandom of="$MNT/a" bs=64k count=16 status=none
 ct_umount "$MNT"
-grep -q '^state=1 .*last_seen=0 ' <<<"$("$NODE_POKE" "$DEV" 0)" &&
+grep -q '^state=1 .*departure=1 ' <<<"$("$NODE_POKE" "$DEV" 0)" &&
     pass "control: row 0 departed cleanly" ||
     { fail "control: a clean unmount did not mark the row departed: $("$NODE_POKE" "$DEV" 0)"; ct_exit; }
 
@@ -49,7 +49,7 @@ grep -q "allocation bitmap not made durable" <<<"$(dmesg_since "$MARK")" &&
     { fail "setup: the injected bitmap flush failure never fired"; ct_exit; }
 ROW="$("$NODE_POKE" "$DEV" 0)"
 grep -q '^state=1 ' <<<"$ROW" || { fail "setup: row 0 is not registered: $ROW"; ct_exit; }
-grep -q ' last_seen=0 ' <<<"$ROW" &&
+grep -q ' departure=1 ' <<<"$ROW" &&
     fail "row 0 was marked departed although the flush failed -- a peer would reclaim it at once: $ROW" ||
     pass "row 0 was left to go stale, not announced as a clean departure"
 

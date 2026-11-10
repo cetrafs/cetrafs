@@ -78,7 +78,8 @@ int main(int argc, char **argv)
         cetrafs_node_row_stamp(&ne);
         memset(&saved, 0, sizeof(saved));
         saved.state = cetrafs_cpu_to_le32(CETRAFS_NODE_STATE_REGISTERED);
-        saved.last_seen = 0;
+        saved.last_seen = cetrafs_cpu_to_le64(1);
+        saved.departure = cetrafs_cpu_to_le32(CETRAFS_NODE_DEPART_CLEAN);
         saved.hb_seq = cetrafs_cpu_to_le64(77);
         memset(saved.node_uuid, 0xa5, sizeof(saved.node_uuid));
         snprintf(saved.label, sizeof(saved.label), "borrowed");

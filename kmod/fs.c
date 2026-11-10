@@ -3559,11 +3559,11 @@ departed:
      * like a merely-slow one, so a peer couldn't reclaim its ZGs/locks
      * until the full stale timeout elapsed even though this node is
      * definitively gone. See node.c's cetrafs_node_mark_offline() for
-     * why this backdates last_seen rather than freeing the row outright
+     * why this records the departure rather than freeing the row outright
      * (freeing it would break this node's own re-attach on its next
      * mount). Must run after heartbeat_stop() above (a concurrent tick
      * could otherwise re-renew this row via cetrafs_node_renew_
-     * heartbeat() right after we backdate it) and is guarded by
+     * heartbeat() right after we record it) and is guarded by
      * node_registered since sbi->node_id alone can't tell a never-
      * registered mount attempt apart from a real claim on row 0. Logged
      * on failure, not treated as fatal: cetrafs_put_super()'s caller

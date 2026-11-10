@@ -15,7 +15,7 @@
 # its re-read and the fence, and the row beats in that gap. The mount
 # must be refused and the row must not be marked departed.
 #
-# DISCRIMINATION: unbound, the row is marked departed (last_seen 0) and
+# DISCRIMINATION: unbound, the row is marked departed (departure=2) and
 # the mount goes ahead.
 set -euo pipefail
 . "$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)/lib/harness.sh"
@@ -47,14 +47,14 @@ sleep $((W + 1)) # past the watch and its re-read: inside the stall
 "$POKE" "$DEV" 1 --beat >/dev/null # the node re-attaches and beats
 wait "$MPID" || RC=$?
 ct_param_set nocaw_fence_stall_ms 0
-LS="$("$POKE" "$DEV" 1 | sed -n 's/.* last_seen=\([0-9]*\) .*/\1/p')"
+DEP="$("$POKE" "$DEV" 1 | sed -n 's/.* departure=\([0-9]*\) .*/\1/p')"
 if mountpoint -q "$MNT"; then
     fail "the mount went ahead beside a node that re-attached before the fence"
     umount "$MNT"
 else
     pass "the mount was refused: the row it was about to fence had come back"
 fi
-[ "${LS:-0}" != 0 ] && pass "the re-attached row was not marked departed" ||
-    fail "the gate marked a live incarnation departed (last_seen=0)"
+[ "${DEP:-x}" = 0 ] && pass "the re-attached row was not marked departed" ||
+    fail "the gate marked a live incarnation departed (departure=${DEP:-?})"
 log "mount rc=$RC; $(dmesg_since "$MARK" | grep -oE 'node 1 came back[^-]*' | head -1)"
 ct_exit

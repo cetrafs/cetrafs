@@ -2439,7 +2439,7 @@ int main(int argc, char **argv)
             return 1;
         }
         node_registered[n] = 1;
-        if (ne.last_seen == 0) {
+        if (cetrafs_le32(ne.departure) != CETRAFS_NODE_DEPART_NONE) {
             node_departed[n] = 1;
             node_departed_rows++;
         }
@@ -2448,12 +2448,12 @@ int main(int argc, char **argv)
          * last_seen against ITS OWN clock, which is the mistake the
          * mkfs/fsck peer probe was built to avoid (two real nodes were
          * found 1h55m apart). What it CAN say is that the row was left
-         * behind rather than released: last_seen == 0 is the explicit
-         * "departed cleanly" sentinel, so anything else is a node that
-         * did not get to write one. Reported, never fatal: it is
-         * exactly the state a crash leaves, and the next node to mount
-         * reclaims it. */
-        if (ne.last_seen != 0)
+         * behind rather than released: departure == CLEAN is the
+         * node's own record of leaving, so anything else is a node that
+         * did not get to write one (DEAD: a peer watched it stop).
+         * Reported, never fatal: it is exactly the state a crash leaves,
+         * and the next node to mount reclaims it. */
+        if (cetrafs_le32(ne.departure) != CETRAFS_NODE_DEPART_CLEAN)
             fprintf(stderr,
                     "WARN: node slot %u is REGISTERED and did not depart cleanly (hb_seq=%" PRIu64
                     ") -- a crashed "

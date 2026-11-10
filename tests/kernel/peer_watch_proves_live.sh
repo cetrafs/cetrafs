@@ -55,14 +55,14 @@ try_mount() { # [opts] -> 0 mounted, else the mount's status
 
 # ------------------------------------------------ (A) a no-CAW row
 plant 0x3 1
-grep -q 'last_seen=0 ' <<<"$(row1)" && { fail "setup: the planted row reads departed"; ct_exit; }
+grep -qE 'departure=[12] ' <<<"$(row1)" && { fail "setup: the planted row reads departed"; ct_exit; }
 MARK="$(dmesg_mark)"
 if try_mount; then
     pass "(A) a dead no-CAW row did not block a CAW mount"
     ct_umount "$MNT"
     # Skipped, never stamped departed: a node returning to a departed row
     # skips its own-claim sweeps (TODO.md, L3).
-    grep -q 'last_seen=0 ' <<<"$(row1)" && fail "(A) the watch stamped the dead row departed: $(row1)" ||
+    grep -qE 'departure=[12] ' <<<"$(row1)" && fail "(A) the watch stamped the dead row departed: $(row1)" ||
         pass "(A) the dead row was skipped, not stamped departed"
 else
     fail "(A) a dead no-CAW row blocked the mount: $(dmesg_since "$MARK" | grep -m1 -i 'cetrafs.*\(refus\|without\)')"

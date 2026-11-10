@@ -15,7 +15,7 @@
 # the case was not reached), then a remount. The row must not read
 # departed, and the remount must clear the bit.
 #
-# DISCRIMINATION: without the check the row reads last_seen=0 and the
+# DISCRIMINATION: without the check the row reads departure=1 and the
 # bit survives the remount.
 set -euo pipefail
 . "$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)/lib/harness.sh"
@@ -52,7 +52,7 @@ pass "setup: the unmount ran with the withdraw still queued ($D)"
 
 ROW="$("$NODE_POKE" "$IMG" "$NID")"
 log "row after the unmount: $ROW"
-grep -q ' last_seen=0 ' <<<"$ROW" &&
+grep -q ' departure=1 ' <<<"$ROW" &&
     fail "the unmount announced a clean departure over a queued release ($ROW)" ||
     pass "the row was left to go stale, not marked departed"
 

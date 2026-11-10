@@ -88,7 +88,7 @@ ct_umount "$MNT"
 
 ROW="$("$NODE_POKE" "$DEV" 0)"
 case "$ROW" in
-*"last_seen=0"*) pass "unmount: this node's row is backdated, so a peer reclaims at once" ;;
+*"departure=1 "*) pass "unmount: this node's row records a clean departure, so a peer reclaims at once" ;;
 *) fail "unmount: row reads $ROW -- a peer would wait out the whole stale window" ;;
 esac
 case "$ROW" in
@@ -134,7 +134,7 @@ ct_umount "$MNT"
 if [ "$FENCED" = "yes" ]; then
     pass "fence: the heartbeat noticed the revoked lease"
     case "$("$NODE_POKE" "$DEV" 0)" in
-    *"last_seen=0"*) fail "fence: a fenced node still backdated its row on the way out" ;;
+    *"departure=1 "*) fail "fence: a fenced node still recorded a clean departure on the way out" ;;
     *) pass "fence: a fenced node left its row alone at unmount" ;;
     esac
 else

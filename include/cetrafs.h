@@ -1011,8 +1011,32 @@ typedef struct {
     __le32  frees_inflight;
     __le32  frees_seq;
 
-    u8   reserved[20];
+    /* Why a REGISTERED row is not beating, if it is not (format 0x000A):
+     * CETRAFS_NODE_DEPART_*.
+     *
+     * NONE: the node is mounted -- or crashed, with nobody having said
+     * so yet; an observer watches hb_seq to tell which. CLEAN: the node
+     * unmounted and recorded it (cetrafs_node_mark_offline()); it holds
+     * no claims, and when it comes back it re-attaches with nothing to
+     * sweep. DEAD: a peer watched it stop for the whole stale window and
+     * recorded the verdict while fencing it (the no-CAW mount gate):
+     * nobody need watch it again, but its claims are still on the device,
+     * so when it comes back it re-attaches as after a crash and sweeps
+     * them. Registration and re-attach set NONE.
+     *
+     * These used to share one sentinel, last_seen == 0, and a node the
+     * gate had declared dead came back as if it had left cleanly,
+     * skipped its own-claim sweeps, and left its old claims reading live
+     * (L3). last_seen is now only the time of the last beat. */
+    __le32  departure;
+
+    u8   reserved[16];
 } CETRA_PACKED cetrafs_node_entry_t; /* 128 bytes */
+
+/* cetrafs_node_entry_t.departure values. */
+#define CETRAFS_NODE_DEPART_NONE  0 /* mounted, or crashed with no verdict yet */
+#define CETRAFS_NODE_DEPART_CLEAN 1 /* unmounted and said so: nothing to sweep */
+#define CETRAFS_NODE_DEPART_DEAD  2 /* declared dead by a peer that watched it: claims remain */
 
 typedef char cetrafs_node_entry_is_128[(sizeof(cetrafs_node_entry_t) == 128) ? 1 : -1];
 

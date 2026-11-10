@@ -217,6 +217,7 @@ static int cetrafs_node_claim_mutate(void *image, unsigned int len, void *priv)
     ne.state = cetrafs_cpu_to_le32(CETRAFS_NODE_STATE_REGISTERED);
     ne.hb_seq = cetrafs_cpu_to_le64(1);
     ne.last_seen = cetrafs_cpu_to_le64(ktime_get_real_seconds());
+    ne.departure = cetrafs_cpu_to_le32(CETRAFS_NODE_DEPART_NONE);
     /* Advertise our tick rate so peers can floor their staleness window
      * at several of OUR beats, rather than at whatever they happen to be
      * configured with. */
@@ -292,6 +293,7 @@ static int cetrafs_node_reattach_mutate(void *image, unsigned int len, void *pri
 
     ne.hb_seq = cetrafs_cpu_to_le64(cetrafs_le64(ne.hb_seq) + 1);
     ne.last_seen = cetrafs_cpu_to_le64(ktime_get_real_seconds());
+    ne.departure = cetrafs_cpu_to_le32(CETRAFS_NODE_DEPART_NONE); /* mounted again */
     ne.hb_interval_secs = cetrafs_cpu_to_le32(ctx->hb_interval);
     ne.stale_secs = cetrafs_cpu_to_le32(ctx->stale_secs);
     /* Re-stamp the cluster file-lock mode: a returning node conforms to
@@ -350,17 +352,18 @@ static int cetrafs_node_fence_mutate(void *image, unsigned int len, void *priv)
 
     /*
      * Is the verdict still about this row's CURRENT incarnation? A
-     * stale verdict rests on one of two things: the departed sentinel
-     * (last_seen == 0), or the watch seeing hb_seq stand still. A node
+     * stale verdict rests on one of two things: a recorded departure
+     * (departure != NONE), or the watch seeing hb_seq stand still. A node
      * that remounted between the verdict and here re-attached to the
-     * same row -- same id -- and wrote last_seen and moved hb_seq on.
+     * same row -- same id -- set departure back to NONE and moved
+     * hb_seq on.
      * Fencing it then revoked a LIVE node's lease, and the caller went
      * on to take what the new incarnation holds. The row is the
      * judge: departed still means departed (the watch is not updated
      * for a departed row, so its seq says nothing then); otherwise the
      * seq must be the one judged.
      */
-    if (ctx->check_verdict && ne.last_seen != 0 &&
+    if (ctx->check_verdict && cetrafs_le32(ne.departure) == CETRAFS_NODE_DEPART_NONE &&
         (!ctx->have_seq || cetrafs_le64(ne.hb_seq) != ctx->seq)) {
         ctx->reattached = true;
         return 1; /* write nothing */
@@ -369,24 +372,25 @@ static int cetrafs_node_fence_mutate(void *image, unsigned int len, void *priv)
     ne.fence_epoch = cetrafs_cpu_to_le64(cetrafs_le64(ne.fence_epoch) + 1);
     ctx->seen_epoch = cetrafs_le64(ne.fence_epoch);
     ctx->landed_seq = cetrafs_le64(ne.hb_seq);
-    /* Record the verdict as well as revoking the lease: last_seen = 0 is
-     * this format's "left deliberately" sentinel, and writing it means
-     * the next observer costs one block read instead of another full
-     * watch window. Only the mount gate asks for this, because only the
-     * mount gate has actually WATCHED the row long enough to conclude
-     * it. (The row stays REGISTERED so the owner can still re-attach by
-     * UUID on its next mount -- freeing it would cost that node its own
-     * identity, which is the bug cetrafs_node_mark_offline() was written
-     * around.) */
+    /* Record the verdict as well as revoking the lease: departure = DEAD
+     * means the next observer costs one block read instead of another
+     * full watch window. Only the mount gate asks for this, because only
+     * the mount gate has actually WATCHED the row long enough to conclude
+     * it. DEAD, never CLEAN: the node did not leave, its claims are still
+     * on the device, and when it comes back it must re-attach as after a
+     * crash and sweep them (L3). (The row stays REGISTERED so the owner
+     * can still re-attach by UUID on its next mount -- freeing it would
+     * cost that node its own identity, which is the bug
+     * cetrafs_node_mark_offline() was written around.) */
     if (ctx->mark_departed)
-        ne.last_seen = 0;
+        ne.departure = cetrafs_cpu_to_le32(CETRAFS_NODE_DEPART_DEAD);
 
     cetrafs_node_image_commit(image, len, &ne);
     return 0;
 }
 
 /*
- * Leave: clear our own last_seen, the "departed deliberately" sentinel,
+ * Leave: record our own departure as CLEAN,
  * and touch nothing else.
  *
  * As a CAS, not a read-modify-write. The blind write this replaces
@@ -411,12 +415,12 @@ static int cetrafs_node_depart_mutate(void *image, unsigned int len, void *priv)
 
     if (cetrafs_le32(ne.state) != CETRAFS_NODE_STATE_REGISTERED)
         return 1; /* already gone: nothing to do, and not an error */
-    if (ne.last_seen == 0)
-        return 1; /* somebody already recorded our departure */
+    if (cetrafs_le32(ne.departure) != CETRAFS_NODE_DEPART_NONE)
+        return 1; /* already recorded: ours, or a peer's verdict that stands */
     if (!cetrafs_node_image_ok(&ne))
         return -EUCLEAN;
 
-    ne.last_seen = 0;
+    ne.departure = cetrafs_cpu_to_le32(CETRAFS_NODE_DEPART_CLEAN);
     cetrafs_node_image_commit(image, len, &ne);
     return 0;
 }
@@ -822,13 +826,13 @@ int cetrafs_node_register(struct super_block *sb,
 
             /* Is the row ours because we LEFT it, or because another
              * machine with our identity is using it right now? A clean
-             * departure (last_seen == 0) answers itself. Otherwise watch
+             * departure (departure == CLEAN) answers itself. Otherwise watch
              * it: a previous incarnation of this machine that crashed
              * never beats again, a live twin does. Taking a live twin's
              * row makes two machines one node -- same Zone Groups, same
              * allocations -- which nothing downstream can detect. Paid
              * only on a mount after an unclean shutdown. */
-            if (ne.last_seen != 0) {
+            if (cetrafs_le32(ne.departure) != CETRAFS_NODE_DEPART_CLEAN) {
                 ret = cetrafs_node_row_quiet(sb, idx, &ne);
                 if (ret == -EBUSY) {
                     pr_err(
@@ -868,8 +872,8 @@ int cetrafs_node_register(struct super_block *sb,
              * and re-attaching makes them read as LIVE again -- nobody
              * reclaims from a node that beats. The mount sweeps them
              * (cetrafs_lock_sweep_own_claims()). */
-            if (ne.last_seen != 0)
-                cetrafs_sb_note_unclean_reattach(sb);
+            if (cetrafs_le32(ne.departure) != CETRAFS_NODE_DEPART_CLEAN)
+                cetrafs_sb_note_unclean_reattach(sb); /* crashed, or declared DEAD (L3) */
             /* Baseline the fence lease at the epoch in the image the swap
              * COMMITTED -- including epochs bumped while we were away (a
              * previous incarnation being fenced must not fence this fresh
@@ -1169,16 +1173,16 @@ int cetrafs_node_frees_snapshot(struct super_block *sb, u32 my_node_id, bool sel
  * tests/mount_test.sh's own remount-reattach check before this ever
  * shipped.
  *
- * Instead, this backdates last_seen to the epoch -- the one input
- * cetrafs_node_is_stale() actually uses for a REGISTERED row -- so
- * staleness reads as immediate to every peer without disturbing
- * state/node_uuid/hb_seq at all: zonegroup.c's reclaim and lock.c's
+ * Instead, this records departure = CLEAN -- which
+ * cetrafs_node_is_stale() reads before anything else for a REGISTERED
+ * row -- so staleness reads as immediate to every peer without
+ * disturbing state/node_uuid/hb_seq at all: zonegroup.c's reclaim and lock.c's
  * lazy reclaim both see this node's former claims as free for the
  * taking right away, no explicit per-ZG/per-lock release needed (the
  * existing stale-owner reclaim path already handles "owner_node_id
  * points at a stale row", and now it fires immediately instead of
  * after a timeout). The next real mount re-attaches to this same row
- * exactly as before and simply bumps last_seen back to "now".
+ * exactly as before and sets departure back to NONE.
  *
  * No PR lock here, matching cetrafs_node_renew_heartbeat()'s reasoning:
  * this is our own row, already confirmed REGISTERED to us, and nobody
@@ -1229,12 +1233,12 @@ int cetrafs_node_mark_offline(struct super_block *sb, u32 my_node_id)
     if (ret)
         return ret;
 
-    if (check.last_seen != 0) {
-        pr_err("node mark-offline: row %u didn't read back with last_seen cleared\n", my_node_id);
+    if (cetrafs_le32(check.departure) == CETRAFS_NODE_DEPART_NONE) {
+        pr_err("node mark-offline: row %u didn't read back with its departure recorded\n", my_node_id);
         return -EIO;
     }
 
-    pr_info("node mark-offline: row %u backdated, now immediately reclaimable by a peer\n", my_node_id);
+    pr_info("node mark-offline: row %u recorded as departed, now immediately reclaimable by a peer\n", my_node_id);
     return 0;
 }
 
@@ -1581,17 +1585,17 @@ int cetrafs_node_live_peer_exists(struct super_block *sb, const u8 *my_uuid, boo
     if (!hb_before)
         return -ENOMEM;
 
-    /* Snapshot. A row that is FREE, or REGISTERED with last_seen == 0
+    /* Snapshot. A row that is FREE, or REGISTERED with a recorded departure
      * (the clean-departure sentinel), is nobody -- no sleep needed for
      * it and no chance of it waking up during one. */
     for (idx = 0; idx < count; idx++) {
         ret = cetrafs_read_node_entry(sb, idx, &ne);
         if (ret)
             goto out;
-        if (cetrafs_le32(ne.state) != CETRAFS_NODE_STATE_REGISTERED || cetrafs_le64(ne.last_seen) == 0)
+        if (cetrafs_le32(ne.state) != CETRAFS_NODE_STATE_REGISTERED || cetrafs_le32(ne.departure) != CETRAFS_NODE_DEPART_NONE)
             continue;
         /* Our OWN row (a prior incarnation of this node) is not a peer.
-         * A clean-departed own row is already skipped (last_seen == 0);
+         * A departed own row is already skipped (departure != NONE);
          * this excludes an own row still REGISTERED after our own crash,
          * within the stale window -- which a remount must not refuse
          * itself over. */
@@ -1639,7 +1643,7 @@ int cetrafs_node_live_peer_exists(struct super_block *sb, const u8 *my_uuid, boo
         ret = cetrafs_read_node_entry(sb, idx, &ne);
         if (ret)
             goto out;
-        if (cetrafs_le32(ne.state) != CETRAFS_NODE_STATE_REGISTERED || cetrafs_le64(ne.last_seen) == 0)
+        if (cetrafs_le32(ne.state) != CETRAFS_NODE_STATE_REGISTERED || cetrafs_le32(ne.departure) != CETRAFS_NODE_DEPART_NONE)
             continue; /* left, or was freed, while we watched */
         if (cetrafs_le64(ne.hb_seq) != hb_before[idx]) {
             pr_err("node %u is alive and mounted on this volume\n", idx);
@@ -1687,7 +1691,7 @@ out:
 
 /*
  * Call 'visit' for every LIVE foreign Node Registry row that 'wants'
- * selects: REGISTERED, not cleanly departed (last_seen != 0), not ours
+ * selects: REGISTERED, no recorded departure (departure == NONE), not ours
  * (by UUID -- a caller may have no row index yet, and excluding by UUID
  * also skips the row it just claimed), and PROVEN live by its hb_seq
  * moving while we watch.
@@ -1733,7 +1737,7 @@ static int cetrafs_for_each_live_peer(struct super_block *sb,
         ret = cetrafs_read_node_entry(sb, idx, &ne);
         if (ret)
             goto out;
-        if (cetrafs_le32(ne.state) != CETRAFS_NODE_STATE_REGISTERED || cetrafs_le64(ne.last_seen) == 0)
+        if (cetrafs_le32(ne.state) != CETRAFS_NODE_STATE_REGISTERED || cetrafs_le32(ne.departure) != CETRAFS_NODE_DEPART_NONE)
             continue; /* FREE, or cleanly departed */
         if (my_uuid && !memcmp(ne.node_uuid, my_uuid, CETRAFS_NODE_UUID_LEN))
             continue; /* our own row / a prior incarnation of us */
@@ -1770,7 +1774,7 @@ static int cetrafs_for_each_live_peer(struct super_block *sb,
             ret = cetrafs_read_node_entry(sb, idx, &ne);
             if (ret)
                 goto out;
-            if (cetrafs_le32(ne.state) != CETRAFS_NODE_STATE_REGISTERED || cetrafs_le64(ne.last_seen) == 0) {
+            if (cetrafs_le32(ne.state) != CETRAFS_NODE_STATE_REGISTERED || cetrafs_le32(ne.departure) != CETRAFS_NODE_DEPART_NONE) {
                 seq[idx] = 0; /* left, or was freed, while we watched */
                 candidates--;
                 continue;
@@ -2072,7 +2076,7 @@ void cetrafs_node_seed_peer_watch(struct super_block *sb)
 
         if (idx == me || cetrafs_read_node_entry(sb, idx, &ne) != 0)
             continue;
-        if (cetrafs_le32(ne.state) != CETRAFS_NODE_STATE_REGISTERED || cetrafs_le64(ne.last_seen) == 0)
+        if (cetrafs_le32(ne.state) != CETRAFS_NODE_STATE_REGISTERED || cetrafs_le32(ne.departure) != CETRAFS_NODE_DEPART_NONE)
             continue;
         /* Discard the verdict: the point is only to record "this is what
          * its counter read at mount time, and this is when we looked". */
@@ -2112,7 +2116,7 @@ void cetrafs_node_report_clock_skew(struct super_block *sb)
 
         if (idx == me || cetrafs_read_node_entry(sb, idx, &ne) != 0)
             continue;
-        if (cetrafs_le32(ne.state) != CETRAFS_NODE_STATE_REGISTERED || cetrafs_le64(ne.last_seen) == 0)
+        if (cetrafs_le32(ne.state) != CETRAFS_NODE_STATE_REGISTERED || cetrafs_le32(ne.departure) != CETRAFS_NODE_DEPART_NONE)
             continue; /* free, or cleanly departed: its stamp is not a clock reading */
 
         delta = (s64) now - (s64) cetrafs_le64(ne.last_seen);
@@ -2165,13 +2169,12 @@ int cetrafs_node_is_stale(struct super_block *sb, u32 node_id, bool *out_stale)
     }
 
     /*
-     * A cleanly departed node backdates its own last_seen to 0
-     * (cetrafs_node_mark_offline), so a peer can reclaim from it at once
-     * instead of waiting out the timeout. That sentinel is a single
-     * exact value, not a duration, so it needs no clock at all and stays
-     * exactly as reliable as it ever was.
+     * A recorded departure -- the node's own clean unmount
+     * (cetrafs_node_mark_offline()), or a peer's DEAD verdict -- lets a
+     * peer reclaim at once instead of waiting out the timeout. An exact
+     * value, not a duration, so it needs no clock at all.
      */
-    if (ne.last_seen == 0) {
+    if (cetrafs_le32(ne.departure) != CETRAFS_NODE_DEPART_NONE) {
         *out_stale = true;
         return 0;
     }

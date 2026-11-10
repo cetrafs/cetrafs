@@ -203,11 +203,12 @@ and the inode lock fields store elsewhere.
 | node_uuid[16] | the node's stable machine UUID (`uuid.c`), raw 128-bit |
 | state | `CETRAFS_NODE_STATE_FREE` (0), `_REGISTERED` (1), or `_REPAIR` (2) — an offline repairer (`fsck -r`, `growfs`) holding the volume. `fill_super()` refuses to mount while such a row is still being refreshed; it is a lease, so a repairer that dies releases the volume after the usual staleness window |
 | hb_seq | heartbeat sequence, bumped every heartbeat tick while mounted |
-| last_seen | unix seconds of the last heartbeat write (backdated to the epoch on a clean unmount, so peers see the departure immediately) |
+| last_seen | unix seconds of the last heartbeat write; informational only (liveness is judged by watching hb_seq, never by a timestamp) |
 | label[32] | informational hostname, NUL-terminated; not used for identity |
 | checksum | CRC32C over the row with this field zeroed |
 | fence_epoch | the node's lease: bumped by whoever reclaims this row's claims; the owner self-fences when it changes |
 | hb_interval_secs | this node's own tick rate, so a peer judges staleness against the rate the node actually beats at, not the observer's setting |
+| departure | why a REGISTERED row is not beating (0x000A): `NONE` (mounted, or crashed with no verdict yet -- observers watch hb_seq), `CLEAN` (the node unmounted and said so: peers reclaim at once, and it re-attaches with nothing to sweep), `DEAD` (a peer watched it stop and recorded the verdict while fencing it -- the no-CAW mount gate: nobody watches it again, and when it comes back it re-attaches as after a crash and sweeps its old claims). Registration and re-attach set `NONE`. These used to share one sentinel, `last_seen == 0`, and a node declared dead came back as if it had left cleanly (L3) |
 | stale_secs | this node's own stale window (how long it waits for a silent peer), re-written every beat since it is a runtime control. The tools (`mkfs`, `fsck`, `growfs`) watch a live-looking row for the longest window any live row advertises, floored at four of its beats; a value outside 15..240 counts as 240 (format 0x000A) |
 | caps | `__le32` bitmask of node capabilities (e.g., `CETRAFS_NODE_CAP_LIVE_GROW`), set by the node at registration. Gates features that require understanding new on-disk structures or sematics; a 0.8.x node without the bit cannot mount during a live grow |
 | frees_inflight, frees_seq | set (and the seq bumped) before a publish that drops blocks the node then frees -- truncate, punch, a defrag step, xattr removal -- and cleared by its heartbeat once none is left; any node's scrub skips its cycle while a live row is set or a seq moved during it, since the dropped blocks are named by nothing until freed |

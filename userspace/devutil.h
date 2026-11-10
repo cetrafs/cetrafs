@@ -116,7 +116,7 @@ static inline int cetrafs_device_mounted(const char *dev, char *where, size_t wh
  * sampling twice far enough apart answers the question with no clock
  * agreement required at all. The cost is the wait, which is paid ONLY
  * when some row actually looks like it might be live: a never-mounted
- * device, or one every node left cleanly (last_seen == 0), returns
+ * device, or one every node has a recorded departure for, returns
  * immediately.
  *
  * Returns 1 and fills the out-parameters for the first live peer found,
@@ -236,9 +236,10 @@ static inline int cetrafs_read_live_candidate(int fd,
     if (!cetrafs_node_row_crc_ok(&ne))
         return 2; /* never verified, re-read included: the caller decides */
 
-    /* An explicit clean departure. A single exact sentinel, not a
+    /* A recorded departure -- the node's own clean unmount, or a peer's
+     * DEAD verdict after watching it stop. An exact value, not a
      * duration, so it needs no clock and stays reliable under skew. */
-    if (ne.last_seen == 0)
+    if (cetrafs_le32(ne.departure) != CETRAFS_NODE_DEPART_NONE)
         return 0;
 
     *out = ne;
@@ -650,8 +651,8 @@ static inline int cetrafs_find_repair_claim(int fd,
  * full of departed nodes is the normal state of a cluster that has been
  * reinstalled a few times, and a volume that cannot be REPAIRED because
  * every row is spoken for would be a trap of its own -- so a row whose
- * node has provably left (the last_seen == 0 clean-departure sentinel,
- * or a lease older than the staleness window) is borrowed and restored.
+ * node has provably left (departure == CLEAN, or a lease older than the
+ * staleness window) is borrowed and restored.
  * The node it belongs to re-attaches by UUID, and a mount cannot happen
  * while the claim is live anyway.
  */
@@ -844,7 +845,7 @@ static inline int cetrafs_repair_claim(int fd, const cetrafs_superblock_t *sb, c
 
     /*
      * Pass 0 takes a free row; pass 1 borrows a cleanly departed one
-     * (last_seen == 0); pass 2 borrows one whose node is PROVEN gone.
+     * (departure == CLEAN); pass 2 borrows one whose node is PROVEN gone.
      * Never in another order: borrowing while a free row exists would
      * displace a registration for no reason.
      *
@@ -901,7 +902,7 @@ static inline int cetrafs_repair_claim(int fd, const cetrafs_superblock_t *sb, c
             } else {
                 if (cetrafs_le32(ne.state) != CETRAFS_NODE_STATE_REGISTERED)
                     continue;
-                if (pass == 1 && ne.last_seen != 0)
+                if (pass == 1 && cetrafs_le32(ne.departure) != CETRAFS_NODE_DEPART_CLEAN)
                     continue; /* not a clean departure: only a probe can tell */
                 if (pass == 2 && memcmp(blk, seen + (size_t) idx * CETRAFS_BLOCK_SIZE, sizeof(blk)) != 0)
                     continue; /* written during the probe: alive, not ours to take */

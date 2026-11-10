@@ -72,8 +72,8 @@ AFTER="$(nonfree_rows)"
     fail "the refused mount left $AFTER non-free rows -- it registered before refusing"
 
 log "control: no live peer -- the mount proceeds (and the force knob really was what refused it)"
-# Knob off, and the poked row departs (last_seen=0, the clean-departure
-# sentinel the gate skips), so there is no live peer: the mount must proceed.
+# Knob off, and the poked row departs (last_seen 0 plants departure =
+# CLEAN, which the gate skips), so there is no live peer: the mount must proceed.
 ct_param_set nocaw_force_live_peer 0
 "$POKE" "$DEV" 1 1 aa 0 >/dev/null
 blockdev --flushbufs "$DEV"

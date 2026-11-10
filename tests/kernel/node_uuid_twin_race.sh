@@ -51,7 +51,7 @@ ct_mkfs_small "$DEV" >/dev/null
 ct_mount "$DEV" "$MNT"
 require_cetrafs_mount "$MNT"
 ct_umount "$MNT"
-grep -q '^state=1 .*last_seen=0 ' <<<"$("$NODE_POKE" "$DEV" 0)" ||
+grep -q '^state=1 .*departure=1 ' <<<"$("$NODE_POKE" "$DEV" 0)" ||
     { fail "setup: row 0 was not left cleanly: $("$NODE_POKE" "$DEV" 0)"; ct_exit; }
 pass "setup: row 0 is ours, left cleanly"
 ct_param_set register_twin_race 1

@@ -69,8 +69,9 @@ int main(int argc, char **argv)
                 "       %s <image> <row> --label <text>     (fill the label field with <text>, NO terminating NUL)\n"
                 "       %s <image> <row> --caps <bits>      (set the advertised CETRAFS_NODE_CAP_* bits)\n"
                 "       %s <image> <row> --stale <secs>     (set the advertised stale_secs)\n"
+                "       %s <image> <row> --depart <n>       (set the recorded departure: 0 none, 1 clean, 2 dead)\n"
                 "       %s <image> <row> --mode <n>         (set the advertised file_lock_mode: 1 on, 2 off)\n",
-                argv[0], argv[0], argv[0], argv[0], argv[0], argv[0], argv[0], argv[0]);
+                argv[0], argv[0], argv[0], argv[0], argv[0], argv[0], argv[0], argv[0], argv[0]);
         return 2;
     }
 
@@ -116,9 +117,9 @@ int main(int argc, char **argv)
 
     if (dump_only) {
         printf("state=%u hb_seq=%" PRIu64 " last_seen=%" PRIu64 " fence_epoch=%" PRIu64 " hb_interval=%u caps=0x%x mode=%u "
-               "stale_secs=%u\n",
+               "departure=%u stale_secs=%u\n",
                ne.state, ne.hb_seq, ne.last_seen, ne.fence_epoch, ne.hb_interval_secs, cetrafs_le32(ne.caps),
-               cetrafs_le32(ne.file_lock_mode), cetrafs_le32(ne.stale_secs));
+               cetrafs_le32(ne.file_lock_mode), cetrafs_le32(ne.departure), cetrafs_le32(ne.stale_secs));
         close(fd);
         return 0;
     }
@@ -134,8 +135,12 @@ int main(int argc, char **argv)
      * is. This is a peer whose CLOCK disagrees with ours while it is
      * perfectly healthy -- the shape that used to get such a node
      * declared dead and its claims stolen. */
+    /* Both beats also clear the recorded departure: a node that beats is
+     * mounted, which is departure NONE (format 0x000A), and a suite that
+     * beats a row to make it look crashed or live means exactly that. */
     if (argc == 4 && strcmp(argv[3], "--beat-keep-time") == 0) {
         ne.hb_seq = cetrafs_cpu_to_le64(cetrafs_le64(ne.hb_seq) + 1);
+        ne.departure = cetrafs_cpu_to_le32(CETRAFS_NODE_DEPART_NONE);
         ne.checksum = 0;
         ne.checksum = cetrafs_cpu_to_le64(crc32c_struct(&ne, sizeof(ne), offsetof(cetrafs_node_entry_t, checksum), sizeof(cetrafs_le64(ne.checksum))));
         pwrite_all(fd, &ne, sizeof(ne), row_off);
@@ -147,6 +152,7 @@ int main(int argc, char **argv)
     if (argc == 4 && strcmp(argv[3], "--beat") == 0) {
         ne.hb_seq = cetrafs_cpu_to_le64(cetrafs_le64(ne.hb_seq) + 1);
         ne.last_seen = cetrafs_cpu_to_le64((uint64_t) time(NULL));
+        ne.departure = cetrafs_cpu_to_le32(CETRAFS_NODE_DEPART_NONE);
         ne.checksum = 0;
         ne.checksum = cetrafs_cpu_to_le64(crc32c_struct(&ne, sizeof(ne), offsetof(cetrafs_node_entry_t, checksum), sizeof(cetrafs_le64(ne.checksum))));
         pwrite_all(fd, &ne, sizeof(ne), row_off);
@@ -198,6 +204,17 @@ int main(int argc, char **argv)
         return 0;
     }
 
+    /* --depart: set the row's recorded departure (CETRAFS_NODE_DEPART_*). */
+    if (argc == 5 && strcmp(argv[3], "--depart") == 0) {
+        ne.departure = cetrafs_cpu_to_le32((uint32_t) strtoul(argv[4], NULL, 0));
+        ne.checksum = 0;
+        ne.checksum = cetrafs_cpu_to_le64(crc32c_struct(&ne, sizeof(ne), offsetof(cetrafs_node_entry_t, checksum), sizeof(cetrafs_le64(ne.checksum))));
+        pwrite_all(fd, &ne, sizeof(ne), row_off);
+        close(fd);
+        printf("node_poke: row %u departure -> %u\n", row, cetrafs_le32(ne.departure));
+        return 0;
+    }
+
     /* --stale: set the row's advertised stale window (what a node
      * running with that stale_secs writes on every beat). */
     if (argc == 5 && strcmp(argv[3], "--stale") == 0) {
@@ -241,6 +258,11 @@ int main(int argc, char **argv)
     ne.state = cetrafs_cpu_to_le32(state);
     ne.hb_seq = cetrafs_cpu_to_le64(1);
     ne.last_seen = cetrafs_cpu_to_le64(last_seen);
+    /* A last_seen of 0 plants a node that left cleanly: since format
+     * 0x000A that is departure = CLEAN, not the timestamp itself, and
+     * every suite that plants a departed row says it this way. */
+    if (!last_seen)
+        ne.departure = cetrafs_cpu_to_le32(CETRAFS_NODE_DEPART_CLEAN);
     if (argc == 7)
         ne.hb_interval_secs = cetrafs_cpu_to_le32((uint32_t) strtoul(argv[6], NULL, 0));
     ne.checksum = 0;
