@@ -1393,48 +1393,52 @@ int cetrafs_node_my_uuid(u8 out[CETRAFS_NODE_UUID_LEN])
  */
 struct cetrafs_node_reap_ctx {
     u64 judged_seq;
-    const cetrafs_node_entry_t *restore; /* NULL: free the row */
+    bool restored;              /* out: the borrowed row was put back */
+    cetrafs_node_entry_t saved; /* out: what was put back */
 };
 
+/*
+ * The displaced row is read from the very image being swapped: it lives
+ * inside the CAS sector (CETRAFS_REPAIR_SAVED_OFF), so what is restored
+ * is exactly what the claim saved, with nothing between the look and
+ * the swap.
+ */
 static int cetrafs_node_reap_mutate(void *image, unsigned int len, void *priv)
 {
     struct cetrafs_node_reap_ctx *ctx = priv;
     cetrafs_node_entry_t ne;
 
+    ctx->restored = false;
+    if (len < CETRAFS_REPAIR_SAVED_OFF + sizeof(ctx->saved))
+        return -EINVAL;
     memcpy(&ne, image, sizeof(ne));
     if (cetrafs_le32(ne.state) != CETRAFS_NODE_STATE_REPAIR || cetrafs_le64(ne.hb_seq) != ctx->judged_seq)
         return -EEXIST;
+    memcpy(&ctx->saved, (u8 *) image + CETRAFS_REPAIR_SAVED_OFF, sizeof(ctx->saved));
     memset(image, 0, len);
-    if (ctx->restore)
-        memcpy(image, ctx->restore, sizeof(*ctx->restore)); /* its own checksum, verified by the caller */
+    if (cetrafs_le32(ctx->saved.state) == CETRAFS_NODE_STATE_REGISTERED &&
+        cetrafs_node_crc(&ctx->saved) == (u32) cetrafs_le64(ctx->saved.checksum)) {
+        memcpy(image, &ctx->saved, sizeof(ctx->saved)); /* its own checksum, verified just now */
+        ctx->restored = true;
+    }
     return 0;
 }
 
 static void cetrafs_node_reap_repair_claim(struct super_block *sb, u32 idx, u64 judged_seq)
 {
     u64 lba = cetrafs_node_row_lba(sb, idx);
-    cetrafs_node_entry_t saved;
     struct cetrafs_node_reap_ctx ctx = {.judged_seq = judged_seq};
-    struct buffer_head *bh;
     int ret;
 
     if (!lba)
         return;
-    bh = cetrafs_bread_uncached(sb, lba);
-    if (!bh)
-        return; /* cannot read what it borrowed: leave it, never guess */
-    memcpy(&saved, bh->b_data + CETRAFS_REPAIR_SAVED_OFF, sizeof(saved));
-    brelse(bh);
-    if (cetrafs_le32(saved.state) == CETRAFS_NODE_STATE_REGISTERED &&
-        cetrafs_node_crc(&saved) == (u32) cetrafs_le64(saved.checksum))
-        ctx.restore = &saved;
     ret = cetrafs_cas_record(sb, lba, cetrafs_node_reap_mutate, &ctx);
     if (ret)
         pr_warn("node registry: the dead repair claim on row %u could not be reaped (%d)\n", idx, ret);
-    else if (ctx.restore)
+    else if (ctx.restored)
         pr_warn("node registry: reaped the dead repair claim on row %u and gave the row back to the node it "
                 "borrowed it from (%*pE)\n",
-                idx, (int) strnlen(saved.label, sizeof(saved.label)), saved.label);
+                idx, (int) strnlen(ctx.saved.label, sizeof(ctx.saved.label)), ctx.saved.label);
     else
         pr_warn("node registry: reaped the dead repair claim on row %u -- the row is free again\n", idx);
 }

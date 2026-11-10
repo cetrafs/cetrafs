@@ -4,21 +4,20 @@
 #
 # A repair claim keeps the registry row it borrowed in its own block, at
 # CETRAFS_REPAIR_SAVED_OFF, so whoever reaps the claim after its
-# repairer dies can put the registration back. On a disk with 512-byte
-# sectors that is the block's tail, outside the one sector COMPARE AND
-# WRITE covers, and the tools wrote it with a blind write before every
-# swap. A reap that judged a claim dead, and then lost its swap because
-# the repairer renewed, had already zeroed the live claim's saved row:
-# when that repairer did die, the borrowed registration was gone
-# (audit 2026-11-06 L24). Only a claim writes the tail now.
+# repairer dies can put the registration back. A reap that judged a
+# claim dead, and then lost its swap because the repairer renewed, must
+# leave the live claim's saved row alone (audit 2026-11-06 L24). Since
+# format 0x000A the saved row lies inside the sector the swap covers, so
+# a miscompared reap writes nothing at all;
+# repair_claim_saved_atomic covers the claim side of the same race.
 #
 # Staged on an LIO disk (512-byte sectors, real CAW): a live claim in row
 # 2 borrowing a registered row; a reap judges it and is held
 # (CETRAFS_TEST_REAP_GAP_SECS) while the claim renews. The reap must
 # miscompare, and the saved row must still be there.
 #
-# DISCRIMINATION: writing the tail on every swap, the miscompared reap
-# leaves the saved row zeroed.
+# DISCRIMINATION: a reap writing the rest of the block blind before its
+# swap leaves the saved row zeroed.
 set -euo pipefail
 . "$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)/lib/harness.sh"
 require_root
@@ -28,7 +27,6 @@ RRP="$(ct_helper repair_reap_probe)"
 IMG="$(ct_image 600 rreap)"
 DISK="$(ct_lio_disks "$IMG" 1)" || { skip "no LIO loopback target here"; ct_exit; }
 ct_mkfs "$DISK" -z 1 -b 512 -J 0 -M 4 -N 1024 -f >/dev/null
-[ "$(blockdev --getss "$DISK")" -lt 4096 ] || { skip "the LIO disk has 4 KiB sectors: no separate tail"; ct_exit; }
 
 "$RRP" "$DISK" plant 2
 S0="$("$RRP" "$DISK" show 2)"

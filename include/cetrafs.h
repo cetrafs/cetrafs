@@ -890,13 +890,18 @@ typedef struct {
 
 /* A repair claim that BORROWED a registered row (no FREE row was left)
  * keeps the row it displaced in its own block, at this byte offset --
- * past the 128-byte entry and out of reach of the row CAS, which writes
- * the first sector only. The release puts it back; so does whoever
+ * right after the 128-byte entry, inside the first 512-byte sector, so
+ * the one compare-and-write that lands the claim lands the saved copy
+ * with it (format 0x000A). It used to sit at 2048, outside the swap, and
+ * was written first: two repairers racing for one row could have the
+ * loser's tail write land after the winner's and erase the row the
+ * winner had saved (L24). The release puts it back; so does whoever
  * reaps the claim of a repairer that died. A copy whose state is not
  * REGISTERED or whose checksum fails means "nothing was borrowed": the
- * row is reaped to FREE. Zero on a volume mkfs wrote, and on every claim
- * that took a FREE row. */
-#define CETRAFS_REPAIR_SAVED_OFF 2048
+ * row is reaped to FREE. Zero on a volume mkfs wrote, on every claim
+ * that took a FREE row, and on every row a node writes (a node's own
+ * swaps clear the rest of the sector). */
+#define CETRAFS_REPAIR_SAVED_OFF 128
 
 /* Hard cap on registry rows, set by cetrafs_inode_t.read_open_nodes being
  * a 64-bit presence mask. Enforced by mkfs on -M, so the mask can never
@@ -1039,6 +1044,11 @@ typedef struct {
 #define CETRAFS_NODE_DEPART_DEAD  2 /* declared dead by a peer that watched it: claims remain */
 
 typedef char cetrafs_node_entry_is_128[(sizeof(cetrafs_node_entry_t) == 128) ? 1 : -1];
+/* The saved copy sits after the entry and inside the smallest CAS unit. */
+typedef char cetrafs_repair_saved_in_cas_sector[(CETRAFS_REPAIR_SAVED_OFF >= sizeof(cetrafs_node_entry_t) &&
+                                                 CETRAFS_REPAIR_SAVED_OFF + sizeof(cetrafs_node_entry_t) <= 512)
+                                                    ? 1
+                                                    : -1];
 
 /* cetrafs_node_entry_t.file_lock_mode values. */
 #define CETRAFS_FLOCK_MODE_UNSET 0 /* no opinion (old/FREE row) -- ignore */

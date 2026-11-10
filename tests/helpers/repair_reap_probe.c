@@ -9,9 +9,9 @@
  *   renew  sector 0 only, hb_seq + 1: the live repairer's renewal
  *   reap   judge the row as it stands now and reap it (the gap between
  *          the judgement and the swap is CETRAFS_TEST_REAP_GAP_SECS)
- *   show   "state=<n> hb=<n> saved=<state> saved_ok=<0|1>"
+ *   show   "state=<n> hb=<n> saved=<state> saved_ok=<0|1> saved_hb=<n>"
  * Every probe-side read and write is O_DIRECT: a page-cache writeback of
- * the whole block would hide what the swap did to its tail.
+ * the whole block would hide what a swap did to the rest of it.
  */
 #define _GNU_SOURCE
 #include <errno.h>
@@ -103,10 +103,6 @@ int main(int argc, char **argv)
             fprintf(stderr, "no COMPARE AND WRITE on %s\n", argv[1]);
             return 3;
         }
-        if (cetrafs_caw_lbs >= CETRAFS_BLOCK_SIZE) {
-            fprintf(stderr, "logical block %u: the row has no separate tail\n", cetrafs_caw_lbs);
-            return 3;
-        }
         if (dread(dfd, off, CETRAFS_BLOCK_SIZE))
             return 1;
         memcpy(&ne, dbuf, sizeof(ne));
@@ -121,9 +117,9 @@ int main(int argc, char **argv)
             return 1;
         memcpy(&ne, dbuf, sizeof(ne));
         memcpy(&saved, dbuf + CETRAFS_REPAIR_SAVED_OFF, sizeof(saved));
-        printf("state=%u hb=%llu saved=%u saved_ok=%d\n", cetrafs_le32(ne.state),
+        printf("state=%u hb=%llu saved=%u saved_ok=%d saved_hb=%llu\n", cetrafs_le32(ne.state),
                (unsigned long long) cetrafs_le64(ne.hb_seq), cetrafs_le32(saved.state),
-               cetrafs_node_row_crc_ok(&saved));
+               cetrafs_node_row_crc_ok(&saved), (unsigned long long) cetrafs_le64(saved.hb_seq));
         return 0;
     }
     fprintf(stderr, "unknown mode %s\n", argv[2]);
