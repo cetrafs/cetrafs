@@ -705,35 +705,44 @@ static inline unsigned cetrafs_peer_probe_secs(void)
 }
 
 /*
- * How long a tool watches a row that looks mounted before calling its
- * node gone: exactly as long as a mounted peer would -- the stale
- * window, floored at four of the row's own advertised beats
- * (cetrafs_node_is_stale(), and the kernel's own mount probe).
- *
- * It was two beats plus 5 s, 20 s at the default interval. But the
- * stale window is 120 s for a reason that has nothing to do with
- * heartbeats (cetrafs.h, CETRAFS_NODE_STALE_SECS): a node whose paths
- * have all failed has its I/O QUEUED by multipath for up to 90 s, its
- * heartbeat included, and then it all lands. A tool that waited 20 s
- * formatted or repaired a volume such a node was about to write to --
- * the inversion that window was raised to prevent, re-opened by the
- * one caller that blocks a human at a prompt. Paid only when some row
- * looks live. Clamped to the legal maximum interval, so a hostile row
- * cannot make us sleep for days; 0 is a row that predates the field.
+ * The stale window a row advertises (cetrafs_node_entry_t.stale_secs):
+ * how long that node waits for a silent peer. Anything outside the legal
+ * range -- a row that is garbage, torn, or not a registered node at
+ * all -- counts as the longest window a node may run, never as a short
+ * one: the error must make a tool wait longer, not act sooner.
  */
-static inline unsigned cetrafs_probe_window(uint32_t max_advertised)
+static inline unsigned cetrafs_row_stale_secs(const cetrafs_node_entry_t *r)
+{
+    uint32_t v = cetrafs_le32(r->stale_secs);
+
+    return v >= CETRAFS_STALE_MIN_SECS && v <= CETRAFS_STALE_MAX_SECS ? v : CETRAFS_STALE_MAX_SECS;
+}
+
+/*
+ * How long a tool watches a row that looks mounted before calling its
+ * node gone: as long as the most patient live node would. That is the
+ * longest stale window any live row advertises (max_stale, from
+ * cetrafs_row_stale_secs()), floored at four of the slowest row's own
+ * beats (cetrafs_node_is_stale(), and the kernel's own mount probe).
+ *
+ * The wait has to be the PEERS' window, not a short guess: a node whose
+ * paths have all failed has its I/O QUEUED by multipath for up to 90 s,
+ * its heartbeat included, and then it all lands. A tool that waited 20 s
+ * formatted or repaired a volume such a node was about to write to, and
+ * one that waited the default 120 s called a node gone that its peers,
+ * at 240 s, still waited for (audit F9). Before the window was on the
+ * device every tool waited the legal maximum, 240 s, whatever the
+ * cluster ran. Paid only when some row looks live. Both inputs are
+ * clamped to their legal maxima, so a hostile row cannot make us sleep
+ * for days.
+ */
+static inline unsigned cetrafs_probe_window(uint32_t max_advertised, unsigned max_stale)
 {
     unsigned knob = cetrafs_peer_probe_secs();
     uint32_t pi = max_advertised < CETRAFS_HB_INTERVAL_MAX_SECS ? max_advertised : CETRAFS_HB_INTERVAL_MAX_SECS;
-    /*
-     * The LONGEST stale window a node may run, not the default: each
-     * mount's stale_secs is an operator control (15..240 s, OPERATIONS.md
-     * section 5) and is not on the device, so a tool cannot know which a
-     * live node chose -- and one that waited the default 120 s called a
-     * node gone that its peers, at 240 s, still waited for (audit F9).
-     * Paid only when some row looks live.
-     */
-    unsigned window = CETRAFS_STALE_MAX_SECS;
+    unsigned window = max_stale >= CETRAFS_STALE_MIN_SECS && max_stale <= CETRAFS_STALE_MAX_SECS
+                          ? max_stale
+                          : CETRAFS_STALE_MAX_SECS;
 
     if (knob) /* tests: the old two-beat rule over a compressed base */
         return pi && 2 * pi + 5 > knob ? 2 * pi + 5 : knob;
@@ -814,6 +823,7 @@ static inline int cetrafs_node_table_placed_ok(int fd, const cetrafs_superblock_
 static inline int cetrafs_repair_claim(int fd, const cetrafs_superblock_t *sb, const char *label)
 {
     uint32_t count = cetrafs_le32(sb->node_table_count), idx, slowest = 0;
+    unsigned patience = 0;
     unsigned char *seen = NULL, cur[CETRAFS_BLOCK_SIZE];
     int pass, caw;
 
@@ -862,15 +872,18 @@ static inline int cetrafs_repair_claim(int fd, const cetrafs_superblock_t *sb, c
                 const cetrafs_node_entry_t *r =
                     (const cetrafs_node_entry_t *) (seen + (size_t) idx * CETRAFS_BLOCK_SIZE);
 
-                if (cetrafs_le32(r->state) == CETRAFS_NODE_STATE_REGISTERED &&
-                    cetrafs_le32(r->hb_interval_secs) > slowest)
+                if (cetrafs_le32(r->state) != CETRAFS_NODE_STATE_REGISTERED)
+                    continue;
+                if (cetrafs_le32(r->hb_interval_secs) > slowest)
                     slowest = cetrafs_le32(r->hb_interval_secs);
+                if (cetrafs_row_stale_secs(r) > patience)
+                    patience = cetrafs_row_stale_secs(r);
             }
             fprintf(stderr,
                     "no free or cleanly released registry row; watching for %us for one whose node is gone...\n",
-                    cetrafs_probe_window(slowest));
+                    cetrafs_probe_window(slowest, patience));
             fflush(stderr);
-            cetrafs_sleep_full(cetrafs_probe_window(slowest));
+            cetrafs_sleep_full(cetrafs_probe_window(slowest, patience));
             posix_fadvise(fd, 0, 0, POSIX_FADV_DONTNEED); /* or the re-read is served from our cache */
         }
         for (idx = 0; idx < count; idx++) {
@@ -1313,6 +1326,7 @@ static inline int cetrafs_find_live_peer_on(int fd,
     cetrafs_superblock_t sb = *sbp;
     cetrafs_node_entry_t *first = NULL;
     uint32_t count, idx, ncand = 0, slowest = 0;
+    unsigned patience = 0;
     unsigned budget = CETRAFS_ROW_SETTLE_BUDGET_MS;
     int found = 0;
 
@@ -1348,6 +1362,8 @@ static inline int cetrafs_find_live_peer_on(int fd,
             ncand++;
             if (cetrafs_le32(first[idx].hb_interval_secs) > slowest)
                 slowest = cetrafs_le32(first[idx].hb_interval_secs);
+            if (cetrafs_row_stale_secs(&first[idx]) > patience)
+                patience = cetrafs_row_stale_secs(&first[idx]);
         } else if (rc == 2) {
             /* REGISTERED but never verified, re-reads included. Most
              * likely garbage -- but a live node's row that stayed torn
@@ -1359,6 +1375,7 @@ static inline int cetrafs_find_live_peer_on(int fd,
              * is garbage. It costs one window, never a refusal. */
             iscand[idx] = 2;
             ncand++;
+            patience = CETRAFS_STALE_MAX_SECS; /* its window is unknown: assume the longest */
         }
     }
     if (ncand == 0) {
@@ -1370,7 +1387,7 @@ static inline int cetrafs_find_live_peer_on(int fd,
     /* Pass 2: give every candidate more than one full heartbeat interval
      * to prove it is alive by moving its own counter. */
     {
-        unsigned probe = cetrafs_probe_window(slowest);
+        unsigned probe = cetrafs_probe_window(slowest, patience);
 
         fprintf(stderr,
                 "%s: %u node registry row(s) look mounted; watching for %us to see whether they are "

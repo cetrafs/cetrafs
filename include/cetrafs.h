@@ -6,9 +6,8 @@
  * the kernel module and the userspace tools. CETRAFS_VERSION (below) is
  * the format version; it is bumped freely and, as a rule, never
  * migrated (pre-1.0, no backward compatibility -- reformat to move
- * between versions). The ONE exception is CETRAFS_VERSION_MIN: see the
- * comment on it for why the 0x0008 -> 0x0009 step accepts both, and why
- * that is temporary.
+ * between versions). CETRAFS_VERSION_MIN once opened a window for the
+ * 0x0008 -> 0x0009 step; it is closed, see the comment on it.
  *
  * Shape of the format:
  *  - Default Block Group (BG) size 1 GiB (mkfs can override).
@@ -123,32 +122,20 @@
  * churn, every step reformatted per the no-compat policy, so the
  * numbers carried no information worth keeping. Historical write-ups
  * (CLAUDE.md, docs) still say "format v0x000B" etc. about that era. */
-#define CETRAFS_VERSION              0x0009
+#define CETRAFS_VERSION              0x000A
 
 /*
  * The OLDEST on-disk version this build will mount, fsck or grow.
  *
- * This is the first time the no-compat policy has been relaxed, and it
- * is deliberate and temporary. 0x0009 exists so that a GROWN volume is
- * refused by builds that predate the grow feature -- their fsck demands
- * pending_free_start immediately after the node table, and their kernel
- * module demands bg_regions_start >= 1+Z+B, neither of which a
- * relocated layout satisfies. Without a version gate those builds
- * report a healthy grown volume as structurally damaged, which is an
- * invitation to run `fsck -r` on it.
+ * Equal to CETRAFS_VERSION: only the current format mounts, and an older
+ * volume is refused and must be reformatted (the pre-1.0 policy). It was
+ * relaxed once, to 0x0008, so volumes from 0.8.x could be grown in place;
+ * that window closed in 0.9.2.
  *
- * So: mkfs writes 0x0009 and growfs stamps 0x0009 on any volume it
- * grows.
- *
- * The transitional window is CLOSED as of 0.9.2. It existed so volumes
- * formatted by 0.8.x could be grown in place instead of rebuilt; that
- * window has served its purpose and this build accepts 0x0009 only.
- * A 0.8.x volume is refused at mount and must be reformatted -- the
- * ordinary pre-1.0 policy, resumed.
- *
- * Note what this does NOT mean: a 0x0009 volume is not necessarily a
- * grown one (mkfs stamps it from birth). "Has this been grown?" is
- * answered by layout_gen in the superblock, not by the version.
+ * 0x000A (after 0.9.5): one format change landing every fix that needed
+ * a field the format did not have -- see the history in
+ * docs/ARCHITECTURE.md. growfs stamps CETRAFS_VERSION on what it grows;
+ * "has this been grown?" is layout_gen, not the version.
  */
 #define CETRAFS_VERSION_MIN          CETRAFS_VERSION
 
@@ -948,6 +935,21 @@ typedef struct {
      * configured window. */
     __le32  hb_interval_secs;
 
+    /* This node's stale window, in seconds, as it is actually running
+     * right now: how long IT waits for a silent peer before declaring
+     * that peer dead. Written at registration and re-written on every
+     * beat, because it is a runtime control (procfs `controls`).
+     *
+     * A tool that must decide a live-looking row is gone (mkfs, fsck,
+     * growfs) has to wait at least as long as the most patient live
+     * node would, or it acts on a volume a peer still considers in use.
+     * Without this it could only assume the largest legal window,
+     * CETRAFS_STALE_MAX_SECS, and every such tool sat 240 s at a prompt
+     * whatever the cluster actually ran (format 0x000A). Always within
+     * [CETRAFS_STALE_MIN_SECS, CETRAFS_STALE_MAX_SECS] on a REGISTERED
+     * row; a reader treats anything else as the maximum. */
+    __le32  stale_secs;
+
     /* The cluster-wide file-lock mode this node is running, as established
      * by whichever node mounted FIRST (the "lead"). A node joining a
      * cluster with a live peer ADOPTS that peer's mode rather than its own
@@ -989,8 +991,10 @@ typedef struct {
     __le32  frees_inflight;
     __le32  frees_seq;
 
-    u8   reserved[24];
+    u8   reserved[20];
 } CETRA_PACKED cetrafs_node_entry_t; /* 128 bytes */
+
+typedef char cetrafs_node_entry_is_128[(sizeof(cetrafs_node_entry_t) == 128) ? 1 : -1];
 
 /* cetrafs_node_entry_t.file_lock_mode values. */
 #define CETRAFS_FLOCK_MODE_UNSET 0 /* no opinion (old/FREE row) -- ignore */

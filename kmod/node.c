@@ -174,6 +174,7 @@ struct cetrafs_node_claim_ctx {
     /* The mutator runs inside the compare-and-swap and has no super_block
      * to ask, so this mount's advertised beat rate is passed in. */
     unsigned int hb_interval;
+    unsigned int stale_secs;
     /* The cluster file-lock mode to advertise in our row (already resolved
      * by fill_super: adopted from the lead, or our own if we ARE the lead). */
     u32 file_lock_mode;
@@ -220,6 +221,7 @@ static int cetrafs_node_claim_mutate(void *image, unsigned int len, void *priv)
      * at several of OUR beats, rather than at whatever they happen to be
      * configured with. */
     ne.hb_interval_secs = cetrafs_cpu_to_le32(ctx->hb_interval);
+    ne.stale_secs = cetrafs_cpu_to_le32(ctx->stale_secs);
     ne.file_lock_mode = cetrafs_cpu_to_le32(ctx->file_lock_mode);
     /* Advertise what this build understands. A constant for the running
      * module -- any node on this code is live-grow-safe; a node without
@@ -252,6 +254,7 @@ static int cetrafs_node_claim_mutate(void *image, unsigned int len, void *priv)
 struct cetrafs_node_reattach_ctx {
     const u8 *uuid;
     unsigned int hb_interval;
+    unsigned int stale_secs;
     u32 file_lock_mode;
     u32 caps;          /* CETRAFS_NODE_CAP_* this mount advertises */
     u64 expect_hb_seq; /* the beat count the row had when it was judged ours */
@@ -290,6 +293,7 @@ static int cetrafs_node_reattach_mutate(void *image, unsigned int len, void *pri
     ne.hb_seq = cetrafs_cpu_to_le64(cetrafs_le64(ne.hb_seq) + 1);
     ne.last_seen = cetrafs_cpu_to_le64(ktime_get_real_seconds());
     ne.hb_interval_secs = cetrafs_cpu_to_le32(ctx->hb_interval);
+    ne.stale_secs = cetrafs_cpu_to_le32(ctx->stale_secs);
     /* Re-stamp the cluster file-lock mode: a returning node conforms to
      * whatever the cluster is now, not whatever it ran last time. */
     ne.file_lock_mode = cetrafs_cpu_to_le32(ctx->file_lock_mode);
@@ -811,6 +815,7 @@ int cetrafs_node_register(struct super_block *sb,
             !memcmp(ne.node_uuid, my_uuid.b, CETRAFS_NODE_UUID_LEN)) {
             struct cetrafs_node_reattach_ctx ctx = {.uuid = my_uuid.b,
                                                     .hb_interval = cetrafs_heartbeat_interval_secs(sb),
+                                                    .stale_secs = cetrafs_sb_stale_secs(sb),
                                                     .file_lock_mode = file_lock_mode,
                                                     .caps = cetrafs_node_my_caps(sb),
                                                     .expect_hb_seq = cetrafs_le64(ne.hb_seq)};
@@ -900,6 +905,7 @@ int cetrafs_node_register(struct super_block *sb,
         struct cetrafs_node_claim_ctx ctx = {
             .uuid = my_uuid.b,
             .hb_interval = cetrafs_heartbeat_interval_secs(sb),
+            .stale_secs = cetrafs_sb_stale_secs(sb),
             .file_lock_mode = file_lock_mode,
             .caps = cetrafs_node_my_caps(sb),
         };
@@ -962,6 +968,7 @@ struct cetrafs_node_renew_ctx {
     /* This mount's advertised beat rate: the mutator runs inside the
      * compare-and-swap and has no super_block to ask. */
     unsigned int hb_interval;
+    unsigned int stale_secs;
 };
 
 static int cetrafs_node_renew_mutate(void *image, unsigned int len, void *priv)
@@ -1009,6 +1016,7 @@ static int cetrafs_node_renew_mutate(void *image, unsigned int len, void *priv)
      * parameter, so a peer must see the value we are ACTUALLY running
      * at, not the one we registered with. */
     ne.hb_interval_secs = cetrafs_cpu_to_le32(ctx->hb_interval);
+    ne.stale_secs = cetrafs_cpu_to_le32(ctx->stale_secs);
     ne.checksum = cetrafs_cpu_to_le64(cetrafs_node_crc(&ne));
 
     memcpy(image, &ne, sizeof(ne));
@@ -1025,7 +1033,8 @@ static int cetrafs_node_renew_mutate(void *image, unsigned int len, void *priv)
 int cetrafs_node_renew_heartbeat(struct super_block *sb, u32 my_node_id)
 {
     struct cetrafs_node_renew_ctx ctx = {.expect_epoch = cetrafs_sb_get_fence_epoch(sb),
-                                         .hb_interval = cetrafs_heartbeat_interval_secs(sb)};
+                                         .hb_interval = cetrafs_heartbeat_interval_secs(sb),
+                                         .stale_secs = cetrafs_sb_stale_secs(sb)};
     int ret = cetrafs_sb_get_node_uuid(sb, ctx.my_uuid);
 
     if (ret)

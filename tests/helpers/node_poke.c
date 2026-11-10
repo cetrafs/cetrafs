@@ -68,8 +68,9 @@ int main(int argc, char **argv)
                 "       %s <image> <row> --beat-keep-time   (same, but leave last_seen alone: a SKEWED live node)\n"
                 "       %s <image> <row> --label <text>     (fill the label field with <text>, NO terminating NUL)\n"
                 "       %s <image> <row> --caps <bits>      (set the advertised CETRAFS_NODE_CAP_* bits)\n"
+                "       %s <image> <row> --stale <secs>     (set the advertised stale_secs)\n"
                 "       %s <image> <row> --mode <n>         (set the advertised file_lock_mode: 1 on, 2 off)\n",
-                argv[0], argv[0], argv[0], argv[0], argv[0], argv[0], argv[0]);
+                argv[0], argv[0], argv[0], argv[0], argv[0], argv[0], argv[0], argv[0]);
         return 2;
     }
 
@@ -114,9 +115,10 @@ int main(int argc, char **argv)
     pread_all(fd, &ne, sizeof(ne), row_off);
 
     if (dump_only) {
-        printf("state=%u hb_seq=%" PRIu64 " last_seen=%" PRIu64 " fence_epoch=%" PRIu64 " hb_interval=%u caps=0x%x mode=%u\n",
+        printf("state=%u hb_seq=%" PRIu64 " last_seen=%" PRIu64 " fence_epoch=%" PRIu64 " hb_interval=%u caps=0x%x mode=%u "
+               "stale_secs=%u\n",
                ne.state, ne.hb_seq, ne.last_seen, ne.fence_epoch, ne.hb_interval_secs, cetrafs_le32(ne.caps),
-               cetrafs_le32(ne.file_lock_mode));
+               cetrafs_le32(ne.file_lock_mode), cetrafs_le32(ne.stale_secs));
         close(fd);
         return 0;
     }
@@ -193,6 +195,18 @@ int main(int argc, char **argv)
         pwrite_all(fd, &ne, sizeof(ne), row_off);
         close(fd);
         printf("node_poke: row %u caps -> 0x%x\n", row, cetrafs_le32(ne.caps));
+        return 0;
+    }
+
+    /* --stale: set the row's advertised stale window (what a node
+     * running with that stale_secs writes on every beat). */
+    if (argc == 5 && strcmp(argv[3], "--stale") == 0) {
+        ne.stale_secs = cetrafs_cpu_to_le32((uint32_t) strtoul(argv[4], NULL, 0));
+        ne.checksum = 0;
+        ne.checksum = cetrafs_cpu_to_le64(crc32c_struct(&ne, sizeof(ne), offsetof(cetrafs_node_entry_t, checksum), sizeof(cetrafs_le64(ne.checksum))));
+        pwrite_all(fd, &ne, sizeof(ne), row_off);
+        close(fd);
+        printf("node_poke: row %u stale_secs -> %u\n", row, cetrafs_le32(ne.stale_secs));
         return 0;
     }
 
