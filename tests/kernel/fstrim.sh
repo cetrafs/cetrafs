@@ -80,6 +80,7 @@ BEFORE="$(used_kb)"
 [ "$BEFORE" -ge 150000 ] && pass "1 setup: the deleted files' 80 MiB still occupy the image ($((BEFORE / 1024)) MiB used)" ||
     { fail "1 setup: only $((BEFORE / 1024)) MiB used after the deletes -- the holes were given back already"; ct_exit; }
 C0="$(info discard_cmds)"
+L1="$(info trim_leaked_blocks)" # module-global: earlier suites in this load count too
 T="$(fstrim -v "$MNT" 2>&1)" || fail "1: fstrim failed: $T"
 BYTES="$(sed -n 's/.*(\([0-9]*\) bytes) trimmed.*/\1/p' <<<"$T")"
 AFTER="$(used_kb)"
@@ -89,8 +90,8 @@ AFTER="$(used_kb)"
     fail "1: no discard was counted"
 [ $((BEFORE - AFTER)) -ge 76000 ] && pass "1: the image gave back $(((BEFORE - AFTER) / 1024)) MiB (the holes are 80)" ||
     fail "1: the image gave back only $(((BEFORE - AFTER) / 1024)) MiB of the 80 MiB of holes"
-[ "$(info trim_leaked_blocks)" = 0 ] && pass "1: every claimed run was given back" ||
-    fail "1: $(info trim_leaked_blocks) claimed block(s) left allocated"
+[ "$(info trim_leaked_blocks)" = "$L1" ] && pass "1: every claimed run was given back" ||
+    fail "1: $(($(info trim_leaked_blocks) - L1)) claimed block(s) left allocated"
 check_kept 1
 fsck_clean 1
 
@@ -102,6 +103,7 @@ check_kept 2
 # ------------------------------------------------------------------- 3
 log "3: NEGATIVE CONTROL -- a discard aimed at metadata"
 R0="$(info discard_refused)"
+L0="$(info trim_leaked_blocks)"
 MARK="$(dmesg_mark)"
 ct_param_set discard_aim_at_bitmap 1
 fstrim "$MNT" >/dev/null 2>&1 || true
@@ -111,7 +113,7 @@ fstrim "$MNT" >/dev/null 2>&1 || true
     fail "3: a discard aimed at the bitmap was not refused"
 dmesg_since "$MARK" | grep -q "is not inside BG .* data region .* refused" && pass "3: and said so" ||
     fail "3: no refusal in dmesg"
-[ "$(info trim_leaked_blocks)" = 0 ] && pass "3: the run it was claimed for was still given back" ||
+[ "$(info trim_leaked_blocks)" = "$L0" ] && pass "3: the run it was claimed for was still given back" ||
     fail "3: the refused run was left allocated"
 check_kept 3
 fsck_clean 3
