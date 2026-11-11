@@ -226,7 +226,7 @@ int main(int argc, char **argv)
     }
 
     /* --frees: set the row's frees_inflight (a node between a publish
-     * and the frees it owes, tests/kernel/scrub_nocaw_stale_frees.sh). */
+     * and the frees it owes, tests/kernel/scrub_stale_row_frees.sh). */
     if (argc == 5 && strcmp(argv[3], "--frees") == 0) {
         ne.frees_inflight = cetrafs_cpu_to_le32((uint32_t) strtoul(argv[4], NULL, 0));
         ne.checksum = 0;

@@ -10,8 +10,7 @@
 # healthy (audit 2026-11-05, N6). Unavailability, not data loss -- a
 # whole host's VMs losing their datastore.
 #
-# Staged with lease_force (the loop rig has no CAW, where the lease is
-# otherwise off), a 5 s beat raised to 30 through controls, and
+# Staged with the lease (armed on every mount), a 5 s beat raised to 30 through controls, and
 # hb_tick_stall_ms holding the next tick right after its re-arm while
 # controls lowers it back to 5. 20 s after that tick the mount must still
 # be up and writable.
@@ -23,7 +22,7 @@ set -euo pipefail
 . "$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)/lib/harness.sh"
 require_root
 require_module
-for k in lease_force hb_tick_stall_ms; do
+for k in hb_tick_stall_ms; do
     [ -w "/sys/module/cetrafs/parameters/$k" ] || { skip "$k is missing"; ct_exit; }
 done
 
@@ -33,7 +32,6 @@ ct_track mnt "$MNT"
 ct_mkfs_small "$DEV" >/dev/null
 ct_param_set hb_interval_secs 5
 ct_param_set stale_secs 120
-ct_param_set lease_force 1
 ct_mount "$DEV" "$MNT"
 require_cetrafs_mount "$MNT"
 PROC="$(ct_procdir "$DEV")"

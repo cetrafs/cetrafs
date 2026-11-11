@@ -524,9 +524,9 @@ struct cetrafs_sb_info {
      * thread keeps writing the moment I/O returns. The lease needs no
      * I/O to check: cetrafs_sb_is_fenced() compares jiffies, and on
      * expiry latches lease_lost for good and has lease_work run the
-     * ordinary self-fence. Armed by the first successful renewal, and
-     * only on a mount that can have peers (CAW). See
-     * cetrafs_sb_lease_renewed().
+     * ordinary self-fence. Armed by the first successful renewal, on
+     * every mount: without CAW a successor is admitted once we look
+     * dead. See cetrafs_sb_lease_renewed().
      */
     struct super_block *sb; /* for lease_work */
     bool lease_active;
@@ -4887,13 +4887,12 @@ int cetrafs_write_gate(struct inode *inode)
 }
 
 /*
- * TEST ONLY. Arm the lease on a mount without CAW, where no peer can
- * exist and it is otherwise off -- the loop harness has no CAW, and this
- * is how tests/kernel/lease_expiry.sh reaches it.
+ * TEST ONLY. Do not arm the lease: the control of
+ * tests/kernel/lease_expiry.sh, the behaviour before the lease existed.
  */
-static bool cetrafs_lease_force;
-cetrafs_test_param(lease_force, cetrafs_lease_force, bool, 0644);
-MODULE_PARM_DESC(lease_force, "TEST ONLY: arm the in-core lease on a mount without CAW");
+static bool cetrafs_lease_disable;
+cetrafs_test_param(lease_disable, cetrafs_lease_disable, bool, 0644);
+MODULE_PARM_DESC(lease_disable, "TEST ONLY: never arm the in-core lease");
 
 static void cetrafs_sb_lease_work(struct work_struct *w)
 {
@@ -4917,10 +4916,13 @@ void cetrafs_sb_lease_renewed(struct super_block *sb, unsigned long t0, unsigned
     if (!sbi || !interval_secs || test_bit(0, &sbi->lease_lost))
         return;
     if (!READ_ONCE(sbi->lease_active)) {
-        if (!cetrafs_sb_mount_has_caw(sb) && !cetrafs_lease_force)
-            return; /* the mount gate admits no peer beside us; a node with our
-                     * UUID that takes our row over is caught by the renewal's
-                     * incarnation compare instead (audit 2026-11-11 N2) */
+        /* Every mount, CAW or not. Without CAW the gate admits no peer
+         * BESIDE us, but it admits one AFTER us the moment we look dead
+         * (a serial hand-over), and if we only stalled we must stop
+         * before we write again -- the premise every "a stale node's
+         * writes never land" rests on (review E1). */
+        if (cetrafs_lease_disable)
+            return;
         if (!sbi->lease_work_ready) {
             sbi->sb = sb;
             INIT_WORK(&sbi->lease_work, cetrafs_sb_lease_work);

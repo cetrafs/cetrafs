@@ -17,15 +17,20 @@
 #      mount reports itself fenced;
 #   B. renewals come back: the node stays fenced (a peer may already
 #      have reclaimed from it);
-#   C. control: with the lease off (lease_force=0 on this no-CAW loop
-#      device) the same failed renewals let writes go on.
+#   C. control: with the lease off (lease_disable=1) the same failed
+#      renewals let writes go on.
 #
-# DISCRIMINATION: C is the old behaviour, measured in the same run.
+# A and B run on this loop device, which has no CAW: the lease is armed
+# on every mount, because without CAW the mount gate admits a successor
+# once a node looks dead (review E1).
+#
+# DISCRIMINATION: C is the old behaviour, measured in the same run; with
+# the lease armed on CAW mounts only (before E1), A fails.
 set -euo pipefail
 . "$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)/lib/harness.sh"
 require_root
 require_module
-for k in lease_force hb_renew_fail; do
+for k in lease_disable hb_renew_fail; do
     [ -w "/sys/module/cetrafs/parameters/$k" ] || { skip "$k is missing"; ct_exit; }
 done
 
@@ -57,10 +62,10 @@ PY
 }
 fenced() { sed -n 's/^fenced: //p' "$(ct_procdir "$DEV")/info"; }
 
-run() { # <lease_force>
+run() { # <lease armed: 1|0>
     ct_mkfs_small "$DEV" >/dev/null
     ct_param_set hb_interval_secs "$INTERVAL"
-    ct_param_set lease_force "$1"
+    ct_param_set lease_disable $((1 - $1))
     ct_mount "$DEV" "$MNT"
     require_cetrafs_mount "$MNT"
     # Past the first renewal, which is what arms the lease.
@@ -71,7 +76,7 @@ run() { # <lease_force>
 }
 finish() {
     ct_param_set hb_renew_fail 0
-    ct_param_set lease_force 0
+    ct_param_set lease_disable 0
     umount "$MNT" 2>/dev/null || umount -l "$MNT" 2>/dev/null || true
     ct_param_set hb_interval_secs 15
 }

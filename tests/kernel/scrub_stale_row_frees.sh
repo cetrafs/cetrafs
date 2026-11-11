@@ -1,24 +1,25 @@
 #!/usr/bin/env bash
 # SPDX-License-Identifier: GPL-2.0-or-later
-# without CAW, a stale row with frees in flight still keeps the scrub out
+# a stale row's frees in flight do not stall the scrub; a live row's do
 #
 # The scrub abandons a cycle while any registry row says frees are in
 # flight -- except a stale row's, on the premise that a stale node's
 # frees never land: it stopped writing when its lease ran out, before any
-# peer could call it stale. The lease is armed on CAW mounts only. On a
-# device without CAW the mount gate admits a second node exactly when
-# the first LOOKS dead, and one that only stalled resumes its frees until
-# its next heartbeat finds the fence -- over blocks the scrub, told the
-# row was quiet, had already freed (audit 2026-11-11 N4).
+# peer could call it stale. The lease was armed on CAW mounts only, so
+# N4 (audit 2026-11-11) kept a stale row busy on a mount without CAW --
+# and nothing ever clears it, so the scrub there stalled for the life of
+# the volume (review E1). The lease is now armed on every mount
+# (lease_expiry.sh runs on this no-CAW loop device), and the exception
+# holds in both modes.
 #
-# The rig: a loop mount (no CAW) with a second registered row that is
-# stale (departure dead) and has frees_inflight set; the scrub runs.
+# The rig: a loop mount (no CAW) with a second registered row that has
+# frees_inflight set; the scrub runs.
 #
-#  1. no scrub cycle completes; cycles are skipped for frees in flight.
-#  2. once the row is gone, cycles complete again.
+#  1. the row stale (departure dead): cycles complete.
+#  2. control: the same row beating -- live: no cycle completes.
 #
-# DISCRIMINATION (2026-11-11, node.c before this fix): 1 completes
-# cycles beside the stale row.
+# DISCRIMINATION (2026-11-11, node.c with N4's no-CAW case): 1 completes
+# no cycle.
 set -euo pipefail
 . "$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)/lib/harness.sh"
 require_root
@@ -45,15 +46,22 @@ grep -q 'state=1 .*departure=2' <<<"$("$NPOKE" "$DEV" 1)" || { fail "setup: the 
 
 C0="$(done_c)"; K0="$(skip_c)"
 ct_param_set scrub 1
-sleep 9
-C1="$(done_c)"; K1="$(skip_c)"
-[ $((C1 - C0 + K1 - K0)) -gt 0 ] || { ct_param_set scrub 0; fail "setup: no scrub cycle ran in 9 s"; ct_exit; }
-[ "$C1" = "$C0" ] && pass "1: no cycle completed beside the stale row with frees in flight ($((K1 - K0)) skipped)" ||
-    fail "1: $((C1 - C0)) cycle(s) completed beside a stale row whose frees may still land"
+wait_for 30 '[ "$(sed -n "s/^scrub_cycles: //p" "'"$PROC/info"'")" -gt '"$C0"' ]' &&
+    pass "1: cycles complete beside a stale row with frees in flight" ||
+    fail "1: no cycle completed in 30 s beside a stale row ($(($(skip_c) - K0)) skipped for frees in flight)"
 
+log "2: the same row, beating"
+( for _ in $(seq 1 40); do "$NPOKE" "$DEV" 1 --beat >/dev/null 2>&1 || true; sleep 0.5; done ) &
+B=$!
+sleep 3
+C1="$(done_c)"; K1="$(skip_c)"
+sleep 9
+C2="$(done_c)"; K2="$(skip_c)"
+kill "$B" 2>/dev/null || true; wait "$B" 2>/dev/null || true
+[ $((K2 - K1)) -gt 0 ] || fail "2 setup: no cycle was skipped for the live row's frees"
+[ "$C2" = "$C1" ] && pass "2: no cycle completed beside a live row with frees in flight ($((K2 - K1)) skipped)" ||
+    fail "2: $((C2 - C1)) cycle(s) completed beside a live row whose frees are in flight"
 "$NPOKE" "$DEV" 1 0 00 0 >/dev/null
-wait_for 30 '[ "$(sed -n "s/^scrub_cycles: //p" "'"$PROC/info"'")" -gt '"$C1"' ]' &&
-    pass "2: with the row gone, cycles complete again" || fail "2: no cycle completed in 30 s after the row was cleared"
 ct_param_set scrub 0
 ct_umount "$MNT"
 ct_exit

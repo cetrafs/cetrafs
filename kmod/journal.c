@@ -87,8 +87,9 @@ struct cetrafs_journal {
      * our advertised heartbeat intervals without progress
      * (cetrafs_sb_peer_progress_stale()), while our lease stops this
      * mount after three (cetrafs_sb_lease_renewed()) -- so no entry of
-     * ours can be committed under a flag a peer has parked CLEAN. On a
-     * mount without CAW there is no peer. Re-derived at every attach,
+     * ours can be committed under a flag a peer has parked CLEAN -- on a
+     * mount without CAW too, where the peer is a successor the gate
+     * admitted once we looked dead. Re-derived at every attach,
      * which replays our own area first.
      */
     bool flag_dirty;
