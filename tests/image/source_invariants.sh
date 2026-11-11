@@ -1641,7 +1641,7 @@ printf 'int cetrafs_scrub_thing(struct super_block *sb)\n{\n    return cetrafs_i
 log "checking every caller of a liveness predicate names its safe direction (class 44)"
 LIVE_OK='fs.c:cetrafs_sb_peer_progress_stale:the predicate itself
 node.c:cetrafs_node_is_stale:the predicate itself
-node.c:cetrafs_for_each_live_peer:mount-time walk -- proves alive by watching hb_seq move, never by one sample
+node.c:cetrafs_for_each_live_peer:mount-time walk -- proves alive by watching hb_seq move, never by one sample, and beats its own row meanwhile so a peer running it sees us move (audit 2026-11-11 N1)
 node.c:cetrafs_node_cluster_file_lock_mode:the walk
 node.c:cetrafs_node_file_lock_mode_conflict:the walk
 node.c:cetrafs_node_nocaw_peer_exists:the walk

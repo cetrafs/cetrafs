@@ -1655,6 +1655,11 @@ static unsigned int cetrafs_nocaw_fence_stall_ms;
 cetrafs_test_param(nocaw_fence_stall_ms, cetrafs_nocaw_fence_stall_ms, uint, 0644);
 MODULE_PARM_DESC(nocaw_fence_stall_ms, "TEST ONLY: pause before the no-CAW mount gate fences a row it judged dead");
 
+/* TEST ONLY: the no-CAW gate's fence of a row it judged dead fails. */
+static bool cetrafs_nocaw_gate_fence_fail;
+cetrafs_test_param(nocaw_gate_fence_fail, cetrafs_nocaw_gate_fence_fail, bool, 0644);
+MODULE_PARM_DESC(nocaw_gate_fence_fail, "TEST ONLY: the no-CAW mount gate cannot revoke a dead row's lease");
+
 int cetrafs_node_live_peer_exists(struct super_block *sb, const u8 *my_uuid, bool *out_exists)
 {
     const cetrafs_superblock_t *raw_sb = cetrafs_sb_raw(sb);
@@ -1720,6 +1725,13 @@ int cetrafs_node_live_peer_exists(struct super_block *sb, const u8 *my_uuid, boo
                 goto out;
             }
             msleep_interruptible(min_t(unsigned long, 500, jiffies_to_msecs(until - jiffies) + 1));
+            /* Beat while we watch (audit 2026-11-11 N1): a peer watching
+             * US over the same window must see this row move, or two
+             * mounters each judge the other dead. A no-op before this
+             * mount has a row. */
+            ret = cetrafs_sb_mount_beat(sb);
+            if (ret)
+                goto out;
         }
     }
 
@@ -1746,10 +1758,11 @@ int cetrafs_node_live_peer_exists(struct super_block *sb, const u8 *my_uuid, boo
          * peer costs every later mount of the volume a full window,
          * forever: nothing else ever clears that row.
          *
-         * A failure is only reported: this takes nothing from the peer
-         * by itself, and every path that later does (its Zone Groups,
-         * locks, journal) revokes the lease again and stops if it
-         * cannot. */
+         * A fence that fails refuses the mount (audit 2026-11-11 N3).
+         * On a volume with no atomic CAW the revoked lease is the only
+         * thing a stalled peer that resumes will see -- no lease of its
+         * own runs out on such a volume -- so a mount that went ahead
+         * unfenced would write beside it. */
         /* Bound to the row this watch judged: a node re-attaching
          * between the re-read above and this fence moves it on, and
          * marking THAT incarnation departed let it keep writing until
@@ -1763,13 +1776,21 @@ int cetrafs_node_live_peer_exists(struct super_block *sb, const u8 *my_uuid, boo
 
             if (READ_ONCE(cetrafs_nocaw_fence_stall_ms))
                 msleep(READ_ONCE(cetrafs_nocaw_fence_stall_ms)); /* TEST ONLY */
-            fret = cetrafs_node_fence_peer_full(sb, idx, "this volume (no atomic CAW: one mounter only)", true, true,
-                                                &judged);
+            fret = READ_ONCE(cetrafs_nocaw_gate_fence_fail)
+                       ? -EIO
+                       : cetrafs_node_fence_peer_full(sb, idx, "this volume (no atomic CAW: one mounter only)", true,
+                                                      true, &judged);
             if (fret == -EBUSY) {
                 pr_err("node %u came back while this mount watched it -- it is alive and mounted on this volume\n",
                        idx);
                 *out_exists = true;
                 break;
+            }
+            if (fret) {
+                pr_err("node %u looks dead but its lease could not be revoked (%d) -- not mounting beside it\n",
+                       idx, fret);
+                ret = fret;
+                goto out;
             }
         }
     }
@@ -1850,6 +1871,15 @@ static int cetrafs_for_each_live_peer(struct super_block *sb,
             ret = -EINTR;
             goto out;
         }
+        /* Our own row moves while we watch theirs (N1): every caller
+         * runs at mount, before the heartbeat, and a peer running this
+         * same watch over our row would otherwise see it stand still for
+         * the whole window and judge us dead -- two simultaneous no-CAW
+         * mounters both going ahead, an ON and an OFF file-lock mode both
+         * passing. */
+        ret = cetrafs_sb_mount_beat(sb);
+        if (ret)
+            goto out;
         expired = time_after_eq(jiffies, deadline);
         for (idx = 0; idx < count && candidates; idx++) {
             if (!seq[idx])
