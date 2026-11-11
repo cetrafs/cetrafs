@@ -5409,8 +5409,8 @@ static int cetrafs_truncate_shrink(struct inode *inode, loff_t new_size)
  * FALLOCATE_FL_PUNCH_HOLE: deallocate [offset, offset+len) without
  * changing i_size (hence requiring FALLOC_FL_KEEP_SIZE -- the only
  * combination besides plain preallocation, cetrafs_do_allocate(), that
- * this project's fallocate(2) support claims). ZERO_RANGE,
- * COLLAPSE_RANGE and INSERT_RANGE are not implemented.
+ * this project's fallocate(2) support claims; ZERO_RANGE is the two in
+ * sequence). COLLAPSE_RANGE and INSERT_RANGE are not implemented.
  *
  * Deliberately reuses cetrafs_truncate_shrink()'s own shape instead of a
  * parallel implementation: the same depth-0/depth-1 dispatch and revert-
@@ -5915,6 +5915,30 @@ static long cetrafs_fallocate(struct file *file, int mode, loff_t offset, loff_t
     if (offset < 0 || len <= 0) {
         kfree(recs);
         return -EINVAL;
+    }
+
+    /*
+     * ZERO_RANGE: a punch, then a preallocation, of the same range. The
+     * punch frees every whole block and zeroes the partial ones at the
+     * edges; the preallocation fills the holes it left with uninit
+     * extents, which read as zeroes, and moves i_size unless KEEP_SIZE.
+     * Each step is the vetted path with its own locks, foreign-open
+     * refusal and file_modified(). Between the two, and after a crash
+     * there, the range is holes -- already zero -- so the only thing
+     * ever visible is zeroes. A write landing between the steps keeps its
+     * block (the preallocation skips mapped blocks): a write after the
+     * zeroing, which is an order the caller could have had anyway. An
+     * ENOSPC from the second step leaves the range zeroed, not allocated.
+     * qemu's write-zeroes uses this; without it qemu wrote the zeroes.
+     */
+    if (mode == FALLOC_FL_ZERO_RANGE || mode == (FALLOC_FL_ZERO_RANGE | FALLOC_FL_KEEP_SIZE)) {
+        long zrc;
+
+        kfree(recs);
+        zrc = cetrafs_fallocate(file, FALLOC_FL_PUNCH_HOLE | FALLOC_FL_KEEP_SIZE, offset, len);
+        if (!zrc)
+            zrc = cetrafs_fallocate(file, mode & FALLOC_FL_KEEP_SIZE, offset, len);
+        return zrc;
     }
 
     /* ALLOCATE: mode 0, or KEEP_SIZE alone. */
