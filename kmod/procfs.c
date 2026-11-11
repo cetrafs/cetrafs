@@ -175,9 +175,13 @@ static int cetrafs_proc_info_show(struct seq_file *m, void *v)
     {
         unsigned long now = jiffies;
         unsigned long last = cetrafs_sb_bg_sweep_last(sb);
+        /* Clamped, and in unsigned long: secs * HZ in 32 bits wrapped
+         * for a large setting -- to a small interval as easily as to a
+         * large one, sweeping on every read (audit 2026-11-11 P1). A
+         * day is longer than anyone wants a status poll to lag. */
+        unsigned long secs = min_t(unsigned int, READ_ONCE(cetrafs_bg_sweep_min_secs), 86400);
 
-        if (!last || !cetrafs_bg_sweep_min_secs ||
-            time_after(now, last + cetrafs_bg_sweep_min_secs * HZ)) {
+        if (!last || !secs || time_after(now, last + secs * HZ)) {
             cetrafs_sb_set_bg_sweep_last(sb, now);
             sweep_foreign = true;
         }
