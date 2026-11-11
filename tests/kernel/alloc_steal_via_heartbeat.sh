@@ -34,6 +34,10 @@ DEV="$(ct_dev 1200 allocsteal)"
 MNT="$(ct_mnt allocsteal)"
 ct_mkfs "$DEV" -z 2 -b 512 -J 0 -N 1024 -f >/dev/null
 ct_param_set scrub 0
+# The adopted group's Block Group is empty, and a release handing it back
+# to the pool lets the next write claim it into our own Zone Group: then
+# no round after it needs the dead peer's group at all.
+ct_param_set bg_release_off 1
 info() { cat "$(ct_procdir "$DEV")/info"; }
 ct_mount "$DEV" "$MNT"
 require_cetrafs_mount "$MNT"
