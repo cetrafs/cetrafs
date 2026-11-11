@@ -36,14 +36,15 @@ ccflags-y += -Wframe-larger-than=1024
 # describe -- five dir.c functions fail a KASAN build while being well
 # inside budget in the build that ships.
 #
-# So raise it for that build only:
-#   make mod KASAN=1
+# So raise it for that build only -- detected from the kernel's own
+# config (kbuild reads it before this file), so a plain `make` against a
+# KASAN kernel builds; `make mod KASAN=1` forces it.
 # It does not relax anything for an ordinary build, and it is not a
 # licence to grow frames: a KASAN build that fails even at 2048 is
 # telling you something real (cetrafs_dm_collect(), which RECURSES four
 # deep, and cetrafs_defrag_inode()'s 652-byte record were both found
 # exactly this way).
-ifeq ($(KASAN),1)
+ifneq ($(KASAN)$(CONFIG_KASAN),)
 ccflags-y += -Wframe-larger-than=2048
 endif
 
