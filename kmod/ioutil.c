@@ -32,8 +32,9 @@
 #include <linux/fs.h>
 #include <linux/module.h>
 #include <linux/pagemap.h>
-/* struct folio_batch moved out of pagevec.h; build against either. */
-#if __has_include(<linux/folio_batch.h>)
+/* struct folio_batch moved out of pagevec.h in 7.1; build against either.
+ * A version test, not __has_include(): sparse cannot parse that. */
+#if LINUX_VERSION_CODE >= KERNEL_VERSION(7, 1, 0)
 #include <linux/folio_batch.h>
 #else
 #include <linux/pagevec.h>
@@ -185,10 +186,16 @@ int cetrafs_bread_uncached_batch(struct super_block *sb, sector_t start, u32 n, 
             unlock_buffer(bh); /* our own pending write: what bh_read() would return too */
             continue;
         }
+#if LINUX_VERSION_CODE >= KERNEL_VERSION(7, 2, 0)
+        /* As __bh_read() on 7.2: the bio completion unlocks the buffer and
+         * takes no reference of its own (as the write paths below). */
+        bh_submit(bh, REQ_OP_READ, bh_end_read);
+#else
         /* As __bh_read(): the completion unlocks and drops this ref. */
         get_bh(bh);
         bh->b_end_io = end_buffer_read_sync;
         submit_bh(REQ_OP_READ, bh);
+#endif
     }
     blk_finish_plug(&plug);
 
