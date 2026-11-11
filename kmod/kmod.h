@@ -553,6 +553,7 @@ int cetrafs_dm_underlying(struct block_device *bdev, dev_t *out, unsigned int ma
 struct scsi_device;
 /* A referenced scsi_device to send 'bdev's passthrough commands to when
  * bdev itself is not SCSI; NULL if none is usable. caller scsi_device_put()s. */
+int cetrafs_dmpath_probe(struct block_device *bdev, struct scsi_device **out);
 struct scsi_device *cetrafs_dmpath_sdev(struct block_device *bdev, bool killable);
 void cetrafs_dmpath_forget(struct block_device *bdev);
 /* Report that a path just failed a command with a TRANSPORT error, so the

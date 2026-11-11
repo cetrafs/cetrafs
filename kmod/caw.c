@@ -524,6 +524,48 @@ static int cetrafs_caw_nvme(struct block_device *bdev,
  * should discover ONCE (e.g. at mount) and cache the result, not call it
  * per operation.
  */
+/* TEST ONLY: the next N Block Limits VPD reads fail as a transient
+ * error would -- the page-list read included (C1). */
+static unsigned int cetrafs_caw_vpd_fail;
+cetrafs_test_param(caw_vpd_fail, cetrafs_caw_vpd_fail, uint, 0644);
+MODULE_PARM_DESC(caw_vpd_fail, "TEST ONLY: fail the next N Block Limits VPD probes as if transient");
+
+/*
+ * The Block Limits VPD page (0xB0) into 'vpd' (64 bytes). 0; -ENODATA
+ * when the device's page list (page 0) is readable and does not carry
+ * 0xB0 -- the one failure that means "no such page"; -EIO when nothing
+ * could be learnt. A transient failure is retried before it is believed.
+ */
+static int cetrafs_caw_vpd_b0(struct scsi_device *sdev, unsigned char *vpd)
+{
+    int tries, i, n;
+
+    for (tries = 0; tries < 3; tries++) {
+        if (cetrafs_caw_vpd_fail) {
+            cetrafs_caw_vpd_fail--;
+            msleep(100);
+            continue;
+        }
+        if (scsi_get_vpd_page(sdev, 0xB0, vpd, 64) == 0)
+            return 0;
+        msleep(100);
+    }
+    if (sdev->skip_vpd_pages || !scsi_device_supports_vpd(sdev))
+        return -ENODATA; /* the device does not do VPD at all */
+    if (cetrafs_caw_vpd_fail) {
+        cetrafs_caw_vpd_fail--;
+        return -EIO;
+    }
+    memset(vpd, 0, 64);
+    if (scsi_get_vpd_page(sdev, 0x00, vpd, 64) != 0)
+        return -EIO;
+    n = min_t(int, (vpd[2] << 8 | vpd[3]) + 4, 64);
+    for (i = 4; i < n; i++)
+        if (vpd[i] == 0xB0)
+            return -EIO; /* listed, and still not given: not an answer */
+    return -ENODATA;
+}
+
 int cetrafs_caw_discover(struct block_device *bdev, struct cetrafs_caw_info *out)
 {
     struct scsi_device *sdev;
@@ -544,8 +586,18 @@ int cetrafs_caw_discover(struct block_device *bdev, struct cetrafs_caw_info *out
                 "atomic CAW (one mounter only). Use the whole LUN for a shared volume.\n",
                 bdev);
     sdev = cetrafs_caw_get_sdev(bdev);
-    if (!sdev)
-        sdev = cetrafs_dmpath_sdev(bdev, false); /* dm (multipath): probe via a path -- see dmpath.c */
+    if (!sdev && !bdev_is_partition(bdev)) {
+        /* dm (multipath): probe via a path -- see dmpath.c. A path that
+         * exists and could not be probed is not "no CAW" (C1). */
+        int prc = cetrafs_dmpath_probe(bdev, &sdev);
+
+        if (prc == -EAGAIN) {
+            pr_err("CAW: %s is backed by a SCSI path that could not be probed just now -- not "
+                   "guessing that it has no atomic CAW; retry the mount once its paths are up\n",
+                   bdev->bd_disk->disk_name);
+            return -EAGAIN;
+        }
+    }
     if (sdev) {
         unsigned char *vpd = kzalloc(64, GFP_KERNEL);
         int rc;
@@ -565,19 +617,24 @@ int cetrafs_caw_discover(struct block_device *bdev, struct cetrafs_caw_info *out
         }
         /* Block Limits VPD page (0xB0), byte 5 = MAXIMUM COMPARE AND
          * WRITE LENGTH, in logical blocks (0 => CAW unsupported). */
-        rc = scsi_get_vpd_page(sdev, 0xB0, vpd, 64);
+        rc = cetrafs_caw_vpd_b0(sdev, vpd);
         if (rc == 0) {
             out->max_caw_blocks = vpd[5];
+        } else if (rc == -ENODATA) {
+            /* The device lists the pages it has, and Block Limits is not
+             * among them: an old target, genuinely without CAW. */
+            pr_warn("CAW: %s has no Block Limits VPD page -- no atomic CAW\n", bdev->bd_disk->disk_name);
         } else {
-            /* The device did not give us Block Limits. That genuinely
-             * may mean "no such page" on an old target, so it is not an
-             * error -- but it is said out loud, because the alternative
-             * reading (a transient failure on a device that does have
-             * CAW) silently downgrades the safety model. */
-            pr_warn(
-                "CAW: %s did not return the Block Limits VPD page (%d) -- "
-                "treating as no atomic CAW\n",
-                bdev->bd_disk->disk_name, rc);
+            /* It could not be asked. scsi_get_vpd_page() says -EINVAL
+             * for every failure, a transient one included, and reading
+             * that as "no CAW" put a CAW-capable shared LUN on the no-CAW
+             * fallback (C1): refuse instead. */
+            pr_err("CAW: %s did not answer for its Block Limits VPD page (%d) -- refusing rather than "
+                   "assuming no atomic CAW\n",
+                   bdev->bd_disk->disk_name, rc);
+            kfree(vpd);
+            scsi_device_put(sdev);
+            return -EIO;
         }
         kfree(vpd);
         scsi_device_put(sdev);

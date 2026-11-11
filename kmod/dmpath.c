@@ -405,24 +405,40 @@ static int cetrafs_dmpath_read(struct scsi_device *sdev, u64 lba, unsigned int n
  * commands at all, which is the other thing we need to know before
  * trusting it with the cluster's mutual exclusion.
  */
-static bool cetrafs_dmpath_identical(struct block_device *dm_bdev, struct scsi_device *sdev, const char *pname)
+/* TEST ONLY: the next N passthrough READs of a path's block 0 fail, as
+ * a path that is down or mid-failover would (audit 2026-11-11 C1). */
+static unsigned int cetrafs_dmpath_read_fail;
+cetrafs_test_param(dmpath_read_fail, cetrafs_dmpath_read_fail, uint, 0644);
+MODULE_PARM_DESC(dmpath_read_fail, "TEST ONLY: fail the next N passthrough READs of a dm path's block 0");
+
+/* 0: the path is a 1:1 map of the device. -EXDEV: it is provably not
+ * (no superblock, a different block 0) -- a different device, not a
+ * failing path. -EIO: it could not be read, so nothing is known. */
+static int cetrafs_dmpath_identical(struct block_device *dm_bdev, struct scsi_device *sdev, const char *pname)
 {
     unsigned int lbs = bdev_logical_block_size(dm_bdev);
     unsigned int nblocks;
     struct buffer_head *bh;
     void *buf;
-    bool ok = false;
+    int ret = -EXDEV;
 
     if (!lbs || lbs > CETRAFS_BLOCK_SIZE || CETRAFS_BLOCK_SIZE % lbs)
-        return false;
+        return -EXDEV;
     nblocks = CETRAFS_BLOCK_SIZE / lbs;
 
     buf = kzalloc(CETRAFS_BLOCK_SIZE, GFP_KERNEL);
     if (!buf)
-        return false;
+        return -EIO;
 
+    if (cetrafs_dmpath_read_fail) {
+        cetrafs_dmpath_read_fail--;
+        pr_warn("dm path: %s does not answer a passthrough READ -- not usable for CAW (test)\n", pname);
+        ret = -EIO;
+        goto out;
+    }
     if (cetrafs_dmpath_read(sdev, 0, nblocks, buf, lbs)) {
         pr_warn("dm path: %s does not answer a passthrough READ -- not usable for CAW\n", pname);
+        ret = -EIO;
         goto out;
     }
 
@@ -432,18 +448,20 @@ static bool cetrafs_dmpath_identical(struct block_device *dm_bdev, struct scsi_d
     }
 
     bh = __bread_gfp(dm_bdev, 0, CETRAFS_BLOCK_SIZE, GFP_KERNEL);
-    if (!bh)
+    if (!bh) {
+        ret = -EIO;
         goto out;
-    ok = memcmp(bh->b_data, buf, CETRAFS_BLOCK_SIZE) == 0;
+    }
+    ret = memcmp(bh->b_data, buf, CETRAFS_BLOCK_SIZE) == 0 ? 0 : -EXDEV;
     brelse(bh);
 
-    if (!ok)
+    if (ret)
         pr_warn("dm path: %s block 0 differs from the mapped device's -- the mapping is not 1:1 "
                 "(a partition or an offset?), refusing to send CAW to it\n",
                 pname);
 out:
     kfree(buf);
-    return ok;
+    return ret;
 }
 
 /* Release the held references, keeping the slot (and its 'avoid'
@@ -485,10 +503,14 @@ static int cetrafs_dmpath_try(struct block_device *dm_bdev, dev_t path_dev, stru
         return -ENXIO; /* not a SCSI device (another dm layer, loop, ...) */
     }
 
-    if (!cetrafs_dmpath_identical(dm_bdev, sdev, pbdev->bd_disk->disk_name)) {
-        scsi_device_put(sdev);
-        fput(file);
-        return -EXDEV;
+    {
+        int ret = cetrafs_dmpath_identical(dm_bdev, sdev, pbdev->bd_disk->disk_name);
+
+        if (ret) {
+            scsi_device_put(sdev);
+            fput(file);
+            return ret;
+        }
     }
 
     e->dm_dev = dm_bdev->bd_dev;
@@ -531,21 +553,68 @@ static int cetrafs_dmpath_resolve(struct block_device *bdev, dev_t avoid, struct
     ret = cetrafs_dm_underlying(bdev, devs, ARRAY_SIZE(devs), &n);
     if (ret || !n)
         return ret ? ret : -ENODEV;
+    ret = 0;
 
     for (pass = 0; pass < (avoid ? 2u : 1u); pass++)
     for (i = 0; i < n; i++) {
+        int tr;
+
         if (pass == 0 && avoid && devs[i] == avoid)
             continue;
         if (pass == 1 && devs[i] != avoid)
             continue; /* pass 0 already tried these */
-        if (cetrafs_dmpath_try(bdev, devs[i], e) == 0) {
+        tr = cetrafs_dmpath_try(bdev, devs[i], e);
+        if (tr == 0) {
             pr_info("dm path: %s -> sending COMPARE AND WRITE via %s (data I/O stays on the mapped "
                     "device, so multipath failover still covers it)\n",
                     bdev->bd_disk->disk_name, e->name);
             return 0;
         }
+        /* Not a SCSI 1:1 path (-ENXIO: another layer, another size;
+         * -EXDEV: another device's block 0) is an answer. Anything else
+         * -- a path that could not be opened or read -- is not: it may
+         * be this LUN, down for the moment. */
+        if (tr != -ENXIO && tr != -EXDEV)
+            ret = -EAGAIN;
     }
-    return -ENODEV;
+    return ret == -EAGAIN ? -EAGAIN : -ENODEV;
+}
+
+/*
+ * Discovery's question, which cetrafs_dmpath_sdev() cannot answer with
+ * a NULL: is there no SCSI path under 'bdev' (no CAW -- a single-mounter
+ * volume), or is there one that could not be probed just now? The second
+ * is not an answer at all, and reading it as the first put a multipath
+ * LUN whose paths were all failing over at mount time on the node-local
+ * no-CAW fallback, beside peers using real COMPARE AND WRITE (audit
+ * 2026-11-11 C1). 0 with *out referenced, -ENODEV, or -EAGAIN.
+ */
+int cetrafs_dmpath_probe(struct block_device *bdev, struct scsi_device **out)
+{
+    struct cetrafs_dmpath_entry tmp = {0};
+    unsigned int nofs;
+    int ret;
+
+    *out = cetrafs_dmpath_sdev(bdev, false);
+    if (*out && !IS_ERR(*out))
+        return 0;
+    *out = NULL;
+    if (!bdev || !bdev->bd_disk || bdev_is_partition(bdev))
+        return -ENODEV;
+    /* Resolve again, uncached, for the verdict: the cached call above
+     * folds every failure into NULL. */
+    nofs = memalloc_nofs_save();
+    ret = cetrafs_dmpath_resolve(bdev, 0, &tmp);
+    memalloc_nofs_restore(nofs);
+    if (ret == 0) {
+        /* A path answered this time: use it once, as an unslotted
+         * resolution would. */
+        if (scsi_device_get(tmp.sdev) == 0)
+            *out = tmp.sdev;
+        cetrafs_dmpath_drop_refs(&tmp);
+        return *out ? 0 : -EAGAIN;
+    }
+    return ret;
 }
 
 /*
