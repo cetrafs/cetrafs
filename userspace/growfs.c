@@ -411,7 +411,6 @@ int main(int argc, char **argv)
     const u32 old_b = cetrafs_le32(sb.block_group_count);
     const u64 bg_size = cetrafs_le64(sb.bg_size_blocks);
     const u64 regions_start = cetrafs_le64(sb.bg_regions_start);
-    const u32 pending_per_zg = cetrafs_le32(sb.pending_free_blocks_per_zg);
 
     if (old_total > dev_blocks)
         die("%s: superblock claims %" PRIu64 " blocks but the device has %" PRIu64
@@ -455,8 +454,8 @@ int main(int argc, char **argv)
      * about to read, and writing new BG headers over them in step 1 --
      * before the publish -- would destroy the old filesystem and the
      * new one together. Skipping it leaves a HOLE in the data area,
-     * which is what bg_data_end exists to describe (cetrafs.h); the
-     * hole is counted into orphan_blocks below.
+     * which is what bg_data_end exists to describe (cetrafs.h). The
+     * "hole" is the previous segment, still in use: nothing is orphaned.
      */
     const u64 old_data_end = cetrafs_le64(sb.bg_data_end) ? cetrafs_le64(sb.bg_data_end)
                                                           : regions_start + (u64) old_b * bg_size;
@@ -592,19 +591,15 @@ int main(int argc, char **argv)
     tail_waste = target_blocks - (reserve_start + reserve_blocks);
 
     /*
-     * What this grow strands.
-     *
-     * First grow: the mkfs-time ZG table, BG table and pending-free
-     * region, left behind in the PREFIX below bg_regions_start, where no
-     * Block Group can ever be carved.
-     *
-     * Later grows: the superseded tail reserve, which is now a hole
-     * INSIDE the data area's bounding box. Its prefix tables were
-     * already counted by the first grow.
+     * What this grow strands: nothing. The tail reserve holds only the
+     * appended Block Group table segment, which stays linked and in use,
+     * and no table moves (stage 5 below) -- so a later grow that starts
+     * its Block Groups past the previous reserve skips a region that is
+     * still the previous segment, not one left behind. This used to add
+     * the prefix tables on a first grow, from when they were relocated,
+     * and persist the sum into the superblock (audit 2026-11-11 G1).
      */
-    const u64 orphaned_now = old_reserve_blocks ? (new_bg_start - old_data_end)
-                                                : (u64) old_z + old_b + (u64) old_z * pending_per_zg;
-    const u64 orphan_total = cetrafs_le64(sb.orphan_blocks) + orphaned_now;
+    const u64 orphan_total = cetrafs_le64(sb.orphan_blocks);
 
     u32 off_bmap32, off_data32;
     u64 data_cnt;
@@ -623,14 +618,12 @@ int main(int argc, char **argv)
             "  new BG regions: LBA %" PRIu64 " .. %" PRIu64
             "\n"
             "  tail reserve:   LBA %" PRIu64 "+%" PRIu64
-            " (relocated ZG/BG/pending-free tables)\n"
+            " (the appended Block Group table segment)\n"
             "  unused tail:    %" PRIu64
-            " blocks (rounding)\n"
-            "  orphaned by this grow: %" PRIu64 " blocks (%llu MiB); total ever: %" PRIu64 " blocks\n",
+            " blocks (rounding)\n",
             dry_run ? "(DRY-RUN)" : "plan", dev_bytes, dev_blocks, old_total, target_blocks, old_b, new_b,
             new_b - old_b, (unsigned long long) (bg_size * CETRAFS_BLOCK_SIZE / 1024 / 1024), old_z, new_z,
-            new_z - old_z, new_bg_start, reserve_start - 1, reserve_start, reserve_blocks, tail_waste, orphaned_now,
-            (unsigned long long) (orphaned_now * CETRAFS_BLOCK_SIZE / 1024 / 1024), orphan_total);
+            new_z - old_z, new_bg_start, reserve_start - 1, reserve_start, reserve_blocks, tail_waste);
 
     /*
      * Growing is a ONE-WAY DOOR for the whole cluster, so say so once

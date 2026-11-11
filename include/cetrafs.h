@@ -335,13 +335,10 @@ typedef struct {
     __le64 tail_reserve_start;   /* LBA, 0 = none (never grown) */
     __le64 tail_reserve_blocks;
 
-    /* Blocks stranded in the prefix by past grows: the superseded ZG
-     * table, BG table and pending-free region, which sit below
-     * bg_regions_start and can never be carved into a BG without
-     * breaking that contiguous-span model. Accumulates across grows.
-     * Reported rather than hidden -- an operator finding it in `df`
-     * instead of in the tool's output is how this becomes a bug
-     * report. */
+    /* Blocks a grow stranded, outside every Block Group and every table.
+     * Grows no longer strand any -- nothing moves, the Block Group table
+     * grows by an appended segment (userspace/growfs.c) -- so this stays
+     * 0; it was the superseded tables back when a grow relocated them. */
     __le64 orphan_blocks;
 
     /*

@@ -255,12 +255,14 @@ done
     pass "four successive grows, $(wc -l < "$WORK/multi") files verified across all of them" ||
     log "see the failures above"
 
-# Each grow must have stranded its predecessor's reserve and said so,
-# rather than quietly losing the space.
-if out="$(ct_growfs "$DEV" -n 2>&1)" && grep -qE 'total ever: [1-9][0-9]* blocks' <<<"$out"; then
-    pass "orphaned space is reported, not hidden"
+# Four grows strand nothing: each one's reserve holds the Block Group
+# table segment it appended, and that segment stays linked into the
+# chain (it used to be reported, and persisted, as orphaned -- audit
+# 2026-11-11 G1; tests/image/growfs_no_orphans.sh is the focused suite).
+if out="$(ct_growfs "$DEV" -n 2>&1)" && ! grep -qi 'orphaned' <<<"$out"; then
+    pass "four grows report nothing orphaned"
 else
-    fail "growfs does not report accumulated orphaned blocks: $out"
+    fail "growfs reports orphaned space after grows that moved nothing: $(grep -i orphaned <<<"$out")"
 fi
 
 # Restore the fully-grown volume the payoff section expects.
