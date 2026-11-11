@@ -84,6 +84,10 @@ log "D: a twin whose paths stall longer than two beats, inside the stale window"
 # watch was two advertised beats + 5 s (7 s here) and re-attached over
 # it (audit L1). Stale window 20 s; the twin beats once, at 12 s.
 ct_param_set stale_secs 20
+# The twin runs that window too, and advertises it: a row advertising an
+# illegal one (the compressed 3 s an earlier mount here wrote) is watched
+# for the maximum, 240 s (cetrafs_row_watch_window()).
+"$NODE_POKE" "$DEV" 0 --stale 20 >/dev/null
 "$NODE_POKE" "$DEV" 0 --beat >/dev/null
 ( sleep 12; "$NODE_POKE" "$DEV" 0 --beat >/dev/null 2>&1 || true ) &
 TWIN=$!

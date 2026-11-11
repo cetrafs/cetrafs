@@ -783,6 +783,36 @@ static int cetrafs_node_twin_row(struct super_block *sb, u32 mine, const u8 *uui
 }
 
 /*
+ * The longest a live node could take to call a silent peer dead: the
+ * window to watch a row for before judging its node gone. That is the
+ * PEER's stale window, not ours -- a peer running 240 s must not be
+ * declared dead by a mounter running 15 s (review F2; the tools already
+ * do this, cetrafs_row_stale_secs()). So: the longer of ours and what
+ * the row advertises, floored at four of the row's own beats. An
+ * advertised window outside the legal range counts as the maximum, so
+ * a garbage row makes us wait longer, never act sooner -- except on a
+ * node whose own window is below the legal range, which only the
+ * unbounded module parameter can set: a loop suite compressing time,
+ * whose planted rows advertise nothing.
+ */
+static u32 cetrafs_row_watch_window(struct super_block *sb, const cetrafs_node_entry_t *ne, u32 window)
+{
+    u32 adv = cetrafs_le32(ne->stale_secs);
+    /* Clamp the peer's advertised interval before flooring the wait on
+     * it -- a hostile/corrupt (checksum-valid) row with a huge
+     * hb_interval_secs would otherwise sleep for days (and *4 can
+     * overflow). Bounded by the operator-enforced max. */
+    u32 pi = min_t(u32, cetrafs_le32(ne->hb_interval_secs), CETRAFS_HB_INTERVAL_MAX_SECS);
+
+    if (adv < CETRAFS_STALE_MIN_SECS || adv > CETRAFS_STALE_MAX_SECS)
+        adv = cetrafs_sb_stale_secs(sb) < CETRAFS_STALE_MIN_SECS ? 0 : CETRAFS_STALE_MAX_SECS;
+    window = max(window, adv);
+    if (pi && pi * 4 > window)
+        window = pi * 4;
+    return window;
+}
+
+/*
  * Watch row 'idx' (as read into 'ne') for as long as a peer would wait
  * before calling it dead: 0 if it did not beat, -EBUSY if it did. The
  * advertised interval is clamped so a corrupt row cannot park the mount
@@ -804,7 +834,7 @@ static int cetrafs_node_row_quiet(struct super_block *sb, u32 idx, const cetrafs
      * stalled in between had its row taken (audit L1). The cost is an
      * unclean re-attach waiting the stale window; a clean one waits not
      * at all. */
-    window = max_t(u32, cetrafs_sb_stale_secs(sb), 4 * pi);
+    window = max_t(u32, cetrafs_row_watch_window(sb, ne, cetrafs_sb_stale_secs(sb)), 4 * pi);
     pr_info(
         "node registration: row %u carries this machine's identity and was not left cleanly -- watching it "
         "%us to be sure no other machine is using it\n",
@@ -1666,14 +1696,7 @@ int cetrafs_node_live_peer_exists(struct super_block *sb, const u8 *my_uuid, boo
         before[idx].watched = true;
         cetrafs_row_mark_of(&before[idx].mark, &ne);
         candidates++;
-        /* Clamp the peer's advertised interval before flooring the wait on
-         * it -- a hostile/corrupt (checksum-valid) row with a huge
-         * hb_interval_secs would otherwise ssleep() for days (and *4 can
-         * overflow). Bounded by the operator-enforced max. */
-        u32 pi = min_t(u32, cetrafs_le32(ne.hb_interval_secs), CETRAFS_HB_INTERVAL_MAX_SECS);
-
-        if (pi && pi * 4 > window)
-            window = pi * 4;
+        window = cetrafs_row_watch_window(sb, &ne, window);
     }
 
     if (!candidates)
@@ -1812,14 +1835,7 @@ static int cetrafs_for_each_live_peer(struct super_block *sb,
             continue; /* the caller's answer does not depend on it */
         seq[idx] = cetrafs_le64(ne.hb_seq) + 1;
         candidates++;
-        {
-            /* Clamped, as the gate does: a checksum-valid row can
-             * advertise any interval. */
-            u32 pi = min_t(u32, cetrafs_le32(ne.hb_interval_secs), CETRAFS_HB_INTERVAL_MAX_SECS);
-
-            if (pi && pi * 4 > window)
-                window = pi * 4;
-        }
+        window = cetrafs_row_watch_window(sb, &ne, window);
     }
     if (!candidates)
         goto out;
