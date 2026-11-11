@@ -1587,6 +1587,17 @@ int main(int argc, char **argv)
         diex("BLKGETSIZE64");
     uint64_t total_blocks = dev_bytes / CETRAFS_BLOCK_SIZE;
 
+    /* Every read below goes through this machine's page cache for the
+     * device, and nothing else drops it: the live-peer probe does only
+     * when a registry row exists, and a last close drops it only when
+     * nobody else (multipathd, udev, a held fd) has the device open. A
+     * peer's writes since our cache filled were then invisible -- a
+     * verdict about the volume as it was, and a repair applied to that
+     * (audit 2026-11-11 F7, tests/image/fsck_reads_device.sh). The
+     * probe drops it again whenever it waited, so a cache filled while
+     * we watched is gone too. */
+    (void) posix_fadvise(fd, 0, 0, POSIX_FADV_DONTNEED);
+
     /* SB */
     uint8_t sbblk[CETRAFS_BLOCK_SIZE] = {0};
     pread_all(fd, sbblk, sizeof(sbblk), 0);
