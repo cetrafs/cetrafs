@@ -1767,6 +1767,20 @@ int main(int argc, char **argv)
                 cetrafs_le32(sb.node_journal_blocks), CETRAFS_JOURNAL_MAX_BLOCKS);
         return 1;
     }
+    /* A pending-free queue no larger than mkfs writes. The size is a
+     * superblock field so it CAN vary (every reader takes it from
+     * there), but nothing writes more than the constant, and the queues
+     * are read block by block, twice, for every Zone Group: a CRC-valid
+     * superblock naming four billion blocks per queue had fsck reading
+     * for hours before it said anything (audit 2026-11-11 F11,
+     * tests/image/fsck_layout_controls.sh). The journals are bounded by
+     * CETRAFS_JOURNAL_MAX_BLOCKS just above. Before the region pass, so
+     * the verdict names the field and not whatever it overlaps. */
+    if (cetrafs_le32(sb.pending_free_blocks_per_zg) > CETRAFS_PENDING_FREE_BLOCKS_PER_ZG) {
+        fprintf(stderr, "ERR: pending-free queue has %u blocks per ZG -- mkfs writes at most %u\n",
+                cetrafs_le32(sb.pending_free_blocks_per_zg), CETRAFS_PENDING_FREE_BLOCKS_PER_ZG);
+        return 1;
+    }
     {
         struct {
             const char *name;

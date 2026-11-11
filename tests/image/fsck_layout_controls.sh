@@ -73,6 +73,11 @@ log "a count that does not fit the region holding it"
 expect_caught "more inodes than the table holds" "inodes_count|bitmap|table|fit"            inodes_count 99999999
 expect_caught "more node rows than the table"    "node_table_count|fit|layout"              node_table_count 99999
 expect_caught "a cluster wider than the mask"    "node_table_count|64|reader"               node_table_count 65
+# Not one mkfs writes, and the queues are read block by block per ZG:
+# four billion of them was hours of reading before any verdict (audit
+# 2026-11-11 F11; before the fix this exits nonzero only by the luck of
+# overlapping the journals, and never for this reason).
+expect_caught "a pending queue larger than mkfs writes" "pending-free queue has 300 blocks per ZG" pending_free_blocks_per_zg 300
 
 log "geometry the kernel refuses at mount"
 # fsck has to refuse what the mount refuses, or an operator is left with
