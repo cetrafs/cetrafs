@@ -5408,11 +5408,9 @@ static int cetrafs_truncate_shrink(struct inode *inode, loff_t new_size)
 /*
  * FALLOCATE_FL_PUNCH_HOLE: deallocate [offset, offset+len) without
  * changing i_size (hence requiring FALLOC_FL_KEEP_SIZE -- the only
- * other combination this project's fallocate(2) support claims).
- * Nothing else (plain preallocation, ZERO_RANGE, COLLAPSE_RANGE,
- * INSERT_RANGE) is implemented; nothing
- * in this project's actual target workload (VM disk images) needs them
- * the way hole-punching does (thin-provisioning's TRIM/UNMAP path).
+ * combination besides plain preallocation, cetrafs_do_allocate(), that
+ * this project's fallocate(2) support claims). ZERO_RANGE,
+ * COLLAPSE_RANGE and INSERT_RANGE are not implemented.
  *
  * Deliberately reuses cetrafs_truncate_shrink()'s own shape instead of a
  * parallel implementation: the same depth-0/depth-1 dispatch and revert-
