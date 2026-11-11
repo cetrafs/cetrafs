@@ -1253,12 +1253,18 @@ int cetrafs_node_frees_snapshot(struct super_block *sb, u32 my_node_id, bool sel
             if (ret)
                 return ret;
         }
-        if (!stale)
+        /* A stale row's frees never land -- on a CAW mount: its node
+         * stopped writing when its lease ran out, three intervals before
+         * any peer can judge it stale (cetrafs_sb_lease_renewed()), and
+         * I/O it had already queued is the advisory fence's known
+         * residue. Without CAW no lease is armed, and the mount gate
+         * admits a second node exactly when the first LOOKS dead: one
+         * that only stalled resumes its frees until its next heartbeat
+         * finds the fence. There the row stays busy -- the scrub keeps,
+         * the safe direction -- until it is no longer registered (audit
+         * 2026-11-11 N4, tests/kernel/scrub_nocaw_stale_frees.sh). */
+        if (!stale || !cetrafs_sb_mount_has_caw(sb))
             *busy = true;
-        /* A stale row's frees never land: its node stopped writing when
-         * its lease ran out, three intervals before any peer can judge
-         * it stale (cetrafs_sb_lease_renewed()). I/O it had already
-         * queued is the advisory fence's known residue. */
     }
     return 0;
 }
