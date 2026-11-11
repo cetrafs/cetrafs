@@ -111,6 +111,11 @@ static void cetrafs_xattr_read_pause(u64 ino)
  */
 #define CETRAFS_XATTR_READ_RETRIES CETRAFS_BLK_TAIL_READ_RETRIES
 
+/* TEST ONLY: setxattr's ctime stamp after an in-place block write fails. */
+static bool cetrafs_xattr_ctime_cas_fail;
+cetrafs_test_param(xattr_ctime_cas_fail, cetrafs_xattr_ctime_cas_fail, bool, 0644);
+MODULE_PARM_DESC(xattr_ctime_cas_fail, "TEST ONLY: the ctime stamp after an in-place xattr write fails");
+
 static int cetrafs_xattr_read_block(struct inode *inode, void **out)
 {
     struct super_block *sb = inode->i_sb;
@@ -500,7 +505,24 @@ static int cetrafs_xattr_set_locked(struct inode *inode, const char *name, const
     brelse(bh);
     if (ret || !now)
         return ret;
-    return cetrafs_inode_ns_cas(sb, inode->i_ino, cetrafs_le64(raw.generation), &raw, cetrafs_ns_apply_ctime, &now);
+    /*
+     * The block is on the device: the attribute IS set. A ctime stamp
+     * that fails now cannot take that back, and reporting the call as
+     * failed told the caller the opposite of what every reader then saw
+     * (audit 2026-11-11 X5). Not stamped first either: a peer that saw
+     * ctime move before the block would refresh its security label from
+     * the old block and keep it. So the change stands and the missed
+     * stamp is said -- peers key their label refresh on ctime, and may
+     * serve the old one until the next change to this file.
+     */
+    ret = READ_ONCE(cetrafs_xattr_ctime_cas_fail)
+              ? -EIO
+              : cetrafs_inode_ns_cas(sb, inode->i_ino, cetrafs_le64(raw.generation), &raw, cetrafs_ns_apply_ctime, &now);
+    if (ret)
+        pr_warn_ratelimited("setxattr: ino=%llu: the attribute is set, but its change time could not be stamped "
+                            "(%d) -- a peer may keep a stale security label until the file next changes\n",
+                            (unsigned long long) inode->i_ino, ret);
+    return 0;
 }
 
 /*
