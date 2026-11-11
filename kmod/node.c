@@ -798,7 +798,7 @@ static int cetrafs_node_twin_row(struct super_block *sb, u32 mine, const u8 *uui
 static u32 cetrafs_row_stale_window(struct super_block *sb, const cetrafs_node_entry_t *ne, u32 window)
 {
     u32 adv_stale = cetrafs_le32(ne->stale_secs);
-    /* Clamp the peer's adv_staleertised interval before flooring the wait on
+    /* Clamp the peer's advertised interval before flooring the wait on
      * it -- a hostile/corrupt (checksum-valid) row with a huge
      * hb_interval_secs would otherwise sleep for days (and *4 can
      * overflow). Bounded by the operator-enforced max. */
