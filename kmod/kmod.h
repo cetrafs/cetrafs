@@ -613,6 +613,7 @@ int cetrafs_fiemap(struct inode *inode, struct fiemap_extent_info *fi, u64 start
 #define CETRAFS_BLK_TAIL_READ_RETRIES 9
 void cetrafs_tear_backoff(int attempt);
 bool cetrafs_tear_injected(void);
+bool cetrafs_record_tear_injected(void);
 void cetrafs_blk_tail_stamp(struct buffer_head *bh, u32 magic);
 bool cetrafs_blk_tail_valid(const struct buffer_head *bh, u32 magic);
 /* Structure sanity on its own, for the CACHED read paths that skip the

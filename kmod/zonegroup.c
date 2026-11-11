@@ -125,7 +125,8 @@ static int cetrafs_read_zg(struct super_block *sb, u32 zg_id, cetrafs_zone_group
             cetrafs_bh_read_lock(bh);
             want = (u32) le64_to_cpu(zg->hot_checksum);
             got = cetrafs_zg_hot_crc(bh->b_data);
-            if (got == want && (u32) le64_to_cpu(zg->cold_checksum) == cetrafs_zg_cold_crc(bh->b_data)) {
+            if (!cetrafs_record_tear_injected() && got == want &&
+                (u32) le64_to_cpu(zg->cold_checksum) == cetrafs_zg_cold_crc(bh->b_data)) {
                 bool id_ok = le16_to_cpu(zg->zg_id) == (u16) zg_id;
 
                 if (id_ok)
@@ -139,8 +140,9 @@ static int cetrafs_read_zg(struct super_block *sb, u32 zg_id, cetrafs_zone_group
 
             /* Same backoff as the inode-record and node-row readers: a
              * checksum tear here is a peer's in-flight write, which
-             * takes milliseconds, not microseconds. */
-            usleep_range(100, 400);
+             * takes milliseconds, not microseconds (E2). */
+            if (attempt + 1 < 5)
+                cetrafs_tear_backoff(attempt);
         }
     }
 

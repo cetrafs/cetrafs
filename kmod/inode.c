@@ -242,7 +242,7 @@ int cetrafs_read_raw_inode(struct super_block *sb, u64 ino, cetrafs_inode_t *out
         cetrafs_bh_copy_stable(bh, out, sizeof(*out));
         brelse(bh);
 
-        if (cetrafs_inode_crcs_ok(out)) {
+        if (!cetrafs_record_tear_injected() && cetrafs_inode_crcs_ok(out)) {
             /* A valid record in the wrong slot -- a misdirected write,
              * or a record copied to where it does not belong -- is not
              * a torn read, and re-reading will not change it. Without
@@ -274,8 +274,12 @@ int cetrafs_read_raw_inode(struct super_block *sb, u64 ino, cetrafs_inode_t *out
          * milliseconds -- without a pause the whole retry budget is a
          * few microseconds of re-reads and a perfectly transient tear
          * is reported as -EUCLEAN. dir.c's dirent reader has always
-         * done this and says why; the record readers did not. */
-        usleep_range(100, 400);
+         * done this and says why; the record readers did not. The
+         * pause is cetrafs_tear_backoff()'s millisecond budget: a fixed
+         * 100-400 us did not span the write it was waiting for (review
+         * E2). */
+        if (attempt + 1 < CETRAFS_RAW_INODE_READ_RETRIES)
+            cetrafs_tear_backoff(attempt);
     }
 
 #ifdef CETRAFS_TRACE

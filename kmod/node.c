@@ -101,13 +101,14 @@ static int cetrafs_read_node_entry(struct super_block *sb, u32 idx, cetrafs_node
             memcpy(out, bh->b_data, sizeof(*out));
             brelse(bh);
 
-            if (cetrafs_le32(out->state) == CETRAFS_NODE_STATE_FREE ||
-                cetrafs_node_crc(out) == (u32) cetrafs_le64(out->checksum))
+            if (!cetrafs_record_tear_injected() && (cetrafs_le32(out->state) == CETRAFS_NODE_STATE_FREE ||
+                                                     cetrafs_node_crc(out) == (u32) cetrafs_le64(out->checksum)))
                 return 0;
 
             /* Same backoff as the inode-record reader: a tear is a
-             * peer's in-flight write, which takes milliseconds. */
-            usleep_range(100, 400);
+             * peer's in-flight write, which takes milliseconds (E2). */
+            if (attempt + 1 < 5)
+                cetrafs_tear_backoff(attempt);
         }
     }
 

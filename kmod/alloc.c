@@ -1384,7 +1384,8 @@ static int cetrafs_read_bg_geom_at(struct super_block *sb, const cetrafs_superbl
         /* Under the buffer lock, as cetrafs_read_zg(): the free count is
          * patched in place on this very buffer (audit L15). */
         cetrafs_bh_read_lock(bh);
-        if (cetrafs_bg_crc_verify(bh->b_data) == (u32) cetrafs_le64(bg->checksum)) {
+        if (likely(!cetrafs_record_tear_injected()) &&
+            cetrafs_bg_crc_verify(bh->b_data) == (u32) cetrafs_le64(bg->checksum)) {
             if (!cetrafs_bg_geom_sane(raw_sb, bg_id, bg)) {
                 pr_err_ratelimited("BG %u descriptor describes an impossible Block Group (start %llu len %llu "
                                    "bitmap +%u data +%u count %llu) -- refusing it (fsck)\n",
@@ -1414,11 +1415,15 @@ static int cetrafs_read_bg_geom_at(struct super_block *sb, const cetrafs_superbl
 
         /* Back off, like every other checksummed-record reader: a
          * mismatch here is a peer's in-flight counter write seen torn,
-         * and a peer's write takes milliseconds. (This is the FIFTH such
-         * reader -- the P5 pass that added the backoff to the inode
-         * record, node row and ZG record enumerated four and missed this
-         * one, which lives in alloc.c rather than with the others.) */
-        usleep_range(100, 400);
+         * and a peer's write takes milliseconds -- so the budget is
+         * cetrafs_tear_backoff()'s, the one X1 gave the block readers; the
+         * fixed 100-400 us it had spent the whole budget in about a
+         * millisecond (review E2). (This is the FIFTH such reader -- the
+         * P5 pass that added the backoff to the inode record, node row
+         * and ZG record enumerated four and missed this one, which lives
+         * in alloc.c rather than with the others.) */
+        if (attempt + 1 < 5)
+            cetrafs_tear_backoff(attempt);
     }
 
     pr_err("BG %u failed its descriptor checksum repeatedly -- corrupted, not just a torn concurrent read\n", bg_id);
