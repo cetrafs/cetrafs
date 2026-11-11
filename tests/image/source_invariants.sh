@@ -300,7 +300,7 @@ for f in "$K"/*.c; do
         *"TEST ONLY"*) ;;
         *) MISSING="$MISSING $(basename "$f"):$name" ;;
         esac
-    done < <(grep -oE '(module_param_named|cetrafs_test_param)\((fail|force)[a-z_]*|(module_param_named|cetrafs_test_param)\([a-z_]*(fail|force|stress|selftest|skip_precheck)[a-z_]*|(module_param_named|cetrafs_test_param)\([a-z_]*_at' "$f" | sed -E 's/(module_param_named|cetrafs_test_param)\(//')
+    done < <(grep -oE '(module_param_named|cetrafs_test_param)\((fail|force)[a-z_]*|(module_param_named|cetrafs_test_param)\([a-z_]*(fail|force|stress|selftest|skip_precheck)[a-z_]*|(module_param_named|cetrafs_test_param)\([a-z_]*_at,' "$f" | sed -E 's/(module_param_named|cetrafs_test_param)\(//; s/,$//')
 done
 NINJ="$(grep -ohE '(module_param_named|cetrafs_test_param)\((fail|force)[a-z_]*' "$K"/*.c | wc -l)"
 [ "$NINJ" -ge 5 ] || fail "injection params: found only $NINJ fail/force knobs -- the scan is not seeing the tree"
