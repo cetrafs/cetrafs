@@ -4260,6 +4260,7 @@ out:
 void cetrafs_trim_release(struct super_block *sb, struct cetrafs_trim_run *run, bool keep)
 {
     struct cetrafs_bg_geom bg;
+    bool sync_kept = false;
     long wrong;
     int ret;
 
@@ -4278,6 +4279,7 @@ void cetrafs_trim_release(struct super_block *sb, struct cetrafs_trim_run *run, 
         atomic64_add((s64) run->count, &cetrafs_trim_leaked_blocks);
         pr_warn_ratelimited("trim: the discard of [%llu +%llu) may still land -- left allocated for the scrub\n",
                             (unsigned long long) run->lba, (unsigned long long) run->count);
+        sync_kept = true;
         goto out;
     }
     if (ret || cetrafs_sb_is_fenced(sb) || cetrafs_alloc_bg_gone(sb, run->bg_id) ||
@@ -4313,6 +4315,31 @@ out:
     run->claimed = false;
     cetrafs_sb_alloc_unlock(sb);
 
+    /*
+     * A kept run is held by its bits alone, and the claim set them in
+     * the buffer cache: dirty, not synced, and not noted for
+     * cetrafs_alloc_flush_bitmaps(). A fence or crash before writeback
+     * -- a transport failure is exactly when one is likely -- hands the
+     * Zone Group to a peer whose recount reads them FREE, and it
+     * allocates under the command that may still land (review U2). So
+     * the hold reaches the device before the failure is reported, or
+     * the mount can promise nothing about that run and stops.
+     */
+    if (sync_kept) {
+        u64 first, last, blk;
+        int sret = ret;
+
+        if (!sret) {
+            first = (run->lba - bg.start_block - bg.off_data_region) / (CETRAFS_BLOCK_SIZE * 8);
+            last = (run->lba + run->count - 1 - bg.start_block - bg.off_data_region) / (CETRAFS_BLOCK_SIZE * 8);
+            for (blk = first; blk <= last && !sret; blk++)
+                sret = cetrafs_sync_one_block(sb, bg.start_block + bg.off_data_bmap + blk);
+        }
+        if (sret)
+            cetrafs_sb_fatal(sb, "trim: could not make the hold on [%llu +%llu) durable (%d) -- a discard of it "
+                                 "may still land",
+                             (unsigned long long) run->lba, (unsigned long long) run->count, sret);
+    }
 }
 
 /* A Block Group's data region, for a discard to check itself against. */

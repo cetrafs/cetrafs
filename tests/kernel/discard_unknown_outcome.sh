@@ -22,6 +22,9 @@
 #     said once, however many passes fail (U3), and handed back only
 #     after a later discard of it succeeds.
 #  D. CONTRAST, definite: handed back in the same pass, no retry.
+#  E. FITRIM, unknown: the kept run's bits are on the DEVICE when fstrim
+#     returns, not only in this node's cache (U2) -- a fence before
+#     writeback would otherwise hand a peer a bitmap reading FREE.
 set -euo pipefail
 . "$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)/lib/harness.sh"
 require_root
@@ -193,4 +196,34 @@ grep -q "handed back from ZG" <<<"$LOG" && pass "D: handed back" || fail "D: nev
 ct_umount "$MNT"
 OUT="$(ct_fsck "$DEV" 2>&1)" && pass "D: fsck clean" || fail "D: fsck: $(grep -m3 -E '^ERR' <<<"$OUT")"
 
+# ------------------------------------------------------------------- E
+log "E: FITRIM, the kept run's hold is on the device"
+hole
+ct_param_set discard_fail_unknown 1
+fstrim -m 4M "$MNT" >/dev/null 2>&1 || true
+ct_param_set discard_fail_unknown 0
+# Read the bitmap block covering the hole from the loop device's
+# backing file: what the device holds. Not an O_DIRECT read of the
+# block device -- that writes the range's dirty cache back first, and
+# would put the hold there itself.
+read -r ST OBM ODR <<<"$("$BGPOKE" "$DEV" 0 --dump | sed -n 's/.*start_block=\([0-9]*\).*off_data_bmap=\([0-9]*\).*off_data_region=\([0-9]*\).*/\1 \2 \3/p')"
+[ -n "$ODR" ] || { fail "E setup: cannot read Block Group 0's layout"; ct_exit; }
+SET="$(python3 - "$IMG" "$ST" "$OBM" "$ODR" "$HOLE" <<'PY'
+import os, sys
+img, st, obm, odr, hole = sys.argv[1], *map(int, sys.argv[2:])
+fd = os.open(img, os.O_RDONLY)
+first = hole - st - odr
+blk = obm + first // 32768
+buf = os.pread(fd, 4096 * 2, (st + blk) * 4096)
+n = 0
+for i in range(first, first + 2048):
+    j = i - (blk - obm) * 32768
+    if buf[j // 8] >> (j % 8) & 1:
+        n += 1
+print(n)
+PY
+)"
+[ "$SET" = 2048 ] && pass "E: all 2048 bits of the kept run read set on the device itself" ||
+    fail "E: the device shows $SET of the kept run's 2048 bits set -- the hold is only in this node's cache"
+ct_umount "$MNT"
 ct_exit
