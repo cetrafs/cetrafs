@@ -2006,7 +2006,9 @@ int main(int argc, char **argv)
                     "     -- its structures are being modified as we read them. Unmount it there;\n"
                     "     its row goes stale after %ds.\n",
                     dev, row, label[0] ? ", " : "", label[0] ? label : "", age, CETRAFS_NODE_STALE_SECS);
-            return 1;
+            /* Not examined, which is 3; 1 claims "problems found" about
+             * a volume nobody looked at (audit 2026-11-11 F1). */
+            return FSCK_EXIT_NOEXAM;
         }
     }
 
@@ -2619,13 +2621,20 @@ int main(int argc, char **argv)
         if (retired)
             fsync(fd);
         else
-            fprintf(stderr, "WARN: the Node Registry is full and every departed row is still referenced -- no "
-                            "row could be retired\n");
+        {
+            /* A problem, not a note: no new node can ever register, and
+             * "OK" with exit 0 told the operator otherwise (audit
+             * 2026-11-11 F8). The same for the two cases below. */
+            fprintf(stderr, "ERR: the Node Registry is full and every departed row is still referenced -- no "
+                            "row could be retired, and no new node can register\n");
+            early_problems++;
+        }
         free(node_ref);
     } else if (node_free_rows == 0 && node_departed_rows > 0 && !repair_mode) {
-        fprintf(stderr, "WARN: the Node Registry is full; %u row(s) belong to nodes that departed cleanly -- "
-                        "fsck -r retires those that nothing references\n",
+        fprintf(stderr, "ERR: the Node Registry is full -- no new node can register; %u row(s) belong to nodes "
+                        "that departed cleanly, and fsck -r retires those that nothing references\n",
                 node_departed_rows);
+        early_problems++;
     }
 
     /*
@@ -3530,8 +3539,9 @@ int main(int argc, char **argv)
         uint64_t leaked = 0, unmarked = 0, idx = 0, miscounted = 0, stale_free = 0;
         /* Test knob only: a pause between the last heartbeat and this
          * pass's writes, so a suite can have a node appear there
-         * (tests/kernel/fsck_write_after_lost_claim.sh). Unset normally. */
-        if (repair_mode && cetrafs_test_env("CETRAFS_TEST_FSCK_HOLD_BEFORE_BG_PASS_SECS")) {
+         * (tests/kernel/fsck_write_after_lost_claim.sh, and without -r
+         * tests/image/fsck_exit_codes.sh). Unset normally. */
+        if (cetrafs_test_env("CETRAFS_TEST_FSCK_HOLD_BEFORE_BG_PASS_SECS")) {
             printf("  holding before the block group pass (test)\n");
             fflush(stdout);
             cetrafs_test_hold("CETRAFS_TEST_FSCK_HOLD_BEFORE_BG_PASS_SECS");
@@ -4670,6 +4680,29 @@ int main(int argc, char **argv)
                         repair_mode ? " -- kept until a repair pass finds the volume clean"
                                     : " -- fsck.cetra -r clears it once the volume is clean");
                 problems++;
+            }
+        }
+
+        /*
+         * The live-peer probe answered for the moment it ran, and the
+         * walk since can take minutes. Without -r nothing keeps a node
+         * from mounting meanwhile (a repair's claim does), and a walk
+         * over a volume a node was changing is a verdict about nothing:
+         * ask again before giving one (audit 2026-11-11 F6).
+         */
+        if (!repair_mode) {
+            char label[CETRAFS_NODE_LABEL_LEN + 1] = {0};
+            long long age = 0;
+            uint32_t row = 0;
+            int lp = cetrafs_find_live_peer(dev, &row, label, sizeof(label), &age);
+
+            if (lp) {
+                fprintf(stderr,
+                        lp < 0 ? "ERR: %s: its Node Registry could not be read again after the walk -- no verdict\n"
+                               : "ERR: %s: a node mounted it while fsck walked it (registry row %u) -- the walk saw a "
+                                 "volume being changed, so it gives no verdict. Re-run with the volume unmounted.\n",
+                        dev, row);
+                return FSCK_EXIT_NOEXAM;
             }
         }
 
