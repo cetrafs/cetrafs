@@ -1472,6 +1472,165 @@ printf 'void cetrafs_thing_cache_drop(struct inode *inode)\n{\n    ci->valid = f
     pass "class 41: control -- a planted drop is found, and one that moves no generation is refused" ||
     fail "class 41: control -- the planted drop was not caught"
 
+# Class 51 (a cache key that summarises its value). A cached answer is
+# trusted when its key still matches the device; a key that is a SUMMARY
+# of the record (counts, a size, a checksum) recurs -- punch k blocks,
+# allocate k -- and then trusts an answer about different contents. So
+# every function whose name says it trusts or looks up cached state is
+# listed with what makes its key an identity: a change stamp every
+# publish moves and nothing returns (compared here), a generation, a
+# call to one that does, or why no key is involved. A new one fails
+# until listed. Names only: a cache trusted under another name is not
+# seen (gap, as for class 41).
+log "checking every cache lookup is keyed on an identity, not a summary (class 51)"
+C51_REG='cetrafs_inode_ext_cache_lookup calls:cetrafs_ext_key_matches
+cetrafs_ext_key_matches key:file_seq
+cetrafs_dir_needs_fresh key:dirent_seq
+cetrafs_verdict_current key:verdict_gen
+cetrafs_inode_foreign_opener_cached calls:cetrafs_verdict_current
+cetrafs_lock_identity_cache_trusted calls:cetrafs_inode_foreign_opener_cached
+cetrafs_lock_read_cache_trusted calls:cetrafs_inode_read_stamp_check
+cetrafs_sb_zg_owned_cached none:this-nodes-own-claims-revoked-only-by-its-fence
+cetrafs_inode_dirent_seq_cached none:an-accessor-of-the-stamp-dir_needs_fresh-compares
+cetrafs_inode_set_dirent_seq_cached none:an-accessor
+cetrafs_tree_invalidate_cached none:an-invalidate-class-41
+cetrafs_inode_is_allocated_fresh none:a-forced-fresh-read-not-a-cache
+cetrafs_inode_ns_held_by_current none:a-lock-holder-test
+cetrafs_xattr_trusted_list none:the-trusted-xattr-namespace'
+c51_names() { # <files...>: every function whose name says it trusts cached state
+    grep -hoE '^(static )?(inline )?(void|bool|int|u32|u64) \*?cetrafs_[a-z0-9_]*(cache_lookup|_cached|_trusted|_current|_fresh|_key_matches)[a-z0-9_]*\(' "$@" |
+        grep -oE 'cetrafs_[a-z0-9_]*' | sort -u
+}
+c51_bad() { # <fn> <kind>: prints why the key is not an identity, nothing if it is
+    case "$2" in
+    key:*) grep -E "${2#key:}" <<<"$(c41_body "$1")" | grep -qE '!=|==' || echo "$1: no longer compares ${2#key:}" ;;
+    calls:*) grep -q "${2#calls:}(" <<<"$(c41_body "$1")" || echo "$1: no longer calls ${2#calls:}" ;;
+    none:*) ;;
+    *) echo "$1: unknown kind $2" ;;
+    esac
+}
+C51_FOUND="$(c51_names "$K"/*.c)"
+[ -n "$C51_FOUND" ] || fail "class 51: setup -- no cache lookup found (the grep no longer matches)"
+C51_NEW="$(comm -23 <(echo "$C51_FOUND") <(cut -d' ' -f1 <<<"$C51_REG" | sort -u))"
+C51_GONE="$(comm -13 <(echo "$C51_FOUND") <(cut -d' ' -f1 <<<"$C51_REG" | sort -u))"
+C51_BAD="$(while read -r fn kind; do c51_bad "$fn" "$kind"; done <<<"$C51_REG")"
+[ -z "$C51_NEW" ] && [ -z "$C51_GONE" ] && [ -z "$C51_BAD" ] &&
+    pass "class 51: every cache lookup names the identity its key carries ($(echo $C51_FOUND | wc -w))" ||
+    fail "class 51: unlisted: $(echo $C51_NEW); listed but gone: $(echo $C51_GONE); not an identity: $C51_BAD"
+# Control: a lookup keyed on counts alone is found and refused.
+C51_SAMPLE="$(ct_tmp c51).c"
+printf 'static bool cetrafs_thing_key_matches(const struct ci *ci, const cetrafs_inode_t *raw)\n{\n    return ci->key_blocks == raw->blocks;\n}\n' >"$C51_SAMPLE"
+[ "$(c51_names "$C51_SAMPLE")" = cetrafs_thing_key_matches ] &&
+    [ -n "$(K="$(dirname "$C51_SAMPLE")" c51_bad cetrafs_thing_key_matches key:file_seq)" ] &&
+    pass "class 51: control -- a planted lookup keyed on a count is found and refused" ||
+    fail "class 51: control -- the planted summary key was not caught"
+
+# Class 43 (a transient withholding reported as a final answer). Every
+# function that ORIGINATES -ENOSPC is listed with what its answer means:
+#   waits:<fn>  it waits out the transient states (a release deciding)
+#               before answering -- and still calls <fn>;
+#   calls:<fn>  its ENOSPC comes after asking <fn>, which waits;
+#   below:...   a per-group/per-bitmap "none here" its caller moves on from;
+#   final:...   a structural limit no wait changes (a full tree, a full
+#               registry), or a caller for whom it is not user-visible.
+# A new originator fails until it says which. What is enumerated is the
+# literal; an ENOSPC passed up from elsewhere is its originator's.
+log "checking every -ENOSPC names the transient states it waited out (class 43)"
+C43_REG='cetrafs_alloc_pick_bg waits:cetrafs_sb_release_wait
+cetrafs_alloc_block_anywhere calls:cetrafs_alloc_pick_bg
+cetrafs_do_allocate calls:cetrafs_alloc_pick_bg
+cetrafs_alloc_data_block below:one-group-full-the-pick-chooses-again
+cetrafs_alloc_data_block_near below:one-group-full-the-pick-chooses-again
+cetrafs_alloc_data_run_resv below:one-group-has-no-run
+cetrafs_alloc_pick_run_resv final:defrag-only-cannot-defrag-now-is-not-user-visible
+cetrafs_bg_claim_free below:nothing-to-claim-the-pick-goes-on-to-wait-for-a-release
+cetrafs_bitmap_alloc_bit below:one-bitmap
+cetrafs_bitmap_alloc_run_start below:one-bitmap
+cetrafs_bitmap_find_free_run below:one-bitmap
+cetrafs_bitmap_try_alloc_exact below:one-bitmap
+cetrafs_bmap_cas_mutate below:one-region-the-caller-tries-the-next
+cetrafs_inode_bitmap_cas_alloc final:every-inode-number-in-use-a-free-in-flight-holds-its-number-until-published
+cetrafs_leaf_array_insert final:a-full-leaf-the-caller-splits
+cetrafs_leaf_array_punch final:no-room-for-the-split-nothing-changed
+cetrafs_tree_append final:the-extent-tree-is-full
+cetrafs_tree_build final:the-extent-tree-is-full
+cetrafs_xattr_set_locked final:the-xattr-block-is-full
+cetrafs_node_register final:every-registry-row-taken
+cetrafs_zg_queue_foreign_free below:a-full-queue-is-a-logged-leak-its-caller-reports-as-success'
+c43_names() { # <files...>: every function with a literal return/assignment of -ENOSPC
+    awk '/^[a-z][a-z0-9_ *]*[ *]cetrafs_[a-z0-9_]*\(/ && !/;[ \t]*$/ { match($0, /cetrafs_[a-z0-9_]*\(/); fn = substr($0, RSTART, RLENGTH - 1) }
+/^cetrafs_[a-z0-9_]*\(/ && !/;[ \t]*$/ { match($0, /cetrafs_[a-z0-9_]*\(/); fn = substr($0, RSTART, RLENGTH - 1) }
+/^\}/ { fn = "" }
+{ line = $0; sub(/\/\*.*$/, "", line); sub(/\/\/.*$/, "", line) }
+line ~ /^[ \t]*\*/ { next }
+line ~ /(return|=)[ \t]*-ENOSPC[ \t]*;/ && fn != "" { print fn }' "$@" | sort -u
+}
+C43_FOUND="$(c43_names "$K"/*.c)"
+[ -n "$C43_FOUND" ] || fail "class 43: setup -- no -ENOSPC found (the scan no longer matches)"
+C43_NEW="$(comm -23 <(echo "$C43_FOUND") <(cut -d' ' -f1 <<<"$C43_REG" | sort -u))"
+C43_GONE="$(comm -13 <(echo "$C43_FOUND") <(cut -d' ' -f1 <<<"$C43_REG" | sort -u))"
+C43_BAD="$(while read -r fn kind; do
+    case "$kind" in
+    waits:* | calls:*) grep -q "${kind#*:}(" <<<"$(c41_body "$fn")" || echo "$fn: no longer calls ${kind#*:}" ;;
+    below:* | final:*) ;;
+    *) echo "$fn: unknown kind $kind" ;;
+    esac
+done <<<"$C43_REG")"
+[ -z "$C43_NEW" ] && [ -z "$C43_GONE" ] && [ -z "$C43_BAD" ] &&
+    pass "class 43: every -ENOSPC originator says what it waited out ($(echo $C43_FOUND | wc -w))" ||
+    fail "class 43: unlisted: $(echo $C43_NEW); listed but gone: $(echo $C43_GONE); $C43_BAD"
+# Control: a new originator, one in a comment (not one), and a pick
+# that stopped waiting.
+C43_SAMPLE="$(ct_tmp c43).c"
+printf 'int cetrafs_thing_alloc(struct super_block *sb)\n{\n    /* return -ENOSPC; */\n    return -ENOSPC;\n}\nint cetrafs_alloc_pick_bg(struct super_block *sb)\n{\n    return -ENOSPC;\n}\n' >"$C43_SAMPLE"
+[ "$(c43_names "$C43_SAMPLE" | tr '\n' ' ')" = "cetrafs_alloc_pick_bg cetrafs_thing_alloc " ] &&
+    ! grep -q "cetrafs_sb_release_wait(" <<<"$(K="$(dirname "$C43_SAMPLE")" c41_body cetrafs_alloc_pick_bg)" &&
+    pass "class 43: control -- a planted originator is found, a comment is not, and a pick that stopped waiting is seen" ||
+    fail "class 43: control -- the planted originators were not seen as expected"
+
+# Class 14 (distance between check and act), for its most destructive
+# act: clearing an inode number's bit. What runs between a verdict and
+# its act is not visible to a grep, but WHO may act is: the bit clear is
+# reachable only through the functions that re-read the record at the
+# act (cetrafs_free_inode_if_dead()/_begin/_finish/_steal) or that free
+# a number no verdict was made about (a create's own unpublished birth,
+# a number held under this node's claim). Each primitive lists its
+# callers; a new caller fails until it says which kind it is.
+log "checking every inode-number free goes through an act-time re-check (class 14)"
+C14_REG='cetrafs_inode_bitmap_cas_free cetrafs_free_inode cetrafs_free_inode_number_claimed
+cetrafs_free_inode cetrafs_create_locked cetrafs_mkdir_locked cetrafs_symlink_locked
+cetrafs_free_inode_number_claimed cetrafs_free_inode_finish cetrafs_lock_sweep_own_claims
+cetrafs_free_inode_finish cetrafs_alloc_retry_reclaim cetrafs_evict_inode cetrafs_free_inode_if_dead cetrafs_free_inode_steal'
+# cetrafs_free_inode: the create paths' rollback of a number they
+#   allocated and never published -- nothing judged, nothing to re-read.
+# cetrafs_free_inode_number_claimed: the dead record is held under this
+#   node's reclaim claim, which is the act-time fence.
+# cetrafs_free_inode_finish: called only after _begin's or _if_dead's
+#   fresh re-read under the claim (rule 15).
+c14_callers() { # <primitive> <files...>
+    local p="$1"
+    shift
+    awk -v P="$p" '/^[a-z][a-z0-9_ *]*[ *]cetrafs_[a-z0-9_]*\(/ && !/;[ \t]*$/ { match($0, /cetrafs_[a-z0-9_]*\(/); fn = substr($0, RSTART, RLENGTH - 1) }
+/^cetrafs_[a-z0-9_]*\(/ && !/;[ \t]*$/ { match($0, /cetrafs_[a-z0-9_]*\(/); fn = substr($0, RSTART, RLENGTH - 1) }
+/^\}/ { fn = "" }
+{ line = $0; sub(/\/\*.*$/, "", line) }
+line ~ /^[ \t]*\*/ { next }
+line ~ ("[^a-z_]" P "\\(") && fn != "" && fn != P { print fn }' "$@" | sort -u | tr '\n' ' '
+}
+C14_BAD="$(while read -r prim callers; do
+    got="$(c14_callers "$prim" "$K"/*.c)"
+    want="$(tr ' ' '\n' <<<"$callers" | sort -u | tr '\n' ' ')"
+    [ "$got" = "$want" ] || echo "$prim: called from [$got], listed [$want];"
+done <<<"$C14_REG")"
+[ -z "$C14_BAD" ] && pass "class 14: every inode-number free is reached only through a listed act-time re-check" ||
+    fail "class 14: $C14_BAD"
+# Control: a planted unlisted caller of the bit clear is seen.
+C14_SAMPLE="$(ct_tmp c14).c"
+printf 'int cetrafs_scrub_thing(struct super_block *sb)\n{\n    return cetrafs_inode_bitmap_cas_free(sb, 1);\n}\n' >"$C14_SAMPLE"
+[ "$(c14_callers cetrafs_inode_bitmap_cas_free "$C14_SAMPLE")" = "cetrafs_scrub_thing " ] &&
+    pass "class 14: control -- a planted caller of the bit clear is found" ||
+    fail "class 14: control -- the planted caller was not found"
+
 # Class 44 ("alive" as the unsafe default). A liveness predicate's first
 # look at a row answers "alive" -- right for a reclaim, which then keeps
 # its hands off, and wrong for a caller that REFUSES or INHERITS on it
