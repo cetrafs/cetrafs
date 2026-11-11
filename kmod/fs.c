@@ -4898,7 +4898,9 @@ void cetrafs_sb_lease_renewed(struct super_block *sb, unsigned long t0, unsigned
         return;
     if (!READ_ONCE(sbi->lease_active)) {
         if (!cetrafs_sb_mount_has_caw(sb) && !cetrafs_lease_force)
-            return; /* no peer can exist, so nobody can reclaim from us */
+            return; /* the mount gate admits no peer beside us; a node with our
+                     * UUID that takes our row over is caught by the renewal's
+                     * incarnation compare instead (audit 2026-11-11 N2) */
         if (!sbi->lease_work_ready) {
             sbi->sb = sb;
             INIT_WORK(&sbi->lease_work, cetrafs_sb_lease_work);

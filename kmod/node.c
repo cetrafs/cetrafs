@@ -440,15 +440,26 @@ static int cetrafs_node_fence_mutate(void *image, unsigned int len, void *priv)
  * not a premise. This one named its own hazard and got the direction
  * wrong.
  */
+struct cetrafs_node_depart_ctx {
+    u8 my_uuid[CETRAFS_NODE_UUID_LEN];
+    u32 my_incarnation;
+};
+
 static int cetrafs_node_depart_mutate(void *image, unsigned int len, void *priv)
 {
+    const struct cetrafs_node_depart_ctx *ctx = priv;
     cetrafs_node_entry_t ne;
 
-    (void) priv;
     memcpy(&ne, image, sizeof(ne));
 
     if (cetrafs_le32(ne.state) != CETRAFS_NODE_STATE_REGISTERED)
         return 1; /* already gone: nothing to do, and not an error */
+    /* Another holder of the row -- a node with our UUID that took it
+     * over while this one stalled: its row, not ours to mark departed
+     * (audit 2026-11-11 N2). */
+    if (memcmp(ne.node_uuid, ctx->my_uuid, CETRAFS_NODE_UUID_LEN) != 0 ||
+        cetrafs_le32(ne.incarnation) != ctx->my_incarnation)
+        return 1;
     if (cetrafs_le32(ne.departure) != CETRAFS_NODE_DEPART_NONE)
         return 1; /* already recorded: ours, or a peer's verdict that stands */
     if (!cetrafs_node_image_ok(&ne))
@@ -660,7 +671,8 @@ int cetrafs_node_fence_peer(struct super_block *sb, u32 node_id, const char *wha
  * row is no longer ours:
  *   - the epoch moved: a peer reclaimed something of ours;
  *   - the row is no longer REGISTERED: someone released it;
- *   - the UUID changed: the row was freed and handed to another node.
+ *   - the UUID changed: the row was freed and handed to another node;
+ *   - the incarnation changed: a node with our UUID took the row over.
  */
 int cetrafs_node_self_fence_check(struct super_block *sb, u32 my_node_id, bool *out_fenced)
 {
@@ -680,6 +692,7 @@ int cetrafs_node_self_fence_check(struct super_block *sb, u32 my_node_id, bool *
 
     if (cetrafs_le32(ne.state) != CETRAFS_NODE_STATE_REGISTERED ||
         memcmp(ne.node_uuid, my_uuid, CETRAFS_NODE_UUID_LEN) != 0 ||
+        cetrafs_le32(ne.incarnation) != cetrafs_sb_incarnation(sb) ||
         cetrafs_le64(ne.fence_epoch) != cetrafs_sb_get_fence_epoch(sb))
         *out_fenced = true;
 
@@ -1058,6 +1071,7 @@ struct cetrafs_node_renew_ctx {
      * compare-and-swap and has no super_block to ask. */
     unsigned int hb_interval;
     unsigned int stale_secs;
+    u32 my_incarnation;
 };
 
 static int cetrafs_node_renew_mutate(void *image, unsigned int len, void *priv)
@@ -1075,7 +1089,14 @@ static int cetrafs_node_renew_mutate(void *image, unsigned int len, void *priv)
      * be -EINVAL, which the tick only logged before going on to claim,
      * drain and replay as a node nobody believes exists. */
     if (cetrafs_le32(ne.state) != CETRAFS_NODE_STATE_REGISTERED ||
-        memcmp(ne.node_uuid, ctx->my_uuid, CETRAFS_NODE_UUID_LEN) != 0) {
+        memcmp(ne.node_uuid, ctx->my_uuid, CETRAFS_NODE_UUID_LEN) != 0 ||
+        cetrafs_le32(ne.incarnation) != ctx->my_incarnation) {
+        /* (The incarnation too: a node with our UUID -- a clone, a
+         * reinstalled host -- that re-attached to this row while we
+         * stalled keeps the epoch we registered with, so only the
+         * incarnation tells its row from ours. On a volume with no
+         * atomic CAW no lease runs out for us either; this is the one
+         * thing that stops us (audit 2026-11-11 N2).) */
         ctx->lost = true;
         return 1; /* write nothing */
     }
@@ -1123,7 +1144,8 @@ int cetrafs_node_renew_heartbeat(struct super_block *sb, u32 my_node_id)
 {
     struct cetrafs_node_renew_ctx ctx = {.expect_epoch = cetrafs_sb_get_fence_epoch(sb),
                                          .hb_interval = cetrafs_heartbeat_interval_secs(sb),
-                                         .stale_secs = cetrafs_sb_stale_secs(sb)};
+                                         .stale_secs = cetrafs_sb_stale_secs(sb),
+                                         .my_incarnation = cetrafs_sb_incarnation(sb)};
     int ret = cetrafs_sb_get_node_uuid(sb, ctx.my_uuid);
 
     if (ret)
@@ -1147,6 +1169,7 @@ struct cetrafs_node_frees_ctx {
     u8 my_uuid[CETRAFS_NODE_UUID_LEN];
     bool on;
     bool fenced, lost;
+    u32 my_incarnation;
 };
 
 static int cetrafs_node_frees_mutate(void *image, unsigned int len, void *priv)
@@ -1156,7 +1179,8 @@ static int cetrafs_node_frees_mutate(void *image, unsigned int len, void *priv)
 
     memcpy(&ne, image, sizeof(ne));
     if (cetrafs_le32(ne.state) != CETRAFS_NODE_STATE_REGISTERED ||
-        memcmp(ne.node_uuid, ctx->my_uuid, CETRAFS_NODE_UUID_LEN) != 0) {
+        memcmp(ne.node_uuid, ctx->my_uuid, CETRAFS_NODE_UUID_LEN) != 0 ||
+        cetrafs_le32(ne.incarnation) != ctx->my_incarnation) {
         ctx->lost = true;
         return 1;
     }
@@ -1178,7 +1202,8 @@ static int cetrafs_node_frees_mutate(void *image, unsigned int len, void *priv)
 
 int cetrafs_node_set_frees(struct super_block *sb, u32 my_node_id, bool on)
 {
-    struct cetrafs_node_frees_ctx ctx = {.expect_epoch = cetrafs_sb_get_fence_epoch(sb), .on = on};
+    struct cetrafs_node_frees_ctx ctx = {
+        .expect_epoch = cetrafs_sb_get_fence_epoch(sb), .on = on, .my_incarnation = cetrafs_sb_incarnation(sb)};
     int ret = cetrafs_sb_get_node_uuid(sb, ctx.my_uuid);
 
     if (ret)
@@ -1310,7 +1335,14 @@ int cetrafs_node_mark_offline(struct super_block *sb, u32 my_node_id)
     /* One CAS of the row's own sector -- see cetrafs_node_depart_mutate().
      * Renewal has always done it this way; this path blind-wrote the
      * whole row and could revert a peer's fence_epoch bump. */
-    ret = cetrafs_cas_record(sb, cetrafs_node_row_lba(sb, my_node_id), cetrafs_node_depart_mutate, NULL);
+    {
+        struct cetrafs_node_depart_ctx dctx = {.my_incarnation = cetrafs_sb_incarnation(sb)};
+
+        ret = cetrafs_sb_get_node_uuid(sb, dctx.my_uuid);
+        if (ret)
+            return ret;
+        ret = cetrafs_cas_record(sb, cetrafs_node_row_lba(sb, my_node_id), cetrafs_node_depart_mutate, &dctx);
+    }
     if (ret < 0)
         return ret;
 
