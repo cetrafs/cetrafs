@@ -3321,10 +3321,19 @@ int cetrafs_fill_super(struct super_block *sb, struct fs_context *fc)
         spin_unlock(&sbi->cold_lock);
     }
 
+    /* What the device says about UNMAP, once, where an operator looks
+     * first. The block layer's limits are the probe: a SCSI disk's come
+     * from its Block Limits VPD page, read when the disk was attached. */
+    if (cetrafs_discard_supported(sb))
+        pr_info("%s: UNMAP supported: up to %u KiB per command, granularity %u KiB; hand-back discard %s\n",
+                sb->s_id, (unsigned int) (bdev_max_discard_sectors(sb->s_bdev) >> 1),
+                bdev_discard_granularity(sb->s_bdev) >> 10, cetrafs_sb_discard_enabled(sb) ? "on" : "off");
+    else
+        pr_info("%s: UNMAP not supported by the device: no discard at hand-back or fstrim\n", sb->s_id);
+
     brelse(bh);
     pr_info("mounted OK: Z=%u, B=%u, bg_size=%llu blocks, data@%llu, node_id=%u\n", sbi->zg_count, sbi->layout->bg_count,
             (unsigned long long) sbi->bg_size_blocks, (unsigned long long) sbi->bg_regions_start, sbi->node_id);
-
     return 0;
 }
 

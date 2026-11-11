@@ -22,6 +22,7 @@
 #  3. a device without discard: the hand-back still happens (discard is
 #     best effort, releasing is not), fstrim says "not supported", and
 #     the controls file says the device has none.
+#  The mount reports which it is, once, in dmesg (1 and 3).
 #  4. a FITRIM claim inside an emptied group while the heartbeat tries
 #     to release it: the release's pre-check sees the claim's debit (an
 #     accrued delta, not yet on the descriptor) and leaves the group
@@ -50,9 +51,12 @@ ct_mkfs "$DEV" -z 1 -b 512 -J 0 -N 1024 -f >/dev/null
 BG0_FREE="$("$BGPOKE" "$IMG" 0 --dump | sed -n 's/.*free_data_blocks=\([0-9]*\).*/\1/p')"
 [ -n "$BG0_FREE" ] && [ "$BG0_FREE" -gt 1024 ] || { fail "setup: cannot read Block Group 0's free count"; ct_exit; }
 compress_timing
+MARK="$(dmesg_mark)"
 ct_mount "$DEV" "$MNT"
 require_cetrafs_mount "$MNT"
 PROC="$(ct_procdir "$DEV")"
+dmesg_since "$MARK" | grep -q "$(basename "$DEV"): UNMAP supported: up to [0-9]* KiB per command, granularity [0-9]* KiB; hand-back discard on" &&
+    pass "1: the mount says the device takes UNMAP" || fail "1: the mount did not report the device's UNMAP support"
 fallocate -l $(((BG0_FREE - 256) * 4096)) "$MNT/pad"
 sync
 
@@ -165,7 +169,10 @@ if ! echo 0 >"$DMQ/discard_max_bytes" 2>/dev/null || [ "$(cat "$DMQ/discard_max_
     ct_exit
 fi
 PROC="$(ct_procdir "$DEV")"
+MARK="$(dmesg_mark)"
 ct_mount "$DEV" "$MNT"
+dmesg_since "$MARK" | grep -q "UNMAP not supported by the device" && pass "3: the mount says the device takes no UNMAP" ||
+    fail "3: the mount did not report the missing UNMAP support"
 grep -q "^discard_supported: no" "$PROC/controls" && pass "3: controls says the device takes no discards" ||
     fail "3: controls still says discard_supported after the device lost it"
 ERR0="$(info discard_errors)"
