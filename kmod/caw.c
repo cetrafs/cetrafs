@@ -1049,6 +1049,48 @@ u64 cetrafs_cas_seed_refused_count(void)
     return (u64) atomic64_read(&cetrafs_cas_seed_refused);
 }
 
+/*
+ * After a swap is known to be on the device: make this node's cached
+ * copy agree with it. The swap's bytes go into any uptodate buffer, dirty
+ * or not (cetrafs_cache_region_after_cas()); a block holding OTHER
+ * regions, which peers swap independently, is then dropped as well --
+ * when it can be.
+ *
+ * The non-sole case used to drop only, with cetrafs_invalidate_block(),
+ * which rightly keeps a DIRTY buffer: that buffer still held the
+ * pre-image of the region just swapped, and its write-back put it back
+ * over the swap -- the swap undone, on the device, for every node
+ * (audit 2026-11-11 C2, the CAS selftest's phase 2e,
+ * tests/kernel/cas_dirty_copy_patched.sh).
+ */
+static void cetrafs_cas_publish_cache(struct super_block *sb, u64 fs_lba, unsigned int off, const void *src,
+                                      unsigned int len, bool sole_region)
+{
+    cetrafs_cache_region_after_cas(sb, fs_lba, off, src, len);
+    if (!sole_region)
+        cetrafs_invalidate_block(sb, fs_lba);
+}
+
+/* TEST ONLY: this node dirties its cached copy of the next swapped block
+ * after the swap's own flush -- a local writer landing between the
+ * flush and the swap (the selftest's phase 2e). */
+static bool cetrafs_cas_dirty_after_flush_once;
+cetrafs_test_param(cas_dirty_after_flush_once, cetrafs_cas_dirty_after_flush_once, bool, 0644);
+MODULE_PARM_DESC(cas_dirty_after_flush_once, "TEST ONLY: dirty the cached block after the next swap's flush");
+
+static void cetrafs_cas_test_dirty(struct super_block *sb, u64 fs_lba)
+{
+    struct buffer_head *bh = sb_find_get_block(sb, fs_lba);
+
+    if (!bh)
+        return;
+    if (buffer_uptodate(bh)) {
+        cetrafs_bh_begin_update(bh); /* no change: only dirtied, by the protocol */
+        cetrafs_bh_end_update(bh);
+    }
+    brelse(bh);
+}
+
 static int cetrafs_cas_region_seeded_impl(struct super_block *sb,
                                           u64 fs_lba,
                                           unsigned int region_idx,
@@ -1168,6 +1210,8 @@ static int cetrafs_cas_region_seeded_impl(struct super_block *sb,
         ret = cetrafs_cas_flush_block(sb, fs_lba);
         if (ret)
             goto out;
+        if (unlikely(READ_ONCE(cetrafs_cas_dirty_after_flush_once)) && xchg(&cetrafs_cas_dirty_after_flush_once, false))
+            cetrafs_cas_test_dirty(sb, fs_lba); /* TEST ONLY: a local writer, after the flush */
 
         if (attempt == 0 && seed && seed_len == region) {
             /* Trust the caller's image once. A stale one just fails the
@@ -1215,10 +1259,7 @@ static int cetrafs_cas_region_seeded_impl(struct super_block *sb,
             if (!memcmp(old, unknown, region)) {
                 pr_warn("CAS lba=%llu: the timed-out command landed late -- taking it as done\n",
                         (unsigned long long) fs_lba);
-                if (sole_region)
-                    cetrafs_cache_region_after_cas(sb, fs_lba, off, unknown, region);
-                else
-                    cetrafs_invalidate_block(sb, fs_lba);
+                cetrafs_cas_publish_cache(sb, fs_lba, off, unknown, region, sole_region);
                 ret = 0;
                 goto out;
             }
@@ -1281,10 +1322,7 @@ static int cetrafs_cas_region_seeded_impl(struct super_block *sb,
              * every swap into a later device read of a block that is
              * about to be wanted again -- write the bytes we just put on
              * the device into it and leave it clean. */
-            if (sole_region)
-                cetrafs_cache_region_after_cas(sb, fs_lba, off, new, region);
-            else
-                cetrafs_invalidate_block(sb, fs_lba);
+            cetrafs_cas_publish_cache(sb, fs_lba, off, new, region, sole_region);
             goto out;
         }
         if (ret == -ETIMEDOUT) {
@@ -1334,10 +1372,7 @@ static int cetrafs_cas_region_seeded_impl(struct super_block *sb,
                 pr_warn("CAS lba=%llu: command timed out but the swap IS on the device -- taking it as done\n",
                         (unsigned long long) fs_lba);
                 brelse(vbh);
-                if (sole_region)
-                    cetrafs_cache_region_after_cas(sb, fs_lba, off, new, region);
-                else
-                    cetrafs_invalidate_block(sb, fs_lba);
+                cetrafs_cas_publish_cache(sb, fs_lba, off, new, region, sole_region);
                 ret = 0;
                 goto out;
             }
@@ -1383,10 +1418,7 @@ static int cetrafs_cas_region_seeded_impl(struct super_block *sb,
                 pr_warn("CAS lba=%llu: the timed-out command landed late -- taking it as done\n",
                         (unsigned long long) fs_lba);
                 brelse(vbh);
-                if (sole_region)
-                    cetrafs_cache_region_after_cas(sb, fs_lba, off, unknown, region);
-                else
-                    cetrafs_invalidate_block(sb, fs_lba);
+                cetrafs_cas_publish_cache(sb, fs_lba, off, unknown, region, sole_region);
                 ret = 0;
                 goto out;
             }
@@ -1829,6 +1861,48 @@ void cetrafs_cas_selftest(struct super_block *sb, u32 my_node_id)
             }
             if (ok)
                 pr_info("CAS selftest: a timeout only a dirty local copy could judge was refused, applied once\n");
+        }
+    }
+
+    /*
+     * 2e. A swap while this node holds a DIRTY copy of the block -- a
+     * local writer landing after the swap's own flush: once that copy is
+     * written back, the device must still hold the swap. The record CAS
+     * is a non-sole region swap, whose cache step used to only drop the
+     * buffer -- and a dirty one is kept, pre-image and all (audit
+     * 2026-11-11 C2, cetrafs_cas_publish_cache()). CAW only: the
+     * fallback writes the swap through the buffer itself.
+     */
+    if (ok && have_caw) {
+        u8 val = 0x77;
+
+        bh = cetrafs_bread_retry(sb, lba);
+        if (!bh) {
+            pr_err("CAS selftest: could not read the block to dirty it\n");
+            ok = false;
+        } else {
+            WRITE_ONCE(cetrafs_cas_dirty_after_flush_once, true);
+            ret = cetrafs_cas_record(sb, lba, cetrafs_cas_selftest_set, &val);
+            WRITE_ONCE(cetrafs_cas_dirty_after_flush_once, false);
+            if (buffer_dirty(bh))
+                (void) cetrafs_sync_buffer(sb, bh); /* the device read below is the check */
+            brelse(bh);
+            if (ret) {
+                pr_err("CAS selftest: a swap over a dirty local copy failed: %d\n", ret);
+                ok = false;
+            } else {
+                bh = cetrafs_bread_uncached_retry(sb, lba);
+                if (!bh || (u8) bh->b_data[CETRAFS_CAS_SELFTEST_OFF] != val) {
+                    pr_err("CAS selftest: writing back a dirty local copy undid a swap (device holds 0x%02x, "
+                           "swapped 0x%02x)\n",
+                           bh ? (u8) bh->b_data[CETRAFS_CAS_SELFTEST_OFF] : 0, val);
+                    ok = false;
+                } else {
+                    pr_info("CAS selftest: a swap over a dirty local copy survives its write-back\n");
+                }
+                if (bh)
+                    brelse(bh);
+            }
         }
     }
 
