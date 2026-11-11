@@ -1063,7 +1063,7 @@ set_stale_window() {
 # hb_seq nobody will ever bump again.
 # The peer ran this node's timing, and advertises its window as a real
 # node would (format 0x000A): a row advertising nothing legal is watched
-# for the maximum, 240 s (kmod/node.c cetrafs_row_watch_window()). Under
+# for the maximum, 240 s (kmod/node.c cetrafs_row_stale_window()). Under
 # compressed timing (a window below the legal 15 s) nothing is planted --
 # the kernel waits its own window for such a row.
 poke_dead_peer() {

@@ -10,7 +10,7 @@
 # advertises its node's stale_secs (format 0x000A) and the tools already
 # wait the longest one (tool_probe_advertised_stale.sh); the kernel's
 # watches now do too (review F2): the gate, the live-peer walk and the
-# twin watch at registration share cetrafs_row_watch_window().
+# twin watch at registration share cetrafs_row_stale_window().
 #
 #  A. compressed timing (our window 3 s), a silent row advertising 20 s:
 #     the gate announces 20 s and waits it out before mounting.
@@ -25,7 +25,7 @@
 # C and D read the announced window and stop the mount (the wait is
 # killable); A runs it through.
 #
-# DISCRIMINATION (2026-11-11, cetrafs_row_watch_window() reduced to the
+# DISCRIMINATION (2026-11-11, cetrafs_row_stale_window() reduced to the
 # old floor): A announces 3 s and mounts after 3, C announces 60 s.
 set -euo pipefail
 . "$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)/lib/harness.sh"
