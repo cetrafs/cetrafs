@@ -451,7 +451,8 @@ int cetrafs_bg_id_of_lba(struct super_block *sb, u64 lba, u32 *out_bg_id);
 /* discard.c */
 struct fstrim_range;
 bool cetrafs_discard_supported(struct super_block *sb);
-int cetrafs_discard_handback(struct super_block *sb, u32 bg_id, unsigned long *pass_started, bool pending);
+int cetrafs_discard_handback(struct super_block *sb, u32 bg_id, unsigned long *pass_started, bool pending,
+                             bool force, bool *discarded);
 long cetrafs_fitrim_ioctl(struct file *file, struct fstrim_range __user *arg);
 u64 cetrafs_discard_cmds_count(void);
 u64 cetrafs_discard_blocks_count(void);
@@ -903,6 +904,7 @@ int cetrafs_sb_first_owned_zg(struct super_block *sb, u32 *out_zg);
 /* Claim a Block Group nobody owns into zg_id, with one compare-and-swap.
  * -ENOSPC if there is none free. docs/internal/BG-OWNERSHIP-DESIGN.md */
 int cetrafs_bg_claim_free(struct super_block *sb, u32 zg_id, u32 *out_bg_id);
+int cetrafs_bg_trim_pool_one(struct super_block *sb, u32 zg_id, u32 b, u64 *out_blocks);
 void cetrafs_bg_refresh_owner_map(struct super_block *sb);
 /* Hand back every empty Block Group of zg_id. The hoarding fix.
  * docs/internal/BG-OWNERSHIP-DESIGN.md */

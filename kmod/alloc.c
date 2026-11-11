@@ -1272,6 +1272,7 @@ struct cetrafs_bg_geom {
     u64 free_data_blocks; /* cached count, as of the last read */
     u64 reconcile_seq;    /* the count's ownership epoch, as of the last read */
     u32 owner_zg;         /* ZG this BG belongs to */
+    u16 flags;            /* CETRAFS_BG_FLAG_* */
 };
 
 /* CRC32C over a BG descriptor block with its checksum field treated as
@@ -1406,6 +1407,7 @@ static int cetrafs_read_bg_geom_at(struct super_block *sb, const cetrafs_superbl
             out->free_data_blocks = cetrafs_le64(bg->free_data_blocks);
             out->reconcile_seq = cetrafs_le64(bg->reconcile_seq);
             out->owner_zg = cetrafs_le16(bg->owner_zg);
+            out->flags = cetrafs_le16(bg->flags);
             cetrafs_bh_read_unlock(bh);
             brelse(bh);
             return 0;
@@ -3350,6 +3352,8 @@ static int cetrafs_bg_claim_mutate(void *image, unsigned int len, void *priv)
 
     ctx->seq = cetrafs_le64(bg->reconcile_seq);
     bg->owner_zg = cetrafs_cpu_to_le16((u16) ctx->zg_id);
+    /* Ours now, and we may write anywhere in it. */
+    bg->flags = cetrafs_cpu_to_le16(cetrafs_le16(bg->flags) & ~CETRAFS_BG_FLAG_DISCARDED);
     /* Same normalise-then-checksum as cetrafs_bg_count_mutate(): the
      * in-sector tail past the real fields is zero by construction, and
      * cetrafs_bg_image_crc() rests on that. */
@@ -3395,6 +3399,7 @@ extern bool cetrafs_bg_release_skip_empty_check;
 /* Hand one Block Group back: the CAS mutate. */
 struct cetrafs_bg_release_ctx {
     u32 zg_id;
+    bool discarded; /* its hand-back discard succeeded: mark it DISCARDED */
 };
 
 static int cetrafs_bg_release_mutate(void *image, unsigned int len, void *priv)
@@ -3427,6 +3432,10 @@ static int cetrafs_bg_release_mutate(void *image, unsigned int len, void *priv)
         return -EAGAIN;
 
     bg->owner_zg = cetrafs_cpu_to_le16((u16) CETRAFS_BG_OWNER_FREE);
+    if (ctx->discarded)
+        bg->flags = cetrafs_cpu_to_le16(cetrafs_le16(bg->flags) | CETRAFS_BG_FLAG_DISCARDED);
+    else
+        bg->flags = cetrafs_cpu_to_le16(cetrafs_le16(bg->flags) & ~CETRAFS_BG_FLAG_DISCARDED);
     memset((u8 *) image + offsetof(cetrafs_block_group_t, pad), 0, len - offsetof(cetrafs_block_group_t, pad));
     bg->checksum = 0;
     bg->checksum = cetrafs_cpu_to_le64(cetrafs_bg_image_crc(image, len));
@@ -3585,6 +3594,185 @@ static unsigned int cetrafs_bg_release_drain_stall_ms;
 cetrafs_test_param(bg_release_drain_stall_ms, cetrafs_bg_release_drain_stall_ms, uint, 0644);
 MODULE_PARM_DESC(bg_release_drain_stall_ms, "test-only: pause one Block Group release while it is drained");
 
+/*
+ * Hand back one Block Group of zg_id if it is provably empty: the body of
+ * cetrafs_bg_release_empty(), and of FITRIM's pool pass. Returns 1 when
+ * it went back to the pool, 0 when it was kept, -EBUSY when it was kept
+ * for a later pass (discard budget, or a discard of unknown outcome).
+ */
+static int cetrafs_bg_release_one(struct super_block *sb, u32 zg_id, u32 b, unsigned long *pass_started, bool force,
+                                  bool *out_discarded)
+{
+    struct cetrafs_bg_release_ctx ctx = {.zg_id = zg_id};
+    u64 total = 0, free = 0;
+    int ret;
+
+    /*
+     * A group whose hand-back discard had an UNKNOWN outcome (review
+     * U1). It has stayed drained since -- out of our allocator, and
+     * not FREE, so out of everyone else's -- and it was proven empty
+     * then. Discard it again; only an outcome we know releases it.
+     * It reads as not ours (drained), so it is looked for first.
+     */
+    if (cetrafs_sb_bg_discard_pending(sb, b)) {
+        ret = cetrafs_discard_handback(sb, b, pass_started, true, force, &ctx.discarded);
+        if (ret) {
+            return -EBUSY; /* kept for a later pass */
+        }
+        if (cetrafs_bg_data_block_stats(sb, b, &total, &free) != 0 || total == 0 || free != total ||
+            cetrafs_bg_release_bitmap_ready(sb, b)) {
+            /* Drained all along, so nothing of ours wrote here: a
+             * group no longer empty or readable is a contradiction.
+             * Its discard is known now; it goes back to use, not
+             * to the pool. */
+            pr_err("BG %u: kept for an outstanding discard, now not provably empty -- kept by this node\n", b);
+            cetrafs_sb_set_bg_discard_pending(sb, b, false);
+            cetrafs_sb_undrain_bg(sb, b);
+            return 0;
+        }
+        cetrafs_sb_set_bg_discard_pending(sb, b, false);
+        pr_info("BG %u: its outstanding discard is settled -- released\n", b);
+        goto release;
+    }
+    if (!cetrafs_sb_bg_is_ours(sb, b))
+        return 0;
+
+    /*
+     * Cheap pre-check BEFORE draining: skip any Block Group whose
+     * cached count already says it holds data.
+     *
+     * Draining clears the owned bit, so between the drain below and
+     * the undrain further down this node does not own this Block
+     * Group -- and on a volume with only one, it owns NOTHING. That
+     * window spans a free-count flush, a descriptor invalidate and
+     * a full bitmap scan, and anything allocating inside it fails:
+     * cetrafs_alloc_pick_run() walks the owned set and returns
+     * -ENOSPC with the volume 99.9% free, so the online defragmenter
+     * declined ("no contiguous run large enough in the zone groups
+     * this node owns") on an almost empty filesystem. Every heartbeat
+     * tick opened that window once per owned Block Group.
+     *
+     * A stale count errs the safe way HERE: it can only make us SKIP
+     * a Block Group that turned out to be empty, deferring its
+     * release to a later tick. In the other direction -- a count
+     * saying empty over a bitmap that is not -- the bitmap scan in
+     * cetrafs_bg_release_bitmap_ready() decides, under the drain.
+     */
+    if (!cetrafs_bg_release_skip_empty_check) {
+        /* With our accrued delta: a FITRIM claim's debit is one, and
+         * the raw descriptor count does not show it -- the group
+         * was drained under the claim, and the claim, finding it
+         * gone, leaked its whole run (review U4). */
+        if (cetrafs_bg_data_block_stats(sb, b, &total, &free) == 0 && free != total)
+            return 0; /* obviously in use -- never take it out of reach */
+    }
+
+    /* Take it out of the allocator's reach first, then look. The
+     * other order leaves a window in which this node allocates into
+     * a Block Group it is in the middle of giving away. */
+    if (!cetrafs_sb_drain_bg(sb, b))
+        return 0; /* a FITRIM holds a run in it: not empty, keep it */
+    {
+        unsigned int pause = xchg(&cetrafs_bg_release_drain_stall_ms, 0);
+
+        if (pause) {
+            pr_info("BG %u release: drained, pausing %u ms (test)\n", b, pause);
+            msleep(pause); /* test-only; see the parameter */
+        }
+    }
+
+    /* Our own accrued delta has to reach the descriptor before its
+     * free count can be believed -- otherwise "empty" is a count
+     * that predates this node's own frees. */
+    cetrafs_flush_dirty_free_counts(sb);
+    cetrafs_bg_invalidate_cache(sb, b);
+
+    if (cetrafs_bg_data_block_stats(sb, b, &total, &free) != 0 || total == 0 ||
+        (free != total && !cetrafs_bg_release_skip_empty_check)) {
+        cetrafs_sb_undrain_bg(sb, b); /* still in use -- keep it */
+        return 0;
+    }
+    if (cetrafs_bg_release_bitmap_ready(sb, b)) {
+        cetrafs_sb_undrain_bg(sb, b); /* not provably empty, or not durable: keep it */
+        return 0;
+    }
+
+    /*
+     * UNMAP the whole data region before it leaves us (discard.c).
+     * Here and nowhere later: drained, nothing of ours can allocate
+     * in it; proven empty on the device, nothing references it; not
+     * yet FREE, nobody else can claim it. After the CAS below it is
+     * the pool's, and a discard then could land on a peer's first
+     * writes. Over budget, the group stays ours for a later tick
+     * rather than going back untrimmed.
+     */
+    ret = cetrafs_discard_handback(sb, b, pass_started, false, force, &ctx.discarded);
+    if (ret == -EAGAIN) {
+        /* The UNMAP may still execute: the group stays drained --
+         * not ours to allocate in, not the pool's -- until a discard
+         * of it has a known outcome (review U1). Said once per group,
+         * unratelimited: a path that keeps failing discards keeps
+         * every emptied group, and with it every Zone Group release
+         * (U3). */
+        if (cetrafs_sb_set_bg_discard_pending(sb, b, true))
+            pr_warn("%s: BG %u: its hand-back discard failed and may still execute -- the group is kept out "
+                    "of use until a discard of it succeeds or is refused. If this device cannot discard "
+                    "reliably, turn discard off (controls: discard=off) so no further group is kept.\n",
+                    sb->s_id, b);
+        return -EBUSY; /* kept for a later pass */
+    }
+    if (ret) {
+        cetrafs_sb_undrain_bg(sb, b); /* over budget: nothing was sent */
+        return -EBUSY; /* kept for a later pass */
+    }
+
+release:
+
+    /*
+     * Both counter moves, by immediate CAS, BEFORE the descriptor
+     * reads FREE. The pool write is cluster-visible the moment it
+     * lands, so pairing it with a LAZY local accrual let every
+     * peer's statfs see one half of the move until this node's next
+     * durability boundary (the cross-node xattrs scenario,
+     * 2026-10-29).
+     *
+     * And before, not after: a peer may claim the Block Group the
+     * instant it reads FREE, and its claim debits the pool shard. A
+     * credit still in flight then is refused as "below zero", the
+     * credit lands afterwards, and the shard overstates by a whole
+     * Block Group for good -- an ERR for fsck from two legal moves
+     * (audit R25). Credited first, a claimant's debit always finds
+     * it there. The aggregate goes first of the two, so a crash
+     * anywhere before the CAS leaves it UNDERSTATING (the next
+     * ownership reconcile recounts it); the pool can overstate by
+     * one Block Group only for a crash between its credit and the
+     * CAS, never for an interleaving. A refused CAS takes both back.
+     */
+    if (!cetrafs_bg_release_credit_late)
+        cetrafs_bg_release_counters(sb, zg_id, b, total, +1);
+    ret = cetrafs_cas_record(sb, cetrafs_sb_bg_desc_lba(sb, b), cetrafs_bg_release_mutate, &ctx);
+    if (ret) {
+        if (!cetrafs_bg_release_credit_late)
+            cetrafs_bg_release_counters(sb, zg_id, b, total, -1);
+        cetrafs_sb_undrain_bg(sb, b);
+        return 0; /* somebody changed it under us; leave it alone */
+    }
+
+    cetrafs_bg_release_drop_bitmap(sb, b);
+    cetrafs_bg_invalidate_cache(sb, b);
+    cetrafs_sb_set_bg_owner(sb, b, CETRAFS_BG_OWNER_FREE);
+    if (cetrafs_bg_release_stall_ms) {
+        pr_info("BG %u: release stalled %u ms after it reads FREE (test)\n", b, cetrafs_bg_release_stall_ms);
+        msleep(cetrafs_bg_release_stall_ms); /* test-only; see the parameter */
+    }
+    if (cetrafs_bg_release_credit_late)
+        cetrafs_bg_release_counters(sb, zg_id, b, total, +1); /* test-only: the old order */
+    pr_info("BG %u handed back from ZG %u (empty, %llu blocks)\n", b, zg_id, (unsigned long long) total);
+    if (out_discarded)
+        *out_discarded = ctx.discarded;
+    return 1;
+}
+
 int cetrafs_bg_release_empty(struct super_block *sb, u32 zg_id, u32 *out_released, u32 *out_deferred,
                              unsigned long *pass_started)
 {
@@ -3603,178 +3791,16 @@ int cetrafs_bg_release_empty(struct super_block *sb, u32 zg_id, u32 *out_release
     nbg = le32_to_cpu(raw_sb->block_group_count);
 
     for (b = 0; b < nbg; b++) {
-        struct cetrafs_bg_release_ctx ctx = {.zg_id = zg_id};
-        u64 total = 0, free = 0;
         int ret;
 
         if (cetrafs_sb_bg_owner(sb, b) != zg_id)
             continue;
 
-        /*
-         * A group whose hand-back discard had an UNKNOWN outcome (review
-         * U1). It has stayed drained since -- out of our allocator, and
-         * not FREE, so out of everyone else's -- and it was proven empty
-         * then. Discard it again; only an outcome we know releases it.
-         * It reads as not ours (drained), so it is looked for first.
-         */
-        if (cetrafs_sb_bg_discard_pending(sb, b)) {
-            ret = cetrafs_discard_handback(sb, b, pass_started, true);
-            if (ret) {
-                deferred++;
-                continue;
-            }
-            if (cetrafs_bg_data_block_stats(sb, b, &total, &free) != 0 || total == 0 || free != total ||
-                cetrafs_bg_release_bitmap_ready(sb, b)) {
-                /* Drained all along, so nothing of ours wrote here: a
-                 * group no longer empty or readable is a contradiction.
-                 * Its discard is known now; it goes back to use, not
-                 * to the pool. */
-                pr_err("BG %u: kept for an outstanding discard, now not provably empty -- kept by this node\n", b);
-                cetrafs_sb_set_bg_discard_pending(sb, b, false);
-                cetrafs_sb_undrain_bg(sb, b);
-                continue;
-            }
-            cetrafs_sb_set_bg_discard_pending(sb, b, false);
-            pr_info("BG %u: its outstanding discard is settled -- released\n", b);
-            goto release;
-        }
-        if (!cetrafs_sb_bg_is_ours(sb, b))
-            continue;
-
-        /*
-         * Cheap pre-check BEFORE draining: skip any Block Group whose
-         * cached count already says it holds data.
-         *
-         * Draining clears the owned bit, so between the drain below and
-         * the undrain further down this node does not own this Block
-         * Group -- and on a volume with only one, it owns NOTHING. That
-         * window spans a free-count flush, a descriptor invalidate and
-         * a full bitmap scan, and anything allocating inside it fails:
-         * cetrafs_alloc_pick_run() walks the owned set and returns
-         * -ENOSPC with the volume 99.9% free, so the online defragmenter
-         * declined ("no contiguous run large enough in the zone groups
-         * this node owns") on an almost empty filesystem. Every heartbeat
-         * tick opened that window once per owned Block Group.
-         *
-         * A stale count errs the safe way HERE: it can only make us SKIP
-         * a Block Group that turned out to be empty, deferring its
-         * release to a later tick. In the other direction -- a count
-         * saying empty over a bitmap that is not -- the bitmap scan in
-         * cetrafs_bg_release_bitmap_ready() decides, under the drain.
-         */
-        if (!cetrafs_bg_release_skip_empty_check) {
-            /* With our accrued delta: a FITRIM claim's debit is one, and
-             * the raw descriptor count does not show it -- the group
-             * was drained under the claim, and the claim, finding it
-             * gone, leaked its whole run (review U4). */
-            if (cetrafs_bg_data_block_stats(sb, b, &total, &free) == 0 && free != total)
-                continue; /* obviously in use -- never take it out of reach */
-        }
-
-        /* Take it out of the allocator's reach first, then look. The
-         * other order leaves a window in which this node allocates into
-         * a Block Group it is in the middle of giving away. */
-        if (!cetrafs_sb_drain_bg(sb, b))
-            continue; /* a FITRIM holds a run in it: not empty, keep it */
-        {
-            unsigned int pause = xchg(&cetrafs_bg_release_drain_stall_ms, 0);
-
-            if (pause) {
-                pr_info("BG %u release: drained, pausing %u ms (test)\n", b, pause);
-                msleep(pause); /* test-only; see the parameter */
-            }
-        }
-
-        /* Our own accrued delta has to reach the descriptor before its
-         * free count can be believed -- otherwise "empty" is a count
-         * that predates this node's own frees. */
-        cetrafs_flush_dirty_free_counts(sb);
-        cetrafs_bg_invalidate_cache(sb, b);
-
-        if (cetrafs_bg_data_block_stats(sb, b, &total, &free) != 0 || total == 0 ||
-            (free != total && !cetrafs_bg_release_skip_empty_check)) {
-            cetrafs_sb_undrain_bg(sb, b); /* still in use -- keep it */
-            continue;
-        }
-        if (cetrafs_bg_release_bitmap_ready(sb, b)) {
-            cetrafs_sb_undrain_bg(sb, b); /* not provably empty, or not durable: keep it */
-            continue;
-        }
-
-        /*
-         * UNMAP the whole data region before it leaves us (discard.c).
-         * Here and nowhere later: drained, nothing of ours can allocate
-         * in it; proven empty on the device, nothing references it; not
-         * yet FREE, nobody else can claim it. After the CAS below it is
-         * the pool's, and a discard then could land on a peer's first
-         * writes. Over budget, the group stays ours for a later tick
-         * rather than going back untrimmed.
-         */
-        ret = cetrafs_discard_handback(sb, b, pass_started, false);
-        if (ret == -EAGAIN) {
-            /* The UNMAP may still execute: the group stays drained --
-             * not ours to allocate in, not the pool's -- until a discard
-             * of it has a known outcome (review U1). Said once per group,
-             * unratelimited: a path that keeps failing discards keeps
-             * every emptied group, and with it every Zone Group release
-             * (U3). */
-            if (cetrafs_sb_set_bg_discard_pending(sb, b, true))
-                pr_warn("%s: BG %u: its hand-back discard failed and may still execute -- the group is kept out "
-                        "of use until a discard of it succeeds or is refused. If this device cannot discard "
-                        "reliably, turn discard off (controls: discard=off) so no further group is kept.\n",
-                        sb->s_id, b);
+        ret = cetrafs_bg_release_one(sb, zg_id, b, pass_started, false, NULL);
+        if (ret > 0)
+            released++;
+        else if (ret == -EBUSY)
             deferred++;
-            continue;
-        }
-        if (ret) {
-            cetrafs_sb_undrain_bg(sb, b); /* over budget: nothing was sent */
-            deferred++;
-            continue;
-        }
-
-release:
-
-        /*
-         * Both counter moves, by immediate CAS, BEFORE the descriptor
-         * reads FREE. The pool write is cluster-visible the moment it
-         * lands, so pairing it with a LAZY local accrual let every
-         * peer's statfs see one half of the move until this node's next
-         * durability boundary (the cross-node xattrs scenario,
-         * 2026-10-29).
-         *
-         * And before, not after: a peer may claim the Block Group the
-         * instant it reads FREE, and its claim debits the pool shard. A
-         * credit still in flight then is refused as "below zero", the
-         * credit lands afterwards, and the shard overstates by a whole
-         * Block Group for good -- an ERR for fsck from two legal moves
-         * (audit R25). Credited first, a claimant's debit always finds
-         * it there. The aggregate goes first of the two, so a crash
-         * anywhere before the CAS leaves it UNDERSTATING (the next
-         * ownership reconcile recounts it); the pool can overstate by
-         * one Block Group only for a crash between its credit and the
-         * CAS, never for an interleaving. A refused CAS takes both back.
-         */
-        if (!cetrafs_bg_release_credit_late)
-            cetrafs_bg_release_counters(sb, zg_id, b, total, +1);
-        ret = cetrafs_cas_record(sb, cetrafs_sb_bg_desc_lba(sb, b), cetrafs_bg_release_mutate, &ctx);
-        if (ret) {
-            if (!cetrafs_bg_release_credit_late)
-                cetrafs_bg_release_counters(sb, zg_id, b, total, -1);
-            cetrafs_sb_undrain_bg(sb, b);
-            continue; /* somebody changed it under us; leave it alone */
-        }
-
-        cetrafs_bg_release_drop_bitmap(sb, b);
-        cetrafs_bg_invalidate_cache(sb, b);
-        cetrafs_sb_set_bg_owner(sb, b, CETRAFS_BG_OWNER_FREE);
-        if (cetrafs_bg_release_stall_ms) {
-            pr_info("BG %u: release stalled %u ms after it reads FREE (test)\n", b, cetrafs_bg_release_stall_ms);
-            msleep(cetrafs_bg_release_stall_ms); /* test-only; see the parameter */
-        }
-        if (cetrafs_bg_release_credit_late)
-            cetrafs_bg_release_counters(sb, zg_id, b, total, +1); /* test-only: the old order */
-        released++;
-        pr_info("BG %u handed back from ZG %u (empty, %llu blocks)\n", b, zg_id, (unsigned long long) total);
     }
 
     if (out_released)
@@ -3855,6 +3881,119 @@ static unsigned int cetrafs_bg_claim_stall_ms;
 cetrafs_test_param(bg_claim_stall_ms, cetrafs_bg_claim_stall_ms, uint, 0644);
 MODULE_PARM_DESC(bg_claim_stall_ms, "test-only: pause one Block Group claim once the group is allocatable");
 
+/*
+ * Claim Block Group b, if it is FREE, into zg_id: the body of
+ * cetrafs_bg_claim_free(), and of FITRIM's pool pass. 0 when claimed,
+ * -EAGAIN when it is not free (or a peer won it), any other error as is.
+ */
+static int cetrafs_bg_claim_one(struct super_block *sb, u32 zg_id, u32 b)
+{
+    struct cetrafs_bg_claim_ctx ctx = {.zg_id = zg_id, .bg_id = b};
+    struct cetrafs_bg_geom geom;
+    u64 total = 0, free = 0;
+    int ret;
+
+    /* Forced fresh: the cached copy can predate a peer's claim, and
+     * a stale FREE here is exactly the read that makes two nodes
+     * reach for the same Block Group (rule 1). The swap would still
+     * refuse, but scanning on fresh data finds a real candidate
+     * sooner.
+     *
+     * Not ours, though: a Block Group this node owns is never FREE,
+     * and its descriptor is the one the allocator reads per block --
+     * dropping it on every claim attempt (each ENOSPC on a full
+     * volume makes one) is PERFORMANCE.md invariant 3 broken (audit
+     * 2026-11-06 L26). */
+    cetrafs_invalidate_block(sb, cetrafs_sb_bg_desc_lba(sb, b));
+    if (cetrafs_read_bg_geom(sb, b, &geom) != 0)
+        return -EAGAIN;
+    if (geom.owner_zg != CETRAFS_BG_OWNER_FREE)
+        return -EAGAIN;
+
+    if (cetrafs_bg_claim_blind) {
+        /* test-only: read, decide, write -- no exclusion at all */
+        struct buffer_head *wbh = cetrafs_bread_retry(sb, cetrafs_sb_bg_desc_lba(sb, b));
+
+        if (!wbh)
+            return -EAGAIN;
+        /* Through the buffer-update protocol, not a bare
+         * mark_buffer_dirty(): this knob exists to remove the
+         * COMPARE-AND-SWAP, not to break buffer handling as well --
+         * a control that injects two faults at once cannot say
+         * which one it measured. image/source_invariants.sh
+         * enforces the protocol and caught exactly that here. */
+        cetrafs_bh_begin_update(wbh);
+        cetrafs_bg_claim_mutate(wbh->b_data, CETRAFS_BLOCK_SIZE, &ctx);
+        cetrafs_bh_end_update(wbh);
+        (void) cetrafs_sync_buffer(sb, wbh); /* test-only path */
+        brelse(wbh);
+        ret = 0;
+    } else {
+        ret = cetrafs_cas_record(sb, cetrafs_sb_bg_desc_lba(sb, b), cetrafs_bg_claim_mutate, &ctx);
+    }
+    if (ret == -EAGAIN)
+        return -EAGAIN; /* a peer got there first */
+    if (ret)
+        return ret;
+
+    /* The descriptor just changed owner, so anything holding the
+     * old one must not serve it -- see
+     * cetrafs_bg_adjust_free_blocks(), which reads owner_zg from
+     * the cache on the allocation path. */
+    cetrafs_bg_invalidate_cache(sb, b);
+    /* Ownership is entering this node's cache, so its count epoch
+     * must too -- BEFORE set_bg_owner() makes the Block Group
+     * allocatable, or the first deltas accrue under whatever epoch
+     * the array held (0 since mount) and every one is refused as a
+     * stale owner's: the count then stays "all free" while the Block
+     * Group fills, and the empty-release path takes it at its word
+     * (tests/kernel/bg_claim_epoch.sh). The ZG claim reconciles and
+     * the re-attach seeds; this path did neither. */
+    cetrafs_sb_set_bg_epoch(sb, b, ctx.seq);
+    /*
+     * The Zone Group just gained this Block Group's free space, and
+     * its aggregate has to say so -- fsck cross-checks "a Zone
+     * Group's aggregate equals the sum over its Block Groups", and
+     * the allocator ranks Zone Groups by it. Read fresh: the
+     * descriptor was just invalidated above precisely because the
+     * cached copy is the pre-claim one.
+     *
+     * Read AND credited before set_bg_owner() makes the group
+     * allocatable (audit 2026-11-06 M4). Read after, an allocation
+     * in between both lowered the count read here and accrued its
+     * own debit: counted twice. Credited after, the debits of
+     * allocations made in between could reach the device first, on
+     * an aggregate that did not hold this group yet -- below zero,
+     * refused, and dropped (cetrafs_zg_apply_free_delta()).
+     */
+    if (cetrafs_bg_data_block_stats(sb, b, &total, &free) == 0 && free) {
+        /* Debit the pool BEFORE crediting the aggregate, both by
+         * immediate CAS -- see the release path for why a lazy
+         * accrual here made peers' statfs dip by this whole Block
+         * Group, and why debit-first keeps a crash window
+         * understating rather than inventing space. The release
+         * credits the pool before the descriptor reads FREE, so a
+         * refusal here means drift, never a credit in flight. */
+        if (cetrafs_zg_adjust_pool_blocks(sb, b, -(s64) free))
+            pr_warn("BG %u: claimed but its pool shard debit failed -- df will overstate until fsck\n", b);
+        if (cetrafs_zg_apply_free_delta(sb, zg_id, (s64) free))
+            cetrafs_zg_adjust_free_blocks(sb, zg_id, (s64) free); /* lazy fallback: never lose the move */
+    }
+    cetrafs_sb_set_bg_owner(sb, b, zg_id);
+    {
+        unsigned int pause = xchg(&cetrafs_bg_claim_stall_ms, 0);
+
+        if (pause) {
+            pr_info("BG %u claim: allocatable, pausing %u ms (test)\n", b, pause);
+            msleep(pause); /* test-only; see the parameter */
+        }
+    }
+
+    pr_info("BG %u claimed into ZG %u (was owned by nobody, %llu blocks free)\n", b, zg_id,
+            (unsigned long long) free);
+    return 0;
+}
+
 int cetrafs_bg_claim_free(struct super_block *sb, u32 zg_id, u32 *out_bg_id)
 {
     const cetrafs_superblock_t *raw_sb = cetrafs_sb_raw(sb);
@@ -3865,116 +4004,68 @@ int cetrafs_bg_claim_free(struct super_block *sb, u32 zg_id, u32 *out_bg_id)
     nbg = le32_to_cpu(raw_sb->block_group_count);
 
     for (b = 0; b < nbg; b++) {
-        struct cetrafs_bg_claim_ctx ctx = {.zg_id = zg_id, .bg_id = b};
-        struct cetrafs_bg_geom geom;
-        u64 total = 0, free = 0;
         int ret;
 
-        /* Forced fresh: the cached copy can predate a peer's claim, and
-         * a stale FREE here is exactly the read that makes two nodes
-         * reach for the same Block Group (rule 1). The swap would still
-         * refuse, but scanning on fresh data finds a real candidate
-         * sooner.
-         *
-         * Not ours, though: a Block Group this node owns is never FREE,
-         * and its descriptor is the one the allocator reads per block --
-         * dropping it on every claim attempt (each ENOSPC on a full
-         * volume makes one) is PERFORMANCE.md invariant 3 broken (audit
-         * 2026-11-06 L26). */
         if (cetrafs_sb_bg_is_ours(sb, b))
             continue;
-        cetrafs_invalidate_block(sb, cetrafs_sb_bg_desc_lba(sb, b));
-        if (cetrafs_read_bg_geom(sb, b, &geom) != 0)
-            continue;
-        if (geom.owner_zg != CETRAFS_BG_OWNER_FREE)
-            continue;
-
-        if (cetrafs_bg_claim_blind) {
-            /* test-only: read, decide, write -- no exclusion at all */
-            struct buffer_head *wbh = cetrafs_bread_retry(sb, cetrafs_sb_bg_desc_lba(sb, b));
-
-            if (!wbh)
-                continue;
-            /* Through the buffer-update protocol, not a bare
-             * mark_buffer_dirty(): this knob exists to remove the
-             * COMPARE-AND-SWAP, not to break buffer handling as well --
-             * a control that injects two faults at once cannot say
-             * which one it measured. image/source_invariants.sh
-             * enforces the protocol and caught exactly that here. */
-            cetrafs_bh_begin_update(wbh);
-            cetrafs_bg_claim_mutate(wbh->b_data, CETRAFS_BLOCK_SIZE, &ctx);
-            cetrafs_bh_end_update(wbh);
-            (void) cetrafs_sync_buffer(sb, wbh); /* test-only path */
-            brelse(wbh);
-            ret = 0;
-        } else {
-            ret = cetrafs_cas_record(sb, cetrafs_sb_bg_desc_lba(sb, b), cetrafs_bg_claim_mutate, &ctx);
-        }
+        ret = cetrafs_bg_claim_one(sb, zg_id, b);
         if (ret == -EAGAIN)
-            continue; /* a peer got there first */
+            continue;
         if (ret)
             return ret;
-
-        /* The descriptor just changed owner, so anything holding the
-         * old one must not serve it -- see
-         * cetrafs_bg_adjust_free_blocks(), which reads owner_zg from
-         * the cache on the allocation path. */
-        cetrafs_bg_invalidate_cache(sb, b);
-        /* Ownership is entering this node's cache, so its count epoch
-         * must too -- BEFORE set_bg_owner() makes the Block Group
-         * allocatable, or the first deltas accrue under whatever epoch
-         * the array held (0 since mount) and every one is refused as a
-         * stale owner's: the count then stays "all free" while the Block
-         * Group fills, and the empty-release path takes it at its word
-         * (tests/kernel/bg_claim_epoch.sh). The ZG claim reconciles and
-         * the re-attach seeds; this path did neither. */
-        cetrafs_sb_set_bg_epoch(sb, b, ctx.seq);
-        /*
-         * The Zone Group just gained this Block Group's free space, and
-         * its aggregate has to say so -- fsck cross-checks "a Zone
-         * Group's aggregate equals the sum over its Block Groups", and
-         * the allocator ranks Zone Groups by it. Read fresh: the
-         * descriptor was just invalidated above precisely because the
-         * cached copy is the pre-claim one.
-         *
-         * Read AND credited before set_bg_owner() makes the group
-         * allocatable (audit 2026-11-06 M4). Read after, an allocation
-         * in between both lowered the count read here and accrued its
-         * own debit: counted twice. Credited after, the debits of
-         * allocations made in between could reach the device first, on
-         * an aggregate that did not hold this group yet -- below zero,
-         * refused, and dropped (cetrafs_zg_apply_free_delta()).
-         */
-        if (cetrafs_bg_data_block_stats(sb, b, &total, &free) == 0 && free) {
-            /* Debit the pool BEFORE crediting the aggregate, both by
-             * immediate CAS -- see the release path for why a lazy
-             * accrual here made peers' statfs dip by this whole Block
-             * Group, and why debit-first keeps a crash window
-             * understating rather than inventing space. The release
-             * credits the pool before the descriptor reads FREE, so a
-             * refusal here means drift, never a credit in flight. */
-            if (cetrafs_zg_adjust_pool_blocks(sb, b, -(s64) free))
-                pr_warn("BG %u: claimed but its pool shard debit failed -- df will overstate until fsck\n", b);
-            if (cetrafs_zg_apply_free_delta(sb, zg_id, (s64) free))
-                cetrafs_zg_adjust_free_blocks(sb, zg_id, (s64) free); /* lazy fallback: never lose the move */
-        }
-        cetrafs_sb_set_bg_owner(sb, b, zg_id);
-        {
-            unsigned int pause = xchg(&cetrafs_bg_claim_stall_ms, 0);
-
-            if (pause) {
-                pr_info("BG %u claim: allocatable, pausing %u ms (test)\n", b, pause);
-                msleep(pause); /* test-only; see the parameter */
-            }
-        }
-
-        pr_info("BG %u claimed into ZG %u (was owned by nobody, %llu blocks free)\n", b, zg_id,
-                (unsigned long long) free);
         if (out_bg_id)
             *out_bg_id = b;
         return 0;
     }
     return -ENOSPC;
+}
+
+/*
+ * FITRIM's pool pass, for one Block Group. A group handed back while
+ * discard was off (`nodiscard`, or the control) went to the pool with
+ * its data region still mapped, and nothing else ever looks at the pool:
+ * the hand-back discards on the way OUT, FITRIM walks only owned groups.
+ * So the space a delete freed then stayed mapped on the array for good.
+ *
+ * Trimmed the only way the ownership rule allows: claim it (one CAS, so
+ * no peer can claim it meanwhile), then hand it straight back through
+ * the ordinary release, which drains it, proves it empty on the device,
+ * discards its data region and marks it DISCARDED as it goes back. If
+ * our own allocator put a block in it between the two, the release
+ * keeps it -- nothing is lost, it is just not trimmed. A group already
+ * marked DISCARDED is skipped, so a pool is trimmed once, not on every
+ * fstrim.
+ *
+ * Returns the blocks discarded in *out_blocks; -EIO when the discard's
+ * outcome is unknown (the group then stays drained and pending, as for
+ * any hand-back).
+ */
+int cetrafs_bg_trim_pool_one(struct super_block *sb, u32 zg_id, u32 b, u64 *out_blocks)
+{
+    struct cetrafs_bg_geom geom;
+    unsigned long started = 0; /* one group, one discard: never over budget */
+    bool discarded = false;
+    int ret;
+
+    *out_blocks = 0;
+    if (cetrafs_sb_bg_is_ours(sb, b))
+        return 0;
+    cetrafs_invalidate_block(sb, cetrafs_sb_bg_desc_lba(sb, b));
+    if (cetrafs_read_bg_geom(sb, b, &geom) != 0)
+        return 0;
+    if (geom.owner_zg != CETRAFS_BG_OWNER_FREE || (geom.flags & CETRAFS_BG_FLAG_DISCARDED))
+        return 0;
+    ret = cetrafs_bg_claim_one(sb, zg_id, b);
+    if (ret == -EAGAIN)
+        return 0; /* a peer has it now: its own hand-back will discard it */
+    if (ret)
+        return ret;
+    ret = cetrafs_bg_release_one(sb, zg_id, b, &started, true, &discarded);
+    if (ret == -EBUSY)
+        return -EIO;
+    if (ret > 0 && discarded)
+        *out_blocks = geom.data_block_count;
+    return 0;
 }
 
 int cetrafs_bg_mount_info(struct super_block *sb, const cetrafs_superblock_t *raw_sb, u32 bg_id, u64 desc_lba,

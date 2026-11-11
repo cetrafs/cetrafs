@@ -849,6 +849,18 @@ typedef struct {
  */
 #define CETRAFS_BG_OWNER_FREE 0xFFFFu
 
+/*
+ * cetrafs_block_group_t.flags.
+ *
+ * DISCARDED: the group is in the pool (owner FREE) and its whole data
+ * region was discarded after its last data was freed -- set by the
+ * release that handed it back when its discard succeeded, cleared by
+ * every claim. FITRIM's pool pass skips a group that has it, so a pool
+ * is trimmed once, not on every fstrim. Zero is the safe reading: "not
+ * known to be discarded", which at worst costs one more discard.
+ */
+#define CETRAFS_BG_FLAG_DISCARDED 0x0001u
+
 /* Node liveness timing. Shared rather than kernel-private because the
  * userspace tools need the same answer the kernel would give: mkfs and
  * fsck decide whether a registry row belongs to a node that is still
@@ -1163,7 +1175,7 @@ typedef char cetrafs_bgseg_fits_one_sector[(offsetof(cetrafs_bg_segment_t, pad) 
 typedef struct {
     __le32 bg_id;                 /* global BG id */
     __le16 owner_zg;              /* ZG that owns this BG */
-    __le16 flags;                 /* future use */
+    __le16 flags;                 /* CETRAFS_BG_FLAG_* */
 
     __le64 start_block;           /* absolute LBA of the BG region start */
     __le64 length_blocks;         /* span size in blocks */

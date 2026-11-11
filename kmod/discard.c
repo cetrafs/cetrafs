@@ -107,6 +107,12 @@ static unsigned int cetrafs_trim_discard_stall_ms;
 cetrafs_test_param(trim_discard_stall_ms, cetrafs_trim_discard_stall_ms, uint, 0644);
 MODULE_PARM_DESC(trim_discard_stall_ms, "TEST ONLY: pause between a FITRIM claim and its discard");
 
+/* TEST ONLY: FITRIM skips the unowned pool, as it did before it had a
+ * pool pass -- the negative control of tests/kernel/fstrim_pool.sh. */
+static bool cetrafs_fitrim_skip_pool;
+cetrafs_test_param(fitrim_skip_pool, cetrafs_fitrim_skip_pool, bool, 0644);
+MODULE_PARM_DESC(fitrim_skip_pool, "TEST ONLY: FITRIM leaves the unowned Block Group pool alone");
+
 /* TEST ONLY: aim the next FITRIM discard at the Block Group's own
  * bitmap instead of its run -- the negative control for the range check
  * below (tests/kernel/fstrim.sh). One-shot. */
@@ -232,17 +238,20 @@ failed:
  * whatever discard is set to, and a device that no longer takes
  * discards, or a fenced mount, keeps it pending.
  */
-int cetrafs_discard_handback(struct super_block *sb, u32 bg_id, unsigned long *pass_started, bool pending)
+int cetrafs_discard_handback(struct super_block *sb, u32 bg_id, unsigned long *pass_started, bool pending,
+                             bool force, bool *discarded)
 {
     unsigned int budget = READ_ONCE(cetrafs_handback_budget_ms);
     u64 data_start, data_count;
     u32 owner;
     int ret;
 
+    *discarded = false;
     if (pending) {
         if (!cetrafs_discard_supported(sb) || cetrafs_sb_is_fenced(sb))
             return -EAGAIN;
-    } else if (!cetrafs_sb_discard_enabled(sb) || !cetrafs_discard_supported(sb) || cetrafs_sb_is_fenced(sb)) {
+    } else if ((!force && !cetrafs_sb_discard_enabled(sb)) || !cetrafs_discard_supported(sb) ||
+               cetrafs_sb_is_fenced(sb)) {
         return 0;
     }
     if (!budget)
@@ -256,9 +265,10 @@ int cetrafs_discard_handback(struct super_block *sb, u32 bg_id, unsigned long *p
     if (cetrafs_bg_data_region(sb, bg_id, &data_start, &data_count, &owner))
         return pending ? -EAGAIN : 0;
     ret = cetrafs_discard_issue(sb, bg_id, data_start, data_count);
-    if (!ret)
+    if (!ret) {
         atomic64_inc(&cetrafs_discard_handback_bgs);
-    else if (!cetrafs_discard_outcome_known(ret)) {
+        *discarded = true; /* the release marks the group DISCARDED */
+    } else if (!cetrafs_discard_outcome_known(ret)) {
         atomic64_inc(&cetrafs_discard_handback_unknown);
         return -EAGAIN;
     }
@@ -367,6 +377,40 @@ long cetrafs_fitrim_ioctl(struct file *file, struct fstrim_range __user *arg)
             if (!rc)
                 trimmed += count;
             cond_resched();
+        }
+    }
+
+    /*
+     * The unowned pool: groups handed back while discard was off went
+     * there still mapped, and are trimmed here, once each
+     * (cetrafs_bg_trim_pool_one()). Only groups wholly inside the range:
+     * trimming less than was asked is allowed, more is not.
+     */
+    if (!ret && !READ_ONCE(cetrafs_fitrim_skip_pool)) {
+        u32 zg;
+
+        if (cetrafs_sb_first_owned_zg(sb, &zg) == 0) {
+            for (b = 0; b < nbg && !ret; b++) {
+                u64 data_start, data_count, blocks;
+                u32 owner;
+
+                if (fatal_signal_pending(current)) {
+                    ret = -EINTR;
+                    break;
+                }
+                if (cetrafs_sb_bg_is_ours(sb, b))
+                    continue;
+                if (cetrafs_bg_data_region(sb, b, &data_start, &data_count, &owner))
+                    continue;
+                /* Its owner is judged fresh in cetrafs_bg_trim_pool_one(): a
+                 * cached copy could say "a peer's" of a group in the pool
+                 * for as long as nothing here re-reads it. */
+                if (data_start < start || data_start + data_count > end)
+                    continue;
+                ret = cetrafs_bg_trim_pool_one(sb, zg, b, &blocks);
+                trimmed += blocks;
+                cond_resched();
+            }
         }
     }
     mutex_unlock(cetrafs_sb_trim_mutex(sb));
