@@ -1990,7 +1990,20 @@ struct cetrafs_pf_ent {
 struct cetrafs_pf_drain_ctx {
     u32 n;
     struct cetrafs_pf_ent seen[CETRAFS_PENDING_FREE_PER_BLOCK];
+    /* TEST ONLY (pf_drain_weaken bit 2): the region as the drain's read
+     * found it; when set, only entries still equal to it are consumed. */
+    const cetrafs_pending_free_t *listed;
+    cetrafs_pending_free_t listed_copy[CETRAFS_PENDING_FREE_PER_BLOCK];
 };
+
+/* TEST ONLY: switch off one part of the drain's copy rule (L19), so each
+ * case of tests/kernel/pf_stale_copy_later_drain.sh has its control in
+ * the tree. Bits: 1 = consume stops at an empty run of queue blocks
+ * (the old scan); 2 = consume only what the read listed; 4 = apply a
+ * range even while a copy is held. */
+static unsigned int cetrafs_pf_drain_weaken;
+cetrafs_test_param(pf_drain_weaken, cetrafs_pf_drain_weaken, uint, 0644);
+MODULE_PARM_DESC(pf_drain_weaken, "TEST ONLY: disable parts of the drain's copy rule (bits: 1 sweep, 2 consume-all, 4 hold)");
 
 static int cetrafs_pf_drain_mutate(void *image, unsigned int len, void *priv)
 {
@@ -2016,6 +2029,9 @@ static int cetrafs_pf_drain_mutate(void *image, unsigned int len, void *priv)
             changed = true;
             continue;
         }
+
+        if (ctx->listed && (ctx->listed[e].lba != ent[e].lba || ctx->listed[e].count != ent[e].count))
+            continue; /* TEST ONLY: not in the read's list (pf_drain_weaken bit 2) */
 
         /* Every valid entry, duplicates included: each copy consumes its
          * own slot, and the drain applies a range once however many
@@ -2188,6 +2204,7 @@ static int cetrafs_zg_drain_one(struct super_block *sb, u32 zg_id)
     struct cetrafs_pf_ent *got = NULL;
     struct maple_tree done_mt, held_mt;
     bool any = false, hold_all = false, stop = false;
+    unsigned int weaken = READ_ONCE(cetrafs_pf_drain_weaken);
     u32 qblocks, qb, ngot = 0, capgot = 0, applied = 0, empty_run = 0;
     u64 qstart;
     u32 e;
@@ -2238,8 +2255,21 @@ static int cetrafs_zg_drain_one(struct super_block *sb, u32 zg_id)
     }
 
     /* 3. Consume. */
+    empty_run = 0;
     for (qb = 0; qb < qblocks; qb++) {
         unsigned int r;
+
+        if (weaken & 1) { /* TEST ONLY: the old scan's empty-run stop */
+            bool used = false;
+
+            for (r = 0; r < regions && !used; r++)
+                used = cetrafs_pf_region_used((const cetrafs_pending_free_t *) (bhs[qb]->b_data + r * region_sz),
+                                              slots);
+            if (used)
+                empty_run = 0;
+            else if (++empty_run >= CETRAFS_PF_DRAIN_EMPTY_RUN)
+                break;
+        }
 
         for (r = 0; r < regions; r++) {
             const cetrafs_pending_free_t *ent = (const cetrafs_pending_free_t *) (bhs[qb]->b_data + r * region_sz);
@@ -2272,6 +2302,11 @@ static int cetrafs_zg_drain_one(struct super_block *sb, u32 zg_id)
                 continue;
             }
 
+            ctx->listed = NULL;
+            if (weaken & 2) { /* TEST ONLY: consume only what the read listed */
+                memcpy(ctx->listed_copy, ent, min_t(size_t, region_sz, sizeof(ctx->listed_copy)));
+                ctx->listed = ctx->listed_copy;
+            }
             for (try = 0;; try++) {
                 if (cetrafs_pf_drain_busy_region && cetrafs_pf_drain_busy_region == idx + 1) {
                     ctx->n = 0; /* TEST ONLY: as if every swap lost */
@@ -2335,7 +2370,7 @@ static int cetrafs_zg_drain_one(struct super_block *sb, u32 zg_id)
          * copy completes the free when a later drain consumes it -- and
          * since nothing can be allocated on them meanwhile, that copy
          * can only free what was never handed out again. */
-        if (hold_all || mt_find(&held_mt, &index, (unsigned long) last)) {
+        if (!(weaken & 4) && (hold_all || mt_find(&held_mt, &index, (unsigned long) last))) {
             atomic64_inc(&cetrafs_pf_drain_held);
             pr_info_ratelimited("pending free: ZG %u lba=%llu count=%u has a copy still queued -- left for the drain "
                                 "that consumes it\n",

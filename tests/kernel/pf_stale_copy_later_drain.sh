@@ -27,16 +27,14 @@
 # runs another drain over whatever is still queued; fsck must then find
 # every referenced block allocated.
 #
-# DISCRIMINATION (checked 2026-11-10, each part disabled alone): with the
-# empty-run stop kept after a find, case 1 leaves a copy queued and the
-# later drain frees the file's block; consuming only the listed entries
-# does the same in case 3; applying a range while a copy is held lets
-# case 2's later drain free the file's block.
+# CONTROLS, in the tree (pf_drain_weaken): each case runs again with its
+# part of the rule switched off and must then end with a block freed
+# under its owner.
 set -euo pipefail
 . "$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)/lib/harness.sh"
 require_root
 require_module
-for p in pf_drain_busy_region pf_drain_consume_stall_ms pf_drain_min_ms; do
+for p in pf_drain_busy_region pf_drain_consume_stall_ms pf_drain_min_ms pf_drain_weaken; do
     [ -w "/sys/module/cetrafs/parameters/$p" ] || { skip "$p is missing"; ct_exit; }
 done
 PP="$(ct_helper pending_poke)"
@@ -116,6 +114,8 @@ later_drain() {
 # else was given it, and fsck finds the volume consistent (it says a
 # freed-under-its-owner block either way: "marked FREE" while nobody has
 # it, "referenced by more than one inode" once the next writer got it).
+# Under a control (CTRL=1) it only records the outcome in BROKEN, for
+# control() to judge.
 verdict() {
     local L="$3" got later
     sync
@@ -123,14 +123,37 @@ verdict() {
     later="$(ext "$MNT/later$4")"
     ct_umount "$MNT"
     OUT="$(ct_fsck "$DEV" 2>&1)" && RC=0 || RC=$?
+    BROKEN=0
     if [ "$RC" != 0 ] || grep -qiE "marked FREE|more than one inode|in use but marked free" <<<"$OUT"; then
-        fail "$1: a later drain freed block $L under its owner (fsck rc=$RC): $(grep -E -m2 '^ERR' <<<"$OUT")"
+        BROKEN=1
+        [ "$CTRL" = 1 ] || fail "$1: a later drain freed block $L under its owner (fsck rc=$RC): $(grep -E -m2 '^ERR' <<<"$OUT")"
     else
-        pass "$1: block $L is still allocated to its owner alone after the later drain (fsck clean)"
+        [ "$CTRL" = 1 ] || pass "$1: block $L is still allocated to its owner alone after the later drain (fsck clean)"
     fi
+    [ "$CTRL" = 1 ] && return 0
     [ "$got" = "$L" ] || fail "$1: $2 no longer maps $L (now $got)"
     [ "$later" != "$L" ] || fail "$1: the later drain's writer was handed $L as well"
 }
+
+# ok <msg> / bad <msg>: a case's own assertions; silent under a control,
+# which judges only the end state.
+ok() { [ "$CTRL" = 1 ] || pass "$*"; }
+bad() { [ "$CTRL" = 1 ] || fail "$*"; }
+
+# control <tag> <bits> <case>: run the case with those parts of the rule
+# off; it must end with a block freed under its owner.
+control() {
+    CTRL=1
+    ct_param_set pf_drain_weaken "$2"
+    BROKEN=0
+    "$3"
+    ct_param_set pf_drain_weaken 0
+    CTRL=0
+    [ "$BROKEN" = 1 ] && pass "$1 CONTROL (pf_drain_weaken=$2): a later drain freed a block under its owner" ||
+        fail "$1 CONTROL (pf_drain_weaken=$2): the volume stayed consistent with the rule off -- the case proves nothing"
+}
+CTRL=0
+
 
 # A block well past anything these cases allocate, free, for the fillers.
 ct_mount "$DEV" "$MNT"
@@ -141,78 +164,101 @@ rm -f "$MNT/probe"
 ct_umount "$MNT"
 
 # ------------------------------------------------------------------- 1
-log "1: a copy past an empty run"
-L="$(stage c1)" || { fail "1 setup: could not stage a queued free"; ct_exit; }
-"$PP" "$IMG" put 0 0 0 "$L" 1 >/dev/null
-"$PP" "$IMG" put 0 3 0 "$L" 1 >/dev/null # blocks 1 and 2 empty
-ct_mount "$DEV" "$MNT"
-ct_param_set pf_drain_min_ms 0
-F="$(grab c1 "$L")" || { fail "1 setup: no file was given the freed block $L"; ct_umount "$MNT"; ct_exit; }
-ct_param_set pf_drain_min_ms 600000
-pass "1 setup: the first drain freed $L and $F was given it"
-[ "$(queued "$L")" = 0 ] && pass "1: no copy of the applied free is left queued" ||
-    fail "1: a copy of the free for $L is still queued behind the empty run"
-later_drain c1
-verdict 1 "$F" "$L" c1
+case1() {
+    log "1: a copy past an empty run"
+    L="$(stage c1)" || { fail "1 setup: could not stage a queued free"; ct_exit; }
+    "$PP" "$IMG" put 0 0 0 "$L" 1 >/dev/null
+    "$PP" "$IMG" put 0 3 0 "$L" 1 >/dev/null # blocks 1 and 2 empty
+    ct_mount "$DEV" "$MNT"
+    ct_param_set pf_drain_min_ms 0
+    F="$(grab c1 "$L")" || { fail "1 setup: no file was given the freed block $L"; ct_umount "$MNT"; ct_exit; }
+    ct_param_set pf_drain_min_ms 600000
+    ok "1 setup: the first drain freed $L and $F was given it"
+    [ "$(queued "$L")" = 0 ] && ok "1: no copy of the applied free is left queued" ||
+        bad "1: a copy of the free for $L is still queued behind the empty run"
+    later_drain c1
+    verdict 1 "$F" "$L" c1
+}
 
 # ------------------------------------------------------------------- 2
-log "2: a copy in a region whose consume keeps losing"
-L="$(stage c2)" || { fail "2 setup: could not stage a queued free"; ct_exit; }
-"$PP" "$IMG" put 0 0 0 "$L" 1 >/dev/null  # region 0: busy
-"$PP" "$IMG" put 0 0 32 "$L" 1 >/dev/null # region 1: consumed
-ct_param_set pf_drain_busy_region 1
-MARK="$(dmesg_mark)"
-ct_mount "$DEV" "$MNT" # the mount's drain: region 0 busy throughout
-# One allocation, the first since the mount: with the cursor at the
-# front it is given L if L is free -- which it must not be while a copy
-# of its free is held.
-dd if=/dev/urandom of="$MNT/k2" bs=4096 count=1 conv=fsync status=none
-K="$(ext "$MNT/k2")"
-[ "$K" != "$L" ] && pass "2: while a copy is held, $L stays allocated (the next file got $K)" ||
-    fail "2: $L was handed to a new file while a copy of its free was still queued"
-dmesg_since "$MARK" | grep -q "lba=$L count=1 has a copy still queued" && pass "2: and the hold was reported" ||
-    fail "2: no 'copy still queued' line"
-[ "$(queued "$L")" = 1 ] || fail "2 setup: expected exactly the busy region's copy queued, found $(queued "$L")"
-ct_umount "$MNT"
-ct_param_set pf_drain_busy_region 0
-ct_mount "$DEV" "$MNT" # its drain consumes the held copy: the free completes
-[ "$(queued "$L")" = 0 ] && pass "2: the held copy was consumed once its region could be" ||
-    fail "2: a copy of the free for $L is still queued after its region came free"
-later_drain c2
-# k2 is the file a wrongly applied copy would have been handed L as;
-# the held copy completing the free must not have touched it either.
-verdict 2 "$MNT/k2" "$K" c2
+case2() {
+    log "2: a copy in a region whose consume keeps losing"
+    L="$(stage c2)" || { fail "2 setup: could not stage a queued free"; ct_exit; }
+    "$PP" "$IMG" put 0 0 0 "$L" 1 >/dev/null  # region 0: busy
+    "$PP" "$IMG" put 0 0 32 "$L" 1 >/dev/null # region 1: consumed
+    ct_param_set pf_drain_busy_region 1
+    MARK="$(dmesg_mark)"
+    ct_mount "$DEV" "$MNT" # the mount's drain: region 0 busy throughout
+    # One allocation, the first since the mount: with the cursor at the
+    # front it is given L if L is free -- which it must not be while a
+    # copy of its free is held.
+    dd if=/dev/urandom of="$MNT/k2" bs=4096 count=1 conv=fsync status=none
+    K="$(ext "$MNT/k2")"
+    [ "$K" != "$L" ] && ok "2: while a copy is held, $L stays allocated (the next file got $K)" ||
+        bad "2: $L was handed to a new file while a copy of its free was still queued"
+    dmesg_since "$MARK" | grep -q "lba=$L count=1 has a copy still queued" && ok "2: and the hold was reported" ||
+        bad "2: no 'copy still queued' line"
+    [ "$(queued "$L")" = 1 ] || fail "2 setup: expected exactly the busy region's copy queued, found $(queued "$L")"
+    ct_umount "$MNT"
+    ct_param_set pf_drain_busy_region 0
+    ct_mount "$DEV" "$MNT" # its drain consumes the held copy: the free completes
+    [ "$(queued "$L")" = 0 ] && ok "2: the held copy was consumed once its region could be" ||
+        bad "2: a copy of the free for $L is still queued after its region came free"
+    later_drain c2
+    # k2 is the file a wrongly applied copy would have been handed L as;
+    # the held copy completing the free must not have touched it either.
+    verdict 2 "$MNT/k2" "$K" c2
+}
+
+# late_copy <tag> <block> <slot>: a drain of the one queued copy of L,
+# stalled between its read and its consumes, and a second copy put at
+# <block> <slot> in that window. Leaves the trigger file's name in TRIG.
+late_copy() {
+    ct_mount "$DEV" "$MNT"
+    "$PP" "$IMG" put 0 0 0 "$L" 1 >/dev/null
+    ct_param_set pf_drain_consume_stall_ms 2000
+    ct_param_set pf_drain_min_ms 0
+    TRIG="$MNT/trigger$1"
+    dd if=/dev/urandom of="$TRIG" bs=4096 count=1 conv=fsync status=none &
+    TPID=$!
+    for _ in $(seq 1 60); do [ "$(cat /sys/module/cetrafs/parameters/pf_drain_consume_stall_ms)" = 0 ] && break; sleep 0.05; done
+    if [ "$(cat /sys/module/cetrafs/parameters/pf_drain_consume_stall_ms)" != 0 ]; then
+        fail "$1 setup: no drain reached its consume"
+        ct_param_set pf_drain_consume_stall_ms 0
+        wait "$TPID" || true
+        ct_umount "$MNT"
+        ct_exit
+    fi
+    "$PP" "$IMG" put 0 "$2" "$3" "$L" 1 >/dev/null
+    wait "$TPID"
+    ct_param_set pf_drain_min_ms 600000
+}
 
 # ------------------------------------------------------------------- 3
-log "3: a copy appended between a drain's read and its swap"
-L="$(stage c3)" || { fail "3 setup: could not stage a queued free"; ct_exit; }
-ct_mount "$DEV" "$MNT"
-"$PP" "$IMG" put 0 0 0 "$L" 1 >/dev/null
-ct_param_set pf_drain_consume_stall_ms 2000
-ct_param_set pf_drain_min_ms 0
-dd if=/dev/urandom of="$MNT/trigger3" bs=4096 count=1 conv=fsync status=none &
-TPID=$!
-for _ in $(seq 1 60); do [ "$(cat /sys/module/cetrafs/parameters/pf_drain_consume_stall_ms)" = 0 ] && break; sleep 0.05; done
-if [ "$(cat /sys/module/cetrafs/parameters/pf_drain_consume_stall_ms)" != 0 ]; then
-    fail "3 setup: no drain reached its consume"
-    ct_param_set pf_drain_consume_stall_ms 0
-    wait "$TPID" || true
-    ct_umount "$MNT"
-    ct_exit
-fi
-"$PP" "$IMG" put 0 0 1 "$L" 1 >/dev/null # the same region, after the read
-wait "$TPID"
-# The trigger's own allocation follows the drain it ran, so it is the
-# first candidate for L.
-if [ "$(ext "$MNT/trigger3")" = "$L" ]; then
-    F="$MNT/trigger3"
-else
-    F="$(grab c3 "$L")" || { fail "3 setup: no file was given the freed block $L"; ct_umount "$MNT"; ct_exit; }
-fi
-ct_param_set pf_drain_min_ms 600000
-pass "3 setup: the drain freed $L and $F was given it"
-[ "$(queued "$L")" = 0 ] && pass "3: the copy appended during the drain was consumed with the one it read" ||
-    fail "3: a copy of the free for $L is still queued after the drain that applied it"
-later_drain c3
-verdict 3 "$F" "$L" c3
+case3() {
+    log "3: a copy appended between a drain's read and its swap"
+    L="$(stage c3)" || { fail "3 setup: could not stage a queued free"; ct_exit; }
+    late_copy 3 0 1 # the same region, after the read
+    # The trigger's own allocation follows the drain it ran, so it is the
+    # first candidate for L.
+    ct_param_set pf_drain_min_ms 0
+    if [ "$(ext "$TRIG")" = "$L" ]; then
+        F="$TRIG"
+    else
+        F="$(grab c3 "$L")" || { fail "3 setup: no file was given the freed block $L"; ct_umount "$MNT"; ct_exit; }
+    fi
+    ct_param_set pf_drain_min_ms 600000
+    ok "3 setup: the drain freed $L and $F was given it"
+    [ "$(queued "$L")" = 0 ] && ok "3: the copy appended during the drain was consumed with the one it read" ||
+        bad "3: a copy of the free for $L is still queued after the drain that applied it"
+    later_drain c3
+    verdict 3 "$F" "$L" c3
+}
+
+case1
+case2
+case3
+control 1 1 case1
+control 2 4 case2
+control 3 2 case3
 ct_exit
