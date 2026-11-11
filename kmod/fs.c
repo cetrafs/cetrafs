@@ -582,6 +582,16 @@ struct cetrafs_sb_info {
     struct mutex trim_mutex;
     u64 trim_lba;
     u64 trim_count;
+    /* discard_pending: Block Groups whose hand-back discard failed with
+     * an UNKNOWN outcome -- it may still execute. Each stays drained
+     * (out of this node's allocator: cetrafs_sb_undrain_bg() refuses
+     * it) and out of every release until a discard of it is known to
+     * have run or been refused (cetrafs_bg_release_empty()). Memory
+     * only: a crash or unmount leaves it owned with an empty bitmap,
+     * the standing advisory-fence caveat for I/O already queued.
+     * Keyed by BG id. */
+    struct xarray discard_pending;
+    atomic_t discard_pending_count;
 
     /* The cross-node whole-file EXCLUSIVE open lock (lock.c): on by
      * default, turned off at mount time with the `nofilelock` option.
@@ -2465,6 +2475,7 @@ int cetrafs_fill_super(struct super_block *sb, struct fs_context *fc)
         sbi->auto_defrag_enabled = true;
         xa_init(&sbi->bad_inos);
         xa_init(&sbi->deferred);
+        xa_init(&sbi->discard_pending);
         INIT_LIST_HEAD(&sbi->deferred_orphans);
         sbi->sb = sb;
         INIT_WORK(&sbi->stop_work, cetrafs_sb_stop_work);
@@ -3665,6 +3676,7 @@ departed:
     }
     xa_destroy(&sbi->deferred);
     xa_destroy(&sbi->bad_inos);
+    xa_destroy(&sbi->discard_pending);
     /* Last: every work item that could read the layout is drained above
      * (rule 20). The raw copy used to be freed before lease_work and
      * stop_work were cancelled. */
@@ -5250,6 +5262,45 @@ bool cetrafs_sb_trim_holds(struct super_block *sb, u64 lba)
     return sbi->trim_count && lba >= sbi->trim_lba && lba < sbi->trim_lba + sbi->trim_count;
 }
 
+bool cetrafs_sb_bg_discard_pending(struct super_block *sb, u32 bg_id)
+{
+    struct cetrafs_sb_info *sbi = sb ? sb->s_fs_info : NULL;
+
+    return sbi && xa_load(&sbi->discard_pending, bg_id);
+}
+
+/* Mark (on) or clear a Block Group's outstanding discard. Returns true
+ * when the call changed it; a failed store leaves it unmarked and says
+ * so, and the caller keeps the group drained either way this pass. */
+bool cetrafs_sb_set_bg_discard_pending(struct super_block *sb, u32 bg_id, bool on)
+{
+    struct cetrafs_sb_info *sbi = sb->s_fs_info;
+
+    if (on) {
+        int ret = xa_insert(&sbi->discard_pending, bg_id, xa_mk_value(1), GFP_NOFS);
+
+        if (ret == -EBUSY)
+            return false;
+        if (ret) {
+            pr_err("BG %u: cannot record its outstanding discard (%d)\n", bg_id, ret);
+            return false;
+        }
+        atomic_inc(&sbi->discard_pending_count);
+        return true;
+    }
+    if (!xa_erase(&sbi->discard_pending, bg_id))
+        return false;
+    atomic_dec(&sbi->discard_pending_count);
+    return true;
+}
+
+unsigned int cetrafs_sb_discard_pending_count(struct super_block *sb)
+{
+    struct cetrafs_sb_info *sbi = sb ? sb->s_fs_info : NULL;
+
+    return sbi ? (unsigned int) atomic_read(&sbi->discard_pending_count) : 0;
+}
+
 void cetrafs_sb_set_defrag_enabled(struct super_block *sb, bool on)
 {
     struct cetrafs_sb_info *sbi = sb->s_fs_info;
@@ -5487,6 +5538,12 @@ void cetrafs_sb_undrain_bg(struct super_block *sb, u32 bg_id)
     struct cetrafs_bg_chunk *c;
     u32 i;
 
+    /* A discard of unknown outcome may still land on it: it stays out of
+     * reach whoever asks, until a known-outcome discard clears the mark
+     * (cetrafs_bg_release_empty()). This is the one place a drained
+     * group comes back, so the one place to refuse. */
+    if (cetrafs_sb_bg_discard_pending(sb, bg_id))
+        return;
     c = cetrafs_bgc(sbi, bg_id, &i);
     if (!c)
         return;

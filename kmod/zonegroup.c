@@ -1455,6 +1455,15 @@ static int cetrafs_zg_try_release_one(struct super_block *sb, u32 zg_id, u32 my_
      * new owner's allocations. See cetrafs_bg_release_bitmap_ready().
      */
     nbg = le32_to_cpu(cetrafs_sb_raw(sb)->block_group_count);
+    /* A member with a discard of unknown outcome outstanding is empty and
+     * drained, and would pass every check below -- and the Zone Group,
+     * given away, takes it to a node that writes where the UNMAP may
+     * still land (review U1). */
+    for (b = 0; b < nbg; b++)
+        if (cetrafs_sb_bg_owner(sb, b) == zg_id && cetrafs_sb_bg_discard_pending(sb, b)) {
+            ret = 0;
+            goto out_unlock;
+        }
     for (b = 0; b < nbg; b++)
         if (cetrafs_sb_bg_owner(sb, b) == zg_id)
             cetrafs_sb_drain_bg(sb, b);

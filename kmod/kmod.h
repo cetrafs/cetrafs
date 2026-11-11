@@ -362,6 +362,10 @@ void cetrafs_sb_set_discard_enabled(struct super_block *sb, bool on);
 struct mutex *cetrafs_sb_trim_mutex(struct super_block *sb);
 void cetrafs_sb_set_trim_claim(struct super_block *sb, u64 lba, u64 count);
 bool cetrafs_sb_trim_holds(struct super_block *sb, u64 lba);
+/* Block Groups kept drained after a hand-back discard of unknown outcome. */
+bool cetrafs_sb_bg_discard_pending(struct super_block *sb, u32 bg_id);
+bool cetrafs_sb_set_bg_discard_pending(struct super_block *sb, u32 bg_id, bool on);
+unsigned int cetrafs_sb_discard_pending_count(struct super_block *sb);
 void cetrafs_sb_set_auto_defrag_enabled(struct super_block *sb, bool on);
 /* Cluster timing for THIS mount (procfs 'controls'); the module params
  * are the defaults. */
@@ -446,7 +450,7 @@ int cetrafs_bg_id_of_lba(struct super_block *sb, u64 lba, u32 *out_bg_id);
 /* discard.c */
 struct fstrim_range;
 bool cetrafs_discard_supported(struct super_block *sb);
-int cetrafs_discard_handback(struct super_block *sb, u32 bg_id, unsigned long *pass_started);
+int cetrafs_discard_handback(struct super_block *sb, u32 bg_id, unsigned long *pass_started, bool pending);
 long cetrafs_fitrim_ioctl(struct file *file, struct fstrim_range __user *arg);
 u64 cetrafs_discard_cmds_count(void);
 u64 cetrafs_discard_blocks_count(void);
@@ -454,6 +458,7 @@ u64 cetrafs_discard_errors_count(void);
 u64 cetrafs_discard_refused_count(void);
 u64 cetrafs_discard_handback_count(void);
 u64 cetrafs_discard_handback_deferred_count(void);
+u64 cetrafs_discard_handback_unknown_count(void);
 /* BG free counts (v0x0004): accrued per BG, applied by one epoch-guarded
  * CAS per dirty BG at the durability boundaries -- never left dirty in
  * the buffer cache (background writeback could land a stale count on a

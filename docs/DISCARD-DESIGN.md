@@ -357,9 +357,24 @@ heartbeat I/O. On by default where the device supports discard;
   failure, a plain I/O error -- may still execute on the array, and an
   UNMAP landing after the blocks were handed out destroys the new data
   (bug class 30). Such a FITRIM run stays allocated (counted in
-  `trim_leaked_blocks`; the scrub reclaims it later) and the pass stops;
-  a hand-back keeps its Block Group and discards it again on a later
-  tick before letting it go.
+  `trim_leaked_blocks`; the scrub reclaims it later), its bits are
+  synced to the device before fstrim returns (a fence before writeback
+  would otherwise hand a peer a bitmap reading FREE), and the pass
+  stops. A hand-back keeps its Block Group DRAINED -- out of this node's
+  allocator as well as out of the pool -- and marks it pending
+  (`discard_pending_bgs`); every later pass discards it again, whatever
+  `discard` is set to (turning it off does not cancel a command already
+  sent), and only a discard whose outcome is known releases it. Its Zone
+  Group is not given back meanwhile. The first time a group is kept
+  this way the kernel says so, unratelimited, naming `discard=off` as
+  the way to stop further groups being kept on a path that keeps
+  failing (`discard_handback_unknown` counts the failures,
+  `discard_handback_deferred` only the budget). The pending mark is in
+  memory: an unmount or crash leaves the group owned with an empty
+  bitmap, and the next mount may allocate in it -- the standing
+  advisory-fence caveat for I/O already queued at a failed path
+  (`docs/LOCKING.md`); recording it on disk would need a format
+  field.
 * Nodes on different paths decide for themselves: each checks its own
   view of the device.
 * Nothing may rely on a discarded block reading zero. An unwritten file
@@ -381,8 +396,12 @@ heartbeat I/O. On by default where the device supports discard;
 ### Tests
 
 `tests/kernel/discard_unknown_outcome.sh` (unknown vs refused, for both
-paths, each with its contrast), `tests/kernel/discard_handback.sh` (the `du` oracle on the image, a
-discard-off control, a device without discard),
+paths, each with its contrast; a write while a hand-back's discard is
+unknown placed outside the kept group, which discard=off does not
+release; a kept FITRIM run's bits read from the device),
+`tests/kernel/discard_handback.sh` (the `du` oracle on the image, a
+discard-off control, a device without discard, a FITRIM claim racing
+the release of an emptied group),
 `tests/kernel/fstrim.sh` (holes inside a group in use, kept files
 checksummed from the device, a range-check control aimed at the bitmap
 and into the data), `tests/kernel/fstrim_claim.sh` (a writer inside the

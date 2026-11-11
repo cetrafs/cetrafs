@@ -68,7 +68,8 @@ static atomic64_t cetrafs_discard_blocks = ATOMIC64_INIT(0);
 static atomic64_t cetrafs_discard_errors = ATOMIC64_INIT(0);
 static atomic64_t cetrafs_discard_refused = ATOMIC64_INIT(0);
 static atomic64_t cetrafs_discard_handback_bgs = ATOMIC64_INIT(0);
-static atomic64_t cetrafs_discard_handback_deferred = ATOMIC64_INIT(0);
+static atomic64_t cetrafs_discard_handback_deferred = ATOMIC64_INIT(0); /* over budget */
+static atomic64_t cetrafs_discard_handback_unknown = ATOMIC64_INIT(0);  /* outcome unknown: kept */
 
 u64 cetrafs_discard_cmds_count(void)
 {
@@ -93,6 +94,10 @@ u64 cetrafs_discard_handback_count(void)
 u64 cetrafs_discard_handback_deferred_count(void)
 {
     return (u64) atomic64_read(&cetrafs_discard_handback_deferred);
+}
+u64 cetrafs_discard_handback_unknown_count(void)
+{
+    return (u64) atomic64_read(&cetrafs_discard_handback_unknown);
 }
 
 /* TEST ONLY: hold a claimed run this long before its discard, so a
@@ -211,25 +216,35 @@ failed:
 /*
  * The hand-back half, from cetrafs_bg_release_empty() with BG 'bg_id'
  * drained and its bitmap proven empty on the device. 0: release it (the
- * region was discarded, or discard is off, unsupported or failed).
+ * region was discarded, or discard is off, unsupported or refused).
  * -EBUSY: this pass's budget is spent -- keep the group and release it
  * on a later tick, so the space it holds is never handed back
  * untrimmed while discard is on. The first group of every pass is
  * always attempted (it starts the clock), so each pass makes progress.
- * Also -EBUSY when the discard failed with an UNKNOWN outcome: it may
- * still execute, and once the group reads FREE a peer can claim it and
- * write into it first. Kept, it is discarded again on a later tick;
- * nothing allocates in an empty group this node is releasing.
+ * -EAGAIN: the discard failed with an UNKNOWN outcome. It may still
+ * execute, so the group must not take data -- not a peer's after it
+ * reads FREE, and not ours either: the caller keeps it DRAINED and marks
+ * it pending (review U1), and only a later discard whose outcome is
+ * known lets it go anywhere.
+ *
+ * 'pending': the group already carries such a discard. The switch and
+ * fencing do not cancel a command already sent, so it is re-issued
+ * whatever discard is set to, and a device that no longer takes
+ * discards, or a fenced mount, keeps it pending.
  */
-int cetrafs_discard_handback(struct super_block *sb, u32 bg_id, unsigned long *pass_started)
+int cetrafs_discard_handback(struct super_block *sb, u32 bg_id, unsigned long *pass_started, bool pending)
 {
     unsigned int budget = READ_ONCE(cetrafs_handback_budget_ms);
     u64 data_start, data_count;
     u32 owner;
     int ret;
 
-    if (!cetrafs_sb_discard_enabled(sb) || !cetrafs_discard_supported(sb) || cetrafs_sb_is_fenced(sb))
+    if (pending) {
+        if (!cetrafs_discard_supported(sb) || cetrafs_sb_is_fenced(sb))
+            return -EAGAIN;
+    } else if (!cetrafs_sb_discard_enabled(sb) || !cetrafs_discard_supported(sb) || cetrafs_sb_is_fenced(sb)) {
         return 0;
+    }
     if (!budget)
         budget = CETRAFS_HANDBACK_TRIM_BUDGET_MS;
     if (!*pass_started) {
@@ -239,12 +254,14 @@ int cetrafs_discard_handback(struct super_block *sb, u32 bg_id, unsigned long *p
         return -EBUSY;
     }
     if (cetrafs_bg_data_region(sb, bg_id, &data_start, &data_count, &owner))
-        return 0;
+        return pending ? -EAGAIN : 0;
     ret = cetrafs_discard_issue(sb, bg_id, data_start, data_count);
     if (!ret)
         atomic64_inc(&cetrafs_discard_handback_bgs);
-    else if (!cetrafs_discard_outcome_known(ret))
-        return -EBUSY;
+    else if (!cetrafs_discard_outcome_known(ret)) {
+        atomic64_inc(&cetrafs_discard_handback_unknown);
+        return -EAGAIN;
+    }
     return 0;
 }
 

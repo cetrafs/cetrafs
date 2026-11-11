@@ -3604,6 +3604,35 @@ int cetrafs_bg_release_empty(struct super_block *sb, u32 zg_id, u32 *out_release
 
         if (cetrafs_sb_bg_owner(sb, b) != zg_id)
             continue;
+
+        /*
+         * A group whose hand-back discard had an UNKNOWN outcome (review
+         * U1). It has stayed drained since -- out of our allocator, and
+         * not FREE, so out of everyone else's -- and it was proven empty
+         * then. Discard it again; only an outcome we know releases it.
+         * It reads as not ours (drained), so it is looked for first.
+         */
+        if (cetrafs_sb_bg_discard_pending(sb, b)) {
+            ret = cetrafs_discard_handback(sb, b, pass_started, true);
+            if (ret) {
+                deferred++;
+                continue;
+            }
+            if (cetrafs_bg_data_block_stats(sb, b, &total, &free) != 0 || total == 0 || free != total ||
+                cetrafs_bg_release_bitmap_ready(sb, b)) {
+                /* Drained all along, so nothing of ours wrote here: a
+                 * group no longer empty or readable is a contradiction.
+                 * Its discard is known now; it goes back to use, not
+                 * to the pool. */
+                pr_err("BG %u: kept for an outstanding discard, now not provably empty -- kept by this node\n", b);
+                cetrafs_sb_set_bg_discard_pending(sb, b, false);
+                cetrafs_sb_undrain_bg(sb, b);
+                continue;
+            }
+            cetrafs_sb_set_bg_discard_pending(sb, b, false);
+            pr_info("BG %u: its outstanding discard is settled -- released\n", b);
+            goto release;
+        }
         if (!cetrafs_sb_bg_is_ours(sb, b))
             continue;
 
@@ -3673,11 +3702,29 @@ int cetrafs_bg_release_empty(struct super_block *sb, u32 zg_id, u32 *out_release
          * writes. Over budget, the group stays ours for a later tick
          * rather than going back untrimmed.
          */
-        if (cetrafs_discard_handback(sb, b, pass_started)) {
-            cetrafs_sb_undrain_bg(sb, b);
+        ret = cetrafs_discard_handback(sb, b, pass_started, false);
+        if (ret == -EAGAIN) {
+            /* The UNMAP may still execute: the group stays drained --
+             * not ours to allocate in, not the pool's -- until a discard
+             * of it has a known outcome (review U1). Said once per group,
+             * unratelimited: a path that keeps failing discards keeps
+             * every emptied group, and with it every Zone Group release
+             * (U3). */
+            if (cetrafs_sb_set_bg_discard_pending(sb, b, true))
+                pr_warn("%s: BG %u: its hand-back discard failed and may still execute -- the group is kept out "
+                        "of use until a discard of it succeeds or is refused. If this device cannot discard "
+                        "reliably, turn discard off (controls: discard=off) so no further group is kept.\n",
+                        sb->s_id, b);
             deferred++;
             continue;
         }
+        if (ret) {
+            cetrafs_sb_undrain_bg(sb, b); /* over budget: nothing was sent */
+            deferred++;
+            continue;
+        }
+
+release:
 
         /*
          * Both counter moves, by immediate CAS, BEFORE the descriptor
@@ -4265,6 +4312,7 @@ out:
     cetrafs_resv_unpublish(sb, &run->span);
     run->claimed = false;
     cetrafs_sb_alloc_unlock(sb);
+
 }
 
 /* A Block Group's data region, for a discard to check itself against. */

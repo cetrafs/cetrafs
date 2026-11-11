@@ -16,8 +16,11 @@
 #     next writer IS placed in it. Proves A's writer was kept out by the
 #     verdict, not by the layout.
 #  C. hand-back, unknown: the emptied Block Group is NOT handed back by
-#     the pass whose discard failed; it is discarded again on a later
-#     tick and handed back after that.
+#     the pass whose discard failed -- and not given back to this node's
+#     allocator either (review U1): a write meanwhile is placed in the
+#     other group, and turning discard off does not release it. It is
+#     said once, however many passes fail (U3), and handed back only
+#     after a later discard of it succeeds.
 #  D. CONTRAST, definite: handed back in the same pass, no retry.
 set -euo pipefail
 . "$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)/lib/harness.sh"
@@ -102,8 +105,10 @@ N="$(leaked_in_hole)"
 # ------------------------------------------------------------------- C/D
 # handback <fail-param>: fill Block Group 0 with a preallocated file (it
 # holds the root and never empties), put 96 MiB in group 1, delete it,
-# and let the hand-back meet a failing discard. Sets LOG, HB (hand-back
-# discards that succeeded meanwhile), ERRS.
+# and let the hand-back meet <count> failing discards (default 1). With
+# HB_HOOK set, that function runs once the first failure is logged,
+# with the failures still armed. Sets LOG, HB (hand-back discards that
+# succeeded meanwhile), ERRS.
 handback() {
     local free mark i
     fresh
@@ -115,11 +120,18 @@ handback() {
     for i in 1 2 3; do dd if=/dev/urandom of="$MNT/bulk/f$i" bs=1M count=32 conv=fsync status=none; done
     sync
     HB0="$(info discard_handback_bgs)"
+    U0="$(info discard_handback_unknown)"
     E0="$(info discard_errors)"
     mark="$(dmesg_mark)"
-    ct_param_set "$1" 1
+    ct_param_set "$1" "${2:-1}"
     rm -rf "$MNT/bulk"
     sync
+    if [ -n "${HB_HOOK:-}" ]; then
+        wait_for 30 "dmesg_since '$mark' | grep -q 'discard \\[.*failed'" ||
+            { fail "setup: no hand-back discard failed"; ct_exit; }
+        "$HB_HOOK" "$mark"
+        ct_param_set "$1" 0
+    fi
     for i in $(seq 1 40); do
         dmesg_since "$mark" | grep -q "handed back from ZG" && break
         sleep 0.5
@@ -131,9 +143,41 @@ handback() {
     ERRS=$(($(info discard_errors) - E0))
 }
 
+# bg1: "<first> <end>" of Block Group 1's data region.
+bg1() {
+    "$BGPOKE" "$DEV" 1 --dump | sed -n 's/.*start_block=\([0-9]*\).*off_data_region=\([0-9]*\).*data_block_count=\([0-9]*\).*/\1 \2 \3/p' |
+        awk '{ print $1 + $2, $1 + $2 + $3 }'
+}
+# kept_window <mark>: with every discard still failing, the kept group
+# takes no write of ours, and discard=off does not let it go.
+kept_window() {
+    local r lba
+    sleep 3 # several passes, each failing again
+    read -r B1 B1E <<<"$(bg1)"
+    dd if=/dev/urandom of="$MNT/w" bs=64k count=1 conv=fsync status=none
+    lba="$(ext "$MNT/w")"
+    [ -n "$B1" ] && { [ "$lba" -lt "$B1" ] || [ "$lba" -ge "$B1E" ]; } &&
+        pass "C: a write while the discard may still land is placed outside the kept group ($lba)" ||
+        fail "C: a write was given block $lba, in the kept group [$B1,$B1E) an UNMAP may still land on"
+    [ "$(info discard_pending_bgs)" -ge 1 ] && pass "C: the group is recorded as carrying an outstanding discard" ||
+        fail "C: no group is recorded as pending"
+    echo "discard=off" >"$PROC/controls"
+    sleep 3
+    if dmesg_since "$1" | grep -q "handed back from ZG"; then
+        fail "C: the kept group was handed back with its discard still unknown (discard=off)"
+    else
+        pass "C: and discard=off does not release it -- the outstanding command does not care"
+    fi
+    echo "discard=on" >"$PROC/controls"
+    [ "$(dmesg_since "$1" | grep -c 'hand-back discard failed and may still execute')" = 1 ] &&
+        pass "C: said once, though every pass failed again ($(($(info discard_handback_unknown) - U0)) unknown outcomes)" ||
+        fail "C: the kept-group warning was not said exactly once"
+}
+
 log "C: hand-back, a discard of unknown outcome"
-handback discard_fail_unknown
-[ "$ERRS" = 1 ] || { fail "C setup: $ERRS discard error(s), not the one injected"; ct_exit; }
+HB_HOOK=kept_window handback discard_fail_unknown 1000000
+HB_HOOK=
+[ "$ERRS" -ge 2 ] || { fail "C setup: $ERRS discard error(s) -- the failures did not repeat"; ct_exit; }
 grep -q "handed back from ZG" <<<"$LOG" && pass "C: the emptied Block Group was handed back in the end" ||
     fail "C: the Block Group was never handed back"
 [ "$HB" -ge 1 ] && pass "C: only after a later discard of it succeeded ($HB)" ||
@@ -148,4 +192,5 @@ grep -q "handed back from ZG" <<<"$LOG" && pass "D: handed back" || fail "D: nev
     fail "D: a refused discard was retried ($HB)"
 ct_umount "$MNT"
 OUT="$(ct_fsck "$DEV" 2>&1)" && pass "D: fsck clean" || fail "D: fsck: $(grep -m3 -E '^ERR' <<<"$OUT")"
+
 ct_exit
