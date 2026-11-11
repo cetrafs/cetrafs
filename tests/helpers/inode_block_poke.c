@@ -230,6 +230,18 @@ int main(int argc, char **argv)
         pwrite_all(fd, &rec, sizeof(rec), rec_off);
         fprintf(stderr, "inode_block_poke: ino %llu dirent_seq -> %llu\n", (unsigned long long) ino,
                 (unsigned long long) cetrafs_le64(rec.dirent_seq));
+    } else if (strcmp(mode, "bumpxseq") == 0) {
+        /* Advance a record's xattr_seq and restamp it: what a peer's
+         * remove-then-set that landed on the same block number leaves
+         * (tests/kernel/xattr_read_seq_gate.sh). */
+        cetrafs_inode_t rec;
+
+        pread_all(fd, &rec, sizeof(rec), rec_off);
+        rec.xattr_seq = cetrafs_cpu_to_le64(cetrafs_le64(rec.xattr_seq) + 1);
+        cetrafs_inode_stamp_crcs_us(&rec);
+        pwrite_all(fd, &rec, sizeof(rec), rec_off);
+        fprintf(stderr, "inode_block_poke: ino %llu xattr_seq -> %llu\n", (unsigned long long) ino,
+                (unsigned long long) cetrafs_le64(rec.xattr_seq));
     } else if (strcmp(mode, "extents") == 0) {
         /* The extent tree's SHAPE, which no other helper exposes.
          * Needed because "this directory is big" is not the same claim

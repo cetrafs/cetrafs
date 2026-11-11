@@ -18,6 +18,7 @@ struct cetrafs_xattr_ns_update {
     __le64 xattr_block;
     bool set_flag;
     u64 ctime;
+    u64 seq; /* xattr_seq: drawn once, before the CAS, so a retry writes the same */
 };
 
 static void cetrafs_ns_apply_xattr(cetrafs_inode_t *rec, void *arg)
@@ -25,6 +26,7 @@ static void cetrafs_ns_apply_xattr(cetrafs_inode_t *rec, void *arg)
     struct cetrafs_xattr_ns_update *u = arg;
 
     rec->xattr_block = u->xattr_block;
+    rec->xattr_seq = cetrafs_cpu_to_le64(u->seq);
     if (u->set_flag)
         rec->flags = cetrafs_cpu_to_le32(cetrafs_le32(rec->flags) | CETRAFS_INODE_XATTR);
     else
@@ -86,6 +88,11 @@ cetrafs_test_param(xattr_tear_copy_once, cetrafs_xattr_tear_copy_once, bool, 064
 MODULE_PARM_DESC(xattr_tear_copy_once, "TEST ONLY: tear the next private copy of an xattr block");
 cetrafs_test_param(xattr_read_pause_ms, cetrafs_xattr_read_pause_ms, uint, 0644);
 MODULE_PARM_DESC(xattr_read_pause_ms, "TEST ONLY: pause between an xattr read's record read and its block read");
+/* TEST ONLY: the same, between the copy and the record re-read that
+ * judges it (tests/kernel/xattr_read_seq_gate.sh). First attempt only. */
+static unsigned int cetrafs_xattr_recheck_pause_ms;
+cetrafs_test_param(xattr_recheck_pause_ms, cetrafs_xattr_recheck_pause_ms, uint, 0644);
+MODULE_PARM_DESC(xattr_recheck_pause_ms, "TEST ONLY: pause between an xattr read's block copy and its record re-read");
 
 static void cetrafs_xattr_read_pause(u64 ino)
 {
@@ -126,7 +133,7 @@ static int cetrafs_xattr_read_block(struct inode *inode, void **out)
     *out = NULL;
     for (attempt = 0; attempt < CETRAFS_XATTR_READ_RETRIES; attempt++) {
         struct buffer_head *bh;
-        u64 lba;
+        u64 lba, seq;
 
         cetrafs_invalidate_raw_inode(sb, inode->i_ino);
         ret = cetrafs_read_raw_inode(sb, inode->i_ino, &raw);
@@ -144,6 +151,7 @@ static int cetrafs_xattr_read_block(struct inode *inode, void **out)
             goto out;
         }
         lba = cetrafs_le64(raw.xattr_block);
+        seq = cetrafs_le64(raw.xattr_seq);
         if (!lba) {
             ret = 0;
             goto out;
@@ -182,12 +190,15 @@ static int cetrafs_xattr_read_block(struct inode *inode, void **out)
             continue;
         }
 
+        if (!attempt && READ_ONCE(cetrafs_xattr_recheck_pause_ms))
+            msleep(READ_ONCE(cetrafs_xattr_recheck_pause_ms));
         cetrafs_invalidate_raw_inode(sb, inode->i_ino);
         ret = cetrafs_read_raw_inode(sb, inode->i_ino, &raw);
         if (ret)
             goto out;
+        /* The stamp as well as the number: the number cycles (X4). */
         if (cetrafs_le64(raw.generation) == cetrafs_inode_get_generation(inode) &&
-            cetrafs_le64(raw.xattr_block) == lba) {
+            cetrafs_le64(raw.xattr_block) == lba && cetrafs_le64(raw.xattr_seq) == seq) {
             *out = copy;
             return 0;
         }
@@ -409,7 +420,8 @@ static int cetrafs_xattr_set_locked(struct inode *inode, const char *name, const
 
         {
             struct cetrafs_xattr_ns_update u = {
-                .xattr_block = cetrafs_cpu_to_le64(lba), .set_flag = true, .ctime = now};
+                .xattr_block = cetrafs_cpu_to_le64(lba), .set_flag = true, .ctime = now,
+                .seq = cetrafs_inode_new_generation(sb)};
 
             ret = cetrafs_inode_ns_cas(sb, inode->i_ino, cetrafs_le64(raw.generation), &raw,
                                        cetrafs_ns_apply_xattr, &u);
@@ -508,7 +520,8 @@ static int cetrafs_xattr_set_locked(struct inode *inode, const char *name, const
         if (ret)
             return ret;
         {
-            struct cetrafs_xattr_ns_update u = {.xattr_block = 0, .set_flag = false, .ctime = now};
+            struct cetrafs_xattr_ns_update u = {.xattr_block = 0, .set_flag = false, .ctime = now,
+                                                .seq = cetrafs_inode_new_generation(sb)};
 
             ret = cetrafs_inode_ns_cas(sb, inode->i_ino, cetrafs_le64(raw.generation), &raw,
                                        cetrafs_ns_apply_xattr, &u);

@@ -1424,7 +1424,17 @@ typedef struct {
      * is left alone (F10). */
     __le32 lock_owner_incarnation;
     __le32 read_open_incarnation[CETRAFS_MAX_READER_NODES];
-    u8 ns_pad[CETRAFS_INODE_NS_BYTES - 108 - 4 * CETRAFS_MAX_READER_NODES];
+
+    /* A STAMP (like dirent_seq: unique per write, only equality asked)
+     * written by every publish that changes xattr_block -- a new block
+     * or the last xattr removed. A lockless reader copies the block the
+     * record names and then requires the record unchanged; xattr_block
+     * alone cannot say so, because the block number cycles: freed by a
+     * remove, taken by another file, freed, taken again by this one --
+     * and the copy is the other file's (audit 2026-11-11 X4). 0 on a
+     * record that never had one. Format 0x000A. */
+    __le64 xattr_seq;
+    u8 ns_pad[CETRAFS_INODE_NS_BYTES - 116 - 4 * CETRAFS_MAX_READER_NODES];
 
     /* ===== SECTOR 1: the FILE DOMAIN ===== */
     __le64 fd_ino;                /* identity echo of .ino */
