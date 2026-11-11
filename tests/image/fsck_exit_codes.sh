@@ -55,6 +55,9 @@ grep -q "holding before the block group pass" <<<"$OUT" && ! grep -q "is mounted
     { fail "2 setup: the walk did not start with the volume free: $(grep -m2 -E 'ERR|hold' <<<"$OUT")"; ct_exit; }
 [ "$rc" = 3 ] && grep -q "a node mounted it while fsck walked it" <<<"$OUT" && pass "2: no verdict, exit 3" ||
     fail "2: exit $rc: $(tail -1 <<<"$OUT")"
+# The re-check can wait a probe window of its own: it says so (review E3).
+grep -q "walk done; checking again that no node mounted" <<<"$OUT" &&
+    pass "2: the second probe is announced, not a silent pause" || fail "2: the re-check ran unannounced"
 "$NPOKE" "$DEV" 1 0 00 0 >/dev/null
 
 log "3: both rows registered and departed cleanly"

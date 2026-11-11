@@ -4713,8 +4713,13 @@ int main(int argc, char **argv)
             char label[CETRAFS_NODE_LABEL_LEN + 1] = {0};
             long long age = 0;
             uint32_t row = 0;
-            int lp = cetrafs_find_live_peer(dev, &row, label, sizeof(label), &age);
+            int lp;
 
+            /* The probe may wait its window again: say why, so the
+             * second pause is not read as a hang (review E3). */
+            fprintf(stderr, "cetrafs fsck: walk done; checking again that no node mounted %s meanwhile\n", dev);
+            fflush(stderr);
+            lp = cetrafs_find_live_peer(dev, &row, label, sizeof(label), &age);
             if (lp) {
                 fprintf(stderr,
                         lp < 0 ? "ERR: %s: its Node Registry could not be read again after the walk -- no verdict\n"
