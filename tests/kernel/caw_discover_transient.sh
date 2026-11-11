@@ -38,8 +38,10 @@ lsmod | grep -q '^scsi_debug ' && { skip "scsi_debug is already loaded (someone 
 command -v dmsetup >/dev/null || { skip "no dmsetup"; ct_exit; }
 
 modprobe scsi_debug dev_size_mb=600 sector_size=512 num_tgts=1 max_luns=1 || { skip "scsi_debug would not load"; ct_exit; }
-unload_sdebug() { dmsetup remove ctcawd1 2>/dev/null || true; dmsetup remove ctcawd2 2>/dev/null || true; udevadm settle 2>/dev/null || true; modprobe -r scsi_debug 2>/dev/null || true; }
-trap 'unload_sdebug' EXIT
+# Torn down by the harness, last registered first: the maps, then the disk.
+ct_track cmd "udevadm settle; modprobe -r scsi_debug"
+ct_track dm ctcawd1
+ct_track dm ctcawd2
 udevadm settle 2>/dev/null || true
 SD=""
 for d in /sys/block/sd*; do
