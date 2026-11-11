@@ -22,6 +22,14 @@
 #  3. a device without discard: the hand-back still happens (discard is
 #     best effort, releasing is not), fstrim says "not supported", and
 #     the controls file says the device has none.
+#  4. a FITRIM claim inside an emptied group while the heartbeat tries
+#     to release it: the release's pre-check sees the claim's debit (an
+#     accrued delta, not yet on the descriptor) and leaves the group
+#     alone, so the claim gives its run back instead of leaking it as
+#     "the BG left this node" (review U4). The group is handed back
+#     once the trim is done.
+#     DISCRIMINATION (2026-11-11, the pre-check reading the raw
+#     descriptor count again): the run is leaked.
 # fsck clean after each.
 set -euo pipefail
 . "$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)/lib/harness.sh"
@@ -108,6 +116,37 @@ echo "discard=on" >"$PROC/controls"
 
 ct_umount "$MNT"
 OUT="$(ct_fsck "$DEV" 2>&1)" && pass "1-2: fsck clean" || fail "1-2: fsck: $(grep -m3 -E '^ERR' <<<"$OUT")"
+
+# ------------------------------------------------------------------- 4
+log "4: a FITRIM claim in an emptied group, racing its release"
+if command -v fstrim >/dev/null && [ -w /sys/module/cetrafs/parameters/trim_discard_stall_ms ]; then
+    ct_mount "$DEV" "$MNT"
+    ct_param_set bg_release_off 1 # the group goes empty and stays ours
+    mkdir "$MNT/bulk"
+    for i in 1 2 3; do dd if=/dev/urandom of="$MNT/bulk/f$i" bs=1M count=32 conv=fsync status=none; done
+    sync
+    rm -rf "$MNT/bulk"
+    sync
+    L0="$(info trim_leaked_blocks)"
+    MARK="$(dmesg_mark)"
+    ct_param_set trim_discard_stall_ms 3000
+    fstrim -m 4M "$MNT" >/dev/null 2>&1 & # group 0 has no 4 MiB run: the claim is in the emptied one
+    TPID=$!
+    sleep 1
+    # A release that drains the group holds it drained across the claim's
+    # give-back -- the window is otherwise a few milliseconds wide.
+    ct_param_set bg_release_drain_stall_ms 4000
+    ct_param_set bg_release_off 0 # the next ticks try to release it, under the claim
+    sleep 3
+    ct_param_set trim_discard_stall_ms 0
+    wait "$TPID" || true
+    [ "$(info trim_leaked_blocks)" = "$L0" ] && pass "4: the claim gave its run back -- the release left the group alone" ||
+        fail "4: $(($(info trim_leaked_blocks) - L0)) block(s) leaked: the release drained the group under the claim"
+    wait_for 20 "dmesg_since '$MARK' | grep -q 'handed back from ZG'" &&
+        pass "4: and the group was handed back once the trim was done" ||
+        fail "4 setup: the emptied group was never handed back -- the release never ran"
+    ct_umount "$MNT"
+fi
 
 # ------------------------------------------------------------------- 3
 log "3: a device that takes no discards"

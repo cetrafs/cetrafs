@@ -3658,9 +3658,11 @@ int cetrafs_bg_release_empty(struct super_block *sb, u32 zg_id, u32 *out_release
          * cetrafs_bg_release_bitmap_ready() decides, under the drain.
          */
         if (!cetrafs_bg_release_skip_empty_check) {
-            struct cetrafs_bg_geom pre;
-
-            if (cetrafs_read_bg_geom(sb, b, &pre) == 0 && pre.free_data_blocks != pre.data_block_count)
+            /* With our accrued delta: a FITRIM claim's debit is one, and
+             * the raw descriptor count does not show it -- the group
+             * was drained under the claim, and the claim, finding it
+             * gone, leaked its whole run (review U4). */
+            if (cetrafs_bg_data_block_stats(sb, b, &total, &free) == 0 && free != total)
                 continue; /* obviously in use -- never take it out of reach */
         }
 
