@@ -1581,9 +1581,11 @@ static void cetrafs_node_reap_repair_claim(struct super_block *sb, u32 idx, cons
  *
  * A LEASE, not a flag: the repairer renews hb_seq on a timer, so a
  * repairer that was killed stops blocking the volume as soon as a probe
- * sees its row stand still. A row whose checksum does not
- * verify is ignored -- garbage must not be able to make a volume
- * unmountable.
+ * sees its row stand still. A row whose checksum does not verify is
+ * NOT ignored: cetrafs_read_node_entry() retries a tear and then marks
+ * the volume corrupt, so the mount is refused as damage -- a repairer's
+ * row read bad can never let a mount through
+ * (tests/kernel/repair_claim_bad_row.sh).
  *
  * Fails CLOSED on an I/O error: not being able to read the registry is
  * not the same as there being no repairer in it.
