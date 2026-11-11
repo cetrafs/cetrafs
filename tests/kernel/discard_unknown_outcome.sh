@@ -25,12 +25,19 @@
 #  E. FITRIM, unknown: the kept run's bits are on the DEVICE when fstrim
 #     returns, not only in this node's cache (U2) -- a fence before
 #     writeback would otherwise hand a peer a bitmap reading FREE.
+#  F. hand-back, unknown, and the group's pending mark cannot be stored
+#     (review U5): the mount stops. Unmarked, the drained group reads as
+#     neither ours nor pending, nothing revisits it, and its Zone Group
+#     could go to the pool with an UNMAP still outstanding inside it.
+#
+# DISCRIMINATION (2026-11-11, the failed store only logged again): F
+# fails, the mount going on with the group drained and unmarked.
 set -euo pipefail
 . "$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)/lib/harness.sh"
 require_root
 require_module
 command -v fstrim >/dev/null || { skip "no fstrim(8)"; ct_exit; }
-for p in discard_fail_unknown discard_fail_definite; do
+for p in discard_fail_unknown discard_fail_definite discard_pending_store_fail; do
     [ -w "/sys/module/cetrafs/parameters/$p" ] || { skip "$p is missing"; ct_exit; }
 done
 PP="$(ct_helper pending_poke)"
@@ -226,4 +233,18 @@ PY
 [ "$SET" = 2048 ] && pass "E: all 2048 bits of the kept run read set on the device itself" ||
     fail "E: the device shows $SET of the kept run's 2048 bits set -- the hold is only in this node's cache"
 ct_umount "$MNT"
+
+# ------------------------------------------------------------------- F
+log "F: hand-back, unknown, and the pending mark cannot be stored"
+ct_param_set discard_pending_store_fail 1
+handback discard_fail_unknown 1000000
+ct_param_set discard_pending_store_fail 0
+[ "$ERRS" -ge 1 ] || { fail "F setup: no hand-back discard failed"; ct_exit; }
+grep -q "cannot record its outstanding discard" <<<"$LOG" ||
+    { fail "F setup: the failed store was never reached"; ct_exit; }
+grep -q "STOPPED" <<<"$LOG" && pass "F: a pending mark that cannot be stored stops the mount" ||
+    fail "F: the mount went on with a drained group no pass will revisit"
+grep -q "handed back from ZG" <<<"$LOG" && fail "F: the group was handed back over an UNMAP that may still land" ||
+    pass "F: and the group was not handed back"
+ct_umount "$MNT" || umount -l "$MNT" || true
 ct_exit

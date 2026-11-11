@@ -5269,20 +5269,36 @@ bool cetrafs_sb_bg_discard_pending(struct super_block *sb, u32 bg_id)
     return sbi && xa_load(&sbi->discard_pending, bg_id);
 }
 
+/* TEST ONLY: the next store of a pending discard mark fails (review U5). */
+static bool cetrafs_discard_pending_store_fail;
+cetrafs_test_param(discard_pending_store_fail, cetrafs_discard_pending_store_fail, bool, 0644);
+MODULE_PARM_DESC(discard_pending_store_fail, "TEST ONLY: the next pending-discard mark cannot be stored");
+
 /* Mark (on) or clear a Block Group's outstanding discard. Returns true
- * when the call changed it; a failed store leaves it unmarked and says
- * so, and the caller keeps the group drained either way this pass. */
+ * when the call changed it.
+ *
+ * The mark is the only thing keeping an UNMAP that may still land out of
+ * every allocator: unmarked, the drained group reads as neither ours nor
+ * pending, no release pass revisits it, and its Zone Group can go to the
+ * pool with it inside. So a mark that cannot be stored is a state this
+ * mount cannot record, and stops it (ERRORS.md; review U5). */
 bool cetrafs_sb_set_bg_discard_pending(struct super_block *sb, u32 bg_id, bool on)
 {
     struct cetrafs_sb_info *sbi = sb->s_fs_info;
 
     if (on) {
-        int ret = xa_insert(&sbi->discard_pending, bg_id, xa_mk_value(1), GFP_NOFS);
+        int ret;
 
+        if (cetrafs_discard_pending_store_fail) {
+            cetrafs_discard_pending_store_fail = false;
+            ret = -ENOMEM;
+        } else {
+            ret = xa_insert(&sbi->discard_pending, bg_id, xa_mk_value(1), GFP_NOFS);
+        }
         if (ret == -EBUSY)
             return false;
         if (ret) {
-            pr_err("BG %u: cannot record its outstanding discard (%d)\n", bg_id, ret);
+            cetrafs_sb_fatal(sb, "BG %u: cannot record its outstanding discard (%d)", bg_id, ret);
             return false;
         }
         atomic_inc(&sbi->discard_pending_count);
