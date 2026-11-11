@@ -1717,6 +1717,18 @@ int main(int argc, char **argv)
                     inodes, (uint64_t) cetrafs_le64(sb.inode_table_blocks));
             return 1;
         }
+        /* Exactly the size its count needs, which is all mkfs ever
+         * writes and nothing (grow included) changes. The bitmap is
+         * read whole into memory below, sized by this field: a
+         * CRC-valid superblock naming a larger bitmap that still fits
+         * the volume had fsck allocate and read terabytes (audit
+         * 2026-11-11 F2, tests/image/fsck_inode_bmap_size.sh). */
+        if (cetrafs_le64(sb.inode_bmap_blocks) != cetrafs_calc_inode_bmap_blocks(inodes)) {
+            fprintf(stderr, "ERR: inode_bmap_blocks %" PRIu64 ", but %" PRIu64 " inodes need exactly %" PRIu64
+                            " -- not a layout mkfs writes\n",
+                    (uint64_t) cetrafs_le64(sb.inode_bmap_blocks), inodes, (uint64_t) cetrafs_calc_inode_bmap_blocks(inodes));
+            return 1;
+        }
         if (!cetrafs_le32(sb.node_table_count) || cetrafs_le32(sb.node_table_count) > cetrafs_le64(sb.node_table_blocks)) {
             fprintf(stderr, "ERR: node_table_count %u does not fit node_table_blocks %" PRIu64 " -- it will not mount\n",
                     cetrafs_le32(sb.node_table_count), (uint64_t) cetrafs_le64(sb.node_table_blocks));
