@@ -15,8 +15,10 @@
 #include <linux/mpage.h>
 #include <linux/pagemap.h>
 /* struct folio_batch moved out of pagevec.h (7.1); build against either,
- * as ioutil.c does. */
-#if __has_include(<linux/folio_batch.h>)
+ * as ioutil.c does. A version test, not __has_include(): sparse cannot
+ * parse that, falls through to pagevec.h, and endian-check stops. */
+#include <linux/version.h>
+#if LINUX_VERSION_CODE >= KERNEL_VERSION(7, 1, 0)
 #include <linux/folio_batch.h>
 #else
 #include <linux/pagevec.h>

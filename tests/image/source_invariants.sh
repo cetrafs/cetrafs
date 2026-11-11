@@ -1080,7 +1080,7 @@ printf 'static int f(void)\n{\n    cetrafs_extent_t *flat = NULL;\n    int r = c
 # did, while ioutil.c had the guard (audit 2026-11-05, section 3).
 log "checking every pagevec.h include falls back from folio_batch.h"
 pagevec_unguarded() {
-    awk '/__has_include\(<linux\/folio_batch\.h>\)/ { g = NR }
+    awk '/__has_include\(<linux\/folio_batch\.h>\)|LINUX_VERSION_CODE >= KERNEL_VERSION\(7, 1, 0\)/ { g = NR }
          /^#include <linux\/pagevec\.h>/ && !(g && NR - g <= 3) { print FILENAME ":" FNR }' "$@"
 }
 PV="$(for f in "$K"/*.c "$K"/*.h; do pagevec_unguarded "$f"; done | sed "s|$K/||")"
