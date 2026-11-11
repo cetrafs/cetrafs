@@ -821,16 +821,28 @@ int cetrafs_caw(struct block_device *bdev, u64 lba, unsigned int nblocks, const 
      * retry still happens -- one level up, and informed.
      */
     {
-        unsigned int attempt;
-        int ret = -EOPNOTSUPP;
+        int ret;
 
-        for (attempt = 0; attempt < 2; attempt++) {
-            sdev = cetrafs_dmpath_sdev(bdev, killable);
-            if (IS_ERR(sdev))
-                return PTR_ERR(sdev); /* -EINTR: interrupted waiting for a path, nothing issued */
-            if (!sdev)
-                break;
-
+        /* One command, no loop: every outcome below returns. (It sat in
+         * a two-attempt loop that could never iterate, under a comment
+         * promising a retry it did not do -- the retry is one level up,
+         * informed by the re-read; audit 2026-11-11 C5.) */
+        sdev = cetrafs_dmpath_sdev(bdev, killable);
+        if (IS_ERR(sdev))
+            return PTR_ERR(sdev); /* -EINTR: interrupted waiting for a path, nothing issued */
+        if (!sdev) {
+            /* A dm node this mount found CAW on, with no path to issue
+             * over right now: a transport failure, nothing issued. It
+             * returned -EOPNOTSUPP -- "this device has no CAW" -- which
+             * every caller passed up as such, and creat(2) reported
+             * "Operation not supported" for a path outage (C6). A node
+             * that is not dm falls through to the backends below. */
+            if (!strncmp(bdev->bd_disk->disk_name, "dm-", 3)) {
+                pr_warn_ratelimited("CAW lba=%llu: no path of %s to issue it over\n", (unsigned long long) lba,
+                                    bdev->bd_disk->disk_name);
+                return -EIO;
+            }
+        } else {
             if (cetrafs_caw_fail_path_once) { /* test knob, see its MODULE_PARM_DESC */
                 cetrafs_caw_fail_path_once = false;
                 ret = -ETIMEDOUT;
@@ -864,11 +876,8 @@ int cetrafs_caw(struct block_device *bdev, u64 lba, unsigned int nblocks, const 
              * and re-issuing the same compare on the next path after one
              * that landed MISCOMPAREs -- which the layer above reads as a
              * lost race and answers by running the mutator again. */
-            if (ret == -ETIMEDOUT || ret == -EIO)
-                return -ETIMEDOUT;
+            return -ETIMEDOUT;
         }
-        if (ret != -EOPNOTSUPP)
-            return ret;
     }
 
     if (!strncmp(bdev->bd_disk->disk_name, "nvme", 4))

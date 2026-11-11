@@ -631,6 +631,12 @@ int cetrafs_dmpath_probe(struct block_device *bdev, struct scsi_device **out)
  * link -- is handled by cetrafs_dmpath_failed() below, which caw.c calls
  * on a transport error so the rotation is driven by the failure itself.
  */
+/* TEST ONLY: the next path lookup finds no path, as an outage of every
+ * path would (tests/kernel/dmpath_no_path_eio.sh). */
+static bool cetrafs_dmpath_no_path_once;
+cetrafs_test_param(dmpath_no_path_once, cetrafs_dmpath_no_path_once, bool, 0644);
+MODULE_PARM_DESC(dmpath_no_path_once, "TEST ONLY: the next dm path lookup finds no path");
+
 struct scsi_device *cetrafs_dmpath_sdev(struct block_device *bdev, bool killable)
 {
     struct cetrafs_dmpath_entry *slot = NULL, *free_slot = NULL, tmp = {0};
@@ -642,6 +648,8 @@ struct scsi_device *cetrafs_dmpath_sdev(struct block_device *bdev, bool killable
     /* A partition addresses from bd_start_sect; every path below
      * addresses from 0 (see cetrafs_caw_get_sdev()). */
     if (!bdev || !bdev->bd_disk || bdev_is_partition(bdev))
+        return NULL;
+    if (unlikely(READ_ONCE(cetrafs_dmpath_no_path_once)) && xchg(&cetrafs_dmpath_no_path_once, false))
         return NULL;
 
 retry:

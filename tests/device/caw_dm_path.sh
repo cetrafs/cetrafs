@@ -140,10 +140,12 @@ rmmod cetrafs 2>/dev/null
 
 echo "== a path failure must be ABSORBED, not surfaced"
 # A second real path to one LUN cannot be fabricated here, so the
-# transport error is injected (caw_fail_path_once). What matters is the
-# behaviour around it: the failing path is dropped, a path is resolved
-# again, and the SAME operation is retried -- so the caller never sees
-# the error. Without the retry in cetrafs_caw(), this create fails EIO.
+# transport error is injected (caw_fail_path_once, reported as a
+# timeout). What matters is the behaviour around it: the failing path is
+# dropped, cetrafs_cas_region_seeded_impl() re-reads the region to learn
+# whether the swap landed, and retries it over a newly resolved path --
+# so the caller never sees the error. cetrafs_caw() itself issues once
+# and never retries (audit 2026-11-11 C5).
 unload && insmod "$ROOT/kmod/cetrafs.ko" 2>/dev/null
 dmesg -C >/dev/null 2>&1
 if mount -t cetrafs /dev/mapper/cawid "$MNT" 2>/dev/null; then
