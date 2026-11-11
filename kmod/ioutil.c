@@ -24,6 +24,7 @@
  */
 #define pr_fmt(fmt) "cetrafs: " fmt
 
+#include <linux/random.h>
 #include <linux/blkdev.h>
 #include <linux/buffer_head.h>
 #include <linux/version.h>
@@ -815,9 +816,30 @@ void cetrafs_forget_block(struct super_block *sb, sector_t block)
  * logical sector and cannot tear. These span all eight
  * sectors of their block, so they can.
  */
+/* TEST ONLY: leave an extent block's eh_generation as it is (the
+ * control for tests/kernel/journal_redo_leaf_aba.sh). */
+static bool cetrafs_ext_gen_stamp_off;
+cetrafs_test_param(ext_gen_stamp_off, cetrafs_ext_gen_stamp_off, bool, 0644);
+MODULE_PARM_DESC(ext_gen_stamp_off, "TEST ONLY: do not stamp a new eh_generation on each extent-block write");
+
 void cetrafs_blk_tail_stamp(struct buffer_head *bh, u32 magic)
 {
     cetrafs_blk_tail_t *tail = (cetrafs_blk_tail_t *) (bh->b_data + CETRAFS_BLK_TAIL_OFF);
+
+    /*
+     * An extent leaf or index block carries a fresh eh_generation every
+     * time it is written, so its bytes never recur. Journal redo decides
+     * "the target write never landed" by the target's CRC alone
+     * (cetrafs_journal_judge()), and a tree rebuild writes a byte-
+     * identical block elsewhere whenever the entries come out the same:
+     * a leaf rebuilt into a block a dead node's entry still names read
+     * as that entry's "before" image, and the redo put the dead node's
+     * leaf over the live one -- an extent over blocks the survivor had
+     * freed (audit 2026-11-11 J1). Random, not a counter: nothing to
+     * persist, and no sequence a restart or a peer replays.
+     */
+    if ((magic == CETRAFS_LEAF_TAIL_MAGIC || magic == CETRAFS_INDEX_TAIL_MAGIC) && !READ_ONCE(cetrafs_ext_gen_stamp_off))
+        ((cetrafs_extent_hdr_t *) bh->b_data)->eh_generation = cetrafs_cpu_to_le32(get_random_u32());
 
     tail->magic = cetrafs_cpu_to_le32(magic);
     tail->crc = cetrafs_cpu_to_le32(~crc32c(~0U, bh->b_data, CETRAFS_BLK_TAIL_OFF));

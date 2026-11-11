@@ -1252,7 +1252,8 @@ typedef struct {
     __le16 eh_entries;         /* number of valid entries after header */
     __le16 eh_max;             /* max entries that fit after header */
     __le16 eh_depth;           /* 0 = leaf, >0 = index */
-    __le32 eh_generation;      /* for tree split/merge */
+    __le32 eh_generation;      /* external leaf/index blocks: fresh on every write, so a
+                                * block's bytes never recur (journal redo's guard); 0 inline */
 } CETRA_PACKED cetrafs_extent_hdr_t;
 
 typedef struct {
