@@ -265,6 +265,42 @@ static unsigned int cetrafs_xattr_pause_after_publish_ms;
 cetrafs_test_param(xattr_pause_after_publish_ms, cetrafs_xattr_pause_after_publish_ms, uint, 0644);
 MODULE_PARM_DESC(xattr_pause_after_publish_ms, "TEST ONLY: one-shot pause after a new xattr block is published");
 
+/* TEST ONLY: hold a setxattr between its first peer-user check and the
+ * rest of the operation (audit 2026-11-11 X2). */
+static unsigned int cetrafs_xattr_set_stall_ms;
+cetrafs_test_param(xattr_set_stall_ms, cetrafs_xattr_set_stall_ms, uint, 0644);
+MODULE_PARM_DESC(xattr_set_stall_ms, "TEST ONLY: one-shot pause after setxattr's first peer-user check");
+
+/*
+ * -ETXTBSY if a live peer holds this file's lock or has it open; 0 if
+ * not. Asked at the start of a setxattr and AGAIN immediately before
+ * each of its publishes (audit 2026-11-11 X2): the operation does a
+ * block allocation, a block write and a flush between the two, and a
+ * peer's open -- which takes no namespace lock -- landing in that time
+ * was allowed to have its file's metadata rewritten under it, the access
+ * rule's one-writer guarantee broken. The open publishes in the record's
+ * lock sector and this publishes in its namespace sector, so the two
+ * cannot be one compare-and-swap; what is left is the microseconds from
+ * this re-check to the swap.
+ */
+static int cetrafs_xattr_peer_user(struct inode *inode)
+{
+    struct super_block *sb = inode->i_sb;
+    bool blocked = false, reader = false;
+    u32 my_node_id = 0;
+    int ret;
+
+    if (!S_ISREG(inode->i_mode))
+        return 0;
+    ret = cetrafs_sb_get_node_id(sb, &my_node_id);
+    if (ret)
+        return ret;
+    ret = cetrafs_lock_foreign_user_exists(sb, inode->i_ino, my_node_id, &blocked, &reader);
+    if (ret)
+        return ret;
+    return blocked || reader ? -ETXTBSY : 0;
+}
+
 /* 'now': the ctime to stamp, in seconds; 0 stamps none. */
 static int cetrafs_xattr_set_locked(struct inode *inode, const char *name, const void *value, size_t size, int flags,
                                     u64 now)
@@ -298,30 +334,20 @@ static int cetrafs_xattr_set_locked(struct inode *inode, const char *name, const
      * an xattr set rewrites the whole record, racing the holder's own
      * in-flight size/extent updates. Same refusal (and same stale-holder
      * journal-replay-then-proceed posture) as unlink and setattr. */
-    if (S_ISREG(inode->i_mode)) {
-        u32 my_node_id = 0;
-        bool blocked = false;
-
-        ret = cetrafs_sb_get_node_id(sb, &my_node_id);
-        if (ret)
-            return ret;
-        /* The LOCK is not the only mark a live writer leaves. A node
-         * that has SUSPENDED this file's automatic lock (lock.c, the
-         * handoff window) is still writing it through an open fd and
-         * publishes itself only in read_open_nodes -- so asking about
-         * the lock alone lets this xattr set rewrite the record out from
-         * under exactly the in-flight updates described above. Refuse on
-         * a peer READER too, as unlink, rename, link and truncate
-         * already do: rewriting a whole record is not something to do
-         * under any peer that has the file open. */
-        bool reader = false;
-
-        ret = cetrafs_lock_foreign_user_exists(sb, inode->i_ino, my_node_id, &blocked, &reader);
-        if (ret)
-            return ret;
-        if (blocked || reader)
-            return -ETXTBSY;
-    }
+    /* The LOCK is not the only mark a live writer leaves. A node that
+     * has SUSPENDED this file's automatic lock (lock.c, the handoff
+     * window) is still writing it through an open fd and publishes
+     * itself only in read_open_nodes -- so asking about the lock alone
+     * lets this xattr set rewrite the record out from under exactly the
+     * in-flight updates described above. Refuse on a peer READER too, as
+     * unlink, rename, link and truncate already do: rewriting a whole
+     * record is not something to do under any peer that has the file
+     * open. Asked again right before each publish below (rule 15). */
+    ret = cetrafs_xattr_peer_user(inode);
+    if (ret)
+        return ret;
+    if (READ_ONCE(cetrafs_xattr_set_stall_ms))
+        msleep(xchg(&cetrafs_xattr_set_stall_ms, 0)); /* TEST ONLY: see the parameter */
 
     cetrafs_invalidate_raw_inode(sb, inode->i_ino);
     ret = cetrafs_read_raw_inode(sb, inode->i_ino, &raw);
@@ -374,6 +400,8 @@ static int cetrafs_xattr_set_locked(struct inode *inode, const char *name, const
          * it back. */
         if (!ret)
             ret = cetrafs_publish_flush(sb);
+        if (!ret)
+            ret = cetrafs_xattr_peer_user(inode);
         if (ret) {
             cetrafs_free_data_block(sb, lba);
             return ret;
@@ -399,6 +427,11 @@ static int cetrafs_xattr_set_locked(struct inode *inode, const char *name, const
         return 0;
     }
 
+    /* The peer-user question again, before the claim: from here to the
+     * block write is memory only (X2). */
+    ret = cetrafs_xattr_peer_user(inode);
+    if (ret)
+        return ret;
     bh = cetrafs_blk_tail_bread(sb, cetrafs_le64(raw.xattr_block), CETRAFS_XATTR_TAIL_MAGIC, "xattr");
     if (!bh)
         return -EIO;
