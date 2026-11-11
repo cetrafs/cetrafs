@@ -2894,6 +2894,16 @@ int main(int argc, char **argv)
         const cetrafs_extent_hdr_t *lh = (const cetrafs_extent_hdr_t *) rootleaf;
         const cetrafs_extent_t *le = (const cetrafs_extent_t *) (rootleaf + sizeof(*lh));
 
+        /* An address off the disk, checked before it aims a read: past
+         * the device it was a short read, "could not examine" (exit 3)
+         * about a volume whose root is simply damaged (audit 2026-11-11
+         * F5, tests/kernel/fsck_root_leaf_address.sh). */
+        if (leaf_lba < cetrafs_le64(sb.bg_regions_start) || leaf_lba >= total_blocks) {
+            fprintf(stderr, "ERR: root external extent leaf block %" PRIu64 " is outside the data area [%" PRIu64
+                            ",%" PRIu64 ")\n",
+                    leaf_lba, (uint64_t) cetrafs_le64(sb.bg_regions_start), total_blocks);
+            return 1;
+        }
         pread_all(fd, rootleaf, sizeof(rootleaf), (off_t) leaf_lba * CETRAFS_BLOCK_SIZE);
         if (cetrafs_le16(lh->eh_magic) != CETRAFS_EXT_MAGIC || cetrafs_le16(lh->eh_entries) < 1) {
             fprintf(stderr, "ERR: root external extent leaf (block %" PRIu64 ") invalid\n", leaf_lba);

@@ -50,7 +50,11 @@ static void wr(int fd, const void *b, size_t n, off_t o)
 
 int main(int argc, char **argv)
 {
-    if (argc != 4) {
+    /* `index0` as a 5th argument: the record is at depth >= 1 and its
+     * inline index 0's LEAF address is what moves (fsck_root_leaf_address.sh). */
+    int index0 = argc == 5 && strcmp(argv[4], "index0") == 0;
+
+    if (argc != 4 && !index0) {
         fprintf(stderr, "usage: %s <backing-file> <ino> <phys-lba|inode_table|sb_table|bg_seg_first|bg_seg_tail|device_end>\n", argv[0]);
         fprintf(stderr, "       points inode <ino>'s inline extent 0 at that physical block\n");
         return 2;
@@ -111,6 +115,19 @@ int main(int argc, char **argv)
 
     rd(fd, &rec, sizeof(rec), rec_off);
 
+    if (index0) {
+        if (cetrafs_le16(rec.eh.eh_depth) == 0 || cetrafs_le16(rec.eh.eh_entries) == 0) {
+            fprintf(stderr, "ino %" PRIu64 " has depth=%u entries=%u -- no inline index 0 to move\n", ino,
+                    cetrafs_le16(rec.eh.eh_depth), cetrafs_le16(rec.eh.eh_entries));
+            return 3;
+        }
+        rec.et.idx[0].ei_leaf_lo = cetrafs_cpu_to_le32((uint32_t) (target & 0xffffffffu));
+        rec.et.idx[0].ei_leaf_hi = cetrafs_cpu_to_le16((uint16_t) (target >> 32));
+        cetrafs_inode_stamp_crcs_us(&rec);
+        wr(fd, &rec, sizeof(rec), rec_off);
+        printf("extent_phys_poke: ino %" PRIu64 " index0 leaf -> %" PRIu64 ", CRCs restamped\n", ino, target);
+        return 0;
+    }
     if (cetrafs_le16(rec.eh.eh_depth) != 0 || cetrafs_le16(rec.eh.eh_entries) == 0) {
         /* The caller wanted an inline extent moved and there is none:
          * say so rather than poking a slot that means nothing, which
