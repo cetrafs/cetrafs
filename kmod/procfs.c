@@ -75,6 +75,11 @@ static unsigned int cetrafs_bg_sweep_min_secs = CETRAFS_BG_SWEEP_MIN_SECS;
 module_param_named(bg_sweep_min_secs, cetrafs_bg_sweep_min_secs, uint, 0644);
 MODULE_PARM_DESC(bg_sweep_min_secs, "minimum seconds between foreign BG descriptor sweeps (0 = every info read)");
 
+/* TEST ONLY: the cluster file's staleness check of row N-1 fails. */
+static unsigned int cetrafs_cluster_stale_fail_row;
+cetrafs_test_param(cluster_stale_fail_row, cetrafs_cluster_stale_fail_row, uint, 0644);
+MODULE_PARM_DESC(cluster_stale_fail_row, "TEST ONLY: the cluster file cannot judge row N-1's staleness (0 = off)");
+
 static int cetrafs_proc_info_show(struct seq_file *m, void *v)
 {
     struct super_block *sb = m->private;
@@ -464,9 +469,10 @@ static int cetrafs_proc_cluster_show(struct seq_file *m, void *v)
             continue;
         }
 
-        ret = cetrafs_node_is_stale(sb, idx, &stale);
-        if (ret)
-            return ret;
+        /* Per row, like the read above: one row whose staleness cannot
+         * be judged cost the operator every row after it, the file
+         * ending in an error (audit 2026-11-11 P2). */
+        ret = READ_ONCE(cetrafs_cluster_stale_fail_row) == idx + 1 ? -EIO : cetrafs_node_is_stale(sb, idx, &stale);
 
         u = ne.node_uuid;
         seq_printf(m,
@@ -480,9 +486,10 @@ static int cetrafs_proc_cluster_show(struct seq_file *m, void *v)
                    : cetrafs_le32(ne.departure) == CETRAFS_NODE_DEPART_DEAD ? "dead"
                    : cetrafs_le32(ne.departure) == CETRAFS_NODE_DEPART_NONE ? "none"
                                                                             : "invalid",
-                   stale ? "yes" : "no",
+                   ret ? "unknown" : stale ? "yes" : "no",
                    idx == my_node_id ? " (this node)" : "");
     }
+    ret = 0;
 
     /* The grow gate, surfaced: yes iff every REGISTERED row advertises
      * live-grow support. An operator reads it to know whether a live
