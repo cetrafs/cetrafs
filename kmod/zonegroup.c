@@ -1467,8 +1467,10 @@ static int cetrafs_zg_try_release_one(struct super_block *sb, u32 zg_id, u32 my_
             goto out_unlock;
         }
     for (b = 0; b < nbg; b++)
-        if (cetrafs_sb_bg_owner(sb, b) == zg_id)
-            cetrafs_sb_drain_bg(sb, b);
+        if (cetrafs_sb_bg_owner(sb, b) == zg_id && !cetrafs_sb_drain_bg(sb, b)) {
+            ret = 0; /* a FITRIM holds a run in a member: not empty */
+            goto out_undrain;
+        }
     cetrafs_flush_dirty_free_counts(sb);
 
     ret = cetrafs_zg_is_fully_empty(sb, zg_id, &empty);

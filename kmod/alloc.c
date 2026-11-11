@@ -3674,7 +3674,8 @@ int cetrafs_bg_release_empty(struct super_block *sb, u32 zg_id, u32 *out_release
         /* Take it out of the allocator's reach first, then look. The
          * other order leaves a window in which this node allocates into
          * a Block Group it is in the middle of giving away. */
-        cetrafs_sb_drain_bg(sb, b);
+        if (!cetrafs_sb_drain_bg(sb, b))
+            continue; /* a FITRIM holds a run in it: not empty, keep it */
         {
             unsigned int pause = xchg(&cetrafs_bg_release_drain_stall_ms, 0);
 
@@ -4249,7 +4250,7 @@ int cetrafs_trim_claim_next(struct super_block *sb, u32 bg_id, u64 *cursor, u64 
     cetrafs_bg_adjust_free_blocks(sb, bg_id, -(s64) len);
     cetrafs_shadow_set(sb, run->lba, len, "trim_claim");
     cetrafs_resv_publish(sb, &run->span, run->lba, (u32) len);
-    cetrafs_sb_set_trim_claim(sb, run->lba, len);
+    cetrafs_sb_set_trim_claim(sb, bg_id, run->lba, len);
     run->claimed = true;
 out:
     cetrafs_sb_alloc_unlock(sb);
@@ -4317,7 +4318,7 @@ void cetrafs_trim_release(struct super_block *sb, struct cetrafs_trim_run *run, 
     cetrafs_bg_adjust_free_blocks(sb, run->bg_id, (s64) run->count);
     cetrafs_shadow_clear(sb, run->lba, run->count, "trim_release");
 out:
-    cetrafs_sb_set_trim_claim(sb, 0, 0);
+    cetrafs_sb_set_trim_claim(sb, 0, 0, 0);
     cetrafs_resv_unpublish(sb, &run->span);
     run->claimed = false;
     cetrafs_sb_alloc_unlock(sb);

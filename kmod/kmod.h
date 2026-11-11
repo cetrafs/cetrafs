@@ -360,7 +360,7 @@ void cetrafs_sb_set_defrag_enabled(struct super_block *sb, bool on);
 bool cetrafs_sb_discard_enabled(struct super_block *sb);
 void cetrafs_sb_set_discard_enabled(struct super_block *sb, bool on);
 struct mutex *cetrafs_sb_trim_mutex(struct super_block *sb);
-void cetrafs_sb_set_trim_claim(struct super_block *sb, u64 lba, u64 count);
+void cetrafs_sb_set_trim_claim(struct super_block *sb, u32 bg_id, u64 lba, u64 count);
 bool cetrafs_sb_trim_holds(struct super_block *sb, u64 lba);
 /* Block Groups kept drained after a hand-back discard of unknown outcome. */
 bool cetrafs_sb_bg_discard_pending(struct super_block *sb, u32 bg_id);
@@ -910,7 +910,7 @@ void cetrafs_bg_refresh_owner_map(struct super_block *sb);
  * callee -- the hand-back discard budget runs per pass (discard.c). */
 int cetrafs_bg_release_empty(struct super_block *sb, u32 zg_id, u32 *out_released, u32 *out_deferred,
                              unsigned long *pass_started);
-void cetrafs_sb_drain_bg(struct super_block *sb, u32 bg_id);
+bool cetrafs_sb_drain_bg(struct super_block *sb, u32 bg_id);
 void cetrafs_sb_undrain_bg(struct super_block *sb, u32 bg_id);
 
 /* Iterate every Block Group this node may allocate from. Flat: it does

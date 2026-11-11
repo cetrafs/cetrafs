@@ -150,6 +150,46 @@ if command -v fstrim >/dev/null && [ -w /sys/module/cetrafs/parameters/trim_disc
         pass "4: and the group was handed back once the trim was done" ||
         fail "4 setup: the emptied group was never handed back -- the release never ran"
     ct_umount "$MNT"
+
+    # --------------------------------------------------------------- 5
+    # 4's release sees the claim's debit and never drains. A release
+    # whose emptiness check ran just BEFORE the claim gets past it and
+    # drains under the claim; skipping the check stands in for that. The
+    # drain itself must refuse, or the give-back finds the group "gone"
+    # and leaks its run in a group that never left.
+    log "5: a release past its emptiness check, draining under a FITRIM claim"
+    ct_mount "$DEV" "$MNT"
+    ct_param_set bg_release_off 1
+    mkdir "$MNT/bulk"
+    for i in 1 2 3; do dd if=/dev/urandom of="$MNT/bulk/f$i" bs=1M count=32 conv=fsync status=none; done
+    sync
+    rm -rf "$MNT/bulk"
+    sync
+    L0="$(info trim_leaked_blocks)"
+    MARK="$(dmesg_mark)"
+    ct_param_set trim_discard_stall_ms 9000
+    fstrim -m 4M "$MNT" >/dev/null 2>&1 &
+    TPID=$!
+    sleep 1
+    # Past the check, group 0 (it holds the root) is a candidate too and
+    # drains first: its pause is the one-shot stall. Re-armed while it
+    # pauses, the stall then holds the CLAIMED group drained across the
+    # give-back at ~9 s.
+    ct_param_set bg_release_skip_empty_check 1
+    ct_param_set bg_release_drain_stall_ms 4000
+    ct_param_set bg_release_off 0
+    wait_for 10 "dmesg_since '$MARK' | grep -q 'BG 0 release: drained, pausing'" ||
+        fail "5 setup: no release drained group 0 -- the stall is not where the claim is"
+    ct_param_set bg_release_drain_stall_ms 6000
+    wait "$TPID" || true
+    ct_param_set trim_discard_stall_ms 0
+    ct_param_set bg_release_skip_empty_check 0
+    [ "$(info trim_leaked_blocks)" = "$L0" ] && pass "5: the claim gave its run back -- the drain refused the claimed group" ||
+        fail "5: $(($(info trim_leaked_blocks) - L0)) block(s) leaked: the release drained the group under the claim"
+    wait_for 20 "dmesg_since '$MARK' | grep -q 'handed back from ZG'" &&
+        pass "5: and the group was handed back once the trim was done" ||
+        fail "5 setup: the emptied group was never handed back -- the release never ran"
+    ct_umount "$MNT"
 fi
 
 # ------------------------------------------------------------------- 3

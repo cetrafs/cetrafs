@@ -577,11 +577,13 @@ struct cetrafs_sb_info {
      * trim_mutex: one FITRIM pass at a time. trim_lba/trim_count: the
      * run that pass has claimed and is discarding right now (0/0 for
      * none), under alloc_mutex -- the free paths refuse to clear a bit
-     * inside it (cetrafs_sb_trim_holds()). */
+     * inside it (cetrafs_sb_trim_holds()), and a release refuses to
+     * drain trim_bg while it is held (cetrafs_sb_drain_bg()). */
     bool discard_enabled;
     struct mutex trim_mutex;
     u64 trim_lba;
     u64 trim_count;
+    u32 trim_bg;
     /* discard_pending: Block Groups whose hand-back discard failed with
      * an UNKNOWN outcome -- it may still execute. Each stays drained
      * (out of this node's allocator: cetrafs_sb_undrain_bg() refuses
@@ -5276,11 +5278,12 @@ cetrafs_test_param(trim_hold_off, cetrafs_trim_hold_off, bool, 0644);
 MODULE_PARM_DESC(trim_hold_off, "TEST ONLY: free paths may clear bits a FITRIM has claimed");
 
 /* Under alloc_mutex, both. */
-void cetrafs_sb_set_trim_claim(struct super_block *sb, u64 lba, u64 count)
+void cetrafs_sb_set_trim_claim(struct super_block *sb, u32 bg_id, u64 lba, u64 count)
 {
     struct cetrafs_sb_info *sbi = sb->s_fs_info;
 
     lockdep_assert_held(&sbi->alloc_mutex);
+    sbi->trim_bg = bg_id;
     sbi->trim_lba = lba;
     sbi->trim_count = count;
 }
@@ -5566,18 +5569,32 @@ bool cetrafs_sb_zg_owned_cached(struct super_block *sb, u32 zg_id)
  * Nothing persists: a node that dies while draining simply still owns
  * the Block Group on disk, which is the safe direction.
  */
-void cetrafs_sb_drain_bg(struct super_block *sb, u32 bg_id)
+/*
+ * Take a Block Group out of the allocator's reach for a release. Refused
+ * (false) while a FITRIM claim lies inside it: the claim's give-back
+ * finds a drained group "gone" and leaves its run allocated, so a
+ * release that drained, looked, saw the claim and undrained leaked a
+ * whole run of a group that never left (review U4's second half). A
+ * claim cannot start in a drained group (cetrafs_trim_claim_next()
+ * re-tests under this mutex), so the two exclude each other.
+ */
+bool cetrafs_sb_drain_bg(struct super_block *sb, u32 bg_id)
 {
     struct cetrafs_sb_info *sbi = sb ? sb->s_fs_info : NULL;
     struct cetrafs_bg_chunk *c;
+    bool drained = false;
     u32 i;
 
     c = cetrafs_bgc(sbi, bg_id, &i);
     if (!c)
-        return;
+        return true; /* not a group we track: nothing to take away */
     mutex_lock(&sbi->alloc_mutex);
-    clear_bit(i, c->owned_bgs);
+    if (!sbi->trim_count || sbi->trim_bg != bg_id) {
+        clear_bit(i, c->owned_bgs);
+        drained = true;
+    }
     mutex_unlock(&sbi->alloc_mutex);
+    return drained;
 }
 
 void cetrafs_sb_undrain_bg(struct super_block *sb, u32 bg_id)
