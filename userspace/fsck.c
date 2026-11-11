@@ -2386,7 +2386,6 @@ int main(int argc, char **argv)
      */
     if (cetrafs_le64(sb.tail_reserve_blocks)) {
         uint64_t rs = cetrafs_le64(sb.tail_reserve_start);
-        uint64_t re = rs + cetrafs_le64(sb.tail_reserve_blocks);
         uint64_t head = cetrafs_le64(sb.bg_table_next);
 
         /*
@@ -2397,9 +2396,28 @@ int main(int argc, char **argv)
          * that they live inside it is checking something that stopped
          * being true (docs/internal/BG-OWNERSHIP-DESIGN.md).
          */
-        if (re > total_blocks || rs == 0) {
+        /*
+         * The kernel's rule (cetrafs_layout_bounds_check()): between the
+         * data area and the end of the volume, with no sum that wraps.
+         * This said only "ends before total_blocks", so a reserve placed
+         * over the tables or inside the data area -- which every mount
+         * refuses -- read as clean, and so did one whose start+length
+         * wrapped past 2^64 (audit 2026-11-11 F4,
+         * tests/image/fsck_tail_reserve_bounds.sh).
+         */
+        uint64_t box_end = cetrafs_le64(sb.bg_data_end);
+
+        if (!box_end)
+            box_end = cetrafs_le64(sb.bg_regions_start) +
+                      (uint64_t) cetrafs_le32(sb.block_group_count) * cetrafs_le64(sb.bg_size_blocks);
+        if (rs == 0 || rs > total_blocks || cetrafs_le64(sb.tail_reserve_blocks) > total_blocks - rs) {
             fprintf(stderr, "ERR: tail reserve [%" PRIu64 ",+%" PRIu64 ") does not fit in total_blocks=%" PRIu64 "\n",
                     rs, cetrafs_le64(sb.tail_reserve_blocks), total_blocks);
+            return 1;
+        }
+        if (rs < box_end) {
+            fprintf(stderr, "ERR: tail reserve [%" PRIu64 ",+%" PRIu64 ") starts inside the data area, which ends at %" PRIu64 "\n",
+                    rs, cetrafs_le64(sb.tail_reserve_blocks), box_end);
             return 1;
         }
         if (!head) {
