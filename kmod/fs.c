@@ -568,6 +568,21 @@ struct cetrafs_sb_info {
     bool defrag_enabled;
     bool auto_defrag_enabled;
 
+    /* UNMAP (discard.c). discard_enabled is the per-mount switch for the
+     * automatic part -- a Block Group's data region discarded as it goes
+     * back to the pool. On by default, off with the `nodiscard` mount
+     * option or the `discard` control. FITRIM is the operator asking and
+     * ignores it.
+     *
+     * trim_mutex: one FITRIM pass at a time. trim_lba/trim_count: the
+     * run that pass has claimed and is discarding right now (0/0 for
+     * none), under alloc_mutex -- the free paths refuse to clear a bit
+     * inside it (cetrafs_sb_trim_holds()). */
+    bool discard_enabled;
+    struct mutex trim_mutex;
+    u64 trim_lba;
+    u64 trim_count;
+
     /* The cross-node whole-file EXCLUSIVE open lock (lock.c): on by
      * default, turned off at mount time with the `nofilelock` option.
      *
@@ -1381,9 +1396,10 @@ struct cetrafs_fc_info {
     bool file_lock;
     bool errors_panic;    /* errors=panic */
     bool corruption_stop; /* corruption=stop */
+    bool nodiscard;       /* nodiscard */
     /* Which of the above were STATED, rather than defaulted: only a
      * stated option can be "asked for and not in force". */
-    bool file_lock_set, errors_set, corruption_set;
+    bool file_lock_set, errors_set, corruption_set, nodiscard_set;
     bool filled; /* fill_super ran: a new mount, not a second one of a mounted device */
 };
 
@@ -2457,6 +2473,7 @@ int cetrafs_fill_super(struct super_block *sb, struct fs_context *fc)
 
             sbi->errors_panic = fci ? fci->errors_panic : false;
             sbi->corruption_stop = fci ? fci->corruption_stop : false;
+            sbi->discard_enabled = !(fci && fci->nodiscard);
 
             /* The operator's REQUESTED mode. May be overridden below by the
              * cluster's mode (the first mounter leads); the authoritative
@@ -2499,6 +2516,7 @@ int cetrafs_fill_super(struct super_block *sb, struct fs_context *fc)
         if (sbi->peer_count)
             sbi->peers = kcalloc(sbi->peer_count, sizeof(*sbi->peers), GFP_KERNEL);
         mutex_init(&sbi->alloc_mutex);
+        mutex_init(&sbi->trim_mutex);
         mutex_init(&sbi->pf_drain_mutex);
         mutex_init(&sbi->zg_claim_mutex);
         init_rwsem(&sbi->release_rwsem);
@@ -5186,6 +5204,52 @@ bool cetrafs_sb_auto_defrag_enabled(struct super_block *sb)
     return sbi && READ_ONCE(sbi->auto_defrag_enabled);
 }
 
+bool cetrafs_sb_discard_enabled(struct super_block *sb)
+{
+    struct cetrafs_sb_info *sbi = sb->s_fs_info;
+
+    return sbi && READ_ONCE(sbi->discard_enabled);
+}
+
+void cetrafs_sb_set_discard_enabled(struct super_block *sb, bool on)
+{
+    struct cetrafs_sb_info *sbi = sb->s_fs_info;
+
+    if (sbi)
+        WRITE_ONCE(sbi->discard_enabled, on);
+}
+
+struct mutex *cetrafs_sb_trim_mutex(struct super_block *sb)
+{
+    return &((struct cetrafs_sb_info *) sb->s_fs_info)->trim_mutex;
+}
+
+/* TEST ONLY: the free paths ignore a FITRIM's hold -- the negative
+ * control for it (tests/kernel/fstrim_claim.sh). */
+static bool cetrafs_trim_hold_off;
+cetrafs_test_param(trim_hold_off, cetrafs_trim_hold_off, bool, 0644);
+MODULE_PARM_DESC(trim_hold_off, "TEST ONLY: free paths may clear bits a FITRIM has claimed");
+
+/* Under alloc_mutex, both. */
+void cetrafs_sb_set_trim_claim(struct super_block *sb, u64 lba, u64 count)
+{
+    struct cetrafs_sb_info *sbi = sb->s_fs_info;
+
+    lockdep_assert_held(&sbi->alloc_mutex);
+    sbi->trim_lba = lba;
+    sbi->trim_count = count;
+}
+
+bool cetrafs_sb_trim_holds(struct super_block *sb, u64 lba)
+{
+    struct cetrafs_sb_info *sbi = sb->s_fs_info;
+
+    lockdep_assert_held(&sbi->alloc_mutex);
+    if (READ_ONCE(cetrafs_trim_hold_off))
+        return false; /* test-only; see the parameter */
+    return sbi->trim_count && lba >= sbi->trim_lba && lba < sbi->trim_lba + sbi->trim_count;
+}
+
 void cetrafs_sb_set_defrag_enabled(struct super_block *sb, bool on)
 {
     struct cetrafs_sb_info *sbi = sb->s_fs_info;
@@ -6232,7 +6296,7 @@ int cetrafs_flush_dirty_free_counts(struct super_block *sb)
 
 /* ------ mount options ------ */
 
-enum cetrafs_param { Opt_nofilelock, Opt_errors, Opt_corruption };
+enum cetrafs_param { Opt_nofilelock, Opt_errors, Opt_corruption, Opt_nodiscard };
 
 /* errors=: what a fatal error does (docs/internal/ERRORS.md, kind 3).
  * There is deliberately no "continue". */
@@ -6254,6 +6318,9 @@ static const struct fs_parameter_spec cetrafs_fs_parameters[] = {
     /* Both mount-time only, like nofilelock. */
     fsparam_enum("errors", Opt_errors, cetrafs_param_errors),
     fsparam_enum("corruption", Opt_corruption, cetrafs_param_corruption),
+    /* No automatic UNMAP (discard.c). Sets the starting value of the
+     * per-mount `discard` control, which can still turn it back on. */
+    fsparam_flag("nodiscard", Opt_nodiscard),
     {}};
 
 static int cetrafs_parse_param(struct fs_context *fc, struct fs_parameter *param)
@@ -6278,6 +6345,10 @@ static int cetrafs_parse_param(struct fs_context *fc, struct fs_parameter *param
         fci->corruption_stop = result.uint_32 == 1;
         fci->corruption_set = true;
         break;
+    case Opt_nodiscard:
+        fci->nodiscard = true;
+        fci->nodiscard_set = true;
+        break;
     }
     return 0;
 }
@@ -6301,6 +6372,8 @@ static bool cetrafs_opts_unmet(const struct cetrafs_fc_info *fci, const struct c
         *what = fci->errors_panic ? "errors=panic" : "errors=stop";
     else if (fci->corruption_set && fci->corruption_stop != sbi->corruption_stop)
         *what = fci->corruption_stop ? "corruption=stop" : "corruption=isolate";
+    else if (fci->nodiscard_set && READ_ONCE(sbi->discard_enabled))
+        *what = "nodiscard";
     else
         return false;
     return true;

@@ -764,6 +764,10 @@ static int cetrafs_show_options(struct seq_file *m, struct dentry *root)
         seq_puts(m, ",errors=panic");
     if (cetrafs_sb_corruption_stop(root->d_sb))
         seq_puts(m, ",corruption=stop");
+    /* The switch as it stands: the `discard` control can move it after
+     * the mount, and this line describes the mount now. */
+    if (!cetrafs_sb_discard_enabled(root->d_sb))
+        seq_puts(m, ",nodiscard");
     return 0;
 }
 

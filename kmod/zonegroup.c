@@ -1554,7 +1554,8 @@ int cetrafs_zg_release_surplus(struct super_block *sb, u32 my_node_id)
 static int cetrafs_zg_release_surplus_locked(struct super_block *sb, u32 my_node_id)
 {
     const cetrafs_superblock_t *raw_sb = cetrafs_sb_raw(sb);
-    u32 zg_count, z, owned_count = 0;
+    u32 zg_count, z, owned_count = 0, deferred = 0;
+    unsigned long pass_started = 0;
     int ret;
 
     if (!raw_sb)
@@ -1581,16 +1582,21 @@ static int cetrafs_zg_release_surplus_locked(struct super_block *sb, u32 my_node
      * all of it. docs/internal/BG-OWNERSHIP-DESIGN.md
      */
     for (z = 0; z < zg_count; z++) {
-        u32 freed = 0;
+        u32 freed = 0, held = 0;
 
         if (!cetrafs_sb_zg_owned_cached(sb, z))
             continue;
-        if (cetrafs_bg_release_empty(sb, z, &freed) == 0 && freed)
+        if (cetrafs_bg_release_empty(sb, z, &freed, &held, &pass_started) == 0 && freed)
             pr_info("ZG %u: handed back %u empty Block Group(s)\n", z, freed);
+        deferred += held;
     }
 
     if (owned_count <= 1)
         return 0; /* nothing surplus to give back at Zone Group level */
+    /* Empty Block Groups kept for a later tick's discard budget: a whole
+     * Zone Group given back now would take them to the pool untrimmed. */
+    if (deferred)
+        return 0;
 
     /*
      * Flush before giving anything back.

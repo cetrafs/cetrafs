@@ -1,10 +1,13 @@
-# UNMAP / discard: giving space back to a thin LUN (design, pre-implementation)
+# UNMAP / discard: giving space back to a thin LUN
 
-cetrafs issues no discard of any kind today. There is no `FITRIM`, no
-`blkdev_issue_discard` call, no `discard` mount option. Space freed in
-the filesystem stays mapped in the array's thin pool for the life of the
-volume, so a datastore that has ever been full stays full as far as the
-array is concerned.
+**Status (2026-11-10): steps 1 and 3 are built** (`kmod/discard.c`),
+together with a hand-back discard this design did not originally have
+(see "As built" at the end). Step 2, inline `-o discard`, is not.
+
+Before this, cetrafs issued no discard of any kind: space freed in the
+filesystem stayed mapped in the array's thin pool for the life of the
+volume, so a datastore that had ever been full stayed full as far as the
+array was concerned.
 
 For the target deployment -- VM images on a shared thin-provisioned LUN
 -- that is a real operational problem, not a nicety: the whole point of
@@ -81,9 +84,25 @@ For cetrafs that reads: under `alloc_mutex`, set the run's bits in the
 Block Group's data bitmap exactly as an allocation does; drop the mutex;
 issue the discard; retake the mutex and free the run.
 
-While the bits are set nothing can take the run -- not the allocator,
-not the scrub (which skips anything that reads allocated), not a peer
-(which cannot allocate from a Zone Group it does not own). A crash
+While the bits are set the allocator cannot take the run, and a peer
+cannot either (it does not allocate from a Zone Group it does not own).
+**The scrub is the exception, and this paragraph used to say otherwise**
+("the scrub skips anything that reads allocated"): the scrub's whole job
+is freeing blocks that read allocated and that nothing references, which
+is exactly what a claimed run is. Two more things are needed, and both
+are built:
+
+* the claim is published on the live-reservation list in the same
+  `alloc_mutex` section that sets its bits, as a defrag destination
+  run is, so the scrub's free (which rechecks that list under the same
+  mutex) leaves it alone;
+* both free paths -- the local one and the pending-free apply -- treat
+  a block inside the claimed run as already free. A double free, or a
+  peer's queued copy of one, otherwise clears the trim's bit, the block
+  is handed out, and the UNMAP still in flight destroys the new owner's
+  data (`cetrafs_sb_trim_holds()`).
+
+A crash
 in the middle leaves the bits set: blocks leaked, which the scrub
 reclaims. That is the safe direction, and the same one the rest of the
 allocator already chooses -- a lost free leaks a block, it never shares
@@ -293,3 +312,82 @@ negative control twice before it was right -- once because the key check
 was not the primary defence, once because the assertion skipped the only
 offset where the fault is visible. Expect the same here and budget for
 it.
+
+---
+
+## As built (2026-11-10)
+
+### The hand-back discard: the part this design was missing
+
+`cetrafs_bg_release_empty()` hands an emptied Block Group back to the
+unowned pool on the next heartbeat tick. So the space a deleted VM image
+frees usually leaves this node's ownership within seconds -- long before
+anyone runs `fstrim` -- and the "trim only what you own" rule above means
+nobody would ever trim it. FITRIM alone would have returned almost none
+of the space that matters.
+
+The release therefore discards the Block Group's whole data region on
+the way out, at the one moment that is safest for it: the group already
+drained out of this node's allocator, its bitmap proven empty **on the
+device** (`cetrafs_bg_release_bitmap_ready()`), and its descriptor not
+yet FREE, so no peer can claim it. After the swap to FREE a discard
+could land on a peer's first writes; before the drain, on ours. Space in
+the pool is then always space already given back, and FITRIM only needs
+the Block Groups a node owns.
+
+It is one command per Block Group (the block layer splits it at the
+device's limit) and runs inside the heartbeat, so a pass may spend at
+most a second starting discards. A group past the budget is kept, and
+released (and discarded) on a later tick, and a Zone Group with such a
+group is not given back whole that tick, so nothing reaches the pool
+untrimmed while discard is on. One discard that hangs still holds the
+tick for as long as the device takes -- the same exposure as any other
+heartbeat I/O. On by default where the device supports discard;
+`nodiscard` at mount or `discard=off` in `controls` turns it off.
+
+### What happens on a device without UNMAP
+
+* `discard_max_bytes` is 0: FITRIM returns `-EOPNOTSUPP` (fstrim says
+  "the discard operation is not supported"), and the hand-back releases
+  without a discard. `controls` shows `discard_supported: no`.
+* The device takes discards but the target refuses one (`-EREMOTEIO`):
+  counted (`discard_errors` in `info`), logged, and the blocks are freed
+  regardless. Discarding is best effort; freeing is not.
+* A discard whose outcome is UNKNOWN -- a timeout, a path or transport
+  failure, a plain I/O error -- may still execute on the array, and an
+  UNMAP landing after the blocks were handed out destroys the new data
+  (bug class 30). Such a FITRIM run stays allocated (counted in
+  `trim_leaked_blocks`; the scrub reclaims it later) and the pass stops;
+  a hand-back keeps its Block Group and discards it again on a later
+  tick before letting it go.
+* Nodes on different paths decide for themselves: each checks its own
+  view of the device.
+* Nothing may rely on a discarded block reading zero. An unwritten file
+  range reads zero because its extent is uninitialised, never because
+  of what the device returns.
+
+### Limits
+
+* A FITRIM claim is at most 256 MiB; the run is out of the allocator's
+  reach for the length of its UNMAP, so on a nearly full volume an
+  allocation can see ENOSPC during an fstrim (ext4 has the same
+  property).
+* Every range is re-checked against its Block Group's data region in
+  `cetrafs_discard_issue()`, the one function that issues a discard,
+  and refused (`discard_refused`) rather than clipped.
+* FITRIM trims the Block Groups this node owns: to trim a whole
+  datastore, run it on every node.
+
+### Tests
+
+`tests/kernel/discard_unknown_outcome.sh` (unknown vs refused, for both
+paths, each with its contrast), `tests/kernel/discard_handback.sh` (the `du` oracle on the image, a
+discard-off control, a device without discard),
+`tests/kernel/fstrim.sh` (holes inside a group in use, kept files
+checksummed from the device, a range-check control aimed at the bitmap
+and into the data), `tests/kernel/fstrim_claim.sh` (a writer inside the
+claim's window with a no-claim control that destroys its data; queued
+and local double frees inside the window with no-hold controls that stop
+the mount). The two-node assertion -- a trim never writes a Block Group
+this node no longer owns -- is still owed to `ctest/`, and so is the
+cost per command on a real array.

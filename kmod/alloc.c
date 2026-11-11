@@ -3036,6 +3036,16 @@ static int __cetrafs_free_data_extent(struct super_block *sb, u64 lba, u32 count
             break;
         }
 
+        /* Inside a run a FITRIM has claimed: the bit is the trim's, and
+         * this block was free before it was claimed -- a double free.
+         * Clearing it would hand the block out under the UNMAP still in
+         * flight (see cetrafs_trim_claim_next()). */
+        if (cetrafs_sb_trim_holds(sb, lba + b)) {
+            pr_warn_ratelimited("free: block %llu is being trimmed, so it was already free (double free of extent "
+                                "[%llu +%u))\n",
+                                (unsigned long long) (lba + b), (unsigned long long) lba, count);
+            continue;
+        }
         ret = cetrafs_bitmap_test_bit(sb, bg.start_block + bg.off_data_bmap, bg.off_data_region - bg.off_data_bmap,
                                       bit + b, &set);
         if (ret)
@@ -3125,6 +3135,8 @@ int cetrafs_apply_pending_free(struct super_block *sb, u64 lba, u32 count, u32 e
 
         if (!(b & 4095))
             cond_resched(); /* class 13 */
+        if (cetrafs_sb_trim_holds(sb, lba + b))
+            continue; /* free before a FITRIM claimed it: as already free (cetrafs_trim_claim_next()) */
         ret = cetrafs_bitmap_test_bit(sb, bg.start_block + bg.off_data_bmap, bg.off_data_region - bg.off_data_bmap,
                                       bit + b, &set);
         if (ret)
@@ -3568,13 +3580,16 @@ static unsigned int cetrafs_bg_release_drain_stall_ms;
 cetrafs_test_param(bg_release_drain_stall_ms, cetrafs_bg_release_drain_stall_ms, uint, 0644);
 MODULE_PARM_DESC(bg_release_drain_stall_ms, "test-only: pause one Block Group release while it is drained");
 
-int cetrafs_bg_release_empty(struct super_block *sb, u32 zg_id, u32 *out_released)
+int cetrafs_bg_release_empty(struct super_block *sb, u32 zg_id, u32 *out_released, u32 *out_deferred,
+                             unsigned long *pass_started)
 {
     const cetrafs_superblock_t *raw_sb = cetrafs_sb_raw(sb);
-    u32 b, nbg, released = 0;
+    u32 b, nbg, released = 0, deferred = 0;
 
     if (!raw_sb)
         return -EINVAL;
+    if (out_deferred)
+        *out_deferred = 0;
     if (READ_ONCE(cetrafs_bg_release_off)) {
         if (out_released)
             *out_released = 0;
@@ -3650,6 +3665,21 @@ int cetrafs_bg_release_empty(struct super_block *sb, u32 zg_id, u32 *out_release
         }
 
         /*
+         * UNMAP the whole data region before it leaves us (discard.c).
+         * Here and nowhere later: drained, nothing of ours can allocate
+         * in it; proven empty on the device, nothing references it; not
+         * yet FREE, nobody else can claim it. After the CAS below it is
+         * the pool's, and a discard then could land on a peer's first
+         * writes. Over budget, the group stays ours for a later tick
+         * rather than going back untrimmed.
+         */
+        if (cetrafs_discard_handback(sb, b, pass_started)) {
+            cetrafs_sb_undrain_bg(sb, b);
+            deferred++;
+            continue;
+        }
+
+        /*
          * Both counter moves, by immediate CAS, BEFORE the descriptor
          * reads FREE. The pool write is cluster-visible the moment it
          * lands, so pairing it with a LAZY local accrual let every
@@ -3694,6 +3724,8 @@ int cetrafs_bg_release_empty(struct super_block *sb, u32 zg_id, u32 *out_release
 
     if (out_released)
         *out_released = released;
+    if (out_deferred)
+        *out_deferred = deferred;
     return 0;
 }
 
@@ -3928,4 +3960,328 @@ int cetrafs_bg_data_block_stats(struct super_block *sb, u32 bg_id, u64 *out_tota
     *out_total = bg.data_block_count;
     *out_free = free > 0 ? (u64) free : 0;
     return 0;
+}
+
+/* ------------------------------------------------------------------ */
+/* FITRIM claims (discard.c drives them).
+ *
+ * A run is discarded only while it is CLAIMED: its bits set exactly as
+ * an allocation sets them, so nothing can be handed it while the UNMAP
+ * is in flight -- and that alone is not enough, because two things in
+ * this module clear bits that read allocated:
+ *
+ *  - the scrub frees allocated blocks nothing references, which is what
+ *    a claimed run is. The claim is published on the reservation list
+ *    in the same alloc_mutex section that sets the bits, as a defrag
+ *    destination run is (cetrafs_alloc_data_run_resv()), and the
+ *    scrub's free rechecks that list under the same mutex.
+ *  - a double free -- ours, or a peer's queued one -- clears whatever
+ *    bit it finds set. Over a claimed run that bit is the TRIM's, and
+ *    clearing it hands the block out while its discard is in flight:
+ *    the new owner's data is destroyed. Both free paths therefore treat
+ *    a block inside the claim as already free (cetrafs_sb_trim_holds()).
+ *
+ * Only a Block Group this node owns: its bitmap is ours alone, and the
+ * cached copy is authoritative for the same reason the allocator's is.
+ * docs/DISCARD-DESIGN.md.
+ */
+
+/* TEST ONLY: find the run but do not claim it -- the negative control
+ * for the claim itself (tests/kernel/fstrim_claim.sh). */
+static bool cetrafs_trim_skip_claim;
+cetrafs_test_param(trim_skip_claim, cetrafs_trim_skip_claim, bool, 0644);
+MODULE_PARM_DESC(trim_skip_claim, "TEST ONLY: FITRIM discards free runs without claiming them first");
+
+static atomic64_t cetrafs_trim_leaked_blocks = ATOMIC64_INIT(0);
+
+u64 cetrafs_trim_leaked_count(void)
+{
+    return (u64) atomic64_read(&cetrafs_trim_leaked_blocks);
+}
+
+/*
+ * The first run of at least 'minlen' free bits at or after 'from', its
+ * length capped at 'maxlen'. A run is counted to its real end before the
+ * cap is applied, so a long run is not mistaken for a short one; the
+ * caller resumes after what it claimed. Returns 0 with the run, -ENOSPC
+ * if there is none, -EIO on a read failure. Byte-wise: an all-ones byte
+ * ends a run and an all-zero byte extends it without a per-bit test --
+ * a 1 GiB Block Group is 32 KiB of bitmap.
+ */
+static int cetrafs_bitmap_find_free_run(struct super_block *sb, u64 bmap_lba, u64 nblocks, u64 nbits, u64 from,
+                                        u64 minlen, u64 maxlen, u64 *out_start, u64 *out_len)
+{
+    u64 run = 0, run_start = 0, idx = from;
+
+    while (idx < nbits) {
+        u64 blk = idx / CETRAFS_BITS_PER_BLOCK;
+        struct buffer_head *bh;
+        const u8 *p;
+
+        if (blk >= nblocks)
+            break;
+        cond_resched();
+        bh = cetrafs_bread_retry(sb, bmap_lba + blk);
+        if (!bh)
+            return -EIO;
+        p = (const u8 *) bh->b_data;
+        while (idx < nbits && idx / CETRAFS_BITS_PER_BLOCK == blk) {
+            u32 in = (u32) (idx % CETRAFS_BITS_PER_BLOCK);
+            u8 byte = p[in / 8];
+
+            if (!(in & 7) && idx + 8 <= nbits && (byte == 0x00 || byte == 0xFF)) {
+                if (byte == 0xFF) {
+                    if (run >= minlen)
+                        goto found;
+                    run = 0;
+                } else {
+                    if (!run)
+                        run_start = idx;
+                    run += 8;
+                }
+                idx += 8;
+                continue;
+            }
+            if (byte & (1u << (in & 7))) {
+                if (run >= minlen)
+                    goto found;
+                run = 0;
+            } else {
+                if (!run)
+                    run_start = idx;
+                run++;
+            }
+            idx++;
+        }
+        brelse(bh);
+        continue;
+found:
+        brelse(bh);
+        break;
+    }
+    if (!run || run < minlen)
+        return -ENOSPC;
+    *out_start = run_start;
+    *out_len = min(run, maxlen);
+    return 0;
+}
+
+/*
+ * Set or clear bits [bit, bit + count), every one expected to be in the
+ * other state. Returns the number that were not (0 is the only answer a
+ * correct caller sees), or a negative errno on a read failure, in which
+ * case the bits before the failing block have been changed. Per bitmap
+ * block, under the buffer-update protocol (cetrafs_bitmap_free_bit()).
+ */
+static long cetrafs_bitmap_flip_range(struct super_block *sb, u64 bmap_lba, u64 nblocks, u64 bit, u64 count,
+                                      bool set)
+{
+    u64 end = bit + count;
+    long wrong = 0;
+
+    while (bit < end) {
+        u64 blk = bit / CETRAFS_BITS_PER_BLOCK;
+        u64 stop = min(end, (blk + 1) * CETRAFS_BITS_PER_BLOCK);
+        struct buffer_head *bh;
+        u8 *p;
+
+        if (blk >= nblocks)
+            return -EINVAL;
+        cond_resched();
+        bh = cetrafs_bread_retry(sb, bmap_lba + blk);
+        if (!bh)
+            return -EIO;
+        p = (u8 *) bh->b_data;
+        cetrafs_bh_begin_update(bh);
+        for (; bit < stop; bit++) {
+            u32 in = (u32) (bit % CETRAFS_BITS_PER_BLOCK);
+            u8 m = (u8) (1u << (in & 7));
+
+            if (!!(p[in / 8] & m) == set) {
+                wrong++;
+                continue;
+            }
+            if (set)
+                p[in / 8] |= m;
+            else
+                p[in / 8] &= (u8) ~m;
+        }
+        cetrafs_bh_end_update(bh);
+        brelse(bh);
+    }
+    return wrong;
+}
+
+/*
+ * Claim the next free run of BG 'bg_id' at or after bit *cursor: at
+ * least 'minlen' blocks, at most 'maxlen'. On success the run is in
+ * 'run', its bits are set and it is held against every free path, and
+ * *cursor is past it. -ENOSPC: no further run in this Block Group.
+ * -EAGAIN / -EPERM: the Block Group is not ours (any more). -EIO: fenced,
+ * or the bitmap could not be read.
+ */
+int cetrafs_trim_claim_next(struct super_block *sb, u32 bg_id, u64 *cursor, u64 minlen, u64 maxlen,
+                            struct cetrafs_trim_run *run)
+{
+    struct cetrafs_bg_geom bg;
+    u64 bmap_lba, bmap_blocks, start = 0, len = 0;
+    long wrong;
+    int ret;
+
+    run->count = 0;
+    run->claimed = false;
+    if (cetrafs_sb_is_fenced(sb))
+        return -EIO;
+    ret = cetrafs_read_bg_geom(sb, bg_id, &bg);
+    if (ret)
+        return ret;
+    if (bg.owner_zg == CETRAFS_BG_OWNER_FREE || !cetrafs_sb_zg_owned_cached(sb, bg.owner_zg))
+        return -EPERM;
+    bmap_lba = bg.start_block + bg.off_data_bmap;
+    bmap_blocks = bg.off_data_region - bg.off_data_bmap;
+
+    cetrafs_sb_alloc_lock(sb);
+    if (cetrafs_alloc_bg_gone(sb, bg_id)) {
+        ret = -EAGAIN;
+        goto out;
+    }
+    ret = cetrafs_bitmap_find_free_run(sb, bmap_lba, bmap_blocks, bg.data_block_count, *cursor, minlen, maxlen,
+                                       &start, &len);
+    if (ret) {
+        if (ret == -ENOSPC)
+            *cursor = bg.data_block_count;
+        goto out;
+    }
+
+    run->bg_id = bg_id;
+    run->owner_zg = bg.owner_zg;
+    run->lba = bg.start_block + bg.off_data_region + start;
+    run->count = len;
+    *cursor = start + len;
+
+    if (READ_ONCE(cetrafs_trim_skip_claim))
+        goto out; /* test-only: discarded with nothing holding it */
+
+    wrong = cetrafs_bitmap_flip_range(sb, bmap_lba, bmap_blocks, start, len, true);
+    if (wrong < 0) {
+        /* A bitmap block would not read, part way: the bits before it
+         * are set. Every bit of the run read clear a moment ago under
+         * this mutex, so clearing the whole run again undoes exactly
+         * what was set (a clear bit stays clear). Nothing is discarded. */
+        (void) cetrafs_bitmap_flip_range(sb, bmap_lba, bmap_blocks, start, len, false);
+        pr_err_ratelimited("trim claim: BG %u bitmap unreadable (%ld) -- skipped\n", bg_id, wrong);
+        run->count = 0;
+        ret = (int) wrong;
+        goto out;
+    }
+    if (wrong) {
+        /* The scan just read these clear under the mutex the only other
+         * setter takes: memory and disk disagree (ERRORS.md, kind 3).
+         * Nothing is discarded; what was set stays set (a leak). */
+        cetrafs_sb_fatal(sb, "trim claim: %ld bit(s) of a run scanned free in BG %u were set under the alloc mutex",
+                         wrong, bg_id);
+        run->count = 0;
+        ret = -EIO;
+        goto out;
+    }
+    /* Debited like an allocation, so the count never shows space the
+     * allocator cannot have. NOT marked for the bitmap flush
+     * (cetrafs_sb_note_bmap_alloc()): that flush exists so an extent
+     * never reaches the device before the bits it names (rule 8), and
+     * nothing will ever name these -- marking them would only make the
+     * next writer's tree edit pay a synchronous bitmap write per claim.
+     * A crash with the debit on the device and the bits not leaves the
+     * count understating, which the next recount corrects. */
+    cetrafs_bg_adjust_free_blocks(sb, bg_id, -(s64) len);
+    cetrafs_shadow_set(sb, run->lba, len, "trim_claim");
+    cetrafs_resv_publish(sb, &run->span, run->lba, (u32) len);
+    cetrafs_sb_set_trim_claim(sb, run->lba, len);
+    run->claimed = true;
+out:
+    cetrafs_sb_alloc_unlock(sb);
+    return ret;
+}
+
+/*
+ * Give a claimed run back once its discard is done (or failed): clear
+ * the bits, credit the count, end the hold. Only while the Block Group
+ * is still ours and this mount is not fenced -- otherwise the bitmap may
+ * be somebody else's by now, and writing it is the single most damaging
+ * thing this module can do. The bits then stay set: a leak, which the
+ * scrub (ours, or the next owner's) reclaims. Never shared.
+ */
+void cetrafs_trim_release(struct super_block *sb, struct cetrafs_trim_run *run, bool keep)
+{
+    struct cetrafs_bg_geom bg;
+    long wrong;
+    int ret;
+
+    if (!run->claimed)
+        return;
+
+    ret = cetrafs_read_bg_geom(sb, run->bg_id, &bg);
+    cetrafs_sb_alloc_lock(sb);
+    if (keep) {
+        /* The discard's outcome is unknown (cetrafs_discard_outcome_known()):
+         * it may still execute. Handed out now, the block could take a
+         * file's data before that UNMAP lands on it -- so the run stays
+         * allocated, as a publish of unknown outcome frees nothing (rule
+         * 21). Off the reservation list below, so the scrub reclaims it,
+         * minutes from now. */
+        atomic64_add((s64) run->count, &cetrafs_trim_leaked_blocks);
+        pr_warn_ratelimited("trim: the discard of [%llu +%llu) may still land -- left allocated for the scrub\n",
+                            (unsigned long long) run->lba, (unsigned long long) run->count);
+        goto out;
+    }
+    if (ret || cetrafs_sb_is_fenced(sb) || cetrafs_alloc_bg_gone(sb, run->bg_id) ||
+        !cetrafs_sb_zg_owned_cached(sb, run->owner_zg)) {
+        atomic64_add((s64) run->count, &cetrafs_trim_leaked_blocks);
+        pr_warn_ratelimited("trim: BG %u left this node during a trim -- [%llu +%llu) stays allocated for the "
+                            "scrub\n",
+                            run->bg_id, (unsigned long long) run->lba, (unsigned long long) run->count);
+        goto out;
+    }
+    wrong = cetrafs_bitmap_flip_range(sb, bg.start_block + bg.off_data_bmap, bg.off_data_region - bg.off_data_bmap,
+                                      run->lba - bg.start_block - bg.off_data_region, run->count, false);
+    if (wrong < 0) {
+        /* Partly given back: the rest stays set, and the count is not
+         * credited at all -- it understates until the next recount, the
+         * safe direction. */
+        atomic64_add((s64) run->count, &cetrafs_trim_leaked_blocks);
+        pr_err("trim: could not give back [%llu +%llu) in BG %u (%ld) -- left for the scrub\n",
+               (unsigned long long) run->lba, (unsigned long long) run->count, run->bg_id, wrong);
+        goto out;
+    }
+    if (wrong) {
+        /* Something cleared a bit the hold refuses to every free path. */
+        cetrafs_sb_fatal(sb, "trim release: %ld bit(s) of the claimed run [%llu +%llu) were already clear", wrong,
+                         (unsigned long long) run->lba, (unsigned long long) run->count);
+        goto out;
+    }
+    cetrafs_bg_adjust_free_blocks(sb, run->bg_id, (s64) run->count);
+    cetrafs_shadow_clear(sb, run->lba, run->count, "trim_release");
+out:
+    cetrafs_sb_set_trim_claim(sb, 0, 0);
+    cetrafs_resv_unpublish(sb, &run->span);
+    run->claimed = false;
+    cetrafs_sb_alloc_unlock(sb);
+}
+
+/* A Block Group's data region, for a discard to check itself against. */
+int cetrafs_bg_data_region(struct super_block *sb, u32 bg_id, u64 *out_start, u64 *out_count, u32 *out_owner_zg)
+{
+    struct cetrafs_bg_geom bg;
+    int ret = cetrafs_read_bg_geom(sb, bg_id, &bg);
+
+    if (ret)
+        return ret;
+    *out_start = bg.start_block + bg.off_data_region;
+    *out_count = bg.data_block_count;
+    *out_owner_zg = bg.owner_zg;
+    return 0;
+}
+
+int cetrafs_bg_id_of_lba(struct super_block *sb, u64 lba, u32 *out_bg_id)
+{
+    return cetrafs_bg_id_for_lba(sb, lba, out_bg_id);
 }

@@ -279,6 +279,13 @@ static int cetrafs_proc_info_show(struct seq_file *m, void *v)
     seq_printf(m, "pf_drain_blocks: %llu\n", cetrafs_pf_drain_blocks_count());
     seq_printf(m, "pf_drain_sweeps: %llu\n", cetrafs_pf_drain_sweeps_count());
     seq_printf(m, "pf_drain_held: %llu\n", cetrafs_pf_drain_held_count());
+    seq_printf(m, "discard_cmds: %llu\n", cetrafs_discard_cmds_count());
+    seq_printf(m, "discard_blocks: %llu\n", cetrafs_discard_blocks_count());
+    seq_printf(m, "discard_errors: %llu\n", cetrafs_discard_errors_count());
+    seq_printf(m, "discard_refused: %llu\n", cetrafs_discard_refused_count());
+    seq_printf(m, "discard_handback_bgs: %llu\n", cetrafs_discard_handback_count());
+    seq_printf(m, "discard_handback_deferred: %llu\n", cetrafs_discard_handback_deferred_count());
+    seq_printf(m, "trim_leaked_blocks: %llu\n", cetrafs_trim_leaked_count());
     seq_printf(m, "bg_recounts: %llu\n", cetrafs_bg_recount_count());
     seq_printf(m, "pf_drop_runs: %llu\n", cetrafs_pf_drop_runs_count());
     seq_printf(m, "pf_drop_blocks: %llu\n", cetrafs_pf_drop_blocks_count());
@@ -519,6 +526,11 @@ static int cetrafs_proc_controls_show(struct seq_file *m, void *v)
     seq_printf(m, "hb_interval_secs: %u\n", cetrafs_sb_hb_interval_secs(sb));
     seq_printf(m, "stale_secs: %u\n", cetrafs_sb_stale_secs(sb));
     seq_printf(m, "shutdown: %s\n", cetrafs_sb_is_fenced(sb) ? "yes" : "no");
+    /* The automatic UNMAP at Block Group hand-back (discard.c), and
+     * whether the device takes discards at all -- "on" over a device
+     * that does not is a switch with nothing behind it. */
+    seq_printf(m, "discard: %s\n", cetrafs_sb_discard_enabled(sb) ? "on" : "off");
+    seq_printf(m, "discard_supported: %s\n", cetrafs_discard_supported(sb) ? "yes" : "no");
     return 0;
 }
 
@@ -672,6 +684,8 @@ timing_out:
         cetrafs_sb_set_defrag_enabled(sb, on);
     else if (!strcmp(key, "auto_defrag"))
         cetrafs_sb_set_auto_defrag_enabled(sb, on);
+    else if (!strcmp(key, "discard"))
+        cetrafs_sb_set_discard_enabled(sb, on);
     else
         return -EINVAL;
 

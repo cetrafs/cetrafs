@@ -356,6 +356,12 @@ bool cetrafs_sb_defrag_enabled(struct super_block *sb);
 bool cetrafs_sb_auto_defrag_enabled(struct super_block *sb);
 bool cetrafs_sb_file_lock_enabled(struct super_block *sb);
 void cetrafs_sb_set_defrag_enabled(struct super_block *sb, bool on);
+/* UNMAP state (fs.c; see cetrafs_sb_info.discard_enabled). */
+bool cetrafs_sb_discard_enabled(struct super_block *sb);
+void cetrafs_sb_set_discard_enabled(struct super_block *sb, bool on);
+struct mutex *cetrafs_sb_trim_mutex(struct super_block *sb);
+void cetrafs_sb_set_trim_claim(struct super_block *sb, u64 lba, u64 count);
+bool cetrafs_sb_trim_holds(struct super_block *sb, u64 lba);
 void cetrafs_sb_set_auto_defrag_enabled(struct super_block *sb, bool on);
 /* Cluster timing for THIS mount (procfs 'controls'); the module params
  * are the defaults. */
@@ -418,6 +424,35 @@ struct cetrafs_resv_span {
 void cetrafs_resv_publish(struct super_block *sb, struct cetrafs_resv_span *span, u64 start, u32 count);
 void cetrafs_resv_unpublish(struct super_block *sb, struct cetrafs_resv_span *span);
 bool cetrafs_resv_covers(struct super_block *sb, u64 lba);
+
+/* FITRIM claims (alloc.c): a free run held, bits set, while discard.c
+ * discards it. */
+struct cetrafs_trim_run {
+    struct cetrafs_resv_span span;
+    u64 lba;
+    u64 count;
+    u32 bg_id;
+    u32 owner_zg;
+    bool claimed;
+};
+int cetrafs_trim_claim_next(struct super_block *sb, u32 bg_id, u64 *cursor, u64 minlen, u64 maxlen,
+                            struct cetrafs_trim_run *run);
+void cetrafs_trim_release(struct super_block *sb, struct cetrafs_trim_run *run, bool keep);
+u64 cetrafs_trim_leaked_count(void);
+int cetrafs_bg_data_region(struct super_block *sb, u32 bg_id, u64 *out_start, u64 *out_count, u32 *out_owner_zg);
+int cetrafs_bg_id_of_lba(struct super_block *sb, u64 lba, u32 *out_bg_id);
+
+/* discard.c */
+struct fstrim_range;
+bool cetrafs_discard_supported(struct super_block *sb);
+int cetrafs_discard_handback(struct super_block *sb, u32 bg_id, unsigned long *pass_started);
+long cetrafs_fitrim_ioctl(struct file *file, struct fstrim_range __user *arg);
+u64 cetrafs_discard_cmds_count(void);
+u64 cetrafs_discard_blocks_count(void);
+u64 cetrafs_discard_errors_count(void);
+u64 cetrafs_discard_refused_count(void);
+u64 cetrafs_discard_handback_count(void);
+u64 cetrafs_discard_handback_deferred_count(void);
 /* BG free counts (v0x0004): accrued per BG, applied by one epoch-guarded
  * CAS per dirty BG at the durability boundaries -- never left dirty in
  * the buffer cache (background writeback could land a stale count on a
@@ -855,7 +890,10 @@ int cetrafs_bg_claim_free(struct super_block *sb, u32 zg_id, u32 *out_bg_id);
 void cetrafs_bg_refresh_owner_map(struct super_block *sb);
 /* Hand back every empty Block Group of zg_id. The hoarding fix.
  * docs/internal/BG-OWNERSHIP-DESIGN.md */
-int cetrafs_bg_release_empty(struct super_block *sb, u32 zg_id, u32 *out_released);
+/* pass_started: 0 before a heartbeat pass's first call, then left to the
+ * callee -- the hand-back discard budget runs per pass (discard.c). */
+int cetrafs_bg_release_empty(struct super_block *sb, u32 zg_id, u32 *out_released, u32 *out_deferred,
+                             unsigned long *pass_started);
 void cetrafs_sb_drain_bg(struct super_block *sb, u32 bg_id);
 void cetrafs_sb_undrain_bg(struct super_block *sb, u32 bg_id);
 
