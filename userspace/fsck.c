@@ -2390,11 +2390,12 @@ int main(int argc, char **argv)
      * pending_end, and pending/journal ending before bg_regions_start.
      * All three encoded the order mkfs happens to pack the prefix in as
      * if it were an invariant of the FORMAT. It is not -- every region's
-     * location is a superblock field, and a GROWN volume has relocated
-     * its ZG table, BG table and pending-free region into a reserve at
-     * the end of the device, leaving the journals where they were
-     * (docs/internal/EXTENDFS-DESIGN.md). A correct grown volume failed
-     * all three.
+     * location is a superblock field, and the first grow design
+     * relocated the ZG table, BG table and pending-free region into a
+     * reserve at the end of the device, leaving the journals where they
+     * were (docs/internal/EXTENDFS-DESIGN.md). A correct grown volume
+     * failed all three. (Grows no longer move anything; the format
+     * still does not promise the order.)
      *
      * Nothing is lost: the sorted pairwise overlap pass above checks
      * every region against every other and bounds each one by
@@ -2406,11 +2407,15 @@ int main(int argc, char **argv)
      */
 
     /*
-     * The tail reserve, when a grow has created one: the relocated
-     * tables must actually live inside the region the superblock claims
-     * holds them. The overlap pass proves they do not collide with
-     * anything; this proves the superblock's own account of itself is
-     * self-consistent, so a half-written grow cannot read as clean.
+     * The tail reserve, when a grow has created one: it holds the Block
+     * Group table segment that grow appended, and must lie where the
+     * kernel requires -- between the data area and the end of the
+     * volume -- with a layout_gen that says a grow happened. The
+     * overlap pass proves the regions do not collide; this proves the
+     * superblock's own account of itself is self-consistent, so a
+     * half-written grow cannot read as clean. (It used to say the
+     * RELOCATED tables live here; nothing is relocated any more --
+     * audit 2026-11-11 F9.)
      */
     if (cetrafs_le64(sb.tail_reserve_blocks)) {
         uint64_t rs = cetrafs_le64(sb.tail_reserve_start);
