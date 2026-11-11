@@ -14,12 +14,15 @@
 #  2. in a busy region: a consume that kept losing to appenders was
 #     skipped, and the copy in it applied by the next drain;
 #  3. appended between the drain's read of a region and its swap: the
-#     swap consumed only what the read had listed.
+#     swap consumed only what the read had listed;
+#  4. appended during the drain into a region its read found EMPTY,
+#     which it therefore never swapped for (review F3).
 #
 # Now a drain that finds anything reads the whole queue, consumes every
-# entry each swap finds, and applies a range only if no copy of it is
-# still queued afterwards -- a held copy keeps its blocks allocated, so
-# the later drain that applies it frees nothing anyone was given.
+# entry each swap finds, reads the whole queue AGAIN once consuming is
+# over, and applies a range only if no copy of it is still queued -- a
+# held copy keeps its blocks allocated, so the later drain that applies
+# it frees nothing anyone was given.
 #
 # Staged as a peer's queued free really is: block L allocated and
 # referenced by nothing (data_leak_poke), two copies of [L +1) queued.
@@ -29,7 +32,10 @@
 #
 # CONTROLS, in the tree (pf_drain_weaken): each case runs again with its
 # part of the rule switched off and must then end with a block freed
-# under its owner.
+# under its owner. The re-read backs up the sweep and the consume-all --
+# a copy either one misses is still queued at the re-read, and held -- so
+# cases 1 and 3 switch off their part AND the re-read; case 2 switches
+# off the hold, case 4 the re-read alone.
 set -euo pipefail
 . "$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)/lib/harness.sh"
 require_root
@@ -255,10 +261,46 @@ case3() {
     verdict 3 "$F" "$L" c3
 }
 
+# ------------------------------------------------------------------- 4
+case4() {
+    log "4: a copy appended during a drain into a region its read found empty"
+    L="$(stage c4)" || { fail "4 setup: could not stage a queued free"; ct_exit; }
+    MARK="$(dmesg_mark)"
+    late_copy 4 1 0 # queue block 1, region 0: empty at the read, never swapped
+    if [ "$CTRL" = 1 ]; then
+        # Unheld, the first copy was applied: L is free, and a file gets it.
+        ct_param_set pf_drain_min_ms 0
+        if [ "$(ext "$TRIG")" = "$L" ]; then
+            F="$TRIG"
+        else
+            F="$(grab c4 "$L")" || { fail "4 CONTROL setup: no file was given the freed block $L"; ct_umount "$MNT"; ct_exit; }
+        fi
+        ct_param_set pf_drain_min_ms 600000
+    else
+        [ "$(queued "$L")" = 1 ] || fail "4 setup: expected the late copy alone queued, found $(queued "$L")"
+        dmesg_since "$MARK" | grep -q "lba=$L count=1 has a copy still queued" &&
+            pass "4: the re-read after consuming found the late copy and held the free" ||
+            fail "4: the drain applied $L with a copy of its free still queued in a region it never swapped"
+        # While held, L stays allocated: the next file goes elsewhere.
+        dd if=/dev/urandom of="$MNT/k4" bs=4096 count=1 conv=fsync status=none
+        [ "$(ext "$MNT/k4")" != "$L" ] && pass "4: and $L was not handed out meanwhile" ||
+            fail "4: $L was handed to a new file while a copy of its free was still queued"
+        F="$MNT/k4"
+    fi
+    later_drain c4 # consumes the late copy: with the hold, frees L, which nobody has
+    if [ "$CTRL" = 1 ]; then
+        verdict 4 "$F" "$L" c4
+    else
+        verdict 4 "$F" "$(ext "$F")" c4
+    fi
+}
+
 case1
 case2
 case3
-control 1 1 case1
+case4
+control 1 9 case1
 control 2 4 case2
-control 3 2 case3
+control 3 10 case3
+control 4 8 case4
 ct_exit

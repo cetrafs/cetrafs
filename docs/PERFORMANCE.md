@@ -489,7 +489,11 @@ One serial uncached read costs ~0.25 ms there, so an unbatched sweep is
 ~64 ms per owned Zone Group per pass with work -- on every tick, once
 UNMAP makes foreign frees continuous. Per owned Zone Group that has
 entries, the batched sweep adds about 1.2 ms per pass; quiet ones add
-nothing.
+nothing. A drain that consumed anything then reads the whole queue a
+second time, after consuming (a copy appended meanwhile into a region
+the first read found empty is held, not left for a later drain to
+apply): one more batched read, so about 2.4 ms per pass with work --
+unmeasured on the array, estimated from the row above.
 
 **Guarded by:** procfs `pf_drain_blocks` / `pf_drain_sweeps` (a quiet
 volume's blocks per drain stay ~2 per owned ZG and its sweeps 0);

@@ -2000,10 +2000,10 @@ struct cetrafs_pf_drain_ctx {
  * case of tests/kernel/pf_stale_copy_later_drain.sh has its control in
  * the tree. Bits: 1 = consume stops at an empty run of queue blocks
  * (the old scan); 2 = consume only what the read listed; 4 = apply a
- * range even while a copy is held. */
+ * range even while a copy is held; 8 = no re-read after consuming. */
 static unsigned int cetrafs_pf_drain_weaken;
 cetrafs_test_param(pf_drain_weaken, cetrafs_pf_drain_weaken, uint, 0644);
-MODULE_PARM_DESC(pf_drain_weaken, "TEST ONLY: disable parts of the drain's copy rule (bits: 1 sweep, 2 consume-all, 4 hold)");
+MODULE_PARM_DESC(pf_drain_weaken, "TEST ONLY: disable parts of the drain's copy rule (bits: 1 sweep, 2 consume-all, 4 hold, 8 recheck)");
 
 static int cetrafs_pf_drain_mutate(void *image, unsigned int len, void *priv)
 {
@@ -2176,6 +2176,9 @@ static int cetrafs_pf_hold_range(struct maple_tree *mt, u64 lba, u32 count)
  *  3. Every region holding an entry is consumed, all of it
  *     (cetrafs_pf_drain_mutate()). A busy region is retried, bounded; one
  *     still busy keeps its entries, and their ranges are HELD.
+ *  3b. Once consuming is over, the whole queue is read again and every
+ *     range still in it is HELD too: a copy appended meanwhile into a
+ *     region the first read found empty was never swapped for.
  *  4. Then the applies: a range already applied by this drain is a copy
  *     and is skipped; a range overlapping a held one is skipped too. Its
  *     blocks stay allocated -- bitmap-set, so nothing can be allocated
@@ -2190,8 +2193,8 @@ static int cetrafs_pf_hold_range(struct maple_tree *mt, u64 lba, u32 count)
  * three nodes). And one drain at a time (pf_drain_mutex), or two would
  * split the queue and each apply its half blind to the other's.
  *
- * Not covered: a copy APPENDED after this drain consumed its region,
- * which a later drain applies -- a double free arriving late, which the
+ * Not covered: a copy APPENDED after the re-read in 3b, which a later
+ * drain applies -- a double free arriving late, which the
  * direct free path could not catch either.
  */
 static int cetrafs_zg_drain_one(struct super_block *sb, u32 zg_id)
@@ -2348,6 +2351,38 @@ static int cetrafs_zg_drain_one(struct super_block *sb, u32 zg_id)
             }
             memcpy(&got[ngot], ctx->seen, ctx->n * sizeof(ctx->seen[0]));
             ngot += ctx->n;
+        }
+    }
+
+    /* 3b. Read the whole queue again, now that consuming is over, and hold
+     * every range still in it. A region the first read found empty was
+     * never swapped, so a copy a peer appended there meanwhile -- and an
+     * appender that loses a busy region moves on to the next one, so
+     * under contention that is where appends go -- was neither consumed
+     * nor held, and a later drain applied it after the block had been
+     * handed out again (review F3). Only when something was consumed:
+     * a drain with nothing to apply needs no hold. A failed read holds
+     * everything (a leak, never a share). */
+    if (ngot && !(weaken & 8)) {
+        for (qb = 0; qb < qblocks; qb++) {
+            brelse(bhs[qb]);
+            bhs[qb] = NULL;
+        }
+        if (cetrafs_bread_uncached_batch(sb, qstart, qblocks, bhs)) {
+            pr_warn_ratelimited("pending free: ZG %u could not re-read its queue after consuming -- holding "
+                                "everything this drain consumed\n",
+                                zg_id);
+            hold_all = true;
+        } else {
+            atomic64_add(qblocks, &cetrafs_pf_drain_blocks);
+            for (qb = 0; qb < qblocks && !hold_all; qb++) {
+                const cetrafs_pending_free_t *ent = (const cetrafs_pending_free_t *) bhs[qb]->b_data;
+
+                for (e = 0; e < regions * slots; e++)
+                    if (ent[e].lba && cetrafs_le32(ent[e].magic) == CETRAFS_PENDING_FREE_MAGIC &&
+                        cetrafs_pf_hold_range(&held_mt, cetrafs_le64(ent[e].lba), cetrafs_le32(ent[e].count)))
+                        hold_all = true;
+            }
         }
     }
 
