@@ -331,9 +331,13 @@ the way out, at the one moment that is safest for it: the group already
 drained out of this node's allocator, its bitmap proven empty **on the
 device** (`cetrafs_bg_release_bitmap_ready()`), and its descriptor not
 yet FREE, so no peer can claim it. After the swap to FREE a discard
-could land on a peer's first writes; before the drain, on ours. Space in
-the pool is then always space already given back, and FITRIM only needs
-the Block Groups a node owns.
+could land on a peer's first writes; before the drain, on ours. While
+discard is on, space in the pool is then space already given back, and
+FITRIM only needs the Block Groups a node owns. A group handed back
+while discard is OFF (`nodiscard`, or `discard=off` in `controls`)
+reaches the pool undiscarded, and nothing discards it afterwards:
+FITRIM never looks at the pool. Measured on an FC array, 2026-11-11
+(docs/internal/UNMAP-BENCHMARK.md); on the TODO list.
 
 It is one command per Block Group (the block layer splits it at the
 device's limit) and runs inside the heartbeat, so a pass may spend at
