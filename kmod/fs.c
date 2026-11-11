@@ -4459,13 +4459,32 @@ void cetrafs_shadow_clear(struct super_block *sb, u64 lba, u64 count, const char
     }
 }
 
-/* Held across cetrafs_cas_region()'s no-CAW read-decide-write only; a
- * leaf lock (no CAS mutator acquires anything). */
+/*
+ * Held across the no-CAW fallback's read-decide-write
+ * (cetrafs_cas_region_seeded_impl()) and across a raw inode record write
+ * on a no-CAW device (cetrafs_write_raw_inode(), which must not land
+ * between a CAS's read and its write). A leaf lock: no CAS mutator and
+ * nothing inside the record write acquires anything.
+ *
+ * Both hold it across DEVICE I/O -- a forced-fresh read and a synced
+ * write -- so a stalled device leaves every other local CAS waiting on
+ * it. The CAS side waits killably when its caller may be interrupted
+ * (cetrafs_sb_cas_lock_killable()); it used to be uninterruptible
+ * whatever the caller, and this comment named only one holder (audit
+ * 2026-11-11 C4, tests/kernel/cas_nocaw_wait_killable.sh).
+ */
 void cetrafs_sb_cas_lock(struct super_block *sb)
 {
     struct cetrafs_sb_info *sbi = sb->s_fs_info;
 
     mutex_lock(&sbi->cas_mutex);
+}
+
+int cetrafs_sb_cas_lock_killable(struct super_block *sb)
+{
+    struct cetrafs_sb_info *sbi = sb->s_fs_info;
+
+    return mutex_lock_killable(&sbi->cas_mutex);
 }
 
 void cetrafs_sb_cas_unlock(struct super_block *sb)

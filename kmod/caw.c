@@ -245,6 +245,13 @@ static int cetrafs_cas_verify_read(struct super_block *sb, u64 fs_lba, u8 *out)
     return ret;
 }
 
+/* TEST ONLY: the next no-CAW swap holds the fallback's mutex this much
+ * longer, so a suite can kill a CAS waiting behind it
+ * (cas_nocaw_wait_killable.sh). One-shot. */
+static unsigned int cetrafs_cas_nocaw_stall_ms;
+cetrafs_test_param(cas_nocaw_stall_ms, cetrafs_cas_nocaw_stall_ms, uint, 0644);
+MODULE_PARM_DESC(cas_nocaw_stall_ms, "TEST ONLY: the next no-CAW CAS holds its mutex this many ms longer (one-shot)");
+
 static bool cetrafs_caw_timeout_late_once;
 cetrafs_test_param(caw_timeout_late_once, cetrafs_caw_timeout_late_once, bool, 0644);
 MODULE_PARM_DESC(caw_timeout_late_once, "TEST ONLY: next CAW reports a timeout, then lands just before the next one");
@@ -1208,8 +1215,15 @@ static int cetrafs_cas_region_seeded_impl(struct super_block *sb,
          * a real I/O error (without the retry a plain create() failed
          * with EIO roughly once per 300).
          */
-        cetrafs_sb_cas_lock(sb);
+        if (!killable) {
+            cetrafs_sb_cas_lock(sb);
+        } else if (cetrafs_sb_cas_lock_killable(sb)) {
+            ret = -EINTR; /* nothing read, nothing written */
+            goto out;
+        }
         ret = cetrafs_cas_nocaw(sb, fs_lba, off, region, old, new, mutate, priv);
+        if (READ_ONCE(cetrafs_cas_nocaw_stall_ms))
+            msleep(xchg(&cetrafs_cas_nocaw_stall_ms, 0)); /* once */
         cetrafs_sb_cas_unlock(sb);
         goto out;
     }

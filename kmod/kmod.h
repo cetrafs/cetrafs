@@ -377,6 +377,7 @@ const struct cetrafs_caw_info *cetrafs_sb_caw(struct super_block *sb);
 bool cetrafs_sb_caw_available(struct super_block *sb);
 bool cetrafs_sb_mount_has_caw(struct super_block *sb);
 void cetrafs_sb_cas_lock(struct super_block *sb);
+int cetrafs_sb_cas_lock_killable(struct super_block *sb);
 void cetrafs_sb_cas_unlock(struct super_block *sb);
 void cetrafs_sb_alloc_lock(struct super_block *sb);
 void cetrafs_sb_alloc_unlock(struct super_block *sb);
