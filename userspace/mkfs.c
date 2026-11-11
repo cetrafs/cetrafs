@@ -12,6 +12,7 @@
 
 #define _GNU_SOURCE
 #include <errno.h>
+#include <signal.h>
 #include <fcntl.h>
 #include <inttypes.h>
 #include <linux/fs.h> /* BLKGETSIZE64 */
@@ -141,7 +142,13 @@ static bool is_device_nonempty(int fd, u64 blocks_to_scan, u32 *found_magic)
 
     /* check block 0 for our magic. A read that fails is not an empty
      * device: it is one we cannot see, and this check is what stands
-     * between -f-less mkfs and an existing volume. */
+     * between -f-less mkfs and an existing volume.
+     *
+     * Read past this machine's cache: a shared LUN is not coherent
+     * through it, and a block 0 cached while the LUN was blank would read
+     * "empty" over a volume a peer has formatted and mounted since
+     * (audit 2026-11-11 M2). */
+    (void) posix_fadvise(fd, 0, (off_t) blocks_to_scan * CETRAFS_BLOCK_SIZE, POSIX_FADV_DONTNEED);
     if (pread(fd, buf, CETRAFS_BLOCK_SIZE, 0) != (ssize_t) CETRAFS_BLOCK_SIZE) {
         free(buf);
         return true; /* conservative */
@@ -331,6 +338,50 @@ static u64 cetrafs_solve_bg_count(u64 total_blocks, u64 fixed_wo_B, u64 bg_size_
  * goes back -- but only over our own zeros: a growfs publish that
  * landed meanwhile is not ours to overwrite.
  */
+/*
+ * The window between zeroing block 0 and the verdict can last the whole
+ * live-peer probe -- minutes, against a row advertising a long stale
+ * window -- and over a volume that may be live. Nothing may end it with
+ * block 0 zero and the old superblock only in this process's memory
+ * (audit 2026-11-11 M1): there is no backup superblock, and a volume
+ * whose block 0 is gone never mounts again.
+ *
+ * So the old block goes to a file first (refused if it cannot: then
+ * nothing has been written), the signals an operator or a provisioning
+ * timeout sends are held off until the verdict, and a restore that fails
+ * says so and names the copy. SIGKILL cannot be held off; the copy and
+ * the command printed before the probe are what is left then.
+ */
+static char mkfs_saved_sb[512];
+
+static void mkfs_save_old_superblock(const unsigned char *old, size_t len, const char *dev)
+{
+    const char *dir = getenv("TMPDIR");
+    const char *base = strrchr(dev, '/');
+    int sfd;
+
+    if (!dir || !*dir)
+        dir = "/var/tmp";
+    snprintf(mkfs_saved_sb, sizeof(mkfs_saved_sb), "%s/mkfs.cetra-%s-%ld.sb", dir, base ? base + 1 : dev,
+             (long) getpid());
+    sfd = open(mkfs_saved_sb, O_WRONLY | O_CREAT | O_EXCL, 0600);
+    if (sfd < 0 || write(sfd, old, len) != (ssize_t) len || fsync(sfd) != 0) {
+        int e = errno;
+
+        if (sfd >= 0) {
+            close(sfd);
+            unlink(mkfs_saved_sb);
+        }
+        die_dev("%s: cannot save its superblock to %s before retiring it: %s -- nothing was written",
+                dev, mkfs_saved_sb, strerror(e));
+    }
+    close(sfd);
+    fprintf(stderr,
+            "%s: old superblock saved to %s while this node checks no other node uses the volume.\n"
+            "       If mkfs is killed before it finishes: dd if=%s of=%s bs=4096 count=1 conv=notrunc,fsync\n",
+            dev, mkfs_saved_sb, mkfs_saved_sb, dev);
+}
+
 static void mkfs_retire_old_superblock(int fd, const char *dev)
 {
     unsigned char old[CETRAFS_BLOCK_SIZE], zero[CETRAFS_BLOCK_SIZE], now[CETRAFS_BLOCK_SIZE];
@@ -338,25 +389,88 @@ static void mkfs_retire_old_superblock(int fd, const char *dev)
     char label[CETRAFS_NODE_LABEL_LEN + 1] = {0};
     long long age = 0;
     uint32_t row = 0;
+    sigset_t hold, prev;
+    bool restored = false, interrupted = false;
     int lp, rc;
 
+    /* Past this machine's cache, as every other reader of a shared LUN
+     * (M2): a cached "not cetrafs" skipped the probe below entirely. */
+    (void) posix_fadvise(fd, 0, CETRAFS_BLOCK_SIZE, POSIX_FADV_DONTNEED);
     if (pread(fd, old, sizeof(old), 0) != (ssize_t) sizeof(old))
         die_dev("%s: cannot read block 0: %s", dev, strerror(errno));
     memcpy(&sb, old, sizeof(sb));
     memset(zero, 0, sizeof(zero));
-    if (pwrite(fd, zero, sizeof(zero), 0) != (ssize_t) sizeof(zero) || fsync(fd) != 0)
-        die_dev("%s: cannot clear the old superblock: %s", dev, strerror(errno));
-    if (cetrafs_le32(sb.magic) != CETRAFS_MAGIC)
+    if (cetrafs_le32(sb.magic) != CETRAFS_MAGIC) {
+        if (pwrite(fd, zero, sizeof(zero), 0) != (ssize_t) sizeof(zero) || fsync(fd) != 0)
+            die_dev("%s: cannot clear the old superblock: %s", dev, strerror(errno));
         return; /* not a cetrafs volume: nobody can be mounting it as one */
+    }
+
+    mkfs_save_old_superblock(old, sizeof(old), dev);
+    sigemptyset(&hold);
+    {
+        /* Only the ones that would end mkfs: one it was started with
+         * ignored (nohup's SIGHUP) stays ignored, not a refusal. */
+        static const int stops[] = {SIGINT, SIGTERM, SIGHUP, SIGQUIT};
+        size_t i;
+
+        for (i = 0; i < sizeof(stops) / sizeof(stops[0]); i++) {
+            struct sigaction sa;
+
+            if (sigaction(stops[i], NULL, &sa) == 0 && sa.sa_handler != SIG_IGN)
+                sigaddset(&hold, stops[i]);
+        }
+    }
+    sigprocmask(SIG_BLOCK, &hold, &prev);
+    if (pwrite(fd, zero, sizeof(zero), 0) != (ssize_t) sizeof(zero) || fsync(fd) != 0)
+        die_dev("%s: cannot clear the old superblock: %s (a copy is in %s)", dev, strerror(errno), mkfs_saved_sb);
 
     lp = cetrafs_find_live_peer_on(fd, dev, &sb, &row, label, sizeof(label), &age);
     rc = lp ? 0 : cetrafs_find_repair_claim(fd, &sb, &row, label, sizeof(label));
-    if (!lp && !rc)
-        return;
+    {
+        /* A signal held off during the probe is the operator stopping
+         * mkfs: that is a refusal, not a licence to format once the
+         * probe is done. */
+        sigset_t pend;
+        int i;
 
-    if (pread(fd, now, sizeof(now), 0) == (ssize_t) sizeof(now) && memcmp(now, zero, sizeof(now)) == 0 &&
-        (pwrite(fd, old, sizeof(old), 0) != (ssize_t) sizeof(old) || fsync(fd) != 0))
+        if (sigpending(&pend) == 0)
+            for (i = 1; i < NSIG && !interrupted; i++)
+                interrupted = sigismember(&hold, i) == 1 && sigismember(&pend, i) == 1;
+    }
+    if (!lp && !rc && !interrupted) {
+        /* The verdict: formatting. */
+        unlink(mkfs_saved_sb);
+        sigprocmask(SIG_SETMASK, &prev, NULL);
+        return;
+    }
+
+    /* Refused: the superblock goes back -- but only over our own zeros:
+     * a growfs publish that landed meanwhile is not ours to overwrite. */
+    (void) posix_fadvise(fd, 0, CETRAFS_BLOCK_SIZE, POSIX_FADV_DONTNEED);
+    if (pread(fd, now, sizeof(now), 0) != (ssize_t) sizeof(now)) {
+        fprintf(stderr, "%s: cannot read block 0 back to restore it: %s\n", dev, strerror(errno));
+    } else if (memcmp(now, zero, sizeof(now)) != 0) {
+        restored = true; /* someone else's write: theirs stands */
+    } else if (pwrite(fd, old, sizeof(old), 0) != (ssize_t) sizeof(old) || fsync(fd) != 0) {
         fprintf(stderr, "%s: could not put the old superblock back: %s\n", dev, strerror(errno));
+    } else {
+        restored = true;
+    }
+    if (!restored)
+        die_dev("%s: its superblock could NOT be put back after the refusal below -- the volume will not\n"
+                "       mount until it is. Restore it from the copy:\n"
+                "       dd if=%s of=%s bs=4096 count=1 conv=notrunc,fsync\n"
+                "       (refused because %s)",
+                dev, mkfs_saved_sb, dev,
+                interrupted        ? "mkfs was interrupted"
+                : lp < 0 || rc < 0 ? "its Node Registry could not be read"
+                : lp               ? "another node has it mounted"
+                                   : "it is being repaired");
+    unlink(mkfs_saved_sb);
+    if (interrupted)
+        die_dev("%s: interrupted -- nothing was formatted, the old superblock is back", dev);
+    sigprocmask(SIG_SETMASK, &prev, NULL);
     if (lp < 0 || rc < 0)
         die_dev("%s: cannot read its Node Registry (I/O error) -- so it is impossible to\n"
                 "       prove no other node has this volume mounted, and formatting on a guess\n"
