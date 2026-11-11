@@ -108,7 +108,7 @@ handback() {
     local free mark i
     fresh
     ct_umount "$MNT"
-    free="$("$BGPOKE" "$IMG" 0 --dump | sed -n 's/.*free_data_blocks=\([0-9]*\).*/\1/p')"
+    free="$("$BGPOKE" "$DEV" 0 --dump | sed -n 's/.*free_data_blocks=\([0-9]*\).*/\1/p')"
     ct_mount "$DEV" "$MNT"
     fallocate -l $(((free - 256) * 4096)) "$MNT/pad"
     mkdir "$MNT/bulk"

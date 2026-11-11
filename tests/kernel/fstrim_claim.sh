@@ -176,6 +176,7 @@ local_double_free() {
     ino="$(stat -c %i "$MNT/d")"
     ct_umount "$MNT"
     "$EPOKE" "$IMG" "$ino" $((HOLE + 7)) >/dev/null
+    blockdev --flushbufs "$DEV" # the mount reads the device, the poke wrote the file
     ct_mount "$DEV" "$MNT"
     mark="$(dmesg_mark)"
     ct_param_set trim_hold_off "$2"
