@@ -588,6 +588,7 @@ u64 cetrafs_pf_full_scans_count(void);
 u64 cetrafs_pf_drain_blocks_count(void);
 u64 cetrafs_pf_drain_sweeps_count(void);
 u64 cetrafs_pf_drain_held_count(void);
+u64 cetrafs_pf_drain_busy_waits_count(void);
 u64 cetrafs_bg_recount_count(void);
 u64 cetrafs_pf_drop_runs_count(void);
 u64 cetrafs_pf_drop_blocks_count(void);
@@ -1023,7 +1024,9 @@ int cetrafs_zg_release_surplus(struct super_block *sb, u32 my_node_id);
 int cetrafs_zg_release_all_rdonly(struct super_block *sb, u32 my_node_id);
 int cetrafs_zg_scrub_adopt_one_stale(struct super_block *sb, bool *out_adopted);
 int cetrafs_zg_queue_foreign_free(struct super_block *sb, u32 zg_id, u64 lba, u32 count);
-int cetrafs_zg_drain_pending_frees(struct super_block *sb);
+/* may_wait: back off on a busy region (heartbeat, mount); false on the
+ * allocation path, where a write is waiting. */
+int cetrafs_zg_drain_pending_frees(struct super_block *sb, bool may_wait);
 /* Read-only walk of a ZG's pending-free queue: the scrub must not treat
  * a block with a free already queued against it as a leak. */
 int cetrafs_zg_pending_free_for_each(struct super_block *sb, u32 zg_id, void (*cb)(void *, u64, u32), void *ctx);

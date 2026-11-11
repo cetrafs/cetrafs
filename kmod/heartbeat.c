@@ -367,7 +367,7 @@ static void cetrafs_heartbeat_maint(struct work_struct *work)
      * is their backoff (cetrafs_lock_retry_cold()). */
     cetrafs_lock_retry_cold(sb);
 
-    ret = cetrafs_zg_drain_pending_frees(sb);
+    ret = cetrafs_zg_drain_pending_frees(sb, true);
     if (ret)
         pr_warn("heartbeat: pending-free drain pass failed: %d\n", ret);
 

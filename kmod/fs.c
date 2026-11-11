@@ -3118,7 +3118,7 @@ int cetrafs_fill_super(struct super_block *sb, struct fs_context *fc)
                 /* Apply any frees other nodes queued against ZGs we own
                  * while we were away -- not fatal if it
                  * fails, the heartbeat tick retries every interval. */
-                rc = cetrafs_zg_drain_pending_frees(sb);
+                rc = cetrafs_zg_drain_pending_frees(sb, true);
                 if (rc)
                     pr_warn("pending-free drain at mount failed (heartbeat will retry): %d\n", rc);
             } else {

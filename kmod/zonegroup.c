@@ -2093,6 +2093,12 @@ MODULE_PARM_DESC(pf_drain_consume_stall_ms, "TEST ONLY: one-shot pause between a
 
 static atomic64_t cetrafs_pf_drain_sweeps = ATOMIC64_INIT(0);
 static atomic64_t cetrafs_pf_drain_held = ATOMIC64_INIT(0);
+static atomic64_t cetrafs_pf_drain_busy_waits = ATOMIC64_INIT(0);
+
+u64 cetrafs_pf_drain_busy_waits_count(void)
+{
+    return (u64) atomic64_read(&cetrafs_pf_drain_busy_waits);
+}
 
 u64 cetrafs_pf_drain_sweeps_count(void)
 {
@@ -2107,7 +2113,12 @@ u64 cetrafs_pf_drain_held_count(void)
 /* A busy region's consume is retried this many times, backing off 1, 2,
  * 4 ... ms (about a quarter of a second in all) before the drain gives
  * up on it for this pass. Bounded: a drain runs on the heartbeat, and an
- * unbounded wait on appenders would be a tick that never ends. */
+ * unbounded wait on appenders would be a tick that never ends. Only a
+ * drain that may wait does: the allocator's runs under a write's
+ * inode_lock and invalidate_lock, where each busy region would add a
+ * quarter second to a VM's write (review F4). There a busy region is
+ * tried once and held -- the hold keeps that correct, and the
+ * heartbeat's next drain retries it. */
 #define CETRAFS_PF_BUSY_RETRIES 8
 
 /* Does this region hold any entry at all (valid or garbage)? */
@@ -2197,7 +2208,7 @@ static int cetrafs_pf_hold_range(struct maple_tree *mt, u64 lba, u32 count)
  * drain applies -- a double free arriving late, which the
  * direct free path could not catch either.
  */
-static int cetrafs_zg_drain_one(struct super_block *sb, u32 zg_id)
+static int cetrafs_zg_drain_one(struct super_block *sb, u32 zg_id, bool may_wait)
 {
     unsigned int region_sz = cetrafs_cas_region_size(sb);
     unsigned int regions = CETRAFS_BLOCK_SIZE / region_sz;
@@ -2317,8 +2328,9 @@ static int cetrafs_zg_drain_one(struct super_block *sb, u32 zg_id)
                 } else {
                     ret = cetrafs_cas_region(sb, qstart + qb, r, cetrafs_pf_drain_mutate, ctx);
                 }
-                if (ret != -EBUSY || try >= CETRAFS_PF_BUSY_RETRIES)
+                if (ret != -EBUSY || !may_wait || try >= CETRAFS_PF_BUSY_RETRIES)
                     break;
+                atomic64_inc(&cetrafs_pf_drain_busy_waits);
                 msleep(1u << try);
             }
             if (ret == -EBUSY) {
@@ -2544,7 +2556,7 @@ u64 cetrafs_pf_drain_count(void)
     return (u64) atomic64_read(&cetrafs_pf_drains);
 }
 
-int cetrafs_zg_drain_pending_frees(struct super_block *sb)
+int cetrafs_zg_drain_pending_frees(struct super_block *sb, bool may_wait)
 {
     atomic64_inc(&cetrafs_pf_drains);
     const cetrafs_superblock_t *raw_sb = cetrafs_sb_raw(sb);
@@ -2568,7 +2580,7 @@ int cetrafs_zg_drain_pending_frees(struct super_block *sb)
         if (!cetrafs_sb_zg_owned_cached(sb, z))
             continue;
 
-        rc = cetrafs_zg_drain_one(sb, z);
+        rc = cetrafs_zg_drain_one(sb, z, may_wait);
         if (rc && !ret)
             ret = rc;
     }
@@ -2709,7 +2721,7 @@ int cetrafs_alloc_pick_bg(struct super_block *sb, u32 *out_bg_id)
         if (!last || !cetrafs_pf_drain_min_ms ||
             time_after(now, last + msecs_to_jiffies(cetrafs_pf_drain_min_ms))) {
             cetrafs_sb_set_pf_drain_last(sb, now);
-            (void) cetrafs_zg_drain_pending_frees(sb);
+            (void) cetrafs_zg_drain_pending_frees(sb, false); /* a write is waiting */
         }
     }
 
@@ -2837,7 +2849,7 @@ retry_scan:
              * its previous owner (or while unowned) -- apply them now,
              * since they may be exactly the free space this allocation
              * is here looking for. */
-            cetrafs_zg_drain_pending_frees(sb);
+            cetrafs_zg_drain_pending_frees(sb, false); /* a write is waiting */
         }
         /* Rescan even without a claim of our own: another thread's may
          * have finished while this one waited for the claim mutex. Once

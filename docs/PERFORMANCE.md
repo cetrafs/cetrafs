@@ -495,6 +495,15 @@ the first read found empty is held, not left for a later drain to
 apply): one more batched read, so about 2.4 ms per pass with work --
 unmeasured on the array, estimated from the row above.
 
+A busy region (a consume that keeps losing to appenders) is retried
+with a back-off of 1 .. 128 ms, about a quarter of a second, only by a
+drain that may wait: the heartbeat's and the mount's. A drain from the
+allocation path runs inside a write, under its inode_lock and
+invalidate_lock, so it tries a busy region once and holds its entries
+for the next pass -- correct because of the hold, and a quarter second
+per busy region off the write. Guarded by procfs `pf_drain_busy_waits`
+and `tests/kernel/pf_alloc_drain_no_wait.sh`.
+
 **Guarded by:** procfs `pf_drain_blocks` / `pf_drain_sweeps` (a quiet
 volume's blocks per drain stay ~2 per owned ZG and its sweeps 0);
 `tests/kernel/pf_stale_copy_later_drain.sh` (correctness). Neither
