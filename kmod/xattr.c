@@ -109,7 +109,7 @@ static void cetrafs_xattr_read_pause(u64 ino)
  * fresh AGAIN after the block, and the copy is used only if the record
  * still names that block for this same file; otherwise start over.
  */
-#define CETRAFS_XATTR_READ_RETRIES 5
+#define CETRAFS_XATTR_READ_RETRIES CETRAFS_BLK_TAIL_READ_RETRIES
 
 static int cetrafs_xattr_read_block(struct inode *inode, void **out)
 {
@@ -172,8 +172,8 @@ static int cetrafs_xattr_read_block(struct inode *inode, void **out)
          * 2026-11-06 L3); a torn one is retried like any other tear. */
         if (unlikely(cetrafs_xattr_tear_copy_once) && xchg(&cetrafs_xattr_tear_copy_once, false))
             ((u8 *) copy)[offsetof(cetrafs_xattr_entry_t, value)] ^= 0xff; /* TEST ONLY: see the parameter */
-        if (!cetrafs_blk_image_valid(copy, CETRAFS_XATTR_TAIL_MAGIC)) {
-            usleep_range(100, 400);
+        if (cetrafs_tear_injected() || !cetrafs_blk_image_valid(copy, CETRAFS_XATTR_TAIL_MAGIC)) {
+            cetrafs_tear_backoff(attempt); /* a peer's write in flight: milliseconds (X1) */
             continue;
         }
 
@@ -186,7 +186,9 @@ static int cetrafs_xattr_read_block(struct inode *inode, void **out)
             *out = copy;
             return 0;
         }
-        /* The record moved under the read: the copy may be anybody's. */
+        /* The record moved under the read: the copy may be anybody's.
+         * A peer's setxattr in flight; give it the time it takes. */
+        cetrafs_tear_backoff(attempt);
     }
     pr_err_ratelimited("xattr on ino=%llu: its xattr block kept changing under %d reads -- giving up\n",
                        (unsigned long long) inode->i_ino, CETRAFS_XATTR_READ_RETRIES);

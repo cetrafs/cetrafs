@@ -605,7 +605,13 @@ u64 cetrafs_journal_replay_applied_count(void);
 int cetrafs_fiemap(struct inode *inode, struct fiemap_extent_info *fi, u64 start, u64 len);
 
 /* ---- ioutil.c: the whole-block tail checksum ---- */
-#define CETRAFS_BLK_TAIL_READ_RETRIES 5
+/* A torn read is a peer's write in flight: milliseconds on a LUN. The
+ * budget is therefore measured in milliseconds -- 1, 2, 4 ... 128 ms
+ * between attempts, about a quarter of a second in all -- and paid only
+ * on a mismatch (cetrafs_tear_backoff(); audit 2026-11-11 X1). */
+#define CETRAFS_BLK_TAIL_READ_RETRIES 9
+void cetrafs_tear_backoff(int attempt);
+bool cetrafs_tear_injected(void);
 void cetrafs_blk_tail_stamp(struct buffer_head *bh, u32 magic);
 bool cetrafs_blk_tail_valid(const struct buffer_head *bh, u32 magic);
 /* Structure sanity on its own, for the CACHED read paths that skip the

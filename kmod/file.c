@@ -1033,7 +1033,8 @@ static struct buffer_head *cetrafs_scrub_tree_bread(struct super_block *sb, u64 
                 return bh;
             brelse(bh);
         }
-        usleep_range(100, 400);
+        if (attempt + 1 < CETRAFS_BLK_TAIL_READ_RETRIES)
+            cetrafs_tear_backoff(attempt); /* a peer's write in flight (X1) */
     }
     return NULL;
 }

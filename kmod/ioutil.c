@@ -906,6 +906,32 @@ bool cetrafs_blk_tail_valid(const struct buffer_head *bh, u32 magic)
  * -- P5's rule, learned when three readers spent a five-attempt budget
  * in a few microseconds against a write that takes milliseconds.
  */
+/* TEST ONLY: for this many ms after it is set, every tail-checksummed
+ * image read reads torn -- a peer's write that takes that long to land. */
+static unsigned int cetrafs_tail_tear_ms;
+static unsigned long cetrafs_tail_tear_until;
+static int cetrafs_tail_tear_set(const char *val, const struct kernel_param *kp)
+{
+    int ret = param_set_uint(val, kp);
+
+    if (!ret)
+        WRITE_ONCE(cetrafs_tail_tear_until, jiffies + msecs_to_jiffies(cetrafs_tail_tear_ms));
+    return ret;
+}
+static const struct kernel_param_ops cetrafs_tail_tear_ops = {.set = cetrafs_tail_tear_set, .get = param_get_uint};
+module_param_cb(tail_tear_ms, &cetrafs_tail_tear_ops, &cetrafs_tail_tear_ms, 0644);
+MODULE_PARM_DESC(tail_tear_ms, "TEST ONLY: every tail-checksummed read reads torn for this many ms from now");
+
+bool cetrafs_tear_injected(void)
+{
+    return READ_ONCE(cetrafs_tail_tear_ms) && time_before(jiffies, READ_ONCE(cetrafs_tail_tear_until));
+}
+
+void cetrafs_tear_backoff(int attempt)
+{
+    msleep(1U << min(attempt, 7));
+}
+
 struct buffer_head *cetrafs_blk_tail_bread(struct super_block *sb, u64 lba, u32 magic, const char *what)
 {
     int attempt, nbad = 0, chk;
@@ -930,12 +956,13 @@ struct buffer_head *cetrafs_blk_tail_bread(struct super_block *sb, u64 lba, u32 
         struct buffer_head *bh = cetrafs_bread_uncached(sb, lba);
 
         if (bh) {
-            if (cetrafs_blk_tail_valid(bh, magic))
+            if (!cetrafs_tear_injected() && cetrafs_blk_tail_valid(bh, magic))
                 return bh;
             brelse(bh);
             nbad++;
         }
-        usleep_range(100, 400);
+        if (attempt + 1 < CETRAFS_BLK_TAIL_READ_RETRIES)
+            cetrafs_tear_backoff(attempt);
     }
 
     /* Corrupt only if every attempt READ the block and every one failed

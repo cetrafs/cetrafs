@@ -121,9 +121,12 @@ const struct file_operations cetrafs_dir_ops = {
  * observation is transient by construction, since the writer completes
  * its sync under the ns mutex. A block that NEVER converges is genuine
  * on-disk corruption and fails loudly with NULL (callers already treat
- * that as -EIO).
+ * that as -EIO). The same budget as every tail-checksummed read --
+ * about a quarter of a second of backoff (cetrafs_tear_backoff()) --
+ * not 20 tries, which with milliseconds between them would hold every
+ * lookup of a genuinely damaged block for seconds.
  */
-#define CETRAFS_DIRENT_READ_RETRIES 20
+#define CETRAFS_DIRENT_READ_RETRIES CETRAFS_BLK_TAIL_READ_RETRIES
 
 static void cetrafs_dirent_block_stamp(struct buffer_head *bh)
 {
@@ -163,7 +166,7 @@ static struct buffer_head *cetrafs_dirent_bread(struct super_block *sb, u64 lba)
         struct buffer_head *bh = cetrafs_bread_uncached(sb, lba);
 
         if (bh) {
-            if (cetrafs_dirent_block_valid(bh))
+            if (!cetrafs_tear_injected() && cetrafs_dirent_block_valid(bh))
                 return bh;
             brelse(bh);
             nbad++;
@@ -176,11 +179,15 @@ static struct buffer_head *cetrafs_dirent_bread(struct super_block *sb, u64 lba)
          * mid-update at all: cetrafs_bh_begin_update() holds the buffer
          * lock across modify-and-restamp, which the forced-fresh read
          * below blocks on.) Back off rather than spin, so the budget
-         * spans a peer's write rather than a few microseconds.
+         * spans a peer's write rather than a few microseconds -- which
+         * the 100-400 us this slept did not: five of them are about
+         * 2 ms against a write that takes milliseconds (audit 2026-11-11
+         * X1). cetrafs_tear_backoff() is milliseconds, doubling.
          * (A NULL read is retried on the same footing -- it means a
          * concurrent forced-fresh read of the same block cleared the
          * uptodate bit under us, which is equally transient.) */
-        usleep_range(100, 400);
+        if (attempt + 1 < CETRAFS_DIRENT_READ_RETRIES)
+            cetrafs_tear_backoff(attempt);
     }
 
     /* Corrupt only if every attempt read the block and failed: a read
