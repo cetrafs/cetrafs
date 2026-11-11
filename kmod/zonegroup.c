@@ -125,7 +125,7 @@ static int cetrafs_read_zg(struct super_block *sb, u32 zg_id, cetrafs_zone_group
             cetrafs_bh_read_lock(bh);
             want = (u32) le64_to_cpu(zg->hot_checksum);
             got = cetrafs_zg_hot_crc(bh->b_data);
-            if (!cetrafs_record_tear_injected() && got == want &&
+            if (!cetrafs_record_tear_injected("ZG record") && got == want &&
                 (u32) le64_to_cpu(zg->cold_checksum) == cetrafs_zg_cold_crc(bh->b_data)) {
                 bool id_ok = le16_to_cpu(zg->zg_id) == (u16) zg_id;
 

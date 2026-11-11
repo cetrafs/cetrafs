@@ -101,7 +101,7 @@ static int cetrafs_read_node_entry(struct super_block *sb, u32 idx, cetrafs_node
             memcpy(out, bh->b_data, sizeof(*out));
             brelse(bh);
 
-            if (!cetrafs_record_tear_injected() && (cetrafs_le32(out->state) == CETRAFS_NODE_STATE_FREE ||
+            if (!cetrafs_record_tear_injected("node row") && (cetrafs_le32(out->state) == CETRAFS_NODE_STATE_FREE ||
                                                      cetrafs_node_crc(out) == (u32) cetrafs_le64(out->checksum)))
                 return 0;
 

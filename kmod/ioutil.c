@@ -943,15 +943,14 @@ static const struct kernel_param_ops cetrafs_record_tear_ops = {.set = cetrafs_r
 module_param_cb(record_tear_ms, &cetrafs_record_tear_ops, &cetrafs_record_tear_ms, 0644);
 MODULE_PARM_DESC(record_tear_ms, "TEST ONLY: every checksummed record read reads torn for this many ms from now");
 
-static unsigned int cetrafs_record_tear_hits; /* reads it tore: the test's proof it reached a reader */
-module_param_named(record_tear_hits, cetrafs_record_tear_hits, uint, 0444);
-MODULE_PARM_DESC(record_tear_hits, "TEST ONLY: record reads record_tear_ms has torn so far");
-
-bool cetrafs_record_tear_injected(void)
+/* 'what' names the reader in the log: the test's proof that its
+ * operation reached the reader it is about. Not ratelimited -- a
+ * suppressed line would read as "never reached"; the window bounds it. */
+bool cetrafs_record_tear_injected(const char *what)
 {
     if (likely(!READ_ONCE(cetrafs_record_tear_ms)) || !time_before(jiffies, READ_ONCE(cetrafs_record_tear_until)))
         return false;
-    WRITE_ONCE(cetrafs_record_tear_hits, cetrafs_record_tear_hits + 1);
+    pr_info("record_tear_ms: tore a %s read\n", what);
     return true;
 }
 

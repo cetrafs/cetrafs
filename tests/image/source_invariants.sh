@@ -144,7 +144,7 @@ for f in "$K"/*.c; do
     awk -v F="$(basename "$f")" '
         /for \(attempt/ { inloop=1; start=NR; sawcrc=0; sawsleep=0 }
         inloop && /_crc\(|crc_verify\(|checksum/ { sawcrc=1 }
-        inloop && /usleep_range|msleep/ { sawsleep=1 }
+        inloop && /usleep_range|msleep|cetrafs_tear_backoff/ { sawsleep=1 }
         inloop && /^    }/ { if (sawcrc && !sawsleep) printf "%s:%d ", F, start; inloop=0 }
     ' "$f" >>/tmp/ct_audit_missing.$$ 2>/dev/null || true
 done

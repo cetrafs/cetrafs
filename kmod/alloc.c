@@ -1384,7 +1384,7 @@ static int cetrafs_read_bg_geom_at(struct super_block *sb, const cetrafs_superbl
         /* Under the buffer lock, as cetrafs_read_zg(): the free count is
          * patched in place on this very buffer (audit L15). */
         cetrafs_bh_read_lock(bh);
-        if (likely(!cetrafs_record_tear_injected()) &&
+        if (likely(!cetrafs_record_tear_injected("BG descriptor")) &&
             cetrafs_bg_crc_verify(bh->b_data) == (u32) cetrafs_le64(bg->checksum)) {
             if (!cetrafs_bg_geom_sane(raw_sb, bg_id, bg)) {
                 pr_err_ratelimited("BG %u descriptor describes an impossible Block Group (start %llu len %llu "

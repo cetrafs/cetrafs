@@ -242,7 +242,7 @@ int cetrafs_read_raw_inode(struct super_block *sb, u64 ino, cetrafs_inode_t *out
         cetrafs_bh_copy_stable(bh, out, sizeof(*out));
         brelse(bh);
 
-        if (!cetrafs_record_tear_injected() && cetrafs_inode_crcs_ok(out)) {
+        if (!cetrafs_record_tear_injected("inode record") && cetrafs_inode_crcs_ok(out)) {
             /* A valid record in the wrong slot -- a misdirected write,
              * or a record copied to where it does not belong -- is not
              * a torn read, and re-reading will not change it. Without

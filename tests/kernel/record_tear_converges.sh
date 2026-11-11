@@ -17,43 +17,57 @@ set -euo pipefail
 . "$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)/lib/harness.sh"
 require_root
 require_module
-P=/sys/module/cetrafs/parameters
-[ -w $P/record_tear_ms ] || { skip "record_tear_ms is missing"; ct_exit; }
+[ -w /sys/module/cetrafs/parameters/record_tear_ms ] || { skip "record_tear_ms is missing"; ct_exit; }
 
 DEV="$(ct_dev 560 rectear)"
 MNT="$(ct_mnt rectear)"
-ct_mkfs_small "$DEV" >/dev/null
-ct_mount "$DEV" "$MNT"
-require_cetrafs_mount "$MNT"
-PROC="/proc/fs/cetrafs/$(basename "$(readlink -f "$DEV")")"
-touch "$MNT/f"
-python3 -c 'import os,sys; os.setxattr(sys.argv[1], "user.k", b"v")' "$MNT/f"
-sync
-
-torn() { # <case> <cmd...>: run cmd while every record read tears for 8 ms
-    local c="$1" h0 h1 mark rc=0
+# torn <case> <kind...> -- <python statement>: arm an 8 ms tear from
+# inside the process, right before the call (interpreter start-up alone
+# outlasts the window), then require the call to succeed, each named
+# reader to have been torn, and nothing declared corrupt.
+torn() {
+    local c="$1" mark rc=0 k
     shift
+    local kinds=()
+    while [ "$1" != -- ]; do kinds+=("$1"); shift; done
+    shift
+    # A fresh volume per case: a tear declared corruption in one case
+    # must not stop the next from reaching its reader.
+    ct_mkfs_small "$DEV" >/dev/null
+    ct_mount "$DEV" "$MNT"
+    require_cetrafs_mount "$MNT"
+    PROC="$(ct_procdir "$DEV")"
+    touch "$MNT/f"
+    python3 -c 'import os,sys; os.setxattr(sys.argv[1], "user.k", b"v")' "$MNT/f"
+    sync
     mark="$(dmesg_mark)"
-    h0="$(cat $P/record_tear_hits)"
-    ct_param_set record_tear_ms 8
-    "$@" >/dev/null 2>&1 || rc=$?
-    h1="$(cat $P/record_tear_hits)"
+    ct_param_set record_tear_ms 0
+    python3 -I -c '
+import os, sys
+p = open("/sys/module/cetrafs/parameters/record_tear_ms", "w")
+p.write("8"); p.flush()
+'"$1" "$MNT" "$PROC" >/dev/null 2>&1 || rc=$?
     sleep 0.05
     ct_param_set record_tear_ms 0
-    [ "$h1" -gt "$h0" ] || { fail "$c: setup: no record read was torn"; return; }
+    local C
+    C="$(awk '$1 == "corruptions:" { print $2 }' "$PROC/info")"
+    ct_umount "$MNT"
+    for k in "${kinds[@]}"; do
+        dmesg_since "$mark" | grep -q "record_tear_ms: tore a $k read" ||
+            { fail "$c: setup: no $k read was torn"; return; }
+    done
+    [ "$C" = 0 ] || { fail "$c: the volume counts $C corruption(s) from an 8 ms tear"; return; }
     if dmesg_since "$mark" | grep -q "corrupted, not just a torn concurrent read"; then
         fail "$c: a tear of 8 ms was declared corruption: $(dmesg_since "$mark" | grep "corrupted, not just" | head -1)"
     elif [ "$rc" != 0 ]; then
         fail "$c: the operation failed (exit $rc)"
     else
-        pass "$c: $((h1 - h0)) torn read(s) converged"
+        pass "$c: the torn read(s) converged"
     fi
 }
 
-torn "inode record (getxattr)" python3 -c 'import os,sys; os.getxattr(sys.argv[1], "user.k")' "$MNT/f"
-torn "node row (cluster dump)" cat "$PROC/cluster"
-torn "ZG and BG records (statfs)" stat -f "$MNT"
-C="$(awk '$1 == "corruptions:" { print $2 }' "$PROC/info")"
-[ "$C" = 0 ] && pass "the volume counts no corruption" || fail "the volume counts $C corruption(s) from tears"
-ct_umount "$MNT"
+torn "inode record (getxattr)" "inode record" -- 'os.getxattr(sys.argv[1] + "/f", "user.k")'
+torn "node row (cluster dump)" "node row" -- 'open(sys.argv[2] + "/cluster").read()'
+torn "ZG record (statfs)" "ZG record" -- 'os.statvfs(sys.argv[1])'
+torn "BG descriptor (info dump)" "BG descriptor" -- 'open(sys.argv[2] + "/info").read()'
 ct_exit
