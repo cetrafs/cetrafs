@@ -1641,8 +1641,11 @@ int cetrafs_cas_record_fd_seeded(struct super_block *sb,
  * fallback path instead -- which is exactly what runs on the loop-device
  * test harness.
  */
+/* Through cetrafs_test_param(): it writes this node's row block at every
+ * mount and injects timeouts into live swaps, and was a plain parameter
+ * that left no trace (audit 2026-11-11 C7). */
 bool cetrafs_cas_selftest_enabled;
-module_param_named(cas_selftest, cetrafs_cas_selftest_enabled, bool, 0644);
+cetrafs_test_param(cas_selftest, cetrafs_cas_selftest_enabled, bool, 0644);
 MODULE_PARM_DESC(
     cas_selftest,
     "test-only: run a CAS round-trip self-test against this node's own registry row at mount (diagnostic)");

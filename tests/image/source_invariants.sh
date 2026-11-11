@@ -314,12 +314,23 @@ NINJ="$(grep -ohE '(module_param_named|cetrafs_test_param)\((fail|force)[a-z_]*'
 untraced_test_params() {
     awk '
         /module_param_named\(/ { n = $0; sub(/.*module_param_named\(/, "", n); sub(/,.*/, "", n); decl[n] = FILENAME ":" FNR }
-        /MODULE_PARM_DESC\(/ { d = $0; sub(/.*MODULE_PARM_DESC\(/, "", d); nm = d; sub(/,.*/, "", nm)
-                               if (nm in decl && tolower($0) ~ /test[- ]only/) print decl[nm] ":" nm }' "$@"
+        # A description may wrap (clang-format puts a long one on the
+        # next line): it is read up to its closing ");", or cas_selftest
+        # -- "test-only" on the line after MODULE_PARM_DESC( -- passed
+        # unseen (audit 2026-11-11 C7).
+        pend { txt = txt " " $0
+               if (nm == "") { nm = $0; gsub(/^[ \t]+/, "", nm); sub(/,.*/, "", nm) }
+               if ($0 ~ /\);/) { judge(); pend = 0 }
+               next }
+        /MODULE_PARM_DESC\(/ { d = $0; sub(/.*MODULE_PARM_DESC\(/, "", d); nm = d; sub(/,.*/, "", nm); txt = $0
+                               if ($0 ~ /\);/) judge(); else pend = 1 }
+        function judge() { if (nm in decl && tolower(txt) ~ /test[- ]only/) print decl[nm] ":" nm }' "$@"
 }
 SAMPLE="$(ct_tmp testparam-sample)"
 printf '%s\n' 'module_param_named(x_knob, x, bool, 0644);' 'MODULE_PARM_DESC(x_knob, "TEST ONLY: bends a check");' >"$SAMPLE"
 [ -n "$(untraced_test_params "$SAMPLE")" ] || fail "test params: the check does not flag the known-bad sample"
+printf '%s\n' 'module_param_named(y_knob, y, bool, 0644);' 'MODULE_PARM_DESC(' '    y_knob,' '    "test-only: wraps");' >"$SAMPLE"
+[ -n "$(untraced_test_params "$SAMPLE")" ] || fail "test params: the check does not flag a known-bad sample whose description wraps"
 NTP="$(grep -c 'cetrafs_test_param(' "$K"/*.c | awk -F: '{ s += $2 } END { print s }')"
 [ "$NTP" -ge 100 ] || fail "test params: only $NTP traced knobs found -- the scan is not seeing the tree"
 HITS="$(untraced_test_params "$K"/*.c | sed "s|$K/||")"
