@@ -867,6 +867,42 @@ static int cetrafs_node_row_quiet(struct super_block *sb, u32 idx, const cetrafs
     }
 }
 
+/*
+ * Before re-attaching row 'mine': is any OTHER row registered with our
+ * identity, not left cleanly, and still beating? A registration whose
+ * give-back failed leaves its fresh row behind with our UUID; pass 1
+ * took the first such row and never looked further, so an orphan at a
+ * lower index than a live twin's row hid the twin, and the two machines
+ * ran as one node (audit 2026-11-11 N6,
+ * tests/kernel/node_uuid_orphan_twin.sh). Paid only when two rows carry
+ * our identity at once.
+ */
+static int cetrafs_node_other_rows_quiet(struct super_block *sb, u32 mine, const u8 *uuid, u32 *out_idx)
+{
+    const cetrafs_superblock_t *raw_sb = cetrafs_sb_raw(sb);
+    u32 count = le32_to_cpu(raw_sb->node_table_count), idx;
+    cetrafs_node_entry_t ne;
+    int ret;
+
+    for (idx = 0; idx < count; idx++) {
+        if (idx == mine)
+            continue;
+        ret = cetrafs_read_node_entry(sb, idx, &ne);
+        if (ret)
+            return ret;
+        if (cetrafs_le32(ne.state) != CETRAFS_NODE_STATE_REGISTERED ||
+            memcmp(ne.node_uuid, uuid, CETRAFS_NODE_UUID_LEN) != 0 ||
+            cetrafs_le32(ne.departure) == CETRAFS_NODE_DEPART_CLEAN)
+            continue;
+        ret = cetrafs_node_row_quiet(sb, idx, &ne);
+        if (ret) {
+            *out_idx = idx;
+            return ret;
+        }
+    }
+    return 0;
+}
+
 int cetrafs_node_register(struct super_block *sb,
                           u32 file_lock_mode,
                           u32 *out_node_id,
@@ -938,6 +974,15 @@ int cetrafs_node_register(struct super_block *sb,
                         idx);
                     return ret;
                 }
+                if (ret)
+                    return ret;
+            }
+            {
+                u32 twin = 0;
+
+                ret = cetrafs_node_other_rows_quiet(sb, idx, my_uuid.b, &twin);
+                if (ret == -EBUSY)
+                    cetrafs_node_refuse_twin(twin);
                 if (ret)
                     return ret;
             }

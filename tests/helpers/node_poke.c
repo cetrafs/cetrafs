@@ -72,8 +72,9 @@ int main(int argc, char **argv)
                 "       %s <image> <row> --depart <n>       (set the recorded departure: 0 none, 1 clean, 2 dead)\n"
                 "       %s <image> <row> --frees <n>        (set frees_inflight)\n"
                 "       %s <image> <row> --inc <n>          (set the row's incarnation)\n"
-                "       %s <image> <row> --mode <n>         (set the advertised file_lock_mode: 1 on, 2 off)\n",
-                argv[0], argv[0], argv[0], argv[0], argv[0], argv[0], argv[0], argv[0], argv[0], argv[0], argv[0]);
+                "       %s <image> <row> --mode <n>         (set the advertised file_lock_mode: 1 on, 2 off)\n"
+                "       %s <image> <row> --copy-from <src>  (make this row a copy of row <src>)\n",
+                argv[0], argv[0], argv[0], argv[0], argv[0], argv[0], argv[0], argv[0], argv[0], argv[0], argv[0], argv[0]);
         return 2;
     }
 
@@ -161,6 +162,23 @@ int main(int argc, char **argv)
         pwrite_all(fd, &ne, sizeof(ne), row_off);
         close(fd);
         printf("node_poke: row %u hb_seq -> %" PRIu64 "\n", row, ne.hb_seq);
+        return 0;
+    }
+
+    /* --copy-from <src>: this row becomes a copy of row <src>, checksum
+     * restamped -- the only way to give a row THIS machine's identity,
+     * which a test cannot spell (node_uuid is a load-time parameter). */
+    if (argc == 5 && strcmp(argv[3], "--copy-from") == 0) {
+        uint32_t src = (uint32_t) strtoul(argv[4], NULL, 0);
+
+        if (src >= cetrafs_le32(sb.node_table_count))
+            return 2;
+        pread_all(fd, &ne, sizeof(ne), (off_t) (cetrafs_le64(sb.node_table_start) + src) * CETRAFS_BLOCK_SIZE);
+        ne.checksum = 0;
+        ne.checksum = cetrafs_cpu_to_le64(crc32c_struct(&ne, sizeof(ne), offsetof(cetrafs_node_entry_t, checksum), sizeof(cetrafs_le64(ne.checksum))));
+        pwrite_all(fd, &ne, sizeof(ne), row_off);
+        close(fd);
+        printf("node_poke: row %u copied from row %u\n", row, src);
         return 0;
     }
 
