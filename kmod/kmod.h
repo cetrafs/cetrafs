@@ -398,7 +398,8 @@ void cetrafs_sb_note_unclean_reattach(struct super_block *sb);
 bool cetrafs_sb_unclean_reattach(struct super_block *sb);
 /* inode.c: advance a record's namespace stamp (dirent_seq) */
 void cetrafs_ns_stamp_advance(cetrafs_inode_t *rec);
-int cetrafs_inode_advance_change_stamp(struct super_block *sb, u64 ino, u64 generation, bool dir);
+/* as_node: whose change the new file_seq says it is (the replayed node). */
+int cetrafs_inode_advance_change_stamp(struct super_block *sb, u64 ino, u64 generation, bool dir, u32 as_node);
 /* lock.c: clear every claim a previous incarnation of this node left */
 int cetrafs_lock_sweep_own_claims(struct super_block *sb, u32 my_node_id);
 u64 cetrafs_deferred_orphaned_count(void);

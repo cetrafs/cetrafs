@@ -2487,13 +2487,15 @@ static int __cetrafs_journal_replay_node(struct super_block *sb, u32 node_id, bo
             atomic64_inc(&cetrafs_journal_replay_applied);
             applied++;
             /* A redo changed bytes no stamp announced: advance the
-             * owner's, so a node caching the block reads it again (L9).
+             * owner's, so a node caching the block reads it again (L9)
+             * -- this one included: the stamp names the node whose
+             * write the redo is, never us.
              * Failing leaves peers on the old copy until the owner's
              * next change -- said, not fatal: the block itself is
              * right. */
             if (owner_known && !cetrafs_journal_ignore_owner) {
                 int tret = cetrafs_inode_advance_change_stamp(sb, entries[s].owner_ino,
-                                                              entries[s].owner_generation, owner_dir);
+                                                              entries[s].owner_generation, owner_dir, node_id);
 
                 if (tret)
                     pr_warn("journal replay: node %u txn %llu: could not advance ino %llu's change stamp after "

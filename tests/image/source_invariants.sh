@@ -220,12 +220,12 @@ FDC="$(grep -n "fd_checksum *=" "$K"/*.c | grep -v "cetrafs_inode_stamp_crc_fd" 
 # matched by the line's presence INSIDE that function, so filter by the
 # file/function pair rather than by text.
 FDC="$(awk '
-    /^void cetrafs_inode_stamp_crc_fd\(/ { inside = 1 }
+    /^(static )?void cetrafs_inode_stamp_crc_fd(_as)?\(/ { inside = 1 }
     inside && /^}/ { inside = 0; next }
     !inside && /fd_checksum[[:space:]]*=/ { print FILENAME ":" NR }
 ' "$K"/*.c || true)"
 if [ -z "$FDC" ]; then
-    pass "file freshness: fd_checksum is only written by cetrafs_inode_stamp_crc_fd(), so every publish stamps file_seq"
+    pass "file freshness: fd_checksum is only written by cetrafs_inode_stamp_crc_fd[_as](), so every publish stamps file_seq"
 else
     fail "file freshness: fd_checksum written outside the stamp function (these publishes would not bump file_seq): $FDC"
 fi

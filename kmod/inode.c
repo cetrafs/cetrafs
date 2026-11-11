@@ -139,12 +139,13 @@ static unsigned long long cetrafs_file_seq_force_age_ns;
 cetrafs_test_param(file_seq_force_age_ns, cetrafs_file_seq_force_age_ns, ullong, 0644);
 MODULE_PARM_DESC(file_seq_force_age_ns, "TEST ONLY: stamp file_seq this many ns in the past (0 = off)");
 
-u64 cetrafs_file_seq_new(struct super_block *sb)
+/* A file_seq attributed to node_id: whose change it is, as every decoder
+ * reads it (CETRAFS_FILE_SEQ_NODE()). Only journal replay names a node
+ * other than this one -- the redo IS that node's write landing. */
+static u64 cetrafs_file_seq_new_as(struct super_block *sb, u32 node_id)
 {
-    u32 node_id = 0;
     u64 val;
 
-    (void) cetrafs_sb_get_node_id(sb, &node_id);
     val = READ_ONCE(cetrafs_file_seq_force_val);
     if (!val)
         val = cetrafs_sb_stamp_ns(sb) - READ_ONCE(cetrafs_file_seq_force_age_ns);
@@ -154,12 +155,31 @@ u64 cetrafs_file_seq_new(struct super_block *sb)
     return ((u64) (node_id & 0xFFFFu) << CETRAFS_FILE_SEQ_NODE_SHIFT) | val;
 }
 
-void cetrafs_inode_stamp_crc_fd(struct super_block *sb, cetrafs_inode_t *in)
+u64 cetrafs_file_seq_new(struct super_block *sb)
+{
+    u32 node_id = 0;
+
+    (void) cetrafs_sb_get_node_id(sb, &node_id);
+    return cetrafs_file_seq_new_as(sb, node_id);
+}
+
+/* The one writer of fd_checksum (tests/image/source_invariants.sh):
+ * every publish of the file sector stamps a new file_seq, named as
+ * node_id's change. */
+static void cetrafs_inode_stamp_crc_fd_as(struct super_block *sb, cetrafs_inode_t *in, u32 node_id)
 {
     in->fd_ino = in->ino;
     in->fd_generation = in->generation;
-    in->file_seq = cetrafs_cpu_to_le64(cetrafs_file_seq_new(sb));
+    in->file_seq = cetrafs_cpu_to_le64(cetrafs_file_seq_new_as(sb, node_id));
     in->fd_checksum = cetrafs_cpu_to_le64(cetrafs_inode_crc_fd(in));
+}
+
+void cetrafs_inode_stamp_crc_fd(struct super_block *sb, cetrafs_inode_t *in)
+{
+    u32 node_id = 0;
+
+    (void) cetrafs_sb_get_node_id(sb, &node_id);
+    cetrafs_inode_stamp_crc_fd_as(sb, in, node_id);
 }
 
 /*
@@ -790,7 +810,14 @@ static void cetrafs_ns_apply_advance(cetrafs_inode_t *rec, void *arg)
 struct cetrafs_fd_touch_ctx {
     struct super_block *sb;
     u64 ino, generation;
+    u32 as_node;
 };
+
+/* TEST ONLY: the replay's stamp names the replaying node, as it did
+ * before review F1 (tests/kernel/journal_replay_owner.sh). */
+static bool cetrafs_replay_stamp_as_self;
+cetrafs_test_param(replay_stamp_as_self, cetrafs_replay_stamp_as_self, bool, 0644);
+MODULE_PARM_DESC(replay_stamp_as_self, "TEST ONLY: a replay's file_seq advance names the replaying node");
 
 static int cetrafs_fd_touch_mutate(void *image, unsigned int len, void *priv)
 {
@@ -807,14 +834,23 @@ static int cetrafs_fd_touch_mutate(void *image, unsigned int len, void *priv)
         return -EUCLEAN; /* restamping would bless the damage */
     rec.ino = rec.fd_ino;
     rec.generation = rec.fd_generation;
-    cetrafs_inode_stamp_crc_fd(ctx->sb, &rec); /* a new file_seq, and the CRC over it */
+    /* A new file_seq, and the CRC over it -- named as the DEAD node's
+     * change. Named as ours, every gate that decodes the stamp read it
+     * on the replaying node as its own writeback: a tree cached before
+     * the redo stayed trusted, and a truncate or punch planned from it
+     * was not refused -- on the node most likely to hold the file, the
+     * one the VM was restarted on (review F1). */
+    cetrafs_inode_stamp_crc_fd_as(ctx->sb, &rec, ctx->as_node);
     cetrafs_inode_fd_to_image(image, &rec);
     return 0;
 }
 
-int cetrafs_inode_advance_change_stamp(struct super_block *sb, u64 ino, u64 generation, bool dir)
+int cetrafs_inode_advance_change_stamp(struct super_block *sb, u64 ino, u64 generation, bool dir, u32 as_node)
 {
-    struct cetrafs_fd_touch_ctx ctx = {.sb = sb, .ino = ino, .generation = generation};
+    struct cetrafs_fd_touch_ctx ctx = {.sb = sb, .ino = ino, .generation = generation, .as_node = as_node};
+
+    if (READ_ONCE(cetrafs_replay_stamp_as_self))
+        (void) cetrafs_sb_get_node_id(sb, &ctx.as_node);
     u64 lba = cetrafs_inode_lba(sb, ino);
 
     if (!lba)
