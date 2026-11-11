@@ -4085,6 +4085,27 @@ int main(int argc, char **argv)
             repair_block("a directory has more than one name, so the link counts around it cannot be trusted");
         }
 
+        /*
+         * A dirent block skipped above (no tail, a bad CRC over an
+         * incoherent table, an impossible entry) is a block whose names
+         * were not counted: refs[] is a LOWER bound wherever one was. A
+         * file named twice, once in a good block and once in a skipped
+         * one, reads refs=1 against nlink=2, and lowering nlink to 1
+         * left a file one unlink away from being freed while still
+         * named, should that block outlive this run (audit 2026-11-11
+         * F3). So while any block was skipped, a count is only ever
+         * RAISED: one left too high leaks the file, it never frees a
+         * named one -- and a second run, with the rebuilt blocks
+         * counted, settles it.
+         */
+        bool tally_partial = false;
+
+        for (uint64_t ino = 2; ino <= cetrafs_le32(sb.inodes_count) && !tally_partial; ++ino)
+            tally_partial = is_dir[ino] && walked[ino] && !dwhole[ino];
+        if (tally_partial)
+            fprintf(stderr, "WARN: some directory blocks could not be read, so the names in them were not counted: "
+                            "link counts are only raised in this run -- run fsck again after it\n");
+
         for (uint64_t ino = 2; ino <= cetrafs_le32(sb.inodes_count); ++ino) {
             uint64_t bit = ino - 1;
 
@@ -4223,8 +4244,9 @@ int main(int argc, char **argv)
                  * of how many of them there are, and P7 showed exactly
                  * how it drifts (a link() increment lost to a peer's
                  * concurrent record write). Setting it to the count has
-                 * one right answer. */
-                if (repair_mode && !repair_blocked) {
+                 * one right answer -- when the count is complete; while
+                 * it is not, only upward (tally_partial, above). */
+                if (repair_mode && !repair_blocked && (!tally_partial || refs[ino] > nlinks[ino])) {
                     repair_set_nlink(fd, &sb, ino, refs[ino]);
                     repairs_made++;
                 }
@@ -4255,7 +4277,9 @@ int main(int argc, char **argv)
                 if (nlinks[ino] + dir_gain[ino] != subdirs[ino] + dir_gain[ino] + 2) {
                     uint32_t want_n = subdirs[ino] + dir_gain[ino] + 2;
 
-                    if (repair_mode && !repair_blocked) {
+                    /* subdirs[] is counted from this directory's own
+                     * blocks: a skipped one hid some (F3). */
+                    if (repair_mode && !repair_blocked && (dwhole[ino] || want_n > nlinks[ino] + dir_gain[ino])) {
                         repair_set_nlink(fd, &sb, ino, want_n);
                         repairs_made++;
                     }
@@ -4461,8 +4485,8 @@ int main(int argc, char **argv)
                        bad_dirent_blocks[i].phys, ino,
                        bad_dirent_blocks[i].first_block ? " (with '.' and '..')" : "");
             }
-            printf("  the directory is readable again and now EMPTY -- anything it held reached "
-                   "/lost+found by inode number\n");
+            printf("  the rebuilt blocks are readable again and EMPTY: a file they named that has no other "
+                   "name reached /lost+found by inode number; one named elsewhere too keeps that name only\n");
         }
         free(bad_dirent_blocks);
         bad_dirent_blocks = NULL;
