@@ -2208,10 +2208,11 @@ int cetrafs_node_nocaw_peer_exists(struct super_block *sb, const u8 *my_uuid, bo
  * Checks EVERY REGISTERED row, not just the non-stale ones: a stale row
  * is a node that is merely paused (slow, swapped out, mid-reboot), and
  * if it is an OLD build it will resume on the old layout with no idea
- * the tables moved. Stale-reclaim does not free a row: no kernel path
- * takes a REGISTERED row to FREE, so a truly dead node's row stays
- * REGISTERED and keeps counting here until an operator clears it
- * offline. A row that lacks the capability therefore blocks the grow
+ * the tables moved. Stale-reclaim does not free a row: the only kernel
+ * path that takes a REGISTERED row to FREE is a registration giving
+ * back the fresh row it claimed moments ago (cetrafs_node_unclaim_
+ * mutate()), so a truly dead node's row stays REGISTERED and keeps
+ * counting here until an operator clears it offline. A row that lacks the capability therefore blocks the grow
  * for as long as it stays REGISTERED, dead or alive (a live old node
  * blocks it for as long as it is mounted). Our own row is included and
  * trivially passes

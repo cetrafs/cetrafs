@@ -3632,10 +3632,11 @@ departed:
      * claim -- are on the device under our id, and the heartbeat that
      * would have released them has stopped. A departure announced over
      * them tells the next mount of this node that there is nothing of
-     * its previous life to sweep (a row with last_seen 0 is a clean
-     * one), and the claims read live again the moment it beats. Left
-     * unannounced, the row goes stale: peers reclaim them as a dead
-     * node's, and the next mount sweeps whatever is left. */
+     * its previous life to sweep (the row's departure reads
+     * CETRAFS_NODE_DEPART_CLEAN), and the claims read live again the
+     * moment it beats. Left unannounced, the row goes stale: peers
+     * reclaim them as a dead node's, and the next mount sweeps whatever
+     * is left. */
     unreleased = READ_ONCE(sbi->nsrel_count) + READ_ONCE(sbi->flrel_count) + READ_ONCE(sbi->prrel_count) +
                  READ_ONCE(sbi->rcrel_count) + (cetrafs_journal_release_pending(sb) ? 1 : 0);
     if (sbi->node_registered && !READ_ONCE(sbi->fenced) && !flush_err && unreleased) {
