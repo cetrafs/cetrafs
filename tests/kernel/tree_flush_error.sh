@@ -18,6 +18,10 @@
 # and clears the on-disk lock.
 set -euo pipefail
 . "$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)/lib/harness.sh"
+# fsck sees a row that beat seconds ago (an unclean departure, or a
+# planted peer) and watches it for the longest window -- twice, since it
+# re-probes after the walk. Not what this suite tests.
+export CETRAFS_PEER_PROBE_SECS=3
 require_root
 require_module
 IPOKE="$(ct_helper inode_block_poke)"

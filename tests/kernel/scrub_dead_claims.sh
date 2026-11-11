@@ -26,6 +26,9 @@ POKE="$(ct_helper orphan_poke)"
 LOCK_POKE="$(ct_helper inode_lock_poke)"
 NODE_POKE="$(ct_helper node_poke)"
 RD=30 LK=31 LIVE=32
+# The planted peers beat seconds before each fsck, so fsck watches them
+# for a window -- twice since it re-probes after the walk. Shorten it.
+export CETRAFS_PEER_PROBE_SECS=3
 
 IMG="$(ct_image 560 scrubdead)"
 DEV="$(ct_loop "$IMG")"
