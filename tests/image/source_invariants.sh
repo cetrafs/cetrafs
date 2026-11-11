@@ -1735,4 +1735,16 @@ else
     fail "module alias: no fs-cetrafs alias in the built module (MODULE_ALIAS_FS gone?) -- \`mount -t cetrafs\` will fail with 'unknown filesystem type' unless something loaded it first. modinfo says: $(modinfo "$KO" 2>&1 | grep -E '^alias' || echo '(no alias at all)')"
 fi
 
+log "checking every discard is issued through the one range-checked issuer"
+# Class 50: a discard aimed outside the region its caller owns destroys
+# metadata or a peer's data, silently (fstrim.sh case 3's DISCRIMINATION:
+# the root directory and every file). cetrafs_discard_issue() checks the
+# range against the Block Group's data region and resolves both ends; a
+# second caller of the block layer's discard would skip that.
+DISC="$(awk '/^(static )?(int|long|void) [a-z_]+\(/ { fn = $0 } /blkdev_issue_(discard|secure_erase|zeroout)|__blkdev_issue_discard/ && fn !~ /cetrafs_discard_issue\(/ { print FILENAME ":" FNR }' "$K"/*.c || true)"
+NDISC="$(grep -c 'blkdev_issue_discard' "$K"/discard.c || true)"
+[ "$NDISC" -ge 1 ] || fail "discard issuer: no blkdev_issue_discard in discard.c -- the scan is not seeing the issuer"
+[ -z "$DISC" ] && pass "discard issuer: blkdev_issue_discard/zeroout appear only in cetrafs_discard_issue()" ||
+    fail "discard issuer: a discard issued outside cetrafs_discard_issue(), skipping its range check: $DISC"
+
 ct_exit
