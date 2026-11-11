@@ -86,6 +86,12 @@ static unsigned int cetrafs_xattr_read_pause_ms;
 static bool cetrafs_xattr_tear_copy_once;
 cetrafs_test_param(xattr_tear_copy_once, cetrafs_xattr_tear_copy_once, bool, 0644);
 MODULE_PARM_DESC(xattr_tear_copy_once, "TEST ONLY: tear the next private copy of an xattr block");
+
+/* TEST ONLY: tear the next N private copies -- a block that never
+ * converges (tests/kernel/xattr_read_giveup_time.sh). */
+static int cetrafs_xattr_tear_copies;
+cetrafs_test_param(xattr_tear_copies, cetrafs_xattr_tear_copies, int, 0644);
+MODULE_PARM_DESC(xattr_tear_copies, "TEST ONLY: tear the next N private copies of an xattr block");
 cetrafs_test_param(xattr_read_pause_ms, cetrafs_xattr_read_pause_ms, uint, 0644);
 MODULE_PARM_DESC(xattr_read_pause_ms, "TEST ONLY: pause between an xattr read's record read and its block read");
 /* TEST ONLY: the same, between the copy and the record re-read that
@@ -185,8 +191,13 @@ static int cetrafs_xattr_read_block(struct inode *inode, void **out)
          * 2026-11-06 L3); a torn one is retried like any other tear. */
         if (unlikely(cetrafs_xattr_tear_copy_once) && xchg(&cetrafs_xattr_tear_copy_once, false))
             ((u8 *) copy)[offsetof(cetrafs_xattr_entry_t, value)] ^= 0xff; /* TEST ONLY: see the parameter */
+        if (unlikely(READ_ONCE(cetrafs_xattr_tear_copies) > 0)) {
+            WRITE_ONCE(cetrafs_xattr_tear_copies, cetrafs_xattr_tear_copies - 1);
+            ((u8 *) copy)[offsetof(cetrafs_xattr_entry_t, value)] ^= 0xff; /* TEST ONLY: see the parameter */
+        }
         if (cetrafs_tear_injected() || !cetrafs_blk_image_valid(copy, CETRAFS_XATTR_TAIL_MAGIC)) {
-            cetrafs_tear_backoff(attempt); /* a peer's write in flight: milliseconds (X1) */
+            if (attempt + 1 < CETRAFS_XATTR_READ_RETRIES) /* no sleep after the last */
+                cetrafs_tear_backoff(attempt); /* a peer's write in flight: milliseconds (X1) */
             continue;
         }
 
@@ -204,7 +215,8 @@ static int cetrafs_xattr_read_block(struct inode *inode, void **out)
         }
         /* The record moved under the read: the copy may be anybody's.
          * A peer's setxattr in flight; give it the time it takes. */
-        cetrafs_tear_backoff(attempt);
+        if (attempt + 1 < CETRAFS_XATTR_READ_RETRIES)
+            cetrafs_tear_backoff(attempt);
     }
     pr_err_ratelimited("xattr on ino=%llu: its xattr block kept changing under %d reads -- giving up\n",
                        (unsigned long long) inode->i_ino, CETRAFS_XATTR_READ_RETRIES);
