@@ -1061,8 +1061,18 @@ set_stale_window() {
 # Park a row as a peer that registered and then died: REGISTERED, a
 # nonzero last_seen (0 means "left cleanly", a different path), and an
 # hb_seq nobody will ever bump again.
+# The peer ran this node's timing, and advertises its window as a real
+# node would (format 0x000A): a row advertising nothing legal is watched
+# for the maximum, 240 s (kmod/node.c cetrafs_row_watch_window()). Under
+# compressed timing (a window below the legal 15 s) nothing is planted --
+# the kernel waits its own window for such a row.
 poke_dead_peer() {
+    local st
     "$(ct_helper node_poke)" "$1" "$2" 1 "$3" "$(date +%s)" >/dev/null
+    st="$(cat "$CETRAFS_STALE_PARAM" 2>/dev/null || echo 0)"
+    if [ "$st" -ge 15 ] && [ "$st" -le 240 ]; then
+        "$(ct_helper node_poke)" "$1" "$2" --stale "$st" >/dev/null
+    fi
 }
 
 wait_out_stale_window() { sleep $((TEST_STALE_SECS + 2)); }
