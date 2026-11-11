@@ -57,6 +57,60 @@ static inline void cetrafs_sleep_full(unsigned secs)
         ;
 }
 
+/*
+ * TEST ONLY environment knobs. Every one the tools honour is read
+ * through these two, so that none of them is silent or unbounded: a
+ * knob that is set says so on stderr (once per knob per process) --
+ * several of them shrink a safety window, and a production run that
+ * inherited one from a test shell must be visible in its own output --
+ * and a numeric one that is not a plain integer inside its range ends
+ * the run (exit 2) instead of becoming whatever atoi() made of it: "-1"
+ * seconds was a 136-year sleep (audit 2026-11-11 G2,
+ * tests/image/tool_test_knobs.sh).
+ */
+static inline const char *cetrafs_test_env(const char *name)
+{
+    static const char *told[32];
+    const char *v = getenv(name);
+    unsigned i;
+
+    if (!v)
+        return NULL;
+    for (i = 0; i < 32 && told[i]; i++)
+        if (strcmp(told[i], name) == 0)
+            return v;
+    if (i < 32)
+        told[i] = name;
+    fprintf(stderr, "cetrafs: TEST KNOB %s=%s is set: this is not a production run\n", name, v);
+    return v;
+}
+
+/* 'dflt' when unset; the value when it is an integer in [lo, hi]; exit 2
+ * otherwise. */
+static inline long long cetrafs_test_env_ll(const char *name, long long lo, long long hi, long long dflt)
+{
+    const char *v = cetrafs_test_env(name);
+    char *end;
+    long long r;
+
+    if (!v)
+        return dflt;
+    errno = 0;
+    r = strtoll(v, &end, 10);
+    if (errno || end == v || *end || r < lo || r > hi) {
+        fprintf(stderr, "cetrafs: TEST KNOB %s=%s is not an integer in [%lld, %lld]; refusing to run\n", name, v, lo,
+                hi);
+        exit(2);
+    }
+    return r;
+}
+
+/* A test hold, in whole seconds: at most an hour. */
+static inline void cetrafs_test_hold(const char *name)
+{
+    cetrafs_sleep_full((unsigned) cetrafs_test_env_ll(name, 0, 3600, 0));
+}
+
 /* Returns 1 (and copies the mountpoint into 'where') if 'dev' is a block
  * device currently mounted on this system, 0 otherwise (including when
  * 'dev' is a regular file image, which can't appear in /proc/self/mounts
@@ -385,7 +439,7 @@ static inline int cetrafs_caw_probe(int fd)
     if (cetrafs_caw_mode >= 0)
         return cetrafs_caw_mode;
     cetrafs_caw_mode = 0;
-    if (getenv("CETRAFS_TEST_TOOLS_NO_CAW")) /* the fallback, for its own suites */
+    if (cetrafs_test_env("CETRAFS_TEST_TOOLS_NO_CAW")) /* the fallback, for its own suites */
         return 0;
     if (fstat(fd, &st) != 0 || !S_ISBLK(st.st_mode))
         return 0;
@@ -523,8 +577,7 @@ static inline void cetrafs_repair_reap(int fd, const cetrafs_superblock_t *sb, u
         /* Test hook only: hold between the judgement and the swap, so a
          * suite can land the repairer's renewal in between
          * (tests/kernel/repair_reap_keeps_saved.sh). */
-        if (getenv("CETRAFS_TEST_REAP_GAP_SECS"))
-            cetrafs_sleep_full((unsigned) atoi(getenv("CETRAFS_TEST_REAP_GAP_SECS")));
+        cetrafs_test_hold("CETRAFS_TEST_REAP_GAP_SECS");
         r = cetrafs_row_caw(fd, sb, idx, blk, out);
 
         if (r == 1)
@@ -687,18 +740,11 @@ static inline void cetrafs_repair_new_nonce(void)
 
 /* CETRAFS_PEER_PROBE_SECS is a test knob only: the suites cannot afford
  * a real stale window per assertion. Returns 0 when unset, which is
- * every normal invocation. */
+ * every normal invocation; it SHRINKS the live-peer window, so it is
+ * announced every time it is in effect (cetrafs_test_env). */
 static inline unsigned cetrafs_peer_probe_secs(void)
 {
-    const char *env = getenv("CETRAFS_PEER_PROBE_SECS");
-
-    if (env && *env) {
-        long v = strtol(env, NULL, 10);
-
-        if (v > 0)
-            return (unsigned) v;
-    }
-    return 0;
+    return (unsigned) cetrafs_test_env_ll("CETRAFS_PEER_PROBE_SECS", 1, CETRAFS_STALE_MAX_SECS, 0);
 }
 
 /*
@@ -834,8 +880,7 @@ static inline int cetrafs_repair_claim(int fd, const cetrafs_superblock_t *sb, c
     /* Test hook only: hold between the caller's "is anyone repairing?"
      * check and the claim, so a suite can start two repairers that both
      * passed it (tests/kernel/repair_claim_concurrent.sh). */
-    if (getenv("CETRAFS_TEST_REPAIR_CLAIM_DELAY_SECS"))
-        cetrafs_sleep_full((unsigned) atoi(getenv("CETRAFS_TEST_REPAIR_CLAIM_DELAY_SECS")));
+    cetrafs_test_hold("CETRAFS_TEST_REPAIR_CLAIM_DELAY_SECS");
     posix_fadvise(fd, 0, 0, POSIX_FADV_DONTNEED); /* the rows as the device has them, not our cache */
     caw = cetrafs_caw_probe(fd);
 
@@ -930,8 +975,7 @@ static inline int cetrafs_repair_claim(int fd, const cetrafs_superblock_t *sb, c
             /* Test hook only: hold between the row read above and the
              * claim, so a suite can land another claim in between
              * (tests/kernel/repair_claim_caw.sh). */
-            if (getenv("CETRAFS_TEST_REPAIR_CLAIM_GAP_SECS"))
-                cetrafs_sleep_full((unsigned) atoi(getenv("CETRAFS_TEST_REPAIR_CLAIM_GAP_SECS")));
+            cetrafs_test_hold("CETRAFS_TEST_REPAIR_CLAIM_GAP_SECS");
             if (caw) {
                 /* Lands only on the row as read: a claim that got there
                  * first makes this one miscompare, and that is another

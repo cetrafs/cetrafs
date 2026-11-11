@@ -483,11 +483,9 @@ int main(int argc, char **argv)
      * operator can reach by misreading the usage text.
      */
     {
-        const char *tw = getenv("CETRAFS_GROWFS_TEST_BG_OFFSET");
+        const long long off = cetrafs_test_env_ll("CETRAFS_GROWFS_TEST_BG_OFFSET", -65536, 65536, 0);
 
-        if (tw) {
-            long long off = strtoll(tw, NULL, 10);
-
+        if (off) {
             fprintf(stderr, "growfs.cetra: TEST MODE: shifting new BG regions by %lld BG(s)\n", off);
             if (off < 0 && (u64) (-off) * bg_size > new_bg_start)
                 die("test offset puts the new regions before block 0");
@@ -744,8 +742,7 @@ int main(int argc, char **argv)
         fflush(stdout);
         /* Test knob only, as in fsck: hold the claim before any work, so
          * a suite can act on the volume while it is held. */
-        if (getenv("CETRAFS_TEST_REPAIR_HOLD_SECS"))
-            cetrafs_sleep_full((unsigned) atoi(getenv("CETRAFS_TEST_REPAIR_HOLD_SECS")));
+        cetrafs_test_hold("CETRAFS_TEST_REPAIR_HOLD_SECS");
         /* Claim first, then look: a node mounting from here on sees the
          * claim and refuses, and one that got in before it is found
          * here. The other order left the gap between them open. A live
@@ -873,11 +870,9 @@ int main(int argc, char **argv)
              * exists for, and the only way to produce it on demand.
              */
             u64 desc_start = start;
-            const char *ds = getenv("CETRAFS_GROWFS_TEST_DESC_SHIFT");
+            const long long sh = cetrafs_test_env_ll("CETRAFS_GROWFS_TEST_DESC_SHIFT", -65536, 65536, 0);
 
-            if (ds) {
-                long long sh = strtoll(ds, NULL, 10);
-
+            if (sh) {
                 if (sh < 0 && (u64) (-sh) * bg_size > desc_start)
                     die("test descriptor shift puts the region before block 0");
                 desc_start = (u64) ((long long) desc_start + sh * (long long) bg_size);
@@ -1071,7 +1066,7 @@ int main(int argc, char **argv)
      * the end of the filesystem, not damage. Without this there is no
      * way to build that image at all.
      */
-    if (getenv("CETRAFS_GROWFS_TEST_NO_PUBLISH")) {
+    if (cetrafs_test_env("CETRAFS_GROWFS_TEST_NO_PUBLISH")) {
         fprintf(stderr, "growfs.cetra: TEST MODE: stopping before the superblock publish\n");
         growfs_release_claim(fd);
         close(fd);
@@ -1093,7 +1088,7 @@ int main(int argc, char **argv)
          * generation, as a grower working from a superblock someone else
          * had already superseded would. The kernel must refuse it
          * (-ESTALE) with nothing written (tests/kernel/grow_live_race.sh). */
-        if (getenv("CETRAFS_GROWFS_TEST_GEN_SKIP")) {
+        if (cetrafs_test_env("CETRAFS_GROWFS_TEST_GEN_SKIP")) {
             fprintf(stderr, "growfs.cetra: TEST MODE: submitting layout_gen + 1 too far\n");
             sb.layout_gen = cetrafs_cpu_to_le64(cetrafs_le64(sb.layout_gen) + 1);
             sb.checksum = 0;
@@ -1106,7 +1101,7 @@ int main(int argc, char **argv)
         /* TEST-ONLY: give the claim up before asking the kernel to
          * publish, as a program calling the ioctl without growfs's claim
          * would. The kernel must refuse (-EBUSY; grow_live_race.sh E). */
-        if (getenv("CETRAFS_GROWFS_TEST_UNCLAIMED")) {
+        if (cetrafs_test_env("CETRAFS_GROWFS_TEST_UNCLAIMED")) {
             fprintf(stderr, "growfs.cetra: TEST MODE: releasing the claim before the publish\n");
             growfs_release_claim(fd);
         }

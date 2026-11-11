@@ -275,9 +275,7 @@ static void pwrite_all(int fd, const void *buf, size_t len, off_t off)
      * would -- no atexit, no release -- so a suite can check that every
      * prefix of a repair is a consistent volume. Unset normally. */
     if (stop_after < 0) {
-        const char *e = getenv("CETRAFS_TEST_FSCK_STOP_AFTER_WRITES");
-
-        stop_after = e ? atol(e) : 0;
+        stop_after = (long) cetrafs_test_env_ll("CETRAFS_TEST_FSCK_STOP_AFTER_WRITES", 1, 1L << 30, 0);
     }
     if (stop_after > 0 && --stop_after == 0)
         _exit(99);
@@ -673,7 +671,7 @@ static int fsck_alloc_block(int fd,
      * is nondeterministic from a test (per-run allocation overheads
      * shift the count), so the path went unexercised. Same pattern as
      * devutil.h's CETRAFS_PEER_PROBE_SECS; unset in every normal run. */
-    if (getenv("CETRAFS_FSCK_LF_NO_BLOCK"))
+    if (cetrafs_test_env("CETRAFS_FSCK_LF_NO_BLOCK"))
         return -1;
     for (uint32_t b = 0; b < bg_count; ++b) {
         uint64_t bmap_blocks = (bg_data_cnt[b] + CETRAFS_BLOCK_SIZE * 8 - 1) / (CETRAFS_BLOCK_SIZE * 8);
@@ -1329,7 +1327,7 @@ static void fsck_mark_run(struct fsck_refctx *c, uint64_t phys, uint64_t len, ui
              * blocks". Marked here rather than in the bitmap sweep: the
              * sweep's reference set also counts blocks merely QUEUED for
              * a free, which are not owned by anybody. */
-            if (getenv("CETRAFS_FSCK_DUMP_REFS"))
+            if (cetrafs_test_env("CETRAFS_FSCK_DUMP_REFS"))
                 fprintf(stderr, "REF: lba=%" PRIu64 " ino=%" PRIu64 "\n", phys + k, ino);
             FSCK_SET(c->refd, idx);
             if (fsck_dead_walk)
@@ -1944,8 +1942,7 @@ int main(int argc, char **argv)
         /* Test knob only: a phase that does no inode work for this long,
          * so a suite can see the claim renew on its timer regardless.
          * Unset in every normal invocation. */
-        if (getenv("CETRAFS_TEST_REPAIR_HOLD_SECS"))
-            cetrafs_sleep_full((unsigned) atoi(getenv("CETRAFS_TEST_REPAIR_HOLD_SECS")));
+        cetrafs_test_hold("CETRAFS_TEST_REPAIR_HOLD_SECS");
     }
 
     {
@@ -3479,10 +3476,10 @@ int main(int argc, char **argv)
         /* Test knob only: a pause between the last heartbeat and this
          * pass's writes, so a suite can have a node appear there
          * (tests/kernel/fsck_write_after_lost_claim.sh). Unset normally. */
-        if (repair_mode && getenv("CETRAFS_TEST_FSCK_HOLD_BEFORE_BG_PASS_SECS")) {
+        if (repair_mode && cetrafs_test_env("CETRAFS_TEST_FSCK_HOLD_BEFORE_BG_PASS_SECS")) {
             printf("  holding before the block group pass (test)\n");
             fflush(stdout);
-            cetrafs_sleep_full((unsigned) atoi(getenv("CETRAFS_TEST_FSCK_HOLD_BEFORE_BG_PASS_SECS")));
+            cetrafs_test_hold("CETRAFS_TEST_FSCK_HOLD_BEFORE_BG_PASS_SECS");
         }
         for (uint32_t b = 0; b < cetrafs_le32(sb.block_group_count); ++b) {
             uint64_t bmap_blocks = (bg_data_cnt[b] + CETRAFS_BLOCK_SIZE * 8 - 1) / (CETRAFS_BLOCK_SIZE * 8);
@@ -3500,7 +3497,7 @@ int main(int argc, char **argv)
                     /* CETRAFS_FSCK_DUMP_LEAKS=1: one line per leaked
                      * block, for post-mortem correlation against traces
                      * (who allocated it, who should have freed it). */
-                    if (getenv("CETRAFS_FSCK_DUMP_LEAKS"))
+                    if (cetrafs_test_env("CETRAFS_FSCK_DUMP_LEAKS"))
                         fprintf(stderr, "LEAK: lba=%" PRIu64 "\n", bg_data_start[b] + i);
                     /* Nothing ALLOCATED references it -- the 128 MiB
                      * evict_inode class, which until now could only be
