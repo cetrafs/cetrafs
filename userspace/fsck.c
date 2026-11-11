@@ -2477,9 +2477,13 @@ int main(int argc, char **argv)
              * expires, and an operator should know why. */
             long long age = (long long) time(NULL) - (long long) cetrafs_le64(ne.last_seen);
 
-            if ((int) n != repair_row && age > (long long) CETRAFS_NODE_STALE_SECS)
-                fprintf(stderr, "WARN: node slot %u holds a repair claim last refreshed %llds ago (%.*s)\n", n, age,
-                        ne.label[0] ? (int) sizeof(ne.label) : 8, ne.label[0] ? ne.label : "no label");
+            if ((int) n != repair_row && age > (long long) CETRAFS_NODE_STALE_SECS) {
+                char lab[CETRAFS_NODE_LABEL_LEN + 1];
+
+                cetrafs_label_copy(lab, sizeof(lab), ne.label, sizeof(ne.label));
+                fprintf(stderr, "WARN: node slot %u holds a repair claim last refreshed %llds ago (%s)\n", n, age,
+                        lab[0] ? lab : "no label");
+            }
             continue;
         }
         if (cetrafs_le32(ne.state) != CETRAFS_NODE_STATE_REGISTERED) {

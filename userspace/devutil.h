@@ -58,6 +58,25 @@ static inline void cetrafs_sleep_full(unsigned secs)
 }
 
 /*
+ * A node label off the disk, made safe to print: up to its NUL (or the
+ * field's end), every byte that is not printable ASCII as '?'. The label
+ * is whatever a registering node wrote -- or whatever a damaged or
+ * hostile row holds -- and the tools print it straight to the
+ * operator's terminal, where an escape sequence is a command (audit
+ * 2026-11-11 F12, tests/image/tool_label_sanitized.sh).
+ */
+static inline void cetrafs_label_copy(char *dst, size_t dst_sz, const char *src, size_t src_len)
+{
+    size_t i;
+
+    if (!dst_sz)
+        return;
+    for (i = 0; i < src_len && i + 1 < dst_sz && src[i]; i++)
+        dst[i] = (unsigned char) src[i] >= 0x20 && (unsigned char) src[i] < 0x7f ? src[i] : '?';
+    dst[i] = 0;
+}
+
+/*
  * TEST ONLY environment knobs. Every one the tools honour is read
  * through these two, so that none of them is silent or unbounded: a
  * knob that is set says so on stderr (once per knob per process) --
@@ -591,9 +610,12 @@ static inline void cetrafs_repair_reap(int fd, const cetrafs_superblock_t *sb, u
         fprintf(stderr, "WARN: registry row %u: the dead repair claim could not be reaped\n", idx);
         return;
     }
-    if (cetrafs_le32(saved.state) == CETRAFS_NODE_STATE_REGISTERED && cetrafs_node_row_crc_ok(&saved))
-        fprintf(stderr, "registry row %u: reaped a dead repair claim and gave the row back to %.*s\n", idx,
-                (int) sizeof(saved.label), saved.label);
+    if (cetrafs_le32(saved.state) == CETRAFS_NODE_STATE_REGISTERED && cetrafs_node_row_crc_ok(&saved)) {
+        char lab[CETRAFS_NODE_LABEL_LEN + 1];
+
+        cetrafs_label_copy(lab, sizeof(lab), saved.label, sizeof(saved.label));
+        fprintf(stderr, "registry row %u: reaped a dead repair claim and gave the row back to %s\n", idx, lab);
+    }
     else
         fprintf(stderr, "registry row %u: reaped a dead repair claim; the row is free again\n", idx);
 }
@@ -684,8 +706,7 @@ static inline int cetrafs_find_repair_claim(int fd,
             if (out_row)
                 *out_row = idx;
             if (out_label && label_sz) {
-                memcpy(out_label, ne.label, label_sz - 1 < sizeof(ne.label) ? label_sz - 1 : sizeof(ne.label));
-                out_label[label_sz - 1] = 0;
+                cetrafs_label_copy(out_label, label_sz, ne.label, sizeof(ne.label));
             }
             found = 1;
             break;
@@ -1344,7 +1365,7 @@ static inline int cetrafs_scan_node_caps(const char *dev,
         }
         if (cetrafs_le32(e.state) != CETRAFS_NODE_STATE_REGISTERED)
             continue;
-        snprintf(labels[n], CETRAFS_NODE_LABEL_LEN + 1, "%.*s", CETRAFS_NODE_LABEL_LEN, e.label);
+        cetrafs_label_copy(labels[n], CETRAFS_NODE_LABEL_LEN + 1, e.label, sizeof(e.label));
         caps_out[n] = cetrafs_le32(e.caps);
         rows_out[n] = idx;
         n++;
@@ -1487,8 +1508,7 @@ static inline int cetrafs_find_live_peer_on(int fd,
             *out_age_secs = age < 0 ? 0 : age;
         }
         if (out_label && label_sz) {
-            memcpy(out_label, now_ne.label, label_sz - 1 < sizeof(now_ne.label) ? label_sz - 1 : sizeof(now_ne.label));
-            out_label[label_sz - 1] = 0;
+            cetrafs_label_copy(out_label, label_sz, now_ne.label, sizeof(now_ne.label));
         }
         found = 1;
     }
