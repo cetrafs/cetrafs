@@ -7,6 +7,7 @@
 #include <linux/bitmap.h>
 #include <linux/blkdev.h>
 #include <linux/buffer_head.h>
+#include <linux/version.h>
 #include <linux/byteorder/generic.h>
 #include <linux/crc32c.h>
 #include <linux/delay.h>
@@ -2589,7 +2590,14 @@ int cetrafs_fill_super(struct super_block *sb, struct fs_context *fc)
         INIT_LIST_HEAD(&sbi->cold_parked);
         mutex_init(&sbi->cold_retry_mutex);
         INIT_DELAYED_WORK(&sbi->resweep_work, cetrafs_sb_resweep_work);
+        /* Per-CPU, as before; 7.2 warns at mount when a workqueue names
+         * neither WQ_PERCPU nor WQ_UNBOUND. WQ_PERCPU is checked present
+         * from 7.0. */
+#if LINUX_VERSION_CODE >= KERNEL_VERSION(7, 0, 0)
+        sbi->cold_wq = alloc_workqueue("cetrafs_cold", WQ_MEM_RECLAIM | WQ_PERCPU, 0);
+#else
         sbi->cold_wq = alloc_workqueue("cetrafs_cold", WQ_MEM_RECLAIM, 0);
+#endif
         if (!sbi->cold_wq) {
             cetrafs_free_sb_info(sb);
             brelse(bh);
