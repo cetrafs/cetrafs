@@ -976,6 +976,55 @@ done
 [ -z "$BAD35" ] && pass "class 35: every mount option ($(echo $OPTS)) is applied and checked on a second mount" ||
     fail "class 35: accepted and not in force:$BAD35"
 
+# Class 52: a count held in two places that readers add up -- an accrued
+# delta in memory plus the record it is flushed to -- must never be in
+# neither (taken from memory before the record or its cached copy holds
+# it) nor in both. Two halves:
+#  (a) every take of an accrued delta (atomic64_xchg on a *_free_delta)
+#      carries a "class 52:" comment within 8 lines above, saying how a
+#      reader stays whole -- a flight, or why nothing reads it there;
+#  (b) the delta is read only by the settles that know about flights,
+#      and by the presence/count helpers listed below -- a new reader
+#      that adds it to a record by hand is the bug this class is about.
+# The scan runs over a planted file of each kind first: both must be
+# refused (the 2026-11-12 ENOSPC: the flush's xchg had no flight, and
+# cetrafs_bg_data_block_stats() added the delta to the descriptor itself).
+log "checking accrued free deltas are never in neither place nor in both (class 52)"
+c52_scan() { # <dir>: prints file:line of each violation
+    local f
+    for f in "$1"/*.c; do
+        awk -v F="$(basename "$f")" '
+            BEGIN { last52 = -100 }
+            /^[a-z].*\(/ && !/;$/ { fn = $0; sub(/\(.*/, "", fn); sub(/.* \**/, "", fn) }
+            /class 52:/ { last52 = NR }
+            /atomic64_xchg\(&[a-z_>.-]*_free_delta/ && NR - last52 > 8 { print F ":" NR ": take with no class 52 argument" }
+            /atomic64_read\(&[a-z_>.-]*_free_delta/ && fn !~ /^(cetrafs_sb_bg_free_settle|cetrafs_sb_zg_free_settle|cetrafs_sb_pending_zg_deltas|cetrafs_sb_zg_delta_pending|cetrafs_flush_dirty_free_counts)$/ {
+                print F ":" NR ": " fn " reads the delta outside the settles"
+            }' "$f"
+    done
+}
+C52P="$(mktemp -d)"
+ct_track dir "$C52P" 2>/dev/null || true
+cat >"$C52P/planted.c" <<'EOF'
+s64 bad_take(struct cetrafs_sb_info *sbi, u32 z)
+{
+    return atomic64_xchg(&sbi->zg_free_delta[z], 0);
+}
+
+u64 bad_sum(struct cetrafs_bg_chunk *c, u32 i, u64 desc)
+{
+    return desc + atomic64_read(&c->bg_free_delta[i]);
+}
+EOF
+C52N="$(c52_scan "$C52P" | wc -l)"
+rm -rf "$C52P"
+[ "$C52N" = 2 ] || fail "class 52: the planted take and reader gave $C52N findings, want 2 -- the scan sees nothing"
+C52="$(c52_scan "$K")"
+N52="$(cat "$K"/*.c | grep -c 'class 52:' || true)"
+[ "$N52" -ge 5 ] || fail "class 52: found $N52 annotations -- the check sees nothing"
+[ -z "$C52" ] && pass "class 52: every take of an accrued delta names its flight, and only the settles read it" ||
+    fail "class 52: $(echo "$C52" | tr '\n' ';')"
+
 # Class 34: a CAS mutator that REFUSES a negative count is safe only if
 # no other actor's inverse move can sit between two of ours -- a credit
 # landing after the debit it pays for reads, in between, as below zero,
