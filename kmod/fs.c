@@ -1369,6 +1369,33 @@ static void cetrafs_layout_free_chain(struct cetrafs_bg_layout *l)
     }
 }
 
+/* TEST ONLY: hold the next layout publish inside owned_lock, after it
+ * has marked the Block Groups it adds and before the layout is
+ * published, for this many ms (one-shot, at most 5000; a busy wait --
+ * the lock is a spinlock). A Zone Group claim or release landing in it
+ * must wait for the publish and then see the new layout
+ * (tests/kernel/grow_live_owned_race.sh). */
+static unsigned int cetrafs_layout_publish_hold_ms;
+cetrafs_test_param(layout_publish_hold_ms, cetrafs_layout_publish_hold_ms, uint, 0644);
+MODULE_PARM_DESC(layout_publish_hold_ms, "TEST ONLY: hold the next layout publish inside owned_lock for N ms");
+
+/* TEST ONLY: the derive takes no owned_lock -- the negative control for
+ * the lock (the same suite). */
+static bool cetrafs_owned_derive_unlocked;
+cetrafs_test_param(owned_derive_unlocked, cetrafs_owned_derive_unlocked, bool, 0644);
+MODULE_PARM_DESC(owned_derive_unlocked, "TEST ONLY: derive owned_bgs without owned_lock");
+
+/* A publish is being held (above), and how many derives started while
+ * it was: the suite's proof that its claim or release really landed in
+ * the window. */
+static atomic_t cetrafs_publish_holding = ATOMIC_INIT(0);
+static atomic64_t cetrafs_owned_derive_overlaps = ATOMIC64_INIT(0);
+
+u64 cetrafs_owned_derive_overlap_count(void)
+{
+    return (u64) atomic64_read(&cetrafs_owned_derive_overlaps);
+}
+
 /*
  * Set or clear owned_bgs for every Block Group zg_id owns, after
  * owned_zgs changed. Under owned_lock, against the layout as it stands
@@ -1382,10 +1409,14 @@ static void cetrafs_layout_free_chain(struct cetrafs_bg_layout *l)
  */
 static void cetrafs_sb_owned_bgs_derive(struct cetrafs_sb_info *sbi, u32 zg_id, bool own)
 {
+    bool locked = !READ_ONCE(cetrafs_owned_derive_unlocked);
     struct cetrafs_bg_layout *l;
     u32 b;
 
-    spin_lock(&sbi->owned_lock);
+    if (atomic_read(&cetrafs_publish_holding))
+        atomic64_inc(&cetrafs_owned_derive_overlaps);
+    if (locked)
+        spin_lock(&sbi->owned_lock);
     l = cetrafs_sb_layout_of(sbi);
     for (b = 0; l && b < l->bg_count; b++) {
         struct cetrafs_bg_chunk *c = l->chunk[b >> CETRAFS_BGC_SHIFT];
@@ -1397,6 +1428,40 @@ static void cetrafs_sb_owned_bgs_derive(struct cetrafs_sb_info *sbi, u32 zg_id, 
             set_bit(i, c->owned_bgs);
         else
             clear_bit(i, c->owned_bgs);
+    }
+    if (locked)
+        spin_unlock(&sbi->owned_lock);
+}
+
+/*
+ * The invariant owned_lock keeps: a Block Group is marked ours exactly
+ * when the Zone Group it belongs to is. 'stray' counts marked groups of
+ * a Zone Group this node does not own -- the allocator would write into
+ * a group given away -- and 'missing' unmarked groups of one it does.
+ * Under owned_lock, so it never sees a derive or publish half done; a
+ * claim or release between its owned_zgs bit and its derive can still
+ * show for that instant, so read it quiet. O(bg_count), procfs only.
+ */
+void cetrafs_sb_owned_bgs_check(struct super_block *sb, u32 *stray, u32 *missing)
+{
+    struct cetrafs_sb_info *sbi = sb->s_fs_info;
+    struct cetrafs_bg_layout *l;
+    u32 b;
+
+    *stray = *missing = 0;
+    spin_lock(&sbi->owned_lock);
+    l = cetrafs_sb_layout_of(sbi);
+    for (b = 0; l && b < l->bg_count; b++) {
+        struct cetrafs_bg_chunk *c = l->chunk[b >> CETRAFS_BGC_SHIFT];
+        u32 i = b & CETRAFS_BGC_MASK;
+        u16 z = READ_ONCE(c->bg_owner_zg[i]);
+        bool should = z < CETRAFS_MAX_ZONE_GROUPS && test_bit(z, sbi->owned_zgs);
+        bool is = test_bit(i, c->owned_bgs);
+
+        if (is && !should)
+            (*stray)++;
+        else if (!is && should)
+            (*missing)++;
     }
     spin_unlock(&sbi->owned_lock);
 }
@@ -1875,6 +1940,13 @@ static void cetrafs_layout_publish(struct super_block *sb, struct cetrafs_bg_lay
 
         if (z < CETRAFS_MAX_ZONE_GROUPS && test_bit(z, sbi->owned_zgs))
             set_bit(i, c->owned_bgs);
+    }
+    if (READ_ONCE(cetrafs_layout_publish_hold_ms)) {
+        unsigned int ms = min_t(unsigned int, xchg(&cetrafs_layout_publish_hold_ms, 0), 5000);
+
+        atomic_set(&cetrafs_publish_holding, 1);
+        mdelay(ms); /* test-only; see the parameter */
+        atomic_set(&cetrafs_publish_holding, 0);
     }
     smp_store_release(&sbi->layout, nl);
     spin_unlock(&sbi->owned_lock);

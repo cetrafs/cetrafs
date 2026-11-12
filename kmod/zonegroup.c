@@ -1661,11 +1661,20 @@ out_unlock:
  */
 static int cetrafs_zg_release_surplus_locked(struct super_block *sb, u32 my_node_id);
 
+/* TEST ONLY: the surplus release pass does nothing while set, so a
+ * suite can choose the moment it runs (grow_live_owned_race.sh). */
+static bool cetrafs_zg_release_hold;
+cetrafs_test_param(zg_release_hold, cetrafs_zg_release_hold, bool, 0644);
+MODULE_PARM_DESC(zg_release_hold, "TEST ONLY: skip the surplus release pass");
+
 /* Under release_rwsem for write: every drain this pass makes is undone
  * or completed before the allocator is told to look again. */
 int cetrafs_zg_release_surplus(struct super_block *sb, u32 my_node_id)
 {
     int ret;
+
+    if (READ_ONCE(cetrafs_zg_release_hold))
+        return 0; /* test-only; see the parameter */
 
     cetrafs_sb_release_lock(sb);
     ret = cetrafs_zg_release_surplus_locked(sb, my_node_id);

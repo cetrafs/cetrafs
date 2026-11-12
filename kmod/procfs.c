@@ -281,6 +281,14 @@ static int cetrafs_proc_info_show(struct seq_file *m, void *v)
     seq_printf(m, "late_claims_cleared: %llu\n", cetrafs_late_claims_cleared_count());
     seq_printf(m, "layout_refreshes: %llu\n", cetrafs_layout_refresh_count());
     seq_printf(m, "layout_refresh_refused: %llu\n", cetrafs_layout_refresh_refused_count());
+    {
+        u32 stray, missing;
+
+        cetrafs_sb_owned_bgs_check(sb, &stray, &missing);
+        seq_printf(m, "owned_bgs_stray: %u\n", stray);
+        seq_printf(m, "owned_bgs_missing: %u\n", missing);
+    }
+    seq_printf(m, "owned_derive_overlaps: %llu\n", cetrafs_owned_derive_overlap_count());
     seq_printf(m, "deferred_orphaned: %llu\n", cetrafs_deferred_orphaned_count());
     seq_printf(m, "deferred_adopted: %llu\n", cetrafs_deferred_adopted_count());
     /* Slots held by entries a failed write kept for replay. Nonzero is a

@@ -171,7 +171,39 @@ int main(int argc, char **argv)
     bool set_geom = (argc == 5 && strncmp(argv[3], "--geom=", 7) == 0);
     bool set_owner = (argc == 5 && strcmp(argv[3], "--owner") == 0);
 
-    off_t bg_off = (off_t) (cetrafs_le64(sb.bg_table_start) + bg_id) * CETRAFS_BLOCK_SIZE;
+    /* The first segment is the run mkfs laid down; a grow appends
+     * segments, each a header then its descriptors
+     * (cetrafs_bg_segment_t). Follow the chain for a grown group. */
+    uint32_t first_count = cetrafs_le32(sb.bg_table_first_count);
+    off_t bg_off;
+
+    if (!first_count)
+        first_count = cetrafs_le32(sb.block_group_count);
+    if (bg_id < first_count) {
+        bg_off = (off_t) (cetrafs_le64(sb.bg_table_start) + bg_id) * CETRAFS_BLOCK_SIZE;
+    } else {
+        uint64_t seg_lba = cetrafs_le64(sb.bg_table_next);
+        int hops = 0;
+
+        bg_off = -1;
+        while (seg_lba && hops++ < 1024) {
+            cetrafs_bg_segment_t seg;
+
+            pread_all(fd, &seg, sizeof(seg), (off_t) seg_lba * CETRAFS_BLOCK_SIZE);
+            if (cetrafs_le32(seg.magic) != CETRAFS_BGSEG_MAGIC)
+                break;
+            if (bg_id >= cetrafs_le32(seg.first_bg_id) &&
+                bg_id < cetrafs_le32(seg.first_bg_id) + cetrafs_le32(seg.count)) {
+                bg_off = (off_t) (seg_lba + 1 + (bg_id - cetrafs_le32(seg.first_bg_id))) * CETRAFS_BLOCK_SIZE;
+                break;
+            }
+            seg_lba = cetrafs_le64(seg.next);
+        }
+        if (bg_off < 0) {
+            fprintf(stderr, "bg_id %u is in no Block Group table segment\n", bg_id);
+            return 1;
+        }
+    }
     cetrafs_block_group_t bg;
     pread_all(fd, &bg, sizeof(bg), bg_off);
 

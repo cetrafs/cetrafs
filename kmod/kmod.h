@@ -953,6 +953,8 @@ int cetrafs_grow_heal_pool(struct super_block *sb);
 u32 cetrafs_bgseg_crc(const cetrafs_bg_segment_t *seg);
 u32 cetrafs_bgseg_crc_prefix(const void *img, unsigned int len);
 u64 cetrafs_layout_refresh_count(void);
+u64 cetrafs_owned_derive_overlap_count(void);
+void cetrafs_sb_owned_bgs_check(struct super_block *sb, u32 *stray, u32 *missing);
 u64 cetrafs_layout_refresh_refused_count(void);
 /* Recompute a BG's cached free count from its bitmap and correct it
  *. *out_delta is (truth - cached), for the caller to fix

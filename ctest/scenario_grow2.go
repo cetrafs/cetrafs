@@ -18,7 +18,9 @@ import (
 // grows, and a Zone Group claiming the new pool Block Groups while the
 // layout that adds them is being published on that node
 // (cetrafs_layout_publish() vs cetrafs_sb_owned_bgs_derive(), both under
-// owned_lock).
+// owned_lock). Nothing here makes the two overlap or checks that they
+// did; the overlap is forced, with a control, in
+// tests/kernel/grow_live_owned_race.sh.
 //
 // The volume is rebuilt small (4 GiB, 512 MiB groups, two Zone Groups)
 // and B fills what it can allocate until ENOSPC, then frees 512 MiB. B
