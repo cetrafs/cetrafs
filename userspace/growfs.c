@@ -1132,6 +1132,59 @@ int main(int argc, char **argv)
         return 0;
     }
 
+    /*
+     * A live grow that died after naming its pool credit (step 1,
+     * kmod/grow.c) left a marker above the published layout_gen on the
+     * Zone Group rows it credited. Every node treats such a marker as
+     * dead and takes its credit back -- but this publish is about to
+     * raise layout_gen past it, after which it reads as settled and the
+     * dead credit stays in the pool for good (review of 63e7f0e). This
+     * grow holds the volume, so no other grow is live: take the credit
+     * back now, BEFORE the publish, exactly as the kernel's step 1 and
+     * fsck -r do. A crash between the two leaves the pool right for the
+     * layout still published.
+     */
+    /* TEST-ONLY: keep the dead credit, as this grow used to -- the
+     * control of grow_live_crash.sh part 3. */
+    if (!cetrafs_test_env("CETRAFS_GROWFS_TEST_KEEP_DEAD_CREDIT")) {
+        u64 published = cetrafs_le64(sb.layout_gen) - 1; /* raised above, not yet written */
+
+        for (u32 z = 0; z < cetrafs_le32(sb.zone_group_count); ++z) {
+            cetrafs_zone_group_t zg;
+            u64 credit, pool;
+
+            read_block(fd, cetrafs_le64(sb.zg_table_start) + z, blk);
+            memcpy(&zg, blk, sizeof(zg));
+            if (cetrafs_le64(zg.pool_grow_gen) <= published)
+                continue;
+            if ((u32) cetrafs_le64(zg.hot_checksum) !=
+                crc32c_struct((const u8 *) &zg + CETRAFS_ZG_HOT_OFF, CETRAFS_ZG_HOT_LEN,
+                              offsetof(cetrafs_zone_group_t, hot_checksum) - CETRAFS_ZG_HOT_OFF,
+                              sizeof(zg.hot_checksum))) {
+                fprintf(stderr, "growfs.cetra: Zone Group %u fails its checksum -- a dead grow's pool credit on it "
+                                "was not taken back; run fsck -r\n",
+                        z);
+                grow_rc = 1;
+                continue;
+            }
+            credit = cetrafs_le64(zg.pool_grow_credit);
+            pool = cetrafs_le64(zg.pool_free_blocks);
+            fprintf(stderr,
+                    "growfs.cetra: Zone Group %u: taking back the pool credit (%" PRIu64 " blocks) of a live grow to "
+                    "layout_gen %" PRIu64 " that never published\n",
+                    z, credit, (u64) cetrafs_le64(zg.pool_grow_gen));
+            zg.pool_free_blocks = cetrafs_cpu_to_le64(credit > pool ? 0 : pool - credit);
+            zg.pool_grow_gen = zg.pool_grow_id = zg.pool_grow_credit = 0;
+            zg.hot_checksum = 0;
+            zg.hot_checksum = cetrafs_cpu_to_le64((u64) crc32c_struct(
+                (const u8 *) &zg + CETRAFS_ZG_HOT_OFF, CETRAFS_ZG_HOT_LEN,
+                offsetof(cetrafs_zone_group_t, hot_checksum) - CETRAFS_ZG_HOT_OFF, sizeof(zg.hot_checksum)));
+            memcpy(blk, &zg, sizeof(zg));
+            write_block(fd, cetrafs_le64(sb.zg_table_start) + z, blk, true);
+        }
+        sync_device(fd, true);
+    }
+
     memset(blk, 0, CETRAFS_BLOCK_SIZE);
     memcpy(blk, &sb, sizeof(sb));
     write_block(fd, CETRAFS_SB_BLOCK_NR, blk, true);

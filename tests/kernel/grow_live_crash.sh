@@ -24,6 +24,10 @@
 #     node sees between a live grow's last two writes); running growfs
 #     again finishes the grow.
 #
+#  3. an OFFLINE grow after a stopped live grow takes the dead credit
+#     back before it publishes (control: CETRAFS_GROWFS_TEST_KEEP_DEAD_CREDIT,
+#     and fsck finds the pool overstated).
+#
 # DISCRIMINATION: with the mount's heal off throughout (grow_heal_off),
 # 1 fails; with step 1 crediting without replacing a dead credit, 1b's
 # fsck reports the pool overstated; with fsck -r leaving the marker,
@@ -185,4 +189,32 @@ verify "2c"
 ct_umount "$MNT"
 out="$(ct_fsck "$DEV" 2>&1)" && pass "2c: fsck is clean after the finished grow" ||
     fail "2c: fsck after the finished grow: $(grep -m3 ERR <<<"$out" | tr '\n' ' ')"
+
+# ------------------------------------- 3: an OFFLINE grow after a dead one
+# The operator's next step after a stopped live grow may be growfs on
+# the unmounted volume rather than a mount. That grow publishes the
+# layout_gen the dead marker names, after which the marker reads as
+# settled and the dead credit stays in the pool for good (review of
+# 63e7f0e). The offline grow takes it back before it publishes.
+offline_after_dead() { # <tag> [env...]: fresh volume, a dead live grow, then an offline grow
+    ct_mkfs "$DEV" -s 600M -b 512 -z 1 -J 0 -N 1024 -f >/dev/null
+    ct_mount "$DEV" "$MNT"
+    require_cetrafs_mount "$MNT"
+    ct_param_set grow_stop_after 1
+    ct_growfs "$DEV" -s 1400M >/dev/null 2>&1 && { fail "$1: setup: the live grow did not stop"; return 1; }
+    ct_umount "$MNT"
+    dead_credit "$1: setup"
+    shift
+    out="$(env "$@" "$ROOT/userspace/growfs.cetra" "$DEV" -s 1400M 2>&1)" ||
+        { fail "offline: the offline grow failed: $(tail -2 <<<"$out")"; return 1; }
+}
+log "3: an offline grow after a stopped live grow"
+offline_after_dead "3 control" CETRAFS_GROWFS_TEST_KEEP_DEAD_CREDIT=1 || ct_exit
+out="$(ct_fsck "$DEV" 2>&1)" && fail "3 control: fsck is clean -- the suite cannot tell the two apart" ||
+    { grep -q 'pool_free_blocks' <<<"$out" && pass "3 control: keeping the dead credit leaves the pool overstated" ||
+        fail "3 control: fsck fails, but not on the pool: $(grep -m3 ERR <<<"$out" | tr '\n' ' ')"; }
+offline_after_dead "3" || ct_exit
+grep -q 'taking back the pool credit' <<<"$out" && pass "3: the offline grow says it took the dead credit back" ||
+    fail "3: the offline grow said nothing about the dead credit"
+clean "3" "fsck is clean after the offline grow, with no -r"
 ct_exit
