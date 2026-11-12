@@ -154,6 +154,7 @@ static void __exit cetrafs_exit(void)
         pr_err("Failed to unregister file system\n");
 
     cetrafs_proc_module_exit();
+    cetrafs_nslock_exit();
 
     /* The memory guaranteed to be freed only after rcu_barrier() */
     rcu_barrier();

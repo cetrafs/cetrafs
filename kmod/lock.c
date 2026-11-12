@@ -2883,24 +2883,22 @@ static int cetrafs_lock_publish_and_clear(struct inode *inode, cetrafs_inode_t *
     return 0;
 }
 
-/*
- * ->release: drops this node's local open count (read or write alike --
- * the counterpart to cetrafs_lock_open()'s refresh-on-first-open above,
- * so the *next* open, once this node has nothing left open locally,
- * knows to treat raw's stat fields as fresh again) and, for a
- * write-opener, drops the local write-open count too, releasing the
- * on-disk claim only once that reaches zero (the last local
- * write-opener).
- */
-int cetrafs_lock_release(struct inode *inode, struct file *file)
+/* What a close needs of its file, taken before the file is gone: a
+ * close handed to a work item outlives it (cetrafs_lock_release()). */
+struct cetrafs_close_args {
+    bool want_write;
+    bool explicit_mine; /* this file held the explicit lock (flock) */
+};
+
+/* The close itself. Called with lock_mutex held; drops it. */
+static void __cetrafs_lock_release(struct inode *inode, const struct cetrafs_close_args *a)
 {
     struct cetrafs_inode_info *ci = CETRAFS_I(inode);
     struct super_block *sb = inode->i_sb;
-    bool want_write = (file->f_mode & FMODE_WRITE) != 0;
+    bool want_write = a->want_write;
     bool lock_on = cetrafs_sb_file_lock_enabled(sb);
     bool last_writer;
 
-    mutex_lock(&ci->lock_mutex);
     /* The last writer publishes below, and nothing that tells a peer the
      * file is free -- its explicit lock, its presence bit -- may go
      * before that publish has landed: a peer's punch in between is
@@ -2914,7 +2912,7 @@ int cetrafs_lock_release(struct inode *inode, struct file *file)
      * never released it via flock(LOCK_UN), its close releases it --
      * the fd-scoped lifetime (Option A) that bounds a crashing holder.
      * The last writer's is released after its publish, below. */
-    if (ci->explicit_lock_file == file && !last_writer) {
+    if (a->explicit_mine && !last_writer) {
         /* The fd is going, so the holder goes with it; a clear that did
          * not land is the heartbeat's to finish
          * (cetrafs_lock_retry_deferred()), never dropped. */
@@ -2935,7 +2933,7 @@ int cetrafs_lock_release(struct inode *inode, struct file *file)
 
     if (!want_write) {
         mutex_unlock(&ci->lock_mutex);
-        return 0;
+        return;
     }
 
     if (atomic_dec_return(&ci->lock_writer_count) == 0) {
@@ -3057,7 +3055,7 @@ int cetrafs_lock_release(struct inode *inode, struct file *file)
             ci->close_owes_suspend_mark = ci->close_owes_suspend_mark || was_suspended;
         }
         ci->lock_suspended = false;
-        if (ci->explicit_lock_file == file) {
+        if (a->explicit_mine) {
             /* The fd goes either way. A clear that cannot run now (the
              * publish failed) or did not land is the heartbeat's: it
              * publishes first and clears after. */
@@ -3115,6 +3113,88 @@ int cetrafs_lock_release(struct inode *inode, struct file *file)
     }
 
     mutex_unlock(&ci->lock_mutex);
+}
+
+struct cetrafs_close_work {
+    struct work_struct work;
+    struct inode *inode; /* a reference held for the work */
+    struct cetrafs_close_args a;
+};
+
+static void cetrafs_close_work_run(struct work_struct *w)
+{
+    struct cetrafs_close_work *cw = container_of(w, struct cetrafs_close_work, work);
+
+    mutex_lock(&CETRAFS_I(cw->inode)->lock_mutex);
+    __cetrafs_lock_release(cw->inode, &cw->a);
+    iput(cw->inode);
+    kfree(cw);
+}
+
+/* TEST ONLY: never hand a dying task's close to a work item -- it waits
+ * for lock_mutex as before (the control for close_dying_defers.sh). */
+static bool cetrafs_close_defer_off;
+cetrafs_test_param(close_defer_off, cetrafs_close_defer_off, bool, 0644);
+MODULE_PARM_DESC(close_defer_off, "TEST ONLY: a dying task's close waits for lock_mutex instead of deferring");
+
+static atomic64_t cetrafs_close_deferrals = ATOMIC64_INIT(0);
+
+u64 cetrafs_lock_close_deferral_count(void)
+{
+    return (u64) atomic64_read(&cetrafs_close_deferrals);
+}
+
+/*
+ * ->release: drops this node's local open count (read or write alike --
+ * the counterpart to cetrafs_lock_open()'s refresh-on-first-open above,
+ * so the *next* open, once this node has nothing left open locally,
+ * knows to treat raw's stat fields as fresh again) and, for a
+ * write-opener, drops the local write-open count too, releasing the
+ * on-disk claim only once that reaches zero (the last local
+ * write-opener).
+ *
+ * A DYING task does not wait for lock_mutex. Another local task can
+ * hold it for seconds -- an open across a fence or a peer's lock, a
+ * suspend waiting out a defrag -- and an uninterruptible wait in the
+ * exit path left a killed process in D state for all of it. If the
+ * mutex is busy and the task is exiting or has a fatal signal, the
+ * close is handed to a work item on the mount's cold_wq instead, with an
+ * inode reference; kill_sb flushes that queue before the inode cache is
+ * evicted (cetrafs_sb_cold_close()), and a mount already closing refuses
+ * the queueing, in which case the close waits as before. The file is
+ * gone by the time the work runs, so what the close needs of it is
+ * taken now: its mode, and whether it held the explicit lock -- which
+ * nothing can change once this fd is closing (only flock(2) on this
+ * very file sets or clears it to this file).
+ */
+int cetrafs_lock_release(struct inode *inode, struct file *file)
+{
+    struct cetrafs_inode_info *ci = CETRAFS_I(inode);
+    struct cetrafs_close_args a = {
+        .want_write = (file->f_mode & FMODE_WRITE) != 0,
+        .explicit_mine = READ_ONCE(ci->explicit_lock_file) == file,
+    };
+
+    if (!mutex_trylock(&ci->lock_mutex)) {
+        if ((fatal_signal_pending(current) || (current->flags & PF_EXITING)) && !READ_ONCE(cetrafs_close_defer_off)) {
+            struct cetrafs_close_work *cw = kmalloc(sizeof(*cw), GFP_NOFS);
+
+            if (cw) {
+                INIT_WORK(&cw->work, cetrafs_close_work_run);
+                ihold(inode);
+                cw->inode = inode;
+                cw->a = a;
+                if (cetrafs_sb_queue_cold(inode->i_sb, &cw->work)) {
+                    atomic64_inc(&cetrafs_close_deferrals);
+                    return 0;
+                }
+                iput(inode);
+                kfree(cw);
+            }
+        }
+        mutex_lock(&ci->lock_mutex);
+    }
+    __cetrafs_lock_release(inode, &a);
     return 0;
 }
 

@@ -43,6 +43,12 @@
 
 #include <linux/delay.h>
 #include <linux/fs.h>
+#include <linux/jiffies.h>
+#include <linux/list.h>
+#include <linux/module.h>
+#include <linux/slab.h>
+#include <linux/spinlock.h>
+#include <linux/task_work.h>
 #include <linux/kernel.h>
 #include <linux/sched.h>
 #include <linux/string.h>
@@ -80,6 +86,13 @@
  * SET_TRIES*SLEEP_MS (~160ms) while we wait on another. The total across
  * rounds is on the order of the single-lock budget, so genuine
  * contention still resolves before the operation gives up. */
+static atomic64_t cetrafs_nslock_restarts = ATOMIC64_INIT(0);
+
+u64 cetrafs_nslock_restart_count(void)
+{
+    return (u64) atomic64_read(&cetrafs_nslock_restarts);
+}
+
 #define CETRAFS_NSLOCK_SET_TRIES 8
 #define CETRAFS_NSLOCK_SET_ROUNDS 40
 
@@ -468,7 +481,8 @@ static int cetrafs_nslock_acquire_tries(struct inode *inode, int max_tries)
             ret = -EINTR;
             goto fail;
         }
-        msleep(CETRAFS_NSLOCK_SLEEP_MS);
+        if (attempt + 1 < max_tries)
+            msleep(CETRAFS_NSLOCK_SLEEP_MS);
     }
     ret = -EBUSY;
 fail:
@@ -702,7 +716,7 @@ void cetrafs_nslock_release(struct inode *inode)
  * a rename within one directory) are skipped -- taking one twice would
  * self-deadlock on the local mutex.
  */
-int cetrafs_nslock_acquire_set(struct inode **inodes, int n)
+static int __cetrafs_nslock_acquire_set(struct inode **inodes, int n, int rounds, int tries)
 {
     struct inode *ordered[CETRAFS_NSLOCK_MAX_SET];
     int count = 0, i, j, ret, round;
@@ -729,11 +743,11 @@ int cetrafs_nslock_acquire_set(struct inode **inodes, int n)
         ordered[j + 1] = key;
     }
 
-    for (round = 0; round < CETRAFS_NSLOCK_SET_ROUNDS; round++) {
+    for (round = 0; round < rounds; round++) {
         for (i = 0; i < count; i++) {
             /* Short per-lock budget: a contended later lock must not pin
              * the earlier ones (hold-and-wait). */
-            ret = cetrafs_nslock_acquire_tries(ordered[i], CETRAFS_NSLOCK_SET_TRIES);
+            ret = cetrafs_nslock_acquire_tries(ordered[i], tries);
             if (ret)
                 break;
         }
@@ -752,12 +766,194 @@ int cetrafs_nslock_acquire_set(struct inode **inodes, int n)
 
         /* Contended: back off and retry the whole ordered set, holding
          * nothing in the meantime. */
-        msleep(CETRAFS_NSLOCK_SLEEP_MS);
+        if (round + 1 < rounds)
+            msleep(CETRAFS_NSLOCK_SLEEP_MS);
     }
-
-    pr_err("nslock: could not acquire a %d-inode namespace set after %d rounds -- heavy directory contention\n", count,
-           CETRAFS_NSLOCK_SET_ROUNDS);
     return -EBUSY;
+}
+
+int cetrafs_nslock_acquire_set(struct inode **inodes, int n)
+{
+    int ret = __cetrafs_nslock_acquire_set(inodes, n, CETRAFS_NSLOCK_SET_ROUNDS, CETRAFS_NSLOCK_SET_TRIES);
+
+    if (ret == -EBUSY)
+        pr_err("nslock: could not acquire a %d-inode namespace set after %d rounds -- heavy directory contention\n",
+               n, CETRAFS_NSLOCK_SET_ROUNDS);
+    return ret;
+}
+
+/*
+ * Waiting for a peer's namespace lock OUTSIDE the VFS's locks.
+ *
+ * Every namespace operation is called with the parent's i_rwsem held
+ * (and s_vfs_rename_mutex for a cross-directory rename). Waiting out a
+ * peer's lock in there -- up to the whole budget, ~12 s -- made every
+ * task queued on that VFS lock wait too: an `ls` of the directory, a
+ * lookup of any uncached name in it, every other create, uninterruptibly
+ * behind one operation that was itself merely waiting. So an operation
+ * called with those locks tries ONCE (no sleep while holding them); if a
+ * peer holds a lock it needs, it has changed nothing, and it returns
+ * -ERESTARTNOINTR with a task_work queued. The task_work runs as the
+ * task returns to user space, with no VFS lock held, and sleeps one
+ * retry interval (killable); the kernel then restarts the system call
+ * -- -ERESTARTNOINTR with no signal delivered is a restart -- which takes
+ * the VFS locks afresh and tries again. Only the caller waits.
+ *
+ * The budget is unchanged: a per-task deadline, kept across the
+ * restarts, ends it with EBUSY exactly where the in-lock wait gave up.
+ *
+ * Only a task that returns to user space through a system call that
+ * restarts can be handed this. Kernel threads and io-wq/user workers
+ * (nfsd, io_uring's forced-async fs ops) never get there, and an exiting
+ * or dumping task must not be restarted: those keep the in-lock wait.
+ * So does any caller that did not opt in (cetrafs_nslock_acquire_set()):
+ * setattr from file_remove_privs() in a write, whose AIO and io_uring
+ * completions turn a restart code into EINTR, and a security.* xattr
+ * that IMA/EVM sets from __fput(), whose return nobody reads.
+ *
+ * The task_work's code is in this module: it holds a module reference
+ * from task_work_add() until its last statement (the drain rule 20
+ * asks for); the task's own return to user space is what runs it,
+ * microseconds after the system call left this filesystem.
+ */
+static bool cetrafs_nslock_restart_off;
+cetrafs_test_param(nslock_restart_off, cetrafs_nslock_restart_off, bool, 0644);
+MODULE_PARM_DESC(nslock_restart_off, "TEST ONLY: wait for a peer's namespace lock inside the VFS's locks, as before");
+
+#define CETRAFS_NSLOCK_BUDGET_MS (CETRAFS_NSLOCK_RETRIES * CETRAFS_NSLOCK_SLEEP_MS)
+
+struct cetrafs_nswait_deadline {
+    struct list_head node;
+    const struct task_struct *task; /* compared, never dereferenced */
+    unsigned long deadline;
+};
+static LIST_HEAD(cetrafs_nswait_list);
+static DEFINE_SPINLOCK(cetrafs_nswait_lock);
+
+/* Remove current's deadline, and any left by a task that never came back
+ * (killed while it waited) once it is a whole budget past due. */
+static void cetrafs_nswait_forget(void)
+{
+    struct cetrafs_nswait_deadline *d, *tmp;
+    unsigned long old = msecs_to_jiffies(CETRAFS_NSLOCK_BUDGET_MS);
+    LIST_HEAD(dead);
+
+    spin_lock(&cetrafs_nswait_lock);
+    list_for_each_entry_safe(d, tmp, &cetrafs_nswait_list, node)
+        if (d->task == current || time_after(jiffies, d->deadline + old))
+            list_move(&d->node, &dead);
+    spin_unlock(&cetrafs_nswait_lock);
+    list_for_each_entry_safe(d, tmp, &dead, node)
+        kfree(d);
+}
+
+/* current's deadline, started now if it has none. 0: still within it;
+ * -EBUSY: past it; -ENOMEM. */
+static int cetrafs_nswait_within(void)
+{
+    struct cetrafs_nswait_deadline *d, *fresh = kmalloc(sizeof(*fresh), GFP_NOFS);
+    int ret = 0;
+
+    spin_lock(&cetrafs_nswait_lock);
+    list_for_each_entry(d, &cetrafs_nswait_list, node)
+        if (d->task == current)
+            break;
+    if (&d->node != &cetrafs_nswait_list) {
+        if (time_after(jiffies, d->deadline))
+            ret = -EBUSY;
+    } else if (fresh) {
+        fresh->task = current;
+        fresh->deadline = jiffies + msecs_to_jiffies(CETRAFS_NSLOCK_BUDGET_MS);
+        list_add(&fresh->node, &cetrafs_nswait_list);
+        fresh = NULL;
+    } else {
+        ret = -ENOMEM;
+    }
+    spin_unlock(&cetrafs_nswait_lock);
+    kfree(fresh);
+    return ret;
+}
+
+void cetrafs_nslock_exit(void)
+{
+    struct cetrafs_nswait_deadline *d, *tmp;
+
+    list_for_each_entry_safe(d, tmp, &cetrafs_nswait_list, node) {
+        list_del(&d->node);
+        kfree(d);
+    }
+}
+
+static bool cetrafs_nslock_can_restart(void)
+{
+    unsigned int no = PF_KTHREAD | PF_IO_WORKER | PF_EXITING | PF_DUMPCORE;
+
+#ifdef PF_USER_WORKER
+    no |= PF_USER_WORKER;
+#endif
+    return !(current->flags & no) && !fatal_signal_pending(current) && !READ_ONCE(cetrafs_nslock_restart_off);
+}
+
+struct cetrafs_nswait_work {
+    struct callback_head cb;
+};
+
+static void cetrafs_nswait_run(struct callback_head *cb)
+{
+    kfree(container_of(cb, struct cetrafs_nswait_work, cb));
+    schedule_timeout_killable(msecs_to_jiffies(CETRAFS_NSLOCK_SLEEP_MS));
+    module_put(THIS_MODULE);
+}
+
+/* 0: queued, return -ERESTARTNOINTR. Anything else: wait in the lock. */
+static int cetrafs_nswait_queue(void)
+{
+    struct cetrafs_nswait_work *w = kmalloc(sizeof(*w), GFP_NOFS);
+
+    if (!w)
+        return -ENOMEM;
+    if (!try_module_get(THIS_MODULE)) {
+        kfree(w);
+        return -ENODEV;
+    }
+    init_task_work(&w->cb, cetrafs_nswait_run);
+    if (task_work_add(current, &w->cb, TWA_SIGNAL)) {
+        module_put(THIS_MODULE);
+        kfree(w);
+        return -ESRCH;
+    }
+    return 0;
+}
+
+/*
+ * cetrafs_nslock_acquire_set() for an operation the VFS called with its
+ * own locks held, whose error the system call returns as it is: see
+ * above. Called before the operation changes anything.
+ */
+int cetrafs_nslock_acquire_set_vfs(struct inode **inodes, int n)
+{
+    int ret;
+
+    if (!cetrafs_nslock_can_restart())
+        return cetrafs_nslock_acquire_set(inodes, n);
+    ret = __cetrafs_nslock_acquire_set(inodes, n, 1, 1);
+    if (ret != -EBUSY) {
+        cetrafs_nswait_forget();
+        return ret;
+    }
+    ret = cetrafs_nswait_within();
+    if (ret == -EBUSY) {
+        cetrafs_nswait_forget();
+        pr_err("nslock: could not acquire a %d-inode namespace set within %u ms -- the holder is not releasing\n",
+               n, CETRAFS_NSLOCK_BUDGET_MS);
+        return -EBUSY;
+    }
+    if (ret || cetrafs_nswait_queue()) {
+        cetrafs_nswait_forget();
+        return cetrafs_nslock_acquire_set(inodes, n);
+    }
+    atomic64_inc(&cetrafs_nslock_restarts);
+    return -ERESTARTNOINTR;
 }
 
 void cetrafs_nslock_release_set(struct inode **inodes, int n)

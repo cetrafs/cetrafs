@@ -1907,8 +1907,9 @@ static int cetrafs_create_locked(struct mnt_idmap *idmap,
  */
 static void cetrafs_ns_report(const char *op, struct inode *dir, const struct qstr *name, int ret)
 {
-    if (!ret || ret == -ENOENT || ret == -EEXIST || ret == -ENOTEMPTY || ret == -ENOTDIR || ret == -EISDIR)
-        return; /* ordinary, expected answers -- not failures */
+    if (!ret || ret == -ENOENT || ret == -EEXIST || ret == -ENOTEMPTY || ret == -ENOTDIR || ret == -EISDIR ||
+        ret == -ERESTARTNOINTR)
+        return; /* ordinary, expected answers -- not failures (a restart waits out a peer's lock) */
     pr_warn_ratelimited("%s '%*pE' in dir ino=%llu failed: %d\n", op, name ? (int) name->len : 0,
                         name ? (const char *) name->name : "", (unsigned long long) dir->i_ino, ret);
 }
@@ -1929,7 +1930,7 @@ static int cetrafs_create(struct mnt_idmap *idmap, struct inode *dir, struct den
 
     if (cetrafs_create_prelock_stall_ms)
         msleep(cetrafs_create_prelock_stall_ms);
-    ret = cetrafs_nslock_acquire_set(set, ARRAY_SIZE(set));
+    ret = cetrafs_nslock_acquire_set_vfs(set, ARRAY_SIZE(set));
     if (ret) {
         cetrafs_ns_report("create (lock)", dir, &dentry->d_name, ret);
         return ret;
@@ -2124,7 +2125,7 @@ static struct dentry *cetrafs_mkdir(struct mnt_idmap *idmap, struct inode *dir, 
 {
     struct inode *set[] = {dir}; /* child freshly allocated -- see cetrafs_create() */
     struct dentry *dret;
-    int ret = cetrafs_nslock_acquire_set(set, ARRAY_SIZE(set));
+    int ret = cetrafs_nslock_acquire_set_vfs(set, ARRAY_SIZE(set));
 
     if (ret)
         return ERR_PTR(ret);
@@ -2410,7 +2411,7 @@ static int cetrafs_unlink(struct inode *dir, struct dentry *dentry)
     /* Parent and victim both: the victim's nlink is mutated too, and another node can reach
      * that same inode through a different hardlink's parent. */
     struct inode *set[] = {dir, d_inode(dentry)};
-    int ret = cetrafs_nslock_acquire_set(set, ARRAY_SIZE(set));
+    int ret = cetrafs_nslock_acquire_set_vfs(set, ARRAY_SIZE(set));
 
     if (ret)
         return ret;
@@ -2531,7 +2532,7 @@ static int cetrafs_rmdir(struct inode *dir, struct dentry *dentry)
     /* Parent and victim both: the victim directory is itself a lockable parent, so a peer
      * could otherwise be mid-create inside the directory we free. */
     struct inode *set[] = {dir, d_inode(dentry)};
-    int ret = cetrafs_nslock_acquire_set(set, ARRAY_SIZE(set));
+    int ret = cetrafs_nslock_acquire_set_vfs(set, ARRAY_SIZE(set));
 
     if (ret)
         return ret;
@@ -3328,7 +3329,7 @@ static int cetrafs_rename(struct mnt_idmap *idmap,
         if (cetrafs_rename_prelock_stall_ms && attempt == 0)
             msleep(cetrafs_rename_prelock_stall_ms);
 
-        ret = cetrafs_nslock_acquire_set(set, ARRAY_SIZE(set));
+        ret = cetrafs_nslock_acquire_set_vfs(set, ARRAY_SIZE(set));
         if (ret) {
             if (discovered)
                 iput(discovered);
@@ -3503,7 +3504,7 @@ static int cetrafs_link(struct dentry *old_dentry, struct inode *dir, struct den
     /* Parent and target both: the target's nlink is mutated, and a peer
      * can be reaching it through one of its other names. */
     struct inode *set[] = {dir, d_inode(old_dentry)};
-    int ret = cetrafs_nslock_acquire_set(set, ARRAY_SIZE(set));
+    int ret = cetrafs_nslock_acquire_set_vfs(set, ARRAY_SIZE(set));
 
     if (ret)
         return ret;
@@ -3654,7 +3655,7 @@ static int cetrafs_symlink_locked(struct mnt_idmap *idmap,
 static int cetrafs_symlink(struct mnt_idmap *idmap, struct inode *dir, struct dentry *dentry, const char *symname)
 {
     struct inode *set[] = {dir}; /* child freshly allocated -- see cetrafs_create() */
-    int ret = cetrafs_nslock_acquire_set(set, ARRAY_SIZE(set));
+    int ret = cetrafs_nslock_acquire_set_vfs(set, ARRAY_SIZE(set));
 
     if (ret)
         return ret;

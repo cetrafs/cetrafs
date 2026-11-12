@@ -502,6 +502,7 @@ ASYNC_OK='
 lock.c|cetrafs_inode_mark_tree_cold|igrab
 lock.c|cetrafs_inode_note_stamp|igrab
 dir.c|cetrafs_link_locked|ihold
+lock.c|cetrafs_lock_release|ihold
 caw.c|cetrafs_cas_stress|kthread_run
 '
 UNLISTED=""
@@ -1443,6 +1444,7 @@ cetrafs_sb_peer_watch_forget safe:a-straddling-sample-re-arms-the-watch-at-now-w
 cetrafs_deferred_forget_range none:the-held-back-set-changes-under-the-buffer-lock
 cetrafs_inode_forget_tree none:an-on-disk-record-not-a-cache
 cetrafs_sb_nslock_forget none:a-release-queue-entry-not-a-cache
+cetrafs_nswait_forget none:a-per-task-deadline-not-a-cache
 cetrafs_file_cache_drop_count none:a-counter'
 c41_names() { # <files...>: every function whose name says it drops cached state
     grep -hoE '^(static )?(inline )?(void|bool|int|u32|u64) \*?cetrafs_[a-z0-9_]*(cache_drop|expire|invalidate|forget)[a-z0-9_]*\(' "$@" |
@@ -1586,7 +1588,9 @@ cetrafs_node_register final:every-registry-row-taken
 cetrafs_zg_queue_foreign_free below:a-full-queue-is-a-logged-leak-its-caller-reports-as-success'
 C43_REG_EBUSY='cetrafs_lock_suspend waits:schedule_timeout_killable
 cetrafs_nslock_acquire_tries waits:msleep
-cetrafs_nslock_acquire_set waits:msleep
+__cetrafs_nslock_acquire_set waits:msleep
+cetrafs_nslock_acquire_set_vfs waits:cetrafs_nswait_queue
+cetrafs_nswait_within below:past-the-deadline-the-caller-answers-ebusy-on-the-old-budget
 cetrafs_apply_raw_to_vfs_inode_sure waits:usleep_range
 cetrafs_cas_region_seeded_impl waits:usleep_range
 __cetrafs_journal_replay_node waits:time_after_eq

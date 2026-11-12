@@ -688,7 +688,11 @@ static int cetrafs_xattr_handler_get(const struct xattr_handler *handler,
 static int cetrafs_xattr_set(struct inode *inode, const char *name, const void *value, size_t size, int flags)
 {
     struct inode *set[] = {inode}; /* the inode's own record + its xattr block */
-    int ret = cetrafs_nslock_acquire_set(set, ARRAY_SIZE(set));
+    /* security.* is also set by IMA/EVM from __fput(), whose return
+     * nobody reads: that one waits in the lock (nslock.c). */
+    int ret = strncmp(name, XATTR_SECURITY_PREFIX, XATTR_SECURITY_PREFIX_LEN)
+                  ? cetrafs_nslock_acquire_set_vfs(set, ARRAY_SIZE(set))
+                  : cetrafs_nslock_acquire_set(set, ARRAY_SIZE(set));
 
     if (ret)
         return ret;

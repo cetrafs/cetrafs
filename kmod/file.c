@@ -6951,7 +6951,12 @@ int cetrafs_setattr(struct mnt_idmap *idmap, struct dentry *dentry, struct iattr
             return -EFBIG;
     }
 
-    ret = cetrafs_nslock_acquire_set(set, ARRAY_SIZE(set));
+    /* file_remove_privs() reaches here from a write, whose AIO and
+     * io_uring completions turn a restart into EINTR: that one waits in
+     * the lock (nslock.c). */
+    ret = (attr->ia_valid & (ATTR_KILL_SUID | ATTR_KILL_SGID | ATTR_KILL_PRIV))
+              ? cetrafs_nslock_acquire_set(set, ARRAY_SIZE(set))
+              : cetrafs_nslock_acquire_set_vfs(set, ARRAY_SIZE(set));
     if (ret)
         return ret;
 

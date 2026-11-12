@@ -338,6 +338,7 @@ void cetrafs_sb_lease_renewed(struct super_block *sb, unsigned long t0, unsigned
 int cetrafs_sb_mount_beat(struct super_block *sb);
 bool cetrafs_sb_defrag_draining(struct super_block *sb);
 bool cetrafs_sb_queue_cold(struct super_block *sb, struct work_struct *w);
+u64 cetrafs_lock_close_deferral_count(void);
 void cetrafs_sb_cold_close(struct super_block *sb);
 #define CETRAFS_COLD_RETRIES_MAX 8u /* heartbeat ticks a failed reconcile is retried for */
 bool cetrafs_sb_cold_park(struct super_block *sb, struct list_head *e);
@@ -822,6 +823,9 @@ void cetrafs_nslock_release(struct inode *inode);
  * cluster-wide (see cetrafs_rename()). */
 #define CETRAFS_NSLOCK_MAX_SET 5
 int cetrafs_nslock_acquire_set(struct inode **inodes, int n);
+int cetrafs_nslock_acquire_set_vfs(struct inode **inodes, int n);
+u64 cetrafs_nslock_restart_count(void);
+void cetrafs_nslock_exit(void);
 void cetrafs_nslock_release_set(struct inode **inodes, int n);
 
 // file.c
