@@ -1605,6 +1605,10 @@ struct cetrafs_lock_cas_ctx {
      * or a real writer's). */
     bool relocating;
     bool yield_request;
+    /* promote: our RELOCATING or YIELD becomes EXCLUSIVE -- a local
+     * writer opened under this node's own move pin (the inverse of
+     * demote below). */
+    bool promote;
     /* demote: our EXCLUSIVE becomes RELOCATING -- the last writer closed
      * while the mover is pinned on its lock. */
     bool demote;
@@ -1790,6 +1794,18 @@ static int cetrafs_lock_cas_mutate(void *image, unsigned int len, void *priv)
          * earlier one too: the bit is this mount's open now. */
         rec.read_open_incarnation[slot] =
             cetrafs_cpu_to_le32(ctx->reader_op == CETRAFS_READER_SET ? ctx->my_incarnation : 0);
+        cetrafs_inode_stamp_crc_ns(&rec);
+        memcpy(image, &rec, CETRAFS_INODE_NS_BYTES);
+        return 0;
+    }
+
+    if (ctx->promote) {
+        u32 m = cetrafs_le32(rec.lock_mode);
+
+        if (cetrafs_le32(rec.lock_owner_node) != ctx->my_node_id ||
+            (m != CETRAFS_LOCK_RELOCATING && m != CETRAFS_LOCK_YIELD))
+            return 1; /* not our move pin any more: nothing to turn */
+        rec.lock_mode = cetrafs_cpu_to_le32(CETRAFS_LOCK_EXCLUSIVE);
         cetrafs_inode_stamp_crc_ns(&rec);
         memcpy(image, &rec, CETRAFS_INODE_NS_BYTES);
         return 0;
@@ -1997,6 +2013,12 @@ static int cetrafs_lock_wait_yield(struct inode *inode, const cetrafs_inode_t *r
 /* A peer's background-move pin: ask it back and wait -- defined with
  * cetrafs_lock_foreign_user_settled(), its other user, far below. */
 static int cetrafs_lock_ask_mover(struct inode *inode, u32 my_node_id);
+
+/* TEST ONLY: a local write-open under this node's own move pin leaves
+ * it RELOCATING -- the control of tests/kernel/open_under_own_pin.sh. */
+static bool cetrafs_lock_open_no_promote;
+cetrafs_test_param(lock_open_no_promote, cetrafs_lock_open_no_promote, bool, 0644);
+MODULE_PARM_DESC(lock_open_no_promote, "TEST ONLY: a write-open under our own move pin keeps it RELOCATING");
 
 /* Clear the on-disk lock this node holds -- defined far below, next to
  * defrag_end which also uses it, but forward-declared here for the
@@ -2422,6 +2444,30 @@ reread:
         ret = cetrafs_lock_reread_claimed(inode, &raw);
         if (ret)
             goto out_give_back;
+    } else if (lock_on && want_write && !ci->lock_suspended && cetrafs_le32(raw.lock_owner_node) == my_node_id &&
+               (cetrafs_le32(raw.lock_mode) == CETRAFS_LOCK_RELOCATING ||
+                cetrafs_le32(raw.lock_mode) == CETRAFS_LOCK_YIELD) &&
+               !READ_ONCE(cetrafs_lock_open_no_promote)) {
+        /* Our own background move holds the file, and a writer is
+         * opening it here. The lock stays ours either way; what changes
+         * is what it SAYS. Left RELOCATING, a peer's open asks the move
+         * back and waits out lock_yield_wait_ms for a mover that, with a
+         * local writer present, reads its record cached and never sees
+         * the ask -- then is refused anyway, after 10 s and a warning
+         * blaming the move. EXCLUSIVE says a writer is here and refuses
+         * the peer at once. The last writer's close demotes it again if
+         * the move is still running. A failed swap only keeps the old
+         * label. */
+        struct cetrafs_lock_cas_ctx pctx = {
+            .my_node_id = my_node_id,
+            .generation = cetrafs_le64(raw.generation),
+            .promote = true,
+        };
+        int pret = cetrafs_lock_cas(inode, &pctx, &raw);
+
+        if (pret)
+            pr_warn_ratelimited("lock: ino=%llu could not mark the move pin as a writer's lock (%d)\n",
+                                (unsigned long long) inode->i_ino, pret);
     }
 
     /* nofilelock: we honor a present lock (above) but never auto-claim one,
