@@ -1643,15 +1643,21 @@ var deviceReadHelpers = map[string]struct {
 	// to choose one. It names a structure and an id; nothing else.
 	prefix  []string
 	maxArgs int
+	// suffix: as prefix, after the arguments, for a helper whose read
+	// mode is named last.
+	suffix []string
 }{
-	"pending":    {"pending_poke", []string{"dump"}, 1},
-	"node":       {"node_poke", nil, 1},
-	"zg":         {"zg_poke", nil, 1},
-	"inode-lock": {"inode_lock_poke", nil, 1},
+	"pending":    {"pending_poke", []string{"dump"}, 1, nil},
+	"node":       {"node_poke", nil, 1, nil},
+	"zg":         {"zg_poke", nil, 1, nil},
+	"inode-lock": {"inode_lock_poke", nil, 1, nil},
 	// The record's own fields (size/nlink/dirent_seq/generation). A
 	// separate kind because the plain inode-lock dump is compared byte
 	// for byte by the kernel suites.
-	"inode-rec": {"inode_lock_poke", []string{"--rec"}, 1},
+	"inode-rec": {"inode_lock_poke", []string{"--rec"}, 1, nil},
+	// A node's journal area flag: state (0 clean, 1 dirty) and its
+	// replay claim. The argument is the node id.
+	"journal": {"journal_poke", nil, 1, []string{"--dump"}},
 }
 
 // Settings the master may change. Whitelisted by key for the same
@@ -1672,6 +1678,18 @@ var settableControls = map[string]bool{
 // same reason set_control whitelists by key. See ModParamArgs in
 // protocol.go for why each one is here.
 var settableModParams = map[string]bool{
+	// sweep-vs-open-replay: keep a node out of a dead peer's replay
+	// until the scenario lets it in, hold the replayer mid-area, stop a
+	// node with its journal entries durable, and (control) the old
+	// sweep that waited for the area mutex.
+	"journal_replay_refuse":              true,
+	"journal_replay_apply_pause_ms":      true,
+	"journal_batch_crash_before_targets": true,
+	"journal_sweep_waits":                true,
+	// replay-after-truncate: a failed consume on one replayer, and its
+	// control (the old park).
+	"journal_consume_fail_once": true,
+	"journal_consume_fail_park": true,
 	// Default-mount lock suspension: each disables one half of what makes
 	// it safe, so the scenario's assertions can be shown to discriminate.
 	"lock_suspend_skip_publish": true,
@@ -1985,6 +2003,7 @@ func (s *Slave) doDeviceRead(a DeviceReadArgs) (DeviceReadResult, error) {
 	}
 	args := append([]string{s.dev()}, spec.prefix...)
 	args = append(args, a.Args...)
+	args = append(args, spec.suffix...)
 	cmd := exec.Command(bin, args...)
 	var out, errb bytes.Buffer
 	cmd.Stdout = &out

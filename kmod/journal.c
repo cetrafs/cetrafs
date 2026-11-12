@@ -2052,11 +2052,27 @@ static enum cetrafs_journal_verdict cetrafs_journal_judge(const struct cetrafs_j
  */
 static int __cetrafs_journal_replay_node(struct super_block *sb, u32 node_id, bool wait_for_claim);
 
+/* TEST ONLY: this node replays no peer's journal while set (-EBUSY), so
+ * a two-node scenario can choose which node claims a dead node's area
+ * first (ctest sweep-vs-open-replay). */
+static bool cetrafs_journal_replay_refuse;
+cetrafs_test_param(journal_replay_refuse, cetrafs_journal_replay_refuse, bool, 0644);
+MODULE_PARM_DESC(journal_replay_refuse, "TEST ONLY: refuse to replay any journal area");
+
+/* TEST ONLY: a caller that does not wait for a replay claim waits for
+ * the area's mutex anyway -- the old sweep, the control of ctest
+ * sweep-vs-open-replay. */
+static bool cetrafs_journal_sweep_waits;
+cetrafs_test_param(journal_sweep_waits, cetrafs_journal_sweep_waits, bool, 0644);
+MODULE_PARM_DESC(journal_sweep_waits, "TEST ONLY: a non-waiting replay still waits for the area mutex");
+
 int cetrafs_journal_replay_node(struct super_block *sb, u32 node_id, bool wait_for_claim)
 {
     struct cetrafs_journal *j = cetrafs_sb_get_journal(sb);
     int ret;
 
+    if (READ_ONCE(cetrafs_journal_replay_refuse))
+        return -EBUSY; /* test-only; see the parameter */
     if (!j || node_id >= 64)
         return __cetrafs_journal_replay_node(sb, node_id, wait_for_claim);
     /*
@@ -2067,7 +2083,7 @@ int cetrafs_journal_replay_node(struct super_block *sb, u32 node_id, bool wait_f
      * from the dead node and whose tick must not stall behind an open's
      * replay (audit F9). -EEXIST is its "someone is at it" already.
      */
-    if (!wait_for_claim) {
+    if (!wait_for_claim && !READ_ONCE(cetrafs_journal_sweep_waits)) {
         if (!mutex_trylock(&j->replay_mutex[node_id]))
             return -EEXIST;
     } else if (mutex_lock_killable(&j->replay_mutex[node_id])) {
@@ -2101,6 +2117,13 @@ int cetrafs_journal_replay_node(struct super_block *sb, u32 node_id, bool wait_f
 static bool cetrafs_journal_consume_fail_once;
 cetrafs_test_param(journal_consume_fail_once, cetrafs_journal_consume_fail_once, bool, 0644);
 MODULE_PARM_DESC(journal_consume_fail_once, "TEST ONLY: fail the next journal replay consume with -EIO");
+
+/* TEST ONLY: a failed consume falls through to the park as it used to,
+ * leaving the area CLEAN with the entry in its slot -- the control of
+ * ctest replay-after-truncate. */
+static bool cetrafs_journal_consume_fail_park;
+cetrafs_test_param(journal_consume_fail_park, cetrafs_journal_consume_fail_park, bool, 0644);
+MODULE_PARM_DESC(journal_consume_fail_park, "TEST ONLY: park the area clean after a failed consume");
 
 static int __cetrafs_journal_replay_node(struct super_block *sb, u32 node_id, bool wait_for_claim)
 {
@@ -2680,6 +2703,11 @@ consume:
             werr_consume = cetrafs_sync_buffer(sb, hbh);
         }
         brelse(hbh);
+        if (werr_consume && READ_ONCE(cetrafs_journal_consume_fail_park)) {
+            pr_err("journal replay: node %u could not consume txn %llu (%d) -- TEST: parking anyway\n", node_id,
+                   (unsigned long long) entries[s].txn_id, werr_consume);
+            werr_consume = 0; /* test-only; see the parameter */
+        }
         if (werr_consume) {
             /*
              * The entry stays, and so must the area's DIRTY flag. Parked
