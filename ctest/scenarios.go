@@ -3253,6 +3253,8 @@ func RunFullSuite(clients []*Client, lockPath, baseDir string, accountingSizeByt
 		{"fence-reclaim", func() (bool, error) { return RunFenceReclaim(clients, baseDir) }},
 		{"replay-race", func() (bool, error) { return RunReplayRace(clients, baseDir) }},
 		{"direct-write", func() (bool, error) { return RunDirectWrite(clients, baseDir) }},
+		{"zero-range", func() (bool, error) { return RunZeroRange(clients, baseDir) }},
+		{"fstrim-pool", func() (bool, error) { return RunFstrimPool(clients, baseDir) }},
 		{"inode-reuse", func() (bool, error) { return RunInodeReuse(clients, baseDir) }},
 		{"dirent-cache", func() (bool, error) { return RunDirentCache(clients, baseDir, dirStormPar) }},
 		{"extent-leaf-staleness", func() (bool, error) { return RunExtentLeafStaleness(clients, baseDir) }},

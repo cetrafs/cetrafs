@@ -625,6 +625,13 @@ func (s *Slave) dispatch(req Request) Response {
 		}
 		return okResp(req.ID, struct{}{})
 
+	case "fstrim":
+		res, err := s.doFstrim()
+		if err != nil {
+			return errResp(req.ID, err)
+		}
+		return okResp(req.ID, res)
+
 	case "dio_write":
 		var a DioWriteArgs
 		if err := unmarshalInto(&a); err != nil {
@@ -1612,6 +1619,9 @@ var settableControls = map[string]bool{
 	"stale_secs":       true,
 	"defrag":           true,
 	"auto_defrag":      true,
+	// fstrim-pool: hand emptied groups back undiscarded, so the pool
+	// holds groups the FITRIM pool pass has to claim.
+	"discard": true,
 }
 
 // Module parameters the master may set: test knobs only, by name, for the

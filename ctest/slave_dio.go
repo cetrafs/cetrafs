@@ -69,12 +69,31 @@ func (s *Slave) doFallocate(a FallocateArgs) error {
 	if err != nil {
 		return err
 	}
-	ferr := syscall.Fallocate(int(f.Fd()), 0, a.Offset, a.Length)
+	ferr := syscall.Fallocate(int(f.Fd()), a.Mode, a.Offset, a.Length)
 	cerr := f.Close()
 	if ferr != nil {
 		return fmt.Errorf("fallocate: %w", ferr)
 	}
 	return cerr
+}
+
+// doFstrim issues FITRIM on the mountpoint over the whole volume.
+func (s *Slave) doFstrim() (FstrimResult, error) {
+	mp, err := s.resolvePath("")
+	if err != nil {
+		return FstrimResult{}, err
+	}
+	f, err := os.Open(mp)
+	if err != nil {
+		return FstrimResult{}, err
+	}
+	defer f.Close()
+	r := struct{ start, length, minlen uint64 }{0, ^uint64(0), 0}
+	const fitrim = 0xC0185879 // _IOWR('X', 121, struct fstrim_range)
+	if _, _, e := syscall.Syscall(syscall.SYS_IOCTL, f.Fd(), fitrim, uintptr(unsafe.Pointer(&r))); e != 0 {
+		return FstrimResult{}, fmt.Errorf("FITRIM: %w", e)
+	}
+	return FstrimResult{Bytes: r.length}, nil
 }
 
 func (s *Slave) doDioWrite(a DioWriteArgs) (DioWriteResult, error) {

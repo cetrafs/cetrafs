@@ -682,13 +682,28 @@ type ModuleInfoResult struct {
 	KoModTime string `json:"ko_mod_time,omitempty"`
 }
 
-// FallocateArgs: fallocate(2) mode 0 over [Offset, Offset+Length), so a
-// file can carry preallocated (unwritten) blocks for a direct write to
-// land in.
+// FallocateArgs: fallocate(2) over [Offset, Offset+Length). Mode 0
+// preallocates (unwritten blocks for a direct write to land in); the
+// zero-range scenario passes FALLOC_FL_ZERO_RANGE, with or without
+// KEEP_SIZE.
 type FallocateArgs struct {
 	Path   string `json:"path"`
 	Offset int64  `json:"offset"`
 	Length int64  `json:"length"`
+	Mode   uint32 `json:"mode,omitempty"`
+}
+
+const (
+	fallocKeepSize  = 0x01 // FALLOC_FL_KEEP_SIZE
+	fallocZeroRange = 0x10 // FALLOC_FL_ZERO_RANGE
+)
+
+// FstrimArgs: FITRIM over the whole mount, as fstrim(8) does it.
+type FstrimArgs struct{}
+
+// FstrimResult: the byte count the kernel reports trimmed.
+type FstrimResult struct {
+	Bytes uint64 `json:"bytes"`
 }
 
 // DioWriteArgs: O_DIRECT writes of whole 4 KiB blocks, Par at a time.
