@@ -491,10 +491,19 @@ static int cetrafs_dmpath_try(struct block_device *dm_bdev, dev_t path_dev, stru
     if (IS_ERR(file))
         return PTR_ERR(file);
 
+    /*
+     * A path SMALLER than the map cannot be a 1:1 map of it. A LARGER one
+     * can, and is what a host has between rescanning its SCSI paths after
+     * the LUN grew and resizing the multipath map over them: refusing it
+     * then cost a mounted node its COMPARE AND WRITE on the next path
+     * failover. An offset map (a partition, a linear map not starting at
+     * 0) is still refused: its block 0 is not the path's, which
+     * cetrafs_dmpath_identical() checks below.
+     */
     pbdev = file_bdev(file);
-    if (!pbdev || bdev_nr_sectors(pbdev) != bdev_nr_sectors(dm_bdev)) {
+    if (!pbdev || bdev_nr_sectors(pbdev) < bdev_nr_sectors(dm_bdev)) {
         fput(file);
-        return -ENXIO; /* different size: not a 1:1 map of this device */
+        return -ENXIO; /* smaller than the map: not a 1:1 map of this device */
     }
 
     sdev = cetrafs_caw_get_sdev(pbdev);
