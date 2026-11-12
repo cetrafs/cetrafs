@@ -45,6 +45,13 @@ type Slave struct {
 	mu      sync.Mutex
 	mounted bool // whether this process believes the mount is up
 
+	// A device-mapper view of 'device' (view_device), or "": what this
+	// node mounts, checks and reads while it is set -- a node whose
+	// device has not been rescanned after the LUN grew sees a shorter
+	// device than its peers. Derived from 'device', never another one.
+	viewMu sync.Mutex
+	view   string
+
 	handleSeq atomic.Uint64
 	handles   sync.Map // uint64 -> *os.File
 
@@ -576,7 +583,7 @@ func (s *Slave) dispatch(req Request) Response {
 		if err := unmarshalInto(&a); err != nil {
 			return errResp(req.ID, err)
 		}
-		res, err := readProcSnapshot(a.Device)
+		res, err := readProcSnapshot(s.viewOf(a.Device))
 		if err != nil {
 			return errResp(req.ID, err)
 		}
@@ -705,11 +712,22 @@ func (s *Slave) dispatch(req Request) Response {
 		}
 		return okResp(req.ID, res)
 
+	case "view_device":
+		var a ViewDeviceArgs
+		if err := unmarshalInto(&a); err != nil {
+			return errResp(req.ID, err)
+		}
+		if err := s.doViewDevice(a); err != nil {
+			return errResp(req.ID, err)
+		}
+		return okResp(req.ID, struct{}{})
+
 	case "proc_raw":
 		var a ProcRawArgs
 		if err := unmarshalInto(&a); err != nil {
 			return errResp(req.ID, err)
 		}
+		a.Device = s.viewOf(a.Device)
 		res, err := doProcRaw(a)
 		if err != nil {
 			return errResp(req.ID, err)
@@ -854,12 +872,12 @@ func (s *Slave) doMount(a MountArgs) error {
 	if a.NoFileLock {
 		margs = append(margs, "-o", "nofilelock")
 	}
-	margs = append(margs, s.device, s.mountPoint)
+	margs = append(margs, s.dev(), s.mountPoint)
 	cmd := exec.Command("mount", margs...)
 	var stderr bytes.Buffer
 	cmd.Stderr = &stderr
 	if err := cmd.Run(); err != nil {
-		return fmt.Errorf("mount %s at %s: %w: %s", s.device, s.mountPoint, err, strings.TrimSpace(stderr.String()))
+		return fmt.Errorf("mount %s at %s: %w: %s", s.dev(), s.mountPoint, err, strings.TrimSpace(stderr.String()))
 	}
 
 	// Never take `mount` exiting 0 as proof. Confirm with the kernel,
@@ -911,7 +929,7 @@ func (s *Slave) doGrowfs(a GrowfsArgs) (MkfsResult, error) {
 	if err != nil {
 		return MkfsResult{}, fmt.Errorf("embedded growfs unavailable: %w", err)
 	}
-	args := []string{s.device}
+	args := []string{s.dev()}
 	if a.Size != "" {
 		args = append(args, "-s", a.Size)
 	}
@@ -960,7 +978,7 @@ func (s *Slave) doMkfs(a MkfsArgs) (MkfsResult, error) {
 	// scenario's "mkfs refuses a mounted device" assertion passed while
 	// mkfs had never even looked at the device. That is why the guard
 	// now matches on WHY mkfs refused, not just that it did.
-	args := []string{s.device}
+	args := []string{s.dev()}
 	args = append(args, a.Extra...)
 	if a.Force {
 		args = append(args, "-f")
@@ -1040,7 +1058,7 @@ func (s *Slave) slaveInfo() SlaveInfoResult {
 		Device:          s.device,
 		MountPoint:      s.mountPoint,
 		Mounted:         mounted,
-		DeviceMountedAt: deviceMountPoints(s.device),
+		DeviceMountedAt: deviceMountPoints(s.dev()),
 	}
 }
 
@@ -1697,10 +1715,11 @@ var settableModParams = map[string]bool{
 	"scrub_ignore_peer_frees": true,
 	// grow-twice: the layout refresh at ENOSPC is the only way to a
 	// grow (heartbeat refresh off); its control turns that off too.
-	"layout_refresh_hb_off":    true,
-	"alloc_enospc_refresh_off": true,
-	"hb_interval_secs":         true,
-	"stale_secs":               true,
+	"layout_refresh_hb_off":      true,
+	"layout_past_end_no_refresh": true,
+	"alloc_enospc_refresh_off":   true,
+	"hb_interval_secs":           true,
+	"stale_secs":                 true,
 	// The background scrub's cadence. A scenario that has to watch the
 	// scrub make (or decline) a decision cannot wait out the 30-minute
 	// default, and these must be set BEFORE the mount: scrub_start()
@@ -1730,7 +1749,7 @@ func (s *Slave) doFsck(a FsckArgs) (FsckResult, error) {
 	if a.Repair {
 		args = append(args, "-r")
 	}
-	args = append(args, s.device)
+	args = append(args, s.dev())
 	cmd := exec.Command(bin, args...)
 	if len(a.Env) > 0 {
 		cmd.Env = os.Environ()
@@ -1778,7 +1797,7 @@ func (s *Slave) doSetControl(a SetControlArgs) (SetControlResult, error) {
 	if !settableControls[a.Key] {
 		return SetControlResult{}, fmt.Errorf("control %q is not settable from here", a.Key)
 	}
-	path := devPath("/proc/fs/cetrafs", s.device, "controls")
+	path := devPath("/proc/fs/cetrafs", s.dev(), "controls")
 	if err := os.WriteFile(path, []byte(a.Key+"="+a.Value+"\n"), 0o200); err != nil {
 		return SetControlResult{}, fmt.Errorf("setting %s=%s: %w", a.Key, a.Value, err)
 	}
@@ -1956,15 +1975,15 @@ func (s *Slave) doDeviceRead(a DeviceReadArgs) (DeviceReadResult, error) {
 	// detected it and fenced itself), while userspace here was handed a
 	// stale page. Same trap the loop suites document as "flush the loop
 	// device after poking the backing file", met on a real LUN.
-	if err := flushBlockDevice(s.device); err != nil {
-		return DeviceReadResult{}, fmt.Errorf("flushing %s before reading it: %w", s.device, err)
+	if err := flushBlockDevice(s.dev()); err != nil {
+		return DeviceReadResult{}, fmt.Errorf("flushing %s before reading it: %w", s.dev(), err)
 	}
 
 	bin, err := s.helperPath(spec.helper)
 	if err != nil {
 		return DeviceReadResult{}, err
 	}
-	args := append([]string{s.device}, spec.prefix...)
+	args := append([]string{s.dev()}, spec.prefix...)
 	args = append(args, a.Args...)
 	cmd := exec.Command(bin, args...)
 	var out, errb bytes.Buffer
@@ -2075,4 +2094,80 @@ func (s *Slave) helperPath(name string) (string, error) {
 		}
 	}
 	return bin, nil
+}
+
+// dev is the device this node mounts and checks: the view while one is
+// set (view_device), the configured device otherwise.
+func (s *Slave) dev() string {
+	s.viewMu.Lock()
+	defer s.viewMu.Unlock()
+	if s.view != "" {
+		return s.view
+	}
+	return s.device
+}
+
+// viewOf maps a master's name for this node's device onto the view, so
+// procfs is read where the kernel published it.
+func (s *Slave) viewOf(d string) string {
+	if d == "" || d == s.device {
+		return s.dev()
+	}
+	return d
+}
+
+const ctestViewName = "ctestview"
+
+// doViewDevice: Sectors > 0 starts a view of the first Sectors of the
+// device (unmounted only); 0 grows the view to the whole device, live --
+// what a rescan does under a mounted node; -1 removes it (unmounted only).
+func (s *Slave) doViewDevice(a ViewDeviceArgs) error {
+	s.mu.Lock()
+	mounted := s.mounted
+	s.mu.Unlock()
+	s.viewMu.Lock()
+	defer s.viewMu.Unlock()
+	dm := func(args ...string) error {
+		out, err := exec.Command("dmsetup", args...).CombinedOutput()
+		if err != nil {
+			return fmt.Errorf("dmsetup %s: %w: %s", strings.Join(args, " "), err, strings.TrimSpace(string(out)))
+		}
+		return nil
+	}
+	switch {
+	case a.Sectors > 0:
+		if mounted || s.view != "" {
+			return fmt.Errorf("view_device: a view needs an unmounted node with none already")
+		}
+		if err := dm("create", ctestViewName, "--table", fmt.Sprintf("0 %d linear %s 0", a.Sectors, s.device)); err != nil {
+			return err
+		}
+		s.view = "/dev/mapper/" + ctestViewName
+		return waitDeviceReadable(s.view, 30)
+	case a.Sectors == 0:
+		if s.view == "" {
+			return fmt.Errorf("view_device: no view to rescan")
+		}
+		out, err := exec.Command("blockdev", "--getsz", s.device).Output()
+		if err != nil {
+			return fmt.Errorf("blockdev --getsz %s: %w", s.device, err)
+		}
+		full := strings.TrimSpace(string(out))
+		if err := dm("reload", ctestViewName, "--table", fmt.Sprintf("0 %s linear %s 0", full, s.device)); err != nil {
+			return err
+		}
+		return dm("resume", ctestViewName)
+	default:
+		if s.view == "" {
+			return nil
+		}
+		if mounted {
+			return fmt.Errorf("view_device: unmount before removing the view")
+		}
+		if err := dm("remove", ctestViewName); err != nil {
+			return err
+		}
+		s.view = ""
+		return nil
+	}
 }

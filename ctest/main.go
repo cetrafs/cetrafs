@@ -357,7 +357,7 @@ func runMaster(cfg masterConfig) (bool, error) {
 		"concurrent-rename", "read-presence", "inode-reuse", "link-stale-reuse", "inode-unique", "dirent-cache", "extent-leaf-staleness",
 		"record-write-race", "dirent-torn", "caw", "pending-free", "scrub-transit", "hypervisor-storm", "ns-fuzz",
 		"create-visibility",
-		"fence-reclaim", "replay-race", "direct-write", "zero-range", "fstrim-pool", "defrag-yield", "handback-unknown", "churn-trim", "rename-loop", "damage-incarnation", "cas-image-check", "grow-twice", "frees-in-flight", "repair-claim-race", "reader-reclaim",
+		"fence-reclaim", "replay-race", "direct-write", "zero-range", "fstrim-pool", "defrag-yield", "handback-unknown", "churn-trim", "rename-loop", "damage-incarnation", "cas-image-check", "grow-twice", "grow-unrescanned", "frees-in-flight", "repair-claim-race", "reader-reclaim",
 		"space-accounting",
 		"sparse-bigfile",
 		"grow-live",
@@ -463,6 +463,8 @@ func dispatchScenario(cfg masterConfig, clients []*Client) (bool, error) {
 		return RunCasImageCheck(clients, cfg.testDir)
 	case "grow-twice":
 		return RunGrowTwice(clients, cfg.testDir)
+	case "grow-unrescanned":
+		return RunGrowUnrescanned(clients, cfg.testDir)
 	case "frees-in-flight":
 		return RunFreesInFlight(clients, cfg.testDir)
 	case "repair-claim-race":

@@ -807,3 +807,8 @@ type DefragFileResult struct {
 	ExtentsAfter  uint64 `json:"extents_after"`
 	BlocksMoved   uint64 `json:"blocks_moved"`
 }
+
+// ViewDeviceArgs: see Slave.doViewDevice.
+type ViewDeviceArgs struct {
+	Sectors int64 `json:"sectors"`
+}
