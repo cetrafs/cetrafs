@@ -1686,6 +1686,9 @@ var settableModParams = map[string]bool{
 	"journal_replay_apply_pause_ms":      true,
 	"journal_batch_crash_before_targets": true,
 	"journal_sweep_waits":                true,
+	// zg-claim-vs-replay control: the heartbeat's takeover waits for
+	// a peer's replay, as it used to.
+	"zg_claim_always_waits": true,
 	// replay-after-truncate: a failed consume on one replayer, and its
 	// control (the old park).
 	"journal_consume_fail_once": true,

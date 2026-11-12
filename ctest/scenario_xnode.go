@@ -556,3 +556,251 @@ func RunReplayAfterTruncate(clients []*Client, baseDir string) (bool, error) {
 	}
 	return ok, nil
 }
+
+// infoField reads one "key: value" line of c's procfs info as a string.
+func infoField(c *Client, key string) string {
+	var pr ProcRawResult
+	resp, err := c.Call("proc_raw", ProcRawArgs{Device: c.Device})
+	if decodeResult(c.Name, resp, err, &pr) != nil {
+		return ""
+	}
+	for _, l := range strings.Split(pr.Info, "\n") {
+		if v, found := strings.CutPrefix(l, key+": "); found {
+			return strings.TrimSpace(v)
+		}
+	}
+	return ""
+}
+
+// RunZgClaimVsReplay: a node's heartbeat does not wait inside a Zone
+// Group takeover for a peer replaying the group's dead owner, and does
+// not take the group before that replay is done.
+//
+// Taking a dead owner's Zone Group replays its journal first, and when a
+// LIVE peer holds the replay claim the taker waits for it -- up to the
+// claim cap, several stale windows. In the heartbeat that wait held the
+// node's claim mutex and parked the whole maintenance pass behind it:
+// sweeps, frees, every retry. The heartbeat now leaves the group for its
+// next tick (zg_claim_replay_deferrals), and keeps an allocator's
+// request for it standing.
+//
+// Two Zone Groups, three nodes: b and c own one each, a owns none, so
+// a's heartbeat goes for the first group it can take. c dies with
+// journal entries durable and not applied; b claims c's area and is held
+// mid-replay (journal_replay_apply_pause_ms); a is kept out until then
+// (journal_replay_refuse). While b is held, a's heartbeat passes must go
+// on, its takeover must be deferred, and a must still own nothing: the
+// group is taken only once b's replay is done.
+//
+// Control (CTEST_ZGCLAIM_CONTROL=1): a's heartbeat waits for the replay
+// (zg_claim_always_waits) -- its passes must stop while b is held.
+func RunZgClaimVsReplay(clients []*Client, baseDir string) (bool, error) {
+	if len(clients) < 3 {
+		return skipScenario("zg-claim-vs-replay needs a dead node and two survivors, have %d", len(clients))
+	}
+	control := os.Getenv("CTEST_ZGCLAIM_CONTROL") != ""
+	a, b, c := clients[0], clients[1], clients[2]
+	if err := ensureUnmounted(clients); err != nil {
+		return false, err
+	}
+	var restores []func()
+	linkDown := false
+	var cHandle uint64
+	defer func() {
+		for i := len(restores) - 1; i >= 0; i-- {
+			restores[i]()
+		}
+		if cHandle != 0 {
+			_, _ = c.Call("close", CloseArgs{Handle: cHandle})
+		}
+		if linkDown {
+			if _, err := c.Call("link_up", nil); err != nil {
+				fmt.Printf("WARNING: could not restore %s's device: %v\n", c.Name, err)
+			}
+		}
+		_ = ensureUnmounted(clients)
+		if err := mkfsOn(a); err != nil {
+			fmt.Printf("WARNING: could not reformat the LUN to its full size: %v\n", err)
+		}
+	}()
+	if err := mkfsOn(a, "-s", "4G", "-z", "2"); err != nil {
+		return false, fmt.Errorf("setup: %w", err)
+	}
+	// b and c first: each claims one of the two groups, a gets none.
+	if err := mountAllDefault([]*Client{b, c, a}); err != nil {
+		return false, err
+	}
+	setClusterTiming(clients, 5, 15, false)
+	restores = append(restores, func() { setClusterTiming(clients, defaultHBIntervalSecs, defaultStaleSecs, true) })
+	if err := waitAdvertisedInterval(a, c, 5, 20*time.Second); err != nil {
+		fmt.Printf("WARNING: %s\n", err)
+	}
+
+	ok := true
+	pass := func(l string) { check(&ok, l, true, "") }
+	dir := baseDir + "/zg-claim"
+	img := dir + "/vm.img"
+	fmt.Printf("=== zg-claim-vs-replay: %s dies dirty, %s replays it slowly, %s's heartbeat wants its group ===\n",
+		c.Name, b.Name, a.Name)
+	if control {
+		fmt.Printf("  NEGATIVE CONTROL: %s's heartbeat waits for the replay\n", a.Name)
+	}
+	for _, cl := range []*Client{b, c} {
+		if w := infoField(cl, "write_ready"); w != "yes" {
+			check(&ok, "setup: "+cl.Name+" owns a zone group", false, "write_ready="+w)
+			return ok, nil
+		}
+	}
+	if w := infoField(a, "write_ready"); w != "no" {
+		check(&ok, "setup: "+a.Name+" owns no zone group", false, "write_ready="+w)
+		return ok, nil
+	}
+	pass("setup: " + b.Name + " and " + c.Name + " own a zone group each, " + a.Name + " none")
+	var snapC ProcSnapshotResult
+	resp, err := c.Call("proc_snapshot", ProcSnapshotArgs{Device: c.Device})
+	if e := decodeResult(c.Name, resp, err, &snapC); e != nil {
+		return false, fmt.Errorf("setup: %w", e)
+	}
+	cID := snapC.ThisNodeID
+
+	for _, kv := range []struct {
+		cl *Client
+		p  []string
+	}{
+		{a, []string{"journal_replay_refuse", "1"}},
+		{b, []string{"journal_replay_apply_pause_ms", "40000"}},
+	} {
+		r, err := modParams(kv.cl, kv.p...)
+		restores = append(restores, r)
+		if err != nil {
+			return false, fmt.Errorf("setup: %w", err)
+		}
+	}
+	if control {
+		r, err := modParams(a, "zg_claim_always_waits", "1")
+		restores = append(restores, r)
+		if err != nil {
+			return false, fmt.Errorf("setup: %w", err)
+		}
+	}
+
+	if err := callOK(c, "mkdir", MkdirArgs{Path: dir}); err != nil {
+		return false, fmt.Errorf("setup mkdir: %w", err)
+	}
+	var oh OpenHoldResult
+	resp, err = c.Call("open_hold", OpenHoldArgs{Path: img, Mode: "rdwr", Create: true})
+	if e := decodeResult(c.Name, resp, err, &oh); e != nil {
+		return false, fmt.Errorf("setup: %s open: %w", c.Name, e)
+	}
+	cHandle = oh.Handle
+	if err := callOK(c, "fallocate", FallocateArgs{Path: img, Length: 64 << 20}); err != nil {
+		return false, fmt.Errorf("setup: %s fallocate: %w", c.Name, err)
+	}
+	for i := 0; i < 8; i++ {
+		if err := callOK(c, "write_held", HeldIOArgs{Handle: cHandle, Offset: int64(i*997%16000) * 4096, Size: 4096,
+			Stamp: fmt.Sprintf("c-%d-", i)}); err != nil {
+			return false, fmt.Errorf("setup: %s write %d: %w", c.Name, i, err)
+		}
+	}
+	mark := fmt.Sprintf("ctest-zgclaim-%d", time.Now().UnixNano())
+	for _, cl := range clients[:3] { // each node's own log: a search on one without it reads it all
+		_ = callOK(cl, "dmesg_mark", DmesgMarkArgs{Marker: mark})
+	}
+	if r, err := modParams(c, "journal_batch_crash_before_targets", "1"); err != nil {
+		return false, fmt.Errorf("setup: %w", err)
+	} else {
+		restores = append(restores, r)
+	}
+	_ = callOK(c, "write_held", HeldIOArgs{Handle: cHandle, Offset: 12345 * 4096, Size: 4096, Stamp: "c-last-"})
+	if !strings.Contains(dmesgSince(c, mark), "before their targets") {
+		check(&ok, "setup: "+c.Name+" stopped with journal entries durable and not applied", false,
+			"no 'TEST stop ... before their targets' in its dmesg")
+		return ok, nil
+	}
+	pass("setup: " + c.Name + " stopped with journal entries durable and not applied")
+	if err := callOK(c, "link_down", nil); err != nil {
+		return false, fmt.Errorf("%s link_down: %w", c.Name, err)
+	}
+	linkDown = true
+	if !waitSeenStale([]*Client{a, b}, 90*time.Second) {
+		check(&ok, "setup: "+a.Name+" and "+b.Name+" see "+c.Name+" stale", false, "never went stale")
+		return ok, nil
+	}
+	if !waitDmesg(b, mark, "journal replay: pausing", 60*time.Second) {
+		check(&ok, "setup: "+b.Name+" is replaying "+c.Name+"'s journal", false, "no 'journal replay: pausing' on "+b.Name)
+		return ok, nil
+	}
+	pass("setup: " + b.Name + " holds the replay claim on " + c.Name + "'s journal and is paused in it")
+
+	_ = callOK(a, "mod_param", ModParamArgs{Name: "journal_replay_refuse", Value: "0"})
+	s0, err := infoCounter(a, "hb_sweeps")
+	if err != nil {
+		return false, err
+	}
+	d0, err := infoCounter(a, "zg_claim_replay_deferrals")
+	if err != nil {
+		return false, err
+	}
+	time.Sleep(4 * time.Second)
+	s1, _ := infoCounter(a, "hb_sweeps")
+	time.Sleep(15 * time.Second)
+	s2, _ := infoCounter(a, "hb_sweeps")
+	d2, _ := infoCounter(a, "zg_claim_replay_deferrals")
+	wr := infoField(a, "write_ready")
+	// The pause is per entry: c's area stays dirty until b has redone
+	// them all.
+	if journalState(a, cID) != 1 {
+		check(&ok, "setup: "+b.Name+" was still held for the whole measurement", false,
+			"its replay ended early -- nothing below is measured")
+		return ok, nil
+	}
+	if control {
+		check(&ok, fmt.Sprintf("control: with the takeover waiting, %s's heartbeat passes stop (%d -> %d over 15 s)",
+			a.Name, s1, s2), s2 <= s1, "they went on -- the scenario cannot tell the two apart")
+	} else {
+		check(&ok, fmt.Sprintf("%s's heartbeat passes go on while %s replays (%d -> %d -> %d)", a.Name, b.Name, s0, s1, s2),
+			s2 >= s1+2, "the maintenance pass is parked behind the takeover")
+		check(&ok, fmt.Sprintf("%s's takeover was left for a later tick (%d deferrals)", a.Name, d2-d0),
+			d2 > d0, "no deferral counted -- the takeover never met the replay")
+	}
+	check(&ok, a.Name+" took no zone group while "+b.Name+" was replaying its owner", wr == "no",
+		"write_ready="+wr+" -- the group was taken under the replay")
+
+	// Once b is done, a's next tick takes the group. b's later entries
+	// go unpaused.
+	_ = callOK(b, "mod_param", ModParamArgs{Name: "journal_replay_apply_pause_ms", Value: "0"})
+	took := false
+	for i := 0; i < 120 && !took; i++ {
+		took = infoField(a, "write_ready") == "yes"
+		if !took {
+			time.Sleep(time.Second)
+		}
+	}
+	check(&ok, a.Name+" takes "+c.Name+"'s zone group once "+b.Name+"'s replay is done", took, "it still owns none")
+
+	// c comes back as a fresh mount, then everything leaves cleanly.
+	_ = ensureUnmounted([]*Client{a, b})
+	_, _ = c.Call("close", CloseArgs{Handle: cHandle}) // on a stopped mount: errors, but the fd goes
+	cHandle = 0
+	if _, err := c.Call("link_up", nil); err != nil {
+		return false, fmt.Errorf("%s link_up: %w", c.Name, err)
+	}
+	linkDown = false
+	_ = ensureUnmounted([]*Client{c})
+	if err := mountAllDefault([]*Client{c}); err == nil {
+		_ = ensureUnmounted([]*Client{c})
+	}
+	var fr FsckResult
+	resp, err = a.Call("fsck", FsckArgs{})
+	if e := decodeResult(a.Name, resp, err, &fr); e != nil {
+		check(&ok, "fsck ran", false, e.Error())
+	} else {
+		check(&ok, "fsck clean", fr.Clean, fmt.Sprintf("exit %d: %s", fr.ExitCode, firstLine(fr.Output)))
+	}
+	if ok {
+		fmt.Printf("PASS: zg-claim-vs-replay\n")
+	} else {
+		fmt.Printf("FAIL: zg-claim-vs-replay: see failed checks above\n")
+	}
+	return ok, nil
+}

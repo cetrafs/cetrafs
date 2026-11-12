@@ -2075,7 +2075,9 @@ static enum cetrafs_journal_verdict cetrafs_journal_judge(const struct cetrafs_j
  * for the holder to finish instead, and every caller that goes on to
  * TAKE something from the dead node must pass it: its own area at
  * mount-attach, and every lock, namespace-lock and Zone Group reclaim.
- * Only the heartbeat sweep, which takes nothing, may walk away. That
+ * A caller that does not wait gets -EEXIST and must take nothing: the
+ * heartbeat sweep, which takes nothing anyway, and the heartbeat's Zone
+ * Group takeover, which leaves the group for its next tick. That
  * plus the flag check serializes concurrent replayers, and replaying
  * twice is idempotent regardless. Reads of the flag and slot
  * headers are uncached: this area belongs to a different node whose
@@ -2255,12 +2257,14 @@ static int __cetrafs_journal_replay_node(struct super_block *sb, u32 node_id, bo
     }
     if (ret) {
         if (ret == -EEXIST) {
-            /* The heartbeat sweep, which takes nothing from the dead
-             * node, walking away from a replay a peer is doing. Counted,
-             * not just tolerated: it is the only evidence that the race
-             * happened at all. */
+            /* A caller that does not wait walking away from a replay a
+             * peer is doing: the heartbeat sweep, or the heartbeat's Zone
+             * Group takeover. -EEXIST, never 0: the takeover would read 0
+             * as "replayed" and take the group while the peer is still
+             * writing its owner's blocks. Counted, not just tolerated:
+             * it is the only evidence that the race happened at all. */
             atomic64_inc(&cetrafs_journal_replay_declines);
-            return 0;
+            return -EEXIST;
         }
         return ret;
     }

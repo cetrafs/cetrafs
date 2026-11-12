@@ -393,6 +393,7 @@ void cetrafs_sb_zg_adopt_done(struct super_block *sb, u32 zg_id);
 bool cetrafs_sb_has_heartbeat(struct super_block *sb);
 bool cetrafs_sb_zg_adopt_wait(struct super_block *sb, u32 zg_id);
 void cetrafs_zg_adopt_wanted(struct super_block *sb, u32 my_node_id);
+u64 cetrafs_zg_claim_replay_deferral_count(void);
 bool cetrafs_sb_in_reclaim_lock(struct super_block *sb);
 bool cetrafs_sb_ro_refuses(struct super_block *sb, const char *what);
 void cetrafs_inode_set_wb_failed(struct inode *inode, bool failed);

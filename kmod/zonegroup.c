@@ -892,21 +892,41 @@ static unsigned int cetrafs_zg_steal_stall_ms;
 cetrafs_test_param(zg_steal_stall_ms, cetrafs_zg_steal_stall_ms, uint, 0644);
 MODULE_PARM_DESC(zg_steal_stall_ms, "TEST ONLY: pause before stealing a stale owner's zone group");
 
+/* TEST ONLY: every Zone Group takeover waits for a peer's replay, the
+ * heartbeat's too -- the control of ctest zg-claim-vs-replay. */
+static bool cetrafs_zg_claim_always_waits;
+cetrafs_test_param(zg_claim_always_waits, cetrafs_zg_claim_always_waits, bool, 0644);
+MODULE_PARM_DESC(zg_claim_always_waits, "TEST ONLY: the heartbeat's Zone Group takeover waits for a peer's replay");
+
+static atomic64_t cetrafs_zg_claim_replay_deferrals = ATOMIC64_INIT(0);
+
+u64 cetrafs_zg_claim_replay_deferral_count(void)
+{
+    return (u64) atomic64_read(&cetrafs_zg_claim_replay_deferrals);
+}
+
 static int __cetrafs_zg_try_claim_one(struct super_block *sb,
                                       u32 zg_id,
                                       u32 my_node_id,
                                       bool at_mount,
+                                      bool may_wait,
                                       bool *out_claimed);
 
 /* Under the node's claim mutex: a claim recounts the Zone Group before
  * caching it as ours, and a concurrent tick's re-attach -- which sees
  * the device already naming this node -- would otherwise cache it in
  * the middle of that recount (audit 2026-11-06 M4). */
-static int cetrafs_zg_try_claim_one(struct super_block *sb, u32 zg_id, u32 my_node_id, bool at_mount, bool *out_claimed)
+/* may_wait: taking a dead owner's Zone Group waits for a live peer
+ * already replaying that owner's journal. The heartbeat passes false:
+ * it leaves the Zone Group for its next tick instead -- a wait here holds
+ * the claim mutex, so every writer of this node that needs a Zone Group
+ * would wait behind it, and the maintenance pass with it. */
+static int cetrafs_zg_try_claim_one(struct super_block *sb, u32 zg_id, u32 my_node_id, bool at_mount, bool may_wait,
+                                    bool *out_claimed)
 {
     unsigned int nofs = 0;
     bool locked = cetrafs_sb_zg_claim_lock(sb, &nofs);
-    int ret = __cetrafs_zg_try_claim_one(sb, zg_id, my_node_id, at_mount, out_claimed);
+    int ret = __cetrafs_zg_try_claim_one(sb, zg_id, my_node_id, at_mount, may_wait, out_claimed);
 
     if (locked)
         cetrafs_sb_zg_claim_unlock(sb, nofs);
@@ -917,6 +937,7 @@ static int __cetrafs_zg_try_claim_one(struct super_block *sb,
                                       u32 zg_id,
                                       u32 my_node_id,
                                       bool at_mount,
+                                      bool may_wait,
                                       bool *out_claimed)
 {
     cetrafs_zone_group_t *zg; /* heap, not stack -- see the comment above */
@@ -996,7 +1017,7 @@ static int __cetrafs_zg_try_claim_one(struct super_block *sb,
         goto out_unlock;
     }
     if (owner != CETRAFS_NODE_ID_NONE) {
-        bool stale = false;
+        bool stale = false, wait;
 
         ret = cetrafs_node_is_stale(sb, owner, &stale);
         if (ret)
@@ -1024,7 +1045,16 @@ static int __cetrafs_zg_try_claim_one(struct super_block *sb,
 
         /* We hold no cluster mutex here any more -- replay claims the
          * area itself, which is what serializes concurrent replayers. */
-        ret = cetrafs_journal_replay_node(sb, owner, /*wait_for_claim=*/true);
+        wait = may_wait || READ_ONCE(cetrafs_zg_claim_always_waits); /* test-only; see the parameter */
+        ret = cetrafs_journal_replay_node(sb, owner, wait);
+        if (ret == -EEXIST && !wait) {
+            /* A peer is replaying it right now: next tick. -EAGAIN, not
+             * 0: an allocator may be waiting for exactly this group
+             * (cetrafs_zg_adopt_wanted() keeps it wanted). */
+            atomic64_inc(&cetrafs_zg_claim_replay_deferrals);
+            ret = -EAGAIN;
+            goto out_unlock;
+        }
         if (ret) {
             pr_err("ZG claim: replaying stale node %u's journal failed (%d), not claiming ZG %u\n", owner, ret, zg_id);
             goto out_unlock;
@@ -1153,7 +1183,7 @@ out_unlock:
  * claim that solves nothing.
  */
 static int cetrafs_zg_claim_one_more_locked(struct super_block *sb, u32 count, u32 my_node_id, bool may_steal,
-                                            bool *out_claimed, s64 *out_defer);
+                                            bool may_wait, bool *out_claimed, s64 *out_defer);
 
 /*
  * may_steal: whether this caller may take a dead owner's Zone Group
@@ -1171,6 +1201,7 @@ static int cetrafs_zg_claim_one_more(struct super_block *sb,
                                      const cetrafs_superblock_t *raw_sb,
                                      u32 my_node_id,
                                      bool may_steal,
+                                     bool may_wait,
                                      bool *out_claimed,
                                      s64 *out_defer)
 {
@@ -1188,14 +1219,14 @@ static int cetrafs_zg_claim_one_more(struct super_block *sb,
      * waits for it here, then finds the result in the cache and passes
      * over it as "already ours" -- the caller rescans either way. */
     locked = cetrafs_sb_zg_claim_lock(sb, &nofs);
-    ret = cetrafs_zg_claim_one_more_locked(sb, count, my_node_id, may_steal, out_claimed, out_defer);
+    ret = cetrafs_zg_claim_one_more_locked(sb, count, my_node_id, may_steal, may_wait, out_claimed, out_defer);
     if (locked)
         cetrafs_sb_zg_claim_unlock(sb, nofs);
     return ret;
 }
 
 static int cetrafs_zg_claim_one_more_locked(struct super_block *sb, u32 count, u32 my_node_id, bool may_steal,
-                                            bool *out_claimed, s64 *out_defer)
+                                            bool may_wait, bool *out_claimed, s64 *out_defer)
 {
     u32 z, best_z = 0, stale_z = 0;
     u64 best_free = 0, stale_free = 0;
@@ -1264,7 +1295,7 @@ static int cetrafs_zg_claim_one_more_locked(struct super_block *sb, u32 count, u
         return 0;
     }
 
-    return cetrafs_zg_try_claim_one(sb, best_z, my_node_id, /*at_mount=*/false, out_claimed);
+    return cetrafs_zg_try_claim_one(sb, best_z, my_node_id, /*at_mount=*/false, may_wait, out_claimed);
 }
 
 /*
@@ -1345,9 +1376,14 @@ void cetrafs_zg_adopt_wanted(struct super_block *sb, u32 my_node_id)
 
         if (!cetrafs_sb_zg_adopt_is_wanted(sb, z))
             continue;
-        if (!cetrafs_sb_zg_owned_cached(sb, z) &&
-            cetrafs_zg_try_claim_one(sb, z, my_node_id, /*at_mount=*/false, &claimed) == 0 && claimed)
-            pr_info("ZG %u: adopted from its stale owner\n", z);
+        if (!cetrafs_sb_zg_owned_cached(sb, z)) {
+            int r = cetrafs_zg_try_claim_one(sb, z, my_node_id, /*at_mount=*/false, /*may_wait=*/false, &claimed);
+
+            if (r == -EAGAIN)
+                continue; /* a peer is replaying its owner: still wanted, next tick */
+            if (!r && claimed)
+                pr_info("ZG %u: adopted from its stale owner\n", z);
+        }
         /* Cleared only now, after the attempt: an allocator waiting on
          * it (cetrafs_sb_zg_adopt_wait()) rescans when it wakes. */
         cetrafs_sb_zg_adopt_done(sb, z);
@@ -1379,7 +1415,7 @@ int cetrafs_zg_scrub_adopt_one_stale(struct super_block *sb, bool *out_adopted)
         if (cetrafs_node_is_stale(sb, info.owner_node_id, &stale) != 0 || !stale)
             continue; /* a LIVE peer owns it -- its own scrub covers it */
 
-        if (cetrafs_zg_try_claim_one(sb, z, my_id, /*at_mount=*/false, &claimed) == 0 && claimed) {
+        if (cetrafs_zg_try_claim_one(sb, z, my_id, /*at_mount=*/false, /*may_wait=*/true, &claimed) == 0 && claimed) {
             *out_adopted = true;
             return 0;
         }
@@ -1441,7 +1477,7 @@ int cetrafs_zg_claim_unowned(struct super_block *sb,
 
         owned++;
 
-        ret = cetrafs_zg_try_claim_one(sb, z, my_node_id, at_mount, &did_claim);
+        ret = cetrafs_zg_try_claim_one(sb, z, my_node_id, at_mount, /*may_wait=*/true, &did_claim);
         if (ret)
             goto out;
         /* did_claim is always false here (already ours); replay already
@@ -1453,7 +1489,12 @@ int cetrafs_zg_claim_unowned(struct super_block *sb,
         bool did_claim = false;
         s64 defer;
 
-        ret = cetrafs_zg_claim_one_more(sb, raw_sb, my_node_id, /*may_steal=*/true, &did_claim, &defer);
+        /* A dead owner's group: the mount waits for a peer replaying
+         * that owner, the heartbeat tries again next tick. */
+        ret = cetrafs_zg_claim_one_more(sb, raw_sb, my_node_id, /*may_steal=*/true, /*may_wait=*/at_mount, &did_claim,
+                                        &defer);
+        if (ret == -EAGAIN)
+            ret = 0; /* a peer is replaying that group's dead owner: next tick */
         if (ret)
             goto out;
         if (did_claim)
@@ -2975,7 +3016,8 @@ retry_scan:
         /* A dead owner's group is the heartbeat's to take, not ours from
          * inside the caller's locks; wait for its attempt once, then look
          * again (cetrafs_zg_claim_one_more()). */
-        ret = cetrafs_zg_claim_one_more(sb, raw_sb, my_node_id, !cetrafs_sb_has_heartbeat(sb), &did_claim, &defer);
+        ret = cetrafs_zg_claim_one_more(sb, raw_sb, my_node_id, !cetrafs_sb_has_heartbeat(sb), /*may_wait=*/true,
+                                        &did_claim, &defer);
         if (ret)
             return ret;
         if (defer >= 0 && !waited_adopt) {
