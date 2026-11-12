@@ -463,6 +463,33 @@ static void cetrafs_zero_post_eof(struct inode *inode, loff_t old_size, loff_t n
     folio_put(folio);
 }
 
+/*
+ * The volume's capacity, which sb->s_maxbytes no longer carries (fs.c's
+ * fill_super()): refused or shortened exactly as generic_write_checks()
+ * does at s_maxbytes, after catching up with a peer's grow. Returns the
+ * count to write or an error.
+ */
+static ssize_t cetrafs_write_capacity(struct kiocb *iocb, struct iov_iter *from)
+{
+    struct super_block *sb = file_inode(iocb->ki_filp)->i_sb;
+    loff_t pos = iocb->ki_pos, cap;
+    size_t count = iov_iter_count(from);
+    int r;
+
+    if (pos + (loff_t) count <= cetrafs_sb_max_file_size(sb))
+        return count;
+    if (iocb->ki_flags & IOCB_NOWAIT)
+        return -EAGAIN; /* the catch-up reads the device */
+    r = cetrafs_sb_capacity_for(sb, pos + count, &cap);
+    if (r)
+        return r;
+    if (pos >= cap)
+        return -EFBIG;
+    if (pos + (loff_t) count > cap)
+        iov_iter_truncate(from, cap - pos);
+    return iov_iter_count(from);
+}
+
 static ssize_t cetrafs_file_write_iter(struct kiocb *iocb, struct iov_iter *from)
 {
     struct inode *inode = file_inode(iocb->ki_filp);
@@ -477,6 +504,8 @@ static ssize_t cetrafs_file_write_iter(struct kiocb *iocb, struct iov_iter *from
     ret = cetrafs_lock_write_gate(inode);
     if (!ret) {
         ret = generic_write_checks(iocb, from);
+        if (ret > 0)
+            ret = cetrafs_write_capacity(iocb, from);
         /* A write starting past EOF grows the size over the old EOF
          * folio's tail: zero it first (cetrafs_zero_post_eof()). The
          * size moves in write_end, after the lock is dropped -- a store
@@ -6101,6 +6130,18 @@ static long cetrafs_fallocate(struct file *file, int mode, loff_t offset, loff_t
     bool zeroed = false;    /* a boundary block was partly zeroed: the contents changed */
     int ret;
 
+    /* The capacity check vfs_fallocate() makes at s_maxbytes, against
+     * the volume's capacity instead (cetrafs_write_capacity()). */
+    if (offset + len > cetrafs_sb_max_file_size(sb)) {
+        loff_t cap;
+
+        ret = cetrafs_sb_capacity_for(sb, offset + len, &cap);
+        if (ret)
+            return ret;
+        if (offset + len > cap)
+            return -EFBIG;
+    }
+
     recs = kmalloc(2 * sizeof(*recs), GFP_NOFS);
     if (!recs)
         return -ENOMEM;
@@ -6895,8 +6936,22 @@ static int cetrafs_setattr_locked(struct mnt_idmap *idmap, struct dentry *dentry
 int cetrafs_setattr(struct mnt_idmap *idmap, struct dentry *dentry, struct iattr *attr)
 {
     struct inode *set[] = {d_inode(dentry)}; /* the file's own record is what changes */
-    int ret = cetrafs_nslock_acquire_set(set, ARRAY_SIZE(set));
+    int ret;
 
+    /* The capacity check inode_newsize_ok() makes at s_maxbytes, against
+     * the volume's capacity instead (cetrafs_write_capacity()). */
+    if ((attr->ia_valid & ATTR_SIZE) && S_ISREG(set[0]->i_mode) &&
+        attr->ia_size > cetrafs_sb_max_file_size(set[0]->i_sb)) {
+        loff_t cap;
+
+        ret = cetrafs_sb_capacity_for(set[0]->i_sb, attr->ia_size, &cap);
+        if (ret)
+            return ret;
+        if (attr->ia_size > cap)
+            return -EFBIG;
+    }
+
+    ret = cetrafs_nslock_acquire_set(set, ARRAY_SIZE(set));
     if (ret)
         return ret;
 

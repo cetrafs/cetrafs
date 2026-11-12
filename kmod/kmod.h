@@ -530,6 +530,8 @@ u32 cetrafs_sb_pending_zg_deltas(struct super_block *sb);
 bool cetrafs_sb_zg_delta_pending(struct super_block *sb, u32 zg_id);
 s64 cetrafs_sb_zg_pending_delta(struct super_block *sb, u32 zg_id);
 u64 cetrafs_sb_total_data_blocks(struct super_block *sb);
+loff_t cetrafs_sb_max_file_size(struct super_block *sb);
+int cetrafs_sb_capacity_for(struct super_block *sb, loff_t end, loff_t *cap);
 int cetrafs_fill_super(struct super_block *sb, struct fs_context *fc);
 
 // caw.c -- generic cross-transport COMPARE AND WRITE (ATS) primitive +
@@ -1080,7 +1082,7 @@ int cetrafs_zg_get_info(struct super_block *sb, u32 zg_id, struct cetrafs_zg_inf
 int cetrafs_zg_adjust_free_blocks(struct super_block *sb, u32 zg_id, s64 delta);
 int cetrafs_zg_apply_free_delta(struct super_block *sb, u32 zg_id, s64 delta);
 int cetrafs_zg_adjust_pool_blocks(struct super_block *sb, u32 bg_id, s64 delta);
-int cetrafs_compute_max_file_size(struct super_block *sb, loff_t *out_max);
+loff_t cetrafs_max_file_size_for(u64 data_blocks);
 
 // lock.c
 int cetrafs_init_inode_cache(void);

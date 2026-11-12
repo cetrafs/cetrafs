@@ -134,11 +134,11 @@ static int cetrafs_proc_info_show(struct seq_file *m, void *v)
         else
             seq_printf(m, "fsck_needed: no\n");
     }
-    /* The exact value fs.c's fill_super() stamped into sb->s_maxbytes --
-     * see cetrafs_compute_max_file_size() (zonegroup.c) for the formula.
-     * Read straight off the live super_block, not recomputed here, so
-     * this always reflects what the VFS is actually enforcing. */
-    seq_printf(m, "max_file_size_bytes: %lld\n", (long long) sb->s_maxbytes);
+    /* The largest file on the layout this node holds: the capacity,
+     * capped by the format (cetrafs_max_file_size_for(), zonegroup.c) --
+     * what write, truncate and fallocate enforce. A live grow raises it;
+     * sb->s_maxbytes is the format ceiling alone. */
+    seq_printf(m, "max_file_size_bytes: %lld\n", (long long) cetrafs_sb_max_file_size(sb));
 
     seq_printf(m, "block_size: %u\n", le32_to_cpu(raw_sb->block_size));
     seq_printf(m, "total_blocks: %llu\n", (unsigned long long) le64_to_cpu(raw_sb->total_blocks));

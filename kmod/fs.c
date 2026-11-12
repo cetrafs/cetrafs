@@ -3201,19 +3201,14 @@ int cetrafs_fill_super(struct super_block *sb, struct fs_context *fc)
 
     /* Populate VFS super_block */
     sb->s_magic = CETRAFS_MAGIC;
-    /* s_maxbytes used to be the plain VFS default
-     * (MAX_LFS_FILESIZE, ~8 EiB -- no relation to this volume's real
-     * capacity at all). It's now the worst-case guaranteed amount of ZG
-     * capacity this/any node could ever claim -- see zonegroup.c's
-     * cetrafs_compute_max_file_size() for the exact formula and why it
-     * has to be a fixed-for-the-mount's-life constant. The VFS enforces
-     * this automatically (setattr_prepare(), already called by
-     * cetrafs_setattr(), rejects ATTR_SIZE growth past s_maxbytes with
-     * -EFBIG) -- no extra check needed in file.c. A failure here isn't
-     * fatal to the mount: fall back to the old unbounded default rather
-     * than refusing to mount over what's fundamentally an informational
-     * cap, but it IS logged loudly, since silently keeping the
-     * unbounded default would quietly undo the whole point of this. */
+    /* s_maxbytes is the FORMAT ceiling (2^32 blocks), which never moves;
+     * the VFS enforces it in setattr_prepare(), generic_write_checks()
+     * and vfs_fallocate(). The volume's CAPACITY, which a live grow
+     * raises, is enforced by cetrafs_sb_capacity_for() in write_iter,
+     * setattr and fallocate instead: the VFS checks s_maxbytes before
+     * ->fallocate is called, so a capacity kept there would refuse a
+     * node that has not yet adopted a peer's grow with nothing able to
+     * catch it up first (class 43). */
     /* noatime, unconditionally: a VM-image datastore gains
      * nothing from access times, and every atime update is a dirtied
      * in-core inode whose eventual VFS writeback blind-writes the raw
@@ -3225,27 +3220,12 @@ int cetrafs_fill_super(struct super_block *sb, struct fs_context *fc)
      * docs/PERFORMANCE.md */
     sb->s_flags |= SB_NOATIME;
 
-    /* The fallback is the FORMAT ceiling, not MAX_LFS_FILESIZE: a file
-     * longer than 2^32 blocks cannot be addressed by
-     * cetrafs_extent_t.ee_block at all, so an unbounded fallback would
-     * let an error path reopen the aliasing hole the clamp exists to
-     * close. Falling back to a cap that is merely too generous for this
-     * volume's capacity is fine -- the allocator returns -ENOSPC. */
-    sb->s_maxbytes = min_t(loff_t, MAX_LFS_FILESIZE, (loff_t) (CETRAFS_MAX_FILE_BLOCKS * CETRAFS_BLOCK_SIZE));
+    sb->s_maxbytes = cetrafs_max_file_size_for(U64_MAX);
     /* link() and mkdir() refuse past this (EMLINK). Far below the u32
      * the record stores, so links added by peers at once -- each checked
      * against its own in-core count -- still cannot reach the wrap; the
      * apply saturates as well (cetrafs_ns_apply_delta()). */
     sb->s_max_links = CETRAFS_MAX_LINKS;
-    {
-        loff_t max_file_size;
-        int rc = cetrafs_compute_max_file_size(sb, &max_file_size);
-
-        if (rc)
-            pr_err("failed to compute max file size, falling back to the format ceiling: %d\n", rc);
-        else
-            sb->s_maxbytes = max_file_size;
-    }
     sb->s_op = &cetrafs_super_ops;
     sb->s_xattr = cetrafs_xattr_handlers;
     /* Every dentry (root included, since it's allocated below) must
@@ -6316,6 +6296,32 @@ u64 cetrafs_sb_total_data_blocks(struct super_block *sb)
     struct cetrafs_bg_layout *l = cetrafs_sb_layout_of(sbi);
 
     return l ? l->total_data_blocks : 0;
+}
+
+/* The largest a file may be on the layout this node holds. */
+loff_t cetrafs_sb_max_file_size(struct super_block *sb)
+{
+    return cetrafs_max_file_size_for(cetrafs_sb_total_data_blocks(sb));
+}
+
+/*
+ * The capacity a file may grow to, caught up with a peer's live grow
+ * when 'end' passes the one this node holds: a node that has not yet
+ * adopted the grow would otherwise refuse with EFBIG what every node
+ * that has accepts (class 43). Returns 0 with *cap set, or the refresh's
+ * error when this node cannot tell -- never EFBIG on a guess. Sleeps.
+ */
+int cetrafs_sb_capacity_for(struct super_block *sb, loff_t end, loff_t *cap)
+{
+    *cap = cetrafs_sb_max_file_size(sb);
+    if (end > *cap) {
+        int r = cetrafs_sb_layout_refresh(sb);
+
+        if (r < 0)
+            return r;
+        *cap = cetrafs_sb_max_file_size(sb);
+    }
+    return 0;
 }
 
 s64 cetrafs_sb_zg_pending_delta(struct super_block *sb, u32 zg_id)

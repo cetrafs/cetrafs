@@ -523,8 +523,8 @@ int cetrafs_zg_apply_free_delta(struct super_block *sb, u32 zg_id, s64 delta)
 /*
  * The largest size any *single* file can ever grow to (via a sparse
  * ftruncate/truncate, before a single byte of real data backs most of
- * it) -- min(MAX_LFS_FILESIZE, the total real data capacity of every
- * Zone Group on the volume).
+ * it) -- min(MAX_LFS_FILESIZE, the 2^32-block extent ceiling, the total
+ * data capacity of every Block Group on the volume).
  *
  * design correction: this used to be a deliberately
  * pessimistic *per-node* worst case -- assume the Node Registry is
@@ -552,54 +552,21 @@ int cetrafs_zg_apply_free_delta(struct super_block *sb, u32 zg_id, s64 delta)
  * ever become": a node that never reaches that size isn't being lied
  * to by this ceiling, it's just not needed to grow that far.
  *
- * Entirely computable from fields that are fixed at mkfs time and
- * never change at runtime (zone_group_count, each ZG's first_bg_id/
- * bg_count span, each BG's data_block_count) -- never from current
- * ownership or free-space state. That's required, not just convenient:
- * the VFS treats sb->s_maxbytes (the caller, fs.c's fill_super()) as a
- * fixed-for-the-life-of-the-mount constant, and this value must be
- * identical on every node mounting the same volume.
- *
- * O(zone_group_count + block_group_count) block reads -- fine to pay
- * once at mount time, not something any hot path calls.
+ * A function of the published layout's capacity and nothing else --
+ * never of ownership or free space -- so every node holding the same
+ * layout answers the same. It is NOT fixed for the life of the mount: a
+ * live grow raises it. It used to be stamped into sb->s_maxbytes once
+ * at mount, from fields its comment called "fixed at mkfs time and
+ * never change at runtime" -- true until live grow, and after one a file
+ * stopped at the size the volume had at mount: EFBIG at 3.5 GiB into a
+ * VM image on a volume grown to 8 GiB, measured by ctest grow-twice
+ * (2026-11-12). s_maxbytes is now the format ceiling alone
+ * (data_blocks = U64_MAX) and the capacity is checked against the
+ * current layout by cetrafs_sb_capacity_for() (fs.c).
  */
-int cetrafs_compute_max_file_size(struct super_block *sb, loff_t *out_max)
+loff_t cetrafs_max_file_size_for(u64 data_blocks)
 {
-    const cetrafs_superblock_t *raw_sb = cetrafs_sb_raw(sb);
-    u64 sum = 0, max_blocks;
-    u32 zg_count, b;
-    int ret;
-
-    if (!raw_sb)
-        return -EINVAL;
-
-    zg_count = le32_to_cpu(raw_sb->zone_group_count);
-
-    if (zg_count == 0) {
-        *out_max = 0; /* degenerate: shouldn't happen in practice (mkfs
-                       * always reserves >=1 ZG), but "no capacity" is
-                       * the only safe answer here. */
-        return 0;
-    }
-
-    /*
-     * The total capacity of the volume, which is the sum over every
-     * Block Group -- it does not depend on who owns what. This used to
-     * walk Zone Groups and sum each one's contiguous range, which
-     * reached exactly the same Block Groups only because the ranges
-     * tile them. One flat pass says the same thing without needing
-     * that to be true (docs/internal/BG-OWNERSHIP-DESIGN.md), and
-     * without a Zone Group record read per Zone Group.
-     */
-    for (b = 0; b < le32_to_cpu(raw_sb->block_group_count); b++) {
-        u64 bg_total, bg_free;
-
-        ret = cetrafs_bg_data_block_stats(sb, b, &bg_total, &bg_free);
-        if (ret)
-            return ret;
-
-        sum += bg_total;
-    }
+    u64 max_blocks;
 
     /* Clamp in block units before converting to bytes, to avoid
      * overflowing loff_t on the multiply -- real capacities are nowhere
@@ -616,11 +583,9 @@ int cetrafs_compute_max_file_size(struct super_block *sb, loff_t *out_max)
     max_blocks = (u64) MAX_LFS_FILESIZE / CETRAFS_BLOCK_SIZE;
     if (max_blocks > CETRAFS_MAX_FILE_BLOCKS)
         max_blocks = CETRAFS_MAX_FILE_BLOCKS;
-    if (sum > max_blocks)
-        sum = max_blocks;
-
-    *out_max = min_t(loff_t, (loff_t) (sum * CETRAFS_BLOCK_SIZE), MAX_LFS_FILESIZE);
-    return 0;
+    if (data_blocks > max_blocks)
+        data_blocks = max_blocks;
+    return min_t(loff_t, (loff_t) (data_blocks * CETRAFS_BLOCK_SIZE), MAX_LFS_FILESIZE);
 }
 
 /*
