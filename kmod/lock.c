@@ -288,6 +288,13 @@ struct cetrafs_inode_info {
      * before the ask would otherwise pin it again at once, and the
      * peer, finding the same node relocating, waits on. */
     unsigned long defrag_yielded_until;
+    /* Lock suspends in progress that asked the mover to stop. While
+     * nonzero the mover stops at its next step boundary and no new pass
+     * pins the file (cetrafs_lock_defrag_begin()): held by the suspend
+     * until it has decided, so a pass cannot pin again between the old
+     * one ending and the suspend re-taking lock_mutex. A count, so two
+     * suspends do not end each other's request. */
+    atomic_t defrag_stop_asks;
 
     /* Userspace-driven explicit whole-file lock (flock(2), cetrafs_flock).
      * Option A / fd-scoped: the fd that acquired the lock, NULL when this
@@ -1267,6 +1274,7 @@ static void cetrafs_inode_identity_init_ci(struct cetrafs_inode_info *ci)
     atomic_set(&ci->defrag_queued, 0);
     ci->defrag_quiet_until = jiffies;
     ci->defrag_yielded_until = jiffies;
+    atomic_set(&ci->defrag_stop_asks, 0);
     ci->explicit_lock_file = NULL;
     ci->close_owes_presence = 0;
     ci->close_owes_suspend_mark = false;
@@ -4567,9 +4575,46 @@ static int cetrafs_lock_suspend(struct inode *inode, struct file *file)
     }
     if (READ_ONCE(ci->defrag_pinned)) {
         /* The incremental mover's whole safety argument is that this
-         * lock stays ours for the pass. Refuse rather than pull it. */
-        ret = -EBUSY;
-        goto out;
+         * lock stays ours for the pass, so it is not pulled from under
+         * it -- but a migration's handoff must not fail because a
+         * background optimisation happens to be running (class 43:
+         * a transient state reported as a final answer). Ask the mover
+         * to stop at its next step boundary, wait for the pin to go,
+         * and decide again. Bounded and killable; lock_mutex is not
+         * held while waiting, as defrag_end takes it. */
+        unsigned long deadline = jiffies + 10 * HZ;
+
+        atomic_inc(&ci->defrag_stop_asks);
+        mutex_unlock(&ci->lock_mutex);
+        while (READ_ONCE(ci->defrag_pinned)) {
+            if (schedule_timeout_killable(msecs_to_jiffies(20)) || fatal_signal_pending(current)) {
+                atomic_dec(&ci->defrag_stop_asks);
+                return -EINTR;
+            }
+            if (time_after(jiffies, deadline)) {
+                atomic_dec(&ci->defrag_stop_asks);
+                pr_warn_ratelimited("lock: ino=%llu suspend: the defrag pass did not stop within 10 s\n",
+                                    (unsigned long long) inode->i_ino);
+                return -EBUSY;
+            }
+        }
+        if (mutex_lock_killable(&ci->lock_mutex)) {
+            atomic_dec(&ci->defrag_stop_asks);
+            return -EINTR;
+        }
+        /* Dropped under lock_mutex: from here the suspend decides under
+         * it, and defrag_begin checks lock_suspended under it too. */
+        atomic_dec(&ci->defrag_stop_asks);
+        if (ci->lock_suspended || atomic_read(&ci->lock_writer_count) == 0) {
+            ret = 0;
+            goto out;
+        }
+        /* No pass can have pinned since: defrag_begin refuses while the
+         * request is held, and it was held until lock_mutex was ours. */
+        if (WARN_ON_ONCE(READ_ONCE(ci->defrag_pinned))) {
+            ret = -EBUSY;
+            goto out;
+        }
     }
 
     /*
@@ -5304,6 +5349,12 @@ int cetrafs_lock_defrag_begin(struct inode *inode)
         ret = -EBUSY;
         goto out;
     }
+    /* A suspend is waiting for a pass to stop: do not start another
+     * under it (see defrag_stop_asks). */
+    if (atomic_read(&ci->defrag_stop_asks)) {
+        ret = -EBUSY;
+        goto out;
+    }
 
     if (ci->defrag_pinned) {
         ret = -EBUSY; /* another pass is already pinned on this inode */
@@ -5478,6 +5529,11 @@ void cetrafs_lock_defrag_quiet_for(struct inode *inode, unsigned int secs)
 void cetrafs_lock_defrag_yielded_for(struct inode *inode, unsigned int secs)
 {
     WRITE_ONCE(CETRAFS_I(inode)->defrag_yielded_until, jiffies + secs * HZ);
+}
+
+bool cetrafs_lock_defrag_stop_asked(struct inode *inode)
+{
+    return atomic_read(&CETRAFS_I(inode)->defrag_stop_asks) > 0;
 }
 
 bool cetrafs_lock_defrag_yielded(struct inode *inode)

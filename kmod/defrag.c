@@ -658,7 +658,10 @@ int cetrafs_defrag_inode(struct inode *inode, struct cetrafs_defrag_stats *out_s
          * caller clears the lock. The read above is fresh here: an idle
          * pin has no local writer. With one, the pin is that writer's
          * EXCLUSIVE lock and no peer asks. */
-        if (cetrafs_le32(raw.lock_mode) == CETRAFS_LOCK_YIELD && !READ_ONCE(cetrafs_defrag_ignore_yield)) {
+        /* ...or this node's own lock suspend did (a migration handoff):
+         * same stop, no I/O to see it. */
+        if ((cetrafs_le32(raw.lock_mode) == CETRAFS_LOCK_YIELD || cetrafs_lock_defrag_stop_asked(inode)) &&
+            !READ_ONCE(cetrafs_defrag_ignore_yield)) {
             atomic64_inc(&cetrafs_defrag_yields);
             ret = -EAGAIN; /* yielded: try again later */
             cetrafs_defrag_inode_unlock(inode);

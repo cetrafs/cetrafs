@@ -1255,6 +1255,7 @@ void cetrafs_lock_defrag_quiet_for(struct inode *inode, unsigned int secs);
 bool cetrafs_lock_defrag_quiet(struct inode *inode);
 void cetrafs_lock_defrag_yielded_for(struct inode *inode, unsigned int secs);
 bool cetrafs_lock_defrag_yielded(struct inode *inode);
+bool cetrafs_lock_defrag_stop_asked(struct inode *inode);
 void cetrafs_inode_identity_init(struct inode *inode);
 extern struct kmem_cache *cetrafs_inode_cache;
 
