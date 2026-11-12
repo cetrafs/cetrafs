@@ -298,11 +298,18 @@ static int cetrafs_statfs(struct dentry *dentry, struct kstatfs *stat)
         struct cetrafs_zg_info zi;
         s64 zfree;
 
-        ret = cetrafs_zg_get_info(sb, zg_id, &zi);
-        if (ret)
-            return ret;
+        /* A delta on its way to the record is counted from the flush
+         * in flight, not lost from both (cetrafs_sb_info.zg_flight_gen). */
+        for (;;) {
+            u32 gen = cetrafs_sb_zg_flight_gen(sb, zg_id);
 
-        zfree = (s64) zi.free_data_blocks + cetrafs_sb_zg_pending_delta(sb, zg_id);
+            ret = cetrafs_zg_get_info(sb, zg_id, &zi);
+            if (ret)
+                return ret;
+            if (cetrafs_sb_zg_free_settle(sb, zg_id, gen, (s64) zi.free_data_blocks, &zfree))
+                break;
+            cond_resched();
+        }
         free_blocks += zfree > 0 ? (u64) zfree : 0;
         /* Capacity of unowned Block Groups sharded to this record: a
          * handed-back BG belongs to no ZG, so without this bucket df

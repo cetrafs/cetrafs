@@ -847,6 +847,26 @@ struct cetrafs_sb_info {
     atomic64_t zg_free_delta[CETRAFS_MAX_ZONE_GROUPS];
 
     /*
+     * A delta on its way to the aggregate: the BG side's in-flight
+     * count (cetrafs_bg_chunk.bg_flight_gen), for the same window --
+     * the flush took the delta out of zg_free_delta before its CAS, and
+     * statfs, which reads the record uncached, counted the blocks free
+     * for one device round trip. Odd zg_flight_gen while a flush is out;
+     * zg_flight_free is the count its CAS writes, known once the mutator
+     * has seen the image (before any write is sent: until then the
+     * record a reader got is the old one, and it adds zg_flight_delta).
+     * zg_flush_busy serialises EVERY local writer of the aggregate, the
+     * direct applies too (a claim's credit, a release's debit, a
+     * reconcile), so nothing of ours moves the record under a flight.
+     */
+    spinlock_t zg_flight_lock;
+    u32 zg_flight_gen[CETRAFS_MAX_ZONE_GROUPS];
+    s64 zg_flight_delta[CETRAFS_MAX_ZONE_GROUPS];
+    s64 zg_flight_free[CETRAFS_MAX_ZONE_GROUPS];
+    bool zg_flight_known[CETRAFS_MAX_ZONE_GROUPS];
+    DECLARE_BITMAP(zg_flush_busy, CETRAFS_MAX_ZONE_GROUPS);
+
+    /*
      * Every LIVE speculative allocation run on this mount, so the
      * background scrub can see them.
      *
@@ -2615,6 +2635,7 @@ int cetrafs_fill_super(struct super_block *sb, struct fs_context *fc)
          * dead peer's Zone Groups, locks or journal ever reclaimed, and
          * nothing said why (audit L30). Refused with the rest below. */
         spin_lock_init(&sbi->resv_list_lock);
+        spin_lock_init(&sbi->zg_flight_lock);
         spin_lock_init(&sbi->owned_lock);
         mutex_init(&sbi->layout_mutex);
         spin_lock_init(&sbi->nsrel_lock);
@@ -5988,8 +6009,6 @@ void cetrafs_sb_accrue_bg_free(struct super_block *sb, u32 bg_id, s64 delta)
     }
 }
 
-/* This node's accrued-but-unapplied delta for one BG -- what the on-disk
- * count is missing from the owner's own point of view. */
 unsigned long cetrafs_sb_pf_drain_last(struct super_block *sb)
 {
     struct cetrafs_sb_info *sbi = sb->s_fs_info;
@@ -6027,16 +6046,6 @@ void cetrafs_sb_set_bg_sweep_last(struct super_block *sb, unsigned long when)
         WRITE_ONCE(sbi->bg_sweep_last, when ? when : 1);
 }
 
-s64 cetrafs_sb_bg_pending_delta(struct super_block *sb, u32 bg_id)
-{
-    struct cetrafs_sb_info *sbi = sb->s_fs_info;
-
-    struct cetrafs_bg_chunk *c;
-    u32 i;
-
-    c = cetrafs_bgc(sbi, bg_id, &i);
-    return c ? atomic64_read(&c->bg_free_delta[i]) : 0;
-}
 
 /* TEST ONLY: readers ignore a flush in flight and add only the delta
  * still accrued -- the old view, the negative control for
@@ -6116,7 +6125,9 @@ s64 cetrafs_sb_bg_flight_begin(struct super_block *sb, u32 bg_id, s64 desc)
     if (!c)
         return 0;
     spin_lock(&c->flight_lock);
-    /* Odd first, then take the delta: see cetrafs_sb_bg_free_settle()'s
+    /* class 52: taken into a flight -- readers count bg_flight_free until
+     * the swap is back.
+     * Odd first, then take the delta: see cetrafs_sb_bg_free_settle()'s
      * lock-free path. A reader that sees odd takes this lock, so it never
      * sees the flight half set up; nothing taken, the flight is undone
      * before the lock drops. */
@@ -6140,8 +6151,54 @@ static bool cetrafs_bg_flush_unserialised;
 cetrafs_test_param(bg_flush_unserialised, cetrafs_bg_flush_unserialised, bool, 0644);
 MODULE_PARM_DESC(bg_flush_unserialised, "TEST ONLY: two flushes of one BG's free count may run at once");
 
-/* Wait for, and take, the right to flush BG #bg_id. Interruptible by a
- * fatal signal only (-EINTR); the holder is one CAS away from letting go. */
+/*
+ * A recount's flight: as cetrafs_sb_bg_flight_begin(), but readers take
+ * 'value' -- the count the recount writes -- and the accrued delta it
+ * already holds leaves memory now. Returns that delta (dropped, or put
+ * back by cetrafs_sb_bg_flight_settle_end() if the write fails). The
+ * caller holds the flush right; the flight is always begun.
+ */
+s64 cetrafs_sb_bg_flight_begin_value(struct super_block *sb, u32 bg_id, s64 value)
+{
+    struct cetrafs_bg_chunk *c;
+    s64 taken;
+    u32 i;
+
+    c = cetrafs_bgc(sb->s_fs_info, bg_id, &i);
+    if (!c)
+        return 0;
+    spin_lock(&c->flight_lock);
+    /* class 52: taken into a flight whose value already holds it. */
+    WRITE_ONCE(c->bg_flight_gen[i], c->bg_flight_gen[i] + 1); /* before the xchg: see the settle */
+    taken = atomic64_xchg(&c->bg_free_delta[i], 0);
+    c->bg_flight_free[i] = value;
+    spin_unlock(&c->flight_lock);
+    return taken;
+}
+
+/* End a recount's flight, putting 'requeue' back; the flush right stays
+ * with the caller. */
+void cetrafs_sb_bg_flight_settle_end(struct super_block *sb, u32 bg_id, s64 requeue)
+{
+    struct cetrafs_bg_chunk *c;
+    u32 i;
+
+    c = cetrafs_bgc(sb->s_fs_info, bg_id, &i);
+    if (!c)
+        return;
+    spin_lock(&c->flight_lock);
+    if (requeue) {
+        atomic64_add(requeue, &c->bg_free_delta[i]);
+        set_bit(i, c->bg_free_dirty);
+    }
+    smp_store_release(&c->bg_flight_gen[i], c->bg_flight_gen[i] + 1);
+    spin_unlock(&c->flight_lock);
+}
+
+/* Wait for, and take, the right to flush BG #bg_id. Not interruptible:
+ * the holder is one CAS away from letting go, and that CAS is bounded by
+ * its own timeout -- while an -EINTR here would be a new way for a
+ * recount or a flush to fail. Always 0. */
 int cetrafs_sb_bg_flush_lock(struct super_block *sb, u32 bg_id)
 {
     struct cetrafs_bg_chunk *c;
@@ -6150,7 +6207,8 @@ int cetrafs_sb_bg_flush_lock(struct super_block *sb, u32 bg_id)
     c = cetrafs_bgc(sb->s_fs_info, bg_id, &i);
     if (!c || READ_ONCE(cetrafs_bg_flush_unserialised))
         return 0;
-    return wait_on_bit_lock(c->bg_flush_busy, i, TASK_KILLABLE) ? -EINTR : 0;
+    wait_on_bit_lock(c->bg_flush_busy, i, TASK_UNINTERRUPTIBLE);
+    return 0;
 }
 
 /* Give the flush right back without having begun (the descriptor could
@@ -6244,6 +6302,11 @@ void cetrafs_sb_set_bg_epoch(struct super_block *sb, u32 bg_id, u64 seq)
     if (prev == seq)
         return; /* re-attach with nobody having reconciled: our deltas stand */
 
+    /* class 52: a recount of ours took the delta in its own flight
+     * (__cetrafs_reconcile_locked()), so nothing is left here; on a
+     * re-attach (cetrafs_bg_seed_count_epochs()) the epoch moved only by
+     * another owner's recount, whose count -- already read fresh into
+     * the cache -- holds every durable effect of what is dropped. */
     stale = atomic64_xchg(&c->bg_free_delta[i], 0);
     clear_bit(i, c->bg_free_dirty);
     if (stale)
@@ -6535,6 +6598,10 @@ s64 cetrafs_sb_take_zg_free_delta(struct super_block *sb, u32 zg_id)
 
     if (!sbi || zg_id >= sbi->zg_count)
         return 0;
+    /* class 52: only at a claim or a mount, before the group can be
+     * allocated from; what is taken is a leftover of an earlier
+     * ownership (the flush drops deltas for groups not ours), noise
+     * beside the record the recount corrects. */
     return atomic64_xchg(&sbi->zg_free_delta[zg_id], 0);
 }
 
@@ -6596,9 +6663,6 @@ u32 cetrafs_sb_pending_zg_deltas(struct super_block *sb)
     return n;
 }
 
-/* This node's accrued-but-unapplied ZG free delta, the aggregate twin of
- * cetrafs_sb_bg_pending_delta(). statfs folds it in so the owner sees its
- * own allocations immediately, exactly as the per-BG path already did. */
 u64 cetrafs_sb_total_data_blocks(struct super_block *sb)
 {
     struct cetrafs_sb_info *sbi = sb ? sb->s_fs_info : NULL;
@@ -6634,13 +6698,130 @@ int cetrafs_sb_capacity_for(struct super_block *sb, loff_t end, loff_t *cap)
     return 0;
 }
 
-s64 cetrafs_sb_zg_pending_delta(struct super_block *sb, u32 zg_id)
+/* TEST ONLY: a ZG aggregate read ignores a flush in flight -- the old
+ * view, the negative control for tests/kernel/bg_flush_inflight_count.sh. */
+static bool cetrafs_zg_flight_ignored;
+cetrafs_test_param(zg_flight_ignored, cetrafs_zg_flight_ignored, bool, 0644);
+MODULE_PARM_DESC(zg_flight_ignored, "TEST ONLY: a ZG aggregate read ignores a flush in flight (the old view)");
+
+/* TEST ONLY: the next aggregate flush pauses this long between taking
+ * the delta and its CAS. */
+static unsigned int cetrafs_zg_flush_stall_ms;
+cetrafs_test_param(zg_flush_stall_ms, cetrafs_zg_flush_stall_ms, uint, 0644);
+MODULE_PARM_DESC(zg_flush_stall_ms, "TEST ONLY: one ZG aggregate flush pauses between taking its delta and its CAS");
+
+/* As cetrafs_sb_bg_flight_gen(), for Zone Group zg_id's aggregate. */
+u32 cetrafs_sb_zg_flight_gen(struct super_block *sb, u32 zg_id)
 {
     struct cetrafs_sb_info *sbi = sb ? sb->s_fs_info : NULL;
 
     if (!sbi || zg_id >= sbi->zg_count)
         return 0;
-    return atomic64_read(&sbi->zg_free_delta[zg_id]);
+    return smp_load_acquire(&sbi->zg_flight_gen[zg_id]);
+}
+
+/*
+ * This node's view of Zone Group zg_id's free aggregate, given the count
+ * 'rec' its record said after cetrafs_sb_zg_flight_gen() returned 'gen'.
+ * As cetrafs_sb_bg_free_settle(); see cetrafs_sb_info.zg_flight_gen.
+ */
+bool cetrafs_sb_zg_free_settle(struct super_block *sb, u32 zg_id, u32 gen, s64 rec, s64 *out)
+{
+    struct cetrafs_sb_info *sbi = sb ? sb->s_fs_info : NULL;
+    bool ok = true;
+
+    if (!sbi || zg_id >= sbi->zg_count) {
+        *out = rec;
+        return true;
+    }
+    if (!(gen & 1)) {
+        s64 v = rec + atomic64_read(&sbi->zg_free_delta[zg_id]);
+
+        smp_rmb();
+        if (READ_ONCE(sbi->zg_flight_gen[zg_id]) != gen)
+            return false;
+        *out = v;
+        return true;
+    }
+    spin_lock(&sbi->zg_flight_lock);
+    if (sbi->zg_flight_gen[zg_id] != gen)
+        ok = false;
+    else if (READ_ONCE(cetrafs_zg_flight_ignored))
+        *out = rec + atomic64_read(&sbi->zg_free_delta[zg_id]);
+    else if (sbi->zg_flight_known[zg_id])
+        *out = sbi->zg_flight_free[zg_id] + atomic64_read(&sbi->zg_free_delta[zg_id]);
+    else
+        *out = rec + sbi->zg_flight_delta[zg_id] + atomic64_read(&sbi->zg_free_delta[zg_id]);
+    spin_unlock(&sbi->zg_flight_lock);
+    return ok;
+}
+
+/* The right to write Zone Group zg_id's aggregate (zg_flush_busy). Not
+ * interruptible, as cetrafs_sb_bg_flush_lock(): a claim's credit or a
+ * reconcile's correction must not gain a way to fail. Always 0. */
+int cetrafs_sb_zg_write_lock(struct super_block *sb, u32 zg_id)
+{
+    struct cetrafs_sb_info *sbi = sb ? sb->s_fs_info : NULL;
+
+    if (!sbi || zg_id >= sbi->zg_count)
+        return 0;
+    wait_on_bit_lock(sbi->zg_flush_busy, zg_id, TASK_UNINTERRUPTIBLE);
+    return 0;
+}
+
+void cetrafs_sb_zg_write_unlock(struct super_block *sb, u32 zg_id)
+{
+    struct cetrafs_sb_info *sbi = sb ? sb->s_fs_info : NULL;
+
+    if (!sbi || zg_id >= sbi->zg_count)
+        return;
+    clear_bit_unlock(zg_id, sbi->zg_flush_busy);
+    smp_mb__after_atomic();
+    wake_up_bit(sbi->zg_flush_busy, zg_id);
+}
+
+/* The flush's mutator has the image its swap starts from: the count the
+ * swap writes is now known (called before every attempt's write). */
+void cetrafs_sb_zg_flight_image(struct super_block *sb, u32 zg_id, s64 cur)
+{
+    struct cetrafs_sb_info *sbi = sb ? sb->s_fs_info : NULL;
+
+    if (!sbi || zg_id >= sbi->zg_count)
+        return;
+    spin_lock(&sbi->zg_flight_lock);
+    sbi->zg_flight_free[zg_id] = cur + sbi->zg_flight_delta[zg_id];
+    sbi->zg_flight_known[zg_id] = true;
+    spin_unlock(&sbi->zg_flight_lock);
+}
+
+/* Take the accrued delta into a flight; 0 when there was none (no
+ * flight to end). The caller holds the write right. */
+static s64 cetrafs_sb_zg_flight_begin(struct cetrafs_sb_info *sbi, u32 zg_id)
+{
+    s64 delta;
+
+    spin_lock(&sbi->zg_flight_lock);
+    /* class 52: taken into a flight -- statfs counts it until the swap is back. */
+    WRITE_ONCE(sbi->zg_flight_gen[zg_id], sbi->zg_flight_gen[zg_id] + 1); /* before the xchg: see the settle */
+    delta = atomic64_xchg(&sbi->zg_free_delta[zg_id], 0);
+    if (delta) {
+        sbi->zg_flight_delta[zg_id] = delta;
+        sbi->zg_flight_known[zg_id] = false;
+    } else {
+        smp_store_release(&sbi->zg_flight_gen[zg_id], sbi->zg_flight_gen[zg_id] + 1);
+    }
+    spin_unlock(&sbi->zg_flight_lock);
+    return delta;
+}
+
+/* End the flight, putting back 'requeue' in the same step. */
+static void cetrafs_sb_zg_flight_end(struct cetrafs_sb_info *sbi, u32 zg_id, s64 requeue)
+{
+    spin_lock(&sbi->zg_flight_lock);
+    if (requeue)
+        atomic64_add(requeue, &sbi->zg_free_delta[zg_id]);
+    smp_store_release(&sbi->zg_flight_gen[zg_id], sbi->zg_flight_gen[zg_id] + 1);
+    spin_unlock(&sbi->zg_flight_lock);
 }
 
 bool cetrafs_sb_zg_delta_pending(struct super_block *sb, u32 zg_id)
@@ -6688,12 +6869,34 @@ int cetrafs_flush_dirty_free_counts(struct super_block *sb)
     for (zg_id = 0; zg_id < sbi->zg_count; zg_id++) {
         /* Take the whole accrued delta in one go, so concurrent
          * allocations keep accruing against a fresh zero rather than
-         * having their change applied twice or dropped. */
-        s64 delta = atomic64_xchg(&sbi->zg_free_delta[zg_id], 0);
+         * having their change applied twice or dropped -- as a flight,
+         * so statfs counts it until the swap is back
+         * (cetrafs_sb_info.zg_flight_gen). */
+        s64 delta;
         int rc;
 
-        if (!delta)
+        if (!atomic64_read(&sbi->zg_free_delta[zg_id]))
             continue;
+        rc = cetrafs_sb_zg_write_lock(sb, zg_id);
+        if (rc) {
+            if (!ret)
+                ret = rc;
+            continue; /* still accrued: the next flush takes it */
+        }
+        delta = cetrafs_sb_zg_flight_begin(sbi, zg_id);
+        if (!delta) {
+            cetrafs_sb_zg_write_unlock(sb, zg_id);
+            continue;
+        }
+        {
+            unsigned int pause = xchg(&cetrafs_zg_flush_stall_ms, 0);
+
+            if (pause) {
+                pr_info("ZG %u: aggregate flush of %lld in flight, pausing %u ms (test)\n", zg_id,
+                        (long long) delta, pause);
+                msleep(pause); /* test-only; see the parameter */
+            }
+        }
 
         /*
          * Never write a free-count delta into a Zone Group this node no
@@ -6721,19 +6924,22 @@ int cetrafs_flush_dirty_free_counts(struct super_block *sb)
         if (!cetrafs_sb_zg_owned_cached(sb, zg_id)) {
             pr_warn("ZG %u: dropping a free-count delta of %lld for a zone group this node no longer owns\n", zg_id,
                     (long long) delta);
+            cetrafs_sb_zg_flight_end(sbi, zg_id, 0);
+            cetrafs_sb_zg_write_unlock(sb, zg_id);
             continue;
         }
 
-        rc = cetrafs_zg_apply_free_delta(sb, zg_id, delta);
+        rc = cetrafs_zg_flush_free_delta(sb, zg_id, delta);
         if (rc) {
             /* Put it back rather than lose it: the aggregate is
              * cross-checked against the member BGs by fsck, so a
              * silently dropped delta shows up later as corruption. */
-            atomic64_add(delta, &sbi->zg_free_delta[zg_id]);
             pr_err("ZG %u: could not apply free-count delta %lld: %d\n", zg_id, (long long) delta, rc);
             if (!ret)
                 ret = rc;
         }
+        cetrafs_sb_zg_flight_end(sbi, zg_id, rc ? delta : 0);
+        cetrafs_sb_zg_write_unlock(sb, zg_id);
     }
 
     return ret;

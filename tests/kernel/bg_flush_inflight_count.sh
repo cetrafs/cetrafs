@@ -25,12 +25,33 @@
 #  2. control (bg_flight_ignored=1, the old view): the full group reads
 #     free in flight and the allocation recounts it.
 # Both: the data reads back, fsck clean.
+#
+# The Zone Group aggregate had the same window: its flush took the delta
+# before the CAS, and statfs -- the record read uncached, plus the delta
+# -- reported the blocks free for one round trip. Staged: a writer holds
+# 2000 freshly written blocks' delta open; a sync's aggregate flush is
+# held in flight (zg_flush_stall_ms) while statfs is read.
+#
+#  3. statfs during the flight reports what it reported before it;
+#  4. control (zg_flight_ignored=1): it reports the 2000 blocks free.
+#
+# A recount had the opposite window: it wrote the bitmap's truth into the
+# descriptor -- the cache took it when the swap landed -- and only then
+# dropped the accrued delta the truth already held, so for that span the
+# delta counted twice and the group read fuller than it was. Staged: a
+# writer holds 1000 blocks' delta open; a forced ENOSPC
+# (alloc_force_enospc_once) makes the next allocation recount Block
+# Group 0, held after its write (reconcile_written_stall_ms).
+#
+#  5. the free count read during the hold is the one read before;
+#  6. control (reconcile_flight_off=1, the old order): 1000 blocks short.
 # ct-timeout: 300
 set -euo pipefail
 . "$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)/lib/harness.sh"
 require_root
 require_module
-for k in bg_flush_stall_ms bg_flight_ignored; do
+for k in bg_flush_stall_ms bg_flight_ignored zg_flush_stall_ms zg_flight_ignored reconcile_written_stall_ms \
+    reconcile_flight_off alloc_force_enospc_once; do
     [ -w "/sys/module/cetrafs/parameters/$k" ] || { skip "$k is missing"; ct_exit; }
 done
 BG_POKE="$(ct_helper bg_poke)"
@@ -43,6 +64,12 @@ READY="$(ct_tmp bgflight-ready)" # off the mount: its close would flush the coun
 ct_track mnt "$MNT"
 ct_param_set bg_flush_stall_ms 0
 ct_param_set bg_flight_ignored 0
+ct_param_set zg_flush_stall_ms 0
+ct_param_set zg_flight_ignored 0
+ct_param_set reconcile_written_stall_ms 0
+ct_param_set reconcile_flight_off 0
+ct_param_set alloc_force_enospc_once 0
+ct_param_set alloc_run_blocks 0 # every block allocated is one the test wrote
 ct_param_set hb_interval_secs 30 # no tick flushes inside the stall
 ct_param_set scrub 0
 ct_param_set auto_defrag 0
@@ -116,4 +143,111 @@ run fix
 [ "$WROTE" = 0 ] && pass "1: the write succeeded" || fail "1: the write failed ($WROTE)"
 [ "$RECOUNTS" = 0 ] && pass "1: the full group never read free -- no recount" ||
     fail "1: the full group read free in flight ($RECOUNTS recount(s))"
+
+# <tag>: sets BEFORE and DURING (statfs free blocks), and GAP (DURING - BEFORE)
+run_zg() {
+    ct_mkfs "$DEV" -z 2 -b 512 -J 2 -N 1024 -f >/dev/null
+    ct_mount "$DEV" "$MNT"
+    require_cetrafs_mount "$MNT"
+    rm -f "$READY"
+    python3 - "$MNT/h" "$READY" <<'PY' &
+import os, sys, time
+fd = os.open(sys.argv[1], os.O_RDWR | os.O_CREAT, 0o644)
+for b in range(2000):
+    os.pwrite(fd, b"H" * 4096, b * 4096)
+open(sys.argv[2], "w").close()
+time.sleep(30) # open: the aggregate's delta stays accrued
+PY
+    local W=$!
+    for _ in $(seq 1 300); do [ -e "$READY" ] && break; sleep 0.1; done
+    [ -e "$READY" ] || { fail "$1: setup: the writer never finished"; kill "$W"; ct_exit; }
+    BEFORE="$(stat -f -c %f "$MNT")"
+    MARK="$(dmesg_mark)"
+    ct_param_set zg_flush_stall_ms 3000
+    sync -f "$MNT" &
+    local S=$!
+    for _ in $(seq 1 50); do dmesg_since "$MARK" | grep -q "ZG 0: aggregate flush of .* in flight" && break; sleep 0.1; done
+    dmesg_since "$MARK" | grep -q "ZG 0: aggregate flush of .* in flight" ||
+        { fail "$1: setup: no aggregate flush was held in flight: $(dmesg_since "$MARK" | tail -5 | tr '\n' '|')"; kill "$W" "$S"; ct_exit; }
+    DURING="$(stat -f -c %f "$MNT")"
+    wait "$S" || true
+    kill "$W" 2>/dev/null || true
+    wait "$W" 2>/dev/null || true
+    GAP=$((DURING - BEFORE))
+    ct_umount "$MNT"
+    out="$(ct_fsck "$DEV" 2>&1)" && pass "$1: fsck clean" || fail "$1: fsck: $(grep -m3 ERR <<<"$out" | tr '\n' ' ')"
+    log "$1: statfs free $BEFORE before the flush, $DURING during it"
+}
+
+# ------------------------------------------------------------------ 4
+log "4: control -- statfs in the old view during an aggregate flush"
+ct_param_set zg_flight_ignored 1
+run_zg zg-control
+ct_param_set zg_flight_ignored 0
+[ "$GAP" -ge 2000 ] && pass "control: statfs reported the in-flight blocks free ($GAP more)" ||
+    fail "control: statfs moved by $GAP -- the suite cannot tell the two apart"
+
+# ------------------------------------------------------------------ 3
+log "3: statfs during an aggregate flush"
+run_zg zg-fix
+[ "$GAP" = 0 ] && pass "3: statfs reported the same free space during the flush" ||
+    fail "3: statfs moved by $GAP blocks during the flush"
+
+# <tag>: sets BEFORE and DURING (procfs free blocks), and GAP (DURING - BEFORE)
+run_recount() {
+    ct_mkfs "$DEV" -z 2 -b 512 -J 2 -N 1024 -f >/dev/null
+    ct_mount "$DEV" "$MNT"
+    require_cetrafs_mount "$MNT"
+    touch "$MNT/g" # its dirent before the forced ENOSPC, not after
+    sync -f "$MNT"
+    rm -f "$READY"
+    python3 - "$MNT/h" "$READY" <<'PY' &
+import os, sys, time
+fd = os.open(sys.argv[1], os.O_RDWR | os.O_CREAT, 0o644)
+for b in range(1000):
+    os.pwrite(fd, b"H" * 4096, b * 4096)
+open(sys.argv[2], "w").close()
+time.sleep(30) # open: the delta stays accrued
+PY
+    local W=$!
+    for _ in $(seq 1 300); do [ -e "$READY" ] && break; sleep 0.1; done
+    [ -e "$READY" ] || { fail "$1: setup: the writer never finished"; kill "$W"; ct_exit; }
+    BEFORE="$(info free_data_blocks)"
+    MARK="$(dmesg_mark)"
+    ct_param_set reconcile_written_stall_ms 3000
+    ct_param_set alloc_force_enospc_once 1
+    python3 -c '
+import os, sys
+fd = os.open(sys.argv[1], os.O_WRONLY)
+os.pwrite(fd, b"G" * 4096, 0)
+os.fsync(fd)
+' "$MNT/g" &
+    local G=$!
+    for _ in $(seq 1 50); do dmesg_since "$MARK" | grep -q "reconcile: BG 0 written, pausing" && break; sleep 0.1; done
+    dmesg_since "$MARK" | grep -q "reconcile: BG 0 written, pausing" ||
+        { fail "$1: setup: no recount of Block Group 0 was held: $(dmesg_since "$MARK" | tail -5 | tr '\n' '|')"; kill "$W" "$G"; ct_exit; }
+    DURING="$(info free_data_blocks)"
+    wait "$G" || fail "$1: the write that recounted failed"
+    kill "$W" 2>/dev/null || true
+    wait "$W" 2>/dev/null || true
+    ct_param_set alloc_force_enospc_once 0
+    GAP=$((DURING - BEFORE))
+    ct_umount "$MNT"
+    out="$(ct_fsck "$DEV" 2>&1)" && pass "$1: fsck clean" || fail "$1: fsck: $(grep -m3 ERR <<<"$out" | tr '\n' ' ')"
+    log "$1: free $BEFORE before the recount, $DURING while its write had landed"
+}
+
+# ------------------------------------------------------------------ 6
+log "6: control -- a recount in the old order"
+ct_param_set reconcile_flight_off 1
+run_recount rc-control
+ct_param_set reconcile_flight_off 0
+[ "$GAP" -le -1000 ] && pass "control: the recounted group read $((-GAP)) blocks fuller than it was" ||
+    fail "control: the count moved by $GAP -- the suite cannot tell the two apart"
+
+# ------------------------------------------------------------------ 5
+log "5: a recount's write as a flight"
+run_recount rc-fix
+[ "$GAP" = 0 ] && pass "5: the free count did not move while the recount landed" ||
+    fail "5: the free count moved by $GAP while the recount landed"
 ct_exit

@@ -478,13 +478,14 @@ bool cetrafs_sb_bmap_alloc_any_dirty(struct super_block *sb);
 int cetrafs_alloc_flush_bitmaps_if_dirty(struct super_block *sb);
 void cetrafs_sb_accrue_bg_free(struct super_block *sb, u32 bg_id, s64 delta);
 u64 cetrafs_sb_bg_alloc_seq(struct super_block *sb, u32 bg_id);
-s64 cetrafs_sb_bg_pending_delta(struct super_block *sb, u32 bg_id);
 u32 cetrafs_sb_bg_flight_gen(struct super_block *sb, u32 bg_id);
 bool cetrafs_sb_bg_free_settle(struct super_block *sb, u32 bg_id, u32 gen, s64 desc, s64 *out);
 int cetrafs_sb_bg_flush_lock(struct super_block *sb, u32 bg_id);
 void cetrafs_sb_bg_flush_unlock(struct super_block *sb, u32 bg_id);
 s64 cetrafs_sb_bg_flight_begin(struct super_block *sb, u32 bg_id, s64 desc);
 void cetrafs_sb_bg_flight_end(struct super_block *sb, u32 bg_id, s64 requeue);
+s64 cetrafs_sb_bg_flight_begin_value(struct super_block *sb, u32 bg_id, s64 value);
+void cetrafs_sb_bg_flight_settle_end(struct super_block *sb, u32 bg_id, s64 requeue);
 u64 cetrafs_sb_bg_epoch(struct super_block *sb, u32 bg_id);
 void cetrafs_sb_set_bg_epoch(struct super_block *sb, u32 bg_id, u64 seq);
 void cetrafs_sb_accrue_zg_free(struct super_block *sb, u32 zg_id, s64 delta);
@@ -536,7 +537,11 @@ int cetrafs_flush_dirty_free_counts(struct super_block *sb);
  * never outlive ownership of its ZG -- see fs.c. */
 u32 cetrafs_sb_pending_zg_deltas(struct super_block *sb);
 bool cetrafs_sb_zg_delta_pending(struct super_block *sb, u32 zg_id);
-s64 cetrafs_sb_zg_pending_delta(struct super_block *sb, u32 zg_id);
+u32 cetrafs_sb_zg_flight_gen(struct super_block *sb, u32 zg_id);
+bool cetrafs_sb_zg_free_settle(struct super_block *sb, u32 zg_id, u32 gen, s64 rec, s64 *out);
+int cetrafs_sb_zg_write_lock(struct super_block *sb, u32 zg_id);
+void cetrafs_sb_zg_write_unlock(struct super_block *sb, u32 zg_id);
+void cetrafs_sb_zg_flight_image(struct super_block *sb, u32 zg_id, s64 cur);
 u64 cetrafs_sb_total_data_blocks(struct super_block *sb);
 loff_t cetrafs_sb_max_file_size(struct super_block *sb);
 int cetrafs_sb_capacity_for(struct super_block *sb, loff_t end, loff_t *cap);
@@ -1102,6 +1107,7 @@ struct cetrafs_zg_info {
 int cetrafs_zg_get_info(struct super_block *sb, u32 zg_id, struct cetrafs_zg_info *out);
 int cetrafs_zg_adjust_free_blocks(struct super_block *sb, u32 zg_id, s64 delta);
 int cetrafs_zg_apply_free_delta(struct super_block *sb, u32 zg_id, s64 delta);
+int cetrafs_zg_flush_free_delta(struct super_block *sb, u32 zg_id, s64 delta);
 int cetrafs_zg_pool_grow_credit(struct super_block *sb, u32 zg_id, u64 published_gen, u64 gen, u64 id, u64 credit,
                                 u64 *took);
 int cetrafs_zg_pool_grow_takeback(struct super_block *sb, u32 zg_id, u64 gen, u64 id, u64 *took);

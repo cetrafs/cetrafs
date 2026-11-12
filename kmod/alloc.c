@@ -1856,14 +1856,20 @@ int cetrafs_bg_apply_free_delta(struct super_block *sb, u32 bg_id)
     /*
      * The seed is a SNAPSHOT, taken under the buffer lock. Handing the
      * CAS bh->b_data itself let it memcpy the live cached block while
-     * another thread of this node -- a close, an fsync, a drain, all of
-     * which flush this descriptor with no node-local serialisation --
-     * patched it after its own landed CAS (cetrafs_cache_region_after_cas(),
-     * under lock_buffer). A half-old, half-new seed fails the mutator's
-     * checksum guard, the CAW is never sent, and the refusal is counted
-     * as damage: a spurious "corruptions:" and, under corruption=stop, a
-     * stopped node, for a race inside one node (audit R15). A stale but
-     * WHOLE seed is fine: it miscompares and the retry reads fresh.
+     * another thread of this node patched it after its own landed CAS
+     * (cetrafs_cache_region_after_cas(), under lock_buffer). A half-old,
+     * half-new seed fails the mutator's checksum guard, the CAW is never
+     * sent, and the refusal is counted as damage: a spurious
+     * "corruptions:" and, under corruption=stop, a stopped node, for a
+     * race inside one node (audit R15). A stale but WHOLE seed is fine:
+     * it miscompares and the retry reads fresh.
+     *
+     * Two flushes of this descriptor (a close, an fsync, a drain) no
+     * longer race here -- the flush right above serialises them -- but a
+     * recount's absolute CAS (cetrafs_reconcile_locked()) still patches
+     * the same buffer without it, so the locked copy stays. The torn-seed
+     * suite reaches the tear by lifting the serialisation
+     * (bg_flush_unserialised) along with the lock (bg_seed_unlocked).
      */
     {
         unsigned int region = cetrafs_cas_region_size(sb);
@@ -3307,6 +3313,16 @@ MODULE_PARM_DESC(reconcile_pause_ms, "TEST ONLY: one-shot pause between a free-c
 
 static int cetrafs_reconcile_locked(struct super_block *sb, u32 bg_id, s64 *out_delta);
 
+/* TEST ONLY: a recount pauses once its write has landed, before the
+ * accrued delta it replaces is gone (tests/kernel/bg_flush_inflight_count.sh);
+ * and the recount runs without its flight -- the old order, the control. */
+static unsigned int cetrafs_reconcile_written_stall_ms;
+cetrafs_test_param(reconcile_written_stall_ms, cetrafs_reconcile_written_stall_ms, uint, 0644);
+MODULE_PARM_DESC(reconcile_written_stall_ms, "TEST ONLY: one recount pauses after its write, before its delta drop");
+static bool cetrafs_reconcile_flight_off;
+cetrafs_test_param(reconcile_flight_off, cetrafs_reconcile_flight_off, bool, 0644);
+MODULE_PARM_DESC(reconcile_flight_off, "TEST ONLY: a recount writes without a flight (the old order)");
+
 int cetrafs_bg_reconcile_free_count(struct super_block *sb, u32 bg_id, s64 *out_delta)
 {
     const cetrafs_superblock_t *raw_sb = cetrafs_sb_raw(sb);
@@ -3330,7 +3346,23 @@ int cetrafs_bg_reconcile_free_count(struct super_block *sb, u32 bg_id, s64 *out_
     return ret;
 }
 
+static int __cetrafs_reconcile_locked(struct super_block *sb, u32 bg_id, s64 *out_delta);
+
+/* Under the flush right: the recount's write is a flight like a flush's
+ * (cetrafs_bg_chunk.bg_flight_gen) -- see the swap below -- and two
+ * writers of one descriptor's count never overlap. */
 static int cetrafs_reconcile_locked(struct super_block *sb, u32 bg_id, s64 *out_delta)
+{
+    int ret = cetrafs_sb_bg_flush_lock(sb, bg_id);
+
+    if (ret)
+        return ret;
+    ret = __cetrafs_reconcile_locked(sb, bg_id, out_delta);
+    cetrafs_sb_bg_flush_unlock(sb, bg_id);
+    return ret;
+}
+
+static int __cetrafs_reconcile_locked(struct super_block *sb, u32 bg_id, s64 *out_delta)
 {
     struct cetrafs_bg_geom bg;
     u64 bmap_lba, bmap_blocks;
@@ -3385,11 +3417,40 @@ static int cetrafs_reconcile_locked(struct super_block *sb, u32 bg_id, s64 *out_
          * (one sector CAW, cache left warm and correct) -- unseeded here:
          * reconcile runs at ownership transfer, where the cache is being
          * repopulated anyway. */
+        s64 taken;
+
+        /* class 52: the accrued delta is already in the truth, and the
+         * cached descriptor takes the truth when the swap lands -- so the
+         * delta must leave memory in that same instant, or a reader adds
+         * it twice and the group reads fuller than it is. As a flight:
+         * readers take the truth from here until the swap is back, and
+         * the delta is gone from memory from here too. Nothing accrues
+         * meanwhile: the caller holds alloc_mutex, under which every
+         * accrual happens. */
+        bool flight = !READ_ONCE(cetrafs_reconcile_flight_off);
+
+        taken = flight ? cetrafs_sb_bg_flight_begin_value(sb, bg_id, (s64) truth) : 0;
         ret = cetrafs_cas_record_seeded(sb, cetrafs_sb_bg_desc_lba(sb, bg_id), NULL, 0, cetrafs_bg_count_mutate, &ctx);
-        if (ret)
+        if (ret) {
+            if (flight)
+                cetrafs_sb_bg_flight_settle_end(sb, bg_id, taken); /* not recounted: the delta still stands */
             return ret;
+        }
+        {
+            unsigned int pause = xchg(&cetrafs_reconcile_written_stall_ms, 0);
+
+            if (pause) {
+                pr_info("reconcile: BG %u written, pausing %u ms (test)\n", bg_id, pause);
+                msleep(pause); /* test-only; see the parameter */
+            }
+        }
+        if (taken)
+            pr_warn("BG %u: dropping an accrued free delta of %lld -- the count was recounted (epoch -> %llu)\n",
+                    bg_id, (long long) taken, (unsigned long long) ctx.out_seq);
         /* Deltas accrued from here on belong to this fresh epoch. */
         cetrafs_sb_set_bg_epoch(sb, bg_id, ctx.out_seq);
+        if (flight)
+            cetrafs_sb_bg_flight_settle_end(sb, bg_id, 0);
     }
 
     if (out_delta)

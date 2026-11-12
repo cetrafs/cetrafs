@@ -350,6 +350,9 @@ struct cetrafs_zg_delta_ctx {
     s64 delta;
     u32 my_node_id;
     bool refused; /* the aggregate cannot take it (underflow) */
+    struct super_block *sb;
+    u32 zg_id;
+    bool flight; /* a flush's: publish the count this swap writes */
 };
 
 static int cetrafs_zg_delta_mutate(void *image, unsigned int len, void *priv)
@@ -369,6 +372,10 @@ static int cetrafs_zg_delta_mutate(void *image, unsigned int len, void *priv)
     ctx->refused = false;
     if (!ctx->delta)
         return 1; /* nothing to do */
+    /* Before this attempt's write is sent: statfs takes the count from
+     * here on (cetrafs_sb_info.zg_flight_gen). */
+    if (ctx->flight)
+        cetrafs_sb_zg_flight_image(ctx->sb, ctx->zg_id, cur);
 
     /*
      * Ownership, checked against the IMAGE rather than this node's
@@ -632,10 +639,32 @@ int cetrafs_zg_pool_grow_marker(struct super_block *sb, u32 zg_id, u64 *gen, u64
     return ret;
 }
 
+static int __cetrafs_zg_apply_free_delta(struct super_block *sb, u32 zg_id, s64 delta, bool flight);
+
+/* A delta that was never accrued (a claim's credit, a release's debit, a
+ * reconcile's correction): under the aggregate's write right, so it never
+ * lands under a flush in flight (cetrafs_sb_info.zg_flight_gen). */
 int cetrafs_zg_apply_free_delta(struct super_block *sb, u32 zg_id, s64 delta)
 {
+    int ret = cetrafs_sb_zg_write_lock(sb, zg_id);
+
+    if (ret)
+        return ret;
+    ret = __cetrafs_zg_apply_free_delta(sb, zg_id, delta, false);
+    cetrafs_sb_zg_write_unlock(sb, zg_id);
+    return ret;
+}
+
+/* The flush's apply: the caller holds the write right and the flight. */
+int cetrafs_zg_flush_free_delta(struct super_block *sb, u32 zg_id, s64 delta)
+{
+    return __cetrafs_zg_apply_free_delta(sb, zg_id, delta, true);
+}
+
+static int __cetrafs_zg_apply_free_delta(struct super_block *sb, u32 zg_id, s64 delta, bool flight)
+{
     const cetrafs_superblock_t *raw_sb = cetrafs_sb_raw(sb);
-    struct cetrafs_zg_delta_ctx ctx = {.delta = delta};
+    struct cetrafs_zg_delta_ctx ctx = {.delta = delta, .sb = sb, .zg_id = zg_id, .flight = flight};
     int ret;
 
     if (!raw_sb)
