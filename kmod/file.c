@@ -6951,10 +6951,13 @@ int cetrafs_setattr(struct mnt_idmap *idmap, struct dentry *dentry, struct iattr
             return -EFBIG;
     }
 
-    /* file_remove_privs() reaches here from a write, whose AIO and
-     * io_uring completions turn a restart into EINTR: that one waits in
-     * the lock (nslock.c). */
-    ret = (attr->ia_valid & (ATTR_KILL_SUID | ATTR_KILL_SGID | ATTR_KILL_PRIV))
+    /* Two callers wait in the lock instead of restarting (nslock.c):
+     * file_remove_privs() from a write, whose AIO and io_uring
+     * completions turn a restart into EINTR; and an open's O_TRUNC
+     * (ATTR_OPEN), which runs AFTER the open may have created the file --
+     * restarted, open(O_CREAT|O_EXCL|O_TRUNC) would then fail EEXIST on
+     * its own file. It holds no parent lock, so waiting costs no one. */
+    ret = (attr->ia_valid & (ATTR_KILL_SUID | ATTR_KILL_SGID | ATTR_KILL_PRIV | ATTR_OPEN))
               ? cetrafs_nslock_acquire_set(set, ARRAY_SIZE(set))
               : cetrafs_nslock_acquire_set_vfs(set, ARRAY_SIZE(set));
     if (ret)

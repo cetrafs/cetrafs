@@ -3157,7 +3157,7 @@ u64 cetrafs_lock_close_deferral_count(void)
  * hold it for seconds -- an open across a fence or a peer's lock, a
  * suspend waiting out a defrag -- and an uninterruptible wait in the
  * exit path left a killed process in D state for all of it. If the
- * mutex is busy and the task is exiting or has a fatal signal, the
+ * mutex is busy and the task was killed (cetrafs_close_killed()), the
  * close is handed to a work item on the mount's cold_wq instead, with an
  * inode reference; kill_sb flushes that queue before the inode cache is
  * evicted (cetrafs_sb_cold_close()), and a mount already closing refuses
@@ -3167,6 +3167,26 @@ u64 cetrafs_lock_close_deferral_count(void)
  * nothing can change once this fd is closing (only flock(2) on this
  * very file sets or clears it to this file).
  */
+/* No file is at this address: the explicit lock of a file whose close was
+ * handed to the work item (cetrafs_lock_release()). */
+#define CETRAFS_EXPLICIT_CLOSING ((struct file *) -1L)
+
+/*
+ * A process that was KILLED, not one exiting normally: only it may have
+ * its close deferred. A normal exit's close must have released the lock
+ * by the time the process is gone -- the operator restarting a VM on
+ * another host relies on "the process is gone" meaning "the image is
+ * free", and a deferred close there is an ETXTBSY. In the exit path the
+ * fatal signal is already dequeued, but exit_code carries it (its low
+ * seven bits; a normal exit's status sits above them).
+ */
+static bool cetrafs_close_killed(void)
+{
+    if (fatal_signal_pending(current))
+        return true;
+    return (current->flags & PF_EXITING) && (current->exit_code & 0x7f);
+}
+
 int cetrafs_lock_release(struct inode *inode, struct file *file)
 {
     struct cetrafs_inode_info *ci = CETRAFS_I(inode);
@@ -3176,7 +3196,7 @@ int cetrafs_lock_release(struct inode *inode, struct file *file)
     };
 
     if (!mutex_trylock(&ci->lock_mutex)) {
-        if ((fatal_signal_pending(current) || (current->flags & PF_EXITING)) && !READ_ONCE(cetrafs_close_defer_off)) {
+        if (cetrafs_close_killed() && !READ_ONCE(cetrafs_close_defer_off)) {
             struct cetrafs_close_work *cw = kmalloc(sizeof(*cw), GFP_NOFS);
 
             if (cw) {
@@ -3184,10 +3204,23 @@ int cetrafs_lock_release(struct inode *inode, struct file *file)
                 ihold(inode);
                 cw->inode = inode;
                 cw->a = a;
+                /* The file is freed when this returns, and a new open of
+                 * this inode can be given the same address: left
+                 * pointing at it, the explicit lock would read as THAT
+                 * file's, its flock(LOCK_EX) would pass as already held
+                 * without claiming, and the work would then clear the
+                 * lock on the device under it. A sentinel no file can
+                 * equal keeps every other fd refused (EBUSY) until the
+                 * work clears it. Only flock(2) on this very file moves
+                 * the pointer away from it, so nothing races the swap. */
+                if (a.explicit_mine)
+                    WRITE_ONCE(ci->explicit_lock_file, CETRAFS_EXPLICIT_CLOSING);
                 if (cetrafs_sb_queue_cold(inode->i_sb, &cw->work)) {
                     atomic64_inc(&cetrafs_close_deferrals);
                     return 0;
                 }
+                if (a.explicit_mine)
+                    WRITE_ONCE(ci->explicit_lock_file, file);
                 iput(inode);
                 kfree(cw);
             }

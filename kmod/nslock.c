@@ -822,11 +822,21 @@ MODULE_PARM_DESC(nslock_restart_off, "TEST ONLY: wait for a peer's namespace loc
 
 #define CETRAFS_NSLOCK_BUDGET_MS (CETRAFS_NSLOCK_RETRIES * CETRAFS_NSLOCK_SLEEP_MS)
 
+/* Keyed by the task AND its start time: a task killed while it waited
+ * leaves its entry behind, and a new task can be given the same
+ * task_struct -- with the address alone it would inherit an expired
+ * deadline and be refused EBUSY on its first wait. */
 struct cetrafs_nswait_deadline {
     struct list_head node;
     const struct task_struct *task; /* compared, never dereferenced */
+    u64 start_time;
     unsigned long deadline;
 };
+
+static bool cetrafs_nswait_is_current(const struct cetrafs_nswait_deadline *d)
+{
+    return d->task == current && d->start_time == current->start_time;
+}
 static LIST_HEAD(cetrafs_nswait_list);
 static DEFINE_SPINLOCK(cetrafs_nswait_lock);
 
@@ -840,7 +850,7 @@ static void cetrafs_nswait_forget(void)
 
     spin_lock(&cetrafs_nswait_lock);
     list_for_each_entry_safe(d, tmp, &cetrafs_nswait_list, node)
-        if (d->task == current || time_after(jiffies, d->deadline + old))
+        if (cetrafs_nswait_is_current(d) || time_after(jiffies, d->deadline + old))
             list_move(&d->node, &dead);
     spin_unlock(&cetrafs_nswait_lock);
     list_for_each_entry_safe(d, tmp, &dead, node)
@@ -856,13 +866,14 @@ static int cetrafs_nswait_within(void)
 
     spin_lock(&cetrafs_nswait_lock);
     list_for_each_entry(d, &cetrafs_nswait_list, node)
-        if (d->task == current)
+        if (cetrafs_nswait_is_current(d))
             break;
     if (&d->node != &cetrafs_nswait_list) {
         if (time_after(jiffies, d->deadline))
             ret = -EBUSY;
     } else if (fresh) {
         fresh->task = current;
+        fresh->start_time = current->start_time;
         fresh->deadline = jiffies + msecs_to_jiffies(CETRAFS_NSLOCK_BUDGET_MS);
         list_add(&fresh->node, &cetrafs_nswait_list);
         fresh = NULL;

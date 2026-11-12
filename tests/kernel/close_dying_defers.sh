@@ -21,6 +21,15 @@
 #     which the harness fails on).
 #  3. control (close_defer_off=1): the killed reader stays until the
 #     pause ends.
+#  4. a reader that EXITS NORMALLY during the pause is not deferred: it
+#     stays until its close has run. "The process is gone" must still
+#     mean "its lock is released" for a VM stopped cleanly and started
+#     on another host; only a killed one may leave its close behind.
+#
+# Not tested, said plainly: the sentinel a deferred close leaves in
+# explicit_lock_file. The bug it closes needs a new file at the freed
+# file's exact address, which no test can arrange, and without that a
+# new fd's flock is refused either way.
 #
 # DISCRIMINATION: 3 is the old path, selected by the knob.
 # ct-timeout: 300
@@ -90,6 +99,26 @@ awk -v t="$t" 'BEGIN { exit !(t >= 3) }' && pass "3: control: the killed reader 
     fail "3: control: the killed reader was gone in ${t}s with deferral off -- the suite cannot tell the two apart"
 ct_param_set close_defer_off 0
 rm -f "$MNT.t"
+
+# ------------------------------------------------------------------ 4
+log "4: a reader that exits normally during the pause is not deferred"
+python3 -c 'import os,sys,time
+fd = os.open(sys.argv[1], os.O_RDONLY); time.sleep(1.5); sys.exit(0)' "$MNT/f" &
+R=$!
+sleep 0.5
+ct_param_set lock_open_pause_ms 6000
+python3 -c 'import os,sys
+os.close(os.open(sys.argv[1], os.O_RDONLY))' "$MNT/f" &
+O=$!
+D0="$(info close_deferrals)"
+T="$(secs)"
+wait "$R" 2>/dev/null || true
+t="$(took "$T")"
+wait "$O" 2>/dev/null || true
+[ "$(info close_deferrals)" = "$D0" ] && pass "4: its close was not deferred" ||
+    fail "4: a normal exit's close was handed to the work item"
+awk -v t="$t" 'BEGIN { exit !(t >= 3) }' && pass "4: it stayed ${t}s, until its close had run" ||
+    fail "4: it was gone in ${t}s, before its close could have run"
 
 # ------------------------------------------------------------------ 2
 log "2: a lazy unmount while the deferred close is queued"
