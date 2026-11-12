@@ -1094,6 +1094,15 @@ u64 cetrafs_cas_seed_refused_count(void)
     return (u64) atomic64_read(&cetrafs_cas_seed_refused);
 }
 
+/* Seeded verdicts other than EUCLEAN that were asked again of a fresh
+ * read (see the loop): the seed disagreed with what it decided. */
+static atomic64_t cetrafs_cas_seed_reverdicts = ATOMIC64_INIT(0);
+
+u64 cetrafs_cas_seed_reverdict_count(void)
+{
+    return (u64) atomic64_read(&cetrafs_cas_seed_reverdicts);
+}
+
 /*
  * After a swap is known to be on the device: make this node's cached
  * copy agree with it. The swap's bytes go into any uptodate buffer, dirty
@@ -1338,6 +1347,19 @@ static int cetrafs_cas_region_seeded_impl(struct super_block *sb,
          */
         if (ret == -EUCLEAN && seeded) {
             atomic64_inc(&cetrafs_cas_seed_refused);
+            continue;
+        }
+        /*
+         * Every other verdict on a seed is about the caller's copy too.
+         * A refusal ("a peer is reading it") or a "nothing to do" from
+         * a copy read before the caller's own last swap is not the
+         * device's answer: an open that cleared a dead node's reader bit
+         * and then claimed with its earlier copy was refused ETXTBSY over
+         * the very bit it had just cleared (ctest reader-reclaim). Only
+         * the device's image may decide; read it and ask again.
+         */
+        if (ret && seeded) {
+            atomic64_inc(&cetrafs_cas_seed_reverdicts);
             continue;
         }
         if (ret) {
