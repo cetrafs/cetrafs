@@ -150,6 +150,19 @@ MODULE_PARM_DESC(defrag_skip_dense_recheck,
  * for the lock. */
 #define CETRAFS_DEFRAG_STEP_BLOCKS 128
 
+/* Moves stopped because a peer asked for the file (procfs defrag_yields). */
+static atomic64_t cetrafs_defrag_yields = ATOMIC64_INIT(0);
+u64 cetrafs_defrag_yield_count(void)
+{
+    return (u64) atomic64_read(&cetrafs_defrag_yields);
+}
+
+/* TEST ONLY: the mover ignores a peer's request to step aside -- the
+ * negative control of ctest's defrag-yield. */
+static bool cetrafs_defrag_ignore_yield;
+cetrafs_test_param(defrag_ignore_yield, cetrafs_defrag_ignore_yield, bool, 0644);
+MODULE_PARM_DESC(defrag_ignore_yield, "TEST ONLY: background defrag ignores a peer's request for the file");
+
 /* The most blocks any one step has moved under the locks since the
  * module loaded -- procfs info's defrag_max_step_blocks, which is what
  * shows the cap holding (tests/kernel/defrag_step_bounded.sh). */
@@ -639,6 +652,18 @@ int cetrafs_defrag_inode(struct inode *inode, struct cetrafs_defrag_stats *out_s
             cetrafs_defrag_inode_unlock(inode);
             goto out_free_tail;
         }
+        /* A peer wants the file: it found our pin RELOCATING and swapped
+         * in YIELD (cetrafs_lock_wait_yield()), and is waiting for it.
+         * Stop at this boundary, where the file is consistent; the
+         * caller clears the lock. The read above is fresh here: an idle
+         * pin has no local writer. With one, the pin is that writer's
+         * EXCLUSIVE lock and no peer asks. */
+        if (cetrafs_le32(raw.lock_mode) == CETRAFS_LOCK_YIELD && !READ_ONCE(cetrafs_defrag_ignore_yield)) {
+            atomic64_inc(&cetrafs_defrag_yields);
+            ret = -EAGAIN; /* yielded: try again later */
+            cetrafs_defrag_inode_unlock(inode);
+            goto out_free_tail;
+        }
         ret = cetrafs_defrag_read_extents(inode, &raw, &el);
         /* has_uninit too, not only at the start: a punch and a fallocate
          * between two steps restore the count and the density while
@@ -1049,6 +1074,11 @@ static void cetrafs_defrag_worker(struct work_struct *work)
 
     if (cetrafs_auto_defrag_begin_delay_ms)
         msleep(cetrafs_auto_defrag_begin_delay_ms); /* TEST ONLY */
+    /* Given up to a peer moments ago: not again yet. */
+    if (cetrafs_lock_defrag_yielded(inode)) {
+        iput(inode);
+        goto out_free;
+    }
     if (S_ISREG(inode->i_mode) && inode->i_nlink > 0) {
         ret = cetrafs_lock_defrag_begin(inode);
         if (ret == 0) {
@@ -1057,8 +1087,10 @@ static void cetrafs_defrag_worker(struct work_struct *work)
             ret = cetrafs_defrag_inode(inode, &stats);
             /* Declined: it would be declined again. Keep the append
              * trigger quiet for a while (cetrafs_lock_defrag_quiet()). */
-            if (ret == -EOPNOTSUPP || ret == -ENOSPC)
+            if (ret == -EOPNOTSUPP || ret == -ENOSPC || ret == -EAGAIN)
                 cetrafs_lock_defrag_quiet_for(inode, cetrafs_auto_defrag_quiet_secs);
+            if (ret == -EAGAIN)
+                cetrafs_lock_defrag_yielded_for(inode, cetrafs_auto_defrag_quiet_secs);
             if (ret == 0 && stats.blocks_moved)
                 pr_debug("auto-defrag: ino=%llu extents %llu -> %llu (%llu blocks moved)\n",
                          (unsigned long long) inode->i_ino, (unsigned long long) stats.extents_before,
@@ -1084,6 +1116,9 @@ static void cetrafs_defrag_worker(struct work_struct *work)
                     "auto-defrag: ino=%llu declined: no contiguous run large enough in the "
                     "zone groups this node owns\n",
                     (unsigned long long) inode->i_ino);
+            else if (ret == -EAGAIN)
+                pr_debug("auto-defrag: ino=%llu stopped: a peer asked for the file\n",
+                         (unsigned long long) inode->i_ino);
             else if (ret == -ESTALE)
                 pr_debug(
                     "auto-defrag: ino=%llu declined: the file changed under us (unlinked, or "

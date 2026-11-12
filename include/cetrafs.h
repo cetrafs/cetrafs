@@ -1586,6 +1586,20 @@ static inline void cetrafs_inode_fd_copy(cetrafs_inode_t *dst, const cetrafs_ino
 /* Inode open-lock modes (lock_owner_node/lock_mode above) */
 #define CETRAFS_LOCK_NONE          0 /* unlocked */
 #define CETRAFS_LOCK_EXCLUSIVE     1 /* held by lock_owner_node; blocks opens from any other node */
+/* Held by lock_owner_node for a background relocation of an idle file
+ * (the defrag janitor, or defrag.cetra without a writer): it blocks
+ * opens like EXCLUSIVE, but a peer that wants the file may ask for it
+ * back by swapping in YIELD. */
+#define CETRAFS_LOCK_RELOCATING    2
+/* RELOCATING, and a peer has asked: the mover stops at its next step
+ * boundary and clears the lock. Still held until it does. */
+#define CETRAFS_LOCK_YIELD         3
+
+/* Is the open lock held, in any of its modes? */
+static inline int cetrafs_lock_mode_held(u32 m)
+{
+    return m == CETRAFS_LOCK_EXCLUSIVE || m == CETRAFS_LOCK_RELOCATING || m == CETRAFS_LOCK_YIELD;
+}
 
 /* ---- Directory entries (fixed‑size) ---- */
 

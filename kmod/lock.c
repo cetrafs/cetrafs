@@ -283,6 +283,11 @@ struct cetrafs_inode_info {
     /* jiffies before which an APPEND does not re-queue this file: set
      * when the janitor declined it (cetrafs_lock_defrag_quiet()). */
     unsigned long defrag_quiet_until;
+    /* Until when the janitor leaves this file alone: it gave it up to a
+     * peer that asked (cetrafs_lock_wait_yield()). A request queued
+     * before the ask would otherwise pin it again at once, and the
+     * peer, finding the same node relocating, waits on. */
+    unsigned long defrag_yielded_until;
 
     /* Userspace-driven explicit whole-file lock (flock(2), cetrafs_flock).
      * Option A / fd-scoped: the fd that acquired the lock, NULL when this
@@ -1261,6 +1266,7 @@ static void cetrafs_inode_identity_init_ci(struct cetrafs_inode_info *ci)
     ci->defrag_pinned = false;
     atomic_set(&ci->defrag_queued, 0);
     ci->defrag_quiet_until = jiffies;
+    ci->defrag_yielded_until = jiffies;
     ci->explicit_lock_file = NULL;
     ci->close_owes_presence = 0;
     ci->close_owes_suspend_mark = false;
@@ -1583,6 +1589,18 @@ struct cetrafs_lock_cas_ctx {
     bool check_incarnation;
     bool moved;
 
+    /* relocating: a claim takes the lock as CETRAFS_LOCK_RELOCATING (the
+     * defrag pin of an idle file), which a peer may ask back.
+     * yield_request: ask for it -- swap RELOCATING to YIELD while the
+     * record still shows steal_from's claim under steal_incarnation.
+     * 'moved' (out): it is no longer that relocation (released, retaken,
+     * or a real writer's). */
+    bool relocating;
+    bool yield_request;
+    /* demote: our EXCLUSIVE becomes RELOCATING -- the last writer closed
+     * while the mover is pinned on its lock. */
+    bool demote;
+
     /* Reader presence. When set, this CAS is purely about
      * read_open_nodes and leaves the write lock alone -- the two are
      * orthogonal and a reader must never disturb a writer's claim. */
@@ -1647,7 +1665,7 @@ static bool cetrafs_lock_rec_dead_to_us(const cetrafs_inode_t *rec, u32 my_node_
         return false;
     if (cetrafs_le64(rec->read_open_nodes) & bit)
         return false;
-    if (cetrafs_le32(rec->lock_mode) == CETRAFS_LOCK_EXCLUSIVE && cetrafs_le32(rec->lock_owner_node) == my_node_id)
+    if (cetrafs_lock_mode_held(cetrafs_le32(rec->lock_mode)) && cetrafs_le32(rec->lock_owner_node) == my_node_id)
         return false;
     return true;
 }
@@ -1711,7 +1729,7 @@ static int cetrafs_lock_cas_mutate(void *image, unsigned int len, void *priv)
         if (ctx->reader_op == CETRAFS_READER_SET && (ctx->refuse_foreign_lock || ctx->refuse_foreign_excl)) {
             u32 owner = cetrafs_le32(rec.lock_owner_node);
 
-            if (cetrafs_le32(rec.lock_mode) == CETRAFS_LOCK_EXCLUSIVE && owner != ctx->my_node_id &&
+            if (cetrafs_lock_mode_held(cetrafs_le32(rec.lock_mode)) && owner != ctx->my_node_id &&
                 owner != ctx->lock_owner_ok)
                 return -ETXTBSY; /* a writer claimed it since our check */
             if (ctx->refuse_foreign_lock && (cetrafs_le64(rec.suspended_writer_nodes) & ~bit))
@@ -1756,6 +1774,34 @@ static int cetrafs_lock_cas_mutate(void *image, unsigned int len, void *priv)
         return 0;
     }
 
+    if (ctx->demote) {
+        if (cetrafs_le32(rec.lock_owner_node) != ctx->my_node_id ||
+            cetrafs_le32(rec.lock_mode) != CETRAFS_LOCK_EXCLUSIVE)
+            return 1; /* not our writer's lock: nothing to turn */
+        rec.lock_mode = cetrafs_cpu_to_le32(CETRAFS_LOCK_RELOCATING);
+        cetrafs_inode_stamp_crc_ns(&rec);
+        memcpy(image, &rec, CETRAFS_INODE_NS_BYTES);
+        return 0;
+    }
+
+    if (ctx->yield_request) {
+        u32 m = cetrafs_le32(rec.lock_mode);
+
+        ctx->moved = false;
+        if (cetrafs_le32(rec.lock_owner_node) != ctx->steal_from ||
+            cetrafs_le32(rec.lock_owner_incarnation) != ctx->steal_incarnation ||
+            (m != CETRAFS_LOCK_RELOCATING && m != CETRAFS_LOCK_YIELD)) {
+            ctx->moved = true;
+            return 1; /* not that relocation any more */
+        }
+        if (m == CETRAFS_LOCK_YIELD)
+            return 1; /* already asked */
+        rec.lock_mode = cetrafs_cpu_to_le32(CETRAFS_LOCK_YIELD);
+        cetrafs_inode_stamp_crc_ns(&rec);
+        memcpy(image, &rec, CETRAFS_INODE_NS_BYTES);
+        return 0;
+    }
+
     if (ctx->steal_release) {
         /* Clear a foreign lock to NONE (no new owner). Only lands if the
          * record still shows the exact stale owner we decided to displace,
@@ -1763,7 +1809,7 @@ static int cetrafs_lock_cas_mutate(void *image, unsigned int len, void *priv)
          * "Nothing to clear" returns 1, which the CAS wrapper folds into
          * 0; 'moved' records the one case the caller must hear about. */
         ctx->moved = false;
-        if (cetrafs_le32(rec.lock_mode) != CETRAFS_LOCK_EXCLUSIVE ||
+        if (!cetrafs_lock_mode_held(cetrafs_le32(rec.lock_mode)) ||
             cetrafs_le32(rec.lock_owner_node) != ctx->steal_from)
             return 1; /* not that owner any more -- nothing to clear */
         if (cetrafs_le32(rec.lock_owner_incarnation) != ctx->steal_incarnation) {
@@ -1784,7 +1830,7 @@ static int cetrafs_lock_cas_mutate(void *image, unsigned int len, void *priv)
          * the incarnation that stamped it. A lock that node took again
          * after re-attaching carries a new incarnation and is a live
          * holder's (F10). */
-        bool stealable = ctx->allow_steal && cetrafs_le32(rec.lock_mode) == CETRAFS_LOCK_EXCLUSIVE &&
+        bool stealable = ctx->allow_steal && cetrafs_lock_mode_held(cetrafs_le32(rec.lock_mode)) &&
                          cetrafs_le32(rec.lock_owner_node) == ctx->steal_from &&
                          cetrafs_le32(rec.lock_owner_incarnation) == ctx->steal_incarnation;
 
@@ -1798,9 +1844,9 @@ static int cetrafs_lock_cas_mutate(void *image, unsigned int len, void *priv)
 
         rec.lock_owner_node = cetrafs_cpu_to_le32(ctx->my_node_id);
         rec.lock_owner_incarnation = cetrafs_cpu_to_le32(ctx->my_incarnation);
-        rec.lock_mode = cetrafs_cpu_to_le32(CETRAFS_LOCK_EXCLUSIVE);
+        rec.lock_mode = cetrafs_cpu_to_le32(ctx->relocating ? CETRAFS_LOCK_RELOCATING : CETRAFS_LOCK_EXCLUSIVE);
     } else {
-        if (cetrafs_le32(rec.lock_mode) != CETRAFS_LOCK_EXCLUSIVE ||
+        if (!cetrafs_lock_mode_held(cetrafs_le32(rec.lock_mode)) ||
             cetrafs_le32(rec.lock_owner_node) != ctx->my_node_id)
             return 1; /* not ours any more -- nothing to release, not an error */
 
@@ -1836,6 +1882,95 @@ static int cetrafs_lock_cas(struct inode *inode, struct cetrafs_lock_cas_ctx *ct
     ctx->my_incarnation = cetrafs_sb_incarnation(inode->i_sb);
     return cetrafs_cas_record_seeded(inode->i_sb, cetrafs_inode_lba(inode->i_sb, inode->i_ino), seed,
                                      seed ? CETRAFS_INODE_NS_BYTES : 0, cetrafs_lock_cas_mutate, ctx);
+}
+
+/* How long an open waits for a background relocation of the file to
+ * step aside once asked. The mover looks between steps (128 blocks and
+ * a commit), so this is many steps. 0: never ask, refuse at once. */
+static unsigned int cetrafs_lock_yield_wait_ms = 10000;
+module_param_named(lock_yield_wait_ms, cetrafs_lock_yield_wait_ms, uint, 0644);
+MODULE_PARM_DESC(lock_yield_wait_ms,
+                 "How long an open waits for a background defrag of the file to step aside (ms, 0 = refuse at once)");
+
+static atomic64_t cetrafs_lock_yield_asks = ATOMIC64_INIT(0);
+u64 cetrafs_lock_yield_ask_count(void)
+{
+    return (u64) atomic64_read(&cetrafs_lock_yield_asks);
+}
+
+/*
+ * A live peer holds the file only to relocate it (RELOCATING or YIELD).
+ * Ask for it back and wait, killably and bounded, until the lock is no
+ * longer that relocation. 0: it is not -- the caller reads the record
+ * again and decides afresh (it may be free, or a real writer's now);
+ * -ETXTBSY: still relocating at the deadline, or the ask failed;
+ * -EINTR, -ESTALE as their own.
+ */
+static int cetrafs_lock_wait_yield(struct inode *inode, const cetrafs_inode_t *raw, u32 my_node_id)
+{
+    struct super_block *sb = inode->i_sb;
+    u32 owner = cetrafs_le32(raw->lock_owner_node);
+    u32 inc = cetrafs_le32(raw->lock_owner_incarnation);
+    struct cetrafs_lock_cas_ctx ctx = {
+        .my_node_id = my_node_id,
+        .generation = cetrafs_le64(raw->generation),
+        .yield_request = true,
+        .steal_from = owner,
+        .steal_incarnation = inc,
+    };
+    unsigned long deadline;
+    cetrafs_inode_t *now;
+    int ret;
+
+    unsigned int wait_ms = min_t(unsigned int, READ_ONCE(cetrafs_lock_yield_wait_ms), 600000);
+
+    if (!wait_ms)
+        return -ETXTBSY;
+    ret = cetrafs_lock_cas(inode, &ctx, raw);
+    if (ret)
+        return ret == -ESTALE || ret == -EINTR ? ret : -ETXTBSY;
+    if (ctx.moved)
+        return 0; /* not that relocation any more: decide again */
+    atomic64_inc(&cetrafs_lock_yield_asks);
+
+    now = kmalloc(sizeof(*now), GFP_NOFS);
+    if (!now)
+        return -ENOMEM;
+    deadline = jiffies + msecs_to_jiffies(wait_ms);
+    for (;;) {
+        u32 m;
+
+        if (schedule_timeout_killable(msecs_to_jiffies(50)) || fatal_signal_pending(current)) {
+            ret = -EINTR;
+            break;
+        }
+        cetrafs_invalidate_raw_inode(sb, inode->i_ino);
+        ret = cetrafs_read_raw_inode(sb, inode->i_ino, now);
+        if (ret)
+            break;
+        m = cetrafs_le32(now->lock_mode);
+        if (cetrafs_le32(now->lock_owner_node) != owner || cetrafs_le32(now->lock_owner_incarnation) != inc ||
+            (m != CETRAFS_LOCK_RELOCATING && m != CETRAFS_LOCK_YIELD)) {
+            ret = 0;
+            break;
+        }
+        /* The ask is a single swap, and the holder's own record
+         * writes can land over it. Still RELOCATING: ask again. */
+        if (m == CETRAFS_LOCK_RELOCATING) {
+            struct cetrafs_lock_cas_ctx again = ctx;
+
+            if (cetrafs_lock_cas(inode, &again, NULL) == 0 && !again.moved)
+                atomic64_inc(&cetrafs_lock_yield_asks);
+        }
+        if (time_after(jiffies, deadline)) {
+            pr_warn_ratelimited("lock: ino=%llu node %u was asked to stop relocating it and still holds it after %u ms\n",
+                                (unsigned long long) inode->i_ino, owner, wait_ms);
+            ret = -ETXTBSY;
+            break;
+        }
+    }
+    kfree(now);
+    return ret;
 }
 
 /* Clear the on-disk lock this node holds -- defined far below, next to
@@ -2036,6 +2171,7 @@ int cetrafs_lock_open(struct inode *inode, struct file *file)
     bool claimed = false; /* this open took the exclusive lock */
     u32 stale_owner = CETRAFS_NODE_ID_NONE;
     u32 stale_incarnation = 0; /* the incarnation behind the judged stale lock */
+    unsigned int yield_rounds = 0; /* relocations this open asked to step aside */
     int ret;
 
     ret = cetrafs_sb_get_node_id(sb, &my_node_id);
@@ -2063,6 +2199,7 @@ int cetrafs_lock_open(struct inode *inode, struct file *file)
      * claim, not whatever this node happened to cache earlier (e.g. a
      * prior read-only open of this same file) -- see
      * cetrafs_invalidate_raw_inode()'s own comment. */
+reread:
     cetrafs_invalidate_raw_inode(sb, inode->i_ino);
 
     ret = cetrafs_read_raw_inode(sb, inode->i_ino, &raw);
@@ -2104,7 +2241,7 @@ int cetrafs_lock_open(struct inode *inode, struct file *file)
      * blocks a peer -- which is exactly its purpose. (dir.c's unlink/rename
      * already enforce a present lock in both modes; this aligns open() with
      * them.) */
-    if (cetrafs_le32(raw.lock_mode) == CETRAFS_LOCK_EXCLUSIVE && cetrafs_le32(raw.lock_owner_node) != my_node_id) {
+    if (cetrafs_lock_mode_held(cetrafs_le32(raw.lock_mode)) && cetrafs_le32(raw.lock_owner_node) != my_node_id) {
         bool stale = false;
 
         /* an earlier phase: a foreign claim left behind by a node whose
@@ -2119,6 +2256,18 @@ int cetrafs_lock_open(struct inode *inode, struct file *file)
             goto out_pr_unlock;
 
         if (!stale) {
+            u32 m = cetrafs_le32(raw.lock_mode);
+
+            /* Held only to relocate an idle file: ask for it back and
+             * decide again once it is no longer that (bounded: the
+             * janitor does not re-pin a file a peer asked for, but a
+             * defrag.cetra could). A real writer is refused at once. */
+            if ((m == CETRAFS_LOCK_RELOCATING || m == CETRAFS_LOCK_YIELD) && yield_rounds++ < 3) {
+                ret = cetrafs_lock_wait_yield(inode, &raw, my_node_id);
+                if (!ret)
+                    goto reread;
+                goto out_pr_unlock;
+            }
             ret = -ETXTBSY;
             goto out_pr_unlock;
         }
@@ -2652,11 +2801,34 @@ static int cetrafs_lock_publish_and_clear(struct inode *inode, cetrafs_inode_t *
          * ran (the durability boundary peers rely on is intact),
          * only the lock-clear is deferred -- the mover's own
          * cetrafs_lock_defrag_end() performs it if no new writer
-         * has appeared by then. */
+         * has appeared by then.
+         *
+         * Until then the lock is held for the move alone, so it says
+         * so: RELOCATING, which a peer that wants the file may ask
+         * back (cetrafs_lock_wait_yield()). Left EXCLUSIVE, every
+         * peer open was refused for the rest of the pass. A failed
+         * swap leaves it EXCLUSIVE: peers wait for the pass, as
+         * before. */
+        u32 me;
+        struct cetrafs_lock_cas_ctx dctx = {
+            .generation = cetrafs_inode_get_generation(inode),
+            .demote = true,
+        };
+
+        if (cetrafs_sb_get_node_id(sb, &me) == 0) {
+            int dret;
+
+            dctx.my_node_id = me;
+            dret = cetrafs_lock_cas(inode, &dctx, ret ? NULL : raw);
+            if (dret)
+                pr_warn_ratelimited("lock release: ino=%llu could not mark the defrag pin relocating (%d) -- "
+                                    "peers wait for the pass\n",
+                                    (unsigned long long) inode->i_ino, dret);
+        }
     } else if (ret) {
         pr_err("lock release: failed to read ino=%llu raw inode: %d\n", (unsigned long long) inode->i_ino, ret);
         return ret;
-    } else if (cetrafs_le32(raw->lock_mode) != CETRAFS_LOCK_EXCLUSIVE) {
+    } else if (!cetrafs_lock_mode_held(cetrafs_le32(raw->lock_mode))) {
         pr_err("lock release: ino=%llu lock_mode=%u, expected EXCLUSIVE -- leaving as-is\n",
                (unsigned long long) inode->i_ino, raw->lock_mode);
     } else {
@@ -4848,7 +5020,7 @@ static int cetrafs_lock_explicit_acquire(struct inode *inode, struct file *file)
             if (ret)
                 goto out;
             owner = cetrafs_le32(raw.lock_owner_node);
-            if (cetrafs_le32(raw.lock_mode) != CETRAFS_LOCK_EXCLUSIVE || owner == my_node_id ||
+            if (!cetrafs_lock_mode_held(cetrafs_le32(raw.lock_mode)) || owner == my_node_id ||
                 cetrafs_node_is_stale(sb, owner, &stale) != 0 || !stale) {
                 ret = -ETXTBSY; /* a live holder (or it just let go): keep waiting */
                 goto out;
@@ -5079,6 +5251,15 @@ static noinline int cetrafs_defrag_check_sole(struct inode *inode, u32 my_node_i
     return reader ? -EBUSY : 0;
 }
 
+/* Files this node has pinned for a relocation right now (procfs
+ * defrag_pinned): a peer refused an open can be told apart from a
+ * writer by it. */
+static atomic_t cetrafs_defrag_pins = ATOMIC_INIT(0);
+u32 cetrafs_defrag_pin_count(void)
+{
+    return (u32) atomic_read(&cetrafs_defrag_pins);
+}
+
 int cetrafs_lock_defrag_begin(struct inode *inode)
 {
     struct cetrafs_inode_info *ci = CETRAFS_I(inode);
@@ -5136,6 +5317,7 @@ int cetrafs_lock_defrag_begin(struct inode *inode)
         if (ret)
             goto out;
         ci->defrag_pinned = true;
+        atomic_inc(&cetrafs_defrag_pins);
         goto out;
     }
 
@@ -5158,10 +5340,14 @@ int cetrafs_lock_defrag_begin(struct inode *inode)
     }
 
     {
+        /* RELOCATING, not EXCLUSIVE: a peer that wants the file may ask
+         * for it back, and the move stops at its next step
+         * (cetrafs_lock_wait_yield()). */
         struct cetrafs_lock_cas_ctx ctx = {
             .my_node_id = my_node_id,
             .generation = cetrafs_le64(raw.generation),
             .claim = true,
+            .relocating = true,
         };
 
         ret = cetrafs_lock_cas(inode, &ctx, &raw);
@@ -5212,6 +5398,7 @@ int cetrafs_lock_defrag_begin(struct inode *inode)
         cetrafs_lock_reconcile_cold(inode, &raw);
 
     ci->defrag_pinned = true;
+    atomic_inc(&cetrafs_defrag_pins);
     ret = 0;
 
 out:
@@ -5230,6 +5417,8 @@ void cetrafs_lock_defrag_end(struct inode *inode)
     struct cetrafs_inode_info *ci = CETRAFS_I(inode);
 
     mutex_lock(&ci->lock_mutex);
+    if (ci->defrag_pinned)
+        atomic_dec(&cetrafs_defrag_pins);
     ci->defrag_pinned = false;
     /* If writers appeared during the move, release duty is theirs again
      * (their last close now takes the normal path). If none remain --
@@ -5284,6 +5473,16 @@ void cetrafs_lock_defrag_unqueue(struct inode *inode)
 void cetrafs_lock_defrag_quiet_for(struct inode *inode, unsigned int secs)
 {
     WRITE_ONCE(CETRAFS_I(inode)->defrag_quiet_until, jiffies + secs * HZ);
+}
+
+void cetrafs_lock_defrag_yielded_for(struct inode *inode, unsigned int secs)
+{
+    WRITE_ONCE(CETRAFS_I(inode)->defrag_yielded_until, jiffies + secs * HZ);
+}
+
+bool cetrafs_lock_defrag_yielded(struct inode *inode)
+{
+    return time_before(jiffies, READ_ONCE(CETRAFS_I(inode)->defrag_yielded_until));
 }
 
 bool cetrafs_lock_defrag_quiet(struct inode *inode)
@@ -5440,7 +5639,7 @@ int cetrafs_lock_foreign_user_judged(struct super_block *sb,
      * stale (a live one returned above), and every presence bit is
      * either judged live below or cleared by it. */
     if (judged_owner)
-        *judged_owner = (cetrafs_le32(raw.lock_mode) == CETRAFS_LOCK_EXCLUSIVE &&
+        *judged_owner = (cetrafs_lock_mode_held(cetrafs_le32(raw.lock_mode)) &&
                          cetrafs_le32(raw.lock_owner_node) != my_node_id)
                             ? cetrafs_le32(raw.lock_owner_node)
                             : CETRAFS_NODE_ID_NONE;
@@ -5477,7 +5676,7 @@ static int cetrafs_foreign_claim_from_raw(struct super_block *sb,
     if (out_repaired)
         *out_repaired = false;
 
-    if (cetrafs_le32(raw.lock_mode) == CETRAFS_LOCK_EXCLUSIVE && cetrafs_le32(raw.lock_owner_node) != my_node_id) {
+    if (cetrafs_lock_mode_held(cetrafs_le32(raw.lock_mode)) && cetrafs_le32(raw.lock_owner_node) != my_node_id) {
         bool stale = false;
 
         ret = cetrafs_node_is_stale(sb, cetrafs_le32(raw.lock_owner_node), &stale);
@@ -5512,7 +5711,7 @@ static int cetrafs_foreign_claim_from_raw(struct super_block *sb,
                 ret = cetrafs_read_raw_inode(sb, cetrafs_le64(raw.ino), &now);
                 if (ret)
                     return ret;
-                if (cetrafs_le32(now.lock_mode) == CETRAFS_LOCK_EXCLUSIVE &&
+                if (cetrafs_lock_mode_held(cetrafs_le32(now.lock_mode)) &&
                     (cetrafs_le32(now.lock_owner_node) != cetrafs_le32(raw.lock_owner_node) ||
                      cetrafs_le32(now.lock_owner_incarnation) != cetrafs_le32(raw.lock_owner_incarnation)))
                     stale = false; /* taken since, by a live incarnation */
@@ -5557,7 +5756,7 @@ int cetrafs_lock_clear_dead_claims(struct super_block *sb, u64 ino, u32 my_node_
         return ret;
     if (cetrafs_le64(raw.read_open_nodes) & bit)
         return -EBUSY;
-    if (cetrafs_le32(raw.lock_mode) == CETRAFS_LOCK_EXCLUSIVE) {
+    if (cetrafs_lock_mode_held(cetrafs_le32(raw.lock_mode))) {
         u32 owner = cetrafs_le32(raw.lock_owner_node);
         struct cetrafs_lock_cas_ctx ctx = {
             .generation = cetrafs_le64(raw.generation),

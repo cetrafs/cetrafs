@@ -1746,7 +1746,7 @@ int cetrafs_write_vfs_inode(struct inode *inode)
     /* A record a LIVE other node holds exclusively locked is that node's
      * file domain to write -- our stat dirt predates its claim. */
     (void) cetrafs_sb_get_node_id(sb, &my_node_id);
-    if (cetrafs_le32(bufs[0].lock_mode) == CETRAFS_LOCK_EXCLUSIVE &&
+    if (cetrafs_lock_mode_held(cetrafs_le32(bufs[0].lock_mode)) &&
         cetrafs_le32(bufs[0].lock_owner_node) != my_node_id) {
         bool stale = false;
 

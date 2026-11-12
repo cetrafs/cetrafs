@@ -6606,7 +6606,7 @@ static void cetrafs_ns_apply_setattr(cetrafs_inode_t *rec, void *arg)
         u64 mine = 1ULL << (u->my_node_id % CETRAFS_MAX_READER_NODES);
         u32 owner = cetrafs_le32(rec->lock_owner_node);
 
-        if (cetrafs_le32(rec->lock_mode) == CETRAFS_LOCK_EXCLUSIVE && owner != u->my_node_id &&
+        if (cetrafs_lock_mode_held(cetrafs_le32(rec->lock_mode)) && owner != u->my_node_id &&
             owner != u->judged_owner)
             u->refused = true;
         if (cetrafs_le64(rec->read_open_nodes) & ~mine & ~u->judged_readers)

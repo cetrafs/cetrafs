@@ -129,7 +129,7 @@ ownership anywhere in this codebase — that's mechanisms 2 and 3's job.
 ## Mechanism 2: the whole-file exclusive open lock
 
 `cetrafs_inode_t` carries `lock_owner_node`/`lock_mode` (a Node Registry
-row index + `CETRAFS_LOCK_NONE`/`_EXCLUSIVE`). Wired into
+row index + `CETRAFS_LOCK_NONE`/`_EXCLUSIVE`/`_RELOCATING`/`_YIELD`). Wired into
 `cetrafs_file_ops`'s `.open`/`.release` (`lock.c`) for **regular files
 only** — directories are never lockable this way, see Mechanism 3.
 
@@ -139,6 +139,18 @@ only** — directories are never lockable this way, see Mechanism 3.
   `CETRAFS_LOCK_EXCLUSIVE` is held rejects with `-ETXTBSY`, unless the
   holder's Node Registry row has gone stale, in which case the open
   proceeds (and a write-open reclaims the lock).
+- A lock held only to relocate an idle file -- the background defrag,
+  or `defrag.cetra` with no writer -- is `CETRAFS_LOCK_RELOCATING`, and
+  so is a writer's lock once its last close lands while the mover is
+  pinned on it. It excludes exactly like `_EXCLUSIVE`, but a peer's open
+  that finds it swaps in `_YIELD` and waits (`lock_yield_wait_ms`,
+  default 10 s, killable). The mover re-reads the record fresh at every
+  step boundary, stops there on `_YIELD` and clears the lock, and the
+  open proceeds; the janitor then leaves the file alone for a while.
+  Before this a peer's open was refused for the whole pass -- minutes on
+  a large image -- so a VM stopped on one host could not start on
+  another until a background optimisation finished. ctest
+  `defrag-yield` covers it, with both halves as negative controls.
 - A write-open from a node while a *different* live node has the file
   open for read (`read_open_nodes`) also rejects with `-ETXTBSY`: one
   writer and nobody else, or readers and no writer

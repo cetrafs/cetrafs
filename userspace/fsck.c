@@ -2606,7 +2606,7 @@ int main(int argc, char **argv)
             pread_all(fd, &in, sizeof(in), (off_t) (cetrafs_le64(sb.inode_table_start) + ino - 1) * CETRAFS_BLOCK_SIZE);
             if (!in.ino && !in.generation)
                 continue; /* never written */
-            if (cetrafs_le32(in.lock_mode) == CETRAFS_LOCK_EXCLUSIVE && cetrafs_le32(in.lock_owner_node) < nrows)
+            if (cetrafs_lock_mode_held(cetrafs_le32(in.lock_mode)) && cetrafs_le32(in.lock_owner_node) < nrows)
                 node_ref[cetrafs_le32(in.lock_owner_node)] = 1;
             if (cetrafs_le32(in.ns_lock_owner) < nrows)
                 node_ref[cetrafs_le32(in.ns_lock_owner)] = 1;
@@ -3129,9 +3129,9 @@ int main(int argc, char **argv)
              * opened for write again, and nothing used to say so.
              * Reported, not repaired: there is no basis for choosing
              * which mode was meant. */
-            if (cetrafs_le32(in.lock_mode) != CETRAFS_LOCK_NONE && cetrafs_le32(in.lock_mode) != CETRAFS_LOCK_EXCLUSIVE)
+            if (cetrafs_le32(in.lock_mode) != CETRAFS_LOCK_NONE && !cetrafs_lock_mode_held(cetrafs_le32(in.lock_mode)))
                 fprintf(stderr,
-                        "WARN: inode %" PRIu64 " has lock_mode %u, which is neither unlocked nor exclusive -- "
+                        "WARN: inode %" PRIu64 " has lock_mode %u, which is no lock mode -- "
                         "no node can open it for write\n",
                         ino, cetrafs_le32(in.lock_mode));
 

@@ -364,6 +364,7 @@ stale_secs:stale window for new mounts; clamped 3..86400 and to >= 3 beats (cetr
 node_uuid:load-time only (0444): this node identity
 pf_full_backoff_ms:pending-free queue backoff (latency)
 pf_drain_min_ms:pending-free drain rate limit (latency)
+lock_yield_wait_ms:how long an open waits for a background defrag to yield (latency); killable, clamped to 10 min, 0 refuses at once as before
 own_claim_resweep_secs:delay of the late own-claim sweep; every clear is judged under the inode lock_mutex, 0 (off) leaves stray claims as they were'
 plain_params() { grep -hoE '^module_param(_named)?\([a-z_0-9]+' "$@" | sed -E 's/^module_param(_named)?\(//' | sort -u; }
 UNLISTED="$(plain_params "$K"/*.c | while read -r n; do grep -q "^$n:" <<<"$PLAIN_OK" || echo "$n"; done)"
@@ -1125,6 +1126,7 @@ dir.c:cetrafs_walk_dirents:target discovery; the locked re-check decides
 heartbeat.c:cetrafs_node_self_fence_check:pre-check; the renewal compares fence_epoch itself
 inode.c:cetrafs_sb_get_node_id:true branch skips a refresh; an error applies it, the default
 lock.c:cetrafs_node_is_stale:acts (reclaims a reader bit) only on success; an error counts the reader
+lock.c:cetrafs_lock_cas:counts a re-asked yield only on success; an error asks nothing and the wait goes on
 lock.c:cetrafs_read_raw_inode:acts (the late sweep clears claims) only on success; an error clears nothing
 node.c:cetrafs_node_is_stale:true branch skips a peer; an error counts it as live
 scrub.c:cetrafs_zg_scrub_adopt_one_stale:log only

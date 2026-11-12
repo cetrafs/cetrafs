@@ -806,6 +806,9 @@ int cetrafs_defrag_init(struct super_block *sb, struct cetrafs_defrag **out_d);
 void cetrafs_defrag_stop(struct cetrafs_defrag *d);
 void cetrafs_defrag_consider(struct inode *inode, u32 extents, u64 nblocks);
 u64 cetrafs_defrag_stale_req_count(void);
+u32 cetrafs_defrag_pin_count(void);
+u64 cetrafs_lock_yield_ask_count(void);
+u64 cetrafs_defrag_yield_count(void);
 u64 cetrafs_defrag_max_step_blocks(void);
 
 // nslock.c -- the per-inode namespace lock
@@ -1250,6 +1253,8 @@ bool cetrafs_lock_defrag_try_queue(struct inode *inode);
 void cetrafs_lock_defrag_unqueue(struct inode *inode);
 void cetrafs_lock_defrag_quiet_for(struct inode *inode, unsigned int secs);
 bool cetrafs_lock_defrag_quiet(struct inode *inode);
+void cetrafs_lock_defrag_yielded_for(struct inode *inode, unsigned int secs);
+bool cetrafs_lock_defrag_yielded(struct inode *inode);
 void cetrafs_inode_identity_init(struct inode *inode);
 extern struct kmem_cache *cetrafs_inode_cache;
 
