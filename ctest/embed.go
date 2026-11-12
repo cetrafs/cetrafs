@@ -69,11 +69,14 @@ func buildEmbeddedHelper(name string) (string, error) {
 
 	bin := filepath.Join(dir, name)
 	cc := exec.Command("cc", "-D_FILE_OFFSET_BITS=64", "-I", dir, "-O2", "-std=gnu99",
-		"-o", bin, filepath.Join(dir, name+".c"))
+		"-o", bin+".tmp", filepath.Join(dir, name+".c"))
 	var e bytes.Buffer
 	cc.Stderr = &e
 	if err := cc.Run(); err != nil {
 		return "", fmt.Errorf("building embedded %s: %w: %s", name, err, strings.TrimSpace(e.String()))
+	}
+	if err := os.Rename(bin+".tmp", bin); err != nil { // see helperBuildMu
+		return "", err
 	}
 	return bin, nil
 }

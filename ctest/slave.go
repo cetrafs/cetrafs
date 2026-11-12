@@ -625,8 +625,34 @@ func (s *Slave) dispatch(req Request) Response {
 		}
 		return okResp(req.ID, struct{}{})
 
+	case "churn":
+		var a ChurnArgs
+		if err := unmarshalInto(&a); err != nil {
+			return errResp(req.ID, err)
+		}
+		res, err := s.doChurn(a)
+		if err != nil {
+			return errResp(req.ID, err)
+		}
+		return okResp(req.ID, res)
+
 	case "fstrim":
 		res, err := s.doFstrim()
+		if err != nil {
+			return errResp(req.ID, err)
+		}
+		return okResp(req.ID, res)
+
+	case "defrag_file":
+		var a DefragFileArgs
+		if err := unmarshalInto(&a); err != nil {
+			return errResp(req.ID, err)
+		}
+		p, err := s.resolvePath(a.Path)
+		if err != nil {
+			return errResp(req.ID, err)
+		}
+		res, err := doDefragFile(p)
 		if err != nil {
 			return errResp(req.ID, err)
 		}
@@ -1645,8 +1671,36 @@ var settableModParams = map[string]bool{
 	"defrag_ignore_yield": true,
 	// handback-unknown: hand-back discards fail as a transport error.
 	"discard_fail_unknown": true,
-	"hb_interval_secs":     true,
-	"stale_secs":           true,
+	// churn-trim's negative control: FITRIM without its claim.
+	"trim_skip_claim":       true,
+	"trim_discard_stall_ms": true,
+	// rename-loop: land both nodes' moves after their lookups and
+	// before their locks; its negative control drops the cycle check.
+	"rename_prelock_stall_ms": true,
+	"rename_skip_cycle_check": true,
+	// damage-incarnation: mark a file damaged on demand, keep the mark
+	// off the superblock, and (control) key marks by number alone.
+	"defrag_damage_ino":   true,
+	"damage_record_off":   true,
+	"damage_mark_any_gen": true,
+	// cas-image-check: hold a swap between its read and its CAW, damage
+	// the sector from the peer, and (control) a lock CAS that ignores
+	// the image's checksum.
+	"cas_stall_ino":      true,
+	"cas_stall_ms":       true,
+	"test_damage_ns_ino": true,
+	"lock_cas_skip_crc":  true,
+	// frees-in-flight: hold a truncate's foreign frees in flight, keep
+	// the file fragmented, and (control) a scrub blind to peers' frees.
+	"pf_append_stall_ms":      true,
+	"alloc_run_blocks":        true,
+	"scrub_ignore_peer_frees": true,
+	// grow-twice: the layout refresh at ENOSPC is the only way to a
+	// grow (heartbeat refresh off); its control turns that off too.
+	"layout_refresh_hb_off":    true,
+	"alloc_enospc_refresh_off": true,
+	"hb_interval_secs":         true,
+	"stale_secs":               true,
 	// The background scrub's cadence. A scenario that has to watch the
 	// scrub make (or decline) a decision cannot wait out the 30-minute
 	// default, and these must be set BEFORE the mount: scrub_start()
@@ -1678,9 +1732,26 @@ func (s *Slave) doFsck(a FsckArgs) (FsckResult, error) {
 	}
 	args = append(args, s.device)
 	cmd := exec.Command(bin, args...)
+	if len(a.Env) > 0 {
+		cmd.Env = os.Environ()
+		for _, kv := range a.Env {
+			if !fsckTestEnv[strings.SplitN(kv, "=", 2)[0]] {
+				return FsckResult{}, fmt.Errorf("fsck environment %q is not settable from here", kv)
+			}
+			cmd.Env = append(cmd.Env, kv)
+		}
+	}
 	out, _ := cmd.CombinedOutput()
 	code := cmd.ProcessState.ExitCode()
 	return FsckResult{ExitCode: code, Output: string(out), Clean: code == 0}, nil
+}
+
+// The tools' test hooks the master may pass to fsck, by name (the
+// repair-claim race of tests/kernel/repair_claim_caw.sh, across nodes).
+var fsckTestEnv = map[string]bool{
+	"CETRAFS_TEST_REPAIR_CLAIM_GAP_SECS": true,
+	"CETRAFS_TEST_REPAIR_HOLD_SECS":      true,
+	"CETRAFS_TEST_TOOLS_NO_CAW":          true,
 }
 
 func doModParam(a ModParamArgs) (ModParamResult, error) {
@@ -1951,7 +2022,14 @@ func helperCacheDir() string { return filepath.Join(os.TempDir(), "ctest-helpers
 
 func fileExists(p string) bool { _, err := os.Stat(p); return err == nil }
 
+// helperBuildMu serialises helperPath: two actors asking for the same
+// helper at once both found it stale, and one exec'd the binary while
+// the other's cc was still writing it ("text file busy").
+var helperBuildMu sync.Mutex
+
 func (s *Slave) helperPath(name string) (string, error) {
+	helperBuildMu.Lock()
+	defer helperBuildMu.Unlock()
 	root := s.repoRoot()
 	if root == "" {
 		// No checkout on this node: build from the sources embedded in
@@ -1984,11 +2062,16 @@ func (s *Slave) helperPath(name string) (string, error) {
 	if stale {
 		cc := exec.Command("cc", "-D_FILE_OFFSET_BITS=64",
 			"-I", filepath.Join(root, "include"), "-I", filepath.Join(root, "userspace"),
-			"-O2", "-std=gnu99", "-o", bin, src)
+			"-O2", "-std=gnu99", "-o", bin+".tmp", src)
 		var e bytes.Buffer
 		cc.Stderr = &e
 		if err := cc.Run(); err != nil {
 			return "", fmt.Errorf("building %s: %w: %s", name, err, strings.TrimSpace(e.String()))
+		}
+		// Rename into place: a helper still running from the old
+		// binary keeps it, and nothing ever execs a half-written one.
+		if err := os.Rename(bin+".tmp", bin); err != nil {
+			return "", err
 		}
 	}
 	return bin, nil

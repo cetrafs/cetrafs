@@ -3257,6 +3257,13 @@ func RunFullSuite(clients []*Client, lockPath, baseDir string, accountingSizeByt
 		{"fstrim-pool", func() (bool, error) { return RunFstrimPool(clients, baseDir) }},
 		{"defrag-yield", func() (bool, error) { return RunDefragYield(clients, baseDir) }},
 		{"handback-unknown", func() (bool, error) { return RunHandbackUnknown(clients, baseDir) }},
+		{"churn-trim", func() (bool, error) { return RunChurnTrim(clients, baseDir) }},
+		{"rename-loop", func() (bool, error) { return RunRenameLoop(clients, baseDir) }},
+		{"damage-incarnation", func() (bool, error) { return RunDamageIncarnation(clients, baseDir) }},
+		{"cas-image-check", func() (bool, error) { return RunCasImageCheck(clients, baseDir) }},
+		{"frees-in-flight", func() (bool, error) { return RunFreesInFlight(clients, baseDir) }},
+		{"repair-claim-race", func() (bool, error) { return RunRepairClaimRace(clients, baseDir) }},
+		{"reader-reclaim", func() (bool, error) { return RunReaderReclaim(clients, baseDir) }},
 		{"inode-reuse", func() (bool, error) { return RunInodeReuse(clients, baseDir) }},
 		{"dirent-cache", func() (bool, error) { return RunDirentCache(clients, baseDir, dirStormPar) }},
 		{"extent-leaf-staleness", func() (bool, error) { return RunExtentLeafStaleness(clients, baseDir) }},
@@ -4851,6 +4858,22 @@ const (
 )
 
 func RunFenceReclaim(clients []*Client, baseDir string) (bool, error) {
+	return runFenceReclaim(clients, baseDir, false)
+}
+
+// RunReaderReclaim: fence-reclaim's twin for READ presence. A holds the
+// file open read-only -- its node's bit in read_open_nodes, which keeps
+// a writer out (one writer XOR many readers) -- and loses its device.
+// While A is live, B's write-open must be refused; once A is stale, the
+// open must reclaim A's reader bit (the give-back the reclaim path does
+// for a dead reader), bump A's fence epoch and succeed; A fences itself
+// when its device returns. Staged single-node until now by editing the
+// image (tests/kernel/reader_*).
+func RunReaderReclaim(clients []*Client, baseDir string) (bool, error) {
+	return runFenceReclaim(clients, baseDir, true)
+}
+
+func runFenceReclaim(clients []*Client, baseDir string, reader bool) (bool, error) {
 	if len(clients) < 2 {
 		return false, fmt.Errorf("fence-reclaim needs at least 2 clients")
 	}
@@ -4881,8 +4904,15 @@ func RunFenceReclaim(clients []*Client, baseDir string) (bool, error) {
 	}()
 
 	dir := baseDir + "/fence"
+	if reader {
+		dir = baseDir + "/reader-reclaim"
+	}
 	path := dir + "/held"
-	fmt.Printf("=== fence reclaim: %s loses its device holding a lock, %s reclaims it ===\n", a.Name, b.Name)
+	if reader {
+		fmt.Printf("=== reader reclaim: %s loses its device reading a file, %s's write-open reclaims its bit ===\n", a.Name, b.Name)
+	} else {
+		fmt.Printf("=== fence reclaim: %s loses its device holding a lock, %s reclaims it ===\n", a.Name, b.Name)
+	}
 
 	// Compress the cluster timing on BOTH nodes. The defaults make the
 	// staleness window ~60s, which this scenario would spend waiting;
@@ -4931,11 +4961,29 @@ func RunFenceReclaim(clients []*Client, baseDir string) (bool, error) {
 	// write. This is the claim b will reclaim, and reclaiming it is what
 	// bumps a's fence epoch.
 	var held OpenHoldResult
-	resp, err := a.Call("open_hold", OpenHoldArgs{Path: path, Mode: "rdwr", Create: true})
+	mode := "rdwr"
+	if reader {
+		mode = "rdonly"
+		if err := callOK(a, "write", WriteArgs{Path: path, Size: 8192, Stamp: "reader"}); err != nil {
+			return false, fmt.Errorf("setup write %s: %w", path, err)
+		}
+	}
+	resp, err := a.Call("open_hold", OpenHoldArgs{Path: path, Mode: mode, Create: !reader})
 	if err2 := decodeResult(a.Name, resp, err, &held); err2 != nil {
-		return false, fmt.Errorf("%s could not open %s for write: %v", a.Name, path, err2)
+		return false, fmt.Errorf("%s could not open %s (%s): %v", a.Name, path, mode, err2)
 	}
 	heldHandle = held.Handle
+	if reader {
+		// The bit must matter: a live reader keeps the writer out.
+		resp, err := b.Call("open_hold", OpenHoldArgs{Path: path, Mode: "rdwr"})
+		var h OpenHoldResult
+		if e := decodeResult(b.Name, resp, err, &h); e == nil {
+			_ = callOK(b, "close", CloseArgs{Handle: h.Handle})
+			check(&ok, "setup: a live reader on "+a.Name+" keeps "+b.Name+"'s writer out", false, "the write-open succeeded")
+			return false, nil
+		}
+		fmt.Printf("  setup: %s's write-open is refused while %s reads\n", b.Name, a.Name)
+	}
 
 	var snapA ProcSnapshotResult
 	resp, err = a.Call("proc_snapshot", ProcSnapshotArgs{Device: a.Device})
@@ -4985,8 +5033,16 @@ func RunFenceReclaim(clients []*Client, baseDir string) (bool, error) {
 		var bHeld OpenHoldResult
 		resp, err := b.Call("open_hold", OpenHoldArgs{Path: path, Mode: "rdwr"})
 		rErr := decodeResult(b.Name, resp, err, &bHeld)
-		check(&ok, fmt.Sprintf("%s reclaims the lock a stale %s was holding", b.Name, a.Name), rErr == nil,
+		what := "the lock"
+		if reader {
+			what = "the reader bit"
+		}
+		check(&ok, fmt.Sprintf("%s reclaims %s a stale %s was holding", b.Name, what, a.Name), rErr == nil,
 			fmt.Sprintf("open was refused: %v", rErr))
+		if rErr == nil && reader {
+			wresp, werr := b.Call("write_held", HeldIOArgs{Handle: bHeld.Handle, Offset: 0, Size: 4096, Stamp: "b-after"})
+			check(&ok, b.Name+" writes the file it took over", decodeResult(b.Name, wresp, werr, nil) == nil, fmt.Sprint(werr))
+		}
 		if rErr == nil {
 			if resp, err := b.Call("close", CloseArgs{Handle: bHeld.Handle}); err != nil {
 				_ = resp

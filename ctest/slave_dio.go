@@ -9,7 +9,9 @@ import (
 	"fmt"
 	"math/rand"
 	"os"
+	"os/exec"
 	"path/filepath"
+	"strings"
 	"sync"
 	"syscall"
 	"time"
@@ -75,6 +77,55 @@ func (s *Slave) doFallocate(a FallocateArgs) error {
 		return fmt.Errorf("fallocate: %w", ferr)
 	}
 	return cerr
+}
+
+// doChurn runs churn_io; a nonzero exit is a result (the oracle's
+// verdict), not an error.
+func (s *Slave) doChurn(a ChurnArgs) (ChurnResult, error) {
+	if a.Mode != "churn" && a.Mode != "verify" {
+		return ChurnResult{}, fmt.Errorf("churn mode %q", a.Mode)
+	}
+	root, err := s.resolvePath(a.Dir)
+	if err != nil {
+		return ChurnResult{}, err
+	}
+	if err := os.MkdirAll(root, 0o755); err != nil {
+		return ChurnResult{}, err
+	}
+	// Per test directory: actor ids repeat across runs, and a state left
+	// by an earlier run describes files that no longer exist.
+	state := filepath.Join(os.TempDir(), "ctest-churn-state", strings.ReplaceAll(a.Dir, "/", "_"))
+	if err := os.MkdirAll(state, 0o755); err != nil {
+		return ChurnResult{}, err
+	}
+	bin, err := s.helperPath("churn_io")
+	if err != nil {
+		return ChurnResult{}, err
+	}
+	args := []string{a.Mode, root, state}
+	if a.Mode == "churn" {
+		args = append(args, fmt.Sprint(a.Seed), fmt.Sprint(a.Actor), fmt.Sprint(a.Secs), fmt.Sprint(a.Files),
+			fmt.Sprint(a.MaxBlk))
+	} else {
+		args = append(args, fmt.Sprint(a.Actor))
+	}
+	cmd := exec.Command(bin, args...)
+	var out bytes.Buffer
+	cmd.Stdout = &out
+	cmd.Stderr = &out
+	err = cmd.Run()
+	res := ChurnResult{}
+	if ee, ok := err.(*exec.ExitError); ok {
+		res.ExitCode = ee.ExitCode()
+	} else if err != nil {
+		return ChurnResult{}, err
+	}
+	o := out.String()
+	if len(o) > 8192 {
+		o = o[len(o)-8192:]
+	}
+	res.Output = o
+	return res, nil
 }
 
 // doFstrim issues FITRIM on the mountpoint over the whole volume.
@@ -277,4 +328,22 @@ func (s *Slave) doVerifyBlocks(a VerifyBlocksArgs) (VerifyBlocksResult, error) {
 		}
 	}
 	return res, nil
+}
+
+// CETRAFS_IOC_DEFRAG: _IOR('C', 0x01, struct cetrafs_defrag_stats), three
+// u64s (include/cetrafs.h).
+const cetrafsIocDefrag = 2<<30 | 24<<16 | 'C'<<8 | 0x01
+
+func doDefragFile(path string) (DefragFileResult, error) {
+	f, err := os.OpenFile(path, os.O_RDWR, 0)
+	if err != nil {
+		return DefragFileResult{}, err
+	}
+	defer f.Close()
+	var st [3]uint64
+	if _, _, e := syscall.Syscall(syscall.SYS_IOCTL, f.Fd(), uintptr(cetrafsIocDefrag),
+		uintptr(unsafe.Pointer(&st[0]))); e != 0 {
+		return DefragFileResult{}, fmt.Errorf("defrag ioctl: %w", e)
+	}
+	return DefragFileResult{ExtentsBefore: st[0], ExtentsAfter: st[1], BlocksMoved: st[2]}, nil
 }

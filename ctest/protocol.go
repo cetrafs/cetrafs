@@ -544,6 +544,9 @@ type SetControlResult struct {
 // catches the common mistake.
 type FsckArgs struct {
 	Repair bool `json:"repair,omitempty"`
+	// Env: test hooks for the tool, NAME=value, whitelisted on the
+	// slave (fsckTestEnv).
+	Env []string `json:"env,omitempty"`
 }
 
 type FsckResult struct {
@@ -698,6 +701,27 @@ const (
 	fallocZeroRange = 0x10 // FALLOC_FL_ZERO_RANGE
 )
 
+// ChurnArgs: run tests/helpers/churn_io on this node -- the randomized
+// workload with a content oracle (tests/kernel/churn_oracle.sh). Mode
+// "churn" works Secs seconds on Files files under Dir (relative to the
+// mount) as actor Actor; "verify" checks every file the actor's state
+// says exists. The oracle's state lives on this node's own disk, so an
+// actor is verified on the node that ran it.
+type ChurnArgs struct {
+	Mode   string `json:"mode"`
+	Dir    string `json:"dir"`
+	Actor  int    `json:"actor"`
+	Seed   int64  `json:"seed,omitempty"`
+	Secs   int    `json:"secs,omitempty"`
+	Files  int    `json:"files,omitempty"`
+	MaxBlk int    `json:"maxblk,omitempty"`
+}
+
+type ChurnResult struct {
+	ExitCode int    `json:"exit_code"`
+	Output   string `json:"output"` // tail of its stdout+stderr
+}
+
 // FstrimArgs: FITRIM over the whole mount, as fstrim(8) does it.
 type FstrimArgs struct{}
 
@@ -770,4 +794,16 @@ type VerifyBlocksResult struct {
 	Garbage   int            `json:"garbage"`
 	Missing   int            `json:"missing"` // Must blocks that did not read back as their stamp
 	Details   []string       `json:"details,omitempty"`
+}
+
+// DefragFileArgs: run CETRAFS_IOC_DEFRAG on Path through a write-open fd,
+// the way defrag.cetra does.
+type DefragFileArgs struct {
+	Path string `json:"path"`
+}
+
+type DefragFileResult struct {
+	ExtentsBefore uint64 `json:"extents_before"`
+	ExtentsAfter  uint64 `json:"extents_after"`
+	BlocksMoved   uint64 `json:"blocks_moved"`
 }
