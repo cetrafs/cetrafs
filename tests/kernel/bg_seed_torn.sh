@@ -22,7 +22,10 @@
 # the locked copy, and nonzero -- with still no damage -- in the control.
 #
 # The control (last): bg_seed_unlocked=1 copies without the lock, and the
-# same load must tear seeds.
+# same load must tear seeds. Flushes of one Block Group are serialised
+# since 2026-11-12 (the in-flight count, bg_flush_inflight_count), so the
+# control also lifts that (bg_flush_unserialised=1): the copy's lock still
+# matters there, a recount's CAS patches the same buffer unserialised.
 set -euo pipefail
 . "$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)/lib/harness.sh"
 require_root
@@ -71,10 +74,12 @@ log "under the locked seed: corruptions $C0 -> $C1, refused seeds $R0 -> $R1"
     fail "concurrent flushes of one Block Group counted $((C1 - C0)) corruption(s)"
 
 ct_param_set bg_seed_unlocked 1
+ct_param_set bg_flush_unserialised 1
 ct_param_set bg_seed_copy_stall_ms 150
 load unlocked
 ct_param_set bg_seed_copy_stall_ms 0
 ct_param_set bg_seed_unlocked 0
+ct_param_set bg_flush_unserialised 0
 C2="$(corrupt)"
 R2="$(refused)"
 log "with the seed copied unlocked: corruptions $C1 -> $C2, refused seeds $R1 -> $R2"

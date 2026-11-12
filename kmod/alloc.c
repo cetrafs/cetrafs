@@ -1789,16 +1789,55 @@ static bool cetrafs_bg_seed_unlocked;
 cetrafs_test_param(bg_seed_unlocked, cetrafs_bg_seed_unlocked, bool, 0644);
 MODULE_PARM_DESC(bg_seed_unlocked, "TEST ONLY: copy the BG free-delta seed without the buffer lock");
 
-int cetrafs_bg_apply_free_delta(struct super_block *sb, u32 bg_id, s64 delta)
+/* TEST ONLY: the next free-count flush pauses this long between taking
+ * a Block Group's delta and its CAS -- a slow SAN's round trip, held
+ * open (tests/kernel/bg_flush_inflight_count.sh). */
+static unsigned int cetrafs_bg_flush_stall_ms;
+cetrafs_test_param(bg_flush_stall_ms, cetrafs_bg_flush_stall_ms, uint, 0644);
+MODULE_PARM_DESC(bg_flush_stall_ms, "TEST ONLY: one BG free-count flush pauses between taking its delta and its CAS");
+
+int cetrafs_bg_apply_free_delta(struct super_block *sb, u32 bg_id)
 {
     const cetrafs_superblock_t *raw_sb = cetrafs_sb_raw(sb);
-    struct cetrafs_bg_count_ctx ctx = {.value = delta, .bg_id = bg_id};
+    struct cetrafs_bg_count_ctx ctx = {.bg_id = bg_id};
+    struct cetrafs_bg_geom geom;
+    s64 delta;
     int ret;
 
     if (!raw_sb)
         return -EINVAL;
     if (bg_id >= le32_to_cpu(raw_sb->block_group_count))
         return -EINVAL;
+
+    /* One flush of this Block Group at a time, and the count it starts
+     * from read under that right: readers see that count plus the delta
+     * for as long as the CAS is out (cetrafs_bg_chunk.bg_flight_gen).
+     * Neither failure has taken anything: the delta stays accrued, and
+     * is marked for the next flush (the caller cleared the mark). */
+    ret = cetrafs_sb_bg_flush_lock(sb, bg_id);
+    if (ret) {
+        cetrafs_sb_accrue_bg_free(sb, bg_id, 0);
+        return ret;
+    }
+    ret = cetrafs_read_bg_geom(sb, bg_id, &geom);
+    if (ret) {
+        cetrafs_sb_bg_flush_unlock(sb, bg_id);
+        cetrafs_sb_accrue_bg_free(sb, bg_id, 0);
+        return ret;
+    }
+    delta = cetrafs_sb_bg_flight_begin(sb, bg_id, (s64) geom.free_data_blocks);
+    if (!delta)
+        return 0;
+    ctx.value = delta;
+    {
+        unsigned int pause = xchg(&cetrafs_bg_flush_stall_ms, 0);
+
+        if (pause) {
+            pr_info("BG %u: free-count flush of %lld in flight, pausing %u ms (test)\n", bg_id, (long long) delta,
+                    pause);
+            msleep(pause); /* test-only; see the parameter */
+        }
+    }
 
     ctx.expect_seq = cetrafs_sb_bg_epoch(sb, bg_id);
 
@@ -1853,8 +1892,20 @@ int cetrafs_bg_apply_free_delta(struct super_block *sb, u32 bg_id, s64 delta)
         pr_err("BG %u: dropping the delta -- this node's free count for it is out of step with its bitmap, "
                "which a reconcile (or fsck) repairs\n",
                bg_id);
+        cetrafs_sb_bg_flight_end(sb, bg_id, 0);
         return 0;
     }
+    if (ret < 0) {
+        /* Real I/O trouble (a DROPPED stale delta is consumed inside
+         * the mutator, loudly): put the delta back rather than lose real
+         * accounting to a transient error -- and say so, since a delta
+         * stuck in memory is invisible in every other way. */
+        pr_err_ratelimited("BG %u free delta %lld could not be applied (%d) -- re-accrued for the next flush\n", bg_id,
+                           (long long) delta, ret);
+        cetrafs_sb_bg_flight_end(sb, bg_id, delta);
+        return ret;
+    }
+    cetrafs_sb_bg_flight_end(sb, bg_id, 0);
     return ret;
 }
 
@@ -4164,16 +4215,27 @@ int cetrafs_bg_data_block_stats(struct super_block *sb, u32 bg_id, u64 *out_tota
     s64 free;
     int ret;
 
-    ret = cetrafs_read_bg_geom(sb, bg_id, &bg);
-    if (ret)
-        return ret;
-
     /* Include this node's own accrued-but-unapplied delta (v0x0004: the
      * on-disk count no longer carries it between durability boundaries),
      * so the owner's own statfs and cetrafs_alloc_pick_bg() ranking see
      * their allocations immediately, exactly as the old dirty-buffer
-     * read did. Zero for every BG this node does not own. */
-    free = (s64) bg.free_data_blocks + cetrafs_sb_bg_pending_delta(sb, bg_id);
+     * read did. Zero for every BG this node does not own.
+     *
+     * And a delta on its way to the descriptor is in neither place: the
+     * settle takes the count that flush is writing instead, and sends us
+     * back to the descriptor if a flush began or ended while we read it
+     * (cetrafs_bg_chunk.bg_flight_gen). Two lock-free loads and one
+     * uncontended spinlock on the per-block path, no I/O. */
+    for (;;) {
+        u32 gen = cetrafs_sb_bg_flight_gen(sb, bg_id);
+
+        ret = cetrafs_read_bg_geom(sb, bg_id, &bg);
+        if (ret)
+            return ret;
+        if (cetrafs_sb_bg_free_settle(sb, bg_id, gen, (s64) bg.free_data_blocks, &free))
+            break;
+        cond_resched();
+    }
     *out_total = bg.data_block_count;
     *out_free = free > 0 ? (u64) free : 0;
     return 0;

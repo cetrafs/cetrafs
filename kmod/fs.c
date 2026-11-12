@@ -179,6 +179,30 @@ struct cetrafs_bg_chunk {
     atomic64_t bg_free_delta[CETRAFS_BGC_SIZE];
 
     /*
+     * A delta on its way to the descriptor. The flush takes it out of
+     * bg_free_delta before its CAS and the cached descriptor carries it
+     * only once the CAS is back, so for the length of one device round
+     * trip neither held it: a full Block Group read as free as its
+     * descriptor last said. The allocator picked it, found its bitmap
+     * full and recounted; a flush walking the owned groups kept one step
+     * ahead of a 1 TiB fallocate and spent every one of its retries, and
+     * it failed ENOSPC with half the volume free (UNMAP benchmark,
+     * 2026-11-12).
+     *
+     * So while a flush is in flight the readers take the count it is
+     * writing (bg_flight_free) instead of the descriptor. bg_flight_gen
+     * is odd for exactly that span, and a reader that sees it move while
+     * it reads the descriptor reads again. bg_flush_busy keeps one
+     * flush per Block Group at a time -- a second would start from the
+     * descriptor the first has not yet replaced.
+     * cetrafs_sb_bg_flight_begin()/_end()/_settle().
+     */
+    spinlock_t flight_lock;
+    u32 bg_flight_gen[CETRAFS_BGC_SIZE];
+    s64 bg_flight_free[CETRAFS_BGC_SIZE];
+    DECLARE_BITMAP(bg_flush_busy, CETRAFS_BGC_SIZE);
+
+    /*
      * Per-BG count of ALLOCATIONS (never frees). The background scrub's
      * verdict -- "this block is bitmap-set and referenced by nothing" --
      * is gathered by a pass that reads one uncached record per allocated
@@ -946,6 +970,7 @@ static struct cetrafs_bg_layout *cetrafs_layout_alloc(const cetrafs_superblock_t
             kvfree(l);
             return NULL;
         }
+        spin_lock_init(&l->chunk[ci]->flight_lock);
     }
     if (prev) {
         l->total_data_blocks = prev->total_data_blocks;
@@ -6013,6 +6038,161 @@ s64 cetrafs_sb_bg_pending_delta(struct super_block *sb, u32 bg_id)
     return c ? atomic64_read(&c->bg_free_delta[i]) : 0;
 }
 
+/* TEST ONLY: readers ignore a flush in flight and add only the delta
+ * still accrued -- the old view, the negative control for
+ * tests/kernel/bg_flush_inflight_count.sh. */
+static bool cetrafs_bg_flight_ignored;
+cetrafs_test_param(bg_flight_ignored, cetrafs_bg_flight_ignored, bool, 0644);
+MODULE_PARM_DESC(bg_flight_ignored, "TEST ONLY: a BG count read ignores a flush in flight (the old view)");
+
+/* The flight generation to pass to cetrafs_sb_bg_free_settle(), read
+ * BEFORE the descriptor. */
+u32 cetrafs_sb_bg_flight_gen(struct super_block *sb, u32 bg_id)
+{
+    struct cetrafs_bg_chunk *c;
+    u32 i;
+
+    c = cetrafs_bgc(sb->s_fs_info, bg_id, &i);
+    return c ? smp_load_acquire(&c->bg_flight_gen[i]) : 0;
+}
+
+/*
+ * This node's view of BG #bg_id's free count, given the count 'desc' its
+ * descriptor said after cetrafs_sb_bg_flight_gen() returned 'gen': the
+ * descriptor plus what is still accrued -- or, while a flush is in
+ * flight, the count that flush is writing plus what is still accrued.
+ * false when a flush began or ended in between: read the descriptor
+ * again. See cetrafs_bg_chunk.bg_flight_gen.
+ */
+bool cetrafs_sb_bg_free_settle(struct super_block *sb, u32 bg_id, u32 gen, s64 desc, s64 *out)
+{
+    struct cetrafs_bg_chunk *c;
+    u32 i;
+    bool ok = true;
+
+    c = cetrafs_bgc(sb->s_fs_info, bg_id, &i);
+    if (!c) {
+        *out = desc;
+        return true;
+    }
+    /* PERF(1): the per-block path, so no lock when no flush is in
+     * flight -- the almost-always case. A begin makes the generation odd
+     * BEFORE its xchg takes the delta (the xchg is fully ordered): a
+     * read of the delta that missed it is followed by a re-read of the
+     * generation that sees the change. docs/PERFORMANCE.md */
+    if (!(gen & 1)) {
+        s64 v = desc + atomic64_read(&c->bg_free_delta[i]);
+
+        smp_rmb();
+        if (READ_ONCE(c->bg_flight_gen[i]) != gen)
+            return false;
+        *out = v;
+        return true;
+    }
+    spin_lock(&c->flight_lock);
+    if (c->bg_flight_gen[i] != gen)
+        ok = false;
+    else if ((gen & 1) && !READ_ONCE(cetrafs_bg_flight_ignored))
+        *out = c->bg_flight_free[i] + atomic64_read(&c->bg_free_delta[i]);
+    else
+        *out = desc + atomic64_read(&c->bg_free_delta[i]);
+    spin_unlock(&c->flight_lock);
+    return ok;
+}
+
+/*
+ * Begin flushing BG #bg_id's accrued delta: wait out another flush of
+ * it, then take the delta and publish the count it will make, 'desc'
+ * being the count the descriptor holds now. Returns the delta taken; 0
+ * means nothing to flush and no flight to end.
+ */
+s64 cetrafs_sb_bg_flight_begin(struct super_block *sb, u32 bg_id, s64 desc)
+{
+    struct cetrafs_bg_chunk *c;
+    s64 delta;
+    u32 i;
+
+    c = cetrafs_bgc(sb->s_fs_info, bg_id, &i);
+    if (!c)
+        return 0;
+    spin_lock(&c->flight_lock);
+    /* Odd first, then take the delta: see cetrafs_sb_bg_free_settle()'s
+     * lock-free path. A reader that sees odd takes this lock, so it never
+     * sees the flight half set up; nothing taken, the flight is undone
+     * before the lock drops. */
+    WRITE_ONCE(c->bg_flight_gen[i], c->bg_flight_gen[i] + 1);
+    delta = atomic64_xchg(&c->bg_free_delta[i], 0);
+    if (delta)
+        c->bg_flight_free[i] = desc + delta;
+    else
+        smp_store_release(&c->bg_flight_gen[i], c->bg_flight_gen[i] + 1);
+    spin_unlock(&c->flight_lock);
+    if (!delta)
+        cetrafs_sb_bg_flush_unlock(sb, bg_id);
+    return delta;
+}
+
+/* TEST ONLY: flushes of one Block Group are not serialised. The seed
+ * copy's buffer lock is then the only thing between two of them, which
+ * is what tests/kernel/bg_seed_torn.sh's control needs to reach; the
+ * flight bookkeeping is not meant to survive it. */
+static bool cetrafs_bg_flush_unserialised;
+cetrafs_test_param(bg_flush_unserialised, cetrafs_bg_flush_unserialised, bool, 0644);
+MODULE_PARM_DESC(bg_flush_unserialised, "TEST ONLY: two flushes of one BG's free count may run at once");
+
+/* Wait for, and take, the right to flush BG #bg_id. Interruptible by a
+ * fatal signal only (-EINTR); the holder is one CAS away from letting go. */
+int cetrafs_sb_bg_flush_lock(struct super_block *sb, u32 bg_id)
+{
+    struct cetrafs_bg_chunk *c;
+    u32 i;
+
+    c = cetrafs_bgc(sb->s_fs_info, bg_id, &i);
+    if (!c || READ_ONCE(cetrafs_bg_flush_unserialised))
+        return 0;
+    return wait_on_bit_lock(c->bg_flush_busy, i, TASK_KILLABLE) ? -EINTR : 0;
+}
+
+/* Give the flush right back without having begun (the descriptor could
+ * not be read). */
+void cetrafs_sb_bg_flush_unlock(struct super_block *sb, u32 bg_id)
+{
+    struct cetrafs_bg_chunk *c;
+    u32 i;
+
+    c = cetrafs_bgc(sb->s_fs_info, bg_id, &i);
+    if (!c)
+        return;
+    clear_bit_unlock(i, c->bg_flush_busy);
+    smp_mb__after_atomic();
+    wake_up_bit(c->bg_flush_busy, i);
+}
+
+/*
+ * End the flight cetrafs_sb_bg_flight_begin() started, once the CAS is
+ * back and the cached descriptor holds whatever it committed. 'requeue'
+ * is a delta that did not reach the device and goes back to be flushed
+ * again; it is put back in the same step that ends the flight, so no
+ * reader sees it in neither place.
+ */
+void cetrafs_sb_bg_flight_end(struct super_block *sb, u32 bg_id, s64 requeue)
+{
+    struct cetrafs_bg_chunk *c;
+    u32 i;
+
+    c = cetrafs_bgc(sb->s_fs_info, bg_id, &i);
+    if (!c)
+        return;
+    spin_lock(&c->flight_lock);
+    if (requeue) {
+        atomic64_add(requeue, &c->bg_free_delta[i]);
+        set_bit(i, c->bg_free_dirty);
+    }
+    smp_store_release(&c->bg_flight_gen[i], c->bg_flight_gen[i] + 1);
+    spin_unlock(&c->flight_lock);
+    cetrafs_sb_bg_flush_unlock(sb, bg_id);
+}
+
 /* The BG count's ownership epoch (see struct cetrafs_bg_chunk.bg_count_epoch). */
 u64 cetrafs_sb_bg_epoch(struct super_block *sb, u32 bg_id)
 {
@@ -6488,32 +6668,21 @@ int cetrafs_flush_dirty_free_counts(struct super_block *sb)
 
     for (bg_id = cetrafs_bgc_next_bit(sbi, offsetof(struct cetrafs_bg_chunk, bg_free_dirty), 0); bg_id != U32_MAX;
          bg_id = cetrafs_bgc_next_bit(sbi, offsetof(struct cetrafs_bg_chunk, bg_free_dirty), bg_id + 1)) {
-        /* Take the whole accrued delta in one go -- same reasoning as
-         * the ZG loop below. */
+        /* The apply takes the whole accrued delta in one go -- same
+         * reasoning as the ZG loop below -- and on real I/O trouble puts
+         * it back for the next flush (cetrafs_sb_bg_flight_end()). */
         struct cetrafs_bg_chunk *c;
-        s64 delta;
         u32 i;
         int rc;
 
         c = cetrafs_bgc(sbi, bg_id, &i);
         clear_bit(i, c->bg_free_dirty);
-        delta = atomic64_xchg(&c->bg_free_delta[i], 0);
-        if (!delta)
+        if (!atomic64_read(&c->bg_free_delta[i]))
             continue;
 
-        rc = cetrafs_bg_apply_free_delta(sb, bg_id, delta);
-        if (rc < 0) {
-            /* Real I/O trouble (a DROPPED stale delta is consumed inside
-             * the apply, loudly): put the delta back rather than lose
-             * real accounting to a transient error -- and say so, since
-             * a delta stuck in memory is invisible in every other way. */
-            pr_err_ratelimited("BG %u free delta %lld could not be applied (%d) -- re-accrued for the next flush\n",
-                               bg_id, (long long) delta, rc);
-            atomic64_add(delta, &c->bg_free_delta[i]);
-            set_bit(i, c->bg_free_dirty);
-            if (!ret)
-                ret = rc;
-        }
+        rc = cetrafs_bg_apply_free_delta(sb, bg_id);
+        if (rc < 0 && !ret)
+            ret = rc;
     }
 
     for (zg_id = 0; zg_id < sbi->zg_count; zg_id++) {

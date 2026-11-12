@@ -479,6 +479,12 @@ int cetrafs_alloc_flush_bitmaps_if_dirty(struct super_block *sb);
 void cetrafs_sb_accrue_bg_free(struct super_block *sb, u32 bg_id, s64 delta);
 u64 cetrafs_sb_bg_alloc_seq(struct super_block *sb, u32 bg_id);
 s64 cetrafs_sb_bg_pending_delta(struct super_block *sb, u32 bg_id);
+u32 cetrafs_sb_bg_flight_gen(struct super_block *sb, u32 bg_id);
+bool cetrafs_sb_bg_free_settle(struct super_block *sb, u32 bg_id, u32 gen, s64 desc, s64 *out);
+int cetrafs_sb_bg_flush_lock(struct super_block *sb, u32 bg_id);
+void cetrafs_sb_bg_flush_unlock(struct super_block *sb, u32 bg_id);
+s64 cetrafs_sb_bg_flight_begin(struct super_block *sb, u32 bg_id, s64 desc);
+void cetrafs_sb_bg_flight_end(struct super_block *sb, u32 bg_id, s64 requeue);
 u64 cetrafs_sb_bg_epoch(struct super_block *sb, u32 bg_id);
 void cetrafs_sb_set_bg_epoch(struct super_block *sb, u32 bg_id, u64 seq);
 void cetrafs_sb_accrue_zg_free(struct super_block *sb, u32 zg_id, s64 delta);
@@ -971,7 +977,7 @@ int cetrafs_bg_reconcile_free_count(struct super_block *sb, u32 bg_id, s64 *out_
 /* Apply one accrued BG free-count delta as an epoch-guarded CAS. 0 means
  * consumed (applied, or loudly dropped as stale); negative only for real
  * I/O trouble, where the caller re-accrues. */
-int cetrafs_bg_apply_free_delta(struct super_block *sb, u32 bg_id, s64 delta);
+int cetrafs_bg_apply_free_delta(struct super_block *sb, u32 bg_id);
 /* Seed this node's in-memory count epoch for every BG of a ZG whose
  * ownership entered the cache WITHOUT a reconcile (the tick re-attach
  * path) -- deltas accrued under an unseeded epoch would all be dropped. */
