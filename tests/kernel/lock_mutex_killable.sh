@@ -7,8 +7,8 @@
 # defrag pin then waited for it in a plain mutex_lock: unkillable, in D,
 # for as long as that took (audit R21). They wait killably now; the
 # heartbeat's retry passes try the mutex and re-queue instead of
-# queueing behind it. NOT covered: the killed process's own close, which
-# must take lock_mutex to publish and release, still waits for it.
+# queueing behind it. The killed process's own close, which also needs
+# lock_mutex, is deferred to a work item (close_dying_defers.sh).
 #
 # Staged on a nofilelock mount: row 1 holds the file's lock and is
 # stale; flock A reclaims it and is held inside lock_mutex just before
@@ -78,7 +78,9 @@ if [ "$ST" != D ]; then
 else
     kill -9 "$PB"
     sleep 1
-    STK="$(cat "/proc/$PB/stack" 2>/dev/null | tr '\n' ' ')"
+    # B may be gone already: a killed task's close is deferred to a work
+    # item when lock_mutex is busy (close_dying_defers.sh).
+    STK="$(cat "/proc/$PB/stack" 2>/dev/null | tr '\n' ' ' || true)"
     A_ALIVE=0
     [ "$(awk '{print $3}' "/proc/$PA/stat" 2>/dev/null)" = D ] && A_ALIVE=1
     log "1 s after SIGKILL: B $( [ -n "$STK" ] && echo "at: $STK" || echo gone); A still inside the reclaim: $A_ALIVE"
@@ -88,9 +90,8 @@ else
     else
         pass "SIGKILL ended the queued flock's wait for lock_mutex while the reclaim still held it"
     fi
-    # Its close still takes lock_mutex: close publishes and releases
-    # (cetrafs_lock_release()), so a dying process waits there -- not
-    # claimed killable here.
+    # Its close needs lock_mutex too; for a killed task that is handed
+    # to a work item (cetrafs_lock_release(), close_dying_defers.sh).
     wait "$PB" 2>/dev/null || true
 fi
 kill -9 "$PA" "$PB" 2>/dev/null || true
