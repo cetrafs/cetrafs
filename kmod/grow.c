@@ -33,10 +33,13 @@
  *      lands first, the same rule a Block Group release follows (a
  *      debit always follows the credit it consumes; class 34). A crash
  *      after this and before 3 leaves the pool OVERSTATING free space by
- *      capacity no superblock counts: df too high, a claim finding
- *      nothing to take, fsck reporting the shard and -r recounting it.
- *      Same window and same direction as a release that dies between
- *      its credit and its descriptor swap.
+ *      capacity no superblock counts -- so each credit is NAMED in its
+ *      shard (pool_grow_gen/id/credit, cetrafs_zone_group_t), and a
+ *      named credit above the published layout_gen with no growfs claim
+ *      held is taken back by id: by the next grow's step 1, by this
+ *      grow's own failure path, and at every mount
+ *      (cetrafs_grow_heal_pool()). A re-run replaces the dead credit
+ *      rather than stacking a second one on it.
  *   2. Link the new segment from the old tail (a second or later grow;
  *      a first grow's link IS the superblock). A crash here leaves a
  *      chain one segment longer than the count, which mount and fsck
@@ -139,38 +142,48 @@ static int cetrafs_grow_sb_mutate(void *image, unsigned int len, void *priv)
     return 0;
 }
 
-/* Take back the credits of shards [0, upto). Best effort: what cannot
- * be taken back leaves the pool overstating, which fsck reports and -r
- * recounts -- the direction step 1's comment describes. */
-static void cetrafs_grow_uncredit(struct super_block *sb, const struct cetrafs_grow_plan *plan, u32 upto)
+/* Take back this grow's credits, by its id: a shard that no longer
+ * names it is left alone. What cannot be taken back now (the CAS
+ * failed) is still named on the device, and the next grow or mount
+ * takes it back (cetrafs_grow_heal_pool()). */
+static void cetrafs_grow_uncredit(struct super_block *sb, const struct cetrafs_grow_plan *plan, u64 id)
 {
+    u64 gen = le64_to_cpu(plan->nw->layout_gen), took;
     u32 z;
 
-    for (z = 0; z < upto; z++)
-        if (plan->shard_credit[z] && cetrafs_zg_adjust_pool_blocks(sb, z, -(s64) plan->shard_credit[z]))
-            pr_warn("grow: pool shard %u keeps a credit of %llu it should not -- df will overstate until fsck -r\n",
-                    z, (unsigned long long) plan->shard_credit[z]);
+    for (z = 0; z < plan->nshards; z++)
+        if (plan->shard_credit[z] && cetrafs_zg_pool_grow_takeback(sb, z, gen, id, &took))
+            pr_warn("grow: pool shard %u keeps this grow's credit for now -- the next grow or mount takes it back\n",
+                    z);
 }
 
 int cetrafs_grow_commit(struct super_block *sb, const struct cetrafs_grow_plan *plan)
 {
     struct cetrafs_grow_sb_ctx sctx = {.cur = plan->cur, .nw = plan->nw};
     unsigned int stop = xchg(&cetrafs_grow_stop_after, 0);
+    u64 published = le64_to_cpu(plan->cur->layout_gen), gen = le64_to_cpu(plan->nw->layout_gen);
+    u64 id = get_random_u64() | 1, took;
     u32 z;
     int rc;
 
-    /* 1. The pool, shard by shard. A shard is a Zone Group record, keyed
-     * by bg_id % zone_group_count, so shard z is reached through any
-     * Block Group id with that remainder -- z itself. */
+    /* 1. The pool, shard by shard -- EVERY shard, not only those this
+     * grow credits: under the growfs claim no other grow is live, so a
+     * marker above the published layout_gen is a grow that died before
+     * publishing, and its credit comes back out in the same swap. A
+     * shard is a Zone Group record, keyed by bg_id % zone_group_count,
+     * so shard z is reached through any Block Group id with that
+     * remainder -- z itself. 'published' is the superblock this node
+     * refreshed to under the claim, which only a grow moves. */
     for (z = 0; z < plan->nshards; z++) {
-        if (!plan->shard_credit[z])
-            continue;
-        rc = cetrafs_zg_adjust_pool_blocks(sb, z, (s64) plan->shard_credit[z]);
+        rc = cetrafs_zg_pool_grow_credit(sb, z, published, gen, id, plan->shard_credit[z], &took);
         if (rc) {
             pr_err("grow: crediting pool shard %u failed (%d) -- nothing published\n", z, rc);
-            cetrafs_grow_uncredit(sb, plan, z);
+            cetrafs_grow_uncredit(sb, plan, id);
             return rc;
         }
+        if (took)
+            pr_warn("grow: pool shard %u held %llu blocks of a grow that never published -- taken back\n", z,
+                    (unsigned long long) took);
     }
     if (stop == 1) {
         pr_warn("grow: stopping after the pool credits (test)\n");
@@ -194,7 +207,7 @@ int cetrafs_grow_commit(struct super_block *sb, const struct cetrafs_grow_plan *
         if (rc) {
             pr_err("grow: linking the new segment from block %llu failed (%d) -- nothing published\n",
                    (unsigned long long) plan->tail_lba, rc);
-            cetrafs_grow_uncredit(sb, plan, plan->nshards);
+            cetrafs_grow_uncredit(sb, plan, id);
             return rc == -ESTALE ? -ESTALE : rc;
         }
     }
@@ -219,7 +232,7 @@ int cetrafs_grow_commit(struct super_block *sb, const struct cetrafs_grow_plan *
         /* Definitely not published. The link, if any, stays: a chain
          * one segment past the count is a grow that never published,
          * which mount accepts and the next grow replaces. */
-        cetrafs_grow_uncredit(sb, plan, plan->nshards);
+        cetrafs_grow_uncredit(sb, plan, id);
         return rc;
     }
     return 0;
@@ -239,7 +252,9 @@ int cetrafs_grow_commit(struct super_block *sb, const struct cetrafs_grow_plan *
  * nothing publishes while NO growfs claim is held. A dead growfs's row
  * would satisfy it, and also blocks every mount until it goes stale.
  */
-static int cetrafs_grow_claim_held(struct super_block *sb)
+/* 0 when a growfs claim is on the device, -EBUSY when none is, -EIO
+ * when the registry cannot be read (not knowing is not "none"). */
+static int cetrafs_grow_claim_present(struct super_block *sb)
 {
     const cetrafs_superblock_t *raw_sb = cetrafs_sb_raw(sb);
     cetrafs_node_entry_t ne;
@@ -258,8 +273,93 @@ static int cetrafs_grow_claim_held(struct super_block *sb)
         if (!strncmp(ne.label, "growfs", sizeof(ne.label)))
             return 0;
     }
-    pr_err("grow: no growfs claim on the volume -- refusing to publish\n");
     return -EBUSY;
+}
+
+static int cetrafs_grow_claim_held(struct super_block *sb)
+{
+    int rc = cetrafs_grow_claim_present(sb);
+
+    if (rc == -EBUSY)
+        pr_err("grow: no growfs claim on the volume -- refusing to publish\n");
+    return rc;
+}
+
+/* TEST ONLY: the mount's heal skips the pool (grow_live_crash.sh's
+ * control: the dead credit stays). */
+static bool cetrafs_grow_heal_off;
+cetrafs_test_param(grow_heal_off, cetrafs_grow_heal_off, bool, 0644);
+MODULE_PARM_DESC(grow_heal_off, "TEST ONLY: the mount does not take back a dead live grow's pool credit");
+
+/*
+ * Take back the pool credit of a live grow that died before publishing
+ * (cetrafs_grow_commit(), step 1). Run at mount, outside any grow.
+ *
+ * The verdict "dead" is three reads, in this order, and the order is
+ * the argument: the markers first; then no growfs claim present; then
+ * the superblock, fresh, below the marker's gen. A grower holds its
+ * claim from before it writes its marker until after its publish has
+ * landed or failed, so a marker seen BEFORE a look that finds no claim
+ * belongs to a grow that has finished -- and one whose gen the
+ * superblock read AFTER that has not reached never published. The
+ * take-back is then a CAS requiring the same id, so a grow that started
+ * since (a new claim, a new id) is never touched: it either replaced
+ * the marker first, and ours does nothing, or finds it gone and
+ * credits afresh. A superblock publish whose outcome its grower could
+ * not tell (a timed-out CAS) that lands only later leaves the pool
+ * UNDERSTATING -- the direction that never hands a block out twice.
+ */
+int cetrafs_grow_heal_pool(struct super_block *sb)
+{
+    const cetrafs_superblock_t *raw_sb = cetrafs_sb_raw(sb);
+    u64 *gen, *id, published, took;
+    u32 nz, z, dead = 0;
+    int rc;
+
+    if (!raw_sb)
+        return -EINVAL;
+    if (READ_ONCE(cetrafs_grow_heal_off))
+        return 0;
+    nz = le32_to_cpu(raw_sb->zone_group_count);
+    gen = kcalloc(nz, sizeof(*gen), GFP_KERNEL);
+    id = kcalloc(nz, sizeof(*id), GFP_KERNEL);
+    rc = gen && id ? 0 : -ENOMEM;
+    for (z = 0; !rc && z < nz; z++) {
+        rc = cetrafs_zg_pool_grow_marker(sb, z, &gen[z], &id[z]);
+        if (!rc && gen[z] > le64_to_cpu(raw_sb->layout_gen))
+            dead++;
+    }
+    if (rc || !dead)
+        goto out;
+    rc = cetrafs_grow_claim_present(sb);
+    if (!rc) {
+        pr_info("%s: a pool credit names a grow that has not published, and a growfs claim is held -- leaving it\n",
+                sb->s_id);
+        goto out;
+    }
+    if (rc != -EBUSY)
+        goto out;
+    rc = cetrafs_sb_layout_refresh(sb);
+    if (rc < 0)
+        goto out;
+    rc = 0;
+    published = le64_to_cpu(cetrafs_sb_raw(sb)->layout_gen);
+    for (z = 0; z < nz; z++) {
+        int r;
+
+        if (gen[z] <= published)
+            continue;
+        r = cetrafs_zg_pool_grow_takeback(sb, z, gen[z], id[z], &took);
+        if (r)
+            rc = r;
+        else if (took)
+            pr_warn("%s: pool shard %u held %llu blocks of a live grow that never published -- taken back\n",
+                    sb->s_id, z, (unsigned long long) took);
+    }
+out:
+    kfree(gen);
+    kfree(id);
+    return rc;
 }
 
 long cetrafs_grow_ioctl(struct file *file, const cetrafs_superblock_t __user *arg)

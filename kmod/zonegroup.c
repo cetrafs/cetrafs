@@ -488,6 +488,150 @@ int cetrafs_zg_adjust_pool_blocks(struct super_block *sb, u32 bg_id, s64 delta)
     return cetrafs_cas_record(sb, le64_to_cpu(raw_sb->zg_table_start) + zg_id, cetrafs_zg_pool_mutate, &ctx);
 }
 
+/* ---- a live grow's pool credit, named (cetrafs_zone_group_t) --------
+ * A grow credits each shard before it publishes the superblock; the
+ * marker beside the count names the grow, so a credit whose grow never
+ * published is taken back exactly once and a re-run never stacks a
+ * second one on it (kmod/grow.c). */
+struct cetrafs_zg_grow_ctx {
+    u64 published_gen; /* credit: the layout_gen on the device, read under the growfs claim */
+    u64 gen, id;       /* the grow: what it publishes, and its random id */
+    u64 credit;        /* credit: what this shard gains; 0 = only heal */
+    u64 took;          /* out: a dead grow's credit taken back */
+};
+
+static void cetrafs_zg_grow_restamp(void *image)
+{
+    cetrafs_zone_group_t *zg = image;
+
+    zg->hot_checksum = cpu_to_le64(0);
+    zg->hot_checksum = cpu_to_le64((u64) cetrafs_zg_hot_crc(image));
+}
+
+/* Remove 'c' from the pool, at zero rather than below it: a pool that
+ * cannot give back what a grow added was already wrong, fsck's to
+ * report -- and understating is the direction that never hands out a
+ * block twice. */
+static void cetrafs_zg_grow_debit(cetrafs_zone_group_t *zg, u64 c)
+{
+    u64 cur = le64_to_cpu(zg->pool_free_blocks);
+
+    if (c > cur)
+        pr_err("ZG %u: a dead grow's pool credit (%llu) exceeds the shard (%llu) -- taking it to 0\n",
+               le16_to_cpu(zg->zg_id), (unsigned long long) c, (unsigned long long) cur);
+    zg->pool_free_blocks = cpu_to_le64(c > cur ? 0 : cur - c);
+}
+
+/* Step 1 of a grow, under its growfs claim: no other grow is live, so a
+ * marker above the published layout_gen is a dead grow's -- take its
+ * credit back in the same swap that records this one. */
+static int cetrafs_zg_grow_credit_mutate(void *image, unsigned int len, void *priv)
+{
+    struct cetrafs_zg_grow_ctx *ctx = priv;
+    cetrafs_zone_group_t *zg = image;
+    u64 p, x;
+
+    (void) len;
+    ctx->took = 0;
+    if (!cetrafs_zg_image_ok(image)) {
+        pr_warn_ratelimited("ZG CAS: the record on the device fails its checksum -- refusing to stamp a fresh one\n");
+        return -EUCLEAN;
+    }
+    p = le64_to_cpu(zg->pool_grow_gen);
+    x = le64_to_cpu(zg->pool_grow_id);
+    if (p == ctx->gen && x == ctx->id)
+        return 1; /* this grow's credit is already here: an earlier attempt landed */
+    if (p > ctx->published_gen) {
+        ctx->took = le64_to_cpu(zg->pool_grow_credit);
+        cetrafs_zg_grow_debit(zg, ctx->took);
+        zg->pool_grow_gen = zg->pool_grow_id = zg->pool_grow_credit = cpu_to_le64(0);
+    } else if (!ctx->credit) {
+        return 1; /* settled or none, and nothing to add */
+    }
+    if (ctx->credit) {
+        zg->pool_free_blocks = cpu_to_le64(le64_to_cpu(zg->pool_free_blocks) + ctx->credit);
+        zg->pool_grow_gen = cpu_to_le64(ctx->gen);
+        zg->pool_grow_id = cpu_to_le64(ctx->id);
+        zg->pool_grow_credit = cpu_to_le64(ctx->credit);
+    }
+    cetrafs_zg_grow_restamp(image);
+    return 0;
+}
+
+/* Take back the credit of exactly the grow (gen, id), if it is still
+ * the one the shard names; anything else is left alone. */
+static int cetrafs_zg_grow_takeback_mutate(void *image, unsigned int len, void *priv)
+{
+    struct cetrafs_zg_grow_ctx *ctx = priv;
+    cetrafs_zone_group_t *zg = image;
+
+    (void) len;
+    ctx->took = 0;
+    if (!cetrafs_zg_image_ok(image)) {
+        pr_warn_ratelimited("ZG CAS: the record on the device fails its checksum -- refusing to stamp a fresh one\n");
+        return -EUCLEAN;
+    }
+    if (le64_to_cpu(zg->pool_grow_gen) != ctx->gen || le64_to_cpu(zg->pool_grow_id) != ctx->id)
+        return 1; /* taken back already, or replaced by a later grow */
+    ctx->took = le64_to_cpu(zg->pool_grow_credit);
+    cetrafs_zg_grow_debit(zg, ctx->took);
+    zg->pool_grow_gen = zg->pool_grow_id = zg->pool_grow_credit = cpu_to_le64(0);
+    cetrafs_zg_grow_restamp(image);
+    return 0;
+}
+
+int cetrafs_zg_pool_grow_credit(struct super_block *sb, u32 zg_id, u64 published_gen, u64 gen, u64 id, u64 credit,
+                                u64 *took)
+{
+    const cetrafs_superblock_t *raw_sb = cetrafs_sb_raw(sb);
+    struct cetrafs_zg_grow_ctx ctx = {.published_gen = published_gen, .gen = gen, .id = id, .credit = credit};
+    int rc;
+
+    *took = 0;
+    if (!raw_sb || zg_id >= le32_to_cpu(raw_sb->zone_group_count))
+        return -EINVAL;
+    rc = cetrafs_cas_record(sb, le64_to_cpu(raw_sb->zg_table_start) + zg_id, cetrafs_zg_grow_credit_mutate, &ctx);
+    if (rc == 1)
+        rc = 0;
+    if (!rc)
+        *took = ctx.took;
+    return rc;
+}
+
+int cetrafs_zg_pool_grow_takeback(struct super_block *sb, u32 zg_id, u64 gen, u64 id, u64 *took)
+{
+    const cetrafs_superblock_t *raw_sb = cetrafs_sb_raw(sb);
+    struct cetrafs_zg_grow_ctx ctx = {.gen = gen, .id = id};
+    int rc;
+
+    *took = 0;
+    if (!raw_sb || zg_id >= le32_to_cpu(raw_sb->zone_group_count))
+        return -EINVAL;
+    rc = cetrafs_cas_record(sb, le64_to_cpu(raw_sb->zg_table_start) + zg_id, cetrafs_zg_grow_takeback_mutate, &ctx);
+    if (rc == 1)
+        rc = 0;
+    if (!rc)
+        *took = ctx.took;
+    return rc;
+}
+
+/* The grow a shard names, read fresh: *gen 0 when none. */
+int cetrafs_zg_pool_grow_marker(struct super_block *sb, u32 zg_id, u64 *gen, u64 *id)
+{
+    cetrafs_zone_group_t *zg = kmalloc(sizeof(*zg), GFP_KERNEL);
+    int ret;
+
+    if (!zg)
+        return -ENOMEM;
+    ret = cetrafs_read_zg(sb, zg_id, zg);
+    if (!ret) {
+        *gen = le64_to_cpu(zg->pool_grow_gen);
+        *id = le64_to_cpu(zg->pool_grow_id);
+    }
+    kfree(zg);
+    return ret;
+}
+
 int cetrafs_zg_apply_free_delta(struct super_block *sb, u32 zg_id, s64 delta)
 {
     const cetrafs_superblock_t *raw_sb = cetrafs_sb_raw(sb);

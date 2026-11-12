@@ -945,6 +945,7 @@ struct cetrafs_grow_plan {
 int cetrafs_sb_layout_grow(struct super_block *sb, const cetrafs_superblock_t *nw);
 int cetrafs_grow_commit(struct super_block *sb, const struct cetrafs_grow_plan *plan);
 long cetrafs_grow_ioctl(struct file *file, const cetrafs_superblock_t __user *arg);
+int cetrafs_grow_heal_pool(struct super_block *sb);
 u32 cetrafs_bgseg_crc(const cetrafs_bg_segment_t *seg);
 u32 cetrafs_bgseg_crc_prefix(const void *img, unsigned int len);
 u64 cetrafs_layout_refresh_count(void);
@@ -1081,6 +1082,10 @@ struct cetrafs_zg_info {
 int cetrafs_zg_get_info(struct super_block *sb, u32 zg_id, struct cetrafs_zg_info *out);
 int cetrafs_zg_adjust_free_blocks(struct super_block *sb, u32 zg_id, s64 delta);
 int cetrafs_zg_apply_free_delta(struct super_block *sb, u32 zg_id, s64 delta);
+int cetrafs_zg_pool_grow_credit(struct super_block *sb, u32 zg_id, u64 published_gen, u64 gen, u64 id, u64 credit,
+                                u64 *took);
+int cetrafs_zg_pool_grow_takeback(struct super_block *sb, u32 zg_id, u64 gen, u64 id, u64 *took);
+int cetrafs_zg_pool_grow_marker(struct super_block *sb, u32 zg_id, u64 *gen, u64 *id);
 int cetrafs_zg_adjust_pool_blocks(struct super_block *sb, u32 bg_id, s64 delta);
 loff_t cetrafs_max_file_size_for(u64 data_blocks);
 

@@ -9,14 +9,25 @@
 # leave it. What each must leave, as the code's comment states it:
 #
 #  1. credits only: the old volume, intact and writable; the pool
-#     OVERSTATES free space by what the grow would have added -- the
-#     same direction as a Block Group release that dies between its
-#     credit and its swap -- so fsck reports the shard and nothing
-#     else, and -r recounts it.
+#     OVERSTATES free space by what the grow would have added, and each
+#     shard NAMES that credit (pool_grow_gen/id/credit). fsck reports
+#     the shard and the dead credit and nothing else. Then each of the
+#     three ways the credit comes back out:
+#       1  the next MOUNT takes it back (control: grow_heal_off=1 and
+#          the mount leaves it; fsck still reports it);
+#       1b a re-run of the grow replaces it rather than stacking a
+#          second credit on it -- fsck clean after the finished grow;
+#       1c fsck -r recounts the pool AND clears the marker, so the
+#          mount after it does not take the credit back a second time.
 #  2. credits and link: the chain is one segment past the count. Mount
 #     and fsck accept it at the OLD size and say so (it is what every
 #     node sees between a live grow's last two writes); running growfs
 #     again finishes the grow.
+#
+# DISCRIMINATION: with the mount's heal off throughout (grow_heal_off),
+# 1 fails; with step 1 crediting without replacing a dead credit, 1b's
+# fsck reports the pool overstated; with fsck -r leaving the marker,
+# 1c's mount takes the credit back again (2026-11-12).
 #
 # And a segment linked past the count that is NOT a grow's next segment
 # is still refused, by the mount and by fsck: acceptance is exactly as
@@ -33,6 +44,7 @@ MNT="$(ct_mnt growcrash)"
 WORK="$(ct_mnt growcrashwork)"
 ct_track mnt "$MNT"
 ct_param_set grow_stop_after 0
+ct_param_set grow_heal_off 0
 
 info() { sed -n "s/^$1: //p" "$(ct_procdir "$DEV")/info"; }
 sb_sum() { dd if="$DEV" bs=4096 count=1 iflag=direct status=none | md5sum; }
@@ -43,7 +55,7 @@ verify() {
 }
 only_pool_errs() { # fsck output -> 0 if every ERR is about a pool shard
     local errs; errs="$(grep ERR <<<"$1" || true)"
-    [ -n "$errs" ] && ! grep -v 'pool_free_blocks' <<<"$errs" | grep -q .
+    [ -n "$errs" ] && ! grep -v -e 'pool_free_blocks' -e 'pool credit' <<<"$errs" | grep -q .
 }
 
 ct_mkfs "$DEV" -s 600M -b 512 -z 1 -J 0 -N 1024 -f >/dev/null
@@ -56,11 +68,11 @@ out="$(ct_growfs "$DEV" -s 1400M 2>&1)" ||
 pass "setup: a first live grow (later grows then link from a tail segment)"
 
 # --------------------------------------------------- 1: credits, no link
-stopped() { # <n> <tag>
+stopped() { # <n> <tag> <size>
     local gen0 sum0 out
     gen0="$(info layout_gen)"; sum0="$(sb_sum)"
     ct_param_set grow_stop_after "$1"
-    if out="$(ct_growfs "$DEV" -s 2100M 2>&1)"; then
+    if out="$(ct_growfs "$DEV" -s "$3" 2>&1)"; then
         fail "$2: setup: the grow completed although it was told to stop after write $1"
         return 1
     fi
@@ -74,21 +86,64 @@ stopped() { # <n> <tag>
         fail "$2: the volume stopped taking writes"
 }
 
-log "1: a grow stopped after its pool credits"
-stopped 1 "credits" || ct_exit
+dead_credit() { # <tag>: fsck (offline) reports the dead credit and nothing but the pool
+    local out
+    out="$(ct_fsck "$DEV" 2>&1)" && { fail "$1: fsck is clean -- the credits never reached the pool (setup)"; return; }
+    grep -q 'never published' <<<"$out" || { fail "$1: fsck does not name the dead grow's credit"; return; }
+    only_pool_errs "$out" && pass "$1: fsck reports the overstated pool and the dead grow's credit, nothing else" ||
+        fail "$1: fsck reports more than the pool: $(grep -m3 ERR <<<"$out" | tr '\n' ' ')"
+}
+clean() { # <tag> <what>
+    local out
+    out="$(ct_fsck "$DEV" 2>&1)" && pass "$1: $2" ||
+        fail "$1: not clean: $(grep -m3 ERR <<<"$out" | tr '\n' ' ')"
+}
+
+log "1: a grow stopped after its pool credits; the next mount takes them back"
+stopped 1 "credits" 2100M || ct_exit
 verify "credits"
 ct_umount "$MNT"
-out="$(ct_fsck "$DEV" 2>&1)" && fail "credits: fsck is clean -- the credits never reached the pool (setup)" ||
-    { only_pool_errs "$out" && pass "credits: fsck reports the overstated pool shard and nothing else" ||
-        fail "credits: fsck reports more than the pool: $(grep -m3 ERR <<<"$out" | tr '\n' ' ')"; }
+dead_credit "credits"
+ct_param_set grow_heal_off 1
+ct_mount "$DEV" "$MNT"; ct_umount "$MNT"
+ct_param_set grow_heal_off 0
+dead_credit "credits: control (the mount's heal off)"
+mark="$(dmesg_mark)"
+ct_mount "$DEV" "$MNT"
+dmesg_since "$mark" | grep -q 'live grow that never published -- taken back' &&
+    pass "credits: the mount says it took the dead grow's credit back" ||
+    fail "credits: the mount said nothing about the dead grow's credit"
+ct_umount "$MNT"
+clean "credits" "after a mount, fsck is clean with no -r"
+ct_mount "$DEV" "$MNT"
+
+log "1b: a grow stopped after its credits, then run again to the end"
+stopped 1 "re-run" 2100M || ct_exit
+out="$(ct_growfs "$DEV" -s 2100M 2>&1)" && pass "re-run: the grow completed live the second time" ||
+    { fail "re-run: the second grow failed: $(tail -2 <<<"$out")"; ct_exit; }
+verify "re-run"
+ct_umount "$MNT"
+clean "re-run" "fsck is clean: the re-run replaced the dead credit, it did not add a second"
+ct_mount "$DEV" "$MNT"
+
+log "1c: fsck -r recounts a dead credit, and the next mount does not take it again"
+stopped 1 "repair" 2800M || ct_exit
+ct_umount "$MNT"
+dead_credit "repair"
 ct_fsck_repair "$DEV" >/dev/null 2>&1 || true
-out="$(ct_fsck "$DEV" 2>&1)" && pass "credits: fsck -r recounts it and the volume is clean" ||
-    fail "credits: still not clean after fsck -r: $(grep -m3 ERR <<<"$out" | tr '\n' ' ')"
+clean "repair" "fsck -r recounts the pool and clears the credit"
+mark="$(dmesg_mark)"
+ct_mount "$DEV" "$MNT"
+dmesg_since "$mark" | grep -q 'never published -- taken back' &&
+    fail "repair: the mount after fsck -r took a credit back again" ||
+    pass "repair: the mount after fsck -r finds nothing to take back"
+ct_umount "$MNT"
+clean "repair" "and fsck is still clean after that mount"
 ct_mount "$DEV" "$MNT"
 
 # ------------------------------------------------- 2: credits and link
 log "2: a grow stopped after linking its segment, before publishing"
-stopped 2 "link" || ct_exit
+stopped 2 "link" 2800M || ct_exit
 ct_umount "$MNT"
 mark="$(dmesg_mark)"
 if mount -t cetrafs "$DEV" "$MNT" 2>/dev/null; then
@@ -119,10 +174,9 @@ out="$(ct_fsck "$DEV" 2>&1)" && fail "2b: fsck accepts a pending segment that li
 dd if="$WORK/pending" of="$DEV" bs=4096 seek="$TAIL" count=1 oflag=direct conv=notrunc status=none # back to what the stopped grow left
 
 log "2c: running growfs again finishes the grow"
-ct_fsck_repair "$DEV" >/dev/null 2>&1 || true # the stopped grow's credits, recounted
-ct_mount "$DEV" "$MNT"
+ct_mount "$DEV" "$MNT" # its mount at step 2 already took the stopped grow's credits back
 gen0="$(info layout_gen)"; bgs0="$(info block_group_count)"
-out="$(ct_growfs "$DEV" -s 2100M 2>&1)" && pass "2c: the re-run completed live" ||
+out="$(ct_growfs "$DEV" -s 2800M 2>&1)" && pass "2c: the re-run completed live" ||
     fail "2c: the re-run failed: $(tail -2 <<<"$out")"
 [ "$(info layout_gen)" = "$((gen0 + 1))" ] && [ "$(info block_group_count)" -gt "$bgs0" ] &&
     pass "2c: the node is at layout_gen $((gen0 + 1)) with $(info block_group_count) Block Groups" ||

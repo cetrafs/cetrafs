@@ -1609,7 +1609,7 @@ cetrafs_lock_explicit_acquire final:a-peer-is-using-the-file-flock-cannot-promis
 cetrafs_fill_super final:a-mount-refused-with-its-reason-repair-running-no-caw-peer-or-a-rewrite
 cetrafs_check_second_mount final:a-second-mount-asking-for-options-the-first-lacks
 cetrafs_node_register final:a-twin-of-this-node-is-mounted
-cetrafs_grow_claim_held final:no-growfs-claim-the-tool-did-not-ask
+cetrafs_grow_claim_present final:no-growfs-claim-the-tool-did-not-ask
 cetrafs_lock_open final:test-injection-open_refresh_fail_once
 cetrafs_defrag_inode final:test-injection-defrag_fail_invalidate
 cetrafs_zg_drain_one final:test-injection-pf_drain_busy_region'

@@ -602,7 +602,27 @@ typedef struct {
      * correct -- every BG starts owned.
      */
     __le64 pool_free_blocks;
-    u8     hot_pad[CETRAFS_HOT_SECTOR - 36];
+    /*
+     * The live grow whose credit is in pool_free_blocks: a grow credits
+     * the pool BEFORE it publishes the superblock (kmod/grow.c, step 1),
+     * so a grow that stops in between leaves capacity in the pool that
+     * no published layout has. These name it, so it can be taken back
+     * exactly once and never stacked by a re-run:
+     *   pool_grow_gen    the layout_gen that grow would publish; 0: none
+     *   pool_grow_id     that grow's random id -- a take-back is a CAS
+     *                    that requires it unchanged, so it can never
+     *                    remove a later grow's credit
+     *   pool_grow_credit what it added here
+     * A marker whose gen the published superblock has reached is
+     * settled and inert. One above it is dead once no growfs claim is
+     * held: the next grow (under its claim), the grow's own failure
+     * path and every mount take it back; fsck -r clears it when it
+     * recounts the pool.
+     */
+    __le64 pool_grow_gen;
+    __le64 pool_grow_id;
+    __le64 pool_grow_credit;
+    u8     hot_pad[CETRAFS_HOT_SECTOR - 60];
 
     /* ===== COLD: bytes [CETRAFS_HOT_SECTOR, CETRAFS_BLOCK_SIZE) ===== */
     /*

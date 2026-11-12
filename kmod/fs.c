@@ -3311,6 +3311,18 @@ int cetrafs_fill_super(struct super_block *sb, struct fs_context *fc)
         spin_unlock(&sbi->cold_lock);
     }
 
+    /* After every failure point: a live grow that died between its pool
+     * credit and its publish left capacity in the pool that no layout
+     * has; take it back (grow.c). Not fatal: what is not taken back
+     * stays named on the device for the next mount or grow. */
+    if (!sb_rdonly(sb)) {
+        int hrc = cetrafs_grow_heal_pool(sb);
+
+        if (hrc)
+            pr_warn("%s: could not check the pool for a dead grow's credit (%d) -- the next mount or grow will\n",
+                    sb->s_id, hrc);
+    }
+
     /* What the device says about UNMAP, once, where an operator looks
      * first. The block layer's limits are the probe: a SCSI disk's come
      * from its Block Limits VPD page, read when the disk was attached. */

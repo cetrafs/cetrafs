@@ -3712,9 +3712,23 @@ int main(int argc, char **argv)
             memcpy(&zg, zblk, sizeof(zg));
             int agg_ok = cetrafs_le64(zg.free_data_blocks) == zg_free_truth[z];
             int pool_ok = cetrafs_le64(zg.pool_free_blocks) == zg_pool_truth[z];
+            /* A live grow names its pool credit before it publishes
+             * (kmod/grow.c); one above the published layout_gen never
+             * did. The count is recounted below either way -- the
+             * marker must go WITH it, or a later mount takes the credit
+             * back a second time from the recounted pool. */
+            int grow_dead = cetrafs_le64(zg.pool_grow_gen) > cetrafs_le64(sb.layout_gen);
 
-            if (agg_ok && pool_ok)
+            if (agg_ok && pool_ok && !grow_dead)
                 continue;
+            if (grow_dead) {
+                fprintf(stderr,
+                        "ERR: ZG%u names the pool credit (%" PRIu64 " blocks) of a live grow to layout_gen %" PRIu64
+                        " that never published (the volume is at %" PRIu64 ")\n",
+                        z, (uint64_t) cetrafs_le64(zg.pool_grow_credit), (uint64_t) cetrafs_le64(zg.pool_grow_gen),
+                        (uint64_t) cetrafs_le64(sb.layout_gen));
+                problems++;
+            }
             if (!pool_ok) {
                 fprintf(stderr,
                         "ERR: ZG%u pool_free_blocks %" PRIu64 " != %" PRIu64
@@ -3734,6 +3748,8 @@ int main(int argc, char **argv)
             if (repair_mode && !repair_blocked) {
                 zg.free_data_blocks = cetrafs_cpu_to_le64(zg_free_truth[z]);
                 zg.pool_free_blocks = cetrafs_cpu_to_le64(zg_pool_truth[z]);
+                if (grow_dead)
+                    zg.pool_grow_gen = zg.pool_grow_id = zg.pool_grow_credit = 0;
                 /* free_data_blocks is a HOT field (v0x0008): only the
                  * hot half's checksum covers it. */
                 zg.hot_checksum = 0;
