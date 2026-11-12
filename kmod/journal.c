@@ -1989,6 +1989,8 @@ static int __cetrafs_journal_replay_node(struct super_block *sb, u32 node_id, bo
     u64 area_start, slots, s, park_seq = 0;
     struct cetrafs_journal_replay_entry *entries;
     u32 count = 0, applied = 0, my_node_id = 0;
+    bool *done = NULL, final_pass = false;
+    unsigned int pass = 0;
     bool dirty = false, claimed = false;
     int ret, werr_consume;
 
@@ -2233,9 +2235,34 @@ static int __cetrafs_journal_replay_node(struct super_block *sb, u32 node_id, bo
     if (count)
         sort(entries, count, sizeof(*entries), cetrafs_journal_replay_cmp, NULL);
 
+    /*
+     * In passes. A boundary is ONE atomic batch (cetrafs_journal_write_
+     * deferred()), and it can hold a NEW tree block together with the
+     * index entry that makes it reachable: the owner check of the new
+     * block then fails until that index is redone, whatever order the
+     * txn ids put them in. Refused on the first look, the batch was
+     * applied in part -- an index naming leaves never written -- and the
+     * writes those leaves mapped were gone after a crash at the worst
+     * point (tests/kernel/convert_split_no_flush.sh, part 4). So an entry
+     * refused ONLY by the owner check waits for the next pass, and passes
+     * repeat while one of them redoes something; once one redoes nothing,
+     * what is still refused is refused as before. Every look is fresh.
+     */
+    done = count ? kvcalloc(count, sizeof(*done), GFP_KERNEL) : NULL;
+    if (count && !done) {
+        ret = -ENOMEM;
+        goto out_free;
+    }
+    for (;;) {
+    unsigned int deferred = 0, applied_before = applied;
+
     for (s = 0; s < count; s++) {
         struct buffer_head *pbh, *tbh, *hbh;
         bool apply, owner_dir = false, owner_known = false;
+
+        if (done[s])
+            continue;
+
 
         if (entries[s].before_park) {
             atomic64_inc(&cetrafs_journal_replay_skipped);
@@ -2334,7 +2361,7 @@ static int __cetrafs_journal_replay_node(struct super_block *sb, u32 node_id, bo
                 if (v != CETRAFS_JV_APPLY && v != CETRAFS_JV_TORN)
                     break;
 
-                if (unlikely(cetrafs_journal_replay_apply_pause_ms)) {
+                if (unlikely(cetrafs_journal_replay_apply_pause_ms) && !pass) { /* once per entry */
                     pr_info("journal replay: pausing %ums before redoing target %llu\n",
                             cetrafs_journal_replay_apply_pause_ms, (unsigned long long) entries[s].target_lba);
                     msleep(cetrafs_journal_replay_apply_pause_ms);
@@ -2433,6 +2460,12 @@ static int __cetrafs_journal_replay_node(struct super_block *sb, u32 node_id, bo
             int held = cetrafs_journal_owner_holds(sb, &entries[s], &owner_dir);
 
             owner_known = held >= 0;
+            if (held == 0 && !final_pass) {
+                deferred++; /* perhaps reachable once the rest is redone */
+                brelse(tbh);
+                brelse(pbh);
+                continue;
+            }
             if (held == 0) {
                 apply = false;
                 atomic64_inc(&cetrafs_journal_replay_refused);
@@ -2548,6 +2581,13 @@ consume:
             ret = werr_consume;
             goto out_free;
         }
+        done[s] = true;
+    }
+    if (!deferred)
+        break;
+    if (applied == applied_before)
+        final_pass = true; /* nothing new is reachable: refuse the rest */
+    pass++;
     }
 
     pr_info("journal replay: node %u replayed %u valid entr%s\n", node_id, applied, applied == 1 ? "y" : "ies");
@@ -2564,6 +2604,7 @@ consume:
     claimed = false;
 
 out_free:
+    kvfree(done);
     kvfree(entries);
 out_release:
     if (claimed)
