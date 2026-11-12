@@ -832,11 +832,17 @@ static u32 cetrafs_row_stale_window(struct super_block *sb, const cetrafs_node_e
  * advertised interval is clamped so a corrupt row cannot park the mount
  * for days.
  */
+/* TEST ONLY: the watch is two advertised beats plus 5 s, as before
+ * a2c53e3 -- the control of ctest twin-watch. */
+static bool cetrafs_twin_watch_short;
+cetrafs_test_param(twin_watch_short, cetrafs_twin_watch_short, bool, 0644);
+MODULE_PARM_DESC(twin_watch_short, "TEST ONLY: watch a row with our identity for two beats + 5 s only");
+
 static int cetrafs_node_row_quiet(struct super_block *sb, u32 idx, const cetrafs_node_entry_t *ne)
 {
     u32 pi = min_t(u32, cetrafs_le32(ne->hb_interval_secs), CETRAFS_HB_INTERVAL_MAX_SECS);
     cetrafs_node_entry_t now;
-    u32 window;
+    u32 window, window_test = 0;
     int ret;
 
     if (!pi)
@@ -849,11 +855,15 @@ static int cetrafs_node_row_quiet(struct super_block *sb, u32 idx, const cetrafs
      * unclean re-attach waiting the stale window; a clean one waits not
      * at all. */
     window = max_t(u32, cetrafs_row_stale_window(sb, ne, cetrafs_sb_stale_secs(sb)), 4 * pi);
+    /* TEST ONLY: the old, short watch -- not a window of its own, so the
+     * source check on liveness windows still sees only the real one. */
+    if (READ_ONCE(cetrafs_twin_watch_short))
+        window_test = 2 * pi + 5;
     pr_info(
         "node registration: row %u carries this machine's identity and was not left cleanly -- watching it "
         "%us to be sure no other machine is using it\n",
-        idx, window);
-    if (msleep_interruptible(window * 1000))
+        idx, window_test ? window_test : window);
+    if (msleep_interruptible((window_test ? window_test : window) * 1000))
         return -EINTR;
     ret = cetrafs_read_node_entry(sb, idx, &now);
     if (ret)

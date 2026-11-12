@@ -357,7 +357,7 @@ func runMaster(cfg masterConfig) (bool, error) {
 		"concurrent-rename", "read-presence", "inode-reuse", "link-stale-reuse", "inode-unique", "dirent-cache", "extent-leaf-staleness",
 		"record-write-race", "dirent-torn", "caw", "pending-free", "scrub-transit", "hypervisor-storm", "ns-fuzz",
 		"create-visibility",
-		"fence-reclaim", "replay-race", "direct-write", "zero-range", "fstrim-pool", "defrag-yield", "handback-unknown", "churn-trim", "rename-loop", "damage-incarnation", "cas-image-check", "grow-twice", "grow-unrescanned", "sweep-vs-open-replay", "replay-after-truncate", "zg-claim-vs-replay", "reader-reattach", "frees-in-flight", "repair-claim-race", "reader-reclaim",
+		"fence-reclaim", "replay-race", "direct-write", "zero-range", "fstrim-pool", "defrag-yield", "handback-unknown", "churn-trim", "rename-loop", "damage-incarnation", "cas-image-check", "grow-twice", "grow-unrescanned", "sweep-vs-open-replay", "replay-after-truncate", "zg-claim-vs-replay", "reader-reattach", "twin-watch", "frees-in-flight", "repair-claim-race", "reader-reclaim",
 		"space-accounting",
 		"sparse-bigfile",
 		"grow-live",
@@ -473,6 +473,8 @@ func dispatchScenario(cfg masterConfig, clients []*Client) (bool, error) {
 		return RunZgClaimVsReplay(clients, cfg.testDir)
 	case "reader-reattach":
 		return RunReaderReattach(clients, cfg.testDir)
+	case "twin-watch":
+		return RunTwinWatch(clients, cfg.testDir)
 	case "frees-in-flight":
 		return RunFreesInFlight(clients, cfg.testDir)
 	case "repair-claim-race":

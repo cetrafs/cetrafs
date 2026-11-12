@@ -698,6 +698,16 @@ func (s *Slave) dispatch(req Request) Response {
 		}
 		return okResp(req.ID, res)
 
+	case "module_reload":
+		var a ModuleReloadArgs
+		if err := unmarshalInto(&a); err != nil {
+			return errResp(req.ID, err)
+		}
+		if err := doModuleReload(a); err != nil {
+			return errResp(req.ID, err)
+		}
+		return okResp(req.ID, nil)
+
 	case "link_down":
 		res, err := s.doDevLink(false)
 		if err != nil {
@@ -1693,6 +1703,10 @@ var settableModParams = map[string]bool{
 	// and (control) the clear before format 0x000A.
 	"lock_reader_clear_any_incarnation": true,
 	"reclaim_stall_before_swap_ms":      true,
+	// twin-watch: stall a node's heartbeat, and (control) the re-attach
+	// watch before a2c53e3.
+	"hb_tick_stall_ms": true,
+	"twin_watch_short": true,
 	// replay-after-truncate: a failed consume on one replayer, and its
 	// control (the old park).
 	"journal_consume_fail_once": true,
@@ -1796,6 +1810,33 @@ var fsckTestEnv = map[string]bool{
 	"CETRAFS_TEST_REPAIR_CLAIM_GAP_SECS": true,
 	"CETRAFS_TEST_REPAIR_HOLD_SECS":      true,
 	"CETRAFS_TEST_TOOLS_NO_CAW":          true,
+}
+
+func doModuleReload(a ModuleReloadArgs) error {
+	mounts, err := os.ReadFile("/proc/mounts")
+	if err != nil {
+		return err
+	}
+	if strings.Contains(string(mounts), " cetrafs ") {
+		return fmt.Errorf("a cetrafs volume is mounted here -- unmount it before reloading the module")
+	}
+	exe, err := os.Executable()
+	if err != nil {
+		return err
+	}
+	ko := filepath.Join(filepath.Dir(exe), "..", "kmod", "cetrafs.ko")
+	if _, err := os.Stat(ko); err != nil {
+		return fmt.Errorf("no module to load: %w", err)
+	}
+	if _, err := os.Stat("/sys/module/cetrafs"); err == nil {
+		if out, err := exec.Command("rmmod", "cetrafs").CombinedOutput(); err != nil {
+			return fmt.Errorf("rmmod: %v: %s", err, out)
+		}
+	}
+	if out, err := exec.Command("insmod", append([]string{ko}, a.Params...)...).CombinedOutput(); err != nil {
+		return fmt.Errorf("insmod %v: %v: %s", a.Params, err, out)
+	}
+	return nil
 }
 
 func doModParam(a ModParamArgs) (ModParamResult, error) {

@@ -1032,3 +1032,166 @@ func RunReaderReattach(clients []*Client, baseDir string) (bool, error) {
 	}
 	return ok, nil
 }
+
+// thisNode returns c's own registry row as its snapshot shows it.
+func thisNode(c *Client) (NodeInfo, error) {
+	var snap ProcSnapshotResult
+	resp, err := c.Call("proc_snapshot", ProcSnapshotArgs{Device: c.Device})
+	if e := decodeResult(c.Name, resp, err, &snap); e != nil {
+		return NodeInfo{}, e
+	}
+	for _, n := range snap.Nodes {
+		if n.ThisNode {
+			return n, nil
+		}
+	}
+	return NodeInfo{}, fmt.Errorf("%s: no row of its own in the snapshot", c.Name)
+}
+
+// RunTwinWatch: a machine mounting with a live node's identity waits a
+// whole stale window before it takes that node's row.
+//
+// A registry row carrying this machine's identity and not left cleanly
+// is either this machine's own crashed mount or a TWIN -- a cloned VM,
+// firmware without a unique UUID -- that is alive. The mount watches the
+// row and takes it only if it does not beat. The watch was two
+// advertised beats + 5 s (65 s at the default 30 s beat) where every
+// peer waits the stale window before calling a node dead, and a node
+// does not fence itself until three beats have failed: a twin whose
+// beats stalled for 65..90 s was alive, unfenced, and had its row taken
+// -- two machines running as one node. The watch now waits the stale
+// window (a2c53e3), staged single-node only until now.
+//
+// a beats every 30 s (the longest interval allowed): the old watch is
+// 65 s, a's lease 90 s. b reloads the module with a's node_uuid. Right
+// after a renews, a's next tick is held 45 s before its renewal
+// (hb_tick_stall_ms): 75 s of silence, past the old watch and short of
+// a's lease. b mounts at once: its watch must see a beat again and
+// refuse the mount.
+//
+// Control (CTEST_TWIN_CONTROL=1): b watches for the old window
+// (twin_watch_short) -- it takes a's row and mounts.
+func RunTwinWatch(clients []*Client, baseDir string) (bool, error) {
+	if len(clients) < 2 {
+		return skipScenario("twin-watch needs two machines, have %d", len(clients))
+	}
+	_ = baseDir
+	control := os.Getenv("CTEST_TWIN_CONTROL") != ""
+	a, b := clients[0], clients[1]
+	if err := ensureUnmounted(clients); err != nil {
+		return false, err
+	}
+	reloaded := false
+	defer func() {
+		_ = ensureUnmounted(clients)
+		if reloaded {
+			if err := callOK(b, "module_reload", ModuleReloadArgs{}); err != nil {
+				fmt.Printf("WARNING: %s: could not reload the module plainly: %v\n", b.Name, err)
+			}
+		}
+	}()
+	if err := mountAllDefault([]*Client{a}); err != nil {
+		return false, err
+	}
+	ok := true
+	pass := func(l string) { check(&ok, l, true, "") }
+	me, err := thisNode(a)
+	if err != nil {
+		return false, err
+	}
+	fmt.Printf("=== twin-watch: %s mounts with %s's identity (%s) while %s's beats stall 45 s ===\n",
+		b.Name, a.Name, me.UUID, a.Name)
+	if control {
+		fmt.Printf("  NEGATIVE CONTROL: %s watches two beats + 5 s only\n", b.Name)
+	}
+	if err := callOK(b, "module_reload", ModuleReloadArgs{Params: []string{"node_uuid=" + me.UUID}}); err != nil {
+		return false, fmt.Errorf("setup: %w", err)
+	}
+	reloaded = true
+	if control {
+		if err := callOK(b, "mod_param", ModParamArgs{Name: "twin_watch_short", Value: "1"}); err != nil {
+			return false, fmt.Errorf("setup: %w", err)
+		}
+	}
+	setClusterTiming([]*Client{a}, 30, 120, true)
+	defer setClusterTiming([]*Client{a}, defaultHBIntervalSecs, defaultStaleSecs, false)
+	mark := fmt.Sprintf("ctest-twin-%d", time.Now().UnixNano())
+	for _, cl := range []*Client{a, b} {
+		_ = callOK(cl, "dmesg_mark", DmesgMarkArgs{Marker: mark})
+	}
+
+	// Line the stall up with a renewal: a's NEXT tick holds 45 s, so its
+	// row is silent for one interval plus that. Two renewals first: the
+	// one already armed may still be at the old interval.
+	seq0 := me.HBSeq
+	var r0 time.Time
+	for k := 0; k < 2; k++ {
+		renewed := false
+		for i := 0; i < 280 && !renewed; i++ {
+			time.Sleep(250 * time.Millisecond)
+			if n, err := thisNode(a); err == nil && n.HBSeq != seq0 {
+				renewed = true
+				seq0 = n.HBSeq
+			}
+		}
+		if !renewed {
+			check(&ok, "setup: "+a.Name+" renews its row", false, "hb_seq did not move in 70 s")
+			return ok, nil
+		}
+	}
+	r0 = time.Now()
+	if err := callOK(a, "mod_param", ModParamArgs{Name: "hb_tick_stall_ms", Value: "45000"}); err != nil {
+		return false, fmt.Errorf("setup: %w", err)
+	}
+	t0 := time.Now()
+	resp, merr := b.Call("mount", MountArgs{})
+	merr = decodeResult(b.Name, resp, merr, nil)
+	took := time.Since(t0).Round(time.Second)
+	_ = callOK(a, "mod_param", ModParamArgs{Name: "hb_tick_stall_ms", Value: "0"})
+
+	bLog := dmesgSince(b, mark)
+	if !strings.Contains(bLog, "carries this machine's identity and was not left cleanly") {
+		check(&ok, "setup: "+b.Name+" found "+a.Name+"'s row under its own identity and watched it", false,
+			fmt.Sprintf("no watch in its log (mount %v after %s)", merr, took))
+		return ok, nil
+	}
+	// a must have stayed alive through its stall: past its lease (90 s
+	// from that renewal) and not expired. (Under the control a is fenced
+	// anyway once b takes its row -- for that, not for its lease.)
+	if d := time.Until(r0.Add(100 * time.Second)); d > 0 {
+		time.Sleep(d)
+	}
+	if aLog := dmesgSince(a, mark); strings.Contains(aLog, "lease expired") {
+		check(&ok, "setup: "+a.Name+" stayed alive through its stall", false,
+			"its lease expired -- the stall was longer than a's lease, nothing below is measured")
+		return ok, nil
+	}
+	pass(fmt.Sprintf("setup: %s watched %s's row (from %s after its renewal) while %s stalled and stayed alive",
+		b.Name, a.Name, t0.Sub(r0).Round(time.Millisecond), a.Name))
+
+	if control {
+		check(&ok, fmt.Sprintf("control: watching two beats + 5 s, %s took the live %s's row and mounted (%s)",
+			b.Name, a.Name, took), merr == nil, fmt.Sprintf("the mount failed (%v) -- the scenario cannot tell the two apart", merr))
+	} else {
+		check(&ok, fmt.Sprintf("%s's mount is refused: the row beat again within the stale window (%s)", b.Name, took),
+			merr != nil, "it mounted as "+a.Name+"'s twin")
+	}
+	_ = ensureUnmounted(clients)
+	if err := callOK(b, "module_reload", ModuleReloadArgs{}); err != nil {
+		fmt.Printf("WARNING: %s: could not reload the module plainly: %v\n", b.Name, err)
+	}
+	reloaded = false
+	var fr FsckResult
+	resp, err = a.Call("fsck", FsckArgs{})
+	if e := decodeResult(a.Name, resp, err, &fr); e != nil {
+		check(&ok, "fsck ran", false, e.Error())
+	} else if !control {
+		check(&ok, "fsck clean", fr.Clean, fmt.Sprintf("exit %d: %s", fr.ExitCode, firstLine(fr.Output)))
+	}
+	if ok {
+		fmt.Printf("PASS: twin-watch\n")
+	} else {
+		fmt.Printf("FAIL: twin-watch: see failed checks above\n")
+	}
+	return ok, nil
+}

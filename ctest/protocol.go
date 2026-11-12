@@ -555,6 +555,14 @@ type FsckResult struct {
 	Clean    bool   `json:"clean"`
 }
 
+// ModuleReloadArgs reloads the cetrafs module on a slave with these
+// load-time parameters ("name=value"), from the checkout's own build
+// (../kmod/cetrafs.ko next to the slave binary). Refused while any
+// cetrafs volume is mounted there. Empty Params: a plain load.
+type ModuleReloadArgs struct {
+	Params []string `json:"params,omitempty"`
+}
+
 type ModParamArgs struct {
 	Name  string `json:"name"`
 	Value string `json:"value"`
