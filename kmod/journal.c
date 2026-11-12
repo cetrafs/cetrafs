@@ -1674,15 +1674,31 @@ static u64 cetrafs_journal_batch_room(struct cetrafs_journal *j, struct buffer_h
  * wait, and the batch refused (-EIO) rather than waiting for slots that
  * will not come. *taken says how many it holds on failure.
  */
+/* TEST ONLY: a batch waiting for a slot gives up on a fatal signal, as
+ * it once did -- the control of tests/kernel/close_killed_slots.sh. */
+static bool cetrafs_journal_batch_eintr;
+cetrafs_test_param(journal_batch_eintr, cetrafs_journal_batch_eintr, bool, 0644);
+MODULE_PARM_DESC(journal_batch_eintr, "TEST ONLY: a batch waiting for journal slots fails -EINTR on a fatal signal");
+
+/* TEST ONLY: the next batch finds every slot in flight for this many ms
+ * (one-shot) -- tests/kernel/close_killed_slots.sh. */
+static unsigned int cetrafs_journal_batch_noslot_ms;
+cetrafs_test_param(journal_batch_noslot_ms, cetrafs_journal_batch_noslot_ms, uint, 0644);
+MODULE_PARM_DESC(journal_batch_noslot_ms, "TEST ONLY: the next tree-block batch finds no free journal slot for N ms");
+
 static int cetrafs_journal_take_batch(struct super_block *sb, struct cetrafs_journal *j, struct buffer_head **bhs,
                                       unsigned int n, u64 *slots, u64 *txn, bool *reused, unsigned int *taken)
 {
     unsigned int k = 0;
+    unsigned int noslot_ms = READ_ONCE(cetrafs_journal_batch_noslot_ms) ? xchg(&cetrafs_journal_batch_noslot_ms, 0) : 0;
+    unsigned long noslot_until = jiffies + msecs_to_jiffies(noslot_ms);
 
     *taken = 0;
     while (k < n) {
         u64 room;
-        int t = cetrafs_journal_take_slot(sb, j, bhs[k]->b_blocknr, true, &slots[k], &txn[k], &reused[k]);
+        int t = noslot_ms && time_before(jiffies, noslot_until) /* test-only; see the parameter */
+                    ? -EAGAIN
+                    : cetrafs_journal_take_slot(sb, j, bhs[k]->b_blocknr, true, &slots[k], &txn[k], &reused[k]);
 
         if (!t) {
             *taken = ++k;
@@ -1699,11 +1715,16 @@ static int cetrafs_journal_take_batch(struct super_block *sb, struct cetrafs_jou
                                n, (unsigned long long) (j->slots - room), (unsigned long long) j->slots);
             return -EIO;
         }
-        if (fatal_signal_pending(current))
-            return -EINTR;
         /* Every other slot is in flight with a single writer, which
          * holds no lock we hold and gives it back. Bounded wait so a
-         * slot kept meanwhile is re-checked above. */
+         * slot kept meanwhile is re-checked above. Not cut short by a
+         * fatal signal: a killed writer's close is one of the callers,
+         * and failing it there kept the file locked until the
+         * heartbeat retried the release -- the VM image a host killed
+         * stayed unopenable elsewhere for an interval. The wait ends
+         * when an in-flight write does. */
+        if (READ_ONCE(cetrafs_journal_batch_eintr) && fatal_signal_pending(current))
+            return -EINTR; /* test-only; see the parameter */
         wait_event_timeout(j->slot_wq, cetrafs_journal_slot_or_none(j), HZ / 10);
     }
     return 0;
