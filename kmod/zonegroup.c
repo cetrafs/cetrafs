@@ -2691,11 +2691,18 @@ u64 cetrafs_bg_pick_scan_count(void)
     return (u64) atomic64_read(&cetrafs_bg_pick_scan);
 }
 
+/* TEST ONLY: an allocation out of space does not look for a grow -- the
+ * negative control for ctest grow-twice. */
+static bool cetrafs_alloc_enospc_refresh_off;
+cetrafs_test_param(alloc_enospc_refresh_off, cetrafs_alloc_enospc_refresh_off, bool, 0644);
+MODULE_PARM_DESC(alloc_enospc_refresh_off, "TEST ONLY: ENOSPC does not refresh the layout first");
+
 int cetrafs_alloc_pick_bg(struct super_block *sb, u32 *out_bg_id)
 {
     const cetrafs_superblock_t *raw_sb = cetrafs_sb_raw(sb);
     u32 my_node_id, zg_count;
     bool tried_claim_more = false, tried_claim_bg = false, waited_release = false, waited_adopt = false;
+    bool refreshed_layout = false;
     int ret;
 
     if (!raw_sb)
@@ -2908,6 +2915,21 @@ retry_scan:
         tried_claim_more = false;
         tried_claim_bg = false;
         goto retry_scan;
+    }
+
+    /* A peer may have grown the volume since this node's last
+     * heartbeat: the Block Groups it added sit in the pool, claimable,
+     * and only this node's layout does not have them yet. That is not
+     * an answer either (class 43): a writer streaming a VM image hit
+     * ENOSPC 124 MiB after a grow it could not see (ctest grow-twice).
+     * One read of block 0, on this path only -- never per block. */
+    if (!refreshed_layout && !READ_ONCE(cetrafs_alloc_enospc_refresh_off)) {
+        refreshed_layout = true;
+        if (cetrafs_sb_layout_refresh(sb) == 1) {
+            tried_claim_more = false;
+            tried_claim_bg = false;
+            goto retry_scan;
+        }
     }
 
     /* Either this node owns no ZGs and none were claimable just now, or
