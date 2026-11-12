@@ -1145,6 +1145,17 @@ static void cetrafs_cas_test_dirty(struct super_block *sb, u64 fs_lba)
     brelse(bh);
 }
 
+/* TEST ONLY: the next real-CAW swap on this inode's record waits
+ * cas_stall_ms between its read and its compare-and-write, where a
+ * peer's change to the sector makes it miscompare (ctest
+ * cas-image-check). One-shot. */
+static unsigned long long cetrafs_cas_stall_ino;
+cetrafs_test_param(cas_stall_ino, cetrafs_cas_stall_ino, ullong, 0644);
+MODULE_PARM_DESC(cas_stall_ino, "TEST ONLY: the next CAW on this inode's record pauses before its swap");
+static unsigned int cetrafs_cas_stall_ms = 3000;
+cetrafs_test_param(cas_stall_ms, cetrafs_cas_stall_ms, uint, 0644);
+MODULE_PARM_DESC(cas_stall_ms, "TEST ONLY: how long cas_stall_ino pauses (ms)");
+
 static int cetrafs_cas_region_seeded_impl(struct super_block *sb,
                                           u64 fs_lba,
                                           unsigned int region_idx,
@@ -1374,6 +1385,9 @@ static int cetrafs_cas_region_seeded_impl(struct super_block *sb,
             goto out;
         }
 
+        if (unlikely(READ_ONCE(cetrafs_cas_stall_ino)) && fs_lba == cetrafs_inode_lba(sb, cetrafs_cas_stall_ino) &&
+            xchg(&cetrafs_cas_stall_ino, 0))
+            msleep(READ_ONCE(cetrafs_cas_stall_ms)); /* TEST ONLY: between the read and the swap */
         ret = cetrafs_caw(sb->s_bdev, dev_lba, 1, old, new, killable);
         {
             /* DEBUG: every inode-bitmap CAS, with everything needed to

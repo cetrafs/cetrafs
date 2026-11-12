@@ -3240,6 +3240,13 @@ static unsigned int cetrafs_rename_prelock_stall_ms;
 cetrafs_test_param(rename_prelock_stall_ms, cetrafs_rename_prelock_stall_ms, uint, 0644);
 MODULE_PARM_DESC(rename_prelock_stall_ms, "TEST ONLY: pause a rename between its lookups and its namespace locks");
 
+/* TEST ONLY: skip the device-side cycle check, so ctest's rename-loop
+ * scenario can show it is the only thing between two nodes' crossed
+ * directory moves and an unreachable pair. */
+static bool cetrafs_rename_skip_cycle_check;
+cetrafs_test_param(rename_skip_cycle_check, cetrafs_rename_skip_cycle_check, bool, 0644);
+MODULE_PARM_DESC(rename_skip_cycle_check, "TEST ONLY: a directory move does not check the device for a cycle");
+
 static int cetrafs_rename(struct mnt_idmap *idmap,
                           struct inode *old_dir,
                           struct dentry *old_dentry,
@@ -3328,7 +3335,9 @@ static int cetrafs_rename(struct mnt_idmap *idmap,
             return ret;
         }
 
-        ret = dir_move ? cetrafs_rename_dest_under_source(new_dir, moved->i_ino) : 0;
+        ret = dir_move && !READ_ONCE(cetrafs_rename_skip_cycle_check)
+                  ? cetrafs_rename_dest_under_source(new_dir, moved->i_ino)
+                  : 0;
         if (!ret)
             ret = cetrafs_rename_locked(idmap, old_dir, old_dentry, new_dir, new_dentry, flags, target,
                                         &target_changed);

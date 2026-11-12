@@ -1270,6 +1270,12 @@ int cetrafs_node_set_frees(struct super_block *sb, u32 my_node_id, bool on)
  * (the caller otherwise asks our in-memory count, which is exact).
  * A row judged alive is busy (class 44: the scrub then keeps).
  */
+/* TEST ONLY: the scrub's snapshot ignores every peer's frees in flight
+ * -- the negative control for ctest frees-in-flight. */
+static bool cetrafs_scrub_ignore_peer_frees;
+cetrafs_test_param(scrub_ignore_peer_frees, cetrafs_scrub_ignore_peer_frees, bool, 0644);
+MODULE_PARM_DESC(scrub_ignore_peer_frees, "TEST ONLY: the scrub does not see a peer's frees in flight");
+
 int cetrafs_node_frees_snapshot(struct super_block *sb, u32 my_node_id, bool self_from_row,
                                 u32 seqs[CETRAFS_MAX_READER_NODES], bool *busy)
 {
@@ -1291,6 +1297,8 @@ int cetrafs_node_frees_snapshot(struct super_block *sb, u32 my_node_id, bool sel
             return ret;
         if (cetrafs_le32(ne.state) != CETRAFS_NODE_STATE_REGISTERED)
             continue;
+        if (i != my_node_id && READ_ONCE(cetrafs_scrub_ignore_peer_frees))
+            continue; /* TEST ONLY */
         seqs[i] = cetrafs_le32(ne.frees_seq);
         if (!cetrafs_le32(ne.frees_inflight) || (i == my_node_id && !self_from_row))
             continue;

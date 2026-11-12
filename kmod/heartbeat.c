@@ -134,6 +134,35 @@ static unsigned int cetrafs_hb_tick_stall_ms;
 cetrafs_test_param(hb_tick_stall_ms, cetrafs_hb_tick_stall_ms, uint, 0644);
 MODULE_PARM_DESC(hb_tick_stall_ms, "TEST ONLY: pause the next heartbeat tick after its re-arm");
 
+/* TEST ONLY: damage this inode's namespace sector on the device -- one
+ * bit of its checksum -- on the next tick. Plays a sector damaged by
+ * something else while a PEER's compare-and-write on it is in flight
+ * (ctest cas-image-check). One-shot. */
+static unsigned long long cetrafs_test_damage_ns_ino;
+cetrafs_test_param(test_damage_ns_ino, cetrafs_test_damage_ns_ino, ullong, 0644);
+MODULE_PARM_DESC(test_damage_ns_ino, "TEST ONLY: flip a checksum bit of this inode's namespace sector, next tick");
+
+static void cetrafs_test_damage_ns(struct super_block *sb, u64 ino)
+{
+    struct buffer_head *bh = cetrafs_bread_uncached(sb, cetrafs_inode_lba(sb, ino));
+
+    if (!bh) {
+        pr_warn("heartbeat: TEST: ino=%llu: could not read its record to damage it\n", (unsigned long long) ino);
+        return;
+    }
+    cetrafs_bh_begin_update(bh);
+    bh->b_data[offsetof(cetrafs_inode_t, ns_checksum)] ^= 0x01;
+    cetrafs_bh_end_update(bh);
+    if (cetrafs_sync_buffer(sb, bh))
+        pr_warn("heartbeat: TEST: ino=%llu: the damaging write failed\n", (unsigned long long) ino);
+    else
+        pr_info("heartbeat: TEST: damaged ino=%llu's namespace sector checksum on the device\n",
+                (unsigned long long) ino);
+    brelse(bh);
+    /* Not ours to keep: the next read of it goes to the device. */
+    cetrafs_invalidate_block(sb, cetrafs_inode_lba(sb, ino));
+}
+
 static void cetrafs_heartbeat_tick(struct work_struct *work)
 {
     struct cetrafs_heartbeat *hb = container_of(work, struct cetrafs_heartbeat, work.work);
@@ -174,6 +203,13 @@ static void cetrafs_heartbeat_tick(struct work_struct *work)
 
         if (ms)
             msleep(ms);
+    }
+
+    if (READ_ONCE(cetrafs_test_damage_ns_ino)) {
+        u64 ino = xchg(&cetrafs_test_damage_ns_ino, 0);
+
+        if (ino)
+            cetrafs_test_damage_ns(sb, ino);
     }
 
     if (cetrafs_test_uncache_zg >= 0) {

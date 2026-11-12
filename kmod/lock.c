@@ -1678,6 +1678,12 @@ static bool cetrafs_lock_rec_dead_to_us(const cetrafs_inode_t *rec, u32 my_node_
     return true;
 }
 
+/* TEST ONLY: the lock CAS stamps a fresh checksum over a sector that
+ * fails its own -- the negative control for ctest cas-image-check. */
+static bool cetrafs_lock_cas_skip_crc;
+cetrafs_test_param(lock_cas_skip_crc, cetrafs_lock_cas_skip_crc, bool, 0644);
+MODULE_PARM_DESC(lock_cas_skip_crc, "TEST ONLY: the lock CAS does not refuse a sector failing its checksum");
+
 static int cetrafs_lock_cas_mutate(void *image, unsigned int len, void *priv)
 {
     struct cetrafs_lock_cas_ctx *ctx = priv;
@@ -1694,7 +1700,7 @@ static int cetrafs_lock_cas_mutate(void *image, unsigned int len, void *priv)
      * a fresh checksum: over a sector that fails its own, that turns a
      * tear or damage into a record every checker accepts. Same refusal
      * as inode.c's namespace mutator. */
-    if (cetrafs_inode_crc_ns(&rec) != (u32) cetrafs_le64(rec.ns_checksum)) {
+    if (cetrafs_inode_crc_ns(&rec) != (u32) cetrafs_le64(rec.ns_checksum) && !READ_ONCE(cetrafs_lock_cas_skip_crc)) {
         pr_warn_ratelimited("lock CAS: the namespace sector on the device fails its checksum -- refusing to "
                             "stamp a fresh one\n");
         return -EUCLEAN;

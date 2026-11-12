@@ -1887,6 +1887,13 @@ u64 cetrafs_pf_drop_blocks_count(void)
     return (u64) atomic64_read(&cetrafs_pf_drop_blocks);
 }
 
+/* TEST ONLY: every foreign-free queue append waits this long first, so
+ * a truncate of a fragmented file keeps its frees in flight for as long
+ * as a peer's scrub needs to meet them (ctest frees-in-flight). */
+static unsigned int cetrafs_pf_append_stall_ms;
+cetrafs_test_param(pf_append_stall_ms, cetrafs_pf_append_stall_ms, uint, 0644);
+MODULE_PARM_DESC(pf_append_stall_ms, "TEST ONLY: delay every foreign-free queue append (ms)");
+
 int cetrafs_zg_queue_foreign_free(struct super_block *sb, u32 zg_id, u64 lba, u32 count)
 {
     struct cetrafs_pf_append_ctx ctx = {.lba = lba, .count = count};
@@ -1894,6 +1901,9 @@ int cetrafs_zg_queue_foreign_free(struct super_block *sb, u32 zg_id, u64 lba, u3
     u64 qstart;
     u32 qblocks, qb;
     int ret;
+
+    if (READ_ONCE(cetrafs_pf_append_stall_ms))
+        msleep(READ_ONCE(cetrafs_pf_append_stall_ms)); /* TEST ONLY */
 
     ret = cetrafs_zg_queue_span(sb, zg_id, &qstart, &qblocks);
     if (ret)

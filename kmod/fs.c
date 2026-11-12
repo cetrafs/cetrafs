@@ -4673,9 +4673,18 @@ void cetrafs_sb_corrupt(struct super_block *sb, u64 ino)
     cetrafs_sb_corrupt_gen(sb, ino, CETRAFS_BAD_GEN_UNKNOWN);
 }
 
+/* TEST ONLY: store every mark as "generation unknown", i.e. keyed by
+ * the number alone -- ctest damage-incarnation's negative control. */
+static bool cetrafs_damage_mark_any_gen;
+cetrafs_test_param(damage_mark_any_gen, cetrafs_damage_mark_any_gen, bool, 0644);
+MODULE_PARM_DESC(damage_mark_any_gen, "TEST ONLY: a damage mark covers every incarnation of the number");
+
 void cetrafs_sb_corrupt_inode(struct inode *inode)
 {
-    cetrafs_sb_corrupt_gen(inode->i_sb, inode->i_ino, cetrafs_bad_gen(cetrafs_inode_get_generation(inode)));
+    cetrafs_sb_corrupt_gen(inode->i_sb, inode->i_ino,
+                           READ_ONCE(cetrafs_damage_mark_any_gen)
+                               ? CETRAFS_BAD_GEN_UNKNOWN
+                               : cetrafs_bad_gen(cetrafs_inode_get_generation(inode)));
 }
 
 static void cetrafs_sb_corrupt_gen(struct super_block *sb, u64 ino, unsigned long gen)
