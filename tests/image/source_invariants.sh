@@ -1451,7 +1451,13 @@ c41_names() { # <files...>: every function whose name says it drops cached state
 c41_body() { # <fn>: its body, from whichever kmod file defines it
     local src
     src="$(grep -lE "^(static )?(inline )?[a-z0-9_]+ \*?$1\\(" "$K"/*.c | head -1)"
-    [ -n "$src" ] && awk -v f="$1" '$0 ~ ("^[a-z].*[ *]" f "\\(") && !/\);/ { on = 1 } on { print } on && /^}/ { exit }' "$src"
+    # A multi-line PROTOTYPE also starts with the name and has no ");"
+    # on its first line: the header is held until a line ending in ";"
+    # (a prototype: dropped) or the opening "{" (the definition).
+    [ -n "$src" ] && awk -v f="$1" '
+!on && !hdr && $0 ~ ("^[a-z_].*[ *]" f "\\(") { hdr = 1; buf = "" }
+hdr { buf = buf $0 "\n"; l = $0; sub(/\/[*\/].*$/, "", l); if (l ~ /;[ \t]*$/) { hdr = 0; next } if (/^\{/) { hdr = 0; on = 1; printf "%s", buf; next } next }
+on { print } on && /^}/ { exit }' "$src"
 }
 c41_bad() { # <fn> <kind>: prints why the fence is missing, nothing if present
     local fn="$1" kind="$2" field store
@@ -1539,19 +1545,27 @@ printf 'static bool cetrafs_thing_key_matches(const struct ci *ci, const cetrafs
     fail "class 51: control -- the planted summary key was not caught"
 
 # Class 43 (a transient withholding reported as a final answer). Every
-# function that ORIGINATES -ENOSPC is listed with what its answer means:
-#   waits:<fn>  it waits out the transient states (a release deciding)
-#               before answering -- and still calls <fn>;
-#   calls:<fn>  its ENOSPC comes after asking <fn>, which waits;
-#   below:...   a per-group/per-bitmap "none here" its caller moves on from;
-#   final:...   a structural limit no wait changes (a full tree, a full
-#               registry), or a caller for whom it is not user-visible.
+# function that ORIGINATES -ENOSPC, -EBUSY or -ENOENT is listed with what
+# its answer means:
+#   waits:<fn>  it waits out the transient states (a release deciding, a
+#               peer's lock, a lost race) before answering -- and still
+#               calls <fn>, the wait or the retried step;
+#   calls:<fn>  its answer comes after asking <fn>, which waits;
+#   below:...   an internal "not here / not now" its caller moves on
+#               from, retries, or keeps for a later pass;
+#   final:...   a structural limit or a state no wait changes (a full
+#               tree, a name that is gone under the lock, a mount
+#               refused with its reason), or a test injection.
 # A new originator fails until it says which. What is enumerated is the
-# literal; an ENOSPC passed up from elsewhere is its originator's.
-log "checking every -ENOSPC names the transient states it waited out (class 43)"
-C43_REG='cetrafs_alloc_pick_bg waits:cetrafs_sb_release_wait
+# literal; an errno passed up from elsewhere is its originator's. A
+# literal the scan cannot place in a function fails as well: the scan
+# once missed every __cetrafs_* function, __cetrafs_get_block()'s
+# ENOSPC among them.
+log "checking every -ENOSPC/-EBUSY/-ENOENT names the transient states it waited out (class 43)"
+C43_REG_ENOSPC='cetrafs_alloc_pick_bg waits:cetrafs_sb_release_wait
 cetrafs_alloc_block_anywhere calls:cetrafs_alloc_pick_bg
 cetrafs_do_allocate calls:cetrafs_alloc_pick_bg
+__cetrafs_get_block calls:cetrafs_alloc_pick_bg
 cetrafs_alloc_data_block below:one-group-full-the-pick-chooses-again
 cetrafs_alloc_data_block_near below:one-group-full-the-pick-chooses-again
 cetrafs_alloc_data_run_resv below:one-group-has-no-run
@@ -1570,35 +1584,82 @@ cetrafs_tree_build final:the-extent-tree-is-full
 cetrafs_xattr_set_locked final:the-xattr-block-is-full
 cetrafs_node_register final:every-registry-row-taken
 cetrafs_zg_queue_foreign_free below:a-full-queue-is-a-logged-leak-its-caller-reports-as-success'
-c43_names() { # <files...>: every function with a literal return/assignment of -ENOSPC
-    awk '/^[a-z][a-z0-9_ *]*[ *]cetrafs_[a-z0-9_]*\(/ && !/;[ \t]*$/ { match($0, /cetrafs_[a-z0-9_]*\(/); fn = substr($0, RSTART, RLENGTH - 1) }
-/^cetrafs_[a-z0-9_]*\(/ && !/;[ \t]*$/ { match($0, /cetrafs_[a-z0-9_]*\(/); fn = substr($0, RSTART, RLENGTH - 1) }
+C43_REG_EBUSY='cetrafs_lock_suspend waits:schedule_timeout_killable
+cetrafs_nslock_acquire_tries waits:msleep
+cetrafs_nslock_acquire_set waits:msleep
+cetrafs_apply_raw_to_vfs_inode_sure waits:usleep_range
+cetrafs_cas_region_seeded_impl waits:usleep_range
+__cetrafs_journal_replay_node waits:time_after_eq
+cetrafs_rename waits:cetrafs_rename_locked
+cetrafs_rename_locked below:the-target-changed-cetrafs_rename-retries
+cetrafs_nslock_try below:a-held-lock-the-acquire-loop-waits-on
+cetrafs_nslock_mutate below:a-cas-callback-held-by-another
+cetrafs_zg_cas_mutate below:a-cas-callback-owned-by-a-live-peer
+cetrafs_caw_scsi below:a-miscompare-the-cas-loop-re-reads
+cetrafs_node_fence_peer_full below:the-peer-came-back-callers-wait-as-for-a-live-holder
+cetrafs_journal_replay_node below:the-node-came-back-its-own-mount-replays
+cetrafs_bg_release_bitmap_ready below:not-released-the-heartbeat-tries-later
+cetrafs_bg_release_one below:kept-for-a-later-pass
+cetrafs_discard_handback below:over-budget-kept-for-a-later-pass
+cetrafs_frees_quiet below:frees-in-flight-the-scrub-skips-this-cycle
+cetrafs_lock_clear_dead_claims below:a-live-user-the-scrub-leaves-it
+cetrafs_evict_inode below:a-peer-named-it-evict-frees-nothing
+cetrafs_lock_defrag_begin below:the-file-is-in-use-defrag-declines-and-yields-to-users
+cetrafs_lock_explicit_acquire final:a-peer-is-using-the-file-flock-cannot-promise-exclusivity
+cetrafs_fill_super final:a-mount-refused-with-its-reason-repair-running-no-caw-peer-or-a-rewrite
+cetrafs_check_second_mount final:a-second-mount-asking-for-options-the-first-lacks
+cetrafs_node_register final:a-twin-of-this-node-is-mounted
+cetrafs_grow_claim_held final:no-growfs-claim-the-tool-did-not-ask
+cetrafs_lock_open final:test-injection-open_refresh_fail_once
+cetrafs_defrag_inode final:test-injection-defrag_fail_invalidate
+cetrafs_zg_drain_one final:test-injection-pf_drain_busy_region'
+C43_REG_ENOENT='cetrafs_dir_extents_get_unchecked final:the-directory-is-gone-on-a-fresh-read
+cetrafs_dir_add_entry final:the-directory-is-gone-on-a-fresh-read
+cetrafs_dir_remove_entry final:the-name-is-gone-under-the-namespace-lock
+cetrafs_dir_retarget_entry final:the-name-is-gone-under-the-namespace-lock
+cetrafs_link_locked final:no-names-left-on-a-fresh-read
+cetrafs_lock_cas_mutate final:deleted-since-our-read
+cetrafs_bg_trim_pool_one below:owns-no-zone-group-the-pool-pass-stops
+cetrafs_sb_first_owned_zg below:none-owned
+cetrafs_pending_next below:no-pending-range
+cetrafs_leaf_array_convert below:not-covered-here
+cetrafs_tree_convert_inner below:not-covered-here'
+c43_names() { # <errno> <files...>: every function with a literal return/assignment of -<errno>
+    local e="$1"
+    shift
+    awk -v E="$e" '/^[a-z][a-z0-9_ *]*[ *]_*cetrafs_[a-z0-9_]*\(/ && !/;[ \t]*$/ { match($0, /_*cetrafs_[a-z0-9_]*\(/); fn = substr($0, RSTART, RLENGTH - 1) }
+/^_*cetrafs_[a-z0-9_]*\(/ && !/;[ \t]*$/ { match($0, /_*cetrafs_[a-z0-9_]*\(/); fn = substr($0, RSTART, RLENGTH - 1) }
 /^\}/ { fn = "" }
 { line = $0; sub(/\/\*.*$/, "", line); sub(/\/\/.*$/, "", line) }
 line ~ /^[ \t]*\*/ { next }
-line ~ /(return|=)[ \t]*-ENOSPC[ \t]*;/ && fn != "" { print fn }' "$@" | sort -u
+line ~ ("(return|=)[ \t]*-" E "[ \t]*;") { print (fn == "" ? "UNPLACED:" FILENAME ":" FNR : fn) }' "$@" | sort -u
 }
-C43_FOUND="$(c43_names "$K"/*.c)"
-[ -n "$C43_FOUND" ] || fail "class 43: setup -- no -ENOSPC found (the scan no longer matches)"
-C43_NEW="$(comm -23 <(echo "$C43_FOUND") <(cut -d' ' -f1 <<<"$C43_REG" | sort -u))"
-C43_GONE="$(comm -13 <(echo "$C43_FOUND") <(cut -d' ' -f1 <<<"$C43_REG" | sort -u))"
-C43_BAD="$(while read -r fn kind; do
-    case "$kind" in
-    waits:* | calls:*) grep -q "${kind#*:}(" <<<"$(c41_body "$fn")" || echo "$fn: no longer calls ${kind#*:}" ;;
-    below:* | final:*) ;;
-    *) echo "$fn: unknown kind $kind" ;;
-    esac
-done <<<"$C43_REG")"
-[ -z "$C43_NEW" ] && [ -z "$C43_GONE" ] && [ -z "$C43_BAD" ] &&
-    pass "class 43: every -ENOSPC originator says what it waited out ($(echo $C43_FOUND | wc -w))" ||
-    fail "class 43: unlisted: $(echo $C43_NEW); listed but gone: $(echo $C43_GONE); $C43_BAD"
-# Control: a new originator, one in a comment (not one), and a pick
-# that stopped waiting.
+for C43_E in ENOSPC EBUSY ENOENT; do
+    eval "C43_REG=\$C43_REG_$C43_E"
+    C43_FOUND="$(c43_names "$C43_E" "$K"/*.c)"
+    [ -n "$C43_FOUND" ] || fail "class 43: setup -- no -$C43_E found (the scan no longer matches)"
+    C43_NEW="$(comm -23 <(echo "$C43_FOUND") <(cut -d' ' -f1 <<<"$C43_REG" | sort -u))"
+    C43_GONE="$(comm -13 <(echo "$C43_FOUND") <(cut -d' ' -f1 <<<"$C43_REG" | sort -u))"
+    C43_BAD="$(while read -r fn kind; do
+        case "$kind" in
+        waits:* | calls:*) grep -q "${kind#*:}(" <<<"$(c41_body "$fn")" || echo "$fn: no longer calls ${kind#*:}" ;;
+        below:* | final:*) ;;
+        *) echo "$fn: unknown kind $kind" ;;
+        esac
+    done <<<"$C43_REG")"
+    [ -z "$C43_NEW" ] && [ -z "$C43_GONE" ] && [ -z "$C43_BAD" ] &&
+        pass "class 43: every -$C43_E originator says what it waited out ($(echo $C43_FOUND | wc -w))" ||
+        fail "class 43: -$C43_E unlisted: $(echo $C43_NEW); listed but gone: $(echo $C43_GONE); $C43_BAD"
+done
+# Control: a new originator, one in a comment (not one), one in a
+# __-prefixed function, and a pick that stopped waiting.
 C43_SAMPLE="$(ct_tmp c43).c"
-printf 'int cetrafs_thing_alloc(struct super_block *sb)\n{\n    /* return -ENOSPC; */\n    return -ENOSPC;\n}\nint cetrafs_alloc_pick_bg(struct super_block *sb)\n{\n    return -ENOSPC;\n}\n' >"$C43_SAMPLE"
-[ "$(c43_names "$C43_SAMPLE" | tr '\n' ' ')" = "cetrafs_alloc_pick_bg cetrafs_thing_alloc " ] &&
+printf 'static int __cetrafs_thing_busy(struct super_block *sb,\n                                int x);\nint cetrafs_thing_alloc(struct super_block *sb)\n{\n    /* return -ENOSPC; */\n    return -ENOSPC;\n}\nstatic int __cetrafs_thing_busy(struct super_block *sb,\n                                int x)\n{\n    cetrafs_thing_wait();\n    return -EBUSY;\n}\nint cetrafs_alloc_pick_bg(struct super_block *sb)\n{\n    return -ENOSPC;\n}\n' >"$C43_SAMPLE"
+[ "$(c43_names ENOSPC "$C43_SAMPLE" | tr '\n' ' ')" = "cetrafs_alloc_pick_bg cetrafs_thing_alloc " ] &&
+    [ "$(c43_names EBUSY "$C43_SAMPLE")" = __cetrafs_thing_busy ] &&
+    grep -q "cetrafs_thing_wait(" <<<"$(K="$(dirname "$C43_SAMPLE")" c41_body __cetrafs_thing_busy)" &&
     ! grep -q "cetrafs_sb_release_wait(" <<<"$(K="$(dirname "$C43_SAMPLE")" c41_body cetrafs_alloc_pick_bg)" &&
-    pass "class 43: control -- a planted originator is found, a comment is not, and a pick that stopped waiting is seen" ||
+    pass "class 43: control -- planted originators are found (a __ one too, its body past its prototype), a comment is not, and a pick that stopped waiting is seen" ||
     fail "class 43: control -- the planted originators were not seen as expected"
 
 # Class 14 (distance between check and act), for its most destructive
