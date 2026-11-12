@@ -3264,6 +3264,8 @@ func RunFullSuite(clients []*Client, lockPath, baseDir string, accountingSizeByt
 		{"frees-in-flight", func() (bool, error) { return RunFreesInFlight(clients, baseDir) }},
 		{"repair-claim-race", func() (bool, error) { return RunRepairClaimRace(clients, baseDir) }},
 		{"reader-reclaim", func() (bool, error) { return RunReaderReclaim(clients, baseDir) }},
+		{"sweep-vs-open-replay", func() (bool, error) { return RunSweepVsOpenReplay(clients, baseDir) }},
+		{"replay-after-truncate", func() (bool, error) { return RunReplayAfterTruncate(clients, baseDir) }},
 		{"inode-reuse", func() (bool, error) { return RunInodeReuse(clients, baseDir) }},
 		{"dirent-cache", func() (bool, error) { return RunDirentCache(clients, baseDir, dirStormPar) }},
 		{"extent-leaf-staleness", func() (bool, error) { return RunExtentLeafStaleness(clients, baseDir) }},
@@ -3288,6 +3290,9 @@ func RunFullSuite(clients []*Client, lockPath, baseDir string, accountingSizeByt
 		steps = append(steps, step{"sparse-bigfile", func() (bool, error) {
 			return RunSparseBigFile(clients, baseDir+"/sparse-bigfile")
 		}})
+		// Last: each reformats the LUN (small, then back to full size).
+		steps = append(steps, step{"grow-twice", func() (bool, error) { return RunGrowTwice(clients, baseDir) }})
+		steps = append(steps, step{"grow-unrescanned", func() (bool, error) { return RunGrowUnrescanned(clients, baseDir) }})
 	}
 
 	type result struct {
