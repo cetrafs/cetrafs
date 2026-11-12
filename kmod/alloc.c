@@ -4020,6 +4020,13 @@ int cetrafs_bg_claim_free(struct super_block *sb, u32 zg_id, u32 *out_bg_id)
     return -ENOSPC;
 }
 
+/* TEST ONLY: the next pool-pass group pauses between its claim and its
+ * release, so a heartbeat release of the same group can be caught trying
+ * to run in between (tests/kernel/fstrim_pool.sh). */
+static unsigned int cetrafs_fitrim_pool_stall_ms;
+cetrafs_test_param(fitrim_pool_stall_ms, cetrafs_fitrim_pool_stall_ms, uint, 0644);
+MODULE_PARM_DESC(fitrim_pool_stall_ms, "TEST ONLY: pause one FITRIM pool-pass group between claim and release");
+
 /*
  * FITRIM's pool pass, for one Block Group. A group handed back while
  * discard was off (`nodiscard`, or the control) went to the pool with
@@ -4036,36 +4043,69 @@ int cetrafs_bg_claim_free(struct super_block *sb, u32 zg_id, u32 *out_bg_id)
  * marked DISCARDED is skipped, so a pool is trimmed once, not on every
  * fstrim.
  *
+ * All of it under release_rwsem for write, like the heartbeat's surplus
+ * release (cetrafs_zg_release_surplus()), which is the only other caller
+ * of the release body. Without it the claimed group -- owned and empty --
+ * is exactly what that release looks for: two releases of one group
+ * interleaved, and the loser's undrain could re-mark as ours a group the
+ * winner had already published FREE, so the allocator took a block in a
+ * group a peer could claim. The same lock keeps the target Zone Group
+ * ours from the pick to the release (a ZG release runs under it too).
+ * Per group, so an allocator waiting in cetrafs_sb_release_wait() waits
+ * for one discard, as it does for the heartbeat; nothing under the lock
+ * takes trim_mutex.
+ *
  * Returns the blocks discarded in *out_blocks; -EIO when the discard's
  * outcome is unknown (the group then stays drained and pending, as for
- * any hand-back).
+ * any hand-back); -ENOENT when this node owns no Zone Group to claim
+ * into.
  */
-int cetrafs_bg_trim_pool_one(struct super_block *sb, u32 zg_id, u32 b, u64 *out_blocks)
+int cetrafs_bg_trim_pool_one(struct super_block *sb, u32 b, u64 *out_blocks)
 {
     struct cetrafs_bg_geom geom;
     unsigned long started = 0; /* one group, one discard: never over budget */
     bool discarded = false;
-    int ret;
+    unsigned int pause;
+    u32 zg_id;
+    int ret = 0;
 
     *out_blocks = 0;
+    cetrafs_sb_release_lock(sb);
     if (cetrafs_sb_bg_is_ours(sb, b))
-        return 0;
+        goto out;
     cetrafs_invalidate_block(sb, cetrafs_sb_bg_desc_lba(sb, b));
     if (cetrafs_read_bg_geom(sb, b, &geom) != 0)
-        return 0;
+        goto out;
     if (geom.owner_zg != CETRAFS_BG_OWNER_FREE || (geom.flags & CETRAFS_BG_FLAG_DISCARDED))
-        return 0;
+        goto out;
+    if (cetrafs_sb_first_owned_zg(sb, &zg_id)) {
+        ret = -ENOENT;
+        goto out;
+    }
     ret = cetrafs_bg_claim_one(sb, zg_id, b);
-    if (ret == -EAGAIN)
-        return 0; /* a peer has it now: its own hand-back will discard it */
+    if (ret == -EAGAIN) {
+        ret = 0; /* a peer has it now: its own hand-back will discard it */
+        goto out;
+    }
     if (ret)
-        return ret;
+        goto out;
+    pause = xchg(&cetrafs_fitrim_pool_stall_ms, 0);
+    if (pause) {
+        pr_info("fitrim pool: BG %u claimed, pausing %u ms (test)\n", b, pause);
+        msleep(pause); /* test-only; see the parameter */
+        pr_info("fitrim pool: BG %u resuming (test)\n", b);
+    }
     ret = cetrafs_bg_release_one(sb, zg_id, b, &started, true, &discarded);
-    if (ret == -EBUSY)
-        return -EIO;
+    if (ret == -EBUSY) {
+        ret = -EIO;
+        goto out;
+    }
     if (ret > 0 && discarded)
         *out_blocks = geom.data_block_count;
-    return 0;
+    ret = 0;
+out:
+    cetrafs_sb_release_unlock(sb);
+    return ret;
 }
 
 int cetrafs_bg_mount_info(struct super_block *sb, const cetrafs_superblock_t *raw_sb, u32 bg_id, u64 desc_lba,

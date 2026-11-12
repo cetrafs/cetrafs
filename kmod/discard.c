@@ -387,30 +387,30 @@ long cetrafs_fitrim_ioctl(struct file *file, struct fstrim_range __user *arg)
      * trimming less than was asked is allowed, more is not.
      */
     if (!ret && !READ_ONCE(cetrafs_fitrim_skip_pool)) {
-        u32 zg;
+        for (b = 0; b < nbg && !ret; b++) {
+            u64 data_start, data_count, blocks;
+            u32 owner;
 
-        if (cetrafs_sb_first_owned_zg(sb, &zg) == 0) {
-            for (b = 0; b < nbg && !ret; b++) {
-                u64 data_start, data_count, blocks;
-                u32 owner;
-
-                if (fatal_signal_pending(current)) {
-                    ret = -EINTR;
-                    break;
-                }
-                if (cetrafs_sb_bg_is_ours(sb, b))
-                    continue;
-                if (cetrafs_bg_data_region(sb, b, &data_start, &data_count, &owner))
-                    continue;
-                /* Its owner is judged fresh in cetrafs_bg_trim_pool_one(): a
-                 * cached copy could say "a peer's" of a group in the pool
-                 * for as long as nothing here re-reads it. */
-                if (data_start < start || data_start + data_count > end)
-                    continue;
-                ret = cetrafs_bg_trim_pool_one(sb, zg, b, &blocks);
-                trimmed += blocks;
-                cond_resched();
+            if (fatal_signal_pending(current)) {
+                ret = -EINTR;
+                break;
             }
+            if (cetrafs_sb_bg_is_ours(sb, b))
+                continue;
+            if (cetrafs_bg_data_region(sb, b, &data_start, &data_count, &owner))
+                continue;
+            /* Its owner is judged fresh in cetrafs_bg_trim_pool_one(): a
+             * cached copy could say "a peer's" of a group in the pool
+             * for as long as nothing here re-reads it. */
+            if (data_start < start || data_start + data_count > end)
+                continue;
+            ret = cetrafs_bg_trim_pool_one(sb, b, &blocks);
+            if (ret == -ENOENT) {
+                ret = 0; /* no Zone Group of ours to claim into: nothing to do */
+                break;
+            }
+            trimmed += blocks;
+            cond_resched();
         }
     }
     mutex_unlock(cetrafs_sb_trim_mutex(sb));

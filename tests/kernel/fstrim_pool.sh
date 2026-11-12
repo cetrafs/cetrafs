@@ -20,7 +20,9 @@
 #
 # DISCRIMINATION: with fitrim_skip_pool (the old FITRIM) case 1's fstrim
 # gives the space back to nobody, and case 2 asserts exactly that before
-# the real pass runs.
+# the real pass runs. Case 6 fails with the release_rwsem taken out of
+# cetrafs_bg_trim_pool_one(): the heartbeat hands the group back inside
+# the stall.
 set -euo pipefail
 . "$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)/lib/harness.sh"
 require_root
@@ -120,6 +122,36 @@ fstrim "$MNT" >/dev/null 2>&1 || fail "5: fstrim failed"
 [ $((BEFORE - $(used_kb))) -ge 90000 ] && [ "$(info discard_handback_bgs)" -gt "$HB3" ] &&
     pass "5: the group claimed and freed again was trimmed again" ||
     fail "5: the reused group was skipped: it went back to the pool still marked DISCARDED"
+
+# ------------------------------------------------------------------- 6
+# Between its claim and its release the pool pass holds an owned, empty
+# group: exactly what the heartbeat's release looks for. Two releases of
+# one group interleaved could leave it marked ours while it reads FREE,
+# so the pass runs under release_rwsem and the heartbeat must wait. The
+# stall holds the claimed group for several heartbeats; a hand-back of it
+# logged inside the stall is the race.
+log "6: the heartbeat cannot hand back a group the pool pass holds"
+echo "discard=off" >"$PROC/controls"
+fill_delete_handback || { fail "6 setup: the emptied Block Group was never handed back"; ct_exit; }
+echo "discard=on" >"$PROC/controls"
+MARK="$(dmesg_mark)"
+ct_param_set fitrim_pool_stall_ms 8000
+fstrim "$MNT" >/dev/null 2>&1 &
+FT=$!
+wait_for 20 "dmesg_since '$MARK' | grep -q 'fitrim pool: BG [0-9]* claimed, pausing'" ||
+    { fail "6 setup: the pool pass never claimed a group"; wait "$FT" || true; ct_exit; }
+wait "$FT" || fail "6: fstrim failed"
+ct_param_set fitrim_pool_stall_ms 0
+LOG="$(dmesg_since "$MARK")"
+PB="$(sed -n 's/.*fitrim pool: BG \([0-9]*\) claimed, pausing.*/\1/p' <<<"$LOG" | head -1)"
+grep -q "fitrim pool: BG $PB resuming" <<<"$LOG" || { fail "6 setup: the stalled group never resumed"; ct_exit; }
+IN="$(awk -v b="$PB" '$0 ~ "fitrim pool: BG " b " claimed" { s = 1; next }
+    $0 ~ "fitrim pool: BG " b " resuming" { s = 0 }
+    s && $0 ~ "BG " b " handed back from ZG" { n++ } END { print n + 0 }' <<<"$LOG")"
+[ "$IN" = 0 ] && pass "6: no hand-back of BG $PB while the pool pass held it" ||
+    fail "6: the heartbeat handed back BG $PB while the pool pass held it ($IN time(s))"
+grep -q "BG $PB handed back from ZG" <<<"$LOG" && pass "6: the pool pass handed it back itself, after the stall" ||
+    fail "6: BG $PB was never handed back"
 
 # ------------------------------------------------------------------- end
 ct_umount "$MNT"
