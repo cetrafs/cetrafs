@@ -3,8 +3,9 @@
 # fallocate(ZERO_RANGE) zeroes exactly its range, allocates it, and moves the size only without KEEP_SIZE
 #
 # ZERO_RANGE returned EOPNOTSUPP, so qemu's write-zeroes wrote real
-# zeroes through the data path. It is now a punch followed by a
-# preallocation of the same range (cetrafs_fallocate()). Each case is
+# zeroes through the data path. It now zeroes written blocks in place
+# where the device can (tests/kernel/zero_range_inplace.sh, which also
+# runs the other path) and preallocates the holes. Each case is
 # checked byte for byte against a model of the file, through the page
 # cache and with O_DIRECT, and the range must end up ALLOCATED (that is
 # what separates it from a punch):

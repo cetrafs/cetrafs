@@ -451,6 +451,7 @@ int cetrafs_bg_id_of_lba(struct super_block *sb, u64 lba, u32 *out_bg_id);
 /* discard.c */
 struct fstrim_range;
 bool cetrafs_discard_supported(struct super_block *sb);
+int cetrafs_zeroout_issue(struct super_block *sb, u64 lba, u64 count, bool unmap);
 int cetrafs_discard_handback(struct super_block *sb, u32 bg_id, unsigned long *pass_started, bool pending,
                              bool force, bool *discarded);
 long cetrafs_fitrim_ioctl(struct file *file, struct fstrim_range __user *arg);
@@ -1173,6 +1174,7 @@ u64 cetrafs_bg_geom_read_count(void);
 u64 cetrafs_pf_drain_count(void);
 u64 cetrafs_giveback_block_count(void);
 u64 cetrafs_convert_leaf_full_count(void);
+u64 cetrafs_zero_inplace_block_count(void);
 u64 cetrafs_tree_block_count(void);
 u64 cetrafs_tree_read_count(void);
 u64 cetrafs_file_cache_reconcile_count(void);

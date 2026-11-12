@@ -5887,6 +5887,201 @@ static int cetrafs_fallocate_modified(struct file *file)
     return file_modified(file);
 }
 
+/*
+ * ZERO_RANGE in place: the written blocks of the range are zeroed where
+ * they are, by the device (REQ_OP_WRITE_ZEROES), and the extent map is
+ * not touched.
+ *
+ * The alternative, a punch then a preallocation, frees every whole block
+ * and allocates a new one somewhere else. On an FC array a qemu-style
+ * stream of 1 MiB write-zeroes over a written image ran at 40 ops/s that
+ * way and took the image from 9 extents to 6264; zeroed in place the
+ * same stream is ~800 ops/s and the layout does not move
+ * (docs/internal/ZERO-RANGE-BENCHMARK.md).
+ *
+ * Preallocated (uninit) extents already read as zeros and are skipped;
+ * holes are left to the preallocation the caller runs next; the partial
+ * blocks at the edges are zeroed through the page cache, as punch does.
+ *
+ * Writing into blocks the file owns is what write(2) does, so this takes
+ * what a write takes and what punch takes on top: inode_lock (write(2),
+ * truncate, punch, defrag's steps), the direct-I/O drain, invalidate_lock
+ * EXCLUSIVELY (faults and readahead cannot bring a block of the range
+ * back into the cache while the device rewrites it), the write gate, and
+ * punch's refusal of a file a peer has open. Before the device writes,
+ * the range's cached pages are dropped and its pending conversions
+ * cancelled (below): a dirty page written back after the zeroing, or a
+ * conversion published after it, would put the old contents back.
+ *
+ * Returns -EOPNOTSUPP, having changed at most part of the range, when the
+ * device cannot zero in place; the caller then runs the punch, which is
+ * correct over a range in any state. *out_mapped says whether every
+ * whole block of the range was found mapped, so the caller may skip the
+ * preallocation.
+ */
+static atomic64_t cetrafs_zero_inplace_blocks = ATOMIC64_INIT(0);
+
+u64 cetrafs_zero_inplace_block_count(void)
+{
+    return (u64) atomic64_read(&cetrafs_zero_inplace_blocks);
+}
+
+/* TEST ONLY: ZERO_RANGE takes the punch + preallocation path, as on a
+ * device without WRITE ZEROES (tests/kernel/zero_range_inplace.sh). */
+static bool cetrafs_zero_inplace_off;
+cetrafs_test_param(zero_inplace_off, cetrafs_zero_inplace_off, bool, 0644);
+MODULE_PARM_DESC(zero_inplace_off, "TEST ONLY: ZERO_RANGE punches and preallocates instead of zeroing in place");
+
+static long cetrafs_zero_range_inplace(struct file *file, loff_t offset, loff_t len, bool *out_mapped)
+{
+    struct inode *inode = file_inode(file);
+    struct super_block *sb = inode->i_sb;
+    struct block_device *bdev = sb->s_bdev;
+    struct cetrafs_inode_extents ex;
+    cetrafs_inode_t *raw = NULL;
+    u64 start_block, end_block, mapped = 0, zeroed = 0;
+    loff_t isize, end, head_end, tail_start;
+    bool unmap;
+    u32 i, my_node_id;
+    int ret;
+
+    *out_mapped = false;
+    if (READ_ONCE(cetrafs_zero_inplace_off) || !bdev_write_zeroes_sectors(bdev))
+        return -EOPNOTSUPP;
+    raw = kmalloc(sizeof(*raw), GFP_NOFS);
+    if (!raw)
+        return -ENOMEM;
+
+    inode_lock(inode);
+    ret = cetrafs_fallocate_modified(file);
+    if (ret) {
+        inode_unlock(inode);
+        kfree(raw);
+        return ret;
+    }
+    inode_dio_wait(inode); /* before invalidate_lock: a DIO completion takes it */
+    filemap_invalidate_lock(inode->i_mapping);
+    cetrafs_lock_expire_verdicts(inode);
+    ret = cetrafs_sb_is_fenced(sb) ? -EIO : cetrafs_lock_write_gate(inode);
+    if (ret)
+        goto out;
+    ret = cetrafs_sb_get_node_id(sb, &my_node_id);
+    if (ret)
+        goto out;
+    {
+        bool blocked = false, reader = false;
+
+        ret = cetrafs_lock_foreign_user_exists(sb, inode->i_ino, my_node_id, &blocked, &reader);
+        if (ret)
+            goto out;
+        if (blocked || reader) {
+            pr_warn_ratelimited("zero range: ino=%llu is open on another node -- refusing to zero it\n",
+                                (unsigned long long) inode->i_ino);
+            ret = -ETXTBSY;
+            goto out;
+        }
+    }
+
+    isize = i_size_read(inode);
+    end = offset + len;
+    if (end > isize)
+        end = isize; /* past EOF there is no data: the preallocation's part */
+    if (end <= offset) {
+        ret = 0;
+        goto out;
+    }
+    start_block = CETRAFS_DIV_ROUND_UP((u64) offset, CETRAFS_BLOCK_SIZE);
+    end_block = (u64) end / CETRAFS_BLOCK_SIZE;
+
+    if (start_block < end_block) {
+        /* Unmaps and drops the folios of the whole blocks, dirty ones
+         * included -- their data is about to be zeros, so writing it back
+         * first would only be undone -- and waits out any writeback
+         * already in flight on them, which would otherwise land after
+         * the zeroing. A store through a mapping now faults, and the
+         * fault waits on invalidate_lock. */
+        truncate_pagecache_range(inode, (loff_t) start_block * CETRAFS_BLOCK_SIZE,
+                                 (loff_t) end_block * CETRAFS_BLOCK_SIZE - 1);
+        /* And, as punch does, the blocks leave the pending set: a buffered
+         * write into preallocated space whose conversion is still pending
+         * would otherwise be flipped to written at the next close or
+         * fsync, over the zeros -- publishing what was on the device. Left
+         * uninit, they read as zeros, which is the point. */
+        if (start_block <= U32_MAX)
+            cetrafs_pending_clear(inode, (u32) start_block, (u32) min_t(u64, end_block - 1, U32_MAX));
+
+        ret = cetrafs_read_raw_inode_overlaid(sb, inode, raw);
+        if (ret)
+            goto out;
+        ret = cetrafs_inode_extents_get(inode, raw, &ex);
+        if (ret)
+            goto out;
+        unmap = cetrafs_sb_discard_enabled(sb);
+        for (i = 0; i < ex.entries && !ret; i++) {
+            const cetrafs_extent_t *e = &ex.arr[i];
+            u64 eb = cetrafs_le32(e->ee_block);
+            u64 elen = cetrafs_extent_len(e->ee_len);
+            u64 lo = max_t(u64, eb, start_block), hi = min_t(u64, eb + elen, end_block);
+            u64 plba;
+
+            if (lo >= hi)
+                continue;
+            mapped += hi - lo;
+            if (cetrafs_extent_is_uninit(e->ee_len))
+                continue; /* reads as zeros already */
+            plba = cetrafs_extent_phys_from_hilo(e->ee_start_hi, e->ee_start_lo) + (lo - eb);
+            /* An address read off the disk, about to aim a write (rule
+             * 19): the same check every mapping gets. */
+            ret = cetrafs_lba_run_check(sb, plba, hi - lo);
+            if (ret) {
+                if (ret == -EAGAIN) {
+                    ret = -EIO;
+                } else {
+                    pr_err_ratelimited("ino=%llu: extent [block %llu +%llu] at lba %llu is not a data address -- "
+                                       "refusing to zero it (fsck)\n",
+                                       (unsigned long long) inode->i_ino, eb, elen, (unsigned long long) plba);
+                    cetrafs_sb_corrupt_inode(inode);
+                    ret = -EUCLEAN;
+                }
+                break;
+            }
+            ret = cetrafs_zeroout_issue(sb, plba, hi - lo, unmap);
+            if (!ret)
+                zeroed += hi - lo;
+            cond_resched();
+        }
+        cetrafs_inode_extents_put(&ex);
+        atomic64_add(zeroed, &cetrafs_zero_inplace_blocks);
+        if (ret)
+            goto out;
+    }
+
+    /*
+     * The edges: a block only partly inside [offset, end) keeps the rest
+     * of its data, so only its in-range part is zeroed, through the
+     * write path -- one piece per block, never crossing a block boundary
+     * (the punch's straddle bug, rule 11). head is [offset, the first
+     * boundary or end); tail is [the last boundary, end), when that is
+     * not inside head.
+     */
+    head_end = min_t(loff_t, end, (loff_t) start_block * CETRAFS_BLOCK_SIZE);
+    tail_start = max_t(loff_t, offset, (loff_t) (end & ~(loff_t) (CETRAFS_BLOCK_SIZE - 1)));
+    if (offset < head_end)
+        ret = cetrafs_zero_range(inode->i_mapping, offset, (size_t) (head_end - offset));
+    if (!ret && tail_start < end && tail_start >= head_end)
+        ret = cetrafs_zero_range(inode->i_mapping, tail_start, (size_t) (end - tail_start));
+    if (!ret) {
+        inode_set_mtime_to_ts(inode, inode_set_ctime_current(inode));
+        mark_inode_dirty(inode);
+        *out_mapped = (u64) offset + (u64) len <= (u64) isize && mapped == end_block - min(start_block, end_block);
+    }
+out:
+    filemap_invalidate_unlock(inode->i_mapping);
+    inode_unlock(inode);
+    kfree(raw);
+    return ret;
+}
+
 static long cetrafs_fallocate(struct file *file, int mode, loff_t offset, loff_t len)
 {
     struct inode *inode = file_inode(file);
@@ -5920,8 +6115,13 @@ static long cetrafs_fallocate(struct file *file, int mode, loff_t offset, loff_t
     }
 
     /*
-     * ZERO_RANGE: a punch, then a preallocation, of the same range. The
-     * punch frees every whole block and zeroes the partial ones at the
+     * ZERO_RANGE: zeroed in place where the device can
+     * (cetrafs_zero_range_inplace()), then a preallocation of the range
+     * for its holes and i_size -- skipped when every block was mapped and
+     * nothing lies past EOF. Where the device cannot zero in place: a
+     * punch, then the preallocation, as follows.
+     *
+     * The punch frees every whole block and zeroes the partial ones at the
      * edges; the preallocation fills the holes it left with uninit
      * extents, which read as zeroes, and moves i_size unless KEEP_SIZE.
      * Each step is the vetted path with its own locks, foreign-open
@@ -5934,10 +6134,15 @@ static long cetrafs_fallocate(struct file *file, int mode, loff_t offset, loff_t
      * qemu's write-zeroes uses this; without it qemu wrote the zeroes.
      */
     if (mode == FALLOC_FL_ZERO_RANGE || mode == (FALLOC_FL_ZERO_RANGE | FALLOC_FL_KEEP_SIZE)) {
+        bool mapped = false;
         long zrc;
 
         kfree(recs);
-        zrc = cetrafs_fallocate(file, FALLOC_FL_PUNCH_HOLE | FALLOC_FL_KEEP_SIZE, offset, len);
+        zrc = cetrafs_zero_range_inplace(file, offset, len, &mapped);
+        if (zrc == -EOPNOTSUPP)
+            zrc = cetrafs_fallocate(file, FALLOC_FL_PUNCH_HOLE | FALLOC_FL_KEEP_SIZE, offset, len);
+        else if (!zrc && mapped)
+            return 0;
         if (!zrc)
             zrc = cetrafs_fallocate(file, mode & FALLOC_FL_KEEP_SIZE, offset, len);
         return zrc;

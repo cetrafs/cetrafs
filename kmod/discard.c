@@ -170,16 +170,14 @@ bool cetrafs_discard_supported(struct super_block *sb)
  * clipped: a caller computing such a range is wrong about something
  * else too.
  */
-static int cetrafs_discard_issue(struct super_block *sb, u32 bg_id, u64 lba, u64 count)
+/* The range check both issuers make: [lba, +count) inside the data
+ * region of Block Group bg_id, both ends resolving to it. */
+static int cetrafs_issue_range_ok(struct super_block *sb, const char *what, u32 bg_id, u64 lba, u64 count)
 {
     u64 data_start, data_count;
     u32 owner, first_bg, last_bg;
     int ret;
 
-    if (!count)
-        return 0;
-    if (cetrafs_sb_is_fenced(sb))
-        return -EIO;
     ret = cetrafs_bg_data_region(sb, bg_id, &data_start, &data_count, &owner);
     if (ret)
         return ret;
@@ -187,11 +185,25 @@ static int cetrafs_discard_issue(struct super_block *sb, u32 bg_id, u64 lba, u64
         cetrafs_bg_id_of_lba(sb, lba, &first_bg) || cetrafs_bg_id_of_lba(sb, lba + count - 1, &last_bg) ||
         first_bg != bg_id || last_bg != bg_id) {
         atomic64_inc(&cetrafs_discard_refused);
-        pr_err("%s: discard [%llu +%llu) is not inside BG %u's data region [%llu +%llu) -- refused\n", sb->s_id,
+        pr_err("%s: %s [%llu +%llu) is not inside BG %u's data region [%llu +%llu) -- refused\n", sb->s_id, what,
                (unsigned long long) lba, (unsigned long long) count, bg_id, (unsigned long long) data_start,
                (unsigned long long) data_count);
         return -EUCLEAN;
     }
+    return 0;
+}
+
+static int cetrafs_discard_issue(struct super_block *sb, u32 bg_id, u64 lba, u64 count)
+{
+    int ret;
+
+    if (!count)
+        return 0;
+    if (cetrafs_sb_is_fenced(sb))
+        return -EIO;
+    ret = cetrafs_issue_range_ok(sb, "discard", bg_id, lba, count);
+    if (ret)
+        return ret;
 
     if (READ_ONCE(cetrafs_discard_fail_unknown) || READ_ONCE(cetrafs_discard_fail_definite)) {
         unsigned int n = READ_ONCE(cetrafs_discard_fail_unknown);
@@ -217,6 +229,35 @@ failed:
     atomic64_inc(&cetrafs_discard_cmds);
     atomic64_add((s64) count, &cetrafs_discard_blocks);
     return 0;
+}
+
+/*
+ * The device zeroes [lba, +count) in place (REQ_OP_WRITE_ZEROES), for
+ * ZERO_RANGE (cetrafs_zero_range_inplace()). A write of zeros is as
+ * destructive as a discard when it is aimed wrong, and with unmap
+ * allowed it IS a discard on a thin array, so it goes through the same
+ * range check: the run must lie inside one Block Group's data region,
+ * resolved here from the LBA (class 50). The caller gives a run of one
+ * extent; an extent never crosses a group, so a run that does is refused
+ * as -EUCLEAN, never split. -EOPNOTSUPP: the device cannot zero in place.
+ */
+int cetrafs_zeroout_issue(struct super_block *sb, u64 lba, u64 count, bool unmap)
+{
+    u32 bg_id;
+    int ret;
+
+    if (!count)
+        return 0;
+    if (cetrafs_sb_is_fenced(sb))
+        return -EIO;
+    if (cetrafs_bg_id_of_lba(sb, lba, &bg_id))
+        return -EUCLEAN;
+    ret = cetrafs_issue_range_ok(sb, "zeroout", bg_id, lba, count);
+    if (ret)
+        return ret;
+    return blkdev_issue_zeroout(sb->s_bdev, (sector_t) lba * (CETRAFS_BLOCK_SIZE >> SECTOR_SHIFT),
+                                (sector_t) count * (CETRAFS_BLOCK_SIZE >> SECTOR_SHIFT), GFP_NOFS,
+                                BLKDEV_ZERO_NOFALLBACK | (unmap ? 0 : BLKDEV_ZERO_NOUNMAP));
 }
 
 /*
