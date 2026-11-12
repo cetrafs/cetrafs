@@ -1600,6 +1600,12 @@ static int cetrafs_journal_batch_chunk(struct super_block *sb, struct cetrafs_jo
  * says which reached the device; the rest stay held back for a retry.
  * mkfs -J 0 has no journal: step 0, then the targets in place.
  */
+/* TEST ONLY: a deferred batch skips step 0's cache flush -- the negative
+ * control for tests/crash/leaf_batch_order.sh. */
+static bool cetrafs_journal_batch_skip_flush;
+cetrafs_test_param(journal_batch_skip_flush, cetrafs_journal_batch_skip_flush, bool, 0644);
+MODULE_PARM_DESC(journal_batch_skip_flush, "TEST ONLY: a held-back leaf batch does not flush the cache first");
+
 int cetrafs_journal_write_deferred(struct super_block *sb, struct buffer_head **bhs,
                                    const struct cetrafs_journal_owner *owners, const u32 *disk_crc, unsigned int n,
                                    bool *written, u32 *wcrc)
@@ -1618,7 +1624,7 @@ int cetrafs_journal_write_deferred(struct super_block *sb, struct buffer_head **
     ret = cetrafs_alloc_flush_bitmaps(sb);
     if (ret)
         return ret;
-    ret = blkdev_issue_flush(sb->s_bdev);
+    ret = READ_ONCE(cetrafs_journal_batch_skip_flush) ? 0 : blkdev_issue_flush(sb->s_bdev);
     if (ret)
         return ret; /* nothing written: the blocks stay held back */
 

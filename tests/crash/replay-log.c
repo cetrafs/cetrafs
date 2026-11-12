@@ -30,6 +30,14 @@
  *   replay-log --log <logdev> --replay <dev> [--limit-fua N | --end-mark NAME]
  *       replay onto <dev>: all entries, or up to and including the Nth
  *       FLUSH/FUA barrier, or up to the entry just before mark NAME
+ *   replay-log --log <logdev> --check-flushed-after-mark NAME
+ *              --data-start LBA --journal-start LBA --journal-blocks N
+ *       order check, no replay: from mark NAME on, at the FIRST write into
+ *       the journal area, print how many data-region writes (file data
+ *       and the bitmaps that live in the Block Groups) were issued since
+ *       the last FLUSH -- i.e. are not yet durable. A batch's entries name
+ *       data and bits that must already be on the platter, so the answer
+ *       must be 0. Prints "pending=<n> first=<lba>" (or "no-journal-write")
  *   replay-log --log <logdev> --replay <dev> --reorder-after-fua N
  *              --data-start LBA --journal-start LBA --journal-blocks N
  *       model a volatile-cache power cut: everything through barrier N durable,
@@ -299,12 +307,67 @@ static int replay_reorder(int logfd, int replayfd, uint64_t nr_entries, uint32_t
     return 0;
 }
 
+static int check_flushed(int logfd, uint64_t nr_entries, uint32_t ss, const char *mark,
+                         uint64_t data_start_lba, uint64_t jstart_lba, uint64_t jblocks)
+{
+    off_t pos = ss;
+    off_t dlo = (off_t) data_start_lba * 4096, jlo = (off_t) jstart_lba * 4096;
+    off_t jhi = jlo + (off_t) jblocks * 4096;
+    uint64_t pending = 0, first_pending = 0;
+    int started = 0;
+    uint8_t hdr[32];
+
+    for (uint64_t i = 0; i < nr_entries; i++) {
+        if (read_at(logfd, hdr, sizeof(hdr), pos)) {
+            fprintf(stderr, "truncated log at entry %llu\n", (unsigned long long) i);
+            return 1;
+        }
+        uint64_t sector = rd64(hdr), nr = rd64(hdr + 8), flags = rd64(hdr + 16), data_len = rd64(hdr + 24);
+        off_t hdr_region = (off_t) roundup(32 + data_len, ss);
+        int is_discard = (flags & LOG_DISCARD_FLAG) != 0;
+        off_t next = pos + hdr_region + (is_discard ? 0 : (off_t) nr * ss);
+        off_t at = (off_t) sector * 512;
+
+        if (flags & LOG_MARK_FLAG) {
+            if (!started && data_len) {
+                char name[256];
+                size_t n = data_len < sizeof(name) - 1 ? data_len : sizeof(name) - 1;
+                if (!read_at(logfd, name, n, pos + 32)) {
+                    name[n] = '\0';
+                    started = !strcmp(name, mark);
+                }
+            }
+            pos = next;
+            continue;
+        }
+        /* A FLUSH makes everything completed before it durable. */
+        if (flags & LOG_FLUSH_FLAG)
+            pending = 0;
+        if (started && nr && !is_discard) {
+            if (at >= jlo && at < jhi) {
+                printf("pending=%llu first=%llu\n", (unsigned long long) pending,
+                       (unsigned long long) (first_pending));
+                return 0;
+            }
+            if (at >= dlo && !(flags & LOG_FUA_FLAG)) {
+                if (!pending)
+                    first_pending = (uint64_t) (at / 4096);
+                pending++;
+            }
+        }
+        pos = next;
+    }
+    printf("no-journal-write\n");
+    return 3;
+}
+
 int main(int argc, char **argv)
 {
     const char *logpath = NULL, *replaypath = NULL, *end_mark = NULL;
     long limit_fua = -1, reorder_after = -1;
     uint64_t data_start_lba = 0, journal_start_lba = 0, journal_blocks = 0;
     int count_fua = 0, count_marks = 0;
+    const char *check_mark = NULL;
 
     for (int i = 1; i < argc; i++) {
         if (!strcmp(argv[i], "--log") && i + 1 < argc)
@@ -327,6 +390,8 @@ int main(int argc, char **argv)
             opt_tear_sectors = atol(argv[++i]);
         else if (!strcmp(argv[i], "--tear-blocks") && i + 1 < argc)
             opt_tear_blocks = atol(argv[++i]);
+        else if (!strcmp(argv[i], "--check-flushed-after-mark") && i + 1 < argc)
+            check_mark = argv[++i];
         else if (!strcmp(argv[i], "--count-fua"))
             count_fua = 1;
         else if (!strcmp(argv[i], "--count-marks"))
@@ -363,6 +428,17 @@ int main(int argc, char **argv)
         fprintf(stderr, "unsupported log version %llu / sectorsize %u\n",
                 (unsigned long long) version, ss);
         return 1;
+    }
+
+    if (check_mark) {
+        if (!data_start_lba || !journal_start_lba || !journal_blocks) {
+            fprintf(stderr, "--check-flushed-after-mark needs --data-start, --journal-start, --journal-blocks\n");
+            return 2;
+        }
+        int rc = check_flushed(logfd, nr_entries, ss, check_mark, data_start_lba, journal_start_lba,
+                               journal_blocks);
+        close(logfd);
+        return rc;
     }
 
     int replayfd = -1;
