@@ -23,9 +23,13 @@ import (
 // The volume is rebuilt small (4 GiB, 512 MiB groups, two Zone Groups)
 // and B fills what it can allocate until ENOSPC, then frees 512 MiB. B
 // then opens vm.img and writes
-// 1.5 GiB into it through one held fd, fsync per 4 MiB chunk, while A
+// into it through one held fd, fsync per 4 MiB chunk, while A
 // grows the volume to 6 GiB and then to 8 GiB. B's writes can only land
-// if B adopts each grow and claims the groups it adds as they appear.
+// if B adopts each grow and claims the groups it adds as they appear;
+// it streams until it has adopted the second grow and then 256 MiB
+// more, so part of the image can only live in that grow. The heartbeat refresh is
+// off on B while it streams, so only the ENOSPC refresh can adopt a
+// grow; it is turned back on afterwards for the catch-up check.
 // Then: both nodes at layout_gen +2 with the same capacity, every chunk
 // of the image reads back on A, fsck clean. The LUN is reformatted to
 // its full size afterwards.
@@ -151,9 +155,14 @@ func RunGrowTwice(clients []*Client, baseDir string) (bool, error) {
 	if err := decodeResult(b.Name, resp, err, &oh); err != nil {
 		return false, fmt.Errorf("%s: open vm.img: %w", b.Name, err)
 	}
+	// B streams until it has adopted the second grow, then 256 MiB more
+	// into the space only that grow added. How much the first grow alone
+	// leaves room for depends on which groups B claims, so the size is
+	// not fixed; the cap bounds a node that never adopts it.
 	const chunk = 4 << 20
-	const imgBytes = 1536 << 20
-	sums := make([]string, imgBytes/chunk)
+	const maxBytes = 5632 << 20
+	const after2 = (256 << 20) / chunk
+	sums := make([]string, 0, maxBytes/chunk)
 	var (
 		werr error
 		wg   sync.WaitGroup
@@ -161,7 +170,8 @@ func RunGrowTwice(clients []*Client, baseDir string) (bool, error) {
 	wg.Add(1)
 	go func() {
 		defer wg.Done()
-		for i := range sums {
+		left := -1
+		for i := 0; i < maxBytes/chunk && left != 0; i++ {
 			resp, err := b.Call("write_held", HeldIOArgs{Handle: oh.Handle, Offset: int64(i) * chunk, Size: chunk,
 				Stamp: fmt.Sprintf("vm-%04d-", i)})
 			var hr HeldIOResult
@@ -169,7 +179,12 @@ func RunGrowTwice(clients []*Client, baseDir string) (bool, error) {
 				werr = fmt.Errorf("chunk %d (%d MiB in): %w", i, i*chunk>>20, err)
 				return
 			}
-			sums[i] = hr.Checksum
+			sums = append(sums, hr.Checksum)
+			if left > 0 {
+				left--
+			} else if left < 0 && i%8 == 7 && infoOf(b, "layout_gen") == gen0b+2 {
+				left = after2
+			}
 		}
 	}()
 
@@ -194,8 +209,15 @@ func RunGrowTwice(clients []*Client, baseDir string) (bool, error) {
 			strings.Contains(werr.Error(), "no space"), fmt.Sprint(werr))
 		return ok, nil
 	}
-	check(&ok, b.Name+" streamed all 1.5 GiB of the image through both grows", werr == nil, fmt.Sprint(werr))
+	check(&ok, b.Name+" streamed the image through both grows", werr == nil, fmt.Sprint(werr))
 
+	if werr == nil {
+		gs := infoOf(b, "layout_gen")
+		check(&ok, "setup: "+b.Name+" adopted the second grow while streaming (by the ENOSPC refresh)", gs == gen0b+2,
+			fmt.Sprintf("B %d->%d", gen0b, gs))
+	}
+	// Hand B back its heartbeat refresh: the catch-up below is that path.
+	_ = callOK(b, "mod_param", ModParamArgs{Name: "layout_refresh_hb_off", Value: "0"})
 	deadline := time.Now().Add(60 * time.Second)
 	for infoOf(b, "layout_gen") != gen0b+2 && time.Now().Before(deadline) {
 		time.Sleep(time.Second)
