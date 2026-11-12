@@ -853,12 +853,15 @@ struct cetrafs_sb_info {
 
     /* Frees in flight: operations between a publish that dropped blocks
      * and the frees of those blocks (cetrafs_frees_begin()). The count
-     * and seq are what this node's own scrub asks; frees_row_flag is
-     * whether our registry row says so to everyone else's. All three
-     * under frees_mutex, which is held across the row CAS so a begin
-     * cannot be overtaken by the heartbeat's clear. */
+     * and seq are what this node's own scrub asks; frees_foreign counts
+     * those with a block outside our own Block Groups, the only ones a
+     * peer's scrub judges, and frees_row_flag is whether our registry
+     * row says so to everyone else's. All under frees_mutex, which is
+     * held across the row CAS so a begin cannot be overtaken by the
+     * heartbeat's clear. */
     struct mutex frees_mutex;
     unsigned int frees_count;
+    unsigned int frees_foreign;
     bool frees_row_flag;
     u64 frees_local_seq;
 };
@@ -4065,28 +4068,63 @@ u64 cetrafs_sb_resv_seq(struct super_block *sb)
 }
 
 /*
- * Frees in flight (cetrafs_node_entry_t.frees_inflight; audit 2026-11-06,
+* Frees in flight (cetrafs_node_entry_t.frees_inflight; audit 2026-11-06,
  * N2 sweep finding A).
  *
  * cetrafs_frees_begin() goes BEFORE a publish that drops blocks this
  * operation then frees, cetrafs_frees_end() after the last of those
  * frees (or after deciding to leave them to the scrub). Between the two
  * the blocks are named by nothing and not yet free, and the scrub -- this
- * node's, and above all the owning peer's -- must not judge them leaked.
+ * node's, and the owning peer's -- must not judge them leaked.
+ *
+ * 'foreign': some dropped block lies outside the Block Groups this node
+ * owns (cetrafs_lba_run_is_ours()). Only then can a PEER's scrub judge
+ * one, so only then does the operation say so in our registry row, which
+ * every peer's scrub reads and abandons its cycle over. Announcing every
+ * free stopped every scrub in the cluster whenever any node punched a
+ * hole in its own image -- a guest discard -- and a node that does that
+ * every heartbeat never let one finish (TODO, class 46). Our own scrub
+ * still counts every free (frees_count). The verdict is safe in both
+ * directions it can be wrong in: a group this node owns is authoritative
+ * in its own cache -- it leaves only by our release, which takes only an
+ * empty group, or by a peer's steal, which fences us first and our frees
+ * then never land -- and anything unreadable or unowned reads foreign.
+ *
  * The row flag is written durably before begin returns; a node that
  * cannot write it (fenced, its row lost) must not publish at all, so the
  * error goes back to the operation. The flag is cleared lazily, by the
- * heartbeat, once nothing is in flight.
+ * heartbeat, once nothing foreign is in flight.
  */
-int cetrafs_frees_begin(struct super_block *sb)
+/* TEST ONLY: every free is announced in the registry row, as before the
+ * scoping -- the control of scrub_spares_inflight_free's own-group part,
+ * and on one node (where every group is ours) the way to put the row in
+ * play at all. */
+static bool cetrafs_frees_announce_all;
+cetrafs_test_param(frees_announce_all, cetrafs_frees_announce_all, bool, 0644);
+MODULE_PARM_DESC(frees_announce_all, "TEST ONLY: announce every free in flight in the registry row, ours or not");
+
+static atomic64_t cetrafs_frees_announced = ATOMIC64_INIT(0);
+
+u64 cetrafs_frees_announced_count(void)
+{
+    return (u64) atomic64_read(&cetrafs_frees_announced);
+}
+
+/* *foreign: in, the operation's verdict; out, what this begin counted --
+ * the value its cetrafs_frees_end() must be given. */
+int cetrafs_frees_begin(struct super_block *sb, bool *foreign_io)
 {
     struct cetrafs_sb_info *sbi = sb->s_fs_info;
+    bool foreign = *foreign_io;
     int ret = 0;
 
     if (!sbi)
         return -EINVAL;
+    if (READ_ONCE(cetrafs_frees_announce_all))
+        foreign = true; /* test-only; see the parameter */
+    *foreign_io = foreign;
     mutex_lock(&sbi->frees_mutex);
-    if (!sbi->frees_row_flag) {
+    if (foreign && !sbi->frees_row_flag) {
         ret = cetrafs_node_set_frees(sb, sbi->node_id, true);
         if (ret) {
             mutex_unlock(&sbi->frees_mutex);
@@ -4107,13 +4145,18 @@ int cetrafs_frees_begin(struct super_block *sb)
         }
         sbi->frees_row_flag = true;
     }
+    if (foreign) {
+        sbi->frees_foreign++;
+        atomic64_inc(&cetrafs_frees_announced);
+    }
     sbi->frees_count++;
     sbi->frees_local_seq++;
     mutex_unlock(&sbi->frees_mutex);
     return 0;
 }
 
-void cetrafs_frees_end(struct super_block *sb)
+/* 'foreign' as the begin it ends left it. */
+void cetrafs_frees_end(struct super_block *sb, bool foreign)
 {
     struct cetrafs_sb_info *sbi = sb->s_fs_info;
 
@@ -4122,11 +4165,14 @@ void cetrafs_frees_end(struct super_block *sb)
     mutex_lock(&sbi->frees_mutex);
     if (!WARN_ON_ONCE(!sbi->frees_count))
         sbi->frees_count--;
+    if (foreign && !WARN_ON_ONCE(!sbi->frees_foreign))
+        sbi->frees_foreign--;
     mutex_unlock(&sbi->frees_mutex);
 }
 
-/* Heartbeat tick: clear our row's flag once nothing is in flight. A
- * failure leaves it set -- peers' scrubs keep waiting, which is safe. */
+/* Heartbeat tick: clear our row's flag once nothing foreign is in
+ * flight. A failure leaves it set -- peers' scrubs keep waiting, which
+ * is safe. */
 void cetrafs_frees_heartbeat(struct super_block *sb)
 {
     struct cetrafs_sb_info *sbi = sb->s_fs_info;
@@ -4134,7 +4180,7 @@ void cetrafs_frees_heartbeat(struct super_block *sb)
     if (!sbi)
         return;
     mutex_lock(&sbi->frees_mutex);
-    if (!sbi->frees_count && sbi->frees_row_flag && !cetrafs_node_set_frees(sb, sbi->node_id, false))
+    if (!sbi->frees_foreign && sbi->frees_row_flag && !cetrafs_node_set_frees(sb, sbi->node_id, false))
         sbi->frees_row_flag = false;
     mutex_unlock(&sbi->frees_mutex);
 }

@@ -336,6 +336,7 @@ static int cetrafs_xattr_set_locked(struct inode *inode, const char *name, const
     unsigned int i;
     int idx, ret;
     bool any_left;
+    bool foreign; /* the freed block is outside our own groups (cetrafs_frees_begin()) */
 
     if (name_len >= CETRAFS_XATTR_KEY_MAX)
         return -ENAMETOOLONG;
@@ -528,7 +529,8 @@ static int cetrafs_xattr_set_locked(struct inode *inode, const char *name, const
         brelse(bh);
         /* Between the clear and the free the block is named by nothing
          * and not yet free: announced first (cetrafs_frees_begin()). */
-        ret = cetrafs_frees_begin(sb);
+        foreign = !cetrafs_lba_run_is_ours(sb, old_lba, 1);
+        ret = cetrafs_frees_begin(sb, &foreign);
         if (ret)
             return ret;
         {
@@ -539,7 +541,7 @@ static int cetrafs_xattr_set_locked(struct inode *inode, const char *name, const
                                        cetrafs_ns_apply_xattr, &u);
         }
         if (ret) {
-            cetrafs_frees_end(sb);
+            cetrafs_frees_end(sb, foreign);
             return ret;
         }
         /* The free must not reach the device ahead of the clear that
@@ -550,11 +552,11 @@ static int cetrafs_xattr_set_locked(struct inode *inode, const char *name, const
             pr_err("removexattr: ino=%llu: the device refused a cache flush -- leaving xattr block %llu allocated "
                    "for the scrub\n",
                    (unsigned long long) inode->i_ino, (unsigned long long) old_lba);
-            cetrafs_frees_end(sb);
+            cetrafs_frees_end(sb, foreign);
             return 0;
         }
         cetrafs_free_data_block(sb, old_lba);
-        cetrafs_frees_end(sb);
+        cetrafs_frees_end(sb, foreign);
         return 0;
     }
 

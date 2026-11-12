@@ -1067,8 +1067,10 @@ typedef struct {
      * for the owner's scrub to free them first and its drain to free them
      * again later (audit 2026-11-06, N2 sweep finding A).
      *
-     * So a node sets frees_inflight here, durably, before such a publish,
-     * and clears it on a heartbeat tick once none is left; frees_seq goes
+     * So a node sets frees_inflight here, durably, before such a publish
+     * when any block it drops lies outside the Block Groups it owns --
+     * only those can a peer's scrub judge (cetrafs_frees_begin()) -- and
+     * clears it on a heartbeat tick once none is left; frees_seq goes
      * up each time it is set. A scrub abandons its cycle while any live
      * row is set, or if any row's frees_seq moved during the cycle.
      * Carved from the zero-filled reserved area like the fields above:

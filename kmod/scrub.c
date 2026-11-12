@@ -55,9 +55,10 @@
  *     point 3's runs. When a peer owns them the frees are one queue CAS
  *     per extent -- seconds to minutes for a fragmented image -- so a
  *     cycle could free them first and the drain free them again. Each
- *     such operation announces itself in its registry row first
- *     (cetrafs_frees_begin()), and a cycle in which any live node had
- *     frees in flight, or began some, frees nothing
+ *     such operation counts itself first, and announces itself in its
+ *     registry row when any block it drops is outside its own groups
+ *     (cetrafs_frees_begin()); a cycle in which this node, or any live
+ *     node's row, had frees in flight, or began some, frees nothing
  *     (cetrafs_frees_quiet(); tests/kernel/scrub_spares_inflight_free.sh).
  *
  * The reference set is built from ALLOCATED inodes only. cetrafs_free_

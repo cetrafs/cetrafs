@@ -2868,6 +2868,37 @@ int cetrafs_free_data_extent_unless_reserved(struct super_block *sb, u64 lba, u3
     return __cetrafs_free_data_extent(sb, lba, count, &resv_seq);
 }
 
+/*
+ * Does [lba, lba+count) lie in one Block Group this node owns -- the
+ * blocks the free path below would clear in our own bitmap rather than
+ * queue to a peer? Asked by a freeing operation before its publish
+ * (cetrafs_frees_begin()): blocks only in our own groups are judged by
+ * no peer's scrub, so the operation need not stop theirs.
+ *
+ * The cached descriptor is the right read here, and not only for speed:
+ * a group this node owns is written by this node alone and leaves it
+ * only by our own release (which takes only an EMPTY group, and these
+ * blocks are allocated) or by a peer's steal (which fences us, and our
+ * frees then never land). Every other answer -- a foreign or unowned
+ * group, an unreadable descriptor, a run past the data region -- is
+ * "not ours", which announces: the safe direction.
+ */
+bool cetrafs_lba_run_is_ours(struct super_block *sb, u64 lba, u64 count)
+{
+    struct cetrafs_bg_geom bg;
+    u64 data_start;
+    u32 bg_id;
+
+    if (!count)
+        return true;
+    if (cetrafs_bg_id_for_lba(sb, lba, &bg_id) || cetrafs_read_bg_geom(sb, bg_id, &bg))
+        return false;
+    if (bg.owner_zg == CETRAFS_BG_OWNER_FREE || !cetrafs_sb_zg_owned_cached(sb, bg.owner_zg))
+        return false;
+    data_start = bg.start_block + bg.off_data_region;
+    return lba >= data_start && lba + count <= data_start + bg.data_block_count;
+}
+
 /* resv_seq: NULL for an owner's free; the scrub passes the registry's
  * release count from before its evidence (cetrafs_sb_resv_seq()). */
 static int __cetrafs_free_data_extent(struct super_block *sb, u64 lba, u32 count, const u64 *resv_seq)

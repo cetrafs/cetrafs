@@ -3244,6 +3244,76 @@ void cetrafs_tree_free_meta(struct inode *inode, const cetrafs_inode_t *raw)
     }
 }
 
+/*
+ * For cetrafs_frees_begin(): is every block cetrafs_tree_free_meta()
+ * would free for 'raw' in a Block Group this node owns? The same walk:
+ * depth 1 is the one leaf, depth 2 the interiors and every leaf they
+ * name. An interior that cannot be read reads "not ours" -- the safe
+ * answer, the one that announces.
+ */
+bool cetrafs_tree_meta_is_ours(struct inode *inode, const cetrafs_inode_t *raw)
+{
+    struct super_block *sb = inode->i_sb;
+    u32 ni;
+
+    if (cetrafs_le16(raw->eh.eh_depth) == 1)
+        return cetrafs_lba_run_is_ours(
+            sb, cetrafs_extent_phys_from_hilo(raw->et.idx[0].ei_leaf_hi, raw->et.idx[0].ei_leaf_lo), 1);
+    if (cetrafs_le16(raw->eh.eh_depth) != 2)
+        return true;
+
+    for (ni = 0; ni < cetrafs_le16(raw->eh.eh_entries) && ni < ARRAY_SIZE(raw->et.idx); ni++) {
+        u64 ilba = cetrafs_extent_phys_from_hilo(raw->et.idx[ni].ei_leaf_hi, raw->et.idx[ni].ei_leaf_lo);
+        struct buffer_head *ibh;
+        const cetrafs_extent_hdr_t *h;
+        const cetrafs_extent_idx_t *ia;
+        u32 li, n;
+        bool ours = true;
+
+        if (!cetrafs_lba_run_is_ours(sb, ilba, 1))
+            return false;
+        ibh = cetrafs_read_index_bh(inode, ilba);
+        if (!ibh)
+            return false;
+        h = (const cetrafs_extent_hdr_t *) ibh->b_data;
+        ia = (const cetrafs_extent_idx_t *) (ibh->b_data + sizeof(*h));
+        n = min_t(u32, cetrafs_le16(h->eh_entries), CETRAFS_EXT_BLOCK_MAX_IDX);
+        for (li = 0; li < n && ours; li++)
+            ours = cetrafs_lba_run_is_ours(sb, cetrafs_extent_phys_from_hilo(ia[li].ei_leaf_hi, ia[li].ei_leaf_lo), 1);
+        brelse(ibh);
+        if (!ours)
+            return false;
+    }
+    return true;
+}
+
+/*
+ * For cetrafs_frees_begin(): is every block 'arr' maps at logical
+ * offsets [from, to) in a Block Group this node owns? The data a
+ * truncate (to = U64_MAX) or a punch drops. Only the extents that
+ * overlap are looked up, so a punch in a large image costs a few
+ * descriptor reads, not one per extent.
+ */
+bool cetrafs_flat_range_is_ours(struct super_block *sb, const cetrafs_extent_t *arr, u32 n, u64 from, u64 to)
+{
+    u32 i;
+
+    for (i = 0; i < n; i++) {
+        u64 start = cetrafs_le32(arr[i].ee_block);
+        u64 end = start + cetrafs_extent_len(arr[i].ee_len);
+        u64 s, e;
+
+        if (end <= from || start >= to)
+            continue;
+        s = max(start, from);
+        e = min(end, to);
+        if (!cetrafs_lba_run_is_ours(
+                sb, cetrafs_extent_phys_from_hilo(arr[i].ee_start_hi, arr[i].ee_start_lo) + (s - start), e - s))
+            return false;
+    }
+    return true;
+}
+
 /* Total extent count across all depths -- reads interior/leaf HEADERS
  * only (no extent copy), so the defrag trigger and close-time nudge can
  * feed cetrafs_frag_index_pct() the real number for a depth-2 file. */
@@ -5250,6 +5320,7 @@ static int __cetrafs_truncate_shrink(struct inode *inode, loff_t new_size)
     u32 old_n, kept;
     u32 freed_dummy, discard = 0;
     u64 meta_blocks = 0;
+    bool foreign; /* a dropped block outside our own groups (cetrafs_frees_begin()) */
     int ret, zret;
 
     recs = kmalloc(2 * sizeof(*recs), GFP_NOFS);
@@ -5330,7 +5401,9 @@ static int __cetrafs_truncate_shrink(struct inode *inode, loff_t new_size)
      * From the publish until the frees below the dropped blocks are named
      * by nothing and not yet free: announced first, so no scrub -- ours
      * or the owning peer's -- takes them for leaked (cetrafs_frees_begin()). */
-    ret = cetrafs_frees_begin(sb);
+    foreign = !(cetrafs_flat_range_is_ours(sb, old_flat, old_n, new_block_count, U64_MAX) &&
+                cetrafs_tree_meta_is_ours(inode, &old_raw));
+    ret = cetrafs_frees_begin(sb, &foreign);
     if (ret) {
         cetrafs_tree_free_meta(inode, &raw);
         kvfree(new_flat);
@@ -5363,7 +5436,7 @@ static int __cetrafs_truncate_shrink(struct inode *inode, loff_t new_size)
         cetrafs_inode_fd_pub_unlock(inode);
     }
     if (ret) {
-        cetrafs_frees_end(sb);
+        cetrafs_frees_end(sb, foreign);
         cetrafs_tree_free_meta(inode, &raw);
         kvfree(new_flat);
         kvfree(old_flat);
@@ -5416,7 +5489,7 @@ static int __cetrafs_truncate_shrink(struct inode *inode, loff_t new_size)
         cetrafs_tree_free_meta(inode, &old_raw);
         cetrafs_leaf_array_trim(sb, old_flat, old_n, new_block_count, &discard, /*do_free=*/true);
     }
-    cetrafs_frees_end(sb);
+    cetrafs_frees_end(sb, foreign);
 
     kvfree(new_flat);
     kvfree(old_flat);
@@ -6171,6 +6244,7 @@ static long cetrafs_fallocate(struct file *file, int mode, loff_t offset, loff_t
     u32 freed = 0, discard = 0;
     bool published = false; /* the map changed: the tail of the punch updates blocks/ctime */
     bool zeroed = false;    /* a boundary block was partly zeroed: the contents changed */
+    bool foreign;           /* a punched block outside our own groups (cetrafs_frees_begin()) */
     int ret;
 
     /* The capacity check vfs_fallocate() makes at s_maxbytes, against
@@ -6532,7 +6606,9 @@ static long cetrafs_fallocate(struct file *file, int mode, loff_t offset, loff_t
         cetrafs_cpu_to_le64((cetrafs_flat_data_blocks(new_flat, new_n) + meta_blocks) * (CETRAFS_BLOCK_SIZE / 512));
 
     /* As truncate: announced before the publish, ended after the frees. */
-    ret = cetrafs_frees_begin(sb);
+    foreign = !(cetrafs_flat_range_is_ours(sb, old_flat, old_n, start_block, end_block) &&
+                cetrafs_tree_meta_is_ours(inode, &old_raw));
+    ret = cetrafs_frees_begin(sb, &foreign);
     if (ret) {
         cetrafs_tree_free_meta(inode, &raw);
         kvfree(new_flat);
@@ -6553,7 +6629,7 @@ static long cetrafs_fallocate(struct file *file, int mode, loff_t offset, loff_t
         cetrafs_inode_fd_pub_unlock(inode);
     }
     if (ret) {
-        cetrafs_frees_end(sb);
+        cetrafs_frees_end(sb, foreign);
         cetrafs_tree_free_meta(inode, &raw);
         kvfree(new_flat);
         kvfree(old_flat);
@@ -6595,7 +6671,7 @@ static long cetrafs_fallocate(struct file *file, int mode, loff_t offset, loff_t
         if (fret)
             pr_err("punch: freeing the old blocks failed (%d) -- %u block(s) may have leaked\n", fret, freed);
     }
-    cetrafs_frees_end(sb);
+    cetrafs_frees_end(sb, foreign);
     kvfree(new_flat);
     kvfree(old_flat);
     published = true;

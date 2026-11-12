@@ -19,7 +19,14 @@
 #   (2) truncate, the same.
 #   (3) punch again with this node's in-memory count stood down
 #       (scrub_ignore_local_frees): only the registry row -- what a PEER's
-#       scrub reads -- keeps the blocks. The foreign case on one node.
+#       scrub reads -- keeps the blocks. The foreign case on one node:
+#       every group here is this node's own, and only a free outside
+#       them is announced, so frees_announce_all puts the row in play.
+#   (4) a punch of blocks in this node's own groups is NOT announced
+#       (frees_announced stays put): no peer's scrub judges those
+#       blocks, and announcing them stopped every scrub in the cluster
+#       whenever any node punched its own image. Control: with
+#       frees_announce_all the same punch is announced.
 #
 # Each part asserts that two cycles looked inside the stall (completed,
 # or stopped by the flag -- scrub_inflight_skips) else nothing was
@@ -27,12 +34,13 @@
 # the stalls a cycle must complete again: the flag comes back down.
 #
 # DISCRIMINATION: without the flag, (1) and (2) reclaim the dropped
-# blocks inside the stall; with the row flag never written, (3) does.
+# blocks inside the stall; with the row flag never written, (3) does;
+# (4) carries its own control.
 set -euo pipefail
 . "$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)/lib/harness.sh"
 require_root
 require_module
-for k in punch_pagecache_delay_ms truncate_free_stall_ms scrub_ignore_local_frees; do
+for k in punch_pagecache_delay_ms truncate_free_stall_ms scrub_ignore_local_frees frees_announce_all; do
     [ -w /sys/module/cetrafs/parameters/$k ] || { skip "$k is missing"; ct_exit; }
 done
 
@@ -103,8 +111,36 @@ MARK="$(dmesg_mark)"
 staged "punch" punch_pagecache_delay_ms punch
 staged "truncate" truncate_free_stall_ms shrink
 ct_param_set scrub_ignore_local_frees 1
+ct_param_set frees_announce_all 1
 staged "punch, registry row only" punch_pagecache_delay_ms punch
+ct_param_set frees_announce_all 0
 ct_param_set scrub_ignore_local_frees 0
+
+# (4) <label>: a plain punch of this node's own blocks; sets ANN (begins
+# announced to peers) and FREED (blocks it gave back).
+own_punch() {
+    local a0 f0
+    dd if=/dev/urandom of="$MNT/f" bs=4096 count="$BLOCKS" status=none
+    sync
+    a0="$(sed -n 's/^frees_announced: //p' "$PROC/info")"
+    f0="$(free_blocks)"
+    punch
+    sync
+    ANN=$(($(sed -n 's/^frees_announced: //p' "$PROC/info") - a0))
+    FREED=$(($(free_blocks) - f0))
+    rm -f "$MNT/f"
+    log "$1: $ANN announced, $FREED blocks freed"
+}
+ct_param_set frees_announce_all 1
+own_punch "own groups, control"
+ct_param_set frees_announce_all 0
+[ "$FREED" -ge $((BLOCKS / 2)) ] || fail "setup (own groups, control): the punch freed $FREED blocks"
+[ "$ANN" -ge 1 ] && pass "own groups, control: announcing every free, the punch is announced" ||
+    fail "own groups, control: not announced even with frees_announce_all -- the counter sees nothing"
+own_punch "own groups"
+[ "$FREED" -ge $((BLOCKS / 2)) ] || fail "setup (own groups): the punch freed $FREED blocks"
+[ "$ANN" = 0 ] && pass "own groups: a punch of this node's own blocks is not announced to peers" ||
+    fail "own groups: the punch was announced ($ANN) -- every peer's scrub stops for it"
 # The flag comes down on a heartbeat once nothing is in flight, and the
 # scrub runs whole cycles again -- else this would be a scrub turned off.
 C0="$(sed -n 's/^scrub_cycles: //p' "$PROC/info")"

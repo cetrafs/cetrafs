@@ -616,6 +616,7 @@ int cetrafs_defrag_inode(struct inode *inode, struct cetrafs_defrag_stats *out_s
         struct blk_plug plug;
         u64 step_end, b;
         u32 si, suffix_start, split_off;
+        bool foreign; /* an old block outside our own groups (cetrafs_frees_begin()) */
 
         if (cetrafs_sb_defrag_draining(sb) || cetrafs_sb_is_fenced(sb)) {
             ret = -ECANCELED;
@@ -872,12 +873,32 @@ int cetrafs_defrag_inode(struct inode *inode, struct cetrafs_defrag_stats *out_s
             }
             /* The commit publishes the step and frees the old tree's
              * meta; the old data blocks follow below. From the publish
-             * until those frees, announced (cetrafs_frees_begin()). */
-            ret = cetrafs_frees_begin(sb);
+             * until those frees, announced (cetrafs_frees_begin()) --
+             * to peers only if one of those blocks is outside our own
+             * groups. el.arr maps [0, file end) in order, which is how
+             * the free loop below walks it; suffix[0] is restored. */
+            {
+                u64 o = 0;
+                u32 e;
+
+                foreign = !cetrafs_tree_meta_is_ours(inode, &raw);
+                for (e = 0; e < el.count && !foreign; e++) {
+                    const cetrafs_extent_t *x = (e == suffix_start && split_off) ? &whole : &el.arr[e];
+                    u64 len = cetrafs_extent_len(x->ee_len);
+                    u64 s = max(o, freed_from), t = min(o + len, step_end);
+
+                    if (s < t &&
+                        !cetrafs_lba_run_is_ours(
+                            sb, cetrafs_extent_phys_from_hilo(x->ee_start_hi, x->ee_start_lo) + (s - o), t - s))
+                        foreign = true;
+                    o += len;
+                }
+            }
+            ret = cetrafs_frees_begin(sb, &foreign);
             if (!ret) {
                 ret = cetrafs_defrag_commit(inode, &raw, dst_base, step_end, nblocks, suffix, suffix_count);
                 if (ret)
-                    cetrafs_frees_end(sb);
+                    cetrafs_frees_end(sb, foreign);
             }
             if (split_off)
                 suffix[0] = whole;
@@ -959,7 +980,7 @@ int cetrafs_defrag_inode(struct inode *inode, struct cetrafs_defrag_stats *out_s
                 if (src != dst_base + b)
                     cetrafs_free_data_block(sb, src);
             }
-            cetrafs_frees_end(sb);
+            cetrafs_frees_end(sb, foreign);
         }
 
         cetrafs_defrag_inode_unlock(inode);

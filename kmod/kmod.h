@@ -1073,8 +1073,15 @@ struct cetrafs_frees_snap {
     u64 local;
     u32 seqs[CETRAFS_MAX_READER_NODES];
 };
-int cetrafs_frees_begin(struct super_block *sb);
-void cetrafs_frees_end(struct super_block *sb);
+int cetrafs_frees_begin(struct super_block *sb, bool *foreign);
+void cetrafs_frees_end(struct super_block *sb, bool foreign);
+u64 cetrafs_frees_announced_count(void);
+/* alloc.c / file.c: whether the blocks a freeing operation drops all lie
+ * in Block Groups this node owns -- if so, no peer's scrub judges them,
+ * and the operation need not announce itself in its registry row. */
+bool cetrafs_lba_run_is_ours(struct super_block *sb, u64 lba, u64 count);
+bool cetrafs_flat_range_is_ours(struct super_block *sb, const cetrafs_extent_t *arr, u32 n, u64 from, u64 to);
+bool cetrafs_tree_meta_is_ours(struct inode *inode, const cetrafs_inode_t *raw);
 void cetrafs_frees_heartbeat(struct super_block *sb);
 int cetrafs_frees_quiet(struct super_block *sb, struct cetrafs_frees_snap *snap, bool compare);
 struct cetrafs_zg_info {
