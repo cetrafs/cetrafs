@@ -1188,8 +1188,10 @@ unwoken() { # <file> <exempt fn> <store re> <wake re>: functions storing without
         /^}/ { if (fn != "" && fn != ex && stored && !woke) print FILENAME ":" fn; fn = "" }' "$1"
 }
 WSITES="$(grep -cE '^[^*/]*\bwait_event[a-z_]*\(' "$K"/*.c | awk -F: '{ n += $2 } END { print n + 0 }')"
-[ "$WSITES" = 6 ] && pass "wait wakes: 6 wait_event sites, each queue specified" ||
-    fail "wait wakes: $WSITES wait_event sites (specified for 6) -- add the new queue's stores and wake to WAKE_SPEC"
+# 7: the batch's slot wait (cetrafs_journal_take_batch()) is a second
+# waiter on j->slot_wq, whose stores and wake the first line specifies.
+[ "$WSITES" = 7 ] && pass "wait wakes: 7 wait_event sites, each queue specified" ||
+    fail "wait wakes: $WSITES wait_event sites (specified for 7) -- add the new queue's stores and wake to WAKE_SPEC"
 UW=""
 while IFS= read -r line; do
     f="${line%%|*}"; rest="${line#*|}"; ex="${rest%%|*}"; rest="${rest#*|}"

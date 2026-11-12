@@ -3593,10 +3593,17 @@ static bool cetrafs_leaf_bh_holds_uninit(struct buffer_head *lbh, u32 iblock)
  * being dirtied: writeback must never write it in place, and the
  * boundary writes it through the journal. Unlocks the buffer.
  */
-static int cetrafs_tree_hold_back(struct inode *inode, struct buffer_head *bh, u32 prev_crc)
+/* 'outer': the caller has no other block mid-update, so the inode's
+ * held-back set may be written here if it reached its cap
+ * (cetrafs_deferred_capped()). A caller still updating another block
+ * passes false -- the write would wait on that block's lock. */
+static int cetrafs_tree_hold_back(struct inode *inode, struct buffer_head *bh, u32 prev_crc, bool outer)
 {
-    if (!cetrafs_bh_defer_update(inode, bh, prev_crc))
+    if (!cetrafs_bh_defer_update(inode, bh, prev_crc)) {
+        if (outer)
+            cetrafs_deferred_capped(inode);
         return 0;
+    }
     return cetrafs_journal_write_block(inode->i_sb, cetrafs_journal_owner_of(inode), bh, prev_crc); /* no registry: the mount is going */
 }
 
@@ -3611,30 +3618,54 @@ static int cetrafs_tree_hold_back(struct inode *inode, struct buffer_head *bh, u
  * reclaims (rule 8).
  *
  * Held-back blocks reach the device only in a boundary's journal batch,
- * and within one chunk of it that is atomic: every entry is durable
- * before any target. Across chunks it is NOT -- chunk 1 is applied and
- * consumed before chunk 2's entries exist, a batch is chunked at 16
- * blocks or whenever slots are busy, and blocks go in the order they were
- * first held back, so the destination can land a chunk ahead of this
- * leaf. That is what this call still prevents: everything held back so
- * far, this leaf included, goes NOW, before the moved piece is appended
- * anywhere. Every block of the inode goes with it -- a leaf may never
- * reach the device ahead of the index that ranges over it.
+ * and a batch is ONE atomic unit: every entry durable before any target
+ * (cetrafs_journal_write_deferred()), and an inode's held-back set kept
+ * under half the journal so it is always one batch
+ * (cetrafs_deferred_capped()). The source and the destination of a
+ * split are in the same set, so they land together or not at all, and
+ * nothing need be written here. It was not always so: a batch went in
+ * chunks of 16, atomic only within each, the destination could land a
+ * chunk ahead of this leaf, and every split of a FULL leaf paid a whole
+ * extra batch -- three cache flushes -- here to prevent it. Random
+ * writes into a fallocated file fill the leaf holding the preallocated
+ * extent and nothing empties it, so that was close to one batch per
+ * guest write (docs/PERFORMANCE.md 14).
  *
- * The cost is a whole batch (three cache flushes) per split of a FULL
- * leaf, and that is not rare: random writes into a fallocated file fill
- * the leaf holding the preallocated extent and nothing empties it, so
- * nearly every conversion lands here (docs/PERFORMANCE.md 14). The way
- * out is a batch whose entries are ALL durable before any target, across
- * chunks (docs/internal/TODO.md, Performance); then this call can go.
+ * Still written here when a batch cannot be atomic: no journal (mkfs
+ * -J 0), whose boundary writes targets in place one by one, or one too
+ * small for the cap to leave room (CETRAFS_CONVERT_ATOMIC_MIN slots).
+ * Then everything held back so far, this leaf included, goes NOW, before
+ * the moved piece is appended anywhere -- every block of the inode with
+ * it, since a leaf may never reach the device ahead of the index that
+ * ranges over it.
  *
  * The caller holds invalidate_lock. On failure the blocks stay held
  * back -- the cached leaf is the only copy of the shrunk state -- and
  * the caller appends nothing.
  */
+#define CETRAFS_CONVERT_ATOMIC_MIN 8
+
+/* TEST ONLY: write a split's source now even when the boundary is atomic
+ * -- the old cost, for measuring against (convert_split_no_flush.sh). */
+static bool cetrafs_convert_flush_always;
+cetrafs_test_param(convert_flush_always, cetrafs_convert_flush_always, bool, 0644);
+MODULE_PARM_DESC(convert_flush_always, "TEST ONLY: a split of a full leaf writes its source at once, as before");
+
+static atomic64_t cetrafs_convert_source_flushes = ATOMIC64_INIT(0);
+
+u64 cetrafs_convert_source_flush_count(void)
+{
+    return (u64) atomic64_read(&cetrafs_convert_source_flushes);
+}
+
 static int cetrafs_convert_source_durable(struct inode *inode, struct buffer_head *lbh)
 {
-    int ret = cetrafs_deferred_flush_inode(inode, true);
+    int ret;
+
+    if (cetrafs_journal_batch_capacity(inode->i_sb) >= CETRAFS_CONVERT_ATOMIC_MIN && !READ_ONCE(cetrafs_convert_flush_always))
+        return 0;
+    atomic64_inc(&cetrafs_convert_source_flushes);
+    ret = cetrafs_deferred_flush_inode(inode, true);
 
     if (ret)
         pr_err_ratelimited("ino=%llu: extent leaf %llu could not be written before its split moved on (%d)\n",
@@ -3701,7 +3732,7 @@ static int cetrafs_tree_convert_inner(struct inode *inode,
          */
         cetrafs_blk_tail_stamp(lbh, CETRAFS_LEAF_TAIL_MAGIC);
         if (S_ISREG(inode->i_mode)) {
-            int wret = cetrafs_tree_hold_back(inode, lbh, prev_crc);
+            int wret = cetrafs_tree_hold_back(inode, lbh, prev_crc, true);
 
             if (!wret && ret == CETRAFS_CONVERT_APPEND)
                 wret = cetrafs_convert_source_durable(inode, lbh);
@@ -3787,7 +3818,7 @@ static int cetrafs_tree_convert_inner(struct inode *inode,
             /* Same trade as the depth-1 site above. */
             cetrafs_blk_tail_stamp(lbh, CETRAFS_LEAF_TAIL_MAGIC);
             if (S_ISREG(inode->i_mode)) {
-                int hret = cetrafs_tree_hold_back(inode, lbh, prev_crc);
+                int hret = cetrafs_tree_hold_back(inode, lbh, prev_crc, true);
 
                 if (hret) {
                     brelse(lbh);
@@ -3831,7 +3862,7 @@ static int cetrafs_tree_convert_inner(struct inode *inode,
                             iarr[li].ei_block = cetrafs_cpu_to_le32(lo);
                             iarr[li].ei_block_end = cetrafs_cpu_to_le32(hi);
                             cetrafs_blk_tail_stamp(ibh, CETRAFS_INDEX_TAIL_MAGIC);
-                            nret = cetrafs_tree_hold_back(inode, ibh, nprev);
+                            nret = cetrafs_tree_hold_back(inode, ibh, nprev, false);
                             if (nret) {
                                 brelse(lbh);
                                 brelse(ibh);
@@ -4003,7 +4034,7 @@ static int cetrafs_tree_append(struct inode *inode,
                  * journal-wrote the short image, erasing the merge
                  *. So only S_ISREG may defer; directories
                  * fall through to the journal write below. */
-                ret = cetrafs_tree_hold_back(inode, lbh, prev_crc);
+                ret = cetrafs_tree_hold_back(inode, lbh, prev_crc, true);
                 brelse(lbh);
                 return ret;
             }
@@ -4015,7 +4046,7 @@ static int cetrafs_tree_append(struct inode *inode,
              * writes -- the splits land in tree_append, not tree_convert. */
             if (S_ISREG(inode->i_mode)) {
                 cetrafs_blk_tail_stamp(lbh, CETRAFS_LEAF_TAIL_MAGIC);
-                ret = cetrafs_tree_hold_back(inode, lbh, prev_crc);
+                ret = cetrafs_tree_hold_back(inode, lbh, prev_crc, true);
             } else {
                 ret = cetrafs_journal_write_block(sb, cetrafs_journal_owner_of(inode), lbh, prev_crc);
             }
@@ -4186,7 +4217,7 @@ static int cetrafs_tree_append(struct inode *inode,
                          * writes both, entries first, so neither can
                          * reach the device without the other being
                          * redoable (leafdefer.c). */
-                        iw = cetrafs_tree_hold_back(inode, ibh, iprev);
+                        iw = cetrafs_tree_hold_back(inode, ibh, iprev, false);
                         if (iw) {
                             cetrafs_bh_abort_update(lbh);
                             brelse(lbh);
@@ -4213,7 +4244,7 @@ static int cetrafs_tree_append(struct inode *inode,
             *leaf_count = cetrafs_le16(lhdr->eh_entries);
             cetrafs_blk_tail_stamp(lbh, CETRAFS_LEAF_TAIL_MAGIC);
             if (*merged) {
-                ret = cetrafs_tree_hold_back(inode, lbh, prev_crc);
+                ret = cetrafs_tree_hold_back(inode, lbh, prev_crc, true);
                 brelse(lbh);
                 brelse(ibh);
                 return ret;
@@ -4226,7 +4257,7 @@ static int cetrafs_tree_append(struct inode *inode,
              * writes -- the splits land in tree_append, not tree_convert. */
             if (S_ISREG(inode->i_mode)) {
                 cetrafs_blk_tail_stamp(lbh, CETRAFS_LEAF_TAIL_MAGIC);
-                ret = cetrafs_tree_hold_back(inode, lbh, prev_crc);
+                ret = cetrafs_tree_hold_back(inode, lbh, prev_crc, true);
             } else {
                 ret = cetrafs_journal_write_block(sb, cetrafs_journal_owner_of(inode), lbh, prev_crc);
             }
@@ -4302,7 +4333,7 @@ static int cetrafs_tree_append(struct inode *inode,
                  * writes -- the splits land in tree_append, not tree_convert. */
                 if (S_ISREG(inode->i_mode)) {
                     cetrafs_blk_tail_stamp(ibh, CETRAFS_INDEX_TAIL_MAGIC);
-                    ret = cetrafs_tree_hold_back(inode, ibh, prev_crc);
+                    ret = cetrafs_tree_hold_back(inode, ibh, prev_crc, false);
                 } else {
                     ret = cetrafs_journal_write_block(sb, cetrafs_journal_owner_of(inode), ibh, prev_crc);
                 }

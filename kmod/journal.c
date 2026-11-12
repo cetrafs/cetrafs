@@ -131,6 +131,11 @@ struct cetrafs_journal {
     u64 *stuck_lba;
     u64 held;
     wait_queue_head_t slot_wq; /* a slot was given back */
+    /* One multi-slot batch at a time (cetrafs_journal_write_deferred()):
+     * a batch waits for slots while holding some, which is safe only if
+     * no other batch is doing the same -- single writers take one slot
+     * and never wait while holding it. */
+    struct mutex batch_mutex;
 };
 
 /* Resolve node #node_id's journal slice. *out_start = 0 means journaling
@@ -591,6 +596,7 @@ int cetrafs_journal_init(struct super_block *sb, struct cetrafs_journal **out_j)
     for (i = 0; i < ARRAY_SIZE(j->replay_mutex); i++)
         mutex_init(&j->replay_mutex[i]);
     init_waitqueue_head(&j->slot_wq);
+    mutex_init(&j->batch_mutex);
     /* area_start/slots stay 0 until cetrafs_journal_attach_node() --
      * fill_super() calls cetrafs_journal_init() before node registration
      * has produced a node id, and until attached every log call is a
@@ -983,7 +989,7 @@ cetrafs_test_param(journal_take_fenced_once, cetrafs_journal_take_fenced_once, b
 MODULE_PARM_DESC(journal_take_fenced_once, "TEST ONLY: the next journal slot take fails its fence check");
 
 static int cetrafs_journal_take_slot(struct super_block *sb, struct cetrafs_journal *j, u64 lba, bool nowait,
-                                     u64 *out_slot, u64 *txn_id)
+                                     u64 *out_slot, u64 *txn_id, bool *out_reused)
 {
     bool reused = false;
     u64 slot;
@@ -1063,6 +1069,8 @@ static int cetrafs_journal_take_slot(struct super_block *sb, struct cetrafs_jour
     *txn_id = ++j->next_txn_id;
     mutex_unlock(&j->lock);
     *out_slot = slot;
+    if (out_reused)
+        *out_reused = reused;
     return 0;
 }
 
@@ -1133,7 +1141,7 @@ static int cetrafs_journal_write_block_flags(struct super_block *sb, struct buff
      * mkfs -J 0 is a different thing: no journal at all, by choice.
      */
     if (j && j->area_start) {
-        int tret = cetrafs_journal_take_slot(sb, j, bh->b_blocknr, false, &slot, &txn_id);
+        int tret = cetrafs_journal_take_slot(sb, j, bh->b_blocknr, false, &slot, &txn_id, NULL);
 
         if (tret) {
             cetrafs_bh_abort_update(bh);
@@ -1431,15 +1439,13 @@ static void cetrafs_journal_batch_retire(struct super_block *sb, struct cetrafs_
     wake_up(&j->slot_wq);
 }
 
-#define CETRAFS_JRNL_BATCH 16
-
-/* One chunk of a deferred batch: k entries in k slots already taken. */
+/* A whole deferred batch: k entries in k slots already taken. */
 static int cetrafs_journal_batch_chunk(struct super_block *sb, struct cetrafs_journal *j,
                                        struct buffer_head **bhs, const struct cetrafs_journal_owner *owners,
                                        const u32 *disk_crc, unsigned int k,
-                                       const u64 *slots, const u64 *txn, bool *written, u32 *wcrc)
+                                       const u64 *slots, const u64 *txn, bool *written, u32 *wcrc,
+                                       struct buffer_head **pb, struct buffer_head **hb)
 {
-    struct buffer_head *pb[CETRAFS_JRNL_BATCH] = {}, *hb[CETRAFS_JRNL_BATCH] = {};
     unsigned int i, nw = 0;
     bool ok = true;
     int ret = 0, ferr;
@@ -1592,14 +1598,118 @@ static int cetrafs_journal_batch_chunk(struct super_block *sb, struct cetrafs_jo
  *  4. Flush, then 5. consume.
  *
  * Three flushes per boundary, whatever the number of blocks -- not per
- * block, which is what made per-write journaling unusable. In chunks of
- * CETRAFS_JRNL_BATCH slots, taken without waiting once one is held (no
- * hold-and-wait between two batches).
+ * block, which is what made per-write journaling unusable. ONE batch,
+ * every slot taken before any entry is written
+ * (cetrafs_journal_take_batch()), so every entry is durable before any
+ * target: a boundary is atomic as a whole. It used to go in chunks of
+ * 16, atomic only within each, and a split leaf's destination could
+ * land a chunk ahead of its source -- which every split of a full leaf
+ * then paid a whole extra batch to prevent
+ * (cetrafs_convert_source_durable()). A batch larger than the journal
+ * is refused, never split: leafdefer.c keeps an inode's set under half
+ * of it.
  *
  * The caller guarantees nobody modifies the blocks meanwhile. written[i]
  * says which reached the device; the rest stay held back for a retry.
  * mkfs -J 0 has no journal: step 0, then the targets in place.
  */
+/* Give back the first k slots of a batch that will not be written: a
+ * kept entry's slot it had taken over is held again, as its entry is
+ * still live on the device (cetrafs_journal_untake_kept()). */
+static void cetrafs_journal_untake_batch(struct cetrafs_journal *j, struct buffer_head **bhs, const u64 *slots,
+                                         const bool *reused, unsigned int k)
+{
+    unsigned int i;
+
+    if (!k)
+        return;
+    mutex_lock(&j->lock);
+    for (i = 0; i < k; i++) {
+        clear_bit(slots[i], j->busy);
+        cetrafs_journal_untake_kept(j, slots[i], bhs[i]->b_blocknr, reused[i]);
+    }
+    mutex_unlock(&j->lock);
+    wake_up(&j->slot_wq);
+}
+
+/* Slots a batch could ever get: all but those held by kept entries it
+ * cannot take over -- a kept entry of one of its own blocks is taken
+ * over by that block's new entry (cetrafs_journal_take_slot()); one of
+ * another block, or kept on purpose, is not. j->lock held. */
+static u64 cetrafs_journal_batch_room(struct cetrafs_journal *j, struct buffer_head **bhs, unsigned int n)
+{
+    u64 slot, ours = 0;
+    unsigned int i;
+
+    if (!j->held)
+        return j->slots;
+    for (slot = 0; slot < j->slots; slot++) {
+        if (!j->stuck_lba[slot])
+            continue;
+        for (i = 0; i < n; i++)
+            if (bhs[i]->b_blocknr == j->stuck_lba[slot]) {
+                ours++;
+                break;
+            }
+    }
+    return j->slots - (j->held - min_t(u64, ours, j->held));
+}
+
+/*
+ * Take a slot for every block of a batch, before any entry is written --
+ * so all of them are durable before any target, however many there are:
+ * the atomicity the old 16-entry chunks lacked across chunks. Only this
+ * batch takes several slots (batch_mutex), so waiting for one while
+ * holding others cannot deadlock against another batch; single writers
+ * hold one and never wait. What can still stop it is a journal whose
+ * slots are held by kept entries of OTHER blocks: checked before each
+ * wait, and the batch refused (-EIO) rather than waiting for slots that
+ * will not come. *taken says how many it holds on failure.
+ */
+static int cetrafs_journal_take_batch(struct super_block *sb, struct cetrafs_journal *j, struct buffer_head **bhs,
+                                      unsigned int n, u64 *slots, u64 *txn, bool *reused, unsigned int *taken)
+{
+    unsigned int k = 0;
+
+    *taken = 0;
+    while (k < n) {
+        u64 room;
+        int t = cetrafs_journal_take_slot(sb, j, bhs[k]->b_blocknr, true, &slots[k], &txn[k], &reused[k]);
+
+        if (!t) {
+            *taken = ++k;
+            continue;
+        }
+        if (t != -EAGAIN)
+            return t;
+        mutex_lock(&j->lock);
+        room = cetrafs_journal_batch_room(j, bhs, n);
+        mutex_unlock(&j->lock);
+        if (room < n) {
+            pr_err_ratelimited("journal: a batch of %u tree blocks cannot get its slots -- %llu of %llu are kept "
+                               "by failed writes of other blocks; refused\n",
+                               n, (unsigned long long) (j->slots - room), (unsigned long long) j->slots);
+            return -EIO;
+        }
+        if (fatal_signal_pending(current))
+            return -EINTR;
+        /* Every other slot is in flight with a single writer, which
+         * holds no lock we hold and gives it back. Bounded wait so a
+         * slot kept meanwhile is re-checked above. */
+        wait_event_timeout(j->slot_wq, cetrafs_journal_slot_or_none(j), HZ / 10);
+    }
+    return 0;
+}
+
+/* The most blocks one batch can carry: every slot of this node's area.
+ * 0 with no journal (mkfs -J 0), where nothing is atomic. */
+unsigned int cetrafs_journal_batch_capacity(struct super_block *sb)
+{
+    struct cetrafs_journal *j = cetrafs_sb_get_journal(sb);
+
+    return (j && j->area_start) ? (unsigned int) min_t(u64, j->slots, UINT_MAX) : 0;
+}
+
 /* TEST ONLY: a deferred batch skips step 0's cache flush -- the negative
  * control for tests/crash/leaf_batch_order.sh. */
 static bool cetrafs_journal_batch_skip_flush;
@@ -1611,7 +1721,7 @@ int cetrafs_journal_write_deferred(struct super_block *sb, struct buffer_head **
                                    bool *written, u32 *wcrc)
 {
     struct cetrafs_journal *j = cetrafs_sb_get_journal(sb);
-    unsigned int i, done = 0;
+    unsigned int i;
     int ret;
 
     for (i = 0; i < n; i++)
@@ -1640,34 +1750,42 @@ int cetrafs_journal_write_deferred(struct super_block *sb, struct buffer_head **
         return ret;
     }
 
-    while (done < n) {
-        u64 slots[CETRAFS_JRNL_BATCH], txn[CETRAFS_JRNL_BATCH];
+    if (n > j->slots) {
+        /* Cannot be one batch: the cap that keeps an inode's held-back
+         * set under half the journal (cetrafs_deferred_capped()) did not
+         * hold. Refused rather than split -- a split batch is not atomic,
+         * and a split leaf's destination could land without its source
+         * (cetrafs_convert_source_durable()). The blocks stay held back. */
+        pr_err_ratelimited("journal: a batch of %u tree blocks does not fit the journal's %llu slots -- refused\n",
+                           n, (unsigned long long) j->slots);
+        return -EIO;
+    }
+    {
+        u64 *slots = kvmalloc_array(n, sizeof(*slots), GFP_NOFS);
+        u64 *txn = kvmalloc_array(n, sizeof(*txn), GFP_NOFS);
+        bool *reused = kvcalloc(n, sizeof(*reused), GFP_NOFS);
+        struct buffer_head **pb = kvcalloc(n, sizeof(*pb), GFP_NOFS);
+        struct buffer_head **hb = kvcalloc(n, sizeof(*hb), GFP_NOFS);
         unsigned int k = 0;
 
-        while (k < CETRAFS_JRNL_BATCH && done + k < n) {
-            int t = cetrafs_journal_take_slot(sb, j, bhs[done + k]->b_blocknr, k > 0, &slots[k], &txn[k]);
-
-            if (t == -EAGAIN)
-                break; /* all in flight: go with what we hold */
-            if (t) {
-                if (k) {
-                    mutex_lock(&j->lock);
-                    for (i = 0; i < k; i++)
-                        clear_bit(slots[i], j->busy);
-                    mutex_unlock(&j->lock);
-                    wake_up(&j->slot_wq);
-                }
-                return t;
-            }
-            k++;
+        ret = slots && txn && reused && pb && hb ? 0 : -ENOMEM;
+        if (!ret) {
+            mutex_lock(&j->batch_mutex);
+            ret = cetrafs_journal_take_batch(sb, j, bhs, n, slots, txn, reused, &k);
+            if (!ret)
+                ret = cetrafs_journal_batch_chunk(sb, j, bhs, owners, disk_crc, n, slots, txn, written, wcrc, pb,
+                                                  hb);
+            else
+                cetrafs_journal_untake_batch(j, bhs, slots, reused, k);
+            mutex_unlock(&j->batch_mutex);
         }
-        ret = cetrafs_journal_batch_chunk(sb, j, bhs + done, owners + done, disk_crc + done, k, slots, txn,
-                                          written + done, wcrc + done);
-        if (ret)
-            return ret;
-        done += k;
+        kvfree(slots);
+        kvfree(txn);
+        kvfree(reused);
+        kvfree(pb);
+        kvfree(hb);
+        return ret;
     }
-    return 0;
 }
 
 /*
@@ -2262,7 +2380,6 @@ static int __cetrafs_journal_replay_node(struct super_block *sb, u32 node_id, bo
 
         if (done[s])
             continue;
-
 
         if (entries[s].before_park) {
             atomic64_inc(&cetrafs_journal_replay_skipped);

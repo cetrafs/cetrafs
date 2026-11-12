@@ -1327,6 +1327,8 @@ struct cetrafs_journal_owner {
 struct cetrafs_journal_owner cetrafs_journal_owner_of(struct inode *inode);
 int cetrafs_journal_write_block(struct super_block *sb, struct cetrafs_journal_owner owner, struct buffer_head *bh,
                                 u32 prev_crc);
+unsigned int cetrafs_journal_batch_capacity(struct super_block *sb);
+u64 cetrafs_convert_source_flush_count(void);
 int cetrafs_journal_write_deferred(struct super_block *sb, struct buffer_head **bhs,
                                    const struct cetrafs_journal_owner *owners, const u32 *disk_crc, unsigned int n,
                                    bool *written, u32 *wcrc);
@@ -1357,6 +1359,8 @@ struct list_head *cetrafs_inode_deferred(struct inode *inode);
 time64_t *cetrafs_inode_label_seen_at(struct inode *inode);
 u64 cetrafs_label_invalidation_count(void);
 struct list_head *cetrafs_sb_deferred_orphans(struct super_block *sb);
+void cetrafs_deferred_capped(struct inode *inode);
+u64 cetrafs_deferred_cap_flush_count(void);
 int cetrafs_deferred_flush_inode(struct inode *inode, bool mapping_locked);
 int cetrafs_deferred_flush_all(struct super_block *sb);
 unsigned long cetrafs_deferred_drop_all(struct super_block *sb);

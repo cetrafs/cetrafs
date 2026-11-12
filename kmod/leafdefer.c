@@ -359,6 +359,47 @@ static int cetrafs_deferred_collect(struct xarray *xa, struct list_head *head, s
     return 0;
 }
 
+/*
+ * Keep an inode's held-back set small enough to be ONE journal batch,
+ * which is what makes a boundary atomic (cetrafs_journal_write_deferred()):
+ * at half the journal, write it now. Called by a tree mutator after
+ * holding a block back, at a point where it has no other block mid-
+ * update, under invalidate_lock. Writing everything held back so far
+ * there is what the journal did before blocks were held back at all --
+ * every edit written at this same call, in program order -- so the
+ * state it makes durable is one that model already made durable. A
+ * failed write is not the caller's to undo: the blocks stay held back
+ * for the boundary, which reports it.
+ */
+static atomic64_t cetrafs_deferred_cap_flushes = ATOMIC64_INIT(0);
+
+u64 cetrafs_deferred_cap_flush_count(void)
+{
+    return (u64) atomic64_read(&cetrafs_deferred_cap_flushes);
+}
+
+void cetrafs_deferred_capped(struct inode *inode)
+{
+    struct xarray *xa = cetrafs_sb_deferred(inode->i_sb);
+    unsigned int cap = cetrafs_journal_batch_capacity(inode->i_sb) / 2, cnt = 0;
+    struct cetrafs_deferred *d;
+
+    if (!xa || !cap || !S_ISREG(inode->i_mode))
+        return;
+    xa_lock(xa);
+    list_for_each_entry(d, cetrafs_inode_deferred(inode), node)
+        if (++cnt >= cap)
+            break;
+    xa_unlock(xa);
+    if (cnt < cap)
+        return;
+    atomic64_inc(&cetrafs_deferred_cap_flushes);
+    if (cetrafs_deferred_flush_inode(inode, true))
+        pr_warn_ratelimited("ino=%llu: held-back tree blocks reached half the journal and could not be written "
+                            "yet -- the boundary will retry\n",
+                            (unsigned long long) inode->i_ino);
+}
+
 u64 cetrafs_deferred_orphaned_count(void)
 {
     return (u64) atomic64_read(&cetrafs_deferred_orphaned);
@@ -486,6 +527,50 @@ int cetrafs_deferred_flush_inode(struct inode *inode, bool mapping_locked)
     return ret;
 }
 
+/*
+ * The orphans of several evicted inodes are written one INODE per batch:
+ * a batch is atomic only up to the journal's size, and each inode's set
+ * was kept under half of it while it was live (cetrafs_deferred_capped())
+ * -- the orphans together are not.
+ */
+static int cetrafs_deferred_write_by_inode(struct super_block *sb, struct buffer_head **bhs, u32 *crcs,
+                                           struct cetrafs_journal_owner *owners, unsigned int n, bool no_inode)
+{
+    struct buffer_head **gb = kvmalloc_array(n, sizeof(*gb), GFP_NOFS);
+    u32 *gc = kvmalloc_array(n, sizeof(*gc), GFP_NOFS);
+    struct cetrafs_journal_owner *go = kvmalloc_array(n, sizeof(*go), GFP_NOFS);
+    bool *done = kvcalloc(n, sizeof(*done), GFP_NOFS);
+    unsigned int i, k, m;
+    int r = 0, w;
+
+    if (!gb || !gc || !go || !done) {
+        r = -ENOMEM;
+        goto out;
+    }
+    for (i = 0; i < n; i++) {
+        if (done[i])
+            continue;
+        for (k = i, m = 0; k < n; k++) {
+            if (done[k] || owners[k].ino != owners[i].ino || owners[k].generation != owners[i].generation)
+                continue;
+            gb[m] = bhs[k];
+            gc[m] = crcs[k];
+            go[m] = owners[k];
+            done[k] = true;
+            m++;
+        }
+        w = cetrafs_deferred_write_set(sb, gb, gc, go, m, no_inode);
+        if (w && !r)
+            r = w;
+    }
+out:
+    kvfree(gb);
+    kvfree(gc);
+    kvfree(go);
+    kvfree(done);
+    return r;
+}
+
 static int cetrafs_deferred_flush_list(struct super_block *sb, struct list_head *head, bool no_inode)
 {
     struct buffer_head **bhs;
@@ -496,7 +581,7 @@ static int cetrafs_deferred_flush_list(struct super_block *sb, struct list_head 
 
     r = cetrafs_deferred_collect(cetrafs_sb_deferred(sb), head, &bhs, &crcs, &owners, &n);
     if (!r && n)
-        r = cetrafs_deferred_write_set(sb, bhs, crcs, owners, n, no_inode);
+        r = cetrafs_deferred_write_by_inode(sb, bhs, crcs, owners, n, no_inode);
     for (i = 0; i < n; i++)
         brelse(bhs[i]);
     kvfree(bhs);

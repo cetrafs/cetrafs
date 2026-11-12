@@ -402,12 +402,19 @@ profile on the 1 Gbit iSCSI node), with the submitting thread at 94%
 system CPU. That cost predates this change (the buffered path did the
 same lookup); making a missed lookup sub-linear is a design change.
 
-Fallocated space stays slow: a conversion inside a FULL extent leaf
-moves the converted block to another leaf, and the source leaf must
-reach the device first (`cetrafs_convert_source_durable()`), once per
-write. Not fixed yet: the fixes that keep it safe either move written
-extents between leaves (which needs a multi-block atomic write) or
-change what a crash may lose.
+A conversion inside a FULL extent leaf moves the converted block to
+another leaf, and the source and the destination must reach the device
+together. That used to cost a whole journal batch -- three cache
+flushes -- per such write (`cetrafs_convert_source_durable()`), because
+a boundary went in chunks of 16 that were atomic only one at a time. A
+boundary is now one atomic batch, every entry durable before any
+target, and an inode's held-back set is kept under half the journal so
+it always fits (`cetrafs_deferred_capped()`); the extra batch is paid
+only with no journal or one under 8 slots. Counted on a loop device: 79
+cache flushes for 1500 random writes into a fallocated image with the
+old writes, 13 without (`tests/kernel/convert_split_no_flush.sh`,
+`convert_source_flushes` in procfs). Not yet measured on the deployment
+LUN.
 
 A direct write that does not cover whole blocks (a 512-byte guest
 sector, say) is serialised: it waits for the file's in-flight direct
