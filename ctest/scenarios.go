@@ -3255,6 +3255,8 @@ func RunFullSuite(clients []*Client, lockPath, baseDir string, accountingSizeByt
 		{"direct-write", func() (bool, error) { return RunDirectWrite(clients, baseDir) }},
 		{"zero-range", func() (bool, error) { return RunZeroRange(clients, baseDir) }},
 		{"fstrim-pool", func() (bool, error) { return RunFstrimPool(clients, baseDir) }},
+		{"defrag-yield", func() (bool, error) { return RunDefragYield(clients, baseDir) }},
+		{"handback-unknown", func() (bool, error) { return RunHandbackUnknown(clients, baseDir) }},
 		{"inode-reuse", func() (bool, error) { return RunInodeReuse(clients, baseDir) }},
 		{"dirent-cache", func() (bool, error) { return RunDirentCache(clients, baseDir, dirStormPar) }},
 		{"extent-leaf-staleness", func() (bool, error) { return RunExtentLeafStaleness(clients, baseDir) }},

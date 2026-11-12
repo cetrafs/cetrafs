@@ -1636,8 +1636,17 @@ var settableModParams = map[string]bool{
 	// direct-write's negative control: completions stop converting, so
 	// the peer must see those blocks missing.
 	"dio_skip_convert": true,
-	"hb_interval_secs": true,
-	"stale_secs":       true,
+	// defrag-yield: slow the background move so a peer's open lands
+	// in the middle of it.
+	"defrag_step_delay_ms": true,
+	// ...and its two negative controls: the peer does not ask, the
+	// mover does not listen.
+	"lock_yield_wait_ms":  true,
+	"defrag_ignore_yield": true,
+	// handback-unknown: hand-back discards fail as a transport error.
+	"discard_fail_unknown": true,
+	"hb_interval_secs":     true,
+	"stale_secs":           true,
 	// The background scrub's cadence. A scenario that has to watch the
 	// scrub make (or decline) a decision cannot wait out the 30-minute
 	// default, and these must be set BEFORE the mount: scrub_start()

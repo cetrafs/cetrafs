@@ -466,3 +466,146 @@ func RunFstrimPool(clients []*Client, baseDir string) (bool, error) {
 	}
 	return ok, nil
 }
+
+// RunHandbackUnknown: a peer allocating while a hand-back discard's
+// outcome is unknown.
+//
+// An emptied Block Group is discarded and then published FREE. When the
+// discard fails as a transport error does, nobody knows whether the
+// UNMAP is still executing on the array, so the group must not reach
+// the pool: it stays drained and marked pending, and only a later
+// discard that completes publishes it. If it were published FREE
+// anyway, a peer could claim it and write data that the late UNMAP
+// then destroys. The scenario forces unknown outcomes on a
+// (discard_fail_unknown) while it hands groups back, has b allocate
+// heavily from the pool at the same time, then lets a's retry finish,
+// and requires b's data to read back whole and fsck to be clean.
+//
+// Setup is asserted: a must count unknown hand-back outcomes and hold
+// groups pending, or nothing was tested. No negative control: no knob
+// publishes a pending group early.
+func RunHandbackUnknown(clients []*Client, baseDir string) (bool, error) {
+	if len(clients) < 2 {
+		return false, fmt.Errorf("handback-unknown needs at least 2 clients")
+	}
+	a, b := clients[0], clients[1]
+	two := []*Client{a, b}
+	failSet := false
+	defer func() {
+		if failSet {
+			_ = callOK(a, "mod_param", ModParamArgs{Name: "discard_fail_unknown", Value: "0"})
+		}
+		if uerr := ensureUnmounted(clients); uerr != nil {
+			fmt.Printf("WARNING: cleanup unmount failed: %v\n", uerr)
+		}
+	}()
+	if err := ensureUnmounted(clients); err != nil {
+		return false, err
+	}
+	if err := mountAllDefault(two); err != nil {
+		return false, err
+	}
+	const (
+		mib   = 1 << 20
+		files = 8
+		fsz   = 128 * mib
+	)
+	dir := baseDir + "/handback-unknown"
+	fmt.Printf("=== handback-unknown: %s's hand-back discards fail unknown while %s allocates ===\n", a.Name, b.Name)
+	ok := true
+	if err := callOK(a, "mkdir", MkdirArgs{Path: dir}); err != nil {
+		return false, fmt.Errorf("setup mkdir %s: %w", dir, err)
+	}
+	for i := 0; i < files; i++ {
+		if err := callOK(a, "write", WriteArgs{Path: fmt.Sprintf("%s/a%d", dir, i), Size: fsz, Stamp: "A"}); err != nil {
+			return false, fmt.Errorf("%s: fill: %w", a.Name, err)
+		}
+	}
+	u0, err := infoCounter(a, "discard_handback_unknown")
+	if err != nil {
+		return false, err
+	}
+	if err := callOK(a, "mod_param", ModParamArgs{Name: "discard_fail_unknown", Value: "1000000"}); err != nil {
+		return false, fmt.Errorf("%s: discard_fail_unknown: %w", a.Name, err)
+	}
+	failSet = true
+	for i := 0; i < files; i++ {
+		if err := callOK(a, "unlink", UnlinkArgs{Path: fmt.Sprintf("%s/a%d", dir, i)}); err != nil {
+			return false, fmt.Errorf("%s: unlink: %w", a.Name, err)
+		}
+	}
+	// b allocates while a's hand-backs come back unknown.
+	sums := map[string]string{}
+	var mu sync.Mutex
+	var wg sync.WaitGroup
+	wg.Add(1)
+	go func() {
+		defer wg.Done()
+		for i := 0; i < files; i++ {
+			p := fmt.Sprintf("%s/b%d", dir, i)
+			var wr WriteResult
+			resp, e := b.Call("write", WriteArgs{Path: p, Size: fsz, Stamp: fmt.Sprintf("B%d", i)})
+			if decodeResult(b.Name, resp, e, &wr) == nil {
+				mu.Lock()
+				sums[p] = wr.Checksum
+				mu.Unlock()
+			}
+		}
+	}()
+	unknown, pending := int64(0), int64(0)
+	for t := time.Now(); time.Since(t) < 3*time.Minute; time.Sleep(2 * time.Second) {
+		u, _ := infoCounter(a, "discard_handback_unknown")
+		p, _ := infoCounter(a, "discard_pending_bgs")
+		unknown = u - u0
+		if p > pending {
+			pending = p
+		}
+		if unknown > 0 && pending > 0 {
+			break
+		}
+	}
+	wg.Wait()
+	check(&ok, fmt.Sprintf("setup: %s's hand-back discards came back unknown (%d) and held %d group(s) pending",
+		a.Name, unknown, pending), unknown > 0 && pending > 0, "no unknown outcome -- nothing was tested")
+	check(&ok, fmt.Sprintf("%s wrote all %d files meanwhile", b.Name, files), len(sums) == files, fmt.Sprintf("%d written", len(sums)))
+
+	// The array answers again: the pending groups are discarded and published.
+	_ = callOK(a, "mod_param", ModParamArgs{Name: "discard_fail_unknown", Value: "0"})
+	failSet = false
+	cleared := false
+	for t := time.Now(); time.Since(t) < 5*time.Minute; time.Sleep(3 * time.Second) {
+		if p, err := infoCounter(a, "discard_pending_bgs"); err == nil && p == 0 {
+			cleared = true
+			break
+		}
+	}
+	check(&ok, fmt.Sprintf("%s's pending groups are discarded and handed back once discards work", a.Name), cleared,
+		"still pending after 5 minutes")
+
+	for p, sum := range sums {
+		for _, c := range two {
+			var rr ReadResult
+			resp, e := c.Call("read", ReadArgs{Path: p})
+			if err := decodeResult(c.Name, resp, e, &rr); err != nil {
+				check(&ok, fmt.Sprintf("%s reads %s", c.Name, p), false, err.Error())
+				continue
+			}
+			check(&ok, fmt.Sprintf("%s reads %s whole", c.Name, p), rr.Checksum == sum && rr.Size == fsz,
+				fmt.Sprintf("size %d checksum %s, written %s", rr.Size, rr.Checksum, sum))
+		}
+	}
+	if err := ensureUnmounted(clients); err != nil {
+		return false, fmt.Errorf("unmount before fsck: %w", err)
+	}
+	var fr FsckResult
+	resp, e := a.Call("fsck", FsckArgs{})
+	if err := decodeResult(a.Name, resp, e, &fr); err != nil {
+		check(&ok, "fsck ran", false, err.Error())
+	} else {
+		check(&ok, "fsck clean", fr.Clean, fmt.Sprintf("exit %d: %s", fr.ExitCode, fr.Output))
+	}
+	if ok {
+		fmt.Printf("PASS: handback-unknown: a group whose discard may still run never reaches a peer\n")
+	}
+	return ok, nil
+}
