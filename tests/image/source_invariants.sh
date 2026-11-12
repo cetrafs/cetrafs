@@ -1705,6 +1705,81 @@ printf 'int cetrafs_scrub_thing(struct super_block *sb)\n{\n    return cetrafs_i
     pass "class 14: control -- a planted caller of the bit clear is found" ||
     fail "class 14: control -- the planted caller was not found"
 
+# Class 14 for DATA blocks. Every function that frees data blocks (a
+# data-bitmap bit cleared, directly or through one of the free
+# primitives) is listed with the kind of verdict its free rests on and
+# what keeps that verdict true at the act:
+#   prim:...     a free primitive; its callers are listed instead;
+#   own:...      blocks this operation allocated and never published --
+#                nothing was judged about anyone else;
+#   recheck:<f>  frees what a judged state no longer names, and asks
+#                again at the act through <f> -- which it must still call;
+#   held:...     frees under a claim no peer can enter while it is held;
+#   queued:...   applies a free a peer published and queued to its owner.
+# A new freeing function fails until it says which.
+log "checking every data-block free names what keeps its verdict true at the act (class 14)"
+C14D_REG='__cetrafs_free_data_extent prim:the-bitmap-clear-for-a-free
+cetrafs_free_fetched_extents prim:evict-s
+cetrafs_free_inline_extents prim:evict-s
+cetrafs_free_leaf_array prim:of-free_inline_extents
+cetrafs_leaf_array_punch prim:fallocate-s-punch
+cetrafs_leaf_array_trim prim:truncate-s
+cetrafs_tree_free_meta prim:its-callers-are-listed
+cetrafs_alloc_data_run_resv own:a-run-it-just-took-back-on-failure
+cetrafs_trim_claim_next own:undoes-its-own-claim
+cetrafs_trim_release own:gives-back-its-own-claim
+cetrafs_mkdir_locked own:a-dirent-block-never-published
+cetrafs_do_allocate own:blocks-never-published-held-in-the-reservation-registry
+__cetrafs_get_block own:a-block-never-published
+cetrafs_tree_append own:a-leaf-or-index-never-published
+cetrafs_tree_build own:a-tree-never-published
+cetrafs_inode_set_reservation own:a-reservation-run-never-published
+cetrafs_inode_drop_reservation own:the-unused-rest-of-a-reservation-run
+cetrafs_evict_inode recheck:cetrafs_free_inode_begin
+__cetrafs_truncate_shrink recheck:cetrafs_rebuild_peer_present
+cetrafs_fallocate recheck:cetrafs_rebuild_peer_present
+cetrafs_xattr_set_locked recheck:cetrafs_xattr_peer_user
+scrub_free_confirmed recheck:cetrafs_free_data_extent_unless_reserved
+cetrafs_defrag_inode held:the-defrag-pin-on-the-whole-file-lock
+cetrafs_defrag_commit held:inside-cetrafs_defrag_inode-s-pin
+cetrafs_apply_pending_free queued:the-owner-applying-a-published-free
+cetrafs_zg_drain_one queued:drains-the-owner-s-queue'
+C14D_PRIMS='cetrafs_free_data_block cetrafs_free_data_extent cetrafs_free_data_extent_unless_reserved cetrafs_apply_pending_free cetrafs_bitmap_free_bit cetrafs_bitmap_flip_range cetrafs_free_fetched_extents cetrafs_free_inline_extents cetrafs_free_leaf_array cetrafs_tree_free_meta cetrafs_leaf_array_punch cetrafs_leaf_array_trim'
+c14d_freers() { # <files...>: every function calling a free primitive (any name, not just cetrafs_*)
+    local p
+    for p in $C14D_PRIMS; do
+        awk -v P="$p" '
+/^[a-z][a-z0-9_ *\t]*[ *\t][a-z_][a-z0-9_]*\(/ && !/;[ \t]*$/ && !/^(return|if|else|while|for)/ { match($0, /[a-z_][a-z0-9_]*\(/); fn = substr($0, RSTART, RLENGTH - 1) }
+/^[a-z_][a-z0-9_]*\(/ && !/;[ \t]*$/ { match($0, /[a-z_][a-z0-9_]*\(/); fn = substr($0, RSTART, RLENGTH - 1) }
+/^\}/ { fn = "" }
+{ line = $0; sub(/\/\*.*$/, "", line); sub(/\/\/.*$/, "", line) }
+line ~ /^[ \t]*\*/ { next }
+line ~ ("(^|[^a-z0-9_])" P "\\(") && fn != P && fn != "" { print fn }' "$@"
+    done | sort -u
+}
+C14D_FOUND="$(c14d_freers "$K"/*.c)"
+[ "$(grep -c . <<<"$C14D_FOUND")" -ge 20 ] || fail "class 14 (data): setup -- found only $(grep -c . <<<"$C14D_FOUND") freeing functions; the scan is not seeing the tree"
+C14D_NEW="$(comm -23 <(echo "$C14D_FOUND") <(cut -d' ' -f1 <<<"$C14D_REG" | sort -u))"
+C14D_GONE="$(comm -13 <(echo "$C14D_FOUND") <(cut -d' ' -f1 <<<"$C14D_REG" | sort -u))"
+C14D_BAD="$(while read -r fn kind; do
+    case "$kind" in
+    recheck:*) grep -q "${kind#recheck:}(" <<<"$(c41_body "$fn")" || echo "$fn: no longer calls ${kind#recheck:}" ;;
+    prim:* | own:* | held:* | queued:*) ;;
+    *) echo "$fn: unknown kind $kind" ;;
+    esac
+done <<<"$C14D_REG")"
+[ -z "$C14D_NEW" ] && [ -z "$C14D_GONE" ] && [ -z "$C14D_BAD" ] &&
+    pass "class 14: every data-block free names what keeps its verdict true at the act ($(echo $C14D_FOUND | wc -w))" ||
+    fail "class 14 (data): unlisted: $(echo $C14D_NEW); listed but gone: $(echo $C14D_GONE); $C14D_BAD"
+# Control: a new freeing function (not cetrafs_-named) is found, and a
+# recheck that stopped calling its re-check is seen.
+C14D_SAMPLE="$(ct_tmp c14d).c"
+printf 'static void scrub_new_dropper(struct super_block *sb)\n{\n    cetrafs_free_data_extent(sb, 5, 1);\n}\nstatic void cetrafs_xattr_set_locked(struct inode *inode)\n{\n    cetrafs_free_data_block(inode->i_sb, 7);\n}\n' >"$C14D_SAMPLE"
+[ "$(c14d_freers "$C14D_SAMPLE" | tr '\n' ' ')" = "cetrafs_xattr_set_locked scrub_new_dropper " ] &&
+    ! grep -q "cetrafs_xattr_peer_user(" <<<"$(K="$(dirname "$C14D_SAMPLE")" c41_body cetrafs_xattr_set_locked)" &&
+    pass "class 14 (data): control -- a planted unlisted free is found, and a recheck that stopped re-checking is seen" ||
+    fail "class 14 (data): control -- the planted cases were not seen as expected"
+
 # Class 44 ("alive" as the unsafe default). A liveness predicate's first
 # look at a row answers "alive" -- right for a reclaim, which then keeps
 # its hands off, and wrong for a caller that REFUSES or INHERITS on it
