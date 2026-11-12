@@ -1689,6 +1689,10 @@ var settableModParams = map[string]bool{
 	// zg-claim-vs-replay control: the heartbeat's takeover waits for
 	// a peer's replay, as it used to.
 	"zg_claim_always_waits": true,
+	// reader-reattach: hold a write-open before its reader-bit clear,
+	// and (control) the clear before format 0x000A.
+	"lock_reader_clear_any_incarnation": true,
+	"reclaim_stall_before_swap_ms":      true,
 	// replay-after-truncate: a failed consume on one replayer, and its
 	// control (the old park).
 	"journal_consume_fail_once": true,

@@ -804,3 +804,231 @@ func RunZgClaimVsReplay(clients []*Client, baseDir string) (bool, error) {
 	}
 	return ok, nil
 }
+
+// RunReaderReattach: a write-open reclaiming a dead reader's presence
+// bit does not take the bit that reader's NEXT incarnation stamped.
+//
+// A write-open that finds a stale node's reader bit fences the node and
+// clears the bit. If the node re-attaches and opens the file again
+// before that clear lands, the bit is a live reader's. The swap used to
+// compare the row number only, re-read the row afterwards and give the
+// bit back if it had beaten -- which also gave a bit back to a node that
+// re-attached WITHOUT re-opening (01554cb, then F10). Every presence bit
+// now records the incarnation that stamped it and the clear takes only
+// the one it judged (format 0x000A). Staged single-node by poking a
+// registry row (reclaim_incarnation.sh); this is the real thing.
+//
+// b reads f and drops off the device; a's write-open fences b and is
+// held just before its clear (reclaim_stall_before_swap_ms). b comes
+// back as a fresh mount -- a new incarnation, its re-attach sweep
+// clearing the old bit -- and opens f for read again. When a's clear
+// lands it must find the new incarnation's bit and refuse the write-open
+// (ETXTBSY): b is reading.
+//
+// Control (CTEST_READER_CONTROL=1): the clear takes b's bit whatever
+// incarnation stamped it (lock_reader_clear_any_incarnation) -- a's
+// write-open succeeds under b's live read.
+func RunReaderReattach(clients []*Client, baseDir string) (bool, error) {
+	if len(clients) < 2 {
+		return skipScenario("reader-reattach needs two nodes, have %d", len(clients))
+	}
+	control := os.Getenv("CTEST_READER_CONTROL") != ""
+	a, b := clients[0], clients[1]
+	two := []*Client{a, b}
+	if err := ensureUnmounted(clients); err != nil {
+		return false, err
+	}
+	if err := mountAllDefault(two); err != nil {
+		return false, err
+	}
+	var restores []func()
+	linkDown := false
+	var handles [][2]any // {client, handle}
+	defer func() {
+		for i := len(restores) - 1; i >= 0; i-- {
+			restores[i]()
+		}
+		for _, h := range handles {
+			_, _ = h[0].(*Client).Call("close", CloseArgs{Handle: h[1].(uint64)})
+		}
+		if linkDown {
+			if _, err := b.Call("link_up", nil); err != nil {
+				fmt.Printf("WARNING: could not restore %s's device: %v\n", b.Name, err)
+			}
+		}
+		_ = ensureUnmounted(clients)
+	}()
+	setClusterTiming(two, 5, 15, false)
+	restores = append(restores, func() { setClusterTiming(two, defaultHBIntervalSecs, defaultStaleSecs, true) })
+	if err := waitAdvertisedInterval(a, b, 5, 20*time.Second); err != nil {
+		fmt.Printf("WARNING: %s\n", err)
+	}
+
+	ok := true
+	pass := func(l string) { check(&ok, l, true, "") }
+	dir := baseDir + "/reader-reattach"
+	f := dir + "/f"
+	fmt.Printf("=== reader-reattach: %s reads f and dies, %s's write-open clears it while %s comes back and reads again ===\n",
+		b.Name, a.Name, b.Name)
+	if control {
+		fmt.Printf("  NEGATIVE CONTROL: %s's clear takes %s's bit whatever incarnation stamped it\n", a.Name, b.Name)
+	}
+	if err := callOK(a, "mkdir", MkdirArgs{Path: dir}); err != nil {
+		return false, fmt.Errorf("setup mkdir: %w", err)
+	}
+	var oh OpenHoldResult
+	resp, err := a.Call("open_hold", OpenHoldArgs{Path: f, Mode: "rdwr", Create: true})
+	if e := decodeResult(a.Name, resp, err, &oh); e != nil {
+		return false, fmt.Errorf("setup: %s create: %w", a.Name, e)
+	}
+	if err := callOK(a, "write_held", HeldIOArgs{Handle: oh.Handle, Offset: 0, Size: 4096, Stamp: "f-"}); err != nil {
+		return false, fmt.Errorf("setup: %s write: %w", a.Name, err)
+	}
+	if err := callOK(a, "close", CloseArgs{Handle: oh.Handle}); err != nil {
+		return false, fmt.Errorf("setup: %s close: %w", a.Name, err)
+	}
+	openRead := func() (uint64, error) {
+		var r OpenHoldResult
+		resp, err := b.Call("open_hold", OpenHoldArgs{Path: f, Mode: "rdonly"})
+		if e := decodeResult(b.Name, resp, err, &r); e != nil {
+			return 0, e
+		}
+		handles = append(handles, [2]any{b, r.Handle})
+		return r.Handle, nil
+	}
+	hB, err := openRead()
+	if err != nil {
+		return false, fmt.Errorf("setup: %s read-open: %w", b.Name, err)
+	}
+
+	// b's next mount: its re-attach watches its old row for b's stale
+	// window, a module default -- the compressed one, not 120 s.
+	if r, err := modParams(b, "stale_secs", "15", "hb_interval_secs", "5"); err != nil {
+		return false, fmt.Errorf("setup: %w", err)
+	} else {
+		restores = append(restores, r)
+	}
+	if err := callOK(b, "link_down", nil); err != nil {
+		return false, fmt.Errorf("%s link_down: %w", b.Name, err)
+	}
+	linkDown = true
+	if !waitSeenStale([]*Client{a}, 90*time.Second) {
+		check(&ok, "setup: "+a.Name+" sees "+b.Name+" stale", false, "never went stale")
+		return ok, nil
+	}
+	pass("setup: " + b.Name + " holds f open for read and is stale to " + a.Name)
+
+	const stall = 60 * time.Second
+	if control {
+		r, err := modParams(a, "lock_reader_clear_any_incarnation", "1")
+		restores = append(restores, r)
+		if err != nil {
+			return false, fmt.Errorf("setup: %w", err)
+		}
+	}
+	r, err := modParams(a, "reclaim_stall_before_swap_ms", fmt.Sprint(stall.Milliseconds()))
+	restores = append(restores, r)
+	if err != nil {
+		return false, fmt.Errorf("setup: %w", err)
+	}
+	// The open runs on a second connection: one connection carries one
+	// request at a time, and the probes below would queue behind it.
+	conns, closeConns, err := a.Parallel(2, 10*time.Second)
+	if err != nil {
+		return false, err
+	}
+	defer closeConns()
+	var openErr error
+	var aHandle uint64
+	openDone := make(chan struct{})
+	go func() {
+		defer close(openDone)
+		var h OpenHoldResult
+		resp, err := conns[1].Call("open_hold", OpenHoldArgs{Path: f, Mode: "rdwr"})
+		openErr = decodeResult(a.Name, resp, err, &h)
+		aHandle = h.Handle
+	}()
+	time.Sleep(3 * time.Second)
+	var mp ModParamResult
+	resp, err = a.Call("mod_param", ModParamArgs{Name: "reclaim_stall_before_swap_ms", Value: "0"})
+	_ = decodeResult(a.Name, resp, err, &mp)
+	select {
+	case <-openDone:
+		check(&ok, "setup: "+a.Name+"'s write-open is held before its clear", false,
+			fmt.Sprintf("it returned at once (%v)", openErr))
+		if aHandle != 0 {
+			handles = append(handles, [2]any{a, aHandle})
+		}
+		return ok, nil
+	default:
+	}
+	if strings.TrimSpace(mp.Prev) != "0" {
+		check(&ok, "setup: "+a.Name+"'s write-open is held before its clear", false,
+			"the one-shot stall was not taken -- the open is waiting on something else")
+		<-openDone
+		return ok, nil
+	}
+	pass("setup: " + a.Name + "'s write-open fenced " + b.Name + " and is held before clearing its bit")
+
+	// b comes back: a fresh mount, a new incarnation, and f open again.
+	_, _ = b.Call("close", CloseArgs{Handle: hB}) // on a fenced mount: errors, but the fd goes
+	if _, err := b.Call("link_up", nil); err != nil {
+		return false, fmt.Errorf("%s link_up: %w", b.Name, err)
+	}
+	linkDown = false
+	_ = ensureUnmounted([]*Client{b})
+	t0 := time.Now()
+	if err := mountAllDefault([]*Client{b}); err != nil {
+		check(&ok, "setup: "+b.Name+" re-attaches", false, err.Error())
+		<-openDone
+		return ok, nil
+	}
+	_, rerr := openRead()
+	stillHeld := false
+	select {
+	case <-openDone:
+	default:
+		stillHeld = true
+	}
+	if rerr != nil || !stillHeld {
+		check(&ok, "setup: "+b.Name+" re-attached and read-opened f while "+a.Name+"'s clear was held", false,
+			fmt.Sprintf("read-open %v, %s's open still held %v (re-attach took %s)", rerr, a.Name, stillHeld,
+				time.Since(t0).Round(time.Second)))
+		<-openDone
+		return ok, nil
+	}
+	pass(fmt.Sprintf("setup: %s re-attached (%s) and read-opened f while %s's clear was held", b.Name,
+		time.Since(t0).Round(time.Second), a.Name))
+
+	<-openDone
+	if aHandle != 0 {
+		handles = append(handles, [2]any{a, aHandle})
+	}
+	busy := openErr != nil && strings.Contains(openErr.Error(), "text file busy")
+	if control {
+		check(&ok, "control: clearing whatever incarnation, "+a.Name+"'s write-open got f under "+b.Name+"'s live read",
+			openErr == nil, fmt.Sprintf("it failed (%v) -- the scenario cannot tell the two apart", openErr))
+	} else {
+		check(&ok, a.Name+"'s write-open is refused: "+b.Name+"'s new open is a live reader", busy,
+			fmt.Sprintf("open returned %v", openErr))
+	}
+
+	for _, h := range handles {
+		_, _ = h[0].(*Client).Call("close", CloseArgs{Handle: h[1].(uint64)})
+	}
+	handles = nil
+	_ = ensureUnmounted(two)
+	var fr FsckResult
+	resp, err = a.Call("fsck", FsckArgs{})
+	if e := decodeResult(a.Name, resp, err, &fr); e != nil {
+		check(&ok, "fsck ran", false, e.Error())
+	} else {
+		check(&ok, "fsck clean", fr.Clean, fmt.Sprintf("exit %d: %s", fr.ExitCode, firstLine(fr.Output)))
+	}
+	if ok {
+		fmt.Printf("PASS: reader-reattach\n")
+	} else {
+		fmt.Printf("FAIL: reader-reattach: see failed checks above\n")
+	}
+	return ok, nil
+}

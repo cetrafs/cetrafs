@@ -1691,6 +1691,14 @@ static bool cetrafs_lock_cas_skip_crc;
 cetrafs_test_param(lock_cas_skip_crc, cetrafs_lock_cas_skip_crc, bool, 0644);
 MODULE_PARM_DESC(lock_cas_skip_crc, "TEST ONLY: the lock CAS does not refuse a sector failing its checksum");
 
+/* TEST ONLY: a reclaim's reader-bit CLEAR takes the node's bit whatever
+ * incarnation stamped it -- the swap before format 0x000A, the control
+ * of ctest reader-reattach. */
+static bool cetrafs_lock_reader_clear_any_incarnation;
+cetrafs_test_param(lock_reader_clear_any_incarnation, cetrafs_lock_reader_clear_any_incarnation, bool, 0644);
+MODULE_PARM_DESC(lock_reader_clear_any_incarnation,
+                 "TEST ONLY: a stale reader's bit is cleared whatever incarnation stamped it");
+
 static int cetrafs_lock_cas_mutate(void *image, unsigned int len, void *priv)
 {
     struct cetrafs_lock_cas_ctx *ctx = priv;
@@ -1765,7 +1773,7 @@ static int cetrafs_lock_cas_mutate(void *image, unsigned int len, void *priv)
          * incarnation that was judged: one stamped since is that node's
          * new open, a live reader (F10). */
         if (ctx->reader_op == CETRAFS_READER_CLEAR && ctx->check_incarnation &&
-            (cetrafs_le64(rec.read_open_nodes) & bit) &&
+            !READ_ONCE(cetrafs_lock_reader_clear_any_incarnation) && (cetrafs_le64(rec.read_open_nodes) & bit) &&
             cetrafs_le32(rec.read_open_incarnation[slot]) != ctx->steal_incarnation) {
             ctx->moved = true;
             return 1;
