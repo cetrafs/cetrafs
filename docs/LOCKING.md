@@ -139,8 +139,10 @@ only** — directories are never lockable this way, see Mechanism 3.
   `CETRAFS_LOCK_EXCLUSIVE` is held rejects with `-ETXTBSY`, unless the
   holder's Node Registry row has gone stale, in which case the open
   proceeds (and a write-open reclaims the lock).
-- A lock held only to relocate an idle file -- the background defrag,
-  or `defrag.cetra` with no writer -- is `CETRAFS_LOCK_RELOCATING`, and
+- A lock held only to relocate an idle file -- the background defrag;
+  `defrag.cetra` opens the file for write and moves it under that
+  writer's `_EXCLUSIVE`, which a peer cannot ask back -- is
+  `CETRAFS_LOCK_RELOCATING`, and
   so is a writer's lock once its last close lands while the mover is
   pinned on it. It excludes exactly like `_EXCLUSIVE`, but a peer's open
   that finds it swaps in `_YIELD` and waits (`lock_yield_wait_ms`,

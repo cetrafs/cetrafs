@@ -2307,8 +2307,9 @@ reread:
 
             /* Held only to relocate an idle file: ask for it back and
              * decide again once it is no longer that (bounded: the
-             * janitor does not re-pin a file a peer asked for, but a
-             * defrag.cetra could). A real writer is refused at once. */
+             * janitor does not re-pin a file a peer asked for, and only
+             * the janitor pins RELOCATING -- defrag.cetra moves under its
+             * own writer's EXCLUSIVE). A real writer is refused at once. */
             if ((m == CETRAFS_LOCK_RELOCATING || m == CETRAFS_LOCK_YIELD) && yield_rounds++ < 3) {
                 ret = cetrafs_lock_wait_yield(inode, &raw, my_node_id);
                 if (!ret)

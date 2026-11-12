@@ -1607,7 +1607,8 @@ static inline void cetrafs_inode_fd_copy(cetrafs_inode_t *dst, const cetrafs_ino
 #define CETRAFS_LOCK_NONE          0 /* unlocked */
 #define CETRAFS_LOCK_EXCLUSIVE     1 /* held by lock_owner_node; blocks opens from any other node */
 /* Held by lock_owner_node for a background relocation of an idle file
- * (the defrag janitor, or defrag.cetra without a writer): it blocks
+ * (the defrag janitor -- defrag.cetra opens the file for write and
+ * pins on that writer's EXCLUSIVE, which is never asked back): it blocks
  * opens like EXCLUSIVE, but a peer that wants the file may ask for it
  * back by swapping in YIELD. */
 #define CETRAFS_LOCK_RELOCATING    2
