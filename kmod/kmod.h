@@ -1123,6 +1123,14 @@ int cetrafs_lock_foreign_user_judged(struct super_block *sb,
                                      bool *out_reader,
                                      u32 *judged_owner,
                                      u64 *judged_readers);
+/* The same for a user's operation: a peer's background-move pin is
+ * asked back and waited for rather than reported as a writer. */
+int cetrafs_lock_foreign_user_settled(struct inode *inode,
+                                      u32 my_node_id,
+                                      bool *out_writer,
+                                      bool *out_reader,
+                                      u32 *judged_owner,
+                                      u64 *judged_readers);
 bool cetrafs_lock_held_for_write_locally(struct inode *inode);
 int cetrafs_lock_write_gate(struct inode *inode); /* -ETXTBSY while this node's lock is suspended */
 bool cetrafs_lock_read_cache_trusted(struct inode *inode);

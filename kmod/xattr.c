@@ -318,7 +318,7 @@ static int cetrafs_xattr_peer_user(struct inode *inode)
     ret = cetrafs_sb_get_node_id(sb, &my_node_id);
     if (ret)
         return ret;
-    ret = cetrafs_lock_foreign_user_exists(sb, inode->i_ino, my_node_id, &blocked, &reader);
+    ret = cetrafs_lock_foreign_user_settled(inode, my_node_id, &blocked, &reader, NULL, NULL);
     if (ret)
         return ret;
     return blocked || reader ? -ETXTBSY : 0;

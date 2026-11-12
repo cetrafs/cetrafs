@@ -1630,6 +1630,9 @@ struct cetrafs_lock_cas_ctx {
      *    it, not a conflict). */
     bool refuse_foreign_excl;
     u32 lock_owner_ok;
+    /* out (READER_SET): the refusal was a peer's RELOCATING or YIELD
+     * pin -- a background move the open may ask back, not a writer. */
+    bool refused_by_mover;
 
     /* Release path only: also stamp this inode's in-core stat fields
      * into the same swap. The close path used to persist them with one
@@ -1744,8 +1747,12 @@ static int cetrafs_lock_cas_mutate(void *image, unsigned int len, void *priv)
             u32 owner = cetrafs_le32(rec.lock_owner_node);
 
             if (cetrafs_lock_mode_held(cetrafs_le32(rec.lock_mode)) && owner != ctx->my_node_id &&
-                owner != ctx->lock_owner_ok)
-                return -ETXTBSY; /* a writer claimed it since our check */
+                owner != ctx->lock_owner_ok) {
+                u32 m = cetrafs_le32(rec.lock_mode);
+
+                ctx->refused_by_mover = m == CETRAFS_LOCK_RELOCATING || m == CETRAFS_LOCK_YIELD;
+                return -ETXTBSY; /* a writer claimed it since our check -- or a mover pinned it */
+            }
             if (ctx->refuse_foreign_lock && (cetrafs_le64(rec.suspended_writer_nodes) & ~bit))
                 return -ETXTBSY; /* a writer handing it over still writes */
         }
@@ -1986,6 +1993,10 @@ static int cetrafs_lock_wait_yield(struct inode *inode, const cetrafs_inode_t *r
     kfree(now);
     return ret;
 }
+
+/* A peer's background-move pin: ask it back and wait -- defined with
+ * cetrafs_lock_foreign_user_settled(), its other user, far below. */
+static int cetrafs_lock_ask_mover(struct inode *inode, u32 my_node_id);
 
 /* Clear the on-disk lock this node holds -- defined far below, next to
  * defrag_end which also uses it, but forward-declared here for the
@@ -2551,6 +2562,24 @@ reread:
         if (READ_ONCE(cetrafs_open_presence_stall_ms))
             msleep(xchg(&cetrafs_open_presence_stall_ms, 0)); /* test-only, one-shot; see the parameter */
         rret = cetrafs_lock_fail_reader_publish ? -EIO : cetrafs_lock_cas(inode, &rctx, &raw);
+        /* A background move pinned the file between the check above and
+         * this swap. The check asks such a pin back and waits
+         * (cetrafs_lock_wait_yield()); refusing it here instead was
+         * ETXTBSY to a reader for a file a peer only defragments -- the
+         * transient answered as final (class 43), seen by ctest
+         * grow-unrescanned. Ask, wait, and publish again; a pin that
+         * keeps coming back after a few rounds is a refusal. */
+        for (int round = 0; rret == -ETXTBSY && rctx.refused_by_mover && round < 3; round++) {
+            int w = cetrafs_lock_ask_mover(inode, my_node_id);
+
+            if (w <= 0) {
+                if (w < 0)
+                    rret = w;
+                break;
+            }
+            rctx.refused_by_mover = false;
+            rret = cetrafs_lock_cas(inode, &rctx, NULL);
+        }
 
         if (rret < 0) {
             /*
@@ -5314,6 +5343,8 @@ int cetrafs_flock(struct file *file, int cmd, struct file_lock *fl)
     struct inode *inode = file_inode(file);
     bool blocking = (cmd == F_SETLKW);
     bool lock_on = cetrafs_sb_file_lock_enabled(inode->i_sb);
+    int mover_rounds = 0;
+    u32 me;
     int ret;
 
     if (!(fl->c.flc_flags & FL_FLOCK))
@@ -5355,6 +5386,20 @@ int cetrafs_flock(struct file *file, int cmd, struct file_lock *fl)
         ret = lock_on ? cetrafs_lock_resume(inode) : cetrafs_lock_explicit_acquire(inode, file);
         if (ret != -EBUSY && ret != -ETXTBSY)
             return ret; /* 0, or terminal (-EOPNOTSUPP default mount, -EROFS, -EIO) */
+        /* Held by a peer's background move of the file: ask for it
+         * back and try again at once. Polling it instead waited out
+         * the whole pass -- and LOCK_NB answered EWOULDBLOCK for a
+         * file nobody was using (class 43). */
+        if (mover_rounds < 3 && !cetrafs_sb_get_node_id(inode->i_sb, &me)) {
+            int w = cetrafs_lock_ask_mover(inode, me);
+
+            if (w < 0)
+                return w;
+            if (w > 0) {
+                mover_rounds++;
+                continue;
+            }
+        }
         if (!blocking)
             return -EWOULDBLOCK; /* LOCK_NB and contended */
         /* Blocking LOCK_EX: wait for the holder (local or a peer) to
@@ -5969,4 +6014,75 @@ int cetrafs_lock_foreign_claim_exists(struct super_block *sb, u64 ino, u32 my_no
     if (ret)
         return ret;
     return cetrafs_foreign_claim_from_raw(sb, &raw, my_node_id, out_exists, NULL);
+}
+
+/*
+ * If the file's lock is a live peer's RELOCATING or YIELD pin -- a
+ * background defrag of a file nobody is using -- ask for it back and
+ * wait for the mover to step aside (cetrafs_lock_wait_yield()).
+ * 1: it did, judge again; 0: no such pin (a real writer, a dead holder
+ * the caller's own path deals with, nothing), or it would not let go in
+ * time; <0: an error, -EINTR for a kill. lock_yield_wait_ms=0 turns the
+ * asking off.
+ */
+static int cetrafs_lock_ask_mover(struct inode *inode, u32 my_node_id)
+{
+    struct super_block *sb = inode->i_sb;
+    cetrafs_inode_t *raw = kmalloc(sizeof(*raw), GFP_NOFS);
+    bool stale = false;
+    u32 m, owner;
+    int ret;
+
+    if (!raw)
+        return -ENOMEM;
+    cetrafs_invalidate_raw_inode(sb, inode->i_ino);
+    ret = cetrafs_read_raw_inode(sb, inode->i_ino, raw);
+    if (ret)
+        goto out;
+    m = cetrafs_le32(raw->lock_mode);
+    owner = cetrafs_le32(raw->lock_owner_node);
+    if ((m != CETRAFS_LOCK_RELOCATING && m != CETRAFS_LOCK_YIELD) || owner == my_node_id)
+        goto out; /* ret == 0 */
+    ret = cetrafs_node_is_stale(sb, owner, &stale);
+    if (ret || stale)
+        goto out;
+    ret = cetrafs_lock_wait_yield(inode, raw, my_node_id);
+    ret = !ret ? 1 : ret == -ETXTBSY ? 0 : ret;
+out:
+    kfree(raw);
+    return ret;
+}
+
+/*
+ * cetrafs_lock_foreign_user_judged() for an operation a user asked for
+ * (unlink, rename over, link, truncate, chmod, fallocate, punch, zero,
+ * setxattr): a "writer" that is only a peer's background-move pin is
+ * asked back and waited for (cetrafs_lock_ask_mover()), then everything
+ * is judged again from a fresh read. It used to be a final ETXTBSY on a
+ * file nobody was using, for as long as the move happened to take
+ * (class 43). A pin still there after the wait, or coming back three
+ * times, stands as a writer.
+ *
+ * Only where the operation has read nothing yet: waiting the mover out
+ * is then the same as arriving after it finished. A check made AFTER a
+ * new map was computed (cetrafs_rebuild_recheck()) must not wait -- a
+ * move committed meanwhile made that map stale.
+ */
+int cetrafs_lock_foreign_user_settled(struct inode *inode,
+                                      u32 my_node_id,
+                                      bool *out_writer,
+                                      bool *out_reader,
+                                      u32 *judged_owner,
+                                      u64 *judged_readers)
+{
+    for (int round = 0;; round++) {
+        int ret = cetrafs_lock_foreign_user_judged(inode->i_sb, inode->i_ino, my_node_id, out_writer, out_reader,
+                                                   judged_owner, judged_readers);
+
+        if (ret || !*out_writer || round >= 3)
+            return ret;
+        ret = cetrafs_lock_ask_mover(inode, my_node_id);
+        if (ret <= 0)
+            return ret; /* 0: *out_writer stands */
+    }
 }

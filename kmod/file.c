@@ -5191,6 +5191,10 @@ MODULE_PARM_DESC(rebuild_stall_post_ms, "TEST ONLY: pause a punch/truncate after
  * the second one is what makes a peer arriving between them safe: what
  * it may still name is left allocated, a leak the scrub reclaims once
  * nothing names it. An error asking counts as yes.
+ *
+ * A peer's defrag pin counts as yes too, and is NOT waited out
+ * (cetrafs_lock_foreign_user_settled()): the second ask runs after the
+ * new map was computed, and a move committed meanwhile made it stale.
  */
 static bool cetrafs_rebuild_peer_present(struct inode *inode)
 {
@@ -6031,7 +6035,7 @@ static long cetrafs_zero_range_inplace(struct file *file, loff_t offset, loff_t 
     {
         bool blocked = false, reader = false;
 
-        ret = cetrafs_lock_foreign_user_exists(sb, inode->i_ino, my_node_id, &blocked, &reader);
+        ret = cetrafs_lock_foreign_user_settled(inode, my_node_id, &blocked, &reader, NULL, NULL);
         if (ret)
             goto out;
         if (blocked || reader) {
@@ -6270,7 +6274,7 @@ static long cetrafs_fallocate(struct file *file, int mode, loff_t offset, loff_t
 
             arc = cetrafs_sb_get_node_id(sb, &my_node_id);
             if (!arc)
-                arc = cetrafs_lock_foreign_user_exists(sb, inode->i_ino, my_node_id, &blocked, &reader);
+                arc = cetrafs_lock_foreign_user_settled(inode, my_node_id, &blocked, &reader, NULL, NULL);
             if (!arc && (blocked || reader)) {
                 pr_warn_ratelimited("fallocate: ino=%llu is open on another node -- refusing to rewrite its map\n",
                                     (unsigned long long) inode->i_ino);
@@ -6347,7 +6351,7 @@ static long cetrafs_fallocate(struct file *file, int mode, loff_t offset, loff_t
         {
             bool blocked = false, reader = false;
 
-            ret = cetrafs_lock_foreign_user_exists(sb, inode->i_ino, my_node_id, &blocked, &reader);
+            ret = cetrafs_lock_foreign_user_settled(inode, my_node_id, &blocked, &reader, NULL, NULL);
             if (ret)
                 goto out;
             if (blocked || reader) {
@@ -6784,7 +6788,7 @@ static int cetrafs_setattr_locked(struct mnt_idmap *idmap, struct dentry *dentry
              */
             bool reader = false;
 
-            ret = cetrafs_lock_foreign_user_exists(inode->i_sb, inode->i_ino, my_node_id, &blocked, &reader);
+            ret = cetrafs_lock_foreign_user_settled(inode, my_node_id, &blocked, &reader, NULL, NULL);
             if (ret)
                 return ret;
             if (blocked || reader)
@@ -6801,8 +6805,8 @@ static int cetrafs_setattr_locked(struct mnt_idmap *idmap, struct dentry *dentry
              * would report a truncate that happened as failed. */
             bool reader = false;
 
-            ret = cetrafs_lock_foreign_user_judged(inode->i_sb, inode->i_ino, my_node_id, &blocked, &reader,
-                                                   &judged_owner, &judged_readers);
+            ret = cetrafs_lock_foreign_user_settled(inode, my_node_id, &blocked, &reader, &judged_owner,
+                                                    &judged_readers);
             if (ret)
                 return ret;
             if (blocked || reader)

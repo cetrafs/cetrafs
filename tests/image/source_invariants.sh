@@ -1566,7 +1566,7 @@ printf 'static bool cetrafs_thing_key_matches(const struct ci *ci, const cetrafs
 # literal the scan cannot place in a function fails as well: the scan
 # once missed every __cetrafs_* function, __cetrafs_get_block()'s
 # ENOSPC among them.
-log "checking every -ENOSPC/-EBUSY/-ENOENT names the transient states it waited out (class 43)"
+log "checking every -ENOSPC/-EBUSY/-ENOENT/-ETXTBSY names the transient states it waited out (class 43)"
 C43_REG_ENOSPC='cetrafs_alloc_pick_bg waits:cetrafs_sb_release_wait
 cetrafs_alloc_block_anywhere calls:cetrafs_alloc_pick_bg
 cetrafs_do_allocate calls:cetrafs_alloc_pick_bg
@@ -1620,6 +1620,21 @@ cetrafs_grow_claim_present final:no-growfs-claim-the-tool-did-not-ask
 cetrafs_lock_open final:test-injection-open_refresh_fail_once
 cetrafs_defrag_inode final:test-injection-defrag_fail_invalidate
 cetrafs_zg_drain_one final:test-injection-pf_drain_busy_region'
+C43_REG_ETXTBSY='cetrafs_lock_open waits:cetrafs_lock_wait_yield
+cetrafs_lock_wait_yield final:the-mover-did-not-step-aside-within-lock_yield_wait_ms
+cetrafs_lock_cas_mutate below:a-cas-callback-the-open-and-flock-ask-a-mover-back-cetrafs_lock_ask_mover
+cetrafs_lock_explicit_acquire below:the-flock-loop-asks-a-mover-back-and-polls-a-holder
+cetrafs_lock_resume below:the-flock-loop-asks-a-mover-back-and-polls-a-holder
+cetrafs_unlink_locked calls:cetrafs_lock_foreign_user_settled
+cetrafs_rename_locked calls:cetrafs_lock_foreign_user_settled
+cetrafs_link_locked calls:cetrafs_lock_foreign_user_settled
+cetrafs_setattr_locked calls:cetrafs_lock_foreign_user_settled
+cetrafs_fallocate calls:cetrafs_lock_foreign_user_settled
+cetrafs_zero_range_inplace calls:cetrafs_lock_foreign_user_settled
+cetrafs_foreign_claim_from_raw final:a-holder-judged-dead-came-back-it-is-live
+cetrafs_rebuild_recheck final:a-peer-arrived-after-the-new-map-was-computed-waiting-would-publish-a-stale-map
+cetrafs_fd_write_mutate final:a-peer-changed-the-file-since-the-plan-a-stale-map-must-not-publish
+cetrafs_evict_inode below:a-peer-uses-it-the-number-stays-allocated-the-scrub-reclaims-it'
 C43_REG_ENOENT='cetrafs_dir_extents_get_unchecked final:the-directory-is-gone-on-a-fresh-read
 cetrafs_dir_add_entry final:the-directory-is-gone-on-a-fresh-read
 cetrafs_dir_remove_entry final:the-name-is-gone-under-the-namespace-lock
@@ -1641,7 +1656,7 @@ c43_names() { # <errno> <files...>: every function with a literal return/assignm
 line ~ /^[ \t]*\*/ { next }
 line ~ ("(return|=)[ \t]*-" E "[ \t]*;") { print (fn == "" ? "UNPLACED:" FILENAME ":" FNR : fn) }' "$@" | sort -u
 }
-for C43_E in ENOSPC EBUSY ENOENT; do
+for C43_E in ENOSPC EBUSY ENOENT ETXTBSY; do
     eval "C43_REG=\$C43_REG_$C43_E"
     C43_FOUND="$(c43_names "$C43_E" "$K"/*.c)"
     [ -n "$C43_FOUND" ] || fail "class 43: setup -- no -$C43_E found (the scan no longer matches)"
@@ -1809,6 +1824,7 @@ inode.c:cetrafs_write_vfs_inode:alive -> drop our own dirt (keep the record)
 journal.c:cetrafs_journal_claim_replay:alive -> leave the replay to it (keep)
 lock.c:cetrafs_foreign_claim_from_raw:alive -> a live claim (keep)
 lock.c:cetrafs_foreign_reader_from_raw:alive -> keep its reader bit
+lock.c:cetrafs_lock_ask_mover:alive -> ask its move back and wait, bounded; a dead mover judged alive costs the wait and then the old refusal (keep)
 lock.c:cetrafs_lock_explicit_acquire:alive -> keep waiting; the runtime watch converges
 lock.c:cetrafs_lock_open:alive -> refuse this open; the runtime watch converges on retry
 nslock.c:cetrafs_nslock_try:alive -> wait and retry

@@ -2318,7 +2318,7 @@ static int cetrafs_unlink_locked(struct inode *dir, struct dentry *dentry)
          * link() and truncate now give. */
         bool reader = false;
 
-        ret = cetrafs_lock_foreign_user_exists(dir->i_sb, inode->i_ino, my_node_id, &blocked, &reader);
+        ret = cetrafs_lock_foreign_user_settled(inode, my_node_id, &blocked, &reader, NULL, NULL);
         if (ret)
             return ret;
         if (blocked || reader)
@@ -2925,7 +2925,7 @@ static int cetrafs_rename_locked(struct mnt_idmap *idmap,
              * link are gated against (ns-fuzz). */
             bool reader = false;
 
-            ret = cetrafs_lock_foreign_user_exists(new_dir->i_sb, new_inode->i_ino, my_node_id, &blocked, &reader);
+            ret = cetrafs_lock_foreign_user_settled(new_inode, my_node_id, &blocked, &reader, NULL, NULL);
             if (ret)
                 goto out;
             if (blocked || reader) {
@@ -3414,7 +3414,7 @@ static int cetrafs_link_locked(struct dentry *old_dentry, struct inode *dir, str
              * whatever this +1 writes -- the ns-fuzz lost-increment class
              *. While any foreign user exists, the record is
              * that opener's; refuse exactly as unlink does. */
-            ret = cetrafs_lock_foreign_user_exists(dir->i_sb, inode->i_ino, my_node_id, &blocked, &reader);
+            ret = cetrafs_lock_foreign_user_settled(inode, my_node_id, &blocked, &reader, NULL, NULL);
             if (ret)
                 return ret;
             if (blocked || reader)
