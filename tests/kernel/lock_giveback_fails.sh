@@ -38,7 +38,8 @@ ct_param_set hb_interval_secs 2
 wait_clear() {
     local d
     d="$("$LOCK_POKE" "$1" "$2")"
-    grep -q 'mode=1' <<<"$d" || { fail "$3: setup: no lock was left on the device ($d)"; return; }
+    # Held: EXCLUSIVE, or RELOCATING for an idle defrag's claim.
+    grep -qE 'mode=[12]( |$)' <<<"$d" || { fail "$3: setup: no lock was left on the device ($d)"; return; }
     [ "$(cat /sys/module/cetrafs/parameters/lock_giveback_fail_once)" = N ] ||
         { fail "$3: setup: the give-back never ran"; return; }
     for _ in $(seq 1 20); do
