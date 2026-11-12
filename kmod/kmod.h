@@ -1370,6 +1370,8 @@ time64_t *cetrafs_inode_label_seen_at(struct inode *inode);
 u64 cetrafs_label_invalidation_count(void);
 struct list_head *cetrafs_sb_deferred_orphans(struct super_block *sb);
 void cetrafs_deferred_capped(struct inode *inode);
+int cetrafs_deferred_room(struct inode *inode);
+u64 cetrafs_deferred_room_refusal_count(void);
 u64 cetrafs_deferred_cap_flush_count(void);
 int cetrafs_deferred_flush_inode(struct inode *inode, bool mapping_locked);
 int cetrafs_deferred_flush_all(struct super_block *sb);

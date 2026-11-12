@@ -3905,6 +3905,9 @@ static int cetrafs_tree_convert(struct inode *inode, cetrafs_inode_t *raw, u32 i
     int ret;
 
     *done = 0;
+    ret = cetrafs_deferred_room(inode); /* before anything is edited */
+    if (ret)
+        return ret;
     ret = cetrafs_tree_convert_inner(inode, raw, iblock, lba, want, done);
     if (ret == 0 && *done == 0)
         *done = 1; /* belt: a path that converted without saying so */
@@ -4761,6 +4764,11 @@ relookup:
      * truncate-up or a write further out to expose. Preallocated, it
      * reads as zeros until something writes it. */
     dio_prealloc = mode == CETRAFS_GB_DIO || mode == CETRAFS_GB_BUF;
+    /* Room for the tree change before a block is allocated for it
+     * (cetrafs_deferred_room()). */
+    ret = cetrafs_deferred_room(inode);
+    if (ret)
+        return ret;
 
     {
         ktime_t t0 = ktime_get();

@@ -258,6 +258,7 @@ static int cetrafs_proc_info_show(struct seq_file *m, void *v)
     seq_printf(m, "close_deferrals: %llu\n", cetrafs_lock_close_deferral_count());
     seq_printf(m, "convert_source_flushes: %llu\n", cetrafs_convert_source_flush_count());
     seq_printf(m, "deferred_cap_flushes: %llu\n", cetrafs_deferred_cap_flush_count());
+    seq_printf(m, "deferred_room_refusals: %llu\n", cetrafs_deferred_room_refusal_count());
     /* Heartbeat maintenance passes that reached their end. */
     seq_printf(m, "hb_sweeps: %llu\n", cetrafs_hb_sweep_count());
     /* Existing-block mappings vs the blocks they covered. Equal means

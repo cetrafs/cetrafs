@@ -378,26 +378,87 @@ u64 cetrafs_deferred_cap_flush_count(void)
     return (u64) atomic64_read(&cetrafs_deferred_cap_flushes);
 }
 
-void cetrafs_deferred_capped(struct inode *inode)
+/* TEST ONLY: the room check never refuses -- the old behaviour, the
+ * control of tests/kernel/deferred_room.sh. */
+static bool cetrafs_deferred_room_off;
+cetrafs_test_param(deferred_room_off, cetrafs_deferred_room_off, bool, 0644);
+MODULE_PARM_DESC(deferred_room_off, "TEST ONLY: never refuse a tree mutation for a held-back set at its cap");
+
+static atomic64_t cetrafs_deferred_room_refusals = ATOMIC64_INIT(0);
+/* Set once any cap flush has failed: until then the room check has
+ * nothing to look at, and it runs on the per-block allocation path
+ * (docs/PERFORMANCE.md 1). Never cleared -- after a failure the check
+ * costs what the cap check after each mutation already costs. */
+static atomic_t cetrafs_deferred_cap_failed = ATOMIC_INIT(0);
+
+u64 cetrafs_deferred_room_refusal_count(void)
+{
+    return (u64) atomic64_read(&cetrafs_deferred_room_refusals);
+}
+
+/* Write the inode's held-back set if it reached half the journal. 0:
+ * below the cap, or written; else the write's error, the set intact. */
+static int __cetrafs_deferred_capped(struct inode *inode)
 {
     struct xarray *xa = cetrafs_sb_deferred(inode->i_sb);
     unsigned int cap = cetrafs_journal_batch_capacity(inode->i_sb) / 2, cnt = 0;
     struct cetrafs_deferred *d;
 
     if (!xa || !cap || !S_ISREG(inode->i_mode))
-        return;
+        return 0;
     xa_lock(xa);
     list_for_each_entry(d, cetrafs_inode_deferred(inode), node)
         if (++cnt >= cap)
             break;
     xa_unlock(xa);
     if (cnt < cap)
-        return;
+        return 0;
     atomic64_inc(&cetrafs_deferred_cap_flushes);
-    if (cetrafs_deferred_flush_inode(inode, true))
+    {
+        int ret = cetrafs_deferred_flush_inode(inode, true);
+
+        if (ret)
+            atomic_set(&cetrafs_deferred_cap_failed, 1);
+        return ret;
+    }
+}
+
+void cetrafs_deferred_capped(struct inode *inode)
+{
+    if (__cetrafs_deferred_capped(inode))
         pr_warn_ratelimited("ino=%llu: held-back tree blocks reached half the journal and could not be written "
-                            "yet -- the boundary will retry\n",
+                            "yet -- the next change to the file's map retries, and fails if this still does\n",
                             (unsigned long long) inode->i_ino);
+}
+
+/*
+ * Before a tree mutation edits anything: room for it in the held-back
+ * set. A cap flush that failed (above) only warns -- the mutation it
+ * ran after is done -- and the set stays at the cap. Each later
+ * mutation would add its blocks on top, and once the set passed the
+ * journal's size no boundary could ever write it: refused for good
+ * (cetrafs_journal_write_deferred()), and unmount dropped it, losing
+ * the extents those leaves mapped with the data on the device. So a
+ * mutation that finds the set at the cap tries the write again first,
+ * and if it still fails, fails itself -- the WRITE errors, not the
+ * boundary. The set therefore never holds more than the cap plus one
+ * mutation's blocks, which is the bound the cap already assumes.
+ */
+int cetrafs_deferred_room(struct inode *inode)
+{
+    int ret;
+
+    if (likely(!atomic_read(&cetrafs_deferred_cap_failed)))
+        return 0;
+    ret = __cetrafs_deferred_capped(inode);
+
+    if (!ret || READ_ONCE(cetrafs_deferred_room_off))
+        return 0;
+    atomic64_inc(&cetrafs_deferred_room_refusals);
+    pr_warn_ratelimited("ino=%llu: held-back tree blocks are at half the journal and still cannot be written (%d) "
+                        "-- refusing to change the file's map\n",
+                        (unsigned long long) inode->i_ino, ret);
+    return ret;
 }
 
 u64 cetrafs_deferred_orphaned_count(void)

@@ -1398,6 +1398,14 @@ journal_failed:
     return -EIO;
 }
 
+/* TEST ONLY: every batch of held-back tree blocks fails to write, cap
+ * flushes and boundaries alike, as a device refusing the journal's
+ * writes would (tests/kernel/deferred_room.sh). An oversized batch is
+ * still refused as that first. */
+static bool cetrafs_journal_batch_fail;
+cetrafs_test_param(journal_batch_fail, cetrafs_journal_batch_fail, bool, 0644);
+MODULE_PARM_DESC(journal_batch_fail, "TEST ONLY: every held-back tree-block batch write fails");
+
 /*
  * TEST ONLY: the next deferred batch stops the mount the moment its
  * entries are durable, before any target is written -- a crash at the
@@ -1760,6 +1768,8 @@ int cetrafs_journal_write_deferred(struct super_block *sb, struct buffer_head **
                            n, (unsigned long long) j->slots);
         return -EIO;
     }
+    if (READ_ONCE(cetrafs_journal_batch_fail))
+        return -EIO; /* test-only; see the parameter */
     {
         u64 *slots = kvmalloc_array(n, sizeof(*slots), GFP_NOFS);
         u64 *txn = kvmalloc_array(n, sizeof(*txn), GFP_NOFS);
