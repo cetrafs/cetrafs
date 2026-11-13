@@ -95,6 +95,7 @@ int main(int argc, char **argv)
         fprintf(stderr, "       %s <backing-file> setsize <ino> <bytes> (as a PEER extending it would)\n", argv[0]);
         fprintf(stderr, "       %s <backing-file> reuse <ino> <gen> <node> (a peer reused the number)\n", argv[0]);
         fprintf(stderr, "       %s <backing-file> size <ino>           (print the on-disk size)\n", argv[0]);
+        fprintf(stderr, "       %s <backing-file> nsget <ino>          (print mode (octal) and nlink)\n", argv[0]);
         fprintf(stderr, "       %s <backing-file> bumpseq <ino>        (advance dirent_seq, as a peer would)\n", argv[0]);
         fprintf(stderr, "       %s <backing-file> extents <ino>       (prints depth/entries/blocks)\n", argv[0]);
         fprintf(stderr, "       %s <backing-file> setctime <ino> <secs>  (as a peer's setxattr leaves it)\n", argv[0]);
@@ -606,6 +607,12 @@ int main(int argc, char **argv)
         pread_all(fd, &rec, sizeof(rec), rec_off);
         printf("%llx %u\n", (unsigned long long) cetrafs_le64(rec.file_seq),
                (unsigned) CETRAFS_FILE_SEQ_NODE(cetrafs_le64(rec.file_seq)));
+    } else if (strcmp(mode, "nsget") == 0) {
+        /* Print the namespace fields a refresh applies: mode (octal), nlink. */
+        cetrafs_inode_t rec;
+
+        pread_all(fd, &rec, sizeof(rec), rec_off);
+        printf("%o %u\n", (unsigned) cetrafs_le32(rec.mode), (unsigned) cetrafs_le32(rec.nlink));
     } else if (strcmp(mode, "size") == 0) {
         cetrafs_inode_t rec;
 

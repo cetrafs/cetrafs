@@ -1565,6 +1565,30 @@ out:
     return ret;
 }
 
+/*
+ * Every swap, whatever its outcome (a timed-out one may still land),
+ * moves the record's publish epoch AFTER the device has it: a refresh
+ * that sampled the epoch before its read can then tell that a local
+ * publish may have landed behind its read (cetrafs_rec_epoch_bump(),
+ * BUG-CLASSES class 29).
+ */
+static int cetrafs_cas_region_seeded_publish(struct super_block *sb,
+                                             u64 fs_lba,
+                                             unsigned int region_idx,
+                                             const void *seed,
+                                             unsigned int seed_len,
+                                             cetrafs_cas_fn mutate,
+                                             void *priv,
+                                             bool sole_region,
+                                             bool killable)
+{
+    int ret = cetrafs_cas_region_seeded_impl(sb, fs_lba, region_idx, seed, seed_len, mutate, priv, sole_region,
+                                             killable);
+
+    cetrafs_rec_epoch_bump(sb, fs_lba);
+    return ret;
+}
+
 int cetrafs_cas_region(struct super_block *sb, u64 fs_lba, unsigned int region_idx, cetrafs_cas_fn mutate, void *priv)
 {
     return cetrafs_cas_region_seeded(sb, fs_lba, region_idx, NULL, 0, mutate, priv);
@@ -1583,8 +1607,8 @@ int cetrafs_cas_region_seeded(struct super_block *sb,
      * bitmap, a pending-free queue. Only the swapped region's new
      * content is known, so the cached copy of the OTHERS may already be
      * stale and the whole block has to be dropped. */
-    return cetrafs_cas_region_seeded_impl(sb, fs_lba, region_idx, seed, seed_len, mutate, priv,
-                                          /*sole_region=*/false, /*killable=*/true);
+    return cetrafs_cas_region_seeded_publish(sb, fs_lba, region_idx, seed, seed_len, mutate, priv,
+                                             /*sole_region=*/false, /*killable=*/true);
 }
 
 /* cetrafs_cas_record() with the caller's own fresh image as the first
@@ -1604,8 +1628,8 @@ int cetrafs_cas_record_seeded(struct super_block *sb,
      * cached record read (freshness-gated where it matters). These are
      * also the blocks most worth keeping: the record a namespace
      * operation just updated is the record the next lookup reads. */
-    return cetrafs_cas_region_seeded_impl(sb, fs_lba, 0, seed, seed_len, mutate, priv, /*sole_region=*/true,
-                                          /*killable=*/true);
+    return cetrafs_cas_region_seeded_publish(sb, fs_lba, 0, seed, seed_len, mutate, priv, /*sole_region=*/true,
+                                             /*killable=*/true);
 }
 
 /* On a device whose atomic unit is wider than the namespace sector (4Kn:
@@ -1651,11 +1675,11 @@ int cetrafs_cas_record_fd_seeded(struct super_block *sb,
     if (cetrafs_cas_region_size(sb) > CETRAFS_INODE_FD_OFF) {
         struct cetrafs_cas_fd_slice_ctx s = {.mutate = mutate, .priv = priv};
 
-        return cetrafs_cas_region_seeded_impl(sb, fs_lba, 0, NULL, 0, cetrafs_cas_fd_slice_mutate, &s,
-                                              /*sole_region=*/true, /*killable=*/true);
+        return cetrafs_cas_region_seeded_publish(sb, fs_lba, 0, NULL, 0, cetrafs_cas_fd_slice_mutate, &s,
+                                                 /*sole_region=*/true, /*killable=*/true);
     }
-    return cetrafs_cas_region_seeded_impl(sb, fs_lba, 1, seed, seed_len, mutate, priv, /*sole_region=*/true,
-                                          /*killable=*/true);
+    return cetrafs_cas_region_seeded_publish(sb, fs_lba, 1, seed, seed_len, mutate, priv, /*sole_region=*/true,
+                                             /*killable=*/true);
 }
 
 /* ---- self-test ------------------------------------------------------
@@ -2246,6 +2270,6 @@ int cetrafs_cas_record(struct super_block *sb, u64 fs_lba, cetrafs_cas_fn mutate
  */
 int cetrafs_cas_record_nointr(struct super_block *sb, u64 fs_lba, cetrafs_cas_fn mutate, void *priv)
 {
-    return cetrafs_cas_region_seeded_impl(sb, fs_lba, 0, NULL, 0, mutate, priv, /*sole_region=*/false,
-                                          /*killable=*/false);
+    return cetrafs_cas_region_seeded_publish(sb, fs_lba, 0, NULL, 0, mutate, priv, /*sole_region=*/false,
+                                             /*killable=*/false);
 }

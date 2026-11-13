@@ -1507,9 +1507,10 @@ typedef struct {
      * Like dirent_seq this is a STAMP, not a counter: it must be unique
      * per write -- two nodes incrementing from the same base would both
      * write the same value for different content. Across nodes only
-     * equality is asked. A node's OWN stamps are also ordered, by their
-     * age against its stamp clock (kmod's cetrafs_sb_own_seq_older()),
-     * which places any two inside the 48-bit wrap (~3.26 days).
+     * equality is asked. Nothing orders two stamps: the low 48 bits wrap
+     * every ~3.26 days, so a stamp from before a wrap can look newer than
+     * one written after it. A node that must judge whether its own read is
+     * superseded re-reads and compares stamps for equality only.
      */
     __le64 file_seq;
 /* file_seq layout: the publishing node's registry row in the top 16

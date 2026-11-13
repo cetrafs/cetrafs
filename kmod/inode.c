@@ -5,6 +5,7 @@
 #include <linux/crc32c.h>
 #include <linux/delay.h>
 #include <linux/fs.h>
+#include <linux/hash.h>
 #include <linux/security.h>
 #include <linux/kernel.h>
 #include <linux/ktime.h>
@@ -94,6 +95,43 @@ u64 cetrafs_inode_lba(struct super_block *sb, u64 ino)
     if (!raw_sb || !ino || ino > le32_to_cpu(raw_sb->inodes_count))
         return 0;
     return le64_to_cpu(raw_sb->inode_table_start) + (ino - 1);
+}
+
+/*
+ * Record publish epochs (BUG-CLASSES class 29). A refresh reads a record
+ * and applies it to in-core state later; a LOCAL publish that lands in
+ * between, and whose writer then updates in-core state to match, would
+ * be reverted by that apply. Every write of a record block -- each swap
+ * (caw.c) and each whole-record write -- bumps the epoch of its block
+ * once the device (or, unsynced, the buffer the forced-fresh read
+ * returns) holds it. A refresh samples the epoch before its read and,
+ * under the locks its apply holds, re-reads if it moved.
+ *
+ * Hashed, not per object: a publisher needs no in-core inode (eviction,
+ * journal replay, a number we hold no object for), and a collision only
+ * costs a re-read. Any block may bump; only inode records are sampled.
+ */
+#define CETRAFS_REC_EPOCH_BITS 8
+static atomic_t cetrafs_rec_epoch[1U << CETRAFS_REC_EPOCH_BITS];
+
+static atomic_t *cetrafs_rec_epoch_slot(struct super_block *sb, u64 lba)
+{
+    return &cetrafs_rec_epoch[hash_64(lba ^ (u64) (uintptr_t) sb, CETRAFS_REC_EPOCH_BITS)];
+}
+
+void cetrafs_rec_epoch_bump(struct super_block *sb, u64 lba)
+{
+    smp_mb__before_atomic(); /* the write is visible before the bump */
+    atomic_inc(cetrafs_rec_epoch_slot(sb, lba));
+    smp_mb__after_atomic();
+}
+
+u64 cetrafs_rec_epoch_sample(struct super_block *sb, u64 ino)
+{
+    u64 e = (u64) (u32) atomic_read(cetrafs_rec_epoch_slot(sb, cetrafs_inode_lba(sb, ino)));
+
+    smp_rmb(); /* sampled before the read it guards */
+    return e;
 }
 
 /* Stamp a WHOLE record: identity echoes plus both sector CRCs. Only for
@@ -863,6 +901,10 @@ int cetrafs_inode_advance_change_stamp(struct super_block *sb, u64 ino, u64 gene
         return -EIO;
     if (dir)
         return cetrafs_inode_ns_cas(sb, ino, generation, NULL, cetrafs_ns_apply_advance, NULL);
+    /* No fd_pub here: no in-core object is taken (an ilookup waits on an
+     * inode being evicted, and the replay can run inside that eviction).
+     * The stamp names the dead owner, which no refresh of this node
+     * judges as its own -- see BUG-CLASSES class 29. */
     return cetrafs_cas_record_fd_seeded(sb, lba, NULL, 0, cetrafs_fd_touch_mutate, &ctx);
 }
 
@@ -1042,7 +1084,11 @@ int cetrafs_inode_forget_tree(struct super_block *sb, u64 ino, u64 generation, u
         memset(&raw->et, 0, sizeof(raw->et));
         raw->size = 0;
         raw->blocks = 0;
-        /* Not cetrafs_write_raw_inode_fd(): this publishes no extent,
+        /* No fd_pub_mutex, deliberately: this runs inside the eviction of
+         * the inode (ilookup would wait on that inode's own I_FREEING),
+         * and on the claimed-free path a refresh needs a reference that a
+         * dead, unopened number does not have (BUG-CLASSES class 29).
+         * Not cetrafs_write_raw_inode_fd(): this publishes no extent,
          * so its bitmap and cache flushes ahead of the swap buy nothing.
          * The flush after it does: the number free that follows must not
          * reach the device first. A refused one is returned, and the
@@ -1074,7 +1120,7 @@ int cetrafs_write_raw_inode_fd_planned(struct super_block *sb, u64 ino, const ce
     return __cetrafs_write_raw_inode_fd(sb, ino, src, self, &plan_seq);
 }
 
-int cetrafs_write_raw_inode(struct super_block *sb, u64 ino, const cetrafs_inode_t *in, bool sync)
+static int __cetrafs_write_raw_inode(struct super_block *sb, u64 ino, const cetrafs_inode_t *in, bool sync)
 {
     if (S_ISDIR(cetrafs_le32(in->mode)))
         ctrace("DRECW ino=%llu size=%llu eh=%u depth=%u from=%pS\n", (unsigned long long) ino,
@@ -1163,6 +1209,9 @@ int cetrafs_write_raw_inode(struct super_block *sb, u64 ino, const cetrafs_inode
     memcpy(bh->b_data, &stamped, sizeof(stamped));
     memset(bh->b_data + sizeof(stamped), 0, CETRAFS_BLOCK_SIZE - sizeof(stamped));
     cetrafs_bh_end_update(bh);
+    /* A forced-fresh read returns this buffer from here on (a dirty one
+     * is never dropped): the record's epoch moves now. */
+    cetrafs_rec_epoch_bump(sb, bh->b_blocknr);
     if (sync) {
         cetrafs_record_write_counted();
         /* The result IS the answer this function exists to give. A
@@ -1177,6 +1226,48 @@ int cetrafs_write_raw_inode(struct super_block *sb, u64 ino, const cetrafs_inode
 
     if (serialise)
         cetrafs_sb_cas_unlock(sb);
+    return ret;
+}
+
+/*
+ * The whole-record write for a number this node has NO in-core object
+ * for: a just-allocated number (create, mkdir, symlink, and their
+ * unwinds). A free number has no live object a refresh could be running
+ * on -- a refresh needs a reference, and an object for a number is only
+ * freed once that number is free -- so there is no fd publish mutex to
+ * take. Callers that hold the inode use cetrafs_write_raw_inode_self(),
+ * which takes it.
+ */
+int cetrafs_write_raw_inode(struct super_block *sb, u64 ino, const cetrafs_inode_t *in, bool sync)
+{
+    return __cetrafs_write_raw_inode(sb, ino, in, sync);
+}
+
+/*
+ * The whole-record write for a record whose in-core object 'self' this
+ * node holds (a directory's create/rename/link, an unlink's target, a
+ * directory's size growth). It publishes the file sector too, without
+ * a note, so a refresh of 'self' that read the record before this write
+ * must not apply it over the write: fd_pub_mutex covers the write, the
+ * same as every other file-sector publisher (BUG-CLASSES class 29).
+ * Lock order: the caller's namespace lock or inode_lock, then fd_pub.
+ */
+/* TEST ONLY: the whole-record writer publishes without fd_pub_mutex --
+ * the unordered publish, for tests/kernel/refresh_dir_growth_publish.sh. */
+static bool cetrafs_record_publish_unlocked;
+cetrafs_test_param(record_publish_unlocked, cetrafs_record_publish_unlocked, bool, 0644);
+MODULE_PARM_DESC(record_publish_unlocked, "TEST ONLY: whole-record writes publish without fd_pub_mutex");
+
+int cetrafs_write_raw_inode_self(struct inode *self, const cetrafs_inode_t *in, bool sync)
+{
+    bool locked = !READ_ONCE(cetrafs_record_publish_unlocked);
+    int ret;
+
+    if (locked)
+        cetrafs_inode_fd_pub_lock(self);
+    ret = __cetrafs_write_raw_inode(self->i_sb, self->i_ino, in, sync);
+    if (locked)
+        cetrafs_inode_fd_pub_unlock(self);
     return ret;
 }
 
@@ -2174,7 +2265,7 @@ enum cetrafs_apply_decline {
 };
 
 static int __cetrafs_apply_raw_to_vfs_inode(struct inode *inode, const cetrafs_inode_t *raw,
-                                            enum cetrafs_apply_decline *why);
+                                            enum cetrafs_apply_decline *why, bool pub_held, u64 epoch);
 
 /*
  * An LSM's cached inode label (class 42's sibling of S_NOSEC). A peer's
@@ -2209,7 +2300,16 @@ int cetrafs_apply_raw_to_vfs_inode(struct inode *inode, const cetrafs_inode_t *r
 {
     enum cetrafs_apply_decline why;
 
-    return __cetrafs_apply_raw_to_vfs_inode(inode, raw, &why);
+    return __cetrafs_apply_raw_to_vfs_inode(inode, raw, &why, false, CETRAFS_REC_EPOCH_NONE);
+}
+
+/* The refresh's apply: the caller holds fd_pub_mutex and sampled the
+ * record's publish epoch before its read (cetrafs_rec_epoch_sample()). */
+static int cetrafs_apply_raw_to_vfs_inode_sampled(struct inode *inode, const cetrafs_inode_t *raw, u64 epoch)
+{
+    enum cetrafs_apply_decline why;
+
+    return __cetrafs_apply_raw_to_vfs_inode(inode, raw, &why, true, epoch);
 }
 
 /*
@@ -2232,7 +2332,7 @@ int cetrafs_apply_raw_to_vfs_inode_sure(struct inode *inode, const cetrafs_inode
 
     for (attempt = 0; attempt < 400; attempt++) {
         enum cetrafs_apply_decline why;
-        int ret = __cetrafs_apply_raw_to_vfs_inode(inode, raw, &why);
+        int ret = __cetrafs_apply_raw_to_vfs_inode(inode, raw, &why, false, CETRAFS_REC_EPOCH_NONE);
 
         if (ret)
             return ret;
@@ -2249,15 +2349,70 @@ int cetrafs_apply_raw_to_vfs_inode_sure(struct inode *inode, const cetrafs_inode
     return -EBUSY;
 }
 
-static int __cetrafs_apply_raw_to_vfs_inode(struct inode *inode, const cetrafs_inode_t *raw,
-                                            enum cetrafs_apply_decline *why)
+/* TEST ONLY: apply the record as the caller read it -- no publish
+ * mutex, no re-read when a local publish may have landed behind the
+ * read. The negative control for
+ * tests/kernel/refresh_ns_publish.sh. */
+static bool cetrafs_refresh_ns_unguarded;
+cetrafs_test_param(refresh_ns_unguarded, cetrafs_refresh_ns_unguarded, bool, 0644);
+MODULE_PARM_DESC(refresh_ns_unguarded, "TEST ONLY: a refresh applies its read over a local namespace publish");
+
+static atomic64_t cetrafs_refresh_ns_rereads = ATOMIC64_INIT(0);
+
+u64 cetrafs_refresh_ns_reread_count(void)
 {
-    bool label_stale;
+    return (u64) atomic64_read(&cetrafs_refresh_ns_rereads);
+}
+
+/*
+ * Make the namespace half of *raw the record as the device holds it NOW,
+ * for a caller holding every lock a local publisher of in-core state
+ * holds (BUG-CLASSES class 29). The caller's read may predate a local
+ * publish: chmod, link, setxattr, a rename's ctime -- each swaps the
+ * record and then sets the same field in core, and applying the older
+ * read afterwards put the in-core field back to a value the device no
+ * longer holds. While this node keeps the file open for write it is
+ * never refreshed again, so the revert stays.
+ *
+ * Every such publisher holds inode_lock, or fd_pub_mutex where the VFS
+ * does not lock the inode (a directory renamed inside one parent), from
+ * its swap to its in-core store; the apply holds both. A namespace
+ * update STAGED for the namespace lock's release is no exception: the
+ * release runs inside the operation, under the VFS's lock of every
+ * inode it stages on (parents, the unlink/rmdir victim). So by the time
+ * the apply has its locks, every local publish has landed -- and one
+ * that landed after the caller's read moved the epoch it sampled
+ * (cetrafs_rec_epoch_bump()): then re-read, and take the namespace
+ * sector from the device. The file sector stays the caller's, judged by
+ * file_seq (cetrafs_refresh_settle()). A caller with no sample
+ * (CETRAFS_REC_EPOCH_NONE) always re-reads.
+ */
+static int cetrafs_apply_settle_ns(struct inode *inode, cetrafs_inode_t *raw, u64 epoch)
+{
+    cetrafs_inode_t *now;
     int ret;
-    bool dirty;
 
-    *why = CETRAFS_APPLY_DONE;
+    if (READ_ONCE(cetrafs_refresh_ns_unguarded))
+        return 0; /* TEST ONLY: see the knob */
+    if (epoch != CETRAFS_REC_EPOCH_NONE && cetrafs_rec_epoch_sample(inode->i_sb, inode->i_ino) == epoch)
+        return 0;
 
+    now = kmalloc(sizeof(*now), GFP_NOFS);
+    if (!now)
+        return -ENOMEM;
+    atomic64_inc(&cetrafs_refresh_ns_rereads);
+    cetrafs_invalidate_raw_inode(inode->i_sb, inode->i_ino);
+    ret = cetrafs_read_raw_inode(inode->i_sb, inode->i_ino, now);
+    if (!ret)
+        memcpy(raw, now, CETRAFS_INODE_NS_BYTES);
+    kfree(now);
+    return ret;
+}
+
+/* Is 'raw' still a record of THIS file, of the same type, that the
+ * namespace still has? Run on every record an apply would store. */
+static int cetrafs_apply_identity_check(struct inode *inode, const cetrafs_inode_t *raw)
+{
     /*
      * Not a DIFFERENT FILE. Inode numbers are reused, and stamping a new
      * file's stat fields onto an object instantiated from the old one
@@ -2311,6 +2466,27 @@ static int __cetrafs_apply_raw_to_vfs_inode(struct inode *inode, const cetrafs_i
         cetrafs_sb_corrupt_inode(inode);
         return -EUCLEAN;
     }
+    return 0;
+}
+
+static int __cetrafs_apply_raw_to_vfs_inode(struct inode *inode, const cetrafs_inode_t *in,
+                                            enum cetrafs_apply_decline *why, bool pub_held, u64 epoch)
+{
+    cetrafs_inode_t *raw;
+    bool label_stale;
+    bool pub = false;
+    int ret;
+    bool dirty;
+
+    *why = CETRAFS_APPLY_DONE;
+
+    raw = kmalloc(sizeof(*raw), GFP_NOFS);
+    if (!raw)
+        return -ENOMEM;
+    memcpy(raw, in, sizeof(*raw));
+    ret = cetrafs_apply_identity_check(inode, raw);
+    if (ret)
+        goto out_free;
 
     /*
      * Never stamp disk state over UNWRITTEN LOCAL CHANGES.
@@ -2352,16 +2528,23 @@ static int __cetrafs_apply_raw_to_vfs_inode(struct inode *inode, const cetrafs_i
     if (cetrafs_apply_trylock_fail_once) {
         cetrafs_apply_trylock_fail_once = false; /* TEST ONLY */
         *why = CETRAFS_APPLY_CONTENDED;
-        return 0;
+        goto out_free;
+    }
+    /* fd_pub_mutex too, which a publisher holding no inode_lock holds
+     * across its swap and its in-core store (cetrafs_apply_settle_ns()).
+     * Taken first and blocking: it is a leaf, and ranks below both. */
+    if (!pub_held && !READ_ONCE(cetrafs_refresh_ns_unguarded)) {
+        cetrafs_inode_fd_pub_lock(inode);
+        pub = true;
     }
     if (!inode_trylock(inode)) {
         *why = CETRAFS_APPLY_CONTENDED;
-        return 0;
+        goto out_pub;
     }
     if (!down_write_trylock(&inode->i_mapping->invalidate_lock)) {
         inode_unlock(inode);
         *why = CETRAFS_APPLY_CONTENDED;
-        return 0;
+        goto out_pub;
     }
     spin_lock(&inode->i_lock);
     dirty = (inode_state_read(inode) & I_DIRTY_ALL) != 0;
@@ -2381,13 +2564,19 @@ static int __cetrafs_apply_raw_to_vfs_inode(struct inode *inode, const cetrafs_i
     if (dirty && !cetrafs_inode_has_unpublished_state(inode))
         dirty = false;
     if (dirty) {
-        up_write(&inode->i_mapping->invalidate_lock);
-        inode_unlock(inode);
         *why = CETRAFS_APPLY_LOCAL;
-        return 0;
+        goto out_unlock;
     }
     if (cetrafs_apply_refresh_stall_ms && S_ISREG(inode->i_mode))
         msleep(cetrafs_apply_refresh_stall_ms);
+
+    /* The namespace half as the device holds it now (BUG-CLASSES class
+     * 29), judged again: the re-read may say the file is gone. */
+    ret = cetrafs_apply_settle_ns(inode, raw, epoch);
+    if (!ret)
+        ret = cetrafs_apply_identity_check(inode, raw);
+    if (ret)
+        goto out_unlock;
 
     label_stale = cetrafs_inode_label_may_be_stale(inode, raw);
     cetrafs_inode_adopt_identity(inode, raw);
@@ -2400,6 +2589,9 @@ static int __cetrafs_apply_raw_to_vfs_inode(struct inode *inode, const cetrafs_i
     cetrafs_inode_stat_baseline_set(inode, raw);
     up_write(&inode->i_mapping->invalidate_lock);
     inode_unlock(inode);
+    if (pub)
+        cetrafs_inode_fd_pub_unlock(inode);
+    pub = false;
     if (label_stale) {
         /* A labelling LSM (SELinux, Smack) re-reads security.* on next
          * use; with none, the hook does nothing. */
@@ -2442,7 +2634,145 @@ static int __cetrafs_apply_raw_to_vfs_inode(struct inode *inode, const cetrafs_i
     if (ret)
         pr_warn("ino=%llu could not fully drop stale page cache on refresh: %d\n", (unsigned long long) inode->i_ino,
                 ret);
+    ret = 0;
+    goto out_free;
+
+out_unlock:
+    up_write(&inode->i_mapping->invalidate_lock);
+    inode_unlock(inode);
+out_pub:
+    if (pub)
+        cetrafs_inode_fd_pub_unlock(inode);
+out_free:
+    kfree(raw);
+    return ret;
+}
+
+/* TEST ONLY: hold a refresh between its first read and its verdict, with
+ * the publish mutex held. A publisher that takes no mutex (the directory
+ * nslock release) can land a publish inside that window.
+ * tests/kernel/refresh_superseded_own_seq.sh. */
+static unsigned int cetrafs_refresh_compare_stall_ms;
+cetrafs_test_param(refresh_compare_stall_ms, cetrafs_refresh_compare_stall_ms, uint, 0644);
+MODULE_PARM_DESC(refresh_compare_stall_ms, "TEST ONLY: stall a refresh between its read and its verdict (ms)");
+
+/* TEST ONLY: judge a superseded own stamp by the old age compare, with no
+ * re-read -- the negative control for tests/kernel/refresh_superseded_own_seq.sh. */
+static bool cetrafs_refresh_seq_age_compare;
+cetrafs_test_param(refresh_seq_age_compare, cetrafs_refresh_seq_age_compare, bool, 0644);
+MODULE_PARM_DESC(refresh_seq_age_compare, "TEST ONLY: judge own stamps by the old age compare (no re-read)");
+
+/* Module-wide refresh counters, read through procfs info. */
+static atomic64_t cetrafs_refresh_stalls = ATOMIC64_INIT(0);
+static atomic64_t cetrafs_refresh_candidates = ATOMIC64_INIT(0);
+static atomic64_t cetrafs_refresh_refused = ATOMIC64_INIT(0);
+
+void cetrafs_refresh_counters(u64 *stalls, u64 *candidates, u64 *refused)
+{
+    *stalls = (u64) atomic64_read(&cetrafs_refresh_stalls);
+    *candidates = (u64) atomic64_read(&cetrafs_refresh_candidates);
+    *refused = (u64) atomic64_read(&cetrafs_refresh_refused);
+}
+
+/* Re-reads a settle makes before it gives up and refuses. */
+#define CETRAFS_REFRESH_SETTLE_TRIES 4
+
+/* TEST ONLY: a settle's re-read never agrees, so every settle runs out
+ * of tries and refuses -- the refuse path, with the knob off as the
+ * comparison (tests/kernel/refresh_settle_refuse.sh). */
+static bool cetrafs_refresh_settle_churn;
+cetrafs_test_param(refresh_settle_churn, cetrafs_refresh_settle_churn, bool, 0644);
+MODULE_PARM_DESC(refresh_settle_churn, "TEST ONLY: a settle's re-read never agrees, so it refuses");
+
+/*
+ * Settle a record read under the publish mutex that carries this node's
+ * OWN file_seq, when that stamp is not the one our last publish noted.
+ *
+ * How a read gets superseded: a publisher that took no fd_pub_mutex --
+ * the directory's nslock release did, before it was brought under the
+ * mutex -- could land between this read and the verdict, then note its
+ * stamp, so the note moved on while the read still showed the record
+ * before that publish. Applying the read reverted in-core state to a
+ * record the device no longer held. Every file-sector publisher now
+ * holds the mutex; this settle stays as defence in depth.
+ *
+ * Why a re-read settles it: a note is only taken AFTER its publish has
+ * landed, and every publish stamps a seq no other write carries. So read
+ * the note (n1), re-read the record, read the note again (n2). If n1 == n2
+ * and the re-read carries the seq of the first read, no publish landed
+ * between them, and the first read stands. Otherwise the first read is
+ * superseded: continue with the re-read, judged the same way. Nothing is
+ * ordered by age here -- stamps wrap, and a stamp from before a wrap can
+ * look newer than a note.
+ *
+ * What makes the last step safe: the caller holds fd_pub_mutex from its
+ * read to the apply, and every publisher of the file sector holds it
+ * across its CAS and its note (BUG-CLASSES.md class 29). So no publish
+ * can land between the last n2 read and the apply. The re-read is kept
+ * as defence in depth for a publisher that is missing from that list.
+ *
+ * Returns 1 to apply *cur, 0 to refuse (in-core stays; the next refresh
+ * retries), or a negative errno from the re-read.
+ */
+static int cetrafs_refresh_settle(struct inode *inode, cetrafs_inode_t *cur)
+{
+    struct super_block *sb = inode->i_sb;
+    u64 ino = inode->i_ino;
+    u32 me = 0;
+    int try;
+
+    if (cetrafs_sb_get_node_id(sb, &me))
+        return 1; /* no node id: nothing here can be ours to judge */
+    me &= 0xFFFFu;
+
+    for (try = 0; try < CETRAFS_REFRESH_SETTLE_TRIES; try++) {
+        u64 seq = cetrafs_le64(cur->file_seq);
+        u64 n1 = cetrafs_inode_local_file_seq(inode);
+        u64 n2;
+        cetrafs_inode_t nxt;
+        int ret;
+
+        /* Not ours, the note itself, or the note is foreign: nothing we
+         * published can be superseded. U64_MAX (no note yet) is still a
+         * candidate: a publish can land before its note does. */
+        if (CETRAFS_FILE_SEQ_NODE(seq) != me || seq == n1 ||
+            (n1 != U64_MAX && CETRAFS_FILE_SEQ_NODE(n1) != me))
+            return 1;
+
+        atomic64_inc(&cetrafs_refresh_candidates);
+        if (READ_ONCE(cetrafs_refresh_seq_age_compare)) {
+            /* TEST ONLY control: the old verdict, age-ordered, no re-read. */
+            if (n1 != U64_MAX && cetrafs_sb_own_seq_older(sb, seq, n1, cetrafs_inode_local_file_seq_at(inode))) {
+                atomic64_inc(&cetrafs_refresh_refused);
+                return 0;
+            }
+            return 1;
+        }
+
+        cetrafs_invalidate_raw_inode(sb, ino);
+        ret = cetrafs_read_raw_inode(sb, ino, &nxt);
+        if (ret)
+            return ret;
+        n2 = cetrafs_inode_local_file_seq(inode);
+        if (n1 == n2 && cetrafs_le64(nxt.file_seq) == seq && !READ_ONCE(cetrafs_refresh_settle_churn))
+            return 1;
+        *cur = nxt;
+    }
+    atomic64_inc(&cetrafs_refresh_refused);
     return 0;
+}
+
+/* v0x0008 reuse detection: a different generation means this is not the
+ * same file this object was instantiated from -- a peer deleted it and
+ * reused the number. Refreshing stat fields onto an object wearing the
+ * OLD file's i_op/i_fop would type-confuse the VFS. Unhash the stale
+ * object so the next iget instantiates a fresh one. */
+static int cetrafs_refresh_reuse_check(struct inode *inode, const cetrafs_inode_t *raw)
+{
+    if (cetrafs_inode_get_generation(inode) == cetrafs_le64(raw->generation))
+        return 0;
+    remove_inode_hash(inode);
+    return -ESTALE;
 }
 
 /*
@@ -2481,6 +2811,7 @@ int cetrafs_refresh_vfs_inode_if_newer(struct inode *inode)
 {
     struct super_block *sb = inode->i_sb;
     cetrafs_inode_t raw;
+    u64 epoch;
     int ret;
 
     /* IDENTITY, not content -- see cetrafs_lock_identity_cache_trusted().
@@ -2491,90 +2822,46 @@ int cetrafs_refresh_vfs_inode_if_newer(struct inode *inode)
 
     /* Read AND stamp under the publish mutex: the publisher holds it
      * across its CAS and its note of the stamped seq, so this refresh
-     * runs either entirely before the publish (whatever it stamps, it
-     * also makes the baseline, so the publish's merge starts from it)
-     * or entirely after it (and the seq guard below then recognises a
-     * superseded read). Without the mutex there is a window where a
-     * fresh-at-read-time image lands on in-core state the publish just
-     * made newer. */
+     * runs either entirely before the publish or entirely after it: every
+     * publisher of the file sector takes it (BUG-CLASSES class 29). The
+     * settle below is defence in depth for a publisher that does not. */
     cetrafs_inode_fd_pub_lock(inode);
+    /* Before the read: a namespace publish landing behind it moves this,
+     * and the apply re-reads (cetrafs_apply_settle_ns()). */
+    epoch = cetrafs_rec_epoch_sample(sb, inode->i_ino);
     cetrafs_invalidate_raw_inode(sb, inode->i_ino);
     ret = cetrafs_read_raw_inode(sb, inode->i_ino, &raw);
     if (ret) {
         cetrafs_inode_fd_pub_unlock(inode);
         return ret;
     }
-
-    /* v0x0008 reuse detection: a different generation means this is not
-     * the same file this object was instantiated from -- a peer deleted
-     * it and reused the number. Refreshing stat fields onto an object
-     * wearing the OLD file's i_op/i_fop would type-confuse the VFS (the
-     * caught case: a cached symlink object reused for a regular file,
-     * whose data then got walked as a link target). Unhash the stale
-     * object so the next iget instantiates a fresh one, and tell the
-     * caller (-ESTALE): d_revalidate reacts by invalidating the dentry,
-     * iget's cache-hit path by dropping its ref and retrying. */
-    if (cetrafs_inode_get_generation(inode) != cetrafs_le64(raw.generation)) {
-        remove_inode_hash(inode);
+    if (cetrafs_refresh_reuse_check(inode, &raw)) {
         cetrafs_inode_fd_pub_unlock(inode);
         return -ESTALE;
     }
 
-    /*
-     * A SUPERSEDED self-stamp must not be applied. If the record's last
-     * file-sector stamp is this node's own but is NOT the seq our last
-     * publish noted, the read predates a publish we have since made --
-     * stamping it reverts in-core state (an 8-core churn run lost 154
-     * blocks of a file to exactly that: extents intact, size reverted
-     * to the end of the last small write, 2026-10-29). Equality means
-     * the read IS our last publish -- apply freely, which is also what
-     * keeps the corruption/type checks inside apply() reachable on a
-     * single node (a poked record with an unchanged seq must still be
-     * refused LOUDLY, not short-circuited). No noted seq yet means this
-     * in-core object has published nothing the read could be older
-     * than. lock.c's two apply sites guard their windows with the
-     * node-id check alone because foreign writes are the only
-     * legitimate changes there; this path serves d_revalidate and
-     * iget's cache hit, where our own record writes are routine.
-     */
-    {
-        u32 my_node_id = 0;
-        u64 cached = cetrafs_inode_local_file_seq(inode);
-
-        /* Same-node seqs embed the same clock's nanoseconds in the low
-         * 48 bits, which never step backward within a mount
-         * (cetrafs_sb_stamp_ns()) and wrap every ~3.26 days -- so they
-         * are ordered by their age against that clock
-         * (cetrafs_sb_own_seq_older()), and
-         * for OUR OWN stamps "older than the publish we noted" is
-         * decidable -- and that is the only read that must be refused.
-         * (A plain '<' called every stamp after a wrap older than the
-         * note, and declined the refresh.) A NEWER self-stamp means a
-         * local publisher ran after our note (background defrag, a
-         * staged release, writeback) and in-core is the stale side:
-         * applying is then the fix, not the bug. The first cut refused
-         * every mismatched self-stamp and wedged refresh until the next
-         * close reset the note -- a full-gate run reproduced it on two
-         * architectures while every isolated run passed. */
-        if (cached != U64_MAX && cetrafs_sb_get_node_id(sb, &my_node_id) == 0 &&
-            CETRAFS_FILE_SEQ_NODE(cetrafs_le64(raw.file_seq)) == (u32) (my_node_id & 0xFFFFu) &&
-            CETRAFS_FILE_SEQ_NODE(cached) == (u32) (my_node_id & 0xFFFFu) &&
-            cetrafs_sb_own_seq_older(sb, cetrafs_le64(raw.file_seq), cached,
-                                     cetrafs_inode_local_file_seq_at(inode))) {
-            ctrace("FDREFRESH ino=%llu verdict=superseded rawseq=%llx cached=%llx rawsize=%llu coresize=%llu\n",
-                   (unsigned long long) inode->i_ino, (unsigned long long) cetrafs_le64(raw.file_seq),
-                   (unsigned long long) cached, (unsigned long long) cetrafs_le64(raw.size),
-                   (unsigned long long) i_size_read(inode));
-            cetrafs_inode_fd_pub_unlock(inode);
-            return 0;
-        }
-        ctrace("FDREFRESH ino=%llu verdict=apply rawseq=%llx cached=%llx rawsize=%llu coresize=%llu dirty=%d\n",
-               (unsigned long long) inode->i_ino, (unsigned long long) cetrafs_le64(raw.file_seq),
-               (unsigned long long) cached, (unsigned long long) cetrafs_le64(raw.size),
-               (unsigned long long) i_size_read(inode), (int) cetrafs_inode_fd_dirty(inode));
+    if (unlikely(READ_ONCE(cetrafs_refresh_compare_stall_ms))) {
+        atomic64_inc(&cetrafs_refresh_stalls);
+        msleep(READ_ONCE(cetrafs_refresh_compare_stall_ms)); /* TEST ONLY: see the knob */
     }
 
-    ret = cetrafs_apply_raw_to_vfs_inode(inode, &raw);
+    ret = cetrafs_refresh_settle(inode, &raw);
+    if (ret <= 0) {
+        cetrafs_inode_fd_pub_unlock(inode);
+        return ret;
+    }
+    /* The settle may have replaced the read: judge the record it returns. */
+    if (cetrafs_refresh_reuse_check(inode, &raw)) {
+        cetrafs_inode_fd_pub_unlock(inode);
+        return -ESTALE;
+    }
+
+    ctrace("FDREFRESH ino=%llu verdict=apply rawseq=%llx cached=%llx rawsize=%llu coresize=%llu dirty=%d\n",
+           (unsigned long long) inode->i_ino, (unsigned long long) cetrafs_le64(raw.file_seq),
+           (unsigned long long) cetrafs_inode_local_file_seq(inode), (unsigned long long) cetrafs_le64(raw.size),
+           (unsigned long long) i_size_read(inode), (int) cetrafs_inode_fd_dirty(inode));
+
+    ret = cetrafs_apply_raw_to_vfs_inode_sampled(inode, &raw, epoch);
     cetrafs_inode_fd_pub_unlock(inode);
     if (ret == -ESTALE) {
         /* apply() says the record describes a deleted file (the
@@ -2582,8 +2869,7 @@ int cetrafs_refresh_vfs_inode_if_newer(struct inode *inode)
          * reason: cetrafs_iget()'s cache-hit path reacts to -ESTALE by
          * dropping its reference and retrying, and a retry that found
          * this same object still hashed would refresh it, get -ESTALE
-         * again, and spin forever. Unhashed, the retry takes the fill
-         * path, which refuses it once and for all. */
+         * again, and spin forever. */
         remove_inode_hash(inode);
     }
     return ret;

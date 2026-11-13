@@ -759,6 +759,7 @@ struct inode *cetrafs_iget(struct super_block *sb, u64 ino);
 int cetrafs_write_vfs_inode(struct inode *inode);
 int cetrafs_read_raw_inode(struct super_block *sb, u64 ino, cetrafs_inode_t *out);
 int cetrafs_write_raw_inode(struct super_block *sb, u64 ino, const cetrafs_inode_t *in, bool sync);
+int cetrafs_write_raw_inode_self(struct inode *self, const cetrafs_inode_t *in, bool sync); /* inode.c: holds fd_pub */
 void cetrafs_invalidate_raw_inode(struct super_block *sb, u64 ino);
 /*
  * Compile-time trace instrumentation.
@@ -793,6 +794,10 @@ void cetrafs_invalidate_raw_inode(struct super_block *sb, u64 ino);
 #endif
 
 u64 cetrafs_inode_lba(struct super_block *sb, u64 ino);
+/* inode.c: record publish epochs (BUG-CLASSES class 29) */
+void cetrafs_rec_epoch_bump(struct super_block *sb, u64 lba);
+u64 cetrafs_rec_epoch_sample(struct super_block *sb, u64 ino);
+#define CETRAFS_REC_EPOCH_NONE U64_MAX
 u32 cetrafs_inode_crc_ns(const cetrafs_inode_t *in);
 u32 cetrafs_inode_crc_fd(const cetrafs_inode_t *in);
 bool cetrafs_inode_crcs_ok(const cetrafs_inode_t *in);
@@ -803,6 +808,7 @@ u64 cetrafs_file_seq_new(struct super_block *sb); /* sector 1 only (the file-pat
 int cetrafs_apply_raw_to_vfs_inode(struct inode *inode, const cetrafs_inode_t *raw);
 int cetrafs_apply_raw_to_vfs_inode_sure(struct inode *inode, const cetrafs_inode_t *raw);
 int cetrafs_refresh_vfs_inode_if_newer(struct inode *inode);
+void cetrafs_refresh_counters(u64 *stalls, u64 *candidates, u64 *refused); /* procfs info */
 u64 cetrafs_inode_new_generation(struct super_block *sb);
 
 // dir.c
@@ -1388,6 +1394,7 @@ void cetrafs_deferred_evict(struct inode *inode);
 struct list_head *cetrafs_inode_deferred(struct inode *inode);
 time64_t *cetrafs_inode_label_seen_at(struct inode *inode);
 u64 cetrafs_label_invalidation_count(void);
+u64 cetrafs_refresh_ns_reread_count(void);
 struct list_head *cetrafs_sb_deferred_orphans(struct super_block *sb);
 void cetrafs_deferred_capped(struct inode *inode);
 int cetrafs_deferred_room(struct inode *inode);

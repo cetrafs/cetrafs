@@ -4816,7 +4816,7 @@ relookup:
          * is namespace-owned end to end, publishes whole and sync under
          * the lock the caller holds. */
         if (S_ISDIR(inode->i_mode)) {
-            ret = cetrafs_write_raw_inode(sb, inode->i_ino, &raw, /*sync=*/true);
+            ret = cetrafs_write_raw_inode_self(inode, &raw, /*sync=*/true);
             if (ret)
                 return ret;
         } else {
@@ -5087,7 +5087,7 @@ relookup:
      * and directories grow once per ~15 entries, so this is not hot.
      */
     if (S_ISDIR(inode->i_mode)) {
-        ret = cetrafs_write_raw_inode(sb, inode->i_ino, &raw, /*sync=*/true);
+        ret = cetrafs_write_raw_inode_self(inode, &raw, /*sync=*/true);
         if (ret) {
             /* Same as above: the leaf (depth 1) is already on the device
              * or in the journal naming 'lba', and a failed record write's

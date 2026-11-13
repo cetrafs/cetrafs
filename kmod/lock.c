@@ -405,7 +405,10 @@ struct cetrafs_inode_info {
      *
      * fd_pub_mutex serialises every PUBLISHER of this record's file
      * sector (writeback's CAS, and the rebuild-then-publish paths:
-     * truncate, punch, fallocate, defrag). Without it, writeback can
+     * truncate, punch, fallocate, defrag; and, since class 29, the
+     * directory paths -- the nslock release's staged sector and the
+     * whole-record writers). The enumeration is BUG-CLASSES class 29.
+     * Without it, writeback can
      * snapshot the pre-rebuild shadow, lose the race to a rebuild's
      * publish, and land the OLD tree over the new one -- the rebuild
      * then frees the old tree's blocks while the device still
@@ -426,7 +429,7 @@ struct cetrafs_inode_info {
      * one always mismatches and reads fresh -- same cold-start posture
      * as dirent_seq_cached above. */
     u64 file_seq_cached;
-    u64 file_seq_noted_at; /* this mount's stamp clock when file_seq_cached was noted */
+    u64 file_seq_noted_at; /* this mount's stamp clock when file_seq_cached was noted (TEST ONLY age compare) */
 
     /* "Cold": the gate saw a PEER's stamp, so this inode's cached tree
      * blocks may name the wrong physical blocks and every tree read must
@@ -890,15 +893,16 @@ void cetrafs_inode_note_local_file_seq(struct inode *inode, u64 seq)
     CETRAFS_I(inode)->file_seq_cached = seq;
 }
 
-/* When the note above was taken, on this mount's stamp clock. */
+/* When the note above was taken, on this mount's stamp clock. Read only
+ * by the TEST ONLY age compare (refresh_seq_age_compare). */
 u64 cetrafs_inode_local_file_seq_at(struct inode *inode)
 {
     return CETRAFS_I(inode)->file_seq_noted_at;
 }
 
 /* The seq our last file-sector publish stamped (U64_MAX: none noted for
- * this in-core object). inode.c's refresh uses it to recognise a read
- * our own publish has superseded. */
+ * this in-core object). inode.c's refresh settles a read against it
+ * (cetrafs_refresh_settle()). */
 u64 cetrafs_inode_local_file_seq(struct inode *inode)
 {
     return CETRAFS_I(inode)->file_seq_cached;

@@ -4473,18 +4473,20 @@ void cetrafs_sb_release_wait(struct super_block *sb)
  * A nanosecond stamp for file_seq and inode generations: the real clock
  * as it read at mount, advanced by the MONOTONIC clock, and strictly
  * increasing per mount. The real clock alone can step backward (NTP, an
- * operator), and a node's own stamps are ORDERED, not just compared
- * (cetrafs_sb_own_seq_older()): a step back made a newer publish look
- * superseded and a needed refresh was declined. Anchored to the real
- * clock so a remount does not restart near values it handed out before.
+ * operator); the monotonic advance keeps one mount's stamps unique and
+ * increasing. Anchored to the real clock so a remount does not restart
+ * near values it handed out before.
+ *
+ * Stamps are compared for EQUALITY only -- is this the record we last
+ * saw? Nothing orders them. The refresh used to age-order its own stamps
+ * against this clock; a 48-bit clock wraps every ~3.26 days, so an old
+ * stamp could look newer than a note, and the refresh now re-reads and
+ * compares for equality instead (cetrafs_refresh_settle()).
  *
  * Monotonic per MOUNT only. Each mount re-anchors to the real clock, so
- * a backward step between an unmount and the next mount -- larger than
- * half the 48-bit wrap, ~1.6 days, for file_seq ordering to invert --
- * puts new stamps behind old ones on the device. The ordering compare
- * only ever runs against a note taken in the current mount, so that
- * needs one of this mount's publishes to have been lost as well. Not
- * guarded; nothing tests it.
+ * a backward step between mounts can give a new stamp a value an older
+ * one already carries. That is only a collision if the clock reproduces
+ * the same nanosecond exactly; it is not guarded against.
  */
 u64 cetrafs_sb_stamp_ns(struct super_block *sb)
 {
@@ -4515,17 +4517,13 @@ u64 cetrafs_sb_stamp_now(struct super_block *sb)
 }
 
 /*
- * Is own file_seq stamp `a` older than own stamp `b`? Both carry this
- * mount's stamp clock in their low 48 bits, which wrap every ~3.26
- * days. Ordering them modulo the wrap alone (as this used to) is right
- * only while they are less than HALF a wrap apart: a file
- * whose last noted publish was ~1.63 days before a newer local one had
- * the newer one judged older and refused, and its in-core state went
- * stale until close (audit L25) -- a VM image stays open that long.
- * Both stamps are in the past of this clock, so each is unwrapped as
- * its age against now, which orders any two inside a FULL wrap; a note
- * older than that cannot be placed, and is not trusted to refuse
- * anything (`noted_at` is the clock when it was taken).
+ * TEST ONLY control: the age-ordered compare the refresh used to make
+ * between an own file_seq stamp and the note of this node's last publish.
+ * Kept only for refresh_seq_age_compare, so the suite can reproduce the
+ * in-core revert it caused. Production never orders stamps. Ordering two
+ * stamps by their age against this clock is right only inside one full
+ * wrap (~3.26 days); a note older than that cannot be placed, and
+ * `noted_at` is the clock when it was taken.
  */
 bool cetrafs_sb_own_seq_older(struct super_block *sb, u64 a, u64 b, u64 noted_at)
 {

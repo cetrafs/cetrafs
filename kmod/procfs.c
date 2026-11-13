@@ -126,6 +126,15 @@ static int cetrafs_proc_info_show(struct seq_file *m, void *v)
      * nonzero count means unmount everywhere and run fsck.cetra. */
     seq_printf(m, "corruptions: %u\n", cetrafs_sb_corruptions(sb));
     {
+        u64 rstalls, rcands, rrefused;
+
+        /* Module-wide, not per mount: the refresh counters the suite reads. */
+        cetrafs_refresh_counters(&rstalls, &rcands, &rrefused);
+        seq_printf(m, "refresh_stalls: %llu\nrefresh_seq_candidates: %llu\nrefresh_seq_refused: %llu\n",
+                   (unsigned long long) rstalls, (unsigned long long) rcands,
+                   (unsigned long long) rrefused);
+    }
+    {
         u32 fnode = 0;
         u64 fsince = cetrafs_sb_fsck_needed(sb, &fnode);
 
@@ -280,6 +289,7 @@ static int cetrafs_proc_info_show(struct seq_file *m, void *v)
     seq_printf(m, "verdict_fills: %llu\n", cetrafs_verdict_fill_count());
     seq_printf(m, "journal_writes: %llu\n", cetrafs_journal_write_count());
     seq_printf(m, "label_invalidations: %llu\n", cetrafs_label_invalidation_count());
+    seq_printf(m, "refresh_ns_rereads: %llu\n", cetrafs_refresh_ns_reread_count());
     seq_printf(m, "ext_cache_stale_refused: %llu\n", cetrafs_ext_cache_stale_refused_count());
     seq_printf(m, "late_claims_cleared: %llu\n", cetrafs_late_claims_cleared_count());
     seq_printf(m, "layout_refreshes: %llu\n", cetrafs_layout_refresh_count());

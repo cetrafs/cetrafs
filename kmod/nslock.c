@@ -515,6 +515,13 @@ static unsigned int cetrafs_nslock_fd_publish_fail;
 cetrafs_test_param(nslock_fd_publish_fail, cetrafs_nslock_fd_publish_fail, uint, 0644);
 MODULE_PARM_DESC(nslock_fd_publish_fail, "TEST ONLY: fail the next N staged file-sector publishes at release");
 
+/* TEST ONLY: publish the staged file sector WITHOUT fd_pub_mutex -- the
+ * unordered publish that let a refresh apply a superseded read. The
+ * negative control for tests/kernel/refresh_superseded_own_seq.sh. */
+static bool cetrafs_nslock_fd_publish_unlocked;
+cetrafs_test_param(nslock_fd_publish_unlocked, cetrafs_nslock_fd_publish_unlocked, bool, 0644);
+MODULE_PARM_DESC(nslock_fd_publish_unlocked, "TEST ONLY: publish the staged file sector without fd_pub_mutex");
+
 void cetrafs_nslock_release(struct inode *inode)
 {
     ctrace("NSHOLD ino=%llu REL\n", (unsigned long long) inode->i_ino);
@@ -595,7 +602,19 @@ void cetrafs_nslock_release(struct inode *inode)
                 cetrafs_nslock_fd_publish_fail--; /* test-only, see the knob */
                 ret = -EIO;
             } else {
+                /* Every file-sector publisher holds fd_pub_mutex across its
+                 * CAS and its note (BUG-CLASSES class 29): a refresh that
+                 * read the record before this publish must either finish
+                 * before it or see it, never apply the older record after
+                 * it. Lock order here is the namespace lock, then fd_pub
+                 * (lock.c). */
+                bool locked = !READ_ONCE(cetrafs_nslock_fd_publish_unlocked); /* test-only: see the knob */
+
+                if (locked)
+                    cetrafs_inode_fd_pub_lock(inode);
                 ret = cetrafs_write_raw_inode_fd(sb, inode->i_ino, &recs[1], inode);
+                if (locked)
+                    cetrafs_inode_fd_pub_unlock(inode);
             }
             if (!ret || ret == -ESTALE)
                 break;

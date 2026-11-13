@@ -1262,7 +1262,7 @@ int cetrafs_dir_update_dotdot(struct inode *dir, u64 new_parent_ino)
                      * -- otherwise a peer whose cached seq still matches
                      * would go on serving the old '..' from its cache. */
                     raw.dirent_seq = cetrafs_cpu_to_le64(cetrafs_dirent_seq_new(dir->i_sb));
-                    ret = cetrafs_write_raw_inode(dir->i_sb, dir->i_ino, &raw, /*sync=*/true);
+                    ret = cetrafs_write_raw_inode_self(dir, &raw, /*sync=*/true);
                     if (ret)
                         return ret;
                     /* No cache claim: this walk stopped at '..' in the
@@ -1402,7 +1402,7 @@ static int cetrafs_dir_retarget_entry(struct inode *dir,
     ctrace("RETGT dir=%llu name='%.*s' new_ino=%llu removed_ino=%llu\n",
             (unsigned long long) dir->i_ino, (int) name->len, name->name,
             (unsigned long long) new_ino, (unsigned long long) *out_old_ino);
-    ret = cetrafs_write_raw_inode(dir->i_sb, dir->i_ino, &raw, /*sync=*/true);
+    ret = cetrafs_write_raw_inode_self(dir, &raw, /*sync=*/true);
     if (ret)
         return ret;
 
@@ -1766,7 +1766,7 @@ static void cetrafs_new_inode_discard(struct inode *inode)
         cetrafs_le64(raw.generation) == cetrafs_inode_get_generation(inode) &&
         cetrafs_le32(raw.nlink) != 0) {
         raw.nlink = 0;
-        (void) cetrafs_write_raw_inode(sb, inode->i_ino, &raw, /*sync=*/true);
+        (void) cetrafs_write_raw_inode_self(inode, &raw, /*sync=*/true);
     }
 
     /* The birth is over: it failed. Eviction frees the number through
@@ -3116,10 +3116,18 @@ static int cetrafs_rename_locked(struct mnt_idmap *idmap,
          * leak, never a free -- and said so (cetrafs_rename_ns_delta()). */
         struct cetrafs_ns_delta d = {.ctime = (u64) now, .nlink_delta = counted ? -1 : 0};
 
+        /* A directory renamed inside one parent is not locked by the VFS
+         * (vfs_rename() locks a moved directory only when its parent
+         * changes), so the swap and the in-core stores below run under
+         * fd_pub_mutex instead: a refresh of it holds that from its read
+         * to its apply, and would otherwise put the old ctime back
+         * (BUG-CLASSES class 29). */
+        cetrafs_inode_fd_pub_lock(old_inode);
         if (!cetrafs_rename_ns_delta(old_dir->i_sb, old_ino, &d, "rename: moved file") && counted)
             set_nlink(old_inode, d.out_nlink);
+        inode_set_ctime(old_inode, now, 0);
+        cetrafs_inode_fd_pub_unlock(old_inode);
     }
-    inode_set_ctime(old_inode, now, 0);
     ret = 0;
 
 out:
