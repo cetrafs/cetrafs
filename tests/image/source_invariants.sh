@@ -1025,6 +1025,293 @@ N52="$(cat "$K"/*.c | grep -c 'class 52:' || true)"
 [ -z "$C52" ] && pass "class 52: every take of an accrued delta names its flight, and only the settles read it" ||
     fail "class 52: $(echo "$C52" | tr '\n' ';')"
 
+# Class 27: a cached leaf, index or xattr block is edited IN PLACE by
+# several stores, and a cached read checks no checksum -- so a reader of
+# its b_data on THIS node needs lock_buffer (or the update / snapshot
+# protocol), or a reason no in-place editor can run under it. Every
+# function in the extent-tree, xattr, held-back-leaf and defrag code that
+# touches b_data without one of those is listed below with its reason
+# (each verified against its callers 2026-11-13); a new one fails until
+# listed. Negative control: a planted unlocked reader.
+log "checking every unlocked reader of a cached tree or xattr block names why no in-place edit can tear it (class 27)"
+C27_ALLOW="
+file.c:cetrafs_write_new_leaf a-new-block,-unreachable-until-published
+file.c:cetrafs_write_new_index a-new-block,-unreachable-until-published
+file.c:cetrafs_tree_convert_inner the-editor,-under-invalidate_lock-exclusive
+file.c:cetrafs_tree_append the-editor,-under-invalidate_lock-exclusive
+file.c:cetrafs_inode_extents_get every-caller-holds-invalidate_lock-(fiemap/seek-shared),-or-the-file-is-being-evicted
+file.c:cetrafs_tree_flatten via-cetrafs_inode_extents_get,-or-defrag-under-invalidate_lock-exclusive
+file.c:cetrafs_tree_extent_count do_allocate-exclusive;-close-after-the-last-writer;-the-defrag-worker-heuristic-only
+file.c:cetrafs_tree_last_contig_lba a-placement-hint,-under-invalidate_lock-exclusive
+file.c:cetrafs_tree_free_meta the-old-tree,-after-its-publish-and-under-invalidate_lock-exclusive
+file.c:cetrafs_tree_meta_is_ours the-old-tree,-under-invalidate_lock-exclusive
+file.c:cetrafs_tree_invalidate_cached drop-only;-an-entry-torn-by-a-local-edit-names-a-block-current-in-the-cache
+xattr.c:cetrafs_xattr_set_locked the-editor,-under-the-namespace-lock-and-the-VFS-inode-lock
+leafdefer.c:cetrafs_deferred_settle_locked its-caller-holds-lock_buffer
+defrag.c:cetrafs_defrag_read_extents under-invalidate_lock-exclusive-(cetrafs_defrag_inode_lock)
+"
+c27_scan() { # <dir>: prints file:function for every unlocked b_data user
+    local f
+    for f in "$1"/file.c "$1"/xattr.c "$1"/leafdefer.c "$1"/defrag.c "$1"/planted.c; do
+        [ -f "$f" ] || continue
+        awk -v F="$(basename "$f")" '
+            function out() { if (fn != "" && bd && !lk) print F ":" fn }
+            /^[a-z].*\(/ && !/;$/ { out(); fn = $0; sub(/\(.*/, "", fn); sub(/.* \**/, "", fn); bd = 0; lk = 0 }
+            /^[[:space:]]*(\*|\/\*)/ { next }
+            /b_data/ { bd = 1 }
+            /lock_buffer\(|cetrafs_bh_read_lock\(|cetrafs_bh_begin_update\(|cetrafs_bh_snapshot\(/ { lk = 1 }
+            END { out() }' "$f"
+    done | sort -u
+}
+C27P="$(mktemp -d)"
+cat >"$C27P/planted.c" <<'EOF'
+static u16 peek(struct buffer_head *bh)
+{
+    return ((cetrafs_extent_hdr_t *) bh->b_data)->eh_entries;
+}
+EOF
+C27N="$(c27_scan "$C27P")"
+rm -rf "$C27P"
+[ "$C27N" = "planted.c:peek" ] || fail "class 27: the planted unlocked reader was not found ($C27N) -- the scan sees nothing"
+C27_FOUND="$(c27_scan "$K")"
+C27_LISTED="$(awk 'NF {print $1}' <<<"$C27_ALLOW" | sort -u)"
+C27_NEW="$(comm -23 <(echo "$C27_FOUND") <(echo "$C27_LISTED"))"
+C27_GONE="$(comm -13 <(echo "$C27_FOUND") <(echo "$C27_LISTED"))"
+[ -n "$C27_FOUND" ] || fail "class 27: setup -- no unlocked b_data user found (the scan no longer matches)"
+[ -z "$C27_NEW" ] && [ -z "$C27_GONE" ] &&
+    pass "class 27: every unlocked reader of a cached tree or xattr block names its reason ($(echo $C27_FOUND | wc -w))" ||
+    fail "class 27: unlisted: $(echo $C27_NEW); listed but gone: $(echo $C27_GONE)"
+
+# Class 20: a user process must not wait for seconds where SIGKILL cannot
+# end the wait, and a wait must not be measured by counting interruptible
+# sleeps (msleep_interruptible() returns at once with a signal pending).
+# Every UNINTERRUPTIBLE wait (wait_event, wait_for_completion, down_read/
+# down_write, wait_on_bit* with TASK_UNINTERRUPTIBLE) and every
+# interruptible sleep is listed below by function, with what bounds it
+# or how its return is used; a new one fails until listed. mutex_lock is
+# not scanned (it is everywhere; class 22 covers waits under a lock the
+# awaited takes). Found on the way in: the allocator's wait for a
+# surplus release was a plain down_read() a discard could hold for over
+# a second -- killable now. Negative control: a planted wait_event().
+log "checking every uninterruptible wait and interruptible sleep names its bound (class 20)"
+C20_ALLOW="
+caw.c:cetrafs_cas_stress test-only-stress-waits-for-its-own-workers
+dmpath.c:cetrafs_dmpath_sdev wait_event_timeout
+dmpath.c:cetrafs_dmpath_forget wait_event_timeout
+fs.c:cetrafs_sb_release_lock heartbeat-only;-the-writers-wait-killable
+fs.c:cetrafs_sb_release_wait killable;-the-plain-down_read-is-the-release_wait_unkillable-control-knob
+fs.c:cetrafs_sb_birth_gate held-across-one-bit-CAS
+fs.c:cetrafs_shutdown_ioctl admin-ioctl;-s_umount
+fs.c:cetrafs_sb_bg_flush_lock holder-is-one-CAS-from-letting-go;-an-EINTR-would-be-a-new-failure
+fs.c:cetrafs_sb_zg_write_lock holder-is-one-CAS-from-letting-go;-an-EINTR-would-be-a-new-failure
+journal.c:cetrafs_journal_take_slot in-flight-writes-only;-a-killed-close-must-finish-(4949eca)
+journal.c:cetrafs_journal_take_batch wait_event_timeout-loop
+lock.c:cetrafs_flock msleep_interruptible-returns-EINTR
+node.c:cetrafs_node_row_quiet msleep_interruptible-returns-EINTR
+node.c:cetrafs_node_repair_claim_exists msleep_interruptible-returns-EINTR
+node.c:cetrafs_node_live_peer_exists msleep_interruptible-in-a-loop-timed-by-jiffies
+"
+c20_scan() { # <dir>: prints file:function for every listed kind of wait
+    local f
+    for f in "$1"/*.c; do
+        awk -v F="$(basename "$f")" '
+            /^[a-z].*\(/ && !/;$/ { fn = $0; sub(/\(.*/, "", fn); sub(/.* \**/, "", fn) }
+            /^[[:space:]]*(\*|\/\*)/ { next }
+            /[^a-z_](wait_event|wait_event_timeout|wait_for_completion|down_read|down_write|msleep_interruptible|schedule_timeout_interruptible)\(/ ||
+            /wait_on_bit(_lock)?\(.*TASK_UNINTERRUPTIBLE/ { print F ":" fn }' "$f"
+    done | sort -u
+}
+C20P="$(mktemp -d)"
+cat >"$C20P/planted.c" <<'EOF'
+static void stuck(struct cetrafs_journal *j)
+{
+    wait_event(j->slot_wq, false);
+}
+EOF
+C20N="$(c20_scan "$C20P")"
+rm -rf "$C20P"
+[ "$C20N" = "planted.c:stuck" ] || fail "class 20: the planted wait was not found ($C20N) -- the scan sees nothing"
+C20_FOUND="$(c20_scan "$K")"
+C20_LISTED="$(awk 'NF {print $1}' <<<"$C20_ALLOW" | sort -u)"
+C20_NEW="$(comm -23 <(echo "$C20_FOUND") <(echo "$C20_LISTED"))"
+C20_GONE="$(comm -13 <(echo "$C20_FOUND") <(echo "$C20_LISTED"))"
+[ -n "$C20_FOUND" ] || fail "class 20: setup -- no wait found (the scan no longer matches)"
+[ -z "$C20_NEW" ] && [ -z "$C20_GONE" ] &&
+    pass "class 20: every uninterruptible wait and interruptible sleep names its bound ($(echo $C20_FOUND | wc -w))" ||
+    fail "class 20: unlisted wait: $(echo $C20_NEW); listed but gone: $(echo $C20_GONE)"
+
+# Class 12: an ADDRESS read off the disk must be validated before it aims
+# an I/O (rule 19: an extent naming the inode table turned an ordinary
+# write(2) into a write over inodes 1..4). Data I/O is aimed in exactly
+# one place, map_bh() in __cetrafs_get_block(), and it may take its
+# address only from the checked lookup: so (a) map_bh() appears in no
+# other function, (b) __cetrafs_get_block() calls no *_unchecked lookup,
+# and (c) cetrafs_tree_lookup() still calls cetrafs_lba_run_check() on
+# what it returns. Tree and dirent blocks are validated where they are
+# read (cetrafs_blk_tail_bread(), cetrafs_read_tree_bh_for()); frees
+# resolve the BG themselves. Negative control: a planted map_bh() in
+# another function, and a planted unchecked lookup, must both be found.
+log "checking data I/O is aimed only through the address-checked lookup (class 12)"
+c12_scan() { # <file>: prints a line per violation
+    awk '
+        /^[a-z].*\(/ && !/;$/ { fn = $0; sub(/\(.*/, "", fn); sub(/.* \**/, "", fn) }
+        /^[[:space:]]*(\*|\/\*)/ { next }
+        /[^a-z_]map_bh\(/ && fn != "__cetrafs_get_block" { print "map_bh in " fn }
+        fn == "__cetrafs_get_block" && /_unchecked\(/ { print "unchecked lookup in __cetrafs_get_block" }
+        fn == "cetrafs_tree_lookup" && /cetrafs_lba_run_check\(/ { checked = 1 }
+        END { if (!checked) print "cetrafs_tree_lookup no longer checks its address" }' "$1"
+}
+C12P="$(mktemp)"
+cat >"$C12P" <<'EOF'
+int cetrafs_tree_lookup(struct inode *inode)
+{
+    return cetrafs_lba_run_check(sb, lba, 1);
+}
+
+static int __cetrafs_get_block(struct inode *inode)
+{
+    ret = cetrafs_tree_lookup_unchecked(inode, raw, iblock);
+    map_bh(bh_result, sb, lba);
+}
+
+static int sneaky(struct inode *inode)
+{
+    map_bh(bh_result, sb, lba);
+}
+EOF
+C12N="$(c12_scan "$C12P" | sort | tr '\n' '|')"
+rm -f "$C12P"
+[ "$C12N" = "map_bh in sneaky|unchecked lookup in __cetrafs_get_block|" ] ||
+    fail "class 12: the planted violations gave '$C12N' -- the scan sees nothing"
+C12="$(cat "$K"/*.c | c12_scan /dev/stdin)"
+[ "$(grep -c '[^a-z_]map_bh(' "$K/file.c")" -ge 1 ] || fail "class 12: setup -- no map_bh() in file.c (the scan no longer matches)"
+[ -z "$C12" ] && pass "class 12: data I/O is aimed only by __cetrafs_get_block(), through the checked lookup" ||
+    fail "class 12: $(echo "$C12" | tr '\n' ';')"
+
+# Class 21: a release that fails must not be forgotten. Every call that
+# DISCARDS the result of an int-returning release / give-back / clear /
+# withdraw / free (a bare statement, or a (void) cast) is listed below by
+# callee, with why losing that failure is safe; a new callee discarded
+# anywhere fails until listed. (Found 2026-11-12 on the way in:
+# cetrafs_bg_adjust_free_blocks() returned before accruing on a failed
+# descriptor read, and every caller discarded it -- the delta was lost.)
+# Negative control: a planted discarded release must be found.
+log "checking no failed release is discarded without a reason (class 21)"
+C21_ALLOW="
+cetrafs_bg_adjust_free_blocks accrues-first;-the-return-is-the-roll-up-only
+cetrafs_flush_dirty_free_counts re-accrues-a-failed-delta-itself
+cetrafs_free_data_extent a-lost-free-leaks;-the-scrub-reclaims-it
+cetrafs_free_inode a-failed-free-keeps-the-bit;-the-orphan-scrub-reclaims-it
+cetrafs_release vfs-release;-its-failures-queue-their-own-retry
+cetrafs_sb_adjust_free_inodes in-memory;-fails-only-without-sb_info
+cetrafs_zg_adjust_free_blocks in-memory-accrue;-fails-only-on-an-impossible-zone-group-id
+cetrafs_zg_drain_pending_frees a-failed-drain-leaves-the-entries-queued-for-the-next
+cetrafs_zg_reconcile_free_counts never-fails-the-claim-by-design;-logs;-the-allocator-recounts-a-lying-group
+"
+c21_scan() { # <dir>: prints file:line:callee of every discarded release
+    local f fns
+    fns="$(grep -hoE '^(static )?int (__)?cetrafs_[a-z_]*(release|give_back|giveback|clear|unlock|withdraw|unpin|yield|free)[a-z_]*\(' "$1"/*.c "$1"/*.h 2>/dev/null |
+        sed -E 's/^(static )?int //; s/\($//' | sort -u | tr '\n' '|' | sed 's/|$//')"
+    [ -n "$fns" ] || return 0
+    for f in "$1"/*.c; do
+        awk -v F="$(basename "$f")" -v RE="^[[:space:]]*([(]void[)][[:space:]]*)?(${fns})[(]" '
+            /^[[:space:]]*$/ || /^[[:space:]]*(\*|\/\*|\/\/)/ { next }
+            $0 ~ RE && (prev ~ /[;{})][[:space:]]*(\/\*.*\*\/)?[[:space:]]*$/ || prev ~ /else[[:space:]]*$/ || prev ~ /\*\/[[:space:]]*$/) {
+                c = $0; sub(/^[[:space:]]*(\(void\)[[:space:]]*)?/, "", c); sub(/\(.*/, "", c)
+                print F ":" NR ":" c
+            }
+            { prev = $0 }' "$f"
+    done
+}
+C21P="$(mktemp -d)"
+cat >"$C21P/planted.c" <<'EOF'
+int cetrafs_thing_release(struct super_block *sb)
+{
+    return -EIO;
+}
+
+static void user(struct super_block *sb)
+{
+    cetrafs_thing_release(sb);
+}
+EOF
+C21N="$(c21_scan "$C21P" | cut -d: -f3)"
+rm -rf "$C21P"
+[ "$C21N" = "cetrafs_thing_release" ] || fail "class 21: the planted discarded release was not found ($C21N) -- the scan sees nothing"
+C21_FOUND="$(c21_scan "$K")"
+C21_LISTED="$(awk 'NF {print $1}' <<<"$C21_ALLOW" | sort -u)"
+C21_NEW="$(cut -d: -f3 <<<"$C21_FOUND" | sort -u | comm -23 - <(echo "$C21_LISTED"))"
+C21_GONE="$(cut -d: -f3 <<<"$C21_FOUND" | sort -u | comm -13 - <(echo "$C21_LISTED"))"
+[ -n "$C21_FOUND" ] || fail "class 21: setup -- no discarded release found (the scan no longer matches)"
+[ -z "$C21_NEW" ] && [ -z "$C21_GONE" ] &&
+    pass "class 21: every discarded release names why its failure is safe ($(wc -l <<<"$C21_FOUND") calls)" ||
+    fail "class 21: discarded with no reason: $(for c in $C21_NEW; do grep ":$c\$" <<<"$C21_FOUND" | head -2; done | tr '\n' ' '); listed but gone: $(echo $C21_GONE)"
+
+# Class 29: an ORDER decided from a real clock is wrong after a backward
+# step, a wrap or a peer's skew. The real clock may be read only for
+# timestamps, log text, or a stamp clock's anchor -- every function that
+# reads it is listed below with which of those it is; a new one fails
+# until listed (and listed-but-gone fails too, so the list stays true).
+# The order-sensitive stamps come from cetrafs_sb_stamp_ns(), monotonic
+# per mount. Negative control: a planted reader in an unlisted function
+# must be found.
+log "checking the real clock is read only for timestamps, logs and the stamp anchor (class 29)"
+C29_ALLOW="
+dir.c:cetrafs_create_locked timestamp
+dir.c:cetrafs_dir_add_entry timestamp
+dir.c:cetrafs_dir_remove_entry timestamp
+dir.c:cetrafs_dir_retarget_entry timestamp
+dir.c:cetrafs_link_locked timestamp
+dir.c:cetrafs_mkdir_locked timestamp
+dir.c:cetrafs_rename_locked timestamp
+dir.c:cetrafs_rmdir_locked timestamp
+dir.c:cetrafs_symlink_locked timestamp
+dir.c:cetrafs_unlink_locked timestamp
+file.c:cetrafs_do_allocate timestamp
+file.c:cetrafs_fallocate timestamp
+xattr.c:cetrafs_xattr_set timestamp
+fs.c:cetrafs_fill_super anchor-of-the-monotonic-stamp-clock
+fs.c:cetrafs_sb_stamp_ns no-mount-fallback
+fs.c:cetrafs_sb_stamp_now no-mount-fallback
+fs.c:cetrafs_sb_record_damage informational-timestamp
+journal.c:cetrafs_journal_claim_mutate written-never-read
+node.c:cetrafs_node_claim_mutate informational-last_seen
+node.c:cetrafs_node_reattach_mutate informational-last_seen
+node.c:cetrafs_node_renew_mutate informational-last_seen
+node.c:cetrafs_node_test_beat_mutate informational-last_seen
+node.c:cetrafs_node_report_clock_skew log
+zonegroup.c:cetrafs_zg_log_foreign_free_leak log
+scrub.c:cetrafs_scrub_cycle procfs-timestamp
+inode.c:cetrafs_inode_label_may_be_stale order-that-fails-toward-a-re-read
+"
+c29_scan() { # <dir>: prints file:function for every real-clock read
+    local f
+    for f in "$1"/*.c; do
+        awk -v F="$(basename "$f")" '
+            /^[a-z].*\(/ && !/;$/ { fn = $0; sub(/\(.*/, "", fn); sub(/.* \**/, "", fn) }
+            /^[[:space:]]*(\*|\/\*)/ { next }
+            /ktime_get_real|ktime_get_clocktai|ktime_get_coarse_real|get_seconds\(\)/ { print F ":" fn }' "$f"
+    done | sort -u
+}
+C29P="$(mktemp -d)"
+cat >"$C29P/planted.c" <<'EOF'
+static bool newer(u64 a)
+{
+    return a < ktime_get_real_ns();
+}
+EOF
+C29N="$(c29_scan "$C29P")"
+rm -rf "$C29P"
+[ "$C29N" = "planted.c:newer" ] || fail "class 29: the planted real-clock compare was not found ($C29N) -- the scan sees nothing"
+C29_FOUND="$(c29_scan "$K")"
+C29_LISTED="$(awk 'NF {print $1}' <<<"$C29_ALLOW" | sort -u)"
+C29_NEW="$(comm -23 <(echo "$C29_FOUND") <(echo "$C29_LISTED"))"
+C29_GONE="$(comm -13 <(echo "$C29_FOUND") <(echo "$C29_LISTED"))"
+[ -n "$C29_FOUND" ] || fail "class 29: setup -- no real-clock read found (the grep no longer matches)"
+[ -z "$C29_NEW" ] && [ -z "$C29_GONE" ] &&
+    pass "class 29: every real-clock read is a timestamp, a log or the stamp anchor ($(echo $C29_FOUND | wc -w))" ||
+    fail "class 29: unlisted real-clock reader: $(echo $C29_NEW); listed but gone: $(echo $C29_GONE)"
+
 # Class 34: a CAS mutator that REFUSES a negative count is safe only if
 # no other actor's inverse move can sit between two of ours -- a credit
 # landing after the debit it pays for reads, in between, as below zero,
