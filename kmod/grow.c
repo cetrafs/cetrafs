@@ -103,6 +103,56 @@ static int cetrafs_grow_link_mutate(void *image, unsigned int len, void *priv)
     return 0;
 }
 
+/*
+ * A Block Group the grow adds becomes reachable the moment the grow
+ * publishes: the pool hands it to a claim and the allocator reads its
+ * bitmap. growfs writes each new group's in-region header and zeroes its
+ * bitmap, syncs both, and only then asks for the commit -- so a header
+ * that does not verify here means the region was never initialised, or
+ * not durably (rule 5). Until now only fsck read these headers, after
+ * the grow had already published over them.
+ *
+ * Grow only, one forced-fresh read per new group. The header and the
+ * bitmap zeroing reach the device under the same sync in growfs, so a
+ * durable header is also the witness for the bitmap.
+ * tests/kernel/grow_live_bg_header.sh.
+ */
+int cetrafs_grow_check_bg_header(struct super_block *sb, u32 bg_id, u64 start, u64 len)
+{
+    static const u8 zero[8] = {0};
+    const size_t off = offsetof(cetrafs_bg_header_t, checksum);
+    const size_t clen = sizeof(((cetrafs_bg_header_t *) NULL)->checksum);
+    const cetrafs_bg_header_t *h;
+    struct buffer_head *bh;
+    u32 bmap, data, crc = ~0U;
+    u64 cnt;
+    int rc = 0;
+
+    BUILD_BUG_ON(sizeof(zero) != clen);
+    BUILD_BUG_ON(sizeof(cetrafs_bg_header_t) != CETRAFS_BLOCK_SIZE);
+
+    bh = cetrafs_bread_uncached(sb, start);
+    if (!bh)
+        return -EIO;
+    h = (const cetrafs_bg_header_t *) bh->b_data;
+    crc = crc32c(crc, h, off);
+    crc = crc32c(crc, zero, clen);
+    crc = crc32c(crc, (const u8 *) h + off + clen, sizeof(*h) - off - clen);
+    cetrafs_calc_bg_layout(len, &bmap, &data, &cnt);
+    if ((u64) ~crc != le64_to_cpu(h->checksum) || le32_to_cpu(h->bg_id) != bg_id ||
+        le64_to_cpu(h->length_blocks) != len || le32_to_cpu(h->off_data_bmap) != bmap ||
+        le32_to_cpu(h->off_data_region) != data || le64_to_cpu(h->data_block_count) != cnt ||
+        le16_to_cpu(h->owner_zg) != (u16) CETRAFS_BG_OWNER_FREE) {
+        pr_err("%s: Block Group %u's header at %llu does not verify (id %u, crc %s) -- its region was not "
+               "initialised on the device\n",
+               sb->s_id, bg_id, (unsigned long long) start, le32_to_cpu(h->bg_id),
+               (u64) ~crc == le64_to_cpu(h->checksum) ? "ok" : "bad");
+        rc = -EUCLEAN;
+    }
+    brelse(bh);
+    return rc;
+}
+
 struct cetrafs_grow_sb_ctx {
     const cetrafs_superblock_t *cur, *nw;
 };

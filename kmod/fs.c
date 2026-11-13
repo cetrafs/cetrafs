@@ -1094,6 +1094,13 @@ static int cetrafs_layout_pending_link(struct super_block *sb, const cetrafs_sup
     return rc;
 }
 
+/* TEST ONLY: the walk skips the new Block Groups' header check, so
+ * tests/crash/growfs_live_crash.sh's control can still record a grow
+ * that publishes over regions nobody initialised. */
+static bool cetrafs_grow_hdr_check_off;
+cetrafs_test_param(grow_hdr_check_off, cetrafs_grow_hdr_check_off, bool, 0644);
+MODULE_PARM_DESC(grow_hdr_check_off, "TEST ONLY: a live grow does not verify its new Block Groups' headers");
+
 /*
  * Walk the Block Group table chain of l->raw and fill in what the
  * layout needs: every descriptor address, the appended segments, and
@@ -1381,8 +1388,14 @@ walked:
             rc = -EINVAL;
             goto out;
         }
-        if (gp)
+        if (gp) {
+            /* The descriptor verified; the region it names must too, or
+             * the grow publishes groups nobody initialised. */
+            rc = READ_ONCE(cetrafs_grow_hdr_check_off) ? 0 : cetrafs_grow_check_bg_header(sb, b, bstart, blen);
+            if (rc)
+                goto out;
             gp->shard_credit[b % gp->nshards] += t;
+        }
         total_data += t;
         WRITE_ONCE(c->bg_owner_zg[ci], (u16) owner);
     }
