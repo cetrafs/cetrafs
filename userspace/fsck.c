@@ -580,6 +580,36 @@ static void fsck_stamp_dirent_block(uint8_t *blk)
  * dirent naming it. It used to wait for the one write-back at the end
  * of the pass: a crash before that left a dirent naming an inode whose
  * bit was clear, which the kernel allocates again. */
+/*
+ * May a free count of Zone Group z lag its bitmaps on this image?
+ *
+ * Free counts accrue in memory and reach their descriptors only at
+ * durability boundaries (docs/PERFORMANCE.md, invariant 4), so a node
+ * that crashed leaves the on-disk counts of the Zone Groups it owned
+ * behind the bitmaps, in either direction. That is not damage: the next
+ * owner recounts them from the bitmaps when it claims the Zone Group,
+ * and the node itself does at re-attach
+ * (cetrafs_zg_reconcile_free_counts()); and a count never decides which
+ * block is free -- the bitmap does. So the lag is a note when the Zone
+ * Group's owner was left behind (no CLEAN departure, or a row no longer
+ * registered -- the next mount reclaims it either way), and stays an
+ * error when the owner departed cleanly, and for unowned groups and the
+ * pool: those counts were flushed, and a mismatch there is a real
+ * accounting bug. tests/image/fsck_count_lag_crash.sh.
+ */
+static int cetrafs_count_lag_expected(uint32_t z, uint32_t zg_count, const uint32_t *zg_owner, uint32_t node_count,
+                                      const uint8_t *node_registered, const uint8_t *node_unclean)
+{
+    uint32_t o;
+
+    if (z >= zg_count)
+        return 0;
+    o = zg_owner[z];
+    if (o == CETRAFS_NODE_ID_NONE || o >= node_count)
+        return 0;
+    return !node_registered[o] || node_unclean[o];
+}
+
 static int fsck_alloc_inode(int fd, const cetrafs_superblock_t *sb, uint8_t *ibmap, int *dirty, uint64_t *out_ino)
 {
     for (uint64_t ino = 2; ino <= cetrafs_le32(sb->inodes_count); ++ino) {
@@ -2464,6 +2494,9 @@ int main(int argc, char **argv)
     }
     uint8_t *node_registered = (uint8_t *) xcalloc(cetrafs_le32(sb.node_table_count) ? cetrafs_le32(sb.node_table_count) : 1, 1);
     uint8_t *node_departed = (uint8_t *) xcalloc(cetrafs_le32(sb.node_table_count) ? cetrafs_le32(sb.node_table_count) : 1, 1);
+    /* Rows left behind rather than released (departure != CLEAN): a
+     * crash, or a node still running. See cetrafs_count_lag_expected(). */
+    uint8_t *node_unclean = (uint8_t *) xcalloc(cetrafs_le32(sb.node_table_count) ? cetrafs_le32(sb.node_table_count) : 1, 1);
     uint32_t node_free_rows = 0, node_departed_rows = 0;
     for (uint32_t n = 0; n < cetrafs_le32(sb.node_table_count); ++n) {
         cetrafs_node_entry_t ne;
@@ -2516,6 +2549,8 @@ int main(int argc, char **argv)
          * did not get to write one (DEAD: a peer watched it stop).
          * Reported, never fatal: it is exactly the state a crash leaves,
          * and the next node to mount reclaims it. */
+        if (cetrafs_le32(ne.departure) != CETRAFS_NODE_DEPART_CLEAN)
+            node_unclean[n] = 1;
         if (cetrafs_le32(ne.departure) != CETRAFS_NODE_DEPART_CLEAN)
             fprintf(stderr,
                     "WARN: node slot %u is REGISTERED and did not depart cleanly (hb_seq=%" PRIu64
@@ -3653,10 +3688,19 @@ int main(int argc, char **argv)
              * The bitmap is already being walked right here for the
              * reachability reconciliation, so the popcount is free. */
             if (bg_free_cached[b] != really_free) {
-                fprintf(stderr,
-                        "ERR: BG%u cached free_data_blocks %" PRIu64 " != %" PRIu64 " actually free in its bitmap\n", b,
-                        bg_free_cached[b], really_free);
-                miscounted++;
+                if (bg_owner_expected[b] != CETRAFS_BG_OWNER_FREE &&
+                    cetrafs_count_lag_expected(bg_owner_expected[b], cetrafs_le32(sb.zone_group_count), zg_owner,
+                                               cetrafs_le32(sb.node_table_count), node_registered, node_unclean))
+                    printf("note: BG%u cached free_data_blocks %" PRIu64 " != %" PRIu64
+                           " free in its bitmap -- Zone Group %u's owner did not depart cleanly, and the mount that "
+                           "reclaims or re-attaches it recounts\n",
+                           b, bg_free_cached[b], really_free, bg_owner_expected[b]);
+                else {
+                    fprintf(stderr,
+                            "ERR: BG%u cached free_data_blocks %" PRIu64 " != %" PRIu64 " actually free in its bitmap\n",
+                            b, bg_free_cached[b], really_free);
+                    miscounted++;
+                }
                 /* The bitmap is the truth and has just been walked (and,
                  * above, corrected), so there is exactly one right
                  * answer. Rewrite the descriptor with its checksum
@@ -3768,7 +3812,22 @@ int main(int argc, char **argv)
                 }
             }
 
-            if (agg_ok && pool_ok && !grow_dead)
+            /* A crashed owner's aggregate lags like its groups' counts
+             * (cetrafs_count_lag_expected()). The pool is nobody's
+             * accrual and keeps its check. */
+            int lag_noted = 0;
+
+            if (!agg_ok && cetrafs_count_lag_expected(z, cetrafs_le32(sb.zone_group_count), zg_owner,
+                                                      cetrafs_le32(sb.node_table_count), node_registered, node_unclean)) {
+                printf("note: ZG%u aggregate free_data_blocks %" PRIu64 " != %" PRIu64
+                       " free in its Block Groups -- its owner did not depart cleanly, and the mount that reclaims or "
+                       "re-attaches it recounts\n",
+                       z, (uint64_t) cetrafs_le64(zg.free_data_blocks), zg_free_truth[z]);
+                agg_ok = 1;
+                lag_noted = 1;
+            }
+            /* class 45: recount -- a noted lag still reaches the recount below under -r */
+            if (agg_ok && pool_ok && !grow_dead && !(lag_noted && repair_mode && !repair_blocked))
                 continue;
             if (grow_dead) {
                 fprintf(stderr,
