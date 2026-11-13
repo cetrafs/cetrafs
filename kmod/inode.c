@@ -109,9 +109,13 @@ u64 cetrafs_inode_lba(struct super_block *sb, u64 ino)
  *
  * Hashed, not per object: a publisher needs no in-core inode (eviction,
  * journal replay, a number we hold no object for), and a collision only
- * costs a re-read. Any block may bump; only inode records are sampled.
+ * costs a re-read. Only inode records are sampled, so only they bump:
+ * the other swaps -- free-count flushes, heartbeats, Zone Group claims --
+ * are the busiest, and would turn every slot into a collision. 4096
+ * slots (16 KiB) keep collisions between records rare; the re-reads they
+ * cost are counted (refresh_ns_rereads in procfs info).
  */
-#define CETRAFS_REC_EPOCH_BITS 8
+#define CETRAFS_REC_EPOCH_BITS 12
 static atomic_t cetrafs_rec_epoch[1U << CETRAFS_REC_EPOCH_BITS];
 
 static atomic_t *cetrafs_rec_epoch_slot(struct super_block *sb, u64 lba)
@@ -121,6 +125,16 @@ static atomic_t *cetrafs_rec_epoch_slot(struct super_block *sb, u64 lba)
 
 void cetrafs_rec_epoch_bump(struct super_block *sb, u64 lba)
 {
+    const cetrafs_superblock_t *raw_sb = cetrafs_sb_raw(sb);
+    u64 first;
+
+    /* Not an inode record: nothing samples it. Without a layout (mount
+     * still building it) bump anyway -- a spare re-read, never a miss. */
+    if (raw_sb) {
+        first = le64_to_cpu(raw_sb->inode_table_start);
+        if (lba < first || lba - first >= le32_to_cpu(raw_sb->inodes_count))
+            return;
+    }
     smp_mb__before_atomic(); /* the write is visible before the bump */
     atomic_inc(cetrafs_rec_epoch_slot(sb, lba));
     smp_mb__after_atomic();
