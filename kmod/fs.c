@@ -4466,7 +4466,7 @@ bool cetrafs_sb_zg_adopt_wait(struct super_block *sb, u32 zg_id)
 
     if (!hb)
         return false;
-    mod_delayed_work(system_long_wq, &hb->maint, 0);
+    mod_delayed_work(system_unbound_wq, &hb->maint, 0); /* the queue heartbeat.c uses */
     cap = (unsigned long) (cetrafs_sb_stale_secs(sb) * 3 + 60) * HZ;
     /* In one-second slices: a fence wakes nobody here. */
     while (test_bit(zg_id, sbi->zg_adopt_wanted)) {
