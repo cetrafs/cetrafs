@@ -180,6 +180,15 @@ This is **whole-file, VMFS-style exclusivity** — not POSIX byte-range
 open for writing," not for many processes sharing fine-grained ranges of
 one file across hosts.
 
+**`fcntl(2)` byte-range locks are not cluster-wide, and are never
+pretended to be.** On a default mount every `fcntl`/OFD lock call fails
+with `ENOLCK` (`cetrafs_posix_lock_refuse()`): granted by the VFS it would
+bind this node only. Under `nofilelock`, or with `-o localposixlocks`, they
+are granted node-local, as on a local filesystem -- for qemu's image
+locking, which refuses to open an image whose locks fail. Either way a
+peer node never sees them; `flock(2)` is the cross-node lock.
+`docs/internal/OPERATIONS.md` has the table and the qemu consequences.
+
 **The claim itself is race-safe cross-node:** the
 read-decide-write that claims or reclaims the lock is bracketed in the same
 compare-and-swap + write-then-verify-readback pattern as every other claim in this

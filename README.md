@@ -42,6 +42,10 @@ per contested claim, the same idea as VMFS's ATS — not over a network.
   `SEEK_HOLE`/`SEEK_DATA` and `FIEMAP`, so thin images stay thin.
 - **Live migration** — the `nofilelock` mount option lets an image be open
   on two nodes during a Proxmox/qemu online-migration handoff, coherently.
+- **Honest locks** — `flock(2)` is a real cross-node lock. `fcntl`/OFD
+  byte-range locks are not cluster-wide: refused with `ENOLCK` on a default
+  mount, granted node-local under `nofilelock` or `-o localposixlocks` (for
+  a stock qemu's image locking; Proxmox's qemu needs neither).
 - **Online maintenance** — in-place defragmentation, a background scrubber
   that reclaims leaked blocks, and an `fsck.cetra` that repairs the
   mechanically-derivable faults and refuses the ambiguous ones.

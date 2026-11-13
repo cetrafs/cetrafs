@@ -320,6 +320,7 @@ bool cetrafs_sb_inode_damaged(struct inode *inode);
 void cetrafs_sb_ino_reborn(struct super_block *sb, u64 ino);
 bool cetrafs_sb_errors_panic(struct super_block *sb);
 bool cetrafs_sb_corruption_stop(struct super_block *sb);
+bool cetrafs_sb_posix_lock_local(struct super_block *sb);
 int cetrafs_read_gate(struct super_block *sb);
 int cetrafs_write_gate(struct inode *inode);
 /* Older uapi headers lack the generic name; ext4, XFS and f2fs used

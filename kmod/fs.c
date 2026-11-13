@@ -517,6 +517,9 @@ struct cetrafs_sb_info {
      * life). See cetrafs_sb_fatal() and cetrafs_sb_corrupt(). */
     bool errors_panic;
     bool corruption_stop;
+    /* localposixlocks: fcntl/OFD locks granted node-local instead of
+     * refused (cetrafs_posix_lock_refuse()). Fixed for the mount's life. */
+    bool posix_lock_local;
     /* Integrity errors seen on this mount (nonzero: the volume needs
      * fsck), and the inode numbers they were found in: every write to
      * one of those is refused until a remount. The SET is in memory
@@ -1553,9 +1556,10 @@ struct cetrafs_fc_info {
     bool corruption_stop; /* corruption=stop */
     bool nodiscard;       /* nodiscard */
     bool inline_discard;  /* discard */
+    bool posix_lock_local; /* localposixlocks */
     /* Which of the above were STATED, rather than defaulted: only a
      * stated option can be "asked for and not in force". */
-    bool file_lock_set, errors_set, corruption_set, nodiscard_set, discard_set;
+    bool file_lock_set, errors_set, corruption_set, nodiscard_set, discard_set, posix_lock_local_set;
     bool filled; /* fill_super ran: a new mount, not a second one of a mounted device */
 };
 
@@ -2638,6 +2642,7 @@ int cetrafs_fill_super(struct super_block *sb, struct fs_context *fc)
 
             sbi->errors_panic = fci ? fci->errors_panic : false;
             sbi->corruption_stop = fci ? fci->corruption_stop : false;
+            sbi->posix_lock_local = fci && fci->posix_lock_local;
             sbi->discard_enabled = !(fci && fci->nodiscard);
 
             /* The operator's REQUESTED mode. May be overridden below by the
@@ -5076,6 +5081,13 @@ bool cetrafs_sb_corruption_stop(struct super_block *sb)
     return sbi && sbi->corruption_stop;
 }
 
+bool cetrafs_sb_posix_lock_local(struct super_block *sb)
+{
+    struct cetrafs_sb_info *sbi = sb->s_fs_info;
+
+    return sbi && sbi->posix_lock_local;
+}
+
 /*
  * FS_IOC_SHUTDOWN, the call `xfs_io -x -c shutdown` and a cluster
  * manager's software fence make: stop this mount now
@@ -7030,7 +7042,7 @@ int cetrafs_flush_dirty_free_counts(struct super_block *sb)
 
 /* ------ mount options ------ */
 
-enum cetrafs_param { Opt_nofilelock, Opt_errors, Opt_corruption, Opt_nodiscard, Opt_discard };
+enum cetrafs_param { Opt_nofilelock, Opt_errors, Opt_corruption, Opt_nodiscard, Opt_discard, Opt_localposixlocks };
 
 /* errors=: what a fatal error does (docs/internal/ERRORS.md, kind 3).
  * There is deliberately no "continue". */
@@ -7061,6 +7073,12 @@ static const struct fs_parameter_spec cetrafs_fs_parameters[] = {
      * starting value of the `inline_discard` control. The last of
      * `discard` and `nodiscard` wins, as on ext4. */
     fsparam_flag("discard", Opt_discard),
+    /* Grant fcntl/OFD byte-range locks on this node only, as a local
+     * filesystem would, instead of refusing them with ENOLCK
+     * (cetrafs_posix_lock_refuse()) -- for a qemu whose image locking
+     * is on. Per node, mount-time only. A nofilelock mount grants them
+     * so anyway. */
+    fsparam_flag("localposixlocks", Opt_localposixlocks),
     {}};
 
 static int cetrafs_parse_param(struct fs_context *fc, struct fs_parameter *param)
@@ -7090,6 +7108,10 @@ static int cetrafs_parse_param(struct fs_context *fc, struct fs_parameter *param
         fci->nodiscard_set = true;
         fci->inline_discard = false;
         fci->discard_set = false;
+        break;
+    case Opt_localposixlocks:
+        fci->posix_lock_local = true;
+        fci->posix_lock_local_set = true;
         break;
     case Opt_discard:
         fci->inline_discard = true;
@@ -7124,6 +7146,8 @@ static bool cetrafs_opts_unmet(const struct cetrafs_fc_info *fci, const struct c
         *what = "nodiscard";
     else if (fci->discard_set && !(READ_ONCE(sbi->discard_enabled) && cetrafs_inline_discard_on(sbi->sb)))
         *what = "discard";
+    else if (fci->posix_lock_local_set && !sbi->posix_lock_local)
+        *what = "localposixlocks";
     else
         return false;
     return true;

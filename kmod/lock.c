@@ -5502,28 +5502,33 @@ static int cetrafs_lock_explicit_release(struct inode *inode, struct file *file)
 }
 
 /*
- * fcntl(2) byte-range locks -- classic POSIX and OFD alike -- are refused.
- * Without this hook the VFS serves them itself, in memory, on this node
- * only: the call succeeds and a process on another node takes the same
- * range a moment later, so the lock looks like protection and is none.
- * The cross-node lock here is flock(2) (cetrafs_flock()); cluster-wide
- * byte ranges are not implemented and will not be
- * (docs/internal/QEMU-LOCKING.md). An unlock is passed to the VFS: with
- * nothing granted it is a no-op, and it keeps close's cleanup exact.
- * tests/kernel/fcntl_lock_refused.sh.
+ * fcntl(2) byte-range locks -- classic POSIX and OFD alike -- are refused
+ * by default. Served by the VFS they live in memory, on this node only:
+ * the call succeeds and a process on another node takes the same range a
+ * moment later, so the lock looks like protection and is none. The
+ * cross-node lock here is flock(2) (cetrafs_flock()); cluster-wide byte
+ * ranges are not implemented and will not be
+ * (docs/internal/QEMU-LOCKING.md).
+ *
+ * Granted node-local, as a local filesystem would, in two cases:
+ *  - nofilelock: the mount has handed cross-node exclusion to the layer
+ *    above (docs/internal/BASICS.md), and a stock qemu's image locking
+ *    -- which fails to open an image when these are refused -- is then
+ *    exactly the node-local guard it is on any other filesystem. Read
+ *    at the call, so a mode inherited from the cluster counts.
+ *  - localposixlocks: the operator asked for the same on a mount with
+ *    the file lock on, so a qemu with locking on still runs; the file
+ *    lock remains the cross-node guard.
+ * An unlock always goes to the VFS: with nothing granted it is a no-op,
+ * and it keeps close's cleanup exact. tests/kernel/fcntl_lock_refused.sh.
  */
-/* TEST ONLY: serve them node-local, as the VFS did with no hook -- the
- * negative control of tests/kernel/fcntl_lock_refused.sh. */
-static bool cetrafs_posix_lock_local;
-cetrafs_test_param(posix_lock_local, cetrafs_posix_lock_local, bool, 0644);
-MODULE_PARM_DESC(posix_lock_local, "TEST ONLY: grant fcntl/OFD locks node-local instead of refusing them");
-
 int cetrafs_posix_lock_refuse(struct file *file, int cmd, struct file_lock *fl)
 {
-    if (READ_ONCE(cetrafs_posix_lock_local) || lock_is_unlock(fl)) {
-        /* test-only (see the knob), and the VFS's unlock at close: what
-         * vfs_lock_file() does with no hook, so a lock granted under the
-         * knob is released whenever its file closes */
+    struct super_block *sb = file_inode(file)->i_sb;
+
+    if (lock_is_unlock(fl) || !cetrafs_sb_file_lock_enabled(sb) || cetrafs_sb_posix_lock_local(sb)) {
+        /* what vfs_lock_file() does with no hook, so a lock granted
+         * here is released whenever its file closes */
         if (cmd == F_GETLK || cmd == F_OFD_GETLK) {
             posix_test_lock(file, fl);
             return 0;
