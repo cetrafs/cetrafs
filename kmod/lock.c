@@ -5159,6 +5159,12 @@ static bool cetrafs_flock_reader_check_fail_once;
 cetrafs_test_param(flock_reader_check_fail_once, cetrafs_flock_reader_check_fail_once, bool, 0644);
 MODULE_PARM_DESC(flock_reader_check_fail_once, "TEST ONLY: the next flock reader check fails with -EIO");
 
+/* TEST ONLY: the explicit claim skips its cache reconcile -- the
+ * negative control of tests/kernel/nofilelock_flock_reconcile.sh. */
+static bool cetrafs_flock_claim_no_reconcile;
+cetrafs_test_param(flock_claim_no_reconcile, cetrafs_flock_claim_no_reconcile, bool, 0644);
+MODULE_PARM_DESC(flock_claim_no_reconcile, "TEST ONLY: flock(LOCK_EX) under nofilelock does not reconcile the cache");
+
 /* TEST ONLY: fail the next give-back of a lock taken for nothing (a
  * flock or defrag claim backing out), as a device error would.
  * tests/kernel/lock_giveback_fails.sh. */
@@ -5353,6 +5359,48 @@ static int cetrafs_lock_explicit_acquire(struct inode *inode, struct file *file)
         if (!ret)
             ret = -EBUSY;
         goto out;
+    }
+
+    /*
+     * The file is ours alone from here, and both cache predicates go back
+     * to trusting what this node has in core. Under nofilelock this fd
+     * was open while a peer -- the migration source -- kept writing, and
+     * a peer that extended the file and stopped left a newer size and
+     * tree on the device. Without this, the first append after the claim
+     * landed at this node's old end of file, over the peer's extension
+     * (tests/kernel/nofilelock_flock_reconcile.sh). Same reconcile as the
+     * default mount's resume (cetrafs_lock_resume()), keyed the same way
+     * on file_seq: a record stamped by us is our own newer state.
+     *
+     * A record that cannot be read or applied reconciles nothing, so the
+     * claim is given back: a blocking LOCK_EX tries again, LOCK_NB sees
+     * EWOULDBLOCK.
+     */
+    if (!READ_ONCE(cetrafs_flock_claim_no_reconcile)) {
+        const u64 claim_gen = cetrafs_le64(raw.generation); /* what the claim was made against */
+
+        cetrafs_invalidate_raw_inode(sb, inode->i_ino);
+        ret = cetrafs_read_raw_inode(sb, inode->i_ino, &raw);
+        if (!ret && cetrafs_le64(raw.generation) != claim_gen)
+            ret = -ESTALE;
+        if (!ret && CETRAFS_FILE_SEQ_NODE(cetrafs_le64(raw.file_seq)) != (u32) (my_node_id & 0xFFFFu)) {
+            cetrafs_tree_invalidate_cached(inode, &raw);
+            ret = cetrafs_apply_raw_to_vfs_inode_sure(inode, &raw);
+        }
+        if (ret) {
+            struct cetrafs_lock_cas_ctx rel = {
+                .my_node_id = my_node_id,
+                .generation = claim_gen,
+                .claim = false,
+            };
+
+            pr_warn("flock: ino=%llu could not take the file as the device has it (%d) -- giving the lock back\n",
+                    (unsigned long long) inode->i_ino, ret);
+            cetrafs_lock_give_back(inode, cetrafs_give_back_cas, &rel, "flock");
+            if (ret == -EBUSY)
+                ret = -ETXTBSY; /* contended apply: a blocking LOCK_EX tries again */
+            goto out;
+        }
     }
 
     ci->explicit_lock_file = file;
