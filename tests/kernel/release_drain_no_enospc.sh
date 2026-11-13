@@ -17,6 +17,14 @@
 #
 # DISCRIMINATION: without the allocator's wait on the release
 # (cetrafs_sb_release_wait()) the write fails with ENOSPC.
+#
+# Part 2: that wait is KILLABLE (class 20). A release can hold it across
+# a Block Group's discard, and a plain down_read() kept a SIGKILLed
+# writer for the whole hold. Staged the same way with a longer hold (the
+# drained Block Group is the only space, so the writer waits for the
+# release); the writer is killed once its stack shows the wait, and
+# must be gone well before the hold ends. Control:
+# release_wait_unkillable=1, the old wait, outlives the kill.
 set -euo pipefail
 . "$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)/lib/harness.sh"
 require_root
@@ -56,6 +64,53 @@ dmesg_since "$MARK" | grep -q "pick_bg failed" &&
     fail "the allocator reported no space during the drain: $(dmesg_since "$MARK" | grep -m1 'pick_bg failed')" ||
     pass "the allocator never reported no space"
 ct_umount "$MNT"
+
+# --------------------------------------------------------- 2: killable
+[ -w /sys/module/cetrafs/parameters/release_wait_unkillable ] || { skip "release_wait_unkillable is missing"; ct_exit; }
+ct_param_set release_wait_unkillable 0
+# <tag>: sets WAITED (the writer reached the release wait) and GONE_MS
+# (how long after SIGKILL it was gone)
+killed_wait() {
+    local w t0 i
+    ct_mkfs "$DEV" -z 1 -b 512 -J 0 -N 1024 -f >/dev/null
+    "$BG_POKE" "$DEV" 0 0 sync-zg >/dev/null
+    "$BG_POKE" "$DEV" 0 0 fill-bitmap >/dev/null
+    ct_mount "$DEV" "$MNT"
+    require_cetrafs_mount "$MNT"
+    MARK="$(dmesg_mark)"
+    ct_param_set bg_release_drain_stall_ms 15000
+    HELD=""
+    for _ in $(seq 1 20); do
+        dmesg_since "$MARK" | grep -q "BG 1 release: drained, pausing" && { HELD=1; break; }
+        sleep 0.5
+    done
+    [ -n "$HELD" ] || { fail "$1: setup: no release drained Block Group 1"; ct_param_set bg_release_drain_stall_ms 0; ct_exit; }
+    dd if=/dev/zero of="$MNT/k" bs=64k count=16 conv=fsync status=none 2>/dev/null &
+    w=$!
+    WAITED=""
+    for _ in $(seq 1 40); do
+        grep -q cetrafs_sb_release_wait "/proc/$w/stack" 2>/dev/null && { WAITED=1; break; }
+        sleep 0.1
+    done
+    t0=$(date +%s%N)
+    kill -9 "$w" 2>/dev/null || true
+    for i in $(seq 1 200); do kill -0 "$w" 2>/dev/null || break; sleep 0.1; done
+    GONE_MS=$((($(date +%s%N) - t0) / 1000000))
+    wait "$w" 2>/dev/null || true
+    ct_param_set bg_release_drain_stall_ms 0
+    ct_umount "$MNT"
+    log "$1: the writer reached the release wait: ${WAITED:-no}; gone ${GONE_MS} ms after SIGKILL"
+}
+ct_param_set release_wait_unkillable 1
+killed_wait control
+ct_param_set release_wait_unkillable 0
+[ -n "$WAITED" ] || { fail "control: setup: the writer never waited for the release"; ct_exit; }
+[ "$GONE_MS" -ge 5000 ] && pass "control: the old wait kept the killed writer ${GONE_MS} ms" ||
+    fail "control: the killed writer was gone in ${GONE_MS} ms -- the suite cannot tell the two apart"
+killed_wait fix
+[ -n "$WAITED" ] || { fail "2: setup: the writer never waited for the release"; ct_exit; }
+[ "$GONE_MS" -lt 3000 ] && pass "2: a killed writer waiting for a release was gone in ${GONE_MS} ms" ||
+    fail "2: a killed writer waiting for a release took ${GONE_MS} ms to go"
 OUT="$(ct_fsck "$DEV" 2>&1 || true)"
 grep -E '^ERR' <<<"$OUT" | grep -qE 'aggregate|pool|referenced' &&
     fail "fsck: $(grep -E '^ERR' <<<"$OUT" | grep -E 'aggregate|pool|referenced' | head -2)" ||

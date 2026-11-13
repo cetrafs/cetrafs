@@ -4443,11 +4443,29 @@ void cetrafs_sb_release_unlock(struct super_block *sb)
     up_write(&((struct cetrafs_sb_info *) sb->s_fs_info)->release_rwsem);
 }
 
+/* TEST ONLY: the allocator's wait for a release is the old plain
+ * down_read(), which SIGKILL cannot end (release_drain_no_enospc.sh's
+ * control). */
+static bool cetrafs_release_wait_unkillable;
+cetrafs_test_param(release_wait_unkillable, cetrafs_release_wait_unkillable, bool, 0644);
+MODULE_PARM_DESC(release_wait_unkillable, "TEST ONLY: the allocator waits for a release uninterruptibly (the old wait)");
+
 void cetrafs_sb_release_wait(struct super_block *sb)
 {
     struct cetrafs_sb_info *sbi = sb->s_fs_info;
 
-    down_read(&sbi->release_rwsem);
+    if (READ_ONCE(cetrafs_release_wait_unkillable)) {
+        down_read(&sbi->release_rwsem); /* test-only; see the parameter */
+        up_read(&sbi->release_rwsem);
+        return;
+    }
+
+    /* Killable (class 20): a release pass can hold this across a Block
+     * Group's discard, a second or more, and the waiter is a writer about
+     * to answer ENOSPC. A killed one has nobody to answer: it skips the
+     * wait, and its allocation ends as it would have without one. */
+    if (down_read_killable(&sbi->release_rwsem))
+        return;
     up_read(&sbi->release_rwsem);
 }
 
