@@ -26,7 +26,7 @@ make check
 ```
 
 That is the gate. It runs every suite under `tests/image/` and
-`tests/kernel/` -- **536 suites, about 4,400 individual assertions** --
+`tests/kernel/` -- **558 suites, about 4,400 individual assertions** --
 against a loop-backed volume, and exits nonzero if any assertion fails
 OR if any suite aborts without failing one. Nothing ships on a red gate.
 
@@ -57,7 +57,7 @@ df -Pm /                                       # confirm the floor
 
 ### `tests/image/` -- the tools, with no kernel involved
 
-45 suites. No module is loaded and nothing is mounted: `mkfs.cetra`
+46 suites. No module is loaded and nothing is mounted: `mkfs.cetra`
 writes the structures, a poke helper corrupts exactly one of them, and
 `fsck.cetra` must report *that* fault and exit nonzero.
 
@@ -75,7 +75,7 @@ unbounded is still the bug.
 
 ### `tests/kernel/` -- the regression suite proper
 
-491 suites, one concern each, against a loaded module and a real mount.
+512 suites, one concern each, against a loaded module and a real mount.
 Roughly by area:
 
 | area | what it covers |
@@ -85,7 +85,7 @@ Roughly by area:
 | file / extent / punch | the extent tree at depth 0/1/2, truncate, hole punch, sparse files, `fiemap`/`SEEK` |
 | addresses read off the disk | an extent whose physical block names the inode table is refused before anything maps it -- the checksum cannot catch it (the record is restamped and merely says something impossible), and following it made an ordinary `write(2)` destroy the global tables |
 | O_DIRECT | a write into a hole or preallocated space stays direct (no fallback to the page cache, queue depth kept, converted on completion), the sub-block zeroing, and punches beside in-flight writes; on a dm-delay device (`ct_delay_dev`), since a loop device makes serialised I/O cost nothing |
-| mmap | allocation at fault time (so `-ENOSPC` reaches the storing process as SIGBUS), and the exclusion between a fault and punch/truncate/`write(2)` -- a fault takes no `inode_lock` and never can |
+| mmap | allocation at fault time (so `-ENOSPC` reaches the storing process as SIGBUS), and the exclusion between a fault and punch/truncate/`write(2)` -- a fault takes no `inode_lock` and never can; and content: coherency with `write(2)`, stores racing a shrinking truncate, `msync` beside a write to the same page, stores into preallocated space |
 | vfs conformance | the answers userspace reads: `EISDIR` on reading a directory, a nonzero `f_fsid`, `FIEMAP_EXTENT_UNWRITTEN` on preallocated ranges, a root inode that must be a directory |
 | controls / procfs | the writable knobs, including the timing pair that constrains itself |
 | alloc / bg / zg | allocation, Block Group and Zone Group ownership, free accounting |
@@ -94,6 +94,9 @@ Roughly by area:
 | scrub / defrag | the background reclaim and the online defragmenter |
 | growfs | growing a volume offline, and live (`grow_live*`): the publish, a node catching up with a grow it did not make (staged with `grow_skip_local_publish`; the real peer is ctest's `grow-live`), the crash points between a live grow's writes, racing growers and an unclaimed publish, a node whose device is behind the grow (`grow_live_behind`), journal replay into new Block Groups (`grow_live_replay`), and a grow landing during a mount (`grow_mid_mount`) |
 | xattr | `user.*` / `trusted.*` / `security.*` and LSM labelling |
+| refresh | a record refresh racing this node's own publishes (`refresh_*`): a read superseded by a local publish is never applied over it |
+| ENOSPC / large offsets | each allocating path filled until it refuses (`enospc_deliberate`, `defrag_enospc_full`), and the block-number boundaries at 2^31 and 2^32 up to the 16 TiB ceiling (`large_offset_sweep`) |
+| randomized data and namespace | `fsx_model.sh`: a seeded stream of buffered, mapped, O_DIRECT, truncate, fallocate and punch/zero-range ops against an in-memory model, with a remount compare. `fsstress_namespace.sh`: several processes of seeded namespace churn (links, renames over and across directories, rmdir, xattrs) with a per-process model, then fsck. `fio_verified_io.sh`: fio's crc32c verify over a 1 GiB sparse file, buffered and O_DIRECT jobs at once, re-read after a remount. Each has a negative control that corrupts the model, or one block on the device, and requires the failure |
 
 ---
 
@@ -232,7 +235,15 @@ hardware the gate cannot assume.
 
 **`make soak`** (`tests/stress/`) -- mixed-workload hammering with a
 full `fsck` after every round, plus a scrub-versus-allocator race and a
-sparse-bigfile exercise.
+sparse-bigfile exercise. It runs unattended: `SOAK_MAX_SECS` bounds it,
+a per-round report is written, and the exit status is nonzero on any
+anomalous or aborted round. Scheduling it is left to the operator
+(`tests/README.md`, "Unattended soak").
+
+**`make -C tests matrix`** (`tests/matrix.sh`) -- a slice of the kernel
+suites under `nofilelock`, under 1 GiB Block Groups, under four Zone Groups
+and under an 8 MiB journal. It exists to show that the suites which mean
+something under those configurations still pass there.
 
 **`tests/crash/`** -- crash consistency for real: `dm-log-writes` records
 every write, `dm-flakey` cuts the device at an arbitrary point, and the

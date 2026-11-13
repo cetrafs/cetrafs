@@ -161,7 +161,7 @@ and at least one of them has to run before a layer is called clean.
 ## Confidence bar
 
 cetrafs is from-scratch: heavily reviewed + tested (about 4,400 single-node asserts
-across 536 suites, ~67 multi-node ctest scenarios on two rigs, fuzzing, a
+across 558 suites, ~67 multi-node ctest scenarios on two rigs, fuzzing, a
 crash rig, and a randomized content oracle whose seeded replays caught
 microsecond-window corruption races at one-in-millions per-operation odds
 -- see docs/TEST-SUITES.md) but NOT production-aged like VMFS/ext4.

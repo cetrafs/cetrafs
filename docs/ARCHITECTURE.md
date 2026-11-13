@@ -137,7 +137,7 @@ and must be accessed through `cetrafs_le*()`/`cetrafs_cpu_to_le*()`; see
 | Field | Type | Meaning |
 |---|---|---|
 | magic | `__le32` | `0xC4553770` |
-| version | `__le16` | `CETRAFS_VERSION` — currently `0x0009`; bumped freely, never migrated. `CETRAFS_VERSION_MIN` equals `CETRAFS_VERSION` as of 0.9.2: the 0x0008..0x0009 compatibility window that let a 0.8.x volume be grown in place is closed, and only the current format mounts. `growfs` stamps 0x0009 on any grown volume |
+| version | `__le16` | `CETRAFS_VERSION` — currently `0x000A`; bumped freely, never migrated. `CETRAFS_VERSION_MIN` equals `CETRAFS_VERSION` as of 0.9.2: the 0x0008..0x0009 compatibility window that let a 0.8.x volume be grown in place is closed, and only the current format mounts. `growfs` stamps `CETRAFS_VERSION` on any grown volume |
 | sb_bytes | `__le16` | `sizeof(superblock)`, sanity check |
 | block_size | `__le32` | fixed 4096 |
 | total_blocks | `__le64` | device size in blocks |
