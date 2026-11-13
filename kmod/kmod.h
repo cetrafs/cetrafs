@@ -1225,6 +1225,8 @@ u64 cetrafs_bg_geom_read_count(void);
 u64 cetrafs_pf_drain_count(void);
 u64 cetrafs_giveback_block_count(void);
 u64 cetrafs_convert_leaf_full_count(void);
+u64 cetrafs_leaf_split_count(void);
+u64 cetrafs_tree_any_leaf_count(void);
 u64 cetrafs_zero_inplace_block_count(void);
 u64 cetrafs_tree_block_count(void);
 u64 cetrafs_tree_read_count(void);

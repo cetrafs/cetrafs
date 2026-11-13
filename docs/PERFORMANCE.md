@@ -517,6 +517,38 @@ volume's blocks per drain stay ~2 per owned ZG and its sweeps 0);
 `tests/kernel/pf_stale_copy_later_drain.sh` (correctness). Neither
 measures time -- a loop device serves the reads from the page cache.
 
+## 18. A full extent leaf is split by range, never appended past
+
+Random writes into a preallocated image split an uninit extent on
+every write. Once the leaf holding the preallocation is full, a convert
+that cannot fit its leaf must SPLIT it by logical range
+(`cetrafs_tree_split_leaf()`): the lower half of its entries moves to a
+new leaf and both get the exact range they hold. Appending the moved
+pieces to the tree's last leaf instead -- what it used to do -- gave
+every leaf filled that way a range spanning the file, and a lookup read
+about half the leaves. And a depth-2 lookup finds its candidate leaves
+in an interior under ONE hold of its buffer lock, not one per entry.
+
+Measured on a loop device (4 GiB fallocated file, 4k random O_DIRECT
+writes, qd16, fdatasync every 32): `cetrafs_tree_lookup()` 94 us -> 3.9
+us per call, tree reads per mapped write 23 -> ~6, 1854 -> 5314 IOPS.
+Before the journal batch change (d823296) the same run did 1290.
+
+**Guarded by:** `tests/kernel/prealloc_random_lookup.sh` (tree reads
+per lookup after random writes into a fallocated file; control
+`leaf_split_off` restores the append) and procfs `leaf_splits` /
+`convert_leaf_full` (the second should stay small next to the first).
+
+A split leaves both halves part full, so on its own it would bring a
+fragmented image to the tree's limit (four interiors) with fewer
+extents than an append-only tree, which fills every leaf. At that limit
+the append fills ANY leaf with a free slot instead
+(`cetrafs_tree_insert_any_leaf()`, procfs `tree_any_leaf_inserts`),
+giving it an unknown range: capacity is at least the append-only
+tree's, and only lookups past the limit pay for it.
+`tests/kernel/tree_full_any_leaf.sh` measures it on a capped tree
+(control `tree_any_leaf_off`).
+
 ## Measured baseline
 
 On the reference hardware -- an enterprise FC array over 32GFC multipath (two

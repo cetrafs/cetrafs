@@ -45,6 +45,11 @@ DEV="$(ct_loop "$IMG")"
 MNT="$(ct_mnt cvsplit)"
 ct_track mnt "$MNT"
 ct_param_set convert_flush_always 0
+# This suite is about the APPEND a full leaf's convert falls back to; a
+# full leaf is split by range first now (cetrafs_tree_split_leaf(),
+# prealloc_random_lookup.sh), so the fallback is reached only with the
+# split off.
+ct_param_set leaf_split_off 1
 ct_param_set journal_slots_max 0
 ct_param_set journal_batch_crash_before_targets 0
 info() { sed -n "s/^$1: //p" "$(ct_procdir "$DEV")/info"; }
