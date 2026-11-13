@@ -41,7 +41,19 @@ ct_track mnt "$MNT"
 ct_param_set journal_batch_eintr 0
 ct_param_set journal_batch_noslot_ms 0
 ct_param_set hb_interval_secs 30
-mode_of() { "$LPOKE" "$DEV" "$1" | sed -n 's/.*mode=\([0-9]*\).*/\1/p'; }
+# What a close that kept the file "in use" leaves on the device: the
+# write lock on a default mount, the presence bit under nofilelock (no
+# lock is taken there; a close whose publish failed keeps the bit --
+# close_presence_after_publish.sh). 1 held, 0 gone.
+mode_of() {
+    local d
+    d="$("$LPOKE" "$DEV" "$1")"
+    if ct_nofilelock_run; then
+        case "$d" in *"readers=0x0 "* | *"readers=0x0") echo 0 ;; *readers=0x*) echo 1 ;; esac
+    else
+        sed -n 's/.*mode=\([0-9]*\).*/\1/p' <<<"$d"
+    fi
+}
 
 # <tag>: sets HELD (lock mode once slots were free), NOTDUR, LOST
 run() {

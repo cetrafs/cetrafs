@@ -20,6 +20,7 @@ set -euo pipefail
 . "$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)/lib/harness.sh"
 require_root
 require_module
+require_file_lock_mode "the write-open's claim; nofilelock takes the file exclusive with LOCK_EX (nofilelock_flock_reconcile.sh)"
 [ -w /sys/module/cetrafs/parameters/lock_claim_gap_ms ] || { skip "lock_claim_gap_ms is missing"; ct_exit; }
 POKE="$(ct_helper inode_block_poke)"
 

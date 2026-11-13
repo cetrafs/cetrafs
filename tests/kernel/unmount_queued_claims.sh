@@ -36,8 +36,18 @@ require_cetrafs_mount "$MNT"
 NID="$(sed -n 's/^this_node_id: //p' "$(ct_procdir "$DEV")/info")"
 echo a >"$MNT/a"; sync
 INO="$(stat -c %i "$MNT/a")"
+# Under nofilelock the writer above holds a presence bit of its own, and
+# its release can trail the sync. The read close below must be the one
+# that withdraws, so the writer's bit goes first.
+for _ in $(seq 1 50); do grep -q 'readers=0x0$' <<<"$("$LOCK_POKE" "$IMG" "$INO")" && break; sleep 0.1; done
+grep -q 'readers=0x0$' <<<"$("$LOCK_POKE" "$IMG" "$INO")" ||
+    { fail "setup: the writer's presence never went ($("$LOCK_POKE" "$IMG" "$INO"))"; ct_exit; }
 
 MARK="$(dmesg_mark)"
+# Registered with the harness before the python arms it behind its back,
+# so a run that never consumes it still restores it (it once leaked
+# presence_withdraw_fail=1 into the next suite).
+ct_param_set presence_withdraw_fail 0
 python3 - "$MNT/a" <<'PY'
 import os, sys
 fd = os.open(sys.argv[1], os.O_RDONLY)

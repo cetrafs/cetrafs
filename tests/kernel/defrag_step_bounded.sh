@@ -25,6 +25,7 @@ set -euo pipefail
 . "$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)/lib/harness.sh"
 require_root
 require_module
+require_file_lock_mode "defrag, which nofilelock refuses (no lock to pin)"
 command -v filefrag >/dev/null || { skip "filefrag is not installed"; ct_exit; }
 
 DEV="$(ct_dev 560 defragstep)"

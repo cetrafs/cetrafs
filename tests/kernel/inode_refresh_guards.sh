@@ -103,6 +103,11 @@ log "checking iget's cache hit reports a refused refresh instead of serving the 
 # DISCRIMINATION (measured on the unfixed code): the second name stats
 # as the old regular file while the kernel logs the refusal.
 ct_mount "$DEV" "$MNT"
+# Under nofilelock the open fd below is a local open with no peer, which
+# is trusted without a refresh (cetrafs_lock_identity_cache_trusted() --
+# this node's presence bit keeps the number from being reused). The
+# cache hit refreshes there once a peer has the file open too: staged.
+ct_nofilelock_run && ct_param_set force_foreign_opener 1
 echo hello >"$MNT/hl_a"
 ln "$MNT/hl_a" "$MNT/hl_b"
 HINO="$(stat -c '%i' "$MNT/hl_a")"
@@ -114,6 +119,7 @@ MARK3="$(dmesg_mark)"
 rc=0
 BTYPE="$(stat -c '%F' "$MNT/hl_b" 2>&1)" || rc=$?
 exec 7<&-
+ct_nofilelock_run && ct_param_set force_foreign_opener 0
 if dmesg_since "$MARK3" | grep -q "refusing a refresh that would change its type"; then
     pass "iget cache hit: setup -- the lookup reached a refresh that refused the record"
 else

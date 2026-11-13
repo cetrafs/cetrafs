@@ -174,6 +174,9 @@ FREE1="$(stat -f -c %f "$MNT")"
     fail "depth-2 unlink leaked $((FREE0 - FREE1)) blocks ($FREE0 -> $FREE1)"
 
 log "defrag collapses a DENSE depth-2 file back to one extent"
+if ct_nofilelock_run; then
+    skip "defrag collapse: nofilelock refuses defrag (no lock to pin)"
+else
 # defrag only touches DENSE files (logically contiguous, scattered
 # physically). Build one by interleaving two files block-by-block so A's
 # 400 blocks are physically every-other but logically 0..399 -- depth 2,
@@ -228,6 +231,7 @@ ct_fsck "$DEV" >/dev/null 2>&1 && pass "fsck clean after defrag" ||
     fail "fsck: $(ct_fsck "$DEV" 2>&1 | grep -iE 'err|warn' | head -3)"
 ct_mount "$DEV" "$MNT"
 require_cetrafs_mount "$MNT"
+fi
 
 ct_umount "$MNT"
 ct_fsck "$DEV" >/dev/null 2>&1 && pass "fsck clean at end" ||

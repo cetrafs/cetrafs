@@ -29,6 +29,7 @@ set -euo pipefail
 . "$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)/lib/harness.sh"
 require_root
 require_module
+ct_mode_own # mounts each mode itself, per case
 [ -w /sys/module/cetrafs/parameters/close_publish_fail ] || { skip "close_publish_fail is missing"; ct_exit; }
 LOCK_POKE="$(ct_helper inode_lock_poke)"
 KNOB=/sys/module/cetrafs/parameters/close_publish_fail

@@ -16,6 +16,7 @@ set -euo pipefail
 . "$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)/lib/harness.sh"
 require_root
 require_module
+require_file_lock_mode "the automatic write-open lock"
 INODE_LOCK_POKE="$(ct_helper inode_lock_poke)"
 NODE_POKE="$(ct_helper node_poke)"
 

@@ -91,8 +91,14 @@ grep -q "owner=1 mode=1" <<<"$L" && pass "lock: the lock is the holder's again (
 RC="$(reattach_during '"$LPOKE" "$IMG" "$I_READ" --reader 1' python3 -c 'import os,sys; os.close(os.open(sys.argv[1], os.O_RDWR))' "$MNT/readf")"
 L="$(lockf "$I_READ")"
 log "reader: open rc=$RC; $L"
+# Refusing a writer past a live reader is the access rule, which
+# nofilelock drops; what must hold in both modes is the bit below.
+if ct_nofilelock_run; then
+    skip "reader: under nofilelock a write-open goes ahead past a live reader by design"
+else
 [ "$RC" != 0 ] && pass "reader: the write-open was refused -- a live reader came back" ||
     fail "reader: the write-open succeeded past a reader that re-attached during the reclaim"
+fi
 grep -q "readers=0x2" <<<"$L" && pass "reader: its bit is set again ($L)" ||
     fail "reader: the re-attached reader's bit was cleared: $L"
 

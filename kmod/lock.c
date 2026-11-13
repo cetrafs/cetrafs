@@ -2084,10 +2084,17 @@ static void cetrafs_lock_presence_withdraw(struct inode *inode)
     if (!ret)
         ret = cetrafs_read_raw_inode(sb, inode->i_ino, &raw);
     if (!ret && READ_ONCE(cetrafs_presence_withdraw_fail)) {
-        WRITE_ONCE(cetrafs_presence_withdraw_fail, cetrafs_presence_withdraw_fail - 1);
-        ret = -EIO; /* test-only */
+        /* One failure per withdraw, exactly: a close and the heartbeat's
+         * retry can both be here, and a plain decrement lost one of them
+         * (release_queue_full.sh counts the knob). */
+        unsigned int v = READ_ONCE(cetrafs_presence_withdraw_fail);
+
+        while (v && cmpxchg(&cetrafs_presence_withdraw_fail, v, v - 1) != v)
+            v = READ_ONCE(cetrafs_presence_withdraw_fail);
+        if (v)
+            ret = -EIO; /* test-only */
     }
-    else if (!ret) {
+    if (!ret) {
         struct cetrafs_lock_cas_ctx rctx = {
             .my_node_id = my_node_id,
             .generation = cetrafs_le64(raw.generation),
@@ -2512,7 +2519,10 @@ reread:
             .steal_from = stale_owner,
             .steal_incarnation = stale_incarnation,
         };
-        int cret = cetrafs_lock_cas(inode, &cctx, &raw);
+        int cret;
+
+        cetrafs_node_test_stall_before_swap(); /* the same staging point as the claim's */
+        cret = cetrafs_lock_cas(inode, &cctx, &raw);
 
         if (cret < 0)
             pr_warn_ratelimited("lock: ino=%llu could not clear stale foreign lock from node %u: %d\n",

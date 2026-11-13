@@ -23,6 +23,7 @@ set -euo pipefail
 . "$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)/lib/harness.sh"
 require_root
 require_module
+require_file_lock_mode "the automatic lock's clear after defrag and at close (nofilelock's flock clear: flock_clear_fails.sh)"
 for k in defrag_clear_fail_once lock_clear_fail_once; do
     [ -w "/sys/module/cetrafs/parameters/$k" ] || { skip "$k is missing"; ct_exit; }
 done

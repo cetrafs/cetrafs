@@ -19,6 +19,7 @@ set -euo pipefail
 . "$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)/lib/harness.sh"
 require_root
 require_module
+require_file_lock_mode "defrag, which nofilelock refuses (no lock to pin)"
 [ -w /sys/module/cetrafs/parameters/defrag_damage_ino ] || { skip "defrag_damage_ino is missing"; ct_exit; }
 ct_param_set alloc_run_blocks 0
 IPOKE="$(ct_helper inode_block_poke)"

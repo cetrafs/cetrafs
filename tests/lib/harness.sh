@@ -148,6 +148,12 @@ ct_cleanup() {
     # environmental abort cascaded into unrelated failures and made the
     # whole gate read as flaky.
     ct_param_restore_all 2>/dev/null
+    # A suite that bails out (a setup failure's ct_exit) while it still
+    # holds a descriptor on a mounted file -- the `exec 8<"$MNT/f"`
+    # pattern -- keeps that mount busy: every umount below failed and the
+    # mount and its loop device outlived the suite. The harness opens no
+    # numbered descriptors of its own, so close 3..9 here.
+    exec 3>&- 4>&- 5>&- 6>&- 7>&- 8>&- 9>&-
     local kind path
     # Mounts first, then the loop devices under them, then the module,
     # then directories, then files -- each category in reverse order of
@@ -712,6 +718,30 @@ ct_mount() {
     ct_track mnt "$2"
 }
 ct_umount() { umount "$1"; }
+
+# The run's mount mode. CT_MOUNT_OPTS=nofilelock (the matrix's, or a whole
+# gate run under it) turns the cluster file lock off on every ct_mount --
+# and with it everything built on the lock: the automatic write-open
+# claim, the LOCK_UN suspend and LOCK_EX resume handoff, the defragmenter
+# (cetrafs_lock_defrag_begin() refuses without a lock to pin).
+ct_nofilelock_run() {
+    case ",${CT_MOUNT_OPTS:-}," in *,nofilelock,*) return 0 ;; esac
+    return 1
+}
+# require_file_lock_mode <what needs it>: a suite whose premise is the
+# default mount's file lock skips under nofilelock, naming that premise.
+# Only for behaviour that does not EXIST in that mode: a hazard the mode
+# has by another path is tested by that path (e.g.
+# nofilelock_flock_reconcile.sh beside lock_resume_reconcile.sh).
+require_file_lock_mode() {
+    ct_nofilelock_run || return 0
+    skip "needs the default file-lock mode under CT_MOUNT_OPTS=$CT_MOUNT_OPTS: $*"
+    ct_exit
+}
+# ct_mode_own: a suite that sets the mount mode itself, per mount (it
+# compares the two, or one is its subject) -- CT_MOUNT_OPTS would turn its
+# default-mode mounts into nofilelock ones.
+ct_mode_own() { CT_MOUNT_OPTS=""; }
 
 # The standard small test volume: one ZG, one 512 MiB BG, no journal,
 # 1024 inodes. Most suites want exactly this.

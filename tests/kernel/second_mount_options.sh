@@ -20,6 +20,7 @@ set -euo pipefail
 . "$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)/lib/harness.sh"
 require_root
 require_module
+ct_mode_own # compares the mount modes itself, per mount
 [ -w /sys/module/cetrafs/parameters/fill_fail_peers_alloc ] || { skip "fill_fail_peers_alloc is missing"; ct_exit; }
 
 DEV="$(ct_dev 560 secmnt)"

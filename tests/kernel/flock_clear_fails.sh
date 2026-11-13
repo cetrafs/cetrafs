@@ -23,6 +23,9 @@ set -euo pipefail
 require_root
 require_module
 [ -w /sys/module/cetrafs/parameters/flock_clear_fail_once ] || { skip "flock_clear_fail_once is missing"; ct_exit; }
+# Armed by the python below straight through sysfs; registered here so
+# one a round never consumes is restored, not leaked to the next suite.
+ct_param_set flock_clear_fail_once N
 LOCK_POKE="$(ct_helper inode_lock_poke)"
 
 DEV="$(ct_dev 560 flockclr)"

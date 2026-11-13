@@ -21,6 +21,7 @@ set -euo pipefail
 . "$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)/lib/harness.sh"
 require_root
 require_module
+ct_mode_own # mounts nofilelock itself for its first half, default for the second
 command -v setpriv >/dev/null || { skip "needs setpriv (util-linux)"; ct_exit; }
 LOCK_POKE="$(ct_helper inode_lock_poke)"
 

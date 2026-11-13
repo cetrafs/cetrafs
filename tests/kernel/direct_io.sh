@@ -113,11 +113,21 @@ print("during:" + lock())
 os.close(fd)
 print("after:" + lock())
 ' "$MNT" "$LOCK_POKE" "$IMG" "$INO")"
+if ct_nofilelock_run; then
+    # No lock is claimed under nofilelock; the open is marked by this
+    # node's presence bit instead, which is what peers ask.
+    echo "$OUT" | grep -q "^during:owner=[0-9]* mode=0 .*readers=0x[1-9a-f]" &&
+        pass "nofilelock: an O_DIRECT write-open publishes its presence, no lock" ||
+        fail "nofilelock: the O_DIRECT open is not marked as present: $(echo "$OUT" | grep during)"
+    echo "$OUT" | grep -q "^after:.*readers=0x0$" && pass "nofilelock: and its close withdraws it" ||
+        fail "nofilelock: the presence bit survived the close: $(echo "$OUT" | grep after)"
+else
 echo "$OUT" | grep -q "^during:owner=0 mode=1" &&
     pass "an O_DIRECT write-open claims the file, exactly as a buffered one does" ||
     fail "the lock was not claimed: $(echo "$OUT" | grep during)"
 echo "$OUT" | grep -q "^after:owner=65535" && pass "and its close releases it" ||
     fail "the lock survived the close: $(echo "$OUT" | grep after)"
+fi
 
 log "buffered and direct access to one file agree"
 OUT="$(python3 -c "$PRE"'

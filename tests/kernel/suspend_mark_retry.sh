@@ -19,6 +19,7 @@ set -euo pipefail
 . "$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)/lib/harness.sh"
 require_root
 require_module
+require_file_lock_mode "the default mount's LOCK_UN suspend and its suspended-writer mark"
 command -v flock >/dev/null || { skip "flock(1) not installed"; ct_exit; }
 [ -w /sys/module/cetrafs/parameters/suspend_unmark_fail_once ] || { skip "suspend_unmark_fail_once is missing"; ct_exit; }
 LPOKE="$(ct_helper inode_lock_poke)"
@@ -37,14 +38,18 @@ sw() { "$LPOKE" "$IMG" --sw "$INO"; }
 
 exec 8<"$MNT/f"            # a local reader: keeps the presence bit
 exec 9>>"$MNT/f"           # the writer
-flock -u 9 || { fail "setup: flock(LOCK_UN) failed"; ct_exit; }
-grep -q "suspended=0x0 " <<<"$(sw)" && { fail "setup: the suspend set no mark ($(sw))"; ct_exit; }
+# A setup failure must let go of the mount before exiting: with these
+# fds open the cleanup's unmount is busy, and the mount and its loop
+# device outlived the suite (seen under a nofilelock gate).
+bail() { fail "$1"; exec 9>&- 8<&-; ct_exit; }
+flock -u 9 || bail "setup: flock(LOCK_UN) failed"
+grep -q "suspended=0x0 " <<<"$(sw)" && bail "setup: the suspend set no mark ($(sw))"
 pass "setup: suspended ($(sw))"
 
 ct_param_set suspend_unmark_fail_once 1
 flock -x 9 || fail "resume: flock(LOCK_EX) failed"
 log "right after the resume: $(sw)"
-grep -q "suspended=0x0 " <<<"$(sw)" && { fail "setup: the clear did not fail -- nothing to retry"; ct_exit; }
+grep -q "suspended=0x0 " <<<"$(sw)" && bail "setup: the clear did not fail -- nothing to retry"
 pass "setup: the resume's clear failed, the mark is still set"
 
 OK=0

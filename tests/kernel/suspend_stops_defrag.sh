@@ -19,6 +19,7 @@ set -euo pipefail
 . "$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)/lib/harness.sh"
 require_root
 require_module
+require_file_lock_mode "a lock suspend against a defrag pass; nofilelock has neither"
 for p in defrag_step_delay_ms defrag_ignore_yield; do
     [ -w "/sys/module/cetrafs/parameters/$p" ] || { skip "$p is missing"; ct_exit; }
 done

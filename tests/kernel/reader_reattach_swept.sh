@@ -25,6 +25,7 @@ set -euo pipefail
 . "$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)/lib/harness.sh"
 require_root
 require_module
+require_file_lock_mode "the write-open's reader check, which sweeps a stale reader's bit; nofilelock makes no reader check"
 [ -w /sys/module/cetrafs/parameters/reclaim_stall_before_swap_ms ] || { skip "reclaim_stall_before_swap_ms is missing"; ct_exit; }
 NPOKE="$(ct_helper node_poke)"
 LPOKE="$(ct_helper inode_lock_poke)"

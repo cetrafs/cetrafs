@@ -50,7 +50,18 @@ sync
 FINO="$(stat -c %i "$MNT/F")"
 "$IPOKE" "$BACK" extents "$FINO" | grep -q '^leaf=' && pass "setup: F's extent map has spilled into a leaf" ||
     { fail "setup: F is still depth 0 -- there is no tree to flush"; ct_exit; }
-lockmode() { "$LOCK_POKE" "$DEV" "$FINO" | sed -n 's/.* mode=\([0-9]*\).*/\1/p'; }
+# 1 while the file is still marked in use, 0 once let go: the write lock
+# on a default mount, the presence bit under nofilelock (which takes no
+# lock -- the bit is what tells a peer the file is open and changing).
+lockmode() {
+    local d
+    d="$("$LOCK_POKE" "$DEV" "$FINO")"
+    if ct_nofilelock_run; then
+        case "$d" in *"readers=0x0") echo 0 ;; *readers=0x*) echo 1 ;; esac
+    else
+        sed -n 's/.* mode=\([0-9]*\).*/\1/p' <<<"$d"
+    fi
+}
 
 log "close"
 MARK="$(dmesg_mark)"

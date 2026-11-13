@@ -17,6 +17,7 @@ set -euo pipefail
 . "$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)/lib/harness.sh"
 require_root
 require_module
+require_file_lock_mode "defrag, which nofilelock refuses (no lock to pin)"
 [ -w /sys/module/cetrafs/parameters/defrag_step_delay_ms ] || { skip "defrag_step_delay_ms is missing"; ct_exit; }
 
 IMG="$(ct_image 560 dfkill)"

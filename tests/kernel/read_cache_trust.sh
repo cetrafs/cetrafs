@@ -22,6 +22,14 @@
 #      (read_trust_ignore_stamp)
 #   4. defrag refuses a file a live peer has open for read
 #      (defrag_ignore_readers)
+#
+# Under nofilelock (CT_MOUNT_OPTS) a reader's trust is not this
+# predicate's reader branch but the presence gate's
+# (cetrafs_lock_held_for_write_locally()): sole opener cached, a peer
+# present fresh -- nofilelock_coherency.sh, with force_foreign_opener as
+# its control -- so 1 and 2 are skipped there. 3 runs, its control
+# file_seq_ignore (the stamp the presence gate notes). 4 needs defrag,
+# which nofilelock refuses.
 set -euo pipefail
 . "$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)/lib/harness.sh"
 require_root
@@ -58,6 +66,9 @@ reads_for() {
 
 # ---------------------------------------------------------------- 1
 log "1. a read-only sequential read does not re-read the record per page"
+if ct_nofilelock_run; then
+    skip "1: under nofilelock a reader's trust is the presence gate's (nofilelock_coherency.sh)"
+else
 truncate -s 64M "$MNT/sparse"
 printf 'HEAD' | dd of="$MNT/sparse" conv=notrunc status=none
 dd if=/dev/urandom of="$MNT/data" bs=1M count=32 status=none
@@ -81,6 +92,7 @@ log "device reads: sparse $N_SPARSE (control $C_SPARSE), data $N_DATA (control $
 [ "$N_DATA" -lt $((PAGES_DATA / 4)) ] &&
     pass "32 MiB of data read with $N_DATA device reads (readahead batches it; read_trust_off: $C_DATA)" ||
     fail "32 MiB of data cost $N_DATA device reads for $PAGES_DATA pages"
+fi
 
 # ------------------------------------------------------- 2 and 3
 # A spilled (depth-1) victim whose block 0 the backing-file poke can
@@ -124,6 +136,9 @@ probe() {
 }
 
 log "2. a held read-only fd keeps its cached map while the stamp is unchanged"
+if ct_nofilelock_run; then
+    skip "2: under nofilelock a reader's trust is the presence gate's (nofilelock_coherency.sh)"
+else
 build_victim v2
 probe v2 no
 [ "$READ1" = VICTIM0000 ] || fail "setup: first read was '$READ1', expected VICTIM0000"
@@ -138,6 +153,7 @@ ct_param_set read_trust_off 0
 [ "$READ2" = DONORDONOR ] &&
     pass "control: with read_trust_off the same reader sees the poke (the probe discriminates)" ||
     fail "control: read_trust_off read '$READ2', expected DONORDONOR -- case 2 proves nothing"
+fi
 
 log "3. a peer's file_seq stamp sends the reader fresh"
 build_victim v3
@@ -147,16 +163,23 @@ probe v3 yes
     pass "peer stamp: the held reader re-mapped block 0 from the device" ||
     fail "peer stamp: the reader read '$READ2' through a map the peer had changed (frozen extent tree)"
 
-ct_param_set read_trust_ignore_stamp 1
+STAMP_KNOB=read_trust_ignore_stamp
+ct_nofilelock_run && STAMP_KNOB=file_seq_ignore
+ct_param_set "$STAMP_KNOB" 1
 build_victim v3c
 probe v3c yes
-ct_param_set read_trust_ignore_stamp 0
+ct_param_set "$STAMP_KNOB" 0
 [ "$READ2" = VICTIM0000 ] &&
     pass "control: ignoring the stamp leaves the reader on its stale map (case 3 discriminates)" ||
-    fail "control: read_trust_ignore_stamp read '$READ2' -- something else refreshed the map, case 3 proves nothing"
+    fail "control: $STAMP_KNOB read '$READ2' -- something else refreshed the map, case 3 proves nothing"
 
 # ---------------------------------------------------------------- 4
 log "4. defrag refuses a file a live peer has open for read"
+if ct_nofilelock_run; then
+    skip "4: nofilelock refuses defrag outright (cetrafs_lock_defrag_begin())"
+    umount "$MNT"
+    ct_exit
+fi
 for i in 0 1 2 3 4 5 6; do
     dd if=/dev/urandom of="$MNT/frag" bs=4096 seek="$i" count=1 conv=notrunc status=none
     [ "$i" -lt 6 ] && printf x >"$MNT/frag_f$i"

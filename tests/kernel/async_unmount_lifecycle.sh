@@ -44,6 +44,9 @@ umount_timed() {
 
 # ---------------------------------------------------------------- 1
 log "1: unmount while the auto-defrag worker is mid-move"
+if ct_nofilelock_run; then
+    skip "1: nofilelock refuses defrag, so there is no defrag worker to unmount under"
+else
 DEV="$(ct_dev 560 lc1)"
 MNT="$(ct_mnt lc1)"
 ct_mkfs_small "$DEV" >/dev/null
@@ -72,6 +75,7 @@ sleep 3
 OUT="$(ct_fsck "$DEV" 2>&1 || true)"
 grep -qE '^(ERR|WARN)' <<<"$OUT" && fail "1: fsck: $(grep -E '^(ERR|WARN)' <<<"$OUT" | head -2)" ||
     pass "1: fsck clean"
+fi
 
 # ---------------------------------------------------------------- 2
 log "2: unmount while the scrub holds its verdict"

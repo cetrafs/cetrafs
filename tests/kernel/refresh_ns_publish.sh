@@ -35,6 +35,11 @@ for p in refresh_compare_stall_ms refresh_ns_unguarded; do
 done
 command -v python3 >/dev/null || { skip "python3 is missing"; ct_exit; }
 POKE="$(ct_helper inode_block_poke)"
+# Under nofilelock a local open with no peer present is trusted as is
+# (cetrafs_lock_identity_cache_trusted()), so the held fd would stop the
+# refresh this suite stalls. The same race is live there whenever a peer
+# has the file open too -- staged as such.
+ct_nofilelock_run && ct_param_set force_foreign_opener 1
 
 IMG="$(ct_image 560 nspub)"
 DEV="$(ct_loop "$IMG")"

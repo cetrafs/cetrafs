@@ -17,6 +17,7 @@ set -euo pipefail
 . "$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)/lib/harness.sh"
 require_root
 require_module
+ct_mode_own # compares the mount modes itself, per mount
 ct_param_set alloc_run_blocks 0
 
 frag() { # a 12-extent file, so a defrag has something to do

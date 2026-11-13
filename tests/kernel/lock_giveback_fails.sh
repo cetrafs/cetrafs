@@ -27,9 +27,14 @@ set -euo pipefail
 . "$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)/lib/harness.sh"
 require_root
 require_module
+ct_mode_own # round A mounts nofilelock itself; B and C are default-mode rounds
 for p in lock_giveback_fail_once flock_reader_check_fail_once auto_defrag_begin_delay_ms lock_ignore_readers; do
     [ -w "/sys/module/cetrafs/parameters/$p" ] || { skip "$p is missing"; ct_exit; }
 done
+# Armed by the python below straight through sysfs; registered here so
+# one a round never consumes is restored, not leaked to the next suite.
+ct_param_set flock_clear_fail_once N
+ct_param_set lock_resume_reread_fail_once N
 LOCK_POKE="$(ct_helper inode_lock_poke)"
 NODE_POKE="$(ct_helper node_poke)"
 ct_param_set hb_interval_secs 2

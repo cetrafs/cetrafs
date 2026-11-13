@@ -23,6 +23,7 @@ set -euo pipefail
 . "$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)/lib/harness.sh"
 require_root
 require_module
+require_file_lock_mode "defrag, which nofilelock refuses (no lock to pin)"
 
 DEFRAG="$ROOT/userspace/defrag.cetra"
 IMG="$(ct_image 560 defragfull)"

@@ -19,6 +19,7 @@ set -euo pipefail
 . "$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)/lib/harness.sh"
 require_root
 require_module
+require_file_lock_mode "a defrag pin against a lock suspend; nofilelock has neither"
 [ -w /sys/module/cetrafs/parameters/defrag_begin_stall_ms ] || { skip "defrag_begin_stall_ms is missing"; ct_exit; }
 DEFRAG="$ROOT/userspace/defrag.cetra"
 [ -x "$DEFRAG" ] || { skip "defrag.cetra is not built"; ct_exit; }

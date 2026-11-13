@@ -39,6 +39,20 @@ done
 LOCK_POKE="$(ct_helper inode_lock_poke)"
 NODE_POKE="$(ct_helper node_poke)"
 
+# held <record>: does the record still carry the local writer's claim?
+# On a default mount that is its lock; under nofilelock a write-open
+# takes no lock, and what marks it -- and what the pass must leave
+# alone -- is this node's presence bit.
+held() {
+    if ct_nofilelock_run; then
+        local r
+        r="$(sed -n 's/.*readers=0x\([0-9a-f]*\).*/\1/p' <<<"$1")"
+        [ -n "$r" ] && [ $(((0x$r >> NID) & 1)) = 1 ]
+    else
+        grep -q "owner=$NID mode=1" <<<"$1"
+    fi
+}
+
 # run <resweep_secs> <ignore_local>: one round; sets GIVEN READER HELD
 # (the three records afterwards), EARLY (the planted lock before the
 # pass is due) and NCLR (late_claims_cleared delta).
@@ -73,7 +87,7 @@ run() {
     "$LOCK_POKE" "$IMG" "$GI" "$NID" 1 >/dev/null
     "$LOCK_POKE" "$IMG" "$RI" --reader "$NID" >/dev/null
     HELD0="$("$LOCK_POKE" "$IMG" "$HI")"
-    if ! grep -q "owner=$NID mode=1" <<<"$HELD0" || ! grep -q "owner=$NID mode=1" <<<"$("$LOCK_POKE" "$IMG" "$GI")"; then
+    if ! held "$HELD0" || ! grep -q "owner=$NID mode=1" <<<"$("$LOCK_POKE" "$IMG" "$GI")"; then
         exec 7>&-
         fail "setup: held '$HELD0', given '$("$LOCK_POKE" "$IMG" "$GI")' -- not both locked by row $NID"
         ct_exit
@@ -105,13 +119,13 @@ grep -q "owner=$NID mode=1" <<<"$EARLY" && pass "the planted lock was still held
 grep -q 'mode=0' <<<"$GIVEN" && pass "the given-back lock was cleared ($GIVEN)" || fail "the given-back lock is still held: $GIVEN"
 grep -q 'readers=0x0$' <<<"$READER" && pass "the given-back presence bit was cleared ($READER)" ||
     fail "the given-back presence bit is still set: $READER"
-grep -q "owner=$NID mode=1" <<<"$HELD" && pass "the lock a local writer holds was left alone ($HELD)" ||
-    fail "the late pass cleared the lock of a file open for write here: $HELD"
+held "$HELD" && pass "the claim a local writer holds was left alone ($HELD)" ||
+    fail "the late pass cleared the claim of a file open for write here: $HELD"
 [ "$NCLR" -eq 2 ] && pass "exactly two records were cleared" || fail "late_claims_cleared moved by $NCLR, expected 2"
 [ "$WROTE" = 1 ] && pass "the held file still takes writes" || fail "the held file's writer failed after the pass"
 
 # Control: ignoring local users and this mount's incarnation, the held lock goes.
 run 8 1
-grep -q 'mode=0' <<<"$HELD" && pass "control: with both guards off the held lock is cleared -- the check above discriminates" ||
-    fail "control: even with both guards off the held lock survived ($HELD) -- the check does not discriminate"
+! held "$HELD" && pass "control: with both guards off the held claim is cleared -- the check above discriminates" ||
+    fail "control: even with both guards off the held claim survived ($HELD) -- the check does not discriminate"
 ct_exit

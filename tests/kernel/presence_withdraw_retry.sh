@@ -29,6 +29,9 @@ set -euo pipefail
 require_root
 require_module
 [ -w /sys/module/cetrafs/parameters/presence_withdraw_fail ] || { skip "presence_withdraw_fail is missing"; ct_exit; }
+# Armed by the python below straight through sysfs; registered here so
+# one a round never consumes is restored, not leaked to the next suite.
+ct_param_set presence_withdraw_fail 0
 LOCK_POKE="$(ct_helper inode_lock_poke)"
 
 DEV="$(ct_dev 560 presretry)"
@@ -63,7 +66,12 @@ knob_spent || fail "A: setup: the close's withdraw was not the one that failed"
 log "A: after the failed withdraw: $(dump a)"
 wait_clear a A
 
-# --- B: a writer's resume, writer still open
+# --- B: a writer's resume, writer still open. Default mount only: under
+# nofilelock LOCK_UN suspends nothing and LOCK_EX withdraws no presence --
+# the open writer's bit is meant to stay.
+if ct_nofilelock_run; then
+    skip "B: the LOCK_UN/LOCK_EX handoff is the default mount's"
+else
 exec 7<>"$MNT/b"
 python3 - "$MNT/b" <<'PY'
 import fcntl, os, sys
@@ -77,6 +85,7 @@ knob_spent || fail "B: setup: the resume's withdraw was not the one that failed"
 log "B: after the failed withdraw: $(dump b)"
 wait_clear b B
 exec 7<&-
+fi
 
 # --- C: the retry must not take a bit a NEW local opener needs. Failed
 # withdraw, then the file is opened again before the heartbeat runs:

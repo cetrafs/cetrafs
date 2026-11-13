@@ -72,15 +72,28 @@ print("after-munmap:" + lock())
 PY
 )"
 echo "$OUT" | sed 's/^/    /'
-echo "$OUT" | grep -q "^while-open:owner=0 mode=1" &&
-    pass "the write lock is held while the file is open and mapped" ||
-    fail "the lock was not held during the mapping: $(echo "$OUT" | grep while-open)"
-echo "$OUT" | grep -q "^after-close:owner=0 mode=1" &&
-    pass "close() with a live mapping does NOT release the lock" ||
-    fail "close() released the lock while a mapping was still writing: $(echo "$OUT" | grep after-close)"
-echo "$OUT" | grep -q "^after-munmap:owner=65535" &&
+# Under nofilelock nothing is locked: what marks the file in use is
+# this node's presence bit, and it must live exactly as long.
+if ct_nofilelock_run; then
+    HELD="^%s:owner=[0-9]* mode=0 .*readers=0x[1-9a-f]"
+    GONE="^after-munmap:.*readers=0x0$"
+    WHAT="presence bit"
+else
+    HELD="^%s:owner=0 mode=1"
+    GONE="^after-munmap:owner=65535"
+    WHAT="write lock"
+fi
+# shellcheck disable=SC2059
+echo "$OUT" | grep -q "$(printf "$HELD" while-open)" &&
+    pass "the $WHAT is held while the file is open and mapped" ||
+    fail "the $WHAT was not held during the mapping: $(echo "$OUT" | grep while-open)"
+# shellcheck disable=SC2059
+echo "$OUT" | grep -q "$(printf "$HELD" after-close)" &&
+    pass "close() with a live mapping does NOT release the $WHAT" ||
+    fail "close() released the $WHAT while a mapping was still writing: $(echo "$OUT" | grep after-close)"
+echo "$OUT" | grep -q "$GONE" &&
     pass "munmap releases it" ||
-    fail "the lock survived munmap: $(echo "$OUT" | grep after-munmap)"
+    fail "the $WHAT survived munmap: $(echo "$OUT" | grep after-munmap)"
 [ "$(head -c 4 "$MNT/m")" = "LIVE" ] && pass "the write made after close() through the mapping landed" ||
     fail "the post-close mapped write was lost"
 
@@ -153,8 +166,13 @@ echo "$OUT" | sed 's/^/    /'
 echo "$OUT" | grep -q "^defrag-ro:EBADF" &&
     pass "defrag on a read-only fd is refused: the write-open IS the exclusivity" ||
     fail "defrag on a read-only fd: $(echo "$OUT" | grep defrag-ro)"
+if ct_nofilelock_run; then
+    echo "$OUT" | grep -q "^defrag-rw:ENOTSUP" && pass "nofilelock: defrag on a write fd is refused (no lock to pin)" ||
+        fail "nofilelock: defrag on a write fd: $(echo "$OUT" | grep defrag-rw) -- expected ENOTSUP"
+else
 echo "$OUT" | grep -q "^defrag-rw:ok" && pass "defrag on a write fd runs" ||
     fail "defrag on a write fd: $(echo "$OUT" | grep defrag-rw)"
+fi
 echo "$OUT" | grep -q "^unknown-cmd:ENOTTY" && pass "an unknown ioctl gives ENOTTY" ||
     fail "an unknown ioctl: $(echo "$OUT" | grep unknown-cmd)"
 echo "$OUT" | grep -qE "^defrag-on-dir:(ENOTTY|EBADF|EISDIR)" &&

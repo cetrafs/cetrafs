@@ -90,6 +90,11 @@ grep -q "owner=1 mode=1" <<<"$L" && fail "A: the lock was handed back to row 1, 
 
 # ------------------------------------------------------------------- B
 log "B: row 1 re-attaches without re-opening the file it read"
+# A write-open sweeps a dead reader's bit only as part of the access
+# rule's reader check, which nofilelock does not make.
+if ct_nofilelock_run; then
+    skip "B: under nofilelock a write-open does not judge readers, so it reclaims no reader bit"
+else
 ct_param_set reclaim_stall_before_swap_ms 2000
 reattach 333 true
 B=$!
@@ -102,6 +107,7 @@ R="$("$LPOKE" "$IMG" "$IB")"
 grep -qE 'readers=0x(2|3|6|7|a|b|e|f)$' <<<"$R" && fail "B: row 1's reader bit was put back: $R" ||
     pass "B: row 1's reader bit stayed cleared"
 "$NPOKE" "$IMG" 1 1 bb 0 >/dev/null; "$NPOKE" "$IMG" 1 --inc 111 >/dev/null
+fi
 
 # ------------------------------------------------------------------- C
 log "C: control -- row 1 re-attaches and takes the lock again"

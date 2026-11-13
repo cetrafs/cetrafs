@@ -33,6 +33,12 @@ for i in $(seq 1 33); do echo "$i" >"$MNT/f$i"; done
 sync
 
 MARK="$(dmesg_mark)"
+# A maintenance pass landing inside the loop retries the withdraws
+# already queued: it spends failures meant for the closes and drains the
+# queue it is filling. Seen once in a full gate ("only 32 of 33"); the
+# pass is held off for the loop (the lease renewal is a separate work
+# item and keeps beating).
+ct_param_set hb_maint_delay_ms 5000
 ct_param_set presence_withdraw_fail 33
 python3 - "$MNT" <<'PY'
 import os, sys
@@ -41,6 +47,7 @@ for i in range(1, 34):
 PY
 LEFT="$(cat /sys/module/cetrafs/parameters/presence_withdraw_fail)"
 ct_param_set presence_withdraw_fail 0
+ct_param_set hb_maint_delay_ms 0
 [ "$LEFT" = 0 ] || fail "setup: only $((33 - LEFT)) of 33 withdraws were made to fail"
 
 STOPPED="$(sed -n 's/^stopped: //p' "$INFO")"

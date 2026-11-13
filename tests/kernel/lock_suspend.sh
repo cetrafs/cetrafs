@@ -23,6 +23,7 @@ set -euo pipefail
 . "$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)/lib/harness.sh"
 require_root
 require_module
+require_file_lock_mode "the default mount's LOCK_UN suspend and LOCK_EX resume"
 command -v flock >/dev/null || { echo "SKIP: flock(1) not installed"; exit 0; }
 LOCK_POKE="$(ct_helper inode_lock_poke)"
 

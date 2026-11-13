@@ -414,6 +414,8 @@ The harness gives you:
 | `ct_mkfs` `ct_mkfs_small` `ct_fsck` `ct_mount` | the tools |
 | `ct_helper <name>` | compiles `helpers/<name>.c` on demand, cached in `.build/` |
 | `require_root` `require_module` `require_cetrafs_mount` | preconditions |
+| `require_file_lock_mode <premise>` | skips, naming the premise, under `CT_MOUNT_OPTS=nofilelock` -- only for behaviour that does not exist in that mode; a hazard the mode reaches by another path is tested on that path |
+| `ct_mode_own` | the suite sets each mount's mode itself (it compares the two), so `CT_MOUNT_OPTS` is ignored |
 | `dmesg_mark` `dmesg_since` | timestamp-based, immune to ring-buffer wrap |
 | `set_stale_window` `poke_dead_peer` `wait_out_stale_window` `reset_stale_window` | node liveness |
 | `ct_exit` | exit 1 if anything failed, whatever the last command returned |

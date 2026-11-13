@@ -18,6 +18,7 @@ set -euo pipefail
 . "$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)/lib/harness.sh"
 require_root
 require_module
+require_file_lock_mode "the automatic claim a failed write-open must give back; under nofilelock the open publishes nothing before the refresh that fails"
 [ -w /sys/module/cetrafs/parameters/open_refresh_fail_once ] || { skip "open_refresh_fail_once is missing"; ct_exit; }
 LOCK_POKE="$(ct_helper inode_lock_poke)"
 

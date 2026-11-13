@@ -27,6 +27,7 @@ set -euo pipefail
 . "$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)/lib/harness.sh"
 require_root
 require_module
+require_file_lock_mode "its cold marks come from a lookup refresh of a file held open here, which nofilelock trusts without refreshing (cetrafs_lock_identity_cache_trusted()); nofilelock marks the same tree cold from a peer's file_seq (cetrafs_inode_note_stamp() -> cetrafs_tree_mark_cold_ci()), the mark and settle this suite proves in the default mode"
 [ -w /sys/module/cetrafs/parameters/cold_work_stall_ms ] || { skip "cold_work_stall_ms is missing"; ct_exit; }
 LEAF_POKE="$(ct_helper leaf_poke)"
 EXTENT_POKE="$(ct_helper pending_poke)"
