@@ -5447,6 +5447,16 @@ static int cetrafs_lock_explicit_acquire(struct inode *inode, struct file *file)
                 ret = -ETXTBSY; /* contended apply: a blocking LOCK_EX tries again */
             goto out;
         }
+        /* The rest of resume's reconcile, which this is: forget the
+         * noted stamp and the verdicts judged against it, and drop the
+         * clean pages read before the handoff. A page-cache hit is served
+         * before any trust predicate is asked, so only a drop removes a
+         * page the source rewrote; the apply drops them only when it
+         * runs, and from here the gate trusts this node's cache. */
+        ci->file_seq_cached = U64_MAX;
+        cetrafs_verdicts_invalidate(ci);
+        if (inode->i_mapping)
+            invalidate_mapping_pages(inode->i_mapping, 0, -1);
     }
 
     ci->explicit_lock_file = file;

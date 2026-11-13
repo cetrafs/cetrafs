@@ -20,10 +20,11 @@
 # node's fd is open and idle. Then flock(LOCK_EX) and one append.
 #
 # The same claim must also drop the pages this node read while the peer
-# was writing: from the claim on the read gate trusts them. Applying the
-# peer's record drops them (the refresh's invalidate_inode_pages2()); the
-# "pages" rounds read block 0 before the peer overwrites it on the
-# device, and read it again after LOCK_EX.
+# was writing: from the claim on the read gate trusts them. The claim
+# drops them as resume does (and the apply of a peer's record drops them
+# too, which is why removing only the claim's drop does not fail this
+# round); the "pages" rounds read block 0 before the peer overwrites it
+# on the device, and read it again after LOCK_EX.
 #
 # DISCRIMINATION: flock_claim_no_reconcile=1 skips the reconcile; the
 # append then lands at 8 KiB, and the read after the claim returns the
