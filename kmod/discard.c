@@ -50,7 +50,10 @@
 #include <linux/fs.h>
 #include <linux/jiffies.h>
 #include <linux/sched/signal.h>
+#include <linux/sort.h>
+#include <linux/spinlock.h>
 #include <linux/uaccess.h>
+#include <linux/workqueue.h>
 
 #include "kmod.h"
 
@@ -462,4 +465,411 @@ long cetrafs_fitrim_ioctl(struct file *file, struct fstrim_range __user *arg)
     if (copy_to_user(arg, &range, sizeof(range)))
         return -EFAULT;
     return 0;
+}
+
+/* ------------------------------------------------------------------ */
+/*
+ * INLINE DISCARD (`-o discard`, docs/DISCARD-DESIGN.md step 2).
+ *
+ * Space freed inside a Block Group that STAYS this node's -- a guest's
+ * TRIM punching holes in a VM image -- is otherwise given back only when
+ * someone runs fstrim. With `discard` on, every run freed in a group
+ * this node owns is noted here, and a worker gives it back a moment
+ * later, batched.
+ *
+ * Never on the free path itself: one UNMAP costs a fixed ~25 ms on an
+ * array (docs/internal/UNMAP-BENCHMARK.md), a punch of a fragmented
+ * range frees thousands of extents, and the free runs under the
+ * caller's invalidate_lock. The free path only appends a range to a
+ * bounded in-memory queue, under a spinlock, with no allocation and no
+ * I/O (cetrafs_inline_discard_note()).
+ *
+ * The worker is FITRIM, aimed: for each noted range it takes trim_mutex
+ * and runs the very claim -> discard -> give-back cycle fstrim runs
+ * (cetrafs_trim_claim_next(), cetrafs_discard_issue(),
+ * cetrafs_trim_release()), over the bits that read free NOW. A block
+ * reallocated since its free reads allocated and is not claimed, so it
+ * is not discarded; a block claimed is held against the allocator, the
+ * scrub and every free path exactly as fstrim's run is. There is no
+ * second discard path to get wrong.
+ *
+ * When. ext4 waits for the journal commit that makes a free durable
+ * before discarding it. Here a free in a group this node owns comes
+ * after the publish that stopped referencing the blocks has reached the
+ * device (rule 21), so the free is already past that boundary -- which
+ * is what lets fstrim discard any free bit at any time, and the worker
+ * stands on exactly fstrim's footing. The delay only batches: a burst
+ * of frees becomes one sorted, coalesced pass.
+ *
+ * Best effort, as discarding is everywhere here; freeing never waits on
+ * it. A full queue drops the new range (the blocks are free already;
+ * only their discard is lost, and fstrim still finds them). The worker
+ * gives up -- drops what is queued, counted -- when the mount is
+ * closing, stopped or read-only, when discard has been turned off, and
+ * when an allocation has just found every owned group full
+ * (cetrafs_inline_discard_pressure()): a claimed run is space a writer
+ * cannot have, and an ENOSPC must never wait on the array digesting
+ * UNMAPs. The queue is preallocated at mount, so memory pressure never
+ * reaches the free path through it, and the worker allocates nothing.
+ *
+ * A discard of UNKNOWN outcome keeps its run allocated for the scrub,
+ * its bits synced, and ends the pass (fstrim's handling, in
+ * cetrafs_trim_release()); a refused one frees the run and carries on.
+ *
+ * Lifetime (rule 20): the queue and its delayed work live from mount to
+ * cetrafs_inline_discard_close(), which cetrafs_free_sb_info() calls on
+ * unmount and on every fill_super failure, after the heartbeat, the
+ * scrub and defrag (the other freers) have stopped and before anything
+ * the worker reads is torn down. It marks the queue closed under the
+ * same spinlock a note queues the work under, then cancels the work
+ * synchronously: nothing can queue after it.
+ */
+
+/* Ranges the queue holds before it drops new ones. 16 bytes each, two
+ * arrays (one filling while the worker owns the other): 128 KiB. */
+#define CETRAFS_IDQ_CAP 4096
+/* A worker claim is at most this many blocks (32 MiB): the run is out
+ * of the allocator's reach while its UNMAP runs. */
+#define CETRAFS_IDQ_MAX_RUN_BLOCKS (1ULL << 13)
+/* How long after a no-space verdict the worker keeps giving up. */
+#define CETRAFS_IDQ_PRESSURE_SECS 5
+#define CETRAFS_IDQ_DELAY_MS 1000
+
+struct cetrafs_idq_ent {
+    u64 lba;
+    u32 count;
+    u32 bg;
+};
+
+struct cetrafs_inline_discard {
+    struct super_block *sb;
+    spinlock_t lock;
+    struct cetrafs_idq_ent *fill; /* notes append here, under 'lock' */
+    struct cetrafs_idq_ent *work; /* the worker's batch (one worker runs at a time) */
+    u32 n;
+    bool on;                   /* the `discard` mount option / `inline_discard` control */
+    bool closed;               /* cetrafs_inline_discard_close() began: nothing queues */
+    unsigned long pressure_at; /* jiffies of the last no-space verdict; 0: none */
+    struct delayed_work dwork;
+    atomic64_t queued;  /* ranges noted */
+    atomic64_t dropped; /* ranges lost to a full queue */
+    atomic64_t gave_up; /* ranges the worker dropped: pressure, closing, off, a failing path */
+    atomic64_t cmds;    /* discards the worker issued */
+    atomic64_t blocks;  /* the blocks they covered */
+};
+
+/* TEST ONLY: the worker's batching delay, in ms (0: the default). */
+static unsigned int cetrafs_inline_discard_delay_ms;
+cetrafs_test_param(inline_discard_delay_ms, cetrafs_inline_discard_delay_ms, uint, 0644);
+MODULE_PARM_DESC(inline_discard_delay_ms, "TEST ONLY: the inline-discard worker's batching delay, in ms");
+
+/* TEST ONLY: hold the worker this long between a claim and its discard,
+ * so a writer allocates while the UNMAP is still to come
+ * (tests/kernel/inline_discard_claim.sh). The claim itself is disabled
+ * with trim_skip_claim, fstrim's control, since it is the same claim. */
+static unsigned int cetrafs_inline_discard_stall_ms;
+cetrafs_test_param(inline_discard_stall_ms, cetrafs_inline_discard_stall_ms, uint, 0644);
+MODULE_PARM_DESC(inline_discard_stall_ms, "TEST ONLY: pause between an inline-discard claim and its discard");
+
+/* TEST ONLY: the worker ignores space pressure and a closing mount --
+ * the negative control for the give-up
+ * (tests/kernel/inline_discard_give_up.sh). */
+static bool cetrafs_inline_discard_never_give_up;
+cetrafs_test_param(inline_discard_never_give_up, cetrafs_inline_discard_never_give_up, bool, 0644);
+MODULE_PARM_DESC(inline_discard_never_give_up, "TEST ONLY: the inline-discard worker ignores pressure and unmount");
+
+static void cetrafs_inline_discard_work(struct work_struct *w);
+
+struct cetrafs_inline_discard *cetrafs_inline_discard_create(struct super_block *sb, bool on)
+{
+    struct cetrafs_inline_discard *d = kzalloc(sizeof(*d), GFP_KERNEL);
+
+    if (!d)
+        return NULL;
+    d->fill = kvcalloc(CETRAFS_IDQ_CAP, sizeof(*d->fill), GFP_KERNEL);
+    d->work = kvcalloc(CETRAFS_IDQ_CAP, sizeof(*d->work), GFP_KERNEL);
+    if (!d->fill || !d->work) {
+        kvfree(d->fill);
+        kvfree(d->work);
+        kfree(d);
+        return NULL;
+    }
+    d->sb = sb;
+    d->on = on;
+    spin_lock_init(&d->lock);
+    INIT_DELAYED_WORK(&d->dwork, cetrafs_inline_discard_work);
+    return d;
+}
+
+/*
+ * The drain (rule 20). Once it returns no work is pending or running,
+ * and none can be queued: a note tests 'closed' and queues the work
+ * under the lock this sets it under. What was queued is dropped (counted
+ * as given up). The memory stays until _destroy().
+ */
+void cetrafs_inline_discard_close(struct cetrafs_inline_discard *d)
+{
+    u32 n;
+
+    if (!d)
+        return;
+    spin_lock(&d->lock);
+    d->closed = true;
+    spin_unlock(&d->lock);
+    cancel_delayed_work_sync(&d->dwork);
+    spin_lock(&d->lock);
+    n = d->n;
+    atomic64_add(n, &d->gave_up);
+    d->n = 0;
+    spin_unlock(&d->lock);
+    if (n)
+        pr_info("%s: inline discard: dropped %u queued range(s) (unmount)\n", d->sb->s_id, n);
+}
+
+void cetrafs_inline_discard_destroy(struct cetrafs_inline_discard *d)
+{
+    if (!d)
+        return;
+    cetrafs_inline_discard_close(d); /* idempotent */
+    kvfree(d->fill);
+    kvfree(d->work);
+    kfree(d);
+}
+
+bool cetrafs_inline_discard_on(struct super_block *sb)
+{
+    struct cetrafs_inline_discard *d = cetrafs_sb_inline_discard(sb);
+
+    return d && READ_ONCE(d->on);
+}
+
+void cetrafs_inline_discard_set(struct super_block *sb, bool on)
+{
+    struct cetrafs_inline_discard *d = cetrafs_sb_inline_discard(sb);
+
+    if (d)
+        WRITE_ONCE(d->on, on);
+}
+
+/* An allocation found every owned group full (zonegroup.c): the worker
+ * stops claiming space for a while. */
+void cetrafs_inline_discard_pressure(struct super_block *sb)
+{
+    struct cetrafs_inline_discard *d = cetrafs_sb_inline_discard(sb);
+
+    if (d)
+        WRITE_ONCE(d->pressure_at, jiffies ? jiffies : 1);
+}
+
+/*
+ * From the free paths, once bits of [lba, +count) in Block Group 'bg' --
+ * one this node owns -- have been cleared. Under the caller's locks: a
+ * spinlock, an append or a merge into the last entry, never I/O and
+ * never an allocation.
+ */
+void cetrafs_inline_discard_note(struct super_block *sb, u32 bg, u64 lba, u32 count)
+{
+    struct cetrafs_inline_discard *d = cetrafs_sb_inline_discard(sb);
+    unsigned int delay;
+    struct cetrafs_idq_ent *last;
+
+    if (!d || !count || !READ_ONCE(d->on) || !cetrafs_sb_discard_enabled(sb))
+        return;
+    delay = READ_ONCE(cetrafs_inline_discard_delay_ms);
+    if (!delay)
+        delay = CETRAFS_IDQ_DELAY_MS;
+    spin_lock(&d->lock);
+    if (d->closed) {
+        spin_unlock(&d->lock);
+        return;
+    }
+    last = d->n ? &d->fill[d->n - 1] : NULL;
+    if (last && last->bg == bg && last->lba + last->count == lba && (u64) last->count + count <= U32_MAX) {
+        last->count += count; /* the common case: a punch frees its extents in order */
+    } else if (d->n < CETRAFS_IDQ_CAP) {
+        d->fill[d->n].lba = lba;
+        d->fill[d->n].count = count;
+        d->fill[d->n].bg = bg;
+        d->n++;
+    } else {
+        atomic64_inc(&d->dropped);
+        spin_unlock(&d->lock);
+        return; /* free already; only the discard is lost */
+    }
+    atomic64_inc(&d->queued);
+    /* Under the lock, so close() cannot fall between the test of
+     * 'closed' and this (rule 20). A no-op while already pending. */
+    queue_delayed_work(system_unbound_wq, &d->dwork, msecs_to_jiffies(delay));
+    spin_unlock(&d->lock);
+}
+
+static int cetrafs_idq_cmp(const void *a, const void *b)
+{
+    const struct cetrafs_idq_ent *x = a, *y = b;
+
+    return x->lba < y->lba ? -1 : x->lba > y->lba;
+}
+
+/* Why the worker must stop now, or NULL. */
+static const char *cetrafs_idq_give_up(struct cetrafs_inline_discard *d)
+{
+    struct super_block *sb = d->sb;
+    unsigned long p = READ_ONCE(d->pressure_at);
+
+    if (READ_ONCE(cetrafs_inline_discard_never_give_up))
+        return NULL; /* test-only; see the parameter */
+    if (READ_ONCE(d->closed))
+        return "unmount";
+    if (cetrafs_sb_is_fenced(sb))
+        return "stopped";
+    if (sb_rdonly(sb))
+        return "read-only";
+    if (!READ_ONCE(d->on) || !cetrafs_sb_discard_enabled(sb) || !cetrafs_discard_supported(sb))
+        return "off";
+    if (p && time_before(jiffies, p + CETRAFS_IDQ_PRESSURE_SECS * HZ))
+        return "no space";
+    return NULL;
+}
+
+/*
+ * One noted range, through fstrim's cycle. 0: done, go on. 1: the
+ * worker must give up (cetrafs_idq_give_up()), part way through this
+ * range. Negative: the discard's error, and the pass ends (unsupported,
+ * stopped, unknown outcome).
+ */
+static int cetrafs_idq_range(struct cetrafs_inline_discard *d, const struct cetrafs_idq_ent *e, u64 minlen,
+                             u64 maxlen)
+{
+    struct super_block *sb = d->sb;
+    u64 data_start, data_count, cursor, end_bit, end_lba;
+    u32 owner;
+
+    if (cetrafs_bg_data_region(sb, e->bg, &data_start, &data_count, &owner))
+        return 0;
+    if (e->lba < data_start || e->lba + e->count > data_start + data_count)
+        return 0; /* not this group's data: the discard's own check would refuse it */
+    cursor = e->lba - data_start;
+    end_bit = cursor + e->count;
+    end_lba = e->lba + e->count;
+
+    while (cursor < end_bit) {
+        struct cetrafs_trim_run run = {.span = {.link = LIST_HEAD_INIT(run.span.link)}};
+        u64 count;
+        int rc;
+
+        if (cetrafs_idq_give_up(d))
+            return 1;
+        rc = cetrafs_trim_claim_next(sb, e->bg, &cursor, minlen, max(min(maxlen, end_bit - cursor), minlen), &run);
+        if (rc)
+            return 0; /* nothing free here any more, or the group is not ours (drained, released) */
+        if (run.lba >= end_lba) {
+            cetrafs_trim_release(sb, &run, false);
+            return 0;
+        }
+        count = min(run.count, end_lba - run.lba);
+        if (cetrafs_inline_discard_stall_ms) {
+            /* test-only; see the parameter */
+            pr_info("%s: inline discard: claimed [%llu +%llu), pausing %u ms (test)\n", sb->s_id,
+                    (unsigned long long) run.lba, (unsigned long long) count, cetrafs_inline_discard_stall_ms);
+            msleep(cetrafs_inline_discard_stall_ms);
+        }
+        rc = cetrafs_discard_issue(sb, e->bg, run.lba, count);
+        cetrafs_trim_release(sb, &run, !cetrafs_discard_outcome_known(rc));
+        if (rc == -EOPNOTSUPP || !cetrafs_discard_outcome_known(rc))
+            return rc; /* the device stopped taking them, we are stopped, or the path is failing */
+        if (!rc) {
+            atomic64_inc(&d->cmds);
+            atomic64_add((s64) count, &d->blocks);
+        }
+        cond_resched();
+    }
+    return 0;
+}
+
+static void cetrafs_inline_discard_work(struct work_struct *w)
+{
+    struct cetrafs_inline_discard *d = container_of(to_delayed_work(w), struct cetrafs_inline_discard, dwork);
+    struct super_block *sb = d->sb;
+    struct cetrafs_idq_ent *batch;
+    const char *why;
+    u64 gran, minlen, maxlen;
+    u32 n, i, m;
+
+    /* Take the filled array; notes go on into the other one. A work
+     * item never runs concurrently with itself, so 'work' is ours
+     * until we return. */
+    spin_lock(&d->lock);
+    batch = d->fill;
+    d->fill = d->work;
+    d->work = batch;
+    n = d->n;
+    d->n = 0;
+    spin_unlock(&d->lock);
+    if (!n)
+        return;
+
+    /* Sorted and coalesced: frees from many files and many moments
+     * become the fewest ranges -- an UNMAP costs per command. */
+    sort(batch, n, sizeof(*batch), cetrafs_idq_cmp, NULL);
+    for (i = 1, m = 0; i < n; i++) {
+        struct cetrafs_idq_ent *p = &batch[m];
+
+        if (batch[i].bg == p->bg && batch[i].lba <= p->lba + p->count) {
+            u64 e = max(p->lba + p->count, batch[i].lba + batch[i].count);
+
+            if (e - p->lba <= U32_MAX) {
+                p->count = (u32) (e - p->lba);
+                continue;
+            }
+        }
+        batch[++m] = batch[i];
+    }
+    n = m + 1;
+
+    gran = DIV_ROUND_UP((u64) bdev_discard_granularity(sb->s_bdev), CETRAFS_BLOCK_SIZE);
+    minlen = max(gran, 1ULL);
+    maxlen = min_t(u64, bdev_max_discard_sectors(sb->s_bdev) / (CETRAFS_BLOCK_SIZE >> SECTOR_SHIFT),
+                   CETRAFS_IDQ_MAX_RUN_BLOCKS);
+    if (maxlen < minlen)
+        maxlen = minlen;
+
+    i = 0;
+    why = cetrafs_idq_give_up(d);
+    if (!why) {
+        mutex_lock(cetrafs_sb_trim_mutex(sb)); /* one claim at a time, fstrim's included */
+        for (; i < n; i++) {
+            int rc;
+
+            why = cetrafs_idq_give_up(d);
+            if (why)
+                break;
+            rc = cetrafs_idq_range(d, &batch[i], minlen, maxlen);
+            if (rc > 0) {
+                why = cetrafs_idq_give_up(d) ?: "gave up";
+                break; /* stopped part way: counted with the rest */
+            }
+            if (rc < 0) {
+                why = "a discard failed";
+                i++; /* that range went as far as it could */
+                break;
+            }
+        }
+        mutex_unlock(cetrafs_sb_trim_mutex(sb));
+    }
+    if (why && i < n) {
+        atomic64_add(n - i, &d->gave_up);
+        pr_info_ratelimited("%s: inline discard: dropped %u queued range(s) (%s)\n", sb->s_id, n - i, why);
+    }
+}
+
+void cetrafs_inline_discard_counts(struct super_block *sb, u64 *queued, u64 *dropped, u64 *gave_up, u64 *cmds,
+                                   u64 *blocks)
+{
+    struct cetrafs_inline_discard *d = cetrafs_sb_inline_discard(sb);
+
+    *queued = d ? (u64) atomic64_read(&d->queued) : 0;
+    *dropped = d ? (u64) atomic64_read(&d->dropped) : 0;
+    *gave_up = d ? (u64) atomic64_read(&d->gave_up) : 0;
+    *cmds = d ? (u64) atomic64_read(&d->cmds) : 0;
+    *blocks = d ? (u64) atomic64_read(&d->blocks) : 0;
 }

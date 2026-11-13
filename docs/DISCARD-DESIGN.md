@@ -1,8 +1,9 @@
 # UNMAP / discard: giving space back to a thin LUN
 
-**Status (2026-11-10): steps 1 and 3 are built** (`kmod/discard.c`),
+**Status (2026-11-13): steps 1, 2 and 3 are built** (`kmod/discard.c`),
 together with a hand-back discard this design did not originally have
-(see "As built" at the end). Step 2, inline `-o discard`, is not.
+(see "As built" at the end). Step 2, inline `-o discard`, is the
+section "Inline discard" there.
 
 Before this, cetrafs issued no discard of any kind: space freed in the
 filesystem stayed mapped in the array's thin pool for the life of the
@@ -392,6 +393,56 @@ heartbeat I/O. On by default where the device supports discard;
   range reads zero because its extent is uninitialised, never because
   of what the device returns.
 
+### Inline discard (`-o discard`, step 2; 2026-11-13)
+
+Off by default; `mount -o discard` turns it on (the name ext4 and XFS
+use for the same thing), `inline_discard=on|off` in `controls` switches
+it per mount, and it is in force only while `discard` (the hand-back
+switch) is on too -- `nodiscard` or `discard=off` stops both. The last
+of `discard` and `nodiscard` on a command line wins.
+
+* **Noted, never issued, on the free path.** A run freed in a Block
+  Group this node owns -- the local free and the pending-free drain
+  alike -- is appended to a per-mount queue (4096 ranges, preallocated;
+  adjacent frees merge) under a spinlock: no I/O, no allocation, inside
+  whatever locks the free holds. A full queue drops the range, counted:
+  the blocks are free already, only the discard is lost, and fstrim
+  still finds them.
+* **A worker discards them a moment later** (one second after the
+  first note, on the unbound workqueue), sorted and coalesced per
+  Block Group, through fstrim's own cycle: under `trim_mutex`, claim
+  the bits that read free NOW (`cetrafs_trim_claim_next()`, at most
+  32 MiB a claim and never past the noted range), discard through
+  `cetrafs_discard_issue()`, give back (`cetrafs_trim_release()`). A
+  block reallocated since its free reads allocated and is not claimed,
+  so it is not discarded; a group drained for hand-back or no longer
+  ours refuses the claim. There is no second discard path.
+* **Why no durability wait.** ext4 discards only after the journal
+  commit that makes the free durable. Here every free in a group this
+  node owns follows the publish that stopped referencing the blocks,
+  and that publish is already on the device (rule 21) -- the same
+  footing that lets fstrim discard any free bit at any moment. The
+  delay is for batching only.
+* **It gives up** -- drops what is queued, counted and logged with the
+  reason -- when the mount is closing, stopped or read-only, when
+  discard is turned off, and for five seconds after an allocation
+  found every owned Block Group full (`cetrafs_inline_discard_pressure()`
+  in the allocator's no-space path): its claims are space a writer
+  cannot have, and an ENOSPC must not wait on the array.
+* **Unknown and refused outcomes** are fstrim's: an unknown one keeps
+  the run allocated, its bits synced, for the scrub
+  (`trim_leaked_blocks`) and ends the pass; a refused one frees the run
+  and goes on.
+* **Lifetime (rule 20).** `cetrafs_inline_discard_close()`, from
+  `cetrafs_free_sb_info()` on unmount and on every `fill_super`
+  failure, after the heartbeat, scrub and defrag have stopped: it marks
+  the queue closed under the lock a note queues the work under, then
+  cancels the work synchronously, so nothing queues after it and no
+  worker outlives the mount. A worker mid-pass stops after the range in
+  hand.
+* `info` counts `inline_discard_queued`, `_dropped` (full queue),
+  `_gave_up`, `_cmds` and `_blocks`.
+
 ### Limits
 
 * A FITRIM claim is at most 256 MiB; the run is out of the allocator's
@@ -418,6 +469,13 @@ checksummed from the device, a range-check control aimed at the bitmap
 and into the data), `tests/kernel/fstrim_claim.sh` (a writer inside the
 claim's window with a no-claim control that destroys its data; queued
 and local double frees inside the window with no-hold controls that stop
-the mount). The two-node assertion -- a trim never writes a Block Group
-this node no longer owns -- is still owed to `ctest/`, and so is the
-cost per command on a real array.
+the mount). Inline discard: `tests/kernel/inline_discard.sh` (the `du` oracle
+with a no-option control, the two switches, a second mount stating
+`discard`), `inline_discard_claim.sh` (a writer inside the worker's
+claim window, with the no-claim control destroying its data),
+`inline_discard_unknown.sh` (unknown keeps the run, refused frees it),
+`inline_discard_give_up.sh` (space pressure and unmount, each with a
+never-give-up control; a pending queue at unmount). The two-node
+assertion -- a trim never writes a Block Group this node no longer owns
+-- is still owed to `ctest/`, and so is the cost per command on a real
+array.

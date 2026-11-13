@@ -3186,6 +3186,9 @@ retry_scan:
      * since what it gave back may be claimable now. */
     if (!waited_release) {
         waited_release = true;
+        /* Every owned group is full: inline discard stops claiming
+         * free runs for a while, so its holds are not what we lack. */
+        cetrafs_inline_discard_pressure(sb);
         cetrafs_sb_release_wait(sb);
         tried_claim_more = false;
         tried_claim_bg = false;

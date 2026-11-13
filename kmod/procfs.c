@@ -327,6 +327,20 @@ static int cetrafs_proc_info_show(struct seq_file *m, void *v)
     seq_printf(m, "discard_handback_unknown: %llu\n", cetrafs_discard_handback_unknown_count());
     seq_printf(m, "discard_pending_bgs: %u\n", cetrafs_sb_discard_pending_count(sb));
     seq_printf(m, "trim_leaked_blocks: %llu\n", cetrafs_trim_leaked_count());
+    {
+        u64 q, dr, gu, c, bl;
+
+        /* Inline discard (discard.c), this mount's: ranges noted by the
+         * free paths, dropped for a full queue, dropped by the worker
+         * giving up (pressure, unmount, off, a failing path), and the
+         * discards it issued and the blocks they covered. */
+        cetrafs_inline_discard_counts(sb, &q, &dr, &gu, &c, &bl);
+        seq_printf(m, "inline_discard_queued: %llu\n", q);
+        seq_printf(m, "inline_discard_dropped: %llu\n", dr);
+        seq_printf(m, "inline_discard_gave_up: %llu\n", gu);
+        seq_printf(m, "inline_discard_cmds: %llu\n", c);
+        seq_printf(m, "inline_discard_blocks: %llu\n", bl);
+    }
     seq_printf(m, "bg_recounts: %llu\n", cetrafs_bg_recount_count());
     seq_printf(m, "pf_drop_runs: %llu\n", cetrafs_pf_drop_runs_count());
     seq_printf(m, "pf_drop_blocks: %llu\n", cetrafs_pf_drop_blocks_count());
@@ -581,6 +595,9 @@ static int cetrafs_proc_controls_show(struct seq_file *m, void *v)
      * that does not is a switch with nothing behind it. */
     seq_printf(m, "discard: %s\n", cetrafs_sb_discard_enabled(sb) ? "on" : "off");
     seq_printf(m, "discard_supported: %s\n", cetrafs_discard_supported(sb) ? "yes" : "no");
+    /* Inline discard (`-o discard`); in force only while `discard` is
+     * on too. */
+    seq_printf(m, "inline_discard: %s\n", cetrafs_inline_discard_on(sb) ? "on" : "off");
     return 0;
 }
 
@@ -736,6 +753,8 @@ timing_out:
         cetrafs_sb_set_auto_defrag_enabled(sb, on);
     else if (!strcmp(key, "discard"))
         cetrafs_sb_set_discard_enabled(sb, on);
+    else if (!strcmp(key, "inline_discard"))
+        cetrafs_inline_discard_set(sb, on);
     else
         return -EINVAL;
 

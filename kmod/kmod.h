@@ -464,6 +464,18 @@ u64 cetrafs_discard_refused_count(void);
 u64 cetrafs_discard_handback_count(void);
 u64 cetrafs_discard_handback_deferred_count(void);
 u64 cetrafs_discard_handback_unknown_count(void);
+/* Inline discard (`-o discard`): frees noted, a worker discards them. */
+struct cetrafs_inline_discard;
+struct cetrafs_inline_discard *cetrafs_inline_discard_create(struct super_block *sb, bool on);
+void cetrafs_inline_discard_close(struct cetrafs_inline_discard *d);
+void cetrafs_inline_discard_destroy(struct cetrafs_inline_discard *d);
+bool cetrafs_inline_discard_on(struct super_block *sb);
+void cetrafs_inline_discard_set(struct super_block *sb, bool on);
+void cetrafs_inline_discard_pressure(struct super_block *sb);
+void cetrafs_inline_discard_note(struct super_block *sb, u32 bg, u64 lba, u32 count);
+void cetrafs_inline_discard_counts(struct super_block *sb, u64 *queued, u64 *dropped, u64 *gave_up, u64 *cmds,
+                                   u64 *blocks);
+struct cetrafs_inline_discard *cetrafs_sb_inline_discard(struct super_block *sb); /* fs.c */
 /* BG free counts (v0x0004): accrued per BG, applied by one epoch-guarded
  * CAS per dirty BG at the durability boundaries -- never left dirty in
  * the buffer cache (background writeback could land a stale count on a

@@ -3227,6 +3227,8 @@ static int __cetrafs_free_data_extent(struct super_block *sb, u64 lba, u32 count
     if (freed > credited)
         cetrafs_bg_adjust_free_blocks(sb, bg_id, (s64) (freed - credited));
     cetrafs_sb_alloc_unlock(sb);
+    if (freed)
+        cetrafs_inline_discard_note(sb, bg_id, lba, count); /* -o discard: queued, never issued here */
 
     /*
      * Say so if it went wrong. Every caller of this function ignores the
@@ -3315,6 +3317,8 @@ int cetrafs_apply_pending_free(struct super_block *sb, u64 lba, u32 count, u32 e
     if (freed)
         cetrafs_bg_adjust_free_blocks(sb, bg_id, (s64) freed);
     cetrafs_sb_alloc_unlock(sb);
+    if (freed)
+        cetrafs_inline_discard_note(sb, bg_id, lba, count); /* -o discard: queued, never issued here */
 
     ctrace("BLKAPPLY lba=%llu count=%u freed=%llu zg=%u\n", (unsigned long long) lba, count, (unsigned long long) freed,
            expect_zg);

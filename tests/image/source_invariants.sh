@@ -446,6 +446,7 @@ fs.c|sbi->lease_work|cancel_work_sync(&sbi->lease_work)|cancel_work_sync(&sbi->l
 scrub.c|s->work|cancel_delayed_work_sync(&s->work)|cetrafs_scrub_stop(
 heartbeat.c|hb->work|cancel_delayed_work_sync(&hb->work)|cetrafs_heartbeat_stop(
 heartbeat.c|hb->maint|cancel_delayed_work_sync(&hb->maint)|cetrafs_heartbeat_stop(
+discard.c|d->dwork|cancel_delayed_work_sync(&d->dwork)|cetrafs_inline_discard_close(
 '
 UNDRAINED=""
 SHARED_SEEN=""

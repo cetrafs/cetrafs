@@ -619,6 +619,10 @@ struct cetrafs_sb_info {
      * Keyed by BG id. */
     struct xarray discard_pending;
     atomic_t discard_pending_count;
+    /* Inline discard (`-o discard`, discard.c): the queue of runs freed
+     * in our own groups and the worker that discards them. From mount
+     * to cetrafs_inline_discard_close() in cetrafs_free_sb_info(). */
+    struct cetrafs_inline_discard *inline_discard;
 
     /* The cross-node whole-file EXCLUSIVE open lock (lock.c): on by
      * default, turned off at mount time with the `nofilelock` option.
@@ -1536,9 +1540,10 @@ struct cetrafs_fc_info {
     bool errors_panic;    /* errors=panic */
     bool corruption_stop; /* corruption=stop */
     bool nodiscard;       /* nodiscard */
+    bool inline_discard;  /* discard */
     /* Which of the above were STATED, rather than defaulted: only a
      * stated option can be "asked for and not in force". */
-    bool file_lock_set, errors_set, corruption_set, nodiscard_set;
+    bool file_lock_set, errors_set, corruption_set, nodiscard_set, discard_set;
     bool filled; /* fill_super ran: a new mount, not a second one of a mounted device */
 };
 
@@ -2705,7 +2710,15 @@ int cetrafs_fill_super(struct super_block *sb, struct fs_context *fc)
          * this replaces were filled in. Published at once because the
          * copy is needed from here on. */
         sbi->layout = cetrafs_layout_alloc(ondisk, NULL);
-        if (!sbi->layout || !sbi->inode_birth) {
+        /* Before anything that can free a block runs; drained in
+         * cetrafs_free_sb_info() (rule 20). */
+        {
+            const struct cetrafs_fc_info *fci = fc ? fc->fs_private : NULL;
+
+            sbi->inline_discard = cetrafs_inline_discard_create(sb, fci && fci->inline_discard);
+        }
+        if (!sbi->layout || !sbi->inode_birth || !sbi->inline_discard) {
+            cetrafs_inline_discard_destroy(sbi->inline_discard);
             cetrafs_layout_free_chain(sbi->layout);
             bitmap_free(sbi->alloc_shadow);
             kvfree(sbi->inode_birth);
@@ -3677,6 +3690,11 @@ void cetrafs_free_sb_info(struct super_block *sb)
     sbi->scrub = NULL;
 
     cetrafs_heartbeat_stop(sbi->hb);
+    /* The inline-discard worker claims through the allocator and reads
+     * the layout, both torn down below; the frees that feed it came from
+     * the evictions, the scrub, defrag and the heartbeat's queue drain,
+     * all finished by now. Nothing queues after this (rule 20). */
+    cetrafs_inline_discard_close(sbi->inline_discard);
     /*
      * A stopped mount -- fenced, its lease lost, a fatal error -- writes
      * NOTHING on the way out (docs/internal/ERRORS.md). The journal park
@@ -3823,6 +3841,8 @@ departed:
     xa_destroy(&sbi->deferred);
     xa_destroy(&sbi->bad_inos);
     xa_destroy(&sbi->discard_pending);
+    cetrafs_inline_discard_destroy(sbi->inline_discard); /* closed above; a late free found it closed */
+    sbi->inline_discard = NULL;
     /* Last: every work item that could read the layout is drained above
      * (rule 20). The raw copy used to be freed before lease_work and
      * stop_work were cancelled. */
@@ -5460,6 +5480,13 @@ bool cetrafs_sb_discard_enabled(struct super_block *sb)
     return sbi && READ_ONCE(sbi->discard_enabled);
 }
 
+struct cetrafs_inline_discard *cetrafs_sb_inline_discard(struct super_block *sb)
+{
+    struct cetrafs_sb_info *sbi = sb ? sb->s_fs_info : NULL;
+
+    return sbi ? sbi->inline_discard : NULL;
+}
+
 void cetrafs_sb_set_discard_enabled(struct super_block *sb, bool on)
 {
     struct cetrafs_sb_info *sbi = sb->s_fs_info;
@@ -6976,7 +7003,7 @@ int cetrafs_flush_dirty_free_counts(struct super_block *sb)
 
 /* ------ mount options ------ */
 
-enum cetrafs_param { Opt_nofilelock, Opt_errors, Opt_corruption, Opt_nodiscard };
+enum cetrafs_param { Opt_nofilelock, Opt_errors, Opt_corruption, Opt_nodiscard, Opt_discard };
 
 /* errors=: what a fatal error does (docs/internal/ERRORS.md, kind 3).
  * There is deliberately no "continue". */
@@ -7001,6 +7028,12 @@ static const struct fs_parameter_spec cetrafs_fs_parameters[] = {
     /* No automatic UNMAP (discard.c). Sets the starting value of the
      * per-mount `discard` control, which can still turn it back on. */
     fsparam_flag("nodiscard", Opt_nodiscard),
+    /* Inline discard as well (discard.c): runs freed inside the Block
+     * Groups this node keeps are discarded a moment later, batched --
+     * what `-o discard` means on ext4 and XFS. Off by default. Sets the
+     * starting value of the `inline_discard` control. The last of
+     * `discard` and `nodiscard` wins, as on ext4. */
+    fsparam_flag("discard", Opt_discard),
     {}};
 
 static int cetrafs_parse_param(struct fs_context *fc, struct fs_parameter *param)
@@ -7028,6 +7061,14 @@ static int cetrafs_parse_param(struct fs_context *fc, struct fs_parameter *param
     case Opt_nodiscard:
         fci->nodiscard = true;
         fci->nodiscard_set = true;
+        fci->inline_discard = false;
+        fci->discard_set = false;
+        break;
+    case Opt_discard:
+        fci->inline_discard = true;
+        fci->discard_set = true;
+        fci->nodiscard = false;
+        fci->nodiscard_set = false;
         break;
     }
     return 0;
@@ -7054,6 +7095,8 @@ static bool cetrafs_opts_unmet(const struct cetrafs_fc_info *fci, const struct c
         *what = fci->corruption_stop ? "corruption=stop" : "corruption=isolate";
     else if (fci->nodiscard_set && READ_ONCE(sbi->discard_enabled))
         *what = "nodiscard";
+    else if (fci->discard_set && !(READ_ONCE(sbi->discard_enabled) && cetrafs_inline_discard_on(sbi->sb)))
+        *what = "discard";
     else
         return false;
     return true;
