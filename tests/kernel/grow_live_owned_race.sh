@@ -49,6 +49,9 @@ IMG="$(ct_big_image 2400 ownrace)"
 DEV="$(ct_loop "$IMG")"
 MNT="$(ct_mnt ownrace)"
 ct_track mnt "$MNT"
+# Two-second beats, not fewer: the held publish blocks the heartbeat, and
+# the lease is three beats -- at 1 s a 3 s hold self-fenced the node and
+# every write after it was EIO. The holds stay under the 6 s lease.
 ct_param_set hb_interval_secs 2
 ct_param_set grow_skip_local_publish 0
 ct_param_set layout_refresh_hb_off 0
@@ -60,6 +63,7 @@ ct_param_set zg_claim_layout_stale 0
 
 info() { sed -n "s/^$1: //p" "$(ct_procdir "$DEV")/info"; }
 zg_owner() { grep -oP "^\s+zg $1: owner=\K\S+" "$(ct_procdir "$DEV")/info"; }
+zg_free() { grep -oP "^\s+zg $1: .*free_data_blocks=\K[0-9]+" "$(ct_procdir "$DEV")/info"; }
 
 # <claim|release>: a fresh volume up to the moment before the race.
 # Leaves the grow on the device, this node behind it, Block Group NEWID
@@ -79,8 +83,20 @@ stage() {
         ct_param_set zg_release_hold 1
         dd if=/dev/zero of="$MNT/f" bs=4096 count=16 conv=fsync status=none # claims Zone Group 1
         [ "$(zg_owner 1)" = 0 ] || { fail "release: setup: the write did not claim Zone Group 1"; return 1; }
+        local f0 f1 _
+        f0="$(zg_free 1)"
         rm -f "$MNT/f"
         sync
+        # A Block Group is handed back only once it reads empty. Wait for
+        # the delete's 16 blocks to show in the aggregate, or the release
+        # this round stages never comes at all.
+        for _ in $(seq 1 60); do
+            f1="$(zg_free 1)"
+            [ "$f1" -ge $((f0 + 16)) ] && break
+            sleep 0.5
+        done
+        [ "$f1" -ge $((f0 + 16)) ] ||
+            { fail "release: setup: the deleted file's blocks never came back to Zone Group 1 ($f0 -> $f1)"; return 1; }
         # The release skips a Zone Group whose aggregate delta is not
         # flushed yet (cetrafs_sb_zg_delta_pending()); the delete just
         # left one. Let two beats flush it with the release still held, or
@@ -150,7 +166,7 @@ run_release() {
     stage release || return 0
     ct_param_set owned_derive_unlocked "$2"
     o0="$(info owned_derive_overlaps)"
-    ct_param_set layout_publish_hold_ms 5000
+    ct_param_set layout_publish_hold_ms 4000
     (head -c 10 "$MNT/v1" >"$MNT.read" 2>/dev/null || true) &
     r=$!
     sleep 0.5
