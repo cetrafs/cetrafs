@@ -17,6 +17,9 @@
 #  2. growfs with a malformed shift refuses (exit 2) and grows nothing.
 #  3. a set boolean knob is announced on stderr, once.
 #  4. a well-formed knob still works: the hold holds.
+#  5. a knob that damages the volume (growfs CLOBBER_*, SKIP_BG_HEADERS,
+#     NO_AGGREGATE) refuses the run on anything but an image file, a
+#     loop device or a dm stack over loops; on a loop device it runs.
 #
 # DISCRIMINATION (2026-11-11, devutil.h/fsck.c/growfs.c before this
 # fix): 1 sleeps until the timeout (124); 2 reads "1x" as a shift of 1
@@ -62,5 +65,14 @@ log "4: CETRAFS_TEST_REPAIR_HOLD_SECS=3 still holds"
 s=$(date +%s); OUT="$(CETRAFS_TEST_REPAIR_HOLD_SECS=3 "$FSCK" -r "$DEV" 2>&1)" || true; e=$(date +%s)
 [ $((e - s)) -ge 3 ] && pass "4: held $((e - s)) s" || fail "4: held $((e - s)) s"
 grep -q "TEST KNOB CETRAFS_TEST_REPAIR_HOLD_SECS=3 is set" <<<"$OUT" && pass "4: and announced it" || fail "4: not announced"
+
+log "5: a knob that damages the volume is refused off a test device"
+DMG="damages the volume and is honoured only on"
+rc=0; OUT="$(CETRAFS_GROWFS_TEST_CLOBBER_JOURNAL=1 timeout 20 "$GROW" /dev/zero 2>&1)" || rc=$?
+[ "$rc" = 2 ] && grep -q "$DMG" <<<"$OUT" && pass "5: refused on a non-test device, exit 2" ||
+    fail "5: exit $rc: $(tail -2 <<<"$OUT")"
+OUT="$(CETRAFS_GROWFS_TEST_NO_AGGREGATE=1 timeout 60 "$GROW" "$DEV" 2>&1)" || true
+! grep -q "$DMG" <<<"$OUT" && grep -q "TEST KNOB CETRAFS_GROWFS_TEST_NO_AGGREGATE=1 is set" <<<"$OUT" &&
+    pass "5: honoured, and announced, on a loop device" || fail "5: on the loop device: $(tail -2 <<<"$OUT")"
 losetup -d "$DEV"
 ct_exit

@@ -353,6 +353,13 @@ int main(int argc, char **argv)
     if (fd < 0)
         die_dev("open(%s): %s", dev, strerror(errno));
 
+    /* The knobs that leave the volume damaged on purpose are refused
+     * here, before anything is written, on anything but a test device. */
+    (void) cetrafs_test_env_damaging("CETRAFS_GROWFS_TEST_SKIP_BG_HEADERS", fd);
+    (void) cetrafs_test_env_damaging("CETRAFS_GROWFS_TEST_CLOBBER_PENDING", fd);
+    (void) cetrafs_test_env_damaging("CETRAFS_GROWFS_TEST_CLOBBER_JOURNAL", fd);
+    (void) cetrafs_test_env_damaging("CETRAFS_GROWFS_TEST_NO_AGGREGATE", fd);
+
     unsigned long long dev_bytes = 0ULL;
 
     if (ioctl(fd, BLKGETSIZE64, &dev_bytes) < 0)

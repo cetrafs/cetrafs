@@ -26,6 +26,7 @@
 #define CETRAFS_DEVUTIL_H
 
 #include <errno.h>
+#include <dirent.h>
 #include <fcntl.h>
 #include <signal.h>
 #include <stdint.h>
@@ -122,6 +123,59 @@ static inline long long cetrafs_test_env_ll(const char *name, long long lo, long
         exit(2);
     }
     return r;
+}
+
+/* Is 'fd' something only a test makes: an image file, a loop device, or
+ * a device-mapper stack whose every member is a loop device (the crash
+ * rig's dm-log-writes)? */
+static inline int cetrafs_fd_is_test_device(int fd)
+{
+    char path[96];
+    struct stat st;
+    DIR *d;
+    struct dirent *e;
+    int members = 0, others = 0;
+
+    if (fstat(fd, &st))
+        return 0;
+    if (S_ISREG(st.st_mode))
+        return 1;
+    if (!S_ISBLK(st.st_mode))
+        return 0;
+    if (major(st.st_rdev) == 7) /* loop */
+        return 1;
+    snprintf(path, sizeof(path), "/sys/dev/block/%u:%u/slaves", major(st.st_rdev), minor(st.st_rdev));
+    d = opendir(path);
+    if (!d)
+        return 0;
+    while ((e = readdir(d))) {
+        if (e->d_name[0] == '.')
+            continue;
+        if (strncmp(e->d_name, "loop", 4) == 0)
+            members++;
+        else
+            others++;
+    }
+    closedir(d);
+    return members > 0 && others == 0;
+}
+
+/* A TEST knob that DAMAGES the volume (zeroes a journal, leaves Block
+ * Group headers unwritten): honoured only on a test device. Set on
+ * anything else -- a production run that inherited it from a test
+ * shell -- it refuses the run (exit 2) before anything is written. */
+static inline const char *cetrafs_test_env_damaging(const char *name, int fd)
+{
+    const char *v = cetrafs_test_env(name);
+
+    if (v && !cetrafs_fd_is_test_device(fd)) {
+        fprintf(stderr,
+                "cetrafs: TEST KNOB %s damages the volume and is honoured only on an image file or a loop "
+                "device; refusing to run\n",
+                name);
+        exit(2);
+    }
+    return v;
 }
 
 /* A test hold, in whole seconds: at most an hour. */
