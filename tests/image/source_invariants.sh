@@ -2370,6 +2370,15 @@ any_fn_body "$K/alloc.c" cetrafs_bg_id_for_lba | grep -q 'cetrafs_sb_layout_refr
     any_fn_body "$K/alloc.c" cetrafs_bg_id_for_lba | grep -q -- '-EAGAIN' &&
     pass "class 48: the Block Group lookup refreshes before it answers 'outside every region'" ||
     fail "class 48: cetrafs_bg_id_for_lba() no longer refreshes the layout or answers -EAGAIN"
+# A claim's recount counts the members of the layout it holds: it must
+# catch up with the device after the swap and before the recount, or a
+# grown member the previous owner claimed is "corrected" out of the
+# aggregate (tests/kernel/zg_claim_behind_grow.sh).
+# The definition, not the forward declaration above it: the last body.
+C48CL="$(awk '$0 ~ "^[a-z_].*[ *]__cetrafs_zg_try_claim_one[(]" { buf = ""; on = 1 } on { buf = buf $0 "\n" } on && /^}/ { last = buf; on = 0 } END { printf "%s", last }' "$K/zonegroup.c" | grep -nE 'cetrafs_sb_layout_refresh|cetrafs_zg_reconcile_free_counts\(sb, zg_id\)' | tail -2 | cut -d: -f2- | grep -oE 'cetrafs_[a-z_]+' | tr '\n' ' ' || true)"
+[ "$C48CL" = "cetrafs_sb_layout_refresh cetrafs_zg_reconcile_free_counts " ] &&
+    pass "class 48: a Zone Group claim catches the layout up before it recounts" ||
+    fail "class 48: __cetrafs_zg_try_claim_one() no longer refreshes the layout before the claim's recount ('$C48CL')"
 SAMPLE="$(ct_tmp c48-sample).c"
 printf 'static int cetrafs_new_reader(struct super_block *sb)\n{\n    if (cetrafs_lba_run_check(sb, 5, 1))\n        cetrafs_sb_corrupt(sb, 0);\n    return 0;\n}\n' >"$SAMPLE"
 [ "$(unhandled_check "$SAMPLE")" = "$(basename "$SAMPLE"):cetrafs_new_reader" ] &&

@@ -934,6 +934,15 @@ u64 cetrafs_zg_claim_replay_deferral_count(void)
     return (u64) atomic64_read(&cetrafs_zg_claim_replay_deferrals);
 }
 
+/* TEST ONLY: a claim recounts over the layout it has, without catching
+ * up with the device first -- the control of
+ * tests/kernel/zg_claim_behind_grow.sh. */
+static bool cetrafs_zg_claim_layout_stale;
+cetrafs_test_param(zg_claim_layout_stale, cetrafs_zg_claim_layout_stale, bool, 0644);
+MODULE_PARM_DESC(zg_claim_layout_stale, "TEST ONLY: a Zone Group claim recounts without refreshing the layout");
+
+static atomic64_t cetrafs_zg_claim_layout_skips = ATOMIC64_INIT(0);
+
 static int __cetrafs_zg_try_claim_one(struct super_block *sb,
                                       u32 zg_id,
                                       u32 my_node_id,
@@ -1122,8 +1131,28 @@ static int __cetrafs_zg_try_claim_one(struct super_block *sb,
      * record this ZG as ours in the in-memory ownership cache, same as
      * the already_ours branch above. */
     {
-        const cetrafs_superblock_t *rsb = cetrafs_sb_raw(sb);
-        u32 b, nbg = rsb ? le32_to_cpu(rsb->block_group_count) : 0;
+        const cetrafs_superblock_t *rsb;
+        u32 b, nbg;
+        int lret = 0;
+
+        /* The members are counted over the layout this node has
+         * published, and that layout can be behind the device: a peer's
+         * grow not caught up with yet, or a publish of it in progress.
+         * A Block Group that grow added and the previous owner claimed
+         * into this Zone Group is then not counted, and the recount
+         * below "corrects" the aggregate by its whole free count. So
+         * catch up first: the swap above made the Zone Group ours, so
+         * from here nobody else adds a member, and every member it has
+         * is in the layout on the device now. layout_mutex waits out a
+         * publish in progress. If the layout cannot be brought up to
+         * date, the recount is skipped: the aggregate keeps its value,
+         * fsck reports any drift and the next mount recounts it. */
+        if (likely(!READ_ONCE(cetrafs_zg_claim_layout_stale)))
+            lret = cetrafs_sb_layout_refresh(sb);
+        else
+            atomic64_inc(&cetrafs_zg_claim_layout_skips); /* test-only: see the knob */
+        rsb = cetrafs_sb_raw(sb);
+        nbg = rsb ? le32_to_cpu(rsb->block_group_count) : 0;
 
         /* Which Block Groups this Zone Group has NOW: the map is from
          * this node's mount, and the previous owner may have handed
@@ -1143,7 +1172,12 @@ static int __cetrafs_zg_try_claim_one(struct super_block *sb,
          * so its numbers are exactly the ones expected to be wrong.
          * After the invalidate above, deliberately, so the scan reads
          * the device rather than this node's stale cache. */
-        cetrafs_zg_reconcile_free_counts(sb, zg_id);
+        if (lret < 0)
+            pr_err("ZG %u claim: the layout could not be brought up to date (%d) -- the free-count recount is "
+                   "skipped\n",
+                   zg_id, lret);
+        else
+            cetrafs_zg_reconcile_free_counts(sb, zg_id);
 
         /* Only now allocatable. Cached first, an allocation could land
          * while the recount ran: its aggregate delta accrued before the

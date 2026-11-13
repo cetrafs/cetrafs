@@ -39,7 +39,7 @@ set -euo pipefail
 . "$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)/lib/harness.sh"
 require_root
 require_module
-for k in layout_publish_hold_ms owned_derive_unlocked zg_release_hold grow_skip_local_publish; do
+for k in layout_publish_hold_ms owned_derive_unlocked zg_release_hold grow_skip_local_publish zg_claim_layout_stale; do
     [ -w "/sys/module/cetrafs/parameters/$k" ] || { skip "$k is missing"; ct_exit; }
 done
 BG_POKE="$(ct_helper bg_poke)"
@@ -56,6 +56,7 @@ ct_param_set layout_past_end_no_refresh 0
 ct_param_set layout_publish_hold_ms 0
 ct_param_set owned_derive_unlocked 0
 ct_param_set zg_release_hold 0
+ct_param_set zg_claim_layout_stale 0
 
 info() { sed -n "s/^$1: //p" "$(ct_procdir "$DEV")/info"; }
 zg_owner() { grep -oP "^\s+zg $1: owner=\K\S+" "$(ct_procdir "$DEV")/info"; }
@@ -80,6 +81,11 @@ stage() {
         [ "$(zg_owner 1)" = 0 ] || { fail "release: setup: the write did not claim Zone Group 1"; return 1; }
         rm -f "$MNT/f"
         sync
+        # The release skips a Zone Group whose aggregate delta is not
+        # flushed yet (cetrafs_sb_zg_delta_pending()); the delete just
+        # left one. Let two beats flush it with the release still held, or
+        # the release slips a beat and can fall past the hold.
+        sleep 5
     fi
     ct_param_set layout_refresh_hb_off 1
     NEWID="$(info block_group_count)"
@@ -103,6 +109,10 @@ stage() {
 finish() {
     ct_umount "$MNT"
     "$PPOKE" "$IMG" "$INO1" "$WAS1" >/dev/null
+    if [ "$1" = A ]; then # the claim skipped its recount's catch-up (run_claim): the mount's recount
+        ct_mount "$DEV" "$MNT"
+        ct_umount "$MNT"
+    fi
     out="$(ct_fsck "$DEV" 2>&1)" && pass "$1: fsck clean" || fail "$1: fsck: $(grep -m3 ERR <<<"$out" | tr '\n' ' ')"
 }
 
@@ -110,6 +120,12 @@ finish() {
 run_claim() {
     local tag="$1" o0 r
     stage claim || return 0
+    # A claim catches its layout up before it recounts, waiting out a
+    # publish in progress (zg_claim_behind_grow.sh) -- so it can no longer
+    # land inside the held publish, and owned_lock could not be measured.
+    # Skip the catch-up here: this suite is about the marks; finish()
+    # remounts so the mount's recount puts the aggregate right.
+    ct_param_set zg_claim_layout_stale 1
     ct_param_set owned_derive_unlocked "$2"
     o0="$(info owned_derive_overlaps)"
     ct_param_set layout_publish_hold_ms 3000
@@ -119,6 +135,7 @@ run_claim() {
     dd if=/dev/zero of="$MNT/w" bs=4096 count=16 conv=fsync status=none # claims Zone Group 1 in the hold
     wait "$r"
     ct_param_set owned_derive_unlocked 0
+    ct_param_set zg_claim_layout_stale 0
     [ "$(info owned_derive_overlaps)" -gt "$o0" ] && [ "$(info block_group_count)" -gt "$NEWID" ] &&
         [ "$(zg_owner 1)" = 0 ] ||
         { fail "$tag: setup: the claim did not land in the held publish (overlaps $o0 -> $(info owned_derive_overlaps), BGs $(info block_group_count), ZG1 owner $(zg_owner 1))"; ct_umount "$MNT"; return 0; }
@@ -133,7 +150,7 @@ run_release() {
     stage release || return 0
     ct_param_set owned_derive_unlocked "$2"
     o0="$(info owned_derive_overlaps)"
-    ct_param_set layout_publish_hold_ms 4000
+    ct_param_set layout_publish_hold_ms 5000
     (head -c 10 "$MNT/v1" >"$MNT.read" 2>/dev/null || true) &
     r=$!
     sleep 0.5

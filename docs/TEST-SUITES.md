@@ -26,7 +26,7 @@ make check
 ```
 
 That is the gate. It runs every suite under `tests/image/` and
-`tests/kernel/` -- **558 suites, about 4,400 individual assertions** --
+`tests/kernel/` -- **559 suites, about 4,400 individual assertions** --
 against a loop-backed volume, and exits nonzero if any assertion fails
 OR if any suite aborts without failing one. Nothing ships on a red gate.
 
@@ -75,7 +75,7 @@ unbounded is still the bug.
 
 ### `tests/kernel/` -- the regression suite proper
 
-512 suites, one concern each, against a loaded module and a real mount.
+513 suites, one concern each, against a loaded module and a real mount.
 Roughly by area:
 
 | area | what it covers |
