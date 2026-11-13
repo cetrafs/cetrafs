@@ -346,6 +346,14 @@ make soak ROUNDS=200 SOAK_MAX_SECS=7200     # stop starting rounds after two hou
   `/tmp`: a 700 MiB image per round does not fit a tmpfs.
 - `SOAK_REPORT` -- the report file (default `$SOAK_DIR/report.txt`). One
   line per round, then a `SUMMARY` line that is always last.
+- `SOAK_RANDOM` -- 1 (default): after the mixed rounds, the randomized
+  suites in their long modes with a fresh seed per cycle -- `fsx_model`
+  (`FSX_LONG`), `fsstress_namespace` (`FSSTRESS_LONG`), `churn_oracle`
+  (6 rounds of 60 s). One cycle always runs; more follow while the
+  deadline allows. A failure is a report line naming the suite and seed,
+  its output kept as `random-fail-N.log`. They run through `tests/run.sh`,
+  which loads the tree's own build. 0 skips them. Control:
+  `FSX_NEGATIVE=150` must make the soak exit 1 naming `fsx_model`.
 
 Exit status: **0** every round that ran was clean and the run reached its
 end (the round count or the deadline); **1** at least one round was

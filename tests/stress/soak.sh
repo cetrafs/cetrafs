@@ -18,8 +18,9 @@
 #   0  every round that ran was clean and the run reached its end
 #      (the round count, or the deadline)
 #   1  at least one round was ANOMALOUS (an operation failed, or fsck
-#      reported a problem) or ABORTED (mkfs or mount failed); the failing
-#      image is kept as mix-fail-N.img beside the report
+#      reported a problem) or ABORTED (mkfs or mount failed), or a
+#      randomized suite failed; the failing image is kept as
+#      mix-fail-N.img, a failing suite's output as random-fail-N.log
 #   2  a precondition failed (module not loaded, scratch directory unusable);
 #      nothing ran, so there is no result
 #
@@ -34,6 +35,21 @@
 #                  from the start on every run.
 #   SOAK_IMG_MB    image size per round (default 700). Too small for mkfs
 #                  is how the abort path is exercised on purpose.
+#   SOAK_RANDOM    1 (the default) runs the randomized suites after the
+#                  mixed rounds, in their long modes, with a fresh seed
+#                  each cycle: fsx_model (FSX_LONG), fsstress_namespace
+#                  (FSSTRESS_LONG) and churn_oracle (CHURN_ROUNDS=6,
+#                  CHURN_SECS=60). One cycle always runs, even past
+#                  the deadline; with a deadline more cycles follow
+#                  while time remains. Each suite
+#                  is a report line; a failing one names its seed, and
+#                  its output is kept as random-fail-N.log. They run
+#                  through tests/run.sh, which loads the tree's own build
+#                  (kmod/cetrafs.ko), not the module the mixed rounds
+#                  used. 0 skips them. FSX_OPS, FSSTRESS_OPS,
+#                  CHURN_ROUNDS and CHURN_SECS pass through to shorten a
+#                  run. CONTROL: FSX_NEGATIVE=150 makes every fsx seed
+#                  fail, and the soak must then exit 1 naming fsx_model.
 #   SOAK_INJECT_FSCK=1  NEGATIVE CONTROL: after each round's operations,
 #                  overwrite the Zone Group table on the unmounted image
 #                  before fsck, so every round is an anomaly. Proves the
@@ -182,13 +198,52 @@ for r in $(seq 1 "$ROUNDS"); do
     rm -f "$IMG"
 done
 
+# The randomized suites, long modes, new seeds each cycle -- what finds a
+# bug nobody imagined (docs/internal/TEST-COVERAGE-GAPS.md, 1 and 6).
+RFAIL=0
+RRAN=0
+# The first cycle always runs, deadline or not: the mixed rounds can use
+# up the whole budget, and these are the part that finds new bugs.
+if [ "${SOAK_RANDOM:-1}" = 1 ] && [ "$ABORTED" = 0 ]; then
+    cycle=0
+    while :; do
+        cycle=$((cycle + 1))
+        seed=$(( $(date +%s) % 100000 + cycle ))
+        for suite in fsx_model fsstress_namespace churn_oracle; do
+            if [ "$cycle" -gt 1 ] && [ $(($(date +%s) - START)) -ge "$MAX_SECS" ]; then
+                STOPPED_AT_DEADLINE=1
+                break 2
+            fi
+            RRAN=$((RRAN + 1))
+            OUT="$DIR/random-$RRAN.log"
+            RC=0
+            case "$suite" in
+            fsx_model) env FSX_LONG=1 FSX_SEEDS="$seed $((seed + 1))" "$ROOT/tests/run.sh" kernel/$suite.sh >"$OUT" 2>&1 || RC=$? ;;
+            fsstress_namespace) env FSSTRESS_LONG=1 FSSTRESS_SEEDS="$seed" "$ROOT/tests/run.sh" kernel/$suite.sh >"$OUT" 2>&1 || RC=$? ;;
+            churn_oracle) env CHURN_SEED="$seed" CHURN_ROUNDS="${CHURN_ROUNDS:-6}" CHURN_SECS="${CHURN_SECS:-60}" \
+                "$ROOT/tests/run.sh" kernel/$suite.sh >"$OUT" 2>&1 || RC=$? ;;
+            esac
+            if [ "$RC" = 0 ]; then
+                say "random $RRAN: clean  ($suite seed=$seed)"
+                rm -f "$OUT"
+            else
+                RFAIL=$((RFAIL + 1))
+                say "random $RRAN: ANOMALY ($suite seed=$seed rc=$RC) -- output kept as random-fail-$RRAN.log"
+                grep -E "^FAIL" "$OUT" | head -4 | sed 's/^/    /' | tee -a "$REPORT"
+                mv "$OUT" "$DIR/random-fail-$RRAN.log"
+            fi
+        done
+        [ "$MAX_SECS" -gt 0 ] || break
+    done
+fi
+
 ELAPSED=$(($(date +%s) - START))
-if [ "$ABORTED" -gt 0 ] || [ "$ANOM" -gt 0 ]; then
+if [ "$ABORTED" -gt 0 ] || [ "$ANOM" -gt 0 ] || [ "$RFAIL" -gt 0 ]; then
     VERDICT=FAIL
 else
     VERDICT=PASS
 fi
-say "SUMMARY verdict=$VERDICT rounds_run=$RAN clean=$CLEAN anomalous=$ANOM aborted=$ABORTED deadline_hit=$STOPPED_AT_DEADLINE elapsed_s=$ELAPSED"
+say "SUMMARY verdict=$VERDICT rounds_run=$RAN clean=$CLEAN anomalous=$ANOM aborted=$ABORTED random_run=$RRAN random_failed=$RFAIL deadline_hit=$STOPPED_AT_DEADLINE elapsed_s=$ELAPSED"
 if [ "$VERDICT" = FAIL ]; then
     say "failing images, if any, are in $DIR (mix-fail-N.img)"
     exit 1
