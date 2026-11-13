@@ -53,7 +53,9 @@ list_suites() {
     local f
     for f in image/*.sh kernel/*.sh device/*.sh stress/*.sh; do
         [ -f "$f" ] || continue
-        printf '  %-42s %s\n' "$f" "$(sed -n '2s/^# \?//p' "$f")"
+        # The purpose is the first comment after the shebang that is not
+        # the SPDX tag (most suites have one, a few do not).
+        printf '  %-42s %s\n' "$f" "$(awk 'NR > 1 && /^#/ && !/SPDX-License-Identifier/ { sub(/^# ?/, ""); print; exit }' "$f")"
     done
 }
 

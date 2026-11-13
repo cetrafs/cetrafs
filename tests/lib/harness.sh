@@ -357,6 +357,10 @@ ct_tmp() {
 # ct_image <size_mb> [name] -> path to a tracked sparse image file
 ct_image() {
     local p avail dir="${CT_IMG_DIR:-/tmp}"
+    # CT_IMG_MIN_MB: a floor on every image's size, set by the configuration
+    # matrix (tests/matrix.sh) so a bigger Block Group or more Zone Groups
+    # has room to exist. Sparse, so the floor costs nothing until written.
+    [ -n "${CT_IMG_MIN_MB:-}" ] && [ "$1" -lt "$CT_IMG_MIN_MB" ] && set -- "$CT_IMG_MIN_MB" "${@:2}"
     # /tmp is a tmpfs here and every suite puts a half-gigabyte image in
     # it. The images are sparse, so the cost is what gets WRITTEN, and a
     # run that fills /tmp does not fail where the space ran out -- it
@@ -539,6 +543,7 @@ ct_procdir() { echo "/proc/fs/cetrafs/$(basename "$(readlink -f "$1")")"; }
 # /root. Sparse, so the cost is still only what gets written.
 ct_big_image() {
     local p avail dir="${CT_BIG_DIR:-/root}"
+    [ -n "${CT_IMG_MIN_MB:-}" ] && [ "$1" -lt "$CT_IMG_MIN_MB" ] && set -- "$CT_IMG_MIN_MB" "${@:2}"
 
     avail="$(df -Pm "$dir" | awk 'NR==2 {print $4}')"
     if [ -n "$avail" ] && [ "$avail" -lt $(($1 + 200)) ]; then
@@ -620,7 +625,12 @@ ct_helper() {
 ct_mkfs() {
     local dev="$1"
     shift
-    "$ROOT/userspace/mkfs.cetra" "$dev" "$@"
+    # CT_MKFS_EXTRA is appended AFTER the suite's own geometry. mkfs reads
+    # its options with getopt and each one overwrites the last, so the
+    # configuration matrix (tests/matrix.sh) can change -b/-z/-J without
+    # touching the suite. Unset, this is exactly the old call.
+    # shellcheck disable=SC2086
+    "$ROOT/userspace/mkfs.cetra" "$dev" "$@" ${CT_MKFS_EXTRA:-}
 }
 ct_fsck() { "$ROOT/userspace/fsck.cetra" "$1"; }
 ct_growfs() { "$ROOT/userspace/growfs.cetra" "$@"; }
@@ -693,7 +703,12 @@ ct_bgs_of_zg() {
 ct_fsck_repair() { "$ROOT/userspace/fsck.cetra" -r "$1"; }
 
 ct_mount() {
-    mount -t cetrafs "$1" "$2" || return $?
+    # CT_MOUNT_OPTS: extra -o options for every ct_mount (the matrix's
+    # nofilelock configuration). A suite that mounts with its own -o does
+    # not go through here.
+    local opts=()
+    [ -n "${CT_MOUNT_OPTS:-}" ] && opts=(-o "$CT_MOUNT_OPTS")
+    mount -t cetrafs ${opts[@]+"${opts[@]}"} "$1" "$2" || return $?
     ct_track mnt "$2"
 }
 ct_umount() { umount "$1"; }

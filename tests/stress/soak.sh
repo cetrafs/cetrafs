@@ -1,7 +1,6 @@
 #!/bin/bash
 # SPDX-License-Identifier: GPL-2.0-or-later
-# mixed-workload soak with a full fsck after every round (slow, opt-in)
-#
+# mixed-workload soak with a full fsck after every round -- runnable unattended (slow, opt-in)
 #
 # mount_test.sh proves specific behaviours; this hammers the structure
 # with the operations that actually mutate it and then asks fsck whether
@@ -10,35 +9,128 @@
 # marked free, leaked blocks, unreachable inodes, nlink mismatches --
 # so a round that comes back clean means something.
 #
-# Usage: sudo tests/soak.sh [rounds]   (default 20, ~5s each)
+# Usage (from the repository root):
+#   make soak ROUNDS=200 SOAK_MAX_SECS=7200
+#   tests/stress/soak.sh [rounds]            (default 20)
 #
-# Needs the module already loaded; it deliberately does NOT insmod, so
-# it can be pointed at whatever build you want to exercise. Every step
-# that could silently no-op (mkfs, mount) is checked -- a soak that
-# passes because it never touched the filesystem is worse than no soak.
+# Unattended: no prompts, no terminal needed. It stops starting new rounds
+# at the deadline, finishes the round it is in, writes a report, and exits:
+#   0  every round that ran was clean and the run reached its end
+#      (the round count, or the deadline)
+#   1  at least one round was ANOMALOUS (an operation failed, or fsck
+#      reported a problem) or ABORTED (mkfs or mount failed); the failing
+#      image is kept as mix-fail-N.img beside the report
+#   2  a precondition failed (module not loaded, scratch directory unusable);
+#      nothing ran, so there is no result
 #
-# Mixed-workload soak. The create-only soak proved creates; this exercises
-# the paths that actually mutate structure -- unlink, rename, hardlink,
-# truncate, hole-punch, xattrs, nested dirs, directory growth past the
-# inline extents -- and fscks the unmounted result each round, so any
-# structural damage is named rather than inferred.
+# Environment:
+#   SOAK_MAX_SECS  stop starting rounds after this many seconds (0 = no
+#                  limit, the default). Checked between rounds only.
+#   SOAK_DIR       scratch directory: images, the mountpoint, mkfs logs and
+#                  the report (default ${CT_BIG_DIR:-/root}/cetrafs-soak).
+#                  Not /tmp: a 700 MiB image per round does not fit a tmpfs.
+#   SOAK_REPORT    the report file (default $SOAK_DIR/report.txt). One line
+#                  per round, then a SUMMARY line; the file is rewritten
+#                  from the start on every run.
+#   SOAK_IMG_MB    image size per round (default 700). Too small for mkfs
+#                  is how the abort path is exercised on purpose.
+#   SOAK_INJECT_FSCK=1  NEGATIVE CONTROL: after each round's operations,
+#                  overwrite the Zone Group table on the unmounted image
+#                  before fsck, so every round is an anomaly. Proves the
+#                  exit status and the report, nothing else.
+#
+# Scheduling it is the operator's job, and nothing here installs a unit:
+# see tests/README.md, "Unattended soak", for a cron entry and the
+# systemd-timer equivalent.
+#
+# Needs the module already loaded; it deliberately does NOT insmod, so it
+# can be pointed at whatever build you want to exercise. Every step that
+# could silently no-op (mkfs, mount) is checked -- a soak that passes
+# because it never touched the filesystem is worse than no soak.
 ROOT="$(cd "$(dirname "$0")/../.." && pwd)"
-IMG=${TMPDIR:-/tmp}/cetrafs-soak/mix.img; MNT=${TMPDIR:-/tmp}/cetrafs-soak/mixmnt
-mkdir -p $MNT
-if ! lsmod | grep -q '^cetrafs '; then echo "cetrafs module not loaded"; exit 2; fi
-# A soak that found damage but still exited 0 would be worse than no soak
-# (the "a test that cannot fail" trap). Count anomalous rounds and fail the
-# whole run if any occurred -- while still finishing the remaining rounds, so
-# one bad round does not hide a second and every failing image is captured.
-ANOM=0
-for r in $(seq 1 ${1:-20}); do
-    rm -f $IMG; truncate -s 700M $IMG
-    LOOP=$(losetup --find --show $IMG)
-    if ! $ROOT/userspace/mkfs.cetra $LOOP -z 1 -b 512 -J 1 -M 4 -N 3000 -f >/tmp/mix_mkfs 2>&1; then
-        echo "round $r: FATAL mkfs failed: $(tail -1 /tmp/mix_mkfs)"; losetup -d $LOOP; exit 2
+ROUNDS="${1:-20}"
+MAX_SECS="${SOAK_MAX_SECS:-0}"
+DIR="${SOAK_DIR:-${CT_BIG_DIR:-/root}/cetrafs-soak}"
+REPORT="${SOAK_REPORT:-$DIR/report.txt}"
+IMG="$DIR/mix.img"
+MNT="$DIR/mixmnt"
+MKFS_LOG="$DIR/mkfs.log"
+IMG_MB="${SOAK_IMG_MB:-700}"
+LOOP=""
+
+case "$ROUNDS$MAX_SECS" in
+*[!0-9]*)
+    echo "soak: ROUNDS and SOAK_MAX_SECS must be whole numbers" >&2
+    exit 2
+    ;;
+esac
+if ! lsmod | grep -q '^cetrafs '; then
+    echo "soak: cetrafs module not loaded -- nothing was run" >&2
+    exit 2
+fi
+mkdir -p "$DIR" "$MNT" 2>/dev/null || {
+    echo "soak: cannot create scratch directory $DIR" >&2
+    exit 2
+}
+: >"$REPORT" || {
+    echo "soak: cannot write report $REPORT" >&2
+    exit 2
+}
+
+say() {
+    echo "$*"
+    echo "$*" >>"$REPORT"
+}
+
+# Whatever happens -- abort, deadline, a signal -- the loop device and the
+# mount go, so an unattended run never leaves a mount behind for the next.
+cleanup() {
+    if grep -q " $MNT cetrafs " /proc/self/mounts 2>/dev/null; then
+        umount "$MNT" 2>/dev/null || true
     fi
-    if ! mount -t cetrafs $LOOP $MNT 2>/dev/null || ! grep -q " $MNT cetrafs " /proc/self/mounts; then
-        echo "round $r: FATAL mount failed"; losetup -d $LOOP; exit 2
+    if [ -n "$LOOP" ]; then
+        losetup -d "$LOOP" 2>/dev/null || true
+    fi
+    rm -f "$IMG"
+}
+trap cleanup EXIT
+trap 'exit 130' INT TERM
+
+START=$(date +%s)
+CLEAN=0
+ANOM=0
+ABORTED=0
+RAN=0
+STOPPED_AT_DEADLINE=0
+say "soak start $(date -u +%Y-%m-%dT%H:%M:%SZ) rounds=$ROUNDS max_secs=$MAX_SECS dir=$DIR"
+
+for r in $(seq 1 "$ROUNDS"); do
+    if [ "$MAX_SECS" -gt 0 ] && [ $(($(date +%s) - START)) -ge "$MAX_SECS" ]; then
+        STOPPED_AT_DEADLINE=1
+        say "deadline reached after $RAN round(s) -- not starting round $r"
+        break
+    fi
+    RAN=$((RAN + 1))
+    rm -f "$IMG"
+    truncate -s "${IMG_MB}M" "$IMG"
+    LOOP=$(losetup --find --show "$IMG") || {
+        say "round $r: ABORTED (no loop device)"
+        ABORTED=$((ABORTED + 1))
+        break
+    }
+    if ! "$ROOT/userspace/mkfs.cetra" "$LOOP" -z 1 -b 512 -J 1 -M 4 -N 3000 -f >"$MKFS_LOG" 2>&1; then
+        say "round $r: ABORTED mkfs failed: $(tail -1 "$MKFS_LOG")"
+        ABORTED=$((ABORTED + 1))
+        losetup -d "$LOOP" 2>/dev/null
+        LOOP=""
+        break
+    fi
+    if ! mount -t cetrafs "$LOOP" "$MNT" 2>/dev/null || ! grep -q " $MNT cetrafs " /proc/self/mounts; then
+        say "round $r: ABORTED mount failed"
+        ABORTED=$((ABORTED + 1))
+        losetup -d "$LOOP" 2>/dev/null
+        LOOP=""
+        break
     fi
     ERRS=0
     mkdir -p $MNT/a/b/c $MNT/z 2>/dev/null || ERRS=$((ERRS+1))
@@ -65,21 +157,40 @@ for r in $(seq 1 ${1:-20}); do
     # 6. delete a swathe, including a whole subtree
     for i in $(seq 56 120); do rm -f $MNT/a/f$i 2>/dev/null || ERRS=$((ERRS+1)); done
     rm -rf $MNT/a/b/c 2>/dev/null || ERRS=$((ERRS+1))
-    sync; umount $MNT
-    FSCK=$($ROOT/userspace/fsck.cetra $LOOP 2>&1 || true)
-    if [ "$ERRS" != "0" ] || echo "$FSCK" | grep -q "problem"; then
-        echo "round $r: ANOMALY op_errors=$ERRS"
-        echo "$FSCK" | grep -E "ERR|WARN|problem" | head -6
-        cp $IMG ${TMPDIR:-/tmp}/cetrafs-soak/mix-fail-$r.img 2>/dev/null
-        ANOM=$((ANOM+1))
-    else
-        echo "round $r: clean  ($(echo "$FSCK" | grep -oP 'content: \K[^,]+'), $(echo "$FSCK" | grep -oP 'namespace: \K.*'))"
+    sync
+    umount "$MNT"
+    if [ "${SOAK_INJECT_FSCK:-0}" = 1 ]; then
+        dd if=/dev/urandom of="$LOOP" bs=4096 count=1 seek=1 conv=notrunc status=none 2>/dev/null
+        blockdev --flushbufs "$LOOP" 2>/dev/null || true
     fi
-    losetup -d $LOOP
+    FSCK_RC=0
+    FSCK="$("$ROOT/userspace/fsck.cetra" "$LOOP" 2>&1)" || FSCK_RC=$?
+    losetup -d "$LOOP" 2>/dev/null
+    LOOP=""
+    PROBLEM=0
+    grep -q "problem" <<<"$FSCK" && PROBLEM=1
+    if [ "$ERRS" != "0" ] || [ "$FSCK_RC" != "0" ] || [ "$PROBLEM" = 1 ]; then
+        ANOM=$((ANOM + 1))
+        say "round $r: ANOMALY op_errors=$ERRS fsck_rc=$FSCK_RC"
+        grep -E "ERR|WARN|problem" <<<"$FSCK" | head -6 | sed 's/^/    /' | tee -a "$REPORT"
+        cp "$IMG" "$DIR/mix-fail-$r.img" 2>/dev/null
+    else
+        CONTENT="$(grep -oE 'content: [^,]+' <<<"$FSCK" | head -1)"
+        CLEAN=$((CLEAN + 1))
+        say "round $r: clean  (${CONTENT:-content: ?})"
+    fi
+    rm -f "$IMG"
 done
-rm -f $IMG
-if [ "$ANOM" != "0" ]; then
-    echo "MIXDONE: $ANOM anomalous round(s) -- failing images saved as ${TMPDIR:-/tmp}/cetrafs-soak/mix-fail-*.img"
+
+ELAPSED=$(($(date +%s) - START))
+if [ "$ABORTED" -gt 0 ] || [ "$ANOM" -gt 0 ]; then
+    VERDICT=FAIL
+else
+    VERDICT=PASS
+fi
+say "SUMMARY verdict=$VERDICT rounds_run=$RAN clean=$CLEAN anomalous=$ANOM aborted=$ABORTED deadline_hit=$STOPPED_AT_DEADLINE elapsed_s=$ELAPSED"
+if [ "$VERDICT" = FAIL ]; then
+    say "failing images, if any, are in $DIR (mix-fail-N.img)"
     exit 1
 fi
-echo MIXDONE
+exit 0

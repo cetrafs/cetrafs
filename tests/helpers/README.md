@@ -16,10 +16,12 @@ only when the source or the format header is newer.
 | `node_poke` | a Node Registry row: state / `hb_seq` / `last_seen` / uuid / `fence_epoch` | write a row, `--beat`, `--beat-keep-time`, `--bump-fence` |
 | `inode_lock_poke` | an inode's `lock_owner_node` / `lock_mode`, and dumps `ns_owner` / `readers` | read-only dump (safe while mounted) or write |
 | `inode_block_poke` | a whole inode record | probe a packed-block clobber, `retype` a record (new mode + generation + valid checksum) |
-| `leaf_poke` | a depth-1 file's external extent leaf | `setphys` |
+| `leaf_poke` | a depth-1 file's external extent leaf | `setphys`, `setblock` (an entry's logical start, restamped: an alias on purpose), `show`, `growlen` |
 | `pending_poke` | a ZG's pending-free queue | `add`, `dump`, and `extent <ino>` (prints an inode's first extent, so a test can learn a real LBA) |
 | `journal_poke` | a node's journal area | write a valid entry, force the clean flag back to MUST-SCAN |
 | `corrupt_poke` | arbitrary structures, for fsck's negative controls | per-field corruption |
+| `fsx_cetra` | one file, a seeded stream of data ops against an in-memory model | `kernel/fsx_model.sh`; `FSX_NEGATIVE` corrupts the model on purpose |
+| `fsstress_cetra` | several processes, a seeded namespace stream, per-process model, shared-directory errno contract | `kernel/fsstress_namespace.sh`; `FSSTRESS_NEGATIVE` corrupts the model |
 
 **Poke while unmounted** unless the helper's own header says otherwise.
 Writing behind a live mount races the kernel's buffer cache, and a read

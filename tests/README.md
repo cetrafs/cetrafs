@@ -30,7 +30,8 @@ make check-one SUITE=kernel/nslock.sh
 
 make check-caw DEV=/dev/sdX    # DESTRUCTIVE: reformats that device
 make check-slow                # slow sparse/s_maxbytes test (loop-backed)
-make soak ROUNDS=20            # module must already be loaded
+make soak ROUNDS=20            # module must already be loaded; see "Unattended soak"
+make -C tests matrix           # a suite slice under each mount/geometry configuration
 
 make mod KASAN=1               # build for a KASAN kernel, then run as usual
 make mod LLVM=1                # build with clang (diagnostics; see below)
@@ -254,6 +255,122 @@ attention: a gate you run reflexively is a gate you stop reading.
 image.  A suite that needs a dead peer in row 1 must *create* one: an
 absent row also reads as stale, so the assertions would pass for
 entirely the wrong reason.
+
+## Randomized data and namespace suites
+
+Four suites are driven by seeded random streams, each checked against a
+model the tool keeps in memory. They are the tools that find what the
+fixed-shape suites cannot, so they are part of `check` at a modest size.
+
+| suite | tool | what it checks |
+|---|---|---|
+| `kernel/fsx_model.sh` | `helpers/fsx_cetra.c` | one file: buffered and mapped I/O, truncate, fallocate (allocate, keep-size, punch, zero-range), O_DIRECT, fsync, reopen; every read against the model; a remount compare |
+| `kernel/fsstress_namespace.sh` | `helpers/fsstress_cetra.c` | several processes: create, link, symlink, rename (over, across directories), rmdir, xattrs, chmod; per-process model, a shared directory held to the errno contract; fsck |
+| `kernel/fio_verified_io.sh` | `/usr/bin/fio` | a 1 GiB sparse file, buffered and O_DIRECT jobs on disjoint regions, in-run verify, verify-only after a remount; skips with a reason when fio is absent |
+
+`fsx_cetra` and `fsstress_cetra` are our own C, built by `ct_helper`
+like the poke tools. Neither is vendored from xfstests, and neither needs
+it.
+
+Every one has a **negative control** that corrupts the tool's model on
+purpose and requires the run to fail for that reason:
+`FSX_NEGATIVE=<op>` (fsx), `FSSTRESS_NEGATIVE=1` (fsstress), and a
+corrupted data block on the device between the write and the verify
+phases (fio). A checker that passes with a wrong model is not a checker.
+
+A failure prints what replays it. fsx prints the seed, op index and the
+last 16 ops; rerun with `FSX_SEED=<seed> FSX_OPS=<ops>`. fsstress prints
+seed, process and op; rerun with `FSSTRESS_SEEDS=<seed>`.
+
+**Long runs** stay out of `check`:
+
+```
+FSX_LONG=1 ./tests/run.sh kernel/fsx_model.sh          # 8 seeds x 40000 ops
+FSSTRESS_LONG=1 ./tests/run.sh kernel/fsstress_namespace.sh   # 8 procs x 5000 ops
+FSX_SEED=17 FSX_OPS=40000 ./tests/run.sh kernel/fsx_model.sh  # one seed, replay
+```
+
+`tests/helpers/fsx_cetra` also takes `FSX_DUMP=<path>` (model contents,
+for an external byte compare) and `FSX_DROPCACHE=1` (drop the page cache
+before each full check, as root).
+
+## Configuration matrix
+
+`tests/matrix.sh` runs a slice of the kernel suites under each of several
+configurations. The configurations are mount options and mkfs geometry
+that the gate itself does not vary:
+
+| configuration | what it changes | why it matters |
+|---|---|---|
+| `base` | nothing | the gate's own geometry, for comparison |
+| `nofilelock` | `-o nofilelock` on every `ct_mount` | the cluster lock mode is a change of semantics, not a tuning knob; it produced two bug families |
+| `bg1g` | `-b 1024`, images at least 2300 MiB | two 1 GiB Block Groups: BG-boundary arithmetic |
+| `zg4` | `-z 4`, images at least 2300 MiB | four Zone Groups over four Block Groups |
+| `journal8` | `-J 8`, images at least 2300 MiB | an 8 MiB journal per node slot; mkfs reserves a slot for each of up to 64 nodes, about 512 MiB, which the 560 MiB images cannot hold |
+
+```
+make -C tests matrix                            # every configuration, the default slice
+make -C tests matrix CONFIGS="nofilelock bg1g"
+tests/matrix.sh zg4
+MATRIX_SUITES="kernel/fsx_model.sh" tests/matrix.sh base  # any slice you name
+```
+
+The matrix drives the suites through three harness overrides, all unset
+by default, so the gate is unchanged:
+
+- `CT_MOUNT_OPTS` -- extra `-o` options for every `ct_mount`;
+- `CT_MKFS_EXTRA` -- extra `mkfs.cetra` arguments, appended after the
+  suite's own (mkfs reads options with `getopt`, so the last one wins);
+- `CT_IMG_MIN_MB` -- a floor on the size of images the suites create, so
+  a larger Block Group or more Zone Groups has room to exist.
+
+A suite that mounts with its own `-o`, or that assumes one Block Group,
+is not in the default slice, and a suite added to the slice must say so
+in its header if it depends on the geometry. Logs go to `CT_MATRIX_DIR`
+(default `${CT_BIG_DIR:-/root}/cetrafs-matrix`), one per configuration.
+The matrix exits 1 if any configuration fails a suite.
+
+## Unattended soak
+
+`make soak` is runnable with no terminal and no operator. It is bounded,
+it writes a report, and its exit status says whether it found anything.
+
+```
+make soak ROUNDS=200 SOAK_MAX_SECS=7200     # stop starting rounds after two hours
+```
+
+- `SOAK_MAX_SECS` -- stop starting new rounds after this many seconds
+  (0, the default, means no limit). A round in progress is finished.
+- `SOAK_DIR` -- scratch directory for images, the mountpoint, the mkfs
+  log and the report (default `${CT_BIG_DIR:-/root}/cetrafs-soak`). Not
+  `/tmp`: a 700 MiB image per round does not fit a tmpfs.
+- `SOAK_REPORT` -- the report file (default `$SOAK_DIR/report.txt`). One
+  line per round, then a `SUMMARY` line that is always last.
+
+Exit status: **0** every round that ran was clean and the run reached its
+end (the round count or the deadline); **1** at least one round was
+anomalous (an operation failed or fsck reported a problem) or aborted (mkfs
+or mount failed) -- the failing image is kept as `mix-fail-N.img`; **2** a
+precondition failed (module not loaded, scratch directory unusable), so
+nothing ran. The module must be loaded before the run; the soak does not
+load it.
+
+The loop device and the mount are released on every exit, including an
+interrupt, so one run never leaves a mount for the next.
+
+**Scheduling** is left to the operator, and nothing in the tree installs
+a unit. A cron entry that runs the soak nightly and keeps its output:
+
+```
+# /etc/cron.d/cetrafs-soak   (example; copy it, adjust the paths)
+30 1 * * * root cd /path/to/cetrafs && SOAK_MAX_SECS=7200 make soak ROUNDS=500 >>/var/log/cetrafs-soak.log 2>&1
+```
+
+A systemd timer is the same command in a `.service` (`Type=oneshot`,
+`ExecStart=/usr/bin/make -C /path/to/cetrafs soak ROUNDS=500`, with
+`Environment=SOAK_MAX_SECS=7200`) and an `OnCalendar=*-*-* 01:30:00`
+`.timer`. The oneshot unit's failure is the exit status, so an anomaly
+shows as a failed unit; the report is in `SOAK_DIR`.
 
 ## Adding a suite
 
