@@ -638,6 +638,19 @@ static bool cetrafs_birth_seed_tear_once;
 cetrafs_test_param(birth_seed_tear_once, cetrafs_birth_seed_tear_once, bool, 0644);
 MODULE_PARM_DESC(birth_seed_tear_once, "TEST ONLY: the next birth claim's seed reads torn once");
 
+/* TEST ONLY: every birth finds its record held by a peer's reclaim for
+ * this many ms, so the create waits in cetrafs_birth_await_release() for
+ * that long (tests/kernel/birth_wait_killable.sh). Staging a real peer's
+ * reclaim on the number a create will pick is not deterministic. */
+static unsigned int cetrafs_birth_hold_ms;
+cetrafs_test_param(birth_hold_ms, cetrafs_birth_hold_ms, uint, 0644);
+MODULE_PARM_DESC(birth_hold_ms, "TEST ONLY: every birth waits as if a peer's reclaim held its record for this many ms");
+/* TEST ONLY: the birth wait sleeps uninterruptibly -- the code before
+ * the fatal-signal check (its negative control). */
+static bool cetrafs_birth_wait_uninterruptible;
+cetrafs_test_param(birth_wait_uninterruptible, cetrafs_birth_wait_uninterruptible, bool, 0644);
+MODULE_PARM_DESC(birth_wait_uninterruptible, "TEST ONLY: the birth wait for a peer's reclaim ignores SIGKILL");
+
 static int cetrafs_birth_read(struct super_block *sb, u64 ino, cetrafs_inode_t *raw, bool *have)
 {
     struct buffer_head *bh;
@@ -710,10 +723,15 @@ static int cetrafs_birth_await_release(struct super_block *sb, u64 ino, cetrafs_
         /* Killable (audit L21): a create stuck behind a peer's reclaim
          * may be abandoned. The caller leaves the bit set on an error --
          * a leak the scrub reclaims, never a number handed out twice. */
-        if (schedule_timeout_killable(msecs_to_jiffies(step)) && fatal_signal_pending(current))
+        if (READ_ONCE(cetrafs_birth_wait_uninterruptible)) {
+            msleep(step); /* TEST ONLY: see the parameter */
+        } else if (schedule_timeout_killable(msecs_to_jiffies(step)) && fatal_signal_pending(current)) {
             return -EINTR;
+        }
         waited += step;
         step = min(step * 2, 64U);
+        if (waited <= READ_ONCE(cetrafs_birth_hold_ms))
+            continue; /* TEST ONLY: still held (see the parameter) */
 
         ret = cetrafs_birth_read(sb, ino, raw, &have);
         if (ret)
@@ -834,7 +852,7 @@ int cetrafs_alloc_inode(struct super_block *sb, u64 *out_ino)
          * claim) is safe to take over -- this node's own scrub never
          * touches a number mid-birth here. */
         owner = cetrafs_le32(raw.ns_lock_owner);
-        if (have && owner != CETRAFS_NODE_ID_NONE && owner != me) {
+        if ((have && owner != CETRAFS_NODE_ID_NONE && owner != me) || READ_ONCE(cetrafs_birth_hold_ms)) {
             ret = cetrafs_birth_await_release(sb, *out_ino, &raw, me, &lost);
             if (!ret && !lost) {
                 ret = cetrafs_inode_birth_claim(sb, *out_ino, &raw, &lost);
@@ -1708,11 +1726,17 @@ static u32 cetrafs_bg_image_crc(const void *image, unsigned int len)
 /* The three descriptor mutators keep the fields they do not change and
  * stamp a fresh checksum: over an image that fails its own, that blesses
  * a tear or damage (inode.c's namespace mutator has the same refusal). */
+/* TEST ONLY: the BG descriptor mutators restamp a descriptor that fails
+ * its checksum (the negative control of tests/kernel/cas_refuses_bad_image_mutators.sh). */
+static bool cetrafs_bg_cas_skip_crc;
+cetrafs_test_param(bg_cas_skip_crc, cetrafs_bg_cas_skip_crc, bool, 0644);
+MODULE_PARM_DESC(bg_cas_skip_crc, "TEST ONLY: the BG descriptor mutators do not refuse a descriptor failing its checksum");
+
 static bool cetrafs_bg_image_ok(const void *image, unsigned int len)
 {
     const cetrafs_block_group_t *bg = image;
 
-    if (cetrafs_bg_image_crc(image, len) == (u32) cetrafs_le64(bg->checksum))
+    if (cetrafs_bg_image_crc(image, len) == (u32) cetrafs_le64(bg->checksum) || READ_ONCE(cetrafs_bg_cas_skip_crc))
         return true;
     pr_warn_ratelimited("BG CAS: the descriptor on the device fails its checksum -- refusing to stamp a fresh one\n");
     return false;

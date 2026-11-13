@@ -1467,6 +1467,17 @@ enum { CETRAFS_FD_F_SIZE, CETRAFS_FD_F_BLOCKS, CETRAFS_FD_F_ATIME, CETRAFS_FD_F_
  * v0x0005 point: however stale this node's view, a peer's nlink delta,
  * lock claim or presence bit is physically out of reach.
  */
+/* TEST ONLY, the stat-publish swap's refusal (tests/kernel/cas_refuses_bad_image_mutators.sh):
+ * the next publish's mutator finds its image damaged -- the first reader
+ * to see it, so no earlier reader refuses it -- and the control restamps
+ * over the damage instead of refusing. */
+static bool cetrafs_stat_mutate_damage_once;
+cetrafs_test_param(stat_mutate_damage_once, cetrafs_stat_mutate_damage_once, bool, 0644);
+MODULE_PARM_DESC(stat_mutate_damage_once, "TEST ONLY: the next stat publish's mutator finds its file sector damaged");
+static bool cetrafs_stat_mutate_skip_crc;
+cetrafs_test_param(stat_mutate_skip_crc, cetrafs_stat_mutate_skip_crc, bool, 0644);
+MODULE_PARM_DESC(stat_mutate_skip_crc, "TEST ONLY: the stat publish's mutator restamps a file sector failing its checksum");
+
 static int cetrafs_vfs_stat_cas_mutate(void *image, unsigned int len, void *priv)
 {
     struct cetrafs_vfs_stat_cas_ctx *ctx = priv;
@@ -1477,6 +1488,8 @@ static int cetrafs_vfs_stat_cas_mutate(void *image, unsigned int len, void *priv
         return -EINVAL;
     memset(&rec, 0, sizeof(rec));
     cetrafs_inode_fd_from_image(&rec, image);
+    if (unlikely(READ_ONCE(cetrafs_stat_mutate_damage_once)) && xchg(&cetrafs_stat_mutate_damage_once, false))
+        rec.fd_checksum ^= cpu_to_le64(1); /* TEST ONLY: damage in the mutator's own read */
 
     /* The fd sector's identity echo is this sector's reuse guard. */
     if (cetrafs_le64(rec.fd_generation) != ctx->generation || rec.fd_ino != ctx->ino_le)
@@ -1484,7 +1497,7 @@ static int cetrafs_vfs_stat_cas_mutate(void *image, unsigned int len, void *priv
     /* The merge below keeps the image's fields where ours did not move:
      * over a sector that fails its checksum, restamping blesses them
      * (the namespace mutator's refusal, cetrafs_ns_cas_mutate()). */
-    if (cetrafs_inode_crc_fd(&rec) != (u32) cetrafs_le64(rec.fd_checksum)) {
+    if (cetrafs_inode_crc_fd(&rec) != (u32) cetrafs_le64(rec.fd_checksum) && !READ_ONCE(cetrafs_stat_mutate_skip_crc)) {
         pr_warn_ratelimited("stat publish on ino=%llu: the file sector on the device fails its checksum -- "
                             "refusing to stamp a fresh one\n",
                             (unsigned long long) inode->i_ino);

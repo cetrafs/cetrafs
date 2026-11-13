@@ -100,6 +100,24 @@ static unsigned int cetrafs_xattr_recheck_pause_ms;
 cetrafs_test_param(xattr_recheck_pause_ms, cetrafs_xattr_recheck_pause_ms, uint, 0644);
 MODULE_PARM_DESC(xattr_recheck_pause_ms, "TEST ONLY: pause between an xattr read's block copy and its record re-read");
 
+/* TEST ONLY: a getxattr copies the block with no buffer lock -- the
+ * negative control of tests/kernel/xattr_copy_torn.sh. */
+static bool cetrafs_xattr_copy_unlocked;
+cetrafs_test_param(xattr_copy_unlocked, cetrafs_xattr_copy_unlocked, bool, 0644);
+MODULE_PARM_DESC(xattr_copy_unlocked, "TEST ONLY: a lockless xattr read copies its block with no buffer lock");
+/* TEST ONLY: log every private copy of an xattr block that fails its
+ * checksum for real (not an injected tear), so a test can count the
+ * copies the buffer lock let through torn. */
+static bool cetrafs_xattr_copy_probe;
+cetrafs_test_param(xattr_copy_probe, cetrafs_xattr_copy_probe, bool, 0644);
+MODULE_PARM_DESC(xattr_copy_probe, "TEST ONLY: log each xattr block copy that fails its checksum");
+/* TEST ONLY: the first attempt of a lockless xattr read pauses between
+ * validating the block and copying it -- the window an edit must start
+ * in (tests/kernel/xattr_copy_torn.sh). */
+static unsigned int cetrafs_xattr_copy_pause_ms;
+cetrafs_test_param(xattr_copy_pause_ms, cetrafs_xattr_copy_pause_ms, uint, 0644);
+MODULE_PARM_DESC(xattr_copy_pause_ms, "TEST ONLY: pause between an xattr read's validation and its copy");
+
 static void cetrafs_xattr_read_pause(u64 ino)
 {
     if (likely(!cetrafs_xattr_read_pause_ms))
@@ -139,6 +157,7 @@ static int cetrafs_xattr_read_block(struct inode *inode, void **out)
     *out = NULL;
     for (attempt = 0; attempt < CETRAFS_XATTR_READ_RETRIES; attempt++) {
         struct buffer_head *bh;
+        bool locked;
         u64 lba, seq;
 
         cetrafs_invalidate_raw_inode(sb, inode->i_ino);
@@ -178,11 +197,17 @@ static int cetrafs_xattr_read_block(struct inode *inode, void **out)
                 goto out;
             }
         }
+        if (!attempt && READ_ONCE(cetrafs_xattr_copy_pause_ms))
+            msleep(READ_ONCE(cetrafs_xattr_copy_pause_ms)); /* TEST ONLY: see the parameter */
         /* A whole image: this node's own xattr writers edit the cached
          * block in place under the buffer lock (cetrafs_bh_read_lock()). */
-        cetrafs_bh_read_lock(bh);
+        /* The knob is read once: two reads could unbalance the lock. */
+        locked = likely(!READ_ONCE(cetrafs_xattr_copy_unlocked));
+        if (locked)
+            cetrafs_bh_read_lock(bh);
         memcpy(copy, bh->b_data, CETRAFS_BLOCK_SIZE);
-        cetrafs_bh_read_unlock(bh);
+        if (locked)
+            cetrafs_bh_read_unlock(bh);
         brelse(bh);
         /* The buffer was validated, then copied: another reader's
          * forced-fresh re-read of the same block can land in between and
@@ -195,6 +220,8 @@ static int cetrafs_xattr_read_block(struct inode *inode, void **out)
             WRITE_ONCE(cetrafs_xattr_tear_copies, cetrafs_xattr_tear_copies - 1);
             ((u8 *) copy)[offsetof(cetrafs_xattr_entry_t, value)] ^= 0xff; /* TEST ONLY: see the parameter */
         }
+        if (unlikely(READ_ONCE(cetrafs_xattr_copy_probe)) && !cetrafs_blk_image_valid(copy, CETRAFS_XATTR_TAIL_MAGIC))
+            pr_info("xattr copy probe: block %llu copied torn\n", (unsigned long long) lba);
         if (cetrafs_tear_injected() || !cetrafs_blk_image_valid(copy, CETRAFS_XATTR_TAIL_MAGIC)) {
             if (attempt + 1 < CETRAFS_XATTR_READ_RETRIES) /* no sleep after the last */
                 cetrafs_tear_backoff(attempt); /* a peer's write in flight: milliseconds (X1) */
@@ -287,6 +314,13 @@ out:
 static unsigned int cetrafs_xattr_pause_after_publish_ms;
 cetrafs_test_param(xattr_pause_after_publish_ms, cetrafs_xattr_pause_after_publish_ms, uint, 0644);
 MODULE_PARM_DESC(xattr_pause_after_publish_ms, "TEST ONLY: one-shot pause after a new xattr block is published");
+
+/* TEST ONLY: an in-place replace of an xattr entry is held half done --
+ * its key and length are new, its value is still the old one -- while
+ * the buffer lock is held (tests/kernel/xattr_copy_torn.sh). */
+static unsigned int cetrafs_xattr_edit_stall_ms;
+cetrafs_test_param(xattr_edit_stall_ms, cetrafs_xattr_edit_stall_ms, uint, 0644);
+MODULE_PARM_DESC(xattr_edit_stall_ms, "TEST ONLY: stall halfway through an in-place xattr replace");
 
 /* TEST ONLY: hold a setxattr between its first peer-user check and the
  * rest of the operation (audit 2026-11-11 X2). */
@@ -479,6 +513,8 @@ static int cetrafs_xattr_set_locked(struct inode *inode, const char *name, const
             memset(&arr[idx], 0, sizeof(arr[idx]));
             strscpy(arr[idx].key, name, CETRAFS_XATTR_KEY_MAX);
             arr[idx].value_len = cetrafs_cpu_to_le16((u16) size);
+            if (unlikely(READ_ONCE(cetrafs_xattr_edit_stall_ms)))
+                msleep(READ_ONCE(cetrafs_xattr_edit_stall_ms)); /* TEST ONLY: see the parameter */
             if (size)
                 memcpy(arr[idx].value, value, size);
         }

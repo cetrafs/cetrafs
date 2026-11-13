@@ -113,6 +113,14 @@ static bool cetrafs_buf_convert_early;
 cetrafs_test_param(buf_convert_early, cetrafs_buf_convert_early, bool, 0644);
 MODULE_PARM_DESC(buf_convert_early, "TEST ONLY: buffered writes mark their extents written at write time");
 
+/* TEST ONLY, and the negative control of the durability-boundary
+ * conversion of buffered and mapped stores (tests/kernel/mmap_prealloc_content.sh):
+ * the blocks are flushed and dropped from the pending set, but their
+ * extents are never marked written, so they read back as zeros. */
+static bool cetrafs_buf_convert_skip;
+cetrafs_test_param(buf_convert_skip, cetrafs_buf_convert_skip, bool, 0644);
+MODULE_PARM_DESC(buf_convert_skip, "TEST ONLY: durability boundaries drop buffered and mapped blocks without marking them written");
+
 /* b_private of a DIO mapping that left preallocated blocks for the
  * completion to convert. The DIO code copies b_private into the dio
  * after EVERY get_block call and never clears it, so once one segment
@@ -145,6 +153,13 @@ MODULE_PARM_DESC(dio_fail_after_alloc_once, "TEST ONLY: fail the next O_DIRECT w
 static unsigned int cetrafs_leaf_drop_copy_stall_ms;
 cetrafs_test_param(leaf_drop_copy_stall_ms, cetrafs_leaf_drop_copy_stall_ms, uint, 0644);
 MODULE_PARM_DESC(leaf_drop_copy_stall_ms, "TEST ONLY: stall halfway through an extent-array drop copy");
+
+/* TEST ONLY: stall halfway through a FRONT shrink of an in-place leaf
+ * edit -- the logical start and length are new, the physical start is
+ * still the old one (the scrub walk's probe, tests/kernel/scrub_walk_torn.sh). */
+static unsigned int cetrafs_leaf_front_shrink_stall_ms;
+cetrafs_test_param(leaf_front_shrink_stall_ms, cetrafs_leaf_front_shrink_stall_ms, uint, 0644);
+MODULE_PARM_DESC(leaf_front_shrink_stall_ms, "TEST ONLY: stall halfway through a front shrink of an extent entry");
 
 static atomic64_t cetrafs_dio_fallbacks = ATOMIC64_INIT(0);
 static atomic64_t cetrafs_dio_converts = ATOMIC64_INIT(0);
@@ -800,6 +815,10 @@ int cetrafs_convert_pending_locked(struct inode *inode)
             struct buffer_head map = {0};
             u64 n;
 
+            if (unlikely(READ_ONCE(cetrafs_buf_convert_skip))) {
+                cur = (u64) last + 1; /* TEST ONLY: see the parameter */
+                break;
+            }
             map.b_size = (size_t) min_t(u64, (u64) last - cur + 1, (u64) U32_MAX >> bits) << bits;
             ret = __cetrafs_get_block(inode, (sector_t) cur, &map, 1, false, CETRAFS_GB_CONVERT_PENDING);
             if (ret)
@@ -1070,6 +1089,22 @@ static struct buffer_head *cetrafs_scrub_tree_bread(struct super_block *sb, u64 
     return NULL;
 }
 
+/* TEST ONLY, the scrub walk's knobs (tests/kernel/scrub_walk_torn.sh):
+ * a pause between the leaf's read and the walk's buffer lock -- the
+ * window an in-place edit has to start in; the control that walks with
+ * no lock at all; and a probe that prints the sum of the extent lengths
+ * a walk reports, against the value the test expects (a torn entry sums
+ * to less). */
+static unsigned int cetrafs_scrub_walk_pause_ms;
+cetrafs_test_param(scrub_walk_pause_ms, cetrafs_scrub_walk_pause_ms, uint, 0644);
+MODULE_PARM_DESC(scrub_walk_pause_ms, "TEST ONLY: pause in the scrub's leaf walk between the read and the lock");
+static bool cetrafs_scrub_walk_unlocked;
+cetrafs_test_param(scrub_walk_unlocked, cetrafs_scrub_walk_unlocked, bool, 0644);
+MODULE_PARM_DESC(scrub_walk_unlocked, "TEST ONLY: the scrub's leaf walk reads the leaf without the buffer lock");
+static unsigned int cetrafs_scrub_walk_expect_sum;
+cetrafs_test_param(scrub_walk_expect_sum, cetrafs_scrub_walk_expect_sum, uint, 0644);
+MODULE_PARM_DESC(scrub_walk_expect_sum, "TEST ONLY: print the extent-length sum of each leaf walk against this value");
+
 /* Walk one external leaf block's extents (read by LBA). */
 static int
 cetrafs_scrub_walk_leaf(struct super_block *sb, u64 lba, void (*cb)(void *, u64, u32), void *ctx, bool fresh)
@@ -1078,6 +1113,8 @@ cetrafs_scrub_walk_leaf(struct super_block *sb, u64 lba, void (*cb)(void *, u64,
     const cetrafs_extent_hdr_t *hdr;
     const cetrafs_extent_t *arr;
     u32 ln, i;
+    u64 sum = 0;
+    bool locked;
 
     if (!bh)
         return -EIO;
@@ -1108,12 +1145,25 @@ cetrafs_scrub_walk_leaf(struct super_block *sb, u64 lba, void (*cb)(void *, u64,
      * a shifted range -- leaving a live block unreported, which is
      * exactly what this walk's caller frees.
      */
-    cetrafs_bh_read_lock(bh);
+    if (unlikely(READ_ONCE(cetrafs_scrub_walk_pause_ms)))
+        msleep(READ_ONCE(cetrafs_scrub_walk_pause_ms)); /* TEST ONLY: see the parameter */
+    /* The knob is read ONCE: flipped between the lock and the unlock,
+     * two reads would unbalance the buffer lock. */
+    locked = likely(!READ_ONCE(cetrafs_scrub_walk_unlocked));
+    if (locked)
+        cetrafs_bh_read_lock(bh);
     ln = min_t(u32, cetrafs_le16(hdr->eh_entries), CETRAFS_EXT_BLOCK_MAX_LEAVES);
-    for (i = 0; i < ln; i++)
-        cb(ctx, cetrafs_extent_phys_from_hilo(arr[i].ee_start_hi, arr[i].ee_start_lo),
-           cetrafs_extent_len(arr[i].ee_len));
-    cetrafs_bh_read_unlock(bh);
+    for (i = 0; i < ln; i++) {
+        u32 len = cetrafs_extent_len(arr[i].ee_len);
+
+        sum += len;
+        cb(ctx, cetrafs_extent_phys_from_hilo(arr[i].ee_start_hi, arr[i].ee_start_lo), len);
+    }
+    if (locked)
+        cetrafs_bh_read_unlock(bh);
+    if (unlikely(READ_ONCE(cetrafs_scrub_walk_expect_sum)))
+        pr_info("scrub walk probe: leaf %llu sums to %llu, expected %u\n", (unsigned long long) lba, sum,
+                READ_ONCE(cetrafs_scrub_walk_expect_sum));
     brelse(bh);
     return 0;
 }
@@ -2456,6 +2506,10 @@ static int cetrafs_leaf_array_convert(struct super_block *sb,
             } else {
                 arr[i].ee_block = cetrafs_cpu_to_le32(eb + count);
                 arr[i].ee_len = cetrafs_extent_pack_len(len - count, true);
+                if (unlikely(READ_ONCE(cetrafs_leaf_front_shrink_stall_ms))) {
+                    /* TEST ONLY: the entry is half moved -- see the parameter. */
+                    msleep(READ_ONCE(cetrafs_leaf_front_shrink_stall_ms));
+                }
                 cetrafs_extent_phys_to_hilo(phys + count, &arr[i].ee_start_hi, &arr[i].ee_start_lo);
             }
         } else {

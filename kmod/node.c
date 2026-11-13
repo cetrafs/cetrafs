@@ -208,9 +208,15 @@ static u32 cetrafs_node_new_incarnation(u32 prev)
  * Checked after each mutator's state test, so a FREE row (never stamped)
  * still answers "nothing to do".
  */
+/* TEST ONLY: the node row mutators restamp a row that fails its checksum
+ * (the negative control of tests/kernel/cas_refuses_bad_image_mutators.sh). */
+static bool cetrafs_node_cas_skip_crc;
+cetrafs_test_param(node_cas_skip_crc, cetrafs_node_cas_skip_crc, bool, 0644);
+MODULE_PARM_DESC(node_cas_skip_crc, "TEST ONLY: the node row mutators do not refuse a row failing its checksum");
+
 static bool cetrafs_node_image_ok(const cetrafs_node_entry_t *ne)
 {
-    if (cetrafs_node_crc(ne) == (u32) cetrafs_le64(ne->checksum))
+    if (cetrafs_node_crc(ne) == (u32) cetrafs_le64(ne->checksum) || READ_ONCE(cetrafs_node_cas_skip_crc))
         return true;
     pr_warn_ratelimited("node registry: a row on the device fails its checksum -- refusing to stamp a fresh one\n");
     return false;
