@@ -79,7 +79,10 @@ MS="$(kill_time "$P1")"
 [ "$MS" -lt 2000 ] && pass "1: the one retrying the peer's lock died ${MS} ms after SIGKILL" ||
     fail "1: the one retrying the peer's lock took ${MS} ms to die"
 sleep 1
-grep -q cetrafs_nslock_acquire "/proc/$P2/stack" 2>/dev/null &&
+# Since eca1478 a create the VFS called with its locks held does not
+# sleep inside the lock: it queues a killable sleep as task_work and
+# restarts the call, so it sits in cetrafs_nswait_run between attempts.
+grep -qE "cetrafs_nslock_acquire|cetrafs_nswait_run" "/proc/$P2/stack" 2>/dev/null &&
     pass "1: setup: the next in line is now retrying the peer's lock itself" ||
     { fail "1: setup: the second create is not in the nslock retry: $(head -2 "/proc/$P2/stack" 2>&1 | tr '\n' ' ')"; ct_exit; }
 MS="$(kill_time "$P2")"
