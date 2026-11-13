@@ -64,6 +64,7 @@ crash:
 	./crash/buffered_extent_order.sh
 	./crash/leaf_batch_order.sh
 	./crash/growfs_crash.sh
+	./crash/crash_residue.sh
 
 soak:
 	./stress/soak.sh $(ROUNDS)

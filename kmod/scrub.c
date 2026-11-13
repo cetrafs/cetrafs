@@ -373,11 +373,19 @@ static int scrub_build_refset(struct cetrafs_scrub *s, struct scrub_ctx *ctx, bo
      * the block, and the next drain then applies that queued free to a
      * block that is live again.
      *
-     * Marking them referenced is the fix, and it is airtight rather than
-     * merely conservative. An entry queued BEFORE pass 1 is seen by this
-     * walk. An entry queued DURING the cycle required its peer to drop
-     * the extent first -- so the block was still referenced at pass 1
-     * and never became a candidate at all. The two cases are disjoint.
+     * Marking them referenced is the fix. An entry queued BEFORE pass 1
+     * is seen by this walk. An entry queued DURING the cycle required its
+     * peer to drop the extent first -- so the block was still referenced
+     * at pass 1 and never became a candidate at all.
+     *
+     * Not airtight, and the one hole is named here rather than argued
+     * away (rule 7): an append whose CAW outcome was UNDECIDED stops its
+     * node's mount (caw.c), and the command can still land on the
+     * device afterwards, at an instant unrelated to when its extent was
+     * dropped. If it lands after pass 2 freed the block as a leak and
+     * the block was handed out again, the drain applies it to live data.
+     * Telling that copy from a live entry needs a stamp in the entry,
+     * which is a format change (docs/internal/TODO.md).
      *
      * One queue read per owned ZG per pass. Targets are collected in
      * Block Group order, and ownership is round-robin (BG b of ZG

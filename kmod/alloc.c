@@ -2863,13 +2863,21 @@ static int cetrafs_sync_one_block(struct super_block *sb, u64 lba)
     return ret;
 }
 
+/* TEST ONLY: the boundary flush does nothing -- a publish can reach the
+ * device ahead of the bits it names. The negative control of
+ * tests/crash/crash_residue.sh: without the flush a cut must find a
+ * block referenced but free, or the census cannot see that class. */
+static bool cetrafs_alloc_flush_skip;
+cetrafs_test_param(alloc_flush_skip, cetrafs_alloc_flush_skip, bool, 0644);
+MODULE_PARM_DESC(alloc_flush_skip, "TEST ONLY: skip the allocation-bitmap flush at durability boundaries");
+
 int cetrafs_alloc_flush_bitmaps(struct super_block *sb)
 {
     const cetrafs_superblock_t *raw_sb = cetrafs_sb_raw(sb);
     u32 bg_count, bg_id;
     int ret = 0;
 
-    if (!raw_sb)
+    if (!raw_sb || unlikely(READ_ONCE(cetrafs_alloc_flush_skip)))
         return 0;
     bg_count = le32_to_cpu(raw_sb->block_group_count);
 

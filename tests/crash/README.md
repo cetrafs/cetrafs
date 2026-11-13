@@ -70,6 +70,14 @@ fsck, and verify.
 - `growfs_crash.sh` — an offline grow, cut after EVERY write of it
   (`replay-log --limit-entries`): each cut must fsck clean, mount at the
   old or the new size, keep its data, and finish on a rerun of growfs.
+- `crash_residue.sh` — the residue census: an unsynced workload (creates,
+  writes, truncates, punches, preallocation, unlinks), cut at every
+  barrier and a sample of the writes between them; mount, unmount, fsck,
+  and count each residue class. No cut may leave a block referenced but
+  free (control `alloc_flush_skip`) or any error outside the known
+  residue. Unlike phase 1 below, these cuts are not ERR-free: a count
+  can lag its names (a directory's size or link count, an unlinked
+  inode's link count) until `fsck -r`.
 
 ### Phase 1 — recoverability
 

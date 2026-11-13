@@ -2450,8 +2450,15 @@ static int cetrafs_pf_hold_range(struct maple_tree *mt, u64 lba, u32 count)
  * split the queue and each apply its half blind to the other's.
  *
  * Not covered: a copy APPENDED after the re-read in 3b, which a later
- * drain applies -- a double free arriving late, which the
- * direct free path could not catch either.
+ * drain applies. Its sources, enumerated (2026-11-13): an append retried
+ * after it had landed is settled inside the CAS (caw.c re-reads an
+ * unknown outcome and stops the mount when it cannot tell), so a copy
+ * arrives only (a) from a double free, which is a bug of its own and
+ * exactly as harmful on the direct free path, or (b) from an undecided
+ * append landing on the device after its node stopped -- later than the
+ * scrub's queue check can see (scrub.c, "Not airtight"). Closing (b)
+ * needs the entry to carry a stamp the drain can check, which is a
+ * format change (docs/internal/TODO.md).
  */
 static int cetrafs_zg_drain_one(struct super_block *sb, u32 zg_id, bool may_wait)
 {
