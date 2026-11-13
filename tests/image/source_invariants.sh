@@ -1039,6 +1039,9 @@ file.c:cetrafs_write_new_leaf a-new-block,-unreachable-until-published
 file.c:cetrafs_write_new_index a-new-block,-unreachable-until-published
 file.c:cetrafs_tree_convert_inner the-editor,-under-invalidate_lock-exclusive
 file.c:cetrafs_tree_append the-editor,-under-invalidate_lock-exclusive
+file.c:cetrafs_tree_split_leaf the-editor,-under-invalidate_lock-exclusive-(asserted);-its-new-leaf-a-new-block
+file.c:cetrafs_tree_insert_any_leaf the-editor,-under-invalidate_lock-exclusive-(asserted)
+file.c:cetrafs_idx_insert_keep_last the-editor,-reads-only-after-cetrafs_bh_begin_update_crc-takes-the-buffer-lock
 file.c:cetrafs_inode_extents_get every-caller-holds-invalidate_lock-(fiemap/seek-shared),-or-the-file-is-being-evicted
 file.c:cetrafs_tree_flatten via-cetrafs_inode_extents_get,-or-defrag-under-invalidate_lock-exclusive
 file.c:cetrafs_tree_extent_count do_allocate-exclusive;-close-after-the-last-writer;-the-defrag-worker-heuristic-only
@@ -1924,6 +1927,7 @@ cetrafs_inode_bitmap_cas_alloc final:every-inode-number-in-use-a-free-in-flight-
 cetrafs_leaf_array_insert final:a-full-leaf-the-caller-splits
 cetrafs_leaf_array_punch final:no-room-for-the-split-nothing-changed
 cetrafs_tree_append final:the-extent-tree-is-full
+cetrafs_tree_insert_any_leaf final:every-interior-and-every-leaf-full-under-invalidate_lock-exclusive
 cetrafs_tree_build final:the-extent-tree-is-full
 cetrafs_xattr_set_locked final:the-xattr-block-is-full
 cetrafs_node_register final:every-registry-row-taken
@@ -2093,6 +2097,7 @@ cetrafs_mkdir_locked own:a-dirent-block-never-published
 cetrafs_do_allocate own:blocks-never-published-held-in-the-reservation-registry
 __cetrafs_get_block own:a-block-never-published
 cetrafs_tree_append own:a-leaf-or-index-never-published
+cetrafs_tree_split_leaf own:a-new-leaf-whose-write-failed-before-any-interior-names-it
 cetrafs_tree_build own:a-tree-never-published
 cetrafs_inode_set_reservation own:a-reservation-run-never-published
 cetrafs_inode_drop_reservation own:the-unused-rest-of-a-reservation-run
@@ -2269,6 +2274,7 @@ scrub.c:scrub_free_confirmed:the judge itself
 file.c:cetrafs_do_allocate:blocks never published, held in the reservation registry until given back (H2)
 file.c:__cetrafs_get_block:a block it allocated and never published
 file.c:cetrafs_tree_append:a leaf or index it allocated and never published
+file.c:cetrafs_tree_split_leaf:a new leaf whose write failed, before any interior names it
 file.c:cetrafs_tree_build:a tree it built and never published
 dir.c:cetrafs_mkdir_locked:a dirent block it allocated and never published
 lock.c:cetrafs_inode_set_reservation:a reservation run, never published

@@ -1062,6 +1062,133 @@ fail:
  * naming it may be a dead file whose leaf was since reused, which is
  * nobody's damage. The caller frees nothing on NULL.
  */
+/*
+ * An extent-tree edit that MOVES entries between tree blocks, against
+ * the readers that hold no invalidate_lock.
+ *
+ * Writeback and an O_DIRECT read map blocks lock-free: they walk a
+ * depth-2 interior one entry at a time (copy it under the buffer lock,
+ * release, read that leaf, go on from the next slot). A range split puts
+ * the new leaf at a slot the walk may already have passed -- the slot
+ * before the last, or another interior -- and then removes the moved
+ * entries from the old leaf. A walk that copied the old leaf's entry
+ * before the insert and reads that leaf after the removal finds the
+ * extent in neither: an O_DIRECT read returns zeros for data, and
+ * writeback maps a dirty page over an "unmapped" block and allocates it
+ * again, naming the block twice. A full leaf's convert has the same
+ * shape: it shrinks the extent in the leaf and appends the piece
+ * elsewhere, through a new root the walk only sees once the record is
+ * staged.
+ *
+ * So every such edit runs bracketed: cetrafs_tree_move_begin() makes the
+ * inode's move sequence odd before the first edit, cetrafs_tree_move_end()
+ * even again once the destination is reachable (after the record is
+ * staged). Both are under invalidate_lock held exclusively, which every
+ * tree writer holds, so the moves of one inode are serialised. A lookup
+ * samples the sequence before it reads the record, and a MISS with the
+ * sequence odd then or changed since is not believed: it reads the
+ * record again and re-walks (__cetrafs_get_block()), a bounded number of
+ * times, and then fails with -EIO rather than answer "hole". A hit needs
+ * no check: a moved extent is the same extent wherever it is found.
+ *
+ * Walkers with no inode in hand (the scrub's, cetrafs_raw_inode_for_each_
+ * owned_block()) use the module-wide begun/ended counts the same way.
+ */
+static atomic_t cetrafs_tree_moves_begun = ATOMIC_INIT(0);
+static atomic_t cetrafs_tree_moves_ended = ATOMIC_INIT(0);
+static atomic64_t cetrafs_tree_move_reruns = ATOMIC64_INIT(0);
+
+u64 cetrafs_tree_move_rerun_count(void)
+{
+    return (u64) atomic64_read(&cetrafs_tree_move_reruns);
+}
+
+/* TEST ONLY: a miss during a move is believed -- the negative control of
+ * tests/kernel/split_hides_extent.sh. */
+static bool cetrafs_tree_move_rerun_off;
+cetrafs_test_param(tree_move_rerun_off, cetrafs_tree_move_rerun_off, bool, 0644);
+MODULE_PARM_DESC(tree_move_rerun_off, "TEST ONLY: a lookup that misses during a tree move does not re-run");
+
+#define CETRAFS_TREE_MOVE_RERUNS 200
+
+static void cetrafs_tree_move_begin(struct inode *inode, bool *moving)
+{
+    unsigned int *seq;
+
+    if (*moving)
+        return;
+    seq = cetrafs_inode_tree_move_seq(inode);
+    atomic_inc(&cetrafs_tree_moves_begun);
+    smp_mb__after_atomic();
+    WRITE_ONCE(*seq, *seq + 1); /* odd: a move is in progress */
+    smp_wmb();                  /* ...before any edit it brackets */
+    *moving = true;
+}
+
+static void cetrafs_tree_move_end(struct inode *inode, bool *moving)
+{
+    unsigned int *seq;
+
+    if (!*moving)
+        return;
+    seq = cetrafs_inode_tree_move_seq(inode);
+    smp_wmb(); /* every edit of the move before the sequence moves on */
+    WRITE_ONCE(*seq, *seq + 1);
+    smp_mb__before_atomic();
+    atomic_inc(&cetrafs_tree_moves_ended);
+    *moving = false;
+}
+
+static unsigned int cetrafs_tree_move_sample(struct inode *inode)
+{
+    unsigned int s = READ_ONCE(*cetrafs_inode_tree_move_seq(inode));
+
+    smp_rmb(); /* sampled before the reads it guards */
+    return s;
+}
+
+/* Did a move overlap the walk that started at sample 's0'? */
+static bool cetrafs_tree_move_overlapped(struct inode *inode, unsigned int s0)
+{
+    if (READ_ONCE(cetrafs_tree_move_rerun_off))
+        return false; /* test-only: see the knob */
+    smp_rmb();
+    return (s0 & 1) || READ_ONCE(*cetrafs_inode_tree_move_seq(inode)) != s0;
+}
+
+/* A re-run's pause: a move holds the lock for microseconds unless it had
+ * to write a block, so a short sleep, then a re-read. */
+static void cetrafs_tree_move_backoff(void)
+{
+    atomic64_inc(&cetrafs_tree_move_reruns);
+    usleep_range(20, 100);
+}
+
+/* TEST ONLY: stall one lookup of block 'lookup_stall_block' of inode
+ * 'lookup_stall_ino', between copying a depth-2 interior entry and
+ * reading its leaf (split_hides_extent.sh). One-shot. */
+static unsigned long long cetrafs_lookup_stall_ino;
+cetrafs_test_param(lookup_stall_ino, cetrafs_lookup_stall_ino, ullong, 0644);
+MODULE_PARM_DESC(lookup_stall_ino, "TEST ONLY: the inode whose next lookup stalls (lookup_stall_ms)");
+static unsigned int cetrafs_lookup_stall_block;
+cetrafs_test_param(lookup_stall_block, cetrafs_lookup_stall_block, uint, 0644);
+MODULE_PARM_DESC(lookup_stall_block, "TEST ONLY: the block whose next lookup stalls (lookup_stall_ms)");
+static unsigned int cetrafs_lookup_stall_ms;
+cetrafs_test_param(lookup_stall_ms, cetrafs_lookup_stall_ms, uint, 0644);
+MODULE_PARM_DESC(lookup_stall_ms, "TEST ONLY: stall one depth-2 lookup before it reads a leaf, once");
+
+static void cetrafs_lookup_stall(struct inode *inode, u32 iblock)
+{
+    unsigned int ms;
+
+    if (likely(!READ_ONCE(cetrafs_lookup_stall_ms)) || inode->i_ino != READ_ONCE(cetrafs_lookup_stall_ino) ||
+        iblock != READ_ONCE(cetrafs_lookup_stall_block))
+        return;
+    ms = xchg(&cetrafs_lookup_stall_ms, 0);
+    if (ms)
+        msleep(min_t(unsigned int, ms, 10000)); /* test-only; see the knob */
+}
+
 static struct buffer_head *cetrafs_scrub_tree_bread(struct super_block *sb, u64 lba, u32 magic, bool fresh)
 {
     int attempt;
@@ -1197,11 +1324,55 @@ cetrafs_scrub_walk_leaf(struct super_block *sb, u64 lba, void (*cb)(void *, u64,
  * (dirent blocks, reached through the extents), file.c (data, leaf,
  * index), xattr.c (the xattr block).
  */
+static int __cetrafs_raw_inode_for_each_owned_block(struct super_block *sb,
+                                                    const cetrafs_inode_t *raw,
+                                                    void (*cb)(void *ctx, u64 phys, u32 len),
+                                                    void *ctx,
+                                                    bool fresh);
+
+/*
+ * The walk's verdicts FREE (the scrub, rule 6), and it walks this node's
+ * own in-core tree with no invalidate_lock: a held-back leaf is never
+ * dropped, so even a fresh read returns this node's image mid-edit. An
+ * extent-tree move (cetrafs_tree_move_begin()) can hide entries from a
+ * walk that overlaps it, and a hidden data block reads as unreferenced.
+ * So a walk that any move overlapped -- module-wide: the walk has no
+ * inode in hand -- runs again, and after CETRAFS_TREE_MOVE_RERUNS tries
+ * answers -EIO, which every caller takes as "references unknown" (the
+ * scrub bails; nothing is freed). Re-running is harmless: the callbacks
+ * only ADD a reference (scrub_mark_ref(), cetrafs_holds_cb()).
+ */
 int cetrafs_raw_inode_for_each_owned_block(struct super_block *sb,
                                            const cetrafs_inode_t *raw,
                                            void (*cb)(void *ctx, u64 phys, u32 len),
                                            void *ctx,
                                            bool fresh)
+{
+    int tries, ret = 0;
+
+    for (tries = 0; tries <= CETRAFS_TREE_MOVE_RERUNS; tries++) {
+        int b0 = atomic_read(&cetrafs_tree_moves_begun);
+        int e0;
+
+        smp_rmb();
+        e0 = atomic_read(&cetrafs_tree_moves_ended);
+        smp_rmb();
+        ret = __cetrafs_raw_inode_for_each_owned_block(sb, raw, cb, ctx, fresh);
+        smp_rmb();
+        if (READ_ONCE(cetrafs_tree_move_rerun_off) ||
+            (b0 == e0 && atomic_read(&cetrafs_tree_moves_begun) == b0))
+            return ret;
+        cetrafs_tree_move_backoff();
+    }
+    pr_err_ratelimited("owned-block walk: every pass overlapped an extent-tree move -- references unknown\n");
+    return -EIO;
+}
+
+static int __cetrafs_raw_inode_for_each_owned_block(struct super_block *sb,
+                                                    const cetrafs_inode_t *raw,
+                                                    void (*cb)(void *ctx, u64 phys, u32 len),
+                                                    void *ctx,
+                                                    bool fresh)
 {
     u16 depth;
     u32 i, n;
@@ -3140,6 +3311,7 @@ static int cetrafs_tree_lookup_unchecked(struct inode *inode,
             if (li >= iln)
                 break;
             li++;
+            cetrafs_lookup_stall(inode, iblock); /* test-only; see the knob */
             llba = cetrafs_extent_phys_from_hilo(ie.ei_leaf_hi, ie.ei_leaf_lo);
             lbh = cetrafs_read_leaf_bh_for(inode, llba, reader);
 
@@ -3867,8 +4039,26 @@ static bool cetrafs_tree_idx_has_room(u32 entries)
 }
 
 static bool cetrafs_leaf_split_off;
+/* TEST ONLY (split_hides_extent.sh): the next convert splits its leaf
+ * however full it is, and a split puts the new leaf in the interior's
+ * FIRST slot -- behind any walk in progress, where a real split's slot
+ * lands when the old leaf was last in its interior or the new leaf goes
+ * to an interior already walked. */
+static bool cetrafs_leaf_split_force;
+cetrafs_test_param(leaf_split_force, cetrafs_leaf_split_force, bool, 0644);
+MODULE_PARM_DESC(leaf_split_force, "TEST ONLY: the next convert splits its leaf whatever its fill, once");
+static bool cetrafs_leaf_split_place_first;
+cetrafs_test_param(leaf_split_place_first, cetrafs_leaf_split_place_first, bool, 0644);
+MODULE_PARM_DESC(leaf_split_place_first, "TEST ONLY: a split's new leaf takes its interior's first slot");
 cetrafs_test_param(leaf_split_off, cetrafs_leaf_split_off, bool, 0644);
 MODULE_PARM_DESC(leaf_split_off, "TEST ONLY: a full leaf a convert meets is not split (appends through the tree, as before)");
+
+/* TEST ONLY: hold one split after its new leaf is written and before any
+ * entry moves, so a suite can start a lookup ahead of the move
+ * (split_hides_extent.sh). One-shot. */
+static unsigned int cetrafs_leaf_split_stall_ms;
+cetrafs_test_param(leaf_split_stall_ms, cetrafs_leaf_split_stall_ms, uint, 0644);
+MODULE_PARM_DESC(leaf_split_stall_ms, "TEST ONLY: stall the next leaf split before its entries move, once");
 
 static atomic64_t cetrafs_leaf_splits = ATOMIC64_INIT(0);
 
@@ -3895,6 +4085,21 @@ static bool cetrafs_leaf_split_wanted(struct inode *inode, struct buffer_head *l
     cetrafs_bh_read_lock(lbh);
     n = cetrafs_le16(((const cetrafs_extent_hdr_t *) lbh->b_data)->eh_entries);
     cetrafs_bh_read_unlock(lbh);
+    if (READ_ONCE(cetrafs_leaf_split_force) && n >= 4 && xchg(&cetrafs_leaf_split_force, false))
+        return true; /* test-only; see the knob */
+    return n + 2 > CETRAFS_EXT_BLOCK_MAX_LEAVES;
+}
+
+/* Could a convert in this leaf shrink an extent here and append its
+ * piece elsewhere (CETRAFS_CONVERT_APPEND)? Only when it lacks room for a
+ * middle split. */
+static bool cetrafs_leaf_nearly_full(struct buffer_head *lbh)
+{
+    u16 n;
+
+    cetrafs_bh_read_lock(lbh);
+    n = cetrafs_le16(((const cetrafs_extent_hdr_t *) lbh->b_data)->eh_entries);
+    cetrafs_bh_read_unlock(lbh);
     return n + 2 > CETRAFS_EXT_BLOCK_MAX_LEAVES;
 }
 
@@ -3915,12 +4120,23 @@ static int cetrafs_idx_insert_keep_last(struct inode *inode, struct buffer_head 
     return cetrafs_tree_hold_back(inode, dbh, prev, false);
 }
 
+/*
+ * Returns 0 (split: walk again), CETRAFS_SPLIT_NONE (nothing changed: the
+ * caller converts in place, or appends the piece elsewhere) or an error.
+ * "Not split" is not an errno: once step 1 has edited an interior, any
+ * failure is an error the caller must return, and an -ENOSPC from there
+ * read as "not split" would convert on into a leaf whose moved entries
+ * the new one names too.
+ */
+#define CETRAFS_SPLIT_NONE 1
+
 static int cetrafs_tree_split_leaf(struct inode *inode,
                                    cetrafs_inode_t *raw,
                                    struct buffer_head *ibh,
                                    u32 li,
                                    struct buffer_head *lbh,
-                                   bool append_target)
+                                   bool append_target,
+                                   bool *moving)
 {
     struct super_block *sb = inode->i_sb;
     cetrafs_extent_hdr_t *ihdr = (cetrafs_extent_hdr_t *) ibh->b_data;
@@ -3935,11 +4151,12 @@ static int cetrafs_tree_split_leaf(struct inode *inode,
     u64 nleaf;
     int ret;
 
+    lockdep_assert_held_write(&inode->i_mapping->invalidate_lock);
     if (cetrafs_journal_batch_capacity(sb) < CETRAFS_CONVERT_ATOMIC_MIN)
-        return -ENOSPC; /* not atomic at the boundary: see above */
+        return CETRAFS_SPLIT_NONE; /* not atomic at the boundary: see above */
     ient = cetrafs_le16(ihdr->eh_entries);
     if (ient == 0 || li >= ient)
-        return -ENOSPC;
+        return CETRAFS_SPLIT_NONE;
 
     /* Where the new leaf goes: this interior if it has room, else any
      * other one that has (root entries carry no range, so a leaf may sit
@@ -3966,11 +4183,11 @@ static int cetrafs_tree_split_leaf(struct inode *inode,
                 brelse(b);
         }
         if (!dbh)
-            return -ENOSPC;
+            return CETRAFS_SPLIT_NONE;
     }
 
     n = min_t(u16, cetrafs_le16(lhdr->eh_entries), CETRAFS_EXT_BLOCK_MAX_LEAVES);
-    ret = -ENOSPC;
+    ret = CETRAFS_SPLIT_NONE;
     if (n < 4)
         goto out;
     part = kmalloc_array(n, sizeof(*part), GFP_NOFS);
@@ -3986,11 +4203,13 @@ static int cetrafs_tree_split_leaf(struct inode *inode,
     for (i = 0; i < n; i++)
         if (cetrafs_le32(larr[i].ee_block) < pivot)
             part[nl++] = larr[i];
-    ret = -ENOSPC;
+    ret = CETRAFS_SPLIT_NONE;
     if (!nl || nl == n)
         goto out;
 
     ret = cetrafs_alloc_block_anywhere(sb, &bg, &nleaf);
+    if (ret == -ENOSPC)
+        ret = CETRAFS_SPLIT_NONE; /* the volume is full: the convert's own append answers */
     if (ret)
         goto out;
     /* Named below from an interior edited in place: its bit first. */
@@ -4009,6 +4228,15 @@ static int cetrafs_tree_split_leaf(struct inode *inode,
             part[k++] = larr[i];
     cetrafs_leaf_array_range(part, k, &ulo, &uhi);
 
+    if (unlikely(READ_ONCE(cetrafs_leaf_split_stall_ms))) {
+        unsigned int ms = xchg(&cetrafs_leaf_split_stall_ms, 0);
+
+        if (ms)
+            msleep(min_t(unsigned int, ms, 10000)); /* test-only; see the knob */
+    }
+    /* From here entries move: a lockless walk may pass where they go. */
+    cetrafs_tree_move_begin(inode, moving);
+
     /* 1. The new leaf into its interior. A lookup for a moved block now
      * finds it there; the old leaf still holds it too. */
     if (dbh == ibh) {
@@ -4016,9 +4244,17 @@ static int cetrafs_tree_split_leaf(struct inode *inode,
          * tightened, which only narrows to what the new leaf took over. */
         const u32 iprev = cetrafs_bh_begin_update_crc(ibh);
         u32 lpos = li == (u32) ient - 1 ? ient : li;
+        u32 npos = ient - 1;
 
         iarr[ient] = iarr[ient - 1];
-        cetrafs_idx_set(&iarr[ient - 1], blo, bhi, nleaf);
+        if (READ_ONCE(cetrafs_leaf_split_place_first) && ient > 1) {
+            /* test-only; see the knob. The last entry stays last. */
+            iarr[ient - 1] = iarr[0];
+            if (li == 0)
+                lpos = ient - 1;
+            npos = 0;
+        }
+        cetrafs_idx_set(&iarr[npos], blo, bhi, nleaf);
         if (!(append_target && lpos == ient)) {
             iarr[lpos].ei_block = cetrafs_cpu_to_le32(ulo);
             iarr[lpos].ei_block_end = cetrafs_cpu_to_le32(uhi);
@@ -4068,7 +4304,8 @@ static int cetrafs_tree_convert_inner(struct inode *inode,
                                       u32 iblock,
                                       u64 lba,
                                       u32 want,
-                                      u32 *done)
+                                      u32 *done,
+                                      bool *moving)
 {
     struct super_block *sb = inode->i_sb;
     struct cetrafs_convert_tail tail = { 0 };
@@ -4090,6 +4327,10 @@ static int cetrafs_tree_convert_inner(struct inode *inode,
 
         if (!lbh)
             return -EIO;
+        /* Full enough that the convert may shrink here and append the
+         * piece elsewhere: a move (cetrafs_tree_move_begin()). */
+        if (cetrafs_leaf_nearly_full(lbh))
+            cetrafs_tree_move_begin(inode, moving);
         const u32 prev_crc = cetrafs_bh_begin_update_crc(lbh);
         lhdr = (cetrafs_extent_hdr_t *) lbh->b_data;
         ret = cetrafs_leaf_array_convert(sb, (cetrafs_extent_t *) (lbh->b_data + sizeof(*lhdr)), &lhdr->eh_entries,
@@ -4189,9 +4430,9 @@ again:
              * holds the block has room now. */
             if (splits < 2 && cetrafs_leaf_split_wanted(inode, lbh)) {
                 bool tail_leaf = ni + 1 == cetrafs_le16(raw->eh.eh_entries) && li + 1 == iln;
-                int sret = cetrafs_tree_split_leaf(inode, raw, ibh, li, lbh, tail_leaf);
+                int sret = cetrafs_tree_split_leaf(inode, raw, ibh, li, lbh, tail_leaf, moving);
 
-                if (sret != -ENOSPC) {
+                if (sret != CETRAFS_SPLIT_NONE) {
                     brelse(lbh);
                     brelse(ibh);
                     if (sret)
@@ -4200,6 +4441,10 @@ again:
                     goto again;
                 }
             }
+            /* Not split, and full enough to append its piece elsewhere: a
+             * move (cetrafs_tree_move_begin()). */
+            if (cetrafs_leaf_nearly_full(lbh))
+                cetrafs_tree_move_begin(inode, moving);
             const u32 prev_crc = cetrafs_bh_begin_update_crc(lbh);
             lhdr = (cetrafs_extent_hdr_t *) lbh->b_data;
             ret = cetrafs_leaf_array_convert(sb, (cetrafs_extent_t *) (lbh->b_data + sizeof(*lhdr)), &lhdr->eh_entries,
@@ -4302,7 +4547,10 @@ again:
  * a caller: any path inside that forgets to act on it is a bug here,
  * caught once and loudly, instead of an errno handed to the VFS.
  */
-static int cetrafs_tree_convert(struct inode *inode, cetrafs_inode_t *raw, u32 iblock, u64 lba, u32 want, u32 *done)
+/* 'moving': set when the convert moved entries (cetrafs_tree_move_begin());
+ * the caller ends the move once the new record is staged. */
+static int cetrafs_tree_convert(struct inode *inode, cetrafs_inode_t *raw, u32 iblock, u64 lba, u32 want, u32 *done,
+                                bool *moving)
 {
     /* A split rewrites a LEAF and can leave the record's depth, entry
      * count and block count untouched -- the key cannot see it. */
@@ -4314,7 +4562,7 @@ static int cetrafs_tree_convert(struct inode *inode, cetrafs_inode_t *raw, u32 i
     ret = cetrafs_deferred_room(inode); /* before anything is edited */
     if (ret)
         return ret;
-    ret = cetrafs_tree_convert_inner(inode, raw, iblock, lba, want, done);
+    ret = cetrafs_tree_convert_inner(inode, raw, iblock, lba, want, done, moving);
     if (ret == 0 && *done == 0)
         *done = 1; /* belt: a path that converted without saying so */
 
@@ -4368,6 +4616,7 @@ static int cetrafs_tree_insert_any_leaf(struct inode *inode,
 
     if (READ_ONCE(cetrafs_tree_any_leaf_off) || !S_ISREG(inode->i_mode))
         return -ENOSPC;
+    lockdep_assert_held_write(&inode->i_mapping->invalidate_lock);
     for (ni = 0; ni < cetrafs_le16(raw->eh.eh_entries) && ni < ARRAY_SIZE(raw->et.idx); ni++) {
         u64 ilba = cetrafs_extent_phys_from_hilo(raw->et.idx[ni].ei_leaf_hi, raw->et.idx[ni].ei_leaf_lo);
         struct buffer_head *ibh = cetrafs_read_index_bh(inode, ilba);
@@ -5012,6 +5261,9 @@ static int __cetrafs_get_block(struct inode *inode,
     bool dio_prealloc = false;
     u32 prun = 0; /* pending blocks from iblock (see the lookup below) */
     bool relooked = false;
+    unsigned int move_seq;
+    int move_reruns = 0;
+    bool moving = false;
     u32 leaf_count;
     int ret;
 
@@ -5055,6 +5307,7 @@ static int __cetrafs_get_block(struct inode *inode,
         cetrafs_invalidate_raw_inode(sb, inode->i_ino);
 
 relookup:
+    move_seq = cetrafs_tree_move_sample(inode); /* before the record: a move may stage a new root */
     ret = cetrafs_read_raw_inode_overlaid(sb, inode, &raw); /* torn-read-safe vs a concurrent publish */
     if (ret)
         return ret;
@@ -5112,6 +5365,21 @@ relookup:
     ret = cetrafs_tree_lookup(inode, &raw, (u32) iblock, &lba, &run, &uninit, &found, reader);
     if (ret)
         return ret;
+    /* A miss while a tree move ran is not believed: the walk may have
+     * passed where the extent went (cetrafs_tree_move_begin()). Read the
+     * record again and walk again; never answer "hole" from a walk a move
+     * overlapped -- at the bound, fail. A writer holds invalidate_lock,
+     * so no move overlaps its walk and this never fires for it. */
+    if (!found && cetrafs_tree_move_overlapped(inode, move_seq)) {
+        if (++move_reruns > CETRAFS_TREE_MOVE_RERUNS) {
+            pr_err_ratelimited("ino=%llu: block %llu: every lookup overlapped an extent-tree move (%d tries) -- "
+                               "refusing to answer\n",
+                               (unsigned long long) inode->i_ino, (unsigned long long) iblock, move_reruns - 1);
+            return -EIO;
+        }
+        cetrafs_tree_move_backoff();
+        goto relookup;
+    }
     /* A buffered write's block, not yet converted: data to this node
      * (enum cetrafs_gb_mode) -- to a reader, a DIO, writeback, a second
      * write into the block -- and never re-zeroed as new. */
@@ -5204,7 +5472,9 @@ relookup:
         want = (u32) min_t(u64, bh_result->b_size >> inode->i_blkbits, run ? run : 1);
         if (!want)
             want = 1;
-        ret = cetrafs_tree_convert(inode, &raw, (u32) iblock, lba, want, &converted);
+        ret = cetrafs_tree_convert(inode, &raw, (u32) iblock, lba, want, &converted, &moving);
+        if (ret)
+            cetrafs_tree_move_end(inode, &moving); /* nothing below stages it: what moved stays in core */
         if (ret == -ENOENT) {
             /* The lookup said preallocated and the tree says otherwise:
              * a disagreement we must not paper over by allocating a
@@ -5223,11 +5493,15 @@ relookup:
          * the lock the caller holds. */
         if (S_ISDIR(inode->i_mode)) {
             ret = cetrafs_write_raw_inode_self(inode, &raw, /*sync=*/true);
+            cetrafs_tree_move_end(inode, &moving);
             if (ret)
                 return ret;
         } else {
             cetrafs_inode_fd_stage(inode, &raw);
             mark_inode_dirty(inode);
+            /* The new record -- a root the move may have grown -- is now
+             * what a lookup reads: the move is over. */
+            cetrafs_tree_move_end(inode, &moving);
         }
 
         map_bh(bh_result, sb, lba);

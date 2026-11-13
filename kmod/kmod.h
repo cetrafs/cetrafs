@@ -1227,6 +1227,7 @@ u64 cetrafs_giveback_block_count(void);
 u64 cetrafs_convert_leaf_full_count(void);
 u64 cetrafs_leaf_split_count(void);
 u64 cetrafs_tree_any_leaf_count(void);
+u64 cetrafs_tree_move_rerun_count(void);
 u64 cetrafs_zero_inplace_block_count(void);
 u64 cetrafs_tree_block_count(void);
 u64 cetrafs_tree_read_count(void);
@@ -1256,6 +1257,7 @@ void cetrafs_inode_fd_published(struct inode *inode, u64 seq);
 u64 cetrafs_inode_fd_seq(struct inode *inode);
 void cetrafs_inode_fd_pub_lock(struct inode *inode);
 void cetrafs_inode_fd_pub_unlock(struct inode *inode);
+unsigned int *cetrafs_inode_tree_move_seq(struct inode *inode);
 /* inode.c: a record's size, bounded by what the format can address. */
 #define CETRAFS_MAX_FILE_BYTES (CETRAFS_MAX_FILE_BLOCKS * (u64) CETRAFS_BLOCK_SIZE)
 static inline bool cetrafs_size_sane(u64 size)

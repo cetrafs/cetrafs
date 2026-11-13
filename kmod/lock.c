@@ -417,6 +417,14 @@ struct cetrafs_inode_info {
     u64 fd_seq;
     struct mutex fd_pub_mutex;
 
+    /* Odd while an extent-tree edit MOVES entries between tree blocks
+     * (a range split, or a full leaf's convert appending its piece
+     * elsewhere): a lookup with no invalidate_lock that misses during one
+     * may have walked past where an extent went, and re-runs
+     * (cetrafs_tree_move_begin(), file.c). Written only under
+     * invalidate_lock held exclusively, which serialises the moves. */
+    unsigned int tree_move_seq;
+
     /* Directories: the dirent_seq at which this node last read this
      * directory's dirent blocks forced-fresh. While the on-disk seq
      * still matches, the cached blocks are known current and can be
@@ -1145,6 +1153,11 @@ void cetrafs_inode_fd_pub_unlock(struct inode *inode)
     mutex_unlock(&CETRAFS_I(inode)->fd_pub_mutex);
 }
 
+unsigned int *cetrafs_inode_tree_move_seq(struct inode *inode)
+{
+    return &CETRAFS_I(inode)->tree_move_seq;
+}
+
 /* Overlay AND claim: the caller is about to rebuild/publish the file
  * domain itself (truncate, fallocate, defrag), so the shadow's content
  * is folded into 'raw' and the pending flag cleared -- from here the
@@ -1316,6 +1329,7 @@ static void cetrafs_inode_init_once(void *foo)
     spin_lock_init(&ci->resv_lock);
     spin_lock_init(&ci->fd_lock);
     mutex_init(&ci->fd_pub_mutex);
+    ci->tree_move_seq = 0;
     INIT_LIST_HEAD(&ci->resv_span.link);
     atomic_set(&ci->lock_writer_count, 0);
     atomic_set(&ci->read_opener_count, 0);
