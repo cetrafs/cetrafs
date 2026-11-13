@@ -452,6 +452,15 @@ static int cetrafs_meta_write_result(struct super_block *sb, struct buffer_head 
     return ret;
 }
 
+/* The wait half of a metadata write the caller submitted itself (with
+ * write_dirty_buffer(), among others in one plug): same verdict as
+ * cetrafs_sync_buffer(). */
+int cetrafs_wait_meta_write(struct super_block *sb, struct buffer_head *bh)
+{
+    wait_on_buffer(bh);
+    return cetrafs_meta_write_result(sb, bh, buffer_uptodate(bh) ? 0 : -EIO);
+}
+
 /* On a stopped mount nothing is written: the dirt stays for the next
  * sweep (cetrafs_drop_dirty_metadata()) to discard. */
 int cetrafs_sync_buffer(struct super_block *sb, struct buffer_head *bh)
@@ -519,6 +528,41 @@ void cetrafs_bh_deferred_settle(struct super_block *sb, struct buffer_head *bh, 
  * cached image stays uptodate: it is the only copy of the edit.
  * 1: no longer held back, nothing written.
  */
+/* The two halves of cetrafs_write_deferred_target(), so a batch can
+ * have every target in flight at once: submit returns 1 (no longer held
+ * back, nothing submitted), 0 (submitted: wait for it) or an error. */
+int cetrafs_submit_deferred_target(struct super_block *sb, struct buffer_head *bh, u32 *wcrc)
+{
+    if (cetrafs_sb_is_fenced(sb))
+        return -EIO;
+    lock_buffer(bh);
+    if (!buffer_cetra_deferred(bh)) {
+        unlock_buffer(bh);
+        return 1;
+    }
+    *wcrc = ~crc32c(~0U, bh->b_data, CETRAFS_BLOCK_SIZE);
+    clear_buffer_write_io_error(bh);
+    clear_buffer_dirty(bh);
+#if LINUX_VERSION_CODE >= KERNEL_VERSION(7, 2, 0)
+    bh_submit(bh, REQ_OP_WRITE | REQ_SYNC, cetrafs_end_write_keep);
+#else
+    get_bh(bh);
+    bh->b_end_io = cetrafs_end_write_keep;
+    submit_bh(REQ_OP_WRITE | REQ_SYNC, bh);
+#endif
+    return 0;
+}
+
+int cetrafs_wait_deferred_target(struct super_block *sb, struct buffer_head *bh)
+{
+    wait_on_buffer(bh);
+    if (buffer_write_io_error(bh)) {
+        clear_buffer_write_io_error(bh);
+        return cetrafs_meta_write_result(sb, bh, -EIO);
+    }
+    return cetrafs_meta_write_result(sb, bh, 0);
+}
+
 int cetrafs_write_deferred_target(struct super_block *sb, struct buffer_head *bh, u32 *wcrc)
 {
     if (cetrafs_sb_is_fenced(sb))

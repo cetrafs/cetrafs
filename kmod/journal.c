@@ -1538,8 +1538,25 @@ static int cetrafs_journal_batch_chunk(struct super_block *sb, struct cetrafs_jo
     }
 
     /* 3. The targets. One that fails keeps its entry live for replay. */
+    /* 4. The targets: all in flight at once, then waited for. Nothing
+     * orders them among themselves -- the flushes either side do the
+     * ordering -- and one at a time was a device round trip per block
+     * of the batch, the cost of a write into preallocated space. 'hb'
+     * (released in 1.) carries which ones were submitted. */
+    {
+        struct blk_plug plug;
+
+        blk_start_plug(&plug);
+        for (i = 0; i < k; i++) {
+            int sret = cetrafs_submit_deferred_target(sb, bhs[i], &wcrc[i]);
+
+            hb[i] = sret == 0 ? bhs[i] : NULL;
+            pb[i] = ERR_PTR(sret > 0 ? 0 : sret); /* the result when not submitted */
+        }
+        blk_finish_plug(&plug);
+    }
     for (i = 0; i < k; i++) {
-        int werr = cetrafs_deferred_write_target(sb, bhs[i], &wcrc[i]);
+        int werr = hb[i] ? cetrafs_wait_deferred_target(sb, bhs[i]) : (int) PTR_ERR(pb[i]);
 
         if (werr) {
             mutex_lock(&j->lock);
@@ -1571,19 +1588,42 @@ static int cetrafs_journal_batch_chunk(struct super_block *sb, struct cetrafs_jo
         return ferr;
     }
 
-    /* 5. Consume. */
+    /* 5. Consume: every header zeroed at once, then waited for -- the
+     * same round trip per block as 4. otherwise. */
+    {
+        struct blk_plug plug;
+        bool fenced = cetrafs_sb_is_fenced(sb);
+
+        blk_start_plug(&plug);
+        for (i = 0; i < k; i++) {
+            hb[i] = NULL;
+            if (!written[i] || fenced)
+                continue;
+            hb[i] = cetrafs_getblk_overwrite(sb, cetrafs_journal_header_lba(j, slots[i]));
+            if (!hb[i])
+                continue;
+            memset(hb[i]->b_data, 0, CETRAFS_BLOCK_SIZE);
+            cetrafs_bh_end_update(hb[i]);
+            write_dirty_buffer(hb[i], REQ_SYNC);
+        }
+        blk_finish_plug(&plug);
+    }
     for (i = 0; i < k; i++) {
+        int zerr;
+
         if (!written[i])
             continue;
-        if (cetrafs_journal_zero_header(sb, cetrafs_journal_header_lba(j, slots[i]))) {
-            mutex_lock(&j->lock);
-            cetrafs_journal_hold_slot(j, slots[i], bhs[i]->b_blocknr); /* live and harmless: see the single write */
-            mutex_unlock(&j->lock);
-        } else {
-            mutex_lock(&j->lock);
-            clear_bit(slots[i], j->busy);
-            mutex_unlock(&j->lock);
+        zerr = -EIO;
+        if (hb[i]) {
+            zerr = cetrafs_wait_meta_write(sb, hb[i]);
+            brelse(hb[i]);
         }
+        mutex_lock(&j->lock);
+        if (zerr)
+            cetrafs_journal_hold_slot(j, slots[i], bhs[i]->b_blocknr); /* live and harmless: see the single write */
+        else
+            clear_bit(slots[i], j->busy);
+        mutex_unlock(&j->lock);
     }
     wake_up(&j->slot_wq);
     return ret;

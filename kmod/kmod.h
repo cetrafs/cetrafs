@@ -1383,6 +1383,9 @@ static inline bool cetrafs_bh_pending(const struct buffer_head *bh)
 }
 int cetrafs_bh_defer_update(struct inode *inode, struct buffer_head *bh, u32 prev_crc);
 int cetrafs_write_deferred_target(struct super_block *sb, struct buffer_head *bh, u32 *wcrc);
+int cetrafs_submit_deferred_target(struct super_block *sb, struct buffer_head *bh, u32 *wcrc);
+int cetrafs_wait_deferred_target(struct super_block *sb, struct buffer_head *bh);
+int cetrafs_wait_meta_write(struct super_block *sb, struct buffer_head *bh);
 void cetrafs_bh_end_update_deferred(struct buffer_head *bh);
 void cetrafs_bh_deferred_unlist(struct super_block *sb, struct buffer_head *bh, bool drop);
 void cetrafs_bh_deferred_settle(struct super_block *sb, struct buffer_head *bh, u32 written_crc);
