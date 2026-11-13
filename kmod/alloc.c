@@ -1592,6 +1592,16 @@ int cetrafs_bg_invalidate_cache(struct super_block *sb, u32 bg_id)
  * the operation this was called from already succeeded, matching every
  * caller (which ignore this return).
  */
+/* TEST ONLY: the next N adjusts find their descriptor unreadable; and
+ * the old order -- a failed read returned before the delta was accrued
+ * (tests/kernel/bg_adjust_read_fail.sh, its control). */
+static unsigned int cetrafs_bg_adjust_read_fail;
+cetrafs_test_param(bg_adjust_read_fail, cetrafs_bg_adjust_read_fail, uint, 0644);
+MODULE_PARM_DESC(bg_adjust_read_fail, "TEST ONLY: the next N free-count adjusts cannot read their descriptor");
+static bool cetrafs_bg_adjust_old_order;
+cetrafs_test_param(bg_adjust_old_order, cetrafs_bg_adjust_old_order, bool, 0644);
+MODULE_PARM_DESC(bg_adjust_old_order, "TEST ONLY: a failed descriptor read drops the delta (the old order)");
+
 static int cetrafs_bg_adjust_free_blocks(struct super_block *sb, u32 bg_id, s64 delta)
 {
     const cetrafs_superblock_t *raw_sb = cetrafs_sb_raw(sb);
@@ -1605,16 +1615,40 @@ static int cetrafs_bg_adjust_free_blocks(struct super_block *sb, u32 bg_id, s64 
     if (bg_id >= le32_to_cpu(raw_sb->block_group_count))
         return -EINVAL;
 
-    bh = cetrafs_bread_retry(sb, cetrafs_sb_bg_desc_lba(sb, bg_id));
-    if (!bh)
-        return -EIO;
-    bg = (const cetrafs_block_group_t *) bh->b_data;
-    owner_zg = cetrafs_le16(bg->owner_zg);
-    brelse(bh);
-
     /* PERF(4): accrue only -- a sync here is one device round trip per
-     * allocated block (1 MiB write: 2s -> 40s). docs/PERFORMANCE.md */
-    cetrafs_sb_accrue_bg_free(sb, bg_id, delta);
+     * allocated block (1 MiB write: 2s -> 40s). docs/PERFORMANCE.md
+     *
+     * FIRST, before anything that can fail: every caller has already
+     * moved the bitmap and ignores this return, so a delta not accrued
+     * here is lost for good -- an allocation the count never hears of
+     * is a full group reading free, the state class 52 is about. It
+     * used to come after the descriptor read below, and a failed read
+     * dropped it. */
+    {
+        bool fail = false;
+
+        if (READ_ONCE(cetrafs_bg_adjust_read_fail)) {
+            WRITE_ONCE(cetrafs_bg_adjust_read_fail, cetrafs_bg_adjust_read_fail - 1);
+            fail = true; /* test-only; see the parameter */
+            if (READ_ONCE(cetrafs_bg_adjust_old_order))
+                return -EIO; /* the old order: nothing accrued */
+        }
+        cetrafs_sb_accrue_bg_free(sb, bg_id, delta);
+
+        /* The owner, for the roll-up: from the cached descriptor, or --
+         * if that cannot be read -- from the in-memory map every claim
+         * and release keeps, so the aggregate's half is not lost either. */
+        bh = fail ? NULL : cetrafs_bread_retry(sb, cetrafs_sb_bg_desc_lba(sb, bg_id));
+    }
+    if (bh) {
+        bg = (const cetrafs_block_group_t *) bh->b_data;
+        owner_zg = cetrafs_le16(bg->owner_zg);
+        brelse(bh);
+    } else {
+        owner_zg = cetrafs_sb_bg_owner(sb, bg_id);
+        pr_warn_ratelimited("BG %u free-count adjust: descriptor unreadable -- rolling up into ZG %u from memory\n",
+                            bg_id, owner_zg);
+    }
 
     /* Nobody's Block Group has nobody's aggregate to roll into, and
      * CETRAFS_BG_OWNER_FREE as an index would run off every per-ZG
