@@ -692,6 +692,8 @@ static void scrub_free_targets(struct scrub_ctx *ctx)
  * the scrub takes the lock the way an operation would, which fences the
  * dead node, replays its journal and recounts; a file no name reaches
  * comes out of that with nlink 0, and its own eviction frees it.
+ * A record flagged CETRAFS_INODE_COUNT_UNVERIFIED -- a recount owed and
+ * failed -- is taken the same way: the acquire recounts it.
  * One acquire per such record per cycle: they exist only after a crash.
  */
 static void scrub_reconcile_stopped_op(struct cetrafs_scrub *s, u64 ino, const cetrafs_inode_t *raw, u32 my_node_id)
@@ -701,10 +703,18 @@ static void scrub_reconcile_stopped_op(struct cetrafs_scrub *s, u64 ino, const c
     struct inode *inode;
     bool stale = false;
 
-    if (from == CETRAFS_NODE_ID_NONE || from == my_node_id)
-        return; /* unlocked, or one of ours: its operation releases it */
-    if (cetrafs_node_is_stale(sb, from, &stale) || !stale)
+    if (from == my_node_id)
+        return; /* one of ours: its operation releases it */
+    if (from == CETRAFS_NODE_ID_NONE) {
+        /* Unlocked: only a record whose recount was owed and failed
+         * (CETRAFS_INODE_COUNT_UNVERIFIED) is this pass's -- an unlinked
+         * file flagged so is reached by no name, so no operation would
+         * ever recount it. */
+        if (!(cetrafs_le32(raw->flags) & CETRAFS_INODE_COUNT_UNVERIFIED))
+            return;
+    } else if (cetrafs_node_is_stale(sb, from, &stale) || !stale) {
         return; /* a live holder's operation is still running */
+    }
     inode = cetrafs_iget(sb, ino);
     if (IS_ERR(inode))
         return;

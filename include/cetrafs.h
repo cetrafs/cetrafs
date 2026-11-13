@@ -1605,6 +1605,12 @@ static inline void cetrafs_inode_fd_copy(cetrafs_inode_t *dst, const cetrafs_ino
 #define CETRAFS_INODE_SNAPSHOT     0x00000002
 #define CETRAFS_INODE_COMPRESSED   0x00000004
 #define CETRAFS_INODE_XATTR        0x00000008
+/* The record's namespace counts (a directory's size and nlink, a file's
+ * nlink) may be behind its entries: an operation stopped holding the
+ * namespace lock, and the recount owed by whoever took it over failed.
+ * Set in the swap that releases the lock; the next acquirer recounts
+ * before building on the counts and clears it (cetrafs_ns_reconcile()). */
+#define CETRAFS_INODE_COUNT_UNVERIFIED 0x00000010
 
 /* Inode open-lock modes (lock_owner_node/lock_mode above) */
 #define CETRAFS_LOCK_NONE          0 /* unlocked */

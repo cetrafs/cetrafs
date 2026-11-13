@@ -323,7 +323,7 @@ CRC32C, computed by `mkfs` and verified by `fsck`.
 | mode, uid, gid, nlink | standard stat fields |
 | size, blocks | bytes / 512B sectors |
 | atime, mtime, ctime | timestamps |
-| flags | `CETRAFS_INODE_*` (EXTENTS always set; XATTR set when an xattr block exists; SNAPSHOT/COMPRESSED reserved) |
+| flags | `CETRAFS_INODE_*` (EXTENTS always set; XATTR set when an xattr block exists; SNAPSHOT/COMPRESSED reserved; COUNT_UNVERIFIED set when a recount owed after a stopped namespace operation failed -- the next acquirer recounts and clears it) |
 | eh + et (union) | embedded extent-tree root: a header plus 4 inline leaf extents (depth 0) or 4 inline index entries (depth 1/2). `kmod/file.c`'s extent machinery walks all depths; see "Extents" |
 | xattr_block | external xattr block, or 0. Lazily allocated by `kmod/xattr.c` on the first set; freed and reset to 0 when the last entry is removed. One block, no chaining |
 | lock_owner_node, lock_mode | whole-file cross-node exclusive open lock (`kmod/lock.c`): `lock_owner_node` is a Node Registry row index (`CETRAFS_NODE_ID_NONE` while unlocked), `lock_mode` is `_NONE`/`_EXCLUSIVE`, or `_RELOCATING`/`_YIELD` for a lock held only by a background move, which a peer may ask back (`docs/LOCKING.md`). A write-open claims it; any open from a *live* different node while locked gets `-ETXTBSY`; a stale holder's lock is reclaimed. Whole-file (VMFS-style), not POSIX byte-range. Reclaim keys off the owner's Node Registry row, so a long-held write-open never ages out on its own |

@@ -320,6 +320,24 @@ static void repair_set_nlink(int fd, const cetrafs_superblock_t *sb, uint64_t in
     pwrite_all(fd, blk, sizeof(blk), off);
 }
 
+/* Clear CETRAFS_INODE_COUNT_UNVERIFIED -- same read-modify-write and
+ * restamp as repair_set_nlink() above. */
+static void repair_clear_unverified(int fd, const cetrafs_superblock_t *sb, uint64_t ino)
+{
+    uint8_t blk[CETRAFS_BLOCK_SIZE] = {0};
+    off_t off = (off_t) (cetrafs_le64(sb->inode_table_start) + (ino - 1)) * CETRAFS_BLOCK_SIZE;
+    cetrafs_inode_t in;
+
+    pread_all(fd, blk, sizeof(blk), off);
+    memcpy(&in, blk, sizeof(in));
+    if (!fsck_record_restampable(&in, ino))
+        return;
+    in.flags = cetrafs_cpu_to_le32(cetrafs_le32(in.flags) & ~CETRAFS_INODE_COUNT_UNVERIFIED);
+    cetrafs_inode_stamp_crcs_us(&in);
+    memcpy(blk, &in, sizeof(in));
+    pwrite_all(fd, blk, sizeof(blk), off);
+}
+
 /* Rewrite a directory record's size -- same read-modify-write and
  * restamp as repair_set_nlink() above. */
 static void repair_set_dir_size(int fd, const cetrafs_superblock_t *sb, uint64_t ino, uint64_t size)
@@ -3924,6 +3942,7 @@ int main(int argc, char **argv)
         uint32_t *parent = (uint32_t *) xcalloc(cetrafs_le32(sb.inodes_count) + 1, sizeof(uint32_t));
         uint8_t *walked = (uint8_t *) xcalloc(cetrafs_le32(sb.inodes_count) + 1, 1);
         uint32_t *nlinks = (uint32_t *) xcalloc(cetrafs_le32(sb.inodes_count) + 1, sizeof(uint32_t));
+        uint8_t *unverified = (uint8_t *) xcalloc(cetrafs_le32(sb.inodes_count) + 1, 1);
         uint8_t *is_dir = (uint8_t *) xcalloc(cetrafs_le32(sb.inodes_count) + 1, 1);
         /* A regular file that holds nothing at all: no size, no extent,
          * no xattr block. Unnamed, it is what a create stopped between
@@ -3993,6 +4012,7 @@ int main(int argc, char **argv)
             if (!cetrafs_inode_crcs_ok(&in))
                 continue; /* already reported above */
             nlinks[ino] = cetrafs_le32(in.nlink);
+            unverified[ino] = !!(cetrafs_le32(in.flags) & CETRAFS_INODE_COUNT_UNVERIFIED);
             is_dir[ino] = ((cetrafs_le32(in.mode) & 0170000u) == 0040000u);
             dsize[ino] = cetrafs_le64(in.size);
             empty[ino] = (cetrafs_le32(in.mode) & 0170000u) == 0100000u && !cetrafs_le64(in.size) &&
@@ -4534,6 +4554,33 @@ int main(int argc, char **argv)
             problems++;
         }
 
+        /*
+         * A record the kernel flagged: a recount it owed after an
+         * operation stopped holding the namespace lock failed, and the
+         * next acquirer was to redo it (CETRAFS_INODE_COUNT_UNVERIFIED).
+         * Its counts were checked above like every other's; the flag
+         * itself is a note. -r clears it only where that check was
+         * complete -- a directory whose blocks were all read, link counts
+         * from a whole tally -- since a cleared flag says "verified".
+         */
+        for (uint64_t ino = 1; ino <= cetrafs_le32(sb.inodes_count); ++ino) {
+            bool complete;
+
+            if (!unverified[ino])
+                continue;
+            complete = !tally_partial && (!is_dir[ino] || (walked[ino] && dwhole[ino]));
+            if (repair_mode && !repair_blocked && complete) {
+                repair_clear_unverified(fd, &sb, ino);
+                repairs_made++;
+                fprintf(stderr, "note: inode %" PRIu64 " was flagged with its counts unverified; checked above, flag "
+                                "cleared\n", ino);
+            } else {
+                fprintf(stderr, "note: inode %" PRIu64 " is flagged with its counts unverified (a recount the "
+                                "kernel owed failed; the next operation on it recounts)%s\n",
+                        ino, complete ? "" : " -- this run could not check them completely");
+            }
+        }
+
         /* Reachability from the ROOT, as opposed to "named by
          * something".
          *
@@ -4791,6 +4838,7 @@ int main(int argc, char **argv)
         free(ibmap);
         free(refs);
         free(nlinks);
+        free(unverified);
         free(is_dir);
         free(empty);
         free(dot_tgt);

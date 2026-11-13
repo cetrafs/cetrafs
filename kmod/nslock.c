@@ -106,6 +106,7 @@ struct cetrafs_nslock_ctx {
     u32 my_incarnation;    /* acquire: what the lock is stamped with */
     bool took_over;        /* acquire: the swap took a lock that was SET -- a dead peer's, an
                             * earlier incarnation's, or a release of ours that never committed */
+    bool owed;             /* acquire: the record carries CETRAFS_INODE_COUNT_UNVERIFIED */
     u32 clobbered; /* release: who held it, when it was no longer ours */
     bool not_ours; /* release: it was no longer ours -- the verdict. Not
                     * clobbered != NONE: a lock found CLEARED has
@@ -156,25 +157,53 @@ static bool cetrafs_nslock_reconcile_off;
 cetrafs_test_param(nslock_reconcile_off, cetrafs_nslock_reconcile_off, bool, 0644);
 MODULE_PARM_DESC(nslock_reconcile_off, "TEST ONLY: no recount after taking over a namespace lock");
 
-/* TEST ONLY: the next N takeover recounts fail as if out of memory, and
- * recount_fail_release takes the path they took before: the directory
- * marked damaged and the lock released over a count nobody re-derives.
- * tests/kernel/ns_recount_fail_retry.sh. */
-static unsigned int cetrafs_nslock_recount_fail;
-cetrafs_test_param(nslock_recount_fail, cetrafs_nslock_recount_fail, uint, 0644);
-MODULE_PARM_DESC(nslock_recount_fail, "TEST ONLY: fail the next N takeover recounts with -ENOMEM");
+/* TEST ONLY, the negative controls of tests/kernel/ns_recount_fail_retry.sh
+ * (the failure itself is dir.c's nslock_recount_fail). With recount_fail_release a
+ * failed recount takes the path it took before the flag: the inode
+ * marked damaged and the lock released over a count nobody re-derives;
+ * with unverified_ignore an acquirer does not honour the flag. The
+ * suite's two negative controls. */
 static bool cetrafs_nslock_recount_fail_release;
 cetrafs_test_param(nslock_recount_fail_release, cetrafs_nslock_recount_fail_release, bool, 0644);
-MODULE_PARM_DESC(nslock_recount_fail_release, "TEST ONLY: a failed takeover recount marks the inode damaged and releases");
+MODULE_PARM_DESC(nslock_recount_fail_release, "TEST ONLY: a failed recount marks the inode damaged and releases");
+static bool cetrafs_nslock_unverified_ignore;
+cetrafs_test_param(nslock_unverified_ignore, cetrafs_nslock_unverified_ignore, bool, 0644);
+MODULE_PARM_DESC(nslock_unverified_ignore, "TEST ONLY: an acquire does not recount a record flagged unverified");
 
-/* The takeover recount, with the test-only failure in front of it. */
+static void cetrafs_ns_apply_unverified(cetrafs_inode_t *rec, void *arg)
+{
+    u32 f = cetrafs_le32(rec->flags);
+
+    rec->flags = cetrafs_cpu_to_le32(*(const bool *) arg ? f | CETRAFS_INODE_COUNT_UNVERIFIED
+                                                         : f & ~CETRAFS_INODE_COUNT_UNVERIFIED);
+}
+
+/* Set or clear CETRAFS_INODE_COUNT_UNVERIFIED; the caller holds the lock. */
+int cetrafs_ns_set_unverified(struct super_block *sb, u64 ino, u64 generation, bool set)
+{
+    return cetrafs_inode_ns_cas(sb, ino, generation, NULL, cetrafs_ns_apply_unverified, &set);
+}
+
+/*
+ * The recount, with a short retry for the failures that resolve by
+ * themselves: a grow this node has not caught up with (-EAGAIN: catch
+ * up, then count) and an allocation (-ENOMEM: once more after a pause).
+ * Anything else, or one that outlives the attempts, is returned.
+ */
 static int cetrafs_nslock_recount(struct super_block *sb, u64 ino, u64 generation, struct inode *self)
 {
-    unsigned int n = READ_ONCE(cetrafs_nslock_recount_fail);
+    int attempt, ret = 0;
 
-    if (n && cmpxchg(&cetrafs_nslock_recount_fail, n, n - 1) == n)
-        return -ENOMEM; /* test-only, see the knob */
-    return cetrafs_ns_reconcile(sb, ino, generation, self);
+    for (attempt = 0; attempt < 3; attempt++) {
+        ret = cetrafs_ns_reconcile(sb, ino, generation, self);
+        if (ret == -EAGAIN)
+            cetrafs_sb_layout_refresh(sb);
+        else if (ret == -ENOMEM)
+            msleep(20);
+        else
+            break;
+    }
+    return ret;
 }
 
 static unsigned int cetrafs_nslock_release_stall_ms;
@@ -237,6 +266,7 @@ static int cetrafs_nslock_mutate(void *image, unsigned int len, void *priv)
         if (!free_now && !mine_already && !stealable)
             return -EBUSY;
         ctx->took_over = !free_now; /* this attempt's image decides, not an earlier one's */
+        ctx->owed = !!(cetrafs_le32(rec.flags) & CETRAFS_INODE_COUNT_UNVERIFIED);
 
         /* Taken from a previous holder -- a dead peer, or a release of
          * ours that never committed -- a DIRECTORY's entries may have
@@ -314,9 +344,6 @@ static int cetrafs_nslock_mutate(void *image, unsigned int len, void *priv)
  * logged as lost at the time -- the point here is only to stop holding
  * a lock nobody else can take.
  *
- * One kind of entry recounts first: a lock taken over from a stopped
- * operation whose recount failed (cetrafs_nslock_acquire_tries()).
- *
  * An entry is settled and dropped when the swap commits, when the
  * record says the lock is no longer ours, or when the identity has
  * changed (-ESTALE: the number was reused, so the lock is not ours to
@@ -341,7 +368,7 @@ void cetrafs_nslock_retry_deferred(struct super_block *sb)
     if (cetrafs_sb_is_fenced(sb) || cetrafs_sb_get_node_id(sb, &my_node_id) != 0) {
         /* Nothing we may write right now; keep them for later. */
         for (i = 0; i < n; i++)
-            cetrafs_sb_nslock_defer_recount(sb, pend[i].ino, pend[i].generation, pend[i].recount);
+            cetrafs_sb_nslock_defer(sb, pend[i].ino, pend[i].generation);
         goto out;
     }
 
@@ -353,31 +380,7 @@ void cetrafs_nslock_retry_deferred(struct super_block *sb)
             .staged = NULL,
             .clobbered = CETRAFS_NODE_ID_NONE,
         };
-        int ret;
-
-        /* A takeover whose recount did not finish kept the lock so that
-         * this recount runs before anyone -- a peer included -- builds
-         * on the count again (cetrafs_nslock_acquire_tries()). Still
-         * ours: the lock is set under our id and every local acquire of
-         * this inode waits out the pass (cetrafs_sb_nslock_forget()). */
-        if (pend[i].recount && !READ_ONCE(cetrafs_nslock_reconcile_off)) {
-            ret = cetrafs_nslock_recount(sb, pend[i].ino, pend[i].generation, NULL);
-            if (ret == -ESTALE) {
-                pr_info("nslock: ino=%llu number reused before its recount -- dropping the retry\n",
-                        (unsigned long long) pend[i].ino);
-                continue;
-            }
-            if (ret) {
-                pr_warn_ratelimited("nslock: ino=%llu recount still failing (%d) -- keeping its lock\n",
-                                    (unsigned long long) pend[i].ino, ret);
-                if (ret == -EUCLEAN)
-                    cetrafs_sb_corrupt(sb, pend[i].ino);
-                cetrafs_sb_nslock_defer_recount(sb, pend[i].ino, pend[i].generation, true);
-                continue;
-            }
-            pr_info("nslock: ino=%llu recounted on retry\n", (unsigned long long) pend[i].ino);
-        }
-        ret = cetrafs_cas_record(sb, cetrafs_inode_lba(sb, pend[i].ino), cetrafs_nslock_mutate, &ctx);
+        int ret = cetrafs_cas_record(sb, cetrafs_inode_lba(sb, pend[i].ino), cetrafs_nslock_mutate, &ctx);
 
         /*
          * The VERDICT comes from the ctx, never from ret.
@@ -395,7 +398,7 @@ void cetrafs_nslock_retry_deferred(struct super_block *sb)
             pr_info("nslock: ino=%llu no longer ours to release (%d) -- dropping the retry\n",
                     (unsigned long long) pend[i].ino, ret);
         } else {
-            cetrafs_sb_nslock_defer(sb, pend[i].ino, pend[i].generation); /* recounted: only the clear is owed */
+            cetrafs_sb_nslock_defer(sb, pend[i].ino, pend[i].generation);
         }
     }
 out:
@@ -405,7 +408,7 @@ out:
 
 /* One acquire attempt. Returns 0 on success, -EBUSY if a live peer holds
  * it, or another errno. */
-static int cetrafs_nslock_try(struct inode *inode, u32 my_node_id, bool *took_over)
+static int cetrafs_nslock_try(struct inode *inode, u32 my_node_id, bool *took_over, bool *owed)
 {
     struct super_block *sb = inode->i_sb;
     struct cetrafs_nslock_ctx ctx = {
@@ -477,6 +480,7 @@ static int cetrafs_nslock_try(struct inode *inode, u32 my_node_id, bool *took_ov
     ret = cetrafs_cas_record_seeded(sb, cetrafs_inode_lba(sb, inode->i_ino), &raw, CETRAFS_INODE_NS_BYTES,
                                     cetrafs_nslock_mutate, &ctx);
     *took_over = !ret && ctx.took_over;
+    *owed = !ret && ctx.owed;
     /* A broken lock is the judged incarnation's or nothing: the swap
      * compares the holder's incarnation, so one that re-attached and
      * took this lock again answers -EBUSY above, a live holder, and
@@ -496,7 +500,7 @@ static int cetrafs_nslock_acquire_tries(struct inode *inode, int max_tries)
 {
     struct super_block *sb = inode->i_sb;
     u64 deferred_gen = 0;
-    bool had_deferred, deferred_recount = false;
+    bool had_deferred;
     u32 my_node_id;
     int attempt, ret;
 
@@ -517,7 +521,7 @@ static int cetrafs_nslock_acquire_tries(struct inode *inode, int max_tries)
         return ret; /* killed while another local operation held it */
     /* Before the acquire can make us the live holder: a deferred retry
      * of an earlier release of ours would clear the lock under us. */
-    ret = cetrafs_sb_nslock_forget(sb, inode->i_ino, &deferred_gen, &deferred_recount);
+    ret = cetrafs_sb_nslock_forget(sb, inode->i_ino, &deferred_gen);
     if (ret < 0) {
         cetrafs_inode_ns_mutex_unlock(inode);
         return ret; /* killed waiting out a release-retry pass */
@@ -525,9 +529,9 @@ static int cetrafs_nslock_acquire_tries(struct inode *inode, int max_tries)
     had_deferred = ret;
 
     for (attempt = 0; attempt < max_tries; attempt++) {
-        bool took_over = false;
+        bool took_over = false, owed = false;
 
-        ret = cetrafs_nslock_try(inode, my_node_id, &took_over);
+        ret = cetrafs_nslock_try(inode, my_node_id, &took_over, &owed);
         if (ret != -EBUSY) {
             if (!ret) {
                 ctrace("NSHOLD ino=%llu ACQ\n", (unsigned long long) inode->i_ino);
@@ -544,10 +548,16 @@ static int cetrafs_nslock_acquire_tries(struct inode *inode, int max_tries)
              * before building on that count. Held, so the recount is
              * exact (cetrafs_dir_reconcile_counts()).
              */
-            if (took_over && !READ_ONCE(cetrafs_nslock_reconcile_off)) {
+            if (READ_ONCE(cetrafs_nslock_unverified_ignore))
+                owed = false; /* test-only, see the knob */
+            if ((took_over || owed) && !READ_ONCE(cetrafs_nslock_reconcile_off)) {
                 u64 gen = cetrafs_inode_get_generation(inode);
 
                 ret = cetrafs_nslock_recount(sb, inode->i_ino, gen, inode);
+                if (!ret && owed && cetrafs_ns_set_unverified(sb, inode->i_ino, gen, false))
+                    pr_warn("nslock: ino=%llu recounted, but its unverified flag could not be cleared -- the next "
+                            "acquirer recounts again\n",
+                            (unsigned long long) inode->i_ino);
                 if (ret == -ESTALE) { /* a reused number: nothing of ours to count */
                     cetrafs_nslock_release(inode);
                     return ret;
@@ -560,28 +570,30 @@ static int cetrafs_nslock_acquire_tries(struct inode *inode, int max_tries)
                 }
                 if (ret) {
                     /*
-                     * The count is unknown, and the set lock is the only
-                     * thing that says so: released, nobody would ask
-                     * again, and a peer would build on the stale count
-                     * (a file's nlink too low frees it while named).
-                     * Keep it set -- peers wait, as for any held lock --
-                     * and let the heartbeat recount and then clear it
-                     * (cetrafs_nslock_retry_deferred()); our own next
-                     * acquire takes it back as a takeover and recounts
-                     * too. Most failures are not damage (no memory, a
-                     * read error, a peer's grow not yet caught up); one
-                     * that is refuses this inode here at once (kind 2,
+                     * The counts are unknown. Releasing the lock alone
+                     * would leave nothing to say so, and keeping it would
+                     * stop every node; the record says it instead, so the
+                     * next acquirer -- on any node, in its own context --
+                     * recounts before building on them. Set while we
+                     * still hold the lock; a swap that cannot land here
+                     * ends in the state a crash leaves (the lock set,
+                     * which the next holder recounts under). Only a
+                     * recount that found damage marks the inode (kind 2,
                      * docs/internal/ERRORS.md).
                      */
-                    pr_err("nslock: ino=%llu: could not recount what a stopped operation left (%d) -- keeping "
-                           "the lock until a recount succeeds\n",
-                           (unsigned long long) inode->i_ino, ret);
+                    int set = cetrafs_ns_set_unverified(sb, inode->i_ino, gen, true);
+
+                    pr_err("nslock: ino=%llu: could not recount what a stopped operation left (%d) -- %s\n",
+                           (unsigned long long) inode->i_ino, ret,
+                           set ? "and could not flag it" : "flagged for the next acquirer");
+                    if (set && set != -ESTALE)
+                        cetrafs_sb_fatal(sb, "nslock: ino=%llu: its counts are unverified and the flag that says "
+                                             "so could not be set (%d)",
+                                         (unsigned long long) inode->i_ino, set);
                     if (ret == -EUCLEAN)
                         cetrafs_sb_corrupt(sb, inode->i_ino);
-                    cetrafs_inode_ns_holder_set(inode, false);
-                    cetrafs_sb_nslock_defer_recount(sb, inode->i_ino, gen, true);
-                    cetrafs_inode_ns_mutex_unlock(inode);
-                    return ret;
+                    cetrafs_nslock_release(inode);
+                    return ret == -EAGAIN ? -EIO : ret;
                 }
             }
             return ret;
@@ -600,7 +612,7 @@ fail:
     /* Not the holder after all: whatever the dropped retry was for is
      * still owed. */
     if (had_deferred)
-        cetrafs_sb_nslock_defer_recount(sb, inode->i_ino, deferred_gen, deferred_recount);
+        cetrafs_sb_nslock_defer(sb, inode->i_ino, deferred_gen);
     cetrafs_inode_ns_mutex_unlock(inode);
     return ret;
 }

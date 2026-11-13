@@ -496,14 +496,12 @@ void cetrafs_sb_accrue_zg_free(struct super_block *sb, u32 zg_id, s64 delta);
 struct cetrafs_nsrel_pending {
     u64 ino;
     u64 generation;
-    bool recount; /* namespace locks only: recount before clearing (cetrafs_ns_reconcile()) */
 };
 void cetrafs_sb_nslock_defer(struct super_block *sb, u64 ino, u64 generation);
-void cetrafs_sb_nslock_defer_recount(struct super_block *sb, u64 ino, u64 generation, bool recount);
 u32 cetrafs_sb_nslock_take_deferred(struct super_block *sb, struct cetrafs_nsrel_pending *out, u32 max);
 void cetrafs_sb_nslock_retry_begin(struct super_block *sb);
 void cetrafs_sb_nslock_retry_end(struct super_block *sb);
-int cetrafs_sb_nslock_forget(struct super_block *sb, u64 ino, u64 *generation, bool *recount);
+int cetrafs_sb_nslock_forget(struct super_block *sb, u64 ino, u64 *generation);
 /* nslock.c: one retry pass over them, called from the heartbeat tick. */
 void cetrafs_nslock_retry_deferred(struct super_block *sb);
 /* fs.c + lock.c: last-writer closes whose publish or lock clear failed,
@@ -817,6 +815,8 @@ u64 cetrafs_inode_new_generation(struct super_block *sb);
 int cetrafs_dir_add_entry(struct inode *dir, const struct qstr *name, u64 ino, u8 file_type);
 /* Counts a stopped operation left behind its entries (dir.c). */
 int cetrafs_ns_reconcile(struct super_block *sb, u64 ino, u64 generation, struct inode *self);
+/* nslock.c: set or clear CETRAFS_INODE_COUNT_UNVERIFIED, holding the lock. */
+int cetrafs_ns_set_unverified(struct super_block *sb, u64 ino, u64 generation, bool set);
 int cetrafs_ns_count_names(struct super_block *sb, const u64 *inos, u32 n, u32 *counts);
 int cetrafs_ns_publish_nlink(struct super_block *sb, u64 ino, u64 generation, const cetrafs_inode_t *seed,
                              u32 want, struct inode *self);

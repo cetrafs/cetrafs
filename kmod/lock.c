@@ -4360,7 +4360,7 @@ struct cetrafs_own_claims_ctx {
     u32 me;
     u32 my_incarnation; /* claims stamped with it are this mount's: never swept */
     u64 generation;
-    bool keep_ns; /* its recount failed: the namespace lock stays, the retry recounts */
+    bool mark_unverified; /* its recount failed: flag the record as the lock is cleared */
 };
 
 /* Clear every claim 'me' holds in one record: the file lock, the
@@ -4402,11 +4402,13 @@ static int cetrafs_own_claims_mutate(void *image, unsigned int len, void *priv)
         rec.suspended_writer_nodes = cetrafs_cpu_to_le64(cetrafs_le64(rec.suspended_writer_nodes) & ~bit);
         changed = true;
     }
-    if (cetrafs_le32(rec.ns_lock_owner) == ctx->me && !ctx->keep_ns &&
+    if (cetrafs_le32(rec.ns_lock_owner) == ctx->me &&
         cetrafs_le32(rec.ns_lock_incarnation) != ctx->my_incarnation) {
         rec.ns_lock_owner = cetrafs_cpu_to_le32(CETRAFS_NODE_ID_NONE);
         rec.ns_lock_incarnation = cetrafs_cpu_to_le32(0);
         cetrafs_ns_stamp_advance(&rec); /* as a peer's steal of a dead holder's lock does */
+        if (ctx->mark_unverified)
+            rec.flags = cetrafs_cpu_to_le32(cetrafs_le32(rec.flags) | CETRAFS_INODE_COUNT_UNVERIFIED);
         changed = true;
     }
     if (!changed)
@@ -4552,32 +4554,29 @@ int cetrafs_lock_sweep_own_claims(struct super_block *sb, u32 my_node_id)
              * size or nlink, an unlinked file's nlink. Recounted while
              * the lock is still that incarnation's, so no peer builds on
              * the old count meanwhile (cetrafs_ns_reconcile()). One it
-             * cannot recount because it is damaged is refused here until
-             * fsck, and KEEPS the lock: released, a peer would build on
-             * the count nobody re-derived. The heartbeat retries the
-             * recount and clears the lock only once one succeeds
-             * (cetrafs_nslock_retry_deferred()). One the device will not
-             * return fails the mount, as a record does.
+             * cannot recount is flagged in the same swap that clears the
+             * lock (CETRAFS_INODE_COUNT_UNVERIFIED), so whoever acquires
+             * it next, on any node, recounts first; one found damaged is
+             * also refused here until fsck.
              */
             if (cetrafs_le32(raw.nlink) != 0 && cetrafs_le32(raw.ns_lock_owner) == my_node_id &&
                 cetrafs_le32(raw.ns_lock_incarnation) != ctx.my_incarnation &&
                 !READ_ONCE(cetrafs_lock_sweep_recount_off)) {
                 ret = cetrafs_ns_reconcile(sb, ino, ctx.generation, NULL);
-                if (ret == -EUCLEAN) {
-                    pr_err("mount: ino=%llu: could not recount it after this node stopped inside an operation on "
-                           "it -- refusing changes to it and keeping its lock until a recount succeeds\n",
-                           (unsigned long long) ino);
-                    cetrafs_sb_corrupt(sb, ino);
-                    cetrafs_sb_nslock_defer_recount(sb, ino, ctx.generation, true);
-                    ctx.keep_ns = true;
-                    ret = 0;
-                } else if (ret == -ESTALE) {
+                if (ret == -EAGAIN) {
+                    cetrafs_sb_layout_refresh(sb);
+                    ret = cetrafs_ns_reconcile(sb, ino, ctx.generation, NULL);
+                }
+                if (ret == -ESTALE) {
                     ret = 0; /* reborn meanwhile: the release below says so too */
                 } else if (ret) {
                     pr_err("mount: ino=%llu: could not recount it after this node stopped inside an operation on "
-                           "it: %d\n",
-                           (unsigned long long) ino, ret);
-                    break;
+                           "it (%d) -- flagged for the next acquirer%s\n",
+                           (unsigned long long) ino, ret, ret == -EUCLEAN ? ", and refused here until fsck" : "");
+                    if (ret == -EUCLEAN)
+                        cetrafs_sb_corrupt(sb, ino);
+                    ctx.mark_unverified = true;
+                    ret = 0;
                 }
             }
         release:

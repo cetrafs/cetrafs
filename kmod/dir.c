@@ -158,9 +158,14 @@ static bool cetrafs_dirent_block_valid(const struct buffer_head *bh)
     return cetrafs_blk_struct_ok_magic(bh, CETRAFS_DIRENT_TAIL_MAGIC);
 }
 
-static struct buffer_head *cetrafs_dirent_bread(struct super_block *sb, u64 lba)
+/* As cetrafs_dirent_bread(), saying why a NULL came back: -EUCLEAN when
+ * every attempt read the block and found it damaged, -EIO when the
+ * device failed a read. */
+static struct buffer_head *cetrafs_dirent_bread_why(struct super_block *sb, u64 lba, int *why)
 {
     int attempt, nbad = 0;
+
+    *why = -EIO;
 
     for (attempt = 0; attempt < CETRAFS_DIRENT_READ_RETRIES; attempt++) {
         struct buffer_head *bh = cetrafs_bread_uncached(sb, lba);
@@ -201,7 +206,15 @@ static struct buffer_head *cetrafs_dirent_bread(struct super_block *sb, u64 lba)
     pr_err("dirent block %llu failed its tail checksum %d times -- corrupted, not just a torn concurrent read\n",
            (unsigned long long) lba, CETRAFS_DIRENT_READ_RETRIES);
     cetrafs_sb_corrupt(sb, 0);
+    *why = -EUCLEAN;
     return NULL;
+}
+
+static struct buffer_head *cetrafs_dirent_bread(struct super_block *sb, u64 lba)
+{
+    int why;
+
+    return cetrafs_dirent_bread_why(sb, lba, &why);
 }
 
 /*
@@ -1982,17 +1995,16 @@ static int cetrafs_dir_raw_visit(struct super_block *sb, const cetrafs_inode_t *
          * "not data" marks the record damaged -- unless it only lies past
          * a grow this node has not caught up with (class 48). */
         ret = cetrafs_lba_run_check(sb, dr->r[i].lba, dr->r[i].len);
-        if (ret == -EAGAIN)
-            return -EIO; /* cannot tell: refuse, mark nothing */
-        if (ret)
+        if (ret) /* -EAGAIN: past a grow not caught up with -- not damage, the caller catches up */
             return ret;
         for (b = 0; b < dr->r[i].len; b++) {
-            struct buffer_head *bh = cetrafs_dirent_read(sb, dr->r[i].lba + b, /*fresh=*/true);
+            int why;
+            struct buffer_head *bh = cetrafs_dirent_bread_why(sb, dr->r[i].lba + b, &why);
             const cetrafs_dirent_t *de;
             unsigned int e;
 
             if (!bh)
-                return -EIO;
+                return why; /* -EUCLEAN only for a block every attempt found damaged */
             de = (const cetrafs_dirent_t *) bh->b_data;
             for (e = 0; e < CETRAFS_DIRENTS_PER_BLOCK; e++)
                 if (de[e].inode != 0)
@@ -2171,8 +2183,16 @@ u64 cetrafs_ns_recounts_count(void)
  * 'self' is the in-core object when there is one (brought to the new
  * values, the fd publish ordered by its fd_pub_mutex); NULL otherwise.
  * Returns 0, -ESTALE if the number now names a different object, or an
- * error with nothing published.
+ * error with nothing published: -EUCLEAN only when THIS record or one of
+ * its own blocks is damaged, -EAGAIN when a block lies past a grow this
+ * node has not caught up with, anything else for what may pass.
  */
+/* TEST ONLY: the next N recounts fail as if out of memory, whoever calls
+ * them (tests/kernel/ns_recount_fail_retry.sh). */
+static unsigned int cetrafs_nslock_recount_fail;
+cetrafs_test_param(nslock_recount_fail, cetrafs_nslock_recount_fail, uint, 0644);
+MODULE_PARM_DESC(nslock_recount_fail, "TEST ONLY: fail the next N namespace recounts with -ENOMEM");
+
 int cetrafs_ns_reconcile(struct super_block *sb, u64 ino, u64 generation, struct inode *self)
 {
     struct cetrafs_dir_tally tally = {0};
@@ -2181,6 +2201,10 @@ int cetrafs_ns_reconcile(struct super_block *sb, u64 ino, u64 generation, struct
     u64 want_size;
     u32 want_nlink;
     int ret;
+    unsigned int n = READ_ONCE(cetrafs_nslock_recount_fail);
+
+    if (n && cmpxchg(&cetrafs_nslock_recount_fail, n, n - 1) == n)
+        return -ENOMEM; /* test-only, see the knob */
 
     raw = kmalloc(sizeof(*raw), GFP_NOFS);
     if (!raw)
@@ -2202,6 +2226,8 @@ int cetrafs_ns_reconcile(struct super_block *sb, u64 ino, u64 generation, struct
         u32 names = 0;
 
         ret = cetrafs_ns_count_names(sb, &ino, 1, &names);
+        if (ret == -EUCLEAN)
+            ret = -EIO; /* damage in some directory read for the count is not this file's */
         if (ret || names == cetrafs_le32(raw->nlink))
             goto out;
         pr_warn("ino=%llu: recounted after an operation that stopped holding its lock: nlink %u -> %u\n",
