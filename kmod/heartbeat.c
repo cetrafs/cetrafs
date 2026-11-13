@@ -196,8 +196,13 @@ static void cetrafs_heartbeat_tick(struct work_struct *work)
      * The work item cannot run twice at once, so arming first costs
      * nothing when a tick overruns: the next one simply starts as soon
      * as this returns.
+     *
+     * Unbound, like the maintenance work: on a per-CPU queue the timer
+     * can migrate to a busy CPU and the beat then waits for that one CPU
+     * to schedule, however idle the others are -- a non-preemptible
+     * stretch there held every beat off (grow_live_owned_race.sh).
      */
-    queue_delayed_work(system_long_wq, &hb->work, msecs_to_jiffies(armed * 1000));
+    queue_delayed_work(system_unbound_wq, &hb->work, msecs_to_jiffies(armed * 1000));
     if (READ_ONCE(cetrafs_hb_tick_stall_ms)) {
         unsigned int ms = xchg(&cetrafs_hb_tick_stall_ms, 0); /* test-only, one tick */
 
@@ -280,7 +285,7 @@ static void cetrafs_heartbeat_tick(struct work_struct *work)
 
         cetrafs_sb_lease_renewed(sb, lease_t0, lease);
         if (lease < armed)
-            mod_delayed_work(system_long_wq, &hb->work, msecs_to_jiffies(lease * 1000));
+            mod_delayed_work(system_unbound_wq, &hb->work, msecs_to_jiffies(lease * 1000));
     }
     if (ret == -EPERM) {
         /* The renew itself found our lease revoked. This is the
@@ -300,7 +305,7 @@ static void cetrafs_heartbeat_tick(struct work_struct *work)
     /* The heavy half runs as its OWN work item -- see
      * cetrafs_heartbeat_maint(). A read-only mount queues it too, for
      * the one retry it owes: see there. */
-    queue_delayed_work(system_long_wq, &hb->maint, 0);
+    queue_delayed_work(system_unbound_wq, &hb->maint, 0);
 
 reschedule:
     return;
@@ -506,7 +511,7 @@ int cetrafs_heartbeat_start(struct super_block *sb, struct cetrafs_heartbeat **o
     hb->sb = sb;
     INIT_DELAYED_WORK(&hb->work, cetrafs_heartbeat_tick);
     INIT_DELAYED_WORK(&hb->maint, cetrafs_heartbeat_maint);
-    queue_delayed_work(system_long_wq, &hb->work, msecs_to_jiffies(cetrafs_sb_hb_interval_secs(sb) * 1000));
+    queue_delayed_work(system_unbound_wq, &hb->work, msecs_to_jiffies(cetrafs_sb_hb_interval_secs(sb) * 1000));
 
     *out_hb = hb;
     return 0;

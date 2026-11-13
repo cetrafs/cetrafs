@@ -64,6 +64,18 @@ ct_param_set zg_claim_layout_stale 0
 info() { sed -n "s/^$1: //p" "$(ct_procdir "$DEV")/info"; }
 zg_owner() { grep -oP "^\s+zg $1: owner=\K\S+" "$(ct_procdir "$DEV")/info"; }
 zg_free() { grep -oP "^\s+zg $1: .*free_data_blocks=\K[0-9]+" "$(ct_procdir "$DEV")/info"; }
+# The hold takes its knob back to 0 the moment it begins
+# (cetrafs_layout_publish()): wait for that, not for a fixed time -- the
+# read reaching the publish takes longer on some machines than a sleep
+# allowed, and the claim or release then ran before the hold.
+hold_began() {
+    local _
+    for _ in $(seq 1 100); do
+        [ "$(cat /sys/module/cetrafs/parameters/layout_publish_hold_ms)" = 0 ] && return 0
+        sleep 0.05
+    done
+    return 1
+}
 
 # <claim|release>: a fresh volume up to the moment before the race.
 # Leaves the grow on the device, this node behind it, Block Group NEWID
@@ -142,21 +154,27 @@ run_claim() {
     # Skip the catch-up here: this suite is about the marks; finish()
     # remounts so the mount's recount puts the aggregate right.
     ct_param_set zg_claim_layout_stale 1
+    # The surplus release held too: Zone Group 1 is still empty when the
+    # claim's derive comes out of the hold, and a beat landing before the
+    # write allocates gives it straight back (the write then takes a free
+    # Block Group instead) -- the round would end with nothing to judge.
+    ct_param_set zg_release_hold 1
     ct_param_set owned_derive_unlocked "$2"
     o0="$(info owned_derive_overlaps)"
     ct_param_set layout_publish_hold_ms 3000
     (head -c 10 "$MNT/v1" >"$MNT.read" 2>/dev/null || true) & # publishes, held
     r=$!
-    sleep 0.5
+    hold_began || { wait "$r"; fail "$tag: setup: the read never reached the publish hold"; ct_param_set layout_publish_hold_ms 0; ct_param_set owned_derive_unlocked 0; ct_param_set zg_claim_layout_stale 0; ct_param_set zg_release_hold 0; ct_umount "$MNT"; return 0; }
     dd if=/dev/zero of="$MNT/w" bs=4096 count=16 conv=fsync status=none # claims Zone Group 1 in the hold
     wait "$r"
     ct_param_set owned_derive_unlocked 0
     ct_param_set zg_claim_layout_stale 0
     [ "$(info owned_derive_overlaps)" -gt "$o0" ] && [ "$(info block_group_count)" -gt "$NEWID" ] &&
         [ "$(zg_owner 1)" = 0 ] ||
-        { fail "$tag: setup: the claim did not land in the held publish (overlaps $o0 -> $(info owned_derive_overlaps), BGs $(info block_group_count), ZG1 owner $(zg_owner 1))"; ct_umount "$MNT"; return 0; }
+        { fail "$tag: setup: the claim did not land in the held publish (overlaps $o0 -> $(info owned_derive_overlaps), BGs $(info block_group_count), ZG1 owner $(zg_owner 1))"; ct_param_set zg_release_hold 0; ct_umount "$MNT"; return 0; }
     pass "$tag: setup: Zone Group 1 was claimed while the publish adding BG$NEWID was held"
     MISSING="$(info owned_bgs_missing)"; STRAY="$(info owned_bgs_stray)"
+    ct_param_set zg_release_hold 0
     [ "$(cat "$MNT.read")" = MARKER-ONE ] || fail "$tag: the read that published got '$(cat "$MNT.read")'"
 }
 
@@ -169,7 +187,7 @@ run_release() {
     ct_param_set layout_publish_hold_ms 4000
     (head -c 10 "$MNT/v1" >"$MNT.read" 2>/dev/null || true) &
     r=$!
-    sleep 0.5
+    hold_began || { wait "$r"; fail "$tag: setup: the read never reached the publish hold"; ct_param_set layout_publish_hold_ms 0; ct_param_set owned_derive_unlocked 0; ct_umount "$MNT"; return 0; }
     ct_param_set zg_release_hold 0 # the next beat (2 s) releases Zone Group 1, in the hold
     wait "$r"
     for _ in $(seq 1 20); do [ "$(zg_owner 1)" = none ] && break; sleep 0.5; done
