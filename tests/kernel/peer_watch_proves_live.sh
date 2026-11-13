@@ -60,8 +60,8 @@ MARK="$(dmesg_mark)"
 if try_mount; then
     pass "(A) a dead no-CAW row did not block a CAW mount"
     ct_umount "$MNT"
-    # Skipped, never stamped departed: a node returning to a departed row
-    # skips its own-claim sweeps (TODO.md, L3).
+    # Skipped, never stamped departed: the watch answers this mount's
+    # question and publishes no verdict (cetrafs_for_each_live_peer()).
     grep -qE 'departure=[12] ' <<<"$(row1)" && fail "(A) the watch stamped the dead row departed: $(row1)" ||
         pass "(A) the dead row was skipped, not stamped departed"
 else

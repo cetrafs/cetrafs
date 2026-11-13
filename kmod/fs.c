@@ -4129,7 +4129,7 @@ u64 cetrafs_sb_resv_seq(struct super_block *sb)
  * every peer's scrub reads and abandons its cycle over. Announcing every
  * free stopped every scrub in the cluster whenever any node punched a
  * hole in its own image -- a guest discard -- and a node that does that
- * every heartbeat never let one finish (TODO, class 46). Our own scrub
+ * every heartbeat never let one finish (class 46). Our own scrub
  * still counts every free (frees_count). The verdict is safe in both
  * directions it can be wrong in: a group this node owns is authoritative
  * in its own cache -- it leaves only by our release, which takes only an

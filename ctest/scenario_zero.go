@@ -336,9 +336,9 @@ func RunFstrimPool(clients []*Client, baseDir string) (bool, error) {
 	if err := callOK(a, "mkdir", MkdirArgs{Path: dir}); err != nil {
 		return false, fmt.Errorf("setup mkdir %s: %w", dir, err)
 	}
-	// Auto-defrag off: it is not what this tests, and a writer's
-	// defrag of a file just written holds that file's lock, refusing
-	// the peer's read-back (TODO.md, Availability: ETXTBSY after close).
+	// Auto-defrag off: it is not what this tests. (A writer's defrag
+	// of a file just written used to refuse the peer's read-back
+	// with ETXTBSY; the open now asks the mover back, class 43.)
 	for _, c := range []*Client{a, b} {
 		if err := callOK(c, "set_control", SetControlArgs{Key: "auto_defrag", Value: "off"}); err != nil {
 			return false, fmt.Errorf("%s: auto_defrag=off: %w", c.Name, err)

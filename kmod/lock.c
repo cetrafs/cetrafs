@@ -4530,8 +4530,8 @@ int cetrafs_lock_sweep_own_claims(struct super_block *sb, u32 my_node_id)
 }
 
 /*
- * The late pass of the own-claim sweep (TODO.md F10, the non-format
- * half).
+ * The late pass of the own-claim sweep (audit finding F10, the
+ * non-format half).
  *
  * The mount-time sweep above clears every claim of the previous
  * incarnation, but it cannot see one given back AFTER it passed: a peer

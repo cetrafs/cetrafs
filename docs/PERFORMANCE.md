@@ -413,8 +413,9 @@ it always fits (`cetrafs_deferred_capped()`); the extra batch is paid
 only with no journal or one under 8 slots. Counted on a loop device: 79
 cache flushes for 1500 random writes into a fallocated image with the
 old writes, 13 without (`tests/kernel/convert_split_no_flush.sh`,
-`convert_source_flushes` in procfs). Not yet measured on the deployment
-LUN.
+`convert_source_flushes` in procfs). On the FC array (2026-11-12,
+`docs/internal/UNMAP-BENCHMARK.md`): 738 IOPS into a fresh fallocated
+image as built, 174 with every tree edit journalled at once.
 
 A direct write that does not cover whole blocks (a 512-byte guest
 sector, say) is serialised: it waits for the file's in-flight direct

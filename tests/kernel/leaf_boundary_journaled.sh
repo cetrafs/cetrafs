@@ -31,11 +31,10 @@
 #       core, sync and writeback run, and the freed block on the device
 #       has not moved.
 #
-# NOT COVERED: C2's ORDER -- data and allocation bits durable before the
-# entries that name them. A loop device completes every write durably and
-# in order, so nothing here can show a reordering; the batch's first step
-# (cetrafs_journal_write_deferred()) is asserted by reading, and the
-# instrument is tests/crash's dm-log-writes rig (docs/internal/TODO.md).
+# NOT COVERED HERE: C2's ORDER -- data and allocation bits durable before
+# the entries that name them. A loop device completes every write durably
+# and in order, so nothing here can show a reordering; that order is read
+# out of a dm-log-writes recording by tests/crash/leaf_batch_order.sh.
 #
 # DISCRIMINATION: with the old dirty-buffer deferral, (1) fails (the leaf
 # moves under writeback); with the batch writing in place without the

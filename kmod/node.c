@@ -2010,10 +2010,11 @@ static int cetrafs_for_each_live_peer(struct super_block *sb,
             if (expired) {
                 /* Watched for the whole window and never moved: dead,
                  * and skipped. NOT stamped departed, as the no-CAW gate
-                 * stamps it: a node that comes back to a departed row
-                 * re-attaches as if it had left cleanly and skips its
-                 * own-claim sweeps (TODO.md, L3). The next mount that
-                 * depends on this row watches it again. */
+                 * stamps it: this pass answers one mount's question and
+                 * has no verdict to publish, and the next mount that
+                 * depends on this row watches it again. (A DEAD stamp
+                 * would no longer cost the node its own-claim sweeps on
+                 * return -- format 0x000A's departure field, L3.) */
                 seq[idx] = 0;
                 candidates--;
             }
