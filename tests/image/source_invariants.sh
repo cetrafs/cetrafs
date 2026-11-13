@@ -2174,6 +2174,7 @@ lock.c:cetrafs_lock_open:alive -> refuse this open; the runtime watch converges 
 nslock.c:cetrafs_nslock_try:alive -> wait and retry
 procfs.c:cetrafs_proc_cluster_show:display only
 scrub.c:scrub_reclaim_orphan_inodes:alive -> skip (keep)
+scrub.c:scrub_reconcile_stopped_op:alive -> skip; the live holder releases and publishes the count (keep)
 zonegroup.c:cetrafs_zg_claim_one_more_locked:alive -> not a candidate (keep)
 zonegroup.c:cetrafs_zg_log_foreign_free_leak:log only
 zonegroup.c:cetrafs_zg_scrub_adopt_one_stale:alive -> skip (keep)

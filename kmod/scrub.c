@@ -681,6 +681,38 @@ static void scrub_free_targets(struct scrub_ctx *ctx)
  *    bitmap free is a CAS, one winner; the blocks go through the block
  *    -reclaim machinery that already arbitrates those frees.
  */
+/*
+ * A record with links whose namespace lock a STOPPED node still holds:
+ * that node died inside an operation on it, after the entry write and
+ * before the release that publishes its count. For a directory or a
+ * named file the next operation on it breaks the lock and recounts
+ * (cetrafs_nslock_try(), cetrafs_ns_reconcile()). An unlinked file is
+ * neither: its name is gone, nlink still says 1, and nothing can reach
+ * it to operate on -- it held its blocks until an offline fsck -r. So
+ * the scrub takes the lock the way an operation would, which fences the
+ * dead node, replays its journal and recounts; a file no name reaches
+ * comes out of that with nlink 0, and its own eviction frees it.
+ * One acquire per such record per cycle: they exist only after a crash.
+ */
+static void scrub_reconcile_stopped_op(struct cetrafs_scrub *s, u64 ino, const cetrafs_inode_t *raw, u32 my_node_id)
+{
+    struct super_block *sb = s->sb;
+    u32 from = cetrafs_le32(raw->ns_lock_owner);
+    struct inode *inode;
+    bool stale = false;
+
+    if (from == CETRAFS_NODE_ID_NONE || from == my_node_id)
+        return; /* unlocked, or one of ours: its operation releases it */
+    if (cetrafs_node_is_stale(sb, from, &stale) || !stale)
+        return; /* a live holder's operation is still running */
+    inode = cetrafs_iget(sb, ino);
+    if (IS_ERR(inode))
+        return;
+    if (cetrafs_inode_get_generation(inode) == cetrafs_le64(raw->generation) && !cetrafs_nslock_acquire(inode))
+        cetrafs_nslock_release(inode);
+    iput(inode); /* recounted to 0: this is its eviction, and the free */
+}
+
 static void scrub_reclaim_orphan_inodes(struct cetrafs_scrub *s)
 {
     struct super_block *sb = s->sb;
@@ -715,8 +747,10 @@ static void scrub_reclaim_orphan_inodes(struct cetrafs_scrub *s)
         if (cetrafs_read_raw_inode(sb, ino, &raw) != 0)
             continue; /* unreadable: cannot vouch -- leave it for fsck */
 
-        if (cetrafs_le32(raw.nlink) != 0)
+        if (cetrafs_le32(raw.nlink) != 0) {
+            scrub_reconcile_stopped_op(s, ino, &raw, my_node_id);
             continue; /* live file */
+        }
         if (cetrafs_le64(raw.read_open_nodes) != 0 || cetrafs_le32(raw.lock_mode) != CETRAFS_LOCK_NONE) {
             /* A live opener's close converges; a DEAD one's never does
              * -- its bit or lock stayed and the file leaked for good.

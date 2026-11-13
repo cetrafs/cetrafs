@@ -813,6 +813,12 @@ u64 cetrafs_inode_new_generation(struct super_block *sb);
 
 // dir.c
 int cetrafs_dir_add_entry(struct inode *dir, const struct qstr *name, u64 ino, u8 file_type);
+/* Counts a stopped operation left behind its entries (dir.c). */
+int cetrafs_ns_reconcile(struct super_block *sb, u64 ino, u64 generation, struct inode *self);
+int cetrafs_ns_count_names(struct super_block *sb, const u64 *inos, u32 n, u32 *counts);
+int cetrafs_ns_publish_nlink(struct super_block *sb, u64 ino, u64 generation, const cetrafs_inode_t *seed,
+                             u32 want, struct inode *self);
+u64 cetrafs_ns_recounts_count(void);
 int cetrafs_dir_remove_entry(struct inode *dir, const struct qstr *name, u64 expect_ino, u64 *out_ino,
                              u8 *out_file_type);
 int cetrafs_dirent_block_init(struct super_block *sb, u64 lba, bool *keep);

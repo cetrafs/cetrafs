@@ -23,23 +23,29 @@
 # cut the volume is mounted (which replays the journal), unmounted, and
 # fsck'd; the residue is counted by class.
 #
-# The assertions: no cut leaves a block referenced but free, and no cut
-# leaves any error outside the known residue. Reported, not asserted:
-# orphans and leaked blocks (the scrub reclaims both online) and a
-# directory whose size or link count lags its entries (an entry durable
-# before the record that counts it, and an unlinked inode whose link
-# count was not yet lowered; fsck -r recounts, nothing online does yet).
+# The assertions: no cut leaves a block referenced but free; no cut,
+# once mounted, leaves a count behind its entries (a directory's size or
+# link count, an unlinked inode's link count: the entry is durable before
+# the release that publishes the count, and the re-attaching mount
+# recounts what a stopped operation's lock still covers --
+# cetrafs_ns_reconcile()); and no cut leaves any error outside the known
+# residue. Reported, not asserted: orphans and leaked blocks (the scrub
+# reclaims both online).
 #
-# DISCRIMINATION: alloc_flush_skip=1 records the same workload with the
-# boundary flush off; some cut must then show a block referenced but
-# free, or this census cannot see the class it exists to count.
+# DISCRIMINATION: the control round records the same workload with the
+# boundary flush off (alloc_flush_skip=1) and mounts its cuts without the
+# recount (lock_sweep_recount_off=1); some cut must then show a block
+# referenced but free, and some a count behind, or this census cannot see
+# the classes it exists to count.
 set -euo pipefail
 . "$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)/lib/harness.sh"
 require_root
 require_module
 for m in dm_log_writes; do modprobe "$m" 2>/dev/null || true; done
 command -v dmsetup >/dev/null || { skip "dmsetup not found"; ct_exit; }
-[ -w /sys/module/cetrafs/parameters/alloc_flush_skip ] || { skip "alloc_flush_skip is missing"; ct_exit; }
+for k in alloc_flush_skip lock_sweep_recount_off; do
+    [ -w "/sys/module/cetrafs/parameters/$k" ] || { skip "$k is missing"; ct_exit; }
+done
 
 REPLAY="$CT_BUILD/replay-log"
 mkdir -p "$CT_BUILD"
@@ -55,6 +61,7 @@ ct_param_set stale_secs 3
 ct_param_set scrub 0
 ct_param_set auto_defrag 0
 ct_param_set alloc_flush_skip 0
+ct_param_set lock_sweep_recount_off 0
 export CETRAFS_PEER_PROBE_SECS=3
 
 SZ_MB=600
@@ -160,11 +167,12 @@ census() {
         grep -q "(orphan)" <<<"$out" && ORPHANS=$((ORPHANS + 1))
         grep -q "(leaked)" <<<"$out" && LEAKS=$((LEAKS + 1))
         # A directory whose size or link count lags its entries: an entry
-        # made durable before the record that counts it (fsck -r recounts).
-        # And its mirror: an unlink whose entry removal is durable before
-        # the target's link count, leaving an inode no name reaches.
+        # made durable before the record that counts it. And its mirror:
+        # an unlink whose entry removal is durable before the target's
+        # link count, leaving an inode no name reaches. The mount above
+        # recounts both (cetrafs_ns_reconcile()).
         LAG='^ERR: directory inode [0-9]+ has size [0-9]+ but holds|has nlink=[0-9]+ but contains|is allocated \(nlink=[0-9]+\) but NO directory entry names it'
-        grep -qE "$LAG" <<<"$out" && DIRLAG=$((DIRLAG + 1))
+        grep -qE "$LAG" <<<"$out" && { DIRLAG=$((DIRLAG + 1)); grep -E "$LAG" <<<"$out" | sed "s|^|  $cut_arg: |"; }
         # Any other error. The referenced-but-free class reports itself
         # twice (the count, then each block).
         KNOWN="in use but marked free|referenced by an inode but marked FREE|$LAG"
@@ -184,10 +192,15 @@ if [ "${RESIDUE_SKIP_CONTROL:-0}" != 1 ]; then
     ct_param_set alloc_flush_skip 1
     record ctl
     ct_param_set alloc_flush_skip 0
+    ct_param_set lock_sweep_recount_off 1
     census "$REC_LOG" control || ct_exit
+    ct_param_set lock_sweep_recount_off 0
     [ "$REFD_FREE" -gt 0 ] &&
         pass "control: without the flush $REFD_FREE of $CUTS cuts leave a block referenced but free -- the census sees the class" ||
         fail "control: without the flush no cut left a block referenced but free -- the census cannot see the class"
+    [ "$DIRLAG" -gt 0 ] &&
+        pass "control: without the recount $DIRLAG of $CUTS cuts leave a count behind its entries -- the census sees the class" ||
+        fail "control: without the recount no cut left a count behind -- the census cannot see the class"
 else
     fail "control skipped (RESIDUE_SKIP_CONTROL=1): this run cannot show the census sees the class"
 fi
@@ -198,7 +211,9 @@ census "$REC_LOG" main || ct_exit
 [ "$CUTS" -gt 0 ] || fail "main: setup: no cut was examined"
 [ "$REFD_FREE" = 0 ] && pass "main: no cut of $CUTS leaves a block referenced but free" ||
     fail "main: $REFD_FREE of $CUTS cuts leave a block referenced but free"
+[ "$DIRLAG" = 0 ] && pass "main: no cut of $CUTS, once mounted, leaves a count behind its entries" ||
+    fail "main: $DIRLAG of $CUTS cuts leave a count behind its entries after the mount"
 [ "$OTHER" = 0 ] && [ "$BAD_MOUNT" = 0 ] && pass "main: every cut mounts and has no other fsck error" ||
     fail "main: $OTHER cut(s) with another fsck error, $BAD_MOUNT unmountable"
-log "main residue (reported, not asserted): orphan at $ORPHANS cut(s), leaked blocks at $LEAKS, count lag (directory size, link count) at $DIRLAG"
+log "main residue (reported, not asserted): orphan at $ORPHANS cut(s), leaked blocks at $LEAKS"
 ct_exit

@@ -294,6 +294,7 @@ static int cetrafs_proc_info_show(struct seq_file *m, void *v)
     seq_printf(m, "refresh_ns_rereads: %llu\n", cetrafs_refresh_ns_reread_count());
     seq_printf(m, "ext_cache_stale_refused: %llu\n", cetrafs_ext_cache_stale_refused_count());
     seq_printf(m, "late_claims_cleared: %llu\n", cetrafs_late_claims_cleared_count());
+    seq_printf(m, "ns_recounts: %llu\n", cetrafs_ns_recounts_count());
     seq_printf(m, "layout_refreshes: %llu\n", cetrafs_layout_refresh_count());
     seq_printf(m, "layout_refresh_refused: %llu\n", cetrafs_layout_refresh_refused_count());
     {

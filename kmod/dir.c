@@ -1929,6 +1929,333 @@ static int cetrafs_create_locked(struct mnt_idmap *idmap,
     return 0;
 }
 
+struct cetrafs_dir_runs {
+    u64 skip_leaf, skip_xattr;
+    u32 n;
+    bool overflow;
+    struct {
+        u64 lba;
+        u32 len;
+    } r[CETRAFS_EXT_BLOCK_MAX_LEAVES];
+};
+
+static void cetrafs_dir_runs_cb(void *p, u64 phys, u32 len)
+{
+    struct cetrafs_dir_runs *dr = p;
+
+    /* The walk reports what the record OWNS: the leaf block and the
+     * xattr block are its, but hold no entries. */
+    if (len == 1 && (phys == dr->skip_leaf || phys == dr->skip_xattr))
+        return;
+    if (dr->n >= ARRAY_SIZE(dr->r)) {
+        dr->overflow = true;
+        return;
+    }
+    dr->r[dr->n].lba = phys;
+    dr->r[dr->n].len = len;
+    dr->n++;
+}
+
+/* Read every dirent block of a directory record forced-fresh; visit each
+ * occupied entry. The record was read fresh by the caller. */
+static int cetrafs_dir_raw_visit(struct super_block *sb, const cetrafs_inode_t *raw, struct cetrafs_dir_runs *dr,
+                                 void (*visit)(void *priv, const cetrafs_dirent_t *de), void *priv)
+{
+    u32 i;
+    int ret;
+
+    memset(dr, 0, sizeof(*dr));
+    if (cetrafs_le16(raw->eh.eh_depth) > 1)
+        return -EUCLEAN; /* a directory's tree is at most one level deep */
+    if (cetrafs_le16(raw->eh.eh_depth) == 1)
+        dr->skip_leaf = cetrafs_extent_phys_from_hilo(raw->et.idx[0].ei_leaf_hi, raw->et.idx[0].ei_leaf_lo);
+    dr->skip_xattr = cetrafs_le64(raw->xattr_block);
+    ret = cetrafs_raw_inode_for_each_owned_block(sb, raw, cetrafs_dir_runs_cb, dr, /*fresh=*/true);
+    if (!ret && dr->overflow)
+        ret = -EUCLEAN;
+    if (ret)
+        return ret;
+    for (i = 0; i < dr->n; i++) {
+        u32 b;
+
+        /* An address read off the disk aims a read here (rule 19), and
+         * "not data" marks the record damaged -- unless it only lies past
+         * a grow this node has not caught up with (class 48). */
+        ret = cetrafs_lba_run_check(sb, dr->r[i].lba, dr->r[i].len);
+        if (ret == -EAGAIN)
+            return -EIO; /* cannot tell: refuse, mark nothing */
+        if (ret)
+            return ret;
+        for (b = 0; b < dr->r[i].len; b++) {
+            struct buffer_head *bh = cetrafs_dirent_read(sb, dr->r[i].lba + b, /*fresh=*/true);
+            const cetrafs_dirent_t *de;
+            unsigned int e;
+
+            if (!bh)
+                return -EIO;
+            de = (const cetrafs_dirent_t *) bh->b_data;
+            for (e = 0; e < CETRAFS_DIRENTS_PER_BLOCK; e++)
+                if (de[e].inode != 0)
+                    visit(priv, &de[e]);
+            brelse(bh);
+            cond_resched();
+        }
+    }
+    return 0;
+}
+
+static bool cetrafs_dirent_is_dot(const cetrafs_dirent_t *de)
+{
+    u16 nl = cetrafs_le16(de->name_len);
+
+    return (nl == 1 && de->name[0] == '.') || (nl == 2 && de->name[0] == '.' && de->name[1] == '.');
+}
+
+struct cetrafs_dir_tally {
+    u64 slots, subdirs;
+};
+
+static void cetrafs_dir_tally_visit(void *priv, const cetrafs_dirent_t *de)
+{
+    struct cetrafs_dir_tally *t = priv;
+
+    t->slots++;
+    if (de->file_type == CETRAFS_FT_DIR && !cetrafs_dirent_is_dot(de))
+        t->subdirs++;
+}
+
+struct cetrafs_name_tally {
+    const u64 *inos;
+    u32 *counts;
+    u32 n;
+};
+
+static void cetrafs_name_tally_visit(void *priv, const cetrafs_dirent_t *de)
+{
+    struct cetrafs_name_tally *t = priv;
+    u64 target = cetrafs_le64(de->inode);
+    u32 i;
+
+    if (cetrafs_dirent_is_dot(de))
+        return;
+    for (i = 0; i < t->n; i++)
+        if (t->inos[i] == target && t->counts[i] < U32_MAX)
+            t->counts[i]++;
+}
+
+/*
+ * How many entries, in every directory on the volume, name each of
+ * inos[0..n)? Every directory record and every dirent block is read
+ * forced-fresh.
+ *
+ * The answer FREES (a count of 0 makes the file dead), so it must be
+ * exact, and it is only while the caller holds the namespace lock of
+ * every inode in the set. A name of X is added, removed or moved only
+ * under X's own lock -- link and unlink lock the target, rename the moved
+ * inode and the one it replaces -- so the set of entries naming X is
+ * frozen for the whole walk, whichever directories are created, renamed
+ * or removed meanwhile: a directory being created holds no name of X
+ * unless X's lock allowed it, and one being removed is empty. A record or
+ * block that cannot be read makes the answer unknown, and that is an
+ * error: nothing may be decided from a count that skipped a directory.
+ * O(directory blocks on the volume); paid only after a crash, once per
+ * inode an operation stopped holding.
+ */
+int cetrafs_ns_count_names(struct super_block *sb, const u64 *inos, u32 n, u32 *counts)
+{
+    const cetrafs_superblock_t *raw_sb = cetrafs_sb_raw(sb);
+    struct cetrafs_name_tally t = {.inos = inos, .counts = counts, .n = n};
+    struct cetrafs_dir_runs *dr;
+    cetrafs_inode_t *raw;
+    u64 ninodes, d;
+    int ret = 0;
+
+    if (!raw_sb)
+        return -EINVAL;
+    memset(counts, 0, n * sizeof(*counts));
+    if (!n)
+        return 0;
+    raw = kmalloc(sizeof(*raw), GFP_NOFS);
+    dr = kmalloc(sizeof(*dr), GFP_NOFS);
+    if (!raw || !dr) {
+        ret = -ENOMEM;
+        goto out;
+    }
+    ninodes = le32_to_cpu(raw_sb->inodes_count);
+    for (d = 1; d <= ninodes; d++) {
+        bool allocated = false;
+
+        if ((d & 255) == 0)
+            cond_resched();
+        ret = cetrafs_inode_is_allocated(sb, d, &allocated);
+        if (ret)
+            goto out;
+        if (!allocated)
+            continue;
+        cetrafs_invalidate_raw_inode(sb, d);
+        ret = cetrafs_read_raw_inode(sb, d, raw);
+        if (ret)
+            goto out;
+        /* A removed directory is empty, and its blocks may be anyone's. */
+        if (!S_ISDIR(cetrafs_le32(raw->mode)) || cetrafs_le32(raw->nlink) == 0)
+            continue;
+        ret = cetrafs_dir_raw_visit(sb, raw, dr, cetrafs_name_tally_visit, &t);
+        if (ret)
+            goto out;
+    }
+out:
+    kfree(dr);
+    kfree(raw);
+    return ret;
+}
+
+static void cetrafs_ns_apply_set_nlink(cetrafs_inode_t *rec, void *arg)
+{
+    rec->nlink = cetrafs_cpu_to_le32(*(const u32 *) arg);
+}
+
+/* Publish a recounted link count; 'self' follows it. */
+int cetrafs_ns_publish_nlink(struct super_block *sb, u64 ino, u64 generation, const cetrafs_inode_t *seed,
+                             u32 want, struct inode *self)
+{
+    int ret = cetrafs_inode_ns_cas(sb, ino, generation, seed, cetrafs_ns_apply_set_nlink, &want);
+
+    if (!ret && self)
+        set_nlink(self, want);
+    return ret;
+}
+
+static atomic64_t cetrafs_ns_recounts = ATOMIC64_INIT(0);
+u64 cetrafs_ns_recounts_count(void)
+{
+    return (u64) atomic64_read(&cetrafs_ns_recounts);
+}
+
+/*
+ * Recount an inode whose namespace lock was taken over from a holder
+ * that stopped inside an operation.
+ *
+ * Every namespace operation writes its entry first -- journaled, synced
+ * (cetrafs_dir_add_entry(), cetrafs_dir_remove_entry()) -- and publishes
+ * the counts that describe it only in the swap that releases each lock
+ * (cetrafs_nslock_release()): a directory's size and, for a
+ * subdirectory, its nlink; an unlinked or renamed-over file's nlink. A
+ * node that stops between the two leaves the entries ahead of their
+ * counts, and the locks still set. The crash census found the directory
+ * half at a third of its cuts (tests/crash/crash_residue.sh); the file
+ * half is an unlinked file whose name is gone and whose nlink still says
+ * 1 -- unreachable, holding its blocks. Nothing re-derived either: every
+ * later operation adjusts the value it reads, so they stayed until an
+ * offline fsck -r -- and a parent's nlink left low by two interrupted
+ * mkdirs reaches 0 once its subdirectories go, and the directory then
+ * reads as removed (cetrafs_dir_add_entry()'s "is it still THERE?").
+ *
+ * The set lock is the signal and covers every such stop: a count is
+ * behind its entries only between an entry write and its release, and
+ * the lock is held across exactly that. Whoever takes it over calls this
+ * holding it: this node taking a lock back or a peer breaking a dead
+ * holder's (cetrafs_nslock_try()), this node re-attached after a crash
+ * (cetrafs_lock_sweep_own_claims()), the scrub for a file no name
+ * reaches any more (scrub_reconcile_stopped_ops()).
+ *
+ * Exact, because of the lock. A directory: its entries, size and nlink
+ * change only under it, so the blocks read here are the ones the counts
+ * describe; the values are fsck's (one slot per occupied entry, '.' and
+ * '..' included; 2 plus one per subdirectory, by the entry's file_type
+ * as the operations count them -- fsck uses the target's mode, which
+ * differs only on a wrong type byte it reports on its own). nlink never
+ * comes out below 2, so a live directory cannot read as removed. A
+ * file: its names, counted across the volume (cetrafs_ns_count_names()).
+ * A count of 0 makes it dead, which is what the stopped unlink meant.
+ *
+ * 'self' is the in-core object when there is one (brought to the new
+ * values, the fd publish ordered by its fd_pub_mutex); NULL otherwise.
+ * Returns 0, -ESTALE if the number now names a different object, or an
+ * error with nothing published.
+ */
+int cetrafs_ns_reconcile(struct super_block *sb, u64 ino, u64 generation, struct inode *self)
+{
+    struct cetrafs_dir_tally tally = {0};
+    struct cetrafs_dir_runs *dr = NULL;
+    cetrafs_inode_t *raw;
+    u64 want_size;
+    u32 want_nlink;
+    int ret;
+
+    raw = kmalloc(sizeof(*raw), GFP_NOFS);
+    if (!raw)
+        return -ENOMEM;
+    cetrafs_invalidate_raw_inode(sb, ino);
+    ret = cetrafs_read_raw_inode(sb, ino, raw);
+    if (ret)
+        goto out;
+    if (cetrafs_le64(raw->generation) != generation) {
+        ret = -ESTALE;
+        goto out;
+    }
+    /* Already dead -- an unlink that published, a removed directory, an
+     * evict's free claim: the free path's, not a count to correct. */
+    if (cetrafs_le32(raw->nlink) == 0)
+        goto out;
+
+    if (!S_ISDIR(cetrafs_le32(raw->mode))) {
+        u32 names = 0;
+
+        ret = cetrafs_ns_count_names(sb, &ino, 1, &names);
+        if (ret || names == cetrafs_le32(raw->nlink))
+            goto out;
+        pr_warn("ino=%llu: recounted after an operation that stopped holding its lock: nlink %u -> %u\n",
+                (unsigned long long) ino, cetrafs_le32(raw->nlink), names);
+        ret = cetrafs_ns_publish_nlink(sb, ino, generation, raw, names, self);
+        if (!ret)
+            atomic64_inc(&cetrafs_ns_recounts);
+        goto out;
+    }
+
+    dr = kmalloc(sizeof(*dr), GFP_NOFS);
+    if (!dr) {
+        ret = -ENOMEM;
+        goto out;
+    }
+    ret = cetrafs_dir_raw_visit(sb, raw, dr, cetrafs_dir_tally_visit, &tally);
+    if (ret)
+        goto out;
+    want_size = tally.slots * sizeof(cetrafs_dirent_t);
+    want_nlink = (u32) min_t(u64, tally.subdirs + 2, U32_MAX);
+    if (cetrafs_le64(raw->size) == want_size && cetrafs_le32(raw->nlink) == want_nlink)
+        goto out; /* the operation that stopped had published, or changed nothing */
+
+    pr_warn("dir ino=%llu: recounted after an operation that stopped holding its lock: size %llu -> %llu, "
+            "nlink %u -> %u\n",
+            (unsigned long long) ino, (unsigned long long) cetrafs_le64(raw->size), (unsigned long long) want_size,
+            cetrafs_le32(raw->nlink), want_nlink);
+    if (cetrafs_le64(raw->size) != want_size) {
+        /* The file sector, fed the fresh read above; its other fields
+         * are the directory's and change only under the lock we hold. */
+        raw->size = cetrafs_cpu_to_le64(want_size);
+        if (self)
+            cetrafs_inode_fd_pub_lock(self);
+        ret = cetrafs_write_raw_inode_fd(sb, ino, raw, self);
+        if (self) {
+            if (!ret)
+                i_size_write(self, want_size);
+            cetrafs_inode_fd_pub_unlock(self);
+        }
+        if (ret)
+            goto out;
+    }
+    /* Absolute, which nlink otherwise never is: a directory's nlink
+     * changes only under its own lock, and this is the count. */
+    if (cetrafs_le32(raw->nlink) != want_nlink)
+        ret = cetrafs_ns_publish_nlink(sb, ino, generation, raw, want_nlink, self);
+    if (!ret)
+        atomic64_inc(&cetrafs_ns_recounts);
+out:
+    kfree(dr);
+    kfree(raw);
+    return ret;
+}
+
 /*
  * Report a failed namespace mutation. These used to fail completely
  * silently: a real two-node run saw ~0.7% of creates return EIO with

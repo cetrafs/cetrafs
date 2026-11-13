@@ -74,10 +74,11 @@ fsck, and verify.
   writes, truncates, punches, preallocation, unlinks), cut at every
   barrier and a sample of the writes between them; mount, unmount, fsck,
   and count each residue class. No cut may leave a block referenced but
-  free (control `alloc_flush_skip`) or any error outside the known
-  residue. Unlike phase 1 below, these cuts are not ERR-free: a count
-  can lag its names (a directory's size or link count, an unlinked
-  inode's link count) until `fsck -r`.
+  free (control `alloc_flush_skip`), a count behind its entries once
+  mounted -- a directory's size or link count, an unlinked inode's link
+  count, which the re-attaching mount recounts (control
+  `lock_sweep_recount_off`) -- or any error outside the known residue
+  (orphans and leaked blocks, which the scrub reclaims).
 - `growfs_live_crash.sh` — a LIVE grow (growfs on a mounted volume; the
   kernel publishes through `CETRAFS_IOC_GROW`), recorded through
   dm-log-writes and cut after EVERY write between the marks, in two

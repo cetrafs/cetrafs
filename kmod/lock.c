@@ -4434,6 +4434,12 @@ static int cetrafs_own_claims_mutate(void *image, unsigned int len, void *priv)
  * a claim nobody can account for is the state this exists to prevent. A
  * damaged one is counted and skipped, as everywhere else.
  */
+/* TEST ONLY: the mount sweep gives back a namespace lock without the
+ * recount -- the control of tests/kernel/ns_count_reconcile.sh. */
+static bool cetrafs_lock_sweep_recount_off;
+cetrafs_test_param(lock_sweep_recount_off, cetrafs_lock_sweep_recount_off, bool, 0644);
+MODULE_PARM_DESC(lock_sweep_recount_off, "TEST ONLY: the re-attach sweep does not recount what a stopped operation left");
+
 int cetrafs_lock_sweep_own_claims(struct super_block *sb, u32 my_node_id)
 {
     const cetrafs_superblock_t *raw_sb = cetrafs_sb_raw(sb);
@@ -4537,6 +4543,36 @@ int cetrafs_lock_sweep_own_claims(struct super_block *sb, u32 my_node_id)
                 if (!ret)
                     pr_info("mount: ino=%llu: finished a free this node had claimed before its departure\n",
                             (unsigned long long) ino);
+            }
+            /*
+             * A record whose namespace lock the previous incarnation
+             * still holds: it stopped between an entry it wrote and the
+             * release that publishes the count of it -- a directory's
+             * size or nlink, an unlinked file's nlink. Recounted while
+             * the lock is still that incarnation's, so no peer builds on
+             * the old count meanwhile (cetrafs_ns_reconcile()). One it
+             * cannot recount is refused as damaged until fsck, like any
+             * other; one the device will not return fails the mount, as
+             * a record does.
+             */
+            if (cetrafs_le32(raw.nlink) != 0 && cetrafs_le32(raw.ns_lock_owner) == my_node_id &&
+                cetrafs_le32(raw.ns_lock_incarnation) != ctx.my_incarnation &&
+                !READ_ONCE(cetrafs_lock_sweep_recount_off)) {
+                ret = cetrafs_ns_reconcile(sb, ino, ctx.generation, NULL);
+                if (ret == -EUCLEAN) {
+                    pr_err("mount: ino=%llu: could not recount it after this node stopped inside an operation on "
+                           "it -- refusing changes to it until fsck\n",
+                           (unsigned long long) ino);
+                    cetrafs_sb_corrupt(sb, ino);
+                    ret = 0;
+                } else if (ret == -ESTALE) {
+                    ret = 0; /* reborn meanwhile: the release below says so too */
+                } else if (ret) {
+                    pr_err("mount: ino=%llu: could not recount it after this node stopped inside an operation on "
+                           "it: %d\n",
+                           (unsigned long long) ino, ret);
+                    break;
+                }
             }
         release:
             ret = cetrafs_cas_record(sb, cetrafs_inode_lba(sb, ino), cetrafs_own_claims_mutate, &ctx);
