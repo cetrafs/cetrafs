@@ -78,6 +78,23 @@ fsck, and verify.
   residue. Unlike phase 1 below, these cuts are not ERR-free: a count
   can lag its names (a directory's size or link count, an unlinked
   inode's link count) until `fsck -r`.
+- `growfs_live_crash.sh` — a LIVE grow (growfs on a mounted volume; the
+  kernel publishes through `CETRAFS_IOC_GROW`), recorded through
+  dm-log-writes and cut after EVERY write between the marks, in two
+  windows: a fresh volume (pool credits, then publish) and a volume a
+  live grow already took to 1200 MiB (credits, the table link, then
+  publish). A cut passes when fsck is clean, or names ONLY a live grow's
+  pool credit that never published (the state `grow_live_crash.sh`
+  documents; the mount takes it back); the volume mounts at the old or
+  the new size with the data intact; a live growfs on that mount finishes
+  the grow; and fsck is clean once it is unmounted. The window starts from
+  a clean unmount and remount, so a cut is judged on what the grow did,
+  not on the file's own count lag. The control records a publish over
+  Block Groups nobody wrote (`CETRAFS_GROWFS_TEST_SKIP_BG_HEADERS`, with
+  `grow_hdr_check_off` so the kernel publishes anyway), finds the publish entry (the one
+  write that changes block 0), and requires the cut at it to be refused
+  while the cut before it passes. Tens of minutes: every cut waits out
+  the stale repair claim its growfs left.
 
 ### Phase 1 — recoverability
 

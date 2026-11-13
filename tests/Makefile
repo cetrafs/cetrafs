@@ -64,6 +64,7 @@ crash:
 	./crash/buffered_extent_order.sh
 	./crash/leaf_batch_order.sh
 	./crash/growfs_crash.sh
+	./crash/growfs_live_crash.sh
 	./crash/crash_residue.sh
 
 soak:
