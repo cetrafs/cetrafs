@@ -600,6 +600,8 @@ const struct file_operations cetrafs_file_ops = {
      * close -- is exactly this lock's. See lock.c.
      */
     .flock = cetrafs_flock,
+    /* fcntl/OFD byte-range locks: refused, never node-local (lock.c). */
+    .lock = cetrafs_posix_lock_refuse,
     .unlocked_ioctl = cetrafs_ioctl,
     /*
      * Without this, a 32-bit userspace on a 64-bit kernel gets -ENOTTY

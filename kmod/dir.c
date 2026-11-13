@@ -90,6 +90,7 @@ const struct file_operations cetrafs_dir_ops = {
     .fsync = cetrafs_dir_fsync,
     .unlocked_ioctl = cetrafs_dir_ioctl,
     .compat_ioctl = compat_ptr_ioctl,
+    .lock = cetrafs_posix_lock_refuse, /* as for files: never node-local (lock.c) */
 };
 
 /*
