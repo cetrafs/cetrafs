@@ -381,12 +381,21 @@ heartbeat I/O. On by default where the device supports discard;
   this way the kernel says so, unratelimited, naming `discard=off` as
   the way to stop further groups being kept on a path that keeps
   failing (`discard_handback_unknown` counts the failures,
-  `discard_handback_deferred` only the budget). The pending mark is in
-  memory: an unmount or crash leaves the group owned with an empty
-  bitmap, and the next mount may allocate in it -- the standing
-  advisory-fence caveat for I/O already queued at a failed path
-  (`docs/LOCKING.md`); recording it on disk would need a format
-  field.
+  `discard_handback_deferred` only the budget). The pending mark is on
+  the device: `CETRAFS_BG_FLAG_DISCARD_PENDING` in the group's
+  descriptor, set by compare-and-swap before the hand-back gives up on
+  the group and cleared only by the release swap that follows a
+  known-outcome discard. The mount and every Zone Group claim load it
+  before deriving which groups may be allocated from, so an unmount, a
+  crash or a node taking the Zone Group over keeps the group out of use
+  and re-issues its discard (`tests/kernel/discard_pending_durable.sh`).
+  A flagged group is proven empty before every re-issue; fsck notes a
+  flagged group, and reports one holding data or in the pool. What the
+  flag cannot do is fence the array: a command queued at a failed path
+  can still land late, on a group the flag has since let go after a
+  later discard succeeded -- the standing advisory-fence caveat
+  (`docs/LOCKING.md`). It stops this filesystem handing the group out;
+  it does not stop the array.
 * Nodes on different paths decide for themselves: each checks its own
   view of the device.
 * Nothing may rely on a discarded block reading zero. An unwritten file

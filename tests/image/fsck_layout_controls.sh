@@ -77,7 +77,7 @@ expect_caught "a cluster wider than the mask"    "node_table_count|64|reader"   
 # four billion of them was hours of reading before any verdict (audit
 # 2026-11-11 F11; before the fix this exits nonzero only by the luck of
 # overlapping the journals, and never for this reason).
-expect_caught "a pending queue larger than mkfs writes" "pending-free queue has 300 blocks per ZG" pending_free_blocks_per_zg 300
+expect_caught "a pending queue larger than mkfs writes" "pending-free queue has 600 blocks per ZG" pending_free_blocks_per_zg 600
 
 log "geometry the kernel refuses at mount"
 # fsck has to refuse what the mount refuses, or an operator is left with

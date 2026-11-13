@@ -475,14 +475,14 @@ rate limited from the allocation path. On a quiet tick it must cost what
 the queue's occupancy costs: appends fill from the front, so it reads
 from block 0 and stops at `CETRAFS_PF_DRAIN_EMPTY_RUN` (2) empty blocks
 -- two uncached reads. Only a drain that finds an entry reads the whole
-queue (`CETRAFS_PENDING_FREE_BLOCKS_PER_ZG`, 256 blocks, 1 MiB), which
+queue (`CETRAFS_PENDING_FREE_BLOCKS_PER_ZG`, 512 blocks, 2 MiB), which
 correctness needs: a copy of a free past an empty run, left behind by a
 drain that applied the other copy, freed a reallocated block (L19,
 `cetrafs_zg_drain_one()`).
 
 That sweep must be ONE batched read (`cetrafs_bread_uncached_batch()`:
 every forced-fresh read submitted under one plug, then waited for), not
-256 serial ones. Measured on the deployment array (2026-11-10, two nodes,
+one serial read per block. Measured, at the 256-block queue of the time, on the deployment array (2026-11-10, two nodes,
 one owned Zone Group, one node deleting the other's files; three
 interleaved runs of each build, drain passes timed with ftrace):
 

@@ -1289,6 +1289,7 @@ struct cetrafs_bg_geom {
     u64 length_blocks;
     u64 free_data_blocks; /* cached count, as of the last read */
     u64 reconcile_seq;    /* the count's ownership epoch, as of the last read */
+    u64 free_gen;         /* the pending-free stamp (cetrafs_block_group_t.free_gen) */
     u32 owner_zg;         /* ZG this BG belongs to */
     u16 flags;            /* CETRAFS_BG_FLAG_* */
 };
@@ -1424,6 +1425,7 @@ static int cetrafs_read_bg_geom_at(struct super_block *sb, const cetrafs_superbl
             out->length_blocks = cetrafs_le64(bg->length_blocks);
             out->free_data_blocks = cetrafs_le64(bg->free_data_blocks);
             out->reconcile_seq = cetrafs_le64(bg->reconcile_seq);
+            out->free_gen = cetrafs_le64(bg->free_gen);
             out->owner_zg = cetrafs_le16(bg->owner_zg);
             out->flags = cetrafs_le16(bg->flags);
             cetrafs_bh_read_unlock(bh);
@@ -2969,11 +2971,12 @@ u64 cetrafs_foreign_free_leak_count(void)
     return (u64) atomic64_read(&cetrafs_foreign_free_leaks);
 }
 
-static int __cetrafs_free_data_extent(struct super_block *sb, u64 lba, u32 count, const u64 *resv_seq);
+static int __cetrafs_free_data_extent(struct super_block *sb, u64 lba, u32 count, const u64 *resv_seq,
+                                      const u64 *alloc_seq);
 
 int cetrafs_free_data_extent(struct super_block *sb, u64 lba, u32 count)
 {
-    return __cetrafs_free_data_extent(sb, lba, count, NULL);
+    return __cetrafs_free_data_extent(sb, lba, count, NULL, NULL);
 }
 
 /*
@@ -2986,9 +2989,21 @@ int cetrafs_free_data_extent(struct super_block *sb, u64 lba, u32 count)
  * run produced. Owner paths keep the plain variant: the reservation
  * DROP deliberately frees blocks its own span still covers.
  */
-int cetrafs_free_data_extent_unless_reserved(struct super_block *sb, u64 lba, u32 count, u64 resv_seq)
+/*
+ * alloc_seq (NULL = unchecked): the Block Group's allocation count from
+ * before the scrub's evidence, rechecked under alloc_mutex with each bit
+ * (cetrafs_sb_bg_alloc_seq()). The scrub's own check runs outside the
+ * mutex, and a block it judged leaked can be cleared and handed out again
+ * between that check and this free: a pending-free copy of it, applied
+ * by the drain in that gap -- legitimately, its stamp still current --
+ * frees it, and the allocator may give it to a new file at once. Tested
+ * here, with the bit, nothing can move between the verdict's last word
+ * and the clear.
+ */
+int cetrafs_free_data_extent_unless_reserved(struct super_block *sb, u64 lba, u32 count, u64 resv_seq,
+                                             const u64 *alloc_seq)
 {
-    return __cetrafs_free_data_extent(sb, lba, count, &resv_seq);
+    return __cetrafs_free_data_extent(sb, lba, count, &resv_seq, alloc_seq);
 }
 
 /*
@@ -3024,7 +3039,7 @@ bool cetrafs_lba_run_is_ours(struct super_block *sb, u64 lba, u64 count)
 
 /* resv_seq: NULL for an owner's free; the scrub passes the registry's
  * release count from before its evidence (cetrafs_sb_resv_seq()). */
-static int __cetrafs_free_data_extent(struct super_block *sb, u64 lba, u32 count, const u64 *resv_seq)
+static int __cetrafs_free_data_extent(struct super_block *sb, u64 lba, u32 count, const u64 *resv_seq, const u64 *alloc_seq)
 {
     struct cetrafs_bg_geom bg;
     u64 data_start, bit, b, freed = 0, credited = 0;
@@ -3118,7 +3133,11 @@ static int __cetrafs_free_data_extent(struct super_block *sb, u64 lba, u32 count
 
     if (cetrafs_sb_caw_available(sb) || cetrafs_pf_force_foreign) {
         if (cetrafs_pf_force_foreign || !cetrafs_sb_zg_owned_cached(sb, bg.owner_zg)) {
-            ret = cetrafs_zg_queue_foreign_free(sb, bg.owner_zg, lba, count);
+            /* The stamp is the descriptor as read above -- refreshed,
+             * for a group we do not own. Read older than the device it
+             * can only make the drain drop this entry: a leak, the safe
+             * direction (rule 6). */
+            ret = cetrafs_zg_queue_foreign_free(sb, bg.owner_zg, lba, count, bg.free_gen);
             ctrace("BLKQUEUE lba=%llu count=%u zg=%u ret=%d from=%pS\n", (unsigned long long) lba, count,
                    (unsigned int) bg.owner_zg, ret, __builtin_return_address(0));
             /*
@@ -3196,6 +3215,10 @@ static int __cetrafs_free_data_extent(struct super_block *sb, u64 lba, u32 count
             ret = -EAGAIN;
             break;
         }
+        if (alloc_seq && cetrafs_sb_bg_alloc_seq(sb, bg_id) != *alloc_seq) {
+            ret = -EAGAIN; /* allocated in since the verdict: the evidence is stale */
+            break;
+        }
 
         /* Inside a run a FITRIM has claimed: the bit is the trim's, and
          * this block was free before it was claimed -- a double free.
@@ -3247,6 +3270,21 @@ static int __cetrafs_free_data_extent(struct super_block *sb, u64 lba, u32 count
     return ret;
 }
 
+/* Pending-free entries the drain dropped because their stamp is not the
+ * Block Group's free_gen any more: a copy from before a scrub reclaim. */
+static atomic64_t cetrafs_pf_stale_drops = ATOMIC64_INIT(0);
+
+u64 cetrafs_pf_stale_drop_count(void)
+{
+    return (u64) atomic64_read(&cetrafs_pf_stale_drops);
+}
+
+/* TEST ONLY: the drain applies an entry whatever its stamp -- the
+ * negative control of tests/kernel/pf_late_copy_after_reclaim.sh. */
+static bool cetrafs_pf_ignore_stamp;
+cetrafs_test_param(pf_ignore_stamp, cetrafs_pf_ignore_stamp, bool, 0644);
+MODULE_PARM_DESC(pf_ignore_stamp, "TEST ONLY: the pending-free drain does not check an entry's free_gen stamp");
+
 /*
  * Apply one pending-free queue entry to this node's OWN bitmaps -- the
  * drain-side half of the delegation above, called by zonegroup.c for a
@@ -3257,7 +3295,24 @@ static int __cetrafs_free_data_extent(struct super_block *sb, u64 lba, u32 count
  * the free counters. expect_zg guards against a corrupted/garbage queue
  * entry naming a block outside the queue's own ZG.
  */
-int cetrafs_apply_pending_free(struct super_block *sb, u64 lba, u32 count, u32 expect_zg)
+/*
+ * stamp: the entry's free_gen. The entry is applied only while it equals
+ * the group's, compared under alloc_mutex together with the bit clears:
+ * the scrub raises free_gen (cetrafs_bg_bump_free_gen()) before it frees
+ * anything here, and its frees take this same mutex after, so an apply
+ * either runs wholly before the scrub's first free -- its blocks were
+ * still the leak the copy names, and the scrub's own free then finds the
+ * bit clear, or allocated again (its alloc_seq guard) -- or sees the new
+ * value and drops the entry. Returns 1 for a dropped entry: its blocks
+ * stay set, a leak the next scrub cycle reclaims.
+ *
+ * The cached descriptor is the authoritative one here: free_gen is
+ * written only by this group's owner (and by fsck -r, with no node
+ * mounted), and every way a group becomes ours swaps its descriptor
+ * fresh -- the claim from the pool, the Zone Group claim's recount, the
+ * mount's walk.
+ */
+int cetrafs_apply_pending_free(struct super_block *sb, u64 lba, u32 count, u32 expect_zg, u64 stamp)
 {
     struct cetrafs_bg_geom bg;
     u64 data_start, bit, b, freed = 0;
@@ -3293,6 +3348,26 @@ int cetrafs_apply_pending_free(struct super_block *sb, u64 lba, u32 count, u32 e
     bit = lba - data_start;
 
     cetrafs_sb_alloc_lock(sb);
+    {
+        struct cetrafs_bg_geom now;
+
+        ret = cetrafs_read_bg_geom(sb, bg_id, &now);
+        if (ret) {
+            cetrafs_sb_alloc_unlock(sb);
+            return ret;
+        }
+        if (now.free_gen != stamp && !READ_ONCE(cetrafs_pf_ignore_stamp)) {
+            cetrafs_sb_alloc_unlock(sb);
+            atomic64_inc(&cetrafs_pf_stale_drops);
+            pr_warn_ratelimited("pending free [%llu +%u) is stamped %llu, BG %u is at %llu: a copy from before a "
+                                "reclaim there -- dropped, its blocks stay allocated for the scrub\n",
+                                (unsigned long long) lba, count, (unsigned long long) stamp, bg_id,
+                                (unsigned long long) now.free_gen);
+            ctrace("PFSTALE lba=%llu count=%u stamp=%llu gen=%llu\n", (unsigned long long) lba, count,
+                   (unsigned long long) stamp, (unsigned long long) now.free_gen);
+            return 1;
+        }
+    }
     for (b = 0; b < count; b++) {
         bool set = false;
 
@@ -3323,6 +3398,79 @@ int cetrafs_apply_pending_free(struct super_block *sb, u64 lba, u32 count, u32 e
     ctrace("BLKAPPLY lba=%llu count=%u freed=%llu zg=%u\n", (unsigned long long) lba, count, (unsigned long long) freed,
            expect_zg);
     return ret;
+}
+
+struct cetrafs_bg_gen_ctx {
+    u64 out_gen; /* the value the committed image carries */
+};
+
+static int cetrafs_bg_gen_mutate(void *image, unsigned int len, void *priv)
+{
+    struct cetrafs_bg_gen_ctx *ctx = priv;
+    cetrafs_block_group_t *bg = (cetrafs_block_group_t *) image;
+
+    if (!cetrafs_bg_image_ok(image, len))
+        return -EUCLEAN;
+    bg->free_gen = cetrafs_cpu_to_le64(cetrafs_le64(bg->free_gen) + 1);
+    ctx->out_gen = cetrafs_le64(bg->free_gen);
+    memset((u8 *) image + offsetof(cetrafs_block_group_t, pad), 0, len - offsetof(cetrafs_block_group_t, pad));
+    bg->checksum = 0;
+    bg->checksum = cetrafs_cpu_to_le64(cetrafs_bg_image_crc(image, len));
+    return 0;
+}
+
+/* TEST ONLY: the scrub reclaims without raising free_gen first. */
+static bool cetrafs_scrub_skip_gen_bump;
+cetrafs_test_param(scrub_skip_gen_bump, cetrafs_scrub_skip_gen_bump, bool, 0644);
+MODULE_PARM_DESC(scrub_skip_gen_bump, "TEST ONLY: the scrub frees leaks without bumping the group's free_gen");
+
+static atomic64_t cetrafs_bg_gen_bumps = ATOMIC64_INIT(0);
+
+u64 cetrafs_bg_gen_bump_count(void)
+{
+    return (u64) atomic64_read(&cetrafs_bg_gen_bumps);
+}
+
+/*
+ * Raise Block Group bg_id's free_gen, before the scrub reclaims a leak in
+ * it (rule 21: the publish first, then the free). Every pending-free
+ * entry stamped before this lands is dropped by the drain from here on
+ * -- which is what makes a copy whose swap reaches the device late, after
+ * the reclaim and the block's next allocation, harmless. The same seeded
+ * record swap the free-count flush uses: it commits by COMPARE AND WRITE
+ * and refreshes this node's cached descriptor with the image it wrote,
+ * so the drain's check (cetrafs_apply_pending_free()) reads the new value
+ * the moment this returns. An outcome that is not known is an error: the
+ * caller frees nothing.
+ */
+int cetrafs_bg_bump_free_gen(struct super_block *sb, u32 bg_id)
+{
+    const cetrafs_superblock_t *raw_sb = cetrafs_sb_raw(sb);
+    struct cetrafs_bg_gen_ctx ctx = {0};
+    unsigned int region;
+    struct buffer_head *bh;
+    u8 *seed;
+    int ret;
+
+    if (!raw_sb || bg_id >= le32_to_cpu(raw_sb->block_group_count))
+        return -EINVAL;
+    if (READ_ONCE(cetrafs_scrub_skip_gen_bump))
+        return 0; /* TEST ONLY: see the parameter */
+    region = cetrafs_cas_region_size(sb);
+    bh = cetrafs_bread_retry(sb, cetrafs_sb_bg_desc_lba(sb, bg_id));
+    seed = bh ? kmalloc(region, GFP_NOFS) : NULL;
+    if (seed)
+        cetrafs_bh_snapshot(bh, seed, region, offsetof(cetrafs_block_group_t, checksum), 0, false);
+    ret = cetrafs_cas_record_seeded(sb, cetrafs_sb_bg_desc_lba(sb, bg_id), seed, seed ? region : 0,
+                                    cetrafs_bg_gen_mutate, &ctx);
+    kfree(seed);
+    if (bh)
+        brelse(bh);
+    if (ret < 0)
+        return ret;
+    atomic64_inc(&cetrafs_bg_gen_bumps);
+    ctrace("BGGEN bg=%u gen=%llu\n", bg_id, (unsigned long long) ctx.out_gen);
+    return 0;
 }
 
 /* Count free inodes in the global inode bitmap, for statfs. */
@@ -3562,6 +3710,12 @@ static int cetrafs_bg_claim_mutate(void *image, unsigned int len, void *priv)
      * it. */
     if (cetrafs_le16(bg->owner_zg) != CETRAFS_BG_OWNER_FREE)
         return -EAGAIN;
+    /* A group in the pool never carries an outstanding discard -- the
+     * release that frees it is what clears the flag -- so this is damage;
+     * refused all the same, since taking it would put data where an
+     * UNMAP may still land. */
+    if (cetrafs_le16(bg->flags) & CETRAFS_BG_FLAG_DISCARD_PENDING)
+        return -EAGAIN;
 
     ctx->seq = cetrafs_le64(bg->reconcile_seq);
     bg->owner_zg = cetrafs_cpu_to_le16((u16) ctx->zg_id);
@@ -3645,6 +3799,9 @@ static int cetrafs_bg_release_mutate(void *image, unsigned int len, void *priv)
         return -EAGAIN;
 
     bg->owner_zg = cetrafs_cpu_to_le16((u16) CETRAFS_BG_OWNER_FREE);
+    /* Only a discard whose outcome is known gets a group this far, so an
+     * outstanding one is settled now, in the same swap that frees it. */
+    bg->flags = cetrafs_cpu_to_le16(cetrafs_le16(bg->flags) & ~CETRAFS_BG_FLAG_DISCARD_PENDING);
     if (ctx->discarded)
         bg->flags = cetrafs_cpu_to_le16(cetrafs_le16(bg->flags) | CETRAFS_BG_FLAG_DISCARDED);
     else
@@ -3807,6 +3964,43 @@ static unsigned int cetrafs_bg_release_drain_stall_ms;
 cetrafs_test_param(bg_release_drain_stall_ms, cetrafs_bg_release_drain_stall_ms, uint, 0644);
 MODULE_PARM_DESC(bg_release_drain_stall_ms, "test-only: pause one Block Group release while it is drained");
 
+struct cetrafs_bg_dpend_ctx {
+    u32 zg_id; /* the group must still be this Zone Group's */
+    bool on;
+};
+
+static int cetrafs_bg_dpend_mutate(void *image, unsigned int len, void *priv)
+{
+    struct cetrafs_bg_dpend_ctx *ctx = priv;
+    cetrafs_block_group_t *bg = (cetrafs_block_group_t *) image;
+    u16 f;
+
+    if (!cetrafs_bg_image_ok(image, len))
+        return -EUCLEAN;
+    if (cetrafs_le16(bg->owner_zg) != ctx->zg_id)
+        return -EAGAIN;
+    f = cetrafs_le16(bg->flags);
+    f = ctx->on ? (f | CETRAFS_BG_FLAG_DISCARD_PENDING) : (f & ~CETRAFS_BG_FLAG_DISCARD_PENDING);
+    if (f == cetrafs_le16(bg->flags))
+        return 1; /* already so */
+    bg->flags = cetrafs_cpu_to_le16(f);
+    memset((u8 *) image + offsetof(cetrafs_block_group_t, pad), 0, len - offsetof(cetrafs_block_group_t, pad));
+    bg->checksum = 0;
+    bg->checksum = cetrafs_cpu_to_le64(cetrafs_bg_image_crc(image, len));
+    return 0;
+}
+
+/* Record (on) or settle Block Group b's outstanding discard on the
+ * device, by compare-and-swap of its descriptor. */
+static int cetrafs_bg_set_discard_pending_flag(struct super_block *sb, u32 zg_id, u32 b, bool on)
+{
+    struct cetrafs_bg_dpend_ctx ctx = {.zg_id = zg_id, .on = on};
+    int ret;
+
+    ret = cetrafs_cas_record(sb, cetrafs_sb_bg_desc_lba(sb, b), cetrafs_bg_dpend_mutate, &ctx);
+    return ret < 0 ? ret : 0;
+}
+
 /*
  * Hand back one Block Group of zg_id if it is provably empty: the body of
  * cetrafs_bg_release_empty(), and of FITRIM's pool pass. Returns 1 when
@@ -3817,34 +4011,38 @@ static int cetrafs_bg_release_one(struct super_block *sb, u32 zg_id, u32 b, unsi
                                   bool *out_discarded)
 {
     struct cetrafs_bg_release_ctx ctx = {.zg_id = zg_id};
+    bool settling = false;
     u64 total = 0, free = 0;
     int ret;
 
     /*
      * A group whose hand-back discard had an UNKNOWN outcome (review
-     * U1). It has stayed drained since -- out of our allocator, and
-     * not FREE, so out of everyone else's -- and it was proven empty
-     * then. Discard it again; only an outcome we know releases it.
-     * It reads as not ours (drained), so it is looked for first.
+     * U1), recorded on the device (CETRAFS_BG_FLAG_DISCARD_PENDING), so
+     * this may be a discard this node inherited -- from its own last
+     * mount, or from the peer whose Zone Group it took over. It has stayed
+     * out of every allocator since, and it was proven empty when the
+     * flag was set. Proven empty again BEFORE the discard is re-issued:
+     * a flagged group holding data would be destroyed by the re-issue,
+     * and that can only be damage, so it is left alone and said.
+     * Discard it again; only an outcome we know releases it. It reads as
+     * not ours (drained), so it is looked for first.
      */
     if (cetrafs_sb_bg_discard_pending(sb, b)) {
+        if (cetrafs_bg_data_block_stats(sb, b, &total, &free) != 0 || total == 0 || free != total ||
+            cetrafs_bg_release_bitmap_ready(sb, b)) {
+            pr_err_ratelimited("BG %u: kept for an outstanding discard, but not provably empty -- not discarded, "
+                               "kept out of use (fsck)\n",
+                               b);
+            return -EBUSY;
+        }
         ret = cetrafs_discard_handback(sb, b, pass_started, true, force, &ctx.discarded);
         if (ret) {
             return -EBUSY; /* kept for a later pass */
         }
-        if (cetrafs_bg_data_block_stats(sb, b, &total, &free) != 0 || total == 0 || free != total ||
-            cetrafs_bg_release_bitmap_ready(sb, b)) {
-            /* Drained all along, so nothing of ours wrote here: a
-             * group no longer empty or readable is a contradiction.
-             * Its discard is known now; it goes back to use, not
-             * to the pool. */
-            pr_err("BG %u: kept for an outstanding discard, now not provably empty -- kept by this node\n", b);
-            cetrafs_sb_set_bg_discard_pending(sb, b, false);
-            cetrafs_sb_undrain_bg(sb, b);
-            return 0;
-        }
-        cetrafs_sb_set_bg_discard_pending(sb, b, false);
-        pr_info("BG %u: its outstanding discard is settled -- released\n", b);
+        /* Settled by the release swap itself (it clears the flag), and
+         * forgotten here only once that swap has landed. */
+        settling = true;
+        pr_info("BG %u: its outstanding discard is settled -- releasing it\n", b);
         goto release;
     }
     if (!cetrafs_sb_bg_is_ours(sb, b))
@@ -3927,6 +4125,16 @@ static int cetrafs_bg_release_one(struct super_block *sb, u32 zg_id, u32 b, unsi
          * unratelimited: a path that keeps failing discards keeps
          * every emptied group, and with it every Zone Group release
          * (U3). */
+        /* On the device first (rule 8): an unmount, a crash or a node
+         * taking the Zone Group over must find the group kept, and only
+         * the descriptor survives them. The mark below is its in-core
+         * mirror. A record that cannot be made is a state this mount
+         * cannot keep: it stops, as an unstorable mark does. */
+        ret = cetrafs_bg_set_discard_pending_flag(sb, zg_id, b, true);
+        if (ret) {
+            cetrafs_sb_fatal(sb, "BG %u: cannot record its outstanding discard on the device (%d)", b, ret);
+            return -EBUSY;
+        }
         if (cetrafs_sb_set_bg_discard_pending(sb, b, true))
             pr_warn("%s: BG %u: its hand-back discard failed and may still execute -- the group is kept out "
                     "of use until a discard of it succeeds or is refused. If this device cannot discard "
@@ -3967,9 +4175,13 @@ release:
     if (ret) {
         if (!cetrafs_bg_release_credit_late)
             cetrafs_bg_release_counters(sb, zg_id, b, total, -1);
+        if (settling)
+            return -EBUSY; /* still flagged on the device: kept, and tried again */
         cetrafs_sb_undrain_bg(sb, b);
         return 0; /* somebody changed it under us; leave it alone */
     }
+    if (settling)
+        cetrafs_sb_set_bg_discard_pending(sb, b, false); /* the swap cleared the flag */
 
     cetrafs_bg_release_drop_bitmap(sb, b);
     cetrafs_bg_invalidate_cache(sb, b);
@@ -4075,6 +4287,12 @@ void cetrafs_bg_refresh_owner_map(struct super_block *sb)
             owner = CETRAFS_BG_OWNER_FREE;
         } else {
             owner = geom.owner_zg;
+            /* An outstanding discard a peer recorded -- one that died
+             * with it, most likely: known BEFORE the claim derives this
+             * group's owned bit, so it is never handed to our allocator
+             * (CETRAFS_BG_FLAG_DISCARD_PENDING). And one the peer has
+             * since settled is forgotten. */
+            cetrafs_sb_set_bg_discard_pending(sb, b, !!(geom.flags & CETRAFS_BG_FLAG_DISCARD_PENDING));
         }
         if (owner != cetrafs_sb_bg_owner(sb, b)) {
             cetrafs_sb_set_bg_owner(sb, b, owner);
@@ -4192,6 +4410,10 @@ static int cetrafs_bg_claim_one(struct super_block *sb, u32 zg_id, u32 b)
         if (cetrafs_zg_apply_free_delta(sb, zg_id, (s64) free))
             cetrafs_zg_adjust_free_blocks(sb, zg_id, (s64) free); /* lazy fallback: never lose the move */
     }
+    /* The swap refused a flagged group, so its discard is settled: an
+     * in-core mark left from when a peer still had it outstanding goes,
+     * or the group would be ours and never allocatable. */
+    cetrafs_sb_set_bg_discard_pending(sb, b, false);
     cetrafs_sb_set_bg_owner(sb, b, zg_id);
     {
         unsigned int pause = xchg(&cetrafs_bg_claim_stall_ms, 0);
@@ -4322,7 +4544,7 @@ out:
 }
 
 int cetrafs_bg_mount_info(struct super_block *sb, const cetrafs_superblock_t *raw_sb, u32 bg_id, u64 desc_lba,
-                          bool fresh, u64 *out_total, u32 *out_owner, u64 *out_start, u64 *out_len)
+                          bool fresh, u64 *out_total, u32 *out_owner, u64 *out_start, u64 *out_len, u16 *out_flags)
 {
     struct cetrafs_bg_geom bg;
     int ret = cetrafs_read_bg_geom_at(sb, raw_sb, bg_id, desc_lba, fresh, &bg);
@@ -4337,6 +4559,8 @@ int cetrafs_bg_mount_info(struct super_block *sb, const cetrafs_superblock_t *ra
         *out_total = bg.data_block_count;
     if (out_owner)
         *out_owner = bg.owner_zg;
+    if (out_flags)
+        *out_flags = bg.flags;
     return 0;
 }
 

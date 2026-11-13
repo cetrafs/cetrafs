@@ -191,7 +191,7 @@ case2() {
     log "2: a copy in a region whose consume keeps losing"
     L="$(stage c2)" || { fail "2 setup: could not stage a queued free"; ct_exit; }
     "$PP" "$IMG" put 0 0 0 "$L" 1 >/dev/null  # region 0: busy
-    "$PP" "$IMG" put 0 0 32 "$L" 1 >/dev/null # region 1: consumed
+    "$PP" "$IMG" put 0 0 16 "$L" 1 >/dev/null # region 1 (16 32-byte slots a sector): consumed
     ct_param_set pf_drain_busy_region 1
     MARK="$(dmesg_mark)"
     ct_mount "$DEV" "$MNT" # the mount's drain: region 0 busy throughout

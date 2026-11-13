@@ -344,6 +344,9 @@ static int cetrafs_proc_info_show(struct seq_file *m, void *v)
     seq_printf(m, "bg_recounts: %llu\n", cetrafs_bg_recount_count());
     seq_printf(m, "pf_drop_runs: %llu\n", cetrafs_pf_drop_runs_count());
     seq_printf(m, "pf_drop_blocks: %llu\n", cetrafs_pf_drop_blocks_count());
+    /* Pending-free entries dropped for a stale stamp, and the scrub raises of free_gen behind them. */
+    seq_printf(m, "pf_stale_drops: %llu\n", cetrafs_pf_stale_drop_count());
+    seq_printf(m, "bg_gen_bumps: %llu\n", cetrafs_bg_gen_bump_count());
     seq_printf(m, "giveback_blocks: %llu\n", cetrafs_giveback_block_count());
     seq_printf(m, "convert_leaf_full: %llu\n", cetrafs_convert_leaf_full_count());
     seq_printf(m, "leaf_splits: %llu\n", cetrafs_leaf_split_count());

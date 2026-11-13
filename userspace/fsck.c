@@ -2126,6 +2126,10 @@ int main(int argc, char **argv)
     /* Each BG's CACHED free count, kept so pass 3 can compare it against
      * what that BG's bitmap actually says -- see the check there. */
     uint64_t *bg_free_cached = (uint64_t *) xcalloc(cetrafs_le32(sb.block_group_count), sizeof(uint64_t));
+    /* Each group's free_gen (format 0x000A): a pending-free entry is live
+     * only while its stamp equals it (cetrafs_pending_free_t.free_gen). */
+    uint64_t *bg_free_gen = (uint64_t *) xcalloc(cetrafs_le32(sb.block_group_count), sizeof(uint64_t));
+    uint16_t *bg_flags = (uint16_t *) xcalloc(cetrafs_le32(sb.block_group_count), sizeof(uint16_t));
 
     /*
      * Where each Block Group's descriptor actually lives.
@@ -2357,6 +2361,8 @@ int main(int argc, char **argv)
         bg_data_cnt[b] = cetrafs_le64(bg.data_block_count);
         bg_bmap_lba[b] = (uint64_t) cetrafs_le64(bg.start_block) + cetrafs_le32(bg.off_data_bmap);
         bg_free_cached[b] = cetrafs_le64(bg.free_data_blocks);
+        bg_free_gen[b] = cetrafs_le64(bg.free_gen);
+        bg_flags[b] = cetrafs_le16(bg.flags);
 
         /* BG header: first block of the BG's own region (off_bg_header,
          * already checked above to be 0). */
@@ -2882,6 +2888,16 @@ int main(int argc, char **argv)
                                     z, e, fbg, lbg);
                             cl_problems++;
                             continue;
+                        }
+                        /* A stamp is the group's free_gen as its appender
+                         * read it, and free_gen only rises: one AHEAD of
+                         * the group was never read from it. */
+                        if (cetrafs_le64(pe.free_gen) > bg_free_gen[fbg]) {
+                            fprintf(stderr,
+                                    "ERR: ZG%u pending-free entry %u is stamped %" PRIu64 ", ahead of BG%" PRId64
+                                    "'s free_gen %" PRIu64 "\n",
+                                    z, e, (uint64_t) cetrafs_le64(pe.free_gen), fbg, bg_free_gen[fbg]);
+                            cl_problems++;
                         }
                         if (bg_owner_expected[fbg] == CETRAFS_BG_OWNER_FREE) {
                             fprintf(stderr,
@@ -3544,6 +3560,38 @@ int main(int argc, char **argv)
                         memcpy(&pe, q + e * sizeof(pe), sizeof(pe));
                         if (!cetrafs_le64(pe.lba) || cetrafs_le32(pe.magic) != CETRAFS_PENDING_FREE_MAGIC || !cetrafs_le32(pe.count))
                             continue;
+                        /* A stale stamp: a copy from before a reclaim in
+                         * its group, which the drain drops rather than
+                         * applies (cetrafs_apply_pending_free()). Not a
+                         * free to come, so its blocks are not queued --
+                         * one nothing references is a leak, reclaimed as
+                         * such -- and not a fault even over a live block,
+                         * which is exactly the copy the stamp exists to
+                         * stop. -r drops it the drain's way. */
+                        {
+                            uint64_t st = cetrafs_le64(pe.lba);
+                            int sbg = -1;
+
+                            for (uint32_t b = 0; b < cetrafs_le32(sb.block_group_count); ++b)
+                                if (st >= bg_data_start[b] && st < bg_data_start[b] + bg_data_cnt[b]) {
+                                    sbg = (int) b;
+                                    break;
+                                }
+                            if (sbg >= 0 && cetrafs_le64(pe.free_gen) < bg_free_gen[sbg]) {
+                                printf("note: Zone Group %u queues a free of %" PRIu64 "+%u stamped %" PRIu64
+                                       ", from before BG%d's last reclaim (free_gen %" PRIu64
+                                       ") -- the drain drops it\n",
+                                       z, st, cetrafs_le32(pe.count), (uint64_t) cetrafs_le64(pe.free_gen), sbg,
+                                       bg_free_gen[sbg]);
+                                /* class 45: keep -- a dropped queue entry leaks the block, never frees it */
+                                if (repair_mode && !repair_blocked) {
+                                    memset(q + e * sizeof(pe), 0, sizeof(pe));
+                                    q_dirty = 1;
+                                    repairs_made++;
+                                }
+                                continue;
+                            }
+                        }
                         /* Pass 1: does any block of this entry already
                          * have an owner -- a file, or an earlier entry? */
                         for (uint32_t k = 0; k < cetrafs_le32(pe.count) && !live; ++k) {
@@ -3705,6 +3753,30 @@ int main(int argc, char **argv)
              *
              * The bitmap is already being walked right here for the
              * reachability reconciliation, so the popcount is free. */
+            /* An outstanding hand-back discard (CETRAFS_BG_FLAG_DISCARD_
+             * PENDING): a legitimate state -- its owner re-issues the
+             * discard and releases the group once one has a known
+             * outcome -- so a note, and -r leaves it alone. Only on an
+             * EMPTY group of a Zone Group: the flag is set on a group
+             * proven empty, and nothing allocates there while it is up,
+             * so data in one, or one in the pool, is damage -- the next
+             * re-issue would refuse it, and the group stays out of use. */
+            if (bg_flags[b] & CETRAFS_BG_FLAG_DISCARD_PENDING) {
+                if (bg_owner_expected[b] == CETRAFS_BG_OWNER_FREE) {
+                    fprintf(stderr, "ERR: BG%u is in the pool with a discard outstanding\n", b);
+                    problems++;
+                } else if (really_free != bg_data_cnt[b]) {
+                    fprintf(stderr,
+                            "ERR: BG%u has a discard outstanding but %" PRIu64
+                            " block(s) in use -- its owner will neither discard nor use it\n",
+                            b, bg_data_cnt[b] - really_free);
+                    problems++;
+                } else {
+                    printf("note: BG%u has a hand-back discard outstanding -- kept out of use until its owner "
+                           "re-issues it successfully\n",
+                           b);
+                }
+            }
             if (bg_free_cached[b] != really_free) {
                 if (bg_owner_expected[b] != CETRAFS_BG_OWNER_FREE &&
                     cetrafs_count_lag_expected(bg_owner_expected[b], cetrafs_le32(sb.zone_group_count), zg_owner,
@@ -4790,7 +4862,23 @@ int main(int argc, char **argv)
                     uint32_t z = bg_owner_expected[b];
                     int pool = z == CETRAFS_BG_OWNER_FREE;
 
-                    /* The bits first, then the counters that credit
+                    /* The group's free_gen first, on the platter before
+                     * any bit clears: a pending-free entry a dead node's
+                     * undecided append lands AFTER this run carries the
+                     * old stamp, and the drain drops it instead of
+                     * freeing these blocks under the file that gets them
+                     * next (cetrafs_pending_free_t.free_gen) -- the
+                     * scrub's order, offline. */
+                    pread_all(fd, blk, sizeof(blk), (off_t) bg_desc_lba[b] * CETRAFS_BLOCK_SIZE);
+                    memcpy(&bgd, blk, sizeof(bgd));
+                    bgd.free_gen = cetrafs_cpu_to_le64(cetrafs_le64(bgd.free_gen) + 1);
+                    bgd.checksum = 0;
+                    bgd.checksum = cetrafs_cpu_to_le64(crc32c_struct(
+                        &bgd, sizeof(bgd), offsetof(cetrafs_block_group_t, checksum), sizeof(bgd.checksum)));
+                    memcpy(blk, &bgd, sizeof(bgd));
+                    pwrite_all(fd, blk, sizeof(blk), (off_t) bg_desc_lba[b] * CETRAFS_BLOCK_SIZE); /* synced */
+
+                    /* The bits next, then the counters that credit
                      * them: stopped in between, the counts are low,
                      * which is the direction a reconcile only raises. */
                     pwrite_all(fd, bmap, (size_t) bmap_blocks * CETRAFS_BLOCK_SIZE,

@@ -281,11 +281,11 @@ the moment its ZG/lock is reclaimed, plus a heartbeat sweep for crashed nodes
 nothing else touched. Only BG-data-region content is journaled (dirent, xattr,
 extent leaf/interior blocks); the global tables are not.
 
-### Pending-free queue — `cetrafs_pending_free_t` (16 bytes/entry)
+### Pending-free queue — `cetrafs_pending_free_t` (32 bytes/entry)
 
 A fixed-slot array per ZG (at `pending_free_start`). When a node frees a block
 that lives in **another** node's ZG, it does not touch that ZG's bitmap; it
-appends a `{lba, count, magic}` entry (one per extent) by CAS, and the owner
+appends a `{lba, count, magic, free_gen}` entry (one per extent) by CAS, and the owner
 drains it at mount, on every heartbeat tick, after an on-demand claim and, rate
 limited, from the allocation path. Append and drain are both lock-free
 compare-and-swap. A drain CONSUMES entries (zeroes them by CAS) before it
@@ -295,7 +295,12 @@ drains: a drain that finds any entry reads the whole queue (one batched read),
 consumes every entry each swap finds, applies a range once however many copies
 it consumed, and holds back a range while any copy of it is still queued (a
 region it could not consume) -- the held blocks stay allocated, so the copy
-that completes the free later frees nothing anyone was given.
+that completes the free later frees nothing anyone was given. `free_gen` is
+the Block Group's free generation as the appender read it: the owner's scrub
+raises the group's before it reclaims a leak there, and the drain applies an
+entry only while the two are equal -- so an append whose outcome its node
+never learned, landing after that reclaim, is dropped rather than freeing a
+block the allocator has given out again.
 
 ### Block Group Descriptor — `cetrafs_block_group_t` (1 block per BG, in the BG table)
 
@@ -307,6 +312,8 @@ that completes the free later frees nothing anyone was given.
 | off_bg_header/data_bmap/data_region | intra-BG offsets, relative to `start_block` |
 | data_block_count, free_data_blocks | usable blocks, cached free count — deltas accrue in the owner's memory on every data-block alloc/free (also rolled up into the owning ZG's aggregate) and are applied by one epoch-guarded compare-and-swap per dirty BG at the durability boundaries |
 | checksum | `__le64` CRC32C, computed by `mkfs`, verified by `fsck` and by the kernel's `cetrafs_read_bg_geom()` |
+| flags | `CETRAFS_BG_FLAG_DISCARDED` (in the pool, already discarded); `CETRAFS_BG_FLAG_DISCARD_PENDING` (its hand-back discard has an unknown outcome: allocated from by nobody until a later discard's outcome is known; see `docs/DISCARD-DESIGN.md`) |
+| free_gen | the free generation: raised by the owner's scrub (and `fsck -r`) before it reclaims a leak here; pending-free entries carry the value they were appended under and are applied only while it is current |
 | reconcile_seq | v0x0004: the count's ownership EPOCH — advanced by every reconcile (a Zone Group ownership transfer rewriting the count from the bitmap truth), so a previous owner's late delta-apply detects the rewrite and drops instead of double counting, even when the recomputed count is byte-identical to what it expects |
 
 ### BG Header — `cetrafs_bg_header_t` (first block of each BG region)

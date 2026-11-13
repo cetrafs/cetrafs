@@ -26,7 +26,7 @@ require_root
 suite "pending-free queue sizing"
 
 TARGET="$(sed -n 's/^#define CETRAFS_PENDING_FREE_BLOCKS_PER_ZG[[:space:]][[:space:]]*\([0-9][0-9]*\).*/\1/p' "$ROOT/include/cetrafs.h")"
-log "target=$TARGET blocks/ZG = $((TARGET * 256)) queued extents per Zone Group"
+log "target=$TARGET blocks/ZG = $((TARGET * 128)) queued extents per Zone Group"
 
 SBP="$(ct_helper sb_poke)"
 
@@ -62,7 +62,7 @@ for CASE in "8192 8 GiB" "1200 1.2 GiB"; do
     measure "$1" "$2 $3"
     [ -n "$PER" ] || continue
     [ "$PER" = "$TARGET" ] &&
-        pass "$2 $3: full queue ($PER blocks/ZG = $((PER * 256)) entries)" ||
+        pass "$2 $3: full queue ($PER blocks/ZG = $((PER * 128)) entries)" ||
         fail "$2 $3: per_zg=$PER, not the target $TARGET"
     [ "$PCT_USED" -le 1 ] &&
         pass "$2 $3: the queues cost ${PCT_USED}% of the volume" ||

@@ -48,6 +48,8 @@ bool cetrafs_sb_zg_owned_cached(struct super_block *sb, u32 zg_id);
 u32 cetrafs_sb_bg_owner(struct super_block *sb, u32 bg_id);
 void cetrafs_sb_set_bg_owner(struct super_block *sb, u32 bg_id, u32 zg_id);
 u32 cetrafs_sb_next_owned_bg(struct super_block *sb, u32 from);
+struct cetrafs_sb_info;
+static bool cetrafs_sb_bg_discard_pending_ignored(struct cetrafs_sb_info *sbi, u32 bg_id);
 
 /* ------ private superblock info kept in s_fs_info ------ */
 struct cetrafs_lba_range {
@@ -613,10 +615,12 @@ struct cetrafs_sb_info {
      * an UNKNOWN outcome -- it may still execute. Each stays drained
      * (out of this node's allocator: cetrafs_sb_undrain_bg() refuses
      * it) and out of every release until a discard of it is known to
-     * have run or been refused (cetrafs_bg_release_empty()). Memory
-     * only: a crash or unmount leaves it owned with an empty bitmap,
-     * the standing advisory-fence caveat for I/O already queued.
-     * Keyed by BG id. */
+     * have run or been refused (cetrafs_bg_release_empty()). The
+     * in-core mirror of CETRAFS_BG_FLAG_DISCARD_PENDING (format
+     * 0x000A), which is what survives an unmount, a crash or a
+     * takeover: loaded from the descriptors at mount and whenever a
+     * Zone Group is about to enter this node's ownership
+     * (cetrafs_bg_refresh_owner_map()). Keyed by BG id. */
     struct xarray discard_pending;
     atomic_t discard_pending_count;
     /* Inline discard (`-o discard`, discard.c): the queue of runs freed
@@ -1335,13 +1339,14 @@ walked:
         u32 ci = b & CETRAFS_BGC_MASK;
         u64 t = 0, bstart = 0, blen = 0;
         u32 owner = CETRAFS_NODE_ID_NONE;
+        u16 bflags = 0;
         u32 si;
         int brc;
 
         /* Same single pass also records which Zone Group owns each
          * Block Group, which is what lets ownership be answered from
          * memory from here on. */
-        brc = cetrafs_bg_mount_info(sb, &l->raw, b, c->bg_desc_lba[ci], fresh, &t, &owner, &bstart, &blen);
+        brc = cetrafs_bg_mount_info(sb, &l->raw, b, c->bg_desc_lba[ci], fresh, &t, &owner, &bstart, &blen, &bflags);
         /*
          * Block Groups in order, none over the one before. Each
          * descriptor was checked alone, so two checksum-valid
@@ -1401,6 +1406,11 @@ walked:
             gp->shard_credit[b % gp->nshards] += t;
         }
         total_data += t;
+        /* A discard outstanding on the device (CETRAFS_BG_FLAG_DISCARD_
+         * PENDING): known before any Zone Group claim derives this
+         * group's owned bit, so no allocator here ever sees it free. */
+        if (bflags & CETRAFS_BG_FLAG_DISCARD_PENDING)
+            cetrafs_sb_set_bg_discard_pending(sb, b, true);
         WRITE_ONCE(c->bg_owner_zg[ci], (u16) owner);
     }
 
@@ -1489,7 +1499,9 @@ static void cetrafs_sb_owned_bgs_derive(struct cetrafs_sb_info *sbi, u32 zg_id, 
 
         if (READ_ONCE(c->bg_owner_zg[i]) != (u16) zg_id)
             continue;
-        if (own)
+        /* A group with a discard outstanding is never allocatable,
+         * whoever owns it (CETRAFS_BG_FLAG_DISCARD_PENDING). */
+        if (own && !cetrafs_sb_bg_discard_pending_ignored(sbi, b))
             set_bit(i, c->owned_bgs);
         else
             clear_bit(i, c->owned_bgs);
@@ -2004,7 +2016,8 @@ static void cetrafs_layout_publish(struct super_block *sb, struct cetrafs_bg_lay
         u32 i = b & CETRAFS_BGC_MASK;
         u16 z = READ_ONCE(c->bg_owner_zg[i]);
 
-        if (z < CETRAFS_MAX_ZONE_GROUPS && test_bit(z, sbi->owned_zgs))
+        if (z < CETRAFS_MAX_ZONE_GROUPS && test_bit(z, sbi->owned_zgs) &&
+            !cetrafs_sb_bg_discard_pending_ignored(sbi, b))
             set_bit(i, c->owned_bgs);
     }
     if (READ_ONCE(cetrafs_layout_publish_hold_ms)) {
@@ -5534,6 +5547,19 @@ bool cetrafs_sb_bg_discard_pending(struct super_block *sb, u32 bg_id)
     return sbi && xa_load(&sbi->discard_pending, bg_id);
 }
 
+/* TEST ONLY: the owned-bit derivation ignores an outstanding discard --
+ * the negative control of tests/kernel/discard_pending_durable.sh. */
+static bool cetrafs_discard_pending_ignore;
+cetrafs_test_param(discard_pending_ignore, cetrafs_discard_pending_ignore, bool, 0644);
+MODULE_PARM_DESC(discard_pending_ignore, "TEST ONLY: a group with a discard outstanding may still be allocated from");
+
+/* For the owned-bit derivations, which run under owned_lock (a spinlock;
+ * xa_load is RCU). */
+static bool cetrafs_sb_bg_discard_pending_ignored(struct cetrafs_sb_info *sbi, u32 bg_id)
+{
+    return !READ_ONCE(cetrafs_discard_pending_ignore) && xa_load(&sbi->discard_pending, bg_id);
+}
+
 /* TEST ONLY: the next store of a pending discard mark fails (review U5). */
 static bool cetrafs_discard_pending_store_fail;
 cetrafs_test_param(discard_pending_store_fail, cetrafs_discard_pending_store_fail, bool, 0644);
@@ -5837,7 +5863,7 @@ void cetrafs_sb_undrain_bg(struct super_block *sb, u32 bg_id)
      * reach whoever asks, until a known-outcome discard clears the mark
      * (cetrafs_bg_release_empty()). This is the one place a drained
      * group comes back, so the one place to refuse. */
-    if (cetrafs_sb_bg_discard_pending(sb, bg_id))
+    if (cetrafs_sb_bg_discard_pending(sb, bg_id) && !READ_ONCE(cetrafs_discard_pending_ignore))
         return;
     c = cetrafs_bgc(sbi, bg_id, &i);
     if (!c)
@@ -5860,7 +5886,8 @@ void cetrafs_sb_set_bg_owner(struct super_block *sb, u32 bg_id, u32 zg_id)
         return;
 
     WRITE_ONCE(c->bg_owner_zg[i], (u16) zg_id);
-    if (zg_id < CETRAFS_MAX_ZONE_GROUPS && test_bit(zg_id, sbi->owned_zgs))
+    if (zg_id < CETRAFS_MAX_ZONE_GROUPS && test_bit(zg_id, sbi->owned_zgs) &&
+        !cetrafs_sb_bg_discard_pending_ignored(sbi, bg_id))
         set_bit(i, c->owned_bgs);
     else
         clear_bit(i, c->owned_bgs);

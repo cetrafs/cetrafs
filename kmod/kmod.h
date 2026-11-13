@@ -936,11 +936,14 @@ static inline int cetrafs_free_data_block(struct super_block *sb, u64 lba)
     cetrafs_forget_block(sb, lba);
     return cetrafs_free_data_extent(sb, lba, 1);
 }
-int cetrafs_apply_pending_free(struct super_block *sb, u64 lba, u32 count, u32 expect_zg);
+int cetrafs_apply_pending_free(struct super_block *sb, u64 lba, u32 count, u32 expect_zg, u64 stamp);
+int cetrafs_bg_bump_free_gen(struct super_block *sb, u32 bg_id);
+u64 cetrafs_pf_stale_drop_count(void);
+u64 cetrafs_bg_gen_bump_count(void);
 int cetrafs_count_free_inodes(struct super_block *sb, u64 *out_free);
 int cetrafs_bg_data_block_stats(struct super_block *sb, u32 bg_id, u64 *out_total, u64 *out_free);
 int cetrafs_bg_mount_info(struct super_block *sb, const cetrafs_superblock_t *raw_sb, u32 bg_id, u64 desc_lba,
-                          bool fresh, u64 *out_total, u32 *out_owner, u64 *out_start, u64 *out_len);
+                          bool fresh, u64 *out_total, u32 *out_owner, u64 *out_start, u64 *out_len, u16 *out_flags);
 
 /* Which Zone Group owns this Block Group, from the owners recorded at
  * mount -- no device read. CETRAFS_NODE_ID_NONE if out of range.
@@ -1094,7 +1097,7 @@ int cetrafs_zg_claim_unowned(struct super_block *sb,
 int cetrafs_zg_release_surplus(struct super_block *sb, u32 my_node_id);
 int cetrafs_zg_release_all_rdonly(struct super_block *sb, u32 my_node_id);
 int cetrafs_zg_scrub_adopt_one_stale(struct super_block *sb, bool *out_adopted);
-int cetrafs_zg_queue_foreign_free(struct super_block *sb, u32 zg_id, u64 lba, u32 count);
+int cetrafs_zg_queue_foreign_free(struct super_block *sb, u32 zg_id, u64 lba, u32 count, u64 stamp);
 /* may_wait: back off on a busy region (heartbeat, mount); false on the
  * allocation path, where a write is waiting. */
 int cetrafs_zg_drain_pending_frees(struct super_block *sb, bool may_wait);
@@ -1106,7 +1109,8 @@ int cetrafs_alloc_pick_run(struct super_block *sb, u64 count, u64 *out_lba);
 int cetrafs_alloc_pick_run_resv(struct super_block *sb, u64 count, u64 *out_lba, struct cetrafs_resv_span *span);
 int cetrafs_alloc_data_run_resv(struct super_block *sb, u32 bg_id, u64 count, u64 *out_lba,
                                 struct cetrafs_resv_span *span);
-int cetrafs_free_data_extent_unless_reserved(struct super_block *sb, u64 lba, u32 count, u64 resv_seq);
+int cetrafs_free_data_extent_unless_reserved(struct super_block *sb, u64 lba, u32 count, u64 resv_seq,
+                                             const u64 *alloc_seq);
 u64 cetrafs_sb_resv_seq(struct super_block *sb);
 /* fs.c: frees in flight between a publish and its frees (cetrafs_frees_begin()). */
 struct cetrafs_frees_snap {

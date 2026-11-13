@@ -135,7 +135,10 @@
  * 0x000A (after 0.9.5): one format change landing every fix that needed
  * a field the format did not have -- see the history in
  * docs/ARCHITECTURE.md. growfs stamps CETRAFS_VERSION on what it grows;
- * "has this been grown?" is layout_gen, not the version.
+ * "has this been grown?" is layout_gen, not the version. 0x000A also
+ * carries the pending-free stamp (cetrafs_pending_free_t.free_gen and
+ * cetrafs_block_group_t.free_gen; the queue entry is 32 bytes) and the
+ * durable pending-discard flag (CETRAFS_BG_FLAG_DISCARD_PENDING).
  */
 #define CETRAFS_VERSION_MIN          CETRAFS_VERSION
 
@@ -422,7 +425,20 @@ typedef struct {
     __le64 lba;   /* first data block to free; 0 = empty slot */
     __le32 count; /* contiguous blocks (an extent never crosses a BG) */
     __le32 magic; /* CETRAFS_PENDING_FREE_MAGIC */
+    /* The free_gen of the Block Group holding lba, as the appender read
+     * it before its swap (format 0x000A). The drain applies the entry only
+     * while the group's free_gen still equals it: the owner's scrub bumps
+     * that value before it reclaims a leak in the group, so a copy whose
+     * swap landed after such a reclaim -- an append whose outcome stayed
+     * undecided, the command arriving after its node stopped -- names a
+     * block that may belong to a new file, and is dropped instead of
+     * clearing it. A dropped entry leaks its blocks; the scrub reclaims
+     * them. */
+    __le64 free_gen;
+    __le64 pad;   /* zero: 32-byte entries tile a 512-byte CAS region */
 } CETRA_PACKED cetrafs_pending_free_t;
+
+typedef char cetrafs_pf_entry_tiles_sector[(512 % sizeof(cetrafs_pending_free_t) == 0) ? 1 : -1];
 
 #define CETRAFS_PENDING_FREE_PER_BLOCK (CETRAFS_BLOCK_SIZE / sizeof(cetrafs_pending_free_t))
 /* Per-ZG pending-free queue, in blocks. This is the size mkfs aims
@@ -430,17 +446,18 @@ typedef struct {
  * shrinks on a device too small to spare it, and every reader takes it
  * from there.
  *
- * 256 blocks is 65,536 queued runs per ZG. The queue holds one entry
+ * 512 blocks is 65,536 queued runs per ZG (32-byte entries since
+ * 0x000A; it was 256 blocks of 16-byte ones). The queue holds one entry
  * per freed EXTENT, and a node deleting a large VM image can produce
  * tens of thousands at once: at the previous 4 blocks (1024 entries) a
  * single 32 GiB image overflowed the queue roughly fiftyfold, and
  * everything past the first 1024 was dropped and leaked until the
  * owner's scrub reclaimed it.
  *
- * The cost is 1 MiB per Zone Group -- 0.01% of a 140 GB LUN, and at
- * worst ~0.2% of the smallest volume mkfs will build, because a ZG
+ * The cost is 2 MiB per Zone Group -- 0.02% of a 140 GB LUN, and at
+ * worst ~0.4% of the smallest volume mkfs will build, because a ZG
  * needs a Block Group and the smallest BG is 512 MiB. */
-#define CETRAFS_PENDING_FREE_BLOCKS_PER_ZG 256
+#define CETRAFS_PENDING_FREE_BLOCKS_PER_ZG 512
 
 /* Consecutive empty queue blocks that end a drain pass. Appends fill
  * from the front, so empties cluster at the tail; more than one is
@@ -881,6 +898,22 @@ typedef struct {
  */
 #define CETRAFS_BG_FLAG_DISCARDED 0x0001u
 
+/*
+ * DISCARD_PENDING (format 0x000A): the group's hand-back discard failed
+ * with an UNKNOWN outcome -- a timeout, a path failure -- so the UNMAP may
+ * still execute, and anything written to the group meanwhile may be
+ * destroyed by it. Set by compare-and-swap, on the device before the
+ * release gives up on the group; cleared only by the release that hands
+ * it back after a later discard of it has a KNOWN outcome. While it is
+ * set the group belongs to its Zone Group, is empty, and is allocated
+ * from by nobody: not by its owner, not by a node that takes the Zone
+ * Group over, not after a remount. Whoever owns it re-issues the
+ * discard. It stops this filesystem handing the group out; it does not
+ * fence the array -- a command queued at a failed path can still land
+ * late, the standing advisory-fence caveat.
+ */
+#define CETRAFS_BG_FLAG_DISCARD_PENDING 0x0002u
+
 /* Node liveness timing. Shared rather than kernel-private because the
  * userspace tools need the same answer the kernel would give: mkfs and
  * fsck decide whether a registry row belongs to a node that is still
@@ -1224,6 +1257,14 @@ typedef struct {
      * recomputed count happens to be byte-identical to what it expects.
      * See alloc.c's cetrafs_bg_count_mutate(). */
     __le64 reconcile_seq;
+    /* The group's FREE GENERATION (format 0x000A). The owner's scrub
+     * bumps it, by compare-and-swap, before it reclaims a leaked block
+     * here; a pending-free entry carries the value its appender read and
+     * is applied only while the two are equal
+     * (cetrafs_pending_free_t.free_gen). Moves with the descriptor, so a
+     * group handed back and claimed again keeps it; zero from mkfs and
+     * growfs. fsck -r bumps it too when it reclaims leaks offline. */
+    __le64 free_gen;
     /* pad sized against the *real* preceding field total (60 bytes).
      * Found: this was previously "- 64", as if 64 bytes of
      * real fields preceded it, making sizeof(cetrafs_block_group_t)
@@ -1238,8 +1279,9 @@ typedef struct {
      * enough kernel-side frees (fallocate's punch-hole) ahead of an
      * fsck run. Fixing the pad to match reality makes both sides hash
      * the same CETRAFS_BLOCK_SIZE bytes without touching either call
-     * site. (68 as of v0x0004: reconcile_seq above.) */
-    u8  pad[CETRAFS_BLOCK_SIZE - 68];
+     * site. (68 as of v0x0004: reconcile_seq above; 76 as of 0x000A:
+     * free_gen.) */
+    u8  pad[CETRAFS_BLOCK_SIZE - 76];
 } CETRA_PACKED cetrafs_block_group_t;
 
 /* ---- Intra‑BG Header (first block of region) ---- */

@@ -2031,6 +2031,7 @@ static int cetrafs_zg_queue_span(struct super_block *sb, u32 zg_id, u64 *out_sta
 struct cetrafs_pf_append_ctx {
     u64 lba;
     u32 count;
+    u64 stamp; /* the group's free_gen, read before the swap */
 };
 
 static int cetrafs_pf_append_mutate(void *image, unsigned int len, void *priv)
@@ -2049,6 +2050,8 @@ static int cetrafs_pf_append_mutate(void *image, unsigned int len, void *priv)
         ent[e].lba = cetrafs_cpu_to_le64(ctx->lba);
         ent[e].count = cetrafs_cpu_to_le32(ctx->count);
         ent[e].magic = cetrafs_cpu_to_le32(CETRAFS_PENDING_FREE_MAGIC);
+        ent[e].free_gen = cetrafs_cpu_to_le64(ctx->stamp);
+        ent[e].pad = 0;
         return 0;
     }
     return -EEXIST; /* this region is full; the caller tries the next */
@@ -2151,9 +2154,9 @@ static unsigned int cetrafs_pf_append_stall_ms;
 cetrafs_test_param(pf_append_stall_ms, cetrafs_pf_append_stall_ms, uint, 0644);
 MODULE_PARM_DESC(pf_append_stall_ms, "TEST ONLY: delay every foreign-free queue append (ms)");
 
-int cetrafs_zg_queue_foreign_free(struct super_block *sb, u32 zg_id, u64 lba, u32 count)
+int cetrafs_zg_queue_foreign_free(struct super_block *sb, u32 zg_id, u64 lba, u32 count, u64 stamp)
 {
-    struct cetrafs_pf_append_ctx ctx = {.lba = lba, .count = count};
+    struct cetrafs_pf_append_ctx ctx = {.lba = lba, .count = count, .stamp = stamp};
     unsigned int regions = CETRAFS_BLOCK_SIZE / cetrafs_cas_region_size(sb);
     u64 qstart;
     u32 qblocks, qb;
@@ -2256,6 +2259,7 @@ queue_full:
 struct cetrafs_pf_ent {
     u64 lba;
     u32 count;
+    u64 stamp; /* its free_gen: applied only while the group's still equals it */
 };
 
 /* What one consume swap of a single region took. Rebuilt from the image
@@ -2318,6 +2322,7 @@ static int cetrafs_pf_drain_mutate(void *image, unsigned int len, void *priv)
          * copies it consumed. */
         ctx->seen[ctx->n].lba = cetrafs_le64(ent[e].lba);
         ctx->seen[ctx->n].count = cetrafs_le32(ent[e].count);
+        ctx->seen[ctx->n].stamp = cetrafs_le64(ent[e].free_gen);
         ctx->n++;
         memset(&ent[e], 0, sizeof(ent[e]));
         changed = true;
@@ -2484,16 +2489,18 @@ static int cetrafs_pf_hold_range(struct maple_tree *mt, u64 lba, u32 count)
  * three nodes). And one drain at a time (pf_drain_mutex), or two would
  * split the queue and each apply its half blind to the other's.
  *
- * Not covered: a copy APPENDED after the re-read in 3b, which a later
- * drain applies. Its sources, enumerated (2026-11-13): an append retried
- * after it had landed is settled inside the CAS (caw.c re-reads an
- * unknown outcome and stops the mount when it cannot tell), so a copy
- * arrives only (a) from a double free, which is a bug of its own and
- * exactly as harmful on the direct free path, or (b) from an undecided
- * append landing on the device after its node stopped -- later than the
- * scrub's queue check can see (scrub.c, "Not airtight"). Closing (b)
- * needs the entry to carry a stamp the drain can check, which is a
- * format change (docs/internal/TODO.md).
+ * A copy APPENDED after the re-read in 3b is applied by a later drain.
+ * Its sources, enumerated (2026-11-13): an append retried after it had
+ * landed is settled inside the CAS (caw.c re-reads an unknown outcome and
+ * stops the mount when it cannot tell), so a late entry arrives only
+ * (a) from a double free, which is a bug of its own and exactly as
+ * harmful on the direct free path, or (b) from an undecided append
+ * landing on the device after its node stopped, possibly after the
+ * owner's scrub reclaimed its blocks as a leak and handed them out
+ * again. (b) is closed by the entry's stamp (format 0x000A): the scrub
+ * raises the group's free_gen before that reclaim, and the apply drops
+ * an entry whose stamp is not the group's current one
+ * (cetrafs_apply_pending_free(); tests/kernel/pf_late_copy_after_reclaim.sh).
  */
 static int cetrafs_zg_drain_one(struct super_block *sb, u32 zg_id, bool may_wait)
 {
@@ -2729,7 +2736,9 @@ static int cetrafs_zg_drain_one(struct super_block *sb, u32 zg_id, bool may_wait
                                 zg_id, (unsigned long long) first, got[e].count, mret);
             continue;
         }
-        aret = cetrafs_apply_pending_free(sb, first, got[e].count, zg_id);
+        aret = cetrafs_apply_pending_free(sb, first, got[e].count, zg_id, got[e].stamp);
+        if (aret > 0)
+            continue; /* stale stamp: dropped, a leak for the scrub (cetrafs_apply_pending_free()) */
         if (!aret)
             applied++;
         else

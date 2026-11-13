@@ -209,12 +209,13 @@ int main(int argc, char **argv)
 
     if (dump) {
         printf("free_data_blocks=%llu reconcile_seq=%llu start_block=%llu length_blocks=%llu off_data_bmap=%u "
-               "off_data_region=%u data_block_count=%llu inode_table_start=%llu\n",
+               "off_data_region=%u data_block_count=%llu inode_table_start=%llu free_gen=%llu flags=%u\n",
                (unsigned long long) cetrafs_le64(bg.free_data_blocks),
                (unsigned long long) cetrafs_le64(bg.reconcile_seq), (unsigned long long) cetrafs_le64(bg.start_block),
                (unsigned long long) cetrafs_le64(bg.length_blocks), cetrafs_le32(bg.off_data_bmap),
                cetrafs_le32(bg.off_data_region), (unsigned long long) cetrafs_le64(bg.data_block_count),
-               (unsigned long long) cetrafs_le64(sb.inode_table_start));
+               (unsigned long long) cetrafs_le64(sb.inode_table_start), (unsigned long long) cetrafs_le64(bg.free_gen),
+               (unsigned) cetrafs_le16(bg.flags));
         close(fd);
         return 0;
     }

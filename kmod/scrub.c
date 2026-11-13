@@ -378,14 +378,15 @@ static int scrub_build_refset(struct cetrafs_scrub *s, struct scrub_ctx *ctx, bo
      * peer to drop the extent first -- so the block was still referenced
      * at pass 1 and never became a candidate at all.
      *
-     * Not airtight, and the one hole is named here rather than argued
-     * away (rule 7): an append whose CAW outcome was UNDECIDED stops its
-     * node's mount (caw.c), and the command can still land on the
-     * device afterwards, at an instant unrelated to when its extent was
-     * dropped. If it lands after pass 2 freed the block as a leak and
-     * the block was handed out again, the drain applies it to live data.
-     * Telling that copy from a live entry needs a stamp in the entry,
-     * which is a format change (docs/internal/TODO.md).
+     * One entry escapes both: an append whose CAW outcome was UNDECIDED
+     * stops its node's mount (caw.c), and the command can still land on
+     * the device afterwards, at an instant unrelated to when its extent
+     * was dropped -- after pass 2 freed the block as a leak and the
+     * block was handed out again. That copy is stopped by its stamp,
+     * not here: scrub_free_confirmed() raises the group's free_gen
+     * before its first free, and the drain drops an entry stamped
+     * before that (cetrafs_apply_pending_free();
+     * tests/kernel/pf_late_copy_after_reclaim.sh).
      *
      * One queue read per owned ZG per pass. Targets are collected in
      * Block Group order, and ownership is round-robin (BG b of ZG
@@ -466,6 +467,7 @@ static int scrub_free_confirmed(struct cetrafs_scrub *s, struct scrub_bg *b, u64
 {
     struct super_block *sb = s->sb;
     u8 *bmap = scrub_read_bitmap(sb, b);
+    bool gen_raised = false;
     u64 bit;
     int ret;
 
@@ -545,7 +547,28 @@ static int scrub_free_confirmed(struct cetrafs_scrub *s, struct scrub_bg *b, u64
             if (reserved)
                 continue;
 
-            ret = cetrafs_free_data_extent_unless_reserved(sb, b->data_start + bit, 1, b->resv_seq);
+            /*
+             * Before the first free in this group, raise its free_gen
+             * (cetrafs_bg_bump_free_gen()). A peer's pending-free entry
+             * for a block judged leaked here may still reach the queue
+             * after this reclaim -- an append whose outcome its node
+             * never learned, landing after the node stopped -- and by
+             * then the block can belong to a new file. Stamped before
+             * this, such an entry is dropped by the drain instead of
+             * freeing that file's block. Not raised, nothing is freed.
+             */
+            if (!gen_raised) {
+                ret = cetrafs_bg_bump_free_gen(sb, b->bg_id);
+                if (ret) {
+                    pr_warn_ratelimited("scrub: BG %u: could not raise its free generation (%d) -- freeing "
+                                        "nothing there this cycle\n",
+                                        b->bg_id, ret);
+                    break;
+                }
+                gen_raised = true;
+            }
+            ret = cetrafs_free_data_extent_unless_reserved(sb, b->data_start + bit, 1, b->resv_seq,
+                                                           cetrafs_scrub_ignore_alloc_seq ? NULL : &b->alloc_seq);
             if (ret == -EAGAIN) {
                 /* A run was released since the verdict: it is somebody's
                  * data now, and the evidence predates it. Same answer as

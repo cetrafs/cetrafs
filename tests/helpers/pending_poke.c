@@ -12,7 +12,12 @@
  * Usage:
  *   pending_poke <image> add <zg_id> <lba> <count>
  *   pending_poke <image> dump <zg_id>          -- prints "lba count" lines
+ *   pending_poke <image> dumpgen <zg_id>       -- prints "lba count free_gen" lines
  *   pending_poke <image> extent <ino>          -- prints "lba len" of extent 0
+ *
+ * An entry is stamped (format 0x000A) with its Block Group's current
+ * free_gen, read from the descriptor -- what a live appender writes --
+ * unless PENDING_POKE_STAMP names another value (a stale copy).
  */
 #include <fcntl.h>
 #include <inttypes.h>
@@ -40,6 +45,27 @@ static void pwrite_all(const void *buf, size_t len, off_t off)
         perror("pwrite");
         exit(1);
     }
+}
+
+/* The free_gen to stamp an entry for lba with: PENDING_POKE_STAMP if set,
+ * else the descriptor's of the group holding lba (first table segment:
+ * the test volumes are never grown), else 0. */
+static uint64_t stamp_for(const cetrafs_superblock_t *sb, uint64_t lba)
+{
+    const char *env = getenv("PENDING_POKE_STAMP");
+    uint32_t n = cetrafs_le64(sb->bg_table_first_count) ? (uint32_t) cetrafs_le64(sb->bg_table_first_count)
+                                                         : cetrafs_le32(sb->block_group_count);
+
+    if (env && *env)
+        return strtoull(env, NULL, 0);
+    for (uint32_t b = 0; b < n; b++) {
+        cetrafs_block_group_t bg;
+
+        pread_all(&bg, sizeof(bg), (off_t) (cetrafs_le64(sb->bg_table_start) + b) * CETRAFS_BLOCK_SIZE);
+        if (lba >= cetrafs_le64(bg.start_block) && lba < cetrafs_le64(bg.start_block) + cetrafs_le64(bg.length_blocks))
+            return cetrafs_le64(bg.free_gen);
+    }
+    return 0;
 }
 
 int main(int argc, char **argv)
@@ -91,13 +117,20 @@ int main(int argc, char **argv)
     uint64_t qstart = cetrafs_le64(sb.pending_free_start) + (uint64_t) zg_id * cetrafs_le32(sb.pending_free_blocks_per_zg);
     unsigned per_block = CETRAFS_BLOCK_SIZE / sizeof(cetrafs_pending_free_t);
 
-    if (strcmp(argv[2], "dump") == 0) {
+    if (strcmp(argv[2], "dump") == 0 || strcmp(argv[2], "dumpgen") == 0) {
+        int gen = strcmp(argv[2], "dumpgen") == 0;
+
         for (uint32_t qb = 0; qb < cetrafs_le32(sb.pending_free_blocks_per_zg); qb++) {
             cetrafs_pending_free_t ents[CETRAFS_BLOCK_SIZE / sizeof(cetrafs_pending_free_t)];
 
             pread_all(ents, sizeof(ents), (off_t) (qstart + qb) * CETRAFS_BLOCK_SIZE);
             for (unsigned e = 0; e < per_block; e++) {
-                if (ents[e].lba)
+                if (!ents[e].lba)
+                    continue;
+                if (gen)
+                    printf("%llu %u %llu\n", (unsigned long long) cetrafs_le64(ents[e].lba),
+                           cetrafs_le32(ents[e].count), (unsigned long long) cetrafs_le64(ents[e].free_gen));
+                else
                     printf("%llu %u\n", (unsigned long long) cetrafs_le64(ents[e].lba), cetrafs_le32(ents[e].count));
             }
         }
@@ -123,6 +156,8 @@ int main(int argc, char **argv)
                 ents[e].lba = cetrafs_cpu_to_le64(lba);
                 ents[e].count = cetrafs_cpu_to_le32(count);
                 ents[e].magic = cetrafs_cpu_to_le32(CETRAFS_PENDING_FREE_MAGIC);
+                ents[e].free_gen = cetrafs_cpu_to_le64(stamp_for(&sb, lba));
+                ents[e].pad = 0;
                 pwrite_all(ents, sizeof(ents), off);
                 printf("pending_poke: ZG%u queued free [%" PRIu64 " +%u)\n", zg_id, lba, count);
                 return 0;
@@ -154,6 +189,8 @@ int main(int argc, char **argv)
         ents[slot].lba = cetrafs_cpu_to_le64(lba);
         ents[slot].count = cetrafs_cpu_to_le32(count);
         ents[slot].magic = cetrafs_cpu_to_le32(CETRAFS_PENDING_FREE_MAGIC);
+        ents[slot].free_gen = cetrafs_cpu_to_le64(stamp_for(&sb, lba));
+        ents[slot].pad = 0;
         pwrite_all(ents, sizeof(ents), off);
         printf("pending_poke: ZG%u block %u slot %u holds free [%" PRIu64 " +%u)\n", zg_id, qb, slot, lba, count);
         return 0;
