@@ -264,6 +264,8 @@ static int cetrafs_proc_info_show(struct seq_file *m, void *v)
     /* CAS seeds a mutator refused and re-read fresh (torn or edited). */
     seq_printf(m, "cas_seed_refused: %llu\n", cetrafs_cas_seed_refused_count());
     seq_printf(m, "cas_seed_reverdicts: %llu\n", cetrafs_cas_seed_reverdict_count());
+    /* ZG records copied torn (failed their own checksum after the copy) and re-read. */
+    seq_printf(m, "zg_copy_torn: %llu\n", cetrafs_zg_copy_torn_count());
     seq_printf(m, "nslock_restarts: %llu\n", cetrafs_nslock_restart_count());
     seq_printf(m, "close_deferrals: %llu\n", cetrafs_lock_close_deferral_count());
     seq_printf(m, "convert_source_flushes: %llu\n", cetrafs_convert_source_flush_count());

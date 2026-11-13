@@ -722,6 +722,25 @@ struct buffer_head *cetrafs_getblk_overwrite(struct super_block *sb, sector_t bl
  * pending write and the write-back then put the old bytes back. A
  * buffer that is not uptodate has nothing stale to correct.
  */
+/* TEST ONLY: a one-shot stall, held halfway through the next in-place patch
+ * of a Zone Group table block. It is consumed (set back to 0) by that patch
+ * and holds the buffer lock across the stall, so a reader that copies the
+ * record without the lock sees the half-applied image. */
+static unsigned int cetrafs_zg_patch_stall_ms;
+cetrafs_test_param(zg_patch_stall_ms, cetrafs_zg_patch_stall_ms, uint, 0644);
+MODULE_PARM_DESC(zg_patch_stall_ms, "TEST ONLY: stall halfway through the next in-place patch of a ZG table block");
+
+static bool cetrafs_is_zg_table_block(struct super_block *sb, sector_t block)
+{
+    const cetrafs_superblock_t *raw = cetrafs_sb_raw(sb);
+    u64 start;
+
+    if (!raw)
+        return false;
+    start = le64_to_cpu(raw->zg_table_start);
+    return block >= start && block < start + le32_to_cpu(raw->zone_group_count);
+}
+
 void cetrafs_cache_region_after_cas(struct super_block *sb, sector_t block, unsigned int off, const void *src,
                                     unsigned int len)
 {
@@ -735,8 +754,31 @@ void cetrafs_cache_region_after_cas(struct super_block *sb, sector_t block, unsi
         return;
 
     lock_buffer(bh);
-    if (buffer_uptodate(bh))
-        memcpy(bh->b_data + off, src, len);
+    if (buffer_uptodate(bh)) {
+        unsigned int stall = 0;
+
+        if (READ_ONCE(cetrafs_zg_patch_stall_ms) && cetrafs_is_zg_table_block(sb, block))
+            stall = xchg(&cetrafs_zg_patch_stall_ms, 0);
+        if (stall) {
+            /* Split inside the bytes this patch changes, so that the
+             * half-applied image differs from both the old and the new
+             * one: between the first and the last differing byte. */
+            u8 *dst = bh->b_data + off;
+            const u8 *nw = src;
+            unsigned int first = 0, last = len, split;
+
+            while (first < len && dst[first] == nw[first])
+                first++;
+            while (last > first && dst[last - 1] == nw[last - 1])
+                last--;
+            split = first >= last ? len / 2 : first + (last - first) / 2;
+            memcpy(dst, nw, split);
+            msleep(stall);
+            memcpy(dst + split, nw + split, len - split);
+        } else {
+            memcpy(bh->b_data + off, src, len);
+        }
+    }
     unlock_buffer(bh);
     brelse(bh);
 }

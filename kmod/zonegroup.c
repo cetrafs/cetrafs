@@ -90,6 +90,26 @@ static u32 cetrafs_zg_cold_crc(const void *blk)
 }
 
 
+/* TEST ONLY: hold the gap between verifying a ZG record and copying it
+ * (ms). The verify and the copy are two steps, and a patch of the cached
+ * block landing in that gap is exactly what the buffer lock keeps out. */
+static unsigned int cetrafs_zg_read_gap_ms;
+cetrafs_test_param(zg_read_gap_ms, cetrafs_zg_read_gap_ms, uint, 0644);
+MODULE_PARM_DESC(zg_read_gap_ms, "TEST ONLY: pause between verifying a ZG record and copying it");
+/* TEST ONLY: verify and copy without the buffer lock (the pre-fix reader). */
+static bool cetrafs_zg_read_unlocked;
+cetrafs_test_param(zg_read_unlocked, cetrafs_zg_read_unlocked, bool, 0644);
+MODULE_PARM_DESC(zg_read_unlocked, "TEST ONLY: copy a ZG record without the buffer lock");
+
+/* Copies that failed their own checksum re-check after the memcpy: a torn
+ * copy, which the reader discards and re-reads. Zero under the lock. */
+static atomic64_t cetrafs_zg_copy_torn = ATOMIC64_INIT(0);
+
+u64 cetrafs_zg_copy_torn_count(void)
+{
+    return (u64) atomic64_read(&cetrafs_zg_copy_torn);
+}
+
 static int cetrafs_read_zg(struct super_block *sb, u32 zg_id, cetrafs_zone_group_t *out)
 {
     const cetrafs_superblock_t *raw_sb = cetrafs_sb_raw(sb);
@@ -112,6 +132,9 @@ static int cetrafs_read_zg(struct super_block *sb, u32 zg_id, cetrafs_zone_group
     {
         int attempt;
 
+        /* Read once: the lock and its unlock below are paired on this. */
+        bool unlocked = READ_ONCE(cetrafs_zg_read_unlocked);
+
         for (attempt = 0; attempt < 5; attempt++) {
             bh = cetrafs_bread_uncached_retry(sb, le64_to_cpu(raw_sb->zg_table_start) + zg_id);
             if (!bh)
@@ -121,22 +144,34 @@ static int cetrafs_read_zg(struct super_block *sb, u32 zg_id, cetrafs_zone_group
             /* Verified and copied under the buffer lock, which every
              * in-place patch of a cached block takes: checked on the
              * live buffer and copied after, a patch landing in between
-             * handed out an image the checksum never saw (audit L15). */
-            cetrafs_bh_read_lock(bh);
+             * handed out an image the checksum never saw (audit L15).
+             * The copy is then checked against its own checksum too: a
+             * copy that fails it was torn, and is read again. */
+            if (!unlocked)
+                cetrafs_bh_read_lock(bh);
             want = (u32) le64_to_cpu(zg->hot_checksum);
             got = cetrafs_zg_hot_crc(bh->b_data);
             if (!cetrafs_record_tear_injected("ZG record") && got == want &&
                 (u32) le64_to_cpu(zg->cold_checksum) == cetrafs_zg_cold_crc(bh->b_data)) {
-                bool id_ok = le16_to_cpu(zg->zg_id) == (u16) zg_id;
+                unsigned int gap = READ_ONCE(cetrafs_zg_read_gap_ms);
 
-                if (id_ok)
-                    memcpy(out, zg, sizeof(*out));
-                cetrafs_bh_read_unlock(bh);
+                if (gap)
+                    msleep(gap);
+                memcpy(out, zg, sizeof(*out));
+                if (!unlocked)
+                    cetrafs_bh_read_unlock(bh);
                 brelse(bh);
-                return id_ok ? 0 : -EINVAL;
+                if (le16_to_cpu(out->zg_id) != (u16) zg_id)
+                    return -EINVAL;
+                if (cetrafs_zg_hot_crc(out) == (u32) le64_to_cpu(out->hot_checksum) &&
+                    cetrafs_zg_cold_crc(out) == (u32) le64_to_cpu(out->cold_checksum))
+                    return 0;
+                atomic64_inc(&cetrafs_zg_copy_torn);
+            } else {
+                if (!unlocked)
+                    cetrafs_bh_read_unlock(bh);
+                brelse(bh);
             }
-            cetrafs_bh_read_unlock(bh);
-            brelse(bh);
 
             /* Same backoff as the inode-record and node-row readers: a
              * checksum tear here is a peer's in-flight write, which

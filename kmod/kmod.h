@@ -879,6 +879,7 @@ int cetrafs_init_security(struct inode *inode, struct inode *dir, const struct q
 u64 cetrafs_bg_lookup_reads_count(void);
 u64 cetrafs_cas_seed_refused_count(void);
 u64 cetrafs_cas_seed_reverdict_count(void); /* caw.c */
+u64 cetrafs_zg_copy_torn_count(void); /* zonegroup.c: ZG copies that failed their re-check */
 u64 cetrafs_hb_sweep_count(void); /* heartbeat.c */
 int cetrafs_alloc_inode(struct super_block *sb, u64 *out_ino);
 int cetrafs_free_inode(struct super_block *sb, u64 ino);
