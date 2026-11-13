@@ -2197,6 +2197,61 @@ printf 'static int cetrafs_new_refuser(struct super_block *sb)\n{\n    return ce
 [ "$(live_callers "$SAMPLE")" = "$(basename "$SAMPLE"):cetrafs_new_refuser" ] &&
     pass "class 44: control -- a planted caller is found" || fail "class 44: control -- a planted caller is not found"
 
+# Class 30 (a discard landing on live data), inline discard's premise.
+# `-o discard` discards a freed run about a second after the free
+# (discard.c), so every block that reaches the queue must already be
+# unreferenced ON THE DEVICE when it is freed: rule 21, publish first,
+# then free. fstrim stood on the same premise but ran rarely enough to
+# hide a free that came before its publish; this does not. The queue is
+# fed only by __cetrafs_free_data_extent() and cetrafs_apply_pending_free(),
+# so every function that calls them -- or runs a tree helper's freeing
+# pass (do_free=true) -- is listed with why its blocks are unreferenced.
+log "checking every path into a freed-run discard frees only what the device no longer references (class 30)"
+FREE_OK='alloc.c:__cetrafs_free_data_extent:the free itself
+alloc.c:cetrafs_free_data_extent:wrapper
+alloc.c:cetrafs_free_data_extent_unless_reserved:wrapper
+alloc.c:cetrafs_apply_pending_free:a peer'"'"'s free, queued by one of these paths on that peer
+alloc.c:cetrafs_foreign_free_leak_count:a forward declaration, not a call
+zonegroup.c:cetrafs_zg_drain_one:the pending-free drain, into cetrafs_apply_pending_free
+file.c:cetrafs_leaf_array_trim:only its do_free pass frees; see the do_free callers
+file.c:cetrafs_leaf_array_punch:only its do_free pass frees; see the do_free callers
+file.c:cetrafs_free_leaf_array:inside cetrafs_free_inline_extents
+file.c:cetrafs_free_inline_extents:no caller
+file.c:cetrafs_free_fetched_extents:evict, after the claim on a record already dead on the device (cetrafs_free_inode_begin())
+defrag.c:cetrafs_defrag_inode:the never-committed tail of its destination run
+lock.c:cetrafs_inode_drop_reservation:a reservation remainder, never written or referenced
+lock.c:cetrafs_inode_set_reservation:a reservation remainder, never written or referenced
+scrub.c:scrub_free_confirmed:a block re-read unreferenced, under the reservation recheck'
+DOFREE_OK='file.c:__cetrafs_truncate_shrink:after the record CAS that publishes the new tree
+file.c:cetrafs_fallocate:the punch, after the record CAS that publishes the new tree'
+free_callers() {
+    for f in "$@"; do
+        awk -v F="$(basename "$f")" '
+            /^[a-z_][a-z0-9_ *]*\(/ && !/;$/ { fn = $0; sub(/\(.*/, "", fn); n = split(fn, a, " "); fn = a[n]; sub(/^\*+/, "", fn) }
+            /cetrafs_free_data_extent\(|cetrafs_free_data_extent_unless_reserved\(|__cetrafs_free_data_extent\(|cetrafs_apply_pending_free\(/ && !/^[[:space:]]*\*/ && !/^[[:space:]]*\/\*/ { print F ":" fn }' "$f"
+    done | sort -u
+}
+dofree_callers() {
+    for f in "$@"; do
+        awk -v F="$(basename "$f")" '
+            /^[a-z_][a-z0-9_ *]*\(/ && !/;$/ { fn = $0; sub(/\(.*/, "", fn); n = split(fn, a, " "); fn = a[n]; sub(/^\*+/, "", fn) }
+            /do_free=\*\/true/ { print F ":" fn }' "$f"
+    done | sort -u
+}
+FC="$(free_callers "$K"/*.c)"; DC="$(dofree_callers "$K"/*.c)"
+[ "$(grep -c . <<<"$FC")" -ge 10 ] && [ "$(grep -c . <<<"$DC")" -ge 2 ] ||
+    fail "class 30: found only $(grep -c . <<<"$FC") free callers and $(grep -c . <<<"$DC") freeing passes -- the scan is not seeing the tree"
+UNF="$(while IFS= read -r l; do [ -n "$l" ] && ! grep -qF "$l:" <<<"$FREE_OK" && echo "$l"; done <<<"$FC" || true)"
+UND="$(while IFS= read -r l; do [ -n "$l" ] && ! grep -qF "$l:" <<<"$DOFREE_OK" && echo "$l"; done <<<"$DC" || true)"
+[ -z "$UNF$UND" ] && pass "class 30: every path into a freed-run discard names why its blocks are unreferenced" ||
+    fail "class 30: unclassified frees (is the block unreferenced on the device before this free?): $(echo $UNF $UND)"
+SAMPLE="$(ct_tmp free-sample).c"
+printf 'static void cetrafs_new_freer(struct super_block *sb)\n{\n    cetrafs_free_data_extent(sb, 1, 1);\n}\nstatic void cetrafs_new_pass(void)\n{\n    x(/*do_free=*/true);\n}\n' >"$SAMPLE"
+[ "$(free_callers "$SAMPLE")" = "$(basename "$SAMPLE"):cetrafs_new_freer" ] &&
+    [ "$(dofree_callers "$SAMPLE")" = "$(basename "$SAMPLE"):cetrafs_new_pass" ] &&
+    pass "class 30: control -- a planted free and a planted freeing pass are found" ||
+    fail "class 30: control -- a planted free or freeing pass is not found"
+
 # Class 45 (repair before the verdict, repair of the ambiguous). fsck -r
 # wrote repairs while a later pass could still find the fault that
 # disables repair, and restamped records it had not shown to be valid

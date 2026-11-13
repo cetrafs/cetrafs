@@ -422,7 +422,15 @@ of `discard` and `nodiscard` on a command line wins.
   node owns follows the publish that stopped referencing the blocks,
   and that publish is already on the device (rule 21) -- the same
   footing that lets fstrim discard any free bit at any moment. The
-  delay is for batching only.
+  delay is for batching only. fstrim ran rarely enough to hide a free that came
+  before its publish; one second does not, so the premise is enforced
+  rather than assumed: `source_invariants.sh` lists every function that
+  feeds the queue (and every freeing pass of the tree helpers) with why
+  its blocks are unreferenced on the device, and a new one fails until
+  someone says so (2026-11-13: truncate and punch after the record CAS,
+  evict after its claim on a dead record, reservation remainders and a
+  defrag's uncommitted tail never referenced, the scrub's re-read
+  blocks, a peer's pending free).
 * **It gives up** -- drops what is queued, counted and logged with the
   reason -- when the mount is closing, stopped or read-only, when
   discard is turned off, and for five seconds after an allocation
@@ -432,7 +440,9 @@ of `discard` and `nodiscard` on a command line wins.
 * **Unknown and refused outcomes** are fstrim's: an unknown one keeps
   the run allocated, its bits synced, for the scrub
   (`trim_leaked_blocks`) and ends the pass; a refused one frees the run
-  and goes on.
+  and goes on. A run kept for an unknown outcome is freed later by the scrub, and
+  that free is noted again: on a transport that keeps failing, the same
+  run is retried at scrub cadence -- bounded, counted, never shared.
 * **Lifetime (rule 20).** `cetrafs_inline_discard_close()`, from
   `cetrafs_free_sb_info()` on unmount and on every `fill_super`
   failure, after the heartbeat, scrub and defrag have stopped: it marks
