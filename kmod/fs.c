@@ -6366,8 +6366,11 @@ static void cetrafs_sb_defer_overflow(struct super_block *sb, const char *what, 
 }
 
 /* Remember a namespace lock whose release did not commit, for the
- * heartbeat to retry. See cetrafs_sb_info.nsrel. */
-void cetrafs_sb_nslock_defer(struct super_block *sb, u64 ino, u64 generation)
+ * heartbeat to retry. See cetrafs_sb_info.nsrel. 'recount': the lock was
+ * taken over from a stopped operation and its recount did not finish --
+ * the retry recounts before it clears, and an entry that already asked
+ * for one keeps asking (cetrafs_nslock_retry_deferred()). */
+void cetrafs_sb_nslock_defer_recount(struct super_block *sb, u64 ino, u64 generation, bool recount)
 {
     struct cetrafs_sb_info *sbi = sb->s_fs_info;
     u32 i;
@@ -6379,6 +6382,7 @@ void cetrafs_sb_nslock_defer(struct super_block *sb, u64 ino, u64 generation)
     for (i = 0; i < sbi->nsrel_count; i++)
         if (sbi->nsrel[i].ino == ino) { /* already queued; keep the newer identity */
             sbi->nsrel[i].generation = generation;
+            sbi->nsrel[i].recount |= recount;
             spin_unlock(&sbi->nsrel_lock);
             return;
         }
@@ -6389,8 +6393,14 @@ void cetrafs_sb_nslock_defer(struct super_block *sb, u64 ino, u64 generation)
     }
     sbi->nsrel[sbi->nsrel_count].ino = ino;
     sbi->nsrel[sbi->nsrel_count].generation = generation;
+    sbi->nsrel[sbi->nsrel_count].recount = recount;
     sbi->nsrel_count++;
     spin_unlock(&sbi->nsrel_lock);
+}
+
+void cetrafs_sb_nslock_defer(struct super_block *sb, u64 ino, u64 generation)
+{
+    cetrafs_sb_nslock_defer_recount(sb, ino, generation, false);
 }
 
 /* Remember a file lock whose last close did not finish, for the
@@ -6571,15 +6581,15 @@ void cetrafs_sb_nslock_retry_end(struct super_block *sb)
  * flight now, nothing for 'ino' can appear until we release. Otherwise
  * wait out any pass in flight, then remove the entry.
  *
- * Returns 1 and fills *generation if an entry was dropped: if the
- * acquire then fails, the caller must put it back
- * (cetrafs_sb_nslock_defer()), or the leftover lock is retried by
+ * Returns 1 and fills *generation and *recount if an entry was dropped:
+ * if the acquire then fails, the caller must put it back, recount flag
+ * and all (cetrafs_sb_nslock_defer_recount()), or the leftover lock is retried by
  * nobody. 0 if there was none. -EINTR if the caller was killed waiting
  * out a retry pass -- which can run 32 CASes on a failing device while
  * this caller holds the inode's ns_mutex and the VFS directory lock
  * (audit R21); nothing was dropped then.
  */
-int cetrafs_sb_nslock_forget(struct super_block *sb, u64 ino, u64 *generation)
+int cetrafs_sb_nslock_forget(struct super_block *sb, u64 ino, u64 *generation, bool *recount)
 {
     struct cetrafs_sb_info *sbi = sb->s_fs_info;
     bool busy;
@@ -6601,6 +6611,7 @@ int cetrafs_sb_nslock_forget(struct super_block *sb, u64 ino, u64 *generation)
     for (i = 0; i < sbi->nsrel_count; i++)
         if (sbi->nsrel[i].ino == ino) {
             *generation = sbi->nsrel[i].generation;
+            *recount = sbi->nsrel[i].recount;
             sbi->nsrel[i] = sbi->nsrel[--sbi->nsrel_count];
             found = 1;
             break;

@@ -496,12 +496,14 @@ void cetrafs_sb_accrue_zg_free(struct super_block *sb, u32 zg_id, s64 delta);
 struct cetrafs_nsrel_pending {
     u64 ino;
     u64 generation;
+    bool recount; /* namespace locks only: recount before clearing (cetrafs_ns_reconcile()) */
 };
 void cetrafs_sb_nslock_defer(struct super_block *sb, u64 ino, u64 generation);
+void cetrafs_sb_nslock_defer_recount(struct super_block *sb, u64 ino, u64 generation, bool recount);
 u32 cetrafs_sb_nslock_take_deferred(struct super_block *sb, struct cetrafs_nsrel_pending *out, u32 max);
 void cetrafs_sb_nslock_retry_begin(struct super_block *sb);
 void cetrafs_sb_nslock_retry_end(struct super_block *sb);
-int cetrafs_sb_nslock_forget(struct super_block *sb, u64 ino, u64 *generation);
+int cetrafs_sb_nslock_forget(struct super_block *sb, u64 ino, u64 *generation, bool *recount);
 /* nslock.c: one retry pass over them, called from the heartbeat tick. */
 void cetrafs_nslock_retry_deferred(struct super_block *sb);
 /* fs.c + lock.c: last-writer closes whose publish or lock clear failed,
