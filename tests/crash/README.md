@@ -67,6 +67,9 @@ fsck, and verify.
   volatile-cache power cut that reorders the in-flight window
   (`--reorder-after-fua`, Phase 5).
 - `crash_consistency.sh` — the five-phase suite.
+- `growfs_crash.sh` — an offline grow, cut after EVERY write of it
+  (`replay-log --limit-entries`): each cut must fsck clean, mount at the
+  old or the new size, keep its data, and finish on a rerun of growfs.
 
 ### Phase 1 — recoverability
 

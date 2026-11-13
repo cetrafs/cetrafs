@@ -11,6 +11,8 @@
  * Usage:
  *   leaf_poke <image> leaf <ino>                       -- print leaf LBA
  *   leaf_poke <image> setphys <ino> <entry> <new_phys> -- rewrite one entry
+ *   leaf_poke <image> setblock <ino> <entry> <new_block> -- rewrite one
+ *       entry's LOGICAL start (ee_block), restamped: an alias on purpose
  *   leaf_poke <image> show <ino>                       -- one line per entry
  *   leaf_poke <image> growlen <ino> <entry> <n>        -- entry covers n more
  *       blocks, as a peer appending in place leaves it (restamped)
@@ -148,9 +150,11 @@ int main(int argc, char **argv)
         return 0;
     }
 
-    if (strcmp(argv[2], "setphys") == 0) {
+    if (strcmp(argv[2], "setphys") == 0 || strcmp(argv[2], "setblock") == 0) {
+        const int set_block = strcmp(argv[2], "setblock") == 0;
+
         if (argc != 6) {
-            fprintf(stderr, "setphys needs <entry> <new_phys>\n");
+            fprintf(stderr, "%s needs <entry> <new_value>\n", argv[2]);
             return 2;
         }
         unsigned entry = (unsigned) strtoul(argv[4], NULL, 0);
@@ -167,7 +171,9 @@ int main(int argc, char **argv)
             return 1;
         }
 
-        {
+        if (set_block) {
+            leaves[entry].ee_block = cetrafs_cpu_to_le32((uint32_t) new_phys);
+        } else {
             __le16 hi;
             __le32 lo;
             cetrafs_extent_phys_to_hilo(new_phys, &hi, &lo);

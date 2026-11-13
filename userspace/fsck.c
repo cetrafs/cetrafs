@@ -3704,6 +3704,27 @@ int main(int argc, char **argv)
          * only proves the two caches agree with each other; this compares
          * it against what the bitmaps actually hold, and is the figure
          * the allocator's claim preference reads. */
+        /* The Block Groups the LAST grow appended: the segment the
+         * superblock's tail reserve names, once it is published. growfs
+         * publishes first and credits the Zone Groups after (growfs.c,
+         * "After the publish"), so a crash between the two leaves those
+         * aggregates short by exactly these Block Groups' capacity. */
+        uint32_t tail_first = 0, tail_count = 0;
+
+        if (cetrafs_le64(sb.tail_reserve_blocks) && cetrafs_le64(sb.tail_reserve_start) < total_blocks) {
+            cetrafs_bg_segment_t tseg;
+
+            pread_all(fd, &tseg, sizeof(tseg), (off_t) cetrafs_le64(sb.tail_reserve_start) * CETRAFS_BLOCK_SIZE);
+            if (cetrafs_le32(tseg.magic) == CETRAFS_BGSEG_MAGIC &&
+                (uint32_t) cetrafs_le64(tseg.checksum) ==
+                    crc32c_struct(&tseg, sizeof(tseg), offsetof(cetrafs_bg_segment_t, checksum),
+                                  sizeof(tseg.checksum)) &&
+                cetrafs_le32(tseg.count) &&
+                (uint64_t) cetrafs_le32(tseg.first_bg_id) + cetrafs_le32(tseg.count) <= cetrafs_le32(sb.block_group_count)) {
+                tail_first = cetrafs_le32(tseg.first_bg_id);
+                tail_count = cetrafs_le32(tseg.count);
+            }
+        }
         for (uint32_t z = 0; z < cetrafs_le32(sb.zone_group_count); ++z) {
             uint8_t zblk[CETRAFS_BLOCK_SIZE] = {0};
             cetrafs_zone_group_t zg;
@@ -3718,6 +3739,34 @@ int main(int argc, char **argv)
              * marker must go WITH it, or a later mount takes the credit
              * back a second time from the recounted pool. */
             int grow_dead = cetrafs_le64(zg.pool_grow_gen) > cetrafs_le64(sb.layout_gen);
+
+            /* The one lag a grow leaves on purpose. Accepted only when it
+             * is EXACTLY the capacity of this Zone Group's share of the
+             * last grow's Block Groups, and those are still untouched
+             * (every block free): nothing has been allocated in them, so
+             * nothing could have moved the aggregate for any other
+             * reason. Lower only, the conservative direction. Anything
+             * else -- a higher count, a different lag, a used Block Group
+             * -- stays an error. */
+            if (!agg_ok && !grow_dead && tail_count) {
+                uint64_t share = 0;
+                int fresh = 1;
+
+                for (uint32_t b = tail_first; b < tail_first + tail_count; ++b) {
+                    if (bg_owner_expected[b] != z)
+                        continue;
+                    share += bg_data_cnt[b];
+                    if (bg_free_cached[b] != bg_data_cnt[b])
+                        fresh = 0;
+                }
+                if (share && fresh && cetrafs_le64(zg.free_data_blocks) + share == zg_free_truth[z]) {
+                    printf("note: Zone Group %u's free count does not yet include the %" PRIu64
+                           " blocks of the Block Groups the last grow added -- a grow interrupted after it published "
+                           "(the next mount re-attach reconciles it)\n",
+                           z, share);
+                    agg_ok = 1;
+                }
+            }
 
             if (agg_ok && pool_ok && !grow_dead)
                 continue;

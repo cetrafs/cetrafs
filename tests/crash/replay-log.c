@@ -27,6 +27,13 @@
  *       print the number of FLUSH/FUA barriers in the log
  *   replay-log --log <logdev> --count-marks
  *       print each mark's name and its barrier ordinal
+ *   replay-log --log <logdev> --entry-of-mark NAME
+ *       print the log entry index of mark NAME (the prefix bound for it)
+ *   replay-log --log <logdev> --count-entries
+ *       print the number of log entries (one per bio)
+ *   replay-log --log <logdev> --replay <dev> --limit-entries N
+ *       replay the first N entries: a power cut between two WRITES, not
+ *       only between barriers (the grow crash rig needs that granularity)
  *   replay-log --log <logdev> --replay <dev> [--limit-fua N | --end-mark NAME]
  *       replay onto <dev>: all entries, or up to and including the Nth
  *       FLUSH/FUA barrier, or up to the entry just before mark NAME
@@ -364,9 +371,10 @@ static int check_flushed(int logfd, uint64_t nr_entries, uint32_t ss, const char
 int main(int argc, char **argv)
 {
     const char *logpath = NULL, *replaypath = NULL, *end_mark = NULL;
-    long limit_fua = -1, reorder_after = -1;
+    long limit_fua = -1, reorder_after = -1, limit_entries = -1;
     uint64_t data_start_lba = 0, journal_start_lba = 0, journal_blocks = 0;
-    int count_fua = 0, count_marks = 0;
+    int count_fua = 0, count_marks = 0, count_entries = 0;
+    const char *entry_of_mark = NULL;
     const char *check_mark = NULL;
 
     for (int i = 1; i < argc; i++) {
@@ -376,6 +384,12 @@ int main(int argc, char **argv)
             replaypath = argv[++i];
         else if (!strcmp(argv[i], "--limit-fua") && i + 1 < argc)
             limit_fua = strtol(argv[++i], NULL, 10);
+        else if (!strcmp(argv[i], "--limit-entries") && i + 1 < argc)
+            limit_entries = strtol(argv[++i], NULL, 10);
+        else if (!strcmp(argv[i], "--count-entries"))
+            count_entries = 1;
+        else if (!strcmp(argv[i], "--entry-of-mark") && i + 1 < argc)
+            entry_of_mark = argv[++i];
         else if (!strcmp(argv[i], "--end-mark") && i + 1 < argc)
             end_mark = argv[++i];
         else if (!strcmp(argv[i], "--reorder-after-fua") && i + 1 < argc)
@@ -487,6 +501,19 @@ int main(int argc, char **argv)
         off_t blk_bytes = (off_t) nr * ss;
         int is_barrier = (flags & (LOG_FLUSH_FLAG | LOG_FUA_FLAG)) != 0;
 
+        if (entry_of_mark && (flags & LOG_MARK_FLAG) && data_len) {
+            char name[256];
+            size_t n = data_len < sizeof(name) - 1 ? data_len : sizeof(name) - 1;
+            if (!read_at(logfd, name, n, pos + 32)) {
+                name[n] = '\0';
+                if (!strcmp(name, entry_of_mark)) {
+                    printf("%llu\n", (unsigned long long) i);
+                    close(logfd);
+                    return 0;
+                }
+            }
+        }
+
         if (count_marks && (flags & LOG_MARK_FLAG) && data_len) {
             char name[256];
             size_t n = data_len < sizeof(name) - 1 ? data_len : sizeof(name) - 1;
@@ -550,6 +577,8 @@ int main(int argc, char **argv)
          * so it does not advance past any data -- only the header region.
          * Treating it like a write desyncs the whole log (mkfs issues TRIM). */
         pos = data_off + ((flags & LOG_DISCARD_FLAG) ? 0 : blk_bytes);
+        if (limit_entries >= 0 && (long) (i + 1) >= limit_entries)
+            break; /* replayed the first N entries, a cut between two writes */
     }
 
     if (replayfd >= 0) {
@@ -559,8 +588,14 @@ int main(int argc, char **argv)
     free(data);
     close(logfd);
 
+    if (entry_of_mark) {
+        fprintf(stderr, "no mark named '%s' in the log\n", entry_of_mark);
+        return 1;
+    }
     if (count_fua)
         printf("%llu\n", (unsigned long long) fua_seen);
+    else if (count_entries)
+        printf("%llu\n", (unsigned long long) nr_entries);
     else if (replaypath)
         fprintf(stderr, "replayed %llu block-write entries (through %llu barrier[s])\n",
                 (unsigned long long) applied, (unsigned long long) fua_seen);

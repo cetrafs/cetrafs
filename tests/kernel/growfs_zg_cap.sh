@@ -14,10 +14,20 @@
 # exist, so the count never changes and the cap is never reached by
 # growing (docs/internal/BG-OWNERSHIP-DESIGN.md).
 #
-# This suite now asserts that absence of a special case. At the cap, a
-# grow must behave exactly as anywhere else: Zone Group count unchanged,
+# This suite asserts that absence of a special case. At the cap, a grow
+# must behave exactly as anywhere else: Zone Group count unchanged,
 # Block Group count up, the new capacity SPREAD rather than piled onto
 # one group, data intact, fsck clean.
+#
+# "Spread" is measured as the number of Zone Groups whose block_groups
+# count RISES across the grow (procfs, before and after). A volume at
+# the cap already has ~25 groups with two Block Groups each, so a count
+# of groups holding more than one would pass before any grow happened.
+#
+# DISCRIMINATION: CETRAFS_GROWFS_TEST_FOLD_LAST folds every new Block
+# Group onto the last Zone Group, the old behaviour. The control runs a
+# second cap volume that way and requires the same measurement to see
+# exactly one group gain capacity.
 #
 # Reaching 255 Zone Groups needs more than 127 GiB of nominal capacity
 # (255 x one 512 MiB Block Group, at minimum), so this builds a
@@ -38,6 +48,21 @@ DUMP="$(ct_tmp growzgcapdump)"
 ct_track file "$DUMP.dig"
 
 sbval() { sed -n "s/^$1=//p" "$DUMP" | head -1; }
+
+# zg_members <device>: "zg-number block-group-count" for each Zone Group,
+# read from procfs. Needs the volume mounted, and then it is.
+zg_members() {
+    local info
+    info="$(cat "/proc/fs/cetrafs/$(basename "$1")/info")"
+    awk '/^  zg [0-9]+:/ { z = $2; sub(":", "", z) }
+         /block_groups=/ { n = $0; sub(/.*block_groups=/, "", n); sub(/ .*/, "", n); print z, n }' <<<"$info"
+}
+
+# gained <before-file> <after-file>: how many Zone Groups have MORE Block
+# Groups after the grow than before.
+gained() {
+    awk 'NR == FNR { b[$1] = $2; next } ($2 + 0 > b[$1] + 0) { n++ } END { print n + 0 }' "$1" "$2"
+}
 
 log "formatting 140 GiB of a 200 GiB device with the maximum $MAX_ZG Zone Groups"
 if out="$(ct_mkfs "$DEV" -s 140G -b 512 -z "$MAX_ZG" -J 0 -N 4096 -f 2>&1)"; then
@@ -65,6 +90,7 @@ for i in 0 1 2 3 4 5 6 7; do
 done
 sync
 ( cd "$MNT" && md5sum d/* > /dev/null ) && ( cd "$MNT" && md5sum d/* > "$DUMP.dig" )
+zg_members "$DEV" > "$DUMP.zg.before"
 ct_umount "$MNT"
 
 log "growing to the full device, with no room for new Zone Groups"
@@ -94,23 +120,15 @@ require_cetrafs_mount "$MNT"
 ( cd "$MNT" && md5sum -c --quiet "$DUMP.dig" ) && pass "data survived the capped grow" ||
     fail "data did not survive the capped grow"
 
-# The last Zone Group is the one that must have absorbed the new Block
-# Groups. procfs reports each ZG's span, so the fold is observable
-# rather than inferred from the counts alone.
-if info="$(cat "/proc/fs/cetrafs/$(basename "$DEV")/info" 2>/dev/null)"; then
-    # The new capacity must be SPREAD, not piled on one group. Counting
-    # how many Zone Groups hold more than one Block Group is the direct
-    # way to see that: under the old fold branch exactly one would have
-    # grown, and every other would still hold its single Block Group.
-    multi="$(printf '%s' "$info" | grep -oE 'block_groups=[0-9]+' | grep -oE '[0-9]+' |
-        awk '$1 > 1 {n++} END {print n+0}')"
-    if [ "${multi:-0}" -gt 1 ]; then
-        pass "the added Block Groups were spread across $multi Zone Groups, not folded into one"
-    else
-        fail "only ${multi:-0} Zone Group(s) gained a Block Group -- the capacity was piled onto one"
-    fi
+# The added Block Groups must be SPREAD: the number of Zone Groups that
+# gained one, and the total they gained, must account for the growth.
+zg_members "$DEV" > "$DUMP.zg.after"
+G="$(gained "$DUMP.zg.before" "$DUMP.zg.after")"
+added="$(awk 'NR == FNR { b += $2; next } { a += $2 } END { print a - b }' "$DUMP.zg.before" "$DUMP.zg.after")"
+if [ "$added" = "$((bg_after - bg_before))" ] && [ "$G" -gt 1 ]; then
+    pass "the $added added Block Groups were spread across $G Zone Groups, not folded into one"
 else
-    skip "procfs info unavailable -- cannot observe the fold directly"
+    fail "the capacity was not spread: $G Zone Group(s) gained $added Block Group(s) (expected $((bg_after - bg_before)) in more than one group)"
 fi
 
 # And the new space has to be usable, not merely counted.
@@ -120,5 +138,35 @@ dd if=/dev/urandom of="$MNT/after_grow" bs=1M count=8 status=none &&
 sync
 ct_umount "$MNT"
 ct_fsck "$DEV" >/dev/null 2>&1 && pass "clean at the end" || fail "not clean at the end"
+
+# ---- the control: the same measurement must see a fold
+#
+# A second cap volume, grown with the old fold behaviour switched on. If
+# the gain count does not come out as exactly one, the measurement above
+# cannot tell a spread from a pile and the spread assertion proves
+# nothing.
+FOLD_DEV="$(ct_sparse_dev 200000 growzgfold)"
+if out="$(ct_mkfs "$FOLD_DEV" -s 140G -b 512 -z "$MAX_ZG" -J 0 -N 4096 -f 2>&1)"; then
+    ct_mount "$FOLD_DEV" "$MNT"
+    require_cetrafs_mount "$MNT"
+    zg_members "$FOLD_DEV" > "$DUMP.fold.before"
+    ct_umount "$MNT"
+    if out="$(CETRAFS_GROWFS_TEST_FOLD_LAST=1 ct_growfs "$FOLD_DEV" 2>&1)"; then
+        ct_mount "$FOLD_DEV" "$MNT"
+        require_cetrafs_mount "$MNT"
+        zg_members "$FOLD_DEV" > "$DUMP.fold.after"
+        ct_umount "$MNT"
+        FG="$(gained "$DUMP.fold.before" "$DUMP.fold.after")"
+        if [ "$FG" = 1 ]; then
+            pass "control: a grow that folds the Block Groups onto the last Zone Group is seen as one group gaining ($FG)"
+        else
+            fail "control: a folded grow reads as $FG Zone Groups gaining capacity -- the spread check does not discriminate"
+        fi
+    else
+        fail "control: the folded grow failed: $(printf '%s' "$out" | tail -1)"
+    fi
+else
+    fail "control: mkfs of the control volume failed: $(printf '%s' "$out" | tail -1)"
+fi
 
 ct_exit

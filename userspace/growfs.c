@@ -761,6 +761,10 @@ int main(int argc, char **argv)
      * are on the platter first, and fsync'd before the tables that name
      * them are written.
      * --------------------------------------------------------------- */
+    /* TEST-ONLY: leave the new Block Groups' headers and bitmaps unwritten.
+     * A grow that publishes over them is what the crash rig must catch. */
+    const bool skip_bg_hdr = cetrafs_test_env("CETRAFS_GROWFS_TEST_SKIP_BG_HEADERS");
+
     {
         u64 start = new_bg_start;
 
@@ -781,12 +785,12 @@ int main(int argc, char **argv)
                                                             sizeof(cetrafs_le64(bh.checksum))));
 
             memcpy(blk, &bh, sizeof(bh));
-            write_block(fd, start, blk, true);
+            write_block(fd, start, blk, !skip_bg_hdr);
 
             /* A stale bitmap from a previous filesystem at these offsets
              * would read as "allocated" and silently cost the volume the
              * space, so these are really zeroed, not assumed zero. */
-            zero_blocks(fd, start + off_bmap32, cetrafs_calc_bg_dbm_blocks(bg_size), true);
+            zero_blocks(fd, start + off_bmap32, cetrafs_calc_bg_dbm_blocks(bg_size), !skip_bg_hdr);
             start += bg_size;
         }
     }
@@ -836,6 +840,11 @@ int main(int argc, char **argv)
             continue;
         }
         bg_owner[b] = (u32) (b % old_z);
+        /* TEST-ONLY: fold every new Block Group onto the last Zone Group,
+         * the behaviour the 255-ZG branch used to have. The spread check
+         * in tests/kernel/growfs_zg_cap.sh must see it. */
+        if (cetrafs_test_env("CETRAFS_GROWFS_TEST_FOLD_LAST"))
+            bg_owner[b] = old_z - 1;
         zg_added[bg_owner[b]]++;
     }
 
@@ -905,7 +914,7 @@ int main(int argc, char **argv)
                 bh.checksum = cetrafs_cpu_to_le64(crc32c_struct(
                     &bh, sizeof(bh), offsetof(cetrafs_bg_header_t, checksum), sizeof(cetrafs_le64(bh.checksum))));
                 memcpy(blk, &bh, sizeof(bh));
-                write_block(fd, start, blk, true);
+                write_block(fd, start, blk, !skip_bg_hdr);
             }
             start += bg_size;
         }
@@ -938,6 +947,21 @@ int main(int argc, char **argv)
      * device. Rule 8: the reference may not become durable before what
      * it refers to, and a dirty page is not written. */
     sync_device(fd, true);
+
+    /* TEST-ONLY: damage what the grow must not damage. Zeroing the
+     * pending-free queue of Zone Group 0, or every node's journal, is the
+     * outcome of a grow that relocated a region and lost it. The
+     * tests/kernel/growfs_pending_queue.sh and grow_dead_journal.sh
+     * assertions must see the loss. */
+    if (cetrafs_test_env("CETRAFS_GROWFS_TEST_CLOBBER_PENDING")) {
+        zero_blocks(fd, cetrafs_le64(sb.pending_free_start), cetrafs_le32(sb.pending_free_blocks_per_zg), true);
+        sync_device(fd, true);
+    }
+    if (cetrafs_test_env("CETRAFS_GROWFS_TEST_CLOBBER_JOURNAL")) {
+        zero_blocks(fd, cetrafs_le64(sb.node_journal_start),
+                    (u64) cetrafs_le32(sb.node_table_count) * cetrafs_le32(sb.node_journal_blocks), true);
+        sync_device(fd, true);
+    }
 
     /* ---------------------------------------------------------------
      * STEP 3: publish.
@@ -1213,10 +1237,15 @@ int main(int argc, char **argv)
      * a peer has cached stays at the address it cached. The
      * pending-free region likewise stays put: it is indexed by Zone
      * Group, so it cannot grow either. */
+    /* TEST-ONLY: leave the Zone Group credits out, which is the state a
+     * crash after the publish leaves; tests/image/fsck_grow_window.sh
+     * needs it on an image. */
+    const bool skip_agg = cetrafs_test_env("CETRAFS_GROWFS_TEST_NO_AGGREGATE") != NULL;
+
     for (u32 z = 0; z < new_z; ++z) {
         cetrafs_zone_group_t zg;
 
-        if (!zg_added[z])
+        if (!zg_added[z] || skip_agg)
             continue;
         read_block(fd, cetrafs_le64(sb.zg_table_start) + z, blk);
         memcpy(&zg, blk, sizeof(zg));

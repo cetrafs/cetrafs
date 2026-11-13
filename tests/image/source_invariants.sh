@@ -1287,6 +1287,9 @@ inode.c:cetrafs_inode_label_may_be_stale order-that-fails-toward-a-re-read
 c29_scan() { # <dir>: prints file:function for every real-clock read
     local f
     for f in "$1"/*.c; do
+        # modpost writes cetrafs.mod.c into the tree on every module build.
+        # It is generated boilerplate, not source, and it reads the clock.
+        case "$f" in *.mod.c) continue ;; esac
         awk -v F="$(basename "$f")" '
             /^[a-z].*\(/ && !/;$/ { fn = $0; sub(/\(.*/, "", fn); sub(/.* \**/, "", fn) }
             /^[[:space:]]*(\*|\/\*)/ { next }
