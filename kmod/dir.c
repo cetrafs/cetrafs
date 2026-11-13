@@ -1095,7 +1095,20 @@ int cetrafs_dir_add_entry(struct inode *dir, const struct qstr *name, u64 ino, u
  * out_ino/out_file_type. Returns 0, or a negative errno (-ENOENT if no
  * dirent matches).
  */
-int cetrafs_dir_remove_entry(struct inode *dir, const struct qstr *name, u64 *out_ino, u8 *out_file_type)
+/* TEST ONLY: the next unlink pauses between verifying its name and
+ * removing it (ms, one-shot), so a name retargeted on the device in that
+ * gap reaches cetrafs_dir_remove_entry() -- and remove_expect_off, the
+ * control, lets that remove through.
+ * tests/kernel/remove_names_locked_inode.sh. */
+static unsigned int cetrafs_unlink_verify_stall_ms;
+cetrafs_test_param(unlink_verify_stall_ms, cetrafs_unlink_verify_stall_ms, uint, 0644);
+MODULE_PARM_DESC(unlink_verify_stall_ms, "TEST ONLY: pause the next unlink between its name check and its remove");
+static bool cetrafs_remove_expect_off;
+cetrafs_test_param(remove_expect_off, cetrafs_remove_expect_off, bool, 0644);
+MODULE_PARM_DESC(remove_expect_off, "TEST ONLY: a dirent remove does not check it names the locked inode");
+
+int cetrafs_dir_remove_entry(struct inode *dir, const struct qstr *name, u64 expect_ino, u64 *out_ino,
+                             u8 *out_file_type)
 {
     unsigned int dirents_per_block = CETRAFS_DIRENTS_PER_BLOCK;
     struct cetrafs_dir_extents dx;
@@ -1156,6 +1169,25 @@ int cetrafs_dir_remove_entry(struct inode *dir, const struct qstr *name, u64 *ou
 
     if (!slot)
         return -ENOENT;
+
+    /*
+     * Only the name of the inode the caller holds the namespace lock of.
+     * A name of X is added, removed or moved only under X's own lock,
+     * and the online recount relies on it: it counts X's names across
+     * the volume, and a count of 0 frees X (cetrafs_ns_count_names()).
+     * Removing a name that resolved to some other inode -- unlocked --
+     * broke that, and the callers then had a "mismatch branch" adjusting
+     * a record they held no lock on. The caller verified the name under
+     * the parent's lock, so this cannot happen; if it does, nothing is
+     * written and the operation fails as a lost race.
+     */
+    if (cetrafs_le64(slot->inode) != expect_ino && !READ_ONCE(cetrafs_remove_expect_off)) {
+        pr_warn_ratelimited("dir ino=%llu: '%.*s' names ino=%llu, not the locked ino=%llu -- refusing the remove\n",
+                            (unsigned long long) dir->i_ino, (int) name->len, name->name,
+                            (unsigned long long) cetrafs_le64(slot->inode), (unsigned long long) expect_ino);
+        brelse(bh);
+        return -ESTALE;
+    }
 
     *out_ino = cetrafs_le64(slot->inode);
     *out_file_type = slot->file_type;
@@ -2283,6 +2315,14 @@ static int cetrafs_unlink_locked(struct inode *dir, struct dentry *dentry)
     ret = cetrafs_verify_name_resolves(dir, &dentry->d_name, inode);
     if (ret)
         return ret;
+    if (READ_ONCE(cetrafs_unlink_verify_stall_ms)) {
+        unsigned int pause = xchg(&cetrafs_unlink_verify_stall_ms, 0);
+
+        if (pause) {
+            pr_info("unlink: name verified, pausing %u ms (test)\n", pause);
+            msleep(pause); /* test-only; see the parameter */
+        }
+    }
 
     /* nlink is a namespace-level property -- any node's link()/unlink()
      * on any name of this inode can change it, not just operations on
@@ -2325,34 +2365,19 @@ static int cetrafs_unlink_locked(struct inode *dir, struct dentry *dentry)
             return -ETXTBSY;
     }
 
-    ret = cetrafs_dir_remove_entry(dir, &dentry->d_name, &ino, &file_type);
+    ret = cetrafs_dir_remove_entry(dir, &dentry->d_name, inode->i_ino, &ino, &file_type);
     if (ret)
         return ret;
 
     /*
-     * Re-read only if the name resolved to something other than the
-     * inode we verified and locked.
-     *
-     * For the ordinary case -- and after cetrafs_verify_name_resolves()
-     * above, it is the only case -- `raw` is already this inode's
-     * record, read fresh a few lines up, and nothing can have changed
-     * it since: this node holds that inode's OWN namespace lock, so no
-     * peer may touch it, and cetrafs_dir_remove_entry() writes the
-     * parent's dirent block and the parent's record, never the
-     * victim's. A forced-fresh re-read there is a device round trip
-     * (tens of milliseconds on a real LUN) spent confirming what the
-     * lock already guarantees.
-     *
-     * The mismatch branch is kept rather than asserted away: it is
-     * cheap, and "the lock guarantees it" is exactly the kind of
-     * reasoning that should still have a fallback.
+     * The entry named the inode we verified and locked
+     * (cetrafs_dir_remove_entry() refuses any other), so `raw` is
+     * already this inode's record, read fresh a few lines up, and
+     * nothing can have changed it since: this node holds that inode's
+     * OWN namespace lock, so no peer may touch it, and
+     * cetrafs_dir_remove_entry() writes the parent's dirent block and
+     * the parent's record, never the victim's.
      */
-    if (ino != inode->i_ino) {
-        cetrafs_invalidate_raw_inode(dir->i_sb, ino);
-        ret = cetrafs_read_raw_inode(dir->i_sb, ino, &raw);
-        if (ret)
-            return ret;
-    }
 
     if (cetrafs_le32(raw.nlink) > 0)
         raw.nlink = cetrafs_cpu_to_le32(cetrafs_le32(raw.nlink) - 1);
@@ -2366,24 +2391,8 @@ static int cetrafs_unlink_locked(struct inode *dir, struct dentry *dentry)
      * that's deferred to actual VFS eviction, not this nlink-drops-to-0
      * moment.
      *
-     * Staged for the namespace lock's release when this really is the
-     * inode the lock set was built from. It may not be: the entry we
-     * removed can name a different inode than the dentry cached (see
-     * the re-read above), and staging on 'inode' would then publish
-     * this record over the wrong one. */
-    if (ino == inode->i_ino) {
-        cetrafs_inode_stage_record(inode, &raw, /*fd_too=*/false);
-    } else {
-        /* Mismatch branch: a record we hold NO lock on -- the decrement
-         * must be a namespace-sector CAS applied to the live value, never
-         * a whole-record write (which would also revert that record's
-         * presence bits and any concurrent accumulator change). */
-        struct cetrafs_ns_delta d = {.nlink_delta = -1, .ctime = cetrafs_le64(raw.ctime)};
-
-        ret = cetrafs_inode_ns_cas(dir->i_sb, ino, cetrafs_le64(raw.generation), &raw, cetrafs_ns_apply_delta, &d);
-        if (ret)
-            return ret;
-    }
+     * Staged for the namespace lock's release. */
+    cetrafs_inode_stage_record(inode, &raw, /*fd_too=*/false);
 
     /* Sync the in-core link count to the ABSOLUTE value just computed
      * from the forced-fresh on-disk read -- not a relative drop_nlink()
@@ -2394,13 +2403,8 @@ static int cetrafs_unlink_locked(struct inode *dir, struct dentry *dentry)
      * actual free on inode->i_nlink: a last unlink that computes disk
      * nlink=0 but drops a stale-high cached count to 1 leaves the file
      * with no names yet UNFREED -- "allocated but no directory entry --
-     * unreachable" on a 3-node run ([create,link,unlink]).
-     * Only when the entry named the inode we locked; the mismatch branch
-     * above already wrote a different 'ino', and 'inode' is stale there. */
-    if (ino == inode->i_ino)
-        set_nlink(inode, cetrafs_le32(raw.nlink));
-    else
-        drop_nlink(inode);
+     * unreachable" on a 3-node run ([create,link,unlink]). */
+    set_nlink(inode, cetrafs_le32(raw.nlink));
     inode_set_ctime(inode, ktime_get_real_seconds(), 0);
 
     return 0;
@@ -2494,32 +2498,17 @@ static int cetrafs_rmdir_locked(struct inode *dir, struct dentry *dentry)
     if (ret)
         return ret;
 
-    ret = cetrafs_dir_remove_entry(dir, &dentry->d_name, &ino, &file_type);
+    ret = cetrafs_dir_remove_entry(dir, &dentry->d_name, inode->i_ino, &ino, &file_type);
     if (ret)
         return ret;
-    if (ino != inode->i_ino) {
-        ret = cetrafs_rmdir_read_victim(dir->i_sb, ino, &raw);
-        if (ret)
-            return ret;
-    }
 
     /* Persist nlink=0 but never free blocks/the inode number here -- see
      * super_ops.c's cetrafs_evict_inode() for why that's deferred to
      * actual VFS eviction, not this point. Staged for the namespace
-     * lock's release, but only when this is the inode the lock set was
-     * built from -- see cetrafs_unlink_locked(). */
+     * lock's release (the entry named the locked inode:
+     * cetrafs_dir_remove_entry() refuses any other). */
     raw.nlink = 0;
-    if (ino == inode->i_ino) {
-        cetrafs_inode_stage_record(inode, &raw, /*fd_too=*/false);
-    } else {
-        /* Unlocked record: sector-0 CAS, same reasoning as unlink's
-         * mismatch branch. */
-        struct cetrafs_ns_delta d = {.set_nlink_zero = true, .ctime = (u64) ktime_get_real_seconds()};
-
-        ret = cetrafs_inode_ns_cas(dir->i_sb, ino, cetrafs_le64(raw.generation), &raw, cetrafs_ns_apply_delta, &d);
-        if (ret)
-            return ret;
-    }
+    cetrafs_inode_stage_record(inode, &raw, /*fd_too=*/false);
 
     clear_nlink(inode);
     inode_set_ctime(inode, ktime_get_real_seconds(), 0);
@@ -3001,7 +2990,8 @@ static int cetrafs_rename_locked(struct mnt_idmap *idmap,
      */
     removed_first = old_file_type == CETRAFS_FT_DIR;
     if (removed_first) {
-        ret = cetrafs_dir_remove_entry(old_dir, &old_dentry->d_name, &discard_ino, &discard_file_type);
+        ret = cetrafs_dir_remove_entry(old_dir, &old_dentry->d_name, old_inode->i_ino, &discard_ino,
+                                       &discard_file_type);
         if (ret)
             goto out_uncount;
         if (cetrafs_ns_step_gap_ms)
@@ -3095,7 +3085,8 @@ static int cetrafs_rename_locked(struct mnt_idmap *idmap,
 
         /* A failure from here on leaves the file with both names and the
          * count that says so: consistent, so nothing is given back. */
-        ret = cetrafs_dir_remove_entry(old_dir, &old_dentry->d_name, &discard_ino, &discard_file_type);
+        ret = cetrafs_dir_remove_entry(old_dir, &old_dentry->d_name, old_inode->i_ino, &discard_ino,
+                                       &discard_file_type);
         if (ret)
             goto out;
     }
