@@ -534,7 +534,7 @@ static int cetrafs_proc_cluster_show(struct seq_file *m, void *v)
                 break;
             continue;
         }
-        if (ne.state == CETRAFS_NODE_STATE_FREE)
+        if (cetrafs_le32(ne.state) == CETRAFS_NODE_STATE_FREE)
             continue;
         if (cetrafs_le32(ne.state) == CETRAFS_NODE_STATE_REPAIR) {
             /* Not a node: an offline repairer holding the volume. Shown

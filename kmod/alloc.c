@@ -1837,7 +1837,7 @@ static int cetrafs_bg_count_mutate(void *image, unsigned int len, void *priv)
      * zero-by-construction invariant cetrafs_bg_image_crc() rests on),
      * same as every node-row mutator does for its region. */
     memset((u8 *) image + offsetof(cetrafs_block_group_t, pad), 0, len - offsetof(cetrafs_block_group_t, pad));
-    bg->checksum = 0;
+    bg->checksum = cetrafs_cpu_to_le64(0);
     bg->checksum = cetrafs_cpu_to_le64(cetrafs_bg_image_crc(image, len));
     return 0;
 }
@@ -3688,7 +3688,7 @@ static int cetrafs_bg_gen_mutate(void *image, unsigned int len, void *priv)
     bg->free_gen = cetrafs_cpu_to_le64(cetrafs_le64(bg->free_gen) + 1);
     ctx->out_gen = cetrafs_le64(bg->free_gen);
     memset((u8 *) image + offsetof(cetrafs_block_group_t, pad), 0, len - offsetof(cetrafs_block_group_t, pad));
-    bg->checksum = 0;
+    bg->checksum = cetrafs_cpu_to_le64(0);
     bg->checksum = cetrafs_cpu_to_le64(cetrafs_bg_image_crc(image, len));
     return 0;
 }
@@ -4112,7 +4112,7 @@ static int cetrafs_bg_claim_mutate(void *image, unsigned int len, void *priv)
      * in-sector tail past the real fields is zero by construction, and
      * cetrafs_bg_image_crc() rests on that. */
     memset((u8 *) image + offsetof(cetrafs_block_group_t, pad), 0, len - offsetof(cetrafs_block_group_t, pad));
-    bg->checksum = 0;
+    bg->checksum = cetrafs_cpu_to_le64(0);
     bg->checksum = cetrafs_cpu_to_le64(cetrafs_bg_image_crc(image, len));
     return 0;
 }
@@ -4194,7 +4194,7 @@ static int cetrafs_bg_release_mutate(void *image, unsigned int len, void *priv)
     else
         bg->flags = cetrafs_cpu_to_le16(cetrafs_le16(bg->flags) & ~CETRAFS_BG_FLAG_DISCARDED);
     memset((u8 *) image + offsetof(cetrafs_block_group_t, pad), 0, len - offsetof(cetrafs_block_group_t, pad));
-    bg->checksum = 0;
+    bg->checksum = cetrafs_cpu_to_le64(0);
     bg->checksum = cetrafs_cpu_to_le64(cetrafs_bg_image_crc(image, len));
     return 0;
 }
@@ -4372,7 +4372,7 @@ static int cetrafs_bg_dpend_mutate(void *image, unsigned int len, void *priv)
         return 1; /* already so */
     bg->flags = cetrafs_cpu_to_le16(f);
     memset((u8 *) image + offsetof(cetrafs_block_group_t, pad), 0, len - offsetof(cetrafs_block_group_t, pad));
-    bg->checksum = 0;
+    bg->checksum = cetrafs_cpu_to_le64(0);
     bg->checksum = cetrafs_cpu_to_le64(cetrafs_bg_image_crc(image, len));
     return 0;
 }

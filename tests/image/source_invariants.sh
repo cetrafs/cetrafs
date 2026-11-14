@@ -2662,4 +2662,44 @@ grep -q 'task_work_add(' "$K/nslock.c" || fail "L-F6: setup: no task_work in nsl
 lf6_ok "$K/nslock.c" && pass "L-F6: unload waits a tasks-RCU grace period, and only a build with it queues the work" ||
     fail "L-F6: nslock.c queues a module task_work that unload does not wait out"
 
+# C11 (audit 2026-11-14): an on-disk __le field stored to, or compared with,
+# a bare constant. sparse (make endian-check) passes a ZERO constant, and a
+# non-zero one reads the same on a little-endian host, so both reach a
+# big-endian build silently. tests/image/le_const_scan.py resolves each
+# member chain's base type and each designated initialiser against the
+# struct definitions in include/cetrafs.h, and reports every bare store or
+# compare. The real tree must come back clean; a planted tree with known
+# violations, and one correctly converted line, must yield exactly the
+# planted violations.
+log "checking no on-disk __le field is stored to or compared with a bare constant (C11)"
+LE_SCAN="$ROOT/tests/image/le_const_scan.py"
+LE_REAL="$(python3 "$LE_SCAN" "$ROOT" 2>&1 || true)"
+[ -z "$LE_REAL" ] && pass "C11: every __le field store and compare in kmod/, userspace/ and include/ converts" ||
+    fail "C11: bare __le store or compare: $(echo "$LE_REAL" | head -3 | tr '\n' ' ')"
+
+LE_P="$(ct_tmp le-plant)"
+rm -f "$LE_P"
+mkdir -p "$LE_P/include" "$LE_P/kmod"
+cp "$ROOT/include/cetrafs.h" "$LE_P/include/cetrafs.h"
+cat >"$LE_P/kmod/planted.c" <<'PLANT'
+/* negative control: four bare stores, compares and initialisers, and one converted line */
+static void planted(cetrafs_inode_t *raw, cetrafs_node_journal_hdr_t *hdr)
+{
+    raw->lock_mode = CETRAFS_LOCK_NONE;
+    hdr->state = 0;
+    if (raw->lock_mode == CETRAFS_LOCK_NONE)
+        return;
+    cetrafs_inode_t tmp = {.lock_mode = CETRAFS_LOCK_NONE};
+    hdr->state = cetrafs_cpu_to_le32(CETRAFS_LOCK_NONE);
+    if (cetrafs_le32(raw->lock_mode) == CETRAFS_LOCK_NONE)
+        return;
+}
+PLANT
+LE_PLANT="$(python3 "$LE_SCAN" "$LE_P" 2>&1 || true)"
+LE_N="$(printf '%s\n' "$LE_PLANT" | grep -c 'planted.c:[0-9]*: ' || true)"
+[ "$LE_N" = 4 ] && ! grep -qE 'planted.c:(9|10):' <<<"$LE_PLANT" &&
+    pass "C11: control -- the four planted bare accesses are found, the converted line is not" ||
+    fail "C11: control -- planted tree gave $LE_N finding(s), want 4 (not the converted line): $(echo "$LE_PLANT" | tr '\n' ' ')"
+rm -rf "$LE_P"
+
 ct_exit

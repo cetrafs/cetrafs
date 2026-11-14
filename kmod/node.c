@@ -46,7 +46,7 @@ static u32 cetrafs_node_crc(const cetrafs_node_entry_t *ne)
 {
     cetrafs_node_entry_t tmp = *ne;
 
-    tmp.checksum = 0;
+    tmp.checksum = cetrafs_cpu_to_le64(0);
     return ~crc32c(~0U, &tmp, sizeof(tmp));
 }
 
@@ -280,7 +280,7 @@ static int cetrafs_node_claim_mutate(void *image, unsigned int len, void *priv)
      * whose machine left CLEANLY (departure == CLEAN): its claims were
      * released and its journal parked, and with no FREE row the volume
      * would otherwise refuse every new machine for good (audit O11). */
-    if (ne.state != CETRAFS_NODE_STATE_FREE &&
+    if (cetrafs_le32(ne.state) != CETRAFS_NODE_STATE_FREE &&
         !(ctx->recycle && cetrafs_le32(ne.state) == CETRAFS_NODE_STATE_REGISTERED &&
           cetrafs_le32(ne.departure) == CETRAFS_NODE_DEPART_CLEAN))
         return -EEXIST;
@@ -385,7 +385,7 @@ static int cetrafs_node_reattach_mutate(void *image, unsigned int len, void *pri
     /* No frees of ours are in flight: the incarnation that set the flag
      * is gone, and so is anything it was going to free. frees_seq keeps
      * counting, so a scrub that saw the old value still sees a change. */
-    ne.frees_inflight = 0;
+    ne.frees_inflight = cetrafs_cpu_to_le32(0);
 
     /* fence_epoch (and everything else) rides through untouched, and the
      * value reported back to the caller is the one in the image this swap
@@ -1018,7 +1018,7 @@ int cetrafs_node_register(struct super_block *sb,
         if (ret)
             return ret;
 
-        if (ne.state == CETRAFS_NODE_STATE_FREE) {
+        if (cetrafs_le32(ne.state) == CETRAFS_NODE_STATE_FREE) {
             any_free = true;
             continue;
         }
@@ -1319,7 +1319,7 @@ static int cetrafs_node_frees_mutate(void *image, unsigned int len, void *priv)
         ne.frees_inflight = cetrafs_cpu_to_le32(1);
         ne.frees_seq = cetrafs_cpu_to_le32(cetrafs_le32(ne.frees_seq) + 1);
     } else {
-        ne.frees_inflight = 0;
+        ne.frees_inflight = cetrafs_cpu_to_le32(0);
     }
     cetrafs_node_image_commit(image, len, &ne);
     return 0;

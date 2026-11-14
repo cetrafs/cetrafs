@@ -643,7 +643,7 @@ int cetrafs_inode_ns_cas(struct super_block *sb,
 static void cetrafs_ns_apply_zero_nlink(cetrafs_inode_t *rec, void *arg)
 {
     (void) arg;
-    rec->nlink = 0;
+    rec->nlink = cetrafs_cpu_to_le32(0);
 }
 
 /*
@@ -799,7 +799,7 @@ static int cetrafs_reclaim_mutate(void *image, unsigned int len, void *priv)
          * block goes before its number does (cetrafs_inode_forget_tree()). */
         if (cetrafs_le32(rec.ns_lock_owner) != ctx->me || cetrafs_le64(rec.dirent_seq) != ctx->seq)
             return -ESTALE;
-        rec.xattr_block = 0;
+        rec.xattr_block = cetrafs_cpu_to_le64(0);
         break;
     case CETRAFS_RECLAIM_RELEASE:
         /* Exactly what our claim wrote: a creator's birth claim on the
@@ -1113,11 +1113,11 @@ int cetrafs_inode_forget_tree(struct super_block *sb, u64 ino, u64 generation, u
     if (!ret && (cetrafs_le64(raw->generation) != generation || cetrafs_le32(raw->nlink) != 0))
         ret = -ESTALE;
     if (!ret && (cetrafs_le16(raw->eh.eh_entries) || cetrafs_le16(raw->eh.eh_depth) || raw->size || raw->blocks)) {
-        raw->eh.eh_entries = 0;
-        raw->eh.eh_depth = 0;
+        raw->eh.eh_entries = cetrafs_cpu_to_le16(0);
+        raw->eh.eh_depth = cetrafs_cpu_to_le16(0);
         memset(&raw->et, 0, sizeof(raw->et));
-        raw->size = 0;
-        raw->blocks = 0;
+        raw->size = cetrafs_cpu_to_le64(0);
+        raw->blocks = cetrafs_cpu_to_le64(0);
         /* No fd_pub_mutex, deliberately: this runs inside the eviction of
          * the inode (ilookup would wait on that inode's own I_FREEING),
          * and on the claimed-free path a refresh needs a reference that a
@@ -1467,7 +1467,7 @@ retry:
      * from disk -- no dirent names it -- so this cannot reach it. Same
      * rule ext4 applies in ext4_iget().
      */
-    if (raw.nlink == 0) {
+    if (cetrafs_le32(raw.nlink) == 0) {
         pr_warn_ratelimited(
             "ino=%llu is named by a directory entry but its record says nlink=0 -- "
             "refusing to hand out a deleted file's blocks\n",
@@ -2491,7 +2491,7 @@ static int cetrafs_apply_identity_check(struct inode *inode, const cetrafs_inode
      * too, and is unaffected: it cannot be reached by name, so no
      * refresh path runs for it.
      */
-    if (raw->nlink == 0)
+    if (cetrafs_le32(raw->nlink) == 0)
         return -ESTALE;
 
     if (((inode->i_mode ^ cetrafs_le32(raw->mode)) & S_IFMT) != 0) {

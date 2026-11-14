@@ -2072,14 +2072,14 @@ static int cetrafs_lock_cas_mutate(void *image, unsigned int len, void *priv)
         }
         rec.lock_owner_node = cetrafs_cpu_to_le32(CETRAFS_NODE_ID_NONE);
         rec.lock_owner_incarnation = cetrafs_cpu_to_le32(0);
-        rec.lock_mode = CETRAFS_LOCK_NONE;
+        rec.lock_mode = cetrafs_cpu_to_le32(CETRAFS_LOCK_NONE);
         cetrafs_inode_stamp_crc_ns(&rec);
         memcpy(image, &rec, CETRAFS_INODE_NS_BYTES);
         return 0;
     }
 
     if (ctx->claim) {
-        bool free_now = (rec.lock_mode == CETRAFS_LOCK_NONE);
+        bool free_now = (cetrafs_le32(rec.lock_mode) == CETRAFS_LOCK_NONE);
         /* A steal takes the judged claim only: the stale owner's row AND
          * the incarnation that stamped it. A lock that node took again
          * after re-attaching carries a new incarnation and is a live
@@ -2106,7 +2106,7 @@ static int cetrafs_lock_cas_mutate(void *image, unsigned int len, void *priv)
 
         rec.lock_owner_node = cetrafs_cpu_to_le32(CETRAFS_NODE_ID_NONE);
         rec.lock_owner_incarnation = cetrafs_cpu_to_le32(0);
-        rec.lock_mode = CETRAFS_LOCK_NONE;
+        rec.lock_mode = cetrafs_cpu_to_le32(CETRAFS_LOCK_NONE);
         /* v0x0005: the stat fields live in the FILE sector now and are
          * published by cetrafs_write_vfs_inode()'s own sector-1 CAS at
          * this same close boundary (see cetrafs_lock_release()); this
@@ -2611,7 +2611,7 @@ reread:
         reclaim_from_stale = true;
         stale_owner = cetrafs_le32(raw.lock_owner_node);
         stale_incarnation = cetrafs_le32(raw.lock_owner_incarnation);
-        raw.lock_mode = CETRAFS_LOCK_NONE;
+        raw.lock_mode = cetrafs_cpu_to_le32(CETRAFS_LOCK_NONE);
         raw.lock_owner_node = cetrafs_cpu_to_le32(CETRAFS_NODE_ID_NONE);
     }
 
@@ -2626,7 +2626,7 @@ reread:
      * here and the swap is caught inside it (refuse_readers). A
      * suspended writer -- the source of a handoff -- is not a reader. */
     if (lock_on && want_write && !ci->lock_suspended && !cetrafs_lock_ignore_readers &&
-        (raw.lock_mode == CETRAFS_LOCK_NONE || reclaim_from_stale)) {
+        (cetrafs_le32(raw.lock_mode) == CETRAFS_LOCK_NONE || reclaim_from_stale)) {
         bool reader = false;
 
         ret = cetrafs_foreign_reader_from_raw(sb, inode->i_ino, &raw, my_node_id,
@@ -2654,7 +2654,7 @@ reread:
             goto out_pr_unlock;
         }
     }
-    if (lock_on && want_write && !ci->lock_suspended && (raw.lock_mode == CETRAFS_LOCK_NONE || reclaim_from_stale)) {
+    if (lock_on && want_write && !ci->lock_suspended && (cetrafs_le32(raw.lock_mode) == CETRAFS_LOCK_NONE || reclaim_from_stale)) {
         /* One atomic compare-and-swap carries the whole claim: no
          * write-then-verify-readback, because the swap can only
          * land on the exact record the decision above was made against.
@@ -3199,7 +3199,7 @@ static int cetrafs_lock_publish_and_clear(struct inode *inode, cetrafs_inode_t *
         return ret;
     } else if (!cetrafs_lock_mode_held(cetrafs_le32(raw->lock_mode))) {
         pr_err("lock release: ino=%llu lock_mode=%u, expected EXCLUSIVE -- leaving as-is\n",
-               (unsigned long long) inode->i_ino, raw->lock_mode);
+               (unsigned long long) inode->i_ino, cetrafs_le32(raw->lock_mode));
     } else {
         u32 my_node_id;
 
@@ -6038,7 +6038,7 @@ int cetrafs_lock_defrag_begin(struct inode *inode)
         ret = -ESTALE; /* number reused for a different file meanwhile */
         goto out;
     }
-    if (raw.lock_mode != CETRAFS_LOCK_NONE || raw.nlink == 0) {
+    if (cetrafs_le32(raw.lock_mode) != CETRAFS_LOCK_NONE || cetrafs_le32(raw.nlink) == 0) {
         ret = -EBUSY;
         goto out;
     }

@@ -288,7 +288,7 @@ static inline int cetrafs_node_row_crc_ok(const cetrafs_node_entry_t *ne)
     cetrafs_node_entry_t c = *ne;
     uint32_t want = (uint32_t) cetrafs_le64(c.checksum);
 
-    c.checksum = 0;
+    c.checksum = cetrafs_cpu_to_le64(0);
     return crc32c_struct(&c, sizeof(c), offsetof(cetrafs_node_entry_t, checksum), sizeof(c.checksum)) == want;
 }
 
@@ -407,7 +407,7 @@ static inline off_t cetrafs_node_row_off(const cetrafs_superblock_t *sb, uint32_
 
 static inline void cetrafs_node_row_stamp(cetrafs_node_entry_t *ne)
 {
-    ne->checksum = 0;
+    ne->checksum = cetrafs_cpu_to_le64(0);
     ne->checksum = cetrafs_cpu_to_le64(
         crc32c_struct(ne, sizeof(*ne), offsetof(cetrafs_node_entry_t, checksum), sizeof(ne->checksum)));
 }

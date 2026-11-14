@@ -252,7 +252,7 @@ static int cetrafs_journal_flag_mutate(void *image, unsigned int len, void *priv
     }
     hdr->state = cetrafs_cpu_to_le32(ctx->dirty ? CETRAFS_NODE_JOURNAL_DIRTY : CETRAFS_NODE_JOURNAL_CLEAN);
     hdr->replay_owner = cetrafs_cpu_to_le32(CETRAFS_NODE_ID_NONE); /* 0 is a real node id -- be explicit */
-    hdr->replay_incarnation = 0;
+    hdr->replay_incarnation = cetrafs_cpu_to_le32(0);
     ctx->new_seq = ctx->dirty ? seq : seq + 1;
     hdr->park_seq = cetrafs_cpu_to_le64(ctx->new_seq);
     return 0;
@@ -375,8 +375,8 @@ static int cetrafs_journal_claim_mutate(void *image, unsigned int len, void *pri
         if (ctx->old_only && cetrafs_le32(hdr->replay_incarnation) == ctx->my_incarnation)
             return 1; /* this mount's own replay's */
         hdr->replay_owner = cetrafs_cpu_to_le32(CETRAFS_NODE_ID_NONE);
-        hdr->replay_incarnation = 0;
-        hdr->replay_claimed = 0;
+        hdr->replay_incarnation = cetrafs_cpu_to_le32(0);
+        hdr->replay_claimed = cetrafs_cpu_to_le64(0);
         if (ctx->set_clean) {
             /* A park: entries still in the slots, or landing late, are
              * from before it (cetrafs_node_journal_hdr_t.park_seq). */

@@ -501,10 +501,10 @@ static void fsck_clear_needed_mark(int fd, cetrafs_superblock_t *sb)
         fprintf(stderr, "ERR: block 0 no longer verifies -- leaving the needs-fsck mark\n");
         return;
     }
-    cur.fsck_needed_since = 0;
-    cur.fsck_needed_node = 0;
-    cur.fsck_needed_pad = 0;
-    cur.checksum = 0;
+    cur.fsck_needed_since = cetrafs_cpu_to_le64(0);
+    cur.fsck_needed_node = cetrafs_cpu_to_le32(0);
+    cur.fsck_needed_pad = cetrafs_cpu_to_le32(0);
+    cur.checksum = cetrafs_cpu_to_le64(0);
     cur.checksum = cetrafs_cpu_to_le64(
         crc32c_struct(&cur, sizeof(cur), offsetof(cetrafs_superblock_t, checksum), sizeof(cur.checksum)));
     memcpy(blk, &cur, sizeof(cur));
@@ -703,7 +703,7 @@ static int fsck_bg_claim_for_write(int fd, uint32_t b)
     if (!(flags & CETRAFS_BG_FLAG_DISCARDED))
         return 0;
     bgd.flags = cetrafs_cpu_to_le16(flags & ~CETRAFS_BG_FLAG_DISCARDED);
-    bgd.checksum = 0;
+    bgd.checksum = cetrafs_cpu_to_le64(0);
     bgd.checksum = cetrafs_cpu_to_le64(
         crc32c_struct(&bgd, sizeof(bgd), offsetof(cetrafs_block_group_t, checksum), sizeof(bgd.checksum)));
     memcpy(blk, &bgd, sizeof(bgd));
@@ -728,7 +728,7 @@ static void fsck_adjust_bg_counts(int fd, uint32_t b, int credit)
         bgd.free_data_blocks = cetrafs_cpu_to_le64(cetrafs_le64(bgd.free_data_blocks) + 1);
     else if (cetrafs_le64(bgd.free_data_blocks))
         bgd.free_data_blocks = cetrafs_cpu_to_le64(cetrafs_le64(bgd.free_data_blocks) - 1);
-    bgd.checksum = 0;
+    bgd.checksum = cetrafs_cpu_to_le64(0);
     bgd.checksum = cetrafs_cpu_to_le64(
         crc32c_struct(&bgd, sizeof(bgd), offsetof(cetrafs_block_group_t, checksum), sizeof(bgd.checksum)));
     memcpy(blk, &bgd, sizeof(bgd));
@@ -749,7 +749,7 @@ static void fsck_adjust_bg_counts(int fd, uint32_t b, int credit)
         zg.pool_free_blocks = cetrafs_cpu_to_le64(cetrafs_le64(zg.pool_free_blocks) - 1);
     else if (!pool && cetrafs_le64(zg.free_data_blocks))
         zg.free_data_blocks = cetrafs_cpu_to_le64(cetrafs_le64(zg.free_data_blocks) - 1);
-    zg.hot_checksum = 0;
+    zg.hot_checksum = cetrafs_cpu_to_le64(0);
     zg.hot_checksum = cetrafs_cpu_to_le64((uint64_t) crc32c_struct((const uint8_t *) &zg + CETRAFS_ZG_HOT_OFF,
                                                                    CETRAFS_ZG_HOT_LEN,
                                                                    offsetof(cetrafs_zone_group_t, hot_checksum) -
@@ -870,7 +870,7 @@ static int fsck_dir_block(const cetrafs_inode_t *in, uint32_t n, uint64_t total_
 {
     uint64_t seen = 0;
 
-    if (in->eh.eh_depth != 0)
+    if (cetrafs_le16(in->eh.eh_depth) != 0)
         return -1;
     for (uint32_t e = 0; e < cetrafs_le16(in->eh.eh_entries) && e < 4; ++e) {
         uint64_t len = cetrafs_le32(in->et.leaf[e].ee_len) & CETRAFS_EXT_LEN_MASK;
@@ -953,7 +953,7 @@ static int fsck_dir_link(int fd,
      * may be (class 45). The caller's earlier check is not this one. */
     if (!fsck_record_restampable(&dir, dir_ino))
         return -1;
-    if (dir.eh.eh_depth != 0)
+    if (cetrafs_le16(dir.eh.eh_depth) != 0)
         return -1;
     nblocks = fsck_dir_nblocks(&dir, cetrafs_le64(sb->total_blocks));
 
@@ -1117,7 +1117,7 @@ static uint64_t fsck_lost_found(int fd,
      * block -- and then fail to link it, leaking both on every -r run.
      * Refuse before allocating anything; the orphans stay reported.
      */
-    if (root.eh.eh_depth != 0) {
+    if (cetrafs_le16(root.eh.eh_depth) != 0) {
         fprintf(stderr, "ERR: the root directory has spilled into an extent leaf; this fsck can neither find nor "
                         "create /lost+found there -- orphans are reported, not relinked\n");
         return 0;
@@ -2513,7 +2513,7 @@ int main(int argc, char **argv)
                 }
             }
         }
-        if (bg.off_bg_header != 0) {
+        if (cetrafs_le32(bg.off_bg_header) != 0) {
             fprintf(stderr, "ERR: BG%zu header off not 0\n", (size_t) b);
             return 1;
         }
@@ -2590,7 +2590,7 @@ int main(int argc, char **argv)
      * checks both counts against the bitmaps unconditionally and repairs
      * them under -r, which is strictly stronger. */
 
-    if (sb.inode_bmap_blocks == 0 || sb.inode_table_blocks == 0) {
+    if (cetrafs_le64(sb.inode_bmap_blocks) == 0 || cetrafs_le64(sb.inode_table_blocks) == 0) {
         fprintf(stderr, "ERR: inode structures not present\n");
         return 1;
     }
@@ -2705,7 +2705,7 @@ int main(int argc, char **argv)
         cetrafs_node_entry_t ne;
         /* one row per block as of v0x0007 */
         pread_all(fd, &ne, sizeof(ne), (off_t) (cetrafs_le64(sb.node_table_start) + n) * CETRAFS_BLOCK_SIZE);
-        if (ne.state == CETRAFS_NODE_STATE_FREE) {
+        if (cetrafs_le32(ne.state) == CETRAFS_NODE_STATE_FREE) {
             node_free_rows++;
             continue;
         }
@@ -3049,7 +3049,7 @@ int main(int argc, char **argv)
                         if (cetrafs_le32(pe.magic) != CETRAFS_PENDING_FREE_MAGIC || cetrafs_le64(pe.lba) == 0)
                             continue;
 
-                        if (pe.count == 0) {
+                        if (cetrafs_le32(pe.count) == 0) {
                             fprintf(stderr, "ERR: ZG%u pending-free entry %u has count 0\n", z, e);
                             cl_problems++;
                             continue;
@@ -3147,7 +3147,7 @@ int main(int argc, char **argv)
      * all and the lba check below compared garbage.
      */
     uint64_t root_lba;
-    if (ri.eh.eh_depth == 0) {
+    if (cetrafs_le16(ri.eh.eh_depth) == 0) {
         root_lba = (((uint64_t) cetrafs_le16(ri.et.leaf[0].ee_start_hi)) << 32) | cetrafs_le32(ri.et.leaf[0].ee_start_lo);
     } else {
         uint8_t rootleaf[CETRAFS_BLOCK_SIZE];
@@ -3370,7 +3370,7 @@ int main(int argc, char **argv)
                     "distinguished from leaked ones");
                 continue;
             }
-            if ((in.nlink == 0) != (dpass == 1))
+            if ((cetrafs_le32(in.nlink) == 0) != (dpass == 1))
                 continue; /* the other pass's */
             fsck_dead_walk = dpass;
             stale_before = stale_blocks;
@@ -3407,7 +3407,7 @@ int main(int argc, char **argv)
              * bounded, reclaimable (-r, or the online scrub), and
              * reported, but NOT a corruption this tool should fail the
              * volume on. See the unreachable-inode pass. */
-            if (in.nlink == 0)
+            if (cetrafs_le32(in.nlink) == 0)
                 fprintf(stderr, "WARN: inode %" PRIu64 " is allocated but has nlink=0 (orphan)\n", ino);
 
             /* A type the kernel cannot instantiate: iget refuses it
@@ -3416,15 +3416,15 @@ int main(int argc, char **argv)
             {
                 uint32_t fmt = cetrafs_le32(in.mode) & 0170000u;
 
-                if (in.nlink != 0 && fmt != 0100000u && fmt != 0040000u && fmt != 0120000u) {
+                if (cetrafs_le32(in.nlink) != 0 && fmt != 0100000u && fmt != 0040000u && fmt != 0120000u) {
                     fprintf(stderr, "ERR: inode %" PRIu64 " has mode 0%o, a type the kernel refuses to open\n", ino,
                             cetrafs_le32(in.mode));
                     problems++;
                 }
             }
-            if (cetrafs_le16(in.eh.eh_magic) != CETRAFS_EXT_MAGIC && in.eh.eh_magic == 0 && in.nlink != 0 &&
-                fsck_all_zero((const uint8_t *) &in.et, sizeof(in.et)) && in.eh.eh_entries == 0 &&
-                in.eh.eh_depth == 0) {
+            if (cetrafs_le16(in.eh.eh_magic) != CETRAFS_EXT_MAGIC && cetrafs_le16(in.eh.eh_magic) == 0 && cetrafs_le32(in.nlink) != 0 &&
+                fsck_all_zero((const uint8_t *) &in.et, sizeof(in.et)) && cetrafs_le16(in.eh.eh_entries) == 0 &&
+                cetrafs_le16(in.eh.eh_depth) == 0) {
                 /* Nothing hidden (no extent bytes at all), but every
                  * creator stamps the magic, and the kernel refuses to
                  * map through a record without it (-EIO on the first
@@ -3440,19 +3440,19 @@ int main(int argc, char **argv)
                  * repair on every healthy volume, which is the
                  * cries-wolf failure N5 is about. Only a header that is
                  * positively wrong hides blocks from the walk. */
-                if (in.eh.eh_magic == 0 && in.nlink != 0 && fsck_all_zero((const uint8_t *) &in.et, sizeof(in.et))) {
+                if (cetrafs_le16(in.eh.eh_magic) == 0 && cetrafs_le32(in.nlink) != 0 && fsck_all_zero((const uint8_t *) &in.et, sizeof(in.et))) {
                     /* No extent bytes, but a count or depth in the
                      * header: nothing the walk could follow either. */
                     fprintf(stderr,
                             "ERR: inode %" PRIu64 " has no extent header; the kernel refuses to map it\n", ino);
                     problems++;
-                } else if (in.eh.eh_magic == 0 && in.nlink != 0) {
+                } else if (cetrafs_le16(in.eh.eh_magic) == 0 && cetrafs_le32(in.nlink) != 0) {
                     fprintf(stderr, "ERR: inode %" PRIu64 " has extent entries under a missing header\n", ino);
                     problems++;
                     repair_block("an inode's extent header is missing over extent data, so the blocks it owns "
                                  "cannot be distinguished from leaked ones");
                 }
-                if (in.eh.eh_magic != 0) {
+                if (cetrafs_le16(in.eh.eh_magic) != 0) {
                     fprintf(stderr, "%s: inode %" PRIu64 " has a bad extent header magic 0x%X\n", FSCK_SEV, ino, in.eh.eh_magic);
                     problems += !fsck_dead_walk;
                     repair_block(
@@ -3502,7 +3502,7 @@ int main(int argc, char **argv)
                              "be distinguished from leaked ones");
             }
 
-            if (in.eh.eh_depth == 0) {
+            if (cetrafs_le16(in.eh.eh_depth) == 0) {
                 uint32_t n = cetrafs_le16(in.eh.eh_entries) > 4 ? 4 : cetrafs_le16(in.eh.eh_entries);
 
                 for (uint32_t e = 0; e < n; ++e) {
@@ -3977,7 +3977,7 @@ int main(int argc, char **argv)
                     pread_all(fd, blk, sizeof(blk), (off_t) bg_desc_lba[b] * CETRAFS_BLOCK_SIZE);
                     memcpy(&bgd, blk, sizeof(bgd));
                     bgd.free_data_blocks = cetrafs_cpu_to_le64(really_free);
-                    bgd.checksum = 0;
+                    bgd.checksum = cetrafs_cpu_to_le64(0);
                     /* Exactly the convention mkfs stamps with and the
                      * structural pass above verifies -- plain-native,
                      * over the struct with the checksum field zeroed. */
@@ -4121,10 +4121,10 @@ int main(int argc, char **argv)
                 zg.free_data_blocks = cetrafs_cpu_to_le64(zg_free_truth[z]);
                 zg.pool_free_blocks = cetrafs_cpu_to_le64(zg_pool_truth[z]);
                 if (grow_dead)
-                    zg.pool_grow_gen = zg.pool_grow_id = zg.pool_grow_credit = 0;
+                    zg.pool_grow_gen = zg.pool_grow_id = zg.pool_grow_credit = cetrafs_cpu_to_le64(0);
                 /* free_data_blocks is a HOT field (v0x0008): only the
                  * hot half's checksum covers it. */
-                zg.hot_checksum = 0;
+                zg.hot_checksum = cetrafs_cpu_to_le64(0);
                 memcpy(zblk, &zg, sizeof(zg));
                 zg.hot_checksum = cetrafs_cpu_to_le64((uint64_t) crc32c_struct(
                     (const uint8_t *) &zg + CETRAFS_ZG_HOT_OFF, CETRAFS_ZG_HOT_LEN,
@@ -4262,7 +4262,7 @@ int main(int argc, char **argv)
             is_dir[ino] = ((cetrafs_le32(in.mode) & 0170000u) == 0040000u);
             dsize[ino] = cetrafs_le64(in.size);
             empty[ino] = (cetrafs_le32(in.mode) & 0170000u) == 0100000u && !cetrafs_le64(in.size) &&
-                         !cetrafs_le64(in.xattr_block) && (in.eh.eh_magic == 0 || !cetrafs_le16(in.eh.eh_entries));
+                         !cetrafs_le64(in.xattr_block) && (cetrafs_le16(in.eh.eh_magic) == 0 || !cetrafs_le16(in.eh.eh_entries));
         }
 
         /* Pass B: walk every directory's entries. */
@@ -4311,7 +4311,7 @@ int main(int argc, char **argv)
             uint32_t n;
             uint8_t leafblk[CETRAFS_BLOCK_SIZE];
 
-            if (in.eh.eh_depth == 0) {
+            if (cetrafs_le16(in.eh.eh_depth) == 0) {
                 n = cetrafs_le16(in.eh.eh_entries) > 4 ? 4 : cetrafs_le16(in.eh.eh_entries);
                 memcpy(ext, in.et.leaf, n * sizeof(ext[0]));
             } else {
@@ -4430,7 +4430,7 @@ int main(int argc, char **argv)
 
                     de = (cetrafs_dirent_t *) db;
                     for (unsigned s = 0; s < CETRAFS_DIRENTS_PER_BLOCK; ++s) {
-                        if (de[s].inode == 0)
+                        if (cetrafs_le64(de[s].inode) == 0)
                             continue;
                         dirents_seen++;
                         dslots[ino]++; /* every occupied slot is in the size, valid or not */
@@ -5055,7 +5055,7 @@ int main(int argc, char **argv)
                     pread_all(fd, blk, sizeof(blk), (off_t) bg_desc_lba[b] * CETRAFS_BLOCK_SIZE);
                     memcpy(&bgd, blk, sizeof(bgd));
                     bgd.free_gen = cetrafs_cpu_to_le64(cetrafs_le64(bgd.free_gen) + 1);
-                    bgd.checksum = 0;
+                    bgd.checksum = cetrafs_cpu_to_le64(0);
                     bgd.checksum = cetrafs_cpu_to_le64(crc32c_struct(
                         &bgd, sizeof(bgd), offsetof(cetrafs_block_group_t, checksum), sizeof(bgd.checksum)));
                     memcpy(blk, &bgd, sizeof(bgd));
@@ -5070,7 +5070,7 @@ int main(int argc, char **argv)
                     pread_all(fd, blk, sizeof(blk), (off_t) bg_desc_lba[b] * CETRAFS_BLOCK_SIZE);
                     memcpy(&bgd, blk, sizeof(bgd));
                     bgd.free_data_blocks = cetrafs_cpu_to_le64(cetrafs_le64(bgd.free_data_blocks) + n);
-                    bgd.checksum = 0;
+                    bgd.checksum = cetrafs_cpu_to_le64(0);
                     bgd.checksum = cetrafs_cpu_to_le64(crc32c_struct(
                         &bgd, sizeof(bgd), offsetof(cetrafs_block_group_t, checksum), sizeof(bgd.checksum)));
                     memcpy(blk, &bgd, sizeof(bgd));
@@ -5085,7 +5085,7 @@ int main(int argc, char **argv)
                         zg.pool_free_blocks = cetrafs_cpu_to_le64(cetrafs_le64(zg.pool_free_blocks) + n);
                     else
                         zg.free_data_blocks = cetrafs_cpu_to_le64(cetrafs_le64(zg.free_data_blocks) + n);
-                    zg.hot_checksum = 0;
+                    zg.hot_checksum = cetrafs_cpu_to_le64(0);
                     zg.hot_checksum = cetrafs_cpu_to_le64((uint64_t) crc32c_struct(
                         (const uint8_t *) &zg + CETRAFS_ZG_HOT_OFF, CETRAFS_ZG_HOT_LEN,
                         offsetof(cetrafs_zone_group_t, hot_checksum) - CETRAFS_ZG_HOT_OFF, sizeof(zg.hot_checksum)));

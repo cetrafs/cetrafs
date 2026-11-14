@@ -101,7 +101,7 @@ static inline void cetrafs_inode_stamp_crcs_us(cetrafs_inode_t *in)
 {
     in->fd_ino = in->ino;
     in->fd_generation = in->generation;
-    in->ns_checksum = 0;
+    in->ns_checksum = cetrafs_cpu_to_le64(0);
     in->ns_checksum = cetrafs_cpu_to_le64(cetrafs_inode_crc_ns_us(in));
     in->fd_checksum = 0;
     in->fd_checksum = cetrafs_cpu_to_le64(cetrafs_inode_crc_fd_us(in));

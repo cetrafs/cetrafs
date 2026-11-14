@@ -488,7 +488,7 @@ int main(int argc, char **argv)
         u64 stored = cetrafs_le64(sb.checksum);
         u32 calc;
 
-        sb.checksum = 0;
+        sb.checksum = cetrafs_cpu_to_le64(0);
         calc = crc32c_struct(&sb, sizeof(sb), offsetof(cetrafs_superblock_t, checksum), sizeof(sb.checksum));
         sb.checksum = cetrafs_cpu_to_le64(stored);
         if ((u32) stored != calc)
@@ -890,7 +890,7 @@ int main(int argc, char **argv)
             bh.off_data_bmap = cetrafs_cpu_to_le32(off_bmap32);
             bh.off_data_region = cetrafs_cpu_to_le32(off_data32);
             bh.data_block_count = cetrafs_cpu_to_le64(data_cnt);
-            bh.checksum = 0;
+            bh.checksum = cetrafs_cpu_to_le64(0);
             bh.checksum = cetrafs_cpu_to_le64(crc32c_struct(&bh, sizeof(bh), offsetof(cetrafs_bg_header_t, checksum),
                                                             sizeof(cetrafs_le64(bh.checksum))));
 
@@ -1011,7 +1011,7 @@ int main(int argc, char **argv)
             bg.off_data_region = cetrafs_cpu_to_le32(off_data32);
             bg.data_block_count = cetrafs_cpu_to_le64(data_cnt);
             bg.free_data_blocks = cetrafs_cpu_to_le64(data_cnt);
-            bg.checksum = 0;
+            bg.checksum = cetrafs_cpu_to_le64(0);
             bg.checksum = cetrafs_cpu_to_le64(crc32c_struct(&bg, sizeof(bg), offsetof(cetrafs_block_group_t, checksum),
                                                             sizeof(cetrafs_le64(bg.checksum))));
 
@@ -1027,7 +1027,7 @@ int main(int argc, char **argv)
                 read_block(fd, start, blk);
                 memcpy(&bh, blk, sizeof(bh));
                 bh.owner_zg = cetrafs_cpu_to_le16((u16) bg_owner[b]);
-                bh.checksum = 0;
+                bh.checksum = cetrafs_cpu_to_le64(0);
                 bh.checksum = cetrafs_cpu_to_le64(crc32c_struct(
                     &bh, sizeof(bh), offsetof(cetrafs_bg_header_t, checksum), sizeof(cetrafs_le64(bh.checksum))));
                 memcpy(blk, &bh, sizeof(bh));
@@ -1048,7 +1048,7 @@ int main(int argc, char **argv)
         seg.count = cetrafs_cpu_to_le32((u32) (new_b - old_b));
         seg.first_bg_id = cetrafs_cpu_to_le32((u32) old_b);
         seg.next = cetrafs_cpu_to_le64(0);
-        seg.checksum = 0;
+        seg.checksum = cetrafs_cpu_to_le64(0);
         seg.checksum = cetrafs_cpu_to_le64((u64) crc32c_struct(&seg, sizeof(seg),
                                                                offsetof(cetrafs_bg_segment_t, checksum),
                                                                sizeof(seg.checksum)));
@@ -1161,7 +1161,7 @@ int main(int argc, char **argv)
                     fprintf(stderr, "growfs.cetra: replacing the link an interrupted grow left at block %" PRIu64 "\n",
                             cur);
                 seg.next = cetrafs_cpu_to_le64(seg_header_lba);
-                seg.checksum = 0;
+                seg.checksum = cetrafs_cpu_to_le64(0);
                 seg.checksum = cetrafs_cpu_to_le64((u64) crc32c_struct(&seg, sizeof(seg),
                                                                        offsetof(cetrafs_bg_segment_t, checksum),
                                                                        sizeof(seg.checksum)));
@@ -1195,7 +1195,7 @@ int main(int argc, char **argv)
     sb.tail_reserve_blocks = cetrafs_cpu_to_le64(reserve_blocks);
     sb.orphan_blocks = cetrafs_cpu_to_le64(orphan_total);
 
-    sb.checksum = 0;
+    sb.checksum = cetrafs_cpu_to_le64(0);
     sb.checksum = cetrafs_cpu_to_le64(
         (u64) crc32c_struct(&sb, sizeof(sb), offsetof(cetrafs_superblock_t, checksum), sizeof(sb.checksum)));
 
@@ -1232,7 +1232,7 @@ int main(int argc, char **argv)
         if (cetrafs_test_env("CETRAFS_GROWFS_TEST_GEN_SKIP")) {
             fprintf(stderr, "growfs.cetra: TEST MODE: submitting layout_gen + 1 too far\n");
             sb.layout_gen = cetrafs_cpu_to_le64(cetrafs_le64(sb.layout_gen) + 1);
-            sb.checksum = 0;
+            sb.checksum = cetrafs_cpu_to_le64(0);
             sb.checksum = cetrafs_cpu_to_le64(
                 (u64) crc32c_struct(&sb, sizeof(sb), offsetof(cetrafs_superblock_t, checksum), sizeof(sb.checksum)));
         }
@@ -1329,8 +1329,8 @@ int main(int argc, char **argv)
                     "layout_gen %" PRIu64 " that never published\n",
                     z, credit, (u64) cetrafs_le64(zg.pool_grow_gen));
             zg.pool_free_blocks = cetrafs_cpu_to_le64(credit > pool ? 0 : pool - credit);
-            zg.pool_grow_gen = zg.pool_grow_id = zg.pool_grow_credit = 0;
-            zg.hot_checksum = 0;
+            zg.pool_grow_gen = zg.pool_grow_id = zg.pool_grow_credit = cetrafs_cpu_to_le64(0);
+            zg.hot_checksum = cetrafs_cpu_to_le64(0);
             zg.hot_checksum = cetrafs_cpu_to_le64((u64) crc32c_struct(
                 (const u8 *) &zg + CETRAFS_ZG_HOT_OFF, CETRAFS_ZG_HOT_LEN,
                 offsetof(cetrafs_zone_group_t, hot_checksum) - CETRAFS_ZG_HOT_OFF, sizeof(zg.hot_checksum)));
@@ -1394,7 +1394,7 @@ int main(int argc, char **argv)
             continue;
         }
         zg.free_data_blocks = cetrafs_cpu_to_le64(cetrafs_le64(zg.free_data_blocks) + zg_added[z] * data_cnt);
-        zg.hot_checksum = 0;
+        zg.hot_checksum = cetrafs_cpu_to_le64(0);
         zg.hot_checksum = cetrafs_cpu_to_le64((u64) crc32c_struct(
             (const u8 *) &zg + CETRAFS_ZG_HOT_OFF, CETRAFS_ZG_HOT_LEN,
             offsetof(cetrafs_zone_group_t, hot_checksum) - CETRAFS_ZG_HOT_OFF, sizeof(zg.hot_checksum)));

@@ -636,7 +636,7 @@ static int cetrafs_dir_extents_get_unchecked(struct inode *dir, const cetrafs_in
         return -EIO;
     }
 
-    if (raw->eh.eh_depth == 0) {
+    if (cetrafs_le16(raw->eh.eh_depth) == 0) {
         de->arr = raw->et.leaf;
         de->entries = min_t(u16, cetrafs_le16(raw->eh.eh_entries), ARRAY_SIZE(raw->et.leaf));
         return 0;
@@ -854,7 +854,7 @@ static int cetrafs_walk_dirents_from(struct inode *dir, cetrafs_dirent_visit_fn 
                 msleep(xchg(&cetrafs_dir_walk_stall_ms, 0)); /* test-only, one-shot */
             de = live ? (const cetrafs_dirent_t *) bh->b_data : img;
             for (e = 0; e < dirents_per_block; e++) {
-                if (de[e].inode == 0)
+                if (cetrafs_le64(de[e].inode) == 0)
                     continue;
 
                 ret = visit(priv, &de[e], base_pos + e * sizeof(cetrafs_dirent_t));
@@ -905,7 +905,7 @@ static bool cetrafs_dirent_slot_free(const struct buffer_head *bh, unsigned int 
 {
     const cetrafs_dirent_t *de = (const cetrafs_dirent_t *) bh->b_data;
 
-    return de[idx].inode == 0;
+    return cetrafs_le64(de[idx].inode) == 0;
 }
 
 /* Does 'name' appear anywhere in this one dirent block? */
@@ -915,7 +915,7 @@ static bool cetrafs_dirent_block_has_name(const struct buffer_head *bh, const st
     unsigned int e;
 
     for (e = 0; e < CETRAFS_DIRENTS_PER_BLOCK; e++) {
-        if (de[e].inode == 0)
+        if (cetrafs_le64(de[e].inode) == 0)
             continue;
         if (cetrafs_le16(de[e].name_len) == name->len && !memcmp(de[e].name, name->name, name->len))
             return true;
@@ -987,7 +987,7 @@ static int cetrafs_dir_scan_for_slot(struct inode *dir,
 
             de = (const cetrafs_dirent_t *) sbh->b_data;
             for (e = 0; e < CETRAFS_DIRENTS_PER_BLOCK; e++) {
-                if (de[e].inode == 0) {
+                if (cetrafs_le64(de[e].inode) == 0) {
                     /* Remember the first free slot, but keep scanning:
                      * the duplicate check is only meaningful if it
                      * covers EVERY block. */
@@ -1364,7 +1364,7 @@ int cetrafs_dir_remove_entry(struct inode *dir, const struct qstr *name, u64 exp
         pr_warn_ratelimited("dir ino=%llu: size %llu is below the entry just removed -- holding it at 0 (fsck "
                             "recounts it)\n",
                             (unsigned long long) dir->i_ino, (unsigned long long) cetrafs_le64(raw.size));
-        raw.size = 0;
+        raw.size = cetrafs_cpu_to_le64(0);
     } else {
         raw.size = cetrafs_cpu_to_le64(cetrafs_le64(raw.size) - (sizeof(cetrafs_dirent_t)));
     }
@@ -1996,7 +1996,7 @@ static void cetrafs_new_inode_discard(struct inode *inode)
     if (cetrafs_read_raw_inode(sb, inode->i_ino, &raw) == 0 &&
         cetrafs_le64(raw.generation) == cetrafs_inode_get_generation(inode) &&
         cetrafs_le32(raw.nlink) != 0) {
-        raw.nlink = 0;
+        raw.nlink = cetrafs_cpu_to_le32(0);
         (void) cetrafs_write_raw_inode_self(inode, &raw, /*sync=*/true);
     }
 
@@ -2193,7 +2193,7 @@ static int cetrafs_dir_raw_visit(struct super_block *sb, const cetrafs_inode_t *
                 return why; /* -EUCLEAN only for a block every attempt found damaged */
             de = (const cetrafs_dirent_t *) bh->b_data;
             for (e = 0; e < CETRAFS_DIRENTS_PER_BLOCK; e++)
-                if (de[e].inode != 0)
+                if (cetrafs_le64(de[e].inode) != 0)
                     visit(priv, &de[e]);
             brelse(bh);
             cond_resched();
@@ -3056,7 +3056,7 @@ static int cetrafs_rmdir_locked(struct inode *dir, struct dentry *dentry)
      * actual VFS eviction, not this point. Staged for the namespace
      * lock's release (the entry named the locked inode:
      * cetrafs_dir_remove_entry() refuses any other). */
-    raw.nlink = 0;
+    raw.nlink = cetrafs_cpu_to_le32(0);
     cetrafs_inode_stage_record(inode, &raw, /*fd_too=*/false);
 
     clear_nlink(inode);

@@ -882,7 +882,7 @@ int main(int argc, char **argv)
     sb.version = cetrafs_cpu_to_le16(CETRAFS_VERSION);
     sb.sb_bytes = cetrafs_cpu_to_le16(sizeof(sb));
     sb.block_size = cetrafs_cpu_to_le32(CETRAFS_BLOCK_SIZE);
-    sb.pad0 = 0;
+    sb.pad0 = cetrafs_cpu_to_le32(0);
     sb.total_blocks = cetrafs_cpu_to_le64(total_blocks);
 
     sb.zone_group_count = cetrafs_cpu_to_le32(zg_count);
@@ -945,7 +945,7 @@ int main(int argc, char **argv)
     }
 
     /* SB checksum (CRC32C over full struct with checksum zeroed) */
-    sb.checksum = 0;
+    sb.checksum = cetrafs_cpu_to_le64(0);
     uint32_t sb_crc = crc32c_struct(&sb, sizeof(sb), offsetof(cetrafs_superblock_t, checksum), sizeof(sb.checksum));
     sb.checksum = cetrafs_cpu_to_le64((u64) sb_crc);
 
@@ -1037,11 +1037,11 @@ int main(int argc, char **argv)
          * the HOT sector is the CAS unit, the COLD remainder is mkfs-time
          * geometry. Each checksum covers only its own half, with its own
          * field zeroed. */
-        zg.hot_checksum = 0;
+        zg.hot_checksum = cetrafs_cpu_to_le64(0);
         zg.hot_checksum = cetrafs_cpu_to_le64((u64) crc32c_struct((const u8 *) &zg + CETRAFS_ZG_HOT_OFF, CETRAFS_ZG_HOT_LEN,
                                                       offsetof(cetrafs_zone_group_t, hot_checksum) - CETRAFS_ZG_HOT_OFF,
                                                       sizeof(zg.hot_checksum)));
-        zg.cold_checksum = 0;
+        zg.cold_checksum = cetrafs_cpu_to_le64(0);
         zg.cold_checksum = cetrafs_cpu_to_le64((u64) crc32c_struct(
             (const u8 *) &zg + CETRAFS_ZG_COLD_OFF, CETRAFS_ZG_COLD_LEN,
             offsetof(cetrafs_zone_group_t, cold_checksum) - CETRAFS_ZG_COLD_OFF, sizeof(zg.cold_checksum)));
@@ -1096,7 +1096,7 @@ int main(int argc, char **argv)
         /* BG descriptor fields are stored plain-native (unlike SB/ZG's
          * __le*), matching fsck.c's read-side precedent -- so the
          * checksum itself is stored plain too, not cetrafs_cpu_to_le64()'d. */
-        bg.checksum = 0;
+        bg.checksum = cetrafs_cpu_to_le64(0);
         bg.checksum = cetrafs_cpu_to_le64(crc32c_struct(&bg, sizeof(bg), offsetof(cetrafs_block_group_t, checksum), sizeof(cetrafs_le64(bg.checksum))));
 
         memcpy(blk, &bg, sizeof(bg));
@@ -1117,7 +1117,7 @@ int main(int argc, char **argv)
         bh.data_block_count = cetrafs_cpu_to_le64(data_cnt);
 
         /* plain-native, like the BG descriptor's checksum above */
-        bh.checksum = 0;
+        bh.checksum = cetrafs_cpu_to_le64(0);
         bh.checksum = cetrafs_cpu_to_le64(crc32c_struct(&bh, sizeof(bh), offsetof(cetrafs_bg_header_t, checksum), sizeof(cetrafs_le64(bh.checksum))));
 
         memcpy(blk, &bh, sizeof(bh));
@@ -1243,8 +1243,8 @@ int main(int argc, char **argv)
 
     ri.ino = cetrafs_cpu_to_le64(CETRAFS_ROOT_INO);
     ri.mode = cetrafs_cpu_to_le32(S_IFDIR | 0755);
-    ri.uid = 0;
-    ri.gid = 0;
+    ri.uid = cetrafs_cpu_to_le32(0);
+    ri.gid = cetrafs_cpu_to_le32(0);
     ri.nlink = cetrafs_cpu_to_le32(2);
     ri.size = cetrafs_cpu_to_le64(sizeof(cetrafs_dirent_t) * 2);
     ri.generation = cetrafs_cpu_to_le64(1);                       /* v0x0008: nonzero; ino 1 (root) is never reused anyway */
@@ -1256,8 +1256,8 @@ int main(int argc, char **argv)
     ri.eh.eh_magic = cetrafs_cpu_to_le16(CETRAFS_EXT_MAGIC);
     ri.eh.eh_entries = cetrafs_cpu_to_le16(1);
     ri.eh.eh_max = cetrafs_cpu_to_le16(4);   /* inline capacity */
-    ri.eh.eh_depth = 0; /* leaf */
-    ri.eh.eh_generation = 0;
+    ri.eh.eh_depth = cetrafs_cpu_to_le16(0); /* leaf */
+    ri.eh.eh_generation = cetrafs_cpu_to_le32(0);
     ri.et.leaf[0].ee_block = 0; /* logical block 0 */
     ri.et.leaf[0].ee_len = cetrafs_extent_pack_len(1, 0);
     {

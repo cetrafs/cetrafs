@@ -2136,13 +2136,13 @@ static int cetrafs_pf_append_mutate(void *image, unsigned int len, void *priv)
      * lost race simply lands in a different slot on the retry -- the
      * same shape as alloc.c's bitmap CAS. */
     for (e = 0; e < slots; e++) {
-        if (ent[e].lba != 0)
+        if (cetrafs_le64(ent[e].lba) != 0)
             continue;
         ent[e].lba = cetrafs_cpu_to_le64(ctx->lba);
         ent[e].count = cetrafs_cpu_to_le32(ctx->count);
         ent[e].magic = cetrafs_cpu_to_le32(CETRAFS_PENDING_FREE_MAGIC);
         ent[e].free_gen = cetrafs_cpu_to_le64(ctx->stamp);
-        ent[e].pad = 0;
+        ent[e].pad = cetrafs_cpu_to_le64(0);
         return 0;
     }
     return -EEXIST; /* this region is full; the caller tries the next */
@@ -2392,7 +2392,7 @@ static int cetrafs_pf_drain_mutate(void *image, unsigned int len, void *priv)
      * swap consumes is only what it finds there. */
     ctx->n = 0;
     for (e = 0; e < slots; e++) {
-        if (ent[e].lba == 0)
+        if (cetrafs_le64(ent[e].lba) == 0)
             continue;
 
         /* Garbage is cleared on sight. Nothing can ever apply it, so
@@ -2677,7 +2677,7 @@ static int cetrafs_zg_drain_one(struct super_block *sb, u32 zg_id, bool may_wait
             unsigned int idx = qb * regions + r, valid = 0, try;
 
             for (e = 0; e < slots; e++) {
-                if (ent[e].lba == 0)
+                if (cetrafs_le64(ent[e].lba) == 0)
                     continue;
                 if (cetrafs_le32(ent[e].magic) != CETRAFS_PENDING_FREE_MAGIC || cetrafs_le32(ent[e].count) == 0) {
                     pr_err("pending free: ZG %u queue block %u entry %u is garbage (magic=0x%x count=%u) -- dropping\n",
@@ -2911,7 +2911,7 @@ int cetrafs_zg_pending_free_for_each(struct super_block *sb, u32 zg_id, void (*c
             unsigned int e;
 
             for (e = 0; e < slots; e++) {
-                if (ent[e].lba == 0)
+                if (cetrafs_le64(ent[e].lba) == 0)
                     continue;
                 /* Garbage is the drain's problem to report and clear; here
                  * it is simply not a block we can vouch for. */

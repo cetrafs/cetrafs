@@ -271,7 +271,7 @@ static int cetrafs_defrag_read_extents(struct inode *inode, const cetrafs_inode_
     if (cetrafs_le16(raw->eh.eh_magic) != CETRAFS_EXT_MAGIC)
         return -EIO;
 
-    if (raw->eh.eh_depth == 0) {
+    if (cetrafs_le16(raw->eh.eh_depth) == 0) {
         el->count = min_t(u32, cetrafs_le16(raw->eh.eh_entries), 4);
         memcpy(el->arr, raw->et.leaf, el->count * sizeof(el->arr[0]));
     } else if (cetrafs_le16(raw->eh.eh_depth) == 1) {
@@ -401,7 +401,7 @@ static int cetrafs_defrag_commit(struct inode *inode,
         u32 len = (u32) min_t(u64, moved - off, (u64) CETRAFS_EXT_LEN_MASK);
 
         out[n].ee_block = cetrafs_cpu_to_le32((u32) off);
-        out[n].ee_pad = 0;
+        out[n].ee_pad = cetrafs_cpu_to_le16(0);
         out[n].ee_len = cetrafs_extent_pack_len(len, 0);
         cetrafs_extent_phys_to_hilo(dst_base + off, &out[n].ee_start_hi, &out[n].ee_start_lo);
         n++;
