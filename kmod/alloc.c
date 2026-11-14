@@ -3454,17 +3454,18 @@ static int __cetrafs_free_data_extent(struct super_block *sb, u64 lba, u32 count
              */
             {
                 struct cetrafs_pf_ent ent = {.lba = lba, .count = count, .stamp = bg.free_gen};
-                struct cetrafs_free_batch local;
+                u32 dropped = 0;
 
                 if (fb)
                     return cetrafs_free_batch_add(sb, fb, bg.owner_zg, &ent);
-                /* One extent, flushed here: the same swap a batch of one makes.
-                 * Holding nothing yet, the add cannot flush, so its return is 0. */
-                cetrafs_free_batch_init(&local);
-                ret = cetrafs_free_batch_add(sb, &local, bg.owner_zg, &ent);
-                if (ret)
-                    return ret;
-                return cetrafs_free_batch_flush(sb, &local);
+                /* One extent: the swap a batch of one makes, without a
+                 * whole batch on the stack -- this frame sits under the
+                 * leaf punch's, which holds one already. */
+                ret = cetrafs_zg_queue_foreign_frees(sb, bg.owner_zg, &ent, 1, &dropped);
+                ctrace("BLKQUEUE zg=%u n=1 dropped=%u ret=%d\n", (unsigned int) bg.owner_zg, dropped, ret);
+                if (dropped)
+                    atomic64_add(dropped, &cetrafs_foreign_free_leaks); /* see cetrafs_free_batch_flush() */
+                return ret;
             }
         }
     }
