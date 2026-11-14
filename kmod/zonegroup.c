@@ -2593,7 +2593,7 @@ static int cetrafs_pf_hold_range(struct maple_tree *mt, u64 lba, u32 count)
  * an entry whose stamp is not the group's current one
  * (cetrafs_apply_pending_free(); tests/kernel/pf_late_copy_after_reclaim.sh).
  */
-static int cetrafs_zg_drain_one(struct super_block *sb, u32 zg_id, bool may_wait)
+static int cetrafs_zg_drain_one(struct super_block *sb, u32 zg_id, bool may_wait, bool probed)
 {
     unsigned int region_sz = cetrafs_cas_region_size(sb);
     unsigned int regions = CETRAFS_BLOCK_SIZE / region_sz;
@@ -2613,8 +2613,10 @@ static int cetrafs_zg_drain_one(struct super_block *sb, u32 zg_id, bool may_wait
     if (ret)
         return ret;
 
-    /* 1. Anything at all? */
-    for (qb = 0; qb < qblocks; qb++) {
+    /* 1. Anything at all? Already asked when 'probed' (the batched probe
+     * of cetrafs_zg_drain_pending_frees() found something). */
+    any = probed;
+    for (qb = 0; qb < qblocks && !probed; qb++) {
         struct buffer_head *bh = cetrafs_bread_uncached_retry(sb, qstart + qb);
         unsigned int r;
 
@@ -2943,11 +2945,80 @@ u64 cetrafs_pf_drain_count(void)
     return (u64) atomic64_read(&cetrafs_pf_drains);
 }
 
+/* TEST ONLY: probe each queue on its own, as before audit 2026-11-14
+ * A5 -- the control of tests/kernel/pf_probe_batched.sh. */
+static bool cetrafs_pf_probe_serial;
+cetrafs_test_param(pf_probe_serial, cetrafs_pf_probe_serial, bool, 0644);
+MODULE_PARM_DESC(pf_probe_serial, "TEST ONLY: the drain probes each owned queue with its own reads");
+
+/*
+ * Which owned Zone Groups' queues have anything in their first
+ * CETRAFS_PF_DRAIN_EMPTY_RUN blocks -- the question cetrafs_zg_drain_one()
+ * step 1 asks -- read forced-fresh as ONE batch over every owned queue.
+ * The inline drain asked it with two serial reads per owned Zone Group,
+ * twice a second, inside a write holding inode_lock and invalidate_lock
+ * (audit 2026-11-14 A5). NULL when it could not batch: each drain then
+ * asks for itself.
+ */
+static unsigned long *cetrafs_zg_probe_queues(struct super_block *sb, u32 zg_count)
+{
+    unsigned int region_sz = cetrafs_cas_region_size(sb);
+    unsigned int regions = CETRAFS_BLOCK_SIZE / region_sz;
+    unsigned int slots = region_sz / sizeof(cetrafs_pending_free_t);
+    unsigned long *busy = NULL;
+    struct buffer_head **bhs = NULL;
+    sector_t *list = NULL;
+    u32 *of = NULL, n = 0, z, i;
+
+    if (READ_ONCE(cetrafs_pf_probe_serial))
+        return NULL;
+    busy = bitmap_zalloc(zg_count, GFP_NOFS);
+    list = kmalloc_array(zg_count * CETRAFS_PF_DRAIN_EMPTY_RUN, sizeof(*list), GFP_NOFS);
+    of = kmalloc_array(zg_count * CETRAFS_PF_DRAIN_EMPTY_RUN, sizeof(*of), GFP_NOFS);
+    bhs = kmalloc_array(zg_count * CETRAFS_PF_DRAIN_EMPTY_RUN, sizeof(*bhs), GFP_NOFS);
+    if (!busy || !list || !of || !bhs)
+        goto fail;
+    for (z = 0; z < zg_count; z++) {
+        u64 qstart;
+        u32 qblocks, qb;
+
+        if (!cetrafs_sb_zg_owned_cached(sb, z) || cetrafs_zg_queue_span(sb, z, &qstart, &qblocks))
+            continue;
+        for (qb = 0; qb < qblocks && qb < CETRAFS_PF_DRAIN_EMPTY_RUN; qb++) {
+            list[n] = qstart + qb;
+            of[n++] = z;
+        }
+    }
+    if (!n)
+        goto out;
+    if (cetrafs_bread_uncached_list(sb, list, n, bhs))
+        goto fail;
+    atomic64_add(n, &cetrafs_pf_drain_blocks);
+    for (i = 0; i < n; i++) {
+        unsigned int r;
+
+        for (r = 0; r < regions && !test_bit(of[i], busy); r++)
+            if (cetrafs_pf_region_used((const cetrafs_pending_free_t *) (bhs[i]->b_data + r * region_sz), slots))
+                set_bit(of[i], busy);
+        brelse(bhs[i]);
+    }
+out:
+    kfree(list);
+    kfree(of);
+    kfree(bhs);
+    return busy;
+fail:
+    bitmap_free(busy);
+    busy = NULL;
+    goto out;
+}
+
 int cetrafs_zg_drain_pending_frees(struct super_block *sb, bool may_wait)
 {
     atomic64_inc(&cetrafs_pf_drains);
     const cetrafs_superblock_t *raw_sb = cetrafs_sb_raw(sb);
     struct mutex *m = cetrafs_sb_pf_drain_mutex(sb);
+    unsigned long *busy;
     u32 zg_count, z;
     int ret = 0;
 
@@ -2961,21 +3032,25 @@ int cetrafs_zg_drain_pending_frees(struct super_block *sb, bool may_wait)
         return 0;
 
     zg_count = le32_to_cpu(raw_sb->zone_group_count);
+    busy = cetrafs_zg_probe_queues(sb, zg_count);
     for (z = 0; z < zg_count; z++) {
         int rc;
 
         if (!cetrafs_sb_zg_owned_cached(sb, z))
             continue;
+        if (busy && !test_bit(z, busy))
+            continue; /* the batched probe found its queue head empty */
         rc = cetrafs_sb_mount_beat(sb); /* the mount-time drain (F1); a no-op from the heartbeat */
         if (rc) {
             ret = rc;
             break;
         }
 
-        rc = cetrafs_zg_drain_one(sb, z, may_wait);
+        rc = cetrafs_zg_drain_one(sb, z, may_wait, busy != NULL);
         if (rc && !ret)
             ret = rc;
     }
+    bitmap_free(busy);
 
     mutex_unlock(m);
     return ret;

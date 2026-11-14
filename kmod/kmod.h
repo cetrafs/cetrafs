@@ -731,6 +731,7 @@ void cetrafs_bh_abort_update(struct buffer_head *bh);
 struct buffer_head *cetrafs_bread_retry(struct super_block *sb, sector_t block);
 struct buffer_head *cetrafs_bread_uncached_retry(struct super_block *sb, sector_t block);
 int cetrafs_bread_uncached_batch(struct super_block *sb, sector_t start, u32 n, struct buffer_head **bhs);
+int cetrafs_bread_uncached_list(struct super_block *sb, const sector_t *list, u32 n, struct buffer_head **bhs);
 /* inode.c -- read an inode's external extent-leaf block at the right
  * freshness for who currently owns the file. */
 struct buffer_head *cetrafs_read_leaf_bh(struct inode *inode, u64 lba);

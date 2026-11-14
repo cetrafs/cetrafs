@@ -163,14 +163,31 @@ struct buffer_head *cetrafs_bread_uncached_retry(struct super_block *sb, sector_
  * Fills bhs[0..n) with referenced buffers. On failure every buffer is
  * released, bhs[] is zeroed and -EIO is returned.
  */
+static int __cetrafs_bread_uncached_batch(struct super_block *sb, sector_t start, const sector_t *list, u32 n,
+                                          struct buffer_head **bhs);
+
 int cetrafs_bread_uncached_batch(struct super_block *sb, sector_t start, u32 n, struct buffer_head **bhs)
+{
+    return __cetrafs_bread_uncached_batch(sb, start, NULL, n, bhs);
+}
+
+/* The same, over n blocks anywhere: list[i] is bhs[i]'s block. One plug,
+ * one wait each, instead of one round trip per block. */
+int cetrafs_bread_uncached_list(struct super_block *sb, const sector_t *list, u32 n, struct buffer_head **bhs)
+{
+    return __cetrafs_bread_uncached_batch(sb, 0, list, n, bhs);
+}
+
+static int __cetrafs_bread_uncached_batch(struct super_block *sb, sector_t start, const sector_t *list, u32 n,
+                                          struct buffer_head **bhs)
 {
     struct blk_plug plug;
     u32 i;
 
+#define CETRAFS_BATCH_BLK(i) (list ? list[i] : start + (i))
     memset(bhs, 0, n * sizeof(*bhs)); /* the failure path releases every slot */
     for (i = 0; i < n; i++) {
-        bhs[i] = sb_getblk(sb, start + i);
+        bhs[i] = sb_getblk(sb, CETRAFS_BATCH_BLK(i));
         if (!bhs[i])
             goto fail;
     }
@@ -204,11 +221,12 @@ int cetrafs_bread_uncached_batch(struct super_block *sb, sector_t start, u32 n, 
         if (buffer_uptodate(bhs[i]))
             continue;
         brelse(bhs[i]);
-        bhs[i] = cetrafs_bread_uncached_retry(sb, start + i);
+        bhs[i] = cetrafs_bread_uncached_retry(sb, CETRAFS_BATCH_BLK(i));
         if (!bhs[i])
             goto fail;
     }
     return 0;
+#undef CETRAFS_BATCH_BLK
 
 fail:
     for (i = 0; i < n; i++) {
