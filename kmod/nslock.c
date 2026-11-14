@@ -732,11 +732,19 @@ void cetrafs_nslock_release(struct inode *inode)
      * read and the write is the lease's window, not a new one. */
     if (have_staged && staged_fd && !READ_ONCE(cetrafs_nslock_fd_precheck_off)) {
         cetrafs_inode_t now;
+        int rret;
 
         cetrafs_invalidate_raw_inode(sb, inode->i_ino);
-        if (!cetrafs_read_raw_inode(sb, inode->i_ino, &now) &&
-            (cetrafs_le64(now.generation) != ctx.generation ||
-             cetrafs_le32(now.ns_lock_owner) != ctx.my_node_id)) {
+        rret = cetrafs_read_raw_inode(sb, inode->i_ino, &now);
+        /* A check that could not run is not a pass: an unreadable sector
+         * leaves the staged update unpublished, as a lost lock would. */
+        if (rret) {
+            pr_err("nslock: ino=%llu release: the namespace sector could not be read (%d) -- its staged file "
+                   "sector is not published\n",
+                   (unsigned long long) inode->i_ino, rret);
+            staged_fd = false;
+        } else if (cetrafs_le64(now.generation) != ctx.generation ||
+                   cetrafs_le32(now.ns_lock_owner) != ctx.my_node_id) {
             pr_warn("nslock: ino=%llu release: the lock is no longer ours -- its staged file sector is not "
                     "published\n",
                     (unsigned long long) inode->i_ino);

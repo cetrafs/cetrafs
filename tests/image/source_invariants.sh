@@ -724,7 +724,7 @@ spin_lines() { # <files...>: file:line:code for every line run with a spinlock h
     }' "$@"
 }
 SPIN_SLEEPERS_RE='\b(msleep|usleep_range|ssleep|mutex_lock[a-z_]*|down|down_[a-z_]+|wait_event[a-z_]*|wait_for_[a-z_]+|schedule[a-z_]*|cond_resched|lock_buffer|wait_on_buffer|[a-z_]*bread[a-z_]*|submit_bh|sync_dirty_buffer|iput|brelse|vmalloc|kvmalloc|copy_(to|from)_user|cancel_[a-z_]*_sync|flush_[a-z_]+|synchronize_[a-z_]+)\('
-SPIN_OK='cetrafs_deferred_on_list cetrafs_ext_key_matches cetrafs_inode_deferred cetrafs_inode_fd_copy cetrafs_inode_get_generation cetrafs_inode_wb_failed cetrafs_le16 cetrafs_le32 cetrafs_le64 cetrafs_nswait_is_current cetrafs_pending_any cetrafs_row_mark_of cetrafs_row_mark_same cetrafs_sb_bg_discard_pending_ignored cetrafs_sb_layout_of cetrafs_sb_stale_secs'
+SPIN_OK='cetrafs_peer_window_floor_secs cetrafs_sb_own_renewal_overdue cetrafs_deferred_on_list cetrafs_ext_key_matches cetrafs_inode_deferred cetrafs_inode_fd_copy cetrafs_inode_get_generation cetrafs_inode_wb_failed cetrafs_le16 cetrafs_le32 cetrafs_le64 cetrafs_nswait_is_current cetrafs_pending_any cetrafs_row_mark_of cetrafs_row_mark_same cetrafs_sb_bg_discard_pending_ignored cetrafs_sb_layout_of cetrafs_sb_stale_secs'
 SL="$(spin_lines "$K"/*.c)"
 [ "$(wc -l <<<"$SL")" -gt 100 ] || fail "class 19 spinlock: setup -- only $(wc -l <<<"$SL") lines found under a spinlock (the scan no longer matches)"
 SPIN_BAD="$(grep -E "$SPIN_SLEEPERS_RE" <<<"$SL" | grep -vE 'GFP_ATOMIC|GFP_NOWAIT' | head -5 || true)"
@@ -1945,7 +1945,10 @@ cetrafs_tree_insert_any_leaf final:every-interior-and-every-leaf-full-under-inva
 cetrafs_tree_build final:the-extent-tree-is-full
 cetrafs_xattr_set_locked final:the-xattr-block-is-full
 cetrafs_node_register final:every-registry-row-taken
-cetrafs_zg_queue_foreign_free below:a-full-queue-is-a-logged-leak-its-caller-reports-as-success'
+cetrafs_zg_queue_foreign_free below:a-full-queue-is-a-logged-leak-its-caller-reports-as-success
+cetrafs_dir_add_entry final:the-directory-is-at-CETRAFS_DIR_MAX_BLOCKS
+cetrafs_tree_resv_fill final:test-injection-convert_append_nospc
+cetrafs_tree_alloc_block final:test-injection-convert_append_nospc'
 C43_REG_EBUSY='cetrafs_lock_suspend waits:schedule_timeout_killable
 cetrafs_nslock_acquire_tries waits:msleep
 __cetrafs_nslock_acquire_set waits:msleep
@@ -2115,6 +2118,7 @@ cetrafs_tree_split_leaf own:a-new-leaf-whose-write-failed-before-any-interior-na
 cetrafs_tree_build own:a-tree-never-published
 cetrafs_inode_set_reservation own:a-reservation-run-never-published
 cetrafs_inode_drop_reservation own:the-unused-rest-of-a-reservation-run
+cetrafs_tree_resv_release own:the-unused-tree-block-reserve-of-a-convert-never-published
 cetrafs_evict_inode recheck:cetrafs_free_inode_begin
 __cetrafs_truncate_shrink recheck:cetrafs_rebuild_peer_present
 cetrafs_fallocate recheck:cetrafs_rebuild_peer_present
@@ -2348,7 +2352,8 @@ file.c:cetrafs_tree_split_leaf:a new leaf whose write failed, before any interio
 file.c:cetrafs_tree_build:a tree it built and never published
 dir.c:cetrafs_mkdir_locked:a dirent block it allocated and never published
 lock.c:cetrafs_inode_set_reservation:a reservation run, never published
-lock.c:cetrafs_inode_drop_reservation:the unused rest of a reservation run, never published'
+lock.c:cetrafs_inode_drop_reservation:the unused rest of a reservation run, never published
+lock.c:cetrafs_tree_resv_release:the unused tree-block reserve of a convert, never published (FD-1)'
 free_callers() {
     for f in "$@"; do
         awk -v F="$(basename "$f")" '
