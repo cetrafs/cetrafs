@@ -2907,10 +2907,18 @@ int cetrafs_alloc_flush_bitmaps(struct super_block *sb)
     return ret;
 }
 
+/* TEST ONLY: the bitmap flush writes the bits but issues no cache flush
+ * after them, as before audit 2026-11-14 A2 -- the control of
+ * tests/kernel/bmap_flush_cache_flush.sh. */
+static bool cetrafs_bmap_flush_no_cache_flush;
+cetrafs_test_param(bmap_flush_no_cache_flush, cetrafs_bmap_flush_no_cache_flush, bool, 0644);
+MODULE_PARM_DESC(bmap_flush_no_cache_flush, "TEST ONLY: no device cache flush after the allocation bitmaps");
+
 static int __cetrafs_alloc_flush_bitmaps(struct super_block *sb)
 {
     const cetrafs_superblock_t *raw_sb = cetrafs_sb_raw(sb);
     u32 bg_count, bg_id;
+    unsigned long *wrote = NULL;
     unsigned int stall;
     int ret = 0;
 
@@ -2949,9 +2957,46 @@ static int __cetrafs_alloc_flush_bitmaps(struct super_block *sb)
                                bg_ret);
             if (!ret)
                 ret = bg_ret;
+        } else {
+            /* Written: remembered, so a refused cache flush below can
+             * put its mark back. Without the memory, mark it back now:
+             * the next boundary rewrites it, which costs a write, never
+             * a publish ahead of its bits. */
+            if (!wrote)
+                wrote = bitmap_zalloc(bg_count, GFP_NOFS);
+            if (wrote) {
+                __set_bit(bg_id, wrote);
+            } else {
+                cetrafs_sb_note_bmap_alloc(sb, bg_id);
+                if (!ret)
+                    ret = -ENOMEM;
+            }
         }
         cond_resched();
     }
+    /*
+     * Written is not durable. Every caller publishes next -- a whole
+     * record, a namespace CAS, an fd sector -- and on a write-back LUN
+     * the publish and these bits reach the media in either order: a
+     * power cut between leaves a directory or xattr block referenced
+     * and FREE (audit 2026-11-14 A2; rule 8). One cache flush here, only
+     * when bits were written, covers every caller; an idle call stays
+     * free. Refused, the marks go back and the caller refuses to publish.
+     */
+    if (wrote && !READ_ONCE(cetrafs_bmap_flush_no_cache_flush)) {
+        int fret = cetrafs_publish_flush(sb);
+
+        if (fret) {
+            for_each_set_bit(bg_id, wrote, bg_count)
+                cetrafs_sb_note_bmap_alloc(sb, bg_id);
+            pr_err_ratelimited("allocation bitmaps written but the device cache flush failed (%d) -- refusing to "
+                               "publish extents\n",
+                               fret);
+            if (!ret)
+                ret = fret;
+        }
+    }
+    bitmap_free(wrote);
     return ret;
 }
 
