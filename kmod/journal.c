@@ -916,6 +916,11 @@ static bool cetrafs_journal_ignore_owner;
 cetrafs_test_param(journal_ignore_owner, cetrafs_journal_ignore_owner, bool, 0644);
 MODULE_PARM_DESC(journal_ignore_owner, "test-only: replay neither checks an entry's owner nor advances its stamp");
 
+/* TEST ONLY: the next N replay region checks answer -EINVAL after the
+ * lookup accepted the target (tests/kernel/journal_replay_no_region.sh). */
+static unsigned int cetrafs_journal_alloc_region_fail;
+cetrafs_test_param(journal_alloc_region_fail, cetrafs_journal_alloc_region_fail, uint, 0644);
+MODULE_PARM_DESC(journal_alloc_region_fail, "TEST ONLY: the next N journal replay region checks answer -EINVAL");
 
 static u64 cetrafs_journal_header_lba(const struct cetrafs_journal *j, u64 slot)
 {
@@ -2536,11 +2541,32 @@ static int __cetrafs_journal_replay_node(struct super_block *sb, u32 node_id, bo
             bool live = true;
             int aret = cetrafs_data_block_is_allocated(sb, entries[s].target_lba, &live);
 
-            if (aret == -EIO || aret == -EAGAIN) {
-                ret = -EIO;
+            if (!aret && READ_ONCE(cetrafs_journal_alloc_region_fail)) {
+                WRITE_ONCE(cetrafs_journal_alloc_region_fail, cetrafs_journal_alloc_region_fail - 1);
+                aret = -EINVAL; /* TEST ONLY: as a region the lookup accepted, then lost */
+            }
+            if (aret == -EINVAL) {
+                /* Outside every data region (a group's header, its
+                 * bitmaps, the tables): no entry this format writes
+                 * targets one, so the redo would scribble on metadata.
+                 * Refuse it and consume it, as a stale target is. */
+                atomic64_inc(&cetrafs_journal_replay_refused);
+                pr_err("journal replay: node %u txn %llu target block %llu lies in no data region -- NOT "
+                       "applying the entry\n",
+                       node_id, (unsigned long long) entries[s].txn_id,
+                       (unsigned long long) entries[s].target_lba);
+                goto consume;
+            }
+            if (aret) {
+                /* Could not decide: the entry is kept, the area stays dirty. */
+                pr_err("journal replay: node %u txn %llu: could not tell whether target block %llu is "
+                       "allocated (%d) -- entry kept, area stays dirty\n",
+                       node_id, (unsigned long long) entries[s].txn_id,
+                       (unsigned long long) entries[s].target_lba, aret);
+                ret = aret == -ENOMEM ? aret : -EIO;
                 goto out_free;
             }
-            if (!aret && !live) {
+            if (!live) {
                 atomic64_inc(&cetrafs_journal_replay_skipped);
                 pr_info("journal replay: node %u txn %llu target block %llu has been freed since -- nothing to "
                         "repair, not writing it\n",
