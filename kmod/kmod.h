@@ -524,6 +524,7 @@ s64 cetrafs_sb_bg_flight_begin(struct super_block *sb, u32 bg_id, s64 desc);
 void cetrafs_sb_bg_flight_end(struct super_block *sb, u32 bg_id, s64 requeue);
 s64 cetrafs_sb_bg_flight_begin_value(struct super_block *sb, u32 bg_id, s64 value);
 bool cetrafs_sb_bg_delta_pending(struct super_block *sb, u32 bg_id);
+u64 cetrafs_release_held_delta_count(void);
 void cetrafs_sb_bg_flight_settle_end(struct super_block *sb, u32 bg_id, s64 requeue);
 u64 cetrafs_sb_bg_epoch(struct super_block *sb, u32 bg_id);
 s64 cetrafs_sb_set_bg_epoch(struct super_block *sb, u32 bg_id, u64 seq);

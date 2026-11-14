@@ -1776,6 +1776,20 @@ static int cetrafs_zg_is_fully_empty(struct super_block *sb, u32 zg_id, bool *ou
  * a local allocation landed in it in the meantime); *out_released just
  * stays false.
  */
+/* TEST ONLY: a release goes ahead with a member's delta still accrued,
+ * as before P3 -- the control of tests/kernel/zg_release_flush.sh. */
+static bool cetrafs_release_delta_guard_off;
+cetrafs_test_param(release_delta_guard_off, cetrafs_release_delta_guard_off, bool, 0644);
+MODULE_PARM_DESC(release_delta_guard_off, "TEST ONLY: release a Zone Group whose member still holds a free-count delta");
+
+/* Releases kept back because a member still held a delta (procfs info). */
+static atomic64_t cetrafs_release_held_delta = ATOMIC64_INIT(0);
+
+u64 cetrafs_release_held_delta_count(void)
+{
+    return (u64) atomic64_read(&cetrafs_release_held_delta);
+}
+
 static int cetrafs_zg_try_release_one(struct super_block *sb, u32 zg_id, u32 my_node_id, bool *out_released)
 {
     cetrafs_zone_group_t *zg; /* heap, not stack -- see the comment above */
@@ -1838,13 +1852,25 @@ static int cetrafs_zg_try_release_one(struct super_block *sb, u32 zg_id, u32 my_
         }
     cetrafs_flush_dirty_free_counts(sb);
     /* A release promises the next owner that no delta of ours can land
-     * after it (its claim keeps the members' epochs, P3): a member whose
-     * flush did not take is kept. */
-    for (b = 0; b < nbg; b++)
-        if (cetrafs_sb_bg_owner(sb, b) == zg_id && cetrafs_sb_bg_delta_pending(sb, b)) {
+     * after it (its claim keeps the members' epochs, P3). The flush above
+     * skips a member another flusher -- a sync -- has already taken into
+     * a flight, and a delta in flight reads as none: so each member's
+     * flush right is taken, which waits that write out, before asking.
+     * A member still holding a delta (its flush did not take) is kept. */
+    for (b = 0; b < nbg && !READ_ONCE(cetrafs_release_delta_guard_off); b++) {
+        bool pending;
+
+        if (cetrafs_sb_bg_owner(sb, b) != zg_id)
+            continue;
+        cetrafs_sb_bg_flush_lock(sb, b);
+        pending = cetrafs_sb_bg_delta_pending(sb, b);
+        cetrafs_sb_bg_flush_unlock(sb, b);
+        if (pending) {
+            atomic64_inc(&cetrafs_release_held_delta);
             ret = 0;
             goto out_undrain;
         }
+    }
 
     ret = cetrafs_zg_is_fully_empty(sb, zg_id, &empty);
     if (ret || !empty) {

@@ -340,6 +340,7 @@ static int cetrafs_proc_info_show(struct seq_file *m, void *v)
     seq_printf(m, "update_crcs: %llu\n", cetrafs_update_crc_count());
     seq_printf(m, "tail_lazy: %llu\n", cetrafs_tail_lazy_count());
     seq_printf(m, "reconcile_epoch_kept: %llu\n", cetrafs_reconcile_epoch_kept_count());
+    seq_printf(m, "release_held_delta: %llu\n", cetrafs_release_held_delta_count());
     /* Slots held by entries a failed write kept for replay. Nonzero is a
      * device that refused writes; at the slot count, journaled writes
      * fail until a rewrite of those blocks (or a remount) frees them. */
