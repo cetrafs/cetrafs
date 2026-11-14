@@ -182,6 +182,9 @@ struct cetrafs_node_claim_ctx {
     u32 file_lock_mode;
     u32 caps; /* CETRAFS_NODE_CAP_* this mount advertises */
     u32 incarnation; /* this mount's (cetrafs_node_new_incarnation()) */
+    /* Registration's last resort, with no FREE row left: a row whose machine
+     * departed CLEANLY may be taken over. Set only then (audit O11). */
+    bool recycle;
 };
 
 /*
@@ -232,8 +235,13 @@ static int cetrafs_node_claim_mutate(void *image, unsigned int len, void *priv)
     /* Only FREE rows are claimable. mkfs leaves the whole table
      * zero-filled and never stamps a FREE row's checksum, so state is
      * the only field that may be trusted here -- exactly as
-     * cetrafs_read_node_entry() documents. */
-    if (ne.state != CETRAFS_NODE_STATE_FREE)
+     * cetrafs_read_node_entry() documents. The one exception is a row
+     * whose machine left CLEANLY (departure == CLEAN): its claims were
+     * released and its journal parked, and with no FREE row the volume
+     * would otherwise refuse every new machine for good (audit O11). */
+    if (ne.state != CETRAFS_NODE_STATE_FREE &&
+        !(ctx->recycle && cetrafs_le32(ne.state) == CETRAFS_NODE_STATE_REGISTERED &&
+          cetrafs_le32(ne.departure) == CETRAFS_NODE_DEPART_CLEAN))
         return -EEXIST;
 
     memset(&ne, 0, sizeof(ne));
@@ -941,6 +949,7 @@ int cetrafs_node_register(struct super_block *sb,
     uuid_t my_uuid;
     cetrafs_node_entry_t ne;
     u32 count, idx;
+    unsigned int pass;
     bool any_free = false, lost_race = false;
     int ret;
 
@@ -1055,11 +1064,6 @@ int cetrafs_node_register(struct super_block *sb,
         }
     }
 
-    if (!any_free) {
-        pr_err("node registration: registry full (%u rows)\n", count);
-        return -ENOSPC;
-    }
-
     /* Pass 2: no existing row -- claim a free one, as ONE atomic
      * compare-and-swap of the row's own sector.
      *
@@ -1073,7 +1077,13 @@ int cetrafs_node_register(struct super_block *sb,
      * -- so a lost race is detected by construction rather than by a
      * verify-read that could itself be stale. On hardware without atomic
      * CAW this degrades inside cetrafs_cas_record() to exactly the old
-     * behavior (cluster mutex around a fresh read-modify-write). */
+     * behavior (cluster mutex around a fresh read-modify-write).
+     *
+     * Pass 3 (only when no row is FREE) takes over a row whose machine
+     * left cleanly -- see cetrafs_node_claim_mutate(). Every new machine
+     * otherwise needed a row of its own for good: 64 identities refused
+     * every mount on the volume, and no tool forgets a node (audit O11). */
+    for (pass = any_free ? 0 : 1; pass < (any_free ? 1u : 2u); pass++)
     for (idx = 0; idx < count; idx++) {
         struct cetrafs_node_claim_ctx ctx = {
             .uuid = my_uuid.b,
@@ -1082,6 +1092,7 @@ int cetrafs_node_register(struct super_block *sb,
             .file_lock_mode = file_lock_mode,
             .caps = cetrafs_node_my_caps(sb),
             .incarnation = cetrafs_node_new_incarnation(0),
+            .recycle = pass == 1,
         };
 
         ret = cetrafs_cas_record(sb, cetrafs_node_row_lba(sb, idx), cetrafs_node_claim_mutate, &ctx);
