@@ -6814,6 +6814,25 @@ s64 cetrafs_sb_set_bg_epoch(struct super_block *sb, u32 bg_id, u64 seq)
     return stale;
 }
 
+/*
+ * As cetrafs_sb_set_bg_epoch(), but the delta accrued so far STAYS. For a
+ * recount whose flight already took the delta its count holds: what is
+ * still accrued happened after that count was read, so it is not in the
+ * count and belongs to the new epoch. Its caller holds the flush right,
+ * so no flush can apply the delta under the old epoch meanwhile.
+ */
+void cetrafs_sb_set_bg_epoch_keep(struct super_block *sb, u32 bg_id, u64 seq)
+{
+    struct cetrafs_sb_info *sbi = sb->s_fs_info;
+
+    struct cetrafs_bg_chunk *c;
+    u32 i;
+
+    c = cetrafs_bgc(sbi, bg_id, &i);
+    if (c)
+        WRITE_ONCE(c->bg_count_epoch[i], seq);
+}
+
 /* Same idea as cetrafs_sb_mark_bg_free_dirty() above, for a ZG's own
  * free_data_blocks aggregate -- called by zonegroup.c's cetrafs_zg_
  * adjust_free_blocks(). */

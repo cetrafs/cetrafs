@@ -4086,7 +4086,7 @@ int cetrafs_bg_reconcile_free_count(struct super_block *sb, u32 bg_id, s64 *out_
     return ret;
 }
 
-static int __cetrafs_reconcile_locked(struct super_block *sb, u32 bg_id, s64 *out_delta, s64 *out_agg);
+static int __cetrafs_reconcile_locked(struct super_block *sb, u32 bg_id, s64 *out_delta);
 
 /* Under the flush right: the recount's write is a flight like a flush's
  * (cetrafs_bg_chunk.bg_flight_gen) -- see the swap below -- and two
@@ -4097,7 +4097,7 @@ static int cetrafs_reconcile_locked(struct super_block *sb, u32 bg_id, s64 *out_
 
     if (ret)
         return ret;
-    ret = __cetrafs_reconcile_locked(sb, bg_id, out_delta, NULL);
+    ret = __cetrafs_reconcile_locked(sb, bg_id, out_delta);
     cetrafs_sb_bg_flush_unlock(sb, bg_id);
     return ret;
 }
@@ -4109,40 +4109,158 @@ static bool cetrafs_recount_agg_off;
 cetrafs_test_param(recount_agg_off, cetrafs_recount_agg_off, bool, 0644);
 MODULE_PARM_DESC(recount_agg_off, "TEST ONLY: an ENOSPC recount does not correct the Zone Group aggregate");
 
+/* TEST ONLY: the ENOSPC recount holds alloc_mutex across its descriptor
+ * write, as before the flight narrowing (audit 2026-11-14 A6, remainder):
+ * the control of tests/kernel/enospc_recount_concurrent.sh. */
+static bool cetrafs_recount_hold_alloc;
+cetrafs_test_param(recount_hold_alloc, cetrafs_recount_hold_alloc, bool, 0644);
+MODULE_PARM_DESC(recount_hold_alloc, "TEST ONLY: an ENOSPC recount holds alloc_mutex across its descriptor write");
+/* TEST ONLY: an ENOSPC recount's epoch move drops the delta accrued
+ * during its flight, as the move did before: the negative control of
+ * the same suite -- the exactness check must catch the loss. */
+static bool cetrafs_recount_inflight_drop;
+cetrafs_test_param(recount_inflight_drop, cetrafs_recount_inflight_drop, bool, 0644);
+MODULE_PARM_DESC(recount_inflight_drop, "TEST ONLY: an ENOSPC recount drops the delta accrued during its flight");
+
 /*
  * The recount after an allocation found a Block Group full that its
  * count called free. The aggregate of its Zone Group summed the same
  * wrong count, and is corrected by the same amount: the truth less what
- * the group's count stood at, its dropped accrual included (that was in
+ * the group's count stood at, its taken accrual included (that was in
  * the aggregate too). fsck's aggregate check failed until the next
  * ownership transfer otherwise (audit 2026-11-14 A6).
+ *
+ * alloc_mutex covers the count and the take of the delta the count
+ * already holds -- the two must see the same bitmap -- and nothing
+ * else. The descriptor write runs as a flight (class 52) with the
+ * flush right held and the mutex dropped: an allocation or a free
+ * landing meanwhile moves the bitmap after the count, so it accrues
+ * into the delta that is still there, and the epoch move keeps it
+ * (cetrafs_sb_set_bg_epoch_keep()). Dropping it would leave the
+ * descriptor short of the bitmap by that much -- the negative control.
  */
 int cetrafs_bg_recount_after_enospc(struct super_block *sb, u32 bg_id, s64 *out_delta)
 {
-    s64 agg = 0;
+    struct cetrafs_bg_geom bg;
+    struct cetrafs_bg_count_ctx ctx = {.absolute = true, .bg_id = bg_id};
+    u64 bmap_lba, bmap_blocks;
+    bool alloc_held = true, flight, hold, drop;
+    long truth;
+    s64 delta = 0, taken = 0, dropped = 0, agg = 0;
+    u32 zg;
     int ret;
 
     if (out_delta)
         *out_delta = 0;
     if (!cetrafs_sb_raw(sb))
         return -EINVAL;
+
     cetrafs_sb_alloc_lock(sb);
     ret = cetrafs_sb_bg_flush_lock(sb, bg_id);
-    if (!ret) {
-        ret = __cetrafs_reconcile_locked(sb, bg_id, out_delta, &agg);
-        cetrafs_sb_bg_flush_unlock(sb, bg_id);
+    if (ret)
+        goto unlock_alloc;
+    ret = cetrafs_read_bg_geom(sb, bg_id, &bg);
+    if (ret)
+        goto put_flush;
+    bmap_lba = bg.start_block + bg.off_data_bmap;
+    bmap_blocks = bg.off_data_region - bg.off_data_bmap;
+    truth = cetrafs_bitmap_count_free(sb, bmap_lba, bmap_blocks, bg.data_block_count);
+    if (truth < 0) {
+        ret = (int) truth;
+        goto put_flush;
     }
-    if (!ret && agg && !READ_ONCE(cetrafs_recount_agg_off)) {
-        u32 zg = cetrafs_sb_bg_owner(sb, bg_id);
+    delta = (s64) truth - (s64) bg.free_data_blocks;
+    if (delta)
+        /* Loud: this is a real inconsistency being repaired, not routine
+         * bookkeeping, and the size of the drift is the only evidence
+         * left of what the crash cost. */
+        pr_warn("BG %u: cached free_data_blocks=%llu but its bitmap says %ld -- correcting (drift %lld)\n", bg_id,
+                bg.free_data_blocks, truth, delta);
 
+    /* class 52: the count and the delta it already holds are taken
+     * together, under the mutex that makes every accrual. From here the
+     * accrued delta is in the flight's value, and anything accrued after
+     * it is in the delta still. */
+    flight = !READ_ONCE(cetrafs_reconcile_flight_off);
+    hold = !flight || READ_ONCE(cetrafs_recount_hold_alloc);
+    drop = !flight || READ_ONCE(cetrafs_recount_inflight_drop);
+    if (flight)
+        taken = cetrafs_sb_bg_flight_begin_value(sb, bg_id, (s64) truth);
+    if (!hold) {
+        cetrafs_sb_alloc_unlock(sb);
+        alloc_held = false;
+    }
+    {
+        unsigned int pause = xchg(&cetrafs_reconcile_pause_ms, 0);
+
+        if (pause) {
+            pr_info("reconcile: BG %u recounted, pausing %u ms (test)\n", bg_id, pause);
+            msleep(pause); /* test-only; see the parameter */
+        }
+    }
+
+    /* The write: a compare-and-swap that also ADVANCES the ownership
+     * epoch (see cetrafs_bg_count_mutate()). */
+    ctx.value = truth;
+    ret = cetrafs_cas_record_seeded(sb, cetrafs_sb_bg_desc_lba(sb, bg_id), NULL, 0, cetrafs_bg_count_mutate, &ctx);
+    if (ret) {
+        if (flight)
+            cetrafs_sb_bg_flight_settle_end(sb, bg_id, taken); /* not recounted: the delta still stands */
+        goto put_flush;
+    }
+    {
+        unsigned int pause = xchg(&cetrafs_reconcile_written_stall_ms, 0);
+
+        if (pause) {
+            pr_info("reconcile: BG %u written, pausing %u ms (test)\n", bg_id, pause);
+            msleep(pause); /* test-only; see the parameter */
+        }
+    }
+    if (taken && drop)
+        pr_warn("BG %u: dropping an accrued free delta of %lld -- the count was recounted (epoch -> %llu)\n", bg_id,
+                (long long) taken, (unsigned long long) ctx.out_seq);
+    /* Deltas accrued from here on belong to the fresh epoch. The move
+     * drops what is still accrued only when it has to (no flight: the
+     * mutex was held throughout, so nothing else is in it, and the
+     * control keeps the drop). */
+    if (drop)
+        dropped = cetrafs_sb_set_bg_epoch(sb, bg_id, ctx.out_seq);
+    else
+        cetrafs_sb_set_bg_epoch_keep(sb, bg_id, ctx.out_seq);
+    if (flight)
+        cetrafs_sb_bg_flight_settle_end(sb, bg_id, 0);
+    /* What the aggregate summed for this group moved by the truth less
+     * what the count stood at, its taken accrual included, and less any
+     * accrual dropped by the move. */
+    agg = delta - taken - dropped;
+
+put_flush:
+    cetrafs_sb_bg_flush_unlock(sb, bg_id);
+    if (ret)
+        goto unlock_alloc;
+    /* The aggregate is corrected under the mutex: the owner must not
+     * change between reading it and accruing into it. */
+    if (!alloc_held) {
+        cetrafs_sb_alloc_lock(sb);
+        alloc_held = true;
+    }
+    if (delta > 0)
+        cetrafs_sb_set_release_check(sb, bg_id, true); /* recounted up: it may be empty */
+    if (agg && !READ_ONCE(cetrafs_recount_agg_off)) {
+        zg = cetrafs_sb_bg_owner(sb, bg_id);
         if (zg != CETRAFS_BG_OWNER_FREE)
             cetrafs_zg_adjust_free_blocks(sb, zg, agg);
     }
-    cetrafs_sb_alloc_unlock(sb);
+    if (out_delta)
+        *out_delta = delta;
+
+unlock_alloc:
+    if (alloc_held)
+        cetrafs_sb_alloc_unlock(sb);
     return ret;
 }
 
-static int __cetrafs_reconcile_locked(struct super_block *sb, u32 bg_id, s64 *out_delta, s64 *out_agg)
+static int __cetrafs_reconcile_locked(struct super_block *sb, u32 bg_id, s64 *out_delta)
 {
     struct cetrafs_bg_geom bg;
     u64 bmap_lba, bmap_blocks;
@@ -4197,7 +4315,7 @@ static int __cetrafs_reconcile_locked(struct super_block *sb, u32 bg_id, s64 *ou
          * (one sector CAW, cache left warm and correct) -- unseeded here:
          * reconcile runs at ownership transfer, where the cache is being
          * repopulated anyway. */
-        s64 taken, dropped;
+        s64 taken;
 
         /* class 52: the accrued delta is already in the truth, and the
          * cached descriptor takes the truth when the swap lands -- so the
@@ -4231,9 +4349,7 @@ static int __cetrafs_reconcile_locked(struct super_block *sb, u32 bg_id, s64 *ou
          * the aggregate summed for this group was the count plus the
          * accrual dropped: taken by the flight, or (no flight) by this
          * epoch move. */
-        dropped = cetrafs_sb_set_bg_epoch(sb, bg_id, ctx.out_seq);
-        if (out_agg)
-            *out_agg = delta - taken - dropped;
+        cetrafs_sb_set_bg_epoch(sb, bg_id, ctx.out_seq);
         if (flight)
             cetrafs_sb_bg_flight_settle_end(sb, bg_id, 0);
         if (delta > 0)
