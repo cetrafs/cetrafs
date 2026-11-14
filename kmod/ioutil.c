@@ -1071,6 +1071,13 @@ bool cetrafs_blk_tail_valid(const struct buffer_head *bh, u32 magic)
     return cetrafs_blk_image_valid(bh->b_data, magic);
 }
 
+/* The test cetrafs_blk_tail_bread() applies to a fresh read, for a caller
+ * that batches its own reads (the tree walk's batch, file.c). */
+bool cetrafs_blk_read_accepts(const struct buffer_head *bh, u32 magic)
+{
+    return !cetrafs_tear_injected() && cetrafs_blk_tail_valid(bh, magic);
+}
+
 /*
  * Forced-fresh read of a tail-checksummed block, retrying a mismatch.
  *

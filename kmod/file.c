@@ -1313,40 +1313,103 @@ void cetrafs_tree_invalidate_cached(struct inode *inode, const cetrafs_inode_t *
  * filefrag of one fallocated 16 GiB image on an FC array made ~880
  * FIEMAP calls, re-read its 1,021 tree blocks on each, and held the
  * inode lock for 285 s. */
-/* TEST ONLY: a whole-tree walk reads its leaves one at a time, as before
- * P12 -- the control of tests/kernel/tree_walk_readahead.sh. */
+/* TEST ONLY: a whole-tree walk reads its index and leaf blocks one at a
+ * time, as before P12 -- the control of tests/kernel/tree_walk_readahead.sh
+ * and tests/kernel/evict_walk_batched.sh. */
 static bool cetrafs_flatten_prefetch_off;
 cetrafs_test_param(flatten_prefetch_off, cetrafs_flatten_prefetch_off, bool, 0644);
-MODULE_PARM_DESC(flatten_prefetch_off, "TEST ONLY: a tree walk reads its extent leaves one at a time");
+MODULE_PARM_DESC(flatten_prefetch_off, "TEST ONLY: a tree walk reads its extent blocks one at a time");
 
 /*
- * P12: the leaves under one index block are read ahead together when the
- * walk will read them from the cache (the same predicate the per-leaf
- * reader uses), so the device sees them in flight at once instead of one
- * round trip per leaf. Only the cached path benefits: an untrusted leaf is
- * read fresh, and a read-ahead would only add a second read of it. Each
- * leaf is still read and checked by the per-leaf reader below; a leaf
- * address that is not a data address is not read ahead.
+ * P12: the blocks a walk needs are read as ONE batch, whichever way the
+ * walk reads them. A walk used to read each extent leaf in turn, one device
+ * round trip apiece, and only a TRUSTED walk at depth 2 had any read-ahead
+ * (sb_breadahead, one index block at a time). An UNTRUSTED walk -- an evict
+ * of a closed file, a scrub, a reporter whose file a peer has open -- had
+ * none, so an unlink of a fragmented file paid ~1000 serial reads before it
+ * freed anything (audit 2026-11-14 P12). Every block the walk does not
+ * already hold is submitted under one plug and waited for once.
+ *
+ * A block is accepted here exactly when the per-block reader would accept
+ * it -- a trusted cached copy that is uptodate, or a fresh read whose tail
+ * verifies -- and its counts check. Everything else (a refused address, a
+ * torn or damaged block, a failed read) is left NULL, and the caller reads
+ * that one block through cetrafs_read_tree_bh_for(), which retries, refuses
+ * and reports exactly as before.
  */
-static void cetrafs_flatten_readahead(struct inode *inode, const cetrafs_extent_idx_t *iarr, u32 iln, bool reader)
+static void cetrafs_tree_batch_fast(struct inode *inode, const sector_t *lbas, u32 n, u32 magic, bool reader,
+                                    struct buffer_head **bhs)
 {
     struct super_block *sb = inode->i_sb;
-    u32 li;
+    sector_t *nl = NULL;
+    struct buffer_head **nb = NULL;
+    u32 *na = NULL;
+    bool trusted;
+    u32 i, j, k = 0;
 
-    if (iln < 2 || READ_ONCE(cetrafs_flatten_prefetch_off))
-        return;
-    if (!(reader ? cetrafs_lock_read_cache_trusted(inode) : cetrafs_lock_held_for_write_locally(inode)))
-        return;
-    for (li = 0; li < iln; li++) {
-        u64 llba = cetrafs_extent_phys_from_hilo(iarr[li].ei_leaf_hi, iarr[li].ei_leaf_lo);
+    for (i = 0; i < n; i++) {
+        /* An address the reader would refuse, or cannot judge yet: the
+         * per-block reader decides, so nothing here is read. */
+        int rc = cetrafs_lba_run_check(sb, lbas[i], 1);
 
-        int rc = cetrafs_lba_run_check(sb, llba, 1);
-
-        /* -EAGAIN (cannot tell yet) or a refusal: nothing read ahead.
-         * Advisory only -- the leaf's own read below decides. */
+        /* -EAGAIN (cannot judge the layout yet) or a refusal: the per-block
+         * reader decides, so nothing here is read. */
         if (rc == -EAGAIN || rc)
+            return;
+    }
+    nl = kvmalloc_array(n, sizeof(*nl), GFP_NOFS);
+    na = kvmalloc_array(n, sizeof(*na), GFP_NOFS);
+    nb = kvcalloc(n, sizeof(*nb), GFP_NOFS);
+    if (!nl || !na || !nb)
+        goto out; /* not an error: every block goes through the per-block reader */
+
+    trusted = reader ? cetrafs_lock_read_cache_trusted(inode) : cetrafs_lock_held_for_write_locally(inode);
+    for (i = 0; i < n; i++) {
+        struct buffer_head *bh = trusted ? sb_getblk(sb, lbas[i]) : NULL;
+
+        if (bh && buffer_uptodate(bh) && cetrafs_blk_struct_ok_magic(bh, magic)) {
+            bhs[i] = bh;
             continue;
-        sb_breadahead(sb, llba);
+        }
+        brelse(bh);
+        nl[k] = lbas[i];
+        na[k++] = i;
+    }
+    if (k && !cetrafs_bread_uncached_list(sb, nl, k, nb)) {
+        for (j = 0; j < k; j++) {
+            struct buffer_head *bh = nb[j];
+
+            /* The per-block reader's test for a fresh read, plus the counts. */
+            if (bh && cetrafs_blk_read_accepts(bh, magic) && cetrafs_blk_struct_ok_magic(bh, magic))
+                bhs[na[j]] = bh;
+            else
+                brelse(bh);
+        }
+    }
+out:
+    kvfree(nb);
+    kvfree(na);
+    kvfree(nl);
+}
+
+/*
+ * Reads lbas[0..n) into bhs[0..n): as one batch where the batch takes the
+ * block, and one at a time through the tree reader for every block it did
+ * not take. bhs[i] is NULL only where that reader failed; the caller
+ * releases every non-NULL entry.
+ */
+static void cetrafs_tree_read_batch(struct inode *inode, const sector_t *lbas, u32 n, u32 magic, const char *what,
+                                    bool reader, struct buffer_head **bhs)
+{
+    u32 i;
+
+    for (i = 0; i < n; i++)
+        bhs[i] = NULL;
+    if (n >= 2 && !READ_ONCE(cetrafs_flatten_prefetch_off))
+        cetrafs_tree_batch_fast(inode, lbas, n, magic, reader, bhs);
+    for (i = 0; i < n; i++) {
+        if (!bhs[i])
+            bhs[i] = cetrafs_read_tree_bh_for(inode, lbas[i], magic, what, reader);
     }
 }
 
@@ -1354,76 +1417,98 @@ static int cetrafs_tree_flatten_for(struct inode *inode, const cetrafs_inode_t *
                                     u32 *out_n, bool reader)
 {
     cetrafs_extent_t *arr = NULL;
-    u32 cap = 0, n = 0, ni;
+    struct buffer_head *ibhs[ARRAY_SIZE(raw->et.idx)] = {NULL};
+    sector_t ilbas[ARRAY_SIZE(raw->et.idx)];
+    u32 cap = 0, n = 0, ni, nin;
     int ret = 0;
 
-    for (ni = 0; ni < cetrafs_le16(raw->eh.eh_entries) && ni < ARRAY_SIZE(raw->et.idx); ni++) {
-        u64 ilba = cetrafs_extent_phys_from_hilo(raw->et.idx[ni].ei_leaf_hi, raw->et.idx[ni].ei_leaf_lo);
-        struct buffer_head *ibh = cetrafs_read_index_bh_for(inode, ilba, reader);
+    /* P12: the root's interior blocks are read as one batch, then each
+     * one's leaves as one batch. Blocks not taken by the batch are read
+     * one at a time by cetrafs_tree_read_batch(), which checks them. */
+    nin = min_t(u32, cetrafs_le16(raw->eh.eh_entries), ARRAY_SIZE(raw->et.idx));
+    for (ni = 0; ni < nin; ni++)
+        ilbas[ni] = cetrafs_extent_phys_from_hilo(raw->et.idx[ni].ei_leaf_hi, raw->et.idx[ni].ei_leaf_lo);
+    cetrafs_tree_read_batch(inode, ilbas, nin, CETRAFS_INDEX_TAIL_MAGIC, "extent index", reader, ibhs);
+
+    for (ni = 0; ni < nin && !ret; ni++) {
         const cetrafs_extent_hdr_t *ihdr;
         const cetrafs_extent_idx_t *iarr;
+        sector_t *llbas = NULL;
+        struct buffer_head **lbhs = NULL;
         u32 li, iln;
 
-        if (!ibh) {
+        if (!ibhs[ni]) {
             ret = -EIO;
-            goto fail;
+            break;
         }
-        ihdr = (const cetrafs_extent_hdr_t *) ibh->b_data;
-        iarr = (const cetrafs_extent_idx_t *) (ibh->b_data + sizeof(*ihdr));
+        ihdr = (const cetrafs_extent_hdr_t *) ibhs[ni]->b_data;
+        iarr = (const cetrafs_extent_idx_t *) (ibhs[ni]->b_data + sizeof(*ihdr));
         iln = min_t(u32, cetrafs_le16(ihdr->eh_entries), CETRAFS_EXT_BLOCK_MAX_IDX);
-        cetrafs_flatten_readahead(inode, iarr, iln, reader);
 
-        for (li = 0; li < iln; li++) {
-            u64 llba = cetrafs_extent_phys_from_hilo(iarr[li].ei_leaf_hi, iarr[li].ei_leaf_lo);
-            struct buffer_head *lbh = cetrafs_read_leaf_bh_for(inode, llba, reader);
-            const cetrafs_extent_hdr_t *lhdr;
-            u32 ln;
+        llbas = kvmalloc_array(iln ? iln : 1, sizeof(*llbas), GFP_NOFS);
+        lbhs = kvcalloc(iln ? iln : 1, sizeof(*lbhs), GFP_NOFS);
+        if (!llbas || !lbhs) {
+            ret = -ENOMEM;
+        } else {
+            for (li = 0; li < iln; li++)
+                llbas[li] = cetrafs_extent_phys_from_hilo(iarr[li].ei_leaf_hi, iarr[li].ei_leaf_lo);
+            cetrafs_tree_read_batch(inode, llbas, iln, CETRAFS_LEAF_TAIL_MAGIC, "extent leaf", reader, lbhs);
 
-            if (!lbh) {
-                brelse(ibh);
-                ret = -EIO;
-                goto fail;
-            }
-            lhdr = (const cetrafs_extent_hdr_t *) lbh->b_data;
-            ln = min_t(u32, cetrafs_le16(lhdr->eh_entries), CETRAFS_EXT_BLOCK_MAX_LEAVES);
+            for (li = 0; li < iln && !ret; li++) {
+                const cetrafs_extent_hdr_t *lhdr;
+                u32 ln;
 
-            if (n + ln > cap) {
-                u32 ncap = max_t(u32, cap ? cap * 2 : 512, n + ln);
-                /*
-                 * kv-, not k-. kmalloc wants PHYSICALLY CONTIGUOUS
-                 * memory and gives up past KMALLOC_MAX_SIZE, which at
-                 * 16 bytes per extent is 262144 of them -- a 1 GiB
-                 * file whose every block is its own extent. The
-                 * failure did not stop at "flatten returned -ENOMEM":
-                 * evict frees the inode NUMBER and then asks this for
-                 * the blocks to free, so the number went back and the
-                 * file's blocks stayed allocated, referenced by
-                 * nothing. A fragmented file big enough to matter is
-                 * exactly the one a VM image becomes.
-                 */
-                cetrafs_extent_t *narr = kvrealloc(arr, (size_t) ncap * sizeof(*narr), GFP_NOFS);
-
-                if (!narr) {
-                    brelse(lbh);
-                    brelse(ibh);
-                    ret = -ENOMEM;
-                    goto fail;
+                if (!lbhs[li]) {
+                    ret = -EIO;
+                    break;
                 }
-                arr = narr;
-                cap = ncap;
+                lhdr = (const cetrafs_extent_hdr_t *) lbhs[li]->b_data;
+                ln = min_t(u32, cetrafs_le16(lhdr->eh_entries), CETRAFS_EXT_BLOCK_MAX_LEAVES);
+
+                if (n + ln > cap) {
+                    u32 ncap = max_t(u32, cap ? cap * 2 : 512, n + ln);
+                    /*
+                     * kv-, not k-. kmalloc wants PHYSICALLY CONTIGUOUS
+                     * memory and gives up past KMALLOC_MAX_SIZE, which at
+                     * 16 bytes per extent is 262144 of them -- a 1 GiB
+                     * file whose every block is its own extent. The
+                     * failure did not stop at "flatten returned -ENOMEM":
+                     * evict frees the inode NUMBER and then asks this for
+                     * the blocks to free, so the number went back and the
+                     * file's blocks stayed allocated, referenced by
+                     * nothing. A fragmented file big enough to matter is
+                     * exactly the one a VM image becomes.
+                     */
+                    cetrafs_extent_t *narr = kvrealloc(arr, (size_t) ncap * sizeof(*narr), GFP_NOFS);
+
+                    if (!narr) {
+                        ret = -ENOMEM;
+                        break;
+                    }
+                    arr = narr;
+                    cap = ncap;
+                }
+                memcpy(arr + n, lbhs[li]->b_data + sizeof(*lhdr), (size_t) ln * sizeof(*arr));
+                n += ln;
             }
-            memcpy(arr + n, lbh->b_data + sizeof(*lhdr), (size_t) ln * sizeof(*arr));
-            n += ln;
-            brelse(lbh);
         }
-        brelse(ibh);
+        for (li = 0; lbhs && li < iln; li++)
+            brelse(lbhs[li]);
+        kvfree(lbhs);
+        kvfree(llbas);
+        brelse(ibhs[ni]);
+        ibhs[ni] = NULL;
     }
 
+    if (ret)
+        goto fail;
     *out_arr = arr;
     *out_n = n;
     return 0;
 
 fail:
+    for (ni = 0; ni < nin; ni++)
+        brelse(ibhs[ni]); /* NULL-safe; the ones already released are NULL */
     kvfree(arr);
     return ret;
 }

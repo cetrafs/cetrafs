@@ -672,6 +672,7 @@ bool cetrafs_tear_injected(void);
 bool cetrafs_record_tear_injected(const char *what);
 void cetrafs_blk_tail_stamp(struct buffer_head *bh, u32 magic);
 bool cetrafs_blk_tail_valid(const struct buffer_head *bh, u32 magic);
+bool cetrafs_blk_read_accepts(const struct buffer_head *bh, u32 magic);
 /* Structure sanity on its own, for the CACHED read paths that skip the
  * tail verification: a block nobody else can be writing is still not
  * necessarily a block that makes sense. */
