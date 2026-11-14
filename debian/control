@@ -8,7 +8,8 @@ Rules-Requires-Root: no
 
 Package: cetrafs-dkms
 Architecture: all
-Depends: ${misc:Depends}, dkms
+Depends: ${misc:Depends}, dkms,
+ proxmox-default-headers | linux-headers-generic | linux-headers-amd64 | linux-headers-arm64
 Recommends: cetrafs-tools
 Description: clustered shared-disk filesystem (VMFS alternative) - kernel module (DKMS)
  cetrafs is a clustered, shared-disk Linux filesystem: several nodes mount
