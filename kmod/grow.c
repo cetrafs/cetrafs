@@ -55,6 +55,7 @@
  * the owner's own flush. Capacity in the pool reaches every node through
  * the ordinary claim path.
  */
+#include <linux/delay.h>
 #include <linux/crc32c.h>
 #include <linux/capability.h>
 #include <linux/fs.h>
@@ -231,6 +232,15 @@ static void cetrafs_grow_uncredit(struct super_block *sb, const struct cetrafs_g
                     z);
 }
 
+/* TEST ONLY: hold a grow just before its publish, and skip the claim
+ * re-check there (tests/kernel/grow_claim_lost.sh and its control). */
+static unsigned int cetrafs_grow_publish_stall_ms;
+cetrafs_test_param(grow_publish_stall_ms, cetrafs_grow_publish_stall_ms, uint, 0644);
+MODULE_PARM_DESC(grow_publish_stall_ms, "TEST ONLY: pause a live grow just before its superblock publish");
+static bool cetrafs_grow_publish_recheck_off;
+cetrafs_test_param(grow_publish_recheck_off, cetrafs_grow_publish_recheck_off, bool, 0644);
+MODULE_PARM_DESC(grow_publish_recheck_off, "TEST ONLY: publish a live grow without re-checking its claim");
+
 int cetrafs_grow_commit(struct super_block *sb, const struct cetrafs_grow_plan *plan)
 {
     struct cetrafs_grow_sb_ctx sctx = {.cur = plan->cur, .nw = plan->nw};
@@ -290,7 +300,24 @@ int cetrafs_grow_commit(struct super_block *sb, const struct cetrafs_grow_plan *
         return -EIO;
     }
 
-    /* 3. The superblock. */
+    /* 3. The superblock -- still under the caller's claim. It was judged
+     * at the ioctl's entry, and the credits, the table writes and the
+     * link have run since: a claim lost in between (reaped, retaken by
+     * another grower) would publish under nobody's (audit 2026-11-14
+     * L8, rule 15). Not published: the link stays, as below. */
+    if (READ_ONCE(cetrafs_grow_publish_stall_ms)) {
+        unsigned int ms = min_t(unsigned int, xchg(&cetrafs_grow_publish_stall_ms, 0), 10000);
+
+        pr_info("grow: pausing %u ms before the publish (test)\n", ms);
+        msleep(ms); /* test-only; see the parameter */
+    }
+    if (plan->claim && !READ_ONCE(cetrafs_grow_publish_recheck_off)) {
+        rc = cetrafs_grow_claim_held(sb, plan->claim);
+        if (rc) {
+            pr_err("grow: the growfs claim was lost before the publish (%d) -- nothing published\n", rc);
+            return rc;
+        }
+    }
     rc = cetrafs_cas_record(sb, CETRAFS_SB_BLOCK_NR, cetrafs_grow_sb_mutate, &sctx);
     if (rc == 1)
         rc = 0;
@@ -391,7 +418,7 @@ static int cetrafs_grow_claim_owned(struct super_block *sb, u32 row, const u8 *n
     return 0;
 }
 
-static int cetrafs_grow_claim_held(struct super_block *sb, const cetrafs_grow_arg_t *arg)
+int cetrafs_grow_claim_held(struct super_block *sb, const cetrafs_grow_arg_t *arg)
 {
     int rc;
 
@@ -516,7 +543,7 @@ long cetrafs_grow_ioctl(struct file *file, const cetrafs_grow_arg_t __user *arg)
         return PTR_ERR(ga);
     rc = cetrafs_grow_claim_held(sb, ga);
     if (!rc)
-        rc = cetrafs_sb_layout_grow(sb, &ga->sb);
+        rc = cetrafs_sb_layout_grow(sb, &ga->sb, ga);
     kfree(ga);
     return rc;
 }

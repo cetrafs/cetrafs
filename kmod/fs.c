@@ -2269,7 +2269,7 @@ int cetrafs_sb_layout_refresh(struct super_block *sb)
  * -ESTALE: the volume is not where growfs found it (someone else grew
  * it, or it was rewritten); nothing was written, run growfs again.
  */
-int cetrafs_sb_layout_grow(struct super_block *sb, const cetrafs_superblock_t *nw)
+int cetrafs_sb_layout_grow(struct super_block *sb, const cetrafs_superblock_t *nw, const cetrafs_grow_arg_t *claim)
 {
     struct cetrafs_sb_info *sbi = sb->s_fs_info;
     struct cetrafs_bg_layout *cur, *nl = NULL;
@@ -2320,6 +2320,7 @@ int cetrafs_sb_layout_grow(struct super_block *sb, const cetrafs_superblock_t *n
     }
     plan.cur = &cur->raw;
     plan.nw = nw;
+    plan.claim = claim;
     plan.old_count = cur->bg_count;
     plan.new_count = le32_to_cpu(nw->block_group_count);
     plan.nshards = le32_to_cpu(nw->zone_group_count);

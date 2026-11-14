@@ -1034,8 +1034,10 @@ struct cetrafs_grow_plan {
     u64 tail_lba;                    /* the segment that links to it; 0 = the superblock does (first grow) */
     u32 nshards;                     /* pool shards: one per Zone Group */
     u64 *shard_credit;               /* capacity each shard gains */
+    const cetrafs_grow_arg_t *claim; /* the caller's growfs claim, re-checked at the publish */
 };
-int cetrafs_sb_layout_grow(struct super_block *sb, const cetrafs_superblock_t *nw);
+int cetrafs_sb_layout_grow(struct super_block *sb, const cetrafs_superblock_t *nw, const cetrafs_grow_arg_t *claim);
+int cetrafs_grow_claim_held(struct super_block *sb, const cetrafs_grow_arg_t *arg);
 int cetrafs_grow_commit(struct super_block *sb, const struct cetrafs_grow_plan *plan);
 int cetrafs_grow_check_bg_header(struct super_block *sb, u32 bg_id, u64 start, u64 len);
 long cetrafs_grow_ioctl(struct file *file, const cetrafs_grow_arg_t __user *arg);
