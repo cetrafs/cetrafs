@@ -2780,4 +2780,23 @@ LE_N="$(printf '%s\n' "$LE_PLANT" | grep -c 'planted.c:[0-9]*: ' || true)"
     fail "C11: control -- planted tree gave $LE_N finding(s), want 4 (not the converted line): $(echo "$LE_PLANT" | tr '\n' ' ')"
 rm -rf "$LE_P"
 
+# journal_info: current->journal_info is shared with every filesystem on
+# the host, and jbd2 takes a non-NULL value for its own transaction
+# handle. A cetrafs scope parked there is dereferenced as an ext4 handle
+# when direct reclaim inside it evicts an ext4 inode (an ext4 root, as on
+# Proxmox). Task-local state lives in a table of our own
+# (cetrafs_dsync_enter()). Comments do not count.
+log "checking no kmod/ code reads or writes current->journal_info"
+ji_scan() { grep -rnE 'journal_info' "$1" --include='*.c' --include='*.h' | grep -vE ':[0-9]+:\s*(/\*|\*)' || true; }
+JI_REAL="$(ji_scan "$ROOT/kmod")"
+[ -z "$JI_REAL" ] && pass "journal_info: no kmod/ code uses current->journal_info" ||
+    fail "journal_info: kmod/ uses current->journal_info: $(echo "$JI_REAL" | head -3 | tr '\n' ' ')"
+JI_P="$(ct_tmp ji-plant)"
+rm -rf "$JI_P"; mkdir -p "$JI_P"
+printf '/* journal_info in a comment */\nstatic void f(void *p)\n{\n    current->journal_info = p;\n}\n' >"$JI_P/planted.c"
+JI_N="$(ji_scan "$JI_P" | grep -c 'planted.c:' || true)"
+[ "$JI_N" = 1 ] && pass "journal_info: control -- the planted assignment is found, the comment is not" ||
+    fail "journal_info: control -- planted tree gave $JI_N finding(s), want 1"
+rm -rf "$JI_P"
+
 ct_exit

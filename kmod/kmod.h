@@ -635,9 +635,13 @@ void cetrafs_cas_op_counted(void);
 u64 cetrafs_record_write_count(void);
 /* fdatasync's task-local scope (file.c, inode.c): see cetrafs_sync_inode_meta(). */
 struct cetrafs_dsync_scope {
+    struct list_head node;
+    struct task_struct *task;
     struct inode *inode;
     bool times_dropped; /* a time-only change was left unpublished in this scope */
 };
+void cetrafs_dsync_enter(struct cetrafs_dsync_scope *s);
+void cetrafs_dsync_exit(struct cetrafs_dsync_scope *s);
 bool cetrafs_dsync_drop_times(struct inode *inode);
 /* Foreign-free appends to a peer's pending-free queue (zonegroup.c). Zero
  * on a single-node/loop volume by construction; the only confirmation the

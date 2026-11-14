@@ -8814,7 +8814,7 @@ MODULE_PARM_DESC(datasync_full, "TEST ONLY: fdatasync publishes the record's tim
  * dirty state is cleared afterwards (cetrafs_apply_raw_to_vfs_inode()
  * refuses to refresh a dirty inode, the trap the comment in
  * cetrafs_fsync_meta() describes). What differs is the scope: while it
- * runs, the task carries a cetrafs_dsync_scope naming this inode, and
+ * runs, a cetrafs_dsync_scope names this task and this inode, and
  * cetrafs_write_vfs_inode() then leaves time-only dirt unpublished (see
  * inode.c). The scope is task-local: a writeback or another task's sync
  * of the same inode never sees it, so their times are still published.
@@ -8847,15 +8847,13 @@ MODULE_PARM_DESC(datasync_full, "TEST ONLY: fdatasync publishes the record's tim
 static int cetrafs_sync_inode_meta(struct inode *inode, bool datasync)
 {
     struct cetrafs_dsync_scope scope = {.inode = inode};
-    void *saved;
     int ret;
 
     if (!datasync || READ_ONCE(cetrafs_datasync_full))
         return sync_inode_metadata(inode, 1);
-    saved = current->journal_info;
-    current->journal_info = &scope;
+    cetrafs_dsync_enter(&scope);
     ret = sync_inode_metadata(inode, 1);
-    current->journal_info = saved;
+    cetrafs_dsync_exit(&scope);
     if (scope.times_dropped)
         mark_inode_dirty_sync(inode);
     return ret;

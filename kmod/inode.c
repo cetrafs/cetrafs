@@ -24,20 +24,55 @@
  * folding a write into a CAS nets to zero there). */
 static atomic64_t cetrafs_record_writes = ATOMIC64_INIT(0);
 
-/* The task-local scope of an fdatasync (file.c cetrafs_sync_inode_meta()):
- * the task's journal_info names it while the VFS sync of its inode runs.
- * True when the scope is for 'inode'; the caller is then leaving a
- * time-only change unpublished, and the scope records that so the sync
- * can re-dirty the inode (the times are still owed, just not by this
- * datasync). */
+/* The task-local scope of an fdatasync (file.c cetrafs_sync_inode_meta()).
+ * Kept in a table of our own, keyed on the task: current->journal_info is
+ * shared with every filesystem, and jbd2 takes a non-NULL one for its own
+ * handle -- direct reclaim inside the scope evicting an ext4 inode would
+ * dereference our scope as one. 'dsync_active' keeps writeback's lookup to
+ * one atomic read while no fdatasync is in its scope. */
+static DEFINE_SPINLOCK(cetrafs_dsync_lock);
+static LIST_HEAD(cetrafs_dsync_scopes);
+static atomic_t cetrafs_dsync_active = ATOMIC_INIT(0);
+
+void cetrafs_dsync_enter(struct cetrafs_dsync_scope *s)
+{
+    s->task = current;
+    s->times_dropped = false;
+    spin_lock(&cetrafs_dsync_lock);
+    list_add(&s->node, &cetrafs_dsync_scopes);
+    atomic_inc(&cetrafs_dsync_active);
+    spin_unlock(&cetrafs_dsync_lock);
+}
+
+void cetrafs_dsync_exit(struct cetrafs_dsync_scope *s)
+{
+    spin_lock(&cetrafs_dsync_lock);
+    list_del(&s->node);
+    atomic_dec(&cetrafs_dsync_active);
+    spin_unlock(&cetrafs_dsync_lock);
+}
+
+/* True when this task is in an fdatasync scope for 'inode'; the caller is
+ * then leaving a time-only change unpublished, and the scope records that
+ * so the sync can re-dirty the inode (the times are still owed, just not
+ * by this datasync). */
 bool cetrafs_dsync_drop_times(struct inode *inode)
 {
-    struct cetrafs_dsync_scope *s = current->journal_info;
+    struct cetrafs_dsync_scope *s;
+    bool found = false;
 
-    if (!s || s->inode != inode)
+    if (!atomic_read(&cetrafs_dsync_active))
         return false;
-    s->times_dropped = true;
-    return true;
+    spin_lock(&cetrafs_dsync_lock);
+    list_for_each_entry(s, &cetrafs_dsync_scopes, node) {
+        if (s->task == current && s->inode == inode) {
+            s->times_dropped = true;
+            found = true;
+            break;
+        }
+    }
+    spin_unlock(&cetrafs_dsync_lock);
+    return found;
 }
 
 u64 cetrafs_record_write_count(void)
