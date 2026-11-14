@@ -487,6 +487,9 @@ struct cetrafs_inline_discard *cetrafs_sb_inline_discard(struct super_block *sb)
  * cetrafs_bg_chunk.bmap_alloc_dirty. */
 void cetrafs_sb_note_bmap_alloc(struct super_block *sb, u32 bg_id);
 bool cetrafs_sb_take_bmap_alloc_dirty(struct super_block *sb, u32 bg_id);
+void cetrafs_sb_bmap_flush_begin(struct super_block *sb);
+void cetrafs_sb_bmap_flush_end(struct super_block *sb);
+bool cetrafs_sb_bmap_flush_inflight(struct super_block *sb);
 int cetrafs_alloc_flush_bitmaps(struct super_block *sb);
 bool cetrafs_sb_bmap_alloc_any_dirty(struct super_block *sb);
 int cetrafs_alloc_flush_bitmaps_if_dirty(struct super_block *sb);

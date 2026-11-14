@@ -441,6 +441,12 @@ struct cetrafs_sb_info {
      * space waits on it once before saying ENOSPC
      * (cetrafs_sb_release_wait()). */
     struct rw_semaphore release_rwsem;
+    /* One allocation-bitmap flush at a time (cetrafs_alloc_flush_bitmaps()),
+     * and how many are in flight: a flusher that finds a group's mark
+     * already taken must wait for the one that took it, or it publishes
+     * extents while their bits are still on the way to the device. */
+    struct mutex bmap_flush_mutex;
+    atomic_t bmap_flush_inflight;
 
     /* Node-LOCAL serialization of cetrafs_cas_region()'s no-CAW
      * fallback. On a device with atomic COMPARE AND WRITE this is never
@@ -2691,6 +2697,8 @@ int cetrafs_fill_super(struct super_block *sb, struct fs_context *fc)
         mutex_init(&sbi->pf_drain_mutex);
         mutex_init(&sbi->zg_claim_mutex);
         init_rwsem(&sbi->release_rwsem);
+        mutex_init(&sbi->bmap_flush_mutex);
+        atomic_set(&sbi->bmap_flush_inflight, 0);
         init_waitqueue_head(&sbi->zg_adopt_wq);
         sbi->stamp_base = (s64) ktime_get_real_ns() - (s64) ktime_get_ns();
         atomic64_set(&sbi->stamp_last, 0);
@@ -6057,6 +6065,35 @@ bool cetrafs_sb_bmap_alloc_any_dirty(struct super_block *sb)
     struct cetrafs_sb_info *sbi = sb->s_fs_info;
 
     return cetrafs_bgc_next_bit(sbi, offsetof(struct cetrafs_bg_chunk, bmap_alloc_dirty), 0) != U32_MAX;
+}
+
+/* Enter and leave the one allocation-bitmap flush. The in-flight count
+ * is raised BEFORE the lock and before any mark is taken, so a reader
+ * that sees no marks also sees the flush that took them. */
+void cetrafs_sb_bmap_flush_begin(struct super_block *sb)
+{
+    struct cetrafs_sb_info *sbi = sb->s_fs_info;
+
+    atomic_inc(&sbi->bmap_flush_inflight);
+    smp_mb__after_atomic();
+    mutex_lock(&sbi->bmap_flush_mutex);
+}
+
+void cetrafs_sb_bmap_flush_end(struct super_block *sb)
+{
+    struct cetrafs_sb_info *sbi = sb->s_fs_info;
+
+    mutex_unlock(&sbi->bmap_flush_mutex);
+    smp_mb__before_atomic();
+    atomic_dec(&sbi->bmap_flush_inflight);
+}
+
+bool cetrafs_sb_bmap_flush_inflight(struct super_block *sb)
+{
+    struct cetrafs_sb_info *sbi = sb->s_fs_info;
+
+    smp_rmb(); /* after the caller's look at the marks */
+    return atomic_read(&sbi->bmap_flush_inflight) != 0;
 }
 
 /* Take and clear the set, for the flush. Clearing first means a racing

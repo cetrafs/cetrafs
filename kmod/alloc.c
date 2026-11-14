@@ -2873,10 +2873,48 @@ static bool cetrafs_alloc_flush_skip;
 cetrafs_test_param(alloc_flush_skip, cetrafs_alloc_flush_skip, bool, 0644);
 MODULE_PARM_DESC(alloc_flush_skip, "TEST ONLY: skip the allocation-bitmap flush at durability boundaries");
 
+/* TEST ONLY: the next flush that takes a group's mark stalls this many
+ * ms before writing it -- the window tests/kernel/bmap_flush_concurrent.sh
+ * opens for a second flusher. */
+static unsigned int cetrafs_alloc_flush_stall_ms;
+cetrafs_test_param(alloc_flush_stall_ms, cetrafs_alloc_flush_stall_ms, uint, 0644);
+MODULE_PARM_DESC(alloc_flush_stall_ms, "TEST ONLY: the next bitmap flush stalls N ms after taking a group's mark");
+
+/* TEST ONLY: flushes are not serialised (the pre-fix behaviour). */
+static bool cetrafs_alloc_flush_unserialised;
+cetrafs_test_param(alloc_flush_unserialised, cetrafs_alloc_flush_unserialised, bool, 0644);
+MODULE_PARM_DESC(alloc_flush_unserialised, "TEST ONLY: concurrent bitmap flushes do not wait for each other");
+
+static int __cetrafs_alloc_flush_bitmaps(struct super_block *sb);
+
+/*
+ * One flush at a time (audit 2026-11-14 A1). The flush takes each
+ * group's mark BEFORE it writes the group's bitmap blocks, so a second
+ * flusher arriving while the first one's write is out finds the mark
+ * clear, skips the group, returns 0 -- and its caller publishes extents
+ * whose bits are in a write that has not completed. A device cache
+ * flush after the publish does not order a write still in flight. So
+ * the second waits for the first: what the first took, the second's
+ * caller needs on the device too.
+ */
 int cetrafs_alloc_flush_bitmaps(struct super_block *sb)
+{
+    bool serial = !READ_ONCE(cetrafs_alloc_flush_unserialised);
+    int ret;
+
+    if (serial)
+        cetrafs_sb_bmap_flush_begin(sb);
+    ret = __cetrafs_alloc_flush_bitmaps(sb);
+    if (serial)
+        cetrafs_sb_bmap_flush_end(sb);
+    return ret;
+}
+
+static int __cetrafs_alloc_flush_bitmaps(struct super_block *sb)
 {
     const cetrafs_superblock_t *raw_sb = cetrafs_sb_raw(sb);
     u32 bg_count, bg_id;
+    unsigned int stall;
     int ret = 0;
 
     if (!raw_sb || unlikely(READ_ONCE(cetrafs_alloc_flush_skip)))
@@ -2892,6 +2930,9 @@ int cetrafs_alloc_flush_bitmaps(struct super_block *sb)
 
         if (!cetrafs_sb_take_bmap_alloc_dirty(sb, bg_id))
             continue;
+        stall = READ_ONCE(cetrafs_alloc_flush_stall_ms) ? xchg(&cetrafs_alloc_flush_stall_ms, 0) : 0;
+        if (stall)
+            msleep(stall); /* test-only; see the parameter */
         /* Taken, so from here every failure must put the mark BACK: a
          * BG whose bits did not reach the device and is no longer marked
          * is never synced by any later boundary, and that boundary then
@@ -2926,7 +2967,10 @@ int cetrafs_alloc_flush_bitmaps(struct super_block *sb)
  */
 int cetrafs_alloc_flush_bitmaps_if_dirty(struct super_block *sb)
 {
-    if (!cetrafs_sb_bmap_alloc_any_dirty(sb))
+    /* No mark is not enough: a flush in flight has taken marks whose
+     * writes may not have completed (see cetrafs_alloc_flush_bitmaps()). */
+    if (!cetrafs_sb_bmap_alloc_any_dirty(sb) &&
+        (READ_ONCE(cetrafs_alloc_flush_unserialised) || !cetrafs_sb_bmap_flush_inflight(sb)))
         return 0;
     return cetrafs_alloc_flush_bitmaps(sb);
 }
