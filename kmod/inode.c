@@ -2564,8 +2564,13 @@ static int cetrafs_apply_identity_check(struct inode *inode, const cetrafs_inode
      * extents the allocator has taken back. Measured.
      *
      * A file unlinked LOCALLY while still open is nlink == 0 in core
-     * too, and is unaffected: it cannot be reached by name, so no
-     * refresh path runs for it.
+     * too. No name reaches it, so no lookup refresh runs for it -- but a
+     * lock RESUME does (flock(LOCK_EX) after LOCK_UN on the default
+     * mount, cetrafs_lock_resume()), and is refused here: whether a peer
+     * reclaimed the number while the lock was given back is not something
+     * this check can tell, so the fd stays without its lock (its writes
+     * fail ETXTBSY) until it closes. Seen by ctest's ns-fuzz, which takes
+     * ESTALE from flock as that answer.
      */
     if (cetrafs_le32(raw->nlink) == 0)
         return -ESTALE;
