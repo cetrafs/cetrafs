@@ -459,6 +459,10 @@ struct cetrafs_sb_info {
      * extents while their bits are still on the way to the device. */
     struct mutex bmap_flush_mutex;
     atomic_t bmap_flush_inflight;
+    /* How many bmap_alloc_dirty marks are set -- never fewer: raised
+     * before a mark is set, lowered after one is cleared. The per-block
+     * tree-edit gate reads it instead of walking every chunk (audit P7). */
+    atomic_t bmap_dirty_n;
 
     /* Node-LOCAL serialization of cetrafs_cas_region()'s no-CAW
      * fallback. On a device with atomic COMPARE AND WRITE this is never
@@ -2761,6 +2765,7 @@ int cetrafs_fill_super(struct super_block *sb, struct fs_context *fc)
         init_rwsem(&sbi->release_rwsem);
         mutex_init(&sbi->bmap_flush_mutex);
         atomic_set(&sbi->bmap_flush_inflight, 0);
+        atomic_set(&sbi->bmap_dirty_n, 0);
         init_waitqueue_head(&sbi->zg_adopt_wq);
         sbi->stamp_base = (s64) ktime_get_real_ns() - (s64) ktime_get_ns();
         atomic64_set(&sbi->stamp_last, 0);
@@ -6323,17 +6328,40 @@ void cetrafs_sb_note_bmap_alloc(struct super_block *sb, u32 bg_id)
     u32 i;
 
     c = cetrafs_bgc(sbi, bg_id, &i);
-    if (c)
-        set_bit(i, c->bmap_alloc_dirty);
+    if (!c)
+        return;
+    /* Raised first: the gate must never read 0 while a mark is set, or
+     * an extent is published over bits still only in memory (rule 8). */
+    atomic_inc(&sbi->bmap_dirty_n);
+    if (test_and_set_bit(i, c->bmap_alloc_dirty))
+        atomic_dec(&sbi->bmap_dirty_n); /* already counted */
 }
 
-/* Does any BG have allocation bits not yet on the device? O(words), no
- * atomics -- the tree-edit gate asks this once per mapped block. */
+/* TEST ONLY: the gate walks every chunk, as before -- the control of
+ * tests/kernel/bmap_gate_cost.sh. */
+static bool cetrafs_bmap_gate_walk;
+cetrafs_test_param(bmap_gate_walk, cetrafs_bmap_gate_walk, bool, 0644);
+MODULE_PARM_DESC(bmap_gate_walk, "TEST ONLY: the dirty-bitmap gate walks every Block Group chunk");
+static atomic64_t cetrafs_bmap_gate_walks = ATOMIC64_INIT(0);
+u64 cetrafs_bmap_gate_walks_count(void)
+{
+    return (u64) atomic64_read(&cetrafs_bmap_gate_walks);
+}
+
+/* Does any BG have allocation bits not yet on the device? One atomic
+ * read -- the tree-edit gate asks this once per mapped block, and a walk
+ * of every chunk was ~0.5 ms at 64 TiB (audit P7). The count is never
+ * below the marks; above them only for the instant around a set or a
+ * take, which costs one needless flush call. */
 bool cetrafs_sb_bmap_alloc_any_dirty(struct super_block *sb)
 {
     struct cetrafs_sb_info *sbi = sb->s_fs_info;
 
-    return cetrafs_bgc_next_bit(sbi, offsetof(struct cetrafs_bg_chunk, bmap_alloc_dirty), 0) != U32_MAX;
+    if (unlikely(READ_ONCE(cetrafs_bmap_gate_walk))) {
+        atomic64_inc(&cetrafs_bmap_gate_walks);
+        return cetrafs_bgc_next_bit(sbi, offsetof(struct cetrafs_bg_chunk, bmap_alloc_dirty), 0) != U32_MAX;
+    }
+    return atomic_read(&sbi->bmap_dirty_n) != 0;
 }
 
 /* The release_check set (see its field). */
@@ -6417,7 +6445,10 @@ bool cetrafs_sb_take_bmap_alloc_dirty(struct super_block *sb, u32 bg_id)
      * bitmap write is out must not publish on it: flushes run one at a
      * time and the per-block gate enters while one is in flight
      * (cetrafs_alloc_flush_bitmaps(), audit A1). */
-    return c ? test_and_clear_bit(i, c->bmap_alloc_dirty) : false;
+    if (!c || !test_and_clear_bit(i, c->bmap_alloc_dirty))
+        return false;
+    atomic_dec(&sbi->bmap_dirty_n); /* lowered after the clear: never below the marks */
+    return true;
 }
 
 /* Allocations only -- see cetrafs_bg_chunk.bg_alloc_seq. */

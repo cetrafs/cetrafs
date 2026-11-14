@@ -304,6 +304,8 @@ static int cetrafs_proc_info_show(struct seq_file *m, void *v)
     /* O_DIRECT overwrites of written blocks that ran under the SHARED
      * inode_lock (file.c, cetrafs_dio_overwrite_write()). */
     seq_printf(m, "dio_overwrites: %llu\n", cetrafs_dio_overwrite_count());
+    seq_printf(m, "bmap_gate_walks: %llu\n", cetrafs_bmap_gate_walks_count());
+    seq_printf(m, "bmap_gate_entries: %llu\n", cetrafs_bmap_gate_entry_count());
     seq_printf(m, "dio_privs_xattr_reads: %llu\n", cetrafs_dio_privs_xattr_reads_count());
     seq_printf(m, "zg_pending_deltas: %u\n", cetrafs_sb_pending_zg_deltas(sb));
     seq_printf(m, "journal_replays: %llu\n", cetrafs_journal_replay_count());

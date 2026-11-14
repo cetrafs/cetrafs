@@ -3076,6 +3076,15 @@ static int __cetrafs_alloc_flush_bitmaps(struct super_block *sb)
  * of a whole run are set at once, so the sync it does costs one bitmap
  * write per run, not per block.
  */
+/* Gate calls that found something to flush: the same workload must enter
+ * as often with the dirty count as with the chunk walk it replaced
+ * (tests/kernel/bmap_gate_cost.sh). */
+static atomic64_t cetrafs_bmap_gate_entries = ATOMIC64_INIT(0);
+u64 cetrafs_bmap_gate_entry_count(void)
+{
+    return (u64) atomic64_read(&cetrafs_bmap_gate_entries);
+}
+
 int cetrafs_alloc_flush_bitmaps_if_dirty(struct super_block *sb)
 {
     /* No mark is not enough: a flush in flight has taken marks whose
@@ -3083,6 +3092,7 @@ int cetrafs_alloc_flush_bitmaps_if_dirty(struct super_block *sb)
     if (!cetrafs_sb_bmap_alloc_any_dirty(sb) &&
         (READ_ONCE(cetrafs_alloc_flush_unserialised) || !cetrafs_sb_bmap_flush_inflight(sb)))
         return 0;
+    atomic64_inc(&cetrafs_bmap_gate_entries);
     return cetrafs_alloc_flush_bitmaps(sb);
 }
 
