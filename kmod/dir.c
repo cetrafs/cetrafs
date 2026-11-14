@@ -702,6 +702,37 @@ static bool cetrafs_dir_walk_no_copy;
 cetrafs_test_param(dir_walk_no_copy, cetrafs_dir_walk_no_copy, bool, 0644);
 MODULE_PARM_DESC(dir_walk_no_copy, "TEST ONLY: readdir and lookup read the live dirent buffer");
 
+/* TEST ONLY: a stale directory is re-read block by block by each walk,
+ * as before audit 2026-11-14 P6 -- the control of
+ * tests/kernel/dir_refresh_whole.sh. */
+static bool cetrafs_dir_refresh_whole_off;
+cetrafs_test_param(dir_refresh_whole_off, cetrafs_dir_refresh_whole_off, bool, 0644);
+MODULE_PARM_DESC(dir_refresh_whole_off, "TEST ONLY: a stale directory is re-read per walk, block by block");
+
+/* Read every dirent block of 'dx' forced-fresh, in batches. */
+static noinline_for_stack int cetrafs_dir_refresh_whole(struct inode *dir, const struct cetrafs_dir_extents *de)
+{
+    struct buffer_head *bhs[32];
+    u16 i;
+
+    for (i = 0; i < de->entries; i++) {
+        u64 phys = cetrafs_extent_phys_from_hilo(de->arr[i].ee_start_hi, de->arr[i].ee_start_lo);
+        u32 len = cetrafs_extent_len(de->arr[i].ee_len), b, n, k;
+
+        for (b = 0; b < len; b += n) {
+            cond_resched();
+            if (fatal_signal_pending(current))
+                return -EINTR; /* RT-3: the count is the disk's */
+            n = min_t(u32, len - b, ARRAY_SIZE(bhs));
+            if (cetrafs_bread_uncached_batch(dir->i_sb, phys + b, n, bhs))
+                return -EIO;
+            for (k = 0; k < n; k++)
+                brelse(bhs[k]);
+        }
+    }
+    return 0;
+}
+
 static int cetrafs_walk_dirents_from(struct inode *dir, cetrafs_dirent_visit_fn visit, void *priv, loff_t min_pos)
 {
     unsigned int dirents_per_block = CETRAFS_DIRENTS_PER_BLOCK;
@@ -740,6 +771,25 @@ static int cetrafs_walk_dirents_from(struct inode *dir, cetrafs_dirent_visit_fn 
     }
 
     fresh = cetrafs_dir_needs_fresh(dir, &raw);
+
+    /* Stale: refresh the WHOLE directory once, in batches, and re-arm
+     * the stamp -- not only on a pass that ran to the end. A lookup
+     * stops at its match and readdir when the buffer fills, so after a
+     * peer changed one entry every stat re-read the directory from block
+     * 0, one forced-fresh round trip per block: ~134k reads for `ls -l`
+     * of 2000 files (audit 2026-11-14 P6). The blocks are read after the
+     * record whose dirent_seq is stamped (rule 10); the walk below then
+     * reads the cache, and its validation re-reads any torn block fresh. */
+    if (fresh && !READ_ONCE(cetrafs_dir_refresh_whole_off)) {
+        ret = cetrafs_dir_refresh_whole(dir, &dx);
+        if (ret == -EINTR)
+            goto out;
+        if (!ret) {
+            cetrafs_inode_set_dirent_seq_cached(dir, cetrafs_le64(raw.dirent_seq));
+            fresh = false;
+        }
+        ret = 0;
+    }
 
     for (i = 0; i < dx.entries; i++) {
         const cetrafs_extent_t *ext = &dx.arr[i];
