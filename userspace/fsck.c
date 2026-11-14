@@ -1278,22 +1278,132 @@ struct fsck_refctx {
  * *base_out, when asked for, receives the number of data blocks in the
  * BGs before the one found -- the caller's bitmap index of its first
  * block. It is meaningless, and untouched, when the answer is -1. */
+/*
+ * Which Block Group holds 'lba': the first by id whose data range has it,
+ * and *base_out the data blocks of the groups before it (the bitmap index
+ * of its first block). It is asked per extent and per queued block, and a
+ * scan over every group made that billions of comparisons at 64 TiB
+ * (audit 2026-11-14 U9). fsck_bgidx_build() sorts the ranges once; a
+ * lookup is then a binary search. A hostile layout whose ranges overlap
+ * keeps the linear scan, whose answer (the first by id) is the defined
+ * one. CETRAFS_FSCK_BG_LINEAR=1 forces the scan, and CETRAFS_FSCK_STATS=1
+ * prints the steps taken (tests/image/fsck_bg_lookup.sh).
+ */
+static struct {
+    const uint64_t *start, *cnt;
+    uint32_t nbg, n;  /* n: entries in order[] (empty ranges left out) */
+    uint32_t *order;  /* ids, by start */
+    uint64_t *base;   /* per id: sum of cnt[] before it */
+    int linear;
+} fsck_bgx;
+static uint64_t fsck_bg_steps, fsck_bg_lookups;
+
+static int fsck_bgidx_cmp(const void *a, const void *b)
+{
+    uint64_t x = fsck_bgx.start[*(const uint32_t *) a], y = fsck_bgx.start[*(const uint32_t *) b];
+
+    return x < y ? -1 : x > y;
+}
+
+static void fsck_bg_stats_print(void)
+{
+    fprintf(stderr, "fsck: bg lookups %" PRIu64 " steps %" PRIu64 " groups %u\n", fsck_bg_lookups, fsck_bg_steps,
+            fsck_bgx.nbg);
+}
+
+static void fsck_bgidx_build(const uint64_t *start, const uint64_t *cnt, uint32_t nbg)
+{
+    uint64_t base = 0;
+    const char *env = getenv("CETRAFS_FSCK_BG_LINEAR");
+    static int stats_armed;
+
+    if (!stats_armed && getenv("CETRAFS_FSCK_STATS")) {
+        stats_armed = 1;
+        atexit(fsck_bg_stats_print);
+    }
+
+    free(fsck_bgx.order);
+    free(fsck_bgx.base);
+    fsck_bgx.start = start;
+    fsck_bgx.cnt = cnt;
+    fsck_bgx.nbg = nbg;
+    fsck_bgx.n = 0;
+    fsck_bgx.order = (uint32_t *) xcalloc(nbg ? nbg : 1, sizeof(uint32_t));
+    fsck_bgx.base = (uint64_t *) xcalloc(nbg ? nbg : 1, sizeof(uint64_t));
+    fsck_bgx.linear = env && *env == '1';
+    for (uint32_t b = 0; b < nbg; ++b) {
+        fsck_bgx.base[b] = base;
+        base += cnt[b];
+        if (cnt[b] == 0)
+            continue; /* holds nothing */
+        if (start[b] + cnt[b] < start[b])
+            fsck_bgx.linear = 1; /* wraps: let the scan judge it */
+        fsck_bgx.order[fsck_bgx.n++] = b;
+    }
+    qsort(fsck_bgx.order, fsck_bgx.n, sizeof(uint32_t), fsck_bgidx_cmp);
+    for (uint32_t i = 1; i < fsck_bgx.n; ++i) {
+        uint32_t p = fsck_bgx.order[i - 1], q = fsck_bgx.order[i];
+
+        if (start[p] + cnt[p] > start[q])
+            fsck_bgx.linear = 1; /* overlapping ranges: the first by id wins */
+    }
+}
+
+static int fsck_bg_lookup(const uint64_t *start, const uint64_t *cnt, uint32_t nbg, uint64_t lba, uint64_t *base_out)
+{
+    fsck_bg_lookups++;
+    if (fsck_bgx.start == start && fsck_bgx.cnt == cnt && fsck_bgx.nbg == nbg && !fsck_bgx.linear) {
+        uint32_t lo = 0, hi = fsck_bgx.n; /* first entry whose start > lba */
+
+        while (lo < hi) {
+            uint32_t mid = lo + (hi - lo) / 2;
+
+            fsck_bg_steps++;
+            if (start[fsck_bgx.order[mid]] <= lba)
+                lo = mid + 1;
+            else
+                hi = mid;
+        }
+        if (lo > 0) {
+            uint32_t b = fsck_bgx.order[lo - 1];
+
+            if (lba - start[b] < cnt[b]) {
+                if (base_out)
+                    *base_out = fsck_bgx.base[b];
+                return (int) b;
+            }
+        }
+        return -1;
+    }
+    {
+        uint64_t base = 0;
+
+        for (uint32_t b = 0; b < nbg; ++b) {
+            fsck_bg_steps++;
+            if (lba >= start[b] && lba < start[b] + cnt[b]) {
+                if (base_out)
+                    *base_out = base;
+                return (int) b;
+            }
+            base += cnt[b];
+        }
+    }
+    return -1;
+}
+
 static int fsck_run_bg(const uint64_t *bg_start, const uint64_t *bg_cnt, uint32_t nbg, uint64_t phys, uint64_t len,
                        uint64_t *base_out)
 {
     uint64_t base = 0;
+    int b = fsck_bg_lookup(bg_start, bg_cnt, nbg, phys, &base);
 
-    for (uint32_t b = 0; b < nbg; ++b) {
-        if (phys >= bg_start[b] && phys < bg_start[b] + bg_cnt[b]) {
-            if (len > bg_cnt[b] || phys + len > bg_start[b] + bg_cnt[b])
-                return -1;
-            if (base_out)
-                *base_out = base;
-            return (int) b;
-        }
-        base += bg_cnt[b];
-    }
-    return -1;
+    if (b < 0)
+        return -1;
+    if (len > bg_cnt[b] || phys + len > bg_start[b] + bg_cnt[b])
+        return -1;
+    if (base_out)
+        *base_out = base;
+    return b;
 }
 
 /* An extent's LOGICAL fields, which fsck_mark_run() (physical) never
@@ -2466,6 +2576,7 @@ int main(int argc, char **argv)
 
         next = cetrafs_le64(bg.start_block) + cetrafs_le64(bg.length_blocks);
     }
+    fsck_bgidx_build(bg_data_start, bg_data_cnt, cetrafs_le32(sb.block_group_count));
 
     /* NO structural "ZG aggregate == sum of its BGs" cross-check here any
      * more (removed). It compared two CACHES against each
@@ -2800,15 +2911,10 @@ int main(int argc, char **argv)
          * it lands inside some BG's data region -- the same question
          * journal.c asks before applying a payload. Returns the BG
          * index, or -1. */
-#define FSCK_BG_FOR_LBA(lba, out_bg)                                                         \
-    do {                                                                                     \
-        (out_bg) = -1;                                                                       \
-        for (uint32_t _b = 0; _b < cetrafs_le32(sb.block_group_count); ++_b) {                             \
-            if ((lba) >= bg_data_start[_b] && (lba) < bg_data_start[_b] + bg_data_cnt[_b]) { \
-                (out_bg) = (int64_t) _b;                                                     \
-                break;                                                                       \
-            }                                                                                \
-        }                                                                                    \
+#define FSCK_BG_FOR_LBA(lba, out_bg)                                                                         \
+    do {                                                                                                     \
+        (out_bg) = (int64_t) fsck_bg_lookup(bg_data_start, bg_data_cnt, cetrafs_le32(sb.block_group_count), \
+                                            (lba), NULL);                                                    \
     } while (0)
 
         if (cetrafs_le32(sb.node_journal_blocks) >= 1 + CETRAFS_JOURNAL_SLOT_BLOCKS) {
@@ -3647,13 +3753,8 @@ int main(int argc, char **argv)
                          * stop. -r drops it the drain's way. */
                         {
                             uint64_t st = cetrafs_le64(pe.lba);
-                            int sbg = -1;
-
-                            for (uint32_t b = 0; b < cetrafs_le32(sb.block_group_count); ++b)
-                                if (st >= bg_data_start[b] && st < bg_data_start[b] + bg_data_cnt[b]) {
-                                    sbg = (int) b;
-                                    break;
-                                }
+                            int sbg = fsck_bg_lookup(bg_data_start, bg_data_cnt, cetrafs_le32(sb.block_group_count),
+                                                     st, NULL);
                             if (sbg >= 0 && cetrafs_le64(pe.free_gen) < bg_free_gen[sbg]) {
                                 printf("note: Zone Group %u queues a free of %" PRIu64 "+%u stamped %" PRIu64
                                        ", from before BG%d's last reclaim (free_gen %" PRIu64
@@ -3673,20 +3774,18 @@ int main(int argc, char **argv)
                          * have an owner -- a file, or an earlier entry? */
                         for (uint32_t k = 0; k < cetrafs_le32(pe.count) && !live; ++k) {
                             uint64_t lba = cetrafs_le64(pe.lba) + k, ix = 0;
+                            int b = fsck_bg_lookup(bg_data_start, bg_data_cnt, cetrafs_le32(sb.block_group_count),
+                                                   lba, &ix);
 
-                            for (uint32_t b = 0; b < cetrafs_le32(sb.block_group_count); ++b) {
-                                if (lba >= bg_data_start[b] && lba < bg_data_start[b] + bg_data_cnt[b]) {
-                                    ix += lba - bg_data_start[b];
-                                    /* A deleted record's claim does not make a
-                                     * block live: freeing it is what the queue
-                                     * is for. */
-                                    if ((FSCK_GET(refd, ix) && !FSCK_GET(weakd, ix)) || FSCK_GET(queued, ix)) {
-                                        live = 1;
-                                        live_lba = lba;
-                                    }
-                                    break;
+                            if (b >= 0) {
+                                ix += lba - bg_data_start[b];
+                                /* A deleted record's claim does not make a
+                                 * block live: freeing it is what the queue
+                                 * is for. */
+                                if ((FSCK_GET(refd, ix) && !FSCK_GET(weakd, ix)) || FSCK_GET(queued, ix)) {
+                                    live = 1;
+                                    live_lba = lba;
                                 }
-                                ix += bg_data_cnt[b];
                             }
                         }
                         if (live) {
@@ -3708,18 +3807,16 @@ int main(int argc, char **argv)
                         /* Pass 2: count it as queued. */
                         for (uint32_t k = 0; k < cetrafs_le32(pe.count); ++k) {
                             uint64_t lba = cetrafs_le64(pe.lba) + k, ix = 0;
+                            int b = fsck_bg_lookup(bg_data_start, bg_data_cnt, cetrafs_le32(sb.block_group_count),
+                                                   lba, &ix);
 
-                            for (uint32_t b = 0; b < cetrafs_le32(sb.block_group_count); ++b) {
-                                if (lba >= bg_data_start[b] && lba < bg_data_start[b] + bg_data_cnt[b]) {
-                                    ix += lba - bg_data_start[b];
-                                    FSCK_SET(queued, ix);
-                                    if (!FSCK_GET(refd, ix)) {
-                                        FSCK_SET(refd, ix); /* queued, not leaked */
-                                        pending++;
-                                    }
-                                    break;
+                            if (b >= 0) {
+                                ix += lba - bg_data_start[b];
+                                FSCK_SET(queued, ix);
+                                if (!FSCK_GET(refd, ix)) {
+                                    FSCK_SET(refd, ix); /* queued, not leaked */
+                                    pending++;
                                 }
-                                ix += bg_data_cnt[b];
                             }
                         }
                     }
