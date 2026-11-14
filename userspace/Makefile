@@ -37,17 +37,25 @@ endif
 # Needs optimisation to do anything, which -O2 below provides.
 HARDEN = -D_FORTIFY_SOURCE=3
 
+# The packager's flags reach the tools too. These tools parse hostile
+# images as root, so a distribution's hardening (dpkg-buildflags' CFLAGS
+# and LDFLAGS: stack protector, RELRO, PIE, fortify) must apply to them;
+# a recipe that names only its own flags left all of it out (audit
+# 2026-11-14 U10). They come last, so -O2 and the warnings stay as set.
+TOOL_CFLAGS = $(CPPFLAGS) $(CFLAGS)
+TOOL_LDFLAGS = $(LDFLAGS)
+
 $(MKFS): mkfs.c $(HDRS)
-	$(CC) -D_FILE_OFFSET_BITS=64 -I $(SDIR)/include -O2 $(HARDEN) -std=gnu99 -Wall -Wextra $(WERROR) -o $@ $<
+	$(CC) -D_FILE_OFFSET_BITS=64 -I $(SDIR)/include -O2 $(HARDEN) -std=gnu99 -Wall -Wextra $(WERROR) $(TOOL_CFLAGS) $(TOOL_LDFLAGS) -o $@ $<
 
 $(FSCK): fsck.c $(HDRS)
-	$(CC) -D_FILE_OFFSET_BITS=64 -I $(SDIR)/include -O2 $(HARDEN) -std=gnu99 -Wall -Wextra $(WERROR) -o $@ $<
+	$(CC) -D_FILE_OFFSET_BITS=64 -I $(SDIR)/include -O2 $(HARDEN) -std=gnu99 -Wall -Wextra $(WERROR) $(TOOL_CFLAGS) $(TOOL_LDFLAGS) -o $@ $<
 
 $(DEFRAG): defrag.c $(HDRS)
-	$(CC) -D_FILE_OFFSET_BITS=64 -I $(SDIR)/include -O2 $(HARDEN) -std=gnu99 -Wall -Wextra $(WERROR) -o $@ $<
+	$(CC) -D_FILE_OFFSET_BITS=64 -I $(SDIR)/include -O2 $(HARDEN) -std=gnu99 -Wall -Wextra $(WERROR) $(TOOL_CFLAGS) $(TOOL_LDFLAGS) -o $@ $<
 
 $(GROWFS): growfs.c $(HDRS)
-	$(CC) -D_FILE_OFFSET_BITS=64 -I $(SDIR)/include -O2 $(HARDEN) -std=gnu99 -Wall -Wextra $(WERROR) -o $@ $<
+	$(CC) -D_FILE_OFFSET_BITS=64 -I $(SDIR)/include -O2 $(HARDEN) -std=gnu99 -Wall -Wextra $(WERROR) $(TOOL_CFLAGS) $(TOOL_LDFLAGS) -o $@ $<
 
 
 # Sparse (>= 0.6.5) static check that every on-disk-struct field is

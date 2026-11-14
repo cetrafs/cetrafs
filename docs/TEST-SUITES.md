@@ -57,7 +57,7 @@ df -Pm /                                       # confirm the floor
 
 ### `tests/image/` -- the tools, with no kernel involved
 
-56 suites. No module is loaded and nothing is mounted: `mkfs.cetra`
+57 suites. No module is loaded and nothing is mounted: `mkfs.cetra`
 writes the structures, a poke helper corrupts exactly one of them, and
 `fsck.cetra` must report *that* fault and exit nonzero.
 
