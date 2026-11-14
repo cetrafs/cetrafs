@@ -549,6 +549,41 @@ tree's, and only lookups past the limit pay for it.
 `tests/kernel/tree_full_any_leaf.sh` measures it on a capped tree
 (control `tree_any_leaf_off`).
 
+## 19. fiemap and SEEK_DATA/SEEK_HOLE pay for the map once, not per call
+
+Both report a file's map, which for a depth-2 tree means flattening up
+to ~258k extents out of ~1,000 tree blocks and sorting them. They did
+both on EVERY call, and asked the write lock's freshness question while
+doing it, so a node not holding the file for write read every tree
+block from the device each time. filefrag makes hundreds of FIEMAP
+calls and qemu's block status is one lseek pair per request -- all of
+it under the inode lock, so the file's writers wait.
+
+Now the tree is read under the reader rule
+(`cetrafs_lock_read_cache_trusted()`, as invariant 13), and the sorted
+map is kept on the inode while the file is open, reused while the
+tree's identity is unchanged (`cetrafs_inode_sorted_runs()`: every
+tree block's address, `eh_generation` and tail CRC, recomputed at each
+use from cached headers). The close-time defrag nudge counts extents
+under the reader rule too.
+
+**Measured** on the reference FC array, a 16 GiB fallocated image after
+60 s of 4k random writes (258,064 extents, 1,021 tree blocks):
+
+| | before | reader rule | + kept map |
+|---|---|---|---|
+| filefrag | 285 s, 901,680 device reads | 42 s, 1,156 | **0.63 s**, ~1,000 |
+| 300 SEEK_DATA/SEEK_HOLE pairs | minutes | 28.5 s | **0.52 s** |
+
+The ~1,000 device reads left are one read of the tree per open (the
+open is where a handoff lands), not per call.
+
+**Guarded by:** `tests/kernel/fiemap_reader_cache.sh` (device reads for
+filefrag, a seek walk and a close; control `read_trust_off`),
+`tests/kernel/seek_map_cache.sh` (one build per filefrag, and a held
+fd's SEEK_DATA after an in-place convert; control `smap_trust_stale`),
+procfs `smap_hits` / `smap_builds`.
+
 ## Measured baseline
 
 On the reference hardware -- an enterprise FC array over 32GFC multipath (two

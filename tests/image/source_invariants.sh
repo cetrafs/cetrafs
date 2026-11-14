@@ -1043,9 +1043,11 @@ file.c:cetrafs_tree_append the-editor,-under-invalidate_lock-exclusive
 file.c:cetrafs_tree_split_leaf the-editor,-under-invalidate_lock-exclusive-(asserted);-its-new-leaf-a-new-block
 file.c:cetrafs_tree_insert_any_leaf the-editor,-under-invalidate_lock-exclusive-(asserted)
 file.c:cetrafs_idx_insert_keep_last the-editor,-reads-only-after-cetrafs_bh_begin_update_crc-takes-the-buffer-lock
-file.c:cetrafs_inode_extents_get every-caller-holds-invalidate_lock-(fiemap/seek-shared),-or-the-file-is-being-evicted
-file.c:cetrafs_tree_flatten via-cetrafs_inode_extents_get,-or-defrag-under-invalidate_lock-exclusive
-file.c:cetrafs_tree_extent_count do_allocate-exclusive;-close-after-the-last-writer;-the-defrag-worker-heuristic-only
+file.c:cetrafs_inode_extents_get_for every-caller-holds-invalidate_lock-(fiemap/seek-shared),-or-the-file-is-being-evicted
+file.c:cetrafs_tree_identity headers-only,-every-caller-holds-invalidate_lock-(fiemap/seek-shared)-and-every-editor-exclusive
+file.c:cetrafs_tree_block_identity via-cetrafs_tree_identity
+file.c:cetrafs_tree_flatten_for via-cetrafs_inode_extents_get_for,-or-defrag-under-invalidate_lock-exclusive
+file.c:cetrafs_tree_extent_count_for do_allocate-exclusive;-close-after-the-last-writer;-the-defrag-worker-heuristic-only
 file.c:cetrafs_tree_last_contig_lba a-placement-hint,-under-invalidate_lock-exclusive
 file.c:cetrafs_tree_free_meta the-old-tree,-after-its-publish-and-under-invalidate_lock-exclusive
 file.c:cetrafs_tree_meta_is_ours the-old-tree,-under-invalidate_lock-exclusive
@@ -1375,7 +1377,7 @@ CALLS="$(grep -c 'cetrafs_dmpath_resolve(bdev' "$K/dmpath.c" || true)"
 # KV_OUT names those functions; the check below refuses a new one that
 # returns kv memory through an out-parameter without being listed.
 log "checking nothing kv/vmalloc-allocated is freed with kfree() (N3)"
-KV_OUT='cetrafs_tree_flatten'
+KV_OUT='cetrafs_tree_flatten|cetrafs_tree_flatten_for|cetrafs_inode_sorted_runs'
 kv_kfree() { # <files>... -- prints file:line of a kfree() of kv memory
     awk -v kvout="$KV_OUT" '
         BEGIN { n = split(kvout, f, "|"); for (i = 1; i <= n; i++) out[f[i]] = 1 }
@@ -2499,5 +2501,64 @@ NDISC="$(grep -c 'blkdev_issue_discard' "$K"/discard.c || true)"
 [ "$NDISC" -ge 1 ] || fail "discard issuer: no blkdev_issue_discard in discard.c -- the scan is not seeing the issuer"
 [ -z "$DISC" ] && pass "discard issuer: blkdev_issue_discard/zeroout appear only in the range-checked issuers (discard.c)" ||
     fail "discard issuer: a discard issued outside cetrafs_discard_issue(), skipping its range check: $DISC"
+
+# Class 53 (a reporting path asking the writer's freshness question).
+# The plain tree readers -- cetrafs_inode_extents_get(),
+# cetrafs_tree_flatten(), cetrafs_tree_extent_count() and
+# cetrafs_read_{leaf,index,tree}_bh() -- answer "is my cache current?"
+# with the write lock: without it every block comes from the device. That
+# is right for a caller that writes, frees, moves or decides a free by
+# what it reads, and a device read per block per call for one that only
+# REPORTS the map (fiemap, SEEK_DATA/HOLE, the defrag nudge's count):
+# filefrag on one fallocated image took 285 s. A reporter takes the
+# _for(..., true) variant and the reader rule
+# (cetrafs_lock_read_cache_trusted()). Every function calling a plain
+# reader is listed with what it does with the answer; a new caller fails
+# until it is classified. Names only: a reporter that reaches a plain
+# reader through a helper is seen as that helper (gap).
+log "checking every plain tree reader's caller is a writer, not a reporter (class 53)"
+C53_REG='cetrafs_defrag_read_extents moves:defrag-relocates-by-it
+cetrafs_do_allocate writes:fallocate-plans-and-publishes-extents
+cetrafs_evict_inode frees:every-block-it-names
+cetrafs_fallocate writes:punch-and-collapse-rebuild-the-tree
+cetrafs_free_inline_extents frees:a-directorys-blocks
+cetrafs_read_index_bh wraps:cetrafs_read_tree_bh
+cetrafs_read_leaf_bh wraps:cetrafs_read_tree_bh
+cetrafs_tree_append writes:the-tree
+cetrafs_tree_convert_inner writes:the-tree
+cetrafs_tree_free_meta frees:the-trees-own-blocks
+cetrafs_tree_insert_any_leaf writes:the-tree
+cetrafs_tree_last_contig_lba writes:the-allocation-goal-of-a-write
+cetrafs_tree_meta_is_ours frees:decides-a-free
+cetrafs_tree_split_leaf writes:the-tree
+__cetrafs_truncate_shrink frees:what-truncate-cuts
+cetrafs_zero_range_inplace writes:zeroes-and-converts-by-it'
+c53_callers() { # <files...>: "<function> <plain reader>" per call site
+    awk '
+/^[a-z][a-z0-9_ *]*[ *]_*cetrafs_[a-z0-9_]+\(/ { match($0, /_*cetrafs_[a-z0-9_]+\(/); sig = substr($0, RSTART, RLENGTH - 1) }
+/^\{/ { fn = sig }
+/^\}/ { fn = "" }
+fn != "" && !/^[[:space:]]*(\*|\/\*|\/\/)/ {
+    line = $0
+    while (match(line, /[^a-z0-9_](cetrafs_inode_extents_get|cetrafs_tree_flatten|cetrafs_tree_extent_count|cetrafs_read_leaf_bh|cetrafs_read_index_bh|cetrafs_read_tree_bh)\(/)) {
+        print fn, substr(line, RSTART + 1, RLENGTH - 2)
+        line = substr(line, RSTART + RLENGTH)
+    }
+}' "$@" | sort -u | awk '$1 != $2 && $1 != $2 "_for"' | sort -u
+}
+C53_FOUND="$(c53_callers $(ls "$K"/*.c | grep -v '\.mod\.c$') | cut -d' ' -f1 | sort -u)"
+[ -n "$C53_FOUND" ] || fail "class 53: setup -- no caller of a plain tree reader found (the scan no longer matches)"
+C53_NEW="$(comm -23 <(echo "$C53_FOUND") <(cut -d' ' -f1 <<<"$C53_REG" | sort -u))"
+C53_GONE="$(comm -13 <(echo "$C53_FOUND") <(cut -d' ' -f1 <<<"$C53_REG" | sort -u))"
+[ -z "$C53_NEW" ] && [ -z "$C53_GONE" ] &&
+    pass "class 53: every caller of a plain tree reader is listed as writing, freeing or moving by it ($(echo $C53_FOUND | wc -w))" ||
+    fail "class 53: unlisted (a reporter? use the _for(..., true) reader variant): $(echo $C53_NEW); listed but gone: $(echo $C53_GONE)"
+# Control: a reporting function on a plain reader is found and unlisted.
+C53_SAMPLE="$(ct_tmp c53).c"
+printf 'static long cetrafs_report_map(struct inode *inode, cetrafs_inode_t *raw)\n{\n    struct cetrafs_inode_extents ex;\n    return cetrafs_inode_extents_get(inode, raw, &ex);\n}\n' >"$C53_SAMPLE"
+[ "$(c53_callers "$C53_SAMPLE")" = "cetrafs_report_map cetrafs_inode_extents_get" ] &&
+    ! grep -q '^cetrafs_report_map ' <<<"$C53_REG" &&
+    pass "class 53: control -- a planted reporter on a plain tree reader is found and unlisted" ||
+    fail "class 53: control -- the planted reporter was not found ($(c53_callers "$C53_SAMPLE"))"
 
 ct_exit

@@ -2,6 +2,7 @@
 
 #include <linux/mm.h>
 #include <linux/workqueue.h>
+#include <linux/refcount.h>
 
 #include "cetrafs.h"
 
@@ -765,6 +766,7 @@ int cetrafs_tree_flatten(struct inode *inode, const cetrafs_inode_t *raw, cetraf
 int cetrafs_tree_build(struct inode *inode, const cetrafs_extent_t *flat, u32 n, cetrafs_inode_t *raw, u64 *out_meta);
 void cetrafs_tree_free_meta(struct inode *inode, const cetrafs_inode_t *raw);
 u32 cetrafs_tree_extent_count(struct inode *inode, const cetrafs_inode_t *raw);
+u32 cetrafs_tree_extent_count_for(struct inode *inode, const cetrafs_inode_t *raw, bool reader);
 u64 cetrafs_flat_data_blocks(const cetrafs_extent_t *flat, u32 n);
 
 // inode.c
@@ -885,6 +887,31 @@ struct cetrafs_inode_extents {
 int cetrafs_inode_extents_get(struct inode *inode, const cetrafs_inode_t *raw, struct cetrafs_inode_extents *ex);
 void cetrafs_inode_extents_put(struct cetrafs_inode_extents *ex);
 void cetrafs_free_fetched_extents(struct inode *dir, const cetrafs_inode_t *raw, struct cetrafs_inode_extents *ex);
+
+/* file.c: an inode's extents in logical order, for the walks that report
+ * the map (fiemap, SEEK_DATA/SEEK_HOLE). */
+struct cetrafs_ext_run {
+    u64 start, len, phys;
+    bool uninit;
+};
+/* A sorted map, shared by reference: the per-inode cache keeps one and
+ * every caller holds its own while it walks. 'key' is the tree's
+ * identity (cetrafs_tree_identity()); 'overlap' that some runs overlap
+ * (damage: every run is then data). */
+struct cetrafs_smap {
+    refcount_t ref;
+    u64 key;
+    u32 n;
+    bool overlap;
+    struct cetrafs_ext_run runs[];
+};
+void cetrafs_smap_put(struct cetrafs_smap *m);
+u64 cetrafs_smap_hit_count(void);
+u64 cetrafs_smap_build_count(void);
+/* lock.c: the per-inode cache of the above. */
+struct cetrafs_smap *cetrafs_inode_smap_get(struct inode *inode, u64 key);
+void cetrafs_inode_smap_store(struct inode *inode, struct cetrafs_smap *m);
+void cetrafs_inode_smap_drop(struct inode *inode);
 int cetrafs_setattr(struct mnt_idmap *idmap, struct dentry *dentry, struct iattr *attr);
 extern const struct inode_operations cetrafs_symlink_iops;
 extern const struct file_operations cetrafs_file_ops;

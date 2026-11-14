@@ -1171,7 +1171,7 @@ static void cetrafs_defrag_worker(struct work_struct *work)
 
                 if (cetrafs_read_raw_inode_overlaid(sb, inode, &rr) == 0 &&
                     cetrafs_le16(rr.eh.eh_magic) == CETRAFS_EXT_MAGIC) {
-                    u32 ext2 = cetrafs_tree_extent_count(inode, &rr);
+                    u32 ext2 = cetrafs_tree_extent_count_for(inode, &rr, true); /* only queues one */
 
                     if (ext2)
                         cetrafs_defrag_consider(inode, ext2,

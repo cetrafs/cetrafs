@@ -971,8 +971,19 @@ void cetrafs_tree_invalidate_cached(struct inode *inode, const cetrafs_inode_t *
  * blocks -> extents; arrays are unordered (append-only), so a full scan
  * is required and that is exactly what the read-side callers (seek,
  * fiemap) do. Single pass, growing the buffer, bounded by the format's
- * structural maximum. */
-int cetrafs_tree_flatten(struct inode *inode, const cetrafs_inode_t *raw, cetrafs_extent_t **out_arr, u32 *out_n)
+ * structural maximum.
+ *
+ * 'reader': the caller only reports the map (fiemap, SEEK_DATA/HOLE)
+ * and frees or writes nothing on the strength of it, so its blocks are
+ * read under the data read path's trust rule
+ * (cetrafs_lock_read_cache_trusted()), not the write lock's. Asking the
+ * write lock's question sent every block of the tree to the device on
+ * every call whenever this node did not hold the file for write: a
+ * filefrag of one fallocated 16 GiB image on an FC array made ~880
+ * FIEMAP calls, re-read its 1,021 tree blocks on each, and held the
+ * inode lock for 285 s. */
+static int cetrafs_tree_flatten_for(struct inode *inode, const cetrafs_inode_t *raw, cetrafs_extent_t **out_arr,
+                                    u32 *out_n, bool reader)
 {
     cetrafs_extent_t *arr = NULL;
     u32 cap = 0, n = 0, ni;
@@ -980,7 +991,7 @@ int cetrafs_tree_flatten(struct inode *inode, const cetrafs_inode_t *raw, cetraf
 
     for (ni = 0; ni < cetrafs_le16(raw->eh.eh_entries) && ni < ARRAY_SIZE(raw->et.idx); ni++) {
         u64 ilba = cetrafs_extent_phys_from_hilo(raw->et.idx[ni].ei_leaf_hi, raw->et.idx[ni].ei_leaf_lo);
-        struct buffer_head *ibh = cetrafs_read_index_bh(inode, ilba);
+        struct buffer_head *ibh = cetrafs_read_index_bh_for(inode, ilba, reader);
         const cetrafs_extent_hdr_t *ihdr;
         const cetrafs_extent_idx_t *iarr;
         u32 li, iln;
@@ -995,7 +1006,7 @@ int cetrafs_tree_flatten(struct inode *inode, const cetrafs_inode_t *raw, cetraf
 
         for (li = 0; li < iln; li++) {
             u64 llba = cetrafs_extent_phys_from_hilo(iarr[li].ei_leaf_hi, iarr[li].ei_leaf_lo);
-            struct buffer_head *lbh = cetrafs_read_leaf_bh(inode, llba);
+            struct buffer_head *lbh = cetrafs_read_leaf_bh_for(inode, llba, reader);
             const cetrafs_extent_hdr_t *lhdr;
             u32 ln;
 
@@ -1046,6 +1057,11 @@ int cetrafs_tree_flatten(struct inode *inode, const cetrafs_inode_t *raw, cetraf
 fail:
     kvfree(arr);
     return ret;
+}
+
+int cetrafs_tree_flatten(struct inode *inode, const cetrafs_inode_t *raw, cetrafs_extent_t **out_arr, u32 *out_n)
+{
+    return cetrafs_tree_flatten_for(inode, raw, out_arr, out_n, false);
 }
 
 /*
@@ -1552,7 +1568,10 @@ static bool cetrafs_extents_fetch_fail_once;
 cetrafs_test_param(extents_fetch_fail_once, cetrafs_extents_fetch_fail_once, bool, 0644);
 MODULE_PARM_DESC(extents_fetch_fail_once, "TEST ONLY: the next extent-list fetch fails");
 
-int cetrafs_inode_extents_get(struct inode *inode, const cetrafs_inode_t *raw, struct cetrafs_inode_extents *ex)
+/* 'reader': see cetrafs_tree_flatten_for(). Only for a caller that
+ * reports the map -- never one that frees, moves or writes by it. */
+static int cetrafs_inode_extents_get_for(struct inode *inode, const cetrafs_inode_t *raw,
+                                         struct cetrafs_inode_extents *ex, bool reader)
 {
     if (cetrafs_extents_fetch_fail_once) {
         cetrafs_extents_fetch_fail_once = false;
@@ -1575,7 +1594,7 @@ int cetrafs_inode_extents_get(struct inode *inode, const cetrafs_inode_t *raw, s
     }
 
     if (cetrafs_le16(raw->eh.eh_depth) == 2) {
-        int ret = cetrafs_tree_flatten(inode, raw, &ex->heap, &ex->entries);
+        int ret = cetrafs_tree_flatten_for(inode, raw, &ex->heap, &ex->entries, reader);
 
         if (ret)
             return ret;
@@ -1584,7 +1603,7 @@ int cetrafs_inode_extents_get(struct inode *inode, const cetrafs_inode_t *raw, s
     }
 
     leaf_lba = cetrafs_extent_phys_from_hilo(raw->et.idx[0].ei_leaf_hi, raw->et.idx[0].ei_leaf_lo);
-    ex->leaf_bh = cetrafs_read_leaf_bh(inode, leaf_lba);
+    ex->leaf_bh = cetrafs_read_leaf_bh_for(inode, leaf_lba, reader);
     if (!ex->leaf_bh)
         return -EIO;
 
@@ -1592,6 +1611,11 @@ int cetrafs_inode_extents_get(struct inode *inode, const cetrafs_inode_t *raw, s
     ex->entries = min_t(u32, cetrafs_le16(((const cetrafs_extent_hdr_t *) ex->leaf_bh->b_data)->eh_entries),
                         CETRAFS_EXT_BLOCK_MAX_LEAVES);
     return 0;
+}
+
+int cetrafs_inode_extents_get(struct inode *inode, const cetrafs_inode_t *raw, struct cetrafs_inode_extents *ex)
+{
+    return cetrafs_inode_extents_get_for(inode, raw, ex, false);
 }
 
 void cetrafs_inode_extents_put(struct cetrafs_inode_extents *ex)
@@ -1617,7 +1641,7 @@ void cetrafs_inode_extents_put(struct cetrafs_inode_extents *ex)
  * appends and only ever merges with the LAST entry, so a file written
  * at descending offsets has its extents in the order they were created,
  * not in logical order. Both walks therefore work on a sorted copy
- * (cetrafs_extents_sorted() below), which also drops zero-length
+ * (cetrafs_inode_sorted_runs() below), which also drops zero-length
  * (damaged) entries SEEK_DATA used to report as data. Assuming order in the array itself
  * would give confidently wrong answers on exactly the files (randomly
  * written VM images) this exists to serve.
@@ -1635,11 +1659,6 @@ void cetrafs_inode_extents_put(struct cetrafs_inode_extents *ex)
  * are corruption, and a walk that steps by a length must never see
  * one -- rule 14).
  */
-struct cetrafs_ext_run {
-    u64 start, len, phys;
-    bool uninit;
-};
-
 static int cetrafs_ext_run_cmp(const void *a, const void *b)
 {
     const struct cetrafs_ext_run *x = a, *y = b;
@@ -1647,34 +1666,155 @@ static int cetrafs_ext_run_cmp(const void *a, const void *b)
     return x->start < y->start ? -1 : x->start > y->start;
 }
 
-static int cetrafs_extents_sorted(struct inode *inode, const struct cetrafs_inode_extents *ex,
-                                  struct cetrafs_ext_run **out, u32 *out_n)
-{
-    struct cetrafs_ext_run *r;
-    u32 i, n = 0;
+static bool cetrafs_runs_overlap(const struct cetrafs_ext_run *r, u32 n);
 
-    r = kvmalloc_array(max_t(u32, ex->entries, 1), sizeof(*r), GFP_KERNEL);
-    if (!r)
+/* Sorted maps reused from the inode, and built (procfs). */
+static atomic64_t cetrafs_smap_hits = ATOMIC64_INIT(0);
+static atomic64_t cetrafs_smap_builds = ATOMIC64_INIT(0);
+
+u64 cetrafs_smap_hit_count(void)
+{
+    return (u64) atomic64_read(&cetrafs_smap_hits);
+}
+
+u64 cetrafs_smap_build_count(void)
+{
+    return (u64) atomic64_read(&cetrafs_smap_builds);
+}
+
+/* One tree block's term in cetrafs_tree_identity(): its eh_generation
+ * and tail CRC beside its address, through an odd multiplier, so two
+ * blocks' terms differ exactly when one of the three does. */
+static u64 cetrafs_tree_block_identity(const struct buffer_head *bh, u64 lba)
+{
+    const cetrafs_blk_tail_t *t = (const cetrafs_blk_tail_t *) (bh->b_data + CETRAFS_BLK_TAIL_OFF);
+    u64 stamp = ((u64) cetrafs_le32(((const cetrafs_extent_hdr_t *) bh->b_data)->eh_generation) << 32) |
+                cetrafs_le32(t->crc);
+
+    return (stamp ^ (lba * 0x9E3779B97F4A7C15ULL)) * 0xC2B2AE3D27D4EB4FULL;
+}
+
+void cetrafs_smap_put(struct cetrafs_smap *m)
+{
+    if (m && refcount_dec_and_test(&m->ref))
+        kvfree(m);
+}
+
+/*
+ * The identity of a depth-2 tree as this node can read it now: a fold of
+ * every interior and leaf block's address, eh_generation and tail CRC.
+ * Every edit of a tree block restamps both before the buffer is unlocked
+ * (cetrafs_blk_tail_stamp(), under invalidate_lock held exclusively), a
+ * block written elsewhere carries its writer's, and a block re-read from
+ * the device carries what the device holds -- so a different tree gives
+ * a different key unless a random 32-bit generation AND the CRC both
+ * repeat. Read under the reader rule, like the walk it stands in for:
+ * from cache when that is trusted, else from the device. The caller
+ * holds invalidate_lock (shared at least), which keeps every editor out
+ * while the headers are read (class 27).
+ *
+ * -EAGAIN for a tree that is not depth 2: small enough to sort per call.
+ */
+static int cetrafs_tree_identity(struct inode *inode, const cetrafs_inode_t *raw, u64 *out_key)
+{
+    u64 key = 0x5eed;
+    u32 ni;
+
+    if (cetrafs_le16(raw->eh.eh_magic) != CETRAFS_EXT_MAGIC || cetrafs_le16(raw->eh.eh_depth) != 2)
+        return -EAGAIN;
+    for (ni = 0; ni < cetrafs_le16(raw->eh.eh_entries) && ni < ARRAY_SIZE(raw->et.idx); ni++) {
+        u64 ilba = cetrafs_extent_phys_from_hilo(raw->et.idx[ni].ei_leaf_hi, raw->et.idx[ni].ei_leaf_lo);
+        struct buffer_head *ibh = cetrafs_read_index_bh_for(inode, ilba, true);
+        const cetrafs_extent_idx_t *iarr;
+        u32 li, iln;
+
+        if (!ibh)
+            return -EIO;
+        key ^= cetrafs_tree_block_identity(ibh, ilba);
+        iarr = (const cetrafs_extent_idx_t *) (ibh->b_data + sizeof(cetrafs_extent_hdr_t));
+        iln = min_t(u32, cetrafs_le16(((const cetrafs_extent_hdr_t *) ibh->b_data)->eh_entries),
+                    CETRAFS_EXT_BLOCK_MAX_IDX);
+        for (li = 0; li < iln; li++) {
+            u64 llba = cetrafs_extent_phys_from_hilo(iarr[li].ei_leaf_hi, iarr[li].ei_leaf_lo);
+            struct buffer_head *lbh = cetrafs_read_leaf_bh_for(inode, llba, true);
+
+            if (!lbh) {
+                brelse(ibh);
+                return -EIO;
+            }
+            key ^= cetrafs_tree_block_identity(lbh, llba);
+            brelse(lbh);
+        }
+        brelse(ibh);
+    }
+    *out_key = key;
+    return 0;
+}
+
+/*
+ * The extents of 'raw' in logical order, as a reference the caller puts
+ * (cetrafs_smap_put()). Caller holds invalidate_lock, shared at least.
+ *
+ * A depth-2 tree's map is kept on the inode between calls and reused
+ * while the tree's identity is unchanged (cetrafs_tree_identity()):
+ * sorting a fragmented image's ~258k extents took ~47 ms, and filefrag
+ * makes hundreds of FIEMAP calls, each of which sorted again -- 42 s of
+ * CPU under the inode lock. Smaller trees are sorted per call.
+ */
+static int cetrafs_inode_sorted_runs(struct inode *inode, const cetrafs_inode_t *raw, struct cetrafs_smap **out)
+{
+    struct cetrafs_inode_extents ex;
+    struct cetrafs_smap *m;
+    struct cetrafs_ext_run *r;
+    bool keyed;
+    u64 key = 0;
+    u32 i, n = 0;
+    int ret;
+
+    keyed = cetrafs_tree_identity(inode, raw, &key) == 0;
+    if (keyed) {
+        m = cetrafs_inode_smap_get(inode, key);
+        if (m) {
+            atomic64_inc(&cetrafs_smap_hits);
+            *out = m;
+            return 0;
+        }
+    }
+    ret = cetrafs_inode_extents_get_for(inode, raw, &ex, true); /* reports the map only */
+    if (ret)
+        return ret;
+    m = kvmalloc(struct_size(m, runs, max_t(u32, ex.entries, 1)), GFP_KERNEL);
+    if (!m) {
+        cetrafs_inode_extents_put(&ex);
         return -ENOMEM;
-    for (i = 0; i < ex->entries; i++) {
-        u64 l = cetrafs_extent_len(ex->arr[i].ee_len);
+    }
+    refcount_set(&m->ref, 1);
+    r = m->runs;
+    for (i = 0; i < ex.entries; i++) {
+        u64 l = cetrafs_extent_len(ex.arr[i].ee_len);
 
         if (!l) {
             pr_err_ratelimited("ino=%llu: extent at block %llu has zero length -- skipping it (fsck)\n",
                                (unsigned long long) inode->i_ino,
-                               (unsigned long long) cetrafs_le32(ex->arr[i].ee_block));
+                               (unsigned long long) cetrafs_le32(ex.arr[i].ee_block));
             cetrafs_sb_corrupt_inode(inode);
             continue;
         }
-        r[n].start = cetrafs_le32(ex->arr[i].ee_block);
+        r[n].start = cetrafs_le32(ex.arr[i].ee_block);
         r[n].len = l;
-        r[n].phys = cetrafs_extent_phys_from_hilo(ex->arr[i].ee_start_hi, ex->arr[i].ee_start_lo);
-        r[n].uninit = cetrafs_extent_is_uninit(ex->arr[i].ee_len);
+        r[n].phys = cetrafs_extent_phys_from_hilo(ex.arr[i].ee_start_hi, ex.arr[i].ee_start_lo);
+        r[n].uninit = cetrafs_extent_is_uninit(ex.arr[i].ee_len);
         n++;
     }
+    cetrafs_inode_extents_put(&ex);
     sort(r, n, sizeof(*r), cetrafs_ext_run_cmp, NULL);
-    *out = r;
-    *out_n = n;
+    m->n = n;
+    m->overlap = cetrafs_runs_overlap(r, n);
+    m->key = key;
+    if (keyed)
+        cetrafs_inode_smap_store(inode, m);
+    atomic64_inc(&cetrafs_smap_builds);
+    *out = m;
     return 0;
 }
 
@@ -1843,11 +1983,8 @@ static u64 cetrafs_next_hole_block(struct address_space *m, const struct cetrafs
 static loff_t cetrafs_seek_hole_data(struct file *file, loff_t offset, int whence)
 {
     struct inode *inode = file->f_mapping->host;
-    struct cetrafs_inode_extents ex;
+    struct cetrafs_smap *m;
     cetrafs_inode_t raw;
-    struct cetrafs_ext_run *runs;
-    u32 nruns;
-    bool as_data;
     loff_t isize, ret;
     u64 iblock, found, nblocks;
 
@@ -1865,10 +2002,12 @@ static loff_t cetrafs_seek_hole_data(struct file *file, loff_t offset, int whenc
     if (ret)
         goto out;
 
-    /* The leaf is read in place; its writers edit it under
-     * invalidate_lock (cetrafs_tree_lookup_unchecked()). */
+    /* The leaves are read in place; their writers edit them under
+     * invalidate_lock (cetrafs_tree_lookup_unchecked()). Held across the
+     * walk too: it asks the page cache about uninit blocks, which a
+     * concurrent convert would change under it. */
     filemap_invalidate_lock_shared(inode->i_mapping);
-    ret = cetrafs_inode_extents_get(inode, &raw, &ex);
+    ret = cetrafs_inode_sorted_runs(inode, &raw, &m);
     if (ret) {
         filemap_invalidate_unlock_shared(inode->i_mapping);
         goto out;
@@ -1877,35 +2016,21 @@ static loff_t cetrafs_seek_hole_data(struct file *file, loff_t offset, int whenc
     iblock = (u64) offset / CETRAFS_BLOCK_SIZE;
     nblocks = ((u64) isize + CETRAFS_BLOCK_SIZE - 1) / CETRAFS_BLOCK_SIZE;
 
-    ret = cetrafs_extents_sorted(inode, &ex, &runs, &nruns);
-    if (ret) {
-        cetrafs_inode_extents_put(&ex);
-        filemap_invalidate_unlock_shared(inode->i_mapping);
-        goto out;
-    }
-    as_data = cetrafs_runs_overlap(runs, nruns);
-
     if (whence == SEEK_DATA) {
-        found = cetrafs_next_data_block(inode->i_mapping, runs, nruns, iblock, as_data);
-        if (found == U64_MAX || found >= nblocks) {
-            kvfree(runs);
-            cetrafs_inode_extents_put(&ex);
-            filemap_invalidate_unlock_shared(inode->i_mapping);
+        found = cetrafs_next_data_block(inode->i_mapping, m->runs, m->n, iblock, m->overlap);
+        if (found == U64_MAX || found >= nblocks)
             ret = -ENXIO; /* nothing but hole between here and EOF */
-            goto out;
-        }
-        /* Staying inside the block we were already in means the answer
-         * is the caller's own offset, not the block boundary below it. */
-        ret = (found == iblock) ? offset : (loff_t) (found * CETRAFS_BLOCK_SIZE);
+        else /* staying inside the block we were already in means the
+              * answer is the caller's own offset, not the block boundary
+              * below it */
+            ret = (found == iblock) ? offset : (loff_t) (found * CETRAFS_BLOCK_SIZE);
     } else {
-        found = cetrafs_next_hole_block(inode->i_mapping, runs, nruns, iblock, nblocks, as_data);
+        found = cetrafs_next_hole_block(inode->i_mapping, m->runs, m->n, iblock, nblocks, m->overlap);
         ret = (found == iblock) ? offset : (loff_t) (found * CETRAFS_BLOCK_SIZE);
         if (ret > isize)
             ret = isize; /* EOF is a hole, but never report past it */
     }
-    kvfree(runs);
-
-    cetrafs_inode_extents_put(&ex);
+    cetrafs_smap_put(m);
     filemap_invalidate_unlock_shared(inode->i_mapping);
 
 out:
@@ -1928,15 +2053,15 @@ out:
  * pair: cetrafs_leaf_array_insert() appends and merges only with the
  * last entry, so the array is in creation order. FIEMAP's contract is
  * that extents come back in increasing logical order, so the array is
- * sorted once (cetrafs_extents_sorted()) and walked. It used to be
+ * sorted once (cetrafs_inode_sorted_runs()) and walked. It used to be
  * rescanned per emitted extent, under a comment calling that "O(n^2) on
  * at most 343 entries" -- true of a depth-1 tree, not of a depth-2 one,
  * which holds ~258k.
  */
 int cetrafs_fiemap(struct inode *inode, struct fiemap_extent_info *fi, u64 start, u64 len)
 {
-    struct cetrafs_inode_extents ex;
-    struct cetrafs_ext_run *runs;
+    const struct cetrafs_ext_run *runs;
+    struct cetrafs_smap *m;
     cetrafs_inode_t raw;
     u64 cursor, end;
     u32 nruns, i;
@@ -1956,22 +2081,19 @@ int cetrafs_fiemap(struct inode *inode, struct fiemap_extent_info *fi, u64 start
         goto out;
     /* The leaf is read in place, and its writers edit it under
      * invalidate_lock (cetrafs_tree_lookup_unchecked()). Held only
-     * while the sorted private copy is built: the loop below copies to
-     * user memory, which can fault on a mapping of this file. */
+     * while the sorted map is fetched: the loop below copies to user
+     * memory, which can fault on a mapping of this file. The map is
+     * our own reference -- immutable, and freed only when its last
+     * holder lets go -- so it needs no lock while it is walked. */
     filemap_invalidate_lock_shared(inode->i_mapping);
-    ret = cetrafs_inode_extents_get(inode, &raw, &ex);
-    if (ret) {
-        filemap_invalidate_unlock_shared(inode->i_mapping);
-        goto out;
-    }
-
-    ret = cetrafs_extents_sorted(inode, &ex, &runs, &nruns);
-    cetrafs_inode_extents_put(&ex);
+    ret = cetrafs_inode_sorted_runs(inode, &raw, &m);
     filemap_invalidate_unlock_shared(inode->i_mapping);
     if (ret)
         goto out;
+    runs = m->runs;
+    nruns = m->n;
 
-    /* In logical order, once (see cetrafs_extents_sorted()): each step
+    /* In logical order (see cetrafs_inode_sorted_runs()): each step
      * emits the lowest run starting at or after the cursor, exactly as
      * the per-step rescan did, and a run starting behind the cursor (an
      * overlap on a damaged tree) is skipped the same way. */
@@ -1996,6 +2118,7 @@ int cetrafs_fiemap(struct inode *inode, struct fiemap_extent_info *fi, u64 start
          * to LAST ("no extent begins after this one"). */
         for (j = i + 1; j < nruns && runs[j].start < cursor; j++)
             ;
+        cond_resched(); /* O(extents) per call; ~258k on a fragmented image */
 
         if (logical >= end)
             break;
@@ -2021,7 +2144,7 @@ int cetrafs_fiemap(struct inode *inode, struct fiemap_extent_info *fi, u64 start
         }
         i = j;
     }
-    kvfree(runs);
+    cetrafs_smap_put(m);
 
 out:
     inode_unlock_shared(inode);
@@ -3549,8 +3672,15 @@ bool cetrafs_flat_range_is_ours(struct super_block *sb, const cetrafs_extent_t *
 
 /* Total extent count across all depths -- reads interior/leaf HEADERS
  * only (no extent copy), so the defrag trigger and close-time nudge can
- * feed cetrafs_frag_index_pct() the real number for a depth-2 file. */
-u32 cetrafs_tree_extent_count(struct inode *inode, const cetrafs_inode_t *raw)
+ * feed cetrafs_frag_index_pct() the real number for a depth-2 file.
+ *
+ * 'reader': the count only decides whether to QUEUE a defrag, which
+ * reads the tree again under its own lock -- so it may trust the cache
+ * as a reader does (cetrafs_tree_flatten_for()). The close-time nudge
+ * runs after the write lock is cleared, and under the write lock's
+ * question it read every tree block from the device on every close of
+ * a fragmented file. */
+u32 cetrafs_tree_extent_count_for(struct inode *inode, const cetrafs_inode_t *raw, bool reader)
 {
     u32 ni, total = 0;
 
@@ -3560,7 +3690,7 @@ u32 cetrafs_tree_extent_count(struct inode *inode, const cetrafs_inode_t *raw)
         return min_t(u32, cetrafs_le16(raw->eh.eh_entries), ARRAY_SIZE(raw->et.leaf));
     if (cetrafs_le16(raw->eh.eh_depth) == 1) {
         u64 llba = cetrafs_extent_phys_from_hilo(raw->et.idx[0].ei_leaf_hi, raw->et.idx[0].ei_leaf_lo);
-        struct buffer_head *lbh = cetrafs_read_leaf_bh(inode, llba);
+        struct buffer_head *lbh = cetrafs_read_leaf_bh_for(inode, llba, reader);
 
         if (lbh) {
             total = min_t(u32, cetrafs_le16(((const cetrafs_extent_hdr_t *) lbh->b_data)->eh_entries),
@@ -3571,7 +3701,7 @@ u32 cetrafs_tree_extent_count(struct inode *inode, const cetrafs_inode_t *raw)
     }
     for (ni = 0; ni < cetrafs_le16(raw->eh.eh_entries) && ni < ARRAY_SIZE(raw->et.idx); ni++) {
         u64 ilba = cetrafs_extent_phys_from_hilo(raw->et.idx[ni].ei_leaf_hi, raw->et.idx[ni].ei_leaf_lo);
-        struct buffer_head *ibh = cetrafs_read_index_bh(inode, ilba);
+        struct buffer_head *ibh = cetrafs_read_index_bh_for(inode, ilba, reader);
 
         if (ibh) {
             const cetrafs_extent_hdr_t *h = (const cetrafs_extent_hdr_t *) ibh->b_data;
@@ -3580,7 +3710,7 @@ u32 cetrafs_tree_extent_count(struct inode *inode, const cetrafs_inode_t *raw)
 
             for (li = 0; li < n; li++) {
                 u64 llba = cetrafs_extent_phys_from_hilo(ia[li].ei_leaf_hi, ia[li].ei_leaf_lo);
-                struct buffer_head *lbh = cetrafs_read_leaf_bh(inode, llba);
+                struct buffer_head *lbh = cetrafs_read_leaf_bh_for(inode, llba, reader);
 
                 if (lbh) {
                     total += min_t(u32, cetrafs_le16(((const cetrafs_extent_hdr_t *) lbh->b_data)->eh_entries),
@@ -3592,6 +3722,11 @@ u32 cetrafs_tree_extent_count(struct inode *inode, const cetrafs_inode_t *raw)
         }
     }
     return total;
+}
+
+u32 cetrafs_tree_extent_count(struct inode *inode, const cetrafs_inode_t *raw)
+{
+    return cetrafs_tree_extent_count_for(inode, raw, false);
 }
 
 u64 cetrafs_flat_data_blocks(const cetrafs_extent_t *flat, u32 n)
@@ -8041,6 +8176,9 @@ static int cetrafs_release(struct inode *inode, struct file *file)
      * flush instead of sitting reserved-but-unreferenced until the
      * scrub notices. */
     cetrafs_inode_drop_reservation(inode);
+    /* A fragmented file's sorted map is megabytes: kept only while the
+     * file is open (cetrafs_inode_sorted_runs()). */
+    cetrafs_inode_smap_drop(inode);
     return cetrafs_lock_release(inode, file);
 }
 

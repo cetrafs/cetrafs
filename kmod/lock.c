@@ -243,6 +243,17 @@ struct cetrafs_inode_info {
     u32 ext_len;   /* how many blocks it covers */
     u64 ext_lba;   /* device block ext_block lives at */
 
+    /* The sorted extent map fiemap and SEEK_DATA/SEEK_HOLE walk
+     * (cetrafs_inode_sorted_runs()), kept between calls: sorting a
+     * fragmented image's ~258k extents was ~47 ms per call, and filefrag
+     * makes hundreds. Keyed on the tree's IDENTITY -- every tree block's
+     * address, eh_generation and tail CRC, all restamped by every edit
+     * (cetrafs_tree_identity()) -- and the key is recomputed and compared
+     * at every use, so a stale map is never walked (class 51). Under
+     * resv_lock; dropped at every close and at evict, so it lives only
+     * while the file is open. */
+    struct cetrafs_smap *smap;
+
     u64 generation; /* on-disk cetrafs_inode_t.generation this object was
                      * instantiated from (v0x0008) -- the cross-node
                      * inode-number-reuse detector; see inode.c */
@@ -810,6 +821,57 @@ void cetrafs_inode_ext_cache_drop(struct inode *inode)
     spin_unlock(&ci->resv_lock);
 }
 
+/* ------ the sorted map (see cetrafs_inode_info.smap) ------ */
+
+/* TEST ONLY: hand back the cached map whatever its key -- the negative
+ * control of tests/kernel/seek_map_cache.sh. */
+static bool cetrafs_smap_trust_stale;
+cetrafs_test_param(smap_trust_stale, cetrafs_smap_trust_stale, bool, 0644);
+MODULE_PARM_DESC(smap_trust_stale, "TEST ONLY: fiemap/SEEK reuse the cached sorted map after the tree changed");
+
+/* A reference to the cached map if its key is 'key', else NULL. */
+struct cetrafs_smap *cetrafs_inode_smap_get(struct inode *inode, u64 key)
+{
+    struct cetrafs_inode_info *ci = CETRAFS_I(inode);
+    struct cetrafs_smap *m = NULL;
+
+    spin_lock(&ci->resv_lock);
+    if (ci->smap && (ci->smap->key == key || READ_ONCE(cetrafs_smap_trust_stale))) {
+        m = ci->smap;
+        refcount_inc(&m->ref);
+    }
+    spin_unlock(&ci->resv_lock);
+    return m;
+}
+
+/* Keep 'm' (the cache takes its own reference), replacing any other. */
+void cetrafs_inode_smap_store(struct inode *inode, struct cetrafs_smap *m)
+{
+    struct cetrafs_inode_info *ci = CETRAFS_I(inode);
+    struct cetrafs_smap *old;
+
+    refcount_inc(&m->ref);
+    spin_lock(&ci->resv_lock);
+    old = ci->smap;
+    ci->smap = m;
+    spin_unlock(&ci->resv_lock);
+    if (old)
+        cetrafs_smap_put(old);
+}
+
+void cetrafs_inode_smap_drop(struct inode *inode)
+{
+    struct cetrafs_inode_info *ci = CETRAFS_I(inode);
+    struct cetrafs_smap *old;
+
+    spin_lock(&ci->resv_lock);
+    old = ci->smap;
+    ci->smap = NULL;
+    spin_unlock(&ci->resv_lock);
+    if (old)
+        cetrafs_smap_put(old);
+}
+
 bool cetrafs_inode_stat_baseline_get(struct inode *inode, struct cetrafs_stat_baseline *out)
 {
     struct cetrafs_inode_info *ci = CETRAFS_I(inode);
@@ -1325,6 +1387,7 @@ static void cetrafs_inode_init_once(void *foo)
     struct cetrafs_inode_info *ci = foo;
 
     INIT_LIST_HEAD(&ci->deferred);
+    ci->smap = NULL; /* evict drops it, so a recycled object has none */
     mutex_init(&ci->lock_mutex);
     spin_lock_init(&ci->resv_lock);
     spin_lock_init(&ci->fd_lock);
@@ -1406,6 +1469,9 @@ void cetrafs_free_vfs_inode(struct inode *inode)
      * list (cetrafs_deferred_evict()); one left here would be freed
      * while the registry still links it. */
     WARN_ON_ONCE(!list_empty(&ci->deferred));
+    /* ->evict_inode drops the sorted map (it is vmalloc memory, and this
+     * runs in softirq). */
+    WARN_ON_ONCE(ci->smap);
 
     kmem_cache_free(cetrafs_inode_cache, ci);
 }
@@ -3209,7 +3275,7 @@ static void __cetrafs_lock_release(struct inode *inode, const struct cetrafs_clo
              * depth-1->2 transition). cetrafs_defrag_consider() then gates
              * on the SIZE-RELATIVE fragmentation index, so a depth-2 file
              * that genuinely needs collapsing gets queued here at close. */
-            u32 extents = cetrafs_tree_extent_count(inode, &raw);
+            u32 extents = cetrafs_tree_extent_count_for(inode, &raw, true); /* only queues a defrag */
 
             if (extents) {
                 u64 nblk = CETRAFS_DIV_ROUND_UP(cetrafs_le64(raw.size), CETRAFS_BLOCK_SIZE);

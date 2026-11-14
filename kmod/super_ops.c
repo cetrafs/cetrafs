@@ -396,6 +396,9 @@ static void cetrafs_evict_inode(struct inode *inode)
     struct super_block *sb = inode->i_sb;
 
     truncate_inode_pages_final(&inode->i_data);
+    /* The sorted extent map, if fiemap or a seek left one: vmalloc
+     * memory, and ->free_inode runs in softirq. */
+    cetrafs_inode_smap_drop(inode);
 
     /* Last stop for a speculative allocation run. ->release() normally
      * returns it, but an inode can reach eviction without one (an
