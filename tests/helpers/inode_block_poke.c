@@ -244,6 +244,31 @@ int main(int argc, char **argv)
         pwrite_all(fd, &rec, sizeof(rec), rec_off);
         fprintf(stderr, "inode_block_poke: ino %llu xattr_seq -> %llu\n", (unsigned long long) ino,
                 (unsigned long long) cetrafs_le64(rec.xattr_seq));
+    } else if (strcmp(mode, "uninit") == 0) {
+        /* The on-disk record's PREALLOCATED state, as a fdatasync test
+         * needs it: how many blocks the inline extents call written and
+         * how many still call preallocated. Depth 0 only -- a test that
+         * sees depth != 0 has left the inline array it is checking. */
+        cetrafs_inode_t rec;
+        unsigned long long wr = 0, un = 0;
+        unsigned nun = 0;
+
+        pread_all(fd, &rec, sizeof(rec), rec_off);
+        if (rec.eh.eh_depth != 0) {
+            printf("depth=%u\n", rec.eh.eh_depth);
+            return 0;
+        }
+        for (uint32_t e = 0; e < cetrafs_le16(rec.eh.eh_entries) && e < 4; ++e) {
+            uint32_t len = cetrafs_extent_len(rec.et.leaf[e].ee_len);
+
+            if (cetrafs_extent_is_uninit(rec.et.leaf[e].ee_len)) {
+                un += len;
+                nun++;
+            } else {
+                wr += len;
+            }
+        }
+        printf("depth=0 written_blocks=%llu uninit_blocks=%llu uninit_entries=%u\n", wr, un, nun);
     } else if (strcmp(mode, "extents") == 0) {
         /* The extent tree's SHAPE, which no other helper exposes.
          * Needed because "this directory is big" is not the same claim

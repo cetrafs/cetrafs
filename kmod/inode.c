@@ -24,6 +24,22 @@
  * folding a write into a CAS nets to zero there). */
 static atomic64_t cetrafs_record_writes = ATOMIC64_INIT(0);
 
+/* The task-local scope of an fdatasync (file.c cetrafs_sync_inode_meta()):
+ * the task's journal_info names it while the VFS sync of its inode runs.
+ * True when the scope is for 'inode'; the caller is then leaving a
+ * time-only change unpublished, and the scope records that so the sync
+ * can re-dirty the inode (the times are still owed, just not by this
+ * datasync). */
+bool cetrafs_dsync_drop_times(struct inode *inode)
+{
+    struct cetrafs_dsync_scope *s = current->journal_info;
+
+    if (!s || s->inode != inode)
+        return false;
+    s->times_dropped = true;
+    return true;
+}
+
 u64 cetrafs_record_write_count(void)
 {
     return (u64) atomic64_read(&cetrafs_record_writes);
@@ -1948,10 +1964,23 @@ int cetrafs_write_vfs_inode(struct inode *inode)
      * writes" -- the VFS dirties the inode for timestamps the merge then
      * finds unchanged). Skip when there is no shadow and every merged
      * field already matches the baseline this node last published. */
-    if (!ctx->have_shadow && (u64) i_size_read(inode) == ctx->base.size && (u64) inode->i_blocks == ctx->base.blocks &&
-        (u64) inode_get_atime_sec(inode) == ctx->base.atime && (u64) inode_get_mtime_sec(inode) == ctx->base.mtime) {
-        ret = 0;
-        goto out_pub;
+    /* Inside an fdatasync's scope (file.c cetrafs_sync_inode_meta()) the
+     * times are not part of what the datasync promises, so time-only dirt
+     * is left unpublished here and the scope re-dirties the inode after
+     * the VFS clears it. The stat baseline keeps the old times. The skip
+     * is only ever taken with no shadow and unchanged size and blocks:
+     * every extent change to a regular file is either staged in the
+     * shadow (cetrafs_inode_fd_stage) or published synchronously by its
+     * own _fd publisher, so nothing this datasync must make durable can
+     * be waiting behind this skip. */
+    if (!ctx->have_shadow && (u64) i_size_read(inode) == ctx->base.size && (u64) inode->i_blocks == ctx->base.blocks) {
+        bool times_same = (u64) inode_get_atime_sec(inode) == ctx->base.atime &&
+                          (u64) inode_get_mtime_sec(inode) == ctx->base.mtime;
+
+        if (times_same || cetrafs_dsync_drop_times(inode)) {
+            ret = 0;
+            goto out_pub;
+        }
     }
 
     ctx->me = my_node_id;

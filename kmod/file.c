@@ -8803,7 +8803,65 @@ static bool cetrafs_fsync_flush_skip;
 cetrafs_test_param(fsync_flush_skip, cetrafs_fsync_flush_skip, bool, 0644);
 MODULE_PARM_DESC(fsync_flush_skip, "TEST ONLY: fsync does not issue its final device cache flush");
 
-static int cetrafs_fsync_meta(struct inode *inode, int ret, bool locked)
+/* TEST ONLY: a datasync fsync publishes the record as a full fsync does,
+ * times included -- the control of tests/kernel/fdatasync_overwrite.sh. */
+static bool cetrafs_datasync_full;
+cetrafs_test_param(datasync_full, cetrafs_datasync_full, bool, 0644);
+MODULE_PARM_DESC(datasync_full, "TEST ONLY: fdatasync publishes the record's timestamps too");
+
+/*
+ * The metadata sync of an fdatasync. It is the VFS path, so the inode's
+ * dirty state is cleared afterwards (cetrafs_apply_raw_to_vfs_inode()
+ * refuses to refresh a dirty inode, the trap the comment in
+ * cetrafs_fsync_meta() describes). What differs is the scope: while it
+ * runs, the task carries a cetrafs_dsync_scope naming this inode, and
+ * cetrafs_write_vfs_inode() then leaves time-only dirt unpublished (see
+ * inode.c). The scope is task-local: a writeback or another task's sync
+ * of the same inode never sees it, so their times are still published.
+ *
+ * WHY THE SKIP IS SAFE. The record publish is skipped only when there is
+ * no shadow and size and blocks are unchanged, so it can only drop a
+ * change that touches neither. Every change to a regular file's extent
+ * state reaches the device one of two ways, and neither depends on this
+ * sync:
+ *   - staged in the shadow (cetrafs_inode_fd_stage(), file.c get_block:
+ *     a new block; the uninit-to-written conversion of a preallocated
+ *     block, whether from write(2) via convert_pending, an O_DIRECT
+ *     completion, or the buffered path). A staged shadow sets fd_dirty,
+ *     so have_shadow is true and the record is published with it. The
+ *     conversion keeps blocks unchanged, which is why the blocks check
+ *     alone would NOT catch it: the shadow is what carries it.
+ *   - published synchronously by the operation that made it (truncate,
+ *     punch, fallocate, defrag, the namespace paths, via the _fd
+ *     publishers, under fd_pub_mutex). It is on the device before that
+ *     operation returns, so it is not left for this sync to publish.
+ * The one thing that can still change in core without either is the
+ * times, and those are what the scope drops. A datasync that finds
+ * nothing staged therefore has nothing to make durable beyond the data
+ * and the leaves, which fsync_meta flushes before this call. The
+ * dropped times are not lost: the scope re-dirties the inode after the
+ * VFS clears it, so writeback or the next full sync publishes them, and
+ * a clean unmount still does. tests/kernel/fdatasync_overwrite.sh counts
+ * the publishes, and tests/crash/fsync_volatile.sh checks the cuts.
+ */
+static int cetrafs_sync_inode_meta(struct inode *inode, bool datasync)
+{
+    struct cetrafs_dsync_scope scope = {.inode = inode};
+    void *saved;
+    int ret;
+
+    if (!datasync || READ_ONCE(cetrafs_datasync_full))
+        return sync_inode_metadata(inode, 1);
+    saved = current->journal_info;
+    current->journal_info = &scope;
+    ret = sync_inode_metadata(inode, 1);
+    current->journal_info = saved;
+    if (scope.times_dropped)
+        mark_inode_dirty_sync(inode);
+    return ret;
+}
+
+static int cetrafs_fsync_meta(struct inode *inode, int ret, bool locked, bool datasync)
 {
     struct super_block *sb = inode->i_sb;
     cetrafs_inode_t raw;
@@ -8854,7 +8912,7 @@ static int cetrafs_fsync_meta(struct inode *inode, int ret, bool locked)
      * extent_leaf_staleness.sh, which went from pass to fail on exactly
      * that.
      */
-    ret2 = sync_inode_metadata(inode, 1);
+    ret2 = cetrafs_sync_inode_meta(inode, datasync);
     if (ret2 && !ret)
         ret = ret2;
 
@@ -8875,19 +8933,21 @@ static int cetrafs_fsync_meta(struct inode *inode, int ret, bool locked)
     return ret;
 }
 
-static int __cetrafs_fsync(struct file *file, loff_t start, loff_t end, bool locked)
+static int __cetrafs_fsync(struct file *file, loff_t start, loff_t end, bool locked, bool datasync)
 {
     int ret = file_write_and_wait_range(file, start, end);
 
     if (ret)
         return ret;
-    return cetrafs_fsync_meta(file_inode(file), 0, locked);
+    return cetrafs_fsync_meta(file_inode(file), 0, locked, datasync);
 }
 
 static int cetrafs_fsync(struct file *file, loff_t start, loff_t end, int datasync)
 {
-    (void) datasync; /* the extents are needed to FIND the data either way */
-    return __cetrafs_fsync(file, start, end, false);
+    /* The extents are needed to FIND the data either way: a datasync
+     * still publishes every structural change; it skips only time-only
+     * dirt (cetrafs_sync_inode_meta()). */
+    return __cetrafs_fsync(file, start, end, false, datasync);
 }
 
 /* sync(2)/syncfs(2): what fsync would do, for an inode with buffered
@@ -8897,7 +8957,7 @@ int cetrafs_inode_sync_pending(struct inode *inode)
 {
     if (!cetrafs_pending_any(inode))
         return 0;
-    return cetrafs_fsync_meta(inode, 0, false);
+    return cetrafs_fsync_meta(inode, 0, false, false);
 }
 
 /*
@@ -8909,7 +8969,7 @@ int cetrafs_inode_sync_pending(struct inode *inode)
  */
 int cetrafs_file_make_durable(struct file *file, bool locked)
 {
-    return __cetrafs_fsync(file, 0, LLONG_MAX, locked);
+    return __cetrafs_fsync(file, 0, LLONG_MAX, locked, false);
 }
 
 /* TEST ONLY: pause a regular file's write-open before it publishes its
