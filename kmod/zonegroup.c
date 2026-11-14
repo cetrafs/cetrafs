@@ -917,6 +917,11 @@ static int cetrafs_zg_reconcile_free_counts(struct super_block *sb, u32 zg_id)
 
         if (cetrafs_sb_bg_owner(sb, b) != zg_id)
             continue;
+        /* A recount at mount scales with the volume: keep beating
+         * (audit 2026-11-14 F1). A no-op once the heartbeat runs. */
+        ret = cetrafs_sb_mount_beat(sb);
+        if (ret)
+            return ret;
 
         ret = cetrafs_bg_reconcile_free_count(sb, b, &delta);
         if (ret) {
@@ -2875,6 +2880,11 @@ int cetrafs_zg_drain_pending_frees(struct super_block *sb, bool may_wait)
 
         if (!cetrafs_sb_zg_owned_cached(sb, z))
             continue;
+        rc = cetrafs_sb_mount_beat(sb); /* the mount-time drain (F1); a no-op from the heartbeat */
+        if (rc) {
+            ret = rc;
+            break;
+        }
 
         rc = cetrafs_zg_drain_one(sb, z, may_wait);
         if (rc && !ret)

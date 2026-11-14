@@ -338,6 +338,7 @@ int cetrafs_getattr(struct mnt_idmap *idmap, const struct path *path, struct kst
                     unsigned int query_flags);
 void cetrafs_sb_lease_renewed(struct super_block *sb, unsigned long t0, unsigned int lease_secs);
 unsigned int cetrafs_sb_lease_secs(unsigned int imin, unsigned int imax, unsigned int smin);
+void cetrafs_sb_mount_lease(struct super_block *sb, unsigned long t0);
 u32 cetrafs_peer_window_floor_secs(u32 interval_secs, u32 stale_secs);
 int cetrafs_sb_mount_beat(struct super_block *sb);
 bool cetrafs_sb_defrag_draining(struct super_block *sb);

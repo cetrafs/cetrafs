@@ -4523,9 +4523,15 @@ int cetrafs_lock_sweep_own_claims(struct super_block *sb, u32 my_node_id)
     ninodes = le32_to_cpu(raw_sb->inodes_count);
 
     for (blk = 0; blk < nbmap && !ret; blk++) {
-        struct buffer_head *bh = cetrafs_bread_retry(sb, bmap + blk);
+        struct buffer_head *bh;
         u64 i;
 
+        /* The sweep runs at mount and walks every allocated inode:
+         * keep beating (audit 2026-11-14 F1). */
+        ret = cetrafs_sb_mount_beat(sb);
+        if (ret)
+            return ret;
+        bh = cetrafs_bread_retry(sb, bmap + blk);
         if (!bh)
             return -EIO;
         for (i = 0; i < CETRAFS_BLOCK_SIZE * 8; i++) {

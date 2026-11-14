@@ -2354,6 +2354,12 @@ static unsigned int cetrafs_mount_register_stall_ms;
 cetrafs_test_param(mount_register_stall_ms, cetrafs_mount_register_stall_ms, uint, 0644);
 MODULE_PARM_DESC(mount_register_stall_ms, "TEST ONLY: one-shot pause between the mount gate and registration");
 
+/* TEST ONLY, one-shot: hold a mount right after its registration, as a
+ * slow claim sweep or recount would (tests/kernel/mount_lease.sh). */
+static unsigned int cetrafs_mount_post_register_stall_ms;
+cetrafs_test_param(mount_post_register_stall_ms, cetrafs_mount_post_register_stall_ms, uint, 0644);
+MODULE_PARM_DESC(mount_post_register_stall_ms, "TEST ONLY: one-shot pause right after the mount registers");
+
 /* TEST ONLY: pretend the kernel runs with this page size, so the
  * refusal below can be reached on the 4 KiB hosts this project has
  * (tests/kernel/page_size_report.sh). 0: the real PAGE_SIZE. */
@@ -3019,6 +3025,7 @@ int cetrafs_fill_super(struct super_block *sb, struct fs_context *fc)
         /* Find/claim this node's Node Registry row. */
         {
             u8 node_uuid[CETRAFS_NODE_UUID_LEN];
+            unsigned long reg_t0 = jiffies;
             int rc = cetrafs_node_register(sb, sbi->file_lock_enabled ? CETRAFS_FLOCK_MODE_ON : CETRAFS_FLOCK_MODE_OFF,
                                            &sbi->node_id, node_uuid);
 
@@ -3030,6 +3037,16 @@ int cetrafs_fill_super(struct super_block *sb, struct fs_context *fc)
             }
             sbi->node_registered = true;
             memcpy(sbi->node_uuid, node_uuid, CETRAFS_NODE_UUID_LEN);
+            /* The registration is a beat: the lease runs from it, not
+             * from the heartbeat's first tick. Every mount phase until
+             * then -- the claim sweep, the Zone Group claim and recount,
+             * the drain -- writes, and can take minutes on a large
+             * volume; past the peers' window they reclaim from us while
+             * we go on (audit 2026-11-14 F1). Freed with sb_info on every
+             * failure path below (cetrafs_free_sb_info()). */
+            cetrafs_sb_mount_lease(sb, reg_t0);
+            if (cetrafs_mount_post_register_stall_ms) /* TEST ONLY, one-shot */
+                msleep(xchg(&cetrafs_mount_post_register_stall_ms, 0));
             CETRAFS_MOUNT_FAIL_POINT(1);
 
             /* Post-registration single-mounter re-check (no-CAW only). The
@@ -5300,27 +5317,42 @@ void cetrafs_sb_lease_renewed(struct super_block *sb, unsigned long t0, unsigned
  * heartbeat's first tick is the next, and between the two the mount can
  * wait minutes for a peer's replay claim to clear -- long enough for
  * every peer to judge this node stale and fence it before it has done
- * anything at all. Called from those waits; renews at most once per
- * heartbeat interval. The lease is not armed here: a mount phase that
- * stalls elsewhere must not stop itself, it is still beating no later
- * than a tick would.
+ * anything at all. Called from those waits and from every phase that
+ * scales with the volume (the claim sweep, the recount, the drain);
+ * renews at most once per heartbeat interval. Each renewal extends the
+ * lease, which registration armed: a mount phase that stalls past it
+ * stops the mount, because peers may reclaim from it by then (audit
+ * 2026-11-14 F1).
  *
  * Returns -EPERM / -EOWNERDEAD if the row says this node was fenced or
  * displaced meanwhile: the mount must fail, not go on.
  */
+/* A renewal from the mount, started at 't0', landed: arm or extend the
+ * lease as a heartbeat renewal does. */
+void cetrafs_sb_mount_lease(struct super_block *sb, unsigned long t0)
+{
+    unsigned int i = cetrafs_heartbeat_interval_secs(sb);
+
+    cetrafs_sb_lease_renewed(sb, t0, cetrafs_sb_lease_secs(i, i, cetrafs_sb_stale_secs(sb)));
+}
+
 int cetrafs_sb_mount_beat(struct super_block *sb)
 {
     struct cetrafs_sb_info *sbi = sb->s_fs_info;
+    unsigned long t0;
     int ret;
 
     if (!sbi || !sbi->node_registered || sbi->hb)
         return 0; /* not registered yet, or the heartbeat beats for us */
     if (sbi->mount_beat_next && time_before(jiffies, sbi->mount_beat_next))
         return 0;
-    sbi->mount_beat_next = jiffies + (unsigned long) cetrafs_heartbeat_interval_secs(sb) * HZ;
+    t0 = jiffies;
+    sbi->mount_beat_next = t0 + (unsigned long) cetrafs_heartbeat_interval_secs(sb) * HZ;
     if (!sbi->mount_beat_next)
         sbi->mount_beat_next = 1;
     ret = cetrafs_node_renew_heartbeat(sb, sbi->node_id);
+    if (ret == 0)
+        cetrafs_sb_mount_lease(sb, t0);
     if (ret == -EPERM || ret == -EOWNERDEAD) {
         pr_err("%s: this node was fenced while it was still mounting -- refusing the mount\n", sb->s_id);
         return ret;
