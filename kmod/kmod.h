@@ -648,6 +648,7 @@ bool cetrafs_dsync_drop_times(struct inode *inode);
  * on a single-node/loop volume by construction; the only confirmation the
  * append path runs on a real multi-node volume. */
 u64 cetrafs_pending_free_append_count(void);
+u64 cetrafs_pf_append_read_count(void);
 u64 cetrafs_pending_free_entry_count(void);
 /* Replay-claim outcomes (journal.c): how many of a dead peer's journal
  * areas this node replayed, and how many it found another node already

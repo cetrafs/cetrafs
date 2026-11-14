@@ -2271,6 +2271,42 @@ static unsigned int cetrafs_pf_append_stall_ms;
 cetrafs_test_param(pf_append_stall_ms, cetrafs_pf_append_stall_ms, uint, 0644);
 MODULE_PARM_DESC(pf_append_stall_ms, "TEST ONLY: delay every foreign-free queue append (ms)");
 
+/* TEST ONLY: the append's planning read takes one round trip per queue
+ * block, as before P10's batch -- the control of
+ * tests/kernel/pf_append_one_read.sh. */
+static bool cetrafs_pf_append_serial;
+cetrafs_test_param(pf_append_serial, cetrafs_pf_append_serial, bool, 0644);
+MODULE_PARM_DESC(pf_append_serial, "TEST ONLY: a foreign-free append reads its queue one block per round trip");
+
+/* Read requests the appends' planning reads made: one per batched pass,
+ * or one per block read singly (procfs info pf_append_reads). */
+static atomic64_t cetrafs_pf_append_reads = ATOMIC64_INIT(0);
+
+u64 cetrafs_pf_append_read_count(void)
+{
+    return (u64) atomic64_read(&cetrafs_pf_append_reads);
+}
+
+#define CETRAFS_PF_APPEND_CHUNK 8U
+
+/* Release what a planning read left unconsumed. */
+static void cetrafs_pf_put_bhs_keep(struct buffer_head **bhs, u32 n)
+{
+    u32 i;
+
+    for (i = 0; bhs && i < n; i++) {
+        brelse(bhs[i]);
+        bhs[i] = NULL;
+    }
+}
+
+/* ...and free the array. */
+static void cetrafs_pf_put_bhs(struct buffer_head **bhs, u32 n)
+{
+    cetrafs_pf_put_bhs_keep(bhs, n);
+    kfree(bhs);
+}
+
 int cetrafs_zg_queue_foreign_frees(struct super_block *sb,
                                    u32 zg_id,
                                    const struct cetrafs_pf_ent *ents,
@@ -2282,6 +2318,7 @@ int cetrafs_zg_queue_foreign_frees(struct super_block *sb,
     unsigned int regions = CETRAFS_BLOCK_SIZE / region;
     unsigned int pass;
     u8 *snap = NULL, *seed = NULL;
+    struct buffer_head **bhs = NULL;
     u64 qstart;
     u32 qblocks, qb, next = 0;
     int ret = 0;
@@ -2325,11 +2362,42 @@ int cetrafs_zg_queue_foreign_frees(struct super_block *sb,
         goto append_failed_free;
     }
 
+    bhs = kcalloc(CETRAFS_PF_APPEND_CHUNK, sizeof(*bhs), GFP_NOFS);
+    if (!bhs) {
+        ret = -ENOMEM;
+        goto append_failed_free;
+    }
     for (pass = 0; pass < 2 && next < n; pass++) {
+        bool batched = false;
+
         for (qb = 0; qb < qblocks && next < n; qb++) {
-            struct buffer_head *bh = cetrafs_bread_uncached_retry(sb, qstart + qb);
+            u32 k = qb % CETRAFS_PF_APPEND_CHUNK;
+            struct buffer_head *bh;
             unsigned int r;
 
+            /* The planning read, a chunk at a time: one wait per
+             * CETRAFS_PF_APPEND_CHUNK queue blocks rather than one round
+             * trip per block (P10). The scan still stops at the first
+             * chunk that places everything, so an append to a queue with
+             * room at its front reads one chunk. */
+            if (k == 0) {
+                u32 c = min_t(u32, CETRAFS_PF_APPEND_CHUNK, qblocks - qb);
+
+                cetrafs_pf_put_bhs_keep(bhs, CETRAFS_PF_APPEND_CHUNK);
+                batched = !READ_ONCE(cetrafs_pf_append_serial);
+                if (batched) {
+                    atomic64_inc(&cetrafs_pf_append_reads);
+                    if (cetrafs_bread_uncached_batch(sb, qstart + qb, c, bhs))
+                        batched = false; /* the per-block reader below retries each */
+                }
+            }
+            if (batched) {
+                bh = bhs[k];
+                bhs[k] = NULL;
+            } else {
+                atomic64_inc(&cetrafs_pf_append_reads);
+                bh = cetrafs_bread_uncached_retry(sb, qstart + qb);
+            }
             if (!bh) {
                 ret = -EIO;
                 goto append_failed_free;
@@ -2375,6 +2443,7 @@ int cetrafs_zg_queue_foreign_frees(struct super_block *sb,
             }
         }
     }
+    cetrafs_pf_put_bhs(bhs, CETRAFS_PF_APPEND_CHUNK);
     kfree(snap);
     kfree(seed);
     if (next == n)
@@ -2438,6 +2507,7 @@ queue_full:
     return 0;
 
 append_failed_free:
+    cetrafs_pf_put_bhs(bhs, CETRAFS_PF_APPEND_CHUNK);
     kfree(snap);
     kfree(seed);
     goto append_failed;
