@@ -510,8 +510,10 @@ int main(int argc, char **argv)
     while ((opt = getopt(argc - 1, argv + 1, "z:b:N:J:M:s:nf")) != -1) {
         switch (opt) {
         case 'z': {
-            long v = (long) parse_int_arg(optarg, "-z");
-            if (v < 1 || v > (long) CETRAFS_MAX_ZONE_GROUPS)
+            /* long long, as parse_int_arg returns: a 32-bit long cut
+             * "4294967297" down to 1 and accepted it (audit 2026-11-14 U11). */
+            long long v = parse_int_arg(optarg, "-z");
+            if (v < 1 || v > (long long) CETRAFS_MAX_ZONE_GROUPS)
                 die_arg("-z out of range");
             zg_count = (u32) v;
             break;
