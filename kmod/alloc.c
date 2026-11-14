@@ -2902,6 +2902,11 @@ int cetrafs_alloc_flush_bitmaps(struct super_block *sb)
     bool serial = !READ_ONCE(cetrafs_alloc_flush_unserialised);
     int ret;
 
+    /* A mount that failed before its sb_info existed, or after it went,
+     * still reaches here from kill_sb's sync_fs: nothing to flush, and
+     * no mutex to take. */
+    if (!sb->s_fs_info || !cetrafs_sb_raw(sb))
+        return 0;
     if (serial)
         cetrafs_sb_bmap_flush_begin(sb);
     ret = __cetrafs_alloc_flush_bitmaps(sb);

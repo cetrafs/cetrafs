@@ -6197,6 +6197,8 @@ bool cetrafs_sb_bmap_flush_inflight(struct super_block *sb)
 {
     struct cetrafs_sb_info *sbi = sb->s_fs_info;
 
+    if (!sbi)
+        return false;
     smp_rmb(); /* after the caller's look at the marks */
     return atomic_read(&sbi->bmap_flush_inflight) != 0;
 }
