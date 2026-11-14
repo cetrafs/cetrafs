@@ -1417,13 +1417,16 @@ static int cetrafs_zg_claim_one_more_locked(struct super_block *sb, u32 count, u
     u32 z, best_z = 0, stale_z = 0;
     u64 best_free = 0, stale_free = 0;
     bool have_best = false, have_stale = false;
+    /* One batch for the scan (A4): the claim's swap decides, this only
+     * picks the candidate. */
+    bool prefetched = cetrafs_zg_prefetch_all(sb);
     int ret;
 
     for (z = 0; z < count; z++) {
         struct cetrafs_zg_info info;
         bool stale;
 
-        ret = cetrafs_zg_get_info(sb, z, &info);
+        ret = prefetched ? cetrafs_zg_get_info_prefetched(sb, z, &info) : cetrafs_zg_get_info(sb, z, &info);
         if (ret)
             return ret;
 

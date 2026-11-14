@@ -4645,7 +4645,14 @@ MODULE_PARM_DESC(bg_claim_stall_ms, "test-only: pause one Block Group claim once
  * cetrafs_bg_claim_free(), and of FITRIM's pool pass. 0 when claimed,
  * -EAGAIN when it is not free (or a peer won it), any other error as is.
  */
+static int __cetrafs_bg_claim_one(struct super_block *sb, u32 zg_id, u32 b, bool prefetched);
+
 static int cetrafs_bg_claim_one(struct super_block *sb, u32 zg_id, u32 b)
+{
+    return __cetrafs_bg_claim_one(sb, zg_id, b, false);
+}
+
+static int __cetrafs_bg_claim_one(struct super_block *sb, u32 zg_id, u32 b, bool prefetched)
 {
     struct cetrafs_bg_claim_ctx ctx = {.zg_id = zg_id, .bg_id = b};
     struct cetrafs_bg_geom geom;
@@ -4662,8 +4669,10 @@ static int cetrafs_bg_claim_one(struct super_block *sb, u32 zg_id, u32 b)
      * and its descriptor is the one the allocator reads per block --
      * dropping it on every claim attempt (each ENOSPC on a full
      * volume makes one) is PERFORMANCE.md invariant 3 broken (audit
-     * 2026-11-06 L26). */
-    cetrafs_invalidate_block(sb, cetrafs_sb_bg_desc_lba(sb, b));
+     * 2026-11-06 L26). 'prefetched': the caller's batch just read it
+     * fresh (cetrafs_bg_claim_free()). */
+    if (!prefetched)
+        cetrafs_invalidate_block(sb, cetrafs_sb_bg_desc_lba(sb, b));
     if (cetrafs_read_bg_geom(sb, b, &geom) != 0)
         return -EAGAIN;
     if (geom.owner_zg != CETRAFS_BG_OWNER_FREE)
@@ -4768,18 +4777,37 @@ static int cetrafs_bg_claim_one(struct super_block *sb, u32 zg_id, u32 b)
 int cetrafs_bg_claim_free(struct super_block *sb, u32 zg_id, u32 *out_bg_id)
 {
     const cetrafs_superblock_t *raw_sb = cetrafs_sb_raw(sb);
+    bool prefetched;
     u32 b, nbg;
 
     if (!raw_sb)
         return -EINVAL;
     nbg = le32_to_cpu(raw_sb->block_group_count);
 
+    /* Every descriptor that is not ours dropped and read ahead first, as
+     * one batch: an ENOSPC paid a serial forced-fresh read per Block
+     * Group here, under the writer's locks (audit 2026-11-14 A4). The
+     * claim swap decides; this only finds the candidate. */
+    prefetched = !READ_ONCE(cetrafs_zg_prefetch_off);
+    if (prefetched) {
+        for (b = 0; b < nbg; b++) {
+            u64 lba;
+
+            if (cetrafs_sb_bg_is_ours(sb, b))
+                continue;
+            lba = cetrafs_sb_bg_desc_lba(sb, b);
+            cetrafs_invalidate_block(sb, lba);
+            sb_breadahead(sb, lba);
+        }
+    }
     for (b = 0; b < nbg; b++) {
         int ret;
 
         if (cetrafs_sb_bg_is_ours(sb, b))
             continue;
-        ret = cetrafs_bg_claim_one(sb, zg_id, b);
+        if ((b & 1023) == 1023)
+            cond_resched();
+        ret = __cetrafs_bg_claim_one(sb, zg_id, b, prefetched);
         if (ret == -EAGAIN)
             continue;
         if (ret)
