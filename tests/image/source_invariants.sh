@@ -2121,6 +2121,7 @@ cetrafs_caw_scsi below:a-miscompare-the-cas-loop-re-reads
 cetrafs_node_fence_peer_full below:the-peer-came-back-callers-wait-as-for-a-live-holder
 cetrafs_journal_replay_node below:the-node-came-back-its-own-mount-replays
 cetrafs_bg_release_bitmap_ready below:not-released-the-heartbeat-tries-later
+cetrafs_journal_settle_range below:a-live-entry-or-a-batch-in-progress-the-group-is-kept-for-a-later-pass
 cetrafs_bg_release_one below:kept-for-a-later-pass
 cetrafs_discard_handback below:over-budget-kept-for-a-later-pass
 cetrafs_frees_quiet below:frees-in-flight-the-scrub-skips-this-cycle

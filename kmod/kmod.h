@@ -1543,6 +1543,8 @@ int cetrafs_journal_write_block(struct super_block *sb, struct cetrafs_journal_o
                                 u32 prev_crc);
 unsigned int cetrafs_journal_batch_capacity(struct super_block *sb);
 int cetrafs_journal_drain_retiring(struct super_block *sb);
+int cetrafs_journal_settle_range(struct super_block *sb, u64 first, u64 count);
+u64 cetrafs_release_journal_drain_count(void);
 u64 cetrafs_convert_source_flush_count(void);
 u64 cetrafs_deferred_batch_count(void);
 u64 cetrafs_deferred_batch_flush_count(void);

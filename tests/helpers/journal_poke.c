@@ -38,6 +38,9 @@
  * area cannot be produced by any single-node sequence of mounts):
  *   journal_poke <image> <node_id> --dump            -- print state/replay_owner
  *   journal_poke <image> <node_id> --claim <owner|release> -- force the flag: DIRTY+owner, or CLEAN+none
+ *   journal_poke <image> <node_id> --live            -- one "slot <n> target <lba>" line per
+ *                                                       live entry (read-only; on a mounted
+ *                                                       device it reads the shared page cache)
  *
  * Park stamps (format 0x000A, cetrafs_node_journal_hdr_t.park_seq): every
  * form that rewrites the flag keeps the park_seq it finds, and stamps a
@@ -172,7 +175,8 @@ static uint64_t flag_park(int fd, uint64_t area_start)
 
 int main(int argc, char **argv)
 {
-    int dump = (argc == 4 && !strcmp(argv[3], "--dump"));
+    int live = (argc == 4 && !strcmp(argv[3], "--live"));
+    int dump = (argc == 4 && !strcmp(argv[3], "--dump")) || live; /* --live: its own branch, first */
     int claim = (argc == 5 && !strcmp(argv[3], "--claim"));
     const char *guard = (argc == 7) ? argv[6] : NULL;
 
@@ -180,7 +184,7 @@ int main(int argc, char **argv)
         fprintf(stderr,
                 "usage: %s <image> <node_id> <slot> <target_lba> <payload_file> "
                 "[--guard-current|--guard-stale|--fresh|--unguarded]\n"
-                "       %s <image> <node_id> --dump\n"
+                "       %s <image> <node_id> --dump|--live\n"
                 "       %s <image> <node_id> --claim <replay_owner|release>\n",
                 argv[0], argv[0], argv[0]);
         return 2;
@@ -199,7 +203,7 @@ int main(int argc, char **argv)
     uint64_t target_lba = (dump || claim) ? 0 : strtoull(argv[4], NULL, 0);
     const char *payload_path = (dump || claim) ? NULL : argv[5];
 
-    int fd = open(path, O_RDWR);
+    int fd = open(path, live ? O_RDONLY : O_RDWR);
     if (fd < 0) {
         perror("open");
         return 1;
@@ -220,6 +224,17 @@ int main(int argc, char **argv)
     uint64_t area_start = cetrafs_le64(sb.node_journal_start) + (uint64_t) node_id * cetrafs_le32(sb.node_journal_blocks);
     uint64_t slots = (cetrafs_le32(sb.node_journal_blocks) - 1) / 2;
 
+    if (live) {
+        for (uint64_t sl = 0; sl < slots; sl++) {
+            cetrafs_journal_header_t h;
+
+            pread_all(fd, &h, sizeof(h), (off_t) (area_start + 1 + sl * 2) * CETRAFS_BLOCK_SIZE);
+            if (cetrafs_le32(h.magic) == CETRAFS_JOURNAL_MAGIC)
+                printf("slot %" PRIu64 " target %" PRIu64 "\n", sl, (uint64_t) cetrafs_le64(h.target_lba));
+        }
+        close(fd);
+        return 0;
+    }
     if (dump) {
         cetrafs_node_journal_hdr_t flag;
         pread_all(fd, &flag, sizeof(flag), (off_t) area_start * CETRAFS_BLOCK_SIZE);

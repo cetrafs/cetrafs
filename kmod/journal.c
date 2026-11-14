@@ -1599,6 +1599,83 @@ int cetrafs_journal_drain_retiring(struct super_block *sb)
     return ret;
 }
 
+/* TEST ONLY: a hand-back leaves this node's live entries for its blocks
+ * as they are -- the control of tests/kernel/release_journal_settled.sh. */
+static bool cetrafs_release_journal_unsettled;
+cetrafs_test_param(release_journal_unsettled, cetrafs_release_journal_unsettled, bool, 0644);
+MODULE_PARM_DESC(release_journal_unsettled, "TEST ONLY: hand back blocks with live journal entries for them");
+
+/* Hand-backs that spent the last batch's entries first (procfs info). */
+static atomic64_t cetrafs_release_journal_drains = ATOMIC64_INIT(0);
+
+u64 cetrafs_release_journal_drain_count(void)
+{
+    return (u64) atomic64_read(&cetrafs_release_journal_drains);
+}
+
+static bool cetrafs_lba_in(u64 lba, u64 first, u64 count)
+{
+    return lba >= first && lba - first < count;
+}
+
+/*
+ * Before blocks [first, first + count) leave this node -- a Block Group
+ * handed back, alone or with its Zone Group: no entry of ours may stay
+ * live for one of them.
+ *
+ * A peer's replay of our journal is safe because no peer reuses this
+ * node's blocks before replaying it: a reused block is the one redo the
+ * prev_checksum judge cannot refuse when the peer's own write of it is
+ * in flight (torn, it reads as "ours, torn by the crash"). A hand-back
+ * is exactly where a peer starts reusing our blocks with no replay in
+ * between, and a held-back batch's entries stay live after the batch
+ * completed -- for a tree block of a file deleted since, in a group that
+ * is now empty. So the last batch's retiring entries are spent here as
+ * at a sync (flush, then zero), when any of them names the range; and a
+ * HELD entry for a block in it (its zero or its target write failed)
+ * keeps the range, as does a hold that names no block, and a batch in
+ * progress (batch_mutex busy: it may be retiring entries right now).
+ *
+ * Returns 0 when nothing of ours is live for the range, -EBUSY to keep
+ * it for a later pass, or the flush's error.
+ */
+int cetrafs_journal_settle_range(struct super_block *sb, u64 first, u64 count)
+{
+    struct cetrafs_journal *j = cetrafs_sb_get_journal(sb);
+    u64 i, named = 0;
+    bool hit = false;
+    int ret = 0;
+
+    if (!j || !j->area_start || READ_ONCE(cetrafs_release_journal_unsettled))
+        return 0;
+    if (!mutex_trylock(&j->batch_mutex))
+        return -EBUSY;
+    for (i = 0; i < j->retire_n && !hit; i++)
+        hit = cetrafs_lba_in(j->retire_lba[i], first, count);
+    if (hit) {
+        ret = blkdev_issue_flush(sb->s_bdev);
+        if (!ret) {
+            cetrafs_journal_drain_locked(sb, j);
+            atomic64_inc(&cetrafs_release_journal_drains);
+        }
+    }
+    if (!ret) {
+        mutex_lock(&j->lock);
+        for (i = 0; i < j->slots && !ret; i++) {
+            if (!j->stuck_lba[i])
+                continue;
+            named++;
+            if (cetrafs_lba_in(j->stuck_lba[i], first, count))
+                ret = -EBUSY;
+        }
+        if (j->held > named)
+            ret = -EBUSY; /* a hold that names no block: it could be any */
+        mutex_unlock(&j->lock);
+    }
+    mutex_unlock(&j->batch_mutex);
+    return ret;
+}
+
 /* A whole deferred batch: k entries in k slots already taken. */
 static int cetrafs_journal_batch_chunk(struct super_block *sb, struct cetrafs_journal *j,
                                        struct buffer_head **bhs, const struct cetrafs_journal_owner *owners,

@@ -4621,6 +4621,9 @@ MODULE_PARM_DESC(bg_release_skip_bitmap_scan, "test-only: hand back a Block Grou
  * writeback would put our image back over the claimer's allocations.
  * Synced here, the blocks are clean and can be dropped after the CAS
  * (cetrafs_bg_release_drop_bitmap()). tests/kernel/bg_release_safety.sh.
+ *
+ * And no entry of this node's journal may still be live for a block in
+ * it (cetrafs_journal_settle_range(); release_journal_settled.sh).
  */
 int cetrafs_bg_release_bitmap_ready(struct super_block *sb, u32 b)
 {
@@ -4653,7 +4656,9 @@ int cetrafs_bg_release_bitmap_ready(struct super_block *sb, u32 b)
         if (ret)
             return ret;
     }
-    return 0;
+    /* Nor may an entry of our journal stay live for a block of it: the
+     * next owner reuses those blocks without replaying our journal. */
+    return cetrafs_journal_settle_range(sb, bg.start_block, bg.length_blocks);
 }
 
 /* After the release CAS: our copy of a bitmap we no longer own must not
