@@ -1428,6 +1428,17 @@ void cetrafs_destroy_inode_cache(void)
  * suspending requires a local writer, and the last writer's close clears
  * it, so a recycled object can never arrive still believing it has
  * surrendered a lock. */
+/* TEST ONLY: every new inode starts from a recycled object whose reader
+ * count an owing nofilelock close left at 1; and ->alloc_inode keeps the
+ * counts it finds, as before audit 2026-11-14 L-F1 (the control) --
+ * tests/kernel/recycled_reader_count.sh. */
+static bool cetrafs_alloc_recycled_reader;
+cetrafs_test_param(alloc_recycled_reader, cetrafs_alloc_recycled_reader, bool, 0644);
+MODULE_PARM_DESC(alloc_recycled_reader, "TEST ONLY: new inodes arrive with a stale reader count of 1");
+static bool cetrafs_alloc_keeps_counts;
+cetrafs_test_param(alloc_keeps_counts, cetrafs_alloc_keeps_counts, bool, 0644);
+MODULE_PARM_DESC(alloc_keeps_counts, "TEST ONLY: a new inode keeps a recycled object's open counts");
+
 struct inode *cetrafs_alloc_vfs_inode(struct super_block *sb)
 {
     struct cetrafs_inode_info *ci = alloc_inode_sb(sb, cetrafs_inode_cache, GFP_KERNEL);
@@ -1435,6 +1446,22 @@ struct inode *cetrafs_alloc_vfs_inode(struct super_block *sb)
     if (!ci)
         return NULL;
     ci->label_seen_at = 0; /* a recycled object keeps another file's */
+    if (READ_ONCE(cetrafs_alloc_recycled_reader))
+        atomic_set(&ci->read_opener_count, 1); /* test-only; see the parameter */
+    /* The local open counters too, for every new inode -- iget's and
+     * create's alike. A nofilelock close whose publish failed keeps
+     * read_opener_count at 1 until the heartbeat's retry lands it, and an
+     * inode evicted meanwhile went back to the slab with the count still
+     * 1: the next file in that object never published its first
+     * reader's presence (atomic_inc_return() == 1 was false), so a peer
+     * saw no reader and could truncate or unlink under it (audit
+     * 2026-11-14 L-F1). The owed on-disk bit is the heartbeat's
+     * (cetrafs_lock_retry_presence()), not this object's. */
+    if (!READ_ONCE(cetrafs_alloc_keeps_counts)) {
+        atomic_set(&ci->read_opener_count, 0);
+        atomic_set(&ci->lock_writer_count, 0);
+        atomic_set(&ci->lock_local_open_count, 0);
+    }
     return &ci->vfs_inode;
 }
 
