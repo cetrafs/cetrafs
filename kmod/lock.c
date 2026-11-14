@@ -3260,16 +3260,35 @@ static void __cetrafs_lock_release(struct inode *inode, const struct cetrafs_clo
          * only now that their data is down (file.c, enum
          * cetrafs_gb_mode). ->flush normally did it already; a store
          * through a mapping that outlived the last close(2) did not.
-         * A failure leaves them reading as zeros, and is logged there.
-         * Then the set goes, converted or not: once the last writer is
+         * The set may not outlive the close: once the last writer is
          * gone a peer may write the file, and an entry left behind would
          * make THIS node read a block the peer preallocated at that
          * offset as data -- whatever it held before. */
-        (void) cetrafs_convert_pending(inode);
-        if (cetrafs_pending_any(inode)) {
-            filemap_invalidate_lock(inode->i_mapping);
-            cetrafs_pending_drop_all(inode);
-            filemap_invalidate_unlock(inode->i_mapping);
+        /* Retried a few times: a refused cache flush keeps the set
+         * (cetrafs_convert_pending_locked()), and a flap is often over
+         * in a second. Still there after that, the set cannot be kept
+         * and cannot be dropped: dropped, its blocks read as zeros for
+         * good while their data is on the device (audit 2026-11-14
+         * FD-2). The mount stops instead -- the state a crash before
+         * this close leaves, where the blocks were never marked written
+         * either and nothing was acknowledged (docs/internal/ERRORS.md). */
+        {
+            int tries, cret = 0;
+
+            for (tries = 0; tries < 3; tries++) {
+                cret = cetrafs_convert_pending(inode);
+                if (!cetrafs_pending_any(inode))
+                    break;
+                msleep(200);
+            }
+            if (cetrafs_pending_any(inode)) {
+                cetrafs_sb_fatal(inode->i_sb,
+                                 "ino=%llu: buffered blocks could not be marked written at the last close (%d)",
+                                 (unsigned long long) inode->i_ino, cret);
+                filemap_invalidate_lock(inode->i_mapping);
+                cetrafs_pending_drop_all(inode);
+                filemap_invalidate_unlock(inode->i_mapping);
+            }
         }
         t_data = ktime_get();
 

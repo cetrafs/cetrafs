@@ -760,6 +760,12 @@ static int cetrafs_dio_end_io(struct kiocb *iocb, loff_t offset, ssize_t size, v
  * page, so the writeback below would miss it and the conversion would
  * declare a block whose data has not even been copied yet.
  */
+/* TEST ONLY: the cache flush before a pending conversion fails, as a
+ * refused SYNCHRONIZE CACHE would (tests/kernel/pending_flush_error.sh). */
+static bool cetrafs_pending_flush_fail;
+cetrafs_test_param(pending_flush_fail, cetrafs_pending_flush_fail, bool, 0644);
+MODULE_PARM_DESC(pending_flush_fail, "TEST ONLY: the device cache flush before a pending conversion fails");
+
 int cetrafs_convert_pending_locked(struct inode *inode)
 {
     struct address_space *m = inode->i_mapping;
@@ -806,13 +812,24 @@ int cetrafs_convert_pending_locked(struct inode *inode)
                 ret = -EIO;
         }
     }
-    if (!ret)
-        ret = cetrafs_publish_flush(inode->i_sb);
     if (ret) {
         pr_err_ratelimited("ino=%llu: buffered data did not reach the device (%d) -- the blocks it was written to "
                            "stay unwritten and read as zeros\n",
                            (unsigned long long) inode->i_ino, ret);
         cetrafs_pending_drop_all(inode);
+        return ret;
+    }
+    /* The writes completed; only their durability is unknown. Dropping
+     * the set here made every block of it unwritten for good while its
+     * data sat on the device -- a multipath flap failing one SYNCHRONIZE
+     * CACHE was enough (audit 2026-11-14 FD-2). Kept, for the next
+     * boundary to flush and convert; the last close retries and stops
+     * the mount rather than drop (cetrafs_lock_release()). */
+    ret = READ_ONCE(cetrafs_pending_flush_fail) ? -EIO : cetrafs_publish_flush(inode->i_sb);
+    if (ret) {
+        pr_err_ratelimited("ino=%llu: the device cache flush before marking buffered blocks written failed (%d) -- "
+                           "they stay pending for the next fsync or close\n",
+                           (unsigned long long) inode->i_ino, ret);
         return ret;
     }
 
