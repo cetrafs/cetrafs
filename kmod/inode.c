@@ -241,6 +241,17 @@ void cetrafs_inode_stamp_crc_fd(struct super_block *sb, cetrafs_inode_t *in)
  * another node owned in the same shared block -- so this is one block
  * read at a fixed offset, no straddle handling.
  */
+/* TEST ONLY: accept an unknown lock_mode, as before audit L-F8 -- the
+ * control of tests/kernel/lock_mode_unknown.sh. */
+static bool cetrafs_lock_mode_check_off;
+cetrafs_test_param(lock_mode_check_off, cetrafs_lock_mode_check_off, bool, 0644);
+MODULE_PARM_DESC(lock_mode_check_off, "TEST ONLY: a record whose lock_mode is not a lock state is accepted");
+
+static bool cetrafs_lock_mode_ok_test(u32 m)
+{
+    return READ_ONCE(cetrafs_lock_mode_check_off) || m <= CETRAFS_LOCK_YIELD;
+}
+
 /* A checksum mismatch is retried a few times with a forced-fresh
  * re-read before being treated as real corruption: readers of an inode
  * record deliberately take no lock (lookup/stat must stay cheap), so a
@@ -315,6 +326,15 @@ int cetrafs_read_raw_inode(struct super_block *sb, u64 ino, cetrafs_inode_t *out
                 pr_err("ino=%llu: its record's size %llu is past the format's %llu-byte ceiling -- refusing it\n",
                        (unsigned long long) ino, (unsigned long long) cetrafs_le64(out->size),
                        (unsigned long long) CETRAFS_MAX_FILE_BYTES);
+                cetrafs_sb_corrupt(sb, ino);
+                return -EUCLEAN;
+            }
+            /* lock_mode is an enum: an unknown value passes the checksum
+             * and reads as "free" to the open path but "held" to the
+             * CAS mutators (audit L-F8). Refused here, for every reader. */
+            if (!cetrafs_lock_mode_ok_test(cetrafs_le32(out->lock_mode))) {
+                pr_err("ino=%llu: its record's lock_mode %u is not a lock state -- refusing it\n",
+                       (unsigned long long) ino, cetrafs_le32(out->lock_mode));
                 cetrafs_sb_corrupt(sb, ino);
                 return -EUCLEAN;
             }

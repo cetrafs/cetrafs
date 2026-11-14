@@ -86,6 +86,7 @@ int main(int argc, char **argv)
         fprintf(stderr, "       %s <backing-file> poke <ino> <byte-value>\n", argv[0]);
         fprintf(stderr, "       %s <backing-file> corrupt <ino>        (invalidate its checksum)\n", argv[0]);
         fprintf(stderr, "       %s <backing-file> extlen <ino> <len>    (absurd preallocated extent)\n", argv[0]);
+        fprintf(stderr, "       %s <backing-file> lockmode <ino> <v>    (a lock_mode no build writes)\n", argv[0]);
         fprintf(stderr, "       %s <backing-file> growext <ino> <n>     (valid record a peer just extended)\n", argv[0]);
         fprintf(stderr, "       %s <backing-file> bumpgen <ino> <gen>   (reuse: generation only)\n", argv[0]);
         fprintf(stderr, "       %s <backing-file> setdepth <ino> <n>    (an extent depth the format lacks)\n", argv[0]);
@@ -289,6 +290,17 @@ int main(int argc, char **argv)
                                              cetrafs_le32(le[e].ee_start_lo)),
                        cetrafs_le32(le[e].ee_len) & CETRAFS_EXT_LEN_MASK);
         }
+    } else if (strcmp(mode, "lockmode") == 0 && argc == 5) {
+        /* A lock_mode no build writes (the enum is 0..3), restamped, so
+         * the record passes its checksum: only a range check sees it. */
+        cetrafs_inode_t rec;
+        uint32_t v = (uint32_t) strtoul(argv[4], NULL, 0);
+
+        pread_all(fd, &rec, sizeof(rec), rec_off);
+        rec.lock_mode = cetrafs_cpu_to_le32(v);
+        cetrafs_inode_stamp_crcs_us(&rec);
+        pwrite_all(fd, &rec, sizeof(rec), rec_off);
+        fprintf(stderr, "inode_block_poke: ino %llu lock_mode -> %u\n", (unsigned long long) ino, v);
     } else if (strcmp(mode, "setmode") == 0) {
         /* Set the raw mode, S_IFMT included. The point is to produce a
          * type this build cannot create -- a device node, a FIFO -- and
