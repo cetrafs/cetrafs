@@ -1833,7 +1833,13 @@ int cetrafs_node_live_peer_exists(struct super_block *sb, const u8 *my_uuid, boo
                 ret = -EINTR;
                 goto out;
             }
-            msleep_interruptible(min_t(unsigned long, 500, jiffies_to_msecs(until - jiffies) + 1));
+            /* Killable, not interruptible: a pending NON-fatal signal makes
+             * msleep_interruptible() return at once, and with it still
+             * pending the loop spins in the kernel, beating on every pass,
+             * for the rest of the window (audit C7; journal.c's claim wait
+             * is the same fix). The fatal check above is the exit. */
+            schedule_timeout_killable(
+                msecs_to_jiffies(min_t(unsigned long, 500, jiffies_to_msecs(until - jiffies) + 1)));
             /* Beat while we watch (audit 2026-11-11 N1): a peer watching
              * US over the same window must see this row move, or two
              * mounters each judge the other dead. A no-op before this
