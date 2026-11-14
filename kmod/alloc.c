@@ -3626,10 +3626,23 @@ static bool cetrafs_pf_apply_one_hold;
 cetrafs_test_param(pf_apply_one_hold, cetrafs_pf_apply_one_hold, bool, 0644);
 MODULE_PARM_DESC(pf_apply_one_hold, "TEST ONLY: apply a pending free under one alloc_mutex hold");
 
+/* TEST ONLY: the pending-free apply looks the bitmap block up twice per
+ * bit, as before -- the control of tests/kernel/pf_apply_bmap_lookups.sh. */
+static bool cetrafs_pf_apply_per_bit;
+cetrafs_test_param(pf_apply_per_bit, cetrafs_pf_apply_per_bit, bool, 0644);
+MODULE_PARM_DESC(pf_apply_per_bit, "TEST ONLY: a pending-free apply looks the bitmap block up per bit");
+static atomic64_t cetrafs_pf_apply_bmap_lookups = ATOMIC64_INIT(0);
+u64 cetrafs_pf_apply_bmap_lookup_count(void)
+{
+    return (u64) atomic64_read(&cetrafs_pf_apply_bmap_lookups);
+}
+
 int cetrafs_apply_pending_free(struct super_block *sb, u64 lba, u32 count, u32 expect_zg, u64 stamp)
 {
     struct cetrafs_bg_geom bg;
     u64 data_start, bit, b, freed = 0, total = 0;
+    struct buffer_head *fbh = NULL; /* the bitmap block the loop holds */
+    u64 fblk = 0;
     u32 bg_id;
     int ret;
 
@@ -3700,6 +3713,11 @@ int cetrafs_apply_pending_free(struct super_block *sb, u64 lba, u32 count, u32 e
         if (b && !(b & 4095) && !READ_ONCE(cetrafs_pf_apply_one_hold)) {
             struct cetrafs_bg_geom now;
 
+            if (fbh) { /* never held across the unlock */
+                cetrafs_bh_end_update(fbh);
+                brelse(fbh);
+                fbh = NULL;
+            }
             if (freed) {
                 cetrafs_bg_adjust_free_blocks(sb, bg_id, (s64) freed);
                 total += freed;
@@ -3730,19 +3748,59 @@ int cetrafs_apply_pending_free(struct super_block *sb, u64 lba, u32 count, u32 e
         }
         if (cetrafs_sb_trim_holds(sb, lba + b))
             continue; /* free before a FITRIM claimed it: as already free (cetrafs_trim_claim_next()) */
-        ret = cetrafs_bitmap_test_bit(sb, bg.start_block + bg.off_data_bmap, bg.off_data_region - bg.off_data_bmap,
-                                      bit + b, &set);
-        if (ret)
-            break;
-        if (!set)
-            continue; /* already free: re-applied entry, or double-queued -- skip the count too */
+        if (READ_ONCE(cetrafs_pf_apply_per_bit)) { /* test-only: the old per-bit lookups */
+            ret = cetrafs_bitmap_test_bit(sb, bg.start_block + bg.off_data_bmap,
+                                          bg.off_data_region - bg.off_data_bmap, bit + b, &set);
+            if (ret)
+                break;
+            atomic64_inc(&cetrafs_pf_apply_bmap_lookups);
+            if (!set)
+                continue; /* already free: re-applied entry, or double-queued -- skip the count too */
+            ret = cetrafs_bitmap_free_bit(sb, bg.start_block + bg.off_data_bmap,
+                                          bg.off_data_region - bg.off_data_bmap, bit + b, /*sync=*/false);
+            if (ret)
+                break;
+            atomic64_inc(&cetrafs_pf_apply_bmap_lookups);
+        } else {
+            /* One lookup and one buffer-lock hold per bitmap block, as
+             * the direct free (__cetrafs_free_data_extent(), audit P2):
+             * the test and the clear under the buffer lock, nothing in
+             * the loop sleeping on I/O while it is held, the hold ended
+             * at every block change and before alloc_mutex is let go. */
+            u64 bb = bit + b, blk = bb / CETRAFS_BITS_PER_BLOCK;
+            u32 in = (u32) (bb % CETRAFS_BITS_PER_BLOCK);
+            u8 *byte;
 
-        ret = cetrafs_bitmap_free_bit(sb, bg.start_block + bg.off_data_bmap, bg.off_data_region - bg.off_data_bmap,
-                                      bit + b, /*sync=*/false);
-        if (ret)
-            break;
+            if (fbh && fblk != blk) {
+                cetrafs_bh_end_update(fbh);
+                brelse(fbh);
+                fbh = NULL;
+            }
+            if (!fbh) {
+                if (blk >= bg.off_data_region - bg.off_data_bmap) {
+                    ret = -EINVAL;
+                    break;
+                }
+                fbh = cetrafs_bread_retry(sb, bg.start_block + bg.off_data_bmap + blk);
+                if (!fbh) {
+                    ret = -EIO;
+                    break;
+                }
+                atomic64_inc(&cetrafs_pf_apply_bmap_lookups);
+                cetrafs_bh_begin_update(fbh);
+                fblk = blk;
+            }
+            byte = (u8 *) fbh->b_data + in / 8;
+            if (!(*byte & (1u << (in % 8))))
+                continue; /* already free: re-applied entry, or double-queued -- skip the count too */
+            *byte &= (u8) ~(1u << (in % 8));
+        }
         cetrafs_shadow_clear(sb, lba + b, 1, "free_data_extent");
         freed++;
+    }
+    if (fbh) {
+        cetrafs_bh_end_update(fbh);
+        brelse(fbh);
     }
     if (freed)
         cetrafs_bg_adjust_free_blocks(sb, bg_id, (s64) freed);
