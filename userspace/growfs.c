@@ -452,6 +452,9 @@ int main(int argc, char **argv)
     (void) cetrafs_test_env_damaging("CETRAFS_GROWFS_TEST_CLOBBER_PENDING", fd);
     (void) cetrafs_test_env_damaging("CETRAFS_GROWFS_TEST_CLOBBER_JOURNAL", fd);
     (void) cetrafs_test_env_damaging("CETRAFS_GROWFS_TEST_NO_AGGREGATE", fd);
+    (void) cetrafs_test_env_damaging("CETRAFS_GROWFS_TEST_BG_OFFSET", fd);
+    (void) cetrafs_test_env_damaging("CETRAFS_GROWFS_TEST_DESC_SHIFT", fd);
+    (void) cetrafs_test_env_damaging("CETRAFS_GROWFS_TEST_KEEP_DEAD_CREDIT", fd);
 
     unsigned long long dev_bytes = 0ULL;
 
