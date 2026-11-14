@@ -533,14 +533,37 @@ struct cetrafs_dir_extents {
  * standing in for an address check -- and a dirent block's image copied
  * anywhere still carries a valid one. Arithmetic only, no I/O.
  */
+/* TEST ONLY: no cap on a directory's blocks, as before audit 2026-11-14
+ * RT-3 -- the control of tests/kernel/dir_extent_len_bound.sh. */
+static bool cetrafs_dir_len_unbounded;
+cetrafs_test_param(dir_len_unbounded, cetrafs_dir_len_unbounded, bool, 0644);
+MODULE_PARM_DESC(dir_len_unbounded, "TEST ONLY: a directory's extents may name any number of blocks");
+
 static int cetrafs_dir_extents_addr_ok(struct inode *dir, const struct cetrafs_dir_extents *de)
 {
+    u64 total = 0;
     u16 i;
 
     for (i = 0; i < de->entries; i++) {
         u64 phys = cetrafs_extent_phys_from_hilo(de->arr[i].ee_start_hi, de->arr[i].ee_start_lo);
         u32 len = cetrafs_extent_len(de->arr[i].ee_len);
         int chk = cetrafs_lba_run_check(dir->i_sb, phys, len);
+
+        /* A count, not only an address (rule 19): every scan of the
+         * directory reads that many blocks forced-fresh under its
+         * namespace lock, and an extent of 2^31 blocks inside the data
+         * area passed the address check -- one create held the lock
+         * for hours (audit 2026-11-14 RT-3). A directory never grows
+         * past CETRAFS_DIR_MAX_BLOCKS (cetrafs_dir_add_entry()), so more
+         * is damage. */
+        total += len;
+        if (total > CETRAFS_DIR_MAX_BLOCKS && !READ_ONCE(cetrafs_dir_len_unbounded)) {
+            pr_err_ratelimited("dir ino=%llu: its extents name %llu blocks, more than a directory may hold (%u) -- "
+                               "refusing them (fsck)\n",
+                               (unsigned long long) dir->i_ino, (unsigned long long) total, CETRAFS_DIR_MAX_BLOCKS);
+            cetrafs_sb_corrupt_inode(dir);
+            return -EUCLEAN;
+        }
 
         if (chk == -EAGAIN)
             return -EIO; /* past a layout this node cannot catch up with: not damage */
@@ -721,6 +744,10 @@ static int cetrafs_walk_dirents_from(struct inode *dir, cetrafs_dirent_visit_fn 
             unsigned int e;
 
             cond_resched(); /* O(blocks) per pass, whatever their content */
+            if (fatal_signal_pending(current)) { /* RT-3: the count is the disk's */
+                ret = -EINTR;
+                goto out;
+            }
             bh = cetrafs_dirent_read(dir->i_sb, phys + b, fresh);
             if (!bh) {
                 ret = -EIO;
@@ -845,9 +872,14 @@ static int cetrafs_dir_scan_for_slot(struct inode *dir,
         u32 b;
 
         for (b = 0; b < len; b++) {
-            struct buffer_head *sbh = cetrafs_dirent_read(dir->i_sb, phys + b, fresh);
+            struct buffer_head *sbh;
             const cetrafs_dirent_t *de;
             unsigned int e;
+
+            cond_resched();
+            if (fatal_signal_pending(current))
+                return -EINTR; /* RT-3: the count is the disk's */
+            sbh = cetrafs_dirent_read(dir->i_sb, phys + b, fresh);
 
             if (!sbh) {
                 pr_warn_ratelimited("dir ino=%llu: dirent block %llu unreadable during add\n",
@@ -1003,6 +1035,9 @@ int cetrafs_dir_add_entry(struct inode *dir, const struct qstr *name, u64 ino, u
         u32 next_logical = (u32) cetrafs_dir_extents_nblocks(&dx);
 
         cetrafs_dir_extents_put(&dx);
+        /* The cap every reader enforces (cetrafs_dir_extents_addr_ok()). */
+        if (next_logical >= CETRAFS_DIR_MAX_BLOCKS)
+            return -ENOSPC;
 
         ret = cetrafs_inode_map_block(dir, next_logical, /*create=*/true, &new_lba);
         if (ret)
@@ -1158,6 +1193,11 @@ int cetrafs_dir_remove_entry(struct inode *dir, const struct qstr *name, u64 exp
             cetrafs_dirent_t *de;
             unsigned int e;
 
+            cond_resched();
+            if (fatal_signal_pending(current)) { /* RT-3: the count is the disk's */
+                cetrafs_dir_extents_put(&dx);
+                return -EINTR;
+            }
             bh = cetrafs_dirent_read(dir->i_sb, phys + b, fresh);
             if (!bh) {
                 pr_warn_ratelimited("dir ino=%llu: dirent block %llu unreadable during remove\n",
@@ -1282,10 +1322,16 @@ int cetrafs_dir_update_dotdot(struct inode *dir, u64 new_parent_ino)
         u32 b;
 
         for (b = 0; b < len; b++) {
-            struct buffer_head *bh = cetrafs_dirent_bread(dir->i_sb, phys + b);
+            struct buffer_head *bh;
             cetrafs_dirent_t *de;
             unsigned int e;
 
+            cond_resched();
+            if (fatal_signal_pending(current)) { /* RT-3: the count is the disk's */
+                cetrafs_dir_extents_put(&dx);
+                return -EINTR;
+            }
+            bh = cetrafs_dirent_bread(dir->i_sb, phys + b);
             if (!bh) {
                 cetrafs_dir_extents_put(&dx);
                 return -EIO;
@@ -1388,6 +1434,11 @@ static int cetrafs_dir_retarget_entry(struct inode *dir,
             cetrafs_dirent_t *de;
             unsigned int e;
 
+            cond_resched();
+            if (fatal_signal_pending(current)) { /* RT-3: the count is the disk's */
+                cetrafs_dir_extents_put(&dx);
+                return -EINTR;
+            }
             /* A writer never uses the dirent cache -- see
              * cetrafs_dir_needs_fresh(). */
             bh = cetrafs_dirent_read(dir->i_sb, phys + b, true);

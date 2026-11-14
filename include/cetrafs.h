@@ -868,6 +868,12 @@ typedef struct {
     ((CETRAFS_BLK_TAIL_OFF - sizeof(cetrafs_extent_hdr_t)) / sizeof(cetrafs_extent_idx_t))
 #define CETRAFS_EXT_MAX_DEPTH 2
 
+/* The most blocks a directory may hold: ~4 million entries. Growth stops
+ * there (ENOSPC), and a directory record naming more is damage -- every
+ * scan reads each block forced-fresh under the namespace lock, so the
+ * count a corrupt or hostile extent claims is bounded here. */
+#define CETRAFS_DIR_MAX_BLOCKS (1U << 18)
+
 #define CETRAFS_NODE_ID_NONE 0xFFFFu
 
 /*
