@@ -903,6 +903,15 @@ MODULE_PARM_DESC(journal_ignore_kind, "test-only: redo a 'torn' target even when
 /* TEST ONLY: redo without the owner check and without advancing the
  * owner's change stamp -- the behaviour before L9 (the control of
  * tests/kernel/journal_replay_owner.sh). */
+/* TEST ONLY: pause between the owner check and the redo's last re-read,
+ * and skip that re-read (the control) -- tests/kernel/journal_replay_owner_gap.sh. */
+static unsigned int cetrafs_journal_owner_pause_ms;
+cetrafs_test_param(journal_owner_pause_ms, cetrafs_journal_owner_pause_ms, uint, 0644);
+MODULE_PARM_DESC(journal_owner_pause_ms, "TEST ONLY: pause after a redo's owner check");
+static bool cetrafs_journal_no_last_read;
+cetrafs_test_param(journal_no_last_read, cetrafs_journal_no_last_read, bool, 0644);
+MODULE_PARM_DESC(journal_no_last_read, "TEST ONLY: redo without re-reading the target after the owner check");
+
 static bool cetrafs_journal_ignore_owner;
 cetrafs_test_param(journal_ignore_owner, cetrafs_journal_ignore_owner, bool, 0644);
 MODULE_PARM_DESC(journal_ignore_owner, "test-only: replay neither checks an entry's owner nor advances its stamp");
@@ -2475,6 +2484,7 @@ static int __cetrafs_journal_replay_node(struct super_block *sb, u32 node_id, bo
     for (s = 0; s < count; s++) {
         struct buffer_head *pbh, *tbh, *hbh;
         bool apply, owner_dir = false, owner_known = false;
+        u32 judged_crc = 0;
 
         if (done[s])
             continue;
@@ -2604,6 +2614,7 @@ static int __cetrafs_journal_replay_node(struct super_block *sb, u32 node_id, bo
                 }
             }
 
+            judged_crc = tcrc;
             switch (v) {
             case CETRAFS_JV_APPLY:
                 apply = true;
@@ -2662,7 +2673,7 @@ static int __cetrafs_journal_replay_node(struct super_block *sb, u32 node_id, bo
             }
         }
 
-        /* The owner check, the last read before the write (rule 15):
+        /* The owner check (rule 15; the target is read again after it):
          * the bytes passed the guard, but a block freed and reallocated
          * since can carry the same bytes -- an empty dirent block looks
          * like any other. It must still be the entry's owner's (L9). An
@@ -2693,6 +2704,35 @@ static int __cetrafs_journal_replay_node(struct super_block *sb, u32 node_id, bo
                         "%llu is still its -- judging by the guard alone\n",
                         node_id, (unsigned long long) entries[s].txn_id, (unsigned long long) entries[s].owner_ino,
                         (unsigned long long) entries[s].target_lba);
+            }
+        }
+
+        /* The owner check read the owner's record and tree from the
+         * device, after the re-read above: under nofilelock a live peer
+         * can rewrite this extent leaf in that gap, and the dead node's
+         * image then lands on top of it (audit 2026-11-14 C1, rule 15).
+         * So the target is read once more, LAST, and must still be what
+         * was judged. */
+        if (apply && unlikely(cetrafs_journal_owner_pause_ms)) {
+            pr_info("journal replay: pausing %ums after the owner check of target %llu\n",
+                    cetrafs_journal_owner_pause_ms, (unsigned long long) entries[s].target_lba);
+            msleep(cetrafs_journal_owner_pause_ms);
+        }
+        if (apply && !READ_ONCE(cetrafs_journal_no_last_read)) {
+            brelse(tbh);
+            tbh = cetrafs_bread_uncached_retry(sb, entries[s].target_lba);
+            if (!tbh) {
+                brelse(pbh);
+                ret = -EIO;
+                goto out_free;
+            }
+            if (~crc32c(~0U, tbh->b_data, CETRAFS_BLOCK_SIZE) != judged_crc) {
+                apply = false;
+                atomic64_inc(&cetrafs_journal_replay_refused);
+                pr_err("journal replay: node %u txn %llu target block %llu changed after its owner was checked -- "
+                       "a live node is writing it; NOT applying the entry\n",
+                       node_id, (unsigned long long) entries[s].txn_id,
+                       (unsigned long long) entries[s].target_lba);
             }
         }
 
