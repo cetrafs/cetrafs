@@ -6624,6 +6624,23 @@ static int cetrafs_zero_range(struct address_space *mapping, loff_t from, size_t
  * Blocks already mapped are skipped -- fallocate must not disturb data
  * that is already there, and must not double-allocate.
  */
+/* Run allocation for fallocate (audit FD-8): a block that needs backing
+ * claims the next run of consecutive blocks in one allocator call
+ * (cetrafs_alloc_run_after()), instead of one allocator call per block
+ * under both exclusive locks. Blocks claimed and not used are given back
+ * at the end. TEST ONLY falloc_run_off restores one allocator call per
+ * block (the control of tests/kernel/fallocate_runs.sh). */
+#define CETRAFS_FALLOC_RUN 256u
+static bool cetrafs_falloc_run_off;
+cetrafs_test_param(falloc_run_off, cetrafs_falloc_run_off, bool, 0644);
+MODULE_PARM_DESC(falloc_run_off, "TEST ONLY: fallocate allocates one block per allocator call, as before FD-8");
+static atomic_long_t cetrafs_falloc_alloc_calls = ATOMIC_LONG_INIT(0);
+/* Read by procfs info (fallocate_alloc_calls). */
+long cetrafs_falloc_alloc_call_count(void)
+{
+    return atomic_long_read(&cetrafs_falloc_alloc_calls);
+}
+
 /*
  * Test-only: slow the per-block allocation loop down.
  *
@@ -6634,6 +6651,7 @@ static int cetrafs_zero_range(struct address_space *mapping, loff_t from, size_t
  */
 static unsigned int cetrafs_fallocate_block_delay_us;
 cetrafs_test_param(fallocate_block_delay_us, cetrafs_fallocate_block_delay_us, uint, 0644);
+
 MODULE_PARM_DESC(fallocate_block_delay_us, "TEST ONLY: microseconds to spend per preallocated block");
 
 /*
@@ -6721,6 +6739,18 @@ static void cetrafs_falloc_resv_drop(struct super_block *sb, struct cetrafs_fall
     r->n = r->cap = 0;
 }
 
+static void cetrafs_falloc_run_give_back_span(struct super_block *sb, u64 lba, u32 n)
+{
+    while (n--)
+        cetrafs_free_data_block(sb, lba++);
+}
+
+static void cetrafs_falloc_run_give_back(struct super_block *sb, u64 *lba, u32 *left)
+{
+    cetrafs_falloc_run_give_back_span(sb, *lba, *left);
+    *left = 0;
+}
+
 static int cetrafs_do_allocate(struct inode *inode, loff_t offset, loff_t len, bool keep_size)
 {
     struct cetrafs_falloc_resv resv = {};
@@ -6798,6 +6828,8 @@ static int cetrafs_do_allocate(struct inode *inode, loff_t offset, loff_t len, b
      */
     tree_have = cetrafs_tree_extent_count(inode, &raw);
     tree_cap = cetrafs_tree_max_extents();
+    u64 run_lba = 0; /* blocks claimed for a run and not yet used */
+    u32 run_left = 0, run_bg = 0;
 
     for (b = start_block; b < end_block; b++) {
         bool found = false, un = false;
@@ -6828,20 +6860,53 @@ static int cetrafs_do_allocate(struct inode *inode, loff_t offset, loff_t len, b
         loop_ret = cetrafs_tree_lookup(inode, &raw, (u32) b, &lba, NULL, &un, &found, false);
         if (loop_ret)
             break;
-        if (found)
+        if (found) {
+            /* A run claimed past this block cannot be used across it. */
+            cetrafs_falloc_run_give_back(sb, &run_lba, &run_left);
             continue; /* already backed (written or preallocated) */
+        }
 
         if (!hint)
             hint = cetrafs_tree_last_contig_lba(inode, &raw);
 
-        loop_ret = cetrafs_alloc_pick_bg(sb, &bg_id);
-        if (loop_ret)
-            break;
-        loop_ret = cetrafs_alloc_data_block_near(sb, bg_id, hint, &lba);
-        if (loop_ret == -ENOSPC || loop_ret == -EAGAIN) /* count lying, or group released since the pick -- see the helper */
-            loop_ret = cetrafs_alloc_block_anywhere(sb, &bg_id, &lba);
-        if (loop_ret)
-            break;
+        if (run_left) {
+            lba = run_lba++; /* the next block of the run claimed for it */
+            bg_id = run_bg;
+            run_left--;
+        } else {
+            atomic_long_inc(&cetrafs_falloc_alloc_calls);
+            loop_ret = cetrafs_alloc_pick_bg(sb, &bg_id);
+            if (loop_ret)
+                break;
+            atomic_long_inc(&cetrafs_falloc_alloc_calls);
+            loop_ret = cetrafs_alloc_data_block_near(sb, bg_id, hint, &lba);
+            if (loop_ret == -ENOSPC || loop_ret == -EAGAIN) { /* count lying, or group released since the pick -- see the helper */
+                atomic_long_inc(&cetrafs_falloc_alloc_calls);
+                loop_ret = cetrafs_alloc_block_anywhere(sb, &bg_id, &lba);
+            }
+            if (loop_ret)
+                break;
+            if (!READ_ONCE(cetrafs_falloc_run_off) && end_block - b > 1) {
+                u32 want = (u32) min_t(u64, CETRAFS_FALLOC_RUN - 1, end_block - b - 1);
+                u32 got;
+
+                atomic_long_inc(&cetrafs_falloc_alloc_calls);
+                got = cetrafs_alloc_run_after(sb, bg_id, lba + 1, want);
+                if (got) {
+                    /* Covered at once: claimed blocks nothing references
+                     * must not be unprotected from the scrub until used. */
+                    loop_ret = cetrafs_falloc_resv_cover(sb, &resv, bg_id, lba + got);
+                    if (loop_ret) {
+                        cetrafs_free_data_block(sb, lba); /* not used either */
+                        cetrafs_falloc_run_give_back_span(sb, lba + 1, got);
+                        break;
+                    }
+                    run_bg = bg_id;
+                    run_lba = lba + 1;
+                    run_left = got;
+                }
+            }
+        }
         /* Before anything else can take long: from here until the
          * publish, the registry is all that tells the scrub it is ours. */
         loop_ret = cetrafs_falloc_resv_cover(sb, &resv, bg_id, lba);
@@ -6888,6 +6953,10 @@ static int cetrafs_do_allocate(struct inode *inode, loff_t offset, loff_t len, b
         hint = lba + 1; /* keep the run contiguous so it stays ONE extent */
         added++;
     }
+
+    /* Blocks claimed for a run and not used are referenced by nothing:
+     * give them back before anything is published. */
+    cetrafs_falloc_run_give_back(sb, &run_lba, &run_left);
 
     /* Nothing allocated and nothing to grow -- or nothing allocated and
      * the loop stopped on an error: nothing to publish. A plain

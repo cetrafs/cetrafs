@@ -963,6 +963,7 @@ int cetrafs_alloc_data_block_near(struct super_block *sb, u32 bg_id, u64 preferr
 int cetrafs_alloc_block_anywhere(struct super_block *sb, u32 *out_bg, u64 *out_lba);
 int cetrafs_alloc_data_run(struct super_block *sb, u32 bg_id, u64 count, u64 *out_lba);
 u32 cetrafs_alloc_run_after(struct super_block *sb, u32 bg_id, u64 start_lba, u32 max);
+long cetrafs_falloc_alloc_call_count(void); /* file.c: allocator calls made by fallocate */
 int cetrafs_free_data_extent(struct super_block *sb, u64 lba, u32 count);
 /* Inline so the BLKFREE/BLKQUEUE traces' from=%pS names the real caller,
  * not this wrapper. */
