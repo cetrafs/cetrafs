@@ -1965,7 +1965,12 @@ static int cetrafs_for_each_live_peer(struct super_block *sb,
     cetrafs_node_entry_t ne;
     u32 count, idx, candidates = 0, window = cetrafs_sb_stale_secs(sb);
     unsigned long deadline;
-    u64 *seq; /* the hb_seq watched, +1 so 0 means "not a candidate" */
+    /* The row as watched, and whether it still is a candidate. The whole
+     * mark, not hb_seq alone: a row re-claimed by another machine restarts
+     * hb_seq, so an equal hb_seq can read "has not moved" over a row that
+     * changed hands (audit C9). */
+    struct cetrafs_row_mark *seq;
+    bool *watching;
     int ret = 0;
 
     if (!raw_sb)
@@ -1973,8 +1978,12 @@ static int cetrafs_for_each_live_peer(struct super_block *sb,
 
     count = le32_to_cpu(raw_sb->node_table_count);
     seq = kcalloc(count, sizeof(*seq), GFP_KERNEL);
-    if (!seq)
+    watching = kcalloc(count, sizeof(*watching), GFP_KERNEL);
+    if (!seq || !watching) {
+        kfree(seq);
+        kfree(watching);
         return -ENOMEM;
+    }
 
     for (idx = 0; idx < count; idx++) {
         ret = cetrafs_read_node_entry(sb, idx, &ne);
@@ -1986,7 +1995,8 @@ static int cetrafs_for_each_live_peer(struct super_block *sb,
             continue; /* our own row / a prior incarnation of us */
         if (wants && !wants(&ne, priv))
             continue; /* the caller's answer does not depend on it */
-        seq[idx] = cetrafs_le64(ne.hb_seq) + 1;
+        cetrafs_row_mark_of(&seq[idx], &ne);
+        watching[idx] = true;
         candidates++;
         window = cetrafs_row_stale_window(sb, &ne, window);
     }
@@ -2014,18 +2024,18 @@ static int cetrafs_for_each_live_peer(struct super_block *sb,
             goto out;
         expired = time_after_eq(jiffies, deadline);
         for (idx = 0; idx < count && candidates; idx++) {
-            if (!seq[idx])
+            if (!watching[idx])
                 continue;
             ret = cetrafs_read_node_entry(sb, idx, &ne);
             if (ret)
                 goto out;
             if (cetrafs_le32(ne.state) != CETRAFS_NODE_STATE_REGISTERED || cetrafs_le32(ne.departure) != CETRAFS_NODE_DEPART_NONE) {
-                seq[idx] = 0; /* left, or was freed, while we watched */
+                watching[idx] = false; /* left, or was freed, while we watched */
                 candidates--;
                 continue;
             }
-            if (cetrafs_le64(ne.hb_seq) + 1 != seq[idx]) {
-                seq[idx] = 0;
+            if (!cetrafs_row_mark_same(&seq[idx], &ne)) {
+                watching[idx] = false;
                 candidates--;
                 if (wants && !wants(&ne, priv))
                     continue; /* changed its answer while we watched */
@@ -2044,13 +2054,14 @@ static int cetrafs_for_each_live_peer(struct super_block *sb,
                  * depends on this row watches it again. (A DEAD stamp
                  * would no longer cost the node its own-claim sweeps on
                  * return -- format 0x000A's departure field, L3.) */
-                seq[idx] = 0;
+                watching[idx] = false;
                 candidates--;
             }
         }
     }
 out:
     kfree(seq);
+    kfree(watching);
     return ret;
 }
 
