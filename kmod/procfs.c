@@ -84,7 +84,7 @@ static int cetrafs_proc_info_show(struct seq_file *m, void *v)
 {
     struct super_block *sb = m->private;
     const cetrafs_superblock_t *raw_sb = cetrafs_sb_raw(sb);
-    u64 free_inodes = 0, total_data_blocks = 0, free_data_blocks = 0;
+    u64 free_inodes = 0, total_data_blocks = 0, free_data_blocks = 0, free_owned = 0, free_unowned = 0;
     u32 zg_count, bg_count, my_node_id, z;
     int ret, stats_err = 0;
 
@@ -213,6 +213,10 @@ static int cetrafs_proc_info_show(struct seq_file *m, void *v)
         }
         total_data_blocks += total;
         free_data_blocks += free;
+        if (cetrafs_sb_bg_is_ours(sb, z))
+            free_owned += free;
+        else if (cetrafs_sb_bg_owner(sb, z) == CETRAFS_BG_OWNER_FREE)
+            free_unowned += free;
     }
     if (stats_err) {
         seq_printf(m, "total_data_blocks: unavailable (%d)\n", stats_err);
@@ -220,6 +224,16 @@ static int cetrafs_proc_info_show(struct seq_file *m, void *v)
     } else {
         seq_printf(m, "total_data_blocks: %llu\n", (unsigned long long) total_data_blocks);
         seq_printf(m, "free_data_blocks: %llu\n", (unsigned long long) free_data_blocks);
+        /* What THIS node can allocate: the free blocks of the Block
+         * Groups it owns, and of the ones nobody owns (claimable). The
+         * rest of free_data_blocks sits in groups a live peer owns, and
+         * a node never takes space back from a live peer -- so a node
+         * can return ENOSPC while free_data_blocks, and df, show room
+         * (audit 2026-11-14 O4; docs/internal/LIMITATIONS.md). Zone
+         * Groups no node owns are claimable too, and counted under
+         * neither line. */
+        seq_printf(m, "free_data_blocks_owned: %llu\n", (unsigned long long) free_owned);
+        seq_printf(m, "free_data_blocks_unowned_bgs: %llu\n", (unsigned long long) free_unowned);
     }
 
     /*
