@@ -57,7 +57,47 @@ static u32 cetrafs_node_crc(const cetrafs_node_entry_t *ne)
  * mkfs (the whole table starts zero-filled) -- only REGISTERED rows are
  * checksum-verified.
  */
+static int __cetrafs_read_node_entry(struct super_block *sb, u32 idx, cetrafs_node_entry_t *out, bool first_cached);
+
 static int cetrafs_read_node_entry(struct super_block *sb, u32 idx, cetrafs_node_entry_t *out)
+{
+    return __cetrafs_read_node_entry(sb, idx, out, false);
+}
+
+/*
+ * The whole Node Registry, forced-fresh, as one batch -- for the
+ * heartbeat's per-tick sweep, which read every row with its own round
+ * trip and then each registered row again to judge it (audit 2026-11-14
+ * P13, C10). Rows are then taken with cetrafs_node_get_entry_prefetched().
+ */
+bool cetrafs_node_prefetch_rows(struct super_block *sb)
+{
+    const cetrafs_superblock_t *raw_sb = cetrafs_sb_raw(sb);
+    struct buffer_head **bhs;
+    u32 n, i;
+    bool ok;
+
+    if (!raw_sb)
+        return false;
+    n = le32_to_cpu(raw_sb->node_table_count);
+    bhs = kcalloc(n, sizeof(*bhs), GFP_NOFS);
+    if (!bhs)
+        return false;
+    ok = cetrafs_bread_uncached_batch(sb, le64_to_cpu(raw_sb->node_table_start), n, bhs) == 0;
+    if (ok)
+        for (i = 0; i < n; i++)
+            brelse(bhs[i]);
+    kfree(bhs);
+    return ok;
+}
+
+/* A row as cetrafs_node_prefetch_rows() fetched it; a tear is re-read fresh. */
+int cetrafs_node_get_entry_prefetched(struct super_block *sb, u32 idx, cetrafs_node_entry_t *out)
+{
+    return __cetrafs_read_node_entry(sb, idx, out, true);
+}
+
+static int __cetrafs_read_node_entry(struct super_block *sb, u32 idx, cetrafs_node_entry_t *out, bool first_cached)
 {
     const cetrafs_superblock_t *raw_sb = cetrafs_sb_raw(sb);
     struct buffer_head *bh;
@@ -94,7 +134,8 @@ static int cetrafs_read_node_entry(struct super_block *sb, u32 idx, cetrafs_node
              * failed a plain create() on whichever node LOST the lock
              * race, which is exactly the asymmetry seen on real two-node
              * hardware. */
-            bh = cetrafs_bread_uncached_retry(sb, le64_to_cpu(raw_sb->node_table_start) + idx);
+            bh = attempt == 0 && first_cached ? cetrafs_bread_retry(sb, le64_to_cpu(raw_sb->node_table_start) + idx)
+                                              : cetrafs_bread_uncached_retry(sb, le64_to_cpu(raw_sb->node_table_start) + idx);
             if (!bh)
                 return -EIO;
 
@@ -2430,6 +2471,13 @@ int cetrafs_node_is_stale(struct super_block *sb, u32 node_id, bool *out_stale)
     ret = cetrafs_read_node_entry(sb, node_id, &ne);
     if (ret)
         return ret;
+    return cetrafs_node_is_stale_entry(sb, node_id, &ne, out_stale);
+}
+
+/* cetrafs_node_is_stale() judging a row the caller has already read. */
+int cetrafs_node_is_stale_entry(struct super_block *sb, u32 node_id, const cetrafs_node_entry_t *row, bool *out_stale)
+{
+    cetrafs_node_entry_t ne = *row;
 
     if (cetrafs_le32(ne.state) != CETRAFS_NODE_STATE_REGISTERED) {
         cetrafs_sb_peer_watch_forget(sb, node_id); /* the next registration is a new watch */

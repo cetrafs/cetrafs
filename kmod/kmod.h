@@ -943,6 +943,7 @@ u64 cetrafs_bg_lookup_reads_count(void);
 u64 cetrafs_cas_seed_refused_count(void);
 u64 cetrafs_cas_seed_reverdict_count(void); /* caw.c */
 u64 cetrafs_zg_copy_torn_count(void); /* zonegroup.c: ZG copies that failed their re-check */
+u64 cetrafs_hb_row_read_count(void);
 u64 cetrafs_hb_sweep_count(void); /* heartbeat.c */
 int cetrafs_alloc_inode(struct super_block *sb, u64 *out_ino);
 int cetrafs_free_inode(struct super_block *sb, u64 ino);
@@ -1124,6 +1125,9 @@ int cetrafs_node_set_frees(struct super_block *sb, u32 my_node_id, bool on);
 int cetrafs_node_frees_snapshot(struct super_block *sb, u32 my_node_id, bool self_from_row,
                                 u32 seqs[CETRAFS_MAX_READER_NODES], bool *busy);
 int cetrafs_node_is_stale(struct super_block *sb, u32 node_id, bool *out_stale);
+int cetrafs_node_is_stale_entry(struct super_block *sb, u32 node_id, const cetrafs_node_entry_t *row, bool *out_stale);
+bool cetrafs_node_prefetch_rows(struct super_block *sb);
+int cetrafs_node_get_entry_prefetched(struct super_block *sb, u32 idx, cetrafs_node_entry_t *out);
 /* The fence lease -- see cetrafs_node_entry_t.fence_epoch. */
 int __must_check cetrafs_node_fence_peer(struct super_block *sb, u32 node_id, const char *what);
 bool cetrafs_node_reattached_since_fence(struct super_block *sb, u32 node_id);

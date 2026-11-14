@@ -125,6 +125,12 @@ static unsigned int cetrafs_hb_maint_delay_ms;
 /* Completed stale-journal sweeps (the end of the maintenance pass): a
  * pass parked behind a lock stops this counter. */
 static atomic64_t cetrafs_hb_sweeps = ATOMIC64_INIT(0);
+/* Registry round trips the sweep made, and its TEST ONLY control: one read per
+ * row as before audit 2026-11-14 P13 (tests/kernel/hb_rows_batched.sh). */
+static atomic64_t cetrafs_hb_row_reads = ATOMIC64_INIT(0);
+static bool cetrafs_hb_rows_serial;
+cetrafs_test_param(hb_rows_serial, cetrafs_hb_rows_serial, bool, 0644);
+MODULE_PARM_DESC(hb_rows_serial, "TEST ONLY: the heartbeat sweep reads each registry row on its own");
 cetrafs_test_param(hb_maint_delay_ms, cetrafs_hb_maint_delay_ms, uint, 0644);
 MODULE_PARM_DESC(hb_maint_delay_ms, "TEST ONLY: milliseconds the heartbeat's maintenance pass takes");
 
@@ -438,7 +444,17 @@ static void cetrafs_heartbeat_maint(struct work_struct *work)
     {
         const cetrafs_superblock_t *raw_sb = cetrafs_sb_raw(sb);
         u32 count = raw_sb ? le32_to_cpu(raw_sb->node_table_count) : 0;
+        /* One batch for the registry, then each row judged from it: 64
+         * serial reads per tick, and each registered row read again to
+         * judge it (audit 2026-11-14 P13). A row the batch shows stale
+         * is judged again from a fresh read before anything acts on it
+         * -- a fence is destructive, and the batch is older by every
+         * row before it (rule 15). */
+        bool batched = !READ_ONCE(cetrafs_hb_rows_serial) && cetrafs_node_prefetch_rows(sb);
         u32 n;
+
+        if (batched)
+            atomic64_inc(&cetrafs_hb_row_reads); /* the one batch */
 
         for (n = 0; n < count; n++) {
             cetrafs_node_entry_t ne;
@@ -446,7 +462,9 @@ static void cetrafs_heartbeat_maint(struct work_struct *work)
 
             if (n == my_node_id)
                 continue;
-            ret = cetrafs_node_get_entry(sb, n, &ne);
+            ret = batched ? cetrafs_node_get_entry_prefetched(sb, n, &ne) : cetrafs_node_get_entry(sb, n, &ne);
+            if (!batched)
+                atomic64_inc(&cetrafs_hb_row_reads);
             /* A device error means every remaining row will fail the
              * same way, so stop rather than grinding through all 64 --
              * each costs a full retry budget against a device that is
@@ -463,6 +481,9 @@ static void cetrafs_heartbeat_maint(struct work_struct *work)
              * was never writing through the journal at all. */
             if (ret || cetrafs_le32(ne.state) != CETRAFS_NODE_STATE_REGISTERED)
                 continue;
+            if (batched && (cetrafs_node_is_stale_entry(sb, n, &ne, &stale) || !stale))
+                continue;
+            atomic64_inc(&cetrafs_hb_row_reads);
             if (cetrafs_node_is_stale(sb, n, &stale) || !stale)
                 continue;
             if (cetrafs_journal_node_is_dirty(sb, n, &dirty) || !dirty)
@@ -497,6 +518,11 @@ static void cetrafs_heartbeat_maint(struct work_struct *work)
         }
     }
     atomic64_inc(&cetrafs_hb_sweeps);
+}
+
+u64 cetrafs_hb_row_read_count(void)
+{
+    return (u64) atomic64_read(&cetrafs_hb_row_reads);
 }
 
 u64 cetrafs_hb_sweep_count(void)
