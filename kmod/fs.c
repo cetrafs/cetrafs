@@ -3811,7 +3811,16 @@ void cetrafs_free_sb_info(struct super_block *sb)
     cetrafs_scrub_stop(sbi->scrub);
     sbi->scrub = NULL;
 
-    cetrafs_heartbeat_stop(sbi->hb);
+    /* Unpublish the heartbeat before it is freed: cetrafs_heartbeat_stop()
+     * frees it, and sbi->hb must not name the freed object afterwards.
+     * The readers (cetrafs_sb_zg_adopt_wait, cetrafs_sb_has_heartbeat)
+     * load it with READ_ONCE and treat NULL as "no heartbeat" (audit F2). */
+    {
+        struct cetrafs_heartbeat *hb = sbi->hb;
+
+        WRITE_ONCE(sbi->hb, NULL);
+        cetrafs_heartbeat_stop(hb);
+    }
     /* The inline-discard worker claims through the allocator and reads
      * the layout, both torn down below; the frees that feed it came from
      * the evictions, the scrub, defrag and the heartbeat's queue drain,
