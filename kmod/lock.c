@@ -2354,6 +2354,22 @@ static int cetrafs_foreign_reader_from_raw(struct super_block *sb,
 
 
 /*
+ * Drop this file's clean cached pages after a peer changed what they
+ * hold. invalidate_mapping_pages() skips a page something maps, so an
+ * mmap reader kept the pre-change bytes for as long as it kept the
+ * mapping (audit C-F7 / L-F7). invalidate_inode_pages2() unmaps first:
+ * the next access faults and reads the device again. Dirty pages are
+ * still left alone (our own unwritten data), so its -EBUSY is expected
+ * and not an error here.
+ */
+static void cetrafs_drop_clean_cache(struct inode *inode)
+{
+    if (!inode->i_mapping)
+        return;
+    (void) invalidate_inode_pages2(inode->i_mapping);
+}
+
+/*
  * The heavy half of a reconcile, for a tree marked cold: re-read the
  * record and drop the cached tree and clean data pages it described.
  * Only where no buffer is locked and no folio held -- an open, or the
@@ -2373,7 +2389,7 @@ static void cetrafs_lock_reconcile_cold(struct inode *inode, cetrafs_inode_t *sc
     if (cetrafs_read_raw_inode(sb, inode->i_ino, scratch) == 0) {
         cetrafs_tree_invalidate_cached(inode, scratch);
         if (inode->i_mapping)
-            invalidate_mapping_pages(inode->i_mapping, 0, -1);
+            cetrafs_drop_clean_cache(inode);
         /* Only a reconcile that dropped the tree settles it; an
          * unreadable record leaves the inode cold, reading fresh. */
         cetrafs_tree_cold_settle(ci, g);
@@ -3907,7 +3923,7 @@ static void cetrafs_inode_cold_work(struct work_struct *w)
     }
     /* Clean pages only -- dirty ones are our own unwritten data. */
     if (inode->i_mapping)
-        invalidate_mapping_pages(inode->i_mapping, 0, -1);
+        cetrafs_drop_clean_cache(inode);
 
     /* Only now is the cache known good again -- and only as of the
      * marks counted at the start: one that landed since is still
@@ -5437,7 +5453,7 @@ static int cetrafs_lock_resume(struct inode *inode)
         ci->file_seq_cached = U64_MAX;
         cetrafs_verdicts_invalidate(ci);
         if (inode->i_mapping)
-            invalidate_mapping_pages(inode->i_mapping, 0, -1);
+            cetrafs_drop_clean_cache(inode);
     }
 
     /* Lock first, presence second -- the mirror of suspend, and for the
@@ -5715,7 +5731,7 @@ static int cetrafs_lock_explicit_acquire(struct inode *inode, struct file *file)
         ci->file_seq_cached = U64_MAX;
         cetrafs_verdicts_invalidate(ci);
         if (inode->i_mapping)
-            invalidate_mapping_pages(inode->i_mapping, 0, -1);
+            cetrafs_drop_clean_cache(inode);
     }
 
     ci->explicit_lock_file = file;
