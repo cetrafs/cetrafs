@@ -687,12 +687,22 @@ typedef int (*cetrafs_dirent_visit_fn)(void *priv, const cetrafs_dirent_t *de, l
  * directory quadratic in device reads whenever it had changed on
  * another node (every read is forced fresh then).
  */
+/* TEST ONLY: visit the live buffer instead of a validated copy, as
+ * before audit 2026-11-14 RT-1 -- the control of tests/kernel/readdir_live_buffer.sh. */
+static unsigned int cetrafs_dir_walk_stall_ms;
+cetrafs_test_param(dir_walk_stall_ms, cetrafs_dir_walk_stall_ms, uint, 0644);
+MODULE_PARM_DESC(dir_walk_stall_ms, "TEST ONLY: one walk pauses between reading a dirent block and visiting it");
+static bool cetrafs_dir_walk_no_copy;
+cetrafs_test_param(dir_walk_no_copy, cetrafs_dir_walk_no_copy, bool, 0644);
+MODULE_PARM_DESC(dir_walk_no_copy, "TEST ONLY: readdir and lookup read the live dirent buffer");
+
 static int cetrafs_walk_dirents_from(struct inode *dir, cetrafs_dirent_visit_fn visit, void *priv, loff_t min_pos)
 {
     unsigned int dirents_per_block = CETRAFS_DIRENTS_PER_BLOCK;
     struct cetrafs_dir_extents dx;
     cetrafs_inode_t raw;
     bool fresh, skipped = false;
+    cetrafs_dirent_t *img;
     int ret, i;
 
     /* Any node can add/remove entries in any directory at any time (no
@@ -708,9 +718,20 @@ static int cetrafs_walk_dirents_from(struct inode *dir, cetrafs_dirent_visit_fn 
     if (ret)
         return ret;
 
+    /* Each block is visited as a private copy, re-validated: the buffer
+     * the read validated can be re-read under us by a forced-fresh
+     * reader in another thread, and a hostile image landing between the
+     * validation and dir_emit() handed it a name_len of thousands -- up
+     * to ~4 KiB of adjacent kernel memory copied to userspace (audit
+     * 2026-11-14 RT-1). xattr.c copies its block for the same reason. */
+    img = kmalloc(CETRAFS_BLOCK_SIZE, GFP_NOFS);
+    if (!img)
+        return -ENOMEM;
     ret = cetrafs_dir_extents_get(dir, &raw, &dx);
-    if (ret)
+    if (ret) {
+        kfree(img);
         return ret;
+    }
 
     fresh = cetrafs_dir_needs_fresh(dir, &raw);
 
@@ -743,34 +764,54 @@ static int cetrafs_walk_dirents_from(struct inode *dir, cetrafs_dirent_visit_fn 
             const cetrafs_dirent_t *de;
             unsigned int e;
 
+            bool live = READ_ONCE(cetrafs_dir_walk_no_copy); /* test-only: see the parameter */
+            unsigned int tries;
+
             cond_resched(); /* O(blocks) per pass, whatever their content */
             if (fatal_signal_pending(current)) { /* RT-3: the count is the disk's */
                 ret = -EINTR;
                 goto out;
             }
-            bh = cetrafs_dirent_read(dir->i_sb, phys + b, fresh);
-            if (!bh) {
-                ret = -EIO;
-                goto out;
+            for (tries = 0;; tries++) {
+                bh = cetrafs_dirent_read(dir->i_sb, phys + b, fresh || tries);
+                if (!bh) {
+                    ret = -EIO;
+                    goto out;
+                }
+                if (live)
+                    break;
+                cetrafs_bh_snapshot(bh, img, CETRAFS_BLOCK_SIZE, 0, 0, false);
+                brelse(bh);
+                bh = NULL;
+                if (cetrafs_blk_image_valid(img, CETRAFS_DIRENT_TAIL_MAGIC))
+                    break;
+                /* Re-read under us into something invalid: a write in
+                 * flight converges, damage does not (rule 3). */
+                if (tries >= 3) {
+                    ret = -EUCLEAN;
+                    goto out;
+                }
+                msleep(10 << tries);
             }
 
-            de = (const cetrafs_dirent_t *) bh->b_data;
+            if (unlikely(READ_ONCE(cetrafs_dir_walk_stall_ms)))
+                msleep(xchg(&cetrafs_dir_walk_stall_ms, 0)); /* test-only, one-shot */
+            de = live ? (const cetrafs_dirent_t *) bh->b_data : img;
             for (e = 0; e < dirents_per_block; e++) {
                 if (de[e].inode == 0)
                     continue;
 
                 ret = visit(priv, &de[e], base_pos + e * sizeof(cetrafs_dirent_t));
-                if (ret > 0) {
-                    brelse(bh);
-                    ret = 0;
-                    goto out;
-                }
-                if (ret < 0) {
-                    brelse(bh);
-                    goto out;
-                }
+                if (ret)
+                    break;
             }
-            brelse(bh);
+            brelse(bh); /* NULL unless live */
+            if (ret > 0) {
+                ret = 0;
+                goto out;
+            }
+            if (ret < 0)
+                goto out;
         }
     }
 
@@ -785,6 +826,7 @@ static int cetrafs_walk_dirents_from(struct inode *dir, cetrafs_dirent_visit_fn 
     ret = 0;
 out:
     cetrafs_dir_extents_put(&dx);
+    kfree(img);
     return ret;
 }
 
@@ -1209,7 +1251,7 @@ int cetrafs_dir_remove_entry(struct inode *dir, const struct qstr *name, u64 exp
             de = (cetrafs_dirent_t *) bh->b_data;
             for (e = 0; e < dirents_per_block; e++) {
                 if (cetrafs_le64(de[e].inode) != 0 && cetrafs_le16(de[e].name_len) == name->len &&
-                    !memcmp(de[e].name, name->name, cetrafs_le16(de[e].name_len))) {
+                    !memcmp(de[e].name, name->name, name->len)) { /* the length just compared, not a re-read (RT-1) */
                     slot = &de[e];
                     break;
                 }
@@ -1452,7 +1494,7 @@ static int cetrafs_dir_retarget_entry(struct inode *dir,
             de = (cetrafs_dirent_t *) bh->b_data;
             for (e = 0; e < dirents_per_block; e++) {
                 if (cetrafs_le64(de[e].inode) != 0 && cetrafs_le16(de[e].name_len) == name->len &&
-                    !memcmp(de[e].name, name->name, cetrafs_le16(de[e].name_len))) {
+                    !memcmp(de[e].name, name->name, name->len)) { /* the length just compared, not a re-read (RT-1) */
                     slot = &de[e];
                     break;
                 }
@@ -1550,7 +1592,7 @@ static int cetrafs_lookup_visit(void *priv, const cetrafs_dirent_t *de, loff_t p
 
     (void) pos;
 
-    if (cetrafs_le16(de->name_len) == ctx->name->len && !memcmp(de->name, ctx->name->name, cetrafs_le16(de->name_len))) {
+    if (cetrafs_le16(de->name_len) == ctx->name->len && !memcmp(de->name, ctx->name->name, ctx->name->len)) {
         ctx->ino = cetrafs_le64(de->inode);
         return 1; /* stop: found */
     }
