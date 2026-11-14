@@ -661,6 +661,7 @@ static inline void cetrafs_repair_reap(int fd, const cetrafs_superblock_t *sb, u
     unsigned char blk[CETRAFS_BLOCK_SIZE], out[CETRAFS_BLOCK_SIZE];
     cetrafs_node_entry_t ne, saved;
 
+    cetrafs_row_drop_cache(fd, sb, idx); /* the row as the device has it (class 57) */
     if (pread(fd, blk, sizeof(blk), cetrafs_node_row_off(sb, idx)) != (ssize_t) sizeof(blk))
         return;
     memcpy(&ne, blk, sizeof(ne));
@@ -820,6 +821,9 @@ static inline int cetrafs_repair_row_is_ours(int fd, const cetrafs_superblock_t 
 {
     cetrafs_node_entry_t ne;
 
+    /* A peer on another host takes a row straight on the device: "still
+     * ours" from this host's cache is the unsafe answer (class 57). */
+    cetrafs_row_drop_cache(fd, sb, idx);
     if (pread(fd, &ne, sizeof(ne), cetrafs_node_row_off(sb, idx)) != (ssize_t) sizeof(ne))
         return 0;
     return cetrafs_le32(ne.state) == CETRAFS_NODE_STATE_REPAIR &&
@@ -1167,6 +1171,7 @@ static inline int __cetrafs_repair_renew(int fd, const cetrafs_superblock_t *sb,
     unsigned char blk[CETRAFS_BLOCK_SIZE];
     cetrafs_node_entry_t ne;
 
+    cetrafs_row_drop_cache(fd, sb, row); /* the row as the device has it (class 57) */
     if (pread(fd, blk, sizeof(blk), cetrafs_node_row_off(sb, row)) != (ssize_t) sizeof(blk))
         return -1;
     memcpy(&ne, blk, sizeof(ne));
@@ -1431,6 +1436,12 @@ static inline int cetrafs_scan_node_caps(const char *dev,
     fd = open(dev, O_RDONLY | O_CLOEXEC);
     if (fd < 0)
         return -1;
+    /* The rows as the device has them: a peer on another host registers
+     * straight to the device, and a fresh fd shares this host's page
+     * cache. A node registered after that cache filled was missed, and
+     * the gate it feeds said every node was ready (class 57). */
+    if (!cetrafs_test_env("CETRAFS_TEST_CAPS_CACHED")) /* the control of tests/image/growfs_caps_fresh.sh */
+        posix_fadvise(fd, 0, 0, POSIX_FADV_DONTNEED);
     if (pread(fd, &sb, sizeof(sb), 0) != (ssize_t) sizeof(sb) || cetrafs_le32(sb.magic) != CETRAFS_MAGIC) {
         close(fd);
         return -1;
