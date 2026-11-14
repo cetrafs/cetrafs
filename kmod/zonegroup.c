@@ -1207,9 +1207,23 @@ static int __cetrafs_zg_try_claim_one(struct super_block *sb,
          * below derives the members from the map. */
         cetrafs_bg_refresh_owner_map(sb);
 
-        for (b = 0; b < nbg; b++)
-            if (cetrafs_sb_bg_owner(sb, b) == zg_id)
-                cetrafs_bg_invalidate_cache(sb, b);
+        /* A member whose bitmap could not be dropped is left out of
+         * the map's reach: allocating from it would trust an earlier
+         * look, which can read the previous owner's allocations as
+         * free (audit 2026-11-14 A7). The next owner-map refresh
+         * retries it. */
+        for (b = 0; b < nbg; b++) {
+            int iret;
+
+            if (cetrafs_sb_bg_owner(sb, b) != zg_id)
+                continue;
+            iret = cetrafs_bg_invalidate_cache(sb, b);
+            if (iret && !cetrafs_bg_invalidate_fail_ignored) {
+                pr_warn("ZG %u claim: BG %u's cached bitmap could not be dropped (%d) -- left out of reach\n",
+                        zg_id, b, iret);
+                cetrafs_sb_set_bg_owner(sb, b, CETRAFS_BG_OWNER_FREE);
+            }
+        }
 
         /* Ownership has just transferred, which is the one moment this
          * ZG's bitmaps are provably ours and provably quiet -- so it is

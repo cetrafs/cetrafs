@@ -1537,6 +1537,24 @@ void cetrafs_bg_desc_refresh_foreign(struct super_block *sb, u32 bg_id)
     atomic64_inc(&cetrafs_bg_desc_refreshed);
 }
 
+/* TEST ONLY: the invalidate of Block Group (value - 1) fails, as a
+ * descriptor read refused by the device would (audit 2026-11-14 A7;
+ * tests/kernel/bg_invalidate_fail.sh). 0 = off. */
+static unsigned int cetrafs_bg_invalidate_fail_bg;
+cetrafs_test_param(bg_invalidate_fail_bg, cetrafs_bg_invalidate_fail_bg, uint, 0644);
+MODULE_PARM_DESC(bg_invalidate_fail_bg, "TEST ONLY: 1 + the Block Group whose cache drop fails");
+/* TEST ONLY: the callers ignore a failed cache drop, as before A7 --
+ * the control of the same suite. */
+bool cetrafs_bg_invalidate_fail_ignored;
+cetrafs_test_param(bg_invalidate_fail_ignored, cetrafs_bg_invalidate_fail_ignored, bool, 0644);
+MODULE_PARM_DESC(bg_invalidate_fail_ignored, "TEST ONLY: a failed Block Group cache drop is ignored");
+
+/*
+ * Returns nonzero when the bitmap blocks could NOT be dropped (their
+ * place is in the descriptor, and it did not read): the cached bitmap
+ * may then be an earlier look, which reads a peer's allocations as
+ * free. A caller about to make the group allocatable must not.
+ */
 int cetrafs_bg_invalidate_cache(struct super_block *sb, u32 bg_id)
 {
     const cetrafs_superblock_t *raw_sb = cetrafs_sb_raw(sb);
@@ -1549,6 +1567,8 @@ int cetrafs_bg_invalidate_cache(struct super_block *sb, u32 bg_id)
 
     cetrafs_invalidate_block(sb, cetrafs_sb_bg_desc_lba(sb, bg_id));
 
+    if (unlikely(READ_ONCE(cetrafs_bg_invalidate_fail_bg) == bg_id + 1))
+        return -EIO; /* test-only: see the parameter */
     ret = cetrafs_read_bg_geom(sb, bg_id, &bg);
     if (ret)
         return ret;
@@ -4284,7 +4304,11 @@ static int cetrafs_bg_release_one(struct super_block *sb, u32 zg_id, u32 b, unsi
      * free count can be believed -- otherwise "empty" is a count
      * that predates this node's own frees. */
     cetrafs_flush_dirty_free_counts(sb);
-    cetrafs_bg_invalidate_cache(sb, b);
+    /* A bitmap not dropped is an earlier look: not proof of empty. */
+    if (cetrafs_bg_invalidate_cache(sb, b) != 0 && !cetrafs_bg_invalidate_fail_ignored) {
+        cetrafs_sb_undrain_bg(sb, b);
+        return 0;
+    }
 
     if (cetrafs_bg_data_block_stats(sb, b, &total, &free) != 0 || total == 0 ||
         (free != total && !cetrafs_bg_release_skip_empty_check)) {
@@ -4372,7 +4396,10 @@ release:
         cetrafs_sb_set_bg_discard_pending(sb, b, false); /* the swap cleared the flag */
 
     cetrafs_bg_release_drop_bitmap(sb, b);
-    cetrafs_bg_invalidate_cache(sb, b);
+    /* Not ours any more: a failed drop is the next claimant's to make
+     * (cetrafs_bg_claim_free() and the Zone Group claim refuse a group
+     * whose drop fails). */
+    (void) cetrafs_bg_invalidate_cache(sb, b);
     cetrafs_sb_set_bg_owner(sb, b, CETRAFS_BG_OWNER_FREE);
     if (cetrafs_bg_release_stall_ms) {
         pr_info("BG %u: release stalled %u ms after it reads FREE (test)\n", b, cetrafs_bg_release_stall_ms);
@@ -4473,6 +4500,13 @@ void cetrafs_bg_refresh_owner_map(struct super_block *sb)
         if (cetrafs_read_bg_geom(sb, b, &geom) != 0) {
             pr_warn("BG %u: descriptor unreadable while refreshing ownership -- leaving it out of reach\n", b);
             owner = CETRAFS_BG_OWNER_FREE;
+        } else if (geom.owner_zg != cetrafs_sb_bg_owner(sb, b) && geom.owner_zg < CETRAFS_BG_OWNER_FREE &&
+                   cetrafs_sb_zg_owned_cached(sb, geom.owner_zg) && cetrafs_bg_invalidate_cache(sb, b) != 0 &&
+                   !cetrafs_bg_invalidate_fail_ignored) {
+            /* Entering a Zone Group this node allocates from: what it
+             * cached of the bitmap must go first, and did not (A7). */
+            pr_warn("BG %u: its cached bitmap could not be dropped -- leaving it out of reach\n", b);
+            owner = CETRAFS_BG_OWNER_FREE;
         } else {
             owner = geom.owner_zg;
             /* An outstanding discard a peer recorded -- one that died
@@ -4558,8 +4592,16 @@ static int cetrafs_bg_claim_one(struct super_block *sb, u32 zg_id, u32 b)
     /* The descriptor just changed owner, so anything holding the
      * old one must not serve it -- see
      * cetrafs_bg_adjust_free_blocks(), which reads owner_zg from
-     * the cache on the allocation path. */
-    cetrafs_bg_invalidate_cache(sb, b);
+     * the cache on the allocation path. If its bitmap could not be
+     * dropped, the group is ours on the device but stays out of the
+     * map's reach: the cached bitmap may predate the previous owner's
+     * last allocations (audit 2026-11-14 A7). The next owner-map
+     * refresh retries the drop (cetrafs_bg_refresh_owner_map()). */
+    ret = cetrafs_bg_invalidate_cache(sb, b);
+    if (ret && !cetrafs_bg_invalidate_fail_ignored) {
+        pr_warn("BG %u: claimed, but its cached bitmap could not be dropped (%d) -- left out of reach\n", b, ret);
+        return ret;
+    }
     /* Ownership is entering this node's cache, so its count epoch
      * must too -- BEFORE set_bg_owner() makes the Block Group
      * allocatable, or the first deltas accrue under whatever epoch
