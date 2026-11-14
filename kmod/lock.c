@@ -201,6 +201,14 @@ struct cetrafs_inode_info {
      */
     struct maple_tree pending;
     errseq_t pending_wb_err;
+    /*
+     * A conversion marked its blocks written in core, and the device
+     * flush that makes them durable was refused (file.c
+     * cetrafs_convert_pending()). The set is empty by then, so this flag
+     * is what keeps the last close retrying and stopping the mount, as
+     * the set did before the flush moved out of the locks.
+     */
+    bool conv_unflushed;
 
     /* The record's stat fields as this node last saw them, under
      * resv_lock (it is the inode's general-purpose short spinlock; this
@@ -1702,6 +1710,16 @@ int cetrafs_pending_next(struct inode *inode, u32 from, u32 *first, u32 *last)
 bool cetrafs_pending_any(struct inode *inode)
 {
     return !mtree_empty(&CETRAFS_I(inode)->pending);
+}
+
+bool cetrafs_conv_unflushed(struct inode *inode)
+{
+    return READ_ONCE(CETRAFS_I(inode)->conv_unflushed);
+}
+
+void cetrafs_conv_unflushed_set(struct inode *inode, bool unflushed)
+{
+    WRITE_ONCE(CETRAFS_I(inode)->conv_unflushed, unflushed);
 }
 
 /* A writeback error since the set was started: see the field. */
@@ -3471,13 +3489,13 @@ static void __cetrafs_lock_release(struct inode *inode, const struct cetrafs_clo
 
             for (tries = 0; tries < 3; tries++) {
                 cret = cetrafs_convert_pending(inode);
-                if (!cetrafs_pending_any(inode))
+                if (!cetrafs_pending_any(inode) && !cetrafs_conv_unflushed(inode))
                     break;
                 msleep(200);
             }
-            if (cetrafs_pending_any(inode)) {
+            if (cetrafs_pending_any(inode) || cetrafs_conv_unflushed(inode)) {
                 cetrafs_sb_fatal(inode->i_sb,
-                                 "ino=%llu: buffered blocks could not be marked written at the last close (%d)",
+                                 "ino=%llu: buffered blocks could not be marked written and flushed at the last close (%d)",
                                  (unsigned long long) inode->i_ino, cret);
                 filemap_invalidate_lock(inode->i_mapping);
                 cetrafs_pending_drop_all(inode);

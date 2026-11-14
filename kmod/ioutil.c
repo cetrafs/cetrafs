@@ -1216,10 +1216,18 @@ MODULE_PARM_DESC(publish_flush_skip, "TEST ONLY: skip the device cache flush at 
  * them, not a completion. On a device without a volatile cache the block
  * layer completes the flush at once.
  */
+/* TEST ONLY: every publish-point flush sleeps this long first, as a slow
+ * array's cache flush would (tests/kernel/fsync_convert_stall.sh). */
+static unsigned int cetrafs_publish_flush_stall_ms;
+cetrafs_test_param(publish_flush_stall_ms, cetrafs_publish_flush_stall_ms, uint, 0644);
+MODULE_PARM_DESC(publish_flush_stall_ms, "TEST ONLY: sleep this long before each publish-point cache flush");
+
 int cetrafs_publish_flush(struct super_block *sb)
 {
     if (READ_ONCE(cetrafs_publish_flush_skip) || !sb->s_bdev)
         return 0;
+    if (READ_ONCE(cetrafs_publish_flush_stall_ms))
+        msleep(READ_ONCE(cetrafs_publish_flush_stall_ms));
     return blkdev_issue_flush(sb->s_bdev);
 }
 

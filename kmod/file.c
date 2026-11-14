@@ -1067,9 +1067,23 @@ static int cetrafs_dio_end_io(struct kiocb *iocb, loff_t offset, ssize_t size, v
  * refused SYNCHRONIZE CACHE would (tests/kernel/pending_flush_error.sh). */
 static bool cetrafs_pending_flush_fail;
 cetrafs_test_param(pending_flush_fail, cetrafs_pending_flush_fail, bool, 0644);
+
+/* TEST ONLY: the conversion's device flush runs under inode_lock and
+ * invalidate_lock, as it did before the flush moved out of them (the
+ * negative control of tests/kernel/fsync_convert_stall.sh). */
+static bool cetrafs_convert_flush_under_lock;
+cetrafs_test_param(convert_flush_under_lock, cetrafs_convert_flush_under_lock, bool, 0644);
+MODULE_PARM_DESC(convert_flush_under_lock, "TEST ONLY: an fsync's conversion flushes the device under the file's locks");
 MODULE_PARM_DESC(pending_flush_fail, "TEST ONLY: the device cache flush before a pending conversion fails");
 
-int cetrafs_convert_pending_locked(struct inode *inode)
+/*
+ * The conversion core, under inode_lock and invalidate_lock (held by the
+ * caller). It writes the set's span back and marks it written; *flipped
+ * says whether any flip was attempted. It does NOT flush: the caller
+ * flushes once the locks are released (cetrafs_convert_pending()), or
+ * under them (cetrafs_convert_pending_locked()).
+ */
+static int __cetrafs_convert_pending(struct inode *inode, bool *flipped)
 {
     struct address_space *m = inode->i_mapping;
     unsigned int bits = inode->i_blkbits;
@@ -1078,6 +1092,7 @@ int cetrafs_convert_pending_locked(struct inode *inode)
     int ret;
 
     lockdep_assert_held_write(&m->invalidate_lock);
+    *flipped = false;
     if (!S_ISREG(inode->i_mode) || !cetrafs_pending_any(inode))
         return 0;
 
@@ -1122,19 +1137,14 @@ int cetrafs_convert_pending_locked(struct inode *inode)
         cetrafs_pending_drop_all(inode);
         return ret;
     }
-    /* The writes completed; only their durability is unknown. Dropping
-     * the set here made every block of it unwritten for good while its
-     * data sat on the device -- a multipath flap failing one SYNCHRONIZE
-     * CACHE was enough (audit 2026-11-14 FD-2). Kept, for the next
-     * boundary to flush and convert; the last close retries and stops
-     * the mount rather than drop (cetrafs_lock_release()). */
-    ret = READ_ONCE(cetrafs_pending_flush_fail) ? -EIO : cetrafs_publish_flush(inode->i_sb);
-    if (ret) {
-        pr_err_ratelimited("ino=%llu: the device cache flush before marking buffered blocks written failed (%d) -- "
-                           "they stay pending for the next fsync or close\n",
-                           (unsigned long long) inode->i_ino, ret);
-        return ret;
-    }
+    /* The writes completed (the wait above), so their data is in the
+     * device's cache and the flip below may be published: the flush that
+     * makes them durable is the caller's, once the locks are released.
+     * What must not happen is a DURABLE publish of the flipped extents
+     * before that flush -- and every publisher of an extent or a tree
+     * block flushes before it publishes (CLAUDE.md rule 8; the audit is
+     * at cetrafs_convert_pending()). */
+    *flipped = true;
 
     while (from <= U32_MAX && !cetrafs_pending_next(inode, (u32) from, &first, &last)) {
         for (cur = first; cur <= last;) {
@@ -1175,18 +1185,117 @@ fail:
     return ret;
 }
 
-int cetrafs_convert_pending(struct inode *inode)
+/*
+ * The device cache flush that makes a conversion's data durable before
+ * anything publishes the flipped extents.
+ *
+ * Who publishes a flipped extent or a tree block that names one, and what
+ * flushes before it does (the audit of FD-7; a new publisher must be
+ * added here):
+ *  - a held-back tree batch (leafdefer.c): its first flush
+ *    (cetrafs_journal_write_deferred(), step 0) follows the flip -- the
+ *    flip edits the cached tree under invalidate_lock, which the batch
+ *    holds too -- and the bitmaps are flushed with it;
+ *  - the record publishes of a shadow or fd sector (inode.c:
+ *    cetrafs_write_raw_inode_fd(), the shadow CAS in cetrafs_write_vfs_inode):
+ *    each takes the shadow AFTER the flip and flushes before its CAS;
+ *  - the close's record publish (lock.c cetrafs_lock_release()): flushes
+ *    before its CAS, and the tree it publishes is a batch's, flushed above;
+ *  - the sync and unmount points: they run the fsync path, which ends in
+ *    a flush.
+ * So a flip is never durable ahead of its data, whichever of these runs
+ * first, and the flush issued here after the flip is what makes the data
+ * durable for a crash that comes before any of them.
+ *
+ * TEST ONLY: convert_flush_under_lock (tests/kernel/fsync_convert_stall.sh)
+ * puts that flush back under the locks, as it was.
+ */
+static int cetrafs_convert_flush(struct super_block *sb, struct inode *inode)
 {
+    int ret = READ_ONCE(cetrafs_pending_flush_fail) ? -EIO : cetrafs_publish_flush(sb);
+
+    if (ret)
+        pr_err_ratelimited("ino=%llu: the device cache flush after marking buffered blocks written failed (%d) -- "
+                           "the next fsync, close or sync publishes them, and flushes before it does\n",
+                           (unsigned long long) inode->i_ino, ret);
+    return ret;
+}
+
+/* Lock-held callers (lock.c's suspension): the flush is under their lock. */
+int cetrafs_convert_pending_locked(struct inode *inode)
+{
+    bool flipped = false;
     int ret;
 
-    if (!S_ISREG(inode->i_mode) || !cetrafs_pending_any(inode))
+    lockdep_assert_held_write(&inode->i_mapping->invalidate_lock);
+    ret = __cetrafs_convert_pending(inode, &flipped);
+    if (!ret && flipped) {
+        ret = cetrafs_convert_flush(inode->i_sb, inode);
+        cetrafs_conv_unflushed_set(inode, ret != 0);
+    }
+    return ret;
+}
+
+/*
+ * The set's span written back before the locks are taken, so the locked
+ * pass finds nothing dirty in it, normally. A write that races this is
+ * written back again under the lock (__cetrafs_convert_pending()): the
+ * result is the same, and only a race pays for its own I/O under the
+ * locks. Its errors are not judged here -- the locked pass judges the
+ * set's own errseq cursor, which keeps them.
+ */
+static void cetrafs_convert_prewrite(struct inode *inode)
+{
+    struct address_space *m = inode->i_mapping;
+    unsigned int bits = inode->i_blkbits;
+    u64 lo = U64_MAX, hi = 0, at = 0;
+    u32 first, last;
+
+    while (at <= U32_MAX && !cetrafs_pending_next(inode, (u32) at, &first, &last)) {
+        lo = min_t(u64, lo, first);
+        hi = max_t(u64, hi, last);
+        at = (u64) last + 1;
+    }
+    if (lo == U64_MAX)
+        return;
+    (void) filemap_fdatawrite_range(m, (loff_t) (lo << bits), (loff_t) (((hi + 1) << bits) - 1));
+    (void) filemap_fdatawait_range_keep_errors(m, (loff_t) (lo << bits), (loff_t) (((hi + 1) << bits) - 1));
+}
+
+int cetrafs_convert_pending(struct inode *inode)
+{
+    struct super_block *sb = inode->i_sb;
+    bool flipped = false, did_flush = false;
+    int ret = 0, fret = 0;
+
+    if (!S_ISREG(inode->i_mode))
         return 0;
+    if (!cetrafs_pending_any(inode)) {
+        /* Nothing to convert, but an earlier conversion's flush may still
+         * be owed (a refused one, retried here). */
+        if (!cetrafs_conv_unflushed(inode))
+            return 0;
+        ret = cetrafs_convert_flush(sb, inode);
+        cetrafs_conv_unflushed_set(inode, ret != 0);
+        return ret;
+    }
+    cetrafs_convert_prewrite(inode);
     inode_lock(inode);
     filemap_invalidate_lock(inode->i_mapping);
-    ret = cetrafs_convert_pending_locked(inode);
+    ret = __cetrafs_convert_pending(inode, &flipped);
+    if (!ret && flipped && READ_ONCE(cetrafs_convert_flush_under_lock)) {
+        fret = cetrafs_convert_flush(sb, inode); /* TEST ONLY: the old place */
+        did_flush = true;
+    }
     filemap_invalidate_unlock(inode->i_mapping);
     inode_unlock(inode);
-    return ret;
+    if (!ret && flipped && !READ_ONCE(cetrafs_convert_flush_under_lock)) {
+        fret = cetrafs_convert_flush(sb, inode);
+        did_flush = true;
+    }
+    if (did_flush)
+        cetrafs_conv_unflushed_set(inode, fret != 0);
+    return ret ? ret : fret;
 }
 
 static ssize_t cetrafs_direct_IO(struct kiocb *iocb, struct iov_iter *iter)

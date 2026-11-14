@@ -1332,6 +1332,8 @@ int cetrafs_pending_add(struct inode *inode, u32 first, u32 count);
 u32 cetrafs_pending_run(struct inode *inode, u32 block);
 int cetrafs_pending_next(struct inode *inode, u32 from, u32 *first, u32 *last);
 bool cetrafs_pending_any(struct inode *inode);
+bool cetrafs_conv_unflushed(struct inode *inode);
+void cetrafs_conv_unflushed_set(struct inode *inode, bool unflushed);
 bool cetrafs_pending_wb_failed(struct inode *inode);
 void cetrafs_pending_clear(struct inode *inode, u32 first, u32 last);
 void cetrafs_pending_drop_all(struct inode *inode);
