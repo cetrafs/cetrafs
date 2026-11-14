@@ -558,14 +558,26 @@ struct cetrafs_defrag_stats {
 #define CETRAFS_IOC_DEFRAG _IOR('C', 0x01, struct cetrafs_defrag_stats)
 
 /*
- * Grow a MOUNTED volume: the superblock growfs.cetra would have written,
- * issued on any directory of the mount. The new Block Groups and their
- * table segment must already be on the device, past the published end;
- * the kernel checks everything the superblock describes, then publishes
- * it (kmod/grow.c). Needs CAP_SYS_ADMIN and the volume's repair claim
- * held by the caller for the whole grow.
+ * The argument of CETRAFS_IOC_GROW: the superblock growfs.cetra would
+ * have written, and the caller's own repair claim -- the Node Registry
+ * row it wrote in REPAIR state and the nonce it stored in that row's
+ * node_uuid. The kernel publishes only when THAT row still carries THAT
+ * nonce ("some growfs row exists" is not a claim the caller holds).
+ *
+ * The superblock must already describe new Block Groups whose headers
+ * and table segment are on the device, past the published end; the
+ * kernel checks everything it describes, then publishes it (kmod/grow.c).
+ * Needs CAP_SYS_ADMIN and the caller's repair claim, held for the whole
+ * grow.
  */
-#define CETRAFS_IOC_GROW _IOW('C', 0x02, cetrafs_superblock_t)
+typedef struct {
+    cetrafs_superblock_t sb;
+    __le32 claim_row;                 /* Node Registry row of the caller's claim */
+    __le32 pad;
+    u8     claim_nonce[16];           /* = that row's node_uuid; CETRAFS_NODE_UUID_LEN */
+} CETRA_PACKED cetrafs_grow_arg_t;
+
+#define CETRAFS_IOC_GROW _IOW('C', 0x03, cetrafs_grow_arg_t)
 
 /*
  * The userspace-driven whole-file exclusive lock is the standard flock(2)

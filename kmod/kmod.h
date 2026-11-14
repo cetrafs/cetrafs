@@ -1035,7 +1035,7 @@ struct cetrafs_grow_plan {
 int cetrafs_sb_layout_grow(struct super_block *sb, const cetrafs_superblock_t *nw);
 int cetrafs_grow_commit(struct super_block *sb, const struct cetrafs_grow_plan *plan);
 int cetrafs_grow_check_bg_header(struct super_block *sb, u32 bg_id, u64 start, u64 len);
-long cetrafs_grow_ioctl(struct file *file, const cetrafs_superblock_t __user *arg);
+long cetrafs_grow_ioctl(struct file *file, const cetrafs_grow_arg_t __user *arg);
 int cetrafs_grow_heal_pool(struct super_block *sb);
 u32 cetrafs_bgseg_crc(const cetrafs_bg_segment_t *seg);
 u32 cetrafs_bgseg_crc_prefix(const void *img, unsigned int len);

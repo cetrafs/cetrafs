@@ -327,7 +327,10 @@ int cetrafs_grow_commit(struct super_block *sb, const struct cetrafs_grow_plan *
  * would satisfy it, and also blocks every mount until it goes stale.
  */
 /* 0 when a growfs claim is on the device, -EBUSY when none is, -EIO
- * when the registry cannot be read (not knowing is not "none"). */
+ * when the registry cannot be read (not knowing is not "none"). Asked
+ * by the mount's heal only: it says whether SOME grow is live, which
+ * is all the heal needs (a claim it leaves alone costs nothing). The
+ * ioctl asks the caller's own claim, cetrafs_grow_claim_owned(). */
 static int cetrafs_grow_claim_present(struct super_block *sb)
 {
     const cetrafs_superblock_t *raw_sb = cetrafs_sb_raw(sb);
@@ -350,12 +353,54 @@ static int cetrafs_grow_claim_present(struct super_block *sb)
     return -EBUSY;
 }
 
-static int cetrafs_grow_claim_held(struct super_block *sb)
-{
-    int rc = cetrafs_grow_claim_present(sb);
+/* TEST ONLY: the ioctl accepts ANY growfs row in REPAIR, as it did
+ * before the claim was carried in the argument. grow_claim_owner.sh's
+ * control: a grow under someone else's claim is then published. */
+static bool cetrafs_grow_claim_any;
+cetrafs_test_param(grow_claim_any, cetrafs_grow_claim_any, bool, 0644);
+MODULE_PARM_DESC(grow_claim_any, "TEST ONLY: a live grow is accepted under ANY growfs claim, not the caller's own");
 
+/*
+ * Is the caller's claim -- Node Registry row `row`, in REPAIR, labelled
+ * "growfs", carrying `nonce` as its node_uuid -- still on the device?
+ * 0 if so, -EBUSY if not (a row that is not that claim, a row out of
+ * range, or a stale claim that was taken away), -EIO if the registry
+ * cannot be read.
+ *
+ * The claim is growfs's: it wrote the nonce into the row when it took
+ * the claim and keeps it for the whole grow. A row that is a growfs
+ * claim belonging to someone else is refused here (audit L8).
+ */
+static int cetrafs_grow_claim_owned(struct super_block *sb, u32 row, const u8 *nonce)
+{
+    const cetrafs_superblock_t *raw_sb = cetrafs_sb_raw(sb);
+    cetrafs_node_entry_t ne;
+    int r;
+
+    BUILD_BUG_ON(sizeof(((cetrafs_grow_arg_t *) NULL)->claim_nonce) != sizeof(ne.node_uuid));
+    if (!raw_sb)
+        return -EIO;
+    if (row >= le32_to_cpu(raw_sb->node_table_count) || row >= CETRAFS_MAX_READER_NODES)
+        return -EBUSY;
+    r = cetrafs_node_get_entry(sb, row, &ne);
+    if (r == -EIO)
+        return -EIO;
+    if (r || le32_to_cpu(ne.state) != CETRAFS_NODE_STATE_REPAIR ||
+        strncmp(ne.label, "growfs", sizeof(ne.label)) || memcmp(ne.node_uuid, nonce, sizeof(ne.node_uuid)))
+        return -EBUSY;
+    return 0;
+}
+
+static int cetrafs_grow_claim_held(struct super_block *sb, const cetrafs_grow_arg_t *arg)
+{
+    int rc;
+
+    if (READ_ONCE(cetrafs_grow_claim_any))
+        rc = cetrafs_grow_claim_present(sb);
+    else
+        rc = cetrafs_grow_claim_owned(sb, le32_to_cpu(arg->claim_row), arg->claim_nonce);
     if (rc == -EBUSY)
-        pr_err("grow: no growfs claim on the volume -- refusing to publish\n");
+        pr_err("grow: no growfs claim of this caller is on the volume -- refusing to publish\n");
     return rc;
 }
 
@@ -436,10 +481,10 @@ out:
     return rc;
 }
 
-long cetrafs_grow_ioctl(struct file *file, const cetrafs_superblock_t __user *arg)
+long cetrafs_grow_ioctl(struct file *file, const cetrafs_grow_arg_t __user *arg)
 {
     struct super_block *sb = file_inode(file)->i_sb;
-    cetrafs_superblock_t *nw;
+    cetrafs_grow_arg_t *ga;
     long rc;
 
     if (!capable(CAP_SYS_ADMIN))
@@ -466,13 +511,12 @@ long cetrafs_grow_ioctl(struct file *file, const cetrafs_superblock_t __user *ar
      * here checked it, so any CAP_SYS_ADMIN program could publish a
      * superblock with no claim held (GROWFS-LIVE-REVIEW M2).
      */
-    rc = cetrafs_grow_claim_held(sb);
-    if (rc)
-        return rc;
-    nw = memdup_user(arg, sizeof(*nw));
-    if (IS_ERR(nw))
-        return PTR_ERR(nw);
-    rc = cetrafs_sb_layout_grow(sb, nw);
-    kfree(nw);
+    ga = memdup_user(arg, sizeof(*ga));
+    if (IS_ERR(ga))
+        return PTR_ERR(ga);
+    rc = cetrafs_grow_claim_held(sb, ga);
+    if (!rc)
+        rc = cetrafs_sb_layout_grow(sb, &ga->sb);
+    kfree(ga);
     return rc;
 }

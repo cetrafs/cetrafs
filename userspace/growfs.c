@@ -1246,7 +1246,21 @@ int main(int argc, char **argv)
             fprintf(stderr, "growfs.cetra: TEST MODE: releasing the claim before the publish\n");
             growfs_release_claim(fd);
         }
-        if (ioctl(dfd, CETRAFS_IOC_GROW, &sb) < 0) {
+        /* The claim this grow holds: its row, and the nonce it wrote into
+         * that row. The kernel publishes only under that claim, not under
+         * any growfs row (audit L8). A grow that released its claim above
+         * sends no row the kernel can match. */
+        cetrafs_grow_arg_t ga;
+
+        memset(&ga, 0, sizeof(ga));
+        ga.sb = sb;
+        if (grow_repair_row >= 0) {
+            ga.claim_row = cetrafs_cpu_to_le32((uint32_t) grow_repair_row);
+            memcpy(ga.claim_nonce, cetrafs_repair_nonce, sizeof(ga.claim_nonce));
+        } else {
+            ga.claim_row = cetrafs_cpu_to_le32(UINT32_MAX);
+        }
+        if (ioctl(dfd, CETRAFS_IOC_GROW, &ga) < 0) {
             int e = errno;
 
             close(dfd);

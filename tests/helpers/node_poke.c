@@ -213,6 +213,41 @@ int main(int argc, char **argv)
         return 0;
     }
 
+    /* --label0 <text>: the label as a claim writes it (snprintf into the
+     * field): the text, NUL-terminated, the rest of the field zero. */
+    if (argc == 5 && strcmp(argv[3], "--label0") == 0) {
+        if (strlen(argv[4]) >= sizeof(ne.label))
+            return 2;
+        memset(ne.label, 0, sizeof(ne.label));
+        memcpy(ne.label, argv[4], strlen(argv[4]));
+        ne.checksum = 0;
+        ne.checksum = cetrafs_cpu_to_le64(crc32c_struct(&ne, sizeof(ne), offsetof(cetrafs_node_entry_t, checksum), sizeof(cetrafs_le64(ne.checksum))));
+        pwrite_all(fd, &ne, sizeof(ne), row_off);
+        close(fd);
+        printf("node_poke: row %u label set\n", row);
+        return 0;
+    }
+
+    /* --uuid <32 hex>: the row's node_uuid exactly as given (a claim's
+     * nonce, a machine id). Checksum restamped: the row is VALID. */
+    if (argc == 5 && strcmp(argv[3], "--uuid") == 0) {
+        if (strlen(argv[4]) != 2 * sizeof(ne.node_uuid))
+            return 2;
+        for (size_t i = 0; i < sizeof(ne.node_uuid); i++) {
+            unsigned int b;
+
+            if (sscanf(argv[4] + 2 * i, "%2x", &b) != 1)
+                return 2;
+            ne.node_uuid[i] = (uint8_t) b;
+        }
+        ne.checksum = 0;
+        ne.checksum = cetrafs_cpu_to_le64(crc32c_struct(&ne, sizeof(ne), offsetof(cetrafs_node_entry_t, checksum), sizeof(cetrafs_le64(ne.checksum))));
+        pwrite_all(fd, &ne, sizeof(ne), row_off);
+        close(fd);
+        printf("node_poke: row %u uuid set\n", row);
+        return 0;
+    }
+
     /* --caps: set the row's advertised capability bits (a peer mounted
      * without atomic CAW advertises CETRAFS_NODE_CAP_NO_CAW). */
     if (argc == 5 && strcmp(argv[3], "--caps") == 0) {
