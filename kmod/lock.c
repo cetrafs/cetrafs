@@ -5306,6 +5306,24 @@ static bool cetrafs_lock_resume_reread_fail_once;
 cetrafs_test_param(lock_resume_reread_fail_once, cetrafs_lock_resume_reread_fail_once, bool, 0644);
 MODULE_PARM_DESC(lock_resume_reread_fail_once, "TEST ONLY: the next lock resume's record re-read fails with -EIO");
 
+/* TEST ONLY: the lock paths that re-read the record take its generation
+ * as the record has it, as before audit 2026-11-14 item 1 (the control of
+ * tests/kernel/flock_reused_number.sh). */
+static bool cetrafs_lock_raw_gen_unchecked;
+cetrafs_test_param(lock_raw_gen_unchecked, cetrafs_lock_raw_gen_unchecked, bool, 0644);
+MODULE_PARM_DESC(lock_raw_gen_unchecked, "TEST ONLY: an explicit lock or resume claims a record whose generation is not this inode's");
+
+/* A record read by a lock path must still be this inode's incarnation
+ * before a claim or release is keyed on it: a reused number is another
+ * file, and a claim on it lands on the wrong file (the open path's check,
+ * cetrafs_lock_open(), made the same decision). */
+static int cetrafs_lock_raw_is_inode(struct inode *inode, const cetrafs_inode_t *raw)
+{
+    if (READ_ONCE(cetrafs_lock_raw_gen_unchecked))
+        return 0;
+    return cetrafs_le64(raw->generation) == cetrafs_inode_get_generation(inode) ? 0 : -ESTALE;
+}
+
 /*
  * flock(fd, LOCK_EX) on a default mount: take the automatic lock back.
  *
@@ -5355,6 +5373,8 @@ static int cetrafs_lock_resume(struct inode *inode)
      * have taken the lock, and a cached record cannot show that. */
     cetrafs_invalidate_raw_inode(sb, inode->i_ino);
     ret = cetrafs_read_raw_inode(sb, inode->i_ino, &raw);
+    if (!ret)
+        ret = cetrafs_lock_raw_is_inode(inode, &raw);
     if (ret)
         goto out;
 
@@ -5580,6 +5600,8 @@ static int cetrafs_lock_explicit_acquire(struct inode *inode, struct file *file)
 
     cetrafs_invalidate_raw_inode(sb, inode->i_ino);
     ret = cetrafs_read_raw_inode(sb, inode->i_ino, &raw);
+    if (!ret)
+        ret = cetrafs_lock_raw_is_inode(inode, &raw);
     if (ret)
         goto out;
 
@@ -5634,6 +5656,8 @@ static int cetrafs_lock_explicit_acquire(struct inode *inode, struct file *file)
                     owner);
             cetrafs_invalidate_raw_inode(sb, inode->i_ino);
             ret = cetrafs_read_raw_inode(sb, inode->i_ino, &raw);
+            if (!ret)
+                ret = cetrafs_lock_raw_is_inode(inode, &raw);
             if (ret)
                 goto out;
             ctx.generation = cetrafs_le64(raw.generation);
@@ -5702,7 +5726,7 @@ static int cetrafs_lock_explicit_acquire(struct inode *inode, struct file *file)
 
         cetrafs_invalidate_raw_inode(sb, inode->i_ino);
         ret = cetrafs_read_raw_inode(sb, inode->i_ino, &raw);
-        if (!ret && cetrafs_le64(raw.generation) != claim_gen)
+        if (!ret && cetrafs_lock_raw_is_inode(inode, &raw))
             ret = -ESTALE;
         if (!ret && CETRAFS_FILE_SEQ_NODE(cetrafs_le64(raw.file_seq)) != (u32) (my_node_id & 0xFFFFu)) {
             cetrafs_tree_invalidate_cached(inode, &raw);
