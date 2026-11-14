@@ -68,9 +68,12 @@ echo "fence_epoch: $BEFORE before, $BUMPED after the peer's bump, $AFTER after t
     pass "the departure left the peer's fence epoch standing" ||
     fail "the unmount reverted the fence epoch ($BUMPED -> $AFTER) -- the peer's revocation is gone"
 
+# A fenced node has no clean departure to announce: its row must go
+# stale and be reclaimed as a crashed node's (audit 2026-11-14 C8,
+# tests/kernel/node_offline_after_fence.sh).
 DEPARTED="$("$NPOKE" "$IMG" 0 2>&1 | sed -n 's/.* departure=\([0-9]*\).*/\1/p' | head -1)"
-[ "$DEPARTED" = "1" ] &&
-    pass "and still recorded the departure (departure=1, CLEAN)" ||
-    fail "the departure was not recorded: departure='$DEPARTED'"
+[ "$DEPARTED" = "0" ] &&
+    pass "and did not announce a clean departure over the fence (departure=0)" ||
+    fail "a fenced node announced its departure: departure='$DEPARTED'"
 
 ct_exit
