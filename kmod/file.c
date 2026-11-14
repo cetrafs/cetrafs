@@ -556,14 +556,34 @@ static ssize_t cetrafs_write_capacity(struct kiocb *iocb, struct iov_iter *from)
  * a setuid or setgid bit, or a security.capability xattr (the capability LSM's
  * need_killpriv). An xattr error other than "absent" counts as "may strip".
  */
+/* TEST ONLY: the shared path ignores S_NOSEC and asks every write, as
+ * before -- the control of tests/kernel/dio_overwrite_nosec.sh. */
+static bool cetrafs_dio_privs_nosec_off;
+cetrafs_test_param(dio_privs_nosec_off, cetrafs_dio_privs_nosec_off, bool, 0644);
+MODULE_PARM_DESC(dio_privs_nosec_off, "TEST ONLY: the shared O_DIRECT path asks for a capability on every write");
+static atomic64_t cetrafs_dio_privs_xattr_reads = ATOMIC64_INIT(0);
+u64 cetrafs_dio_privs_xattr_reads_count(void)
+{
+    return (u64) atomic64_read(&cetrafs_dio_privs_xattr_reads);
+}
+
 static bool cetrafs_dio_may_strip_privs(struct file *file)
 {
     struct inode *inode = file_inode(file);
     struct super_block *sb = inode->i_sb;
+    bool nosec_ok = !READ_ONCE(cetrafs_dio_privs_nosec_off);
     cetrafs_inode_t *raw;
     bool no_xattr;
     int r;
 
+    /* The VFS's own answer, as file_remove_privs() takes it: set after a
+     * write found nothing to strip (SB_NOSEC, from get_tree_bdev()),
+     * cleared by a local chmod +s or security.* setxattr and by the
+     * adoption of a peer's identity (cetrafs_inode_adopt_identity()).
+     * Without it every write paid the forced-fresh capability lookup
+     * below -- two device reads -- on the path that exists to be fast. */
+    if (nosec_ok && IS_NOSEC(inode))
+        return false;
     if (inode->i_mode & (S_ISUID | S_ISGID))
         return true;
     /* The xattr block is in the record, and the record is read as the
@@ -584,10 +604,19 @@ static bool cetrafs_dio_may_strip_privs(struct file *file)
     }
     no_xattr = !cetrafs_le64(raw->xattr_block);
     kfree(raw);
-    if (no_xattr)
-        return false;
-    r = cetrafs_xattr_caps_size(inode);
-    return r > 0 || (r < 0 && r != -ENODATA && r != -EOPNOTSUPP);
+    if (!no_xattr) {
+        atomic64_inc(&cetrafs_dio_privs_xattr_reads);
+        r = cetrafs_xattr_caps_size(inode);
+        if (r > 0 || (r < 0 && r != -ENODATA && r != -EOPNOTSUPP))
+            return true;
+    }
+    /* Nothing to strip: say so as the VFS does (inode_has_no_xattr(),
+     * which checks setuid/setgid and SB_NOSEC itself). i_flags is
+     * otherwise written under i_rwsem held exclusively; here it is held
+     * shared, and every writer that can run beside us sets this same bit. */
+    if (nosec_ok)
+        inode_has_no_xattr(inode);
+    return false;
 }
 
 /*
