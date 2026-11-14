@@ -3161,12 +3161,20 @@ MODULE_PARM_DESC(rename_nlink_fail, "TEST ONLY: fail the next N rename link-coun
  * shape: it keeps its name, but its last unlink then frees nothing. Returns the swap's result; 'd->out_nlink' is
  * valid on 0.
  */
+static bool cetrafs_rename_dir_one_attempt;
+cetrafs_test_param(rename_dir_one_attempt, cetrafs_rename_dir_one_attempt, bool, 0644);
+MODULE_PARM_DESC(rename_dir_one_attempt, "TEST ONLY: a replaced directory's count gets one swap attempt");
+
 static int cetrafs_rename_ns_delta(struct super_block *sb, u64 ino, struct cetrafs_ns_delta *d, const char *what)
 {
     cetrafs_inode_t raw;
     int ret = -EIO, attempt;
 
-    for (attempt = 0; attempt < 3; attempt++) {
+    /* rename_dir_one_attempt: the replaced directory's single swap, as
+     * before audit 2026-11-14 N8 (test-only). */
+    int attempts = d->set_nlink_zero && READ_ONCE(cetrafs_rename_dir_one_attempt) ? 1 : 3;
+
+    for (attempt = 0; attempt < attempts; attempt++) {
         cetrafs_invalidate_raw_inode(sb, ino);
         ret = cetrafs_read_raw_inode(sb, ino, &raw);
         if (!ret && READ_ONCE(cetrafs_rename_nlink_fail)) {
@@ -3503,7 +3511,6 @@ static int cetrafs_rename_locked(struct mnt_idmap *idmap,
     if (new_inode) {
         u64 removed_ino;
         u8 removed_file_type;
-        cetrafs_inode_t raw;
 
         /* One dirent write, so the destination name never stops
          * resolving -- see cetrafs_dir_retarget_entry(). This both
@@ -3526,11 +3533,12 @@ static int cetrafs_rename_locked(struct mnt_idmap *idmap,
             struct cetrafs_ns_delta d = {.set_nlink_zero = true, .ctime = (u64) now};
             int nret;
 
-            cetrafs_invalidate_raw_inode(new_dir->i_sb, removed_ino);
-            nret = cetrafs_read_raw_inode(new_dir->i_sb, removed_ino, &raw);
-            if (!nret)
-                nret = cetrafs_inode_ns_cas(new_dir->i_sb, removed_ino, cetrafs_le64(raw.generation), &raw,
-                                            cetrafs_ns_apply_delta, &d);
+            /* The same retries as the replaced file's -1 below: one
+             * refused swap left the directory unreachable and allocated
+             * until fsck (audit 2026-11-14 N8). */
+            if (removed_ino == new_inode->i_ino)
+                d.gen = cetrafs_inode_get_generation(new_inode);
+            nret = cetrafs_rename_ns_delta(new_dir->i_sb, removed_ino, &d, "rename: replaced directory");
             /*
              * Both results used to be discarded, and the rename carried
              * on as if the record had been zeroed. It cannot be undone
