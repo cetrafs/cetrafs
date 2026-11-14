@@ -265,7 +265,7 @@ typedef struct {
     __le64 bg_size_blocks;        /* default/target BG span in blocks (mkfs‑set) */
 
     /* Cluster */
-    __le32 cluster_id;            /* arbitrary cluster identifier */
+    __le32 cluster_id;            /* RESERVED: mkfs writes 0, nothing reads it; cluster membership is the Node Registry's */
     __le32 pad_cluster;           /* alignment */
 
     /* Node Registry (global table; see cetrafs_node_entry_t below). No

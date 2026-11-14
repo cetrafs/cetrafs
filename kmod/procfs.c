@@ -459,7 +459,7 @@ static int cetrafs_proc_properties_show(struct seq_file *m, void *v)
      * exercised at 4K. */
     seq_printf(m, "kernel_page_size: %lu\n", PAGE_SIZE);
     seq_printf(m, "blocks_per_page: %lu\n", PAGE_SIZE / CETRAFS_BLOCK_SIZE);
-    seq_printf(m, "cluster_id: %u\n", le32_to_cpu(raw_sb->cluster_id));
+    seq_printf(m, "cluster_id (reserved): %u\n", le32_to_cpu(raw_sb->cluster_id));
     seq_printf(m, "features_compat: 0x%llx\n", (unsigned long long) le64_to_cpu(raw_sb->features_compat));
     seq_printf(m, "features_ro_compat: 0x%llx\n", (unsigned long long) le64_to_cpu(raw_sb->features_ro_compat));
 

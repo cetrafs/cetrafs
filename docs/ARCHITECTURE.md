@@ -149,7 +149,7 @@ and must be accessed through `cetrafs_le*()`/`cetrafs_cpu_to_le*()`; see
 | root_ino | `__le64` | inode # of `/` (always 1 today) |
 | inode_size / inodes_count | `__le32` | on-disk inode size, total inode slots |
 | bg_size_blocks | `__le64` | target BG span |
-| cluster_id | `__le32` | arbitrary cluster identifier |
+| cluster_id | `__le32` | reserved: mkfs writes 0, nothing reads it (membership is the Node Registry) |
 | node_table_start / node_table_blocks | `__le64` | Node Registry LBA + block count |
 | node_table_count | `__le32` | Node Registry capacity (mkfs `-M`, default 64, ≤ `CETRAFS_MAX_READER_NODES`) |
 | node_entry_size | `__le32` | `sizeof(cetrafs_node_entry_t)` on-disk |
