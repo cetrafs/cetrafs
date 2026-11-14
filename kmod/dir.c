@@ -2208,6 +2208,22 @@ static int cetrafs_dir_raw_visit(struct super_block *sb, const cetrafs_inode_t *
         ret = -EUCLEAN;
     if (ret)
         return ret;
+    /* The count every other scan refuses (cetrafs_dir_extents_addr_ok(),
+     * audit 2026-11-14 RT-3), and this one is a forced-fresh read per
+     * block too: a record naming more is damage, not 2^31 reads (re-audit
+     * of the fixes -- the signal check made it killable, not bounded). */
+    {
+        u64 total = 0;
+
+        for (i = 0; i < dr->n; i++)
+            total += dr->r[i].len;
+        if (total > CETRAFS_DIR_MAX_BLOCKS && !READ_ONCE(cetrafs_dir_len_unbounded)) {
+            pr_err_ratelimited("dir record: its extents name %llu blocks, more than a directory may hold (%u) -- "
+                               "not scanned (fsck)\n",
+                               (unsigned long long) total, CETRAFS_DIR_MAX_BLOCKS);
+            return -EUCLEAN;
+        }
+    }
     for (i = 0; i < dr->n; i++) {
         u32 b;
 
