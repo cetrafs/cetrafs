@@ -672,6 +672,17 @@ static int cetrafs_dio_overwrite_probe(struct inode *inode, loff_t pos, size_t c
  * concurrency, the exclusive control, and the race against punch, truncate
  * and defrag with the window knob and its nolock negative control).
  */
+/* TEST ONLY: the next N shared-path direct writes find a cached page that
+ * will not invalidate (generic_file_direct_write() returns 0);
+ * _zero_ok returns that 0 to the caller, as before -- the control of
+ * tests/kernel/dio_overwrite_busy.sh. */
+static unsigned int cetrafs_dio_overwrite_busy;
+cetrafs_test_param(dio_overwrite_busy, cetrafs_dio_overwrite_busy, uint, 0644);
+MODULE_PARM_DESC(dio_overwrite_busy, "TEST ONLY: the next N shared-path direct writes report a page that will not invalidate");
+static bool cetrafs_dio_overwrite_zero_ok;
+cetrafs_test_param(dio_overwrite_zero_ok, cetrafs_dio_overwrite_zero_ok, bool, 0644);
+MODULE_PARM_DESC(dio_overwrite_zero_ok, "TEST ONLY: a shared-path direct write that wrote nothing returns 0");
+
 static ssize_t cetrafs_dio_overwrite_write(struct kiocb *iocb, struct iov_iter *from, bool *took)
 {
     struct file *file = iocb->ki_filp;
@@ -718,9 +729,22 @@ static ssize_t cetrafs_dio_overwrite_write(struct kiocb *iocb, struct iov_iter *
         gap = READ_ONCE(cetrafs_dio_overwrite_gap_ms);
         if (unlikely(gap))
             msleep(gap);
-        ret = generic_file_direct_write(iocb, from);
+        if (cetrafs_dio_overwrite_busy) {
+            cetrafs_dio_overwrite_busy--; /* test-only: as a page that would not invalidate */
+            ret = 0;
+        } else {
+            ret = generic_file_direct_write(iocb, from);
+        }
         if (ret > 0 || ret == -EIOCBQUEUED)
             atomic64_inc(&cetrafs_dio_overwrites);
+        /* 0 is generic_file_direct_write()'s "a cached page would not
+         * invalidate: fall back to a buffered write" (mm/filemap.c), with
+         * nothing written and the iterator untouched. The fallback needs
+         * the exclusive lock, so the exclusive path takes the write from
+         * the start -- returning the 0 made write(2) report nothing
+         * written for a nonempty request. */
+        if (ret == 0 && !READ_ONCE(cetrafs_dio_overwrite_zero_ok))
+            *took = false;
     }
     cetrafs_inode_shared_dio_adjust(inode, -1);
 out:
