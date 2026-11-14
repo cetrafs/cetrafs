@@ -263,8 +263,11 @@ block holding the literal post-image of `target_lba`:
 **Write-ahead:** `cetrafs_journal_write_block()` (used by `dir.c`/`xattr.c`/`file.c`)
 takes the target buffer *locked and not-yet-dirty*, writes+syncs the payload,
 then writes+syncs this header as the commit marker, then lets the real in-place
-write proceed and immediately **consumes** the entry (zeroes the header), so a
-surviving entry always means its writer crashed mid-operation.
+write proceed and immediately **consumes** the entry (zeroes the header). A
+held-back tree batch is the exception: its entries are retired only after the
+next batch's first flush, so a surviving entry may belong to a batch that
+completed. Replay does not need to tell the two apart -- it judges every entry
+against the target, as below.
 
 **Replay verifies before it redoes.** `prev_checksum` records what the target
 held *before* the modification, and an entry is applied only while the target

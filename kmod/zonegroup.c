@@ -1195,9 +1195,10 @@ static int __cetrafs_zg_try_claim_one(struct super_block *sb,
         pr_warn("ZG claim: reclaiming ZG %u from stale node %u\n", zg_id, owner);
 
         /* Before building anything on this ZG's blocks, replay the stale
-         * owner's per-node journal: a surviving
-         * entry means it crashed mid-operation, possibly mid-write of a
-         * metadata block in this very ZG's data region -- repair that
+         * owner's per-node journal: a surviving entry may be a write it
+         * crashed in the middle of, possibly of a metadata block in this
+         * very ZG's data region (or a completed held-back batch not yet
+         * retired, which the replay judge skips or refuses) -- repair that
          * first, while we already hold the cluster mutex that serializes
          * every replayer. Idempotent and one-shot (the area's own flag
          * goes clean after the first successful replay), so reclaiming
