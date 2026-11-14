@@ -4478,7 +4478,16 @@ int main(int argc, char **argv)
                  * above already reclaims -- on the NEXT run, since that
                  * pass has been and gone. Hence the note below.
                  */
-                if (nlinks[ino] != 0 && empty[ino] && repair_mode && !repair_blocked) {
+                /* Nothing here may decide while a directory block was
+                 * unread: the name that would say whether this inode is
+                 * garbage may be in it, and a free of an inode that is
+                 * named there is not undoable (audit 2026-11-14 U5). */
+                if (tally_partial && repair_mode) {
+                    fprintf(stderr,
+                            "WARN: inode %" PRIu64 " left as it is: a directory block could not be read, so "
+                            "its name may be in it -- run fsck again after it\n",
+                            ino);
+                } else if (nlinks[ino] != 0 && empty[ino] && repair_mode && !repair_blocked) {
                     /* Nothing to recover, so free it rather than give it
                      * a /lost+found name. nlink first: the kernel's
                      * allocator refuses a number whose record still
