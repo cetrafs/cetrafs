@@ -3025,7 +3025,6 @@ int cetrafs_fill_super(struct super_block *sb, struct fs_context *fc)
         /* Find/claim this node's Node Registry row. */
         {
             u8 node_uuid[CETRAFS_NODE_UUID_LEN];
-            unsigned long reg_t0 = jiffies;
             int rc = cetrafs_node_register(sb, sbi->file_lock_enabled ? CETRAFS_FLOCK_MODE_ON : CETRAFS_FLOCK_MODE_OFF,
                                            &sbi->node_id, node_uuid);
 
@@ -3037,14 +3036,22 @@ int cetrafs_fill_super(struct super_block *sb, struct fs_context *fc)
             }
             sbi->node_registered = true;
             memcpy(sbi->node_uuid, node_uuid, CETRAFS_NODE_UUID_LEN);
-            /* The registration is a beat: the lease runs from it, not
-             * from the heartbeat's first tick. Every mount phase until
-             * then -- the claim sweep, the Zone Group claim and recount,
-             * the drain -- writes, and can take minutes on a large
-             * volume; past the peers' window they reclaim from us while
-             * we go on (audit 2026-11-14 F1). Freed with sb_info on every
-             * failure path below (cetrafs_free_sb_info()). */
-            cetrafs_sb_mount_lease(sb, reg_t0);
+            /* The lease runs from here, not from the heartbeat's first
+             * tick. Every mount phase until then -- the claim sweep, the
+             * Zone Group claim and recount, the drain -- writes, and can
+             * take minutes on a large volume; past the peers' window they
+             * reclaim from us while we go on (audit 2026-11-14 F1). From
+             * a renewal of its own, timed from just before it: the
+             * registration can include a watch of the row minutes long,
+             * and a lease counted from before that is already over. The
+             * work it arms is drained with sb_info on every failure path
+             * below (cetrafs_free_sb_info()). */
+            rc = cetrafs_sb_mount_beat(sb);
+            if (rc) {
+                cetrafs_free_sb_info(sb);
+                brelse(bh);
+                return rc;
+            }
             if (cetrafs_mount_post_register_stall_ms) /* TEST ONLY, one-shot */
                 msleep(xchg(&cetrafs_mount_post_register_stall_ms, 0));
             CETRAFS_MOUNT_FAIL_POINT(1);
