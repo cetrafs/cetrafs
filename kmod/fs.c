@@ -5755,10 +5755,12 @@ void cetrafs_sb_set_auto_defrag_enabled(struct super_block *sb, bool on)
  * 0 judged every peer dead at the floor of its advertised interval (a
  * split-brain lever), and a large beat overflowed `secs * 1000` and
  * `secs * 3 * HZ` (audit 2026-11-05, N5). The bounds are wide enough
- * for every suite (a 1 s beat and 3 s window; a 3600 s beat to keep a
- * tick out of a test) and nowhere near an overflow.
+ * for every suite (a 1 s beat and 3 s window) and nowhere near an
+ * overflow. The beat stops at the 30 s every observer clamps an
+ * advertised one to: a longer beat had peers call the node dead before
+ * its lease ran out (audit 2026-11-14 C2).
  */
-#define CETRAFS_PARAM_HB_MAX_SECS    3600u
+#define CETRAFS_PARAM_HB_MAX_SECS    CETRAFS_HB_INTERVAL_MAX_SECS /* what observers clamp a beat to (audit C2) */
 #define CETRAFS_PARAM_STALE_MIN_SECS 3u
 #define CETRAFS_PARAM_STALE_MAX_SECS 86400u
 
@@ -5770,8 +5772,8 @@ unsigned int cetrafs_param_hb_interval_secs(void)
 /* Bounded alone AND against the beat, as the controls file bounds an
  * operator's write: a window under CETRAFS_STALE_MIN_BEATS beats has
  * peers call this node dead while it still holds a lease of three beats
- * (hb_interval_secs=3600 with the default 120 s window: dead after two
- * minutes, leased for three hours). The window is raised to fit the beat;
+ * (hb_interval_secs=3600 with the default 120 s window was dead after
+ * two minutes and leased for three hours, before the beat was capped). The window is raised to fit the beat;
  * 3 x CETRAFS_PARAM_HB_MAX_SECS is still under the cap. */
 unsigned int cetrafs_param_stale_secs(void)
 {

@@ -68,7 +68,7 @@
  * Heartbeat period: the default for mounts made after a write, so it
  * can be set persistently (modprobe.d) as well as per mount (the
  * controls file). The suites also use it to compress timing. A mount
- * takes it clamped to 1..3600 s, and stale_secs is raised to at least
+ * takes it clamped to 1..30 s, and stale_secs is raised to at least
  * three beats (cetrafs_param_stale_secs()). Keep it well below
  * stale_secs -- several ticks must fit inside the stale window, or
  * ordinary jitter starts looking like a dead node.
@@ -76,7 +76,7 @@
 unsigned int cetrafs_hb_interval_secs = CETRAFS_HEARTBEAT_INTERVAL_SECS;
 module_param_named(hb_interval_secs, cetrafs_hb_interval_secs, uint, 0644);
 MODULE_PARM_DESC(hb_interval_secs,
-                 "seconds between heartbeat ticks, for mounts made after a write (default 15; clamped to 1..3600). "
+                 "seconds between heartbeat ticks, for mounts made after a write (default 15; clamped to 1..30). "
                  "The controls file sets it per mount within 5..30");
 
 /* TEST ONLY: fail every heartbeat renewal without touching the device,
@@ -127,6 +127,13 @@ static unsigned int cetrafs_hb_maint_delay_ms;
 static atomic64_t cetrafs_hb_sweeps = ATOMIC64_INIT(0);
 cetrafs_test_param(hb_maint_delay_ms, cetrafs_hb_maint_delay_ms, uint, 0644);
 MODULE_PARM_DESC(hb_maint_delay_ms, "TEST ONLY: milliseconds the heartbeat's maintenance pass takes");
+
+/* TEST ONLY: the maintenance pass skips the pending-free drain. Suites
+ * asserting about a queued entry used a 3600 s beat to keep the drain
+ * out; the beat is capped at 30 s since audit 2026-11-14 C2. */
+static bool cetrafs_hb_drain_off;
+cetrafs_test_param(hb_drain_off, cetrafs_hb_drain_off, bool, 0644);
+MODULE_PARM_DESC(hb_drain_off, "TEST ONLY: the heartbeat does not drain pending frees");
 
 /* TEST ONLY: pause a tick right after it re-arms, where a controls
  * write can move the interval under it. */
@@ -412,7 +419,7 @@ static void cetrafs_heartbeat_maint(struct work_struct *work)
      * is their backoff (cetrafs_lock_retry_cold()). */
     cetrafs_lock_retry_cold(sb);
 
-    ret = cetrafs_zg_drain_pending_frees(sb, true);
+    ret = READ_ONCE(cetrafs_hb_drain_off) ? 0 : cetrafs_zg_drain_pending_frees(sb, true);
     if (ret)
         pr_warn("heartbeat: pending-free drain pass failed: %d\n", ret);
 

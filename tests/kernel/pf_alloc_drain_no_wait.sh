@@ -26,7 +26,7 @@ set -euo pipefail
 . "$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)/lib/harness.sh"
 require_root
 require_module
-for p in pf_drain_busy_region pf_drain_min_ms hb_interval_secs; do
+for p in pf_drain_busy_region pf_drain_min_ms hb_drain_off; do
     [ -w "/sys/module/cetrafs/parameters/$p" ] || { skip "$p is missing"; ct_exit; }
 done
 PP="$(ct_helper pending_poke)"
@@ -38,7 +38,7 @@ ct_mkfs_small "$DEV" >/dev/null
 ct_param_set auto_defrag 0
 ct_param_set scrub 0
 ct_param_set pf_drain_min_ms 600000 # no allocator drain until case 2 asks
-ct_param_set hb_interval_secs 3600  # no heartbeat drain inside the measured write
+ct_param_set hb_drain_off 1  # no heartbeat drain inside the measured write
 
 info() { awk -v k="$1:" '$1 == k { print $2 }' "$(ct_procdir "$DEV")/info"; }
 ext() { "$PP" "$IMG" extent "$(stat -c %i "$1")" | awk '{ print $1 }'; }

@@ -61,7 +61,7 @@ round() {
     ct_param_set scrub 1
     ct_param_set scrub_interval_secs 3
     ct_param_set scrub_gap_secs 2
-    ct_param_set hb_interval_secs 3600 # no drain but the mount's
+    ct_param_set hb_drain_off 1 # no drain but the mount's
     ct_param_set pf_ignore_stamp 0
     ct_mkfs_small "$DEV" -z 1 >/dev/null
     L="$("$LEAK" "$DEV" 0 40 1 | sed -n 's/.* lba \([0-9]*\).*/\1/p')"

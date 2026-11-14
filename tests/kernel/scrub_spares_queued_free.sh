@@ -48,10 +48,10 @@ reclaim() { sed -n 's/^scrub_reclaimed: //p' "$PROC"; }
 ct_param_set scrub 1
 ct_param_set scrub_interval_secs 3
 ct_param_set scrub_gap_secs 2
-# And a heartbeat that will not tick during the test. The drain runs on a
+# And a heartbeat that does not drain during the test. The drain runs on a
 # tick, and a drained entry is no longer queued -- the test would then be
 # asserting about an empty queue and would pass against broken code.
-ct_param_set hb_interval_secs 3600
+ct_param_set hb_drain_off 1
 
 log "leak two ranges of $NLEAK blocks each, neither referenced by any inode"
 "$LEAK" "$DEV" 0 "$OFF_PLAIN" "$NLEAK" >/dev/null
