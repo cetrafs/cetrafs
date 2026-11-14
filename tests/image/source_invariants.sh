@@ -1598,9 +1598,20 @@ printf 'static void cetrafs_repair_tick(int sig)\n{\n    cetrafs_write_row(fd);\
 # presence -- are set by .open/.release/.flock/.lock; a directory
 # file_operations with any of them would arm every such write as a
 # lost update (audit 2026-11-05, the rename retarget question).
+# One hook is exempt by name: .lock = cetrafs_posix_lock_refuse, which
+# refuses an fcntl lock or hands it to the VFS's in-memory table and
+# writes no record -- held to that below: it may call no cetrafs
+# function but the two read-only mount accessors.
 log "checking directory records have no writer outside the namespace lock"
 dir_ops_hooks() { awk '/^const struct file_operations cetrafs_dir_ops = \{/ { on = 1 } on { print } on && /^\};/ { exit }' "$1" |
+    grep -vE '^\s*\.lock\s*=\s*cetrafs_posix_lock_refuse\s*,' |
     { grep -oE '^\s*\.(open|release|flock|lock)\s*=' || true; } | tr -d ' .=' | sort -u | tr '\n' ' '; }
+plr_body() { awk '/^int cetrafs_posix_lock_refuse\(/ { on = 1 } on { print } on && /^}/ { exit }' "$K/lock.c"; }
+PLR="$(plr_body | tail -n +2 | grep -oE 'cetrafs_[a-z0-9_]+\(' | sort -u | tr -d '(' |
+    grep -vxE 'cetrafs_sb_file_lock_enabled|cetrafs_sb_posix_lock_local' || true)"
+[ -n "$(plr_body)" ] || fail "directory records: cetrafs_posix_lock_refuse not found -- the exemption names nothing"
+[ -z "$PLR" ] && pass "directory records: the exempt .lock hook calls only the read-only mount accessors" ||
+    fail "directory records: cetrafs_posix_lock_refuse now calls $(echo $PLR) -- re-audit the directory .lock exemption"
 DH="$(dir_ops_hooks "$K/dir.c")"
 DOPS="$(awk '/^const struct file_operations cetrafs_dir_ops = \{/ { on = 1 } on { n++ } on && /^\};/ { print n; exit }' "$K/dir.c")"
 [ "${DOPS:-0}" -ge 3 ] || fail "directory records: cetrafs_dir_ops not found in dir.c -- the scan is not seeing it"
