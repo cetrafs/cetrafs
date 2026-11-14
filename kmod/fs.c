@@ -168,6 +168,15 @@ struct cetrafs_bg_chunk {
      */
     DECLARE_BITMAP(bmap_alloc_dirty, CETRAFS_BGC_SIZE);
 
+    /* Block Groups the per-tick empty-group release must look at: set
+     * whenever one may have BECOME empty -- a credit to its free count,
+     * ownership entering this node, an outstanding discard -- and
+     * cleared only when a look found it holding data. The release used
+     * to walk the whole table once per owned Zone Group per tick and
+     * CRC every owned descriptor (audit 2026-11-14 P13; PERFORMANCE.md
+     * invariant 5). A missed mark keeps a group, never gives one away. */
+    DECLARE_BITMAP(release_check, CETRAFS_BGC_SIZE);
+
     /* The BG deltas themselves, ACCRUED per BG and applied by one
      * compare-and-swap per dirty BG at the same durability boundaries
      * (v0x0004; bg_free_dirty above is the iteration filter). The BG
@@ -1550,7 +1559,7 @@ static void cetrafs_sb_owned_bgs_derive(struct cetrafs_sb_info *sbi, u32 zg_id, 
         /* A group with a discard outstanding is never allocatable,
          * whoever owns it (CETRAFS_BG_FLAG_DISCARD_PENDING). */
         if (own && !cetrafs_sb_bg_discard_pending_ignored(sbi, b))
-            set_bit(i, c->owned_bgs);
+            set_bit(i, c->owned_bgs), set_bit(i, c->release_check);
         else
             clear_bit(i, c->owned_bgs);
     }
@@ -2074,7 +2083,7 @@ static void cetrafs_layout_publish(struct super_block *sb, struct cetrafs_bg_lay
 
         if (z < CETRAFS_MAX_ZONE_GROUPS && test_bit(z, sbi->owned_zgs) &&
             !cetrafs_sb_bg_discard_pending_ignored(sbi, b))
-            set_bit(i, c->owned_bgs);
+            set_bit(i, c->owned_bgs), set_bit(i, c->release_check);
     }
     if (READ_ONCE(cetrafs_layout_publish_hold_ms)) {
         unsigned int ms = min_t(unsigned int, xchg(&cetrafs_layout_publish_hold_ms, 0), 5000);
@@ -5857,6 +5866,18 @@ bool cetrafs_sb_set_bg_discard_pending(struct super_block *sb, u32 bg_id, bool o
     return true;
 }
 
+/* The first Block Group at or after 'from' with an outstanding
+ * discard, or U32_MAX. */
+u32 cetrafs_sb_next_discard_pending(struct super_block *sb, u32 from)
+{
+    struct cetrafs_sb_info *sbi = sb ? sb->s_fs_info : NULL;
+    unsigned long idx = from;
+
+    if (!sbi || !atomic_read(&sbi->discard_pending_count))
+        return U32_MAX;
+    return xa_find(&sbi->discard_pending, &idx, U32_MAX - 1, XA_PRESENT) ? (u32) idx : U32_MAX;
+}
+
 unsigned int cetrafs_sb_discard_pending_count(struct super_block *sb)
 {
     struct cetrafs_sb_info *sbi = sb ? sb->s_fs_info : NULL;
@@ -6128,7 +6149,7 @@ void cetrafs_sb_undrain_bg(struct super_block *sb, u32 bg_id)
         return;
     mutex_lock(&sbi->alloc_mutex);
     if (c->bg_owner_zg[i] < CETRAFS_MAX_ZONE_GROUPS && test_bit(c->bg_owner_zg[i], sbi->owned_zgs))
-        set_bit(i, c->owned_bgs);
+        set_bit(i, c->owned_bgs), set_bit(i, c->release_check);
     mutex_unlock(&sbi->alloc_mutex);
 }
 
@@ -6146,7 +6167,7 @@ void cetrafs_sb_set_bg_owner(struct super_block *sb, u32 bg_id, u32 zg_id)
     WRITE_ONCE(c->bg_owner_zg[i], (u16) zg_id);
     if (zg_id < CETRAFS_MAX_ZONE_GROUPS && test_bit(zg_id, sbi->owned_zgs) &&
         !cetrafs_sb_bg_discard_pending_ignored(sbi, bg_id))
-        set_bit(i, c->owned_bgs);
+        set_bit(i, c->owned_bgs), set_bit(i, c->release_check);
     else
         clear_bit(i, c->owned_bgs);
 }
@@ -6305,6 +6326,31 @@ bool cetrafs_sb_bmap_alloc_any_dirty(struct super_block *sb)
     return cetrafs_bgc_next_bit(sbi, offsetof(struct cetrafs_bg_chunk, bmap_alloc_dirty), 0) != U32_MAX;
 }
 
+/* The release_check set (see its field). */
+u32 cetrafs_sb_next_release_check(struct super_block *sb, u32 from)
+{
+    struct cetrafs_sb_info *sbi = sb->s_fs_info;
+
+    return cetrafs_bgc_next_bit(sbi, offsetof(struct cetrafs_bg_chunk, release_check), from);
+}
+
+void cetrafs_sb_set_release_check(struct super_block *sb, u32 bg_id, bool on)
+{
+    struct cetrafs_sb_info *sbi = sb->s_fs_info;
+    struct cetrafs_bg_chunk *c;
+    u32 i;
+
+    c = cetrafs_bgc(sbi, bg_id, &i);
+    if (!c)
+        return;
+    if (on) {
+        set_bit(i, c->release_check);
+    } else {
+        clear_bit(i, c->release_check);
+        smp_mb__after_atomic(); /* before the caller's re-look at the count */
+    }
+}
+
 /* The first BG at or after 'from' with allocation bits not yet on the
  * device, U32_MAX when none: the flush visits only those (audit
  * 2026-11-14 P7). */
@@ -6383,6 +6429,8 @@ void cetrafs_sb_accrue_bg_free(struct super_block *sb, u32 bg_id, s64 delta)
     if (c) {
         atomic64_add(delta, &c->bg_free_delta[i]);
         set_bit(i, c->bg_free_dirty);
+        if (delta > 0)
+            set_bit(i, c->release_check); /* it may be empty now */
         /* A negative delta IS an allocation. One uncontended atomic on
          * the per-block path -- no device I/O, so PERFORMANCE.md's
          * per-block budget is untouched. */

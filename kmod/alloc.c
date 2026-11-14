@@ -4037,6 +4037,8 @@ static int __cetrafs_reconcile_locked(struct super_block *sb, u32 bg_id, s64 *ou
             *out_agg = delta - taken - dropped;
         if (flight)
             cetrafs_sb_bg_flight_settle_end(sb, bg_id, 0);
+        if (delta > 0)
+            cetrafs_sb_set_release_check(sb, bg_id, true); /* recounted up: it may be empty */
     }
 
     if (out_delta)
@@ -4585,6 +4587,17 @@ release:
     return 1;
 }
 
+/* TEST ONLY: the empty-group release walks the whole table, as before
+ * audit 2026-11-14 P13 -- the control of tests/kernel/release_walk_marked.sh. */
+static bool cetrafs_release_walk_all;
+cetrafs_test_param(release_walk_all, cetrafs_release_walk_all, bool, 0644);
+MODULE_PARM_DESC(release_walk_all, "TEST ONLY: the per-tick empty-group release walks every Block Group");
+static atomic64_t cetrafs_release_visits = ATOMIC64_INIT(0);
+u64 cetrafs_release_visit_count(void)
+{
+    return (u64) atomic64_read(&cetrafs_release_visits);
+}
+
 int cetrafs_bg_release_empty(struct super_block *sb, u32 zg_id, u32 *out_released, u32 *out_deferred,
                              unsigned long *pass_started)
 {
@@ -4602,12 +4615,62 @@ int cetrafs_bg_release_empty(struct super_block *sb, u32 zg_id, u32 *out_release
     }
     nbg = le32_to_cpu(raw_sb->block_group_count);
 
-    for (b = 0; b < nbg; b++) {
+    /*
+     * Only the groups that may have become empty since they were last
+     * seen holding data (release_check), plus every group with an
+     * outstanding discard: the walk used to be the whole table per
+     * owned Zone Group per tick, and a descriptor CRC per owned group
+     * (audit 2026-11-14 P13). The mark is cleared only where the look
+     * below finds the group in use; a later credit sets it again.
+     */
+    for (b = READ_ONCE(cetrafs_release_walk_all) ? 0 : cetrafs_sb_next_release_check(sb, 0); b < nbg;
+         b = READ_ONCE(cetrafs_release_walk_all) ? b + 1 : cetrafs_sb_next_release_check(sb, b + 1)) {
+        u64 total, free;
+        int ret;
+
+        atomic64_inc(&cetrafs_release_visits);
+        if (cetrafs_sb_bg_owner(sb, b) != zg_id) {
+            u32 o = cetrafs_sb_bg_owner(sb, b);
+
+            if (o < CETRAFS_MAX_ZONE_GROUPS && cetrafs_sb_zg_owned_cached(sb, o))
+                continue; /* another of our Zone Groups: its own pass */
+            /* Not ours (handed back, or never): nothing to release. A
+             * claim that makes it ours marks it again after this. */
+            cetrafs_sb_set_release_check(sb, b, false);
+            o = cetrafs_sb_bg_owner(sb, b);
+            if (o < CETRAFS_MAX_ZONE_GROUPS && cetrafs_sb_zg_owned_cached(sb, o))
+                cetrafs_sb_set_release_check(sb, b, true);
+            continue;
+        }
+        if (cetrafs_sb_bg_discard_pending(sb, b))
+            continue; /* the loop below */
+        {
+            if (!cetrafs_sb_bg_is_ours(sb, b))
+                continue;
+            if (!cetrafs_bg_release_skip_empty_check && cetrafs_bg_data_block_stats(sb, b, &total, &free) == 0 &&
+                free != total) {
+                cetrafs_sb_set_release_check(sb, b, false);
+                /* A credit between the stats and the clear set it
+                 * again before we cleared it: look once more. */
+                if (cetrafs_bg_data_block_stats(sb, b, &total, &free) != 0 || free == total)
+                    cetrafs_sb_set_release_check(sb, b, true);
+                continue;
+            }
+        }
+        ret = cetrafs_bg_release_one(sb, zg_id, b, pass_started, false, NULL);
+        if (ret > 0)
+            released++;
+        else if (ret == -EBUSY)
+            deferred++;
+        if ((b & 1023) == 1023)
+            cond_resched();
+    }
+    /* Outstanding discards are not ours (drained) and may carry no mark. */
+    for (b = cetrafs_sb_next_discard_pending(sb, 0); b < nbg; b = cetrafs_sb_next_discard_pending(sb, b + 1)) {
         int ret;
 
         if (cetrafs_sb_bg_owner(sb, b) != zg_id)
             continue;
-
         ret = cetrafs_bg_release_one(sb, zg_id, b, pass_started, false, NULL);
         if (ret > 0)
             released++;
