@@ -1115,7 +1115,6 @@ journal.c:cetrafs_journal_take_batch wait_event_timeout-loop
 lock.c:cetrafs_flock msleep_interruptible-returns-EINTR
 node.c:cetrafs_node_row_quiet msleep_interruptible-returns-EINTR
 node.c:cetrafs_node_repair_claim_exists msleep_interruptible-returns-EINTR
-node.c:cetrafs_node_live_peer_exists msleep_interruptible-in-a-loop-timed-by-jiffies
 "
 c20_scan() { # <dir>: prints file:function for every listed kind of wait
     local f
@@ -1979,7 +1978,9 @@ cetrafs_node_register final:a-twin-of-this-node-is-mounted
 cetrafs_grow_claim_present final:no-growfs-claim-the-tool-did-not-ask
 cetrafs_lock_open final:test-injection-open_refresh_fail_once
 cetrafs_defrag_inode final:test-injection-defrag_fail_invalidate
-cetrafs_zg_drain_one final:test-injection-pf_drain_busy_region'
+cetrafs_zg_drain_one final:test-injection-pf_drain_busy_region
+cetrafs_defrag_check_sole final:a-user-or-a-lock-on-a-fresh-read-defrag-declines
+cetrafs_node_row_quiet waits:msleep_interruptible'
 C43_REG_ETXTBSY='cetrafs_lock_open waits:cetrafs_lock_wait_yield
 cetrafs_lock_wait_yield final:the-mover-did-not-step-aside-within-lock_yield_wait_ms
 cetrafs_lock_cas_mutate below:a-cas-callback-the-open-and-flock-ask-a-mover-back-cetrafs_lock_ask_mover
@@ -1994,7 +1995,9 @@ cetrafs_zero_range_inplace calls:cetrafs_lock_foreign_user_settled
 cetrafs_foreign_claim_from_raw final:a-holder-judged-dead-came-back-it-is-live
 cetrafs_rebuild_recheck final:a-peer-arrived-after-the-new-map-was-computed-waiting-would-publish-a-stale-map
 cetrafs_fd_write_mutate final:a-peer-changed-the-file-since-the-plan-a-stale-map-must-not-publish
-cetrafs_evict_inode below:a-peer-uses-it-the-number-stays-allocated-the-scrub-reclaims-it'
+cetrafs_evict_inode below:a-peer-uses-it-the-number-stays-allocated-the-scrub-reclaims-it
+cetrafs_lock_write_gate final:the-lock-is-suspended-flock-lock_ex-takes-it-back
+cetrafs_xattr_peer_user final:a-peer-holds-or-reads-the-file-on-a-fresh-read'
 C43_REG_ENOENT='cetrafs_dir_extents_get_unchecked final:the-directory-is-gone-on-a-fresh-read
 cetrafs_dir_add_entry final:the-directory-is-gone-on-a-fresh-read
 cetrafs_dir_remove_entry final:the-name-is-gone-under-the-namespace-lock
@@ -2005,7 +2008,8 @@ cetrafs_bg_trim_pool_one below:owns-no-zone-group-the-pool-pass-stops
 cetrafs_sb_first_owned_zg below:none-owned
 cetrafs_pending_next below:no-pending-range
 cetrafs_leaf_array_convert below:not-covered-here
-cetrafs_tree_convert_inner below:not-covered-here'
+cetrafs_tree_convert_inner below:not-covered-here
+cetrafs_inode_map_block final:a-hole-on-a-read-only-mapping'
 c43_names() { # <errno> <files...>: every function with a literal return/assignment of -<errno>
     local e="$1"
     shift
@@ -2014,7 +2018,7 @@ c43_names() { # <errno> <files...>: every function with a literal return/assignm
 /^\}/ { fn = "" }
 { line = $0; sub(/\/\*.*$/, "", line); sub(/\/\/.*$/, "", line) }
 line ~ /^[ \t]*\*/ { next }
-line ~ ("(return|=)[ \t]*-" E "[ \t]*;") { print (fn == "" ? "UNPLACED:" FILENAME ":" FNR : fn) }' "$@" | sort -u
+line ~ ("(return|=)[ \t]*-" E "[ \t]*;") || line ~ ("return[^;]*[?:][ \t]*-" E "[ \t]*[;:]") { print (fn == "" ? "UNPLACED:" FILENAME ":" FNR : fn) }' "$@" | sort -u
 }
 for C43_E in ENOSPC EBUSY ENOENT ETXTBSY; do
     eval "C43_REG=\$C43_REG_$C43_E"
@@ -2036,9 +2040,11 @@ done
 # Control: a new originator, one in a comment (not one), one in a
 # __-prefixed function, and a pick that stopped waiting.
 C43_SAMPLE="$(ct_tmp c43).c"
-printf 'static int __cetrafs_thing_busy(struct super_block *sb,\n                                int x);\nint cetrafs_thing_alloc(struct super_block *sb)\n{\n    /* return -ENOSPC; */\n    return -ENOSPC;\n}\nstatic int __cetrafs_thing_busy(struct super_block *sb,\n                                int x)\n{\n    cetrafs_thing_wait();\n    return -EBUSY;\n}\nint cetrafs_alloc_pick_bg(struct super_block *sb)\n{\n    return -ENOSPC;\n}\n' >"$C43_SAMPLE"
-[ "$(c43_names ENOSPC "$C43_SAMPLE" | tr '\n' ' ')" = "cetrafs_alloc_pick_bg cetrafs_thing_alloc " ] &&
-    [ "$(c43_names EBUSY "$C43_SAMPLE")" = __cetrafs_thing_busy ] &&
+printf 'static int __cetrafs_thing_busy(struct super_block *sb,\n                                int x);\nint cetrafs_thing_alloc(struct super_block *sb)\n{\n    /* return -ENOSPC; */\n    return -ENOSPC;\n}\nstatic int __cetrafs_thing_busy(struct super_block *sb,\n                                int x)\n{\n    cetrafs_thing_wait();\n    return -EBUSY;\n}\nint cetrafs_alloc_pick_bg(struct super_block *sb)\n{\n    return -ENOSPC;\n}\nint cetrafs_thing_either(struct super_block *sb, bool lost)\n{\n    return lost ? -EBUSY : -ENOSPC;\n}\n' >"$C43_SAMPLE"
+[ "$(c43_names ENOSPC "$C43_SAMPLE" | tr '\n' ' ')" = "cetrafs_alloc_pick_bg cetrafs_thing_alloc cetrafs_thing_either " ] &&
+    [ "$(c43_names EBUSY "$C43_SAMPLE" | grep -c .)" = 2 ] &&
+    c43_names EBUSY "$C43_SAMPLE" | grep -qx __cetrafs_thing_busy &&
+    c43_names EBUSY "$C43_SAMPLE" | grep -qx cetrafs_thing_either &&
     grep -q "cetrafs_thing_wait(" <<<"$(K="$(dirname "$C43_SAMPLE")" c41_body __cetrafs_thing_busy)" &&
     ! grep -q "cetrafs_sb_release_wait(" <<<"$(K="$(dirname "$C43_SAMPLE")" c41_body cetrafs_alloc_pick_bg)" &&
     pass "class 43: control -- planted originators are found (a __ one too, its body past its prototype), a comment is not, and a pick that stopped waiting is seen" ||
