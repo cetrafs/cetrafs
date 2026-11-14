@@ -2001,6 +2001,52 @@ static u64 cetrafs_next_hole_block(struct address_space *m, const struct cetrafs
     return from < nblocks ? from : nblocks; /* EOF itself is the hole */
 }
 
+/*
+ * The record and the map it names, read as one snapshot for SEEK_HOLE,
+ * SEEK_DATA and FIEMAP (audit 2026-11-14 FD-4). Returns with
+ * invalidate_lock held shared on success.
+ *
+ * The record must be read UNDER the lock: a convert that splits a full
+ * leaf publishes a new root (a new leaf or interior under it) inside its
+ * exclusive hold. A record read before the lock can name the old leaf,
+ * which the convert has already shrunk, so the block it moved reads as
+ * a hole. The lookup path is safe the same way (its tree-move sequence
+ * re-runs). cetrafs_map_read_late restores the old order for the control
+ * of tests/kernel/map_read_under_lock.sh.
+ */
+static bool cetrafs_map_read_late;
+cetrafs_test_param(map_read_late, cetrafs_map_read_late, bool, 0644);
+MODULE_PARM_DESC(map_read_late, "TEST ONLY: SEEK_HOLE/SEEK_DATA/FIEMAP read the record before taking invalidate_lock, as before FD-4");
+
+static unsigned int cetrafs_map_read_pause_ms;
+cetrafs_test_param(map_read_pause_ms, cetrafs_map_read_pause_ms, uint, 0644);
+MODULE_PARM_DESC(map_read_pause_ms, "TEST ONLY: a SEEK_HOLE/SEEK_DATA/FIEMAP call sleeps this long between its record read and its walk");
+
+static int cetrafs_map_snapshot_begin(struct inode *inode, cetrafs_inode_t *raw)
+{
+    struct address_space *m = inode->i_mapping;
+    int ret;
+
+    if (READ_ONCE(cetrafs_map_read_late)) {
+        ret = cetrafs_read_raw_inode_overlaid(inode->i_sb, inode, raw); /* torn-read-safe vs a concurrent publish */
+        if (ret)
+            return ret;
+        if (READ_ONCE(cetrafs_map_read_pause_ms))
+            msleep(READ_ONCE(cetrafs_map_read_pause_ms));
+        filemap_invalidate_lock_shared(m);
+        return 0;
+    }
+    filemap_invalidate_lock_shared(m);
+    ret = cetrafs_read_raw_inode_overlaid(inode->i_sb, inode, raw); /* torn-read-safe vs a concurrent publish */
+    if (ret) {
+        filemap_invalidate_unlock_shared(m);
+        return ret;
+    }
+    if (READ_ONCE(cetrafs_map_read_pause_ms))
+        msleep(READ_ONCE(cetrafs_map_read_pause_ms));
+    return 0;
+}
+
 static loff_t cetrafs_seek_hole_data(struct file *file, loff_t offset, int whence)
 {
     struct inode *inode = file->f_mapping->host;
@@ -2019,15 +2065,13 @@ static loff_t cetrafs_seek_hole_data(struct file *file, loff_t offset, int whenc
         return -ENXIO;
     }
 
-    ret = cetrafs_read_raw_inode_overlaid(inode->i_sb, inode, &raw); /* torn-read-safe vs a concurrent publish */
+    /* The record and the leaves are read under invalidate_lock, shared
+     * (cetrafs_map_snapshot_begin()); held across the walk too: it asks
+     * the page cache about uninit blocks, which a concurrent convert
+     * would change under it. */
+    ret = cetrafs_map_snapshot_begin(inode, &raw);
     if (ret)
         goto out;
-
-    /* The leaves are read in place; their writers edit them under
-     * invalidate_lock (cetrafs_tree_lookup_unchecked()). Held across the
-     * walk too: it asks the page cache about uninit blocks, which a
-     * concurrent convert would change under it. */
-    filemap_invalidate_lock_shared(inode->i_mapping);
     ret = cetrafs_inode_sorted_runs(inode, &raw, &m);
     if (ret) {
         filemap_invalidate_unlock_shared(inode->i_mapping);
@@ -2097,16 +2141,15 @@ int cetrafs_fiemap(struct inode *inode, struct fiemap_extent_info *fi, u64 start
 
     inode_lock_shared(inode);
 
-    ret = cetrafs_read_raw_inode_overlaid(inode->i_sb, inode, &raw); /* torn-read-safe vs a concurrent publish */
-    if (ret)
-        goto out;
     /* The leaf is read in place, and its writers edit it under
      * invalidate_lock (cetrafs_tree_lookup_unchecked()). Held only
      * while the sorted map is fetched: the loop below copies to user
      * memory, which can fault on a mapping of this file. The map is
      * our own reference -- immutable, and freed only when its last
      * holder lets go -- so it needs no lock while it is walked. */
-    filemap_invalidate_lock_shared(inode->i_mapping);
+    ret = cetrafs_map_snapshot_begin(inode, &raw);
+    if (ret)
+        goto out;
     ret = cetrafs_inode_sorted_runs(inode, &raw, &m);
     filemap_invalidate_unlock_shared(inode->i_mapping);
     if (ret)
