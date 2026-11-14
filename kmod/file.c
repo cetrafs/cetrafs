@@ -2625,6 +2625,7 @@ struct cetrafs_convert_tail {
     u64 lba;
     u32 len;
     bool may_append; /* the tree blocks for an append are reserved */
+    struct inode *ino; /* the file being converted: a damaged extent marks it */
 };
 
 static int cetrafs_leaf_array_convert(struct super_block *sb,
@@ -2691,7 +2692,11 @@ static int cetrafs_leaf_array_convert(struct super_block *sb,
         if (len == 0 || (u64) eb + len > CETRAFS_MAX_FILE_BLOCKS || phys + len > total_blocks) {
             pr_err_ratelimited("extent [block %u +%u] at lba %llu does not fit the volume (%llu blocks) -- corrupt\n",
                                eb, len, (unsigned long long) phys, (unsigned long long) total_blocks);
-            cetrafs_sb_corrupt(sb, 0);
+            /* The inode, not the volume: its later writes are refused
+             * (the write gate reads the mark), as for every other damaged
+             * extent. A volume-only mark let the same file keep appending
+             * through its damaged map (audit FD-9). */
+            cetrafs_sb_corrupt_inode(tail_out->ino);
             return -EUCLEAN;
         }
 
@@ -4528,6 +4533,8 @@ static int cetrafs_tree_convert_inner(struct inode *inode,
     struct cetrafs_convert_tail tail = { 0 };
     u32 ni;
     int ret, splits = 0;
+
+    tail.ino = inode;
 
     if (raw->eh.eh_depth == 0) {
         ret = cetrafs_leaf_array_convert(sb, raw->et.leaf, &raw->eh.eh_entries, (u16) ARRAY_SIZE(raw->et.leaf), iblock,
