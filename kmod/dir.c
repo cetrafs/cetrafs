@@ -2172,6 +2172,21 @@ static int cetrafs_create_locked(struct mnt_idmap *idmap,
     return 0;
 }
 
+/*
+ * The namespace walks (cetrafs_ns_count_names(), cetrafs_dir_raw_visit())
+ * read their blocks in batches of this many: one plugged submission and
+ * one wait per batch, not one round trip per block (audit 2026-11-14 N2).
+ * Every block of a batch is still read forced-fresh (ioutil.c's batch
+ * helpers) and checked by the same validator as the single-block path.
+ */
+#define CETRAFS_NS_WALK_BATCH 64
+
+/* TEST ONLY: the namespace walks read one block per round trip, as they
+ * did before the batching (tests/kernel/ns_count_walk_reads.sh). */
+static bool cetrafs_ns_count_serial;
+cetrafs_test_param(ns_count_serial, cetrafs_ns_count_serial, bool, 0644);
+MODULE_PARM_DESC(ns_count_serial, "TEST ONLY: the namespace recount reads one block per round trip");
+
 struct cetrafs_dir_runs {
     u64 skip_leaf, skip_xattr;
     u32 n;
@@ -2180,6 +2195,8 @@ struct cetrafs_dir_runs {
         u64 lba;
         u32 len;
     } r[CETRAFS_EXT_BLOCK_MAX_LEAVES];
+    /* One batch of dirent blocks, held between its read and its visit. */
+    struct buffer_head *bh[CETRAFS_NS_WALK_BATCH];
 };
 
 static void cetrafs_dir_runs_cb(void *p, u64 phys, u32 len)
@@ -2197,6 +2214,38 @@ static void cetrafs_dir_runs_cb(void *p, u64 phys, u32 len)
     dr->r[dr->n].lba = phys;
     dr->r[dr->n].len = len;
     dr->n++;
+}
+
+/*
+ * Read the n dirent blocks lba..lba+n into dr->bh[0..n) as one batch
+ * (cetrafs_bread_uncached_batch(): forced-fresh, one wait per batch), each
+ * checked by cetrafs_dirent_block_valid() -- the validator the single-block
+ * path uses. A block the batch did not deliver, or delivered damaged, is
+ * read again alone through cetrafs_dirent_bread_why(), which owns the retry
+ * budget and the damage accounting. On failure every buffer is released and
+ * dr->bh[] is left empty.
+ */
+static int cetrafs_dirent_batch_read(struct super_block *sb, struct cetrafs_dir_runs *dr, u64 lba, u32 n)
+{
+    bool batched = !READ_ONCE(cetrafs_ns_count_serial) && !cetrafs_bread_uncached_batch(sb, lba, n, dr->bh);
+    int why = -EIO;
+    u32 k;
+
+    for (k = 0; k < n; k++) {
+        if (batched && !cetrafs_tear_injected() && cetrafs_dirent_block_valid(dr->bh[k]))
+            continue;
+        if (batched)
+            brelse(dr->bh[k]);
+        dr->bh[k] = cetrafs_dirent_bread_why(sb, lba + k, &why);
+        if (!dr->bh[k]) {
+            for (k = 0; k < n; k++) {
+                brelse(dr->bh[k]); /* NULL-safe */
+                dr->bh[k] = NULL;
+            }
+            return why;
+        }
+    }
+    return 0;
 }
 
 /* Read every dirent block of a directory record forced-fresh; visit each
@@ -2235,7 +2284,7 @@ static int cetrafs_dir_raw_visit(struct super_block *sb, const cetrafs_inode_t *
         }
     }
     for (i = 0; i < dr->n; i++) {
-        u32 b;
+        u32 b = 0;
 
         /* An address read off the disk aims a read here (rule 19), and
          * "not data" marks the record damaged -- unless it only lies past
@@ -2243,19 +2292,25 @@ static int cetrafs_dir_raw_visit(struct super_block *sb, const cetrafs_inode_t *
         ret = cetrafs_lba_run_check(sb, dr->r[i].lba, dr->r[i].len);
         if (ret) /* -EAGAIN: past a grow not caught up with -- not damage, the caller catches up */
             return ret;
-        for (b = 0; b < dr->r[i].len; b++) {
-            int why;
-            struct buffer_head *bh = cetrafs_dirent_bread_why(sb, dr->r[i].lba + b, &why);
-            const cetrafs_dirent_t *de;
-            unsigned int e;
+        while (b < dr->r[i].len) {
+            u32 nb = min_t(u32, CETRAFS_NS_WALK_BATCH, dr->r[i].len - b);
+            u32 k;
 
-            if (!bh)
-                return why; /* -EUCLEAN only for a block every attempt found damaged */
-            de = (const cetrafs_dirent_t *) bh->b_data;
-            for (e = 0; e < CETRAFS_DIRENTS_PER_BLOCK; e++)
-                if (cetrafs_le64(de[e].inode) != 0)
-                    visit(priv, &de[e]);
-            brelse(bh);
+            /* -EUCLEAN only for a block every attempt found damaged */
+            ret = cetrafs_dirent_batch_read(sb, dr, dr->r[i].lba + b, nb);
+            if (ret)
+                return ret;
+            for (k = 0; k < nb; k++) {
+                const cetrafs_dirent_t *de = (const cetrafs_dirent_t *) dr->bh[k]->b_data;
+                unsigned int e;
+
+                for (e = 0; e < CETRAFS_DIRENTS_PER_BLOCK; e++)
+                    if (cetrafs_le64(de[e].inode) != 0)
+                        visit(priv, &de[e]);
+                brelse(dr->bh[k]);
+                dr->bh[k] = NULL;
+            }
+            b += nb;
             cond_resched();
             if (fatal_signal_pending(current))
                 return -EINTR; /* N2: a directory's worth of reads, killable */
@@ -2321,12 +2376,50 @@ static void cetrafs_name_tally_visit(void *priv, const cetrafs_dirent_t *de)
  * O(directory blocks on the volume); paid only after a crash, once per
  * inode an operation stopped holding.
  */
+/* One window of the inode scan: its allocated numbers, and their records
+ * read as one batch (see cetrafs_ns_count_names()). */
+struct cetrafs_ns_window {
+    u64 ino[CETRAFS_NS_WALK_BATCH];
+    sector_t blk[CETRAFS_NS_WALK_BATCH];
+    struct buffer_head *bh[CETRAFS_NS_WALK_BATCH];
+};
+
+/*
+ * Why the batched scan may read a record that was prefetched a window ago
+ * (rule 1 asks for forced-fresh reads under a lock; this is one, and the
+ * argument is what makes it safe here):
+ *
+ * - Every name of X is frozen for the walk: X's namespace lock is held, and
+ *   an entry naming X is only added or removed under it. So which blocks
+ *   hold an X-name cannot change while we read, and a block read at any
+ *   moment of the walk shows the same X-names as one read at its start.
+ * - A directory that holds an X-name cannot be created or removed during the
+ *   walk (creating it would add a name of X; removing it needs it empty). A
+ *   directory created after a window was read has no X-name, and one removed
+ *   after it was read is caught by the fresh re-read below.
+ * - A directory's blocks are read immediately after its own record is read
+ *   fresh (cetrafs_dir_raw_visit() is given that record), so the verdict on
+ *   the record is close to the act (rule 15).
+ *
+ * So the prefetch changes how many requests the scan makes, not what it
+ * counts. ns_count_serial restores the one-read-per-record walk.
+ *
+ * Exact, because of the lock. A count of X's names is the number of entries
+ * naming X across the volume; every directory is read, and every name
+ * counted once. A block that cannot be read makes the answer unknown, and
+ * that is an error: nothing may be decided from a count that skipped a
+ * directory. O(the volume), paid only after a crash, once per inode an
+ * operation stopped holding -- but in batches, so a volume costs its blocks
+ * in round trips of CETRAFS_NS_WALK_BATCH, not one per inode.
+ */
 int cetrafs_ns_count_names(struct super_block *sb, const u64 *inos, u32 n, u32 *counts)
 {
     const cetrafs_superblock_t *raw_sb = cetrafs_sb_raw(sb);
     struct cetrafs_name_tally t = {.inos = inos, .counts = counts, .n = n};
     struct cetrafs_dir_runs *dr;
+    struct cetrafs_ns_window *win;
     cetrafs_inode_t *raw;
+    bool serial = READ_ONCE(cetrafs_ns_count_serial);
     u64 ninodes, d;
     int ret = 0;
 
@@ -2337,41 +2430,72 @@ int cetrafs_ns_count_names(struct super_block *sb, const u64 *inos, u32 n, u32 *
         return 0;
     raw = kmalloc(sizeof(*raw), GFP_NOFS);
     dr = kmalloc(sizeof(*dr), GFP_NOFS);
-    if (!raw || !dr) {
+    win = kmalloc(sizeof(*win), GFP_NOFS);
+    if (!raw || !dr || !win) {
         ret = -ENOMEM;
         goto out;
     }
     ninodes = le32_to_cpu(raw_sb->inodes_count);
-    for (d = 1; d <= ninodes; d++) {
-        bool allocated = false;
+    for (d = 1; d <= ninodes; d += CETRAFS_NS_WALK_BATCH) {
+        u64 end = min_t(u64, d + CETRAFS_NS_WALK_BATCH - 1, ninodes), x;
+        u32 nw = 0, j;
 
-        if ((d & 255) == 0) {
-            cond_resched();
-            /* O(the volume), under the parent's VFS lock: killable (audit
-             * 2026-11-14 N2). The count is unknown, so nothing is
-             * decided; the lock stays stopped for the next taker. */
-            if (fatal_signal_pending(current)) {
-                ret = -EINTR;
+        cond_resched();
+        /* Killable: the count is unknown, so nothing is decided; the lock
+         * stays stopped for the next taker (audit 2026-11-14 N2). */
+        if (fatal_signal_pending(current)) {
+            ret = -EINTR;
+            goto out;
+        }
+        for (x = d; x <= end; x++) {
+            bool allocated = false;
+
+            ret = cetrafs_inode_is_allocated(sb, x, &allocated);
+            if (ret)
                 goto out;
+            if (allocated)
+                win->ino[nw++] = x;
+        }
+        if (!serial && nw) {
+            /* The window's records, one batch: each forced-fresh, and the
+             * reads below find them in the buffer cache (see above). */
+            for (j = 0; j < nw; j++)
+                win->blk[j] = cetrafs_inode_lba(sb, win->ino[j]);
+            ret = cetrafs_bread_uncached_list(sb, win->blk, nw, win->bh);
+            if (ret)
+                goto out;
+            for (j = 0; j < nw; j++) {
+                brelse(win->bh[j]);
+                win->bh[j] = NULL;
             }
         }
-        ret = cetrafs_inode_is_allocated(sb, d, &allocated);
-        if (ret)
-            goto out;
-        if (!allocated)
-            continue;
-        cetrafs_invalidate_raw_inode(sb, d);
-        ret = cetrafs_read_raw_inode(sb, d, raw);
-        if (ret)
-            goto out;
-        /* A removed directory is empty, and its blocks may be anyone's. */
-        if (!S_ISDIR(cetrafs_le32(raw->mode)) || cetrafs_le32(raw->nlink) == 0)
-            continue;
-        ret = cetrafs_dir_raw_visit(sb, raw, dr, cetrafs_name_tally_visit, &t);
-        if (ret)
-            goto out;
+        for (j = 0; j < nw; j++) {
+            x = win->ino[j];
+            if (serial)
+                cetrafs_invalidate_raw_inode(sb, x);
+            ret = cetrafs_read_raw_inode(sb, x, raw);
+            if (ret)
+                goto out;
+            /* A removed directory is empty, and its blocks may be anyone's. */
+            if (!S_ISDIR(cetrafs_le32(raw->mode)) || cetrafs_le32(raw->nlink) == 0)
+                continue;
+            if (!serial) {
+                /* The verdict above may be a window old: re-read the record
+                 * now, the read a directory's blocks are about to follow. */
+                cetrafs_invalidate_raw_inode(sb, x);
+                ret = cetrafs_read_raw_inode(sb, x, raw);
+                if (ret)
+                    goto out;
+                if (!S_ISDIR(cetrafs_le32(raw->mode)) || cetrafs_le32(raw->nlink) == 0)
+                    continue;
+            }
+            ret = cetrafs_dir_raw_visit(sb, raw, dr, cetrafs_name_tally_visit, &t);
+            if (ret)
+                goto out;
+        }
     }
 out:
+    kfree(win);
     kfree(dr);
     kfree(raw);
     return ret;
