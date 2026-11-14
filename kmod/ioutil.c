@@ -458,15 +458,52 @@ static unsigned int cetrafs_meta_write_fail;
 cetrafs_test_param(meta_write_fail, cetrafs_meta_write_fail, uint, 0644);
 MODULE_PARM_DESC(meta_write_fail, "TEST ONLY: fail the next N synchronous metadata writes as the device would");
 
+/* What a block of the volume IS, for the line that stops the mount over
+ * it: an operator reading "block 81234" cannot tell a journal slot from
+ * a directory (audit 2026-11-14 O3). Positional, from the superblock. */
+const char *cetrafs_block_role(struct super_block *sb, u64 lba)
+{
+    const cetrafs_superblock_t *r = cetrafs_sb_raw(sb);
+#define CETRAFS_IN(start, n) (lba >= (u64) (start) && lba - (u64) (start) < (u64) (n))
+
+    if (!r)
+        return "a block";
+    if (lba == 0)
+        return "the superblock";
+    if (CETRAFS_IN(le64_to_cpu(r->zg_table_start), le32_to_cpu(r->zone_group_count)))
+        return "a Zone Group record";
+    if (CETRAFS_IN(le64_to_cpu(r->bg_table_start), le64_to_cpu(r->bg_table_first_count)))
+        return "a Block Group descriptor";
+    if (CETRAFS_IN(le64_to_cpu(r->inode_bmap_start), le64_to_cpu(r->inode_bmap_blocks)))
+        return "the inode bitmap";
+    if (CETRAFS_IN(le64_to_cpu(r->inode_table_start), le64_to_cpu(r->inode_table_blocks)))
+        return "an inode record";
+    if (CETRAFS_IN(le64_to_cpu(r->node_table_start), le64_to_cpu(r->node_table_blocks)))
+        return "a Node Registry row";
+    if (CETRAFS_IN(le64_to_cpu(r->node_journal_start),
+                   (u64) le32_to_cpu(r->node_journal_blocks) * le32_to_cpu(r->node_table_count)))
+        return "a node journal block";
+    if (CETRAFS_IN(le64_to_cpu(r->pending_free_start),
+                   (u64) le32_to_cpu(r->pending_free_blocks_per_zg) * le32_to_cpu(r->zone_group_count)))
+        return "a pending-free queue block";
+    if (lba >= le64_to_cpu(r->bg_regions_start))
+        return "a Block Group header, bitmap, or tree or directory block";
+    return "a reserved block";
+#undef CETRAFS_IN
+}
+
 static int cetrafs_meta_write_result(struct super_block *sb, struct buffer_head *bh, int ret)
 {
     if (!ret && cetrafs_meta_write_fail) {
         cetrafs_meta_write_fail--;
         ret = -EIO;
     }
+    /* Stop, whatever the cause: a buffer write reports only that it did
+     * not complete, never whether anything landed, so "refused, nothing
+     * written" cannot be told from a torn write here (O3; ERRORS.md). */
     if (ret)
-        cetrafs_sb_fatal(sb, "the device refused a metadata write (block %llu, %d)",
-                         (unsigned long long) bh->b_blocknr, ret);
+        cetrafs_sb_fatal(sb, "the device refused a metadata write (%s, block %llu, %d)",
+                         cetrafs_block_role(sb, bh->b_blocknr), (unsigned long long) bh->b_blocknr, ret);
     return ret;
 }
 

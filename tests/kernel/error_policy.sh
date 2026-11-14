@@ -147,6 +147,13 @@ ct_param_set meta_write_fail 0
     fail "C: stopped: $(info stopped) after a refused metadata write"
 dmesg_since "$MARK" | grep -q "STOPPED (error): the device refused a metadata write" &&
     pass "C: the kernel says why" || fail "C: no STOPPED line in dmesg"
+# ...and which structure the block belongs to, not only its number
+# (audit 2026-11-14 O3).
+ROLE="$(dmesg_since "$MARK" | sed -n 's/.*refused a metadata write (\([^,]*\), block.*/\1/p' | head -1)"
+case "$ROLE" in
+"" | block*) fail "C: the stop line does not say what the block is" ;;
+*) pass "C: the stop line names the block: $ROLE" ;;
+esac
 { : >"$MNT/d/c2"; } 2>/dev/null && fail "C: a create went through after the stop" || pass "C: and refuses what follows"
 umount "$MNT" || umount -l "$MNT"
 mount -t cetrafs "$DEV" "$MNT" && [ "$(cat "$MNT/d/f")" = before ] &&
