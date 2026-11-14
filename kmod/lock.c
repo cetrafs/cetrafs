@@ -788,8 +788,8 @@ u32 cetrafs_inode_ext_cache_gen(struct inode *inode)
  * the one-entry cache of before P14: the control of
  * tests/kernel/extent_cache_entries.sh. */
 static unsigned int cetrafs_ext_cache_entries = CETRAFS_EXT_CACHE_MAX;
-module_param_named(ext_cache_entries, cetrafs_ext_cache_entries, uint, 0644);
-MODULE_PARM_DESC(ext_cache_entries, "extents remembered per inode by the extent cache (1..16)");
+cetrafs_test_param(ext_cache_entries, cetrafs_ext_cache_entries, uint, 0644);
+MODULE_PARM_DESC(ext_cache_entries, "TEST ONLY: extents remembered per inode by the extent cache (1..16)");
 
 void cetrafs_inode_ext_cache_store(struct inode *inode,
                                    const cetrafs_inode_t *raw,

@@ -2120,6 +2120,7 @@ cetrafs_trim_claim_next own:undoes-its-own-claim
 cetrafs_trim_release own:gives-back-its-own-claim
 cetrafs_mkdir_locked own:a-dirent-block-never-published
 cetrafs_do_allocate own:blocks-never-published-held-in-the-reservation-registry
+cetrafs_falloc_run_give_back_span own:the-unused-rest-of-a-fallocate-run-never-published
 __cetrafs_get_block own:a-block-never-published
 cetrafs_tree_append own:a-leaf-or-index-never-published
 cetrafs_tree_split_leaf own:a-new-leaf-whose-write-failed-before-any-interior-names-it
@@ -2246,6 +2247,7 @@ file.c:cetrafs_free_fetched_extents:evict, after the claim on a record already d
 defrag.c:cetrafs_defrag_inode:the never-committed tail of its destination run
 lock.c:cetrafs_inode_drop_reservation:a reservation remainder, never written or referenced
 lock.c:cetrafs_inode_set_reservation:a reservation remainder, never written or referenced
+file.c:cetrafs_falloc_run_give_back_span:a fallocate run remainder, never written or referenced
 scrub.c:scrub_free_confirmed:a block re-read unreferenced, under the reservation recheck'
 DOFREE_OK='file.c:__cetrafs_truncate_shrink:after the record CAS that publishes the new tree
 file.c:cetrafs_fallocate:the punch, after the record CAS that publishes the new tree'
@@ -2354,6 +2356,7 @@ defrag.c:cetrafs_defrag_commit:inside its only caller'"'"'s bracket (cetrafs_def
 super_ops.c:cetrafs_evict_inode:the claimed dead record names every block until forget_tree (H1)
 scrub.c:scrub_free_confirmed:the judge itself
 file.c:cetrafs_do_allocate:blocks never published, held in the reservation registry until given back (H2)
+file.c:cetrafs_falloc_run_give_back_span:the unused rest of a fallocate run, never published, held in the reservation registry until given back (H2)
 file.c:__cetrafs_get_block:a block it allocated and never published
 file.c:cetrafs_tree_append:a leaf or index it allocated and never published
 file.c:cetrafs_tree_split_leaf:a new leaf whose write failed, before any interior names it

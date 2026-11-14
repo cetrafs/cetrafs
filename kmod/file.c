@@ -1030,8 +1030,13 @@ static void cetrafs_flatten_readahead(struct inode *inode, const cetrafs_extent_
     for (li = 0; li < iln; li++) {
         u64 llba = cetrafs_extent_phys_from_hilo(iarr[li].ei_leaf_hi, iarr[li].ei_leaf_lo);
 
-        if (cetrafs_lba_run_check(sb, llba, 1) == 0)
-            sb_breadahead(sb, llba);
+        int rc = cetrafs_lba_run_check(sb, llba, 1);
+
+        /* -EAGAIN (cannot tell yet) or a refusal: nothing read ahead.
+         * Advisory only -- the leaf's own read below decides. */
+        if (rc == -EAGAIN || rc)
+            continue;
+        sb_breadahead(sb, llba);
     }
 }
 
@@ -6772,10 +6777,12 @@ static void cetrafs_falloc_resv_drop(struct super_block *sb, struct cetrafs_fall
     r->n = r->cap = 0;
 }
 
+/* Blocks of a claimed run this call never used: one free for the span.
+ * Never published, and held in the reservation registry until here (H2). */
 static void cetrafs_falloc_run_give_back_span(struct super_block *sb, u64 lba, u32 n)
 {
-    while (n--)
-        cetrafs_free_data_block(sb, lba++);
+    if (n)
+        (void) cetrafs_free_data_extent(sb, lba, n);
 }
 
 static void cetrafs_falloc_run_give_back(struct super_block *sb, u64 *lba, u32 *left)
