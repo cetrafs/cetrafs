@@ -3353,10 +3353,16 @@ MODULE_PARM_DESC(pf_ignore_stamp, "TEST ONLY: the pending-free drain does not ch
  * fresh -- the claim from the pool, the Zone Group claim's recount, the
  * mount's walk.
  */
+/* TEST ONLY: apply a pending free in one hold of alloc_mutex, as before
+ * audit 2026-11-14 P1 -- the control of tests/kernel/pf_apply_lock_chunks.sh. */
+static bool cetrafs_pf_apply_one_hold;
+cetrafs_test_param(pf_apply_one_hold, cetrafs_pf_apply_one_hold, bool, 0644);
+MODULE_PARM_DESC(pf_apply_one_hold, "TEST ONLY: apply a pending free under one alloc_mutex hold");
+
 int cetrafs_apply_pending_free(struct super_block *sb, u64 lba, u32 count, u32 expect_zg, u64 stamp)
 {
     struct cetrafs_bg_geom bg;
-    u64 data_start, bit, b, freed = 0;
+    u64 data_start, bit, b, freed = 0, total = 0;
     u32 bg_id;
     int ret;
 
@@ -3412,8 +3418,49 @@ int cetrafs_apply_pending_free(struct super_block *sb, u64 lba, u32 count, u32 e
     for (b = 0; b < count; b++) {
         bool set = false;
 
-        if (!(b & 4095))
+        /* An entry is one freed extent, up to a whole Block Group, and
+         * one hold of alloc_mutex across it stalled every allocating
+         * write on this node for the whole apply -- 100 ms per 1 GiB
+         * entry, back to back through a drain (audit 2026-11-14 P1).
+         * Let go between chunks, as the direct free does, the chunk's
+         * credit taken first. After relocking, the stamp and the owner
+         * are re-checked: the scrub raises free_gen before it frees
+         * here, so an apply that finds it moved stops, and the bits not
+         * yet cleared stay set -- a leak the scrub reclaims, never a
+         * block freed twice. Nothing else can reach them meanwhile: set
+         * bits are not allocated, and a group with set bits is not
+         * released. */
+        if (b && !(b & 4095) && !READ_ONCE(cetrafs_pf_apply_one_hold)) {
+            struct cetrafs_bg_geom now;
+
+            if (freed) {
+                cetrafs_bg_adjust_free_blocks(sb, bg_id, (s64) freed);
+                total += freed;
+                freed = 0;
+            }
+            cetrafs_sb_alloc_unlock(sb);
+            cond_resched();
+            cetrafs_sb_alloc_lock(sb);
+            if (cetrafs_sb_is_fenced(sb)) {
+                ret = -EIO;
+                break;
+            }
+            ret = cetrafs_read_bg_geom(sb, bg_id, &now);
+            if (ret)
+                break;
+            if (now.owner_zg != expect_zg ||
+                (now.free_gen != stamp && !READ_ONCE(cetrafs_pf_ignore_stamp))) {
+                atomic64_inc(&cetrafs_pf_stale_drops);
+                pr_warn_ratelimited("pending free [%llu +%u): BG %u changed under the apply (owner ZG %u, gen "
+                                    "%llu) -- the rest dropped, its blocks stay allocated for the scrub\n",
+                                    (unsigned long long) lba, count, bg_id, now.owner_zg,
+                                    (unsigned long long) now.free_gen);
+                ret = 1;
+                break;
+            }
+        } else if (!(b & 4095)) {
             cond_resched(); /* class 13 */
+        }
         if (cetrafs_sb_trim_holds(sb, lba + b))
             continue; /* free before a FITRIM claimed it: as already free (cetrafs_trim_claim_next()) */
         ret = cetrafs_bitmap_test_bit(sb, bg.start_block + bg.off_data_bmap, bg.off_data_region - bg.off_data_bmap,
@@ -3432,11 +3479,12 @@ int cetrafs_apply_pending_free(struct super_block *sb, u64 lba, u32 count, u32 e
     }
     if (freed)
         cetrafs_bg_adjust_free_blocks(sb, bg_id, (s64) freed);
+    total += freed;
     cetrafs_sb_alloc_unlock(sb);
-    if (freed)
+    if (total)
         cetrafs_inline_discard_note(sb, bg_id, lba, count); /* -o discard: queued, never issued here */
 
-    ctrace("BLKAPPLY lba=%llu count=%u freed=%llu zg=%u\n", (unsigned long long) lba, count, (unsigned long long) freed,
+    ctrace("BLKAPPLY lba=%llu count=%u freed=%llu zg=%u\n", (unsigned long long) lba, count, (unsigned long long) total,
            expect_zg);
     return ret;
 }
