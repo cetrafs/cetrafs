@@ -35,7 +35,11 @@ endif
 # read-modify-write whose failure would have cleared every other bit in
 # the block -- built clean locally and only failed on Ubuntu's level 3.
 # Needs optimisation to do anything, which -O2 below provides.
-HARDEN = -D_FORTIFY_SOURCE=3
+# Placed AFTER the packager's flags, and undefined first: dpkg's
+# CPPFLAGS carry -D_FORTIFY_SOURCE=2, and a second -D of the same macro
+# is a redefinition GCC warns about -- under -Werror the package did not
+# build. -U then -D is not a redefinition, and level 3 is kept.
+HARDEN = -U_FORTIFY_SOURCE -D_FORTIFY_SOURCE=3
 
 # The packager's flags reach the tools too. These tools parse hostile
 # images as root, so a distribution's hardening (dpkg-buildflags' CFLAGS
@@ -46,16 +50,16 @@ TOOL_CFLAGS = $(CPPFLAGS) $(CFLAGS)
 TOOL_LDFLAGS = $(LDFLAGS)
 
 $(MKFS): mkfs.c $(HDRS)
-	$(CC) -D_FILE_OFFSET_BITS=64 -I $(SDIR)/include -O2 $(HARDEN) -std=gnu99 -Wall -Wextra $(WERROR) $(TOOL_CFLAGS) $(TOOL_LDFLAGS) -o $@ $<
+	$(CC) -D_FILE_OFFSET_BITS=64 -I $(SDIR)/include -O2 -std=gnu99 -Wall -Wextra $(WERROR) $(TOOL_CFLAGS) $(HARDEN) $(TOOL_LDFLAGS) -o $@ $<
 
 $(FSCK): fsck.c $(HDRS)
-	$(CC) -D_FILE_OFFSET_BITS=64 -I $(SDIR)/include -O2 $(HARDEN) -std=gnu99 -Wall -Wextra $(WERROR) $(TOOL_CFLAGS) $(TOOL_LDFLAGS) -o $@ $<
+	$(CC) -D_FILE_OFFSET_BITS=64 -I $(SDIR)/include -O2 -std=gnu99 -Wall -Wextra $(WERROR) $(TOOL_CFLAGS) $(HARDEN) $(TOOL_LDFLAGS) -o $@ $<
 
 $(DEFRAG): defrag.c $(HDRS)
-	$(CC) -D_FILE_OFFSET_BITS=64 -I $(SDIR)/include -O2 $(HARDEN) -std=gnu99 -Wall -Wextra $(WERROR) $(TOOL_CFLAGS) $(TOOL_LDFLAGS) -o $@ $<
+	$(CC) -D_FILE_OFFSET_BITS=64 -I $(SDIR)/include -O2 -std=gnu99 -Wall -Wextra $(WERROR) $(TOOL_CFLAGS) $(HARDEN) $(TOOL_LDFLAGS) -o $@ $<
 
 $(GROWFS): growfs.c $(HDRS)
-	$(CC) -D_FILE_OFFSET_BITS=64 -I $(SDIR)/include -O2 $(HARDEN) -std=gnu99 -Wall -Wextra $(WERROR) $(TOOL_CFLAGS) $(TOOL_LDFLAGS) -o $@ $<
+	$(CC) -D_FILE_OFFSET_BITS=64 -I $(SDIR)/include -O2 -std=gnu99 -Wall -Wextra $(WERROR) $(TOOL_CFLAGS) $(HARDEN) $(TOOL_LDFLAGS) -o $@ $<
 
 
 # Sparse (>= 0.6.5) static check that every on-disk-struct field is
