@@ -816,9 +816,12 @@ int cetrafs_proc_mount_init(struct super_block *sb, struct cetrafs_proc_mount **
         return -ENOMEM;
     }
 
-    if (!proc_create_single_data("info", 0444, pm->dir, cetrafs_proc_info_show, sb) ||
+    /* info and cluster read the device uncached on every read: root
+     * only, or an unprivileged loop generates steady SAN I/O (audit
+     * 2026-11-14 L6). properties is computed in memory. */
+    if (!proc_create_single_data("info", 0400, pm->dir, cetrafs_proc_info_show, sb) ||
         !proc_create_single_data("properties", 0444, pm->dir, cetrafs_proc_properties_show, sb) ||
-        !proc_create_single_data("cluster", 0444, pm->dir, cetrafs_proc_cluster_show, sb) ||
+        !proc_create_single_data("cluster", 0400, pm->dir, cetrafs_proc_cluster_show, sb) ||
         !proc_create_data("controls", 0644, pm->dir, &cetrafs_proc_controls_ops, sb)) {
         proc_remove(pm->dir);
         kfree(pm);
