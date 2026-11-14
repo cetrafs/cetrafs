@@ -83,10 +83,10 @@ struct cetrafs_journal {
      * Our on-disk flag's state as we last wrote it. NOT because we are
      * its only writer: a peer replaying our area releases it CLEAN
      * (cetrafs_journal_claim_mutate()). It stays truthful because a peer
-     * replays only after judging us stale, which takes at least four of
-     * our advertised heartbeat intervals without progress
-     * (cetrafs_sb_peer_progress_stale()), while our lease stops this
-     * mount after three (cetrafs_sb_lease_renewed()) -- so no entry of
+     * replays only after judging us stale, which takes at least the
+     * window our row advertises (cetrafs_peer_window_floor_secs(), in
+     * cetrafs_sb_peer_progress_stale()), while our lease stops this
+     * mount one beat sooner (cetrafs_sb_lease_secs()) -- so no entry of
      * ours can be committed under a flag a peer has parked CLEAN -- on a
      * mount without CAW too, where the peer is a successor the gate
      * admitted once we looked dead. Re-derived at every attach,

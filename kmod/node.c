@@ -1324,8 +1324,8 @@ int cetrafs_node_frees_snapshot(struct super_block *sb, u32 my_node_id, bool sel
                 return ret;
         }
         /* A stale row's frees never land: its node stopped writing when
-         * its lease ran out, three intervals before any peer can judge
-         * it stale (cetrafs_sb_lease_renewed()), and I/O it had already
+         * its lease ran out, one beat before any peer can judge it
+         * stale (cetrafs_sb_lease_secs()), and I/O it had already
          * queued is the advisory fence's known residue. That holds
          * without CAW too, where the peer is a successor the gate
          * admitted once the row looked dead: the lease is armed on every

@@ -65,6 +65,10 @@ fenced() { sed -n 's/^fenced: //p' "$(ct_procdir "$DEV")/info"; }
 run() { # <lease armed: 1|0>
     ct_mkfs_small "$DEV" >/dev/null
     ct_param_set hb_interval_secs "$INTERVAL"
+    # A window below the legal range counts for nothing in the lease
+    # (cetrafs_peer_window_floor_secs()), which is then three beats: the
+    # timing this suite measures. lease_window.sh covers a legal one.
+    ct_param_set stale_secs $((INTERVAL * 3))
     ct_param_set lease_disable $((1 - $1))
     ct_mount "$DEV" "$MNT"
     require_cetrafs_mount "$MNT"

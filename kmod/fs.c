@@ -565,6 +565,10 @@ struct cetrafs_sb_info {
      * dead. See cetrafs_sb_lease_renewed().
      */
     struct super_block *sb; /* for lease_work */
+    /* jiffies our last renewal landed, and when renewals last resumed
+     * after an overdue gap (cetrafs_sb_note_renewal()). */
+    unsigned long renew_ok_at;
+    unsigned long renew_resumed_at;
     bool lease_active;
     unsigned long lease_until;
     unsigned long lease_lost; /* bit 0: expired, latched */
@@ -684,8 +688,8 @@ struct cetrafs_sb_info {
      * move. A peer takes a ZG only from an owner it has judged stale,
      * and it bumps that owner's fence_epoch first. A live owner whose
      * renewals keep landing is never judged stale; one whose renewals
-     * stop self-fences after three intervals, before the stale window
-     * a peer must wait out (cetrafs_sb_lease_renewed()); and one that
+     * stop self-fences one beat before the soonest window any peer may
+     * use on it (cetrafs_sb_lease_secs()); and one that
      * WAS judged stale -- wrongly or not -- sees its epoch move on its
      * next heartbeat tick and fences. So a ZG can be taken from under
      * this cache, and this node can go on allocating from it until that
@@ -3528,6 +3532,61 @@ int cetrafs_fill_super(struct super_block *sb, struct fs_context *fc)
  * nothing below can be concurrently read out from under its teardown.
  */
 /*
+ * The soonest any peer may call dead a node whose row advertises
+ * 'interval_secs' and 'stale_secs': four of its beats (the interval
+ * clamped as every observer clamps it), or its own stale window when
+ * that is a legal one. An illegal advertised window -- a corrupt row, or
+ * a loop suite's compressed one -- counts for nothing, on both sides.
+ *
+ * Every observer's window is at least this (cetrafs_sb_peer_progress_stale()),
+ * and this node's lease is this less one beat (cetrafs_sb_lease_secs()):
+ * one formula for both, so the lease can never outlive the window
+ * (audit 2026-11-14 O1, C2).
+ */
+u32 cetrafs_peer_window_floor_secs(u32 interval_secs, u32 stale_secs)
+{
+    u32 w = min_t(u32, interval_secs, CETRAFS_HB_INTERVAL_MAX_SECS) * 4;
+
+    if (stale_secs >= CETRAFS_STALE_MIN_SECS && stale_secs <= CETRAFS_STALE_MAX_SECS && stale_secs > w)
+        w = stale_secs;
+    return w;
+}
+
+/* TEST ONLY: count a peer's silence across our own renewal gap -- the
+ * behaviour before audit 2026-11-14 O2, the control of
+ * tests/kernel/peer_watch_observer_gap.sh. */
+static bool cetrafs_peer_watch_no_restart;
+cetrafs_test_param(peer_watch_no_restart, cetrafs_peer_watch_no_restart, bool, 0644);
+MODULE_PARM_DESC(peer_watch_no_restart, "TEST ONLY: count the observer's own absence as the peer's silence");
+
+/*
+ * Whether this node's own heartbeat renewals are overdue -- more than
+ * three of its beats since the last one landed -- and when they last
+ * resumed after such a gap (0: never). Judged only once the heartbeat
+ * runs: a mount phase renews when it can (cetrafs_sb_mount_beat()) and
+ * must still be able to judge a peer it is waiting on.
+ */
+static bool cetrafs_sb_own_renewal_overdue(struct cetrafs_sb_info *sbi, unsigned long now, unsigned long *resumed)
+{
+    unsigned long ok = READ_ONCE(sbi->renew_ok_at);
+
+    *resumed = READ_ONCE(sbi->renew_resumed_at);
+    if (!sbi->hb || !ok)
+        return false;
+    return time_after(now, ok + (unsigned long) cetrafs_sb_hb_interval_secs(sbi->sb) * 3 * HZ);
+}
+
+/* A renewal of this node's row reached the device. */
+static void cetrafs_sb_note_renewal(struct cetrafs_sb_info *sbi)
+{
+    unsigned long now = jiffies, ok = READ_ONCE(sbi->renew_ok_at);
+
+    if (ok && time_after(now, ok + (unsigned long) cetrafs_sb_hb_interval_secs(sbi->sb) * 3 * HZ))
+        WRITE_ONCE(sbi->renew_resumed_at, now ? now : 1);
+    WRITE_ONCE(sbi->renew_ok_at, now ? now : 1);
+}
+
+/*
  * Observe a peer's heartbeat counter and say whether it has stopped
  * advancing for longer than CETRAFS_NODE_STALE_SECS of OUR OWN clock.
  *
@@ -3568,34 +3627,47 @@ bool cetrafs_sb_peer_progress_stale(struct super_block *sb, u32 node_id, const c
         stale = false;
     } else {
         /*
-         * The window is ours, but it is floored at four of the PEER's
-         * own advertised beats.
+         * The window is ours, floored at what the PEER advertises: four
+         * of its own beats, and its own stale window when that is a
+         * legal one (cetrafs_peer_window_floor_secs()).
          *
          * Our stale_secs says how long WE are willing to wait; it says
-         * nothing about how often the other node actually ticks. If that
-         * node runs a longer interval than we expect -- a different
-         * build, a tuned deployment, or simply a test that compressed
-         * the parameters on one node and not the other -- then a
-         * perfectly healthy peer stops looking alive between its beats,
-         * and we go on to break its locks and fence it. Flooring at
-         * 4x its own rate makes the decision depend on the peer's real
-         * behaviour rather than on our configuration matching its.
+         * nothing about how often the other node actually ticks, nor
+         * how long its lease runs. A peer running a longer interval
+         * than we expect stops looking alive between its beats, and a
+         * peer whose lease is sized from its own longer window
+         * (cetrafs_sb_lease_renewed()) is still writing when a window
+         * of ours would call it dead. The floor makes the decision
+         * depend on what the peer published, never on our
+         * configuration matching its.
          *
-         * A row written before hb_interval_secs existed advertises 0,
-         * and then our own window is all there is to go on.
+         * Both advertised values are clamped inside the helper: a
+         * hostile or corrupt (checksum-valid) row can carry anything,
+         * and must neither make the peer un-reclaimable nor overflow.
          */
         unsigned long window = (unsigned long) cetrafs_sb_stale_secs(sb) * HZ;
-        /* Clamp the PEER's advertised interval: a hostile or corrupt
-         * (checksum-valid) node row can carry any hb_interval_secs, and an
-         * unclamped *4 would both floor this window arbitrarily high (an
-         * un-reclaimable peer) and overflow. A real node's interval is
-         * bounded by the operator controls to CETRAFS_HB_INTERVAL_MAX_SECS. */
-        u32 pi = min_t(u32, peer_hb_interval, CETRAFS_HB_INTERVAL_MAX_SECS);
-        unsigned long peer_floor = (unsigned long) pi * 4 * HZ;
+        unsigned long peer_floor = (unsigned long) cetrafs_peer_window_floor_secs(
+                                       peer_hb_interval, cetrafs_le32(ne->stale_secs)) * HZ;
 
-        if (pi && peer_floor > window)
+        unsigned long from = w->seen_at;
+
+        if (peer_floor > window)
             window = peer_floor;
-        stale = time_after(now, w->seen_at + window);
+        /* Our OWN renewals say whether we could see the device. While
+         * ours are overdue the peer's silence may be the same outage,
+         * and its renewal queued behind it as ours is: no verdict. Once
+         * ours land again the watch counts from then, not from before
+         * the outage -- the observer's absence is not the peer's
+         * silence (audit 2026-11-14 O2). A restart only delays. */
+        if (!READ_ONCE(cetrafs_peer_watch_no_restart)) {
+            unsigned long resumed;
+
+            if (cetrafs_sb_own_renewal_overdue(sbi, now, &resumed))
+                from = now + window; /* not stale; seen_at untouched */
+            else if (resumed && time_after(resumed, from))
+                from = resumed;
+        }
+        stale = time_after(now, from + window);
         if (stale) {
             w->judged_mark = w->mark;
             w->judged = true;
@@ -5151,6 +5223,12 @@ static bool cetrafs_lease_disable;
 cetrafs_test_param(lease_disable, cetrafs_lease_disable, bool, 0644);
 MODULE_PARM_DESC(lease_disable, "TEST ONLY: never arm the in-core lease");
 
+/* TEST ONLY: the lease is three beats whatever the window, as before
+ * audit 2026-11-14 O1 -- the control of tests/kernel/lease_window.sh. */
+static bool cetrafs_lease_three_beats;
+cetrafs_test_param(lease_three_beats, cetrafs_lease_three_beats, bool, 0644);
+MODULE_PARM_DESC(lease_three_beats, "TEST ONLY: size the lease at three beats, not from the stale window");
+
 static void cetrafs_sb_lease_work(struct work_struct *w)
 {
     struct cetrafs_sb_info *sbi = container_of(w, struct cetrafs_sb_info, lease_work);
@@ -5161,16 +5239,41 @@ static void cetrafs_sb_lease_work(struct work_struct *w)
 }
 
 /*
- * A renewal that STARTED at jiffies 't0' advertising 'interval_secs'
- * reached the device: extend the lease. The first one arms it. Nothing
+ * A renewal that STARTED at jiffies 't0' reached the device: extend the
+ * lease to 'lease_secs' from t0 (cetrafs_sb_lease_secs()). The first one
+ * arms it. Nothing
  * extends a lease that has lapsed -- by then a peer may have reclaimed
  * from us, and the only way back is a remount.
  */
-void cetrafs_sb_lease_renewed(struct super_block *sb, unsigned long t0, unsigned int interval_secs)
+/*
+ * The lease a renewal earns, in seconds: the soonest any peer may call
+ * this node dead (cetrafs_peer_window_floor_secs() of what the row
+ * advertises), less one beat of margin for I/O already issued when the
+ * lease runs out. 'imin'/'smin' are the smallest interval and window
+ * the renewal could have advertised, 'imax' the longest beat it could
+ * have run at. With the default 15 s beat and 120 s window that is
+ * 105 s: a controller failover or a queued multipath stall up to that
+ * long is ridden out. It used to be three beats whatever the window
+ * (45 s), so every node of a cluster stopped together on a 60 s stall
+ * nobody could have reclaimed anything in (audit 2026-11-14 O1).
+ */
+unsigned int cetrafs_sb_lease_secs(unsigned int imin, unsigned int imax, unsigned int smin)
+{
+    u32 w = cetrafs_peer_window_floor_secs(imin, smin);
+
+    if (READ_ONCE(cetrafs_lease_three_beats))
+        return imin * 3;
+    return w > imax ? w - imax : w / 2;
+}
+
+void cetrafs_sb_lease_renewed(struct super_block *sb, unsigned long t0, unsigned int lease_secs)
 {
     struct cetrafs_sb_info *sbi = sb->s_fs_info;
 
-    if (!sbi || !interval_secs || test_bit(0, &sbi->lease_lost))
+    if (!sbi)
+        return;
+    cetrafs_sb_note_renewal(sbi);
+    if (!lease_secs || test_bit(0, &sbi->lease_lost))
         return;
     if (!READ_ONCE(sbi->lease_active)) {
         /* Every mount, CAW or not. Without CAW the gate admits no peer
@@ -5186,7 +5289,7 @@ void cetrafs_sb_lease_renewed(struct super_block *sb, unsigned long t0, unsigned
             sbi->lease_work_ready = true;
         }
     }
-    WRITE_ONCE(sbi->lease_until, t0 + (unsigned long) interval_secs * 3 * HZ);
+    WRITE_ONCE(sbi->lease_until, t0 + (unsigned long) lease_secs * HZ);
     smp_wmb(); /* the deadline before the flag that makes it count */
     WRITE_ONCE(sbi->lease_active, true);
 }

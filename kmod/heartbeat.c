@@ -169,7 +169,7 @@ static void cetrafs_heartbeat_tick(struct work_struct *work)
     struct super_block *sb = hb->sb;
     u32 my_node_id;
     unsigned long lease_t0;
-    unsigned int lease_interval;
+    unsigned int lease_interval, lease_stale;
     /* The interval this tick ARMS the next one with -- read once. The
      * lease below is bounded by it too: the controls file can move the
      * interval while this tick runs (there is a device read before the
@@ -272,20 +272,24 @@ static void cetrafs_heartbeat_tick(struct work_struct *work)
      * watch no earlier than when the new hb_seq lands, which is later. */
     lease_t0 = jiffies;
     lease_interval = cetrafs_heartbeat_interval_secs(sb);
+    lease_stale = cetrafs_sb_stale_secs(sb);
     ret = cetrafs_hb_renew_fail ? -EIO /* test-only, see the parameter */
                                 : cetrafs_node_renew_heartbeat(sb, my_node_id);
     if (ret == 0) {
-        /* The smallest of the intervals before and after the renewal --
-         * the row advertises one of them, and peers floor their window
-         * at it -- and the one the next tick is armed with. If that
-         * makes the lease shorter than the armed wait, the next tick
-         * comes sooner instead: the lease must always outlive the gap to
-         * the next renewal. */
-        unsigned int lease = min3(lease_interval, cetrafs_heartbeat_interval_secs(sb), armed);
+        /* The row advertises the interval and window read during the
+         * renewal, so the lease is sized from the smallest of each
+         * before and after it, with the longest beat as its margin
+         * (cetrafs_sb_lease_secs()). The next tick must come no later
+         * than that smallest beat, or a lowered interval would leave
+         * the lease outliving its next renewal: it is armed sooner. */
+        unsigned int now_int = cetrafs_heartbeat_interval_secs(sb);
+        unsigned int imin = min(lease_interval, now_int);
+        unsigned int lease = cetrafs_sb_lease_secs(imin, max3(lease_interval, now_int, armed),
+                                                   min(lease_stale, cetrafs_sb_stale_secs(sb)));
 
         cetrafs_sb_lease_renewed(sb, lease_t0, lease);
-        if (lease < armed)
-            mod_delayed_work(system_unbound_wq, &hb->work, msecs_to_jiffies(lease * 1000));
+        if (imin < armed)
+            mod_delayed_work(system_unbound_wq, &hb->work, msecs_to_jiffies(imin * 1000));
     }
     if (ret == -EPERM) {
         /* The renew itself found our lease revoked. This is the

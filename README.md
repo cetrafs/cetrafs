@@ -145,6 +145,14 @@ In this repo:
   `/proc/fs/cetrafs/<dev>/controls` (bounded 15-240 s, and at least 3x
   `hb_interval_secs`).
 
+  The same window bounds how long a node rides out its OWN stall: it
+  stops itself (every I/O EIO until remount) once its last heartbeat
+  renewal is the stale window less one heartbeat old -- 105 s with the
+  defaults -- because peers may reclaim from it after the window. When
+  every node of the cluster loses the LUN at once, each of them stops
+  at that point. A stall you want the cluster to survive must therefore
+  be shorter than `stale_secs - hb_interval_secs`.
+
   A `controls` change lasts until the volume is unmounted; the next mount
   takes the module option again. The module option is read when a volume
   is mounted, so changing it (in modprobe.d or
