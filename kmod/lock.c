@@ -1759,6 +1759,13 @@ enum cetrafs_reader_op {
     CETRAFS_SUSPEND_CLEAR,
 };
 
+/* TEST ONLY: a read-open does not re-apply the record after its presence
+ * is published, as before audit L-F4 -- the control of
+ * tests/kernel/read_open_after_publish.sh. */
+static bool cetrafs_lock_open_reapply_off;
+cetrafs_test_param(lock_open_reapply_off, cetrafs_lock_open_reapply_off, bool, 0644);
+MODULE_PARM_DESC(lock_open_reapply_off, "TEST ONLY: a read-open applies the record it read before its presence was published");
+
 /* TEST ONLY: the presence swap reads past a judged-stale holder by row
  * alone, as before audit L-F3 -- the control of
  * tests/kernel/read_open_judged_incarnation.sh. */
@@ -2880,6 +2887,38 @@ reread:
             atomic_dec(&ci->lock_local_open_count);
             ret = rret;
             goto out_pr_unlock;
+        }
+
+        /*
+         * The open-boundary refresh above applied a record read BEFORE
+         * this node was published as an opener. A peer that wrote and
+         * closed in that gap saw no opener and never flagged this
+         * node's view, so the record applied is stale for the fd's
+         * life (audit 2026-11-14 L-F4). Now that this node is visible,
+         * re-read it and apply the same refresh again -- under the same
+         * gate: the first local opener, and a publish by a peer.
+         */
+        if (!want_write && atomic_read(&ci->lock_local_open_count) == 1 &&
+            !READ_ONCE(cetrafs_lock_open_reapply_off)) {
+            /* 'raw' is read into again: nothing past here reads the old
+             * copy (a second cetrafs_inode_t would overflow the frame). */
+            u64 gen = cetrafs_le64(raw.generation);
+            int fret;
+
+            cetrafs_invalidate_raw_inode(sb, inode->i_ino);
+            fret = cetrafs_read_raw_inode(sb, inode->i_ino, &raw);
+            if (!fret && cetrafs_le64(raw.generation) != gen)
+                fret = -ESTALE;
+            if (!fret && CETRAFS_FILE_SEQ_NODE(cetrafs_le64(raw.file_seq)) != (u32) (my_node_id & 0xFFFFu))
+                fret = cetrafs_apply_raw_to_vfs_inode_sure(inode, &raw);
+            if (fret && fret != -EUCLEAN) { /* -EUCLEAN: a type change, ignored as the refresh above does */
+                /* Not a view to open on: withdraw the presence just taken. */
+                atomic_dec(&ci->read_opener_count);
+                atomic_dec(&ci->lock_local_open_count);
+                cetrafs_lock_presence_withdraw(inode);
+                ret = fret;
+                goto out_pr_unlock;
+            }
         }
     }
 
