@@ -7022,6 +7022,20 @@ long cetrafs_falloc_alloc_call_count(void)
     return atomic_long_read(&cetrafs_falloc_alloc_calls);
 }
 
+/* FD-8: the planner walks the old tree's extent map (cetrafs_falloc_map)
+ * instead of looking every block up in it. TEST ONLY falloc_lookup_per_block
+ * restores the per-block tree lookup (the control of
+ * tests/kernel/fallocate_map_walk.sh). fallocate_tree_lookups counts the
+ * lookups the planner made, which is what that suite measures. */
+static bool cetrafs_falloc_lookup_per_block;
+cetrafs_test_param(falloc_lookup_per_block, cetrafs_falloc_lookup_per_block, bool, 0644);
+MODULE_PARM_DESC(falloc_lookup_per_block, "TEST ONLY: fallocate looks every block up in the tree, as before FD-8");
+static atomic_long_t cetrafs_falloc_tree_lookups = ATOMIC_LONG_INIT(0);
+long cetrafs_falloc_tree_lookup_count(void)
+{
+    return atomic_long_read(&cetrafs_falloc_tree_lookups);
+}
+
 /*
  * Test-only: slow the per-block allocation loop down.
  *
@@ -7128,6 +7142,98 @@ static void cetrafs_falloc_run_give_back_span(struct super_block *sb, u64 lba, u
         (void) cetrafs_free_data_extent(sb, lba, n);
 }
 
+/*
+ * FD-8: the old tree's mapped extents inside the call's range, sorted by
+ * logical block and read ONCE per call. The planner used to look each
+ * block up in the tree -- a leaf scan under the buffer lock, per block --
+ * and a run claimed 255 blocks past each new one whether or not a mapped
+ * block cut it short, the overhang then given back. With the map, a hole
+ * is walked from its start to the next mapped block and a run never
+ * crosses one. The tree is not changed until the publish, so the snapshot
+ * stays true for the whole plan. Each entry is checked as the lookup
+ * checked a found block (cetrafs_tree_lookup()).
+ */
+struct cetrafs_falloc_map {
+    cetrafs_extent_t *v;
+    u32 n;
+};
+
+static int cetrafs_falloc_map_cmp(const void *a, const void *b)
+{
+    u32 ea = cetrafs_le32(((const cetrafs_extent_t *) a)->ee_block);
+    u32 eb = cetrafs_le32(((const cetrafs_extent_t *) b)->ee_block);
+
+    return ea < eb ? -1 : ea > eb;
+}
+
+static u64 cetrafs_falloc_map_start(const cetrafs_extent_t *e)
+{
+    return cetrafs_le32(e->ee_block);
+}
+
+static u64 cetrafs_falloc_map_end(const cetrafs_extent_t *e)
+{
+    return cetrafs_le32(e->ee_block) + cetrafs_extent_len(e->ee_len);
+}
+
+static void cetrafs_falloc_map_free(struct cetrafs_falloc_map *m)
+{
+    kvfree(m->v);
+    m->v = NULL;
+    m->n = 0;
+}
+
+static int cetrafs_falloc_map_build(struct inode *inode, const cetrafs_inode_t *raw, u64 start_block, u64 end_block,
+                                    struct cetrafs_falloc_map *m)
+{
+    struct super_block *sb = inode->i_sb;
+    struct cetrafs_inode_extents ex;
+    u32 i, k = 0;
+    int ret;
+
+    m->v = NULL;
+    m->n = 0;
+    ret = cetrafs_inode_extents_get(inode, raw, &ex);
+    if (ret)
+        return ret;
+    m->v = kvmalloc_array(ex.entries ? ex.entries : 1, sizeof(*m->v), GFP_NOFS);
+    if (!m->v) {
+        cetrafs_inode_extents_put(&ex);
+        return -ENOMEM;
+    }
+    for (i = 0; i < ex.entries; i++) {
+        const cetrafs_extent_t *e = &ex.arr[i];
+        u64 lba = cetrafs_extent_phys_from_hilo(e->ee_start_hi, e->ee_start_lo);
+        u64 run = cetrafs_extent_len(e->ee_len);
+
+        if (!run || cetrafs_falloc_map_end(e) <= start_block || cetrafs_falloc_map_start(e) >= end_block)
+            continue;
+        /* The same check cetrafs_tree_lookup() makes of a block it found. */
+        ret = cetrafs_lba_run_check(sb, lba, run);
+        if (ret == -EAGAIN) {
+            ret = -EIO; /* past a layout this node cannot catch up with: not damage */
+            goto out;
+        }
+        if (ret) {
+            pr_err_ratelimited("ino=%llu: extent [%llu,+%llu) maps to [%llu,+%llu), which is not a data address -- refusing it (fsck)\n",
+                               (unsigned long long) inode->i_ino, (unsigned long long) cetrafs_falloc_map_start(e),
+                               (unsigned long long) run, (unsigned long long) lba, (unsigned long long) run);
+            cetrafs_sb_corrupt_inode(inode);
+            ret = -EUCLEAN;
+            goto out;
+        }
+        m->v[k++] = *e;
+    }
+    m->n = k;
+    sort(m->v, k, sizeof(*m->v), cetrafs_falloc_map_cmp, NULL);
+    ret = 0;
+out:
+    cetrafs_inode_extents_put(&ex);
+    if (ret)
+        cetrafs_falloc_map_free(m);
+    return ret;
+}
+
 static void cetrafs_falloc_run_give_back(struct super_block *sb, u64 *lba, u32 *left)
 {
     cetrafs_falloc_run_give_back_span(sb, *lba, *left);
@@ -7213,9 +7319,19 @@ static int cetrafs_do_allocate(struct inode *inode, loff_t offset, loff_t len, b
     tree_cap = cetrafs_tree_max_extents();
     u64 run_lba = 0; /* blocks claimed for a run and not yet used */
     u32 run_left = 0, run_bg = 0;
+    bool per_block = READ_ONCE(cetrafs_falloc_lookup_per_block);
+    struct cetrafs_falloc_map map = {0};
+    u32 mi = 0; /* the first map entry that does not end before b */
+
+    if (!per_block) {
+        ret = cetrafs_falloc_map_build(inode, &raw, start_block, end_block, &map);
+        if (ret)
+            goto out_free;
+    }
 
     for (b = start_block; b < end_block; b++) {
         bool found = false, un = false;
+        u64 hole_end = end_block; /* the hole at b ends here: next mapped block or range end */
         u32 bg_id;
         u64 lba;
 
@@ -7240,9 +7356,22 @@ static int cetrafs_do_allocate(struct inode *inode, loff_t offset, loff_t len, b
             usleep_range(cetrafs_fallocate_block_delay_us, cetrafs_fallocate_block_delay_us * 2);
 
         /* Looked up in the OLD tree, which nothing here changes. */
-        loop_ret = cetrafs_tree_lookup(inode, &raw, (u32) b, &lba, NULL, &un, &found, false);
-        if (loop_ret)
-            break;
+        if (per_block) {
+            loop_ret = cetrafs_tree_lookup(inode, &raw, (u32) b, &lba, NULL, &un, &found, false);
+            if (loop_ret)
+                break;
+            atomic_long_inc(&cetrafs_falloc_tree_lookups);
+        } else {
+            while (mi < map.n && cetrafs_falloc_map_end(&map.v[mi]) <= b)
+                mi++;
+            if (mi < map.n && cetrafs_falloc_map_start(&map.v[mi]) <= b) {
+                found = true;
+                /* Its whole extent is backed: nothing in it needs a look. */
+                b = cetrafs_falloc_map_end(&map.v[mi]) - 1;
+            } else if (mi < map.n) {
+                hole_end = min_t(u64, end_block, cetrafs_falloc_map_start(&map.v[mi]));
+            }
+        }
         if (found) {
             /* A run claimed past this block cannot be used across it. */
             cetrafs_falloc_run_give_back(sb, &run_lba, &run_left);
@@ -7269,8 +7398,9 @@ static int cetrafs_do_allocate(struct inode *inode, loff_t offset, loff_t len, b
             }
             if (loop_ret)
                 break;
-            if (!READ_ONCE(cetrafs_falloc_run_off) && end_block - b > 1) {
-                u32 want = (u32) min_t(u64, CETRAFS_FALLOC_RUN - 1, end_block - b - 1);
+            /* The run stays in this hole: a mapped block after b ends it. */
+            if (!READ_ONCE(cetrafs_falloc_run_off) && hole_end - b > 1) {
+                u32 want = (u32) min_t(u64, CETRAFS_FALLOC_RUN - 1, hole_end - b - 1);
                 u32 got;
 
                 atomic_long_inc(&cetrafs_falloc_alloc_calls);
@@ -7459,6 +7589,7 @@ out_free:
     /* Published (the record names them) or given back (above): either
      * way the registry has nothing left to hold for the scrub. */
     cetrafs_falloc_resv_drop(sb, &resv);
+    cetrafs_falloc_map_free(&map);
     kvfree(flat);
     kvfree(add);
     kfree(recs);

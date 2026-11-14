@@ -976,6 +976,7 @@ int cetrafs_alloc_block_anywhere(struct super_block *sb, u32 *out_bg, u64 *out_l
 int cetrafs_alloc_data_run(struct super_block *sb, u32 bg_id, u64 count, u64 *out_lba);
 u32 cetrafs_alloc_run_after(struct super_block *sb, u32 bg_id, u64 start_lba, u32 max);
 long cetrafs_falloc_alloc_call_count(void); /* file.c: allocator calls made by fallocate */
+long cetrafs_falloc_tree_lookup_count(void); /* file.c: tree lookups the fallocate planner made */
 int cetrafs_free_data_extent(struct super_block *sb, u64 lba, u32 count);
 
 /* Foreign frees gathered by one operation and queued as one batch

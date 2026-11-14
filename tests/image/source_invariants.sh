@@ -2610,6 +2610,7 @@ C53_REG='cetrafs_defrag_read_extents moves:defrag-relocates-by-it
 cetrafs_do_allocate writes:fallocate-plans-and-publishes-extents
 cetrafs_evict_inode frees:every-block-it-names
 cetrafs_fallocate writes:punch-and-collapse-rebuild-the-tree
+cetrafs_falloc_map_build writes:the-plan-the-publish-is-built-over
 cetrafs_free_inline_extents frees:a-directorys-blocks
 cetrafs_read_index_bh wraps:cetrafs_read_tree_bh
 cetrafs_read_leaf_bh wraps:cetrafs_read_tree_bh
