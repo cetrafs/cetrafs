@@ -201,6 +201,11 @@
 #define CETRAFS_XATTR_VALUE_MAX      256
 
 #define CETRAFS_MAX_ZONE_GROUPS      255U
+/* The most Block Groups a volume may have. A mount sizes its in-core layout
+ * by the count before reading a single descriptor, so a count the format
+ * cannot justify is refused first (audit F4). 2^20 is 512 TiB at the default
+ * Block Group size. */
+#define CETRAFS_MAX_BLOCK_GROUPS     (1U << 20)
 
 /* Default BG sizing (mkfs can override sb.bg_size_blocks) */
 #define CETRAFS_DEFAULT_BG_SIZE_BYTES  (1ULL << 30) /* 1 GiB */

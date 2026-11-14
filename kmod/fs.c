@@ -993,6 +993,8 @@ static struct cetrafs_bg_layout *cetrafs_layout_alloc(const cetrafs_superblock_t
 
     if (prev && nbg < prev->bg_count)
         return NULL; /* a layout never loses Block Groups; the caller refuses first */
+    if (nbg > CETRAFS_MAX_BLOCK_GROUPS)
+        return NULL; /* every path that sizes a layout by the count: the mount refuses it first (F4) */
     l = kvzalloc(struct_size(l, chunk, nchunks), GFP_KERNEL);
     if (!l)
         return NULL;
@@ -1740,6 +1742,13 @@ static int cetrafs_validate_layout(const cetrafs_superblock_t *sb, u64 total_blo
      * volume has a hole where a superseded tail reserve used to be, so
      * bg_cnt * bg_size_blocks is no longer its extent (cetrafs.h). A
      * never-grown volume keeps the exact computed span. */
+    /* Refused before the layout is sized by it: the mount allocates per
+     * Block Group before it reads any descriptor (audit F4). */
+    if (bg_cnt > CETRAFS_MAX_BLOCK_GROUPS) {
+        pr_err("superblock: %llu Block Groups exceeds the format's %u\n", (unsigned long long) bg_cnt,
+               CETRAFS_MAX_BLOCK_GROUPS);
+        return -EINVAL;
+    }
     {
         u64 data_start = le64_to_cpu(sb->bg_regions_start);
         u64 data_end = le64_to_cpu(sb->bg_data_end);
