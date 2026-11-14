@@ -702,6 +702,40 @@ static bool cetrafs_dir_walk_no_copy;
 cetrafs_test_param(dir_walk_no_copy, cetrafs_dir_walk_no_copy, bool, 0644);
 MODULE_PARM_DESC(dir_walk_no_copy, "TEST ONLY: readdir and lookup read the live dirent buffer");
 
+/*
+ * A fatal signal stops a directory scan (RT-3: its length is the disk's)
+ * -- except inside an UNDO. A rename that already took a directory's old
+ * name away gives it back through the same scans, and a SIGKILL there
+ * left the directory with no name at all (it used to fail only on a
+ * device error). The undo registers the task for its duration; a
+ * forward scan stays killable. Looked up only once a fatal signal is
+ * pending, so the scans pay nothing for it.
+ */
+static DEFINE_XARRAY(cetrafs_dir_undo_tasks);
+
+static bool cetrafs_dir_killed(void)
+{
+    return fatal_signal_pending(current) && !xa_load(&cetrafs_dir_undo_tasks, (unsigned long) current);
+}
+
+static void cetrafs_dir_undo_begin(void)
+{
+    /* Cannot fail for want of memory in a way that matters: without the
+     * entry the undo is merely killable again, as before the fix. */
+    xa_store(&cetrafs_dir_undo_tasks, (unsigned long) current, current, GFP_NOFS);
+}
+
+static void cetrafs_dir_undo_end(void)
+{
+    xa_erase(&cetrafs_dir_undo_tasks, (unsigned long) current);
+}
+
+/* TEST ONLY: deliver the rename undo a pending SIGKILL check as before the
+ * fix -- the control of tests/kernel/rename_undo_sigkill.sh. */
+static bool cetrafs_rename_undo_killable;
+cetrafs_test_param(rename_undo_killable, cetrafs_rename_undo_killable, bool, 0644);
+MODULE_PARM_DESC(rename_undo_killable, "TEST ONLY: a SIGKILL also stops a rename's undo");
+
 /* TEST ONLY: a stale directory is re-read block by block by each walk,
  * as before audit 2026-11-14 P6 -- the control of
  * tests/kernel/dir_refresh_whole.sh. */
@@ -721,7 +755,7 @@ static noinline_for_stack int cetrafs_dir_refresh_whole(struct inode *dir, const
 
         for (b = 0; b < len; b += n) {
             cond_resched();
-            if (fatal_signal_pending(current))
+            if (cetrafs_dir_killed())
                 return -EINTR; /* RT-3: the count is the disk's */
             n = min_t(u32, len - b, ARRAY_SIZE(bhs));
             if (cetrafs_bread_uncached_batch(dir->i_sb, phys + b, n, bhs))
@@ -824,7 +858,7 @@ static int cetrafs_walk_dirents_from(struct inode *dir, cetrafs_dirent_visit_fn 
             unsigned int tries;
 
             cond_resched(); /* O(blocks) per pass, whatever their content */
-            if (fatal_signal_pending(current)) { /* RT-3: the count is the disk's */
+            if (cetrafs_dir_killed()) { /* RT-3: the count is the disk's */
                 ret = -EINTR;
                 goto out;
             }
@@ -975,7 +1009,7 @@ static int cetrafs_dir_scan_for_slot(struct inode *dir,
             unsigned int e;
 
             cond_resched();
-            if (fatal_signal_pending(current))
+            if (cetrafs_dir_killed())
                 return -EINTR; /* RT-3: the count is the disk's */
             sbh = cetrafs_dirent_read(dir->i_sb, phys + b, fresh);
 
@@ -1292,7 +1326,7 @@ int cetrafs_dir_remove_entry(struct inode *dir, const struct qstr *name, u64 exp
             unsigned int e;
 
             cond_resched();
-            if (fatal_signal_pending(current)) { /* RT-3: the count is the disk's */
+            if (cetrafs_dir_killed()) { /* RT-3: the count is the disk's */
                 cetrafs_dir_extents_put(&dx);
                 return -EINTR;
             }
@@ -1437,7 +1471,7 @@ int cetrafs_dir_update_dotdot(struct inode *dir, u64 new_parent_ino)
             unsigned int e;
 
             cond_resched();
-            if (fatal_signal_pending(current)) { /* RT-3: the count is the disk's */
+            if (cetrafs_dir_killed()) { /* RT-3: the count is the disk's */
                 cetrafs_dir_extents_put(&dx);
                 return -EINTR;
             }
@@ -1555,7 +1589,7 @@ static int cetrafs_dir_retarget_entry(struct inode *dir,
             unsigned int e;
 
             cond_resched();
-            if (fatal_signal_pending(current)) { /* RT-3: the count is the disk's */
+            if (cetrafs_dir_killed()) { /* RT-3: the count is the disk's */
                 cetrafs_dir_extents_put(&dx);
                 return -EINTR;
             }
@@ -3280,6 +3314,9 @@ static int cetrafs_rename_dotdot(struct inode *dir, u64 parent_ino)
     return cetrafs_dir_update_dotdot(dir, parent_ino);
 }
 
+static void cetrafs_rename_undo_rest(struct inode *old_dir, struct inode *new_dir, struct inode *old_inode, u64 old_ino,
+                                     u64 old_gen, time64_t now, bool counted, bool dotdot_moved);
+
 static int cetrafs_rename_locked(struct mnt_idmap *idmap,
                                  struct inode *old_dir,
                                  struct dentry *old_dentry,
@@ -3291,7 +3328,7 @@ static int cetrafs_rename_locked(struct mnt_idmap *idmap,
 {
     struct inode *old_inode = d_inode(old_dentry);
     struct inode *new_inode = target;
-    u64 old_ino, discard_ino, old_gen;
+    u64 old_ino, discard_ino, old_gen = 0;
     bool counted = false;
     bool dotdot_moved = false;
     bool removed_first = false;
@@ -3695,19 +3732,40 @@ out_unremove:
      * need room the directory does not have; if it fails anyway the
      * directory has no name at all, and says so -- fsck finds it and
      * links it into /lost+found, contents intact. */
+    /* The undo is not interruptible: a SIGKILL that stopped the forward
+     * step must not also stop the step that puts things back. */
+    if (!READ_ONCE(cetrafs_rename_undo_killable))
+        cetrafs_dir_undo_begin();
     if (removed_first) {
         int rret = cetrafs_dir_add_entry(old_dir, &old_dentry->d_name, old_ino, old_file_type);
 
-        if (rret) {
+        /* Failed anyway (a device error): the directory has no name, and
+         * the count and '..' below are still given back -- fsck then
+         * finds a consistent orphan to link into /lost+found. */
+        if (rret)
             pr_err("rename: directory ino=%llu lost its name '%*pE' in ino=%llu and could neither take the new one "
                    "(%d) nor get the old one back (%d) -- it is unnamed until fsck links it into /lost+found\n",
                    (unsigned long long) old_ino, (int) old_dentry->d_name.len, old_dentry->d_name.name,
                    (unsigned long long) old_dir->i_ino, ret, rret);
-            return ret;
-        }
     }
+    cetrafs_rename_undo_rest(old_dir, new_dir, old_inode, old_ino, old_gen, now, counted, dotdot_moved);
+    if (!READ_ONCE(cetrafs_rename_undo_killable))
+        cetrafs_dir_undo_end();
+    return ret;
+
 out_uncount:
-    /* The new name never landed: give the count back, and the '..'. */
+    if (!READ_ONCE(cetrafs_rename_undo_killable))
+        cetrafs_dir_undo_begin();
+    cetrafs_rename_undo_rest(old_dir, new_dir, old_inode, old_ino, old_gen, now, counted, dotdot_moved);
+    if (!READ_ONCE(cetrafs_rename_undo_killable))
+        cetrafs_dir_undo_end();
+    return ret;
+}
+
+/* The new name never landed: give the count back, and the '..'. */
+static void cetrafs_rename_undo_rest(struct inode *old_dir, struct inode *new_dir, struct inode *old_inode, u64 old_ino,
+                                     u64 old_gen, time64_t now, bool counted, bool dotdot_moved)
+{
     if (counted)
         cetrafs_nlink_giveback(old_dir->i_sb, old_inode, old_gen, now, "rename: un-moved file");
     if (dotdot_moved) {
@@ -3719,7 +3777,6 @@ out_uncount:
                    (unsigned long long) old_ino, (unsigned long long) old_dir->i_ino,
                    (unsigned long long) new_dir->i_ino, dret);
     }
-    return ret;
 }
 
 /*
