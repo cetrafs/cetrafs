@@ -630,8 +630,9 @@ int main(int argc, char **argv)
 
         u64 cand_b = (u64) old_b + added;
 
-        if (cand_b > UINT32_MAX)
-            die("%s: %" PRIu64 " Block Groups exceeds the 32-bit block_group_count", dev, cand_b);
+        if (cand_b > CETRAFS_MAX_BLOCK_GROUPS)
+            die("%s: %" PRIu64 " Block Groups exceed the %u a volume may have (the mount refuses more)", dev, cand_b,
+                CETRAFS_MAX_BLOCK_GROUPS);
 
         /*
          * Zone Group policy: keep roughly the BGs-per-ZG ratio the

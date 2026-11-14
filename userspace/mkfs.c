@@ -825,6 +825,11 @@ int main(int argc, char **argv)
                 if (b_512m > 0 && (b_1g == 0 || waste_512m < waste_1g))
                     bg_size_bytes = 512ULL * 1024 * 1024;
             }
+            /* Past 1 PiB the default would exceed the Block Group count
+             * the mount accepts: double it until it fits. */
+            while (total_blocks / (bg_size_bytes / CETRAFS_BLOCK_SIZE) > CETRAFS_MAX_BLOCK_GROUPS &&
+                   bg_size_bytes / CETRAFS_BLOCK_SIZE * 2 <= CETRAFS_MAX_BG_SIZE_BLOCKS)
+                bg_size_bytes *= 2;
         }
 
         bg_size_blocks = bg_size_bytes / CETRAFS_BLOCK_SIZE;
@@ -833,6 +838,15 @@ int main(int argc, char **argv)
         B = cetrafs_solve_bg_count(total_blocks, fixed_wo_B, bg_size_blocks, &waste);
         if (B == 0)
             die("no space for any BG (increase device or reduce -b/-J/-N)");
+        /* The mount refuses more (kmod/fs.c), so a volume past it would
+         * be written and then unmountable. Name the -b that fits. */
+        if (B > CETRAFS_MAX_BLOCK_GROUPS) {
+            u64 need = (total_blocks * (u64) CETRAFS_BLOCK_SIZE / CETRAFS_MAX_BLOCK_GROUPS + (1ULL << 20) - 1) >> 20;
+
+            die("%" PRIu64 " Block Groups of %llu MiB exceed the %u a volume may have -- pass -b %llu or more", B,
+                (unsigned long long) (bg_size_blocks * CETRAFS_BLOCK_SIZE >> 20), CETRAFS_MAX_BLOCK_GROUPS,
+                (unsigned long long) need);
+        }
 
         if (B >= zg_count)
             break;
