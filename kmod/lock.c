@@ -117,6 +117,13 @@ struct cetrafs_inode_info {
                                      * the on-disk presence bit is set on 0->1 and cleared on
                                      * 1->0, so repeated local opens cost nothing on the wire */
     atomic_t lock_local_open_count; /* this node's local open refcount, read+write alike */
+    /* Tree blocks reserved for one convert that must append through the
+     * tree after shrinking a full leaf (cetrafs_tree_resv_fill()). Under
+     * invalidate_lock held exclusively; empty outside cetrafs_tree_convert(). */
+    u64 tree_resv_lba[4]; /* two appends: the written block, the tail */
+    u32 tree_resv_bg[4];
+    unsigned int tree_resv_n;
+    bool tree_in_convert_append; /* test-only: cetrafs_convert_append_nospc */
     /*
      * Speculative allocation reservation: a contiguous run claimed in
      * the bitmap ahead of need and handed out one block at a time by
@@ -1338,6 +1345,8 @@ static void cetrafs_tree_mark_cold_ci(struct cetrafs_inode_info *ci)
  */
 static void cetrafs_inode_identity_init_ci(struct cetrafs_inode_info *ci)
 {
+    WARN_ON_ONCE(ci->tree_resv_n);
+    ci->tree_resv_n = 0;
     ci->fd_dirty = false;
     ci->fd_seq = 0;
     ci->resv_next = 0;
@@ -1635,6 +1644,74 @@ void cetrafs_pending_clear(struct inode *inode, u32 first, u32 last)
         return;
     lockdep_assert_held_write(&inode->i_mapping->invalidate_lock);
     mtree_store_range(&ci->pending, first, last, NULL, GFP_NOFS | __GFP_NOFAIL);
+}
+
+/*
+ * Reserve the blocks a tree append may need -- a leaf and an interior --
+ * BEFORE a convert shrinks a full leaf to hand its block to that append.
+ * Allocated after the shrink, a full volume failed the append and left
+ * the written block in no extent: data on the device, a hole in the map
+ * (audit 2026-11-14 FD-1). Reserved first, ENOSPC fails the convert
+ * with nothing edited, and the block stays pending for a later boundary.
+ * The blocks are set and unreferenced while held -- a few microseconds,
+ * the window every tree append already has between its allocation and
+ * its publish. Caller holds invalidate_lock exclusively.
+ */
+/* TEST ONLY: a tree append made for a convert finds the volume full --
+ * the reserve (fixed order) or the append itself (tree_resv_off, the
+ * old order). tests/kernel/convert_append_nospc.sh. */
+bool cetrafs_convert_append_nospc;
+cetrafs_test_param(convert_append_nospc, cetrafs_convert_append_nospc, bool, 0644);
+MODULE_PARM_DESC(convert_append_nospc, "TEST ONLY: tree blocks for a convert's append fail with ENOSPC");
+
+int cetrafs_tree_resv_fill(struct inode *inode)
+{
+    struct cetrafs_inode_info *ci = CETRAFS_I(inode);
+
+    if (READ_ONCE(cetrafs_convert_append_nospc))
+        return -ENOSPC;
+    while (ci->tree_resv_n < ARRAY_SIZE(ci->tree_resv_lba)) {
+        int ret = cetrafs_alloc_block_anywhere(inode->i_sb, &ci->tree_resv_bg[ci->tree_resv_n],
+                                               &ci->tree_resv_lba[ci->tree_resv_n]);
+
+        if (ret)
+            return ret;
+        ci->tree_resv_n++;
+    }
+    return 0;
+}
+
+/* A tree block for an append: a reserved one first. */
+int cetrafs_tree_alloc_block(struct inode *inode, u32 *bg, u64 *lba)
+{
+    struct cetrafs_inode_info *ci = CETRAFS_I(inode);
+
+    if (READ_ONCE(cetrafs_convert_append_nospc) && ci->tree_in_convert_append)
+        return -ENOSPC; /* test-only; see the parameter */
+    if (ci->tree_resv_n) {
+        ci->tree_resv_n--;
+        *bg = ci->tree_resv_bg[ci->tree_resv_n];
+        *lba = ci->tree_resv_lba[ci->tree_resv_n];
+        return 0;
+    }
+    return cetrafs_alloc_block_anywhere(inode->i_sb, bg, lba);
+}
+
+void cetrafs_tree_mark_convert_append(struct inode *inode, bool on)
+{
+    CETRAFS_I(inode)->tree_in_convert_append = on;
+}
+
+/* Give back what the convert did not use: never referenced by anything,
+ * so free at once. */
+void cetrafs_tree_resv_release(struct inode *inode)
+{
+    struct cetrafs_inode_info *ci = CETRAFS_I(inode);
+
+    while (ci->tree_resv_n) {
+        ci->tree_resv_n--;
+        cetrafs_free_data_block(inode->i_sb, ci->tree_resv_lba[ci->tree_resv_n]);
+    }
 }
 
 /* Forget every pending block, converting none: they keep reading as

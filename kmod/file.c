@@ -46,6 +46,10 @@
  * return code. Every later convert path inherits that for free.
  */
 #define CETRAFS_CONVERT_APPEND 1
+/* The convert would have to append through the tree, and the caller has
+ * not reserved the blocks for that yet (cetrafs_tree_resv_fill()): nothing
+ * was modified. Internal, like CETRAFS_CONVERT_APPEND. */
+#define CETRAFS_CONVERT_NEED_ROOM 2
 
 /* Debug-only timing: the per-new-block allocation path below is
  * node-exclusive by design (zonegroup.c's cetrafs_alloc_pick_bg() and
@@ -2549,10 +2553,18 @@ static bool cetrafs_leaf_array_coalesce(cetrafs_extent_t *arr, u16 *np, u32 iblo
 
 /* A preallocated remainder a full leaf could not keep: the caller
  * appends it through the tree as an uninit extent. len 0 = none. */
+/* TEST ONLY: shrink a full leaf before the append's blocks are reserved,
+ * as before audit 2026-11-14 FD-1 -- the control of
+ * tests/kernel/convert_append_nospc.sh. */
+static bool cetrafs_tree_resv_off;
+cetrafs_test_param(tree_resv_off, cetrafs_tree_resv_off, bool, 0644);
+MODULE_PARM_DESC(tree_resv_off, "TEST ONLY: a convert shrinks a full leaf without reserving the append's blocks");
+
 struct cetrafs_convert_tail {
     u32 block;
     u64 lba;
     u32 len;
+    bool may_append; /* the tree blocks for an append are reserved */
 };
 
 static int cetrafs_leaf_array_convert(struct super_block *sb,
@@ -2684,9 +2696,13 @@ static int cetrafs_leaf_array_convert(struct super_block *sb,
             /* Rare path (leaf full). Stay single-block here: the run
              * optimisation below is what carries the common case, and
              * the append this hands back converts one block. */
-            atomic64_inc(&cetrafs_convert_leaf_full);
             count = 1;
             tail = len - head - 1;
+            /* Every branch below but the first appends through the tree:
+             * its blocks reserved before anything here is touched. */
+            if (len != 1 && !tail_out->may_append && !READ_ONCE(cetrafs_tree_resv_off))
+                return CETRAFS_CONVERT_NEED_ROOM;
+            atomic64_inc(&cetrafs_convert_leaf_full);
 
             if (len == 1) {
                 /* The extent was only this block: dropping it FREES a
@@ -2728,6 +2744,8 @@ static int cetrafs_leaf_array_convert(struct super_block *sb,
         if (middle) {
             u32 head = iblock - eb;
 
+            if (n + 2 > max && !tail_out->may_append && !READ_ONCE(cetrafs_tree_resv_off))
+                return CETRAFS_CONVERT_NEED_ROOM; /* the append below, reserved first */
             arr[i].ee_len = cetrafs_extent_pack_len(head, true);
 
             if (n + 2 <= max) {
@@ -3958,7 +3976,9 @@ static int cetrafs_tree_convert_append(struct inode *inode,
     u32 leaf_count = 0;
     int ret, tret = 0;
 
+    cetrafs_tree_mark_convert_append(inode, true);
     ret = cetrafs_tree_append(inode, raw, iblock, lba, 1, /*uninit=*/false, &merged, &leaf_count);
+    cetrafs_tree_mark_convert_append(inode, false);
     if (!ret && tail->len)
         tret = cetrafs_tree_append(inode, raw, tail->block, tail->lba, tail->len, /*uninit=*/true, &merged,
                                    &leaf_count);
@@ -4452,6 +4472,14 @@ static int cetrafs_tree_convert_inner(struct inode *inode,
     if (raw->eh.eh_depth == 0) {
         ret = cetrafs_leaf_array_convert(sb, raw->et.leaf, &raw->eh.eh_entries, (u16) ARRAY_SIZE(raw->et.leaf), iblock,
                                          lba, want, done, &tail);
+        if (ret == CETRAFS_CONVERT_NEED_ROOM) {
+            ret = cetrafs_tree_resv_fill(inode);
+            if (ret)
+                return ret;
+            tail.may_append = true;
+            ret = cetrafs_leaf_array_convert(sb, raw->et.leaf, &raw->eh.eh_entries, (u16) ARRAY_SIZE(raw->et.leaf),
+                                             iblock, lba, want, done, &tail);
+        }
         if (ret == CETRAFS_CONVERT_APPEND)
             return cetrafs_tree_convert_append(inode, raw, (u32) iblock, lba, &tail);
         return ret;
@@ -4459,9 +4487,11 @@ static int cetrafs_tree_convert_inner(struct inode *inode,
 
     if (cetrafs_le16(raw->eh.eh_depth) == 1) {
         u64 llba = cetrafs_extent_phys_from_hilo(raw->et.idx[0].ei_leaf_hi, raw->et.idx[0].ei_leaf_lo);
-        struct buffer_head *lbh = cetrafs_read_leaf_bh(inode, llba);
+        struct buffer_head *lbh;
         cetrafs_extent_hdr_t *lhdr;
 
+retry1:
+        lbh = cetrafs_read_leaf_bh(inode, llba);
         if (!lbh)
             return -EIO;
         /* Full enough that the convert may shrink here and append the
@@ -4472,6 +4502,15 @@ static int cetrafs_tree_convert_inner(struct inode *inode,
         lhdr = (cetrafs_extent_hdr_t *) lbh->b_data;
         ret = cetrafs_leaf_array_convert(sb, (cetrafs_extent_t *) (lbh->b_data + sizeof(*lhdr)), &lhdr->eh_entries,
                                          CETRAFS_EXT_BLOCK_MAX_LEAVES, iblock, lba, want, done, &tail);
+        if (ret == CETRAFS_CONVERT_NEED_ROOM) {
+            cetrafs_bh_abort_update(lbh);
+            brelse(lbh);
+            ret = cetrafs_tree_resv_fill(inode);
+            if (ret)
+                return ret;
+            tail.may_append = true;
+            goto retry1;
+        }
         if (ret && ret != CETRAFS_CONVERT_APPEND) {
             cetrafs_bh_abort_update(lbh);
             brelse(lbh);
@@ -4591,6 +4630,16 @@ again:
                 brelse(lbh);
                 continue; /* not in this leaf; try the next */
             }
+            if (ret == CETRAFS_CONVERT_NEED_ROOM) {
+                cetrafs_bh_abort_update(lbh);
+                brelse(lbh);
+                brelse(ibh);
+                ret = cetrafs_tree_resv_fill(inode);
+                if (ret)
+                    return ret;
+                tail.may_append = true;
+                goto again;
+            }
             if (ret && ret != CETRAFS_CONVERT_APPEND) {
                 cetrafs_bh_abort_update(lbh);
                 brelse(lbh);
@@ -4700,6 +4749,9 @@ static int cetrafs_tree_convert(struct inode *inode, cetrafs_inode_t *raw, u32 i
     if (ret)
         return ret;
     ret = cetrafs_tree_convert_inner(inode, raw, iblock, lba, want, done, moving);
+    cetrafs_tree_resv_release(inode); /* what an append did not take */
+    if (WARN_ON_ONCE(ret == CETRAFS_CONVERT_NEED_ROOM))
+        ret = -EIO;
     if (ret == 0 && *done == 0)
         *done = 1; /* belt: a path that converted without saying so */
 
@@ -4863,7 +4915,7 @@ static int cetrafs_tree_append(struct inode *inode,
             cetrafs_extent_t tmp[ARRAY_SIZE(raw->et.leaf) + 1];
             u16 n = min_t(u16, before, ARRAY_SIZE(raw->et.leaf));
 
-            ret = cetrafs_alloc_block_anywhere(sb, &ext_bg, &new_leaf);
+            ret = cetrafs_tree_alloc_block(inode, &ext_bg, &new_leaf);
             if (ret)
                 return ret;
 
@@ -4986,10 +5038,10 @@ static int cetrafs_tree_append(struct inode *inode,
             one.ee_len = cetrafs_extent_pack_len(count, uninit);
             cetrafs_extent_phys_to_hilo(lba, &one.ee_start_hi, &one.ee_start_lo);
 
-            ret = cetrafs_alloc_block_anywhere(sb, &bg, &new_leaf);
+            ret = cetrafs_tree_alloc_block(inode, &bg, &new_leaf);
             if (ret)
                 return ret;
-            ret = cetrafs_alloc_block_anywhere(sb, &bg, &new_idx);
+            ret = cetrafs_tree_alloc_block(inode, &bg, &new_idx);
             if (ret) {
                 cetrafs_free_data_block(sb, new_leaf);
                 return ret;
@@ -5206,7 +5258,7 @@ static int cetrafs_tree_append(struct inode *inode,
             one.ee_len = cetrafs_extent_pack_len(count, uninit);
             cetrafs_extent_phys_to_hilo(lba, &one.ee_start_hi, &one.ee_start_lo);
 
-            ret = cetrafs_alloc_block_anywhere(sb, &bg, &new_leaf);
+            ret = cetrafs_tree_alloc_block(inode, &bg, &new_leaf);
             if (ret) {
                 brelse(ibh);
                 return ret;
@@ -5276,7 +5328,7 @@ static int cetrafs_tree_append(struct inode *inode,
                 u64 new_idx;
                 cetrafs_extent_idx_t idx1;
 
-                ret = cetrafs_alloc_block_anywhere(sb, &bg, &new_idx);
+                ret = cetrafs_tree_alloc_block(inode, &bg, &new_idx);
                 if (ret) {
                     cetrafs_free_data_block(sb, new_leaf);
                     return ret;
@@ -5685,8 +5737,16 @@ relookup:
     }
     if (!create)
         return 0; /* hole: leave unmapped, reader sees zeros */
-    if (mode == CETRAFS_GB_CONVERT_PENDING)
-        return 0; /* nothing left to convert; the caller steps one block */
+    if (mode == CETRAFS_GB_CONVERT_PENDING) {
+        /* A pending block is one a buffered write put data in, and
+         * truncate and punch take theirs out of the set: a hole here is
+         * a block the map lost. Clearing it as "nothing to convert" made
+         * the next fsync report success over data that reads as zeros
+         * (audit 2026-11-14 FD-1). Said, and kept pending. */
+        pr_err_ratelimited("ino=%llu: buffered block %llu is in no extent -- its data cannot be reached\n",
+                           (unsigned long long) inode->i_ino, (unsigned long long) iblock);
+        return -EIO;
+    }
     if (mode == CETRAFS_GB_CONVERT) {
         /* The write being completed mapped this block, and nothing may
          * free it while that write is in flight. A hole here means the
