@@ -159,7 +159,12 @@ func (s *Slave) handleConn(c net.Conn) {
 }
 
 func errResp(id uint64, err error) Response {
-	return Response{ID: id, OK: false, Error: err.Error()}
+	r := Response{ID: id, OK: false, Error: err.Error()}
+	var en syscall.Errno
+	if errors.As(err, &en) {
+		r.Errno = int(en)
+	}
+	return r
 }
 
 func okResp(id uint64, result any) Response {
@@ -617,6 +622,39 @@ func (s *Slave) dispatch(req Request) Response {
 			return errResp(req.ID, err)
 		}
 		res, err := doModParam(a)
+		if err != nil {
+			return errResp(req.ID, err)
+		}
+		return okResp(req.ID, res)
+
+	case "fuzz_write":
+		var a FuzzWriteArgs
+		if err := unmarshalInto(&a); err != nil {
+			return errResp(req.ID, err)
+		}
+		res, err := s.doFuzzWrite(a)
+		if err != nil {
+			return errResp(req.ID, err)
+		}
+		return okResp(req.ID, res)
+
+	case "fuzz_read":
+		var a FuzzReadArgs
+		if err := unmarshalInto(&a); err != nil {
+			return errResp(req.ID, err)
+		}
+		res, err := s.doFuzzRead(a)
+		if err != nil {
+			return errResp(req.ID, err)
+		}
+		return okResp(req.ID, res)
+
+	case "fuzz_verify":
+		var a FuzzVerifyArgs
+		if err := unmarshalInto(&a); err != nil {
+			return errResp(req.ID, err)
+		}
+		res, err := s.doFuzzVerify(a)
 		if err != nil {
 			return errResp(req.ID, err)
 		}
@@ -1752,6 +1790,10 @@ var settableModParams = map[string]bool{
 	"pf_append_stall_ms":      true,
 	"alloc_run_blocks":        true,
 	"scrub_ignore_peer_frees": true,
+	// ns-fuzz -nsfuzz-knob: the controls that prove its oracles see real
+	// faults -- a freshness gate turned off.
+	"file_seq_ignore":       true,
+	"ext_cache_trust_stale": true,
 	// foreign-free-batch: the control (one swap per extent) and the full queue.
 	"pf_batch_size":       true,
 	"pf_force_queue_full": true,

@@ -22,9 +22,13 @@ type Request struct {
 }
 
 type Response struct {
-	ID     uint64          `json:"id"`
-	OK     bool            `json:"ok"`
-	Error  string          `json:"error,omitempty"`
+	ID    uint64 `json:"id"`
+	OK    bool   `json:"ok"`
+	Error string `json:"error,omitempty"`
+	// Errno is the error's errno when it carries one (0 otherwise), so a
+	// caller can judge WHICH failure it got (the namespace fuzzer's
+	// legal-error oracle) rather than matching message text.
+	Errno  int             `json:"errno,omitempty"`
 	Result json.RawMessage `json:"result,omitempty"`
 }
 

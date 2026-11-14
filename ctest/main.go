@@ -101,6 +101,8 @@ func main() {
 	nsFuzzOps := flag.Int("nsfuzz-ops", 2500, "ns-fuzz: random namespace ops PER NODE (crank it, or -repeat, for a soak)")
 	nsFuzzSeed := flag.Int64("nsfuzz-seed", 1, "ns-fuzz: PRNG seed, so a failing run reproduces")
 	nsFuzzPool := flag.Int("nsfuzz-pool", 160, "ns-fuzz: size of the shared name pool in the one arena directory")
+	nsFuzzKnob := flag.String("nsfuzz-knob", "", "ns-fuzz: name=value of a TEST ONLY module parameter set on every node for the storm -- a negative control (e.g. file_seq_ignore=1 must make the run FAIL)")
+	nsFuzzFileLock := flag.Bool("nsfuzz-filelock", false, "ns-fuzz: run on the default mount (automatic file lock) instead of nofilelock")
 	nsFuzzOpset := flag.String("nsfuzz-opset", "", "ns-fuzz: comma list restricting ops (e.g. create,link) to triage a failure; empty = all")
 	stormInject := flag.Bool("storm-inject", true, "hypervisor-storm: pull a node's device periodically. "+
 		"Set false to separate faults that need a device failure from faults that do not -- the storm's "+
@@ -174,6 +176,8 @@ func main() {
 			nsFuzzSeed:          *nsFuzzSeed,
 			nsFuzzPool:          *nsFuzzPool,
 			nsFuzzOpset:         *nsFuzzOpset,
+			nsFuzzFileLock:      *nsFuzzFileLock,
+			nsFuzzKnob:          *nsFuzzKnob,
 			stormInject:         *stormInject,
 			stormNoFileLock:     *stormNoFileLock,
 			visRounds:           *visRounds,
@@ -219,6 +223,8 @@ type masterConfig struct {
 	nsFuzzSeed          int64
 	nsFuzzPool          int
 	nsFuzzOpset         string
+	nsFuzzFileLock      bool
+	nsFuzzKnob          string
 }
 
 func runMaster(cfg masterConfig) (bool, error) {
@@ -523,7 +529,7 @@ func dispatchScenario(cfg masterConfig, clients []*Client) (bool, error) {
 	case "mkfs-guard":
 		return RunMkfsGuard(clients)
 	case "ns-fuzz":
-		return RunNsFuzz(clients, cfg.testDir, cfg.nsFuzzSeed, cfg.nsFuzzOps, cfg.nsFuzzPool, cfg.nsFuzzOpset)
+		return RunNsFuzz(clients, cfg.testDir, cfg.nsFuzzSeed, cfg.nsFuzzOps, cfg.nsFuzzPool, cfg.nsFuzzOpset, cfg.nsFuzzFileLock, cfg.nsFuzzKnob)
 	case "full-suite":
 		return RunFullSuite(clients, cfg.lockPath, cfg.testDir, cfg.accountingSizeBytes,
 			cfg.dirStormFiles, cfg.dirStormMaxBytes, cfg.dirStormPar, cfg.dirStormSeed)
