@@ -1310,6 +1310,7 @@ u64 cetrafs_tree_block_count(void);
 u64 cetrafs_tree_read_count(void);
 u64 cetrafs_file_cache_reconcile_count(void);
 u64 cetrafs_foreign_free_leak_count(void);
+u64 cetrafs_free_bmap_lookup_count(void);
 /* Stage a record update for the namespace lock's release to publish --
  * see lock.c. Only for an inode in the lock set, and only for the
  * operation's last update to that record. */
