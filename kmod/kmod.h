@@ -1554,6 +1554,13 @@ void cetrafs_deferred_capped(struct inode *inode);
 int cetrafs_deferred_room(struct inode *inode);
 u64 cetrafs_deferred_room_refusal_count(void);
 u64 cetrafs_deferred_cap_flush_count(void);
+/* Held-back tree blocks' update path (P9): CRCs computed by the update
+ * and stamp paths, re-holds of an already-held block, and the list steps
+ * the eager control walks. leafdefer.c / ioutil.c. */
+u64 cetrafs_update_crc_count(void);
+bool cetrafs_deferred_eager(void);
+u64 cetrafs_deferred_hold_count(void);
+u64 cetrafs_deferred_list_step_count(void);
 int cetrafs_deferred_flush_inode(struct inode *inode, bool mapping_locked);
 int cetrafs_deferred_flush_all(struct super_block *sb);
 unsigned long cetrafs_deferred_drop_all(struct super_block *sb);

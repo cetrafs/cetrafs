@@ -330,6 +330,9 @@ static int cetrafs_proc_info_show(struct seq_file *m, void *v)
     seq_printf(m, "owned_derive_overlaps: %llu\n", cetrafs_owned_derive_overlap_count());
     seq_printf(m, "deferred_orphaned: %llu\n", cetrafs_deferred_orphaned_count());
     seq_printf(m, "deferred_adopted: %llu\n", cetrafs_deferred_adopted_count());
+    seq_printf(m, "deferred_holds: %llu\n", cetrafs_deferred_hold_count());
+    seq_printf(m, "deferred_list_steps: %llu\n", cetrafs_deferred_list_step_count());
+    seq_printf(m, "update_crcs: %llu\n", cetrafs_update_crc_count());
     /* Slots held by entries a failed write kept for replay. Nonzero is a
      * device that refused writes; at the slot count, journaled writes
      * fail until a rewrite of those blocks (or a remount) frees them. */

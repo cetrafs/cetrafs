@@ -285,9 +285,35 @@ void cetrafs_bh_begin_update(struct buffer_head *bh)
  * never runs on the per-block data path -- see docs/PERFORMANCE.md
  * invariant 1 before moving it anywhere else.
  */
+static atomic64_t cetrafs_update_crcs = ATOMIC64_INIT(0);
+
+u64 cetrafs_update_crc_count(void)
+{
+    return (u64) atomic64_read(&cetrafs_update_crcs);
+}
+
 u32 cetrafs_bh_begin_update_crc(struct buffer_head *bh)
 {
     cetrafs_bh_begin_update(bh);
+    /* A held-back block (leafdefer.c) skips the pre-image CRC. Its
+     * device image is already in its listing (d->disk_crc), and every
+     * consumer of this value ignores it for a listed block:
+     *  - cetrafs_bh_defer_update(): a listed block returns before using
+     *    prev_crc (the only use is the new-entry path, reached only for
+     *    an unlisted block);
+     *  - cetrafs_tree_hold_back()'s fallback: taken only when the defer
+     *    declines, which it does only for an UNLISTED block;
+     *  - cetrafs_journal_write_block_flags(): for a block whose bit is
+     *    set, a GUARDED entry takes the listing's disk_crc instead;
+     *  - the boundary: its entry's prev_checksum is d->disk_crc, from
+     *    the listing, never this value.
+     * The bit and the listing change together under the buffer lock this
+     * call holds, so "bit set, unlisted" cannot be seen here (that WARN
+     * path is the one place prev_crc would be used). The TEST ONLY
+     * deferred_hold_eager control computes it anyway, as before. */
+    if (buffer_cetra_deferred(bh) && !cetrafs_deferred_eager())
+        return 0;
+    atomic64_inc(&cetrafs_update_crcs);
     return ~crc32c(~0U, bh->b_data, CETRAFS_BLOCK_SIZE);
 }
 
@@ -990,6 +1016,7 @@ void cetrafs_blk_tail_stamp(struct buffer_head *bh, u32 magic)
         ((cetrafs_extent_hdr_t *) bh->b_data)->eh_generation = cetrafs_cpu_to_le32(get_random_u32());
 
     tail->magic = cetrafs_cpu_to_le32(magic);
+    atomic64_inc(&cetrafs_update_crcs);
     tail->crc = cetrafs_cpu_to_le32(~crc32c(~0U, bh->b_data, CETRAFS_BLK_TAIL_OFF));
 }
 

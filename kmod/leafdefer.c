@@ -59,6 +59,9 @@ struct cetrafs_deferred {
      * was evicted; under the xarray's lock. A boundary walks only its
      * own inode's (leafdefer review 2026-11-08, item 3). */
     struct list_head node;
+    /* On the mount's orphan list: kept with the list move, so "on this
+     * inode's list" is two loads, not a walk of the list. */
+    bool orphan;
 };
 
 /*
@@ -76,16 +79,49 @@ struct cetrafs_deferred {
 static atomic64_t cetrafs_deferred_orphaned = ATOMIC64_INIT(0);
 static atomic64_t cetrafs_deferred_adopted = ATOMIC64_INIT(0);
 
-/* Is 'd' on 'head'? Under the xarray lock. Only for the adoption count:
- * an inode's list is its own handful of blocks. */
+/* TEST ONLY: the update path as it was before the orphan flag -- it
+ * walks the inode's list to decide adoption, and computes the
+ * pre-image CRC of a block already held back (ioutil.c). The control
+ * of tests/kernel/deferred_hold_cost.sh. */
+static bool cetrafs_deferred_eager_knob;
+cetrafs_test_param(deferred_hold_eager, cetrafs_deferred_eager_knob, bool, 0644);
+MODULE_PARM_DESC(deferred_hold_eager, "TEST ONLY: re-hold a held-back block the old way (list walk, pre-image CRC)");
+
+bool cetrafs_deferred_eager(void)
+{
+    return READ_ONCE(cetrafs_deferred_eager_knob);
+}
+
+static atomic64_t cetrafs_deferred_holds = ATOMIC64_INIT(0);
+static atomic64_t cetrafs_deferred_list_steps = ATOMIC64_INIT(0);
+
+u64 cetrafs_deferred_hold_count(void)
+{
+    return (u64) atomic64_read(&cetrafs_deferred_holds);
+}
+
+u64 cetrafs_deferred_list_step_count(void)
+{
+    return (u64) atomic64_read(&cetrafs_deferred_list_steps);
+}
+
+/* Is 'd' on 'head'? Under the xarray lock. Only the TEST ONLY eager
+ * path calls it: the flag answers the same question in O(1). */
 static bool cetrafs_deferred_on_list(struct cetrafs_deferred *d, struct list_head *head)
 {
     struct cetrafs_deferred *e;
+    u64 steps = 0;
+    bool found = false;
 
-    list_for_each_entry(e, head, node)
-        if (e == d)
-            return true;
-    return false;
+    list_for_each_entry(e, head, node) {
+        steps++;
+        if (e == d) {
+            found = true;
+            break;
+        }
+    }
+    atomic64_add(steps, &cetrafs_deferred_list_steps);
+    return found;
 }
 
 /* TEST ONLY: decline every NEW deferral, so the caller writes the block
@@ -119,6 +155,8 @@ int cetrafs_bh_defer_update(struct inode *inode, struct buffer_head *bh, u32 pre
         xa_lock(xa);
         old = xa_load(xa, bh->b_blocknr);
         listed = old && old->bh == bh;
+        if (listed)
+            atomic64_inc(&cetrafs_deferred_holds);
         /* ...and listed on THIS inode's list. An entry its inode's
          * eviction moved to the mount's orphans (a boundary that failed)
          * is written only at sync_fs or unmount, so this edit would miss
@@ -127,10 +165,17 @@ int cetrafs_bh_defer_update(struct inode *inode, struct buffer_head *bh, u32 pre
          * (cetrafs_convert_source_durable()). Bring it home: unlist and
          * settle find it through the xarray from either list. */
         if (listed) {
-            if (old->ino != inode->i_ino || !cetrafs_deferred_on_list(old, cetrafs_inode_deferred(inode)))
+            bool home;
+
+            if (cetrafs_deferred_eager())
+                home = old->ino == inode->i_ino && cetrafs_deferred_on_list(old, cetrafs_inode_deferred(inode));
+            else
+                home = old->ino == inode->i_ino && !old->orphan;
+            if (!home)
                 atomic64_inc(&cetrafs_deferred_adopted);
             list_move_tail(&old->node, cetrafs_inode_deferred(inode));
             old->ino = inode->i_ino;
+            old->orphan = false;
             old->generation = cetrafs_inode_get_generation(inode);
         }
         xa_unlock(xa);
@@ -154,6 +199,7 @@ int cetrafs_bh_defer_update(struct inode *inode, struct buffer_head *bh, u32 pre
     d->ino = inode->i_ino;
     d->generation = cetrafs_inode_get_generation(inode);
     d->disk_crc = prev_crc;
+    d->orphan = false;
     INIT_LIST_HEAD(&d->node);
     old = xa_store(xa, bh->b_blocknr, d, GFP_NOFS | __GFP_NOFAIL);
     xa_lock(xa);
@@ -484,8 +530,10 @@ void cetrafs_deferred_evict(struct inode *inode)
     if (!xa || !orphans)
         return;
     xa_lock(xa);
-    list_for_each_entry(d, cetrafs_inode_deferred(inode), node)
+    list_for_each_entry(d, cetrafs_inode_deferred(inode), node) {
         n++;
+        d->orphan = true;
+    }
     list_splice_tail_init(cetrafs_inode_deferred(inode), orphans);
     xa_unlock(xa);
     if (n)
