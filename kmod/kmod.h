@@ -497,6 +497,7 @@ bool cetrafs_sb_take_bmap_alloc_dirty(struct super_block *sb, u32 bg_id);
 u64 cetrafs_bmap_gate_walks_count(void);
 u64 cetrafs_bmap_gate_entry_count(void);
 u64 cetrafs_pf_apply_bmap_lookup_count(void);
+u64 cetrafs_run_claim_bmap_lookup_count(void);
 u64 cetrafs_dio_privs_xattr_reads_count(void);
 u32 cetrafs_sb_next_bmap_alloc_dirty(struct super_block *sb, u32 from);
 u32 cetrafs_sb_next_release_check(struct super_block *sb, u32 from);

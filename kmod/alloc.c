@@ -2349,6 +2349,17 @@ int cetrafs_alloc_data_block_near(struct super_block *sb, u32 bg_id, u64 preferr
  * test-and-set the next LBAs and stop when one is taken. Cost is
  * proportional to what we actually get, not to the size of the group.
  */
+/* TEST ONLY: a run claim looks the bitmap block up per bit, as before --
+ * the control of tests/kernel/run_claim_bmap_lookups.sh. */
+static bool cetrafs_run_claim_per_bit;
+cetrafs_test_param(run_claim_per_bit, cetrafs_run_claim_per_bit, bool, 0644);
+MODULE_PARM_DESC(run_claim_per_bit, "TEST ONLY: a speculative run claim looks the bitmap block up per bit");
+static atomic64_t cetrafs_run_claim_bmap_lookups = ATOMIC64_INIT(0);
+u64 cetrafs_run_claim_bmap_lookup_count(void)
+{
+    return (u64) atomic64_read(&cetrafs_run_claim_bmap_lookups);
+}
+
 u32 cetrafs_alloc_run_after(struct super_block *sb, u32 bg_id, u64 start_lba, u32 max)
 {
     struct cetrafs_bg_geom bg;
@@ -2373,11 +2384,53 @@ u32 cetrafs_alloc_run_after(struct super_block *sb, u32 bg_id, u64 start_lba, u3
         cetrafs_sb_alloc_unlock(sb);
         return 0; /* best effort: no run from a group we no longer own */
     }
-    while (got < max && first_bit + got < bg.data_block_count) {
-        if (cetrafs_bitmap_try_alloc_exact(sb, bmap_lba, bmap_blocks, bg.data_block_count, first_bit + got,
-                                           /*sync=*/false))
-            break;
-        got++;
+    if (READ_ONCE(cetrafs_run_claim_per_bit)) { /* test-only: the old per-bit claims */
+        while (got < max && first_bit + got < bg.data_block_count) {
+            atomic64_inc(&cetrafs_run_claim_bmap_lookups);
+            if (cetrafs_bitmap_try_alloc_exact(sb, bmap_lba, bmap_blocks, bg.data_block_count, first_bit + got,
+                                               /*sync=*/false))
+                break;
+            got++;
+        }
+    } else {
+        /* One lookup and one buffer-lock hold per bitmap block, not one
+         * lookup per bit: up to 4096 of them under alloc_mutex per run
+         * (audit 2026-11-14 P2). The test and the set are under the
+         * buffer lock, as cetrafs_bitmap_try_alloc_exact()'s set is;
+         * nothing here sleeps on I/O while it is held. */
+        struct buffer_head *bh = NULL;
+        u64 held = 0;
+
+        while (got < max && first_bit + got < bg.data_block_count) {
+            u64 bit = first_bit + got, blk = bit / CETRAFS_BITS_PER_BLOCK;
+            u32 in = (u32) (bit % CETRAFS_BITS_PER_BLOCK);
+            u8 *byte;
+
+            if (bh && held != blk) {
+                cetrafs_bh_end_update(bh);
+                brelse(bh);
+                bh = NULL;
+            }
+            if (!bh) {
+                if (blk >= bmap_blocks)
+                    break;
+                bh = cetrafs_bread_retry(sb, bmap_lba + blk);
+                if (!bh)
+                    break; /* best effort: what was claimed stands */
+                atomic64_inc(&cetrafs_run_claim_bmap_lookups);
+                cetrafs_bh_begin_update(bh);
+                held = blk;
+            }
+            byte = (u8 *) bh->b_data + in / 8;
+            if (*byte & (1u << (in % 8)))
+                break;
+            *byte |= (u8) (1u << (in % 8));
+            got++;
+        }
+        if (bh) {
+            cetrafs_bh_end_update(bh);
+            brelse(bh);
+        }
     }
     if (got) {
         cetrafs_bg_adjust_free_blocks(sb, bg_id, -(s64) got);
