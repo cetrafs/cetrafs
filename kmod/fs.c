@@ -1140,6 +1140,13 @@ MODULE_PARM_DESC(grow_hdr_check_off, "TEST ONLY: a live grow does not verify its
  * past every one of them. Reads are forced fresh on a refresh: the
  * blocks are a peer's, written moments ago.
  */
+/* TEST ONLY: the layout walk reads each descriptor on its own, as before
+ * audit 2026-11-14 P4 -- the control of tests/kernel/mount_bg_readahead.sh. */
+static bool cetrafs_mount_bg_ra_off;
+cetrafs_test_param(mount_bg_ra_off, cetrafs_mount_bg_ra_off, bool, 0644);
+MODULE_PARM_DESC(mount_bg_ra_off, "TEST ONLY: the mount reads each Block Group descriptor on its own");
+#define CETRAFS_MOUNT_BG_RA 256
+
 static int cetrafs_layout_walk(struct super_block *sb, struct cetrafs_bg_layout *l,
                                const struct cetrafs_bg_layout *prev, struct cetrafs_grow_plan *gp)
 {
@@ -1147,6 +1154,7 @@ static int cetrafs_layout_walk(struct super_block *sb, struct cetrafs_bg_layout 
     const u64 total = le64_to_cpu(ondisk->total_blocks);
     const u32 nbg = l->bg_count, from = prev ? prev->bg_count : 0;
     const bool fresh = prev != NULL;
+    const bool ra = !READ_ONCE(cetrafs_mount_bg_ra_off); /* once per walk */
     struct cetrafs_lba_range *segs = NULL;
     u32 nsegs = 0, b;
     u64 prev_end = prev ? prev->last_bg_end : 0; /* where the previous Block Group ended */
@@ -1361,10 +1369,32 @@ walked:
         u32 si;
         int brc;
 
+        /* Read the next window ahead, as one plugged batch: one
+         * synchronous round trip per descriptor made a 64 TiB mount
+         * 65,536 serial reads before anything else (audit 2026-11-14
+         * P4). Dropped first when this walk must read fresh, so what
+         * lands is the device's; each read below still verifies, and
+         * retries a tear forced-fresh. */
+        if (ra && (b - from) % CETRAFS_MOUNT_BG_RA == 0) {
+            struct blk_plug plug;
+            u32 r, rend = min_t(u32, nbg, b + CETRAFS_MOUNT_BG_RA);
+
+            blk_start_plug(&plug);
+            for (r = b; r < rend; r++) {
+                u64 rl = l->chunk[r >> CETRAFS_BGC_SHIFT]->bg_desc_lba[r & CETRAFS_BGC_MASK];
+
+                if (fresh)
+                    cetrafs_invalidate_block(sb, rl);
+                sb_breadahead(sb, rl);
+            }
+            blk_finish_plug(&plug);
+            cond_resched();
+        }
         /* Same single pass also records which Zone Group owns each
          * Block Group, which is what lets ownership be answered from
-         * memory from here on. */
-        brc = cetrafs_bg_mount_info(sb, &l->raw, b, c->bg_desc_lba[ci], fresh, &t, &owner, &bstart, &blen, &bflags);
+         * memory from here on. Fresh was served by the drop above. */
+        brc = cetrafs_bg_mount_info(sb, &l->raw, b, c->bg_desc_lba[ci], fresh && !ra, &t, &owner, &bstart, &blen,
+                                    &bflags);
         /*
          * Block Groups in order, none over the one before. Each
          * descriptor was checked alone, so two checksum-valid
