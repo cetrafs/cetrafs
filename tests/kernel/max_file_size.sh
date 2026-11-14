@@ -98,24 +98,31 @@ PY
 fi
 
 # ------------------------------------------------- the ordinary volume
-log "checking a volume smaller than the ceiling still reports its own capacity"
+# F6: a file is bounded by the format, not by the volume it lives on. A
+# sparse file may be larger than the volume (sparse_beyond_volume.sh); the
+# TEST ONLY knob puts the old capacity cap back for the control.
+log "checking a volume smaller than the ceiling reports the format ceiling"
 SIMG="$(ct_image 1200 mfssmall)"
 SDEV="$(ct_loop "$SIMG")"
 SMNT="$(ct_mnt mfssmall)"
 ct_mkfs "$SDEV" -z 2 -b 512 -J 1 -M 4 -N 1024 -f >/dev/null
 ct_mount "$SDEV" "$SMNT"
 SMAX="$(sed -n 's/^max_file_size_bytes: //p' "$(ct_procdir "$SDEV")/info" 2>/dev/null || echo 0)"
-if [ "$SMAX" -gt 0 ] && [ "$SMAX" -lt "$CEILING" ]; then
-    pass "a 1 GiB volume reports its own capacity ($SMAX), well under the ceiling"
+[ "$SMAX" = "$CEILING" ] &&
+    pass "a 1 GiB volume reports the format ceiling ($SMAX), not its capacity" ||
+    fail "a small volume reports max_file_size_bytes=$SMAX, expected $CEILING"
+if truncate -s $((2 * 1024 * 1024 * 1024)) "$SMNT/bigsparse" 2>/dev/null; then
+    pass "a 2 GiB sparse file on a 1 GiB volume is accepted"
 else
-    fail "a small volume reports max_file_size_bytes=$SMAX"
+    fail "a 2 GiB sparse file on a 1 GiB volume was refused"
 fi
-# And the capacity cap is enforced: a file cannot exceed the volume.
-if truncate -s $((SMAX + 4096)) "$SMNT/toobig" 2>/dev/null; then
-    fail "a file larger than the whole volume's capacity was accepted"
+ct_param_set cap_file_to_volume 1
+if truncate -s $((2 * 1024 * 1024 * 1024)) "$SMNT/capped" 2>/dev/null; then
+    fail "control: with the capacity cap restored, a 2 GiB file on a 1 GiB volume was accepted"
 else
-    pass "a file larger than the volume's capacity is refused"
+    pass "control: with the capacity cap restored, a 2 GiB file on a 1 GiB volume is refused"
 fi
+ct_param_set cap_file_to_volume 0
 
 # ------------------------------------------------------- forced noatime
 #

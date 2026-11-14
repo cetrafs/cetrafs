@@ -76,6 +76,9 @@ ct_mkfs "$DEV" -s 600M -b 512 -z 1 -J 0 -N 1024 -f >/dev/null
 ct_mount "$DEV" "$MNT"
 require_cetrafs_mount "$MNT"
 ct_param_set layout_refresh_hb_off 1
+# F6: the per-file ceiling is the format's unless this TEST ONLY knob puts
+# the volume's capacity back -- and everything below is about that cap.
+ct_param_set cap_file_to_volume 1
 
 # ------------------------------------------------- the cap is still enforced
 CAP0="$(info max_file_size_bytes)"
@@ -105,6 +108,7 @@ for op in truncate fallocate write; do
 done
 
 ct_param_set layout_refresh_hb_off 0
+ct_param_set cap_file_to_volume 0
 ct_umount "$MNT"
 out="$(ct_fsck "$DEV" 2>&1)" && pass "fsck clean after the grows" ||
     fail "fsck: $(grep -m3 ERR <<<"$out" | tr '\n' ' ')"

@@ -7172,9 +7172,24 @@ u64 cetrafs_sb_total_data_blocks(struct super_block *sb)
     return l ? l->total_data_blocks : 0;
 }
 
-/* The largest a file may be on the layout this node holds. */
+/*
+ * TEST ONLY: cap a file at the volume's capacity, as before audit F6. The
+ * default is the format's ceiling alone -- a sparse file may be larger than
+ * the volume, as on ext4, xfs and VMFS; a write that finds no room ends in
+ * ENOSPC from the allocator. The knob keeps the old refusal so tests can
+ * show the cap was real and reach the same checks (write, fallocate,
+ * truncate) that the lifted policy goes through.
+ */
+static bool cetrafs_cap_file_to_volume;
+cetrafs_test_param(cap_file_to_volume, cetrafs_cap_file_to_volume, bool, 0644);
+MODULE_PARM_DESC(cap_file_to_volume, "TEST ONLY: refuse a file past the volume's capacity (EFBIG), as before F6");
+
+/* The largest a file may be: the format's ceiling, or under the TEST ONLY
+ * knob the capacity of the layout this node holds. */
 loff_t cetrafs_sb_max_file_size(struct super_block *sb)
 {
+    if (!READ_ONCE(cetrafs_cap_file_to_volume))
+        return cetrafs_max_file_size_for(U64_MAX);
     return cetrafs_max_file_size_for(cetrafs_sb_total_data_blocks(sb));
 }
 
@@ -7188,7 +7203,9 @@ loff_t cetrafs_sb_max_file_size(struct super_block *sb)
 int cetrafs_sb_capacity_for(struct super_block *sb, loff_t end, loff_t *cap)
 {
     *cap = cetrafs_sb_max_file_size(sb);
-    if (end > *cap) {
+    /* The format ceiling never moves, so only the TEST ONLY capacity cap
+     * can be behind a peer's grow. */
+    if (end > *cap && READ_ONCE(cetrafs_cap_file_to_volume)) {
         int r = cetrafs_sb_layout_refresh(sb);
 
         if (r < 0)
