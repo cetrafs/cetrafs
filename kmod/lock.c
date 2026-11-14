@@ -4787,15 +4787,102 @@ static bool cetrafs_lock_sweep_recount_off;
 cetrafs_test_param(lock_sweep_recount_off, cetrafs_lock_sweep_recount_off, bool, 0644);
 MODULE_PARM_DESC(lock_sweep_recount_off, "TEST ONLY: the re-attach sweep does not recount what a stopped operation left");
 
+/* TEST ONLY: the sweep recounts each stopped file in its own walk, as
+ * before -- the control of tests/kernel/sweep_recount_one_walk.sh. */
+static bool cetrafs_sweep_walk_each;
+cetrafs_test_param(sweep_walk_each, cetrafs_sweep_walk_each, bool, 0644);
+MODULE_PARM_DESC(sweep_walk_each, "TEST ONLY: the mount sweep recounts each stopped file in a walk of its own");
+static atomic64_t cetrafs_sweep_name_walks = ATOMIC64_INIT(0);
+u64 cetrafs_sweep_name_walk_count(void)
+{
+    return (u64) atomic64_read(&cetrafs_sweep_name_walks);
+}
+
+#define CETRAFS_SWEEP_RECOUNT_BATCH 256
+
+struct cetrafs_sweep_pending {
+    u64 ino[CETRAFS_SWEEP_RECOUNT_BATCH];
+    u64 gen[CETRAFS_SWEEP_RECOUNT_BATCH];
+    u32 names[CETRAFS_SWEEP_RECOUNT_BATCH];
+    u32 n;
+};
+
+/* Recount and release the files the sweep held back. Their names are
+ * counted in ONE walk of the volume: each recount was a whole-volume walk
+ * of its own (audit 2026-11-14 N2), and every one of these files' namespace
+ * locks is still this node's on the device -- held since before the walk
+ * and until the release below -- so no name of any of them can change
+ * meanwhile and each count is exact. */
+static int cetrafs_sweep_recount_flush(struct super_block *sb, struct cetrafs_sweep_pending *pd, u32 me,
+                                       u32 my_incarnation, u64 *cleared)
+{
+    bool shared = !READ_ONCE(cetrafs_sweep_walk_each);
+    int cret = -EINVAL, ret = 0;
+    u32 k;
+
+    if (!pd->n)
+        return 0;
+    if (shared) {
+        atomic64_inc(&cetrafs_sweep_name_walks);
+        cret = cetrafs_ns_count_names(sb, pd->ino, pd->n, pd->names);
+        if (cret == -EAGAIN) {
+            cetrafs_sb_layout_refresh(sb);
+            atomic64_inc(&cetrafs_sweep_name_walks);
+            cret = cetrafs_ns_count_names(sb, pd->ino, pd->n, pd->names);
+        }
+        /* A walk that failed counts nothing: each file then recounts on
+         * its own below and meets the failure as it always did. */
+    }
+    for (k = 0; k < pd->n; k++) {
+        u64 ino = pd->ino[k];
+        struct cetrafs_own_claims_ctx ctx = {.me = me, .my_incarnation = my_incarnation, .generation = pd->gen[k]};
+
+        if (cret)
+            atomic64_inc(&cetrafs_sweep_name_walks);
+        ret = cetrafs_ns_reconcile_counted(sb, ino, ctx.generation, NULL, cret ? NULL : &pd->names[k]);
+        if (ret == -EAGAIN && cret) {
+            cetrafs_sb_layout_refresh(sb);
+            ret = cetrafs_ns_reconcile_counted(sb, ino, ctx.generation, NULL, NULL);
+        }
+        if (ret == -ESTALE) {
+            ret = 0; /* reborn meanwhile: the release below says so too */
+        } else if (ret) {
+            pr_err("mount: ino=%llu: could not recount it after this node stopped inside an operation on "
+                   "it (%d) -- flagged for the next acquirer%s\n",
+                   (unsigned long long) ino, ret, ret == -EUCLEAN ? ", and refused here until fsck" : "");
+            if (ret == -EUCLEAN)
+                cetrafs_sb_corrupt(sb, ino);
+            ctx.mark_unverified = true;
+            ret = 0;
+        }
+        ret = cetrafs_cas_record(sb, cetrafs_inode_lba(sb, ino), cetrafs_own_claims_mutate, &ctx);
+        if (ret == -ESTALE)
+            ret = 0; /* reborn meanwhile: a peer's now, not ours */
+        else if (!ret)
+            (*cleared)++;
+        if (ret) {
+            pr_err("mount: ino=%llu still carries this node's claims and they could not be cleared: %d\n",
+                   (unsigned long long) ino, ret);
+            break;
+        }
+    }
+    pd->n = 0;
+    return ret;
+}
+
 int cetrafs_lock_sweep_own_claims(struct super_block *sb, u32 my_node_id)
 {
     const cetrafs_superblock_t *raw_sb = cetrafs_sb_raw(sb);
     u64 bmap, nbmap, ninodes, blk, seen = 0, cleared = 0;
     u64 bit = 1ULL << (my_node_id % CETRAFS_MAX_READER_NODES);
+    struct cetrafs_sweep_pending *pd;
     int ret = 0;
 
     if (!raw_sb)
         return -EINVAL;
+    pd = kvzalloc(sizeof(*pd), GFP_KERNEL);
+    if (!pd)
+        return -ENOMEM;
     bmap = le64_to_cpu(raw_sb->inode_bmap_start);
     nbmap = le64_to_cpu(raw_sb->inode_bmap_blocks);
     ninodes = le32_to_cpu(raw_sb->inodes_count);
@@ -4911,6 +4998,21 @@ int cetrafs_lock_sweep_own_claims(struct super_block *sb, u32 my_node_id)
              */
             if (cetrafs_le32(raw.nlink) != 0 && cetrafs_le32(raw.ns_lock_owner) == my_node_id &&
                 cetrafs_le32(raw.ns_lock_incarnation) != ctx.my_incarnation &&
+                !READ_ONCE(cetrafs_lock_sweep_recount_off) && !S_ISDIR(cetrafs_le32(raw.mode))) {
+                /* A file: held back, its lock kept, to be counted in one
+                 * walk with the others (cetrafs_sweep_recount_flush()). */
+                if (pd->n == CETRAFS_SWEEP_RECOUNT_BATCH) {
+                    ret = cetrafs_sweep_recount_flush(sb, pd, my_node_id, ctx.my_incarnation, &cleared);
+                    if (ret)
+                        break;
+                }
+                pd->ino[pd->n] = ino;
+                pd->gen[pd->n] = ctx.generation;
+                pd->n++;
+                continue;
+            }
+            if (cetrafs_le32(raw.nlink) != 0 && cetrafs_le32(raw.ns_lock_owner) == my_node_id &&
+                cetrafs_le32(raw.ns_lock_incarnation) != ctx.my_incarnation &&
                 !READ_ONCE(cetrafs_lock_sweep_recount_off)) {
                 ret = cetrafs_ns_reconcile(sb, ino, ctx.generation, NULL);
                 if (ret == -EAGAIN) {
@@ -4943,6 +5045,9 @@ int cetrafs_lock_sweep_own_claims(struct super_block *sb, u32 my_node_id)
         }
         brelse(bh);
     }
+    if (!ret)
+        ret = cetrafs_sweep_recount_flush(sb, pd, my_node_id, cetrafs_sb_incarnation(sb), &cleared);
+    kvfree(pd);
     pr_info("mount: re-attached after an unclean departure -- cleared the claims of %llu of %llu inode(s)\n",
             (unsigned long long) cleared, (unsigned long long) seen);
     return ret;

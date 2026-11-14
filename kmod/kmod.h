@@ -498,6 +498,7 @@ struct cetrafs_inline_discard *cetrafs_sb_inline_discard(struct super_block *sb)
 void cetrafs_sb_note_bmap_alloc(struct super_block *sb, u32 bg_id);
 bool cetrafs_sb_take_bmap_alloc_dirty(struct super_block *sb, u32 bg_id);
 u64 cetrafs_bmap_gate_walks_count(void);
+u64 cetrafs_sweep_name_walk_count(void);
 u64 cetrafs_bmap_gate_entry_count(void);
 u64 cetrafs_pf_apply_bmap_lookup_count(void);
 u64 cetrafs_run_claim_bmap_lookup_count(void);
@@ -856,6 +857,8 @@ u64 cetrafs_inode_new_generation(struct super_block *sb);
 int cetrafs_dir_add_entry(struct inode *dir, const struct qstr *name, u64 ino, u8 file_type);
 /* Counts a stopped operation left behind its entries (dir.c). */
 int cetrafs_ns_reconcile(struct super_block *sb, u64 ino, u64 generation, struct inode *self);
+int cetrafs_ns_reconcile_counted(struct super_block *sb, u64 ino, u64 generation, struct inode *self,
+                                 const u32 *counted);
 /* nslock.c: set or clear CETRAFS_INODE_COUNT_UNVERIFIED, holding the lock. */
 int cetrafs_ns_set_unverified(struct super_block *sb, u64 ino, u64 generation, bool set);
 int cetrafs_ns_count_names(struct super_block *sb, const u64 *inos, u32 n, u32 *counts);

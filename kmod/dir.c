@@ -2353,6 +2353,23 @@ static void cetrafs_name_tally_visit(void *priv, const cetrafs_dirent_t *de)
 
     if (cetrafs_dirent_is_dot(de))
         return;
+    if (t->n > 8) {
+        /* inos is ascending (cetrafs_ns_count_names()'s contract): one
+         * search per entry, not a scan of up to 256 (the mount sweep). */
+        u32 lo = 0, hi = t->n;
+
+        while (lo < hi) {
+            u32 mid = lo + (hi - lo) / 2;
+
+            if (t->inos[mid] < target)
+                lo = mid + 1;
+            else
+                hi = mid;
+        }
+        if (lo < t->n && t->inos[lo] == target && t->counts[lo] < U32_MAX)
+            t->counts[lo]++;
+        return;
+    }
     for (i = 0; i < t->n; i++)
         if (t->inos[i] == target && t->counts[i] < U32_MAX)
             t->counts[i]++;
@@ -2412,6 +2429,7 @@ struct cetrafs_ns_window {
  * operation stopped holding -- but in batches, so a volume costs its blocks
  * in round trips of CETRAFS_NS_WALK_BATCH, not one per inode.
  */
+/* 'inos' must be ascending and without repeats when n > 8. */
 int cetrafs_ns_count_names(struct super_block *sb, const u64 *inos, u32 n, u32 *counts)
 {
     const cetrafs_superblock_t *raw_sb = cetrafs_sb_raw(sb);
@@ -2575,6 +2593,20 @@ MODULE_PARM_DESC(nslock_recount_fail, "TEST ONLY: fail the next N namespace reco
 
 int cetrafs_ns_reconcile(struct super_block *sb, u64 ino, u64 generation, struct inode *self)
 {
+    return cetrafs_ns_reconcile_counted(sb, ino, generation, self, NULL);
+}
+
+/*
+ * cetrafs_ns_reconcile(), with a file's names already counted by the
+ * caller in one walk shared with other files (the mount sweep of this
+ * node's stopped claims, cetrafs_lock_sweep_own_claims()). 'counted' is
+ * exact only if the caller held the file's namespace lock from before
+ * that walk until now, so no name of it could change; NULL counts here.
+ * A directory counts its own blocks either way.
+ */
+int cetrafs_ns_reconcile_counted(struct super_block *sb, u64 ino, u64 generation, struct inode *self,
+                                 const u32 *counted)
+{
     struct cetrafs_dir_tally tally = {0};
     struct cetrafs_dir_runs *dr = NULL;
     cetrafs_inode_t *raw;
@@ -2603,9 +2635,9 @@ int cetrafs_ns_reconcile(struct super_block *sb, u64 ino, u64 generation, struct
         goto out;
 
     if (!S_ISDIR(cetrafs_le32(raw->mode))) {
-        u32 names = 0;
+        u32 names = counted ? *counted : 0;
 
-        ret = cetrafs_ns_count_names(sb, &ino, 1, &names);
+        ret = counted ? 0 : cetrafs_ns_count_names(sb, &ino, 1, &names);
         if (ret == -EUCLEAN)
             ret = -EIO; /* damage in some directory read for the count is not this file's */
         if (ret || names == cetrafs_le32(raw->nlink))
