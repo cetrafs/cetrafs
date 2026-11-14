@@ -258,7 +258,8 @@ static int cetrafs_statfs(struct dentry *dentry, struct kstatfs *stat)
     struct super_block *sb = dentry->d_sb;
     const cetrafs_superblock_t *raw_sb = cetrafs_sb_raw(sb);
     u64 total_blocks = 0, free_blocks = 0, free_inodes;
-    u32 zg_count, zg_id;
+    u32 zg_count, zg_id, *gens;
+    bool prefetched;
     int ret;
 
     fs_debug(info, "cetrafs_statfs");
@@ -294,18 +295,36 @@ static int cetrafs_statfs(struct dentry *dentry, struct kstatfs *stat)
      * writes would not move its own df until the next boundary.
      */
     zg_count = le32_to_cpu(raw_sb->zone_group_count);
+    /* One batch for every record, then each read from it: one round
+     * trip per record made df cost the Zone Group count (P13). */
+    /* Each record's flight generation is taken BEFORE the batch reads
+     * it, as the per-record loop takes it before its read: a flight
+     * ending between the read and a later sample would read as settled
+     * with the delta in neither place (class 52). */
+    gens = kmalloc_array(zg_count, sizeof(*gens), GFP_NOFS);
+    if (gens) {
+        for (zg_id = 0; zg_id < zg_count; zg_id++)
+            gens[zg_id] = cetrafs_sb_zg_flight_gen(sb, zg_id);
+        prefetched = cetrafs_zg_prefetch_all(sb);
+    } else {
+        prefetched = false;
+    }
     for (zg_id = 0; zg_id < zg_count; zg_id++) {
         struct cetrafs_zg_info zi;
         s64 zfree;
+        bool first = prefetched;
 
         /* A delta on its way to the record is counted from the flush
          * in flight, not lost from both (cetrafs_sb_info.zg_flight_gen). */
         for (;;) {
-            u32 gen = cetrafs_sb_zg_flight_gen(sb, zg_id);
+            u32 gen = first ? gens[zg_id] : cetrafs_sb_zg_flight_gen(sb, zg_id);
 
-            ret = cetrafs_zg_get_info(sb, zg_id, &zi);
-            if (ret)
+            ret = first ? cetrafs_zg_get_info_prefetched(sb, zg_id, &zi) : cetrafs_zg_get_info(sb, zg_id, &zi);
+            first = false;
+            if (ret) {
+                kfree(gens);
                 return ret;
+            }
             if (cetrafs_sb_zg_free_settle(sb, zg_id, gen, (s64) zi.free_data_blocks, &zfree))
                 break;
             cond_resched();
@@ -317,6 +336,7 @@ static int cetrafs_statfs(struct dentry *dentry, struct kstatfs *stat)
          * release (the cross-node suite caught exactly that). */
         free_blocks += zi.pool_free_blocks;
     }
+    kfree(gens);
 
     /* Capacity is fixed at mkfs time, so it is computed once at mount
      * rather than re-derived from every descriptor on every call. */

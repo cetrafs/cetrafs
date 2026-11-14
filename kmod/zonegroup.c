@@ -110,7 +110,68 @@ u64 cetrafs_zg_copy_torn_count(void)
     return (u64) atomic64_read(&cetrafs_zg_copy_torn);
 }
 
+static int __cetrafs_read_zg(struct super_block *sb, u32 zg_id, cetrafs_zone_group_t *out, bool first_cached);
+
 static int cetrafs_read_zg(struct super_block *sb, u32 zg_id, cetrafs_zone_group_t *out)
+{
+    return __cetrafs_read_zg(sb, zg_id, out, false);
+}
+
+/* TEST ONLY: whole-table sweeps read each Zone Group record (statfs, the
+ * claim scan) and each Block Group descriptor (the free-group claim) on
+ * its own, as before audit 2026-11-14 P13/A4 -- the control of
+ * tests/kernel/statfs_zg_batched.sh and enospc_scan_batched.sh. */
+bool cetrafs_zg_prefetch_off;
+cetrafs_test_param(zg_prefetch_off, cetrafs_zg_prefetch_off, bool, 0644);
+MODULE_PARM_DESC(zg_prefetch_off, "TEST ONLY: table sweeps read each record on its own");
+
+/*
+ * Read every Zone Group record forced-fresh as ONE batch, for a sweep
+ * that then reads each (cetrafs_zg_get_info_prefetched()): statfs, which
+ * pvestatd polls every ~10 s, paid one serial round trip per record
+ * (audit 2026-11-14 P13). Returns true when the batch landed.
+ */
+bool cetrafs_zg_prefetch_all(struct super_block *sb)
+{
+    const cetrafs_superblock_t *raw_sb = cetrafs_sb_raw(sb);
+    struct buffer_head **bhs;
+    u32 n, i;
+    bool ok;
+
+    if (!raw_sb || READ_ONCE(cetrafs_zg_prefetch_off))
+        return false;
+    n = le32_to_cpu(raw_sb->zone_group_count);
+    bhs = kcalloc(n, sizeof(*bhs), GFP_NOFS);
+    if (!bhs)
+        return false;
+    ok = cetrafs_bread_uncached_batch(sb, le64_to_cpu(raw_sb->zg_table_start), n, bhs) == 0;
+    if (ok)
+        for (i = 0; i < n; i++)
+            brelse(bhs[i]);
+    kfree(bhs);
+    return ok;
+}
+
+/* cetrafs_zg_get_info() whose first read takes the image a
+ * cetrafs_zg_prefetch_all() just fetched; a tear is retried fresh. */
+int cetrafs_zg_get_info_prefetched(struct super_block *sb, u32 zg_id, struct cetrafs_zg_info *out)
+{
+    cetrafs_zone_group_t *zg = kmalloc(sizeof(*zg), GFP_NOFS);
+    int ret;
+
+    if (!zg)
+        return -ENOMEM;
+    ret = __cetrafs_read_zg(sb, zg_id, zg, true);
+    if (!ret) {
+        out->owner_node_id = le16_to_cpu(zg->owner_node_id);
+        out->free_data_blocks = le64_to_cpu(zg->free_data_blocks);
+        out->pool_free_blocks = le64_to_cpu(zg->pool_free_blocks);
+    }
+    kfree(zg);
+    return ret;
+}
+
+static int __cetrafs_read_zg(struct super_block *sb, u32 zg_id, cetrafs_zone_group_t *out, bool first_cached)
 {
     const cetrafs_superblock_t *raw_sb = cetrafs_sb_raw(sb);
     struct buffer_head *bh;
@@ -136,7 +197,8 @@ static int cetrafs_read_zg(struct super_block *sb, u32 zg_id, cetrafs_zone_group
         bool unlocked = READ_ONCE(cetrafs_zg_read_unlocked);
 
         for (attempt = 0; attempt < 5; attempt++) {
-            bh = cetrafs_bread_uncached_retry(sb, le64_to_cpu(raw_sb->zg_table_start) + zg_id);
+            bh = attempt == 0 && first_cached ? cetrafs_bread_retry(sb, le64_to_cpu(raw_sb->zg_table_start) + zg_id)
+                                              : cetrafs_bread_uncached_retry(sb, le64_to_cpu(raw_sb->zg_table_start) + zg_id);
             if (!bh)
                 return -EIO;
 
