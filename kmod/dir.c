@@ -533,6 +533,12 @@ struct cetrafs_dir_extents {
  * standing in for an address check -- and a dirent block's image copied
  * anywhere still carries a valid one. Arithmetic only, no I/O.
  */
+/* TEST ONLY: an unlink decrements a directory's size with no floor, as
+ * before audit 2026-11-14 N4 -- the control of tests/kernel/dir_size_floor.sh. */
+static bool cetrafs_dir_size_no_floor;
+cetrafs_test_param(dir_size_no_floor, cetrafs_dir_size_no_floor, bool, 0644);
+MODULE_PARM_DESC(dir_size_no_floor, "TEST ONLY: an unlink may wrap a directory's size below zero");
+
 /* TEST ONLY: no cap on a directory's blocks, as before audit 2026-11-14
  * RT-3 -- the control of tests/kernel/dir_extent_len_bound.sh. */
 static bool cetrafs_dir_len_unbounded;
@@ -1299,7 +1305,19 @@ int cetrafs_dir_remove_entry(struct inode *dir, const struct qstr *name, u64 exp
         return ret;
 
     now = ktime_get_real_seconds();
-    raw.size = cetrafs_cpu_to_le64(cetrafs_le64(raw.size) - (sizeof(cetrafs_dirent_t)));
+    /* Floored: a directory whose size was mis-counted -- a lost staged
+     * publish, a peer's damage -- wrapped to 2^64 here and read back as
+     * corrupt from then on (audit 2026-11-14 N4). A size below one entry
+     * with an entry still in it is wrong already; say so, keep it at 0,
+     * and let fsck recount it. */
+    if (cetrafs_le64(raw.size) < sizeof(cetrafs_dirent_t) && !READ_ONCE(cetrafs_dir_size_no_floor)) {
+        pr_warn_ratelimited("dir ino=%llu: size %llu is below the entry just removed -- holding it at 0 (fsck "
+                            "recounts it)\n",
+                            (unsigned long long) dir->i_ino, (unsigned long long) cetrafs_le64(raw.size));
+        raw.size = 0;
+    } else {
+        raw.size = cetrafs_cpu_to_le64(cetrafs_le64(raw.size) - (sizeof(cetrafs_dirent_t)));
+    }
     raw.dirent_seq = cetrafs_cpu_to_le64(cetrafs_dirent_seq_new(dir->i_sb)); /* this directory's blocks just changed -- see cetrafs_dirent_read() */
     raw.mtime = cetrafs_cpu_to_le64((u64) now);
     raw.ctime = cetrafs_cpu_to_le64((u64) now);
