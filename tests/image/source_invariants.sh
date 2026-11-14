@@ -2605,4 +2605,35 @@ N6_N="$(grep -c GFP_NOFS "$K/caw.c" || true)"
 [ -z "$(echo $N6_HITS)" ] && pass "N6: the namespace layer, ->alloc_inode and the CAS core allocate NOFS" ||
     fail "N6: GFP_KERNEL on a path that holds namespace locks or alloc_mutex, at: $(echo $N6_HITS)"
 
+# N2 (audit 2026-11-14): a walk over every inode on the volume runs for
+# as long as the volume is large, often under a VFS lock; one that does
+# not check for a fatal signal makes its caller unkillable. Every loop
+# bounded by inodes_count in the namespace layer checks it.
+# Negative control: a planted walk without the check.
+log "checking every whole-volume inode walk is killable (N2)"
+# unkillable_walks <file>...: file:line of each for-loop over an
+# inodes_count bound whose body never calls fatal_signal_pending().
+unkillable_walks() {
+    awk '
+        FNR == 1 { inl = 0; depth = 0 }
+        /^[[:space:]]*for \(.*<= *ninodes|^[[:space:]]*for \(.*inodes_count/ { inl = FNR; ld = depth; ok = 0 }
+        inl && /fatal_signal_pending\(/ { ok = 1 }
+        {
+            o = gsub(/\{/, "{"); c = gsub(/\}/, "}"); depth += o - c
+            if (inl && FNR > inl && depth <= ld) { if (!ok) print FILENAME ":" inl; inl = 0 }
+        }
+    ' "$@"
+}
+N2_SAMPLE="$(ct_tmp n2-sample.c)"
+printf '%s\n' 'int f(u64 ninodes)' '{' '    for (d = 1; d <= ninodes; d++) {' '        look(d);' '    }' \
+    '    for (d = 1; d <= ninodes; d++) {' '        if (fatal_signal_pending(current))' '            return -EINTR;' '    }' '}' >"$N2_SAMPLE"
+[ "$(unkillable_walks "$N2_SAMPLE" | tr '\n' ' ')" = "$N2_SAMPLE:3 " ] &&
+    pass "N2: control -- a planted walk without the check is found, one with it is not" ||
+    fail "N2: control -- the scan does not discriminate (got '$(unkillable_walks "$N2_SAMPLE" | tr '\n' ' ')')"
+N2_N="$(grep -cE 'for \(.*<= *ninodes' "$K/dir.c" || true)"
+[ "${N2_N:-0}" -ge 1 ] || fail "N2: setup: no inode walk found in dir.c -- the scan is not seeing the tree"
+N2_HITS="$(unkillable_walks "$K/dir.c" "$K/nslock.c" | sed "s|$K/||")"
+[ -z "$N2_HITS" ] && pass "N2: every whole-volume inode walk in the namespace layer is killable" ||
+    fail "N2: an inode walk with no fatal-signal check, at: $(echo $N2_HITS)"
+
 ct_exit

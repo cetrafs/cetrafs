@@ -2147,6 +2147,8 @@ static int cetrafs_dir_raw_visit(struct super_block *sb, const cetrafs_inode_t *
                     visit(priv, &de[e]);
             brelse(bh);
             cond_resched();
+            if (fatal_signal_pending(current))
+                return -EINTR; /* N2: a directory's worth of reads, killable */
         }
     }
     return 0;
@@ -2233,8 +2235,16 @@ int cetrafs_ns_count_names(struct super_block *sb, const u64 *inos, u32 n, u32 *
     for (d = 1; d <= ninodes; d++) {
         bool allocated = false;
 
-        if ((d & 255) == 0)
+        if ((d & 255) == 0) {
             cond_resched();
+            /* O(the volume), under the parent's VFS lock: killable (audit
+             * 2026-11-14 N2). The count is unknown, so nothing is
+             * decided; the lock stays stopped for the next taker. */
+            if (fatal_signal_pending(current)) {
+                ret = -EINTR;
+                goto out;
+            }
+        }
         ret = cetrafs_inode_is_allocated(sb, d, &allocated);
         if (ret)
             goto out;
