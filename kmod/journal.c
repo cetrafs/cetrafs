@@ -916,6 +916,7 @@ static bool cetrafs_journal_ignore_owner;
 cetrafs_test_param(journal_ignore_owner, cetrafs_journal_ignore_owner, bool, 0644);
 MODULE_PARM_DESC(journal_ignore_owner, "test-only: replay neither checks an entry's owner nor advances its stamp");
 
+
 static u64 cetrafs_journal_header_lba(const struct cetrafs_journal *j, u64 slot)
 {
     return j->area_start + 1 + slot * CETRAFS_JOURNAL_SLOT_BLOCKS;
@@ -1983,6 +1984,18 @@ struct cetrafs_journal_replay_entry {
  * happen to pass the guard; -EIO: its record or tree could not be read.
  * '*is_dir' is set whenever the record was read.
  */
+/* TEST ONLY: the next N owner-record reads fail as an unreadable record
+ * would (tests/kernel/journal_replay_owner_unreadable.sh). */
+static unsigned int cetrafs_journal_owner_read_fail;
+cetrafs_test_param(journal_owner_read_fail, cetrafs_journal_owner_read_fail, uint, 0644);
+MODULE_PARM_DESC(journal_owner_read_fail, "TEST ONLY: fail the next N journal replay owner-record reads with -EIO");
+
+/* TEST ONLY: the old fail-open verdict -- an owner that cannot be read
+ * leaves the entry to the guard alone. The control for the suite above. */
+static bool cetrafs_journal_owner_fail_open;
+cetrafs_test_param(journal_owner_fail_open, cetrafs_journal_owner_fail_open, bool, 0644);
+MODULE_PARM_DESC(journal_owner_fail_open, "TEST ONLY: judge an unreadable owner by the guard alone (the old behaviour)");
+
 static int cetrafs_journal_owner_holds(struct super_block *sb, const struct cetrafs_journal_replay_entry *e,
                                        bool *is_dir)
 {
@@ -1995,6 +2008,10 @@ static int cetrafs_journal_owner_holds(struct super_block *sb, const struct cetr
     if (!e->owner_ino || !raw_sb || e->owner_ino > le32_to_cpu(raw_sb->inodes_count))
         return 0; /* no writer of this format names no owner */
     cetrafs_invalidate_raw_inode(sb, e->owner_ino);
+    if (READ_ONCE(cetrafs_journal_owner_read_fail)) {
+        WRITE_ONCE(cetrafs_journal_owner_read_fail, cetrafs_journal_owner_read_fail - 1);
+        return -EIO; /* TEST ONLY */
+    }
     ret = cetrafs_read_raw_inode(sb, e->owner_ino, &raw);
     if (ret)
         return -EIO;
@@ -2683,8 +2700,38 @@ static int __cetrafs_journal_replay_node(struct super_block *sb, u32 node_id, bo
         owner_dir = false;
         owner_known = false;
         if (apply && !cetrafs_journal_ignore_owner) {
-            int held = cetrafs_journal_owner_holds(sb, &entries[s], &owner_dir);
+            int held = -EIO;
+            unsigned int otry;
 
+            /* An owner that cannot be read is retried with backoff: a
+             * record read fails for transient reasons (a path failover),
+             * and the verdict must not depend on one unlucky read. Still
+             * unreadable after that, the entry is refused and the area
+             * stays dirty -- the guard alone is not enough to redo a
+             * block whose owner we could not check (rule 6: a redo onto
+             * a reused block is the corruption this check exists for). */
+            for (otry = 0; otry < 5; otry++) {
+                held = cetrafs_journal_owner_holds(sb, &entries[s], &owner_dir);
+                if (held >= 0)
+                    break;
+                msleep(10U << otry);
+            }
+            if (held < 0 && READ_ONCE(cetrafs_journal_owner_fail_open)) {
+                held = 1; /* TEST ONLY: the old verdict */
+                pr_warn("journal replay: node %u txn %llu: owner ino %llu unreadable -- judging by the guard alone "
+                        "(test control)\n",
+                        node_id, (unsigned long long) entries[s].txn_id, (unsigned long long) entries[s].owner_ino);
+            } else if (held < 0) {
+                atomic64_inc(&cetrafs_journal_replay_refused);
+                pr_err("journal replay: node %u txn %llu: could not read owner ino %llu to confirm target block "
+                       "%llu is still its after retries -- entry kept, area stays dirty\n",
+                       node_id, (unsigned long long) entries[s].txn_id, (unsigned long long) entries[s].owner_ino,
+                       (unsigned long long) entries[s].target_lba);
+                brelse(tbh);
+                brelse(pbh);
+                ret = -EIO;
+                goto out_free;
+            }
             owner_known = held >= 0;
             if (held == 0 && !final_pass) {
                 deferred++; /* perhaps reachable once the rest is redone */
@@ -2699,11 +2746,6 @@ static int __cetrafs_journal_replay_node(struct super_block *sb, u32 node_id, bo
                        "(ino %llu, generation %llu) -- freed and reused since; NOT applying the entry\n",
                        node_id, (unsigned long long) entries[s].txn_id, (unsigned long long) entries[s].target_lba,
                        (unsigned long long) entries[s].owner_ino, (unsigned long long) entries[s].owner_generation);
-            } else if (held < 0) {
-                pr_warn("journal replay: node %u txn %llu: could not read owner ino %llu to confirm target block "
-                        "%llu is still its -- judging by the guard alone\n",
-                        node_id, (unsigned long long) entries[s].txn_id, (unsigned long long) entries[s].owner_ino,
-                        (unsigned long long) entries[s].target_lba);
             }
         }
 
