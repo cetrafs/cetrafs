@@ -1126,6 +1126,10 @@ static void fsck_set_dotdot(int fd, const cetrafs_superblock_t *sb, uint64_t dir
 
     if (!fsck_dotdot_settable(fd, sb, dir_ino, &in, blk, &lba))
         return;
+    /* Its record is restamped below (class 45); settable checked it, and
+     * the check stays where the restamp is. */
+    if (!fsck_record_restampable(&in, dir_ino))
+        return;
     de = (cetrafs_dirent_t *) blk;
     de[1].inode = cetrafs_cpu_to_le64(parent);
     fsck_stamp_dirent_block(blk);
