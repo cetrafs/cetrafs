@@ -380,7 +380,7 @@ static int cetrafs_journal_claim_mutate(void *image, unsigned int len, void *pri
         if (ctx->set_clean) {
             /* A park: entries still in the slots, or landing late, are
              * from before it (cetrafs_node_journal_hdr_t.park_seq). */
-            hdr->state = CETRAFS_NODE_JOURNAL_CLEAN;
+            hdr->state = cetrafs_cpu_to_le32(CETRAFS_NODE_JOURNAL_CLEAN);
             hdr->park_seq = cetrafs_cpu_to_le64(cetrafs_le64(hdr->park_seq) + 1);
         }
         return 0;
