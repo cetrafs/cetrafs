@@ -265,6 +265,11 @@ void cetrafs_deferred_unlist_locked(struct super_block *sb, struct buffer_head *
         }
         xa_unlock(xa);
     }
+    /* No longer held back: a cached image left in memory must carry a
+     * valid tail for whoever reads or writes it next (P9). */
+    if (!drop)
+        cetrafs_blk_tail_settle(bh);
+    clear_buffer_cetra_tail_stale(bh);
     clear_buffer_cetra_deferred(bh);
     if (drop) {
         clear_buffer_dirty(bh);

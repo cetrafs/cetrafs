@@ -341,6 +341,7 @@ void cetrafs_bh_read_unlock(struct buffer_head *bh)
  * complete, correctly-checksummed image from here on. */
 void cetrafs_bh_end_update(struct buffer_head *bh)
 {
+    cetrafs_blk_tail_settle(bh); /* dirty means writeback may write it: never with a stale tail */
     mark_buffer_dirty(bh);
     unlock_buffer(bh);
 }
@@ -621,6 +622,7 @@ int cetrafs_submit_deferred_target(struct super_block *sb, struct buffer_head *b
         unlock_buffer(bh);
         return 1;
     }
+    cetrafs_blk_tail_settle(bh); /* what reaches the device carries its CRC */
     *wcrc = ~crc32c(~0U, bh->b_data, CETRAFS_BLOCK_SIZE);
     clear_buffer_write_io_error(bh);
     clear_buffer_dirty(bh);
@@ -653,6 +655,7 @@ int cetrafs_write_deferred_target(struct super_block *sb, struct buffer_head *bh
         unlock_buffer(bh);
         return 1;
     }
+    cetrafs_blk_tail_settle(bh); /* what reaches the device carries its CRC */
     /* What this write puts on the device: the settle afterwards compares
      * the image in core with it, under the same lock. */
     *wcrc = ~crc32c(~0U, bh->b_data, CETRAFS_BLOCK_SIZE);
@@ -684,6 +687,16 @@ int cetrafs_write_deferred_target(struct super_block *sb, struct buffer_head *bh
 void cetrafs_bh_copy_stable(struct buffer_head *bh, void *out, size_t len)
 {
     cetrafs_bh_copy_stable_at(bh, 0, out, len);
+}
+
+/* The batch's payload copy of a held-back block: stamped first, so the
+ * journal's image and the target write carry the same, valid tail. */
+void cetrafs_bh_copy_settled(struct buffer_head *bh, void *out)
+{
+    lock_buffer(bh);
+    cetrafs_blk_tail_settle(bh);
+    memcpy(out, bh->b_data, CETRAFS_BLOCK_SIZE);
+    unlock_buffer(bh);
 }
 
 /* The same, from an offset into the block: the CAS layer copies and
@@ -992,6 +1005,20 @@ void cetrafs_forget_block(struct super_block *sb, sector_t block)
  */
 /* TEST ONLY: leave an extent block's eh_generation as it is (the
  * control for tests/kernel/journal_redo_leaf_aba.sh). */
+/* TEST ONLY: stamp every held-back edit's tail CRC at once, as before
+ * P9 -- the control of tests/kernel/deferred_tail_lazy.sh. */
+static bool cetrafs_tail_eager;
+cetrafs_test_param(deferred_tail_eager, cetrafs_tail_eager, bool, 0644);
+MODULE_PARM_DESC(deferred_tail_eager, "TEST ONLY: stamp a held-back tree block's tail CRC on every edit");
+
+/* Edits of a held-back block whose tail CRC was left for the boundary. */
+static atomic64_t cetrafs_tail_lazy = ATOMIC64_INIT(0);
+
+u64 cetrafs_tail_lazy_count(void)
+{
+    return (u64) atomic64_read(&cetrafs_tail_lazy);
+}
+
 static bool cetrafs_ext_gen_stamp_off;
 cetrafs_test_param(ext_gen_stamp_off, cetrafs_ext_gen_stamp_off, bool, 0644);
 MODULE_PARM_DESC(ext_gen_stamp_off, "TEST ONLY: do not stamp a new eh_generation on each extent-block write");
@@ -1016,6 +1043,31 @@ void cetrafs_blk_tail_stamp(struct buffer_head *bh, u32 magic)
         ((cetrafs_extent_hdr_t *) bh->b_data)->eh_generation = cetrafs_cpu_to_le32(get_random_u32());
 
     tail->magic = cetrafs_cpu_to_le32(magic);
+    /* A block already held back is not written until a boundary, and
+     * every path that takes its image out of memory -- the batch's
+     * payload copy, the target write, a single journal write, the end of
+     * the hold -- stamps it first (cetrafs_blk_tail_settle()). So its CRC
+     * waits for that, once, instead of costing a 4 KiB CRC per edit (audit
+     * 2026-11-14 P9). The generation above still moves on every edit, and
+     * is what the tree's cache identity tells edits apart by. */
+    if (buffer_cetra_deferred(bh) && !READ_ONCE(cetrafs_tail_eager)) {
+        set_buffer_cetra_tail_stale(bh);
+        atomic64_inc(&cetrafs_tail_lazy);
+        return;
+    }
+    clear_buffer_cetra_tail_stale(bh);
+    atomic64_inc(&cetrafs_update_crcs);
+    tail->crc = cetrafs_cpu_to_le32(~crc32c(~0U, bh->b_data, CETRAFS_BLK_TAIL_OFF));
+}
+
+/* Stamp a held-back block's tail if an edit left it stale. Under the
+ * buffer lock; a no-op for a block whose tail is current. */
+void cetrafs_blk_tail_settle(struct buffer_head *bh)
+{
+    cetrafs_blk_tail_t *tail = (cetrafs_blk_tail_t *) (bh->b_data + CETRAFS_BLK_TAIL_OFF);
+
+    if (!test_clear_buffer_cetra_tail_stale(bh))
+        return;
     atomic64_inc(&cetrafs_update_crcs);
     tail->crc = cetrafs_cpu_to_le32(~crc32c(~0U, bh->b_data, CETRAFS_BLK_TAIL_OFF));
 }
@@ -1068,6 +1120,15 @@ bool cetrafs_blk_image_valid(const void *img, u32 magic)
 
 bool cetrafs_blk_tail_valid(const struct buffer_head *bh, u32 magic)
 {
+    /* A held-back block with a stale tail is this node's own edit, still
+     * in memory (an uncached read returns a held buffer as it is): its
+     * CRC is stamped when it leaves memory. Its structure is checked as
+     * any block's is. */
+    if (buffer_cetra_tail_stale(bh)) {
+        const cetrafs_blk_tail_t *tail = (const cetrafs_blk_tail_t *) (bh->b_data + CETRAFS_BLK_TAIL_OFF);
+
+        return cetrafs_le32(tail->magic) == magic && cetrafs_blk_struct_ok(bh->b_data, magic);
+    }
     return cetrafs_blk_image_valid(bh->b_data, magic);
 }
 

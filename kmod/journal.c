@@ -1205,6 +1205,7 @@ static int cetrafs_journal_write_block_flags(struct super_block *sb, struct buff
         pbh = cetrafs_getblk_overwrite(sb, payload_lba);
         if (!pbh)
             goto journal_failed;
+        cetrafs_blk_tail_settle(bh); /* a held-back block's last edit, if it left the tail stale */
         memcpy(pbh->b_data, bh->b_data, CETRAFS_BLOCK_SIZE);
         cetrafs_bh_end_update(pbh);
 
@@ -1624,7 +1625,7 @@ static int cetrafs_journal_batch_chunk(struct super_block *sb, struct cetrafs_jo
             ok = false;
             break;
         }
-        cetrafs_bh_copy_stable(bhs[i], pb[i]->b_data, CETRAFS_BLOCK_SIZE);
+        cetrafs_bh_copy_settled(bhs[i], pb[i]->b_data);
         pcrc = ~crc32c(~0U, pb[i]->b_data, CETRAFS_BLOCK_SIZE);
         cetrafs_bh_end_update(pb[i]);
 

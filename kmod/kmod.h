@@ -753,6 +753,7 @@ int cetrafs_sync_buffer(struct super_block *sb, struct buffer_head *bh);
 int cetrafs_sync_buffer_keep(struct super_block *sb, struct buffer_head *bh);
 bool cetrafs_bh_test_stable(struct buffer_head *bh, bool (*test)(const void *data, void *arg), void *arg);
 void cetrafs_bh_copy_stable(struct buffer_head *bh, void *out, size_t len);
+void cetrafs_bh_copy_settled(struct buffer_head *bh, void *out);
 void cetrafs_bh_copy_stable_at(struct buffer_head *bh, unsigned int off, void *out, size_t len);
 int cetrafs_bh_memcmp_stable_at(struct buffer_head *bh, unsigned int off, const void *buf, size_t len);
 void cetrafs_bh_abort_update(struct buffer_head *bh);
@@ -1551,8 +1552,16 @@ int cetrafs_journal_write_deferred(struct super_block *sb, struct buffer_head **
  * bit, and every "does this buffer hold a write the device has not seen?"
  * asks cetrafs_bh_pending(). */
 #include <linux/buffer_head.h>
-enum { BH_CetraDeferred = BH_PrivateStart };
+enum { BH_CetraDeferred = BH_PrivateStart, BH_CetraTailStale };
 BUFFER_FNS(CetraDeferred, cetra_deferred)
+/* A held-back tree block edited since its tail was last stamped: the
+ * eh_generation and magic are current, the tail CRC is not. Stamped once
+ * where the image leaves memory (cetrafs_blk_tail_settle()), under the
+ * buffer lock. Only ever set on a buffer that is also CetraDeferred. */
+BUFFER_FNS(CetraTailStale, cetra_tail_stale)
+TAS_BUFFER_FNS(CetraTailStale, cetra_tail_stale)
+void cetrafs_blk_tail_settle(struct buffer_head *bh);
+u64 cetrafs_tail_lazy_count(void);
 static inline bool cetrafs_bh_pending(const struct buffer_head *bh)
 {
     return buffer_dirty(bh) || buffer_cetra_deferred(bh);
