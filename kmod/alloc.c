@@ -4073,8 +4073,36 @@ MODULE_PARM_DESC(bg_claim_keeps_free_gen, "TEST ONLY: claiming a free Block Grou
 struct cetrafs_bg_claim_ctx {
     u32 zg_id;
     u32 bg_id;
-    u64 seq; /* the count's ownership epoch on the image the claim landed on */
+    u64 seq;        /* the count's ownership epoch on the image the claim landed on */
+    u16 old_flags;  /* the flags before the claim, for its undo */
 };
+
+/* Give back a claim that landed but cannot be used: owner back to the
+ * pool, and the discard knowledge the claim cleared restored. Only over
+ * our own claim -- anything else is not ours to undo. free_gen keeps its
+ * bump: a stamp that drops more late copies is the safe direction. */
+static int cetrafs_bg_unclaim_mutate(void *image, unsigned int len, void *priv)
+{
+    struct cetrafs_bg_claim_ctx *ctx = priv;
+    cetrafs_block_group_t *bg = (cetrafs_block_group_t *) image;
+
+    if (!cetrafs_bg_image_ok(image, len))
+        return -EUCLEAN;
+    if (cetrafs_le16(bg->owner_zg) != ctx->zg_id)
+        return -EAGAIN;
+    bg->owner_zg = cetrafs_cpu_to_le16(CETRAFS_BG_OWNER_FREE);
+    bg->flags = cetrafs_cpu_to_le16(cetrafs_le16(bg->flags) | (ctx->old_flags & CETRAFS_BG_FLAG_DISCARDED));
+    memset((u8 *) image + offsetof(cetrafs_block_group_t, pad), 0, len - offsetof(cetrafs_block_group_t, pad));
+    bg->checksum = cetrafs_cpu_to_le64(0);
+    bg->checksum = cetrafs_cpu_to_le64(cetrafs_bg_image_crc(image, len));
+    return 0;
+}
+
+/* TEST ONLY: a claim whose bitmap drop fails is kept, owned and out of
+ * reach, as before -- the control of tests/kernel/pool_claim_drop_fail.sh. */
+static bool cetrafs_pool_claim_undo_off;
+cetrafs_test_param(pool_claim_undo_off, cetrafs_pool_claim_undo_off, bool, 0644);
+MODULE_PARM_DESC(pool_claim_undo_off, "TEST ONLY: keep a pool claim whose bitmap drop failed instead of undoing it");
 
 static int cetrafs_bg_claim_mutate(void *image, unsigned int len, void *priv)
 {
@@ -4099,6 +4127,7 @@ static int cetrafs_bg_claim_mutate(void *image, unsigned int len, void *priv)
         return -EAGAIN;
 
     ctx->seq = cetrafs_le64(bg->reconcile_seq);
+    ctx->old_flags = cetrafs_le16(bg->flags);
     bg->owner_zg = cetrafs_cpu_to_le16((u16) ctx->zg_id);
     /* A new tenure: a queued free stamped before it -- a late copy from
      * before the release, from the same Zone Group or any -- names
@@ -4844,12 +4873,32 @@ static int __cetrafs_bg_claim_one(struct super_block *sb, u32 zg_id, u32 b, bool
      * the cache on the allocation path. If its bitmap could not be
      * dropped, the group is ours on the device but stays out of the
      * map's reach: the cached bitmap may predate the previous owner's
-     * last allocations (audit 2026-11-14 A7). The next owner-map
-     * refresh retries the drop (cetrafs_bg_refresh_owner_map()). */
+     * last allocations (audit 2026-11-14 A7). Kept like that, it was
+     * owned on the device, out of every node's reach and not debited
+     * from the pool -- df overstated until a Zone Group claim or a
+     * remount (re-audit of the fixes). The claim is undone instead:
+     * back to the pool, nothing allocated from it, and the caller
+     * looks for another group. An undo that cannot land is a CAS
+     * failure, which stops the mount as every undecidable one does. */
     ret = cetrafs_bg_invalidate_cache(sb, b);
     if (ret && !cetrafs_bg_invalidate_fail_ignored) {
-        pr_warn("BG %u: claimed, but its cached bitmap could not be dropped (%d) -- left out of reach\n", b, ret);
-        return ret;
+        int uret;
+
+        if (READ_ONCE(cetrafs_pool_claim_undo_off)) {
+            pr_warn("BG %u: claimed, but its cached bitmap could not be dropped (%d) -- left out of reach\n", b,
+                    ret);
+            return ret;
+        }
+        uret = cetrafs_cas_record(sb, cetrafs_sb_bg_desc_lba(sb, b), cetrafs_bg_unclaim_mutate, &ctx);
+        if (uret < 0) {
+            pr_err("BG %u: claimed, its cached bitmap could not be dropped (%d), and the claim could not be undone "
+                   "(%d) -- owned and out of reach until a remount\n",
+                   b, ret, uret);
+            return ret;
+        }
+        pr_warn("BG %u: claimed, but its cached bitmap could not be dropped (%d) -- given back to the pool\n", b,
+                ret);
+        return -EAGAIN; /* try another group */
     }
     /* Ownership is entering this node's cache, so its count epoch
      * must too -- BEFORE set_bg_owner() makes the Block Group
