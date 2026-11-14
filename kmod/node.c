@@ -450,11 +450,13 @@ static int cetrafs_node_fence_mutate(void *image, unsigned int len, void *priv)
 struct cetrafs_node_depart_ctx {
     u8 my_uuid[CETRAFS_NODE_UUID_LEN];
     u32 my_incarnation;
+    u64 expect_epoch; /* the lease epoch this node last renewed under */
+    bool fenced;      /* out: a peer moved the lease; nothing was written */
 };
 
 static int cetrafs_node_depart_mutate(void *image, unsigned int len, void *priv)
 {
-    const struct cetrafs_node_depart_ctx *ctx = priv;
+    struct cetrafs_node_depart_ctx *ctx = priv;
     cetrafs_node_entry_t ne;
 
     memcpy(&ne, image, sizeof(ne));
@@ -469,6 +471,15 @@ static int cetrafs_node_depart_mutate(void *image, unsigned int len, void *priv)
         return 1;
     if (cetrafs_le32(ne.departure) != CETRAFS_NODE_DEPART_NONE)
         return 1; /* already recorded: ours, or a peer's verdict that stands */
+    /* A peer fenced us after our last renewal. The heartbeat may not have
+     * noticed yet (it looks once a tick), so the in-core flag cannot be
+     * trusted here: the row is the judge. A fenced node has no clean
+     * departure to announce -- its claims are not released, and the row
+     * must go stale and be reclaimed as a crashed node's (audit C8). */
+    if (cetrafs_le64(ne.fence_epoch) != ctx->expect_epoch) {
+        ctx->fenced = true;
+        return 1;
+    }
     if (!cetrafs_node_image_ok(&ne))
         return -EUCLEAN;
 
@@ -1411,15 +1422,21 @@ int cetrafs_node_mark_offline(struct super_block *sb, u32 my_node_id)
      * Renewal has always done it this way; this path blind-wrote the
      * whole row and could revert a peer's fence_epoch bump. */
     {
-        struct cetrafs_node_depart_ctx dctx = {.my_incarnation = cetrafs_sb_incarnation(sb)};
+        struct cetrafs_node_depart_ctx dctx = {.my_incarnation = cetrafs_sb_incarnation(sb),
+                                               .expect_epoch = cetrafs_sb_get_fence_epoch(sb)};
 
         ret = cetrafs_sb_get_node_uuid(sb, dctx.my_uuid);
         if (ret)
             return ret;
         ret = cetrafs_cas_record(sb, cetrafs_node_row_lba(sb, my_node_id), cetrafs_node_depart_mutate, &dctx);
+        if (ret < 0)
+            return ret;
+        if (dctx.fenced) {
+            pr_err("node mark-offline: row %u was fenced by a peer -- not recording a clean departure\n",
+                   my_node_id);
+            return -EIO;
+        }
     }
-    if (ret < 0)
-        return ret;
 
     ret = cetrafs_read_node_entry(sb, my_node_id, &check);
     if (ret)
