@@ -2127,6 +2127,28 @@ MODULE_PARM_DESC(run_alloc_fail_once, "TEST ONLY: fail the second bit of the nex
  * its caller down the recount path. */
 static bool cetrafs_alloc_force_enospc_once;
 cetrafs_test_param(alloc_force_enospc_once, cetrafs_alloc_force_enospc_once, bool, 0644);
+/* TEST ONLY: the next allocation's Block Group gets this many blocks
+ * of free count it does not have, aggregate included, and then finds
+ * itself full: the ENOSPC recount of tests/kernel/enospc_recount_aggregate.sh. */
+static unsigned int cetrafs_alloc_inflate_once;
+cetrafs_test_param(alloc_inflate_once, cetrafs_alloc_inflate_once, uint, 0644);
+MODULE_PARM_DESC(alloc_inflate_once, "TEST ONLY: inflate the next allocation's group count, then fail it ENOSPC");
+
+static bool cetrafs_alloc_test_enospc(struct super_block *sb, u32 bg_id)
+{
+    unsigned int n;
+
+    if (READ_ONCE(cetrafs_alloc_force_enospc_once) && xchg(&cetrafs_alloc_force_enospc_once, false))
+        return true;
+    n = READ_ONCE(cetrafs_alloc_inflate_once) ? xchg(&cetrafs_alloc_inflate_once, 0) : 0;
+    if (!n)
+        return false;
+    /* A count that lies, aggregate included, on a group then found full. */
+    cetrafs_sb_alloc_lock(sb);
+    cetrafs_bg_adjust_free_blocks(sb, bg_id, (s64) n);
+    cetrafs_sb_alloc_unlock(sb);
+    return true;
+}
 MODULE_PARM_DESC(alloc_force_enospc_once, "TEST ONLY: fail the next data allocation with ENOSPC, once");
 
 int cetrafs_alloc_data_block(struct super_block *sb, u32 bg_id, u64 *out_lba)
@@ -2135,8 +2157,8 @@ int cetrafs_alloc_data_block(struct super_block *sb, u32 bg_id, u64 *out_lba)
     long bit;
     int ret;
 
-    if (READ_ONCE(cetrafs_alloc_force_enospc_once) && xchg(&cetrafs_alloc_force_enospc_once, false))
-        return -ENOSPC; /* test-only; see the parameter */
+    if (unlikely(cetrafs_alloc_test_enospc(sb, bg_id)))
+        return -ENOSPC; /* test-only; see the parameters */
     if (cetrafs_sb_is_fenced(sb))
         return -EIO; /* self-fenced */
 
@@ -2242,7 +2264,7 @@ int cetrafs_alloc_block_anywhere(struct super_block *sb, u32 *out_bg, u64 *out_l
         if (ret != -ENOSPC)
             return ret;
 
-        if (cetrafs_bg_reconcile_free_count(sb, bg, &delta) != 0)
+        if (cetrafs_bg_recount_after_enospc(sb, bg, &delta) != 0)
             return ret;
         atomic64_inc(&cetrafs_bg_recounts);
         pr_warn_ratelimited("alloc: BG %u reported free space but its bitmap is full -- recounted (delta %lld)\n", bg,
@@ -2256,8 +2278,8 @@ int cetrafs_alloc_data_block_near(struct super_block *sb, u32 bg_id, u64 preferr
     struct cetrafs_bg_geom bg;
     int ret;
 
-    if (READ_ONCE(cetrafs_alloc_force_enospc_once) && xchg(&cetrafs_alloc_force_enospc_once, false))
-        return -ENOSPC; /* test-only; see the parameter */
+    if (unlikely(cetrafs_alloc_test_enospc(sb, bg_id)))
+        return -ENOSPC; /* test-only; see the parameters */
     if (cetrafs_sb_is_fenced(sb))
         return -EIO; /* self-fenced */
 
@@ -3772,7 +3794,7 @@ int cetrafs_bg_reconcile_free_count(struct super_block *sb, u32 bg_id, s64 *out_
     return ret;
 }
 
-static int __cetrafs_reconcile_locked(struct super_block *sb, u32 bg_id, s64 *out_delta);
+static int __cetrafs_reconcile_locked(struct super_block *sb, u32 bg_id, s64 *out_delta, s64 *out_agg);
 
 /* Under the flush right: the recount's write is a flight like a flush's
  * (cetrafs_bg_chunk.bg_flight_gen) -- see the swap below -- and two
@@ -3783,12 +3805,52 @@ static int cetrafs_reconcile_locked(struct super_block *sb, u32 bg_id, s64 *out_
 
     if (ret)
         return ret;
-    ret = __cetrafs_reconcile_locked(sb, bg_id, out_delta);
+    ret = __cetrafs_reconcile_locked(sb, bg_id, out_delta, NULL);
     cetrafs_sb_bg_flush_unlock(sb, bg_id);
     return ret;
 }
 
-static int __cetrafs_reconcile_locked(struct super_block *sb, u32 bg_id, s64 *out_delta)
+/* TEST ONLY: the ENOSPC recount corrects the Block Group and leaves its
+ * Zone Group's aggregate alone, as before audit 2026-11-14 A6 -- the
+ * control of tests/kernel/enospc_recount_aggregate.sh. */
+static bool cetrafs_recount_agg_off;
+cetrafs_test_param(recount_agg_off, cetrafs_recount_agg_off, bool, 0644);
+MODULE_PARM_DESC(recount_agg_off, "TEST ONLY: an ENOSPC recount does not correct the Zone Group aggregate");
+
+/*
+ * The recount after an allocation found a Block Group full that its
+ * count called free. The aggregate of its Zone Group summed the same
+ * wrong count, and is corrected by the same amount: the truth less what
+ * the group's count stood at, its dropped accrual included (that was in
+ * the aggregate too). fsck's aggregate check failed until the next
+ * ownership transfer otherwise (audit 2026-11-14 A6).
+ */
+int cetrafs_bg_recount_after_enospc(struct super_block *sb, u32 bg_id, s64 *out_delta)
+{
+    s64 agg = 0;
+    int ret;
+
+    if (out_delta)
+        *out_delta = 0;
+    if (!cetrafs_sb_raw(sb))
+        return -EINVAL;
+    cetrafs_sb_alloc_lock(sb);
+    ret = cetrafs_sb_bg_flush_lock(sb, bg_id);
+    if (!ret) {
+        ret = __cetrafs_reconcile_locked(sb, bg_id, out_delta, &agg);
+        cetrafs_sb_bg_flush_unlock(sb, bg_id);
+    }
+    if (!ret && agg && !READ_ONCE(cetrafs_recount_agg_off)) {
+        u32 zg = cetrafs_sb_bg_owner(sb, bg_id);
+
+        if (zg != CETRAFS_BG_OWNER_FREE)
+            cetrafs_zg_adjust_free_blocks(sb, zg, agg);
+    }
+    cetrafs_sb_alloc_unlock(sb);
+    return ret;
+}
+
+static int __cetrafs_reconcile_locked(struct super_block *sb, u32 bg_id, s64 *out_delta, s64 *out_agg)
 {
     struct cetrafs_bg_geom bg;
     u64 bmap_lba, bmap_blocks;
@@ -3873,6 +3935,10 @@ static int __cetrafs_reconcile_locked(struct super_block *sb, u32 bg_id, s64 *ou
         if (taken)
             pr_warn("BG %u: dropping an accrued free delta of %lld -- the count was recounted (epoch -> %llu)\n",
                     bg_id, (long long) taken, (unsigned long long) ctx.out_seq);
+        /* What the aggregate summed for this group was the count plus
+         * the accrual just dropped. */
+        if (out_agg)
+            *out_agg = delta - taken;
         /* Deltas accrued from here on belong to this fresh epoch. */
         cetrafs_sb_set_bg_epoch(sb, bg_id, ctx.out_seq);
         if (flight)

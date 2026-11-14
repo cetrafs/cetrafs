@@ -5875,7 +5875,7 @@ relookup:
                 {
                     s64 delta = 0;
 
-                    if (cetrafs_bg_reconcile_free_count(sb, bg_id, &delta) != 0)
+                    if (cetrafs_bg_recount_after_enospc(sb, bg_id, &delta) != 0)
                         return ret; /* cannot even recount: report the original */
                     pr_warn_ratelimited(
                         "alloc: BG %u reported free space but its bitmap is full -- recounted (delta %lld)\n", bg_id,

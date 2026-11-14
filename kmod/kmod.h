@@ -1085,6 +1085,7 @@ u64 cetrafs_dio_fallback_count(void);
 u64 cetrafs_dio_convert_count(void);
 int cetrafs_bg_owner_zg_for_lba(struct super_block *sb, u64 lba, u32 *out_zg_id);
 int cetrafs_bg_invalidate_cache(struct super_block *sb, u32 bg_id);
+int cetrafs_bg_recount_after_enospc(struct super_block *sb, u32 bg_id, s64 *out_delta);
 extern bool cetrafs_bg_invalidate_fail_ignored; /* test-only */
 extern bool cetrafs_alloc_shadow_enabled;
 void cetrafs_shadow_set(struct super_block *sb, u64 lba, u64 count, const char *who);
