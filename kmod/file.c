@@ -108,6 +108,16 @@ enum cetrafs_gb_mode {
     CETRAFS_GB_CONVERT,
     CETRAFS_GB_BUF,
     CETRAFS_GB_CONVERT_PENDING,
+    /*
+     * OVERWRITE is an O_DIRECT write under the SHARED inode_lock
+     * (cetrafs_dio_overwrite_write()). It maps a WRITTEN block and
+     * nothing else: it converts nothing and allocates nothing, because
+     * no exclusive lock is held to allocate under. A block that is not
+     * written is a hole to the reader (create == 0: unmapped, so the
+     * caller falls back) and a contradiction to the writer (create == 1:
+     * -EIO, never an allocation).
+     */
+    CETRAFS_GB_OVERWRITE,
 };
 
 /* TEST ONLY, and the negative control of the above: a buffered write
@@ -145,6 +155,36 @@ MODULE_PARM_DESC(dio_fill_holes,
 static bool cetrafs_dio_skip_convert;
 cetrafs_test_param(dio_skip_convert, cetrafs_dio_skip_convert, bool, 0644);
 MODULE_PARM_DESC(dio_skip_convert, "TEST ONLY: leave an O_DIRECT write's preallocated blocks unconverted");
+
+/* Shared-lock O_DIRECT overwrites (cetrafs_dio_overwrite_write()). Off
+ * restores the exclusive path for every O_DIRECT write: the A/B control
+ * of the concurrency suite. */
+static bool cetrafs_dio_shared_overwrite = true;
+cetrafs_test_param(dio_shared_overwrite, cetrafs_dio_shared_overwrite, bool, 0644);
+MODULE_PARM_DESC(dio_shared_overwrite,
+                 "TEST ONLY: an aligned O_DIRECT overwrite of written blocks runs under the shared inode_lock (0 = exclusive)");
+
+/* TEST ONLY: pause a shared-lock overwrite after its mapping is checked,
+ * still inside the shared section -- the window the race suite aims a
+ * punch, truncate or defrag into. */
+static unsigned int cetrafs_dio_overwrite_gap_ms;
+cetrafs_test_param(dio_overwrite_gap_ms, cetrafs_dio_overwrite_gap_ms, uint, 0644);
+MODULE_PARM_DESC(dio_overwrite_gap_ms, "TEST ONLY: pause a shared-lock overwrite between its check and its I/O");
+
+/* TEST ONLY, the negative control of the shared section: the overwrite
+ * takes no inode_lock at all, so the verdict is taken with nothing
+ * holding off a punch, truncate or defrag. */
+static bool cetrafs_dio_overwrite_nolock;
+cetrafs_test_param(dio_overwrite_nolock, cetrafs_dio_overwrite_nolock, bool, 0644);
+MODULE_PARM_DESC(dio_overwrite_nolock, "TEST ONLY: a shared-lock overwrite takes no inode_lock (negative control)");
+
+/* Overwrites that ran in the shared section (procfs dio_overwrites). */
+static atomic64_t cetrafs_dio_overwrites = ATOMIC64_INIT(0);
+
+u64 cetrafs_dio_overwrite_count(void)
+{
+    return (u64) atomic64_read(&cetrafs_dio_overwrites);
+}
 
 /* Test-only: fail an O_DIRECT write right after it allocated a block
  * (cetrafs_dio_get_block()), leaving that block allocated and unwritten. */
@@ -509,10 +549,197 @@ static ssize_t cetrafs_write_capacity(struct kiocb *iocb, struct iov_iter *from)
     return iov_iter_count(from);
 }
 
+/*
+ * Would this write strip a privilege? file_remove_privs() is a notify_change()
+ * into cetrafs_setattr(), which needs the exclusive lock, so such a write takes
+ * the exclusive path. The test is the VFS's own (dentry_needs_remove_privs()):
+ * a setuid or setgid bit, or a security.capability xattr (the capability LSM's
+ * need_killpriv). An xattr error other than "absent" counts as "may strip".
+ */
+static bool cetrafs_dio_may_strip_privs(struct file *file)
+{
+    struct inode *inode = file_inode(file);
+    struct super_block *sb = inode->i_sb;
+    cetrafs_inode_t *raw;
+    bool no_xattr;
+    int r;
+
+    if (inode->i_mode & (S_ISUID | S_ISGID))
+        return true;
+    /* The xattr block is in the record, and the record is read as the
+     * mapping reads it (the same trust gate as __cetrafs_get_block()). A
+     * file with no xattr block has no capability to strip, and this costs
+     * one record read -- not the xattr read below, which forces a fresh
+     * record and the xattr block on every call. A record that is not this
+     * file's, or cannot be read, takes the exclusive path, which asks again. */
+    raw = kmalloc(sizeof(*raw), GFP_NOFS);
+    if (!raw)
+        return true;
+    if (!cetrafs_lock_held_for_write_locally(inode))
+        cetrafs_invalidate_raw_inode(sb, inode->i_ino);
+    r = cetrafs_read_raw_inode_overlaid(sb, inode, raw);
+    if (r || cetrafs_le64(raw->generation) != cetrafs_inode_get_generation(inode)) {
+        kfree(raw);
+        return true;
+    }
+    no_xattr = !cetrafs_le64(raw->xattr_block);
+    kfree(raw);
+    if (no_xattr)
+        return false;
+    r = cetrafs_xattr_caps_size(inode);
+    return r > 0 || (r < 0 && r != -ENODATA && r != -EOPNOTSUPP);
+}
+
+/*
+ * Is every block of [pos, pos + count) written? 1 yes, 0 no (a hole, a
+ * preallocated block, or a pending one: take the exclusive path), < 0 an
+ * error. Caller holds inode_lock shared. Walks by the run each lookup
+ * reports, and never steps by less than one block: a run of zero would be
+ * a loop that never ends (CLAUDE.md rule 14).
+ */
+static int cetrafs_dio_overwrite_probe(struct inode *inode, loff_t pos, size_t count)
+{
+    unsigned int bits = inode->i_blkbits;
+    sector_t b = (sector_t) (pos >> bits);
+    sector_t end = (sector_t) ((pos + (loff_t) count) >> bits);
+
+    while (b < end) {
+        struct buffer_head bh = { 0 };
+        u64 step;
+        int ret;
+
+        bh.b_size = (size_t) ((end - b) << bits);
+        if (down_read_killable(&inode->i_mapping->invalidate_lock))
+            return -EINTR;
+        ret = __cetrafs_get_block(inode, b, &bh, 0, false, CETRAFS_GB_OVERWRITE);
+        up_read(&inode->i_mapping->invalidate_lock);
+        if (ret)
+            return ret;
+        if (!buffer_mapped(&bh))
+            return 0;
+        step = bh.b_size >> bits;
+        if (!step)
+            return 0;
+        b += min_t(u64, step, end - b);
+        cond_resched();
+    }
+    return 1;
+}
+
+/*
+ * An aligned O_DIRECT overwrite of WRITTEN blocks inside i_size, run under
+ * the SHARED inode_lock. ext4 and XFS take the same shared lock for it.
+ *
+ * Why the shared lock is enough. Every change that can free or remap a
+ * written block holds inode_lock EXCLUSIVELY: truncate (VFS, i_rwsem), punch
+ * and the other fallocate modes (inode_lock), the defrag mover
+ * (cetrafs_defrag_inode_lock_drained(), which also drains direct I/O), and
+ * the lock suspend (inode_lock, then inode_dio_wait). While this write holds
+ * the shared lock -- the mapping check, the submission, and for a synchronous
+ * write the completion -- none of them runs, and a new one waits for it. The
+ * DIO count (inode_dio_begin) also stays up until the completion, so a
+ * freeing path that drains direct I/O waits for an async write in flight.
+ * The paths that hold invalidate_lock but not inode_lock never free or remap
+ * a WRITTEN block: a fault and writeback allocate only holes, a DIO completion
+ * and the fsync-time conversion touch only preallocated blocks, and the pending
+ * set is preallocated too. Two shared writers may run together: each maps
+ * written blocks and writes them, and neither edits the tree.
+ *
+ * The verdict is not carried across the I/O on trust. The probe below checks
+ * every block of the range under invalidate_lock (shared), and the DIO's
+ * get_block checks each block again in CETRAFS_GB_OVERWRITE mode, which
+ * refuses rather than allocates. Under nofilelock a PEER can change the file
+ * outside this lock, as it can under the exclusive path: the same extent-cache
+ * freshness gate decides what this node reads, and a block a peer took away
+ * fails the write with -EIO instead of being allocated under a lock it does
+ * not hold.
+ *
+ * Only what the lock covers qualifies, and everything else takes the
+ * exclusive path unchanged: a direct write that is not block aligned (its
+ * partial blocks are zeroed through the convert machinery, which needs the
+ * exclusive section), NOWAIT, O_APPEND, a write reaching past i_size (a
+ * hole or preallocated block, or a size change), a write that would strip a
+ * privilege (cetrafs_dio_may_strip_privs(): stripping is a setattr, which
+ * needs the exclusive lock), or a range with any block that is not
+ * written (a hole, a preallocated block, or a buffered write still pending).
+ *
+ * The DIO is run through generic_file_direct_write(), not
+ * __generic_file_write_iter(): the latter falls back to a buffered write for
+ * a short direct write, and a write_begin under the shared lock would
+ * allocate. A short direct write is returned as the short count it is.
+ *
+ * Regression suite: tests/kernel/dio_overwrite_shared.sh (classification,
+ * concurrency, the exclusive control, and the race against punch, truncate
+ * and defrag with the window knob and its nolock negative control).
+ */
+static ssize_t cetrafs_dio_overwrite_write(struct kiocb *iocb, struct iov_iter *from, bool *took)
+{
+    struct file *file = iocb->ki_filp;
+    struct inode *inode = file_inode(file);
+    bool locked = !READ_ONCE(cetrafs_dio_overwrite_nolock);
+    unsigned int gap;
+    ssize_t ret;
+    int probe;
+
+    *took = false;
+    if (!READ_ONCE(cetrafs_dio_shared_overwrite) || !(iocb->ki_flags & IOCB_DIRECT) ||
+        (iocb->ki_flags & (IOCB_NOWAIT | IOCB_APPEND)))
+        return 0;
+
+    if (locked)
+        inode_lock_shared(inode);
+    ret = cetrafs_lock_write_gate(inode);
+    if (ret) {
+        *took = true;
+        goto out;
+    }
+    ret = generic_write_checks(iocb, from);
+    if (ret <= 0) {
+        *took = ret < 0;
+        goto out;
+    }
+    if (cetrafs_dio_unaligned(inode, iocb, from) || iocb->ki_pos + (loff_t) ret > i_size_read(inode) ||
+        cetrafs_dio_may_strip_privs(file)) {
+        ret = 0;
+        goto out;
+    }
+
+    probe = cetrafs_dio_overwrite_probe(inode, iocb->ki_pos, iov_iter_count(from));
+    if (probe <= 0) {
+        ret = probe; /* 0: not all written, the exclusive path; < 0: failed */
+        *took = probe < 0;
+        goto out;
+    }
+    *took = true;
+
+    cetrafs_inode_shared_dio_adjust(inode, 1);
+    ret = file_update_time(file);
+    if (!ret) {
+        gap = READ_ONCE(cetrafs_dio_overwrite_gap_ms);
+        if (unlikely(gap))
+            msleep(gap);
+        ret = generic_file_direct_write(iocb, from);
+        if (ret > 0 || ret == -EIOCBQUEUED)
+            atomic64_inc(&cetrafs_dio_overwrites);
+    }
+    cetrafs_inode_shared_dio_adjust(inode, -1);
+out:
+    if (locked)
+        inode_unlock_shared(inode);
+    if (*took && ret > 0)
+        ret = generic_write_sync(iocb, ret);
+    return ret;
+}
+
 static ssize_t cetrafs_file_write_iter(struct kiocb *iocb, struct iov_iter *from)
 {
     struct inode *inode = file_inode(iocb->ki_filp);
     ssize_t ret;
+    bool took;
+
+    ret = cetrafs_dio_overwrite_write(iocb, from, &took);
+    if (took)
+        return ret;
 
     if (iocb->ki_flags & IOCB_NOWAIT) {
         if (!inode_trylock(inode))
@@ -675,6 +902,29 @@ static int cetrafs_dio_get_block(struct inode *inode, sector_t iblock, struct bu
     if (!ret && buffer_new(bh_result) && READ_ONCE(cetrafs_dio_fail_after_alloc_once) &&
         xchg(&cetrafs_dio_fail_after_alloc_once, false))
         ret = -EIO;
+    return ret;
+}
+
+/*
+ * The DIO get_block of a shared-lock overwrite (cetrafs_dio_overwrite_write()).
+ * It holds invalidate_lock SHARED, not exclusive: it maps a written block
+ * and nothing else, so there is no tree edit for the exclusive lock to
+ * exclude -- the shared lock excludes only a mover (a split, a move, a
+ * convert in another range) that would make this lookup miss. Taken per
+ * call, not across the whole DIO, for the reason cetrafs_dio_get_block()
+ * gives: the DIO code pins user pages between calls.
+ */
+static int cetrafs_dio_get_block_overwrite(struct inode *inode, sector_t iblock, struct buffer_head *bh_result,
+                                           int create)
+{
+    int ret;
+
+    if (!create)
+        return cetrafs_get_block_read(inode, iblock, bh_result, 0);
+    if (down_read_killable(&inode->i_mapping->invalidate_lock))
+        return -EINTR;
+    ret = __cetrafs_get_block(inode, iblock, bh_result, create, false, CETRAFS_GB_OVERWRITE);
+    up_read(&inode->i_mapping->invalidate_lock);
     return ret;
 }
 
@@ -900,8 +1150,15 @@ static ssize_t cetrafs_direct_IO(struct kiocb *iocb, struct iov_iter *iter)
      * maps with create == 1 and stays direct (enum cetrafs_gb_mode).
      * With it, those inside i_size fall back to buffered -- but a write
      * past i_size still maps here, preallocated like any other, so the
-     * completion that converts it is passed either way. */
-    return __blockdev_direct_IO(iocb, inode, inode->i_sb->s_bdev, iter, cetrafs_dio_get_block, cetrafs_dio_end_io,
+     * completion that converts it is passed either way.
+     *
+     * A write while a shared-lock overwrite is in its section can only be
+     * that overwrite: the exclusive i_rwsem and the shared one exclude each
+     * other, so the count is non-zero only for the writer that raised it. */
+    return __blockdev_direct_IO(iocb, inode, inode->i_sb->s_bdev, iter,
+                                cetrafs_inode_shared_dio_active(inode) ? cetrafs_dio_get_block_overwrite :
+                                                                         cetrafs_dio_get_block,
+                                cetrafs_dio_end_io,
                                 DIO_LOCKING | (READ_ONCE(cetrafs_dio_fill_holes) ? 0 : DIO_SKIP_HOLES));
 }
 
@@ -5673,6 +5930,17 @@ relookup:
         }
         cetrafs_tree_move_backoff();
         goto relookup;
+    }
+    /* A shared-lock overwrite maps written blocks only (enum
+     * cetrafs_gb_mode, OVERWRITE). A pending block is uninit in the tree,
+     * so it is refused here too, before the pending-set mapping below
+     * could make it data for this write. */
+    if (mode == CETRAFS_GB_OVERWRITE && (!found || uninit)) {
+        if (!create)
+            return 0; /* not written: the caller takes the exclusive path */
+        pr_err_ratelimited("ino=%llu: block %llu is not written under a shared-lock overwrite -- refusing to allocate\n",
+                           (unsigned long long) inode->i_ino, (unsigned long long) iblock);
+        return -EIO;
     }
     /* A buffered write's block, not yet converted: data to this node
      * (enum cetrafs_gb_mode) -- to a reader, a DIO, writeback, a second

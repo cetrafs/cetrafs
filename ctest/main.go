@@ -357,7 +357,7 @@ func runMaster(cfg masterConfig) (bool, error) {
 		"concurrent-rename", "read-presence", "inode-reuse", "link-stale-reuse", "inode-unique", "dirent-cache", "extent-leaf-staleness",
 		"record-write-race", "dirent-torn", "caw", "pending-free", "scrub-transit", "hypervisor-storm", "ns-fuzz",
 		"create-visibility",
-		"fence-reclaim", "replay-race", "direct-write", "zero-range", "fstrim-pool", "defrag-yield", "handback-unknown", "churn-trim", "rename-loop", "damage-incarnation", "cas-image-check", "grow-twice", "grow-unrescanned", "sweep-vs-open-replay", "replay-after-truncate", "zg-claim-vs-replay", "reader-reattach", "twin-watch", "frees-in-flight", "repair-claim-race", "reader-reclaim",
+		"fence-reclaim", "replay-race", "direct-write", "direct-overwrite", "zero-range", "fstrim-pool", "defrag-yield", "handback-unknown", "churn-trim", "rename-loop", "damage-incarnation", "cas-image-check", "grow-twice", "grow-unrescanned", "sweep-vs-open-replay", "replay-after-truncate", "zg-claim-vs-replay", "reader-reattach", "twin-watch", "frees-in-flight", "repair-claim-race", "reader-reclaim",
 		"space-accounting",
 		"sparse-bigfile",
 		"grow-live",
@@ -445,6 +445,8 @@ func dispatchScenario(cfg masterConfig, clients []*Client) (bool, error) {
 		return RunFenceReclaim(clients, cfg.testDir)
 	case "direct-write":
 		return RunDirectWrite(clients, cfg.testDir)
+	case "direct-overwrite":
+		return RunDirectOverwrite(clients, cfg.testDir)
 	case "zero-range":
 		return RunZeroRange(clients, cfg.testDir)
 	case "fstrim-pool":

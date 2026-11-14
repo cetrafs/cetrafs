@@ -403,6 +403,9 @@ u64 cetrafs_zg_claim_replay_deferral_count(void);
 bool cetrafs_sb_in_reclaim_lock(struct super_block *sb);
 bool cetrafs_sb_ro_refuses(struct super_block *sb, const char *what);
 void cetrafs_inode_set_wb_failed(struct inode *inode, bool failed);
+/* lock.c: the shared-lock O_DIRECT overwrite count (file.c). */
+void cetrafs_inode_shared_dio_adjust(struct inode *inode, int delta);
+bool cetrafs_inode_shared_dio_active(struct inode *inode);
 bool cetrafs_inode_wb_failed(struct inode *inode);
 u64 cetrafs_sb_stamp_ns(struct super_block *sb);
 u64 cetrafs_sb_stamp_now(struct super_block *sb);
@@ -1095,6 +1098,8 @@ u64 cetrafs_map_call_count(void);
 u64 cetrafs_map_block_count(void);
 u64 cetrafs_dio_fallback_count(void);
 u64 cetrafs_dio_convert_count(void);
+u64 cetrafs_dio_overwrite_count(void);
+int cetrafs_xattr_caps_size(struct inode *inode);
 int cetrafs_bg_owner_zg_for_lba(struct super_block *sb, u64 lba, u32 *out_zg_id);
 int cetrafs_bg_invalidate_cache(struct super_block *sb, u32 bg_id);
 int cetrafs_bg_recount_after_enospc(struct super_block *sb, u32 bg_id, s64 *out_delta);

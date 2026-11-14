@@ -299,6 +299,15 @@ out:
 }
 
 /*
+ * security.capability's size (file.c, cetrafs_dio_may_strip_privs()): what
+ * the VFS asks before a write strips privileges. -ENODATA when absent.
+ */
+int cetrafs_xattr_caps_size(struct inode *inode)
+{
+    return cetrafs_xattr_get(inode, "security.capability", NULL, 0);
+}
+
+/*
  * Core setxattr/removexattr (value==NULL means remove, matching
  * vfs_removexattr's call into handler->set()). 'name' is already the full
  * namespaced name, as in cetrafs_xattr_get(). Allocates the inode's one

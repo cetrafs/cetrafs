@@ -363,6 +363,13 @@ struct cetrafs_inode_info {
      * read path, where it must stay a plain in-core bool. */
     bool lock_suspended;
 
+    /* O_DIRECT overwrites running under the SHARED inode_lock right now
+     * (file.c, cetrafs_dio_overwrite_write()). Raised and lowered only
+     * under that shared lock, so it is non-zero only while no exclusive
+     * i_rwsem holder can run; cetrafs_direct_IO() reads it to choose the
+     * block-mapping variant. Atomic because the shared holders are many. */
+    atomic_t shared_dio_writers;
+
     /* Serializes THIS node's own threads over the per-inode namespace
      * lock (nslock.c); the on-disk field arbitrates between nodes. Kept
      * separate from lock_mutex, which guards open/close refcounting --
@@ -549,6 +556,21 @@ void cetrafs_inode_drop_reservation(struct inode *inode)
 static inline struct cetrafs_inode_info *CETRAFS_I(struct inode *inode)
 {
     return container_of(inode, struct cetrafs_inode_info, vfs_inode);
+}
+
+/* file.c: an O_DIRECT overwrite enters and leaves the shared section
+ * around its mapping and I/O (see cetrafs_dio_overwrite_write()). */
+void cetrafs_inode_shared_dio_adjust(struct inode *inode, int delta)
+{
+    if (delta > 0)
+        atomic_inc(&CETRAFS_I(inode)->shared_dio_writers);
+    else
+        atomic_dec(&CETRAFS_I(inode)->shared_dio_writers);
+}
+
+bool cetrafs_inode_shared_dio_active(struct inode *inode)
+{
+    return atomic_read(&CETRAFS_I(inode)->shared_dio_writers) != 0;
 }
 
 void cetrafs_inode_set_wb_failed(struct inode *inode, bool failed)
@@ -1445,6 +1467,10 @@ static void cetrafs_inode_init_once(void *foo)
     struct cetrafs_inode_info *ci = foo;
 
     INIT_LIST_HEAD(&ci->deferred);
+    /* Balanced inc/dec under the shared lock: zero whenever the inode is
+     * idle, so set once here and never reset (a reset would unbalance a
+     * writer in flight). */
+    atomic_set(&ci->shared_dio_writers, 0);
     ci->smap = NULL; /* evict drops it, so a recycled object has none */
     mutex_init(&ci->lock_mutex);
     spin_lock_init(&ci->resv_lock);
