@@ -96,6 +96,7 @@ int main(int argc, char **argv)
         fprintf(stderr, "       %s <backing-file> setsize <ino> <bytes> (as a PEER extending it would)\n", argv[0]);
         fprintf(stderr, "       %s <backing-file> reuse <ino> <gen> <node> (a peer reused the number)\n", argv[0]);
         fprintf(stderr, "       %s <backing-file> size <ino>           (print the on-disk size)\n", argv[0]);
+        fprintf(stderr, "       %s <backing-file> mtime <ino>          (print the on-disk mtime)\n", argv[0]);
         fprintf(stderr, "       %s <backing-file> nsget <ino>          (print mode (octal) and nlink)\n", argv[0]);
         fprintf(stderr, "       %s <backing-file> bumpseq <ino>        (advance dirent_seq, as a peer would)\n", argv[0]);
         fprintf(stderr, "       %s <backing-file> extents <ino>       (prints depth/entries/blocks)\n", argv[0]);
@@ -655,6 +656,11 @@ int main(int argc, char **argv)
 
         pread_all(fd, &rec, sizeof(rec), rec_off);
         printf("%llu\n", (unsigned long long) cetrafs_le64(rec.size));
+    } else if (strcmp(mode, "mtime") == 0) {
+        cetrafs_inode_t rec;
+
+        pread_all(fd, &rec, sizeof(rec), rec_off);
+        printf("%llu\n", (unsigned long long) cetrafs_le64(rec.mtime));
     } else if (strcmp(mode, "xattrblk") == 0) {
         /* Print the record's xattr block, or set it (as a peer that
          * dropped or moved the file's xattrs would). */

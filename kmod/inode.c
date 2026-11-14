@@ -2321,15 +2321,25 @@ static unsigned int cetrafs_apply_refresh_stall_ms;
 cetrafs_test_param(apply_refresh_stall_ms, cetrafs_apply_refresh_stall_ms, uint, 0644);
 MODULE_PARM_DESC(apply_refresh_stall_ms, "TEST ONLY: widen a refresh's dirty-check-to-store window");
 
+/* TEST ONLY: unpublished times decline a peer's record apply, as before
+ * -- the control of tests/kernel/fdatasync_peer_refresh.sh. */
+static bool cetrafs_apply_times_decline;
+cetrafs_test_param(apply_times_decline, cetrafs_apply_times_decline, bool, 0644);
+MODULE_PARM_DESC(apply_times_decline, "TEST ONLY: unpublished atime/mtime decline a peer's record apply");
+
 /*
  * Does this node hold state for the inode that the device does not have
  * yet? An extent shadow not yet published, or a file-domain stat field
  * that differs from the baseline -- the record as this node last read
  * or stamped it. No baseline means no answer, which counts as yes.
  *
- * The fields are exactly the ones writeback's own "nothing to publish"
- * test compares (cetrafs_write_vfs_inode()): size, blocks, atime and
- * mtime are what a dirty inode can carry unpublished. The namespace
+ * Size and blocks are what a dirty inode can carry unpublished that the
+ * apply would lose. Its atime and mtime can be unpublished too -- an
+ * fdatasync leaves time-only dirt for writeback, up to 30 s -- but they
+ * do not decline the apply: declining would hold a peer's size and
+ * identity back for that long (a read past the stale size returns
+ * short). The apply keeps this node's unpublished times instead
+ * (the apply below), and writeback publishes them. The namespace
  * fields are not deferred -- chmod, chown and link-count changes write
  * their sector before they return -- and the baseline is installed from
  * the file-sector image, where they read as zero.
@@ -2345,8 +2355,10 @@ static bool cetrafs_inode_has_unpublished_state(struct inode *inode)
         return true;
     if (!cetrafs_inode_stat_baseline_get(inode, &b))
         return true;
-    return b.size != (u64) i_size_read(inode) || b.blocks != (u64) inode->i_blocks ||
-           b.atime != (u64) inode_get_atime_sec(inode) || b.mtime != (u64) inode_get_mtime_sec(inode);
+    if (READ_ONCE(cetrafs_apply_times_decline)) /* TEST ONLY: the old guard */
+        if (b.atime != (u64) inode_get_atime_sec(inode) || b.mtime != (u64) inode_get_mtime_sec(inode))
+            return true;
+    return b.size != (u64) i_size_read(inode) || b.blocks != (u64) inode->i_blocks;
 }
 
 /* TEST ONLY: the next apply loses its inode_lock trylock, as it does to
@@ -2677,12 +2689,24 @@ static int __cetrafs_apply_raw_to_vfs_inode(struct inode *inode, const cetrafs_i
         goto out_unlock;
 
     label_stale = cetrafs_inode_label_may_be_stale(inode, raw);
-    cetrafs_inode_adopt_identity(inode, raw);
-    set_nlink(inode, cetrafs_le32(raw->nlink));
-    i_size_write(inode, cetrafs_le64(raw->size));
-    inode->i_blocks = cetrafs_le64(raw->blocks);
-    inode_set_atime(inode, (time64_t) cetrafs_le64(raw->atime), 0);
-    inode_set_mtime(inode, (time64_t) cetrafs_le64(raw->mtime), 0);
+    /* This node's times not yet published (an fdatasync left them for
+     * writeback) are newer than what it last saw on the device: they
+     * stay, and the inode stays dirty, so writeback publishes them over
+     * the baseline set below. */
+    {
+        struct cetrafs_stat_baseline b;
+        bool have_b = cetrafs_inode_stat_baseline_get(inode, &b);
+        time64_t at = inode_get_atime_sec(inode), mt = inode_get_mtime_sec(inode);
+        bool keep_at = have_b && (u64) at != b.atime;
+        bool keep_mt = have_b && (u64) mt != b.mtime;
+
+        cetrafs_inode_adopt_identity(inode, raw);
+        set_nlink(inode, cetrafs_le32(raw->nlink));
+        i_size_write(inode, cetrafs_le64(raw->size));
+        inode->i_blocks = cetrafs_le64(raw->blocks);
+        inode_set_atime(inode, keep_at ? at : (time64_t) cetrafs_le64(raw->atime), 0);
+        inode_set_mtime(inode, keep_mt ? mt : (time64_t) cetrafs_le64(raw->mtime), 0);
+    }
     inode_set_ctime(inode, (time64_t) cetrafs_le64(raw->ctime), 0);
     cetrafs_inode_stat_baseline_set(inode, raw);
     up_write(&inode->i_mapping->invalidate_lock);
