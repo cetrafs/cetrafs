@@ -411,24 +411,54 @@ static unsigned int cetrafs_dmpath_read_fail;
 cetrafs_test_param(dmpath_read_fail, cetrafs_dmpath_read_fail, uint, 0644);
 MODULE_PARM_DESC(dmpath_read_fail, "TEST ONLY: fail the next N passthrough READs of a dm path's block 0");
 
-/* 0: the path is a 1:1 map of the device. -EXDEV: it is provably not
- * (no superblock, a different block 0) -- a different device, not a
- * failing path. -EIO: it could not be read, so nothing is known. */
+/*
+ * One block of the STACKED device, read from the device itself. Not the
+ * buffer cache: a cached copy is what a peer's write leaves behind (the
+ * needs-fsck mark, a grow), and this read decides a path's fate.
+ * bdev_rw_virt() goes straight to the device and does not touch the
+ * cache at all, which is the only freshness this one-off read needs.
+ */
+static int cetrafs_dmpath_dev_read(struct block_device *bdev, u64 byte_off, void *buf)
+{
+    return bdev_rw_virt(bdev, byte_off >> SECTOR_SHIFT, buf, CETRAFS_BLOCK_SIZE, REQ_OP_READ) ? -EIO : 0;
+}
+
+/*
+ * 0: the path is a 1:1 map of the device, as far as it can be proven
+ * here. -EXDEV: it is provably not (no superblock, another volume, a
+ * differing last block) -- a different device, not a failing path.
+ * -EIO: it could not be read, so nothing is known.
+ *
+ * Block 0 is compared on the identity fields the superblock carries for
+ * the whole life of the volume -- magic and UUID -- and NOT byte for
+ * byte: the mark a peer sets when it finds the volume needs fsck, and a
+ * grow, rewrite block 0 while the path keeps the same LUN (audit C6). A
+ * byte compare then refused every path in the window between that write
+ * and the next look, and the failover that wanted a path had none.
+ *
+ */
 static int cetrafs_dmpath_identical(struct block_device *dm_bdev, struct scsi_device *sdev, const char *pname)
 {
     unsigned int lbs = bdev_logical_block_size(dm_bdev);
     unsigned int nblocks;
-    struct buffer_head *bh;
-    void *buf;
+    u64 nr_blocks;
+    const cetrafs_superblock_t *psb, *dsb;
+    void *pbuf = NULL, *dbuf = NULL;
     int ret = -EXDEV;
 
     if (!lbs || lbs > CETRAFS_BLOCK_SIZE || CETRAFS_BLOCK_SIZE % lbs)
         return -EXDEV;
     nblocks = CETRAFS_BLOCK_SIZE / lbs;
+    nr_blocks = bdev_nr_bytes(dm_bdev) / CETRAFS_BLOCK_SIZE;
+    if (nr_blocks < 2)
+        return -EXDEV;
 
-    buf = kzalloc(CETRAFS_BLOCK_SIZE, GFP_KERNEL);
-    if (!buf)
-        return -EIO;
+    pbuf = kzalloc(CETRAFS_BLOCK_SIZE, GFP_KERNEL);
+    dbuf = kzalloc(CETRAFS_BLOCK_SIZE, GFP_KERNEL);
+    if (!pbuf || !dbuf) {
+        ret = -EIO;
+        goto out;
+    }
 
     if (cetrafs_dmpath_read_fail) {
         cetrafs_dmpath_read_fail--;
@@ -436,31 +466,33 @@ static int cetrafs_dmpath_identical(struct block_device *dm_bdev, struct scsi_de
         ret = -EIO;
         goto out;
     }
-    if (cetrafs_dmpath_read(sdev, 0, nblocks, buf, lbs)) {
+    if (cetrafs_dmpath_read(sdev, 0, nblocks, pbuf, lbs)) {
         pr_warn("dm path: %s does not answer a passthrough READ -- not usable for CAW\n", pname);
         ret = -EIO;
         goto out;
     }
-
-    if (cetrafs_le32(((const cetrafs_superblock_t *) buf)->magic) != CETRAFS_MAGIC) {
+    psb = pbuf;
+    if (cetrafs_le32(psb->magic) != CETRAFS_MAGIC) {
         pr_warn("dm path: %s has no cetrafs superblock at LBA 0 -- refusing to send CAW to it\n", pname);
         goto out;
     }
 
-    bh = __bread_gfp(dm_bdev, 0, CETRAFS_BLOCK_SIZE, GFP_KERNEL);
-    if (!bh) {
+    if (cetrafs_dmpath_dev_read(dm_bdev, 0, dbuf)) {
         ret = -EIO;
         goto out;
     }
-    ret = memcmp(bh->b_data, buf, CETRAFS_BLOCK_SIZE) == 0 ? 0 : -EXDEV;
-    brelse(bh);
-
-    if (ret)
-        pr_warn("dm path: %s block 0 differs from the mapped device's -- the mapping is not 1:1 "
+    dsb = dbuf;
+    if (cetrafs_le32(dsb->magic) != CETRAFS_MAGIC || memcmp(dsb->uuid, psb->uuid, sizeof(dsb->uuid))) {
+        pr_warn("dm path: %s block 0 is not the mapped device's volume (magic or UUID) -- the mapping is not 1:1 "
                 "(a partition or an offset?), refusing to send CAW to it\n",
                 pname);
+        goto out;
+    }
+
+    ret = 0;
 out:
-    kfree(buf);
+    kfree(pbuf);
+    kfree(dbuf);
     return ret;
 }
 
