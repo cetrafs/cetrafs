@@ -86,8 +86,8 @@ PF_FREE_AFTER="$(stat -f -c '%f' "$PF_MNT")"
 
 # --- the queue now spans CAS REGIONS ------------------------------------
 # Appending and draining are lock-free compare-and-swaps over one CAS
-# region at a time (512 B = 32 slots), not the whole 4 KiB block, so a
-# queue holding more than 32 entries is the case that actually walks
+# region at a time (512 B = 16 slots of 32 bytes), not the whole 4 KiB block, so a
+# queue holding more than 16 entries is the case that actually walks
 # region to region. Queue 40 distinct single-block extents from the
 # probe file's own BG and confirm every one is applied exactly once.
 umount "$PF_MNT"

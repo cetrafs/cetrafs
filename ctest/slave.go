@@ -1752,6 +1752,9 @@ var settableModParams = map[string]bool{
 	"pf_append_stall_ms":      true,
 	"alloc_run_blocks":        true,
 	"scrub_ignore_peer_frees": true,
+	// foreign-free-batch: the control (one swap per extent) and the full queue.
+	"pf_batch_size":       true,
+	"pf_force_queue_full": true,
 	// grow-twice: the layout refresh at ENOSPC is the only way to a
 	// grow (heartbeat refresh off); its control turns that off too.
 	"layout_refresh_hb_off":      true,

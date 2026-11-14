@@ -107,6 +107,7 @@ func RunForeignFreeBatch(clients []*Client, baseDir string) (bool, error) {
 	// unlinkByB: B deletes f and reports what its queue appends did.
 	type phaseResult struct {
 		entries, swaps, leaks int64
+		cas                   int64
 		wall                  time.Duration
 		err                   error
 	}
@@ -115,6 +116,7 @@ func RunForeignFreeBatch(clients []*Client, baseDir string) (bool, error) {
 		e0, _ := infoCounter(b, "pending_free_entries")
 		s0, _ := infoCounter(b, "pending_free_appends")
 		l0, _ := infoCounter(b, "foreign_free_leaks")
+		c0, _ := infoCounter(b, "cas_ops")
 		t0 := time.Now()
 		resp, e := b.Call("unlink", UnlinkArgs{Path: f})
 		r.wall = time.Since(t0)
@@ -122,7 +124,8 @@ func RunForeignFreeBatch(clients []*Client, baseDir string) (bool, error) {
 		e1, _ := infoCounter(b, "pending_free_entries")
 		s1, _ := infoCounter(b, "pending_free_appends")
 		l1, _ := infoCounter(b, "foreign_free_leaks")
-		r.entries, r.swaps, r.leaks = e1-e0, s1-s0, l1-l0
+		c1, _ := infoCounter(b, "cas_ops")
+		r.entries, r.swaps, r.leaks, r.cas = e1-e0, s1-s0, l1-l0, c1-c0
 		return r
 	}
 
@@ -136,7 +139,7 @@ func RunForeignFreeBatch(clients []*Client, baseDir string) (bool, error) {
 	if r1.err != nil {
 		return false, fmt.Errorf("%s: unlink (batched): %w", b.Name, r1.err)
 	}
-	fmt.Printf("  batched:      %d entries in %d swap(s), unlink %.2fs\n", r1.entries, r1.swaps, r1.wall.Seconds())
+	fmt.Printf("  batched:      %d entries in %d swap(s), %d CAS op(s), unlink %.2fs\n", r1.entries, r1.swaps, r1.cas, r1.wall.Seconds())
 	check(&ok, "setup: the unlink queued the extents to "+a.Name+"'s queue (one entry per extent)",
 		r1.entries >= int64(n)*9/10,
 		fmt.Sprintf("%d entries for %d extents", r1.entries, n))
@@ -159,7 +162,7 @@ func RunForeignFreeBatch(clients []*Client, baseDir string) (bool, error) {
 	if r2.err != nil {
 		return false, fmt.Errorf("%s: unlink (one-per-swap): %w", b.Name, r2.err)
 	}
-	fmt.Printf("  one-per-swap: %d entries in %d swap(s), unlink %.2fs\n", r2.entries, r2.swaps, r2.wall.Seconds())
+	fmt.Printf("  one-per-swap: %d entries in %d swap(s), %d CAS op(s), unlink %.2fs\n", r2.entries, r2.swaps, r2.cas, r2.wall.Seconds())
 	check(&ok, fmt.Sprintf("control: pf_batch_size=1 gives one swap per entry (%d for %d)", r2.swaps, r2.entries),
 		r2.entries >= int64(n)*9/10 && r2.swaps >= r2.entries*9/10 && r2.swaps <= r2.entries,
 		"the knob does not restore the one-per-extent path, so the batched count proves nothing")
@@ -180,8 +183,8 @@ func RunForeignFreeBatch(clients []*Client, baseDir string) (bool, error) {
 	if r3.err != nil {
 		return false, fmt.Errorf("%s: unlink (concurrent): %w", b.Name, r3.err)
 	}
-	fmt.Printf("  concurrent:   %d entries in %d swap(s), unlink %.2fs, %s draining every 1 s\n",
-		r3.entries, r3.swaps, r3.wall.Seconds(), a.Name)
+	fmt.Printf("  concurrent:   %d entries in %d swap(s), %d CAS op(s), unlink %.2fs, %s draining every 1 s\n",
+		r3.entries, r3.swaps, r3.cas, r3.wall.Seconds(), a.Name)
 
 	// ---- recovery: A alone applies the queue, then fsck ----------------
 	if err := ensureUnmounted(two); err != nil {
