@@ -55,12 +55,17 @@ require_module
 DEV="$(ct_big_dev 1200 enospcleak)"
 MNT="$(ct_mnt enospcleak)"
 
+# fsck's exit status is not the question here (it exits nonzero on the
+# very leak counted), and under pipefail it killed run_fill's subshell
+# mid-way once the negative control's mount began to stop at its first
+# close (FD-2) -- the harness cleanup then ran inside it and the suite
+# timed out. Read the report, ignore the status.
 leaked_count() {
-    ct_fsck "$1" 2>&1 |
+    { ct_fsck "$1" 2>&1 || true; } |
         sed -n 's/^WARN: \([0-9]*\) data block(s) marked in use but referenced by no inode.*/\1/p' |
         head -1
 }
-overlap_count() { ct_fsck "$1" 2>&1 | grep -c "more than one inode" || true; }
+overlap_count() { { ct_fsck "$1" 2>&1 || true; } | grep -c "more than one inode" || true; }
 
 # Fill to ENOSPC with one writer (8 MiB files until dd fails for space),
 # a concurrent `sync` loop forcing write_inode to race the appends.
@@ -89,6 +94,12 @@ run_fill() {
     local files lk ov
     files="$(fill_to_enospc "$MNT")"
     sync
+    ct_umount "$MNT"
+    # With the bug restored the mount now STOPS at the first close it
+    # cannot convert (FD-2), so its row never departs cleanly and fsck
+    # would wait out the stale window -- four minutes. A remount
+    # re-attaches the row and leaves cleanly; it frees nothing.
+    ct_mount "$DEV" "$MNT"
     ct_umount "$MNT"
     lk="$(leaked_count "$DEV")"; lk="${lk:-0}"
     ov="$(overlap_count "$DEV")"; ov="${ov:-0}"
