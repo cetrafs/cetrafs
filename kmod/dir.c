@@ -1457,8 +1457,18 @@ struct cetrafs_lookup_ctx {
  * same type (the VFS has already refused a directory/non-directory
  * mismatch), so the directory's subdirectory count cannot change.
  */
+/* TEST ONLY: a rename-over retargets whatever the slot names, as before
+ * audit 2026-11-14 N1 -- the control of tests/kernel/retarget_names_locked_inode.sh. */
+static unsigned int cetrafs_rename_verify_stall_ms;
+cetrafs_test_param(rename_verify_stall_ms, cetrafs_rename_verify_stall_ms, uint, 0644);
+MODULE_PARM_DESC(rename_verify_stall_ms, "TEST ONLY: pause the next rename-over between its target check and its retarget");
+static bool cetrafs_retarget_expect_off;
+cetrafs_test_param(retarget_expect_off, cetrafs_retarget_expect_off, bool, 0644);
+MODULE_PARM_DESC(retarget_expect_off, "TEST ONLY: a rename-over does not check the slot names the locked inode");
+
 static int cetrafs_dir_retarget_entry(struct inode *dir,
                                       const struct qstr *name,
+                                      u64 expect_ino,
                                       u64 new_ino,
                                       u8 new_file_type,
                                       u64 *out_old_ino,
@@ -1526,6 +1536,20 @@ static int cetrafs_dir_retarget_entry(struct inode *dir,
 
     if (!slot)
         return -ENOENT;
+
+    /* The name must still name the inode the rename locked, as for a
+     * remove (cetrafs_dir_remove_entry()): the caller decrements the
+     * count of whatever the slot named, and a slot naming another inode
+     * would have it mutate a record it holds no lock on. Nothing is
+     * written; the VFS retries the rename against what is there now
+     * (audit 2026-11-14 N1). */
+    if (cetrafs_le64(slot->inode) != expect_ino && !READ_ONCE(cetrafs_retarget_expect_off)) {
+        pr_warn_ratelimited("dir ino=%llu: '%.*s' names ino=%llu, not the locked ino=%llu -- refusing the rename\n",
+                            (unsigned long long) dir->i_ino, (int) name->len, name->name,
+                            (unsigned long long) cetrafs_le64(slot->inode), (unsigned long long) expect_ino);
+        brelse(bh);
+        return -ESTALE;
+    }
 
     *out_old_ino = cetrafs_le64(slot->inode);
     *out_old_file_type = slot->file_type;
@@ -3298,6 +3322,14 @@ static int cetrafs_rename_locked(struct mnt_idmap *idmap,
             *out_target_changed = true;
             return -EBUSY;
         }
+        if (new_inode && READ_ONCE(cetrafs_rename_verify_stall_ms)) {
+            unsigned int pause = xchg(&cetrafs_rename_verify_stall_ms, 0);
+
+            if (pause) {
+                pr_info("rename: target verified, pausing %u ms (test)\n", pause);
+                msleep(pause); /* test-only, see the knob */
+            }
+        }
     }
 
     if (old_inode == new_inode)
@@ -3479,8 +3511,8 @@ static int cetrafs_rename_locked(struct mnt_idmap *idmap,
          * to other processes throughout the renaming operation") and
          * removes the window in which a failure here could destroy the
          * target while leaving the source in place. */
-        ret = cetrafs_dir_retarget_entry(new_dir, &new_dentry->d_name, old_ino, old_file_type, &removed_ino,
-                                         &removed_file_type);
+        ret = cetrafs_dir_retarget_entry(new_dir, &new_dentry->d_name, new_inode->i_ino, old_ino, old_file_type,
+                                         &removed_ino, &removed_file_type);
         if (ret)
             goto out_unremove;
 
