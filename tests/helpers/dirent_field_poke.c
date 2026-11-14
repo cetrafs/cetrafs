@@ -4,7 +4,10 @@
  * block on a raw, UNMOUNTED cetrafs image, restamping the block's tail
  * CRC so the block stays checksum-valid.
  *
- * usage: dirent_field_poke <image> <block> <slot> <name_len|file_type> <value>
+ * usage: dirent_field_poke <image> <block> <slot> <name_len|file_type|inode> <value>
+ *
+ * inode 0 unnames the entry, as an unlink that never reached the target's
+ * record would leave it.
  *
  * The class this reproduces is "valid CRC, impossible content": a block
  * every reader accepts by its checksum and structure check, whose entry
@@ -33,7 +36,7 @@ int main(int argc, char **argv)
     int fd;
 
     if (argc != 6) {
-        fprintf(stderr, "usage: %s <image> <block> <slot> <name_len|file_type> <value>\n", argv[0]);
+        fprintf(stderr, "usage: %s <image> <block> <slot> <name_len|file_type|inode> <value>\n", argv[0]);
         return 2;
     }
     fd = open(argv[1], O_RDWR);
@@ -56,6 +59,8 @@ int main(int argc, char **argv)
         de[slot].name_len = cetrafs_cpu_to_le16((uint16_t) value);
     else if (!strcmp(argv[4], "file_type"))
         de[slot].file_type = (uint8_t) value;
+    else if (!strcmp(argv[4], "inode"))
+        de[slot].inode = cetrafs_cpu_to_le64((uint64_t) value);
     else {
         fprintf(stderr, "unknown field %s\n", argv[4]);
         return 2;

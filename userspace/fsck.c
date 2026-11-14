@@ -903,6 +903,32 @@ static int fsck_dir_block(const cetrafs_inode_t *in, uint32_t n, uint64_t total_
  * content pass, in the two repair paths that do not have the BG tables
  * to hand; a block past the end of the device holds no dirent either
  * way, so dropping it loses nothing a walk could have found. */
+/* Whether a depth-0 directory's extents are what fsck_dir_block() and
+ * fsck_dir_link() assume: every entry on the device and non-empty, and
+ * numbered densely in array order (entry e starts at the sum of the
+ * lengths before it). fsck_dir_nblocks() drops a bad entry, so on any
+ * other shape the count, the block walk and the ee_block a new extent is
+ * given all disagree -- a link would write past what the kernel maps, or
+ * over a logical block another extent already names. Such a directory is
+ * reported by the walk and left alone here. */
+static int fsck_dir_extents_dense(const cetrafs_inode_t *dir, uint64_t total_blocks)
+{
+    uint64_t next = 0;
+
+    if (cetrafs_le16(dir->eh.eh_depth) != 0 || cetrafs_le16(dir->eh.eh_entries) > 4)
+        return 0;
+    for (uint32_t e = 0; e < cetrafs_le16(dir->eh.eh_entries); ++e) {
+        uint64_t len = cetrafs_le32(dir->et.leaf[e].ee_len) & CETRAFS_EXT_LEN_MASK;
+        uint64_t phys = ((uint64_t) cetrafs_le16(dir->et.leaf[e].ee_start_hi) << 32) | cetrafs_le32(dir->et.leaf[e].ee_start_lo);
+
+        if (len == 0 || !fsck_lba_in_range(phys, total_blocks) || phys + len > total_blocks ||
+            cetrafs_le32(dir->et.leaf[e].ee_block) != next)
+            return 0;
+        next += len;
+    }
+    return 1;
+}
+
 static uint32_t fsck_dir_nblocks(const cetrafs_inode_t *dir, uint64_t total_blocks)
 {
     uint64_t n = 0;
@@ -955,6 +981,13 @@ static int fsck_dir_link(int fd,
         return -1;
     if (cetrafs_le16(dir.eh.eh_depth) != 0)
         return -1;
+    if (!fsck_dir_extents_dense(&dir, cetrafs_le64(sb->total_blocks))) {
+        fprintf(stderr,
+                "WARN: directory inode %" PRIu64 " has an extent this tool cannot extend (empty, off the device or "
+                "out of order), so no name was written into it\n",
+                dir_ino);
+        return -1;
+    }
     nblocks = fsck_dir_nblocks(&dir, cetrafs_le64(sb->total_blocks));
 
     for (uint32_t n = 0; n < nblocks; ++n) {
@@ -1060,6 +1093,30 @@ linked:
  * assume '..' is the second entry of the first block -- every directory
  * this filesystem creates is built that way, and the namespace pass has
  * already reported any that is not. */
+/* Whether fsck_set_dotdot() can repoint dir_ino's '..': a valid record,
+ * a dense depth-0 tree, and a first block that is sound with '..' second.
+ * Asked BEFORE the directory is linked anywhere, so a directory whose
+ * '..' cannot be moved is not given a parent that it would then deny
+ * (re-audit of the 2026-11-14 fixes). Fills *blk and *lba. */
+static int fsck_dotdot_settable(int fd, const cetrafs_superblock_t *sb, uint64_t dir_ino, cetrafs_inode_t *in,
+                                uint8_t *blk, uint64_t *lba)
+{
+    const cetrafs_dirent_t *de = (const cetrafs_dirent_t *) blk;
+
+    fsck_read_inode(fd, sb, dir_ino, in);
+    /* Its record is restamped by the caller (class 45). */
+    if (!fsck_record_restampable(in, dir_ino) || !fsck_dir_extents_dense(in, cetrafs_le64(sb->total_blocks)))
+        return 0;
+    if (fsck_dir_block(in, 0, cetrafs_le64(sb->total_blocks), lba))
+        return 0;
+    pread_all(fd, blk, CETRAFS_BLOCK_SIZE, (off_t) *lba * CETRAFS_BLOCK_SIZE);
+    /* The restamp below makes the block VALID whatever it held: only a
+     * block shown sound may be (U6, the same rule as fsck_dir_link()). */
+    if (!fsck_dirent_block_sound(blk, sb, 1, dir_ino))
+        return 0;
+    return cetrafs_le16(de[1].name_len) == 2 && de[1].name[0] == '.' && de[1].name[1] == '.';
+}
+
 static void fsck_set_dotdot(int fd, const cetrafs_superblock_t *sb, uint64_t dir_ino, uint64_t parent)
 {
     cetrafs_inode_t in;
@@ -1067,16 +1124,9 @@ static void fsck_set_dotdot(int fd, const cetrafs_superblock_t *sb, uint64_t dir
     cetrafs_dirent_t *de;
     uint64_t lba = 0;
 
-    fsck_read_inode(fd, sb, dir_ino, &in);
-    /* Its record is restamped below (class 45). */
-    if (!fsck_record_restampable(&in, dir_ino))
+    if (!fsck_dotdot_settable(fd, sb, dir_ino, &in, blk, &lba))
         return;
-    if (fsck_dir_block(&in, 0, cetrafs_le64(sb->total_blocks), &lba))
-        return;
-    pread_all(fd, blk, sizeof(blk), (off_t) lba * CETRAFS_BLOCK_SIZE);
     de = (cetrafs_dirent_t *) blk;
-    if (!(cetrafs_le16(de[1].name_len) == 2 && de[1].name[0] == '.' && de[1].name[1] == '.'))
-        return;
     de[1].inode = cetrafs_cpu_to_le64(parent);
     fsck_stamp_dirent_block(blk);
     pwrite_all(fd, blk, sizeof(blk), (off_t) lba * CETRAFS_BLOCK_SIZE);
@@ -4698,7 +4748,25 @@ int main(int argc, char **argv)
                     if (ft == CETRAFS_FT_DIR && !is_dir[ino])
                         ft = CETRAFS_FT_REG;
                     snprintf(nm, sizeof(nm), "#%" PRIu64, ino);
-                    if (lfino &&
+                    /* A directory whose '..' cannot be repointed is not
+                     * linked: lost+found would name it while its '..'
+                     * named the old parent, and the restamp that
+                     * repointing needs is refused on an unsound block. */
+                    int dotdot_ok = 1;
+
+                    if (is_dir[ino]) {
+                        cetrafs_inode_t din;
+                        uint8_t dblk[CETRAFS_BLOCK_SIZE];
+                        uint64_t dlba = 0;
+
+                        dotdot_ok = fsck_dotdot_settable(fd, &sb, ino, &din, dblk, &dlba);
+                        if (!dotdot_ok)
+                            fprintf(stderr,
+                                    "WARN: directory inode %" PRIu64 " has no sound first block with '..' to "
+                                    "repoint, so it is not linked into /lost+found\n",
+                                    ino);
+                    }
+                    if (lfino && dotdot_ok &&
                         !fsck_dir_link(fd, &sb, cetrafs_le32(sb.block_group_count), bg_data_start, bg_data_cnt, bg_bmap_lba, lfino,
                                        nm, ino, ft)) {
                         /* A recovered DIRECTORY's '..' must name its new
@@ -4716,7 +4784,7 @@ int main(int argc, char **argv)
                     } else {
                         fprintf(stderr,
                                 "WARN: inode %" PRIu64 " could not be linked into /lost+found (%s) -- left unnamed\n",
-                                ino, lfino ? "no room in it" : "no lost+found");
+                                ino, !lfino ? "no lost+found" : !dotdot_ok ? "its '..' cannot be repointed" : "no room in it");
                     }
                 }
             } else if (!is_dir[ino] && refs[ino] != nlinks[ino]) {
