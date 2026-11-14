@@ -1003,6 +1003,38 @@ void cetrafs_tree_invalidate_cached(struct inode *inode, const cetrafs_inode_t *
  * filefrag of one fallocated 16 GiB image on an FC array made ~880
  * FIEMAP calls, re-read its 1,021 tree blocks on each, and held the
  * inode lock for 285 s. */
+/* TEST ONLY: a whole-tree walk reads its leaves one at a time, as before
+ * P12 -- the control of tests/kernel/tree_walk_readahead.sh. */
+static bool cetrafs_flatten_prefetch_off;
+cetrafs_test_param(flatten_prefetch_off, cetrafs_flatten_prefetch_off, bool, 0644);
+MODULE_PARM_DESC(flatten_prefetch_off, "TEST ONLY: a tree walk reads its extent leaves one at a time");
+
+/*
+ * P12: the leaves under one index block are read ahead together when the
+ * walk will read them from the cache (the same predicate the per-leaf
+ * reader uses), so the device sees them in flight at once instead of one
+ * round trip per leaf. Only the cached path benefits: an untrusted leaf is
+ * read fresh, and a read-ahead would only add a second read of it. Each
+ * leaf is still read and checked by the per-leaf reader below; a leaf
+ * address that is not a data address is not read ahead.
+ */
+static void cetrafs_flatten_readahead(struct inode *inode, const cetrafs_extent_idx_t *iarr, u32 iln, bool reader)
+{
+    struct super_block *sb = inode->i_sb;
+    u32 li;
+
+    if (iln < 2 || READ_ONCE(cetrafs_flatten_prefetch_off))
+        return;
+    if (!(reader ? cetrafs_lock_read_cache_trusted(inode) : cetrafs_lock_held_for_write_locally(inode)))
+        return;
+    for (li = 0; li < iln; li++) {
+        u64 llba = cetrafs_extent_phys_from_hilo(iarr[li].ei_leaf_hi, iarr[li].ei_leaf_lo);
+
+        if (cetrafs_lba_run_check(sb, llba, 1) == 0)
+            sb_breadahead(sb, llba);
+    }
+}
+
 static int cetrafs_tree_flatten_for(struct inode *inode, const cetrafs_inode_t *raw, cetrafs_extent_t **out_arr,
                                     u32 *out_n, bool reader)
 {
@@ -1024,6 +1056,7 @@ static int cetrafs_tree_flatten_for(struct inode *inode, const cetrafs_inode_t *
         ihdr = (const cetrafs_extent_hdr_t *) ibh->b_data;
         iarr = (const cetrafs_extent_idx_t *) (ibh->b_data + sizeof(*ihdr));
         iln = min_t(u32, cetrafs_le16(ihdr->eh_entries), CETRAFS_EXT_BLOCK_MAX_IDX);
+        cetrafs_flatten_readahead(inode, iarr, iln, reader);
 
         for (li = 0; li < iln; li++) {
             u64 llba = cetrafs_extent_phys_from_hilo(iarr[li].ei_leaf_hi, iarr[li].ei_leaf_lo);
