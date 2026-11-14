@@ -2114,7 +2114,7 @@ static int cetrafs_zg_queue_span(struct super_block *sb, u32 zg_id, u64 *out_sta
  * teardown phase.
  *
  * A CAS covers one region (cetrafs_cas_region_size(), a logical block --
- * 512 B on the real LUN, so 32 slots), not the whole 4 KiB block, so the
+ * 512 B on the real LUN, so 16 slots of 32 bytes), not the whole 4 KiB block, so the
  * queue is walked region by region.
  */
 #define CETRAFS_PF_PER_REGION(sb) (cetrafs_cas_region_size(sb) / sizeof(cetrafs_pending_free_t))
@@ -2124,6 +2124,19 @@ struct cetrafs_pf_append_ctx {
     u32 n;                             /* how many */
     u32 placed;                        /* placed by the LAST mutate run */
 };
+
+/* Does this region image have a free slot? The append path's snapshot uses
+ * it to skip a full region without a swap. A snapshot only chooses where to
+ * try -- the swap's own compare decides -- so a wrong answer costs a swap. */
+static bool cetrafs_pf_region_has_room(const cetrafs_pending_free_t *ent, unsigned int region)
+{
+    unsigned int e, slots = region / sizeof(*ent);
+
+    for (e = 0; e < slots; e++)
+        if (!ent[e].lba)
+            return true;
+    return false;
+}
 
 /* Fill the free slots of one region with the head of ents[], in order, as
  * many as fit. The CAS runs this on a fresh image on every attempt, so
@@ -2265,7 +2278,10 @@ int cetrafs_zg_queue_foreign_frees(struct super_block *sb,
                                    u32 *dropped)
 {
     struct cetrafs_pf_append_ctx ctx;
-    unsigned int regions = CETRAFS_BLOCK_SIZE / cetrafs_cas_region_size(sb);
+    unsigned int region = cetrafs_cas_region_size(sb);
+    unsigned int regions = CETRAFS_BLOCK_SIZE / region;
+    unsigned int pass;
+    u8 *snap = NULL, *seed = NULL;
     u64 qstart;
     u32 qblocks, qb, next = 0;
     int ret = 0;
@@ -2288,45 +2304,79 @@ int cetrafs_zg_queue_foreign_frees(struct super_block *sb,
     if (cetrafs_sb_zg_pf_backoff_active(sb, zg_id))
         goto queue_full;
 
-    /* Each swap places the head of what is left into the first region with
-     * room. The scan starts at block 0 every time: the drain's quiet probe
-     * stops at CETRAFS_PF_DRAIN_EMPTY_RUN empty blocks, which is only sound
-     * while appends fill from the front, so no cursor may skip the front. */
-    for (qb = 0; qb < qblocks && next < n; qb++) {
-        unsigned int r;
+    /* Where the swaps go. The scan starts at block 0 on every pass: the
+     * drain's quiet probe stops at CETRAFS_PF_DRAIN_EMPTY_RUN empty blocks,
+     * which is only sound while appends fill from the front, so no cursor
+     * may skip the front.
+     *
+     * Each block is read ONCE per pass, forced fresh, into a snapshot, and
+     * the snapshot picks the regions to try: a region it shows full costs no
+     * I/O, and a region with room gets one seeded CAS whose first compare is
+     * the snapshot's image. A stale snapshot costs only that swap -- the CAS
+     * miscompares, re-reads, and the mutator runs on the live image, which
+     * is full (-EEXIST: next region) or has room (it places). The CAS decides;
+     * the snapshot only chooses where to try. The scan this replaces paid one
+     * CAS, one device read, for every full region ahead of the swap, so each
+     * swap cost O(full regions) and a delete of N extents cost O(N^2/16). */
+    snap = kmalloc(CETRAFS_BLOCK_SIZE, GFP_NOFS);
+    seed = kmalloc(region, GFP_NOFS);
+    if (!snap || !seed) {
+        ret = -ENOMEM;
+        goto append_failed_free;
+    }
 
-        for (r = 0; r < regions && next < n; r++) {
-            /* Test-only: behave as a full region. Deliberately inside
-             * the loop, so the SCAN still happens and is counted --
-             * modelling a queue that is full, not one that is skipped.
-             * The CAS is not issued, so the test does not pay for I/O
-             * it is only counting. */
-            if (cetrafs_pf_force_queue_full)
-                continue;
-            ctx.ents = &ents[next];
-            ctx.n = n - next;
-            ctx.placed = 0;
-            ret = cetrafs_cas_region(sb, qstart + qb, r, cetrafs_pf_append_mutate, &ctx);
-            if (ret == 0) {
-                u64 runs, blocks;
+    for (pass = 0; pass < 2 && next < n; pass++) {
+        for (qb = 0; qb < qblocks && next < n; qb++) {
+            struct buffer_head *bh = cetrafs_bread_uncached_retry(sb, qstart + qb);
+            unsigned int r;
 
-                /* ctx.placed is what the winning swap carried: see the mutator. */
-                next += ctx.placed;
-                atomic64_inc(&cetrafs_pending_appends);
-                atomic64_add(ctx.placed, &cetrafs_pending_entries);
-                /* Space again: say what the burst cost, once. */
-                if (cetrafs_sb_zg_pf_take_drops(sb, zg_id, &runs, &blocks))
-                    pr_warn("pending free: ZG %u queue drained; %llu run(s)/%llu block(s) "
-                            "were dropped while it was full and stay allocated until the "
-                            "owner's scrub or fsck -r reclaims them\n",
-                            zg_id, (unsigned long long) runs, (unsigned long long) blocks);
-                continue;
+            if (!bh) {
+                ret = -EIO;
+                goto append_failed_free;
             }
-            if (ret == -EEXIST || ret == -EBUSY)
-                continue; /* region full, or lost the race too often: move on */
-            goto append_failed;
+            memcpy(snap, bh->b_data, CETRAFS_BLOCK_SIZE);
+            brelse(bh);
+
+            for (r = 0; r < regions && next < n; r++) {
+                const u8 *img = snap + (size_t) r * region;
+
+                /* Test-only: behave as a full region. Deliberately inside
+                 * the loop, so the READ still happens and is counted --
+                 * modelling a queue that is full, not one that is skipped.
+                 * The CAS is not issued, so the test does not pay for I/O
+                 * it is only counting. */
+                if (cetrafs_pf_force_queue_full)
+                    continue;
+                if (!cetrafs_pf_region_has_room((const cetrafs_pending_free_t *) img, region))
+                    continue;
+                memcpy(seed, img, region);
+                ctx.ents = &ents[next];
+                ctx.n = n - next;
+                ctx.placed = 0;
+                ret = cetrafs_cas_region_seeded(sb, qstart + qb, r, seed, region, cetrafs_pf_append_mutate, &ctx);
+                if (ret == 0) {
+                    u64 runs, blocks;
+
+                    /* ctx.placed is what the winning swap carried: see the mutator. */
+                    next += ctx.placed;
+                    atomic64_inc(&cetrafs_pending_appends);
+                    atomic64_add(ctx.placed, &cetrafs_pending_entries);
+                    /* Space again: say what the burst cost, once. */
+                    if (cetrafs_sb_zg_pf_take_drops(sb, zg_id, &runs, &blocks))
+                        pr_warn("pending free: ZG %u queue drained; %llu run(s)/%llu block(s) "
+                                "were dropped while it was full and stay allocated until the "
+                                "owner's scrub or fsck -r reclaims them\n",
+                                zg_id, (unsigned long long) runs, (unsigned long long) blocks);
+                    continue;
+                }
+                if (ret == -EEXIST || ret == -EBUSY)
+                    continue; /* region full, or lost the race too often: move on */
+                goto append_failed_free;
+            }
         }
     }
+    kfree(snap);
+    kfree(seed);
     if (next == n)
         return 0;
 
@@ -2386,6 +2436,11 @@ queue_full:
             cetrafs_zg_log_foreign_free_leak(sb, zg_id, ents[next].lba, ents[next].count);
     }
     return 0;
+
+append_failed_free:
+    kfree(snap);
+    kfree(seed);
+    goto append_failed;
 
 append_failed:
     /* The device refused a swap, or the queue could not be located: nothing
