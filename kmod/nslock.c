@@ -997,7 +997,9 @@ int cetrafs_nslock_acquire_set(struct inode **inodes, int n)
  * The task_work's code is in this module: it holds a module reference
  * from task_work_add() until its last statement (the drain rule 20
  * asks for); the task's own return to user space is what runs it,
- * microseconds after the system call left this filesystem.
+ * microseconds after the system call left this filesystem. The return
+ * after that last statement is still this module's text, which unload
+ * waits out with a tasks-RCU grace period (cetrafs_nslock_exit()).
  */
 static bool cetrafs_nslock_restart_off;
 cetrafs_test_param(nslock_restart_off, cetrafs_nslock_restart_off, bool, 0644);
@@ -1072,6 +1074,16 @@ void cetrafs_nslock_exit(void)
 {
     struct cetrafs_nswait_deadline *d, *tmp;
 
+    /* The restart wait's last statement drops the module reference, and
+     * its return still executes in this module's text: an unload in
+     * between freed the code under it (audit 2026-11-14 L-F6). A
+     * tasks-RCU grace period ends only once every task has switched
+     * voluntarily or returned to user space -- past that return. Only
+     * then is the text ours to free. */
+#ifdef CONFIG_TASKS_RCU
+    synchronize_rcu_tasks();
+#endif
+
     list_for_each_entry_safe(d, tmp, &cetrafs_nswait_list, node) {
         list_del(&d->node);
         kfree(d);
@@ -1085,7 +1097,10 @@ static bool cetrafs_nslock_can_restart(void)
 #ifdef PF_USER_WORKER
     no |= PF_USER_WORKER;
 #endif
-    return !(current->flags & no) && !fatal_signal_pending(current) && !READ_ONCE(cetrafs_nslock_restart_off);
+    /* Without tasks RCU, unload cannot wait out the task_work's tail
+     * (cetrafs_nslock_exit()): such a build keeps the in-lock wait. */
+    return IS_ENABLED(CONFIG_TASKS_RCU) && !(current->flags & no) && !fatal_signal_pending(current) &&
+           !READ_ONCE(cetrafs_nslock_restart_off);
 }
 
 struct cetrafs_nswait_work {

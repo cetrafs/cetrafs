@@ -2636,4 +2636,23 @@ N2_HITS="$(unkillable_walks "$K/dir.c" "$K/nslock.c" | sed "s|$K/||")"
 [ -z "$N2_HITS" ] && pass "N2: every whole-volume inode walk in the namespace layer is killable" ||
     fail "N2: an inode walk with no fatal-signal check, at: $(echo $N2_HITS)"
 
+# L-F6 (audit 2026-11-14): a task_work in this module that drops its
+# own module reference returns into freed text if unload runs between
+# the two. Unload must wait a tasks-RCU grace period first, and a build
+# without tasks RCU must never queue one. No loop-device instrument can
+# see the race short of crashing the box on rmmod, so it is checked here.
+# Negative control: the exit without the wait.
+log "checking unload waits out the namespace restart task_work's tail (L-F6)"
+lf6_ok() { # <nslock.c>: exit waits tasks RCU, the queue path is gated on it
+    awk '/^void cetrafs_nslock_exit\(void\)/ { f = 1 } f && /synchronize_rcu_tasks\(\)/ { w = 1 } f && /^\}/ { f = 0 }
+         /IS_ENABLED\(CONFIG_TASKS_RCU\)/ { g = 1 } END { exit !(w && g) }' "$1"
+}
+LF6_SAMPLE="$(ct_tmp lf6-sample.c)"
+sed '/synchronize_rcu_tasks()/d' "$K/nslock.c" >"$LF6_SAMPLE"
+! lf6_ok "$LF6_SAMPLE" && pass "L-F6: control -- an exit without the grace period is caught" ||
+    fail "L-F6: control -- an exit without the grace period passes"
+grep -q 'task_work_add(' "$K/nslock.c" || fail "L-F6: setup: no task_work in nslock.c -- the check is stale"
+lf6_ok "$K/nslock.c" && pass "L-F6: unload waits a tasks-RCU grace period, and only a build with it queues the work" ||
+    fail "L-F6: nslock.c queues a module task_work that unload does not wait out"
+
 ct_exit
