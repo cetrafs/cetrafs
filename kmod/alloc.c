@@ -3139,11 +3139,11 @@ u64 cetrafs_free_bmap_lookup_count(void)
 }
 
 static int __cetrafs_free_data_extent(struct super_block *sb, u64 lba, u32 count, const u64 *resv_seq,
-                                      const u64 *alloc_seq);
+                                      const u64 *alloc_seq, u64 *out_freed);
 
 int cetrafs_free_data_extent(struct super_block *sb, u64 lba, u32 count)
 {
-    return __cetrafs_free_data_extent(sb, lba, count, NULL, NULL);
+    return __cetrafs_free_data_extent(sb, lba, count, NULL, NULL, NULL);
 }
 
 /*
@@ -3168,9 +3168,9 @@ int cetrafs_free_data_extent(struct super_block *sb, u64 lba, u32 count)
  * and the clear.
  */
 int cetrafs_free_data_extent_unless_reserved(struct super_block *sb, u64 lba, u32 count, u64 resv_seq,
-                                             const u64 *alloc_seq)
+                                             const u64 *alloc_seq, u64 *out_freed)
 {
-    return __cetrafs_free_data_extent(sb, lba, count, &resv_seq, alloc_seq);
+    return __cetrafs_free_data_extent(sb, lba, count, &resv_seq, alloc_seq, out_freed);
 }
 
 /*
@@ -3206,7 +3206,8 @@ bool cetrafs_lba_run_is_ours(struct super_block *sb, u64 lba, u64 count)
 
 /* resv_seq: NULL for an owner's free; the scrub passes the registry's
  * release count from before its evidence (cetrafs_sb_resv_seq()). */
-static int __cetrafs_free_data_extent(struct super_block *sb, u64 lba, u32 count, const u64 *resv_seq, const u64 *alloc_seq)
+/* out_freed: the blocks this call cleared (only the direct path clears any). */
+static int __cetrafs_free_data_extent(struct super_block *sb, u64 lba, u32 count, const u64 *resv_seq, const u64 *alloc_seq, u64 *out_freed)
 {
     struct buffer_head *fbh = NULL; /* the bitmap block the loop holds */
     u64 fblk = 0;
@@ -3215,6 +3216,8 @@ static int __cetrafs_free_data_extent(struct super_block *sb, u64 lba, u32 count
     u32 bg_id;
     int ret;
 
+    if (out_freed)
+        *out_freed = 0;
     if (!count)
         return 0;
     if (cetrafs_sb_ro_refuses(sb, "a data block free"))
@@ -3471,6 +3474,8 @@ static int __cetrafs_free_data_extent(struct super_block *sb, u64 lba, u32 count
     if (freed > credited)
         cetrafs_bg_adjust_free_blocks(sb, bg_id, (s64) (freed - credited));
     cetrafs_sb_alloc_unlock(sb);
+    if (out_freed)
+        *out_freed = freed;
     if (freed)
         cetrafs_inline_discard_note(sb, bg_id, lba, count); /* -o discard: queued, never issued here */
 

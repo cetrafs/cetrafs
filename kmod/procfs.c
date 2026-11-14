@@ -393,6 +393,9 @@ static int cetrafs_proc_info_show(struct seq_file *m, void *v)
     seq_printf(m, "bmap_flush_visits: %llu\n", cetrafs_bmap_flush_visit_count());
     seq_printf(m, "free_bmap_lookups: %llu\n", cetrafs_free_bmap_lookup_count());
     seq_printf(m, "release_visits: %llu\n", cetrafs_release_visit_count());
+    seq_printf(m, "scrub_set_bytes_peak: %llu\n", cetrafs_scrub_set_bytes_peak_count());
+    seq_printf(m, "scrub_free_calls: %llu\n", cetrafs_scrub_free_call_count());
+    seq_printf(m, "scrub_inode_readahead: %llu\n", cetrafs_scrub_inode_ra_count());
     seq_printf(m, "defrag_passes: %llu\n", cetrafs_defrag_pass_count());
     seq_printf(m, "defrag_growth_cancels: %llu\n", cetrafs_defrag_growth_cancel_count());
     seq_printf(m, "lock_yield_asks: %llu\n", cetrafs_lock_yield_ask_count());

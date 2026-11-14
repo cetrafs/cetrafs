@@ -1157,7 +1157,7 @@ int cetrafs_alloc_pick_run_resv(struct super_block *sb, u64 count, u64 *out_lba,
 int cetrafs_alloc_data_run_resv(struct super_block *sb, u32 bg_id, u64 count, u64 *out_lba,
                                 struct cetrafs_resv_span *span);
 int cetrafs_free_data_extent_unless_reserved(struct super_block *sb, u64 lba, u32 count, u64 resv_seq,
-                                             const u64 *alloc_seq);
+                                             const u64 *alloc_seq, u64 *out_freed);
 u64 cetrafs_sb_resv_seq(struct super_block *sb);
 /* fs.c: frees in flight between a publish and its frees (cetrafs_frees_begin()). */
 struct cetrafs_frees_snap {
@@ -1409,6 +1409,9 @@ void cetrafs_heartbeat_stop(struct cetrafs_heartbeat *hb);
 struct cetrafs_scrub; /* opaque; owned entirely by scrub.c */
 int cetrafs_scrub_start(struct super_block *sb, struct cetrafs_scrub **out_s);
 void cetrafs_scrub_stop(struct cetrafs_scrub *s);
+u64 cetrafs_scrub_set_bytes_peak_count(void);
+u64 cetrafs_scrub_free_call_count(void);
+u64 cetrafs_scrub_inode_ra_count(void);
 u64 cetrafs_scrub_reclaimed_count(void);
 u64 cetrafs_scrub_inflight_skip_count(void);
 u64 cetrafs_scrub_orphans_count(void);

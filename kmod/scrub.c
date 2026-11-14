@@ -175,6 +175,38 @@ MODULE_PARM_DESC(scrub_bg_moved_once, "TEST ONLY: the scrub's next free finds it
 MODULE_PARM_DESC(scrub_ignore_alloc_seq,
                  "TEST ONLY: free on a verdict older than the last allocation in the Block Group");
 
+/*
+ * Memory and I/O shape of a cycle (audit 2026-11-14 M3, L1, L2). The
+ * reference set is built a batch of Block Groups at a time under this
+ * budget, and kept past pass 1 only for groups that have a candidate;
+ * candidates are allocated only where one exists. Holding both sets for
+ * every owned group for the whole cycle cost 64 KiB per owned GiB.
+ */
+static unsigned int cetrafs_scrub_ref_budget_kb = 65536;
+cetrafs_test_param(scrub_ref_budget_kb, cetrafs_scrub_ref_budget_kb, uint, 0644);
+MODULE_PARM_DESC(scrub_ref_budget_kb, "TEST ONLY: the scrub's reference-set budget per batch, KiB");
+/* TEST ONLY: the old shape -- every set for every group for the whole
+ * cycle, one free per block, every inode block read ahead -- the control
+ * of tests/kernel/scrub_shape.sh. */
+static bool cetrafs_scrub_old_shape;
+cetrafs_test_param(scrub_old_shape, cetrafs_scrub_old_shape, bool, 0644);
+MODULE_PARM_DESC(scrub_old_shape, "TEST ONLY: the scrub holds every set, frees per block and reads every inode ahead");
+static atomic64_t cetrafs_scrub_set_bytes_peak = ATOMIC64_INIT(0);
+static atomic64_t cetrafs_scrub_free_calls = ATOMIC64_INIT(0);
+static atomic64_t cetrafs_scrub_inode_ra = ATOMIC64_INIT(0);
+u64 cetrafs_scrub_set_bytes_peak_count(void)
+{
+    return (u64) atomic64_read(&cetrafs_scrub_set_bytes_peak);
+}
+u64 cetrafs_scrub_free_call_count(void)
+{
+    return (u64) atomic64_read(&cetrafs_scrub_free_calls);
+}
+u64 cetrafs_scrub_inode_ra_count(void)
+{
+    return (u64) atomic64_read(&cetrafs_scrub_inode_ra);
+}
+
 static atomic64_t cetrafs_scrub_reclaimed = ATOMIC64_INIT(0);
 u64 cetrafs_scrub_reclaimed_count(void)
 {
@@ -310,6 +342,7 @@ static int scrub_build_refset(struct cetrafs_scrub *s, struct scrub_ctx *ctx, bo
 {
     struct super_block *sb = s->sb;
     const cetrafs_superblock_t *raw_sb = cetrafs_sb_raw(sb);
+    DECLARE_BITMAP(dropped, 128); /* this window's records dropped ahead */
     struct inode *vfs_inode;
     u64 ninodes, ino;
     u32 i;
@@ -332,6 +365,7 @@ static int scrub_build_refset(struct cetrafs_scrub *s, struct scrub_ctx *ctx, bo
     for (i = 0; i < ctx->nbgs; i++)
         bitmap_zero(ctx->bgs[i].ref, (unsigned int) ctx->bgs[i].data_count);
 
+    bitmap_zero(dropped, 128);
     for (ino = 1; ino <= ninodes; ino++) {
         cetrafs_inode_t raw;
         bool allocated = false;
@@ -342,8 +376,26 @@ static int scrub_build_refset(struct cetrafs_scrub *s, struct scrub_ctx *ctx, bo
         if ((ino & 127) == 1) {
             u64 k;
 
-            for (k = ino; k < ino + 128 && k <= ninodes; k++)
+            /* Ahead only for allocated numbers, and on the fresh pass
+             * dropped BEFORE the read ahead rather than after it: every
+             * block was read ahead and then thrown away again by the
+             * invalidate below (audit 2026-11-14 L2). A number the read
+             * below finds allocated and this did not is dropped there. */
+            bitmap_zero(dropped, 128);
+            for (k = ino; k < ino + 128 && k <= ninodes; k++) {
+                bool a = true;
+
+                if (!READ_ONCE(cetrafs_scrub_old_shape)) {
+                    if (cetrafs_inode_is_allocated(sb, k, &a) != 0 || !a)
+                        continue;
+                    if (fresh) {
+                        cetrafs_invalidate_raw_inode(sb, k);
+                        __set_bit((unsigned int) (k - ino), dropped);
+                    }
+                }
                 sb_breadahead(sb, cetrafs_inode_lba(sb, k));
+                atomic64_inc(&cetrafs_scrub_inode_ra);
+            }
             cond_resched();
         }
 
@@ -356,7 +408,7 @@ static int scrub_build_refset(struct cetrafs_scrub *s, struct scrub_ctx *ctx, bo
          * for. On the deciding pass that answer must come from the
          * device, not from whatever this node last happened to cache of
          * a table every node writes. */
-        if (fresh)
+        if (fresh && !test_bit((unsigned int) ((ino - 1) & 127), dropped))
             cetrafs_invalidate_raw_inode(sb, ino);
 
         /*
@@ -491,10 +543,19 @@ static int scrub_mark_candidates(struct super_block *sb, struct scrub_bg *b)
 
     if (!bmap)
         return -EIO;
-    bitmap_zero(b->cand, (unsigned int) b->data_count);
+    if (b->cand)
+        bitmap_zero(b->cand, (unsigned int) b->data_count);
     for (bit = 0; bit < b->data_count; bit++) {
-        if (scrub_bit_set(bmap, bit) && !test_bit((unsigned int) bit, b->ref))
+        if (scrub_bit_set(bmap, bit) && !test_bit((unsigned int) bit, b->ref)) {
+            if (!b->cand) { /* only a group with a candidate holds the set */
+                b->cand = kvcalloc(BITS_TO_LONGS(b->data_count), sizeof(long), GFP_NOFS);
+                if (!b->cand) {
+                    kvfree(bmap);
+                    return -ENOMEM;
+                }
+            }
             __set_bit((unsigned int) bit, b->cand);
+        }
         if (!(bit & 0xffff))
             cond_resched(); /* data_count is disk geometry: up to 2^32 */
     }
@@ -584,9 +645,22 @@ static int scrub_free_confirmed(struct cetrafs_scrub *s, struct scrub_bg *b, u64
              * gap and before this loop, and a run installed in between
              * would not be in it.
              */
+            u32 run = 1, got_run;
+            u64 got = 0;
+
             reserved = cetrafs_resv_covers(sb, b->data_start + bit);
             if (reserved)
                 continue;
+            /* The confirmed blocks that follow go in the same call: one
+             * free per block re-resolved the group and took the mutex
+             * every time (audit 2026-11-14 L1). The free re-checks the
+             * reservations and the allocation count per block, under the
+             * mutex, as it did for one. */
+            if (!READ_ONCE(cetrafs_scrub_old_shape))
+                while (run < 4096 && bit + run < b->data_count && test_bit((unsigned int) (bit + run), b->cand) &&
+                       scrub_bit_set(bmap, bit + run) && !test_bit((unsigned int) (bit + run), b->ref))
+                    run++;
+            got_run = run;
 
             /*
              * Before the first free in this group, raise its free_gen
@@ -608,8 +682,9 @@ static int scrub_free_confirmed(struct cetrafs_scrub *s, struct scrub_bg *b, u64
                 }
                 gen_raised = true;
             }
-            ret = cetrafs_free_data_extent_unless_reserved(sb, b->data_start + bit, 1, b->resv_seq,
-                                                           cetrafs_scrub_ignore_alloc_seq ? NULL : &b->alloc_seq);
+            ret = cetrafs_free_data_extent_unless_reserved(sb, b->data_start + bit, got_run, b->resv_seq,
+                                                           cetrafs_scrub_ignore_alloc_seq ? NULL : &b->alloc_seq, &got);
+            atomic64_inc(&cetrafs_scrub_free_calls);
             if (ret == -EAGAIN) {
                 /* A run was released since the verdict: it is somebody's
                  * data now, and the evidence predates it. Same answer as
@@ -618,10 +693,12 @@ static int scrub_free_confirmed(struct cetrafs_scrub *s, struct scrub_bg *b, u64
                 break;
             }
             if (ret == 0) {
-                ctrace("SCRUBFREE lba=%llu bg=%u\n", (unsigned long long) (b->data_start + bit), b->bg_id);
-                (*out_freed)++;
-                atomic64_inc(&cetrafs_scrub_reclaimed);
+                ctrace("SCRUBFREE lba=%llu +%u bg=%u\n", (unsigned long long) (b->data_start + bit), got_run,
+                       b->bg_id);
+                *out_freed += got;
+                atomic64_add((s64) got, &cetrafs_scrub_reclaimed);
             }
+            bit += got_run - 1; /* the loop's ++ steps past the run */
         }
         if ((bit & 4095) == 0)
             cond_resched();
@@ -672,12 +749,14 @@ static int scrub_collect_targets(struct super_block *sb, struct scrub_ctx *ctx)
             if (cetrafs_bg_data_layout(sb, b->bg_id, &b->data_start, &b->data_count, &b->bmap_lba, &b->bmap_blocks) !=
                 0)
                 continue; /* skip an unreadable BG rather than fail the cycle */
-            b->ref = kvcalloc(BITS_TO_LONGS(b->data_count), sizeof(long), GFP_NOFS);
-            b->cand = kvcalloc(BITS_TO_LONGS(b->data_count), sizeof(long), GFP_NOFS);
-            if (!b->ref || !b->cand) {
-                kvfree(b->ref);
-                kvfree(b->cand);
-                goto oom;
+            if (READ_ONCE(cetrafs_scrub_old_shape)) { /* test-only: both sets, every group, all cycle */
+                b->ref = kvcalloc(BITS_TO_LONGS(b->data_count), sizeof(long), GFP_NOFS);
+                b->cand = kvcalloc(BITS_TO_LONGS(b->data_count), sizeof(long), GFP_NOFS);
+                if (!b->ref || !b->cand) {
+                    kvfree(b->ref);
+                    kvfree(b->cand);
+                    goto oom;
+                }
             }
             n++;
         }
@@ -889,17 +968,83 @@ static void scrub_reclaim_orphan_inodes(struct cetrafs_scrub *s)
                 (unsigned long long) freed);
 }
 
+static u64 scrub_set_bytes(const struct scrub_bg *b)
+{
+    return (u64) BITS_TO_LONGS(b->data_count) * sizeof(long);
+}
+
+/* The groups [from, end) whose reference sets fit the budget; at least one. */
+static u32 scrub_batch_end(const struct scrub_ctx *ctx, u32 from)
+{
+    u64 budget = (u64) max(READ_ONCE(cetrafs_scrub_ref_budget_kb), 1U) * 1024, used = 0;
+    u32 i = from;
+
+    do {
+        used += scrub_set_bytes(&ctx->bgs[i]);
+        i++;
+    } while (i < ctx->nbgs && used + scrub_set_bytes(&ctx->bgs[i]) <= budget);
+    return i;
+}
+
+static int scrub_refs_alloc(struct scrub_ctx *ctx, u32 from, u32 to)
+{
+    u32 i;
+
+    for (i = from; i < to; i++) {
+        if (ctx->bgs[i].ref)
+            continue;
+        ctx->bgs[i].ref = kvcalloc(BITS_TO_LONGS(ctx->bgs[i].data_count), sizeof(long), GFP_NOFS);
+        if (!ctx->bgs[i].ref)
+            return -ENOMEM;
+    }
+    return 0;
+}
+
+static void scrub_refs_drop(struct scrub_ctx *ctx, u32 from, u32 to)
+{
+    u32 i;
+
+    for (i = from; i < to; i++) {
+        kvfree(ctx->bgs[i].ref);
+        ctx->bgs[i].ref = NULL;
+    }
+}
+
+/* [from, to) as a context of its own: an ordered list stays ordered. */
+static struct scrub_ctx scrub_sub(const struct scrub_ctx *ctx, u32 from, u32 to)
+{
+    struct scrub_ctx sub = {.bgs = ctx->bgs + from, .nbgs = to - from, .ordered = ctx->ordered};
+
+    return sub;
+}
+
+/* The sets held right now, for the peak the suite reads. */
+static void scrub_note_peak(const struct scrub_ctx *ctx)
+{
+    u64 held = 0, peak;
+    u32 i;
+
+    for (i = 0; i < ctx->nbgs; i++)
+        held += (ctx->bgs[i].ref ? scrub_set_bytes(&ctx->bgs[i]) : 0) +
+                (ctx->bgs[i].cand ? scrub_set_bytes(&ctx->bgs[i]) : 0);
+    peak = (u64) atomic64_read(&cetrafs_scrub_set_bytes_peak);
+    while (held > peak && atomic64_cmpxchg(&cetrafs_scrub_set_bytes_peak, (s64) peak, (s64) held) != (s64) peak)
+        peak = (u64) atomic64_read(&cetrafs_scrub_set_bytes_peak);
+}
+
 static void cetrafs_scrub_cycle(struct cetrafs_scrub *s)
 {
     struct super_block *sb = s->sb;
     struct scrub_ctx ctx = {0};
     struct cetrafs_frees_snap frees;
     u64 freed = 0;
-    u32 i, gap;
+    u32 i, gap, from, to;
+    bool old;
     int ret;
     ktime_t t0 = ktime_get();
 
     atomic64_set(&cetrafs_scrub_last_start, (s64) ktime_get_real_seconds());
+    atomic64_set(&cetrafs_scrub_set_bytes_peak, 0); /* this cycle's, from here */
 
     if (cetrafs_sb_is_fenced(sb))
         return; /* a fenced mount writes nothing */
@@ -921,15 +1066,37 @@ static void cetrafs_scrub_cycle(struct cetrafs_scrub *s)
     ret = scrub_collect_targets(sb, &ctx);
     if (ret || ctx.nbgs == 0)
         goto done;
+    old = READ_ONCE(cetrafs_scrub_old_shape);
 
     /* Pass 1: reference set from all allocated inodes, then candidates.
-     * Cached -- it only proposes, and proposing too much costs nothing. */
-    if (scrub_build_refset(s, &ctx, /*fresh=*/false) != 0)
-        goto done; /* any read failure -> free nothing this cycle */
-    for (i = 0; i < ctx.nbgs; i++)
-        if (scrub_mark_candidates(sb, &ctx.bgs[i]) != 0)
-            goto done;
+     * Cached -- it only proposes, and proposing too much costs nothing.
+     * A batch of groups at a time under the budget, each batch's set
+     * dropped once its candidates are taken (M3). */
+    for (from = 0; from < ctx.nbgs; from = to) {
+        struct scrub_ctx sub;
 
+        to = old ? ctx.nbgs : scrub_batch_end(&ctx, from);
+        if (scrub_refs_alloc(&ctx, from, to) != 0)
+            goto done;
+        sub = scrub_sub(&ctx, from, to);
+        if (scrub_build_refset(s, &sub, /*fresh=*/false) != 0)
+            goto done; /* any read failure -> free nothing this cycle */
+        for (i = from; i < to; i++)
+            if (scrub_mark_candidates(sb, &ctx.bgs[i]) != 0)
+                goto done;
+        scrub_note_peak(&ctx);
+        if (!old)
+            scrub_refs_drop(&ctx, from, to);
+    }
+    /* Only a group with a candidate has anything to confirm. */
+    if (!old) {
+        u32 j = 0;
+
+        for (i = 0; i < ctx.nbgs; i++)
+            if (ctx.bgs[i].cand)
+                ctx.bgs[j++] = ctx.bgs[i];
+        ctx.nbgs = j;
+    }
 
     /* The gap: let any in-flight allocation commit its extent. Bail early
      * if unmounting. */
@@ -939,48 +1106,75 @@ static void cetrafs_scrub_cycle(struct cetrafs_scrub *s)
     if (READ_ONCE(s->draining))
         goto done;
 
-    /* Snapshot each BG's allocation count BEFORE the evidence is
-     * gathered, not after: the refset build below reads one uncached
-     * record per allocated inode and is itself slow, so an allocation
-     * during it would otherwise go unnoticed by a verdict that claims to
-     * describe the state afterwards. */
-    for (i = 0; i < ctx.nbgs; i++) {
-        ctx.bgs[i].alloc_seq = cetrafs_sb_bg_alloc_seq(sb, ctx.bgs[i].bg_id);
-        ctx.bgs[i].resv_seq = cetrafs_sb_resv_seq(sb);
-    }
-
-    /* Frees in flight anywhere (cetrafs_frees_quiet()): a block an
-     * operation has published away and not yet freed -- here, or as a
-     * queue append still to come from a peer -- reads leaked to both
-     * passes, and freeing it means it is freed twice. Asked again just
-     * before the frees. */
-    if (cetrafs_frees_quiet(sb, &frees, false)) {
-        pr_debug("scrub: frees in flight on some node -- skipping this cycle\n");
-        atomic64_inc(&cetrafs_scrub_inflight_skips);
+    if (ctx.nbgs == 0) {
+        /* Nothing proposed: no verdict to take, so no fresh walk. The
+         * in-flight check still answers for the cycle, as it did. */
+        if (cetrafs_frees_quiet(sb, &frees, false)) {
+            atomic64_inc(&cetrafs_scrub_inflight_skips);
+            goto done;
+        }
+        atomic64_inc(&cetrafs_scrub_cycles);
         goto done;
     }
 
-    /* Pass 2: rebuild the reference set FRESH, confirm, free. This is
-     * the verdict that frees blocks, so it may not rest on a cached view
-     * of a table other nodes write. */
-    if (scrub_build_refset(s, &ctx, /*fresh=*/true) != 0)
-        goto done;
-    if (cetrafs_scrub_verdict_stall_ms) { /* TEST ONLY */
-        unsigned int ms;
+    /* Pass 2, a batch at a time, each batch its own verdict: snapshot,
+     * in-flight check, fresh evidence, in-flight check again, free. */
+    for (from = 0; from < ctx.nbgs && !READ_ONCE(s->draining); from = to) {
+        struct scrub_ctx sub;
 
-        pr_info("scrub: holding the verdict %u ms (test)\n", cetrafs_scrub_verdict_stall_ms);
-        for (ms = 0; ms < cetrafs_scrub_verdict_stall_ms && !READ_ONCE(s->draining); ms += 100)
-            msleep(100);
-        pr_info("scrub: verdict released (test)\n");
+        to = old ? ctx.nbgs : scrub_batch_end(&ctx, from);
+
+        /* Snapshot each BG's allocation count BEFORE the evidence is
+         * gathered, not after: the refset build below reads one uncached
+         * record per allocated inode and is itself slow, so an allocation
+         * during it would otherwise go unnoticed by a verdict that claims to
+         * describe the state afterwards. */
+        for (i = from; i < to; i++) {
+            ctx.bgs[i].alloc_seq = cetrafs_sb_bg_alloc_seq(sb, ctx.bgs[i].bg_id);
+            ctx.bgs[i].resv_seq = cetrafs_sb_resv_seq(sb);
+        }
+
+        /* Frees in flight anywhere (cetrafs_frees_quiet()): a block an
+         * operation has published away and not yet freed -- here, or as a
+         * queue append still to come from a peer -- reads leaked to both
+         * passes, and freeing it means it is freed twice. Asked again just
+         * before the frees. */
+        if (cetrafs_frees_quiet(sb, &frees, false)) {
+            pr_debug("scrub: frees in flight on some node -- skipping this cycle\n");
+            atomic64_inc(&cetrafs_scrub_inflight_skips);
+            goto done;
+        }
+
+        /* Rebuild the reference set FRESH, confirm, free. This is the
+         * verdict that frees blocks, so it may not rest on a cached view
+         * of a table other nodes write. */
+        if (scrub_refs_alloc(&ctx, from, to) != 0)
+            goto done;
+        sub = scrub_sub(&ctx, from, to);
+        if (scrub_build_refset(s, &sub, /*fresh=*/true) != 0)
+            goto done;
+        scrub_note_peak(&ctx);
+        if (cetrafs_scrub_verdict_stall_ms) { /* TEST ONLY */
+            unsigned int ms;
+
+            pr_info("scrub: holding the verdict %u ms (test)\n", cetrafs_scrub_verdict_stall_ms);
+            for (ms = 0; ms < cetrafs_scrub_verdict_stall_ms && !READ_ONCE(s->draining); ms += 100)
+                msleep(100);
+            pr_info("scrub: verdict released (test)\n");
+        }
+        if (cetrafs_frees_quiet(sb, &frees, true)) {
+            pr_debug("scrub: frees began or were in flight during the verdict -- skipping this cycle\n");
+            atomic64_inc(&cetrafs_scrub_inflight_skips);
+            goto done;
+        }
+        for (i = from; i < to && !READ_ONCE(s->draining); i++)
+            if (scrub_free_confirmed(s, &ctx.bgs[i], &freed) != 0)
+                goto done;
+        if (!old)
+            scrub_refs_drop(&ctx, from, to);
     }
-    if (cetrafs_frees_quiet(sb, &frees, true)) {
-        pr_debug("scrub: frees began or were in flight during the verdict -- skipping this cycle\n");
-        atomic64_inc(&cetrafs_scrub_inflight_skips);
+    if (READ_ONCE(s->draining))
         goto done;
-    }
-    for (i = 0; i < ctx.nbgs && !READ_ONCE(s->draining); i++)
-        if (scrub_free_confirmed(s, &ctx.bgs[i], &freed) != 0)
-            break;
 
     atomic64_inc(&cetrafs_scrub_cycles);
 
