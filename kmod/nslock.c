@@ -206,6 +206,13 @@ static int cetrafs_nslock_recount(struct super_block *sb, u64 ino, u64 generatio
     return ret;
 }
 
+/* TEST ONLY: publish the staged file sector without first checking the
+ * lock is still ours, as before audit 2026-11-14 L-F2 -- the control of
+ * tests/kernel/nslock_fd_publish_stolen.sh. */
+static bool cetrafs_nslock_fd_precheck_off;
+cetrafs_test_param(nslock_fd_precheck_off, cetrafs_nslock_fd_precheck_off, bool, 0644);
+MODULE_PARM_DESC(nslock_fd_precheck_off, "TEST ONLY: a release publishes its file sector without checking ownership");
+
 static unsigned int cetrafs_nslock_release_stall_ms;
 cetrafs_test_param(nslock_release_stall_ms, cetrafs_nslock_release_stall_ms, uint, 0644);
 MODULE_PARM_DESC(nslock_release_stall_ms, "TEST ONLY: sleep before publishing a staged record at release");
@@ -715,6 +722,27 @@ void cetrafs_nslock_release(struct inode *inode)
      * the freshness barrier peers gate on: nobody trusts the new dirent
      * state before the sector that describes it is on the device.
      */
+    /* "While we still hold the lock" is a claim the swap below is the
+     * first to check: a peer that judged us stale and took the lock
+     * meanwhile would get our file sector -- size, extent root -- written
+     * over its own, before we learn it is no longer ours (audit
+     * 2026-11-14 L-F2). One fresh read of the namespace sector first:
+     * not ours, and the staged update is forfeit, as the swap would
+     * decide. A steal needs our lease gone, so what remains between this
+     * read and the write is the lease's window, not a new one. */
+    if (have_staged && staged_fd && !READ_ONCE(cetrafs_nslock_fd_precheck_off)) {
+        cetrafs_inode_t now;
+
+        cetrafs_invalidate_raw_inode(sb, inode->i_ino);
+        if (!cetrafs_read_raw_inode(sb, inode->i_ino, &now) &&
+            (cetrafs_le64(now.generation) != ctx.generation ||
+             cetrafs_le32(now.ns_lock_owner) != ctx.my_node_id)) {
+            pr_warn("nslock: ino=%llu release: the lock is no longer ours -- its staged file sector is not "
+                    "published\n",
+                    (unsigned long long) inode->i_ino);
+            staged_fd = false;
+        }
+    }
     if (have_staged && staged_fd) {
         /* Retried like the swap below, and for the same reason: the lock
          * is ours, so a failure here is transient or the device is
