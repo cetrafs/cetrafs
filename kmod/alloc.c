@@ -3962,6 +3962,12 @@ static int __cetrafs_reconcile_locked(struct super_block *sb, u32 bg_id, s64 *ou
  * thousands of times a second. Combined with the capacity read rather
  * than added beside it, so mount still makes exactly one pass.
  */
+/* TEST ONLY: a claim leaves free_gen alone, as before audit 2026-11-14
+ * A8 -- the control of tests/kernel/bg_claim_free_gen.sh. */
+static bool cetrafs_bg_claim_keeps_free_gen;
+cetrafs_test_param(bg_claim_keeps_free_gen, cetrafs_bg_claim_keeps_free_gen, bool, 0644);
+MODULE_PARM_DESC(bg_claim_keeps_free_gen, "TEST ONLY: claiming a free Block Group does not raise its free_gen");
+
 /* Claim one unowned Block Group into zg_id: the CAS mutate. */
 struct cetrafs_bg_claim_ctx {
     u32 zg_id;
@@ -3993,6 +3999,12 @@ static int cetrafs_bg_claim_mutate(void *image, unsigned int len, void *priv)
 
     ctx->seq = cetrafs_le64(bg->reconcile_seq);
     bg->owner_zg = cetrafs_cpu_to_le16((u16) ctx->zg_id);
+    /* A new tenure: a queued free stamped before it -- a late copy from
+     * before the release, from the same Zone Group or any -- names
+     * blocks this claim may hand out again, and must be dropped, not
+     * applied (audit 2026-11-14 A8; cetrafs_apply_pending_free()). */
+    if (!READ_ONCE(cetrafs_bg_claim_keeps_free_gen))
+        bg->free_gen = cetrafs_cpu_to_le64(cetrafs_le64(bg->free_gen) + 1);
     /* Ours now, and we may write anywhere in it. */
     bg->flags = cetrafs_cpu_to_le16(cetrafs_le16(bg->flags) & ~CETRAFS_BG_FLAG_DISCARDED);
     /* Same normalise-then-checksum as cetrafs_bg_count_mutate(): the

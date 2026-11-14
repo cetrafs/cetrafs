@@ -72,7 +72,7 @@ int main(int argc, char **argv)
 {
     if (argc < 4) {
         fprintf(stderr,
-                "usage: %s <image> add <zg_id> <lba> <count>\n"
+                "usage: %s <image> add <zg_id> <lba> <count> [<free_gen stamp>]\n"
                 "       %s <image> put <zg_id> <block> <slot> <lba> <count>   (at that queue block/slot exactly)\n"
                 "       %s <image> dump <zg_id>\n"
                 "       %s <image> extent <ino>\n",
@@ -138,12 +138,15 @@ int main(int argc, char **argv)
     }
 
     if (strcmp(argv[2], "add") == 0) {
-        if (argc != 6) {
-            fprintf(stderr, "add needs <lba> <count>\n");
+        if (argc != 6 && argc != 7) {
+            fprintf(stderr, "add needs <lba> <count> [<stamp>]\n");
             return 2;
         }
         uint64_t lba = strtoull(argv[4], NULL, 0);
         uint32_t count = (uint32_t) strtoul(argv[5], NULL, 0);
+        /* An explicit stamp: a copy queued under an earlier free_gen. */
+        int have_stamp = argc == 7;
+        uint64_t stamp = have_stamp ? strtoull(argv[6], NULL, 0) : 0;
 
         for (uint32_t qb = 0; qb < cetrafs_le32(sb.pending_free_blocks_per_zg); qb++) {
             cetrafs_pending_free_t ents[CETRAFS_BLOCK_SIZE / sizeof(cetrafs_pending_free_t)];
@@ -156,7 +159,7 @@ int main(int argc, char **argv)
                 ents[e].lba = cetrafs_cpu_to_le64(lba);
                 ents[e].count = cetrafs_cpu_to_le32(count);
                 ents[e].magic = cetrafs_cpu_to_le32(CETRAFS_PENDING_FREE_MAGIC);
-                ents[e].free_gen = cetrafs_cpu_to_le64(stamp_for(&sb, lba));
+                ents[e].free_gen = cetrafs_cpu_to_le64(have_stamp ? stamp : stamp_for(&sb, lba));
                 ents[e].pad = 0;
                 pwrite_all(ents, sizeof(ents), off);
                 printf("pending_poke: ZG%u queued free [%" PRIu64 " +%u)\n", zg_id, lba, count);
