@@ -524,6 +524,8 @@ int cetrafs_defrag_inode(struct inode *inode, struct cetrafs_defrag_stats *out_s
      */
     cetrafs_inode_t *rawp;
     struct buffer_head **copy_src, **copy_dst;
+    sector_t *copy_lba; /* one step's source blocks, for the batched read (M1) */
+    u32 *copy_off;      /* ...and each one's block offset from the step's start */
 #define raw (*rawp)
     u64 nblocks, dst_base = 0, moved = 0;
     bool have_dst = false;
@@ -549,9 +551,13 @@ int cetrafs_defrag_inode(struct inode *inode, struct cetrafs_defrag_stats *out_s
     rawp = kmalloc(sizeof(*rawp), GFP_NOFS);
     /* One step's buffers, source then destination (M1). */
     copy_src = kcalloc(2 * CETRAFS_DEFRAG_STEP_BLOCKS, sizeof(*copy_src), GFP_NOFS);
-    if (!rawp || !copy_src) {
+    copy_lba = kcalloc(CETRAFS_DEFRAG_STEP_BLOCKS, sizeof(*copy_lba), GFP_NOFS);
+    copy_off = kcalloc(CETRAFS_DEFRAG_STEP_BLOCKS, sizeof(*copy_off), GFP_NOFS);
+    if (!rawp || !copy_src || !copy_lba || !copy_off) {
         kfree(rawp);
         kfree(copy_src);
+        kfree(copy_lba);
+        kfree(copy_off);
         kvfree(el.arr);
         return -ENOMEM;
     }
@@ -804,16 +810,19 @@ int cetrafs_defrag_inode(struct inode *inode, struct cetrafs_defrag_stats *out_s
         }
 
         /*
-         * Copied a contiguous source run at a time, up to a step's worth:
-         * its reads as one batch, its writes submitted together and
-         * waited for once. Two synchronous round trips per block made a
-         * 512 KiB step ~256 serial ones under the file's exclusive locks
-         * -- every guest write stalled that long once a step (audit
-         * 2026-11-14 M1). defrag_copy_serial restores that, test-only.
+         * Copied a STEP at a time, however many source runs it crosses: its
+         * source blocks read as one batch, its writes submitted together
+         * and waited for once. A file fragmented into one-block runs -- what
+         * defrag exists for -- paid a read and a write round trip per block
+         * under the file's locks when the batch was per run (audit
+         * 2026-11-14 M1). defrag_copy_serial copies one block per round
+         * trip, test-only.
          */
-        for (b = moved; b < step_end && !ret;) {
-            u64 src = 0, o = 0, run = 0;
-            u32 e, i, n;
+        b = moved;
+        while (b < step_end && !ret) {
+            u64 bb = b, ce_off = 0;
+            u32 ce = 0, nb = 0, i;
+            u32 lim = READ_ONCE(cetrafs_defrag_copy_serial) ? 1 : CETRAFS_DEFRAG_STEP_BLOCKS;
 
             /* Inside the step too: a step is bounded, but an unmount, a
              * fence or SIGKILL should not wait out even that (M9).
@@ -824,35 +833,40 @@ int cetrafs_defrag_inode(struct inode *inode, struct cetrafs_defrag_stats *out_s
                 break;
             }
 
-            for (e = 0; e < el.count; e++) {
-                u32 len = cetrafs_extent_len(el.arr[e].ee_len);
+            /* This batch: the source of each block from bb on, across runs,
+             * up to the batch cap. The cursor (ce, ce_off) only moves
+             * forward, so the whole step costs one pass over the map. */
+            for (; bb < step_end && nb < lim; bb++) {
+                u64 src;
 
-                if (b < o + len) {
-                    src = cetrafs_extent_phys_from_hilo(el.arr[e].ee_start_hi, el.arr[e].ee_start_lo) + (b - o);
-                    run = o + len - b; /* contiguous on the device from src */
+                while (ce < el.count && bb >= ce_off + cetrafs_extent_len(el.arr[ce].ee_len)) {
+                    ce_off += cetrafs_extent_len(el.arr[ce].ee_len);
+                    ce++;
+                }
+                if (ce >= el.count) {
+                    ret = -EIO; /* the map does not cover the step: the checks above make this damage */
                     break;
                 }
-                o += len;
+                src = cetrafs_extent_phys_from_hilo(el.arr[ce].ee_start_hi, el.arr[ce].ee_start_lo) + (bb - ce_off);
+                if (src == dst_base + bb) /* already in place */
+                    continue;
+                copy_lba[nb] = src;
+                copy_off[nb] = (u32) (bb - moved);
+                nb++;
             }
-            if (!run) {
-                ret = -EIO; /* the map does not cover the step: the checks above make this damage */
+            if (ret)
                 break;
-            }
-            n = (u32) min3(run, step_end - b, (u64) CETRAFS_DEFRAG_STEP_BLOCKS);
-            if (READ_ONCE(cetrafs_defrag_copy_serial))
-                n = 1; /* test-only: the old per-block round trips */
-
-            if (src == dst_base + b) { /* already in place: the whole run is */
-                b += n;
+            b = bb;
+            if (!nb)
                 continue;
-            }
 
-            ret = cetrafs_bread_uncached_batch(sb, src, n, copy_src);
+            /* Forced-fresh reads of every source block, as one batch. */
+            ret = cetrafs_bread_uncached_list(sb, copy_lba, nb, copy_src);
             if (ret)
                 break;
             blk_start_plug(&plug);
-            for (i = 0; i < n; i++) {
-                struct buffer_head *dbh = sb_getblk(sb, dst_base + b + i);
+            for (i = 0; i < nb; i++) {
+                struct buffer_head *dbh = sb_getblk(sb, dst_base + moved + copy_off[i]);
 
                 copy_dst[i] = dbh;
                 if (!dbh) {
@@ -870,7 +884,7 @@ int cetrafs_defrag_inode(struct inode *inode, struct cetrafs_defrag_stats *out_s
                 write_dirty_buffer(dbh, REQ_SYNC);
             }
             blk_finish_plug(&plug);
-            for (i = 0; i < n; i++) {
+            for (i = 0; i < nb; i++) {
                 if (copy_dst[i]) {
                     wait_on_buffer(copy_dst[i]);
                     if (!buffer_uptodate(copy_dst[i]))
@@ -881,7 +895,6 @@ int cetrafs_defrag_inode(struct inode *inode, struct cetrafs_defrag_stats *out_s
                 brelse(copy_src[i]);
                 copy_src[i] = NULL;
             }
-            b += n;
         }
         if (ret) {
             cetrafs_defrag_inode_unlock(inode);
@@ -1073,6 +1086,8 @@ out_done:
     kvfree(el.arr);
     kfree(rawp);
     kfree(copy_src);
+    kfree(copy_lba);
+    kfree(copy_off);
     return ret;
 #undef raw
 }
