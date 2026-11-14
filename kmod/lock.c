@@ -103,6 +103,16 @@ u64 cetrafs_lock_resume_count(void)
  * cross-node exclusion is the on-disk lock_mode/lock_owner_node
  * themselves, not this mutex -- it has no reach outside this node.
  */
+/* P14: up to CETRAFS_EXT_CACHE_MAX remembered extents per inode,
+ * all under the one record key (see cetrafs_inode_info.ext_valid). */
+#define CETRAFS_EXT_CACHE_MAX 16
+struct cetrafs_ext_ent {
+    u32 block; /* first file-relative block covered */
+    u32 len;   /* how many blocks */
+    u64 lba;   /* device block 'block' lives at */
+    bool uninit;
+};
+
 struct cetrafs_inode_info {
     /* When this node last adopted the record's identity (seconds);
      * cetrafs_inode_label_may_be_stale(). Under inode_lock. */
@@ -237,7 +247,9 @@ struct cetrafs_inode_info {
      * are and never a window wider. Guarded by resv_lock.
      */
     bool ext_valid;
-    bool ext_uninit;
+    u8 ext_n;    /* entries in ext_ent that answer, under the key */
+    u8 ext_next; /* ring slot the next store replaces once full */
+    struct cetrafs_ext_ent ext_ent[CETRAFS_EXT_CACHE_MAX];
     u16 ext_key_depth;
     u16 ext_key_entries;
     u64 ext_key_blocks;
@@ -246,9 +258,6 @@ struct cetrafs_inode_info {
      * and its store is refused if it moved, so a fill that read before
      * a drop never lands after it (class 41). */
     u32 ext_gen;
-    u32 ext_block; /* first file-relative block the extent covers */
-    u32 ext_len;   /* how many blocks it covers */
-    u64 ext_lba;   /* device block ext_block lives at */
 
     /* The sorted extent map fiemap and SEEK_DATA/SEEK_HOLE walk
      * (cetrafs_inode_sorted_runs()), kept between calls: sorting a
@@ -726,14 +735,21 @@ bool cetrafs_inode_ext_cache_lookup(struct inode *inode,
         return false;
 
     spin_lock(&ci->resv_lock);
-    if (ci->ext_valid && (cetrafs_ext_cache_trust_stale || cetrafs_ext_key_matches(ci, raw)) &&
-        iblock >= ci->ext_block && (u64) iblock < (u64) ci->ext_block + ci->ext_len) {
-        *out_lba = ci->ext_lba + (iblock - ci->ext_block);
-        if (out_run)
-            *out_run = ci->ext_len - (iblock - ci->ext_block);
-        if (out_uninit)
-            *out_uninit = ci->ext_uninit;
-        hit = true;
+    if (ci->ext_valid && (cetrafs_ext_cache_trust_stale || cetrafs_ext_key_matches(ci, raw))) {
+        u8 i;
+
+        for (i = 0; i < ci->ext_n && !hit; i++) {
+            const struct cetrafs_ext_ent *e = &ci->ext_ent[i];
+
+            if (iblock >= e->block && (u64) iblock < (u64) e->block + e->len) {
+                *out_lba = e->lba + (iblock - e->block);
+                if (out_run)
+                    *out_run = e->len - (iblock - e->block);
+                if (out_uninit)
+                    *out_uninit = e->uninit;
+                hit = true;
+            }
+        }
     }
     spin_unlock(&ci->resv_lock);
 
@@ -768,6 +784,13 @@ u32 cetrafs_inode_ext_cache_gen(struct inode *inode)
     return gen;
 }
 
+/* How many extents an inode remembers (1..CETRAFS_EXT_CACHE_MAX). 1 is
+ * the one-entry cache of before P14: the control of
+ * tests/kernel/extent_cache_entries.sh. */
+static unsigned int cetrafs_ext_cache_entries = CETRAFS_EXT_CACHE_MAX;
+module_param_named(ext_cache_entries, cetrafs_ext_cache_entries, uint, 0644);
+MODULE_PARM_DESC(ext_cache_entries, "extents remembered per inode by the extent cache (1..16)");
+
 void cetrafs_inode_ext_cache_store(struct inode *inode,
                                    const cetrafs_inode_t *raw,
                                    u32 ext_block,
@@ -777,6 +800,10 @@ void cetrafs_inode_ext_cache_store(struct inode *inode,
                                    u32 gen)
 {
     struct cetrafs_inode_info *ci = CETRAFS_I(inode);
+    unsigned int max = clamp(READ_ONCE(cetrafs_ext_cache_entries), 1u, (unsigned int) CETRAFS_EXT_CACHE_MAX);
+    struct cetrafs_ext_ent *e;
+    u8 slot;
+    bool same_key;
 
     if (!ext_len || !cetrafs_ext_cache_enabled)
         return;
@@ -789,15 +816,34 @@ void cetrafs_inode_ext_cache_store(struct inode *inode,
         atomic64_inc(&cetrafs_ext_cache_stale_refused);
         return;
     }
-    ci->ext_key_depth = cetrafs_le16(raw->eh.eh_depth);
-    ci->ext_key_entries = cetrafs_le16(raw->eh.eh_entries);
-    ci->ext_key_blocks = cetrafs_le64(raw->blocks);
-    ci->ext_key_seq = cetrafs_le64(raw->file_seq);
-    ci->ext_block = ext_block;
-    ci->ext_len = ext_len;
-    ci->ext_lba = ext_lba;
-    ci->ext_uninit = uninit;
-    ci->ext_valid = true;
+    /* A different record key is a different map: what was remembered
+     * under the old key goes. The same key adds to the set. */
+    same_key = ci->ext_valid && cetrafs_ext_key_matches(ci, raw);
+    if (!same_key) {
+        ci->ext_key_depth = cetrafs_le16(raw->eh.eh_depth);
+        ci->ext_key_entries = cetrafs_le16(raw->eh.eh_entries);
+        ci->ext_key_blocks = cetrafs_le64(raw->blocks);
+        ci->ext_key_seq = cetrafs_le64(raw->file_seq);
+        ci->ext_n = 0;
+        ci->ext_next = 0;
+        ci->ext_valid = true;
+    }
+    for (slot = 0; slot < ci->ext_n; slot++)
+        if (ci->ext_ent[slot].block == ext_block && ci->ext_ent[slot].len == ext_len) {
+            spin_unlock(&ci->resv_lock);
+            return; /* already remembered */
+        }
+    if (ci->ext_n < max) {
+        slot = ci->ext_n++;
+    } else {
+        slot = ci->ext_next % max;
+        ci->ext_next = (u8) ((slot + 1) % max);
+    }
+    e = &ci->ext_ent[slot];
+    e->block = ext_block;
+    e->len = ext_len;
+    e->lba = ext_lba;
+    e->uninit = uninit;
     spin_unlock(&ci->resv_lock);
 }
 
@@ -824,6 +870,7 @@ void cetrafs_inode_ext_cache_drop(struct inode *inode)
 
     spin_lock(&ci->resv_lock);
     ci->ext_valid = false;
+    ci->ext_n = 0;
     ci->ext_gen++;
     spin_unlock(&ci->resv_lock);
 }
@@ -1377,6 +1424,8 @@ static void cetrafs_inode_identity_init_ci(struct cetrafs_inode_info *ci)
     /* A slab object is recycled across identities; a remembered extent
      * carried over would map the PREVIOUS file's blocks. */
     ci->ext_valid = false;
+    ci->ext_n = 0;
+    ci->ext_next = 0;
     /* Nor may a namespace operation's staged record: the next release
      * would publish the previous file's image onto this one. The ctor
      * runs this too, so a never-used object starts clean -- slab memory
