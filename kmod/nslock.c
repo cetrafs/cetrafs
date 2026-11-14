@@ -641,6 +641,17 @@ int cetrafs_nslock_acquire(struct inode *inode)
 
 /* TEST ONLY: fail this many staged file-sector publishes at release, as
  * a device error would. */
+/* TEST ONLY: the next N reads of the namespace sector before a staged
+ * file-sector publish fail (tests/kernel/nslock_fd_precheck_read.sh);
+ * _quiet makes one failure withhold the publish and go on, as before --
+ * that suite's control. */
+static unsigned int cetrafs_nslock_fd_precheck_read_fail;
+cetrafs_test_param(nslock_fd_precheck_read_fail, cetrafs_nslock_fd_precheck_read_fail, uint, 0644);
+MODULE_PARM_DESC(nslock_fd_precheck_read_fail, "TEST ONLY: fail the next N release prechecks' namespace-sector reads");
+static bool cetrafs_nslock_fd_precheck_quiet;
+cetrafs_test_param(nslock_fd_precheck_quiet, cetrafs_nslock_fd_precheck_quiet, bool, 0644);
+MODULE_PARM_DESC(nslock_fd_precheck_quiet, "TEST ONLY: a failed release precheck read withholds the publish and goes on");
+
 static unsigned int cetrafs_nslock_fd_publish_fail;
 cetrafs_test_param(nslock_fd_publish_fail, cetrafs_nslock_fd_publish_fail, uint, 0644);
 MODULE_PARM_DESC(nslock_fd_publish_fail, "TEST ONLY: fail the next N staged file-sector publishes at release");
@@ -734,14 +745,34 @@ void cetrafs_nslock_release(struct inode *inode)
         cetrafs_inode_t now;
         int rret;
 
-        cetrafs_invalidate_raw_inode(sb, inode->i_ino);
-        rret = cetrafs_read_raw_inode(sb, inode->i_ino, &now);
-        /* A check that could not run is not a pass: an unreadable sector
-         * leaves the staged update unpublished, as a lost lock would. */
-        if (rret) {
+        for (attempt = 0; attempt < CETRAFS_NSLOCK_RELEASE_RETRIES; attempt++) {
+            cetrafs_invalidate_raw_inode(sb, inode->i_ino);
+            if (cetrafs_nslock_fd_precheck_read_fail) {
+                cetrafs_nslock_fd_precheck_read_fail--; /* test-only, see the knob */
+                rret = -EIO;
+            } else {
+                rret = cetrafs_read_raw_inode(sb, inode->i_ino, &now);
+            }
+            if (!rret || READ_ONCE(cetrafs_nslock_fd_precheck_quiet))
+                break;
+            msleep(CETRAFS_NSLOCK_SLEEP_MS);
+        }
+        /* A check that could not run is not a pass -- and not a lost
+         * lock either. Withholding the file sector and going on let the
+         * sector-0 swap below publish dirent_seq over a size that never
+         * landed, and the directory kept the wrong size for good
+         * (re-audit of the 2026-11-14 fixes). Transient read errors are
+         * retried, as the publish is; one that persists stops the mount,
+         * which also refuses that swap. */
+        if (rret && READ_ONCE(cetrafs_nslock_fd_precheck_quiet)) {
             pr_err("nslock: ino=%llu release: the namespace sector could not be read (%d) -- its staged file "
                    "sector is not published\n",
                    (unsigned long long) inode->i_ino, rret);
+            staged_fd = false;
+        } else if (rret) {
+            cetrafs_sb_fatal(sb, "nslock: ino=%llu release: the namespace sector could not be read in %d "
+                                 "attempts (%d) -- its staged update cannot be published",
+                             (unsigned long long) inode->i_ino, CETRAFS_NSLOCK_RELEASE_RETRIES, rret);
             staged_fd = false;
         } else if (cetrafs_le64(now.generation) != ctx.generation ||
                    cetrafs_le32(now.ns_lock_owner) != ctx.my_node_id) {
