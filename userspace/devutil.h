@@ -450,7 +450,11 @@ static unsigned cetrafs_caw_lbs;
 static unsigned char cetrafs_caw_buf[2 * CETRAFS_BLOCK_SIZE] __attribute__((aligned(4096)));
 
 /* One SCSI command. Returns 0 GOOD, 1 MISCOMPARE, 2 UNIT ATTENTION,
- * -1 refused before execution, -2 outcome unknown. */
+ * -1 refused before execution (the device says the command is not
+ * supported, or the data is protected), -2 outcome unknown, -3 RESERVATION
+ * CONFLICT: another initiator holds the device, so nothing ran. -3 is not
+ * -1: a flush refused for a reservation is a flush that did not happen,
+ * not a device with nothing to flush (audit 2026-11-14 U8). */
 static inline int cetrafs_sg_cmd(int fd, unsigned char *cdb, unsigned char cdb_len, int dir, void *buf, unsigned len)
 {
     unsigned char sense[64];
@@ -473,7 +477,7 @@ static inline int cetrafs_sg_cmd(int fd, unsigned char *cdb, unsigned char cdb_l
     if (io.status == 0 && io.host_status == 0 && (io.driver_status & 0x0f) == 0)
         return 0;
     if (io.status == 0x18) /* RESERVATION CONFLICT: not executed */
-        return -1;
+        return -3;
     if (io.sb_len_wr < 3)
         return -2;
     key = (sense[0] & 0x7f) >= 0x72 ? (sense[1] & 0x0f) : (sense[2] & 0x0f);
@@ -499,6 +503,8 @@ static inline int cetrafs_sg_sync_cache(int fd)
     for (i = 0; i < 3; i++)
         if ((r = cetrafs_sg_cmd(fd, cdb, sizeof(cdb), SG_DXFER_NONE, NULL, 0)) != 2)
             break;
+    /* -1: the device has no cache to flush. -3 (a reservation held by
+     * someone else) and -2 (unknown) are a flush that did not happen. */
     return r == 0 || r == -1 ? 0 : -1;
 }
 
@@ -582,8 +588,20 @@ static inline int cetrafs_row_caw(int fd, const cetrafs_superblock_t *sb, uint32
         if ((r = cetrafs_sg_cmd(fd, cdb, sizeof(cdb), SG_DXFER_TO_DEV, cetrafs_caw_buf, 2 * lbs)) != 2)
             break;
     cetrafs_row_drop_cache(fd, sb, idx);
-    if (r == 0)
-        return cetrafs_sg_sync_cache(fd) == 0 ? 0 : -1;
+    if (r == 0) {
+        /* The swap LANDED: the device returned GOOD, and every reader
+         * through that device sees the new row. A flush that then fails
+         * does not un-land it -- reporting failure here made the caller
+         * leave a claim it had taken unreleased and treat its own row as
+         * not its (audit 2026-11-14 U8). The flush failure is said. */
+        if (cetrafs_sg_sync_cache(fd) != 0) {
+            /* write(2), not fprintf: this runs from the renewal timer. */
+            static const char msg[] = "WARN: a registry claim landed but the device would not flush it\n";
+
+            (void) !write(STDERR_FILENO, msg, sizeof(msg) - 1);
+        }
+        return 0;
+    }
     if (r == 1)
         return r;
     if (r == -2) {
