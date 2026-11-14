@@ -704,6 +704,7 @@ static inline int cetrafs_find_repair_claim(int fd,
 
     if (!count || count > 4096)
         return 0;
+    cetrafs_registry_drop_cache(fd, sb); /* the first sample from the device (audit 2026-11-14 U2) */
     first = (cetrafs_node_entry_t *) calloc(count, sizeof(*first));
     if (!first)
         return -1; /* cannot verify is not "nobody" */
@@ -1461,6 +1462,11 @@ static inline int cetrafs_find_live_peer_on(int fd,
     int found = 0;
 
     count = cetrafs_le32(sb.node_table_count);
+    /* The first sample is the verdict on whether anybody needs watching,
+     * so it must come from the device: a row this host cached while it
+     * was still FREE would read "nobody" and let the caller format a
+     * volume a peer has mounted since (audit 2026-11-14 U2). */
+    cetrafs_registry_drop_cache(fd, &sb);
     /* Same trust boundary: a garbage count must not size an allocation.
      * Any legal volume's node table is <= CETRAFS_MAX_READER_NODES (64,
      * mkfs-enforced); 4096 is comfortably past any future format and
