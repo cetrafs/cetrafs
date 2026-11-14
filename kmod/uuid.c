@@ -94,17 +94,19 @@ MODULE_PARM_DESC(placeholder_ok, "TEST ONLY: accept a placeholder DMI or node_uu
 
 /* TEST ONLY: the DMI product UUID is read from this table instead of the
  * firmware, so a suite can give the module a placeholder or a distinct
- * identity without the machine's own. 0 = the firmware's value. */
+ * identity without the machine's own. 0 = the firmware's value; 5 = no
+ * UUID and no serials either. */
 static const char *const cetrafs_dmi_test_uuids[] = {
     NULL,
     "00000000-0000-0000-0000-000000000000",
     "ffffffff-ffff-ffff-ffff-ffffffffffff",
     "03000200-0400-0500-0006-000700080009",
     "5b1d4f22-2e7a-4c91-9d3b-6a0f8e21c4d7",
+    "", /* 5: no DMI UUID and no serials -- the hash fallback with nothing to hash */
 };
 static unsigned int cetrafs_dmi_uuid_inject;
 cetrafs_test_param(dmi_uuid_inject, cetrafs_dmi_uuid_inject, uint, 0644);
-MODULE_PARM_DESC(dmi_uuid_inject, "TEST ONLY: index of the DMI product UUID to use instead of the firmware's (1-4)");
+MODULE_PARM_DESC(dmi_uuid_inject, "TEST ONLY: index of the DMI product UUID to use instead of the firmware's (1-5)");
 
 /* Refuse a placeholder identity with the way out named. The override is
  * the module parameter node_uuid, set when cetrafs loads. */
@@ -116,6 +118,34 @@ static const char *cetrafs_placeholder_refused(const char *what, const char *uui
            "command line)\n",
            what, uuid);
     return NULL;
+}
+
+/* A serial number that tells this machine from another of its model: not
+ * absent, not empty, not one of the strings firmware writes in its place,
+ * and not one character repeated ("0000000", "xxxxx"). */
+static bool cetrafs_serial_usable(const char *s)
+{
+    static const char *const fillers[] = {"to be filled by o.e.m.", "default string", "not specified", "none",
+                                          "system serial number", "not applicable", "n/a", "unknown",
+                                          "chassis serial number", "base board serial number"};
+    size_t i, n;
+
+    if (!s)
+        return false;
+    while (*s == ' ')
+        s++;
+    n = strlen(s);
+    while (n && s[n - 1] == ' ')
+        n--;
+    if (!n)
+        return false;
+    for (i = 0; i < ARRAY_SIZE(fillers); i++)
+        if (n == strlen(fillers[i]) && !strncasecmp(s, fillers[i], n))
+            return false;
+    for (i = 1; i < n; i++)
+        if (tolower(s[i]) != tolower(s[0]))
+            return true;
+    return false;
 }
 
 const char *get_stable_machine_uuid(void)
@@ -167,6 +197,15 @@ const char *get_stable_machine_uuid(void)
         const char *product = dmi_get_system_info(DMI_PRODUCT_NAME);
         const char *serial = dmi_get_system_info(DMI_PRODUCT_SERIAL);
         const char *board = dmi_get_system_info(DMI_BOARD_SERIAL);
+
+        if (READ_ONCE(cetrafs_dmi_uuid_inject) == 5) /* test-only; see the parameter */
+            serial = board = NULL;
+        /* Vendor and product name every board of a model alike: with no
+         * serial to tell two machines apart the hash is the model's, and
+         * two such machines become one node (audit 2026-11-14 L7). */
+        if (!cetrafs_serial_usable(serial) && !cetrafs_serial_usable(board) && !READ_ONCE(cetrafs_placeholder_ok))
+            return cetrafs_placeholder_refused("this machine's identity (no DMI UUID and no serial number)",
+                                               "the vendor and product name alone");
 
         snprintf(buf, sizeof(buf), "%s-%s-%s-%s", vendor ? vendor : "unknown", product ? product : "unknown",
                  serial ? serial : "unknown", board ? board : "unknown");

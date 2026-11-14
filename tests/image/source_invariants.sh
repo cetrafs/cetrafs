@@ -1477,6 +1477,7 @@ lock.c:cetrafs_read_raw_inode:acts (the late sweep clears claims) only on succes
 node.c:cetrafs_node_is_stale:true branch skips a peer; an error counts it as live
 scrub.c:cetrafs_zg_scrub_adopt_one_stale:log only
 xattr.c:cetrafs_xattr_slot_free:returns bool, not an error
+uuid.c:cetrafs_serial_usable:returns bool, not an error
 zonegroup.c:cetrafs_bg_release_empty:log only
 zonegroup.c:cetrafs_zg_try_claim_one:acts (counts a claim) only on success
 zonegroup.c:cetrafs_bg_data_block_stats:fast-path pick; an error falls to the full scan'

@@ -72,6 +72,26 @@ if [ "$RC" = 0 ]; then
 else
     fail "B: the ordinary identity did not mount (exit $RC): $(grep cetrafs <<<"$LOG" | tail -2 | tr '\n' ' ')"
 fi
+log "C: no DMI UUID and no serial: the vendor/product hash is refused too"
+# Two machines of one model, neither with a serial, hashed to one
+# identity (audit 2026-11-14 L7's residual). Index 5: no UUID, no serials.
+try_mount 5
+if [ "$RC" != 0 ] && ! mountpoint -q "$MNT" && grep -q 'no DMI UUID and no serial number' <<<"$LOG" &&
+    grep -q 'node_uuid=<uuid>' <<<"$LOG"; then
+    pass "C: refused (mount exit $RC), and the log names node_uuid"
+else
+    fail "C: a serial-less model hash was taken as an identity (mount exit $RC)"
+    mountpoint -q "$MNT" && umount "$MNT" 2>/dev/null || true
+fi
+log "C control: with the check removed the same machine mounts"
+ct_param_set placeholder_ok 1
+try_mount 5
+if [ "$RC" = 0 ]; then
+    pass "C control: placeholder_ok lets the serial-less hash mount -- C tests the check"
+    ct_umount "$MNT"
+else
+    fail "C control: it did not mount even with the check removed (exit $RC)"
+fi
 ct_param_set dmi_uuid_inject 0
 ct_param_set placeholder_ok 0
 ct_exit
