@@ -3138,12 +3138,71 @@ u64 cetrafs_free_bmap_lookup_count(void)
     return (u64) atomic64_read(&cetrafs_free_bmap_lookups);
 }
 
-static int __cetrafs_free_data_extent(struct super_block *sb, u64 lba, u32 count, const u64 *resv_seq,
-                                      const u64 *alloc_seq, u64 *out_freed);
+/* TEST ONLY: at most this many entries per pending-free swap (0 = the batch's
+ * full size; 1 = one swap per extent, the control of
+ * tests/kernel/pf_batch_cas.sh). */
+static unsigned int cetrafs_pf_batch_size;
+cetrafs_test_param(pf_batch_size, cetrafs_pf_batch_size, uint, 0644);
+MODULE_PARM_DESC(pf_batch_size, "TEST ONLY: most entries one pending-free swap carries (0 = full batch, 1 = one per swap)");
+
+static unsigned int cetrafs_pf_batch_limit(void)
+{
+    unsigned int v = READ_ONCE(cetrafs_pf_batch_size);
+
+    return (!v || v > CETRAFS_FREE_BATCH) ? CETRAFS_FREE_BATCH : v;
+}
+
+/* Queue what fb holds, one owner's Zone Group at a time. Every entry leaves
+ * fb here, queued or leaked: a batch is never carried past its operation. */
+int cetrafs_free_batch_flush(struct super_block *sb, struct cetrafs_free_batch *fb)
+{
+    u32 dropped = 0;
+    int ret;
+
+    if (!fb->n)
+        return 0;
+    ret = cetrafs_zg_queue_foreign_frees(sb, fb->zg, fb->ents, fb->n, &dropped);
+    ctrace("BLKQUEUE zg=%u n=%u dropped=%u ret=%d\n", (unsigned int) fb->zg, (unsigned int) fb->n, dropped, ret);
+    /* Dropped extents are the deliberate leak the caller never hears of --
+     * see cetrafs_zg_queue_foreign_frees(). */
+    if (dropped)
+        atomic64_add(dropped, &cetrafs_foreign_free_leaks);
+    fb->n = 0;
+    return ret;
+}
+
+/* Hold one foreign extent in fb, flushing first when it is for another
+ * Zone Group or the batch is at its limit. */
+static int cetrafs_free_batch_add(struct super_block *sb,
+                                  struct cetrafs_free_batch *fb,
+                                  u32 zg_id,
+                                  const struct cetrafs_pf_ent *ent)
+{
+    int ret = 0;
+
+    if (fb->n && (fb->zg != zg_id || fb->n >= cetrafs_pf_batch_limit()))
+        ret = cetrafs_free_batch_flush(sb, fb);
+    fb->zg = zg_id;
+    fb->ents[fb->n++] = *ent;
+    return ret;
+}
+
+static int __cetrafs_free_data_extent(struct super_block *sb,
+                                      u64 lba,
+                                      u32 count,
+                                      const u64 *resv_seq,
+                                      const u64 *alloc_seq,
+                                      u64 *out_freed,
+                                      struct cetrafs_free_batch *fb);
 
 int cetrafs_free_data_extent(struct super_block *sb, u64 lba, u32 count)
 {
-    return __cetrafs_free_data_extent(sb, lba, count, NULL, NULL, NULL);
+    return __cetrafs_free_data_extent(sb, lba, count, NULL, NULL, NULL, NULL);
+}
+
+int cetrafs_free_data_extent_batched(struct super_block *sb, u64 lba, u32 count, struct cetrafs_free_batch *fb)
+{
+    return __cetrafs_free_data_extent(sb, lba, count, NULL, NULL, NULL, fb);
 }
 
 /*
@@ -3170,7 +3229,7 @@ int cetrafs_free_data_extent(struct super_block *sb, u64 lba, u32 count)
 int cetrafs_free_data_extent_unless_reserved(struct super_block *sb, u64 lba, u32 count, u64 resv_seq,
                                              const u64 *alloc_seq, u64 *out_freed)
 {
-    return __cetrafs_free_data_extent(sb, lba, count, &resv_seq, alloc_seq, out_freed);
+    return __cetrafs_free_data_extent(sb, lba, count, &resv_seq, alloc_seq, out_freed, NULL);
 }
 
 /*
@@ -3207,7 +3266,7 @@ bool cetrafs_lba_run_is_ours(struct super_block *sb, u64 lba, u64 count)
 /* resv_seq: NULL for an owner's free; the scrub passes the registry's
  * release count from before its evidence (cetrafs_sb_resv_seq()). */
 /* out_freed: the blocks this call cleared (only the direct path clears any). */
-static int __cetrafs_free_data_extent(struct super_block *sb, u64 lba, u32 count, const u64 *resv_seq, const u64 *alloc_seq, u64 *out_freed)
+static int __cetrafs_free_data_extent(struct super_block *sb, u64 lba, u32 count, const u64 *resv_seq, const u64 *alloc_seq, u64 *out_freed, struct cetrafs_free_batch *fb)
 {
     struct buffer_head *fbh = NULL; /* the bitmap block the loop holds */
     u64 fblk = 0;
@@ -3309,28 +3368,41 @@ static int __cetrafs_free_data_extent(struct super_block *sb, u64 lba, u32 count
              * for a group we do not own. Read older than the device it
              * can only make the drain drop this entry: a leak, the safe
              * direction (rule 6). */
-            ret = cetrafs_zg_queue_foreign_free(sb, bg.owner_zg, lba, count, bg.free_gen);
-            ctrace("BLKQUEUE lba=%llu count=%u zg=%u ret=%d from=%pS\n", (unsigned long long) lba, count,
-                   (unsigned int) bg.owner_zg, ret, __builtin_return_address(0));
             /*
-             * -ENOSPC: the queue was full -- its owner behind, or dead and
-             * flagged for the heartbeat to adopt (never adopted here: this
-             * runs inside the caller's locks; audit 2026-11-06 M6) -- so the
-             * extent was deliberately LEAKED (logged, reclaimed later by
-             * the scrub or fsck -r). That is a bounded, recoverable loss
-             * of SPACE -- it is not a failure of the caller's operation,
-             * and it must never be reported as one. Returning it failed
-             * the guest's I/O on a punch-hole: qemu latched
-             * "I/O status: nospace" and Proxmox paused the VM, while the
-             * volume had 2 TB free. A caller asked us to
-             * stop referencing these blocks and we did; whether the
-             * owner got to reuse them yet is our problem, not theirs.
+             * The extent joins a batch. A full queue leaks what it cannot
+             * place -- its owner behind, or dead and flagged for the
+             * heartbeat to adopt (never adopted here: this runs inside the
+             * caller's locks; audit 2026-11-06 M6) -- deliberately, logged,
+             * and reclaimed later by the scrub or fsck -r. That is a
+             * bounded, recoverable loss of SPACE, never a failure of the
+             * caller's operation: returning it failed the guest's I/O on a
+             * punch-hole, qemu latched "I/O status: nospace" and Proxmox
+             * paused the VM, while the volume had 2 TB free. The flush
+             * counts such leaks (cetrafs_free_batch_flush()) and returns
+             * only a hard error. A caller asked us to stop referencing
+             * these blocks and we did; whether the owner got to reuse them
+             * yet is our problem, not theirs.
+             *
+             * The stamp is the descriptor as read above -- refreshed, for a
+             * group we do not own. Read older than the device it can only
+             * make the drain drop this entry: a leak, the safe direction
+             * (rule 6). Each entry keeps its own, since one batch can span
+             * Block Groups.
              */
-            if (ret == -ENOSPC) {
-                atomic64_inc(&cetrafs_foreign_free_leaks);
-                return 0;
+            {
+                struct cetrafs_pf_ent ent = {.lba = lba, .count = count, .stamp = bg.free_gen};
+                struct cetrafs_free_batch local;
+
+                if (fb)
+                    return cetrafs_free_batch_add(sb, fb, bg.owner_zg, &ent);
+                /* One extent, flushed here: the same swap a batch of one makes.
+                 * Holding nothing yet, the add cannot flush, so its return is 0. */
+                cetrafs_free_batch_init(&local);
+                ret = cetrafs_free_batch_add(sb, &local, bg.owner_zg, &ent);
+                if (ret)
+                    return ret;
+                return cetrafs_free_batch_flush(sb, &local);
             }
-            return ret;
         }
     }
 

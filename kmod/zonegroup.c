@@ -1546,7 +1546,7 @@ static int cetrafs_zg_claim_one_more_locked(struct super_block *sb, u32 count, u
  * keeps the scrub from aggressively fencing a peer that is just slow.
  */
 /*
- * Adopt the Zone Groups a free found full (cetrafs_zg_queue_foreign_free()'s
+ * Adopt the Zone Groups a free found full (cetrafs_zg_queue_foreign_frees()'s
  * queue-full path) or an allocator found to be its only space
  * (cetrafs_zg_claim_one_more()), from the heartbeat tick. cetrafs_zg_try_claim_one()
  * only steals from a stale or absent owner, so a full queue whose owner
@@ -2120,11 +2120,17 @@ static int cetrafs_zg_queue_span(struct super_block *sb, u32 zg_id, u64 *out_sta
 #define CETRAFS_PF_PER_REGION(sb) (cetrafs_cas_region_size(sb) / sizeof(cetrafs_pending_free_t))
 
 struct cetrafs_pf_append_ctx {
-    u64 lba;
-    u32 count;
-    u64 stamp; /* the group's free_gen, read before the swap */
+    const struct cetrafs_pf_ent *ents; /* the entries still to place, in order */
+    u32 n;                             /* how many */
+    u32 placed;                        /* placed by the LAST mutate run */
 };
 
+/* Fill the free slots of one region with the head of ents[], in order, as
+ * many as fit. The CAS runs this on a fresh image on every attempt, so
+ * 'placed' always describes the swap that lands: an attempt that loses
+ * resets it, and the run that wins counts again. Nothing placed is "region
+ * full" (-EEXIST), which is no swap at all -- and a lost race lands the
+ * same entries in whatever slots the new image has free. */
 static int cetrafs_pf_append_mutate(void *image, unsigned int len, void *priv)
 {
     struct cetrafs_pf_append_ctx *ctx = priv;
@@ -2132,20 +2138,20 @@ static int cetrafs_pf_append_mutate(void *image, unsigned int len, void *priv)
     unsigned int slots = len / sizeof(*ent);
     unsigned int e;
 
-    /* Re-finds a free slot in whatever image the CAS hands back, so a
-     * lost race simply lands in a different slot on the retry -- the
-     * same shape as alloc.c's bitmap CAS. */
-    for (e = 0; e < slots; e++) {
+    ctx->placed = 0;
+    for (e = 0; e < slots && ctx->placed < ctx->n; e++) {
+        const struct cetrafs_pf_ent *src = &ctx->ents[ctx->placed];
+
         if (cetrafs_le64(ent[e].lba) != 0)
             continue;
-        ent[e].lba = cetrafs_cpu_to_le64(ctx->lba);
-        ent[e].count = cetrafs_cpu_to_le32(ctx->count);
+        ent[e].lba = cetrafs_cpu_to_le64(src->lba);
+        ent[e].count = cetrafs_cpu_to_le32(src->count);
         ent[e].magic = cetrafs_cpu_to_le32(CETRAFS_PENDING_FREE_MAGIC);
-        ent[e].free_gen = cetrafs_cpu_to_le64(ctx->stamp);
+        ent[e].free_gen = cetrafs_cpu_to_le64(src->stamp);
         ent[e].pad = cetrafs_cpu_to_le64(0);
-        return 0;
+        ctx->placed++;
     }
-    return -EEXIST; /* this region is full; the caller tries the next */
+    return ctx->placed ? 0 : -EEXIST; /* this region is full; the caller tries the next */
 }
 
 /* How many times a foreign free was appended to a peer's pending-free
@@ -2160,6 +2166,13 @@ static atomic64_t cetrafs_pending_appends = ATOMIC64_INIT(0);
 u64 cetrafs_pending_free_append_count(void)
 {
     return (u64) atomic64_read(&cetrafs_pending_appends);
+}
+/* Entries those appends carried: one per extent appended, however many a
+ * single compare-and-swap placed (pending_free_appends counts swaps). */
+static atomic64_t cetrafs_pending_entries = ATOMIC64_INIT(0);
+u64 cetrafs_pending_free_entry_count(void)
+{
+    return (u64) atomic64_read(&cetrafs_pending_entries);
 }
 
 /*
@@ -2245,20 +2258,27 @@ static unsigned int cetrafs_pf_append_stall_ms;
 cetrafs_test_param(pf_append_stall_ms, cetrafs_pf_append_stall_ms, uint, 0644);
 MODULE_PARM_DESC(pf_append_stall_ms, "TEST ONLY: delay every foreign-free queue append (ms)");
 
-int cetrafs_zg_queue_foreign_free(struct super_block *sb, u32 zg_id, u64 lba, u32 count, u64 stamp)
+int cetrafs_zg_queue_foreign_frees(struct super_block *sb,
+                                   u32 zg_id,
+                                   const struct cetrafs_pf_ent *ents,
+                                   u32 n,
+                                   u32 *dropped)
 {
-    struct cetrafs_pf_append_ctx ctx = {.lba = lba, .count = count, .stamp = stamp};
+    struct cetrafs_pf_append_ctx ctx;
     unsigned int regions = CETRAFS_BLOCK_SIZE / cetrafs_cas_region_size(sb);
     u64 qstart;
-    u32 qblocks, qb;
-    int ret;
+    u32 qblocks, qb, next = 0;
+    int ret = 0;
 
+    *dropped = 0;
+    if (!n)
+        return 0;
     if (READ_ONCE(cetrafs_pf_append_stall_ms))
         msleep(READ_ONCE(cetrafs_pf_append_stall_ms)); /* TEST ONLY */
 
     ret = cetrafs_zg_queue_span(sb, zg_id, &qstart, &qblocks);
     if (ret)
-        return ret;
+        goto append_failed;
 
     /* Known full: do not scan. The scan is qblocks * regions device
      * round trips and it just failed; the owner drains on its own tick,
@@ -2268,10 +2288,14 @@ int cetrafs_zg_queue_foreign_free(struct super_block *sb, u32 zg_id, u64 lba, u3
     if (cetrafs_sb_zg_pf_backoff_active(sb, zg_id))
         goto queue_full;
 
-    for (qb = 0; qb < qblocks; qb++) {
+    /* Each swap places the head of what is left into the first region with
+     * room. The scan starts at block 0 every time: the drain's quiet probe
+     * stops at CETRAFS_PF_DRAIN_EMPTY_RUN empty blocks, which is only sound
+     * while appends fill from the front, so no cursor may skip the front. */
+    for (qb = 0; qb < qblocks && next < n; qb++) {
         unsigned int r;
 
-        for (r = 0; r < regions; r++) {
+        for (r = 0; r < regions && next < n; r++) {
             /* Test-only: behave as a full region. Deliberately inside
              * the loop, so the SCAN still happens and is counted --
              * modelling a queue that is full, not one that is skipped.
@@ -2279,28 +2303,36 @@ int cetrafs_zg_queue_foreign_free(struct super_block *sb, u32 zg_id, u64 lba, u3
              * it is only counting. */
             if (cetrafs_pf_force_queue_full)
                 continue;
+            ctx.ents = &ents[next];
+            ctx.n = n - next;
+            ctx.placed = 0;
             ret = cetrafs_cas_region(sb, qstart + qb, r, cetrafs_pf_append_mutate, &ctx);
             if (ret == 0) {
                 u64 runs, blocks;
 
+                /* ctx.placed is what the winning swap carried: see the mutator. */
+                next += ctx.placed;
                 atomic64_inc(&cetrafs_pending_appends);
+                atomic64_add(ctx.placed, &cetrafs_pending_entries);
                 /* Space again: say what the burst cost, once. */
                 if (cetrafs_sb_zg_pf_take_drops(sb, zg_id, &runs, &blocks))
                     pr_warn("pending free: ZG %u queue drained; %llu run(s)/%llu block(s) "
                             "were dropped while it was full and stay allocated until the "
                             "owner's scrub or fsck -r reclaims them\n",
                             zg_id, (unsigned long long) runs, (unsigned long long) blocks);
-                return 0;
+                continue;
             }
             if (ret == -EEXIST || ret == -EBUSY)
                 continue; /* region full, or lost the race too often: move on */
-            return ret;
+            goto append_failed;
         }
     }
+    if (next == n)
+        return 0;
 
-    /* One scan of every slot in the ZG's queue, completed without
-     * finding space. This is the cost the backoff exists to stop
-     * repeating: qblocks * regions device round trips, per extent. */
+    /* One scan of every slot in the ZG's queue, completed without finding
+     * room for the rest. This is the cost the backoff exists to stop
+     * repeating: qblocks * regions device round trips, per burst. */
     atomic64_inc(&cetrafs_pf_full_scans);
 
 queue_full:
@@ -2330,28 +2362,40 @@ queue_full:
      * Owner is alive but not draining fast enough (a burst). A loud,
      * bounded leak -- the blocks stay marked allocated, never a silent
      * loss -- with the owner's state frozen in the log, since by the
-     * time anyone inspects it the owner may have recovered.
+     * time anyone inspects it the owner may have recovered. Every extent
+     * not placed is counted and reported to the caller in *dropped; it is
+     * not an error for the caller's operation.
      */
-    /* Count every drop; do the EXPENSIVE diagnostic only on the first of
-     * a burst. The full message reads the ZG record and the owner's
-     * registry row -- two device round trips -- and is worth it once,
-     * to name who was not draining and whether they were alive. Tens of
-     * thousands of copies of it are just a console storm on a path that
-     * is already failing. The rest are summarised when the queue drains
-     * (see the append path above) or at unmount. */
-    atomic64_inc(&cetrafs_pf_drop_runs);
-    atomic64_add(count, &cetrafs_pf_drop_blocks);
-    if (cetrafs_sb_zg_pf_note_drop(sb, zg_id, count, cetrafs_pf_full_backoff_ms))
-        cetrafs_zg_log_foreign_free_leak(sb, zg_id, lba, count);
-    return -ENOSPC;
-}
+    {
+        u64 blocks = 0;
+        u32 i;
 
-/* One queue entry as a drain handles it. */
-struct cetrafs_pf_ent {
-    u64 lba;
-    u32 count;
-    u64 stamp; /* its free_gen: applied only while the group's still equals it */
-};
+        for (i = next; i < n; i++)
+            blocks += ents[i].count;
+        *dropped = n - next;
+        /* Count every drop; do the EXPENSIVE diagnostic only on the first of
+         * a burst. The full message reads the ZG record and the owner's
+         * registry row -- two device round trips -- and is worth it once,
+         * to name who was not draining and whether they were alive. Tens of
+         * thousands of copies of it are just a console storm on a path that
+         * is already failing. The rest are summarised when the queue drains
+         * (see the append path above) or at unmount. */
+        atomic64_add(n - next, &cetrafs_pf_drop_runs);
+        atomic64_add(blocks, &cetrafs_pf_drop_blocks);
+        if (cetrafs_sb_zg_pf_note_drop(sb, zg_id, n - next, blocks, cetrafs_pf_full_backoff_ms))
+            cetrafs_zg_log_foreign_free_leak(sb, zg_id, ents[next].lba, ents[next].count);
+    }
+    return 0;
+
+append_failed:
+    /* The device refused a swap, or the queue could not be located: nothing
+     * more of this batch is queued, and its blocks stay allocated for the
+     * scrub. Not a queue drop -- say so, and tell the caller how many. */
+    *dropped = n - next;
+    pr_err_ratelimited("pending free: ZG %u: %u extent(s) not queued (%d) -- left allocated for the scrub\n", zg_id,
+                       n - next, ret);
+    return ret;
+}
 
 /* What one consume swap of a single region took. Rebuilt from the image
  * on every attempt, so once the CAS lands it is exactly what the WINNING

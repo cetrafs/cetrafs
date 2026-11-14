@@ -1275,6 +1275,8 @@ C21_ALLOW="
 cetrafs_bg_adjust_free_blocks accrues-first;-the-return-is-the-roll-up-only
 cetrafs_flush_dirty_free_counts re-accrues-a-failed-delta-itself
 cetrafs_free_data_extent a-lost-free-leaks;-the-scrub-reclaims-it
+cetrafs_free_data_extent_batched a-hard-error-is-logged-and-its-blocks-stay-allocated-for-the-scrub
+cetrafs_free_batch_flush a-hard-error-is-logged-and-its-blocks-stay-allocated-for-the-scrub
 cetrafs_free_inode a-failed-free-keeps-the-bit;-the-orphan-scrub-reclaims-it
 cetrafs_release vfs-release;-its-failures-queue-their-own-retry
 cetrafs_sb_adjust_free_inodes in-memory;-fails-only-without-sb_info
@@ -2015,7 +2017,6 @@ cetrafs_tree_insert_any_leaf final:every-interior-and-every-leaf-full-under-inva
 cetrafs_tree_build final:the-extent-tree-is-full
 cetrafs_xattr_set_locked final:the-xattr-block-is-full
 cetrafs_node_register final:every-registry-row-taken
-cetrafs_zg_queue_foreign_free below:a-full-queue-is-a-logged-leak-its-caller-reports-as-success
 cetrafs_dir_add_entry final:the-directory-is-at-CETRAFS_DIR_MAX_BLOCKS
 cetrafs_tree_resv_fill final:test-injection-convert_append_nospc
 cetrafs_tree_alloc_block final:test-injection-convert_append_nospc'
@@ -2207,7 +2208,7 @@ cetrafs_defrag_inode held:the-defrag-pin-on-the-whole-file-lock
 cetrafs_defrag_commit held:inside-cetrafs_defrag_inode-s-pin
 cetrafs_apply_pending_free queued:the-owner-applying-a-published-free
 cetrafs_zg_drain_one queued:drains-the-owner-s-queue'
-C14D_PRIMS='cetrafs_free_data_block cetrafs_free_data_extent cetrafs_free_data_extent_unless_reserved cetrafs_apply_pending_free cetrafs_bitmap_free_bit cetrafs_bitmap_flip_range cetrafs_free_fetched_extents cetrafs_free_inline_extents cetrafs_free_leaf_array cetrafs_tree_free_meta cetrafs_leaf_array_punch cetrafs_leaf_array_trim'
+C14D_PRIMS='cetrafs_free_data_block cetrafs_free_data_extent cetrafs_free_data_extent_batched cetrafs_free_data_extent_unless_reserved cetrafs_apply_pending_free cetrafs_bitmap_free_bit cetrafs_bitmap_flip_range cetrafs_free_fetched_extents cetrafs_free_inline_extents cetrafs_free_leaf_array cetrafs_tree_free_meta cetrafs_leaf_array_punch cetrafs_leaf_array_trim'
 c14d_freers() { # <files...>: every function calling a free primitive (any name, not just cetrafs_*)
     local p
     for p in $C14D_PRIMS; do
@@ -2305,6 +2306,7 @@ printf 'static int cetrafs_new_refuser(struct super_block *sb)\n{\n    return ce
 log "checking every path into a freed-run discard frees only what the device no longer references (class 30)"
 FREE_OK='alloc.c:__cetrafs_free_data_extent:the free itself
 alloc.c:cetrafs_free_data_extent:wrapper
+alloc.c:cetrafs_free_data_extent_batched:wrapper -- the batched form; its callers flush before their own return
 alloc.c:cetrafs_free_data_extent_unless_reserved:wrapper
 alloc.c:cetrafs_apply_pending_free:a peer'"'"'s free, queued by one of these paths on that peer
 alloc.c:cetrafs_foreign_free_leak_count:a forward declaration, not a call
@@ -2325,7 +2327,7 @@ free_callers() {
     for f in "$@"; do
         awk -v F="$(basename "$f")" '
             /^[a-z_][a-z0-9_ *]*\(/ && !/;$/ { fn = $0; sub(/\(.*/, "", fn); n = split(fn, a, " "); fn = a[n]; sub(/^\*+/, "", fn) }
-            /cetrafs_free_data_extent\(|cetrafs_free_data_extent_unless_reserved\(|__cetrafs_free_data_extent\(|cetrafs_apply_pending_free\(/ && !/^[[:space:]]*\*/ && !/^[[:space:]]*\/\*/ { print F ":" fn }' "$f"
+            /cetrafs_free_data_extent\(|cetrafs_free_data_extent_batched\(|cetrafs_free_data_extent_unless_reserved\(|__cetrafs_free_data_extent\(|cetrafs_apply_pending_free\(/ && !/^[[:space:]]*\*/ && !/^[[:space:]]*\/\*/ { print F ":" fn }' "$f"
     done | sort -u
 }
 dofree_callers() {
@@ -2415,6 +2417,7 @@ printf 'int main(void)\n{\n    if (repair_mode && !repair_blocked)\n        fix(
 log "checking every block free is announced to the scrub or names what covers it (class 46)"
 FREE_OK='alloc.c:__cetrafs_free_data_extent:the primitive
 alloc.c:cetrafs_free_data_extent:the primitive
+alloc.c:cetrafs_free_data_extent_batched:the primitive (batched) -- every batch is flushed by the function that filled it, inside its frees_begin bracket
 alloc.c:cetrafs_free_data_extent_unless_reserved:the primitive (the scrub'"'"'s)
 file.c:cetrafs_free_fetched_extents:primitive -- evict'"'"'s, whose record names the blocks until forget_tree
 file.c:cetrafs_free_inline_extents:primitive
@@ -2439,7 +2442,7 @@ free_callers() {
     for f in "$@"; do
         awk -v F="$(basename "$f")" '
             /^[a-z_][a-z0-9_ *]*\(/ && !/;$/ { if (fn != "" && hit && !beg) print F ":" fn; fn = $0; sub(/\(.*/, "", fn); n = split(fn, a, " "); fn = a[n]; sub(/^\*+/, "", fn); hit = 0; beg = 0 }
-            /(cetrafs_free_data_block|cetrafs_free_data_extent|cetrafs_free_data_extent_unless_reserved|cetrafs_zg_queue_foreign_free|cetrafs_tree_free_meta|cetrafs_free_fetched_extents|cetrafs_free_leaf_array|cetrafs_free_inline_extents|cetrafs_leaf_array_trim|cetrafs_leaf_array_punch)\(/ && !/^[a-z_]/ && !/^[[:space:]]*\*/ && !/^[[:space:]]*\/\*/ { hit = 1 }
+            /(cetrafs_free_data_block|cetrafs_free_data_extent|cetrafs_free_data_extent_batched|cetrafs_free_data_extent_unless_reserved|cetrafs_tree_free_meta|cetrafs_free_fetched_extents|cetrafs_free_leaf_array|cetrafs_free_inline_extents|cetrafs_leaf_array_trim|cetrafs_leaf_array_punch)\(/ && !/^[a-z_]/ && !/^[[:space:]]*\*/ && !/^[[:space:]]*\/\*/ { hit = 1 }
             /cetrafs_frees_begin\(/ && !/^[a-z_]/ { beg = 1 }
             END { if (fn != "" && hit && !beg) print F ":" fn }' "$f"
     done | sort -u

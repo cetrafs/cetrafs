@@ -289,7 +289,7 @@ void cetrafs_sb_cache_zg_ownership(struct super_block *sb, u32 zg_id);
 void cetrafs_sb_uncache_zg_ownership(struct super_block *sb, u32 zg_id);
 bool cetrafs_sb_zg_owned_cached(struct super_block *sb, u32 zg_id);
 bool cetrafs_sb_zg_pf_backoff_active(struct super_block *sb, u32 zg_id);
-bool cetrafs_sb_zg_pf_note_drop(struct super_block *sb, u32 zg_id, u32 count, unsigned int backoff_ms);
+bool cetrafs_sb_zg_pf_note_drop(struct super_block *sb, u32 zg_id, u32 runs, u64 blocks, unsigned int backoff_ms);
 bool cetrafs_sb_zg_pf_take_drops(struct super_block *sb, u32 zg_id, u64 *runs, u64 *blocks);
 bool cetrafs_sb_owns_any_zg(struct super_block *sb);
 bool cetrafs_sb_bg_is_ours(struct super_block *sb, u32 bg_id);
@@ -629,6 +629,7 @@ u64 cetrafs_record_write_count(void);
  * on a single-node/loop volume by construction; the only confirmation the
  * append path runs on a real multi-node volume. */
 u64 cetrafs_pending_free_append_count(void);
+u64 cetrafs_pending_free_entry_count(void);
 /* Replay-claim outcomes (journal.c): how many of a dead peer's journal
  * areas this node replayed, and how many it found another node already
  * on. The loser of that race returns success silently, so the decline
@@ -969,6 +970,34 @@ int cetrafs_alloc_data_run(struct super_block *sb, u32 bg_id, u64 count, u64 *ou
 u32 cetrafs_alloc_run_after(struct super_block *sb, u32 bg_id, u64 start_lba, u32 max);
 long cetrafs_falloc_alloc_call_count(void); /* file.c: allocator calls made by fallocate */
 int cetrafs_free_data_extent(struct super_block *sb, u64 lba, u32 count);
+
+/* Foreign frees gathered by one operation and queued as one batch
+ * (alloc.c, zonegroup.c). A pending-free swap covers one CAS region of a
+ * queue block -- 16 entries on a 512-byte logical block -- so a batch of
+ * this many is a few swaps, not one per extent. The entries keep their own
+ * stamps: a batch can span Block Groups whose free_gen differ. */
+#define CETRAFS_FREE_BATCH 32
+struct cetrafs_pf_ent {
+    u64 lba;
+    u32 count;
+    u64 stamp; /* its free_gen: applied only while the group's still equals it */
+};
+struct cetrafs_free_batch {
+    u32 n;   /* entries held */
+    u32 zg;  /* the owning Zone Group every held entry is aimed at */
+    struct cetrafs_pf_ent ents[CETRAFS_FREE_BATCH];
+};
+static inline void cetrafs_free_batch_init(struct cetrafs_free_batch *fb)
+{
+    fb->n = 0;
+    fb->zg = 0;
+}
+/* Free [lba, lba+count) as part of batch fb: a foreign extent is held in fb
+ * and queued by the batch's flush, a block of ours is cleared now. Every
+ * batch MUST be flushed before the operation that filled it returns, inside
+ * the same frees_begin/frees_end bracket the frees belong to. */
+int cetrafs_free_data_extent_batched(struct super_block *sb, u64 lba, u32 count, struct cetrafs_free_batch *fb);
+int cetrafs_free_batch_flush(struct super_block *sb, struct cetrafs_free_batch *fb);
 /* Inline so the BLKFREE/BLKQUEUE traces' from=%pS names the real caller,
  * not this wrapper. */
 /*
@@ -1160,7 +1189,15 @@ int cetrafs_zg_claim_unowned(struct super_block *sb,
 int cetrafs_zg_release_surplus(struct super_block *sb, u32 my_node_id);
 int cetrafs_zg_release_all_rdonly(struct super_block *sb, u32 my_node_id);
 int cetrafs_zg_scrub_adopt_one_stale(struct super_block *sb, bool *out_adopted);
-int cetrafs_zg_queue_foreign_free(struct super_block *sb, u32 zg_id, u64 lba, u32 count, u64 stamp);
+/* Append n entries to zg_id's queue, as many per swap as its regions take.
+ * Returns 0 when every entry is queued or deliberately dropped (*dropped
+ * counts the drops: leaked on purpose, reclaimed by the scrub or fsck -r),
+ * or a hard error with the entries from *dropped on not queued. */
+int cetrafs_zg_queue_foreign_frees(struct super_block *sb,
+                                   u32 zg_id,
+                                   const struct cetrafs_pf_ent *ents,
+                                   u32 n,
+                                   u32 *dropped);
 /* may_wait: back off on a busy region (heartbeat, mount); false on the
  * allocation path, where a write is waiting. */
 int cetrafs_zg_drain_pending_frees(struct super_block *sb, bool may_wait);

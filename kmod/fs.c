@@ -4060,9 +4060,9 @@ bool cetrafs_sb_zg_pf_backoff_active(struct super_block *sb, u32 zg_id)
     return until && time_before(jiffies, until);
 }
 
-/* Record a dropped run. Returns true the FIRST time in a burst, which
- * is when the caller does the expensive diagnostic. */
-bool cetrafs_sb_zg_pf_note_drop(struct super_block *sb, u32 zg_id, u32 count, unsigned int backoff_ms)
+/* Record dropped runs (extents) and their blocks. Returns true the FIRST
+ * time in a burst, which is when the caller does the expensive diagnostic. */
+bool cetrafs_sb_zg_pf_note_drop(struct super_block *sb, u32 zg_id, u32 runs, u64 blocks, unsigned int backoff_ms)
 {
     struct cetrafs_sb_info *sbi = sb->s_fs_info;
     bool first;
@@ -4075,8 +4075,8 @@ bool cetrafs_sb_zg_pf_note_drop(struct super_block *sb, u32 zg_id, u32 count, un
         WRITE_ONCE(sbi->zg_pf_drop_runs[zg_id], 0);
         WRITE_ONCE(sbi->zg_pf_drop_blocks[zg_id], 0);
     }
-    WRITE_ONCE(sbi->zg_pf_drop_runs[zg_id], READ_ONCE(sbi->zg_pf_drop_runs[zg_id]) + 1);
-    WRITE_ONCE(sbi->zg_pf_drop_blocks[zg_id], READ_ONCE(sbi->zg_pf_drop_blocks[zg_id]) + count);
+    WRITE_ONCE(sbi->zg_pf_drop_runs[zg_id], READ_ONCE(sbi->zg_pf_drop_runs[zg_id]) + runs);
+    WRITE_ONCE(sbi->zg_pf_drop_blocks[zg_id], READ_ONCE(sbi->zg_pf_drop_blocks[zg_id]) + blocks);
     /* 0 means "do not remember at all" -- the negative control. Setting
      * jiffies+1 instead would still suppress every scan inside the same
      * tick, which is most of a burst, and the control would measure

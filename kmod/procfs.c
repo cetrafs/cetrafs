@@ -253,6 +253,7 @@ static int cetrafs_proc_info_show(struct seq_file *m, void *v)
     seq_printf(m, "cas_ops: %llu\n", cetrafs_cas_op_count());
     seq_printf(m, "record_writes: %llu\n", cetrafs_record_write_count());
     seq_printf(m, "pending_free_appends: %llu\n", cetrafs_pending_free_append_count());
+    seq_printf(m, "pending_free_entries: %llu\n", cetrafs_pending_free_entry_count());
     seq_printf(m, "foreign_free_leaks: %llu\n", cetrafs_foreign_free_leak_count());
     seq_printf(m, "scrub_reclaimed: %llu\n", cetrafs_scrub_reclaimed_count());
     seq_printf(m, "scrub_orphan_inodes_reclaimed: %llu\n", cetrafs_scrub_orphans_count());

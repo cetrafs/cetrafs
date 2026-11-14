@@ -2632,18 +2632,22 @@ const struct address_space_operations cetrafs_aops = {
  * path's "drop the whole thing" case. */
 static void cetrafs_free_leaf_array(struct super_block *sb, const cetrafs_extent_t *arr, u16 entries)
 {
+    struct cetrafs_free_batch fb;
     u16 i;
 
     /* Whole-extent frees, not per-block: besides fewer bitmap RMWs, a
      * free aimed at another node's ZG becomes ONE pending-free queue
-     * entry (one cluster-mutex cycle) per extent instead of one per
-     * block -- see cetrafs_free_data_extent(). */
+     * entry per extent instead of one per block, and the batch packs
+     * those entries into as few queue swaps as the queue takes -- see
+     * cetrafs_free_data_extent_batched(). */
+    cetrafs_free_batch_init(&fb);
     for (i = 0; i < entries; i++) {
         u64 phys = cetrafs_extent_phys_from_hilo(arr[i].ee_start_hi, arr[i].ee_start_lo);
         u32 len = cetrafs_extent_len(arr[i].ee_len);
 
-        cetrafs_free_data_extent(sb, phys, len);
+        cetrafs_free_data_extent_batched(sb, phys, len, &fb);
     }
+    cetrafs_free_batch_flush(sb, &fb);
 }
 
 void cetrafs_tree_free_meta(struct inode *inode, const cetrafs_inode_t *raw);
@@ -2677,11 +2681,16 @@ void cetrafs_tree_free_meta(struct inode *inode, const cetrafs_inode_t *raw);
 void cetrafs_free_fetched_extents(struct inode *dir, const cetrafs_inode_t *raw, struct cetrafs_inode_extents *ex)
 {
     struct super_block *sb = dir->i_sb;
+    struct cetrafs_free_batch fb;
     u32 i;
 
+    /* A large image is tens of thousands of extents: batched, so one queue
+     * swap carries many of them when its owner is another node. */
+    cetrafs_free_batch_init(&fb);
     for (i = 0; i < ex->entries; i++)
-        cetrafs_free_data_extent(sb, cetrafs_extent_phys_from_hilo(ex->arr[i].ee_start_hi, ex->arr[i].ee_start_lo),
-                                 cetrafs_extent_len(ex->arr[i].ee_len));
+        cetrafs_free_data_extent_batched(sb, cetrafs_extent_phys_from_hilo(ex->arr[i].ee_start_hi, ex->arr[i].ee_start_lo),
+                                         cetrafs_extent_len(ex->arr[i].ee_len), &fb);
+    cetrafs_free_batch_flush(sb, &fb);
     if (cetrafs_le16(raw->eh.eh_depth) != 0)
         cetrafs_tree_free_meta(dir, raw);
 }
@@ -2708,12 +2717,15 @@ void cetrafs_free_inline_extents(struct inode *dir, const cetrafs_inode_t *raw)
         int ret = cetrafs_inode_extents_get(dir, raw, &ex);
 
         if (ret == 0) {
+            struct cetrafs_free_batch fb;
             u32 i;
 
+            cetrafs_free_batch_init(&fb);
             for (i = 0; i < ex.entries; i++)
-                cetrafs_free_data_extent(sb,
-                                         cetrafs_extent_phys_from_hilo(ex.arr[i].ee_start_hi, ex.arr[i].ee_start_lo),
-                                         cetrafs_extent_len(ex.arr[i].ee_len));
+                cetrafs_free_data_extent_batched(sb,
+                                                 cetrafs_extent_phys_from_hilo(ex.arr[i].ee_start_hi, ex.arr[i].ee_start_lo),
+                                                 cetrafs_extent_len(ex.arr[i].ee_len), &fb);
+            cetrafs_free_batch_flush(sb, &fb);
             cetrafs_inode_extents_put(&ex);
         } else {
             pr_err("ino=%llu: could not read extent tree to free it (%d) -- data blocks leaked\n",
@@ -3351,9 +3363,11 @@ static u32 cetrafs_leaf_array_trim(struct super_block *sb,
                                    u32 *out_freed,
                                    bool do_free)
 {
+    struct cetrafs_free_batch fb;
     u32 i, kept = 0;
     u32 freed = 0;
 
+    cetrafs_free_batch_init(&fb);
     for (i = 0; i < entries; i++) {
         u32 len = cetrafs_extent_len(arr[i].ee_len);
         /* Same rule as the punch's splits: a trimmed PREALLOCATED
@@ -3365,7 +3379,7 @@ static u32 cetrafs_leaf_array_trim(struct super_block *sb,
 
         if (start >= new_block_count) {
             if (do_free)
-                cetrafs_free_data_extent(sb, phys, len);
+                cetrafs_free_data_extent_batched(sb, phys, len, &fb);
             freed += len;
             continue; /* drop the entry entirely */
         }
@@ -3374,7 +3388,7 @@ static u32 cetrafs_leaf_array_trim(struct super_block *sb,
             u32 new_len = (u32) (new_block_count - start);
 
             if (do_free)
-                cetrafs_free_data_extent(sb, phys + new_len, len - new_len);
+                cetrafs_free_data_extent_batched(sb, phys + new_len, len - new_len, &fb);
             freed += len - new_len;
             arr[i].ee_len = cetrafs_extent_pack_len(new_len, uninit_entry);
         }
@@ -3383,6 +3397,8 @@ static u32 cetrafs_leaf_array_trim(struct super_block *sb,
             arr[kept] = arr[i];
         kept++;
     }
+    /* The frees of this trim, queued before its caller's frees_end(). */
+    cetrafs_free_batch_flush(sb, &fb);
 
     *out_freed = freed;
     return kept;
@@ -3422,9 +3438,12 @@ static int cetrafs_leaf_array_punch(struct super_block *sb,
                                     u32 *out_freed,
                                     bool do_free)
 {
+    struct cetrafs_free_batch fb;
     u32 i, w, count = *entries;
     u32 freed = 0;
     u32 splits = 0;
+
+    cetrafs_free_batch_init(&fb);
 
     /*
      * Dry run first: decide whether this punch can complete BEFORE a
@@ -3494,7 +3513,7 @@ static int cetrafs_leaf_array_punch(struct super_block *sb,
         }
 
         if (do_free)
-            cetrafs_free_data_extent(sb, phys + (hs - estart), (u32) (he - hs));
+            cetrafs_free_data_extent_batched(sb, phys + (hs - estart), (u32) (he - hs), &fb);
         freed += (u32) (he - hs);
 
         if (hs == estart && he == eend) {
@@ -3534,6 +3553,7 @@ static int cetrafs_leaf_array_punch(struct super_block *sb,
                  * drifted apart and blocks have already been freed. The
                  * array is intact here (w == i: nothing compacted). */
                 pr_err("punch: split would overflow the leaf after freeing %u block(s) -- dry run disagreed\n", freed);
+                cetrafs_free_batch_flush(sb, &fb);
                 *entries = count;
                 *out_freed = freed;
                 return -ENOSPC;
@@ -3547,6 +3567,8 @@ static int cetrafs_leaf_array_punch(struct super_block *sb,
         }
     }
     count = w;
+    /* The punch's frees, queued before its caller's frees_end(). */
+    cetrafs_free_batch_flush(sb, &fb);
 
     *entries = count;
     *out_freed = freed;
