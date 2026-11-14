@@ -436,15 +436,20 @@ static int cetrafs_dmpath_dev_read(struct block_device *bdev, u64 byte_off, void
  * byte compare then refused every path in the window between that write
  * and the next look, and the failover that wanted a path had none.
  *
+ * Block 0 alone proves the first block only: a multi-segment linear map
+ * can start on the same LUN and end on another. So the LAST block of the
+ * device is compared too (audit L4), the same way. A peer writing that
+ * block between the two reads would look like a different device, so the
+ * compare is retried before it is believed.
  */
 static int cetrafs_dmpath_identical(struct block_device *dm_bdev, struct scsi_device *sdev, const char *pname)
 {
     unsigned int lbs = bdev_logical_block_size(dm_bdev);
     unsigned int nblocks;
-    u64 nr_blocks;
+    u64 nr_blocks, last_off;
     const cetrafs_superblock_t *psb, *dsb;
     void *pbuf = NULL, *dbuf = NULL;
-    int ret = -EXDEV;
+    int ret = -EXDEV, attempt;
 
     if (!lbs || lbs > CETRAFS_BLOCK_SIZE || CETRAFS_BLOCK_SIZE % lbs)
         return -EXDEV;
@@ -489,7 +494,30 @@ static int cetrafs_dmpath_identical(struct block_device *dm_bdev, struct scsi_de
         goto out;
     }
 
-    ret = 0;
+    /* The last block: the same LBA on both sides, read fresh from each. */
+    last_off = (nr_blocks - 1) * CETRAFS_BLOCK_SIZE;
+    for (attempt = 0; attempt < 3; attempt++) {
+        bool same;
+
+        if (cetrafs_dmpath_read(sdev, last_off / lbs, nblocks, pbuf, lbs)) {
+            pr_warn("dm path: %s does not answer a passthrough READ of its last block -- not usable for CAW\n",
+                    pname);
+            ret = -EIO;
+            goto out;
+        }
+        if (cetrafs_dmpath_dev_read(dm_bdev, last_off, dbuf)) {
+            ret = -EIO;
+            goto out;
+        }
+        same = memcmp(pbuf, dbuf, CETRAFS_BLOCK_SIZE) == 0;
+        if (same) {
+            ret = 0;
+            goto out;
+        }
+    }
+    pr_warn("dm path: %s last block differs from the mapped device's -- the mapping is not 1:1 (a multi-segment "
+            "map?), refusing to send CAW to it\n",
+            pname);
 out:
     kfree(pbuf);
     kfree(dbuf);
