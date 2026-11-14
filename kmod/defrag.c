@@ -150,6 +150,12 @@ MODULE_PARM_DESC(defrag_skip_dense_recheck,
  * for the lock. */
 #define CETRAFS_DEFRAG_STEP_BLOCKS 128
 
+/* TEST ONLY: copy one block per round trip, as before audit 2026-11-14
+ * M1 -- the control of tests/kernel/defrag_copy_batched.sh. */
+static bool cetrafs_defrag_copy_serial;
+cetrafs_test_param(defrag_copy_serial, cetrafs_defrag_copy_serial, bool, 0644);
+MODULE_PARM_DESC(defrag_copy_serial, "TEST ONLY: the defrag mover copies one block per round trip");
+
 /* Moves stopped because a peer asked for the file (procfs defrag_yields). */
 static atomic64_t cetrafs_defrag_yields = ATOMIC64_INIT(0);
 u64 cetrafs_defrag_yield_count(void)
@@ -517,6 +523,7 @@ int cetrafs_defrag_inode(struct inode *inode, struct cetrafs_defrag_stats *out_s
      * cetrafs_fallocate() uses.
      */
     cetrafs_inode_t *rawp;
+    struct buffer_head **copy_src, **copy_dst;
 #define raw (*rawp)
     u64 nblocks, dst_base = 0, moved = 0;
     bool have_dst = false;
@@ -540,10 +547,15 @@ int cetrafs_defrag_inode(struct inode *inode, struct cetrafs_defrag_stats *out_s
     if (!el.arr)
         return -ENOMEM;
     rawp = kmalloc(sizeof(*rawp), GFP_NOFS);
-    if (!rawp) {
+    /* One step's buffers, source then destination (M1). */
+    copy_src = kcalloc(2 * CETRAFS_DEFRAG_STEP_BLOCKS, sizeof(*copy_src), GFP_NOFS);
+    if (!rawp || !copy_src) {
+        kfree(rawp);
+        kfree(copy_src);
         kvfree(el.arr);
         return -ENOMEM;
     }
+    copy_dst = copy_src + CETRAFS_DEFRAG_STEP_BLOCKS;
 
     cetrafs_defrag_inode_lock(inode);
     /* The write gate, not just the fence: a damaged inode refuses every
@@ -791,18 +803,23 @@ int cetrafs_defrag_inode(struct inode *inode, struct cetrafs_defrag_stats *out_s
             goto out_free_tail;
         }
 
-        blk_start_plug(&plug);
-        for (b = moved; b < step_end && !ret; b++) {
-            u64 src = 0, o = 0;
-            struct buffer_head *sbh, *dbh;
-            u32 e;
+        /*
+         * Copied a contiguous source run at a time, up to a step's worth:
+         * its reads as one batch, its writes submitted together and
+         * waited for once. Two synchronous round trips per block made a
+         * 512 KiB step ~256 serial ones under the file's exclusive locks
+         * -- every guest write stalled that long once a step (audit
+         * 2026-11-14 M1). defrag_copy_serial restores that, test-only.
+         */
+        for (b = moved; b < step_end && !ret;) {
+            u64 src = 0, o = 0, run = 0;
+            u32 e, i, n;
 
             /* Inside the step too: a step is bounded, but an unmount, a
              * fence or SIGKILL should not wait out even that (M9).
              * Nothing is committed yet, so stopping here is the same
              * clean abort as between steps. */
-            if (((b - moved) & 31) == 0 &&
-                (cetrafs_sb_defrag_draining(sb) || cetrafs_sb_is_fenced(sb) || fatal_signal_pending(current))) {
+            if (cetrafs_sb_defrag_draining(sb) || cetrafs_sb_is_fenced(sb) || fatal_signal_pending(current)) {
                 ret = fatal_signal_pending(current) ? -EINTR : -ECANCELED;
                 break;
             }
@@ -812,37 +829,60 @@ int cetrafs_defrag_inode(struct inode *inode, struct cetrafs_defrag_stats *out_s
 
                 if (b < o + len) {
                     src = cetrafs_extent_phys_from_hilo(el.arr[e].ee_start_hi, el.arr[e].ee_start_lo) + (b - o);
+                    run = o + len - b; /* contiguous on the device from src */
                     break;
                 }
                 o += len;
             }
-
-            if (src == dst_base + b)
-                continue; /* already in place */
-
-            sbh = cetrafs_bread_uncached_retry(sb, src);
-            dbh = sbh ? sb_getblk(sb, dst_base + b) : NULL;
-            if (!sbh || !dbh) {
-                brelse(sbh);
-                ret = -EIO;
+            if (!run) {
+                ret = -EIO; /* the map does not cover the step: the checks above make this damage */
                 break;
             }
-            /* Via the helpers: cetrafs_bh_end_update() dirties before
-             * unlocking, closing the window in which a forced-fresh
-             * reader could take the lock on a clean, uptodate buffer and
-             * re-read the destination's OLD content over the copy we
-             * just made. */
-            cetrafs_bh_begin_update(dbh);
-            memcpy(dbh->b_data, sbh->b_data, CETRAFS_BLOCK_SIZE);
-            cetrafs_bh_end_update(dbh);
-            write_dirty_buffer(dbh, REQ_SYNC);
-            brelse(sbh);
-            wait_on_buffer(dbh);
-            if (!buffer_uptodate(dbh))
-                ret = -EIO;
-            brelse(dbh);
+            n = (u32) min3(run, step_end - b, (u64) CETRAFS_DEFRAG_STEP_BLOCKS);
+            if (READ_ONCE(cetrafs_defrag_copy_serial))
+                n = 1; /* test-only: the old per-block round trips */
+
+            if (src == dst_base + b) { /* already in place: the whole run is */
+                b += n;
+                continue;
+            }
+
+            ret = cetrafs_bread_uncached_batch(sb, src, n, copy_src);
+            if (ret)
+                break;
+            blk_start_plug(&plug);
+            for (i = 0; i < n; i++) {
+                struct buffer_head *dbh = sb_getblk(sb, dst_base + b + i);
+
+                copy_dst[i] = dbh;
+                if (!dbh) {
+                    ret = -EIO;
+                    break;
+                }
+                /* Via the helpers: cetrafs_bh_end_update() dirties before
+                 * unlocking, closing the window in which a forced-fresh
+                 * reader could take the lock on a clean, uptodate buffer
+                 * and re-read the destination's OLD content over the
+                 * copy we just made. */
+                cetrafs_bh_begin_update(dbh);
+                memcpy(dbh->b_data, copy_src[i]->b_data, CETRAFS_BLOCK_SIZE);
+                cetrafs_bh_end_update(dbh);
+                write_dirty_buffer(dbh, REQ_SYNC);
+            }
+            blk_finish_plug(&plug);
+            for (i = 0; i < n; i++) {
+                if (copy_dst[i]) {
+                    wait_on_buffer(copy_dst[i]);
+                    if (!buffer_uptodate(copy_dst[i]))
+                        ret = -EIO;
+                    brelse(copy_dst[i]);
+                    copy_dst[i] = NULL;
+                }
+                brelse(copy_src[i]);
+                copy_src[i] = NULL;
+            }
+            b += n;
         }
-        blk_finish_plug(&plug);
         if (ret) {
             cetrafs_defrag_inode_unlock(inode);
             goto out_free_tail;
@@ -1032,6 +1072,7 @@ out_done:
         *out_stats = stats;
     kvfree(el.arr);
     kfree(rawp);
+    kfree(copy_src);
     return ret;
 #undef raw
 }
