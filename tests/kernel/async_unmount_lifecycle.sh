@@ -82,6 +82,8 @@ log "2: unmount while the scrub holds its verdict"
 DEV="$(ct_dev 560 lc2)"
 MNT="$(ct_mnt lc2)"
 ct_mkfs_small "$DEV" >/dev/null
+# A cycle with no candidate takes no verdict: leak one block to propose.
+"$(ct_helper data_leak_poke)" "$DEV" 0 100 1 >/dev/null
 ct_param_set scrub_interval_secs 2
 ct_param_set scrub_gap_floor_secs 1
 ct_param_set scrub_gap_secs 1
@@ -98,8 +100,10 @@ ct_param_set scrub_verdict_stall_ms 0
     fail "2: a scrub cycle is still running after the unmount returned"
 sleep 2
 OUT="$(ct_fsck "$DEV" 2>&1 || true)"
+# The planted block, if the drained cycle never freed it: a leak, the safe side.
+OUT="$(grep -v '^WARN: 1 data block(s) marked in use but referenced by no inode (leaked)' <<<"$OUT" || true)"
 grep -qE '^(ERR|WARN)' <<<"$OUT" && fail "2: fsck: $(grep -E '^(ERR|WARN)' <<<"$OUT" | head -2)" ||
-    pass "2: fsck clean"
+    pass "2: fsck clean (beyond the planted leak)"
 
 # ---------------------------------------------------------------- 3
 log "3: unmount during heartbeat maintenance, with a deferred lock clear of a deleted file"
