@@ -2102,7 +2102,8 @@ cetrafs_xattr_set_locked final:the-xattr-block-is-full
 cetrafs_node_register final:every-registry-row-taken
 cetrafs_dir_add_entry final:the-directory-is-at-CETRAFS_DIR_MAX_BLOCKS
 cetrafs_tree_resv_fill final:test-injection-convert_append_nospc
-cetrafs_tree_alloc_block final:test-injection-convert_append_nospc'
+cetrafs_tree_alloc_block final:test-injection-convert_append_nospc
+cetrafs_tree_block_anywhere final:test-injection-tree_alloc_fail_at'
 C43_REG_EBUSY='cetrafs_lock_suspend waits:schedule_timeout_killable
 cetrafs_nslock_acquire_tries waits:msleep
 __cetrafs_nslock_acquire_set waits:msleep
