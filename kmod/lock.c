@@ -2288,7 +2288,10 @@ static void cetrafs_lock_presence_withdraw(struct inode *inode)
     if (!ret) {
         struct cetrafs_lock_cas_ctx rctx = {
             .my_node_id = my_node_id,
-            .generation = cetrafs_le64(raw.generation),
+            /* The in-core identity, not the record's: a record the number
+             * was reused for is another file, and this node's bit on the
+             * old one is not there to clear (audit L-F5). */
+            .generation = cetrafs_inode_get_generation(inode),
             .reader_op = CETRAFS_READER_CLEAR,
         };
 
@@ -3198,7 +3201,7 @@ static int cetrafs_lock_publish_and_clear(struct inode *inode, cetrafs_inode_t *
              * than blindly stomped. */
             struct cetrafs_lock_cas_ctx ctx = {
                 .my_node_id = my_node_id,
-                .generation = cetrafs_le64(raw->generation),
+                .generation = cetrafs_inode_get_generation(inode),
                 .claim = false,
             };
 
@@ -3208,6 +3211,8 @@ static int cetrafs_lock_publish_and_clear(struct inode *inode, cetrafs_inode_t *
             } else {
                 ret = cetrafs_lock_cas(inode, &ctx, raw);
             }
+            if (ret == -ESTALE)
+                return 0; /* the number was reused: our lock went with the old file */
             if (ret < 0) {
                 pr_err("lock release: failed to write ino=%llu raw inode: %d\n", (unsigned long long) inode->i_ino,
                        ret);
@@ -4406,7 +4411,7 @@ static int cetrafs_lock_clear_on_disk(struct inode *inode, bool stamp_stat)
     if (!ret)
         ret = cetrafs_read_raw_inode(sb, inode->i_ino, &raw);
     if (!ret) {
-        ctx.generation = cetrafs_le64(raw.generation);
+        ctx.generation = cetrafs_inode_get_generation(inode);
         ret = cetrafs_lock_cas(inode, &ctx, &raw);
         if (!ret && stamp_stat)
             cetrafs_inode_stat_baseline_from_incore(inode);
@@ -4469,7 +4474,7 @@ static int cetrafs_lock_presence_get(struct inode *inode)
     if (!ret) {
         struct cetrafs_lock_cas_ctx rctx = {
             .my_node_id = my_node_id,
-            .generation = cetrafs_le64(raw.generation),
+            .generation = cetrafs_inode_get_generation(inode),
             .reader_op = CETRAFS_READER_SET,
         };
 
@@ -4511,7 +4516,7 @@ static int cetrafs_lock_suspend_mark(struct inode *inode, bool set)
     if (!ret) {
         struct cetrafs_lock_cas_ctx rctx = {
             .my_node_id = my_node_id,
-            .generation = cetrafs_le64(raw.generation),
+            .generation = cetrafs_inode_get_generation(inode),
             .reader_op = set ? CETRAFS_SUSPEND_SET : CETRAFS_SUSPEND_CLEAR,
         };
 
