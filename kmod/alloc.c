@@ -4040,7 +4040,7 @@ void cetrafs_bg_prefetch_bitmap(struct super_block *sb, u32 bg_id)
     kvfree(bhs);
 }
 
-static int cetrafs_reconcile_locked(struct super_block *sb, u32 bg_id, s64 *out_delta);
+static int cetrafs_reconcile_locked(struct super_block *sb, u32 bg_id, s64 *out_delta, bool keep_epoch);
 
 /*
  * The recount of a member of a Zone Group this node has not cached yet
@@ -4052,18 +4052,19 @@ static int cetrafs_reconcile_locked(struct super_block *sb, u32 bg_id, s64 *out_
  * CAW's round trip (audit 2026-11-14 P3). Refused, as a programming
  * error, if the Zone Group IS cached.
  */
-int cetrafs_bg_reconcile_free_count_uncached(struct super_block *sb, u32 bg_id, u32 zg_id, s64 *out_delta)
+int cetrafs_bg_reconcile_free_count_uncached(struct super_block *sb, u32 bg_id, u32 zg_id, s64 *out_delta,
+                                             bool keep_epoch)
 {
     if (out_delta)
         *out_delta = 0;
     if (READ_ONCE(cetrafs_reconcile_serial))
-        return cetrafs_bg_reconcile_free_count(sb, bg_id, out_delta);
+        return cetrafs_bg_reconcile_free_count(sb, bg_id, out_delta, keep_epoch);
     if (WARN_ON_ONCE(cetrafs_sb_zg_owned_cached(sb, zg_id)))
-        return cetrafs_bg_reconcile_free_count(sb, bg_id, out_delta);
-    return cetrafs_reconcile_locked(sb, bg_id, out_delta);
+        return cetrafs_bg_reconcile_free_count(sb, bg_id, out_delta, keep_epoch);
+    return cetrafs_reconcile_locked(sb, bg_id, out_delta, keep_epoch);
 }
 
-int cetrafs_bg_reconcile_free_count(struct super_block *sb, u32 bg_id, s64 *out_delta)
+int cetrafs_bg_reconcile_free_count(struct super_block *sb, u32 bg_id, s64 *out_delta, bool keep_epoch)
 {
     const cetrafs_superblock_t *raw_sb = cetrafs_sb_raw(sb);
     int ret;
@@ -4081,23 +4082,32 @@ int cetrafs_bg_reconcile_free_count(struct super_block *sb, u32 bg_id, s64 *out_
      * stayed off by it for good. The callers run at ownership transfer
      * and after an ENOSPC, never on the per-block path. */
     cetrafs_sb_alloc_lock(sb);
-    ret = cetrafs_reconcile_locked(sb, bg_id, out_delta);
+    ret = cetrafs_reconcile_locked(sb, bg_id, out_delta, keep_epoch);
     cetrafs_sb_alloc_unlock(sb);
     return ret;
 }
 
-static int __cetrafs_reconcile_locked(struct super_block *sb, u32 bg_id, s64 *out_delta);
+static int __cetrafs_reconcile_locked(struct super_block *sb, u32 bg_id, s64 *out_delta, bool keep_epoch);
+
+/* Recounts that kept a matching count's epoch without a swap (procfs
+ * info reconcile_epoch_kept). */
+static atomic64_t cetrafs_reconcile_epoch_kept = ATOMIC64_INIT(0);
+
+u64 cetrafs_reconcile_epoch_kept_count(void)
+{
+    return (u64) atomic64_read(&cetrafs_reconcile_epoch_kept);
+}
 
 /* Under the flush right: the recount's write is a flight like a flush's
  * (cetrafs_bg_chunk.bg_flight_gen) -- see the swap below -- and two
  * writers of one descriptor's count never overlap. */
-static int cetrafs_reconcile_locked(struct super_block *sb, u32 bg_id, s64 *out_delta)
+static int cetrafs_reconcile_locked(struct super_block *sb, u32 bg_id, s64 *out_delta, bool keep_epoch)
 {
     int ret = cetrafs_sb_bg_flush_lock(sb, bg_id);
 
     if (ret)
         return ret;
-    ret = __cetrafs_reconcile_locked(sb, bg_id, out_delta);
+    ret = __cetrafs_reconcile_locked(sb, bg_id, out_delta, keep_epoch);
     cetrafs_sb_bg_flush_unlock(sb, bg_id);
     return ret;
 }
@@ -4260,7 +4270,7 @@ unlock_alloc:
     return ret;
 }
 
-static int __cetrafs_reconcile_locked(struct super_block *sb, u32 bg_id, s64 *out_delta)
+static int __cetrafs_reconcile_locked(struct super_block *sb, u32 bg_id, s64 *out_delta, bool keep_epoch)
 {
     struct cetrafs_bg_geom bg;
     u64 bmap_lba, bmap_blocks;
@@ -4293,6 +4303,21 @@ static int __cetrafs_reconcile_locked(struct super_block *sb, u32 bg_id, s64 *ou
          * left of what the crash cost. */
         pr_warn("BG %u: cached free_data_blocks=%llu but its bitmap says %ld -- correcting (drift %lld)\n", bg_id,
                 bg.free_data_blocks, truth, delta);
+
+    /* The previous owner flushed every delta before it gave this group
+     * up (a clean departure, or a release, which refuses while one is
+     * outstanding -- the caller decides): nothing can arrive late, so a
+     * count that matches its bitmap keeps its epoch, and costs no swap.
+     * One CAW per Block Group was ~2.5 min per Zone Group on a 64 TiB
+     * re-attach (P3). Nothing of ours is accrued for a group not yet
+     * cached; if anything is, the swap below runs as before. */
+    if (keep_epoch && !delta && !cetrafs_sb_bg_delta_pending(sb, bg_id)) {
+        atomic64_inc(&cetrafs_reconcile_epoch_kept);
+        cetrafs_sb_set_bg_epoch(sb, bg_id, bg.reconcile_seq);
+        if (out_delta)
+            *out_delta = 0;
+        return 0;
+    }
 
     /*
      * Written as a compare-and-swap that also ADVANCES the ownership

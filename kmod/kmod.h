@@ -523,6 +523,7 @@ void cetrafs_sb_bg_flush_unlock(struct super_block *sb, u32 bg_id);
 s64 cetrafs_sb_bg_flight_begin(struct super_block *sb, u32 bg_id, s64 desc);
 void cetrafs_sb_bg_flight_end(struct super_block *sb, u32 bg_id, s64 requeue);
 s64 cetrafs_sb_bg_flight_begin_value(struct super_block *sb, u32 bg_id, s64 value);
+bool cetrafs_sb_bg_delta_pending(struct super_block *sb, u32 bg_id);
 void cetrafs_sb_bg_flight_settle_end(struct super_block *sb, u32 bg_id, s64 requeue);
 u64 cetrafs_sb_bg_epoch(struct super_block *sb, u32 bg_id);
 s64 cetrafs_sb_set_bg_epoch(struct super_block *sb, u32 bg_id, u64 seq);
@@ -1116,8 +1117,10 @@ u64 cetrafs_layout_refresh_refused_count(void);
  * not a hope that retrying helps. */
 #define CETRAFS_ALLOC_PICK_RETRIES 8u
 
-int cetrafs_bg_reconcile_free_count(struct super_block *sb, u32 bg_id, s64 *out_delta);
-int cetrafs_bg_reconcile_free_count_uncached(struct super_block *sb, u32 bg_id, u32 zg_id, s64 *out_delta);
+int cetrafs_bg_reconcile_free_count(struct super_block *sb, u32 bg_id, s64 *out_delta, bool keep_epoch);
+int cetrafs_bg_reconcile_free_count_uncached(struct super_block *sb, u32 bg_id, u32 zg_id, s64 *out_delta,
+                                             bool keep_epoch);
+u64 cetrafs_reconcile_epoch_kept_count(void);
 void cetrafs_bg_prefetch_bitmap(struct super_block *sb, u32 bg_id);
 /* Apply one accrued BG free-count delta as an epoch-guarded CAS. 0 means
  * consumed (applied, or loudly dropped as stale); negative only for real

@@ -44,8 +44,11 @@ dd if=/dev/zero of="$MNT/f" bs=4096 count=64 conv=fsync status=none
 sync
 BASE_FREE="$(bg0_free)"
 BASE_SEQ="$(bg0_seq)"
-[ "$BASE_SEQ" -ge 1 ] && pass "the claim-time reconcile stamped an epoch (reconcile_seq=$BASE_SEQ)" ||
-    fail "reconcile_seq=$BASE_SEQ after mount+write -- reconcile is not advancing the epoch"
+# A fresh volume's Zone Group was claimed unowned, so its matching counts
+# kept their epoch (P3: only a steal must move it); the control below
+# shows this node's epoch agrees with the device's.
+[ -n "$BASE_SEQ" ] && pass "the claim-time reconcile seeded this node's epoch from the device (reconcile_seq=$BASE_SEQ)" ||
+    fail "no reconcile_seq readable after mount+write"
 
 log "control first: with no steal, a delta flushes normally through the CAS"
 # Runs BEFORE the simulated steal, deliberately: the steal below leaves this

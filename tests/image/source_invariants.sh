@@ -999,7 +999,7 @@ c52_scan() { # <dir>: prints file:line of each violation
             /^[a-z].*\(/ && !/;$/ { fn = $0; sub(/\(.*/, "", fn); sub(/.* \**/, "", fn) }
             /class 52:/ { last52 = NR }
             /atomic64_xchg\(&[a-z_>.-]*_free_delta/ && NR - last52 > 8 { print F ":" NR ": take with no class 52 argument" }
-            /atomic64_read\(&[a-z_>.-]*_free_delta/ && fn !~ /^(cetrafs_sb_bg_free_settle|cetrafs_sb_zg_free_settle|cetrafs_sb_pending_zg_deltas|cetrafs_sb_zg_delta_pending|cetrafs_flush_dirty_free_counts)$/ {
+            /atomic64_read\(&[a-z_>.-]*_free_delta/ && fn !~ /^(cetrafs_sb_bg_free_settle|cetrafs_sb_zg_free_settle|cetrafs_sb_pending_zg_deltas|cetrafs_sb_zg_delta_pending|cetrafs_sb_bg_delta_pending|cetrafs_flush_dirty_free_counts)$/ {
                 print F ":" NR ": " fn " reads the delta outside the settles"
             }' "$f"
     done
@@ -2624,7 +2624,7 @@ any_fn_body "$K/alloc.c" cetrafs_bg_id_for_lba | grep -q 'cetrafs_sb_layout_refr
 # grown member the previous owner claimed is "corrected" out of the
 # aggregate (tests/kernel/zg_claim_behind_grow.sh).
 # The definition, not the forward declaration above it: the last body.
-C48CL="$(awk '$0 ~ "^[a-z_].*[ *]__cetrafs_zg_try_claim_one[(]" { buf = ""; on = 1 } on { buf = buf $0 "\n" } on && /^}/ { last = buf; on = 0 } END { printf "%s", last }' "$K/zonegroup.c" | grep -nE 'cetrafs_sb_layout_refresh|cetrafs_zg_reconcile_free_counts\(sb, zg_id\)' | tail -2 | cut -d: -f2- | grep -oE 'cetrafs_[a-z_]+' | tr '\n' ' ' || true)"
+C48CL="$(awk '$0 ~ "^[a-z_].*[ *]__cetrafs_zg_try_claim_one[(]" { buf = ""; on = 1 } on { buf = buf $0 "\n" } on && /^}/ { last = buf; on = 0 } END { printf "%s", last }' "$K/zonegroup.c" | grep -nE 'cetrafs_sb_layout_refresh|cetrafs_zg_reconcile_free_counts\(sb, zg_id[,)]' | tail -2 | cut -d: -f2- | grep -oE 'cetrafs_[a-z_]+' | tr '\n' ' ' || true)"
 [ "$C48CL" = "cetrafs_sb_layout_refresh cetrafs_zg_reconcile_free_counts " ] &&
     pass "class 48: a Zone Group claim catches the layout up before it recounts" ||
     fail "class 48: __cetrafs_zg_try_claim_one() no longer refreshes the layout before the claim's recount ('$C48CL')"

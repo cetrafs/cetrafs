@@ -6605,6 +6605,17 @@ bool cetrafs_sb_bg_free_settle(struct super_block *sb, u32 bg_id, u32 gen, s64 d
     return ok;
 }
 
+/* Has BG #bg_id accrued a delta not yet flushed? Presence only: a
+ * reader that wants the count goes through cetrafs_sb_bg_free_settle(). */
+bool cetrafs_sb_bg_delta_pending(struct super_block *sb, u32 bg_id)
+{
+    struct cetrafs_bg_chunk *c;
+    u32 i;
+
+    c = cetrafs_bgc(sb->s_fs_info, bg_id, &i);
+    return c && atomic64_read(&c->bg_free_delta[i]) != 0;
+}
+
 /*
  * Begin flushing BG #bg_id's accrued delta: wait out another flush of
  * it, then take the delta and publish the count it will make, 'desc'

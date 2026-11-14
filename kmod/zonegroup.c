@@ -291,6 +291,7 @@ struct cetrafs_zg_cas_ctx {
     u32 steal_from;  /* meaningful only when allow_steal */
     u64 steal_seq;   /* ...and the hb_seq the stale verdict was made against */
     bool reassert;   /* a mount re-asserting a ZG it still owns: bump hb_seq */
+    bool took_unowned; /* claim: the swap found the Zone Group unowned (released by its owner) */
 };
 
 /*
@@ -344,6 +345,7 @@ static int cetrafs_zg_cas_mutate(void *image, unsigned int len, void *priv)
         if (!unowned && !stealable)
             return -EBUSY; /* a live peer owns it (or took it since we looked) */
 
+        ctx->took_unowned = unowned;
         zg->owner_node_id = cpu_to_le16((u16) ctx->my_node_id);
     } else {
         if (owner != (u16) ctx->my_node_id)
@@ -941,7 +943,18 @@ static unsigned int cetrafs_zg_reconcile_stall_ms;
 cetrafs_test_param(zg_reconcile_stall_ms, cetrafs_zg_reconcile_stall_ms, uint, 0644);
 MODULE_PARM_DESC(zg_reconcile_stall_ms, "test-only: pause one Zone Group reconcile before its recount");
 
-static int cetrafs_zg_reconcile_free_counts(struct super_block *sb, u32 zg_id)
+/* TEST ONLY: every ownership entry moves every member count's epoch with
+ * its own swap, as before P3 -- the control of
+ * tests/kernel/reattach_epoch_writes.sh. */
+static bool cetrafs_reconcile_epoch_always;
+cetrafs_test_param(reconcile_epoch_always, cetrafs_reconcile_epoch_always, bool, 0644);
+MODULE_PARM_DESC(reconcile_epoch_always, "TEST ONLY: a clean re-attach or an unowned claim still rewrites every member count");
+
+/* keep_epoch: the previous owner flushed every delta before giving the
+ * Zone Group up (a clean departure, or a release), so no late delta can
+ * arrive: a member whose count matches its bitmap keeps its epoch and is
+ * not rewritten. Otherwise every member's epoch moves (P3). */
+static int cetrafs_zg_reconcile_free_counts(struct super_block *sb, u32 zg_id, bool keep_epoch)
 {
     const cetrafs_superblock_t *raw_sb = cetrafs_sb_raw(sb);
     u64 truth = 0;
@@ -986,8 +999,9 @@ static int cetrafs_zg_reconcile_free_counts(struct super_block *sb, u32 zg_id)
             return ret;
 
         cetrafs_bg_prefetch_bitmap(sb, b);
-        ret = cetrafs_sb_zg_owned_cached(sb, zg_id) ? cetrafs_bg_reconcile_free_count(sb, b, &delta)
-                                                    : cetrafs_bg_reconcile_free_count_uncached(sb, b, zg_id, &delta);
+        ret = cetrafs_sb_zg_owned_cached(sb, zg_id)
+                  ? cetrafs_bg_reconcile_free_count(sb, b, &delta, keep_epoch)
+                  : cetrafs_bg_reconcile_free_count_uncached(sb, b, zg_id, &delta, keep_epoch);
         if (ret) {
             /* Never fails the claim: a ZG with an unreadable BG is
              * still better owned than left to nobody, and the ordinary
@@ -1083,6 +1097,7 @@ static int __cetrafs_zg_try_claim_one(struct super_block *sb,
                                       bool *out_claimed)
 {
     cetrafs_zone_group_t *zg; /* heap, not stack -- see the comment above */
+    bool took_unowned = false, epoch_always;
     u16 owner;
     int ret;
 
@@ -1157,7 +1172,11 @@ static int __cetrafs_zg_try_claim_one(struct super_block *sb,
         /* PERF(5): this branch runs every heartbeat tick -- neither call
          * may become unconditional. docs/PERFORMANCE.md */
         if (at_mount) {
-            cetrafs_zg_reconcile_free_counts(sb, zg_id);
+            /* After a clean departure the previous incarnation flushed
+             * every delta before it marked its row departed, so nothing
+             * can arrive late: only a drifted count is rewritten (P3). */
+            cetrafs_zg_reconcile_free_counts(sb, zg_id, !cetrafs_sb_unclean_reattach(sb) &&
+                                                            !READ_ONCE(cetrafs_reconcile_epoch_always));
             cetrafs_sb_cache_zg_ownership(sb, zg_id);
         } else if (!was_cached)
             cetrafs_bg_seed_count_epochs(sb, zg_id);
@@ -1227,9 +1246,11 @@ static int __cetrafs_zg_try_claim_one(struct super_block *sb,
         }
         if (ret)
             goto out_unlock;
+        took_unowned = ctx.took_unowned;
     }
 
     *out_claimed = true;
+    epoch_always = READ_ONCE(cetrafs_reconcile_epoch_always);
 
     /* Ownership just changed hands (freshly claimed, or reclaimed from a
      * stale peer): drop any cached view this node had of this ZG's BGs
@@ -1300,7 +1321,11 @@ static int __cetrafs_zg_try_claim_one(struct super_block *sb,
                    "skipped\n",
                    zg_id, lret);
         else
-            cetrafs_zg_reconcile_free_counts(sb, zg_id);
+            /* Released by its owner, the Zone Group carries no delta that
+             * can arrive late (cetrafs_zg_try_release_one() refuses while
+             * one is outstanding); stolen, it can, and every count's epoch
+             * moves (P3). */
+            cetrafs_zg_reconcile_free_counts(sb, zg_id, took_unowned && !epoch_always);
 
         /* Only now allocatable. Cached first, an allocation could land
          * while the recount ran: its aggregate delta accrued before the
@@ -1811,6 +1836,14 @@ static int cetrafs_zg_try_release_one(struct super_block *sb, u32 zg_id, u32 my_
             goto out_undrain;
         }
     cetrafs_flush_dirty_free_counts(sb);
+    /* A release promises the next owner that no delta of ours can land
+     * after it (its claim keeps the members' epochs, P3): a member whose
+     * flush did not take is kept. */
+    for (b = 0; b < nbg; b++)
+        if (cetrafs_sb_bg_owner(sb, b) == zg_id && cetrafs_sb_bg_delta_pending(sb, b)) {
+            ret = 0;
+            goto out_undrain;
+        }
 
     ret = cetrafs_zg_is_fully_empty(sb, zg_id, &empty);
     if (ret || !empty) {
@@ -2020,6 +2053,12 @@ static int cetrafs_zg_release_surplus_locked(struct super_block *sb, u32 my_node
  * unowned Zone Group reconciles its counts from the bitmaps and drains
  * its queue. Each release is the ordinary owner-guarded CAS, so a Zone
  * Group a peer reclaimed meanwhile is left alone.
+ *
+ * The claimer keeps each matching count's epoch (P3): no delta can land
+ * late. This incarnation accrued none, and the previous one was this
+ * host -- unmounted or rebooted, so nothing of it is still issuing
+ * writes. A late delta needs a previous owner that may still be ALIVE,
+ * which is a steal from a peer, and a steal moves every epoch.
  */
 int cetrafs_zg_release_all_rdonly(struct super_block *sb, u32 my_node_id)
 {
