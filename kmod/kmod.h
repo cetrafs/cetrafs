@@ -490,6 +490,7 @@ struct cetrafs_inline_discard *cetrafs_sb_inline_discard(struct super_block *sb)
  * cetrafs_bg_chunk.bmap_alloc_dirty. */
 void cetrafs_sb_note_bmap_alloc(struct super_block *sb, u32 bg_id);
 bool cetrafs_sb_take_bmap_alloc_dirty(struct super_block *sb, u32 bg_id);
+u32 cetrafs_sb_next_bmap_alloc_dirty(struct super_block *sb, u32 from);
 void cetrafs_sb_bmap_flush_begin(struct super_block *sb);
 void cetrafs_sb_bmap_flush_end(struct super_block *sb);
 bool cetrafs_sb_bmap_flush_inflight(struct super_block *sb);
@@ -1086,6 +1087,7 @@ u64 cetrafs_dio_convert_count(void);
 int cetrafs_bg_owner_zg_for_lba(struct super_block *sb, u64 lba, u32 *out_zg_id);
 int cetrafs_bg_invalidate_cache(struct super_block *sb, u32 bg_id);
 int cetrafs_bg_recount_after_enospc(struct super_block *sb, u32 bg_id, s64 *out_delta);
+u64 cetrafs_bmap_flush_visit_count(void);
 extern bool cetrafs_bg_invalidate_fail_ignored; /* test-only */
 extern bool cetrafs_alloc_shadow_enabled;
 void cetrafs_shadow_set(struct super_block *sb, u64 lba, u64 count, const char *who);

@@ -2956,6 +2956,29 @@ static bool cetrafs_bmap_flush_no_cache_flush;
 cetrafs_test_param(bmap_flush_no_cache_flush, cetrafs_bmap_flush_no_cache_flush, bool, 0644);
 MODULE_PARM_DESC(bmap_flush_no_cache_flush, "TEST ONLY: no device cache flush after the allocation bitmaps");
 
+/* TEST ONLY: the flush visits every Block Group, as before audit
+ * 2026-11-14 P7 -- the control of tests/kernel/bmap_flush_visits.sh. */
+static bool cetrafs_bmap_flush_scan_all;
+cetrafs_test_param(bmap_flush_scan_all, cetrafs_bmap_flush_scan_all, bool, 0644);
+MODULE_PARM_DESC(bmap_flush_scan_all, "TEST ONLY: the bitmap flush tests every Block Group's mark");
+static atomic64_t cetrafs_bmap_flush_visits = ATOMIC64_INIT(0);
+u64 cetrafs_bmap_flush_visit_count(void)
+{
+    return (u64) atomic64_read(&cetrafs_bmap_flush_visits);
+}
+
+static u32 cetrafs_bmap_flush_first(struct super_block *sb, u32 from, u32 bg_count)
+{
+    u32 b;
+
+    if (from >= bg_count)
+        return bg_count;
+    if (READ_ONCE(cetrafs_bmap_flush_scan_all))
+        return from;
+    b = cetrafs_sb_next_bmap_alloc_dirty(sb, from);
+    return b < bg_count ? b : bg_count;
+}
+
 static int __cetrafs_alloc_flush_bitmaps(struct super_block *sb)
 {
     const cetrafs_superblock_t *raw_sb = cetrafs_sb_raw(sb);
@@ -2968,13 +2991,17 @@ static int __cetrafs_alloc_flush_bitmaps(struct super_block *sb)
         return 0;
     bg_count = le32_to_cpu(raw_sb->block_group_count);
 
-    for (bg_id = 0; bg_id < bg_count; bg_id++) {
+    /* Only the marked groups: a test of every group's mark made each
+     * flush O(Block Groups), several per fdatasync (audit 2026-11-14 P7). */
+    for (bg_id = cetrafs_bmap_flush_first(sb, 0, bg_count); bg_id < bg_count;
+         bg_id = cetrafs_bmap_flush_first(sb, bg_id + 1, bg_count)) {
         struct cetrafs_bg_geom bg;
         u64 b, nblocks;
         int r;
 
         int bg_ret = 0;
 
+        atomic64_inc(&cetrafs_bmap_flush_visits);
         if (!cetrafs_sb_take_bmap_alloc_dirty(sb, bg_id))
             continue;
         stall = READ_ONCE(cetrafs_alloc_flush_stall_ms) ? xchg(&cetrafs_alloc_flush_stall_ms, 0) : 0;

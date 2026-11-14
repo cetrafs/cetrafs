@@ -6211,6 +6211,16 @@ bool cetrafs_sb_bmap_alloc_any_dirty(struct super_block *sb)
     return cetrafs_bgc_next_bit(sbi, offsetof(struct cetrafs_bg_chunk, bmap_alloc_dirty), 0) != U32_MAX;
 }
 
+/* The first BG at or after 'from' with allocation bits not yet on the
+ * device, U32_MAX when none: the flush visits only those (audit
+ * 2026-11-14 P7). */
+u32 cetrafs_sb_next_bmap_alloc_dirty(struct super_block *sb, u32 from)
+{
+    struct cetrafs_sb_info *sbi = sb->s_fs_info;
+
+    return cetrafs_bgc_next_bit(sbi, offsetof(struct cetrafs_bg_chunk, bmap_alloc_dirty), from);
+}
+
 /* Enter and leave the one allocation-bitmap flush. The in-flight count
  * is raised BEFORE the lock and before any mark is taken, so a reader
  * that sees no marks also sees the flush that took them. */
