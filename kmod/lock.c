@@ -1759,6 +1759,13 @@ enum cetrafs_reader_op {
     CETRAFS_SUSPEND_CLEAR,
 };
 
+/* TEST ONLY: the presence swap reads past a judged-stale holder by row
+ * alone, as before audit L-F3 -- the control of
+ * tests/kernel/read_open_judged_incarnation.sh. */
+static bool cetrafs_lock_owner_ok_row_only;
+cetrafs_test_param(lock_owner_ok_row_only, cetrafs_lock_owner_ok_row_only, bool, 0644);
+MODULE_PARM_DESC(lock_owner_ok_row_only, "TEST ONLY: a presence swap reads past a judged-stale holder by row only");
+
 struct cetrafs_lock_cas_ctx {
     u32 my_node_id;
     u64 generation; /* inode must still be this incarnation (v0x0008) */
@@ -1821,7 +1828,7 @@ struct cetrafs_lock_cas_ctx {
      *    for a nofilelock write-open (a suspended writer is a handoff to
      *    it, not a conflict). */
     bool refuse_foreign_excl;
-    u32 lock_owner_ok;
+    u32 lock_owner_ok;  /* with steal_incarnation: the judged holder's claim */
     /* out (READER_SET): the refusal was a peer's RELOCATING or YIELD
      * pin -- a background move the open may ask back, not a writer. */
     bool refused_by_mover;
@@ -1946,8 +1953,15 @@ static int cetrafs_lock_cas_mutate(void *image, unsigned int len, void *priv)
         if (ctx->reader_op == CETRAFS_READER_SET && (ctx->refuse_foreign_lock || ctx->refuse_foreign_excl)) {
             u32 owner = cetrafs_le32(rec.lock_owner_node);
 
-            if (cetrafs_lock_mode_held(cetrafs_le32(rec.lock_mode)) && owner != ctx->my_node_id &&
-                owner != ctx->lock_owner_ok) {
+            /* The holder the caller judged stale is read past only while
+             * it is still that claim: the same row AND the incarnation
+             * judged. A row that re-attached and took the lock again since
+             * the judgement is a live holder (audit L-F3). */
+            bool judged = owner == ctx->lock_owner_ok &&
+                          (READ_ONCE(cetrafs_lock_owner_ok_row_only) ||
+                           cetrafs_le32(rec.lock_owner_incarnation) == ctx->steal_incarnation);
+
+            if (cetrafs_lock_mode_held(cetrafs_le32(rec.lock_mode)) && owner != ctx->my_node_id && !judged) {
                 u32 m = cetrafs_le32(rec.lock_mode);
 
                 ctx->refused_by_mover = m == CETRAFS_LOCK_RELOCATING || m == CETRAFS_LOCK_YIELD;
@@ -2809,6 +2823,7 @@ reread:
             .refuse_foreign_lock = !want_write && !cetrafs_lock_ignore_readers,
             .refuse_foreign_excl = want_write,
             .lock_owner_ok = stale_owner,
+            .steal_incarnation = stale_incarnation,
         };
         int rret;
 
