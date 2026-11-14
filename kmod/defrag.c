@@ -56,6 +56,7 @@
 #include <linux/math64.h>
 #include <linux/minmax.h>
 #include <linux/slab.h>
+#include <linux/sort.h>
 #include <linux/string.h>
 #include <linux/workqueue.h>
 
@@ -259,6 +260,21 @@ static int cetrafs_defrag_read_raw(struct super_block *sb, struct inode *inode, 
     return cetrafs_read_raw_inode_overlaid(sb, inode, raw); /* torn-read-safe vs a concurrent publish */
 }
 
+/* TEST ONLY: leave the extent list in array order, as before P11 -- the
+ * control of tests/kernel/defrag_random_holes.sh. */
+static bool cetrafs_defrag_extents_unsorted;
+cetrafs_test_param(defrag_extents_unsorted, cetrafs_defrag_extents_unsorted, bool, 0644);
+MODULE_PARM_DESC(defrag_extents_unsorted, "TEST ONLY: the defragmenter reads the extent array unsorted");
+
+/* Logical order of two extent records, for the sort in read_extents(). */
+static int cetrafs_defrag_ext_cmp(const void *a, const void *b)
+{
+    u32 ea = cetrafs_le32(((const cetrafs_extent_t *) a)->ee_block);
+    u32 eb = cetrafs_le32(((const cetrafs_extent_t *) b)->ee_block);
+
+    return (ea > eb) - (ea < eb);
+}
+
 static int cetrafs_defrag_read_extents(struct inode *inode, const cetrafs_inode_t *raw, struct cetrafs_ext_list *el)
 {
     struct super_block *sb = inode->i_sb;
@@ -318,6 +334,16 @@ static int cetrafs_defrag_read_extents(struct inode *inode, const cetrafs_inode_
             memcpy(el->arr, flat, (size_t) n * sizeof(el->arr[0]));
         kvfree(flat);
     }
+
+    /* The extent array is UNSORTED (cetrafs_leaf_array_insert() appends,
+     * and merges only with the last entry), so a file filled in random
+     * order lists its extents in arrival order. The mover reads the array
+     * as the file's logical map, and the density test below asks whether
+     * it is contiguous -- so put it in logical order first. Without this a
+     * 64 MiB random fill (16,384 extents) was declined as "interior holes"
+     * forever, and the janitor could never heal it (audit P11). */
+    if (el->count > 1 && !READ_ONCE(cetrafs_defrag_extents_unsorted))
+        sort(el->arr, el->count, sizeof(el->arr[0]), cetrafs_defrag_ext_cmp, NULL);
 
     el->dense = true;
     el->has_uninit = false;
