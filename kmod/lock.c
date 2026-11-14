@@ -1450,7 +1450,7 @@ MODULE_PARM_DESC(alloc_keeps_counts, "TEST ONLY: a new inode keeps a recycled ob
 
 struct inode *cetrafs_alloc_vfs_inode(struct super_block *sb)
 {
-    struct cetrafs_inode_info *ci = alloc_inode_sb(sb, cetrafs_inode_cache, GFP_KERNEL);
+    struct cetrafs_inode_info *ci = alloc_inode_sb(sb, cetrafs_inode_cache, GFP_NOFS); /* namespace locks held (N6) */
 
     if (!ci)
         return NULL;

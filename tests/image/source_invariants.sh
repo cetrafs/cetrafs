@@ -2566,4 +2566,43 @@ printf 'static long cetrafs_report_map(struct inode *inode, cetrafs_inode_t *raw
     pass "class 53: control -- a planted reporter on a plain tree reader is found and unlisted" ||
     fail "class 53: control -- the planted reporter was not found ($(c53_callers "$C53_SAMPLE"))"
 
+# N6 (audit 2026-11-14): an allocation that may enter reclaim with a
+# namespace lock or alloc_mutex held can recurse into an evict that
+# wants the same lock. The namespace layer allocates NOFS throughout;
+# ->alloc_inode and the CAS core did not. The files below allocate
+# nothing GFP_KERNEL, and in lock.c and caw.c the functions every
+# namespace operation and every claim go through do not either.
+# Negative control: a planted GFP_KERNEL in a listed function.
+log "checking the namespace and CAS paths allocate NOFS (N6)"
+# gfp_kernel_in <file> <func>...: file:line of each GFP_KERNEL inside
+# the named functions' bodies (a definition opens at column 0).
+gfp_kernel_in() {
+    local f="$1"; shift
+    awk -v names="$*" '
+        BEGIN { n = split(names, a, " "); for (i = 1; i <= n; i++) want[a[i]] = 1 }
+        /^[a-z].*\(/ && !/;[[:space:]]*$/ {
+            nm = $0; sub(/\(.*/, "", nm); sub(/.*[ *]/, "", nm); cur = (nm in want) ? nm : ""; depth = 0; seen = 0
+        }
+        cur != "" {
+            if (/GFP_KERNEL/) print FILENAME ":" FNR
+            o = gsub(/\{/, "{"); c = gsub(/\}/, "}"); depth += o - c; if (o) seen = 1
+            if (seen && depth <= 0) cur = ""
+        }
+    ' "$f"
+}
+N6_SAMPLE="$(ct_tmp n6-sample.c)"
+printf '%s\n' 'static int keep(void)' '{' '    return kmalloc(8, GFP_KERNEL) != NULL;' '}' \
+    'int cetrafs_alloc_vfs_inode(struct super_block *sb)' '{' '    void *p = kmalloc(8, GFP_NOFS);' \
+    '    void *q = kmalloc(8, GFP_KERNEL);' '    return !p || !q;' '}' >"$N6_SAMPLE"
+[ "$(gfp_kernel_in "$N6_SAMPLE" cetrafs_alloc_vfs_inode | tr '\n' ' ')" = "$N6_SAMPLE:8 " ] &&
+    pass "N6: control -- a planted GFP_KERNEL in a listed function is found, one outside it is not" ||
+    fail "N6: control -- the scan does not discriminate (got '$(gfp_kernel_in "$N6_SAMPLE" cetrafs_alloc_vfs_inode | tr '\n' ' ')')"
+N6_HITS="$(grep -n GFP_KERNEL "$K/dir.c" "$K/nslock.c" "$K/inode.c" "$K/xattr.c" | sed "s|$K/||" | cut -d: -f1,2 || true)"
+N6_HITS="$N6_HITS $(gfp_kernel_in "$K/lock.c" cetrafs_alloc_vfs_inode | sed "s|$K/||")"
+N6_HITS="$N6_HITS $(gfp_kernel_in "$K/caw.c" cetrafs_caw_scsi cetrafs_cas_region_seeded_impl | sed "s|$K/||")"
+N6_N="$(grep -c GFP_NOFS "$K/caw.c" || true)"
+[ "${N6_N:-0}" -ge 5 ] || fail "N6: setup: caw.c has $N6_N NOFS allocations -- the scan is not seeing the tree"
+[ -z "$(echo $N6_HITS)" ] && pass "N6: the namespace layer, ->alloc_inode and the CAS core allocate NOFS" ||
+    fail "N6: GFP_KERNEL on a path that holds namespace locks or alloc_mutex, at: $(echo $N6_HITS)"
+
 ct_exit

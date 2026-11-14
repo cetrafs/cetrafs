@@ -413,10 +413,12 @@ static int cetrafs_caw_scsi(struct scsi_device *sdev,
     int ret;
     int attempt;
 
-    buf = kmalloc((size_t) half * 2, GFP_KERNEL);
+    /* NOFS: every claim and publish comes through here, namespace
+     * locks and alloc_mutex held (audit 2026-11-14 N6). */
+    buf = kmalloc((size_t) half * 2, GFP_NOFS);
     if (!buf)
         return -ENOMEM;
-    sense = kzalloc(SCSI_SENSE_BUFFERSIZE, GFP_KERNEL);
+    sense = kzalloc(SCSI_SENSE_BUFFERSIZE, GFP_NOFS);
     if (!sense) {
         kfree(buf);
         return -ENOMEM;
@@ -1194,11 +1196,14 @@ static int cetrafs_cas_region_seeded_impl(struct super_block *sb,
      * gets here checks it. */
     WARN_ON_ONCE(cetrafs_sb_in_reclaim_lock(sb) && !(current->flags & PF_MEMALLOC_NOFS));
 
-    old = kmalloc(region, GFP_KERNEL);
-    new = kmalloc(region, GFP_KERNEL);
+    /* NOFS, not only in a reclaim-locked scope: callers hold namespace
+     * locks too, and reclaim can reach an evict that wants one (audit
+     * 2026-11-14 N6). */
+    old = kmalloc(region, GFP_NOFS);
+    new = kmalloc(region, GFP_NOFS);
     /* Up front: allocated after a timeout, a failure returned -ENOMEM
      * for a swap that may still land (audit 2026-11-06 L12). */
-    unknown = kmalloc(2 * region, GFP_KERNEL);
+    unknown = kmalloc(2 * region, GFP_NOFS);
     if (!old || !new || !unknown) {
         kfree(old);
         kfree(new);
