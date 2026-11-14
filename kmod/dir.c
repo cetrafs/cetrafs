@@ -1168,10 +1168,20 @@ int cetrafs_dir_add_entry(struct inode *dir, const struct qstr *name, u64 ino, u
 
         cetrafs_dir_extents_put(&dx);
         /* The cap every reader enforces (cetrafs_dir_extents_addr_ok()). */
-        if (next_logical >= CETRAFS_DIR_MAX_BLOCKS)
+        /* Either limit names the directory in the log
+         * (docs/internal/LIMITATIONS.md): an ENOSPC on a create in a
+         * volume with free space is otherwise a mystery. */
+        if (next_logical >= CETRAFS_DIR_MAX_BLOCKS) {
+            pr_warn_ratelimited("dir ino=%llu is full: %u blocks, the most a directory may hold\n",
+                                (unsigned long long) dir->i_ino, CETRAFS_DIR_MAX_BLOCKS);
             return -ENOSPC;
+        }
 
         ret = cetrafs_inode_map_block(dir, next_logical, /*create=*/true, &new_lba);
+        if (ret == -ENOSPC)
+            pr_warn_ratelimited("dir ino=%llu cannot grow past %u blocks: its extent tree is full or the volume "
+                                "is out of space\n",
+                                (unsigned long long) dir->i_ino, next_logical);
         if (ret)
             return ret;
         new_block = true;
