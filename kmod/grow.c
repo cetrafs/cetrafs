@@ -125,7 +125,7 @@ int cetrafs_grow_check_bg_header(struct super_block *sb, u32 bg_id, u64 start, u
     const cetrafs_bg_header_t *h;
     struct buffer_head *bh;
     u32 bmap, data, crc = ~0U;
-    u64 cnt;
+    u64 cnt, i;
     int rc = 0;
 
     BUILD_BUG_ON(sizeof(zero) != clen);
@@ -150,6 +150,30 @@ int cetrafs_grow_check_bg_header(struct super_block *sb, u32 bg_id, u64 start, u
         rc = -EUCLEAN;
     }
     brelse(bh);
+
+    /*
+     * Its data bitmap, as the device has it, must be zero: the allocator
+     * reads it the moment the group is handed out, and a region that held
+     * an earlier group's bitmap would read that group's allocations as
+     * this group's (audit L8). growfs zeroes it under the same sync as the
+     * header; a region that was never zeroed is refused here, the same as
+     * a header that does not verify. Forced-fresh, one block at a time.
+     */
+    for (i = 0; !rc && i < data - bmap; i++) {
+        struct buffer_head *bbh = cetrafs_bread_uncached(sb, start + bmap + i);
+
+        if (!bbh) {
+            rc = -EIO;
+            break;
+        }
+        if (memchr_inv(bbh->b_data, 0, CETRAFS_BLOCK_SIZE)) {
+            pr_err("%s: Block Group %u's bitmap block at %llu is not zeroed -- its region was not initialised on "
+                   "the device\n",
+                   sb->s_id, bg_id, (unsigned long long) (start + bmap + i));
+            rc = -EUCLEAN;
+        }
+        brelse(bbh);
+    }
     return rc;
 }
 

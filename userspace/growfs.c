@@ -871,6 +871,9 @@ int main(int argc, char **argv)
     /* TEST-ONLY: leave the new Block Groups' headers and bitmaps unwritten.
      * A grow that publishes over them is what the crash rig must catch. */
     const bool skip_bg_hdr = cetrafs_test_env("CETRAFS_GROWFS_TEST_SKIP_BG_HEADERS");
+    /* TEST-ONLY: the new bitmaps are left full of 1s, as an earlier
+     * filesystem's would be; the kernel must refuse the grow. */
+    const bool dirty_bmp = cetrafs_test_env("CETRAFS_GROWFS_TEST_DIRTY_BG_BITMAPS");
 
     {
         u64 start = new_bg_start;
@@ -897,7 +900,14 @@ int main(int argc, char **argv)
             /* A stale bitmap from a previous filesystem at these offsets
              * would read as "allocated" and silently cost the volume the
              * space, so these are really zeroed, not assumed zero. */
-            zero_blocks(fd, start + off_bmap32, cetrafs_calc_bg_dbm_blocks(bg_size), !skip_bg_hdr);
+            if (dirty_bmp) {
+                /* TEST-ONLY: a bitmap a previous filesystem left behind. */
+                memset(blk, 0xff, CETRAFS_BLOCK_SIZE);
+                for (u64 k = 0; k < cetrafs_calc_bg_dbm_blocks(bg_size); ++k)
+                    write_block(fd, start + off_bmap32 + k, blk, !skip_bg_hdr);
+            } else {
+                zero_blocks(fd, start + off_bmap32, cetrafs_calc_bg_dbm_blocks(bg_size), !skip_bg_hdr);
+            }
             start += bg_size;
         }
     }
