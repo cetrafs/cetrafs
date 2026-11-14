@@ -1744,6 +1744,45 @@ bool cetrafs_convert_append_nospc;
 cetrafs_test_param(convert_append_nospc, cetrafs_convert_append_nospc, bool, 0644);
 MODULE_PARM_DESC(convert_append_nospc, "TEST ONLY: tree blocks for a convert's append fail with ENOSPC");
 
+/* TEST ONLY: fail the Nth tree-block allocation from now (a countdown; it
+ * disarms after one failure and then reads 0). Every tree block the
+ * module takes from the allocator goes through
+ * cetrafs_tree_block_anywhere(), counted in cetrafs_tree_allocs (procfs
+ * info tree_allocs). A block handed out of a convert's reservation is not
+ * an allocation and cannot fail, so it is neither counted nor refused. The
+ * class 56 instrument: tests/kernel/fsx_enospc_sweep.sh walks N over a run. */
+static uint cetrafs_tree_alloc_fail_at;
+cetrafs_test_param(tree_alloc_fail_at, cetrafs_tree_alloc_fail_at, uint, 0644);
+MODULE_PARM_DESC(tree_alloc_fail_at, "TEST ONLY: the Nth tree-block allocation from now fails with ENOSPC (0 = off)");
+static atomic64_t cetrafs_tree_allocs = ATOMIC64_INIT(0);
+static DEFINE_SPINLOCK(cetrafs_tree_alloc_lock);
+
+u64 cetrafs_tree_alloc_count(void)
+{
+    return (u64) atomic64_read(&cetrafs_tree_allocs);
+}
+
+static bool cetrafs_tree_alloc_hit(void)
+{
+    bool hit = false;
+
+    atomic64_inc(&cetrafs_tree_allocs);
+    if (!READ_ONCE(cetrafs_tree_alloc_fail_at))
+        return false;
+    spin_lock(&cetrafs_tree_alloc_lock);
+    if (cetrafs_tree_alloc_fail_at && --cetrafs_tree_alloc_fail_at == 0)
+        hit = true;
+    spin_unlock(&cetrafs_tree_alloc_lock);
+    return hit;
+}
+
+int cetrafs_tree_block_anywhere(struct super_block *sb, u32 *bg, u64 *lba)
+{
+    if (cetrafs_tree_alloc_hit())
+        return -ENOSPC;
+    return cetrafs_alloc_block_anywhere(sb, bg, lba);
+}
+
 int cetrafs_tree_resv_fill(struct inode *inode)
 {
     struct cetrafs_inode_info *ci = CETRAFS_I(inode);
@@ -1751,8 +1790,8 @@ int cetrafs_tree_resv_fill(struct inode *inode)
     if (READ_ONCE(cetrafs_convert_append_nospc))
         return -ENOSPC;
     while (ci->tree_resv_n < ARRAY_SIZE(ci->tree_resv_lba)) {
-        int ret = cetrafs_alloc_block_anywhere(inode->i_sb, &ci->tree_resv_bg[ci->tree_resv_n],
-                                               &ci->tree_resv_lba[ci->tree_resv_n]);
+        int ret = cetrafs_tree_block_anywhere(inode->i_sb, &ci->tree_resv_bg[ci->tree_resv_n],
+                                              &ci->tree_resv_lba[ci->tree_resv_n]);
 
         if (ret)
             return ret;
@@ -1774,7 +1813,7 @@ int cetrafs_tree_alloc_block(struct inode *inode, u32 *bg, u64 *lba)
         *lba = ci->tree_resv_lba[ci->tree_resv_n];
         return 0;
     }
-    return cetrafs_alloc_block_anywhere(inode->i_sb, bg, lba);
+    return cetrafs_tree_block_anywhere(inode->i_sb, bg, lba);
 }
 
 void cetrafs_tree_mark_convert_append(struct inode *inode, bool on)

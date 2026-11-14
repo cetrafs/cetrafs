@@ -4343,7 +4343,7 @@ int cetrafs_tree_build(struct inode *inode, const cetrafs_extent_t *flat, u32 n,
         {
             u64 lba;
 
-            ret = cetrafs_alloc_block_anywhere(sb, &bg, &lba);
+            ret = cetrafs_tree_block_anywhere(sb, &bg, &lba);
             if (ret)
                 return ret;
             ret = cetrafs_write_new_leaf(sb, lba, flat, (u16) n);
@@ -4377,7 +4377,7 @@ int cetrafs_tree_build(struct inode *inode, const cetrafs_extent_t *flat, u32 n,
         return -ENOMEM;
 
     for (allocated = 0; allocated < total; allocated++) {
-        ret = cetrafs_alloc_block_anywhere(sb, &bg, &blk[allocated]);
+        ret = cetrafs_tree_block_anywhere(sb, &bg, &blk[allocated]);
         if (ret)
             goto fail;
     }
@@ -4884,7 +4884,7 @@ static int cetrafs_tree_split_leaf(struct inode *inode,
     if (!nl || nl == n)
         goto out;
 
-    ret = cetrafs_alloc_block_anywhere(sb, &bg, &nleaf);
+    ret = cetrafs_tree_block_anywhere(sb, &bg, &nleaf);
     if (ret == -ENOSPC)
         ret = CETRAFS_SPLIT_NONE; /* the volume is full: the convert's own append answers */
     if (ret)

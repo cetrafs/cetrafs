@@ -91,6 +91,8 @@ static uint64_t rs;
 static int64_t neg_from = -1;
 static int neg_done;
 static int dropcache;
+static int enospc_tol;	/* FSX_ENOSPC=1: ENOSPC and short writes are outcomes to settle */
+static uint64_t n_enospc;
 
 static uint64_t rnd(void)
 {
@@ -157,6 +159,90 @@ static void ioerr(const char *what)
 	       strerror(errno));
 	fflush(stdout);
 	exit(2);
+}
+
+/* FSX_ENOSPC: an operation that failed with ENOSPC is not an I/O error. It
+ * was refused with the volume's tree blocks gone, so it must have left one
+ * of two states: the file as the model stood before the op, or the model as
+ * it would stand had the op succeeded. A write may instead land a prefix,
+ * which is the post state at the length it returned (write_settle). cetrafs
+ * publishes a tree edit once, so a failed punch, truncate or fallocate may
+ * not leave a mix of the two. Checked by reading the whole file back. */
+static int enospc_ok(const char *what)
+{
+	if (!enospc_tol || errno != ENOSPC)
+		return 0;
+	n_enospc++;
+	record(-1, "ENOSPC from %s", what);
+	return 1;
+}
+
+static void settle(const char *what, const uint8_t *post, uint64_t post_size,
+		   int allow_pre)
+{
+	uint64_t top = msize > post_size ? msize : post_size;
+	uint8_t *buf = malloc(CHUNK);
+	struct stat st;
+	int pre_ok, post_ok;
+
+	if (fstat(fd, &st))
+		ioerr("settle: fstat");
+	pre_ok = allow_pre && (uint64_t)st.st_size == msize;
+	post_ok = (uint64_t)st.st_size == post_size;
+	for (uint64_t off = 0; off < top; off += CHUNK) {
+		uint64_t len = top - off < CHUNK ? top - off : CHUNK;
+		ssize_t n = pread(fd, buf, len, off);
+
+		if (n < 0)
+			ioerr("settle: read");
+		memset(buf + n, 0, len - n);
+		for (uint64_t i = 0; i < len; i++) {
+			if (buf[i] != model[off + i])
+				pre_ok = 0;
+			if (buf[i] != post[off + i])
+				post_ok = 0;
+		}
+	}
+	free(buf);
+	if (pre_ok) {
+		record(-1, "%s after ENOSPC: the file is as before the op", what);
+		return;
+	}
+	if (!post_ok)
+		fail("%s: after ENOSPC the file is neither the model before the op "
+		     "(%llu bytes) nor after it (%llu bytes)",
+		     what, (unsigned long long)msize, (unsigned long long)post_size);
+	memcpy(model, post, maxsize);
+	msize = post_size;
+	record(-1, "%s after ENOSPC: the file is as after the op", what);
+}
+
+/* The op's effect is zero bytes in [zfrom, zfrom+zlen) and size post_size. */
+static void settle_zero(const char *what, uint64_t zfrom, uint64_t zlen,
+			uint64_t post_size, int allow_pre)
+{
+	uint8_t *post = malloc(maxsize);
+
+	memcpy(post, model, maxsize);
+	if (zlen)
+		memset(post + zfrom, 0, zlen);
+	settle(what, post, post_size, allow_pre);
+	free(post);
+}
+
+/* A write that landed n of its len bytes. n is 0 for a refused write. */
+static void write_settle(const char *what, uint64_t off, const uint8_t *buf,
+			 ssize_t n)
+{
+	uint64_t done = n > 0 ? (uint64_t)n : 0, post_size = msize;
+	uint8_t *post = malloc(maxsize);
+
+	memcpy(post, model, maxsize);
+	memcpy(post + off, buf, done);
+	if (done && off + done > post_size)
+		post_size = off + done;
+	settle(what, post, post_size, done == 0);
+	free(post);
 }
 
 static void check_bytes(const char *what, uint64_t off, const uint8_t *got,
@@ -262,14 +348,18 @@ static void op_write(void)
 	buf = malloc(len);
 	fillrnd(buf, len);
 	n = pwrite(fd, buf, len, off);
-	if (n < 0)
+	if (n < 0 && !enospc_ok("write"))
 		ioerr("write");
-	if ((uint64_t)n != len)
-		fail("write at %llu returned %zd of %llu", (unsigned long long)off, n,
-		     (unsigned long long)len);
-	memcpy(model + off, buf, len);
-	if (off + len > msize)
-		msize = off + len;
+	if (n < 0 || (uint64_t)n != len) {
+		if (!enospc_tol)
+			fail("write at %llu returned %zd of %llu", (unsigned long long)off, n,
+			     (unsigned long long)len);
+		write_settle("write", off, buf, n);
+	} else {
+		memcpy(model + off, buf, len);
+		if (off + len > msize)
+			msize = off + len;
+	}
 	free(buf);
 	counts[K_WRITE]++;
 	negative_point(off);
@@ -319,8 +409,13 @@ static void op_trunc(void)
 
 	record(K_TRUNC, "truncate to %llu (was %llu)", (unsigned long long)n,
 	       (unsigned long long)msize);
-	if (ftruncate(fd, (off_t)n))
-		ioerr("ftruncate");
+	if (ftruncate(fd, (off_t)n)) {
+		if (!enospc_ok("ftruncate"))
+			ioerr("ftruncate");
+		settle_zero("ftruncate", n, n < msize ? msize - n : 0, n, 1);
+		counts[K_TRUNC]++;
+		return;
+	}
 	if (n < msize)
 		memset(model + n, 0, msize - n);
 	msize = n;
@@ -337,8 +432,17 @@ static void op_falloc(void)
 	record(K_FALLOC, "fallocate mode=%s off=%llu len=%llu",
 	       keep ? "keep" : "allocate", (unsigned long long)off,
 	       (unsigned long long)len);
-	if (fallocate(fd, keep, (off_t)off, (off_t)len))
-		ioerr("fallocate");
+	if (fallocate(fd, keep, (off_t)off, (off_t)len)) {
+		uint64_t post_size = msize;
+
+		if (!enospc_ok("fallocate"))
+			ioerr("fallocate");
+		if (!keep && off + len > msize)
+			post_size = off + len;
+		settle_zero("fallocate", 0, 0, post_size, 1);
+		counts[K_FALLOC]++;
+		return;
+	}
 	if (!keep && off + len > msize)
 		msize = off + len;
 	counts[K_FALLOC]++;
@@ -355,8 +459,13 @@ static void op_punch(void)
 	record(K_PUNCH, "punch off=%llu len=%llu", (unsigned long long)off,
 	       (unsigned long long)len);
 	if (fallocate(fd, FALLOC_FL_PUNCH_HOLE | FALLOC_FL_KEEP_SIZE, (off_t)off,
-		      (off_t)len))
-		ioerr("punch");
+		      (off_t)len)) {
+		if (!enospc_ok("punch"))
+			ioerr("punch");
+		settle_zero("punch", off, len, msize, 1);
+		counts[K_PUNCH]++;
+		return;
+	}
 	memset(model + off, 0, len);
 	counts[K_PUNCH]++;
 	negative_point(off);
@@ -372,8 +481,17 @@ static void op_zero(void)
 		len = maxsize - off;
 	record(K_ZERO, "zero-range %s off=%llu len=%llu", keep ? "keep" : "extend",
 	       (unsigned long long)off, (unsigned long long)len);
-	if (fallocate(fd, FALLOC_FL_ZERO_RANGE | keep, (off_t)off, (off_t)len))
-		ioerr("zero-range");
+	if (fallocate(fd, FALLOC_FL_ZERO_RANGE | keep, (off_t)off, (off_t)len)) {
+		uint64_t post_size = msize;
+
+		if (!enospc_ok("zero-range"))
+			ioerr("zero-range");
+		if (!keep && off + len > msize)
+			post_size = off + len;
+		settle_zero("zero-range", off, len, post_size, 1);
+		counts[K_ZERO]++;
+		return;
+	}
 	memset(model + off, 0, len);
 	if (!keep && off + len > msize)
 		msize = off + len;
@@ -428,14 +546,18 @@ static void op_dwrite(void)
 		ioerr("posix_memalign");
 	fillrnd(buf, len);
 	n = pwrite(dfd, buf, len, start);
-	if (n < 0)
+	if (n < 0 && !enospc_ok("O_DIRECT write"))
 		ioerr("O_DIRECT write");
-	if ((uint64_t)n != len)
-		fail("O_DIRECT write at %llu returned %zd of %llu",
-		     (unsigned long long)start, n, (unsigned long long)len);
-	memcpy(model + start, buf, len);
-	if (start + len > msize)
-		msize = start + len;
+	if (n < 0 || (uint64_t)n != len) {
+		if (!enospc_tol)
+			fail("O_DIRECT write at %llu returned %zd of %llu",
+			     (unsigned long long)start, n, (unsigned long long)len);
+		write_settle("O_DIRECT write", start, buf, n);
+	} else {
+		memcpy(model + start, buf, len);
+		if (start + len > msize)
+			msize = start + len;
+	}
 	free(buf);
 	counts[K_DWRITE]++;
 	negative_point(start);
@@ -444,8 +566,11 @@ static void op_dwrite(void)
 static void op_fsync(void)
 {
 	record(K_FSYNC, "fsync");
-	if (fsync(fd))
-		ioerr("fsync");
+	if (fsync(fd)) {
+		if (!enospc_ok("fsync"))
+			ioerr("fsync");
+		settle_zero("fsync", 0, 0, msize, 1);
+	}
 	counts[K_FSYNC]++;
 }
 
@@ -491,6 +616,7 @@ int main(int argc, char **argv)
 	if (ng && *ng)
 		neg_from = (int64_t)strtoll(ng, NULL, 0);
 	dropcache = getenv("FSX_DROPCACHE") && *getenv("FSX_DROPCACHE") == '1';
+	enospc_tol = getenv("FSX_ENOSPC") && *getenv("FSX_ENOSPC") == '1';
 
 	model = calloc(1, maxsize);
 	fd = open(g_path, O_RDWR | O_CREAT | O_TRUNC, 0644);
@@ -516,8 +642,14 @@ int main(int argc, char **argv)
 			op_write();
 		else if (r < 44)
 			op_mmap(0);
-		else if (r < 52)
-			op_mmap(1);
+		else if (r < 52) {
+			/* A mapped write allocates at fault time, and a refused one is
+			 * a SIGBUS, not an errno: under FSX_ENOSPC it is a plain write. */
+			if (enospc_tol)
+				op_write();
+			else
+				op_mmap(1);
+		}
 		else if (r < 57)
 			op_trunc();
 		else if (r < 65)
@@ -559,6 +691,7 @@ int main(int argc, char **argv)
 	printf("COUNTS");
 	for (int k = 0; k < K_N; k++)
 		printf(" %s=%llu", kname[k], (unsigned long long)counts[k]);
+	printf("FSX enospc=%llu\n", (unsigned long long)n_enospc);
 	printf("\nFSX PASS seed=%s ops=%llu size=%llu\n", g_seed_s, g_ops,
 	       (unsigned long long)msize);
 	close(fd);

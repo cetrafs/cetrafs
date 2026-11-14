@@ -1337,6 +1337,8 @@ void cetrafs_pending_clear(struct inode *inode, u32 first, u32 last);
 void cetrafs_pending_drop_all(struct inode *inode);
 int cetrafs_tree_resv_fill(struct inode *inode);
 int cetrafs_tree_alloc_block(struct inode *inode, u32 *bg, u64 *lba);
+int cetrafs_tree_block_anywhere(struct super_block *sb, u32 *bg, u64 *lba);
+u64 cetrafs_tree_alloc_count(void);
 void cetrafs_tree_resv_release(struct inode *inode);
 void cetrafs_tree_mark_convert_append(struct inode *inode, bool on);
 bool cetrafs_inode_foreign_opener_cached(struct inode *inode);
