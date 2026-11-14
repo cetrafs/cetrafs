@@ -410,6 +410,7 @@ static int cetrafs_proc_info_show(struct seq_file *m, void *v)
     seq_printf(m, "enospc_rescans: %llu\n", cetrafs_enospc_rescan_count());
     seq_printf(m, "release_visits: %llu\n", cetrafs_release_visit_count());
     seq_printf(m, "scrub_set_bytes_peak: %llu\n", cetrafs_scrub_set_bytes_peak_count());
+    seq_printf(m, "scrub_cand_deferred: %llu\n", cetrafs_scrub_cand_deferred_count());
     seq_printf(m, "scrub_free_calls: %llu\n", cetrafs_scrub_free_call_count());
     seq_printf(m, "scrub_inode_readahead: %llu\n", cetrafs_scrub_inode_ra_count());
     seq_printf(m, "defrag_passes: %llu\n", cetrafs_defrag_pass_count());

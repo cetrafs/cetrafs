@@ -197,6 +197,27 @@ MODULE_PARM_DESC(scrub_ignore_alloc_seq,
 static unsigned int cetrafs_scrub_ref_budget_kb = 65536;
 cetrafs_test_param(scrub_ref_budget_kb, cetrafs_scrub_ref_budget_kb, uint, 0644);
 MODULE_PARM_DESC(scrub_ref_budget_kb, "TEST ONLY: the scrub's reference-set budget per batch, KiB");
+/*
+ * Candidates are kept as runs of consecutive bits, not as a bitmap of the
+ * whole group: a group with a few leaks holds a few runs (audit M3). The
+ * runs of a cycle share one budget, and a group whose runs would exceed
+ * it keeps none this cycle -- it reclaims less, and the next cycle asks
+ * again -- so the budget can only make the scrub free less, never more.
+ * TEST ONLY: scrub_cand_bitmap restores the bitmap a group with a
+ * candidate held for the whole cycle (the control of
+ * tests/kernel/scrub_cand_runs.sh).
+ */
+static unsigned int cetrafs_scrub_cand_budget_kb = 4096;
+cetrafs_test_param(scrub_cand_budget_kb, cetrafs_scrub_cand_budget_kb, uint, 0644);
+MODULE_PARM_DESC(scrub_cand_budget_kb, "TEST ONLY: the scrub's candidate-run budget per cycle, KiB");
+static bool cetrafs_scrub_cand_bitmap;
+cetrafs_test_param(scrub_cand_bitmap, cetrafs_scrub_cand_bitmap, bool, 0644);
+MODULE_PARM_DESC(scrub_cand_bitmap, "TEST ONLY: the scrub holds a candidate bitmap per group with a candidate, all cycle");
+static atomic64_t cetrafs_scrub_cand_deferred = ATOMIC64_INIT(0);
+u64 cetrafs_scrub_cand_deferred_count(void)
+{
+    return (u64) atomic64_read(&cetrafs_scrub_cand_deferred);
+}
 /* TEST ONLY: the old shape -- every set for every group for the whole
  * cycle, one free per block, every inode block read ahead -- the control
  * of tests/kernel/scrub_shape.sh. */
@@ -288,11 +309,19 @@ struct scrub_bg {
     u64 bmap_lba;        /* data-bitmap first LBA */
     u64 bmap_blocks;     /* data-bitmap length in blocks */
     unsigned long *ref;  /* referenced set, data_count bits (indexed block - data_start) */
-    unsigned long *cand; /* pass-1 candidate set, data_count bits */
+    unsigned long *cand; /* TEST ONLY (scrub_cand_bitmap): pass-1 candidate bitmap */
+    struct scrub_run *runs; /* pass-1 candidates: runs of consecutive block indices */
+    u32 nruns, capruns;
+    u32 rcur;            /* pass 2's cursor into runs[]: it asks ascending bits */
     u64 alloc_seq;       /* allocations in this BG when the evidence was taken */
     u64 resv_seq;        /* reservation releases when the evidence was taken */
 };
 
+/* Consecutive candidates [start, start+len), block indices into the BG. */
+struct scrub_run {
+    u32 start;
+    u32 len;
+};
 
 struct scrub_ctx {
     struct scrub_bg *bgs;
@@ -300,6 +329,7 @@ struct scrub_ctx {
     /* bgs[] data ranges strictly ascending and disjoint, checked when
      * the list is built: scrub_mark_ref() may then binary-search it. */
     bool ordered;
+    u64 cand_bytes;      /* bytes of candidate runs held this cycle, against the budget */
 };
 
 /* The for_each_extent callback: mark every block of [phys, phys+len) that
@@ -547,32 +577,100 @@ static inline bool scrub_bit_set(const u8 *buf, u64 bit)
     return (buf[bit >> 3] >> (bit & 7)) & 1;
 }
 
+/* Drop a group's candidates for this cycle, and their share of the budget. */
+static void scrub_cand_release(struct scrub_ctx *ctx, struct scrub_bg *b)
+{
+    ctx->cand_bytes -= (u64) b->capruns * sizeof(struct scrub_run);
+    kvfree(b->runs);
+    b->runs = NULL;
+    b->nruns = b->capruns = 0;
+    kvfree(b->cand);
+    b->cand = NULL;
+}
+
+/* Append candidate 'bit' to the group's runs. 1 added, 0 over the budget
+ * (the group keeps none this cycle), -ENOMEM. */
+static int scrub_cand_add(struct scrub_ctx *ctx, struct scrub_bg *b, u64 bit)
+{
+    u64 budget = (u64) max(READ_ONCE(cetrafs_scrub_cand_budget_kb), 1U) * 1024;
+    struct scrub_run *r;
+
+    if (b->nruns && (u64) b->runs[b->nruns - 1].start + b->runs[b->nruns - 1].len == bit) {
+        b->runs[b->nruns - 1].len++;
+        return 1;
+    }
+    if (b->nruns == b->capruns) {
+        u32 ncap = b->capruns ? b->capruns * 2 : 16;
+        u64 grow = (u64) (ncap - b->capruns) * sizeof(*r);
+
+        if (ctx->cand_bytes + grow > budget)
+            return 0;
+        r = kvmalloc_array(ncap, sizeof(*r), GFP_NOFS);
+        if (!r)
+            return -ENOMEM;
+        if (b->nruns)
+            memcpy(r, b->runs, (size_t) b->nruns * sizeof(*r));
+        kvfree(b->runs);
+        b->runs = r;
+        b->capruns = ncap;
+        ctx->cand_bytes += grow;
+    }
+    b->runs[b->nruns].start = (u32) bit;
+    b->runs[b->nruns].len = 1;
+    b->nruns++;
+    return 1;
+}
+
 /* Pass 1: a candidate is an allocated bitmap bit referenced by nothing. */
-static int scrub_mark_candidates(struct super_block *sb, struct scrub_bg *b)
+static int scrub_mark_candidates(struct super_block *sb, struct scrub_ctx *ctx, struct scrub_bg *b)
 {
     u8 *bmap = scrub_read_bitmap(sb, b);
+    bool over = false;
     u64 bit;
+    int ret = 0;
 
     if (!bmap)
         return -EIO;
     if (b->cand)
         bitmap_zero(b->cand, (unsigned int) b->data_count);
-    for (bit = 0; bit < b->data_count; bit++) {
+    for (bit = 0; bit < b->data_count && !over; bit++) {
         if (scrub_bit_set(bmap, bit) && !test_bit((unsigned int) bit, b->ref)) {
-            if (!b->cand) { /* only a group with a candidate holds the set */
+            if (!b->cand && READ_ONCE(cetrafs_scrub_cand_bitmap)) { /* TEST ONLY: the old shape */
                 b->cand = kvcalloc(BITS_TO_LONGS(b->data_count), sizeof(long), GFP_NOFS);
                 if (!b->cand) {
-                    kvfree(bmap);
-                    return -ENOMEM;
+                    ret = -ENOMEM;
+                    break;
                 }
             }
-            __set_bit((unsigned int) bit, b->cand);
+            if (b->cand)
+                __set_bit((unsigned int) bit, b->cand);
+            ret = scrub_cand_add(ctx, b, bit);
+            if (ret == 0) {
+                /* Over the cycle's budget: this group keeps none. */
+                scrub_cand_release(ctx, b);
+                atomic64_inc(&cetrafs_scrub_cand_deferred);
+                over = true;
+                ret = 0;
+            } else if (ret < 0) {
+                break;
+            }
         }
         if (!(bit & 0xffff))
             cond_resched(); /* data_count is disk geometry: up to 2^32 */
     }
     kvfree(bmap);
-    return 0;
+    return ret < 0 ? ret : 0;
+}
+
+/* Pass 2's test of one block index. It asks ascending indices, so the
+ * cursor only moves forward. */
+static bool scrub_is_cand(struct scrub_bg *b, u64 bit)
+{
+    if (b->cand)
+        return test_bit((unsigned int) bit, b->cand);
+    while (b->rcur < b->nruns && (u64) b->runs[b->rcur].start + b->runs[b->rcur].len <= bit)
+        b->rcur++;
+    return b->rcur < b->nruns && b->runs[b->rcur].start <= bit;
 }
 
 /* Pass 2: a candidate still allocated AND still unreferenced after the gap is
@@ -587,6 +685,7 @@ static int scrub_free_confirmed(struct cetrafs_scrub *s, struct scrub_bg *b, u64
 
     if (!bmap)
         return -EIO;
+    b->rcur = 0;
     for (bit = 0; bit < b->data_count; bit++) {
         if (READ_ONCE(s->draining))
             break;
@@ -610,7 +709,7 @@ static int scrub_free_confirmed(struct cetrafs_scrub *s, struct scrub_bg *b, u64
             pr_debug("scrub: BG %u saw an allocation since the deciding pass -- abandoning it this cycle\n", b->bg_id);
             break;
         }
-        if (!test_bit((unsigned int) bit, b->cand))
+        if (!scrub_is_cand(b, bit))
             continue;
 
         /*
@@ -669,7 +768,7 @@ static int scrub_free_confirmed(struct cetrafs_scrub *s, struct scrub_bg *b, u64
              * reservations and the allocation count per block, under the
              * mutex, as it did for one. */
             if (!READ_ONCE(cetrafs_scrub_old_shape))
-                while (run < 4096 && bit + run < b->data_count && test_bit((unsigned int) (bit + run), b->cand) &&
+                while (run < 4096 && bit + run < b->data_count && scrub_is_cand(b, bit + run) &&
                        scrub_bit_set(bmap, bit + run) && !test_bit((unsigned int) (bit + run), b->ref))
                     run++;
             got_run = run;
@@ -796,10 +895,12 @@ static void scrub_free_targets(struct scrub_ctx *ctx)
     for (i = 0; i < ctx->nbgs; i++) {
         kvfree(ctx->bgs[i].ref);
         kvfree(ctx->bgs[i].cand);
+        kvfree(ctx->bgs[i].runs);
     }
     kfree(ctx->bgs);
     ctx->bgs = NULL;
     ctx->nbgs = 0;
+    ctx->cand_bytes = 0;
 }
 
 /*
@@ -1038,7 +1139,8 @@ static void scrub_note_peak(const struct scrub_ctx *ctx)
 
     for (i = 0; i < ctx->nbgs; i++)
         held += (ctx->bgs[i].ref ? scrub_set_bytes(&ctx->bgs[i]) : 0) +
-                (ctx->bgs[i].cand ? scrub_set_bytes(&ctx->bgs[i]) : 0);
+                (ctx->bgs[i].cand ? scrub_set_bytes(&ctx->bgs[i]) : 0) +
+                (u64) ctx->bgs[i].capruns * sizeof(struct scrub_run);
     peak = (u64) atomic64_read(&cetrafs_scrub_set_bytes_peak);
     while (held > peak && atomic64_cmpxchg(&cetrafs_scrub_set_bytes_peak, (s64) peak, (s64) held) != (s64) peak)
         peak = (u64) atomic64_read(&cetrafs_scrub_set_bytes_peak);
@@ -1094,7 +1196,7 @@ static void cetrafs_scrub_cycle(struct cetrafs_scrub *s)
         if (scrub_build_refset(s, &sub, /*fresh=*/false) != 0)
             goto done; /* any read failure -> free nothing this cycle */
         for (i = from; i < to; i++)
-            if (scrub_mark_candidates(sb, &ctx.bgs[i]) != 0)
+            if (scrub_mark_candidates(sb, &ctx, &ctx.bgs[i]) != 0)
                 goto done;
         scrub_note_peak(&ctx);
         if (!old)
@@ -1105,7 +1207,7 @@ static void cetrafs_scrub_cycle(struct cetrafs_scrub *s)
         u32 j = 0;
 
         for (i = 0; i < ctx.nbgs; i++)
-            if (ctx.bgs[i].cand)
+            if (ctx.bgs[i].cand || ctx.bgs[i].nruns)
                 ctx.bgs[j++] = ctx.bgs[i];
         ctx.nbgs = j;
     }
