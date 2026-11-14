@@ -723,17 +723,34 @@ static int cetrafs_xattr_handler_get(const struct xattr_handler *handler,
  * happened while holding this lock, so no one else can have modified
  * the block since (see journal.c's header comment).
  */
+/* TEST ONLY: a nested xattr set acquires the namespace lock again, as it
+ * did before the nesting check below -- the negative control of
+ * tests/kernel/xattr_strip_nested.sh, which then hangs on itself. */
+static bool cetrafs_xattr_nested_wait;
+cetrafs_test_param(xattr_nested_wait, cetrafs_xattr_nested_wait, bool, 0644);
+MODULE_PARM_DESC(xattr_nested_wait, "TEST ONLY: a xattr set nested in a setattr waits on the namespace lock it holds");
+
 static int cetrafs_xattr_set(struct inode *inode, const char *name, const void *value, size_t size, int flags)
 {
     struct inode *set[] = {inode}; /* the inode's own record + its xattr block */
+    /* The caller may already hold this inode's namespace lock. A write that
+     * strips security.capability reaches here from setattr_prepare()'s
+     * killpriv, inside cetrafs_setattr(), which holds the lock; acquiring it
+     * again waits on ourselves forever (the write hung in D state). The
+     * outer operation holds the lock and persists the record it changes, so
+     * the nested set runs under that lock and does not take it again. */
+    bool nested = !READ_ONCE(cetrafs_xattr_nested_wait) && cetrafs_inode_ns_held_by_current(inode);
     /* security.* is also set by IMA/EVM from __fput(), whose return
      * nobody reads: that one waits in the lock (nslock.c). */
-    int ret = strncmp(name, XATTR_SECURITY_PREFIX, XATTR_SECURITY_PREFIX_LEN)
+    int ret = 0;
+
+    if (!nested) {
+        ret = strncmp(name, XATTR_SECURITY_PREFIX, XATTR_SECURITY_PREFIX_LEN)
                   ? cetrafs_nslock_acquire_set_vfs(set, ARRAY_SIZE(set))
                   : cetrafs_nslock_acquire_set(set, ARRAY_SIZE(set));
-
-    if (ret)
-        return ret;
+        if (ret)
+            return ret;
+    }
 
     {
         u64 now = (u64) ktime_get_real_seconds();
@@ -742,7 +759,8 @@ static int cetrafs_xattr_set(struct inode *inode, const char *name, const void *
         if (!ret)
             inode_set_ctime(inode, (time64_t) now, 0);
     }
-    cetrafs_nslock_release_set(set, ARRAY_SIZE(set));
+    if (!nested)
+        cetrafs_nslock_release_set(set, ARRAY_SIZE(set));
     return ret;
 }
 
