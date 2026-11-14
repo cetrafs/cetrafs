@@ -265,6 +265,99 @@ static void growfs_release_claim(int fd)
  * Refuse a volume a node has mounted: the device itself is asked, by
  * watching every registered row's heartbeat over a probe window.
  */
+/*
+ * The layout the superblock describes must hold, before growfs writes
+ * anything: the data area holds every Block Group the superblock already
+ * names, and no table lies inside it. The mount (cetrafs_validate_layout)
+ * and fsck enforce the same. growfs writes Block Group headers and zeroed
+ * bitmaps at the end of the data area before its publish, so a layout
+ * that breaks these is one whose "new" groups land on live ones (audit
+ * 2026-11-14 U3, tests/image/growfs_layout_before_writes.sh). The regions
+ * are the ones the kernel lists; the tail reserve is not one of them.
+ */
+struct growfs_region {
+    const char *name;
+    u64 start, count;
+};
+
+static void growfs_check_layout(const char *dev, const cetrafs_superblock_t *sb, u64 total_blocks)
+{
+    struct growfs_region r[10];
+    unsigned n = 0, i, j;
+    const u64 zg_cnt = cetrafs_le32(sb->zone_group_count);
+    const u64 bg_cnt = cetrafs_le32(sb->block_group_count);
+    const u64 bg_size = cetrafs_le64(sb->bg_size_blocks);
+    const u64 data_start = cetrafs_le64(sb->bg_regions_start);
+    const u64 node_cnt = cetrafs_le32(sb->node_table_count);
+    u64 span, data_end, first, count;
+
+    if (bg_size > CETRAFS_MAX_BG_SIZE_BLOCKS)
+        die("%s: Block Group size %llu blocks exceeds the format's limit -- run fsck.cetra first", dev,
+            (unsigned long long) bg_size);
+    if (bg_size && bg_cnt > UINT64_MAX / bg_size)
+        die("%s: %llu Block Groups of %llu blocks overflow the layout -- run fsck.cetra first", dev,
+            (unsigned long long) bg_cnt, (unsigned long long) bg_size);
+    span = bg_cnt * bg_size;
+    if (data_start > UINT64_MAX - span)
+        die("%s: the data area at block %llu overflows -- run fsck.cetra first", dev, (unsigned long long) data_start);
+    data_end = cetrafs_le64(sb->bg_data_end) ? cetrafs_le64(sb->bg_data_end) : data_start + span;
+    if (data_end < data_start)
+        die("%s: bg_data_end (%llu) precedes bg_regions_start (%llu) -- run fsck.cetra first", dev,
+            (unsigned long long) data_end, (unsigned long long) data_start);
+    /* The box holds its groups: a box shorter than them puts the next
+     * group's header on top of the last one. */
+    if (data_end - data_start < span)
+        die("%s: the data area [%llu,%llu) cannot hold the %llu Block Groups the superblock names -- "
+            "run fsck.cetra first",
+            dev, (unsigned long long) data_start, (unsigned long long) data_end, (unsigned long long) bg_cnt);
+    if (data_end > total_blocks)
+        die("%s: the data area ends at block %llu, past the %llu blocks of the volume -- run fsck.cetra first", dev,
+            (unsigned long long) data_end, (unsigned long long) total_blocks);
+
+    first = cetrafs_le64(sb->bg_table_first_count);
+    if (!first || first > bg_cnt)
+        first = bg_cnt;
+    r[n++] = (struct growfs_region) {"superblock", 0, 1};
+    r[n++] = (struct growfs_region) {"zone group table", cetrafs_le64(sb->zg_table_start), zg_cnt};
+    r[n++] = (struct growfs_region) {"block group table", cetrafs_le64(sb->bg_table_start), first};
+    r[n++] = (struct growfs_region) {"inode bitmap", cetrafs_le64(sb->inode_bmap_start), cetrafs_le64(sb->inode_bmap_blocks)};
+    r[n++] = (struct growfs_region) {"inode table", cetrafs_le64(sb->inode_table_start), cetrafs_le64(sb->inode_table_blocks)};
+    r[n++] = (struct growfs_region) {"node registry", cetrafs_le64(sb->node_table_start), cetrafs_le64(sb->node_table_blocks)};
+    count = zg_cnt * cetrafs_le32(sb->pending_free_blocks_per_zg);
+    r[n++] = (struct growfs_region) {"pending-free queues", cetrafs_le64(sb->pending_free_start), count};
+    count = node_cnt * cetrafs_le32(sb->node_journal_blocks);
+    r[n++] = (struct growfs_region) {"per-node journals", cetrafs_le64(sb->node_journal_start), count};
+    r[n++] = (struct growfs_region) {"block group regions", data_start, data_end - data_start};
+
+    for (i = 0; i < n;) {
+        if (r[i].count == 0) {
+            r[i] = r[--n];
+            continue;
+        }
+        if (r[i].start == 0 && i != 0)
+            die("%s: %s starts at block 0 (the superblock) -- run fsck.cetra first", dev, r[i].name);
+        if (r[i].count > total_blocks || r[i].start > total_blocks - r[i].count)
+            die("%s: %s [%llu,+%llu) does not fit in the %llu blocks of the volume -- run fsck.cetra first", dev,
+                r[i].name, (unsigned long long) r[i].start, (unsigned long long) r[i].count,
+                (unsigned long long) total_blocks);
+        i++;
+    }
+    /* Insertion sort by start: a dozen entries, and the overlap test is
+     * then one linear pass. */
+    for (i = 1; i < n; i++) {
+        struct growfs_region key = r[i];
+
+        for (j = i; j > 0 && r[j - 1].start > key.start; j--)
+            r[j] = r[j - 1];
+        r[j] = key;
+    }
+    for (i = 1; i < n; i++)
+        if (r[i].start < r[i - 1].start + r[i - 1].count)
+            die("%s: %s [%llu,+%llu) overlaps %s [%llu,+%llu) -- run fsck.cetra first", dev, r[i].name,
+                (unsigned long long) r[i].start, (unsigned long long) r[i].count, r[i - 1].name,
+                (unsigned long long) r[i - 1].start, (unsigned long long) r[i - 1].count);
+}
+
 static void growfs_refuse_live_peer(const char *dev)
 {
     char label[CETRAFS_NODE_LABEL_LEN + 1] = {0};
@@ -436,6 +529,10 @@ int main(int argc, char **argv)
         close(fd);
         return 0;
     }
+
+    /* Before any write below: the layout the new groups are carved from
+     * must be one the mount accepts (audit 2026-11-14 U3). */
+    growfs_check_layout(dev, &sb, old_total);
 
     /*
      * ---- geometry ----
