@@ -1777,7 +1777,7 @@ static int cetrafs_zg_is_fully_empty(struct super_block *sb, u32 zg_id, bool *ou
  * stays false.
  */
 /* TEST ONLY: a release goes ahead with a member's delta still accrued,
- * as before P3 -- the control of tests/kernel/zg_release_flush.sh. */
+ * as before P3 -- the control of tests/kernel/zg_release_held_delta.sh. */
 static bool cetrafs_release_delta_guard_off;
 cetrafs_test_param(release_delta_guard_off, cetrafs_release_delta_guard_off, bool, 0644);
 MODULE_PARM_DESC(release_delta_guard_off, "TEST ONLY: release a Zone Group whose member still holds a free-count delta");
