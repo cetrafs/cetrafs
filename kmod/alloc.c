@@ -336,37 +336,29 @@ static long cetrafs_bitmap_count_free(struct super_block *sb, u64 bmap_lba, u64 
     u64 blk;
     u64 free = 0;
 
-    for (blk = 0; blk < nblocks; blk++) {
+    for (blk = 0; blk < nblocks && blk * CETRAFS_BITS_PER_BLOCK < nbits; blk++) {
         struct buffer_head *bh;
+        unsigned int nb, i, used = 0;
+        const __le64 *w;
 
         /* A whole-bitmap walk, under alloc_mutex: on a large Block
          * Group that is seconds of CPU per pass (audit R18). */
         cond_resched();
         bh = cetrafs_bread_retry(sb, bmap_lba + blk);
-        unsigned int byte;
-
         if (!bh)
             return -EIO;
-
-        for (byte = 0; byte < CETRAFS_BLOCK_SIZE; byte++) {
-            const u8 *b = (const u8 *) bh->b_data + byte;
-            unsigned int bit;
-
-            if (*b == 0xFF)
-                continue; /* fully used byte */
-
-            for (bit = 0; bit < 8; bit++) {
-                u64 idx = blk * CETRAFS_BITS_PER_BLOCK + byte * 8 + bit;
-
-                if (idx >= nbits) {
-                    brelse(bh);
-                    return (long) free;
-                }
-                if (!(*b & (1u << bit)))
-                    free++;
-            }
-        }
-
+        /* Word-wise: a 64-bit population count per word, not a test per
+         * bit (audit 2026-11-14 P3). The bitmap is little-endian bit
+         * order -- bit i is bit i%8 of byte i/8 -- which is bit i of the
+         * little-endian 64-bit word, on any host. */
+        nb = (unsigned int) min_t(u64, CETRAFS_BITS_PER_BLOCK, nbits - blk * CETRAFS_BITS_PER_BLOCK);
+        w = (const __le64 *) bh->b_data;
+        for (i = 0; i < nb / 64; i++)
+            used += hweight64(le64_to_cpu(w[i]));
+        for (i = (nb / 64) * 64; i < nb; i++)
+            if (((const u8 *) bh->b_data)[i / 8] & (1u << (i % 8)))
+                used++;
+        free += nb - used;
         brelse(bh);
     }
 
@@ -3578,8 +3570,6 @@ static unsigned int cetrafs_reconcile_pause_ms;
 cetrafs_test_param(reconcile_pause_ms, cetrafs_reconcile_pause_ms, uint, 0644);
 MODULE_PARM_DESC(reconcile_pause_ms, "TEST ONLY: one-shot pause between a free-count recount and its write");
 
-static int cetrafs_reconcile_locked(struct super_block *sb, u32 bg_id, s64 *out_delta);
-
 /* TEST ONLY: a recount pauses once its write has landed, before the
  * accrued delta it replaces is gone (tests/kernel/bg_flush_inflight_count.sh);
  * and the recount runs without its flight -- the old order, the control. */
@@ -3589,6 +3579,62 @@ MODULE_PARM_DESC(reconcile_written_stall_ms, "TEST ONLY: one recount pauses afte
 static bool cetrafs_reconcile_flight_off;
 cetrafs_test_param(reconcile_flight_off, cetrafs_reconcile_flight_off, bool, 0644);
 MODULE_PARM_DESC(reconcile_flight_off, "TEST ONLY: a recount writes without a flight (the old order)");
+
+/* TEST ONLY: a Zone Group recount reads each bitmap block alone and holds
+ * alloc_mutex, as before audit 2026-11-14 P3 -- the control of
+ * tests/kernel/zg_reconcile_batched.sh. */
+static bool cetrafs_reconcile_serial;
+cetrafs_test_param(reconcile_serial, cetrafs_reconcile_serial, bool, 0644);
+MODULE_PARM_DESC(reconcile_serial, "TEST ONLY: a Zone Group recount reads its bitmaps one block at a time");
+
+/*
+ * Read Block Group 'bg_id's data bitmap forced-fresh as ONE batch
+ * (cetrafs_bread_uncached_batch()), leaving it in the cache for the
+ * recount that follows: one device round trip instead of one per bitmap
+ * block. The recount at a Zone Group claim paid eight serial reads per
+ * group, ~3 minutes per Zone Group at 64 TiB (audit 2026-11-14 P3).
+ * Best effort: on any failure the recount reads the blocks itself.
+ */
+void cetrafs_bg_prefetch_bitmap(struct super_block *sb, u32 bg_id)
+{
+    struct cetrafs_bg_geom bg;
+    struct buffer_head **bhs;
+    u32 n, i;
+
+    if (READ_ONCE(cetrafs_reconcile_serial) || cetrafs_read_bg_geom(sb, bg_id, &bg))
+        return;
+    n = (u32) min_t(u64, bg.off_data_region - bg.off_data_bmap, 4096);
+    bhs = kvcalloc(n, sizeof(*bhs), GFP_KERNEL);
+    if (!bhs)
+        return;
+    if (!cetrafs_bread_uncached_batch(sb, bg.start_block + bg.off_data_bmap, n, bhs))
+        for (i = 0; i < n; i++)
+            brelse(bhs[i]);
+    kvfree(bhs);
+}
+
+static int cetrafs_reconcile_locked(struct super_block *sb, u32 bg_id, s64 *out_delta);
+
+/*
+ * The recount of a member of a Zone Group this node has not cached yet
+ * (a claim, a steal, the mount's re-attach): nothing allocates from it,
+ * frees into it go to its queue, the drain and the scrub skip it -- all
+ * of them ask cetrafs_sb_zg_owned_cached() -- so nothing accrues a delta
+ * for it, and alloc_mutex, which every other recount holds against
+ * exactly those, would only stall this node's allocating writes for the
+ * CAW's round trip (audit 2026-11-14 P3). Refused, as a programming
+ * error, if the Zone Group IS cached.
+ */
+int cetrafs_bg_reconcile_free_count_uncached(struct super_block *sb, u32 bg_id, u32 zg_id, s64 *out_delta)
+{
+    if (out_delta)
+        *out_delta = 0;
+    if (READ_ONCE(cetrafs_reconcile_serial))
+        return cetrafs_bg_reconcile_free_count(sb, bg_id, out_delta);
+    if (WARN_ON_ONCE(cetrafs_sb_zg_owned_cached(sb, zg_id)))
+        return cetrafs_bg_reconcile_free_count(sb, bg_id, out_delta);
+    return cetrafs_reconcile_locked(sb, bg_id, out_delta);
+}
 
 int cetrafs_bg_reconcile_free_count(struct super_block *sb, u32 bg_id, s64 *out_delta)
 {

@@ -923,7 +923,9 @@ static int cetrafs_zg_reconcile_free_counts(struct super_block *sb, u32 zg_id)
         if (ret)
             return ret;
 
-        ret = cetrafs_bg_reconcile_free_count(sb, b, &delta);
+        cetrafs_bg_prefetch_bitmap(sb, b);
+        ret = cetrafs_sb_zg_owned_cached(sb, zg_id) ? cetrafs_bg_reconcile_free_count(sb, b, &delta)
+                                                    : cetrafs_bg_reconcile_free_count_uncached(sb, b, zg_id, &delta);
         if (ret) {
             /* Never fails the claim: a ZG with an unreadable BG is
              * still better owned than left to nobody, and the ordinary
@@ -1066,7 +1068,11 @@ static int __cetrafs_zg_try_claim_one(struct super_block *sb,
         /* re-attaching to a ZG we already owned */
         bool was_cached = cetrafs_sb_zg_owned_cached(sb, zg_id);
 
-        cetrafs_sb_cache_zg_ownership(sb, zg_id);
+        /* At mount, cached only after the recount below, as a claim
+         * does: the recount then runs quiet, outside alloc_mutex
+         * (cetrafs_bg_reconcile_free_count_uncached()). */
+        if (!at_mount)
+            cetrafs_sb_cache_zg_ownership(sb, zg_id);
         ret = 0;
         /* At MOUNT this is the "our own crash" case: whatever deltas
          * this node had accrued but not applied died with it, so the
@@ -1088,9 +1094,10 @@ static int __cetrafs_zg_try_claim_one(struct super_block *sb,
          * streaming write bandwidth on a real LUN. */
         /* PERF(5): this branch runs every heartbeat tick -- neither call
          * may become unconditional. docs/PERFORMANCE.md */
-        if (at_mount)
+        if (at_mount) {
             cetrafs_zg_reconcile_free_counts(sb, zg_id);
-        else if (!was_cached)
+            cetrafs_sb_cache_zg_ownership(sb, zg_id);
+        } else if (!was_cached)
             cetrafs_bg_seed_count_epochs(sb, zg_id);
         goto out_unlock;
     }

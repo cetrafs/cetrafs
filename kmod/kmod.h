@@ -1045,6 +1045,8 @@ u64 cetrafs_layout_refresh_refused_count(void);
 #define CETRAFS_ALLOC_PICK_RETRIES 8u
 
 int cetrafs_bg_reconcile_free_count(struct super_block *sb, u32 bg_id, s64 *out_delta);
+int cetrafs_bg_reconcile_free_count_uncached(struct super_block *sb, u32 bg_id, u32 zg_id, s64 *out_delta);
+void cetrafs_bg_prefetch_bitmap(struct super_block *sb, u32 bg_id);
 /* Apply one accrued BG free-count delta as an epoch-guarded CAS. 0 means
  * consumed (applied, or loudly dropped as stale); negative only for real
  * I/O trouble, where the caller re-accrues. */
