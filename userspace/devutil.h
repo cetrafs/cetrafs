@@ -536,6 +536,16 @@ static inline void cetrafs_row_drop_cache(int fd, const cetrafs_superblock_t *sb
     posix_fadvise(fd, cetrafs_node_row_off(sb, idx), CETRAFS_BLOCK_SIZE, POSIX_FADV_DONTNEED);
 }
 
+/* The whole registry, as the device has it: a peer's row write reaches
+ * the device, not this machine's page cache (audit 2026-11-14 U1). */
+static inline void cetrafs_registry_drop_cache(int fd, const cetrafs_superblock_t *sb)
+{
+    uint32_t count = cetrafs_le32(sb->node_table_count);
+
+    if (count)
+        posix_fadvise(fd, cetrafs_node_row_off(sb, 0), (off_t) count * CETRAFS_BLOCK_SIZE, POSIX_FADV_DONTNEED);
+}
+
 /*
  * Swap the row block's first logical block from old_blk to new_blk (both
  * whole row blocks; only the first lbs bytes are compared). With
@@ -1242,17 +1252,22 @@ static inline void cetrafs_repair_watch_arm(int fd, const cetrafs_superblock_t *
 {
     uint32_t count = cetrafs_le32(sb->node_table_count), idx;
 
+    cetrafs_registry_drop_cache(fd, sb); /* the baseline as the device has it */
     for (idx = 0; idx < count && idx < CETRAFS_REPAIR_WATCH_ROWS; idx++)
         if (idx == row || cetrafs_repair_row_read(fd, sb, idx, &cetrafs_renew_seen[idx]) != 0)
             memset(&cetrafs_renew_seen[idx], 0, sizeof(cetrafs_renew_seen[idx]));
 }
 
-/* Async-signal-safe: pread only. 1 if some other REGISTERED row beat. */
+/* Async-signal-safe: pread and posix_fadvise only. 1 if some other
+ * REGISTERED row beat. The registry is dropped from this machine's cache
+ * first: a peer's beat is on the device, and a tick served from the cache
+ * would watch the baseline forever (audit 2026-11-14 U1). */
 static inline int cetrafs_repair_node_beat(int fd, const cetrafs_superblock_t *sb, uint32_t row)
 {
     uint32_t count = cetrafs_le32(sb->node_table_count), idx;
     cetrafs_node_entry_t ne;
 
+    cetrafs_registry_drop_cache(fd, sb);
     for (idx = 0; idx < count && idx < CETRAFS_REPAIR_WATCH_ROWS; idx++) {
         if (idx == row || cetrafs_repair_row_read(fd, sb, idx, &ne) != 0)
             continue;
