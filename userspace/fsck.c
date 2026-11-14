@@ -593,6 +593,27 @@ static void fsck_stamp_dirent_block(uint8_t *blk)
     memcpy(blk + CETRAFS_DIRENT_TAIL_OFF, &tail, sizeof(tail));
 }
 
+/*
+ * May a dirent block be written into and re-stamped? Only if it is sound
+ * by every test there is: the tail magic and CRC verify, the structural
+ * check passes, and every entry is coherent. A block that fails any of
+ * them is not made valid by a stamp -- the stamp would only certify it.
+ */
+static int fsck_dirent_block_sound(const uint8_t *blk, const cetrafs_superblock_t *sb, int first_block,
+                                   uint64_t self_ino)
+{
+    cetrafs_dirent_tail_t tail;
+
+    memcpy(&tail, blk + CETRAFS_DIRENT_TAIL_OFF, sizeof(tail));
+    if (cetrafs_le32(tail.magic) != CETRAFS_DIRENT_TAIL_MAGIC)
+        return 0;
+    if (cetrafs_le32(tail.crc) != crc32c_update(0, blk, CETRAFS_DIRENT_TAIL_OFF))
+        return 0;
+    if (!cetrafs_blk_struct_ok(blk, CETRAFS_DIRENT_TAIL_MAGIC))
+        return 0;
+    return fsck_dirent_block_coherent(blk, sb, first_block, self_ino);
+}
+
 /* Claim a free inode number in the in-memory bitmap the namespace pass
  * holds, AND on the device, before the caller writes the record or any
  * dirent naming it. It used to wait for the one write-back at the end
@@ -905,6 +926,16 @@ static int fsck_dir_link(int fd,
         if (fsck_dir_block(&dir, n, cetrafs_le64(sb->total_blocks), &lba))
             return -1;
         pread_all(fd, blk, sizeof(blk), (off_t) lba * CETRAFS_BLOCK_SIZE);
+        /* Restamping makes a block VALID, whatever it held: a block that
+         * is not sound now is never written into, or its damage would be
+         * certified as intact (audit 2026-11-14 U6). */
+        if (!fsck_dirent_block_sound(blk, sb, n == 0, dir_ino)) {
+            fprintf(stderr,
+                    "WARN: directory inode %" PRIu64 " block %" PRIu64
+                    " is not sound, so no name was written into it\n",
+                    dir_ino, lba);
+            continue;
+        }
         de = (cetrafs_dirent_t *) blk;
         for (unsigned k = 0; k < CETRAFS_DIRENTS_PER_BLOCK; ++k) {
             if (de[k].inode)
