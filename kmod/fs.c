@@ -295,10 +295,13 @@ struct cetrafs_sb_info {
      * creates in different directories loses one of them. Nothing
      * *decides* on this value -- allocation scans the bitmap and returns
      * -ENOSPC on its own -- so a drift is a lying `df -i` rather than
-     * corruption, but it is a lost update either way and it never
-     * self-corrects: the count is seeded by one scan at mount and only
-     * adjusted from then on. */
+     * corruption. It is adjusted by THIS node's creates and unlinks only,
+     * so a peer's allocations never reach it: cetrafs_sb_get_free_inodes()
+     * recounts the bitmap, fresh, when the value is older than
+     * CETRAFS_FREE_INODES_RECOUNT_JIFFIES, and sets it from the count
+     * (audit O9). */
     atomic64_t free_inodes;
+    unsigned long free_inodes_next; /* jiffies: the next recount is due at or after this */
 
     /* This node's own Node Registry row index, found/claimed by
      * cetrafs_node_register() at mount time. Needed by
@@ -4144,13 +4147,56 @@ int cetrafs_sb_adjust_free_inodes(struct super_block *sb, s64 delta)
     return 0;
 }
 
-/* Read back the cached free-inode count, for statfs. */
+/*
+ * How often statfs recounts the inode bitmap. A recount reads every inode
+ * bitmap block, so it is not done per call (pvestatd polls every ~10 s).
+ */
+#define CETRAFS_FREE_INODES_RECOUNT_JIFFIES (10 * HZ)
+
+/*
+ * Recount the free inodes from the bitmap as the device has it. The
+ * blocks are dropped first (clean ones only, as cetrafs_invalidate_block()
+ * always does): a cached copy is what a peer's allocations leave behind.
+ */
+static int cetrafs_sb_recount_free_inodes(struct super_block *sb, u64 *out)
+{
+    const cetrafs_superblock_t *raw_sb = cetrafs_sb_raw(sb);
+    u64 bmap, nblocks, i;
+
+    if (!raw_sb)
+        return -EINVAL;
+    bmap = le64_to_cpu(raw_sb->inode_bmap_start);
+    nblocks = le64_to_cpu(raw_sb->inode_bmap_blocks);
+    for (i = 0; i < nblocks; i++)
+        cetrafs_invalidate_block(sb, bmap + i);
+    return cetrafs_count_free_inodes(sb, out);
+}
+
+/*
+ * Read the free-inode count, for statfs. Recounted from the bitmap when
+ * due (audit O9): a peer's creates and unlinks never reached this node's
+ * own adjustments, so the count drifted without bound. A failed recount
+ * reports the cached value rather than failing statfs.
+ *
+ * A recount can overlap this node's own in-flight create or unlink (the
+ * bitmap bit is set before the adjustment lands), so the value can be off
+ * by those few operations until the next recount. That is a lying df for
+ * a moment, never an allocation decision, and it does not accumulate.
+ */
 int cetrafs_sb_get_free_inodes(struct super_block *sb, u64 *out)
 {
     struct cetrafs_sb_info *sbi = sb->s_fs_info;
 
     if (!sbi)
         return -EINVAL;
+    if (time_after_eq(jiffies, READ_ONCE(sbi->free_inodes_next))) {
+        u64 n = 0;
+
+        if (!cetrafs_sb_recount_free_inodes(sb, &n)) {
+            atomic64_set(&sbi->free_inodes, (s64) n);
+            WRITE_ONCE(sbi->free_inodes_next, jiffies + CETRAFS_FREE_INODES_RECOUNT_JIFFIES);
+        }
+    }
     *out = (u64) atomic64_read(&sbi->free_inodes);
     return 0;
 }
