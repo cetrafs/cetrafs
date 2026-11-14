@@ -679,6 +679,38 @@ static const uint64_t *fsck_g_bg_desc_lba;
  * count checks ran earlier in the pass, so a block taken now without this
  * left both one high on disk and the next run reporting it (audit
  * 2026-11-06 L10, its sibling). */
+/*
+ * Before fsck writes a block into Block Group b: may it, and what must it
+ * first say? A group marked DISCARD_PENDING has an UNMAP outstanding that
+ * may still land on its blocks, so a block put there now can lose its
+ * data to it -- refused (returns 1). A group marked DISCARDED is trimmed
+ * and empty; the kernel's claim clears the mark before it hands out a
+ * block, and fsck does the same so no group holding data says it was
+ * discarded (audit 2026-11-14 U7). Returns 0 when the group may be
+ * written, after clearing the mark, -1 on an I/O error.
+ */
+static int fsck_bg_claim_for_write(int fd, uint32_t b)
+{
+    uint8_t blk[CETRAFS_BLOCK_SIZE];
+    cetrafs_block_group_t bgd;
+    uint16_t flags;
+
+    pread_all(fd, blk, sizeof(blk), (off_t) fsck_g_bg_desc_lba[b] * CETRAFS_BLOCK_SIZE);
+    memcpy(&bgd, blk, sizeof(bgd));
+    flags = cetrafs_le16(bgd.flags);
+    if (flags & CETRAFS_BG_FLAG_DISCARD_PENDING)
+        return 1;
+    if (!(flags & CETRAFS_BG_FLAG_DISCARDED))
+        return 0;
+    bgd.flags = cetrafs_cpu_to_le16(flags & ~CETRAFS_BG_FLAG_DISCARDED);
+    bgd.checksum = 0;
+    bgd.checksum = cetrafs_cpu_to_le64(
+        crc32c_struct(&bgd, sizeof(bgd), offsetof(cetrafs_block_group_t, checksum), sizeof(bgd.checksum)));
+    memcpy(blk, &bgd, sizeof(bgd));
+    pwrite_all(fd, blk, sizeof(blk), (off_t) fsck_g_bg_desc_lba[b] * CETRAFS_BLOCK_SIZE);
+    return 0;
+}
+
 static void fsck_adjust_bg_counts(int fd, uint32_t b, int credit)
 {
     const cetrafs_superblock_t *sb = fsck_g_sb;
@@ -750,6 +782,11 @@ static int fsck_alloc_block(int fd,
         for (uint64_t i = 0; i < bg_data_cnt[b]; ++i) {
             if (bmap[i / 8] & (1u << (i % 8)))
                 continue;
+            /* Its flags first: a group with an UNMAP outstanding takes
+             * no block, and one marked discarded is marked as holding
+             * data again before it does (fsck_bg_claim_for_write()). */
+            if (fsck_bg_claim_for_write(fd, b) == 1)
+                break;
             bmap[i / 8] |= (uint8_t) (1u << (i % 8));
             pwrite_all(fd, bmap, (size_t) bmap_blocks * CETRAFS_BLOCK_SIZE,
                        (off_t) bg_bmap_lba[b] * CETRAFS_BLOCK_SIZE);
