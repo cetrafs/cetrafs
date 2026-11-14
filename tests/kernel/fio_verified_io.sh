@@ -152,8 +152,10 @@ fi
 
 # Where the device holds file offset 0, for the negative control. Taken
 # while mounted, from the same filefrag the fsck-side tooling uses; -b1
-# makes the physical column bytes.
-PHYS="$(filefrag -v -b1 "$F" | awk '$1 == "0:" { x = $4; sub(/\.\.$/, "", x); print x; exit }')" || true
+# makes the physical column bytes. The columns are matched by regex, not by
+# field number: filefrag glues a wide logical range to its colon ("0..67108863:")
+# and that shifts every later field, so a field index parses some runs and not others.
+PHYS="$(filefrag -v -b1 "$F" | sed -n 's/^ *0: *0\.\.[ ]*[0-9]*: *\([0-9]*\)\.\..*/\1/p' | head -1)" || true
 case "$PHYS" in
 '' | *[!0-9]*) fail "setup: could not find the device offset of file offset 0 -- the negative control cannot run" ;;
 *) pass "file offset 0 lives at device byte $PHYS" ;;
