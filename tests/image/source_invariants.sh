@@ -1026,6 +1026,75 @@ N52="$(cat "$K"/*.c | grep -c 'class 52:' || true)"
 [ -z "$C52" ] && pass "class 52: every take of an accrued delta names its flight, and only the settles read it" ||
     fail "class 52: $(echo "$C52" | tr '\n' ';')"
 
+# Class 55: a dirty mark cleared as the CLAIM to write what it marks.
+# A second caller that finds it clear while the first's write is still
+# out reads "nothing to do" and goes on -- and if it then publishes on
+# that, the publish can reach the device ahead of what it refers to
+# (audit 2026-11-14 A1: two bitmap flushes, one fsync's extents
+# published over bits still in flight). Every clear of a *dirty mark
+# carries a "class 55:" comment within 6 lines above, naming what a
+# second caller who finds it clear waits on, or why none needs to.
+log "checking every dirty mark cleared before its write names what a second caller waits on (class 55)"
+c55_scan() { # <dir>: file:line of each unargued clear
+    local f
+    for f in "$1"/*.c; do
+        awk -v F="$(basename "$f")" '
+            BEGIN { last = -100 }
+            /class 55:/ { last = NR }
+            /(test_and_clear_bit|clear_bit)\([^)]*dirty|[a-z_>.]+_dirty = false/ && !/test knob/ && !/\*out_/ &&
+                NR - last > 6 { print F ":" NR ": " $0 }' "$f"
+    done
+}
+C55P="$(mktemp -d)"
+cat >"$C55P/planted.c" <<'EOF'
+bool take(struct cetrafs_bg_chunk *c, u32 i)
+{
+    return test_and_clear_bit(i, c->bmap_alloc_dirty);
+}
+
+void done(struct cetrafs_inode_info *ci)
+{
+    ci->fd_dirty = false;
+}
+EOF
+C55N="$(c55_scan "$C55P" | wc -l)"
+rm -rf "$C55P"
+[ "$C55N" = 2 ] && pass "class 55: control -- a planted take and a planted clear are found" ||
+    fail "class 55: control -- the planted clears gave $C55N findings, want 2"
+N55="$(cat "$K"/*.c | grep -c 'class 55:' || true)"
+[ "$N55" -ge 8 ] || fail "class 55: found $N55 annotations -- the check sees nothing"
+C55="$(c55_scan "$K")"
+[ -z "$C55" ] && pass "class 55: every dirty mark cleared names what a second caller finding it clear waits on" ||
+    fail "class 55: $(echo "$C55" | tr '\n' ';')"
+
+# Class 57: a tool reading what a peer on another host writes, through
+# this host's page cache. The kernel writes the Node Registry with its
+# own I/O and a peer host never touches our cache, so a buffered re-read
+# returns the first read forever (audit 2026-11-14 U1: the repair
+# claim's heartbeat watch; its sibling, growfs's node-readiness scan).
+# Every tool function that reads registry rows drops this host's copy
+# in the same function, or is listed with why its callers do.
+log "checking every tool read of the Node Registry drops this host's cached copy (class 57)"
+# cetrafs_repair_row_read: its two callers drop the whole registry
+# before each pass (cetrafs_repair_watch_arm(), the beat check).
+C57_OK="cetrafs_repair_row_read"
+C57_SCAN="$CT_TESTS/image/c57_scan.py"
+C57P="$(mktemp -d)"
+cat >"$C57P/planted.h" <<'EOF'
+static inline int cached_row(int fd, const cetrafs_superblock_t *sb, uint32_t idx, cetrafs_node_entry_t *ne)
+{
+    /* posix_fadvise in a comment is not a drop */
+    return pread(fd, ne, sizeof(*ne), cetrafs_node_row_off(sb, idx)) == (ssize_t) sizeof(*ne);
+}
+EOF
+C57N="$(python3 "$C57_SCAN" "$C57_OK" "$C57P/planted.h" | wc -l)"
+rm -rf "$C57P"
+[ "$C57N" = 1 ] && pass "class 57: control -- a planted cached registry read is found" ||
+    fail "class 57: control -- the planted read gave $C57N findings, want 1"
+C57="$(python3 "$C57_SCAN" "$C57_OK" "$ROOT"/userspace/*.h "$ROOT"/userspace/*.c)"
+[ -z "$C57" ] && pass "class 57: every tool read of registry rows drops this host's cached copy" ||
+    fail "class 57: reads the registry through the cache: $(echo $C57)"
+
 # Class 27: a cached leaf, index or xattr block is edited IN PLACE by
 # several stores, and a cached read checks no checksum -- so a reader of
 # its b_data on THIS node needs lock_buffer (or the update / snapshot

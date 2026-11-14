@@ -1263,6 +1263,8 @@ void cetrafs_inode_fd_published(struct inode *inode, u64 seq)
     struct cetrafs_inode_info *ci = CETRAFS_I(inode);
 
     spin_lock(&ci->fd_lock);
+    /* class 55: cleared after the publish landed, and only if nothing
+     * was staged since. */
     if (ci->fd_seq == seq)
         ci->fd_dirty = false;
     spin_unlock(&ci->fd_lock);
@@ -1308,6 +1310,8 @@ void cetrafs_inode_fd_fold(struct inode *inode, cetrafs_inode_t *raw)
     struct cetrafs_inode_info *ci = CETRAFS_I(inode);
 
     spin_lock(&ci->fd_lock);
+    /* class 55: evict is the only caller (super_ops.c), the record's
+     * last actor -- nobody else asks the mark after it. */
     if (ci->fd_dirty)
         cetrafs_inode_fd_copy(raw, &ci->fd_shadow);
     ci->fd_dirty = false;
@@ -1416,6 +1420,7 @@ static void cetrafs_inode_identity_init_ci(struct cetrafs_inode_info *ci)
 {
     WARN_ON_ONCE(ci->tree_resv_n);
     ci->tree_resv_n = 0;
+    /* class 55: a fresh in-core object -- no write stands behind it. */
     ci->fd_dirty = false;
     ci->fd_seq = 0;
     ci->resv_next = 0;

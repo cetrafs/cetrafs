@@ -6413,6 +6413,10 @@ bool cetrafs_sb_take_bmap_alloc_dirty(struct super_block *sb, u32 bg_id)
     u32 i;
 
     c = cetrafs_bgc(sbi, bg_id, &i);
+    /* class 55: a flusher that finds this mark clear while another's
+     * bitmap write is out must not publish on it: flushes run one at a
+     * time and the per-block gate enters while one is in flight
+     * (cetrafs_alloc_flush_bitmaps(), audit A1). */
     return c ? test_and_clear_bit(i, c->bmap_alloc_dirty) : false;
 }
 
@@ -6749,6 +6753,8 @@ s64 cetrafs_sb_set_bg_epoch(struct super_block *sb, u32 bg_id, u64 seq)
      * another owner's recount, whose count -- already read fresh into
      * the cache -- holds every durable effect of what is dropped. */
     stale = atomic64_xchg(&c->bg_free_delta[i], 0);
+    /* class 55: nothing is written behind this mark -- the delta it
+     * stood for is dropped here, not flushed. */
     clear_bit(i, c->bg_free_dirty);
     if (stale)
         pr_warn("BG %u: dropping an accrued free delta of %lld -- the count was recounted (epoch %llu -> %llu)\n", bg_id,
@@ -7299,6 +7305,10 @@ int cetrafs_flush_dirty_free_counts(struct super_block *sb)
         int rc;
 
         c = cetrafs_bgc(sbi, bg_id, &i);
+        /* class 55: a second flusher finding this clear returns before
+         * the CAS below lands, and nothing is published on that premise:
+         * the counts are caches recounted at every claim (rule 8 is about
+         * the bitmap), and readers take the value in flight (class 52). */
         clear_bit(i, c->bg_free_dirty);
         if (!atomic64_read(&c->bg_free_delta[i]))
             continue;

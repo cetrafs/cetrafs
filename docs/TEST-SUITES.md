@@ -26,7 +26,7 @@ make check
 ```
 
 That is the gate. It runs every suite under `tests/image/` and
-`tests/kernel/` -- **590 suites, about 4,400 individual assertions** --
+`tests/kernel/` -- **659 suites, about 4,400 individual assertions** --
 against a loop-backed volume, and exits nonzero if any assertion fails
 OR if any suite aborts without failing one. Nothing ships on a red gate.
 
@@ -57,7 +57,7 @@ df -Pm /                                       # confirm the floor
 
 ### `tests/image/` -- the tools, with no kernel involved
 
-58 suites. No module is loaded and nothing is mounted: `mkfs.cetra`
+61 suites. No module is loaded and nothing is mounted: `mkfs.cetra`
 writes the structures, a poke helper corrupts exactly one of them, and
 `fsck.cetra` must report *that* fault and exit nonzero.
 
@@ -75,7 +75,7 @@ unbounded is still the bug.
 
 ### `tests/kernel/` -- the regression suite proper
 
-590 suites, one concern each, against a loaded module and a real mount.
+598 suites, one concern each, against a loaded module and a real mount.
 Roughly by area:
 
 | area | what it covers |

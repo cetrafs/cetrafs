@@ -780,6 +780,7 @@ int cetrafs_journal_attach_node(struct super_block *sb, u32 node_id)
             return ret;
     }
 
+    /* class 55: replay runs before any writer of this journal exists. */
     j->flag_dirty = false; /* replay always ends with the flag clean */
     j->next_txn_id = 0;
     {
@@ -1957,6 +1958,7 @@ void cetrafs_journal_shutdown(struct super_block *sb)
     if (j->flag_dirty) {
         if (!bitmap_empty(j->busy, j->slots))
             pr_err("journal: shutdown with in-flight slots still busy -- leaving flag dirty\n");
+        /* class 55: cleared after the write landed, under j->lock. */
         else if (cetrafs_journal_write_flag(sb, j, false) == 0)
             j->flag_dirty = false;
     }
