@@ -1044,6 +1044,24 @@ struct cetrafs_defrag {
 
 /* Requests that found their inode number reused by another file. */
 static atomic64_t cetrafs_defrag_stale_reqs = ATOMIC64_INIT(0);
+/* Background passes started, and those a growing file cancelled. */
+static atomic64_t cetrafs_defrag_passes = ATOMIC64_INIT(0);
+static atomic64_t cetrafs_defrag_growth_cancels = ATOMIC64_INIT(0);
+u64 cetrafs_defrag_pass_count(void)
+{
+    return (u64) atomic64_read(&cetrafs_defrag_passes);
+}
+u64 cetrafs_defrag_growth_cancel_count(void)
+{
+    return (u64) atomic64_read(&cetrafs_defrag_growth_cancels);
+}
+
+/* TEST ONLY: a pass a growing file cancelled is requeued at once and
+ * leaves the append trigger armed, as before audit 2026-11-14 M2 -- the
+ * control of tests/kernel/defrag_growth_backoff.sh. */
+static bool cetrafs_defrag_growth_requeue;
+cetrafs_test_param(defrag_growth_requeue, cetrafs_defrag_growth_requeue, bool, 0644);
+MODULE_PARM_DESC(defrag_growth_requeue, "TEST ONLY: requeue a growth-cancelled defrag at once");
 u64 cetrafs_defrag_stale_req_count(void)
 {
     return (u64) atomic64_read(&cetrafs_defrag_stale_reqs);
@@ -1107,8 +1125,23 @@ static void cetrafs_defrag_worker(struct work_struct *work)
         ret = cetrafs_lock_defrag_begin(inode);
         if (ret == 0) {
             struct cetrafs_defrag_stats stats = {0};
+            loff_t size0 = i_size_read(inode);
+            bool grew;
 
+            atomic64_inc(&cetrafs_defrag_passes);
             ret = cetrafs_defrag_inode(inode, &stats);
+            /* Cancelled because the file grew under the move: a backup
+             * archive or a qcow2 still being written. Every pass then
+             * allocated a full-size run, moved a step, freed it and was
+             * queued again at once -- by its own hand-back below, or by
+             * the append trigger, which a cancel left armed (audit
+             * 2026-11-14 M2). Quiet the append trigger as for a decline;
+             * the hand-back below waits for the writer's last close. */
+            grew = ret == -ECANCELED && i_size_read(inode) != size0 && !READ_ONCE(cetrafs_defrag_growth_requeue);
+            if (grew) {
+                atomic64_inc(&cetrafs_defrag_growth_cancels);
+                cetrafs_lock_defrag_quiet_for(inode, cetrafs_auto_defrag_quiet_secs);
+            }
             /* Declined: it would be declined again. Keep the append
              * trigger quiet for a while (cetrafs_lock_defrag_quiet()). */
             if (ret == -EOPNOTSUPP || ret == -ENOSPC || ret == -EAGAIN)
@@ -1165,8 +1198,12 @@ static void cetrafs_defrag_worker(struct work_struct *work)
              * gone; consider()'s own thresholds filter, and a writer
              * that is still active just repeats this handoff until its
              * real last close takes the normal path.
+             *
+             * After a growth cancel that writer is still here, so there
+             * is nothing to hand back yet: its last close re-judges the
+             * file. Requeueing now only restarts the move it outran.
              */
-            if (ret == -ECANCELED) {
+            if (ret == -ECANCELED && !(grew && cetrafs_lock_has_local_writer(inode))) {
                 cetrafs_inode_t rr;
 
                 if (cetrafs_read_raw_inode_overlaid(sb, inode, &rr) == 0 &&

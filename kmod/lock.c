@@ -6105,6 +6105,13 @@ bool cetrafs_lock_defrag_quiet(struct inode *inode)
     return time_before(jiffies, READ_ONCE(CETRAFS_I(inode)->defrag_quiet_until));
 }
 
+/* Is the file open for write on this node right now? Its last close
+ * then takes the normal path, janitor trigger included. */
+bool cetrafs_lock_has_local_writer(struct inode *inode)
+{
+    return atomic_read(&CETRAFS_I(inode)->lock_writer_count) > 0;
+}
+
 /*
  * Does a LIVE node other than us currently hold 'ino' open for read?
  *
