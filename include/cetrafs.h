@@ -1006,7 +1006,7 @@ typedef struct {
 
 /* A repair claim that BORROWED a registered row (no FREE row was left)
  * keeps the row it displaced in its own block, at this byte offset --
- * right after the 128-byte entry, inside the first 512-byte sector, so
+ * right after the 144-byte entry, inside the first 512-byte sector, so
  * the one compare-and-write that lands the claim lands the saved copy
  * with it (format 0x000A). It used to sit at 2048, outside the swap, and
  * was written first: two repairers racing for one row could have the
@@ -1017,7 +1017,7 @@ typedef struct {
  * row is reaped to FREE. Zero on a volume mkfs wrote, on every claim
  * that took a FREE row, and on every row a node writes (a node's own
  * swaps clear the rest of the sector). */
-#define CETRAFS_REPAIR_SAVED_OFF 128
+#define CETRAFS_REPAIR_SAVED_OFF 144
 
 /* Hard cap on registry rows, set by cetrafs_inode_t.read_open_nodes being
  * a 64-bit presence mask. Enforced by mkfs on -M, so the mask can never
@@ -1163,15 +1163,32 @@ typedef struct {
      * for the dead incarnation's claim and the live one's (F10). */
     __le32  incarnation;
 
+    /* Who last fenced this row, why, and when (format 0x000A). A fence
+     * that revokes this row's lease stamps all three in the same
+     * compare-and-write that moves fence_epoch, so the victim can say whose
+     * verdict revoked it, and the record outlives the victim's log.
+     * fence_reason CETRAFS_FENCE_NONE means never fenced: fenced_by and
+     * fenced_at are then not read. fenced_by is CETRAFS_NODE_ID_NONE when
+     * the fencer had no row yet (a mount gate that fences before its own
+     * registration). */
+    __le32  fenced_by;            /* registry row index of the fencer */
+    __le32  fence_reason;         /* CETRAFS_FENCE_* */
+    __le64  fenced_at;            /* unix seconds of that fence */
+
     u8   reserved[12];
-} CETRA_PACKED cetrafs_node_entry_t; /* 128 bytes */
+} CETRA_PACKED cetrafs_node_entry_t; /* 144 bytes */
+
+/* cetrafs_node_entry_t.fence_reason values. */
+#define CETRAFS_FENCE_NONE        0 /* never fenced since the row was written */
+#define CETRAFS_FENCE_RECLAIM     1 /* a peer reclaimed something this node held: a lock, a Zone Group, a journal, a namespace lock */
+#define CETRAFS_FENCE_NOCAW_MOUNT 2 /* a mount on a device without atomic CAW watched this row go stale and fenced it */
 
 /* cetrafs_node_entry_t.departure values. */
 #define CETRAFS_NODE_DEPART_NONE  0 /* mounted, or crashed with no verdict yet */
 #define CETRAFS_NODE_DEPART_CLEAN 1 /* unmounted and said so: nothing to sweep */
 #define CETRAFS_NODE_DEPART_DEAD  2 /* declared dead by a peer that watched it: claims remain */
 
-typedef char cetrafs_node_entry_is_128[(sizeof(cetrafs_node_entry_t) == 128) ? 1 : -1];
+typedef char cetrafs_node_entry_is_144[(sizeof(cetrafs_node_entry_t) == 144) ? 1 : -1];
 /* The saved copy sits after the entry and inside the smallest CAS unit. */
 typedef char cetrafs_repair_saved_in_cas_sector[(CETRAFS_REPAIR_SAVED_OFF >= sizeof(cetrafs_node_entry_t) &&
                                                  CETRAFS_REPAIR_SAVED_OFF + sizeof(cetrafs_node_entry_t) <= 512)

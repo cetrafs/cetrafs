@@ -421,7 +421,84 @@ struct cetrafs_node_fence_ctx {
     struct cetrafs_row_mark mark;
     bool reattached;                /* out: refused, the row's owner came back */
     struct cetrafs_row_mark landed; /* out: the row as the fence committed it */
+    u32 fencer;                     /* the row doing the fencing, or CETRAFS_NODE_ID_NONE */
+    u32 reason;                     /* CETRAFS_FENCE_*, stamped into the victim's row */
+    char victim_label[CETRAFS_NODE_LABEL_LEN]; /* out: the victim's label as read by the fence */
 };
+
+/* TEST ONLY: the fence bumps the epoch and nothing else -- the row keeps
+ * no trace of who fenced it (fence_trace.sh's negative control). */
+static bool cetrafs_fence_trace_off;
+cetrafs_test_param(fence_trace_off, cetrafs_fence_trace_off, bool, 0644);
+MODULE_PARM_DESC(fence_trace_off, "TEST ONLY: a fence stamps no fenced_by, reason or time into the victim's row");
+
+static const char *cetrafs_fence_reason_name(u32 r)
+{
+    switch (r) {
+    case CETRAFS_FENCE_NONE:
+        return "none";
+    case CETRAFS_FENCE_RECLAIM:
+        return "reclaim";
+    case CETRAFS_FENCE_NOCAW_MOUNT:
+        return "mount watch (no atomic CAW)";
+    default:
+        return "unknown";
+    }
+}
+
+/* Row idx's label, read fresh, for a log line: "row N (label L)", or
+ * "none" for no row. The label is informational; it is the operator's
+ * host name, not an identity (the row index is). */
+static void cetrafs_node_who(struct super_block *sb, u32 idx, char *out, size_t sz)
+{
+    cetrafs_node_entry_t ne;
+
+    if (idx == CETRAFS_NODE_ID_NONE) {
+        snprintf(out, sz, "none (fenced before this node had a row)");
+        return;
+    }
+    if (cetrafs_node_get_entry(sb, idx, &ne)) {
+        snprintf(out, sz, "%u (label unreadable)", idx);
+        return;
+    }
+    snprintf(out, sz, "%u (label %.*s)", idx, (int) sizeof(ne.label), ne.label);
+}
+
+/* The fencer's log. The first sentence is the one suites grep for; the
+ * rest names both rows and both labels (audit O8). */
+static void cetrafs_node_log_fence(struct super_block *sb, u32 victim, const char *victim_label, u32 fencer,
+                                   u32 reason, u64 epoch, const char *what)
+{
+    char who[96];
+
+    cetrafs_node_who(sb, fencer, who, sizeof(who));
+    pr_info("fence: revoked stale node %u's lease (epoch %llu) while reclaiming %s -- victim row %u (label %.*s), "
+            "fenced by row %s, reason %s\n",
+            victim, (unsigned long long) epoch, what, victim, (int) CETRAFS_NODE_LABEL_LEN, victim_label, who,
+            cetrafs_fence_reason_name(reason));
+}
+
+/* The victim's log, from its own row: who revoked this node's lease, and
+ * why. Read fresh; the fencer's label is read from the fencer's row. */
+void cetrafs_node_log_fencer(struct super_block *sb, u32 my_node_id)
+{
+    cetrafs_node_entry_t ne;
+    char who[96];
+
+    if (cetrafs_node_get_entry(sb, my_node_id, &ne)) {
+        pr_err("this node's lease was revoked, and its own row cannot be read to say by whom\n");
+        return;
+    }
+    if (cetrafs_le32(ne.fence_reason) == CETRAFS_FENCE_NONE) {
+        pr_err("this node's lease was revoked, but its row records no fence (fence_epoch %llu)\n",
+               (unsigned long long) cetrafs_le64(ne.fence_epoch));
+        return;
+    }
+    cetrafs_node_who(sb, cetrafs_le32(ne.fenced_by), who, sizeof(who));
+    pr_err("this node's lease was revoked: fenced by row %s, reason %s, at %llu -- stopping writes\n", who,
+           cetrafs_fence_reason_name(cetrafs_le32(ne.fence_reason)),
+           (unsigned long long) cetrafs_le64(ne.fenced_at));
+}
 
 static int cetrafs_node_fence_mutate(void *image, unsigned int len, void *priv)
 {
@@ -462,6 +539,15 @@ static int cetrafs_node_fence_mutate(void *image, unsigned int len, void *priv)
     ne.fence_epoch = cetrafs_cpu_to_le64(cetrafs_le64(ne.fence_epoch) + 1);
     ctx->seen_epoch = cetrafs_le64(ne.fence_epoch);
     cetrafs_row_mark_of(&ctx->landed, &ne); /* the fence moves neither hb_seq nor the incarnation */
+    /* Who fenced it, why and when, in the same write (audit O8): the victim
+     * reads its own row to say so, and the row keeps it after the fencer's
+     * log has scrolled away. */
+    if (!READ_ONCE(cetrafs_fence_trace_off)) {
+        ne.fenced_by = cetrafs_cpu_to_le32(ctx->fencer);
+        ne.fence_reason = cetrafs_cpu_to_le32(ctx->reason);
+        ne.fenced_at = cetrafs_cpu_to_le64((u64) ktime_get_real_seconds());
+    }
+    memcpy(ctx->victim_label, ne.label, sizeof(ctx->victim_label));
     /* Record the verdict as well as revoking the lease: departure = DEAD
      * means the next observer costs one block read instead of another
      * full watch window. Only the mount gate asks for this, because only
@@ -573,15 +659,21 @@ MODULE_PARM_DESC(fence_peer_fail, "TEST ONLY: revoking a stale peer's lease fail
  */
 /* 'judged': the row the caller itself watched stand still, when it has
  * one (the no-CAW mount gate); NULL takes the peer watch's. */
-static int cetrafs_node_fence_peer_full(struct super_block *sb, u32 node_id, const char *what, bool mark_departed,
-                                        bool check_verdict, const struct cetrafs_row_mark *judged)
+static int cetrafs_node_fence_peer_full(struct super_block *sb, u32 node_id, const char *what, u32 reason,
+                                        bool mark_departed, bool check_verdict,
+                                        const struct cetrafs_row_mark *judged)
 {
-    struct cetrafs_node_fence_ctx ctx = {.mark_departed = mark_departed, .check_verdict = check_verdict};
+    struct cetrafs_node_fence_ctx ctx = {.mark_departed = mark_departed, .check_verdict = check_verdict,
+                                         .fencer = CETRAFS_NODE_ID_NONE, .reason = reason};
     const cetrafs_superblock_t *raw_sb = cetrafs_sb_raw(sb);
     int ret;
 
     if (!raw_sb)
         return -EINVAL;
+    /* A mount gate fences before this node has a row: it is then no fencer
+     * row at all, and the victim's row says so (CETRAFS_NODE_ID_NONE). */
+    if (cetrafs_sb_node_registered(sb))
+        (void) cetrafs_sb_get_node_id(sb, &ctx.fencer);
     /* An id past the registry was never handed out (cetrafs_node_is_stale()
      * already calls it stale): there is no lease to revoke, and nothing
      * that could still be using what it names. Refusing here made every
@@ -612,8 +704,7 @@ static int cetrafs_node_fence_peer_full(struct super_block *sb, u32 node_id, con
         return ret;
     }
     if (ctx.seen_epoch) {
-        pr_info("fence: revoked stale node %u's lease (epoch %llu) while reclaiming %s\n", node_id,
-                (unsigned long long) ctx.seen_epoch, what);
+        cetrafs_node_log_fence(sb, node_id, ctx.victim_label, ctx.fencer, ctx.reason, ctx.seen_epoch, what);
         cetrafs_sb_peer_note_fenced(sb, node_id, &ctx.landed);
         /* And close its journal session, so a DIRTY flip or an entry it
          * had queued past the fence is from before a park (M10). Not
@@ -721,7 +812,7 @@ int cetrafs_node_fence_peer(struct super_block *sb, u32 node_id, const char *wha
             msleep(stall); /* TEST ONLY: see the parameter */
     }
     {
-        int ret = cetrafs_node_fence_peer_full(sb, node_id, what, false, true, NULL);
+        int ret = cetrafs_node_fence_peer_full(sb, node_id, what, CETRAFS_FENCE_RECLAIM, false, true, NULL);
         unsigned int stall = ret ? 0 : xchg(&cetrafs_reclaim_stall_after_fence_ms, 0);
 
         if (stall)
@@ -1068,8 +1159,8 @@ int cetrafs_node_register(struct super_block *sb,
             if (cetrafs_register_twin_race) /* test knob, see its MODULE_PARM_DESC */
                 (void) cetrafs_cas_record(sb, cetrafs_node_row_lba(sb, idx), cetrafs_node_test_beat_mutate, NULL);
             if (cetrafs_reattach_race_bump) /* test knob, see its MODULE_PARM_DESC */
-                (void) cetrafs_node_fence_peer_full(sb, idx, "a test-forced concurrent reclaim (reattach_race_bump)", false, false,
-                                                    NULL);
+                (void) cetrafs_node_fence_peer_full(sb, idx, "a test-forced concurrent reclaim (reattach_race_bump)",
+                                                    CETRAFS_FENCE_RECLAIM, false, false, NULL);
 
             /* The take-back is a CAS, never a blind write of the row read
              * above -- see cetrafs_node_reattach_mutate() for the fence
@@ -1962,8 +2053,8 @@ int cetrafs_node_live_peer_exists(struct super_block *sb, const u8 *my_uuid, boo
                 msleep(READ_ONCE(cetrafs_nocaw_fence_stall_ms)); /* TEST ONLY */
             fret = READ_ONCE(cetrafs_nocaw_gate_fence_fail)
                        ? -EIO
-                       : cetrafs_node_fence_peer_full(sb, idx, "this volume (no atomic CAW: one mounter only)", true,
-                                                      true, &judged);
+                       : cetrafs_node_fence_peer_full(sb, idx, "this volume (no atomic CAW: one mounter only)",
+                                                      CETRAFS_FENCE_NOCAW_MOUNT, true, true, &judged);
             if (fret == -EBUSY) {
                 pr_err("node %u came back while this mount watched it -- it is alive and mounted on this volume\n",
                        idx);

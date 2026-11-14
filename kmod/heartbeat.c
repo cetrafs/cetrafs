@@ -276,6 +276,7 @@ static void cetrafs_heartbeat_tick(struct work_struct *work)
         bool fenced = false;
 
         if (cetrafs_node_self_fence_check(sb, my_node_id, &fenced) == 0 && fenced) {
+            cetrafs_node_log_fencer(sb, my_node_id);
             cetrafs_sb_fence(sb, "our Node Registry lease was revoked by a peer");
             goto reschedule;
         }
@@ -309,6 +310,7 @@ static void cetrafs_heartbeat_tick(struct work_struct *work)
          * authoritative detection -- the check above races, since a peer
          * can revoke between it and here, whereas the renew tests and
          * renews in one compare-and-swap. */
+        cetrafs_node_log_fencer(sb, my_node_id);
         cetrafs_sb_fence(sb, "our Node Registry lease was revoked, found while renewing it");
         goto reschedule;
     }

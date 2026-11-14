@@ -4240,6 +4240,15 @@ int cetrafs_sb_get_free_inodes(struct super_block *sb, u64 *out)
     return 0;
 }
 
+/* Has this mount registered its own Node Registry row? A fence taken
+ * before that (the no-CAW mount gate) has no fencer row to name. */
+bool cetrafs_sb_node_registered(struct super_block *sb)
+{
+    struct cetrafs_sb_info *sbi = sb->s_fs_info;
+
+    return sbi && sbi->node_registered;
+}
+
 /* This node's own Node Registry row index, claimed at mount time by
  * cetrafs_node_register() -- needed by later phases (ZG claiming). */
 int cetrafs_sb_get_node_id(struct super_block *sb, u32 *out)

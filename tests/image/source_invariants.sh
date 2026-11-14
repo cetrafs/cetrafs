@@ -1281,6 +1281,7 @@ fs.c:cetrafs_sb_stamp_now no-mount-fallback
 fs.c:cetrafs_sb_record_damage informational-timestamp
 journal.c:cetrafs_journal_claim_mutate written-never-read
 node.c:cetrafs_node_claim_mutate informational-last_seen
+node.c:cetrafs_node_fence_mutate informational-fenced_at
 node.c:cetrafs_node_reattach_mutate informational-last_seen
 node.c:cetrafs_node_renew_mutate informational-last_seen
 node.c:cetrafs_node_test_beat_mutate informational-last_seen

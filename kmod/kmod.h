@@ -213,6 +213,7 @@ static inline bool cetrafs_lba_run_is_data(struct super_block *sb, u64 lba, u64 
 int cetrafs_sb_adjust_free_inodes(struct super_block *sb, s64 delta);
 int cetrafs_sb_get_free_inodes(struct super_block *sb, u64 *out);
 int cetrafs_sb_get_node_id(struct super_block *sb, u32 *out);
+bool cetrafs_sb_node_registered(struct super_block *sb);
 /*
  * What a watch of a registry row remembers: the beat, and WHO beat it.
  * hb_seq alone restarts at 1 when a row is registered afresh, so a
@@ -1133,6 +1134,7 @@ int __must_check cetrafs_node_fence_peer(struct super_block *sb, u32 node_id, co
 bool cetrafs_node_reattached_since_fence(struct super_block *sb, u32 node_id);
 void cetrafs_node_test_stall_before_swap(void);
 int cetrafs_node_self_fence_check(struct super_block *sb, u32 my_node_id, bool *out_fenced);
+void cetrafs_node_log_fencer(struct super_block *sb, u32 my_node_id);
 int cetrafs_node_get_entry(struct super_block *sb, u32 idx, cetrafs_node_entry_t *out);
 u64 cetrafs_node_row_lba(struct super_block *sb, u32 idx);
 

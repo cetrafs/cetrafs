@@ -122,7 +122,7 @@ deliberate — it makes a cross-node clobber of a block-mate record structurally
 impossible (a cross-node data-loss class that packed records suffered). The
 default inode count is 1 per 4 MiB, capped at 65536, so the 4 KiB stride does
 not bloat a large device; `-N` overrides. The Node Registry packs densely by
-contrast (128 bytes/row, many rows per block) — there are far fewer nodes than
+contrast (144 bytes/row, many rows per block) — there are far fewer nodes than
 inodes.
 
 ## On-disk structures
@@ -193,7 +193,7 @@ checksum.
 > without mutating existing ZG records. `owner_node_id` is left at `CETRAFS_NODE_ID_NONE` at
 > mkfs time; a real node claims it at runtime. Journals are per-node (below).
 
-### Node Registry — `cetrafs_node_entry_t` (128 bytes/entry, global table)
+### Node Registry — `cetrafs_node_entry_t` (144 bytes/entry, global table)
 
 Packed densely (many rows per block). Maps a node's stable 128-bit machine UUID
 to a compact row index — *that index*, not the UUID, is what `owner_node_id`
@@ -208,6 +208,7 @@ and the inode lock fields store elsewhere.
 | label[32] | informational hostname, NUL-terminated; not used for identity |
 | checksum | CRC32C over the row with this field zeroed |
 | fence_epoch | the node's lease: bumped by whoever reclaims this row's claims; the owner self-fences when it changes |
+| fenced_by, fence_reason, fenced_at | who last fenced this row (its registry row index, or `CETRAFS_NODE_ID_NONE` if the fencer had no row), why (`CETRAFS_FENCE_RECLAIM`, or `CETRAFS_FENCE_NOCAW_MOUNT` for the no-CAW mount watch; `NONE` = never fenced), and when (unix seconds). Stamped in the same compare-and-write that bumps `fence_epoch`, so the victim's log can name the fencer (format 0x000A) |
 | hb_interval_secs | this node's own tick rate, so a peer judges staleness against the rate the node actually beats at, not the observer's setting |
 | departure | why a REGISTERED row is not beating (0x000A): `NONE` (mounted, or crashed with no verdict yet -- observers watch hb_seq), `CLEAN` (the node unmounted and said so: peers reclaim at once, and it re-attaches with nothing to sweep), `DEAD` (a peer watched it stop and recorded the verdict while fencing it -- the no-CAW mount gate: nobody watches it again, and when it comes back it re-attaches as after a crash and sweeps its old claims). Registration and re-attach set `NONE`. These used to share one sentinel, `last_seen == 0`, and a node declared dead came back as if it had left cleanly (L3) |
 | incarnation | random, nonzero, drawn afresh at every registration and re-attach (0x000A): which mount of the node the row is now. Every claim the node stamps carries it beside the row number |

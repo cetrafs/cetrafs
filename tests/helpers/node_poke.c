@@ -120,10 +120,11 @@ int main(int argc, char **argv)
 
     if (dump_only) {
         printf("state=%u hb_seq=%" PRIu64 " last_seen=%" PRIu64 " fence_epoch=%" PRIu64 " hb_interval=%u caps=0x%x mode=%u "
-               "departure=%u incarnation=%u stale_secs=%u\n",
-               ne.state, ne.hb_seq, ne.last_seen, ne.fence_epoch, ne.hb_interval_secs, cetrafs_le32(ne.caps),
-               cetrafs_le32(ne.file_lock_mode), cetrafs_le32(ne.departure), cetrafs_le32(ne.incarnation),
-               cetrafs_le32(ne.stale_secs));
+               "departure=%u incarnation=%u stale_secs=%u fenced_by=%u fence_reason=%u fenced_at=%" PRIu64 "\n",
+               cetrafs_le32(ne.state), cetrafs_le64(ne.hb_seq), cetrafs_le64(ne.last_seen), cetrafs_le64(ne.fence_epoch),
+               cetrafs_le32(ne.hb_interval_secs), cetrafs_le32(ne.caps), cetrafs_le32(ne.file_lock_mode),
+               cetrafs_le32(ne.departure), cetrafs_le32(ne.incarnation), cetrafs_le32(ne.stale_secs),
+               cetrafs_le32(ne.fenced_by), cetrafs_le32(ne.fence_reason), cetrafs_le64(ne.fenced_at));
         close(fd);
         return 0;
     }
@@ -225,6 +226,23 @@ int main(int argc, char **argv)
         pwrite_all(fd, &ne, sizeof(ne), row_off);
         close(fd);
         printf("node_poke: row %u label set\n", row);
+        return 0;
+    }
+
+    /* --fence <by> <reason>: a peer's fence as the fencer writes it -- the
+     * epoch moves, and the row says who, why and when (fenced_by,
+     * fence_reason, fenced_at). Checksum restamped: the row is VALID. */
+    if (argc == 6 && strcmp(argv[3], "--fence") == 0) {
+        ne.fence_epoch = cetrafs_cpu_to_le64(cetrafs_le64(ne.fence_epoch) + 1);
+        ne.fenced_by = cetrafs_cpu_to_le32((uint32_t) strtoul(argv[4], NULL, 0));
+        ne.fence_reason = cetrafs_cpu_to_le32((uint32_t) strtoul(argv[5], NULL, 0));
+        ne.fenced_at = cetrafs_cpu_to_le64((uint64_t) time(NULL));
+        ne.checksum = 0;
+        ne.checksum = cetrafs_cpu_to_le64(crc32c_struct(&ne, sizeof(ne), offsetof(cetrafs_node_entry_t, checksum), sizeof(cetrafs_le64(ne.checksum))));
+        pwrite_all(fd, &ne, sizeof(ne), row_off);
+        close(fd);
+        printf("node_poke: row %u fenced by row %s, reason %s, epoch -> %" PRIu64 "\n", row, argv[4], argv[5],
+               cetrafs_le64(ne.fence_epoch));
         return 0;
     }
 
