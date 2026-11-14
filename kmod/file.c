@@ -1804,7 +1804,7 @@ static int cetrafs_inode_sorted_runs(struct inode *inode, const cetrafs_inode_t 
     ret = cetrafs_inode_extents_get_for(inode, raw, &ex, true); /* reports the map only */
     if (ret)
         return ret;
-    m = kvmalloc(struct_size(m, runs, max_t(u32, ex.entries, 1)), GFP_KERNEL);
+    m = kvmalloc(struct_size(m, runs, max_t(u32, ex.entries, 1)), GFP_NOFS);
     if (!m) {
         cetrafs_inode_extents_put(&ex);
         return -ENOMEM;
