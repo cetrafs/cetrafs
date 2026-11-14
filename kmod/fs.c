@@ -453,6 +453,9 @@ struct cetrafs_sb_info {
      * space waits on it once before saying ENOSPC
      * (cetrafs_sb_release_wait()). */
     struct rw_semaphore release_rwsem;
+    /* Releases ended this mount: an allocator at ENOSPC looks again
+     * after waiting only if one ended since it began (audit A4). */
+    atomic_t release_seq;
     /* One allocation-bitmap flush at a time (cetrafs_alloc_flush_bitmaps()),
      * and how many are in flight: a flusher that finds a group's mark
      * already taken must wait for the one that took it, or it publishes
@@ -2763,6 +2766,7 @@ int cetrafs_fill_super(struct super_block *sb, struct fs_context *fc)
         mutex_init(&sbi->pf_drain_mutex);
         mutex_init(&sbi->zg_claim_mutex);
         init_rwsem(&sbi->release_rwsem);
+        atomic_set(&sbi->release_seq, 0);
         mutex_init(&sbi->bmap_flush_mutex);
         atomic_set(&sbi->bmap_flush_inflight, 0);
         atomic_set(&sbi->bmap_dirty_n, 0);
@@ -4713,7 +4717,10 @@ void cetrafs_sb_release_lock(struct super_block *sb)
 
 void cetrafs_sb_release_unlock(struct super_block *sb)
 {
-    up_write(&((struct cetrafs_sb_info *) sb->s_fs_info)->release_rwsem);
+    struct cetrafs_sb_info *sbi = sb->s_fs_info;
+
+    atomic_inc(&sbi->release_seq); /* before the unlock: a waiter that gets in sees it */
+    up_write(&sbi->release_rwsem);
 }
 
 /* TEST ONLY: the allocator's wait for a release is the old plain
@@ -4722,6 +4729,20 @@ void cetrafs_sb_release_unlock(struct super_block *sb)
 static bool cetrafs_release_wait_unkillable;
 cetrafs_test_param(release_wait_unkillable, cetrafs_release_wait_unkillable, bool, 0644);
 MODULE_PARM_DESC(release_wait_unkillable, "TEST ONLY: the allocator waits for a release uninterruptibly (the old wait)");
+
+/* A stamp for cetrafs_sb_release_ended_since(). */
+int cetrafs_sb_release_seq(struct super_block *sb)
+{
+    return atomic_read(&((struct cetrafs_sb_info *) sb->s_fs_info)->release_seq);
+}
+
+/* Did a release end after 'seq' was taken? Any release that overlapped
+ * the caller's scans either ended before this call or was waited for by
+ * cetrafs_sb_release_wait() and ended then. */
+bool cetrafs_sb_release_ended_since(struct super_block *sb, int seq)
+{
+    return cetrafs_sb_release_seq(sb) != seq;
+}
 
 void cetrafs_sb_release_wait(struct super_block *sb)
 {

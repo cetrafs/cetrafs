@@ -3250,12 +3250,24 @@ static bool cetrafs_alloc_enospc_refresh_off;
 cetrafs_test_param(alloc_enospc_refresh_off, cetrafs_alloc_enospc_refresh_off, bool, 0644);
 MODULE_PARM_DESC(alloc_enospc_refresh_off, "TEST ONLY: ENOSPC does not refresh the layout first");
 
+/* TEST ONLY: ENOSPC looks again after the release wait whether or not a
+ * release ran, as before -- the control of tests/kernel/enospc_one_pass.sh. */
+static bool cetrafs_enospc_always_rescan;
+cetrafs_test_param(enospc_always_rescan, cetrafs_enospc_always_rescan, bool, 0644);
+MODULE_PARM_DESC(enospc_always_rescan, "TEST ONLY: ENOSPC rescans after the release wait even with no release");
+static atomic64_t cetrafs_enospc_rescans = ATOMIC64_INIT(0);
+u64 cetrafs_enospc_rescan_count(void)
+{
+    return (u64) atomic64_read(&cetrafs_enospc_rescans);
+}
+
 int cetrafs_alloc_pick_bg(struct super_block *sb, u32 *out_bg_id)
 {
     const cetrafs_superblock_t *raw_sb = cetrafs_sb_raw(sb);
     u32 my_node_id, zg_count;
     bool tried_claim_more = false, tried_claim_bg = false, waited_release = false, waited_adopt = false;
     bool refreshed_layout = false;
+    int release_seq = cetrafs_sb_release_seq(sb); /* one plain read; see waited_release */
     int ret;
 
     if (!raw_sb)
@@ -3469,9 +3481,17 @@ retry_scan:
          * free runs for a while, so its holds are not what we lack. */
         cetrafs_inline_discard_pressure(sb);
         cetrafs_sb_release_wait(sb);
-        tried_claim_more = false;
-        tried_claim_bg = false;
-        goto retry_scan;
+        /* Look again only if a release ended since this allocation
+         * began: with none, the second pass re-read every Zone Group
+         * record and Block Group descriptor for an answer it already had
+         * (audit 2026-11-14 A4). Every release that overlapped the scans
+         * above has ended by now -- this wait saw to it. */
+        if (cetrafs_sb_release_ended_since(sb, release_seq) || READ_ONCE(cetrafs_enospc_always_rescan)) {
+            atomic64_inc(&cetrafs_enospc_rescans);
+            tried_claim_more = false;
+            tried_claim_bg = false;
+            goto retry_scan;
+        }
     }
 
     /* A peer may have grown the volume since this node's last

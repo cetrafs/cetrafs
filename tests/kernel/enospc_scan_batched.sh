@@ -25,6 +25,11 @@ MNT="$(ct_mnt esb)"
 ct_track mnt "$MNT"
 ct_mkfs "$DEV" -z 16 -b 1024 -J 0 -N 1024 -f >/dev/null
 ct_param_set zg_prefetch_off 0
+# The scans are what this measures: both passes run, as they did when it
+# was written (enospc_one_pass.sh is the suite for dropping the second
+# when no release ran -- with one pass the fixed reads of each write are
+# most of the count, and the ratio stops meaning anything).
+ct_param_set enospc_always_rescan 1
 ct_param_set auto_defrag 0
 ct_param_set scrub 0
 ct_mount "$DEV" "$MNT"
