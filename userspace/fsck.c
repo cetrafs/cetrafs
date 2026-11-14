@@ -2752,7 +2752,15 @@ int main(int argc, char **argv)
             node_registered[n] = 0;
             retired++;
             repairs_made++;
-            printf("  registry full: retired node slot %u, which departed cleanly and is referenced by nothing\n", n);
+            /* The predicate above takes a row a peer declared DEAD as well
+             * as one that said goodbye: the message must not say which
+             * one this was (audit 2026-11-14 U11). */
+            /* The predicate above takes a row a peer declared DEAD as well
+             * as one that said goodbye: the message must not say which
+             * one this was (audit 2026-11-14 U11). */
+            printf("  registry full: retired node slot %u, which departed (cleanly, or declared dead by a peer) and is "
+                   "referenced by nothing\n",
+                   n);
         }
         if (retired)
             fsync(fd);
@@ -2768,7 +2776,8 @@ int main(int argc, char **argv)
         free(node_ref);
     } else if (node_free_rows == 0 && node_departed_rows > 0 && !repair_mode) {
         fprintf(stderr, "ERR: the Node Registry is full -- no new node can register; %u row(s) belong to nodes "
-                        "that departed cleanly, and fsck -r retires those that nothing references\n",
+                        "that departed (cleanly, or declared dead by a peer), and fsck -r retires those that nothing "
+                        "references\n",
                 node_departed_rows);
         early_problems++;
     }
