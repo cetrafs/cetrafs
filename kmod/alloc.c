@@ -3932,7 +3932,7 @@ static int __cetrafs_reconcile_locked(struct super_block *sb, u32 bg_id, s64 *ou
          * (one sector CAW, cache left warm and correct) -- unseeded here:
          * reconcile runs at ownership transfer, where the cache is being
          * repopulated anyway. */
-        s64 taken;
+        s64 taken, dropped;
 
         /* class 52: the accrued delta is already in the truth, and the
          * cached descriptor takes the truth when the swap lands -- so the
@@ -3962,12 +3962,13 @@ static int __cetrafs_reconcile_locked(struct super_block *sb, u32 bg_id, s64 *ou
         if (taken)
             pr_warn("BG %u: dropping an accrued free delta of %lld -- the count was recounted (epoch -> %llu)\n",
                     bg_id, (long long) taken, (unsigned long long) ctx.out_seq);
-        /* What the aggregate summed for this group was the count plus
-         * the accrual just dropped. */
+        /* Deltas accrued from here on belong to this fresh epoch. What
+         * the aggregate summed for this group was the count plus the
+         * accrual dropped: taken by the flight, or (no flight) by this
+         * epoch move. */
+        dropped = cetrafs_sb_set_bg_epoch(sb, bg_id, ctx.out_seq);
         if (out_agg)
-            *out_agg = delta - taken;
-        /* Deltas accrued from here on belong to this fresh epoch. */
-        cetrafs_sb_set_bg_epoch(sb, bg_id, ctx.out_seq);
+            *out_agg = delta - taken - dropped;
         if (flight)
             cetrafs_sb_bg_flight_settle_end(sb, bg_id, 0);
     }

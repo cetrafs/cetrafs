@@ -508,7 +508,7 @@ void cetrafs_sb_bg_flight_end(struct super_block *sb, u32 bg_id, s64 requeue);
 s64 cetrafs_sb_bg_flight_begin_value(struct super_block *sb, u32 bg_id, s64 value);
 void cetrafs_sb_bg_flight_settle_end(struct super_block *sb, u32 bg_id, s64 requeue);
 u64 cetrafs_sb_bg_epoch(struct super_block *sb, u32 bg_id);
-void cetrafs_sb_set_bg_epoch(struct super_block *sb, u32 bg_id, u64 seq);
+s64 cetrafs_sb_set_bg_epoch(struct super_block *sb, u32 bg_id, u64 seq);
 void cetrafs_sb_accrue_zg_free(struct super_block *sb, u32 zg_id, s64 delta);
 
 /* fs.c: namespace locks whose release did not commit, retried by the

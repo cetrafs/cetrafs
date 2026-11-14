@@ -6572,7 +6572,8 @@ u64 cetrafs_sb_bg_epoch(struct super_block *sb, u32 bg_id)
  * truth, the recount just read them, and nothing of ours is lost that
  * the recount did not already record.
  */
-void cetrafs_sb_set_bg_epoch(struct super_block *sb, u32 bg_id, u64 seq)
+/* Returns the accrued delta the move dropped (0 if none). */
+s64 cetrafs_sb_set_bg_epoch(struct super_block *sb, u32 bg_id, u64 seq)
 {
     struct cetrafs_sb_info *sbi = sb->s_fs_info;
     u64 prev;
@@ -6583,12 +6584,12 @@ void cetrafs_sb_set_bg_epoch(struct super_block *sb, u32 bg_id, u64 seq)
 
     c = cetrafs_bgc(sbi, bg_id, &i);
     if (!c)
-        return;
+        return 0;
 
     prev = READ_ONCE(c->bg_count_epoch[i]);
     WRITE_ONCE(c->bg_count_epoch[i], seq);
     if (prev == seq)
-        return; /* re-attach with nobody having reconciled: our deltas stand */
+        return 0; /* re-attach with nobody having reconciled: our deltas stand */
 
     /* class 52: a recount of ours took the delta in its own flight
      * (__cetrafs_reconcile_locked()), so nothing is left here; on a
@@ -6600,6 +6601,7 @@ void cetrafs_sb_set_bg_epoch(struct super_block *sb, u32 bg_id, u64 seq)
     if (stale)
         pr_warn("BG %u: dropping an accrued free delta of %lld -- the count was recounted (epoch %llu -> %llu)\n", bg_id,
                 (long long) stale, (unsigned long long) prev, (unsigned long long) seq);
+    return stale;
 }
 
 /* Same idea as cetrafs_sb_mark_bg_free_dirty() above, for a ZG's own
