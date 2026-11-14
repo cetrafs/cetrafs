@@ -8579,6 +8579,14 @@ int cetrafs_flush_tree_blocks(struct inode *inode, const cetrafs_inode_t *raw, b
  * and the device cache. `locked`: the caller already holds inode_lock and
  * invalidate_lock (exclusively) -- the lock suspension does.
  */
+/* TEST ONLY: fsync_meta's final cache flush is skipped -- the negative
+ * control of tests/crash/fsync_volatile.sh. Only that flush, not the
+ * ones inside the metadata publishes, so the rig must show what the
+ * final flush alone was covering. */
+static bool cetrafs_fsync_flush_skip;
+cetrafs_test_param(fsync_flush_skip, cetrafs_fsync_flush_skip, bool, 0644);
+MODULE_PARM_DESC(fsync_flush_skip, "TEST ONLY: fsync does not issue its final device cache flush");
+
 static int cetrafs_fsync_meta(struct inode *inode, int ret, bool locked)
 {
     struct super_block *sb = inode->i_sb;
@@ -8644,7 +8652,7 @@ static int cetrafs_fsync_meta(struct inode *inode, int ret, bool locked)
      * cache (a battery-backed LUN, the primary target) the block layer
      * makes it a no-op.
      */
-    ret2 = blkdev_issue_flush(sb->s_bdev);
+    ret2 = READ_ONCE(cetrafs_fsync_flush_skip) ? 0 : blkdev_issue_flush(sb->s_bdev);
     if (ret2 && !ret)
         ret = ret2;
 

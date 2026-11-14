@@ -50,6 +50,15 @@
  *       model a volatile-cache power cut: everything through barrier N durable,
  *       the next window's journal-area writes dropped and its last data-region
  *       (target) block torn -- see replay_reorder() below
+ *   replay-log --log <logdev> --replay <dev> --volatile-cut-mark NAME
+ *              | --volatile-cut-token STR | --volatile-cut-fua N
+ *              [--volatile-mode drop|random] [--volatile-seed S]
+ *       (a token is the data prefix of a write the workload issued after the
+ *       writes it acknowledges: marks are not ordered against data bios)
+ *       a volatile write cache at the cut: every write covered by a later
+ *       FLUSH/FUA is applied; the writes after the last barrier before the
+ *       cut are dropped (drop) or a seeded random subset is kept (random)
+ *       -- see replay_volatile() below
  */
 #define _GNU_SOURCE
 #include <endian.h>
@@ -314,6 +323,155 @@ static int replay_reorder(int logfd, int replayfd, uint64_t nr_entries, uint32_t
     return 0;
 }
 
+/*
+ * Volatile-window model: a power cut through a WRITE CACHE, not a
+ * barrier-ordered log. Every write is durable only once a FLUSH or FUA
+ * barrier covers it. So: each barrier makes every write issued before it
+ * durable (applied in full, in log order); the cut is at a named mark or
+ * before barrier cut_fua; the writes issued after the last barrier and
+ * before the cut were never covered by a flush, and each is then either
+ * dropped (drop) or kept with probability 1/2 by a seeded PRNG (random),
+ * in log order -- a cache may persist any subset, not a prefix. Unlike
+ * the journal-area model above this does not single out what is lost:
+ * any acknowledged write that lacks a later flush is lost, and the rig's
+ * reads of acknowledged data are what catch it.
+ *
+ * The cut must not flush: replay-log only applies the log, so the window
+ * is exactly what the workload left volatile.
+ */
+enum volatile_mode { VOL_DROP, VOL_RANDOM };
+struct vwrite {
+    off_t at;
+    uint64_t nr;
+    off_t data_off;
+};
+
+static uint64_t vol_rng;
+static int vol_keep(void)
+{
+    /* xorshift64: one bit per window write */
+    vol_rng ^= vol_rng << 13;
+    vol_rng ^= vol_rng >> 7;
+    vol_rng ^= vol_rng << 17;
+    return (int) (vol_rng & 1);
+}
+
+static int replay_volatile(int logfd, int replayfd, uint64_t nr_entries, uint32_t ss, const char *cut_mark,
+                           long cut_fua, const char *cut_token, enum volatile_mode mode)
+{
+    off_t pos = ss;
+    uint64_t fua_seen = 0, applied = 0, kept = 0, dropped = 0;
+    uint8_t hdr[32];
+    uint8_t *data = NULL;
+    size_t data_cap = 0;
+    struct vwrite *pw = NULL;
+    size_t pw_n = 0, pw_cap = 0;
+    int rc = 0, cut_found = 0;
+
+    /* apply one write from the log to the replay device */
+    #define VOL_APPLY(W)                                                                              \
+        do {                                                                                          \
+            off_t bytes_ = (off_t) (W).nr * ss;                                                       \
+            if ((size_t) bytes_ > data_cap) {                                                         \
+                free(data);                                                                           \
+                data = malloc(bytes_);                                                                \
+                if (!data) { fprintf(stderr, "oom\n"); rc = 1; goto out; }                             \
+                data_cap = bytes_;                                                                    \
+            }                                                                                         \
+            if (read_at(logfd, data, bytes_, (W).data_off) || write_at(replayfd, data, bytes_, (W).at)) { \
+                fprintf(stderr, "volatile: write at entry failed\n"); rc = 1; goto out;               \
+            }                                                                                         \
+        } while (0)
+
+    for (uint64_t i = 0; i < nr_entries; i++) {
+        if (read_at(logfd, hdr, sizeof(hdr), pos))
+            break;
+        uint64_t sector = rd64(hdr), nr = rd64(hdr + 8), flags = rd64(hdr + 16), data_len = rd64(hdr + 24);
+        off_t data_off = pos + (off_t) roundup(32 + data_len, ss);
+        int is_discard = (flags & LOG_DISCARD_FLAG) != 0;
+        int is_barrier = (flags & (LOG_FLUSH_FLAG | LOG_FUA_FLAG)) != 0;
+        off_t next = data_off + (is_discard ? 0 : (off_t) nr * ss);
+
+        if ((flags & LOG_MARK_FLAG) && data_len && cut_mark) {
+            char name[256];
+            size_t n = data_len < sizeof(name) - 1 ? data_len : sizeof(name) - 1;
+            if (!read_at(logfd, name, n, pos + 32)) {
+                name[n] = '\0';
+                if (!strcmp(name, cut_mark)) {
+                    cut_found = 1;
+                    break; /* the cut: everything before the mark is in the window or durable */
+                }
+            }
+        }
+        if (is_barrier && cut_fua >= 0 && (long) fua_seen == cut_fua)
+            break; /* the cut: before barrier cut_fua */
+        if (cut_token && nr && !is_discard && !is_barrier) {
+            /* A token write: the workload's in-band marker. Data bios are
+             * logged in the order they were issued, marks are not (dm-log-
+             * writes writes a mark straight to the log), so the token -- a
+             * data write issued after an fsync returned -- orders the cut. */
+            char tok[64];
+            size_t tl = strlen(cut_token);
+            if (tl < sizeof(tok) && !read_at(logfd, tok, tl, data_off) && !memcmp(tok, cut_token, tl)) {
+                cut_found = 1;
+                break;
+            }
+        }
+        if (is_barrier) {
+            /* Everything issued before this barrier is durable now. */
+            for (size_t k = 0; k < pw_n; k++) {
+                if (pw[k].nr) { VOL_APPLY(pw[k]); applied++; }
+            }
+            pw_n = 0;
+            fua_seen++;
+        }
+        if (nr && !is_discard) {
+            struct vwrite w = {.at = (off_t) sector * ss, .nr = nr, .data_off = data_off};
+            if (flags & LOG_FUA_FLAG) {
+                /* A FUA write is durable by its own completion. A FLUSH
+                 * (PREFLUSH) entry's data is not: the flush precedes it. */
+                VOL_APPLY(w);
+                applied++;
+            } else {
+                if (pw_n == pw_cap) {
+                    pw_cap = pw_cap ? pw_cap * 2 : 64;
+                    pw = realloc(pw, pw_cap * sizeof(*pw));
+                    if (!pw) { fprintf(stderr, "oom\n"); rc = 1; goto out; }
+                }
+                pw[pw_n++] = w;
+            }
+        }
+        pos = next;
+    }
+
+    if ((cut_mark || cut_token) && !cut_found) {
+        /* Without the cut the walk ran to the end of the log: not a cut. */
+        fprintf(stderr, "no %s in the log\n", cut_mark ? "mark" : "token");
+        rc = 1;
+        goto out;
+    }
+    /* The cut: the window's writes are volatile. */
+    for (size_t k = 0; k < pw_n; k++) {
+        int keep = mode == VOL_RANDOM ? vol_keep() : 0;
+        if (keep) {
+            VOL_APPLY(pw[k]);
+            kept++;
+        } else {
+            dropped++;
+        }
+    }
+    fsync(replayfd);
+out:
+    #undef VOL_APPLY
+    free(data);
+    free(pw);
+    if (rc == 0)
+        fprintf(stderr, "volatile cut (%s): %llu barrier[s] durable, %llu window write[s] kept, %llu dropped\n",
+                mode == VOL_RANDOM ? "random" : "drop", (unsigned long long) fua_seen,
+                (unsigned long long) kept, (unsigned long long) dropped);
+    return rc;
+}
+
 static int check_flushed(int logfd, uint64_t nr_entries, uint32_t ss, const char *mark,
                          uint64_t data_start_lba, uint64_t jstart_lba, uint64_t jblocks)
 {
@@ -376,6 +534,10 @@ int main(int argc, char **argv)
     int count_fua = 0, count_marks = 0, count_entries = 0;
     const char *entry_of_mark = NULL;
     const char *check_mark = NULL;
+    const char *vol_mark = NULL, *vol_token = NULL;
+    long vol_fua = -1;
+    enum volatile_mode vol_mode = VOL_DROP;
+    uint64_t vol_seed = 1;
 
     for (int i = 1; i < argc; i++) {
         if (!strcmp(argv[i], "--log") && i + 1 < argc)
@@ -406,6 +568,24 @@ int main(int argc, char **argv)
             opt_tear_blocks = atol(argv[++i]);
         else if (!strcmp(argv[i], "--check-flushed-after-mark") && i + 1 < argc)
             check_mark = argv[++i];
+        else if (!strcmp(argv[i], "--volatile-cut-mark") && i + 1 < argc)
+            vol_mark = argv[++i];
+        else if (!strcmp(argv[i], "--volatile-cut-token") && i + 1 < argc)
+            vol_token = argv[++i];
+        else if (!strcmp(argv[i], "--volatile-cut-fua") && i + 1 < argc)
+            vol_fua = strtol(argv[++i], NULL, 10);
+        else if (!strcmp(argv[i], "--volatile-mode") && i + 1 < argc) {
+            const char *m = argv[++i];
+            if (!strcmp(m, "drop"))
+                vol_mode = VOL_DROP;
+            else if (!strcmp(m, "random"))
+                vol_mode = VOL_RANDOM;
+            else {
+                fprintf(stderr, "--volatile-mode is drop or random\n");
+                return 2;
+            }
+        } else if (!strcmp(argv[i], "--volatile-seed") && i + 1 < argc)
+            vol_seed = strtoull(argv[++i], NULL, 10);
         else if (!strcmp(argv[i], "--count-fua"))
             count_fua = 1;
         else if (!strcmp(argv[i], "--count-marks"))
@@ -464,6 +644,21 @@ int main(int argc, char **argv)
         }
     }
 
+    if (vol_mark || vol_token || vol_fua >= 0) {
+        if (replayfd < 0) {
+            fprintf(stderr, "--volatile-cut-* needs --replay <dev>\n");
+            return 2;
+        }
+        if ((vol_mark != NULL) + (vol_token != NULL) + (vol_fua >= 0) > 1) {
+            fprintf(stderr, "--volatile-cut-mark, -token and -fua are one cut\n");
+            return 2;
+        }
+        vol_rng = vol_seed ? vol_seed : 1; /* xorshift state must be nonzero */
+        int rc = replay_volatile(logfd, replayfd, nr_entries, ss, vol_mark, vol_fua, vol_token, vol_mode);
+        close(replayfd);
+        close(logfd);
+        return rc;
+    }
     if (reorder_after >= 0) {
         if (replayfd < 0) {
             fprintf(stderr, "--reorder-after-fua needs --replay <dev>\n");
