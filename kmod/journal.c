@@ -136,6 +136,17 @@ struct cetrafs_journal {
      * no other batch is doing the same -- single writers take one slot
      * and never wait while holding it. */
     struct mutex batch_mutex;
+    /*
+     * The last held-back batch's entries, written and waited for, whose
+     * TARGETS have not been flushed yet: the entries stay live (busy, and
+     * replayable) until the next batch's first flush -- issued after
+     * those targets completed -- has run, and only then are they zeroed
+     * (cetrafs_journal_drain_locked()). Under batch_mutex. Sized to the
+     * journal's slots, as busy and stuck_lba are.
+     */
+    u64 *retire_slot;
+    u64 *retire_lba;
+    u64 retire_n;
 };
 
 /* Resolve node #node_id's journal slice. *out_start = 0 means journaling
@@ -611,6 +622,8 @@ void cetrafs_journal_free(struct cetrafs_journal *j)
         return;
     kvfree(j->busy);
     kvfree(j->stuck_lba);
+    kvfree(j->retire_slot);
+    kvfree(j->retire_lba);
     kfree(j);
 }
 
@@ -756,11 +769,17 @@ int cetrafs_journal_attach_node(struct super_block *sb, u32 node_id)
 
     j->busy = kvcalloc(BITS_TO_LONGS(j->slots), sizeof(unsigned long), GFP_KERNEL);
     j->stuck_lba = kvcalloc(j->slots, sizeof(*j->stuck_lba), GFP_KERNEL);
-    if (!j->busy || !j->stuck_lba) {
+    j->retire_slot = kvcalloc(j->slots, sizeof(*j->retire_slot), GFP_KERNEL);
+    j->retire_lba = kvcalloc(j->slots, sizeof(*j->retire_lba), GFP_KERNEL);
+    if (!j->busy || !j->stuck_lba || !j->retire_slot || !j->retire_lba) {
         kvfree(j->busy);
         kvfree(j->stuck_lba);
+        kvfree(j->retire_slot);
+        kvfree(j->retire_lba);
         j->busy = NULL;
         j->stuck_lba = NULL;
+        j->retire_slot = NULL;
+        j->retire_lba = NULL;
         j->area_start = 0;
         j->slots = 0;
         return -ENOMEM;
@@ -1414,6 +1433,37 @@ journal_failed:
     return -EIO;
 }
 
+/* Held-back tree batches written, and the device cache flushes they
+ * issued (procfs deferred_batches / deferred_batch_flushes). A batch's
+ * flushes are what a write into a preallocated image pays for; the
+ * flushes per batch are the number tests/kernel/deferred_batch_flushes.sh
+ * reads. */
+static atomic64_t cetrafs_batch_count = ATOMIC64_INIT(0);
+static atomic64_t cetrafs_batch_flush_count = ATOMIC64_INIT(0);
+
+u64 cetrafs_deferred_batch_count(void)
+{
+    return (u64) atomic64_read(&cetrafs_batch_count);
+}
+
+u64 cetrafs_deferred_batch_flush_count(void)
+{
+    return (u64) atomic64_read(&cetrafs_batch_flush_count);
+}
+
+static int cetrafs_batch_flush(struct super_block *sb)
+{
+    atomic64_inc(&cetrafs_batch_flush_count);
+    return blkdev_issue_flush(sb->s_bdev);
+}
+
+/* TEST ONLY: a held-back batch issues the flush after its targets, as it
+ * did before the flush moved into the next batch's step 0 (the negative
+ * control of tests/kernel/deferred_batch_flushes.sh). */
+static bool cetrafs_batch_after_flush;
+cetrafs_test_param(deferred_batch_after_flush, cetrafs_batch_after_flush, bool, 0644);
+MODULE_PARM_DESC(deferred_batch_after_flush, "TEST ONLY: a held-back tree batch flushes after its targets too");
+
 /* TEST ONLY: every batch of held-back tree blocks fails to write, cap
  * flushes and boundaries alike, as a device refusing the journal's
  * writes would (tests/kernel/deferred_room.sh). An oversized batch is
@@ -1461,6 +1511,91 @@ static void cetrafs_journal_batch_retire(struct super_block *sb, struct cetrafs_
         mutex_unlock(&j->lock);
     }
     wake_up(&j->slot_wq);
+}
+
+/* TEST ONLY: a held-back batch spends its entries right after their
+ * targets, with no flush in between -- the order the retiring flush
+ * exists to forbid. The negative control of tests/crash/batch_retire_order.sh. */
+static bool cetrafs_journal_retire_early;
+cetrafs_test_param(journal_batch_retire_early, cetrafs_journal_retire_early, bool, 0644);
+MODULE_PARM_DESC(journal_batch_retire_early, "TEST ONLY: a held-back batch spends its entries before its targets are flushed");
+
+#define CETRAFS_RETIRE_CHUNK 16
+
+/*
+ * Spend the retiring entries of the last batch: zero their headers, in
+ * chunks of one write round each, and give their slots back. A header
+ * that will not zero is held, live for replay. Called with batch_mutex
+ * held, and only after a cache flush that was issued after those
+ * batches' targets completed -- so a zeroed entry never outlives a
+ * target that is still volatile.
+ */
+static void cetrafs_journal_drain_locked(struct super_block *sb, struct cetrafs_journal *j)
+{
+    bool fenced = cetrafs_sb_is_fenced(sb);
+    unsigned int base;
+
+    for (base = 0; base < j->retire_n; base += CETRAFS_RETIRE_CHUNK) {
+        unsigned int m = min_t(unsigned int, j->retire_n - base, CETRAFS_RETIRE_CHUNK);
+        struct buffer_head *hb[CETRAFS_RETIRE_CHUNK] = {NULL};
+        int zerr[CETRAFS_RETIRE_CHUNK];
+        struct blk_plug plug;
+        unsigned int i;
+
+        blk_start_plug(&plug);
+        for (i = 0; i < m; i++) {
+            if (fenced)
+                continue;
+            hb[i] = cetrafs_getblk_overwrite(sb, cetrafs_journal_header_lba(j, j->retire_slot[base + i]));
+            if (!hb[i])
+                continue;
+            memset(hb[i]->b_data, 0, CETRAFS_BLOCK_SIZE);
+            cetrafs_bh_end_update(hb[i]);
+            write_dirty_buffer(hb[i], REQ_SYNC);
+        }
+        blk_finish_plug(&plug);
+        for (i = 0; i < m; i++) {
+            zerr[i] = -EIO;
+            if (hb[i]) {
+                zerr[i] = cetrafs_wait_meta_write(sb, hb[i]);
+                brelse(hb[i]);
+            }
+        }
+        mutex_lock(&j->lock);
+        for (i = 0; i < m; i++) {
+            u64 slot = j->retire_slot[base + i];
+
+            if (zerr[i]) /* live and harmless: see the single write */
+                cetrafs_journal_hold_slot(j, slot, j->retire_lba[base + i]);
+            else
+                clear_bit(slot, j->busy);
+        }
+        mutex_unlock(&j->lock);
+    }
+    j->retire_n = 0;
+    wake_up(&j->slot_wq);
+}
+
+/*
+ * The sync and unmount point (cetrafs_deferred_flush_all()): flush, then
+ * spend what the last batch left live. Nothing else needs it -- the next
+ * batch does this itself, and a crash replays the live entries.
+ */
+int cetrafs_journal_drain_retiring(struct super_block *sb)
+{
+    struct cetrafs_journal *j = cetrafs_sb_get_journal(sb);
+    int ret = 0;
+
+    if (!j || !j->area_start)
+        return 0;
+    mutex_lock(&j->batch_mutex);
+    if (j->retire_n) {
+        ret = blkdev_issue_flush(sb->s_bdev);
+        if (!ret)
+            cetrafs_journal_drain_locked(sb, j);
+    }
+    mutex_unlock(&j->batch_mutex);
+    return ret;
 }
 
 /* A whole deferred batch: k entries in k slots already taken. */
@@ -1534,7 +1669,7 @@ static int cetrafs_journal_batch_chunk(struct super_block *sb, struct cetrafs_jo
     atomic64_add(k, &cetrafs_journal_writes);
 
     /* 2. The entries on the platter before any target can be. */
-    ferr = blkdev_issue_flush(sb->s_bdev);
+    ferr = cetrafs_batch_flush(sb);
     if (ferr) {
         cetrafs_sb_fatal(sb, "journal: cache flush after a batch of %u entries failed (%d)", k, ferr);
         mutex_lock(&j->lock);
@@ -1590,58 +1725,49 @@ static int cetrafs_journal_batch_chunk(struct super_block *sb, struct cetrafs_jo
     if (!nw)
         return ret;
 
-    /* 4. The targets on the platter before their entries are spent. */
-    ferr = blkdev_issue_flush(sb->s_bdev);
-    if (ferr) {
-        cetrafs_sb_fatal(sb, "journal: cache flush after a batch of %u tree-block writes failed (%d)", nw, ferr);
-        mutex_lock(&j->lock);
-        for (i = 0; i < k; i++)
-            if (written[i])
-                cetrafs_journal_hold_slot(j, slots[i], bhs[i]->b_blocknr);
-        mutex_unlock(&j->lock);
-        for (i = 0; i < k; i++)
-            written[i] = false; /* not shown durable: stays held back */
-        return ferr;
-    }
+    if (!nw)
+        return ret;
 
-    /* 5. Consume: every header zeroed at once, then waited for -- the
-     * same round trip per block as 4. otherwise. */
+    /* Retiring: the targets are written and waited for, and their entries
+     * are spent only after a cache flush issued after this point. The
+     * next batch's first flush does that (cetrafs_journal_write_deferred(),
+     * cetrafs_journal_drain_locked()); until then the entries stay busy,
+     * so a crash replays them and a target that landed is skipped
+     * (judge: LANDED). A batch too large to keep its entries past itself
+     * (over half the journal, which the single writers must still get
+     * slots from) and the controls below flush now, as before. */
     {
-        struct blk_plug plug;
-        bool fenced = cetrafs_sb_is_fenced(sb);
+        bool now = READ_ONCE(cetrafs_batch_after_flush) || k > j->slots / 2;
 
-        blk_start_plug(&plug);
+        if (now) {
+            /* 4. The targets on the platter before their entries are spent. */
+            ferr = cetrafs_batch_flush(sb);
+            if (ferr) {
+                cetrafs_sb_fatal(sb, "journal: cache flush after a batch of %u tree-block writes failed (%d)", nw,
+                                 ferr);
+                mutex_lock(&j->lock);
+                for (i = 0; i < k; i++)
+                    if (written[i])
+                        cetrafs_journal_hold_slot(j, slots[i], bhs[i]->b_blocknr);
+                mutex_unlock(&j->lock);
+                for (i = 0; i < k; i++)
+                    written[i] = false; /* not shown durable: stays held back */
+                return ferr;
+            }
+        }
         for (i = 0; i < k; i++) {
-            hb[i] = NULL;
-            if (!written[i] || fenced)
+            if (!written[i])
                 continue;
-            hb[i] = cetrafs_getblk_overwrite(sb, cetrafs_journal_header_lba(j, slots[i]));
-            if (!hb[i])
-                continue;
-            memset(hb[i]->b_data, 0, CETRAFS_BLOCK_SIZE);
-            cetrafs_bh_end_update(hb[i]);
-            write_dirty_buffer(hb[i], REQ_SYNC);
+            j->retire_slot[j->retire_n] = slots[i];
+            j->retire_lba[j->retire_n] = bhs[i]->b_blocknr;
+            j->retire_n++;
         }
-        blk_finish_plug(&plug);
+        if (!now && !READ_ONCE(cetrafs_journal_retire_early))
+            return ret;
+        /* The consume now: after the flush above, or (the control) with
+         * none at all -- the order a crash must not be allowed to see. */
+        cetrafs_journal_drain_locked(sb, j);
     }
-    for (i = 0; i < k; i++) {
-        int zerr;
-
-        if (!written[i])
-            continue;
-        zerr = -EIO;
-        if (hb[i]) {
-            zerr = cetrafs_wait_meta_write(sb, hb[i]);
-            brelse(hb[i]);
-        }
-        mutex_lock(&j->lock);
-        if (zerr)
-            cetrafs_journal_hold_slot(j, slots[i], bhs[i]->b_blocknr); /* live and harmless: see the single write */
-        else
-            clear_bit(slots[i], j->busy);
-        mutex_unlock(&j->lock);
-    }
-    wake_up(&j->slot_wq);
     return ret;
 }
 
@@ -1659,10 +1785,18 @@ static int cetrafs_journal_batch_chunk(struct super_block *sb, struct cetrafs_jo
  *  2. Flush: every entry durable before any target is touched.
  *  3. The targets, in place. A crash here leaves each one old, new or
  *     torn, and replay redoes the torn and the old (C1).
- *  4. Flush, then 5. consume.
+ *  4. Nothing flushes here. The entries stay live -- busy, replayable --
+ *     until the NEXT batch's step 0, whose flush is issued after these
+ *     targets completed; then they are zeroed (cetrafs_journal_drain_locked()).
+ *     A replay meeting a target that landed finds it LANDED and skips it,
+ *     so a crash anywhere in between is the redo it always was. The
+ *     sync and unmount points spend what is left (cetrafs_journal_drain_retiring()).
+ *     A batch over half the journal, and the controls, flush and spend
+ *     at once instead, as before.
  *
- * Three flushes per boundary, whatever the number of blocks -- not per
- * block, which is what made per-write journaling unusable. ONE batch,
+ * Two flushes per boundary in steady state (steps 0 and 2), whatever the
+ * number of blocks -- not per block, which is what made per-write
+ * journaling unusable. ONE batch,
  * every slot taken before any entry is written
  * (cetrafs_journal_take_batch()), so every entry is durable before any
  * target: a boundary is atomic as a whole. It used to go in chunks of
@@ -1815,15 +1949,15 @@ int cetrafs_journal_write_deferred(struct super_block *sb, struct buffer_head **
         return 0;
     if (cetrafs_sb_is_fenced(sb))
         return -EIO;
-
-    ret = cetrafs_alloc_flush_bitmaps(sb);
-    if (ret)
-        return ret;
-    ret = READ_ONCE(cetrafs_journal_batch_skip_flush) ? 0 : blkdev_issue_flush(sb->s_bdev);
-    if (ret)
-        return ret; /* nothing written: the blocks stay held back */
+    atomic64_inc(&cetrafs_batch_count);
 
     if (!j || !j->area_start) {
+        ret = cetrafs_alloc_flush_bitmaps(sb);
+        if (ret)
+            return ret;
+        ret = READ_ONCE(cetrafs_journal_batch_skip_flush) ? 0 : cetrafs_batch_flush(sb);
+        if (ret)
+            return ret; /* nothing written: the blocks stay held back */
         for (i = 0; i < n; i++) {
             int werr = cetrafs_deferred_write_target(sb, bhs[i], &wcrc[i]);
 
@@ -1853,17 +1987,31 @@ int cetrafs_journal_write_deferred(struct super_block *sb, struct buffer_head **
         bool *reused = kvcalloc(n, sizeof(*reused), GFP_NOFS);
         struct buffer_head **pb = kvcalloc(n, sizeof(*pb), GFP_NOFS);
         struct buffer_head **hb = kvcalloc(n, sizeof(*hb), GFP_NOFS);
-        unsigned int k = 0;
 
         ret = slots && txn && reused && pb && hb ? 0 : -ENOMEM;
         if (!ret) {
+            unsigned int k = 0;
+
             mutex_lock(&j->batch_mutex);
-            ret = cetrafs_journal_take_batch(sb, j, bhs, n, slots, txn, reused, &k);
+            /* 0. What the blocks name reaches the device first: the
+             * allocation bits, and the data written back so far (a
+             * leaf marking a block written must never be durable ahead
+             * of that block's data or bit -- C2). The same flush is what
+             * makes the PREVIOUS batch's targets durable, so its entries
+             * are spent right after it (cetrafs_journal_drain_locked()). */
+            ret = cetrafs_alloc_flush_bitmaps(sb);
             if (!ret)
-                ret = cetrafs_journal_batch_chunk(sb, j, bhs, owners, disk_crc, n, slots, txn, written, wcrc, pb,
-                                                  hb);
-            else
-                cetrafs_journal_untake_batch(j, bhs, slots, reused, k);
+                ret = READ_ONCE(cetrafs_journal_batch_skip_flush) ? 0 : cetrafs_batch_flush(sb);
+            if (!ret)
+                cetrafs_journal_drain_locked(sb, j);
+            if (!ret) {
+                ret = cetrafs_journal_take_batch(sb, j, bhs, n, slots, txn, reused, &k);
+                if (ret)
+                    cetrafs_journal_untake_batch(j, bhs, slots, reused, k);
+                else
+                    ret = cetrafs_journal_batch_chunk(sb, j, bhs, owners, disk_crc, n, slots, txn, written, wcrc,
+                                                      pb, hb);
+            }
             mutex_unlock(&j->batch_mutex);
         }
         kvfree(slots);

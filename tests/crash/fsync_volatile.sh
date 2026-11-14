@@ -21,7 +21,15 @@
 #                    a FALLOCATED file: the rounds write blocks that are
 #                    still preallocated, so every round is an uninit-to-
 #                    written conversion that the datasync must publish
-#                    and that changes neither size nor blocks.
+#                    and that changes neither size nor blocks;
+#   retire-prealloc  the same workload, with the control removing the
+#                    flushes that would cover a held-back tree batch's
+#                    targets before its entries are spent: the batch's
+#                    entries are zeroed right after their targets, and
+#                    the publish and final flushes are skipped too
+#                    (journal_batch_retire_early, publish_flush_skip,
+#                    fsync_flush_skip). The shipped order retires a batch's
+#                    entries only after the next batch's first flush.
 #
 # Workload: a 64-block file, fully written and fsynced ("base") -- for the
 # prealloc variant only blocks 0..15 are written, the rest of the 64 are
@@ -52,6 +60,7 @@ require_module
 modprobe dm-log-writes 2>/dev/null || true
 command -v dmsetup >/dev/null || { skip "dmsetup not found"; ct_exit; }
 [ -w /sys/module/cetrafs/parameters/fsync_flush_skip ] || { skip "fsync_flush_skip is missing"; ct_exit; }
+[ -w /sys/module/cetrafs/parameters/journal_batch_retire_early ] || { skip "journal_batch_retire_early is missing"; ct_exit; }
 command -v python3 >/dev/null || { skip "python3 not found"; ct_exit; }
 
 REPLAY="$CT_BUILD/replay-log"
@@ -135,8 +144,10 @@ os.close(fd)
 PY
 }
 
-# record <key> <skip> <sync> <prealloc>: the workload through dm-log-writes
-# with the final flush skipped (1) or not (0). Prints the log device.
+# record <key> <skip> <sync> <prealloc> <retire>: the workload through
+# dm-log-writes with the final flush skipped (1) or not (0). retire=1 also
+# skips the publish flushes and retires batch entries early (the control
+# of retire-prealloc). Prints the log device.
 record() {
     local key="$1" data log dm lw
     data="$(ct_loop "$(ct_image "$DM_MB" "fsv-d$key")")"
@@ -146,12 +157,18 @@ record() {
     ct_track dm "$dm"
     lw="/dev/mapper/$dm"
     ct_param_set fsync_flush_skip "$2"
+    if [ "$5" = 1 ]; then
+        ct_param_set publish_flush_skip "$2"
+        ct_param_set journal_batch_retire_early "$2"
+    fi
     ct_mkfs "$lw" -s "${SZ_MB}M" -z 1 -b 512 -J 4 -M 4 -N 1024 -f >/dev/null
     ct_mount "$lw" "$MNT"
     mkdir -p "$OUT/rec$key"
     workload "$MNT/vm" "$lw" "$OUT/rec$key" "$3" "$4"
     ct_umount "$MNT"
     ct_param_set fsync_flush_skip 0
+    ct_param_set publish_flush_skip 0
+    ct_param_set journal_batch_retire_early 0
     dmsetup remove "$dm"
     blockdev --flushbufs "$log"
     echo "$log"
@@ -203,10 +220,11 @@ run_round() {
     fsync) sync=fsync prealloc=0 ;;
     fdatasync) sync=fdatasync prealloc=0 ;;
     fdatasync-prealloc) sync=fdatasync prealloc=1 ;;
+    retire-prealloc) sync=fdatasync prealloc=1 ;;
     *) echo "unknown variant $variant" >&2; ct_exit ;;
     esac
     key="$tag-$skip"
-    log="$(record "$key" "$skip" "$sync" "$prealloc")"
+    log="$(record "$key" "$skip" "$sync" "$prealloc" "$([ "$variant" = retire-prealloc ] && echo 1 || echo 0)")"
     rimg="$(ct_loop "$(ct_image "$DM_MB" "fsv-r$key")")"
     for m in $MARKS; do
         CHECK_EXP="$OUT/rec$key/exp-$m"
@@ -222,7 +240,7 @@ run_round() {
     done
 }
 
-for variant in ${FSV_VARIANTS:-fsync fdatasync fdatasync-prealloc}; do
+for variant in ${FSV_VARIANTS:-fsync fdatasync fdatasync-prealloc retire-prealloc}; do
     log "variant $variant: control (the final flush removed), then as shipped"
     # ---- control first: the knob removes the final flush of the call ----
     ctl="$(run_round "$variant" 1 control)"

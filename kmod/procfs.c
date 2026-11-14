@@ -334,6 +334,8 @@ static int cetrafs_proc_info_show(struct seq_file *m, void *v)
     seq_printf(m, "deferred_adopted: %llu\n", cetrafs_deferred_adopted_count());
     seq_printf(m, "deferred_holds: %llu\n", cetrafs_deferred_hold_count());
     seq_printf(m, "tree_allocs: %llu\n", cetrafs_tree_alloc_count());
+    seq_printf(m, "deferred_batches: %llu\n", cetrafs_deferred_batch_count());
+    seq_printf(m, "deferred_batch_flushes: %llu\n", cetrafs_deferred_batch_flush_count());
     seq_printf(m, "deferred_list_steps: %llu\n", cetrafs_deferred_list_step_count());
     seq_printf(m, "update_crcs: %llu\n", cetrafs_update_crc_count());
     /* Slots held by entries a failed write kept for replay. Nonzero is a

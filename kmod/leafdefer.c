@@ -714,7 +714,7 @@ int cetrafs_deferred_flush_all(struct super_block *sb)
     int ret = 0;
 
     if (!xa || !orphans)
-        return 0;
+        return cetrafs_journal_drain_retiring(sb);
     /* Bounded by what is listed now: a writer still deferring blocks
      * must not keep a sync going for ever. */
     xa_lock(xa);
@@ -756,7 +756,13 @@ int cetrafs_deferred_flush_all(struct super_block *sb)
             break; /* left listed: the next sync, or unmount, retries */
         }
     }
-    return ret;
+    /* The last batch's entries, live until a flush after their targets:
+     * this point is where they are spent (journal.c). */
+    {
+        int dr = cetrafs_journal_drain_retiring(sb);
+
+        return ret ? ret : dr;
+    }
 }
 
 /*
