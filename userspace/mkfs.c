@@ -929,6 +929,19 @@ int main(int argc, char **argv)
     }
 
 
+    /* The volume's identity: a random version-4 UUID per format. It was
+     * never written, so every volume read as the all-zero UUID (audit
+     * 2026-11-14 U11). */
+    {
+        int ur = open("/dev/urandom", O_RDONLY | O_CLOEXEC);
+
+        if (ur < 0 || read(ur, sb.uuid, sizeof(sb.uuid)) != (ssize_t) sizeof(sb.uuid))
+            die("cannot read random bytes for the volume UUID: %s", strerror(errno));
+        close(ur);
+        sb.uuid[6] = (u8) ((sb.uuid[6] & 0x0f) | 0x40);
+        sb.uuid[8] = (u8) ((sb.uuid[8] & 0x3f) | 0x80);
+    }
+
     /* SB checksum (CRC32C over full struct with checksum zeroed) */
     sb.checksum = 0;
     uint32_t sb_crc = crc32c_struct(&sb, sizeof(sb), offsetof(cetrafs_superblock_t, checksum), sizeof(sb.checksum));

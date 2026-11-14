@@ -159,6 +159,10 @@ int main(int argc, char **argv)
     if (argc == 2) {
         for (i = 0; i < nfields; i++)
             printf("%s=%" PRIu64 "\n", FIELDS[i].name, field_get(&sb, i));
+        printf("uuid=");
+        for (i = 0; i < sizeof(sb.uuid); i++)
+            printf("%02x", sb.uuid[i]);
+        printf("\n");
         return 0;
     }
 
