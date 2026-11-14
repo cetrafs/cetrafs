@@ -1095,6 +1095,89 @@ C57="$(python3 "$C57_SCAN" "$C57_OK" "$ROOT"/userspace/*.h "$ROOT"/userspace/*.c
 [ -z "$C57" ] && pass "class 57: every tool read of registry rows drops this host's cached copy" ||
     fail "class 57: reads the registry through the cache: $(echo $C57)"
 
+# Class 54: a path that holds an inode's namespace lock reaches a second
+# acquire of it, directly or through a VFS entry point whose module callback
+# takes it (setattr_prepare()'s killpriv into the xattr handler).
+# tests/image/ns_reentry_scan.py walks the callees of every holder. The real
+# tree must be clean. Controls: a planted direct self-wait and a planted VFS
+# self-wait are found, a guarded acquire and a ?: alternative are not, and a
+# copy of the real tree with the nesting guard removed is found.
+log "checking no path re-acquires the namespace lock it already holds (class 54)"
+C54_SCAN="$CT_TESTS/image/ns_reentry_scan.py"
+[ "$(grep -l 'cetrafs_nslock_acquire' "$K"/*.c | wc -l)" -ge 3 ] ||
+    fail "class 54: setup: the namespace-lock acquirers are not where the scan expects them"
+C54P="$(ct_tmp ns-reentry-plant)"
+rm -f "$C54P"
+mkdir -p "$C54P"
+cat >"$C54P/xattr.c" <<'PLANT'
+static int planted_guarded_acquire(struct inode *inode)
+{
+    bool nested = cetrafs_inode_ns_held_by_current(inode);
+
+    if (!nested)
+        return cetrafs_nslock_acquire(inode);
+    return 0;
+}
+static int planted_unguarded_set(struct inode *inode)
+{
+    return cetrafs_nslock_acquire(inode);
+}
+static const struct xattr_handler planted_handler = {
+    .set = planted_unguarded_set,
+};
+PLANT
+cat >"$C54P/planted.c" <<'PLANT'
+static int planted_direct_helper(struct inode *inode)
+{
+    return cetrafs_nslock_acquire(inode);
+}
+static void planted_direct_holder(struct inode *inode)
+{
+    cetrafs_nslock_acquire(inode);
+    planted_direct_helper(inode);
+    cetrafs_nslock_release(inode);
+}
+static void planted_vfs_holder(struct mnt_idmap *idmap, struct dentry *d, struct inode *inode, struct iattr *a)
+{
+    cetrafs_nslock_acquire(inode);
+    setattr_prepare(idmap, d, a);
+    cetrafs_nslock_release(inode);
+}
+static void planted_guarded_holder(struct inode *inode)
+{
+    cetrafs_nslock_acquire(inode);
+    planted_guarded_acquire(inode);
+    cetrafs_nslock_release(inode);
+}
+static int planted_ternary(struct inode *inode, bool set)
+{
+    return set ? cetrafs_nslock_acquire(inode) : cetrafs_nslock_acquire_set(&inode, 1);
+}
+PLANT
+C54N="$(python3 "$C54_SCAN" "$C54P" | wc -l)"
+C54L="$(python3 "$C54_SCAN" "$C54P")"
+[ "$C54N" = 2 ] && grep -q '^planted.c:planted_direct_holder -> planted_direct_helper ' <<<"$C54L" &&
+    grep -q '^planted.c:planted_vfs_holder -> setattr_prepare -> planted_unguarded_set ' <<<"$C54L" &&
+    pass "class 54: control -- a planted direct and a planted VFS self-wait are found; a guarded acquire and a ?: alternative are not" ||
+    fail "class 54: control -- the planted tree gave $C54N finding(s), want 2 (direct and VFS): $C54L"
+rm -rf "$C54P"
+
+C54R="$(python3 "$C54_SCAN" "$K")"
+[ -z "$C54R" ] && pass "class 54: no path under the namespace lock takes it again" ||
+    fail "class 54: a path re-acquires the namespace lock it holds: $C54R"
+
+# The real nesting guard is the only thing that keeps xattr_set from waiting
+# on the setattr that calls it. Removed from a copy, the scan must find it.
+C54G="$(ct_tmp ns-reentry-guard)"
+rm -f "$C54G"
+mkdir -p "$C54G"
+cp "$K"/*.c "$K"/*.h "$C54G"/
+sed -i "s/bool nested = .*held_by_current(inode);/bool nested = false;/" "$C54G/xattr.c"
+[ "$(python3 "$C54_SCAN" "$C54G" | grep -c 'cetrafs_setattr -> .*cetrafs_xattr_set')" = 1 ] &&
+    pass "class 54: control -- with the xattr nesting guard removed, the setattr path is found" ||
+    fail "class 54: control -- the scan does not find the xattr self-wait with the guard removed"
+rm -rf "$C54G"
+
 # Class 27: a cached leaf, index or xattr block is edited IN PLACE by
 # several stores, and a cached read checks no checksum -- so a reader of
 # its b_data on THIS node needs lock_buffer (or the update / snapshot
