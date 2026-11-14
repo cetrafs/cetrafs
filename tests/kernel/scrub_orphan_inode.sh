@@ -63,6 +63,7 @@ echo "$FSCK_OUT" | grep -q "inode $ORPHAN is allocated" \
 log "enable a fast scrub; one cycle must reclaim ino=$ORPHAN and spare ino=$HELD"
 ct_param_set scrub 0
 ct_param_set scrub_interval_secs 2
+ct_param_set scrub_gap_floor_secs 1
 ct_param_set scrub_gap_secs 1
 # DELTA, not absolute: the counter is module-global and suites in one
 # run share the module load, so an earlier suite's reclaims (e.g.

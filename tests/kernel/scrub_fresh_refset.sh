@@ -39,6 +39,7 @@ ct_mkfs_small "$DEV" -z 1 >/dev/null
 # interval as it reads it then).
 ct_param_set scrub 1
 ct_param_set scrub_interval_secs 3
+ct_param_set scrub_gap_floor_secs 1
 ct_param_set scrub_gap_secs 2
 # One block at a time: a speculative run would reserve the very blocks
 # this test wants to allocate behind the kernel's back.

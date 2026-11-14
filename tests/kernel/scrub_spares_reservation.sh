@@ -47,6 +47,7 @@ ct_mkfs_small "$DEV" >/dev/null
 # that never comes (it did, on the first run).
 ct_param_set scrub 1
 ct_param_set scrub_interval_secs 3
+ct_param_set scrub_gap_floor_secs 1
 ct_param_set scrub_gap_secs 2
 
 ct_track mnt "$MNT"

@@ -32,6 +32,7 @@ ct_param_set alloc_run_blocks 256
 ct_param_set alloc_run_max_blocks 256
 ct_param_set scrub 0
 ct_param_set scrub_interval_secs 2 # scheduled at mount: set before it
+ct_param_set scrub_gap_floor_secs 1
 ct_param_set scrub_gap_secs 1
 ct_mount "$DEV" "$MNT"
 require_cetrafs_mount "$MNT"

@@ -97,6 +97,7 @@ grep -q '^size=0 nlink=0 ' <<<"$("$LOCK_POKE" "$DEV" "$CINO" --rec)" &&
     grep -q 'ns_owner=1 ' <<<"$("$LOCK_POKE" "$DEV" "$CINO")" ||
     { fail "setup: the dead peer's claimed record is not on the device"; ct_exit; }
 ct_param_set scrub_interval_secs 2
+ct_param_set scrub_gap_floor_secs 1
 ct_param_set scrub_gap_secs 1
 MARK="$(dmesg_mark)"
 ct_mount "$DEV" "$MNT"

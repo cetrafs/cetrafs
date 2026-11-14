@@ -47,6 +47,7 @@ reclaim() { sed -n 's/^scrub_reclaimed: //p' "$PROC"; }
 # interval as it reads at mount time.
 ct_param_set scrub 1
 ct_param_set scrub_interval_secs 3
+ct_param_set scrub_gap_floor_secs 1
 ct_param_set scrub_gap_secs 2
 # And a heartbeat that does not drain during the test. The drain runs on a
 # tick, and a drained entry is no longer queued -- the test would then be

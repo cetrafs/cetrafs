@@ -35,6 +35,7 @@ reclaimed() { info | sed -n 's/^scrub_reclaimed: //p'; }
 # A fast scrub: a 2 s cycle with a 1 s two-pass gap (the default is 30 min).
 # `scrub` itself is armed only AFTER the baseline below is captured.
 ct_param_set scrub_interval_secs 2
+ct_param_set scrub_gap_floor_secs 1
 ct_param_set scrub_gap_secs 1
 
 log "leak $NLEAK blocks directly in BG 0's data bitmap (no file references them)"

@@ -104,26 +104,38 @@ MODULE_PARM_DESC(scrub, "automatic background reclaim of leaked data blocks (def
  */
 #define CETRAFS_SCRUB_INTERVAL_MAX_SECS 86400U /* a day */
 #define CETRAFS_SCRUB_GAP_MAX_SECS 3600U       /* an hour */
+/* The gap is a safety window -- it must outlast any allocation's commit
+ * window -- so it has a floor root cannot go below: the default. A 1 s
+ * gap was accepted from sysfs (audit 2026-11-14 L3, class 39). */
+#define CETRAFS_SCRUB_GAP_MIN_SECS 15U
 
-static int cetrafs_scrub_secs_set(const char *val, const struct kernel_param *kp, unsigned int max)
+/* TEST ONLY: the gap's floor. The suites drive the gap to 1-2 s for
+ * speed and lower this first; as a test parameter, setting it says so. */
+static unsigned int cetrafs_scrub_gap_floor_secs = CETRAFS_SCRUB_GAP_MIN_SECS;
+cetrafs_test_param(scrub_gap_floor_secs, cetrafs_scrub_gap_floor_secs, uint, 0644);
+MODULE_PARM_DESC(scrub_gap_floor_secs, "TEST ONLY: the lowest scrub_gap_secs accepted (default 15)");
+
+static int cetrafs_scrub_secs_set(const char *val, const struct kernel_param *kp, unsigned int min, unsigned int max)
 {
     unsigned int v;
     int ret = kstrtouint(val, 0, &v);
 
     if (ret)
         return ret;
-    *(unsigned int *) kp->arg = clamp_t(unsigned int, v, 1U, max);
+    *(unsigned int *) kp->arg = clamp_t(unsigned int, v, min, max);
     return 0;
 }
 
 static int cetrafs_scrub_interval_set(const char *val, const struct kernel_param *kp)
 {
-    return cetrafs_scrub_secs_set(val, kp, CETRAFS_SCRUB_INTERVAL_MAX_SECS);
+    return cetrafs_scrub_secs_set(val, kp, 1U, CETRAFS_SCRUB_INTERVAL_MAX_SECS);
 }
 
 static int cetrafs_scrub_gap_set(const char *val, const struct kernel_param *kp)
 {
-    return cetrafs_scrub_secs_set(val, kp, CETRAFS_SCRUB_GAP_MAX_SECS);
+    unsigned int floor = clamp_t(unsigned int, READ_ONCE(cetrafs_scrub_gap_floor_secs), 1U, CETRAFS_SCRUB_GAP_MIN_SECS);
+
+    return cetrafs_scrub_secs_set(val, kp, floor, CETRAFS_SCRUB_GAP_MAX_SECS);
 }
 
 static const struct kernel_param_ops cetrafs_scrub_interval_ops = {
@@ -142,7 +154,7 @@ MODULE_PARM_DESC(scrub_interval_secs, "seconds between scrub cycles (1..86400)")
 static unsigned int cetrafs_scrub_gap_secs = 15;
 module_param_cb(scrub_gap_secs, &cetrafs_scrub_gap_ops, &cetrafs_scrub_gap_secs, 0644);
 MODULE_PARM_DESC(scrub_gap_secs,
-                 "two-pass confirmation gap in seconds, 1..3600 (must exceed any allocation's commit window)");
+                 "two-pass confirmation gap in seconds, 15..3600 (must exceed any allocation's commit window)");
 
 /* TEST ONLY: decide from the on-disk record alone, ignoring the in-core
  * shadow -- the negative control for the overlay in scrub_build_refset().

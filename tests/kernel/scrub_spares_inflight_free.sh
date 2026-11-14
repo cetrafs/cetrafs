@@ -51,6 +51,7 @@ MNT="$(ct_mnt sinfl)"
 ct_track mnt "$MNT"
 ct_mkfs_small "$DEV" >/dev/null
 ct_param_set scrub_interval_secs 2
+ct_param_set scrub_gap_floor_secs 1
 ct_param_set scrub_gap_secs 1
 ct_param_set hb_interval_secs 2
 ct_mount "$DEV" "$MNT"

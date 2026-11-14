@@ -32,6 +32,7 @@ ct_track mnt "$MNT"
 ct_param_set scrub_old_shape 0
 ct_param_set scrub_ref_budget_kb 16
 ct_param_set scrub_interval_secs 2
+ct_param_set scrub_gap_floor_secs 1
 ct_param_set scrub_gap_secs 1
 ct_param_set scrub 0 # armed per probe, below
 P=/sys/module/cetrafs/parameters

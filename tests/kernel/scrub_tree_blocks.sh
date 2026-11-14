@@ -61,6 +61,7 @@ reclaimed() { sed -n 's/^scrub_reclaimed: //p' "/proc/fs/cetrafs/$PROC_DEV/info"
 # ENABLE flag is re-read per cycle by cetrafs_scrub_work(), so it is the
 # right lever for "cycles tick, but do nothing yet".
 ct_param_set scrub_interval_secs 2
+ct_param_set scrub_gap_floor_secs 1
 ct_param_set scrub_gap_secs 1
 ct_param_set scrub 0
 

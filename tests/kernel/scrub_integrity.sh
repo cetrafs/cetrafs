@@ -59,6 +59,7 @@ grep -q "leaked" <<<"$FSCK_OUT" &&
 
 # ---- mount with a fast scrub; it reclaims the leak with live files present ----
 ct_param_set scrub_interval_secs 2
+ct_param_set scrub_gap_floor_secs 1
 ct_param_set scrub_gap_secs 1
 ct_mount "$DEV" "$MNT"
 require_cetrafs_mount "$MNT"

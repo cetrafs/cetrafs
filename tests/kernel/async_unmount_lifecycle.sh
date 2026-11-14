@@ -83,6 +83,7 @@ DEV="$(ct_dev 560 lc2)"
 MNT="$(ct_mnt lc2)"
 ct_mkfs_small "$DEV" >/dev/null
 ct_param_set scrub_interval_secs 2
+ct_param_set scrub_gap_floor_secs 1
 ct_param_set scrub_gap_secs 1
 ct_param_set scrub_verdict_stall_ms 6000
 MARK="$(dmesg_mark)"

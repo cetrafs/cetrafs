@@ -36,6 +36,7 @@ ct_mkfs_small "$DEV" -z 1 >/dev/null
 
 ct_param_set scrub 1
 ct_param_set scrub_interval_secs 3
+ct_param_set scrub_gap_floor_secs 1
 ct_param_set scrub_gap_secs 2
 ct_param_set alloc_run_blocks 0
 ct_param_set auto_defrag 0

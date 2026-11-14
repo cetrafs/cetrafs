@@ -60,6 +60,7 @@ round() {
     local tag="$1" L G0 G1 R0 C0 out frc=0
     ct_param_set scrub 1
     ct_param_set scrub_interval_secs 3
+    ct_param_set scrub_gap_floor_secs 1
     ct_param_set scrub_gap_secs 2
     ct_param_set hb_drain_off 1 # no drain but the mount's
     ct_param_set pf_ignore_stamp 0

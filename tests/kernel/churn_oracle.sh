@@ -82,6 +82,7 @@ ct_param_set auto_defrag_min_extents 2
 ct_param_set auto_defrag_min_pct 1
 case "$SCRUB" in 2) ct_param_set scrub 0 ;; *) ct_param_set scrub "$SCRUB" ;; esac
 ct_param_set scrub_interval_secs 3
+ct_param_set scrub_gap_floor_secs 1
 ct_param_set scrub_gap_secs 2
 
 ct_mkfs "$DEV" -z 1 -b 512 -J 1 -N 4096 -f >/dev/null

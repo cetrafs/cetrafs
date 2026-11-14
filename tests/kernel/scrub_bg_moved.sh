@@ -29,6 +29,7 @@ info() { cat "$(ct_procdir "$DEV")/info"; }
 reclaimed() { info | sed -n 's/^scrub_reclaimed: //p'; }
 ct_param_set scrub 0
 ct_param_set scrub_interval_secs 2
+ct_param_set scrub_gap_floor_secs 1
 ct_param_set scrub_gap_secs 1
 "$LEAK" "$DEV" 0 100 40 >/dev/null
 ct_mount "$DEV" "$MNT"

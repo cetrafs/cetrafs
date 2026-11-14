@@ -10,8 +10,10 @@
 #
 #   gap       1 .. 3600 s     interval  1 .. 86400 s
 #
-# Zero is a floor (1 s), not "off". The suites drive the gap to 1-2 s for
-# speed, which is why the floor is 1 and not the default.
+# Zero is a floor, not "off". The gap's floor is the default, 15 s: it is
+# a safety window, and root lowering it to 1 s was a finding (L3). The
+# suites that drive it to 1-2 s for speed lower the floor first through
+# the test parameter scrub_gap_floor_secs.
 #
 # DISCRIMINATION: with the unbounded parameters the readback is the value
 # written (4294967295), and the assertions below fail.
@@ -34,10 +36,17 @@ put() { echo "$2" >"$P/$1" 2>/dev/null || true; cat "$P/$1"; }
 [ "$(put scrub_gap_secs 429496730)" = 3600 ] &&
     pass "a gap whose x10 wraps is held at the ceiling, not the wrapped value" ||
     fail "a gap of 429496730 is held as $(cat "$P/scrub_gap_secs")"
-[ "$(put scrub_gap_secs 0)" = 1 ] && pass "a gap of 0 is held at the 1 s floor" ||
+# The gap is a safety window: its floor is the default, 15 s, and only
+# the test parameter lowers it (audit 2026-11-14 L3, class 39).
+[ "$(put scrub_gap_secs 0)" = 15 ] && pass "a gap of 0 is held at the 15 s floor" ||
     fail "a gap of 0 is held as $(cat "$P/scrub_gap_secs")"
-[ "$(put scrub_gap_secs 2)" = 2 ] && pass "control: an in-range gap is held as written" ||
-    fail "control: a gap of 2 is held as $(cat "$P/scrub_gap_secs")"
+[ "$(put scrub_gap_secs 1)" = 15 ] && pass "a gap of 1 s, below the safety floor, is held at 15 s" ||
+    fail "a gap of 1 is held as $(cat "$P/scrub_gap_secs") -- root can shrink the safety window"
+[ "$(put scrub_gap_secs 20)" = 20 ] && pass "control: an in-range gap is held as written" ||
+    fail "control: a gap of 20 is held as $(cat "$P/scrub_gap_secs")"
+ct_param_set scrub_gap_floor_secs 1
+[ "$(put scrub_gap_secs 2)" = 2 ] && pass "control: with the test floor lowered, a 2 s gap is held as written" ||
+    fail "control: a gap of 2 under the test floor is held as $(cat "$P/scrub_gap_secs")"
 
 [ "$(put scrub_interval_secs 4294967295)" = 86400 ] &&
     pass "an enormous interval is held at the one-day ceiling" ||

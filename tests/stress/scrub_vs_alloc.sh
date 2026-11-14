@@ -27,6 +27,7 @@ ct_mkfs "$DEV" -z 2 -b 512 -J 0 -N 2048 -f >/dev/null
 ct_param_set auto_defrag 0   # isolate the OTHER bg tasks from the defrag bug
 ct_param_set scrub 1
 ct_param_set scrub_interval_secs 2
+ct_param_set scrub_gap_floor_secs 1
 ct_param_set scrub_gap_secs 1
 compress_timing              # 1s heartbeat tick: surplus-release fires in-window
 

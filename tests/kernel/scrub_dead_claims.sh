@@ -54,6 +54,7 @@ pass "setup: three orphans -- a dead node's presence bit, its lock, a live node'
 
 ct_param_set scrub 0
 ct_param_set scrub_interval_secs 2
+ct_param_set scrub_gap_floor_secs 1
 ct_param_set scrub_gap_secs 1
 MARK="$(dmesg_mark)"
 ct_mount "$DEV" "$MNT"

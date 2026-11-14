@@ -40,6 +40,7 @@ STRESS="$(ct_helper fsstress_cetra)"
 # scrub has had its quiet cycles rather than before.
 ct_param_set scrub 1
 ct_param_set scrub_interval_secs 3
+ct_param_set scrub_gap_floor_secs 1
 ct_param_set scrub_gap_secs 2
 DEV="$(ct_big_dev 1536 fsstress)"
 MNT="$(ct_mnt fsstress)"

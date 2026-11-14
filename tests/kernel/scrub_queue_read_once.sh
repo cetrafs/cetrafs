@@ -29,6 +29,7 @@ MNT="$(ct_mnt scrubq)"
 ct_mkfs "$DEV" -z 2 -b 512 -J 0 -N 1024 -f >/dev/null
 ct_param_set scrub 0
 ct_param_set scrub_interval_secs 2
+ct_param_set scrub_gap_floor_secs 1
 ct_param_set scrub_gap_secs 1
 ct_mount "$DEV" "$MNT"
 require_cetrafs_mount "$MNT"

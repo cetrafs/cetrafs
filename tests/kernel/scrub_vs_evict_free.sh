@@ -34,6 +34,7 @@ MNT="$(ct_mnt scevict)"
 ct_track mnt "$MNT"
 ct_mkfs_small "$DEV" >/dev/null
 ct_param_set scrub_interval_secs 2
+ct_param_set scrub_gap_floor_secs 1
 ct_param_set scrub_gap_secs 1
 ct_param_set scrub 0 # armed for the window only
 ct_mount "$DEV" "$MNT"

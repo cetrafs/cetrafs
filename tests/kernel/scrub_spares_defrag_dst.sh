@@ -36,6 +36,7 @@ ct_mkfs_small "$DEV" >/dev/null
 # The fastest cycle the scrub allows, so one lands inside the move
 # rather than the move having to be long enough to catch a slow one.
 ct_param_set scrub_interval_secs 1
+ct_param_set scrub_gap_floor_secs 1
 ct_param_set scrub_gap_secs 1
 ct_mount "$DEV" "$MNT"
 require_cetrafs_mount "$MNT"

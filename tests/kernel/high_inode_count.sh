@@ -61,6 +61,7 @@ echo "$FSCK_OUT" | grep -q "inode $HIGHER is allocated" &&
 log "the scrub reclaims a high-numbered orphan (bitmap CAS in block 2)"
 ct_param_set scrub 1
 ct_param_set scrub_interval_secs 2
+ct_param_set scrub_gap_floor_secs 1
 ct_param_set scrub_gap_secs 1
 orphans() { sed -n 's/^scrub_orphan_inodes_reclaimed: //p' "/proc/fs/cetrafs/$PROC_DEV/info"; }
 # Delta against the module-global counter, same as scrub_orphan_inode.sh:
