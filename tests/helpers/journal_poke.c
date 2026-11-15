@@ -297,7 +297,9 @@ int main(int argc, char **argv)
     cetrafs_journal_header_t hdr;
     memset(&hdr, 0, sizeof(hdr));
     hdr.magic = cetrafs_cpu_to_le32(CETRAFS_JOURNAL_MAGIC);
-    hdr.txn_id = cetrafs_cpu_to_le64(1);
+    /* JOURNAL_POKE_TXN orders several planted entries (replay sorts by
+     * txn id; equal ids sort in no defined order). */
+    hdr.txn_id = cetrafs_cpu_to_le64(getenv("JOURNAL_POKE_TXN") ? strtoull(getenv("JOURNAL_POKE_TXN"), NULL, 0) : 1);
     hdr.target_lba = cetrafs_cpu_to_le64(target_lba);
     hdr.payload_checksum = cetrafs_cpu_to_le32(crc32c_update(0, payload, sizeof(payload)));
     {

@@ -2977,6 +2977,25 @@ static int __cetrafs_journal_replay_node(struct super_block *sb, u32 node_id, bo
                 pr_warn("journal replay: node %u txn %llu: owner ino %llu unreadable -- judging by the guard alone "
                         "(test control)\n",
                         node_id, (unsigned long long) entries[s].txn_id, (unsigned long long) entries[s].owner_ino);
+            } else if (held < 0 && !final_pass) {
+                /*
+                 * Unreadable now, perhaps not after the rest is redone:
+                 * the owner path of a leaf entry crosses an interior
+                 * that is very likely ANOTHER entry of the same batch,
+                 * torn by the crash, and a batch puts a re-edited block
+                 * at its tail, so the leaf's entry often comes first.
+                 * Aborting here aborted the whole area on every attempt
+                 * -- the node could never mount and no peer could
+                 * reclaim it (audit 2026-11-14 A-10). Deferred like an
+                 * unreachable owner; refused below once a pass redoes
+                 * nothing.
+                 */
+                pr_warn("journal replay: node %u txn %llu: owner ino %llu unreadable -- deferred to the next pass\n",
+                        node_id, (unsigned long long) entries[s].txn_id, (unsigned long long) entries[s].owner_ino);
+                deferred++;
+                brelse(tbh);
+                brelse(pbh);
+                continue;
             } else if (held < 0) {
                 atomic64_inc(&cetrafs_journal_replay_refused);
                 pr_err("journal replay: node %u txn %llu: could not read owner ino %llu to confirm target block "
