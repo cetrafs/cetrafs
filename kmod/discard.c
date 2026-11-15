@@ -337,9 +337,24 @@ int cetrafs_discard_handback(struct super_block *sb, u32 bg_id, unsigned long *p
     return 0;
 }
 
+/* TEST ONLY: FITRIM trims on a mount whose discard switch is off, as
+ * before audit 2026-11-15 B-37 (tests/kernel/fstrim_nodiscard.sh). */
+static bool cetrafs_fitrim_ignores_nodiscard;
+cetrafs_test_param(fitrim_ignores_nodiscard, cetrafs_fitrim_ignores_nodiscard, bool, 0644);
+MODULE_PARM_DESC(fitrim_ignores_nodiscard, "TEST ONLY: FITRIM trims with the discard switch off");
+
 /*
  * FITRIM. The range is in bytes, as fstrim(8) passes it; on return
  * range.len is the number of bytes discarded.
+ *
+ * Not while the mount's discard switch is off (`nodiscard`, or
+ * `discard=off` in controls): the switch is what an operator turns off
+ * on an array whose UNMAP is slow, and a distribution's weekly
+ * fstrim.timer runs `fstrim -a` on every node unasked -- long UNMAPs
+ * in flight on every node at once, on exactly the arrays they were
+ * turned off for (audit 2026-11-15 B-37). EOPNOTSUPP is what fstrim(8)
+ * reports as "not supported" and skips. An operator who means it turns
+ * `discard=on` in controls first.
  */
 long cetrafs_fitrim_ioctl(struct file *file, struct fstrim_range __user *arg)
 {
@@ -356,6 +371,12 @@ long cetrafs_fitrim_ioctl(struct file *file, struct fstrim_range __user *arg)
         return -EINVAL;
     if (!cetrafs_discard_supported(sb))
         return -EOPNOTSUPP;
+    if (!cetrafs_sb_discard_enabled(sb) && !READ_ONCE(cetrafs_fitrim_ignores_nodiscard)) {
+        pr_info_ratelimited("%s: fstrim refused: discard is off on this mount (nodiscard, or discard=off in "
+                            "controls); turn discard=on in controls to trim\n",
+                            sb->s_id);
+        return -EOPNOTSUPP;
+    }
     if (sb_rdonly(sb))
         return -EROFS;
     if (cetrafs_sb_is_fenced(sb))
