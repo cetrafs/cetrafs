@@ -265,13 +265,14 @@ struct cetrafs_ext_list {
     u64 *rl;
 };
 
-/* Cap on how fragmented a file this collapser will take on. Each commit
- * rebuilds the shrinking tree (tree_build writes ~entries/255 blocks), so
- * the whole pass is ~O(count^2/255) block writes -- seconds for a
- * realistically fragmented file, ~a minute at this cap, and declined
- * above it (a file that fragmented past 64k extents is better left than
- * churned for many minutes; it still works). */
-#define CETRAFS_DEFRAG_MAX_EXTENTS 65536u
+/* Cap on how fragmented a file this collapser will take on: every file
+ * the tree can hold (4 x 254 x 254). It was 65,536, declining the most
+ * fragmented files -- the ones that need it most (audit 2026-11-15
+ * A-14) -- because each step rebuilt the whole tree; a step now patches
+ * only what it touches (cetrafs_tree_patch()), and what is left per step
+ * is reading and sorting the list, O(n log n) in memory. */
+#define CETRAFS_DEFRAG_MAX_EXTENTS                                                                                   \
+    ((u32) (ARRAY_SIZE(((cetrafs_inode_t *) NULL)->et.idx) * CETRAFS_EXT_BLOCK_MAX_IDX * CETRAFS_EXT_BLOCK_MAX_LEAVES))
 
 /* TEST ONLY: a lower cap, so a suite can have a file declined at will
  * (tests/kernel/defrag_declines.sh). 0: CETRAFS_DEFRAG_MAX_EXTENTS. */
