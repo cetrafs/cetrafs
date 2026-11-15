@@ -3070,8 +3070,8 @@ int cetrafs_alloc_flush_bitmaps(struct super_block *sb)
      * no mutex to take. */
     if (!sb->s_fs_info || !cetrafs_sb_raw(sb))
         return 0;
-    if (serial)
-        cetrafs_sb_bmap_flush_begin(sb);
+    if (serial && cetrafs_sb_bmap_flush_begin(sb))
+        return -EINTR;
     ret = __cetrafs_alloc_flush_bitmaps(sb);
     if (serial)
         cetrafs_sb_bmap_flush_end(sb);
@@ -3108,11 +3108,55 @@ static u32 cetrafs_bmap_flush_first(struct super_block *sb, u32 from, u32 bg_cou
     return b < bg_count ? b : bg_count;
 }
 
+/* TEST ONLY: the boundary flush writes one bitmap block at a time, each
+ * waited for (before audit 2026-11-15 B-29; bmap_flush_batched.sh). */
+static bool cetrafs_bmap_flush_serial;
+cetrafs_test_param(bmap_flush_serial, cetrafs_bmap_flush_serial, bool, 0644);
+MODULE_PARM_DESC(bmap_flush_serial, "TEST ONLY: the boundary bitmap flush writes one block at a time");
+
+static atomic64_t cetrafs_bmap_flush_batches = ATOMIC64_INIT(0);
+u64 cetrafs_bmap_flush_batch_count(void)
+{
+    return (u64) atomic64_read(&cetrafs_bmap_flush_batches);
+}
+
+#define CETRAFS_BMAP_FLUSH_BATCH 256
+
+/* The bitmap blocks a flush collected, sent and waited for together. */
+struct cetrafs_bmap_flush_q {
+    struct buffer_head *bh[CETRAFS_BMAP_FLUSH_BATCH];
+    u32 bg[CETRAFS_BMAP_FLUSH_BATCH];
+    int res[CETRAFS_BMAP_FLUSH_BATCH];
+    unsigned int n, cap;
+};
+
+/* Write what is queued; a failed block fails its group. */
+static void cetrafs_bmap_flush_q_run(struct super_block *sb, struct cetrafs_bmap_flush_q *q, unsigned long *failed)
+{
+    unsigned int i;
+    int r;
+
+    if (!q->n)
+        return;
+    atomic64_inc(&cetrafs_bmap_flush_batches);
+    r = cetrafs_sync_buffers_keep(sb, q->bh, q->n, q->res);
+    for (i = 0; i < q->n; i++) {
+        /* fenced: nothing was sent, every group fails */
+        if (r == -EIO && cetrafs_sb_is_fenced(sb))
+            q->res[i] = -EIO;
+        if (q->res[i])
+            __set_bit(q->bg[i], failed);
+        brelse(q->bh[i]);
+    }
+    q->n = 0;
+}
+
 static int __cetrafs_alloc_flush_bitmaps(struct super_block *sb)
 {
     const cetrafs_superblock_t *raw_sb = cetrafs_sb_raw(sb);
+    struct cetrafs_bmap_flush_q *q = NULL;
     u32 bg_count, bg_id;
-    unsigned long *wrote = NULL;
+    unsigned long *wrote = NULL, *taken = NULL, *failed = NULL;
     unsigned int stall;
     int ret = 0;
 
@@ -3124,56 +3168,77 @@ static int __cetrafs_alloc_flush_bitmaps(struct super_block *sb)
      * flush O(Block Groups), several per fdatasync (audit 2026-11-14 P7). */
     /* Something to write: the device's word on the fence first (B-18). */
     bg_id = cetrafs_bmap_flush_first(sb, 0, bg_count);
-    if (bg_id < bg_count && cetrafs_sb_fence_witnessed(sb))
+    if (bg_id >= bg_count)
+        return 0;
+    if (cetrafs_sb_fence_witnessed(sb))
         return -EIO;
+    /* Before any mark is taken: a mark taken must be written or put back. */
+    q = kvmalloc(sizeof(*q), GFP_NOFS);
+    taken = bitmap_zalloc(bg_count, GFP_NOFS);
+    failed = bitmap_zalloc(bg_count, GFP_NOFS);
+    wrote = bitmap_zalloc(bg_count, GFP_NOFS);
+    if (!q || !taken || !failed || !wrote) {
+        ret = -ENOMEM;
+        goto out;
+    }
+    q->n = 0;
+    q->cap = READ_ONCE(cetrafs_bmap_flush_serial) ? 1 : CETRAFS_BMAP_FLUSH_BATCH;
     for (; bg_id < bg_count; bg_id = cetrafs_bmap_flush_first(sb, bg_id + 1, bg_count)) {
         struct cetrafs_bg_geom bg;
         u64 b, nblocks;
-        int r;
-
-        int bg_ret = 0;
 
         atomic64_inc(&cetrafs_bmap_flush_visits);
         if (!cetrafs_sb_take_bmap_alloc_dirty(sb, bg_id))
             continue;
-        stall = READ_ONCE(cetrafs_alloc_flush_stall_ms) ? xchg(&cetrafs_alloc_flush_stall_ms, 0) : 0;
-        if (stall)
-            msleep(stall); /* test-only; see the parameter */
         /* Taken, so from here every failure must put the mark BACK: a
          * BG whose bits did not reach the device and is no longer marked
          * is never synced by any later boundary, and that boundary then
          * reports success and publishes extents naming those blocks. */
-        bg_ret = cetrafs_read_bg_geom(sb, bg_id, &bg);
-        if (!bg_ret) {
-            nblocks = bg.off_data_region - bg.off_data_bmap;
-            for (b = 0; b < nblocks; b++) {
-                r = cetrafs_sync_one_block(sb, bg.start_block + bg.off_data_bmap + b);
-                if (r && !bg_ret)
-                    bg_ret = r;
-            }
+        __set_bit(bg_id, taken);
+        stall = READ_ONCE(cetrafs_alloc_flush_stall_ms) ? xchg(&cetrafs_alloc_flush_stall_ms, 0) : 0;
+        if (stall)
+            msleep(stall); /* test-only; see the parameter */
+        if (cetrafs_read_bg_geom(sb, bg_id, &bg)) {
+            __set_bit(bg_id, failed);
+            continue;
         }
-        if (bg_ret) {
-            cetrafs_sb_note_bmap_alloc(sb, bg_id);
-            pr_err_ratelimited("BG %u: allocation bitmap not made durable (%d) -- refusing to publish extents\n", bg_id,
-                               bg_ret);
-            if (!ret)
-                ret = bg_ret;
-        } else {
-            /* Written: remembered, so a refused cache flush below can
-             * put its mark back. Without the memory, mark it back now:
-             * the next boundary rewrites it, which costs a write, never
-             * a publish ahead of its bits. */
-            if (!wrote)
-                wrote = bitmap_zalloc(bg_count, GFP_NOFS);
-            if (wrote) {
-                __set_bit(bg_id, wrote);
-            } else {
-                cetrafs_sb_note_bmap_alloc(sb, bg_id);
-                if (!ret)
-                    ret = -ENOMEM;
+        nblocks = bg.off_data_region - bg.off_data_bmap;
+        for (b = 0; b < nblocks; b++) {
+            /* find, not read: a block we never cached cannot be dirty,
+             * and reading it in just to discover that would turn a flush
+             * into I/O over the whole bitmap. */
+            struct buffer_head *bh = sb_find_get_block(sb, bg.start_block + bg.off_data_bmap + b);
+
+            if (!bh)
+                continue;
+            if (unlikely(READ_ONCE(cetrafs_alloc_flush_fail)) && (buffer_dirty(bh) || buffer_cetra_held(bh))) {
+                brelse(bh); /* as a failed write leaves it: still pending */
+                __set_bit(bg_id, failed);
+                continue;
             }
+            q->bh[q->n] = bh;
+            q->bg[q->n] = bg_id;
+            if (++q->n >= q->cap)
+                cetrafs_bmap_flush_q_run(sb, q, failed);
         }
         cond_resched();
+    }
+    cetrafs_bmap_flush_q_run(sb, q, failed);
+    for_each_set_bit(bg_id, taken, bg_count) {
+        if (test_bit(bg_id, failed)) {
+            cetrafs_sb_note_bmap_alloc(sb, bg_id);
+            pr_err_ratelimited("BG %u: allocation bitmap not made durable -- refusing to publish extents\n", bg_id);
+            if (!ret)
+                ret = -EIO;
+        } else {
+            /* Written: remembered, so a refused cache flush below can
+             * put its mark back. */
+            __set_bit(bg_id, wrote);
+        }
+    }
+    if (bitmap_empty(wrote, bg_count)) {
+        bitmap_free(wrote);
+        wrote = NULL;
     }
     /*
      * Written is not durable. Every caller publishes next -- a whole
@@ -3197,7 +3262,11 @@ static int __cetrafs_alloc_flush_bitmaps(struct super_block *sb)
                 ret = fret;
         }
     }
+out:
     bitmap_free(wrote);
+    bitmap_free(failed);
+    bitmap_free(taken);
+    kvfree(q);
     return ret;
 }
 

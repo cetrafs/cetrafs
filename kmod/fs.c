@@ -6678,13 +6678,32 @@ u32 cetrafs_sb_next_bmap_alloc_dirty(struct super_block *sb, u32 from)
 /* Enter and leave the one allocation-bitmap flush. The in-flight count
  * is raised BEFORE the lock and before any mark is taken, so a reader
  * that sees no marks also sees the flush that took them. */
-void cetrafs_sb_bmap_flush_begin(struct super_block *sb)
+/* TEST ONLY: the flush mutex is taken unkillably, as before (the
+ * control of tests/kernel/bmap_flush_batched.sh). */
+static bool cetrafs_bmap_flush_unkillable;
+cetrafs_test_param(bmap_flush_unkillable, cetrafs_bmap_flush_unkillable, bool, 0644);
+MODULE_PARM_DESC(bmap_flush_unkillable, "TEST ONLY: a bitmap flush waits for the one in flight unkillably");
+
+/* Killable: a caller queued behind a long flush -- a large
+ * preallocation's thousands of bitmap blocks -- was unkillable in D state
+ * for as long as it took (audit 2026-11-15 B-29). -EINTR: not entered;
+ * the caller publishes nothing. */
+int cetrafs_sb_bmap_flush_begin(struct super_block *sb)
 {
     struct cetrafs_sb_info *sbi = sb->s_fs_info;
 
     atomic_inc(&sbi->bmap_flush_inflight);
     smp_mb__after_atomic();
-    mutex_lock(&sbi->bmap_flush_mutex);
+    if (READ_ONCE(cetrafs_bmap_flush_unkillable)) {
+        mutex_lock(&sbi->bmap_flush_mutex); /* TEST ONLY: see the parameter */
+        return 0;
+    }
+    if (mutex_lock_killable(&sbi->bmap_flush_mutex)) {
+        smp_mb__before_atomic();
+        atomic_dec(&sbi->bmap_flush_inflight);
+        return -EINTR;
+    }
+    return 0;
 }
 
 void cetrafs_sb_bmap_flush_end(struct super_block *sb)

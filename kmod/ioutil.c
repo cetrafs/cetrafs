@@ -1013,6 +1013,49 @@ int cetrafs_sync_buffer_keep(struct super_block *sb, struct buffer_head *bh)
 }
 
 /*
+ * cetrafs_sync_buffer_keep() for several blocks: every write sent under
+ * one plug, then all waited for; res[i] is each one's verdict. The
+ * boundary bitmap flush wrote its blocks one synchronous write at a time
+ * under the node's flush mutex -- ~38 ms a block on a SAN, minutes for
+ * a large preallocation, every fsync and close of the node queued behind
+ * it (audit 2026-11-15 B-29, M-8). Returns the first error.
+ */
+int cetrafs_sync_buffers_keep(struct super_block *sb, struct buffer_head **bhs, unsigned int n, int *res)
+{
+    struct cetrafs_keep_io {
+        int state;
+        bool was_dirty, was_held;
+    } *io;
+    struct blk_plug plug;
+    unsigned int i;
+    int ret = 0, r;
+
+    if (cetrafs_sb_is_fenced(sb))
+        return -EIO;
+    io = kmalloc_array(n, sizeof(*io), GFP_NOFS);
+    if (!io) {
+        for (i = 0; i < n; i++) {
+            res[i] = cetrafs_sync_buffer_keep(sb, bhs[i]);
+            if (res[i] && !ret)
+                ret = res[i];
+        }
+        return ret;
+    }
+    blk_start_plug(&plug);
+    for (i = 0; i < n; i++)
+        io[i].state = __cetrafs_keep_submit(bhs[i], &io[i].was_dirty, &io[i].was_held);
+    blk_finish_plug(&plug);
+    for (i = 0; i < n; i++) {
+        r = io[i].state == 1 ? __cetrafs_keep_wait(bhs[i], io[i].was_dirty, io[i].was_held) : io[i].state;
+        res[i] = cetrafs_meta_write_result(sb, bhs[i], r);
+        if (res[i] && !ret)
+            ret = res[i];
+    }
+    kfree(io);
+    return ret;
+}
+
+/*
  * End an update WITHOUT dirtying the buffer: the edit is held back for
  * the next boundary (leafdefer.c), which writes it through the journal.
  * The first time, the buffer is pinned and marked; the caller has listed
