@@ -3102,7 +3102,7 @@ static int __cetrafs_journal_replay_node(struct super_block *sb, u32 node_id, bo
             cetrafs_bh_begin_update(tbh);
             memcpy(tbh->b_data, pbh->b_data, CETRAFS_BLOCK_SIZE);
             cetrafs_bh_end_update(tbh);
-            werr = cetrafs_sync_buffer(sb, tbh);
+            werr = cetrafs_sync_buffer_refusable(sb, tbh);
             if (werr) {
                 /* Do NOT consume this entry and do NOT park the area
                  * CLEAN: the redo did not land, and the entry is the
@@ -3171,7 +3171,7 @@ consume:
             cetrafs_bh_begin_update(hbh);
             memset(hbh->b_data, 0, CETRAFS_BLOCK_SIZE);
             cetrafs_bh_end_update(hbh);
-            werr_consume = cetrafs_sync_buffer(sb, hbh);
+            werr_consume = cetrafs_sync_buffer_refusable(sb, hbh);
         }
         brelse(hbh);
         if (werr_consume && READ_ONCE(cetrafs_journal_consume_fail_park)) {

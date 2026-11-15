@@ -582,11 +582,22 @@ static unsigned int cetrafs_meta_write_nospc;
 cetrafs_test_param(meta_write_nospc, cetrafs_meta_write_nospc, uint, 0644);
 MODULE_PARM_DESC(meta_write_nospc, "TEST ONLY: the next N synchronous metadata writes return BLK_STS_NOSPC unsent");
 
+/* TEST ONLY: every synchronous metadata write of this one block answers
+ * BLK_STS_NOSPC unsent while it is set -- a block the array keeps
+ * refusing, as a snapshot's copy-on-write with the pool full does
+ * (tests/kernel/journal_replay_refused.sh). 0 = off. */
+static unsigned long long cetrafs_meta_write_nospc_block;
+cetrafs_test_param(meta_write_nospc_block, cetrafs_meta_write_nospc_block, ullong, 0644);
+
 static int cetrafs_write_locked_bh(struct buffer_head *bh)
 {
     struct bio *bio;
     int ret;
 
+    if (READ_ONCE(cetrafs_meta_write_nospc_block) && bh->b_blocknr == READ_ONCE(cetrafs_meta_write_nospc_block)) {
+        ret = -ENOSPC; /* test-only: see the parameter */
+        goto done;
+    }
     if (cetrafs_meta_write_nospc) {
         cetrafs_meta_write_nospc--;
         ret = -ENOSPC; /* test-only: what a full thin pool answers */
@@ -817,6 +828,41 @@ int cetrafs_sync_buffer(struct super_block *sb, struct buffer_head *bh)
     if (cetrafs_sb_is_fenced(sb))
         return -EIO;
     return cetrafs_meta_write_result(sb, bh, __cetrafs_sync_buffer(bh));
+}
+
+/*
+ * cetrafs_sync_buffer() for a journal replay's redo and consume: the
+ * device's DEFINITE refusal -- a thin pool out of space (BLK_STS_NOSPC),
+ * a target refusing the command (BLK_STS_TARGET: write protect, an
+ * illegal request) -- comes back as an error, not a stop. Nothing landed;
+ * the entry stays, the area stays DIRTY, and the replayer releases its
+ * claim and lives. It stopped instead, and a block the array refuses
+ * for everyone -- a snapshot's copy-on-write, a full pool -- stopped
+ * every survivor that came to replay the dead node's area, one stale
+ * window apart, and boot-looped one under errors=panic (audit 2026-11-15
+ * B-25, B-34). The cached copy, which holds the bytes that did not land,
+ * is forgotten. Any other error still stops: it may have landed.
+ */
+static bool cetrafs_replay_refusal_stops;
+cetrafs_test_param(replay_refusal_stops, cetrafs_replay_refusal_stops, bool, 0644);
+MODULE_PARM_DESC(replay_refusal_stops, "TEST ONLY: a replay write the device refuses stops the mount, as before");
+
+int cetrafs_sync_buffer_refusable(struct super_block *sb, struct buffer_head *bh)
+{
+    int ret;
+
+    if (cetrafs_sb_is_fenced(sb))
+        return -EIO;
+    ret = __cetrafs_sync_buffer(bh);
+    if ((ret == -ENOSPC || ret == -EREMOTEIO) && !READ_ONCE(cetrafs_replay_refusal_stops)) {
+        pr_warn_ratelimited("%s: the device refused a journal replay write (%s, block %llu, %d) -- not executed; "
+                            "the entry is kept for a later replay\n",
+                            sb->s_id, cetrafs_block_role(sb, bh->b_blocknr), (unsigned long long) bh->b_blocknr,
+                            ret);
+        cetrafs_forget_block(sb, bh->b_blocknr);
+        return ret;
+    }
+    return cetrafs_meta_write_result(sb, bh, ret);
 }
 
 /*

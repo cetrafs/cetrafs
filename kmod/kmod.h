@@ -761,6 +761,7 @@ void cetrafs_bh_read_unlock(struct buffer_head *bh);
 /* Synchronous write whose result is TRUE, unlike sync_dirty_buffer()'s
  * here -- see ioutil.c. _keep never discards the cached bytes on error. */
 int cetrafs_sync_buffer(struct super_block *sb, struct buffer_head *bh);
+int cetrafs_sync_buffer_refusable(struct super_block *sb, struct buffer_head *bh);
 int cetrafs_sync_buffer_keep(struct super_block *sb, struct buffer_head *bh);
 int cetrafs_sync_new_buffer(struct super_block *sb, struct buffer_head *bh);
 int cetrafs_sync_new_buffers(struct super_block *sb, struct buffer_head **bhs, unsigned int n);
