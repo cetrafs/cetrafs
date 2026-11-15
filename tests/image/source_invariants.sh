@@ -724,7 +724,7 @@ spin_lines() { # <files...>: file:line:code for every line run with a spinlock h
     }' "$@"
 }
 SPIN_SLEEPERS_RE='\b(msleep|usleep_range|ssleep|mutex_lock[a-z_]*|down|down_[a-z_]+|wait_event[a-z_]*|wait_for_[a-z_]+|schedule[a-z_]*|cond_resched|lock_buffer|wait_on_buffer|[a-z_]*bread[a-z_]*|submit_bh|sync_dirty_buffer|iput|brelse|vmalloc|kvmalloc|copy_(to|from)_user|cancel_[a-z_]*_sync|flush_[a-z_]+|synchronize_[a-z_]+)\('
-SPIN_OK='cetrafs_peer_window_floor_secs cetrafs_sb_own_renewal_overdue cetrafs_deferred_on_list cetrafs_deferred_eager cetrafs_ext_key_matches cetrafs_inode_deferred cetrafs_inode_fd_copy cetrafs_inode_get_generation cetrafs_inode_wb_failed cetrafs_le16 cetrafs_le32 cetrafs_le64 cetrafs_nswait_is_current cetrafs_pending_any cetrafs_row_mark_of cetrafs_row_mark_same cetrafs_sb_bg_discard_pending_ignored cetrafs_sb_layout_of cetrafs_sb_stale_secs'
+SPIN_OK='cetrafs_peer_window_floor_secs cetrafs_sb_own_renewal_overdue cetrafs_deferred_on_list cetrafs_deferred_eager cetrafs_ext_key_matches cetrafs_inode_deferred cetrafs_inode_fd_copy cetrafs_inode_get_generation cetrafs_inode_wb_failed cetrafs_le16 cetrafs_le32 cetrafs_le64 cetrafs_nswait_is_current cetrafs_pending_any cetrafs_resv_publish cetrafs_resv_unpublish cetrafs_row_mark_of cetrafs_row_mark_same cetrafs_sb_bg_discard_pending_ignored cetrafs_sb_layout_of cetrafs_sb_stale_secs'
 SL="$(spin_lines "$K"/*.c)"
 [ "$(wc -l <<<"$SL")" -gt 100 ] || fail "class 19 spinlock: setup -- only $(wc -l <<<"$SL") lines found under a spinlock (the scan no longer matches)"
 SPIN_BAD="$(grep -E "$SPIN_SLEEPERS_RE" <<<"$SL" | grep -vE 'GFP_ATOMIC|GFP_NOWAIT' | head -5 || true)"
@@ -1260,6 +1260,7 @@ fs.c:cetrafs_sb_release_lock heartbeat-only;-the-writers-wait-killable
 fs.c:cetrafs_sb_release_wait killable;-the-plain-down_read-is-the-release_wait_unkillable-control-knob
 fs.c:cetrafs_sb_birth_gate held-across-one-bit-CAS
 fs.c:cetrafs_shutdown_ioctl admin-ioctl;-s_umount
+inode.c:cetrafs_write_vfs_inode invalidate_lock-shared-of-an-inode-being-evicted:-its-only-holders-are-tree-edits-each-bounded-by-its-own-I/O
 fs.c:cetrafs_sb_bg_flush_lock holder-is-one-CAS-from-letting-go;-an-EINTR-would-be-a-new-failure
 fs.c:cetrafs_sb_zg_write_lock holder-is-one-CAS-from-letting-go;-an-EINTR-would-be-a-new-failure
 journal.c:cetrafs_journal_take_slot in-flight-writes-only;-a-killed-close-must-finish-(4949eca)
@@ -1917,7 +1918,9 @@ for fn in $FDM; do
     u="$(fd_unchecked "$src" "$fn")"
     if [ -n "$u" ] && ! fd_publishes "$src" "$fn"; then FDS="$FDS$fn "; else FDU="$FDU$u "; fi
 done
-[ "$(echo $FDM | wc -w)" = 3 ] || fail "class 9: $(echo $FDM | wc -w) file-sector CAS mutators (pinned at 3: $(echo $FDM)) -- review the new one and update the pin"
+# 4: cetrafs_unborn_fd_mutate (review F-11) swaps only a never-written
+# sector -- all zeros, file_seq 0 -- and stamps a new file_seq
+[ "$(echo $FDM | wc -w)" = 4 ] || fail "class 9: $(echo $FDM | wc -w) file-sector CAS mutators (pinned at 4: $(echo $FDM)) -- review the new one and update the pin"
 [ -z "${FDU// /}" ] && pass "class 9: every file-sector CAS mutator that publishes compares file_seq ($(echo $FDM); stamp-only: $(echo $FDS))" ||
     fail "class 9: a file-sector CAS mutator publishes without comparing file_seq: $FDU"
 SAMPLE="$(ct_tmp fdmut).c"
@@ -2148,7 +2151,6 @@ cetrafs_unlink_locked calls:cetrafs_lock_foreign_user_settled
 cetrafs_rename_locked calls:cetrafs_lock_foreign_user_settled
 cetrafs_link_locked calls:cetrafs_lock_foreign_user_settled
 cetrafs_setattr_locked calls:cetrafs_lock_foreign_user_settled
-cetrafs_fallocate calls:cetrafs_lock_foreign_user_settled
 cetrafs_zero_range_inplace calls:cetrafs_lock_foreign_user_settled
 cetrafs_foreign_claim_from_raw final:a-holder-judged-dead-came-back-it-is-live
 cetrafs_rebuild_recheck final:a-peer-arrived-after-the-new-map-was-computed-waiting-would-publish-a-stale-map

@@ -238,13 +238,12 @@ static int cetrafs_sync_fs(struct super_block *sb, int wait)
          * was past its gate when the stop came -- the dirt the re-gate
          * below keeps off the device (tests/kernel/sync_stopped_midflush.sh). */
         if (unlikely(READ_ONCE(cetrafs_sync_test_dirty_lba)) && wait) {
-            struct buffer_head *tbh = sb_bread(sb, xchg(&cetrafs_sync_test_dirty_lba, 0));
+            struct buffer_head *tbh = cetrafs_bread_retry(sb, xchg(&cetrafs_sync_test_dirty_lba, 0));
 
             if (tbh) {
-                lock_buffer(tbh);
+                cetrafs_bh_begin_update(tbh);
                 memset(tbh->b_data, 0xd7, 64);
-                mark_buffer_dirty(tbh);
-                unlock_buffer(tbh);
+                cetrafs_bh_end_update(tbh); /* left dirty for writeback: the point of the knob */
                 brelse(tbh);
             }
             /* ...and the lease runs out now, after the flushes */

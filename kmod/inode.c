@@ -851,6 +851,7 @@ static int cetrafs_birth_claim_mutate(void *image, unsigned int len, void *priv)
  * Returns 0 stamped, 1 the number was claimed first, <0 an error.
  */
 struct cetrafs_unborn_ctx {
+    struct super_block *sb;
     u64 ino;
     bool lost;
 };
@@ -882,18 +883,19 @@ static int cetrafs_unborn_fd_mutate(void *image, unsigned int len, void *priv)
 
     if (len < CETRAFS_INODE_FD_BYTES)
         return -EINVAL;
-    if (memchr_inv(image, 0, CETRAFS_INODE_FD_BYTES)) {
+    memset(&rec, 0, sizeof(rec));
+    memcpy((u8 *) &rec + CETRAFS_INODE_FD_OFF, image, sizeof(rec) - CETRAFS_INODE_FD_OFF);
+    /* Never written: no change stamp yet, and no other byte either. */
+    if (cetrafs_le64(rec.file_seq) != 0 || memchr_inv(image, 0, CETRAFS_INODE_FD_BYTES)) {
         ctx->lost = true;
         return 1;
     }
-    memset(&rec, 0, sizeof(rec));
     rec.ino = cetrafs_cpu_to_le64(ctx->ino);
-    rec.fd_ino = rec.ino;
     /* An empty tree, as every creator stamps one: a header the owned-
      * block walk can read, and nothing under it. */
     rec.eh.eh_magic = cetrafs_cpu_to_le16(CETRAFS_EXT_MAGIC);
     rec.eh.eh_max = cetrafs_cpu_to_le16(ARRAY_SIZE(rec.et.leaf));
-    rec.fd_checksum = cetrafs_cpu_to_le64(cetrafs_inode_crc_fd(&rec));
+    cetrafs_inode_stamp_crc_fd(ctx->sb, &rec); /* identity echo, file_seq, checksum */
     /* The struct ends short of the sector: the rest is dead space, zero. */
     memset(image, 0, CETRAFS_INODE_FD_BYTES);
     memcpy(image, (const u8 *) &rec + CETRAFS_INODE_FD_OFF, sizeof(rec) - CETRAFS_INODE_FD_OFF);
@@ -903,7 +905,7 @@ static int cetrafs_unborn_fd_mutate(void *image, unsigned int len, void *priv)
 int cetrafs_inode_stamp_unborn(struct super_block *sb, u64 ino)
 {
     static const u8 zeros[CETRAFS_INODE_NS_BYTES];
-    struct cetrafs_unborn_ctx ctx = {.ino = ino};
+    struct cetrafs_unborn_ctx ctx = {.sb = sb, .ino = ino};
     u64 lba = cetrafs_inode_lba(sb, ino);
     int ret;
 
