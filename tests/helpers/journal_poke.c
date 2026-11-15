@@ -56,6 +56,10 @@
  * JOURNAL_POKE_OWNER=<ino> names that inode instead (its generation read
  * from its record), and JOURNAL_POKE_OWNER_GEN=<n> overrides the
  * generation.
+ *
+ * JOURNAL_POKE_PREV_FROM=<file> guards the entry against the image in
+ * <file> instead of the target's current one: the second of two entries
+ * for one block, written against what the first puts there.
  */
 #include <fcntl.h>
 #include <inttypes.h>
@@ -320,7 +324,20 @@ int main(int argc, char **argv)
         uint8_t cur[CETRAFS_BLOCK_SIZE];
         uint32_t prev;
 
-        pread_all(fd, cur, sizeof(cur), (off_t) target_lba * CETRAFS_BLOCK_SIZE);
+        if (getenv("JOURNAL_POKE_PREV_FROM") && *getenv("JOURNAL_POKE_PREV_FROM")) {
+            /* guard against this image instead of the target's current
+             * one: an entry chained after another for the same block */
+            int pf = open(getenv("JOURNAL_POKE_PREV_FROM"), O_RDONLY);
+
+            if (pf < 0) {
+                perror("JOURNAL_POKE_PREV_FROM");
+                exit(1);
+            }
+            pread_all(pf, cur, sizeof(cur), 0);
+            close(pf);
+        } else {
+            pread_all(fd, cur, sizeof(cur), (off_t) target_lba * CETRAFS_BLOCK_SIZE);
+        }
         prev = crc32c_update(0, cur, sizeof(cur));
         if (!strcmp(guard, "--guard-stale"))
             prev = ~prev; /* a value the target provably does not hold */

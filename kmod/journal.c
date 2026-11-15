@@ -2246,8 +2246,54 @@ struct cetrafs_journal_replay_entry {
     u32 prev_checksum;
     u32 payload_checksum;
     bool before_park; /* from a session the area was parked after */
+    bool undecided; /* the scan could not judge it: kept, never applied */
     u64 owner_ino, owner_generation; /* whose block the target is (L9) */
 };
+
+/* Replay's verdict on each entry, per replay call. */
+enum {
+    CETRAFS_JR_PENDING = 0,
+    CETRAFS_JR_DONE,     /* redone or refused, and consumed */
+    CETRAFS_JR_KEPT,     /* undecidable this time: kept, the area stays DIRTY */
+    CETRAFS_JR_DEFERRED, /* waits for the next pass */
+};
+
+/* TEST ONLY: an undecidable entry aborts the whole area, as before
+ * (tests/kernel/journal_replay_kept.sh's negative control). */
+static bool cetrafs_journal_kept_aborts;
+cetrafs_test_param(journal_kept_aborts, cetrafs_journal_kept_aborts, bool, 0644);
+MODULE_PARM_DESC(journal_kept_aborts, "TEST ONLY: one undecidable replay entry aborts the whole area (the old behaviour)");
+
+/* TEST ONLY: judge an entry although an older entry for the same block
+ * waits or is kept (journal_replay_kept.sh's other control). */
+static bool cetrafs_journal_unordered;
+cetrafs_test_param(journal_unordered, cetrafs_journal_unordered, bool, 0644);
+MODULE_PARM_DESC(journal_unordered, "TEST ONLY: judge a replay entry past an older undecided one for the same block");
+
+/*
+ * Does an OLDER entry for the same block still wait (DEFERRED) or stay
+ * undecided (KEPT)? Then this one may not be judged yet: the guard
+ * judges an entry against the block as it is NOW, and the block does not
+ * yet hold the image the older entry would put there -- the newer entry
+ * reads CHANGED, is consumed unapplied, and when the older one is redone
+ * the block is left at the older image, the newer write lost for good.
+ * Entries are sorted by txn id, so "older" is "earlier in the array".
+ */
+static int cetrafs_journal_blocked_by_older(const struct cetrafs_journal_replay_entry *entries, const u8 *st,
+                                            u64 s)
+{
+    u64 j;
+
+    if (READ_ONCE(cetrafs_journal_unordered))
+        return CETRAFS_JR_PENDING;
+    for (j = s; j-- > 0;) {
+        if (entries[j].target_lba != entries[s].target_lba)
+            continue;
+        if (st[j] == CETRAFS_JR_KEPT || st[j] == CETRAFS_JR_DEFERRED)
+            return st[j];
+    }
+    return CETRAFS_JR_PENDING;
+}
 
 /*
  * Is the entry's target still a metadata block of the inode it was
@@ -2497,13 +2543,34 @@ static bool cetrafs_journal_consume_fail_park;
 cetrafs_test_param(journal_consume_fail_park, cetrafs_journal_consume_fail_park, bool, 0644);
 MODULE_PARM_DESC(journal_consume_fail_park, "TEST ONLY: park the area clean after a failed consume");
 
+/* Entries a replay kept undecided (procfs journal_replay_kept). */
+static atomic64_t cetrafs_journal_replay_kept = ATOMIC64_INIT(0);
+
+u64 cetrafs_journal_replay_kept_count(void)
+{
+    return (u64) atomic64_read(&cetrafs_journal_replay_kept);
+}
+
+/* An entry the scan could not judge: what it names is all it records. */
+static void cetrafs_journal_entry_undecided(struct cetrafs_journal_replay_entry *e,
+                                            const cetrafs_journal_header_t *hdr, u64 header_lba)
+{
+    memset(e, 0, sizeof(*e));
+    e->txn_id = cetrafs_le64(hdr->txn_id);
+    e->target_lba = cetrafs_le64(hdr->target_lba);
+    e->header_lba = header_lba;
+    e->undecided = true;
+}
+
 static int __cetrafs_journal_replay_node(struct super_block *sb, u32 node_id, bool wait_for_claim)
 {
     u64 area_start, slots, s, park_seq = 0;
     struct cetrafs_journal_replay_entry *entries;
     u32 count = 0, applied = 0, my_node_id = 0;
-    bool *done = NULL, final_pass = false;
-    unsigned int pass = 0;
+    u8 *st = NULL;
+    bool final_pass = false;
+    unsigned int pass = 0, kept = 0;
+    int kept_ret = 0;
     bool dirty = false, claimed = false;
     int ret, werr_consume;
 
@@ -2662,9 +2729,19 @@ static int __cetrafs_journal_replay_node(struct super_block *sb, u32 node_id, bo
 
         pbh = cetrafs_bread_uncached_retry(sb, header_lba + 1);
         if (!pbh) {
+            /* Its target is known, so the entry is kept -- and every
+             * newer entry for that block waits behind it -- while the
+             * rest of the area is replayed. */
+            pr_err("journal replay: node %u slot %llu: payload unreadable -- entry kept, area stays dirty\n",
+                   node_id, (unsigned long long) s);
+            cetrafs_journal_entry_undecided(&entries[count++], hdr, header_lba);
             brelse(hbh);
-            ret = -EIO;
-            goto out_free;
+            if (READ_ONCE(cetrafs_journal_kept_aborts)) {
+                ret = -EIO;
+                goto out_free;
+            }
+            kept_ret = kept_ret ?: -EIO;
+            continue;
         }
         payload_crc = ~crc32c(~0U, pbh->b_data, CETRAFS_BLOCK_SIZE);
         brelse(pbh);
@@ -2697,8 +2774,8 @@ static int __cetrafs_journal_replay_node(struct super_block *sb, u32 node_id, bo
          * parked CLEAN over it -- the torn block it would have repaired
          * stayed torn for good (audit 2026-11-06 M3;
          * tests/kernel/journal_replay_lookup_error.sh). Not knowing
-         * aborts with the area DIRTY, as a payload read failure does;
-         * the next replay asks again.
+         * keeps the entry with the area DIRTY, as a payload read
+         * failure does; the next replay asks again.
          *
          * A target past the end of THIS node's layout is the same "not
          * knowing" on a volume grown live: a peer can grow, write there
@@ -2725,11 +2802,16 @@ static int __cetrafs_journal_replay_node(struct super_block *sb, u32 node_id, bo
             }
             if (lret) {
                 pr_err("journal replay: node %u slot %llu: could not tell where target block %llu lies (%d) -- "
-                       "leaving the area dirty for the next replay\n",
+                       "entry kept, leaving the area dirty for the next replay\n",
                        node_id, (unsigned long long) s, (unsigned long long) cetrafs_le64(hdr->target_lba), lret);
+                cetrafs_journal_entry_undecided(&entries[count++], hdr, header_lba);
                 brelse(hbh);
-                ret = lret;
-                goto out_free;
+                if (READ_ONCE(cetrafs_journal_kept_aborts)) {
+                    ret = lret;
+                    goto out_free;
+                }
+                kept_ret = kept_ret ?: lret;
+                continue;
             }
         }
 
@@ -2741,6 +2823,7 @@ static int __cetrafs_journal_replay_node(struct super_block *sb, u32 node_id, bo
         entries[count].prev_checksum = cetrafs_le32(hdr->prev_checksum);
         entries[count].payload_checksum = cetrafs_le32(hdr->payload_checksum);
         entries[count].before_park = false;
+        entries[count].undecided = false;
         entries[count].owner_ino = cetrafs_le64(hdr->owner_ino);
         entries[count].owner_generation = cetrafs_le64(hdr->owner_generation);
         count++;
@@ -2763,10 +2846,16 @@ static int __cetrafs_journal_replay_node(struct super_block *sb, u32 node_id, bo
      * repeat while one of them redoes something; once one redoes nothing,
      * what is still refused is refused as before. Every look is fresh.
      */
-    done = count ? kvcalloc(count, sizeof(*done), GFP_KERNEL) : NULL;
-    if (count && !done) {
+    st = count ? kvcalloc(count, sizeof(*st), GFP_KERNEL) : NULL;
+    if (count && !st) {
         ret = -ENOMEM;
         goto out_free;
+    }
+    for (s = 0; s < count; s++) {
+        if (entries[s].undecided) {
+            st[s] = CETRAFS_JR_KEPT;
+            kept++;
+        }
     }
     for (;;) {
     unsigned int deferred = 0, applied_before = applied;
@@ -2775,9 +2864,26 @@ static int __cetrafs_journal_replay_node(struct super_block *sb, u32 node_id, bo
         struct buffer_head *pbh, *tbh, *hbh;
         bool apply, owner_dir = false, owner_known = false;
         u32 judged_crc = 0;
+        int blocked;
 
-        if (done[s])
+        if (st[s] == CETRAFS_JR_DEFERRED)
+            st[s] = CETRAFS_JR_PENDING; /* a new pass looks again */
+        if (st[s] != CETRAFS_JR_PENDING)
             continue;
+
+        blocked = cetrafs_journal_blocked_by_older(entries, st, s);
+        if (blocked == CETRAFS_JR_DEFERRED) {
+            st[s] = CETRAFS_JR_DEFERRED;
+            deferred++;
+            continue;
+        }
+        if (blocked == CETRAFS_JR_KEPT) {
+            pr_warn("journal replay: node %u txn %llu: an older entry for target block %llu is kept -- "
+                    "keeping this one behind it\n",
+                    node_id, (unsigned long long) entries[s].txn_id, (unsigned long long) entries[s].target_lba);
+            ret = -EIO;
+            goto keep;
+        }
 
         if (entries[s].before_park) {
             atomic64_inc(&cetrafs_journal_replay_skipped);
@@ -2832,7 +2938,7 @@ static int __cetrafs_journal_replay_node(struct super_block *sb, u32 node_id, bo
                        node_id, (unsigned long long) entries[s].txn_id,
                        (unsigned long long) entries[s].target_lba, aret);
                 ret = aret == -ENOMEM ? aret : -EIO;
-                goto out_free;
+                goto keep;
             }
             if (!live) {
                 atomic64_inc(&cetrafs_journal_replay_skipped);
@@ -2846,7 +2952,7 @@ static int __cetrafs_journal_replay_node(struct super_block *sb, u32 node_id, bo
         pbh = cetrafs_bread_uncached_retry(sb, entries[s].payload_lba);
         if (!pbh) {
             ret = -EIO;
-            goto out_free;
+            goto keep;
         }
 
         /* FORCED-FRESH, not sb_bread(): the whole point of the read is
@@ -2866,7 +2972,7 @@ static int __cetrafs_journal_replay_node(struct super_block *sb, u32 node_id, bo
                     if (!tbh) {
                         brelse(pbh);
                         ret = -EIO;
-                        goto out_free;
+                        goto keep;
                     }
                 }
                 tcrc = ~crc32c(~0U, tbh->b_data, CETRAFS_BLOCK_SIZE);
@@ -2915,7 +3021,7 @@ static int __cetrafs_journal_replay_node(struct super_block *sb, u32 node_id, bo
                 if (!tbh) {
                     brelse(pbh);
                     ret = -EIO;
-                    goto out_free;
+                    goto keep;
                 }
                 if (~crc32c(~0U, tbh->b_data, CETRAFS_BLOCK_SIZE) == tcrc)
                     break;
@@ -3031,6 +3137,7 @@ static int __cetrafs_journal_replay_node(struct super_block *sb, u32 node_id, bo
                  */
                 pr_warn("journal replay: node %u txn %llu: owner ino %llu unreadable -- deferred to the next pass\n",
                         node_id, (unsigned long long) entries[s].txn_id, (unsigned long long) entries[s].owner_ino);
+                st[s] = CETRAFS_JR_DEFERRED;
                 deferred++;
                 brelse(tbh);
                 brelse(pbh);
@@ -3044,10 +3151,11 @@ static int __cetrafs_journal_replay_node(struct super_block *sb, u32 node_id, bo
                 brelse(tbh);
                 brelse(pbh);
                 ret = -EIO;
-                goto out_free;
+                goto keep;
             }
             owner_known = held >= 0;
             if (held == 0 && !final_pass) {
+                st[s] = CETRAFS_JR_DEFERRED;
                 deferred++; /* perhaps reachable once the rest is redone */
                 brelse(tbh);
                 brelse(pbh);
@@ -3080,7 +3188,7 @@ static int __cetrafs_journal_replay_node(struct super_block *sb, u32 node_id, bo
             if (!tbh) {
                 brelse(pbh);
                 ret = -EIO;
-                goto out_free;
+                goto keep;
             }
             if (~crc32c(~0U, tbh->b_data, CETRAFS_BLOCK_SIZE) != judged_crc) {
                 apply = false;
@@ -3117,7 +3225,7 @@ static int __cetrafs_journal_replay_node(struct super_block *sb, u32 node_id, bo
                 brelse(tbh);
                 brelse(pbh);
                 ret = werr;
-                goto out_free;
+                goto keep;
             }
             /* Durable, not just completed, before the consume below --
              * the write path's own rule: a volatile cache can otherwise
@@ -3133,7 +3241,7 @@ static int __cetrafs_journal_replay_node(struct super_block *sb, u32 node_id, bo
                 brelse(tbh);
                 brelse(pbh);
                 ret = werr;
-                goto out_free;
+                goto keep;
             }
             atomic64_inc(&cetrafs_journal_replay_applied);
             applied++;
@@ -3163,7 +3271,7 @@ consume:
         hbh = cetrafs_bread_retry(sb, entries[s].header_lba);
         if (!hbh) {
             ret = -EIO;
-            goto out_free;
+            goto keep;
         }
         if (READ_ONCE(cetrafs_journal_consume_fail_once) && xchg(&cetrafs_journal_consume_fail_once, false)) {
             werr_consume = -EIO; /* TEST ONLY: as a header write the device refused */
@@ -3195,9 +3303,27 @@ consume:
                    "for a later attempt\n",
                    node_id, (unsigned long long) entries[s].txn_id, werr_consume);
             ret = werr_consume;
-            goto out_free;
+            goto keep;
         }
-        done[s] = true;
+        st[s] = CETRAFS_JR_DONE;
+        continue;
+
+keep:
+        /*
+         * This entry cannot be decided now: keep it, and with it the
+         * area's DIRTY flag, and go on with the rest. One unreadable
+         * owner or refused write used to abort the whole area, so every
+         * other block it would have repaired stayed torn until that one
+         * entry could be decided (audit 2026-11-15 A-10, B-6). Newer
+         * entries for the same block stay behind it
+         * (cetrafs_journal_blocked_by_older()).
+         */
+        if (READ_ONCE(cetrafs_journal_kept_aborts))
+            goto out_free;
+        st[s] = CETRAFS_JR_KEPT;
+        kept++;
+        kept_ret = kept_ret ?: ret;
+        ret = 0;
     }
     if (!deferred)
         break;
@@ -3206,6 +3332,14 @@ consume:
     pass++;
     }
 
+    if (kept) {
+        pr_err("journal replay: node %u replayed %u entr%s; %u kept undecided -- the area stays dirty for the "
+               "next replay\n",
+               node_id, applied, applied == 1 ? "y" : "ies", kept);
+        atomic64_add(kept, &cetrafs_journal_replay_kept);
+        ret = kept_ret ?: -EIO;
+        goto out_free;
+    }
     pr_info("journal replay: node %u replayed %u valid entr%s\n", node_id, applied, applied == 1 ? "y" : "ies");
 
     /* Park the flag at CLEAN and drop the claim in ONE compare-and-swap:
@@ -3220,7 +3354,7 @@ consume:
     claimed = false;
 
 out_free:
-    kvfree(done);
+    kvfree(st);
     kvfree(entries);
 out_release:
     if (claimed)
