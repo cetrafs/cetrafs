@@ -102,6 +102,7 @@ if [ "$TEST_HOOKS" = 1 ]; then
     no_hold=${CETRAFS_TEST_NO_TRANSPORT_HOLD:-}
     t_open=${CETRAFS_TEST_TIMER_FAILS_OPEN:-} # an unknown timer reads 0, as before F-23
     t_nostack=${CETRAFS_TEST_NO_STACK:-}      # stacked dm devices unchecked, as before F-23
+    t_nodetect=${CETRAFS_TEST_NO_DETECT:-}    # iSCSI NOP-out detection left out, as before B-20
 fi
 
 # tmr <file>: a timer's seconds, or "?" when it cannot be told -- missing,
@@ -133,6 +134,27 @@ path_hold() {
     if [ -n "$s" ]; then
         x=$(tmr "$SYS/class/iscsi_session/$s/recovery_tmo")
         why="iSCSI $s recovery_tmo ${x}s"
+        # recovery_tmo runs from when the session NOTICES the connection
+        # is gone, and a NOP-out notices it after up to its interval plus
+        # its timeout (noop_out_interval and noop_out_timeout: the
+        # connection's recv_tmo and ping_tmo). Counted on top of the
+        # command timeout, which bounds the other way of noticing, error
+        # handling included (B-20). 0 is NOP-out off.
+        if [ -z "$t_nodetect" ]; then
+            c=$(ls -d "$SYS/class/iscsi_connection/connection${s#session}:"* 2>/dev/null | head -1)
+            ri="?"
+            pi="?"
+            if [ -n "$c" ]; then
+                ri=$(tmr "$c/recv_tmo")
+                pi=$(tmr "$c/ping_tmo")
+            fi
+            why="$why + NOP-out interval ${ri}s + timeout ${pi}s"
+            if [ "$ri" = "?" ] || [ "$pi" = "?" ]; then
+                x="?"
+            elif [ "$x" != "?" ]; then
+                x=$((x + ri + pi))
+            fi
+        fi
     elif [ -n "$r" ]; then
         f=$(cat "$SYS/class/fc_remote_ports/$r/fast_io_fail_tmo" 2>/dev/null || echo "?")
         case "$f" in
