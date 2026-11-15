@@ -181,7 +181,7 @@ static void cetrafs_heartbeat_tick(struct work_struct *work)
     struct cetrafs_heartbeat *hb = container_of(work, struct cetrafs_heartbeat, work.work);
     struct super_block *sb = hb->sb;
     u32 my_node_id;
-    unsigned long lease_t0;
+    u64 lease_t0;
     unsigned int lease_interval, lease_stale;
     /* The interval this tick ARMS the next one with -- read once. The
      * lease below is bounded by it too: the controls file can move the
@@ -285,7 +285,7 @@ static void cetrafs_heartbeat_tick(struct work_struct *work)
 
     /* The lease is counted from BEFORE the renewal: a peer starts its
      * watch no earlier than when the new hb_seq lands, which is later. */
-    lease_t0 = jiffies;
+    lease_t0 = cetrafs_lease_clock();
     lease_interval = cetrafs_heartbeat_interval_secs(sb);
     lease_stale = cetrafs_sb_stale_secs(sb);
     ret = cetrafs_hb_renew_fail ? -EIO /* test-only, see the parameter */

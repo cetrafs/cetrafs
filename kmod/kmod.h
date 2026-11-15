@@ -338,9 +338,10 @@ long cetrafs_shutdown_ioctl(struct super_block *sb, u32 __user *argp);
 /* inode.c */
 int cetrafs_getattr(struct mnt_idmap *idmap, const struct path *path, struct kstat *stat, u32 request_mask,
                     unsigned int query_flags);
-void cetrafs_sb_lease_renewed(struct super_block *sb, unsigned long t0, unsigned int lease_secs);
+u64 cetrafs_lease_clock(void);
+void cetrafs_sb_lease_renewed(struct super_block *sb, u64 t0, unsigned int lease_secs);
 unsigned int cetrafs_sb_lease_secs(unsigned int imin, unsigned int imax, unsigned int smin);
-void cetrafs_sb_mount_lease(struct super_block *sb, unsigned long t0);
+void cetrafs_sb_mount_lease(struct super_block *sb, u64 t0);
 u32 cetrafs_peer_window_floor_secs(u32 interval_secs, u32 stale_secs);
 int cetrafs_sb_mount_beat(struct super_block *sb);
 bool cetrafs_sb_defrag_draining(struct super_block *sb);

@@ -598,7 +598,7 @@ struct cetrafs_sb_info {
     unsigned long renew_ok_at;
     unsigned long renew_resumed_at;
     bool lease_active;
-    unsigned long lease_until;
+    u64 lease_until; /* cetrafs_lease_clock() ns */
     unsigned long lease_lost; /* bit 0: expired, latched */
     /* Device witnesses of our own row (cetrafs_sb_fence_witnessed()):
      * reads started, and the latest one that completed. A count, never a
@@ -5527,6 +5527,34 @@ static bool cetrafs_lease_disable;
 cetrafs_test_param(lease_disable, cetrafs_lease_disable, bool, 0644);
 MODULE_PARM_DESC(lease_disable, "TEST ONLY: never arm the in-core lease");
 
+/*
+ * The clock a lease is judged by: boottime, in ns. jiffies stop across a
+ * suspend and a stunned guest's catch up only as its ticks are
+ * replayed, so a lease judged by them read as still running for exactly
+ * the time a peer's watch -- on a clock that did not stop -- counted it
+ * as lapsed (audit 2026-11-15 A-15). Boottime counts every second.
+ *
+ * TEST ONLY: lease_clock_skew_secs is added to it -- seconds this node
+ * "slept", which boottime sees and jiffies do not -- so a suite can wake
+ * it past its lease without suspending the box.
+ */
+static unsigned int cetrafs_lease_clock_skew_secs;
+cetrafs_test_param(lease_clock_skew_secs, cetrafs_lease_clock_skew_secs, uint, 0644);
+MODULE_PARM_DESC(lease_clock_skew_secs, "TEST ONLY: seconds added to the clock leases are judged by");
+
+/* TEST ONLY: judge leases by jiffies, as before -- which do not see the
+ * skew above, as they do not see a suspend (lease_clock_boottime.sh's
+ * control). Read once per mount's life: set it before mounting. */
+static bool cetrafs_lease_clock_jiffies;
+cetrafs_test_param(lease_clock_jiffies, cetrafs_lease_clock_jiffies, bool, 0644);
+
+u64 cetrafs_lease_clock(void)
+{
+    if (READ_ONCE(cetrafs_lease_clock_jiffies))
+        return jiffies_to_nsecs(get_jiffies_64() - INITIAL_JIFFIES);
+    return ktime_get_boottime_ns() + (u64) READ_ONCE(cetrafs_lease_clock_skew_secs) * NSEC_PER_SEC;
+}
+
 /* TEST ONLY: the lease is three beats whatever the window, as before
  * audit 2026-11-14 O1 -- the control of tests/kernel/lease_window.sh. */
 static bool cetrafs_lease_three_beats;
@@ -5570,7 +5598,7 @@ unsigned int cetrafs_sb_lease_secs(unsigned int imin, unsigned int imax, unsigne
     return w > imax ? w - imax : w / 2;
 }
 
-void cetrafs_sb_lease_renewed(struct super_block *sb, unsigned long t0, unsigned int lease_secs)
+void cetrafs_sb_lease_renewed(struct super_block *sb, u64 t0, unsigned int lease_secs)
 {
     struct cetrafs_sb_info *sbi = sb->s_fs_info;
 
@@ -5593,7 +5621,7 @@ void cetrafs_sb_lease_renewed(struct super_block *sb, unsigned long t0, unsigned
             sbi->lease_work_ready = true;
         }
     }
-    WRITE_ONCE(sbi->lease_until, t0 + (unsigned long) lease_secs * HZ);
+    WRITE_ONCE(sbi->lease_until, t0 + (u64) lease_secs * NSEC_PER_SEC);
     smp_wmb(); /* the deadline before the flag that makes it count */
     WRITE_ONCE(sbi->lease_active, true);
 }
@@ -5616,7 +5644,7 @@ void cetrafs_sb_lease_renewed(struct super_block *sb, unsigned long t0, unsigned
  */
 /* A renewal from the mount, started at 't0', landed: arm or extend the
  * lease as a heartbeat renewal does. */
-void cetrafs_sb_mount_lease(struct super_block *sb, unsigned long t0)
+void cetrafs_sb_mount_lease(struct super_block *sb, u64 t0)
 {
     unsigned int i = cetrafs_heartbeat_interval_secs(sb);
 
@@ -5627,6 +5655,7 @@ int cetrafs_sb_mount_beat(struct super_block *sb)
 {
     struct cetrafs_sb_info *sbi = sb->s_fs_info;
     unsigned long t0;
+    u64 lt0;
     int ret;
 
     if (!sbi || !sbi->node_registered || sbi->hb)
@@ -5634,12 +5663,13 @@ int cetrafs_sb_mount_beat(struct super_block *sb)
     if (sbi->mount_beat_next && time_before(jiffies, sbi->mount_beat_next))
         return 0;
     t0 = jiffies;
+    lt0 = cetrafs_lease_clock();
     sbi->mount_beat_next = t0 + (unsigned long) cetrafs_heartbeat_interval_secs(sb) * HZ;
     if (!sbi->mount_beat_next)
         sbi->mount_beat_next = 1;
     ret = cetrafs_node_renew_heartbeat(sb, sbi->node_id);
     if (ret == 0)
-        cetrafs_sb_mount_lease(sb, t0);
+        cetrafs_sb_mount_lease(sb, lt0);
     if (ret == -EPERM || ret == -EOWNERDEAD) {
         pr_err("%s: this node was fenced while it was still mounting -- refusing the mount\n", sb->s_id);
         return ret;
@@ -5766,7 +5796,7 @@ bool cetrafs_sb_is_fenced(struct super_block *sb)
         return true;
     if (READ_ONCE(sbi->lease_active)) {
         smp_rmb();
-        if (time_after(jiffies, READ_ONCE(sbi->lease_until))) {
+        if (cetrafs_lease_clock() > READ_ONCE(sbi->lease_until)) {
             /* One-way: a renewal that lands later must not reopen
              * what a peer may already have reclaimed. */
             if (!test_and_set_bit(0, &sbi->lease_lost))
