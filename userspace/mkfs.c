@@ -365,6 +365,38 @@ static void mkfs_retire_old_superblock(int fd, const char *dev)
         return; /* not a cetrafs volume: nobody can be mounting it as one */
     }
 
+    /*
+     * A superblock that does not verify -- its checksum, or a layout the
+     * device cannot hold -- places its Node Registry nowhere provable,
+     * so no claim can be written there and no probe can read there
+     * (cetrafs_node_table_placed_ok()). No node can mount it either:
+     * the mount refuses the same superblock. Formatting it is what -f
+     * is for; refusing left a damaged volume impossible to reformat
+     * (8c19f12). Read a few times first, apart: a peer's growfs publish
+     * of block 0 seen torn verifies on a later read, and then this is a
+     * live volume and the probe below runs.
+     */
+    for (int tries = 0; tries < 5 && !cetrafs_node_table_placed_ok(fd, &sb); tries++) {
+        if (tries == 4) {
+            fprintf(stderr,
+                    "%s: its old superblock does not verify -- no node can mount it and its Node Registry\n"
+                    "       cannot be located, so no live-node check is possible; formatting over it (-f)\n",
+                    dev);
+            if (pwrite(fd, zero, sizeof(zero), 0) != (ssize_t) sizeof(zero) || fsync(fd) != 0)
+                die_dev("%s: cannot clear the old superblock: %s", dev, strerror(errno));
+            return;
+        }
+        usleep(200000);
+        (void) posix_fadvise(fd, 0, CETRAFS_BLOCK_SIZE, POSIX_FADV_DONTNEED);
+        if (pread(fd, old, sizeof(old), 0) != (ssize_t) sizeof(old))
+            die_dev("%s: cannot read block 0: %s", dev, strerror(errno));
+        memcpy(&sb, old, sizeof(sb));
+        if (cetrafs_le32(sb.magic) != CETRAFS_MAGIC)
+            break; /* rewritten meanwhile: judged again below */
+    }
+    if (cetrafs_le32(sb.magic) != CETRAFS_MAGIC)
+        die_dev("%s: its superblock changed while mkfs read it -- nothing was written; run it again", dev);
+
     rc = cetrafs_find_repair_claim(fd, &sb, &row, label, sizeof(label));
     if (rc < 0)
         die_dev("%s: cannot read its Node Registry (I/O error) -- so it is impossible to\n"
