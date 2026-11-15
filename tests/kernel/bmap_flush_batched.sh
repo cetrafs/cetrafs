@@ -20,13 +20,20 @@
 #    queues behind it and is sent SIGKILL:
 #      2. it is gone within a second, long before the held flush ends.
 #
+# C. One write of the batch fails (keep_batch_fail=1), and -- as another
+#    bitmap writer taking the buffer between the completion and the look
+#    would -- its shared error flag is cleared (keep_flag_steal=1):
+#      3. the fsync fails and the mount stops: the failure was the batch's
+#         own, carried by its bio, not by the flag (audit 2026-11-15 F-19).
+#
 # DISCRIMINATION: bmap_flush_serial=1 (A: a delay per block);
-# bmap_flush_unkillable=1 (B: the killed fsync waits out the flush).
+# bmap_flush_unkillable=1 (B: the killed fsync waits out the flush);
+# keep_batch_legacy=1 (C: the error is missed, the fsync succeeds).
 set -euo pipefail
 . "$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)/lib/harness.sh"
 require_root
 require_module
-for p in bmap_flush_serial bmap_flush_unkillable alloc_flush_stall_ms; do
+for p in bmap_flush_serial bmap_flush_unkillable alloc_flush_stall_ms keep_batch_fail keep_batch_legacy keep_flag_steal; do
     [ -w "/sys/module/cetrafs/parameters/$p" ] || { skip "$p is missing"; ct_exit; }
 done
 command -v dmsetup >/dev/null || { skip "dmsetup is missing"; ct_exit; }
@@ -38,6 +45,9 @@ ct_track mnt "$MNT"
 ct_param_set bmap_flush_serial 0
 ct_param_set bmap_flush_unkillable 0
 ct_param_set alloc_flush_stall_ms 0
+ct_param_set keep_batch_fail 0
+ct_param_set keep_batch_legacy 0
+ct_param_set keep_flag_steal 0
 ct_param_set scrub 0
 ct_param_set auto_defrag 0
 DELAY_MS=40
@@ -97,6 +107,39 @@ round_b() {
     echo 0 >$P/bmap_flush_unkillable
     ct_umount "$MNT"
 }
+
+# C <legacy 0|1> -> RES
+round_c() {
+    local dev mark rc=0
+    dev="$(ct_loop "$(ct_image 560 "bfc$1")")"
+    ct_mkfs_small "$dev" >/dev/null
+    ct_mount "$dev" "$MNT"
+    sync
+    echo "$1" >$P/keep_batch_legacy
+    echo 1 >$P/keep_flag_steal
+    echo 1 >$P/keep_batch_fail
+    mark="$(dmesg_mark)"
+    dd if=/dev/zero of="$MNT/c" bs=4096 count=64 conv=fsync status=none 2>/dev/null || rc=$?
+    RES="fsync_rc=$rc left=$(cat $P/keep_batch_fail) stopped=$(dmesg_since "$mark" | grep -c STOPPED || true)"
+    echo 0 >$P/keep_batch_fail
+    echo 0 >$P/keep_flag_steal
+    echo 0 >$P/keep_batch_legacy
+    umount "$MNT" 2>/dev/null || umount -l "$MNT"
+}
+
+round_c 1
+CC="$RES"
+log "C control (judged by the shared flag): $CC"
+round_c 0
+CR="$RES"
+log "C: $CR"
+[ "$(get left "$CR")" = 0 ] && [ "$(get left "$CC")" = 0 ] ||
+    { fail "setup: the injected failure was not reached ($CR | $CC)"; ct_exit; }
+[ "$(get fsync_rc "$CR")" != 0 ] && [ "$(get stopped "$CR")" -ge 1 ] &&
+    pass "3: the batch's own failed write failed the fsync and stopped the mount" || fail "3: $CR"
+[ "$(get fsync_rc "$CC")" = 0 ] && [ "$(get stopped "$CC")" = 0 ] &&
+    pass "C control: judged by the shared flag, the cleared error passed as a success" ||
+    fail "C control: $CC -- the suite does not reach the flag"
 
 round_a 1
 AC="$RES"

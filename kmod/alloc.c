@@ -3174,9 +3174,11 @@ static int __cetrafs_alloc_flush_bitmaps(struct super_block *sb)
         return -EIO;
     /* Before any mark is taken: a mark taken must be written or put back. */
     q = kvmalloc(sizeof(*q), GFP_NOFS);
-    taken = bitmap_zalloc(bg_count, GFP_NOFS);
-    failed = bitmap_zalloc(bg_count, GFP_NOFS);
-    wrote = bitmap_zalloc(bg_count, GFP_NOFS);
+    /* kvcalloc: a huge Block Group table must not turn an fsync into a
+     * failed high-order allocation (audit 2026-11-15 F-21) */
+    taken = kvcalloc(BITS_TO_LONGS(bg_count), sizeof(long), GFP_NOFS);
+    failed = kvcalloc(BITS_TO_LONGS(bg_count), sizeof(long), GFP_NOFS);
+    wrote = kvcalloc(BITS_TO_LONGS(bg_count), sizeof(long), GFP_NOFS);
     if (!q || !taken || !failed || !wrote) {
         ret = -ENOMEM;
         goto out;
@@ -3237,7 +3239,7 @@ static int __cetrafs_alloc_flush_bitmaps(struct super_block *sb)
         }
     }
     if (bitmap_empty(wrote, bg_count)) {
-        bitmap_free(wrote);
+        kvfree(wrote);
         wrote = NULL;
     }
     /*
@@ -3263,9 +3265,9 @@ static int __cetrafs_alloc_flush_bitmaps(struct super_block *sb)
         }
     }
 out:
-    bitmap_free(wrote);
-    bitmap_free(failed);
-    bitmap_free(taken);
+    kvfree(wrote);
+    kvfree(failed);
+    kvfree(taken);
     kvfree(q);
     return ret;
 }

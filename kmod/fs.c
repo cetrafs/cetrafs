@@ -6694,8 +6694,12 @@ int cetrafs_sb_bmap_flush_begin(struct super_block *sb)
 
     atomic_inc(&sbi->bmap_flush_inflight);
     smp_mb__after_atomic();
-    if (READ_ONCE(cetrafs_bmap_flush_unkillable)) {
-        mutex_lock(&sbi->bmap_flush_mutex); /* TEST ONLY: see the parameter */
+    /* An exiting task's closes run with the kill already pending: a
+     * killable wait would fail every one of them at once and leave its
+     * lock release to the heartbeat (audit 2026-11-15 F-21). It is
+     * leaving anyway; let it wait. */
+    if (READ_ONCE(cetrafs_bmap_flush_unkillable) || (current->flags & PF_EXITING)) {
+        mutex_lock(&sbi->bmap_flush_mutex);
         return 0;
     }
     if (mutex_lock_killable(&sbi->bmap_flush_mutex)) {

@@ -1019,19 +1019,110 @@ int cetrafs_sync_buffer_keep(struct super_block *sb, struct buffer_head *bh)
  * under the node's flush mutex -- ~38 ms a block on a SAN, minutes for
  * a large preallocation, every fsync and close of the node queued behind
  * it (audit 2026-11-15 B-29, M-8). Returns the first error.
+ *
+ * Each write's status is its own, carried by its bio, and the buffer
+ * stays LOCKED from submit until its verdict is applied. The buffer's
+ * BH_Write_EIO is shared: another bitmap writer locking the buffer
+ * between the completion and our look would take the error as its own
+ * and clear it, and this flush then called a write that failed a
+ * success -- and its caller published extents over bits that never
+ * reached the device (audit 2026-11-15 F-19).
  */
+struct cetrafs_keep_bio {
+    struct completion *all;
+    atomic_t *left;
+    int status;
+};
+
+static void cetrafs_keep_bio_end(struct bio *bio)
+{
+    struct cetrafs_keep_bio *io = bio->bi_private;
+
+    io->status = blk_status_to_errno(bio->bi_status);
+    bio_put(bio);
+    if (atomic_dec_and_test(io->left))
+        complete(io->all);
+}
+
+/* TEST ONLY: the next N batched keep-writes fail, as the device would
+ * refuse them (tests/kernel/bmap_flush_batched.sh, F-19). */
+static unsigned int cetrafs_keep_batch_fail;
+cetrafs_test_param(keep_batch_fail, cetrafs_keep_batch_fail, uint, 0644);
+MODULE_PARM_DESC(keep_batch_fail, "TEST ONLY: the next N batched bitmap writes fail");
+
+/*
+ * TEST ONLY: the batch as b1ad118 wrote it -- each write's error kept only
+ * in the buffer's shared BH_Write_EIO, read after the whole batch -- and
+ * a second knob that clears that flag between the completions and the
+ * look, as another keep-writer taking the buffer lock there does
+ * (tests/kernel/bmap_flush_batched.sh's F-19 control).
+ */
+static bool cetrafs_keep_batch_legacy;
+cetrafs_test_param(keep_batch_legacy, cetrafs_keep_batch_legacy, bool, 0644);
+MODULE_PARM_DESC(keep_batch_legacy, "TEST ONLY: batched bitmap writes judged by the shared buffer flag (F-19)");
+static bool cetrafs_keep_flag_steal;
+cetrafs_test_param(keep_flag_steal, cetrafs_keep_flag_steal, bool, 0644);
+MODULE_PARM_DESC(keep_flag_steal, "TEST ONLY: with keep_batch_legacy, another writer clears the error flag first");
+
+static int cetrafs_sync_buffers_keep_legacy(struct super_block *sb, struct buffer_head **bhs, unsigned int n,
+                                            int *res)
+{
+    struct blk_plug plug;
+    unsigned int i;
+    int ret = 0, r;
+    int *st = kmalloc_array(n, sizeof(*st), GFP_NOFS);
+    bool *wd = kmalloc_array(n, sizeof(*wd), GFP_NOFS), *wh = kmalloc_array(n, sizeof(*wh), GFP_NOFS);
+
+    if (!st || !wd || !wh) {
+        kfree(st);
+        kfree(wd);
+        kfree(wh);
+        return -ENOMEM;
+    }
+    blk_start_plug(&plug);
+    for (i = 0; i < n; i++)
+        st[i] = __cetrafs_keep_submit(bhs[i], &wd[i], &wh[i]);
+    blk_finish_plug(&plug);
+    for (i = 0; i < n; i++) {
+        if (st[i] != 1)
+            continue;
+        wait_on_buffer(bhs[i]);
+        if (READ_ONCE(cetrafs_keep_batch_fail)) {
+            WRITE_ONCE(cetrafs_keep_batch_fail, cetrafs_keep_batch_fail - 1);
+            set_buffer_write_io_error(bhs[i]); /* as the completion records a failure */
+        }
+        if (READ_ONCE(cetrafs_keep_flag_steal))
+            clear_buffer_write_io_error(bhs[i]); /* another party took it */
+    }
+    for (i = 0; i < n; i++) {
+        r = st[i] == 1 ? __cetrafs_keep_wait(bhs[i], wd[i], wh[i]) : st[i];
+        res[i] = cetrafs_meta_write_result(sb, bhs[i], r);
+        if (res[i] && !ret)
+            ret = res[i];
+    }
+    kfree(st);
+    kfree(wd);
+    kfree(wh);
+    return ret;
+}
+
 int cetrafs_sync_buffers_keep(struct super_block *sb, struct buffer_head **bhs, unsigned int n, int *res)
 {
     struct cetrafs_keep_io {
-        int state;
+        struct cetrafs_keep_bio b;
+        int state; /* 1 sent, 0 nothing to write, < 0 an earlier failure found */
         bool was_dirty, was_held;
     } *io;
+    DECLARE_COMPLETION_ONSTACK(all);
+    atomic_t left;
     struct blk_plug plug;
     unsigned int i;
     int ret = 0, r;
 
     if (cetrafs_sb_is_fenced(sb))
         return -EIO;
+    if (READ_ONCE(cetrafs_keep_batch_legacy))
+        return cetrafs_sync_buffers_keep_legacy(sb, bhs, n, res);
     io = kmalloc_array(n, sizeof(*io), GFP_NOFS);
     if (!io) {
         for (i = 0; i < n; i++) {
@@ -1041,13 +1132,69 @@ int cetrafs_sync_buffers_keep(struct super_block *sb, struct buffer_head **bhs, 
         }
         return ret;
     }
+    atomic_set(&left, 1);
     blk_start_plug(&plug);
-    for (i = 0; i < n; i++)
-        io[i].state = __cetrafs_keep_submit(bhs[i], &io[i].was_dirty, &io[i].was_held);
-    blk_finish_plug(&plug);
     for (i = 0; i < n; i++) {
-        r = io[i].state == 1 ? __cetrafs_keep_wait(bhs[i], io[i].was_dirty, io[i].was_held) : io[i].state;
-        res[i] = cetrafs_meta_write_result(sb, bhs[i], r);
+        struct buffer_head *bh = bhs[i];
+        struct bio *bio;
+
+        io[i].b.all = &all;
+        io[i].b.left = &left;
+        io[i].b.status = 0;
+        lock_buffer(bh); /* also waits out a writeback already in flight */
+        if (buffer_write_io_error(bh)) {
+            /* an earlier write of these bytes failed: put them back */
+            clear_buffer_write_io_error(bh);
+            set_buffer_uptodate(bh);
+            unlock_buffer(bh);
+            mark_buffer_dirty(bh);
+            io[i].state = -EIO;
+            continue;
+        }
+        io[i].was_dirty = test_clear_buffer_dirty(bh);
+        io[i].was_held = test_clear_buffer_cetra_held(bh);
+        if (!io[i].was_dirty && !io[i].was_held) {
+            unlock_buffer(bh);
+            io[i].state = 0;
+            continue;
+        }
+        io[i].state = 1;
+        if (READ_ONCE(cetrafs_keep_batch_fail)) {
+            WRITE_ONCE(cetrafs_keep_batch_fail, cetrafs_keep_batch_fail - 1);
+            io[i].b.status = -EIO; /* TEST ONLY: refused, unsent */
+            continue;
+        }
+        atomic_inc(&left);
+        bio = bio_alloc(bh->b_bdev, 1, REQ_OP_WRITE | REQ_SYNC | REQ_META, GFP_NOIO);
+        bio->bi_iter.bi_sector = bh->b_blocknr * (bh->b_size >> 9);
+        bio_add_folio_nofail(bio, bh->b_folio, bh->b_size, offset_in_folio(bh->b_folio, bh->b_data));
+        bio->bi_end_io = cetrafs_keep_bio_end;
+        bio->bi_private = &io[i].b;
+        submit_bio(bio);
+    }
+    blk_finish_plug(&plug);
+    if (!atomic_dec_and_test(&left))
+        wait_for_completion_io(&all);
+    for (i = 0; i < n; i++) {
+        struct buffer_head *bh = bhs[i];
+
+        r = io[i].state;
+        if (r == 1) {
+            /* still locked: the verdict is applied before anyone else
+             * can look at the buffer */
+            r = io[i].b.status;
+            if (r) {
+                /* still uptodate: the next boundary retries it -- held
+                 * again if it was held, never handed to writeback (A-15) */
+                if (io[i].was_held && !io[i].was_dirty)
+                    set_buffer_cetra_held(bh);
+                else
+                    mark_buffer_dirty(bh);
+                r = -EIO;
+            }
+            unlock_buffer(bh);
+        }
+        res[i] = cetrafs_meta_write_result(sb, bh, r);
         if (res[i] && !ret)
             ret = res[i];
     }
