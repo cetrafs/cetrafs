@@ -118,7 +118,8 @@ unsigned int cetrafs_frag_index_pct(u64 nblocks, u32 extents);
 // fs.c
 int cetrafs_init_fs_context(struct fs_context *fc);
 void cetrafs_kill_sb(struct super_block *sb);
-void cetrafs_free_sb_info(struct super_block *sb);
+/* true: the mount ended stopped (its put_super must write nothing) */
+bool cetrafs_free_sb_info(struct super_block *sb);
 const cetrafs_superblock_t *cetrafs_sb_raw(struct super_block *sb);
 
 /*

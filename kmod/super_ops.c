@@ -37,6 +37,11 @@ static unsigned int cetrafs_evict_check_fail;
 cetrafs_test_param(evict_check_fail, cetrafs_evict_check_fail, uint, 0644);
 MODULE_PARM_DESC(evict_check_fail, "TEST ONLY: fail the next N evictions' foreign-user check");
 
+/* TEST ONLY, one-shot: sync_fs dirties this block after its flushes,
+ * then stops the mount -- a lease that ran out during them (B-30). */
+static unsigned long long cetrafs_sync_test_dirty_lba;
+cetrafs_test_param(sync_test_dirty_lba, cetrafs_sync_test_dirty_lba, ullong, 0644);
+
 static void cetrafs_put_super(struct super_block *sb)
 {
     /* Asked before sb_info goes: a stopped mount writes nothing, not
@@ -49,7 +54,10 @@ static void cetrafs_put_super(struct super_block *sb)
      * before freeing anything -- deliberately done
      * *before* sync/invalidate below, so no tick can race with tearing
      * down the backing device. */
-    cetrafs_free_sb_info(sb);
+    /* ...or stopped during it: a lease that ran out in its flushes
+     * leaves dirt the sync below would write (B-30). */
+    if (cetrafs_free_sb_info(sb) && !READ_ONCE(cetrafs_sync_regate_off))
+        stopped = true;
     /* Flush and invalidate backing device -- or, stopped, drop what is
      * dirty: invalidate_bdev() keeps dirty pages, and writeback would
      * write them after the unmount. */
@@ -226,6 +234,34 @@ static int cetrafs_sync_fs(struct super_block *sb, int wait)
          * here, then flush the cache. fsync already did this per file;
          * nothing did it for the filesystem. On a device without a
          * volatile cache the block layer makes the flush a no-op. */
+        /* TEST ONLY: a metadata buffer left dirty by an operation that
+         * was past its gate when the stop came -- the dirt the re-gate
+         * below keeps off the device (tests/kernel/sync_stopped_midflush.sh). */
+        if (unlikely(READ_ONCE(cetrafs_sync_test_dirty_lba)) && wait) {
+            struct buffer_head *tbh = sb_bread(sb, xchg(&cetrafs_sync_test_dirty_lba, 0));
+
+            if (tbh) {
+                lock_buffer(tbh);
+                memset(tbh->b_data, 0xd7, 64);
+                mark_buffer_dirty(tbh);
+                unlock_buffer(tbh);
+                brelse(tbh);
+            }
+            /* ...and the lease runs out now, after the flushes */
+            cetrafs_sb_stop(sb, CETRAFS_STOP_MANUAL, "TEST: stopped after sync_fs's flushes");
+        }
+        /* Stopped during the flushes above (a lease that ran out in a
+         * slow write): what they were refused is still dirty, and both
+         * this sync and the VFS's right after it would write it (B-30).
+         * Dropped instead, as the stopped branch at the top drops. */
+        if (cetrafs_sb_is_fenced(sb) && !READ_ONCE(cetrafs_sync_regate_off)) {
+            if (sb->s_bdev) {
+                cetrafs_drop_dirty_metadata(sb);
+                cetrafs_deferred_drop_all(sb);
+                cetrafs_held_drop_all(sb);
+            }
+            return -EIO;
+        }
         if (wait && sb->s_bdev) {
             int sret = sync_blockdev(sb->s_bdev);
             int fret = blkdev_issue_flush(sb->s_bdev);

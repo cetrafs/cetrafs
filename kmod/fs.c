@@ -36,7 +36,11 @@ int cetrafs_init_fs_context(struct fs_context *fc);
 static void cetrafs_sb_resweep_work(struct work_struct *w);
 static unsigned int cetrafs_own_claim_resweep_secs;
 void cetrafs_kill_sb(struct super_block *sb);
-void cetrafs_free_sb_info(struct super_block *sb);
+bool cetrafs_free_sb_info(struct super_block *sb);
+/* TEST ONLY: sync_fs and unmount sync the device without asking the
+ * fence again after their flushes (B-30's control). */
+bool cetrafs_sync_regate_off;
+cetrafs_test_param(sync_regate_off, cetrafs_sync_regate_off, bool, 0644);
 const cetrafs_superblock_t *cetrafs_sb_raw(struct super_block *sb);
 int cetrafs_sb_adjust_free_inodes(struct super_block *sb, s64 delta);
 int cetrafs_sb_get_free_inodes(struct super_block *sb, u64 *out);
@@ -3845,15 +3849,15 @@ static bool cetrafs_umount_tree_flush_fail;
 cetrafs_test_param(umount_tree_flush_fail, cetrafs_umount_tree_flush_fail, bool, 0644);
 MODULE_PARM_DESC(umount_tree_flush_fail, "TEST ONLY: unmount's extent-tree flush reports -EIO");
 
-void cetrafs_free_sb_info(struct super_block *sb)
+bool cetrafs_free_sb_info(struct super_block *sb)
 {
     struct cetrafs_sb_info *sbi = sb->s_fs_info;
     int flush_err = 0, r;
     u32 unreleased;
-    bool stopped;
+    bool stopped = false, left_stopped;
 
     if (!sbi)
-        return;
+        return false;
 
     /* First, while everything below is still standing: a reconcile still
      * queued (a failed mount never ran kill_sb's flush) may hold the last
@@ -3978,6 +3982,17 @@ void cetrafs_free_sb_info(struct super_block *sb)
      *
      * Not reproducible on one kernel (the peer is the other half), so
      * this is reasoned rather than measured -- ctest owns the proof. */
+    /* Stopped DURING the flushes above -- a lease that ran out in a
+     * slow bitmap write: what they were refused is still dirty, and the
+     * sync below would write it after peers took over (audit 2026-11-15
+     * B-30). Asked again here, last; dropped as the stop branch drops. */
+    if (cetrafs_sb_is_fenced(sb) && !READ_ONCE(cetrafs_sync_regate_off)) {
+        if (sb->s_bdev)
+            (void) (cetrafs_drop_dirty_metadata(sb) + cetrafs_deferred_drop_all(sb) + cetrafs_held_drop_all(sb));
+        flush_err = -EIO;
+        stopped = true;
+        goto departed;
+    }
     if (sb->s_bdev) {
         r = sync_blockdev(sb->s_bdev);
         if (r && !flush_err)
@@ -4097,8 +4112,10 @@ departed:
     kfree(sbi->zg_pf_drop_runs);
     kfree(sbi->zg_pf_full_until);
     kfree(sbi->peers);
+    left_stopped = stopped || READ_ONCE(sbi->fenced) || test_bit(0, &sbi->lease_lost);
     kfree(sbi);
     sb->s_fs_info = NULL;
+    return left_stopped;
 }
 
 /* Pending-free backoff state, for zonegroup.c. See the field comments
