@@ -434,6 +434,13 @@ static int cetrafs_defrag_read_extents(struct inode *inode, const cetrafs_inode_
         }
         if (cetrafs_le32(el->arr[i].ee_block) != expect)
             el->dense = false;
+        /* The plan maps the k-th mapped block in logical order to the
+         * k-th block of the run, which needs the list in that order with
+         * nothing overlapping. Sorted above, so only an overlap (damage)
+         * or the unsorted test read gets here: decline, as the density
+         * test used to. */
+        if (i && cetrafs_le32(el->arr[i].ee_block) < cetrafs_defrag_run_end(el, i - 1))
+            return -EOPNOTSUPP;
         /* A run continues while the next extent starts where the last
          * ended, however the extents inside it are cut (a convert splits
          * one); its (start, length) is hashed when it closes. */
@@ -460,25 +467,96 @@ static int cetrafs_defrag_read_extents(struct inode *inode, const cetrafs_inode_
 }
 
 /*
- * Persist a layout of: prefix [0, moved) as a contiguous run at
- * 'dst_base', followed by the suffix [moved, nblocks) copied verbatim
- * from 'suffix' (the original extents, already shifted so entry 0 is the
- * first extent at or after logical 'moved'). Builds a FRESH tree at
- * whatever depth the result needs (0/1/2), publishes the new root, and
- * frees the OLD tree's meta blocks -- so it correctly handles a depth-2
- * file collapsing through depth 1 to depth 0, one step at a time. Caller
- * holds inode_lock and the defrag pin.
+ * The new run's entries for ranks [from, to): each piece at its own
+ * logical block, at dst_base + its rank, with its own extent's flag -- a
+ * hole stays a hole and a preallocated block stays preallocated. Pieces
+ * that continue each other logically, physically and in kind are one
+ * entry, split at the length cap. The pieces are head[] whole, then the
+ * first split_off blocks of 'split' (the extent the step ends inside, as
+ * it was before the suffix took its remainder). *lo / *hi: the logical
+ * range the emitted pieces span. -EIO: they do not add up to [from, to).
+ */
+static int cetrafs_defrag_pieces(const cetrafs_extent_t *head, u32 head_count, const cetrafs_extent_t *split,
+                                 u32 split_off, u64 from, u64 to, u64 dst_base, cetrafs_extent_t *out, u32 *out_n,
+                                 u32 cap, u64 *lo, u64 *hi)
+{
+    u64 off = 0, got = 0;
+    u32 i, n = *out_n;
+
+    *lo = U64_MAX;
+    *hi = 0;
+    for (i = 0; i <= head_count && off < to; i++) {
+        const cetrafs_extent_t *x = i < head_count ? &head[i] : split;
+        u64 len, lg, skip;
+        bool un;
+
+        if (!x)
+            break;
+        len = min_t(u64, i < head_count ? cetrafs_extent_len(x->ee_len) : split_off, to - off);
+        lg = cetrafs_le32(x->ee_block);
+        un = cetrafs_extent_is_uninit(x->ee_len) && !READ_ONCE(cetrafs_defrag_ignore_uninit);
+        /* Ranks below 'from' are not this window's. */
+        skip = from > off ? min_t(u64, from - off, len) : 0;
+        off += skip;
+        lg += skip;
+        len -= skip;
+        if (len && lg < *lo)
+            *lo = lg;
+
+        while (len) {
+            cetrafs_extent_t *p = n ? &out[n - 1] : NULL;
+            u32 plen = p ? cetrafs_extent_len(p->ee_len) : 0;
+            u64 take;
+
+            if (p && (u64) cetrafs_le32(p->ee_block) + plen == lg &&
+                cetrafs_extent_phys_from_hilo(p->ee_start_hi, p->ee_start_lo) + plen == dst_base + off &&
+                cetrafs_extent_is_uninit(p->ee_len) == un && plen < CETRAFS_EXT_LEN_MASK) {
+                take = min_t(u64, len, (u64) CETRAFS_EXT_LEN_MASK - plen);
+                p->ee_len = cetrafs_extent_pack_len(plen + (u32) take, un);
+            } else {
+                if (n >= cap)
+                    return -EIO; /* cannot happen: one entry per source piece */
+                take = min_t(u64, len, (u64) CETRAFS_EXT_LEN_MASK);
+                memset(&out[n], 0, sizeof(out[n]));
+                out[n].ee_block = cetrafs_cpu_to_le32((u32) lg);
+                out[n].ee_len = cetrafs_extent_pack_len((u32) take, un);
+                cetrafs_extent_phys_to_hilo(dst_base + off, &out[n].ee_start_hi, &out[n].ee_start_lo);
+                n++;
+            }
+            len -= take;
+            lg += take;
+            off += take;
+            got += take;
+            *hi = lg;
+        }
+    }
+    *out_n = n;
+    return got == to - from ? 0 : -EIO;
+}
+
+/*
+ * Persist a layout of: ranks [0, moved) on the run at 'dst_base' (each
+ * at its own logical block, see cetrafs_defrag_pieces()), followed by the
+ * suffix -- the original extents from rank 'moved' on, already shifted so
+ * entry 0 is the first piece at or after it. The step [prev, moved) goes
+ * through the tree patch, which writes only what changes; a tree it
+ * cannot patch (depth 0/1, one that would fit a leaf, a full root) gets a
+ * FRESH tree at whatever depth the result needs -- so a depth-2 file still
+ * collapses to depth 0 at the end. Either way the new root is published
+ * and only then the old tree's blocks the new one no longer names are
+ * freed. Caller holds inode_lock and the defrag pin.
  *
- * Fresh-build-and-free (rather than in-place leaf rewrite) is what makes
- * it depth-agnostic and crash-safe: the old tree is intact until the new
- * root is durable, and new/old meta are disjoint (new allocated before
- * old freed). It also keeps raw.blocks honest across a depth change,
- * which the old in-place path did not (a depth-1->0 collapse leaked the
- * leaf from i_blocks).
+ * Copy-on-write in both cases (rather than editing leaves in place) is
+ * what makes it crash-safe: the old tree is intact until the new root is
+ * durable, and new and old meta are disjoint where they differ (new
+ * allocated before old freed). It also keeps raw.blocks honest across a
+ * depth change, which the old in-place path did not (a depth-1->0
+ * collapse leaked the leaf from i_blocks).
  */
 static int cetrafs_defrag_commit(struct inode *inode,
                                  cetrafs_inode_t *raw,
                                  u64 dst_base,
+                                 u64 prev,
                                  u64 moved,
                                  u64 nblocks,
                                  const cetrafs_extent_t *head,
@@ -496,7 +574,7 @@ static int cetrafs_defrag_commit(struct inode *inode,
      * (audit 2026-11-05, section 3). */
     cetrafs_inode_t *old;
     u32 n = 0, i, cap = head_count + 1 + suffix_count + 8;
-    u64 off, meta = 0;
+    u64 meta = 0;
     bool verdict_old = false; /* a failed publish proven NOT to have landed */
     int ret;
 
@@ -516,54 +594,39 @@ static int cetrafs_defrag_commit(struct inode *inode,
      * entry, split at the length cap. The pieces are head[] whole, then
      * the first split_off blocks of 'split' (the extent the step ends
      * inside, as it was before the suffix took its remainder). */
-    off = 0;
-    for (i = 0; i <= head_count && off < moved; i++) {
-        const cetrafs_extent_t *x = i < head_count ? &head[i] : split;
-        u64 len, lg;
-        bool un;
+    /*
+     * First the step alone, through the tree patch: the step's logical
+     * span leaves the tree (it holds exactly the step's ranks) and its
+     * pieces on the new run go in, extending the run the steps before
+     * built. Only the leaves and interiors that change are written --
+     * the rebuild below wrote the whole tree every 128 blocks (audit
+     * 2026-11-15 A-14). A tree it cannot patch is rebuilt.
+     */
+    {
+        u64 lo, hi;
+        u32 an = 0;
 
-        if (!x)
-            break;
-        len = min_t(u64, i < head_count ? cetrafs_extent_len(x->ee_len) : split_off, moved - off);
-        lg = cetrafs_le32(x->ee_block);
-        un = cetrafs_extent_is_uninit(x->ee_len) && !READ_ONCE(cetrafs_defrag_ignore_uninit);
-
-        while (len) {
-            cetrafs_extent_t *p = n ? &out[n - 1] : NULL;
-            u32 plen = p ? cetrafs_extent_len(p->ee_len) : 0;
-            u64 take;
-
-            if (p && (u64) cetrafs_le32(p->ee_block) + plen == lg &&
-                cetrafs_extent_phys_from_hilo(p->ee_start_hi, p->ee_start_lo) + plen == dst_base + off &&
-                cetrafs_extent_is_uninit(p->ee_len) == un && plen < CETRAFS_EXT_LEN_MASK) {
-                take = min_t(u64, len, (u64) CETRAFS_EXT_LEN_MASK - plen);
-                p->ee_len = cetrafs_extent_pack_len(plen + (u32) take, un);
-            } else {
-                if (n >= cap) {
-                    ret = -EIO; /* cannot happen: one entry per source piece */
-                    goto out;
-                }
-                take = min_t(u64, len, (u64) CETRAFS_EXT_LEN_MASK);
-                memset(&out[n], 0, sizeof(out[n]));
-                out[n].ee_block = cetrafs_cpu_to_le32((u32) lg);
-                out[n].ee_len = cetrafs_extent_pack_len((u32) take, un);
-                cetrafs_extent_phys_to_hilo(dst_base + off, &out[n].ee_start_hi, &out[n].ee_start_lo);
-                n++;
-            }
-            len -= take;
-            lg += take;
-            off += take;
+        ret = cetrafs_defrag_pieces(head, head_count, split, split_off, prev, moved, dst_base, out, &an, cap, &lo,
+                                    &hi);
+        if (ret)
+            goto out;
+        ret = an ? cetrafs_tree_patch(inode, raw, lo, hi, out, an, U32_MAX, nblocks, &meta) : -EAGAIN;
+        if (ret && ret != -EAGAIN) {
+            *raw = *old;
+            goto out;
         }
     }
-    if (off != moved) {
-        ret = -EIO; /* the pieces do not add up to the step: refuse rather than publish a wrong map */
-        goto out;
-    }
-    /* Suffix: original extents for [moved, nblocks), verbatim. */
-    for (i = 0; i < suffix_count && n < cap; i++)
-        out[n++] = suffix[i];
+    if (ret == -EAGAIN) {
+        u64 lo, hi;
 
-    ret = cetrafs_tree_build(inode, out, n, raw, &meta);
+        ret = cetrafs_defrag_pieces(head, head_count, split, split_off, 0, moved, dst_base, out, &n, cap, &lo, &hi);
+        if (ret)
+            goto out;
+        /* Suffix: original extents for [moved, nblocks), verbatim. */
+        for (i = 0; i < suffix_count && n < cap; i++)
+            out[n++] = suffix[i];
+        ret = cetrafs_tree_build(inode, out, n, raw, &meta);
+    }
     if (ret) {
         *raw = *old;
         goto out;
@@ -636,7 +699,7 @@ static int cetrafs_defrag_commit(struct inode *inode,
     }
     if (ret) {
         if (verdict_old) {
-            cetrafs_tree_free_meta(inode, raw); /* provably unreferenced: undo the fresh tree */
+            cetrafs_tree_free_meta_except(inode, raw, old); /* provably unreferenced: undo the new blocks */
             *raw = *old;
             goto out;
         }
@@ -644,7 +707,7 @@ static int cetrafs_defrag_commit(struct inode *inode,
         ret = -ENOTRECOVERABLE; /* outcome unknown: the caller must free no destination block */
         goto out;
     }
-    cetrafs_tree_free_meta(inode, old); /* the old tree's meta is now unreferenced */
+    cetrafs_tree_free_meta_except(inode, old, raw); /* what the old tree had and the new one does not */
 
 out:
     kvfree(out);
@@ -1130,7 +1193,7 @@ int cetrafs_defrag_inode(struct inode *inode, struct cetrafs_defrag_stats *out_s
             }
             ret = cetrafs_frees_begin(sb, &foreign);
             if (!ret) {
-                ret = cetrafs_defrag_commit(inode, &raw, dst_base, step_end, nblocks, el.arr, suffix_start,
+                ret = cetrafs_defrag_commit(inode, &raw, dst_base, moved, step_end, nblocks, el.arr, suffix_start,
                                             split_off ? &whole : NULL, split_off, suffix, suffix_count);
                 if (ret)
                     cetrafs_frees_end(sb, foreign);
