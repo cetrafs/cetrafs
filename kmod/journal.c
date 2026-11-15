@@ -533,6 +533,12 @@ static bool cetrafs_journal_release_fail_once;
 cetrafs_test_param(journal_release_fail_once, cetrafs_journal_release_fail_once, bool, 0644);
 MODULE_PARM_DESC(journal_release_fail_once, "TEST ONLY: fail the next journal replay-claim release with -EIO");
 
+/* TEST ONLY: attach leaves a failed release of our own area to the
+ * heartbeat, as before B-5 (tests/kernel/journal_release_own_area.sh). */
+static bool cetrafs_journal_attach_release_async;
+cetrafs_test_param(journal_attach_release_async, cetrafs_journal_attach_release_async, bool, 0644);
+MODULE_PARM_DESC(journal_attach_release_async, "TEST ONLY: a failed own-area release at attach is left to the heartbeat");
+
 static void cetrafs_journal_release_replay(struct super_block *sb, u32 node_id, u64 area_start, u32 my_node_id,
                                            bool set_clean)
 {
@@ -788,6 +794,36 @@ int cetrafs_journal_attach_node(struct super_block *sb, u32 node_id)
     ret = cetrafs_journal_replay_node(sb, node_id, /*wait_for_claim=*/true);
     if (ret)
         return ret;
+    /*
+     * Our own area's release -- the swap that parks it CLEAN and drops
+     * the replay claim -- may have failed and been queued for the
+     * heartbeat. The park_seq read below is then the claimed one, and
+     * when the heartbeat's retry lands the area is one park later: every
+     * DIRTY flip of this session fails -ESTALE for the life of the mount,
+     * creates, unlinks and every tree boundary with it, while the node
+     * keeps beating (audit 2026-11-14 B-5). Retried here, a few times;
+     * still pending, the mount fails rather than run like that.
+     */
+    if (node_id < 64 && !READ_ONCE(cetrafs_journal_attach_release_async)) {
+        u32 my_node_id;
+        int tries;
+
+        if (cetrafs_sb_get_node_id(sb, &my_node_id))
+            my_node_id = node_id;
+        for (tries = 0; test_bit(node_id, j->rel_pending) && tries < 5; tries++) {
+            msleep(200);
+            mutex_lock(&j->rel_mutex);
+            if (test_bit(node_id, j->rel_pending))
+                cetrafs_journal_release_replay(sb, node_id, j->area_start, my_node_id,
+                                               test_bit(node_id, j->rel_clean));
+            mutex_unlock(&j->rel_mutex);
+        }
+        if (test_bit(node_id, j->rel_pending)) {
+            pr_err("journal: our own area at %llu could not be parked after its replay -- refusing the mount\n",
+                   (unsigned long long) j->area_start);
+            return -EIO;
+        }
+    }
     {
         u64 area, all;
 
