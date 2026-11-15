@@ -13,6 +13,7 @@
 #include <linux/ktime.h>
 #include <linux/minmax.h>
 #include <linux/mpage.h>
+#include <linux/writeback.h>
 #include <linux/pagemap.h>
 /* struct folio_batch moved out of pagevec.h (7.1); build against either,
  * as ioutil.c does. A version test, not __has_include(): sparse cannot
@@ -918,6 +919,23 @@ const struct file_operations cetrafs_file_ops = {
  * becomes durable at fsync, which is what qemu's flush barriers issue
  * and what F7's fix made correct. ext4 behaves the same way.
  */
+/* TEST ONLY: the gate once per call only (the old writeback and DIO). */
+static bool cetrafs_fence_per_block_off;
+cetrafs_test_param(fence_per_block_off, cetrafs_fence_per_block_off, bool, 0644);
+
+/*
+ * The fence, asked again for every block a bulk write maps. writepages
+ * and a DIO are gated once, when they start; a WB_SYNC_ALL pass over GiB
+ * of dirty pages, or one large O_DIRECT, outlives that answer by
+ * minutes, and the pages mapped after a lease ran out landed on blocks a
+ * peer had taken over by then (audit 2026-11-15 B-17). Two reads and a
+ * jiffies compare, against a get_block that walks the tree.
+ */
+static inline bool cetrafs_bulk_fenced(struct inode *inode)
+{
+    return !READ_ONCE(cetrafs_fence_per_block_off) && cetrafs_sb_is_fenced(inode->i_sb);
+}
+
 /*
  * The DIO get_block. An allocating call mutates the extent tree, and
  * mapping->invalidate_lock, held EXCLUSIVELY, is what serialises that
@@ -940,6 +958,8 @@ static int cetrafs_dio_get_block(struct inode *inode, sector_t iblock, struct bu
 
     if (!create)
         return cetrafs_get_block_read(inode, iblock, bh_result, 0);
+    if (cetrafs_bulk_fenced(inode))
+        return -EIO; /* per block, not per call (B-17) */
     /* Killable, as page_mkwrite (audit L21): this runs in the
      * submitter's context and may queue behind a fault or the defrag
      * mover doing device I/O. A fatal signal fails the write before
@@ -974,6 +994,8 @@ static int cetrafs_dio_get_block_overwrite(struct inode *inode, sector_t iblock,
 
     if (!create)
         return cetrafs_get_block_read(inode, iblock, bh_result, 0);
+    if (cetrafs_bulk_fenced(inode))
+        return -EIO; /* per block, not per call (B-17) */
     if (down_read_killable(&inode->i_mapping->invalidate_lock))
         return -EINTR;
     ret = __cetrafs_get_block(inode, iblock, bh_result, create, false, CETRAFS_GB_OVERWRITE);
@@ -6948,9 +6970,13 @@ static int cetrafs_write_begin(const struct kiocb *iocb,
  */
 static int cetrafs_get_block_writeback(struct inode *inode, sector_t iblock, struct buffer_head *bh, int create)
 {
+    int ret;
+
+    if (cetrafs_bulk_fenced(inode))
+        return -EIO;
     /* PLAIN: writeback holds no invalidate_lock, so it may not add to
      * the pending set. It never maps anything new anyway (below). */
-    int ret = __cetrafs_get_block(inode, iblock, bh, create, false, CETRAFS_GB_PLAIN);
+    ret = __cetrafs_get_block(inode, iblock, bh, create, false, CETRAFS_GB_PLAIN);
 
     if (!ret && buffer_new(bh)) {
         pr_err_ratelimited("ino=%llu: writeback allocated/converted block %llu -- every block should be mapped "
@@ -6961,12 +6987,103 @@ static int cetrafs_get_block_writeback(struct inode *inode, sector_t iblock, str
     return ret;
 }
 
+/* TEST ONLY: after this many writeback chunks, one stall of wb_stall_ms
+ * -- the middle of a writepages pass, where a lease can run out
+ * (tests/kernel/writepages_fence_midloop.sh). */
+static unsigned int cetrafs_wb_stall_ms, cetrafs_wb_stall_after;
+cetrafs_test_param(wb_stall_ms, cetrafs_wb_stall_ms, uint, 0644);
+cetrafs_test_param(wb_stall_after, cetrafs_wb_stall_after, uint, 0644);
+
+/* Pages per writeback chunk: the fence is asked between chunks. 8 MiB
+ * keeps mpage's merged bios whole on a streaming file. */
+#define CETRAFS_WB_CHUNK_PAGES 2048UL
+
+/* Fenced now? Asked between chunks; the test stall sits in front of it. */
+static bool cetrafs_wb_chunk_fenced(struct inode *inode)
+{
+    if (unlikely(READ_ONCE(cetrafs_wb_stall_ms)) && READ_ONCE(cetrafs_wb_stall_after) && !--cetrafs_wb_stall_after)
+        msleep(xchg(&cetrafs_wb_stall_ms, 0));
+    return cetrafs_bulk_fenced(inode);
+}
+
+/*
+ * Writeback, a chunk at a time, the fence asked before each (B-17). One
+ * gate at the start covered the whole pass, and a WB_SYNC_ALL pass over
+ * GiB of dirty pages outlives it by minutes: the pages written after the
+ * lease ran out landed on blocks a peer owned by then. The get_block
+ * callback cannot ask -- a page whose buffers are mapped, which is every
+ * page of an image, never reaches it.
+ *
+ * A ranged pass (fsync, sync, WB_SYNC_ALL) walks its range in windows,
+ * jumping over the clean stretches by the dirty tag; a cyclic one (the
+ * flusher) hands mpage its quota a chunk at a time, mapping's
+ * writeback_index carrying the position.
+ */
 static int cetrafs_writepages(struct address_space *mapping, struct writeback_control *wbc)
 {
-    if (cetrafs_sb_is_fenced(mapping->host->i_sb))
-        return -EIO; /* self-fenced: dirty data never reaches the device */
+    struct inode *inode = mapping->host;
+    int ret = 0;
 
-    return mpage_writepages(mapping, wbc, cetrafs_get_block_writeback);
+    if (cetrafs_sb_is_fenced(inode->i_sb))
+        return -EIO; /* self-fenced: dirty data never reaches the device */
+    if (READ_ONCE(cetrafs_fence_per_block_off)) {
+        (void) cetrafs_wb_chunk_fenced(inode); /* the test stall only: the old pass asks no more */
+        return mpage_writepages(mapping, wbc, cetrafs_get_block_writeback);
+    }
+
+    if (!wbc->range_cyclic) {
+        loff_t start = wbc->range_start, end = wbc->range_end;
+        pgoff_t idx = start >> PAGE_SHIFT, last = end >> PAGE_SHIFT;
+
+        while (idx <= last) {
+            pgoff_t stop;
+
+            rcu_read_lock();
+            if (!xa_find(&mapping->i_pages, &idx, last, PAGECACHE_TAG_DIRTY))
+                idx = last + 1;
+            rcu_read_unlock();
+            if (idx > last)
+                break;
+            if (cetrafs_wb_chunk_fenced(inode)) {
+                ret = -EIO;
+                break;
+            }
+            stop = idx + CETRAFS_WB_CHUNK_PAGES - 1;
+            if (stop < idx || stop > last)
+                stop = last;
+            wbc->range_start = (loff_t) idx << PAGE_SHIFT;
+            wbc->range_end = stop == last ? end : ((loff_t) (stop + 1) << PAGE_SHIFT) - 1;
+            ret = mpage_writepages(mapping, wbc, cetrafs_get_block_writeback);
+            if (ret || stop == last)
+                break;
+            if (wbc->sync_mode == WB_SYNC_NONE && wbc->nr_to_write <= 0)
+                break;
+            idx = stop + 1;
+        }
+        wbc->range_start = start;
+        wbc->range_end = end;
+        return ret;
+    }
+
+    {
+        long left = wbc->nr_to_write;
+
+        while (left > 0) {
+            long chunk = min_t(long, left, CETRAFS_WB_CHUNK_PAGES);
+
+            if (cetrafs_wb_chunk_fenced(inode)) {
+                ret = -EIO;
+                break;
+            }
+            wbc->nr_to_write = chunk;
+            ret = mpage_writepages(mapping, wbc, cetrafs_get_block_writeback);
+            left -= chunk - wbc->nr_to_write;
+            if (ret || wbc->nr_to_write > 0)
+                break; /* an error, or nothing more to write */
+        }
+        wbc->nr_to_write = left;
+    }
+    return ret;
 }
 
 /*
