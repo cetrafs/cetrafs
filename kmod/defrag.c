@@ -53,7 +53,6 @@
 
 #include <linux/blkdev.h>
 #include <linux/buffer_head.h>
-#include <linux/crc32c.h>
 #include <linux/fs.h>
 #include <linux/kernel.h>
 #include <linux/ktime.h>
@@ -254,12 +253,16 @@ struct cetrafs_ext_list {
     u64 leaf_lba;    /* external leaf LBA if depth==1, else 0 */
     bool dense;      /* no interior holes: extent i starts where i-1 ended */
     bool has_uninit; /* any extent is preallocated-but-never-written */
-    /* Which logical blocks are mapped, as runs: their count and a
-     * CRC32C over (start, length) of each. Preallocated or written does
-     * not enter it -- each step reads the flags afresh and the commit
-     * publishes them as they are. */
+    /* Which logical blocks are mapped, as runs: (start, length) pairs
+     * in logical order, 'runs' of them in 'rl' (2 * cap entries).
+     * Preallocated or written does not enter it -- each step reads the
+     * flags afresh and the commit publishes them as they are. The list
+     * itself, not a CRC of it: the plan maps rank k to a logical block,
+     * so a layout that changed between steps but hashed the same would
+     * have had the next step copy blocks to the wrong place (audit
+     * 2026-11-15 F-16). */
     u32 runs;
-    u32 shape;
+    u64 *rl;
 };
 
 /* Cap on how fragmented a file this collapser will take on. Each commit
@@ -343,7 +346,7 @@ static int cetrafs_defrag_read_extents(struct inode *inode, const cetrafs_inode_
 {
     struct super_block *sb = inode->i_sb;
     u32 i;
-    u64 expect = 0, run[2] = {0, 0};
+    u64 expect = 0;
 
     el->depth = cetrafs_le16(raw->eh.eh_depth);
     el->leaf_lba = 0;
@@ -419,7 +422,6 @@ static int cetrafs_defrag_read_extents(struct inode *inode, const cetrafs_inode_
     el->dense = true;
     el->has_uninit = false;
     el->runs = 0;
-    el->shape = 0;
     for (i = 0; i < el->count; i++) {
         /* Defrag copies these blocks and FREES them: an address read off
          * the device is checked before either (rule 19, as the free path
@@ -446,15 +448,13 @@ static int cetrafs_defrag_read_extents(struct inode *inode, const cetrafs_inode_
             return -EOPNOTSUPP;
         /* A run continues while the next extent starts where the last
          * ended, however the extents inside it are cut (a convert splits
-         * one); its (start, length) is hashed when it closes. */
+         * one). */
         if (!i || cetrafs_le32(el->arr[i].ee_block) != cetrafs_defrag_run_end(el, i - 1)) {
-            if (i)
-                el->shape = crc32c(el->shape, run, sizeof(run));
-            run[0] = cetrafs_le32(el->arr[i].ee_block);
-            run[1] = 0;
+            el->rl[2 * el->runs] = cetrafs_le32(el->arr[i].ee_block);
+            el->rl[2 * el->runs + 1] = 0;
             el->runs++;
         }
-        run[1] += cetrafs_extent_len(el->arr[i].ee_len);
+        el->rl[2 * el->runs - 1] += cetrafs_extent_len(el->arr[i].ee_len);
         /* cetrafs_extent_len() MASKS the uninit bit off, so a
          * preallocated extent is indistinguishable from data here
          * unless it is asked about explicitly. See the refusal below
@@ -463,8 +463,6 @@ static int cetrafs_defrag_read_extents(struct inode *inode, const cetrafs_inode_
             el->has_uninit = true;
         expect += cetrafs_extent_len(el->arr[i].ee_len);
     }
-    if (el->count)
-        el->shape = crc32c(el->shape, run, sizeof(run));
     el->nblocks = expect;
     return 0;
 }
@@ -857,7 +855,8 @@ int cetrafs_defrag_inode(struct inode *inode, struct cetrafs_defrag_stats *out_s
 #define raw (*rawp)
     u64 nblocks, moved = 0;
     struct cetrafs_defrag_dst dst = {0};
-    u32 snapshot_shape = 0, snapshot_runs = 0;
+    u64 *snapshot_rl = NULL;
+    u32 snapshot_runs = 0;
     bool have_dst = false;
     /*
      * The destination run is bitmap-allocated and referenced by NOTHING
@@ -876,8 +875,12 @@ int cetrafs_defrag_inode(struct inode *inode, struct cetrafs_defrag_stats *out_s
 
     el.cap = CETRAFS_DEFRAG_MAX_EXTENTS;
     el.arr = kvmalloc_array(el.cap, sizeof(*el.arr), GFP_KERNEL);
-    if (!el.arr)
+    el.rl = kvmalloc_array(2 * (size_t) el.cap, sizeof(*el.rl), GFP_KERNEL);
+    if (!el.arr || !el.rl) {
+        kvfree(el.arr);
+        kvfree(el.rl);
         return -ENOMEM;
+    }
     rawp = kmalloc(sizeof(*rawp), GFP_NOFS);
     /* One step's buffers, source then destination (M1). */
     copy_src = kcalloc(2 * CETRAFS_DEFRAG_STEP_BLOCKS, sizeof(*copy_src), GFP_NOFS);
@@ -889,6 +892,7 @@ int cetrafs_defrag_inode(struct inode *inode, struct cetrafs_defrag_stats *out_s
         kfree(copy_lba);
         kfree(copy_off);
         kvfree(el.arr);
+        kvfree(el.rl);
         return -ENOMEM;
     }
     copy_dst = copy_src + CETRAFS_DEFRAG_STEP_BLOCKS;
@@ -935,8 +939,12 @@ int cetrafs_defrag_inode(struct inode *inode, struct cetrafs_defrag_stats *out_s
      * "HOLE HOLDS DATA"). The flag travels with the extent instead, and
      * defrag_ignore_uninit drops it to show that it must.
      */
-    snapshot_shape = el.shape;
     snapshot_runs = el.runs;
+    snapshot_rl = kvmemdup(el.rl, 2 * (size_t) el.runs * sizeof(*el.rl), GFP_KERNEL);
+    if (!snapshot_rl) {
+        ret = -ENOMEM;
+        goto out_unlock;
+    }
 
     /* The span rides INSIDE the allocation -- bits set and span
      * published under one alloc_mutex hold -- because publish-after-
@@ -1039,7 +1047,8 @@ int cetrafs_defrag_inode(struct inode *inode, struct cetrafs_defrag_stats *out_s
          * written may change between steps -- a write converts -- and
          * each step copies and publishes the flags as it reads them. */
         if (ret || el.nblocks != nblocks ||
-            ((el.shape != snapshot_shape || el.runs != snapshot_runs) && !cetrafs_defrag_skip_dense_recheck)) {
+            ((el.runs != snapshot_runs || memcmp(el.rl, snapshot_rl, 2 * (size_t) el.runs * sizeof(*el.rl))) &&
+             !cetrafs_defrag_skip_dense_recheck)) {
             ret = ret ? ret : -ECANCELED;
             cetrafs_defrag_inode_unlock(inode);
             goto out_free_tail;
@@ -1468,6 +1477,8 @@ out_done:
     if (out_stats)
         *out_stats = stats;
     kvfree(el.arr);
+    kvfree(el.rl);
+    kvfree(snapshot_rl);
     kfree(rawp);
     kfree(copy_src);
     kfree(copy_lba);
