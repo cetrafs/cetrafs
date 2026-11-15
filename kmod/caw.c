@@ -74,6 +74,8 @@
 /* Retries for conditions the target reports as "command not executed"
  * (UNIT ATTENTION, ABORTED COMMAND) -- never for MISCOMPARE. */
 #define CETRAFS_CAW_RETRIES 5
+/* Paths one CAW over dm tries after a not-executed refusal of a path. */
+#define CETRAFS_CAW_PATH_TRIES 4
 
 /*
  * Count of compare-and-swaps that lost their race and were retried
@@ -103,6 +105,15 @@ u64 cetrafs_cas_op_count(void)
 void cetrafs_cas_op_counted(void)
 {
     atomic64_inc(&cetrafs_cas_ops);
+}
+
+/* Waits of a swap whose outcome was unknown for a path to answer
+ * (cetrafs_cas_undecided_nap()). */
+static atomic64_t cetrafs_cas_undecided_naps = ATOMIC64_INIT(0);
+
+u64 cetrafs_cas_undecided_nap_count(void)
+{
+    return (u64) atomic64_read(&cetrafs_cas_undecided_naps);
 }
 
 u64 cetrafs_cas_miscompare_count(void)
@@ -203,6 +214,37 @@ static struct super_block *cetrafs_cas_selftest_sb;
 static bool cetrafs_cas_selftest_stop_seen;
 
 /*
+ * A swap whose outcome is unknown keeps its call alive until it has an
+ * answer. A transport failure on the way to that answer -- the re-read,
+ * the flush, the retry refused or finding no path -- is not one; it
+ * used to end the call, and every undecided call that ends stops the
+ * mount, so one path failover with a peer CAS in the same seconds
+ * stopped a node, and its peers failed over with it (audit 2026-11-15
+ * M-21, M-22). Wait instead, backing off, and let the next attempt's
+ * fresh read judge. Bounded: the lease fences this node long before the
+ * window (cetrafs_sb_is_fenced()), and a fenced mount writes nothing.
+ */
+static unsigned long cetrafs_cas_undecided_window(struct super_block *sb)
+{
+    return (unsigned long) max(cetrafs_sb_stale_secs(sb), 10u) * HZ;
+}
+
+/* TEST ONLY: an undecided swap ends on a transport error, as before
+ * (tests/kernel/cas_undecided_waits.sh's control). */
+static bool cetrafs_cas_undecided_wait_off;
+cetrafs_test_param(cas_undecided_wait_off, cetrafs_cas_undecided_wait_off, bool, 0644);
+
+static bool cetrafs_cas_undecided_nap(struct super_block *sb, unsigned long until, int *naps)
+{
+    if (READ_ONCE(cetrafs_cas_undecided_wait_off) || cetrafs_sb_is_fenced(sb) || time_after(jiffies, until))
+        return false;
+    atomic64_inc(&cetrafs_cas_undecided_naps);
+    msleep(min(50u << min(*naps, 5), 1000u));
+    (*naps)++;
+    return true;
+}
+
+/*
  * The re-read that decides an unknown outcome, from the DEVICE: a bio
  * into a private page, never the buffer cache.
  *
@@ -286,9 +328,18 @@ static int cetrafs_caw_sense_landed_once;
 cetrafs_test_param(caw_sense_landed_once, cetrafs_caw_sense_landed_once, int, 0644);
 MODULE_PARM_DESC(caw_sense_landed_once, "TEST ONLY: next sd CAW executes, then reports this sense key");
 
-static bool cetrafs_caw_eio_landed_once;
-cetrafs_test_param(caw_eio_landed_once, cetrafs_caw_eio_landed_once, bool, 0644);
-MODULE_PARM_DESC(caw_eio_landed_once, "TEST ONLY: next CAW over a dm path executes, then reports -EIO");
+/* TEST ONLY: the next this-many CAWs are refused NOT READY / standby
+ * port (asc 0x04 ascq 0x0b) without being issued -- what an
+ * active/passive array answers on its passive port
+ * (tests/kernel/caw_not_ready_rotates.sh). */
+static int cetrafs_caw_not_ready_count;
+cetrafs_test_param(caw_not_ready_count, cetrafs_caw_not_ready_count, int, 0644);
+MODULE_PARM_DESC(caw_not_ready_count, "TEST ONLY: refuse the next N CAWs NOT READY (not executed)");
+
+/* TEST ONLY: a definite refusal over a dm path reported as an unknown
+ * outcome, as before audit 2026-11-15 M-22 (its suite's control). */
+static bool cetrafs_caw_definite_as_unknown;
+cetrafs_test_param(caw_definite_as_unknown, cetrafs_caw_definite_as_unknown, bool, 0644);
 
 static struct {
     u8 *compare, *write_data;
@@ -406,7 +457,10 @@ struct scsi_device *cetrafs_caw_get_sdev(struct block_device *bdev)
 /* Issue one SCSI COMPARE AND WRITE. 'half' buffers are each
  * nblocks * logical_block_size bytes. Returns 0 on success, -EBUSY on
  * MISCOMPARE (another writer changed the region), -EIO when the target
- * says it did not execute, -ETIMEDOUT when nothing says that. */
+ * says it did not execute for a reason another path cannot change,
+ * -EAGAIN when it says it did not execute for a reason of THIS path (a
+ * standby or transitioning port, a busy one), -ETIMEDOUT when nothing
+ * says it did not execute. */
 static int cetrafs_caw_scsi(struct scsi_device *sdev,
                             u64 lba,
                             unsigned int nblocks,
@@ -459,11 +513,22 @@ static int cetrafs_caw_scsi(struct scsi_device *sdev,
      *    it is retried here: the same compare image, the same atomic
      *    swap, not a blind re-write.
      *  - RESERVATION CONFLICT status, DATA PROTECT, and ILLEGAL REQUEST
-     *    against the CDB itself (ASC 0x20 opcode, 0x24 field in CDB):
-     *    refused before any medium access -- a definite -EIO.
+     *    against the CDB itself (ASC 0x20 opcode, 0x21 LBA out of
+     *    range, 0x24 field in CDB): refused before any medium access --
+     *    a definite -EIO.
+     *  - NOT READY with ASC 0x04 (logical unit not ready: a standby or
+     *    unavailable ALUA port, a transition in progress), and the
+     *    BUSY / TASK SET FULL statuses: the command was not accepted
+     *    for processing (SAM, SPC). Definite, and about this PATH: a
+     *    busy one is retried here after a pause, and either ends as
+     *    -EAGAIN so a dm caller can rotate to another path. They read
+     *    as unknown once, and an active/passive failover then sent the
+     *    swap through the undecided machinery, whose contended exits
+     *    stop the mount (audit 2026-11-15 M-22, N-66).
      *  - Anything else -- ABORTED COMMAND, MEDIUM ERROR, HARDWARE
-     *    ERROR, NOT READY, ILLEGAL REQUEST in the parameter data, no
-     *    sense at all: nothing promises the write did not happen. That
+     *    ERROR, NOT READY for another cause, ILLEGAL REQUEST in the
+     *    parameter data, no sense at all: nothing promises the write
+     *    did not happen. That
      *    is UNKNOWN (-ETIMEDOUT), which cetrafs_cas_region_seeded_impl()
      *    settles by reading the region back. ABORTED COMMAND used to be
      *    retried here as "not executed"; if it had landed, the retry
@@ -477,8 +542,20 @@ static int cetrafs_caw_scsi(struct scsi_device *sdev,
         memset(sense, 0, SCSI_SENSE_BUFFERSIZE);
         memset(&sshdr, 0, sizeof(sshdr));
 
-        ret = scsi_execute_cmd(sdev, cdb, REQ_OP_DRV_OUT, buf, half * 2, CETRAFS_CAW_TIMEOUT_JIFFIES, 0, &args);
-        valid = scsi_sense_valid(&sshdr);
+        if (READ_ONCE(cetrafs_caw_not_ready_count) > 0) {
+            /* TEST ONLY: refused by a standby port, never issued. */
+            WRITE_ONCE(cetrafs_caw_not_ready_count, cetrafs_caw_not_ready_count - 1);
+            sshdr.response_code = 0x70;
+            sshdr.sense_key = NOT_READY;
+            sshdr.asc = 0x04;
+            sshdr.ascq = 0x0b; /* target port in standby state */
+            ret = SAM_STAT_CHECK_CONDITION;
+            valid = true;
+        } else {
+            ret = scsi_execute_cmd(sdev, cdb, REQ_OP_DRV_OUT, buf, half * 2, CETRAFS_CAW_TIMEOUT_JIFFIES, 0,
+                                   &args);
+            valid = scsi_sense_valid(&sshdr);
+        }
         if (!ret && cetrafs_caw_sense_landed_once) {
             /* TEST ONLY: it executed; report a sense key anyway. */
             memset(&sshdr, 0, sizeof(sshdr));
@@ -506,11 +583,18 @@ static int cetrafs_caw_scsi(struct scsi_device *sdev,
                 }
                 pr_err("CAW lba=%llu still failing after %d retries (unit attention asc=0x%02x ascq=0x%02x)\n",
                        (unsigned long long) lba, CETRAFS_CAW_RETRIES, sshdr.asc, sshdr.ascq);
-                ret = -EIO;
+                ret = -EAGAIN;
+                break;
+            }
+            if (sshdr.sense_key == NOT_READY && sshdr.asc == 0x04) {
+                pr_warn_ratelimited("CAW lba=%llu: path not ready (asc=0x04 ascq=0x%02x), not executed\n",
+                                    (unsigned long long) lba, sshdr.ascq);
+                ret = -EAGAIN;
                 break;
             }
             if (sshdr.sense_key == DATA_PROTECT ||
-                (sshdr.sense_key == ILLEGAL_REQUEST && (sshdr.asc == 0x20 || sshdr.asc == 0x24))) {
+                (sshdr.sense_key == ILLEGAL_REQUEST &&
+                 (sshdr.asc == 0x20 || sshdr.asc == 0x21 || sshdr.asc == 0x24))) {
                 pr_err_ratelimited("CAW lba=%llu refused (not executed): sense key 0x%x asc=0x%02x ascq=0x%02x\n",
                                    (unsigned long long) lba, sshdr.sense_key, sshdr.asc, sshdr.ascq);
                 ret = -EIO;
@@ -529,6 +613,17 @@ static int cetrafs_caw_scsi(struct scsi_device *sdev,
             pr_err_ratelimited("CAW lba=%llu refused: RESERVATION CONFLICT (not executed)\n",
                                (unsigned long long) lba);
             ret = -EIO;
+            break;
+        }
+        if (ret > 0 && ((ret & 0xff) == SAM_STAT_BUSY || (ret & 0xff) == SAM_STAT_TASK_SET_FULL)) {
+            /* A STATUS: the target did not accept the command (SAM). */
+            if (attempt < CETRAFS_CAW_RETRIES) {
+                msleep(20 << attempt);
+                continue;
+            }
+            pr_warn_ratelimited("CAW lba=%llu: target still busy (status 0x%02x), not executed\n",
+                                (unsigned long long) lba, ret & 0xff);
+            ret = -EAGAIN;
             break;
         }
         /* No valid sense: the target never answered. A timeout says the
@@ -797,6 +892,8 @@ int cetrafs_caw(struct block_device *bdev, u64 lba, unsigned int nblocks, const 
         int ret = cetrafs_caw_scsi(sdev, lba, nblocks, compare, write_data, lbs);
 
         scsi_device_put(sdev);
+        if (ret == -EAGAIN)
+            ret = -EIO; /* not executed; one path, nothing to rotate to */
         if (ret == 0 && cetrafs_caw_timeout_landed_once) {
             /* Test-only: it DID execute; the caller is told it timed
              * out. The dangerous half of the ambiguity. */
@@ -824,37 +921,43 @@ int cetrafs_caw(struct block_device *bdev, u64 lba, unsigned int nblocks, const 
      * rather than writing an absolute value then applies it TWICE:
      * cetrafs_zg_delta_mutate(), cetrafs_zg_pool_mutate(),
      * cetrafs_pf_append_mutate(), cetrafs_bg_count_mutate()'s delta
-     * arm. Silent, and exactly the free-count corruption shape this
-     * filesystem has already paid for once.
+     * arm. So an unknown outcome marks the path failed and is handed up
+     * to cetrafs_cas_region_seeded_impl(), which re-reads the region
+     * and tells the cases apart before deciding to retry.
      *
-     * So the path is marked failed and the ambiguity is handed up to
-     * cetrafs_cas_region_seeded_impl(), which can re-read the region
-     * and tell the three cases apart before deciding to retry. The
-     * retry still happens -- one level up, and informed.
+     * A refusal the target says was NOT executed is a different thing,
+     * and must stay one. A refusal of this path (-EAGAIN: a standby
+     * port, a busy one) is re-issued here, on the next path -- the same
+     * compare image, nothing to double -- a bounded number of times,
+     * and ends as a definite -EIO. A refusal of the LU itself (-EIO:
+     * reservation conflict, data protect, an illegal CDB) is no path's
+     * fault and returns as it is, the path kept. Both used to be
+     * rewritten to -ETIMEDOUT here, so an active/passive failover --
+     * every host at once -- sent each swap into the undecided machinery
+     * whose contended exits stop the mount, and 16 refusals in a row
+     * stopped it with no peer at all (audit 2026-11-15 M-22, N-66).
      */
     {
-        int ret;
+        int ret = -EIO, tries;
 
-        /* One command, no loop: every outcome below returns. (It sat in
-         * a two-attempt loop that could never iterate, under a comment
-         * promising a retry it did not do -- the retry is one level up,
-         * informed by the re-read; audit 2026-11-11 C5.) */
-        sdev = cetrafs_dmpath_sdev(bdev, killable);
-        if (IS_ERR(sdev))
-            return PTR_ERR(sdev); /* -EINTR: interrupted waiting for a path, nothing issued */
-        if (!sdev) {
-            /* A dm node this mount found CAW on, with no path to issue
-             * over right now: a transport failure, nothing issued. It
-             * returned -EOPNOTSUPP -- "this device has no CAW" -- which
-             * every caller passed up as such, and creat(2) reported
-             * "Operation not supported" for a path outage (C6). A node
-             * that is not dm falls through to the backends below. */
-            if (!strncmp(bdev->bd_disk->disk_name, "dm-", 3)) {
+        for (tries = 0; tries < CETRAFS_CAW_PATH_TRIES; tries++) {
+            sdev = cetrafs_dmpath_sdev(bdev, killable);
+            if (IS_ERR(sdev))
+                return PTR_ERR(sdev); /* -EINTR: interrupted waiting for a path, nothing issued */
+            if (!sdev) {
+                /* A dm node this mount found CAW on, with no path to
+                 * issue over right now: a transport failure, nothing
+                 * issued. It returned -EOPNOTSUPP -- "this device has
+                 * no CAW" -- which every caller passed up as such, and
+                 * creat(2) reported "Operation not supported" for a
+                 * path outage (C6). A node that is not dm falls through
+                 * to the backends below. */
+                if (strncmp(bdev->bd_disk->disk_name, "dm-", 3))
+                    break;
                 pr_warn_ratelimited("CAW lba=%llu: no path of %s to issue it over\n", (unsigned long long) lba,
                                     bdev->bd_disk->disk_name);
                 return -EIO;
             }
-        } else {
             if (cetrafs_caw_fail_path_once) { /* test knob, see its MODULE_PARM_DESC */
                 cetrafs_caw_fail_path_once = false;
                 ret = -ETIMEDOUT;
@@ -866,30 +969,22 @@ int cetrafs_caw(struct block_device *bdev, u64 lba, unsigned int nblocks, const 
                             (unsigned long long) lba);
                     ret = -ETIMEDOUT;
                 }
-                if (ret == 0 && cetrafs_caw_eio_landed_once) {
-                    cetrafs_caw_eio_landed_once = false;
-                    pr_warn("CAW lba=%llu: TEST caw_eio_landed_once -- executed, reporting -EIO anyway\n",
-                            (unsigned long long) lba);
-                    ret = -EIO;
-                }
             }
-
-            if (ret != -EIO && ret != -ETIMEDOUT) { /* success, or MISCOMPARE, or a non-path error */
+            if ((ret == -EAGAIN || ret == -EIO) && READ_ONCE(cetrafs_caw_definite_as_unknown))
+                ret = -ETIMEDOUT; /* TEST ONLY: the old rewrite */
+            if (ret == -EAGAIN) {
+                cetrafs_dmpath_failed(bdev, sdev);
                 scsi_device_put(sdev);
-                return ret;
+                ret = -EIO; /* if no path takes it: definite, not executed */
+                continue;
             }
-
-            cetrafs_dmpath_failed(bdev, sdev);
+            if (ret == -ETIMEDOUT)
+                cetrafs_dmpath_failed(bdev, sdev);
             scsi_device_put(sdev);
-
-            /* Outcome unknown: the caller re-reads and decides. -EIO
-             * too: it carries sense, but a MEDIUM or HARDWARE ERROR on a
-             * COMPARE AND WRITE does not say the write did not happen,
-             * and re-issuing the same compare on the next path after one
-             * that landed MISCOMPAREs -- which the layer above reads as a
-             * lost race and answers by running the mutator again. */
-            return -ETIMEDOUT;
+            return ret;
         }
+        if (tries)
+            return ret;
     }
 
     if (!strncmp(bdev->bd_disk->disk_name, "nvme", 4))
@@ -1189,7 +1284,8 @@ static int cetrafs_cas_region_seeded_impl(struct super_block *sb,
     u8 *unknown = NULL; /* a swap whose outcome was unknown: its post-image, then its pre-image */
     bool undecided = false; /* 'unknown' holds a swap that may still land */
     bool seeded = false; /* this attempt's image is the caller's seed, not the device's */
-    int attempt, ret;
+    unsigned long undecided_until = 0;
+    int attempt, ret, extra = 0, naps = 0;
 
     if (!mutate || off + region > CETRAFS_BLOCK_SIZE)
         return -EINVAL;
@@ -1274,7 +1370,7 @@ static int cetrafs_cas_region_seeded_impl(struct super_block *sb,
         goto out;
     }
 
-    for (attempt = 0; attempt < CETRAFS_CAS_RETRIES; attempt++) {
+    for (attempt = 0; attempt < CETRAFS_CAS_RETRIES + extra; attempt++) {
         struct buffer_head *bh;
 
         /* Per attempt, not per call: a fence landing during sixteen
@@ -1297,6 +1393,10 @@ static int cetrafs_cas_region_seeded_impl(struct super_block *sb,
          * avoid. Only the READ is skippable. */
         /* PERF(8): not optional -- docs/PERFORMANCE.md */
         ret = cetrafs_cas_flush_block(sb, fs_lba);
+        if (ret && undecided && cetrafs_cas_undecided_nap(sb, undecided_until, &naps)) {
+            extra++;
+            continue;
+        }
         if (ret)
             goto out;
         if (unlikely(READ_ONCE(cetrafs_cas_dirty_after_flush_once)) && xchg(&cetrafs_cas_dirty_after_flush_once, false))
@@ -1323,6 +1423,10 @@ static int cetrafs_cas_region_seeded_impl(struct super_block *sb,
             if (cetrafs_caw_late.compare && cetrafs_caw_late.before_read)
                 cetrafs_caw_land_held(sb->s_bdev); /* TEST ONLY */
             bh = cetrafs_bread_uncached_retry(sb, fs_lba); /* see the no-CAW path above */
+            if (!bh && undecided && cetrafs_cas_undecided_nap(sb, undecided_until, &naps)) {
+                extra++;
+                continue;
+            }
             if (!bh) {
                 ret = -EIO;
                 goto out;
@@ -1419,7 +1523,10 @@ static int cetrafs_cas_region_seeded_impl(struct super_block *sb,
             ret = -EIO;
             goto out;
         }
-        ret = cetrafs_caw(sb->s_bdev, dev_lba, 1, old, new, killable);
+        /* Once a swap is undecided, nothing may end this call short of
+         * an answer: an -EINTR from a killed wait for a path stopped
+         * the mount (M-21). */
+        ret = cetrafs_caw(sb->s_bdev, dev_lba, 1, old, new, killable && !undecided);
         if (image_only && ret == 0 && READ_ONCE(cetrafs_cas_judged_timeout_once) &&
             xchg(&cetrafs_cas_judged_timeout_once, false))
             ret = -ETIMEDOUT; /* TEST ONLY: landed, reported timed out -- see the parameter */
@@ -1480,6 +1587,19 @@ static int cetrafs_cas_region_seeded_impl(struct super_block *sb,
 
             if (!vb || cetrafs_cas_verify_read(sb, fs_lba, vb)) {
                 kfree(vb);
+                /* Not readable NOW (the path just failed): the swap is
+                 * undecided, and the next attempt's fresh read judges
+                 * it once a path answers (M-21). */
+                if (!undecided) {
+                    memcpy(unknown, new, region);
+                    memcpy(unknown + region, old, region);
+                    undecided = true;
+                    undecided_until = jiffies + cetrafs_cas_undecided_window(sb);
+                }
+                if (cetrafs_cas_undecided_nap(sb, undecided_until, &naps)) {
+                    extra++;
+                    continue;
+                }
                 if (READ_ONCE(cetrafs_cas_selftest_sb) == sb) {
                     pr_info("CAS selftest: lba=%llu would stop the mount here (outcome undecidable)\n",
                             (unsigned long long) fs_lba);
@@ -1512,6 +1632,8 @@ static int cetrafs_cas_region_seeded_impl(struct super_block *sb,
                 kfree(vb);
                 memcpy(unknown, new, region);          /* its post-image */
                 memcpy(unknown + region, old, region); /* and the image it compared */
+                if (!undecided)
+                    undecided_until = jiffies + cetrafs_cas_undecided_window(sb);
                 undecided = true;
                 continue;
             }
@@ -1523,6 +1645,14 @@ static int cetrafs_cas_region_seeded_impl(struct super_block *sb,
             goto out;
         }
 
+        if (ret != -EBUSY && undecided && cetrafs_cas_undecided_nap(sb, undecided_until, &naps)) {
+            /* A definite "not executed" (or no path) on the retry of an
+             * undecided swap is not an answer about the FIRST one: wait,
+             * re-read and re-judge. Ending here stopped the mount over a
+             * path failover (audit 2026-11-15 M-21). */
+            extra++;
+            continue;
+        }
         if (ret != -EBUSY)
             goto out; /* real transport error */
 
@@ -1540,6 +1670,11 @@ static int cetrafs_cas_region_seeded_impl(struct super_block *sb,
             u8 *vb = kmalloc(CETRAFS_BLOCK_SIZE, GFP_NOIO);
             int vret = vb ? cetrafs_cas_verify_read(sb, fs_lba, vb) : -ENOMEM;
 
+            if (vret && cetrafs_cas_undecided_nap(sb, undecided_until, &naps)) {
+                kfree(vb);
+                extra++;
+                continue; /* the next attempt's read judges it */
+            }
             if (!vret && !memcmp(vb + off, unknown, region)) {
                 pr_warn("CAS lba=%llu: the timed-out command landed late -- taking it as done\n",
                         (unsigned long long) fs_lba);
@@ -1926,7 +2061,7 @@ void cetrafs_cas_selftest(struct super_block *sb, u32 my_node_id)
         static const char *const whats[] = {"lost",
                                             "landed",
                                             "landed late",
-                                            "-EIO after landing",
+                                            "refused not-ready on one path",
                                             "landed before the re-read",
                                             "MEDIUM ERROR after landing",
                                             "ABORTED COMMAND after landing"};
@@ -1945,18 +2080,22 @@ void cetrafs_cas_selftest(struct super_block *sb, u32 my_node_id)
             cetrafs_caw_timeout_lost_once = phase == 0;
             cetrafs_caw_timeout_landed_once = phase == 1;
             cetrafs_caw_timeout_late_once = phase == 2;
-            cetrafs_caw_eio_landed_once = phase == 3;
+            if (phase == 3 && strncmp(sb->s_bdev->bd_disk->disk_name, "dm-", 3)) {
+                pr_info("CAS selftest: the %s case needs a dm path -- not exercised here\n", what);
+                continue;
+            }
+            cetrafs_caw_not_ready_count = phase == 3;
             cetrafs_caw_timeout_late_preread_once = phase == 4;
             cetrafs_caw_sense_landed_once = phase == 5 ? MEDIUM_ERROR : phase == 6 ? ABORTED_COMMAND : 0;
 
             ret = cetrafs_cas_record(sb, lba, cetrafs_cas_selftest_inc, NULL);
             /* The -EIO knob only fires on a dm path; say so rather than
              * report a case that never ran as passed. */
-            fired = !cetrafs_caw_eio_landed_once && !cetrafs_caw_sense_landed_once;
+            fired = !cetrafs_caw_not_ready_count && !cetrafs_caw_sense_landed_once;
             cetrafs_caw_timeout_landed_once = false;
             cetrafs_caw_timeout_lost_once = false;
             cetrafs_caw_timeout_late_once = false;
-            cetrafs_caw_eio_landed_once = false;
+            cetrafs_caw_not_ready_count = 0;
             cetrafs_caw_timeout_late_preread_once = false;
             cetrafs_caw_sense_landed_once = 0;
             if (!fired) {

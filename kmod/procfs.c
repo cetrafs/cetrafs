@@ -252,6 +252,7 @@ static int cetrafs_proc_info_show(struct seq_file *m, void *v)
      * this device.
      */
     seq_printf(m, "cas_miscompares: %llu\n", cetrafs_cas_miscompare_count());
+    seq_printf(m, "cas_undecided_naps: %llu\n", cetrafs_cas_undecided_nap_count());
     seq_printf(m, "cas_ops: %llu\n", cetrafs_cas_op_count());
     seq_printf(m, "record_writes: %llu\n", cetrafs_record_write_count());
     seq_printf(m, "pending_free_appends: %llu\n", cetrafs_pending_free_append_count());

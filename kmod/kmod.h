@@ -632,6 +632,7 @@ int cetrafs_cas_record(struct super_block *sb, u64 fs_lba, cetrafs_cas_fn mutate
 int cetrafs_cas_record_nointr(struct super_block *sb, u64 fs_lba, cetrafs_cas_fn mutate, void *priv);
 unsigned int cetrafs_cas_region_size(struct super_block *sb);
 u64 cetrafs_cas_miscompare_count(void);
+u64 cetrafs_cas_undecided_nap_count(void);
 /* Device round trips an operation costs, made countable because neither
  * is visible in /sys/block: a CAW is a passthrough request the block
  * layer does not account, and a record write is one 4 KiB write among
