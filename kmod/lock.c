@@ -94,6 +94,7 @@ u64 cetrafs_lock_resume_count(void)
  * (local or a peer). The on-disk claim is a non-blocking CAS, so blocking
  * is an interruptible retry, same as the cluster filesystems' glock wait. */
 #define CETRAFS_FLOCK_POLL_MS 100
+#define CETRAFS_FLOCK_POLL_MAX_MS 1000 /* a peer opener: backoff ceiling (M-26) */
 
 /*
  * Private per-inode state. lock_mutex serializes this node's own
@@ -6295,6 +6296,20 @@ static int cetrafs_give_back_cas(struct inode *inode, void *arg)
  * (a peer holds the lock) are the contended results the flock wrapper maps
  * to -EWOULDBLOCK / retries on; everything else is terminal.
  */
+/* TEST ONLY: flock claims without first asking whether a peer has the
+ * file open (before audit 2026-11-14 M-26; flock_waits_quietly.sh). */
+static bool cetrafs_flock_no_precheck;
+cetrafs_test_param(flock_no_precheck, cetrafs_flock_no_precheck, bool, 0644);
+MODULE_PARM_DESC(flock_no_precheck, "TEST ONLY: nofilelock flock claims before asking about peer openers");
+
+/* Claims flock took and gave back on finding a peer opener (procfs). */
+static atomic64_t cetrafs_flock_backouts = ATOMIC64_INIT(0);
+
+u64 cetrafs_flock_backout_count(void)
+{
+    return (u64) atomic64_read(&cetrafs_flock_backouts);
+}
+
 static int cetrafs_lock_explicit_acquire(struct inode *inode, struct file *file)
 {
     struct cetrafs_inode_info *ci = CETRAFS_I(inode);
@@ -6327,6 +6342,21 @@ static int cetrafs_lock_explicit_acquire(struct inode *inode, struct file *file)
     if (ci->explicit_lock_file) {
         ret = -EBUSY; /* another local fd holds it; one holder, one releaser */
         goto out;
+    }
+
+    /* A peer opener present now makes the claim below a claim that is
+     * given straight back: two device writes per poll for a blocking
+     * waiter, and every peer open landing inside that window refused
+     * ETXTBSY for a lock that was never going to stand (audit 2026-11-14
+     * M-26). Asked read-only first; the check after the claim stays --
+     * it is the one that decides, as only then is the set of openers
+     * frozen. */
+    if (!READ_ONCE(cetrafs_flock_no_precheck)) {
+        ret = cetrafs_lock_foreign_reader_exists(sb, inode->i_ino, my_node_id, &present);
+        if (!ret && present)
+            ret = -EBUSY;
+        if (ret)
+            goto out;
     }
 
     cetrafs_invalidate_raw_inode(sb, inode->i_ino);
@@ -6392,6 +6422,7 @@ static int cetrafs_lock_explicit_acquire(struct inode *inode, struct file *file)
         };
 
         cetrafs_lock_give_back(inode, cetrafs_give_back_cas, &rel, "flock");
+        atomic64_inc(&cetrafs_flock_backouts);
         if (!ret)
             ret = -EBUSY;
         goto out;
@@ -6547,6 +6578,7 @@ int cetrafs_flock(struct file *file, int cmd, struct file_lock *fl)
     struct inode *inode = file_inode(file);
     bool blocking = (cmd == F_SETLKW);
     bool lock_on = cetrafs_sb_file_lock_enabled(inode->i_sb);
+    unsigned int poll_ms = CETRAFS_FLOCK_POLL_MS;
     int mover_rounds = 0;
     u32 me;
     int ret;
@@ -6607,9 +6639,14 @@ int cetrafs_flock(struct file *file, int cmd, struct file_lock *fl)
         if (!blocking)
             return -EWOULDBLOCK; /* LOCK_NB and contended */
         /* Blocking LOCK_EX: wait for the holder (local or a peer) to
-         * release. Interruptible so a signal (or kill) does not wedge. */
-        if (msleep_interruptible(CETRAFS_FLOCK_POLL_MS))
+         * release. Interruptible so a signal (or kill) does not wedge.
+         * A peer that keeps the file open is waited for with backoff:
+         * each look is a forced-fresh read, and a VM's open lasts
+         * minutes, not milliseconds (M-26). */
+        if (msleep_interruptible(poll_ms))
             return -EINTR;
+        if (ret == -EBUSY && !READ_ONCE(cetrafs_flock_no_precheck))
+            poll_ms = min(poll_ms * 2, CETRAFS_FLOCK_POLL_MAX_MS);
     }
 }
 

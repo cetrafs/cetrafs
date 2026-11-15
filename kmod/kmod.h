@@ -670,6 +670,7 @@ u64 cetrafs_journal_replay_torn_count(void);
 u64 cetrafs_journal_replay_kept_count(void);
 u64 cetrafs_evict_rereads_changed_count(void);
 u64 cetrafs_bmap_flush_batch_count(void);
+u64 cetrafs_flock_backout_count(void);
 extern bool cetrafs_pf_force_foreign;
 u64 cetrafs_pf_full_scans_count(void);
 u64 cetrafs_pf_drain_blocks_count(void);
