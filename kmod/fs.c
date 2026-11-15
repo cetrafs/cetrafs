@@ -385,6 +385,10 @@ struct cetrafs_sb_info {
      * on an sbi that never actually registered would try to release
      * some *other* node's row 0 right out from under it. */
     bool node_registered;
+    /* The mount failed before this node's own journal area was replayed
+     * (or its claims swept): the teardown must not announce a clean
+     * departure over it (audit 2026-11-14 B-6). */
+    bool own_area_unsettled;
 
     /* This node's own parsed UUID, cached alongside node_id -- needed
      * again by heartbeat.c's periodic tick to derive
@@ -3355,6 +3359,7 @@ int cetrafs_fill_super(struct super_block *sb, struct fs_context *fc)
                 rc = cetrafs_journal_sweep_own_claims(sb, sbi->node_id);
                 if (rc) {
                     pr_err("could not hand back the replay claims this node held before it went down: %d\n", rc);
+                    sbi->own_area_unsettled = true;
                     cetrafs_free_sb_info(sb);
                     brelse(bh);
                     return rc;
@@ -3363,6 +3368,7 @@ int cetrafs_fill_super(struct super_block *sb, struct fs_context *fc)
             rc = cetrafs_journal_attach_node(sb, sbi->node_id);
             if (rc) {
                 pr_err("own journal replay/attach failed: %d\n", rc);
+                sbi->own_area_unsettled = true;
                 cetrafs_free_sb_info(sb);
                 brelse(bh);
                 return rc;
@@ -4007,6 +4013,14 @@ departed:
      * moment it beats. Left unannounced, the row goes stale: peers
      * reclaim them as a dead node's, and the next mount sweeps whatever
      * is left. */
+    /* A mount refused over an unreplayed own area announces nothing: a
+     * clean departure lets peers take the row's Zone Groups at once and
+     * skip what a crashed node's sweep would do, and the next mount of
+     * this node its own-claim sweeps -- over entries never replayed. */
+    if (sbi->own_area_unsettled && !flush_err) {
+        pr_err("%s: own journal area left unreplayed -- not announcing a clean departure\n", sb->s_id);
+        flush_err = -EIO;
+    }
     unreleased = READ_ONCE(sbi->nsrel_count) + READ_ONCE(sbi->flrel_count) + READ_ONCE(sbi->prrel_count) +
                  READ_ONCE(sbi->rcrel_count) + (cetrafs_journal_release_pending(sb) ? 1 : 0);
     if (sbi->node_registered && !READ_ONCE(sbi->fenced) && !flush_err && unreleased) {

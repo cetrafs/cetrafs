@@ -120,6 +120,7 @@ static void *xcalloc(size_t n, size_t s)
 #define CETRAFS_KNOWN_RO_COMPAT 0ULL
 
 static int repair_mode;    /* -r given */
+static long discard_journal = -1; /* --discard-journal N: the row whose area to park, -1 none */
 /* The Node Registry row this run holds while it repairs, so a node
  * cannot mount the volume mid-pass. -1 when nothing is held. See
  * devutil.h's cetrafs_repair_claim(). */
@@ -1819,6 +1820,72 @@ static void fsck_salvage_free(void)
     fsck_nsalv = fsck_salv_cap = 0;
 }
 
+/*
+ * --discard-journal N: park row N's journal area CLEAN without replaying
+ * it. Replay refuses -- and leaves the area DIRTY -- whatever it cannot
+ * decide: an entry whose owner stays unreadable once a pass redoes
+ * nothing, a header or target it cannot read. That is the right call for
+ * a mount to make, and it is permanent on a bad sector: the node never
+ * mounts again and no peer can take its Zone Groups over (audit
+ * 2026-11-14 A-10/B-6). This is the operator's way out, under the repair
+ * claim and with no live node: every entry is dropped unapplied, and the
+ * park_seq bump means one that lands late is from a parked session.
+ * The redo is lost; a torn target it would have rewritten fails its own
+ * checksum, which the walk that follows reports.
+ */
+static void fsck_discard_journal(int fd, const cetrafs_superblock_t *sb, uint32_t n)
+{
+    uint32_t jb = cetrafs_le32(sb->node_journal_blocks);
+    uint64_t area, slots, dropped = 0;
+    uint8_t blk[CETRAFS_BLOCK_SIZE];
+    cetrafs_node_journal_hdr_t flag;
+
+    if (!jb) {
+        fprintf(stderr, "ERR: --discard-journal: this volume has no journal (mkfs -J 0)\n");
+        exit(FSCK_EXIT_USAGE);
+    }
+    if (n >= cetrafs_le32(sb->node_table_count)) {
+        fprintf(stderr, "ERR: --discard-journal: row %u is past the Node Registry (%u rows)\n", n,
+                cetrafs_le32(sb->node_table_count));
+        exit(FSCK_EXIT_USAGE);
+    }
+    area = cetrafs_le64(sb->node_journal_start) + (uint64_t) n * jb;
+    slots = (jb - 1) / CETRAFS_JOURNAL_SLOT_BLOCKS;
+    pread_all(fd, blk, sizeof(blk), (off_t) area * CETRAFS_BLOCK_SIZE);
+    memcpy(&flag, blk, sizeof(flag));
+    if (cetrafs_le32(flag.magic) != CETRAFS_NODE_JOURNAL_MAGIC || cetrafs_le32(flag.state) != CETRAFS_NODE_JOURNAL_DIRTY) {
+        printf("  node %u journal is not DIRTY -- nothing to discard\n", n);
+        return;
+    }
+    for (uint64_t sl = 0; sl < slots; ++sl) {
+        uint64_t hlba = area + 1 + sl * CETRAFS_JOURNAL_SLOT_BLOCKS;
+        cetrafs_journal_header_t hdr;
+
+        pread_all(fd, blk, sizeof(blk), (off_t) hlba * CETRAFS_BLOCK_SIZE);
+        memcpy(&hdr, blk, sizeof(hdr));
+        if (cetrafs_le32(hdr.magic) != CETRAFS_JOURNAL_MAGIC)
+            continue;
+        printf("  node %u journal slot %" PRIu64 ": txn %" PRIu64 " for block %" PRIu64 " discarded unapplied\n", n, sl,
+               (uint64_t) cetrafs_le64(hdr.txn_id), (uint64_t) cetrafs_le64(hdr.target_lba));
+        memset(blk, 0, sizeof(blk));
+        pwrite_all(fd, blk, sizeof(blk), (off_t) hlba * CETRAFS_BLOCK_SIZE);
+        dropped++;
+    }
+    /* The headers are gone before the flag says CLEAN: the other order
+     * leaves entries under a CLEAN flag if this run dies between. */
+    flag.state = cetrafs_cpu_to_le32(CETRAFS_NODE_JOURNAL_CLEAN);
+    flag.replay_owner = cetrafs_cpu_to_le32(CETRAFS_NODE_ID_NONE);
+    flag.replay_incarnation = cetrafs_cpu_to_le32(0);
+    flag.replay_claimed = cetrafs_cpu_to_le64(0);
+    flag.park_seq = cetrafs_cpu_to_le64(cetrafs_le64(flag.park_seq) + 1);
+    pread_all(fd, blk, sizeof(blk), (off_t) area * CETRAFS_BLOCK_SIZE);
+    memcpy(blk, &flag, sizeof(flag));
+    pwrite_all(fd, blk, sizeof(blk), (off_t) area * CETRAFS_BLOCK_SIZE);
+    repairs_made++;
+    printf("  node %u journal: %" PRIu64 " entr%s discarded, area parked CLEAN\n", n, dropped, dropped == 1 ? "y" : "ies");
+    fflush(stdout);
+}
+
 int main(int argc, char **argv)
 {
     const char *dev = NULL;
@@ -1826,7 +1893,17 @@ int main(int argc, char **argv)
     for (int i = 1; i < argc; ++i) {
         if (!strcmp(argv[i], "-r") || !strcmp(argv[i], "--repair"))
             repair_mode = 1;
-        else if (argv[i][0] == '-') {
+        else if (!strcmp(argv[i], "--discard-journal") && i + 1 < argc) {
+            char *end;
+
+            discard_journal = strtol(argv[++i], &end, 10);
+            if (*end || discard_journal < 0 || discard_journal >= CETRAFS_NODE_ID_NONE) {
+                fprintf(stderr, "--discard-journal needs a registry row number\n");
+                dev = NULL;
+                break;
+            }
+            repair_mode = 1; /* writes: the repair claim and the live-peer check */
+        } else if (argv[i][0] == '-') {
             fprintf(stderr, "unknown option %s\n", argv[i]);
             dev = NULL;
             break;
@@ -1841,6 +1918,10 @@ int main(int argc, char **argv)
         fprintf(stderr, "                 (bitmap bits, cached free counts, link counts).\n");
         fprintf(stderr, "                 Never touches cross-file overlap, unreachable inodes\n");
         fprintf(stderr, "                 or dangling entries -- those are reported, not guessed.\n");
+        fprintf(stderr, "  --discard-journal N  park registry row N's DIRTY journal area CLEAN\n");
+        fprintf(stderr, "                 WITHOUT replaying it (implies -r). Only for an area a mount\n");
+        fprintf(stderr, "                 cannot replay (an unreadable block): the redo is lost, and the\n");
+        fprintf(stderr, "                 blocks it would have repaired are reported by the walk after.\n");
         fprintf(stderr, "exit: 0 clean, 1 problems found, 2 usage, 3 could not examine the device\n");
         return FSCK_EXIT_USAGE;
     }
@@ -2291,6 +2372,9 @@ int main(int argc, char **argv)
             return FSCK_EXIT_NOEXAM;
         }
     }
+
+    if (discard_journal >= 0)
+        fsck_discard_journal(fd, &sb, (uint32_t) discard_journal);
 
     /* ZG table. Also records each ZG's (first_bg_id, bg_count,
      * free_data_blocks) for the ZG<->BG ownership cross-checks below

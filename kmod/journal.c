@@ -2986,9 +2986,10 @@ static int __cetrafs_journal_replay_node(struct super_block *sb, u32 node_id, bo
          * the bytes passed the guard, but a block freed and reallocated
          * since can carry the same bytes -- an empty dirent block looks
          * like any other. It must still be the entry's owner's (L9). An
-         * owner whose record or tree cannot be read leaves the verdict
-         * to the guard, as before the check existed: refusing would
-         * leave a torn block unrepaired on a read error elsewhere. */
+         * owner whose record or tree cannot be read is deferred to the
+         * next pass, and refused -- the area left DIRTY -- once a pass
+         * redoes nothing (below); fsck --discard-journal is the way out
+         * of an area that stays undecidable. */
         owner_dir = false;
         owner_known = false;
         if (apply && !cetrafs_journal_ignore_owner) {
