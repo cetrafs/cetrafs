@@ -368,6 +368,10 @@ static bool cetrafs_bitmap_writeback;
 cetrafs_test_param(bitmap_writeback, cetrafs_bitmap_writeback, bool, 0644);
 MODULE_PARM_DESC(bitmap_writeback, "TEST ONLY: allocation bitmaps are left dirty for writeback (before A-15)");
 
+static int __cetrafs_keep_submit(struct buffer_head *bh, bool *was_dirty, bool *was_held);
+static int __cetrafs_keep_wait(struct buffer_head *bh, bool was_dirty, bool was_held);
+static int cetrafs_meta_write_result(struct super_block *sb, struct buffer_head *bh, int ret);
+
 static atomic64_t cetrafs_held_flushes = ATOMIC64_INIT(0);
 
 u64 cetrafs_held_flush_count(void)
@@ -411,11 +415,61 @@ void cetrafs_bh_end_update_held(struct super_block *sb, struct buffer_head *bh, 
  * the block stays held -- its bytes are the only record of bits that did
  * not land (cetrafs_sync_buffer_keep()) -- and the error is returned.
  */
+/* TEST ONLY: write held blocks one at a time, each waited for before the
+ * next is sent -- the flush before batching (tests/kernel/held_flush_batched.sh). */
+static bool cetrafs_held_flush_serial;
+cetrafs_test_param(held_flush_serial, cetrafs_held_flush_serial, bool, 0644);
+MODULE_PARM_DESC(held_flush_serial, "TEST ONLY: the held-bitmap flush writes one block at a time");
+
+static atomic64_t cetrafs_held_flush_batches = ATOMIC64_INIT(0);
+
+u64 cetrafs_held_flush_batch_count(void)
+{
+    return (u64) atomic64_read(&cetrafs_held_flush_batches);
+}
+
+#define CETRAFS_HELD_BATCH 256
+
+struct cetrafs_held_io {
+    struct buffer_head *bh;
+    unsigned long idx;
+    int state; /* __cetrafs_keep_submit()'s answer */
+    bool was_dirty, was_held;
+};
+
+/* Finish one entry: its write's verdict, and unlisted if no longer held. */
+static int cetrafs_held_finish(struct super_block *sb, struct xarray *xa, struct cetrafs_held_io *io)
+{
+    struct buffer_head *bh = io->bh;
+    int r = io->state == 1 ? __cetrafs_keep_wait(bh, io->was_dirty, io->was_held) : io->state;
+
+    r = cetrafs_meta_write_result(sb, bh, r);
+    lock_buffer(bh);
+    if (!buffer_cetra_held(bh) && xa_load(xa, io->idx) == bh) {
+        xa_erase(xa, io->idx);
+        put_bh(bh); /* the list's pin */
+    }
+    unlock_buffer(bh);
+    put_bh(bh);
+    return r;
+}
+
+/*
+ * Every held block is sent before any is waited for, a batch at a time
+ * under one plug: one synchronous write per block, ~38 ms each on a SAN,
+ * made deleting a 1 TiB image (~8,192 bitmap blocks) about five minutes
+ * of serial writes that the pending-free drain, a Zone Group release and
+ * every sync queued behind -- where writeback, before A-15, had sent them
+ * together and merged neighbours.
+ */
 int cetrafs_held_flush(struct super_block *sb)
 {
     struct xarray *xa = cetrafs_sb_held(sb);
+    struct cetrafs_held_io one, *io;
     struct buffer_head *bh;
     unsigned long idx;
+    unsigned int n = 0, cap, i;
+    struct blk_plug plug;
     int ret = 0, r;
 
     if (!xa || xa_empty(xa))
@@ -423,20 +477,39 @@ int cetrafs_held_flush(struct super_block *sb)
     if (cetrafs_sb_is_fenced(sb))
         return -EIO;
     atomic64_inc(&cetrafs_held_flushes);
+    io = READ_ONCE(cetrafs_held_flush_serial) ? NULL : kmalloc_array(CETRAFS_HELD_BATCH, sizeof(*io), GFP_NOFS);
+    cap = io ? CETRAFS_HELD_BATCH : 1;
+    if (!io)
+        io = &one;
+    blk_start_plug(&plug);
     xa_for_each(xa, idx, bh) {
-        cond_resched();
         get_bh(bh);
-        r = cetrafs_sync_buffer_keep(sb, bh); /* writes it if held or dirty */
+        io[n].bh = bh;
+        io[n].idx = idx;
+        io[n].state = __cetrafs_keep_submit(bh, &io[n].was_dirty, &io[n].was_held);
+        if (++n < cap)
+            continue;
+        blk_finish_plug(&plug);
+        atomic64_inc(&cetrafs_held_flush_batches);
+        for (i = 0; i < n; i++) {
+            r = cetrafs_held_finish(sb, xa, &io[i]);
+            if (r && !ret)
+                ret = r;
+        }
+        n = 0;
+        cond_resched();
+        blk_start_plug(&plug);
+    }
+    blk_finish_plug(&plug);
+    if (n)
+        atomic64_inc(&cetrafs_held_flush_batches);
+    for (i = 0; i < n; i++) {
+        r = cetrafs_held_finish(sb, xa, &io[i]);
         if (r && !ret)
             ret = r;
-        lock_buffer(bh);
-        if (!buffer_cetra_held(bh) && xa_load(xa, idx) == bh) {
-            xa_erase(xa, idx);
-            put_bh(bh); /* the list's pin */
-        }
-        unlock_buffer(bh);
-        put_bh(bh);
     }
+    if (io != &one)
+        kfree(io);
     return ret;
 }
 
@@ -591,7 +664,9 @@ static void cetrafs_end_write_keep(struct buffer_head *bh, int uptodate)
  * whose completion does clear BH_Uptodate): while the bit is still clear
  * nobody has re-read the block over our bytes, so they are put back.
  */
-static int __cetrafs_sync_buffer_keep(struct buffer_head *bh)
+/* The submit half: 1 submitted (finish with __cetrafs_keep_wait()), 0
+ * nothing to write, -EIO an earlier failed write found and re-dirtied. */
+static int __cetrafs_keep_submit(struct buffer_head *bh, bool *was_dirty, bool *was_held)
 {
     lock_buffer(bh); /* also waits out a writeback already in flight */
     if (buffer_write_io_error(bh)) {
@@ -601,37 +676,48 @@ static int __cetrafs_sync_buffer_keep(struct buffer_head *bh)
         mark_buffer_dirty(bh);
         return -EIO;
     }
-    {
-        bool was_dirty = test_clear_buffer_dirty(bh);
-        bool was_held = test_clear_buffer_cetra_held(bh);
-
-        if (!was_dirty && !was_held) {
-            unlock_buffer(bh);
-            return 0;
-        }
+    *was_dirty = test_clear_buffer_dirty(bh);
+    *was_held = test_clear_buffer_cetra_held(bh);
+    if (!*was_dirty && !*was_held) {
+        unlock_buffer(bh);
+        return 0;
+    }
 #if LINUX_VERSION_CODE >= KERNEL_VERSION(7, 2, 0)
-        bh_submit(bh, REQ_OP_WRITE | REQ_SYNC, cetrafs_end_write_keep);
+    bh_submit(bh, REQ_OP_WRITE | REQ_SYNC, cetrafs_end_write_keep);
 #else
-        get_bh(bh);
-        bh->b_end_io = cetrafs_end_write_keep;
-        submit_bh(REQ_OP_WRITE | REQ_SYNC, bh);
+    get_bh(bh);
+    bh->b_end_io = cetrafs_end_write_keep;
+    submit_bh(REQ_OP_WRITE | REQ_SYNC, bh);
 #endif
-        wait_on_buffer(bh);
-        if (buffer_write_io_error(bh)) {
-            clear_buffer_write_io_error(bh);
-            /* still uptodate: the next boundary retries it -- held again
-             * if it was held, never handed to writeback (A-15) */
-            if (was_held && !was_dirty) {
-                lock_buffer(bh);
-                set_buffer_cetra_held(bh);
-                unlock_buffer(bh);
-            } else {
-                mark_buffer_dirty(bh);
-            }
-            return -EIO;
+    return 1;
+}
+
+/* The completion half of a submitted keep-write. */
+static int __cetrafs_keep_wait(struct buffer_head *bh, bool was_dirty, bool was_held)
+{
+    wait_on_buffer(bh);
+    if (buffer_write_io_error(bh)) {
+        clear_buffer_write_io_error(bh);
+        /* still uptodate: the next boundary retries it -- held again
+         * if it was held, never handed to writeback (A-15) */
+        if (was_held && !was_dirty) {
+            lock_buffer(bh);
+            set_buffer_cetra_held(bh);
+            unlock_buffer(bh);
+        } else {
+            mark_buffer_dirty(bh);
         }
+        return -EIO;
     }
     return 0;
+}
+
+static int __cetrafs_sync_buffer_keep(struct buffer_head *bh)
+{
+    bool was_dirty, was_held;
+    int ret = __cetrafs_keep_submit(bh, &was_dirty, &was_held);
+
+    return ret == 1 ? __cetrafs_keep_wait(bh, was_dirty, was_held) : ret;
 }
 
 /*

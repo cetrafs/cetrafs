@@ -386,6 +386,7 @@ static int cetrafs_proc_info_show(struct seq_file *m, void *v)
     seq_printf(m, "meta_nospc: %llu\n", cetrafs_meta_nospc_count());
     seq_printf(m, "tree_half_full: %llu\n", cetrafs_tree_half_full_count());
     seq_printf(m, "close_nospc_drops: %llu\n", cetrafs_close_nospc_drop_count());
+    seq_printf(m, "held_flush_batches: %llu\n", cetrafs_held_flush_batch_count());
     seq_printf(m, "convert_leaf_full: %llu\n", cetrafs_convert_leaf_full_count());
     seq_printf(m, "leaf_splits: %llu\n", cetrafs_leaf_split_count());
     seq_printf(m, "tree_any_leaf_inserts: %llu\n", cetrafs_tree_any_leaf_count());
