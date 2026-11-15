@@ -6001,6 +6001,65 @@ static int cetrafs_lock_raw_is_inode(struct inode *inode, const cetrafs_inode_t 
  * Returns -ETXTBSY when a peer holds it, which cetrafs_flock() maps to
  * -EWOULDBLOCK (or retries, for a blocking LOCK_EX).
  */
+/*
+ * The lock is held, and a claim was refused for it. If its holder is a
+ * DEAD node nothing will ever release it: fence the holder, replay its
+ * journal (it may have died mid-write on this very file), and arm 'ctx'
+ * to displace exactly that holder's claim and no other. 0: armed, 'raw'
+ * re-read; -ETXTBSY: a live holder (or it just let go) -- keep waiting.
+ */
+static int cetrafs_lock_arm_stale_steal(struct inode *inode, u32 my_node_id, cetrafs_inode_t *raw,
+                                        struct cetrafs_lock_cas_ctx *ctx, const char *who)
+{
+    struct super_block *sb = inode->i_sb;
+    bool stale = false;
+    u32 owner;
+    int ret;
+
+    cetrafs_invalidate_raw_inode(sb, inode->i_ino);
+    ret = cetrafs_read_raw_inode(sb, inode->i_ino, raw);
+    if (ret)
+        return ret;
+    owner = cetrafs_le32(raw->lock_owner_node);
+    if (!cetrafs_lock_mode_held(cetrafs_le32(raw->lock_mode)) || owner == my_node_id ||
+        cetrafs_node_is_stale(sb, owner, &stale) != 0 || !stale)
+        return -ETXTBSY;
+    ret = cetrafs_node_fence_peer(sb, owner, "a file lock (flock)");
+    if (ret == -EBUSY)
+        return -ETXTBSY; /* its owner came back: a live holder */
+    if (!ret)
+        ret = cetrafs_journal_replay_node(sb, owner, /*wait_for_claim=*/true);
+    if (ret) {
+        pr_err("%s: ino=%llu could not fence and replay stale node %u (%d) -- not taking its lock\n", who,
+               (unsigned long long) inode->i_ino, owner, ret);
+        return ret;
+    }
+    pr_warn("%s: ino=%llu reclaiming a stale lock from node %u\n", who, (unsigned long long) inode->i_ino, owner);
+    cetrafs_invalidate_raw_inode(sb, inode->i_ino);
+    ret = cetrafs_read_raw_inode(sb, inode->i_ino, raw);
+    if (!ret)
+        ret = cetrafs_lock_raw_is_inode(inode, raw);
+    if (ret)
+        return ret;
+    ctx->generation = cetrafs_le64(raw->generation);
+    ctx->allow_steal = true;
+    ctx->steal_from = owner;
+    /* The incarnation judged stale: a lock its node took again after
+     * re-attaching is not stealable (F10), and the swap answers
+     * -ETXTBSY -- a live holder, keep waiting. */
+    ctx->steal_incarnation = cetrafs_le32(raw->lock_owner_incarnation);
+    if (cetrafs_le32(raw->lock_owner_node) != owner)
+        ctx->steal_incarnation = 0; /* moved on: the swap finds it free or someone else's */
+    cetrafs_node_test_stall_before_swap();
+    return 0;
+}
+
+/* TEST ONLY: a default-mount resume refuses any held lock, a dead
+ * holder's too (before audit 2026-11-14 M-25; lock_resume_stale_holder.sh). */
+static bool cetrafs_lock_resume_no_reclaim;
+cetrafs_test_param(lock_resume_no_reclaim, cetrafs_lock_resume_no_reclaim, bool, 0644);
+MODULE_PARM_DESC(lock_resume_no_reclaim, "TEST ONLY: flock(LOCK_EX) resume never reclaims a dead holder's lock");
+
 static int cetrafs_lock_resume(struct inode *inode)
 {
     struct cetrafs_inode_info *ci = CETRAFS_I(inode);
@@ -6043,11 +6102,6 @@ static int cetrafs_lock_resume(struct inode *inode)
     if (ret)
         goto out;
 
-    if (cetrafs_le32(raw.lock_mode) != CETRAFS_LOCK_NONE) {
-        ret = -ETXTBSY;
-        goto out;
-    }
-
     {
         struct cetrafs_lock_cas_ctx ctx = {
             .my_node_id = my_node_id,
@@ -6058,6 +6112,18 @@ static int cetrafs_lock_resume(struct inode *inode)
             .refuse_readers = !cetrafs_lock_ignore_readers,
         };
 
+        /* Held. A migration destination that claimed the file and then
+         * died never releases it: the source's resume answered -ETXTBSY
+         * for ever, its VM's writes failing until qemu was restarted --
+         * the nofilelock flock reclaimed a dead holder and this did not
+         * (audit 2026-11-14 M-25). */
+        if (cetrafs_le32(raw.lock_mode) != CETRAFS_LOCK_NONE) {
+            ret = READ_ONCE(cetrafs_lock_resume_no_reclaim)
+                      ? -ETXTBSY
+                      : cetrafs_lock_arm_stale_steal(inode, my_node_id, &raw, &ctx, "resume");
+            if (ret)
+                goto out;
+        }
         ret = cetrafs_lock_cas(inode, &ctx, &raw);
         if (ret < 0)
             goto out; /* -ETXTBSY: lost the race to a peer */
@@ -6292,49 +6358,9 @@ static int cetrafs_lock_explicit_acquire(struct inode *inode, struct file *file)
              * on this very file), then displace exactly that holder's
              * claim and no other.
              */
-            u32 owner;
-            bool stale = false;
-
-            cetrafs_invalidate_raw_inode(sb, inode->i_ino);
-            ret = cetrafs_read_raw_inode(sb, inode->i_ino, &raw);
+            ret = cetrafs_lock_arm_stale_steal(inode, my_node_id, &raw, &ctx, "flock");
             if (ret)
                 goto out;
-            owner = cetrafs_le32(raw.lock_owner_node);
-            if (!cetrafs_lock_mode_held(cetrafs_le32(raw.lock_mode)) || owner == my_node_id ||
-                cetrafs_node_is_stale(sb, owner, &stale) != 0 || !stale) {
-                ret = -ETXTBSY; /* a live holder (or it just let go): keep waiting */
-                goto out;
-            }
-            ret = cetrafs_node_fence_peer(sb, owner, "a file lock (flock)");
-            if (ret == -EBUSY) {
-                ret = -ETXTBSY; /* its owner came back: a live holder */
-                goto out;
-            }
-            if (!ret)
-                ret = cetrafs_journal_replay_node(sb, owner, /*wait_for_claim=*/true);
-            if (ret) {
-                pr_err("flock: ino=%llu could not fence and replay stale node %u (%d) -- not taking its lock\n",
-                       (unsigned long long) inode->i_ino, owner, ret);
-                goto out;
-            }
-            pr_warn("flock: ino=%llu reclaiming a stale lock from node %u\n", (unsigned long long) inode->i_ino,
-                    owner);
-            cetrafs_invalidate_raw_inode(sb, inode->i_ino);
-            ret = cetrafs_read_raw_inode(sb, inode->i_ino, &raw);
-            if (!ret)
-                ret = cetrafs_lock_raw_is_inode(inode, &raw);
-            if (ret)
-                goto out;
-            ctx.generation = cetrafs_le64(raw.generation);
-            ctx.allow_steal = true;
-            ctx.steal_from = owner;
-            /* The incarnation judged stale: a lock its node took again
-             * after re-attaching is not stealable (F10), and the swap
-             * answers -ETXTBSY -- a live holder, keep waiting. */
-            ctx.steal_incarnation = cetrafs_le32(raw.lock_owner_incarnation);
-            if (cetrafs_le32(raw.lock_owner_node) != owner)
-                ctx.steal_incarnation = 0; /* moved on: the swap finds it free or someone else's */
-            cetrafs_node_test_stall_before_swap();
             ret = cetrafs_lock_cas(inode, &ctx, &raw);
         }
         if (ret)
