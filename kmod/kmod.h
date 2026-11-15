@@ -828,6 +828,8 @@ u64 cetrafs_flat_data_blocks(const cetrafs_extent_t *flat, u32 n);
 // inode.c
 struct inode *cetrafs_iget(struct super_block *sb, u64 ino);
 int cetrafs_write_vfs_inode(struct inode *inode);
+/* inode.c: a table walk's read -- -ENODATA for a never-written record (F-7) */
+int cetrafs_read_raw_inode_walk(struct super_block *sb, u64 ino, cetrafs_inode_t *out);
 int cetrafs_read_raw_inode(struct super_block *sb, u64 ino, cetrafs_inode_t *out);
 int cetrafs_write_raw_inode(struct super_block *sb, u64 ino, const cetrafs_inode_t *in, bool sync);
 int cetrafs_write_raw_inode_self(struct inode *self, const cetrafs_inode_t *in, bool sync); /* inode.c: holds fd_pub */

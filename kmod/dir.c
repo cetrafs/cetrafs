@@ -2509,7 +2509,11 @@ int cetrafs_ns_count_names(struct super_block *sb, const u64 *inos, u32 n, u32 *
             x = win->ino[j];
             if (serial)
                 cetrafs_invalidate_raw_inode(sb, x);
-            ret = cetrafs_read_raw_inode(sb, x, raw);
+            ret = cetrafs_read_raw_inode_walk(sb, x, raw);
+            if (ret == -ENODATA) {
+                ret = 0;
+                continue; /* never written: names nothing (F-7) */
+            }
             if (ret)
                 goto out;
             /* A removed directory is empty, and its blocks may be anyone's. */

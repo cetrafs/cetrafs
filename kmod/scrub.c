@@ -487,7 +487,9 @@ static int scrub_build_refset(struct cetrafs_scrub *s, struct scrub_ctx *ctx, bo
             if (cetrafs_scrub_ignore_shadow) /* TEST ONLY: the negative control */
                 ret = cetrafs_read_raw_inode(sb, ino, &raw);
         } else {
-            ret = cetrafs_read_raw_inode(sb, ino, &raw);
+            ret = cetrafs_read_raw_inode_walk(sb, ino, &raw);
+            if (ret == -ENODATA)
+                continue; /* never written: owns nothing (F-7) */
         }
         if (!ret)
             ret = cetrafs_raw_inode_for_each_owned_block(sb, &raw, scrub_mark_ref, ctx, fresh);
@@ -1010,8 +1012,8 @@ static void scrub_reclaim_orphan_inodes(struct cetrafs_scrub *s)
 
         /* The verdict read: fresh, never this node's cache. */
         cetrafs_invalidate_raw_inode(sb, ino);
-        if (cetrafs_read_raw_inode(sb, ino, &raw) != 0)
-            continue; /* unreadable: cannot vouch -- leave it for fsck */
+        if (cetrafs_read_raw_inode_walk(sb, ino, &raw) != 0)
+            continue; /* unreadable, or never written (F-7): cannot vouch -- leave it for fsck */
 
         if (cetrafs_le32(raw.nlink) != 0) {
             scrub_reconcile_stopped_op(s, ino, &raw, my_node_id);

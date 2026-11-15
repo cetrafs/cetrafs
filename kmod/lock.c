@@ -5178,7 +5178,11 @@ int cetrafs_lock_sweep_own_claims(struct super_block *sb, u32 my_node_id)
             if (!(bh->b_data[i >> 3] & (1 << (i & 7))))
                 continue;
             seen++;
-            ret = cetrafs_read_raw_inode(sb, ino, &raw);
+            ret = cetrafs_read_raw_inode_walk(sb, ino, &raw);
+            if (ret == -ENODATA) {
+                ret = 0;
+                continue; /* never written: carries no claim (F-7) */
+            }
             if (ret == -EUCLEAN) {
                 /* Damaged (kind 2): counted and left to fsck, like any
                  * other read of it; it cannot carry a claim we could
@@ -5514,7 +5518,7 @@ int cetrafs_lock_resweep_own_claims(struct super_block *sb, u32 my_node_id, bool
                 continue;
             /* A cheap look first: one record in thousands names us. */
             cetrafs_invalidate_raw_inode(sb, ino);
-            if (cetrafs_read_raw_inode(sb, ino, &raw) != 0 || cetrafs_le32(raw.nlink) == 0)
+            if (cetrafs_read_raw_inode_walk(sb, ino, &raw) != 0 || cetrafs_le32(raw.nlink) == 0)
                 continue;
             if (!(cetrafs_le32(raw.lock_owner_node) == my_node_id && cetrafs_le32(raw.lock_mode) != CETRAFS_LOCK_NONE) &&
                 !(cetrafs_le64(raw.read_open_nodes) & bit) && !(cetrafs_le64(raw.suspended_writer_nodes) & bit))

@@ -315,7 +315,38 @@ static bool cetrafs_lock_mode_ok_test(u32 m)
  * shape as dir.c's dirent-tail retry. */
 #define CETRAFS_RAW_INODE_READ_RETRIES 5
 
+static int __cetrafs_read_raw_inode(struct super_block *sb, u64 ino, cetrafs_inode_t *out, bool zero_ok);
+
 int cetrafs_read_raw_inode(struct super_block *sb, u64 ino, cetrafs_inode_t *out)
+{
+    return __cetrafs_read_raw_inode(sb, ino, out, false);
+}
+
+/* TEST ONLY: the table walks count an all-zero record as damage, as
+ * before F-7 (tests/kernel/ibmap_cas_image_only.sh). */
+static bool cetrafs_walk_zero_is_damage;
+cetrafs_test_param(walk_zero_is_damage, cetrafs_walk_zero_is_damage, bool, 0644);
+
+/*
+ * For the walks over the whole inode table (scrub, the namespace
+ * recount, the own-claims sweeps): a number whose bit is set over a
+ * record never written -- all zeros, read fresh -- is -ENODATA, not
+ * damage. Two things leave one: a create between its bit and its record
+ * write (a peer's, which a walk cannot see the end of), and a bit the
+ * inode allocator abandoned after a swap of unknown outcome (alloc.c,
+ * B-4). It names nothing, so it owns no block and no name, and counting
+ * it as damage made every scrub cycle bail and every recount fail
+ * (review F-7). The number stays allocated: freeing it on sight could
+ * free a peer's create. fsck -r frees it offline. A record that is
+ * zeros for a file this node holds is read by cetrafs_read_raw_inode(),
+ * which still calls it damage.
+ */
+int cetrafs_read_raw_inode_walk(struct super_block *sb, u64 ino, cetrafs_inode_t *out)
+{
+    return __cetrafs_read_raw_inode(sb, ino, out, !READ_ONCE(cetrafs_walk_zero_is_damage));
+}
+
+static int __cetrafs_read_raw_inode(struct super_block *sb, u64 ino, cetrafs_inode_t *out, bool zero_ok)
 {
     const cetrafs_superblock_t *raw_sb = cetrafs_sb_raw(sb);
     u64 blk;
@@ -420,6 +451,9 @@ int cetrafs_read_raw_inode(struct super_block *sb, u64 ino, cetrafs_inode_t *out
             brelse(_b);
     }
 #endif
+    /* The last attempt was a forced-fresh read: all zeros is the device's. */
+    if (zero_ok && !memchr_inv(out, 0, sizeof(*out)))
+        return -ENODATA;
     pr_err("ino=%llu failed its record checksum %d times -- corrupted, not just a torn concurrent read\n",
            (unsigned long long) ino, CETRAFS_RAW_INODE_READ_RETRIES);
     cetrafs_sb_corrupt(sb, ino);

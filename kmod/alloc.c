@@ -508,8 +508,12 @@ static long cetrafs_inode_bitmap_cas_alloc(struct super_block *sb)
                  * peer that read the same region built the same bytes,
                  * and may be the one that set it -- two creators with one
                  * virgin number, two names on one record (audit
-                 * 2026-11-14 B-4). Not ours to use: it stays set, a leak
-                 * the scrub reclaims, and the next free bit is tried. */
+                 * 2026-11-14 B-4). Not ours to use: it stays set and the
+                 * next free bit is tried. If no peer writes a record
+                 * there, it is a never-written number: the scrub and
+                 * every table walk skip it as owning nothing, and only
+                 * fsck -r frees it -- a walk cannot tell it from a
+                 * peer's create still on its way (review F-7). */
                 atomic64_inc(&cetrafs_ibmap_abandoned);
                 pr_warn("inode bitmap: bit %llu was claimed by a swap whose outcome was unknown -- not "
                         "taken; another number is used\n",
@@ -761,7 +765,9 @@ static int cetrafs_birth_await_release(struct super_block *sb, u64 ino, cetrafs_
 
         /* Killable (audit L21): a create stuck behind a peer's reclaim
          * may be abandoned. The caller leaves the bit set on an error --
-         * a leak the scrub reclaims, never a number handed out twice. */
+         * a leaked number, never one handed out twice (the scrub
+         * reclaims it once its record is a dead one; a never-written
+         * record only fsck -r frees, see cetrafs_read_raw_inode_walk()). */
         if (READ_ONCE(cetrafs_birth_wait_uninterruptible)) {
             msleep(step); /* TEST ONLY: see the parameter */
         } else if (schedule_timeout_killable(msecs_to_jiffies(step)) && fatal_signal_pending(current)) {
@@ -849,7 +855,7 @@ int cetrafs_alloc_inode(struct super_block *sb, u64 *out_ino)
          * here is not stale residue.
          *
          * Per the correctness bar a detected collision is never silently
-         * accepted. Losing one number is a leak the scrub reclaims; handing
+         * accepted. Losing one number is a leak (fsck -r frees it); handing
          * it out twice is data loss.
          *
          * Read the record ONCE, raw. cetrafs_read_raw_inode() is wrong
@@ -937,7 +943,7 @@ int cetrafs_alloc_inode(struct super_block *sb, u64 *out_ino)
         if (ret) {
             cetrafs_sb_birth_end(sb, *out_ino);
             *out_ino = 0;
-            return ret; /* bit left set: a leak the scrub reclaims */
+            return ret; /* bit left set: a leaked number, freed by fsck -r if its record was never written */
         }
 
         /*
