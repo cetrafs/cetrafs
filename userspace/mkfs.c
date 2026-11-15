@@ -772,6 +772,15 @@ int main(int argc, char **argv)
 
         /* Solve B from: B * (bg_size_blocks + 1 BG-table block per BG) <= remaining */
         B = cetrafs_solve_bg_count(total_blocks, fixed_wo_B, bg_size_blocks, &waste);
+        /* Each Zone Group costs its pending-free queue, so on a small
+         * device the count itself can leave no room for one Block Group
+         * -- the -M-derived default of 64 on a 600 MiB volume did. Fewer
+         * Zone Groups, then solve again; the clamp below and the warning
+         * after the loop finish the job. */
+        if (B == 0 && zg_count > 1) {
+            zg_count = (zg_count + 1) / 2;
+            continue;
+        }
         if (B == 0)
             die("no space for any BG (increase device or reduce -b/-J/-N)");
         /* The mount refuses more (kmod/fs.c), so a volume past it would

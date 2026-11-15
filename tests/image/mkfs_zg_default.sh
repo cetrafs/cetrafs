@@ -12,9 +12,12 @@
 #   1. no -z, default -M, a device that backs 64: 64 Zone Groups, no warning;
 #   2. no -z, -M 8: 16, no warning;
 #   3. -z 4 (default -M): warned, "at most 4";
-#   4. no -z, a device that backs only a few Block Groups: warned, "at most <that>".
+#   4. no -z, a device that backs only a few Block Groups: warned, "at most <that>";
+#   5. no -z, a device too small for 64 Zone Groups' queues and one Block
+#      Group: still formats, with fewer Zone Groups, warned.
 #
-# DISCRIMINATION: the old default gives 16 in 1, and no warning in 3 or 4.
+# DISCRIMINATION: the old default gives 16 in 1, and no warning in 3 or 4;
+# without the halving, 5 dies "no space for any BG".
 set -euo pipefail
 . "$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)/lib/harness.sh"
 require_root
@@ -42,4 +45,8 @@ Z="$(zgs 2200 -b 512)"
 [ -n "$Z" ] && [ "$Z" -lt 16 ] && grep -q "at most $Z node(s) can ever write" "$ERR" &&
     pass "4: a device backing only $Z Block Groups: warned" ||
     fail "4: small device: ${Z:-?} Zone Groups, stderr: $(cat "$ERR")"
+Z="$(zgs 600)"
+[ -n "$Z" ] && [ "$Z" -ge 1 ] && grep -q "at most $Z node(s) can ever write" "$ERR" &&
+    pass "5: a 600 MiB device with no -z formats ($Z Zone Group(s)), warned" ||
+    fail "5: a 600 MiB device with no -z did not format: $(cat "$ERR")"
 ct_exit
