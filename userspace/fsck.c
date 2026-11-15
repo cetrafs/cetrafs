@@ -207,6 +207,19 @@ static int fsck_dead_walk;
 static int fsck_dead_unwalkable;
 #define FSCK_SEV (fsck_dead_walk ? "WARN" : "ERR")
 
+static int fsck_all_zero(const uint8_t *p, size_t n);
+
+/* The kernel's cetrafs_inode_half_born(): the namespace sector stamped by
+ * a birth claim or the allocator's dead stamp, naming no file, and the
+ * file sector never written -- a create (or that stamp) stopped between
+ * its two sectors. Reported and freed like an all-zero record. */
+static int fsck_half_born(const cetrafs_inode_t *in, uint64_t ino)
+{
+    return (uint32_t) cetrafs_le64(in->ns_checksum) == cetrafs_inode_crc_ns_us(in) && cetrafs_le64(in->ino) == ino &&
+           !in->mode && !in->generation && !in->nlink &&
+           fsck_all_zero((const uint8_t *) in + CETRAFS_INODE_FD_OFF, sizeof(*in) - CETRAFS_INODE_FD_OFF);
+}
+
 static int fsck_all_zero(const uint8_t *p, size_t n)
 {
     for (size_t i = 0; i < n; ++i)
@@ -3470,7 +3483,7 @@ int main(int argc, char **argv)
             fsck_dead_walk = 0;
             if (!cetrafs_inode_crcs_ok(&in) && dpass)
                 continue; /* reported by the first pass */
-            if (!cetrafs_inode_crcs_ok(&in) && fsck_all_zero(iblk, sizeof(iblk))) {
+            if (!cetrafs_inode_crcs_ok(&in) && (fsck_all_zero(iblk, sizeof(iblk)) || fsck_half_born(&in, ino))) {
                 /* All zero: the number was taken and its record never
                  * written -- a create stopped between the two (a crash,
                  * or a write the device refused). It names nothing, so

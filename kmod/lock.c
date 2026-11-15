@@ -5181,7 +5181,7 @@ int cetrafs_lock_sweep_own_claims(struct super_block *sb, u32 my_node_id)
             ret = cetrafs_read_raw_inode_walk(sb, ino, &raw);
             if (ret == -ENODATA) {
                 ret = 0;
-                continue; /* never written: carries no claim (F-7) */
+                continue; /* never written (or read back as zeros): no claim to release, nothing freed */
             }
             if (ret == -EUCLEAN) {
                 /* Damaged (kind 2): counted and left to fsck, like any

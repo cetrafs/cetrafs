@@ -2510,10 +2510,14 @@ int cetrafs_ns_count_names(struct super_block *sb, const u64 *inos, u32 n, u32 *
             if (serial)
                 cetrafs_invalidate_raw_inode(sb, x);
             ret = cetrafs_read_raw_inode_walk(sb, x, raw);
-            if (ret == -ENODATA) {
+            if (ret == -ENODATA && cetrafs_walk_zero_owns_nothing_test()) {
                 ret = 0;
-                continue; /* never written: names nothing (F-7) */
+                continue; /* TEST ONLY: names nothing, as F-7 had it */
             }
+            /* -ENODATA: never written, or a directory's record read back
+             * as zeros -- the same bytes, and a count that skipped it
+             * could publish nlink 0 for a file named only there (review
+             * F-11). No count, so nothing is published. */
             if (ret)
                 goto out;
             /* A removed directory is empty, and its blocks may be anyone's. */

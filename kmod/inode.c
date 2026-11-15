@@ -322,28 +322,49 @@ int cetrafs_read_raw_inode(struct super_block *sb, u64 ino, cetrafs_inode_t *out
     return __cetrafs_read_raw_inode(sb, ino, out, false);
 }
 
-/* TEST ONLY: the table walks count an all-zero record as damage, as
- * before F-7 (tests/kernel/ibmap_cas_image_only.sh). */
-static bool cetrafs_walk_zero_is_damage;
-cetrafs_test_param(walk_zero_is_damage, cetrafs_walk_zero_is_damage, bool, 0644);
+/*
+ * A record never written past its birth: the namespace sector valid --
+ * stamped by a birth claim of a virgin number, or by the allocator over
+ * a number it abandoned (cetrafs_inode_stamp_unborn()) -- and naming no
+ * file (mode, generation and nlink 0), the file sector still all zero.
+ * Between the two sectors' writes, or forever if the writer died there.
+ */
+bool cetrafs_inode_half_born(const cetrafs_inode_t *in, u64 ino)
+{
+    return cetrafs_inode_crc_ns(in) == (u32) cetrafs_le64(in->ns_checksum) && cetrafs_le64(in->ino) == ino &&
+           !in->mode && !in->generation && !in->nlink &&
+           !memchr_inv((const u8 *) in + CETRAFS_INODE_FD_OFF, 0, sizeof(*in) - CETRAFS_INODE_FD_OFF);
+}
+
+/* TEST ONLY: a walk reads a never-written record as naming nothing, as
+ * F-7 had it (review F-11's control). */
+static bool cetrafs_walk_zero_owns_nothing;
+cetrafs_test_param(walk_zero_owns_nothing, cetrafs_walk_zero_owns_nothing, bool, 0644);
+MODULE_PARM_DESC(walk_zero_owns_nothing, "TEST ONLY: table walks take a never-written record as owning nothing");
+
+bool cetrafs_walk_zero_owns_nothing_test(void)
+{
+    return READ_ONCE(cetrafs_walk_zero_owns_nothing);
+}
 
 /*
  * For the walks over the whole inode table (scrub, the namespace
  * recount, the own-claims sweeps): a number whose bit is set over a
- * record never written -- all zeros, read fresh -- is -ENODATA, not
- * damage. Two things leave one: a create between its bit and its record
- * write (a peer's, which a walk cannot see the end of), and a bit the
- * inode allocator abandoned after a swap of unknown outcome (alloc.c,
- * B-4). It names nothing, so it owns no block and no name, and counting
- * it as damage made every scrub cycle bail and every recount fail
- * (review F-7). The number stays allocated: freeing it on sight could
- * free a peer's create. fsck -r frees it offline. A record that is
- * zeros for a file this node holds is read by cetrafs_read_raw_inode(),
- * which still calls it damage.
+ * record never written -- all zeros, or half-born, read fresh -- is
+ * -ENODATA, not counted as damage. It is NOT "owns nothing": a live
+ * file's record that reads back zero -- a stray write, a rolled-back
+ * LUN, an array returning zeros for a lost block -- is the same bytes,
+ * and these walks free what nothing owns: a whole image's blocks given
+ * to other files, a file's last name counted away (review F-11). So it
+ * is UNKNOWN, and every caller that decides a free over the whole table
+ * makes no such decision while one is there. The number a create left
+ * so (a crash between its bit and its record) waits for fsck -r; the
+ * one the allocator abandons it stamps dead, which the orphan pass
+ * reclaims (alloc.c).
  */
 int cetrafs_read_raw_inode_walk(struct super_block *sb, u64 ino, cetrafs_inode_t *out)
 {
-    return __cetrafs_read_raw_inode(sb, ino, out, !READ_ONCE(cetrafs_walk_zero_is_damage));
+    return __cetrafs_read_raw_inode(sb, ino, out, true);
 }
 
 static int __cetrafs_read_raw_inode(struct super_block *sb, u64 ino, cetrafs_inode_t *out, bool zero_ok)
@@ -452,7 +473,7 @@ static int __cetrafs_read_raw_inode(struct super_block *sb, u64 ino, cetrafs_ino
     }
 #endif
     /* The last attempt was a forced-fresh read: all zeros is the device's. */
-    if (zero_ok && !memchr_inv(out, 0, sizeof(*out)))
+    if (zero_ok && (!memchr_inv(out, 0, sizeof(*out)) || cetrafs_inode_half_born(out, ino)))
         return -ENODATA;
     pr_err("ino=%llu failed its record checksum %d times -- corrupted, not just a torn concurrent read\n",
            (unsigned long long) ino, CETRAFS_RAW_INODE_READ_RETRIES);
@@ -770,8 +791,10 @@ static void cetrafs_ns_apply_zero_nlink(cetrafs_inode_t *rec, void *arg)
  * and fsck's ("marked in use but its checksum is wrong"). The previous
  * version of this bumped it, and churn_oracle caught it.
  *
- * A VIRGIN number (never allocated since mkfs: sector 0 all zero) needs
- * no birth claim: no reclaim judges a record that fails its checksum.
+ * A VIRGIN number (never allocated since mkfs: sector 0 all zero) is
+ * claimed the same way, against the zeros: the allocator may stamp a
+ * number it abandoned dead by the same compare (cetrafs_inode_stamp_unborn()),
+ * and only one of the two may land (review F-11).
  * tests/kernel/scrub_vs_birth.sh.
  */
 void cetrafs_ns_stamp_advance(cetrafs_inode_t *rec)
@@ -781,6 +804,7 @@ void cetrafs_ns_stamp_advance(cetrafs_inode_t *rec)
 
 struct cetrafs_birth_ctx {
     const u8 *seed; /* sector 0 as the creator judged it */
+    u64 ino;
     u32 me;
     u32 my_incarnation;
     bool lost; /* the verdict travels here: a >0 mutate return is flattened to success */
@@ -799,6 +823,7 @@ static int cetrafs_birth_claim_mutate(void *image, unsigned int len, void *priv)
     }
     memset(&rec, 0, sizeof(rec));
     memcpy(&rec, image, CETRAFS_INODE_NS_BYTES);
+    rec.ino = cetrafs_cpu_to_le64(ctx->ino); /* a virgin sector names no number yet */
     rec.ns_lock_owner = cetrafs_cpu_to_le32(ctx->me);
     rec.ns_lock_incarnation = cetrafs_cpu_to_le32(ctx->my_incarnation);
     cetrafs_ns_stamp_advance(&rec);
@@ -807,12 +832,105 @@ static int cetrafs_birth_claim_mutate(void *image, unsigned int len, void *priv)
     return 0;
 }
 
+/*
+ * The allocator's stamp over a number it took and will not use
+ * (alloc.c: a bit won by a swap of unknown outcome). Its record is
+ * zeros, which no walk may read as "owns nothing" (see
+ * cetrafs_read_raw_inode_walk()) -- left so, it stopped every scrub
+ * cycle's frees for good. Stamped dead it is an ordinary orphan, and
+ * the orphan pass reclaims it.
+ *
+ * Both sectors by CAS against zeros, the namespace sector first. Every
+ * creator of a virgin number birth-claims it against the same zeros
+ * (alloc.c), so of a stamp and a claim exactly one lands: a lost stamp
+ * leaves a peer's birth alone, and a lost claim sends the creator to
+ * another number. The file sector's swap fails on anything a creator
+ * wrote there after the number was reclaimed and reborn, and lands
+ * harmlessly ahead of one. Only the allocator stamps: a walk cannot
+ * tell this record from a live one read back as zeros.
+ * Returns 0 stamped, 1 the number was claimed first, <0 an error.
+ */
+struct cetrafs_unborn_ctx {
+    u64 ino;
+    bool lost;
+};
+
+static int cetrafs_unborn_ns_mutate(void *image, unsigned int len, void *priv)
+{
+    struct cetrafs_unborn_ctx *ctx = priv;
+    cetrafs_inode_t rec;
+
+    if (len < CETRAFS_INODE_NS_BYTES)
+        return -EINVAL;
+    if (memchr_inv(image, 0, CETRAFS_INODE_NS_BYTES)) {
+        ctx->lost = true;
+        return 1;
+    }
+    memset(&rec, 0, sizeof(rec));
+    rec.ino = cetrafs_cpu_to_le64(ctx->ino);
+    rec.ns_lock_owner = cetrafs_cpu_to_le32(CETRAFS_NODE_ID_NONE);
+    cetrafs_ns_stamp_advance(&rec);
+    cetrafs_inode_stamp_crc_ns(&rec);
+    memcpy(image, &rec, CETRAFS_INODE_NS_BYTES);
+    return 0;
+}
+
+static int cetrafs_unborn_fd_mutate(void *image, unsigned int len, void *priv)
+{
+    struct cetrafs_unborn_ctx *ctx = priv;
+    cetrafs_inode_t rec;
+
+    if (len < CETRAFS_INODE_FD_BYTES)
+        return -EINVAL;
+    if (memchr_inv(image, 0, CETRAFS_INODE_FD_BYTES)) {
+        ctx->lost = true;
+        return 1;
+    }
+    memset(&rec, 0, sizeof(rec));
+    rec.ino = cetrafs_cpu_to_le64(ctx->ino);
+    rec.fd_ino = rec.ino;
+    /* An empty tree, as every creator stamps one: a header the owned-
+     * block walk can read, and nothing under it. */
+    rec.eh.eh_magic = cetrafs_cpu_to_le16(CETRAFS_EXT_MAGIC);
+    rec.eh.eh_max = cetrafs_cpu_to_le16(ARRAY_SIZE(rec.et.leaf));
+    rec.fd_checksum = cetrafs_cpu_to_le64(cetrafs_inode_crc_fd(&rec));
+    /* The struct ends short of the sector: the rest is dead space, zero. */
+    memset(image, 0, CETRAFS_INODE_FD_BYTES);
+    memcpy(image, (const u8 *) &rec + CETRAFS_INODE_FD_OFF, sizeof(rec) - CETRAFS_INODE_FD_OFF);
+    return 0;
+}
+
+int cetrafs_inode_stamp_unborn(struct super_block *sb, u64 ino)
+{
+    static const u8 zeros[CETRAFS_INODE_NS_BYTES];
+    struct cetrafs_unborn_ctx ctx = {.ino = ino};
+    u64 lba = cetrafs_inode_lba(sb, ino);
+    int ret;
+
+    if (!lba)
+        return -EINVAL;
+    if (cetrafs_sb_is_fenced(sb))
+        return -EIO;
+    ret = cetrafs_cas_record_seeded(sb, lba, zeros, CETRAFS_INODE_NS_BYTES, cetrafs_unborn_ns_mutate, &ctx);
+    if (ret)
+        return ret;
+    if (ctx.lost)
+        return 1;
+    cetrafs_record_write_counted();
+    ret = cetrafs_cas_record_fd_seeded(sb, lba, zeros, CETRAFS_INODE_FD_BYTES, cetrafs_unborn_fd_mutate, &ctx);
+    if (ret)
+        return ret;
+    if (!ctx.lost)
+        cetrafs_record_write_counted();
+    return 0; /* a lost file-sector swap: the number was reborn since, and is its creator's */
+}
+
 /* The creator's half. 'seed' is the record read after the bit CAS, and
  * must be a checksummed record (a virgin one needs no claim). Sets
  * *out_lost when a reclaim got to the record first. */
 int cetrafs_inode_birth_claim(struct super_block *sb, u64 ino, const cetrafs_inode_t *seed, bool *out_lost)
 {
-    struct cetrafs_birth_ctx ctx = {.seed = (const u8 *) seed, .my_incarnation = cetrafs_sb_incarnation(sb)};
+    struct cetrafs_birth_ctx ctx = {.seed = (const u8 *) seed, .ino = ino, .my_incarnation = cetrafs_sb_incarnation(sb)};
     u64 lba = cetrafs_inode_lba(sb, ino);
     int ret;
 

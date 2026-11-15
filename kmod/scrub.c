@@ -227,6 +227,11 @@ MODULE_PARM_DESC(scrub_old_shape, "TEST ONLY: the scrub holds every set, frees p
 static atomic64_t cetrafs_scrub_set_bytes_peak = ATOMIC64_INIT(0);
 static atomic64_t cetrafs_scrub_free_calls = ATOMIC64_INIT(0);
 static atomic64_t cetrafs_scrub_inode_ra = ATOMIC64_INIT(0);
+static atomic64_t cetrafs_scrub_unknown_records = ATOMIC64_INIT(0);
+u64 cetrafs_scrub_unknown_record_count(void)
+{
+    return (u64) atomic64_read(&cetrafs_scrub_unknown_records);
+}
 u64 cetrafs_scrub_set_bytes_peak_count(void)
 {
     return (u64) atomic64_read(&cetrafs_scrub_set_bytes_peak);
@@ -488,8 +493,19 @@ static int scrub_build_refset(struct cetrafs_scrub *s, struct scrub_ctx *ctx, bo
                 ret = cetrafs_read_raw_inode(sb, ino, &raw);
         } else {
             ret = cetrafs_read_raw_inode_walk(sb, ino, &raw);
-            if (ret == -ENODATA)
-                continue; /* never written: owns nothing (F-7) */
+            if (ret == -ENODATA && cetrafs_walk_zero_owns_nothing_test())
+                continue; /* TEST ONLY: owns nothing, as F-7 had it */
+            if (ret == -ENODATA) {
+                /* Never written -- or a live record read back as zeros:
+                 * the same bytes. What it owns is unknown, so nothing is
+                 * freed this cycle (review F-11). Not damage either: a
+                 * peer's create can be on its way. */
+                atomic64_inc(&cetrafs_scrub_unknown_records);
+                pr_info_ratelimited("scrub: ino=%llu is allocated but its record was never written -- no leaked "
+                                    "block is freed while it is (fsck -r frees the number)\n",
+                                    (unsigned long long) ino);
+                return -EAGAIN;
+            }
         }
         if (!ret)
             ret = cetrafs_raw_inode_for_each_owned_block(sb, &raw, scrub_mark_ref, ctx, fresh);
@@ -1013,7 +1029,7 @@ static void scrub_reclaim_orphan_inodes(struct cetrafs_scrub *s)
         /* The verdict read: fresh, never this node's cache. */
         cetrafs_invalidate_raw_inode(sb, ino);
         if (cetrafs_read_raw_inode_walk(sb, ino, &raw) != 0)
-            continue; /* unreadable, or never written (F-7): cannot vouch -- leave it for fsck */
+            continue; /* unreadable, or never written (F-11): cannot vouch -- not this number's free */
 
         if (cetrafs_le32(raw.nlink) != 0) {
             scrub_reconcile_stopped_op(s, ino, &raw, my_node_id);

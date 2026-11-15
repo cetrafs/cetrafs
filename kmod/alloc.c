@@ -470,6 +470,12 @@ MODULE_PARM_DESC(ibmap_trust_image, "TEST ONLY: an inode number claimed by an un
 
 static atomic64_t cetrafs_ibmap_abandoned = ATOMIC64_INIT(0);
 
+/* TEST ONLY: an abandoned number keeps its never-written record, and a
+ * virgin create claims nothing, as before review F-11. */
+static bool cetrafs_ibmap_abandon_no_stamp;
+cetrafs_test_param(ibmap_abandon_no_stamp, cetrafs_ibmap_abandon_no_stamp, bool, 0644);
+MODULE_PARM_DESC(ibmap_abandon_no_stamp, "TEST ONLY: an abandoned inode number is not stamped dead");
+
 u64 cetrafs_ibmap_abandoned_count(void)
 {
     return (u64) atomic64_read(&cetrafs_ibmap_abandoned);
@@ -509,12 +515,20 @@ static long cetrafs_inode_bitmap_cas_alloc(struct super_block *sb)
                  * and may be the one that set it -- two creators with one
                  * virgin number, two names on one record (audit
                  * 2026-11-14 B-4). Not ours to use: it stays set and the
-                 * next free bit is tried. If no peer writes a record
-                 * there, it is a never-written number: the scrub and
-                 * every table walk skip it as owning nothing, and only
-                 * fsck -r frees it -- a walk cannot tell it from a
-                 * peer's create still on its way (review F-7). */
+                 * next free bit is tried. Its record, never written, is
+                 * stamped dead -- unless a peer's birth claim got there
+                 * first -- so the orphan pass reclaims the number; left
+                 * zeros, no walk may take it as owning nothing, and every
+                 * scrub cycle would free nothing (review F-11). */
                 atomic64_inc(&cetrafs_ibmap_abandoned);
+                if (!READ_ONCE(cetrafs_ibmap_abandon_no_stamp)) {
+                    int sret = cetrafs_inode_stamp_unborn(sb, base + ctx.bit + 1);
+
+                    if (sret < 0)
+                        pr_warn("inode bitmap: ino=%llu could not be stamped dead (%d) -- it stays allocated until "
+                                "fsck -r frees it, and the scrub frees nothing while it is unwritten\n",
+                                (unsigned long long) (base + ctx.bit + 1), sret);
+                }
                 pr_warn("inode bitmap: bit %llu was claimed by a swap whose outcome was unknown -- not "
                         "taken; another number is used\n",
                         (unsigned long long) (base + ctx.bit));
@@ -704,7 +718,9 @@ static int cetrafs_birth_read(struct super_block *sb, u64 ino, cetrafs_inode_t *
         return -EIO;
     cetrafs_bh_copy_stable(bh, raw, sizeof(*raw));
     brelse(bh);
-    *have = cetrafs_inode_crcs_ok(raw);
+    /* A half-born record is a claim's sector with its file sector still
+     * to come: its owner arbitrates like any checksummed record's. */
+    *have = cetrafs_inode_crcs_ok(raw) || cetrafs_inode_half_born(raw, ino);
     return 0;
 }
 
@@ -766,8 +782,9 @@ static int cetrafs_birth_await_release(struct super_block *sb, u64 ino, cetrafs_
         /* Killable (audit L21): a create stuck behind a peer's reclaim
          * may be abandoned. The caller leaves the bit set on an error --
          * a leaked number, never one handed out twice (the scrub
-         * reclaims it once its record is a dead one; a never-written
-         * record only fsck -r frees, see cetrafs_read_raw_inode_walk()). */
+         * reclaims it once its record is a dead one; one whose record
+         * was never written waits for fsck -r, and stops the scrub's
+         * frees until then -- see cetrafs_read_raw_inode_walk()). */
         if (READ_ONCE(cetrafs_birth_wait_uninterruptible)) {
             msleep(step); /* TEST ONLY: see the parameter */
         } else if (schedule_timeout_killable(msecs_to_jiffies(step)) && fatal_signal_pending(current)) {
@@ -903,10 +920,16 @@ int cetrafs_alloc_inode(struct super_block *sb, u64 *out_ino)
                 ret = cetrafs_inode_birth_claim(sb, *out_ino, &raw, &lost);
                 claimed = !ret && !lost;
             }
+        } else if (!memchr_inv(&raw, 0, CETRAFS_INODE_NS_BYTES) && READ_ONCE(cetrafs_ibmap_abandon_no_stamp)) {
+            ret = 0; /* TEST ONLY: unclaimed, as before F-11 */
         } else if (!memchr_inv(&raw, 0, CETRAFS_INODE_NS_BYTES)) {
-            ret = 0; /* virgin: no reclaim judges an unchecksummed record,
-                      * so nothing to arbitrate -- and no extra write per
-                      * first use */
+            /* Virgin: claimed against the zeros, like any other birth.
+             * No reclaim judges an unchecksummed record, but the
+             * allocator's stamp of a number it abandoned does
+             * (cetrafs_inode_stamp_unborn()), and of the two only one
+             * may land (review F-11). One write per first use. */
+            ret = cetrafs_inode_birth_claim(sb, *out_ino, &raw, &lost);
+            claimed = !ret && !lost;
         } else {
             /* The claim's seed must be a checksummed record: the claim
              * stamps a fresh checksum over whatever it is handed, so a
