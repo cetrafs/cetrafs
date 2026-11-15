@@ -3946,7 +3946,9 @@ void cetrafs_lock_retry_deferred(struct super_block *sb)
                     if (filemap_write_and_wait(inode->i_mapping) || cetrafs_flush_dirty_free_counts(sb))
                         pr_err("lock release retry: ino=%llu data or free counts not flushed\n",
                                (unsigned long long) inode->i_ino);
-                    ret = cetrafs_lock_publish_and_clear(inode, raw, false, &cleared);
+                    ret = cetrafs_deferred_flush_orphans_of(sb, inode->i_ino);
+                    if (!ret)
+                        ret = cetrafs_lock_publish_and_clear(inode, raw, false, &cleared);
                 }
                 if (!ret)
                     ret = cetrafs_lock_clear_on_disk(inode, /*stamp_stat=*/false);
@@ -3995,8 +3997,11 @@ void cetrafs_lock_retry_deferred(struct super_block *sb)
             pr_err("lock release retry: ino=%llu failed to flush BG/ZG free counts: %d\n",
                    (unsigned long long) inode->i_ino, ret);
         /* A suspended writer's close gave its lock to the peer: nothing
-         * of ours to clear, only its mark and bit to settle. */
-        ret = cetrafs_lock_publish_and_clear(inode, raw, !ci->close_owes_suspend_mark, &cleared);
+         * of ours to clear, only its mark and bit to settle. Its tree
+         * blocks first, wherever an eviction left them. */
+        ret = cetrafs_deferred_flush_orphans_of(sb, inode->i_ino);
+        if (!ret)
+            ret = cetrafs_lock_publish_and_clear(inode, raw, !ci->close_owes_suspend_mark, &cleared);
         if (!ret)
             cetrafs_lock_settle_close(inode, true);
         mutex_unlock(&ci->lock_mutex);

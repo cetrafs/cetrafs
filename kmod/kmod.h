@@ -1627,6 +1627,7 @@ bool cetrafs_deferred_eager(void);
 u64 cetrafs_deferred_hold_count(void);
 u64 cetrafs_deferred_list_step_count(void);
 int cetrafs_deferred_flush_inode(struct inode *inode, bool mapping_locked);
+int cetrafs_deferred_flush_orphans_of(struct super_block *sb, u64 ino);
 int cetrafs_deferred_flush_all(struct super_block *sb);
 unsigned long cetrafs_deferred_drop_all(struct super_block *sb);
 int cetrafs_journal_write_new_block(struct super_block *sb, struct buffer_head *bh);

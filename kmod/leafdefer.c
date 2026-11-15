@@ -589,9 +589,10 @@ static int cetrafs_deferred_write_set(struct super_block *sb, struct buffer_head
 
 /* TEST ONLY: an inode flush writes nothing and reports success, so its
  * close lets the inode go with blocks still held back and an eviction
- * orphans them (tests/kernel/deferred_orphan_adopted.sh). A failed flush
- * cannot stage that: the close that failed pins the inode until a retry
- * has flushed the tree. */
+ * orphans them (tests/kernel/deferred_orphan_adopted.sh). A failed close
+ * does NOT pin its inode -- it queues only (ino, generation) -- so it can
+ * be evicted before the heartbeat finishes the close; the retry writes
+ * the orphans first (cetrafs_deferred_flush_orphans_of(), B-7). */
 static bool cetrafs_tree_flush_skip_all;
 cetrafs_test_param(tree_flush_skip_all, cetrafs_tree_flush_skip_all, bool, 0644);
 MODULE_PARM_DESC(tree_flush_skip_all, "TEST ONLY: extent-tree block flushes of an inode write nothing");
@@ -702,6 +703,42 @@ static int cetrafs_deferred_flush_list(struct super_block *sb, struct list_head 
     kvfree(crcs);
     kvfree(owners);
     return r;
+}
+
+/* TEST ONLY: the close retry does not look at the orphans, as before
+ * B-7 (tests/kernel/close_retry_orphans.sh). */
+static bool cetrafs_retry_orphans_off;
+cetrafs_test_param(retry_orphans_off, cetrafs_retry_orphans_off, bool, 0644);
+MODULE_PARM_DESC(retry_orphans_off, "TEST ONLY: a close finished by the heartbeat ignores the inode's orphaned tree blocks");
+
+/*
+ * A close that failed is finished by the heartbeat on a fresh iget: if
+ * the inode was evicted in between, its held-back tree blocks are on the
+ * mount's orphan list and its own list is empty, so the retry's flush
+ * wrote nothing, published the record and cleared the lock -- and the
+ * orphan batch later wrote the old leaf over whatever a peer had made of
+ * it since (audit 2026-11-14 B-7). They are written first: the lock is
+ * still ours, so they are still this node's latest state. A failure
+ * keeps the close unfinished.
+ */
+int cetrafs_deferred_flush_orphans_of(struct super_block *sb, u64 ino)
+{
+    struct xarray *xa = cetrafs_sb_deferred(sb);
+    struct list_head *orphans = cetrafs_sb_deferred_orphans(sb);
+    struct cetrafs_deferred *d;
+    bool any = false;
+
+    if (!xa || !orphans || READ_ONCE(cetrafs_retry_orphans_off))
+        return 0;
+    xa_lock(xa);
+    list_for_each_entry(d, orphans, node) {
+        if (d->ino == ino) {
+            any = true;
+            break;
+        }
+    }
+    xa_unlock(xa);
+    return any ? cetrafs_deferred_flush_list(sb, orphans, true) : 0;
 }
 
 /*
