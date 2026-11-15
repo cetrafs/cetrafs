@@ -22,6 +22,10 @@
 #      restamped the file reads back byte-exact.
 #   4. a number taken by a create stopped before its record write: the
 #      bit is set over an all-zero record. WARN, and -r frees it.
+#   5. a deleted DIRECTORY whose dirent block a live file now holds
+#      (audit 2026-11-15 B-28): -r must not walk it as a directory and
+#      "repair" the live file's block into an empty dirent block -- the
+#      file reads back byte-exact.
 #
 # The kernel no longer leaves such a record behind -- a freed number's
 # record names nothing since evict clears it first -- but a volume
@@ -31,7 +35,8 @@
 #
 # DISCRIMINATION: 1 and 2 fail against the previous fsck (ERR, exit 1).
 # 3 fails if the deleted-record walk stops deferring leak repair: the
-# first -r then clears the live file's blocks.
+# first -r then clears the live file's blocks. 5 fails if the dirent
+# walk follows an nlink-0 directory.
 set -euo pipefail
 . "$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)/lib/harness.sh"
 require_root
@@ -205,4 +210,40 @@ grep -q "WARN: inode $N is marked in use but its record was never written" <<<"$
     pass "4: set up -- the bit is set over an all-zero record, reported as an interrupted create" ||
     { fail "4: not set up: $(grep -E '^(ERR|WARN)' <<<"$FSCK_OUT" | head -3)"; ct_exit; }
 converge "4"
+
+# ---------------------------------------------------------------- 5
+log "5: a deleted directory whose block a live file now holds"
+EPOKE="$(ct_helper pending_poke)"
+XPOKE="$(ct_helper extent_phys_poke)"
+fresh
+mkdir "$MNT/D"
+touch "$MNT/D/a" "$MNT/D/b"
+sync
+N="$(stat -c %i "$MNT/D")"
+ct_umount "$MNT"
+REC="$(ct_tmp deadrec-5)"
+save_rec "$N" "$REC"
+ct_mount "$DEV" "$MNT"
+require_cetrafs_mount "$MNT"
+rm -r "$MNT/D"
+sync
+failed_create
+dd if=/dev/urandom of="$MNT/live" bs=4096 count=4 conv=fsync status=none
+SUM="$(sha256sum <"$MNT/live")"
+L="$(stat -c %i "$MNT/live")"
+ct_umount "$MNT"
+LPHYS="$("$EPOKE" "$IMG" extent "$L" | cut -d' ' -f1)"
+plant_dead_rec "$N" "$REC"
+"$XPOKE" "$IMG" "$N" "$LPHYS" >/dev/null # its dirent block is the live file's first block now
+blockdev --flushbufs "$DEV"
+[ "$("$EPOKE" "$IMG" extent "$N" | cut -d' ' -f1)" = "$LPHYS" ] ||
+    { fail "5: setup: the dead directory does not name the live file's block"; ct_exit; }
+pass "5: set up -- dead directory $N names block $LPHYS, the live file's"
+"$FSCK" -r "$DEV" >/dev/null 2>&1 || true
+"$FSCK" -r "$DEV" >/dev/null 2>&1 || true
+ct_mount "$DEV" "$MNT"
+echo 3 >/proc/sys/vm/drop_caches
+[ "$(sha256sum <"$MNT/live")" = "$SUM" ] && pass "5: the live file reads back byte-exact after fsck -r" ||
+    fail "5: fsck -r rewrote the live file's block as a directory's"
+ct_umount "$MNT"
 ct_exit

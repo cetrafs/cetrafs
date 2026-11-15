@@ -4420,6 +4420,17 @@ int main(int argc, char **argv)
             if (!is_dir[ino])
                 continue;
             /*
+             * A deleted directory (nlink 0, its number not reclaimed yet)
+             * names nothing: its evict freed its blocks, and one of them
+             * may be a live file's by now. Walking it reported that
+             * block as a damaged dirent block and -r "repaired" it --
+             * an empty dirent block written over 4 KiB of the live file
+             * (audit 2026-11-15 B-28). The content pass judges dead
+             * records apart (fsck_dead_walk); the walk leaves them out.
+             */
+            if (!nlinks[ino])
+                continue;
+            /*
              * A directory the walk cannot follow used to be skipped in
              * silence. Its names are then invisible to the reference
              * count: a child named only there reads as unreachable, one
