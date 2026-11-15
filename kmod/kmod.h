@@ -768,6 +768,10 @@ u32 cetrafs_bh_begin_update_crc(struct buffer_head *bh);
 struct buffer_head *cetrafs_getblk_overwrite(struct super_block *sb, sector_t block);
 void cetrafs_bh_end_update(struct super_block *sb, struct buffer_head *bh);
 void cetrafs_write_pending_buffer(struct buffer_head *bh, unsigned int op_flags);
+bool cetrafs_refusal_definite(int err);
+u64 cetrafs_journal_op_refusal_count(void);
+void cetrafs_write_bhs_status(struct buffer_head **bhs, unsigned int n, int *st);
+int cetrafs_sync_buffer_op_refusable(struct super_block *sb, struct buffer_head *bh);
 void cetrafs_bh_read_lock(struct buffer_head *bh);
 void cetrafs_bh_read_unlock(struct buffer_head *bh);
 /* Synchronous write whose result is TRUE, unlike sync_dirty_buffer()'s

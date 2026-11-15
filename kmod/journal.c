@@ -1174,6 +1174,33 @@ static void cetrafs_journal_stamp_header(struct cetrafs_journal *j, struct buffe
     hdr->header_checksum = cetrafs_cpu_to_le32(cetrafs_journal_header_crc(hbh->b_data));
 }
 
+/*
+ * A directory-entry or xattr block (its tail magic): the namespace and
+ * xattr operations that write one undo themselves when the write fails,
+ * so a DEFINITE refusal of it -- a thin pool out of space -- fails that
+ * operation with ENOSPC instead of stopping the mount (audit 2026-11-14
+ * A-4, the part the user chose). Records, extent-tree blocks and bitmaps
+ * still stop: their changes span several blocks.
+ */
+static bool cetrafs_journal_nospc_stops;
+cetrafs_test_param(journal_nospc_stops, cetrafs_journal_nospc_stops, bool, 0644);
+MODULE_PARM_DESC(journal_nospc_stops, "TEST ONLY: a refused dirent/xattr write stops the mount, as before A-4");
+
+static atomic64_t cetrafs_journal_op_refusals = ATOMIC64_INIT(0);
+
+u64 cetrafs_journal_op_refusal_count(void)
+{
+    return (u64) atomic64_read(&cetrafs_journal_op_refusals);
+}
+
+static bool cetrafs_journal_op_refusable(struct buffer_head *bh)
+{
+    if (READ_ONCE(cetrafs_journal_nospc_stops))
+        return false;
+    return cetrafs_blk_struct_ok_magic(bh, CETRAFS_DIRENT_TAIL_MAGIC) ||
+           cetrafs_blk_struct_ok_magic(bh, CETRAFS_XATTR_TAIL_MAGIC);
+}
+
 static int cetrafs_journal_write_block_flags(struct super_block *sb, struct buffer_head *bh, u32 flags, u32 prev_crc,
                                              struct cetrafs_journal_owner owner)
 {
@@ -1193,6 +1220,10 @@ static int cetrafs_journal_write_block_flags(struct super_block *sb, struct buff
     struct buffer_head *pbh, *hbh;
     bool journaled = false;
     bool entry_refused = false; /* the device refused the entry write itself */
+    /* A directory-entry or xattr block: an operation whose refused write
+     * can fail cleanly (cetrafs_journal_op_refusable()). */
+    bool op_block = cetrafs_journal_op_refusable(bh);
+    int est[2] = {0, 0}; /* what the device answered the entry's payload and header */
     /* A held-back tree block (leafdefer.c) is written at its boundary,
      * in a batch whose first step makes what it names durable; nothing
      * should journal one here. If something does, its guard is the
@@ -1265,15 +1296,13 @@ static int cetrafs_journal_write_block_flags(struct super_block *sb, struct buff
             struct blk_plug plug;
             bool ok;
 
-            /* PERF(9): both out together, one wait -- docs/PERFORMANCE.md */
-            blk_start_plug(&plug);
-            cetrafs_write_pending_buffer(pbh, REQ_SYNC);
-            cetrafs_write_pending_buffer(hbh, REQ_SYNC);
-            blk_finish_plug(&plug);
+            /* PERF(9): both out together, one wait -- docs/PERFORMANCE.md.
+             * Each with the device's own answer (A-4). */
+            struct buffer_head *pair[2] = {pbh, hbh};
 
-            wait_on_buffer(pbh);
-            wait_on_buffer(hbh);
-            ok = buffer_uptodate(pbh) && buffer_uptodate(hbh) && !cetrafs_journal_fail_entry_write;
+            (void) plug;
+            cetrafs_write_bhs_status(pair, 2, est);
+            ok = !est[0] && !est[1] && !cetrafs_journal_fail_entry_write;
             brelse(pbh);
             brelse(hbh);
             if (!ok) {
@@ -1367,10 +1396,42 @@ static int cetrafs_journal_write_block_flags(struct super_block *sb, struct buff
          * until the next write of the same block, which takes the slot
          * over (see the slot search above).
          */
-        int werr = cetrafs_sync_buffer(sb, bh);
+        int werr = op_block ? cetrafs_sync_buffer_op_refusable(sb, bh) : cetrafs_sync_buffer(sb, bh);
 
         if (!werr && was_deferred)
             cetrafs_bh_deferred_unlist(sb, bh, false);
+        if (cetrafs_refusal_definite(werr) && op_block) {
+            /*
+             * Refused before anything was written (A-4): the device still
+             * holds the block's old image, and the operation fails with
+             * ENOSPC rather than the mount. The entry -- durable, holding
+             * the image that never landed -- must go first: a later replay
+             * would otherwise redo an operation its caller was told
+             * failed. Retired, or the mount stops as it always did; then
+             * the cached after-image is forgotten, so the next read is the
+             * device's.
+             */
+            if (journaled) {
+                mutex_lock(&j->lock);
+                if (cetrafs_journal_zero_header(sb, header_lba)) {
+                    cetrafs_journal_hold_slot(j, slot, bh->b_blocknr);
+                    mutex_unlock(&j->lock);
+                    cetrafs_sb_fatal(sb, "journal: block %llu refused (%d) and its entry could not be retired",
+                                     (unsigned long long) bh->b_blocknr, werr);
+                    return -EIO;
+                }
+                clear_bit(slot, j->busy);
+                mutex_unlock(&j->lock);
+                wake_up(&j->slot_wq);
+            }
+            cetrafs_forget_block(sb, bh->b_blocknr);
+            atomic64_inc(&cetrafs_journal_op_refusals);
+            pr_warn_ratelimited("%s: the device refused the write of %s block %llu (%d, no space) -- the operation "
+                                "fails with ENOSPC; the mount runs on\n",
+                                sb->s_id, cetrafs_block_role(sb, bh->b_blocknr), (unsigned long long) bh->b_blocknr,
+                                werr);
+            return -ENOSPC;
+        }
         if (werr) {
             if (journaled) {
                 mutex_lock(&j->lock);
@@ -1443,6 +1504,32 @@ static int cetrafs_journal_write_block_flags(struct super_block *sb, struct buff
     return 0;
 
 journal_failed:
+    /* The entry refused before any of it was written -- or with its
+     * header refused, which is what makes an entry -- for an operation
+     * that can fail cleanly (A-4): nothing to retire, ENOSPC, the mount
+     * lives. A payload refused under a header that landed still needs
+     * the header retired below first. */
+    if (entry_refused && op_block && !READ_ONCE(cetrafs_journal_nospc_stops) &&
+        (est[0] || est[1]) && (!est[0] || cetrafs_refusal_definite(est[0])) &&
+        (!est[1] || cetrafs_refusal_definite(est[1]))) {
+        cetrafs_bh_abort_update(bh);
+        mutex_lock(&j->lock);
+        if (est[1] || !cetrafs_journal_zero_header(sb, header_lba)) {
+            clear_bit(slot, j->busy);
+            mutex_unlock(&j->lock);
+            wake_up(&j->slot_wq);
+            atomic64_inc(&cetrafs_journal_op_refusals);
+            pr_warn_ratelimited("%s: the device refused the journal entry for block %llu (no space) -- the "
+                                "operation fails with ENOSPC; the mount runs on\n",
+                                sb->s_id, (unsigned long long) bh->b_blocknr);
+            return -ENOSPC;
+        }
+        cetrafs_journal_hold_slot(j, slot, bh->b_blocknr);
+        mutex_unlock(&j->lock);
+        cetrafs_sb_fatal(sb, "journal: the entry for block %llu was refused and could not be retired",
+                         (unsigned long long) bh->b_blocknr);
+        return -EIO;
+    }
     /* Could not write the entry: the target is not written either (see
      * the top of this function). What did reach the device may be a
      * complete entry -- both writes can land and still be reported

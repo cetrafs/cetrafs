@@ -895,6 +895,127 @@ static int cetrafs_meta_write_result(struct super_block *sb, struct buffer_head 
     return ret;
 }
 
+/* A refusal the device made BEFORE writing anything: a thin pool out of
+ * space (BLK_STS_NOSPC), a target refusing the command (BLK_STS_TARGET).
+ * Anything else may have landed in part. */
+bool cetrafs_refusal_definite(int err)
+{
+    return err == -ENOSPC || err == -EREMOTEIO;
+}
+
+/* TEST ONLY: the next N buffers cetrafs_write_bhs_status() writes -- a
+ * journal entry's payload, then its header -- answer BLK_STS_NOSPC unsent
+ * (tests/kernel/dirent_nospc_op.sh). */
+static unsigned int cetrafs_journal_entry_nospc;
+cetrafs_test_param(journal_entry_nospc, cetrafs_journal_entry_nospc, uint, 0644);
+MODULE_PARM_DESC(journal_entry_nospc, "TEST ONLY: the next N journal entry blocks are refused for space");
+
+struct cetrafs_status_bio {
+    struct completion *all;
+    atomic_t *left;
+    int status;
+};
+
+static void cetrafs_status_bio_end(struct bio *bio)
+{
+    struct cetrafs_status_bio *io = bio->bi_private;
+
+    io->status = blk_status_to_errno(bio->bi_status);
+    bio_put(bio);
+    if (atomic_dec_and_test(io->left))
+        complete(io->all);
+}
+
+/*
+ * Write up to two buffers published by cetrafs_bh_end_update() -- a
+ * journal entry's payload and header -- together, and say for each what
+ * the DEVICE answered (st[i], an errno): the buffer layer's own completion
+ * keeps only "uptodate or not", and a definite "no space" must be told
+ * from a write that may have landed (audit 2026-11-14 A-4). Ends each
+ * buffer as end_buffer_write_sync() leaves it. A buffer with nothing to
+ * write gets st 0.
+ */
+void cetrafs_write_bhs_status(struct buffer_head **bhs, unsigned int n, int *st)
+{
+    DECLARE_COMPLETION_ONSTACK(all);
+    struct cetrafs_status_bio io[2];
+    bool sent[2] = {false, false};
+    atomic_t left = ATOMIC_INIT(1);
+    struct blk_plug plug;
+    unsigned int i;
+
+    if (WARN_ON_ONCE(n > 2))
+        n = 2;
+    blk_start_plug(&plug);
+    for (i = 0; i < n; i++) {
+        struct buffer_head *bh = bhs[i];
+        bool dirty, held;
+        struct bio *bio;
+
+        st[i] = 0;
+        lock_buffer(bh);
+        dirty = test_clear_buffer_dirty(bh);
+        held = test_clear_buffer_cetra_held(bh);
+        if (!dirty && !held) {
+            unlock_buffer(bh);
+            continue;
+        }
+        if ((READ_ONCE(cetrafs_meta_write_nospc_block) && bh->b_blocknr == READ_ONCE(cetrafs_meta_write_nospc_block)) ||
+            (cetrafs_meta_write_nospc && cetrafs_meta_write_nospc--) ||
+            (cetrafs_journal_entry_nospc && cetrafs_journal_entry_nospc--)) {
+            st[i] = -ENOSPC; /* test-only: what a full thin pool answers */
+            set_buffer_write_io_error(bh);
+            clear_buffer_uptodate(bh);
+            unlock_buffer(bh);
+            continue;
+        }
+        io[i].all = &all;
+        io[i].left = &left;
+        io[i].status = 0;
+        atomic_inc(&left);
+        bio = bio_alloc(bh->b_bdev, 1, REQ_OP_WRITE | REQ_SYNC | REQ_META, GFP_NOIO);
+        bio->bi_iter.bi_sector = bh->b_blocknr * (bh->b_size >> 9);
+        bio_add_folio_nofail(bio, bh->b_folio, bh->b_size, offset_in_folio(bh->b_folio, bh->b_data));
+        bio->bi_private = &io[i];
+        bio->bi_end_io = cetrafs_status_bio_end;
+        submit_bio(bio);
+        sent[i] = true;
+    }
+    blk_finish_plug(&plug);
+    if (!atomic_dec_and_test(&left))
+        wait_for_completion_io(&all);
+    for (i = 0; i < n; i++) {
+        if (!sent[i])
+            continue;
+        st[i] = io[i].status;
+        if (st[i]) {
+            set_buffer_write_io_error(bhs[i]);
+            clear_buffer_uptodate(bhs[i]);
+        } else {
+            set_buffer_uptodate(bhs[i]);
+        }
+        unlock_buffer(bhs[i]);
+    }
+}
+
+/*
+ * cetrafs_sync_buffer() for a block whose operation can fail cleanly: a
+ * DEFINITE refusal (nothing was written) comes back as the error and the
+ * mount lives; the caller undoes the operation. Anything else stops, as
+ * cetrafs_sync_buffer() does: it may have landed.
+ */
+int cetrafs_sync_buffer_op_refusable(struct super_block *sb, struct buffer_head *bh)
+{
+    int ret;
+
+    if (cetrafs_sb_is_fenced(sb))
+        return -EIO;
+    ret = __cetrafs_sync_buffer(bh);
+    if (cetrafs_refusal_definite(ret))
+        return ret;
+    return cetrafs_meta_write_result(sb, bh, ret);
+}
+
 /* The wait half of a metadata write the caller submitted itself (with
  * write_dirty_buffer(), among others in one plug): same verdict as
  * cetrafs_sync_buffer(). */
@@ -1710,6 +1831,11 @@ void cetrafs_forget_block(struct super_block *sb, sector_t block)
     clear_buffer_dirty(bh);
     clear_buffer_cetra_held(bh); /* unlisted by the next held flush or drop */
     clear_buffer_uptodate(bh);
+    /* The caller has handled the write that failed: a BH_Write_EIO left
+     * behind is reported again by the next sync of this block -- the
+     * held flush still lists it -- and that stopped the mount a tick
+     * after a refused replay redo had been survived. */
+    clear_buffer_write_io_error(bh);
     unlock_buffer(bh);
 
     brelse(bh);
