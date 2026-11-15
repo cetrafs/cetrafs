@@ -21,7 +21,17 @@
 #   - no_path_retry N with N x polling_interval longer than the lease.
 # no_path_retry "fail"/"off", or N short enough, mounts.
 #
-# -o x-cetrafs.mpath-queue-ok mounts such a map anyway, with a warning --
+# And before any of that, a path holds a write for as long as its
+# transport waits for it: the SCSI command timeout, plus an iSCSI
+# session's recovery_tmo (replacement_timeout) or an FC port's
+# fast_io_fail_tmo (dev_loss_tmo when that is off). A single-path device
+# whose hold outlasts the lease is refused like a queueing map, and a
+# map's bound is its slowest path's hold PLUS its queueing (audit
+# 2026-11-15 B-20: the default replacement_timeout, 120 s, is the stale
+# window itself).
+#
+# -o x-cetrafs.mpath-queue-ok (or x-cetrafs.queue-ok) mounts such a
+# device anyway, with a warning --
 # for a cluster fenced in hardware (SCSI-3 reservations, power), where
 # a fenced node's queued writes are refused by the array or never sent.
 #
@@ -60,7 +70,7 @@ kept=""
 oldifs=$IFS
 IFS=,
 for o in $opts; do
-    if [ "$o" = "x-cetrafs.mpath-queue-ok" ]; then
+    if [ "$o" = "x-cetrafs.mpath-queue-ok" ] || [ "$o" = "x-cetrafs.queue-ok" ]; then
         override=1
     else
         kept="${kept:+$kept,}$o"
@@ -77,6 +87,62 @@ stale=$(param stale_secs 120)
 hb=$(param hb_interval_secs 15)
 lease=$((stale - hb))
 
+# Where sysfs is: a suite stages a fake tree under CETRAFS_SYSFS.
+SYS=${CETRAFS_SYSFS:-/sys}
+num() { case "${1:-}" in '' | *[!0-9]*) echo 0 ;; *) echo "$1" ;; esac; }
+
+# path_hold <disk>: $hold, the seconds a write can sit on this SCSI path
+# before it fails back to us (0 when it is not a SCSI disk), and $why.
+path_hold() {
+    d=$1
+    why=""
+    hold=0
+    # TEST ONLY: the hold left out, as before (mount_helper_transport_hold.sh)
+    [ -z "${CETRAFS_TEST_NO_TRANSPORT_HOLD:-}" ] || return 0
+    [ -e "$SYS/block/$d/device" ] || return 0
+    t=$(num "$(cat "$SYS/block/$d/device/timeout" 2>/dev/null)")
+    p=$(readlink -f "$SYS/block/$d/device" 2>/dev/null || true)
+    x=0
+    s=$(echo "$p" | grep -o 'session[0-9]*' | head -1)
+    r=$(echo "$p" | grep -o 'rport-[0-9:-]*' | head -1)
+    if [ -n "$s" ] && [ -r "$SYS/class/iscsi_session/$s/recovery_tmo" ]; then
+        x=$(num "$(cat "$SYS/class/iscsi_session/$s/recovery_tmo")")
+        why="iSCSI $s recovery_tmo ${x}s"
+    elif [ -n "$r" ] && [ -d "$SYS/class/fc_remote_ports/$r" ]; then
+        f=$(cat "$SYS/class/fc_remote_ports/$r/fast_io_fail_tmo" 2>/dev/null || echo off)
+        case "$f" in
+        '' | *[!0-9]*)
+            x=$(num "$(cat "$SYS/class/fc_remote_ports/$r/dev_loss_tmo" 2>/dev/null)")
+            why="FC $r dev_loss_tmo ${x}s (fast_io_fail_tmo off)"
+            ;;
+        *)
+            x=$f
+            why="FC $r fast_io_fail_tmo ${x}s"
+            ;;
+        esac
+    fi
+    why="SCSI timeout ${t}s${why:+ + $why}"
+    hold=$((t + x))
+}
+
+# The longest hold of any path under a dm map (from its table's devices).
+detect=0
+detect_why=""
+map_hold() {
+    detect=0
+    detect_why=""
+    for mm in $(echo "$1" | grep -o '[0-9][0-9]*:[0-9][0-9]*'); do
+        d=$(readlink -f "$SYS/dev/block/$mm" 2>/dev/null || true)
+        d=${d##*/}
+        [ -n "$d" ] || continue
+        path_hold "$d"
+        if [ "$hold" -gt "$detect" ]; then
+            detect=$hold
+            detect_why="$d: $why"
+        fi
+    done
+}
+
 # mpath_check <dm name> -> 0 mountable, 1 refused (reason on stderr)
 mpath_check() {
     map=$1
@@ -84,9 +150,18 @@ mpath_check() {
     # "<start> <len> multipath <#features> <feature>... ": queueing is the
     # queue_if_no_path feature
     feats=$(echo "$table" | awk '{ for (i = 1; i <= NF; i++) if ($i == "multipath") { n = $(i + 1); s = ""; for (j = 1; j <= n; j++) s = s " " $(i + 1 + j); print s; exit } }')
+    map_hold "$table"
     case " $feats " in
     *" queue_if_no_path "*) ;;
-    *) return 0 ;; # fails I/O at once when no path is up
+    *)
+        # fails I/O at once when no path is up -- once its paths have
+        # failed it back, which takes their hold
+        [ "$detect" -le "$lease" ] && return 0
+        warn "$dev: a path of multipath map $map holds a write for up to ${detect}s ($detect_why) before"
+        warn "  failing it, longer than this node's lease (${lease}s): it can reach the array after a peer has"
+        warn "  taken over the blocks it was aimed at. Lower the transport timeouts."
+        return 1
+        ;;
     esac
     q=""
     poll=5
@@ -110,11 +185,12 @@ mpath_check() {
         return 1
         ;;
     esac
-    bound=$(($1 * poll))
+    bound=$(($1 * poll + detect))
     [ "$bound" -le "$lease" ] && return 0
     warn "$dev: multipath map $map queues writes for up to ${bound}s with no path up (no_path_retry $1 x"
-    warn "  polling_interval ${poll}s), longer than this node's lease (${lease}s): they can reach the array"
-    warn "  after a peer has taken over the blocks they were aimed at. Lower no_path_retry in multipath.conf."
+    warn "  polling_interval ${poll}s${detect_why:+, after up to ${detect}s for a path to fail them: $detect_why}),"
+    warn "  longer than this node's lease (${lease}s): they can reach the array after a peer has taken over"
+    warn "  the blocks they were aimed at. Lower no_path_retry in multipath.conf, or the transport timeouts."
     return 1
 }
 
@@ -136,6 +212,28 @@ mpath-*)
         else
             warn "$dev: not mounted. (-o x-cetrafs.mpath-queue-ok overrides, for a hardware-fenced cluster.)"
             exit 32
+        fi
+    fi
+    ;;
+*)
+    # Not a multipath map: a single path, or anything else. A SCSI disk
+    # (or a partition of one) holds a write for its transport's time.
+    d=$name
+    [ -e "$SYS/block/$d/device" ] || d=$(basename "$(dirname "$(readlink -f "$SYS/class/block/$name" 2>/dev/null)")" 2>/dev/null || echo "")
+    if [ -n "$d" ] && [ -e "$SYS/block/$d/device" ]; then
+        path_hold "$d"
+        if [ "$hold" -gt "$lease" ]; then
+            warn "$dev holds a write for up to ${hold}s ($why) before failing it, longer than this node's"
+            warn "  lease (${lease}s): after a path outage it can reach the array once a peer has taken over"
+            warn "  the blocks it was aimed at. Lower the transport timeouts (iSCSI replacement_timeout, FC"
+            warn "  fast_io_fail_tmo) so the sum is under ${lease}s, or use multipath with no_path_retry fail."
+            if [ "$override" = 1 ]; then
+                warn "$dev: mounting anyway (x-cetrafs.queue-ok): only hardware fencing keeps this node's late"
+                warn "  writes off blocks its peers own after it is fenced"
+            else
+                warn "$dev: not mounted. (-o x-cetrafs.queue-ok overrides, for a hardware-fenced cluster.)"
+                exit 32
+            fi
         fi
     fi
     ;;

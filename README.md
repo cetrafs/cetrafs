@@ -153,6 +153,21 @@ In this repo:
   at that point. A stall you want the cluster to survive must therefore
   be shorter than `stale_secs - hb_interval_secs`.
 
+  The bound is on the whole time a write can be held, not on the
+  queueing alone: a path holds it first for the SCSI command timeout plus
+  its transport's own wait -- an iSCSI session's `replacement_timeout`
+  (120 s by default, the whole stale window) or an FC port's
+  `fast_io_fail_tmo` (`dev_loss_tmo` when that is off) -- and only then
+  does multipath queue it. The rule is therefore
+
+      SCSI timeout + transport wait + no_path_retry x polling_interval
+          < stale_secs - hb_interval_secs
+
+  for multipath and single-path initiators alike (no multipath: the last
+  term is zero). `mount.cetrafs` checks it from sysfs and refuses a device
+  that breaks it; `-o x-cetrafs.queue-ok` overrides, for a cluster that
+  fences in hardware.
+
   A `controls` change lasts until the volume is unmounted; the next mount
   takes the module option again. The module option is read when a volume
   is mounted, so changing it (in modprobe.d or
