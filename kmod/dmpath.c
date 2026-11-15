@@ -84,6 +84,11 @@ static bool cetrafs_slave_actor(struct dir_context *ctx, const char *name, int n
     return true;
 }
 
+/* TEST ONLY: resolve inside the caller's path walk, as before
+ * (tests/kernel/caw_not_ready_rotates.sh's control). */
+static bool cetrafs_dmpath_nested_walk;
+cetrafs_test_param(dmpath_nested_walk, cetrafs_dmpath_nested_walk, bool, 0644);
+
 /*
  * Open a sysfs path the same way whoever triggered the resolution.
  *
@@ -94,9 +99,21 @@ static bool cetrafs_slave_actor(struct dir_context *ctx, const char *name, int n
  * sysfs. The answer -- which SCSI path carries this LUN's CAW -- must
  * not depend on any of that (audit L31). So the lookup starts at init's
  * root, under kernel credentials.
+ *
+ * And as a walk of its own, not a continuation of the caller's. A CAS
+ * runs inside open(2), mkdir(2) and the rest, i.e. inside the caller's
+ * own path walk, and a nested walk inherits that walk's symlink count
+ * and hands its own back when it ends (fs/namei.c set_nameidata() /
+ * restore_nameidata()). Every resolution follows a few sysfs symlinks,
+ * so after five or six of them in one system call -- a path refusing
+ * CAWs, rotated away from and back -- every lookup failed ELOOP, the
+ * volume had "no path" until that system call ended, and an undecided
+ * swap waited out its window on it. The caller's walk is parked for the
+ * duration and put back untouched.
  */
 static struct file *cetrafs_sysfs_open(const char *path, int flags)
 {
+    struct nameidata *outer = current->nameidata;
     struct path root;
     struct cred *kcred;
     const struct cred *old;
@@ -107,7 +124,10 @@ static struct file *cetrafs_sysfs_open(const char *path, int flags)
         return ERR_PTR(-ENOMEM);
     get_fs_root(init_task.fs, &root);
     old = override_creds(kcred);
+    if (!READ_ONCE(cetrafs_dmpath_nested_walk))
+        current->nameidata = NULL;
     f = file_open_root(&root, path, flags, 0);
+    current->nameidata = outer;
     revert_creds(old);
     path_put(&root);
     put_cred(kcred);
