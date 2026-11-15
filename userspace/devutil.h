@@ -543,11 +543,19 @@ static inline void cetrafs_row_drop_cache(int fd, const cetrafs_superblock_t *sb
 }
 
 /* The whole registry, as the device has it: a peer's row write reaches
- * the device, not this machine's page cache (audit 2026-11-14 U1). */
+ * the device, not this machine's page cache (audit 2026-11-14 U1).
+ * POSIX_FADV_DONTNEED alone is advice: it leaves a page it cannot drop
+ * at that instant where it is, and the first sample of mkfs -f's probe
+ * read a FREE row a peer had claimed since, one run in two
+ * (image/mkfs_probe_fresh.sh). On a block device BLKFLSBUF writes back
+ * and invalidates the whole cache, every CPU's LRU drained first. */
 static inline void cetrafs_registry_drop_cache(int fd, const cetrafs_superblock_t *sb)
 {
     uint32_t count = cetrafs_le32(sb->node_table_count);
+    struct stat st;
 
+    if (fstat(fd, &st) == 0 && S_ISBLK(st.st_mode))
+        (void) ioctl(fd, BLKFLSBUF, 0);
     if (count)
         posix_fadvise(fd, cetrafs_node_row_off(sb, 0), (off_t) count * CETRAFS_BLOCK_SIZE, POSIX_FADV_DONTNEED);
 }
