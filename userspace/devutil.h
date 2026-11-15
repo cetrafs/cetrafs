@@ -525,6 +525,30 @@ static inline int cetrafs_caw_probe(int fd)
     snprintf(path, sizeof(path), "/sys/dev/block/%u:%u/partition", major(st.st_rdev), minor(st.st_rdev));
     if (access(path, F_OK) == 0)
         return 0; /* the command addresses the whole disk */
+    /*
+     * A device-mapper node passes SCSI commands to the disk under it,
+     * and they address THAT disk's blocks: through a kpartx partition or
+     * an LV that does not start at block 0, the swap's LBA is the
+     * volume's and lands that far before the row -- the claim always
+     * miscompares, or, over zeros, writes a stray row into whatever is
+     * there (audit 2026-11-15 B-26). Only a whole multipath map
+     * (dm uuid "mpath-...") addresses the volume's own blocks; the kernel
+     * refuses the rest the same way (caw.c). The others take the
+     * fallback, as a device without CAW does.
+     */
+    snprintf(path, sizeof(path), "/sys/dev/block/%u:%u/dm/uuid", major(st.st_rdev), minor(st.st_rdev));
+    {
+        FILE *u = fopen(path, "r");
+
+        if (u) {
+            char uuid[160] = "";
+            bool mpath = fgets(uuid, sizeof(uuid), u) && strncmp(uuid, "mpath-", 6) == 0;
+
+            fclose(u);
+            if (!mpath && !cetrafs_test_env("CETRAFS_TEST_TOOLS_DM_ANY"))
+                return 0;
+        }
+    }
     if (ioctl(fd, BLKSSZGET, &lbs) != 0 || lbs < 512 || (unsigned) lbs > CETRAFS_BLOCK_SIZE)
         return 0;
     memset(vpd, 0, sizeof(vpd));
@@ -532,6 +556,29 @@ static inline int cetrafs_caw_probe(int fd)
         return 0;
     if (vpd[1] != 0xb0 || vpd[5] < 1)
         return 0;
+    /* And the identity itself: what a SCSI READ of block 0 returns must
+     * be what a read of the device's block 0 returns, or the command
+     * reaches some other block 0. */
+    if (!cetrafs_test_env("CETRAFS_TEST_TOOLS_DM_ANY")) {
+        static unsigned char viasg[CETRAFS_BLOCK_SIZE] __attribute__((aligned(4096)));
+        static unsigned char viadev[CETRAFS_BLOCK_SIZE] __attribute__((aligned(4096)));
+        unsigned char rcdb[16];
+        unsigned nlb = CETRAFS_BLOCK_SIZE / (unsigned) lbs;
+
+        memset(rcdb, 0, sizeof(rcdb));
+        rcdb[0] = 0x88; /* READ(16), LBA 0 */
+        rcdb[10] = (unsigned char) (nlb >> 24);
+        rcdb[11] = (unsigned char) (nlb >> 16);
+        rcdb[12] = (unsigned char) (nlb >> 8);
+        rcdb[13] = (unsigned char) nlb;
+        if (cetrafs_sg_cmd(fd, rcdb, sizeof(rcdb), SG_DXFER_FROM_DEV, viasg, sizeof(viasg)) != 0 ||
+            pread(fd, viadev, sizeof(viadev), 0) != (ssize_t) sizeof(viadev) ||
+            memcmp(viasg, viadev, sizeof(viasg)) != 0) {
+            fprintf(stderr, "note: SCSI commands through this device reach a different block 0 -- "
+                            "not using COMPARE AND WRITE on it\n");
+            return 0;
+        }
+    }
     cetrafs_caw_lbs = (unsigned) lbs;
     cetrafs_caw_mode = 1;
     return 1;
