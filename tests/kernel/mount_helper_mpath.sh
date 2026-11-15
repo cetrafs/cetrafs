@@ -21,9 +21,11 @@
 #   4. queueing bounded OVER the lease: refused;
 #   5. queueing, and no multipathd to say what bounds it: refused;
 #   6. 3 with -o x-cetrafs.mpath-queue-ok: mounts, with a warning;
-#   7. not a multipath map: mounts.
+#   7. not a multipath map: mounts;
+#   8. queueing, and multipathd reporting no_path_retry "-" (not set): refused.
 #
 # DISCRIMINATION: without the helper (mount -i, the kernel alone) 3 mounts.
+# A helper taking "-" as "fails at once": 8 mounts.
 set -euo pipefail
 . "$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)/lib/harness.sh"
 require_root
@@ -84,6 +86,9 @@ R="$(try "1 queue_if_no_path" "on" "x-cetrafs.mpath-queue-ok")"
     fail "6: the override: $R: $(cat "$ERR")"
 R="$(FAKE_NOT_DM=1 try "1 queue_if_no_path" "on")"
 [ "$R" = "rc=0 mounted=yes" ] && pass "7: not a multipath map: mounted" || fail "7: $R: $(cat "$ERR")"
+R="$(try "1 queue_if_no_path" "-")"
+[ "$R" = "rc=32 mounted=no" ] && grep -q "with no limit" "$ERR" && pass "8: queueing with no_path_retry not set: refused" ||
+    fail "8: no_path_retry '-': $R: $(cat "$ERR")"
 
 rc=0
 mount -i -t cetrafs "$DEV" "$MNT" 2>/dev/null || rc=$?

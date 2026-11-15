@@ -68,8 +68,10 @@ for o in $opts; do
 done
 IFS=$oldifs
 
-# The lease, from the loaded module's timing (or its defaults): the stale
-# window less one heartbeat.
+# The lease, from the module's timing: the stale window less one
+# heartbeat. Loaded first, so options set in modprobe.d count -- before
+# that, the parameters are not there and only the built-in defaults were.
+[ -d /sys/module/cetrafs/parameters ] || modprobe -q cetrafs 2>/dev/null || true
 param() { cat "/sys/module/cetrafs/parameters/$1" 2>/dev/null || echo "$2"; }
 stale=$(param stale_secs 120)
 hb=$(param hb_interval_secs 15)
@@ -94,8 +96,10 @@ mpath_check() {
         case "$p" in '' | *[!0-9]*) ;; *) poll=$p ;; esac
     fi
     set -- $q
+    # "-" is multipathd's "not set" -- and the table above already says
+    # the map queues, so not set is no bound at all, not "fails at once".
     case "${1:-}" in
-    off | fail | -)
+    off | fail)
         return 0
         ;;
     '' | *[!0-9]*)
