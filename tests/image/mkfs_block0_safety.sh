@@ -1,31 +1,30 @@
 #!/usr/bin/env bash
 # SPDX-License-Identifier: GPL-2.0-or-later
-# mkfs -f over a cetrafs volume: interrupted while it probes, it puts the superblock back; a stale cached block 0 does not skip the probe
+# mkfs -f over a cetrafs volume: block 0 survives anything that ends mkfs while it probes; a stale cached block 0 does not skip the probe
 #
-# mkfs retires the old superblock (zeroes block 0) BEFORE it probes the
-# registry for a live node, so no mount can start meanwhile, and puts it
-# back if it finds one. The probe can wait minutes. The old superblock
-# lived only in mkfs's memory and the restore ran only on a normal
-# return: a ^C or a SIGTERM during the wait left block 0 zero on a
-# volume that may be live, with no backup superblock anywhere -- it never
-# mounts again (audit 2026-11-11 M1). And both of mkfs's block-0 reads
-# went through this machine's page cache: a block 0 cached while the LUN
-# was blank read "not cetrafs" over a volume formatted since, and the
-# probe never ran (M2).
+# Before formatting over a cetrafs volume mkfs proves nobody uses it: a
+# probe of the registry that can last minutes. It used to retire the old
+# superblock (zero block 0) FIRST, as its claim, keeping the only other
+# copy in a file on this host: a SIGKILL, an OOM kill or a host crash
+# during the probe left a possibly live volume with no superblock, never
+# to mount again (audit 2026-11-11 M1, then 2026-11-14 A-8). Now mkfs
+# takes the repair claim fsck -r and growfs take (a REPAIR row mounts
+# refuse) and probes under it; block 0 is touched only once the verdict
+# is "format". And both of mkfs's block-0 reads go past this machine's
+# page cache: a block 0 cached while the LUN was blank read "not
+# cetrafs" over a volume formatted since, and the probe never ran (M2).
 #
-#  1. SIGINT during the probe: block 0 is the old superblock again,
-#     mkfs exits nonzero, nothing is formatted.
+#  1. SIGINT during the probe: block 0 is the old superblock, mkfs exits
+#     nonzero, its claim is given back, nothing is formatted.
 #  2. SIGTERM: the same.
-#  3. SIGKILL (cannot be caught): the old superblock is in the file mkfs
-#     named before the probe, and the dd it printed restores it.
-#  4. CONTROL, no signal, the row dead: the volume is formatted and the
-#     saved copy removed.
+#  3. SIGKILL (cannot be caught): block 0 is still the old superblock;
+#     the claim stays behind, dead, for a mount or a tool to reap.
+#  4. CONTROL, no signal, the row dead: the volume is formatted.
 #  5. a stale cached block 0 ("blank") over a volume whose row beats:
 #     mkfs reads the device, probes, and refuses.
 #
-# DISCRIMINATION (2026-11-11): with the save, the held signals and the
-# DONTNEED reverted, 1 and 2 leave block 0 zero, 3 finds no copy, and 5
-# formats the live volume.
+# DISCRIMINATION: with block 0 zeroed before the probe (the code before
+# A-8), 3 finds block 0 zero.
 set -euo pipefail
 . "$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)/lib/harness.sh"
 require_root
@@ -65,30 +64,34 @@ interrupt() {
     wait "$p" || RC=$?
 }
 
+# repair_rows: how many registry rows read REPAIR (state 2)
+repair_rows() {
+    local r n=0
+    for r in 0 1 2 3; do
+        "$POKE" "$DEV" "$r" 2>/dev/null | grep -q '^state=2 ' && n=$((n + 1))
+    done
+    echo "$n"
+}
+
 for sig in INT TERM; do
     log "$sig during the probe"
     stage
     interrupt "$sig"
-    [ "$(blk0)" = "$ORIG" ] && pass "$sig: block 0 is the old superblock again" ||
+    [ "$(blk0)" = "$ORIG" ] && pass "$sig: block 0 is the old superblock" ||
         { [ "$(blk0)" = "$ZERO" ] && fail "$sig: mkfs left block 0 ZERO -- the volume will never mount" ||
             fail "$sig: block 0 is neither the old superblock nor zero"; }
     [ "$RC" != 0 ] && pass "$sig: mkfs exited nonzero ($RC)" || fail "$sig: mkfs exited 0 after being interrupted"
-    grep -q "interrupted -- nothing was formatted" "$ERR" && pass "$sig: and said nothing was formatted" ||
-        fail "$sig: no interruption message: $(tail -2 "$ERR")"
-    [ -z "$(ls "$SAVE")" ] && pass "$sig: the saved copy was removed once restored" || fail "$sig: left $(ls "$SAVE")"
+    [ "$(repair_rows)" = 0 ] && pass "$sig: its claim was given back" || fail "$sig: a REPAIR claim is left behind"
 done
 
 log "KILL during the probe"
 stage
 interrupt KILL
-COPY="$(ls "$SAVE"/mkfs.cetra-* 2>/dev/null | head -1 || true)"
-[ -n "$COPY" ] && [ "$(sha256sum <"$COPY" | cut -d' ' -f1)" = "$ORIG" ] &&
-    pass "KILL: the old superblock is in the copy mkfs named ($COPY)" ||
-    fail "KILL: no copy of the old superblock survives the kill"
-CMD="$(sed -n 's/^ *If mkfs is killed before it finishes: //p' "$ERR")"
-[ -n "$CMD" ] && eval "$CMD" 2>/dev/null && blockdev --flushbufs "$DEV" && [ "$(blk0)" = "$ORIG" ] &&
-    pass "KILL: and the command it printed puts it back" || fail "KILL: the printed restore did not work: ${CMD:-none}"
-rm -f "$SAVE"/*
+[ "$(blk0)" = "$ORIG" ] && pass "KILL: block 0 is still the old superblock" ||
+    { [ "$(blk0)" = "$ZERO" ] && fail "KILL: mkfs left block 0 ZERO -- the volume will never mount" ||
+        fail "KILL: block 0 is neither the old superblock nor zero"; }
+[ "$(repair_rows)" = 1 ] && pass "KILL: its claim is left behind, dead, for a reaper" ||
+    fail "KILL: $(repair_rows) REPAIR row(s) after the kill (want the 1 mkfs took)"
 
 log "CONTROL: no signal, the row dead -- formatted"
 stage
@@ -96,7 +99,7 @@ RC=0
 "$MKFS" "$DEV" -z 1 -b 512 -J 0 -N 1024 -f >/dev/null 2>"$ERR" || RC=$?
 [ "$RC" = 0 ] && [ "$(blk0)" != "$ORIG" ] && [ "$(blk0)" != "$ZERO" ] && pass "CONTROL: formatted" ||
     fail "CONTROL: mkfs did not format a volume whose row is dead (rc $RC): $(tail -2 "$ERR")"
-[ -z "$(ls "$SAVE")" ] && pass "CONTROL: and removed its copy" || fail "CONTROL: left $(ls "$SAVE")"
+[ -z "$(ls "$SAVE")" ] && pass "CONTROL: and left no file behind" || fail "CONTROL: left $(ls "$SAVE")"
 
 log "a stale cached 'blank' block 0 over a volume whose row beats"
 stage

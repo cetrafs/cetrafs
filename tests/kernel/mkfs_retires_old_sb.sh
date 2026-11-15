@@ -8,20 +8,22 @@
 # live node ran before the first write, and it ignored repair claims,
 # so it formatted a volume a live fsck -r or growfs was working on.
 #
-# Now block 0 is zeroed first and the registry is probed after; anyone
-# found gets the superblock back. A mount that read the old superblock
-# before the zero and registers after it re-reads block 0 once its row
-# is committed, and refuses.
+# Now mkfs takes a repair claim first (a REPAIR row, which mounts refuse)
+# and probes the registry under it; block 0 is rewritten only once the
+# verdict is "format" (audit 2026-11-14 A-8: zeroing it as the claim left
+# a volume with no superblock when mkfs died during the probe). A mount
+# that read the old superblock before the format and registers after it
+# re-reads block 0 once its row is committed, and refuses.
 #
-#   A: a node heartbeating in the registry -- while mkfs watches it,
-#      block 0 is already zero; mkfs refuses and puts the superblock back.
-#   B: a live repair claim -- mkfs refuses and puts the superblock back.
+#   A: a node heartbeating in the registry -- while mkfs watches it, its
+#      claim holds the volume and block 0 is untouched; mkfs refuses.
+#   B: a live repair claim -- mkfs refuses; the superblock stays.
 #   C: a mount stalled before registering while block 0 is rewritten
 #      under it must refuse.
 #
-# DISCRIMINATION: with the old order, block 0 still holds a valid
-# superblock during A's watch, and B formats the volume. Without the
-# kernel's post-registration re-read, C mounts.
+# DISCRIMINATION: with the claim-by-zeroing order, A's watch finds block
+# 0 zero and no claim. Without the kernel's post-registration re-read,
+# C mounts.
 set -euo pipefail
 . "$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)/lib/harness.sh"
 require_root
@@ -64,14 +66,18 @@ MPID=$!
 for _ in $(seq 1 40); do grep -q 'watching' "$OUTF" && break; sleep 0.25; done
 grep -q 'watching' "$OUTF" || { fail "A: setup: mkfs never started watching the live node: $(head -2 "$OUTF")"; }
 MID="$(b0)"
+CLAIM=0
+for r in 0 1 2 3; do "$NPOKE" "$IMG" "$r" 2>/dev/null | grep -q '^state=2 ' && CLAIM=$((CLAIM + 1)); done
 wait "$MPID" || true
 stop_beat
-[ "$MID" = "$ZERO" ] && pass "A: while mkfs watched for live nodes, block 0 was already zero" ||
-    fail "A: block 0 still held the old superblock while mkfs watched -- a mount then sees a valid volume"
+[ "$CLAIM" = 1 ] && pass "A: while mkfs watched for live nodes, its repair claim held the volume (mounts refuse it)" ||
+    fail "A: $CLAIM repair claim(s) while mkfs watched -- nothing kept a mount out"
+[ "$MID" = "$OLD" ] && pass "A: and block 0 was untouched: nothing is lost if mkfs dies there" ||
+    fail "A: block 0 was already rewritten while mkfs watched (audit 2026-11-14 A-8)"
 grep -q 'mounted by another node' "$OUTF" && pass "A: mkfs refused the live node" ||
     fail "A: mkfs did not refuse: $(tail -2 "$OUTF")"
-[ "$(b0)" = "$OLD" ] && pass "A: and put the old superblock back, byte for byte" ||
-    fail "A: the old superblock was not restored"
+[ "$(b0)" = "$OLD" ] && pass "A: and the old superblock is there, byte for byte" ||
+    fail "A: the old superblock is gone"
 
 # --- B: a live repair claim
 fresh
