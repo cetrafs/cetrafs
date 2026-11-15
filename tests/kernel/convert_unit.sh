@@ -30,6 +30,18 @@ require_module
 for k in convert_unit_blocks dio_track_off dio_end_io_stall_ms; do
     [ -w /sys/module/cetrafs/parameters/$k ] || { skip "$k is missing"; ct_exit; }
 done
+# The unit is zeroed with WRITE ZEROES and no unmap, which a loop device
+# serves as FALLOC_FL_ZERO_RANGE on its backing file: tmpfs has none, so
+# the images live on a filesystem that does.
+export CT_IMG_DIR="${CT_IMG_DIR:-/var/tmp}"
+ZR="$(mktemp "$CT_IMG_DIR/cetrafs-zr-XXXXXX")"
+truncate -s 1M "$ZR"
+if ! fallocate -z -o 0 -l 65536 "$ZR" 2>/dev/null; then
+    rm -f "$ZR"
+    skip "$CT_IMG_DIR cannot zero a range in place (FALLOC_FL_ZERO_RANGE) -- set CT_IMG_DIR to one that can"
+    ct_exit
+fi
+rm -f "$ZR"
 AIO="$(ct_helper dio_aio)"
 MNT="$(ct_mnt cvu)"
 ct_track mnt "$MNT"

@@ -6378,13 +6378,10 @@ u64 cetrafs_convert_unit_busy_count(void)
 
 static int cetrafs_convert_zero(struct super_block *sb, u64 lba, u64 count)
 {
-    if (!count)
-        return 0;
-    if (cetrafs_sb_is_fenced(sb))
-        return -EIO; /* the per-block path's gate, as the data write's */
-    return blkdev_issue_zeroout(sb->s_bdev, (sector_t) lba * (CETRAFS_BLOCK_SIZE >> SECTOR_SHIFT),
-                                (sector_t) count * (CETRAFS_BLOCK_SIZE >> SECTOR_SHIFT), GFP_NOFS,
-                                BLKDEV_ZERO_NOFALLBACK);
+    /* Through the range-checked issuer (class 50): inside one Block
+     * Group's data region, behind the witnessed fence, and NOUNMAP -- a
+     * thin array must keep the space a preallocation reserved. */
+    return cetrafs_zeroout_issue(sb, lba, count, false);
 }
 
 /* Zero the blocks of [first, first + count) (at 'plba') that are not
