@@ -2361,6 +2361,46 @@ static bool cetrafs_inode_has_unpublished_state(struct inode *inode)
     return b.size != (u64) i_size_read(inode) || b.blocks != (u64) inode->i_blocks;
 }
 
+/* TEST ONLY: the cold reconcile drops the tree and pages but leaves the
+ * size as it was (the old reconcile; tests/kernel/cold_reconcile_size.sh). */
+static bool cetrafs_cold_size_off;
+cetrafs_test_param(cold_size_off, cetrafs_cold_size_off, bool, 0644);
+
+/*
+ * The cold reconcile's size half (lock.c's cetrafs_inode_cold_work()).
+ * A file_seq change sends the tree and the clean pages back to the
+ * device, and nothing else: an open held across a peer's appends kept
+ * the size it opened with, so fstat, SEEK_END and every read clamped at
+ * it -- a nofilelock destination read a growing image short, and qemu
+ * zero-fills a short read (audit 2026-11-15 B-10). The record just read
+ * fresh says what the file is now; its size and block count are applied
+ * when this node holds no unpublished size of its own (the stat
+ * baseline, as the full refresh judges it) and the record is still this
+ * inode's.
+ * -EAGAIN: the inode lock was held -- the caller retries later.
+ */
+int cetrafs_inode_apply_size_from_raw(struct inode *inode, const cetrafs_inode_t *raw)
+{
+    struct cetrafs_stat_baseline b;
+    u64 size = cetrafs_le64(raw->size), blocks = cetrafs_le64(raw->blocks);
+
+    if (READ_ONCE(cetrafs_cold_size_off) || !S_ISREG(inode->i_mode))
+        return 0;
+    if (cetrafs_le64(raw->generation) != cetrafs_inode_get_generation(inode))
+        return 0; /* another file now: not ours to apply */
+    if ((u64) i_size_read(inode) == size && (u64) inode->i_blocks == blocks)
+        return 0;
+    if (!inode_trylock(inode))
+        return -EAGAIN;
+    if (!cetrafs_inode_has_unpublished_state(inode) && cetrafs_inode_stat_baseline_get(inode, &b)) {
+        i_size_write(inode, size);
+        inode->i_blocks = blocks;
+        cetrafs_inode_stat_baseline_set_size(inode, size, blocks);
+    }
+    inode_unlock(inode);
+    return 0;
+}
+
 /* TEST ONLY: the next apply loses its inode_lock trylock, as it does to
  * a local writer retrying -ETXTBSY. tests/kernel/lock_resume_reconcile.sh. */
 static bool cetrafs_apply_trylock_fail_once;

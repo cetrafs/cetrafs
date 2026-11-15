@@ -80,7 +80,7 @@ done
 sleep 5 # two more beats: nothing may follow the give-up
 USED=$((50 - $(knob)))
 ct_param_set cold_read_fail 0
-dmesg_since "$MARK" | grep -q "record still unreadable .* after 8 tries" &&
+dmesg_since "$MARK" | grep -q "still not reconciled .* after 8 tries" &&
     pass "the give-up is reported" || fail "no report after the retries ran out"
 [ "$USED" = 9 ] && pass "the reconcile was tried 1 + 8 times and then left alone" ||
     fail "the reconcile was tried $USED times (want 9: one run, eight retries)"

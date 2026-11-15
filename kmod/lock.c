@@ -998,6 +998,19 @@ void cetrafs_inode_smap_drop(struct inode *inode)
         cetrafs_smap_put(old);
 }
 
+/* The size half of the baseline only, for the cold reconcile's size
+ * apply (cetrafs_inode_apply_size_from_raw()): the times it did not
+ * apply keep the baseline they had. */
+void cetrafs_inode_stat_baseline_set_size(struct inode *inode, u64 size, u64 blocks)
+{
+    struct cetrafs_inode_info *ci = CETRAFS_I(inode);
+
+    spin_lock(&ci->resv_lock);
+    ci->stat_baseline.size = size;
+    ci->stat_baseline.blocks = blocks;
+    spin_unlock(&ci->resv_lock);
+}
+
 bool cetrafs_inode_stat_baseline_get(struct inode *inode, struct cetrafs_stat_baseline *out)
 {
     struct cetrafs_inode_info *ci = CETRAFS_I(inode);
@@ -4246,6 +4259,12 @@ static void cetrafs_inode_cold_work(struct work_struct *w)
         if (rret == 0) {
             cetrafs_tree_invalidate_cached(inode, raw);
             dropped = true;
+            /* and the size the peer's change left (B-10); a held inode
+             * lock is retried from the park like an unreadable record */
+            if (cetrafs_inode_apply_size_from_raw(inode, raw) == -EAGAIN) {
+                dropped = false;
+                rret = -EAGAIN;
+            }
         }
         kfree(raw);
     }
@@ -4264,7 +4283,7 @@ static void cetrafs_inode_cold_work(struct work_struct *w)
         ci->cold_retries = 0;
         cetrafs_tree_cold_settle(ci, g);
         atomic64_inc(&cetrafs_file_cache_reconciles);
-    } else if ((rret == -ENOMEM || rret == -EIO) && !cetrafs_sb_is_fenced(sb)) {
+    } else if ((rret == -ENOMEM || rret == -EIO || rret == -EAGAIN) && !cetrafs_sb_is_fenced(sb)) {
         /*
          * Nothing was read, so nothing settles -- and nothing else will
          * queue this again: only a NEW mark does, and a running VM never
@@ -4289,7 +4308,7 @@ static void cetrafs_inode_cold_work(struct work_struct *w)
             if (cetrafs_sb_cold_park(sb, &ci->cold_park))
                 return;
         } else {
-            pr_warn("cold reconcile: ino=%llu record still unreadable (%d) after %u tries -- its extent tree "
+            pr_warn("cold reconcile: ino=%llu still not reconciled (%d) after %u tries -- its extent tree "
                     "stays uncached (every map reads the device) until the next change\n",
                     (unsigned long long) inode->i_ino, rret, CETRAFS_COLD_RETRIES_MAX);
             ci->cold_retries = 0;

@@ -1385,6 +1385,9 @@ struct cetrafs_stat_baseline {
 };
 void cetrafs_inode_stat_baseline_set(struct inode *inode, const cetrafs_inode_t *raw);
 bool cetrafs_inode_stat_baseline_get(struct inode *inode, struct cetrafs_stat_baseline *out);
+void cetrafs_inode_stat_baseline_set_size(struct inode *inode, u64 size, u64 blocks);
+/* inode.c: the cold reconcile applies the fresh record's size (B-10). */
+int cetrafs_inode_apply_size_from_raw(struct inode *inode, const cetrafs_inode_t *raw);
 /* For the paths that persist stat through a CAS stamp (lock.c's close
  * and lock-clear), where the committed record equals the in-core block. */
 void cetrafs_inode_stat_baseline_from_incore(struct inode *inode);

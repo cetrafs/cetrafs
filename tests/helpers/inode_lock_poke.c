@@ -92,6 +92,35 @@ int main(int argc, char **argv)
         return 0;
     }
 
+    /* --peer-size <ino> <size> <node_id>: a peer's publish as the record
+     * shows it -- the size it left and its row in file_seq's top bits,
+     * the counter advanced (tests/kernel/cold_reconcile_size.sh). */
+    if (argc == 6 && strcmp(argv[2], "--peer-size") == 0) {
+        int pfd = open(argv[1], O_RDWR);
+        cetrafs_superblock_t psb;
+        cetrafs_inode_t pin;
+        off_t poff;
+        uint64_t seq;
+
+        if (pfd < 0) {
+            perror("open");
+            return 1;
+        }
+        pread_all(pfd, &psb, sizeof(psb), 0);
+        poff = (off_t) (cetrafs_le64(psb.inode_table_start) + strtoull(argv[3], NULL, 0) - 1) * CETRAFS_BLOCK_SIZE;
+        pread_all(pfd, &pin, sizeof(pin), poff);
+        seq = ((cetrafs_le64(pin.file_seq) & CETRAFS_FILE_SEQ_VAL_MASK) + 1) |
+              ((uint64_t) strtoul(argv[5], NULL, 0) << CETRAFS_FILE_SEQ_NODE_SHIFT);
+        pin.size = cetrafs_cpu_to_le64(strtoull(argv[4], NULL, 0));
+        pin.file_seq = cetrafs_cpu_to_le64(seq);
+        cetrafs_inode_stamp_crcs_us(&pin);
+        pwrite_all(pfd, &pin, sizeof(pin), poff);
+        fsync(pfd);
+        close(pfd);
+        printf("inode_lock_poke: ino=%s size -> %s file_seq -> 0x%" PRIx64 "\n", argv[3], argv[4], seq);
+        return 0;
+    }
+
     if (argc != 3 && argc != 5 && !(argc == 4 && (has_rec || has_incs))) {
         fprintf(stderr,
                 "usage: %s <image> <ino> [<owner_node_id> <lock_mode> | --ns <id> | --reader <node_id> | --unreader <node_id> | --suspended <node_id> | --mark-only <node_id>]\n",
