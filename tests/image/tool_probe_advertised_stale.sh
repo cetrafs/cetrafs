@@ -34,7 +34,7 @@ blockdev --flushbufs "$DEV"
 plant() {
     "$NPOKE" "$IMG" "$1" 1 "$(printf '%02x' $((0xa0 + $1)))" "$(date +%s)" "$2" >/dev/null
     "$NPOKE" "$IMG" "$1" --stale "$3" >/dev/null
-    grep -q "state=1 .*hb_interval=$2 .*stale_secs=$3\$" <<<"$("$NPOKE" "$IMG" "$1")" ||
+    grep -qE "state=1 .*hb_interval=$2 .*stale_secs=$3( |$)" <<<"$("$NPOKE" "$IMG" "$1")" ||
         { fail "setup: row $1 not planted as interval $2, stale $3: $("$NPOKE" "$IMG" "$1")"; ct_exit; }
 }
 clear_row() { "$NPOKE" "$IMG" "$1" 0 00 0 >/dev/null; }
