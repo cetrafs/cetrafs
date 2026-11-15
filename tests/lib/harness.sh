@@ -751,6 +751,8 @@ ct_mode_own() { CT_MOUNT_OPTS=""; }
 # no CAW, so this is the only way a kernel suite reaches the real
 # primitive. Torn down by the harness after the unmounts. Returns 1 with
 # the reason on stderr when LIO is unavailable -- the caller skips.
+# CT_LIO_ALUA=1: nexus i > 1 gets its own ALUA target port group, so
+# ct_lio_alua can move one path's state alone (scsi_dh_alua reports it).
 ct_lio_disks() {
     local img="$1" n="$2" cf=/sys/kernel/config/target tag hba bs i t a d td
     modprobe target_core_mod 2>/dev/null && modprobe target_core_file 2>/dev/null &&
@@ -769,6 +771,7 @@ ct_lio_disks() {
             echo "rm -f '$t/tpgt_1/lun/lun_0/ct$tag'"
             echo "rmdir '$t/tpgt_1/lun/lun_0' '$t/tpgt_1' '$t' 2>/dev/null"
         done
+        [ "${CT_LIO_ALUA:-0}" = 1 ] && for i in $(seq 2 "$n"); do echo "rmdir '$bs/alua/ctg$i' 2>/dev/null"; done
         echo "rmdir '$bs' '$hba' 2>/dev/null"
         echo "[ ! -d '$bs' ]"
     } >"$td"
@@ -782,6 +785,13 @@ ct_lio_disks() {
         mkdir -p "$t/tpgt_1/lun/lun_0"
         printf 'naa.5001405%07x%02x' "$tag" "$((i + 10))" >"$t/tpgt_1/nexus"
         ln -s "$bs" "$t/tpgt_1/lun/lun_0/ct$tag"
+        if [ "${CT_LIO_ALUA:-0}" = 1 ] && [ "$i" -gt 1 ]; then
+            modprobe scsi_dh_alua 2>/dev/null || true
+            mkdir "$bs/alua/ctg$i"
+            echo "$i" >"$bs/alua/ctg$i/tg_pt_gp_id"
+            echo 3 >"$bs/alua/ctg$i/alua_access_type" # implicit and explicit
+            echo "ctg$i" >"$t/tpgt_1/lun/lun_0/alua_tg_pt_gp"
+        fi
     done
     for i in $(seq 1 "$n"); do
         a="$(cat "$cf/loopback/$(printf 'naa.5001405%07x%02x' "$tag" "$i")/tpgt_1/address")"
@@ -797,6 +807,34 @@ ct_lio_disks() {
         echo "$d"
     done
     udevadm settle 2>/dev/null || true
+}
+
+# ct_lio_alua <disk> <state>: set the ALUA state of the target port
+# group behind one ct_lio_disks disk made with CT_LIO_ALUA=1 (0
+# active/optimised, 1 active/non-optimised, 2 standby, 3 unavailable),
+# and wait until the initiator's scsi_dh_alua reports it. The first
+# nexus shares the default group with nothing else; it works too.
+ct_lio_alua() {
+    local disk="${1#/dev/}" st="$2" cf=/sys/kernel/config/target sd t gp bs want _
+    local names=(active/optimized active/non-optimized standby unavailable)
+    sd="$(readlink -f "/sys/block/$disk/device")"
+    for t in "$cf"/loopback/naa.*; do
+        [ "$sd" = "$(readlink -f "/sys/class/scsi_device/$(cat "$t/tpgt_1/address"):0/device")" ] || continue
+        gp="$(sed -n 's/^TG Port Alias: //p' "$t/tpgt_1/lun/lun_0/alua_tg_pt_gp")"
+        bs="$(readlink -f "$t"/tpgt_1/lun/lun_0/ct*)"
+        echo "$st" >"$bs/alua/$gp/alua_access_state" || return 1
+        want="${names[$st]}"
+        for _ in $(seq 1 50); do
+            # an RTPG refreshes what the initiator believes
+            echo 1 >"$sd/rescan" 2>/dev/null || true
+            [ "$(cat "$sd/access_state" 2>/dev/null)" = "$want" ] && return 0
+            sleep 0.1
+        done
+        echo "ct_lio_alua: $disk never reported $want (reads $(cat "$sd/access_state" 2>/dev/null))" >&2
+        return 1
+    done
+    echo "ct_lio_alua: $disk is not a ct_lio_disks disk" >&2
+    return 1
 }
 
 ct_mkfs_small() { ct_mkfs "$1" -z 1 -b 512 -J 0 -N 1024 -f "${@:2}"; }

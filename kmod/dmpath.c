@@ -309,6 +309,8 @@ struct cetrafs_dmpath_entry {
     struct file *file;         /* the path, held open NON-exclusively */
     struct scsi_device *sdev;  /* reference held; NULL = needs (re)resolution */
     bool resolving;            /* a resolution is in flight; the slot is claimed but empty */
+    u8 rank;                   /* the path's ALUA rank when resolved (cetrafs_dmpath_rank()) */
+    unsigned long resolved_at; /* jiffies of that resolution */
     char name[DISK_NAME_LEN];
 };
 
@@ -558,10 +560,81 @@ static void cetrafs_dmpath_drop_refs(struct cetrafs_dmpath_entry *e)
     e->name[0] = '\0';
 }
 
+/*
+ * Which path a CAW goes down, by what the array says of it (ALUA, as
+ * scsi_dh_alua records it in access_state; a path with no handler reads
+ * OPTIMAL): 0 active/optimised, 1 active/non-optimised, 2 in transition
+ * or unknown, 3 standby, unavailable or offline. The first slave that
+ * passed the identity check was taken whatever its state, so on an
+ * active/non-optimised array every CAW was proxied between controllers,
+ * and on strict active/passive one went to the standby port and was
+ * refused there, each swap, until the rotation found the active one
+ * (audit 2026-11-15 M-23).
+ *
+ * TEST ONLY: dmpath_ignore_alua=1 ranks every path alike, as before.
+ */
+static bool cetrafs_dmpath_ignore_alua;
+cetrafs_test_param(dmpath_ignore_alua, cetrafs_dmpath_ignore_alua, bool, 0644);
+
+/* How often a CAW path that is not optimised looks for one that is. */
+static unsigned int cetrafs_dmpath_upgrade_secs = 30;
+cetrafs_test_param(dmpath_upgrade_secs, cetrafs_dmpath_upgrade_secs, uint, 0644);
+MODULE_PARM_DESC(dmpath_upgrade_secs, "seconds between a non-optimised CAW path's looks for an optimised one (0 = never)");
+
+static u8 cetrafs_dmpath_rank(const struct scsi_device *sdev)
+{
+    if (READ_ONCE(cetrafs_dmpath_ignore_alua))
+        return 0;
+    switch (READ_ONCE(sdev->access_state) & SCSI_ACCESS_STATE_MASK) {
+    case SCSI_ACCESS_STATE_OPTIMAL:
+        return 0;
+    case SCSI_ACCESS_STATE_ACTIVE:
+    case SCSI_ACCESS_STATE_LBA:
+        return 1;
+    case SCSI_ACCESS_STATE_STANDBY:
+    case SCSI_ACCESS_STATE_UNAVAILABLE:
+    case SCSI_ACCESS_STATE_OFFLINE:
+        return 3;
+    default:
+        return 2;
+    }
+}
+
+static const char *const cetrafs_dmpath_rank_name[] = {"active/optimised", "active/non-optimised", "transitioning",
+                                                       "standby"};
+
+/* Is any path under 'bdev' of a better ALUA rank than 'than'? A field
+ * read per path, no I/O: the resolution that follows does the checks. */
+static bool cetrafs_dmpath_better_exists(struct block_device *bdev, u8 than)
+{
+    dev_t devs[CETRAFS_DM_MAX_SLAVES];
+    unsigned int n = 0, i;
+    bool better = false;
+
+    if (cetrafs_dm_underlying(bdev, devs, ARRAY_SIZE(devs), &n))
+        return false;
+    for (i = 0; i < n && !better; i++) {
+        struct file *file = bdev_file_open_by_dev(devs[i], BLK_OPEN_READ, NULL, NULL);
+        struct scsi_device *sdev;
+
+        if (IS_ERR(file))
+            continue;
+        sdev = cetrafs_caw_get_sdev(file_bdev(file));
+        if (sdev) {
+            better = scsi_device_online(sdev) && cetrafs_dmpath_rank(sdev) < than;
+            scsi_device_put(sdev);
+        }
+        fput(file);
+    }
+    return better;
+}
+
 /* Try one candidate: open it non-exclusively (dm holds its paths
  * EXCLUSIVELY, so an exclusive open here returns -EBUSY), require a SCSI
- * parent, then put it through the identity guard. */
-static int cetrafs_dmpath_try(struct block_device *dm_bdev, dev_t path_dev, struct cetrafs_dmpath_entry *e)
+ * parent of ALUA rank 'rank', then put it through the identity guard.
+ * -ENOLINK: a path of another rank, nothing read from it. */
+static int cetrafs_dmpath_try(struct block_device *dm_bdev, dev_t path_dev, struct cetrafs_dmpath_entry *e,
+                              u8 rank)
 {
     struct block_device *pbdev;
     struct scsi_device *sdev;
@@ -590,6 +663,11 @@ static int cetrafs_dmpath_try(struct block_device *dm_bdev, dev_t path_dev, stru
     if (!sdev) {
         fput(file);
         return -ENXIO; /* not a SCSI device (another dm layer, loop, ...) */
+    }
+    if (cetrafs_dmpath_rank(sdev) != rank) {
+        scsi_device_put(sdev);
+        fput(file);
+        return -ENOLINK;
     }
 
     {
@@ -634,6 +712,7 @@ static int cetrafs_dmpath_resolve(struct block_device *bdev, dev_t avoid, struct
 {
     dev_t devs[CETRAFS_DM_MAX_SLAVES];
     unsigned int n = 0, i, pass;
+    u8 rank;
     int ret;
 
     if (cetrafs_dmpath_resolve_delay_ms)
@@ -644,7 +723,10 @@ static int cetrafs_dmpath_resolve(struct block_device *bdev, dev_t avoid, struct
         return ret ? ret : -ENODEV;
     ret = 0;
 
+    /* The path that just failed last, whatever its rank; among the
+     * rest, the best ALUA rank first (cetrafs_dmpath_rank()). */
     for (pass = 0; pass < (avoid ? 2u : 1u); pass++)
+    for (rank = 0; rank < ARRAY_SIZE(cetrafs_dmpath_rank_name); rank++)
     for (i = 0; i < n; i++) {
         int tr;
 
@@ -652,11 +734,15 @@ static int cetrafs_dmpath_resolve(struct block_device *bdev, dev_t avoid, struct
             continue;
         if (pass == 1 && devs[i] != avoid)
             continue; /* pass 0 already tried these */
-        tr = cetrafs_dmpath_try(bdev, devs[i], e);
+        tr = cetrafs_dmpath_try(bdev, devs[i], e, rank);
+        if (tr == -ENOLINK)
+            continue; /* another rank's turn */
         if (tr == 0) {
-            pr_info("dm path: %s -> sending COMPARE AND WRITE via %s (data I/O stays on the mapped "
+            e->rank = rank;
+            e->resolved_at = jiffies;
+            pr_info("dm path: %s -> sending COMPARE AND WRITE via %s, %s (data I/O stays on the mapped "
                     "device, so multipath failover still covers it)\n",
-                    bdev->bd_disk->disk_name, e->name);
+                    bdev->bd_disk->disk_name, e->name, cetrafs_dmpath_rank_name[rank]);
             return 0;
         }
         /* Not a SCSI 1:1 path (-ENXIO: another layer, another size;
@@ -796,12 +882,43 @@ retry:
          * SCSI layer has given up on; a path that fails commands while
          * still reading "online" is caught instead by
          * cetrafs_dmpath_failed(), driven by the error itself. */
-        if (scsi_device_online(slot->sdev)) {
+        /* And a path the array has since moved to a worse ALUA state (a
+         * controller failover made it standby) is re-resolved too: the
+         * active one is where the swap belongs, not a refusal and a
+         * rotation away. Only when worse than when it was chosen -- the
+         * best there was is kept, whatever its rank. */
+        u8 now = scsi_device_online(slot->sdev) ? cetrafs_dmpath_rank(slot->sdev) : U8_MAX;
+        unsigned int up = READ_ONCE(cetrafs_dmpath_upgrade_secs);
+
+        /* A path that is not optimised -- the best there was, or where a
+         * failure on the optimised one sent us -- is looked past again
+         * now and then: after a failback the optimised port is back, and
+         * nothing else would ever return to it. */
+        if (now != U8_MAX && now && up && time_after(jiffies, slot->resolved_at + (unsigned long) up * HZ)) {
+            slot->resolved_at = jiffies;
+            mutex_unlock(&cetrafs_dmpath_mutex);
+            if (cetrafs_dmpath_better_exists(bdev, now)) {
+                mutex_lock(&cetrafs_dmpath_mutex);
+                if (slot->dm_dev == bdev->bd_dev && slot->sdev && !slot->resolving) {
+                    pr_info("dm path: %s is %s and a better path is up -- re-resolving a path for CAW\n",
+                            slot->name, cetrafs_dmpath_rank_name[min_t(u8, now, 3)]);
+                    slot->avoid = 0;
+                    cetrafs_dmpath_drop_refs(slot);
+                }
+                mutex_unlock(&cetrafs_dmpath_mutex);
+            }
+            goto retry;
+        }
+        if (now <= slot->rank) {
             if (scsi_device_get(slot->sdev) == 0)
                 sdev = slot->sdev;
             goto out;
         }
-        pr_warn("dm path: %s went offline -- re-resolving a path for CAW\n", slot->name);
+        if (now != U8_MAX)
+            pr_warn("dm path: %s is now %s -- re-resolving a path for CAW\n", slot->name,
+                    cetrafs_dmpath_rank_name[cetrafs_dmpath_rank(slot->sdev)]);
+        else
+            pr_warn("dm path: %s went offline -- re-resolving a path for CAW\n", slot->name);
         slot->avoid = slot->path_dev;
         cetrafs_dmpath_drop_refs(slot);
     }
