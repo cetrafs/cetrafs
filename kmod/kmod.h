@@ -1453,7 +1453,7 @@ u64 cetrafs_free_bmap_lookup_count(void);
 /* Stage a record update for the namespace lock's release to publish --
  * see lock.c. Only for an inode in the lock set, and only for the
  * operation's last update to that record. */
-void cetrafs_inode_stage_record(struct inode *inode, const cetrafs_inode_t *rec, bool fd_too);
+void cetrafs_inode_stage_record(struct inode *inode, const cetrafs_inode_t *rec, bool fd_too, u32 read_nlink);
 u32 cetrafs_inode_staged_nlink_base(struct inode *inode);
 void cetrafs_inode_drop_staged_record(struct inode *inode);
 bool cetrafs_inode_take_staged_record(struct inode *inode, cetrafs_inode_t *out, bool *out_fd_too);

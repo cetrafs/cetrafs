@@ -1086,6 +1086,16 @@ void cetrafs_inode_set_dirent_seq_cached(struct inode *inode, u64 seq)
     CETRAFS_I(inode)->dirent_seq_cached = seq;
 }
 
+/* TEST ONLY: stage_record takes its nlink base from a second, fresh read
+ * of the record, failing the next N of them (the old behaviour; the
+ * negative control of tests/kernel/ns_stage_base_read.sh). */
+static bool cetrafs_ns_stage_base_reread;
+cetrafs_test_param(ns_stage_base_reread, cetrafs_ns_stage_base_reread, bool, 0644);
+MODULE_PARM_DESC(ns_stage_base_reread, "TEST ONLY: take a staged nlink's base from a second read (the old behaviour)");
+static unsigned int cetrafs_ns_stage_base_read_fail;
+cetrafs_test_param(ns_stage_base_read_fail, cetrafs_ns_stage_base_read_fail, uint, 0644);
+MODULE_PARM_DESC(ns_stage_base_read_fail, "TEST ONLY: with ns_stage_base_reread, fail the next N of those reads");
+
 /* Test-only: make note_local_file_seq a no-op, simulating a publish
  * path that stamps but forgets to record what it stamped -- which is
  * exactly the bug that shipped (cetrafs_write_vfs_inode did not record
@@ -1139,28 +1149,47 @@ u64 cetrafs_inode_local_file_seq(struct inode *inode)
  * wants. The copy is also pushed into the buffer cache unsynced so a
  * read later in the same operation sees it; it is the staged copy, not
  * the cached block, that the release publishes.
+ *
+ * read_nlink is the nlink of the record the caller changed, as it read
+ * it: rec->nlink - read_nlink is THIS operation's change. nlink is an
+ * accumulator mutated by every node that names this inode, so the
+ * release does not publish the staged value: it re-reads the device in
+ * its swap and applies (staged - base) to whatever it finds there, and
+ * a peer's change made meanwhile survives.
+ *
+ * The base used to be a second, fresh read made here. A failure of that
+ * read set base = staged -- a delta of zero, the unlink's decrement a
+ * silent no-op and the file left live with no name -- and a peer's
+ * change landing between the caller's read and this one was reverted:
+ * the delta was taken against a value the change was not computed from
+ * (audit 2026-11-15 BM N-70). The caller's own read is the one the
+ * change is relative to, and costs nothing.
+ *
+ * A second stage in one operation adds its change to the first's: the
+ * base moves so that (staged - base) is the sum, whether the caller read
+ * the staged image (read_nlink = the first staged value) or the device.
  */
-void cetrafs_inode_stage_record(struct inode *inode, const cetrafs_inode_t *rec, bool fd_too)
+void cetrafs_inode_stage_record(struct inode *inode, const cetrafs_inode_t *rec, bool fd_too, u32 read_nlink)
 {
     struct cetrafs_inode_info *ci = CETRAFS_I(inode);
-    cetrafs_inode_t base;
+    long total = (long) cetrafs_le32(rec->nlink) - (long) read_nlink;
 
+    if (ci->ns_staged)
+        total += (long) cetrafs_le32(ci->ns_record.nlink) - (long) ci->ns_nlink_base;
+    if (READ_ONCE(cetrafs_ns_stage_base_reread)) {
+        /* TEST ONLY: the old second read (the suite's control) */
+        cetrafs_inode_t base;
+        int rret = -EIO;
+
+        cetrafs_invalidate_raw_inode(inode->i_sb, inode->i_ino);
+        if (READ_ONCE(cetrafs_ns_stage_base_read_fail))
+            WRITE_ONCE(cetrafs_ns_stage_base_read_fail, cetrafs_ns_stage_base_read_fail - 1);
+        else
+            rret = cetrafs_read_raw_inode(inode->i_sb, inode->i_ino, &base);
+        total = (long) cetrafs_le32(rec->nlink) - (rret ? (long) cetrafs_le32(rec->nlink) : (long) cetrafs_le32(base.nlink));
+    }
     memcpy(&ci->ns_record, rec, sizeof(ci->ns_record));
-    /* Snapshot the device's CURRENT nlink as the base for this staged
-     * change. nlink is an accumulator mutated by every node that names
-     * this inode; publishing the staged value wholesale reverts a
-     * peer's change made since this operation read the record. The
-     * namespace-lock CAS at release re-reads the device and applies
-     * (staged_nlink - base) to whatever it then finds, so a concurrent
-     * delta from another node survives. Read here, under the lock this
-     * operation holds, so the base is the value the staged delta is
-     * actually relative to. A read failure leaves base == staged, i.e.
-     * the old wholesale behaviour for that one publish. */
-    cetrafs_invalidate_raw_inode(inode->i_sb, inode->i_ino);
-    if (cetrafs_read_raw_inode(inode->i_sb, inode->i_ino, &base) == 0)
-        ci->ns_nlink_base = cetrafs_le32(base.nlink);
-    else
-        ci->ns_nlink_base = cetrafs_le32(rec->nlink);
+    ci->ns_nlink_base = (u32) ((long) cetrafs_le32(rec->nlink) - total);
     ci->ns_staged = true;
     ci->ns_staged_fd = fd_too;
 }

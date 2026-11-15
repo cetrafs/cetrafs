@@ -1048,6 +1048,7 @@ static int cetrafs_dir_scan_for_slot(struct inode *dir,
 
 int cetrafs_dir_add_entry(struct inode *dir, const struct qstr *name, u64 ino, u8 file_type)
 {
+    u32 read_nlink;
     struct cetrafs_dir_extents dx;
     cetrafs_inode_t raw;
     struct buffer_head *bh = NULL;
@@ -1248,6 +1249,7 @@ int cetrafs_dir_add_entry(struct inode *dir, const struct qstr *name, u64 ino, u
     raw.dirent_seq = cetrafs_cpu_to_le64(cetrafs_dirent_seq_new(dir->i_sb)); /* this directory's blocks just changed -- see cetrafs_dirent_read() */
     raw.mtime = cetrafs_cpu_to_le64((u64) now);
     raw.ctime = cetrafs_cpu_to_le64((u64) now);
+    read_nlink = cetrafs_le32(raw.nlink);
     if (file_type == CETRAFS_FT_DIR)
         raw.nlink = cetrafs_cpu_to_le32(cetrafs_le32(raw.nlink) + 1);
 
@@ -1255,7 +1257,7 @@ int cetrafs_dir_add_entry(struct inode *dir, const struct qstr *name, u64 ino, u
      * compare-and-swap of this very record, so it can publish these
      * fields in the swap it was going to make anyway -- one device
      * round trip instead of two. See cetrafs_inode_stage_record(). */
-    cetrafs_inode_stage_record(dir, &raw, /*fd_too=*/true);
+    cetrafs_inode_stage_record(dir, &raw, /*fd_too=*/true, read_nlink);
 
     /* Our own mutation, and this pass IS entitled to claim the cache --
      * for the reason the claim rule actually requires, which is that
@@ -1301,6 +1303,7 @@ MODULE_PARM_DESC(remove_expect_off, "TEST ONLY: a dirent remove does not check i
 int cetrafs_dir_remove_entry(struct inode *dir, const struct qstr *name, u64 expect_ino, u64 *out_ino,
                              u8 *out_file_type)
 {
+    u32 read_nlink;
     unsigned int dirents_per_block = CETRAFS_DIRENTS_PER_BLOCK;
     struct cetrafs_dir_extents dx;
     cetrafs_inode_t raw;
@@ -1415,12 +1418,13 @@ int cetrafs_dir_remove_entry(struct inode *dir, const struct qstr *name, u64 exp
     raw.dirent_seq = cetrafs_cpu_to_le64(cetrafs_dirent_seq_new(dir->i_sb)); /* this directory's blocks just changed -- see cetrafs_dirent_read() */
     raw.mtime = cetrafs_cpu_to_le64((u64) now);
     raw.ctime = cetrafs_cpu_to_le64((u64) now);
+    read_nlink = cetrafs_le32(raw.nlink);
     if (*out_file_type == CETRAFS_FT_DIR)
         raw.nlink = cetrafs_cpu_to_le32(cetrafs_le32(raw.nlink) - 1);
 
     /* Staged for the namespace lock's release -- see
      * cetrafs_dir_add_entry(). */
-    cetrafs_inode_stage_record(dir, &raw, /*fd_too=*/true);
+    cetrafs_inode_stage_record(dir, &raw, /*fd_too=*/true, read_nlink);
 
     /*
      * Deliberately NOT claiming the dirent cache here.
@@ -3111,6 +3115,7 @@ static void cetrafs_ns_apply_delta(cetrafs_inode_t *rec, void *arg)
 
 static int cetrafs_unlink_locked(struct inode *dir, struct dentry *dentry)
 {
+    u32 read_nlink;
     struct inode *inode = d_inode(dentry);
     cetrafs_inode_t raw;
     u64 ino;
@@ -3187,6 +3192,7 @@ static int cetrafs_unlink_locked(struct inode *dir, struct dentry *dentry)
      * the parent's record, never the victim's.
      */
 
+    read_nlink = cetrafs_le32(raw.nlink);
     if (cetrafs_le32(raw.nlink) > 0)
         raw.nlink = cetrafs_cpu_to_le32(cetrafs_le32(raw.nlink) - 1);
     /* POSIX: removing a link updates the inode's ctime. This was set on
@@ -3200,7 +3206,7 @@ static int cetrafs_unlink_locked(struct inode *dir, struct dentry *dentry)
      * moment.
      *
      * Staged for the namespace lock's release. */
-    cetrafs_inode_stage_record(inode, &raw, /*fd_too=*/false);
+    cetrafs_inode_stage_record(inode, &raw, /*fd_too=*/false, read_nlink);
 
     /* Sync the in-core link count to the ABSOLUTE value just computed
      * from the forced-fresh on-disk read -- not a relative drop_nlink()
@@ -3274,6 +3280,7 @@ static int cetrafs_rmdir_read_victim(struct super_block *sb, u64 ino, cetrafs_in
 
 static int cetrafs_rmdir_locked(struct inode *dir, struct dentry *dentry)
 {
+    u32 read_nlink;
     struct inode *inode = d_inode(dentry);
     struct cetrafs_dir_nondot_ctx ctx = {.found = 0};
     cetrafs_inode_t raw;
@@ -3315,8 +3322,9 @@ static int cetrafs_rmdir_locked(struct inode *dir, struct dentry *dentry)
      * actual VFS eviction, not this point. Staged for the namespace
      * lock's release (the entry named the locked inode:
      * cetrafs_dir_remove_entry() refuses any other). */
+    read_nlink = cetrafs_le32(raw.nlink);
     raw.nlink = cetrafs_cpu_to_le32(0);
-    cetrafs_inode_stage_record(inode, &raw, /*fd_too=*/false);
+    cetrafs_inode_stage_record(inode, &raw, /*fd_too=*/false, read_nlink);
 
     clear_nlink(inode);
     inode_set_ctime(inode, ktime_get_real_seconds(), 0);
