@@ -594,7 +594,10 @@ static int cetrafs_write_locked_bh(struct buffer_head *bh)
     }
     bio = bio_alloc(bh->b_bdev, 1, REQ_OP_WRITE | REQ_SYNC | REQ_META, GFP_NOIO);
     bio->bi_iter.bi_sector = bh->b_blocknr * (bh->b_size >> 9);
-    __bio_add_page(bio, bh->b_page, bh->b_size, bh_offset(bh));
+    /* The folio and the offset in it, as submit_bh() builds its bio: a
+     * block device cache in large folios puts b_data past b_page's first
+     * page, where the page form pointed at the wrong one. */
+    bio_add_folio_nofail(bio, bh->b_folio, bh->b_size, offset_in_folio(bh->b_folio, bh->b_data));
     ret = submit_bio_wait(bio);
     bio_put(bio);
 done:
