@@ -462,6 +462,78 @@ static unsigned long long cetrafs_evict_drop_nlink_ino;
 cetrafs_test_param(evict_drop_nlink_ino, cetrafs_evict_drop_nlink_ino, ullong, 0644);
 MODULE_PARM_DESC(evict_drop_nlink_ino, "TEST ONLY: evict this inode number with its in-core link count dropped to 0");
 
+/* Evicts that found the record changed between verdict and claim
+ * (procfs evict_rereads_changed). */
+static atomic64_t cetrafs_evict_rereads_changed = ATOMIC64_INIT(0);
+
+u64 cetrafs_evict_rereads_changed_count(void)
+{
+    return (u64) atomic64_read(&cetrafs_evict_rereads_changed);
+}
+
+/* TEST ONLY: free what the pre-claim read named (the old behaviour;
+ * tests/kernel/evict_claim_reread.sh's negative control). */
+static bool cetrafs_evict_claim_no_reread;
+cetrafs_test_param(evict_claim_no_reread, cetrafs_evict_claim_no_reread, bool, 0644);
+MODULE_PARM_DESC(evict_claim_no_reread, "TEST ONLY: evict frees what its pre-claim read named");
+
+/*
+ * Under evict's claim, read the record once more and make 'raw' and 'ex'
+ * what it names. Unchanged since the verdict (file_seq, xattr pointer
+ * and stamp): nothing to do -- the shadow folded into 'raw' stays. A
+ * file sector a peer published since: the extent list is fetched again
+ * from this read, and the shadow's extents, published by nobody, leak to
+ * the block scrub (the safe direction). Not dead or not ours any more,
+ * or unreadable: an error, and the caller frees nothing.
+ */
+static int cetrafs_evict_reread_claimed(struct inode *inode, cetrafs_inode_t *raw, u64 verdict_file_seq,
+                                        struct cetrafs_inode_extents *ex)
+{
+    struct super_block *sb = inode->i_sb;
+    cetrafs_inode_t now;
+    bool fd_moved;
+    int ret;
+
+    cetrafs_invalidate_raw_inode(sb, inode->i_ino);
+    ret = cetrafs_read_raw_inode(sb, inode->i_ino, &now);
+    if (ret) {
+        pr_err("evict_inode: ino=%llu: the claimed record cannot be read (%d) -- freeing nothing\n",
+               (unsigned long long) inode->i_ino, ret);
+        return ret;
+    }
+    if (cetrafs_le64(now.generation) != cetrafs_inode_get_generation(inode) || cetrafs_le32(now.nlink) != 0) {
+        pr_warn("evict_inode: ino=%llu is not the dead record it judged under its claim -- freeing nothing\n",
+                (unsigned long long) inode->i_ino);
+        return -ESTALE;
+    }
+    fd_moved = cetrafs_le64(now.file_seq) != verdict_file_seq;
+    if (!fd_moved && now.xattr_block == raw->xattr_block && now.xattr_seq == raw->xattr_seq)
+        return 0;
+    pr_warn("evict_inode: ino=%llu was changed after the verdict (%s%s) -- freeing what the record names now\n",
+            (unsigned long long) inode->i_ino, fd_moved ? "extents" : "",
+            now.xattr_seq != raw->xattr_seq || now.xattr_block != raw->xattr_block ? (fd_moved ? ", xattr" : "xattr")
+                                                                                     : "");
+    atomic64_inc(&cetrafs_evict_rereads_changed);
+    if (fd_moved) {
+        struct cetrafs_inode_extents ex2;
+
+        cetrafs_lock_expire_verdicts(inode);
+        ret = cetrafs_inode_extents_get(inode, &now, &ex2);
+        if (ret) {
+            pr_err("evict_inode: ino=%llu: its new extent tree cannot be read (%d) -- freeing nothing\n",
+                   (unsigned long long) inode->i_ino, ret);
+            return ret;
+        }
+        cetrafs_inode_extents_put(ex);
+        *ex = ex2;
+        *raw = now;
+    } else {
+        raw->xattr_block = now.xattr_block;
+        raw->xattr_seq = now.xattr_seq;
+    }
+    return 0;
+}
+
 static void cetrafs_evict_inode(struct inode *inode)
 {
     struct super_block *sb = inode->i_sb;
@@ -497,6 +569,7 @@ static void cetrafs_evict_inode(struct inode *inode)
     }
     if (!inode->i_nlink) {
         cetrafs_inode_t raw;
+        u64 verdict_file_seq;
         u32 my_node_id = CETRAFS_NODE_ID_NONE;
         int ret;
 
@@ -504,6 +577,7 @@ static void cetrafs_evict_inode(struct inode *inode)
          * from this node's cache. */
         cetrafs_invalidate_raw_inode(sb, inode->i_ino);
         ret = cetrafs_read_raw_inode(sb, inode->i_ino, &raw);
+        verdict_file_seq = ret ? 0 : cetrafs_le64(raw.file_seq);
         /* v0x0005: the device's file sector can lag this node's own
          * hot-path shadow -- blocks allocated into shadow-only extents
          * would be missed by the frees below and leaked. Fold (claim)
@@ -742,6 +816,25 @@ static void cetrafs_evict_inode(struct inode *inode)
                        (unsigned long long) inode->i_ino);
                 cetrafs_free_inode_abort(sb, inode->i_ino, cetrafs_inode_get_generation(inode), fseq);
                 fret = 1;
+            }
+            /*
+             * What the frees below use -- the extent list and the xattr
+             * pointer -- was read before the claim, and the claim does not
+             * bind them: it compares the namespace stamp, which a peer's
+             * namespace-locked truncate, setxattr or removexattr on this
+             * dead record does not move. Such a peer frees what it took
+             * off the record, and the frees below then freed it a second
+             * time -- a live block once it was reallocated (audit
+             * 2026-11-15 BM N-69). The claim stops any further change, so
+             * the record read now is final: free what it names.
+             */
+            if (fret == 0 && !READ_ONCE(cetrafs_evict_claim_no_reread)) {
+                int rr = cetrafs_evict_reread_claimed(inode, &raw, verdict_file_seq, &ex);
+
+                if (rr) {
+                    cetrafs_free_inode_abort(sb, inode->i_ino, cetrafs_inode_get_generation(inode), fseq);
+                    fret = rr;
+                }
             }
             if (fret == 0) {
                 int nret;
