@@ -821,6 +821,9 @@ void cetrafs_tree_invalidate_cached(struct inode *inode, const cetrafs_inode_t *
 int cetrafs_tree_flatten(struct inode *inode, const cetrafs_inode_t *raw, cetrafs_extent_t **out_arr, u32 *out_n);
 int cetrafs_tree_build(struct inode *inode, const cetrafs_extent_t *flat, u32 n, cetrafs_inode_t *raw, u64 *out_meta);
 void cetrafs_tree_free_meta(struct inode *inode, const cetrafs_inode_t *raw);
+void cetrafs_tree_free_meta_except(struct inode *inode, const cetrafs_inode_t *raw, const cetrafs_inode_t *keep);
+u64 cetrafs_tree_patch_count(void);
+u64 cetrafs_tree_patch_write_count(void);
 u32 cetrafs_tree_extent_count(struct inode *inode, const cetrafs_inode_t *raw);
 u32 cetrafs_tree_extent_count_for(struct inode *inode, const cetrafs_inode_t *raw, bool reader);
 u64 cetrafs_flat_data_blocks(const cetrafs_extent_t *flat, u32 n);

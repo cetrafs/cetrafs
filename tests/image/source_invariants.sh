@@ -1202,6 +1202,8 @@ file.c:cetrafs_tree_flatten_for via-cetrafs_inode_extents_get_for,-or-defrag-und
 file.c:cetrafs_tree_extent_count_for do_allocate-exclusive;-close-after-the-last-writer;-the-defrag-worker-heuristic-only
 file.c:cetrafs_tree_last_contig_lba a-placement-hint,-under-invalidate_lock-exclusive
 file.c:cetrafs_tree_free_meta the-old-tree,-after-its-publish-and-under-invalidate_lock-exclusive
+file.c:cetrafs_tree_patch the-editor,-under-invalidate_lock-exclusive-(asserted);-what-it-writes-new-blocks
+file.c:cetrafs_tree_meta_set via-cetrafs_tree_free_meta_except,-whose-callers-hold-invalidate_lock-exclusive
 file.c:cetrafs_tree_meta_is_ours the-old-tree,-under-invalidate_lock-exclusive
 file.c:cetrafs_tree_invalidate_cached drop-only;-an-entry-torn-by-a-local-edit-names-a-block-current-in-the-cache
 xattr.c:cetrafs_xattr_set_locked the-editor,-under-the-namespace-lock-and-the-VFS-inode-lock
@@ -1532,7 +1534,10 @@ CALLS="$(grep -c 'cetrafs_dmpath_resolve(bdev' "$K/dmpath.c" || true)"
 # KV_OUT names those functions; the check below refuses a new one that
 # returns kv memory through an out-parameter without being listed.
 log "checking nothing kv/vmalloc-allocated is freed with kfree() (N3)"
-KV_OUT='cetrafs_tree_flatten|cetrafs_tree_flatten_for|cetrafs_inode_sorted_runs'
+KV_OUT='cetrafs_tree_flatten|cetrafs_tree_flatten_for|cetrafs_inode_sorted_runs|cetrafs_tree_meta_set'
+# Not kv out-parameters, though the scan below reads them so: their
+# out-parameter is a count, and their kv memory is freed inside.
+KV_OUT_NOT='cetrafs_tree_patch'
 kv_kfree() { # <files>... -- prints file:line of a kfree() of kv memory
     awk -v kvout="$KV_OUT" '
         BEGIN { n = split(kvout, f, "|"); for (i = 1; i <= n; i++) out[f[i]] = 1 }
@@ -1568,7 +1573,7 @@ UNLISTED="$(awk '
     /^[a-z].*\(/ && !/;[[:space:]]*$/ { fn = $0; sub(/\(.*/, "", fn); sub(/.*[ *]/, "", fn); kvfn = 0 }
     /(kvmalloc|kvzalloc|kvcalloc|kvrealloc|vmalloc|vzalloc)\(/ { kvfn = 1 }
     kvfn && /^[[:space:]]*\*[a-z_]+[[:space:]]*=[[:space:]]*[a-z_]+;/ { print fn }' "$K"/*.c | sort -u |
-    grep -vxE "$KV_OUT" || true)"
+    grep -vxE "$KV_OUT|$KV_OUT_NOT" || true)"
 [ -z "$UNLISTED" ] && pass "allocator family: every function handing out kv memory by out-parameter is listed ($KV_OUT)" ||
     fail "allocator family: these hand out kv memory by out-parameter and are not in KV_OUT: $(echo $UNLISTED)"
 # Negative control: the check must catch the shape it exists for.
@@ -2274,6 +2279,7 @@ cetrafs_free_leaf_array prim:of-free_inline_extents
 cetrafs_leaf_array_punch prim:fallocate-s-punch
 cetrafs_leaf_array_trim prim:truncate-s
 cetrafs_tree_free_meta prim:its-callers-are-listed
+cetrafs_tree_free_meta_except prim:its-callers-are-listed
 cetrafs_alloc_data_run_resv own:a-run-it-just-took-back-on-failure
 cetrafs_trim_claim_next own:undoes-its-own-claim
 cetrafs_trim_release own:gives-back-its-own-claim
@@ -2284,6 +2290,7 @@ __cetrafs_get_block own:a-block-never-published
 cetrafs_tree_append own:a-leaf-or-index-never-published
 cetrafs_tree_split_leaf own:a-new-leaf-whose-write-failed-before-any-interior-names-it
 cetrafs_tree_build own:a-tree-never-published
+cetrafs_tree_patch own:leaves-and-interiors-it-wrote-and-never-published
 cetrafs_inode_set_reservation own:a-reservation-run-never-published
 cetrafs_inode_drop_reservation own:the-unused-rest-of-a-reservation-run
 cetrafs_tree_resv_release own:the-unused-tree-block-reserve-of-a-convert-never-published
@@ -2296,7 +2303,7 @@ cetrafs_defrag_inode held:the-defrag-pin-on-the-whole-file-lock
 cetrafs_defrag_commit held:inside-cetrafs_defrag_inode-s-pin
 cetrafs_apply_pending_free queued:the-owner-applying-a-published-free
 cetrafs_zg_drain_one queued:drains-the-owner-s-queue'
-C14D_PRIMS='cetrafs_free_data_block cetrafs_free_data_extent cetrafs_free_data_extent_batched cetrafs_free_data_extent_unless_reserved cetrafs_apply_pending_free cetrafs_bitmap_free_bit cetrafs_bitmap_flip_range cetrafs_free_fetched_extents cetrafs_free_inline_extents cetrafs_free_leaf_array cetrafs_tree_free_meta cetrafs_leaf_array_punch cetrafs_leaf_array_trim'
+C14D_PRIMS='cetrafs_free_data_block cetrafs_free_data_extent cetrafs_free_data_extent_batched cetrafs_free_data_extent_unless_reserved cetrafs_apply_pending_free cetrafs_bitmap_free_bit cetrafs_bitmap_flip_range cetrafs_free_fetched_extents cetrafs_free_inline_extents cetrafs_free_leaf_array cetrafs_tree_free_meta cetrafs_tree_free_meta_except cetrafs_leaf_array_punch cetrafs_leaf_array_trim'
 c14d_freers() { # <files...>: every function calling a free primitive (any name, not just cetrafs_*)
     local p
     for p in $C14D_PRIMS; do
@@ -2513,6 +2520,7 @@ file.c:cetrafs_free_leaf_array:primitive
 file.c:cetrafs_leaf_array_punch:primitive -- its do_free callers are checked
 file.c:cetrafs_leaf_array_trim:primitive -- its do_free callers are checked
 file.c:cetrafs_tree_free_meta:primitive -- its callers are checked
+file.c:cetrafs_tree_free_meta_except:primitive -- its callers are checked
 defrag.c:cetrafs_defrag_commit:inside its only caller'"'"'s bracket (cetrafs_defrag_inode)
 super_ops.c:cetrafs_evict_inode:the claimed dead record names every block until forget_tree (H1)
 scrub.c:scrub_free_confirmed:the judge itself
@@ -2522,6 +2530,7 @@ file.c:__cetrafs_get_block:a block it allocated and never published
 file.c:cetrafs_tree_append:a leaf or index it allocated and never published
 file.c:cetrafs_tree_split_leaf:a new leaf whose write failed, before any interior names it
 file.c:cetrafs_tree_build:a tree it built and never published
+file.c:cetrafs_tree_patch:leaves and interiors it wrote and never published
 dir.c:cetrafs_mkdir_locked:a dirent block it allocated and never published
 lock.c:cetrafs_inode_set_reservation:a reservation run, never published
 lock.c:cetrafs_inode_drop_reservation:the unused rest of a reservation run, never published
@@ -2530,7 +2539,7 @@ free_callers() {
     for f in "$@"; do
         awk -v F="$(basename "$f")" '
             /^[a-z_][a-z0-9_ *]*\(/ && !/;$/ { if (fn != "" && hit && !beg) print F ":" fn; fn = $0; sub(/\(.*/, "", fn); n = split(fn, a, " "); fn = a[n]; sub(/^\*+/, "", fn); hit = 0; beg = 0 }
-            /(cetrafs_free_data_block|cetrafs_free_data_extent|cetrafs_free_data_extent_batched|cetrafs_free_data_extent_unless_reserved|cetrafs_tree_free_meta|cetrafs_free_fetched_extents|cetrafs_free_leaf_array|cetrafs_free_inline_extents|cetrafs_leaf_array_trim|cetrafs_leaf_array_punch)\(/ && !/^[a-z_]/ && !/^[[:space:]]*\*/ && !/^[[:space:]]*\/\*/ { hit = 1 }
+            /(cetrafs_free_data_block|cetrafs_free_data_extent|cetrafs_free_data_extent_batched|cetrafs_free_data_extent_unless_reserved|cetrafs_tree_free_meta|cetrafs_tree_free_meta_except|cetrafs_free_fetched_extents|cetrafs_free_leaf_array|cetrafs_free_inline_extents|cetrafs_leaf_array_trim|cetrafs_leaf_array_punch)\(/ && !/^[a-z_]/ && !/^[[:space:]]*\*/ && !/^[[:space:]]*\/\*/ { hit = 1 }
             /cetrafs_frees_begin\(/ && !/^[a-z_]/ { beg = 1 }
             END { if (fn != "" && hit && !beg) print F ":" fn }' "$f"
     done | sort -u
@@ -2550,7 +2559,7 @@ post_publish_frees() {
             /^[[:space:]]*\*/ || /^[[:space:]]*\/\*/ { next }
             /cetrafs_frees_begin\(/ && !/^[a-z_]/ { beg = 1 }
             /cetrafs_write_raw_inode[a-z_]*\(|cetrafs_write_vfs_inode\(/ && !/^[a-z_]/ { pub = 1 }
-            /(cetrafs_free_data_block|cetrafs_free_data_extent|cetrafs_free_data_extent_batched|cetrafs_tree_free_meta|cetrafs_free_leaf_array|cetrafs_free_inline_extents|cetrafs_leaf_array_trim|cetrafs_leaf_array_punch)\(/ && !/^[a-z_]/ && pub && !beg { print F ":" fn ":" FNR }' "$f"
+            /(cetrafs_free_data_block|cetrafs_free_data_extent|cetrafs_free_data_extent_batched|cetrafs_tree_free_meta|cetrafs_tree_free_meta_except|cetrafs_free_leaf_array|cetrafs_free_inline_extents|cetrafs_leaf_array_trim|cetrafs_leaf_array_punch)\(/ && !/^[a-z_]/ && pub && !beg { print F ":" fn ":" FNR }' "$f"
     done
 }
 # function:count:what covers them -- the count pins the sites, so a new
@@ -2737,6 +2746,8 @@ cetrafs_tree_free_meta frees:the-trees-own-blocks
 cetrafs_tree_insert_any_leaf writes:the-tree
 cetrafs_tree_last_contig_lba writes:the-allocation-goal-of-a-write
 cetrafs_tree_meta_is_ours frees:decides-a-free
+cetrafs_tree_meta_set frees:decides-which-old-tree-blocks-go
+cetrafs_tree_patch writes:the-tree
 cetrafs_tree_split_leaf writes:the-tree
 __cetrafs_truncate_shrink frees:what-truncate-cuts
 cetrafs_zero_range_inplace writes:zeroes-and-converts-by-it'
