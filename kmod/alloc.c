@@ -4997,9 +4997,9 @@ release:
         cetrafs_sb_set_bg_discard_pending(sb, b, false); /* the swap cleared the flag */
 
     cetrafs_bg_release_drop_bitmap(sb, b);
-    /* Not ours any more: a failed drop is the next claimant's to make
-     * (cetrafs_bg_claim_free() and the Zone Group claim refuse a group
-     * whose drop fails). */
+    /* Not ours any more. The bitmap blocks were forgotten above, dirty
+     * or held, so nothing of ours goes out over the next owner's bits.
+     * The descriptor cache is dropped here; a claimant reads it fresh. */
     (void) cetrafs_bg_invalidate_cache(sb, b);
     cetrafs_sb_set_bg_owner(sb, b, CETRAFS_BG_OWNER_FREE);
     if (cetrafs_bg_release_stall_ms) {
