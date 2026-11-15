@@ -1855,6 +1855,42 @@ void cetrafs_tree_resv_release(struct inode *inode)
     }
 }
 
+/* TEST ONLY: a last close whose conversion was refused for room stops
+ * the mount, as before B-8 (tests/kernel/tree_full_convert.sh, buf). */
+static bool cetrafs_close_nospc_stops;
+cetrafs_test_param(close_nospc_stops, cetrafs_close_nospc_stops, bool, 0644);
+MODULE_PARM_DESC(close_nospc_stops, "TEST ONLY: a last close refused ENOSPC converting buffered blocks stops the mount");
+
+static atomic64_t cetrafs_close_nospc_drops = ATOMIC64_INIT(0);
+
+u64 cetrafs_close_nospc_drop_count(void)
+{
+    return (u64) atomic64_read(&cetrafs_close_nospc_drops);
+}
+
+/* Drop the pending set and the page cache over its span: the blocks read
+ * as zeros from the device, and a cached copy of the refused data must
+ * not keep answering on this node alone. Under invalidate_lock, so no
+ * fault maps a page back in between. */
+static void cetrafs_pending_forget_cached(struct inode *inode)
+{
+    struct address_space *m = inode->i_mapping;
+    unsigned int shift = PAGE_SHIFT - inode->i_blkbits;
+    u64 lo = U64_MAX, hi = 0, at = 0;
+    u32 first, last;
+
+    filemap_invalidate_lock(m);
+    while (at <= U32_MAX && !cetrafs_pending_next(inode, (u32) at, &first, &last)) {
+        lo = min_t(u64, lo, first);
+        hi = max_t(u64, hi, last);
+        at = (u64) last + 1;
+    }
+    cetrafs_pending_drop_all(inode);
+    if (lo != U64_MAX)
+        (void) invalidate_inode_pages2_range(m, (pgoff_t) (lo >> shift), (pgoff_t) (hi >> shift));
+    filemap_invalidate_unlock(m);
+}
+
 /* Forget every pending block, converting none: they keep reading as
  * zeros. For eviction and for a writeback that failed. */
 void cetrafs_pending_drop_all(struct inode *inode)
@@ -3497,7 +3533,26 @@ static void __cetrafs_lock_release(struct inode *inode, const struct cetrafs_clo
                     break;
                 msleep(200);
             }
-            if (cetrafs_pending_any(inode) || cetrafs_conv_unflushed(inode)) {
+            if (cret == -ENOSPC && cetrafs_pending_any(inode) && !cetrafs_conv_unflushed(inode) &&
+                !READ_ONCE(cetrafs_close_nospc_stops)) {
+                /* Refused for room: the tree took no new extent (its
+                 * ceiling, or no block for a new tree block) and a
+                 * refused convert edits nothing (cetrafs_tree_append_room(),
+                 * cetrafs_tree_resv_fill()) -- the blocks are still
+                 * preallocated and read as zeros on every node, and the
+                 * application was told ENOSPC by this close's ->flush and
+                 * by any fsync before it. That is a write that failed,
+                 * not a node that no longer knows the device: it stopped
+                 * the mount, every guest on the node with it (audit
+                 * 2026-11-14 B-8). The set goes, and this node's cache of
+                 * those blocks with it, so it reads what its peers do. */
+                cetrafs_pending_forget_cached(inode);
+                atomic64_inc(&cetrafs_close_nospc_drops);
+                pr_warn("%s: ino=%llu: buffered writes into preallocated space could not be marked written at "
+                        "the last close (no room in the extent tree or the volume): they were refused with "
+                        "ENOSPC and read as zeros\n",
+                        inode->i_sb->s_id, (unsigned long long) inode->i_ino);
+            } else if (cetrafs_pending_any(inode) || cetrafs_conv_unflushed(inode)) {
                 cetrafs_sb_fatal(inode->i_sb,
                                  "ino=%llu: buffered blocks could not be marked written and flushed at the last close (%d)",
                                  (unsigned long long) inode->i_ino, cret);
