@@ -257,8 +257,8 @@ static int cetrafs_statfs(struct dentry *dentry, struct kstatfs *stat)
 {
     struct super_block *sb = dentry->d_sb;
     const cetrafs_superblock_t *raw_sb = cetrafs_sb_raw(sb);
-    u64 total_blocks = 0, free_blocks = 0, free_inodes;
-    u32 zg_count, zg_id, *gens;
+    u64 total_blocks = 0, free_blocks = 0, avail_blocks = 0, free_inodes;
+    u32 zg_count, zg_id, *gens, me;
     bool prefetched;
     int ret;
 
@@ -295,6 +295,8 @@ static int cetrafs_statfs(struct dentry *dentry, struct kstatfs *stat)
      * writes would not move its own df until the next boundary.
      */
     zg_count = le32_to_cpu(raw_sb->zone_group_count);
+    if (cetrafs_sb_get_node_id(sb, &me))
+        me = CETRAFS_NODE_ID_NONE;
     /* One batch for every record, then each read from it: one round
      * trip per record made df cost the Zone Group count (P13). */
     /* Each record's flight generation is taken BEFORE the batch reads
@@ -330,11 +332,20 @@ static int cetrafs_statfs(struct dentry *dentry, struct kstatfs *stat)
             cond_resched();
         }
         free_blocks += zfree > 0 ? (u64) zfree : 0;
+        /* What this node can allocate: its own Zone Groups and the ones
+         * nobody owns. A live peer's free space is never taken back, so
+         * counting it in f_bavail told Proxmox placement and every
+         * alert there was room this node would answer ENOSPC to (audit
+         * 2026-11-14 A-13). It stays in f_bfree, the volume's figure. */
+        if (zi.owner_node_id == me || zi.owner_node_id == CETRAFS_NODE_ID_NONE)
+            avail_blocks += zfree > 0 ? (u64) zfree : 0;
         /* Capacity of unowned Block Groups sharded to this record: a
          * handed-back BG belongs to no ZG, so without this bucket df
          * would shrink by the group's full size at every surplus
-         * release (the cross-node suite caught exactly that). */
+         * release (the cross-node suite caught exactly that). Anyone
+         * may claim it. */
         free_blocks += zi.pool_free_blocks;
+        avail_blocks += zi.pool_free_blocks;
     }
     kfree(gens);
 
@@ -351,6 +362,8 @@ static int cetrafs_statfs(struct dentry *dentry, struct kstatfs *stat)
      * more free than exists (audit 2026-11-06 L17). */
     if (free_blocks > total_blocks)
         free_blocks = total_blocks;
+    if (me == CETRAFS_NODE_ID_NONE || avail_blocks > free_blocks)
+        avail_blocks = free_blocks;
     if ((s64) free_inodes < 0)
         free_inodes = 0;
     if (free_inodes > le32_to_cpu(raw_sb->inodes_count))
@@ -360,7 +373,7 @@ static int cetrafs_statfs(struct dentry *dentry, struct kstatfs *stat)
     stat->f_bsize = sb->s_blocksize;
     stat->f_blocks = total_blocks;
     stat->f_bfree = free_blocks;
-    stat->f_bavail = free_blocks;
+    stat->f_bavail = avail_blocks;
     stat->f_files = le32_to_cpu(raw_sb->inodes_count);
     stat->f_ffree = free_inodes;
     stat->f_namelen = CETRAFS_FILENAME_MAX;
