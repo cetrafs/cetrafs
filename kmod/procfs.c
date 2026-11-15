@@ -125,6 +125,7 @@ static int cetrafs_proc_info_show(struct seq_file *m, void *v)
     /* Damaged metadata found by this mount, every retry included; any
      * nonzero count means unmount everywhere and run fsck.cetra. */
     seq_printf(m, "corruptions: %u\n", cetrafs_sb_corruptions(sb));
+    seq_printf(m, "fence_witness_reads: %llu\n", (unsigned long long) cetrafs_sb_fence_witness_reads());
     seq_printf(m, "fallocate_alloc_calls: %ld\n", cetrafs_falloc_alloc_call_count());
     seq_printf(m, "fallocate_tree_lookups: %ld\n", cetrafs_falloc_tree_lookup_count());
     {

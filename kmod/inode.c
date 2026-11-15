@@ -2135,6 +2135,12 @@ int cetrafs_write_vfs_inode(struct inode *inode)
         }
     }
 
+    /* The publish is this boundary's commit point: the device's word on
+     * our lease first, not only the clock's (review F-8). */
+    if (cetrafs_sb_fence_witnessed_f8(sb)) {
+        ret = -EIO;
+        goto out_pub;
+    }
     ctx->me = my_node_id;
     ret = cetrafs_cas_record_fd_seeded(sb, cetrafs_inode_lba(sb, inode->i_ino),
                                        (const u8 *) &bufs[0] + CETRAFS_INODE_FD_OFF, CETRAFS_INODE_FD_LIVE,

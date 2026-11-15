@@ -600,9 +600,12 @@ struct cetrafs_sb_info {
     bool lease_active;
     unsigned long lease_until;
     unsigned long lease_lost; /* bit 0: expired, latched */
-    /* The last device witness of our own row (cetrafs_sb_fence_witnessed()),
-     * in jiffies; the mutex keeps two boundaries from reading it twice. */
-    unsigned long witness_at;
+    /* Device witnesses of our own row (cetrafs_sb_fence_witnessed()):
+     * reads started, and the latest one that completed. A count, never a
+     * clock -- the clock is what a paused node cannot trust (F-8). */
+    u64 witness_started;
+    u64 witness_done;
+    unsigned long witness_at; /* jiffies, for fence_witness_f8_off only */
     struct mutex witness_mutex;
     struct work_struct lease_work;
     bool lease_work_ready;
@@ -5678,15 +5681,12 @@ bool cetrafs_sb_ro_refuses(struct super_block *sb, const char *what)
 /* TEST ONLY: boundaries trust the local lease clock alone (B-18's control). */
 static bool cetrafs_fence_witness_off;
 cetrafs_test_param(fence_witness_off, cetrafs_fence_witness_off, bool, 0644);
-
-/* The heartbeat's own row check counts as a witness. */
-void cetrafs_sb_note_fence_witness(struct super_block *sb)
-{
-    struct cetrafs_sb_info *sbi = sb->s_fs_info;
-
-    if (sbi)
-        WRITE_ONCE(sbi->witness_at, jiffies);
-}
+static atomic64_t cetrafs_fence_witness_reads = ATOMIC64_INIT(0);
+/* TEST ONLY: as before review F-8 -- a witness under a second old by
+ * jiffies is trusted, and the journal, tree-batch and record-publish
+ * gates ask the clock alone (cetrafs_sb_fence_witnessed_f8()). */
+bool cetrafs_fence_witness_f8_off;
+cetrafs_test_param(fence_witness_f8_off, cetrafs_fence_witness_f8_off, bool, 0644);
 
 /*
  * cetrafs_sb_is_fenced(), and the device's word on it before a boundary
@@ -5695,10 +5695,14 @@ void cetrafs_sb_note_fence_witness(struct super_block *sb)
  * peer's verdict and fence_epoch bump are then invisible to every gate
  * here until the next heartbeat tick -- up to a whole beat in which the
  * boundary flush writes bitmap blocks and the discard workers UNMAP runs
- * a peer may own now (audit 2026-11-15 B-18). So a boundary whose last
- * witness is over a second old reads this node's row forced-fresh first
- * (cetrafs_node_self_fence_check()) and fences on a moved epoch. Not on
- * the per-block path: boundaries only, at most once a second.
+ * a peer may own now (audit 2026-11-15 B-18). So a boundary reads this
+ * node's row forced-fresh first (cetrafs_node_self_fence_check()) and
+ * fences on a moved epoch.
+ * Not rate-limited by time: a "last read under a second ago" judged on
+ * jiffies is the same clock, and the first second after a resume trusted
+ * it (review F-8). Callers arriving together share ONE read -- one that
+ * STARTED after they arrived; a read already under way when a caller came
+ * may predate its pause. Boundaries only, never the per-block path.
  * A read that fails is not evidence: the clock's answer stands.
  */
 bool cetrafs_sb_fence_witnessed(struct super_block *sb)
@@ -5706,26 +5710,50 @@ bool cetrafs_sb_fence_witnessed(struct super_block *sb)
     struct cetrafs_sb_info *sbi = sb->s_fs_info;
     bool fenced = false;
     u32 my_node_id;
+    u64 since;
 
     if (!sbi)
         return false;
     if (cetrafs_sb_is_fenced(sb))
         return true;
-    if (READ_ONCE(cetrafs_fence_witness_off) || !time_after(jiffies, READ_ONCE(sbi->witness_at) + HZ))
+    if (READ_ONCE(cetrafs_fence_witness_off))
         return false;
     if (cetrafs_sb_get_node_id(sb, &my_node_id))
         return false;
+    if (READ_ONCE(cetrafs_fence_witness_f8_off) && sbi->witness_done &&
+        !time_after(jiffies, READ_ONCE(sbi->witness_at) + HZ))
+        return false; /* test-only: the old clock-judged skip */
+    since = READ_ONCE(sbi->witness_started);
     mutex_lock(&sbi->witness_mutex);
-    if (time_after(jiffies, READ_ONCE(sbi->witness_at) + HZ) &&
-        cetrafs_node_self_fence_check(sb, my_node_id, &fenced) == 0) {
-        WRITE_ONCE(sbi->witness_at, jiffies);
-        if (fenced) {
-            cetrafs_node_log_fencer(sb, my_node_id);
-            cetrafs_sb_fence(sb, "our Node Registry lease was revoked by a peer (seen at a boundary)");
+    if (sbi->witness_done <= since) {
+        u64 gen = sbi->witness_started + 1;
+
+        WRITE_ONCE(sbi->witness_started, gen);
+        atomic64_inc(&cetrafs_fence_witness_reads);
+        if (cetrafs_node_self_fence_check(sb, my_node_id, &fenced) == 0) {
+            sbi->witness_done = gen;
+            WRITE_ONCE(sbi->witness_at, jiffies);
+            if (fenced) {
+                cetrafs_node_log_fencer(sb, my_node_id);
+                cetrafs_sb_fence(sb, "our Node Registry lease was revoked by a peer (seen at a boundary)");
+            }
         }
     }
     mutex_unlock(&sbi->witness_mutex);
     return cetrafs_sb_is_fenced(sb);
+}
+
+/* The gates review F-8 added: the journal, tree batches, the record publish. */
+bool cetrafs_sb_fence_witnessed_f8(struct super_block *sb)
+{
+    if (READ_ONCE(cetrafs_fence_witness_f8_off))
+        return cetrafs_sb_is_fenced(sb);
+    return cetrafs_sb_fence_witnessed(sb);
+}
+
+u64 cetrafs_sb_fence_witness_reads(void)
+{
+    return (u64) atomic64_read(&cetrafs_fence_witness_reads);
 }
 
 bool cetrafs_sb_is_fenced(struct super_block *sb)

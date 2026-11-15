@@ -1220,7 +1220,8 @@ int cetrafs_node_self_fence_check(struct super_block *sb, u32 my_node_id, bool *
 /* fs.c: is_fenced, and the own row read fresh first at a boundary (B-18). */
 bool cetrafs_sb_fence_witnessed(struct super_block *sb);
 extern bool cetrafs_sync_regate_off; /* fs.c, TEST ONLY (B-30) */
-void cetrafs_sb_note_fence_witness(struct super_block *sb);
+u64 cetrafs_sb_fence_witness_reads(void); /* fs.c: count, for the suites */
+bool cetrafs_sb_fence_witnessed_f8(struct super_block *sb);
 void cetrafs_node_log_fencer(struct super_block *sb, u32 my_node_id);
 int cetrafs_node_get_entry(struct super_block *sb, u32 idx, cetrafs_node_entry_t *out);
 u64 cetrafs_node_row_lba(struct super_block *sb, u32 idx);

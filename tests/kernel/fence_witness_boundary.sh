@@ -8,7 +8,7 @@
 # next heartbeat tick -- up to a whole beat in which boundary flushes
 # wrote bitmap blocks and discards went out over Zone Groups a peer had
 # taken (audit 2026-11-15 B-18). A boundary with something to write now
-# reads this node's own row fresh first, at most once a second, and
+# reads this node's own row fresh first and
 # fences on a moved epoch.
 #
 # The paused clock is played by a tick that does not look:

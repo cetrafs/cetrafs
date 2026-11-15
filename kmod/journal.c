@@ -1179,7 +1179,9 @@ static int cetrafs_journal_write_block_flags(struct super_block *sb, struct buff
 {
     struct cetrafs_journal *j = cetrafs_sb_get_journal(sb);
 
-    if (cetrafs_sb_is_fenced(sb)) {
+    /* The device's word too, not only the clock's (F-8): one small read
+     * beside the three cache flushes this write costs. */
+    if (cetrafs_sb_fence_witnessed_f8(sb)) {
         /* Self-fenced: no metadata may be written at all. Abort rather
          * than end the update -- publishing a change this node is no
          * longer entitled to make is the whole thing being prevented. */
@@ -2061,7 +2063,7 @@ int cetrafs_journal_write_deferred(struct super_block *sb, struct buffer_head **
         written[i] = false;
     if (!n)
         return 0;
-    if (cetrafs_sb_is_fenced(sb))
+    if (cetrafs_sb_fence_witnessed_f8(sb)) /* the device's word, not only the clock's (F-8) */
         return -EIO;
     atomic64_inc(&cetrafs_batch_count);
 
