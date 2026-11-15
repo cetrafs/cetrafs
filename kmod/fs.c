@@ -3826,6 +3826,12 @@ bool cetrafs_sb_peer_fenced_mark(struct super_block *sb, u32 node_id, struct cet
     return valid;
 }
 
+/* TEST ONLY: unmount's flush of held-back extent-tree blocks reports
+ * -EIO after it ran (tests/kernel/umount_flush_err_kept.sh). */
+static bool cetrafs_umount_tree_flush_fail;
+cetrafs_test_param(umount_tree_flush_fail, cetrafs_umount_tree_flush_fail, bool, 0644);
+MODULE_PARM_DESC(umount_tree_flush_fail, "TEST ONLY: unmount's extent-tree flush reports -EIO");
+
 void cetrafs_free_sb_info(struct super_block *sb)
 {
     struct cetrafs_sb_info *sbi = sb->s_fs_info;
@@ -3916,18 +3922,31 @@ void cetrafs_free_sb_info(struct super_block *sb)
      * the last close, a boundary that failed -- go through the journal
      * while it is still attached. */
     r = cetrafs_deferred_flush_all(sb);
+    if (!r && READ_ONCE(cetrafs_umount_tree_flush_fail))
+        r = -EIO; /* TEST ONLY: see the knob */
     if (r) {
         pr_err("%s: unmount: deferred extent-tree blocks could not be written (%d)\n", sb->s_id, r);
         flush_err = r;
     }
     /* Park the journal flag and push the accrued free-space counters
-     * out BEFORE announcing the departure below. See the sync there. */
-    cetrafs_journal_shutdown(sb);
+     * out BEFORE announcing the departure below. See the sync there.
+     * Not over a failed tree flush: entries of ours may be all that
+     * holds those blocks, and a clean flag says there is nothing to
+     * replay (audit 2026-11-14 A-9). */
+    if (!flush_err)
+        cetrafs_journal_shutdown(sb);
+    else
+        pr_err("%s: unmount: journal left dirty for replay after the failed flush\n", sb->s_id);
     /* Allocation bits first, then the counters that summarise them --
      * the same order as sync_fs. sync_fs already ran in
      * generic_shutdown_super(), but the VFS ignores its result there, so
      * this is the only place a failure can still change anything. */
-    flush_err = cetrafs_alloc_flush_bitmaps(sb);
+    /* Kept, never overwritten: a failed tree flush above followed by a
+     * bitmap flush with nothing to do used to read as a clean departure
+     * (audit 2026-11-14 A-9; tests/kernel/umount_flush_err_kept.sh). */
+    r = cetrafs_alloc_flush_bitmaps(sb);
+    if (r && !flush_err)
+        flush_err = r;
     r = cetrafs_flush_dirty_free_counts(sb);
     if (r && !flush_err)
         flush_err = r;
