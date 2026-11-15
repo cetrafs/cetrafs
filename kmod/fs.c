@@ -3116,6 +3116,9 @@ int cetrafs_fill_super(struct super_block *sb, struct fs_context *fc)
             }
             sbi->node_registered = true;
             memcpy(sbi->node_uuid, node_uuid, CETRAFS_NODE_UUID_LEN);
+            /* The path identity a wiped block 0 cannot give (dmpath.c, B-15). */
+            cetrafs_dmpath_set_anchor(sb->s_bdev, cetrafs_node_row_lba(sb, sbi->node_id) * CETRAFS_BLOCK_SIZE,
+                                      node_uuid);
             /* The lease runs from here, not from the heartbeat's first
              * tick. Every mount phase until then -- the claim sweep, the
              * Zone Group claim and recount, the drain -- writes, and can

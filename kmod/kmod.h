@@ -621,6 +621,8 @@ struct scsi_device;
 int cetrafs_dmpath_probe(struct block_device *bdev, struct scsi_device **out);
 struct scsi_device *cetrafs_dmpath_sdev(struct block_device *bdev, bool killable);
 void cetrafs_dmpath_forget(struct block_device *bdev);
+void cetrafs_dmpath_set_anchor(struct block_device *bdev, u64 byte_off, const u8 *node_uuid);
+bool cetrafs_node_row_is(const void *blk, const u8 *uuid);
 /* Report that a path just failed a command with a TRANSPORT error, so the
  * next resolution picks a different one. Never called for a MISCOMPARE. */
 void cetrafs_dmpath_failed(struct block_device *bdev, struct scsi_device *sdev);

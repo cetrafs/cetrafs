@@ -50,6 +50,16 @@ static u32 cetrafs_node_crc(const cetrafs_node_entry_t *ne)
     return ~crc32c(~0U, &tmp, sizeof(tmp));
 }
 
+/* A registry row as read raw off the device: its checksum holds and it
+ * names 'uuid' (dmpath.c's identity anchor, audit 2026-11-15 B-15). */
+bool cetrafs_node_row_is(const void *blk, const u8 *uuid)
+{
+    const cetrafs_node_entry_t *ne = blk;
+
+    return cetrafs_node_crc(ne) == (u32) cetrafs_le64(ne->checksum) &&
+           !memcmp(ne->node_uuid, uuid, CETRAFS_NODE_UUID_LEN);
+}
+
 /*
  * Read node registry row #idx (one whole block per row as of v0x0007).
  *
