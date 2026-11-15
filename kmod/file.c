@@ -7214,7 +7214,18 @@ static int __cetrafs_get_block(struct inode *inode,
      * makes nofilelock both safe across a handoff and fast when alone.
      */
     /* A pure READ asks a different question -- may a reader trust its
-     * cache? -- answered by cetrafs_lock_read_cache_trusted(). */
+     * cache? -- answered by cetrafs_lock_read_cache_trusted(). So does a
+     * shared-lock OVERWRITE: it maps written blocks only, allocates and
+     * publishes nothing, and what a stale map could send it to is a
+     * block this file still has -- every path that frees or moves one
+     * refuses while this node is in the file (the reader's argument,
+     * cetrafs_lock_read_cache_trusted()). Asking the writer's question
+     * made it re-read the record and every tree block from the device
+     * on each call while a peer had the image open -- the whole
+     * live-migration pre-copy, twice per overwrite (audit 2026-11-15
+     * B-12). */
+    if (mode == CETRAFS_GB_OVERWRITE && !READ_ONCE(cetrafs_read_trust_writer_defers))
+        reader = true;
     if (S_ISDIR(inode->i_mode) ||
         !(reader ? cetrafs_lock_read_cache_trusted(inode) : cetrafs_lock_held_for_write_locally(inode)))
         cetrafs_invalidate_raw_inode(sb, inode->i_ino);

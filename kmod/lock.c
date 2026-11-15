@@ -4845,6 +4845,12 @@ static bool cetrafs_read_trust_off;
 cetrafs_test_param(read_trust_off, cetrafs_read_trust_off, bool, 0644);
 MODULE_PARM_DESC(read_trust_off, "TEST ONLY: readers re-read the record per block (the pre-fix behaviour)");
 
+/* TEST ONLY: with a local writer the reader's cache question gets the
+ * write lock's answer, as before audit 2026-11-15 B-12. */
+bool cetrafs_read_trust_writer_defers;
+cetrafs_test_param(read_trust_writer_defers, cetrafs_read_trust_writer_defers, bool, 0644);
+MODULE_PARM_DESC(read_trust_writer_defers, "TEST ONLY: a local writer makes readers ask the write lock's question");
+
 static bool cetrafs_read_trust_ignore_stamp;
 cetrafs_test_param(read_trust_ignore_stamp, cetrafs_read_trust_ignore_stamp, bool, 0644);
 MODULE_PARM_DESC(read_trust_ignore_stamp, "TEST ONLY: readers trust their cache without the file_seq check");
@@ -4892,8 +4898,22 @@ bool cetrafs_lock_read_cache_trusted(struct inode *inode)
         return true;
     if (cetrafs_read_trust_off || !S_ISREG(inode->i_mode))
         return false;
-    if (atomic_read(&ci->lock_writer_count) > 0 || READ_ONCE(ci->defrag_pinned))
-        return false; /* a writer here: the write lock's answer stands */
+    /*
+     * A writer here used to make the write lock's answer stand -- a scope
+     * kept when the reader's trust was introduced, not a safety argument.
+     * Past the write lock's own "yes" (sole opener, lock held) it is
+     * reached only when a peer is in the file or the lock is suspended:
+     * the migration window, where the guest on this node reads and
+     * overwrites at full rate while every mapping re-read the record and
+     * the tree from the device (audit 2026-11-15 B-12). The reader's
+     * argument holds with a local writer as well: a peer cannot free or
+     * move a block while this node is in the file, and this node's own
+     * frees and moves run under invalidate_lock exclusively, which a
+     * mapping excludes. The local defrag pin still defers.
+     */
+    if (READ_ONCE(ci->defrag_pinned) ||
+        (READ_ONCE(cetrafs_read_trust_writer_defers) && atomic_read(&ci->lock_writer_count) > 0))
+        return false;
 
     /* Under nofilelock the predicate above has just run the stamp check
      * itself (cetrafs_inode_foreign_opener_cached()); asking again
