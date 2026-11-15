@@ -311,7 +311,11 @@ Two concrete shapes of that window, named so nobody rediscovers them
   A fenced (stopped) mount discards its dirty metadata without writing it
   -- right after the stop, on every heartbeat tick, and in `sync_fs` just
   before unmount's `sync_blockdev()` -- and the CAS primitive and the
-  metadata-write choke point refuse to write at all. What is left: a
+  metadata-write choke point refuse to write at all (the CAS asks again
+  immediately before each compare-and-write, after its fresh read;
+  writeback asks per 8 MiB chunk and an O_DIRECT write per block;
+  boundaries also read this node's own registry row, at most once a
+  second, rather than trust the local lease clock). What is left: a
   metadata buffer dirtied by an operation already past every gate can be
   written by the block layer's own writeback before the next sweep, and
   I/O already queued on the device lands whenever it lands

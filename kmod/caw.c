@@ -254,6 +254,10 @@ static int cetrafs_cas_verify_read(struct super_block *sb, u64 fs_lba, u8 *out)
 /* TEST ONLY: the next no-CAW swap holds the fallback's mutex this much
  * longer, so a suite can kill a CAS waiting behind it
  * (cas_nocaw_wait_killable.sh). One-shot. */
+/* TEST ONLY: no fence test between the read and the swap (B-19's control). */
+static bool cetrafs_cas_gate_last_off;
+cetrafs_test_param(cas_gate_last_off, cetrafs_cas_gate_last_off, bool, 0644);
+
 static unsigned int cetrafs_cas_nocaw_stall_ms;
 cetrafs_test_param(cas_nocaw_stall_ms, cetrafs_cas_nocaw_stall_ms, uint, 0644);
 MODULE_PARM_DESC(cas_nocaw_stall_ms, "TEST ONLY: the next no-CAW CAS holds its mutex this many ms longer (one-shot)");
@@ -1401,6 +1405,20 @@ static int cetrafs_cas_region_seeded_impl(struct super_block *sb,
         if (unlikely(READ_ONCE(cetrafs_cas_stall_ino)) && fs_lba == cetrafs_inode_lba(sb, cetrafs_cas_stall_ino) &&
             xchg(&cetrafs_cas_stall_ino, 0))
             msleep(READ_ONCE(cetrafs_cas_stall_ms)); /* TEST ONLY: between the read and the swap */
+        /*
+         * And again here, last, on every attempt: the gates above come
+         * before a cache flush and a forced-fresh read that can wait out
+         * a path failover (dmpath's resolve, 15 s), and a swap built from
+         * that read went out after a lease that lapsed meanwhile -- a
+         * last-writer-wins record publish stamping this node's stale
+         * extent root over the tree of the node HA restarted the VM on
+         * (audit 2026-11-15 B-19). One load-compare per swap. A CAW
+         * already queued below this line is the A-6 residue.
+         */
+        if (cetrafs_sb_is_fenced(sb) && !READ_ONCE(cetrafs_cas_gate_last_off)) {
+            ret = -EIO;
+            goto out;
+        }
         ret = cetrafs_caw(sb->s_bdev, dev_lba, 1, old, new, killable);
         if (image_only && ret == 0 && READ_ONCE(cetrafs_cas_judged_timeout_once) &&
             xchg(&cetrafs_cas_judged_timeout_once, false))
