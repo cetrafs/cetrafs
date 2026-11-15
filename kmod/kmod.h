@@ -825,6 +825,7 @@ void cetrafs_tree_free_meta_except(struct inode *inode, const cetrafs_inode_t *r
 int cetrafs_tree_patch(struct inode *inode, cetrafs_inode_t *raw, u64 start, u64 end, const cetrafs_extent_t *add,
                        u32 add_n, u32 want_n, u64 want_data, u64 *out_meta);
 u64 cetrafs_tree_patch_count(void);
+u64 cetrafs_defrag_segment_count(void);
 u64 cetrafs_tree_patch_write_count(void);
 u32 cetrafs_tree_extent_count(struct inode *inode, const cetrafs_inode_t *raw);
 u32 cetrafs_tree_extent_count_for(struct inode *inode, const cetrafs_inode_t *raw, bool reader);

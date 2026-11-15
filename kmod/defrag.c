@@ -2,8 +2,11 @@
 /*
  * defrag.c -- per-file online defragmentation.
  *
- * The mover is INCREMENTAL: it relocates the file's physical blocks into
- * a single contiguous run one step at a time, taking inode_lock only for
+ * The mover is INCREMENTAL: it relocates the file's mapped blocks, in
+ * logical order, into contiguous runs -- one when a free run the file's
+ * size exists, otherwise as few as fit (struct cetrafs_defrag_dst) --
+ * holes staying holes and preallocated extents preallocated, one step at
+ * a time, taking inode_lock only for
  * the duration of each step and dropping it in between, so a file that is
  * CONTINUOUSLY OPEN FOR WRITE (the target workload -- a VM disk image
  * open for months) still gets defragmented, with the VM's own writes
@@ -467,8 +470,118 @@ static int cetrafs_defrag_read_extents(struct inode *inode, const cetrafs_inode_
 }
 
 /*
+ * The destination: runs ("segments"), each holding the next ranks of the
+ * file in order. One run the size of the whole file used to be required,
+ * so a file larger than the largest free run -- any image larger than a
+ * Block Group -- was never defragmented (audit 2026-11-15 A-14). A
+ * segment is allocated when the one before it is fully committed: as
+ * large as what is left of the file, or the largest that fits, down to
+ * CETRAFS_DEFRAG_SEG_MIN blocks. A step never crosses a segment.
+ */
+struct cetrafs_defrag_seg {
+    u64 first; /* the rank of its first block */
+    u64 base;  /* its first block on the device */
+    u64 count;
+};
+
+struct cetrafs_defrag_dst {
+    struct cetrafs_defrag_seg *seg;
+    u32 n, cap;
+};
+
+#define CETRAFS_DEFRAG_SEG_MIN 1024u /* 4 MiB: a segment smaller than this is not worth a pass */
+
+/* TEST ONLY: segments no larger than this many blocks, so a loop-sized
+ * file spans several (tests/kernel/defrag_segments.sh). 0: no cap. */
+static unsigned int cetrafs_defrag_seg_max;
+cetrafs_test_param(defrag_seg_max, cetrafs_defrag_seg_max, uint, 0644);
+MODULE_PARM_DESC(defrag_seg_max, "TEST ONLY: defrag destination runs of at most this many blocks");
+
+/* TEST ONLY: one run the size of the file or nothing, as before
+ * (tests/kernel/defrag_segments.sh's control). */
+static bool cetrafs_defrag_one_run;
+cetrafs_test_param(defrag_one_run, cetrafs_defrag_one_run, bool, 0644);
+MODULE_PARM_DESC(defrag_one_run, "TEST ONLY: defrag needs one free run the size of the file, as before");
+
+static atomic64_t cetrafs_defrag_segments = ATOMIC64_INIT(0);
+
+u64 cetrafs_defrag_segment_count(void)
+{
+    return (u64) atomic64_read(&cetrafs_defrag_segments);
+}
+
+/* The segment holding rank r (r below the last segment's end). */
+static const struct cetrafs_defrag_seg *cetrafs_defrag_seg_of(const struct cetrafs_defrag_dst *d, u64 r)
+{
+    u32 lo = 0, hi = d->n;
+
+    while (hi - lo > 1) {
+        u32 mid = lo + (hi - lo) / 2;
+
+        if (d->seg[mid].first <= r)
+            lo = mid;
+        else
+            hi = mid;
+    }
+    return &d->seg[lo];
+}
+
+static u64 cetrafs_defrag_dst_of(const struct cetrafs_defrag_dst *d, u64 r)
+{
+    const struct cetrafs_defrag_seg *g = cetrafs_defrag_seg_of(d, r);
+
+    return g->base + (r - g->first);
+}
+
+static u64 cetrafs_defrag_seg_end(const struct cetrafs_defrag_dst *d, u64 r)
+{
+    const struct cetrafs_defrag_seg *g = cetrafs_defrag_seg_of(d, r);
+
+    return g->first + g->count;
+}
+
+/* The next segment, from rank 'first', 'left' ranks still to place. The
+ * span is published with the bits (cetrafs_alloc_pick_run_resv()). */
+static int cetrafs_defrag_dst_grow(struct super_block *sb, struct cetrafs_defrag_dst *d, u64 first, u64 left,
+                                   struct cetrafs_resv_span *span)
+{
+    u64 want = left, base;
+    unsigned int cap = READ_ONCE(cetrafs_defrag_seg_max);
+    int ret;
+
+    if (cap && want > cap)
+        want = cap;
+    if (d->n == d->cap) {
+        u32 ncap = d->cap ? d->cap * 2 : 16;
+        struct cetrafs_defrag_seg *ns = kvmalloc_array(ncap, sizeof(*ns), GFP_KERNEL);
+
+        if (!ns)
+            return -ENOMEM;
+        if (d->n)
+            memcpy(ns, d->seg, (size_t) d->n * sizeof(*ns));
+        kvfree(d->seg);
+        d->seg = ns;
+        d->cap = ncap;
+    }
+    for (;;) {
+        ret = cetrafs_alloc_pick_run_resv(sb, want, &base, span);
+        if (!ret)
+            break;
+        if (ret != -ENOSPC || want <= min_t(u64, CETRAFS_DEFRAG_SEG_MIN, left) || READ_ONCE(cetrafs_defrag_one_run))
+            return ret;
+        want = max_t(u64, want / 2, min_t(u64, CETRAFS_DEFRAG_SEG_MIN, left));
+    }
+    d->seg[d->n].first = first;
+    d->seg[d->n].base = base;
+    d->seg[d->n].count = want;
+    d->n++;
+    atomic64_inc(&cetrafs_defrag_segments);
+    return 0;
+}
+
+/*
  * The new run's entries for ranks [from, to): each piece at its own
- * logical block, at dst_base + its rank, with its own extent's flag -- a
+ * logical block, at its rank's place on the destination, with its own extent's flag -- a
  * hole stays a hole and a preallocated block stays preallocated. Pieces
  * that continue each other logically, physically and in kind are one
  * entry, split at the length cap. The pieces are head[] whole, then the
@@ -477,8 +590,8 @@ static int cetrafs_defrag_read_extents(struct inode *inode, const cetrafs_inode_
  * range the emitted pieces span. -EIO: they do not add up to [from, to).
  */
 static int cetrafs_defrag_pieces(const cetrafs_extent_t *head, u32 head_count, const cetrafs_extent_t *split,
-                                 u32 split_off, u64 from, u64 to, u64 dst_base, cetrafs_extent_t *out, u32 *out_n,
-                                 u32 cap, u64 *lo, u64 *hi)
+                                 u32 split_off, u64 from, u64 to, const struct cetrafs_defrag_dst *d,
+                                 cetrafs_extent_t *out, u32 *out_n, u32 cap, u64 *lo, u64 *hi)
 {
     u64 off = 0, got = 0;
     u32 i, n = *out_n;
@@ -506,21 +619,22 @@ static int cetrafs_defrag_pieces(const cetrafs_extent_t *head, u32 head_count, c
         while (len) {
             cetrafs_extent_t *p = n ? &out[n - 1] : NULL;
             u32 plen = p ? cetrafs_extent_len(p->ee_len) : 0;
-            u64 take;
+            u64 take, phys = cetrafs_defrag_dst_of(d, off);
+            u64 seg_left = cetrafs_defrag_seg_end(d, off) - off; /* a piece stays inside its segment */
 
             if (p && (u64) cetrafs_le32(p->ee_block) + plen == lg &&
-                cetrafs_extent_phys_from_hilo(p->ee_start_hi, p->ee_start_lo) + plen == dst_base + off &&
+                cetrafs_extent_phys_from_hilo(p->ee_start_hi, p->ee_start_lo) + plen == phys &&
                 cetrafs_extent_is_uninit(p->ee_len) == un && plen < CETRAFS_EXT_LEN_MASK) {
-                take = min_t(u64, len, (u64) CETRAFS_EXT_LEN_MASK - plen);
+                take = min3(len, (u64) CETRAFS_EXT_LEN_MASK - plen, seg_left);
                 p->ee_len = cetrafs_extent_pack_len(plen + (u32) take, un);
             } else {
                 if (n >= cap)
                     return -EIO; /* cannot happen: one entry per source piece */
-                take = min_t(u64, len, (u64) CETRAFS_EXT_LEN_MASK);
+                take = min3(len, (u64) CETRAFS_EXT_LEN_MASK, seg_left);
                 memset(&out[n], 0, sizeof(out[n]));
                 out[n].ee_block = cetrafs_cpu_to_le32((u32) lg);
                 out[n].ee_len = cetrafs_extent_pack_len((u32) take, un);
-                cetrafs_extent_phys_to_hilo(dst_base + off, &out[n].ee_start_hi, &out[n].ee_start_lo);
+                cetrafs_extent_phys_to_hilo(phys, &out[n].ee_start_hi, &out[n].ee_start_lo);
                 n++;
             }
             len -= take;
@@ -535,7 +649,7 @@ static int cetrafs_defrag_pieces(const cetrafs_extent_t *head, u32 head_count, c
 }
 
 /*
- * Persist a layout of: ranks [0, moved) on the run at 'dst_base' (each
+ * Persist a layout of: ranks [0, moved) on the destination 'd' (each
  * at its own logical block, see cetrafs_defrag_pieces()), followed by the
  * suffix -- the original extents from rank 'moved' on, already shifted so
  * entry 0 is the first piece at or after it. The step [prev, moved) goes
@@ -555,7 +669,7 @@ static int cetrafs_defrag_pieces(const cetrafs_extent_t *head, u32 head_count, c
  */
 static int cetrafs_defrag_commit(struct inode *inode,
                                  cetrafs_inode_t *raw,
-                                 u64 dst_base,
+                                 const struct cetrafs_defrag_dst *d,
                                  u64 prev,
                                  u64 moved,
                                  u64 nblocks,
@@ -573,7 +687,7 @@ static int cetrafs_defrag_commit(struct inode *inode,
      * frame -- its caller heap-allocates the same type for this reason
      * (audit 2026-11-05, section 3). */
     cetrafs_inode_t *old;
-    u32 n = 0, i, cap = head_count + 1 + suffix_count + 8;
+    u32 n = 0, i, cap = head_count + 1 + suffix_count + d->n + 8;
     u64 meta = 0;
     bool verdict_old = false; /* a failed publish proven NOT to have landed */
     int ret;
@@ -587,7 +701,7 @@ static int cetrafs_defrag_commit(struct inode *inode,
     }
     *old = *raw;
 
-    /* Prefix: ranks [0, moved) on the run at dst_base, each at its own
+    /* Prefix: ranks [0, moved) on the destination, each at its own
      * logical block and with its own extent's flag -- a hole stays a
      * hole and a preallocated block stays preallocated. Pieces that
      * continue each other logically, physically and in kind are one
@@ -606,8 +720,7 @@ static int cetrafs_defrag_commit(struct inode *inode,
         u64 lo, hi;
         u32 an = 0;
 
-        ret = cetrafs_defrag_pieces(head, head_count, split, split_off, prev, moved, dst_base, out, &an, cap, &lo,
-                                    &hi);
+        ret = cetrafs_defrag_pieces(head, head_count, split, split_off, prev, moved, d, out, &an, cap, &lo, &hi);
         if (ret)
             goto out;
         ret = an ? cetrafs_tree_patch(inode, raw, lo, hi, out, an, U32_MAX, nblocks, &meta) : -EAGAIN;
@@ -619,7 +732,7 @@ static int cetrafs_defrag_commit(struct inode *inode,
     if (ret == -EAGAIN) {
         u64 lo, hi;
 
-        ret = cetrafs_defrag_pieces(head, head_count, split, split_off, 0, moved, dst_base, out, &n, cap, &lo, &hi);
+        ret = cetrafs_defrag_pieces(head, head_count, split, split_off, 0, moved, d, out, &n, cap, &lo, &hi);
         if (ret)
             goto out;
         /* Suffix: original extents for [moved, nblocks), verbatim. */
@@ -742,7 +855,8 @@ int cetrafs_defrag_inode(struct inode *inode, struct cetrafs_defrag_stats *out_s
     sector_t *copy_lba; /* one step's source blocks, for the batched read (M1) */
     u32 *copy_off;      /* ...and each one's block offset from the step's start */
 #define raw (*rawp)
-    u64 nblocks, dst_base = 0, moved = 0;
+    u64 nblocks, moved = 0;
+    struct cetrafs_defrag_dst dst = {0};
     u32 snapshot_shape = 0, snapshot_runs = 0;
     bool have_dst = false;
     /*
@@ -829,8 +943,7 @@ int cetrafs_defrag_inode(struct inode *inode, struct cetrafs_defrag_stats *out_s
      * return left the run's first blocks stealable for a scrub cycle
      * (322 of them, in a loaded full-gate run). The negative control
      * passes NULL and publishes nothing, same observable as before. */
-    ret = cetrafs_alloc_pick_run_resv(sb, nblocks, &dst_base,
-                                      cetrafs_defrag_skip_resv ? NULL : &dst_span);
+    ret = cetrafs_defrag_dst_grow(sb, &dst, 0, nblocks, cetrafs_defrag_skip_resv ? NULL : &dst_span);
     if (ret)
         goto out_unlock;
     have_dst = true;
@@ -838,9 +951,23 @@ int cetrafs_defrag_inode(struct inode *inode, struct cetrafs_defrag_stats *out_s
 
     while (moved < nblocks) {
         struct blk_plug plug;
-        u64 step_end, b, step_lo, step_hi;
+        u64 step_end, b, step_lo, step_hi, seg_end, lim;
         u32 si, suffix_start, split_off;
         bool foreign; /* an old block outside our own groups (cetrafs_frees_begin()) */
+
+        /* The segment is fully committed: the file names all of it, so
+         * its span goes, and the next segment comes with its own. */
+        if (moved == dst.seg[dst.n - 1].first + dst.seg[dst.n - 1].count) {
+            cetrafs_resv_unpublish(sb, &dst_span);
+            have_dst = false;
+            ret = cetrafs_defrag_dst_grow(sb, &dst, moved, nblocks - moved,
+                                          cetrafs_defrag_skip_resv ? NULL : &dst_span);
+            if (ret)
+                goto out_free_tail; /* no room for more: the file stays as the steps so far left it */
+            have_dst = true;
+        }
+        seg_end = cetrafs_defrag_seg_end(&dst, moved);
+        lim = min_t(u64, CETRAFS_DEFRAG_STEP_BLOCKS, seg_end - moved);
 
         if (cetrafs_sb_defrag_draining(sb) || cetrafs_sb_is_fenced(sb)) {
             ret = -ECANCELED;
@@ -953,12 +1080,16 @@ int cetrafs_defrag_inode(struct inode *inode, struct cetrafs_defrag_stats *out_s
                 u64 phys = cetrafs_extent_phys_from_hilo(el.arr[e].ee_start_hi, el.arr[e].ee_start_lo);
                 u64 len = cetrafs_extent_len(el.arr[e].ee_len);
 
-                if (phys != dst_base + off) {
+                u64 last = min_t(u64, off + len, moved) - 1;
+
+                /* Both ends: the destination is several runs, and an
+                 * extent starting right could still run past its own. */
+                if (phys != cetrafs_defrag_dst_of(&dst, off) || phys + (last - off) != cetrafs_defrag_dst_of(&dst, last)) {
                     pr_warn_ratelimited(
                         "defrag: ino=%llu block %llu moved to %llu but now reads %llu -- rewritten under us, "
                         "abandoning the move\n",
                         (unsigned long long) inode->i_ino, (unsigned long long) off,
-                        (unsigned long long) (dst_base + off), (unsigned long long) phys);
+                        (unsigned long long) cetrafs_defrag_dst_of(&dst, off), (unsigned long long) phys);
                     ret = -ECANCELED;
                     cetrafs_defrag_inode_unlock(inode);
                     goto out_free_tail;
@@ -991,14 +1122,14 @@ int cetrafs_defrag_inode(struct inode *inode, struct cetrafs_defrag_stats *out_s
                     continue;
                 }
                 /* this extent starts at or past 'moved' */
-                if (off + len - moved > CETRAFS_DEFRAG_STEP_BLOCKS) {
-                    step_end = moved + CETRAFS_DEFRAG_STEP_BLOCKS;
+                if (off + len - moved > lim) {
+                    step_end = moved + lim;
                     split_off = (u32) (step_end - off); /* within this extent, > 0 */
                     break;                              /* si: the split extent heads the suffix */
                 }
                 step_end = off + len;
                 off += len;
-                if (step_end - moved >= CETRAFS_DEFRAG_STEP_BLOCKS) {
+                if (step_end - moved >= lim) {
                     si++;
                     break;
                 }
@@ -1071,7 +1202,7 @@ int cetrafs_defrag_inode(struct inode *inode, struct cetrafs_defrag_stats *out_s
                     break;
                 }
                 src = cetrafs_extent_phys_from_hilo(el.arr[ce].ee_start_hi, el.arr[ce].ee_start_lo) + (bb - ce_off);
-                if (src == dst_base + bb) /* already in place */
+                if (src == cetrafs_defrag_dst_of(&dst, bb)) /* already in place */
                     continue;
                 /* Preallocated: nothing in it is the file's, and it stays
                  * preallocated where it lands (cetrafs_defrag_commit()). */
@@ -1111,7 +1242,7 @@ int cetrafs_defrag_inode(struct inode *inode, struct cetrafs_defrag_stats *out_s
                     ret = -ECANCELED;
                     break;
                 }
-                dbh = sb_getblk(sb, dst_base + moved + copy_off[i]);
+                dbh = sb_getblk(sb, cetrafs_defrag_dst_of(&dst, moved + copy_off[i]));
                 copy_dst[i] = dbh;
                 if (!dbh) {
                     ret = -EIO;
@@ -1193,7 +1324,7 @@ int cetrafs_defrag_inode(struct inode *inode, struct cetrafs_defrag_stats *out_s
             }
             ret = cetrafs_frees_begin(sb, &foreign);
             if (!ret) {
-                ret = cetrafs_defrag_commit(inode, &raw, dst_base, moved, step_end, nblocks, el.arr, suffix_start,
+                ret = cetrafs_defrag_commit(inode, &raw, &dst, moved, step_end, nblocks, el.arr, suffix_start,
                                             split_off ? &whole : NULL, split_off, suffix, suffix_count);
                 if (ret)
                     cetrafs_frees_end(sb, foreign);
@@ -1274,7 +1405,7 @@ int cetrafs_defrag_inode(struct inode *inode, struct cetrafs_defrag_stats *out_s
                     }
                     o += len;
                 }
-                if (src != dst_base + b)
+                if (src != cetrafs_defrag_dst_of(&dst, b))
                     cetrafs_free_data_block(sb, src);
             }
             cetrafs_frees_end(sb, foreign);
@@ -1284,7 +1415,7 @@ int cetrafs_defrag_inode(struct inode *inode, struct cetrafs_defrag_stats *out_s
         cond_resched();
     }
 
-    /* Done: file lives contiguously at dst_base. Old tree meta (the
+    /* Done: the file lives in order on the destination's runs. Old tree meta (the
      * external leaf, and at depth 2 the interiors) was freed by each
      * cetrafs_defrag_commit() as it published the next tree, so there is
      * nothing left to free here.
@@ -1315,10 +1446,16 @@ out_unlock:
 out_free_tail:
     /* Free the never-committed tail of the destination run; the
      * committed prefix [0, moved) is the file's real data now. */
+    /* Only the current segment's: the earlier ones are committed, the
+     * later ones never allocated. */
     if (have_dst && moved < nblocks) {
-        ctrace("DEFRAGFREE-TAIL ino=%llu lba=%llu count=%llu\n", (unsigned long long) inode->i_ino,
-               (unsigned long long) (dst_base + moved), (unsigned long long) (nblocks - moved));
-        cetrafs_free_data_extent(sb, dst_base + moved, nblocks - moved);
+        u64 end = cetrafs_defrag_seg_end(&dst, moved);
+
+        if (moved < end) {
+            ctrace("DEFRAGFREE-TAIL ino=%llu lba=%llu count=%llu\n", (unsigned long long) inode->i_ino,
+                   (unsigned long long) cetrafs_defrag_dst_of(&dst, moved), (unsigned long long) (end - moved));
+            cetrafs_free_data_extent(sb, cetrafs_defrag_dst_of(&dst, moved), end - moved);
+        }
     }
     cetrafs_flush_dirty_free_counts(sb);
 
@@ -1327,6 +1464,7 @@ out_done:
      * allocatable again, and the committed prefix is referenced by the
      * file's own extents from here on. */
     cetrafs_resv_unpublish(sb, &dst_span);
+    kvfree(dst.seg);
     if (out_stats)
         *out_stats = stats;
     kvfree(el.arr);
