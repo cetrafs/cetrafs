@@ -37,6 +37,9 @@ require_cetrafs_mount "$MNT"
 # and the converted blocks cannot all merge back into one extent -- that
 # is what makes a leaf actually fill.
 ct_param_set alloc_run_blocks 1
+# The splits are built a block at a time; a 64 KiB convert unit would
+# coalesce them before the leaf fills.
+ct_param_set convert_unit_blocks 1
 
 inf() { sed -n "s/^$1: //p" "/proc/fs/cetrafs/$PD/info"; }
 LF0="$(inf convert_leaf_full)"

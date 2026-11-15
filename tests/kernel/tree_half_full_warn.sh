@@ -31,6 +31,9 @@ DEV="$(ct_dev 1200 thfw)"
 MNT="$(ct_mnt thfw)"
 ct_track mnt "$MNT"
 ct_mkfs "$DEV" -f >/dev/null
+# The tree is filled a block-sized convert at a time; a 64 KiB convert
+# unit would coalesce the scattered writes that fill it.
+ct_param_set convert_unit_blocks 1
 ct_param_set tree_root_cap 2
 ct_param_set tree_idx_cap 4
 ct_param_set auto_defrag 0

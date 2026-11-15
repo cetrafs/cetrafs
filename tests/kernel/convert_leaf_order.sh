@@ -34,6 +34,9 @@ BACK="$(losetup -l -n -O BACK-FILE "$DEV")"
 MNT="$(ct_mnt cvorder)"
 SNAP="$(ct_tmp cvorder-snap)"
 ct_mkfs_small "$DEV" >/dev/null
+# The tree is filled a block-sized convert at a time; a 64 KiB convert
+# unit would coalesce the scattered writes that fill it.
+ct_param_set convert_unit_blocks 1
 ct_param_set auto_defrag 0
 ct_mount "$DEV" "$MNT"
 require_cetrafs_mount "$MNT"

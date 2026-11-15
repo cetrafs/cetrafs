@@ -43,6 +43,9 @@ for k in tree_root_cap tree_idx_cap tree_append_room_off close_nospc_stops; do
 done
 MNT="$(ct_mnt tfc)"
 ct_track mnt "$MNT"
+# The tree is filled a block-sized convert at a time; a 64 KiB convert
+# unit would coalesce the scattered writes that fill it.
+ct_param_set convert_unit_blocks 1
 ct_param_set tree_append_room_off 0
 ct_param_set close_nospc_stops 0
 NBLK=16384 # 64 MiB

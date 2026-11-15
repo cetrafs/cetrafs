@@ -31,6 +31,9 @@ for k in tree_resv_keep_off tree_resv_unregistered tree_build_full; do
 done
 MNT="$(ct_mnt trk)"
 ct_track mnt "$MNT"
+# The tree is filled a block-sized convert at a time; a 64 KiB convert
+# unit would coalesce the scattered writes that fill it.
+ct_param_set convert_unit_blocks 1
 ct_param_set auto_defrag 0
 ct_param_set scrub 0
 ct_param_set scrub_interval_secs 2

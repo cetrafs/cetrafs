@@ -137,10 +137,11 @@ cetrafs_test_param(buf_convert_skip, cetrafs_buf_convert_skip, bool, 0644);
 MODULE_PARM_DESC(buf_convert_skip, "TEST ONLY: durability boundaries drop buffered and mapped blocks without marking them written");
 
 /* b_private of a DIO mapping that left preallocated blocks for the
- * completion to convert. The DIO code copies b_private into the dio
- * after EVERY get_block call and never clears it, so once one segment
- * sets it, the completion sees it. */
-#define CETRAFS_DIO_CONVERT_MARK ((void *) 1)
+ * completion to convert: the write's tracker (lock.c,
+ * cetrafs_dio_track_add()). The DIO code copies b_private into the dio
+ * after EVERY get_block call and never clears it -- nor resets it before
+ * the next call -- so once one segment sets it, every later segment adds
+ * to the same tracker and the completion receives it. */
 
 /* Escape hatch and A/B control: off restores DIO_SKIP_HOLES, i.e. the
  * buffered fallback for every O_DIRECT write that is not an overwrite. */
@@ -226,11 +227,16 @@ u64 cetrafs_dio_convert_count(void)
  * write does not cover (the block's old contents become reachable the
  * moment it is converted); defer_completion runs the completion from a
  * workqueue, since converting takes locks and does I/O. */
-static void cetrafs_dio_mark_convert(struct buffer_head *bh)
+static int cetrafs_dio_mark_convert(struct inode *inode, struct buffer_head *bh, sector_t iblock)
 {
+    void *t = cetrafs_dio_track_add(inode, bh->b_private, (u32) iblock, (u32) (bh->b_size >> inode->i_blkbits));
+
+    if (!t)
+        return -ENOMEM; /* untracked, a unit convert could zero its landed data */
     set_buffer_new(bh);
     set_buffer_defer_completion(bh);
-    bh->b_private = CETRAFS_DIO_CONVERT_MARK;
+    bh->b_private = t;
+    return 0;
 }
 
 static int __cetrafs_get_block(struct inode *inode,
@@ -1027,6 +1033,13 @@ static int cetrafs_dio_get_block_overwrite(struct inode *inode, sector_t iblock,
  * map still says preallocated, so the range reads as zeros, and the
  * caller is told.
  */
+/* TEST ONLY: the next O_DIRECT completion waits this long before it
+ * converts (one-shot) -- a write whose data has landed, unconverted,
+ * while others complete (tests/kernel/convert_unit.sh). */
+static unsigned int cetrafs_dio_end_io_stall_ms;
+cetrafs_test_param(dio_end_io_stall_ms, cetrafs_dio_end_io_stall_ms, uint, 0644);
+MODULE_PARM_DESC(dio_end_io_stall_ms, "TEST ONLY: the next O_DIRECT completion stalls before converting (one-shot)");
+
 static int cetrafs_dio_end_io(struct kiocb *iocb, loff_t offset, ssize_t size, void *private)
 {
     struct inode *inode = file_inode(iocb->ki_filp);
@@ -1034,10 +1047,14 @@ static int cetrafs_dio_end_io(struct kiocb *iocb, loff_t offset, ssize_t size, v
     sector_t b, last;
     int ret = 0;
 
-    if (private != CETRAFS_DIO_CONVERT_MARK || size <= 0)
+    if (!cetrafs_dio_is_track(private))
         return 0;
-    if (cetrafs_dio_skip_convert)
-        return 0; /* test-only, see the knob */
+    if (unlikely(READ_ONCE(cetrafs_dio_end_io_stall_ms)))
+        msleep(xchg(&cetrafs_dio_end_io_stall_ms, 0)); /* TEST ONLY, one-shot */
+    if (size <= 0 || cetrafs_dio_skip_convert) { /* skip: test-only, see the knob */
+        cetrafs_dio_track_done(inode, private); /* nothing landed to convert, or kept preallocated */
+        return 0;
+    }
 
     b = offset >> bits;
     last = (offset + size - 1) >> bits;
@@ -1055,6 +1072,10 @@ static int cetrafs_dio_end_io(struct kiocb *iocb, loff_t offset, ssize_t size, v
         n = clamp_t(u64, map.b_size >> bits, 1, last - b + 1);
         b += n;
     }
+    /* Its blocks are converted (or reading as zeros, reported below):
+     * no longer in flight to a unit convert -- under the lock, so none
+     * judges them between the two. */
+    cetrafs_dio_track_done(inode, private);
     filemap_invalidate_unlock(inode->i_mapping);
 
     if (ret)
@@ -6312,6 +6333,132 @@ static unsigned int cetrafs_pending_race_delay_ms;
 cetrafs_test_param(pending_race_delay_ms, cetrafs_pending_race_delay_ms, uint, 0644);
 MODULE_PARM_DESC(pending_race_delay_ms, "TEST ONLY: stall get_block after the tree says unwritten");
 
+/*
+ * G-1: convert preallocated space a UNIT at a time, not a block at a
+ * time. Every first write into a preallocated extent split it -- one
+ * extent, or two for a middle block, per 4 KiB -- so scattered first
+ * writes reached the per-file extent ceiling (A-1) after about a GiB of
+ * scatter. Converting the aligned unit around the write (64 KiB by
+ * default) leaves the next writes into that unit nothing to convert, and
+ * written units merge with their written neighbours.
+ *
+ * The unit's other blocks were never written: they are zeroed on the
+ * device first (WRITE ZEROES; a device without it gets no widening), and
+ * only then is the whole unit marked written -- the same order as the
+ * data the convert is for (rule 8). Never a block someone else is
+ * writing:
+ *   - one an O_DIRECT write in flight has mapped: its data may have
+ *     landed, its completion not yet run -- the unit is left alone
+ *     (cetrafs_unit_dio_busy());
+ *   - one pending (a buffered or mapped write a boundary converts): at
+ *     the boundary itself (CONVERT_PENDING) its data was written back
+ *     with the whole set before any flip, so it is marked written with
+ *     the unit and NOT zeroed; anywhere else its data may still be in a
+ *     page, and the unit is left alone.
+ * Both are added under invalidate_lock, held here exclusively. And only
+ * within the one preallocated extent the written block is in.
+ */
+static unsigned int cetrafs_convert_unit_blocks = 16;
+cetrafs_test_param(convert_unit_blocks, cetrafs_convert_unit_blocks, uint, 0644);
+MODULE_PARM_DESC(convert_unit_blocks,
+                 "blocks marked written together on a first write into preallocated space (power of two, 1-256; 1 = off)");
+
+static atomic64_t cetrafs_convert_widened = ATOMIC64_INIT(0);
+static atomic64_t cetrafs_convert_unit_busy = ATOMIC64_INIT(0);
+
+u64 cetrafs_convert_widened_count(void)
+{
+    return (u64) atomic64_read(&cetrafs_convert_widened);
+}
+
+u64 cetrafs_convert_unit_busy_count(void)
+{
+    return (u64) atomic64_read(&cetrafs_convert_unit_busy);
+}
+
+static int cetrafs_convert_zero(struct super_block *sb, u64 lba, u64 count)
+{
+    if (!count)
+        return 0;
+    if (cetrafs_sb_is_fenced(sb))
+        return -EIO; /* the per-block path's gate, as the data write's */
+    return blkdev_issue_zeroout(sb->s_bdev, (sector_t) lba * (CETRAFS_BLOCK_SIZE >> SECTOR_SHIFT),
+                                (sector_t) count * (CETRAFS_BLOCK_SIZE >> SECTOR_SHIFT), GFP_NOFS,
+                                BLKDEV_ZERO_NOFALLBACK);
+}
+
+/* Zero the blocks of [first, first + count) (at 'plba') that are not
+ * pending; pending ones are skipped, their data landed (the caller's
+ * mode says so) -- or, with !pending_landed, any pending one is -EBUSY. */
+static int cetrafs_convert_zero_side(struct inode *inode, u32 first, u64 plba, u32 count, bool pending_landed)
+{
+    u64 b = first, end = (u64) first + count;
+    u32 pf, pl;
+
+    while (b < end) {
+        u64 stop = end;
+
+        if (!cetrafs_pending_next(inode, (u32) b, &pf, &pl) && pf < end) {
+            if (!pending_landed)
+                return -EBUSY;
+            stop = pf;
+        }
+        if (stop > b) {
+            int ret = cetrafs_convert_zero(inode->i_sb, plba + (b - first), stop - b);
+
+            if (ret)
+                return ret;
+        }
+        if (stop == end)
+            break;
+        b = (u64) pl + 1; /* past the pending run: its data is on the device */
+    }
+    return 0;
+}
+
+/* [iblock, iblock + want) at lba is about to be converted: widen it to
+ * the aligned unit when the unit is free to take. */
+static void cetrafs_convert_widen(struct inode *inode, const cetrafs_inode_t *raw, u32 iblock, u64 lba, u32 want,
+                                  bool pending_landed, u32 *cv_iblock, u64 *cv_lba, u32 *cv_want)
+{
+    u32 unit = READ_ONCE(cetrafs_convert_unit_blocks), run = 0;
+    u64 ws, we, lws = 0;
+    bool uninit = false, found = false;
+
+    if (unit <= 1 || unit > 256 || !is_power_of_2(unit) || !want)
+        return;
+    ws = iblock & ~(u64) (unit - 1);
+    we = round_up((u64) iblock + want, (u64) unit);
+    if (we > U32_MAX || we - ws == want)
+        return;
+    /* The whole unit in the written block's own preallocated extent:
+     * the block at its start is uninit, at the matching address, with
+     * the run reaching the unit's end. */
+    if (cetrafs_tree_lookup(inode, raw, (u32) ws, &lws, &run, &uninit, &found, false) || !found || !uninit ||
+        lws + (iblock - ws) != lba || run < we - ws)
+        return;
+    if (cetrafs_unit_dio_busy(inode, (u32) ws, (u32) (iblock - ws)) ||
+        cetrafs_unit_dio_busy(inode, iblock + want, (u32) (we - iblock - want))) {
+        atomic64_inc(&cetrafs_convert_unit_busy);
+        return;
+    }
+    {
+        int zret = cetrafs_convert_zero_side(inode, (u32) ws, lws, (u32) (iblock - ws), pending_landed);
+
+        if (!zret)
+            zret = cetrafs_convert_zero_side(inode, iblock + want, lba + want, (u32) (we - iblock - want),
+                                             pending_landed);
+        if (zret == -EBUSY)
+            atomic64_inc(&cetrafs_convert_unit_busy);
+        if (zret)
+            return; /* not all zeroed: the unit is not marked written; the block alone is */
+    }
+    *cv_iblock = (u32) ws;
+    *cv_lba = lws;
+    *cv_want = (u32) (we - ws);
+    atomic64_inc(&cetrafs_convert_widened);
+}
+
 static int __cetrafs_get_block(struct inode *inode,
                                sector_t iblock,
                                struct buffer_head *bh_result,
@@ -6319,7 +6466,7 @@ static int __cetrafs_get_block(struct inode *inode,
                                bool reader,
                                enum cetrafs_gb_mode mode)
 {
-    u32 want = 1, converted = 1;
+    u32 want = 1, converted = 1, ahead = 0;
     struct super_block *sb = inode->i_sb;
     cetrafs_inode_t raw;
     u64 lba;
@@ -6511,7 +6658,9 @@ relookup:
         map_bh(bh_result, sb, lba);
         if (w > 1 && run > 1)
             bh_result->b_size = (size_t) min_t(u64, w, run) << inode->i_blkbits;
-        cetrafs_dio_mark_convert(bh_result);
+        ret = cetrafs_dio_mark_convert(inode, bh_result, iblock);
+        if (ret)
+            return ret;
         atomic64_inc(&cetrafs_map_calls);
         atomic64_add(bh_result->b_size >> inode->i_blkbits, &cetrafs_map_blocks);
         return 0;
@@ -6551,7 +6700,34 @@ relookup:
         want = (u32) min_t(u64, bh_result->b_size >> inode->i_blkbits, run ? run : 1);
         if (!want)
             want = 1;
-        ret = cetrafs_tree_convert(inode, &raw, (u32) iblock, lba, want, &converted, &moving);
+        {
+            u32 cv_iblock = (u32) iblock, cv_want = want;
+            u64 cv_lba = lba;
+
+            if (mode == CETRAFS_GB_CONVERT || mode == CETRAFS_GB_CONVERT_PENDING)
+                cetrafs_convert_widen(inode, &raw, (u32) iblock, lba, want, mode == CETRAFS_GB_CONVERT_PENDING,
+                                      &cv_iblock, &cv_lba, &cv_want);
+            ahead = (u32) iblock - cv_iblock;
+            ret = cetrafs_tree_convert(inode, &raw, cv_iblock, cv_lba, cv_want, &converted, &moving);
+            /* A convert may stop short (a split with one free slot hands
+             * the rest back), possibly before iblock: go on from where it
+             * stopped until the caller's block is in. Counted from the
+             * unit's start, so the blocks before iblock are not this
+             * call's to report, and no more than the caller asked for. */
+            while (!ret && converted <= ahead) {
+                u32 more = 0;
+
+                if (WARN_ON_ONCE(converted >= cv_want)) {
+                    ret = -EIO;
+                    break;
+                }
+                ret = cetrafs_tree_convert(inode, &raw, cv_iblock + converted, cv_lba + converted, cv_want - converted,
+                                           &more, &moving);
+                converted += more;
+            }
+            if (!ret)
+                converted = min_t(u32, converted - ahead, want);
+        }
         if (ret)
             cetrafs_tree_move_end(inode, &moving); /* nothing below stages it: what moved stays in core */
         if (ret == -ENOENT) {
@@ -6881,8 +7057,11 @@ relookup:
     }
     map_bh(bh_result, sb, lba);
     set_buffer_new(bh_result);
-    if (mode == CETRAFS_GB_DIO)
-        cetrafs_dio_mark_convert(bh_result);
+    if (mode == CETRAFS_GB_DIO) {
+        ret = cetrafs_dio_mark_convert(inode, bh_result, iblock);
+        if (ret)
+            return ret; /* the block stays preallocated, reading as zeros */
+    }
 
     /* A growing OPEN regular file that just added a NEW extent (not a
      * merge) to its external tree is the moment fragmentation happens;

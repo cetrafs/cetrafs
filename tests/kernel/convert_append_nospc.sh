@@ -33,6 +33,9 @@ for k in convert_append_nospc tree_resv_off; do
 done
 MNT="$(ct_mnt cans)"
 ct_track mnt "$MNT"
+# The tree is filled a block-sized convert at a time; a 64 KiB convert
+# unit would coalesce the scattered writes that fill it.
+ct_param_set convert_unit_blocks 1
 ct_param_set auto_defrag 0
 ct_param_set convert_append_nospc 0
 ct_param_set tree_resv_off 0

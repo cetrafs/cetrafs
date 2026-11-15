@@ -27,6 +27,9 @@ require_module
 [ -w /sys/module/cetrafs/parameters/tree_build_full ] || { skip "tree_build_full is missing"; ct_exit; }
 MNT="$(ct_mnt rbls)"
 ct_track mnt "$MNT"
+# The tree is filled a block-sized convert at a time; a 64 KiB convert
+# unit would coalesce the scattered writes that fill it.
+ct_param_set convert_unit_blocks 1
 ct_param_set auto_defrag 0
 ct_param_set scrub 0
 ct_param_set tree_build_full 0

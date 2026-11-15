@@ -37,6 +37,9 @@ ct_track mnt "$MNT"
 ct_mkfs "$DEV" -f >/dev/null
 ct_mount "$DEV" "$MNT"
 require_cetrafs_mount "$MNT"
+# The tree is filled a block-sized convert at a time; a 64 KiB convert
+# unit would coalesce the scattered writes that fill it.
+ct_param_set convert_unit_blocks 1
 ct_param_set leaf_split_off 0
 ct_param_set tree_any_leaf_off 0
 ct_param_set tree_root_cap 1

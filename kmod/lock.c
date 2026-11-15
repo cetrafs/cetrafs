@@ -211,6 +211,13 @@ struct cetrafs_inode_info {
      * nothing in the set may then be converted.
      */
     struct maple_tree pending;
+    /* O_DIRECT writes in flight into preallocated blocks of this file:
+     * one tracker per DIO, from its mapping to its completion (file.c,
+     * cetrafs_dio_end_io()). Their data may be on the device before the
+     * completion converts it, so a unit convert must not zero those
+     * blocks (cetrafs_unit_busy(), G-1). Under dio_track_lock. */
+    struct list_head dio_tracks;
+    spinlock_t dio_track_lock;
     errseq_t pending_wb_err;
     /*
      * A conversion marked its blocks written in core, and the device
@@ -1559,6 +1566,8 @@ static void cetrafs_inode_init_once(void *foo)
     mutex_init(&ci->fd_pub_mutex);
     ci->tree_move_seq = 0;
     INIT_LIST_HEAD(&ci->resv_span.link);
+    INIT_LIST_HEAD(&ci->dio_tracks);
+    spin_lock_init(&ci->dio_track_lock);
     {
         unsigned int i;
 
@@ -1660,6 +1669,7 @@ void cetrafs_free_vfs_inode(struct inode *inode)
      * a recycled object with an empty link, so this also proves the
      * recycle invariant rather than assuming it. */
     WARN_ON_ONCE(!list_empty(&ci->resv_span.link));
+    WARN_ON_ONCE(!list_empty(&ci->dio_tracks)); /* a DIO holds the file open */
     {
         unsigned int i;
 
@@ -1785,6 +1795,118 @@ int cetrafs_pending_next(struct inode *inode, u32 from, u32 *first, u32 *last)
     }
     rcu_read_unlock();
     return ret;
+}
+
+/*
+ * The preallocated ranges one O_DIRECT write mapped, from its mapping to
+ * its completion. Carried as the DIO's b_private, which the DIO code
+ * keeps across the write's get_block calls and hands to the completion.
+ * A write that maps more ranges than fit widens the last one: a busy
+ * range too large only ever stops a unit convert.
+ */
+#define CETRAFS_DIO_TRACK_MAGIC 0x43544b44U /* "DKTC" */
+#define CETRAFS_DIO_TRACK_RANGES 16
+
+struct cetrafs_dio_track {
+    u32 magic;
+    u32 n;
+    struct list_head link;
+    struct {
+        u32 first, last;
+    } r[CETRAFS_DIO_TRACK_RANGES];
+};
+
+/* TEST ONLY: O_DIRECT writes in flight are not tracked, so a unit
+ * convert may zero their blocks (tests/kernel/convert_unit.sh). */
+static bool cetrafs_dio_track_off;
+cetrafs_test_param(dio_track_off, cetrafs_dio_track_off, bool, 0644);
+MODULE_PARM_DESC(dio_track_off, "TEST ONLY: unit converts do not see O_DIRECT writes in flight");
+
+bool cetrafs_dio_is_track(void *p)
+{
+    return p && ((struct cetrafs_dio_track *) p)->magic == CETRAFS_DIO_TRACK_MAGIC;
+}
+
+/* Record [first, first + count) for the DIO whose b_private is 'cur'
+ * (NULL: its first preallocated mapping). Returns the tracker, or NULL
+ * when none could be allocated -- the write must then fail: untracked,
+ * its landed data could be zeroed by a unit convert. Caller holds
+ * invalidate_lock exclusively. */
+void *cetrafs_dio_track_add(struct inode *inode, void *cur, u32 first, u32 count)
+{
+    struct cetrafs_inode_info *ci = CETRAFS_I(inode);
+    struct cetrafs_dio_track *t = cur;
+    u32 last = first + count - 1;
+
+    if (!count)
+        return cur;
+    if (!cetrafs_dio_is_track(t)) {
+        t = kzalloc(sizeof(*t), GFP_NOFS);
+        if (!t)
+            return NULL;
+        t->magic = CETRAFS_DIO_TRACK_MAGIC;
+        INIT_LIST_HEAD(&t->link);
+        spin_lock(&ci->dio_track_lock);
+        list_add(&t->link, &ci->dio_tracks);
+        spin_unlock(&ci->dio_track_lock);
+    }
+    spin_lock(&ci->dio_track_lock);
+    if (t->n < CETRAFS_DIO_TRACK_RANGES) {
+        t->r[t->n].first = first;
+        t->r[t->n].last = last;
+        t->n++;
+    } else {
+        t->r[t->n - 1].first = min(t->r[t->n - 1].first, first);
+        t->r[t->n - 1].last = max(t->r[t->n - 1].last, last);
+    }
+    spin_unlock(&ci->dio_track_lock);
+    return t;
+}
+
+/* The DIO completed (converted, or failed): its ranges are no longer in
+ * flight. After the conversion, so no unit convert sees them free with
+ * their data landed and unconverted. */
+void cetrafs_dio_track_done(struct inode *inode, void *p)
+{
+    struct cetrafs_inode_info *ci = CETRAFS_I(inode);
+    struct cetrafs_dio_track *t = p;
+
+    if (!cetrafs_dio_is_track(t))
+        return;
+    spin_lock(&ci->dio_track_lock);
+    list_del_init(&t->link);
+    spin_unlock(&ci->dio_track_lock);
+    t->magic = 0;
+    kfree(t);
+}
+
+/*
+ * Has an O_DIRECT write in flight mapped any of [first, first + count)?
+ * Its data may have landed, unconverted: a unit convert must neither zero
+ * those blocks nor mark them written. Caller holds invalidate_lock
+ * exclusively, which every mapping that adds a tracker holds too.
+ */
+bool cetrafs_unit_dio_busy(struct inode *inode, u32 first, u32 count)
+{
+    struct cetrafs_inode_info *ci = CETRAFS_I(inode);
+    struct cetrafs_dio_track *t;
+    u32 last = first + count - 1;
+    bool busy = false;
+    u32 i;
+
+    if (!count)
+        return false;
+    if (READ_ONCE(cetrafs_dio_track_off))
+        return false;
+    spin_lock(&ci->dio_track_lock);
+    list_for_each_entry(t, &ci->dio_tracks, link) {
+        for (i = 0; i < t->n && !busy; i++)
+            busy = t->r[i].first <= last && first <= t->r[i].last;
+        if (busy)
+            break;
+    }
+    spin_unlock(&ci->dio_track_lock);
+    return busy;
 }
 
 bool cetrafs_pending_any(struct inode *inode)

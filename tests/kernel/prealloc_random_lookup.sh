@@ -39,6 +39,9 @@ PD="$(basename "$DEV")"
 ct_mkfs "$DEV" -f >/dev/null
 ct_mount "$DEV" "$MNT"
 require_cetrafs_mount "$MNT"
+# The tree is filled a block-sized convert at a time; a 64 KiB convert
+# unit would coalesce the scattered writes that fill it.
+ct_param_set convert_unit_blocks 1
 ct_param_set leaf_split_off 0
 c() { sed -n "s/^$1: //p" "/proc/fs/cetrafs/$PD/info"; }
 

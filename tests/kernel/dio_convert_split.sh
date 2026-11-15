@@ -41,6 +41,9 @@ INFO="$(ct_procdir "$DEV")/info"
 ctr() { awk -F': ' -v k="$1" '$1 == k {print $2}' "$INFO"; }
 ct_param_set auto_defrag 0
 ct_param_set dio_fill_holes 1
+# The splits are built a block at a time; a 64 KiB convert unit would
+# coalesce them before the leaf fills.
+ct_param_set convert_unit_blocks 1
 
 # Every block is stamped with its own number, whichever path wrote it.
 PY_COMMON='
