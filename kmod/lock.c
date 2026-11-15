@@ -6022,6 +6022,12 @@ static int cetrafs_lock_raw_is_inode(struct inode *inode, const cetrafs_inode_t 
  * Returns -ETXTBSY when a peer holds it, which cetrafs_flock() maps to
  * -EWOULDBLOCK (or retries, for a blocking LOCK_EX).
  */
+/* TEST ONLY: bind the steal to the incarnation re-read after the fence
+ * and replay, as d3985fd did (lock_steal_judged_inc.sh's control). */
+static bool cetrafs_lock_steal_reread_inc;
+cetrafs_test_param(lock_steal_reread_inc, cetrafs_lock_steal_reread_inc, bool, 0644);
+MODULE_PARM_DESC(lock_steal_reread_inc, "TEST ONLY: a flock/resume steal binds to the re-read incarnation (F-22)");
+
 /*
  * The lock is held, and a claim was refused for it. If its holder is a
  * DEAD node nothing will ever release it: fence the holder, replay its
@@ -6034,7 +6040,7 @@ static int cetrafs_lock_arm_stale_steal(struct inode *inode, u32 my_node_id, cet
 {
     struct super_block *sb = inode->i_sb;
     bool stale = false;
-    u32 owner;
+    u32 owner, judged_inc;
     int ret;
 
     cetrafs_invalidate_raw_inode(sb, inode->i_ino);
@@ -6042,6 +6048,13 @@ static int cetrafs_lock_arm_stale_steal(struct inode *inode, u32 my_node_id, cet
     if (ret)
         return ret;
     owner = cetrafs_le32(raw->lock_owner_node);
+    /* The incarnation that is JUDGED stale here, before the fence and
+     * the replay -- not one read after them: a holder that re-attached
+     * in between and took the lock again carries a new one, and binding
+     * the steal to the re-read stole a live holder's lock -- two writers
+     * on one image (audit 2026-11-15 F-22). The open path does the same
+     * (stale_incarnation). */
+    judged_inc = cetrafs_le32(raw->lock_owner_incarnation);
     if (!cetrafs_lock_mode_held(cetrafs_le32(raw->lock_mode)) || owner == my_node_id ||
         cetrafs_node_is_stale(sb, owner, &stale) != 0 || !stale)
         return -ETXTBSY;
@@ -6056,6 +6069,7 @@ static int cetrafs_lock_arm_stale_steal(struct inode *inode, u32 my_node_id, cet
         return ret;
     }
     pr_warn("%s: ino=%llu reclaiming a stale lock from node %u\n", who, (unsigned long long) inode->i_ino, owner);
+    cetrafs_node_test_stall_before_swap();
     cetrafs_invalidate_raw_inode(sb, inode->i_ino);
     ret = cetrafs_read_raw_inode(sb, inode->i_ino, raw);
     if (!ret)
@@ -6068,10 +6082,8 @@ static int cetrafs_lock_arm_stale_steal(struct inode *inode, u32 my_node_id, cet
     /* The incarnation judged stale: a lock its node took again after
      * re-attaching is not stealable (F10), and the swap answers
      * -ETXTBSY -- a live holder, keep waiting. */
-    ctx->steal_incarnation = cetrafs_le32(raw->lock_owner_incarnation);
-    if (cetrafs_le32(raw->lock_owner_node) != owner)
-        ctx->steal_incarnation = 0; /* moved on: the swap finds it free or someone else's */
-    cetrafs_node_test_stall_before_swap();
+    ctx->steal_incarnation = READ_ONCE(cetrafs_lock_steal_reread_inc) ? cetrafs_le32(raw->lock_owner_incarnation)
+                                                                         : judged_inc;
     return 0;
 }
 
