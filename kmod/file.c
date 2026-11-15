@@ -4153,6 +4153,117 @@ static int cetrafs_tree_lookup_unchecked(struct inode *inode,
     return 0;
 }
 
+/* Does any extent of an array overlap [lo, hi)? */
+static bool cetrafs_leaf_array_overlaps(const cetrafs_extent_t *arr, u16 entries, u32 lo, u32 hi)
+{
+    u16 i;
+
+    for (i = 0; i < entries; i++) {
+        u64 eb = cetrafs_le32(arr[i].ee_block);
+
+        if (eb < hi && eb + cetrafs_extent_len(arr[i].ee_len) > lo)
+            return true;
+    }
+    return false;
+}
+
+/* May an interior entry's leaf hold anything in [lo, hi)? */
+static bool cetrafs_idx_may_overlap(const cetrafs_extent_idx_t *e, u32 lo, u32 hi)
+{
+    u32 end = cetrafs_le32(e->ei_block_end);
+
+    if (cetrafs_idx_range_ignore || !end)
+        return true;
+    return lo < end && hi > cetrafs_le32(e->ei_block);
+}
+
+/*
+ * Is any block of [lo, hi) mapped (written or preallocated)? 1 yes, 0
+ * no, <0 an error. For a writer holding invalidate_lock: the tree cannot
+ * change under the walk. The leaves read are those whose recorded range
+ * meets [lo, hi) -- for a unit, about the ones the point lookup of a
+ * block in it already read.
+ */
+static int cetrafs_tree_range_mapped(struct inode *inode, const cetrafs_inode_t *raw, u32 lo, u32 hi)
+{
+    u32 ni;
+    bool hit;
+
+    if (cetrafs_le16(raw->eh.eh_depth) == 0)
+        return cetrafs_leaf_array_overlaps(raw->et.leaf,
+                                           min_t(u16, cetrafs_le16(raw->eh.eh_entries), ARRAY_SIZE(raw->et.leaf)), lo,
+                                           hi);
+    if (cetrafs_le16(raw->eh.eh_depth) == 1) {
+        u64 llba = cetrafs_extent_phys_from_hilo(raw->et.idx[0].ei_leaf_hi, raw->et.idx[0].ei_leaf_lo);
+        struct buffer_head *lbh = cetrafs_read_leaf_bh_for(inode, llba, false);
+        const cetrafs_extent_hdr_t *lhdr;
+
+        if (!lbh)
+            return -EIO;
+        lhdr = (const cetrafs_extent_hdr_t *) lbh->b_data;
+        cetrafs_bh_read_lock(lbh);
+        hit = cetrafs_leaf_array_overlaps((const cetrafs_extent_t *) (lbh->b_data + sizeof(*lhdr)),
+                                          min_t(u16, cetrafs_le16(lhdr->eh_entries), CETRAFS_EXT_BLOCK_MAX_LEAVES), lo,
+                                          hi);
+        cetrafs_bh_read_unlock(lbh);
+        brelse(lbh);
+        return hit;
+    }
+    for (ni = 0; ni < cetrafs_le16(raw->eh.eh_entries) && ni < ARRAY_SIZE(raw->et.idx); ni++) {
+        struct buffer_head *ibh;
+        const cetrafs_extent_hdr_t *ihdr;
+        const cetrafs_extent_idx_t *iarr;
+        u32 li;
+
+        if (!cetrafs_idx_may_overlap(&raw->et.idx[ni], lo, hi))
+            continue;
+        ibh = cetrafs_read_index_bh_for(inode,
+                                        cetrafs_extent_phys_from_hilo(raw->et.idx[ni].ei_leaf_hi,
+                                                                      raw->et.idx[ni].ei_leaf_lo),
+                                        false);
+        if (!ibh)
+            return -EIO;
+        ihdr = (const cetrafs_extent_hdr_t *) ibh->b_data;
+        iarr = (const cetrafs_extent_idx_t *) (ibh->b_data + sizeof(*ihdr));
+        for (li = 0;;) {
+            struct buffer_head *lbh;
+            const cetrafs_extent_hdr_t *lhdr;
+            cetrafs_extent_idx_t ie;
+            u32 iln;
+
+            /* One interior lock at a time, never two (as the lookup). */
+            cetrafs_bh_read_lock(ibh);
+            iln = min_t(u32, cetrafs_le16(ihdr->eh_entries), CETRAFS_EXT_BLOCK_MAX_IDX);
+            while (li < iln && !cetrafs_idx_may_overlap(&iarr[li], lo, hi))
+                li++;
+            if (li < iln)
+                ie = iarr[li];
+            cetrafs_bh_read_unlock(ibh);
+            if (li >= iln)
+                break;
+            li++;
+            lbh = cetrafs_read_leaf_bh_for(inode, cetrafs_extent_phys_from_hilo(ie.ei_leaf_hi, ie.ei_leaf_lo), false);
+            if (!lbh) {
+                brelse(ibh);
+                return -EIO;
+            }
+            lhdr = (const cetrafs_extent_hdr_t *) lbh->b_data;
+            cetrafs_bh_read_lock(lbh);
+            hit = cetrafs_leaf_array_overlaps((const cetrafs_extent_t *) (lbh->b_data + sizeof(*lhdr)),
+                                              min_t(u16, cetrafs_le16(lhdr->eh_entries), CETRAFS_EXT_BLOCK_MAX_LEAVES),
+                                              lo, hi);
+            cetrafs_bh_read_unlock(lbh);
+            brelse(lbh);
+            if (hit) {
+                brelse(ibh);
+                return 1;
+            }
+        }
+        brelse(ibh);
+    }
+    return 0;
+}
+
 /*
  * The resolver above, with the one thing it never checked: that the
  * address it produced is one a file's blocks may occupy.
@@ -6890,6 +7001,59 @@ static void cetrafs_convert_widen(struct inode *inode, const cetrafs_inode_t *ra
     atomic64_inc(&cetrafs_convert_widened);
 }
 
+/*
+ * A first write into a SPARSE file's hole allocates the aligned unit
+ * around it (convert_unit_blocks, 64 KiB by default) as one preallocated
+ * extent, its block in place inside it; the write's convert then marks
+ * the whole unit written (cetrafs_convert_widen()). Per block, scattered
+ * first writes -- a database, a guest filesystem on a thin image -- made
+ * one extent each, and a thin image reached the tree's 258,064-extent
+ * ceiling after about 1 GiB of scatter (audit 2026-11-15 A-1, G-1).
+ *
+ * Only where the whole unit is a hole inside i_size AND the block before the write is
+ * one: a write right after mapped data is a sequential fill, which merges
+ * into the extent before it and must not pay a zeroing for blocks it is
+ * about to write anyway. Block 0 likewise. The check is one range walk,
+ * on the allocation path only -- once per unit, not per mapped block.
+ */
+static bool cetrafs_sparse_unit_off;
+cetrafs_test_param(sparse_unit_off, cetrafs_sparse_unit_off, bool, 0644);
+MODULE_PARM_DESC(sparse_unit_off, "TEST ONLY: a first write into a sparse hole allocates its block alone");
+
+static atomic64_t cetrafs_sparse_units = ATOMIC64_INIT(0);
+u64 cetrafs_sparse_unit_count(void)
+{
+    return (u64) atomic64_read(&cetrafs_sparse_units);
+}
+
+/* 0 with the unit start and LBA set when [start, start + unit) was
+ * allocated as one run; anything else: allocate the block alone. */
+static int cetrafs_sparse_unit_alloc(struct inode *inode, const cetrafs_inode_t *raw, sector_t iblock,
+                                     enum cetrafs_gb_mode mode, u32 *out_unit, u64 *ws, u64 *ulba)
+{
+    struct super_block *sb = inode->i_sb;
+    u32 unit = READ_ONCE(cetrafs_convert_unit_blocks), bg_id;
+    u64 lo;
+
+    if (READ_ONCE(cetrafs_sparse_unit_off) || !S_ISREG(inode->i_mode) ||
+        (mode != CETRAFS_GB_DIO && mode != CETRAFS_GB_BUF) || unit <= 1 || unit > 256 || !is_power_of_2(unit) ||
+        !iblock)
+        return -EAGAIN;
+    *ws = iblock & ~(u64) (unit - 1);
+    /* Inside the file's size: a thin image's size is fixed, and that is
+     * the case this is for. Past it, a small file grew a unit's worth of
+     * written zeros beyond its end. */
+    if (*ws + unit > CETRAFS_MAX_FILE_BLOCKS || (*ws + unit) * CETRAFS_BLOCK_SIZE > (u64) i_size_read(inode))
+        return -EAGAIN;
+    lo = *ws == iblock ? iblock - 1 : *ws; /* the unit, and the block before the write */
+    if (cetrafs_tree_range_mapped(inode, raw, (u32) lo, (u32) (*ws + unit)) != 0)
+        return -EAGAIN;
+    if (cetrafs_alloc_pick_bg(sb, &bg_id) || cetrafs_alloc_data_run(sb, bg_id, unit, ulba))
+        return -EAGAIN; /* no run that long here: the block alone, through the full path */
+    *out_unit = unit;
+    return 0;
+}
+
 static int __cetrafs_get_block(struct inode *inode,
                                sector_t iblock,
                                struct buffer_head *bh_result,
@@ -6897,6 +7061,7 @@ static int __cetrafs_get_block(struct inode *inode,
                                bool reader,
                                enum cetrafs_gb_mode mode)
 {
+    u32 nalloc = 1; /* blocks this call allocated */
     u32 want = 1, converted = 1, ahead = 0;
     struct super_block *sb = inode->i_sb;
     cetrafs_inode_t raw;
@@ -7269,6 +7434,23 @@ relookup:
         return ret;
 
     {
+        u64 ws = 0, ulba = 0;
+        u32 unit = 0;
+
+        if (!cetrafs_sparse_unit_alloc(inode, &raw, iblock, mode, &unit, &ws, &ulba)) {
+            ret = cetrafs_tree_append(inode, &raw, (u32) ws, ulba, unit, true, &merged, &leaf_count);
+            if (ret) {
+                cetrafs_free_data_extent(sb, ulba, unit); /* named by nothing: the append failed */
+                return ret;
+            }
+            atomic64_inc(&cetrafs_sparse_units);
+            lba = ulba + (iblock - ws);
+            nalloc = unit;
+            goto allocated;
+        }
+    }
+
+    {
         ktime_t t0 = ktime_get();
         s64 us;
         /*
@@ -7441,8 +7623,9 @@ relookup:
         return ret;
     }
 
-    raw.blocks =
-        cetrafs_cpu_to_le64(cetrafs_le64(raw.blocks) + (CETRAFS_BLOCK_SIZE / 512)); /* the newly allocated data block */
+allocated:
+    raw.blocks = cetrafs_cpu_to_le64(cetrafs_le64(raw.blocks) +
+                                     (u64) nalloc * (CETRAFS_BLOCK_SIZE / 512)); /* the newly allocated data blocks */
 
     /*
      * The hot per-allocated-block path (256 calls for a 1 MiB write).

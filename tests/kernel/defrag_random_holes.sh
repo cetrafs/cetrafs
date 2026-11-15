@@ -29,6 +29,7 @@ MNT="$(ct_mnt rndholes)"
 ct_track mnt "$MNT"
 ct_mkfs "$DEV" -z 1 -b 512 -J 0 -N 1024 -f >/dev/null
 ct_param_set auto_defrag 1 # the harness turns it off for every suite
+ct_param_set sparse_unit_off 1 # the fragmented fill this heals: one extent per random first write
 ct_mount "$DEV" "$MNT"
 require_cetrafs_mount "$MNT"
 
