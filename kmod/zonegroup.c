@@ -2927,7 +2927,10 @@ static int cetrafs_zg_drain_one(struct super_block *sb, u32 zg_id, bool may_wait
     mt_init(&done_mt);
     mt_init(&held_mt);
     ctx = kmalloc(sizeof(*ctx), GFP_NOFS);
-    bhs = kvmalloc_array(qblocks, sizeof(*bhs), GFP_NOFS);
+    /* Zeroed: the exit releases every slot, and a failed ctx allocation
+     * reaches it before the batch read has filled any (audit 2026-11-15
+     * BM-5). */
+    bhs = kvcalloc(qblocks, sizeof(*bhs), GFP_NOFS);
     if (!ctx || !bhs) {
         ret = -ENOMEM;
         goto out;
