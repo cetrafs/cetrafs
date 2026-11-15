@@ -1,6 +1,6 @@
 #!/usr/bin/env bash
 # SPDX-License-Identifier: GPL-2.0-or-later
-# procfs says defrag is unavailable on a nofilelock mount, where every defrag is refused
+# procfs says whether defrag is available, and agrees with what defrag.cetra does
 #
 # The controls file showed "defrag: on" on a nofilelock mount, where the
 # defragmenter has no file lock to pin and cetrafs_lock_defrag_begin()
@@ -8,9 +8,11 @@
 # 2026-11-06 L26). The switch still reads back as set; a read-only
 # defrag_available line beside it says what will happen.
 #
-# Both mounts: the default one must say yes, the nofilelock one no, and
-# defrag.cetra must really be refused there (the line is only worth
-# having if it agrees with the refusal).
+# Both mounts: the default one must say yes. A nofilelock mount runs
+# defrag too since audit 2026-11-14 A-14 (tests/kernel/defrag_nofilelock.sh);
+# with TEST ONLY defrag_nofilelock_off -- the refusal -- it must say no
+# and defrag.cetra must really be refused (the line is only worth having
+# if it agrees with what happens).
 #
 # DISCRIMINATION: without the line, both assertions on it fail.
 set -euo pipefail
@@ -19,6 +21,7 @@ require_root
 require_module
 ct_mode_own # compares the mount modes itself, per mount
 ct_param_set alloc_run_blocks 0
+ct_param_set defrag_nofilelock_off 1
 
 frag() { # a 12-extent file, so a defrag has something to do
     python3 - "$1" "$1.sep" <<'PY'

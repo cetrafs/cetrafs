@@ -311,6 +311,10 @@ struct cetrafs_inode_info {
      * way (pre-held by local writers, or claimed by the mover itself
      * when there were none). */
     bool defrag_pinned;
+    /* The pin's lock was claimed by the pin itself and is the pin's to
+     * give back at defrag_end, writers or not: under nofilelock a writer
+     * never holds the lock, so none will release it (A-14). */
+    bool defrag_owns_lock;
     /* The last writeback publish of this record failed: sync_fs retries it
      * and reports it (audit 2026-11-06 L16). */
     bool wb_publish_failed;
@@ -6224,10 +6228,22 @@ u32 cetrafs_defrag_pin_count(void)
     return (u32) atomic_read(&cetrafs_defrag_pins);
 }
 
+/* TEST ONLY: refuse every defrag under nofilelock, as before A-14 -- the
+ * control of tests/kernel/defrag_nofilelock.sh. */
+static bool cetrafs_defrag_nofilelock_off;
+cetrafs_test_param(defrag_nofilelock_off, cetrafs_defrag_nofilelock_off, bool, 0644);
+MODULE_PARM_DESC(defrag_nofilelock_off, "TEST ONLY: refuse defrag on a nofilelock mount, as before");
+
+bool cetrafs_defrag_nofilelock_refused(void)
+{
+    return READ_ONCE(cetrafs_defrag_nofilelock_off);
+}
+
 int cetrafs_lock_defrag_begin(struct inode *inode)
 {
     struct cetrafs_inode_info *ci = CETRAFS_I(inode);
     struct super_block *sb = inode->i_sb;
+    bool lock_on = cetrafs_sb_file_lock_enabled(sb);
     cetrafs_inode_t raw;
     u32 my_node_id;
     int ret;
@@ -6235,12 +6251,19 @@ int cetrafs_lock_defrag_begin(struct inode *inode)
     if (cetrafs_sb_is_fenced(sb))
         return -EIO;
 
-    /* The defragmenter's safety RESTS on pinning the file's exclusive lock
-     * so no peer can write it mid-relocation. With the lock off (nofilelock)
-     * there is nothing to pin and no mutual exclusion, so relocating would
-     * race a peer's write -- decline. cetrafs_sb_defrag_enabled() stays the
-     * operator switch; this is the hard safety floor under it. */
-    if (!cetrafs_sb_file_lock_enabled(sb))
+    /* The defragmenter's safety RESTS on pinning the file's lock so no
+     * peer can write it mid-relocation. Under nofilelock no open TAKES
+     * that lock, but every open HONOURS one present on the record, in
+     * both modes (cetrafs_lock_open()), and a nofilelock write-open
+     * publishes its presence bit by a swap that refuses it. So the pin
+     * is the same swap there: a peer present before it is seen by the
+     * check after it, and a peer arriving after it asks it to step
+     * aside. What nofilelock changes is only who holds the lock -- never
+     * a local writer, so the pin always claims it, and always gives it
+     * back (defrag_owns_lock). It refused every run: the production
+     * migration mode had no repair for fragmentation at all (audit
+     * 2026-11-14 A-14). TEST ONLY defrag_nofilelock_off: the old refusal. */
+    if (!lock_on && READ_ONCE(cetrafs_defrag_nofilelock_off))
         return -EOPNOTSUPP;
 
     ret = cetrafs_sb_get_node_id(sb, &my_node_id);
@@ -6280,7 +6303,7 @@ int cetrafs_lock_defrag_begin(struct inode *inode)
         goto out;
     }
 
-    if (atomic_read(&ci->lock_writer_count) > 0) {
+    if (lock_on && atomic_read(&ci->lock_writer_count) > 0) {
         /* The lock is already ours via local writers -- but a peer that
          * opened for read BEFORE our writer did is still in. */
         ret = cetrafs_defrag_check_sole(inode, my_node_id);
@@ -6368,6 +6391,7 @@ int cetrafs_lock_defrag_begin(struct inode *inode)
         cetrafs_lock_reconcile_cold(inode, &raw);
 
     ci->defrag_pinned = true;
+    ci->defrag_owns_lock = !lock_on;
     atomic_inc(&cetrafs_defrag_pins);
     ret = 0;
 
@@ -6387,9 +6411,12 @@ void cetrafs_lock_defrag_end(struct inode *inode)
     struct cetrafs_inode_info *ci = CETRAFS_I(inode);
 
     mutex_lock(&ci->lock_mutex);
+    bool owns = ci->defrag_owns_lock;
+
     if (ci->defrag_pinned)
         atomic_dec(&cetrafs_defrag_pins);
     ci->defrag_pinned = false;
+    ci->defrag_owns_lock = false;
     /* If writers appeared during the move, release duty is theirs again
      * (their last close now takes the normal path). If none remain --
      * either there never were any, or they closed while we were pinned
@@ -6400,7 +6427,10 @@ void cetrafs_lock_defrag_end(struct inode *inode)
      * of a node that keeps beating, which stale reclaim never touches,
      * and every peer got -ETXTBSY until this node opened and closed the
      * file again. */
-    if (atomic_read(&ci->lock_writer_count) == 0) {
+    /* nofilelock (owns): the pin's claim is the pin's to give back,
+     * local writers or not -- unless a flock(LOCK_EX) taken meanwhile has
+     * made it that holder's, whose release clears it. */
+    if (atomic_read(&ci->lock_writer_count) == 0 || (owns && !ci->explicit_lock_file)) {
         int ret;
 
         if (cetrafs_defrag_clear_fail_once) {

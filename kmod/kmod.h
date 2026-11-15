@@ -1474,6 +1474,7 @@ struct file_lock;
 int cetrafs_flock(struct file *file, int cmd, struct file_lock *fl);
 int cetrafs_posix_lock_refuse(struct file *file, int cmd, struct file_lock *fl);
 int cetrafs_lock_defrag_begin(struct inode *inode);
+bool cetrafs_defrag_nofilelock_refused(void); /* lock.c, test-only control */
 void cetrafs_lock_defrag_end(struct inode *inode);
 bool cetrafs_lock_defrag_try_queue(struct inode *inode);
 void cetrafs_lock_defrag_unqueue(struct inode *inode);

@@ -641,7 +641,9 @@ static int cetrafs_proc_controls_show(struct seq_file *m, void *v)
      * whatever the switch says. "defrag: on" alone told an operator it
      * would run (audit 2026-11-06 L26). */
     seq_printf(m, "defrag_available: %s\n",
-               cetrafs_sb_file_lock_enabled(sb) ? "yes" : "no (nofilelock: no file lock to pin)");
+               cetrafs_sb_file_lock_enabled(sb) ? "yes"
+               : cetrafs_defrag_nofilelock_refused() ? "no (nofilelock: no file lock to pin)"
+                                                     : "yes (nofilelock: a file no peer has open)");
     seq_printf(m, "hb_interval_secs: %u\n", cetrafs_sb_hb_interval_secs(sb));
     seq_printf(m, "stale_secs: %u\n", cetrafs_sb_stale_secs(sb));
     seq_printf(m, "shutdown: %s\n", cetrafs_sb_is_fenced(sb) ? "yes" : "no");
