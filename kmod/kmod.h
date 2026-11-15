@@ -753,6 +753,7 @@ void cetrafs_bh_read_unlock(struct buffer_head *bh);
  * here -- see ioutil.c. _keep never discards the cached bytes on error. */
 int cetrafs_sync_buffer(struct super_block *sb, struct buffer_head *bh);
 int cetrafs_sync_buffer_keep(struct super_block *sb, struct buffer_head *bh);
+u64 cetrafs_tree_half_full_count(void); /* file.c */
 bool cetrafs_bh_test_stable(struct buffer_head *bh, bool (*test)(const void *data, void *arg), void *arg);
 void cetrafs_bh_copy_stable(struct buffer_head *bh, void *out, size_t len);
 void cetrafs_bh_copy_settled(struct buffer_head *bh, void *out);

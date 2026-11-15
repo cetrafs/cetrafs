@@ -383,6 +383,7 @@ static int cetrafs_proc_info_show(struct seq_file *m, void *v)
     seq_printf(m, "pf_stale_drops: %llu\n", cetrafs_pf_stale_drop_count());
     seq_printf(m, "bg_gen_bumps: %llu\n", cetrafs_bg_gen_bump_count());
     seq_printf(m, "giveback_blocks: %llu\n", cetrafs_giveback_block_count());
+    seq_printf(m, "tree_half_full: %llu\n", cetrafs_tree_half_full_count());
     seq_printf(m, "convert_leaf_full: %llu\n", cetrafs_convert_leaf_full_count());
     seq_printf(m, "leaf_splits: %llu\n", cetrafs_leaf_split_count());
     seq_printf(m, "tree_any_leaf_inserts: %llu\n", cetrafs_tree_any_leaf_count());

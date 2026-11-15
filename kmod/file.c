@@ -4824,6 +4824,63 @@ static bool cetrafs_tree_idx_has_room(u32 entries)
     return entries < max;
 }
 
+/*
+ * A file's extent tree has a fixed ceiling (cetrafs_tree_max_extents(),
+ * docs/internal/LIMITATIONS.md), and a guest's scattered first writes
+ * walk it up one entry each. Reaching it fails writes ENOSPC with the
+ * volume free, so the way there is announced: once a depth-2 tree has
+ * used more than half its leaf blocks, a warning and the info counter
+ * tree_half_full (audit 2026-11-14 A-1). Leaves are what run out -- an
+ * interior is full before the next one is added -- so the count is the
+ * full interiors before the last plus the last one's entries. Until at
+ * least half the interiors exist it reads nothing.
+ */
+static atomic64_t cetrafs_tree_half_full = ATOMIC64_INIT(0);
+
+u64 cetrafs_tree_half_full_count(void)
+{
+    return (u64) atomic64_read(&cetrafs_tree_half_full);
+}
+
+/* Leaf blocks a depth-2 tree uses, or 0 while it cannot be past half. */
+static u32 cetrafs_tree_leaves_if_half(struct inode *inode, const cetrafs_inode_t *raw, u32 *max)
+{
+    u32 rc = READ_ONCE(cetrafs_tree_root_cap), ic = READ_ONCE(cetrafs_tree_idx_cap);
+    u32 rmax = rc && rc < ARRAY_SIZE(raw->et.idx) ? rc : ARRAY_SIZE(raw->et.idx);
+    u32 idx_max = ic && ic < CETRAFS_EXT_BLOCK_MAX_IDX ? ic : CETRAFS_EXT_BLOCK_MAX_IDX;
+    u32 nroot, n;
+    struct buffer_head *ibh;
+    u64 ilba;
+
+    *max = rmax * idx_max;
+    if (cetrafs_le16(raw->eh.eh_magic) != CETRAFS_EXT_MAGIC || cetrafs_le16(raw->eh.eh_depth) != 2)
+        return 0;
+    nroot = min_t(u32, cetrafs_le16(raw->eh.eh_entries), ARRAY_SIZE(raw->et.idx));
+    if (!nroot || (u64) nroot * idx_max * 2 <= *max)
+        return 0;
+    ilba = cetrafs_extent_phys_from_hilo(raw->et.idx[nroot - 1].ei_leaf_hi, raw->et.idx[nroot - 1].ei_leaf_lo);
+    ibh = cetrafs_read_index_bh(inode, ilba);
+    if (!ibh)
+        return 0;
+    n = min_t(u32, cetrafs_le16(((const cetrafs_extent_hdr_t *) ibh->b_data)->eh_entries), idx_max);
+    brelse(ibh);
+    return (nroot - 1) * idx_max + n;
+}
+
+static void cetrafs_tree_note_capacity(struct inode *inode, const cetrafs_inode_t *raw, u32 before)
+{
+    u32 max, after = cetrafs_tree_leaves_if_half(inode, raw, &max);
+
+    if ((u64) after * 2 > max && (u64) before * 2 <= max) {
+        atomic64_inc(&cetrafs_tree_half_full);
+        pr_warn("%s: ino=%llu: extent tree past half full (%u of %u leaf blocks, at most %u extents): "
+                "scattered first writes fail ENOSPC at the limit whatever the volume has free -- "
+                "copy the file to lay it out again\n",
+                inode->i_sb->s_id, (unsigned long long) inode->i_ino, after, max, cetrafs_tree_max_extents());
+    }
+}
+
+
 static bool cetrafs_leaf_split_off;
 /* TEST ONLY (split_hides_extent.sh): the next convert splits its leaf
  * however full it is, and a split puts the new leaf in the interior's
@@ -5330,7 +5387,11 @@ again:
              * holds the block has room now. */
             if (splits < 2 && cetrafs_leaf_split_wanted(inode, lbh)) {
                 bool tail_leaf = ni + 1 == cetrafs_le16(raw->eh.eh_entries) && li + 1 == iln;
+                u32 cmax, cbefore = cetrafs_tree_leaves_if_half(inode, raw, &cmax);
                 int sret = cetrafs_tree_split_leaf(inode, raw, ibh, li, lbh, tail_leaf, moving);
+
+                if (!sret)
+                    cetrafs_tree_note_capacity(inode, raw, cbefore);
 
                 if (sret != CETRAFS_SPLIT_NONE) {
                     brelse(lbh);
@@ -5603,7 +5664,7 @@ static int cetrafs_tree_insert_any_leaf(struct inode *inode,
     return -ENOSPC;
 }
 
-static int cetrafs_tree_append(struct inode *inode,
+static int cetrafs_tree_append_inner(struct inode *inode,
                                cetrafs_inode_t *raw,
                                u32 iblock,
                                u64 lba,
@@ -6074,6 +6135,23 @@ static int cetrafs_tree_append(struct inode *inode,
             }
         }
     }
+}
+
+static int cetrafs_tree_append(struct inode *inode,
+                               cetrafs_inode_t *raw,
+                               u32 iblock,
+                               u64 lba,
+                               u32 count,
+                               bool uninit,
+                               bool *merged,
+                               u32 *leaf_count)
+{
+    u32 max, before = cetrafs_tree_leaves_if_half(inode, raw, &max);
+    int ret = cetrafs_tree_append_inner(inode, raw, iblock, lba, count, uninit, merged, leaf_count);
+
+    if (!ret)
+        cetrafs_tree_note_capacity(inode, raw, before);
+    return ret;
 }
 
 /*
