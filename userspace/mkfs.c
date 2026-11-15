@@ -208,7 +208,8 @@ static void usage(const char *argv0)
     fprintf(stderr,
             "Usage: %s <blockdev> [-z ZGs] [-b BG_MiB] [-N inodes] [-J MiB] [-M nodes]\n"
             "       [-s size] [-n] [-f]\n"
-            "  -z: number of Zone Groups (1..%u), default 16 (clamped down to\n"
+            "  -z: number of Zone Groups (1..%u), default the larger of 16 and -M\n"
+            "      -- one per node that may ever write (clamped down to\n"
             "      however many Block Groups the device can actually back if\n"
             "      fewer than that -- a ZG with no BGs is never useful, even if\n"
             "      -z was given explicitly)\n"
@@ -422,7 +423,8 @@ int main(int argc, char **argv)
 
     const char *dev = argv[1];
 
-    u32 zg_count = 16;                                 /* default */
+    u32 zg_count = 16;                                 /* default: see zg_explicit */
+    bool zg_explicit = false;
     u64 bg_size_bytes = CETRAFS_DEFAULT_BG_SIZE_BYTES; /* default 1 GiB */
     u64 inodes_total = 0;                              /* 0 => derive */
     u64 j_per_node_bytes = 2ULL * 1024 * 1024;         /* 2 MiB per node slot */
@@ -443,6 +445,7 @@ int main(int argc, char **argv)
             if (v < 1 || v > (long long) CETRAFS_MAX_ZONE_GROUPS)
                 die_arg("-z out of range");
             zg_count = (u32) v;
+            zg_explicit = true;
             break;
         }
         case 'b': {
@@ -544,6 +547,12 @@ int main(int argc, char **argv)
             return 2; /* bad option */
         }
     }
+
+    /* Default: one Zone Group per node that may ever write (A-13). */
+    if (!zg_explicit)
+        zg_count = (u32) (node_table_count > 16 ? (node_table_count < CETRAFS_MAX_ZONE_GROUPS ? node_table_count
+                                                                                           : CETRAFS_MAX_ZONE_GROUPS)
+                                                : 16);
 
     /* Safety first: never format a device a kernel on this system has
      * mounted -- not even with -f or in dry-run; -f is about overwriting
@@ -798,6 +807,19 @@ int main(int argc, char **argv)
                 zg_count, B, B);
         zg_count = (u32) B;
     }
+
+    /* A Zone Group is owned by one node at a time and a node allocates
+     * only from groups it owns, so a node past the zg_count-th mounts
+     * cleanly and fails its first allocating write ENOSPC (audit
+     * 2026-11-14 A-13). Said loudly, not refused: a small volume cannot
+     * back more, and a test or single-node volume does not need it. */
+    if (zg_count < node_table_count)
+        fprintf(stderr,
+                "warning: %u Zone Group(s) for up to %llu nodes (-M): at most %u node(s) can ever write to this\n"
+                "         volume. A node beyond that mounts and then fails every allocating write with ENOSPC.\n"
+                "         Pass -M with the real cluster size%s.\n",
+                zg_count, (unsigned long long) node_table_count, zg_count,
+                zg_explicit ? ", or a larger -z" : ", or a larger device");
 
     const u64 bg_table_blk = B; /* one block per BG */
     const u64 consumed = total_blocks - waste;
