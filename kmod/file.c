@@ -240,6 +240,16 @@ static int cetrafs_dio_mark_convert(struct inode *inode, struct buffer_head *bh,
     return 0;
 }
 
+/* TEST ONLY: a directory's growth publishes its record under the old
+ * dirent_seq (the old behaviour; tests/kernel/dir_grow_stamp.sh). */
+static bool cetrafs_dir_grow_no_stamp;
+cetrafs_test_param(dir_grow_no_stamp, cetrafs_dir_grow_no_stamp, bool, 0644);
+MODULE_PARM_DESC(dir_grow_no_stamp, "TEST ONLY: a directory's growth record keeps its old dirent_seq");
+/* TEST ONLY: the next directory growth pauses after its record write. */
+static unsigned int cetrafs_dir_grow_stall_ms;
+cetrafs_test_param(dir_grow_stall_ms, cetrafs_dir_grow_stall_ms, uint, 0644);
+MODULE_PARM_DESC(dir_grow_stall_ms, "TEST ONLY: the next directory growth pauses after publishing its record");
+
 static int __cetrafs_get_block(struct inode *inode,
                                sector_t iblock,
                                struct buffer_head *bh_result,
@@ -7736,7 +7746,18 @@ allocated:
      * and directories grow once per ~15 entries, so this is not hot.
      */
     if (S_ISDIR(inode->i_mode)) {
+        /* The stamp moves with the block set (rule 10): a peer's walk
+         * judges its cached dirent blocks by dirent_seq alone, and with
+         * the new extent published under the old stamp it read the new
+         * block from its cache -- for a block it held in an earlier life
+         * (a dirent block of a directory since removed), a valid block
+         * of somebody else's directory, until the entry's release moved
+         * the stamp (audit 2026-11-15 BM N-72). */
+        if (!READ_ONCE(cetrafs_dir_grow_no_stamp))
+            raw.dirent_seq = cetrafs_cpu_to_le64(cetrafs_inode_new_generation(sb));
         ret = cetrafs_write_raw_inode_self(inode, &raw, /*sync=*/true);
+        if (!ret && unlikely(READ_ONCE(cetrafs_dir_grow_stall_ms)))
+            msleep(xchg(&cetrafs_dir_grow_stall_ms, 0)); /* test-only, one-shot */
         if (ret) {
             /* Same as above: the leaf (depth 1) is already on the device
              * or in the journal naming 'lba', and a failed record write's
