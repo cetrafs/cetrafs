@@ -29,7 +29,10 @@ MNT="$(ct_mnt xctime)"
 ct_mkfs_small "$DEV" >/dev/null
 ct_mount "$DEV" "$MNT"
 require_cetrafs_mount "$MNT"
-: >"$MNT/f"
+# A directory: a regular file's block is replaced and its pointer and
+# ctime published in one swap (audit 2026-11-15 BM N-74); the in-place
+# write followed by a ctime stamp is a directory's.
+mkdir "$MNT/f"
 sx() { python3 -c 'import os, sys; os.setxattr(sys.argv[1], "user.k", sys.argv[2].encode())' "$MNT/f" "$1"; }
 gx() { python3 -c 'import os, sys; print(os.getxattr(sys.argv[1], "user.k").decode())' "$MNT/f"; }
 sx one # the block exists: the next set rewrites it in place

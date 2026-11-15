@@ -337,34 +337,274 @@ static unsigned int cetrafs_xattr_set_stall_ms;
 cetrafs_test_param(xattr_set_stall_ms, cetrafs_xattr_set_stall_ms, uint, 0644);
 MODULE_PARM_DESC(xattr_set_stall_ms, "TEST ONLY: one-shot pause after setxattr's first peer-user check");
 
+/* TEST ONLY: the old setxattr -- no guard inside the swap, a regular
+ * file's block edited in place (xattr_set_peer_late.sh's control). */
+static bool cetrafs_xattr_swap_unguarded;
+cetrafs_test_param(xattr_swap_unguarded, cetrafs_xattr_swap_unguarded, bool, 0644);
+MODULE_PARM_DESC(xattr_swap_unguarded, "TEST ONLY: setxattr's swap asks nothing and a file's block is edited in place");
+
+/*
+ * What setxattr judged about the file's peers (regular files only:
+ * nothing else can be open for write on another node).
+ */
+struct cetrafs_xattr_guard {
+    bool on;
+    u32 my_node_id;
+    u32 judged_owner;
+    u64 judged_readers;
+};
+
 /*
  * -ETXTBSY if a live peer holds this file's lock or has it open; 0 if
- * not. Asked at the start of a setxattr and AGAIN immediately before
- * each of its publishes (audit 2026-11-11 X2): the operation does a
- * block allocation, a block write and a flush between the two, and a
- * peer's open -- which takes no namespace lock -- landing in that time
- * was allowed to have its file's metadata rewritten under it, the access
- * rule's one-writer guarantee broken. The open publishes in the record's
- * lock sector and this publishes in its namespace sector, so the two
- * cannot be one compare-and-swap; what is left is the microseconds from
- * this re-check to the swap.
+ * not. Asked at the start of a setxattr -- 'settle': a peer's
+ * background mover is asked to yield and waited out, as nothing has
+ * been read yet -- and again, without waiting, before the publish
+ * (audit 2026-11-11 X2; a wait there would hold an allocated, unnamed
+ * block through it: audit 2026-11-15 BM N-74).
+ *
+ * Neither ask is the last word: a peer's open takes no namespace lock,
+ * and the publish is one or more device round trips after the second
+ * ask. What the asks judged is therefore asked once more INSIDE the
+ * publishing swap (cetrafs_xattr_guard_refuses()): the lock and presence
+ * fields live in the same sector as the xattr pointer, so a lock or
+ * presence neither ask judged refuses the publish atomically -- as
+ * setattr's swap does (cetrafs_ns_apply_setattr()).
  */
-static int cetrafs_xattr_peer_user(struct inode *inode)
+static int cetrafs_xattr_peer_user(struct inode *inode, struct cetrafs_xattr_guard *g, bool settle)
 {
     struct super_block *sb = inode->i_sb;
     bool blocked = false, reader = false;
-    u32 my_node_id = 0;
     int ret;
 
+    g->on = false;
     if (!S_ISREG(inode->i_mode))
         return 0;
-    ret = cetrafs_sb_get_node_id(sb, &my_node_id);
+    ret = cetrafs_sb_get_node_id(sb, &g->my_node_id);
     if (ret)
         return ret;
-    ret = cetrafs_lock_foreign_user_settled(inode, my_node_id, &blocked, &reader, NULL, NULL);
+    g->judged_owner = CETRAFS_NODE_ID_NONE;
+    g->judged_readers = 0;
+    if (settle)
+        ret = cetrafs_lock_foreign_user_settled(inode, g->my_node_id, &blocked, &reader, &g->judged_owner,
+                                                &g->judged_readers);
+    else
+        ret = cetrafs_lock_foreign_user_judged(sb, inode->i_ino, g->my_node_id, &blocked, &reader, &g->judged_owner,
+                                               &g->judged_readers);
     if (ret)
         return ret;
-    return blocked || reader ? -ETXTBSY : 0;
+    if (blocked || reader)
+        return -ETXTBSY;
+    g->on = !READ_ONCE(cetrafs_xattr_swap_unguarded);
+    return 0;
+}
+
+/* Inside the swap: a lock or presence on the live image the asks did not
+ * judge. Per attempt -- a retry re-reads the image. */
+static bool cetrafs_xattr_guard_refuses(const struct cetrafs_xattr_guard *g, const cetrafs_inode_t *rec)
+{
+    u64 mine = 1ULL << (g->my_node_id % CETRAFS_MAX_READER_NODES);
+    u32 owner = cetrafs_le32(rec->lock_owner_node);
+
+    if (!g->on)
+        return false;
+    if (cetrafs_lock_mode_held(cetrafs_le32(rec->lock_mode)) && owner != g->my_node_id && owner != g->judged_owner)
+        return true;
+    return (cetrafs_le64(rec->read_open_nodes) & ~mine & ~g->judged_readers) != 0;
+}
+
+/* TEST ONLY: hold a setxattr after its second peer-user ask, right before
+ * its publish (tests/kernel/xattr_set_peer_late.sh, audit 2026-11-15
+ * BM N-74). One-shot. */
+static unsigned int cetrafs_xattr_pre_publish_stall_ms;
+cetrafs_test_param(xattr_pre_publish_stall_ms, cetrafs_xattr_pre_publish_stall_ms, uint, 0644);
+MODULE_PARM_DESC(xattr_pre_publish_stall_ms, "TEST ONLY: one-shot pause between setxattr's second ask and its publish");
+
+static void cetrafs_xattr_pre_publish_stall(void)
+{
+    if (unlikely(READ_ONCE(cetrafs_xattr_pre_publish_stall_ms)))
+        msleep(xchg(&cetrafs_xattr_pre_publish_stall_ms, 0)); /* TEST ONLY */
+}
+
+/* The xattr pointer swap: refused, nothing applied, when the guard finds
+ * a peer it did not judge, or when the live pointer is no longer the one
+ * this operation decided from (the namespace lock was lost). */
+struct cetrafs_xattr_ns_publish {
+    struct cetrafs_xattr_guard *g;
+    struct cetrafs_xattr_ns_update u;
+    __le64 expect_block;
+    int refused; /* 0, -ETXTBSY or -ESTALE: per attempt */
+};
+
+static void cetrafs_ns_apply_xattr_guarded(cetrafs_inode_t *rec, void *arg)
+{
+    struct cetrafs_xattr_ns_publish *p = arg;
+
+    p->refused = 0;
+    if (cetrafs_xattr_guard_refuses(p->g, rec)) {
+        p->refused = -ETXTBSY;
+        return;
+    }
+    if (rec->xattr_block != p->expect_block) {
+        p->refused = -ESTALE;
+        return;
+    }
+    cetrafs_ns_apply_xattr(rec, &p->u);
+}
+
+/* Publish xattr_block = 'lba' (0: none) over 'expect', guarded. */
+static int cetrafs_xattr_publish(struct inode *inode, cetrafs_inode_t *raw, struct cetrafs_xattr_guard *g, u64 lba,
+                                 u64 now)
+{
+    struct super_block *sb = inode->i_sb;
+    struct cetrafs_xattr_ns_publish p = {
+        .g = g,
+        .u = {.xattr_block = cetrafs_cpu_to_le64(lba), .set_flag = lba != 0, .ctime = now,
+              .seq = cetrafs_inode_new_generation(sb)},
+        .expect_block = raw->xattr_block,
+    };
+    int ret;
+
+    ret = cetrafs_inode_ns_cas(sb, inode->i_ino, cetrafs_le64(raw->generation), raw, cetrafs_ns_apply_xattr_guarded,
+                               &p);
+    if (!ret && p.refused) {
+        if (p.refused == -ETXTBSY)
+            pr_info_ratelimited("setxattr: ino=%llu: a peer opened the file during the change -- refused, "
+                                "nothing applied\n",
+                                (unsigned long long) inode->i_ino);
+        else
+            pr_warn("setxattr: ino=%llu: its xattr pointer changed under the namespace lock -- refused\n",
+                    (unsigned long long) inode->i_ino);
+        ret = p.refused;
+    }
+    return ret;
+}
+
+/* A new xattr block holding 'img', written and durable, named by nothing
+ * yet. On success *out_lba names it; on failure it is given back. */
+static int cetrafs_xattr_write_new(struct super_block *sb, const void *img, u64 *out_lba)
+{
+    struct buffer_head *bh;
+    u32 bg_id;
+    u64 lba;
+    int ret;
+
+    ret = cetrafs_alloc_block_anywhere(sb, &bg_id, &lba);
+    if (ret)
+        return ret;
+    bh = cetrafs_getblk_overwrite(sb, lba);
+    if (!bh) {
+        cetrafs_free_data_block(sb, lba);
+        return -EIO;
+    }
+    memcpy(bh->b_data, img, CETRAFS_BLOCK_SIZE);
+    cetrafs_blk_tail_stamp(bh, CETRAFS_XATTR_TAIL_MAGIC);
+    ret = cetrafs_journal_write_new_block(sb, bh);
+    brelse(bh);
+    /* Written is not durable: on a volatile cache the record naming
+     * this block could survive a power cut without it (rule 8; audit
+     * 2026-11-06 L2). Nothing names it yet, so a refused flush gives
+     * it back. */
+    if (!ret)
+        ret = cetrafs_publish_flush(sb);
+    if (ret) {
+        cetrafs_free_data_block(sb, lba);
+        return ret;
+    }
+    *out_lba = lba;
+    return 0;
+}
+
+/*
+ * Apply set/remove of 'name' to the entry array 'arr' (a whole block).
+ * 0, or -EEXIST/-ENODATA/-ENOSPC with 'arr' unchanged. *any_left: an
+ * entry remains.
+ */
+static int cetrafs_xattr_edit(cetrafs_xattr_entry_t *arr, const char *name, const void *value, size_t size,
+                              int flags, bool *any_left)
+{
+    unsigned int i;
+    int idx = cetrafs_xattr_find_slot(arr, name);
+
+    if (idx >= 0) {
+        if (value && (flags & XATTR_CREATE))
+            return -EEXIST;
+        memset(&arr[idx], 0, sizeof(arr[idx]));
+        if (value) {
+            strscpy(arr[idx].key, name, CETRAFS_XATTR_KEY_MAX);
+            arr[idx].value_len = cetrafs_cpu_to_le16((u16) size);
+            if (unlikely(READ_ONCE(cetrafs_xattr_edit_stall_ms)))
+                msleep(READ_ONCE(cetrafs_xattr_edit_stall_ms)); /* TEST ONLY: see the parameter */
+            if (size)
+                memcpy(arr[idx].value, value, size);
+        }
+    } else {
+        int free_idx = -1;
+
+        if (!value || (flags & XATTR_REPLACE))
+            return -ENODATA;
+        for (i = 0; i < CETRAFS_XATTR_ENTRIES_PER_BLOCK; i++) {
+            if (cetrafs_xattr_slot_free(&arr[i])) {
+                free_idx = (int) i;
+                break;
+            }
+        }
+        if (free_idx < 0)
+            return -ENOSPC;
+        strscpy(arr[free_idx].key, name, CETRAFS_XATTR_KEY_MAX);
+        arr[free_idx].value_len = cetrafs_cpu_to_le16((u16) size);
+        if (size)
+            memcpy(arr[free_idx].value, value, size);
+    }
+    *any_left = false;
+    for (i = 0; i < CETRAFS_XATTR_ENTRIES_PER_BLOCK; i++) {
+        if (!cetrafs_xattr_slot_free(&arr[i])) {
+            *any_left = true;
+            break;
+        }
+    }
+    return 0;
+}
+
+/*
+ * Replace or drop the block 'raw' names: publish 'new_lba' (0: none) in
+ * its place, then free the old one. Between the publish and the free the
+ * old block is named by nothing and not yet free: announced first
+ * (cetrafs_frees_begin()). A failed publish gives 'new_lba' back.
+ */
+static int cetrafs_xattr_swap_block(struct inode *inode, cetrafs_inode_t *raw, struct cetrafs_xattr_guard *g,
+                                    u64 new_lba, u64 now)
+{
+    struct super_block *sb = inode->i_sb;
+    u64 old_lba = cetrafs_le64(raw->xattr_block);
+    bool foreign = !cetrafs_lba_run_is_ours(sb, old_lba, 1);
+    int ret;
+
+    ret = cetrafs_frees_begin(sb, &foreign);
+    if (!ret) {
+        cetrafs_xattr_pre_publish_stall();
+        ret = cetrafs_xattr_publish(inode, raw, g, new_lba, now);
+        if (ret)
+            cetrafs_frees_end(sb, foreign);
+    }
+    if (ret) {
+        if (new_lba)
+            cetrafs_free_data_block(sb, new_lba);
+        return ret;
+    }
+    /* The free must not reach the device ahead of the publish that
+     * stopped naming the block (rule 21; audit 2026-11-06 L2). A
+     * refused flush leaks it to the scrub rather than freeing a block
+     * the durable record may still name. */
+    if (cetrafs_publish_flush(sb)) {
+        pr_err("setxattr: ino=%llu: the device refused a cache flush -- leaving xattr block %llu allocated "
+               "for the scrub\n",
+               (unsigned long long) inode->i_ino, (unsigned long long) old_lba);
+        cetrafs_frees_end(sb, foreign);
+        return 0;
+    }
+    cetrafs_free_data_block(sb, old_lba);
+    cetrafs_frees_end(sb, foreign);
+    return 0;
 }
 
 /* 'now': the ctime to stamp, in seconds; 0 stamps none. */
@@ -372,14 +612,13 @@ static int cetrafs_xattr_set_locked(struct inode *inode, const char *name, const
                                     u64 now)
 {
     struct super_block *sb = inode->i_sb;
+    struct cetrafs_xattr_guard g;
     cetrafs_inode_t raw;
     struct buffer_head *bh;
     cetrafs_xattr_entry_t *arr;
     size_t name_len = strlen(name);
-    unsigned int i;
-    int idx, ret;
     bool any_left;
-    bool foreign; /* the freed block is outside our own groups (cetrafs_frees_begin()) */
+    int ret;
 
     if (name_len >= CETRAFS_XATTR_KEY_MAX)
         return -ENAMETOOLONG;
@@ -409,8 +648,9 @@ static int cetrafs_xattr_set_locked(struct inode *inode, const char *name, const
      * in-flight updates described above. Refuse on a peer READER too, as
      * unlink, rename, link and truncate already do: rewriting a whole
      * record is not something to do under any peer that has the file
-     * open. Asked again right before each publish below (rule 15). */
-    ret = cetrafs_xattr_peer_user(inode);
+     * open. Asked again before the publish, and inside it
+     * (cetrafs_xattr_peer_user()). */
+    ret = cetrafs_xattr_peer_user(inode, &g, true);
     if (ret)
         return ret;
     if (READ_ONCE(cetrafs_xattr_set_stall_ms))
@@ -437,50 +677,27 @@ static int cetrafs_xattr_set_locked(struct inode *inode, const char *name, const
     }
 
     if (!raw.xattr_block) {
+        void *img;
         u64 lba;
-        u32 bg_id;
 
         if (!value || (flags & XATTR_REPLACE))
             return -ENODATA;
-
-        ret = cetrafs_alloc_block_anywhere(sb, &bg_id, &lba);
-        if (ret)
-            return ret;
-        bh = cetrafs_getblk_overwrite(sb, lba);
-        if (!bh) {
-            cetrafs_free_data_block(sb, lba);
-            return -EIO;
-        }
-        memset(bh->b_data, 0, CETRAFS_BLOCK_SIZE);
-        arr = (cetrafs_xattr_entry_t *) bh->b_data;
+        img = kzalloc(CETRAFS_BLOCK_SIZE, GFP_NOFS);
+        if (!img)
+            return -ENOMEM;
+        arr = img;
         strscpy(arr[0].key, name, CETRAFS_XATTR_KEY_MAX);
         arr[0].value_len = cetrafs_cpu_to_le16((u16) size);
         if (size)
             memcpy(arr[0].value, value, size);
-
-        cetrafs_blk_tail_stamp(bh, CETRAFS_XATTR_TAIL_MAGIC);
-        ret = cetrafs_journal_write_new_block(sb, bh);
-        brelse(bh);
-        /* Written is not durable: on a volatile cache the record naming
-         * this block could survive a power cut without it (rule 8; audit
-         * 2026-11-06 L2). Nothing names it yet, so a refused flush gives
-         * it back. */
-        if (!ret)
-            ret = cetrafs_publish_flush(sb);
-        if (!ret)
-            ret = cetrafs_xattr_peer_user(inode);
-        if (ret) {
-            cetrafs_free_data_block(sb, lba);
+        ret = cetrafs_xattr_write_new(sb, img, &lba);
+        kfree(img);
+        if (ret)
             return ret;
-        }
-
-        {
-            struct cetrafs_xattr_ns_update u = {
-                .xattr_block = cetrafs_cpu_to_le64(lba), .set_flag = true, .ctime = now,
-                .seq = cetrafs_inode_new_generation(sb)};
-
-            ret = cetrafs_inode_ns_cas(sb, inode->i_ino, cetrafs_le64(raw.generation), &raw,
-                                       cetrafs_ns_apply_xattr, &u);
+        ret = cetrafs_xattr_peer_user(inode, &g, false);
+        if (!ret) {
+            cetrafs_xattr_pre_publish_stall();
+            ret = cetrafs_xattr_publish(inode, &raw, &g, lba, now);
         }
         if (ret) {
             cetrafs_free_data_block(sb, lba);
@@ -495,118 +712,75 @@ static int cetrafs_xattr_set_locked(struct inode *inode, const char *name, const
         return 0;
     }
 
-    /* The peer-user question again, before the claim: from here to the
-     * block write is memory only (X2). */
-    ret = cetrafs_xattr_peer_user(inode);
+    /*
+     * A regular file's block is replaced, not edited in place: the new
+     * image goes to a new block, and the pointer swap that names it is
+     * the one publish -- guarded inside the swap like the others. The
+     * in-place write could not be: a 4 KiB blind write with no swap to
+     * ask in, a read, a journal entry and two flushes after the last
+     * ask, so a peer's open landing there had the file's attributes
+     * changed under it (audit 2026-11-15 BM N-74). Other kinds keep the
+     * in-place edit: nothing opens them for write on another node.
+     */
+    if (S_ISREG(inode->i_mode) && !READ_ONCE(cetrafs_xattr_swap_unguarded)) {
+        void *img;
+        u64 lba = 0;
+
+        bh = cetrafs_blk_tail_bread(sb, cetrafs_le64(raw.xattr_block), CETRAFS_XATTR_TAIL_MAGIC, "xattr");
+        if (!bh)
+            return -EIO;
+        img = kmalloc(CETRAFS_BLOCK_SIZE, GFP_NOFS);
+        if (img) {
+            cetrafs_bh_read_lock(bh);
+            memcpy(img, bh->b_data, CETRAFS_BLOCK_SIZE);
+            cetrafs_bh_read_unlock(bh);
+        }
+        brelse(bh);
+        if (!img)
+            return -ENOMEM;
+        ret = cetrafs_xattr_edit(img, name, value, size, flags, &any_left);
+        if (!ret && any_left)
+            ret = cetrafs_xattr_write_new(sb, img, &lba);
+        kfree(img);
+        if (ret)
+            return ret;
+        ret = cetrafs_xattr_peer_user(inode, &g, false);
+        if (ret) {
+            if (lba)
+                cetrafs_free_data_block(sb, lba);
+            return ret;
+        }
+        return cetrafs_xattr_swap_block(inode, &raw, &g, lba, now);
+    }
+
+    /* The ask again before the edit: other kinds have no peer user to
+     * judge (a no-op), and the TEST ONLY old order asks it here. */
+    ret = cetrafs_xattr_peer_user(inode, &g, false);
     if (ret)
         return ret;
+    if (S_ISREG(inode->i_mode))
+        cetrafs_xattr_pre_publish_stall(); /* the old order's window */
     bh = cetrafs_blk_tail_bread(sb, cetrafs_le64(raw.xattr_block), CETRAFS_XATTR_TAIL_MAGIC, "xattr");
     if (!bh)
         return -EIO;
-    /* Claim it before touching any entry -- see ioutil.c. Every early
-     * exit below (-EEXIST, -ENODATA, -ENOSPC) has modified nothing and
-     * gives the claim up with cetrafs_bh_abort_update(): nothing is
-     * written. */
-    const u32 prev_crc = cetrafs_bh_begin_update_crc(bh);
-    arr = (cetrafs_xattr_entry_t *) bh->b_data;
+    /* Claim it before touching any entry -- see ioutil.c. An early exit
+     * (-EEXIST, -ENODATA, -ENOSPC) has modified nothing and gives the
+     * claim up with cetrafs_bh_abort_update(): nothing is written. */
+    {
+        const u32 prev_crc = cetrafs_bh_begin_update_crc(bh);
 
-    idx = cetrafs_xattr_find_slot(arr, name);
-    if (idx >= 0) {
-        if (!value) {
-            memset(&arr[idx], 0, sizeof(arr[idx]));
-        } else if (flags & XATTR_CREATE) {
+        ret = cetrafs_xattr_edit((cetrafs_xattr_entry_t *) bh->b_data, name, value, size, flags, &any_left);
+        if (ret || !any_left) {
+            /* the last entry gone: the block is freed, nothing written */
             cetrafs_bh_abort_update(bh);
             brelse(bh);
-            return -EEXIST;
-        } else {
-            memset(&arr[idx], 0, sizeof(arr[idx]));
-            strscpy(arr[idx].key, name, CETRAFS_XATTR_KEY_MAX);
-            arr[idx].value_len = cetrafs_cpu_to_le16((u16) size);
-            if (unlikely(READ_ONCE(cetrafs_xattr_edit_stall_ms)))
-                msleep(READ_ONCE(cetrafs_xattr_edit_stall_ms)); /* TEST ONLY: see the parameter */
-            if (size)
-                memcpy(arr[idx].value, value, size);
+            if (ret)
+                return ret;
+            return cetrafs_xattr_swap_block(inode, &raw, &g, 0, now);
         }
-    } else {
-        int free_idx = -1;
-
-        if (!value) {
-            cetrafs_bh_abort_update(bh);
-            brelse(bh);
-            return -ENODATA;
-        }
-        if (flags & XATTR_REPLACE) {
-            cetrafs_bh_abort_update(bh);
-            brelse(bh);
-            return -ENODATA;
-        }
-        for (i = 0; i < CETRAFS_XATTR_ENTRIES_PER_BLOCK; i++) {
-            if (cetrafs_xattr_slot_free(&arr[i])) {
-                free_idx = (int) i;
-                break;
-            }
-        }
-        if (free_idx < 0) {
-            cetrafs_bh_abort_update(bh);
-            brelse(bh);
-            return -ENOSPC;
-        }
-        strscpy(arr[free_idx].key, name, CETRAFS_XATTR_KEY_MAX);
-        arr[free_idx].value_len = cetrafs_cpu_to_le16((u16) size);
-        if (size)
-            memcpy(arr[free_idx].value, value, size);
+        cetrafs_blk_tail_stamp(bh, CETRAFS_XATTR_TAIL_MAGIC);
+        ret = cetrafs_journal_write_block(sb, cetrafs_journal_owner_of(inode), bh, prev_crc);
     }
-
-    any_left = false;
-    for (i = 0; i < CETRAFS_XATTR_ENTRIES_PER_BLOCK; i++) {
-        if (!cetrafs_xattr_slot_free(&arr[i])) {
-            any_left = true;
-            break;
-        }
-    }
-
-    if (!any_left) {
-        u64 old_lba = cetrafs_le64(raw.xattr_block);
-
-        /* The block is about to be freed, so there is nothing worth
-         * publishing -- just give up the claim. */
-        cetrafs_bh_abort_update(bh);
-        brelse(bh);
-        /* Between the clear and the free the block is named by nothing
-         * and not yet free: announced first (cetrafs_frees_begin()). */
-        foreign = !cetrafs_lba_run_is_ours(sb, old_lba, 1);
-        ret = cetrafs_frees_begin(sb, &foreign);
-        if (ret)
-            return ret;
-        {
-            struct cetrafs_xattr_ns_update u = {.xattr_block = 0, .set_flag = false, .ctime = now,
-                                                .seq = cetrafs_inode_new_generation(sb)};
-
-            ret = cetrafs_inode_ns_cas(sb, inode->i_ino, cetrafs_le64(raw.generation), &raw,
-                                       cetrafs_ns_apply_xattr, &u);
-        }
-        if (ret) {
-            cetrafs_frees_end(sb, foreign);
-            return ret;
-        }
-        /* The free must not reach the device ahead of the clear that
-         * stopped naming the block (rule 21; audit 2026-11-06 L2). A
-         * refused flush leaks it to the scrub rather than freeing a
-         * block the durable record may still name. */
-        if (cetrafs_publish_flush(sb)) {
-            pr_err("removexattr: ino=%llu: the device refused a cache flush -- leaving xattr block %llu allocated "
-                   "for the scrub\n",
-                   (unsigned long long) inode->i_ino, (unsigned long long) old_lba);
-            cetrafs_frees_end(sb, foreign);
-            return 0;
-        }
-        cetrafs_free_data_block(sb, old_lba);
-        cetrafs_frees_end(sb, foreign);
-        return 0;
-    }
-
-    cetrafs_blk_tail_stamp(bh, CETRAFS_XATTR_TAIL_MAGIC);
-    ret = cetrafs_journal_write_block(sb, cetrafs_journal_owner_of(inode), bh, prev_crc);
     brelse(bh);
     if (ret || !now)
         return ret;

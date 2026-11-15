@@ -83,7 +83,10 @@ python3 -I -c "
 import os, sys
 os.setxattr(sys.argv[1], 'user.k', b'value-of-A')" "$MNT/a"
 sync
-[ "$("$REC_POKE" "$IMG" xattrblk "$AINO")" = "$LA" ] || { fail "setup: A's xattr block moved to $("$REC_POKE" "$IMG" xattrblk "$AINO")"; ct_exit; }
+# A regular file's re-set writes a new block (audit 2026-11-15 BM N-74):
+# the block the listing reads is wherever A's record names it now.
+LA="$("$REC_POKE" "$IMG" xattrblk "$AINO")"
+[ -n "$LA" ] && [ "$LA" != 0 ] || { fail "setup: A has no xattr block after the re-set"; ct_exit; }
 ct_param_set xattr_read_pause_ms 1500
 MARK="$(dmesg_mark)"
 python3 -I -c "

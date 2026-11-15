@@ -43,8 +43,11 @@ ct_param_set auto_defrag 0
 ct_track mnt "$MNT"
 ct_mount "$DEV" "$MNT"
 require_cetrafs_mount "$MNT"
+# A directory: a regular file's xattr block is replaced, never edited
+# in place (audit 2026-11-15 BM N-74); the in-place edit this suite
+# holds open is a directory's (or a symlink's).
 F="$MNT/victim"
-echo x >"$F"
+mkdir "$F"
 python3 -c 'import os, sys; os.setxattr(sys.argv[1], "user.k", b"A" * 64)' "$F"
 sync
 
