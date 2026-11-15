@@ -696,6 +696,8 @@ bool cetrafs_blk_struct_ok_magic(const struct buffer_head *bh, u32 magic);
 bool cetrafs_blk_image_valid(const void *img, u32 magic);
 struct buffer_head *cetrafs_blk_tail_bread(struct super_block *sb, u64 lba, u32 magic, const char *what);
 int cetrafs_cas_region(struct super_block *sb, u64 fs_lba, unsigned int region_idx, cetrafs_cas_fn mutate, void *priv);
+int cetrafs_cas_region_judged(struct super_block *sb, u64 fs_lba, unsigned int region_idx, cetrafs_cas_fn mutate,
+                              void *priv, bool *image_only);
 /* Seeded variants: pass the caller's already-fresh image of the region to
  * skip the CAS's own read on the first attempt. A stale seed costs one
  * failed CAW and falls back to a fresh re-read -- never correctness. */
@@ -760,6 +762,7 @@ u64 cetrafs_meta_nospc_count(void);
 u64 cetrafs_tree_half_full_count(void); /* file.c */
 u64 cetrafs_close_nospc_drop_count(void); /* lock.c */
 u64 cetrafs_held_flush_batch_count(void); /* ioutil.c */
+u64 cetrafs_ibmap_abandoned_count(void); /* alloc.c */
 extern bool cetrafs_convert_append_nospc; /* lock.c, test-only */
 bool cetrafs_bh_test_stable(struct buffer_head *bh, bool (*test)(const void *data, void *arg), void *arg);
 void cetrafs_bh_copy_stable(struct buffer_head *bh, void *out, size_t len);

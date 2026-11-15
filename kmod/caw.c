@@ -154,6 +154,12 @@ MODULE_PARM_DESC(caw_fail_path_once, "TEST ONLY: fail the next CAW issued over a
  * Both must end with the mutator having been applied EXACTLY ONCE. A
  * mutator that adds a delta is the one that can tell the difference.
  */
+/* TEST ONLY: the next swap made through cetrafs_cas_region_judged() is
+ * executed and then reported timed out (tests/kernel/ibmap_cas_image_only.sh). */
+static bool cetrafs_cas_judged_timeout_once;
+cetrafs_test_param(cas_judged_timeout_once, cetrafs_cas_judged_timeout_once, bool, 0644);
+MODULE_PARM_DESC(cas_judged_timeout_once, "TEST ONLY: next judged CAS executes, then reports a timeout");
+
 static bool cetrafs_caw_timeout_landed_once;
 cetrafs_test_param(caw_timeout_landed_once, cetrafs_caw_timeout_landed_once, bool, 0644);
 MODULE_PARM_DESC(caw_timeout_landed_once, "TEST ONLY: next CAW executes, then reports a timeout");
@@ -1167,7 +1173,8 @@ static int cetrafs_cas_region_seeded_impl(struct super_block *sb,
                                           cetrafs_cas_fn mutate,
                                           void *priv,
                                           bool sole_region,
-                                          bool killable)
+                                          bool killable,
+                                          bool *image_only)
 {
     const struct cetrafs_caw_info *caw = cetrafs_sb_caw(sb);
     bool have_caw = cetrafs_sb_caw_available(sb);
@@ -1395,6 +1402,9 @@ static int cetrafs_cas_region_seeded_impl(struct super_block *sb,
             xchg(&cetrafs_cas_stall_ino, 0))
             msleep(READ_ONCE(cetrafs_cas_stall_ms)); /* TEST ONLY: between the read and the swap */
         ret = cetrafs_caw(sb->s_bdev, dev_lba, 1, old, new, killable);
+        if (image_only && ret == 0 && READ_ONCE(cetrafs_cas_judged_timeout_once) &&
+            xchg(&cetrafs_cas_judged_timeout_once, false))
+            ret = -ETIMEDOUT; /* TEST ONLY: landed, reported timed out -- see the parameter */
         {
             /* DEBUG: every inode-bitmap CAS, with everything needed to
              * compare two nodes' wins for one bit: the exact device
@@ -1466,6 +1476,8 @@ static int cetrafs_cas_region_seeded_impl(struct super_block *sb,
             if (!memcmp(vb + off, new, region)) {
                 pr_warn("CAS lba=%llu: command timed out but the swap IS on the device -- taking it as done\n",
                         (unsigned long long) fs_lba);
+                if (image_only)
+                    *image_only = true; /* a peer's identical swap reads the same */
                 kfree(vb);
                 cetrafs_cas_publish_cache(sb, fs_lba, off, new, region, sole_region);
                 ret = 0;
@@ -1513,6 +1525,8 @@ static int cetrafs_cas_region_seeded_impl(struct super_block *sb,
             if (!vret && !memcmp(vb + off, unknown, region)) {
                 pr_warn("CAS lba=%llu: the timed-out command landed late -- taking it as done\n",
                         (unsigned long long) fs_lba);
+                if (image_only)
+                    *image_only = true;
                 kfree(vb);
                 cetrafs_cas_publish_cache(sb, fs_lba, off, unknown, region, sole_region);
                 ret = 0;
@@ -1589,8 +1603,29 @@ static int cetrafs_cas_region_seeded_publish(struct super_block *sb,
                                              bool killable)
 {
     int ret = cetrafs_cas_region_seeded_impl(sb, fs_lba, region_idx, seed, seed_len, mutate, priv, sole_region,
-                                             killable);
+                                             killable, NULL);
 
+    cetrafs_rec_epoch_bump(sb, fs_lba);
+    return ret;
+}
+
+/*
+ * cetrafs_cas_region(), telling the caller when its success was decided
+ * from the image alone: the command's outcome was unknown and the region
+ * was found holding this swap's post-image. That is our swap -- or a
+ * peer's that built the same bytes from the same pre-image, which a
+ * mutator carrying no writer identity does (the inode allocator takes
+ * the lowest free bit, so two creators build identical images). Such a
+ * caller cannot act on the success as its own (audit 2026-11-14 B-4).
+ */
+int cetrafs_cas_region_judged(struct super_block *sb, u64 fs_lba, unsigned int region_idx, cetrafs_cas_fn mutate,
+                              void *priv, bool *image_only)
+{
+    int ret;
+
+    *image_only = false;
+    ret = cetrafs_cas_region_seeded_impl(sb, fs_lba, region_idx, NULL, 0, mutate, priv, /*sole_region=*/false,
+                                         /*killable=*/true, image_only);
     cetrafs_rec_epoch_bump(sb, fs_lba);
     return ret;
 }

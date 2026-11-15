@@ -462,6 +462,19 @@ static int cetrafs_bmap_cas_mutate(void *image, unsigned int len, void *priv)
     return 0;
 }
 
+/* TEST ONLY: take a bit claimed by a swap of unknown outcome as ours,
+ * as before B-4 (tests/kernel/ibmap_cas_image_only.sh). */
+static bool cetrafs_ibmap_trust_image;
+cetrafs_test_param(ibmap_trust_image, cetrafs_ibmap_trust_image, bool, 0644);
+MODULE_PARM_DESC(ibmap_trust_image, "TEST ONLY: an inode number claimed by an unknown-outcome swap is used");
+
+static atomic64_t cetrafs_ibmap_abandoned = ATOMIC64_INIT(0);
+
+u64 cetrafs_ibmap_abandoned_count(void)
+{
+    return (u64) atomic64_read(&cetrafs_ibmap_abandoned);
+}
+
 /* Walk the global inode bitmap region by region, trying to claim a free
  * bit in each via CAS. Returns the global bit index, or -ENOSPC. */
 static long cetrafs_inode_bitmap_cas_alloc(struct super_block *sb)
@@ -481,13 +494,28 @@ static long cetrafs_inode_bitmap_cas_alloc(struct super_block *sb)
         for (r = 0; r < regions_per_block; r++) {
             u64 base = blk * CETRAFS_BITS_PER_BLOCK + (u64) r * region * 8;
             struct cetrafs_bmap_cas_ctx ctx = {.alloc = true};
+            bool image_only;
             int ret;
 
             if (base >= nbits)
                 return -ENOSPC;
             ctx.valid_bits = min_t(u64, (u64) region * 8, nbits - base);
 
-            ret = cetrafs_cas_region(sb, start + blk, r, cetrafs_bmap_cas_mutate, &ctx);
+        again:
+            ret = cetrafs_cas_region_judged(sb, start + blk, r, cetrafs_bmap_cas_mutate, &ctx, &image_only);
+            if (ret == 0 && image_only && !READ_ONCE(cetrafs_ibmap_trust_image)) {
+                /* Decided from the image alone: the bit is set, but a
+                 * peer that read the same region built the same bytes,
+                 * and may be the one that set it -- two creators with one
+                 * virgin number, two names on one record (audit
+                 * 2026-11-14 B-4). Not ours to use: it stays set, a leak
+                 * the scrub reclaims, and the next free bit is tried. */
+                atomic64_inc(&cetrafs_ibmap_abandoned);
+                pr_warn("inode bitmap: bit %llu was claimed by a swap whose outcome was unknown -- not "
+                        "taken; another number is used\n",
+                        (unsigned long long) (base + ctx.bit));
+                goto again;
+            }
             if (ret == 0)
                 return (long) (base + ctx.bit);
             if (ret == -ENOSPC)
