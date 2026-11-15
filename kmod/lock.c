@@ -1841,26 +1841,74 @@ static int cetrafs_tree_resv_provision(struct super_block *sb, u64 lba)
     return ret;
 }
 
+/* TEST ONLY: provision the reserve one block at a time, each write
+ * waited for -- as before F-5 (tests/kernel/tree_resv_batched.sh). */
+static bool cetrafs_resv_provision_serial;
+cetrafs_test_param(resv_provision_serial, cetrafs_resv_provision_serial, bool, 0644);
+MODULE_PARM_DESC(resv_provision_serial, "TEST ONLY: reserved tree blocks are written one at a time");
+
 int cetrafs_tree_resv_fill(struct inode *inode)
 {
     struct cetrafs_inode_info *ci = CETRAFS_I(inode);
+    struct super_block *sb = inode->i_sb;
+    struct buffer_head *bhs[ARRAY_SIZE(ci->tree_resv_lba)];
+    unsigned int first = ci->tree_resv_n, n = 0, i;
+    int ret = 0;
 
     if (READ_ONCE(cetrafs_convert_append_nospc))
         return -ENOSPC;
-    while (ci->tree_resv_n < ARRAY_SIZE(ci->tree_resv_lba)) {
-        int ret = cetrafs_tree_block_anywhere(inode->i_sb, &ci->tree_resv_bg[ci->tree_resv_n],
+    if (READ_ONCE(cetrafs_resv_provision_serial)) {
+        while (ci->tree_resv_n < ARRAY_SIZE(ci->tree_resv_lba)) {
+            ret = cetrafs_tree_block_anywhere(sb, &ci->tree_resv_bg[ci->tree_resv_n],
                                               &ci->tree_resv_lba[ci->tree_resv_n]);
-
-        if (ret)
-            return ret;
-        ret = cetrafs_tree_resv_provision(inode->i_sb, ci->tree_resv_lba[ci->tree_resv_n]);
-        if (ret) {
-            cetrafs_free_data_block(inode->i_sb, ci->tree_resv_lba[ci->tree_resv_n]);
-            return ret;
+            if (ret)
+                return ret;
+            ret = cetrafs_tree_resv_provision(sb, ci->tree_resv_lba[ci->tree_resv_n]);
+            if (ret) {
+                cetrafs_free_data_block(sb, ci->tree_resv_lba[ci->tree_resv_n]);
+                return ret;
+            }
+            ci->tree_resv_n++;
         }
+        return 0;
+    }
+    /* Every block allocated first, then all written together (F-5). */
+    while (ci->tree_resv_n < ARRAY_SIZE(ci->tree_resv_lba)) {
+        ret = cetrafs_tree_block_anywhere(sb, &ci->tree_resv_bg[ci->tree_resv_n], &ci->tree_resv_lba[ci->tree_resv_n]);
+        if (ret)
+            break;
         ci->tree_resv_n++;
     }
-    return 0;
+    if (!READ_ONCE(cetrafs_resv_provision_off)) {
+        for (i = first; i < ci->tree_resv_n; i++) {
+            struct buffer_head *bh = cetrafs_getblk_overwrite(sb, ci->tree_resv_lba[i]);
+
+            if (!bh) {
+                ret = ret ? ret : -EIO;
+                break;
+            }
+            memset(bh->b_data, 0, CETRAFS_BLOCK_SIZE);
+            cetrafs_bh_end_update(bh);
+            bhs[n++] = bh;
+        }
+        if (n) {
+            int wret = cetrafs_sync_new_buffers(sb, bhs, n);
+
+            if (wret && (!ret || wret == -ENOSPC))
+                ret = wret;
+        }
+        for (i = 0; i < n; i++)
+            brelse(bhs[i]);
+    }
+    if (ret) {
+        /* None of this fill is referenced: all of it goes back, so a
+         * refused fill leaves the reserve as it found it. */
+        while (ci->tree_resv_n > first) {
+            ci->tree_resv_n--;
+            cetrafs_free_data_block(sb, ci->tree_resv_lba[ci->tree_resv_n]);
+        }
+    }
+    return ret;
 }
 
 /* A tree block for an append: a reserved one first. */

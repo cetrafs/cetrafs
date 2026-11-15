@@ -865,6 +865,100 @@ int cetrafs_sync_new_buffer(struct super_block *sb, struct buffer_head *bh)
     return cetrafs_meta_write_result(sb, bh, ret);
 }
 
+/* One new block's write in a batch: cetrafs_sync_new_buffers(). */
+struct cetrafs_new_io {
+    struct completion *all;
+    atomic_t *left;
+    int status;
+};
+
+static void cetrafs_new_io_end(struct bio *bio)
+{
+    struct cetrafs_new_io *io = bio->bi_private;
+
+    io->status = blk_status_to_errno(bio->bi_status);
+    bio_put(bio);
+    if (atomic_dec_and_test(io->left))
+        complete(io->all);
+}
+
+/*
+ * cetrafs_sync_new_buffer() for several new blocks at once: every write
+ * submitted under one plug, then all waited for, each judged as that
+ * function judges one (a full thin pool is the operation's ENOSPC, any
+ * other failure the mount's). The tree reserve wrote its four blocks
+ * one at a time, each waited for -- ~150 ms per convert that needs room
+ * on a SAN (F-5). Returns the first error, ENOSPC before any other.
+ */
+int cetrafs_sync_new_buffers(struct super_block *sb, struct buffer_head **bhs, unsigned int n)
+{
+    struct cetrafs_new_io io[8];
+    DECLARE_COMPLETION_ONSTACK(all);
+    atomic_t left;
+    struct blk_plug plug;
+    unsigned int i;
+    int ret = 0, r;
+
+    if (n > ARRAY_SIZE(io) || READ_ONCE(cetrafs_new_block_nospc) || READ_ONCE(cetrafs_meta_write_nospc)) {
+        /* larger sets, and the test injections, one at a time */
+        for (i = 0; i < n; i++) {
+            r = cetrafs_sync_new_buffer(sb, bhs[i]);
+            if (r && (!ret || r == -ENOSPC))
+                ret = r;
+        }
+        return ret;
+    }
+    if (cetrafs_sb_is_fenced(sb))
+        return -EIO;
+    atomic_set(&left, n + 1);
+    blk_start_plug(&plug);
+    for (i = 0; i < n; i++) {
+        struct buffer_head *bh = bhs[i];
+        struct bio *bio;
+
+        io[i].all = &all;
+        io[i].left = &left;
+        io[i].status = 0;
+        lock_buffer(bh);
+        clear_buffer_dirty(bh);
+        clear_buffer_cetra_held(bh);
+        clear_buffer_write_io_error(bh);
+        bio = bio_alloc(bh->b_bdev, 1, REQ_OP_WRITE | REQ_SYNC | REQ_META, GFP_NOIO);
+        bio->bi_iter.bi_sector = bh->b_blocknr * (bh->b_size >> 9);
+        bio_add_folio_nofail(bio, bh->b_folio, bh->b_size, offset_in_folio(bh->b_folio, bh->b_data));
+        bio->bi_end_io = cetrafs_new_io_end;
+        bio->bi_private = &io[i];
+        submit_bio(bio);
+    }
+    blk_finish_plug(&plug);
+    if (!atomic_dec_and_test(&left))
+        wait_for_completion_io(&all);
+    for (i = 0; i < n; i++) {
+        struct buffer_head *bh = bhs[i];
+
+        r = io[i].status;
+        if (r) {
+            set_buffer_write_io_error(bh);
+            clear_buffer_uptodate(bh);
+        } else {
+            set_buffer_uptodate(bh);
+        }
+        unlock_buffer(bh);
+        if (r == -ENOSPC && !READ_ONCE(cetrafs_nospc_stops)) {
+            atomic64_inc(&cetrafs_meta_nospc);
+            pr_warn_ratelimited("%s: the device has no space for a new metadata block (%llu): the operation fails "
+                                "with ENOSPC -- a thin-provisioned LUN out of space?\n",
+                                sb->s_id, (unsigned long long) bh->b_blocknr);
+            cetrafs_forget_block(sb, bh->b_blocknr);
+        } else {
+            r = cetrafs_meta_write_result(sb, bh, r);
+        }
+        if (r && (!ret || r == -ENOSPC))
+            ret = r;
+    }
+    return ret;
+}
+
 int cetrafs_sync_buffer_keep(struct super_block *sb, struct buffer_head *bh)
 {
     if (cetrafs_sb_is_fenced(sb))

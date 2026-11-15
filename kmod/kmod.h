@@ -758,6 +758,7 @@ void cetrafs_bh_read_unlock(struct buffer_head *bh);
 int cetrafs_sync_buffer(struct super_block *sb, struct buffer_head *bh);
 int cetrafs_sync_buffer_keep(struct super_block *sb, struct buffer_head *bh);
 int cetrafs_sync_new_buffer(struct super_block *sb, struct buffer_head *bh);
+int cetrafs_sync_new_buffers(struct super_block *sb, struct buffer_head **bhs, unsigned int n);
 u64 cetrafs_meta_nospc_count(void);
 u64 cetrafs_tree_half_full_count(void); /* file.c */
 u64 cetrafs_close_nospc_drop_count(void); /* lock.c */
