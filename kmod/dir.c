@@ -2430,6 +2430,10 @@ struct cetrafs_ns_window {
  * in round trips of CETRAFS_NS_WALK_BATCH, not one per inode.
  */
 /* 'inos' must be ascending and without repeats when n > 8. */
+/* TEST ONLY: the recount trusts the cached inode bitmap (B-22's control). */
+static bool cetrafs_ns_count_cached_bmap;
+cetrafs_test_param(ns_count_cached_bmap, cetrafs_ns_count_cached_bmap, bool, 0644);
+
 int cetrafs_ns_count_names(struct super_block *sb, const u64 *inos, u32 n, u32 *counts)
 {
     const cetrafs_superblock_t *raw_sb = cetrafs_sb_raw(sb);
@@ -2454,6 +2458,20 @@ int cetrafs_ns_count_names(struct super_block *sb, const u64 *inos, u32 n, u32 *
         goto out;
     }
     ninodes = le32_to_cpu(raw_sb->inodes_count);
+    /*
+     * The inode bitmap fresh, first: it decides which records are walked
+     * at all, and a cached block changes only on this node's own swaps.
+     * A directory a peer created since was skipped, the file it names
+     * counted 0, and 0 is the count that frees it -- the destructive
+     * direction of staleness (rule 6; audit 2026-11-15 B-22). A handful
+     * of blocks, under a lock already held; as the scrub's fresh pass.
+     */
+    if (!READ_ONCE(cetrafs_ns_count_cached_bmap)) {
+        u64 b, bstart = le64_to_cpu(raw_sb->inode_bmap_start), bn = le64_to_cpu(raw_sb->inode_bmap_blocks);
+
+        for (b = 0; b < bn; b++)
+            cetrafs_invalidate_block(sb, bstart + b);
+    }
     for (d = 1; d <= ninodes; d += CETRAFS_NS_WALK_BATCH) {
         u64 end = min_t(u64, d + CETRAFS_NS_WALK_BATCH - 1, ninodes), x;
         u32 nw = 0, j;
