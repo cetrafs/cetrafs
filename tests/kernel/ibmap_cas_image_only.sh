@@ -19,7 +19,8 @@
 #   1. the create after it gets a number past the one that swap claimed,
 #      and info counts the abandoned bit;
 #   2. creates after it go on normally; fsck reports no error.
-#   3. the abandoned number's record is stamped dead: two scrub cycles
+#   3. the abandoned number's record -- zeros, staged: mkfs writes every
+#      slot dead since F-12 -- is stamped dead: two scrub cycles
 #      run over it, meet no never-written record (which stops a cycle's
 #      frees, review F-11) and count no damage; fsck finds no
 #      never-written record.
@@ -45,6 +46,7 @@ ct_param_set scrub_interval_secs 3
 ct_param_set scrub_gap_floor_secs 1
 ct_param_set scrub_gap_secs 2
 WHY="$(ct_tmp ibci-why)"
+SB_POKE="$(ct_helper sb_poke)"
 
 # <trust 0|1> [<no stamp 0|1>] -> "a=<ino> b=<ino> c=<ino> abandoned=<delta> cycles=<n> damage=<n> unknown=<n> unwritten=<0|1> fsck=<clean|ERR>"
 round() {
@@ -56,6 +58,15 @@ round() {
     proc="$(ct_procdir "$disk")"
     touch "$MNT/a"
     a="$(stat -c %i "$MNT/a")"
+    # The number the swap will claim, a+1, as a slot of zeros: mkfs writes
+    # every slot dead now (F-12), and the stamp is for the slot that is
+    # not -- damage, or a slot fsck never restamped.
+    # Unmounted: the target's view of a slot written behind a live mount
+    # is not coherent sector by sector.
+    ct_umount "$MNT"
+    eval "$("$SB_POKE" "$img" | grep -E '^inode_table_start=')"
+    dd if=/dev/zero of="$img" bs=4096 seek=$((inode_table_start + a)) count=1 conv=notrunc,fsync status=none
+    ct_mount "$disk" "$MNT"
     n0="$(sed -n 's/^ibmap_abandoned: //p' "$proc/info")"
     echo "${2:-0}" >/sys/module/cetrafs/parameters/ibmap_abandon_no_stamp
     echo "$1" >/sys/module/cetrafs/parameters/ibmap_trust_image

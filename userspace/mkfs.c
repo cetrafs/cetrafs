@@ -1112,7 +1112,36 @@ int main(int argc, char **argv)
 
     /* zero them */
     zero_blocks(fd, i_bmap_lba, i_bmap_blk, !dry_run);
-    zero_blocks(fd, i_tbl_lba, i_tbl_blk, !dry_run);
+    /* Every slot a DEAD record, not zeros (cetrafs_inode_dead_stamp_us()).
+     * An all-zero record cannot be told from a live one read back as
+     * zeros, so no walk that frees may take it as empty -- and a create
+     * that stopped between its bit and its record left exactly that,
+     * stopping every node's scrub until an offline fsck -r (audit
+     * 2026-11-15 F-12). A dead record is what the orphan scrub reclaims.
+     * Same bytes on the wire as the zeroing it replaces, batched. */
+    if (!dry_run) {
+        const u64 batch = 256;
+        u8 *tb = (u8 *) calloc(batch, CETRAFS_BLOCK_SIZE);
+
+        if (!tb)
+            die("out of memory for the inode table");
+        for (u64 b = 0; b < i_tbl_blk; b += batch) {
+            u64 n = i_tbl_blk - b < batch ? i_tbl_blk - b : batch;
+
+            memset(tb, 0, (size_t) (n * CETRAFS_BLOCK_SIZE));
+            for (u64 k = 0; k < n; ++k) {
+                u64 ino = b + k + 1;
+                cetrafs_inode_t rec;
+
+                if (ino > inodes_total)
+                    break; /* past the last number: zeros, as before */
+                cetrafs_inode_dead_stamp_us(&rec, ino);
+                memcpy(tb + k * CETRAFS_BLOCK_SIZE, &rec, sizeof(rec));
+            }
+            pwrite_all(fd, tb, (size_t) (n * CETRAFS_BLOCK_SIZE), (off_t) ((i_tbl_lba + b) * CETRAFS_BLOCK_SIZE));
+        }
+        free(tb);
+    }
 
     /* ----------------------- */
     /* --- Node Registry  --- */

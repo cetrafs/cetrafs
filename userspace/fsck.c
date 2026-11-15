@@ -4857,6 +4857,21 @@ int main(int argc, char **argv)
                     orphans_freed++;
                     repairs_made++;
                 } else if (nlinks[ino] == 0 && repair_mode && !repair_blocked) {
+                    /* A record never written goes back as a DEAD one, as
+                     * mkfs writes every slot: left zeros, the next
+                     * create of this number would open the window where
+                     * a stop leaves a record no walk can judge (audit
+                     * 2026-11-15 F-12). */
+                    uint8_t zb[CETRAFS_BLOCK_SIZE];
+                    cetrafs_inode_t zin;
+
+                    pread_all(fd, zb, sizeof(zb),
+                              (off_t) (cetrafs_le64(sb.inode_table_start) + ino - 1) * CETRAFS_BLOCK_SIZE);
+                    memcpy(&zin, zb, sizeof(zin));
+                    if (!cetrafs_inode_crcs_ok(&zin) && (fsck_all_zero(zb, sizeof(zb)) || fsck_half_born(&zin, ino))) {
+                        cetrafs_inode_dead_stamp_us(&zin, ino);
+                        fsck_write_inode(fd, &sb, ino, &zin);
+                    }
                     ibmap[bit / 8] &= (uint8_t) ~(1u << (bit % 8));
                     ibmap_dirty = 1;
                     orphans_freed++;

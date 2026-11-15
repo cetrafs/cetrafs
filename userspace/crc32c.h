@@ -107,6 +107,23 @@ static inline void cetrafs_inode_stamp_crcs_us(cetrafs_inode_t *in)
     in->fd_checksum = cetrafs_cpu_to_le64(cetrafs_inode_crc_fd_us(in));
 }
 
+/* A dead record for inode number 'ino': named by nothing, owning
+ * nothing, unlocked -- what a free leaves and what every create claims
+ * (cetrafs_inode_birth_claim()). mkfs writes one into every slot, so no
+ * slot is ever all zeros: a create that stops between its bit and its
+ * record leaves this, which the orphan scrub reclaims, not a record no
+ * walk can judge (audit 2026-11-15 F-12). */
+static inline void cetrafs_inode_dead_stamp_us(cetrafs_inode_t *in, uint64_t ino)
+{
+    memset(in, 0, sizeof(*in));
+    in->ino = cetrafs_cpu_to_le64(ino);
+    in->ns_lock_owner = cetrafs_cpu_to_le32(CETRAFS_NODE_ID_NONE);
+    in->dirent_seq = cetrafs_cpu_to_le64(1);
+    in->eh.eh_magic = cetrafs_cpu_to_le16(CETRAFS_EXT_MAGIC);
+    in->eh.eh_max = cetrafs_cpu_to_le16(4);
+    cetrafs_inode_stamp_crcs_us(in);
+}
+
 /* Both sectors checksum-valid AND agreeing on identity. A mismatch
  * between the sectors' identities is a half-landed whole-record write --
  * transient on a live volume, a fault on a quiet one. */

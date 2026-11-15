@@ -199,14 +199,18 @@ fresh
 ct_umount "$MNT"
 SBPOKE="$(ct_helper sb_poke)"
 IBM="$("$SBPOKE" "$DEV" | sed -n 's/^inode_bmap_start=//p')"
+ITS="$("$SBPOKE" "$DEV" | sed -n 's/^inode_table_start=//p')"
 N=9
-python3 -I - "$IMG" "$IBM" "$N" <<'PY'
+# The slot zeros as well: mkfs writes every slot dead since F-12, so a
+# never-written record is now a slot that is not -- damage, or an old one.
+python3 -I - "$IMG" "$IBM" "$N" "$ITS" <<'PY'
 import os, sys
-img, ibm, ino = sys.argv[1], int(sys.argv[2]), int(sys.argv[3])
+img, ibm, ino, its = sys.argv[1], int(sys.argv[2]), int(sys.argv[3]), int(sys.argv[4])
 fd = os.open(img, os.O_RDWR)
 off = ibm * 4096 + (ino - 1) // 8
 b = os.pread(fd, 1, off)[0]
 os.pwrite(fd, bytes([b | (1 << ((ino - 1) % 8))]), off)
+os.pwrite(fd, bytes(4096), (its + ino - 1) * 4096)
 os.fsync(fd)
 PY
 blockdev --flushbufs "$DEV"
@@ -215,6 +219,16 @@ grep -q "WARN: inode $N is marked in use but its record was never written" <<<"$
     pass "4: set up -- the bit is set over an all-zero record, reported as an interrupted create" ||
     { fail "4: not set up: $(grep -E '^(ERR|WARN)' <<<"$FSCK_OUT" | head -3)"; ct_exit; }
 converge "4"
+# Freed, the slot goes back as a dead record, as mkfs writes them: left
+# zeros, the next create of the number re-opens F-12's window.
+python3 -I - "$IMG" "$ITS" "$N" <<'PY' | grep -q dead &&
+import sys
+img, its, ino = sys.argv[1], int(sys.argv[2]), int(sys.argv[3])
+with open(img, "rb") as f:
+    f.seek((its + ino - 1) * 4096)
+    print("zeros" if f.read(4096) == bytes(4096) else "dead")
+PY
+    pass "4: fsck -r wrote the freed slot back as a dead record" || fail "4: fsck -r left the freed slot zeros"
 
 # ---------------------------------------------------------------- 5
 log "5: a deleted directory whose block a live file now holds"
