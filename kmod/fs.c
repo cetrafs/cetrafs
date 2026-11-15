@@ -4744,6 +4744,35 @@ bool cetrafs_sb_release_ended_since(struct super_block *sb, int seq)
     return cetrafs_sb_release_seq(sb) != seq;
 }
 
+/* Hold off every release while a Block Group is claimed into a Zone
+ * Group this node owns (zonegroup.c). Killable; -EINTR when killed.
+ * TEST ONLY release_claim_unlocked: the old, unlocked claim. */
+static bool cetrafs_release_claim_unlocked;
+cetrafs_test_param(release_claim_unlocked, cetrafs_release_claim_unlocked, bool, 0644);
+MODULE_PARM_DESC(release_claim_unlocked, "TEST ONLY: a pool claim does not wait out a Zone Group release");
+
+int cetrafs_sb_release_read_lock(struct super_block *sb)
+{
+    struct cetrafs_sb_info *sbi = sb->s_fs_info;
+
+    if (READ_ONCE(cetrafs_release_claim_unlocked))
+        return 0;
+    if (READ_ONCE(cetrafs_release_wait_unkillable)) {
+        down_read(&sbi->release_rwsem); /* test-only: the old, unkillable wait */
+        return 0;
+    }
+    /* Killable (class 20), like cetrafs_sb_release_wait(): a release can
+     * hold the lock across a discard. */
+    return down_read_killable(&sbi->release_rwsem) ? -EINTR : 0;
+}
+
+void cetrafs_sb_release_read_unlock(struct super_block *sb)
+{
+    if (READ_ONCE(cetrafs_release_claim_unlocked))
+        return;
+    up_read(&((struct cetrafs_sb_info *) sb->s_fs_info)->release_rwsem);
+}
+
 void cetrafs_sb_release_wait(struct super_block *sb)
 {
     struct cetrafs_sb_info *sbi = sb->s_fs_info;
@@ -6200,12 +6229,18 @@ void cetrafs_sb_set_bg_owner(struct super_block *sb, u32 bg_id, u32 zg_id)
     if (!c)
         return;
 
+    /* Under owned_lock, like the derive (cetrafs_sb_owned_bgs_derive()):
+     * otherwise a release's derive could run between this test of
+     * owned_zgs and the set_bit, and the group stayed marked ours in a
+     * Zone Group given away (audit 2026-11-14 A-2). */
+    spin_lock(&sbi->owned_lock);
     WRITE_ONCE(c->bg_owner_zg[i], (u16) zg_id);
     if (zg_id < CETRAFS_MAX_ZONE_GROUPS && test_bit(zg_id, sbi->owned_zgs) &&
         !cetrafs_sb_bg_discard_pending_ignored(sbi, bg_id))
         set_bit(i, c->owned_bgs), set_bit(i, c->release_check);
     else
         clear_bit(i, c->owned_bgs);
+    spin_unlock(&sbi->owned_lock);
 }
 
 /* Any Zone Group this node owns, for claiming a free Block Group into.

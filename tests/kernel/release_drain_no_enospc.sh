@@ -89,7 +89,7 @@ killed_wait() {
     w=$!
     WAITED=""
     for _ in $(seq 1 40); do
-        grep -q cetrafs_sb_release_wait "/proc/$w/stack" 2>/dev/null && { WAITED=1; break; }
+        grep -qE 'cetrafs_sb_release_(wait|read_lock)' "/proc/$w/stack" 2>/dev/null && { WAITED=1; break; }
         sleep 0.1
     done
     t0=$(date +%s%N)

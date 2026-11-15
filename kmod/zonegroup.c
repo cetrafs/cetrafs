@@ -1790,6 +1790,13 @@ u64 cetrafs_release_held_delta_count(void)
     return (u64) atomic64_read(&cetrafs_release_held_delta);
 }
 
+/* TEST ONLY: hold the next Zone Group release after its members are
+ * proven empty and durable, before its CAS, once
+ * (tests/kernel/zg_release_vs_pool_claim.sh). */
+static unsigned int cetrafs_zg_release_stall_ms;
+cetrafs_test_param(zg_release_stall_ms, cetrafs_zg_release_stall_ms, uint, 0644);
+MODULE_PARM_DESC(zg_release_stall_ms, "TEST ONLY: stall the next Zone Group release before its CAS, once");
+
 static int cetrafs_zg_try_release_one(struct super_block *sb, u32 zg_id, u32 my_node_id, bool *out_released)
 {
     cetrafs_zone_group_t *zg; /* heap, not stack -- see the comment above */
@@ -1880,6 +1887,14 @@ static int cetrafs_zg_try_release_one(struct super_block *sb, u32 zg_id, u32 my_
     for (b = 0; b < nbg; b++)
         if (cetrafs_sb_bg_owner(sb, b) == zg_id && cetrafs_bg_release_bitmap_ready(sb, b))
             goto out_undrain; /* not provably empty, or not durable: keep it */
+    {
+        unsigned int pause = xchg(&cetrafs_zg_release_stall_ms, 0);
+
+        if (pause) {
+            pr_info("ZG %u release: members ready, pausing %u ms before the CAS (test)\n", zg_id, pause);
+            msleep(pause); /* test-only; see the parameter */
+        }
+    }
 
     {
         /* One CAS gives it back: it only lands while the record still
@@ -3382,6 +3397,14 @@ u64 cetrafs_bg_pick_scan_count(void)
 
 /* TEST ONLY: an allocation out of space does not look for a grow -- the
  * negative control for ctest grow-twice. */
+/* TEST ONLY: an allocator out of space claims no further Zone Group,
+ * only pool Block Groups (tests/kernel/zg_release_vs_pool_claim.sh: an
+ * unowned full Zone Group would otherwise be claimed first and take the
+ * pool group the suite is about). */
+static bool cetrafs_alloc_claim_zg_off;
+cetrafs_test_param(alloc_claim_zg_off, cetrafs_alloc_claim_zg_off, bool, 0644);
+MODULE_PARM_DESC(alloc_claim_zg_off, "TEST ONLY: an allocator out of space claims pool Block Groups only, no Zone Group");
+
 static bool cetrafs_alloc_enospc_refresh_off;
 cetrafs_test_param(alloc_enospc_refresh_off, cetrafs_alloc_enospc_refresh_off, bool, 0644);
 MODULE_PARM_DESC(alloc_enospc_refresh_off, "TEST ONLY: ENOSPC does not refresh the layout first");
@@ -3539,7 +3562,7 @@ retry_scan:
         }
     }
 
-    if (!tried_claim_more) {
+    if (!tried_claim_more && !READ_ONCE(cetrafs_alloc_claim_zg_off)) {
         bool did_claim = false;
         s64 defer = -1;
 
@@ -3594,16 +3617,30 @@ retry_scan:
 
         tried_claim_bg = true;
 
+        /*
+         * Under release_rwsem, read: a Zone Group this node is giving
+         * back is still in owned_zgs until its CAS lands, so without it
+         * the pick below could name one mid-release and the claimed
+         * group -- allocatable at once -- left with it, its new bits
+         * only in this node's memory, for the next owner to allocate
+         * again (audit 2026-11-14 A-2). Every release holds the lock for
+         * write from its drain to its uncache.
+         */
+        if (cetrafs_sb_release_read_lock(sb))
+            return -EINTR;
         if (cetrafs_sb_first_owned_zg(sb, &mine) == 0) {
             u32 got = 0;
 
             ret = cetrafs_bg_claim_free(sb, mine, &got);
+            cetrafs_sb_release_read_unlock(sb);
             if (ret == 0) {
                 pr_info("alloc: out of space in owned Block Groups, claimed free BG %u into ZG %u\n", got, mine);
                 goto retry_scan;
             }
             if (ret != -ENOSPC)
                 return ret;
+        } else {
+            cetrafs_sb_release_read_unlock(sb);
         }
     }
 

@@ -393,6 +393,8 @@ void cetrafs_sb_zg_claim_unlock(struct super_block *sb, unsigned int nofs);
 void cetrafs_sb_release_lock(struct super_block *sb);
 void cetrafs_sb_release_unlock(struct super_block *sb);
 void cetrafs_sb_release_wait(struct super_block *sb);
+int cetrafs_sb_release_read_lock(struct super_block *sb);
+void cetrafs_sb_release_read_unlock(struct super_block *sb);
 int cetrafs_sb_release_seq(struct super_block *sb);
 bool cetrafs_sb_release_ended_since(struct super_block *sb, int seq);
 u64 cetrafs_enospc_rescan_count(void);
