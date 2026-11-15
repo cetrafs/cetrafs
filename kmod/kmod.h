@@ -671,6 +671,7 @@ u64 cetrafs_journal_replay_kept_count(void);
 u64 cetrafs_evict_rereads_changed_count(void);
 u64 cetrafs_bmap_flush_batch_count(void);
 u64 cetrafs_flock_backout_count(void);
+u64 cetrafs_xattr_inplace_fallback_count(void);
 extern bool cetrafs_read_trust_writer_defers; /* lock.c, TEST ONLY */
 extern bool cetrafs_pf_force_foreign;
 u64 cetrafs_pf_full_scans_count(void);

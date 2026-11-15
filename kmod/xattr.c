@@ -412,6 +412,21 @@ static bool cetrafs_xattr_guard_refuses(const struct cetrafs_xattr_guard *g, con
     return (cetrafs_le64(rec->read_open_nodes) & ~mine & ~g->judged_readers) != 0;
 }
 
+/* TEST ONLY: a regular file's copy finds no free block (F-20), and the
+ * old answer to that -- the call fails ENOSPC (the suite's control). */
+static bool cetrafs_xattr_cow_nospc;
+cetrafs_test_param(xattr_cow_nospc, cetrafs_xattr_cow_nospc, bool, 0644);
+MODULE_PARM_DESC(xattr_cow_nospc, "TEST ONLY: a regular file's xattr copy finds no free block");
+static bool cetrafs_xattr_cow_nospc_fails;
+cetrafs_test_param(xattr_cow_nospc_fails, cetrafs_xattr_cow_nospc_fails, bool, 0644);
+MODULE_PARM_DESC(xattr_cow_nospc_fails, "TEST ONLY: no block for the xattr copy fails the call (before F-20)");
+static atomic64_t cetrafs_xattr_inplace_fallbacks = ATOMIC64_INIT(0);
+
+u64 cetrafs_xattr_inplace_fallback_count(void)
+{
+    return (u64) atomic64_read(&cetrafs_xattr_inplace_fallbacks);
+}
+
 /* TEST ONLY: hold a setxattr after its second peer-user ask, right before
  * its publish (tests/kernel/xattr_set_peer_late.sh, audit 2026-11-15
  * BM N-74). One-shot. */
@@ -690,15 +705,17 @@ static int cetrafs_xattr_set_locked(struct inode *inode, const char *name, const
         arr[0].value_len = cetrafs_cpu_to_le16((u16) size);
         if (size)
             memcpy(arr[0].value, value, size);
-        ret = cetrafs_xattr_write_new(sb, img, &lba);
+        /* Asked again -- waiting a peer's mover out, as nothing is held
+         * yet -- before the block is allocated (audit 2026-11-15 F-21);
+         * the swap asks the last time. */
+        ret = cetrafs_xattr_peer_user(inode, &g, true);
+        if (!ret)
+            ret = cetrafs_xattr_write_new(sb, img, &lba);
         kfree(img);
         if (ret)
             return ret;
-        ret = cetrafs_xattr_peer_user(inode, &g, false);
-        if (!ret) {
-            cetrafs_xattr_pre_publish_stall();
-            ret = cetrafs_xattr_publish(inode, &raw, &g, lba, now);
-        }
+        cetrafs_xattr_pre_publish_stall();
+        ret = cetrafs_xattr_publish(inode, &raw, &g, lba, now);
         if (ret) {
             cetrafs_free_data_block(sb, lba);
             return ret;
@@ -739,19 +756,33 @@ static int cetrafs_xattr_set_locked(struct inode *inode, const char *name, const
         if (!img)
             return -ENOMEM;
         ret = cetrafs_xattr_edit(img, name, value, size, flags, &any_left);
+        if (!ret)
+            ret = cetrafs_xattr_peer_user(inode, &g, true);
         if (!ret && any_left)
-            ret = cetrafs_xattr_write_new(sb, img, &lba);
+            ret = READ_ONCE(cetrafs_xattr_cow_nospc) ? -ENOSPC : cetrafs_xattr_write_new(sb, img, &lba);
         kfree(img);
+        /*
+         * No block for the copy -- a full volume, or no free block in
+         * this node's groups: edit in place instead, as before the copy
+         * (audit 2026-11-15 F-20). Removing an attribute is how an
+         * operator makes room, and it must not need room itself. That
+         * path's write is not inside a swap, so a peer's open landing
+         * during it is not refused: the window N-74 closed, open again
+         * for exactly this case and said when it is taken.
+         */
+        if (ret == -ENOSPC && !READ_ONCE(cetrafs_xattr_cow_nospc_fails)) {
+            atomic64_inc(&cetrafs_xattr_inplace_fallbacks);
+            pr_info_ratelimited("setxattr: ino=%llu: no free block for the copy -- editing the xattr block in "
+                                "place\n",
+                                (unsigned long long) inode->i_ino);
+            goto in_place;
+        }
         if (ret)
             return ret;
-        ret = cetrafs_xattr_peer_user(inode, &g, false);
-        if (ret) {
-            if (lba)
-                cetrafs_free_data_block(sb, lba);
-            return ret;
-        }
         return cetrafs_xattr_swap_block(inode, &raw, &g, lba, now);
     }
+
+in_place:
 
     /* The ask again before the edit: other kinds have no peer user to
      * judge (a no-op), and the TEST ONLY old order asks it here. */

@@ -427,6 +427,7 @@ static int cetrafs_proc_info_show(struct seq_file *m, void *v)
     seq_printf(m, "evict_rereads_changed: %llu\n", cetrafs_evict_rereads_changed_count());
     seq_printf(m, "bmap_flush_batches: %llu\n", cetrafs_bmap_flush_batch_count());
     seq_printf(m, "flock_backouts: %llu\n", cetrafs_flock_backout_count());
+    seq_printf(m, "xattr_inplace_fallbacks: %llu\n", cetrafs_xattr_inplace_fallback_count());
     seq_printf(m, "defrag_stale_requests: %llu\n", cetrafs_defrag_stale_req_count());
     seq_printf(m, "defrag_pinned: %u\n", cetrafs_defrag_pin_count());
     seq_printf(m, "defrag_yields: %llu\n", cetrafs_defrag_yield_count());
