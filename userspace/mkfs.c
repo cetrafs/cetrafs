@@ -343,6 +343,54 @@ static u64 cetrafs_solve_bg_count(u64 total_blocks, u64 fixed_wo_B, u64 bg_size_
  * A mount that read the old superblock before the format and registers
  * after it re-reads block 0 once its row is committed, and refuses.
  */
+/*
+ * A superblock that does not verify can still be a live cluster's: a
+ * stray write into block 0 (audit 2026-11-15 A-7) breaks its checksum
+ * and nothing else, and its nodes, which read it at mount, keep running
+ * and beating. Formatting it on "no node can mount it" alone destroyed
+ * that cluster (B-16). The registry is wherever the damaged superblock
+ * still places it, if that is inside the device; every row carries its
+ * own magic and checksum, so a row that verifies and beats is a live
+ * node wherever it is found. Watch it there, read-only -- no claim can be
+ * written to a place nothing proves -- and refuse on a beat or on an I/O
+ * error. A placement outside the device locates nothing: format.
+ *
+ * TEST ONLY: CETRAFS_TEST_UNVERIFIED_NO_PROBE=1 skips it (the control of
+ * tests/kernel/mkfs_damaged_sb_live.sh).
+ */
+static void mkfs_probe_unverified(int fd, const char *dev, const cetrafs_superblock_t *sb)
+{
+    unsigned long long dev_bytes = 0;
+    uint64_t start = cetrafs_le64(sb->node_table_start), nblk = cetrafs_le64(sb->node_table_blocks);
+    uint32_t count = cetrafs_le32(sb->node_table_count), row = 0;
+    char label[CETRAFS_NODE_LABEL_LEN + 1] = {0};
+    long long age = 0;
+    struct stat st;
+    int lp;
+
+    if (cetrafs_test_env_ll("CETRAFS_TEST_UNVERIFIED_NO_PROBE", 0, 1, 0))
+        return;
+    if (ioctl(fd, BLKGETSIZE64, &dev_bytes) < 0) {
+        if (fstat(fd, &st) < 0)
+            die_dev("%s: cannot size the device: %s", dev, strerror(errno));
+        dev_bytes = (unsigned long long) st.st_size;
+    }
+    if (!start || !count || count > nblk || nblk > dev_bytes / CETRAFS_BLOCK_SIZE ||
+        start > dev_bytes / CETRAFS_BLOCK_SIZE - nblk)
+        return; /* places no registry on this device */
+    lp = cetrafs_find_live_peer_on(fd, dev, sb, &row, label, sizeof(label), &age);
+    if (lp < 0)
+        die_dev("%s: its old superblock does not verify, and the Node Registry it places cannot be read\n"
+                "       (I/O error) -- so it is impossible to prove no node still runs on it. Nothing was\n"
+                "       written. Fix the device and retry.",
+                dev);
+    if (lp)
+        die_dev("%s: its old superblock does not verify, but a node is still heartbeating in its registry\n"
+                "       (row %u%s%s) -- this is a live cluster's volume with a damaged block 0, and\n"
+                "       formatting it would destroy it. Nothing was written. Unmount it everywhere first.",
+                dev, row, label[0] ? ", " : "", label[0] ? label : "");
+}
+
 static void mkfs_retire_old_superblock(int fd, const char *dev)
 {
     unsigned char old[CETRAFS_BLOCK_SIZE], zero[CETRAFS_BLOCK_SIZE];
@@ -378,9 +426,9 @@ static void mkfs_retire_old_superblock(int fd, const char *dev)
      */
     for (int tries = 0; tries < 5 && !cetrafs_node_table_placed_ok(fd, &sb); tries++) {
         if (tries == 4) {
-            fprintf(stderr,
-                    "%s: its old superblock does not verify -- no node can mount it and its Node Registry\n"
-                    "       cannot be located, so no live-node check is possible; formatting over it (-f)\n",
+            mkfs_probe_unverified(fd, dev, &sb);
+            fprintf(stderr, "%s: its old superblock does not verify and no node beats in a registry it places\n"
+                            "       -- no node can mount it; formatting over it (-f)\n",
                     dev);
             if (pwrite(fd, zero, sizeof(zero), 0) != (ssize_t) sizeof(zero) || fsync(fd) != 0)
                 die_dev("%s: cannot clear the old superblock: %s", dev, strerror(errno));
