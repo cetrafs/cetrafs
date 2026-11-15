@@ -6,13 +6,16 @@
 # from cetrafs_lock_defrag_begin(), and -ENOSPC/-EOPNOTSUPP/-ESTALE from
 # cetrafs_defrag_inode(). Only a successful move is logged.
 #
-# That is not cosmetic. A SPARSE file is declined -EOPNOTSUPP, and a
-# sparse VM image is the normal case here -- so a file that will never
-# be defragmented leaves no trace saying why, and the fragmentation
-# simply persists with nothing to explain it. It cost an hour of
-# diagnosis while writing heartbeat_tick_work.sh, where a sparse probe
-# file was being refused and the test sat waiting for a relocation the
-# kernel had already decided against.
+# That is not cosmetic. A file the mover declines -- a sparse one was,
+# and a sparse VM image is the normal case here -- leaves no trace saying
+# why, and the fragmentation simply persists with nothing to explain it.
+# It cost an hour of diagnosis while writing heartbeat_tick_work.sh,
+# where a sparse probe file was being refused and the test sat waiting
+# for a relocation the kernel had already decided against.
+#
+# Sparse files are moved now (audit 2026-11-15 A-14). The decline left is
+# a file past the mover's extent cap, lowered here (TEST ONLY
+# defrag_extent_cap) so a 24-extent file reaches it.
 set -euo pipefail
 . "$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)/lib/harness.sh"
 require_root
@@ -33,27 +36,30 @@ ct_mkfs_small "$DEV" >/dev/null
 ct_mount "$DEV" "$MNT"
 require_cetrafs_mount "$MNT"
 ct_param_set auto_defrag 1
+[ -w /sys/module/cetrafs/parameters/defrag_extent_cap ] || { skip "defrag_extent_cap is missing"; ct_exit; }
+ct_param_set defrag_extent_cap 4
 
-log "a sparse file qualifies the gate but cannot be relocated"
-# Strided writes: 24 single-block extents with holes between them, which
-# clears both gates (>= 4 extents, index >= 200%) and so really does
-# reach the worker -- and is then declined, because relocating a file
-# with interior holes is not supported.
+log "a file past the mover's extent cap qualifies the gate but is declined"
+# Interleaved with a filler: 24 single-block extents, which clears both
+# gates (>= 4 extents, index >= 200%) and so really does reach the
+# worker -- and is then declined, past the (lowered) cap.
 MARK="$(dmesg_mark)"
-python3 - "$MNT/probe-a" <<'PY'
+python3 - "$MNT/probe-a" "$MNT/probe-fill" <<'PY'
 import os, sys
 fd = os.open(sys.argv[1], os.O_CREAT | os.O_WRONLY, 0o644)
+fl = os.open(sys.argv[2], os.O_CREAT | os.O_WRONLY, 0o644)
 blk = b's' * 4096
 for i in range(24):
-    os.pwrite(fd, blk, i * 2 * 4096)   # stride 2: a hole after every block
-os.fsync(fd)
-os.close(fd)
+    os.pwrite(fd, blk, i * 4096)
+    os.pwrite(fl, blk, i * 4096)   # interleaved: every block its own extent
+os.fsync(fd); os.fsync(fl)
+os.close(fl); os.close(fd)
 PY
 sync
 INO="$(stat -c '%i' "$MNT/probe-a")"
 EXT="$("$IPOKE" "$IMG" extents "$INO")"
 echo "$EXT" | grep -q "depth=1" &&
-    pass "the sparse file is fragmented enough to reach the worker ($EXT)" ||
+    pass "the file is fragmented enough to reach the worker ($EXT)" ||
     fail "not fragmented enough: $EXT -- the worker would never be asked"
 
 # Give the workqueue a moment; it is a separate thread. The budget is
@@ -81,29 +87,31 @@ else
     log "diag: full-ring hits for ino=$INO: $(dmesg | grep -c "auto-defrag: ino=$INO" || true)"
     log "diag: any auto-defrag lines since mark: $(dmesg_since "$MARK" | grep -c "auto-defrag" || true)"
 fi
-dmesg_since "$MARK" | grep "auto-defrag: ino=$INO" | grep -qiE "sparse|hole|not supported|declin" &&
+dmesg_since "$MARK" | grep "auto-defrag: ino=$INO" | grep -qiE "extent cap|not supported|declin" &&
     pass "...and says WHY, not merely that something happened" ||
     fail "the line gives no reason: $(dmesg_since "$MARK" | grep "auto-defrag: ino=$INO" | head -1)"
 
-# The CLI, run by hand on the same sparse file, must explain itself too --
-# the kernel returns EOPNOTSUPP for both "sparse" and "defrag disabled", and
-# a bare strerror ("Operation not supported") leaves an operator guessing.
-log "defrag.cetra on that sparse file explains itself, not an opaque errno"
+# The CLI, run by hand on the same file, must explain itself too -- the
+# kernel returns EOPNOTSUPP for both "past the cap" and "defrag disabled",
+# and a bare strerror ("Operation not supported") leaves an operator
+# guessing.
+log "defrag.cetra on that file explains itself, not an opaque errno"
 DOUT="$("$ROOT/userspace/defrag.cetra" "$MNT/probe-a" 2>&1 || true)"
-echo "$DOUT" | grep -qiE "sparse|disabled on this mount" &&
+echo "$DOUT" | grep -qiE "extents than the mover|disabled on this mount" &&
     pass "defrag.cetra: ${DOUT#*: }" ||
-    fail "defrag.cetra gave an opaque message for a sparse file: $DOUT"
+    fail "defrag.cetra gave an opaque message for a declined file: $DOUT"
 
 log "a declined file is left exactly as it was"
 sync
 AFTER="$("$IPOKE" "$IMG" extents "$INO")"
-[ "$AFTER" = "$EXT" ] && pass "the sparse file is untouched ($AFTER)" ||
+[ "$AFTER" = "$EXT" ] && pass "the declined file is untouched ($AFTER)" ||
     fail "the file changed despite being declined: $EXT -> $AFTER"
 SUM_OK="$(python3 -c "
 import sys
 d = open(sys.argv[1],'rb').read()
-print('yes' if d[:4096] == b's'*4096 and d[4096:8192] == bytes(4096) else 'no')" "$MNT/probe-a")"
-[ "$SUM_OK" = "yes" ] && pass "its data and holes are intact" || fail "content changed"
+print('yes' if d == b's' * 4096 * 24 else 'no')" "$MNT/probe-a")"
+[ "$SUM_OK" = "yes" ] && pass "its data is intact" || fail "content changed"
+ct_param_set defrag_extent_cap 0
 
 log "a successful defrag still logs its move"
 # The control: the logging added for declines must not have replaced or

@@ -24,11 +24,12 @@ int main(int argc, char **argv)
     if (argc != 2) {
         fprintf(stderr,
                 "Usage: %s <file-on-a-cetrafs-mount>\n"
-                "  Relocates a regular file into one contiguous run, online.\n"
+                "  Relocates a regular file's blocks into one contiguous run, online;\n"
+                "  holes stay holes and preallocated ranges stay preallocated.\n"
                 "  Opens O_RDWR: the write-open claims the whole-file exclusive\n"
                 "  lock that makes the move safe, so a file another node holds\n"
-                "  open for write is refused. Sparse files (interior holes) are\n"
-                "  declined -- they cannot be relocated block-for-block.\n"
+                "  open for write is refused. A file with more extents than the\n"
+                "  mover takes is declined.\n"
                 "  Exit: 0 done, 1 failed, 2 usage.\n",
                 argv[0]);
         return 2;
@@ -49,16 +50,14 @@ int main(int argc, char **argv)
     if (ioctl(fd, CETRAFS_IOC_DEFRAG, &st) != 0) {
         switch (errno) {
         case EOPNOTSUPP:
-            /* The kernel returns this both for a sparse file (interior
-             * holes, which cannot be moved block-for-block) and for a
-             * mount with defragmentation turned off or impossible (a
-             * nofilelock mount has no file lock to pin) -- it does not
-             * tell them apart, so neither do we; the controls file does
-             * (defrag, defrag_available). */
+            /* The kernel returns this both for a file with more extents
+             * than the mover takes and for a mount with defragmentation
+             * turned off -- it does not tell them apart, so neither do
+             * we; the controls file does (defrag, defrag_available). */
             fprintf(stderr,
-                    "%s: defragmentation not supported here -- the file is sparse (has interior\n"
-                    "       holes), or defrag is disabled on this mount, or the volume is mounted\n"
-                    "       nofilelock (/proc/fs/cetrafs/<dev>/controls: defrag, defrag_available).\n",
+                    "%s: defragmentation not supported here -- the file has more extents than the\n"
+                    "       mover takes, or defrag is disabled on this mount\n"
+                    "       (/proc/fs/cetrafs/<dev>/controls: defrag, defrag_available).\n",
                     argv[1]);
             break;
         case EBADF:

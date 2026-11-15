@@ -50,6 +50,7 @@
 
 #include <linux/blkdev.h>
 #include <linux/buffer_head.h>
+#include <linux/crc32c.h>
 #include <linux/fs.h>
 #include <linux/kernel.h>
 #include <linux/ktime.h>
@@ -84,10 +85,19 @@ cetrafs_test_param(defrag_skip_resv, cetrafs_defrag_skip_resv, bool, 0644);
 MODULE_PARM_DESC(defrag_skip_resv,
                  "TEST ONLY: do not register the defrag destination run (the scrub may reclaim it mid-move)");
 
+/* TEST ONLY: a moved preallocated extent loses its flag -- the stale
+ * blocks behind it become the file's data (tests/kernel/defrag_uninit_extent.sh's
+ * control). */
 static bool cetrafs_defrag_ignore_uninit;
 cetrafs_test_param(defrag_ignore_uninit, cetrafs_defrag_ignore_uninit, bool, 0644);
 MODULE_PARM_DESC(defrag_ignore_uninit,
-                 "TEST ONLY: defrag a file with preallocated extents anyway (publishes their stale blocks)");
+                 "TEST ONLY: defrag publishes moved preallocated extents as written (their stale blocks as data)");
+
+/* TEST ONLY: a step does not convert the inode's pending buffered
+ * stores first (tests/kernel/defrag_sparse.sh's control). */
+static bool cetrafs_defrag_pending_unconverted;
+cetrafs_test_param(defrag_pending_unconverted, cetrafs_defrag_pending_unconverted, bool, 0644);
+MODULE_PARM_DESC(defrag_pending_unconverted, "TEST ONLY: a defrag step moves blocks with buffered stores still pending");
 
 static bool cetrafs_defrag_fail_invalidate;
 cetrafs_test_param(defrag_fail_invalidate, cetrafs_defrag_fail_invalidate, bool, 0644);
@@ -130,13 +140,12 @@ static unsigned int cetrafs_defrag_final_stall_ms;
 cetrafs_test_param(defrag_final_stall_ms, cetrafs_defrag_final_stall_ms, uint, 0644);
 MODULE_PARM_DESC(defrag_final_stall_ms, "TEST ONLY: pause after the last defrag step, with inode_lock dropped");
 
-/* The per-step shape re-check (length + density) happens to catch a
- * rewritten prefix too, because today's writers APPEND the new extent
- * and the array stops being in logical order. That makes the prefix
- * walk below unreachable from a test -- and an unreachable check is an
- * unproven one. This knob relaxes the density half so a suite can make
- * the walk the sole guard and prove it works: with it set and the walk
- * removed, the rewritten bytes are lost and 16 blocks leak. */
+/* The per-step shape re-check (length + the logical shape) can catch a
+ * rewritten prefix too. That makes the prefix walk below unreachable
+ * from a test -- and an unreachable check is an unproven one. This knob
+ * relaxes the shape half so a suite can make the walk the sole guard and
+ * prove it works: with it set and the walk removed, the rewritten bytes
+ * are lost and 16 blocks leak. */
 static bool cetrafs_defrag_skip_dense_recheck;
 cetrafs_test_param(defrag_skip_dense_recheck, cetrafs_defrag_skip_dense_recheck, bool, 0644);
 MODULE_PARM_DESC(defrag_skip_dense_recheck,
@@ -242,6 +251,12 @@ struct cetrafs_ext_list {
     u64 leaf_lba;    /* external leaf LBA if depth==1, else 0 */
     bool dense;      /* no interior holes: extent i starts where i-1 ended */
     bool has_uninit; /* any extent is preallocated-but-never-written */
+    /* Which logical blocks are mapped, as runs: their count and a
+     * CRC32C over (start, length) of each. Preallocated or written does
+     * not enter it -- each step reads the flags afresh and the commit
+     * publishes them as they are. */
+    u32 runs;
+    u32 shape;
 };
 
 /* Cap on how fragmented a file this collapser will take on. Each commit
@@ -251,6 +266,12 @@ struct cetrafs_ext_list {
  * above it (a file that fragmented past 64k extents is better left than
  * churned for many minutes; it still works). */
 #define CETRAFS_DEFRAG_MAX_EXTENTS 65536u
+
+/* TEST ONLY: a lower cap, so a suite can have a file declined at will
+ * (tests/kernel/defrag_declines.sh). 0: CETRAFS_DEFRAG_MAX_EXTENTS. */
+static unsigned int cetrafs_defrag_extent_cap;
+cetrafs_test_param(defrag_extent_cap, cetrafs_defrag_extent_cap, uint, 0644);
+MODULE_PARM_DESC(defrag_extent_cap, "TEST ONLY: defrag declines a file with more extents than this");
 
 /*
  * The record the move is planned from. Fresh unless this node is the
@@ -282,11 +303,44 @@ static int cetrafs_defrag_ext_cmp(const void *a, const void *b)
     return (ea > eb) - (ea < eb);
 }
 
+static u64 cetrafs_defrag_run_end(const struct cetrafs_ext_list *el, u32 i)
+{
+    return (u64) cetrafs_le32(el->arr[i].ee_block) + cetrafs_extent_len(el->arr[i].ee_len);
+}
+
+/*
+ * The mover counts in RANKS: the k-th mapped block of the file in
+ * logical order is the k-th block of the destination run. For a file
+ * with no holes rank and logical block are the same number; for a sparse
+ * one they are not, and what touches the page cache needs the logical
+ * one. The logical block of rank r, and the end (exclusive) of the
+ * logical range ranks [.., r) reach.
+ */
+static u64 cetrafs_defrag_rank_logical(const struct cetrafs_ext_list *el, u64 r)
+{
+    u64 o = 0;
+    u32 e;
+
+    for (e = 0; e < el->count; e++) {
+        u64 len = cetrafs_extent_len(el->arr[e].ee_len);
+
+        if (r < o + len)
+            return cetrafs_le32(el->arr[e].ee_block) + (r - o);
+        o += len;
+    }
+    return el->count ? cetrafs_defrag_run_end(el, el->count - 1) : 0;
+}
+
+static u64 cetrafs_defrag_rank_logical_end(const struct cetrafs_ext_list *el, u64 r)
+{
+    return r ? cetrafs_defrag_rank_logical(el, r - 1) + 1 : 0;
+}
+
 static int cetrafs_defrag_read_extents(struct inode *inode, const cetrafs_inode_t *raw, struct cetrafs_ext_list *el)
 {
     struct super_block *sb = inode->i_sb;
     u32 i;
-    u64 expect = 0;
+    u64 expect = 0, run[2] = {0, 0};
 
     el->depth = cetrafs_le16(raw->eh.eh_depth);
     el->leaf_lba = 0;
@@ -342,6 +396,13 @@ static int cetrafs_defrag_read_extents(struct inode *inode, const cetrafs_inode_
         kvfree(flat);
     }
 
+    {
+        unsigned int c = READ_ONCE(cetrafs_defrag_extent_cap); /* TEST ONLY: see the parameter */
+
+        if (c && el->count > c)
+            return -EOPNOTSUPP;
+    }
+
     /* The extent array is UNSORTED (cetrafs_leaf_array_insert() appends,
      * and merges only with the last entry), so a file filled in random
      * order lists its extents in arrival order. The mover reads the array
@@ -354,6 +415,8 @@ static int cetrafs_defrag_read_extents(struct inode *inode, const cetrafs_inode_
 
     el->dense = true;
     el->has_uninit = false;
+    el->runs = 0;
+    el->shape = 0;
     for (i = 0; i < el->count; i++) {
         /* Defrag copies these blocks and FREES them: an address read off
          * the device is checked before either (rule 19, as the free path
@@ -371,6 +434,17 @@ static int cetrafs_defrag_read_extents(struct inode *inode, const cetrafs_inode_
         }
         if (cetrafs_le32(el->arr[i].ee_block) != expect)
             el->dense = false;
+        /* A run continues while the next extent starts where the last
+         * ended, however the extents inside it are cut (a convert splits
+         * one); its (start, length) is hashed when it closes. */
+        if (!i || cetrafs_le32(el->arr[i].ee_block) != cetrafs_defrag_run_end(el, i - 1)) {
+            if (i)
+                el->shape = crc32c(el->shape, run, sizeof(run));
+            run[0] = cetrafs_le32(el->arr[i].ee_block);
+            run[1] = 0;
+            el->runs++;
+        }
+        run[1] += cetrafs_extent_len(el->arr[i].ee_len);
         /* cetrafs_extent_len() MASKS the uninit bit off, so a
          * preallocated extent is indistinguishable from data here
          * unless it is asked about explicitly. See the refusal below
@@ -379,6 +453,8 @@ static int cetrafs_defrag_read_extents(struct inode *inode, const cetrafs_inode_
             el->has_uninit = true;
         expect += cetrafs_extent_len(el->arr[i].ee_len);
     }
+    if (el->count)
+        el->shape = crc32c(el->shape, run, sizeof(run));
     el->nblocks = expect;
     return 0;
 }
@@ -405,6 +481,10 @@ static int cetrafs_defrag_commit(struct inode *inode,
                                  u64 dst_base,
                                  u64 moved,
                                  u64 nblocks,
+                                 const cetrafs_extent_t *head,
+                                 u32 head_count,
+                                 const cetrafs_extent_t *split,
+                                 u32 split_off,
                                  const cetrafs_extent_t *suffix,
                                  u32 suffix_count)
 {
@@ -415,7 +495,7 @@ static int cetrafs_defrag_commit(struct inode *inode,
      * frame -- its caller heap-allocates the same type for this reason
      * (audit 2026-11-05, section 3). */
     cetrafs_inode_t *old;
-    u32 n = 0, i, cap = suffix_count + 8;
+    u32 n = 0, i, cap = head_count + 1 + suffix_count + 8;
     u64 off, meta = 0;
     bool verdict_old = false; /* a failed publish proven NOT to have landed */
     int ret;
@@ -429,16 +509,55 @@ static int cetrafs_defrag_commit(struct inode *inode,
     }
     *old = *raw;
 
-    /* Prefix: [0, moved) as contiguous run entries, split at the length cap. */
-    for (off = 0; off < moved && n < cap;) {
-        u32 len = (u32) min_t(u64, moved - off, (u64) CETRAFS_EXT_LEN_MASK);
+    /* Prefix: ranks [0, moved) on the run at dst_base, each at its own
+     * logical block and with its own extent's flag -- a hole stays a
+     * hole and a preallocated block stays preallocated. Pieces that
+     * continue each other logically, physically and in kind are one
+     * entry, split at the length cap. The pieces are head[] whole, then
+     * the first split_off blocks of 'split' (the extent the step ends
+     * inside, as it was before the suffix took its remainder). */
+    off = 0;
+    for (i = 0; i <= head_count && off < moved; i++) {
+        const cetrafs_extent_t *x = i < head_count ? &head[i] : split;
+        u64 len, lg;
+        bool un;
 
-        out[n].ee_block = cetrafs_cpu_to_le32((u32) off);
-        out[n].ee_pad = cetrafs_cpu_to_le16(0);
-        out[n].ee_len = cetrafs_extent_pack_len(len, 0);
-        cetrafs_extent_phys_to_hilo(dst_base + off, &out[n].ee_start_hi, &out[n].ee_start_lo);
-        n++;
-        off += len;
+        if (!x)
+            break;
+        len = min_t(u64, i < head_count ? cetrafs_extent_len(x->ee_len) : split_off, moved - off);
+        lg = cetrafs_le32(x->ee_block);
+        un = cetrafs_extent_is_uninit(x->ee_len) && !READ_ONCE(cetrafs_defrag_ignore_uninit);
+
+        while (len) {
+            cetrafs_extent_t *p = n ? &out[n - 1] : NULL;
+            u32 plen = p ? cetrafs_extent_len(p->ee_len) : 0;
+            u64 take;
+
+            if (p && (u64) cetrafs_le32(p->ee_block) + plen == lg &&
+                cetrafs_extent_phys_from_hilo(p->ee_start_hi, p->ee_start_lo) + plen == dst_base + off &&
+                cetrafs_extent_is_uninit(p->ee_len) == un && plen < CETRAFS_EXT_LEN_MASK) {
+                take = min_t(u64, len, (u64) CETRAFS_EXT_LEN_MASK - plen);
+                p->ee_len = cetrafs_extent_pack_len(plen + (u32) take, un);
+            } else {
+                if (n >= cap) {
+                    ret = -EIO; /* cannot happen: one entry per source piece */
+                    goto out;
+                }
+                take = min_t(u64, len, (u64) CETRAFS_EXT_LEN_MASK);
+                memset(&out[n], 0, sizeof(out[n]));
+                out[n].ee_block = cetrafs_cpu_to_le32((u32) lg);
+                out[n].ee_len = cetrafs_extent_pack_len((u32) take, un);
+                cetrafs_extent_phys_to_hilo(dst_base + off, &out[n].ee_start_hi, &out[n].ee_start_lo);
+                n++;
+            }
+            len -= take;
+            lg += take;
+            off += take;
+        }
+    }
+    if (off != moved) {
+        ret = -EIO; /* the pieces do not add up to the step: refuse rather than publish a wrong map */
+        goto out;
     }
     /* Suffix: original extents for [moved, nblocks), verbatim. */
     for (i = 0; i < suffix_count && n < cap; i++)
@@ -561,6 +680,7 @@ int cetrafs_defrag_inode(struct inode *inode, struct cetrafs_defrag_stats *out_s
     u32 *copy_off;      /* ...and each one's block offset from the step's start */
 #define raw (*rawp)
     u64 nblocks, dst_base = 0, moved = 0;
+    u32 snapshot_shape = 0, snapshot_runs = 0;
     bool have_dst = false;
     /*
      * The destination run is bitmap-allocated and referenced by NOTHING
@@ -622,34 +742,24 @@ int cetrafs_defrag_inode(struct inode *inode, struct cetrafs_defrag_stats *out_s
         ret = 0; /* already contiguous */
         goto out_unlock;
     }
-    if (!el.dense) {
-        ret = -EOPNOTSUPP; /* interior holes: block-for-block copy wouldn't hold */
-        goto out_unlock;
-    }
-    if (el.has_uninit && !cetrafs_defrag_ignore_uninit) {
-        /*
-         * A preallocated extent maps real blocks that have never been
-         * written, and reads as zeros BECAUSE of the uninit flag -- the
-         * blocks themselves still hold whatever the previous owner left
-         * in them. This mover is a block-for-block copy that rebuilds
-         * the prefix as one plain (initialized) extent, so it would
-         * copy those bytes to the new run and publish them as the
-         * file's data: fallocate a range, defrag, read back content
-         * that was freed from somewhere else.
-         *
-         * Found by tests/kernel/churn_oracle.sh, which reported it as
-         * "HOLE HOLDS DATA" -- punch a hole, fallocate over it, defrag,
-         * and the punched block came back.
-         *
-         * Declining is the same answer the interior-hole case gets: the
-         * file is left fragmented, which costs performance and nothing
-         * else. Honouring the flag instead would mean splitting the
-         * destination into init/uninit extents, which is a different
-         * (and much larger) change than a mover that promises one run.
-         */
-        ret = -EOPNOTSUPP;
-        goto out_unlock;
-    }
+    /*
+     * Holes and preallocated extents are kept: the destination run holds
+     * the MAPPED blocks in logical order, each prefix entry goes back at
+     * its own logical block, and a preallocated one keeps its flag (its
+     * blocks are not copied -- nothing in them is the file's). Both used
+     * to be refused, so a thin or preallocated VM image -- the usual
+     * kind -- could never be defragmented (audit 2026-11-15 A-14).
+     *
+     * The refusal's reason, kept for what it guards: a preallocated
+     * extent maps real blocks that have never been written, and reads as
+     * zeros BECAUSE of the uninit flag. A mover that published the moved
+     * blocks as plain data would copy whatever the previous owner left
+     * and publish it as the file's (tests/kernel/churn_oracle.sh's
+     * "HOLE HOLDS DATA"). The flag travels with the extent instead, and
+     * defrag_ignore_uninit drops it to show that it must.
+     */
+    snapshot_shape = el.shape;
+    snapshot_runs = el.runs;
 
     /* The span rides INSIDE the allocation -- bits set and span
      * published under one alloc_mutex hold -- because publish-after-
@@ -665,7 +775,7 @@ int cetrafs_defrag_inode(struct inode *inode, struct cetrafs_defrag_stats *out_s
 
     while (moved < nblocks) {
         struct blk_plug plug;
-        u64 step_end, b;
+        u64 step_end, b, step_lo, step_hi;
         u32 si, suffix_start, split_off;
         bool foreign; /* an old block outside our own groups (cetrafs_frees_begin()) */
 
@@ -692,6 +802,19 @@ int cetrafs_defrag_inode(struct inode *inode, struct cetrafs_defrag_stats *out_s
 
         /* The step below frees the old physical blocks. */
         cetrafs_defrag_inode_lock_drained(inode);
+
+        /* A buffered or mapped store into a preallocated block is data
+         * to this node while the extent still says preallocated, until a
+         * boundary converts it (enum cetrafs_gb_mode). The step copies
+         * only what the tree calls written, so convert first: the
+         * stores are on the device and the tree says so. */
+        if (cetrafs_pending_any(inode) && !READ_ONCE(cetrafs_defrag_pending_unconverted)) {
+            ret = cetrafs_convert_pending_locked(inode);
+            if (ret) {
+                cetrafs_defrag_inode_unlock(inode);
+                goto out_free_tail;
+            }
+        }
 
         /* Re-read and revalidate: same file (generation), same shape
          * (length + dense), still long enough. Anything else -- a
@@ -720,13 +843,13 @@ int cetrafs_defrag_inode(struct inode *inode, struct cetrafs_defrag_stats *out_s
             goto out_free_tail;
         }
         ret = cetrafs_defrag_read_extents(inode, &raw, &el);
-        /* has_uninit too, not only at the start: a punch and a fallocate
-         * between two steps restore the count and the density while
-         * mapping never-written blocks, and the next step would copy
-         * their stale bytes and publish them as data (audit 2026-11-06
-         * M8; tests/kernel/defrag_uninit_between_steps.sh). */
-        if (ret || el.nblocks != nblocks || (!el.dense && !cetrafs_defrag_skip_dense_recheck) ||
-            (el.has_uninit && !cetrafs_defrag_ignore_uninit)) {
+        /* The same mapped blocks at the same logical places as when the
+         * pass began (a hole punched, filled or moved changes the plan:
+         * rank k must still be the same logical block). Preallocated or
+         * written may change between steps -- a write converts -- and
+         * each step copies and publishes the flags as it reads them. */
+        if (ret || el.nblocks != nblocks ||
+            ((el.shape != snapshot_shape || el.runs != snapshot_runs) && !cetrafs_defrag_skip_dense_recheck)) {
             ret = ret ? ret : -ECANCELED;
             cetrafs_defrag_inode_unlock(inode);
             goto out_free_tail;
@@ -836,7 +959,11 @@ int cetrafs_defrag_inode(struct inode *inode, struct cetrafs_defrag_stats *out_s
          * the writer's just-flushed data -- the exact data-loss the
          * concurrent-writer test caught. The flush above makes the old
          * block on disk authoritative; the uncached read then gets it. */
-        ret = filemap_write_and_wait_range(inode->i_mapping, (loff_t) moved << 12, (((loff_t) step_end) << 12) - 1);
+        /* Pages are logical: the step's ranks reach from the logical
+         * block of rank 'moved' to the end of rank step_end - 1. */
+        step_lo = cetrafs_defrag_rank_logical(&el, moved);
+        step_hi = cetrafs_defrag_rank_logical_end(&el, step_end);
+        ret = filemap_write_and_wait_range(inode->i_mapping, (loff_t) step_lo << 12, (((loff_t) step_hi) << 12) - 1);
         if (ret) {
             cetrafs_defrag_inode_unlock(inode);
             goto out_free_tail;
@@ -882,6 +1009,10 @@ int cetrafs_defrag_inode(struct inode *inode, struct cetrafs_defrag_stats *out_s
                 }
                 src = cetrafs_extent_phys_from_hilo(el.arr[ce].ee_start_hi, el.arr[ce].ee_start_lo) + (bb - ce_off);
                 if (src == dst_base + bb) /* already in place */
+                    continue;
+                /* Preallocated: nothing in it is the file's, and it stays
+                 * preallocated where it lands (cetrafs_defrag_commit()). */
+                if (cetrafs_extent_is_uninit(el.arr[ce].ee_len) && !READ_ONCE(cetrafs_defrag_ignore_uninit))
                     continue;
                 copy_lba[nb] = src;
                 copy_off[nb] = (u32) (bb - moved);
@@ -999,7 +1130,8 @@ int cetrafs_defrag_inode(struct inode *inode, struct cetrafs_defrag_stats *out_s
             }
             ret = cetrafs_frees_begin(sb, &foreign);
             if (!ret) {
-                ret = cetrafs_defrag_commit(inode, &raw, dst_base, step_end, nblocks, suffix, suffix_count);
+                ret = cetrafs_defrag_commit(inode, &raw, dst_base, step_end, nblocks, el.arr, suffix_start,
+                                            split_off ? &whole : NULL, split_off, suffix, suffix_count);
                 if (ret)
                     cetrafs_frees_end(sb, foreign);
             }
@@ -1040,8 +1172,8 @@ int cetrafs_defrag_inode(struct inode *inode, struct cetrafs_defrag_stats *out_s
             /* PAGE indices, not block numbers -- see cetrafs_blk_to_pgoff().
              * These were passed raw, which is correct only while a page
              * is one block. */
-            ret = invalidate_inode_pages2_range(inode->i_mapping, cetrafs_blk_to_pgoff(freed_from),
-                                                cetrafs_blk_end_pgoff(step_end - 1));
+            ret = invalidate_inode_pages2_range(inode->i_mapping, cetrafs_blk_to_pgoff(step_lo),
+                                                cetrafs_blk_end_pgoff(step_hi - 1));
             if (cetrafs_defrag_fail_invalidate)
                 ret = -EBUSY; /* TEST ONLY: a racing reader's page reference, on demand */
             if (ret) {
@@ -1054,12 +1186,11 @@ int cetrafs_defrag_inode(struct inode *inode, struct cetrafs_defrag_stats *out_s
                  * then reallocated) space. Force the pages out instead
                  * -- clean and flushed, so nothing is lost -- and carry
                  * on with the step. */
-                unmap_mapping_range(inode->i_mapping, (loff_t) freed_from << 12, (loff_t) (step_end - freed_from) << 12,
-                                    1);
-                truncate_inode_pages_range(inode->i_mapping, (loff_t) freed_from << 12, ((loff_t) step_end << 12) - 1);
+                unmap_mapping_range(inode->i_mapping, (loff_t) step_lo << 12, (loff_t) (step_hi - step_lo) << 12, 1);
+                truncate_inode_pages_range(inode->i_mapping, (loff_t) step_lo << 12, ((loff_t) step_hi << 12) - 1);
                 pr_info_ratelimited("defrag: ino=%llu forced page drop for blocks [%llu, %llu)\n",
-                                    (unsigned long long) inode->i_ino, (unsigned long long) freed_from,
-                                    (unsigned long long) step_end);
+                                    (unsigned long long) inode->i_ino, (unsigned long long) step_lo,
+                                    (unsigned long long) step_hi);
                 ret = 0;
             }
 
@@ -1107,7 +1238,9 @@ int cetrafs_defrag_inode(struct inode *inode, struct cetrafs_defrag_stats *out_s
         msleep(cetrafs_defrag_final_stall_ms); /* test-only: no lock held here */
     cetrafs_flush_dirty_free_counts(sb);
 
-    stats.extents_after = CETRAFS_DIV_ROUND_UP(nblocks, (u64) CETRAFS_EXT_LEN_MASK);
+    /* One per run of mapped blocks (more where an extent's length cap or
+     * a written/preallocated boundary splits one). */
+    stats.extents_after = max_t(u64, snapshot_runs, CETRAFS_DIV_ROUND_UP(nblocks, (u64) CETRAFS_EXT_LEN_MASK));
     stats.blocks_moved = nblocks;
     ret = 0;
     goto out_done;
@@ -1272,7 +1405,7 @@ static void cetrafs_defrag_worker(struct work_struct *work)
              * it just has to be asked for, via dynamic debug (+p).
              */
             else if (ret == -EOPNOTSUPP)
-                pr_debug("auto-defrag: ino=%llu declined: sparse, or fragmented past the collapse cap\n",
+                pr_debug("auto-defrag: ino=%llu declined: fragmented past the mover's extent cap\n",
                          (unsigned long long) inode->i_ino);
             else if (ret == -ENOSPC)
                 pr_debug(

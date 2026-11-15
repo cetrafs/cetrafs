@@ -23,7 +23,7 @@ set -euo pipefail
 . "$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)/lib/harness.sh"
 require_root
 require_module
-for k in defrag_growth_requeue defrag_step_delay_ms; do
+for k in defrag_growth_requeue defrag_step_delay_ms defrag_extent_cap; do
     [ -w "/sys/module/cetrafs/parameters/$k" ] || { skip "$k is missing"; ct_exit; }
 done
 ct_param_set alloc_run_blocks 0
@@ -31,6 +31,8 @@ ct_param_set auto_defrag 0
 ct_param_set defrag_growth_requeue 0
 ct_param_set defrag_step_delay_ms 0
 ct_param_set auto_defrag_quiet_secs 10
+# The file reaches ~700 extents in its 8 s, the filler starts at 1,200.
+ct_param_set defrag_extent_cap 1000
 IPOKE="$(ct_helper inode_block_poke)"
 MNT="$(ct_mnt dgb)"
 ct_track mnt "$MNT"
@@ -43,15 +45,19 @@ a = os.open(path, os.O_CREAT | os.O_RDWR, 0o644)
 b = os.open(path + ".fill", os.O_CREAT | os.O_WRONLY, 0o644)
 blk = b"g" * 4096
 n = 0
-# The filler is sparse (every other block), so the janitor declines it
-# once and the passes counted are the file's.
+# The filler takes four extents per block of the file, so it is past the
+# mover's extent cap (lowered below) from the start and stays past it:
+# the janitor declines it once and the passes counted are the file's.
+def fill(n):
+    for k in range(4):
+        os.pwrite(b, blk, (8 * n + 2 * k) * 4096)
 for _ in range(300):               # interleaved: one extent per block
-    os.pwrite(a, blk, n * 4096); os.pwrite(b, blk, 2 * n * 4096); n += 1
+    os.pwrite(a, blk, n * 4096); fill(n); n += 1
 os.fsync(a); os.fsync(b)
 open(sys.argv[2], "w").write("1")  # auto_defrag on: the next append queues it
 t = time.time() + 8
 while time.time() < t:
-    os.pwrite(a, blk, n * 4096); os.pwrite(b, blk, 2 * n * 4096); n += 1
+    os.pwrite(a, blk, n * 4096); fill(n); n += 1
     os.fsync(a); os.fsync(b)
     time.sleep(0.02)
 print(n, flush=True)

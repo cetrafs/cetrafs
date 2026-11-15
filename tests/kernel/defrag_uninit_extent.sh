@@ -1,6 +1,6 @@
 #!/usr/bin/env bash
 # SPDX-License-Identifier: GPL-2.0-or-later
-# defrag never publishes a preallocated extent's stale blocks
+# defrag moves a preallocated extent as preallocated, never its stale blocks as data
 #
 # fallocate(2) hands a file real blocks that it has never written. They
 # read as zeros because the extent carries CETRAFS_EXT_UNINIT -- the
@@ -18,9 +18,14 @@
 # Found by tests/kernel/churn_oracle.sh (reported as "HOLE HOLDS DATA"),
 # which is why this suite exists as its own named regression.
 #
-# Discrimination: defrag_ignore_uninit=1 removes the refusal and nothing
-# else. With it, the stale bytes MUST come back -- otherwise the refusal
-# is not what protects the data and this suite proves nothing.
+# Such a file used to be declined. It is moved now (audit 2026-11-15
+# A-14): a preallocated extent's blocks are not copied, and its entry on
+# the new run keeps the flag, so the range still reads zeros.
+#
+# Discrimination: defrag_ignore_uninit=1 drops the flag from the moved
+# extent and nothing else. With it, the stale bytes MUST come back --
+# otherwise the flag is not what protects the data and this suite proves
+# nothing.
 set -euo pipefail
 . "$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)/lib/harness.sh"
 require_root
@@ -44,8 +49,8 @@ val() { sed -n "s/^$1: //p" <<<"$OUT"; }
     { fail "setup: the range reads '$(val before)' before the defrag -- nothing below means anything"; ct_exit; }
 
 case "$(val defrag)" in
-Declined* | declined*) pass "defrag declined the file: $(val defrag)" ;;
-*) fail "defrag ran on a file with a preallocated extent: $(val defrag)" ;;
+ran*) pass "defrag moved the file with its preallocated extent: $(val defrag)" ;;
+*) fail "defrag did not move the file: $(val defrag)" ;;
 esac
 
 [ "$(val warm)" = "zeros" ] && pass "the preallocated range still reads zeros after the defrag" ||
@@ -58,7 +63,7 @@ ct_fsck "$DEV" >/dev/null 2>&1 && pass "fsck clean" || fail "fsck reports a prob
 
 # ---------------------------------------- is the refusal what protects it?
 if [ -w /sys/module/cetrafs/parameters/defrag_ignore_uninit ]; then
-    log "discrimination: defrag the same file with the refusal removed"
+    log "discrimination: defrag the same file, the moved extent losing its flag"
     ct_mkfs_small "$DEV" >/dev/null
     ct_mount "$DEV" "$MNT"
     require_cetrafs_mount "$MNT"
@@ -69,12 +74,12 @@ if [ -w /sys/module/cetrafs/parameters/defrag_ignore_uninit ]; then
     ct_umount "$MNT"
 
     if [ "$(val cold)" = "data" ]; then
-        pass "without the refusal the defrag published the stale blocks -- the refusal is what prevents it"
+        pass "without the flag the defrag published the stale blocks -- the flag is what prevents it"
     else
-        fail "even with the refusal removed the range read '$(val cold)' -- the refusal is not what protects the data, something else is"
+        fail "even without the flag the range read '$(val cold)' ($(val defrag)) -- the suite cannot see the stale blocks"
     fi
 else
-    skip "defrag_ignore_uninit unavailable -- cannot measure what the refusal contributes"
+    skip "defrag_ignore_uninit unavailable -- cannot measure what the flag contributes"
 fi
 
 ct_exit
