@@ -153,6 +153,13 @@ MODULE_PARM_DESC(defrag_skip_dense_recheck,
 
 /* TEST ONLY: copy one block per round trip, as before audit 2026-11-14
  * M1 -- the control of tests/kernel/defrag_copy_batched.sh. */
+/* TEST ONLY: one stall between a step's source read and its writes
+ * (tests/kernel/defrag_vs_fence.sh), and that gate's control. */
+static unsigned int cetrafs_defrag_copy_stall_ms;
+cetrafs_test_param(defrag_copy_stall_ms, cetrafs_defrag_copy_stall_ms, uint, 0644);
+static bool cetrafs_defrag_copy_gate_off;
+cetrafs_test_param(defrag_copy_gate_off, cetrafs_defrag_copy_gate_off, bool, 0644);
+
 static bool cetrafs_defrag_copy_serial;
 cetrafs_test_param(defrag_copy_serial, cetrafs_defrag_copy_serial, bool, 0644);
 MODULE_PARM_DESC(defrag_copy_serial, "TEST ONLY: the defrag mover copies one block per round trip");
@@ -890,10 +897,27 @@ int cetrafs_defrag_inode(struct inode *inode, struct cetrafs_defrag_stats *out_s
             ret = cetrafs_bread_uncached_list(sb, copy_lba, nb, copy_src);
             if (ret)
                 break;
+            if (unlikely(READ_ONCE(cetrafs_defrag_copy_stall_ms)))
+                msleep(xchg(&cetrafs_defrag_copy_stall_ms, 0)); /* TEST ONLY: between the read and the writes */
             blk_start_plug(&plug);
             for (i = 0; i < nb; i++) {
-                struct buffer_head *dbh = sb_getblk(sb, dst_base + moved + copy_off[i]);
+                struct buffer_head *dbh;
 
+                /*
+                 * The fence again, here and per block: the test above
+                 * precedes up to 128 forced-fresh reads, and a stall in
+                 * them outlasting the stale window let a peer take the
+                 * group, recount it from a device without the
+                 * destination's bits, and hand the run to a growing
+                 * file -- which these copies then overwrote with this
+                 * file's old blocks (audit 2026-11-15 B-32). Before the
+                 * buffer is dirtied, so nothing is left for writeback.
+                 */
+                if (cetrafs_sb_is_fenced(sb) && !READ_ONCE(cetrafs_defrag_copy_gate_off)) {
+                    ret = -ECANCELED;
+                    break;
+                }
+                dbh = sb_getblk(sb, dst_base + moved + copy_off[i]);
                 copy_dst[i] = dbh;
                 if (!dbh) {
                     ret = -EIO;
