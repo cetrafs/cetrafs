@@ -4707,6 +4707,29 @@ int main(int argc, char **argv)
          * counts would only make the volume agree with itself around the
          * fault. Checked before the loop below, which repairs as it goes.
          */
+        /*
+         * A directory the walk left out for its record's nlink 0 (a
+         * deleted one: its blocks may be a live file's, B-28) that a
+         * walked directory names after all. Either the name is stale or
+         * the record's count is wrong -- a live directory, whose children
+         * the walk never counted. -r cannot tell which: relinking those
+         * children into lost+found, or walking blocks that may be a live
+         * file's, are both wrong for one of the two (review F-9).
+         */
+        for (uint64_t ino = 2; ino <= cetrafs_le32(sb.inodes_count); ++ino) {
+            uint64_t bit = ino - 1;
+
+            if (!(ibmap[bit / 8] & (1u << (bit % 8))) || !is_dir[ino] || nlinks[ino] || !refs[ino])
+                continue;
+            fprintf(stderr,
+                    "ERR: directory inode %" PRIu64 " is named by %u directory entr%s but its record says nlink 0 "
+                    "-- its entries were not walked\n",
+                    ino, (unsigned) refs[ino], refs[ino] == 1 ? "y" : "ies");
+            problems++;
+            repair_block("a named directory's record says it was deleted, so whether its entries are live cannot be "
+                         "known");
+        }
+
         for (uint64_t ino = 2; ino <= cetrafs_le32(sb.inodes_count); ++ino) {
             uint64_t bit = ino - 1;
 

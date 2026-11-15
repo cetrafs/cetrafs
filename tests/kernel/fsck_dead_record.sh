@@ -26,6 +26,10 @@
 #      (audit 2026-11-15 B-28): -r must not walk it as a directory and
 #      "repair" the live file's block into an empty dirent block -- the
 #      file reads back byte-exact.
+#   6. a LIVE directory whose record wrongly says nlink 0 (review F-9):
+#      fsck reports it named yet deleted, and -r leaves its children
+#      where they are instead of moving them to lost+found (with the
+#      count put back by hand, D reads back whole).
 #
 # The kernel no longer leaves such a record behind -- a freed number's
 # record names nothing since evict clears it first -- but a volume
@@ -36,7 +40,8 @@
 # DISCRIMINATION: 1 and 2 fail against the previous fsck (ERR, exit 1).
 # 3 fails if the deleted-record walk stops deferring leak repair: the
 # first -r then clears the live file's blocks. 5 fails if the dirent
-# walk follows an nlink-0 directory.
+# walk follows an nlink-0 directory. 6 fails if a named nlink-0
+# directory is skipped in silence: -r relinks its children.
 set -euo pipefail
 . "$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)/lib/harness.sh"
 require_root
@@ -245,5 +250,32 @@ ct_mount "$DEV" "$MNT"
 echo 3 >/proc/sys/vm/drop_caches
 [ "$(sha256sum <"$MNT/live")" = "$SUM" ] && pass "5: the live file reads back byte-exact after fsck -r" ||
     fail "5: fsck -r rewrote the live file's block as a directory's"
+ct_umount "$MNT"
+
+# ---------------------------------------------------------------- 6
+log "6: a live directory whose record says nlink 0"
+fresh
+mkdir "$MNT/D"
+echo a >"$MNT/D/a"
+echo b >"$MNT/D/b"
+sync
+N="$(stat -c %i "$MNT/D")"
+ct_umount "$MNT"
+"$IPOKE" "$IMG" nlink "$N" 0 >/dev/null
+blockdev --flushbufs "$DEV"
+OUT6="$("$FSCK" "$DEV" 2>&1 || true)"
+grep -q "ERR: directory inode $N is named by 1 directory entry but its record says nlink 0" <<<"$OUT6" &&
+    pass "6: fsck reports the named directory whose record says it was deleted" ||
+    fail "6: not reported: $(grep -E '^(ERR|WARN)' <<<"$OUT6" | head -3)"
+"$FSCK" -r "$DEV" >/dev/null 2>&1 || true
+"$FSCK" -r "$DEV" >/dev/null 2>&1 || true
+# fsck could not know which side is wrong and changed nothing; the
+# operator's answer -- D is live -- is put back, and must find it whole
+"$IPOKE" "$IMG" nlink "$N" 2 >/dev/null
+blockdev --flushbufs "$DEV"
+ct_mount "$DEV" "$MNT"
+[ "$(cat "$MNT/D/a" 2>/dev/null)$(cat "$MNT/D/b" 2>/dev/null)" = ab ] && [ -z "$(ls -A "$MNT/lost+found" 2>/dev/null)" ] &&
+    pass "6: fsck -r changed nothing around it: with D's count put back, D/a and D/b are in D, lost+found is empty" ||
+    fail "6: fsck -r moved the children: D=[$(ls "$MNT/D" 2>&1 | tr '\n' ' ')] lost+found=[$(ls "$MNT/lost+found" 2>&1 | tr '\n' ' ')]"
 ct_umount "$MNT"
 ct_exit
