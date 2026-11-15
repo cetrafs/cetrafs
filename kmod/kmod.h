@@ -460,6 +460,7 @@ struct cetrafs_trim_run {
 };
 int cetrafs_trim_claim_next(struct super_block *sb, u32 bg_id, u64 *cursor, u64 minlen, u64 maxlen,
                             struct cetrafs_trim_run *run);
+int cetrafs_trim_hold_durable(struct super_block *sb, const struct cetrafs_trim_run *run);
 void cetrafs_trim_release(struct super_block *sb, struct cetrafs_trim_run *run, bool keep);
 u64 cetrafs_trim_leaked_count(void);
 int cetrafs_bg_data_region(struct super_block *sb, u32 bg_id, u64 *out_start, u64 *out_count, u32 *out_owner_zg);
@@ -469,6 +470,7 @@ int cetrafs_bg_id_of_lba(struct super_block *sb, u64 lba, u32 *out_bg_id);
 struct fstrim_range;
 bool cetrafs_discard_supported(struct super_block *sb);
 int cetrafs_zeroout_issue(struct super_block *sb, u64 lba, u64 count, bool unmap);
+bool cetrafs_discard_handback_would_send(struct super_block *sb, bool force);
 int cetrafs_discard_handback(struct super_block *sb, u32 bg_id, unsigned long *pass_started, bool pending,
                              bool force, bool *discarded);
 long cetrafs_fitrim_ioctl(struct file *file, struct fstrim_range __user *arg);

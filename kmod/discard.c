@@ -196,12 +196,24 @@ static int cetrafs_issue_range_ok(struct super_block *sb, const char *what, u32 
     return 0;
 }
 
+/* TEST ONLY: every discard pauses this long before it is sent, so a
+ * suite can look at the device while one is about to go out
+ * (tests/kernel/discard_hold_durable_first.sh). */
+static unsigned int cetrafs_discard_issue_stall_ms;
+cetrafs_test_param(discard_issue_stall_ms, cetrafs_discard_issue_stall_ms, uint, 0644);
+MODULE_PARM_DESC(discard_issue_stall_ms, "TEST ONLY: pause before every discard is sent");
+
 static int cetrafs_discard_issue(struct super_block *sb, u32 bg_id, u64 lba, u64 count)
 {
     int ret;
 
     if (!count)
         return 0;
+    if (READ_ONCE(cetrafs_discard_issue_stall_ms)) {
+        pr_info("%s: discard [%llu +%llu) of BG %u: pausing %u ms before it is sent (test)\n", sb->s_id,
+                (unsigned long long) lba, (unsigned long long) count, bg_id, cetrafs_discard_issue_stall_ms);
+        msleep(READ_ONCE(cetrafs_discard_issue_stall_ms));
+    }
     if (cetrafs_sb_fence_witnessed(sb)) /* the device's word, not only the clock's (B-18) */
         return -EIO;
     ret = cetrafs_issue_range_ok(sb, "discard", bg_id, lba, count);
@@ -282,6 +294,12 @@ int cetrafs_zeroout_issue(struct super_block *sb, u64 lba, u64 count, bool unmap
  * whatever discard is set to, and a device that no longer takes
  * discards, or a fenced mount, keeps it pending.
  */
+/* Would cetrafs_discard_handback(pending=false) send anything? */
+bool cetrafs_discard_handback_would_send(struct super_block *sb, bool force)
+{
+    return (force || cetrafs_sb_discard_enabled(sb)) && cetrafs_discard_supported(sb) && !cetrafs_sb_is_fenced(sb);
+}
+
 int cetrafs_discard_handback(struct super_block *sb, u32 bg_id, unsigned long *pass_started, bool pending,
                              bool force, bool *discarded)
 {
@@ -410,6 +428,12 @@ long cetrafs_fitrim_ioctl(struct file *file, struct fstrim_range __user *arg)
                 }
             }
 
+            rc = cetrafs_trim_hold_durable(sb, &run);
+            if (rc) {
+                cetrafs_trim_release(sb, &run, false); /* nothing sent */
+                ret = rc;
+                break;
+            }
             rc = cetrafs_discard_issue(sb, b, lba, count);
             cetrafs_trim_release(sb, &run, !cetrafs_discard_outcome_known(rc));
             if (rc == -EOPNOTSUPP || !cetrafs_discard_outcome_known(rc)) {
@@ -772,6 +796,11 @@ static int cetrafs_idq_range(struct cetrafs_inline_discard *d, const struct cetr
             pr_info("%s: inline discard: claimed [%llu +%llu), pausing %u ms (test)\n", sb->s_id,
                     (unsigned long long) run.lba, (unsigned long long) count, cetrafs_inline_discard_stall_ms);
             msleep(cetrafs_inline_discard_stall_ms);
+        }
+        rc = cetrafs_trim_hold_durable(sb, &run);
+        if (rc) {
+            cetrafs_trim_release(sb, &run, false); /* nothing sent */
+            return rc;
         }
         rc = cetrafs_discard_issue(sb, e->bg, run.lba, count);
         cetrafs_trim_release(sb, &run, !cetrafs_discard_outcome_known(rc));

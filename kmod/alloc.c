@@ -4824,6 +4824,11 @@ static unsigned int cetrafs_bg_release_drain_stall_ms;
 cetrafs_test_param(bg_release_drain_stall_ms, cetrafs_bg_release_drain_stall_ms, uint, 0644);
 MODULE_PARM_DESC(bg_release_drain_stall_ms, "test-only: pause one Block Group release while it is drained");
 
+/* TEST ONLY: the hand-back flags its group only after a discard failed,
+ * as before (tests/kernel/discard_hold_durable_first.sh's control). */
+static bool cetrafs_handback_flag_first_off;
+cetrafs_test_param(handback_flag_first_off, cetrafs_handback_flag_first_off, bool, 0644);
+
 struct cetrafs_bg_dpend_ctx {
     u32 zg_id; /* the group must still be this Zone Group's */
     bool on;
@@ -4871,7 +4876,7 @@ static int cetrafs_bg_release_one(struct super_block *sb, u32 zg_id, u32 b, unsi
                                   bool *out_discarded)
 {
     struct cetrafs_bg_release_ctx ctx = {.zg_id = zg_id};
-    bool settling = false;
+    bool settling = false, flagged;
     u64 total = 0, free = 0;
     int ret;
 
@@ -4990,6 +4995,23 @@ static int cetrafs_bg_release_one(struct super_block *sb, u32 zg_id, u32 b, unsi
      * writes. Over budget, the group stays ours for a later tick
      * rather than going back untrimmed.
      */
+    /*
+     * Flagged on the device BEFORE the UNMAP is sent, not only once it
+     * failed. A command that hangs in a multipath queue past this node's
+     * lease outlives the node: a peer takes the Zone Group, recounts,
+     * finds the group empty and unflagged, and allocates it -- and the
+     * queued UNMAP lands on its data with fsck clean (audit 2026-11-15
+     * B-21). Flagged, the peer keeps the group out of use until a discard
+     * of it has a known outcome. The release swap below clears it.
+     */
+    flagged = false;
+    if (cetrafs_discard_handback_would_send(sb, force) && !READ_ONCE(cetrafs_handback_flag_first_off)) {
+        if (cetrafs_bg_set_discard_pending_flag(sb, zg_id, b, true)) {
+            cetrafs_sb_undrain_bg(sb, b); /* nothing sent: kept, tried again later */
+            return -EBUSY;
+        }
+        flagged = true;
+    }
     ret = cetrafs_discard_handback(sb, b, pass_started, false, force, &ctx.discarded);
     if (ret == -EAGAIN) {
         /* The UNMAP may still execute: the group stays drained --
@@ -5003,7 +5025,7 @@ static int cetrafs_bg_release_one(struct super_block *sb, u32 zg_id, u32 b, unsi
          * the descriptor survives them. The mark below is its in-core
          * mirror. A record that cannot be made is a state this mount
          * cannot keep: it stops, as an unstorable mark does. */
-        ret = cetrafs_bg_set_discard_pending_flag(sb, zg_id, b, true);
+        ret = flagged ? 0 : cetrafs_bg_set_discard_pending_flag(sb, zg_id, b, true);
         if (ret) {
             cetrafs_sb_fatal(sb, "BG %u: cannot record its outstanding discard on the device (%d)", b, ret);
             return -EBUSY;
@@ -5016,9 +5038,18 @@ static int cetrafs_bg_release_one(struct super_block *sb, u32 zg_id, u32 b, unsi
         return -EBUSY; /* kept for a later pass */
     }
     if (ret) {
-        cetrafs_sb_undrain_bg(sb, b); /* over budget: nothing was sent */
+        /* Over budget: nothing was sent. The flag comes off again; if
+         * that swap fails it stays, and the group is settled as one
+         * with an outstanding discard -- kept, never shared. */
+        if (flagged && cetrafs_bg_set_discard_pending_flag(sb, zg_id, b, false)) {
+            cetrafs_sb_set_bg_discard_pending(sb, b, true);
+            return -EBUSY;
+        }
+        cetrafs_sb_undrain_bg(sb, b);
         return -EBUSY; /* kept for a later pass */
     }
+    if (flagged)
+        settling = true; /* the release swap clears the flag; refused, the group stays flagged and kept */
 
 release:
 
@@ -5048,8 +5079,10 @@ release:
     if (ret) {
         if (!cetrafs_bg_release_credit_late)
             cetrafs_bg_release_counters(sb, zg_id, b, total, -1);
-        if (settling)
-            return -EBUSY; /* still flagged on the device: kept, and tried again */
+        if (settling) {
+            cetrafs_sb_set_bg_discard_pending(sb, b, true); /* still flagged on the device: kept, tried again */
+            return -EBUSY;
+        }
         cetrafs_sb_undrain_bg(sb, b);
         return 0; /* somebody changed it under us; leave it alone */
     }
@@ -5927,6 +5960,37 @@ out:
                                  "may still land",
                              (unsigned long long) run->lba, (unsigned long long) run->count, sret);
     }
+}
+
+/*
+ * A claimed run's bits, on the device, before its discard is sent. The
+ * claim sets them in the cache only; a discard that then hangs in a
+ * multipath queue past this node's lease leaves the run reading FREE to
+ * the peer that takes the Zone Group over, which allocates it -- and the
+ * queued UNMAP lands on that data, fsck clean (audit 2026-11-15 B-21,
+ * B-37). One synchronous bitmap write per run, against an UNMAP that
+ * costs as much. Nonzero: not durable, so nothing may be discarded.
+ */
+static bool cetrafs_trim_hold_sync_off;
+cetrafs_test_param(trim_hold_sync_off, cetrafs_trim_hold_sync_off, bool, 0644);
+MODULE_PARM_DESC(trim_hold_sync_off, "TEST ONLY: a trim claim's hold is not made durable before its discard");
+
+int cetrafs_trim_hold_durable(struct super_block *sb, const struct cetrafs_trim_run *run)
+{
+    struct cetrafs_bg_geom bg;
+    u64 first, last, blk;
+    int ret;
+
+    if (!run->claimed || READ_ONCE(cetrafs_trim_hold_sync_off))
+        return 0;
+    ret = cetrafs_read_bg_geom(sb, run->bg_id, &bg);
+    if (ret)
+        return ret;
+    first = (run->lba - bg.start_block - bg.off_data_region) / (CETRAFS_BLOCK_SIZE * 8);
+    last = (run->lba + run->count - 1 - bg.start_block - bg.off_data_region) / (CETRAFS_BLOCK_SIZE * 8);
+    for (blk = first; blk <= last && !ret; blk++)
+        ret = cetrafs_sync_one_block(sb, bg.start_block + bg.off_data_bmap + blk);
+    return ret;
 }
 
 /* A Block Group's data region, for a discard to check itself against. */
