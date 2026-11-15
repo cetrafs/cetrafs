@@ -2164,8 +2164,10 @@ int cetrafs_journal_write_new_block(struct super_block *sb, struct buffer_head *
 
     cetrafs_bh_end_update(bh);
     /* The result from the write itself, never from BH_Uptodate -- a
-     * forced-fresh reader may clear that concurrently (ioutil.c). */
-    return cetrafs_sync_buffer(sb, bh);
+     * forced-fresh reader may clear that concurrently (ioutil.c). A
+     * definite ENOSPC is the operation's, not the mount's: nothing
+     * references this block yet (cetrafs_sync_new_buffer()). */
+    return cetrafs_sync_new_buffer(sb, bh);
 }
 
 /*

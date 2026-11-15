@@ -373,6 +373,45 @@ cetrafs_test_param(sync_writeback_eio, cetrafs_sync_writeback_eio, uint, 0644);
 MODULE_PARM_DESC(sync_writeback_eio,
                  "TEST ONLY: the next N synchronous metadata writes find the buffer written and failed by writeback");
 
+/*
+ * Write a locked buffer whose dirty bit the caller cleared, wait, unlock,
+ * and return the block layer's OWN status as an errno. submit_bh()'s
+ * completion is told only "uptodate or not", so a definite "space
+ * allocation failed" from a thin LUN (BLK_STS_NOSPC: sd's DATA PROTECT
+ * 27/07, dm-thin out of space) read exactly like a medium error, and the
+ * mount stopped for it (audit 2026-11-14 A-4). On failure the buffer
+ * ends as end_buffer_write_sync() leaves it: BH_Write_EIO, not uptodate.
+ */
+static unsigned int cetrafs_meta_write_nospc;
+cetrafs_test_param(meta_write_nospc, cetrafs_meta_write_nospc, uint, 0644);
+MODULE_PARM_DESC(meta_write_nospc, "TEST ONLY: the next N synchronous metadata writes return BLK_STS_NOSPC unsent");
+
+static int cetrafs_write_locked_bh(struct buffer_head *bh)
+{
+    struct bio *bio;
+    int ret;
+
+    if (cetrafs_meta_write_nospc) {
+        cetrafs_meta_write_nospc--;
+        ret = -ENOSPC; /* test-only: what a full thin pool answers */
+        goto done;
+    }
+    bio = bio_alloc(bh->b_bdev, 1, REQ_OP_WRITE | REQ_SYNC | REQ_META, GFP_NOIO);
+    bio->bi_iter.bi_sector = bh->b_blocknr * (bh->b_size >> 9);
+    __bio_add_page(bio, bh->b_page, bh->b_size, bh_offset(bh));
+    ret = submit_bio_wait(bio);
+    bio_put(bio);
+done:
+    if (ret) {
+        set_buffer_write_io_error(bh);
+        clear_buffer_uptodate(bh);
+    } else {
+        set_buffer_uptodate(bh);
+    }
+    unlock_buffer(bh);
+    return ret;
+}
+
 static int __cetrafs_sync_buffer(struct buffer_head *bh)
 {
     lock_buffer(bh);
@@ -390,17 +429,7 @@ static int __cetrafs_sync_buffer(struct buffer_head *bh)
         return ret;
     }
     clear_buffer_write_io_error(bh);
-#if LINUX_VERSION_CODE >= KERNEL_VERSION(7, 2, 0)
-    /* 7.2 completes per bio and takes no buffer reference of its own;
-     * bh_end_write() is end_buffer_write_sync() without the put_bh(). */
-    bh_submit(bh, REQ_OP_WRITE | REQ_SYNC, bh_end_write);
-#else
-    get_bh(bh);
-    bh->b_end_io = end_buffer_write_sync;
-    submit_bh(REQ_OP_WRITE | REQ_SYNC, bh);
-#endif
-    wait_on_buffer(bh);
-    return buffer_write_io_error(bh) ? -EIO : 0;
+    return cetrafs_write_locked_bh(bh);
 }
 
 /*
@@ -481,6 +510,18 @@ static int __cetrafs_sync_buffer_keep(struct buffer_head *bh)
  * The callers still see -EIO and unwind as before; on a stopped mount
  * every write they attempt is refused at its own gate, without I/O.
  */
+/* TEST ONLY: a new block's definite NOSPC stops the mount, as before. */
+static bool cetrafs_nospc_stops;
+cetrafs_test_param(nospc_stops, cetrafs_nospc_stops, bool, 0644);
+MODULE_PARM_DESC(nospc_stops, "TEST ONLY: a new metadata block refused for space stops the mount (the old verdict)");
+
+static atomic64_t cetrafs_meta_nospc = ATOMIC64_INIT(0);
+
+u64 cetrafs_meta_nospc_count(void)
+{
+    return (u64) atomic64_read(&cetrafs_meta_nospc);
+}
+
 static unsigned int cetrafs_meta_write_fail;
 cetrafs_test_param(meta_write_fail, cetrafs_meta_write_fail, uint, 0644);
 MODULE_PARM_DESC(meta_write_fail, "TEST ONLY: fail the next N synchronous metadata writes as the device would");
@@ -550,6 +591,37 @@ int cetrafs_sync_buffer(struct super_block *sb, struct buffer_head *bh)
     if (cetrafs_sb_is_fenced(sb))
         return -EIO;
     return cetrafs_meta_write_result(sb, bh, __cetrafs_sync_buffer(bh));
+}
+
+/*
+ * cetrafs_sync_buffer() for a block allocated and initialised just now,
+ * which nothing references yet: its caller publishes the reference only
+ * after this returns 0 (rule 8), and on an error frees the block. That
+ * makes a DEFINITE "no space" from the device -- a thin LUN whose pool is
+ * full, the write not executed -- an ordinary ENOSPC for the operation,
+ * not a stop: nothing was written, nothing refers to the block, and the
+ * buffer is forgotten so no later writeback lays it over whoever gets
+ * the block next. The guest sees ENOSPC (qemu pauses it) and the mount
+ * stays up for the moment the array has space again. Every other error,
+ * and every other metadata write, still stops the mount (audit
+ * 2026-11-14 A-4; tests/kernel/thin_nospc_new_block.sh).
+ */
+int cetrafs_sync_new_buffer(struct super_block *sb, struct buffer_head *bh)
+{
+    int ret;
+
+    if (cetrafs_sb_is_fenced(sb))
+        return -EIO;
+    ret = __cetrafs_sync_buffer(bh);
+    if (ret == -ENOSPC && !READ_ONCE(cetrafs_nospc_stops)) {
+        atomic64_inc(&cetrafs_meta_nospc);
+        pr_warn_ratelimited("%s: the device has no space for a new metadata block (%llu): the operation fails "
+                            "with ENOSPC -- a thin-provisioned LUN out of space?\n",
+                            sb->s_id, (unsigned long long) bh->b_blocknr);
+        cetrafs_forget_block(sb, bh->b_blocknr);
+        return -ENOSPC;
+    }
+    return cetrafs_meta_write_result(sb, bh, ret);
 }
 
 int cetrafs_sync_buffer_keep(struct super_block *sb, struct buffer_head *bh)
