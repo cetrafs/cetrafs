@@ -596,6 +596,10 @@ struct cetrafs_sb_info {
     bool lease_active;
     unsigned long lease_until;
     unsigned long lease_lost; /* bit 0: expired, latched */
+    /* The last device witness of our own row (cetrafs_sb_fence_witnessed()),
+     * in jiffies; the mutex keeps two boundaries from reading it twice. */
+    unsigned long witness_at;
+    struct mutex witness_mutex;
     struct work_struct lease_work;
     bool lease_work_ready;
 
@@ -2761,6 +2765,7 @@ int cetrafs_fill_super(struct super_block *sb, struct fs_context *fc)
         spin_lock_init(&sbi->rcrel_lock);
         mutex_init(&sbi->nsrel_mutex);
         mutex_init(&sbi->frees_mutex);
+        mutex_init(&sbi->witness_mutex);
         INIT_LIST_HEAD(&sbi->resv_list);
 
         spin_lock_init(&sbi->peer_lock);
@@ -5651,6 +5656,59 @@ bool cetrafs_sb_ro_refuses(struct super_block *sb, const char *what)
         return false;
     pr_err_ratelimited("%s: read-only mount -- refusing %s; a read-only mount writes nothing\n", sb->s_id, what);
     return true;
+}
+
+/* TEST ONLY: boundaries trust the local lease clock alone (B-18's control). */
+static bool cetrafs_fence_witness_off;
+cetrafs_test_param(fence_witness_off, cetrafs_fence_witness_off, bool, 0644);
+
+/* The heartbeat's own row check counts as a witness. */
+void cetrafs_sb_note_fence_witness(struct super_block *sb)
+{
+    struct cetrafs_sb_info *sbi = sb->s_fs_info;
+
+    if (sbi)
+        WRITE_ONCE(sbi->witness_at, jiffies);
+}
+
+/*
+ * cetrafs_sb_is_fenced(), and the device's word on it before a boundary
+ * writes shared state. The lease is judged on jiffies, and a node a
+ * hypervisor paused may resume with that clock where it stopped: a
+ * peer's verdict and fence_epoch bump are then invisible to every gate
+ * here until the next heartbeat tick -- up to a whole beat in which the
+ * boundary flush writes bitmap blocks and the discard workers UNMAP runs
+ * a peer may own now (audit 2026-11-15 B-18). So a boundary whose last
+ * witness is over a second old reads this node's row forced-fresh first
+ * (cetrafs_node_self_fence_check()) and fences on a moved epoch. Not on
+ * the per-block path: boundaries only, at most once a second.
+ * A read that fails is not evidence: the clock's answer stands.
+ */
+bool cetrafs_sb_fence_witnessed(struct super_block *sb)
+{
+    struct cetrafs_sb_info *sbi = sb->s_fs_info;
+    bool fenced = false;
+    u32 my_node_id;
+
+    if (!sbi)
+        return false;
+    if (cetrafs_sb_is_fenced(sb))
+        return true;
+    if (READ_ONCE(cetrafs_fence_witness_off) || !time_after(jiffies, READ_ONCE(sbi->witness_at) + HZ))
+        return false;
+    if (cetrafs_sb_get_node_id(sb, &my_node_id))
+        return false;
+    mutex_lock(&sbi->witness_mutex);
+    if (time_after(jiffies, READ_ONCE(sbi->witness_at) + HZ) &&
+        cetrafs_node_self_fence_check(sb, my_node_id, &fenced) == 0) {
+        WRITE_ONCE(sbi->witness_at, jiffies);
+        if (fenced) {
+            cetrafs_node_log_fencer(sb, my_node_id);
+            cetrafs_sb_fence(sb, "our Node Registry lease was revoked by a peer (seen at a boundary)");
+        }
+    }
+    mutex_unlock(&sbi->witness_mutex);
+    return cetrafs_sb_is_fenced(sb);
 }
 
 bool cetrafs_sb_is_fenced(struct super_block *sb)

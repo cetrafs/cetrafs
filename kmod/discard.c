@@ -202,7 +202,7 @@ static int cetrafs_discard_issue(struct super_block *sb, u32 bg_id, u64 lba, u64
 
     if (!count)
         return 0;
-    if (cetrafs_sb_is_fenced(sb))
+    if (cetrafs_sb_fence_witnessed(sb)) /* the device's word, not only the clock's (B-18) */
         return -EIO;
     ret = cetrafs_issue_range_ok(sb, "discard", bg_id, lba, count);
     if (ret)
@@ -251,7 +251,7 @@ int cetrafs_zeroout_issue(struct super_block *sb, u64 lba, u64 count, bool unmap
 
     if (!count)
         return 0;
-    if (cetrafs_sb_is_fenced(sb))
+    if (cetrafs_sb_fence_witnessed(sb)) /* B-18, as a discard's */
         return -EIO;
     if (cetrafs_bg_id_of_lba(sb, lba, &bg_id))
         return -EUCLEAN;

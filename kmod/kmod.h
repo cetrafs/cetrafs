@@ -1214,6 +1214,10 @@ int __must_check cetrafs_node_fence_peer(struct super_block *sb, u32 node_id, co
 bool cetrafs_node_reattached_since_fence(struct super_block *sb, u32 node_id);
 void cetrafs_node_test_stall_before_swap(void);
 int cetrafs_node_self_fence_check(struct super_block *sb, u32 my_node_id, bool *out_fenced);
+/* fs.c: is_fenced, and the own row read fresh first at a boundary (B-18). */
+bool cetrafs_sb_fence_witnessed(struct super_block *sb);
+extern bool cetrafs_sync_regate_off; /* fs.c, TEST ONLY (B-30) */
+void cetrafs_sb_note_fence_witness(struct super_block *sb);
 void cetrafs_node_log_fencer(struct super_block *sb, u32 my_node_id);
 int cetrafs_node_get_entry(struct super_block *sb, u32 idx, cetrafs_node_entry_t *out);
 u64 cetrafs_node_row_lba(struct super_block *sb, u32 idx);

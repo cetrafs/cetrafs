@@ -474,7 +474,7 @@ int cetrafs_held_flush(struct super_block *sb)
 
     if (!xa || xa_empty(xa))
         return 0;
-    if (cetrafs_sb_is_fenced(sb))
+    if (cetrafs_sb_fence_witnessed(sb)) /* the device's word, not only the clock's (B-18) */
         return -EIO;
     atomic64_inc(&cetrafs_held_flushes);
     io = READ_ONCE(cetrafs_held_flush_serial) ? NULL : kmalloc_array(CETRAFS_HELD_BATCH, sizeof(*io), GFP_NOFS);

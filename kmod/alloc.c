@@ -3093,8 +3093,11 @@ static int __cetrafs_alloc_flush_bitmaps(struct super_block *sb)
 
     /* Only the marked groups: a test of every group's mark made each
      * flush O(Block Groups), several per fdatasync (audit 2026-11-14 P7). */
-    for (bg_id = cetrafs_bmap_flush_first(sb, 0, bg_count); bg_id < bg_count;
-         bg_id = cetrafs_bmap_flush_first(sb, bg_id + 1, bg_count)) {
+    /* Something to write: the device's word on the fence first (B-18). */
+    bg_id = cetrafs_bmap_flush_first(sb, 0, bg_count);
+    if (bg_id < bg_count && cetrafs_sb_fence_witnessed(sb))
+        return -EIO;
+    for (; bg_id < bg_count; bg_id = cetrafs_bmap_flush_first(sb, bg_id + 1, bg_count)) {
         struct cetrafs_bg_geom bg;
         u64 b, nblocks;
         int r;

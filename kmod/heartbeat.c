@@ -274,8 +274,11 @@ static void cetrafs_heartbeat_tick(struct work_struct *work)
      * stale-looking node's registration, and it went away with PR. */
     if (!cetrafs_fence_skip_precheck) {
         bool fenced = false;
+        int fret = cetrafs_node_self_fence_check(sb, my_node_id, &fenced);
 
-        if (cetrafs_node_self_fence_check(sb, my_node_id, &fenced) == 0 && fenced) {
+        if (fret == 0)
+            cetrafs_sb_note_fence_witness(sb);
+        if (fret == 0 && fenced) {
             cetrafs_node_log_fencer(sb, my_node_id);
             cetrafs_sb_fence(sb, "our Node Registry lease was revoked by a peer");
             goto reschedule;
