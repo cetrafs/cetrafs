@@ -7039,6 +7039,11 @@ static bool cetrafs_rebuild_peer_present(struct inode *inode)
     return blocked || reader;
 }
 
+/* TEST ONLY: the old answers to a peer-open file -- preallocation
+ * -ETXTBSY, a same-size truncate -ETXTBSY (B-11). */
+static bool cetrafs_falloc_foreign_etxtbsy;
+cetrafs_test_param(falloc_foreign_etxtbsy, cetrafs_falloc_foreign_etxtbsy, bool, 0644);
+
 /* The pre-publish half: -ETXTBSY if a peer has arrived since the start. */
 static int cetrafs_rebuild_recheck(struct inode *inode, const char *what)
 {
@@ -8307,8 +8312,12 @@ static long cetrafs_fallocate(struct file *file, int mode, loff_t offset, loff_t
          * 16): preallocation rewrites the extent map and publishes the
          * whole file sector, last writer wins, so under nofilelock a peer
          * writing the file meanwhile has its new extents published over.
-         * Same refusal, same reason: a peer with the file open is
-         * -ETXTBSY (tests/kernel/fallocate_foreign_open.sh).
+         * Same refusal, same reason, and punch's errno: EOPNOTSUPP, which
+         * qemu's write-zeroes fallback past EOF and glibc's
+         * posix_fallocate() read as "not here" and write the zeros
+         * themselves; ETXTBSY was a guest I/O error for the whole
+         * pre-copy of a migration (audit 2026-11-15 B-11,
+         * tests/kernel/fallocate_foreign_open.sh).
          */
         if (!arc) {
             u32 my_node_id;
@@ -8320,7 +8329,7 @@ static long cetrafs_fallocate(struct file *file, int mode, loff_t offset, loff_t
             if (!arc && (blocked || reader)) {
                 pr_warn_ratelimited("fallocate: ino=%llu is open on another node -- refusing to rewrite its map\n",
                                     (unsigned long long) inode->i_ino);
-                arc = -ETXTBSY;
+                arc = READ_ONCE(cetrafs_falloc_foreign_etxtbsy) ? -ETXTBSY : -EOPNOTSUPP;
             }
         }
         if (!arc)
@@ -8848,6 +8857,13 @@ static int cetrafs_setattr_locked(struct mnt_idmap *idmap, struct dentry *dentry
             ret = cetrafs_lock_foreign_user_settled(inode, my_node_id, &blocked, &reader, NULL, NULL);
             if (ret)
                 return ret;
+            /* A resize to the size the file has frees and reshapes
+             * nothing: done, not refused -- qemu's resize to the current
+             * length under a migration's open destination was an error
+             * to the guest (B-11). Its time update is what is skipped. */
+            if ((blocked || reader) && attr->ia_size == i_size_read(inode) &&
+                !READ_ONCE(cetrafs_falloc_foreign_etxtbsy))
+                return 0;
             if (blocked || reader)
                 return -ETXTBSY;
         } else {

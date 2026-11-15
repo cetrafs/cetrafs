@@ -11,9 +11,17 @@
 # the image meanwhile had its new extents published over -- their
 # blocks referenced by nothing, its data gone.
 #
+# The refusal is EOPNOTSUPP, not ETXTBSY: qemu's write-zeroes fallback
+# past EOF and posix_fallocate() read it as "write the zeros yourself",
+# where ETXTBSY was a guest I/O error for a whole migration pre-copy
+# (audit 2026-11-15 B-11). For the same reason a resize to the size the
+# file already has succeeds -- it frees nothing -- while a real resize
+# stays refused.
+#
 # DISCRIMINATION: remove the check from cetrafs_fallocate()'s ALLOCATE
 # branch and the first assertion fails -- the preallocation succeeds and
 # takes blocks while the peer is still using the file.
+# falloc_foreign_etxtbsy=1 (the old answers): ETXTBSY for both.
 set -euo pipefail
 . "$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)/lib/harness.sh"
 require_root
@@ -53,18 +61,42 @@ sys.stdout.flush()
 PY
 }
 
+# trunc <blocks> -> "<rc> <errno>"
+trunc() {
+    python3 - "$MNT/image" "$1" <<'PY'
+import os, sys
+f = os.open(sys.argv[1], os.O_RDWR)
+try:
+    os.ftruncate(f, int(sys.argv[2]) * 4096); print("0 0")
+except OSError as e:
+    print("-1 %d" % e.errno)
+os.close(f)
+PY
+}
+
 # A write fd is needed, and the access rule refuses a write-open while
 # a live peer reads (access_rule.sh). Turn that half off for this one
 # open, so fallocate's own check is the only thing that can refuse.
 ct_param_set lock_ignore_readers 1
 OUT="$(falloc)"
+TSAME="$(trunc 64)"
+TGROW="$(trunc 80)"
+ct_param_set falloc_foreign_etxtbsy 1
+COUT="$(falloc)"
+CSAME="$(trunc 64)"
+ct_param_set falloc_foreign_etxtbsy 0
 ct_param_set lock_ignore_readers 0
 RC="${OUT% *}"; ERR="${OUT#* }"
-log "fallocate while a peer has it open -> rc=$RC errno=$ERR"
+log "fallocate while a peer has it open -> rc=$RC errno=$ERR; truncate same size -> $TSAME, grow -> $TGROW"
+log "control (old answers): fallocate -> $COUT, truncate same size -> $CSAME"
 
-[ "$RC" != "0" ] && [ "$ERR" = "26" ] &&
-    pass "the preallocation refused with ETXTBSY while a live peer held the file open" ||
-    fail "the preallocation returned rc=$RC errno=$ERR: it rewrote the map of a file a peer is still using"
+[ "$RC" != "0" ] && [ "$ERR" = "95" ] &&
+    pass "the preallocation refused with EOPNOTSUPP while a live peer held the file open" ||
+    fail "the preallocation returned rc=$RC errno=$ERR: not the EOPNOTSUPP refusal"
+[ "$TSAME" = "0 0" ] && pass "a resize to the current size succeeds" || fail "a same-size resize returned $TSAME"
+[ "$TGROW" = "-1 26" ] && pass "a real resize stays refused (ETXTBSY)" || fail "a real resize returned $TGROW"
+[ "$COUT" = "-1 26" ] && [ "$CSAME" = "-1 26" ] && pass "control: the old answers were ETXTBSY for both" ||
+    fail "control: the old answers were $COUT / $CSAME -- the knob does not reach them"
 
 FREE_NOW="$(sed -n 's/^free_data_blocks: //p' "$(ct_procdir "$DEV")/info")"
 [ "$FREE_NOW" = "$FREE_BEFORE" ] &&
