@@ -8067,7 +8067,7 @@ static long cetrafs_zero_range_inplace(struct file *file, loff_t offset, loff_t 
         if (blocked || reader) {
             pr_warn_ratelimited("zero range: ino=%llu is open on another node -- refusing to zero it\n",
                                 (unsigned long long) inode->i_ino);
-            ret = -ETXTBSY;
+            ret = -ETXTBSY; /* the caller makes it EOPNOTSUPP, as a punch's (A-12) */
             goto out;
         }
     }
@@ -8248,6 +8248,11 @@ static long cetrafs_fallocate(struct file *file, int mode, loff_t offset, loff_t
             return 0;
         if (!zrc)
             zrc = cetrafs_fallocate(file, mode & FALLOC_FL_KEEP_SIZE, offset, len);
+        /* A peer has the file open (any of the steps): EOPNOTSUPP, so
+         * qemu writes the zeroes itself rather than failing the guest's
+         * request -- see the punch's refusal (audit 2026-11-14 A-12). */
+        if (zrc == -ETXTBSY)
+            zrc = -EOPNOTSUPP;
         return zrc;
     }
 
@@ -8384,7 +8389,18 @@ static long cetrafs_fallocate(struct file *file, int mode, loff_t offset, loff_t
             if (blocked || reader) {
                 pr_warn_ratelimited("punch: ino=%llu is open on another node -- refusing to free its blocks\n",
                                     (unsigned long long) inode->i_ino);
-                ret = -ETXTBSY;
+                /*
+                 * EOPNOTSUPP, not ETXTBSY. A punch is how a guest's
+                 * discard and write-zeroes reach the image, and during a
+                 * live migration under nofilelock the destination holds
+                 * it open for the whole precopy. qemu turns any other
+                 * errno into a guest I/O error; this one it reads as
+                 * "not here": a discard is skipped (advisory anyway) and
+                 * write-zeroes falls back to writing zeros -- correct
+                 * data, nothing freed under the peer (audit 2026-11-14
+                 * A-12).
+                 */
+                ret = -EOPNOTSUPP;
                 goto out;
             }
         }
@@ -8561,6 +8577,8 @@ static long cetrafs_fallocate(struct file *file, int mode, loff_t offset, loff_t
         goto out;
     }
     ret = cetrafs_rebuild_recheck(inode, "punch");
+    if (ret == -ETXTBSY)
+        ret = -EOPNOTSUPP; /* a peer opened it meanwhile: as the check above (A-12) */
     if (!ret) {
         u64 fd_seq;
 

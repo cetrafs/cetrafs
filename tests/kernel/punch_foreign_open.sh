@@ -15,7 +15,10 @@
 # allowed, and both halves of that sentence could happen.
 #
 # unlink, rename-replace, setattr, setxattr and eviction all answer
-# -ETXTBSY here. Punch now does too.
+# -ETXTBSY here. Punch now does too -- as EOPNOTSUPP, which qemu takes
+# as "not here" rather than a guest I/O error (audit 2026-11-14 A-12: a
+# migration destination holds the image open; a discard is then skipped
+# and write-zeroes written as zeroes). ZERO_RANGE likewise.
 #
 # Discrimination: remove the check from cetrafs_fallocate()'s punch
 # branch and the first assertion fails -- the punch succeeds and the
@@ -71,9 +74,28 @@ ct_param_set lock_ignore_readers 0
 RC="${OUT% *}"; ERR="${OUT#* }"
 log "punch while a peer has it open -> rc=$RC errno=$ERR"
 
-[ "$RC" != "0" ] && [ "$ERR" = "26" ] &&
-    pass "the punch refused with ETXTBSY while a live peer held the file open" ||
-    fail "the punch returned rc=$RC errno=$ERR: it freed blocks under a peer that is still using them"
+[ "$RC" != "0" ] && [ "$ERR" = "95" ] &&
+    pass "the punch refused with EOPNOTSUPP while a live peer held the file open" ||
+    fail "the punch returned rc=$RC errno=$ERR (want EOPNOTSUPP): ETXTBSY is a guest I/O error to qemu, success frees blocks under the peer"
+
+# ZERO_RANGE, qemu's write-zeroes, the same: EOPNOTSUPP, so qemu writes
+# the zeroes itself (audit 2026-11-14 A-12), and the data is untouched.
+SUM0="$(md5sum <"$MNT/image")"
+ct_param_set lock_ignore_readers 1
+ZOUT="$(python3 - "$MNT/image" <<'PY'
+import ctypes, os, sys
+libc = ctypes.CDLL("libc.so.6", use_errno=True)
+f = os.open(sys.argv[1], os.O_RDWR)
+r = libc.fallocate(f, 0x10 | 0x01, ctypes.c_long(8 * 4096), ctypes.c_long(16 * 4096))
+e = ctypes.get_errno()
+os.close(f)
+print("%d %d" % (r, e))
+PY
+)"
+ct_param_set lock_ignore_readers 0
+[ "${ZOUT% *}" != 0 ] && [ "${ZOUT#* }" = 95 ] && [ "$(md5sum <"$MNT/image")" = "$SUM0" ] &&
+    pass "zero range refused with EOPNOTSUPP too, the data untouched" ||
+    fail "zero range while a peer held it open: rc/errno ${ZOUT} (want EOPNOTSUPP)"
 
 FREE_NOW="$(sed -n 's/^free_data_blocks: //p' "$(ct_procdir "$DEV")/info")"
 [ "$FREE_NOW" = "$FREE_BEFORE" ] &&

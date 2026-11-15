@@ -75,8 +75,12 @@ PY
     log "$name: $op -> rc=$RC errno=$ERR; free $FREE0 -> $(freeb)"
     case "$name" in
         *pre)
-            [ "$RC" != 0 ] && [ "$ERR" = 26 ] &&
-                pass "$name: the $op refused (ETXTBSY) when the peer arrived before its publish" ||
+            # a punch says EOPNOTSUPP (qemu then skips the discard or
+            # writes the zeroes, audit 2026-11-14 A-12); a truncate ETXTBSY
+            want=26
+            [ "$op" = punch ] && want=95
+            [ "$RC" != 0 ] && [ "$ERR" = "$want" ] &&
+                pass "$name: the $op refused (errno $want) when the peer arrived before its publish" ||
                 fail "$name: the $op returned rc=$RC errno=$ERR with a peer that opened the file meanwhile"
             ;;
         *post)
