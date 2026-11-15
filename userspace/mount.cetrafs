@@ -336,5 +336,9 @@ if [ "$ok" = 0 ]; then
     fi
 fi
 
+# The check ran: say so. The module refuses a mount without it, so one
+# that skips this helper (mount -i, a direct mount(2)) is not let through
+# unchecked (audit 2026-11-15 A-6).
+kept="${kept:+$kept,}transport_checked"
 # shellcheck disable=SC2086 # $args is a list of single-word flags
-exec mount -i -t cetrafs $args ${kept:+-o "$kept"} "$dev" "$dir"
+exec mount -i -t cetrafs $args -o "$kept" "$dev" "$dir"

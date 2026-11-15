@@ -308,7 +308,7 @@ run_pass() {
     # "cetrafs module not loaded". Load it here, which is the matrix
     # being the operator.
     if want_stage soak && ! lsmod | grep -q '^cetrafs '; then
-        if insmod "$SDIR/kmod/cetrafs.ko" 2>/dev/null; then
+        if insmod "$SDIR/kmod/cetrafs.ko" require_mount_check=0 2>/dev/null; then
             say "loaded the module for the soak stage (soak does not insmod by design)"
             SOAK_LOADED_MODULE=1
         else

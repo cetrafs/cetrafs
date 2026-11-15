@@ -916,6 +916,12 @@ func (s *Slave) doMount(a MountArgs) error {
 		return fmt.Errorf("mkdir mountpoint: %w", err)
 	}
 
+	// The scratch LUN is mounted with plain mount(8), and a node may have
+	// no mount.cetrafs installed to vouch for its transport: the module
+	// refuses such a mount unless require_mount_check is off (audit
+	// 2026-11-15 A-6). Best effort -- an older module has no parameter.
+	_ = os.WriteFile("/sys/module/cetrafs/parameters/require_mount_check", []byte("0"), 0644)
+
 	margs := []string{"-t", "cetrafs"}
 	if a.NoFileLock {
 		margs = append(margs, "-o", "nofilelock")

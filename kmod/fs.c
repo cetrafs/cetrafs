@@ -1634,6 +1634,7 @@ struct cetrafs_fc_info {
     bool nodiscard;       /* nodiscard */
     bool inline_discard;  /* discard */
     bool posix_lock_local; /* localposixlocks */
+    bool transport_checked; /* transport_checked: mount.cetrafs vouched (cetrafs_get_tree()) */
     /* Which of the above were STATED, rather than defaulted: only a
      * stated option can be "asked for and not in force". */
     bool file_lock_set, errors_set, corruption_set, nodiscard_set, discard_set, posix_lock_local_set;
@@ -7776,7 +7777,15 @@ int cetrafs_flush_dirty_free_counts(struct super_block *sb)
 
 /* ------ mount options ------ */
 
-enum cetrafs_param { Opt_nofilelock, Opt_errors, Opt_corruption, Opt_nodiscard, Opt_discard, Opt_localposixlocks };
+enum cetrafs_param {
+    Opt_nofilelock,
+    Opt_errors,
+    Opt_corruption,
+    Opt_nodiscard,
+    Opt_discard,
+    Opt_localposixlocks,
+    Opt_transport_checked,
+};
 
 /* errors=: what a fatal error does (docs/internal/ERRORS.md, kind 3).
  * There is deliberately no "continue". */
@@ -7813,6 +7822,9 @@ static const struct fs_parameter_spec cetrafs_fs_parameters[] = {
      * is on. Per node, mount-time only. A nofilelock mount grants them
      * so anyway. */
     fsparam_flag("localposixlocks", Opt_localposixlocks),
+    /* Passed by mount.cetrafs once its transport check has passed (or
+     * was overridden on purpose); see cetrafs_get_tree(). */
+    fsparam_flag("transport_checked", Opt_transport_checked),
     {}};
 
 static int cetrafs_parse_param(struct fs_context *fc, struct fs_parameter *param)
@@ -7846,6 +7858,9 @@ static int cetrafs_parse_param(struct fs_context *fc, struct fs_parameter *param
     case Opt_localposixlocks:
         fci->posix_lock_local = true;
         fci->posix_lock_local_set = true;
+        break;
+    case Opt_transport_checked:
+        fci->transport_checked = true;
         break;
     case Opt_discard:
         fci->inline_discard = true;
@@ -7913,9 +7928,40 @@ static int cetrafs_check_second_mount(struct fs_context *fc)
     return -EBUSY;
 }
 
+/*
+ * A mount that did not come through mount.cetrafs is refused.
+ *
+ * Whether a frozen or cut-off node's queued writes can reach the array
+ * after its lease is gone -- after a peer has taken over the blocks
+ * they aim at -- is decided by settings the module cannot read: the
+ * multipath map's queueing and the transports' timers. mount.cetrafs
+ * checks them (audit 2026-11-14 A-6, B-20) and says so with
+ * transport_checked. mount(8) runs it for every `mount -t cetrafs`; a
+ * mount that skips it -- `mount -i`, a direct mount(2), a node with the
+ * module and not the tools -- joined the cluster unchecked (audit
+ * 2026-11-15 A-6). require_mount_check=0 turns the gate off for a node
+ * whose mounts are known to be safe (the test harnesses, which mount
+ * loop devices with no transport at all).
+ */
+static bool cetrafs_require_mount_check = true;
+module_param_named(require_mount_check, cetrafs_require_mount_check, bool, 0644);
+MODULE_PARM_DESC(require_mount_check,
+                 "Refuse a mount that did not come through mount.cetrafs's transport check (default: Y)");
+
 static int cetrafs_get_tree(struct fs_context *fc)
 {
-    int ret = get_tree_bdev(fc, cetrafs_fill_super);
+    const struct cetrafs_fc_info *fci = fc->fs_private;
+    int ret;
+
+    if (READ_ONCE(cetrafs_require_mount_check) && !(fci && fci->transport_checked)) {
+        pr_err("'%s' not mounted: it did not come through mount.cetrafs, which checks that this node's "
+               "queued writes cannot outlast its lease (multipath no_path_retry, transport timeouts). Mount "
+               "with `mount -t cetrafs` and the cetrafs tools installed; a cluster fenced in hardware passes "
+               "-o x-cetrafs.queue-ok to it.\n",
+               fc->source ?: "<?>");
+        return invalfc(fc, "not checked by mount.cetrafs");
+    }
+    ret = get_tree_bdev(fc, cetrafs_fill_super);
 
     if (!ret)
         ret = cetrafs_check_second_mount(fc);

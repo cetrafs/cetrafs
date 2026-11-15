@@ -71,7 +71,7 @@ unload() {
 probe() { # <dm-name> -> prints the probe verdict line, or a reason
     unload || { echo "(cetrafs stayed loaded; probe impossible)"; return 1; }
     dmesg -C >/dev/null 2>&1
-    insmod "$ROOT/kmod/cetrafs.ko" caw_probe="/dev/mapper/$1" 2>/dev/null ||
+    insmod "$ROOT/kmod/cetrafs.ko" require_mount_check=0 caw_probe="/dev/mapper/$1" 2>/dev/null ||
         { echo "(insmod failed)"; return 1; }
     dmesg | grep -i "caw probe" | tail -1
     rmmod cetrafs 2>/dev/null

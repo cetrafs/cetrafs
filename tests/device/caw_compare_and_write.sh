@@ -128,7 +128,7 @@ THREADS=8
 ITERS=200
 log "mounting with cas_selftest + cas_stress ($THREADS threads x $ITERS increments)"
 RUN_MARK="$(dmesg_mark)"
-insmod "$ROOT/kmod/cetrafs.ko" cas_selftest=1 cas_stress="$THREADS" cas_stress_iters="$ITERS" || {
+insmod "$ROOT/kmod/cetrafs.ko" cas_selftest=1 require_mount_check=0 cas_stress="$THREADS" cas_stress_iters="$ITERS" || {
     fail "insmod failed"
     exit 1
 }

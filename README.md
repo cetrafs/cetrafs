@@ -175,6 +175,12 @@ In this repo:
   through the devices under it. `-o x-cetrafs.queue-ok` overrides, for a
   cluster that fences in hardware.
 
+  The module refuses a mount that did not come through `mount.cetrafs`
+  (`mount -i`, a direct mount(2), a node with the module and not the
+  tools): install the tools and mount with `mount -t cetrafs`. The module
+  option `require_mount_check=0` turns that refusal off, for a node whose
+  mounts are known to be safe.
+
   A `controls` change lasts until the volume is unmounted; the next mount
   takes the module option again. The module option is read when a volume
   is mounted, so changing it (in modprobe.d or

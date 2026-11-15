@@ -88,7 +88,7 @@ dmsetup create stallB --table "0 $SECT_B linear $DEV_B 0" || { echo "dmsetup sta
 rmmod cetrafs 2>/dev/null
 MARK="dmpath-stall-$$"
 echo "$MARK" > /dev/kmsg                      # only count resolutions from THIS run
-insmod "$ROOT/kmod/cetrafs.ko" || { echo "insmod failed"; exit 2; }
+insmod "$ROOT/kmod/cetrafs.ko" require_mount_check=0 || { echo "insmod failed"; exit 2; }
 mount -t cetrafs /dev/mapper/stallA "$MNT_A" || { echo "mount A failed"; exit 2; }
 mount -t cetrafs /dev/mapper/stallB "$MNT_B" || { echo "mount B failed"; exit 2; }
 

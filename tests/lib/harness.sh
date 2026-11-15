@@ -891,8 +891,11 @@ require_module() {
         # cas_selftest=1: exercise cetrafs_cas_record() once per mount. On a
         # loop device there is no atomic CAW, so this covers the no-CAW
         # fallback -- the path real hardware never takes, and therefore the
-        # one nothing else exercises.
-        if ! insmod "$ROOT/kmod/cetrafs.ko" cas_selftest=1 "$@" 2>/dev/null; then
+        # one nothing else exercises. require_mount_check=0: suites mount
+        # loop devices with plain `mount -t cetrafs`, and no mount.cetrafs
+        # is installed to vouch (tests/kernel/mount_requires_helper.sh
+        # turns the gate back on).
+        if ! insmod "$ROOT/kmod/cetrafs.ko" cas_selftest=1 require_mount_check=0 "$@" 2>/dev/null; then
             # "File exists" here is the previous suite's rmmod still
             # settling: delete_module can return before the module is fully
             # out of the kernel's list, so this insmod races it. Wait for
@@ -916,7 +919,7 @@ require_module() {
             why=""
             for _try in $(seq 1 30); do
                 lsmod | grep -q '^cetrafs ' && { sleep 1; continue; }
-                why="$(insmod "$ROOT/kmod/cetrafs.ko" cas_selftest=1 "$@" 2>&1)" && { loaded=1; break; }
+                why="$(insmod "$ROOT/kmod/cetrafs.ko" cas_selftest=1 require_mount_check=0 "$@" 2>&1)" && { loaded=1; break; }
                 # "File exists" is not a failure to diagnose, it is the
                 # kernel telling us a module of this name IS present --
                 # whatever lsmod says. ADOPT it: proceed, and leave
@@ -942,7 +945,7 @@ require_module() {
                                 [ -d /sys/module/cetrafs ] || break
                                 sleep 0.2
                             done
-                            why="$(insmod "$ROOT/kmod/cetrafs.ko" cas_selftest=1 "$@" 2>&1)" &&
+                            why="$(insmod "$ROOT/kmod/cetrafs.ko" cas_selftest=1 require_mount_check=0 "$@" 2>&1)" &&
                                 { loaded=1; break; }
                         fi
                         # Could not take it over (in use, or it will not
