@@ -434,6 +434,7 @@ static int cetrafs_proc_info_show(struct seq_file *m, void *v)
     seq_printf(m, "scrub_cand_deferred: %llu\n", cetrafs_scrub_cand_deferred_count());
     seq_printf(m, "scrub_free_calls: %llu\n", cetrafs_scrub_free_call_count());
     seq_printf(m, "scrub_unknown_records: %llu\n", cetrafs_scrub_unknown_record_count());
+    seq_printf(m, "half_born_settled: %llu\n", cetrafs_half_born_settled_count());
     seq_printf(m, "scrub_inode_readahead: %llu\n", cetrafs_scrub_inode_ra_count());
     seq_printf(m, "defrag_passes: %llu\n", cetrafs_defrag_pass_count());
     seq_printf(m, "defrag_growth_cancels: %llu\n", cetrafs_defrag_growth_cancel_count());

@@ -1540,6 +1540,7 @@ void cetrafs_scrub_stop(struct cetrafs_scrub *s);
 u64 cetrafs_scrub_set_bytes_peak_count(void);
 u64 cetrafs_scrub_cand_deferred_count(void); /* scrub.c: groups that kept no candidates for the candidate budget */
 u64 cetrafs_scrub_unknown_record_count(void);
+u64 cetrafs_half_born_settled_count(void);
 u64 cetrafs_scrub_free_call_count(void);
 u64 cetrafs_scrub_inode_ra_count(void);
 u64 cetrafs_scrub_reclaimed_count(void);

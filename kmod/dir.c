@@ -2434,6 +2434,12 @@ struct cetrafs_ns_window {
 static bool cetrafs_ns_count_cached_bmap;
 cetrafs_test_param(ns_count_cached_bmap, cetrafs_ns_count_cached_bmap, bool, 0644);
 
+/* TEST ONLY: a half-born record is unknown to the recount, as before
+ * F-12 (tests/kernel/half_born_settled.sh). */
+static bool cetrafs_ns_count_half_born_unknown;
+cetrafs_test_param(ns_count_half_born_unknown, cetrafs_ns_count_half_born_unknown, bool, 0644);
+MODULE_PARM_DESC(ns_count_half_born_unknown, "TEST ONLY: the namespace recount fails on a half-born record");
+
 int cetrafs_ns_count_names(struct super_block *sb, const u64 *inos, u32 n, u32 *counts)
 {
     const cetrafs_superblock_t *raw_sb = cetrafs_sb_raw(sb);
@@ -2513,6 +2519,17 @@ int cetrafs_ns_count_names(struct super_block *sb, const u64 *inos, u32 n, u32 *
             if (ret == -ENODATA && cetrafs_walk_zero_owns_nothing_test()) {
                 ret = 0;
                 continue; /* TEST ONLY: names nothing, as F-7 had it */
+            }
+            /* Half-born: a create between its birth claim and its record
+             * write, which settling left alone (its creator is live).
+             * Not a directory yet, and nothing a live record reads back
+             * as -- a checksummed namespace sector naming no file -- so
+             * it names nothing. Unknown, it failed the recount of every
+             * file while the create lasted, and for good if it never
+             * finished (audit 2026-11-15 F-12). */
+            if (ret == -ENODATA && cetrafs_inode_half_born(raw, x) && !READ_ONCE(cetrafs_ns_count_half_born_unknown)) {
+                ret = 0;
+                continue;
             }
             /* -ENODATA: never written, or a directory's record read back
              * as zeros -- the same bytes, and a count that skipped it

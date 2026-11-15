@@ -362,9 +362,19 @@ bool cetrafs_walk_zero_owns_nothing_test(void)
  * one the allocator abandons it stamps dead, which the orphan pass
  * reclaims (alloc.c).
  */
+static int cetrafs_half_born_settle(struct super_block *sb, u64 ino, const cetrafs_inode_t *seen);
+
 int cetrafs_read_raw_inode_walk(struct super_block *sb, u64 ino, cetrafs_inode_t *out)
 {
-    return __cetrafs_read_raw_inode(sb, ino, out, true);
+    int ret = __cetrafs_read_raw_inode(sb, ino, out, true);
+
+    /* A half-born record whose creator is gone is settled here, the
+     * one reader every whole-table walk goes through. */
+    if (ret == -ENODATA && cetrafs_inode_half_born(out, ino) && cetrafs_half_born_settle(sb, ino, out) == 0) {
+        cetrafs_invalidate_raw_inode(sb, ino);
+        ret = __cetrafs_read_raw_inode(sb, ino, out, true);
+    }
+    return ret;
 }
 
 static int __cetrafs_read_raw_inode(struct super_block *sb, u64 ino, cetrafs_inode_t *out, bool zero_ok)
@@ -852,6 +862,7 @@ static int cetrafs_birth_claim_mutate(void *image, unsigned int len, void *priv)
  */
 struct cetrafs_unborn_ctx {
     struct super_block *sb;
+    const u8 *seed; /* the namespace sector judged: zeros, or a half-born one */
     u64 ino;
     bool lost;
 };
@@ -863,13 +874,16 @@ static int cetrafs_unborn_ns_mutate(void *image, unsigned int len, void *priv)
 
     if (len < CETRAFS_INODE_NS_BYTES)
         return -EINVAL;
-    if (memchr_inv(image, 0, CETRAFS_INODE_NS_BYTES)) {
+    if (memcmp(image, ctx->seed, CETRAFS_INODE_NS_BYTES)) {
         ctx->lost = true;
         return 1;
     }
+    /* Zeros, or the half-born sector judged: its stamp carries on. */
     memset(&rec, 0, sizeof(rec));
+    memcpy(&rec, image, CETRAFS_INODE_NS_BYTES);
     rec.ino = cetrafs_cpu_to_le64(ctx->ino);
     rec.ns_lock_owner = cetrafs_cpu_to_le32(CETRAFS_NODE_ID_NONE);
+    rec.ns_lock_incarnation = cetrafs_cpu_to_le32(0);
     cetrafs_ns_stamp_advance(&rec);
     cetrafs_inode_stamp_crc_ns(&rec);
     memcpy(image, &rec, CETRAFS_INODE_NS_BYTES);
@@ -902,10 +916,10 @@ static int cetrafs_unborn_fd_mutate(void *image, unsigned int len, void *priv)
     return 0;
 }
 
-int cetrafs_inode_stamp_unborn(struct super_block *sb, u64 ino)
+static int cetrafs_inode_stamp_dead_from(struct super_block *sb, u64 ino, const u8 *seed)
 {
-    static const u8 zeros[CETRAFS_INODE_NS_BYTES];
-    struct cetrafs_unborn_ctx ctx = {.sb = sb, .ino = ino};
+    static const u8 zeros[CETRAFS_INODE_FD_BYTES];
+    struct cetrafs_unborn_ctx ctx = {.sb = sb, .seed = seed, .ino = ino};
     u64 lba = cetrafs_inode_lba(sb, ino);
     int ret;
 
@@ -913,7 +927,7 @@ int cetrafs_inode_stamp_unborn(struct super_block *sb, u64 ino)
         return -EINVAL;
     if (cetrafs_sb_is_fenced(sb))
         return -EIO;
-    ret = cetrafs_cas_record_seeded(sb, lba, zeros, CETRAFS_INODE_NS_BYTES, cetrafs_unborn_ns_mutate, &ctx);
+    ret = cetrafs_cas_record_seeded(sb, lba, seed, CETRAFS_INODE_NS_BYTES, cetrafs_unborn_ns_mutate, &ctx);
     if (ret)
         return ret;
     if (ctx.lost)
@@ -925,6 +939,81 @@ int cetrafs_inode_stamp_unborn(struct super_block *sb, u64 ino)
     if (!ctx.lost)
         cetrafs_record_write_counted();
     return 0; /* a lost file-sector swap: the number was reborn since, and is its creator's */
+}
+
+int cetrafs_inode_stamp_unborn(struct super_block *sb, u64 ino)
+{
+    static const u8 zeros[CETRAFS_INODE_NS_BYTES];
+
+    return cetrafs_inode_stamp_dead_from(sb, ino, zeros);
+}
+
+/* TEST ONLY: a walk leaves a half-born record whose creator is gone as
+ * it is, as before F-12 (tests/kernel/half_born_settled.sh). */
+static bool cetrafs_half_born_settle_off;
+cetrafs_test_param(half_born_settle_off, cetrafs_half_born_settle_off, bool, 0644);
+MODULE_PARM_DESC(half_born_settle_off, "TEST ONLY: walks leave a dead creator's half-born record unknown");
+
+static atomic64_t cetrafs_half_born_settled = ATOMIC64_INIT(0);
+u64 cetrafs_half_born_settled_count(void)
+{
+    return (u64) atomic64_read(&cetrafs_half_born_settled);
+}
+
+/*
+ * A half-born record names its creator: the birth claim stamped
+ * ns_lock_owner and ns_lock_incarnation. Is that create over for good?
+ * Nobody (an allocator's own stamp stopped between its two sectors);
+ * an earlier incarnation of this node; a peer whose row has moved to
+ * another incarnation; or a stale peer, fenced here. A create never
+ * resumes in a later incarnation, and a fenced one writes nothing more.
+ * Then the record is stamped dead -- by a swap that lands only on the
+ * exact sector judged, so a create that wrote its record meanwhile is
+ * left alone -- and the orphan scrub reclaims the number like any other.
+ * Left half-born, every walk that frees read it as unknown: no scrub
+ * cycle freed anything and no recount completed, on every node, until
+ * an offline fsck -r (audit 2026-11-15 F-12).
+ *
+ * Returns 0 stamped (re-read it), -ENODATA the creator is live or could
+ * not be judged, <0 an error.
+ */
+static int cetrafs_half_born_settle(struct super_block *sb, u64 ino, const cetrafs_inode_t *seen)
+{
+    u32 owner = cetrafs_le32(seen->ns_lock_owner), inc = cetrafs_le32(seen->ns_lock_incarnation), me;
+    bool gone = false;
+    int ret;
+
+    if (READ_ONCE(cetrafs_half_born_settle_off) || cetrafs_sb_is_fenced(sb) || sb_rdonly(sb) ||
+        cetrafs_sb_get_node_id(sb, &me))
+        return -ENODATA;
+    if (owner == CETRAFS_NODE_ID_NONE) {
+        gone = true;
+    } else if (owner == me) {
+        gone = inc != cetrafs_sb_incarnation(sb);
+    } else {
+        cetrafs_node_entry_t row;
+        bool stale = false;
+
+        ret = cetrafs_node_is_stale(sb, owner, &stale);
+        if (ret)
+            return -ENODATA;
+        if (!stale && owner < le32_to_cpu(cetrafs_sb_raw(sb)->node_table_count) &&
+            !cetrafs_node_get_entry(sb, owner, &row) && cetrafs_le32(row.incarnation) != inc)
+            gone = true; /* re-attached since: that create's session is over */
+        else if (stale)
+            gone = !cetrafs_node_fence_peer(sb, owner, "an unfinished create");
+    }
+    if (!gone)
+        return -ENODATA;
+    ret = cetrafs_inode_stamp_dead_from(sb, ino, (const u8 *) seen);
+    if (ret < 0)
+        return ret;
+    if (ret == 0) {
+        atomic64_inc(&cetrafs_half_born_settled);
+        pr_info("ino=%llu: a create by node %u stopped before writing its record -- stamped dead\n",
+                (unsigned long long) ino, owner);
+    }
+    return 0; /* stamped, or changed under us: either way read it again */
 }
 
 /* The creator's half. 'seed' is the record read after the bit CAS, and
