@@ -1645,6 +1645,18 @@ MODULE_PARM_DESC(fd_merge_stall_ms, "TEST ONLY: widen the stat publish's read-to
  * tree blocks, as before (B-23's control). */
 static bool cetrafs_publish_root_ahead;
 cetrafs_test_param(publish_root_ahead, cetrafs_publish_root_ahead, bool, 0644);
+/* TEST ONLY: the publish judges the held set before taking the shadow, not
+ * after (the order review F-10 found racing a convert); and a stall in
+ * between for one inode, to let a convert land there. */
+static bool cetrafs_publish_pending_early;
+cetrafs_test_param(publish_pending_early, cetrafs_publish_pending_early, bool, 0644);
+MODULE_PARM_DESC(publish_pending_early, "TEST ONLY: judge the held tree set before the shadow take (old order)");
+static unsigned long long cetrafs_publish_take_stall_ino;
+cetrafs_test_param(publish_take_stall_ino, cetrafs_publish_take_stall_ino, ullong, 0644);
+MODULE_PARM_DESC(publish_take_stall_ino, "TEST ONLY: the inode publish_take_stall_ms applies to");
+static unsigned int cetrafs_publish_take_stall_ms;
+cetrafs_test_param(publish_take_stall_ms, cetrafs_publish_take_stall_ms, uint, 0644);
+MODULE_PARM_DESC(publish_take_stall_ms, "TEST ONLY: stall a record publish before its shadow take");
 
 struct cetrafs_vfs_stat_cas_ctx {
     struct inode *inode;
@@ -1917,7 +1929,7 @@ int cetrafs_write_vfs_inode(struct inode *inode)
     cetrafs_inode_t *bufs; /* [0]=raw, [1]=shadow, [2]=written -- heap: 3 KiB of records */
     u32 my_node_id = 0;
     u64 fd_seq = 0;
-    bool ilocked = false;
+    bool ilocked = false, freeing = false, root_gated = false;
     int ret;
 
     bufs = kmalloc(3 * sizeof(*bufs), GFP_NOFS);
@@ -2027,12 +2039,13 @@ int cetrafs_write_vfs_inode(struct inode *inode)
      * still held after that keeps the device's root, and the shadow
      * stays pending for the boundary that writes the set.
      */
-    if (S_ISREG(inode->i_mode) && cetrafs_deferred_inode_pending(inode) && !READ_ONCE(cetrafs_publish_root_ahead)) {
-        bool freeing;
-
+    if (S_ISREG(inode->i_mode) && !READ_ONCE(cetrafs_publish_root_ahead)) {
         spin_lock(&inode->i_lock);
         freeing = inode_state_read(inode) & (I_FREEING | I_WILL_FREE);
         spin_unlock(&inode->i_lock);
+        root_gated = !freeing;
+    }
+    if (S_ISREG(inode->i_mode) && cetrafs_deferred_inode_pending(inode) && !READ_ONCE(cetrafs_publish_root_ahead)) {
         /* (TEST ONLY deferred_flush_no_inode leaves the set to sync_fs's
          * lockless batch, which is what that knob stages.) */
         if (!READ_ONCE(cetrafs_deferred_flush_no_inode)) {
@@ -2055,10 +2068,29 @@ int cetrafs_write_vfs_inode(struct inode *inode)
          * past a boundary whose flush failed (a failing close pins its
          * inode for the retry, and the retry writes the orphans first).
          */
-        ctx->defer_root = !freeing && cetrafs_deferred_inode_pending(inode);
+        if (READ_ONCE(cetrafs_publish_pending_early))
+            ctx->defer_root = !freeing && cetrafs_deferred_inode_pending(inode);
     }
+    if (cetrafs_publish_take_stall_ms && READ_ONCE(cetrafs_publish_take_stall_ino) == inode->i_ino)
+        msleep(cetrafs_publish_take_stall_ms);
     cetrafs_inode_fd_pub_lock(inode);
     ctx->have_shadow = cetrafs_inode_fd_take(inode, &bufs[1], &fd_seq);
+    /*
+     * The held set is judged AFTER the take, and must be: a convert
+     * between a judgement made earlier and the take held its shrunk
+     * leaf back, staged a root naming its new one, and this publish
+     * carried that root to the device ahead of the leaf -- the B-23
+     * double naming again, through a window as long as the convert's
+     * own writes (review F-10). A tree edit registers what it holds
+     * back before it stages the root (cetrafs_tree_convert() runs
+     * before cetrafs_inode_fd_stage()), and the stage and the take are
+     * ordered by fd_lock: a shadow naming a held block is seen here
+     * with that block still in the set. A flush empties the set only
+     * once its writes completed, so "not pending" here means the blocks
+     * are on the device.
+     */
+    if (root_gated && !READ_ONCE(cetrafs_publish_pending_early))
+        ctx->defer_root = cetrafs_deferred_inode_pending(inode);
 
     /* The shadow carries this file's hot-path extents, and this CAS is
      * what publishes them: rule 8's flush belongs here exactly as in
