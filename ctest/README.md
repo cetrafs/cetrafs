@@ -29,13 +29,28 @@ cd ctest && go build -o ctest .
 
 ## Run
 
+A slave runs as root and formats, mounts and writes the shared device on
+request, so every request is authenticated: both ends read a shared key
+from `/etc/cetrafs/ctest.key` (`-key` names another file), which must be
+the same on every node and readable by its owner only. Create it once and
+copy it:
+
+```
+install -m 600 /dev/null /etc/cetrafs/ctest.key
+head -c 32 /dev/urandom >/etc/cetrafs/ctest.key
+```
+
+A slave also refuses to listen on every interface: `-addr` names the
+address the master reaches it on. Run campaigns on an isolated test
+network all the same.
+
 On each machine that will mount the shared device. The slave owns both
 the device and the mountpoint; it creates the mountpoint if it does not
 exist, and `-mkfs` is only needed for the `mkfs-guard` scenario (it
 defaults to `../userspace/mkfs.cetra` next to the binary):
 
 ```
-./ctest -mode=slave -addr=:9100 -device=/dev/sda [-mountpoint=/mnt/ctest]
+./ctest -mode=slave -addr=10.0.0.1:9100 -device=/dev/sda [-mountpoint=/mnt/ctest]
 ```
 
 On the machine driving the test (can be one of the above, or separate).
@@ -54,7 +69,7 @@ To also run a slave on the master's own machine in the same invocation
 
 ```
 ./ctest -mode=master \
-    -local-slave=:9100 -slaves=local=127.0.0.1:9100,remote=10.0.0.2:9100 \
+    -local-slave=127.0.0.1:9100 -slaves=local=127.0.0.1:9100,remote=10.0.0.2:9100 \
     -device=/dev/sda -scenario=lock-race -lock-path=ctest-lockfile
 ```
 

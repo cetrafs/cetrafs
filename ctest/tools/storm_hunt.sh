@@ -41,8 +41,8 @@ for i in $(seq 1 12); do
     for h in $H; do
         timeout 45 ssh -n -o ConnectTimeout=10 $h "pkill -f 'mode=sla[v]e'; sleep 1; umount /mnt/cetra 2>/dev/null; rmmod cetrafs 2>/dev/null; insmod /root/cetrafs.ko 2>&1|head -1; for d in /sys/block/sd*/device/state; do grep -q offline \$d 2>/dev/null && echo running > \$d; done; multipath -r >/dev/null 2>&1; pkill -x dmesg; dmesg -C; (setsid dmesg --follow --time-format=iso > /root/rev-stream.txt 2>/dev/null &)" 2>/dev/null
     done
-    timeout 45 ssh -n "$SELF" "cd $REPO && (setsid nohup ./ctest/ctest -mode=slave -device=$D -mountpoint /mnt/cetra >/root/ctest-slave.log 2>&1 </dev/null &)" 2>/dev/null
-    for h in $PEERS; do timeout 45 ssh -n $h "cd /root && (setsid nohup ./ctest -mode=slave -device=$D -mountpoint /mnt/cetra >/root/ctest-slave.log 2>&1 </dev/null &)" 2>/dev/null; done
+    timeout 45 ssh -n "$SELF" "cd $REPO && (setsid nohup ./ctest/ctest -mode=slave -addr=127.0.0.1:9100 -device=$D -mountpoint /mnt/cetra >/root/ctest-slave.log 2>&1 </dev/null &)" 2>/dev/null
+    for h in $PEERS; do timeout 45 ssh -n $h "cd /root && (setsid nohup ./ctest -mode=slave -addr=$h:9100 -device=$D -mountpoint /mnt/cetra >/root/ctest-slave.log 2>&1 </dev/null &)" 2>/dev/null; done
     sleep 3
     # NEVER mkfs over a live mount: a silent umount failure leaves a
     # node whose cached world and the device disagree completely, and

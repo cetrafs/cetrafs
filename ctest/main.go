@@ -34,7 +34,10 @@ func main() {
 	mode := flag.String("mode", "", "slave | master")
 
 	// slave flags
-	addr := flag.String("addr", ":9100", "slave: address to listen on")
+	addr := flag.String("addr", "", "slave: address to listen on, host included (e.g. 10.0.0.1:9100) -- "+
+		"a bare :port, every interface, is refused")
+	keyPath := flag.String("key", DefaultKeyPath, "slave and master: the shared key file (root-only, the same "+
+		"on every node) that authenticates every request")
 	// The slave owns BOTH of these. The master used to send the
 	// mountpoint over the wire, which meant a slave could be driven to
 	// mount somewhere other than where it was configured -- and when
@@ -51,7 +54,7 @@ func main() {
 		"master: comma-separated name=host:port list, e.g. nodeA=127.0.0.1:9100,nodeB=10.0.0.2:9100")
 	localSlave := flag.String("local-slave", "",
 		"master: also start a slave listening on this address, in-process -- include it in -slaves too "+
-			"(e.g. -local-slave=:9100 -slaves=local=127.0.0.1:9100,remote=10.0.0.2:9100) to run a slave on "+
+			"(e.g. -local-slave=127.0.0.1:9100 -slaves=local=127.0.0.1:9100,remote=10.0.0.2:9100) to run a slave on "+
 			"the same machine as the master")
 	scenario := flag.String("scenario", "", "lock-race | lock-sequential | lock-hold | explicit-lock | lock-suspend | cluster-lock-mode | nocaw-mount-race | symlink-publish | zg-fairness | diag | module-info | xattrs | "+
 		"cross-node-visibility | concurrent-create | concurrent-unlink | concurrent-mkdir | concurrent-mkdir-storm | concurrent-rename | "+
@@ -118,6 +121,14 @@ func main() {
 		effectiveTestDir = fmt.Sprintf("ctest-suite-%d", time.Now().Unix())
 	}
 
+	if *mode == "slave" || *mode == "master" {
+		k, err := loadKey(*keyPath)
+		if err != nil {
+			log.Fatal(err)
+		}
+		ctestKey = k
+	}
+
 	switch *mode {
 	case "slave":
 		if err := runSlave(*addr, *slaveDevice, *slaveMount, resolveMkfsPath(*mkfsPath)); err != nil {
@@ -145,7 +156,7 @@ func main() {
 					"these are SLAVE flags and the master cannot apply them: %s\n\n"+
 						"Each slave owns where it mounts, so that a scenario cannot be driven to\n"+
 						"write outside the filesystem under test. Pass them when starting the slave:\n"+
-						"    ctest -mode=slave -addr=:9100 -device=<dev> -mountpoint=<path>\n\n"+
+						"    ctest -mode=slave -addr=<this-host>:9100 -device=<dev> -mountpoint=<path>\n\n"+
 						"The master then drives whatever each slave was configured with, and prints\n"+
 						"it per node at the start of the run.\n",
 					strings.Join(misplaced, " "))
@@ -190,7 +201,7 @@ func main() {
 		}
 	default:
 		fmt.Fprintln(os.Stderr, "usage:")
-		fmt.Fprintln(os.Stderr, "  ctest -mode=slave -addr=:9100 -device=/dev/sda [-mountpoint=/mnt/ctest]")
+		fmt.Fprintln(os.Stderr, "  ctest -mode=slave -addr=<this-host>:9100 -device=/dev/sda [-mountpoint=/mnt/ctest]")
 		fmt.Fprintln(os.Stderr, "  ctest -mode=master -slaves=name=host:port,... [-local-slave=:port] \\")
 		fmt.Fprintln(os.Stderr, "        -scenario=lock-race|zg-fairness|mkfs-guard|full-suite")
 		os.Exit(2)

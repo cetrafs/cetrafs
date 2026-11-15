@@ -19,6 +19,9 @@ type Request struct {
 	ID   uint64          `json:"id"`
 	Op   string          `json:"op"`
 	Args json.RawMessage `json:"args,omitempty"`
+	// Mac authenticates the frame: frameMAC() over the connection's
+	// nonce, ID, Op and Args (auth.go).
+	Mac string `json:"mac"`
 }
 
 type Response struct {
@@ -66,6 +69,18 @@ func (f *frameConn) writeResponse(r Response) error {
 	f.mu.Lock()
 	defer f.mu.Unlock()
 	return f.enc.Encode(r)
+}
+
+func (f *frameConn) writeHello(h Hello) error {
+	f.mu.Lock()
+	defer f.mu.Unlock()
+	return f.enc.Encode(h)
+}
+
+func (f *frameConn) readHello() (Hello, error) {
+	var h Hello
+	err := f.dec.Decode(&h)
+	return h, err
 }
 
 func (f *frameConn) readResponse() (Response, error) {

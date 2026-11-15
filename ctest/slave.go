@@ -72,6 +72,12 @@ func runSlave(addr, device, mountPoint, mkfsPath string) error {
 		return fmt.Errorf("slave: mkdir mountpoint %s: %w", mountPoint, err)
 	}
 
+	if len(ctestKey) == 0 {
+		return fmt.Errorf("slave: no ctest key loaded (-key)")
+	}
+	if err := checkListenAddr(addr); err != nil {
+		return err
+	}
 	ln, err := net.Listen("tcp", addr)
 	if err != nil {
 		return err
@@ -141,11 +147,24 @@ func (s *Slave) handleConn(c net.Conn) {
 		}
 	}()
 	fc := newFrameConn(c)
+	nonce, err := newNonce()
+	if err != nil || fc.writeHello(Hello{Nonce: nonce}) != nil {
+		return
+	}
+	var lastID uint64
 	for {
 		req, err := fc.readRequest()
 		if err != nil {
 			return // peer closed, or EOF
 		}
+		// Unauthenticated, or a replay of an earlier frame: not run, not
+		// answered (auth.go).
+		if !frameOK(ctestKey, nonce, req) || req.ID <= lastID {
+			log.Printf("slave: refused a request from %s that failed authentication (op=%q id=%d) -- closing",
+				c.RemoteAddr(), req.Op, req.ID)
+			return
+		}
+		lastID = req.ID
 		resp := s.dispatch(req)
 		if resp.OK {
 			log.Printf("-> id=%d op=%s ok", req.ID, req.Op)
@@ -898,7 +917,7 @@ func (s *Slave) resolvePath(relPath string) (string, error) {
 		return "", fmt.Errorf("%s is not a cetrafs mount (send \"mount\" first) "+
 			"-- refusing to write to the host filesystem", mp)
 	}
-	return filepath.Join(mp, relPath), nil
+	return joinUnder(mp, relPath)
 }
 
 func (s *Slave) doMount(a MountArgs) error {
@@ -1033,6 +1052,11 @@ func (s *Slave) doMkfs(a MkfsArgs) (MkfsResult, error) {
 	// mkfs had never even looked at the device. That is why the guard
 	// now matches on WHY mkfs refused, not just that it did.
 	args := []string{s.dev()}
+	for _, x := range a.Extra {
+		if !safeArg(x) {
+			return MkfsResult{}, fmt.Errorf("mkfs argument %q refused: flags and numbers only", x)
+		}
+	}
 	args = append(args, a.Extra...)
 	if a.Force {
 		args = append(args, "-f")
@@ -1882,6 +1906,12 @@ func doModuleReload(a ModuleReloadArgs) error {
 	if _, err := os.Stat("/sys/module/cetrafs"); err == nil {
 		if out, err := exec.Command("rmmod", "cetrafs").CombinedOutput(); err != nil {
 			return fmt.Errorf("rmmod: %v: %s", err, out)
+		}
+	}
+	for _, p := range a.Params {
+		name, _, _ := strings.Cut(p, "=")
+		if !safeArg(p) || !(settableModParams[name] || name == "node_uuid") {
+			return fmt.Errorf("module parameter %q refused: test knobs and node_uuid only", p)
 		}
 	}
 	if out, err := exec.Command("insmod", append([]string{ko}, a.Params...)...).CombinedOutput(); err != nil {

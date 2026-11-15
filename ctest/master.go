@@ -42,6 +42,7 @@ type Client struct {
 	// costs nothing they rely on.
 	callMu sync.Mutex
 	seq    atomic.Uint64
+	nonce  string // the slave's Hello for this connection (auth.go)
 }
 
 func dialClient(name, addr string, timeout time.Duration) (*Client, error) {
@@ -49,7 +50,15 @@ func dialClient(name, addr string, timeout time.Duration) (*Client, error) {
 	if err != nil {
 		return nil, fmt.Errorf("dial %s (%s): %w", name, addr, err)
 	}
-	return &Client{Name: name, Addr: addr, conn: conn, fc: newFrameConn(conn)}, nil
+	fc := newFrameConn(conn)
+	_ = conn.SetReadDeadline(time.Now().Add(timeout))
+	h, err := fc.readHello()
+	_ = conn.SetReadDeadline(time.Time{})
+	if err != nil || len(h.Nonce) != 64 {
+		conn.Close()
+		return nil, fmt.Errorf("dial %s (%s): no hello from the slave (an older ctest?): %v", name, addr, err)
+	}
+	return &Client{Name: name, Addr: addr, conn: conn, fc: fc, nonce: h.Nonce}, nil
 }
 
 func (c *Client) Close() error {
@@ -109,7 +118,9 @@ func (c *Client) Call(op string, args any) (Response, error) {
 	defer c.callMu.Unlock()
 
 	id := c.seq.Add(1)
-	if err := c.fc.writeRequest(Request{ID: id, Op: op, Args: b}); err != nil {
+	req := Request{ID: id, Op: op, Args: b}
+	req.Mac = frameMAC(ctestKey, c.nonce, id, op, req.Args)
+	if err := c.fc.writeRequest(req); err != nil {
 		return Response{}, fmt.Errorf("%s: write request: %w", c.Name, err)
 	}
 
