@@ -1564,8 +1564,21 @@ int cetrafs_journal_write_deferred(struct super_block *sb, struct buffer_head **
  * bit, and every "does this buffer hold a write the device has not seen?"
  * asks cetrafs_bh_pending(). */
 #include <linux/buffer_head.h>
-enum { BH_CetraDeferred = BH_PrivateStart, BH_CetraTailStale };
+enum { BH_CetraDeferred = BH_PrivateStart, BH_CetraTailStale, BH_CetraHeld };
 BUFFER_FNS(CetraDeferred, cetra_deferred)
+/* ioutil.c: an allocation-bitmap block modified in cache and HELD from
+ * the device until cetrafs writes it at one of its own gated points
+ * (cetrafs_held_flush()). Not dirty, so the block layer's writeback
+ * never writes it -- after a freeze that outlived the lease, writeback
+ * used to race the self-fence's sweep and lay this node's stale bitmap
+ * over a peer's (audit 2026-11-14 A-15). Pinned and listed per sb. */
+BUFFER_FNS(CetraHeld, cetra_held)
+TAS_BUFFER_FNS(CetraHeld, cetra_held)
+void cetrafs_bh_end_update_held(struct super_block *sb, struct buffer_head *bh, bool changed);
+int cetrafs_held_flush(struct super_block *sb);
+unsigned long cetrafs_held_drop_all(struct super_block *sb);
+struct xarray *cetrafs_sb_held(struct super_block *sb);
+u64 cetrafs_held_flush_count(void);
 /* A held-back tree block edited since its tail was last stamped: the
  * eh_generation and magic are current, the tail CRC is not. Stamped once
  * where the image leaves memory (cetrafs_blk_tail_settle()), under the
@@ -1576,7 +1589,7 @@ void cetrafs_blk_tail_settle(struct buffer_head *bh);
 u64 cetrafs_tail_lazy_count(void);
 static inline bool cetrafs_bh_pending(const struct buffer_head *bh)
 {
-    return buffer_dirty(bh) || buffer_cetra_deferred(bh);
+    return buffer_dirty(bh) || buffer_cetra_deferred(bh) || buffer_cetra_held(bh);
 }
 int cetrafs_bh_defer_update(struct inode *inode, struct buffer_head *bh, u32 prev_crc);
 int cetrafs_write_deferred_target(struct super_block *sb, struct buffer_head *bh, u32 *wcrc);

@@ -561,6 +561,7 @@ struct cetrafs_sb_info {
     /* A regular file's extent-tree blocks held back from writeback until
      * a durability boundary, by LBA (leafdefer.c). */
     struct xarray deferred;
+    struct xarray held; /* allocation-bitmap buffers held from writeback, by block (ioutil.c) */
     /* Held-back blocks of inodes evicted with blocks still listed; under
      * the deferred xarray's lock (leafdefer.c). */
     struct list_head deferred_orphans;
@@ -2708,6 +2709,7 @@ int cetrafs_fill_super(struct super_block *sb, struct fs_context *fc)
         sbi->auto_defrag_enabled = true;
         xa_init(&sbi->bad_inos);
         xa_init(&sbi->deferred);
+        xa_init(&sbi->held);
         xa_init(&sbi->discard_pending);
         INIT_LIST_HEAD(&sbi->deferred_orphans);
         sbi->sb = sb;
@@ -3908,7 +3910,7 @@ void cetrafs_free_sb_info(struct super_block *sb)
     if (stopped) {
         cancel_work_sync(&sbi->stop_work); /* its sweep, finished; ours covers what came after */
         if (sb->s_bdev) {
-            unsigned long n = cetrafs_drop_dirty_metadata(sb) + cetrafs_deferred_drop_all(sb);
+            unsigned long n = cetrafs_drop_dirty_metadata(sb) + cetrafs_deferred_drop_all(sb) + cetrafs_held_drop_all(sb);
 
             if (n)
                 pr_err("%s: unmount of a stopped mount: discarded %lu dirty metadata buffer(s) without "
@@ -3945,6 +3947,9 @@ void cetrafs_free_sb_info(struct super_block *sb)
      * bitmap flush with nothing to do used to read as a clean departure
      * (audit 2026-11-14 A-9; tests/kernel/umount_flush_err_kept.sh). */
     r = cetrafs_alloc_flush_bitmaps(sb);
+    if (r && !flush_err)
+        flush_err = r;
+    r = cetrafs_held_flush(sb); /* the frees still held: unmarked, so not in the flush above */
     if (r && !flush_err)
         flush_err = r;
     r = cetrafs_flush_dirty_free_counts(sb);
@@ -4048,8 +4053,16 @@ departed:
 
         if (n)
             pr_err("%s: released %lu extent-tree block(s) that never reached the device\n", sb->s_id, n);
+        /* Held bitmap blocks likewise: a clean unmount flushed them
+         * (cetrafs_alloc_flush_bitmaps() + cetrafs_held_flush()); this
+         * only gives the pins back -- and drops what a stopped mount or
+         * a failed flush still holds. */
+        n = cetrafs_held_drop_all(sb);
+        if (n)
+            pr_err("%s: released %lu allocation-bitmap block(s) that never reached the device\n", sb->s_id, n);
     }
     xa_destroy(&sbi->deferred);
+    xa_destroy(&sbi->held);
     xa_destroy(&sbi->bad_inos);
     xa_destroy(&sbi->discard_pending);
     cetrafs_inline_discard_destroy(sbi->inline_discard); /* closed above; a late free found it closed */
@@ -4321,6 +4334,13 @@ struct list_head *cetrafs_sb_deferred_orphans(struct super_block *sb)
     struct cetrafs_sb_info *sbi = sb->s_fs_info;
 
     return sbi ? &sbi->deferred_orphans : NULL;
+}
+
+struct xarray *cetrafs_sb_held(struct super_block *sb)
+{
+    struct cetrafs_sb_info *sbi = sb->s_fs_info;
+
+    return sbi ? &sbi->held : NULL;
 }
 
 struct xarray *cetrafs_sb_deferred(struct super_block *sb)
@@ -5109,13 +5129,24 @@ void cetrafs_sb_stop(struct super_block *sb, enum cetrafs_stop_cause cause, cons
     schedule_work(&sbi->stop_work);
 }
 
+/* TEST ONLY: the stop's sweep of dirty metadata starts N ms late -- the
+ * window a node resuming from a freeze gives the block layer's own
+ * writeback before the sweep runs (tests/kernel/fence_writeback_race.sh). */
+static unsigned int cetrafs_stop_sweep_delay_ms;
+cetrafs_test_param(stop_sweep_delay_ms, cetrafs_stop_sweep_delay_ms, uint, 0644);
+MODULE_PARM_DESC(stop_sweep_delay_ms, "TEST ONLY: delay the self-fence's sweep of dirty metadata by N ms");
+
 static void cetrafs_sb_stop_work(struct work_struct *w)
 {
     struct cetrafs_sb_info *sbi = container_of(w, struct cetrafs_sb_info, stop_work);
     struct super_block *sb = sbi->sb;
 
     if (sb && sb->s_bdev) {
-        unsigned long n = cetrafs_drop_dirty_metadata(sb) + cetrafs_deferred_drop_all(sb);
+        unsigned long n;
+
+        if (READ_ONCE(cetrafs_stop_sweep_delay_ms))
+            msleep(READ_ONCE(cetrafs_stop_sweep_delay_ms)); /* test-only; see the parameter */
+        n = cetrafs_drop_dirty_metadata(sb) + cetrafs_deferred_drop_all(sb) + cetrafs_held_drop_all(sb);
 
         if (n)
             pr_err("%s: SELF-FENCED: discarded %lu dirty metadata buffer(s) without writing them -- the "

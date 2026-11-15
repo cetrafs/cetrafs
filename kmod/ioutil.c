@@ -347,6 +347,129 @@ void cetrafs_bh_end_update(struct buffer_head *bh)
 }
 
 /*
+ * End an update of an allocation-bitmap block: HELD from the device, not
+ * dirtied (BH_CetraHeld; kmod.h). Only cetrafs writes it, at its own
+ * gated points -- a boundary's bitmap flush (cetrafs_alloc_flush_bitmaps(),
+ * through cetrafs_sync_buffer_keep()), a heartbeat tick, sync_fs, unmount
+ * (cetrafs_held_flush()) -- each of which refuses on a fenced mount. The
+ * block layer's writeback never sees it, so a node that froze past its
+ * lease cannot have writeback lay its stale bitmap over a peer's before
+ * the self-fence drops it (audit 2026-11-14 A-15).
+ *
+ * 'changed' false: the update changed no bit, and the block is left as it
+ * was -- dirtying an unchanged image is not free either: a bitmap block
+ * dirtied by a free that cleared nothing outlived the hand-back of its
+ * group and was written over the next owner's (audit 2026-11-14 A-3).
+ *
+ * Pinned (get_bh) while listed, so reclaim cannot drop the only copy.
+ * Called with the buffer locked (cetrafs_bh_begin_update()); unlocks.
+ */
+static bool cetrafs_bitmap_writeback;
+cetrafs_test_param(bitmap_writeback, cetrafs_bitmap_writeback, bool, 0644);
+MODULE_PARM_DESC(bitmap_writeback, "TEST ONLY: allocation bitmaps are left dirty for writeback (before A-15)");
+
+static atomic64_t cetrafs_held_flushes = ATOMIC64_INIT(0);
+
+u64 cetrafs_held_flush_count(void)
+{
+    return (u64) atomic64_read(&cetrafs_held_flushes);
+}
+
+void cetrafs_bh_end_update_held(struct super_block *sb, struct buffer_head *bh, bool changed)
+{
+    struct xarray *xa = cetrafs_sb_held(sb);
+    void *old;
+
+    if (!changed) {
+        unlock_buffer(bh);
+        return;
+    }
+    if (READ_ONCE(cetrafs_bitmap_writeback) || !xa) {
+        cetrafs_bh_end_update(bh); /* test-only (or no sb_info): dirty, as before */
+        return;
+    }
+    if (!test_set_buffer_cetra_held(bh)) {
+        get_bh(bh);
+        old = xa_store(xa, bh->b_blocknr, bh, GFP_NOFS);
+        if (xa_is_err(old)) {
+            /* No room to list it: dirty, as before -- writeback may
+             * write it, which is the old exposure, not a lost bit. */
+            clear_buffer_cetra_held(bh);
+            put_bh(bh);
+            cetrafs_bh_end_update(bh);
+            return;
+        }
+        if (old)
+            put_bh((struct buffer_head *) old); /* listed already: one pin per entry */
+    }
+    unlock_buffer(bh);
+}
+
+/*
+ * Write every held bitmap block, and unlist what is no longer held. A
+ * gated write: nothing on a fenced or stopped mount. On a failed write
+ * the block stays held -- its bytes are the only record of bits that did
+ * not land (cetrafs_sync_buffer_keep()) -- and the error is returned.
+ */
+int cetrafs_held_flush(struct super_block *sb)
+{
+    struct xarray *xa = cetrafs_sb_held(sb);
+    struct buffer_head *bh;
+    unsigned long idx;
+    int ret = 0, r;
+
+    if (!xa || xa_empty(xa))
+        return 0;
+    if (cetrafs_sb_is_fenced(sb))
+        return -EIO;
+    atomic64_inc(&cetrafs_held_flushes);
+    xa_for_each(xa, idx, bh) {
+        cond_resched();
+        get_bh(bh);
+        r = cetrafs_sync_buffer_keep(sb, bh); /* writes it if held or dirty */
+        if (r && !ret)
+            ret = r;
+        lock_buffer(bh);
+        if (!buffer_cetra_held(bh) && xa_load(xa, idx) == bh) {
+            xa_erase(xa, idx);
+            put_bh(bh); /* the list's pin */
+        }
+        unlock_buffer(bh);
+        put_bh(bh);
+    }
+    return ret;
+}
+
+/*
+ * Forget every held block unwritten: the self-fence's sweep, a stopped
+ * mount's unmount, and the last teardown (where a clean unmount has
+ * flushed them and this only gives the pins back). The bytes are
+ * dropped (!uptodate): the next read is the device's. Returns how many
+ * were still held.
+ */
+unsigned long cetrafs_held_drop_all(struct super_block *sb)
+{
+    struct xarray *xa = cetrafs_sb_held(sb);
+    struct buffer_head *bh;
+    unsigned long idx, dropped = 0;
+
+    if (!xa)
+        return 0;
+    xa_for_each(xa, idx, bh) {
+        lock_buffer(bh);
+        if (test_clear_buffer_cetra_held(bh)) {
+            dropped++;
+            if (!buffer_dirty(bh))
+                clear_buffer_uptodate(bh);
+        }
+        unlock_buffer(bh);
+        xa_erase(xa, idx);
+        put_bh(bh);
+    }
+    return dropped;
+}
+
+/*
  * Write a dirty buffer synchronously and say whether it reached the
  * device. Use this, not sync_dirty_buffer(), wherever the answer matters.
  *
@@ -421,13 +544,14 @@ static int __cetrafs_sync_buffer(struct buffer_head *bh)
         clear_buffer_dirty(bh);
         set_buffer_write_io_error(bh);
     }
-    if (!test_clear_buffer_dirty(bh)) {
+    if (!test_clear_buffer_dirty(bh) && !test_clear_buffer_cetra_held(bh)) {
         int ret = buffer_write_io_error(bh) ? -EIO : 0;
 
         clear_buffer_write_io_error(bh); /* reported once: the mount stops */
         unlock_buffer(bh);
         return ret;
     }
+    clear_buffer_cetra_held(bh); /* written now, whichever it was */
     clear_buffer_write_io_error(bh);
     return cetrafs_write_locked_bh(bh);
 }
@@ -477,22 +601,35 @@ static int __cetrafs_sync_buffer_keep(struct buffer_head *bh)
         mark_buffer_dirty(bh);
         return -EIO;
     }
-    if (!test_clear_buffer_dirty(bh)) {
-        unlock_buffer(bh);
-        return 0;
-    }
+    {
+        bool was_dirty = test_clear_buffer_dirty(bh);
+        bool was_held = test_clear_buffer_cetra_held(bh);
+
+        if (!was_dirty && !was_held) {
+            unlock_buffer(bh);
+            return 0;
+        }
 #if LINUX_VERSION_CODE >= KERNEL_VERSION(7, 2, 0)
-    bh_submit(bh, REQ_OP_WRITE | REQ_SYNC, cetrafs_end_write_keep);
+        bh_submit(bh, REQ_OP_WRITE | REQ_SYNC, cetrafs_end_write_keep);
 #else
-    get_bh(bh);
-    bh->b_end_io = cetrafs_end_write_keep;
-    submit_bh(REQ_OP_WRITE | REQ_SYNC, bh);
+        get_bh(bh);
+        bh->b_end_io = cetrafs_end_write_keep;
+        submit_bh(REQ_OP_WRITE | REQ_SYNC, bh);
 #endif
-    wait_on_buffer(bh);
-    if (buffer_write_io_error(bh)) {
-        clear_buffer_write_io_error(bh);
-        mark_buffer_dirty(bh); /* still uptodate: the next boundary retries it */
-        return -EIO;
+        wait_on_buffer(bh);
+        if (buffer_write_io_error(bh)) {
+            clear_buffer_write_io_error(bh);
+            /* still uptodate: the next boundary retries it -- held again
+             * if it was held, never handed to writeback (A-15) */
+            if (was_held && !was_dirty) {
+                lock_buffer(bh);
+                set_buffer_cetra_held(bh);
+                unlock_buffer(bh);
+            } else {
+                mark_buffer_dirty(bh);
+            }
+            return -EIO;
+        }
     }
     return 0;
 }
@@ -1054,6 +1191,7 @@ void cetrafs_forget_block(struct super_block *sb, sector_t block)
 
     lock_buffer(bh);
     clear_buffer_dirty(bh);
+    clear_buffer_cetra_held(bh); /* unlisted by the next held flush or drop */
     clear_buffer_uptodate(bh);
     unlock_buffer(bh);
 

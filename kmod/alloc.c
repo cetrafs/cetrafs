@@ -61,6 +61,25 @@ MODULE_PARM_DESC(pf_force_foreign, "test-only: route every block free through th
  * Returns the bit index (>= 0), or a negative errno (-ENOSPC if none free,
  * -EIO on a read failure).
  */
+/* TEST ONLY: the old behaviour on both sides of audit 2026-11-14 A-3 --
+ * a free that clears no bit still dirties its bitmap block, and a
+ * hand-back leaves a dirty bitmap block in the cache
+ * (tests/kernel/release_noop_free_clean.sh). */
+static bool cetrafs_noop_free_dirties;
+cetrafs_test_param(noop_free_dirties, cetrafs_noop_free_dirties, bool, 0644);
+MODULE_PARM_DESC(noop_free_dirties, "TEST ONLY: a no-op free dirties the bitmap and a hand-back keeps it dirty");
+
+/* Every data-bitmap update ends here: held from writeback until a gated
+ * flush (cetrafs_bh_end_update_held(), audit 2026-11-14 A-15), and left
+ * clean when it changed nothing (A-3). */
+static void cetrafs_bmap_end_update(struct super_block *sb, struct buffer_head *bh, bool changed)
+{
+    if (READ_ONCE(cetrafs_noop_free_dirties)) {
+        cetrafs_bh_end_update(bh); /* test-only: dirty, whatever changed */
+        return;
+    }
+    cetrafs_bh_end_update_held(sb, bh, changed);
+}
 /*
  * 'sync' matters: the global inode bitmap is shared cross-node (the
  * cluster mutex is the only thing closing that race, see
@@ -116,7 +135,7 @@ static long cetrafs_bitmap_alloc_bit(struct super_block *sb, u64 bmap_lba, u64 n
                      * end_update(), never inside the region. */
                     cetrafs_bh_begin_update(bh);
                     *b |= (u8) (1u << bit);
-                    cetrafs_bh_end_update(bh);
+                    cetrafs_bmap_end_update(sb, bh, true);
                     if (sync) /* no caller passes true today */
                         (void) cetrafs_sync_buffer(sb, bh);
                     brelse(bh);
@@ -271,7 +290,7 @@ static int cetrafs_bitmap_free_bit(struct super_block *sb, u64 bmap_lba, u64 nbl
      * entries. */
     cetrafs_bh_begin_update(bh);
     *((u8 *) bh->b_data + byte) &= (u8) ~(1u << bit_in_byte);
-    cetrafs_bh_end_update(bh);
+    cetrafs_bmap_end_update(sb, bh, true);
     if (sync) /* no caller passes true today */
         (void) cetrafs_sync_buffer(sb, bh);
     brelse(bh);
@@ -317,7 +336,7 @@ static int cetrafs_bitmap_try_alloc_exact(struct super_block *sb,
 
     cetrafs_bh_begin_update(bh);
     *b |= (u8) (1u << bit_in_byte);
-    cetrafs_bh_end_update(bh);
+    cetrafs_bmap_end_update(sb, bh, true);
     if (sync) /* no caller passes true today */
         (void) cetrafs_sync_buffer(sb, bh);
     brelse(bh);
@@ -2407,7 +2426,7 @@ u32 cetrafs_alloc_run_after(struct super_block *sb, u32 bg_id, u64 start_lba, u3
             u8 *byte;
 
             if (bh && held != blk) {
-                cetrafs_bh_end_update(bh);
+                cetrafs_bmap_end_update(sb, bh, true);
                 brelse(bh);
                 bh = NULL;
             }
@@ -2428,7 +2447,7 @@ u32 cetrafs_alloc_run_after(struct super_block *sb, u32 bg_id, u64 start_lba, u3
             got++;
         }
         if (bh) {
-            cetrafs_bh_end_update(bh);
+            cetrafs_bmap_end_update(sb, bh, true);
             brelse(bh);
         }
     }
@@ -2941,9 +2960,9 @@ static int cetrafs_sync_one_block(struct super_block *sb, u64 lba)
     if (!bh)
         return 0;
 
-    if (unlikely(READ_ONCE(cetrafs_alloc_flush_fail)) && buffer_dirty(bh)) {
+    if (unlikely(READ_ONCE(cetrafs_alloc_flush_fail)) && (buffer_dirty(bh) || buffer_cetra_held(bh))) {
         brelse(bh);
-        return -EIO; /* as a failed write leaves it: still dirty */
+        return -EIO; /* as a failed write leaves it: still pending */
     }
     /* _keep: on a failed write these bytes are the only record of the
      * bits that did not land -- see ioutil.c. */
@@ -3332,6 +3351,7 @@ bool cetrafs_lba_run_is_ours(struct super_block *sb, u64 lba, u64 count)
 static int __cetrafs_free_data_extent(struct super_block *sb, u64 lba, u32 count, const u64 *resv_seq, const u64 *alloc_seq, u64 *out_freed, struct cetrafs_free_batch *fb)
 {
     struct buffer_head *fbh = NULL; /* the bitmap block the loop holds */
+    bool fchg = false; /* fbh had a bit cleared: dirty it, else leave it clean */
     u64 fblk = 0;
     struct cetrafs_bg_geom bg;
     u64 data_start, bit, b, freed = 0, credited = 0;
@@ -3506,7 +3526,7 @@ static int __cetrafs_free_data_extent(struct super_block *sb, u64 lba, u32 count
          * below are per block, under the lock, as before. */
         if (b && !(b & 4095)) {
             if (fbh) { /* never held across the unlock */
-                cetrafs_bh_end_update(fbh);
+                cetrafs_bmap_end_update(sb, fbh, fchg);
                 brelse(fbh);
                 fbh = NULL;
             }
@@ -3574,7 +3594,7 @@ static int __cetrafs_free_data_extent(struct super_block *sb, u64 lba, u32 count
             u8 *byte;
 
             if (fbh && fblk != blk) {
-                cetrafs_bh_end_update(fbh);
+                cetrafs_bmap_end_update(sb, fbh, fchg);
                 brelse(fbh);
                 fbh = NULL;
             }
@@ -3591,6 +3611,7 @@ static int __cetrafs_free_data_extent(struct super_block *sb, u64 lba, u32 count
                 atomic64_inc(&cetrafs_free_bmap_lookups);
                 cetrafs_bh_begin_update(fbh);
                 fblk = blk;
+                fchg = false;
             }
             byte = (u8 *) fbh->b_data + in / 8;
             if (!(*byte & (1u << (in % 8)))) {
@@ -3599,12 +3620,13 @@ static int __cetrafs_free_data_extent(struct super_block *sb, u64 lba, u32 count
                 continue;
             }
             *byte &= (u8) ~(1u << (in % 8));
+            fchg = true;
         }
         cetrafs_shadow_clear(sb, lba + b, 1, "free_data_extent");
         freed++;
     }
     if (fbh) {
-        cetrafs_bh_end_update(fbh);
+        cetrafs_bmap_end_update(sb, fbh, fchg);
         brelse(fbh);
     }
     if (freed > credited)
@@ -3696,6 +3718,7 @@ int cetrafs_apply_pending_free(struct super_block *sb, u64 lba, u32 count, u32 e
     struct cetrafs_bg_geom bg;
     u64 data_start, bit, b, freed = 0, total = 0;
     struct buffer_head *fbh = NULL; /* the bitmap block the loop holds */
+    bool fchg = false; /* fbh had a bit cleared: dirty it, else leave it clean */
     u64 fblk = 0;
     u32 bg_id;
     int ret;
@@ -3768,7 +3791,7 @@ int cetrafs_apply_pending_free(struct super_block *sb, u64 lba, u32 count, u32 e
             struct cetrafs_bg_geom now;
 
             if (fbh) { /* never held across the unlock */
-                cetrafs_bh_end_update(fbh);
+                cetrafs_bmap_end_update(sb, fbh, fchg);
                 brelse(fbh);
                 fbh = NULL;
             }
@@ -3826,7 +3849,7 @@ int cetrafs_apply_pending_free(struct super_block *sb, u64 lba, u32 count, u32 e
             u8 *byte;
 
             if (fbh && fblk != blk) {
-                cetrafs_bh_end_update(fbh);
+                cetrafs_bmap_end_update(sb, fbh, fchg);
                 brelse(fbh);
                 fbh = NULL;
             }
@@ -3843,17 +3866,19 @@ int cetrafs_apply_pending_free(struct super_block *sb, u64 lba, u32 count, u32 e
                 atomic64_inc(&cetrafs_pf_apply_bmap_lookups);
                 cetrafs_bh_begin_update(fbh);
                 fblk = blk;
+                fchg = false;
             }
             byte = (u8 *) fbh->b_data + in / 8;
             if (!(*byte & (1u << (in % 8))))
                 continue; /* already free: re-applied entry, or double-queued -- skip the count too */
             *byte &= (u8) ~(1u << (in % 8));
+            fchg = true;
         }
         cetrafs_shadow_clear(sb, lba + b, 1, "free_data_extent");
         freed++;
     }
     if (fbh) {
-        cetrafs_bh_end_update(fbh);
+        cetrafs_bmap_end_update(sb, fbh, fchg);
         brelse(fbh);
     }
     if (freed)
@@ -4673,7 +4698,18 @@ void cetrafs_bg_release_drop_bitmap(struct super_block *sb, u32 b)
         return;
     for (blk = 0; blk < (u64) bg.off_data_region - bg.off_data_bmap; blk++) {
         cond_resched();
-        cetrafs_invalidate_block(sb, bg.start_block + bg.off_data_bmap + blk);
+        /*
+         * Forgotten, dirty or not. The group is the next owner's from the
+         * CAS on, and everything of ours in its bitmap was synced before
+         * it (cetrafs_bg_release_bitmap_ready()): a block dirty NOW holds
+         * nothing to keep, and invalidating refuses a dirty buffer --
+         * which left it for writeback to lay over the next owner's
+         * bitmap (audit 2026-11-14 A-3).
+         */
+        if (READ_ONCE(cetrafs_noop_free_dirties))
+            cetrafs_invalidate_block(sb, bg.start_block + bg.off_data_bmap + blk); /* test-only: the old drop */
+        else
+            cetrafs_forget_block(sb, bg.start_block + bg.off_data_bmap + blk);
     }
 }
 
@@ -4694,6 +4730,14 @@ MODULE_PARM_DESC(bg_release_off, "test-only: never hand back individual Block Gr
  * restores the old order, counters moved only after that window, as the
  * suite's control.
  */
+/* TEST ONLY: the next Block Group release frees one already-free block
+ * of the group after its bitmap is synced and before its CAS -- the
+ * duplicate free audit 2026-11-14 A-3 is about, at the one moment it
+ * matters (tests/kernel/release_noop_free_clean.sh). One-shot. */
+static bool cetrafs_release_noop_free;
+cetrafs_test_param(release_noop_free, cetrafs_release_noop_free, bool, 0644);
+MODULE_PARM_DESC(release_noop_free, "TEST ONLY: the next Block Group release frees an already-free block before its CAS");
+
 static unsigned int cetrafs_bg_release_stall_ms;
 cetrafs_test_param(bg_release_stall_ms, cetrafs_bg_release_stall_ms, uint, 0644);
 MODULE_PARM_DESC(bg_release_stall_ms, "test-only: stall a Block Group release after it reads FREE");
@@ -4866,6 +4910,15 @@ static int cetrafs_bg_release_one(struct super_block *sb, u32 zg_id, u32 b, unsi
     if (cetrafs_bg_release_bitmap_ready(sb, b)) {
         cetrafs_sb_undrain_bg(sb, b); /* not provably empty, or not durable: keep it */
         return 0;
+    }
+    if (xchg(&cetrafs_release_noop_free, 0)) { /* TEST ONLY: see the parameter */
+        struct cetrafs_bg_geom g;
+
+        if (!cetrafs_read_bg_geom(sb, b, &g)) {
+            pr_info("BG %u release: a free of already-free block %llu inside the hand-back (test)\n", b,
+                    (unsigned long long) (g.start_block + g.off_data_region));
+            cetrafs_free_data_extent(sb, g.start_block + g.off_data_region, 1);
+        }
     }
 
     /*
@@ -5627,7 +5680,7 @@ static long cetrafs_bitmap_flip_range(struct super_block *sb, u64 bmap_lba, u64 
             else
                 p[in / 8] &= (u8) ~m;
         }
-        cetrafs_bh_end_update(bh);
+        cetrafs_bmap_end_update(sb, bh, true);
         brelse(bh);
     }
     return wrong;

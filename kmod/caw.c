@@ -923,8 +923,9 @@ static int cetrafs_cas_flush_block(struct super_block *sb, u64 fs_lba)
     if (!bh)
         return 0;
     /* A failed flush discards the pending write (clean, !uptodate): the
-     * CAS must not go ahead as if it had landed. */
-    if (buffer_dirty(bh))
+     * CAS must not go ahead as if it had landed. A HELD bitmap image
+     * (ioutil.c) is a pending write just the same. */
+    if (buffer_dirty(bh) || buffer_cetra_held(bh))
         ret = cetrafs_sync_buffer(sb, bh);
     brelse(bh);
     return ret;

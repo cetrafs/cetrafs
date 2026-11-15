@@ -395,6 +395,13 @@ static void cetrafs_heartbeat_maint(struct work_struct *work)
         return;
     }
 
+    /* Allocation-bitmap blocks held from writeback (ioutil.c, audit
+     * 2026-11-14 A-15) go out here at the latest -- a gated write, under
+     * the lease just renewed: the boundaries write the allocations their
+     * publishes need, and this bounds how long a free stays only in
+     * memory. A failure keeps them held for the next tick. */
+    (void) cetrafs_held_flush(sb);
+
     /* Our row's frees-in-flight flag goes back down once nothing is in
      * flight (cetrafs_frees_begin()); peers' scrubs wait while it is up. */
     cetrafs_frees_heartbeat(sb);

@@ -200,6 +200,7 @@ static int cetrafs_sync_fs(struct super_block *sb, int wait)
         if (sb->s_bdev) {
             cetrafs_drop_dirty_metadata(sb);
             cetrafs_deferred_drop_all(sb);
+            cetrafs_held_drop_all(sb);
         }
         return -EIO;
     }
@@ -209,12 +210,14 @@ static int cetrafs_sync_fs(struct super_block *sb, int wait)
     {
         int pret = wait ? cetrafs_sync_fs_pending(sb) : 0;
         int bret = cetrafs_alloc_flush_bitmaps(sb);
+        /* and the held frees no group mark names (ioutil.c, A-15) */
+        int hret = cetrafs_held_flush(sb);
         int cret = cetrafs_flush_dirty_free_counts(sb);
         /* Extent-tree blocks held back from writeback (leafdefer.c):
          * sync_blockdev() below no longer sees them, so they go here,
          * through the journal. */
         int dret = wait ? cetrafs_deferred_flush_all(sb) : 0;
-        int ret = pret ? pret : bret ? bret : cret ? cret : dret;
+        int ret = pret ? pret : bret ? bret : hret ? hret : cret ? cret : dret;
 
         /* sync(2), syncfs(2) and unmount promise the data is durable,
          * and a deployment LUN's write cache may well be volatile: a
