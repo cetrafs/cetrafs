@@ -310,7 +310,8 @@ struct cetrafs_dmpath_entry {
     struct scsi_device *sdev;  /* reference held; NULL = needs (re)resolution */
     bool resolving;            /* a resolution is in flight; the slot is claimed but empty */
     u8 rank;                   /* the path's ALUA rank when resolved (cetrafs_dmpath_rank()) */
-    unsigned long resolved_at; /* jiffies of that resolution */
+    unsigned long resolved_at; /* jiffies of that resolution, or of the last upgrade look */
+    unsigned int upgrade_backoff; /* seconds to the next upgrade look after one that failed; 0 = dmpath_upgrade_secs */
     char name[DISK_NAME_LEN];
 };
 
@@ -812,6 +813,58 @@ static bool cetrafs_dmpath_no_path_once;
 cetrafs_test_param(dmpath_no_path_once, cetrafs_dmpath_no_path_once, bool, 0644);
 MODULE_PARM_DESC(dmpath_no_path_once, "TEST ONLY: the next dm path lookup finds no path");
 
+/* better_exists() under NOFS: it opens block devices, which allocates
+ * (audit L23: reclaim may need a compare-and-swap of this very volume). */
+static bool cetrafs_dmpath_better_exists_nofs(struct block_device *bdev, u8 than)
+{
+    unsigned int nofs = memalloc_nofs_save();
+    bool b = cetrafs_dmpath_better_exists(bdev, than);
+
+    memalloc_nofs_restore(nofs);
+    return b;
+}
+
+/* TEST ONLY: drop the working path before resolving a better one, as
+ * 04c7d49 did (tests/kernel/dmpath_upgrade_beside.sh's control). */
+static bool cetrafs_dmpath_upgrade_drops_first;
+cetrafs_test_param(dmpath_upgrade_drops_first, cetrafs_dmpath_upgrade_drops_first, bool, 0644);
+MODULE_PARM_DESC(dmpath_upgrade_drops_first, "TEST ONLY: an ALUA upgrade drops the working path before resolving");
+
+/* Look for a path better than 'now' beside 'slot''s working one; swap it
+ * in on success, back the next look off on failure. */
+static void cetrafs_dmpath_upgrade(struct block_device *bdev, struct cetrafs_dmpath_entry *slot, u8 now)
+{
+    struct cetrafs_dmpath_entry tmp = {0};
+    unsigned int nofs;
+    bool found = false;
+
+    nofs = memalloc_nofs_save();
+    if (cetrafs_dmpath_better_exists(bdev, now))
+        found = cetrafs_dmpath_resolve(bdev, 0, &tmp) == 0;
+    memalloc_nofs_restore(nofs);
+    if (found && tmp.rank >= now) {
+        cetrafs_dmpath_drop_refs(&tmp); /* the "better" one did not pass: same rank or worse */
+        found = false;
+    }
+
+    mutex_lock(&cetrafs_dmpath_mutex);
+    if (found && slot->dm_dev == bdev->bd_dev && slot->sdev && !slot->resolving) {
+        pr_info("dm path: %s is %s and %s passed as %s -- moving CAW there\n", slot->name,
+                cetrafs_dmpath_rank_name[min_t(u8, now, 3)], tmp.name, cetrafs_dmpath_rank_name[tmp.rank]);
+        cetrafs_dmpath_drop_refs(slot);
+        *slot = tmp;
+        found = false; /* the slot holds the references now */
+    } else if (slot->dm_dev == bdev->bd_dev) {
+        unsigned int up = max(READ_ONCE(cetrafs_dmpath_upgrade_secs), 1u);
+
+        slot->upgrade_backoff = min(max(up, slot->upgrade_backoff) * 2, 600u);
+        slot->resolved_at = jiffies;
+    }
+    mutex_unlock(&cetrafs_dmpath_mutex);
+    if (found)
+        cetrafs_dmpath_drop_refs(&tmp); /* the slot moved on meanwhile */
+}
+
 struct scsi_device *cetrafs_dmpath_sdev(struct block_device *bdev, bool killable)
 {
     struct cetrafs_dmpath_entry *slot = NULL, *free_slot = NULL, tmp = {0};
@@ -894,19 +947,35 @@ retry:
          * failure on the optimised one sent us -- is looked past again
          * now and then: after a failback the optimised port is back, and
          * nothing else would ever return to it. */
-        if (now != U8_MAX && now && up && time_after(jiffies, slot->resolved_at + (unsigned long) up * HZ)) {
+        if (now != U8_MAX && now && up &&
+            time_after(jiffies, slot->resolved_at + (unsigned long) max(up, slot->upgrade_backoff) * HZ)) {
+            if (READ_ONCE(cetrafs_dmpath_upgrade_drops_first)) {
+                /* TEST ONLY: the path dropped before a better one is
+                 * found, as 04c7d49 did (F-24's control) */
+                slot->resolved_at = jiffies;
+                mutex_unlock(&cetrafs_dmpath_mutex);
+                if (cetrafs_dmpath_better_exists_nofs(bdev, now)) {
+                    mutex_lock(&cetrafs_dmpath_mutex);
+                    if (slot->dm_dev == bdev->bd_dev && slot->sdev && !slot->resolving) {
+                        slot->avoid = 0;
+                        cetrafs_dmpath_drop_refs(slot);
+                    }
+                    mutex_unlock(&cetrafs_dmpath_mutex);
+                }
+                goto retry;
+            }
+            /* Resolved BESIDE the working path, which every other caller
+             * keeps using meanwhile, and swapped in only once a better
+             * one has passed the identity check. Dropping the working
+             * path first sent every CAW of the volume -- the heartbeat's
+             * renewal too -- to wait out the new resolution, up to the
+             * identity READ's timeout, every look, and for good when the
+             * "better" path reports optimal and does not answer (audit
+             * 2026-11-15 F-24). A look that finds nothing better backs
+             * off, doubling to ten minutes. */
             slot->resolved_at = jiffies;
             mutex_unlock(&cetrafs_dmpath_mutex);
-            if (cetrafs_dmpath_better_exists(bdev, now)) {
-                mutex_lock(&cetrafs_dmpath_mutex);
-                if (slot->dm_dev == bdev->bd_dev && slot->sdev && !slot->resolving) {
-                    pr_info("dm path: %s is %s and a better path is up -- re-resolving a path for CAW\n",
-                            slot->name, cetrafs_dmpath_rank_name[min_t(u8, now, 3)]);
-                    slot->avoid = 0;
-                    cetrafs_dmpath_drop_refs(slot);
-                }
-                mutex_unlock(&cetrafs_dmpath_mutex);
-            }
+            cetrafs_dmpath_upgrade(bdev, slot, now);
             goto retry;
         }
         if (now <= slot->rank) {
@@ -919,7 +988,9 @@ retry:
                     cetrafs_dmpath_rank_name[cetrafs_dmpath_rank(slot->sdev)]);
         else
             pr_warn("dm path: %s went offline -- re-resolving a path for CAW\n", slot->name);
-        slot->avoid = slot->path_dev;
+        /* 'avoid' is for a path that FAILED; a demoted one still works,
+         * and the ranking already puts it after a better one (F-24). */
+        slot->avoid = now == U8_MAX ? slot->path_dev : 0;
         cetrafs_dmpath_drop_refs(slot);
     }
 
