@@ -157,14 +157,17 @@ const cetrafs_superblock_t *cetrafs_sb_raw(struct super_block *sb);
  * refused by name (cetrafs_sb_lba_run_hits_bg_table(): a loop over the
  * grows, zero iterations on a volume never grown).
  *
- * What it does NOT catch, stated rather than implied: a block inside
- * the BG regions but pointing at some OTHER BG's header or bitmap,
- * which are interleaved with the data. Catching those needs the BG
- * geometry, which is a device read per BG (cetrafs_bg_id_for_lba()) and
- * cannot be afforded here. They damage one Block Group's bookkeeping,
- * not the whole volume, and fsck names them.
+ * Inside the box, a run must also lie in ONE Block Group's data region
+ * (cetrafs_sb_lba_run_in_bg_data(), from geometry the mount kept in
+ * memory): a group's header and bitmap sit between two data regions,
+ * and an extent aimed at a bitmap made a file write mark other files'
+ * live blocks free for the allocator to hand out (audit 2026-11-14
+ * M-40; tests/kernel/extent_aims_bitmap.sh). This used to be left
+ * uncaught as "one group's bookkeeping" -- it is every file with a
+ * block in that group.
  */
 bool cetrafs_sb_lba_run_hits_bg_table(struct super_block *sb, u64 lba, u64 count);
+bool cetrafs_sb_lba_run_in_bg_data(struct super_block *sb, u64 lba, u64 count);
 int cetrafs_lba_run_past_end(struct super_block *sb, u64 lba, u64 count);
 /*
  * 0: [lba, lba+count) is data. -EUCLEAN: it is not, against a layout
@@ -199,9 +202,10 @@ static inline int cetrafs_lba_run_check(struct super_block *sb, u64 lba, u64 cou
      * the per-block budget: a valid address never gets here. */
     if (count > hi || lba > hi - count)
         return cetrafs_lba_run_past_end(sb, lba, count);
-    /* And the holes earlier grows left inside it, which hold the older
-     * segments. */
-    return cetrafs_sb_lba_run_hits_bg_table(sb, lba, count) ? -EUCLEAN : 0;
+    /* And inside the box, one Block Group's data region: not a header
+     * or bitmap between two of them, nor a hole an earlier grow left
+     * holding an older table segment. */
+    return cetrafs_sb_lba_run_in_bg_data(sb, lba, count) ? 0 : -EUCLEAN;
 }
 /* For callers whose refusal is not destructive and marks nothing (a
  * skipped invalidation, a scrub candidate dropped): "not known to be
@@ -1095,7 +1099,8 @@ u64 cetrafs_bg_gen_bump_count(void);
 int cetrafs_count_free_inodes(struct super_block *sb, u64 *out_free);
 int cetrafs_bg_data_block_stats(struct super_block *sb, u32 bg_id, u64 *out_total, u64 *out_free);
 int cetrafs_bg_mount_info(struct super_block *sb, const cetrafs_superblock_t *raw_sb, u32 bg_id, u64 desc_lba,
-                          bool fresh, u64 *out_total, u32 *out_owner, u64 *out_start, u64 *out_len, u16 *out_flags);
+                          bool fresh, u64 *out_total, u32 *out_owner, u64 *out_start, u64 *out_len, u16 *out_flags,
+                          u64 *out_data_start);
 
 /* Which Zone Group owns this Block Group, from the owners recorded at
  * mount -- no device read. CETRAFS_NODE_ID_NONE if out of range.

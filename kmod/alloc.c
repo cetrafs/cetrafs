@@ -5648,7 +5648,8 @@ out:
 }
 
 int cetrafs_bg_mount_info(struct super_block *sb, const cetrafs_superblock_t *raw_sb, u32 bg_id, u64 desc_lba,
-                          bool fresh, u64 *out_total, u32 *out_owner, u64 *out_start, u64 *out_len, u16 *out_flags)
+                          bool fresh, u64 *out_total, u32 *out_owner, u64 *out_start, u64 *out_len, u16 *out_flags,
+                          u64 *out_data_start)
 {
     struct cetrafs_bg_geom bg;
     int ret = cetrafs_read_bg_geom_at(sb, raw_sb, bg_id, desc_lba, fresh, &bg);
@@ -5665,6 +5666,8 @@ int cetrafs_bg_mount_info(struct super_block *sb, const cetrafs_superblock_t *ra
         *out_owner = bg.owner_zg;
     if (out_flags)
         *out_flags = bg.flags;
+    if (out_data_start)
+        *out_data_start = bg.start_block + bg.off_data_region;
     return 0;
 }
 

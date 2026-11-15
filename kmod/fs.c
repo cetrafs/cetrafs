@@ -144,6 +144,20 @@ struct cetrafs_bg_chunk {
     u64 bg_desc_lba[CETRAFS_BGC_SIZE];
 
     /*
+     * Each Block Group's DATA region, [bg_data_start, +bg_data_count),
+     * read with the descriptor by the mount's walk (and a refresh's, for
+     * the groups a grow added) and never changed after. The per-block
+     * address check needs it: a group's header and bitmap sit between
+     * two data regions, inside the box [bg_regions_start, bg_data_end)
+     * the cheap check used to stop at, and an extent aimed at a bitmap
+     * turned a file write into "these live blocks are free" (audit
+     * 2026-11-14 M-40). Written before the layout that counts the group
+     * is published, so a reader bounded by bg_count sees it set.
+     */
+    u64 bg_data_start[CETRAFS_BGC_SIZE];
+    u64 bg_data_count[CETRAFS_BGC_SIZE];
+
+    /*
      * BGs whose DATA BITMAP carries allocation bits this node has not
      * made durable yet.
      *
@@ -1398,7 +1412,7 @@ walked:
     for (b = from; b < nbg; b++) {
         struct cetrafs_bg_chunk *c = l->chunk[b >> CETRAFS_BGC_SHIFT];
         u32 ci = b & CETRAFS_BGC_MASK;
-        u64 t = 0, bstart = 0, blen = 0;
+        u64 t = 0, bstart = 0, blen = 0, dstart = 0;
         u32 owner = CETRAFS_NODE_ID_NONE;
         u16 bflags = 0;
         u32 si;
@@ -1429,7 +1443,15 @@ walked:
          * Block Group, which is what lets ownership be answered from
          * memory from here on. Fresh was served by the drop above. */
         brc = cetrafs_bg_mount_info(sb, &l->raw, b, c->bg_desc_lba[ci], fresh && !ra, &t, &owner, &bstart, &blen,
-                                    &bflags);
+                                    &bflags, &dstart);
+        /* The data region inside the group, or the address check would
+         * accept a run the group cannot hold. */
+        if (!brc && (dstart < bstart || t > blen || dstart - bstart > blen - t)) {
+            pr_err("Block Group %u's data region [%llu,+%llu) is not inside the group [%llu,+%llu) -- refusing\n", b,
+                   (unsigned long long) dstart, (unsigned long long) t, (unsigned long long) bstart,
+                   (unsigned long long) blen);
+            brc = -EUCLEAN;
+        }
         /*
          * Block Groups in order, none over the one before. Each
          * descriptor was checked alone, so two checksum-valid
@@ -1495,6 +1517,8 @@ walked:
         if (bflags & CETRAFS_BG_FLAG_DISCARD_PENDING)
             cetrafs_sb_set_bg_discard_pending(sb, b, true);
         WRITE_ONCE(c->bg_owner_zg[ci], (u16) owner);
+        WRITE_ONCE(c->bg_data_start[ci], dstart);
+        WRITE_ONCE(c->bg_data_count[ci], t);
     }
 
     l->total_data_blocks = total_data;
@@ -2051,6 +2075,11 @@ MODULE_PARM_DESC(grow_skip_local_publish, "TEST ONLY: the next live grow is not 
  * catching up -- the negative control for the on-demand refresh. */
 static bool cetrafs_layout_past_end_no_refresh;
 cetrafs_test_param(layout_past_end_no_refresh, cetrafs_layout_past_end_no_refresh, bool, 0644);
+
+/* TEST ONLY: the address check stops at the box, as before M-40 -- the
+ * negative control of tests/kernel/extent_aims_bitmap.sh. */
+static bool cetrafs_lba_bg_check_off;
+cetrafs_test_param(lba_bg_check_off, cetrafs_lba_bg_check_off, bool, 0644);
 MODULE_PARM_DESC(layout_past_end_no_refresh, "TEST ONLY: refuse past-the-end addresses without refreshing the layout");
 
 static atomic64_t cetrafs_layout_refreshes = ATOMIC64_INIT(0);
@@ -4239,6 +4268,62 @@ int cetrafs_lba_run_past_end(struct super_block *sb, u64 lba, u64 count)
  * The half of cetrafs_lba_run_is_data() that needs the mount's chain
  * walk. O(grows) with no I/O; zero iterations on a never-grown volume.
  */
+/* Is [lba, lba+count) inside Block Group b's data region? */
+static bool cetrafs_layout_run_in_bg(const struct cetrafs_bg_layout *l, u32 b, u64 lba, u64 count)
+{
+    const struct cetrafs_bg_chunk *c = l->chunk[b >> CETRAFS_BGC_SHIFT];
+    u32 i = b & CETRAFS_BGC_MASK;
+    u64 s = READ_ONCE(c->bg_data_start[i]), n = READ_ONCE(c->bg_data_count[i]);
+
+    return lba >= s && count <= n && lba - s <= n - count;
+}
+
+/*
+ * Does [lba, lba+count) lie inside ONE Block Group's data region? What
+ * fsck asks of every extent (fsck_run_bg()), and what the allocator
+ * guarantees: a run comes from one group's bitmap. The other half of
+ * cetrafs_lba_run_check(), past its box test: a header or bitmap sits
+ * between two data regions, inside the box (M-40).
+ *
+ * No I/O. On a never-grown volume the group is arithmetic -- one
+ * division and two loads on the per-block path; a grown one, whose
+ * later groups start past the holes earlier grows left, or an address
+ * in a header, falls to a binary search over the starts in memory
+ * (ordered: the mount refuses a group that starts before the previous
+ * one ends).
+ */
+bool cetrafs_sb_lba_run_in_bg_data(struct super_block *sb, u64 lba, u64 count)
+{
+    const struct cetrafs_bg_layout *l = cetrafs_sb_layout_of(sb->s_fs_info);
+    u64 rs, span;
+    u32 lo, hi;
+
+    if (!l || !l->bg_count || !count)
+        return false;
+    if (READ_ONCE(cetrafs_lba_bg_check_off))
+        return !cetrafs_sb_lba_run_hits_bg_table(sb, lba, count); /* TEST ONLY: the box alone */
+    rs = le64_to_cpu(l->raw.bg_regions_start);
+    span = le64_to_cpu(l->raw.bg_size_blocks);
+    if (span && lba >= rs) {
+        u64 cand = div64_u64(lba - rs, span);
+
+        if (cand < l->bg_count && cetrafs_layout_run_in_bg(l, (u32) cand, lba, count))
+            return true;
+    }
+    lo = 0;
+    hi = l->bg_count;
+    while (hi - lo > 1) {
+        u32 mid = lo + (hi - lo) / 2;
+        const struct cetrafs_bg_chunk *c = l->chunk[mid >> CETRAFS_BGC_SHIFT];
+
+        if (READ_ONCE(c->bg_data_start[mid & CETRAFS_BGC_MASK]) <= lba)
+            lo = mid;
+        else
+            hi = mid;
+    }
+    return cetrafs_layout_run_in_bg(l, lo, lba, count);
+}
+
 bool cetrafs_sb_lba_run_hits_bg_table(struct super_block *sb, u64 lba, u64 count)
 {
     struct cetrafs_bg_layout *l = cetrafs_sb_layout_of(sb->s_fs_info);

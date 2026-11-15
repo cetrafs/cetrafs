@@ -55,7 +55,7 @@ int main(int argc, char **argv)
     int index0 = argc == 5 && strcmp(argv[4], "index0") == 0;
 
     if (argc != 4 && !index0) {
-        fprintf(stderr, "usage: %s <backing-file> <ino> <phys-lba|inode_table|sb_table|bg_seg_first|bg_seg_tail|device_end>\n", argv[0]);
+        fprintf(stderr, "usage: %s <backing-file> <ino> <phys-lba|inode_table|sb_table|bg_seg_first|bg_seg_tail|bg_bitmap_last|device_end>\n", argv[0]);
         fprintf(stderr, "       points inode <ino>'s inline extent 0 at that physical block\n");
         return 2;
     }
@@ -98,6 +98,20 @@ int main(int argc, char **argv)
             }
             target = cur;
         }
+    } else if (strcmp(argv[3], "bg_bitmap_last") == 0) {
+        /* The LAST Block Group's data bitmap: inside the data box
+         * [bg_regions_start, bg_data_end), between two data regions
+         * (audit 2026-11-14 M-40). Read from the first table segment,
+         * which holds every group of a never-grown volume. */
+        uint32_t nbg = cetrafs_le32(sb.block_group_count);
+        cetrafs_block_group_t bg;
+
+        if (nbg < 2) {
+            fprintf(stderr, "the volume has %u Block Group(s); the last one's bitmap needs a group before it\n", nbg);
+            return 3;
+        }
+        rd(fd, &bg, sizeof(bg), (off_t) (cetrafs_le64(sb.bg_table_start) + nbg - 1) * cetrafs_le32(sb.block_size));
+        target = cetrafs_le64(bg.start_block) + cetrafs_le32(bg.off_data_bmap);
     } else if (strcmp(argv[3], "device_end") == 0) {
         /* The last block of the device: past bg_data_end on a grown
          * volume, so no Block Group's data. */
