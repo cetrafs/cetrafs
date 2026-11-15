@@ -2534,7 +2534,36 @@ free_callers() {
 }
 FC="$(free_callers "$K"/*.c)"
 [ "$(grep -c . <<<"$FC")" -ge 15 ] || fail "class 46: found only $(grep -c . <<<"$FC") unbracketed freeing functions -- the scan is not seeing the tree"
-for b in __cetrafs_truncate_shrink cetrafs_defrag_inode cetrafs_xattr_set_locked cetrafs_fallocate; do
+# Per call site, not per function: the list above names what covers a
+# function's OTHER frees, and cetrafs_do_allocate's "never published"
+# covered its own new blocks while it freed the old tree after publishing
+# a new one (audit 2026-11-15 B-31). A free that follows a record publish
+# in the same function, with no frees_begin before it, is reported
+# whatever the list says.
+post_publish_frees() {
+    for f in "$@"; do
+        awk -v F="$(basename "$f")" '
+            /^[a-z_][a-z0-9_ *]*\(/ && !/;$/ { fn = $0; sub(/\(.*/, "", fn); n = split(fn, a, " "); fn = a[n]; sub(/^\*+/, "", fn); pub = 0; beg = 0 }
+            /^[[:space:]]*\*/ || /^[[:space:]]*\/\*/ { next }
+            /cetrafs_frees_begin\(/ && !/^[a-z_]/ { beg = 1 }
+            /cetrafs_write_raw_inode[a-z_]*\(|cetrafs_write_vfs_inode\(/ && !/^[a-z_]/ { pub = 1 }
+            /(cetrafs_free_data_block|cetrafs_free_data_extent|cetrafs_free_data_extent_batched|cetrafs_tree_free_meta|cetrafs_free_leaf_array|cetrafs_free_inline_extents|cetrafs_leaf_array_trim|cetrafs_leaf_array_punch)\(/ && !/^[a-z_]/ && pub && !beg { print F ":" fn ":" FNR }' "$f"
+    done
+}
+# function:count:what covers them -- the count pins the sites, so a new
+# post-publish free in a listed function is reported too
+PP_OK='defrag.c:cetrafs_defrag_commit:2:inside its only caller'"'"'s bracket (cetrafs_defrag_inode)
+dir.c:cetrafs_mkdir_locked:2:its own new dirent block, with the number it goes back with -- no publish named it alive
+file.c:__cetrafs_get_block:2:a block the failed append never published (a directory'"'"'s publish is a different block)'
+PPC="$(post_publish_frees "$K"/*.c | cut -d: -f1,2 | sort | uniq -c | awk '{print $2 ":" $1}')"
+PPU="$(while IFS= read -r l; do [ -n "$l" ] && ! grep -q "^$l:" <<<"$PP_OK" && echo "$l"; done <<<"$PPC" || true)"
+[ -z "$PPU" ] && pass "class 46: every free after a record publish is bracketed, or its sites are counted with their cover" ||
+    fail "class 46: frees after a record publish with no cetrafs_frees_begin() (file:function:count): $(echo $PPU)"
+PSAMPLE="$(ct_tmp pp-sample).c"
+printf 'static int cetrafs_do_allocate(struct inode *inode)\n{\n    cetrafs_write_raw_inode_fd(sb, 1, raw, inode);\n    cetrafs_tree_free_meta(inode, old);\n}\n' >"$PSAMPLE"
+[ -n "$(post_publish_frees "$PSAMPLE")" ] && pass "class 46: control -- a free after a publish is found per call site, whatever the list says" ||
+    fail "class 46: control -- a free after a publish is not found"
+for b in __cetrafs_truncate_shrink cetrafs_defrag_inode cetrafs_xattr_set_locked cetrafs_fallocate cetrafs_do_allocate; do
     grep -q "cetrafs_frees_begin" <<<"$(awk "/^[a-z_].*[ *]$b\\(/,/^}/" "$K"/*.c)" ||
         fail "class 46: $b no longer brackets its post-publish frees with cetrafs_frees_begin()"
 done

@@ -7736,6 +7736,16 @@ static void cetrafs_falloc_run_give_back(struct super_block *sb, u64 *lba, u32 *
     *left = 0;
 }
 
+/* TEST ONLY: preallocation's rebuild stalls between its publish and the
+ * old tree's frees; and the frees go unannounced, as before B-31
+ * (tests/kernel/fallocate_free_announced.sh). */
+static unsigned int cetrafs_falloc_free_stall_ms;
+cetrafs_test_param(falloc_free_stall_ms, cetrafs_falloc_free_stall_ms, uint, 0644);
+MODULE_PARM_DESC(falloc_free_stall_ms, "TEST ONLY: stall preallocation between its publish and the old tree's frees");
+static bool cetrafs_falloc_frees_unannounced;
+cetrafs_test_param(falloc_frees_unannounced, cetrafs_falloc_frees_unannounced, bool, 0644);
+MODULE_PARM_DESC(falloc_frees_unannounced, "TEST ONLY: preallocation frees its old tree with no frees-in-flight announcement");
+
 static int cetrafs_do_allocate(struct inode *inode, loff_t offset, loff_t len, bool keep_size)
 {
     struct cetrafs_falloc_resv resv = {};
@@ -7745,6 +7755,7 @@ static int cetrafs_do_allocate(struct inode *inode, loff_t offset, loff_t len, b
 #define old_raw (recs[1])
     u64 b, start_block, end_block, hint = 0;
     u64 added = 0, meta_blocks = 0, plan_seq;
+    bool foreign = false, announced = false; /* the old tree's meta is a peer's (cetrafs_frees_begin()) */
     loff_t end = offset + len;
     cetrafs_extent_t *add = NULL, *flat = NULL;
     u32 add_n = 0, add_cap = 0, flat_n = 0;
@@ -8029,6 +8040,24 @@ static int cetrafs_do_allocate(struct inode *inode, loff_t offset, loff_t len, b
         raw.size = cetrafs_cpu_to_le64((u64) end);
     }
 
+    /*
+     * From the publish until the frees below, the old tree's leaves and
+     * interiors are named by nothing and not yet free -- a leak to any
+     * scrub that looks, ours or the owning peer's, and a peer's are freed
+     * one queue CAS each, long enough for its scrub to free them first
+     * and its drain to free them again over a live block (audit
+     * 2026-11-15 B-31). Announced before the publish, as truncate and
+     * punch do.
+     */
+    if (built && !READ_ONCE(cetrafs_falloc_frees_unannounced)) {
+        foreign = !cetrafs_tree_meta_is_ours(inode, &old_raw);
+        ret = cetrafs_frees_begin(sb, &foreign);
+        if (ret) {
+            cetrafs_tree_free_meta(inode, &raw);
+            goto out_free_added;
+        }
+        announced = true;
+    }
     ret = cetrafs_rebuild_recheck(inode, "fallocate");
     if (!ret) {
         u64 fd_seq;
@@ -8041,6 +8070,8 @@ static int cetrafs_do_allocate(struct inode *inode, loff_t offset, loff_t len, b
         cetrafs_inode_fd_pub_unlock(inode);
     }
     if (ret) {
+        if (announced)
+            cetrafs_frees_end(sb, foreign);
         if (built)
             cetrafs_tree_free_meta(inode, &raw);
         goto out_free_added;
@@ -8050,6 +8081,8 @@ static int cetrafs_do_allocate(struct inode *inode, loff_t offset, loff_t len, b
      * after the last check, as in truncate and punch, when what it may
      * still name is left for the scrub. */
     if (built) {
+        if (cetrafs_falloc_free_stall_ms)
+            msleep(cetrafs_falloc_free_stall_ms); /* TEST ONLY: see the parameter */
         if (cetrafs_rebuild_peer_present(inode))
             pr_warn("fallocate: ino=%llu was opened on another node during the publish -- leaving the old "
                     "map's blocks allocated for the scrub\n",
@@ -8057,6 +8090,8 @@ static int cetrafs_do_allocate(struct inode *inode, loff_t offset, loff_t len, b
         else
             cetrafs_tree_free_meta(inode, &old_raw);
     }
+    if (announced)
+        cetrafs_frees_end(sb, foreign);
 
     inode->i_blocks = cetrafs_le64(raw.blocks);
     if (!keep_size && end > i_size_read(inode))

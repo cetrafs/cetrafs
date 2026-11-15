@@ -49,8 +49,9 @@
  *     anything that leaves a block bitmap-allocated for longer than one
  *     get_block() without committing an extent MUST appear there.
  *
- *  4. FREES IN FLIGHT ARE EXEMPT. Truncate, punch, a defrag step and
- *     xattr removal publish a record that drops blocks and free them
+ *  4. FREES IN FLIGHT ARE EXEMPT. Truncate, punch, preallocation's tree
+ *     rebuild, a defrag step and xattr removal publish a record that
+ *     drops blocks and free them
  *     after (rule 21), and in between the blocks look exactly like
  *     point 3's runs. When a peer owns them the frees are one queue CAS
  *     per extent -- seconds to minutes for a fragmented image -- so a

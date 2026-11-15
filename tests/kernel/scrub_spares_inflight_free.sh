@@ -28,6 +28,11 @@
 #       whenever any node punched its own image. Control: with
 #       frees_announce_all the same punch is announced.
 #
+#   (5) preallocation over a fragmented file's holes rebuilds its tree:
+#       stalled between that publish and the old tree's frees, the scrub
+#       reclaims none of the old leaves and interiors -- with this node's
+#       count, and with only the registry row (audit 2026-11-15 B-31).
+#
 # Each part asserts that two cycles looked inside the stall (completed,
 # or stopped by the flag -- scrub_inflight_skips) else nothing was
 # measured, and that the operation then freed what it dropped. After
@@ -35,12 +40,14 @@
 #
 # DISCRIMINATION: without the flag, (1) and (2) reclaim the dropped
 # blocks inside the stall; with the row flag never written, (3) does;
-# (4) carries its own control.
+# (4) carries its own control; (5) with falloc_frees_unannounced=1 (the
+# frees unannounced, as before) reclaims the old tree's blocks.
 set -euo pipefail
 . "$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)/lib/harness.sh"
 require_root
 require_module
-for k in punch_pagecache_delay_ms truncate_free_stall_ms scrub_ignore_local_frees frees_announce_all; do
+for k in punch_pagecache_delay_ms truncate_free_stall_ms scrub_ignore_local_frees frees_announce_all \
+    falloc_free_stall_ms falloc_frees_unannounced; do
     [ -w /sys/module/cetrafs/parameters/$k ] || { skip "$k is missing"; ct_exit; }
 done
 
@@ -116,6 +123,65 @@ ct_param_set frees_announce_all 1
 staged "punch, registry row only" punch_pagecache_delay_ms punch
 ct_param_set frees_announce_all 0
 ct_param_set scrub_ignore_local_frees 0
+
+# (5) <label>: a depth-2 file (every other block of 6000 written), its
+# holes preallocated: the rebuild's old tree is freed after the publish,
+# behind the stall. Sets GOT (blocks the scrub reclaimed in the stall).
+prealloc_staged() {
+    local label="$1" pid r0 c0 nc running depth
+    python3 -I - "$MNT/g" <<'PY'
+import os, sys
+fd = os.open(sys.argv[1], os.O_CREAT | os.O_WRONLY, 0o644)
+b = os.urandom(4096)
+for i in range(0, 6000, 2):
+    os.pwrite(fd, b, i * 4096)
+os.fsync(fd); os.close(fd)
+PY
+    sync
+    ct_param_set falloc_free_stall_ms "$STALL"
+    fallocate -o 0 -l $((6000 * 4096)) "$MNT/g" &
+    pid=$!
+    sleep 1
+    r0="$(reclaimed)"
+    c0="$(cycles)"
+    ct_param_set scrub 1
+    wait_for 30 '[ "$(( $(cycles) - '"$c0"' ))" -ge 2 ] || ! kill -0 '"$pid"' 2>/dev/null' || true
+    running=0
+    kill -0 "$pid" 2>/dev/null && running=1
+    nc=$(($(cycles) - c0))
+    GOT=$(($(reclaimed) - r0))
+    ct_param_set scrub 0
+    wait "$pid" || fail "$label: the preallocation itself failed"
+    ct_param_set falloc_free_stall_ms 0
+    sync
+    rm -f "$MNT/g"
+    [ "$running" = 1 ] && [ "$nc" -ge 2 ] ||
+        { fail "setup ($label): the stall did not span two scrub cycles (cycles $nc, still running: $running)"; GOT=x; return; }
+    log "$label: $nc cycles in the stall, $GOT block(s) reclaimed"
+}
+prealloc_staged "preallocation"
+[ "$GOT" = 0 ] && pass "preallocation: the scrub reclaimed none of the old tree's blocks before their free" ||
+    fail "preallocation: the scrub reclaimed $GOT block(s) of the old tree -- freed twice"
+ct_param_set scrub_ignore_local_frees 1
+ct_param_set frees_announce_all 1
+prealloc_staged "preallocation, registry row only"
+[ "$GOT" = 0 ] && pass "preallocation, registry row only: the row kept the old tree's blocks" ||
+    fail "preallocation, registry row only: the scrub reclaimed $GOT block(s) of the old tree"
+ct_param_set falloc_frees_unannounced 1
+prealloc_staged "preallocation, unannounced (control)"
+ct_param_set falloc_frees_unannounced 0
+ct_param_set frees_announce_all 0
+ct_param_set scrub_ignore_local_frees 0
+[ "$GOT" != x ] && [ "$GOT" -gt 0 ] && pass "preallocation, control: unannounced, the scrub reclaimed $GOT block(s) of the old tree" ||
+    fail "preallocation, control: unannounced, the scrub reclaimed nothing -- the case does not reach the old tree"
+# The control freed blocks the scrub had already freed: fsck below would
+# report that, so the volume is rebuilt for what follows.
+ct_umount "$MNT"
+ct_mkfs_small "$DEV" >/dev/null
+ct_mount "$DEV" "$MNT"
+require_cetrafs_mount "$MNT"
+PROC="$(ct_procdir "$DEV")"
+MARK="$(dmesg_mark)"
 
 # (4) <label>: a plain punch of this node's own blocks; sets ANN (begins
 # announced to peers) and FREED (blocks it gave back).
