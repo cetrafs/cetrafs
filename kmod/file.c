@@ -7172,6 +7172,7 @@ static int __cetrafs_get_block(struct inode *inode,
     u32 run = 1; /* contiguous blocks mappable from iblock (see below) */
     bool found, merged, uninit = false;
     bool dio_prealloc = false;
+    bool fresh_record = false, tree_reader = reader; /* B-12: see the record read below */
     u32 prun = 0; /* pending blocks from iblock (see the lookup below) */
     bool relooked = false;
     unsigned int move_seq;
@@ -7227,14 +7228,20 @@ static int __cetrafs_get_block(struct inode *inode,
     if (mode == CETRAFS_GB_OVERWRITE && !READ_ONCE(cetrafs_read_trust_writer_defers))
         reader = true;
     if (S_ISDIR(inode->i_mode) ||
-        !(reader ? cetrafs_lock_read_cache_trusted(inode) : cetrafs_lock_held_for_write_locally(inode)))
+        !(reader ? cetrafs_lock_read_cache_trusted(inode) : cetrafs_lock_held_for_write_locally(inode))) {
         cetrafs_invalidate_raw_inode(sb, inode->i_ino);
+        fresh_record = !reader && S_ISREG(inode->i_mode);
+    }
 
 relookup:
     move_seq = cetrafs_tree_move_sample(inode); /* before the record: a move may stage a new root */
     ret = cetrafs_read_raw_inode_overlaid(sb, inode, &raw); /* torn-read-safe vs a concurrent publish */
     if (ret)
         return ret;
+    /* A writer in the migration window: the record just came from the
+     * device, and its stamp decides whether the cached tree under it
+     * still stands (cetrafs_lock_alloc_tree_trusted(), B-12). */
+    tree_reader = reader || (fresh_record && cetrafs_lock_alloc_tree_trusted(inode, &raw));
     /* The device's file sector may lag this node's own in-flight writes:
      * overlay the pending shadow (v0x0005) so this mapping sees every
      * extent the hot path has already handed out. */
@@ -7286,7 +7293,7 @@ relookup:
         cetrafs_le16(raw.eh.eh_entries) > ARRAY_SIZE(raw.et.leaf))
         return -EIO;
 
-    ret = cetrafs_tree_lookup(inode, &raw, (u32) iblock, &lba, &run, &uninit, &found, reader);
+    ret = cetrafs_tree_lookup(inode, &raw, (u32) iblock, &lba, &run, &uninit, &found, tree_reader);
     if (ret)
         return ret;
     /* A miss while a tree move ran is not believed: the walk may have

@@ -1368,6 +1368,8 @@ int cetrafs_lock_foreign_user_settled(struct inode *inode,
 bool cetrafs_lock_held_for_write_locally(struct inode *inode);
 int cetrafs_lock_write_gate(struct inode *inode); /* -ETXTBSY while this node's lock is suspended */
 bool cetrafs_lock_read_cache_trusted(struct inode *inode);
+bool cetrafs_lock_alloc_tree_trusted(struct inode *inode, const cetrafs_inode_t *fresh);
+u64 cetrafs_tree_cold_mark_count(void);
 void cetrafs_inode_mark_tree_cold(struct inode *inode);
 bool cetrafs_lock_identity_cache_trusted(struct inode *inode);
 /* lock.c: default-mount lock suspension counters (procfs `info`). */
