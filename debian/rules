@@ -26,7 +26,10 @@ override_dh_auto_install:
 	install -m 0755 userspace/fsck.cetra   debian/cetrafs-tools/usr/sbin/
 	install -m 0755 userspace/defrag.cetra debian/cetrafs-tools/usr/sbin/
 	install -m 0755 userspace/growfs.cetra debian/cetrafs-tools/usr/sbin/
-	install -m 0755 userspace/mount.cetrafs debian/cetrafs-tools/usr/sbin/
+	# the packaged helper honours no test variable (TEST_HOOKS=0)
+	sed 's/^TEST_HOOKS=1$$/TEST_HOOKS=0/' userspace/mount.cetrafs >debian/cetrafs-tools/usr/sbin/mount.cetrafs
+	chmod 0755 debian/cetrafs-tools/usr/sbin/mount.cetrafs
+	grep -q '^TEST_HOOKS=0$$' debian/cetrafs-tools/usr/sbin/mount.cetrafs
 	# kernel-module source -> cetrafs-dkms (dh_dkms adds dkms.conf + maint scripts)
 	install -d debian/cetrafs-dkms/usr/src/cetrafs-$(VERSION)
 	cp -a kmod include debian/cetrafs-dkms/usr/src/cetrafs-$(VERSION)/

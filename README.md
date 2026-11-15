@@ -165,8 +165,11 @@ In this repo:
 
   for multipath and single-path initiators alike (no multipath: the last
   term is zero). `mount.cetrafs` checks it from sysfs and refuses a device
-  that breaks it; `-o x-cetrafs.queue-ok` overrides, for a cluster that
-  fences in hardware.
+  that breaks it -- and one whose timers it cannot read, or whose
+  `replacement_timeout` is -1 (no limit). A device-mapper node that is not
+  a multipath map (LVM, dm-crypt, a kpartx partition of a map) is checked
+  through the devices under it. `-o x-cetrafs.queue-ok` overrides, for a
+  cluster that fences in hardware.
 
   A `controls` change lasts until the volume is unmounted; the next mount
   takes the module option again. The module option is read when a volume

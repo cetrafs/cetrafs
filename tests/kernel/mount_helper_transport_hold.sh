@@ -21,8 +21,17 @@
 #   6. a multipath map queueing 12 x 5 s over an iSCSI path holding 150 s:
 #      refused (60 s alone is under the lease).
 #
+#   7. iSCSI recovery_tmo -1 (an infinite hold): refused;
+#   8. a disk whose command timeout cannot be read: refused;
+#   9. a device-mapper node that is not a multipath map (LVM, crypt, a
+#      kpartx partition) over a path holding 150 s: refused, through its
+#      slaves;
+#  10. the packaged copy (TEST_HOOKS=0) ignores CETRAFS_SYSFS: the staged
+#      refusing tree of 1 does not reach it (audit 2026-11-15 F-23).
+#
 # DISCRIMINATION: CETRAFS_TEST_NO_TRANSPORT_HOLD=1 (the hold left out, as
-# before): 1, 3 and 6 mount.
+# before): 1, 3 and 6 mount. CETRAFS_TEST_TIMER_FAILS_OPEN=1 (an unknown
+# timer read as 0): 7 and 8 mount. CETRAFS_TEST_NO_STACK=1: 9 mounts.
 set -euo pipefail
 . "$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)/lib/harness.sh"
 require_root
@@ -85,8 +94,8 @@ try() {
     local rc=0 m=no off="" path=$PATH
     [ "$1" = old ] && off=1
     [ "${2:-}" = mpath ] && path="$FAKE:$PATH"
-    CETRAFS_TEST_NO_TRANSPORT_HOLD="$off" CETRAFS_SYSFS="$SYS" PATH="$path" "$HELPER" "$DEV" "$MNT" ${3:+-o "$3"} \
-        2>"$ERR" || rc=$?
+    CETRAFS_TEST_NO_TRANSPORT_HOLD="$off" CETRAFS_SYSFS="$SYS" PATH="$path" CETRAFS_TEST_TIMER_FAILS_OPEN="${OPEN:-}" \
+        CETRAFS_TEST_NO_STACK="${NOSTACK:-}" "${H:-$HELPER}" "$DEV" "$MNT" ${3:+-o "$3"} 2>"$ERR" || rc=$?
     mountpoint -q "$MNT" && { m=yes; umount "$MNT"; }
     echo "rc=$rc mounted=$m"
 }
@@ -120,4 +129,37 @@ R="$(try new mpath)"
 C6="$(try old mpath)"
 [ "$C1" = "rc=0 mounted=yes" ] && [ "$C3" = "rc=0 mounted=yes" ] && [ "$C6" = "rc=0 mounted=yes" ] &&
     pass "control: with the hold left out, 1, 3 and 6 mounted" || fail "control: 1 $C1, 3 $C3, 6 $C6"
+
+stage "$NAME" iscsi -1
+R="$(try new)"
+[ "$R" = "rc=32 mounted=no" ] && grep -q "cannot tell" "$ERR" &&
+    pass "7: recovery_tmo -1 (an infinite hold): refused" || fail "7: $R: $(cat "$ERR")"
+C7="$(OPEN=1 try new)"
+stage "$NAME" iscsi 5
+rm -f "$(readlink -f "$SYS/block/$NAME/device")/timeout"
+R="$(try new)"
+[ "$R" = "rc=32 mounted=no" ] && grep -q "cannot tell" "$ERR" &&
+    pass "8: a command timeout that cannot be read: refused" || fail "8: $R: $(cat "$ERR")"
+C8="$(OPEN=1 try new)"
+# 9: the device is a dm node (not a map) over sdz, which holds 150 s
+stage sdz iscsi 120
+mkdir -p "$SYS/block/$NAME/dm" "$SYS/block/$NAME/slaves"
+echo "LVM-cetratest" >"$SYS/block/$NAME/dm/uuid"
+ln -s "$SYS/block/sdz" "$SYS/block/$NAME/slaves/sdz"
+R="$(try new)"
+[ "$R" = "rc=32 mounted=no" ] && grep -q "sdz holds a write for up to 150s" "$ERR" &&
+    pass "9: a stacked dm node over a path holding 150 s: refused through its slaves" || fail "9: $R: $(cat "$ERR")"
+C9="$(NOSTACK=1 try new)"
+[ "$C7" = "rc=0 mounted=yes" ] && [ "$C8" = "rc=0 mounted=yes" ] && [ "$C9" = "rc=0 mounted=yes" ] &&
+    pass "control: an unknown timer read as 0 mounted 7 and 8; unchecked stacking mounted 9" ||
+    fail "control: 7 $C7, 8 $C8, 9 $C9"
+PKG="$(ct_tmp mhth-pkg)"
+sed 's/^TEST_HOOKS=1$/TEST_HOOKS=0/' "$HELPER" >"$PKG"
+chmod +x "$PKG"
+grep -q '^TEST_HOOKS=0$' "$PKG" || { fail "setup: the packaged copy was not made"; ct_exit; }
+stage "$NAME" iscsi 120
+R="$(H="$PKG" try new)"
+[ "$R" = "rc=0 mounted=yes" ] && [ "$(try new)" = "rc=32 mounted=no" ] &&
+    pass "10: the packaged copy ignored CETRAFS_SYSFS (the staged refusal reached only the test copy)" ||
+    fail "10: packaged $R: $(cat "$ERR")"
 ct_exit
