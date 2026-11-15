@@ -74,6 +74,11 @@ elif op == "punch":  # punch <file> <block> <count>
         sys.exit("punch: errno %d" % ctypes.get_errno())
     os.close(fd)
     model -= set(range(b, b + n))
+elif op == "falloc":  # falloc <file> <block> <count>: preallocate, the size grows
+    b, n = int(sys.argv[3]), int(sys.argv[4])
+    fd = os.open(path, os.O_RDWR)
+    os.posix_fallocate(fd, b * 4096, n * 4096)
+    os.close(fd)
 elif op == "trunc":  # trunc <file> <blocks>
     n = int(sys.argv[3])
     os.truncate(path, n * 4096)
@@ -190,6 +195,35 @@ log "F, flushed again: $R4"
     fail "F: the device copy has $(get extents "$R4") extents, not $FX ($R2 | $R4)"
 [ "$(get extents "$R3")" = $((FX - 1)) ] && pass "F control: unflushed, the device copy lost the held-back append" ||
     fail "F control: unflushed, the copy has $(get extents "$R3") extents (flushed: $FX) -- the suite cannot see the flush"
+
+# G <patch_off 0|1> <first> <count> -> "writes=<n> patches=<n>": a
+# fallocate over a stride-2 range fills every hole with its own extent,
+# hundreds appended at once -- the last leaf's free slots, new leaves,
+# and (four leaves per interior) a new interior.
+gcase() {
+    local w0 p0
+    echo "$1" >$P/tree_patch_off
+    w0="$(ctr tree_blocks)" p0="$(ctr tree_patches)"
+    drv falloc "$F" "$2" "$3"
+    echo 0 >$P/tree_patch_off
+    echo "writes=$(($(ctr tree_blocks) - w0)) patches=$(($(ctr tree_patches) - p0)) extents=$(filefrag -v "$F" | grep -cE '^ *[0-9]+:')"
+}
+log "G: fallocate over holes"
+E0="$(filefrag -v "$F" | grep -cE '^ *[0-9]+:')"
+G1="$(gcase 0 0 800)"
+log "G, patched: $G1 (extents before: $E0)"
+G2="$(gcase 1 800 800)"
+log "G, control (tree_patch_off=1): $G2"
+[ "$(get extents "$G1")" -ge $((E0 + 300)) ] || fail "G setup: the fallocate added only $(($(get extents "$G1") - E0)) extents ($G1)"
+[ "$(get patches "$G1")" = 1 ] && [ "$(get writes "$G1")" -lt "$(get writes "$G2")" ] && [ "$(get writes "$G1")" -le 6 ] &&
+    pass "G: $(($(get extents "$G1") - E0)) appended extents cost $(get writes "$G1") tree block(s), the rebuild $(get writes "$G2")" ||
+    fail "G: $G1 | control $G2"
+OUT="$(drv check "$F")"
+[ "$OUT" = ok ] && pass "G: the preallocated holes read as zeros, the rest as written" || fail "G: $OUT"
+drv w "$F" 1 200 2 # first writes into the preallocated holes: converts in the patched tree
+drv w "$F" 6201 50 2
+OUT="$(drv check "$F")"
+[ "$OUT" = ok ] && pass "G: writes into the preallocation and appends after it read back" || fail "G: $OUT"
 
 log "R: after a remount"
 ct_umount "$MNT"
