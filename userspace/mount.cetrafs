@@ -1,0 +1,141 @@
+#!/bin/sh
+# SPDX-License-Identifier: GPL-2.0-or-later
+#
+# mount.cetrafs -- mount(8)'s helper for -t cetrafs: a preflight, then
+# the mount itself (mount -i, so this helper is not called again).
+#
+#   mount.cetrafs <device> <dir> [-sfnvNi] [-o <options>]
+#
+# What it checks: how long dm-multipath may hold this node's writes back.
+# A node that loses its paths self-fences when its lease runs out (the
+# stale window less one heartbeat, 105 s by default) and its peers then
+# take over its Zone Groups and allocate in them. Writes already
+# submitted are not recalled: a multipath map that queues while no path
+# is up hands them to the array when the paths return -- bitmap, extent
+# leaf, journal and record writes aimed at blocks a peer now owns, which
+# is double allocation with a clean fsck at every moment before it
+# (audit 2026-11-14 A-6). So a map whose queueing can outlast the lease
+# is refused:
+#   - queue_if_no_path with no_path_retry "queue" (never gives up), or
+#     with multipathd not there to say what bounds it;
+#   - no_path_retry N with N x polling_interval longer than the lease.
+# no_path_retry "fail"/"off", or N short enough, mounts.
+#
+# -o x-cetrafs.mpath-queue-ok mounts such a map anyway, with a warning --
+# for a cluster fenced in hardware (SCSI-3 reservations, power), where
+# a fenced node's queued writes are refused by the array or never sent.
+#
+# Exit status: as mount(8) -- 32 for a refused mount.
+set -u
+
+warn() { echo "mount.cetrafs: $*" >&2; }
+
+[ $# -ge 2 ] || { warn "usage: mount.cetrafs <device> <dir> [-sfnvN] [-o options]"; exit 1; }
+dev=$1
+dir=$2
+shift 2
+
+opts=""
+args=""
+override=0
+while [ $# -gt 0 ]; do
+    case "$1" in
+    -o)
+        [ $# -ge 2 ] || { warn "-o needs an argument"; exit 1; }
+        opts=$2
+        shift 2
+        ;;
+    -t)
+        shift 2 # always cetrafs
+        ;;
+    *)
+        args="$args $1"
+        shift
+        ;;
+    esac
+done
+
+# Our own option never reaches the kernel.
+kept=""
+oldifs=$IFS
+IFS=,
+for o in $opts; do
+    if [ "$o" = "x-cetrafs.mpath-queue-ok" ]; then
+        override=1
+    else
+        kept="${kept:+$kept,}$o"
+    fi
+done
+IFS=$oldifs
+
+# The lease, from the loaded module's timing (or its defaults): the stale
+# window less one heartbeat.
+param() { cat "/sys/module/cetrafs/parameters/$1" 2>/dev/null || echo "$2"; }
+stale=$(param stale_secs 120)
+hb=$(param hb_interval_secs 15)
+lease=$((stale - hb))
+
+# mpath_check <dm name> -> 0 mountable, 1 refused (reason on stderr)
+mpath_check() {
+    map=$1
+    table=$(dmsetup table "$map" 2>/dev/null) || { warn "$dev: cannot read the multipath table of $map"; return 1; }
+    # "<start> <len> multipath <#features> <feature>... ": queueing is the
+    # queue_if_no_path feature
+    feats=$(echo "$table" | awk '{ for (i = 1; i <= NF; i++) if ($i == "multipath") { n = $(i + 1); s = ""; for (j = 1; j <= n; j++) s = s " " $(i + 1 + j); print s; exit } }')
+    case " $feats " in
+    *" queue_if_no_path "*) ;;
+    *) return 0 ;; # fails I/O at once when no path is up
+    esac
+    q=""
+    poll=5
+    if command -v multipathd >/dev/null 2>&1; then
+        q=$(multipathd show maps raw format "%n|%Q" 2>/dev/null | awk -F'|' -v m="$map" '$1 == m { print $2; exit }')
+        p=$(multipathd show config 2>/dev/null | awk '$1 == "polling_interval" { print $2; exit }')
+        case "$p" in '' | *[!0-9]*) ;; *) poll=$p ;; esac
+    fi
+    set -- $q
+    case "${1:-}" in
+    off | fail | -)
+        return 0
+        ;;
+    '' | *[!0-9]*)
+        warn "$dev: multipath map $map queues writes while no path is up${q:+ (no_path_retry: $q)}, with no limit"
+        warn "  this node can see -- they can reach the array after this node's lease (${lease}s) has run out"
+        warn "  and a peer owns the blocks they were aimed at. Set no_path_retry to fail, or to a count with"
+        warn "  count x polling_interval (${poll}s) under ${lease}s, in multipath.conf."
+        return 1
+        ;;
+    esac
+    bound=$(($1 * poll))
+    [ "$bound" -le "$lease" ] && return 0
+    warn "$dev: multipath map $map queues writes for up to ${bound}s with no path up (no_path_retry $1 x"
+    warn "  polling_interval ${poll}s), longer than this node's lease (${lease}s): they can reach the array"
+    warn "  after a peer has taken over the blocks they were aimed at. Lower no_path_retry in multipath.conf."
+    return 1
+}
+
+real=$(readlink -f "$dev" 2>/dev/null || echo "$dev")
+name=${real##*/}
+info=""
+if [ -d "/sys/block/$name/dm" ] && ! command -v dmsetup >/dev/null 2>&1; then
+    warn "$dev is a device-mapper node and dmsetup is not installed: cannot check its multipath queueing"
+    [ "$override" = 1 ] || { warn "$dev: not mounted. (-o x-cetrafs.mpath-queue-ok overrides.)"; exit 32; }
+fi
+command -v dmsetup >/dev/null 2>&1 && info=$(dmsetup info -c --noheadings -o uuid,name --separator '|' "$real" 2>/dev/null || true)
+case "$info" in
+mpath-*)
+    map=${info#*|}
+    if ! mpath_check "$map"; then
+        if [ "$override" = 1 ]; then
+            warn "$dev: mounting anyway (x-cetrafs.mpath-queue-ok): only hardware fencing keeps this node's"
+            warn "  queued writes off blocks its peers own after it is fenced"
+        else
+            warn "$dev: not mounted. (-o x-cetrafs.mpath-queue-ok overrides, for a hardware-fenced cluster.)"
+            exit 32
+        fi
+    fi
+    ;;
+esac
+
+# shellcheck disable=SC2086 # $args is a list of single-word flags
+exec mount -i -t cetrafs $args ${kept:+-o "$kept"} "$dev" "$dir"
