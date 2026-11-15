@@ -171,6 +171,12 @@ struct cetrafs_inode_info {
      * streams through a whole run, back to the base after a jump or a
      * close. See cetrafs_inode_next_run_len(). 0 = not started. */
     u32 resv_run;
+    /* Bumped by every install (cetrafs_inode_set_reservation()), under
+     * resv_lock. The span is re-pointed or unpublished only by whoever
+     * still holds the latest install, so a drop or an older install that
+     * did I/O in between cannot unpublish or overwrite a newer run's
+     * span (audit 2026-11-15 B-9). */
+    u32 resv_gen;
 
     /*
      * The same run, published to the mount so the background scrub can
@@ -527,6 +533,15 @@ struct cetrafs_inode_info {
 
 static void cetrafs_verdicts_invalidate(struct cetrafs_inode_info *ci); /* see cetrafs_verdict_word() */
 
+/* TEST ONLY: one-shot stall in cetrafs_inode_drop_reservation() between
+ * taking the run and giving it back -- the window a writer installs a
+ * new run in (tests/kernel/resv_drop_vs_install.sh). */
+static unsigned int cetrafs_resv_drop_stall_ms;
+cetrafs_test_param(resv_drop_stall_ms, cetrafs_resv_drop_stall_ms, uint, 0644);
+/* TEST ONLY: the old drop, which unpublished whatever the span held. */
+static bool cetrafs_resv_drop_unpublish_always;
+cetrafs_test_param(resv_drop_unpublish_always, cetrafs_resv_drop_unpublish_always, bool, 0644);
+
 /*
  * Give back whatever is left of this inode's speculative run.
  *
@@ -541,7 +556,7 @@ void cetrafs_inode_drop_reservation(struct inode *inode)
     struct cetrafs_inode_info *ci = container_of(inode, struct cetrafs_inode_info, vfs_inode);
     struct super_block *sb = inode->i_sb;
     u64 lba;
-    u32 n;
+    u32 n, gen;
 
     if (!ci)
         return;
@@ -549,10 +564,14 @@ void cetrafs_inode_drop_reservation(struct inode *inode)
     spin_lock(&ci->resv_lock);
     lba = ci->resv_next;
     n = ci->resv_remaining;
+    gen = ci->resv_gen;
     ci->resv_remaining = 0;
     ci->resv_next = 0;
     ci->resv_run = 0;
     spin_unlock(&ci->resv_lock);
+
+    if (unlikely(READ_ONCE(cetrafs_resv_drop_stall_ms)))
+        msleep(xchg(&cetrafs_resv_drop_stall_ms, 0)); /* TEST ONLY, one-shot */
 
     /* Free FIRST, unpublish after: the span still covers these blocks
      * while we hand them back, so a scrub running concurrently skips
@@ -562,7 +581,19 @@ void cetrafs_inode_drop_reservation(struct inode *inode)
     if (n)
         cetrafs_free_data_extent(sb, lba, n);
 
-    cetrafs_resv_unpublish(sb, &ci->resv_span);
+    /*
+     * Only if no run was installed meanwhile. The drop runs at every
+     * release -- a read-only open of the image included -- with no lock
+     * a writer holds, and the free above waits on the allocator: a
+     * writer that found the run gone installed and published a new one
+     * in that time. Unpublishing it left a set, unreferenced run no
+     * span covered, which the scrub frees while the writer goes on
+     * handing its blocks out: two files, one block (B-9).
+     */
+    spin_lock(&ci->resv_lock);
+    if (ci->resv_gen == gen || READ_ONCE(cetrafs_resv_drop_unpublish_always))
+        cetrafs_resv_unpublish(sb, &ci->resv_span);
+    spin_unlock(&ci->resv_lock);
 }
 
 static inline struct cetrafs_inode_info *CETRAFS_I(struct inode *inode)
@@ -626,7 +657,7 @@ void cetrafs_inode_set_reservation(struct inode *inode, u64 next, u32 count, u32
     struct cetrafs_inode_info *ci = CETRAFS_I(inode);
     struct super_block *sb = inode->i_sb;
     u64 old_lba;
-    u32 old_n;
+    u32 old_n, gen;
 
     spin_lock(&ci->resv_lock);
     old_lba = ci->resv_next;
@@ -634,6 +665,7 @@ void cetrafs_inode_set_reservation(struct inode *inode, u64 next, u32 count, u32
     ci->resv_next = next;
     ci->resv_remaining = count;
     ci->resv_bg = bg;
+    gen = ++ci->resv_gen;
     spin_unlock(&ci->resv_lock);
 
     /* Give the old remainder back while the published span still covers
@@ -648,7 +680,13 @@ void cetrafs_inode_set_reservation(struct inode *inode, u64 next, u32 count, u32
     if (old_n)
         cetrafs_free_data_extent(sb, old_lba, old_n);
 
-    cetrafs_resv_publish(sb, &ci->resv_span, next, count);
+    /* Unless a later install (or a drop) came meanwhile: the span is
+     * the latest run's, and the latest install publishes it. A drop that
+     * took this run already gave its blocks back. */
+    spin_lock(&ci->resv_lock);
+    if (ci->resv_gen == gen)
+        cetrafs_resv_publish(sb, &ci->resv_span, next, count);
+    spin_unlock(&ci->resv_lock);
 }
 
 /*
