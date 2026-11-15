@@ -1620,6 +1620,8 @@ u32 cetrafs_deferred_disk_crc(struct super_block *sb, struct buffer_head *bh, u3
 void cetrafs_deferred_forget_range(struct super_block *sb, u64 lba, u32 count);
 void cetrafs_deferred_evict(struct inode *inode);
 struct list_head *cetrafs_inode_deferred(struct inode *inode);
+bool cetrafs_deferred_inode_pending(struct inode *inode); /* leafdefer.c */
+extern bool cetrafs_deferred_flush_no_inode; /* leafdefer.c, TEST ONLY */
 time64_t *cetrafs_inode_label_seen_at(struct inode *inode);
 u64 cetrafs_label_invalidation_count(void);
 u64 cetrafs_refresh_ns_reread_count(void);

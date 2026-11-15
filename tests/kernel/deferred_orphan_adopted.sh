@@ -39,6 +39,12 @@ require_cetrafs_mount "$MNT"
 ct_param_set scrub 0
 ct_param_set auto_defrag 0
 ct_param_set tree_flush_skip_all 0 # recorded before the helper below sets it
+# The state staged here -- an inode evicted with tree blocks still held
+# -- needs the record publish that does not wait for them: a publish now
+# writes the held set first, or keeps the device's root and the inode
+# dirty, so nothing is left to evict (publish_root_after_tree.sh). The
+# old order is what this suite's staging stands on.
+ct_param_set publish_root_ahead 1
 F="$MNT/img"
 
 # dio_write <path> <block> <tag> [fsync|failclose]

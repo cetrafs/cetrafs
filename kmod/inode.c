@@ -1607,11 +1607,19 @@ static unsigned int cetrafs_fd_merge_stall_ms;
 cetrafs_test_param(fd_merge_stall_ms, cetrafs_fd_merge_stall_ms, uint, 0644);
 MODULE_PARM_DESC(fd_merge_stall_ms, "TEST ONLY: widen the stat publish's read-to-merge window on i_size");
 
+/* TEST ONLY: a record publish carries the shadow's root over held-back
+ * tree blocks, as before (B-23's control). */
+static bool cetrafs_publish_root_ahead;
+cetrafs_test_param(publish_root_ahead, cetrafs_publish_root_ahead, bool, 0644);
+
 struct cetrafs_vfs_stat_cas_ctx {
     struct inode *inode;
     u64 generation;   /* in-core identity; checked against the fd echo */
     __le64 ino_le;    /* in-core ino, for the echo check */
     bool have_shadow; /* publish the hot path's pending extent state too */
+    /* ...but not its extent root: tree blocks it points through are
+     * still held back (B-23). Stat fields only; the root waits. */
+    bool defer_root;
     cetrafs_inode_t *shadow;
     struct cetrafs_stat_baseline base;
     cetrafs_inode_t *written;
@@ -1682,7 +1690,7 @@ static int cetrafs_vfs_stat_cas_mutate(void *image, unsigned int len, void *priv
 
     /* The hot path's pending extent state supersedes the device's: it is
      * strictly newer (this node is the file's writer). */
-    if (ctx->have_shadow) {
+    if (ctx->have_shadow && !ctx->defer_root) {
         rec.eh = ctx->shadow->eh;
         rec.et = ctx->shadow->et;
     }
@@ -1972,6 +1980,49 @@ int cetrafs_write_vfs_inode(struct inode *inode)
      * tree and then freeing the old one must never interleave with this
      * CAS, or the pre-rebuild shadow lands on top of the fresh tree and
      * the device ends up referencing freed blocks. */
+    /*
+     * The root goes out after the blocks it points through. Tree edits
+     * are held back until a boundary (leafdefer.c), and this publish --
+     * writeback's, sync's, a setattr's -- carried the shadow's root to
+     * the device while a leaf edit that makes it consistent was still
+     * only in memory: a crash then left a new leaf naming a block an old
+     * leaf still covered, one block named twice (audit 2026-11-15
+     * B-23). So the held set is written first where that cannot block
+     * on a caller's own lock (a trylock: a caller holding
+     * invalidate_lock flushed the set itself or is mid-edit); what is
+     * still held after that keeps the device's root, and the shadow
+     * stays pending for the boundary that writes the set.
+     */
+    if (S_ISREG(inode->i_mode) && cetrafs_deferred_inode_pending(inode) && !READ_ONCE(cetrafs_publish_root_ahead)) {
+        bool freeing;
+
+        spin_lock(&inode->i_lock);
+        freeing = inode_state_read(inode) & (I_FREEING | I_WILL_FREE);
+        spin_unlock(&inode->i_lock);
+        /* (TEST ONLY deferred_flush_no_inode leaves the set to sync_fs's
+         * lockless batch, which is what that knob stages.) */
+        if (!READ_ONCE(cetrafs_deferred_flush_no_inode)) {
+            /* An inode on its way out holds no lock of anyone's: wait. */
+            if (freeing)
+                down_read(&inode->i_mapping->invalidate_lock);
+            if (freeing || down_read_trylock(&inode->i_mapping->invalidate_lock)) {
+                ret = cetrafs_deferred_flush_inode(inode, true);
+                up_read(&inode->i_mapping->invalidate_lock);
+                if (ret)
+                    goto out;
+            }
+        }
+        /*
+         * Not for an inode being evicted: its shadow dies with it, and
+         * the set goes to the orphan list, which sync_fs and unmount
+         * write. Keeping the device's root there loses the edit for
+         * good -- a written block left a hole -- where publishing it
+         * leaves the crash window until that orphan flush. Reached only
+         * past a boundary whose flush failed (a failing close pins its
+         * inode for the retry, and the retry writes the orphans first).
+         */
+        ctx->defer_root = !freeing && cetrafs_deferred_inode_pending(inode);
+    }
     cetrafs_inode_fd_pub_lock(inode);
     ctx->have_shadow = cetrafs_inode_fd_take(inode, &bufs[1], &fd_seq);
 
@@ -2033,7 +2084,10 @@ int cetrafs_write_vfs_inode(struct inode *inode)
          * window then rebuilt its tree from the lagging device record,
          * leaking every extent in flight (the ~15k-blocks-per-fill
          * leak, 2026-10-27). */
-        cetrafs_inode_fd_published(inode, fd_seq);
+        if (ctx->defer_root)
+            mark_inode_dirty_sync(inode); /* the root is still to go: the shadow stays pending */
+        else
+            cetrafs_inode_fd_published(inode, fd_seq);
         cetrafs_record_write_counted();
         cetrafs_vfs_stat_adopt(inode, ctx); /* may point 'written' fields back at core: baseline only */
         cetrafs_inode_stat_baseline_set(inode, ctx->written);

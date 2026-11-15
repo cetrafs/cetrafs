@@ -554,7 +554,7 @@ MODULE_PARM_DESC(deferred_settle_stall_ms, "TEST ONLY: pause between a batch's t
 /* TEST ONLY: sync_fs/unmount flush every listed block as if its inode
  * were not in core -- with no lock against a writer of the file, the
  * condition deferred_settle_stall_ms exists to race. */
-static bool cetrafs_deferred_flush_no_inode;
+bool cetrafs_deferred_flush_no_inode;
 cetrafs_test_param(deferred_flush_no_inode, cetrafs_deferred_flush_no_inode, bool, 0644);
 MODULE_PARM_DESC(deferred_flush_no_inode, "TEST ONLY: flush held-back blocks without looking up their inode");
 
@@ -609,6 +609,20 @@ MODULE_PARM_DESC(tree_flush_fail_once, "TEST ONLY: the next extent-tree block fl
  * -- every tree mutator holds it exclusively (CLAUDE.md rule 18), the
  * O_DIRECT completion's conversion included.
  */
+/* Does this inode have tree blocks held back right now? */
+bool cetrafs_deferred_inode_pending(struct inode *inode)
+{
+    struct xarray *xa = cetrafs_sb_deferred(inode->i_sb);
+    bool pending;
+
+    if (!xa || xa_empty(xa))
+        return false;
+    xa_lock(xa);
+    pending = !list_empty(cetrafs_inode_deferred(inode));
+    xa_unlock(xa);
+    return pending;
+}
+
 int cetrafs_deferred_flush_inode(struct inode *inode, bool mapping_locked)
 {
     struct super_block *sb = inode->i_sb;
