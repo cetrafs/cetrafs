@@ -4611,6 +4611,16 @@ static int cetrafs_tree_convert_append(struct inode *inode,
     if (!ret && tail->len)
         tret = cetrafs_tree_append(inode, raw, tail->block, tail->lba, tail->len, /*uninit=*/true, &merged,
                                    &leaf_count);
+    /* The shrink before this may already be on the device
+     * (cetrafs_convert_source_durable()), and a refused append leaves the
+     * written block, and any tail, in no extent. ENOSPC is not a refusal
+     * that can happen here: the room was checked and the tree blocks
+     * reserved -- and written, so a thin pool said no before the edit
+     * (cetrafs_tree_resv_provision()). If it does, the state is not what
+     * this node believes, and that is a stop, not a hole (B-2). */
+    if ((ret == -ENOSPC || tret == -ENOSPC) && !READ_ONCE(cetrafs_convert_append_nospc))
+        cetrafs_sb_fatal(inode->i_sb, "ino=%llu: a convert's append was refused ENOSPC after its leaf was shrunk",
+                         (unsigned long long) inode->i_ino);
     if (tail->len && (ret || tret)) {
         /*
          * The tail is in no extent now. It is NOT freed: the leaf that

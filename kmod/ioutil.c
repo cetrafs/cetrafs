@@ -743,13 +743,28 @@ int cetrafs_sync_buffer(struct super_block *sb, struct buffer_head *bh)
  * and every other metadata write, still stops the mount (audit
  * 2026-11-14 A-4; tests/kernel/thin_nospc_new_block.sh).
  */
+/* TEST ONLY: the next N new-block writes find the thin pool full: the
+ * write is not sent and answers ENOSPC (tests/kernel/thin_nospc_convert.sh).
+ * Only new blocks, so the heartbeat's own writes are not the ones hit. */
+static unsigned int cetrafs_new_block_nospc;
+cetrafs_test_param(new_block_nospc, cetrafs_new_block_nospc, uint, 0644);
+MODULE_PARM_DESC(new_block_nospc, "TEST ONLY: the next N new metadata block writes answer ENOSPC unsent");
+
 int cetrafs_sync_new_buffer(struct super_block *sb, struct buffer_head *bh)
 {
     int ret;
 
     if (cetrafs_sb_is_fenced(sb))
         return -EIO;
-    ret = __cetrafs_sync_buffer(bh);
+    if (READ_ONCE(cetrafs_new_block_nospc)) {
+        WRITE_ONCE(cetrafs_new_block_nospc, cetrafs_new_block_nospc - 1);
+        lock_buffer(bh);
+        clear_buffer_dirty(bh);
+        unlock_buffer(bh);
+        ret = -ENOSPC; /* test-only: what a full pool answers */
+    } else {
+        ret = __cetrafs_sync_buffer(bh);
+    }
     if (ret == -ENOSPC && !READ_ONCE(cetrafs_nospc_stops)) {
         atomic64_inc(&cetrafs_meta_nospc);
         pr_warn_ratelimited("%s: the device has no space for a new metadata block (%llu): the operation fails "

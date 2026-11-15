@@ -1805,6 +1805,42 @@ int cetrafs_tree_block_anywhere(struct super_block *sb, u32 *bg, u64 *lba)
     return cetrafs_alloc_block_anywhere(sb, bg, lba);
 }
 
+/* TEST ONLY: reserve tree blocks without writing them first -- the
+ * order before the thin-pool provisioning below (tests/kernel/
+ * thin_nospc_convert.sh's control). */
+static bool cetrafs_resv_provision_off;
+cetrafs_test_param(resv_provision_off, cetrafs_resv_provision_off, bool, 0644);
+MODULE_PARM_DESC(resv_provision_off, "TEST ONLY: reserved tree blocks are not written when reserved");
+
+/*
+ * Write a reserved block once, zeroed, before the convert edits anything:
+ * on a thin-provisioned LUN the write is what allocates it. The append
+ * that later uses it as a leaf or interior writes it through
+ * cetrafs_sync_new_buffer(), where a full pool is an ENOSPC for the
+ * operation -- clean for a block nothing names, not for one the convert
+ * appends to AFTER shrinking a leaf, which may already be on the device
+ * (cetrafs_convert_source_durable()): the rest of the preallocation
+ * became a hole (B-2, re-opened by A-4). Provisioned here, the pool says
+ * no while nothing has changed. Nothing references the block, so its
+ * failure frees it.
+ */
+static int cetrafs_tree_resv_provision(struct super_block *sb, u64 lba)
+{
+    struct buffer_head *bh;
+    int ret;
+
+    if (READ_ONCE(cetrafs_resv_provision_off))
+        return 0; /* test-only; see the parameter */
+    bh = cetrafs_getblk_overwrite(sb, lba);
+    if (!bh)
+        return -EIO;
+    memset(bh->b_data, 0, CETRAFS_BLOCK_SIZE);
+    cetrafs_bh_end_update(bh);
+    ret = cetrafs_sync_new_buffer(sb, bh);
+    brelse(bh);
+    return ret;
+}
+
 int cetrafs_tree_resv_fill(struct inode *inode)
 {
     struct cetrafs_inode_info *ci = CETRAFS_I(inode);
@@ -1817,6 +1853,11 @@ int cetrafs_tree_resv_fill(struct inode *inode)
 
         if (ret)
             return ret;
+        ret = cetrafs_tree_resv_provision(inode->i_sb, ci->tree_resv_lba[ci->tree_resv_n]);
+        if (ret) {
+            cetrafs_free_data_block(inode->i_sb, ci->tree_resv_lba[ci->tree_resv_n]);
+            return ret;
+        }
         ci->tree_resv_n++;
     }
     return 0;
