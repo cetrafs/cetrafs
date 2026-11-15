@@ -478,6 +478,7 @@ static void cetrafs_evict_inode(struct inode *inode)
      * leaks every one of them. Idempotent, so the common double call is
      * free. */
     cetrafs_inode_drop_reservation(inode);
+    cetrafs_tree_resv_release(inode); /* the converts' kept tree reserve: nothing else holds the inode */
 
     /* Buffered blocks never marked written: every close and fsync tries,
      * so one left here is one those reported failing. The page cache is

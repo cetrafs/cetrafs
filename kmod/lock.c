@@ -127,11 +127,16 @@ struct cetrafs_inode_info {
                                      * the on-disk presence bit is set on 0->1 and cleared on
                                      * 1->0, so repeated local opens cost nothing on the wire */
     atomic_t lock_local_open_count; /* this node's local open refcount, read+write alike */
-    /* Tree blocks reserved for one convert that must append through the
+    /* Tree blocks reserved for a convert that must append through the
      * tree after shrinking a full leaf (cetrafs_tree_resv_fill()). Under
-     * invalidate_lock held exclusively; empty outside cetrafs_tree_convert(). */
+     * invalidate_lock held exclusively. Kept between converts while the
+     * file is open for write -- provisioned once, not per convert
+     * (review F-5) -- each published in the reservation registry while
+     * held, since it is set and named by nothing (the scrub's leak);
+     * given back at a write close and at eviction. */
     u64 tree_resv_lba[4]; /* two appends: the written block, the tail */
     u32 tree_resv_bg[4];
+    struct cetrafs_resv_span tree_resv_span[4];
     unsigned int tree_resv_n;
     bool tree_in_convert_append; /* test-only: cetrafs_convert_append_nospc */
     /*
@@ -1483,6 +1488,14 @@ static void cetrafs_inode_identity_init_ci(struct cetrafs_inode_info *ci)
 {
     WARN_ON_ONCE(ci->tree_resv_n);
     ci->tree_resv_n = 0;
+    {
+        unsigned int i;
+
+        for (i = 0; i < ARRAY_SIZE(ci->tree_resv_span); i++) {
+            ci->tree_resv_span[i].start = 0;
+            ci->tree_resv_span[i].count = 0;
+        }
+    }
     /* class 55: a fresh in-core object -- no write stands behind it. */
     ci->fd_dirty = false;
     ci->fd_seq = 0;
@@ -1546,6 +1559,12 @@ static void cetrafs_inode_init_once(void *foo)
     mutex_init(&ci->fd_pub_mutex);
     ci->tree_move_seq = 0;
     INIT_LIST_HEAD(&ci->resv_span.link);
+    {
+        unsigned int i;
+
+        for (i = 0; i < ARRAY_SIZE(ci->tree_resv_span); i++)
+            INIT_LIST_HEAD(&ci->tree_resv_span[i].link);
+    }
     atomic_set(&ci->lock_writer_count, 0);
     atomic_set(&ci->read_opener_count, 0);
     atomic_set(&ci->lock_local_open_count, 0);
@@ -1641,6 +1660,12 @@ void cetrafs_free_vfs_inode(struct inode *inode)
      * a recycled object with an empty link, so this also proves the
      * recycle invariant rather than assuming it. */
     WARN_ON_ONCE(!list_empty(&ci->resv_span.link));
+    {
+        unsigned int i;
+
+        for (i = 0; i < ARRAY_SIZE(ci->tree_resv_span); i++)
+            WARN_ON_ONCE(!list_empty(&ci->tree_resv_span[i].link));
+    }
     /* ->evict_inode empties it (cetrafs_pending_drop_all()); a recycled
      * object must not carry another file's pending blocks. */
     WARN_ON_ONCE(!mtree_empty(&ci->pending));
@@ -1898,6 +1923,19 @@ static bool cetrafs_resv_provision_serial;
 cetrafs_test_param(resv_provision_serial, cetrafs_resv_provision_serial, bool, 0644);
 MODULE_PARM_DESC(resv_provision_serial, "TEST ONLY: reserved tree blocks are written one at a time");
 
+/* TEST ONLY: kept reserve blocks are not published in the reservation
+ * registry, so a scrub may take them for leaks (tests/kernel/
+ * tree_resv_kept.sh's control). */
+static bool cetrafs_tree_resv_unregistered;
+cetrafs_test_param(tree_resv_unregistered, cetrafs_tree_resv_unregistered, bool, 0644);
+MODULE_PARM_DESC(tree_resv_unregistered, "TEST ONLY: the converts' kept tree reserve is not in the reservation registry");
+
+static void cetrafs_tree_resv_publish(struct super_block *sb, struct cetrafs_inode_info *ci)
+{
+    if (!READ_ONCE(cetrafs_tree_resv_unregistered))
+        cetrafs_resv_publish(sb, &ci->tree_resv_span[ci->tree_resv_n], ci->tree_resv_lba[ci->tree_resv_n], 1);
+}
+
 int cetrafs_tree_resv_fill(struct inode *inode)
 {
     struct cetrafs_inode_info *ci = CETRAFS_I(inode);
@@ -1914,9 +1952,11 @@ int cetrafs_tree_resv_fill(struct inode *inode)
                                               &ci->tree_resv_lba[ci->tree_resv_n]);
             if (ret)
                 return ret;
+            cetrafs_tree_resv_publish(sb, ci);
             ret = cetrafs_tree_resv_provision(sb, ci->tree_resv_lba[ci->tree_resv_n]);
             if (ret) {
                 cetrafs_free_data_block(sb, ci->tree_resv_lba[ci->tree_resv_n]);
+                cetrafs_resv_unpublish(sb, &ci->tree_resv_span[ci->tree_resv_n]);
                 return ret;
             }
             ci->tree_resv_n++;
@@ -1928,6 +1968,7 @@ int cetrafs_tree_resv_fill(struct inode *inode)
         ret = cetrafs_tree_block_anywhere(sb, &ci->tree_resv_bg[ci->tree_resv_n], &ci->tree_resv_lba[ci->tree_resv_n]);
         if (ret)
             break;
+        cetrafs_tree_resv_publish(sb, ci);
         ci->tree_resv_n++;
     }
     if (!READ_ONCE(cetrafs_resv_provision_off)) {
@@ -1957,6 +1998,7 @@ int cetrafs_tree_resv_fill(struct inode *inode)
         while (ci->tree_resv_n > first) {
             ci->tree_resv_n--;
             cetrafs_free_data_block(sb, ci->tree_resv_lba[ci->tree_resv_n]);
+            cetrafs_resv_unpublish(sb, &ci->tree_resv_span[ci->tree_resv_n]);
         }
     }
     return ret;
@@ -1973,6 +2015,9 @@ int cetrafs_tree_alloc_block(struct inode *inode, u32 *bg, u64 *lba)
         ci->tree_resv_n--;
         *bg = ci->tree_resv_bg[ci->tree_resv_n];
         *lba = ci->tree_resv_lba[ci->tree_resv_n];
+        /* An append's block from here: named in core by the edit it is
+         * taken for, within this get_block, like any fresh allocation. */
+        cetrafs_resv_unpublish(inode->i_sb, &ci->tree_resv_span[ci->tree_resv_n]);
         return 0;
     }
     return cetrafs_tree_block_anywhere(inode->i_sb, bg, lba);
@@ -1983,8 +2028,10 @@ void cetrafs_tree_mark_convert_append(struct inode *inode, bool on)
     CETRAFS_I(inode)->tree_in_convert_append = on;
 }
 
-/* Give back what the convert did not use: never referenced by anything,
- * so free at once. */
+/* Give back the reserve: never referenced by anything, so free at once
+ * -- before the span goes, so a scrub running meanwhile still skips the
+ * blocks. Caller holds invalidate_lock exclusively, or the inode is
+ * being evicted. */
 void cetrafs_tree_resv_release(struct inode *inode)
 {
     struct cetrafs_inode_info *ci = CETRAFS_I(inode);
@@ -1992,7 +2039,18 @@ void cetrafs_tree_resv_release(struct inode *inode)
     while (ci->tree_resv_n) {
         ci->tree_resv_n--;
         cetrafs_free_data_block(inode->i_sb, ci->tree_resv_lba[ci->tree_resv_n]);
+        cetrafs_resv_unpublish(inode->i_sb, &ci->tree_resv_span[ci->tree_resv_n]);
     }
+}
+
+/* At a write close: what was kept for the next convert goes back. */
+void cetrafs_tree_resv_drop(struct inode *inode)
+{
+    if (!READ_ONCE(CETRAFS_I(inode)->tree_resv_n))
+        return;
+    filemap_invalidate_lock(inode->i_mapping);
+    cetrafs_tree_resv_release(inode);
+    filemap_invalidate_unlock(inode->i_mapping);
 }
 
 /* TEST ONLY: a last close whose conversion was refused for room stops

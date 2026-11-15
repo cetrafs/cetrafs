@@ -5588,6 +5588,12 @@ again:
  */
 /* 'moving': set when the convert moved entries (cetrafs_tree_move_begin());
  * the caller ends the move once the new record is staged. */
+/* TEST ONLY: the reserve goes back after every convert, as before
+ * (tests/kernel/tree_resv_kept.sh's control). */
+static bool cetrafs_tree_resv_keep_off;
+cetrafs_test_param(tree_resv_keep_off, cetrafs_tree_resv_keep_off, bool, 0644);
+MODULE_PARM_DESC(tree_resv_keep_off, "TEST ONLY: a convert's unused tree reserve is freed after every convert");
+
 static int cetrafs_tree_convert(struct inode *inode, cetrafs_inode_t *raw, u32 iblock, u64 lba, u32 want, u32 *done,
                                 bool *moving)
 {
@@ -5602,7 +5608,11 @@ static int cetrafs_tree_convert(struct inode *inode, cetrafs_inode_t *raw, u32 i
     if (ret)
         return ret;
     ret = cetrafs_tree_convert_inner(inode, raw, iblock, lba, want, done, moving);
-    cetrafs_tree_resv_release(inode); /* what an append did not take */
+    /* What an append did not take stays for the next convert (F-5),
+     * given back at the write close; a refused convert gives it back
+     * now, so an ENOSPC leaves the volume as it found it. */
+    if (ret < 0 || READ_ONCE(cetrafs_tree_resv_keep_off))
+        cetrafs_tree_resv_release(inode);
     if (WARN_ON_ONCE(ret == CETRAFS_CONVERT_NEED_ROOM))
         ret = -EIO;
     if (ret == 0 && *done == 0)
@@ -9548,6 +9558,8 @@ static int cetrafs_release(struct inode *inode, struct file *file)
      * flush instead of sitting reserved-but-unreferenced until the
      * scrub notices. */
     cetrafs_inode_drop_reservation(inode);
+    if (file->f_mode & FMODE_WRITE)
+        cetrafs_tree_resv_drop(inode); /* the converts' kept tree reserve (F-5) */
     /* A fragmented file's sorted map is megabytes: kept only while the
      * file is open (cetrafs_inode_sorted_runs()). */
     cetrafs_inode_smap_drop(inode);
