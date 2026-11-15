@@ -25,6 +25,18 @@ set -euo pipefail
 require_root
 require_module
 [ -w /sys/module/cetrafs/parameters/sparse_unit_off ] || { skip "sparse_unit_off is missing"; ct_exit; }
+# A unit is zeroed with WRITE ZEROES, which a loop device serves as
+# FALLOC_FL_ZERO_RANGE on its backing file; without it no unit is
+# allocated at all (sparse_unit_no_split.sh).
+export CT_IMG_DIR="${CT_IMG_DIR:-/var/tmp}"
+ZR="$(mktemp "$CT_IMG_DIR/cetrafs-zr-XXXXXX")"
+truncate -s 1M "$ZR"
+if ! fallocate -z -o 0 -l 65536 "$ZR" 2>/dev/null; then
+    rm -f "$ZR"
+    skip "$CT_IMG_DIR cannot zero a range in place (FALLOC_FL_ZERO_RANGE) -- set CT_IMG_DIR to one that can"
+    ct_exit
+fi
+rm -f "$ZR"
 MNT="$(ct_mnt spu)"
 ct_track mnt "$MNT"
 ct_param_set auto_defrag 0

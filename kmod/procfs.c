@@ -394,6 +394,7 @@ static int cetrafs_proc_info_show(struct seq_file *m, void *v)
     seq_printf(m, "leaf_splits: %llu\n", cetrafs_leaf_split_count());
     seq_printf(m, "convert_spills: %llu\n", cetrafs_convert_spill_count());
     seq_printf(m, "convert_units_widened: %llu\n", cetrafs_convert_widened_count());
+    seq_printf(m, "convert_units_healed: %llu\n", cetrafs_convert_healed_count());
     seq_printf(m, "sparse_units: %llu\n", cetrafs_sparse_unit_count());
     seq_printf(m, "tree_patches: %llu\n", cetrafs_tree_patch_count());
     seq_printf(m, "defrag_segments: %llu\n", cetrafs_defrag_segment_count());

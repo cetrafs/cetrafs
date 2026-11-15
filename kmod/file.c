@@ -6958,10 +6958,89 @@ static int cetrafs_convert_zero_side(struct inode *inode, u32 first, u64 plba, u
     return 0;
 }
 
+/*
+ * A unit that a convert had to split: a block written while a sibling's
+ * write into the same unit was still in flight (cetrafs_unit_dio_busy())
+ * was converted alone, leaving the unit as three extents, and the
+ * single-extent test below then refused it on every later write -- one
+ * more split each. A sparse file's units (cetrafs_sparse_unit_alloc())
+ * made that the common case under concurrent O_DIRECT, and a thin image
+ * reached the extent ceiling sooner than with no units at all (audit
+ * 2026-11-15 F-18).
+ *
+ * So a later write into such a unit heals it: when every block of the
+ * unit is mapped at its place in the one run the unit was allocated as,
+ * and none still preallocated is in flight, those are zeroed and
+ * converted here, the caller converts its own, and the written pieces
+ * merge back into one extent. Same rules as the widening: zeroed before
+ * marked written, never a block someone else is writing.
+ *
+ * Returns true when the unit was healed except for the caller's range.
+ */
+static bool cetrafs_convert_heal_off;
+cetrafs_test_param(convert_heal_off, cetrafs_convert_heal_off, bool, 0644);
+MODULE_PARM_DESC(convert_heal_off, "TEST ONLY: a split unit is never converted whole again");
+
+static atomic64_t cetrafs_convert_healed = ATOMIC64_INIT(0);
+u64 cetrafs_convert_healed_count(void)
+{
+    return (u64) atomic64_read(&cetrafs_convert_healed);
+}
+
+static bool cetrafs_convert_heal(struct inode *inode, cetrafs_inode_t *raw, u32 iblock, u64 lba, u32 want, u64 ws,
+                                 u64 we, bool pending_landed, bool *moving)
+{
+    u64 base = lba - (iblock - ws), b;
+    int pass;
+
+    if (READ_ONCE(cetrafs_convert_heal_off))
+        return false;
+    /* Pass 0 checks the whole unit; pass 1 zeroes and pass 2 converts
+     * its preallocated pieces outside [iblock, iblock + want). */
+    for (pass = 0; pass < 3; pass++) {
+        for (b = ws; b < we;) {
+            u64 plba = 0, end;
+            u32 run = 0;
+            bool uninit = false, found = false;
+
+            if (b >= iblock && b < (u64) iblock + want) {
+                b = (u64) iblock + want;
+                continue;
+            }
+            if (cetrafs_tree_lookup(inode, raw, (u32) b, &plba, &run, &uninit, &found, false) || !found ||
+                !run || plba != base + (b - ws))
+                return false; /* not the unit's own run: leave it */
+            end = min_t(u64, b + run, we);
+            if (b < iblock)
+                end = min_t(u64, end, iblock);
+            if (uninit) {
+                if (pass == 0 && cetrafs_unit_dio_busy(inode, (u32) b, (u32) (end - b))) {
+                    atomic64_inc(&cetrafs_convert_unit_busy);
+                    return false;
+                }
+                if (pass == 1 &&
+                    cetrafs_convert_zero_side(inode, (u32) b, plba, (u32) (end - b), pending_landed))
+                    return false; /* not all zeroed: nothing marked written yet */
+                if (pass == 2) {
+                    u32 done = 0;
+
+                    if (cetrafs_tree_convert(inode, raw, (u32) b, plba, (u32) (end - b), &done, moving) ||
+                        !done)
+                        return false; /* what converted is zeroed and written: consistent */
+                    end = b + min_t(u64, done, end - b);
+                }
+            }
+            b = end;
+        }
+    }
+    atomic64_inc(&cetrafs_convert_healed);
+    return true;
+}
+
 /* [iblock, iblock + want) at lba is about to be converted: widen it to
  * the aligned unit when the unit is free to take. */
-static void cetrafs_convert_widen(struct inode *inode, const cetrafs_inode_t *raw, u32 iblock, u64 lba, u32 want,
-                                  bool pending_landed, u32 *cv_iblock, u64 *cv_lba, u32 *cv_want)
+static void cetrafs_convert_widen(struct inode *inode, cetrafs_inode_t *raw, u32 iblock, u64 lba, u32 want,
+                                  bool pending_landed, bool *moving, u32 *cv_iblock, u64 *cv_lba, u32 *cv_want)
 {
     u32 unit = READ_ONCE(cetrafs_convert_unit_blocks), run = 0;
     u64 ws, we, lws = 0;
@@ -6977,8 +7056,11 @@ static void cetrafs_convert_widen(struct inode *inode, const cetrafs_inode_t *ra
      * the block at its start is uninit, at the matching address, with
      * the run reaching the unit's end. */
     if (cetrafs_tree_lookup(inode, raw, (u32) ws, &lws, &run, &uninit, &found, false) || !found || !uninit ||
-        lws + (iblock - ws) != lba || run < we - ws)
+        lws + (iblock - ws) != lba || run < we - ws) {
+        if (we - ws == unit)
+            (void) cetrafs_convert_heal(inode, raw, iblock, lba, want, ws, we, pending_landed, moving);
         return;
+    }
     if (cetrafs_unit_dio_busy(inode, (u32) ws, (u32) (iblock - ws)) ||
         cetrafs_unit_dio_busy(inode, iblock + want, (u32) (we - iblock - want))) {
         atomic64_inc(&cetrafs_convert_unit_busy);
@@ -7020,6 +7102,11 @@ static bool cetrafs_sparse_unit_off;
 cetrafs_test_param(sparse_unit_off, cetrafs_sparse_unit_off, bool, 0644);
 MODULE_PARM_DESC(sparse_unit_off, "TEST ONLY: a first write into a sparse hole allocates its block alone");
 
+/* TEST ONLY: units on a device that cannot zero them, as before
+ * (tests/kernel/sparse_unit_no_split.sh's control). */
+static bool cetrafs_sparse_unit_zeroes_check_off;
+cetrafs_test_param(sparse_unit_zeroes_check_off, cetrafs_sparse_unit_zeroes_check_off, bool, 0644);
+
 static atomic64_t cetrafs_sparse_units = ATOMIC64_INIT(0);
 u64 cetrafs_sparse_unit_count(void)
 {
@@ -7047,6 +7134,11 @@ static int cetrafs_sparse_unit_alloc(struct inode *inode, const cetrafs_inode_t 
         return -EAGAIN;
     lo = *ws == iblock ? iblock - 1 : *ws; /* the unit, and the block before the write */
     if (cetrafs_tree_range_mapped(inode, raw, (u32) lo, (u32) (*ws + unit)) != 0)
+        return -EAGAIN;
+    /* The convert widens a unit by zeroing it (WRITE ZEROES). A device
+     * without that never widens, and each first write then split the
+     * unit into three extents where a block alone made one (F-18). */
+    if (!bdev_write_zeroes_sectors(sb->s_bdev) && !READ_ONCE(cetrafs_sparse_unit_zeroes_check_off))
         return -EAGAIN;
     if (cetrafs_alloc_pick_bg(sb, &bg_id) || cetrafs_alloc_data_run(sb, bg_id, unit, ulba))
         return -EAGAIN; /* no run that long here: the block alone, through the full path */
@@ -7301,7 +7393,7 @@ relookup:
             u64 cv_lba = lba;
 
             if (mode == CETRAFS_GB_CONVERT || mode == CETRAFS_GB_CONVERT_PENDING)
-                cetrafs_convert_widen(inode, &raw, (u32) iblock, lba, want, mode == CETRAFS_GB_CONVERT_PENDING,
+                cetrafs_convert_widen(inode, &raw, (u32) iblock, lba, want, mode == CETRAFS_GB_CONVERT_PENDING, &moving,
                                       &cv_iblock, &cv_lba, &cv_want);
             ahead = (u32) iblock - cv_iblock;
             ret = cetrafs_tree_convert(inode, &raw, cv_iblock, cv_lba, cv_want, &converted, &moving);

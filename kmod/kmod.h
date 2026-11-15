@@ -1434,6 +1434,7 @@ u64 cetrafs_convert_leaf_full_count(void);
 u64 cetrafs_leaf_split_count(void);
 u64 cetrafs_convert_spill_count(void);
 u64 cetrafs_convert_widened_count(void);
+u64 cetrafs_convert_healed_count(void);
 u64 cetrafs_sparse_unit_count(void);
 u64 cetrafs_convert_unit_busy_count(void);
 u64 cetrafs_tree_any_leaf_count(void);
