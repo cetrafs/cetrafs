@@ -69,6 +69,12 @@ bool cetrafs_node_row_is(const void *blk, const u8 *uuid)
  */
 static int __cetrafs_read_node_entry(struct super_block *sb, u32 idx, cetrafs_node_entry_t *out, bool first_cached);
 
+/* TEST ONLY: a row reading FREE is free whatever else it holds, as
+ * before BM-36 -- the negative control of
+ * tests/kernel/node_row_free_bitflip.sh. */
+static bool cetrafs_node_free_any;
+cetrafs_test_param(node_free_any, cetrafs_node_free_any, bool, 0644);
+
 static int cetrafs_read_node_entry(struct super_block *sb, u32 idx, cetrafs_node_entry_t *out)
 {
     return __cetrafs_read_node_entry(sb, idx, out, false);
@@ -152,8 +158,10 @@ static int __cetrafs_read_node_entry(struct super_block *sb, u32 idx, cetrafs_no
             memcpy(out, bh->b_data, sizeof(*out));
             brelse(bh);
 
-            if (!cetrafs_record_tear_injected("node row") && (cetrafs_le32(out->state) == CETRAFS_NODE_STATE_FREE ||
-                                                     cetrafs_node_crc(out) == (u32) cetrafs_le64(out->checksum)))
+            if (!cetrafs_record_tear_injected("node row") &&
+                ((cetrafs_le32(out->state) == CETRAFS_NODE_STATE_FREE &&
+                  (cetrafs_node_entry_blank(out) || READ_ONCE(cetrafs_node_free_any))) ||
+                 cetrafs_node_crc(out) == (u32) cetrafs_le64(out->checksum)))
                 return 0;
 
             /* Same backoff as the inode-record reader: a tear is a
@@ -283,9 +291,14 @@ static int cetrafs_node_claim_mutate(void *image, unsigned int len, void *priv)
 
     memcpy(&ne, image, sizeof(ne));
 
+    /* A row reading FREE that is not blank is a damaged live row, not a
+     * free one (BM-36): never claimed. */
+    if (cetrafs_le32(ne.state) == CETRAFS_NODE_STATE_FREE && !cetrafs_node_entry_blank(&ne) &&
+        !READ_ONCE(cetrafs_node_free_any) && cetrafs_node_crc(&ne) != (u32) cetrafs_le64(ne.checksum))
+        return -EEXIST;
     /* Only FREE rows are claimable. mkfs leaves the whole table
-     * zero-filled and never stamps a FREE row's checksum, so state is
-     * the only field that may be trusted here -- exactly as
+     * zero-filled and never stamps a FREE row's checksum, so a blank
+     * row is free without one -- exactly as
      * cetrafs_read_node_entry() documents. The one exception is a row
      * whose machine left CLEANLY (departure == CLEAN): its claims were
      * released and its journal parked, and with no FREE row the volume
@@ -518,7 +531,16 @@ static int cetrafs_node_fence_mutate(void *image, unsigned int len, void *priv)
     memcpy(&ne, image, sizeof(ne));
 
     /* Only a REGISTERED row carries a lease worth revoking. A row that
-     * has already gone FREE has no owner left to fence. */
+     * has already gone FREE has no owner left to fence -- if it is
+     * blank: a live row with its state bit flipped reads FREE too, and
+     * "nothing to fence" then let the caller take a live node's claims
+     * (BM-36). */
+    if (cetrafs_le32(ne.state) == CETRAFS_NODE_STATE_FREE && !cetrafs_node_entry_blank(&ne) &&
+        !READ_ONCE(cetrafs_node_free_any) && cetrafs_node_crc(&ne) != (u32) cetrafs_le64(ne.checksum)) {
+        pr_err_ratelimited("fence: the row reads FREE but is not blank and fails its checksum -- damaged, not "
+                           "free; refusing\n");
+        return -EUCLEAN;
+    }
     if (cetrafs_le32(ne.state) != CETRAFS_NODE_STATE_REGISTERED)
         return 1; /* nothing to do -- not an error */
     if (!cetrafs_node_image_ok(&ne))

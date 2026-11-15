@@ -1178,6 +1178,26 @@ typedef struct {
     u8   reserved[12];
 } CETRA_PACKED cetrafs_node_entry_t; /* 144 bytes */
 
+/*
+ * A FREE row carries no checksum: mkfs zero-fills the table and every
+ * writer that gives a row back (fsck's retire, a tool's repair release)
+ * writes zeros. So FREE is believed only of a BLANK row. A live row
+ * with one bit flipped in `state` reads FREE and is not blank -- and
+ * believing it handed that node's row to the next mounter and let a
+ * reclaim take its claims without revoking its lease (audit 2026-11-15
+ * BM-36). Such a row must pass its checksum like any other.
+ */
+static inline int cetrafs_node_entry_blank(const cetrafs_node_entry_t *ne)
+{
+    const unsigned char *p = (const unsigned char *) ne;
+    unsigned int i;
+
+    for (i = 0; i < sizeof(*ne); i++)
+        if (p[i])
+            return 0;
+    return 1;
+}
+
 /* cetrafs_node_entry_t.fence_reason values. */
 #define CETRAFS_FENCE_NONE        0 /* never fenced since the row was written */
 #define CETRAFS_FENCE_RECLAIM     1 /* a peer reclaimed something this node held: a lock, a Zone Group, a journal, a namespace lock */

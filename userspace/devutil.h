@@ -1103,6 +1103,8 @@ static inline int cetrafs_repair_claim(int fd, const cetrafs_superblock_t *sb, c
             if (pass == 0) {
                 if (cetrafs_le32(ne.state) != CETRAFS_NODE_STATE_FREE)
                     continue;
+                if (!cetrafs_node_entry_blank(&ne))
+                    continue; /* a live row with a flipped state, not a free one (BM-36) */
             } else {
                 if (cetrafs_le32(ne.state) != CETRAFS_NODE_STATE_REGISTERED)
                     continue;

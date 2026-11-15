@@ -73,8 +73,10 @@ int main(int argc, char **argv)
                 "       %s <image> <row> --frees <n>        (set frees_inflight)\n"
                 "       %s <image> <row> --inc <n>          (set the row's incarnation)\n"
                 "       %s <image> <row> --mode <n>         (set the advertised file_lock_mode: 1 on, 2 off)\n"
-                "       %s <image> <row> --copy-from <src>  (make this row a copy of row <src>)\n",
-                argv[0], argv[0], argv[0], argv[0], argv[0], argv[0], argv[0], argv[0], argv[0], argv[0], argv[0], argv[0]);
+                "       %s <image> <row> --copy-from <src>  (make this row a copy of row <src>)\n"
+                "       %s <image> <row> --flip-free        (state reads FREE, checksum left as it was)\n",
+                argv[0], argv[0], argv[0], argv[0], argv[0], argv[0], argv[0], argv[0], argv[0], argv[0], argv[0], argv[0],
+                argv[0]);
         return 2;
     }
 
@@ -188,6 +190,16 @@ int main(int argc, char **argv)
      * catch it -- the same discrimination argument as inode_block_poke's
      * `corrupt` mode. Restoring is any ordinary write of the row (every
      * other mode restamps a correct checksum). */
+    /* --flip-free: the state field reads FREE, nothing else changes and
+     * the checksum is not restamped -- one flipped field of a live row
+     * (audit 2026-11-15 BM-36). */
+    if (argc == 4 && strcmp(argv[3], "--flip-free") == 0) {
+        ne.state = cetrafs_cpu_to_le32(CETRAFS_NODE_STATE_FREE);
+        pwrite_all(fd, &ne, sizeof(ne), row_off);
+        close(fd);
+        printf("node_poke: row %u state -> FREE, checksum left\n", row);
+        return 0;
+    }
     if (argc == 4 && strcmp(argv[3], "--badsum") == 0) {
         ne.checksum = cetrafs_cpu_to_le64(cetrafs_le64(ne.checksum) ^ 0xFFFFFFFFu);
         pwrite_all(fd, &ne, sizeof(ne), row_off);
