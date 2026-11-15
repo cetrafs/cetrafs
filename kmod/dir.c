@@ -392,7 +392,7 @@ int cetrafs_dirent_block_init(struct super_block *sb, u64 lba, bool *keep)
         return -EIO;
     memset(bh->b_data, 0, CETRAFS_BLOCK_SIZE);
     cetrafs_dirent_block_stamp(bh);
-    cetrafs_bh_end_update(bh);
+    cetrafs_bh_end_update(sb, bh);
     ret = cetrafs_sync_new_buffer(sb, bh); /* on the device before its extent: a failure is the caller's */
     brelse(bh);
     return ret;
@@ -2890,7 +2890,7 @@ static struct dentry *cetrafs_mkdir_locked(struct mnt_idmap *idmap,
      * the journal costs four per block (payload, header, target,
      * consume) and on the real LUN a write is ~38 ms. */
     cetrafs_dirent_block_stamp(bh);
-    cetrafs_bh_end_update(bh);
+    cetrafs_bh_end_update(sb, bh);
     ret = cetrafs_sync_new_buffer(sb, bh); /* nothing names it yet: a full thin pool is ENOSPC */
     brelse(bh);
     if (ret) {

@@ -237,7 +237,7 @@ fail:
 }
 
 /*
- * Claim a cached buffer for modification; cetrafs_bh_end_update()
+ * Claim a cached buffer for modification; cetrafs_bh_end_update(sb, )
  * publishes the result. Only the buffer LOCK excludes both hazards:
  *
  *  1. The forced-fresh readers above clear uptodate and re-read into the
@@ -337,13 +337,43 @@ void cetrafs_bh_read_unlock(struct buffer_head *bh)
     unlock_buffer(bh);
 }
 
-/* Publish a buffer modified under cetrafs_bh_begin_update(): it is a
- * complete, correctly-checksummed image from here on. */
-void cetrafs_bh_end_update(struct buffer_head *bh)
+/* The pre-A-15 publish: dirty, for the block layer's writeback. Only the
+ * fallbacks below and TEST ONLY meta_writeback use it. */
+static void cetrafs_bh_end_update_dirty(struct buffer_head *bh)
 {
     cetrafs_blk_tail_settle(bh); /* dirty means writeback may write it: never with a stale tail */
     mark_buffer_dirty(bh);
     unlock_buffer(bh);
+}
+
+/* TEST ONLY: in-place metadata updates are left dirty for writeback, as
+ * before A-15's second half (tests/kernel/fence_writeback_meta.sh). */
+static bool cetrafs_meta_writeback;
+cetrafs_test_param(meta_writeback, cetrafs_meta_writeback, bool, 0644);
+MODULE_PARM_DESC(meta_writeback, "TEST ONLY: in-place metadata updates are left dirty for writeback (before A-15)");
+
+/*
+ * Publish a buffer modified under cetrafs_bh_begin_update(): it is a
+ * complete, correctly-checksummed image from here on.
+ *
+ * HELD, not dirtied, as the allocation bitmaps are
+ * (cetrafs_bh_end_update_held()): only cetrafs writes it -- the caller's
+ * own gated write (cetrafs_sync_buffer(), cetrafs_write_pending_buffer()),
+ * or the held flush at a heartbeat tick, sync_fs or unmount, each of
+ * which refuses on a fenced mount. Dirty, it was the block layer's to
+ * write too: a node frozen between this and its write -- or fenced
+ * there, whose refused write left it dirty until the queued sweep ran --
+ * had the flusher put the image on the device after its lease was gone,
+ * over whatever a peer had written there since (audit 2026-11-15 A-15).
+ */
+void cetrafs_bh_end_update(struct super_block *sb, struct buffer_head *bh)
+{
+    if (READ_ONCE(cetrafs_meta_writeback)) {
+        cetrafs_bh_end_update_dirty(bh); /* test-only; see the parameter */
+        return;
+    }
+    cetrafs_blk_tail_settle(bh); /* held is written as it stands: never with a stale tail */
+    cetrafs_bh_end_update_held(sb, bh, true);
 }
 
 /*
@@ -389,7 +419,7 @@ void cetrafs_bh_end_update_held(struct super_block *sb, struct buffer_head *bh, 
         return;
     }
     if (READ_ONCE(cetrafs_bitmap_writeback) || !xa) {
-        cetrafs_bh_end_update(bh); /* test-only (or no sb_info): dirty, as before */
+        cetrafs_bh_end_update_dirty(bh); /* test-only (or no sb_info): dirty, as before */
         return;
     }
     if (!test_set_buffer_cetra_held(bh)) {
@@ -400,7 +430,7 @@ void cetrafs_bh_end_update_held(struct super_block *sb, struct buffer_head *bh, 
              * write it, which is the old exposure, not a lost bit. */
             clear_buffer_cetra_held(bh);
             put_bh(bh);
-            cetrafs_bh_end_update(bh);
+            cetrafs_bh_end_update_dirty(bh);
             return;
         }
         if (old)
@@ -724,6 +754,59 @@ static int __cetrafs_keep_wait(struct buffer_head *bh, bool was_dirty, bool was_
         return -EIO;
     }
     return 0;
+}
+
+#if LINUX_VERSION_CODE >= KERNEL_VERSION(7, 2, 0)
+static void cetrafs_end_write_pending(struct bio *bio)
+{
+    struct buffer_head *bh;
+
+    if (bio_endio_bh(bio, &bh)) {
+        set_buffer_uptodate(bh);
+    } else {
+        set_buffer_write_io_error(bh);
+        clear_buffer_uptodate(bh);
+    }
+    unlock_buffer(bh);
+}
+#else
+static void cetrafs_end_write_pending(struct buffer_head *bh, int uptodate)
+{
+    if (uptodate) {
+        set_buffer_uptodate(bh);
+    } else {
+        set_buffer_write_io_error(bh);
+        clear_buffer_uptodate(bh);
+    }
+    unlock_buffer(bh);
+    put_bh(bh);
+}
+#endif
+
+/*
+ * write_dirty_buffer() for a buffer published by cetrafs_bh_end_update(sb, ):
+ * held or dirty, it is submitted (no wait -- the caller waits, as it did
+ * for write_dirty_buffer(), and judges uptodate); neither, nothing is.
+ * Ends as end_buffer_write_sync() leaves a buffer.
+ */
+void cetrafs_write_pending_buffer(struct buffer_head *bh, unsigned int op_flags)
+{
+    bool dirty, held;
+
+    lock_buffer(bh);
+    dirty = test_clear_buffer_dirty(bh);
+    held = test_clear_buffer_cetra_held(bh);
+    if (!dirty && !held) {
+        unlock_buffer(bh);
+        return;
+    }
+#if LINUX_VERSION_CODE >= KERNEL_VERSION(7, 2, 0)
+    bh_submit(bh, REQ_OP_WRITE | op_flags, cetrafs_end_write_pending);
+#else
+    get_bh(bh);
+    bh->b_end_io = cetrafs_end_write_pending;
+    submit_bh(REQ_OP_WRITE | op_flags, bh);
+#endif
 }
 
 static int __cetrafs_sync_buffer_keep(struct buffer_head *bh)
@@ -1417,8 +1500,8 @@ void cetrafs_bh_abort_update(struct buffer_head *bh)
  *
  * sb_getblk() allocates the buffer without reading it, and
  * cetrafs_bh_begin_update() marks it uptodate -- honest only because the
- * caller overwrites every byte before cetrafs_bh_end_update() publishes
- * it. Returns the buffer LOCKED: exactly one of cetrafs_bh_end_update()
+ * caller overwrites every byte before cetrafs_bh_end_update(sb, ) publishes
+ * it. Returns the buffer LOCKED: exactly one of cetrafs_bh_end_update(sb, )
  * / cetrafs_bh_abort_update() must follow on every path, as for
  * begin_update itself.
  *

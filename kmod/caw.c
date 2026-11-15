@@ -269,7 +269,7 @@ static int cetrafs_cas_verify_read(struct super_block *sb, u64 fs_lba, u8 *out)
         if (bh) {
             if (buffer_uptodate(bh)) {
                 cetrafs_bh_begin_update(bh); /* no change: only dirtied, by the protocol */
-                cetrafs_bh_end_update(bh);
+                cetrafs_bh_end_update(sb, bh);
             }
             brelse(bh);
         }
@@ -1138,7 +1138,7 @@ static int cetrafs_cas_nocaw(struct super_block *sb,
      * and re-read the block straight over these bytes. */
     cetrafs_bh_begin_update(bh);
     memcpy(bh->b_data + off, new, region);
-    cetrafs_bh_end_update(bh);
+    cetrafs_bh_end_update(sb, bh);
     /* The swap is only done if it reached the device: a failed sync
      * leaves the buffer clean and !uptodate, the new image is gone, and
      * reporting success there told a namespace-lock acquire, an inode
@@ -1248,7 +1248,7 @@ static void cetrafs_cas_test_dirty(struct super_block *sb, u64 fs_lba)
         return;
     if (buffer_uptodate(bh)) {
         cetrafs_bh_begin_update(bh); /* no change: only dirtied, by the protocol */
-        cetrafs_bh_end_update(bh);
+        cetrafs_bh_end_update(sb, bh);
     }
     brelse(bh);
 }
@@ -2169,7 +2169,7 @@ void cetrafs_cas_selftest(struct super_block *sb, u32 my_node_id)
              * past the cache: applied once, and not undone. */
             bh = sb_find_get_block(sb, lba);
             if (bh) {
-                if (buffer_dirty(bh))
+                if (cetrafs_bh_pending(bh))
                     (void) cetrafs_sync_buffer(sb, bh); /* the device read below is the check */
                 brelse(bh);
             }
@@ -2208,7 +2208,7 @@ void cetrafs_cas_selftest(struct super_block *sb, u32 my_node_id)
             WRITE_ONCE(cetrafs_cas_dirty_after_flush_once, true);
             ret = cetrafs_cas_record(sb, lba, cetrafs_cas_selftest_set, &val);
             WRITE_ONCE(cetrafs_cas_dirty_after_flush_once, false);
-            if (buffer_dirty(bh))
+            if (cetrafs_bh_pending(bh))
                 (void) cetrafs_sync_buffer(sb, bh); /* the device read below is the check */
             brelse(bh);
             if (ret) {

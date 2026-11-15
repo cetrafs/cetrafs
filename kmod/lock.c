@@ -2063,7 +2063,7 @@ static int cetrafs_tree_resv_provision(struct super_block *sb, u64 lba)
     if (!bh)
         return -EIO;
     memset(bh->b_data, 0, CETRAFS_BLOCK_SIZE);
-    cetrafs_bh_end_update(bh);
+    cetrafs_bh_end_update(sb, bh);
     ret = cetrafs_sync_new_buffer(sb, bh);
     brelse(bh);
     return ret;
@@ -2132,7 +2132,7 @@ int cetrafs_tree_resv_fill(struct inode *inode)
                 break;
             }
             memset(bh->b_data, 0, CETRAFS_BLOCK_SIZE);
-            cetrafs_bh_end_update(bh);
+            cetrafs_bh_end_update(sb, bh);
             bhs[n++] = bh;
         }
         if (n) {

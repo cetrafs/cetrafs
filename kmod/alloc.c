@@ -75,7 +75,7 @@ MODULE_PARM_DESC(noop_free_dirties, "TEST ONLY: a no-op free dirties the bitmap 
 static void cetrafs_bmap_end_update(struct super_block *sb, struct buffer_head *bh, bool changed)
 {
     if (READ_ONCE(cetrafs_noop_free_dirties)) {
-        cetrafs_bh_end_update(bh); /* test-only: dirty, whatever changed */
+        cetrafs_bh_end_update(sb, bh); /* test-only: dirty, whatever changed */
         return;
     }
     cetrafs_bh_end_update_held(sb, bh, changed);
@@ -5412,7 +5412,7 @@ static int __cetrafs_bg_claim_one(struct super_block *sb, u32 zg_id, u32 b, bool
          * enforces the protocol and caught exactly that here. */
         cetrafs_bh_begin_update(wbh);
         cetrafs_bg_claim_mutate(wbh->b_data, CETRAFS_BLOCK_SIZE, &ctx);
-        cetrafs_bh_end_update(wbh);
+        cetrafs_bh_end_update(sb, wbh);
         (void) cetrafs_sync_buffer(sb, wbh); /* test-only path */
         brelse(wbh);
         ret = 0;

@@ -77,7 +77,10 @@ log "$out"
 # Captured, then matched: `dmesg_since | grep -q` under pipefail reports
 # the producer's SIGPIPE as a miss (tests/README.md).
 klog="$(dmesg_since "$MARK")"
-if grep -q "logical block $BLK," <<<"$klog"; then
+# The block layer logs a buffer-layer write's failure; cetrafs's own
+# write (the only one since in-place updates are held, not dirtied --
+# A-15) is named by its stop.
+if grep -qE "logical block $BLK,|refused a metadata write \(an inode record, block $BLK," <<<"$klog"; then
     pass "a write to ino $T's record block hit the injected error"
 else
     fail "no I/O error was logged for block $BLK -- the fault never fired (setup did not arrange the situation)"
@@ -134,10 +137,11 @@ PY2
 dm_set "$LINEAR"
 log "creates that reported success: ${claimed:-none}"
 klog="$(dmesg_since "$MARK2")"
-if grep -q "logical block $DBLK," <<<"$klog"; then
+if grep -qE "logical block $DBLK,|refused a metadata write \(an inode record, block $DBLK," <<<"$klog"; then
     pass "a write to directory ino $D's record block hit the injected error"
 else
     fail "no I/O error was logged for block $DBLK -- the fault never fired"
+    tail -8 <<<"$klog" >&2
 fi
 
 umount "$MNT" || umount -l "$MNT" # stopped by the first refused write, like the first case

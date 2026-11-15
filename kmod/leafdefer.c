@@ -190,7 +190,7 @@ int cetrafs_bh_defer_update(struct inode *inode, struct buffer_head *bh, u32 pre
      * would not be the device's, and the replay guard recorded from it
      * would refuse a torn target's redo. Say so; the boundary still
      * writes it. */
-    WARN_ON_ONCE(buffer_dirty(bh));
+    WARN_ON_ONCE(buffer_dirty(bh) || buffer_cetra_held(bh)); /* held: written by the next tick, ahead of its journal */
     /* Cannot fail: a block not listed would have to be written now, and
      * a leaf written ahead of its index is the ordering this exists to
      * keep (cetrafs_convert_source_durable()). 24 bytes. */

@@ -243,7 +243,7 @@ static int cetrafs_sync_fs(struct super_block *sb, int wait)
             if (tbh) {
                 cetrafs_bh_begin_update(tbh);
                 memset(tbh->b_data, 0xd7, 64);
-                cetrafs_bh_end_update(tbh); /* left dirty for writeback: the point of the knob */
+                cetrafs_bh_end_update(sb, tbh); /* left dirty for writeback: the point of the knob */
                 brelse(tbh);
             }
             /* ...and the lease runs out now, after the flushes */

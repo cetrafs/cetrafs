@@ -862,7 +862,7 @@ int cetrafs_journal_attach_node(struct super_block *sb, u32 node_id)
  *
  * Both halves are load-bearing, and the previous contract -- "the caller
  * must not have marked the buffer dirty yet" -- was violated by all
- * eleven call sites, every one of which called cetrafs_bh_end_update()
+ * eleven call sites, every one of which called cetrafs_bh_end_update(sb, )
  * (which marks it dirty) immediately before. That defeats write-ahead
  * logging: a dirty buffer can be flushed by ordinary background
  * writeback at any moment, so the target block could reach the device
@@ -993,7 +993,7 @@ static int cetrafs_journal_zero_header(struct super_block *sb, u64 header_lba)
     if (!jbh)
         return -EIO;
     memset(jbh->b_data, 0, CETRAFS_BLOCK_SIZE);
-    cetrafs_bh_end_update(jbh);
+    cetrafs_bh_end_update(sb, jbh);
     ret = cetrafs_sync_buffer(sb, jbh);
     brelse(jbh);
     return ret;
@@ -1245,7 +1245,7 @@ static int cetrafs_journal_write_block_flags(struct super_block *sb, struct buff
             goto journal_failed;
         cetrafs_blk_tail_settle(bh); /* a held-back block's last edit, if it left the tail stale */
         memcpy(pbh->b_data, bh->b_data, CETRAFS_BLOCK_SIZE);
-        cetrafs_bh_end_update(pbh);
+        cetrafs_bh_end_update(sb, pbh);
 
         hbh = cetrafs_getblk_overwrite(sb, header_lba);
         if (!hbh) {
@@ -1259,7 +1259,7 @@ static int cetrafs_journal_write_block_flags(struct super_block *sb, struct buff
          * the payload block and cannot change meanwhile: it is locked. */
         cetrafs_journal_stamp_header(j, hbh, flags, txn_id, bh->b_blocknr, prev_crc,
                                      ~crc32c(~0U, bh->b_data, CETRAFS_BLOCK_SIZE), owner);
-        cetrafs_bh_end_update(hbh);
+        cetrafs_bh_end_update(sb, hbh);
 
         {
             struct blk_plug plug;
@@ -1267,8 +1267,8 @@ static int cetrafs_journal_write_block_flags(struct super_block *sb, struct buff
 
             /* PERF(9): both out together, one wait -- docs/PERFORMANCE.md */
             blk_start_plug(&plug);
-            write_dirty_buffer(pbh, REQ_SYNC);
-            write_dirty_buffer(hbh, REQ_SYNC);
+            cetrafs_write_pending_buffer(pbh, REQ_SYNC);
+            cetrafs_write_pending_buffer(hbh, REQ_SYNC);
             blk_finish_plug(&plug);
 
             wait_on_buffer(pbh);
@@ -1351,7 +1351,7 @@ static int cetrafs_journal_write_block_flags(struct super_block *sb, struct buff
         return -EIO;
     }
 
-    cetrafs_bh_end_update(bh);
+    cetrafs_bh_end_update(sb, bh);
     {
         /*
          * CHECK it. "The target is durable" below was asserted, never
@@ -1589,8 +1589,8 @@ static void cetrafs_journal_drain_locked(struct super_block *sb, struct cetrafs_
             if (!hb[i])
                 continue;
             memset(hb[i]->b_data, 0, CETRAFS_BLOCK_SIZE);
-            cetrafs_bh_end_update(hb[i]);
-            write_dirty_buffer(hb[i], REQ_SYNC);
+            cetrafs_bh_end_update(sb, hb[i]);
+            cetrafs_write_pending_buffer(hb[i], REQ_SYNC);
         }
         blk_finish_plug(&plug);
         for (i = 0; i < m; i++) {
@@ -1742,22 +1742,22 @@ static int cetrafs_journal_batch_chunk(struct super_block *sb, struct cetrafs_jo
         }
         cetrafs_bh_copy_settled(bhs[i], pb[i]->b_data);
         pcrc = ~crc32c(~0U, pb[i]->b_data, CETRAFS_BLOCK_SIZE);
-        cetrafs_bh_end_update(pb[i]);
+        cetrafs_bh_end_update(sb, pb[i]);
 
         /* prev: the DEVICE's image, recorded when the block was first held
          * back -- not the in-core one before the last edit, which never
          * reached the device and which a replay would never find. */
         cetrafs_journal_stamp_header(j, hb[i], CETRAFS_JRNL_F_GUARDED, txn[i], bhs[i]->b_blocknr, disk_crc[i], pcrc,
                                      owners[i]);
-        cetrafs_bh_end_update(hb[i]);
+        cetrafs_bh_end_update(sb, hb[i]);
     }
     if (ok) {
         struct blk_plug plug;
 
         blk_start_plug(&plug);
         for (i = 0; i < k; i++) {
-            write_dirty_buffer(pb[i], REQ_SYNC);
-            write_dirty_buffer(hb[i], REQ_SYNC);
+            cetrafs_write_pending_buffer(pb[i], REQ_SYNC);
+            cetrafs_write_pending_buffer(hb[i], REQ_SYNC);
         }
         blk_finish_plug(&plug);
     }
@@ -2200,7 +2200,7 @@ int cetrafs_journal_write_new_block(struct super_block *sb, struct buffer_head *
         return -EIO;
     }
 
-    cetrafs_bh_end_update(bh);
+    cetrafs_bh_end_update(sb, bh);
     /* The result from the write itself, never from BH_Uptodate -- a
      * forced-fresh reader may clear that concurrently (ioutil.c). A
      * definite ENOSPC is the operation's, not the mount's: nothing
@@ -3209,7 +3209,7 @@ static int __cetrafs_journal_replay_node(struct super_block *sb, u32 node_id, bo
              * Every other writer in the tree goes through it. */
             cetrafs_bh_begin_update(tbh);
             memcpy(tbh->b_data, pbh->b_data, CETRAFS_BLOCK_SIZE);
-            cetrafs_bh_end_update(tbh);
+            cetrafs_bh_end_update(sb, tbh);
             werr = cetrafs_sync_buffer_refusable(sb, tbh);
             if (werr) {
                 /* Do NOT consume this entry and do NOT park the area
@@ -3278,7 +3278,7 @@ consume:
         } else {
             cetrafs_bh_begin_update(hbh);
             memset(hbh->b_data, 0, CETRAFS_BLOCK_SIZE);
-            cetrafs_bh_end_update(hbh);
+            cetrafs_bh_end_update(sb, hbh);
             werr_consume = cetrafs_sync_buffer_refusable(sb, hbh);
         }
         brelse(hbh);

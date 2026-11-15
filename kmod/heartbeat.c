@@ -165,7 +165,7 @@ static void cetrafs_test_damage_ns(struct super_block *sb, u64 ino)
     }
     cetrafs_bh_begin_update(bh);
     bh->b_data[offsetof(cetrafs_inode_t, ns_checksum)] ^= 0x01;
-    cetrafs_bh_end_update(bh);
+    cetrafs_bh_end_update(sb, bh);
     if (cetrafs_sync_buffer(sb, bh))
         pr_warn("heartbeat: TEST: ino=%llu: the damaging write failed\n", (unsigned long long) ino);
     else

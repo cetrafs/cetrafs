@@ -761,7 +761,8 @@ u32 cetrafs_bh_begin_update_crc(struct buffer_head *bh);
 /* begin_update on a block claimed WITHOUT reading it: for a write that
  * replaces every byte. See ioutil.c. */
 struct buffer_head *cetrafs_getblk_overwrite(struct super_block *sb, sector_t block);
-void cetrafs_bh_end_update(struct buffer_head *bh);
+void cetrafs_bh_end_update(struct super_block *sb, struct buffer_head *bh);
+void cetrafs_write_pending_buffer(struct buffer_head *bh, unsigned int op_flags);
 void cetrafs_bh_read_lock(struct buffer_head *bh);
 void cetrafs_bh_read_unlock(struct buffer_head *bh);
 /* Synchronous write whose result is TRUE, unlike sync_dirty_buffer()'s

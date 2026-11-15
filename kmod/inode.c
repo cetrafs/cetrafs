@@ -594,7 +594,7 @@ void cetrafs_invalidate_raw_inode(struct super_block *sb, u64 ino)
      */
     bh = sb_find_get_block(sb, blk);
     if (bh) {
-        if (buffer_dirty(bh)) {
+        if (buffer_dirty(bh) || buffer_cetra_held(bh)) { /* held: cetrafs_bh_end_update() */
             /* DEBUG: a dirty record buffer here means the sync below
              * PUBLISHES this node's cached record image -- over
              * whatever a peer's CAS put on the device since. Who
@@ -1448,6 +1448,17 @@ int cetrafs_write_raw_inode_fd_planned(struct super_block *sb, u64 ino, const ce
     return __cetrafs_write_raw_inode_fd(sb, ino, src, self, &plan_seq);
 }
 
+/* TEST ONLY, one-shot: the next record write of inode
+ * record_publish_stall_ino (0: of any inode) waits this long between
+ * publishing its image to the cache and writing it -- the window a node
+ * frozen there resumes in (tests/kernel/fence_writeback_meta.sh). */
+static unsigned int cetrafs_record_publish_stall_ms;
+cetrafs_test_param(record_publish_stall_ms, cetrafs_record_publish_stall_ms, uint, 0644);
+MODULE_PARM_DESC(record_publish_stall_ms, "TEST ONLY: stall a record write between its cache publish and its write");
+static unsigned long long cetrafs_record_publish_stall_ino;
+cetrafs_test_param(record_publish_stall_ino, cetrafs_record_publish_stall_ino, ullong, 0644);
+MODULE_PARM_DESC(record_publish_stall_ino, "TEST ONLY: the inode record_publish_stall_ms applies to (0: any)");
+
 static int __cetrafs_write_raw_inode(struct super_block *sb, u64 ino, const cetrafs_inode_t *in, bool sync)
 {
     if (S_ISDIR(cetrafs_le32(in->mode)))
@@ -1522,7 +1533,7 @@ static int __cetrafs_write_raw_inode(struct super_block *sb, u64 ino, const cetr
         return -EIO;
     }
 
-    /* The helpers, not a hand-rolled equivalent: cetrafs_bh_end_update()
+    /* The helpers, not a hand-rolled equivalent: cetrafs_bh_end_update(sb, )
      * marks the buffer dirty BEFORE unlocking it, and that order is the
      * whole point. Dirtying after the unlock leaves a window in which
      * the buffer is uptodate, clean, and holding an image that exists
@@ -1536,10 +1547,20 @@ static int __cetrafs_write_raw_inode(struct super_block *sb, u64 ino, const cetr
     cetrafs_bh_begin_update(bh);
     memcpy(bh->b_data, &stamped, sizeof(stamped));
     memset(bh->b_data + sizeof(stamped), 0, CETRAFS_BLOCK_SIZE - sizeof(stamped));
-    cetrafs_bh_end_update(bh);
+    cetrafs_bh_end_update(sb, bh);
     /* A forced-fresh read returns this buffer from here on (a dirty one
      * is never dropped): the record's epoch moves now. */
     cetrafs_rec_epoch_bump(sb, bh->b_blocknr);
+    if (unlikely(READ_ONCE(cetrafs_record_publish_stall_ms)) &&
+        (!READ_ONCE(cetrafs_record_publish_stall_ino) || ino == READ_ONCE(cetrafs_record_publish_stall_ino))) {
+        unsigned int t = xchg(&cetrafs_record_publish_stall_ms, 0); /* test-only, one-shot; see the parameter */
+
+        if (t) {
+            pr_info("TEST: record write of ino %llu stalled %u ms after its cache publish\n",
+                    (unsigned long long) ino, t);
+            msleep(t);
+        }
+    }
     if (sync) {
         cetrafs_record_write_counted();
         /* The result IS the answer this function exists to give. A

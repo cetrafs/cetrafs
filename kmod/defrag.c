@@ -1258,15 +1258,15 @@ int cetrafs_defrag_inode(struct inode *inode, struct cetrafs_defrag_stats *out_s
                     ret = -EIO;
                     break;
                 }
-                /* Via the helpers: cetrafs_bh_end_update() dirties before
+                /* Via the helpers: cetrafs_bh_end_update(sb, ) dirties before
                  * unlocking, closing the window in which a forced-fresh
                  * reader could take the lock on a clean, uptodate buffer
                  * and re-read the destination's OLD content over the
                  * copy we just made. */
                 cetrafs_bh_begin_update(dbh);
                 memcpy(dbh->b_data, copy_src[i]->b_data, CETRAFS_BLOCK_SIZE);
-                cetrafs_bh_end_update(dbh);
-                write_dirty_buffer(dbh, REQ_SYNC);
+                cetrafs_bh_end_update(sb, dbh);
+                cetrafs_write_pending_buffer(dbh, REQ_SYNC);
             }
             blk_finish_plug(&plug);
             for (i = 0; i < nb; i++) {
