@@ -732,6 +732,9 @@ struct cetrafs_sb_info {
      * (tests/kernel/zg_steal_victim_fences.sh). Nothing here re-reads
      * the ZG record: that would be a device round trip per block. */
     DECLARE_BITMAP(owned_zgs, CETRAFS_MAX_ZONE_GROUPS);
+    /* Zone Group records found unreadable (cetrafs_sb_zg_note_unreadable()):
+     * reported once each, then left out of every claim. */
+    DECLARE_BITMAP(zg_unreadable, CETRAFS_MAX_ZONE_GROUPS);
     /* Zone Groups a free found full under a dead owner: the heartbeat
      * adopts them (cetrafs_zg_adopt_wanted()), never the freeing thread,
      * which may hold inode_lock/invalidate_lock or run from reclaim. */
@@ -6326,6 +6329,22 @@ void cetrafs_sb_uncache_zg_ownership(struct super_block *sb, u32 zg_id)
  * the reason this exists: it used to call cetrafs_read_zg() (always a
  * forced-uncached, real device round trip) for every ZG on every single
  * new block a write needed. */
+/* A Zone Group record failed its checksum on every read: true the first
+ * time for 'zg_id', so it is reported once per mount, not per tick. */
+bool cetrafs_sb_zg_note_unreadable(struct super_block *sb, u32 zg_id)
+{
+    struct cetrafs_sb_info *sbi = sb->s_fs_info;
+
+    return sbi && zg_id < CETRAFS_MAX_ZONE_GROUPS && !test_and_set_bit(zg_id, sbi->zg_unreadable);
+}
+
+u32 cetrafs_sb_zg_unreadable_count(struct super_block *sb)
+{
+    struct cetrafs_sb_info *sbi = sb->s_fs_info;
+
+    return sbi ? bitmap_weight(sbi->zg_unreadable, CETRAFS_MAX_ZONE_GROUPS) : 0;
+}
+
 bool cetrafs_sb_zg_owned_cached(struct super_block *sb, u32 zg_id)
 {
     struct cetrafs_sb_info *sbi = sb->s_fs_info;

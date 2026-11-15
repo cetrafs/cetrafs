@@ -361,6 +361,8 @@ static int cetrafs_statfs(struct dentry *dentry, struct kstatfs *stat)
 
             ret = first ? cetrafs_zg_get_info_prefetched(sb, zg_id, &zi) : cetrafs_zg_get_info(sb, zg_id, &zi);
             first = false;
+            if (ret == -EUCLEAN && !READ_ONCE(cetrafs_zg_unreadable_fatal))
+                break; /* a damaged record: a group nobody can claim counts no free space (B-14) */
             if (ret) {
                 kfree(gens);
                 return ret;
@@ -368,6 +370,10 @@ static int cetrafs_statfs(struct dentry *dentry, struct kstatfs *stat)
             if (cetrafs_sb_zg_free_settle(sb, zg_id, gen, (s64) zi.free_data_blocks, &zfree))
                 break;
             cond_resched();
+        }
+        if (ret == -EUCLEAN) {
+            ret = 0;
+            continue;
         }
         free_blocks += zfree > 0 ? (u64) zfree : 0;
         /* What this node can allocate: its own Zone Groups and the ones

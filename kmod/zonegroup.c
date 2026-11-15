@@ -243,9 +243,36 @@ static int __cetrafs_read_zg(struct super_block *sb, u32 zg_id, cetrafs_zone_gro
         }
     }
 
-    pr_err("ZG %u failed its checksum repeatedly -- corrupted, not just a torn concurrent read\n", zg_id);
-    cetrafs_sb_corrupt(sb, 0);
+    /*
+     * Damaged, not torn. A record this node owns is its own metadata and
+     * stays the corruption it always was. Any other is a group nobody
+     * can claim until fsck rebuilds it -- and nothing more: failing every
+     * mount, read-only ones included, and every tick of a node that owns
+     * no group, over one record of a group it does not use (audit
+     * 2026-11-15 B-14) took the whole volume down for one sector. Each
+     * caller leaves it out; reported once.
+     */
+    if (cetrafs_sb_zg_owned_cached(sb, zg_id) || READ_ONCE(cetrafs_zg_unreadable_fatal)) {
+        pr_err("ZG %u failed its checksum repeatedly -- corrupted, not just a torn concurrent read\n", zg_id);
+        cetrafs_sb_corrupt(sb, 0);
+    } else if (cetrafs_sb_zg_note_unreadable(sb, zg_id)) {
+        pr_err("ZG %u: its record failed its checksum repeatedly -- damaged; this node leaves the group alone "
+               "(no claim, no release) until `fsck.cetra -r` rebuilds it\n",
+               zg_id);
+    }
     return -EUCLEAN;
+}
+
+/* TEST ONLY: an unreadable Zone Group record fails the mount, the tick
+ * and statfs, as before B-14 (tests/kernel/zg_record_damaged.sh). */
+bool cetrafs_zg_unreadable_fatal;
+cetrafs_test_param(zg_unreadable_fatal, cetrafs_zg_unreadable_fatal, bool, 0644);
+MODULE_PARM_DESC(zg_unreadable_fatal, "TEST ONLY: an unreadable Zone Group record fails whoever reads it");
+
+/* An unreadable record (above) is left out of a sweep, not its end. */
+static inline bool cetrafs_zg_skip_unreadable(int ret)
+{
+    return ret == -EUCLEAN && !READ_ONCE(cetrafs_zg_unreadable_fatal);
 }
 
 /* No whole-record ZG writer remains at runtime: ownership
@@ -1453,6 +1480,8 @@ static int cetrafs_zg_claim_one_more_locked(struct super_block *sb, u32 count, u
         bool stale;
 
         ret = prefetched ? cetrafs_zg_get_info_prefetched(sb, z, &info) : cetrafs_zg_get_info(sb, z, &info);
+        if (cetrafs_zg_skip_unreadable(ret))
+            continue; /* damaged: nobody's to claim */
         if (ret)
             return ret;
 
@@ -1684,6 +1713,8 @@ int cetrafs_zg_claim_unowned(struct super_block *sb,
         }
 
         ret = cetrafs_read_zg(sb, z, zg);
+        if (cetrafs_zg_skip_unreadable(ret))
+            continue; /* damaged: whoever owned it, nobody claims it now */
         if (ret)
             goto out;
 
@@ -1693,6 +1724,8 @@ int cetrafs_zg_claim_unowned(struct super_block *sb,
         owned++;
 
         ret = cetrafs_zg_try_claim_one(sb, z, my_node_id, at_mount, /*may_wait=*/true, &did_claim);
+        if (cetrafs_zg_skip_unreadable(ret))
+            continue; /* damaged: left alone */
         if (ret)
             goto out;
         /* did_claim is always false here (already ours); replay already
@@ -2069,6 +2102,8 @@ static int cetrafs_zg_release_surplus_locked(struct super_block *sb, u32 my_node
             continue;
 
         ret = cetrafs_zg_try_release_one(sb, z, my_node_id, &did_release);
+        if (cetrafs_zg_skip_unreadable(ret))
+            continue;
         if (ret)
             return ret;
 
@@ -2118,6 +2153,10 @@ int cetrafs_zg_release_all_rdonly(struct super_block *sb, u32 my_node_id)
         struct cetrafs_zg_cas_ctx ctx = {.my_node_id = my_node_id, .claim = false};
 
         ret = cetrafs_read_zg(sb, z, zg);
+        if (cetrafs_zg_skip_unreadable(ret)) {
+            ret = 0;
+            continue;
+        }
         if (ret)
             break;
         if (le16_to_cpu(zg->owner_node_id) != (u16) my_node_id)
