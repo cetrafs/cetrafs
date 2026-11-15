@@ -4439,6 +4439,12 @@ static u32 cetrafs_tree_max_extents(void)
     return (u32) min_t(u64, cap, U32_MAX);
 }
 
+/* TEST ONLY: depth-2 rebuilds pack every leaf full, as before G-3's slack
+ * (tests/kernel/rebuild_leaf_slack.sh). */
+static bool cetrafs_tree_build_full;
+cetrafs_test_param(tree_build_full, cetrafs_tree_build_full, bool, 0644);
+MODULE_PARM_DESC(tree_build_full, "TEST ONLY: tree rebuilds pack every leaf full (no slack)");
+
 int cetrafs_tree_build(struct inode *inode, const cetrafs_extent_t *flat, u32 n, cetrafs_inode_t *raw, u64 *out_meta)
 {
     /* The whole map is being rewritten. This is also the choke point
@@ -4448,7 +4454,7 @@ int cetrafs_tree_build(struct inode *inode, const cetrafs_extent_t *flat, u32 n,
     cetrafs_inode_ext_cache_drop(inode);
 
     struct super_block *sb = inode->i_sb;
-    u32 nleaves, ninter, bg, i, j, off;
+    u32 nleaves, ninter, bg, i, j, off, leaf_fill;
     u64 *blk = NULL; /* [0..nleaves) leaves, [nleaves..) interiors */
     u32 allocated = 0, total;
     int ret;
@@ -4497,7 +4503,27 @@ int cetrafs_tree_build(struct inode *inode, const cetrafs_extent_t *flat, u32 n,
         }
     }
 
-    /* depth 2 */
+    /*
+     * depth 2. Leaves are filled to three quarters, not to the brim: a
+     * convert that splits an extent inside a FULL leaf shrinks it there
+     * and appends the rest to the tree's last leaf, so a rebuild that
+     * packed every leaf full turned the next scatter of first writes
+     * into a split per write (audit 2026-11-15 G-3). The slack goes
+     * only as far as the tree's capacity allows: a map too large for
+     * three-quarter leaves gets the fill it needs to fit.
+     */
+    {
+        u32 fill = CETRAFS_EXT_BLOCK_MAX_LEAVES;
+
+        if (!READ_ONCE(cetrafs_tree_build_full)) {
+            u32 cap_leaves = (u32) ARRAY_SIZE(raw->et.idx) * CETRAFS_EXT_BLOCK_MAX_IDX;
+
+            fill = max_t(u32, CETRAFS_EXT_BLOCK_MAX_LEAVES * 3 / 4, (u32) CETRAFS_DIV_ROUND_UP(n, cap_leaves));
+            fill = min_t(u32, fill, CETRAFS_EXT_BLOCK_MAX_LEAVES);
+        }
+        leaf_fill = fill;
+        nleaves = (u32) CETRAFS_DIV_ROUND_UP(n, fill);
+    }
     ninter = (u32) CETRAFS_DIV_ROUND_UP(nleaves, CETRAFS_EXT_BLOCK_MAX_IDX);
     if (ninter > ARRAY_SIZE(raw->et.idx))
         return -ENOSPC;
@@ -4516,7 +4542,7 @@ int cetrafs_tree_build(struct inode *inode, const cetrafs_extent_t *flat, u32 n,
     /* write leaves */
     off = 0;
     for (i = 0; i < nleaves; i++) {
-        u32 cnt = min_t(u32, n - off, CETRAFS_EXT_BLOCK_MAX_LEAVES);
+        u32 cnt = min_t(u32, n - off, leaf_fill);
 
         ret = cetrafs_write_new_leaf(sb, blk[i], flat + off, (u16) cnt);
         if (ret)
@@ -4538,10 +4564,10 @@ int cetrafs_tree_build(struct inode *inode, const cetrafs_extent_t *flat, u32 n,
             }
             for (j = 0; j < cnt; j++) {
                 u32 lf = leaf0 + j;
-                u32 fe = lf * CETRAFS_EXT_BLOCK_MAX_LEAVES; /* first extent in that leaf */
+                u32 fe = lf * leaf_fill; /* first extent in that leaf */
 
                 {
-                    u32 cnt_in_leaf = min_t(u32, n - fe, CETRAFS_EXT_BLOCK_MAX_LEAVES);
+                    u32 cnt_in_leaf = min_t(u32, n - fe, leaf_fill);
                     u32 lo, hi;
 
                     cetrafs_leaf_array_range(flat + fe, (u16) cnt_in_leaf, &lo, &hi);
@@ -4617,6 +4643,15 @@ static int cetrafs_tree_append(struct inode *inode,
  * This is what keeps a full leaf from turning every later write into a
  * preallocation give-back.
  */
+/* Converts whose leaf had no room for the split: the piece went to the
+ * tree's last leaf instead (G-3: what a rebuild's slack saves). */
+static atomic64_t cetrafs_convert_spills = ATOMIC64_INIT(0);
+
+u64 cetrafs_convert_spill_count(void)
+{
+    return (u64) atomic64_read(&cetrafs_convert_spills);
+}
+
 static int cetrafs_tree_convert_append(struct inode *inode,
                                        cetrafs_inode_t *raw,
                                        u32 iblock,
@@ -4627,6 +4662,7 @@ static int cetrafs_tree_convert_append(struct inode *inode,
     u32 leaf_count = 0;
     int ret, tret = 0;
 
+    atomic64_inc(&cetrafs_convert_spills);
     cetrafs_tree_mark_convert_append(inode, true);
     ret = cetrafs_tree_append(inode, raw, iblock, lba, 1, /*uninit=*/false, &merged, &leaf_count);
     cetrafs_tree_mark_convert_append(inode, false);
