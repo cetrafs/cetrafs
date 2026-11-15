@@ -5000,6 +5000,12 @@ void cetrafs_sb_cas_unlock(struct super_block *sb)
     mutex_unlock(&sbi->cas_mutex);
 }
 
+/* TEST ONLY: errors=panic logs "would panic" on a fence, lease or
+ * device-gone stop instead of panicking (tests/kernel/errors_panic_stops.sh). */
+static bool cetrafs_panic_dry_run;
+cetrafs_test_param(panic_dry_run, cetrafs_panic_dry_run, bool, 0644);
+MODULE_PARM_DESC(panic_dry_run, "TEST ONLY: errors=panic on a fence/lease/device-gone stop logs instead of panicking");
+
 static const char *const cetrafs_stop_cause_names[] = {
     [CETRAFS_STOP_NONE] = "none",
     [CETRAFS_STOP_FENCED] = "fenced",
@@ -5062,6 +5068,23 @@ void cetrafs_sb_stop(struct super_block *sb, enum cetrafs_stop_cause cause, cons
                "longer renews, so peers recover this node's work as after a crash. Unmount, check the "
                "volume, and mount again.\n",
                sb->s_id, cetrafs_stop_cause_names[cause], reason);
+    /*
+     * errors=panic is the pairing for a node a watchdog reboots, and the
+     * stops a storage outage produces are exactly these three: a peer
+     * fenced us, our own lease ran out, the device went away. Stopping
+     * instead left the host up and "healthy" to the cluster manager with
+     * every guest in EIO, so HA never acted (audit 2026-11-14 A-5). A
+     * MANUAL stop was asked for and does not panic; ERROR and CORRUPTION
+     * panic before they get here (cetrafs_sb_fatal(), cetrafs_sb_corrupt()).
+     */
+    if (sbi->errors_panic &&
+        (cause == CETRAFS_STOP_FENCED || cause == CETRAFS_STOP_LEASE || cause == CETRAFS_STOP_DEVICE_GONE)) {
+        if (READ_ONCE(cetrafs_panic_dry_run))
+            pr_err("%s: errors=panic: would panic now (%s) -- panic_dry_run, test\n", sb->s_id,
+                   cetrafs_stop_cause_names[cause]);
+        else
+            panic("cetrafs %s: %s: %s (errors=panic)\n", sb->s_id, cetrafs_stop_cause_names[cause], reason);
+    }
     /* After the flag, so nothing re-dirties behind the sweep through an
      * entry point that already checks it. */
     schedule_work(&sbi->stop_work);
