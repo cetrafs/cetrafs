@@ -137,6 +137,17 @@ static cetrafs_superblock_t repair_sb;
  * (devutil.h): stop before another write. Every repair write asks
  * (pwrite_all()), not only the loops that beat -- whole write phases run
  * between beats. */
+/* TEST ONLY: the set-bit repair waits for every other fault, as before
+ * audit 2026-11-15 BM-67 (tests/kernel/fsck_setbit_when_blocked.sh). */
+static int fsck_setbit_gated(void)
+{
+    static int v = -1;
+
+    if (v < 0)
+        v = cetrafs_test_env("CETRAFS_TEST_FSCK_SETBIT_GATED") != NULL;
+    return v;
+}
+
 /* TEST ONLY: clear leaked blocks even when a directory block could not be
  * read (before audit 2026-11-15 BM-66; tests/image/fsck_leak_gate_partial.sh). */
 static int fsck_leak_ungated(void)
@@ -4065,8 +4076,14 @@ int main(int argc, char **argv)
                     /* A live extent names it, so the bit must be set:
                      * leaving it clear means the allocator hands the
                      * same block to a second file. */
-                    /* class 45: set -- marking a named block in use can only leak */
-                    if (repair_mode && !repair_blocked) {
+                    /* class 45: set -- marking a named block in use can only leak.
+                     * So it runs whatever else blocked repair: a fault
+                     * elsewhere -- a double allocation above all, whose
+                     * aftermath is exactly blocks named but marked free
+                     * -- left them to be handed out once more (audit
+                     * 2026-11-15 BM-67). Setting a bit never shares a
+                     * block; at worst it leaks one for a later run. */
+                    if (repair_mode && (!repair_blocked || !fsck_setbit_gated())) {
                         bmap[i / 8] |= (uint8_t) (1u << (i % 8));
                         bmap_dirty = 1;
                         marked = 1;
@@ -4137,8 +4154,12 @@ int main(int argc, char **argv)
                  * above, corrected), so there is exactly one right
                  * answer. Rewrite the descriptor with its checksum
                  * restamped the same way mkfs does. */
-                /* class 45: recount -- the count from the bitmap just walked */
-                if (repair_mode && !repair_blocked) {
+                /* class 45: recount -- the count from the bitmap just walked.
+                 * LOWERED even when repair is blocked: the bits set above
+                 * are counted out here, and a count too low only makes the
+                 * allocator look elsewhere (BM-67). Raised only when not. */
+                if (repair_mode &&
+                    (!repair_blocked || (really_free < bg_free_cached[b] && !fsck_setbit_gated()))) {
                     uint8_t blk[CETRAFS_BLOCK_SIZE] = {0};
                     cetrafs_block_group_t bgd;
 
