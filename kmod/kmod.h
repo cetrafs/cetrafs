@@ -389,6 +389,8 @@ void cetrafs_sb_set_auto_defrag_enabled(struct super_block *sb, bool on);
  * are the defaults. */
 unsigned int cetrafs_sb_hb_interval_secs(struct super_block *sb);
 unsigned int cetrafs_sb_stale_secs(struct super_block *sb);
+bool cetrafs_sb_half_landed_aged(struct super_block *sb, u64 ino, u32 ns_crc);
+void cetrafs_sb_half_landed_forget(struct super_block *sb, u64 ino);
 void cetrafs_sb_set_hb_interval_secs(struct super_block *sb, unsigned int v);
 void cetrafs_sb_set_stale_secs(struct super_block *sb, unsigned int v);
 const struct cetrafs_caw_info *cetrafs_sb_caw(struct super_block *sb);
@@ -867,6 +869,7 @@ struct inode *cetrafs_iget(struct super_block *sb, u64 ino);
 int cetrafs_write_vfs_inode(struct inode *inode);
 /* inode.c: a table walk's read -- -ENODATA for a never-written record (F-7) */
 bool cetrafs_inode_half_born(const cetrafs_inode_t *in, u64 ino);
+bool cetrafs_inode_half_landed(const cetrafs_inode_t *in, u64 ino);
 int cetrafs_inode_stamp_unborn(struct super_block *sb, u64 ino);
 bool cetrafs_walk_zero_owns_nothing_test(void);
 int cetrafs_read_raw_inode_walk(struct super_block *sb, u64 ino, cetrafs_inode_t *out);

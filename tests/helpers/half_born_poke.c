@@ -8,6 +8,7 @@
 //
 // usage: half_born_poke <image> <ino> <owner_node_id> <incarnation>
 //        half_born_poke <image> <ino> --landed
+//        half_born_poke <image> <ino> --landed-fd <owner_node_id> <incarnation>
 //
 // --landed stages the other half-landed shape (audit 2026-11-15 BM-69):
 // inode #ino's bit set, its file sector left as it is, its namespace
@@ -15,6 +16,10 @@
 // record write leaves when it stops between its two sectors. A slot
 // with no file in it (mkfs's dead stamp) is given a regular file's
 // mode and one link, as the create was writing.
+//
+// --landed-fd stages the other half: the namespace sector is the birth
+// claim of <owner> at <incarnation> over the slot's dead record, and the
+// FILE sector has landed, restamped on the next generation.
 #include <fcntl.h>
 #include <inttypes.h>
 #include <stddef.h>
@@ -41,7 +46,7 @@ static void wr(int fd, const void *b, size_t n, off_t o)
     }
 }
 
-static int landed(const char *path, uint64_t ino)
+static int landed(const char *path, uint64_t ino, int fd_half, uint32_t owner, uint32_t inc)
 {
     int fd = open(path, O_RDWR);
     cetrafs_superblock_t sb;
@@ -67,15 +72,30 @@ static int landed(const char *path, uint64_t ino)
         fprintf(stderr, "ino %" PRIu64 ": not a valid record to half-land\n", ino);
         return 2;
     }
-    if (!in.mode) {
-        in.mode = cetrafs_cpu_to_le32(0100644);
-        in.nlink = cetrafs_cpu_to_le32(1);
+    if (fd_half) {
+        /* The claim's sector over the dead record, and a file sector of
+         * the next generation -- an empty tree, as a create writes. */
+        in.ns_lock_owner = cetrafs_cpu_to_le32(owner);
+        in.ns_lock_incarnation = cetrafs_cpu_to_le32(inc);
+        in.ns_checksum = cetrafs_cpu_to_le64(0);
+        in.ns_checksum = cetrafs_cpu_to_le64(cetrafs_inode_crc_ns_us(&in));
+        in.fd_generation = cetrafs_cpu_to_le64(cetrafs_le64(in.generation) + 1);
+        in.fd_ino = in.ino;
+        in.fd_checksum = 0;
+        in.fd_checksum = cetrafs_cpu_to_le64(cetrafs_inode_crc_fd_us(&in));
+        memcpy(blk, &in, sizeof(in));
+        wr(fd, blk, CETRAFS_INODE_NS_BYTES + CETRAFS_INODE_FD_BYTES, roff);
+    } else {
+        if (!in.mode) {
+            in.mode = cetrafs_cpu_to_le32(0100644);
+            in.nlink = cetrafs_cpu_to_le32(1);
+        }
+        in.generation = cetrafs_cpu_to_le64(cetrafs_le64(in.fd_generation) + 1);
+        in.ns_checksum = cetrafs_cpu_to_le64(0);
+        in.ns_checksum = cetrafs_cpu_to_le64(cetrafs_inode_crc_ns_us(&in));
+        memcpy(blk, &in, CETRAFS_INODE_NS_BYTES); /* the file sector as it was */
+        wr(fd, blk, CETRAFS_INODE_NS_BYTES, roff);
     }
-    in.generation = cetrafs_cpu_to_le64(cetrafs_le64(in.fd_generation) + 1);
-    in.ns_checksum = cetrafs_cpu_to_le64(0);
-    in.ns_checksum = cetrafs_cpu_to_le64(cetrafs_inode_crc_ns_us(&in));
-    memcpy(blk, &in, CETRAFS_INODE_NS_BYTES); /* the file sector as it was */
-    wr(fd, blk, CETRAFS_INODE_NS_BYTES, roff);
     rd(fd, &byte, 1, boff);
     byte |= (unsigned char) (1u << ((ino - 1) % 8));
     wr(fd, &byte, 1, boff);
@@ -92,7 +112,10 @@ static int landed(const char *path, uint64_t ino)
 int main(int argc, char **argv)
 {
     if (argc == 4 && !strcmp(argv[3], "--landed"))
-        return landed(argv[1], strtoull(argv[2], NULL, 0));
+        return landed(argv[1], strtoull(argv[2], NULL, 0), 0, 0, 0);
+    if (argc == 6 && !strcmp(argv[3], "--landed-fd"))
+        return landed(argv[1], strtoull(argv[2], NULL, 0), 1, (uint32_t) strtoul(argv[4], NULL, 0),
+                      (uint32_t) strtoul(argv[5], NULL, 0));
     if (argc != 5) {
         fprintf(stderr, "usage: %s <image> <ino> <owner_node_id> <incarnation>\n", argv[0]);
         return 2;

@@ -601,6 +601,9 @@ struct cetrafs_sb_info {
      * (fsck_needed_since below). */
     atomic_t corruptions;
     struct xarray bad_inos;
+    /* ino -> when this node first saw it half-landed with no creator
+     * named (cetrafs_sb_half_landed_aged()); values, never pointers. */
+    struct xarray half_landed;
     /* The superblock's lasting "needs fsck" mark as this node last read
      * it (mount, every heartbeat's block-0 read), and whether this mount
      * has put its own damage there yet (cetrafs_sb_record_damage()). */
@@ -2808,6 +2811,7 @@ int cetrafs_fill_super(struct super_block *sb, struct fs_context *fc)
         sbi->defrag_enabled = true;
         sbi->auto_defrag_enabled = true;
         xa_init(&sbi->bad_inos);
+        xa_init(&sbi->half_landed);
         xa_init(&sbi->deferred);
         xa_init(&sbi->held);
         xa_init(&sbi->discard_pending);
@@ -4189,6 +4193,7 @@ departed:
     xa_destroy(&sbi->deferred);
     xa_destroy(&sbi->held);
     xa_destroy(&sbi->bad_inos);
+    xa_destroy(&sbi->half_landed);
     xa_destroy(&sbi->discard_pending);
     cetrafs_inline_discard_destroy(sbi->inline_discard); /* closed above; a late free found it closed */
     sbi->inline_discard = NULL;
@@ -6377,6 +6382,53 @@ unsigned int cetrafs_sb_hb_interval_secs(struct super_block *sb)
     unsigned int v = sbi ? READ_ONCE(sbi->hb_interval_secs) : 0;
 
     return v ? v : cetrafs_param_hb_interval_secs();
+}
+
+/* TEST ONLY: how long a creatorless half-landed record must stay so
+ * before it is settled, in place of the stale window (-1: the window). */
+static int cetrafs_half_landed_wait_secs = -1;
+cetrafs_test_param(half_landed_wait_secs, cetrafs_half_landed_wait_secs, int, 0644);
+MODULE_PARM_DESC(half_landed_wait_secs, "TEST ONLY: settle a creatorless half-landed record after this long (-1: stale window)");
+
+/*
+ * A half-landed record whose new namespace sector landed names no
+ * creator: the create's record write releases its birth claim in that
+ * same sector. Its creator is then judged by time instead: a live one's
+ * synced write completes, or fails and stops its mount, well inside a
+ * stale window, so a record still half-landed a whole window after this
+ * node first saw it is a crashed create's. Keyed by the namespace
+ * sector's checksum as well, so a later, different stop of the same
+ * number starts its own clock. True once that much time has passed.
+ */
+bool cetrafs_sb_half_landed_aged(struct super_block *sb, u64 ino, u32 ns_crc)
+{
+    struct cetrafs_sb_info *sbi = sb->s_fs_info;
+    u64 now = (u64) ktime_get_boottime_seconds() & 0x7fffffffULL;
+    int wait = READ_ONCE(cetrafs_half_landed_wait_secs);
+    void *e;
+
+    if (!sbi || ino > ULONG_MAX)
+        return false;
+    e = xa_load(&sbi->half_landed, (unsigned long) ino);
+    if (e && (u32) (xa_to_value(e) >> 31) == ns_crc) {
+        u64 first = xa_to_value(e) & 0x7fffffffULL;
+
+        return ((now - first) & 0x7fffffffULL) >= (u64) (wait >= 0 ? wait : (int) cetrafs_sb_stale_secs(sb));
+    }
+    /* First sight (or a different stop): start the clock. A store that
+     * fails only means the clock starts on a later walk. */
+    xa_store(&sbi->half_landed, (unsigned long) ino, xa_mk_value(((unsigned long) ns_crc << 31) | (unsigned long) now),
+             GFP_NOFS);
+    return false;
+}
+
+/* The number reads as something else now: its clock, if any, is over. */
+void cetrafs_sb_half_landed_forget(struct super_block *sb, u64 ino)
+{
+    struct cetrafs_sb_info *sbi = sb->s_fs_info;
+
+    if (sbi && ino <= ULONG_MAX && !xa_empty(&sbi->half_landed))
+        xa_erase(&sbi->half_landed, (unsigned long) ino);
 }
 
 unsigned int cetrafs_sb_stale_secs(struct super_block *sb)

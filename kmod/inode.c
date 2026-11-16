@@ -336,6 +336,29 @@ bool cetrafs_inode_half_born(const cetrafs_inode_t *in, u64 ino)
            !memchr_inv((const u8 *) in + CETRAFS_INODE_FD_OFF, 0, sizeof(*in) - CETRAFS_INODE_FD_OFF);
 }
 
+/*
+ * A create's whole-record write stopped between its sectors: both valid,
+ * both naming this number, on different generations. Only a create
+ * writes a new generation, synced before its dirent, so this names no
+ * file -- the kernel's side of fsck's fsck_half_landed() (audit
+ * 2026-11-15 BM-69). The creator's birth claim is in ns_lock_owner
+ * whichever half landed, so it is judged and settled like a half-born
+ * record (cetrafs_half_born_settle()). Counted as damage, one creator's
+ * crash raised needs-fsck and, under corruption=stop, stopped every node
+ * whose scrub or recount walked the table (BM-26).
+ */
+static bool cetrafs_half_landed_damage;
+cetrafs_test_param(half_landed_damage, cetrafs_half_landed_damage, bool, 0644);
+MODULE_PARM_DESC(half_landed_damage, "TEST ONLY: a half-landed create's record counts as damage, as before BM-26");
+
+bool cetrafs_inode_half_landed(const cetrafs_inode_t *in, u64 ino)
+{
+    return !READ_ONCE(cetrafs_half_landed_damage) &&
+           cetrafs_inode_crc_ns(in) == (u32) cetrafs_le64(in->ns_checksum) &&
+           cetrafs_inode_crc_fd(in) == (u32) cetrafs_le64(in->fd_checksum) && cetrafs_le64(in->ino) == ino &&
+           cetrafs_le64(in->fd_ino) == ino && in->fd_generation != in->generation;
+}
+
 /* TEST ONLY: a walk reads a never-written record as naming nothing, as
  * F-7 had it (review F-11's control). */
 static bool cetrafs_walk_zero_owns_nothing;
@@ -370,10 +393,13 @@ int cetrafs_read_raw_inode_walk(struct super_block *sb, u64 ino, cetrafs_inode_t
 
     /* A half-born record whose creator is gone is settled here, the
      * one reader every whole-table walk goes through. */
-    if (ret == -ENODATA && cetrafs_inode_half_born(out, ino) && cetrafs_half_born_settle(sb, ino, out) == 0) {
+    if (ret == -ENODATA && (cetrafs_inode_half_born(out, ino) || cetrafs_inode_half_landed(out, ino)) &&
+        cetrafs_half_born_settle(sb, ino, out) == 0) {
         cetrafs_invalidate_raw_inode(sb, ino);
         ret = __cetrafs_read_raw_inode(sb, ino, out, true);
     }
+    if (ret == 0)
+        cetrafs_sb_half_landed_forget(sb, ino);
     return ret;
 }
 
@@ -483,7 +509,8 @@ static int __cetrafs_read_raw_inode(struct super_block *sb, u64 ino, cetrafs_ino
     }
 #endif
     /* The last attempt was a forced-fresh read: all zeros is the device's. */
-    if (zero_ok && (!memchr_inv(out, 0, sizeof(*out)) || cetrafs_inode_half_born(out, ino)))
+    if (zero_ok && (!memchr_inv(out, 0, sizeof(*out)) || cetrafs_inode_half_born(out, ino) ||
+                    cetrafs_inode_half_landed(out, ino)))
         return -ENODATA;
     pr_err("ino=%llu failed its record checksum %d times -- corrupted, not just a torn concurrent read\n",
            (unsigned long long) ino, CETRAFS_RAW_INODE_READ_RETRIES);
@@ -941,6 +968,106 @@ static int cetrafs_inode_stamp_dead_from(struct super_block *sb, u64 ino, const 
     return 0; /* a lost file-sector swap: the number was reborn since, and is its creator's */
 }
 
+/*
+ * Stamp a half-landed record dead, each sector by a swap that lands only
+ * on the exact bytes judged: the namespace sector first, then the file
+ * sector's previous life -- extents of blocks long freed -- replaced by
+ * an empty tree. Stopped between the two, the record is still half-
+ * landed, now with no creator, and the next walk finishes it. A swap
+ * that finds other bytes means the number moved on: left alone.
+ * Returns 0 stamped, 1 changed under us, <0 an error.
+ */
+struct cetrafs_landed_ctx {
+    struct super_block *sb;
+    const u8 *seed; /* the sector judged */
+    u64 ino, dirent_seq;
+    bool lost;
+};
+
+static int cetrafs_landed_ns_mutate(void *image, unsigned int len, void *priv)
+{
+    struct cetrafs_landed_ctx *ctx = priv;
+    cetrafs_inode_t rec;
+
+    if (len < CETRAFS_INODE_NS_BYTES)
+        return -EINVAL;
+    if (memcmp(image, ctx->seed, CETRAFS_INODE_NS_BYTES)) {
+        ctx->lost = true;
+        return 1;
+    }
+    memset(&rec, 0, sizeof(rec));
+    rec.ino = cetrafs_cpu_to_le64(ctx->ino);
+    rec.ns_lock_owner = cetrafs_cpu_to_le32(CETRAFS_NODE_ID_NONE);
+    rec.dirent_seq = cetrafs_cpu_to_le64(ctx->dirent_seq);
+    cetrafs_ns_stamp_advance(&rec); /* forward from the bytes replaced: no ABA for a birth claim */
+    cetrafs_inode_stamp_crc_ns(&rec);
+    memcpy(image, &rec, CETRAFS_INODE_NS_BYTES);
+    return 0;
+}
+
+static int cetrafs_landed_fd_mutate(void *image, unsigned int len, void *priv)
+{
+    struct cetrafs_landed_ctx *ctx = priv;
+    cetrafs_inode_t rec;
+
+    if (len < CETRAFS_INODE_FD_BYTES)
+        return -EINVAL;
+    if (memcmp(image, ctx->seed, CETRAFS_INODE_FD_BYTES)) {
+        ctx->lost = true;
+        return 1;
+    }
+    memset(&rec, 0, sizeof(rec));
+    rec.ino = cetrafs_cpu_to_le64(ctx->ino);
+    rec.eh.eh_magic = cetrafs_cpu_to_le16(CETRAFS_EXT_MAGIC);
+    rec.eh.eh_max = cetrafs_cpu_to_le16(ARRAY_SIZE(rec.et.leaf));
+    cetrafs_inode_stamp_crc_fd(ctx->sb, &rec); /* identity echo (generation 0), file_seq, checksum */
+    cetrafs_inode_fd_to_image(image, &rec);
+    return 0;
+}
+
+/* A namespace sector naming no file and no claim: a free's or this
+ * settle's. Over a half-landed file sector it is a settle stopped
+ * between its swaps, nobody's create -- finished without a wait. */
+static bool cetrafs_inode_ns_dead(const cetrafs_inode_t *in)
+{
+    return !in->mode && !in->generation && !in->nlink &&
+           cetrafs_le32(in->ns_lock_owner) == CETRAFS_NODE_ID_NONE;
+}
+
+static int cetrafs_inode_stamp_dead_landed(struct super_block *sb, u64 ino, const cetrafs_inode_t *seen)
+{
+    struct cetrafs_landed_ctx ctx = {.sb = sb, .ino = ino, .dirent_seq = cetrafs_le64(seen->dirent_seq)};
+    u64 lba = cetrafs_inode_lba(sb, ino);
+    u8 *fd;
+    int ret;
+
+    if (!lba)
+        return -EINVAL;
+    if (cetrafs_sb_is_fenced(sb))
+        return -EIO;
+    /* The namespace sector is the record's first CETRAFS_INODE_NS_BYTES. */
+    ctx.seed = (const u8 *) seen;
+    ret = cetrafs_cas_record_seeded(sb, lba, seen, CETRAFS_INODE_NS_BYTES, cetrafs_landed_ns_mutate, &ctx);
+    if (ret)
+        return ret;
+    if (ctx.lost)
+        return 1;
+    cetrafs_record_write_counted();
+    fd = kmalloc(CETRAFS_INODE_FD_BYTES, GFP_NOFS);
+    if (!fd)
+        return -ENOMEM; /* still half-landed, creatorless: the next walk finishes it */
+    cetrafs_inode_fd_to_image(fd, seen);
+    ctx.seed = fd;
+    ret = cetrafs_cas_record_fd_seeded(sb, lba, fd, CETRAFS_INODE_FD_BYTES, cetrafs_landed_fd_mutate, &ctx);
+    kfree(fd);
+    if (ret)
+        return ret;
+    if (ctx.lost)
+        return 1;
+    cetrafs_record_write_counted();
+    return 0;
+}
+
 int cetrafs_inode_stamp_unborn(struct super_block *sb, u64 ino)
 {
     static const u8 zeros[CETRAFS_INODE_NS_BYTES];
@@ -987,7 +1114,10 @@ static int cetrafs_half_born_settle(struct super_block *sb, u64 ino, const cetra
         cetrafs_sb_get_node_id(sb, &me))
         return -ENODATA;
     if (owner == CETRAFS_NODE_ID_NONE) {
-        gone = true;
+        /* Half-landed with its new namespace sector: no creator named,
+         * judged by time (cetrafs_sb_half_landed_aged()). */
+        gone = !cetrafs_inode_half_landed(seen, ino) || cetrafs_inode_ns_dead(seen) ||
+               cetrafs_sb_half_landed_aged(sb, ino, (u32) cetrafs_le64(seen->ns_checksum));
     } else if (owner == me) {
         gone = inc != cetrafs_sb_incarnation(sb);
     } else {
@@ -1005,7 +1135,10 @@ static int cetrafs_half_born_settle(struct super_block *sb, u64 ino, const cetra
     }
     if (!gone)
         return -ENODATA;
-    ret = cetrafs_inode_stamp_dead_from(sb, ino, (const u8 *) seen);
+    if (cetrafs_inode_half_landed(seen, ino))
+        ret = cetrafs_inode_stamp_dead_landed(sb, ino, seen);
+    else
+        ret = cetrafs_inode_stamp_dead_from(sb, ino, (const u8 *) seen);
     if (ret < 0)
         return ret;
     if (ret == 0) {

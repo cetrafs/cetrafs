@@ -2580,7 +2580,8 @@ int cetrafs_ns_count_names(struct super_block *sb, const u64 *inos, u32 n, u32 *
              * it names nothing. Unknown, it failed the recount of every
              * file while the create lasted, and for good if it never
              * finished (audit 2026-11-15 F-12). */
-            if (ret == -ENODATA && cetrafs_inode_half_born(raw, x) && !READ_ONCE(cetrafs_ns_count_half_born_unknown)) {
+            if (ret == -ENODATA && (cetrafs_inode_half_born(raw, x) || cetrafs_inode_half_landed(raw, x)) &&
+                !READ_ONCE(cetrafs_ns_count_half_born_unknown)) {
                 ret = 0;
                 continue;
             }
