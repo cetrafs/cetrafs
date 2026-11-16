@@ -517,11 +517,15 @@ fi
 # site is listed by its enclosing function with what releases it; a new
 # igrab()/ihold() or a first timer/call_rcu/kthread fails here until it
 # says what drains it.
+#   nslock.c's deferred settle: task work, run before the task returns
+#   to user space; it pins the superblock active, so the unmount it
+#   would race ends in its own deactivate_super().
 #   file | enclosing function | construct
 ASYNC_OK='
 lock.c|cetrafs_inode_mark_tree_cold|igrab
 lock.c|cetrafs_inode_note_stamp|igrab
 dir.c|cetrafs_link_locked|ihold
+nslock.c|cetrafs_nslock_defer|ihold
 lock.c|cetrafs_lock_release|ihold
 caw.c|cetrafs_cas_stress|kthread_run
 '

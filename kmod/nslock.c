@@ -1407,15 +1407,41 @@ static bool cetrafs_settle_marked(void)
 struct cetrafs_settle_work {
     struct callback_head cb;
     struct inode *inode;
+    bool sb_pinned;
+    int kills; /* cetrafs_sb_kills when queued, for the unpinned test */
     int what;
 };
+
+/* TEST ONLY: the deferred settle holds its inode but not the superblock,
+ * as before (tests/kernel/nslock_settle_unmount.sh). So the control can
+ * run anywhere, a work that finds a superblock torn down since it was
+ * queued says so and touches nothing -- before, it went on into freed
+ * memory. */
+static bool cetrafs_nslock_defer_unpinned;
+cetrafs_test_param(nslock_defer_unpinned, cetrafs_nslock_defer_unpinned, bool, 0644);
+MODULE_PARM_DESC(nslock_defer_unpinned, "TEST ONLY: a deferred namespace settle does not pin the superblock");
+
+/* TEST ONLY: a deferred settle sleeps this many ms before its work. */
+static unsigned int cetrafs_nslock_settle_stall_ms;
+cetrafs_test_param(nslock_settle_stall_ms, cetrafs_nslock_settle_stall_ms, uint, 0644);
+MODULE_PARM_DESC(nslock_settle_stall_ms, "TEST ONLY: a deferred namespace settle sleeps this many ms first");
 
 static void cetrafs_settle_run(struct callback_head *cb)
 {
     struct cetrafs_settle_work *w = container_of(cb, struct cetrafs_settle_work, cb);
     struct inode *inode = w->inode;
+    struct super_block *sb = inode->i_sb;
     u32 me;
 
+    if (READ_ONCE(cetrafs_nslock_settle_stall_ms))
+        msleep(READ_ONCE(cetrafs_nslock_settle_stall_ms));
+    if (!w->sb_pinned && atomic_read(&cetrafs_sb_kills) != w->kills) {
+        /* TEST ONLY (nslock_defer_unpinned): the inode is leaked. */
+        pr_err("nslock: a deferred settle outlived its superblock (nslock_defer_unpinned)\n");
+        kfree(w);
+        module_put(THIS_MODULE);
+        return;
+    }
     if (w->what == CETRAFS_SETTLE_RECOUNT) {
         /* Alone and outside the VFS: the acquire recounts what the dead
          * holder left (the record is flagged) and clears the flag. */
@@ -1441,6 +1467,8 @@ static void cetrafs_settle_run(struct callback_head *cb)
         spin_unlock(&cetrafs_nswait_lock);
     }
     iput(inode);
+    if (w->sb_pinned)
+        deactivate_super(sb); /* may be the last: unmount finishes here */
     kfree(w);
     module_put(THIS_MODULE);
 }
@@ -1460,12 +1488,29 @@ static int cetrafs_nslock_defer(struct inode *inode, int what)
         goto nomem;
     if (!try_module_get(THIS_MODULE))
         goto nomem;
+    /*
+     * The work outlives the call: it runs as the task returns to user
+     * space, AFTER the call has dropped its path. Task work runs newest
+     * first, and a lazy unmount's last mntput queues the superblock's
+     * teardown exactly there -- or runs it in the umount itself while
+     * this work stalls. An inode reference alone left kill_sb to find
+     * the inode busy, put_super to free sb_info, and this work's
+     * acquire and iput() to run on it (rule 20). An active reference
+     * keeps the superblock whole until the work has dropped the inode;
+     * the caller holds a path on it, so it is active now.
+     */
+    w->sb_pinned = !READ_ONCE(cetrafs_nslock_defer_unpinned);
+    if (w->sb_pinned)
+        atomic_inc(&inode->i_sb->s_active);
+    w->kills = atomic_read(&cetrafs_sb_kills);
     ihold(inode);
     w->inode = inode;
     w->what = what;
     init_task_work(&w->cb, cetrafs_settle_run);
     if (task_work_add(current, &w->cb, TWA_SIGNAL)) {
         iput(inode);
+        if (w->sb_pinned)
+            deactivate_super(inode->i_sb);
         module_put(THIS_MODULE);
         goto nomem;
     }

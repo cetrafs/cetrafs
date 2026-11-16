@@ -8573,8 +8573,13 @@ int cetrafs_init_fs_context(struct fs_context *fc)
 }
 
 /* Unmount a cetrafs partition */
+/* Superblocks torn down since load: lets a TEST ONLY path tell that the
+ * one it did not pin is gone (nslock.c, nslock_defer_unpinned). */
+atomic_t cetrafs_sb_kills = ATOMIC_INIT(0);
+
 void cetrafs_kill_sb(struct super_block *sb)
 {
+    atomic_inc(&cetrafs_sb_kills);
     pr_debug("kill_sb()\n");
     /* Before kill_block_super(): its evict_inodes() skips an inode a
      * queued reconcile still pins, and that reconcile's iput() would
