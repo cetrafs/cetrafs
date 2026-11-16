@@ -473,6 +473,7 @@ struct cetrafs_sb_info {
      * tolerates NULL the same way cetrafs_heartbeat_stop() does. */
     struct cetrafs_proc_mount *proc_mount;
     bool proc_closing; /* unmount: procfs sweeps stop (cetrafs_proc_sweep_stop()) */
+    u64 shrink_seen;   /* the short device size the last tick saw, 0 none (cetrafs_sb_check_device_size()) */
 
 
     /* Node-LOCAL serialization of data-bitmap / free-counter
@@ -6074,6 +6075,22 @@ static bool cetrafs_device_shrink_ignored;
 cetrafs_test_param(device_shrink_ignored, cetrafs_device_shrink_ignored, bool, 0644);
 MODULE_PARM_DESC(device_shrink_ignored, "TEST ONLY: a LUN shrunk under the mount is not noticed");
 
+/* TEST ONLY: the next N device-size samples read device_size_fake_blocks
+ * instead of the device's size -- a revalidate in flight, which a loop
+ * device cannot show without losing its data. */
+static int cetrafs_device_size_fake_ticks;
+cetrafs_test_param(device_size_fake_ticks, cetrafs_device_size_fake_ticks, int, 0644);
+MODULE_PARM_DESC(device_size_fake_ticks, "TEST ONLY: the next N device-size samples read device_size_fake_blocks");
+static unsigned long long cetrafs_device_size_fake_blocks;
+cetrafs_test_param(device_size_fake_blocks, cetrafs_device_size_fake_blocks, ullong, 0644);
+MODULE_PARM_DESC(device_size_fake_blocks, "TEST ONLY: the device size a faked sample reads, in blocks");
+
+/* TEST ONLY: one smaller sample, zero included, stops the mount, as
+ * 28a22bf did (tests/kernel/device_shrink_stops.sh's F-39 control). */
+static bool cetrafs_device_shrink_one_sample;
+cetrafs_test_param(device_shrink_one_sample, cetrafs_device_shrink_one_sample, bool, 0644);
+MODULE_PARM_DESC(device_shrink_one_sample, "TEST ONLY: a single short device-size sample, zero included, stops the mount");
+
 /*
  * Is the device still as large as the volume? Checked at mount and when
  * a peer's grow is adopted, and nowhere else: a LUN shrunk under a live
@@ -6094,8 +6111,32 @@ void cetrafs_sb_check_device_size(struct super_block *sb)
         return;
     have = bdev_nr_bytes(sb->s_bdev) / CETRAFS_BLOCK_SIZE;
     need = le64_to_cpu(l->raw.total_blocks);
-    if (have >= need)
+    if (READ_ONCE(cetrafs_device_size_fake_ticks) > 0) {
+        /* TEST ONLY: this sample reads as the fake size (see the parameter) */
+        WRITE_ONCE(cetrafs_device_size_fake_ticks, cetrafs_device_size_fake_ticks - 1);
+        have = READ_ONCE(cetrafs_device_size_fake_blocks);
+        pr_info("%s: TEST device size sample faked: %llu blocks\n", sb->s_id, (unsigned long long) have);
+    }
+    /*
+     * Zero is no size at all: a plain sd device whose READ CAPACITY
+     * fails during a controller failover or a LUN reset reads 0 until
+     * its next good revalidate, and is back at full size seconds later.
+     * A device really gone is the removal hook's (CETRAFS_STOP_DEVICE_GONE).
+     * And a shortfall must hold for two ticks in a row: one sample
+     * stopped -- under errors=panic, panicked -- a host whose LUN was
+     * only being revalidated (audit 2026-11-15 F-39).
+     */
+    if (have >= need || (have == 0 && !READ_ONCE(cetrafs_device_shrink_one_sample))) {
+        WRITE_ONCE(sbi->shrink_seen, 0);
         return;
+    }
+    if (!READ_ONCE(cetrafs_device_shrink_one_sample) && READ_ONCE(sbi->shrink_seen) != have) {
+        pr_warn("%s: the device reads %llu blocks, the volume needs %llu -- stopping if it still does at the next "
+                "beat\n",
+                sb->s_id, (unsigned long long) have, (unsigned long long) need);
+        WRITE_ONCE(sbi->shrink_seen, have);
+        return;
+    }
     cetrafs_sb_fatal(sb, "the device shrank under the mount: %llu blocks, the volume needs %llu",
                      (unsigned long long) have, (unsigned long long) need);
 }
