@@ -17,12 +17,16 @@
 # has v open for write, so the entry is kept. Its image points v's first extent at
 # a block the dead node "allocated" (bit set) and nothing else references.
 #   S. an open of w (node 1 had it open) succeeds; an open of v is refused;
-#   G. the scrub skips while node 1's journal is dirty; once node 2 closes
-#      v and the entry is redone, the block it names is still in use.
+#   G. the scrub runs while node 1's journal is dirty, keeping the block
+#      the entry names and freeing an unrelated leaked one (F-40: it used
+#      to skip every cycle); once node 2 closes v and the entry is
+#      redone, the block it names is still in use.
 #
 # DISCRIMINATION: journal_scope_off=1: S refuses the open of w.
 # scrub_ignores_dead_journal=1: the scrub frees the block and the redo
 # publishes an extent over a FREE block (fsck: "marked FREE").
+# scrub_dead_journal_whole=1: the scrub frees nothing at all, the
+# unrelated leak included.
 set -euo pipefail
 . "$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)/lib/harness.sh"
 require_root
@@ -44,6 +48,7 @@ ct_param_set scrub_gap_secs 1
 ct_param_set journal_live_opener_off 0
 ct_param_set journal_scope_off 0
 ct_param_set scrub_ignores_dead_journal 0
+ct_param_set scrub_dead_journal_whole 0
 ct_param_set hb_replay_sweep_off 0
 get() { grep -o "$1=[^ ]*" <<<"$2" | head -1 | cut -d= -f2; }
 nfmount() { mount -t cetrafs -o nofilelock "$1" "$2"; }
@@ -85,10 +90,12 @@ setup() {
         base="$("$LEAK" "$IMG" "$bg" 0 0 | sed -n 's/.* lba \([0-9]*\)$/\1/p')"
         [ -n "$base" ] && [ "$tgt" -ge "$base" ] || { fail "setup: no data offset for lba $tgt"; ct_exit; }
         "$LEAK" "$IMG" "$bg" $((tgt - base)) 1 >/dev/null
+        # And one no journal names: the scrub's to reclaim.
+        "$LEAK" "$IMG" "$bg" 3000 1 >/dev/null
         blockdev --flushbufs "$DEV"
         out="$(ct_fsck "$DEV" 2>&1 || true)"
-        echo "$out" | grep -q " 1 leaked" ||
-            { fail "setup: lba $tgt does not read as the one leaked block: $(echo "$out" | grep -E 'leaked|^(ERR|WARN)' | head -3)"; ct_exit; }
+        echo "$out" | grep -q " 2 leaked" ||
+            { fail "setup: lba $tgt and one other do not read as the two leaked blocks: $(echo "$out" | grep -E 'leaked|^(ERR|WARN)' | head -3)"; ct_exit; }
     fi
     compress_timing
     poke_dead_peer "$DEV" 1 aa
@@ -124,23 +131,27 @@ round_s() {
     reset_stale_window
 }
 
-# <tag> <ignore 0|1> -> RES
+# <tag> <ignore 0|1> <whole 0|1> -> RES
 round_g() {
-    local r0 s0 mark out
+    local r0 s0 k0 mark out
     setup "$1" G
     echo "$2" >$P/scrub_ignores_dead_journal
+    echo "$3" >$P/scrub_dead_journal_whole
     echo 1 >$P/hb_replay_sweep_off # the kept entry stays kept: node 2 has v open
     nfmount "$DEV" "$MNT"
     ct_beat_row "$DEV" 2
     wait_out_stale_window
-    r0="$(info scrub_reclaimed)" s0="$(info scrub_dead_journal_skips)"
+    r0="$(info scrub_reclaimed)" s0="$(info scrub_dead_journal_skips)" k0="$(info scrub_dead_journal_kept)"
     ct_param_set scrub 1
     wait_for 30 "[ \$((\$(info scrub_reclaimed) - $r0)) -gt 0 ] || [ \$((\$(info scrub_dead_journal_skips) - $s0)) -gt 2 ]" || true
+    sleep 6 # more cycles: a block kept once must stay kept
     ct_param_set scrub 0
     RES="reclaimed=$(($(info scrub_reclaimed) - r0)) skips=$(($(info scrub_dead_journal_skips) - s0))"
+    RES="$RES kept=$(($(info scrub_dead_journal_kept) - k0))"
     ct_unbeat
     umount "$MNT" 2>/dev/null || umount -l "$MNT"
     echo 0 >$P/scrub_ignores_dead_journal
+    echo 0 >$P/scrub_dead_journal_whole
     reset_stale_window
     # Node 2 closes v: the entry is redone by the next sweep.
     "$LPOKE" "$DEV" "$INO" --unreader 2 >/dev/null
@@ -167,10 +178,13 @@ log "S (scoped): $S"
 round_s sc 1
 SC="$RES"
 log "S control (every caller strict): $SC"
-round_g g 0
+round_g g 0 0
 G="$RES"
-log "G (scrub guarded): $G"
-round_g gc 1
+log "G (scrub scoped): $G"
+round_g gw 0 1
+GW="$RES"
+log "G control (a dirty dead journal skips the whole cycle): $GW"
+round_g gc 1 0
 GC="$RES"
 log "G control (scrub ignores the dead journal): $GC"
 
@@ -179,10 +193,13 @@ log "G control (scrub ignores the dead journal): $GC"
 [ "$(get w "$SC")" = fail ] &&
     pass "S control: as before, the kept entry refused the other file too" ||
     fail "S control: w opened without the change -- the suite does not reach it: $SC"
-[ "$(get reclaimed "$G")" = 0 ] && [ "$(get skips "$G")" -ge 1 ] &&
-    pass "G: the scrub freed nothing while the dead node's journal was dirty" || fail "G: $G"
+[ "$(get reclaimed "$G")" = 1 ] && [ "$(get kept "$G")" -ge 1 ] &&
+    pass "G: the scrub ran while the dead node's journal was dirty, freeing the unrelated leak only" || fail "G: $G"
+[ "$(get reclaimed "$GW")" = 0 ] && [ "$(get skips "$GW")" -ge 1 ] && [ "$(get fsck "$GW")" = ok ] &&
+    pass "G control: as before, a dirty dead journal stopped every scrub cycle, the unrelated leak kept" ||
+    fail "G control (whole): $GW"
 [ "$(get fsck "$G")" = ok ] && pass "G: the redone extent names a block still in use" || fail "G: $G"
-[ "$(get reclaimed "$GC")" -ge 1 ] && [ "$(get fsck "$GC")" = shared ] &&
+[ "$(get reclaimed "$GC")" -ge 2 ] && [ "$(get fsck "$GC")" = shared ] &&
     pass "G control: the scrub freed the block and the redo published it FREE" ||
     fail "G control: the hazard did not reproduce -- the suite does not reach it: $GC"
 ct_exit

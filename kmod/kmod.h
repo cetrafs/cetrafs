@@ -1600,6 +1600,7 @@ u64 cetrafs_scrub_inode_ra_count(void);
 u64 cetrafs_scrub_reclaimed_count(void);
 u64 cetrafs_scrub_inflight_skip_count(void);
 u64 cetrafs_scrub_dead_journal_skip_count(void);
+u64 cetrafs_scrub_dead_journal_kept_count(void);
 u64 cetrafs_scrub_orphans_count(void);
 u64 cetrafs_scrub_cycle_count(void);
 u64 cetrafs_scrub_last_start_unix(void);
@@ -1723,7 +1724,17 @@ int cetrafs_journal_write_new_block(struct super_block *sb, struct buffer_head *
 void cetrafs_journal_shutdown(struct super_block *sb);
 int cetrafs_journal_replay_node(struct super_block *sb, u32 node_id, bool wait_for_claim);
 #define CETRAFS_REPLAY_STRICT U64_MAX
-bool cetrafs_journal_dead_dirty(struct super_block *sb);
+/* The blocks stale nodes' dirty journals can name (journal.c, F-40). */
+struct cetrafs_journal_ref {
+    u64 phys, len;
+};
+struct cetrafs_journal_refs {
+    struct cetrafs_journal_ref *v;
+    u32 n, cap;
+};
+int cetrafs_journal_dead_refs(struct super_block *sb, struct cetrafs_journal_refs *r, bool *out_any);
+int cetrafs_journal_retire_node(struct super_block *sb, u32 node_id, u32 incarnation, u32 *out);
+void cetrafs_journal_refs_free(struct cetrafs_journal_refs *r);
 int cetrafs_journal_replay_node_scoped(struct super_block *sb, u32 node_id, bool wait_for_claim, u64 scope);
 int cetrafs_journal_node_is_dirty(struct super_block *sb, u32 node_id, bool *out_dirty);
 void cetrafs_journal_retry_release(struct super_block *sb);

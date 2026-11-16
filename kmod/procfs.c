@@ -303,6 +303,7 @@ static int cetrafs_proc_info_show(struct seq_file *m, void *v)
     seq_printf(m, "scrub_cycles: %llu\n", cetrafs_scrub_cycle_count());
     seq_printf(m, "scrub_inflight_skips: %llu\n", cetrafs_scrub_inflight_skip_count());
     seq_printf(m, "scrub_dead_journal_skips: %llu\n", cetrafs_scrub_dead_journal_skip_count());
+    seq_printf(m, "scrub_dead_journal_kept: %llu\n", cetrafs_scrub_dead_journal_kept_count());
     seq_printf(m, "frees_announced: %llu\n", cetrafs_frees_announced_count());
     seq_printf(m, "scrub_last_run_unix: %llu\n", cetrafs_scrub_last_start_unix());
     seq_printf(m, "scrub_last_run_ms: %llu\n", cetrafs_scrub_last_duration_ms());
@@ -883,6 +884,28 @@ timing_out:
             return dret;
         }
         pr_warn("%s: controls: row %u (incarnation %u) declared dead\n", sb->s_id, row, inc);
+        return len;
+    }
+
+    /* retire_journal=<row>:<incarnation>: give up a dead node's journal
+     * entries that will not settle -- a decommissioned host's
+     * (cetrafs_journal_retire_node()). CAP_SYS_ADMIN, like dead=. */
+    if (!strcmp(key, "retire_journal")) {
+        unsigned int row, inc, n = 0;
+        char tail;
+        int rret;
+
+        if (!capable(CAP_SYS_ADMIN))
+            return -EPERM;
+        if (sscanf(val, "%u:%u%c", &row, &inc, &tail) != 2)
+            return -EINVAL;
+        rret = cetrafs_journal_retire_node(sb, row, inc, &n);
+        if (rret) {
+            pr_warn("%s: controls: retire_journal=%u:%u refused (%d)\n", sb->s_id, row, inc, rret);
+            return rret;
+        }
+        pr_warn("%s: controls: row %u's journal retired (%u entr%s given up)\n", sb->s_id, row, n,
+                n == 1 ? "y" : "ies");
         return len;
     }
 

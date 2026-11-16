@@ -3683,38 +3683,258 @@ static bool cetrafs_scrub_ignores_dead_journal;
 cetrafs_test_param(scrub_ignores_dead_journal, cetrafs_scrub_ignores_dead_journal, bool, 0644);
 MODULE_PARM_DESC(scrub_ignores_dead_journal, "TEST ONLY: the scrub frees while a stale node's journal is dirty");
 
+/* Is row 'node_id' still the dead incarnation the operator named? */
+static int cetrafs_journal_retire_row_ok(struct super_block *sb, u32 node_id, u32 incarnation)
+{
+    cetrafs_node_entry_t ne;
+    bool stale = false;
+    int ret = cetrafs_node_get_entry(sb, node_id, &ne);
+
+    if (ret)
+        return ret;
+    if (cetrafs_le32(ne.incarnation) != incarnation)
+        return -ESTALE; /* it came back since: its own mount replays the area */
+    ret = cetrafs_node_is_stale(sb, node_id, &stale);
+    if (ret)
+        return ret;
+    return stale ? 0 : -EBUSY;
+}
+
 /*
- * Is a stale node's journal still DIRTY? Its entries can name, in their
- * payloads, blocks nothing on the device references yet -- a dead
- * node's last tree write, kept for a live opener and redone later
- * (cetrafs_journal_replay_node_scoped()). Its Zone Groups may be ours by
- * then, and a scrub that judged those blocks leaked would free what the
- * redo then publishes. So no scrub cycle frees while one is (scrub.c).
- * A read that fails answers yes.
+ * Retire a dead node's journal area: an operator's release for an area
+ * that will not settle by itself -- the node decommissioned and never
+ * mounting again, an entry kept undecided because its owner record is
+ * unreadable. While it stays dirty, every file that node had open keeps
+ * its presence bit (truncate, setxattr, flock and defrag refused there)
+ * and every open of one re-scans the area (audit 2026-11-15 F-40).
+ *
+ * Everything that can be redone is redone first, by an ordinary replay.
+ * What is left is said entry by entry, then consumed unapplied and the
+ * area parked CLEAN -- the dead node's last writes to those blocks are
+ * given up: the block keeps what it holds now (a live writer's state
+ * wins, as replay already decided), and blocks only those entries named
+ * become leaks the scrub reclaims. Bound to the incarnation the operator
+ * read and to the row being stale, checked again under the replay claim
+ * so a node that re-attached meanwhile keeps its area. *out: how many.
  */
-bool cetrafs_journal_dead_dirty(struct super_block *sb)
+int cetrafs_journal_retire_node(struct super_block *sb, u32 node_id, u32 incarnation, u32 *out)
+{
+    const cetrafs_superblock_t *raw_sb = cetrafs_sb_raw(sb);
+    u64 area_start, slots, sl, park_seq = 0;
+    bool dirty = false;
+    u32 me, n = 0;
+    int ret;
+
+    *out = 0;
+    if (!raw_sb || node_id >= le32_to_cpu(raw_sb->node_table_count) || !incarnation)
+        return -EINVAL;
+    if (cetrafs_sb_get_node_id(sb, &me) || me == node_id)
+        return -EINVAL;
+    if (cetrafs_sb_is_fenced(sb) || sb_rdonly(sb))
+        return -EROFS;
+    ret = cetrafs_journal_retire_row_ok(sb, node_id, incarnation);
+    if (ret)
+        return ret;
+    ret = cetrafs_journal_node_area(sb, node_id, &area_start, &slots);
+    if (ret || !area_start)
+        return ret;
+
+    /* What can be redone, is. Its failure is what is left to retire. */
+    ret = cetrafs_journal_replay_node(sb, node_id, true);
+    if (ret == -EINTR || cetrafs_sb_is_fenced(sb))
+        return ret ?: -EIO;
+
+    ret = cetrafs_journal_read_flag(sb, area_start, &dirty);
+    if (ret || !dirty)
+        return ret;
+    ret = cetrafs_journal_claim_replay(sb, area_start, me);
+    if (ret)
+        return ret == -EEXIST ? -EBUSY : ret;
+    /* Under the claim: the decision again, right before the act. */
+    ret = cetrafs_journal_retire_row_ok(sb, node_id, incarnation);
+    if (!ret)
+        ret = cetrafs_journal_read_flag_seq(sb, area_start, &dirty, &park_seq);
+    if (ret || !dirty)
+        goto release;
+
+    for (sl = 0; sl < slots; sl++) {
+        u64 header_lba = area_start + 1 + sl * CETRAFS_JOURNAL_SLOT_BLOCKS;
+        const cetrafs_journal_header_t *hdr;
+        struct buffer_head *hbh = cetrafs_bread_uncached_retry(sb, header_lba);
+
+        if (!hbh) {
+            ret = -EIO;
+            goto release;
+        }
+        hdr = (const cetrafs_journal_header_t *) hbh->b_data;
+        if (cetrafs_le32(hdr->magic) != CETRAFS_JOURNAL_MAGIC ||
+            cetrafs_journal_header_crc(hbh->b_data) != cetrafs_le32(hdr->header_checksum)) {
+            brelse(hbh);
+            continue;
+        }
+        pr_warn("journal: retiring node %u's entry txn %llu unapplied: block %llu of ino %llu keeps what it holds\n",
+                node_id, (unsigned long long) cetrafs_le64(hdr->txn_id),
+                (unsigned long long) cetrafs_le64(hdr->target_lba), (unsigned long long) cetrafs_le64(hdr->owner_ino));
+        cetrafs_bh_begin_update(hbh);
+        memset(hbh->b_data, 0, CETRAFS_BLOCK_SIZE);
+        cetrafs_bh_end_update(sb, hbh);
+        ret = cetrafs_sync_buffer_refusable(sb, hbh);
+        brelse(hbh);
+        if (ret)
+            goto release; /* the area stays dirty: nothing half-retired is parked clean */
+        n++;
+    }
+    *out = n;
+    pr_warn("journal: node %u's area retired: %u entr%s given up, parked clean\n", node_id, n, n == 1 ? "y" : "ies");
+    cetrafs_journal_release_replay(sb, node_id, area_start, me, /*set_clean=*/true);
+    return 0;
+
+release:
+    cetrafs_journal_release_replay(sb, node_id, area_start, me, /*set_clean=*/false);
+    return ret;
+}
+
+/* TEST ONLY: any stale node's dirty journal stops the whole scrub cycle,
+ * as before audit 2026-11-15 F-40 (tests/kernel/journal_replay_scope.sh). */
+static bool cetrafs_scrub_dead_journal_whole;
+cetrafs_test_param(scrub_dead_journal_whole, cetrafs_scrub_dead_journal_whole, bool, 0644);
+MODULE_PARM_DESC(scrub_dead_journal_whole, "TEST ONLY: a stale node's dirty journal skips the whole scrub cycle");
+
+/* More ranges than this and the scrub skips its cycle instead. */
+#define CETRAFS_JREFS_MAX (1U << 20)
+
+static int cetrafs_jrefs_add(struct cetrafs_journal_refs *r, u64 phys, u64 len)
+{
+    if (!len)
+        return 0;
+    if (r->n == r->cap) {
+        u32 cap = r->cap ? r->cap * 2 : 64;
+        struct cetrafs_journal_ref *nv;
+
+        if (cap > CETRAFS_JREFS_MAX)
+            return -E2BIG;
+        nv = kvrealloc(r->v, (size_t) cap * sizeof(*nv), GFP_NOFS);
+        if (!nv)
+            return -ENOMEM;
+        r->v = nv;
+        r->cap = cap;
+    }
+    r->v[r->n].phys = phys;
+    r->v[r->n].len = len;
+    r->n++;
+    return 0;
+}
+
+/* Every block one journal payload can name: the target itself, and for
+ * an extent leaf or index block, every extent or child in it. Read as
+ * the bytes say, bounded by the block and nothing else -- a range too
+ * many only keeps a block, and the marks are clipped to the groups the
+ * scrub holds. */
+static int cetrafs_jrefs_payload(struct cetrafs_journal_refs *r, u64 target, const u8 *payload)
+{
+    const cetrafs_extent_hdr_t *eh = (const cetrafs_extent_hdr_t *) payload;
+    u32 n, i, room = (CETRAFS_BLOCK_SIZE - sizeof(*eh)) / sizeof(cetrafs_extent_t);
+    int ret = cetrafs_jrefs_add(r, target, 1);
+
+    if (ret || cetrafs_le16(eh->eh_magic) != CETRAFS_EXT_MAGIC)
+        return ret;
+    n = min_t(u32, cetrafs_le16(eh->eh_entries), room);
+    for (i = 0; i < n && !ret; i++) {
+        if (cetrafs_le16(eh->eh_depth) == 0) {
+            const cetrafs_extent_t *e = (const cetrafs_extent_t *) (payload + sizeof(*eh)) + i;
+
+            ret = cetrafs_jrefs_add(r, (u64) cetrafs_le32(e->ee_start_lo) | ((u64) cetrafs_le16(e->ee_start_hi) << 32),
+                                    cetrafs_le32(e->ee_len) & 0x7fffffffU);
+        } else {
+            const cetrafs_extent_idx_t *x = (const cetrafs_extent_idx_t *) (payload + sizeof(*eh)) + i;
+
+            ret = cetrafs_jrefs_add(r, (u64) cetrafs_le32(x->ei_leaf_lo) | ((u64) cetrafs_le16(x->ei_leaf_hi) << 32),
+                                    1);
+        }
+    }
+    return ret;
+}
+
+/*
+ * The blocks a stale node's still-dirty journal can name (scrub.c). A
+ * kept entry's payload can name blocks no tree references yet -- the dead
+ * node's last tree write, redone once its live opener closes -- and a
+ * scrub judging them leaked would free what the redo then publishes. The
+ * scrub used to skip every cycle while any such area was dirty, so a
+ * dead node that never came back (a decommissioned host), or one entry
+ * that could not be decided, stopped every leak reclaim on every node
+ * (audit 2026-11-15 F-40). Now those blocks, and only those, are kept.
+ *
+ * Collected BEFORE the scrub reads the trees, applied after: an entry a
+ * peer redoes and consumes in between is on the device by the time the
+ * trees are read. Every slot with a valid header counts, whatever its
+ * session: more marks only keep blocks. Fails (the cycle frees nothing)
+ * on any read it cannot make. *out_any: some stale node's area was dirty.
+ */
+int cetrafs_journal_dead_refs(struct super_block *sb, struct cetrafs_journal_refs *r, bool *out_any)
 {
     const cetrafs_superblock_t *raw_sb = cetrafs_sb_raw(sb);
     u32 n, count, me;
+    int ret = 0;
 
+    *out_any = false;
     if (READ_ONCE(cetrafs_scrub_ignores_dead_journal))
-        return false;
+        return 0;
     if (!raw_sb || cetrafs_sb_get_node_id(sb, &me))
-        return true;
+        return -EIO;
     count = le32_to_cpu(raw_sb->node_table_count);
-    for (n = 0; n < count; n++) {
+    for (n = 0; n < count && !ret; n++) {
         bool dirty = false, stale = false;
+        u64 area_start, slots, sl;
 
         if (n == me)
             continue;
         if (cetrafs_journal_node_is_dirty(sb, n, &dirty))
-            return true;
+            return -EIO;
         if (!dirty)
             continue;
-        if (cetrafs_node_is_stale(sb, n, &stale) || stale)
-            return true;
+        if (cetrafs_node_is_stale(sb, n, &stale))
+            return -EIO;
+        if (!stale)
+            continue;
+        *out_any = true;
+        if (READ_ONCE(cetrafs_scrub_dead_journal_whole))
+            return -EBUSY; /* TEST ONLY: see the parameter */
+        ret = cetrafs_journal_node_area(sb, n, &area_start, &slots);
+        if (ret || !area_start)
+            return ret ? ret : -EIO;
+        for (sl = 0; sl < slots && !ret; sl++) {
+            u64 header_lba = area_start + 1 + sl * CETRAFS_JOURNAL_SLOT_BLOCKS;
+            const cetrafs_journal_header_t *hdr;
+            struct buffer_head *hbh, *pbh;
+            u64 target;
+
+            hbh = cetrafs_bread_uncached_retry(sb, header_lba);
+            if (!hbh)
+                return -EIO;
+            hdr = (const cetrafs_journal_header_t *) hbh->b_data;
+            if (cetrafs_le32(hdr->magic) != CETRAFS_JOURNAL_MAGIC ||
+                cetrafs_journal_header_crc(hbh->b_data) != cetrafs_le32(hdr->header_checksum)) {
+                brelse(hbh);
+                continue;
+            }
+            target = cetrafs_le64(hdr->target_lba);
+            brelse(hbh);
+            pbh = cetrafs_bread_uncached_retry(sb, header_lba + 1);
+            if (!pbh)
+                return -EIO;
+            ret = cetrafs_jrefs_payload(r, target, (const u8 *) pbh->b_data);
+            brelse(pbh);
+        }
     }
-    return false;
+    return ret;
+}
+
+void cetrafs_journal_refs_free(struct cetrafs_journal_refs *r)
+{
+    kvfree(r->v);
+    r->v = NULL;
+    r->n = r->cap = 0;
 }
 
 /* Is node #node_id's journal flag currently DIRTY? Used by heartbeat.c's

@@ -284,11 +284,20 @@ u64 cetrafs_scrub_inflight_skip_count(void)
     return (u64) atomic64_read(&cetrafs_scrub_inflight_skips);
 }
 
-/* Cycles skipped because a stale node's journal was still dirty. */
+/* Cycles skipped because a stale node's dirty journal could not be read
+ * (or, under scrub_dead_journal_whole, was dirty at all). */
 static atomic64_t cetrafs_scrub_dead_journal_skips = ATOMIC64_INIT(0);
 u64 cetrafs_scrub_dead_journal_skip_count(void)
 {
     return (u64) atomic64_read(&cetrafs_scrub_dead_journal_skips);
+}
+
+/* Verdicts that ran keeping the blocks a stale node's dirty journal
+ * names (cetrafs_journal_dead_refs()). */
+static atomic64_t cetrafs_scrub_dead_journal_kept = ATOMIC64_INIT(0);
+u64 cetrafs_scrub_dead_journal_kept_count(void)
+{
+    return (u64) atomic64_read(&cetrafs_scrub_dead_journal_kept);
 }
 
 /* When the last cycle STARTED (unix seconds, 0 = never since module
@@ -1177,6 +1186,7 @@ static void cetrafs_scrub_cycle(struct cetrafs_scrub *s)
     struct super_block *sb = s->sb;
     struct scrub_ctx ctx = {0};
     struct cetrafs_frees_snap frees;
+    struct cetrafs_journal_refs jrefs = {0};
     u64 freed = 0;
     u32 i, gap, from, to;
     bool old;
@@ -1284,12 +1294,22 @@ static void cetrafs_scrub_cycle(struct cetrafs_scrub *s)
             atomic64_inc(&cetrafs_scrub_inflight_skips);
             goto done;
         }
-        /* A stale node's journal still dirty: its kept entries can name
-         * blocks no tree references yet (cetrafs_journal_dead_dirty()). */
-        if (cetrafs_journal_dead_dirty(sb)) {
-            pr_debug("scrub: a stale node's journal is not replayed yet -- skipping this cycle\n");
-            atomic64_inc(&cetrafs_scrub_dead_journal_skips);
-            goto done;
+        /* A stale node's journal still dirty: its entries can name
+         * blocks no tree references yet. Collected now, BEFORE the trees
+         * are read, and counted as referenced after
+         * (cetrafs_journal_dead_refs()); a cycle that cannot read them
+         * frees nothing. */
+        {
+            bool any = false;
+
+            cetrafs_journal_refs_free(&jrefs);
+            if (cetrafs_journal_dead_refs(sb, &jrefs, &any)) {
+                pr_debug("scrub: a stale node's journal could not be read -- skipping this cycle\n");
+                atomic64_inc(&cetrafs_scrub_dead_journal_skips);
+                goto done;
+            }
+            if (any)
+                atomic64_inc(&cetrafs_scrub_dead_journal_kept);
         }
 
         /* Rebuild the reference set FRESH, confirm, free. This is the
@@ -1300,6 +1320,17 @@ static void cetrafs_scrub_cycle(struct cetrafs_scrub *s)
         sub = scrub_sub(&ctx, from, to);
         if (scrub_build_refset(s, &sub, /*fresh=*/true) != 0)
             goto done;
+        for (i = 0; i < jrefs.n; i++) {
+            u64 p = jrefs.v[i].phys, left = jrefs.v[i].len;
+
+            while (left) {
+                u32 step = (u32) min_t(u64, left, U32_MAX);
+
+                scrub_mark_ref(&sub, p, step);
+                p += step;
+                left -= step;
+            }
+        }
         scrub_note_peak(&ctx);
         if (cetrafs_scrub_verdict_stall_ms) { /* TEST ONLY */
             unsigned int ms;
@@ -1329,6 +1360,7 @@ static void cetrafs_scrub_cycle(struct cetrafs_scrub *s)
         pr_info("scrub: reclaimed %llu leaked data block(s) across %u owned BG(s)\n", (unsigned long long) freed,
                 ctx.nbgs);
 done:
+    cetrafs_journal_refs_free(&jrefs);
     scrub_free_targets(&ctx);
     atomic64_set(&cetrafs_scrub_last_ms, ktime_ms_delta(ktime_get(), t0));
 }
