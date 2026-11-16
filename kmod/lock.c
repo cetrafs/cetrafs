@@ -373,6 +373,11 @@ struct cetrafs_inode_info {
      * (cetrafs_lock_settle_close()). Guarded by lock_mutex. */
     unsigned int close_owes_presence;
     bool close_owes_suspend_mark;
+    /* nofilelock: this node's bit in write_open_nodes is set (or a clear
+     * of it did not land). Set by a write-open, cleared once the last
+     * writer's publish has landed (cetrafs_lock_settle_close()) or with
+     * the presence bit. Guarded by lock_mutex. */
+    bool writer_bit_published;
 
     /* DEFAULT mount only: this node has surrendered this inode's
      * automatic lock on request (flock(LOCK_UN)) while still holding it
@@ -1562,6 +1567,7 @@ static void cetrafs_inode_identity_init_ci(struct cetrafs_inode_info *ci)
     ci->explicit_lock_file = NULL;
     ci->close_owes_presence = 0;
     ci->close_owes_suspend_mark = false;
+    ci->writer_bit_published = false;
     ci->lock_suspended = false;
     ci->dirent_seq_cached = U64_MAX;
     ci->file_seq_cached = U64_MAX;
@@ -2293,6 +2299,8 @@ enum cetrafs_reader_op {
     CETRAFS_READER_CLEAR, /* clears this node's suspended-writer bit too */
     CETRAFS_SUSPEND_SET,  /* mark this node's presence as a suspended writer */
     CETRAFS_SUSPEND_CLEAR,
+    CETRAFS_WRITER_SET,   /* mark this node's presence as a nofilelock writer */
+    CETRAFS_WRITER_CLEAR, /* (write_open_nodes; READER_CLEAR clears it too) */
 };
 
 /* TEST ONLY: a read-open does not re-apply the record after its presence
@@ -2355,6 +2363,9 @@ struct cetrafs_lock_cas_ctx {
      * read_open_nodes and leaves the write lock alone -- the two are
      * orthogonal and a reader must never disturb a writer's claim. */
     enum cetrafs_reader_op reader_op;
+    /* READER_SET: set the write_open_nodes bit in the same swap (a
+     * nofilelock write-open that is this node's first opener). */
+    bool set_writer;
 
     /* The access rule (docs/internal/BASICS.md): one writer and nobody
      * else, or readers and no writer. Checked INSIDE the swap, so two
@@ -2490,6 +2501,21 @@ static int cetrafs_lock_cas_mutate(void *image, unsigned int len, void *priv)
             return 0;
         }
 
+        if (ctx->reader_op == CETRAFS_WRITER_SET || ctx->reader_op == CETRAFS_WRITER_CLEAR) {
+            u64 wo = cetrafs_le64(rec.write_open_nodes);
+            u64 nwo = (ctx->reader_op == CETRAFS_WRITER_SET) ? (wo | bit) : (wo & ~bit);
+
+            /* A subset of read_open_nodes, as the suspended mark is. */
+            if (ctx->reader_op == CETRAFS_WRITER_SET && !(cetrafs_le64(rec.read_open_nodes) & bit))
+                return -EINVAL;
+            if (nwo == wo)
+                return 1;
+            rec.write_open_nodes = cetrafs_cpu_to_le64(nwo);
+            cetrafs_inode_stamp_crc_ns(&rec);
+            memcpy(image, &rec, CETRAFS_INODE_NS_BYTES);
+            return 0;
+        }
+
         if (ctx->reader_op == CETRAFS_READER_SET && cetrafs_lock_rec_dead_to_us(&rec, ctx->my_node_id))
             return -ENOENT; /* deleted since our read: see the helper */
 
@@ -2526,11 +2552,13 @@ static int cetrafs_lock_cas_mutate(void *image, unsigned int len, void *priv)
 
         want = (ctx->reader_op == CETRAFS_READER_SET) ? (cetrafs_le64(rec.read_open_nodes) | bit)
                                                       : (cetrafs_le64(rec.read_open_nodes) & ~bit);
-        if (ctx->reader_op == CETRAFS_READER_CLEAR && (cetrafs_le64(rec.suspended_writer_nodes) & bit)) {
-            /* Gone entirely: a suspended writer's mark goes with its
-             * presence (last close while suspended, or a dead node's
-             * bits being cleared). */
+        if (ctx->reader_op == CETRAFS_READER_CLEAR &&
+            ((cetrafs_le64(rec.suspended_writer_nodes) | cetrafs_le64(rec.write_open_nodes)) & bit)) {
+            /* Gone entirely: a suspended writer's mark and a writer's
+             * bit go with its presence (last close while suspended, or a
+             * dead node's bits being cleared). */
             rec.suspended_writer_nodes = cetrafs_cpu_to_le64(cetrafs_le64(rec.suspended_writer_nodes) & ~bit);
+            rec.write_open_nodes = cetrafs_cpu_to_le64(cetrafs_le64(rec.write_open_nodes) & ~bit);
             rec.read_open_nodes = cetrafs_cpu_to_le64(want);
             rec.read_open_incarnation[slot] = cetrafs_cpu_to_le32(0);
             cetrafs_inode_stamp_crc_ns(&rec);
@@ -2540,9 +2568,12 @@ static int cetrafs_lock_cas_mutate(void *image, unsigned int len, void *priv)
 
         if (want == cetrafs_le64(rec.read_open_nodes) &&
             (ctx->reader_op != CETRAFS_READER_SET ||
-             cetrafs_le32(rec.read_open_incarnation[slot]) == ctx->my_incarnation))
+             (cetrafs_le32(rec.read_open_incarnation[slot]) == ctx->my_incarnation &&
+              (!ctx->set_writer || (cetrafs_le64(rec.write_open_nodes) & bit)))))
             return 1; /* already in the desired state -- nothing to do */
         rec.read_open_nodes = cetrafs_cpu_to_le64(want);
+        if (ctx->reader_op == CETRAFS_READER_SET && ctx->set_writer)
+            rec.write_open_nodes = cetrafs_cpu_to_le64(cetrafs_le64(rec.write_open_nodes) | bit);
         /* SET stamps this mount's incarnation -- over a leftover bit of an
          * earlier one too: the bit is this mount's open now. */
         rec.read_open_incarnation[slot] =
@@ -2780,6 +2811,7 @@ static int cetrafs_lock_clear_on_disk(struct inode *inode, bool stamp_stat);
 /* Withdraw this node from read_open_nodes -- defined with the suspension
  * code below, used by the close path above it. */
 static void cetrafs_lock_presence_put(struct inode *inode);
+static int cetrafs_lock_writer_mark(struct inode *inode, bool set);
 static int cetrafs_lock_suspend_mark(struct inode *inode, bool set);
 
 /* TEST ONLY: fail the next presence withdraw, as a CAS the device
@@ -2992,6 +3024,13 @@ MODULE_PARM_DESC(open_silent_peer_ok, "TEST ONLY: a nofilelock open ignores a si
 
 static bool cetrafs_open_replay_stale_off;
 cetrafs_test_param(open_replay_stale_off, cetrafs_open_replay_stale_off, bool, 0644);
+
+/* TEST ONLY: a nofilelock write-open publishes no write_open_nodes bit,
+ * as before audit 2026-11-15 F-37 -- the control of
+ * tests/kernel/journal_replay_writers_only.sh. */
+static bool cetrafs_open_writer_bit_off;
+cetrafs_test_param(open_writer_bit_off, cetrafs_open_writer_bit_off, bool, 0644);
+MODULE_PARM_DESC(open_writer_bit_off, "TEST ONLY: a nofilelock write-open publishes no write_open_nodes bit");
 
 int cetrafs_lock_open(struct inode *inode, struct file *file)
 {
@@ -3486,6 +3525,8 @@ reread:
             .refuse_foreign_excl = want_write,
             .lock_owner_ok = stale_owner,
             .steal_incarnation = stale_incarnation,
+            /* And as a writer (write_open_nodes), in the same swap. */
+            .set_writer = want_write && !READ_ONCE(cetrafs_open_writer_bit_off),
         };
         int rret;
 
@@ -3544,6 +3585,10 @@ reread:
             goto out_pr_unlock;
         }
 
+        /* Published as a writer in that same swap. */
+        if (rctx.set_writer)
+            ci->writer_bit_published = true;
+
         /*
          * The open-boundary refresh above applied a record read BEFORE
          * this node was published as an opener. A peer that wrote and
@@ -3575,6 +3620,30 @@ reread:
                 goto out_pr_unlock;
             }
         }
+    }
+
+    /*
+     * A nofilelock write-open on a file this node already had open (for
+     * read): the presence bit was there, the writer bit is not. Journal
+     * replay keeps a dead node's entry back only for a WRITER
+     * (write_open_nodes), so a writer that ran unmarked could have that
+     * node's older image redone over its own writes (audit 2026-11-15
+     * F-37). Refused when it cannot be set, as the presence publish is.
+     */
+    if (want_write && !lock_on && !ci->writer_bit_published && !READ_ONCE(cetrafs_open_writer_bit_off)) {
+        int wret = cetrafs_lock_writer_mark(inode, true);
+
+        if (wret) {
+            pr_warn_ratelimited("ino=%llu could not publish this node as a writer: %d -- refusing the open\n",
+                                (unsigned long long) inode->i_ino, wret);
+            if (atomic_dec_return(&ci->read_opener_count) == 0)
+                cetrafs_lock_presence_withdraw(inode);
+            atomic_dec(&ci->lock_writer_count);
+            atomic_dec(&ci->lock_local_open_count);
+            ret = wret;
+            goto out_pr_unlock;
+        }
+        ci->writer_bit_published = true;
     }
 
     /* Force the next freshness check to go to the device instead of
@@ -3679,6 +3748,19 @@ static void cetrafs_lock_settle_close(struct inode *inode, bool orphaned)
             cetrafs_lock_presence_put(inode);
     } else if (orphaned && !atomic_read(&ci->read_opener_count)) {
         cetrafs_lock_presence_withdraw(inode);
+    }
+    /*
+     * The last writer's publish has landed: its writer bit goes too. A
+     * presence withdraw just issued takes it along (or, deferred, the
+     * heartbeat's READER_CLEAR does); a local reader still open keeps
+     * the presence, so the bit is cleared alone. One that does not land
+     * stays set, flagged for the next settle: a writer bit left behind
+     * only keeps a dead node's entry back longer -- never lets one land
+     * over a writer -- and it goes with the presence at the last close.
+     */
+    if (ci->writer_bit_published && !atomic_read(&ci->lock_writer_count)) {
+        if (!atomic_read(&ci->read_opener_count) || !cetrafs_lock_writer_mark(inode, false))
+            ci->writer_bit_published = false;
     }
 }
 
@@ -5273,6 +5355,32 @@ static int cetrafs_lock_suspend_mark(struct inode *inode, bool set)
     return ret;
 }
 
+/* Set or clear this node's bit in write_open_nodes (nofilelock). Caller
+ * holds lock_mutex; a SET needs the presence bit already set. */
+static int cetrafs_lock_writer_mark(struct inode *inode, bool set)
+{
+    struct super_block *sb = inode->i_sb;
+    cetrafs_inode_t raw;
+    u32 my_node_id;
+    int ret;
+
+    ret = cetrafs_sb_get_node_id(sb, &my_node_id);
+    if (!ret)
+        ret = cetrafs_read_raw_inode(sb, inode->i_ino, &raw);
+    if (!ret) {
+        struct cetrafs_lock_cas_ctx rctx = {
+            .my_node_id = my_node_id,
+            .generation = cetrafs_inode_get_generation(inode),
+            .reader_op = set ? CETRAFS_WRITER_SET : CETRAFS_WRITER_CLEAR,
+        };
+
+        ret = cetrafs_lock_cas(inode, &rctx, &raw);
+        if (ret > 0)
+            ret = 0; /* already so */
+    }
+    return ret;
+}
+
 static void cetrafs_lock_presence_put(struct inode *inode)
 {
     struct cetrafs_inode_info *ci = CETRAFS_I(inode);
@@ -5388,12 +5496,18 @@ static int cetrafs_own_claims_mutate(void *image, unsigned int len, void *priv)
         cetrafs_le32(rec.read_open_incarnation[ctx->me % CETRAFS_MAX_READER_NODES]) != ctx->my_incarnation) {
         rec.read_open_nodes = cetrafs_cpu_to_le64(cetrafs_le64(rec.read_open_nodes) & ~bit);
         rec.suspended_writer_nodes = cetrafs_cpu_to_le64(cetrafs_le64(rec.suspended_writer_nodes) & ~bit);
+        rec.write_open_nodes = cetrafs_cpu_to_le64(cetrafs_le64(rec.write_open_nodes) & ~bit);
         rec.read_open_incarnation[ctx->me % CETRAFS_MAX_READER_NODES] = cetrafs_cpu_to_le32(0);
         changed = true;
     }
     if ((cetrafs_le64(rec.suspended_writer_nodes) & bit) && !(cetrafs_le64(rec.read_open_nodes) & bit)) {
         /* A mark without the presence it must ride on: no open has it. */
         rec.suspended_writer_nodes = cetrafs_cpu_to_le64(cetrafs_le64(rec.suspended_writer_nodes) & ~bit);
+        changed = true;
+    }
+    if ((cetrafs_le64(rec.write_open_nodes) & bit) && !(cetrafs_le64(rec.read_open_nodes) & bit)) {
+        /* The same for a writer bit (write_open_nodes). */
+        rec.write_open_nodes = cetrafs_cpu_to_le64(cetrafs_le64(rec.write_open_nodes) & ~bit);
         changed = true;
     }
     if (cetrafs_le32(rec.ns_lock_owner) == ctx->me &&
@@ -5784,12 +5898,18 @@ static int cetrafs_late_claims_mutate(void *image, unsigned int len, void *priv)
         cetrafs_le32(rec.read_open_incarnation[ctx->me % CETRAFS_MAX_READER_NODES]) != ctx->my_incarnation) {
         rec.read_open_nodes = cetrafs_cpu_to_le64(cetrafs_le64(rec.read_open_nodes) & ~bit);
         rec.suspended_writer_nodes = cetrafs_cpu_to_le64(cetrafs_le64(rec.suspended_writer_nodes) & ~bit);
+        rec.write_open_nodes = cetrafs_cpu_to_le64(cetrafs_le64(rec.write_open_nodes) & ~bit);
         rec.read_open_incarnation[ctx->me % CETRAFS_MAX_READER_NODES] = cetrafs_cpu_to_le32(0);
         changed = true;
     }
     if ((cetrafs_le64(rec.suspended_writer_nodes) & bit) && !(cetrafs_le64(rec.read_open_nodes) & bit)) {
         /* A mark without the presence it must ride on: no open has it. */
         rec.suspended_writer_nodes = cetrafs_cpu_to_le64(cetrafs_le64(rec.suspended_writer_nodes) & ~bit);
+        changed = true;
+    }
+    if ((cetrafs_le64(rec.write_open_nodes) & bit) && !(cetrafs_le64(rec.read_open_nodes) & bit)) {
+        /* The same for a writer bit (write_open_nodes). */
+        rec.write_open_nodes = cetrafs_cpu_to_le64(cetrafs_le64(rec.write_open_nodes) & ~bit);
         changed = true;
     }
     if (!changed)

@@ -1570,7 +1570,18 @@ typedef struct {
      * and the copy is the other file's (audit 2026-11-11 X4). 0 on a
      * record that never had one. Format 0x000A. */
     __le64 xattr_seq;
-    u8 ns_pad[CETRAFS_INODE_NS_BYTES - 116 - 4 * CETRAFS_MAX_READER_NODES];
+
+    /* Which of the read_open_nodes bits hold the file open FOR WRITE
+     * under nofilelock, format 0x000A. Set with or after the presence
+     * bit on a node's first write-open, cleared once its last writer's
+     * close has published (or with the presence bit). Always a subset of
+     * read_open_nodes. What journal replay asks of a live opener: only a
+     * writer can land a write on a dead node's journaled block between
+     * replay's read and its redo, so only a writer keeps an entry back
+     * (audit 2026-11-15 F-37). A default mount's writer is marked by the
+     * file lock instead, and never sets it. */
+    __le64 write_open_nodes;
+    u8 ns_pad[CETRAFS_INODE_NS_BYTES - 124 - 4 * CETRAFS_MAX_READER_NODES];
 
     /* ===== SECTOR 1: the FILE DOMAIN ===== */
     __le64 fd_ino;                /* identity echo of .ino */

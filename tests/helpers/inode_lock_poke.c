@@ -73,8 +73,9 @@ int main(int argc, char **argv)
      * presence bit), format 0x000A: INODE_LOCK_POKE_INC=<n>, default 0. */
     uint32_t plant_inc = getenv("INODE_LOCK_POKE_INC") ? (uint32_t) strtoul(getenv("INODE_LOCK_POKE_INC"), NULL, 0) : 0;
 
-    /* --sw <ino>: print suspended_writer_nodes alone (access_rule.sh). */
-    if (argc == 4 && strcmp(argv[2], "--sw") == 0) {
+    /* --sw <ino>: print suspended_writer_nodes alone (access_rule.sh);
+     * --wo <ino>: write_open_nodes (journal_replay_writers_only.sh). */
+    if (argc == 4 && (strcmp(argv[2], "--sw") == 0 || strcmp(argv[2], "--wo") == 0)) {
         int sfd = open(argv[1], O_RDONLY);
         cetrafs_superblock_t ssb;
         cetrafs_inode_t sin;
@@ -86,8 +87,12 @@ int main(int argc, char **argv)
         pread_all(sfd, &ssb, sizeof(ssb), 0);
         pread_all(sfd, &sin, sizeof(sin),
                   (off_t) (cetrafs_le64(ssb.inode_table_start) + strtoull(argv[3], NULL, 0) - 1) * CETRAFS_BLOCK_SIZE);
-        printf("suspended=0x%" PRIx64 " readers=0x%" PRIx64 "\n", (uint64_t) cetrafs_le64(sin.suspended_writer_nodes),
-               (uint64_t) cetrafs_le64(sin.read_open_nodes));
+        if (strcmp(argv[2], "--wo") == 0)
+            printf("writers=0x%" PRIx64 " readers=0x%" PRIx64 "\n", (uint64_t) cetrafs_le64(sin.write_open_nodes),
+                   (uint64_t) cetrafs_le64(sin.read_open_nodes));
+        else
+            printf("suspended=0x%" PRIx64 " readers=0x%" PRIx64 "\n", (uint64_t) cetrafs_le64(sin.suspended_writer_nodes),
+                   (uint64_t) cetrafs_le64(sin.read_open_nodes));
         close(sfd);
         return 0;
     }
@@ -156,7 +161,7 @@ int main(int argc, char **argv)
 
     if (argc != 3 && argc != 5 && !(argc == 4 && (has_rec || has_incs))) {
         fprintf(stderr,
-                "usage: %s <image> <ino> [<owner_node_id> <lock_mode> | --ns <id> | --reader <node_id> | --unreader <node_id> | --suspended <node_id> | --mark-only <node_id>]\n",
+                "usage: %s <image> <ino> [<owner_node_id> <lock_mode> | --ns <id> | --reader <node_id> | --unreader <node_id> | --suspended <node_id> | --mark-only <node_id> | --writer <node_id>]\n",
                 argv[0]);
         return 2;
     }
@@ -239,6 +244,7 @@ int main(int argc, char **argv)
     bool suspended_mode = (strcmp(argv[3], "--suspended") == 0);
     bool mark_only = (strcmp(argv[3], "--mark-only") == 0);
     bool unreader = (strcmp(argv[3], "--unreader") == 0);
+    bool writer_mode = (strcmp(argv[3], "--writer") == 0);
     uint32_t owner = 0, lock_mode = 0;
 
     if (unreader) {
@@ -248,7 +254,17 @@ int main(int argc, char **argv)
 
         in.read_open_nodes = cetrafs_cpu_to_le64(cetrafs_le64(in.read_open_nodes) & ~bit);
         in.suspended_writer_nodes = cetrafs_cpu_to_le64(cetrafs_le64(in.suspended_writer_nodes) & ~bit);
+        in.write_open_nodes = cetrafs_cpu_to_le64(cetrafs_le64(in.write_open_nodes) & ~bit);
         in.read_open_incarnation[strtoul(argv[4], NULL, 0) % 64] = cetrafs_cpu_to_le32(0);
+        reader_mode = true; /* same report below */
+    } else if (writer_mode) {
+        /* A PEER holding the file open for write under nofilelock:
+         * presence bit plus its writer bit (write_open_nodes). */
+        uint64_t bit = 1ULL << (strtoul(argv[4], NULL, 0) % 64);
+
+        in.read_open_nodes = cetrafs_cpu_to_le64(cetrafs_le64(in.read_open_nodes) | bit);
+        in.write_open_nodes = cetrafs_cpu_to_le64(cetrafs_le64(in.write_open_nodes) | bit);
+        in.read_open_incarnation[strtoul(argv[4], NULL, 0) % 64] = cetrafs_cpu_to_le32(plant_inc);
         reader_mode = true; /* same report below */
     } else if (mark_only) {
         /* A writer mark with NO presence bit under it: the state fsck

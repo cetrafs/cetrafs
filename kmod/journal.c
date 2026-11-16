@@ -2445,9 +2445,10 @@ MODULE_PARM_DESC(journal_live_opener_off, "TEST ONLY: replay redoes an entry who
  * of it and the redo landing, the dead node's older image would land
  * on top of the live write (audit 2026-11-15 M-20). So:
  *
- *   - a LIVE foreign node (not the dead one, not stale) has it open:
- *     1, kept -- the area stays dirty, and the redo waits for that
- *     opener to close (or for its own replay of it, below);
+ *   - a LIVE foreign node (not the dead one, not stale) has it open
+ *     for write (see below for what counts): 1, kept -- the area stays
+ *     dirty, and the redo waits for that writer to close (or for its
+ *     own replay of it);
  *   - THIS node has it open: its writers mutate the tree under
  *     invalidate_lock, held exclusively here across the last read and
  *     the redo (*out, to be released by the caller); taken only by
@@ -2457,11 +2458,17 @@ MODULE_PARM_DESC(journal_live_opener_off, "TEST ONLY: replay redoes an entry who
  *
  * Any read that fails is -EIO: kept, never guessed.
  */
+/* TEST ONLY: a live READER keeps a dead node's entry back too, as before
+ * audit 2026-11-15 F-37 (tests/kernel/journal_replay_writers_only.sh). */
+static bool cetrafs_journal_any_opener;
+cetrafs_test_param(journal_any_opener, cetrafs_journal_any_opener, bool, 0644);
+MODULE_PARM_DESC(journal_any_opener, "TEST ONLY: replay keeps an entry back for a live reader too");
+
 static int cetrafs_journal_live_opener(struct super_block *sb, const struct cetrafs_journal_replay_entry *e, u32 dead,
                                        struct inode **out)
 {
     cetrafs_inode_t raw;
-    u64 others;
+    u64 others, mine;
     u32 me;
 
     *out = NULL;
@@ -2474,12 +2481,31 @@ static int cetrafs_journal_live_opener(struct super_block *sb, const struct cetr
         return -EIO;
     if (cetrafs_le64(raw.generation) != e->owner_generation)
         return 0; /* not the entry's file: the owner check refuses it */
-    others = (cetrafs_le64(raw.read_open_nodes) | cetrafs_le64(raw.suspended_writer_nodes)) &
-             ~(1ULL << (dead % CETRAFS_MAX_READER_NODES));
-    if (others & (1ULL << (me % CETRAFS_MAX_READER_NODES))) {
+    /*
+     * Only a WRITER can land a write on the target between our read and
+     * the redo: a node with the file open for write (write_open_nodes),
+     * a writer handing it over (suspended_writer_nodes), or the holder
+     * of a lock taken under nofilelock (flock(LOCK_EX), a defrag pin).
+     * A reader only reads, and a reader that opens for write later goes
+     * through the open's own replay of this node first (lock.c). Keeping
+     * an entry back for readers held a dead node's redo -- and with it
+     * the open of its file elsewhere -- for as long as any node merely
+     * read the file (audit 2026-11-15 F-37).
+     */
+    mine = 1ULL << (me % CETRAFS_MAX_READER_NODES);
+    others = cetrafs_le64(raw.write_open_nodes) | cetrafs_le64(raw.suspended_writer_nodes);
+    if (READ_ONCE(cetrafs_journal_any_opener))
+        others |= cetrafs_le64(raw.read_open_nodes);
+    if (cetrafs_lock_mode_held(cetrafs_le32(raw.lock_mode)) &&
+        cetrafs_le32(raw.lock_owner_node) < CETRAFS_MAX_READER_NODES)
+        others |= 1ULL << cetrafs_le32(raw.lock_owner_node);
+    others &= ~(1ULL << (dead % CETRAFS_MAX_READER_NODES));
+    /* This node: any opener of ours, reader or writer, is excluded by
+     * invalidate_lock below. */
+    if ((others | cetrafs_le64(raw.read_open_nodes)) & mine) {
         struct inode *inode = ilookup(sb, e->owner_ino);
 
-        others &= ~(1ULL << (me % CETRAFS_MAX_READER_NODES));
+        others &= ~mine;
         if (inode && cetrafs_inode_get_generation(inode) == e->owner_generation) {
             if (!down_write_trylock(&inode->i_mapping->invalidate_lock)) {
                 iput(inode);

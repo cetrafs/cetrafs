@@ -14,7 +14,7 @@
 # tree references yet: the scrub must not judge them leaked while it is.
 #
 # Node 1 is dead with one entry for file v's extent leaf; node 2, live,
-# has v open, so the entry is kept. Its image points v's first extent at
+# has v open for write, so the entry is kept. Its image points v's first extent at
 # a block the dead node "allocated" (bit set) and nothing else references.
 #   S. an open of w (node 1 had it open) succeeds; an open of v is refused;
 #   G. the scrub skips while node 1's journal is dirty; once node 2 closes
@@ -96,7 +96,7 @@ setup() {
     "$JPOKE" "$DEV" 1 0 "$p" "$b" --guard-current >/dev/null
     poke_dead_peer "$DEV" 2 bb
     "$(ct_helper node_poke)" "$DEV" 2 --mode 2 >/dev/null
-    "$LPOKE" "$DEV" "$INO" --reader 2 >/dev/null
+    "$LPOKE" "$DEV" "$INO" --writer 2 >/dev/null
     if [ "$2" = S ]; then
         "$LPOKE" "$DEV" "$INO" --reader 1 >/dev/null
         "$LPOKE" "$DEV" "$w" --reader 1 >/dev/null

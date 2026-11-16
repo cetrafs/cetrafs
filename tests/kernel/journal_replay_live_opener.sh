@@ -13,7 +13,7 @@
 # Node 1 is dead with one entry for file v's extent leaf (guarded
 # against the leaf as it is, so a redo would apply). The heartbeat's
 # sweep replays it:
-#   L. node 2, live, has v open: kept -- the leaf untouched, counted;
+#   L. node 2, live, has v open for write: kept -- the leaf untouched, counted;
 #   R. node 2's presence cleared: applied;
 #   O. only this node has v open (an fd held across the sweep): applied.
 #
@@ -70,7 +70,9 @@ round() {
     if [ "$2" != O ]; then
         poke_dead_peer "$DEV" 2 bb
         "$(ct_helper node_poke)" "$DEV" 2 --mode 2 >/dev/null
-        "$LPOKE" "$DEV" "$ino" --reader 2 >/dev/null
+        # Open for WRITE: only a writer keeps an entry back
+        # (journal_replay_writers_only.sh covers the reader).
+        "$LPOKE" "$DEV" "$ino" --writer 2 >/dev/null
         [ "$2" = R ] && "$LPOKE" "$DEV" "$ino" --unreader 2 >/dev/null
     fi
     blockdev --flushbufs "$DEV"

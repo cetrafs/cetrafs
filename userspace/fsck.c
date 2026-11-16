@@ -3626,6 +3626,13 @@ int main(int argc, char **argv)
                         "presence bit the mark qualifies\n",
                         ino,
                         (uint64_t) (cetrafs_le64(in.suspended_writer_nodes) & ~cetrafs_le64(in.read_open_nodes)));
+            /* The same for the writer bits (write_open_nodes). Left
+             * behind, it only keeps a dead node's journal entry back. */
+            if (cetrafs_le64(in.write_open_nodes) & ~cetrafs_le64(in.read_open_nodes))
+                fprintf(stderr,
+                        "WARN: inode %" PRIu64 " marks node(s) 0x%" PRIx64 " as writers without the presence "
+                        "bit the mark qualifies\n",
+                        ino, (uint64_t) (cetrafs_le64(in.write_open_nodes) & ~cetrafs_le64(in.read_open_nodes)));
 
             /* An allocated nlink=0 inode is left when a delete could
              * not free it -- a peer's open racing the unlink's check, an
