@@ -64,6 +64,7 @@
 #include <linux/kernel.h>
 #include <linux/minmax.h>
 #include <linux/mutex.h>
+#include <linux/sched/mm.h>
 #include <linux/slab.h>
 #include <linux/sort.h>
 #include <linux/stddef.h>
@@ -2609,7 +2610,14 @@ int cetrafs_journal_replay_node(struct super_block *sb, u32 node_id, bool wait_f
                     node_id);
             ret = -EBUSY;
         } else {
+            /* No allocation in here may recurse into this filesystem:
+             * reclaim evicting an inode can reach a stale holder's
+             * branch that replays this same node, behind the mutex this
+             * task holds (audit 2026-11-15 BM-35). */
+            unsigned int nofs = memalloc_nofs_save();
+
             ret = __cetrafs_journal_replay_node(sb, node_id, wait_for_claim);
+            memalloc_nofs_restore(nofs);
         }
     }
     atomic_dec(&j->replaying[node_id]);
