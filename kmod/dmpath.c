@@ -673,7 +673,8 @@ static void cetrafs_dmpath_drop_refs(struct cetrafs_dmpath_entry *e)
  * Which path a CAW goes down, by what the array says of it (ALUA, as
  * scsi_dh_alua records it in access_state; a path with no handler reads
  * OPTIMAL): 0 active/optimised, 1 active/non-optimised, 2 in transition
- * or unknown, 3 standby, unavailable or offline. The first slave that
+ * or unknown, 3 standby, unavailable or offline; 4 blocked, whatever its
+ * ALUA state (below). The first slave that
  * passed the identity check was taken whatever its state, so on an
  * active/non-optimised array every CAW was proxied between controllers,
  * and on strict active/passive one went to the standby port and was
@@ -690,8 +691,77 @@ static unsigned int cetrafs_dmpath_upgrade_secs = 30;
 cetrafs_test_param(dmpath_upgrade_secs, cetrafs_dmpath_upgrade_secs, uint, 0644);
 MODULE_PARM_DESC(dmpath_upgrade_secs, "seconds between a non-optimised CAW path's looks for an optimised one (0 = never)");
 
+/*
+ * A path the SCSI layer has BLOCKED -- an iSCSI session in recovery, an
+ * FC rport gone until fast_io_fail_tmo -- still reads "online", and a
+ * command sent to it is not timed: its request sits in a quiesced queue,
+ * and CETRAFS_CAW_TIMEOUT_JIFFIES only starts at dispatch. A CAW on it
+ * waits for the transport to give up, which can outlast the lease while
+ * another path sits right there; the heartbeat's renewal is a CAW too
+ * (audit 2026-11-15 BM-49). So a blocked path ranks below every other
+ * and is taken only when nothing else is left -- waiting then is the
+ * fail-safe direction (a self-fence, not a ghost write), and the same
+ * wait the mapped device's own I/O is in.
+ *
+ * TEST ONLY: dmpath_ignore_blocked=1 ranks it as before.
+ */
+static bool cetrafs_dmpath_ignore_blocked;
+cetrafs_test_param(dmpath_ignore_blocked, cetrafs_dmpath_ignore_blocked, bool, 0644);
+MODULE_PARM_DESC(dmpath_ignore_blocked, "TEST ONLY: a blocked SCSI path ranks by its ALUA state alone");
+
+#define CETRAFS_DMPATH_RANK_BLOCKED 4
+
+/*
+ * TEST ONLY: block a SCSI disk's device as a transport in recovery does,
+ * for real -- state SDEV_BLOCK, its queue quiesced -- so a command sent
+ * to it waits untimed. "sdX" blocks it, "-sdX" unblocks it
+ * (tests/kernel/dmpath_blocked_path.sh). No sysfs knob does this: the
+ * device's "state" file takes only running and offline.
+ */
+static int cetrafs_dmpath_test_block_set(const char *val, const struct kernel_param *kp)
+{
+    char path[48], name[32];
+    bool unblock = val[0] == '-';
+    struct scsi_device *sdev;
+    struct file *file;
+    int ret;
+
+    if (sscanf(val + unblock, "%31s", name) != 1 || strchr(name, '/'))
+        return -EINVAL;
+    snprintf(path, sizeof(path), "/dev/%s", name);
+    file = bdev_file_open_by_path(path, BLK_OPEN_READ, NULL, NULL);
+    if (IS_ERR(file))
+        return PTR_ERR(file);
+    sdev = cetrafs_caw_get_sdev(file_bdev(file));
+    if (!sdev) {
+        fput(file);
+        return -ENXIO;
+    }
+    mutex_lock(&sdev->state_mutex);
+    ret = unblock ? scsi_internal_device_unblock_nowait(sdev, SDEV_RUNNING)
+                  : scsi_internal_device_block_nowait(sdev);
+    mutex_unlock(&sdev->state_mutex);
+    pr_warn("dm path: TEST %s %s: %d\n", unblock ? "unblocked" : "blocked", name, ret);
+    add_taint(TAINT_USER, LOCKDEP_STILL_OK); /* as every test knob (cetrafs_test_param()) */
+    scsi_device_put(sdev);
+    fput(file);
+    return ret;
+}
+static const struct kernel_param_ops cetrafs_dmpath_test_block_ops = {.set = cetrafs_dmpath_test_block_set};
+module_param_cb(dmpath_test_block, &cetrafs_dmpath_test_block_ops, NULL, 0200);
+MODULE_PARM_DESC(dmpath_test_block, "TEST ONLY: \"sdX\" blocks that SCSI device, \"-sdX\" unblocks it");
+
+static bool cetrafs_dmpath_blocked(const struct scsi_device *sdev)
+{
+    enum scsi_device_state st = READ_ONCE(sdev->sdev_state);
+
+    return !READ_ONCE(cetrafs_dmpath_ignore_blocked) && (st == SDEV_BLOCK || st == SDEV_CREATED_BLOCK);
+}
+
 static u8 cetrafs_dmpath_rank(const struct scsi_device *sdev)
 {
+    if (cetrafs_dmpath_blocked(sdev))
+        return CETRAFS_DMPATH_RANK_BLOCKED;
     if (READ_ONCE(cetrafs_dmpath_ignore_alua))
         return 0;
     switch (READ_ONCE(sdev->access_state) & SCSI_ACCESS_STATE_MASK) {
@@ -710,7 +780,7 @@ static u8 cetrafs_dmpath_rank(const struct scsi_device *sdev)
 }
 
 static const char *const cetrafs_dmpath_rank_name[] = {"active/optimised", "active/non-optimised", "transitioning",
-                                                       "standby"};
+                                                       "standby", "blocked"};
 
 /* Is any path under 'bdev' of a better ALUA rank than 'than'? A field
  * read per path, no I/O: the resolution that follows does the checks. */
@@ -958,7 +1028,7 @@ static void cetrafs_dmpath_upgrade(struct block_device *bdev, struct cetrafs_dmp
     mutex_lock(&cetrafs_dmpath_mutex);
     if (found && slot->dm_dev == bdev->bd_dev && slot->sdev && !slot->resolving) {
         pr_info("dm path: %s is %s and %s passed as %s -- moving CAW there\n", slot->name,
-                cetrafs_dmpath_rank_name[min_t(u8, now, 3)], tmp.name, cetrafs_dmpath_rank_name[tmp.rank]);
+                cetrafs_dmpath_rank_name[min_t(u8, now, CETRAFS_DMPATH_RANK_BLOCKED)], tmp.name, cetrafs_dmpath_rank_name[tmp.rank]);
         cetrafs_dmpath_drop_refs(slot);
         *slot = tmp;
         found = false; /* the slot holds the references now */
