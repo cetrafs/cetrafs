@@ -881,7 +881,9 @@ int cetrafs_node_declare_dead(struct super_block *sb, u32 node_id, u32 incarnati
         return -EINVAL;
     if (cetrafs_sb_is_fenced(sb))
         return -EIO;
-    if (!cetrafs_sb_get_node_id(sb, &me) && me == node_id)
+    /* Not "no error and it is me": an error skipped the guard, and this
+     * node could declare itself (fail closed, class 36). */
+    if (cetrafs_sb_get_node_id(sb, &me) || me == node_id)
         return -EINVAL;
     if (READ_ONCE(cetrafs_declare_dead_unguarded))
         return cetrafs_node_fence_peer_full(sb, node_id, "nothing: declared dead through controls",
