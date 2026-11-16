@@ -441,84 +441,11 @@ MODULE_PARM_DESC(dmpath_read_fail, "TEST ONLY: fail the next N passthrough READs
  * bdev_rw_virt() goes straight to the device and does not touch the
  * cache at all, which is the only freshness this one-off read needs.
  */
-/*
- * A second identity for a mounted volume, for when block 0 no longer
- * says which volume it is: this node's own registry row. A wiped or
- * zeroed block 0 -- an admin's "wipe", a stray partition table (audit
- * 2026-11-14 A-7) -- left every running node refusing every path at its
- * next path event, a routine failover included, and stopping (audit
- * 2026-11-15 B-15). The row carries its own checksum and this machine's
- * UUID, and its heartbeat fields make it unlike any block on another
- * LUN, so the passthrough and the mapped device returning the same
- * bytes there proves the path reaches this volume. Set once this node
- * has registered; forgotten at unmount.
- */
-struct cetrafs_dmpath_anchor {
-    dev_t dm_dev;
-    u64 byte_off;
-    u8 uuid[CETRAFS_NODE_UUID_LEN];
-};
-static struct cetrafs_dmpath_anchor cetrafs_dmpath_anchors[8];
-static DEFINE_SPINLOCK(cetrafs_dmpath_anchor_lock);
-
-/* TEST ONLY: no anchor -- a path is identified by block 0 alone, as
+/* TEST ONLY: a path is identified by block 0 alone, never its copy, as
  * before B-15 (tests/kernel/dmpath_block0_wiped.sh's control). */
-static bool cetrafs_dmpath_no_anchor;
-cetrafs_test_param(dmpath_no_anchor, cetrafs_dmpath_no_anchor, bool, 0644);
-MODULE_PARM_DESC(dmpath_no_anchor, "TEST ONLY: identify a dm path by block 0 alone");
-
-void cetrafs_dmpath_set_anchor(struct block_device *bdev, u64 byte_off, const u8 *node_uuid)
-{
-    struct cetrafs_dmpath_anchor *free_a = NULL;
-    unsigned int i;
-
-    if (!bdev)
-        return;
-    spin_lock(&cetrafs_dmpath_anchor_lock);
-    for (i = 0; i < ARRAY_SIZE(cetrafs_dmpath_anchors); i++) {
-        struct cetrafs_dmpath_anchor *a = &cetrafs_dmpath_anchors[i];
-
-        if (a->dm_dev == bdev->bd_dev) {
-            free_a = a;
-            break;
-        }
-        if (!a->dm_dev && !free_a)
-            free_a = a;
-    }
-    if (free_a) {
-        free_a->dm_dev = bdev->bd_dev;
-        free_a->byte_off = byte_off;
-        memcpy(free_a->uuid, node_uuid, CETRAFS_NODE_UUID_LEN);
-    }
-    spin_unlock(&cetrafs_dmpath_anchor_lock);
-}
-
-static bool cetrafs_dmpath_get_anchor(dev_t dm_dev, struct cetrafs_dmpath_anchor *out)
-{
-    bool found = false;
-    unsigned int i;
-
-    spin_lock(&cetrafs_dmpath_anchor_lock);
-    for (i = 0; i < ARRAY_SIZE(cetrafs_dmpath_anchors); i++)
-        if (cetrafs_dmpath_anchors[i].dm_dev == dm_dev) {
-            *out = cetrafs_dmpath_anchors[i];
-            found = true;
-            break;
-        }
-    spin_unlock(&cetrafs_dmpath_anchor_lock);
-    return found;
-}
-
-static void cetrafs_dmpath_drop_anchor(dev_t dm_dev)
-{
-    unsigned int i;
-
-    spin_lock(&cetrafs_dmpath_anchor_lock);
-    for (i = 0; i < ARRAY_SIZE(cetrafs_dmpath_anchors); i++)
-        if (cetrafs_dmpath_anchors[i].dm_dev == dm_dev)
-            memset(&cetrafs_dmpath_anchors[i], 0, sizeof(cetrafs_dmpath_anchors[i]));
-    spin_unlock(&cetrafs_dmpath_anchor_lock);
-}
+static bool cetrafs_dmpath_no_sb_copy;
+cetrafs_test_param(dmpath_no_sb_copy, cetrafs_dmpath_no_sb_copy, bool, 0644);
+MODULE_PARM_DESC(dmpath_no_sb_copy, "TEST ONLY: identify a dm path by block 0 alone, never its copy");
 
 static int cetrafs_dmpath_dev_read(struct block_device *bdev, u64 byte_off, void *buf)
 {
@@ -548,7 +475,7 @@ static int cetrafs_dmpath_identical(struct block_device *dm_bdev, struct scsi_de
 {
     unsigned int lbs = bdev_logical_block_size(dm_bdev);
     unsigned int nblocks;
-    u64 nr_blocks, last_off;
+    u64 nr_blocks, last_off, id_off = 0;
     const cetrafs_superblock_t *psb, *dsb;
     void *pbuf = NULL, *dbuf = NULL;
     int ret = -EXDEV, attempt;
@@ -580,49 +507,44 @@ static int cetrafs_dmpath_identical(struct block_device *dm_bdev, struct scsi_de
     }
     psb = pbuf;
     if (cetrafs_le32(psb->magic) != CETRAFS_MAGIC) {
-        struct cetrafs_dmpath_anchor a;
-        bool anchored = false;
-
-        if (READ_ONCE(cetrafs_dmpath_no_anchor) || !cetrafs_dmpath_get_anchor(dm_bdev->bd_dev, &a)) {
+        /*
+         * Block 0 no longer names the volume -- an admin's "wipe", a
+         * stray partition table. Every running node then refused every
+         * path at its next path event, a routine failover included, and
+         * stopped (audit 2026-11-15 B-15). The copy of block 0 (A-7)
+         * names it still, at a place no grow moves, and is compared the
+         * same way.
+         */
+        if (READ_ONCE(cetrafs_dmpath_no_sb_copy) || nr_blocks <= CETRAFS_SB_REPLICA_NR) {
             pr_warn("dm path: %s has no cetrafs superblock at LBA 0 -- refusing to send CAW to it\n", pname);
             goto out;
         }
-        /* Block 0 no longer names the volume: this node's registry row
-         * does (see cetrafs_dmpath_anchors). A heartbeat landing between
-         * the two reads is a difference, not an answer: read again. */
-        for (attempt = 0; attempt < 3 && !anchored; attempt++) {
-            if (cetrafs_dmpath_read(sdev, a.byte_off / lbs, nblocks, pbuf, lbs)) {
-                pr_warn("dm path: %s does not answer a passthrough READ -- not usable for CAW\n", pname);
-                ret = -EIO;
-                goto out;
-            }
-            if (cetrafs_dmpath_dev_read(dm_bdev, a.byte_off, dbuf)) {
-                ret = -EIO;
-                goto out;
-            }
-            anchored = !memcmp(pbuf, dbuf, CETRAFS_BLOCK_SIZE) && cetrafs_node_row_is(pbuf, a.uuid);
-        }
-        if (!anchored) {
-            pr_warn("dm path: %s has no cetrafs superblock at LBA 0, and this node's registry row does not read "
-                    "the same through it -- refusing to send CAW to it\n",
-                    pname);
-            goto out;
-        }
-        pr_warn_ratelimited("dm path: %s: block 0 holds no cetrafs superblock (wiped?) -- the path is identified "
-                            "by this node's registry row; run fsck before the next mount\n",
-                            pname);
-    } else {
-        if (cetrafs_dmpath_dev_read(dm_bdev, 0, dbuf)) {
+        id_off = CETRAFS_SB_REPLICA_NR * CETRAFS_BLOCK_SIZE;
+        if (cetrafs_dmpath_read(sdev, id_off / lbs, nblocks, pbuf, lbs)) {
+            pr_warn("dm path: %s does not answer a passthrough READ -- not usable for CAW\n", pname);
             ret = -EIO;
             goto out;
         }
-        dsb = dbuf;
-        if (cetrafs_le32(dsb->magic) != CETRAFS_MAGIC || memcmp(dsb->uuid, psb->uuid, sizeof(dsb->uuid))) {
-            pr_warn("dm path: %s block 0 is not the mapped device's volume (magic or UUID) -- the mapping is not "
-                    "1:1 (a partition or an offset?), refusing to send CAW to it\n",
-                    pname);
+        if (cetrafs_le32(psb->magic) != CETRAFS_MAGIC) {
+            pr_warn("dm path: %s has no cetrafs superblock at LBA 0 nor its copy at block %llu -- refusing to "
+                    "send CAW to it\n",
+                    pname, (unsigned long long) CETRAFS_SB_REPLICA_NR);
             goto out;
         }
+        pr_warn_ratelimited("dm path: %s: block 0 holds no cetrafs superblock (wiped?) -- the path is identified "
+                            "by its copy at block %llu; fsck.cetra -r restores block 0 from it\n",
+                            pname, (unsigned long long) CETRAFS_SB_REPLICA_NR);
+    }
+    if (cetrafs_dmpath_dev_read(dm_bdev, id_off, dbuf)) {
+        ret = -EIO;
+        goto out;
+    }
+    dsb = dbuf;
+    if (cetrafs_le32(dsb->magic) != CETRAFS_MAGIC || memcmp(dsb->uuid, psb->uuid, sizeof(dsb->uuid))) {
+        pr_warn("dm path: %s block %llu is not the mapped device's volume (magic or UUID) -- the mapping is not "
+                "1:1 (a partition or an offset?), refusing to send CAW to it\n",
+                pname, (unsigned long long) (id_off / CETRAFS_BLOCK_SIZE));
+        goto out;
     }
 
     /* The last block: the same LBA on both sides, read fresh from each. */
@@ -1287,7 +1209,6 @@ void cetrafs_dmpath_forget(struct block_device *bdev)
 
     if (!bdev)
         return;
-    cetrafs_dmpath_drop_anchor(bdev->bd_dev);
 
 restart:
     mutex_lock(&cetrafs_dmpath_mutex);
