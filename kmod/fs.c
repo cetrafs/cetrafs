@@ -3874,6 +3874,42 @@ bool cetrafs_sb_peer_progress_stale(struct super_block *sb, u32 node_id, const c
     return stale;
 }
 
+/*
+ * Sample a peer's row into the same watch the stale verdict uses, for a
+ * caller that needs "is it beating NOW?" rather than "is it dead?"
+ * (cetrafs_node_peer_beating()). Returns true when the row moved since
+ * the last sample; *first is set when there was none (no move can be
+ * inferred), and *since is when the current mark was first seen -- no
+ * earlier than the beat itself, so a silence measured from it is never
+ * overstated.
+ */
+bool cetrafs_sb_peer_sample(struct super_block *sb, u32 node_id, const cetrafs_node_entry_t *ne, bool *first,
+                            unsigned long *since)
+{
+    struct cetrafs_sb_info *sbi = sb->s_fs_info;
+    struct cetrafs_peer_watch *w;
+    bool moved = false;
+
+    *first = true;
+    *since = jiffies;
+    if (!sbi || !sbi->peers || node_id >= sbi->peer_count)
+        return false;
+    spin_lock(&sbi->peer_lock);
+    w = &sbi->peers[node_id];
+    if (!w->valid || !cetrafs_row_mark_same(&w->mark, ne)) {
+        *first = !w->valid;
+        moved = w->valid;
+        w->valid = true;
+        cetrafs_row_mark_of(&w->mark, ne);
+        w->seen_at = jiffies;
+    } else {
+        *first = false;
+    }
+    *since = w->seen_at;
+    spin_unlock(&sbi->peer_lock);
+    return moved;
+}
+
 /* The row is not REGISTERED: whatever we sampled was a previous
  * incarnation, and the next one starts a new watch. */
 void cetrafs_sb_peer_watch_forget(struct super_block *sb, u32 node_id)

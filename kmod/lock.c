@@ -2984,6 +2984,12 @@ MODULE_PARM_DESC(open_presence_stall_ms, "TEST ONLY: pause one open before its p
 /* TEST ONLY: a nofilelock open does not replay a dead opener's journal
  * (before audit 2026-11-14 M-20) -- the control of
  * tests/kernel/nofilelock_open_replays_dead.sh. */
+/* TEST ONLY: an open goes on past a silent, not-yet-stale peer with a
+ * dirty journal, as before (tests/kernel/nofilelock_open_silent_peer.sh). */
+static bool cetrafs_open_silent_peer_ok;
+cetrafs_test_param(open_silent_peer_ok, cetrafs_open_silent_peer_ok, bool, 0644);
+MODULE_PARM_DESC(open_silent_peer_ok, "TEST ONLY: a nofilelock open ignores a silent, not-yet-stale opener");
+
 static bool cetrafs_open_replay_stale_off;
 cetrafs_test_param(open_replay_stale_off, cetrafs_open_replay_stale_off, bool, 0644);
 
@@ -3084,12 +3090,46 @@ reread:
 
         while (others) {
             u32 n = (u32) __ffs64(others);
-            bool stale = false, dirty = false;
+            bool stale = false, dirty = false, beating = false;
 
             others &= ~(1ULL << n);
-            if (cetrafs_node_is_stale(sb, n, &stale) || !stale)
+            /* A read that fails decides nothing, and going on is the
+             * hazard: refused, not skipped (M-20 status, point 3). */
+            ret = cetrafs_journal_node_is_dirty(sb, n, &dirty);
+            if (!ret && dirty)
+                ret = cetrafs_node_is_stale(sb, n, &stale);
+            if (ret) {
+                pr_err("lock: ino=%llu: could not judge node %u, which has this file open (%d) -- refusing "
+                       "the open\n",
+                       (unsigned long long) inode->i_ino, n, ret);
+                goto out_pr_unlock;
+            }
+            if (!dirty)
                 continue;
-            if (cetrafs_journal_node_is_dirty(sb, n, &dirty) || !dirty)
+            /*
+             * Not stale yet: beating -- a live opener, the source of a
+             * live migration, whose journal is its own to flush -- or
+             * silent: dead, most likely, and HA restarting the VM here
+             * inside the stale window. Opened then, the file ran past
+             * the dead node's unreplayed tree writes and the heartbeat's
+             * redo a window later landed on top of this node's (M-20
+             * status, point 1). Refused until the node is stale, when
+             * this same open replays it first -- the wait a default
+             * mount's ETXTBSY already imposes there (M-48).
+             */
+            if (!stale && !READ_ONCE(cetrafs_open_silent_peer_ok)) {
+                ret = cetrafs_node_peer_beating(sb, n, &beating);
+                if (ret)
+                    goto out_pr_unlock;
+                if (beating)
+                    continue;
+                pr_warn_ratelimited("lock: ino=%llu: node %u had this file open, has stopped beating and is not "
+                                    "stale yet -- its journal must be replayed first: open refused, retry\n",
+                                    (unsigned long long) inode->i_ino, n);
+                ret = -EAGAIN;
+                goto out_pr_unlock;
+            }
+            if (!stale)
                 continue;
             ret = cetrafs_node_fence_peer(sb, n, "an open of a file it had open (nofilelock)");
             if (ret == -EBUSY)

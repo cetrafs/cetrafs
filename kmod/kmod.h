@@ -1268,6 +1268,9 @@ u64 cetrafs_sb_fence_witness_reads(void); /* fs.c: count, for the suites */
 bool cetrafs_sb_fence_witnessed_f8(struct super_block *sb);
 void cetrafs_node_log_fencer(struct super_block *sb, u32 my_node_id);
 int cetrafs_node_get_entry(struct super_block *sb, u32 idx, cetrafs_node_entry_t *out);
+int cetrafs_node_peer_beating(struct super_block *sb, u32 node_id, bool *beating);
+bool cetrafs_sb_peer_sample(struct super_block *sb, u32 node_id, const cetrafs_node_entry_t *ne, bool *first,
+                            unsigned long *since);
 u64 cetrafs_node_row_lba(struct super_block *sb, u32 idx);
 
 // zonegroup.c

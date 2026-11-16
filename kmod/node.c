@@ -2568,6 +2568,53 @@ void cetrafs_node_report_clock_skew(struct super_block *sb)
             (long long) abs(worst), worst >= 0 ? "AHEAD of" : "BEHIND", worst_row);
 }
 
+/* TEST ONLY: how long a silent peer is watched before it is called
+ * silent, in place of one of its beats plus 5 s (0: that). */
+static unsigned int cetrafs_peer_beating_wait_secs;
+cetrafs_test_param(peer_beating_wait_secs, cetrafs_peer_beating_wait_secs, uint, 0644);
+MODULE_PARM_DESC(peer_beating_wait_secs, "TEST ONLY: watch a not-yet-stale peer this long before calling it silent");
+
+/*
+ * Is a peer that is not stale beating, or has it gone silent? Asked
+ * where "not stale yet" is not enough to act on (a nofilelock open of a
+ * file it had open, cetrafs_lock_open()). Beating is only ever a move
+ * this node SAW: a first sample proves nothing, so the row is watched
+ * until it moves (beating) or stays put for one of its own beats plus a
+ * margin from when its current mark was first seen (silent). A dead
+ * node is therefore never taken for a live one; a live one is at worst
+ * waited on for one of its intervals. Killable.
+ */
+int cetrafs_node_peer_beating(struct super_block *sb, u32 node_id, bool *beating)
+{
+    *beating = false;
+    for (;;) {
+        cetrafs_node_entry_t ne;
+        unsigned long since, bound;
+        bool first;
+        u32 pi;
+        int ret;
+
+        ret = cetrafs_read_node_entry(sb, node_id, &ne);
+        if (ret)
+            return ret;
+        if (cetrafs_le32(ne.state) != CETRAFS_NODE_STATE_REGISTERED ||
+            cetrafs_le32(ne.departure) != CETRAFS_NODE_DEPART_NONE)
+            return 0; /* no live claim at all */
+        if (cetrafs_sb_peer_sample(sb, node_id, &ne, &first, &since) && !first) {
+            *beating = true;
+            return 0;
+        }
+        pi = min_t(u32, cetrafs_le32(ne.hb_interval_secs), CETRAFS_HB_INTERVAL_MAX_SECS);
+        if (!pi)
+            pi = CETRAFS_HEARTBEAT_INTERVAL_SECS;
+        bound = (unsigned long) (READ_ONCE(cetrafs_peer_beating_wait_secs) ?: pi + 5) * HZ;
+        if (time_after_eq(jiffies, since + bound))
+            return 0; /* silent */
+        if (schedule_timeout_killable(HZ))
+            return -EINTR;
+    }
+}
+
 int cetrafs_node_is_stale(struct super_block *sb, u32 node_id, bool *out_stale)
 {
     const cetrafs_superblock_t *raw_sb = cetrafs_sb_raw(sb);
