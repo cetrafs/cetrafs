@@ -16,6 +16,10 @@
 #   2. through mount.cetrafs (a loop device: no transport to hold
 #      anything): mounted;
 #   3. `mount -i -o transport_checked`, said on purpose: mounted.
+# And with the gate off (F-28: one modprobe.d line turned it off for
+# good with nothing saying so):
+#   4. the unchecked mount says so in the log and in info
+#      (mount_checked: no), a checked one says yes.
 #
 # DISCRIMINATION: require_mount_check=0 (no gate, as before): 1 mounts.
 set -euo pipefail
@@ -31,7 +35,7 @@ ct_track mnt "$MNT"
 ct_param_set require_mount_check 0
 ct_mkfs_small "$DEV" >/dev/null
 
-# try <require 0|1> <how: plain|helper|vouched> -> "rc=<n> mounted=<yes|no>"
+# try <require 0|1> <how: plain|helper|vouched> -> "rc=<n> mounted=<yes|no>"; CHECKED=<info's mount_checked>
 try() {
     local rc=0 m=no
     echo "$1" >$P/require_mount_check
@@ -40,7 +44,12 @@ try() {
     helper) "$HELPER" "$DEV" "$MNT" 2>/dev/null || rc=$? ;;
     vouched) mount -i -t cetrafs -o transport_checked "$DEV" "$MNT" 2>/dev/null || rc=$? ;;
     esac
-    mountpoint -q "$MNT" && { m=yes; umount "$MNT"; }
+    CHECKED=-
+    if mountpoint -q "$MNT"; then
+        m=yes
+        CHECKED="$(sed -n 's/^mount_checked: //p' "$(ct_procdir "$DEV")/info")"
+        umount "$MNT"
+    fi
     echo 0 >$P/require_mount_check
     echo "rc=$rc mounted=$m"
 }
@@ -49,11 +58,20 @@ MARK="$(dmesg_mark)"
 R1="$(try 1 plain)"
 [ "${R1#*mounted=}" = no ] && dmesg_since "$MARK" | grep -q "did not come through mount.cetrafs" &&
     pass "1: a mount that skipped mount.cetrafs: refused, and said why" || fail "1: $R1"
-R2="$(try 1 helper)"
+T="$(ct_tmp mrh)"
+try 1 helper >"$T"
+R2="$(cat "$T")" C2="$CHECKED"
 [ "$R2" = "rc=0 mounted=yes" ] && pass "2: through mount.cetrafs: mounted" || fail "2: $R2"
 R3="$(try 1 vouched)"
 [ "$R3" = "rc=0 mounted=yes" ] && pass "3: transport_checked given on purpose: mounted" || fail "3: $R3"
-C="$(try 0 plain)"
+echo 1 >$P/require_mount_check
+MARK="$(dmesg_mark)"
+try 0 plain >"$T"
+C="$(cat "$T")" CC="$CHECKED"
 [ "$C" = "rc=0 mounted=yes" ] && pass "control: with the gate off, the unchecked mount went through" ||
     fail "control: $C -- the suite does not reach the gate"
+[ "$CC" = no ] && [ "$C2" = yes ] && dmesg_since "$MARK" | grep -q "require_mount_check=0: mounts skip" &&
+    dmesg_since "$MARK" | grep -q "mounting without mount.cetrafs's transport check" &&
+    pass "4: the gate turned off and the mount it let in are both said, and info tells them apart" ||
+    fail "4: info mount_checked unchecked=$CC checked=$C2; log: $(dmesg_since "$MARK" | grep -c require_mount_check)"
 ct_exit

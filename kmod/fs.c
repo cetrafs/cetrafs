@@ -705,6 +705,11 @@ struct cetrafs_sb_info {
      * inside it (cetrafs_sb_trim_holds()), and a release refuses to
      * drain trim_bg while it is held (cetrafs_sb_drain_bg()). */
     bool discard_enabled;
+    /* The mount came through mount.cetrafs's transport check (an
+     * attestation, not a mode: cetrafs_get_tree() judges it for every
+     * mount). No means require_mount_check=0 let it in; info says which
+     * (audit 2026-11-15 F-28). */
+    bool transport_checked;
     struct mutex trim_mutex;
     u64 trim_lba;
     u64 trim_count;
@@ -2853,6 +2858,7 @@ int cetrafs_fill_super(struct super_block *sb, struct fs_context *fc)
             sbi->corruption_stop = fci ? fci->corruption_stop : false;
             sbi->posix_lock_local = fci && fci->posix_lock_local;
             sbi->discard_enabled = !(fci && fci->nodiscard);
+            sbi->transport_checked = fci && fci->transport_checked;
 
             /* The operator's REQUESTED mode. May be overridden below by the
              * cluster's mode (the first mounter leads); the authoritative
@@ -6427,6 +6433,13 @@ bool cetrafs_sb_file_lock_enabled(struct super_block *sb)
     return !sbi || sbi->file_lock_enabled; /* default on if somehow unset */
 }
 
+bool cetrafs_sb_transport_checked(struct super_block *sb)
+{
+    struct cetrafs_sb_info *sbi = sb->s_fs_info;
+
+    return sbi && sbi->transport_checked;
+}
+
 /* May the BACKGROUND janitor run? A manual defrag.cetra is unaffected
  * by this one; cetrafs_sb_defrag_enabled() is what covers both. */
 bool cetrafs_sb_auto_defrag_enabled(struct super_block *sb)
@@ -8432,7 +8445,24 @@ static int cetrafs_check_second_mount(struct fs_context *fc)
  * loop devices with no transport at all).
  */
 static bool cetrafs_require_mount_check = true;
-module_param_named(require_mount_check, cetrafs_require_mount_check, bool, 0644);
+
+/* A gate an operator turns off says so in the log, and each
+ * mount it lets in says so in info (mount_checked) -- one modprobe.d
+ * line turned it off for good with nothing anywhere saying so (audit
+ * 2026-11-15 F-28). */
+static int cetrafs_require_mount_check_set(const char *val, const struct kernel_param *kp)
+{
+    bool was = READ_ONCE(cetrafs_require_mount_check);
+    int ret = param_set_bool(val, kp);
+
+    if (!ret && was != READ_ONCE(cetrafs_require_mount_check))
+        pr_warn("require_mount_check=%d: mounts %s mount.cetrafs's transport check\n",
+                READ_ONCE(cetrafs_require_mount_check), READ_ONCE(cetrafs_require_mount_check) ? "need" : "skip");
+    return ret;
+}
+static const struct kernel_param_ops cetrafs_require_mount_check_ops = {.set = cetrafs_require_mount_check_set,
+                                                                        .get = param_get_bool};
+module_param_cb(require_mount_check, &cetrafs_require_mount_check_ops, &cetrafs_require_mount_check, 0644);
 MODULE_PARM_DESC(require_mount_check,
                  "Refuse a mount that did not come through mount.cetrafs's transport check (default: Y)");
 
@@ -8449,6 +8479,9 @@ static int cetrafs_get_tree(struct fs_context *fc)
                fc->source ?: "<?>");
         return invalfc(fc, "not checked by mount.cetrafs");
     }
+    if (!(fci && fci->transport_checked))
+        pr_warn("'%s': mounting without mount.cetrafs's transport check (require_mount_check=0)\n",
+                fc->source ?: "<?>");
     ret = get_tree_bdev(fc, cetrafs_fill_super);
 
     if (!ret)
