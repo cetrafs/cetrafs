@@ -2150,6 +2150,52 @@ bool cetrafs_tree_damage_unowned(void)
     return READ_ONCE(cetrafs_tree_damage_ino0);
 }
 
+/* TEST ONLY: a torn tree block awaiting a peer's replay counts as
+ * damage, as before audit 2026-11-15 F-35 (tests/kernel/torn_leaf_awaits_replay.sh). */
+static bool cetrafs_tear_replay_ignored;
+cetrafs_test_param(tear_replay_ignored, cetrafs_tear_replay_ignored, bool, 0644);
+MODULE_PARM_DESC(tear_replay_ignored, "TEST ONLY: a torn tree block whose file a dirty-journal node has open is damage");
+
+/*
+ * A tree block of file 'ino' that stays torn while another node that
+ * has the file open -- or holds its lock -- has a DIRTY journal is that
+ * node's write, most likely stopped by its death: its replay rewrites
+ * the block, and until then the read fails. Marked damaged, the file
+ * refused every write on this node until it remounted -- a VM image
+ * HA had just restarted here, unwritable after the replay had repaired
+ * it (audit 2026-11-15 F-35, BM-37). Read fresh; a read that fails
+ * explains nothing, and the verdict stands.
+ */
+static bool cetrafs_tear_awaits_replay(struct super_block *sb, u64 ino, u64 lba, const char *what)
+{
+    cetrafs_inode_t raw;
+    u64 others;
+    u32 me;
+
+    if (!ino || READ_ONCE(cetrafs_tear_replay_ignored) || cetrafs_sb_get_node_id(sb, &me))
+        return false;
+    cetrafs_invalidate_raw_inode(sb, ino);
+    if (cetrafs_read_raw_inode(sb, ino, &raw))
+        return false;
+    others = cetrafs_le64(raw.read_open_nodes) | cetrafs_le64(raw.suspended_writer_nodes);
+    if (cetrafs_lock_mode_held(cetrafs_le32(raw.lock_mode)))
+        others |= 1ULL << (cetrafs_le32(raw.lock_owner_node) % CETRAFS_MAX_READER_NODES);
+    others &= ~(1ULL << (me % CETRAFS_MAX_READER_NODES));
+    while (others) {
+        u32 n = (u32) __ffs64(others);
+        bool dirty = false;
+
+        others &= ~(1ULL << n);
+        if (!cetrafs_journal_node_is_dirty(sb, n, &dirty) && dirty) {
+            pr_warn_ratelimited("%s block %llu of ino=%llu reads torn while node %u, which has the file open, has "
+                                "an unreplayed journal -- its write, awaiting replay: not counted as damage\n",
+                                what, (unsigned long long) lba, (unsigned long long) ino, n);
+            return true;
+        }
+    }
+    return false;
+}
+
 struct buffer_head *cetrafs_blk_tail_bread(struct super_block *sb, u64 ino, u64 generation, u64 lba, u32 magic,
                                           const char *what)
 {
@@ -2198,6 +2244,10 @@ struct buffer_head *cetrafs_blk_tail_bread(struct super_block *sb, u64 ino, u64 
         pr_err_ratelimited("%s block %llu could not be read (%d of %d attempts failed) -- I/O error\n", what,
                            (unsigned long long) lba, CETRAFS_BLK_TAIL_READ_RETRIES - nbad,
                            CETRAFS_BLK_TAIL_READ_RETRIES);
+        return NULL;
+    }
+    if (cetrafs_tear_awaits_replay(sb, ino, lba, what)) {
+        cetrafs_invalidate_block(sb, lba); /* the next read checks again */
         return NULL;
     }
     pr_err("%s block %llu failed its tail checksum %d times -- corrupted, not just a torn concurrent read\n", what,
