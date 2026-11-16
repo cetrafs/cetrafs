@@ -139,6 +139,10 @@ MODULE_PARM_DESC(hb_maint_delay_ms, "TEST ONLY: milliseconds the heartbeat's mai
  * out; the beat is capped at 30 s since audit 2026-11-14 C2. */
 static bool cetrafs_hb_drain_off;
 cetrafs_test_param(hb_drain_off, cetrafs_hb_drain_off, bool, 0644);
+/* TEST ONLY: the heartbeat does not replay a stale node's journal, so a
+ * suite can see who else does (tests/kernel/nofilelock_open_replays_dead.sh). */
+static bool cetrafs_hb_replay_sweep_off;
+cetrafs_test_param(hb_replay_sweep_off, cetrafs_hb_replay_sweep_off, bool, 0644);
 MODULE_PARM_DESC(hb_drain_off, "TEST ONLY: the heartbeat does not drain pending frees");
 
 /* TEST ONLY: pause a tick right after it re-arms, where a controls
@@ -498,6 +502,8 @@ static void cetrafs_heartbeat_maint(struct work_struct *work)
                 continue;
             if (cetrafs_journal_node_is_dirty(sb, n, &dirty) || !dirty)
                 continue;
+            if (READ_ONCE(cetrafs_hb_replay_sweep_off))
+                continue; /* TEST ONLY: see the parameter */
 
             /* Revoke its lease BEFORE replaying, exactly as the ZG-steal
              * and lock-reclaim paths do (zonegroup.c, lock.c). This was

@@ -2981,6 +2981,12 @@ static unsigned int cetrafs_open_presence_stall_ms;
 cetrafs_test_param(open_presence_stall_ms, cetrafs_open_presence_stall_ms, uint, 0644);
 MODULE_PARM_DESC(open_presence_stall_ms, "TEST ONLY: pause one open before its presence swap");
 
+/* TEST ONLY: a nofilelock open does not replay a dead opener's journal
+ * (before audit 2026-11-14 M-20) -- the control of
+ * tests/kernel/nofilelock_open_replays_dead.sh. */
+static bool cetrafs_open_replay_stale_off;
+cetrafs_test_param(open_replay_stale_off, cetrafs_open_replay_stale_off, bool, 0644);
+
 int cetrafs_lock_open(struct inode *inode, struct file *file)
 {
     struct cetrafs_inode_info *ci = CETRAFS_I(inode);
@@ -3055,6 +3061,53 @@ reread:
 
         if (pause)
             msleep(pause); /* test-only: see the parameter */
+    }
+
+    /*
+     * nofilelock: a DEAD node that had this file open is replayed before
+     * the open goes on. Under the default lock its exclusive claim sends
+     * an open through the stale-holder branch below, which fences and
+     * replays it; under nofilelock it holds no claim, only its presence
+     * bit, so the file was opened past its unreplayed journal. HA
+     * restarting the VM elsewhere then ran it without the dead node's
+     * last committed tree writes, and the heartbeat's replay a stale
+     * window later raced the new writer on the same leaf -- a blind
+     * redo of the dead node's older image over the live one (audit
+     * 2026-11-14 M-20). Fenced first, and only when its area is dirty,
+     * as the heartbeat's sweep does. A replay that cannot finish refuses
+     * the open: running past it is the hazard.
+     */
+    if (!lock_on && !sb_rdonly(sb) && !READ_ONCE(cetrafs_open_replay_stale_off)) {
+        u64 others = (cetrafs_le64(raw.read_open_nodes) | cetrafs_le64(raw.suspended_writer_nodes)) &
+                     ~(1ULL << (my_node_id % CETRAFS_MAX_READER_NODES));
+        bool replayed = false;
+
+        while (others) {
+            u32 n = (u32) __ffs64(others);
+            bool stale = false, dirty = false;
+
+            others &= ~(1ULL << n);
+            if (cetrafs_node_is_stale(sb, n, &stale) || !stale)
+                continue;
+            if (cetrafs_journal_node_is_dirty(sb, n, &dirty) || !dirty)
+                continue;
+            ret = cetrafs_node_fence_peer(sb, n, "an open of a file it had open (nofilelock)");
+            if (ret == -EBUSY)
+                continue; /* it came back: a live opener, nothing to replay */
+            if (!ret)
+                ret = cetrafs_journal_replay_node(sb, n, /*wait_for_claim=*/true);
+            if (ret) {
+                pr_err("lock: ino=%llu: dead node %u had this file open and its journal could not be replayed "
+                       "(%d) -- refusing the open\n",
+                       (unsigned long long) inode->i_ino, n, ret);
+                goto out_pr_unlock;
+            }
+            pr_warn("lock: ino=%llu: replayed dead node %u's journal before opening a file it had open\n",
+                    (unsigned long long) inode->i_ino, n);
+            replayed = true;
+        }
+        if (replayed)
+            goto reread; /* the replay may have rewritten this record */
     }
 
     /* Enforcement honors a lock that is actually PRESENT on disk, in BOTH
