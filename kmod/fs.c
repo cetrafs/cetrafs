@@ -1750,6 +1750,13 @@ MODULE_PARM_DESC(mount_fail_at,
                  "TEST ONLY: fail the mount after stage N (1=register 2=gate 3=journal 4=zg-claim "
                  "5=heartbeat 6=defrag 7=root-dentry 8=procfs); 0 disables");
 
+/* TEST ONLY: a mount failing after an unclean re-attach and before its
+ * claim sweep announces a clean departure, as before audit 2026-11-15
+ * BM-16 (tests/kernel/mount_fail_unswept.sh). */
+static bool cetrafs_mount_unswept_clean;
+cetrafs_test_param(mount_unswept_clean, cetrafs_mount_unswept_clean, bool, 0644);
+MODULE_PARM_DESC(mount_unswept_clean, "TEST ONLY: a mount failing before its own-claim sweep departs clean");
+
 #define CETRAFS_MOUNT_FAIL_POINT(stage)                                                  \
     do {                                                                                 \
         if (unlikely(cetrafs_mount_fail_at == (stage))) {                                \
@@ -3205,6 +3212,15 @@ int cetrafs_fill_super(struct super_block *sb, struct fs_context *fc)
             }
             sbi->node_registered = true;
             memcpy(sbi->node_uuid, node_uuid, CETRAFS_NODE_UUID_LEN);
+            /* Back from a crash: until the sweeps below have run, the
+             * previous incarnation's claims and journal are still ours to
+             * settle, and a mount failing before then must not announce
+             * a clean departure -- the next mount would read it, skip
+             * the sweeps, and every claim of that incarnation would read
+             * live for good (audit 2026-11-15 BM-16). Cleared once the
+             * claim sweep has run. */
+            if (cetrafs_sb_unclean_reattach(sb) && !READ_ONCE(cetrafs_mount_unswept_clean))
+                sbi->own_area_unsettled = true;
             /* The path identity a wiped block 0 cannot give (dmpath.c, B-15). */
             cetrafs_dmpath_set_anchor(sb->s_bdev, cetrafs_node_row_lba(sb, sbi->node_id) * CETRAFS_BLOCK_SIZE,
                                       node_uuid);
@@ -3488,6 +3504,7 @@ int cetrafs_fill_super(struct super_block *sb, struct fs_context *fc)
                     brelse(bh);
                     return rc;
                 }
+                sbi->own_area_unsettled = false; /* replayed and swept: see the registration */
             }
             CETRAFS_MOUNT_FAIL_POINT(3);
 
@@ -4173,7 +4190,7 @@ departed:
      * skip what a crashed node's sweep would do, and the next mount of
      * this node its own-claim sweeps -- over entries never replayed. */
     if (sbi->own_area_unsettled && !flush_err) {
-        pr_err("%s: own journal area left unreplayed -- not announcing a clean departure\n", sb->s_id);
+        pr_err("%s: own journal area or claims left unsettled -- not announcing a clean departure\n", sb->s_id);
         flush_err = -EIO;
     }
     unreleased = READ_ONCE(sbi->nsrel_count) + READ_ONCE(sbi->flrel_count) + READ_ONCE(sbi->prrel_count) +
