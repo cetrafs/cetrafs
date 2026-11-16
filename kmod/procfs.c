@@ -339,6 +339,7 @@ static int cetrafs_proc_info_show(struct seq_file *m, void *v)
     seq_printf(m, "hb_sweeps: %llu\n", cetrafs_hb_sweep_count());
     seq_printf(m, "hb_row_reads: %llu\n", cetrafs_hb_row_read_count());
     seq_printf(m, "zg_claim_replay_deferrals: %llu\n", cetrafs_zg_claim_replay_deferral_count());
+    seq_printf(m, "zg_claim_replay_skips: %llu\n", cetrafs_zg_claim_replay_skip_count());
     /* Existing-block mappings vs the blocks they covered. Equal means
      * every caller is coming back per 4 KiB; blocks > calls means
      * cetrafs_get_block() is answering with contiguous runs. */

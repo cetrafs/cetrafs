@@ -499,6 +499,10 @@ struct cetrafs_sb_info {
      * another thread is still recounting (audit 2026-11-06 M4). */
     struct mutex zg_claim_mutex;
     struct task_struct *zg_claim_owner;
+    /* Zone Groups claimed on the device and not cached yet: their
+     * claim is recounting outside zg_claim_mutex (zonegroup.c, BM-39). */
+    DECLARE_BITMAP(zg_claiming, CETRAFS_MAX_ZONE_GROUPS);
+    wait_queue_head_t zg_claiming_wq;
     /* Held for write by the surplus release while it has Block Groups
      * drained out of the allocator's reach; an allocator that found no
      * space waits on it once before saying ENOSPC
@@ -2896,6 +2900,7 @@ int cetrafs_fill_super(struct super_block *sb, struct fs_context *fc)
         mutex_init(&sbi->trim_mutex);
         mutex_init(&sbi->pf_drain_mutex);
         mutex_init(&sbi->zg_claim_mutex);
+        init_waitqueue_head(&sbi->zg_claiming_wq);
         init_rwsem(&sbi->release_rwsem);
         atomic_set(&sbi->release_seq, 0);
         mutex_init(&sbi->bmap_flush_mutex);
@@ -4977,6 +4982,46 @@ bool cetrafs_sb_zg_claim_busy(struct super_block *sb)
 }
 
 /* Does the calling task hold the claim mutex? */
+/* A Zone Group claimed on the device whose claim is finishing outside
+ * the claim mutex (zonegroup.c). */
+void cetrafs_sb_zg_claiming_set(struct super_block *sb, u32 zg_id, bool on)
+{
+    struct cetrafs_sb_info *sbi = sb->s_fs_info;
+
+    if (zg_id >= CETRAFS_MAX_ZONE_GROUPS)
+        return;
+    if (on) {
+        set_bit(zg_id, sbi->zg_claiming);
+    } else {
+        clear_bit(zg_id, sbi->zg_claiming);
+        wake_up_all(&sbi->zg_claiming_wq);
+    }
+}
+
+bool cetrafs_sb_zg_claiming(struct super_block *sb, u32 zg_id)
+{
+    struct cetrafs_sb_info *sbi = sb->s_fs_info;
+
+    return zg_id < CETRAFS_MAX_ZONE_GROUPS && test_bit(zg_id, sbi->zg_claiming);
+}
+
+bool cetrafs_sb_zg_any_claiming(struct super_block *sb)
+{
+    struct cetrafs_sb_info *sbi = sb->s_fs_info;
+
+    return !bitmap_empty(sbi->zg_claiming, CETRAFS_MAX_ZONE_GROUPS);
+}
+
+/* Wait, killable, for every claim finishing outside the mutex. */
+int cetrafs_sb_zg_claiming_wait(struct super_block *sb)
+{
+    struct cetrafs_sb_info *sbi = sb->s_fs_info;
+
+    return wait_event_killable(sbi->zg_claiming_wq, bitmap_empty(sbi->zg_claiming, CETRAFS_MAX_ZONE_GROUPS))
+               ? -EINTR
+               : 0;
+}
+
 bool cetrafs_sb_zg_claim_held(struct super_block *sb)
 {
     struct cetrafs_sb_info *sbi = sb->s_fs_info;
