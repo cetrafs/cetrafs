@@ -14,8 +14,14 @@
 #   1. fsck -r reports the overlap and that repair is disabled;
 #   2. c's block is marked in use afterwards.
 #
+# Z. the same, with Block Group 0's count and Zone Group 0's total both
+#    overstated: the blocked run lowers the group's count, and must lower
+#    the total with it -- left alone it stood above the groups just
+#    lowered under it (audit 2026-11-15 F-34).
+#
 # DISCRIMINATION: CETRAFS_TEST_FSCK_SETBIT_GATED=1 (as before): c's block
-# stays free.
+# stays free. CETRAFS_TEST_FSCK_ZG_LOWER_GATED=1 (as before F-34): Z's
+# total stays above its groups.
 set -euo pipefail
 . "$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)/lib/harness.sh"
 require_root
@@ -30,9 +36,9 @@ ct_param_set auto_defrag 0
 export CETRAFS_PEER_PROBE_SECS=3
 get() { grep -o "$1=[^ ]*" <<<"$2" | head -1 | cut -d= -f2; }
 
-# <tag> <gated 0|1> -> RES
+# <tag> <gated 0|1> [Z <zg gated 0|1>] -> RES
 round() {
-    local img dev a b c pa pc d0 ds bm off byte out
+    local img dev a b c pa pc d0 ds bm off byte out out2 fr
     img="$(ct_image 560 "fsb$1")"
     dev="$(ct_loop "$img")"
     ct_mkfs "$dev" -z 1 -b 512 -J 0 -M 4 -N 1024 -f >/dev/null
@@ -53,8 +59,14 @@ round() {
     off=$((bm * 4096 + (pc - ds) / 8))
     byte="$(dd if="$img" bs=1 skip="$off" count=1 status=none | od -An -tu1 | tr -d ' ')"
     printf "\\x$(printf %02x $((byte & ~(1 << ((pc - ds) % 8)))))" | dd of="$img" bs=1 seek="$off" conv=notrunc status=none
+    if [ "${3:-}" = Z ]; then
+        fr="$(grep -oP 'free_data_blocks=\K[0-9]+' <<<"$d0")"
+        "$BGPOKE" "$img" 0 $((fr + 50)) sync-zg >/dev/null || { fail "setup: bg_poke sync-zg"; ct_exit; }
+    fi
     blockdev --flushbufs "$dev"
-    if [ "$2" = 1 ]; then
+    if [ "${3:-}" = Z ] && [ "$4" = 1 ]; then
+        out="$(CETRAFS_TEST_FSCK_ZG_LOWER_GATED=1 "$ROOT/userspace/fsck.cetra" -r "$dev" 2>&1 || true)"
+    elif [ "$2" = 1 ]; then
         out="$(CETRAFS_TEST_FSCK_SETBIT_GATED=1 "$ROOT/userspace/fsck.cetra" -r "$dev" 2>&1 || true)"
     else
         out="$("$ROOT/userspace/fsck.cetra" -r "$dev" 2>&1 || true)"
@@ -63,6 +75,9 @@ round() {
     byte="$(dd if="$img" bs=1 skip="$off" count=1 status=none | od -An -tu1 | tr -d ' ')"
     RES="overlap=$(grep -c 'cross-file overlap' <<<"$out" || true) blocked=$(grep -c 'repair is disabled' <<<"$out" || true)"
     RES="$RES unmarked=$(grep -c 'marked FREE' <<<"$out" || true) cbit=$(((byte >> ((pc - ds) % 8)) & 1))"
+    out2="$("$ROOT/userspace/fsck.cetra" "$dev" 2>&1 || true)"
+    RES="$RES zgbefore=$(grep -c 'ZG0 aggregate free_data_blocks' <<<"$out" || true)"
+    RES="$RES zgafter=$(grep -c 'ZG0 aggregate free_data_blocks' <<<"$out2" || true)"
 }
 
 round c 1
@@ -77,4 +92,17 @@ log "fixed: $R"
 [ "$(get cbit "$R")" = 1 ] && pass "2: c's block is marked in use despite the blocked repair" || fail "2: $R"
 [ "$(get cbit "$C")" = 0 ] && pass "control: gated, c's block was left free to be handed out again" ||
     fail "control: c's block was marked without the change -- the suite does not reach the gate: $C"
+
+round z 0 Z 0
+Z="$RES"
+log "Z fixed: $Z"
+round zc 0 Z 1
+ZC="$RES"
+log "Z control (totals left alone): $ZC"
+[ "$(get blocked "$Z")" -ge 1 ] && [ "$(get zgbefore "$Z")" -ge 1 ] ||
+    { fail "setup: Z had no blocked repair or no overstated total: $Z"; ct_exit; }
+[ "$(get zgafter "$Z")" = 0 ] && pass "Z: the blocked run lowered the Zone Group total with its group" ||
+    fail "Z: the total still disagrees with its groups after the run: $Z"
+[ "$(get zgafter "$ZC")" -ge 1 ] && pass "Z control: as before, the total was left above its groups" ||
+    fail "Z control: the total agreed without the change -- the suite does not reach it: $ZC"
 ct_exit

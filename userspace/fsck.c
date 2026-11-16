@@ -148,6 +148,17 @@ static int fsck_setbit_gated(void)
     return v;
 }
 
+/* TEST ONLY: a blocked repair leaves the Zone Group totals alone, as
+ * before audit 2026-11-15 F-34 (tests/kernel/fsck_setbit_when_blocked.sh). */
+static int fsck_zg_lower_gated(void)
+{
+    static int v = -1;
+
+    if (v < 0)
+        v = cetrafs_test_env("CETRAFS_TEST_FSCK_ZG_LOWER_GATED") != NULL;
+    return v;
+}
+
 /* TEST ONLY: a half-landed record blocks all repair, as it did before
  * audit 2026-11-15 BM-69 (tests/image/fsck_half_landed.sh). */
 static int fsck_half_landed_off(void)
@@ -4341,12 +4352,29 @@ int main(int argc, char **argv)
                         z, (uint64_t) cetrafs_le64(zg.free_data_blocks), zg_free_truth[z]);
                 problems++;
             }
-            /* class 45: recount -- the aggregate from its Block Groups */
-            if (repair_mode && !repair_blocked) {
-                zg.free_data_blocks = cetrafs_cpu_to_le64(zg_free_truth[z]);
-                zg.pool_free_blocks = cetrafs_cpu_to_le64(zg_pool_truth[z]);
-                if (grow_dead)
-                    zg.pool_grow_gen = zg.pool_grow_id = zg.pool_grow_credit = cetrafs_cpu_to_le64(0);
+            /* class 45: recount -- the aggregate from its Block Groups.
+             * While repair is blocked the groups' counts are only ever
+             * lowered (the group pass above), and the totals follow by
+             * the same rule: lowered to what the bitmaps hold, never
+             * raised. Left as they were, they stood above the groups
+             * just lowered under them (audit 2026-11-15 F-34). An
+             * understated total only sends the allocator elsewhere. */
+            int zg_free_lower = cetrafs_le64(zg.free_data_blocks) > zg_free_truth[z];
+            int zg_pool_lower = cetrafs_le64(zg.pool_free_blocks) > zg_pool_truth[z];
+
+            if (repair_mode && repair_blocked && !fsck_zg_lower_gated() && (zg_free_lower || zg_pool_lower)) {
+                if (zg_free_lower)
+                    zg.free_data_blocks = cetrafs_cpu_to_le64(zg_free_truth[z]);
+                if (zg_pool_lower)
+                    zg.pool_free_blocks = cetrafs_cpu_to_le64(zg_pool_truth[z]);
+            }
+            if (repair_mode && (!repair_blocked || (!fsck_zg_lower_gated() && (zg_free_lower || zg_pool_lower)))) {
+                if (!repair_blocked) {
+                    zg.free_data_blocks = cetrafs_cpu_to_le64(zg_free_truth[z]);
+                    zg.pool_free_blocks = cetrafs_cpu_to_le64(zg_pool_truth[z]);
+                    if (grow_dead)
+                        zg.pool_grow_gen = zg.pool_grow_id = zg.pool_grow_credit = cetrafs_cpu_to_le64(0);
+                }
                 /* free_data_blocks is a HOT field (v0x0008): only the
                  * hot half's checksum covers it. */
                 zg.hot_checksum = cetrafs_cpu_to_le64(0);
