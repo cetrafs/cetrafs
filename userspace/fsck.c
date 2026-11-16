@@ -137,6 +137,17 @@ static cetrafs_superblock_t repair_sb;
  * (devutil.h): stop before another write. Every repair write asks
  * (pwrite_all()), not only the loops that beat -- whole write phases run
  * between beats. */
+/* TEST ONLY: clear leaked blocks even when a directory block could not be
+ * read (before audit 2026-11-15 BM-66; tests/image/fsck_leak_gate_partial.sh). */
+static int fsck_leak_ungated(void)
+{
+    static int v = -1;
+
+    if (v < 0)
+        v = cetrafs_test_env("CETRAFS_TEST_FSCK_LEAK_UNGATED") != NULL;
+    return v;
+}
+
 static void fsck_repair_lost_check(void)
 {
     if (cetrafs_repair_write_gate() == 3) {
@@ -5242,6 +5253,17 @@ int main(int argc, char **argv)
         if (leak_deferred && repair_blocked) {
             fprintf(stderr, "NOTE: %" PRIu64 " leaked block(s) not cleared: the namespace pass found a fault "
                             "that makes them indistinguishable from a live file's\n",
+                    leak_deferred);
+        } else if (leak_deferred && tally_partial && !fsck_leak_ungated()) {
+            /* A directory block could not be read, and the orphan free
+             * above refuses for exactly that: the name that says whether
+             * an inode is garbage may be in it. Clearing leaks is the
+             * same kind of act -- not undoable, and it decides from a
+             * walk that did not see everything -- so it waits for the
+             * run that can read every block (audit 2026-11-15 BM-66). A
+             * leak left is space; a live block freed is two files. */
+            fprintf(stderr, "NOTE: %" PRIu64 " leaked block(s) not cleared: some directory blocks could not be "
+                            "read this run -- run fsck -r again after it\n",
                     leak_deferred);
         } else if (leak_deferred) {
             uint64_t ix = 0, cleared = 0;
