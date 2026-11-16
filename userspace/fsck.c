@@ -148,6 +148,17 @@ static int fsck_setbit_gated(void)
     return v;
 }
 
+/* TEST ONLY: a half-landed record blocks all repair, as it did before
+ * audit 2026-11-15 BM-69 (tests/image/fsck_half_landed.sh). */
+static int fsck_half_landed_off(void)
+{
+    static int v = -1;
+
+    if (v < 0)
+        v = cetrafs_test_env("CETRAFS_TEST_FSCK_HALF_LANDED_OFF") != NULL;
+    return v;
+}
+
 /* TEST ONLY: clear leaked blocks even when a directory block could not be
  * read (before audit 2026-11-15 BM-66; tests/image/fsck_leak_gate_partial.sh). */
 static int fsck_leak_ungated(void)
@@ -246,6 +257,24 @@ static int fsck_half_born(const cetrafs_inode_t *in, uint64_t ino)
     return (uint32_t) cetrafs_le64(in->ns_checksum) == cetrafs_inode_crc_ns_us(in) && cetrafs_le64(in->ino) == ino &&
            !in->mode && !in->generation && !in->nlink &&
            fsck_all_zero((const uint8_t *) in + CETRAFS_INODE_FD_OFF, sizeof(*in) - CETRAFS_INODE_FD_OFF);
+}
+
+/* Both sectors valid and naming this number, but on different
+ * generations: a whole-record write stopped between its sectors. Only a
+ * create writes a new generation (cetrafs_write_raw_inode() from
+ * create, mkdir and symlink), synced before the dirent that names it,
+ * so the record is a create that never finished: unnamed, owning
+ * nothing the generation it was meant to start. Its file sector may
+ * still map the previous life's blocks, freed long since and maybe
+ * another file's now -- so its extents are not collected, and a name
+ * pointing at it is the one thing that still blocks repair. */
+static int fsck_half_landed(const cetrafs_inode_t *in, uint64_t ino)
+{
+    if (fsck_half_landed_off())
+        return 0;
+    return (uint32_t) cetrafs_le64(in->ns_checksum) == cetrafs_inode_crc_ns_us(in) &&
+           (uint32_t) cetrafs_le64(in->fd_checksum) == cetrafs_inode_crc_fd_us(in) && cetrafs_le64(in->ino) == ino &&
+           cetrafs_le64(in->fd_ino) == ino && in->fd_generation != in->generation;
 }
 
 static int fsck_all_zero(const uint8_t *p, size_t n)
@@ -3511,6 +3540,13 @@ int main(int argc, char **argv)
             fsck_dead_walk = 0;
             if (!cetrafs_inode_crcs_ok(&in) && dpass)
                 continue; /* reported by the first pass */
+            if (fsck_half_landed(&in, ino)) {
+                fprintf(stderr,
+                        "WARN: inode %" PRIu64 "'s two sectors are of different generations (%" PRIu64 " and %" PRIu64
+                        ") -- a create stopped between writing them\n",
+                        ino, (uint64_t) cetrafs_le64(in.generation), (uint64_t) cetrafs_le64(in.fd_generation));
+                continue;
+            }
             if (!cetrafs_inode_crcs_ok(&in) && (fsck_all_zero(iblk, sizeof(iblk)) || fsck_half_born(&in, ino))) {
                 /* All zero: the number was taken and its record never
                  * written -- a create stopped between the two (a crash,
@@ -4384,6 +4420,7 @@ int main(int argc, char **argv)
          * its record write and its directory entry leaves, and there is
          * nothing in it to recover. */
         uint8_t *empty = (uint8_t *) xcalloc(cetrafs_le32(sb.inodes_count) + 1, 1);
+        uint8_t *halfl = (uint8_t *) xcalloc(cetrafs_le32(sb.inodes_count) + 1, 1);
         /* How many SUBDIRECTORIES each directory contains. A directory's
          * link count is 2 (itself, plus its own '.') plus one per
          * subdirectory, contributed by that child's '..'. Nothing
@@ -4444,6 +4481,7 @@ int main(int argc, char **argv)
                 continue;
             pread_all(fd, iblk, sizeof(iblk), (off_t) (cetrafs_le64(sb.inode_table_start) + ino - 1) * CETRAFS_BLOCK_SIZE);
             memcpy(&in, iblk, sizeof(in));
+            halfl[ino] = (uint8_t) fsck_half_landed(&in, ino);
             if (!cetrafs_inode_crcs_ok(&in))
                 continue; /* already reported above */
             nlinks[ino] = cetrafs_le32(in.nlink);
@@ -4681,6 +4719,20 @@ int main(int argc, char **argv)
                                 "reference tallies cannot be trusted");
                         }
                         refs[t]++;
+                        /* A half-landed record is a create that never
+                         * finished, and nothing names one of those
+                         * (fsck_half_landed()). Named, it is something
+                         * else, and which of its two halves is the file
+                         * cannot be told -- nor which blocks it owns. */
+                        if (halfl[t]) {
+                            fprintf(stderr,
+                                    "ERR: directory %" PRIu64 " names inode %" PRIu64
+                                    ", whose two sectors are of different generations\n",
+                                    ino, t);
+                            problems++;
+                            repair_block("a directory entry names a half-written inode record, so the blocks it "
+                                         "owns cannot be distinguished from leaked ones");
+                        }
 
                         /* The dirent's file_type is a COPY of the target's
                          * kind, handed to readdir as d_type; tools that trust
@@ -4906,7 +4958,8 @@ int main(int argc, char **argv)
                     pread_all(fd, zb, sizeof(zb),
                               (off_t) (cetrafs_le64(sb.inode_table_start) + ino - 1) * CETRAFS_BLOCK_SIZE);
                     memcpy(&zin, zb, sizeof(zin));
-                    if (!cetrafs_inode_crcs_ok(&zin) && (fsck_all_zero(zb, sizeof(zb)) || fsck_half_born(&zin, ino))) {
+                    if (!cetrafs_inode_crcs_ok(&zin) &&
+                        (fsck_all_zero(zb, sizeof(zb)) || fsck_half_born(&zin, ino) || fsck_half_landed(&zin, ino))) {
                         cetrafs_inode_dead_stamp_us(&zin, ino);
                         fsck_write_inode(fd, &sb, ino, &zin);
                     }
@@ -5379,6 +5432,7 @@ int main(int argc, char **argv)
         free(unverified);
         free(is_dir);
         free(empty);
+        free(halfl);
         free(dot_tgt);
         free(dotdot_tgt);
         free(parent);
