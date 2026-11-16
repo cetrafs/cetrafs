@@ -113,9 +113,16 @@ OUT="$(ct_fsck_repair "$DEV" 2>&1 || true)"
 echo "$OUT" | grep -q "NOTE: repair is disabled" &&
     pass "fsck -r says why it will not repair a volume with cross-file overlap" ||
     fail "no refusal note: $(echo "$OUT" | tail -3)"
-echo "$OUT" | grep -q "nothing repaired" && pass "...and reports that it changed nothing" ||
-    fail "it did not say it changed nothing: $(echo "$OUT" | tail -2)"
-AFTER="$(ct_fsck "$DEV" 2>&1 | grep -c "leaked" || true)"
+# The one repair still made: the shared block was marked FREE, and
+# setting the bit of a block a live extent names can only leak it, never
+# share it (audit 2026-11-15 BM-67, tests/kernel/fsck_setbit_when_blocked.sh).
+echo "$OUT" | grep -q "referenced by an inode but marked FREE" ||
+    fail "setup: the overlapping block was not reported marked FREE: $(echo "$OUT" | tail -3)"
+ROUT="$(ct_fsck "$DEV" 2>&1 || true)"
+! echo "$ROUT" | grep -q "referenced by an inode but marked FREE" &&
+    pass "...and its one repair was marking the named block in use" ||
+    fail "the named block was left FREE for the allocator: $(echo "$ROUT" | grep "marked FREE" | head -2)"
+AFTER="$(echo "$ROUT" | grep -c "leaked" || true)"
 [ "$AFTER" -ge 1 ] &&
     pass "the blocks that merely LOOK leaked were left alone (clearing them would corrupt a live file)" ||
     fail "the repair cleared blocks on a volume it did not understand"
