@@ -329,7 +329,8 @@ static void cetrafs_heartbeat_tick(struct work_struct *work)
     /* The heavy half runs as its OWN work item -- see
      * cetrafs_heartbeat_maint(). A read-only mount queues it too, for
      * the one retry it owes: see there. */
-    queue_delayed_work(system_unbound_wq, &hb->maint, 0);
+    if (!READ_ONCE(hb->stopping))
+        queue_delayed_work(system_unbound_wq, &hb->maint, 0);
 
 reschedule:
     return;
@@ -356,6 +357,8 @@ static void cetrafs_heartbeat_maint(struct work_struct *work)
 
     if (cetrafs_hb_maint_delay_ms)
         msleep(cetrafs_hb_maint_delay_ms); /* test-only; see the parameter */
+    if (READ_ONCE(hb->stopping))
+        return; /* unmounting: cetrafs_heartbeat_stop() */
 
     /* Re-checked here, not inherited from the renewal that queued us:
      * a peer may have fenced us in between, and these are all writes we
@@ -577,14 +580,36 @@ int cetrafs_heartbeat_start(struct super_block *sb, struct cetrafs_heartbeat **o
  * flag needed. Safe to call with hb == NULL (every cetrafs_free_sb_info()
  * call site before fill_super() reaches cetrafs_heartbeat_start()).
  */
+/* TEST ONLY: stop the renewal before waiting for a maintenance pass, as
+ * before audit 2026-11-15 BM-23 (tests/kernel/unmount_maint_lease.sh). */
+static bool cetrafs_hb_stop_tick_first;
+cetrafs_test_param(hb_stop_tick_first, cetrafs_hb_stop_tick_first, bool, 0644);
+MODULE_PARM_DESC(hb_stop_tick_first, "TEST ONLY: unmount stops the lease renewal before the maintenance pass");
+
 void cetrafs_heartbeat_stop(struct cetrafs_heartbeat *hb)
 {
     if (!hb)
         return;
 
-    /* The renewal first: it is the one that queues the other, so
-     * cancelling it first means the maintenance cancel below cannot be
-     * raced by a fresh queue_delayed_work() from a tick still running. */
+    if (READ_ONCE(cetrafs_hb_stop_tick_first)) {
+        cancel_delayed_work_sync(&hb->work);
+        cancel_delayed_work_sync(&hb->maint);
+        kfree(hb);
+        return;
+    }
+    /*
+     * The maintenance pass first, with the renewal still running: a pass
+     * can block on the device for as long as it likes (a replay, a
+     * drain), and waiting for it with the renewal already cancelled let
+     * the lease lapse during the unmount -- the mount then self-fenced
+     * and could not record its clean departure, and its peers could
+     * reclaim from it while it still wrote (audit 2026-11-15 BM-23).
+     * 'stopping' keeps the tick from queuing another pass; one queued
+     * before the tick saw it returns at once, and the second cancel
+     * below waits for it.
+     */
+    WRITE_ONCE(hb->stopping, true);
+    cancel_delayed_work_sync(&hb->maint);
     cancel_delayed_work_sync(&hb->work);
     cancel_delayed_work_sync(&hb->maint);
     kfree(hb);

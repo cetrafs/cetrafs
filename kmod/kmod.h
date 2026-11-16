@@ -1579,6 +1579,7 @@ struct cetrafs_heartbeat {
     struct super_block *sb;
     struct delayed_work work;  /* the lease renewal, and nothing else */
     struct delayed_work maint; /* reclaim/drain/replay: unbounded, and not on the lease's clock */
+    bool stopping;             /* unmount: no new maintenance pass (cetrafs_heartbeat_stop()) */
 };
 int cetrafs_heartbeat_start(struct super_block *sb, struct cetrafs_heartbeat **out_hb);
 unsigned int cetrafs_heartbeat_interval_secs(struct super_block *sb);
