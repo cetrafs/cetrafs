@@ -3479,6 +3479,14 @@ bool cetrafs_lba_run_is_ours(struct super_block *sb, u64 lba, u64 count)
 /* resv_seq: NULL for an owner's free; the scrub passes the registry's
  * release count from before its evidence (cetrafs_sb_resv_seq()). */
 /* out_freed: the blocks this call cleared (only the direct path clears any). */
+/* TEST ONLY: a one-shot stall where the direct free lets go of
+ * alloc_mutex between chunks, and the old loop that asked nothing after
+ * it (tests/kernel/free_chunk_fence.sh). */
+static unsigned int cetrafs_free_chunk_stall_ms;
+cetrafs_test_param(free_chunk_stall_ms, cetrafs_free_chunk_stall_ms, uint, 0644);
+static bool cetrafs_free_chunk_recheck_off;
+cetrafs_test_param(free_chunk_recheck_off, cetrafs_free_chunk_recheck_off, bool, 0644);
+
 static int __cetrafs_free_data_extent(struct super_block *sb, u64 lba, u32 count, const u64 *resv_seq, const u64 *alloc_seq, u64 *out_freed, struct cetrafs_free_batch *fb)
 {
     struct buffer_head *fbh = NULL; /* the bitmap block the loop holds */
@@ -3667,7 +3675,27 @@ static int __cetrafs_free_data_extent(struct super_block *sb, u64 lba, u32 count
             }
             cetrafs_sb_alloc_unlock(sb);
             cond_resched();
+            {
+                unsigned int ms = xchg(&cetrafs_free_chunk_stall_ms, 0);
+
+                if (ms) {
+                    pr_info("free: chunk stall at block %llu of extent [%llu +%u], %u ms\n",
+                            (unsigned long long) b, (unsigned long long) lba, count, ms);
+                    msleep(ms); /* TEST ONLY: see the parameter */
+                }
+            }
             cetrafs_sb_alloc_lock(sb);
+            /* Re-asked after every let-go, as the pending-free apply
+             * does: a fence or a Zone Group given up meanwhile makes the
+             * rest of this bitmap someone else's to change. The bits not
+             * yet cleared stay set -- a leak the scrub reclaims, never a
+             * block freed under its next owner (audit 2026-11-14 M-2). */
+            if (!READ_ONCE(cetrafs_free_chunk_recheck_off) &&
+                (cetrafs_sb_is_fenced(sb) ||
+                 (cetrafs_sb_caw_available(sb) && !cetrafs_sb_zg_owned_cached(sb, bg.owner_zg)))) {
+                ret = -EIO;
+                break;
+            }
         }
         if (resv_seq && cetrafs_resv_covers(sb, lba + b))
             continue; /* a live reservation claimed it since the caller decided -- not ours to free */
