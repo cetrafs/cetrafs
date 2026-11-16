@@ -262,6 +262,11 @@ static void cetrafs_heartbeat_tick(struct work_struct *work)
         goto reschedule;
     }
 
+    /* No I/O: a LUN shrunk under the mount stops it (fs.c). */
+    cetrafs_sb_check_device_size(sb);
+    if (cetrafs_sb_is_fenced(sb))
+        goto reschedule;
+
     ret = cetrafs_sb_get_node_id(sb, &my_node_id);
     if (ret) {
         pr_warn("heartbeat: failed to get our own node id: %d\n", ret);

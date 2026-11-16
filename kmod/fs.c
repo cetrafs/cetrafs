@@ -6068,6 +6068,38 @@ u64 cetrafs_sb_fence_witness_reads(void)
     return (u64) atomic64_read(&cetrafs_fence_witness_reads);
 }
 
+/* TEST ONLY: a device smaller than the volume goes unnoticed, as before
+ * audit 2026-11-15 M-45 (tests/kernel/device_shrink_stops.sh). */
+static bool cetrafs_device_shrink_ignored;
+cetrafs_test_param(device_shrink_ignored, cetrafs_device_shrink_ignored, bool, 0644);
+MODULE_PARM_DESC(device_shrink_ignored, "TEST ONLY: a LUN shrunk under the mount is not noticed");
+
+/*
+ * Is the device still as large as the volume? Checked at mount and when
+ * a peer's grow is adopted, and nowhere else: a LUN shrunk under a live
+ * mount was never noticed (audit 2026-11-15 M-45), and every block past
+ * the new end -- data, Block Group bitmaps, a grow's reserve -- read and
+ * wrote as an I/O error one at a time, each judged on its own. A volume
+ * whose device lost its tail is not one this node knows any more: stop,
+ * as for any contradiction between memory and disk. A field read and a
+ * compare, once per heartbeat tick.
+ */
+void cetrafs_sb_check_device_size(struct super_block *sb)
+{
+    struct cetrafs_sb_info *sbi = sb->s_fs_info;
+    struct cetrafs_bg_layout *l = cetrafs_sb_layout_of(sbi);
+    u64 have, need;
+
+    if (!l || !sb->s_bdev || READ_ONCE(cetrafs_device_shrink_ignored))
+        return;
+    have = bdev_nr_bytes(sb->s_bdev) / CETRAFS_BLOCK_SIZE;
+    need = le64_to_cpu(l->raw.total_blocks);
+    if (have >= need)
+        return;
+    cetrafs_sb_fatal(sb, "the device shrank under the mount: %llu blocks, the volume needs %llu",
+                     (unsigned long long) have, (unsigned long long) need);
+}
+
 bool cetrafs_sb_is_fenced(struct super_block *sb)
 {
     struct cetrafs_sb_info *sbi = sb->s_fs_info;
