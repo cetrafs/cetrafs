@@ -5503,7 +5503,9 @@ static u32 cetrafs_tree_leaves_if_half(struct inode *inode, const cetrafs_inode_
     if (!nroot || (u64) nroot * idx_max * 2 <= *max)
         return 0;
     ilba = cetrafs_extent_phys_from_hilo(raw->et.idx[nroot - 1].ei_leaf_hi, raw->et.idx[nroot - 1].ei_leaf_lo);
-    ibh = cetrafs_read_index_bh(inode, ilba);
+    /* It only counts, for a warning: the reporter's reader (class 53),
+     * which trusts a cache the writer's would re-read. */
+    ibh = cetrafs_read_index_bh_for(inode, ilba, true);
     if (!ibh)
         return 0;
     n = min_t(u32, cetrafs_le16(((const cetrafs_extent_hdr_t *) ibh->b_data)->eh_entries), idx_max);
