@@ -982,6 +982,7 @@ int cetrafs_nslock_acquire_set(struct inode **inodes, int n);
 int cetrafs_nslock_acquire_set_vfs(struct inode **inodes, int n);
 u64 cetrafs_nslock_restart_count(void);
 u64 cetrafs_nslock_silent_extend_count(void);
+u64 cetrafs_nslock_settle_deferred_count(void);
 void cetrafs_nslock_exit(void);
 void cetrafs_nslock_release_set(struct inode **inodes, int n);
 
@@ -1390,6 +1391,8 @@ int cetrafs_lock_foreign_user_judged(struct super_block *sb,
                                      u64 *judged_readers);
 /* The same for a user's operation: a peer's background-move pin is
  * asked back and waited for rather than reported as a writer. */
+bool cetrafs_lock_foreign_user_would_wait(struct inode *inode, u32 my_node_id);
+int cetrafs_nslock_defer_settle(struct inode *inode);
 int cetrafs_lock_foreign_user_settled(struct inode *inode,
                                       u32 my_node_id,
                                       bool *out_writer,

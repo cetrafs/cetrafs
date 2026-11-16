@@ -3221,6 +3221,11 @@ static int cetrafs_unlink_locked(struct inode *dir, struct dentry *dentry)
          * link() and truncate now give. */
         bool reader = false;
 
+        /* A wait it would do -- a dead holder's fence and replay, a
+         * mover asked back -- outside the directory's locks (BM-27):
+         * nothing is changed yet. */
+        if (cetrafs_lock_foreign_user_would_wait(inode, my_node_id) && !cetrafs_nslock_defer_settle(inode))
+            return -ERESTARTNOINTR;
         ret = cetrafs_lock_foreign_user_settled(inode, my_node_id, &blocked, &reader, NULL, NULL);
         if (ret)
             return ret;
@@ -3799,6 +3804,12 @@ static int cetrafs_rename_locked(struct mnt_idmap *idmap,
              * link are gated against (ns-fuzz). */
             bool reader = false;
 
+            /* As unlink: a wait outside the directories' locks (BM-27). */
+            if (cetrafs_lock_foreign_user_would_wait(new_inode, my_node_id) &&
+                !cetrafs_nslock_defer_settle(new_inode)) {
+                ret = -ERESTARTNOINTR;
+                goto out;
+            }
             ret = cetrafs_lock_foreign_user_settled(new_inode, my_node_id, &blocked, &reader, NULL, NULL);
             if (ret)
                 goto out;
@@ -4317,7 +4328,10 @@ static int cetrafs_link_locked(struct dentry *old_dentry, struct inode *dir, str
              * deferred hot-path record dirt whose eventual flush reverts
              * whatever this +1 writes -- the ns-fuzz lost-increment class
              *. While any foreign user exists, the record is
-             * that opener's; refuse exactly as unlink does. */
+             * that opener's; refuse exactly as unlink does. A wait it
+             * would do runs outside the directory's locks (BM-27). */
+            if (cetrafs_lock_foreign_user_would_wait(inode, my_node_id) && !cetrafs_nslock_defer_settle(inode))
+                return -ERESTARTNOINTR;
             ret = cetrafs_lock_foreign_user_settled(inode, my_node_id, &blocked, &reader, NULL, NULL);
             if (ret)
                 return ret;

@@ -199,9 +199,18 @@ int cetrafs_ns_set_unverified(struct super_block *sb, u64 ino, u64 generation, b
  * up, then count) and an allocation (-ENOMEM: once more after a pause).
  * Anything else, or one that outlives the attempts, is returned.
  */
+/* TEST ONLY: each recount takes this long, as a large directory's does
+ * (tests/kernel/nslock_settle_outside_vfs.sh). */
+static unsigned int cetrafs_nslock_recount_stall_ms;
+cetrafs_test_param(nslock_recount_stall_ms, cetrafs_nslock_recount_stall_ms, uint, 0644);
+MODULE_PARM_DESC(nslock_recount_stall_ms, "TEST ONLY: each namespace recount sleeps this many ms first");
+
 static int cetrafs_nslock_recount(struct super_block *sb, u64 ino, u64 generation, struct inode *self)
 {
     int attempt, ret = 0;
+
+    if (READ_ONCE(cetrafs_nslock_recount_stall_ms))
+        msleep(READ_ONCE(cetrafs_nslock_recount_stall_ms)); /* test-only; see the parameter */
 
     for (attempt = 0; attempt < 3; attempt++) {
         ret = cetrafs_ns_reconcile(sb, ino, generation, self);
@@ -525,6 +534,10 @@ static int cetrafs_nslock_try(struct inode *inode, u32 my_node_id, bool *took_ov
     return ret;
 }
 
+/* Work deferred outside the VFS's locks (BM-27), defined further down. */
+enum { CETRAFS_SETTLE_RECOUNT = 1, CETRAFS_SETTLE_USERS };
+static int cetrafs_nslock_defer(struct inode *inode, int what);
+
 /*
  * Take the namespace lock on 'inode' with a caller-chosen try budget.
  * Returns 0 holding both the local mutex and the on-disk lock; -EBUSY
@@ -589,6 +602,16 @@ static int cetrafs_nslock_acquire_tries(struct inode *inode, int max_tries, bool
                 owed = false; /* test-only, see the knob */
             if ((took_over || owed) && !READ_ONCE(cetrafs_nslock_reconcile_off)) {
                 u64 gen = cetrafs_inode_get_generation(inode);
+
+                /* Under the VFS's locks: recount outside them instead,
+                 * the record flagged so that acquire does (BM-27). A
+                 * lock taken over carries no flag yet; it gets one
+                 * while still held, or the recount stays here. */
+                if (vfs && (owed || !cetrafs_ns_set_unverified(sb, inode->i_ino, gen, true)) &&
+                    !cetrafs_nslock_defer(inode, CETRAFS_SETTLE_RECOUNT)) {
+                    cetrafs_nslock_release(inode);
+                    return -ERESTARTNOINTR;
+                }
 
                 ret = cetrafs_nslock_recount(sb, inode->i_ino, gen, inode);
                 if (!ret && owed && cetrafs_ns_set_unverified(sb, inode->i_ino, gen, false))
@@ -1313,6 +1336,163 @@ static int cetrafs_nswait_queue(void)
         return -ESRCH;
     }
     return 0;
+}
+
+/*
+ * Work an operation called under the VFS's locks and its namespace set
+ * would otherwise WAIT for in there (audit 2026-11-15 BM-27): the
+ * recount of a namespace lock taken over from a dead holder, and the
+ * settle of a file's foreign users (a stale holder's fence and replay, a
+ * peer's mover asked back). Both can run for seconds or minutes, and
+ * every task queued on the directory waited with them, as did every
+ * peer wanting any lock of the set. Instead the operation, having
+ * changed nothing, releases everything and returns -ERESTARTNOINTR with
+ * a task_work that does the work with no lock of the operation held --
+ * the recount under that one inode's namespace lock alone -- and the
+ * system call restarts, as for a peer's lock (cetrafs_nswait_queue()).
+ *
+ * Once per call: a restart marks the call (task, start time, syscall
+ * and arguments, as the deadlines are keyed), and a call that comes
+ * back marked does the work where it is, as before -- so a settle that
+ * keeps finding new work cannot restart forever.
+ */
+static bool cetrafs_nslock_settle_in_vfs;
+cetrafs_test_param(nslock_settle_in_vfs, cetrafs_nslock_settle_in_vfs, bool, 0644);
+MODULE_PARM_DESC(nslock_settle_in_vfs, "TEST ONLY: recounts and foreign-user settles run under the VFS and set locks");
+
+static atomic64_t cetrafs_nslock_settle_deferred = ATOMIC64_INIT(0);
+u64 cetrafs_nslock_settle_deferred_count(void)
+{
+    return (u64) atomic64_read(&cetrafs_nslock_settle_deferred);
+}
+
+struct cetrafs_settle_mark {
+    struct list_head node;
+    const struct task_struct *task; /* compared, never dereferenced */
+    u64 start_time;
+    long nr;
+    unsigned long args[6];
+    unsigned long at;
+};
+static LIST_HEAD(cetrafs_settle_marks);
+
+/* Was this call already restarted for a settle? Consumes the mark, and
+ * drops any older than CETRAFS_NSWAIT_IDLE_MS (a call that never came
+ * back). */
+static bool cetrafs_settle_marked(void)
+{
+    struct cetrafs_settle_mark *m, *tmp;
+    unsigned long args[6];
+    bool found = false;
+    LIST_HEAD(dead);
+    long nr;
+
+    cetrafs_nswait_call(&nr, args);
+    spin_lock(&cetrafs_nswait_lock);
+    list_for_each_entry_safe(m, tmp, &cetrafs_settle_marks, node) {
+        bool mine = m->task == current && m->start_time == current->start_time;
+
+        if (mine && m->nr == nr && !memcmp(m->args, args, sizeof(args)) &&
+            !time_after(jiffies, m->at + msecs_to_jiffies(CETRAFS_NSWAIT_IDLE_MS)))
+            found = true;
+        if (mine || time_after(jiffies, m->at + msecs_to_jiffies(CETRAFS_NSWAIT_IDLE_MS)))
+            list_move(&m->node, &dead);
+    }
+    spin_unlock(&cetrafs_nswait_lock);
+    list_for_each_entry_safe(m, tmp, &dead, node)
+        kfree(m);
+    return found;
+}
+
+struct cetrafs_settle_work {
+    struct callback_head cb;
+    struct inode *inode;
+    int what;
+};
+
+static void cetrafs_settle_run(struct callback_head *cb)
+{
+    struct cetrafs_settle_work *w = container_of(cb, struct cetrafs_settle_work, cb);
+    struct inode *inode = w->inode;
+    u32 me;
+
+    if (w->what == CETRAFS_SETTLE_RECOUNT) {
+        /* Alone and outside the VFS: the acquire recounts what the dead
+         * holder left (the record is flagged) and clears the flag. */
+        if (!cetrafs_nslock_acquire(inode)) {
+            cetrafs_nslock_release(inode);
+            cetrafs_flush_dirty_free_counts(inode->i_sb);
+        }
+    } else if (!cetrafs_sb_get_node_id(inode->i_sb, &me)) {
+        bool blocked, reader;
+
+        (void) cetrafs_lock_foreign_user_settled(inode, me, &blocked, &reader, NULL, NULL);
+    }
+    /* The restart is now: its mark ages from here, not from when the
+     * work was queued -- a settle longer than the idle window would
+     * otherwise send the call round again. */
+    {
+        struct cetrafs_settle_mark *m;
+
+        spin_lock(&cetrafs_nswait_lock);
+        list_for_each_entry(m, &cetrafs_settle_marks, node)
+            if (m->task == current && m->start_time == current->start_time)
+                m->at = jiffies;
+        spin_unlock(&cetrafs_nswait_lock);
+    }
+    iput(inode);
+    kfree(w);
+    module_put(THIS_MODULE);
+}
+
+/* 0: queued, the caller releases everything and returns -ERESTARTNOINTR.
+ * Anything else: do the work in place. */
+static int cetrafs_nslock_defer(struct inode *inode, int what)
+{
+    struct cetrafs_settle_work *w;
+    struct cetrafs_settle_mark *m;
+
+    if (READ_ONCE(cetrafs_nslock_settle_in_vfs) || !cetrafs_nslock_can_restart() || cetrafs_settle_marked())
+        return -EALREADY;
+    w = kmalloc(sizeof(*w), GFP_NOFS);
+    m = kmalloc(sizeof(*m), GFP_NOFS);
+    if (!w || !m)
+        goto nomem;
+    if (!try_module_get(THIS_MODULE))
+        goto nomem;
+    ihold(inode);
+    w->inode = inode;
+    w->what = what;
+    init_task_work(&w->cb, cetrafs_settle_run);
+    if (task_work_add(current, &w->cb, TWA_SIGNAL)) {
+        iput(inode);
+        module_put(THIS_MODULE);
+        goto nomem;
+    }
+    m->task = current;
+    m->start_time = current->start_time;
+    cetrafs_nswait_call(&m->nr, m->args);
+    m->at = jiffies;
+    spin_lock(&cetrafs_nswait_lock);
+    list_add(&m->node, &cetrafs_settle_marks);
+    spin_unlock(&cetrafs_nswait_lock);
+    atomic64_inc(&cetrafs_nslock_settle_deferred);
+    pr_info_ratelimited("nslock: ino=%llu: %s outside the directory's locks, restarting the call\n",
+                        (unsigned long long) inode->i_ino,
+                        what == CETRAFS_SETTLE_RECOUNT ? "recounting" : "settling its foreign users");
+    return 0;
+nomem:
+    kfree(w);
+    kfree(m);
+    return -ENOMEM;
+}
+
+/* For dir.c and xattr.c: the foreign-user settle, deferred. Only from an
+ * operation that holds its set through cetrafs_nslock_acquire_set_vfs()
+ * and has changed nothing yet. */
+int cetrafs_nslock_defer_settle(struct inode *inode)
+{
+    return cetrafs_nslock_defer(inode, CETRAFS_SETTLE_USERS);
 }
 
 /*

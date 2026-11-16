@@ -349,6 +349,7 @@ MODULE_PARM_DESC(xattr_swap_unguarded, "TEST ONLY: setxattr's swap asks nothing 
  */
 struct cetrafs_xattr_guard {
     bool on;
+    bool may_defer; /* the first settle may run outside the VFS's locks (BM-27) */
     u32 my_node_id;
     u32 judged_owner;
     u64 judged_readers;
@@ -384,6 +385,13 @@ static int cetrafs_xattr_peer_user(struct inode *inode, struct cetrafs_xattr_gua
         return ret;
     g->judged_owner = CETRAFS_NODE_ID_NONE;
     g->judged_readers = 0;
+    if (settle && g->may_defer) {
+        /* The first ask, nothing changed yet: a wait it would do runs
+         * outside the VFS's locks and the set (BM-27). */
+        g->may_defer = false;
+        if (cetrafs_lock_foreign_user_would_wait(inode, g->my_node_id) && !cetrafs_nslock_defer_settle(inode))
+            return -ERESTARTNOINTR;
+    }
     if (settle)
         ret = cetrafs_lock_foreign_user_settled(inode, g->my_node_id, &blocked, &reader, &g->judged_owner,
                                                 &g->judged_readers);
@@ -624,10 +632,10 @@ static int cetrafs_xattr_swap_block(struct inode *inode, cetrafs_inode_t *raw, s
 
 /* 'now': the ctime to stamp, in seconds; 0 stamps none. */
 static int cetrafs_xattr_set_locked(struct inode *inode, const char *name, const void *value, size_t size, int flags,
-                                    u64 now)
+                                    u64 now, bool may_defer)
 {
     struct super_block *sb = inode->i_sb;
-    struct cetrafs_xattr_guard g;
+    struct cetrafs_xattr_guard g = {.may_defer = may_defer};
     cetrafs_inode_t raw;
     struct buffer_head *bh;
     cetrafs_xattr_entry_t *arr;
@@ -969,7 +977,10 @@ static int cetrafs_xattr_set(struct inode *inode, const char *name, const void *
     {
         u64 now = (u64) ktime_get_real_seconds();
 
-        ret = cetrafs_xattr_set_locked(inode, name, value, size, flags, now);
+        /* Its first settle may restart the call outside the VFS's locks
+         * only where the set came through the restartable acquire. */
+        ret = cetrafs_xattr_set_locked(inode, name, value, size, flags, now,
+                                       !nested && strncmp(name, XATTR_SECURITY_PREFIX, XATTR_SECURITY_PREFIX_LEN));
         if (!ret)
             inode_set_ctime(inode, (time64_t) now, 0);
     }
@@ -1080,7 +1091,7 @@ static int cetrafs_initxattrs(struct inode *inode, const struct xattr *xattr_arr
             return -ERANGE;
         /* now = 0: a new inode's ctime is already its creation time,
          * and stamping it again would cost a swap per label. */
-        ret = cetrafs_xattr_set_locked(inode, name, xattr->value, xattr->value_len, 0, 0);
+        ret = cetrafs_xattr_set_locked(inode, name, xattr->value, xattr->value_len, 0, 0, false);
         if (ret)
             break;
     }

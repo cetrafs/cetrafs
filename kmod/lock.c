@@ -7736,6 +7736,35 @@ out:
 }
 
 /*
+ * Would cetrafs_lock_foreign_user_settled() WAIT on this file -- fence a
+ * stale holder and replay its journal, or ask a live peer's mover back
+ * and wait for it? One fresh read, nothing changed. An operation called
+ * under the VFS's locks and its namespace set does that wait outside
+ * them instead (cetrafs_nslock_defer_settle(), audit 2026-11-15 BM-27).
+ * A read that fails answers no: the settle itself then reports it.
+ */
+bool cetrafs_lock_foreign_user_would_wait(struct inode *inode, u32 my_node_id)
+{
+    struct super_block *sb = inode->i_sb;
+    cetrafs_inode_t raw;
+    bool stale = false;
+    u32 m, owner;
+
+    cetrafs_invalidate_raw_inode(sb, inode->i_ino);
+    if (cetrafs_read_raw_inode(sb, inode->i_ino, &raw))
+        return false;
+    m = cetrafs_le32(raw.lock_mode);
+    owner = cetrafs_le32(raw.lock_owner_node);
+    if (!cetrafs_lock_mode_held(m) || owner == my_node_id)
+        return false;
+    if (cetrafs_node_is_stale(sb, owner, &stale))
+        return false;
+    if (stale)
+        return true; /* a fence and a replay */
+    return (m == CETRAFS_LOCK_RELOCATING || m == CETRAFS_LOCK_YIELD) && READ_ONCE(cetrafs_lock_yield_wait_ms);
+}
+
+/*
  * cetrafs_lock_foreign_user_judged() for an operation a user asked for
  * (unlink, rename over, link, truncate, chmod, fallocate, punch, zero,
  * setxattr): a "writer" that is only a peer's background-move pin is
