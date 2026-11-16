@@ -284,6 +284,13 @@ u64 cetrafs_scrub_inflight_skip_count(void)
     return (u64) atomic64_read(&cetrafs_scrub_inflight_skips);
 }
 
+/* Cycles skipped because a stale node's journal was still dirty. */
+static atomic64_t cetrafs_scrub_dead_journal_skips = ATOMIC64_INIT(0);
+u64 cetrafs_scrub_dead_journal_skip_count(void)
+{
+    return (u64) atomic64_read(&cetrafs_scrub_dead_journal_skips);
+}
+
 /* When the last cycle STARTED (unix seconds, 0 = never since module
  * load) and how long it took. "Did the scrub run during that window,
  * and could a cycle have straddled it?" kept coming up in post-mortems
@@ -1275,6 +1282,13 @@ static void cetrafs_scrub_cycle(struct cetrafs_scrub *s)
         if (cetrafs_frees_quiet(sb, &frees, false)) {
             pr_debug("scrub: frees in flight on some node -- skipping this cycle\n");
             atomic64_inc(&cetrafs_scrub_inflight_skips);
+            goto done;
+        }
+        /* A stale node's journal still dirty: its kept entries can name
+         * blocks no tree references yet (cetrafs_journal_dead_dirty()). */
+        if (cetrafs_journal_dead_dirty(sb)) {
+            pr_debug("scrub: a stale node's journal is not replayed yet -- skipping this cycle\n");
+            atomic64_inc(&cetrafs_scrub_dead_journal_skips);
             goto done;
         }
 

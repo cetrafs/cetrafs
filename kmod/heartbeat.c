@@ -528,7 +528,7 @@ static void cetrafs_heartbeat_maint(struct work_struct *work)
             if (cetrafs_node_fence_peer(sb, n, "a stale node's dirty journal"))
                 continue; /* not revoked: replaying now is the hazard above; next tick tries again */
 
-            ret = cetrafs_journal_replay_node(sb, n, /*wait_for_claim=*/false);
+            ret = cetrafs_journal_replay_node_scoped(sb, n, /*wait_for_claim=*/false, 0);
             if (ret && ret != -EEXIST) /* -EEXIST: another replay is at it; next tick */
                 pr_warn("heartbeat: replay of stale node %u's journal failed: %d\n", n, ret);
         }

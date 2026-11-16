@@ -263,6 +263,7 @@ static int cetrafs_proc_info_show(struct seq_file *m, void *v)
     seq_printf(m, "scrub_orphan_inodes_reclaimed: %llu\n", cetrafs_scrub_orphans_count());
     seq_printf(m, "scrub_cycles: %llu\n", cetrafs_scrub_cycle_count());
     seq_printf(m, "scrub_inflight_skips: %llu\n", cetrafs_scrub_inflight_skip_count());
+    seq_printf(m, "scrub_dead_journal_skips: %llu\n", cetrafs_scrub_dead_journal_skip_count());
     seq_printf(m, "frees_announced: %llu\n", cetrafs_frees_announced_count());
     seq_printf(m, "scrub_last_run_unix: %llu\n", cetrafs_scrub_last_start_unix());
     seq_printf(m, "scrub_last_run_ms: %llu\n", cetrafs_scrub_last_duration_ms());
@@ -428,6 +429,7 @@ static int cetrafs_proc_info_show(struct seq_file *m, void *v)
     seq_printf(m, "journal_replay_torn: %llu\n", cetrafs_journal_replay_torn_count());
     seq_printf(m, "journal_replay_live_kept: %llu\n", cetrafs_journal_replay_live_kept_count());
     seq_printf(m, "journal_replay_own_opener: %llu\n", cetrafs_journal_replay_own_opener_count());
+    seq_printf(m, "journal_replay_scoped_ok: %llu\n", cetrafs_journal_replay_scoped_ok_count());
     seq_printf(m, "journal_replay_kept: %llu\n", cetrafs_journal_replay_kept_count());
     seq_printf(m, "evict_rereads_changed: %llu\n", cetrafs_evict_rereads_changed_count());
     seq_printf(m, "bmap_flush_batches: %llu\n", cetrafs_bmap_flush_batch_count());

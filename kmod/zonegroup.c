@@ -1240,7 +1240,7 @@ static int __cetrafs_zg_try_claim_one(struct super_block *sb,
         /* We hold no cluster mutex here any more -- replay claims the
          * area itself, which is what serializes concurrent replayers. */
         wait = may_wait || READ_ONCE(cetrafs_zg_claim_always_waits); /* test-only; see the parameter */
-        ret = cetrafs_journal_replay_node(sb, owner, wait);
+        ret = cetrafs_journal_replay_node_scoped(sb, owner, wait, 0); /* see scrub.c on kept entries */
         if (ret == -EEXIST && !wait) {
             /* A peer is replaying it right now: next tick. -EAGAIN, not
              * 0: an allocator may be waiting for exactly this group

@@ -2336,6 +2336,7 @@ struct cetrafs_journal_replay_entry {
     bool before_park; /* from a session the area was parked after */
     bool undecided; /* the scan could not judge it: kept, never applied */
     u64 owner_ino, owner_generation; /* whose block the target is (L9) */
+    bool live_kept; /* kept only because a live node has its file open */
 };
 
 /* Replay's verdict on each entry, per replay call. */
@@ -2537,6 +2538,14 @@ u64 cetrafs_journal_replay_live_kept_count(void)
     return (u64) atomic64_read(&cetrafs_journal_replay_live_kept);
 }
 
+/* Replays that kept entries for live openers yet let their caller on. */
+static atomic64_t cetrafs_journal_replay_scoped_ok = ATOMIC64_INIT(0);
+
+u64 cetrafs_journal_replay_scoped_ok_count(void)
+{
+    return (u64) atomic64_read(&cetrafs_journal_replay_scoped_ok);
+}
+
 /* Redos run under this node's own opener's invalidate_lock. */
 static atomic64_t cetrafs_journal_replay_own_opener = ATOMIC64_INIT(0);
 
@@ -2658,7 +2667,7 @@ static enum cetrafs_journal_verdict cetrafs_journal_judge(const struct cetrafs_j
  * headers are uncached: this area belongs to a different node whose
  * writes our cache has never seen.
  */
-static int __cetrafs_journal_replay_node(struct super_block *sb, u32 node_id, bool wait_for_claim);
+static int __cetrafs_journal_replay_node(struct super_block *sb, u32 node_id, bool wait_for_claim, u64 scope);
 
 /* TEST ONLY: this node replays no peer's journal while set (-EBUSY), so
  * a two-node scenario can choose which node claims a dead node's area
@@ -2674,15 +2683,51 @@ static bool cetrafs_journal_sweep_waits;
 cetrafs_test_param(journal_sweep_waits, cetrafs_journal_sweep_waits, bool, 0644);
 MODULE_PARM_DESC(journal_sweep_waits, "TEST ONLY: a non-waiting replay still waits for the area mutex");
 
+/* TEST ONLY: every kept entry fails every replay, as before audit
+ * 2026-11-15 F-37 (tests/kernel/journal_replay_scope.sh). */
+static bool cetrafs_journal_scope_off;
+cetrafs_test_param(journal_scope_off, cetrafs_journal_scope_off, bool, 0644);
+MODULE_PARM_DESC(journal_scope_off, "TEST ONLY: an entry kept for a live opener fails every replay");
+
 int cetrafs_journal_replay_node(struct super_block *sb, u32 node_id, bool wait_for_claim)
+{
+    return cetrafs_journal_replay_node_scoped(sb, node_id, wait_for_claim, CETRAFS_REPLAY_STRICT);
+}
+
+/*
+ * A replay whose caller waits on one thing (audit 2026-11-15 F-37). An
+ * entry kept only because a live node has its file open (cetrafs_
+ * journal_live_opener()) used to fail every replay of the area, and so
+ * everything waiting on the dead node: HA restarting its OTHER VMs, a
+ * namespace-lock break, the claim of its Zone Groups -- for as long as
+ * that one file stayed open. 'scope' says what the caller waits on:
+ *
+ *   CETRAFS_REPLAY_STRICT  anything kept fails it, as before (our own
+ *                          area at mount, whose slots are reused next;
+ *                          the scrub's finish of a stale free);
+ *   0                      no file: entries kept for live openers do
+ *                          not fail it (a namespace-lock break -- such
+ *                          entries are regular files' -- a Zone Group
+ *                          claim, the sweep);
+ *   an inode number        only such an entry of THAT file fails it
+ *                          (an open of it, its lock reclaims, its free).
+ *
+ * Whatever is kept, the area stays DIRTY and is never parked CLEAN, so
+ * the entry waits for the next replay; and while a stale node's area is
+ * dirty no scrub cycle frees (scrub.c), which covers blocks only a kept
+ * entry's payload names in Zone Groups claimed meanwhile.
+ */
+int cetrafs_journal_replay_node_scoped(struct super_block *sb, u32 node_id, bool wait_for_claim, u64 scope)
 {
     struct cetrafs_journal *j = cetrafs_sb_get_journal(sb);
     int ret;
 
+    if (READ_ONCE(cetrafs_journal_scope_off))
+        scope = CETRAFS_REPLAY_STRICT;
     if (READ_ONCE(cetrafs_journal_replay_refuse))
         return -EBUSY; /* test-only; see the parameter */
     if (!j || node_id >= 64)
-        return __cetrafs_journal_replay_node(sb, node_id, wait_for_claim);
+        return __cetrafs_journal_replay_node(sb, node_id, wait_for_claim, scope);
     /*
      * A caller that does not wait for a replay claim does not wait for
      * this mutex either: its holder is a local replay of the same area,
@@ -2718,7 +2763,7 @@ int cetrafs_journal_replay_node(struct super_block *sb, u32 node_id, bool wait_f
              * task holds (audit 2026-11-15 BM-35). */
             unsigned int nofs = memalloc_nofs_save();
 
-            ret = __cetrafs_journal_replay_node(sb, node_id, wait_for_claim);
+            ret = __cetrafs_journal_replay_node(sb, node_id, wait_for_claim, scope);
             memalloc_nofs_restore(nofs);
         }
     }
@@ -2759,7 +2804,7 @@ static void cetrafs_journal_entry_undecided(struct cetrafs_journal_replay_entry 
     e->undecided = true;
 }
 
-static int __cetrafs_journal_replay_node(struct super_block *sb, u32 node_id, bool wait_for_claim)
+static int __cetrafs_journal_replay_node(struct super_block *sb, u32 node_id, bool wait_for_claim, u64 scope)
 {
     u64 area_start, slots, s, park_seq = 0;
     struct cetrafs_journal_replay_entry *entries;
@@ -3076,10 +3121,18 @@ static int __cetrafs_journal_replay_node(struct super_block *sb, u32 node_id, bo
             continue;
         }
         if (blocked == CETRAFS_JR_KEPT) {
+            u64 o;
+
             pr_warn("journal replay: node %u txn %llu: an older entry for target block %llu is kept -- "
                     "keeping this one behind it\n",
                     node_id, (unsigned long long) entries[s].txn_id, (unsigned long long) entries[s].target_lba);
-            ret = -EIO;
+            /* Behind a live opener's entry, it waits on that opener too. */
+            for (o = s; o-- > 0;)
+                if (entries[o].target_lba == entries[s].target_lba && st[o] == CETRAFS_JR_KEPT) {
+                    entries[s].live_kept = entries[o].live_kept;
+                    break;
+                }
+            ret = entries[s].live_kept ? -EBUSY : -EIO;
             goto keep;
         }
 
@@ -3385,6 +3438,7 @@ static int __cetrafs_journal_replay_node(struct super_block *sb, u32 node_id, bo
                                     (unsigned long long) entries[s].owner_ino,
                                     lo < 0 ? "its record could not be read" : "it could be writing the block");
                 atomic64_inc(&cetrafs_journal_replay_live_kept);
+                entries[s].live_kept = lo > 0;
                 brelse(tbh);
                 brelse(pbh);
                 ret = lo < 0 ? lo : -EBUSY;
@@ -3551,10 +3605,27 @@ keep:
     }
 
     if (kept) {
+        bool blocks = false;
+
+        for (s = 0; s < count && !blocks; s++)
+            if (st[s] == CETRAFS_JR_KEPT)
+                blocks = !entries[s].live_kept || scope == CETRAFS_REPLAY_STRICT ||
+                         (scope && entries[s].owner_ino == scope);
+        atomic64_add(kept, &cetrafs_journal_replay_kept);
+        if (!blocks) {
+            /* Every one waits on a live opener of a file this caller is
+             * not waiting on. The area stays dirty for the next replay;
+             * the caller goes on. */
+            pr_warn_ratelimited("journal replay: node %u replayed %u entr%s; %u kept for live openers of other "
+                                "files -- the area stays dirty, the caller goes on\n",
+                                node_id, applied, applied == 1 ? "y" : "ies", kept);
+            atomic64_inc(&cetrafs_journal_replay_scoped_ok);
+            ret = 0;
+            goto out_free;
+        }
         pr_err("journal replay: node %u replayed %u entr%s; %u kept undecided -- the area stays dirty for the "
                "next replay\n",
                node_id, applied, applied == 1 ? "y" : "ies", kept);
-        atomic64_add(kept, &cetrafs_journal_replay_kept);
         ret = kept_ret ?: -EIO;
         goto out_free;
     }
@@ -3578,6 +3649,46 @@ out_release:
     if (claimed)
         cetrafs_journal_release_replay(sb, node_id, area_start, my_node_id, /*set_clean=*/false);
     return ret;
+}
+
+/* TEST ONLY: the scrub frees while a stale node's journal is dirty, as
+ * before audit 2026-11-15 F-37 (tests/kernel/journal_replay_scope.sh). */
+static bool cetrafs_scrub_ignores_dead_journal;
+cetrafs_test_param(scrub_ignores_dead_journal, cetrafs_scrub_ignores_dead_journal, bool, 0644);
+MODULE_PARM_DESC(scrub_ignores_dead_journal, "TEST ONLY: the scrub frees while a stale node's journal is dirty");
+
+/*
+ * Is a stale node's journal still DIRTY? Its entries can name, in their
+ * payloads, blocks nothing on the device references yet -- a dead
+ * node's last tree write, kept for a live opener and redone later
+ * (cetrafs_journal_replay_node_scoped()). Its Zone Groups may be ours by
+ * then, and a scrub that judged those blocks leaked would free what the
+ * redo then publishes. So no scrub cycle frees while one is (scrub.c).
+ * A read that fails answers yes.
+ */
+bool cetrafs_journal_dead_dirty(struct super_block *sb)
+{
+    const cetrafs_superblock_t *raw_sb = cetrafs_sb_raw(sb);
+    u32 n, count, me;
+
+    if (READ_ONCE(cetrafs_scrub_ignores_dead_journal))
+        return false;
+    if (!raw_sb || cetrafs_sb_get_node_id(sb, &me))
+        return true;
+    count = le32_to_cpu(raw_sb->node_table_count);
+    for (n = 0; n < count; n++) {
+        bool dirty = false, stale = false;
+
+        if (n == me)
+            continue;
+        if (cetrafs_journal_node_is_dirty(sb, n, &dirty))
+            return true;
+        if (!dirty)
+            continue;
+        if (cetrafs_node_is_stale(sb, n, &stale) || stale)
+            return true;
+    }
+    return false;
 }
 
 /* Is node #node_id's journal flag currently DIRTY? Used by heartbeat.c's

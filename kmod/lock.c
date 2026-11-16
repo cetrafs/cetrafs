@@ -3006,6 +3006,11 @@ int cetrafs_lock_open(struct inode *inode, struct file *file)
     cetrafs_inode_t raw;
     u32 my_node_id;
     bool reclaim_from_stale = false;
+    /* Dead openers this open already replayed. A replay that kept an
+     * entry for another file leaves the area dirty and returns 0
+     * (cetrafs_journal_replay_node_scoped()); the reread must not take
+     * that node round again. */
+    u64 replayed_nodes = 0;
     bool claimed = false; /* this open took the exclusive lock */
     u32 stale_owner = CETRAFS_NODE_ID_NONE;
     u32 stale_incarnation = 0; /* the incarnation behind the judged stale lock */
@@ -3085,7 +3090,7 @@ reread:
      */
     if (!lock_on && !sb_rdonly(sb) && !READ_ONCE(cetrafs_open_replay_stale_off)) {
         u64 others = (cetrafs_le64(raw.read_open_nodes) | cetrafs_le64(raw.suspended_writer_nodes)) &
-                     ~(1ULL << (my_node_id % CETRAFS_MAX_READER_NODES));
+                     ~(1ULL << (my_node_id % CETRAFS_MAX_READER_NODES)) & ~replayed_nodes;
         bool replayed = false;
 
         while (others) {
@@ -3135,7 +3140,7 @@ reread:
             if (ret == -EBUSY)
                 continue; /* it came back: a live opener, nothing to replay */
             if (!ret)
-                ret = cetrafs_journal_replay_node(sb, n, /*wait_for_claim=*/true);
+                ret = cetrafs_journal_replay_node_scoped(sb, n, /*wait_for_claim=*/true, inode->i_ino);
             if (ret) {
                 pr_err("lock: ino=%llu: dead node %u had this file open and its journal could not be replayed "
                        "(%d) -- refusing the open\n",
@@ -3144,6 +3149,7 @@ reread:
             }
             pr_warn("lock: ino=%llu: replayed dead node %u's journal before opening a file it had open\n",
                     (unsigned long long) inode->i_ino, n);
+            replayed_nodes |= 1ULL << n;
             replayed = true;
         }
         if (replayed)
@@ -3220,7 +3226,8 @@ reread:
                 goto out_pr_unlock;
             }
             if (!ret)
-                ret = cetrafs_journal_replay_node(sb, cetrafs_le32(raw.lock_owner_node), /*wait_for_claim=*/true);
+                ret = cetrafs_journal_replay_node_scoped(sb, cetrafs_le32(raw.lock_owner_node), /*wait_for_claim=*/true,
+                                                         inode->i_ino);
             if (ret) {
                 pr_err("lock: ino=%llu could not fence and replay stale node %u (%d), refusing open\n",
                        (unsigned long long) inode->i_ino, raw.lock_owner_node, ret);
@@ -6208,7 +6215,7 @@ static int cetrafs_lock_arm_stale_steal(struct inode *inode, u32 my_node_id, cet
     if (ret == -EBUSY)
         return -ETXTBSY; /* its owner came back: a live holder */
     if (!ret)
-        ret = cetrafs_journal_replay_node(sb, owner, /*wait_for_claim=*/true);
+        ret = cetrafs_journal_replay_node_scoped(sb, owner, /*wait_for_claim=*/true, inode->i_ino);
     if (ret) {
         pr_err("%s: ino=%llu could not fence and replay stale node %u (%d) -- not taking its lock\n", who,
                (unsigned long long) inode->i_ino, owner, ret);
@@ -7367,7 +7374,8 @@ static int cetrafs_foreign_claim_from_raw(struct super_block *sb,
                 return -ETXTBSY; /* its owner came back: a live holder */
             if (ret)
                 return ret;
-            ret = cetrafs_journal_replay_node(sb, cetrafs_le32(raw.lock_owner_node), /*wait_for_claim=*/true);
+            ret = cetrafs_journal_replay_node_scoped(sb, cetrafs_le32(raw.lock_owner_node), /*wait_for_claim=*/true,
+                                                     cetrafs_le64(raw.ino));
             if (ret)
                 return ret;
             if (out_repaired)
