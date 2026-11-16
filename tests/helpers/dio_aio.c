@@ -30,6 +30,10 @@
 //       may still be completing. Prints "inflight=<0|1> read=<n>
 //       first=<c>" (c: the block's first byte, '0' for NUL), then reaps.
 //
+//   dio_aio once <file> <off> <len>
+//       Submit ONE async write of <len> bytes of 'O' at <off> and reap
+//       it. Prints "ms=<submit to reap> res=<result>".
+//
 //   dio_aio unit <file> <blk_a> <blk_b> <gap_ms>
 //       Submit ONE async 4 KiB write of 'A' at <blk_a>, wait <gap_ms>,
 //       then submit and reap ONE of 'B' at <blk_b>, then reap the first.
@@ -187,6 +191,34 @@ static int do_trunc(const char *path, long long off, size_t len, long long newsi
     return 0;
 }
 
+/* once: one async write, submit to reap, timed. */
+static int do_once(const char *path, long long off, size_t len)
+{
+    aio_context_t ctx = 0;
+    int fd = open(path, O_RDWR | O_DIRECT);
+    char *buf = abuf(len);
+    struct iocb c, *cbs[1] = { &c };
+    struct io_event ev;
+    long long t0;
+    long n;
+
+    if (fd < 0 || io_setup(4, &ctx) < 0) {
+        perror("open/io_setup");
+        return 2;
+    }
+    memset(buf, 'O', len);
+    prep(&c, fd, buf, len, off);
+    t0 = now_ms();
+    if (io_submit(ctx, 1, cbs) != 1) {
+        perror("io_submit");
+        return 2;
+    }
+    while ((n = io_getevents(ctx, 1, 1, &ev, NULL)) < 0 && errno == EINTR)
+        ;
+    printf("ms=%lld res=%lld\n", now_ms() - t0, n == 1 ? (long long) ev.res : -1LL);
+    return 0;
+}
+
 static int do_unit(const char *path, long long ba, long long bb, long gap_ms)
 {
     aio_context_t ctx = 0;
@@ -310,6 +342,8 @@ int main(int argc, char **argv)
     }
     if (argc == 6 && strcmp(argv[1], "trunc") == 0)
         return do_trunc(argv[2], strtoll(argv[3], NULL, 0), strtoul(argv[4], NULL, 0), strtoll(argv[5], NULL, 0));
+    if (argc == 5 && strcmp(argv[1], "once") == 0)
+        return do_once(argv[2], strtoll(argv[3], NULL, 0), strtoul(argv[4], NULL, 0));
     if (argc == 6 && strcmp(argv[1], "unit") == 0)
         return do_unit(argv[2], strtoll(argv[3], NULL, 0), strtoll(argv[4], NULL, 0), strtol(argv[5], NULL, 0));
     if (argc == 7 && strcmp(argv[1], "readmid") == 0)
@@ -319,7 +353,8 @@ int main(int argc, char **argv)
             "usage: %s pair <file> <nblocks> <half>\n"
             "       %s trunc <file> <off> <len> <newsize>\n"
             "       %s readmid <file> <off> <len> <delay_ms> <read_blk>\n"
-            "       %s unit <file> <blk_a> <blk_b> <gap_ms>\n",
-            argv[0], argv[0], argv[0], argv[0]);
+            "       %s unit <file> <blk_a> <blk_b> <gap_ms>\n"
+            "       %s once <file> <off> <len>\n",
+            argv[0], argv[0], argv[0], argv[0], argv[0]);
     return 2;
 }

@@ -3560,6 +3560,51 @@ u64 cetrafs_bg_pick_scan_count(void)
  * pool group the suite is about). */
 static bool cetrafs_alloc_claim_zg_off;
 cetrafs_test_param(alloc_claim_zg_off, cetrafs_alloc_claim_zg_off, bool, 0644);
+
+/* TEST ONLY: an allocator waits for a dead owner's group before trying
+ * the pool, as before audit 2026-11-15 L-23 (tests/kernel/alloc_pool_before_adopt.sh). */
+static bool cetrafs_alloc_adopt_first;
+cetrafs_test_param(alloc_adopt_first, cetrafs_alloc_adopt_first, bool, 0644);
+MODULE_PARM_DESC(alloc_adopt_first, "TEST ONLY: an allocator waits for a dead owner's Zone Group before the pool claim");
+
+static atomic64_t cetrafs_alloc_adopt_skips = ATOMIC64_INIT(0);
+
+u64 cetrafs_alloc_adopt_skip_count(void)
+{
+    return (u64) atomic64_read(&cetrafs_alloc_adopt_skips);
+}
+
+/*
+ * Wait for the heartbeat to take over a dead owner's Zone Group for this
+ * allocation (cetrafs_sb_zg_adopt_wait()). 0: look again; nonzero: stop
+ * (killed, or fenced). Not from a workqueue: an O_DIRECT completion
+ * converts there, a kill cannot reach it, and the wait would hold that
+ * write's completion -- and truncate and fsync behind it -- for minutes
+ * with nothing able to end it (audit 2026-11-15 BM-40). It looks no
+ * further, as when the wait finds nothing.
+ */
+/* TEST ONLY: a workqueue allocator waits for an adoption too, as before
+ * audit 2026-11-15 BM-40 (tests/kernel/alloc_pool_before_adopt.sh). */
+static bool cetrafs_alloc_adopt_worker_waits;
+cetrafs_test_param(alloc_adopt_worker_waits, cetrafs_alloc_adopt_worker_waits, bool, 0644);
+MODULE_PARM_DESC(alloc_adopt_worker_waits, "TEST ONLY: a workqueue allocator waits for a Zone Group adoption");
+
+static int cetrafs_alloc_adopt_wait(struct super_block *sb, u32 zg)
+{
+    if ((current->flags & (PF_WQ_WORKER | PF_KTHREAD)) && !READ_ONCE(cetrafs_alloc_adopt_worker_waits)) {
+        atomic64_inc(&cetrafs_alloc_adopt_skips);
+        return 0;
+    }
+    if (fatal_signal_pending(current))
+        return -EINTR;
+    if (cetrafs_sb_zg_adopt_wait(sb, zg))
+        pr_info("alloc: the heartbeat took over zone group %u for this allocation\n", zg);
+    if (fatal_signal_pending(current))
+        return -EINTR;
+    if (cetrafs_sb_is_fenced(sb))
+        return -EIO;
+    return 0;
+}
 MODULE_PARM_DESC(alloc_claim_zg_off, "TEST ONLY: an allocator out of space claims pool Block Groups only, no Zone Group");
 
 static bool cetrafs_alloc_enospc_refresh_off;
@@ -3582,6 +3627,7 @@ int cetrafs_alloc_pick_bg(struct super_block *sb, u32 *out_bg_id)
     const cetrafs_superblock_t *raw_sb = cetrafs_sb_raw(sb);
     u32 my_node_id, zg_count;
     bool tried_claim_more = false, tried_claim_bg = false, waited_release = false, waited_adopt = false;
+    s64 adopt_pending = -1; /* a dead owner's group, waited for only after the pool claim */
     bool refreshed_layout = false;
     int release_seq = cetrafs_sb_release_seq(sb); /* one plain read; see waited_release */
     int ret;
@@ -3733,16 +3779,21 @@ retry_scan:
         if (ret)
             return ret;
         if (defer >= 0 && !waited_adopt) {
-            waited_adopt = true;
-            if (fatal_signal_pending(current))
-                return -EINTR;
-            if (cetrafs_sb_zg_adopt_wait(sb, (u32) defer))
-                pr_info("alloc: the heartbeat took over zone group %lld for this allocation\n", (long long) defer);
-            if (fatal_signal_pending(current))
-                return -EINTR;
-            if (cetrafs_sb_is_fenced(sb))
-                return -EIO;
-            goto retry_scan;
+            /*
+             * Not yet: the pool claim below takes a free Block Group in
+             * one CAS, with no fence and no replay, and this wait is up
+             * to 3 x stale + 60 s with the caller's inode_lock and
+             * invalidate_lock held (audit 2026-11-15 L-23). Waited for
+             * only if the pool has nothing.
+             */
+            adopt_pending = defer;
+            if (READ_ONCE(cetrafs_alloc_adopt_first)) {
+                waited_adopt = true;
+                ret = cetrafs_alloc_adopt_wait(sb, (u32) defer);
+                if (ret)
+                    return ret;
+                goto retry_scan;
+            }
         }
 
         if (did_claim) {
@@ -3799,6 +3850,15 @@ retry_scan:
         } else {
             cetrafs_sb_release_read_unlock(sb);
         }
+    }
+
+    /* The pool had nothing: now the dead owner's group (above). */
+    if (adopt_pending >= 0 && !waited_adopt) {
+        waited_adopt = true;
+        ret = cetrafs_alloc_adopt_wait(sb, (u32) adopt_pending);
+        if (ret)
+            return ret;
+        goto retry_scan;
     }
 
     /* A surplus release may have had the space this needs drained out
