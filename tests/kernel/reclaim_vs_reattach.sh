@@ -56,26 +56,30 @@ INODE_LOCK_POKE_INC=100 "$LPOKE" "$IMG" "$I_READ" --reader 1 >/dev/null
 INODE_LOCK_POKE_INC=100 "$LPOKE" "$IMG" "$I_DIR" --ns 1 >/dev/null
 ct_mount "$DEV" "$MNT"
 
-# reattach_during <retake> <cmd...>: run <cmd> with the reclaim held
-# after its fence while row 1 re-attaches (a beat, incarnation 200) and
-# runs <retake> -- its re-claim, stamped with 200 -- or "true" for none;
-# prints "<rc>".
+# reattach_during <stall> <retake> <cmd...>: run <cmd> with the reclaim
+# held at <stall> (reclaim_stall_after_fence_ms, or _before_swap_ms)
+# while row 1 re-attaches (a beat, incarnation 200) and runs <retake> --
+# its re-claim, stamped with 200 -- or "true" for none; prints "<rc>".
+# The open path judges the holder again from a fresh read after its fence
+# and replay (lock_mutex is dropped across them, audit 2026-11-15 M-27),
+# so a re-attach during the fence is caught there; the swap's own check
+# is staged after that judgement, right before the claim's CAS.
 reattach_during() {
-    local rc=0 retake="$1"
-    shift
-    ct_param_set reclaim_stall_after_fence_ms 2000
+    local rc=0 stall="$1" retake="$2"
+    shift 2
+    ct_param_set "$stall" 2000
     ( sleep 0.8; "$NPOKE" "$IMG" 1 --beat >/dev/null 2>&1; "$NPOKE" "$IMG" 1 --inc 200 >/dev/null 2>&1
       eval "INODE_LOCK_POKE_INC=200 $retake" >/dev/null 2>&1 ) &
     local B=$!
     "$@" 2>/dev/null || rc=$?
     wait "$B" || true
-    ct_param_set reclaim_stall_after_fence_ms 0
+    ct_param_set "$stall" 0
     echo "$rc"
 }
 lockf() { "$LPOKE" "$IMG" "$1"; }
 
 # 1. The file lock: a write-open steals it.
-RC="$(reattach_during '"$LPOKE" "$IMG" "$I_LOCK" 1 1' python3 -c 'import os,sys; os.close(os.open(sys.argv[1], os.O_RDWR))' "$MNT/lockf")"
+RC="$(reattach_during reclaim_stall_before_swap_ms '"$LPOKE" "$IMG" "$I_LOCK" 1 1' python3 -c 'import os,sys; os.close(os.open(sys.argv[1], os.O_RDWR))' "$MNT/lockf")"
 L="$(lockf "$I_LOCK")"
 log "lock: open rc=$RC; $L"
 [ "$RC" != 0 ] && pass "lock: the write-open was refused -- the holder came back" ||
@@ -88,7 +92,7 @@ grep -q "owner=1 mode=1" <<<"$L" && pass "lock: the lock is the holder's again (
 "$NPOKE" "$IMG" 1 --inc 100 >/dev/null
 
 # 2. A reader bit: a write-open clears a stale reader first.
-RC="$(reattach_during '"$LPOKE" "$IMG" "$I_READ" --reader 1' python3 -c 'import os,sys; os.close(os.open(sys.argv[1], os.O_RDWR))' "$MNT/readf")"
+RC="$(reattach_during reclaim_stall_after_fence_ms '"$LPOKE" "$IMG" "$I_READ" --reader 1' python3 -c 'import os,sys; os.close(os.open(sys.argv[1], os.O_RDWR))' "$MNT/readf")"
 L="$(lockf "$I_READ")"
 log "reader: open rc=$RC; $L"
 # Refusing a writer past a live reader is the access rule, which
@@ -132,7 +136,7 @@ INODE_LOCK_POKE_INC=0 "$LPOKE" "$IMG" "$I_DIR" --ns 0xFFFF >/dev/null
 "$NPOKE" "$IMG" 1 --inc 100 >/dev/null
 INODE_LOCK_POKE_INC=100 "$LPOKE" "$IMG" "$I_LOCK" 1 1 >/dev/null
 ct_param_set reattach_after_fence_force 0
-RC="$(reattach_during true python3 -c 'import os,sys; os.close(os.open(sys.argv[1], os.O_RDWR))' "$MNT/lockf")"
+RC="$(reattach_during reclaim_stall_before_swap_ms true python3 -c 'import os,sys; os.close(os.open(sys.argv[1], os.O_RDWR))' "$MNT/lockf")"
 ct_param_set reattach_after_fence_force -1
 L="$(lockf "$I_LOCK")"
 log "control: open rc=$RC; $L"

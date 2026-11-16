@@ -3032,6 +3032,32 @@ static bool cetrafs_open_writer_bit_off;
 cetrafs_test_param(open_writer_bit_off, cetrafs_open_writer_bit_off, bool, 0644);
 MODULE_PARM_DESC(open_writer_bit_off, "TEST ONLY: a nofilelock write-open publishes no write_open_nodes bit");
 
+/*
+ * The slow parts of an open -- a dead holder's fence and journal replay,
+ * the watch on a silent opener, the wait for a mover to step aside --
+ * run with lock_mutex DROPPED, and the open decides again from a fresh
+ * read once it has it back. Held across them, every local close() of
+ * the file queued behind it uninterruptibly: release cannot fail, so it
+ * takes the mutex plainly, for as long as a replay runs (audit
+ * 2026-11-15 M-27, BM-38). Nothing this open counts or claims happens
+ * before those points, so there is nothing to undo.
+ */
+static bool cetrafs_lock_open_slow_held;
+cetrafs_test_param(lock_open_slow_held, cetrafs_lock_open_slow_held, bool, 0644);
+MODULE_PARM_DESC(lock_open_slow_held, "TEST ONLY: an open keeps lock_mutex across fence, replay and waits, as before");
+
+static void cetrafs_lock_open_drop(struct cetrafs_inode_info *ci)
+{
+    if (!READ_ONCE(cetrafs_lock_open_slow_held))
+        mutex_unlock(&ci->lock_mutex);
+}
+
+/* 0 with the mutex held again, or -EINTR without it. */
+static int cetrafs_lock_open_retake(struct cetrafs_inode_info *ci, bool dropped)
+{
+    return dropped ? mutex_lock_killable(&ci->lock_mutex) : 0;
+}
+
 int cetrafs_lock_open(struct inode *inode, struct file *file)
 {
     struct cetrafs_inode_info *ci = CETRAFS_I(inode);
@@ -3050,6 +3076,10 @@ int cetrafs_lock_open(struct inode *inode, struct file *file)
      * (cetrafs_journal_replay_node_scoped()); the reread must not take
      * that node round again. */
     u64 replayed_nodes = 0;
+    /* Openers this open watched and found beating, with the mutex
+     * dropped (cetrafs_lock_open_drop()). */
+    u64 beating_nodes = 0;
+    bool dropped;
     bool claimed = false; /* this open took the exclusive lock */
     u32 stale_owner = CETRAFS_NODE_ID_NONE;
     u32 stale_incarnation = 0; /* the incarnation behind the judged stale lock */
@@ -3129,14 +3159,19 @@ reread:
      */
     if (!lock_on && !sb_rdonly(sb) && !READ_ONCE(cetrafs_open_replay_stale_off)) {
         u64 others = (cetrafs_le64(raw.read_open_nodes) | cetrafs_le64(raw.suspended_writer_nodes)) &
-                     ~(1ULL << (my_node_id % CETRAFS_MAX_READER_NODES)) & ~replayed_nodes;
-        bool replayed = false;
+                     ~(1ULL << (my_node_id % CETRAFS_MAX_READER_NODES));
 
         while (others) {
             u32 n = (u32) __ffs64(others);
             bool stale = false, dirty = false, beating = false;
 
             others &= ~(1ULL << n);
+            /* Replayed by this open already -- unless the row came back
+             * since its fence and is another incarnation now, whose
+             * journal is new. */
+            if ((replayed_nodes & (1ULL << n)) && !cetrafs_node_reattached_since_fence(sb, n))
+                continue;
+            replayed_nodes &= ~(1ULL << n);
             /* A read that fails decides nothing, and going on is the
              * hazard: refused, not skipped (M-20 status, point 3). */
             ret = cetrafs_journal_node_is_dirty(sb, n, &dirty);
@@ -3162,37 +3197,59 @@ reread:
              * mount's ETXTBSY already imposes there (M-48).
              */
             if (!stale && !READ_ONCE(cetrafs_open_silent_peer_ok)) {
-                ret = cetrafs_node_peer_beating(sb, n, &beating);
-                if (ret)
-                    goto out_pr_unlock;
-                if (beating)
+                if (beating_nodes & (1ULL << n))
                     continue;
-                pr_warn_ratelimited("lock: ino=%llu: node %u had this file open, has stopped beating and is not "
-                                    "stale yet -- its journal must be replayed first: open refused, retry\n",
-                                    (unsigned long long) inode->i_ino, n);
-                ret = -EAGAIN;
-                goto out_pr_unlock;
+                dropped = !READ_ONCE(cetrafs_lock_open_slow_held);
+                cetrafs_lock_open_drop(ci);
+                ret = cetrafs_node_peer_beating(sb, n, &beating);
+                if (!ret && !beating) {
+                    pr_warn_ratelimited("lock: ino=%llu: node %u had this file open, has stopped beating and is "
+                                        "not stale yet -- its journal must be replayed first: open refused, "
+                                        "retry\n",
+                                        (unsigned long long) inode->i_ino, n);
+                    ret = -EAGAIN;
+                }
+                if (ret) {
+                    if (!dropped)
+                        goto out_pr_unlock;
+                    return ret;
+                }
+                ret = cetrafs_lock_open_retake(ci, dropped);
+                if (ret)
+                    return ret;
+                beating_nodes |= 1ULL << n;
+                goto reread;
             }
             if (!stale)
                 continue;
+            dropped = !READ_ONCE(cetrafs_lock_open_slow_held);
+            cetrafs_lock_open_drop(ci);
             ret = cetrafs_node_fence_peer(sb, n, "an open of a file it had open (nofilelock)");
+            /* The FENCE's -EBUSY: it came back, a live opener with
+             * nothing to replay -- judged again below. The replay's own
+             * -EBUSY (an entry kept for this file) refuses, as any
+             * other replay failure. */
             if (ret == -EBUSY)
-                continue; /* it came back: a live opener, nothing to replay */
-            if (!ret)
+                ret = 1;
+            else if (!ret)
                 ret = cetrafs_journal_replay_node_scoped(sb, n, /*wait_for_claim=*/true, inode->i_ino);
-            if (ret) {
+            if (ret < 0) {
                 pr_err("lock: ino=%llu: dead node %u had this file open and its journal could not be replayed "
                        "(%d) -- refusing the open\n",
                        (unsigned long long) inode->i_ino, n, ret);
-                goto out_pr_unlock;
+                if (!dropped)
+                    goto out_pr_unlock;
+                return ret;
             }
-            pr_warn("lock: ino=%llu: replayed dead node %u's journal before opening a file it had open\n",
-                    (unsigned long long) inode->i_ino, n);
+            if (!ret)
+                pr_warn("lock: ino=%llu: replayed dead node %u's journal before opening a file it had open\n",
+                        (unsigned long long) inode->i_ino, n);
+            ret = cetrafs_lock_open_retake(ci, dropped);
+            if (ret)
+                return ret;
             replayed_nodes |= 1ULL << n;
-            replayed = true;
-        }
-        if (replayed)
             goto reread; /* the replay may have rewritten this record */
+        }
     }
 
     /* Enforcement honors a lock that is actually PRESENT on disk, in BOTH
@@ -3228,10 +3285,16 @@ reread:
              * the janitor pins RELOCATING -- defrag.cetra moves under its
              * own writer's EXCLUSIVE). A real writer is refused at once. */
             if ((m == CETRAFS_LOCK_RELOCATING || m == CETRAFS_LOCK_YIELD) && yield_rounds++ < 3) {
+                dropped = !READ_ONCE(cetrafs_lock_open_slow_held);
+                cetrafs_lock_open_drop(ci);
                 ret = cetrafs_lock_wait_yield(inode, &raw, my_node_id);
                 if (!ret)
-                    goto reread;
-                goto out_pr_unlock;
+                    ret = cetrafs_lock_open_retake(ci, dropped);
+                else if (!dropped)
+                    goto out_pr_unlock;
+                if (ret)
+                    return ret;
+                goto reread;
             }
             ret = -ETXTBSY;
             goto out_pr_unlock;
@@ -3258,20 +3321,32 @@ reread:
                 "lock: ino=%llu read-only mount: reading past node %u's stale lock "
                 "WITHOUT replaying its journal -- its metadata may be unrepaired\n",
                 (unsigned long long) inode->i_ino, raw.lock_owner_node);
-        } else {
-            ret = cetrafs_node_fence_peer(sb, cetrafs_le32(raw.lock_owner_node), "a file lock");
-            if (ret == -EBUSY) {
+        } else if (!(replayed_nodes & (1ULL << (cetrafs_le32(raw.lock_owner_node) % CETRAFS_MAX_READER_NODES))) ||
+                   cetrafs_node_reattached_since_fence(sb, cetrafs_le32(raw.lock_owner_node))) {
+            u32 owner = cetrafs_le32(raw.lock_owner_node);
+
+            dropped = !READ_ONCE(cetrafs_lock_open_slow_held);
+            cetrafs_lock_open_drop(ci);
+            ret = cetrafs_node_fence_peer(sb, owner, "a file lock");
+            if (ret == -EBUSY)
                 ret = -ETXTBSY; /* its owner came back: a live holder (cetrafs_node_fence_mutate()) */
-                goto out_pr_unlock;
-            }
-            if (!ret)
-                ret = cetrafs_journal_replay_node_scoped(sb, cetrafs_le32(raw.lock_owner_node), /*wait_for_claim=*/true,
-                                                         inode->i_ino);
+            else if (!ret)
+                ret = cetrafs_journal_replay_node_scoped(sb, owner, /*wait_for_claim=*/true, inode->i_ino);
             if (ret) {
-                pr_err("lock: ino=%llu could not fence and replay stale node %u (%d), refusing open\n",
-                       (unsigned long long) inode->i_ino, raw.lock_owner_node, ret);
-                goto out_pr_unlock;
+                if (ret != -ETXTBSY)
+                    pr_err("lock: ino=%llu could not fence and replay stale node %u (%d), refusing open\n",
+                           (unsigned long long) inode->i_ino, owner, ret);
+                if (!dropped)
+                    goto out_pr_unlock;
+                return ret;
             }
+            ret = cetrafs_lock_open_retake(ci, dropped);
+            if (ret)
+                return ret;
+            /* Fenced and replayed: judged again from a fresh read, the
+             * claim taken only if it is still that holder's. */
+            replayed_nodes |= 1ULL << (owner % CETRAFS_MAX_READER_NODES);
+            goto reread;
         }
 
         pr_warn("lock: ino=%llu reclaiming a stale lock from node %u\n", (unsigned long long) inode->i_ino,
