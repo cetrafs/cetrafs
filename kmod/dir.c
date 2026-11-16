@@ -162,7 +162,8 @@ static bool cetrafs_dirent_block_valid(const struct buffer_head *bh)
 /* As cetrafs_dirent_bread(), saying why a NULL came back: -EUCLEAN when
  * every attempt read the block and found it damaged, -EIO when the
  * device failed a read. */
-static struct buffer_head *cetrafs_dirent_bread_why(struct super_block *sb, u64 lba, int *why)
+static struct buffer_head *cetrafs_dirent_bread_why(struct super_block *sb, u64 ino, u64 generation, u64 lba,
+                                                    int *why)
 {
     int attempt, nbad = 0;
 
@@ -206,16 +207,20 @@ static struct buffer_head *cetrafs_dirent_bread_why(struct super_block *sb, u64 
     }
     pr_err("dirent block %llu failed its tail checksum %d times -- corrupted, not just a torn concurrent read\n",
            (unsigned long long) lba, CETRAFS_DIRENT_READ_RETRIES);
-    cetrafs_sb_corrupt(sb, 0);
+    /* The directory's own damage, as for its tree blocks
+     * (cetrafs_blk_tail_bread(), audit 2026-11-15 M-13). */
+    if (cetrafs_tree_damage_unowned())
+        ino = generation = 0;
+    cetrafs_sb_corrupt_owner(sb, ino, generation);
     *why = -EUCLEAN;
     return NULL;
 }
 
-static struct buffer_head *cetrafs_dirent_bread(struct super_block *sb, u64 lba)
+static struct buffer_head *cetrafs_dirent_bread(struct inode *dir, u64 lba)
 {
     int why;
 
-    return cetrafs_dirent_bread_why(sb, lba, &why);
+    return cetrafs_dirent_bread_why(dir->i_sb, dir->i_ino, cetrafs_inode_get_generation(dir), lba, &why);
 }
 
 /*
@@ -340,7 +345,8 @@ static int cetrafs_dirent_block_live_owner(struct super_block *sb, u64 lba, u64 
             return -EIO;
         if (chk)
             return 0; /* not a tree that can list anything */
-        leaf = cetrafs_blk_tail_bread(sb, leaf_lba, CETRAFS_LEAF_TAIL_MAGIC, "extent leaf");
+        leaf = cetrafs_blk_tail_bread(sb, self, cetrafs_le64(r.generation), leaf_lba, CETRAFS_LEAF_TAIL_MAGIC,
+                                      "extent leaf");
         if (!leaf)
             return -EIO; /* cannot prove the block free: do not zero it */
         arr = (const cetrafs_extent_t *) (leaf->b_data + sizeof(cetrafs_extent_hdr_t));
@@ -411,20 +417,20 @@ int cetrafs_dirent_block_init(struct super_block *sb, u64 lba, bool *keep)
  * read rather than being trusted or rejected -- costing at most what
  * the old always-fresh path cost.
  */
-static struct buffer_head *cetrafs_dirent_read(struct super_block *sb, u64 lba, bool fresh)
+static struct buffer_head *cetrafs_dirent_read(struct inode *dir, u64 lba, bool fresh)
 {
     struct buffer_head *bh;
 
     if (fresh)
-        return cetrafs_dirent_bread(sb, lba);
+        return cetrafs_dirent_bread(dir, lba);
 
-    bh = cetrafs_bread_retry(sb, lba);
+    bh = cetrafs_bread_retry(dir->i_sb, lba);
     if (bh) {
         if (cetrafs_dirent_block_valid(bh))
             return bh;
         brelse(bh);
     }
-    return cetrafs_dirent_bread(sb, lba);
+    return cetrafs_dirent_bread(dir, lba);
 }
 
 /*
@@ -863,7 +869,7 @@ static int cetrafs_walk_dirents_from(struct inode *dir, cetrafs_dirent_visit_fn 
                 goto out;
             }
             for (tries = 0;; tries++) {
-                bh = cetrafs_dirent_read(dir->i_sb, phys + b, fresh || tries);
+                bh = cetrafs_dirent_read(dir, phys + b, fresh || tries);
                 if (!bh) {
                     ret = -EIO;
                     goto out;
@@ -1011,7 +1017,7 @@ static int cetrafs_dir_scan_for_slot(struct inode *dir,
             cond_resched();
             if (cetrafs_dir_killed())
                 return -EINTR; /* RT-3: the count is the disk's */
-            sbh = cetrafs_dirent_read(dir->i_sb, phys + b, fresh);
+            sbh = cetrafs_dirent_read(dir, phys + b, fresh);
 
             if (!sbh) {
                 pr_warn_ratelimited("dir ino=%llu: dirent block %llu unreadable during add\n",
@@ -1131,7 +1137,7 @@ int cetrafs_dir_add_entry(struct inode *dir, const struct qstr *name, u64 ino, u
          * regardless of how the decision was reached. Everything written
          * below goes into THIS image, so no cached copy can be published
          * even if the decision above came from one. */
-        bh = cetrafs_dirent_read(dir->i_sb, slot_lba, /*fresh=*/true);
+        bh = cetrafs_dirent_read(dir, slot_lba, /*fresh=*/true);
         if (!bh) {
             pr_warn_ratelimited("dir ino=%llu: dirent block %llu unreadable during add\n",
                                 (unsigned long long) dir->i_ino, (unsigned long long) slot_lba);
@@ -1343,7 +1349,7 @@ int cetrafs_dir_remove_entry(struct inode *dir, const struct qstr *name, u64 exp
                 cetrafs_dir_extents_put(&dx);
                 return -EINTR;
             }
-            bh = cetrafs_dirent_read(dir->i_sb, phys + b, fresh);
+            bh = cetrafs_dirent_read(dir, phys + b, fresh);
             if (!bh) {
                 pr_warn_ratelimited("dir ino=%llu: dirent block %llu unreadable during remove\n",
                                     (unsigned long long) dir->i_ino, (unsigned long long) (phys + b));
@@ -1489,7 +1495,7 @@ int cetrafs_dir_update_dotdot(struct inode *dir, u64 new_parent_ino)
                 cetrafs_dir_extents_put(&dx);
                 return -EINTR;
             }
-            bh = cetrafs_dirent_bread(dir->i_sb, phys + b);
+            bh = cetrafs_dirent_bread(dir, phys + b);
             if (!bh) {
                 cetrafs_dir_extents_put(&dx);
                 return -EIO;
@@ -1609,7 +1615,7 @@ static int cetrafs_dir_retarget_entry(struct inode *dir,
             }
             /* A writer never uses the dirent cache -- see
              * cetrafs_dir_needs_fresh(). */
-            bh = cetrafs_dirent_read(dir->i_sb, phys + b, true);
+            bh = cetrafs_dirent_read(dir, phys + b, true);
             if (!bh) {
                 pr_warn_ratelimited("dir ino=%llu: dirent block %llu unreadable during retarget\n",
                                     (unsigned long long) dir->i_ino, (unsigned long long) (phys + b));
@@ -2229,7 +2235,8 @@ static void cetrafs_dir_runs_cb(void *p, u64 phys, u32 len)
  * budget and the damage accounting. On failure every buffer is released and
  * dr->bh[] is left empty.
  */
-static int cetrafs_dirent_batch_read(struct super_block *sb, struct cetrafs_dir_runs *dr, u64 lba, u32 n)
+static int cetrafs_dirent_batch_read(struct super_block *sb, const cetrafs_inode_t *raw, struct cetrafs_dir_runs *dr,
+                                     u64 lba, u32 n)
 {
     bool batched = !READ_ONCE(cetrafs_ns_count_serial) && !cetrafs_bread_uncached_batch(sb, lba, n, dr->bh);
     int why = -EIO;
@@ -2240,7 +2247,7 @@ static int cetrafs_dirent_batch_read(struct super_block *sb, struct cetrafs_dir_
             continue;
         if (batched)
             brelse(dr->bh[k]);
-        dr->bh[k] = cetrafs_dirent_bread_why(sb, lba + k, &why);
+        dr->bh[k] = cetrafs_dirent_bread_why(sb, cetrafs_le64(raw->ino), cetrafs_le64(raw->generation), lba + k, &why);
         if (!dr->bh[k]) {
             for (k = 0; k < n; k++) {
                 brelse(dr->bh[k]); /* NULL-safe */
@@ -2301,7 +2308,7 @@ static int cetrafs_dir_raw_visit(struct super_block *sb, const cetrafs_inode_t *
             u32 k;
 
             /* -EUCLEAN only for a block every attempt found damaged */
-            ret = cetrafs_dirent_batch_read(sb, dr, dr->r[i].lba + b, nb);
+            ret = cetrafs_dirent_batch_read(sb, raw, dr, dr->r[i].lba + b, nb);
             if (ret)
                 return ret;
             for (k = 0; k < nb; k++) {

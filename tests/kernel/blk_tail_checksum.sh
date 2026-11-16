@@ -78,17 +78,21 @@ log "the same for an xattr block"
 # the other xattr suite already uses os.setxattr for the same reason.
 xset() { python3 -c "import os,sys; os.setxattr(sys.argv[1], sys.argv[2], sys.argv[3].encode())" "$@"; }
 xget() { python3 -c "import os,sys; sys.stdout.write(os.getxattr(sys.argv[1], sys.argv[2]).decode())" "$@"; }
-xset "$MNT/frag" user.one first
-xset "$MNT/frag" user.two second
+# A file of its own: frag's failed leaf marked frag damaged, which
+# refuses every write to it -- setxattr included (audit 2026-11-15 M-13).
+: >"$MNT/xf"
+XINO="$(stat -c '%i' "$MNT/xf")"
+xset "$MNT/xf" user.one first
+xset "$MNT/xf" user.two second
 sync
-[ "$(xget "$MNT/frag" user.one 2>/dev/null)" = "first" ] &&
+[ "$(xget "$MNT/xf" user.one 2>/dev/null)" = "first" ] &&
     pass "the xattrs read back before the poke" || fail "setxattr/getxattr did not round-trip"
-"$POKE" "$IMG" xattr "$INO" check >/dev/null &&
+"$POKE" "$IMG" xattr "$XINO" check >/dev/null &&
     pass "the xattr block carries a valid XBLK tail" || fail "the xattr block has no valid tail"
 
-"$POKE" "$IMG" xattr "$INO" corrupt >/dev/null
+"$POKE" "$IMG" xattr "$XINO" corrupt >/dev/null
 MARK="$(dmesg_mark)"
-if xget "$MNT/frag" user.one >/dev/null 2>&1; then
+if xget "$MNT/xf" user.one >/dev/null 2>&1; then
     fail "an xattr block with a broken tail was parsed anyway"
 else
     pass "an xattr block with a broken tail fails the read"
@@ -96,8 +100,8 @@ fi
 dmesg_since "$MARK" | grep -q "xattr block .* failed its tail checksum" &&
     pass "...and says so, naming the block" || fail "nothing was logged"
 
-"$POKE" "$IMG" xattr "$INO" restamp >/dev/null
-[ "$(xget "$MNT/frag" user.one 2>/dev/null)" = "first" ] &&
+"$POKE" "$IMG" xattr "$XINO" restamp >/dev/null
+[ "$(xget "$MNT/xf" user.one 2>/dev/null)" = "first" ] &&
     pass "the xattrs read correctly again once the tail is valid" ||
     fail "the xattrs did not come back"
 
@@ -117,12 +121,12 @@ log "fsck sees a broken xattr tail too, and a healthy xattr block is not a leak"
 # rest of that inode, so the xattr fault would be shadowed and this
 # section would assert nothing about it.
 "$POKE" "$IMG" leaf "$INO" restamp >/dev/null
-"$POKE" "$IMG" xattr "$INO" corrupt >/dev/null
+"$POKE" "$IMG" xattr "$XINO" corrupt >/dev/null
 OUT="$(ct_fsck "$DEV" 2>&1 || true)"
 echo "$OUT" | grep -q "xattr block .* failed its tail checksum" &&
     pass "fsck reports an xattr block whose tail is wrong" ||
     fail "fsck did not report the xattr tail: $(echo "$OUT" | grep -i err | head -2)"
-"$POKE" "$IMG" xattr "$INO" restamp >/dev/null
+"$POKE" "$IMG" xattr "$XINO" restamp >/dev/null
 # The restore control carries the SECOND detection this section exists
 # for: fsck used to never walk xattr_block at all, so a file carrying
 # xattrs reported its (live) xattr block as a phantom LEAK -- and -r's

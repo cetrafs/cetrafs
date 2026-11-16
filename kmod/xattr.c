@@ -184,7 +184,7 @@ static int cetrafs_xattr_read_block(struct inode *inode, void **out)
 
         if (!attempt)
             cetrafs_xattr_read_pause(inode->i_ino);
-        bh = cetrafs_blk_tail_bread(sb, lba, CETRAFS_XATTR_TAIL_MAGIC, "xattr");
+        bh = cetrafs_blk_tail_bread(sb, inode->i_ino, cetrafs_inode_get_generation(inode), lba, CETRAFS_XATTR_TAIL_MAGIC, "xattr");
         if (!bh) {
             ret = -EIO;
             goto out;
@@ -743,7 +743,7 @@ static int cetrafs_xattr_set_locked(struct inode *inode, const char *name, const
         void *img;
         u64 lba = 0;
 
-        bh = cetrafs_blk_tail_bread(sb, cetrafs_le64(raw.xattr_block), CETRAFS_XATTR_TAIL_MAGIC, "xattr");
+        bh = cetrafs_blk_tail_bread(sb, inode->i_ino, cetrafs_inode_get_generation(inode), cetrafs_le64(raw.xattr_block), CETRAFS_XATTR_TAIL_MAGIC, "xattr");
         if (!bh)
             return -EIO;
         img = kmalloc(CETRAFS_BLOCK_SIZE, GFP_NOFS);
@@ -791,7 +791,7 @@ in_place:
         return ret;
     if (S_ISREG(inode->i_mode))
         cetrafs_xattr_pre_publish_stall(); /* the old order's window */
-    bh = cetrafs_blk_tail_bread(sb, cetrafs_le64(raw.xattr_block), CETRAFS_XATTR_TAIL_MAGIC, "xattr");
+    bh = cetrafs_blk_tail_bread(sb, inode->i_ino, cetrafs_inode_get_generation(inode), cetrafs_le64(raw.xattr_block), CETRAFS_XATTR_TAIL_MAGIC, "xattr");
     if (!bh)
         return -EIO;
     /* Claim it before touching any entry -- see ioutil.c. An early exit

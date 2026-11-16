@@ -2138,9 +2138,28 @@ void cetrafs_tear_backoff(int attempt)
     msleep(1U << min(attempt, 7));
 }
 
-struct buffer_head *cetrafs_blk_tail_bread(struct super_block *sb, u64 lba, u32 magic, const char *what)
+/* TEST ONLY: a damaged tree or xattr block marks inode 0, as before
+ * audit 2026-11-15 M-13 -- no file's writes are refused
+ * (tests/kernel/tree_damage_marks_inode.sh). */
+static bool cetrafs_tree_damage_ino0;
+cetrafs_test_param(tree_damage_ino0, cetrafs_tree_damage_ino0, bool, 0644);
+MODULE_PARM_DESC(tree_damage_ino0, "TEST ONLY: a damaged tree, xattr or dirent block marks no file");
+
+bool cetrafs_tree_damage_unowned(void)
+{
+    return READ_ONCE(cetrafs_tree_damage_ino0);
+}
+
+struct buffer_head *cetrafs_blk_tail_bread(struct super_block *sb, u64 ino, u64 generation, u64 lba, u32 magic,
+                                          const char *what)
 {
     int attempt, nbad = 0, chk;
+
+    /* The block is its file's: marking inode 0 counted the damage and
+     * refused nothing, so writes went on through a tree that had just
+     * failed its checksum (audit 2026-11-15 M-13). */
+    if (cetrafs_tree_damage_unowned())
+        ino = generation = 0;
 
     /* Every block read here -- extent leaf, interior index, xattr -- is
      * reached through an address read off the device, and the xattr and
@@ -2154,7 +2173,7 @@ struct buffer_head *cetrafs_blk_tail_bread(struct super_block *sb, u64 lba, u32 
     if (chk) {
         pr_err_ratelimited("%s block %llu is not a data address -- refusing it (fsck)\n", what,
                            (unsigned long long) lba);
-        cetrafs_sb_corrupt(sb, 0);
+        cetrafs_sb_corrupt_owner(sb, ino, generation);
         return NULL;
     }
 
@@ -2183,7 +2202,7 @@ struct buffer_head *cetrafs_blk_tail_bread(struct super_block *sb, u64 lba, u32 
     }
     pr_err("%s block %llu failed its tail checksum %d times -- corrupted, not just a torn concurrent read\n", what,
            (unsigned long long) lba, CETRAFS_BLK_TAIL_READ_RETRIES);
-    cetrafs_sb_corrupt(sb, 0);
+    cetrafs_sb_corrupt_owner(sb, ino, generation);
     /* And do not leave it behind. The last attempt's buffer is still
      * cached and uptodate, and a reader that trusts its cache takes an
      * uptodate block as already verified -- so the read that this call

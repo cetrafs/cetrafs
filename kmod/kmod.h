@@ -322,6 +322,8 @@ const char *cetrafs_sb_stop_cause_name(struct super_block *sb);
 __printf(2, 3) void cetrafs_sb_fatal(struct super_block *sb, const char *fmt, ...);
 void cetrafs_sb_corrupt(struct super_block *sb, u64 ino);
 void cetrafs_sb_corrupt_inode(struct inode *inode);
+void cetrafs_sb_corrupt_owner(struct super_block *sb, u64 ino, u64 generation);
+bool cetrafs_tree_damage_unowned(void); /* ioutil.c, TEST ONLY knob */
 unsigned int cetrafs_sb_corruptions(struct super_block *sb);
 void cetrafs_sb_record_damage(struct super_block *sb);
 u64 cetrafs_sb_fsck_needed(struct super_block *sb, u32 *out_node);
@@ -714,7 +716,10 @@ bool cetrafs_blk_read_accepts(const struct buffer_head *bh, u32 magic);
  * necessarily a block that makes sense. */
 bool cetrafs_blk_struct_ok_magic(const struct buffer_head *bh, u32 magic);
 bool cetrafs_blk_image_valid(const void *img, u32 magic);
-struct buffer_head *cetrafs_blk_tail_bread(struct super_block *sb, u64 lba, u32 magic, const char *what);
+/* ino/generation: the file whose tree or xattr block this is, marked
+ * damaged when the block is (0 when no one file owns it). */
+struct buffer_head *cetrafs_blk_tail_bread(struct super_block *sb, u64 ino, u64 generation, u64 lba, u32 magic,
+                                          const char *what);
 int cetrafs_cas_region(struct super_block *sb, u64 fs_lba, unsigned int region_idx, cetrafs_cas_fn mutate, void *priv);
 int cetrafs_cas_region_judged(struct super_block *sb, u64 fs_lba, unsigned int region_idx, cetrafs_cas_fn mutate,
                               void *priv, bool *image_only);

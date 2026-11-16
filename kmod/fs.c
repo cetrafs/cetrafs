@@ -5428,10 +5428,16 @@ MODULE_PARM_DESC(damage_mark_any_gen, "TEST ONLY: a damage mark covers every inc
 
 void cetrafs_sb_corrupt_inode(struct inode *inode)
 {
-    cetrafs_sb_corrupt_gen(inode->i_sb, inode->i_ino,
-                           READ_ONCE(cetrafs_damage_mark_any_gen)
-                               ? CETRAFS_BAD_GEN_UNKNOWN
-                               : cetrafs_bad_gen(cetrafs_inode_get_generation(inode)));
+    cetrafs_sb_corrupt_owner(inode->i_sb, inode->i_ino, cetrafs_inode_get_generation(inode));
+}
+
+/* A block owned by file 'ino' at 'generation' is damaged: the mark that
+ * refuses its writes. Generation 0 is unknown and covers every one. */
+void cetrafs_sb_corrupt_owner(struct super_block *sb, u64 ino, u64 generation)
+{
+    cetrafs_sb_corrupt_gen(sb, ino,
+                           READ_ONCE(cetrafs_damage_mark_any_gen) ? CETRAFS_BAD_GEN_UNKNOWN
+                                                                  : cetrafs_bad_gen(generation));
 }
 
 static void cetrafs_sb_corrupt_gen(struct super_block *sb, u64 ino, unsigned long gen)

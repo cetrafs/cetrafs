@@ -2510,7 +2510,7 @@ struct buffer_head *cetrafs_read_tree_bh_for(struct inode *inode, u64 lba, u32 t
          * writer do the same on a cache miss. */
         if (bh && !buffer_uptodate(bh)) {
             brelse(bh);
-            return cetrafs_blk_tail_bread(inode->i_sb, lba, tail_magic, what);
+            return cetrafs_blk_tail_bread(inode->i_sb, inode->i_ino, cetrafs_inode_get_generation(inode), lba, tail_magic, what);
         }
         if (bh && !cetrafs_blk_struct_ok_magic(bh, tail_magic)) {
             pr_err_ratelimited("ino=%llu: %s block %llu has an impossible entry count -- refusing it\n",
@@ -2527,7 +2527,7 @@ struct buffer_head *cetrafs_read_tree_bh_for(struct inode *inode, u64 lba, u32 t
      * spilled directory reads its leaf unsynchronised. Verify the tail
      * and retry a mismatch, which is a torn write far more often than
      * it is corruption. */
-    return cetrafs_blk_tail_bread(inode->i_sb, lba, tail_magic, what);
+    return cetrafs_blk_tail_bread(inode->i_sb, inode->i_ino, cetrafs_inode_get_generation(inode), lba, tail_magic, what);
 }
 
 struct buffer_head *cetrafs_read_tree_bh(struct inode *inode, u64 lba, u32 tail_magic, const char *what)
@@ -2587,7 +2587,7 @@ struct buffer_head *cetrafs_read_dir_leaf_bh(struct inode *inode, u64 lba, bool 
 
         if (bh && !buffer_uptodate(bh)) {
             brelse(bh);
-            return cetrafs_blk_tail_bread(inode->i_sb, lba, CETRAFS_LEAF_TAIL_MAGIC, "extent leaf");
+            return cetrafs_blk_tail_bread(inode->i_sb, inode->i_ino, cetrafs_inode_get_generation(inode), lba, CETRAFS_LEAF_TAIL_MAGIC, "extent leaf");
         }
         if (bh && !cetrafs_blk_struct_ok_magic(bh, CETRAFS_LEAF_TAIL_MAGIC)) {
             pr_err_ratelimited("dir ino=%llu: extent leaf %llu has an impossible entry count -- refusing it\n",
@@ -2598,7 +2598,7 @@ struct buffer_head *cetrafs_read_dir_leaf_bh(struct inode *inode, u64 lba, bool 
         }
         return bh;
     }
-    return cetrafs_blk_tail_bread(inode->i_sb, lba, CETRAFS_LEAF_TAIL_MAGIC, "extent leaf");
+    return cetrafs_blk_tail_bread(inode->i_sb, inode->i_ino, cetrafs_inode_get_generation(inode), lba, CETRAFS_LEAF_TAIL_MAGIC, "extent leaf");
 }
 
 /* v2: an interior index block, same freshness rules, its own tail magic
