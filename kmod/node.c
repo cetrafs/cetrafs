@@ -2574,22 +2574,25 @@ int cetrafs_node_nocaw_peer_exists(struct super_block *sb, const u8 *my_uuid, bo
  * build, or any row written before caps existed (caps == 0) -- would
  * keep compare-and-swapping Block Group descriptors at superseded LBAs.
  *
- * Checks EVERY REGISTERED row, not just the non-stale ones: a stale row
+ * Checks every REGISTERED row with no recorded departure, not just the
+ * non-stale ones: a stale row
  * is a node that is merely paused (slow, swapped out, mid-reboot), and
  * if it is an OLD build it will resume on the old layout with no idea
- * the tables moved. Stale-reclaim does not free a row: the only kernel
- * path that takes a REGISTERED row to FREE is a registration giving
- * back the fresh row it claimed moments ago (cetrafs_node_unclaim_
- * mutate()), so a truly dead node's row stays REGISTERED and keeps
- * counting here until an operator clears it offline. A row that lacks the capability therefore blocks the grow
- * for as long as it stays REGISTERED, dead or alive (a live old node
- * blocks it for as long as it is mounted). Our own row is included and
+ * the tables moved. A crashed node's row keeps counting until a reclaim
+ * fence or a declaration records it DEAD; a live old node blocks the
+ * grow for as long as it is mounted. Our own row is included and
  * trivially passes
  * (we stamped it). Returns false on any read error -- unknown is unsafe.
  *
  * One record read per row, bounded by the table's mkfs capacity; called
  * only from the grow path, never on a hot path.
  */
+/* TEST ONLY: the capability gate counts departed rows too, as before
+ * (tests/kernel/grow_gate_departed.sh). */
+static bool cetrafs_caps_gate_departed;
+cetrafs_test_param(caps_gate_departed, cetrafs_caps_gate_departed, bool, 0644);
+MODULE_PARM_DESC(caps_gate_departed, "TEST ONLY: the cluster capability gate counts departed rows");
+
 bool cetrafs_cluster_all_advertise(struct super_block *sb, u32 cap)
 {
     const cetrafs_superblock_t *raw_sb = cetrafs_sb_raw(sb);
@@ -2605,7 +2608,14 @@ bool cetrafs_cluster_all_advertise(struct super_block *sb, u32 cap)
         if (cetrafs_read_node_entry(sb, idx, &ne) != 0)
             return false; /* cannot read a row -> cannot vouch for the cluster */
         if (cetrafs_le32(ne.state) != CETRAFS_NODE_STATE_REGISTERED)
-            continue; /* FREE or departed: not a live participant */
+            continue; /* FREE: not a participant */
+        /* Departed: CLEAN re-reads the layout when it mounts again, and
+         * DEAD was fenced, so it stops at its next beat before any write.
+         * The comment said departed rows were skipped; the predicate
+         * skipped only FREE ones, and every dead old-build row blocked
+         * every grow (audit 2026-11-15 M-28). */
+        if (cetrafs_le32(ne.departure) != CETRAFS_NODE_DEPART_NONE && !READ_ONCE(cetrafs_caps_gate_departed))
+            continue;
         if ((cetrafs_le32(ne.caps) & cap) != cap) {
             pr_warn("cluster capability gate: node row %u advertises caps 0x%x, missing 0x%x\n", idx,
                     cetrafs_le32(ne.caps), cap);
