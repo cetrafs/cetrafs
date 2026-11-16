@@ -32,7 +32,7 @@ set -euo pipefail
 . "$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)/lib/harness.sh"
 require_root
 require_module
-for p in journal_kept_aborts journal_unordered journal_replay_lookup_fail journal_owner_read_fail; do
+for p in journal_kept_aborts journal_unordered journal_replay_lookup_fail journal_owner_read_fail journal_replay_refuse; do
     [ -w "/sys/module/cetrafs/parameters/$p" ] || { skip "$p is missing"; ct_exit; }
 done
 JPOKE="$(ct_helper journal_poke)"
@@ -45,6 +45,7 @@ ct_param_set journal_kept_aborts 0
 ct_param_set journal_unordered 0
 ct_param_set journal_replay_lookup_fail 0
 ct_param_set journal_owner_read_fail 0
+ct_param_set journal_replay_refuse 0
 compress_timing
 
 get() { grep -o "$1=[^ ]*" <<<"$2" | head -1 | sed 's/^[^=]*=//'; }
@@ -112,12 +113,19 @@ round() {
     # the first replay ends in its summary line -- or, aborted, in the abort
     ctl='journal replay: node 1 replayed'
     [ "$4" = 1 ] && ctl="$ctl\\|could not tell where target"
-    wait_for 60 "dmesg_since '$mark' | grep -q '$ctl'" || true
-    sleep 1
+    # Polled finely, and further replays held off the moment it is seen:
+    # on the compressed 1 s tick the next sweep finished the chain inside
+    # a 1 s poll plus a 1 s sleep, and "first" measured the second.
+    for _ in $(seq 1 1200); do
+        dmesg_since "$mark" | grep -q "$ctl" && break
+        sleep 0.05
+    done
+    echo 1 >"$P/journal_replay_refuse"
     RES="first_root=$(which_img "$dev" "$t" "$dir/s0" "$dir/s1" "$dir/s2")"
     RES="$RES first_d=$(which_img "$dev" "$d" "$dir/d0" "$dir/d1") first_state=$(state "$dev")"
     RES="$RES kept_logged=$(dmesg_since "$mark" | grep -c 'kept undecided' || true)"
     echo 0 >"$P/$2"
+    echo 0 >"$P/journal_replay_refuse"
     echo 0 >$P/journal_kept_aborts
     echo 0 >$P/journal_unordered
     wait_for 90 "[ \"\$(\"$JPOKE\" '$dev' 1 --dump | head -1 | sed -n 's/^state=\([0-9]*\).*/\1/p')\" = 0 ]" || true
