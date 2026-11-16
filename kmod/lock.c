@@ -7313,6 +7313,13 @@ static int cetrafs_foreign_claim_from_raw(struct super_block *sb,
                                           bool *out_exists,
                                           bool *out_repaired);
 
+/* TEST ONLY: a stale node's presence bit is cleared whatever its journal
+ * says, as before audit 2026-11-15 F-37 -- the control of
+ * tests/kernel/dead_reader_bit_awaits_replay.sh. */
+static bool cetrafs_reader_clear_dirty_ok;
+cetrafs_test_param(reader_clear_dirty_ok, cetrafs_reader_clear_dirty_ok, bool, 0644);
+MODULE_PARM_DESC(reader_clear_dirty_ok, "TEST ONLY: a stale node's presence bit is cleared though its journal is dirty");
+
 /* The decision half of cetrafs_lock_foreign_reader_exists(), from a
  * record the caller has already read fresh. */
 static int cetrafs_foreign_reader_from_raw(struct super_block *sb,
@@ -7346,6 +7353,26 @@ static int cetrafs_foreign_reader_from_raw(struct super_block *sb,
                 .check_incarnation = true,
                 .steal_incarnation = cetrafs_le32(raw.read_open_incarnation[n % CETRAFS_MAX_READER_NODES]),
             };
+            /*
+             * nofilelock: a dead node's bit is what sends the next open of
+             * this file through a replay of its journal first (the open
+             * hook in cetrafs_lock_open()). Cleared while that journal is
+             * still dirty, the open skips the replay, the file runs past
+             * the dead node's last tree writes, and the heartbeat's redo
+             * lands on top of the live writer's -- M-20 by another door
+             * (audit 2026-11-15 F-37). Kept, and counted as a reader,
+             * until the journal is clean: a destroy goes the orphan way,
+             * whose reclaim replays it first (scrub.c). A read that fails
+             * counts it too.
+             */
+            if (!cetrafs_sb_file_lock_enabled(sb) && !READ_ONCE(cetrafs_reader_clear_dirty_ok)) {
+                bool dirty = true;
+
+                if (cetrafs_journal_node_is_dirty(sb, n, &dirty) || dirty) {
+                    *out_exists = true;
+                    return 0;
+                }
+            }
             if (cetrafs_node_fence_peer(sb, n, "a read-open reference")) {
                 /* Not revoked: it may still be reading. Count it. */
                 *out_exists = true;
