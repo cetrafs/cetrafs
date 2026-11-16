@@ -156,6 +156,8 @@ static int cetrafs_proc_info_show(struct seq_file *m, void *v)
     /* No: require_mount_check=0 let this mount skip mount.cetrafs's
      * transport check (F-28). */
     seq_printf(m, "mount_checked: %s\n", cetrafs_sb_transport_checked(sb) ? "yes" : "no");
+    /* Block 0's copy, as found at mount: ok, stale or bad (A-7). */
+    seq_printf(m, "sb_copy: %s\n", cetrafs_sb_copy_state_name(sb));
     /* Why (docs/internal/ERRORS.md): none, fenced, lease, error,
      * corruption, manual or device_gone. 'fenced: yes' for every one of
      * them -- the state is the same, only the cause differs. */

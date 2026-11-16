@@ -167,6 +167,30 @@ static void sync_device(int fd, bool do_write)
         die_dev("fsync: %s", strerror(errno));
 }
 
+/* Block 0's copy (CETRAFS_SB_REPLICA_NR, A-7), after the primary is
+ * published: the layout, never the needs-fsck status. A stop before it
+ * leaves a stale copy that mount reports and fsck -r rewrites from
+ * block 0 -- never a copy ahead of block 0. */
+static void growfs_write_sb_copy(int fd, const cetrafs_superblock_t *sb)
+{
+    uint8_t blk[CETRAFS_BLOCK_SIZE];
+    cetrafs_superblock_t s = *sb;
+
+    if (cetrafs_test_env("CETRAFS_GROWFS_TEST_NO_SB_COPY")) {
+        fprintf(stderr, "growfs.cetra: TEST MODE: leaving the copy of block 0 as it was\n");
+        return;
+    }
+    s.fsck_needed_since = cetrafs_cpu_to_le64(0);
+    s.fsck_needed_node = cetrafs_cpu_to_le32(0);
+    s.fsck_needed_pad = cetrafs_cpu_to_le32(0);
+    s.checksum = cetrafs_cpu_to_le64(
+        crc32c_struct(&s, sizeof(s), offsetof(cetrafs_superblock_t, checksum), sizeof(s.checksum)));
+    memset(blk, 0, sizeof(blk));
+    memcpy(blk, &s, sizeof(s));
+    write_block(fd, CETRAFS_SB_REPLICA_NR, blk, true);
+    sync_device(fd, true);
+}
+
 static void usage(const char *argv0)
 {
     fprintf(stderr,
@@ -318,7 +342,7 @@ static void growfs_check_layout(const char *dev, const cetrafs_superblock_t *sb,
     first = cetrafs_le64(sb->bg_table_first_count);
     if (!first || first > bg_cnt)
         first = bg_cnt;
-    r[n++] = (struct growfs_region) {"superblock", 0, 1};
+    r[n++] = (struct growfs_region) {"superblock and its copy", 0, CETRAFS_SB_AREA_BLOCKS};
     r[n++] = (struct growfs_region) {"zone group table", cetrafs_le64(sb->zg_table_start), zg_cnt};
     r[n++] = (struct growfs_region) {"block group table", cetrafs_le64(sb->bg_table_start), first};
     r[n++] = (struct growfs_region) {"inode bitmap", cetrafs_le64(sb->inode_bmap_start), cetrafs_le64(sb->inode_bmap_blocks)};
@@ -1286,6 +1310,7 @@ int main(int argc, char **argv)
         }
         close(dfd);
         free(zg_added);
+        growfs_write_sb_copy(fd, &sb);
         growfs_release_claim(fd);
         close(fd);
         free(blk);
@@ -1353,6 +1378,7 @@ int main(int argc, char **argv)
     memcpy(blk, &sb, sizeof(sb));
     write_block(fd, CETRAFS_SB_BLOCK_NR, blk, true);
     sync_device(fd, true);
+    growfs_write_sb_copy(fd, &sb);
 
     /*
      * Zone Group aggregates LAST, after the publish.

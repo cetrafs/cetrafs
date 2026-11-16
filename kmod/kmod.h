@@ -375,6 +375,11 @@ bool cetrafs_sb_defrag_enabled(struct super_block *sb);
 bool cetrafs_sb_auto_defrag_enabled(struct super_block *sb);
 bool cetrafs_sb_file_lock_enabled(struct super_block *sb);
 bool cetrafs_sb_transport_checked(struct super_block *sb);
+/* fs.c: block 0's copy as found at mount (A-7) */
+#define CETRAFS_SB_COPY_OK    0
+#define CETRAFS_SB_COPY_STALE 1
+#define CETRAFS_SB_COPY_BAD   2
+const char *cetrafs_sb_copy_state_name(struct super_block *sb);
 void cetrafs_sb_row_silent_note(struct super_block *sb, u32 idx, const cetrafs_node_entry_t *ne);
 bool cetrafs_sb_row_silent(struct super_block *sb, u32 idx, const cetrafs_node_entry_t *ne);
 extern atomic_t cetrafs_sb_kills; /* fs.c: kill_sb calls since load */

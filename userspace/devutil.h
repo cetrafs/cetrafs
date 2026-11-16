@@ -1005,7 +1005,7 @@ static inline int cetrafs_node_table_placed_ok(int fd, const cetrafs_superblock_
         first = bg;
     if (!data_end)
         data_end = cetrafs_le64(sb->bg_regions_start) + bg * cetrafs_le64(sb->bg_size_blocks);
-    r[n].start = 0, r[n++].count = 1;
+    r[n].start = 0, r[n++].count = CETRAFS_SB_AREA_BLOCKS;
     r[n].start = cetrafs_le64(sb->zg_table_start), r[n++].count = zg;
     r[n].start = cetrafs_le64(sb->bg_table_start), r[n++].count = first;
     r[n].start = cetrafs_le64(sb->inode_bmap_start), r[n++].count = cetrafs_le64(sb->inode_bmap_blocks);
@@ -1208,8 +1208,13 @@ static inline int cetrafs_repair_claim(int fd, const cetrafs_superblock_t *sb, c
             {
                 unsigned char sblk[CETRAFS_BLOCK_SIZE];
 
+                /* ...or, for fsck acting through block 0's copy (A-7)
+                 * because block 0 does not verify, that copy. */
                 if (pread(fd, sblk, sizeof(sblk), 0) != (ssize_t) sizeof(sblk) ||
-                    memcmp(sblk, sb, sizeof(*sb)) != 0) {
+                    (memcmp(sblk, sb, sizeof(*sb)) != 0 &&
+                     (pread(fd, sblk, sizeof(sblk), (off_t) CETRAFS_SB_REPLICA_NR * CETRAFS_BLOCK_SIZE) !=
+                          (ssize_t) sizeof(sblk) ||
+                      memcmp(sblk, sb, sizeof(*sb)) != 0))) {
                     cetrafs_repair_release(fd, sb, idx);
                     return -3;
                 }

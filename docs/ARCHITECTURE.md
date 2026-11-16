@@ -64,8 +64,10 @@ capacity (`-M`).
 
 ```
 LBA  0                  Superblock (1 block)
-LBA  1 .. Z             Zone Group table (1 block per ZG)
-LBA  1+Z .. Z+B         Block Group table (1 block per BG)
+LBA  1 .. 2047          left empty
+LBA  2048               Copy of the superblock (8 MiB in; CETRAFS_SB_REPLICA_NR)
+LBA  2049 ..            Zone Group table (1 block per ZG)
+     ...                Block Group table (1 block per BG)
      ...                Global inode bitmap (inode_bmap_blocks)
      ...                Global inode table (inode_table_blocks, densely packed)
      ...                Node Registry (node_table_blocks, densely packed)
@@ -133,6 +135,18 @@ and must be accessed through `cetrafs_le*()`/`cetrafs_cpu_to_le*()`; see
 **Endianness** below.
 
 ### Superblock — `cetrafs_superblock_t` (424 bytes, block 0)
+
+A copy of block 0 lives at the fixed block 2048 (8 MiB in, past what a
+partition tool, a label or a stray `dd` at the start of the disk reaches,
+and at a place no grow moves). It carries the layout only: its
+`fsck_needed_*` fields are always zero, and comparisons ignore those and
+the checksum. mkfs writes it before block 0 and growfs after block 0;
+the kernel never writes it and never mounts from it. A mount whose block
+0 does not verify is refused with a message naming the copy; a mount
+whose copy is missing or describes another layout goes ahead, warns, and
+says so in `info` (`sb_copy: ok|stale|bad`). `fsck.cetra` checks the
+volume through the copy when block 0 is damaged, and `-r` restores block
+0 from it -- or rewrites a copy that is stale or damaged.
 
 | Field | Type | Meaning |
 |---|---|---|

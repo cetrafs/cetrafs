@@ -614,6 +614,10 @@ struct cetrafs_sb_info {
      * it (mount, every heartbeat's block-0 read), and whether this mount
      * has put its own damage there yet (cetrafs_sb_record_damage()). */
     u64 fsck_needed_since;
+    /* What block CETRAFS_SB_REPLICA_NR held at mount (A-7): one of
+     * CETRAFS_SB_COPY_*. Said in info; a copy that is not OK is the
+     * operator's to fix with fsck -r, never a reason to refuse. */
+    int sb_copy_state;
     u32 fsck_needed_node;
     bool damage_recorded;
     /* A regular file's extent-tree blocks held back from writeback until
@@ -1900,7 +1904,7 @@ static int cetrafs_validate_layout(const cetrafs_superblock_t *sb, u64 total_blo
         return -EINVAL;
     }
 
-    r[n++] = (struct cetrafs_region) {"superblock", 0, 1};
+    r[n++] = (struct cetrafs_region) {"superblock and its copy", 0, CETRAFS_SB_AREA_BLOCKS};
     r[n++] = (struct cetrafs_region) {"zone group table", le64_to_cpu(sb->zg_table_start), zg_cnt};
     /* the FIRST SEGMENT only. The Block Group table is a chain: the run at
      * bg_table_start holds bg_table_first_count descriptors and the rest
@@ -2106,6 +2110,37 @@ static bool cetrafs_sb_same_layout(const cetrafs_superblock_t *a, const cetrafs_
     cetrafs_sb_copy_status(&y, &x);
     y.checksum = x.checksum;
     return !memcmp(&x, &y, sizeof(x));
+}
+
+/*
+ * The copy of block 0 (CETRAFS_SB_REPLICA_NR, A-7), read off the device.
+ * 0 and *out filled: a superblock that verifies. -EUCLEAN: anything else
+ * (no magic, a bad checksum). -EIO: unreadable. Reported only: nothing
+ * mounts from the copy, since each node choosing between two copies on
+ * its own is how a shared volume ends up with two layouts.
+ */
+static int cetrafs_sb_copy_read(struct super_block *sb, cetrafs_superblock_t *out)
+{
+    struct buffer_head *bh = cetrafs_bread_uncached(sb, CETRAFS_SB_REPLICA_NR);
+
+    if (!bh)
+        return -EIO;
+    cetrafs_bh_copy_stable(bh, out, sizeof(*out));
+    brelse(bh);
+    if (le32_to_cpu(out->magic) != CETRAFS_MAGIC || cetrafs_check_sb_crc(out, sizeof(*out), out->checksum))
+        return -EUCLEAN;
+    return 0;
+}
+
+/* Say what block 0's copy offers when block 0 itself does not verify. */
+static void cetrafs_sb_copy_hint(struct super_block *sb)
+{
+    cetrafs_superblock_t copy;
+
+    if (!cetrafs_sb_copy_read(sb, &copy))
+        pr_err("%s: block 0 does not verify, but its copy at block %llu does -- unmount every node and run "
+               "fsck.cetra -r, which restores block 0 from it\n",
+               sb->s_id, (unsigned long long) CETRAFS_SB_REPLICA_NR);
 }
 
 /* Remember the mark as last read off the device. */
@@ -2626,8 +2661,10 @@ int cetrafs_fill_super(struct super_block *sb, struct fs_context *fc)
 
     /* Basic identity checks (LE on disk) */
     if (le32_to_cpu(ondisk->magic) != CETRAFS_MAGIC) {
-        if (!(fc->sb_flags & SB_SILENT))
+        if (!(fc->sb_flags & SB_SILENT)) {
             pr_err("bad magic: 0x%08x\n", le32_to_cpu(ondisk->magic));
+            cetrafs_sb_copy_hint(sb);
+        }
         brelse(bh);
         return -EINVAL;
     }
@@ -2670,6 +2707,7 @@ int cetrafs_fill_super(struct super_block *sb, struct fs_context *fc)
         int rc = cetrafs_check_sb_crc(ondisk, sizeof(*ondisk), ondisk->checksum);
         if (rc) {
             pr_err("superblock CRC32C mismatch\n");
+            cetrafs_sb_copy_hint(sb);
             brelse(bh);
             return rc;
         }
@@ -2879,6 +2917,19 @@ int cetrafs_fill_super(struct super_block *sb, struct fs_context *fc)
          * clears it. The mount goes ahead -- damage refuses writes where
          * it is found, it does not take the volume down. */
         cetrafs_sb_note_status(sbi, ondisk);
+        {
+            cetrafs_superblock_t copy;
+            int crc = cetrafs_sb_copy_read(sb, &copy);
+
+            sbi->sb_copy_state = crc ? CETRAFS_SB_COPY_BAD
+                                 : cetrafs_sb_same_layout(&copy, ondisk) ? CETRAFS_SB_COPY_OK
+                                                                         : CETRAFS_SB_COPY_STALE;
+            if (sbi->sb_copy_state != CETRAFS_SB_COPY_OK)
+                pr_warn("%s: the copy of block 0 at block %llu %s -- fsck.cetra -r rewrites it from block 0\n",
+                        sb->s_id, (unsigned long long) CETRAFS_SB_REPLICA_NR,
+                        sbi->sb_copy_state == CETRAFS_SB_COPY_BAD ? "does not verify"
+                                                                  : "describes a different layout");
+        }
         if (sbi->fsck_needed_since)
             pr_err("%s: this volume needs fsck: damaged metadata was found by registry row %u at %llu (unix "
                    "time) -- unmount it on every node and run fsck.cetra -r\n",
@@ -6501,6 +6552,17 @@ bool cetrafs_sb_row_silent(struct super_block *sb, u32 idx, const cetrafs_node_e
         idx >= le32_to_cpu(raw_sb->node_table_count) || !test_bit(idx, sbi->row_silent_valid))
         return false;
     return cetrafs_row_mark_same(&sbi->row_silent[idx], ne);
+}
+
+const char *cetrafs_sb_copy_state_name(struct super_block *sb)
+{
+    struct cetrafs_sb_info *sbi = sb->s_fs_info;
+
+    if (!sbi)
+        return "unknown";
+    return sbi->sb_copy_state == CETRAFS_SB_COPY_OK      ? "ok"
+           : sbi->sb_copy_state == CETRAFS_SB_COPY_STALE ? "stale"
+                                                         : "bad";
 }
 
 bool cetrafs_sb_transport_checked(struct super_block *sb)

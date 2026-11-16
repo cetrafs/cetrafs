@@ -893,7 +893,7 @@ int main(int argc, char **argv)
     }
 
     /* --- compute metadata footprint, auto-tune J/B, and solve B --- */
-    const u64 sb_blocks = 1;
+    const u64 sb_blocks = CETRAFS_SB_AREA_BLOCKS; /* block 0, the gap, the copy (A-7) */
     const u64 i_bmap_blk = cetrafs_calc_inode_bmap_blocks(inodes_total);
     const u64 i_tbl_blk = cetrafs_calc_inode_table_blocks(inodes_total, CETRAFS_INODE_ONDISK_SIZE);
     /* Node Registry is packed densely like the inode table, just a much
@@ -1065,7 +1065,7 @@ int main(int argc, char **argv)
 
     /* --- lay out absolute LBAs --- */
     const u64 sb_lba = CETRAFS_SB_BLOCK_NR;      /* 0 */
-    const u64 zg_lba = sb_lba + sb_blocks;       /* 1 */
+    const u64 zg_lba = sb_lba + sb_blocks;       /* CETRAFS_SB_AREA_BLOCKS */
     const u64 bg_table_lba = zg_lba + zg_blocks; /* 1 + Z */
     const u64 i_bmap_lba = bg_table_lba + bg_table_blk;
     const u64 i_tbl_lba = i_bmap_lba + i_bmap_blk;
@@ -1172,6 +1172,18 @@ int main(int argc, char **argv)
     if (!dry_run) {
         mkfs_retire_old_superblock(fd, dev);
         mkfs_wipe_backup_gpt(fd, dev);
+        /* The old volume's copy of block 0 goes with it, before any new
+         * structure is written: a stop between here and the new copy
+         * must not leave a valid copy describing the old volume over
+         * half-written new tables, for fsck -r to restore (A-7). */
+        {
+            uint8_t zero[CETRAFS_BLOCK_SIZE];
+
+            memset(zero, 0, sizeof(zero));
+            write_block(fd, CETRAFS_SB_REPLICA_NR, zero, true);
+            if (fsync(fd) != 0)
+                die("fsync failed after clearing the old superblock copy: %s", strerror(errno));
+        }
     }
 
     /* --------------------------- */
@@ -1513,6 +1525,13 @@ int main(int argc, char **argv)
         /* Everything the superblock will point at, on the device. */
         if (fsync(fd) != 0)
             die("fsync failed before stamping the superblock: %s", strerror(errno));
+
+        /* The copy first (A-7): a stop between the two leaves a volume
+         * whose block 0 fsck -r restores from it, never a volume with a
+         * superblock and no copy. */
+        write_block(fd, CETRAFS_SB_REPLICA_NR, sb_blk, true);
+        if (fsync(fd) != 0)
+            die("fsync of the superblock copy failed: %s", strerror(errno));
 
         /* Only now does the volume become mountable. */
         write_block(fd, sb_lba, sb_blk, true);

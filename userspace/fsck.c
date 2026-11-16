@@ -239,6 +239,9 @@ static uint64_t repairs_made;
  * is never silently dropped from the count just because it was found
  * early -- and so a repaired one still makes the run report itself. */
 static uint64_t early_problems;
+/* Block 0 did not verify and the volume is checked through its copy;
+ * the copy did not match block 0 (A-7). */
+static int sb_from_copy, sb_copy_bad;
 
 /*
  * Set while the content pass walks a DELETED record (nlink=0): its
@@ -593,6 +596,55 @@ static void fsck_clear_needed_mark(int fd, cetrafs_superblock_t *sb)
     pwrite_all(fd, blk, sizeof(blk), 0);
     fsync(fd);
     *sb = cur;
+}
+
+/*
+ * Block 0's copy (CETRAFS_SB_REPLICA_NR, audit 2026-11-15 A-7). The copy
+ * carries the layout and never the needs-fsck status, so the two are
+ * compared with the status fields and the checksum left out.
+ */
+static int fsck_sb_verifies(const cetrafs_superblock_t *s)
+{
+    return cetrafs_le32(s->magic) == (uint32_t) CETRAFS_MAGIC &&
+           (uint32_t) cetrafs_le64(s->checksum) ==
+               crc32c_struct(s, sizeof(*s), offsetof(cetrafs_superblock_t, checksum), sizeof(s->checksum));
+}
+
+static void fsck_sb_strip_status(cetrafs_superblock_t *s)
+{
+    s->fsck_needed_since = cetrafs_cpu_to_le64(0);
+    s->fsck_needed_node = cetrafs_cpu_to_le32(0);
+    s->fsck_needed_pad = cetrafs_cpu_to_le32(0);
+    s->checksum = cetrafs_cpu_to_le64(0);
+}
+
+static int fsck_sb_same_layout(const cetrafs_superblock_t *a, const cetrafs_superblock_t *b)
+{
+    cetrafs_superblock_t x = *a, y = *b;
+
+    fsck_sb_strip_status(&x);
+    fsck_sb_strip_status(&y);
+    return !memcmp(&x, &y, sizeof(x));
+}
+
+/* Write 'sb', status fields cleared, to block 'lba': the copy, or block 0
+ * restored from the copy. The rest of the block is zero, as mkfs leaves it. */
+static void fsck_write_sb_at(int fd, const cetrafs_superblock_t *sb, uint64_t lba)
+{
+    uint8_t blk[CETRAFS_BLOCK_SIZE];
+    cetrafs_superblock_t s = *sb;
+
+    fsck_sb_strip_status(&s);
+    s.checksum = cetrafs_cpu_to_le64(
+        crc32c_struct(&s, sizeof(s), offsetof(cetrafs_superblock_t, checksum), sizeof(s.checksum)));
+    memset(blk, 0, sizeof(blk));
+    memcpy(blk, &s, sizeof(s));
+    pwrite_all(fd, blk, sizeof(blk), (off_t) lba * CETRAFS_BLOCK_SIZE);
+    if (fsync(fd) != 0) {
+        fprintf(stderr, "ERR: fsync after writing the superblock at block %" PRIu64 " failed: %s\n", lba,
+                strerror(errno));
+        exit(FSCK_EXIT_NOEXAM);
+    }
 }
 
 static void fsck_write_inode(int fd, const cetrafs_superblock_t *sb, uint64_t ino, cetrafs_inode_t *in)
@@ -2063,6 +2115,37 @@ int main(int argc, char **argv)
     pread_all(fd, sbblk, sizeof(sbblk), 0);
     cetrafs_superblock_t sb;
     memcpy(&sb, sbblk, sizeof(sb));
+    /* Block 0 and its copy (A-7). Block 0 that verifies is the volume's
+     * superblock and the copy is checked against it; one that does not,
+     * beside a copy that does, is checked through the copy and restored
+     * from it by -r once the walk has found the layout sound. */
+    {
+        cetrafs_superblock_t copy;
+
+        memset(&copy, 0, sizeof(copy));
+        if (total_blocks > CETRAFS_SB_REPLICA_NR)
+            pread_all(fd, &copy, sizeof(copy), (off_t) CETRAFS_SB_REPLICA_NR * CETRAFS_BLOCK_SIZE);
+        if (fsck_sb_verifies(&sb)) {
+            if (!fsck_sb_verifies(&copy) || !fsck_sb_same_layout(&sb, &copy)) {
+                sb_copy_bad = 1;
+                fprintf(stderr, "ERR: the copy of block 0 at block %llu %s%s\n",
+                        (unsigned long long) CETRAFS_SB_REPLICA_NR,
+                        fsck_sb_verifies(&copy) ? "describes a different layout" : "does not verify",
+                        repair_mode ? "" : " -- fsck.cetra -r rewrites it from block 0");
+                early_problems++;
+            }
+        } else if (fsck_sb_verifies(&copy)) {
+            fprintf(stderr,
+                    "ERR: block 0 %s; checking the volume through its copy at block %llu%s\n",
+                    cetrafs_le32(sb.magic) != (uint32_t) CETRAFS_MAGIC ? "holds no cetrafs superblock"
+                                                                      : "fails its checksum",
+                    (unsigned long long) CETRAFS_SB_REPLICA_NR,
+                    repair_mode ? "" : " -- fsck.cetra -r restores block 0 from it");
+            sb = copy;
+            sb_from_copy = 1;
+            early_problems++;
+        }
+    }
     if (cetrafs_le32(sb.magic) != (uint32_t) CETRAFS_MAGIC) {
         fprintf(stderr, "ERR: bad magic\n");
         return 1;
@@ -2249,7 +2332,7 @@ int main(int argc, char **argv)
         unsigned n = 0, i, j;
         uint64_t zg_cnt = cetrafs_le32(sb.zone_group_count), bg_cnt = cetrafs_le32(sb.block_group_count);
 
-        r[n++] = (typeof(r[0])) {"superblock", 0, 1};
+        r[n++] = (typeof(r[0])) {"superblock and its copy", 0, CETRAFS_SB_AREA_BLOCKS};
         r[n++] = (typeof(r[0])) {"zone group table", cetrafs_le64(sb.zg_table_start), zg_cnt};
         /* the FIRST SEGMENT only. The Block Group table is a chain: the run at
          * bg_table_start holds bg_table_first_count descriptors and the rest
@@ -5484,6 +5567,20 @@ int main(int argc, char **argv)
         free(dsize);
         free(dslots);
         free(dwhole);
+
+        /* Block 0 and its copy (A-7). class 45: lossless whatever the
+         * run decided -- the walk just checked the whole volume against
+         * the superblock written here, and the other copy stays as it is
+         * until this one is on the device. */
+        if (repair_mode && !repair_blocked && sb_from_copy) {
+            fsck_write_sb_at(fd, &sb, CETRAFS_SB_BLOCK_NR);
+            printf("  restored block 0 from its copy at block %llu\n", (unsigned long long) CETRAFS_SB_REPLICA_NR);
+            repairs_made++;
+        } else if (repair_mode && !repair_blocked && sb_copy_bad) {
+            fsck_write_sb_at(fd, &sb, CETRAFS_SB_REPLICA_NR);
+            printf("  rewrote the copy of block 0 at block %llu\n", (unsigned long long) CETRAFS_SB_REPLICA_NR);
+            repairs_made++;
+        }
 
         problems += early_problems;
 

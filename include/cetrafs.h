@@ -589,6 +589,18 @@ typedef struct {
  */
 
 #define CETRAFS_SB_BLOCK_NR        0ULL
+/* A copy of block 0, 8 MiB in (audit 2026-11-15 A-7). One stray write
+ * to block 0 -- a partition tool, a label, a dd -- made the volume
+ * unmountable on every node with all of its data intact. The copy sits
+ * where those miss, at a place that never moves, so a tool finds it
+ * with no superblock to say where. Blocks 1..CETRAFS_SB_REPLICA_NR-1
+ * are left empty: the gap is what a short overwrite of the start spends
+ * itself on. The copy carries the layout; its fsck_needed_* status
+ * fields are always zero (the kernel marks block 0 alone). Written by
+ * mkfs and growfs only, after the primary; nothing mounts from it --
+ * fsck -r restores block 0 from it. */
+#define CETRAFS_SB_REPLICA_NR      2048ULL
+#define CETRAFS_SB_AREA_BLOCKS     (CETRAFS_SB_REPLICA_NR + 1) /* no table starts inside */
 
 /* ---- Zone Group Descriptor (1 block per ZG) ---- */
 /*
