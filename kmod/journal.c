@@ -2431,6 +2431,92 @@ static int cetrafs_journal_owner_holds(struct super_block *sb, const struct cetr
     return held ? 1 : 0;
 }
 
+/* TEST ONLY: redo an entry whatever peer has its file open, as before
+ * (tests/kernel/journal_replay_live_opener.sh). */
+static bool cetrafs_journal_live_opener_off;
+cetrafs_test_param(journal_live_opener_off, cetrafs_journal_live_opener_off, bool, 0644);
+MODULE_PARM_DESC(journal_live_opener_off, "TEST ONLY: replay redoes an entry whose file a live peer has open");
+
+/*
+ * nofilelock: may this entry's redo run now? Its target is a block of a
+ * regular file, and under nofilelock no lock stops a live node that has
+ * the file open from writing that block -- between replay's last read
+ * of it and the redo landing, the dead node's older image would land
+ * on top of the live write (audit 2026-11-15 M-20). So:
+ *
+ *   - a LIVE foreign node (not the dead one, not stale) has it open:
+ *     1, kept -- the area stays dirty, and the redo waits for that
+ *     opener to close (or for its own replay of it, below);
+ *   - THIS node has it open: its writers mutate the tree under
+ *     invalidate_lock, held exclusively here across the last read and
+ *     the redo (*out, to be released by the caller); taken only by
+ *     trylock -- replay runs from paths holding other locks -- and kept
+ *     for the next attempt when busy;
+ *   - nobody live: 0, redo as before.
+ *
+ * Any read that fails is -EIO: kept, never guessed.
+ */
+static int cetrafs_journal_live_opener(struct super_block *sb, const struct cetrafs_journal_replay_entry *e, u32 dead,
+                                       struct inode **out)
+{
+    cetrafs_inode_t raw;
+    u64 others;
+    u32 me;
+
+    *out = NULL;
+    if (cetrafs_sb_file_lock_enabled(sb) || READ_ONCE(cetrafs_journal_live_opener_off))
+        return 0;
+    if (cetrafs_sb_get_node_id(sb, &me))
+        return -EIO;
+    cetrafs_invalidate_raw_inode(sb, e->owner_ino);
+    if (cetrafs_read_raw_inode(sb, e->owner_ino, &raw))
+        return -EIO;
+    if (cetrafs_le64(raw.generation) != e->owner_generation)
+        return 0; /* not the entry's file: the owner check refuses it */
+    others = (cetrafs_le64(raw.read_open_nodes) | cetrafs_le64(raw.suspended_writer_nodes)) &
+             ~(1ULL << (dead % CETRAFS_MAX_READER_NODES));
+    if (others & (1ULL << (me % CETRAFS_MAX_READER_NODES))) {
+        struct inode *inode = ilookup(sb, e->owner_ino);
+
+        others &= ~(1ULL << (me % CETRAFS_MAX_READER_NODES));
+        if (inode && cetrafs_inode_get_generation(inode) == e->owner_generation) {
+            if (!down_write_trylock(&inode->i_mapping->invalidate_lock)) {
+                iput(inode);
+                return 1;
+            }
+            *out = inode;
+        } else if (inode) {
+            iput(inode);
+        }
+    }
+    while (others) {
+        u32 n = (u32) __ffs64(others);
+        bool stale = false;
+        int ret;
+
+        others &= ~(1ULL << n);
+        ret = cetrafs_node_is_stale(sb, n, &stale);
+        if (ret || !stale) {
+            if (*out) {
+                up_write(&(*out)->i_mapping->invalidate_lock);
+                iput(*out);
+                *out = NULL;
+            }
+            return ret ? -EIO : 1;
+        }
+    }
+    return 0;
+}
+
+static void cetrafs_journal_opener_put(struct inode **oi)
+{
+    if (*oi) {
+        up_write(&(*oi)->i_mapping->invalidate_lock);
+        iput(*oi);
+        *oi = NULL;
+    }
+}
+
 static int cetrafs_journal_replay_cmp(const void *a, const void *b)
 {
     const struct cetrafs_journal_replay_entry *ea = a, *eb = b;
@@ -2442,6 +2528,22 @@ static int cetrafs_journal_replay_cmp(const void *a, const void *b)
  * doing the one job it exists for. Distinct from a plain apply so a
  * test can tell "it repaired a tear" from "it redid a lost write". */
 static atomic64_t cetrafs_journal_replay_torn = ATOMIC64_INIT(0);
+
+/* Entries kept because a live node had their file open (nofilelock). */
+static atomic64_t cetrafs_journal_replay_live_kept = ATOMIC64_INIT(0);
+
+u64 cetrafs_journal_replay_live_kept_count(void)
+{
+    return (u64) atomic64_read(&cetrafs_journal_replay_live_kept);
+}
+
+/* Redos run under this node's own opener's invalidate_lock. */
+static atomic64_t cetrafs_journal_replay_own_opener = ATOMIC64_INIT(0);
+
+u64 cetrafs_journal_replay_own_opener_count(void)
+{
+    return (u64) atomic64_read(&cetrafs_journal_replay_own_opener);
+}
 
 u64 cetrafs_journal_replay_torn_count(void)
 {
@@ -2957,6 +3059,7 @@ static int __cetrafs_journal_replay_node(struct super_block *sb, u32 node_id, bo
 
     for (s = 0; s < count; s++) {
         struct buffer_head *pbh, *tbh, *hbh;
+        struct inode *oi = NULL; /* this node's opener, its invalidate_lock held across the redo */
         bool apply, owner_dir = false, owner_known = false;
         u32 judged_crc = 0;
         int blocked;
@@ -3272,6 +3375,22 @@ static int __cetrafs_journal_replay_node(struct super_block *sb, u32 node_id, bo
          * image then lands on top of it (audit 2026-11-14 C1, rule 15).
          * So the target is read once more, LAST, and must still be what
          * was judged. */
+        if (apply && owner_known && !owner_dir) {
+            int lo = cetrafs_journal_live_opener(sb, &entries[s], node_id, &oi);
+
+            if (lo) {
+                pr_warn_ratelimited("journal replay: node %u txn %llu: ino %llu is open on a live node -- %s; the "
+                                    "redo waits\n",
+                                    node_id, (unsigned long long) entries[s].txn_id,
+                                    (unsigned long long) entries[s].owner_ino,
+                                    lo < 0 ? "its record could not be read" : "it could be writing the block");
+                atomic64_inc(&cetrafs_journal_replay_live_kept);
+                brelse(tbh);
+                brelse(pbh);
+                ret = lo < 0 ? lo : -EBUSY;
+                goto keep;
+            }
+        }
         if (apply && unlikely(cetrafs_journal_owner_pause_ms)) {
             pr_info("journal replay: pausing %ums after the owner check of target %llu\n",
                     cetrafs_journal_owner_pause_ms, (unsigned long long) entries[s].target_lba);
@@ -3339,6 +3458,8 @@ static int __cetrafs_journal_replay_node(struct super_block *sb, u32 node_id, bo
                 goto keep;
             }
             atomic64_inc(&cetrafs_journal_replay_applied);
+            if (oi)
+                atomic64_inc(&cetrafs_journal_replay_own_opener);
             applied++;
             /* A redo changed bytes no stamp announced: advance the
              * owner's, so a node caching the block reads it again (L9)
@@ -3359,6 +3480,7 @@ static int __cetrafs_journal_replay_node(struct super_block *sb, u32 node_id, bo
                             (unsigned long long) entries[s].target_lba);
             }
         }
+        cetrafs_journal_opener_put(&oi);
         brelse(tbh);
         brelse(pbh);
 
@@ -3404,6 +3526,7 @@ consume:
         continue;
 
 keep:
+        cetrafs_journal_opener_put(&oi);
         /*
          * This entry cannot be decided now: keep it, and with it the
          * area's DIRTY flag, and go on with the rest. One unreadable

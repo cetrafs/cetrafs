@@ -426,6 +426,8 @@ static int cetrafs_proc_info_show(struct seq_file *m, void *v)
      * corruption prevented. Worth alerting on. */
     seq_printf(m, "journal_replay_refused: %llu\n", cetrafs_journal_replay_refused_count());
     seq_printf(m, "journal_replay_torn: %llu\n", cetrafs_journal_replay_torn_count());
+    seq_printf(m, "journal_replay_live_kept: %llu\n", cetrafs_journal_replay_live_kept_count());
+    seq_printf(m, "journal_replay_own_opener: %llu\n", cetrafs_journal_replay_own_opener_count());
     seq_printf(m, "journal_replay_kept: %llu\n", cetrafs_journal_replay_kept_count());
     seq_printf(m, "evict_rereads_changed: %llu\n", cetrafs_evict_rereads_changed_count());
     seq_printf(m, "bmap_flush_batches: %llu\n", cetrafs_bmap_flush_batch_count());
