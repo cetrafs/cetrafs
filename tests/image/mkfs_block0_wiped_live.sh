@@ -6,19 +6,23 @@
 # cetrafs volume: nobody can be mounting it", and -f formatted it with
 # no registry probe at all -- so a live cluster whose block 0 took a
 # stray write (a partition table, a wipe) was formatted under its running
-# nodes (audit 2026-11-15 B-16). With no superblock to place the
-# registry, mkfs now looks for blocks that read as registry rows and
-# watches their heartbeat.
+# nodes (audit 2026-11-15 B-16). The copy of block 0 at block 2048
+# (A-7) still places the registry, and mkfs probes it through the copy
+# exactly as through block 0. (It used to search the first GiB for
+# blocks that looked like registry rows.)
 #
 # A volume with row 1 beating (a node impersonated, every 0.3 s); block
 # 0 zeroed:
 #   1. mkfs -f refuses, says a node is heartbeating, and writes nothing
 #      (block 0 still zero, the inode table untouched);
-#   2. the beat stopped: mkfs -f formats over the rows;
-#   3. without -f mkfs refuses, and does not just say "use -f".
+#   2. the beat stopped: mkfs -f formats, having probed through the copy;
+#   3. without -f mkfs refuses, and does not just say "use -f";
+#   4. block 0 zeroed, without -f: refused, naming the copy -- blocks
+#      1..2047 are empty now, so the first-MiB "is it empty?" scan alone
+#      read this volume as blank.
 #
-# DISCRIMINATION: CETRAFS_TEST_MKFS_NO_ROW_SCAN=1 (no scan, as before):
-# 1 formats.
+# DISCRIMINATION: CETRAFS_TEST_MKFS_NO_SB_COPY_PROBE=1 (block 0 alone,
+# as before): 1 formats; 4 with the copy zeroed as well formats.
 set -euo pipefail
 . "$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)/lib/harness.sh"
 require_root
@@ -65,13 +69,13 @@ stop_beat
 
 stage dead
 R2="$(fmt)"
-[ "$R2" = "rc=0" ] && grep -q "no node beats in those rows" "$ERR" &&
-    pass "2: with no beat, mkfs -f formatted over the rows" || fail "2: $R2: $(cat "$ERR")"
+[ "$R2" = "rc=0" ] && grep -q "but its copy at block 2048 does" "$ERR" &&
+    pass "2: with no beat, mkfs -f probed through the copy and formatted" || fail "2: $R2: $(cat "$ERR")"
 
 stage beat
-C="$(fmt CETRAFS_TEST_MKFS_NO_ROW_SCAN=1)"
+C="$(fmt CETRAFS_TEST_MKFS_NO_SB_COPY_PROBE=1)"
 stop_beat
-[ "$C" = "rc=0" ] && pass "control: without the scan, mkfs -f formatted the live volume" ||
+[ "$C" = "rc=0" ] && pass "control: without the copy, mkfs -f formatted the live volume" ||
     fail "control: $C -- the suite does not reach the no-superblock path: $(cat "$ERR")"
 
 stage dead
@@ -80,4 +84,15 @@ rc=0
 "$MKFS" "$DEV" -z 1 -b 512 -J 0 -N 1024 >/dev/null 2>"$ERR" || rc=$?
 [ "$rc" != 0 ] && grep -q "block 0 was overwritten" "$ERR" &&
     pass "3: without -f: refused, naming a damaged volume as a possibility" || fail "3: rc=$rc: $(cat "$ERR")"
+
+stage dead
+rc=0
+"$MKFS" "$DEV" -z 1 -b 512 -J 0 -N 1024 >/dev/null 2>"$ERR" || rc=$?
+[ "$rc" != 0 ] && grep -q "its copy" "$ERR" && [ "$(blk 0)" = "$ZERO" ] &&
+    pass "4: block 0 zeroed, without -f: refused, naming the copy" || fail "4: rc=$rc: $(cat "$ERR")"
+dd if=/dev/zero of="$DEV" bs=4096 seek=2048 count=1 oflag=direct conv=notrunc status=none
+rc=0
+"$MKFS" "$DEV" -z 1 -b 512 -J 0 -N 1024 >/dev/null 2>"$ERR" || rc=$?
+[ "$rc" = 0 ] && pass "4 control: with the copy zeroed too, the first MiB alone reads blank and mkfs formats" ||
+    fail "4 control: rc=$rc -- something else refused: $(cat "$ERR")"
 ct_exit

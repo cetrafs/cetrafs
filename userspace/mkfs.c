@@ -400,92 +400,24 @@ static void mkfs_probe_unverified(int fd, const char *dev, const cetrafs_superbl
 }
 
 /*
- * Block 0 holds no cetrafs superblock -- but it may be a live cluster's
- * volume whose block 0 took a stray write (a partition table, a wipe),
- * and with no superblock there is no registry to probe: mkfs -f
- * formatted under running nodes (audit 2026-11-15 B-16). Until block 0
- * has a replica, look for the registry the hard way: any block that
- * reads as a registered or repairing row -- every row carries its own
- * checksum -- is watched for a probe window, and one whose heartbeat
- * moves is a node still running on this device. Bounded to the first
- * GiB (CETRAFS_MKFS_ROW_SCAN_MIB), which holds the registry of every
- * volume made with the default inode count.
+ * The copy of block 0 at CETRAFS_SB_REPLICA_NR (A-7), read past this
+ * machine's cache. 1 when it holds a superblock that verifies. With
+ * block 0 overwritten this is what still places the volume's registry:
+ * mkfs used to search the first GiB for blocks that looked like
+ * registry rows instead (B-16).
  */
-#define MKFS_ROW_SCAN_MAX 64
-static void mkfs_probe_rows_without_sb(int fd, const char *dev)
+static int mkfs_read_sb_copy(int fd, cetrafs_superblock_t *out)
 {
-    static unsigned char chunk[8 << 20] __attribute__((aligned(4096)));
-    struct {
-        uint64_t off, hb_seq;
-        uint32_t incarnation;
-    } cand[MKFS_ROW_SCAN_MAX];
-    unsigned n = 0, i, window = 2, probe = cetrafs_peer_probe_secs();
-    uint64_t dev_bytes = 0, cap, off;
-    struct stat st;
+    unsigned char blk[CETRAFS_BLOCK_SIZE];
+    const off_t at = (off_t) CETRAFS_SB_REPLICA_NR * CETRAFS_BLOCK_SIZE;
 
-    if (getenv("CETRAFS_TEST_MKFS_NO_ROW_SCAN")) /* TEST ONLY: the control of mkfs_block0_wiped_live.sh */
-        return;
-    if (fstat(fd, &st) == 0 && S_ISBLK(st.st_mode)) {
-        if (ioctl(fd, BLKGETSIZE64, &dev_bytes) < 0)
-            return;
-        (void) ioctl(fd, BLKFLSBUF, 0);
-    } else {
-        dev_bytes = (uint64_t) st.st_size;
-    }
-    cap = (uint64_t) cetrafs_test_env_ll("CETRAFS_MKFS_ROW_SCAN_MIB", 1, 1 << 30, 1024) << 20;
-    if (cap > dev_bytes)
-        cap = dev_bytes;
-    for (off = CETRAFS_BLOCK_SIZE; off < cap && n < MKFS_ROW_SCAN_MAX; off += sizeof(chunk)) {
-        size_t len = cap - off < sizeof(chunk) ? (size_t) (cap - off) : sizeof(chunk);
-        ssize_t got = pread(fd, chunk, len, (off_t) off);
-
-        if (got <= 0)
-            break;
-        for (size_t b = 0; b + CETRAFS_BLOCK_SIZE <= (size_t) got && n < MKFS_ROW_SCAN_MAX; b += CETRAFS_BLOCK_SIZE) {
-            const cetrafs_node_entry_t *ne = (const void *) (chunk + b);
-            uint32_t state = cetrafs_le32(ne->state);
-            static const unsigned char zero_uuid[CETRAFS_NODE_UUID_LEN];
-
-            if ((state != CETRAFS_NODE_STATE_REGISTERED && state != CETRAFS_NODE_STATE_REPAIR) ||
-                !memcmp(ne->node_uuid, zero_uuid, sizeof(zero_uuid)) || !cetrafs_node_row_crc_ok(ne))
-                continue;
-            cand[n].off = off + b;
-            cand[n].hb_seq = cetrafs_le64(ne->hb_seq);
-            cand[n].incarnation = cetrafs_le32(ne->incarnation);
-            {
-                unsigned w = 2 * cetrafs_le32(ne->hb_interval_secs);
-
-                if (w > window)
-                    window = w > 120 ? 120 : w;
-            }
-            n++;
-        }
-    }
-    if (!n)
-        return;
-    if (probe)
-        window = probe;
-    fprintf(stderr, "%s: block 0 holds no cetrafs superblock, but %u block(s) read as Node Registry rows --\n"
-                    "       watching them for %us in case this is a live volume whose block 0 was overwritten\n",
-            dev, n, window);
-    sleep(window);
-    if (S_ISBLK(st.st_mode))
-        (void) ioctl(fd, BLKFLSBUF, 0);
-    for (i = 0; i < n; i++) {
-        cetrafs_node_entry_t ne;
-
-        if (pread(fd, &ne, sizeof(ne), (off_t) cand[i].off) != (ssize_t) sizeof(ne))
-            die_dev("%s: cannot re-read a registry row at block %" PRIu64 " (I/O error) -- nothing was written",
-                    dev, cand[i].off / CETRAFS_BLOCK_SIZE);
-        if (cetrafs_node_row_crc_ok(&ne) &&
-            (cetrafs_le64(ne.hb_seq) != cand[i].hb_seq || cetrafs_le32(ne.incarnation) != cand[i].incarnation))
-            die_dev("%s: block 0 holds no cetrafs superblock, but a node is still heartbeating in a Node\n"
-                    "       Registry row at block %" PRIu64 " -- this is a live cluster's volume whose block 0 was\n"
-                    "       overwritten, and formatting it would destroy it. Nothing was written. Unmount it\n"
-                    "       everywhere first.",
-                    dev, cand[i].off / CETRAFS_BLOCK_SIZE);
-    }
-    fprintf(stderr, "%s: no node beats in those rows -- formatting over them (-f)\n", dev);
+    (void) posix_fadvise(fd, at, CETRAFS_BLOCK_SIZE, POSIX_FADV_DONTNEED);
+    if (pread(fd, blk, sizeof(blk), at) != (ssize_t) sizeof(blk))
+        return 0;
+    memcpy(out, blk, sizeof(*out));
+    return cetrafs_le32(out->magic) == (uint32_t) CETRAFS_MAGIC &&
+           (uint32_t) cetrafs_le64(out->checksum) ==
+               crc32c_struct(out, sizeof(*out), offsetof(cetrafs_superblock_t, checksum), sizeof(out->checksum));
 }
 
 /*
@@ -543,11 +475,23 @@ static void mkfs_retire_old_superblock(int fd, const char *dev)
     memcpy(&sb, old, sizeof(sb));
     memset(zero, 0, sizeof(zero));
     if (cetrafs_le32(sb.magic) != CETRAFS_MAGIC) {
-        /* No superblock -- but maybe a live volume's damaged block 0. */
-        mkfs_probe_rows_without_sb(fd, dev);
-        if (pwrite(fd, zero, sizeof(zero), 0) != (ssize_t) sizeof(zero) || fsync(fd) != 0)
-            die_dev("%s: cannot clear the old superblock: %s", dev, strerror(errno));
-        return;
+        /*
+         * No superblock -- but maybe a live cluster's volume whose block
+         * 0 took a stray write (B-16). Its copy places the registry: if
+         * it verifies, the volume is probed through it exactly as through
+         * block 0. With neither, no node can be mounting it (a mount
+         * needs block 0, and the copy was written before any block 0).
+         */
+        if (getenv("CETRAFS_TEST_MKFS_NO_SB_COPY_PROBE") || /* TEST ONLY: the control of mkfs_block0_wiped_live.sh */
+            !mkfs_read_sb_copy(fd, &sb) || !cetrafs_node_table_placed_ok(fd, &sb)) {
+            if (pwrite(fd, zero, sizeof(zero), 0) != (ssize_t) sizeof(zero) || fsync(fd) != 0)
+                die_dev("%s: cannot clear the old superblock: %s", dev, strerror(errno));
+            return;
+        }
+        fprintf(stderr, "%s: block 0 holds no cetrafs superblock, but its copy at block %llu does -- checking\n"
+                        "       the registry it places for a node still using this volume\n",
+                dev, (unsigned long long) CETRAFS_SB_REPLICA_NR);
+        goto probe;
     }
 
     /*
@@ -582,6 +526,7 @@ static void mkfs_retire_old_superblock(int fd, const char *dev)
     if (cetrafs_le32(sb.magic) != CETRAFS_MAGIC)
         die_dev("%s: its superblock changed while mkfs read it -- nothing was written; run it again", dev);
 
+probe:
     rc = cetrafs_find_repair_claim(fd, &sb, &row, label, sizeof(label));
     if (rc < 0)
         die_dev("%s: cannot read its Node Registry (I/O error) -- so it is impossible to\n"
@@ -881,8 +826,18 @@ int main(int argc, char **argv)
     /* --- non-empty check --- */
     if (!dry_run && !force) {
         u32 mg = 0;
-        bool nonempty = is_device_nonempty(fd, 256 /* ~1MB */, &mg);
+        cetrafs_superblock_t copy;
+        /* Blocks 1..2047 of a cetrafs volume are empty (A-7): with block
+         * 0 overwritten by zeros the first MiB reads empty, and only the
+         * copy says what this is. */
+        bool has_copy = mkfs_read_sb_copy(fd, &copy);
+        bool nonempty = has_copy || is_device_nonempty(fd, 256 /* ~1MB */, &mg);
         if (nonempty) {
+            if (mg != CETRAFS_MAGIC && has_copy)
+                die("Refusing to format: this is a cetrafs volume whose block 0 was overwritten -- its copy\n"
+                    "       at block %llu is intact, and fsck.cetra -r restores block 0 from it. Use -f only to\n"
+                    "       destroy it; -f still refuses a volume a node is heartbeating on.",
+                    (unsigned long long) CETRAFS_SB_REPLICA_NR);
             if (mg == CETRAFS_MAGIC)
                 die("Refusing to overwrite existing cetrafs (use -f)");
             else
