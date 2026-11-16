@@ -405,6 +405,7 @@ bool cetrafs_sb_zg_claim_lock(struct super_block *sb, unsigned int *nofs);
 int cetrafs_sb_zg_claim_lock_killable(struct super_block *sb, unsigned int *nofs);
 bool cetrafs_sb_zg_claim_held(struct super_block *sb);
 bool cetrafs_sb_zg_claim_busy(struct super_block *sb);
+bool cetrafs_sb_proc_closing(struct super_block *sb);
 void cetrafs_sb_zg_claim_unlock(struct super_block *sb, unsigned int nofs);
 void cetrafs_sb_release_lock(struct super_block *sb);
 void cetrafs_sb_release_unlock(struct super_block *sb);

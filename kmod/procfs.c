@@ -66,6 +66,41 @@ struct cetrafs_proc_mount {
     struct proc_dir_entry *dir;
 };
 
+/* TEST ONLY: a sweep reads on through an unmount and a kill, as before
+ * audit 2026-11-15 BM-52 (tests/kernel/procfs_sweep_stops.sh). */
+static bool cetrafs_proc_sweep_unstoppable;
+cetrafs_test_param(proc_sweep_unstoppable, cetrafs_proc_sweep_unstoppable, bool, 0644);
+MODULE_PARM_DESC(proc_sweep_unstoppable, "TEST ONLY: procfs sweeps ignore unmount and fatal signals");
+
+/* TEST ONLY: each step of a procfs sweep sleeps this long, standing in
+ * for a stalled device read (tests/kernel/procfs_sweep_stops.sh). */
+static unsigned int cetrafs_proc_sweep_step_ms;
+cetrafs_test_param(proc_sweep_step_ms, cetrafs_proc_sweep_step_ms, uint, 0644);
+MODULE_PARM_DESC(proc_sweep_step_ms, "TEST ONLY: each procfs sweep step sleeps this many ms");
+
+/*
+ * Should a sweep stop before its next device read? The info and cluster
+ * files read every Block Group, Zone Group or registry row in turn, each
+ * an uninterruptible read; on a stalled device the reader hung for all
+ * of them, unkillable, and unmount's proc_remove() waited for it (audit
+ * 2026-11-15 BM-52). Now a kill, or an unmount under way, ends it at the
+ * next step, with the file saying so.
+ */
+static bool cetrafs_proc_sweep_stop(struct seq_file *m, struct super_block *sb)
+{
+    unsigned int step = READ_ONCE(cetrafs_proc_sweep_step_ms);
+
+    if (step)
+        msleep(step); /* TEST ONLY: see the parameter */
+    if (READ_ONCE(cetrafs_proc_sweep_unstoppable))
+        return false;
+    if (fatal_signal_pending(current) || cetrafs_sb_proc_closing(sb)) {
+        seq_puts(m, "sweep: interrupted\n");
+        return true;
+    }
+    return false;
+}
+
 /* Gap between whole-volume foreign-descriptor sweeps. Tunable because
  * statfs_no_bg_sweep.sh and statfs_keeps_bg_cache.sh OBSERVE statfs via
  * this file's counters -- rate-limiting it unconditionally made those
@@ -207,6 +242,10 @@ static int cetrafs_proc_info_show(struct seq_file *m, void *v)
     for (z = 0; z < bg_count; z++) {
         u64 total, free;
 
+        if (cetrafs_proc_sweep_stop(m, sb)) {
+            stats_err = -EINTR;
+            break;
+        }
         if (sweep_foreign)
             cetrafs_bg_desc_refresh_foreign(sb, z);
         ret = cetrafs_bg_data_block_stats(sb, z, &total, &free);
@@ -462,6 +501,8 @@ static int cetrafs_proc_info_show(struct seq_file *m, void *v)
     for (z = 0; z < zg_count; z++) {
         struct cetrafs_zg_info info;
 
+        if (cetrafs_proc_sweep_stop(m, sb))
+            break;
         ret = cetrafs_zg_get_info(sb, z, &info);
         if (ret) {
             /* Degrade, do not abort: the fields above this point are
@@ -579,6 +620,8 @@ static int cetrafs_proc_cluster_show(struct seq_file *m, void *v)
         bool stale = false;
         const u8 *u;
 
+        if (cetrafs_proc_sweep_stop(m, sb))
+            break;
         ret = cetrafs_node_get_entry(sb, idx, &ne);
         if (ret) {
             /* Degrade per row rather than failing the file: a device

@@ -472,6 +472,7 @@ struct cetrafs_sb_info {
      * cetrafs_proc_mount_init() succeeds; cetrafs_proc_mount_exit()
      * tolerates NULL the same way cetrafs_heartbeat_stop() does. */
     struct cetrafs_proc_mount *proc_mount;
+    bool proc_closing; /* unmount: procfs sweeps stop (cetrafs_proc_sweep_stop()) */
 
 
     /* Node-LOCAL serialization of data-bitmap / free-counter
@@ -3999,6 +4000,9 @@ bool cetrafs_free_sb_info(struct super_block *sb)
         sbi->cold_wq = NULL;
     }
 
+    /* A reader mid-sweep stops at its next read: proc_remove() waits
+     * for it (audit 2026-11-15 BM-52). */
+    WRITE_ONCE(sbi->proc_closing, true);
     cetrafs_proc_mount_exit(sbi->proc_mount);
     /* Stop the heartbeat *before* doing any of our own final flush work
      * below, not after: heartbeat.c's periodic tick calls zonegroup.c's
@@ -4902,6 +4906,13 @@ int cetrafs_sb_zg_claim_lock_killable(struct super_block *sb, unsigned int *nofs
     }
     WRITE_ONCE(sbi->zg_claim_owner, current);
     return 1;
+}
+
+bool cetrafs_sb_proc_closing(struct super_block *sb)
+{
+    struct cetrafs_sb_info *sbi = sb->s_fs_info;
+
+    return !sbi || READ_ONCE(sbi->proc_closing);
 }
 
 /* Is the claim mutex held by anyone? (A test probe.) */
