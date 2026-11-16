@@ -1107,6 +1107,21 @@ static int __cetrafs_zg_try_claim_one(struct super_block *sb,
 static int cetrafs_zg_settle_owner(struct super_block *sb, u32 zg_id, u32 my_node_id, bool may_wait);
 static void cetrafs_zg_settle_test_stall(struct super_block *sb);
 
+/* A test stall inside a steal, renewing this node's lease as it sleeps
+ * the way the steal's own long steps do (cetrafs_sb_mount_beat(), a
+ * no-op once the heartbeat runs): one long msleep at mount outlived a
+ * compressed lease, and the stall then tested the lease, not the steal. */
+static void cetrafs_zg_test_sleep(struct super_block *sb, unsigned int ms)
+{
+    while (ms) {
+        unsigned int step = min(ms, 200u);
+
+        msleep(step);
+        ms -= step;
+        (void) cetrafs_sb_mount_beat(sb);
+    }
+}
+
 static int cetrafs_zg_try_claim_one(struct super_block *sb, u32 zg_id, u32 my_node_id, bool at_mount, bool may_wait,
                                     bool *out_claimed)
 {
@@ -1266,7 +1281,7 @@ static int __cetrafs_zg_try_claim_one(struct super_block *sb,
     }
 
     if (owner != CETRAFS_NODE_ID_NONE && READ_ONCE(cetrafs_zg_steal_stall_ms))
-        msleep(READ_ONCE(cetrafs_zg_steal_stall_ms)); /* TEST ONLY */
+        cetrafs_zg_test_sleep(sb, READ_ONCE(cetrafs_zg_steal_stall_ms)); /* TEST ONLY */
     {
         struct cetrafs_zg_cas_ctx ctx = {
             .my_node_id = my_node_id,
@@ -1455,7 +1470,7 @@ static void cetrafs_zg_settle_test_stall(struct super_block *sb)
 
     if (stall) {
         pr_info("ZG claim: settle stall, claim mutex held=%d\n", cetrafs_sb_zg_claim_busy(sb));
-        msleep(stall); /* TEST ONLY: see the parameter */
+        cetrafs_zg_test_sleep(sb, stall); /* TEST ONLY: see the parameter */
     }
 }
 
