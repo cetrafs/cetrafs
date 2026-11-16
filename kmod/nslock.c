@@ -55,6 +55,7 @@
 #include <linux/timekeeping.h>
 
 #include <linux/moduleparam.h>
+#include <asm/syscall.h>
 
 #include "kmod.h"
 
@@ -91,6 +92,14 @@ static atomic64_t cetrafs_nslock_restarts = ATOMIC64_INIT(0);
 u64 cetrafs_nslock_restart_count(void)
 {
     return (u64) atomic64_read(&cetrafs_nslock_restarts);
+}
+
+/* Budgets a silent holder extended instead of ending in EBUSY (M-17). */
+static atomic64_t cetrafs_nslock_silent_extends = ATOMIC64_INIT(0);
+
+u64 cetrafs_nslock_silent_extend_count(void)
+{
+    return (u64) atomic64_read(&cetrafs_nslock_silent_extends);
 }
 
 #define CETRAFS_NSLOCK_SET_TRIES 8
@@ -1042,12 +1051,46 @@ MODULE_PARM_DESC(nslock_restart_off, "TEST ONLY: wait for a peer's namespace loc
  * leaves its entry behind, and a new task can be given the same
  * task_struct -- with the address alone it would inherit an expired
  * deadline and be refused EBUSY on its first wait. */
+/*
+ * And by the SYSTEM CALL it is the wait of: its number and arguments,
+ * which a restart re-executes unchanged. A restarted call that failed
+ * before it got back here -- its path gone, a permission changed --
+ * leaves the entry behind, and the task's next contended operation, a
+ * different call, inherited the spent deadline: EBUSY at once, with no
+ * wait at all (audit 2026-11-15 M-18). The arguments alone cannot tell:
+ * a program making the same call again from the same place passes the
+ * same values, a path buffer at a reused address included. So 'last'
+ * decides too: a restart asks again one retry interval after the last
+ * ask, plus the path walk, so an entry idle for longer than
+ * CETRAFS_NSWAIT_IDLE_MS is an orphan. Mistaking a chain for a new one
+ * -- a restarted call held that long on the way back -- only waits
+ * longer, never refuses sooner.
+ */
+#define CETRAFS_NSWAIT_IDLE_MS 2000
 struct cetrafs_nswait_deadline {
     struct list_head node;
     const struct task_struct *task; /* compared, never dereferenced */
     u64 start_time;
     unsigned long deadline;
+    unsigned long started; /* when this chain of restarts began */
+    unsigned long last;    /* when it was last asked */
+    long nr;
+    unsigned long args[6];
 };
+
+/* TEST ONLY: an entry is the task's whatever call asks, as before audit
+ * 2026-11-15 M-18 (tests/kernel/nslock_restart_deadline_orphan.sh). */
+static bool cetrafs_nswait_any_call;
+cetrafs_test_param(nswait_any_call, cetrafs_nswait_any_call, bool, 0644);
+MODULE_PARM_DESC(nswait_any_call, "TEST ONLY: a namespace-lock wait deadline is the task's, whatever call asks");
+
+static void cetrafs_nswait_call(long *nr, unsigned long args[6])
+{
+    struct pt_regs *regs = task_pt_regs(current);
+
+    *nr = syscall_get_nr(current, regs);
+    syscall_get_arguments(current, regs, args);
+}
 
 static bool cetrafs_nswait_is_current(const struct cetrafs_nswait_deadline *d)
 {
@@ -1073,24 +1116,44 @@ static void cetrafs_nswait_forget(void)
         kfree(d);
 }
 
-/* current's deadline, started now if it has none. 0: still within it;
- * -EBUSY: past it; -ENOMEM. */
-static int cetrafs_nswait_within(void)
+/* current's deadline, started now if it has none (or has an orphan's,
+ * see above). 0: still within it; -EBUSY: past it; -ENOMEM. *started:
+ * when this call's wait began. */
+static int cetrafs_nswait_within(unsigned long *started)
 {
     struct cetrafs_nswait_deadline *d, *fresh = kmalloc(sizeof(*fresh), GFP_NOFS);
+    unsigned long now = jiffies, budget = msecs_to_jiffies(CETRAFS_NSLOCK_BUDGET_MS);
+    unsigned long args[6];
+    long nr;
     int ret = 0;
 
+    cetrafs_nswait_call(&nr, args);
     spin_lock(&cetrafs_nswait_lock);
     list_for_each_entry(d, &cetrafs_nswait_list, node)
         if (cetrafs_nswait_is_current(d))
             break;
+    if (&d->node != &cetrafs_nswait_list && !READ_ONCE(cetrafs_nswait_any_call) &&
+        (d->nr != nr || memcmp(d->args, args, sizeof(args)) ||
+         time_after(now, d->last + msecs_to_jiffies(CETRAFS_NSWAIT_IDLE_MS)))) {
+        /* An orphan: this call's wait starts now. */
+        d->deadline = now + budget;
+        d->started = now;
+        d->nr = nr;
+        memcpy(d->args, args, sizeof(args));
+    }
     if (&d->node != &cetrafs_nswait_list) {
-        if (time_after(jiffies, d->deadline))
+        d->last = now;
+        *started = d->started;
+        if (time_after(now, d->deadline))
             ret = -EBUSY;
     } else if (fresh) {
         fresh->task = current;
         fresh->start_time = current->start_time;
-        fresh->deadline = jiffies + msecs_to_jiffies(CETRAFS_NSLOCK_BUDGET_MS);
+        fresh->deadline = now + budget;
+        fresh->started = fresh->last = now;
+        fresh->nr = nr;
+        memcpy(fresh->args, args, sizeof(args));
+        *started = now;
         list_add(&fresh->node, &cetrafs_nswait_list);
         fresh = NULL;
     } else {
@@ -1099,6 +1162,72 @@ static int cetrafs_nswait_within(void)
     spin_unlock(&cetrafs_nswait_lock);
     kfree(fresh);
     return ret;
+}
+
+/* Another budget for current's wait (a silent holder, M-17). */
+static void cetrafs_nswait_extend(void)
+{
+    struct cetrafs_nswait_deadline *d;
+
+    spin_lock(&cetrafs_nswait_lock);
+    list_for_each_entry(d, &cetrafs_nswait_list, node)
+        if (cetrafs_nswait_is_current(d)) {
+            d->deadline = jiffies + msecs_to_jiffies(CETRAFS_NSLOCK_BUDGET_MS);
+            break;
+        }
+    spin_unlock(&cetrafs_nswait_lock);
+}
+
+/* TEST ONLY: a silent holder's budget ends in EBUSY as a live one's does,
+ * as before audit 2026-11-15 M-17 (tests/kernel/nslock_silent_holder.sh). */
+static bool cetrafs_nslock_silent_extend_off;
+cetrafs_test_param(nslock_silent_extend_off, cetrafs_nslock_silent_extend_off, bool, 0644);
+MODULE_PARM_DESC(nslock_silent_extend_off, "TEST ONLY: a silent namespace-lock holder ends the wait in EBUSY");
+
+/*
+ * Is every foreign holder of a lock in this set SILENT -- its row not
+ * moved since 'started', when this wait began? Such a holder is dead
+ * most likely, and goes stale within the window, when the acquire
+ * fences it, replays its journal and takes the lock. Ending the wait in
+ * EBUSY there -- an errno creat, unlink and rename do not define -- made
+ * HA restarting a VM into a directory the dead node was creating in fail
+ * for the whole window (audit 2026-11-15 M-17). A holder that moved is
+ * alive and holding: the budget ends as before. Read fresh; anything
+ * unreadable, or never watched, is not silent.
+ */
+static bool cetrafs_nslock_set_holder_silent(struct inode **inodes, int n, unsigned long started)
+{
+    bool any = false;
+    u32 me;
+    int i;
+
+    if (READ_ONCE(cetrafs_nslock_silent_extend_off) || !n || !inodes[0] ||
+        cetrafs_sb_get_node_id(inodes[0]->i_sb, &me))
+        return false;
+    for (i = 0; i < n; i++) {
+        struct super_block *sb;
+        cetrafs_node_entry_t ne;
+        cetrafs_inode_t raw;
+        unsigned long since;
+        bool first;
+        u32 owner;
+
+        if (!inodes[i])
+            continue;
+        sb = inodes[i]->i_sb;
+        cetrafs_invalidate_raw_inode(sb, inodes[i]->i_ino);
+        if (cetrafs_read_raw_inode(sb, inodes[i]->i_ino, &raw))
+            return false;
+        owner = cetrafs_le32(raw.ns_lock_owner);
+        if (owner == CETRAFS_NODE_ID_NONE || owner == me)
+            continue;
+        if (cetrafs_node_get_entry(sb, owner, &ne) || cetrafs_le32(ne.state) != CETRAFS_NODE_STATE_REGISTERED)
+            return false;
+        if (cetrafs_sb_peer_sample(sb, owner, &ne, &first, &since) || first || time_after(since, started))
+            return false; /* moved since the wait began: alive */
+        any = true;
+    }
+    return any;
 }
 
 void cetrafs_nslock_exit(void)
@@ -1172,6 +1301,7 @@ static int cetrafs_nswait_queue(void)
  */
 int cetrafs_nslock_acquire_set_vfs(struct inode **inodes, int n)
 {
+    unsigned long started = 0;
     int ret;
 
     if (!cetrafs_nslock_can_restart())
@@ -1181,7 +1311,16 @@ int cetrafs_nslock_acquire_set_vfs(struct inode **inodes, int n)
         cetrafs_nswait_forget();
         return ret;
     }
-    ret = cetrafs_nswait_within();
+    ret = cetrafs_nswait_within(&started);
+    if (ret == -EBUSY && cetrafs_nslock_set_holder_silent(inodes, n, started)) {
+        /* Silent since the wait began: another budget, restarting. */
+        cetrafs_nswait_extend();
+        atomic64_inc(&cetrafs_nslock_silent_extends);
+        pr_warn_ratelimited("nslock: a %d-inode namespace set is held by a node that has stopped beating -- "
+                            "waiting for it to go stale\n",
+                            n);
+        ret = 0;
+    }
     if (ret == -EBUSY) {
         cetrafs_nswait_forget();
         pr_err("nslock: could not acquire a %d-inode namespace set within %u ms -- the holder is not releasing\n",

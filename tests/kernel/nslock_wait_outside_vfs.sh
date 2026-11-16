@@ -56,6 +56,9 @@ took() { awk -v a="$1" -v b="$(secs)" 'BEGIN { printf "%.1f", b - a }'; }
 # would watch it for a whole window first).
 "$NODE_POKE" "$DEV" 1 1 aa "$(date +%s)" >/dev/null
 peer_holds
+# And beats: a live peer holding its lock. A silent one is waited out
+# until it goes stale instead (nslock_silent_holder.sh).
+ct_beat_row "$DEV" 1
 
 # ------------------------------------------------------------------ 1
 log "1: a mkdir waits for the peer's lock; ls of the directory does not wait for it"
