@@ -857,6 +857,15 @@ MODULE_PARM_DESC(reclaim_fence_no_dead, "TEST ONLY: a reclaim fence does not rec
  * promise that the host can no longer write: like the fence itself it
  * is advisory, and I/O the host already queued still lands.
  */
+static int __cetrafs_node_peer_beating(struct super_block *sb, u32 node_id, bool *beating, bool during,
+                                       struct cetrafs_row_mark *still);
+
+/* TEST ONLY: declare a row dead without watching it stand still, as
+ * before audit 2026-11-15 F-38 (tests/kernel/declare_dead_beating.sh). */
+static bool cetrafs_declare_dead_unguarded;
+cetrafs_test_param(declare_dead_unguarded, cetrafs_declare_dead_unguarded, bool, 0644);
+MODULE_PARM_DESC(declare_dead_unguarded, "TEST ONLY: a declare-dead does not check the row stands still");
+
 int cetrafs_node_declare_dead(struct super_block *sb, u32 node_id, u32 incarnation)
 {
     const cetrafs_superblock_t *raw_sb = cetrafs_sb_raw(sb);
@@ -868,8 +877,39 @@ int cetrafs_node_declare_dead(struct super_block *sb, u32 node_id, u32 incarnati
         return -EIO;
     if (!cetrafs_sb_get_node_id(sb, &me) && me == node_id)
         return -EINVAL;
-    return cetrafs_node_fence_peer_full(sb, node_id, "nothing: declared dead through controls", CETRAFS_FENCE_DECLARED,
-                                        true, false, NULL, incarnation);
+    if (READ_ONCE(cetrafs_declare_dead_unguarded))
+        return cetrafs_node_fence_peer_full(sb, node_id, "nothing: declared dead through controls",
+                                            CETRAFS_FENCE_DECLARED, true, false, NULL, incarnation);
+    /*
+     * The agent's word is not enough on its own: one that names the wrong
+     * row, or declares before its power-off has taken effect, would have
+     * every peer replay and take over from a node still writing -- which
+     * only notices at its next fence check, up to a heartbeat later
+     * (audit 2026-11-15 F-38). So the row must be SEEN to stand still --
+     * watched until it moves during this call (refused) or stays put for
+     * one of its beats plus a margin (cetrafs_node_peer_beating()) -- and
+     * the fence CAS is
+     * bound to the very mark that stood still (check_verdict): a beat
+     * landing after the watch makes it write nothing.
+     */
+    {
+        struct cetrafs_row_mark still = {0}; /* unset: a row with no live claim, which the fence refuses */
+        bool beating = false;
+        int ret = __cetrafs_node_peer_beating(sb, node_id, &beating, true, &still);
+
+        if (ret)
+            return ret;
+        if (beating) {
+            pr_warn("%s: controls: row %u is still beating -- not declaring it dead\n", sb->s_id, node_id);
+            return -EBUSY;
+        }
+        ret = cetrafs_node_fence_peer_full(sb, node_id, "nothing: declared dead through controls",
+                                           CETRAFS_FENCE_DECLARED, true, true, &still, incarnation);
+        if (ret == -EBUSY)
+            pr_warn("%s: controls: row %u beat during the declaration -- not declaring it dead\n", sb->s_id,
+                    node_id);
+        return ret;
+    }
 }
 
 int cetrafs_node_fence_peer(struct super_block *sb, u32 node_id, const char *what)
@@ -2641,8 +2681,13 @@ MODULE_PARM_DESC(peer_beating_wait_secs, "TEST ONLY: watch a not-yet-stale peer 
  * node is therefore never taken for a live one; a live one is at worst
  * waited on for one of its intervals. Killable.
  */
-int cetrafs_node_peer_beating(struct super_block *sb, u32 node_id, bool *beating)
+/* 'still', when silent: the mark that stood still (a row with no live
+ * claim leaves it untouched). */
+static int __cetrafs_node_peer_beating(struct super_block *sb, u32 node_id, bool *beating, bool during,
+                                       struct cetrafs_row_mark *still)
 {
+    bool sampled = false;
+
     *beating = false;
     for (;;) {
         cetrafs_node_entry_t ne;
@@ -2657,19 +2702,31 @@ int cetrafs_node_peer_beating(struct super_block *sb, u32 node_id, bool *beating
         if (cetrafs_le32(ne.state) != CETRAFS_NODE_STATE_REGISTERED ||
             cetrafs_le32(ne.departure) != CETRAFS_NODE_DEPART_NONE)
             return 0; /* no live claim at all */
-        if (cetrafs_sb_peer_sample(sb, node_id, &ne, &first, &since) && !first) {
+        /* 'during': only a move seen inside this call counts -- the
+         * first sample's comparison is against one taken who knows when
+         * (cetrafs_node_declare_dead()). */
+        if (cetrafs_sb_peer_sample(sb, node_id, &ne, &first, &since) && !first && (!during || sampled)) {
             *beating = true;
             return 0;
         }
+        sampled = true;
         pi = min_t(u32, cetrafs_le32(ne.hb_interval_secs), CETRAFS_HB_INTERVAL_MAX_SECS);
         if (!pi)
             pi = CETRAFS_HEARTBEAT_INTERVAL_SECS;
         bound = (unsigned long) (READ_ONCE(cetrafs_peer_beating_wait_secs) ?: pi + 5) * HZ;
-        if (time_after_eq(jiffies, since + bound))
+        if (time_after_eq(jiffies, since + bound)) {
+            if (still)
+                cetrafs_row_mark_of(still, &ne);
             return 0; /* silent */
+        }
         if (schedule_timeout_killable(HZ))
             return -EINTR;
     }
+}
+
+int cetrafs_node_peer_beating(struct super_block *sb, u32 node_id, bool *beating)
+{
+    return __cetrafs_node_peer_beating(sb, node_id, beating, false, NULL);
 }
 
 int cetrafs_node_is_stale(struct super_block *sb, u32 node_id, bool *out_stale)
