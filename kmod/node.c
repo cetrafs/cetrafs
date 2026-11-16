@@ -1142,6 +1142,14 @@ static int cetrafs_node_row_quiet(struct super_block *sb, u32 idx, const cetrafs
 
     if (!pi)
         pi = CETRAFS_HEARTBEAT_INTERVAL_SECS;
+    /* Watched stand still already, by this mount's mode walk, and still
+     * at that mark: silent for longer than a window (BM-22). */
+    if (cetrafs_sb_row_silent(sb, idx, ne)) {
+        pr_info("node registration: row %u carries this machine's identity; this mount already watched it stand "
+                "still for a whole window -- not watching it again\n",
+                idx);
+        return 0;
+    }
     /* The window every peer waits before it calls a row dead, and the
      * tools' probe uses (devutil.h's cetrafs_probe_window()): a live twin
      * whose paths stall for less than that must not read as gone. Two
@@ -1169,7 +1177,11 @@ static int cetrafs_node_row_quiet(struct super_block *sb, u32 idx, const cetrafs
         /* Not hb_seq alone: a twin that re-registered the row restarts
          * it and can stand at the value we sampled (cetrafs_row_mark). */
         cetrafs_row_mark_of(&then, ne);
-        return cetrafs_row_mark_same(&then, &now) ? 0 : -EBUSY;
+        if (!cetrafs_row_mark_same(&then, &now))
+            return -EBUSY;
+        if (!window_test)
+            cetrafs_sb_row_silent_note(sb, idx, &now);
+        return 0;
     }
 }
 
@@ -2281,6 +2293,11 @@ static int cetrafs_for_each_live_peer(struct super_block *sb,
      * changed hands (audit C9). */
     struct cetrafs_row_mark *seq;
     bool *watching;
+    /* Our own rows left uncleanly, watched for silence alongside: the
+     * registration's re-attach then has the verdict and does not watch
+     * them a window of its own (BM-22). The window each needs is the
+     * re-attach's own, cetrafs_node_row_quiet(). Never visited. */
+    u32 *own_need;
     int ret = 0;
 
     if (!raw_sb)
@@ -2289,9 +2306,11 @@ static int cetrafs_for_each_live_peer(struct super_block *sb,
     count = le32_to_cpu(raw_sb->node_table_count);
     seq = kcalloc(count, sizeof(*seq), GFP_KERNEL);
     watching = kcalloc(count, sizeof(*watching), GFP_KERNEL);
-    if (!seq || !watching) {
+    own_need = kcalloc(count, sizeof(*own_need), GFP_KERNEL);
+    if (!seq || !watching || !own_need) {
         kfree(seq);
         kfree(watching);
+        kfree(own_need);
         return -ENOMEM;
     }
 
@@ -2299,12 +2318,27 @@ static int cetrafs_for_each_live_peer(struct super_block *sb,
         ret = cetrafs_read_node_entry(sb, idx, &ne);
         if (ret)
             goto out;
-        if (cetrafs_le32(ne.state) != CETRAFS_NODE_STATE_REGISTERED || cetrafs_le32(ne.departure) != CETRAFS_NODE_DEPART_NONE)
-            continue; /* FREE, or cleanly departed */
-        if (my_uuid && !memcmp(ne.node_uuid, my_uuid, CETRAFS_NODE_UUID_LEN))
-            continue; /* our own row / a prior incarnation of us */
+        if (cetrafs_le32(ne.state) != CETRAFS_NODE_STATE_REGISTERED)
+            continue; /* FREE */
+        if (my_uuid && !memcmp(ne.node_uuid, my_uuid, CETRAFS_NODE_UUID_LEN)) {
+            /* our own row / a prior incarnation of us: never a peer */
+            if (cetrafs_le32(ne.departure) != CETRAFS_NODE_DEPART_CLEAN && !cetrafs_sb_row_silent(sb, idx, &ne)) {
+                u32 pi = min_t(u32, cetrafs_le32(ne.hb_interval_secs), CETRAFS_HB_INTERVAL_MAX_SECS);
+
+                cetrafs_row_mark_of(&seq[idx], &ne);
+                own_need[idx] = max_t(u32, cetrafs_row_stale_window(sb, &ne, cetrafs_sb_stale_secs(sb)),
+                                      4 * (pi ? pi : CETRAFS_HEARTBEAT_INTERVAL_SECS));
+            }
+            continue;
+        }
+        if (cetrafs_le32(ne.departure) != CETRAFS_NODE_DEPART_NONE)
+            continue; /* departed */
         if (wants && !wants(&ne, priv))
             continue; /* the caller's answer does not depend on it */
+        /* Watched stand still already by this mount, and still at that
+         * mark: dead, and not watched again (BM-22). */
+        if (cetrafs_sb_row_silent(sb, idx, &ne))
+            continue;
         cetrafs_row_mark_of(&seq[idx], &ne);
         watching[idx] = true;
         candidates++;
@@ -2333,8 +2367,23 @@ static int cetrafs_for_each_live_peer(struct super_block *sb,
         if (ret)
             goto out;
         expired = time_after_eq(jiffies, deadline);
-        for (idx = 0; idx < count && candidates; idx++) {
-            if (!watching[idx])
+        for (idx = 0; idx < count; idx++) {
+            if (own_need[idx]) {
+                /* Our own row: silence only. Moved: a twin, which the
+                 * re-attach watches and refuses. Still at its mark after
+                 * a window as long as the re-attach's: its verdict. */
+                ret = cetrafs_read_node_entry(sb, idx, &ne);
+                if (ret)
+                    goto out;
+                if (!cetrafs_row_mark_same(&seq[idx], &ne))
+                    own_need[idx] = 0;
+                else if (expired && window >= own_need[idx]) {
+                    cetrafs_sb_row_silent_note(sb, idx, &ne);
+                    own_need[idx] = 0;
+                }
+                continue;
+            }
+            if (!watching[idx] || !candidates)
                 continue;
             ret = cetrafs_read_node_entry(sb, idx, &ne);
             if (ret)
@@ -2363,7 +2412,10 @@ static int cetrafs_for_each_live_peer(struct super_block *sb,
                  * has no verdict to publish, and the next mount that
                  * depends on this row watches it again. (A DEAD stamp
                  * would no longer cost the node its own-claim sweeps on
-                 * return -- format 0x000A's departure field, L3.) */
+                 * return -- format 0x000A's departure field, L3.) This
+                 * mount remembers it, so its own later watches do not
+                 * watch it again while it stays at this mark (BM-22). */
+                cetrafs_sb_row_silent_note(sb, idx, &ne);
                 watching[idx] = false;
                 candidates--;
             }
@@ -2372,6 +2424,7 @@ static int cetrafs_for_each_live_peer(struct super_block *sb,
 out:
     kfree(seq);
     kfree(watching);
+    kfree(own_need);
     return ret;
 }
 

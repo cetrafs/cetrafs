@@ -713,6 +713,11 @@ struct cetrafs_sb_info {
     struct mutex trim_mutex;
     u64 trim_lba;
     u64 trim_count;
+    /* Rows a watch of this mount saw stand still for a whole window,
+     * with the mark they stood at (node.c; audit 2026-11-15 BM-22). One
+     * per registry row, allocated by the first verdict. */
+    struct cetrafs_row_mark *row_silent;
+    unsigned long *row_silent_valid;
     u32 trim_bg;
     /* discard_pending: Block Groups whose hand-back discard failed with
      * an UNKNOWN outcome -- it may still execute. Each stays drained
@@ -4326,6 +4331,8 @@ departed:
     kfree(sbi->zg_pf_drop_runs);
     kfree(sbi->zg_pf_full_until);
     kfree(sbi->peers);
+    kfree(sbi->row_silent);
+    bitmap_free(sbi->row_silent_valid);
     left_stopped = stopped || READ_ONCE(sbi->fenced) || test_bit(0, &sbi->lease_lost);
     kfree(sbi);
     sb->s_fs_info = NULL;
@@ -6445,6 +6452,55 @@ bool cetrafs_sb_file_lock_enabled(struct super_block *sb)
     struct cetrafs_sb_info *sbi = sb->s_fs_info;
 
     return !sbi || sbi->file_lock_enabled; /* default on if somehow unset */
+}
+
+/* TEST ONLY: every mount-time watch watches a row again, as before
+ * BM-22 (tests/kernel/mount_watch_once.sh). */
+static bool cetrafs_row_silent_forget;
+cetrafs_test_param(row_silent_forget, cetrafs_row_silent_forget, bool, 0644);
+MODULE_PARM_DESC(row_silent_forget, "TEST ONLY: a mount watches a row again that it already watched stand still");
+
+/*
+ * A row this mount watched stand still for a whole window. Its verdict
+ * holds for as long as the row still reads at that mark: silent from the
+ * watch's start until now, which is longer than the window. Three
+ * consecutive watches of the same dead row -- the mode walk, the
+ * re-attach, the post-registration re-check -- cost a mount six minutes
+ * (audit 2026-11-15 BM-22). Mount-time only: one task, before the
+ * heartbeat.
+ */
+void cetrafs_sb_row_silent_note(struct super_block *sb, u32 idx, const cetrafs_node_entry_t *ne)
+{
+    struct cetrafs_sb_info *sbi = sb->s_fs_info;
+    const cetrafs_superblock_t *raw_sb = cetrafs_sb_raw(sb);
+    u32 count = raw_sb ? le32_to_cpu(raw_sb->node_table_count) : 0;
+
+    if (!sbi || idx >= count)
+        return;
+    if (!sbi->row_silent) {
+        sbi->row_silent = kcalloc(count, sizeof(*sbi->row_silent), GFP_KERNEL);
+        sbi->row_silent_valid = bitmap_zalloc(count, GFP_KERNEL);
+        if (!sbi->row_silent || !sbi->row_silent_valid) {
+            kfree(sbi->row_silent);
+            bitmap_free(sbi->row_silent_valid);
+            sbi->row_silent = NULL;
+            sbi->row_silent_valid = NULL;
+            return; /* only the saving is lost: the next watch watches */
+        }
+    }
+    cetrafs_row_mark_of(&sbi->row_silent[idx], ne);
+    set_bit(idx, sbi->row_silent_valid);
+}
+
+bool cetrafs_sb_row_silent(struct super_block *sb, u32 idx, const cetrafs_node_entry_t *ne)
+{
+    struct cetrafs_sb_info *sbi = sb->s_fs_info;
+    const cetrafs_superblock_t *raw_sb = cetrafs_sb_raw(sb);
+
+    if (!sbi || !sbi->row_silent || READ_ONCE(cetrafs_row_silent_forget) || !raw_sb ||
+        idx >= le32_to_cpu(raw_sb->node_table_count) || !test_bit(idx, sbi->row_silent_valid))
+        return false;
+    return cetrafs_row_mark_same(&sbi->row_silent[idx], ne);
 }
 
 bool cetrafs_sb_transport_checked(struct super_block *sb)
