@@ -1266,7 +1266,7 @@ int cetrafs_defrag_inode(struct inode *inode, struct cetrafs_defrag_stats *out_s
                 cetrafs_bh_begin_update(dbh);
                 memcpy(dbh->b_data, copy_src[i]->b_data, CETRAFS_BLOCK_SIZE);
                 cetrafs_bh_end_update(sb, dbh);
-                cetrafs_write_pending_buffer(dbh, REQ_SYNC);
+                cetrafs_write_pending_buffer(sb, dbh, REQ_SYNC);
             }
             blk_finish_plug(&plug);
             for (i = 0; i < nb; i++) {

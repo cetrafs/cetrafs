@@ -1302,7 +1302,7 @@ static int cetrafs_journal_write_block_flags(struct super_block *sb, struct buff
             struct buffer_head *pair[2] = {pbh, hbh};
 
             (void) plug;
-            cetrafs_write_bhs_status(pair, 2, est);
+            cetrafs_write_bhs_status(sb, pair, 2, est);
             ok = !est[0] && !est[1] && !cetrafs_journal_fail_entry_write;
             brelse(pbh);
             brelse(hbh);
@@ -1678,7 +1678,7 @@ static void cetrafs_journal_drain_locked(struct super_block *sb, struct cetrafs_
                 continue;
             memset(hb[i]->b_data, 0, CETRAFS_BLOCK_SIZE);
             cetrafs_bh_end_update(sb, hb[i]);
-            cetrafs_write_pending_buffer(hb[i], REQ_SYNC);
+            cetrafs_write_pending_buffer(sb, hb[i], REQ_SYNC);
         }
         blk_finish_plug(&plug);
         for (i = 0; i < m; i++) {
@@ -1844,8 +1844,8 @@ static int cetrafs_journal_batch_chunk(struct super_block *sb, struct cetrafs_jo
 
         blk_start_plug(&plug);
         for (i = 0; i < k; i++) {
-            cetrafs_write_pending_buffer(pb[i], REQ_SYNC);
-            cetrafs_write_pending_buffer(hb[i], REQ_SYNC);
+            cetrafs_write_pending_buffer(sb, pb[i], REQ_SYNC);
+            cetrafs_write_pending_buffer(sb, hb[i], REQ_SYNC);
         }
         blk_finish_plug(&plug);
     }

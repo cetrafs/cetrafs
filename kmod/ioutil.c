@@ -398,7 +398,7 @@ static bool cetrafs_bitmap_writeback;
 cetrafs_test_param(bitmap_writeback, cetrafs_bitmap_writeback, bool, 0644);
 MODULE_PARM_DESC(bitmap_writeback, "TEST ONLY: allocation bitmaps are left dirty for writeback (before A-15)");
 
-static int __cetrafs_keep_submit(struct buffer_head *bh, bool *was_dirty, bool *was_held);
+static int __cetrafs_keep_submit(struct super_block *sb, struct buffer_head *bh, bool *was_dirty, bool *was_held);
 static int __cetrafs_keep_wait(struct buffer_head *bh, bool was_dirty, bool was_held);
 static int cetrafs_meta_write_result(struct super_block *sb, struct buffer_head *bh, int ret);
 
@@ -516,7 +516,7 @@ int cetrafs_held_flush(struct super_block *sb)
         get_bh(bh);
         io[n].bh = bh;
         io[n].idx = idx;
-        io[n].state = __cetrafs_keep_submit(bh, &io[n].was_dirty, &io[n].was_held);
+        io[n].state = __cetrafs_keep_submit(sb, bh, &io[n].was_dirty, &io[n].was_held);
         if (++n < cap)
             continue;
         blk_finish_plug(&plug);
@@ -652,9 +652,51 @@ done:
     return ret;
 }
 
-static int __cetrafs_sync_buffer(struct buffer_head *bh)
+/*
+ * The fence, asked again UNDER the buffer lock. Every writer asks before
+ * it starts, and then takes lock_buffer() -- which waits out a write of
+ * the same block already in flight, for as long as the device takes. A
+ * node whose lease lapsed in that wait submitted its newer image anyway,
+ * after a peer may have taken the block over (audit 2026-11-15 BM-24).
+ * Asked here, nothing is submitted once the fence is known: the buffer
+ * keeps its dirt for the fence's sweep to discard, and the caller gets
+ * -ESHUTDOWN, which cetrafs_meta_write_result() reports as -EIO without
+ * calling it a device error.
+ */
+static bool cetrafs_meta_gate_unlocked_only;
+cetrafs_test_param(meta_gate_unlocked_only, cetrafs_meta_gate_unlocked_only, bool, 0644);
+MODULE_PARM_DESC(meta_gate_unlocked_only, "TEST ONLY: metadata writes ask the fence only before the buffer lock");
+static unsigned int cetrafs_meta_gate_stall_ms;
+cetrafs_test_param(meta_gate_stall_ms, cetrafs_meta_gate_stall_ms, uint, 0644);
+MODULE_PARM_DESC(meta_gate_stall_ms, "TEST ONLY: one-shot stall of the next synchronous metadata write, just after it locks its buffer");
+static unsigned long long cetrafs_meta_gate_stall_block;
+cetrafs_test_param(meta_gate_stall_block, cetrafs_meta_gate_stall_block, ullong, 0644);
+MODULE_PARM_DESC(meta_gate_stall_block, "TEST ONLY: meta_gate_stall_ms holds only a write of this block (0 = any)");
+
+static inline bool cetrafs_meta_gate_shut(struct super_block *sb)
+{
+    return sb && !READ_ONCE(cetrafs_meta_gate_unlocked_only) && cetrafs_sb_is_fenced(sb);
+}
+
+static int __cetrafs_sync_buffer(struct super_block *sb, struct buffer_head *bh)
 {
     lock_buffer(bh);
+    /* TEST ONLY: the lock won after a wait the fence landed in -- held
+     * here, the fence's own sweep queues behind it as it would behind
+     * the in-flight write this writer waited out. */
+    if (unlikely(READ_ONCE(cetrafs_meta_gate_stall_ms)) &&
+        (!READ_ONCE(cetrafs_meta_gate_stall_block) || bh->b_blocknr == READ_ONCE(cetrafs_meta_gate_stall_block))) {
+        unsigned int ms = xchg(&cetrafs_meta_gate_stall_ms, 0);
+
+        if (ms) {
+            pr_info("meta_gate_stall: block %llu, %u ms\n", (unsigned long long) bh->b_blocknr, ms);
+            msleep(ms);
+        }
+    }
+    if (cetrafs_meta_gate_shut(sb)) {
+        unlock_buffer(bh);
+        return -ESHUTDOWN;
+    }
     if (cetrafs_sync_writeback_eio && buffer_dirty(bh)) {
         /* what a failed flusher write leaves: clean, BH_Write_EIO */
         cetrafs_sync_writeback_eio--;
@@ -710,9 +752,13 @@ static void cetrafs_end_write_keep(struct buffer_head *bh, int uptodate)
  */
 /* The submit half: 1 submitted (finish with __cetrafs_keep_wait()), 0
  * nothing to write, -EIO an earlier failed write found and re-dirtied. */
-static int __cetrafs_keep_submit(struct buffer_head *bh, bool *was_dirty, bool *was_held)
+static int __cetrafs_keep_submit(struct super_block *sb, struct buffer_head *bh, bool *was_dirty, bool *was_held)
 {
     lock_buffer(bh); /* also waits out a writeback already in flight */
+    if (cetrafs_meta_gate_shut(sb)) {
+        unlock_buffer(bh);
+        return -ESHUTDOWN;
+    }
     if (buffer_write_io_error(bh)) {
         clear_buffer_write_io_error(bh);
         set_buffer_uptodate(bh);
@@ -789,11 +835,21 @@ static void cetrafs_end_write_pending(struct buffer_head *bh, int uptodate)
  * for write_dirty_buffer(), and judges uptodate); neither, nothing is.
  * Ends as end_buffer_write_sync() leaves a buffer.
  */
-void cetrafs_write_pending_buffer(struct buffer_head *bh, unsigned int op_flags)
+void cetrafs_write_pending_buffer(struct super_block *sb, struct buffer_head *bh, unsigned int op_flags)
 {
     bool dirty, held;
 
     lock_buffer(bh);
+    if (cetrafs_meta_gate_shut(sb)) {
+        /* Not sent, and its caller judges by uptodate: as a failed
+         * write leaves it. A fenced node writes none of its dirt. */
+        clear_buffer_dirty(bh);
+        clear_buffer_cetra_held(bh);
+        set_buffer_write_io_error(bh);
+        clear_buffer_uptodate(bh);
+        unlock_buffer(bh);
+        return;
+    }
     dirty = test_clear_buffer_dirty(bh);
     held = test_clear_buffer_cetra_held(bh);
     if (!dirty && !held) {
@@ -809,10 +865,10 @@ void cetrafs_write_pending_buffer(struct buffer_head *bh, unsigned int op_flags)
 #endif
 }
 
-static int __cetrafs_sync_buffer_keep(struct buffer_head *bh)
+static int __cetrafs_sync_buffer_keep(struct super_block *sb, struct buffer_head *bh)
 {
     bool was_dirty, was_held;
-    int ret = __cetrafs_keep_submit(bh, &was_dirty, &was_held);
+    int ret = __cetrafs_keep_submit(sb, bh, &was_dirty, &was_held);
 
     return ret == 1 ? __cetrafs_keep_wait(bh, was_dirty, was_held) : ret;
 }
@@ -882,6 +938,8 @@ const char *cetrafs_block_role(struct super_block *sb, u64 lba)
 
 static int cetrafs_meta_write_result(struct super_block *sb, struct buffer_head *bh, int ret)
 {
+    if (ret == -ESHUTDOWN)
+        return -EIO; /* the fence, asked under the buffer lock: nothing was sent */
     if (!ret && cetrafs_meta_write_fail) {
         cetrafs_meta_write_fail--;
         ret = -EIO;
@@ -935,7 +993,7 @@ static void cetrafs_status_bio_end(struct bio *bio)
  * buffer as end_buffer_write_sync() leaves it. A buffer with nothing to
  * write gets st 0.
  */
-void cetrafs_write_bhs_status(struct buffer_head **bhs, unsigned int n, int *st)
+void cetrafs_write_bhs_status(struct super_block *sb, struct buffer_head **bhs, unsigned int n, int *st)
 {
     DECLARE_COMPLETION_ONSTACK(all);
     struct cetrafs_status_bio io[2];
@@ -954,6 +1012,11 @@ void cetrafs_write_bhs_status(struct buffer_head **bhs, unsigned int n, int *st)
 
         st[i] = 0;
         lock_buffer(bh);
+        if (cetrafs_meta_gate_shut(sb)) {
+            st[i] = -ESHUTDOWN; /* not sent; the fence's sweep discards the dirt */
+            unlock_buffer(bh);
+            continue;
+        }
         dirty = test_clear_buffer_dirty(bh);
         held = test_clear_buffer_cetra_held(bh);
         if (!dirty && !held) {
@@ -1010,7 +1073,7 @@ int cetrafs_sync_buffer_op_refusable(struct super_block *sb, struct buffer_head 
 
     if (cetrafs_sb_is_fenced(sb))
         return -EIO;
-    ret = __cetrafs_sync_buffer(bh);
+    ret = __cetrafs_sync_buffer(sb, bh);
     if (cetrafs_refusal_definite(ret))
         return ret;
     return cetrafs_meta_write_result(sb, bh, ret);
@@ -1031,7 +1094,7 @@ int cetrafs_sync_buffer(struct super_block *sb, struct buffer_head *bh)
 {
     if (cetrafs_sb_is_fenced(sb))
         return -EIO;
-    return cetrafs_meta_write_result(sb, bh, __cetrafs_sync_buffer(bh));
+    return cetrafs_meta_write_result(sb, bh, __cetrafs_sync_buffer(sb, bh));
 }
 
 /*
@@ -1057,7 +1120,7 @@ int cetrafs_sync_buffer_refusable(struct super_block *sb, struct buffer_head *bh
 
     if (cetrafs_sb_is_fenced(sb))
         return -EIO;
-    ret = __cetrafs_sync_buffer(bh);
+    ret = __cetrafs_sync_buffer(sb, bh);
     if ((ret == -ENOSPC || ret == -EREMOTEIO) && !READ_ONCE(cetrafs_replay_refusal_stops)) {
         pr_warn_ratelimited("%s: the device refused a journal replay write (%s, block %llu, %d) -- not executed; "
                             "the entry is kept for a later replay\n",
@@ -1102,7 +1165,7 @@ int cetrafs_sync_new_buffer(struct super_block *sb, struct buffer_head *bh)
         unlock_buffer(bh);
         ret = -ENOSPC; /* test-only: what a full pool answers */
     } else {
-        ret = __cetrafs_sync_buffer(bh);
+        ret = __cetrafs_sync_buffer(sb, bh);
     }
     if (ret == -ENOSPC && !READ_ONCE(cetrafs_nospc_stops)) {
         atomic64_inc(&cetrafs_meta_nospc);
@@ -1170,6 +1233,13 @@ int cetrafs_sync_new_buffers(struct super_block *sb, struct buffer_head **bhs, u
         io[i].left = &left;
         io[i].status = 0;
         lock_buffer(bh);
+        if (cetrafs_meta_gate_shut(sb)) {
+            /* not sent: completes as refused, never reaches the device */
+            io[i].status = -ESHUTDOWN;
+            if (atomic_dec_and_test(&left))
+                complete(&all);
+            continue;
+        }
         clear_buffer_dirty(bh);
         clear_buffer_cetra_held(bh);
         clear_buffer_write_io_error(bh);
@@ -1213,7 +1283,7 @@ int cetrafs_sync_buffer_keep(struct super_block *sb, struct buffer_head *bh)
 {
     if (cetrafs_sb_is_fenced(sb))
         return -EIO;
-    return cetrafs_meta_write_result(sb, bh, __cetrafs_sync_buffer_keep(bh));
+    return cetrafs_meta_write_result(sb, bh, __cetrafs_sync_buffer_keep(sb, bh));
 }
 
 /*
@@ -1285,7 +1355,7 @@ static int cetrafs_sync_buffers_keep_legacy(struct super_block *sb, struct buffe
     }
     blk_start_plug(&plug);
     for (i = 0; i < n; i++)
-        st[i] = __cetrafs_keep_submit(bhs[i], &wd[i], &wh[i]);
+        st[i] = __cetrafs_keep_submit(sb, bhs[i], &wd[i], &wh[i]);
     blk_finish_plug(&plug);
     for (i = 0; i < n; i++) {
         if (st[i] != 1)
@@ -1346,6 +1416,11 @@ int cetrafs_sync_buffers_keep(struct super_block *sb, struct buffer_head **bhs, 
         io[i].b.left = &left;
         io[i].b.status = 0;
         lock_buffer(bh); /* also waits out a writeback already in flight */
+        if (cetrafs_meta_gate_shut(sb)) {
+            unlock_buffer(bh);
+            io[i].state = -ESHUTDOWN;
+            continue;
+        }
         if (buffer_write_io_error(bh)) {
             /* an earlier write of these bytes failed: put them back */
             clear_buffer_write_io_error(bh);
@@ -1465,6 +1540,10 @@ int cetrafs_submit_deferred_target(struct super_block *sb, struct buffer_head *b
     if (cetrafs_sb_is_fenced(sb))
         return -EIO;
     lock_buffer(bh);
+    if (cetrafs_meta_gate_shut(sb)) {
+        unlock_buffer(bh);
+        return -EIO; /* not sent: the fence's sweep discards it */
+    }
     if (!buffer_cetra_deferred(bh)) {
         unlock_buffer(bh);
         return 1;
@@ -1498,6 +1577,10 @@ int cetrafs_write_deferred_target(struct super_block *sb, struct buffer_head *bh
     if (cetrafs_sb_is_fenced(sb))
         return -EIO;
     lock_buffer(bh);
+    if (cetrafs_meta_gate_shut(sb)) {
+        unlock_buffer(bh);
+        return -EIO; /* not sent: the fence's sweep discards it */
+    }
     if (!buffer_cetra_deferred(bh)) {
         unlock_buffer(bh);
         return 1;
