@@ -1104,13 +1104,22 @@ static int __cetrafs_zg_try_claim_one(struct super_block *sb,
  * it leaves the Zone Group for its next tick instead -- a wait here holds
  * the claim mutex, so every writer of this node that needs a Zone Group
  * would wait behind it, and the maintenance pass with it. */
+static int cetrafs_zg_settle_owner(struct super_block *sb, u32 zg_id, u32 my_node_id, bool may_wait);
+static void cetrafs_zg_settle_test_stall(struct super_block *sb);
+
 static int cetrafs_zg_try_claim_one(struct super_block *sb, u32 zg_id, u32 my_node_id, bool at_mount, bool may_wait,
                                     bool *out_claimed)
 {
     unsigned int nofs = 0;
-    bool locked = cetrafs_sb_zg_claim_lock(sb, &nofs);
-    int ret = __cetrafs_zg_try_claim_one(sb, zg_id, my_node_id, at_mount, may_wait, out_claimed);
+    bool locked;
+    int ret;
 
+    *out_claimed = false;
+    ret = cetrafs_zg_settle_owner(sb, zg_id, my_node_id, may_wait);
+    if (ret)
+        return ret;
+    locked = cetrafs_sb_zg_claim_lock(sb, &nofs);
+    ret = __cetrafs_zg_try_claim_one(sb, zg_id, my_node_id, at_mount, may_wait, out_claimed);
     if (locked)
         cetrafs_sb_zg_claim_unlock(sb, nofs);
     return ret;
@@ -1236,6 +1245,7 @@ static int __cetrafs_zg_try_claim_one(struct super_block *sb,
         ret = cetrafs_node_fence_peer(sb, owner, "a zone group");
         if (ret)
             goto out_unlock;
+        cetrafs_zg_settle_test_stall(sb); /* one-shot: the settle outside the mutex took it */
 
         /* We hold no cluster mutex here any more -- replay claims the
          * area itself, which is what serializes concurrent replayers. */
@@ -1422,7 +1432,74 @@ out_unlock:
  * claim that solves nothing.
  */
 static int cetrafs_zg_claim_one_more_locked(struct super_block *sb, u32 count, u32 my_node_id, bool may_steal,
-                                            bool may_wait, bool *out_claimed, s64 *out_defer);
+                                            bool may_wait, bool *out_claimed, s64 *out_defer, u32 *settle_z,
+                                            u32 settled);
+
+/* TEST ONLY: a claim fences and replays a stale owner under the claim
+ * mutex, as before audit 2026-11-15 BM-39 (tests/kernel/zg_claim_settle_unlocked.sh). */
+static bool cetrafs_zg_settle_locked;
+cetrafs_test_param(zg_settle_locked, cetrafs_zg_settle_locked, bool, 0644);
+MODULE_PARM_DESC(zg_settle_locked, "TEST ONLY: a Zone Group steal fences and replays under the claim mutex");
+
+/* TEST ONLY: pause once inside the settle of a stale owner, after its
+ * fence (tests/kernel/zg_claim_settle_unlocked.sh). */
+static unsigned int cetrafs_zg_settle_stall_ms;
+cetrafs_test_param(zg_settle_stall_ms, cetrafs_zg_settle_stall_ms, uint, 0644);
+MODULE_PARM_DESC(zg_settle_stall_ms, "TEST ONLY: pause once in a Zone Group steal, after the owner's fence");
+
+/* The test stall, after a steal's fence: says whether the claim mutex is
+ * held across it. */
+static void cetrafs_zg_settle_test_stall(struct super_block *sb)
+{
+    unsigned int stall = xchg(&cetrafs_zg_settle_stall_ms, 0);
+
+    if (stall) {
+        pr_info("ZG claim: settle stall, claim mutex held=%d\n", cetrafs_sb_zg_claim_busy(sb));
+        msleep(stall); /* TEST ONLY: see the parameter */
+    }
+}
+
+/*
+ * The slow half of taking a dead owner's Zone Group -- its fence and the
+ * replay of its whole journal, with the claim wait -- run BEFORE the
+ * claim mutex, which every writer of this node that needs a Zone Group
+ * takes. Held across them, a heartbeat steal stalled every such writer,
+ * uninterruptibly, for as long as the replay ran (audit 2026-11-15
+ * BM-39). The claim under the mutex then fences again (one CAS) and
+ * finds the journal replayed. 0: settled, or nothing to settle;
+ * -EAGAIN: a peer is replaying it (no wait asked); else the error.
+ */
+static int cetrafs_zg_settle_owner(struct super_block *sb, u32 zg_id, u32 my_node_id, bool may_wait)
+{
+    cetrafs_zone_group_t *zg;
+    bool stale = false;
+    u16 owner;
+    int ret;
+
+    if (READ_ONCE(cetrafs_zg_settle_locked) || cetrafs_sb_zg_claim_held(sb))
+        return 0; /* the claim does it, as before */
+    zg = kmalloc(sizeof(*zg), GFP_KERNEL);
+    if (!zg)
+        return -ENOMEM;
+    ret = cetrafs_read_zg(sb, zg_id, zg);
+    owner = ret ? CETRAFS_NODE_ID_NONE : le16_to_cpu(zg->owner_node_id);
+    kfree(zg);
+    if (ret || owner == CETRAFS_NODE_ID_NONE || owner == (u16) my_node_id)
+        return ret;
+    ret = cetrafs_node_is_stale(sb, owner, &stale);
+    if (ret || !stale)
+        return ret;
+    ret = cetrafs_node_fence_peer(sb, owner, "a zone group");
+    if (ret)
+        return ret == -EBUSY ? 0 : ret; /* came back: the claim judges it again */
+    cetrafs_zg_settle_test_stall(sb);
+    ret = cetrafs_journal_replay_node_scoped(sb, owner, may_wait || READ_ONCE(cetrafs_zg_claim_always_waits), 0);
+    if (ret == -EEXIST && !may_wait) {
+        atomic64_inc(&cetrafs_zg_claim_replay_deferrals);
+        return -EAGAIN;
+    }
+    return ret;
+}
 
 /*
  * may_steal: whether this caller may take a dead owner's Zone Group
@@ -1444,10 +1521,9 @@ static int cetrafs_zg_claim_one_more(struct super_block *sb,
                                      bool *out_claimed,
                                      s64 *out_defer)
 {
-    u32 count;
+    u32 count, settled = U32_MAX;
     unsigned int nofs = 0;
-    bool locked;
-    int ret;
+    int locked, ret, round;
 
     *out_claimed = false;
     *out_defer = -1;
@@ -1456,17 +1532,35 @@ static int cetrafs_zg_claim_one_more(struct super_block *sb,
     /* The whole pick under the claim mutex, not only the claim: a writer
      * that ran out while another thread's claim is still recounting
      * waits for it here, then finds the result in the cache and passes
-     * over it as "already ours" -- the caller rescans either way. */
-    locked = cetrafs_sb_zg_claim_lock(sb, &nofs);
-    ret = cetrafs_zg_claim_one_more_locked(sb, count, my_node_id, may_steal, may_wait, out_claimed, out_defer);
-    if (locked)
-        cetrafs_sb_zg_claim_unlock(sb, nofs);
-    return ret;
+     * over it as "already ours" -- the caller rescans either way.
+     * Killable: an allocator waits here inside write(2) or a fault. */
+    for (round = 0;; round++) {
+        u32 settle = U32_MAX;
+
+        locked = cetrafs_sb_zg_claim_lock_killable(sb, &nofs);
+        if (locked < 0)
+            return locked;
+        /* A pick that lands on a dead owner's group hands it back to be
+         * settled outside the mutex (cetrafs_zg_settle_owner()) -- once,
+         * and only by the task that took the mutex here. */
+        ret = cetrafs_zg_claim_one_more_locked(sb, count, my_node_id, may_steal, may_wait, out_claimed, out_defer,
+                                               locked && round < 3 ? &settle : NULL, settled);
+        if (locked)
+            cetrafs_sb_zg_claim_unlock(sb, nofs);
+        if (ret != -EINPROGRESS)
+            return ret;
+        settled = settle;
+        ret = cetrafs_zg_settle_owner(sb, settle, my_node_id, may_wait);
+        if (ret)
+            return ret;
+    }
 }
 
 static int cetrafs_zg_claim_one_more_locked(struct super_block *sb, u32 count, u32 my_node_id, bool may_steal,
-                                            bool may_wait, bool *out_claimed, s64 *out_defer)
+                                            bool may_wait, bool *out_claimed, s64 *out_defer, u32 *settle_z,
+                                            u32 settled)
 {
+    bool best_foreign = false;
     u32 z, best_z = 0, stale_z = 0;
     u64 best_free = 0, stale_free = 0;
     bool have_best = false, have_stale = false;
@@ -1527,6 +1621,7 @@ static int cetrafs_zg_claim_one_more_locked(struct super_block *sb, u32 count, u
             (info.free_data_blocks < best_free && !(best_free > 0 && info.free_data_blocks == 0))) {
             best_z = z;
             best_free = info.free_data_blocks;
+            best_foreign = info.owner_node_id != CETRAFS_NODE_ID_NONE;
             have_best = true;
         }
     }
@@ -1539,6 +1634,11 @@ static int cetrafs_zg_claim_one_more_locked(struct super_block *sb, u32 count, u
         return 0;
     }
 
+    /* A dead owner's: settled first, with the mutex dropped. */
+    if (best_foreign && settle_z && best_z != settled && !READ_ONCE(cetrafs_zg_settle_locked)) {
+        *settle_z = best_z;
+        return -EINPROGRESS;
+    }
     return cetrafs_zg_try_claim_one(sb, best_z, my_node_id, /*at_mount=*/false, may_wait, out_claimed);
 }
 

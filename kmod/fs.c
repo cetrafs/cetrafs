@@ -4888,6 +4888,38 @@ bool cetrafs_sb_zg_claim_lock(struct super_block *sb, unsigned int *nofs)
     return true;
 }
 
+/* Killable: 1 taken, 0 the caller already holds it, -EINTR. */
+int cetrafs_sb_zg_claim_lock_killable(struct super_block *sb, unsigned int *nofs)
+{
+    struct cetrafs_sb_info *sbi = sb->s_fs_info;
+
+    if (READ_ONCE(sbi->zg_claim_owner) == current)
+        return 0;
+    *nofs = memalloc_nofs_save();
+    if (mutex_lock_killable(&sbi->zg_claim_mutex)) {
+        memalloc_nofs_restore(*nofs);
+        return -EINTR;
+    }
+    WRITE_ONCE(sbi->zg_claim_owner, current);
+    return 1;
+}
+
+/* Is the claim mutex held by anyone? (A test probe.) */
+bool cetrafs_sb_zg_claim_busy(struct super_block *sb)
+{
+    struct cetrafs_sb_info *sbi = sb->s_fs_info;
+
+    return mutex_is_locked(&sbi->zg_claim_mutex);
+}
+
+/* Does the calling task hold the claim mutex? */
+bool cetrafs_sb_zg_claim_held(struct super_block *sb)
+{
+    struct cetrafs_sb_info *sbi = sb->s_fs_info;
+
+    return READ_ONCE(sbi->zg_claim_owner) == current;
+}
+
 void cetrafs_sb_zg_claim_unlock(struct super_block *sb, unsigned int nofs)
 {
     struct cetrafs_sb_info *sbi = sb->s_fs_info;
