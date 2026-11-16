@@ -35,7 +35,7 @@ round() {
     "$OPOKE" "$img" 3 0 0 >/dev/null || { fail "setup: orphan_poke failed"; ct_exit; }
     "$DPOKE" "$img" 2 2700 3 >/dev/null || { fail "setup: dirtree_poke failed"; ct_exit; }
     d0="$("$BGPOKE" "$dev" 0 --dump)"
-    bm=$(( $(grep -oP 'start_block=\K[0-9]+' <<<"$d0") + $(grep -oP 'off_data_bmap=\K[0-9]+' <<<"$d0") ))
+    bm=$(( $(tr ' ' '\n' <<<"$d0" | sed -n 's/^start_block=\([0-9]*\).*/\1/p' | awk 'NR == 1') + $(tr ' ' '\n' <<<"$d0" | sed -n 's/^off_data_bmap=\([0-9]*\).*/\1/p' | awk 'NR == 1') ))
     off=$((bm * 4096 + LEAKBIT / 8))
     printf '\x01' | dd of="$img" bs=1 seek="$off" conv=notrunc status=none
     blockdev --flushbufs "$dev"

@@ -25,6 +25,11 @@ set -euo pipefail
 . "$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)/lib/harness.sh"
 
 K="$ROOT/kmod"
+# A piped grep -q exits at its first match; the producer then takes
+# SIGPIPE, and under pipefail the pipeline reads as no match -- a long
+# function body that does match is reported as one that does not. GNU
+# grep treats a /dev/null stdout as -q too. has reads all of its input.
+has() { local in; in="$(cat)"; grep -q "$@" <<<"$in"; }
 
 log "checking no buffer is modified outside the update protocol"
 # The question P3 should have asked. cetrafs_bh_begin_update()/_end_update()
@@ -120,7 +125,9 @@ for f in "$K"/*.c; do
         # durable.
         # cetrafs_tree_hold_back() likewise: it ends the update itself,
         # held back for the boundary or journaled now (file.c).
-        inreg && /cetrafs_bh_end_update\(|cetrafs_bh_abort_update\(|cetrafs_journal_write_(new_)?block\(|cetrafs_tree_hold_back\(/ { inreg=0; next }
+        # cetrafs_bmap_end_update() (alloc.c) ends it on both of its
+        # branches: end_update, or end_update_held.
+        inreg && /cetrafs_bh_end_update(_held)?\(|cetrafs_bmap_end_update\(|cetrafs_bh_abort_update\(|cetrafs_journal_write_(new_)?block\(|cetrafs_tree_hold_back\(/ { inreg=0; next }
         # The NULL check belonging to the claim is not a leak: there is no
         # buffer to release yet. Only the few lines right after the claim.
         inreg && NR <= start + 6 && /^[[:space:]]*(return|goto) / { next }
@@ -919,7 +926,7 @@ callgraph "$S5" >"$E5"
 FLUSHERS="$(c5_flushers "$K"/*.c)"
 MISS5=""
 for b in cetrafs_sync_fs cetrafs_put_super cetrafs_file_flush __cetrafs_fsync cetrafs_dir_fsync cetrafs_lock_release; do
-    grep -q "^$b " "$CG" || body_matches "$b" . "$K"/*.c | grep -q . || { MISS5="$MISS5 $b(gone?)"; continue; }
+    grep -q "^$b " "$CG" || body_matches "$b" . "$K"/*.c | has . || { MISS5="$MISS5 $b(gone?)"; continue; }
     [ -n "$(c5_reaches "$CG" "$b" $FLUSHERS)" ] || MISS5="$MISS5 $b"
 done
 [ -z "$MISS5" ] && pass "class 5: every durability boundary reaches a device cache flush" ||
@@ -940,8 +947,8 @@ SENT="$(sed -n 's/^#define \(CETRAFS_[A-Z_]*\(STATE_FREE\|OWNER_FREE\|ID_NONE\|L
 MISS=""
 for c in $SENT; do
     cat "$K"/*.c "$ROOT"/userspace/*.c "$ROOT"/userspace/*.h |
-        grep -E "(=[^=]*\b$c\b|memset.*\b$c\b)" | grep -vqE "(==|!=)[^=]*\b$c\b" && continue
-    cat "$K"/*.c "$ROOT"/userspace/*.c "$ROOT"/userspace/*.h | grep -E "memset.*\b$c\b" -q || MISS="$MISS $c"
+        grep -E "(=[^=]*\b$c\b|memset.*\b$c\b)" | has -vE "(==|!=)[^=]*\b$c\b" && continue
+    cat "$K"/*.c "$ROOT"/userspace/*.c "$ROOT"/userspace/*.h | has -E "memset.*\b$c\b" || MISS="$MISS $c"
 done
 [ -z "$MISS" ] && pass "class 32: every free/none sentinel is written somewhere ($(echo $SENT))" ||
     fail "class 32: tested but never written:$MISS"
@@ -1739,10 +1746,10 @@ UNL="$(while read -r c; do [ -n "$c" ] && ! grep -q "^$c:" <<<"$SIGSAFE_OK" && e
 [ -n "$CALLED" ] || fail "signal handlers: found nothing the handlers call -- the scan is not seeing them"
 [ -z "$UNL" ] && pass "signal handlers: everything they call is listed with what keeps the main line out" ||
     fail "signal handlers: they call, unjudged: $(echo $UNL)"
-fn_body "$U/devutil.h" cetrafs_repair_renew | grep -q 'sigprocmask(SIG_BLOCK' &&
+fn_body "$U/devutil.h" cetrafs_repair_renew | has 'sigprocmask(SIG_BLOCK' &&
     pass "signal handlers: cetrafs_repair_renew masks SIGALRM" ||
     fail "signal handlers: cetrafs_repair_renew no longer masks SIGALRM around the renewal"
-fn_body "$U/devutil.h" cetrafs_repair_release | tail -n +2 | grep -m1 -E 'cetrafs_|pread|pwrite' | grep -q 'cetrafs_repair_timer(fd, sb, row, 0)' &&
+fn_body "$U/devutil.h" cetrafs_repair_release | tail -n +2 | awk '!d && /cetrafs_|pread|pwrite/ { print; d = 1 }' | has 'cetrafs_repair_timer(fd, sb, row, 0)' &&
     pass "signal handlers: cetrafs_repair_release disarms the timer first" ||
     fail "signal handlers: cetrafs_repair_release does I/O before disarming the timer"
 NB="$(grep -nE 'cetrafs_repair_node_beat\(' "$U"/*.c "$U"/*.h | grep -vE 'static inline int cetrafs_repair_node_beat|cetrafs_renew_fd' || true)"
@@ -1802,7 +1809,7 @@ MS="$(mode_sites "$K"/*.c)"
 UNM="$(while IFS= read -r l; do [ -n "$l" ] && ! grep -qF "$l:" <<<"$MODE_OK" && echo "$l"; done <<<"$MS" || true)"
 [ -z "$UNM" ] && pass "adopted mode: every i_mode assignment is the helper or a listed exception" ||
     fail "adopted mode: set i_mode through cetrafs_inode_adopt_identity() (it clears S_NOSEC): $UNM"
-grep -A6 '^void cetrafs_inode_adopt_identity' "$K/inode.c" | grep -q 'i_flags &= ~S_NOSEC' &&
+grep -A6 '^void cetrafs_inode_adopt_identity' "$K/inode.c" | has 'i_flags &= ~S_NOSEC' &&
     pass "adopted mode: the helper clears S_NOSEC" || fail "adopted mode: cetrafs_inode_adopt_identity() no longer clears S_NOSEC"
 SAMPLE="$(ct_tmp mode-sample).c"
 printf '    inode->i_mode = cetrafs_le32(bufs[0].mode);\n' >"$SAMPLE"
@@ -1850,7 +1857,7 @@ cas_check() { # <file>: prints what is wrong, nothing when it holds
     [ "$(grep -c 'unknown = kmalloc' <<<"$b")" = 1 ] || echo "the in-flight buffer is allocated $(grep -c 'unknown = kmalloc' <<<"$b") times"
     awk '/unknown = kmalloc/{a=NR} /for [(]attempt = 0;/{if(!f){f=NR}} END{if(!a||!f||a>f) print "the in-flight buffer is not allocated before the loop"}' <<<"$b"
     awk '/for [(]attempt = 0;/{on=1} /^out:/{on=0} on && /^[[:space:]]+return /{print "a return inside the loop skips out: -- " $0}' <<<"$b"
-    sed -n '/^out:/,/kfree(unknown)/p' <<<"$b" | grep -q 'if (undecided && ret' || echo "out: does not stop the mount for an undecided swap"
+    sed -n '/^out:/,/kfree(unknown)/p' <<<"$b" | has 'if (undecided && ret' || echo "out: does not stop the mount for an undecided swap"
 }
 CC="$(cas_check "$K/caw.c")"
 [ -z "$CC" ] && pass "class 30: every exit of the CAS loop confirms a timed-out swap or stops the mount" ||
@@ -1918,7 +1925,7 @@ FDM="$(fd_mutators "$K"/*.c)"
 FDU=""
 FDS=""
 for fn in $FDM; do
-    src="$(grep -lE "^static int $fn\\(" "$K"/*.c | head -1)"
+    src="$(grep -lE "^static int $fn\\(" "$K"/*.c | awk 'NR == 1')"
     [ -n "$src" ] || { FDU="$FDU$fn(no-body) "; continue; }
     u="$(fd_unchecked "$src" "$fn")"
     if [ -n "$u" ] && ! fd_publishes "$src" "$fn"; then FDS="$FDS$fn "; else FDU="$FDU$u "; fi
@@ -1973,7 +1980,7 @@ c41_names() { # <files...>: every function whose name says it drops cached state
 }
 c41_body() { # <fn>: its body, from whichever kmod file defines it
     local src
-    src="$(grep -lE "^(static )?(inline )?[a-z0-9_]+ \*?$1\\(" "$K"/*.c | head -1)"
+    src="$(grep -lE "^(static )?(inline )?[a-z0-9_]+ \*?$1\\(" "$K"/*.c | awk 'NR == 1')"
     # A multi-line PROTOTYPE also starts with the name and has no ");"
     # on its first line: the header is held until a line ending in ";"
     # (a prototype: dropped) or the opening "{" (the definition).
@@ -1988,12 +1995,12 @@ c41_bad() { # <fn> <kind>: prints why the fence is missing, nothing if present
     gen:*)
         field="$(cut -d: -f2 <<<"$kind")"
         store="$(cut -d: -f3 <<<"$kind")"
-        c41_body "$fn" | grep -qE "$field\\+\\+|atomic_inc\\(&[a-z]+->$field\\)" || echo "$fn: does not move $field"
-        c41_body "$store" | grep -E "$field" | grep -qE '!=|==' || echo "$store: never compares $field"
+        c41_body "$fn" | has -E "$field\\+\\+|atomic_inc\\(&[a-z]+->$field\\)" || echo "$fn: does not move $field"
+        c41_body "$store" | grep -E "$field" | has -E '!=|==' || echo "$store: never compares $field"
         ;;
-    calls:*) c41_body "$fn" | grep -q "${kind#calls:}(" || echo "$fn: no longer calls ${kind#calls:}" ;;
-    buffer) c41_body "$fn" | grep -q 'lock_buffer(' || echo "$fn: takes no buffer lock" ;;
-    wait) c41_body "$fn" | grep -qE 'wait_event|resolving' || echo "$fn: waits for nothing" ;;
+    calls:*) c41_body "$fn" | has "${kind#calls:}(" || echo "$fn: no longer calls ${kind#calls:}" ;;
+    buffer) c41_body "$fn" | has 'lock_buffer(' || echo "$fn: takes no buffer lock" ;;
+    wait) c41_body "$fn" | has -E 'wait_event|resolving' || echo "$fn: waits for nothing" ;;
     safe:* | none:*) ;;
     *) echo "$fn: unknown kind $kind" ;;
     esac
@@ -2046,7 +2053,7 @@ c51_names() { # <files...>: every function whose name says it trusts cached stat
 }
 c51_bad() { # <fn> <kind>: prints why the key is not an identity, nothing if it is
     case "$2" in
-    key:*) grep -E "${2#key:}" <<<"$(c41_body "$1")" | grep -qE '!=|==' || echo "$1: no longer compares ${2#key:}" ;;
+    key:*) grep -E "${2#key:}" <<<"$(c41_body "$1")" | has -E '!=|==' || echo "$1: no longer compares ${2#key:}" ;;
     calls:*) grep -q "${2#calls:}(" <<<"$(c41_body "$1")" || echo "$1: no longer calls ${2#calls:}" ;;
     none:*) ;;
     *) echo "$1: unknown kind $2" ;;
@@ -2209,8 +2216,8 @@ C43_SAMPLE="$(ct_tmp c43).c"
 printf 'static int __cetrafs_thing_busy(struct super_block *sb,\n                                int x);\nint cetrafs_thing_alloc(struct super_block *sb)\n{\n    /* return -ENOSPC; */\n    return -ENOSPC;\n}\nstatic int __cetrafs_thing_busy(struct super_block *sb,\n                                int x)\n{\n    cetrafs_thing_wait();\n    return -EBUSY;\n}\nint cetrafs_alloc_pick_bg(struct super_block *sb)\n{\n    return -ENOSPC;\n}\nint cetrafs_thing_either(struct super_block *sb, bool lost)\n{\n    return lost ? -EBUSY : -ENOSPC;\n}\n' >"$C43_SAMPLE"
 [ "$(c43_names ENOSPC "$C43_SAMPLE" | tr '\n' ' ')" = "cetrafs_alloc_pick_bg cetrafs_thing_alloc cetrafs_thing_either " ] &&
     [ "$(c43_names EBUSY "$C43_SAMPLE" | grep -c .)" = 2 ] &&
-    c43_names EBUSY "$C43_SAMPLE" | grep -qx __cetrafs_thing_busy &&
-    c43_names EBUSY "$C43_SAMPLE" | grep -qx cetrafs_thing_either &&
+    c43_names EBUSY "$C43_SAMPLE" | has -x __cetrafs_thing_busy &&
+    c43_names EBUSY "$C43_SAMPLE" | has -x cetrafs_thing_either &&
     grep -q "cetrafs_thing_wait(" <<<"$(K="$(dirname "$C43_SAMPLE")" c41_body __cetrafs_thing_busy)" &&
     ! grep -q "cetrafs_sb_release_wait(" <<<"$(K="$(dirname "$C43_SAMPLE")" c41_body cetrafs_alloc_pick_bg)" &&
     pass "class 43: control -- planted originators are found (a __ one too, its body past its prototype), a comment is not, and a pick that stopped waiting is seen" ||
@@ -2643,7 +2650,7 @@ any_fn_body() { # <file> <fn>: fn_body, for static and exported functions alike
 unhandled_check() { # <files...>: callers of cetrafs_lba_run_check() that never mention -EAGAIN
     local c
     for c in $(fns_with 'cetrafs_lba_run_check[(]' "$@"); do
-        any_fn_body "$(dirname "$1")/${c%%:*}" "${c#*:}" | grep -q -- '-EAGAIN' || echo "$c"
+        any_fn_body "$(dirname "$1")/${c%%:*}" "${c#*:}" | has -- '-EAGAIN' || echo "$c"
     done
 }
 CK="$(fns_with 'cetrafs_lba_run_check[(]' "$K"/*.c)"
@@ -2657,19 +2664,21 @@ BOOL_OK='file.c:cetrafs_scrub_tree_bread file.c:cetrafs_tree_invalidate_cached'
 BC="$(fns_with 'cetrafs_lba_run_is_data[(]' "$K"/*.c | tr '\n' ' ' | sed 's/ $//')"
 [ "$BC" = "$BOOL_OK" ] && pass "class 48: the boolean address check is used only where 'not data' decides nothing" ||
     fail "class 48: cetrafs_lba_run_is_data() callers changed: '$BC' (reviewed: '$BOOL_OK') -- a caller that marks, drops or zeroes on 'not data' must use cetrafs_lba_run_check()"
-any_fn_body "$K/alloc.c" cetrafs_bg_id_for_lba | grep -q 'cetrafs_sb_layout_refresh' &&
-    any_fn_body "$K/alloc.c" cetrafs_bg_id_for_lba | grep -q -- '-EAGAIN' &&
+any_fn_body "$K/alloc.c" cetrafs_bg_id_for_lba | has 'cetrafs_sb_layout_refresh' &&
+    any_fn_body "$K/alloc.c" cetrafs_bg_id_for_lba | has -- '-EAGAIN' &&
     pass "class 48: the Block Group lookup refreshes before it answers 'outside every region'" ||
     fail "class 48: cetrafs_bg_id_for_lba() no longer refreshes the layout or answers -EAGAIN"
 # A claim's recount counts the members of the layout it holds: it must
 # catch up with the device after the swap and before the recount, or a
 # grown member the previous owner claimed is "corrected" out of the
 # aggregate (tests/kernel/zg_claim_behind_grow.sh).
-# The definition, not the forward declaration above it: the last body.
-C48CL="$(awk '$0 ~ "^[a-z_].*[ *]__cetrafs_zg_try_claim_one[(]" { buf = ""; on = 1 } on { buf = buf $0 "\n" } on && /^}/ { last = buf; on = 0 } END { printf "%s", last }' "$K/zonegroup.c" | grep -nE 'cetrafs_sb_layout_refresh|cetrafs_zg_reconcile_free_counts\(sb, zg_id[,)]' | tail -2 | cut -d: -f2- | grep -oE 'cetrafs_[a-z_]+' | tr '\n' ' ' || true)"
+# The recount runs in the claim's post-swap work, outside the claim
+# mutex (audit 2026-11-15 BM-39): cetrafs_zg_claim_post(). The
+# definition, not the forward declaration above it: the last body.
+C48CL="$(awk '$0 ~ "^[a-z_].*[ *]cetrafs_zg_claim_post[(]" { buf = ""; on = 1 } on { buf = buf $0 "\n" } on && /^}/ { last = buf; on = 0 } END { printf "%s", last }' "$K/zonegroup.c" | grep -nE 'cetrafs_sb_layout_refresh|cetrafs_zg_reconcile_free_counts\(sb, zg_id[,)]' | tail -2 | cut -d: -f2- | grep -oE 'cetrafs_[a-z_]+' | tr '\n' ' ' || true)"
 [ "$C48CL" = "cetrafs_sb_layout_refresh cetrafs_zg_reconcile_free_counts " ] &&
     pass "class 48: a Zone Group claim catches the layout up before it recounts" ||
-    fail "class 48: __cetrafs_zg_try_claim_one() no longer refreshes the layout before the claim's recount ('$C48CL')"
+    fail "class 48: cetrafs_zg_claim_post() no longer refreshes the layout before the claim's recount ('$C48CL')"
 SAMPLE="$(ct_tmp c48-sample).c"
 printf 'static int cetrafs_new_reader(struct super_block *sb)\n{\n    if (cetrafs_lba_run_check(sb, 5, 1))\n        cetrafs_sb_corrupt(sb, 0);\n    return 0;\n}\n' >"$SAMPLE"
 [ "$(unhandled_check "$SAMPLE")" = "$(basename "$SAMPLE"):cetrafs_new_reader" ] &&
