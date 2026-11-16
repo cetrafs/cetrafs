@@ -1222,7 +1222,8 @@ C27_ALLOW="
 file.c:cetrafs_write_new_leaf a-new-block,-unreachable-until-published
 file.c:cetrafs_write_new_index a-new-block,-unreachable-until-published
 file.c:cetrafs_tree_convert_inner the-editor,-under-invalidate_lock-exclusive
-file.c:cetrafs_tree_append the-editor,-under-invalidate_lock-exclusive
+file.c:cetrafs_tree_append_inner the-editor,-under-invalidate_lock-exclusive
+file.c:cetrafs_tree_leaves_if_half a-count-for-a-warning,-called-by-the-editors-under-invalidate_lock-exclusive
 file.c:cetrafs_tree_split_leaf the-editor,-under-invalidate_lock-exclusive-(asserted);-its-new-leaf-a-new-block
 file.c:cetrafs_tree_insert_any_leaf the-editor,-under-invalidate_lock-exclusive-(asserted)
 file.c:cetrafs_idx_insert_keep_last the-editor,-reads-only-after-cetrafs_bh_begin_update_crc-takes-the-buffer-lock
@@ -1237,7 +1238,7 @@ file.c:cetrafs_tree_patch the-editor,-under-invalidate_lock-exclusive-(asserted)
 file.c:cetrafs_tree_meta_set via-cetrafs_tree_free_meta_except,-whose-callers-hold-invalidate_lock-exclusive
 file.c:cetrafs_tree_meta_is_ours the-old-tree,-under-invalidate_lock-exclusive
 file.c:cetrafs_tree_invalidate_cached drop-only;-an-entry-torn-by-a-local-edit-names-a-block-current-in-the-cache
-xattr.c:cetrafs_xattr_set_locked the-editor,-under-the-namespace-lock-and-the-VFS-inode-lock
+xattr.c:cetrafs_xattr_write_new its-own-new-block,-named-by-nothing
 leafdefer.c:cetrafs_deferred_settle_locked its-caller-holds-lock_buffer
 defrag.c:cetrafs_defrag_read_extents under-invalidate_lock-exclusive-(cetrafs_defrag_inode_lock)
 "
@@ -1672,7 +1673,11 @@ xattr.c:cetrafs_xattr_slot_free:returns bool, not an error
 uuid.c:cetrafs_serial_usable:returns bool, not an error
 zonegroup.c:cetrafs_bg_release_empty:log only
 zonegroup.c:cetrafs_zg_try_claim_one:acts (counts a claim) only on success
-zonegroup.c:cetrafs_bg_data_block_stats:fast-path pick; an error falls to the full scan'
+zonegroup.c:cetrafs_bg_data_block_stats:fast-path pick; an error falls to the full scan
+file.c:cetrafs_pending_next:an in-memory lookup; nonzero only means nothing pending
+inode.c:cetrafs_node_get_entry:acts (judges the create gone) only on success; an error keeps the record
+ioutil.c:cetrafs_journal_node_is_dirty:true branch excuses a tear; an error counts it as damage, the strict answer
+node.c:cetrafs_node_entry_blank:returns bool, not an error'
 failopen_sites() {
     for f in "$@"; do
         grep -nE '(cetrafs_[a-z0-9_]+\([^;]*&[^;]*\)[[:space:]]*==[[:space:]]*0[[:space:]]*&&)|(![[:space:]]*cetrafs_[a-z0-9_]+\([^;]*&[^;]*\)[[:space:]]*&&)' "$f" |
@@ -1934,7 +1939,10 @@ fd_mutators() { # <files...>: names of the mutators passed to the fd CAS
 fd_unchecked() { # <file> <mutator...>: the ones whose body never compares file_seq
     local f="$1"; shift
     for fn in "$@"; do
+        # Or the whole sector against the bytes judged, file_seq among
+        # them (the half-landed settle's cetrafs_landed_fd_mutate()).
         awk -v fn="$fn" '$0 ~ "^static int " fn "\\(" { on = 1 } on && /file_seq/ && /(!=|==)/ { hit = 1 }
+            on && /memcmp\(image, ctx->seed, CETRAFS_INODE_FD_BYTES\)/ { hit = 1 }
             on && /^}/ { on = 0 } END { exit !hit }' "$f" || echo "$fn"
     done
 }
@@ -1961,7 +1969,9 @@ for fn in $FDM; do
 done
 # 4: cetrafs_unborn_fd_mutate (review F-11) swaps only a never-written
 # sector -- all zeros, file_seq 0 -- and stamps a new file_seq
-[ "$(echo $FDM | wc -w)" = 4 ] || fail "class 9: $(echo $FDM | wc -w) file-sector CAS mutators (pinned at 4: $(echo $FDM)) -- review the new one and update the pin"
+# 5: cetrafs_landed_fd_mutate (233f6f9) replaces a half-landed create's
+# file sector only if it is still, byte for byte, the one judged dead.
+[ "$(echo $FDM | wc -w)" = 5 ] || fail "class 9: $(echo $FDM | wc -w) file-sector CAS mutators (pinned at 5: $(echo $FDM)) -- review the new one and update the pin"
 [ -z "${FDU// /}" ] && pass "class 9: every file-sector CAS mutator that publishes compares file_seq ($(echo $FDM); stamp-only: $(echo $FDS))" ||
     fail "class 9: a file-sector CAS mutator publishes without comparing file_seq: $FDU"
 SAMPLE="$(ct_tmp fdmut).c"
@@ -2002,7 +2012,9 @@ cetrafs_deferred_forget_range none:the-held-back-set-changes-under-the-buffer-lo
 cetrafs_inode_forget_tree none:an-on-disk-record-not-a-cache
 cetrafs_sb_nslock_forget none:a-release-queue-entry-not-a-cache
 cetrafs_nswait_forget none:a-per-task-deadline-not-a-cache
-cetrafs_file_cache_drop_count none:a-counter'
+cetrafs_file_cache_drop_count none:a-counter
+cetrafs_pending_forget_cached calls:filemap_invalidate_lock
+cetrafs_sb_half_landed_forget safe:a-straddling-first-sight-restarts-the-clock-which-only-delays-a-settle'
 c41_names() { # <files...>: every function whose name says it drops cached state
     grep -hoE '^(static )?(inline )?(void|bool|int|u32|u64) \*?cetrafs_[a-z0-9_]*(cache_drop|expire|invalidate|forget)[a-z0-9_]*\(' "$@" |
         grep -oE 'cetrafs_[a-z0-9_]*' | sort -u
@@ -2075,7 +2087,9 @@ cetrafs_tree_invalidate_cached none:an-invalidate-class-41
 cetrafs_inode_is_allocated_fresh none:a-forced-fresh-read-not-a-cache
 cetrafs_inode_ns_held_by_current none:a-lock-holder-test
 cetrafs_nswait_is_current key:start_time
-cetrafs_xattr_trusted_list none:the-trusted-xattr-namespace'
+cetrafs_xattr_trusted_list none:the-trusted-xattr-namespace
+cetrafs_lock_alloc_tree_trusted calls:cetrafs_inode_note_stamp
+cetrafs_pending_forget_cached none:an-invalidate-class-41'
 c51_names() { # <files...>: every function whose name says it trusts cached state
     grep -hoE '^(static )?(inline )?(void|bool|int|u32|u64) \*?cetrafs_[a-z0-9_]*(cache_lookup|_cached|_trusted|_current|_fresh|_key_matches)[a-z0-9_]*\(' "$@" |
         grep -oE 'cetrafs_[a-z0-9_]*' | sort -u
@@ -2139,10 +2153,15 @@ cetrafs_bmap_cas_mutate below:one-region-the-caller-tries-the-next
 cetrafs_inode_bitmap_cas_alloc final:every-inode-number-in-use-a-free-in-flight-holds-its-number-until-published
 cetrafs_leaf_array_insert final:a-full-leaf-the-caller-splits
 cetrafs_leaf_array_punch final:no-room-for-the-split-nothing-changed
-cetrafs_tree_append final:the-extent-tree-is-full
+cetrafs_tree_append_inner final:the-extent-tree-is-full
+cetrafs_tree_append_room final:the-extent-tree-is-full-asked-before-a-convert-edits-it
 cetrafs_tree_insert_any_leaf final:every-interior-and-every-leaf-full-under-invalidate_lock-exclusive
 cetrafs_tree_build final:the-extent-tree-is-full
-cetrafs_xattr_set_locked final:the-xattr-block-is-full
+cetrafs_xattr_edit final:the-xattr-block-is-full
+cetrafs_journal_write_block_flags final:the-device-refused-the-write-no-space-thin-pool-the-mount-runs-on
+cetrafs_sync_new_buffer final:the-device-refused-the-write-no-space-thin-pool-or-test-injection
+cetrafs_write_locked_bh final:the-device-refused-the-write-no-space-thin-pool-or-test-injection
+cetrafs_write_bhs_status final:test-injection-what-a-full-thin-pool-answers
 cetrafs_node_register final:every-registry-row-taken
 cetrafs_dir_add_entry final:the-directory-is-at-CETRAFS_DIR_MAX_BLOCKS
 cetrafs_tree_resv_fill final:test-injection-convert_append_nospc
@@ -2164,7 +2183,11 @@ cetrafs_nslock_mutate below:a-cas-callback-held-by-another
 cetrafs_zg_cas_mutate below:a-cas-callback-owned-by-a-live-peer
 cetrafs_caw_scsi below:a-miscompare-the-cas-loop-re-reads
 cetrafs_node_fence_peer_full below:the-peer-came-back-callers-wait-as-for-a-live-holder
-cetrafs_journal_replay_node below:the-node-came-back-its-own-mount-replays
+cetrafs_journal_replay_node_scoped below:the-node-came-back-its-own-mount-replays
+cetrafs_journal_dead_refs final:test-injection-scrub_dead_journal_whole
+cetrafs_journal_retire_row_ok final:an-operator-retirement-of-a-row-that-is-not-stale-refused
+cetrafs_journal_retire_node final:another-node-holds-the-replay-claim-on-the-area
+cetrafs_node_declare_dead final:an-operator-declaration-of-a-row-seen-beating-refused
 cetrafs_bg_release_bitmap_ready below:not-released-the-heartbeat-tries-later
 cetrafs_journal_settle_range below:a-live-entry-or-a-batch-in-progress-the-group-is-kept-for-a-later-pass
 cetrafs_bg_release_one below:kept-for-a-later-pass
@@ -2199,7 +2222,9 @@ cetrafs_rebuild_recheck final:a-peer-arrived-after-the-new-map-was-computed-wait
 cetrafs_fd_write_mutate final:a-peer-changed-the-file-since-the-plan-a-stale-map-must-not-publish
 cetrafs_evict_inode below:a-peer-uses-it-the-number-stays-allocated-the-scrub-reclaims-it
 cetrafs_lock_write_gate final:the-lock-is-suspended-flock-lock_ex-takes-it-back
-cetrafs_xattr_peer_user final:a-peer-holds-or-reads-the-file-on-a-fresh-read'
+cetrafs_xattr_peer_user final:a-peer-holds-or-reads-the-file-on-a-fresh-read
+cetrafs_ns_apply_xattr_guarded final:a-peer-opened-the-file-seen-inside-the-publishing-swap-nothing-applied
+cetrafs_lock_arm_stale_steal below:a-live-holder-the-flock-and-resume-loops-poll-it'
 C43_REG_ENOENT='cetrafs_dir_extents_get_unchecked final:the-directory-is-gone-on-a-fresh-read
 cetrafs_dir_add_entry final:the-directory-is-gone-on-a-fresh-read
 cetrafs_dir_remove_entry final:the-name-is-gone-under-the-namespace-lock
@@ -2323,7 +2348,10 @@ cetrafs_mkdir_locked own:a-dirent-block-never-published
 cetrafs_do_allocate own:blocks-never-published-held-in-the-reservation-registry
 cetrafs_falloc_run_give_back_span own:the-unused-rest-of-a-fallocate-run-never-published
 __cetrafs_get_block own:a-block-never-published
-cetrafs_tree_append own:a-leaf-or-index-never-published
+cetrafs_tree_append_inner own:a-leaf-or-index-never-published
+cetrafs_tree_resv_fill own:a-tree-block-reserve-fill-nothing-references-given-back-before-its-reservation-is-unpublished
+cetrafs_xattr_write_new own:its-new-block-named-by-nothing-on-failure
+cetrafs_bg_release_one own:test-injection-release_noop_free-of-an-already-free-block
 cetrafs_tree_split_leaf own:a-new-leaf-whose-write-failed-before-any-interior-names-it
 cetrafs_tree_build own:a-tree-never-published
 cetrafs_tree_patch own:leaves-and-interiors-it-wrote-and-never-published
@@ -2333,7 +2361,8 @@ cetrafs_tree_resv_release own:the-unused-tree-block-reserve-of-a-convert-never-p
 cetrafs_evict_inode recheck:cetrafs_free_inode_begin
 __cetrafs_truncate_shrink recheck:cetrafs_rebuild_peer_present
 cetrafs_fallocate recheck:cetrafs_rebuild_peer_present
-cetrafs_xattr_set_locked recheck:cetrafs_xattr_peer_user
+cetrafs_xattr_set_locked own:a-new-block-its-failed-publish-never-named
+cetrafs_xattr_swap_block recheck:cetrafs_xattr_publish
 scrub_free_confirmed recheck:cetrafs_free_data_extent_unless_reserved
 cetrafs_defrag_inode held:the-defrag-pin-on-the-whole-file-lock
 cetrafs_defrag_commit held:inside-cetrafs_defrag_inode-s-pin
@@ -2407,7 +2436,14 @@ scrub.c:scrub_reconcile_stopped_op:alive -> skip; the live holder releases and p
 zonegroup.c:cetrafs_zg_claim_one_more_locked:alive -> not a candidate (keep)
 zonegroup.c:cetrafs_zg_log_foreign_free_leak:log only
 zonegroup.c:cetrafs_zg_scrub_adopt_one_stale:alive -> skip (keep)
-zonegroup.c:__cetrafs_zg_try_claim_one:alive -> leave the Zone Group (keep)'
+zonegroup.c:__cetrafs_zg_try_claim_one:alive -> leave the Zone Group (keep)
+zonegroup.c:cetrafs_zg_settle_owner:alive -> no fence, no replay; the claim judges the owner again (keep)
+inode.c:cetrafs_half_born_settle:alive -> its create may still be running, the half-born record is left (keep)
+journal.c:cetrafs_journal_dead_refs:alive -> its entries are not collected; its blocks are in Zone Groups it owns, which this scrub never judges, and taking one over replays its journal first (keep)
+journal.c:cetrafs_journal_live_opener:alive -> a live opener, its entry is kept (keep)
+journal.c:cetrafs_journal_retire_row_ok:alive -> the operator'"'"'s retirement is refused (keep)
+lock.c:cetrafs_lock_arm_stale_steal:alive -> no steal; the flock and resume loops poll the holder (keep)
+lock.c:cetrafs_lock_foreign_user_would_wait:alive -> chooses only where the settle runs; the settle judges again (keep)'
 live_callers() {
     for f in "$@"; do
         awk -v F="$(basename "$f")" '
@@ -2451,7 +2487,9 @@ defrag.c:cetrafs_defrag_inode:the never-committed tail of its destination run
 lock.c:cetrafs_inode_drop_reservation:a reservation remainder, never written or referenced
 lock.c:cetrafs_inode_set_reservation:a reservation remainder, never written or referenced
 file.c:cetrafs_falloc_run_give_back_span:a fallocate run remainder, never written or referenced
-scrub.c:scrub_free_confirmed:a block re-read unreferenced, under the reservation recheck'
+scrub.c:scrub_free_confirmed:a block re-read unreferenced, under the reservation recheck
+file.c:__cetrafs_get_block:a regular file'"'"'s sparse unit its failed append never put on the device (a leaf edit is held back; that fails only on a torn-down mount or leaf_defer_off)
+alloc.c:cetrafs_bg_release_one:TEST ONLY (release_noop_free): a free of a block already free'
 DOFREE_OK='file.c:__cetrafs_truncate_shrink:after the record CAS that publishes the new tree
 file.c:cetrafs_fallocate:the punch, after the record CAS that publishes the new tree'
 free_callers() {
@@ -2494,7 +2532,8 @@ printf 'static void cetrafs_new_freer(struct super_block *sb)\n{\n    cetrafs_fr
 log "checking fsck restamps only valid records and justifies every early repair (class 45)"
 FSCK_C="$ROOT/userspace/fsck.c"
 RESTAMP_OK='fsck_write_inode:the writer itself
-fsck_lost_found:writes the new record it built'
+fsck_lost_found:writes the new record it built
+fsck_write_dead_record:writes a new dead record, only over one that is not a valid record (zeros, half born, half landed)'
 restampers() { # <file> -> fn names that restamp a record without the check
     awk '
         /^[a-z_][a-z0-9_ *]*\(/ && !/;$/ { if (fn != "" && hit && !chk) print fn; fn = $0; sub(/\(.*/, "", fn); n = split(fn, a, " "); fn = a[n]; sub(/^\*+/, "", fn); hit = 0; chk = 0 }
@@ -2563,7 +2602,11 @@ scrub.c:scrub_free_confirmed:the judge itself
 file.c:cetrafs_do_allocate:blocks never published, held in the reservation registry until given back (H2)
 file.c:cetrafs_falloc_run_give_back_span:the unused rest of a fallocate run, never published, held in the reservation registry until given back (H2)
 file.c:__cetrafs_get_block:a block it allocated and never published
-file.c:cetrafs_tree_append:a leaf or index it allocated and never published
+file.c:cetrafs_tree_append_inner:a leaf or index it allocated and never published
+lock.c:cetrafs_tree_resv_fill:a reserve fill nothing references, given back before its reservation is unpublished
+xattr.c:cetrafs_xattr_write_new:its own new block, named by nothing
+xattr.c:cetrafs_xattr_set_locked:a new block its failed publish never named (the old block goes through cetrafs_xattr_swap_block'"'"'s bracket)
+alloc.c:cetrafs_bg_release_one:TEST ONLY (release_noop_free): a free of a block already free
 file.c:cetrafs_tree_split_leaf:a new leaf whose write failed, before any interior names it
 file.c:cetrafs_tree_build:a tree it built and never published
 file.c:cetrafs_tree_patch:leaves and interiors it wrote and never published
@@ -2602,7 +2645,7 @@ post_publish_frees() {
 # post-publish free in a listed function is reported too
 PP_OK='defrag.c:cetrafs_defrag_commit:2:inside its only caller'"'"'s bracket (cetrafs_defrag_inode)
 dir.c:cetrafs_mkdir_locked:2:its own new dirent block, with the number it goes back with -- no publish named it alive
-file.c:__cetrafs_get_block:2:a block the failed append never published (a directory'"'"'s publish is a different block)'
+file.c:__cetrafs_get_block:3:a block or sparse unit the failed append never published (a directory'"'"'s publish is a different block; a regular file'"'"'s leaf edit is held back, which fails only on a torn-down mount or leaf_defer_off)'
 PPC="$(post_publish_frees "$K"/*.c | cut -d: -f1,2 | sort | uniq -c | awk '{print $2 ":" $1}')"
 PPU="$(while IFS= read -r l; do [ -n "$l" ] && ! grep -q "^$l:" <<<"$PP_OK" && echo "$l"; done <<<"$PPC" || true)"
 [ -z "$PPU" ] && pass "class 46: every free after a record publish is bracketed, or its sites are counted with their cover" ||
@@ -2611,7 +2654,7 @@ PSAMPLE="$(ct_tmp pp-sample).c"
 printf 'static int cetrafs_do_allocate(struct inode *inode)\n{\n    cetrafs_write_raw_inode_fd(sb, 1, raw, inode);\n    cetrafs_tree_free_meta(inode, old);\n}\n' >"$PSAMPLE"
 [ -n "$(post_publish_frees "$PSAMPLE")" ] && pass "class 46: control -- a free after a publish is found per call site, whatever the list says" ||
     fail "class 46: control -- a free after a publish is not found"
-for b in __cetrafs_truncate_shrink cetrafs_defrag_inode cetrafs_xattr_set_locked cetrafs_fallocate cetrafs_do_allocate; do
+for b in __cetrafs_truncate_shrink cetrafs_defrag_inode cetrafs_xattr_swap_block cetrafs_fallocate cetrafs_do_allocate; do
     grep -q "cetrafs_frees_begin" <<<"$(awk "/^[a-z_].*[ *]$b\\(/,/^}/" "$K"/*.c)" ||
         fail "class 46: $b no longer brackets its post-publish frees with cetrafs_frees_begin()"
 done
@@ -2778,7 +2821,9 @@ cetrafs_falloc_map_build writes:the-plan-the-publish-is-built-over
 cetrafs_free_inline_extents frees:a-directorys-blocks
 cetrafs_read_index_bh wraps:cetrafs_read_tree_bh
 cetrafs_read_leaf_bh wraps:cetrafs_read_tree_bh
-cetrafs_tree_append writes:the-tree
+cetrafs_tree_append_inner writes:the-tree
+cetrafs_tree_append_room writes:the-room-check-before-a-convert-edits-the-tree
+cetrafs_evict_reread_claimed frees:the-claimed-dead-records-tree
 cetrafs_tree_convert_inner writes:the-tree
 cetrafs_tree_free_meta frees:the-trees-own-blocks
 cetrafs_tree_insert_any_leaf writes:the-tree
