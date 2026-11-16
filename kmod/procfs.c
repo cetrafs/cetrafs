@@ -153,9 +153,6 @@ static int cetrafs_proc_info_show(struct seq_file *m, void *v)
      * lock and refuses no open (nofilelock; set at mount, fixed for life). */
     seq_printf(m, "file_lock: %s\n", cetrafs_sb_file_lock_enabled(sb) ? "on" : "off");
     seq_printf(m, "fenced: %s\n", cetrafs_sb_is_fenced(sb) ? "yes" : "no");
-    /* No: require_mount_check=0 let this mount skip mount.cetrafs's
-     * transport check (F-28). */
-    seq_printf(m, "mount_checked: %s\n", cetrafs_sb_transport_checked(sb) ? "yes" : "no");
     /* Block 0's copy, as found at mount: ok, stale or bad (A-7). */
     seq_printf(m, "sb_copy: %s\n", cetrafs_sb_copy_state_name(sb));
     /* Why (docs/internal/ERRORS.md): none, fenced, lease, error,

@@ -168,18 +168,9 @@ In this repo:
   + replacement_timeout`.
 
   for multipath and single-path initiators alike (no multipath: the last
-  term is zero). `mount.cetrafs` checks it from sysfs and refuses a device
-  that breaks it -- and one whose timers it cannot read, or whose
-  `replacement_timeout` is -1 (no limit). A device-mapper node that is not
-  a multipath map (LVM, dm-crypt, a kpartx partition of a map) is checked
-  through the devices under it. `-o x-cetrafs.queue-ok` overrides, for a
-  cluster that fences in hardware.
-
-  The module refuses a mount that did not come through `mount.cetrafs`
-  (`mount -i`, a direct mount(2), a node with the module and not the
-  tools): install the tools and mount with `mount -t cetrafs`. The module
-  option `require_mount_check=0` turns that refusal off, for a node whose
-  mounts are known to be safe.
+  term is zero). An iSCSI `replacement_timeout` of -1 (no limit) breaks it
+  by definition. Nothing checks this at mount time: setting the timers is
+  the operator's job, as is hardware fencing where a cluster has it.
 
   A `controls` change lasts until the volume is unmounted; the next mount
   takes the module option again. The module option is read when a volume

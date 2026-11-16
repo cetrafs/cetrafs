@@ -367,15 +367,14 @@ scrub:background leak scrub on/off; off leaks until fsck, never frees
 scrub_interval_secs:scrub period (0 means the default)
 scrub_gap_secs:scrub pacing (0 means the default)
 hb_interval_secs:heartbeat period for new mounts; clamped 1..3600 (cetrafs_param_hb_interval_secs)
-require_mount_check:the mount.cetrafs gate; off is a site decision (hardware fencing, the harnesses), logged on every change and shown per mount as info mount_checked (F-28)
 stale_secs:stale window for new mounts; refused above 240, clamped 3..240 and to >= 3 beats (cetrafs_param_stale_secs)
 node_uuid:load-time only (0444): this node identity
 pf_full_backoff_ms:pending-free queue backoff (latency)
 pf_drain_min_ms:pending-free drain rate limit (latency)
 lock_yield_wait_ms:how long an open waits for a background defrag to yield (latency); killable, clamped to 10 min, 0 refuses at once as before
 own_claim_resweep_secs:delay of the late own-claim sweep; every clear is judged under the inode lock_mutex, 0 (off) leaves stray claims as they were'
-# A callback parameter is a parameter too (stale_secs, require_mount_check
-# are): only a TEST ONLY description takes one out of this list.
+# A callback parameter is a parameter too (stale_secs
+# is): only a TEST ONLY description takes one out of this list.
 plain_params() {
     local f n
     for f in "$@"; do
@@ -993,16 +992,8 @@ for o in $OPTS; do
     CASE="$(awk -v o="case $o:" '$0 ~ o { f = 1; next } f && /break;|case Opt_/ { exit } f { print }' "$FS")"
     SETF="$(sed -n 's/.*fci->\([a-z_]*\)_set = true.*/\1/p' <<<"$CASE")"
     VALF="$(sed -n 's/.*fci->\([a-z_]*\) = .*/\1/p' <<<"$CASE" | grep -v '_set$' | awk 'NR == 1')"
-    # transport_checked is an attestation, not a mode: cetrafs_get_tree()
-    # judges it for EVERY mount, a second one included, before the
-    # superblock is looked up -- there is nothing for a second mount to
-    # differ from. It is still applied (info's mount_checked).
-    if [ "$o" = Opt_transport_checked ]; then
-        [ -n "$VALF" ] || BAD35="$BAD35 $o(sets nothing)"
-    else
-        [ -n "$SETF" ] && [ -n "$VALF" ] || { BAD35="$BAD35 $o(no value or _set in its case)"; continue; }
-        grep -q "fci->${SETF}_set" <<<"$UNMET" || BAD35="$BAD35 $o(not compared on a second mount)"
-    fi
+    [ -n "$SETF" ] && [ -n "$VALF" ] || { BAD35="$BAD35 $o(no value or _set in its case)"; continue; }
+    grep -q "fci->${SETF}_set" <<<"$UNMET" || BAD35="$BAD35 $o(not compared on a second mount)"
     grep -E "sbi->[a-z_]+ = .*fci->$VALF\b" "$FS" | has . || BAD35="$BAD35 $o(never applied to the superblock)"
 done
 [ -z "$BAD35" ] && pass "class 35: every mount option ($(echo $OPTS)) is applied and checked on a second mount" ||
