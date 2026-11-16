@@ -360,7 +360,7 @@ scrub:background leak scrub on/off; off leaks until fsck, never frees
 scrub_interval_secs:scrub period (0 means the default)
 scrub_gap_secs:scrub pacing (0 means the default)
 hb_interval_secs:heartbeat period for new mounts; clamped 1..3600 (cetrafs_param_hb_interval_secs)
-stale_secs:stale window for new mounts; clamped 3..86400 and to >= 3 beats (cetrafs_param_stale_secs)
+stale_secs:stale window for new mounts; refused above 240, clamped 3..240 and to >= 3 beats (cetrafs_param_stale_secs)
 node_uuid:load-time only (0444): this node identity
 pf_full_backoff_ms:pending-free queue backoff (latency)
 pf_drain_min_ms:pending-free drain rate limit (latency)

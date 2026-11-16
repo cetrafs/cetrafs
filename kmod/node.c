@@ -1755,16 +1755,45 @@ int cetrafs_node_mark_offline(struct super_block *sb, u32 my_node_id)
  * the default for mounts made after a write, so a site whose multipath
  * queues I/O longer than the default window can raise it persistently
  * (modprobe.d, README). The suites also use it to compress timing. A
- * mount takes it clamped to 3..86400 s and to at least three heartbeat
+ * mount takes it clamped to 3..240 s and to at least three heartbeat
  * intervals (cetrafs_param_stale_secs()). Too small and an ordinarily
  * slow node gets reclaimed out from under itself -- the controls file
  * keeps a live change within 15..240.
  */
 unsigned int cetrafs_stale_secs = CETRAFS_NODE_STALE_SECS;
-module_param_named(stale_secs, cetrafs_stale_secs, uint, 0644);
+
+/* TEST ONLY: a stale_secs above CETRAFS_STALE_MAX_SECS is accepted, as
+ * before audit 2026-11-15 BM-41 (tests/kernel/stale_param_bound.sh). */
+bool cetrafs_stale_param_unbounded;
+cetrafs_test_param(stale_param_unbounded, cetrafs_stale_param_unbounded, bool, 0644);
+MODULE_PARM_DESC(stale_param_unbounded, "TEST ONLY: the stale_secs parameter accepts values above 240");
+
+/*
+ * Above CETRAFS_STALE_MAX_SECS a window is one no peer honours: a row
+ * advertising it reads as illegal and is watched for four of its beats
+ * instead, and the lease, sized from what peers will wait, shrinks with
+ * it -- 300 configured, 45 s of lease, and "stale_secs: 300" everywhere
+ * (audit 2026-11-15 BM-41). Refused, so a modprobe.d line saying it
+ * fails the load rather than the cluster.
+ */
+static int cetrafs_stale_secs_set(const char *val, const struct kernel_param *kp)
+{
+    unsigned int v;
+    int ret = kstrtouint(val, 0, &v);
+
+    if (ret)
+        return ret;
+    if (v > CETRAFS_STALE_MAX_SECS && !READ_ONCE(cetrafs_stale_param_unbounded)) {
+        pr_err("stale_secs=%u refused: peers honour a window of at most %u s\n", v, CETRAFS_STALE_MAX_SECS);
+        return -EINVAL;
+    }
+    return param_set_uint(val, kp);
+}
+static const struct kernel_param_ops cetrafs_stale_secs_ops = {.set = cetrafs_stale_secs_set, .get = param_get_uint};
+module_param_cb(stale_secs, &cetrafs_stale_secs_ops, &cetrafs_stale_secs, 0644);
 MODULE_PARM_DESC(stale_secs,
                  "seconds a peer may stall before it is treated as dead, for mounts made after a write (default 120; "
-                 "clamped to 3..86400 and to at least 3 heartbeats). The controls file sets it per mount within 15..240");
+                 "at most 240, and at least 3 heartbeats). The controls file sets it per mount within 15..240");
 
 /* TEST ONLY: make the no-CAW mount gate's live-peer check report a live
  * foreign peer unconditionally, skipping the heartbeat watch. On the loop

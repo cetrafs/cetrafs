@@ -6601,7 +6601,6 @@ void cetrafs_sb_set_auto_defrag_enabled(struct super_block *sb, bool on)
  */
 #define CETRAFS_PARAM_HB_MAX_SECS    CETRAFS_HB_INTERVAL_MAX_SECS /* what observers clamp a beat to (audit C2) */
 #define CETRAFS_PARAM_STALE_MIN_SECS 3u
-#define CETRAFS_PARAM_STALE_MAX_SECS 86400u
 
 unsigned int cetrafs_param_hb_interval_secs(void)
 {
@@ -6616,8 +6615,10 @@ unsigned int cetrafs_param_hb_interval_secs(void)
  * 3 x CETRAFS_PARAM_HB_MAX_SECS is still under the cap. */
 unsigned int cetrafs_param_stale_secs(void)
 {
-    unsigned int v = clamp_t(unsigned int, READ_ONCE(cetrafs_stale_secs), CETRAFS_PARAM_STALE_MIN_SECS,
-                             CETRAFS_PARAM_STALE_MAX_SECS);
+    /* Never above what peers honour (audit 2026-11-15 BM-41): the
+     * parameter refuses it, and this keeps a mount from taking one. */
+    unsigned int hi = READ_ONCE(cetrafs_stale_param_unbounded) ? 86400u : CETRAFS_STALE_MAX_SECS;
+    unsigned int v = clamp_t(unsigned int, READ_ONCE(cetrafs_stale_secs), CETRAFS_PARAM_STALE_MIN_SECS, hi);
 
     return max_t(unsigned int, v, CETRAFS_STALE_MIN_BEATS * cetrafs_param_hb_interval_secs());
 }
