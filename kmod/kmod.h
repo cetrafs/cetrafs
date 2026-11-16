@@ -376,6 +376,7 @@ bool cetrafs_sb_auto_defrag_enabled(struct super_block *sb);
 bool cetrafs_sb_file_lock_enabled(struct super_block *sb);
 bool cetrafs_sb_transport_checked(struct super_block *sb);
 extern atomic_t cetrafs_sb_kills; /* fs.c: kill_sb calls since load */
+extern bool cetrafs_ro_mount_leads; /* fs.c, TEST ONLY */
 void cetrafs_sb_set_defrag_enabled(struct super_block *sb, bool on);
 /* UNMAP state (fs.c; see cetrafs_sb_info.discard_enabled). */
 bool cetrafs_sb_discard_enabled(struct super_block *sb);

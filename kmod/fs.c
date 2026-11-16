@@ -3153,6 +3153,10 @@ int cetrafs_fill_super(struct super_block *sb, struct fs_context *fc)
                             "first mounter), overriding this node's default\n",
                             cluster_off ? "off" : "on");
                     sbi->file_lock_enabled = !cluster_off;
+                } else if (sb_rdonly(sb) && !READ_ONCE(cetrafs_ro_mount_leads)) {
+                    pr_info("mount: no live peer -- read-only, so this node sets no mode for the cluster "
+                            "(file_lock=%s here)\n",
+                            sbi->file_lock_enabled ? "on" : "off");
                 } else {
                     pr_info(
                         "mount: no live peer -- this node leads the cluster with "
@@ -3225,11 +3229,21 @@ int cetrafs_fill_super(struct super_block *sb, struct fs_context *fc)
             return -EACCES;
         }
 
-        /* Find/claim this node's Node Registry row. */
+        /* Find/claim this node's Node Registry row. A read-only mount
+         * advertises no mode: an observer follows the cluster's mode and
+         * never sets it. Its row said ON, so a first mounter that only
+         * looked fixed the mode for every node after it and refused
+         * every nofilelock writer (audit 2026-11-15 BM-42). It is safe
+         * in either mode itself: it never holds a write, so every cache
+         * it trusts is gated on a change stamp or read fresh. */
         {
             u8 node_uuid[CETRAFS_NODE_UUID_LEN];
-            int rc = cetrafs_node_register(sb, sbi->file_lock_enabled ? CETRAFS_FLOCK_MODE_ON : CETRAFS_FLOCK_MODE_OFF,
-                                           &sbi->node_id, node_uuid);
+            u32 adv = sbi->file_lock_enabled ? CETRAFS_FLOCK_MODE_ON : CETRAFS_FLOCK_MODE_OFF;
+            int rc;
+
+            if (sb_rdonly(sb) && !READ_ONCE(cetrafs_ro_mount_leads))
+                adv = CETRAFS_FLOCK_MODE_UNSET;
+            rc = cetrafs_node_register(sb, adv, &sbi->node_id, node_uuid);
 
             if (rc) {
                 pr_err("node registration failed: %d\n", rc);
@@ -8445,6 +8459,12 @@ static int cetrafs_check_second_mount(struct fs_context *fc)
  * loop devices with no transport at all).
  */
 static bool cetrafs_require_mount_check = true;
+
+/* TEST ONLY: a read-only mount advertises its file-lock mode like any
+ * other, as before BM-42 (tests/kernel/ro_mount_no_lead.sh). */
+bool cetrafs_ro_mount_leads;
+cetrafs_test_param(ro_mount_leads, cetrafs_ro_mount_leads, bool, 0644);
+MODULE_PARM_DESC(ro_mount_leads, "TEST ONLY: a read-only mount sets the cluster's file-lock mode, as before");
 
 /* A gate an operator turns off says so in the log, and each
  * mount it lets in says so in info (mount_checked) -- one modprobe.d
