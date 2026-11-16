@@ -5709,6 +5709,18 @@ static int cetrafs_sweep_recount_flush(struct super_block *sb, struct cetrafs_sw
     return ret;
 }
 
+/* TEST ONLY: the sweep renews once per bitmap block, as before BM-21
+ * (tests/kernel/mount_sweep_beats.sh). */
+static bool cetrafs_sweep_beat_per_block;
+cetrafs_test_param(sweep_beat_per_block, cetrafs_sweep_beat_per_block, bool, 0644);
+MODULE_PARM_DESC(sweep_beat_per_block, "TEST ONLY: the mount's claim sweep renews once per bitmap block");
+
+/* TEST ONLY: the sweep sleeps this many ms per allocated record, as a
+ * cold read on a slow LUN takes. */
+static unsigned int cetrafs_sweep_read_stall_ms;
+cetrafs_test_param(sweep_read_stall_ms, cetrafs_sweep_read_stall_ms, uint, 0644);
+MODULE_PARM_DESC(sweep_read_stall_ms, "TEST ONLY: the mount's claim sweep sleeps this many ms per allocated record");
+
 int cetrafs_lock_sweep_own_claims(struct super_block *sb, u32 my_node_id)
 {
     const cetrafs_superblock_t *raw_sb = cetrafs_sb_raw(sb);
@@ -5750,6 +5762,17 @@ int cetrafs_lock_sweep_own_claims(struct super_block *sb, u32 my_node_id)
             if (!(bh->b_data[i >> 3] & (1 << (i & 7))))
                 continue;
             seen++;
+            /* Per record, not per bitmap block: a block covers 32768
+             * numbers, and at a cold read each that was minutes between
+             * renewals against a lease of 105 s (audit 2026-11-15
+             * BM-21). Renews at most once per interval. */
+            if (!READ_ONCE(cetrafs_sweep_beat_per_block)) {
+                ret = cetrafs_sb_mount_beat(sb);
+                if (ret)
+                    break;
+            }
+            if (READ_ONCE(cetrafs_sweep_read_stall_ms))
+                msleep(READ_ONCE(cetrafs_sweep_read_stall_ms)); /* TEST ONLY */
             ret = cetrafs_read_raw_inode_walk(sb, ino, &raw);
             if (ret == -ENODATA) {
                 ret = 0;

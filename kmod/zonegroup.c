@@ -3325,6 +3325,12 @@ static int cetrafs_zg_drain_one(struct super_block *sb, u32 zg_id, bool may_wait
         int aret, mret;
 
         ctrace("PFDRAIN zg=%u lba=%llu count=%u\n", zg_id, (unsigned long long) first, got[e].count);
+        /* One queue can hold thousands of entries, a bitmap swap each:
+         * the mount-time drain renews between them, not only between
+         * groups (BM-21). A no-op from the heartbeat; a fence it finds
+         * is reported by the next group's beat, and the frees refuse on
+         * their own meanwhile. */
+        (void) cetrafs_sb_mount_beat(sb);
         if (applied && (ms = xchg(&cetrafs_pf_apply_stall_ms, 0)))
             msleep(ms); /* TEST ONLY, one-shot */
         if (last < first) {
