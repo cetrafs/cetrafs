@@ -1293,7 +1293,44 @@ static inline int cetrafs_repair_renew(int fd, const cetrafs_superblock_t *sb, u
  * by nobody else while the timer runs. A renewal that finds the row
  * taken sets cetrafs_repair_lost for the work loop to stop on.
  */
-static volatile sig_atomic_t cetrafs_repair_lost; /* 1: our row was taken; 2: a node is live */
+static int cetrafs_renew_fd = -1;
+static volatile sig_atomic_t cetrafs_repair_lost; /* 1: our row was taken; 2: a node is live; 3: lease lapsed */
+
+/*
+ * The claim's lease, as a node's (cetrafs_sb_lease_renewed()): a watcher
+ * calls a claim dead once its hb_seq has not moved for
+ * CETRAFS_REPAIR_PROBE_SECS at the least, and then reaps it -- so a
+ * repairer whose own renewals stalled (its paths gone, its I/O queued)
+ * was still writing when a node reaped the claim and mounted (audit
+ * 2026-11-15 BM-64, BM-65). Now a tool whose last LANDED renewal is
+ * older than this stops writing, before any watcher can give up on it.
+ * One-way: a renewal that lands later does not reopen what a node may
+ * already have taken. Writes already queued in the device path are the
+ * transport's (A-6; persistent reservations are G-11).
+ */
+#define CETRAFS_REPAIR_LEASE_SECS (2 * CETRAFS_REPAIR_RENEW_SECS)
+_Static_assert(CETRAFS_REPAIR_LEASE_SECS < CETRAFS_REPAIR_PROBE_SECS,
+               "a repairer must stop writing before the shortest watch can call it dead");
+static volatile long cetrafs_renew_ok_at;           /* CLOCK_MONOTONIC s: the start of the last landed renewal */
+static unsigned cetrafs_renew_stall_secs;           /* TEST ONLY: the next renewal is stuck this long */
+static int cetrafs_renew_no_lease;                  /* TEST ONLY: the control -- no lease */
+
+static inline long cetrafs_mono_secs(void) /* async-signal-safe */
+{
+    struct timespec ts;
+
+    clock_gettime(CLOCK_MONOTONIC, &ts);
+    return (long) ts.tv_sec;
+}
+
+/* Every repair write asks this first: 0 to go on, else why to stop. */
+static inline int cetrafs_repair_write_gate(void)
+{
+    if (cetrafs_renew_fd >= 0 && !cetrafs_repair_lost && !cetrafs_renew_no_lease &&
+        cetrafs_mono_secs() - cetrafs_renew_ok_at > CETRAFS_REPAIR_LEASE_SECS)
+        cetrafs_repair_lost = 3;
+    return cetrafs_repair_lost;
+}
 /* Set by a tool that works on a MOUNTED volume through the kernel (a
  * live grow): mounted nodes beating under its claim are expected, not a
  * node that got in, so the watch for them is off. Losing its own row
@@ -1301,7 +1338,6 @@ static volatile sig_atomic_t cetrafs_repair_lost; /* 1: our row was taken; 2: a 
  * renewal died on the first write after a peer's heartbeat
  * (GROWFS-LIVE-REVIEW M1). */
 static volatile sig_atomic_t cetrafs_repair_peers_expected;
-static int cetrafs_renew_fd = -1;
 static cetrafs_superblock_t cetrafs_renew_sb;
 static uint32_t cetrafs_renew_row;
 
@@ -1361,13 +1397,28 @@ static inline int cetrafs_repair_node_beat(int fd, const cetrafs_superblock_t *s
 static void cetrafs_repair_tick(int sig)
 {
     int saved = errno;
+    long t0 = cetrafs_mono_secs();
 
     (void) sig;
-    if (cetrafs_renew_fd >= 0 && cetrafs_repair_renew(cetrafs_renew_fd, &cetrafs_renew_sb, cetrafs_renew_row) != 0)
+    if (cetrafs_renew_fd >= 0 && cetrafs_renew_stall_secs) {
+        unsigned s = cetrafs_renew_stall_secs;
+
+        cetrafs_renew_stall_secs = 0;
+        cetrafs_sleep_full(s); /* TEST ONLY: this renewal's write stuck in the device path */
+    }
+    if (cetrafs_renew_fd >= 0 && cetrafs_repair_renew(cetrafs_renew_fd, &cetrafs_renew_sb, cetrafs_renew_row) != 0) {
         cetrafs_repair_lost = 1;
-    else if (cetrafs_renew_fd >= 0 && !cetrafs_repair_lost && !cetrafs_repair_peers_expected &&
-             cetrafs_repair_node_beat(cetrafs_renew_fd, &cetrafs_renew_sb, cetrafs_renew_row))
-        cetrafs_repair_lost = 2;
+    } else if (cetrafs_renew_fd >= 0) {
+        /* Landed -- but a watcher saw nothing from t0 until now, and
+         * the gap since the previous one counts too. */
+        if (!cetrafs_renew_no_lease && !cetrafs_repair_lost &&
+            (cetrafs_mono_secs() - cetrafs_renew_ok_at > CETRAFS_REPAIR_LEASE_SECS))
+            cetrafs_repair_lost = 3;
+        cetrafs_renew_ok_at = t0;
+        if (!cetrafs_repair_lost && !cetrafs_repair_peers_expected &&
+            cetrafs_repair_node_beat(cetrafs_renew_fd, &cetrafs_renew_sb, cetrafs_renew_row))
+            cetrafs_repair_lost = 2;
+    }
     errno = saved;
 }
 
@@ -1414,6 +1465,9 @@ static inline void cetrafs_repair_timer(int fd, const cetrafs_superblock_t *sb, 
     cetrafs_renew_sb = *sb;
     cetrafs_renew_row = row;
     cetrafs_repair_watch_arm(fd, sb, row);
+    cetrafs_renew_stall_secs = (unsigned) cetrafs_test_env_ll("CETRAFS_TEST_REPAIR_RENEW_STALL_SECS", 0, 600, 0);
+    cetrafs_renew_no_lease = cetrafs_test_env("CETRAFS_TEST_REPAIR_NO_LEASE") != NULL;
+    cetrafs_renew_ok_at = cetrafs_mono_secs(); /* the claim itself landed just now */
     cetrafs_renew_fd = fd;
     sa.sa_handler = cetrafs_repair_tick;
     sa.sa_flags = SA_RESTART;

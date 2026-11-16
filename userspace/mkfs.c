@@ -112,6 +112,14 @@ static void write_block(int fd, u64 block_num, const void *data, bool do_write)
 {
     if (!do_write)
         return;
+    /* While mkfs holds a registry claim (formatting over an old volume):
+     * its row taken, a node beating, or its own renewal stalled past the
+     * lease -- stop before writing more (devutil.h). */
+    if (cetrafs_repair_write_gate())
+        die("%s -- stopping before writing more",
+            cetrafs_repair_lost == 2   ? "a node is mounted on this volume while it is being formatted"
+            : cetrafs_repair_lost == 3 ? "mkfs's registry claim was not renewed in time (a node may call it dead)"
+                                       : "mkfs's registry claim was taken away");
     pwrite_all(fd, data, CETRAFS_BLOCK_SIZE, (off_t) block_num * CETRAFS_BLOCK_SIZE);
 }
 

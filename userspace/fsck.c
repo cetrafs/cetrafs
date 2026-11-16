@@ -139,6 +139,12 @@ static cetrafs_superblock_t repair_sb;
  * between beats. */
 static void fsck_repair_lost_check(void)
 {
+    if (cetrafs_repair_write_gate() == 3) {
+        /* The claim's own renewal stalled past its lease (devutil.h). */
+        fprintf(stderr, "ERR: this repair's registry claim was not renewed in time -- a node may call it dead "
+                        "and mount; stopping before writing more\n");
+        exit(FSCK_EXIT_NOEXAM);
+    }
     if (cetrafs_repair_lost == 2) {
         /* The timer saw a node beating under the claim (devutil.h). */
         fprintf(stderr, "ERR: a node is mounted on this volume while it is being repaired -- stopping before "

@@ -134,10 +134,11 @@ static void write_block(int fd, u64 lba, const void *data, bool do_write)
         return;
     /* The claim's timer found our row taken, or a node beating under it
      * (devutil.h): writing on would relocate tables under a live mount. */
-    if (cetrafs_repair_lost)
+    if (cetrafs_repair_write_gate())
         die("%s -- stopping before writing more",
-            cetrafs_repair_lost == 2 ? "a node is mounted on this volume while it is being grown"
-                                     : "this grow's registry claim was taken away");
+            cetrafs_repair_lost == 2   ? "a node is mounted on this volume while it is being grown"
+            : cetrafs_repair_lost == 3 ? "this grow's registry claim was not renewed in time (a node may call it dead)"
+                                       : "this grow's registry claim was taken away");
     pwrite_all(fd, data, CETRAFS_BLOCK_SIZE, (off_t) lba * CETRAFS_BLOCK_SIZE);
 }
 
