@@ -1757,8 +1757,23 @@ static bool cetrafs_mount_unswept_clean;
 cetrafs_test_param(mount_unswept_clean, cetrafs_mount_unswept_clean, bool, 0644);
 MODULE_PARM_DESC(mount_unswept_clean, "TEST ONLY: a mount failing before its own-claim sweep departs clean");
 
+/* TEST ONLY: a fatal error (cetrafs_sb_fatal()) at fail point N, the
+ * mount carrying on as a phase that only logs its failure would
+ * (tests/kernel/mount_stopped_refused.sh). */
+static unsigned int cetrafs_mount_fatal_at;
+cetrafs_test_param(mount_fatal_at, cetrafs_mount_fatal_at, uint, 0644);
+MODULE_PARM_DESC(mount_fatal_at, "TEST ONLY: stop the mount with a fatal error at fail point N and carry on");
+
+/* TEST ONLY: a mount that stopped while mounting reports success, as
+ * before audit 2026-11-15 BM-20. */
+static bool cetrafs_mount_stopped_ok;
+cetrafs_test_param(mount_stopped_ok, cetrafs_mount_stopped_ok, bool, 0644);
+MODULE_PARM_DESC(mount_stopped_ok, "TEST ONLY: a mount that stopped while mounting still succeeds");
+
 #define CETRAFS_MOUNT_FAIL_POINT(stage)                                                  \
     do {                                                                                 \
+        if (unlikely(cetrafs_mount_fatal_at == (stage)))                                 \
+            cetrafs_sb_fatal(sb, "TEST: fatal error at mount stage %u", (unsigned int) (stage)); \
         if (unlikely(cetrafs_mount_fail_at == (stage))) {                                \
             pr_warn("TEST: failing the mount after stage %u\n", (unsigned int) (stage)); \
             cetrafs_free_sb_info(sb);                                                    \
@@ -3725,6 +3740,26 @@ int cetrafs_fill_super(struct super_block *sb, struct fs_context *fc)
     else
         pr_info("%s: UNMAP not supported by the device: no discard at hand-back or fstrim\n", sb->s_id);
 
+    /*
+     * A phase that only logs its own failure may still have stopped the
+     * mount on the way (a refused metadata write, an undecidable swap:
+     * cetrafs_sb_fatal()), and a lease that ran out latches the same
+     * way. Reporting success then handed the caller a mount that fails
+     * every I/O with EIO, and dropped the reason it stopped (audit
+     * 2026-11-15 BM-20): refuse it, as any other failure here.
+     */
+    if (READ_ONCE(sbi->fenced) || test_bit(0, &sbi->lease_lost)) {
+        if (READ_ONCE(cetrafs_mount_stopped_ok)) {
+            pr_warn("%s: TEST mount_stopped_ok -- reporting a stopped mount (%s) as mounted\n", sb->s_id,
+                    cetrafs_sb_stop_cause_name(sb));
+        } else {
+            pr_err("%s: the mount stopped while mounting (%s) -- refusing it\n", sb->s_id,
+                   cetrafs_sb_stop_cause_name(sb));
+            cetrafs_free_sb_info(sb);
+            brelse(bh);
+            return -EIO;
+        }
+    }
     brelse(bh);
     pr_info("mounted OK: Z=%u, B=%u, bg_size=%llu blocks, data@%llu, node_id=%u\n", sbi->zg_count, sbi->layout->bg_count,
             (unsigned long long) sbi->bg_size_blocks, (unsigned long long) sbi->bg_regions_start, sbi->node_id);
