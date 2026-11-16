@@ -632,6 +632,11 @@ int main(int argc, char **argv)
 
     const char *dev = argv[1];
 
+    /* The device comes first and options follow; "mkfs.cetra -f /dev/x"
+     * used to open "-f" (audit 2026-11-14 M-35). */
+    if (dev[0] == '-')
+        die_arg("the device comes first: %s <device> [options] (got '%s' where the device goes)", argv[0], dev);
+
     u32 zg_count = 16;                                 /* default: see zg_explicit */
     bool zg_explicit = false;
     u64 bg_size_bytes = CETRAFS_DEFAULT_BG_SIZE_BYTES; /* default 1 GiB */
@@ -756,6 +761,10 @@ int main(int argc, char **argv)
             return 2; /* bad option */
         }
     }
+    /* Anything left is not an option: "mkfs.cetra /dev/x 8T" formatted
+     * the whole LUN and dropped the 8T (M-35). The size is -s. */
+    if (optind < argc - 1)
+        die_arg("unexpected argument '%s' (a size is given with -s)", argv[1 + optind]);
 
     /* Default: one Zone Group per node that may ever write (A-13). */
     if (!zg_explicit)

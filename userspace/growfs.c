@@ -393,6 +393,9 @@ int main(int argc, char **argv)
 
     const char *dev = argv[1];
     bool dry_run = false;
+
+    if (dev[0] == '-')
+        die_arg("the device comes first: %s <device> [options] (got '%s' where the device goes)", argv[0], dev);
     u64 want_bytes = 0;
     int opt;
 
@@ -411,6 +414,10 @@ int main(int argc, char **argv)
             return 2;
         }
     }
+    /* "growfs.cetra /dev/x 3T" grew to the whole device and dropped the
+     * 3T -- irreversibly (M-35, BM-62). The size is -s. */
+    if (optind < argc - 1)
+        die_arg("unexpected argument '%s' (a size is given with -s)", argv[1 + optind]);
 
     /*
      * The offline premise, enforced before anything is read for a
