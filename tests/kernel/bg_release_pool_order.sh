@@ -16,6 +16,12 @@
 # reads FREE (bg_release_stall_ms) while a writer fills the first and
 # has to claim the second back.
 #
+# The claimant stands in for a PEER: since a pool claim takes
+# release_rwsem for read (audit 2026-11-14 A-2), a claim on the releasing
+# node waits the release out, and only another node's claim -- which no
+# local lock orders -- can land inside it. release_claim_unlocked=1 lets
+# this node's claim through as a peer's would.
+#
 # CONTROL (second half): bg_release_credit_late restores the old order;
 # the same moves must leave the shard drifted (fsck ERR, a refused debit).
 set -euo pipefail
@@ -29,7 +35,7 @@ MNT="$(ct_mnt bgpool)"
 compress_timing
 ct_track mnt "$MNT"
 # Registered here, in the suite's own shell, so ct_exit restores them.
-for k in bg_release_off bg_release_credit_late bg_release_stall_ms; do
+for k in bg_release_off bg_release_credit_late bg_release_stall_ms release_claim_unlocked; do
     ct_param_set "$k" "$(cat /sys/module/cetrafs/parameters/$k)"
 done
 RES="$(ct_tmp bgpool-res)"
@@ -66,6 +72,7 @@ round() {
     wait_for 20 'dmesg_since "'"$mark"'" | grep -q "BG 1: release stalled"' ||
         { fail "setup: the release of Block Group 1 never started"; ct_exit; }
     ct_param_set bg_release_stall_ms 0
+    ct_param_set release_claim_unlocked 1 # a peer's claim: see the header
     # The writer needs more than the first Block Group has left: it must
     # claim the second, which reads FREE right now.
     dd if=/dev/zero of="$MNT/w" bs=1M count=64 conv=fsync status=none 2>/dev/null || true
@@ -75,6 +82,7 @@ round() {
     wait_for 25 'dmesg_since "'"$mark"'" | grep -q "BG 1 handed back"' || true
     ct_param_set bg_release_off 1
     ct_param_set bg_release_credit_late 0
+    ct_param_set release_claim_unlocked 0
     n="$(dmesg_since "$mark" | grep -c "claimed but its pool shard debit failed" || true)"
     ct_umount "$MNT"
     err="$(ct_fsck "$DEV" 2>&1 | grep -c '^ERR' || true)"
