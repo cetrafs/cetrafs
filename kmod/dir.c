@@ -162,6 +162,44 @@ static bool cetrafs_dirent_block_valid(const struct buffer_head *bh)
 /* As cetrafs_dirent_bread(), saying why a NULL came back: -EUCLEAN when
  * every attempt read the block and found it damaged, -EIO when the
  * device failed a read. */
+/* TEST ONLY: a dirent block that stays torn under a peer's namespace
+ * lock counts as damage, as before audit 2026-11-15 M-16
+ * (tests/kernel/dirent_tear_under_peer_lock.sh). */
+static bool cetrafs_dirent_tear_lock_ignored;
+cetrafs_test_param(dirent_tear_lock_ignored, cetrafs_dirent_tear_lock_ignored, bool, 0644);
+MODULE_PARM_DESC(dirent_tear_lock_ignored, "TEST ONLY: a torn dirent block under a peer's namespace lock is damage");
+
+/*
+ * Every dirent write runs under its directory's namespace lock, and is
+ * journaled. A block that stays torn while ANOTHER node holds that lock
+ * is that node's write: in flight on a slow path, or stopped by its
+ * death -- and then the reclaim that breaks the lock replays its
+ * journal first (cetrafs_inode_ns_lock()), which rewrites the block.
+ * Counted as damage, one node's crash raised needs-fsck on every node
+ * that listed the directory within the stale window, and stopped each
+ * of them under corruption=stop (audit 2026-11-15 M-16/BM-26). Read
+ * fresh: an older copy can only say "held" of a lock since released,
+ * which defers the verdict to the next read, never skips it for good.
+ */
+static bool cetrafs_dirent_tear_explained(struct super_block *sb, u64 ino, u64 lba)
+{
+    cetrafs_inode_t raw;
+    u32 owner, me;
+
+    if (!ino || READ_ONCE(cetrafs_dirent_tear_lock_ignored) || cetrafs_sb_get_node_id(sb, &me))
+        return false;
+    cetrafs_invalidate_raw_inode(sb, ino);
+    if (cetrafs_read_raw_inode(sb, ino, &raw))
+        return false;
+    owner = cetrafs_le32(raw.ns_lock_owner);
+    if (owner == CETRAFS_NODE_ID_NONE || owner == me)
+        return false;
+    pr_warn_ratelimited("dirent block %llu of directory ino=%llu reads torn while node %u holds its namespace lock -- "
+                        "that node's write, in flight or awaiting replay: not counted as damage\n",
+                        (unsigned long long) lba, (unsigned long long) ino, owner);
+    return true;
+}
+
 static struct buffer_head *cetrafs_dirent_bread_why(struct super_block *sb, u64 ino, u64 generation, u64 lba,
                                                     int *why)
 {
@@ -203,6 +241,10 @@ static struct buffer_head *cetrafs_dirent_bread_why(struct super_block *sb, u64 
         pr_err_ratelimited("dirent block %llu could not be read (%d of %d attempts failed) -- I/O error\n",
                            (unsigned long long) lba, CETRAFS_DIRENT_READ_RETRIES - nbad,
                            CETRAFS_DIRENT_READ_RETRIES);
+        return NULL;
+    }
+    if (cetrafs_dirent_tear_explained(sb, ino, lba)) {
+        *why = -EAGAIN;
         return NULL;
     }
     pr_err("dirent block %llu failed its tail checksum %d times -- corrupted, not just a torn concurrent read\n",
