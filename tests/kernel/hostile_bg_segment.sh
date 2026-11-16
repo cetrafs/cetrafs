@@ -12,7 +12,15 @@
 #
 #  A. the segment copied onto the inode table;
 #  B. the segment copied into Block Group 0;
-#  C. the segment where the grow put it (control).
+#  C. the segment where the grow put it (control);
+#  D. a segment describing no Block Group (count 0): a grow adds at
+#     least one, and empty segments are what let a hostile chain run a
+#     million links -- each one a read, and the overlap check quadratic
+#     in them, in mount context (audit 2026-11-14 M-31). Refused by name.
+#     The old code also refused this one chain, for its tally ("describes
+#     N of M"); what the name proves is that the walk stops at the first
+#     empty segment. The scale itself (killable walk, sorted overlap
+#     check) is not reproduced here: it needs a million-group superblock.
 #
 # Each copy verifies in every byte: only its placement is wrong.
 #
@@ -69,4 +77,15 @@ try B refused
 log "C: control -- the segment where the grow put it"
 grown
 try C mounted
+
+log "D: a segment that describes no Block Group"
+grown
+"$SEG_POKE" "$DEV" count 0 >/dev/null
+blockdev --flushbufs "$DEV"
+MARK="$(dmesg_mark)"
+rc=0
+mount -t cetrafs "$DEV" "$MNT" 2>/dev/null || rc=$?
+[ "$rc" = 0 ] && umount "$MNT"
+[ "$rc" != 0 ] && dmesg_since "$MARK" | grep -q "describes no Block Group" &&
+    pass "D: the empty segment was refused by name" || fail "D: mount rc=$rc, not refused as an empty segment"
 ct_exit

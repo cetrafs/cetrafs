@@ -21,7 +21,9 @@
 #include <linux/module.h>
 #include <linux/mutex.h>
 #include <linux/sched.h>
+#include <linux/sched/signal.h>
 #include <linux/slab.h>
+#include <linux/sort.h>
 #include <linux/spinlock.h>
 #include <linux/stddef.h>
 #include <linux/string.h>
@@ -59,6 +61,31 @@ static bool cetrafs_sb_bg_discard_pending_ignored(struct cetrafs_sb_info *sbi, u
 struct cetrafs_lba_range {
     u64 start, end; /* [start, end) */
 };
+
+static int cetrafs_lba_range_cmp(const void *a, const void *b)
+{
+    const struct cetrafs_lba_range *x = a, *y = b;
+
+    return x->start < y->start ? -1 : x->start > y->start;
+}
+
+/* Does [lba, lba+count) touch any of n ranges SORTED by start and not
+ * overlapping each other? O(log n). */
+static bool cetrafs_lba_ranges_hit(const struct cetrafs_lba_range *r, u32 n, u64 lba, u64 count)
+{
+    u32 lo = 0, hi = n;
+
+    /* the first range ending past lba */
+    while (lo < hi) {
+        u32 mid = lo + (hi - lo) / 2;
+
+        if (r[mid].end <= lba)
+            lo = mid + 1;
+        else
+            hi = mid;
+    }
+    return lo < n && r[lo].start < lba + count;
+}
 
 /*
  * The Block Group layout: everything that describes WHICH Block Groups
@@ -1220,7 +1247,7 @@ static int cetrafs_layout_walk(struct super_block *sb, struct cetrafs_bg_layout 
         u64 first = le64_to_cpu(ondisk->bg_table_first_count);
         u64 seg_lba = le64_to_cpu(ondisk->bg_table_next);
         u64 tbl = le64_to_cpu(ondisk->bg_table_start);
-        u32 filled = 0, guard = 0;
+        u32 filled = 0, guard = 0, cap = 0;
 
         /* Zero on a volume that has never been grown: the table is the
          * contiguous run it has always been. */
@@ -1264,6 +1291,14 @@ static int cetrafs_layout_walk(struct super_block *sb, struct cetrafs_bg_layout 
                 rc = -EUCLEAN;
                 goto out;
             }
+            /* One read per segment, up to a million on a hostile chain:
+             * killable, and never a soft lockup (audit 2026-11-14 M-31,
+             * BM-19). */
+            if (fatal_signal_pending(current)) {
+                rc = -EINTR;
+                goto out;
+            }
+            cond_resched();
             if (fresh)
                 cetrafs_invalidate_block(sb, seg_lba);
             sbh = sb_bread(sb, seg_lba);
@@ -1293,6 +1328,15 @@ static int cetrafs_layout_walk(struct super_block *sb, struct cetrafs_bg_layout 
             }
 
             cnt = le32_to_cpu(seg->count);
+            /* A grow adds at least one Block Group, so a segment with
+             * none is damage -- and it is what let a chain grow to a
+             * million segments without describing a single group. */
+            if (!cnt) {
+                pr_err("BG table segment at %llu describes no Block Group\n", (unsigned long long) seg_lba);
+                brelse(sbh);
+                rc = -EUCLEAN;
+                goto out;
+            }
             /*
              * Checked BEFORE the loop, not after it. 'cnt' comes off the
              * device and 'filled' is a u32: a segment claiming four
@@ -1349,8 +1393,9 @@ static int cetrafs_layout_walk(struct super_block *sb, struct cetrafs_bg_layout 
                 rc = -EUCLEAN;
                 goto out;
             }
-            {
-                void *n = krealloc(segs, (nsegs + 1) * sizeof(*segs), GFP_KERNEL);
+            if (nsegs == cap) {
+                u32 ncap = cap ? cap * 2 : 8;
+                void *n = krealloc_array(segs, ncap, sizeof(*segs), GFP_KERNEL);
 
                 if (!n) {
                     brelse(sbh);
@@ -1358,6 +1403,9 @@ static int cetrafs_layout_walk(struct super_block *sb, struct cetrafs_bg_layout 
                     goto out;
                 }
                 segs = n;
+                cap = ncap;
+            }
+            {
                 segs[nsegs].start = seg_lba;
                 segs[nsegs].end = seg_lba + 1 + cnt;
                 nsegs++;
@@ -1395,18 +1443,22 @@ walked:
      * writes the other's. Checked against the fixed tables and the Block
      * Groups only, never each other (audit 2026-11-06 M2).
      */
+    /* Sorted, so each pair is the neighbours: O(n log n) where the
+     * pairwise compare was O(n^2) -- 10^12 compares on a hostile chain,
+     * in mount context, unkillable (M-31). The Block Group checks below
+     * and cetrafs_sb_lba_run_hits_bg_table() search it. */
     {
-        u32 a, c;
+        u32 a;
 
-        for (a = 0; a < nsegs; a++)
-            for (c = a + 1; c < nsegs; c++)
-                if (segs[a].start < segs[c].end && segs[c].start < segs[a].end) {
-                    pr_err("BG table segments [%llu,%llu) and [%llu,%llu) overlap -- refusing\n",
-                           (unsigned long long) segs[a].start, (unsigned long long) segs[a].end,
-                           (unsigned long long) segs[c].start, (unsigned long long) segs[c].end);
-                    rc = -EUCLEAN;
-                    goto out;
-                }
+        sort(segs, nsegs, sizeof(*segs), cetrafs_lba_range_cmp, NULL);
+        for (a = 1; a < nsegs; a++)
+            if (segs[a].start < segs[a - 1].end) {
+                pr_err("BG table segments [%llu,%llu) and [%llu,%llu) overlap -- refusing\n",
+                       (unsigned long long) segs[a - 1].start, (unsigned long long) segs[a - 1].end,
+                       (unsigned long long) segs[a].start, (unsigned long long) segs[a].end);
+                rc = -EUCLEAN;
+                goto out;
+            }
     }
 
     for (b = from; b < nbg; b++) {
@@ -1415,7 +1467,6 @@ walked:
         u64 t = 0, bstart = 0, blen = 0, dstart = 0;
         u32 owner = CETRAFS_NODE_ID_NONE;
         u16 bflags = 0;
-        u32 si;
         int brc;
 
         /* Read the next window ahead, as one plugged batch: one
@@ -1438,6 +1489,10 @@ walked:
             }
             blk_finish_plug(&plug);
             cond_resched();
+            if (fatal_signal_pending(current)) {
+                rc = -EINTR; /* a mount reading a million descriptors stays killable */
+                goto out;
+            }
         }
         /* Same single pass also records which Zone Group owns each
          * Block Group, which is what lets ownership be answered from
@@ -1470,13 +1525,10 @@ walked:
         /* A descriptor segment inside a Block Group is a table the
          * allocator will write data over, and data a descriptor update
          * will write over. */
-        for (si = 0; !brc && si < nsegs; si++) {
-            if (segs[si].start < bstart + blen && bstart < segs[si].end) {
-                pr_err("BG table segment [%llu,%llu) overlaps Block Group %u [%llu,+%llu) -- refusing\n",
-                       (unsigned long long) segs[si].start, (unsigned long long) segs[si].end, b,
-                       (unsigned long long) bstart, (unsigned long long) blen);
-                brc = -EUCLEAN;
-            }
+        if (!brc && blen && cetrafs_lba_ranges_hit(segs, nsegs, bstart, blen)) {
+            pr_err("a BG table segment overlaps Block Group %u [%llu,+%llu) -- refusing\n", b,
+                   (unsigned long long) bstart, (unsigned long long) blen);
+            brc = -EUCLEAN;
         }
         if (brc) {
             /*
@@ -4327,14 +4379,10 @@ bool cetrafs_sb_lba_run_in_bg_data(struct super_block *sb, u64 lba, u64 count)
 bool cetrafs_sb_lba_run_hits_bg_table(struct super_block *sb, u64 lba, u64 count)
 {
     struct cetrafs_bg_layout *l = cetrafs_sb_layout_of(sb->s_fs_info);
-    u32 i;
 
     if (!l)
         return true;
-    for (i = 0; i < l->bg_nsegs; i++)
-        if (lba < l->bg_segs[i].end && l->bg_segs[i].start < lba + count)
-            return true;
-    return false;
+    return cetrafs_lba_ranges_hit(l->bg_segs, l->bg_nsegs, lba, count);
 }
 
 const cetrafs_superblock_t *cetrafs_sb_raw(struct super_block *sb)
