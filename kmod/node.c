@@ -860,6 +860,12 @@ MODULE_PARM_DESC(reclaim_fence_no_dead, "TEST ONLY: a reclaim fence does not rec
 static int __cetrafs_node_peer_beating(struct super_block *sb, u32 node_id, bool *beating, bool during,
                                        struct cetrafs_row_mark *still);
 
+/* TEST ONLY: a declaration needs one of the row's beats of silence plus
+ * a margin, as 3fbf50d did (tests/kernel/declare_dead_beating.sh). */
+static bool cetrafs_declare_silence_one_beat;
+cetrafs_test_param(declare_silence_one_beat, cetrafs_declare_silence_one_beat, bool, 0644);
+MODULE_PARM_DESC(declare_silence_one_beat, "TEST ONLY: a declare-dead needs one beat of silence, not the lease");
+
 /* TEST ONLY: declare a row dead without watching it stand still, as
  * before audit 2026-11-15 F-38 (tests/kernel/declare_dead_beating.sh). */
 static bool cetrafs_declare_dead_unguarded;
@@ -887,7 +893,8 @@ int cetrafs_node_declare_dead(struct super_block *sb, u32 node_id, u32 incarnati
      * only notices at its next fence check, up to a heartbeat later
      * (audit 2026-11-15 F-38). So the row must be SEEN to stand still --
      * watched until it moves during this call (refused) or stays put for
-     * one of its beats plus a margin (cetrafs_node_peer_beating()) -- and
+     * its whole lease, three of its beats, plus a margin
+     * (cetrafs_node_peer_beating()) -- and
      * the fence CAS is
      * bound to the very mark that stood still (check_verdict): a beat
      * landing after the watch makes it write nothing.
@@ -2713,6 +2720,14 @@ static int __cetrafs_node_peer_beating(struct super_block *sb, u32 node_id, bool
         pi = min_t(u32, cetrafs_le32(ne.hb_interval_secs), CETRAFS_HB_INTERVAL_MAX_SECS);
         if (!pi)
             pi = CETRAFS_HEARTBEAT_INTERVAL_SECS;
+        /* A declaration (during) waits out the declared node's whole
+         * lease -- three of its beats (cetrafs_sb_lease_secs()) -- so a
+         * node that is merely slow has stopped writing on its own
+         * before every peer takes over from it. One beat plus a margin
+         * let a node 20 s silent be declared while its 45 s lease still
+         * ran (audit 2026-11-15 F-38). */
+        if (during && !READ_ONCE(cetrafs_declare_silence_one_beat))
+            pi *= 3;
         bound = (unsigned long) (READ_ONCE(cetrafs_peer_beating_wait_secs) ?: pi + 5) * HZ;
         if (time_after_eq(jiffies, since + bound)) {
             if (still)

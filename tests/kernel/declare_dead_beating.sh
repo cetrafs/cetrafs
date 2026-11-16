@@ -17,21 +17,31 @@
 #
 # DISCRIMINATION: declare_dead_unguarded=1 -- the beating row is
 # declared dead.
+#
+# And the silence it needs is the row's whole lease, three of its beats,
+# not one beat plus a margin (a node 20 s silent was declared while its
+# 45 s lease still ran):
+#   L. row 1 advertises a 4 s beat, beats, goes quiet for 12 s, beats
+#      again: the declaration made at the quiet start is refused.
+# DISCRIMINATION: declare_silence_one_beat=1 -- it is accepted at 9 s.
 set -euo pipefail
 . "$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)/lib/harness.sh"
 require_root
 require_module
 NPOKE="$(ct_helper node_poke)"
-IMG="$(ct_image 560 declbeat)"
-DEV="$(ct_loop "$IMG")"
+# A device per round: a row left registered would make the next mkfs on
+# the same device watch it out first.
+fresh() { DEV="$(ct_loop "$(ct_image 560 "declbeat$1")")"; }
 MNT="$(ct_mnt declbeat)"
 ct_track mnt "$MNT"
 ct_param_set declare_dead_unguarded 0
+ct_param_set declare_silence_one_beat 0
 field() { tr ' ' '\n' <<<"$2" | sed -n "s/^$1=//p" | head -1; }
 
 # <tag> <unguarded 0|1> -> RES
 round() {
     local ctl mark rc=0 e0 r
+    fresh "$1"
     ct_mkfs "$DEV" -z 1 -f >/dev/null
     ct_mount "$DEV" "$MNT"
     require_cetrafs_mount "$MNT"
@@ -54,6 +64,41 @@ round() {
     dmesg_since "$mark" | grep -q "row 1 is still beating" && RES="$RES said=yes" || RES="$RES said=no"
     ct_umount "$MNT"
 }
+
+# <tag> <one_beat 0|1> -> LRES
+round_l() {
+    local ctl mark rc=0 bpid
+    fresh "$1"
+    ct_mkfs "$DEV" -z 1 -f >/dev/null
+    ct_mount "$DEV" "$MNT"
+    require_cetrafs_mount "$MNT"
+    ctl="$(ct_procdir "$DEV")/controls"
+    "$NPOKE" "$DEV" 1 1 aa "$(date +%s)" 4 >/dev/null
+    "$NPOKE" "$DEV" 1 --inc 7 >/dev/null
+    "$NPOKE" "$DEV" 1 --beat >/dev/null
+    blockdev --flushbufs "$DEV"
+    echo "$2" >/sys/module/cetrafs/parameters/declare_silence_one_beat
+    (sleep 12; "$NPOKE" "$DEV" 1 --beat >/dev/null) &
+    bpid=$!
+    mark="$(dmesg_mark)"
+    echo "dead=1:7" >"$ctl" 2>/dev/null || rc=1
+    wait "$bpid" || true
+    echo 0 >/sys/module/cetrafs/parameters/declare_silence_one_beat
+    LRES="accepted=$([ "$rc" = 0 ] && echo yes || echo no) departure=$(field departure "$("$NPOKE" "$DEV" 1)")"
+    ct_umount "$MNT"
+}
+
+round_l l 0
+L="$LRES"
+log "L: $L"
+round_l lc 1
+LC="$LRES"
+log "L control (one beat of silence): $LC"
+[ "$(field accepted "$L")" = no ] && [ "$(field departure "$L")" = 0 ] &&
+    pass "L: a row quiet for 12 s of a 4 s beat, then beating again, was not declared ($L)" || fail "L: $L"
+[ "$(field accepted "$LC")" = yes ] &&
+    pass "L control: as before, one beat of silence was enough to declare it ($LC)" ||
+    fail "L control: $LC -- the suite does not reach the silence bound"
 
 round f 0
 F="$RES"
