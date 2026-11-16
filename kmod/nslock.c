@@ -422,9 +422,17 @@ out:
 }
 
 
+/* TEST ONLY: an operation called under the VFS's locks waits there for
+ * another node's replay of a dead holder, as before audit 2026-11-15
+ * BM-27 (tests/kernel/nslock_replay_claim_outside_vfs.sh). */
+static bool cetrafs_nslock_replay_waits_in_vfs;
+cetrafs_test_param(nslock_replay_waits_in_vfs, cetrafs_nslock_replay_waits_in_vfs, bool, 0644);
+MODULE_PARM_DESC(nslock_replay_waits_in_vfs, "TEST ONLY: a VFS-locked namespace operation waits for a peer's replay claim");
+
 /* One acquire attempt. Returns 0 on success, -EBUSY if a live peer holds
- * it, or another errno. */
-static int cetrafs_nslock_try(struct inode *inode, u32 my_node_id, bool *took_over, bool *owed)
+ * it, or another errno. vfs: the caller holds the VFS's locks and can
+ * restart (cetrafs_nslock_acquire_set_vfs()). */
+static int cetrafs_nslock_try(struct inode *inode, u32 my_node_id, bool *took_over, bool *owed, bool vfs)
 {
     struct super_block *sb = inode->i_sb;
     struct cetrafs_nslock_ctx ctx = {
@@ -476,7 +484,20 @@ static int cetrafs_nslock_try(struct inode *inode, u32 my_node_id, bool *took_ov
          * the lock, so nobody builds on a half-finished operation. */
         if (cetrafs_node_fence_peer(sb, cetrafs_le32(raw.ns_lock_owner), "a namespace lock"))
             return -EBUSY; /* not revoked: wait and try again, as for a live holder */
-        ret = cetrafs_journal_replay_node_scoped(sb, cetrafs_le32(raw.ns_lock_owner), /*wait_for_claim=*/true, 0);
+        /*
+         * Under the VFS's locks, not waiting for another node's replay
+         * of the holder: that wait has no bound of its own, and every
+         * task queued on the directory -- an ls, a lookup -- waited with
+         * it (audit 2026-11-15 BM-27). The operation restarts instead,
+         * outside them, and finds the journal replayed. Its own pass
+         * over the journal stays here: it is bounded by the journal's
+         * size, as the recount below is by the directory's.
+         */
+        ret = cetrafs_journal_replay_node_scoped(sb, cetrafs_le32(raw.ns_lock_owner),
+                                                 /*wait_for_claim=*/!vfs || READ_ONCE(cetrafs_nslock_replay_waits_in_vfs),
+                                                 0);
+        if (ret == -EEXIST && vfs)
+            return -EBUSY; /* a peer is replaying it: restart and look again */
         if (ret)
             return ret;
 
@@ -512,7 +533,7 @@ static int cetrafs_nslock_try(struct inode *inode, u32 my_node_id, bool *took_ov
  * caller decides whether exhaustion is terminal (a single acquire) or a
  * cue to back off and retry the whole set (acquire_set).
  */
-static int cetrafs_nslock_acquire_tries(struct inode *inode, int max_tries)
+static int cetrafs_nslock_acquire_tries(struct inode *inode, int max_tries, bool vfs)
 {
     struct super_block *sb = inode->i_sb;
     u64 deferred_gen = 0;
@@ -547,7 +568,7 @@ static int cetrafs_nslock_acquire_tries(struct inode *inode, int max_tries)
     for (attempt = 0; attempt < max_tries; attempt++) {
         bool took_over = false, owed = false;
 
-        ret = cetrafs_nslock_try(inode, my_node_id, &took_over, &owed);
+        ret = cetrafs_nslock_try(inode, my_node_id, &took_over, &owed, vfs);
         if (ret != -EBUSY) {
             if (!ret) {
                 ctrace("NSHOLD ino=%llu ACQ\n", (unsigned long long) inode->i_ino);
@@ -640,7 +661,7 @@ fail:
  */
 int cetrafs_nslock_acquire(struct inode *inode)
 {
-    int ret = cetrafs_nslock_acquire_tries(inode, CETRAFS_NSLOCK_RETRIES);
+    int ret = cetrafs_nslock_acquire_tries(inode, CETRAFS_NSLOCK_RETRIES, false);
 
     if (ret == -EBUSY)
         pr_err("nslock: ino=%llu could not acquire the namespace lock (holder not releasing and not stale)\n",
@@ -939,7 +960,7 @@ void cetrafs_nslock_release(struct inode *inode)
  * a rename within one directory) are skipped -- taking one twice would
  * self-deadlock on the local mutex.
  */
-static int __cetrafs_nslock_acquire_set(struct inode **inodes, int n, int rounds, int tries)
+static int __cetrafs_nslock_acquire_set(struct inode **inodes, int n, int rounds, int tries, bool vfs)
 {
     struct inode *ordered[CETRAFS_NSLOCK_MAX_SET];
     int count = 0, i, j, ret, round;
@@ -970,7 +991,7 @@ static int __cetrafs_nslock_acquire_set(struct inode **inodes, int n, int rounds
         for (i = 0; i < count; i++) {
             /* Short per-lock budget: a contended later lock must not pin
              * the earlier ones (hold-and-wait). */
-            ret = cetrafs_nslock_acquire_tries(ordered[i], tries);
+            ret = cetrafs_nslock_acquire_tries(ordered[i], tries, vfs);
             if (ret)
                 break;
         }
@@ -997,7 +1018,7 @@ static int __cetrafs_nslock_acquire_set(struct inode **inodes, int n, int rounds
 
 int cetrafs_nslock_acquire_set(struct inode **inodes, int n)
 {
-    int ret = __cetrafs_nslock_acquire_set(inodes, n, CETRAFS_NSLOCK_SET_ROUNDS, CETRAFS_NSLOCK_SET_TRIES);
+    int ret = __cetrafs_nslock_acquire_set(inodes, n, CETRAFS_NSLOCK_SET_ROUNDS, CETRAFS_NSLOCK_SET_TRIES, false);
 
     if (ret == -EBUSY)
         pr_err("nslock: could not acquire a %d-inode namespace set after %d rounds -- heavy directory contention\n",
@@ -1306,7 +1327,7 @@ int cetrafs_nslock_acquire_set_vfs(struct inode **inodes, int n)
 
     if (!cetrafs_nslock_can_restart())
         return cetrafs_nslock_acquire_set(inodes, n);
-    ret = __cetrafs_nslock_acquire_set(inodes, n, 1, 1);
+    ret = __cetrafs_nslock_acquire_set(inodes, n, 1, 1, true);
     if (ret != -EBUSY) {
         cetrafs_nswait_forget();
         return ret;
