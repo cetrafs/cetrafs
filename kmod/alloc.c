@@ -3872,6 +3872,12 @@ u64 cetrafs_pf_apply_bmap_lookup_count(void)
     return (u64) atomic64_read(&cetrafs_pf_apply_bmap_lookups);
 }
 
+/* TEST ONLY: a late copy for a group that left the Zone Group counts as
+ * corruption, as before audit 2026-11-15 M-7 (tests/kernel/pf_late_copy_not_corrupt.sh). */
+static bool cetrafs_pf_late_copy_corrupt;
+cetrafs_test_param(pf_late_copy_corrupt, cetrafs_pf_late_copy_corrupt, bool, 0644);
+MODULE_PARM_DESC(pf_late_copy_corrupt, "TEST ONLY: a late pending-free copy for a departed group counts as corruption");
+
 int cetrafs_apply_pending_free(struct super_block *sb, u64 lba, u32 count, u32 expect_zg, u64 stamp)
 {
     struct cetrafs_bg_geom bg;
@@ -3894,7 +3900,33 @@ int cetrafs_apply_pending_free(struct super_block *sb, u64 lba, u32 count, u32 e
     if (ret)
         return ret;
 
+    /* Another Zone Group's group, or nobody's: decided on the device's
+     * descriptor, not a cached copy of a group this node does not own. */
     if (bg.owner_zg != expect_zg) {
+        ret = cetrafs_read_bg_geom_at(sb, cetrafs_sb_raw(sb), bg_id, cetrafs_sb_bg_desc_lba(sb, bg_id), true, &bg);
+        if (ret)
+            return ret;
+    }
+    if (bg.owner_zg != expect_zg) {
+        /* A late copy, not damage: the group left this Zone Group since
+         * the free was queued. Released, it had no bit set (a release
+         * needs it empty); claimed again, by any Zone Group, its claim
+         * raised free_gen past the stamp. Either way the blocks named
+         * are not this queue's to free -- dropped, as a stale stamp is
+         * below. Counting it as corruption raised needs-fsck and, under
+         * corruption=stop, stopped the node (audit 2026-11-15 M-7/BM-1).
+         * Only a copy stamped with the current owner's own tenure is a
+         * free no queue of ours could hold. */
+        if (!READ_ONCE(cetrafs_pf_late_copy_corrupt) &&
+            (bg.owner_zg == CETRAFS_BG_OWNER_FREE || bg.free_gen != stamp)) {
+            atomic64_inc(&cetrafs_pf_stale_drops);
+            pr_warn_ratelimited("pending free [%llu +%u) from ZG %u's queue names BG %u, now %s (stamp %llu, "
+                                "group at %llu): a late copy from before it left -- dropped\n",
+                                (unsigned long long) lba, count, expect_zg, bg_id,
+                                bg.owner_zg == CETRAFS_BG_OWNER_FREE ? "unowned" : "another Zone Group's",
+                                (unsigned long long) stamp, (unsigned long long) bg.free_gen);
+            return 1;
+        }
         pr_err("pending free [%llu +%u) names BG %u (ZG %u), but came from ZG %u's queue -- skipping\n",
                (unsigned long long) lba, count, bg_id, bg.owner_zg, expect_zg);
         cetrafs_sb_corrupt(sb, 0);
