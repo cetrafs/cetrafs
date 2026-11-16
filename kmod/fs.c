@@ -8256,6 +8256,12 @@ static bool cetrafs_opts_unmet(const struct cetrafs_fc_info *fci, const struct c
  * what the first mount ASKED for, since its effective file-lock mode may
  * be the cluster's.
  */
+/* TEST ONLY: a mount may be handed a stopped superblock, as before audit
+ * 2026-11-15 BM-44 (tests/kernel/mount_stopped_not_reused.sh). */
+static bool cetrafs_mount_reuse_stopped;
+cetrafs_test_param(mount_reuse_stopped, cetrafs_mount_reuse_stopped, bool, 0644);
+MODULE_PARM_DESC(mount_reuse_stopped, "TEST ONLY: a new mount reuses a stopped, lazily unmounted superblock");
+
 static int cetrafs_check_second_mount(struct fs_context *fc)
 {
     const struct cetrafs_fc_info *fci = fc->fs_private;
@@ -8263,7 +8269,26 @@ static int cetrafs_check_second_mount(struct fs_context *fc)
     const struct cetrafs_sb_info *sbi = sb->s_fs_info;
     const char *what;
 
-    if (!fci || fci->filled || !sbi || !cetrafs_opts_unmet(fci, sbi, &what))
+    if (!fci || fci->filled || !sbi)
+        return 0;
+    /*
+     * The superblock found is a STOPPED one -- typically a lazy unmount
+     * (umount -l) of a stopped mount, kept alive by the files still open
+     * on it. Handing it out again logged a mount success for a mount
+     * that fails every I/O with EIO and never rejoins the cluster (audit
+     * 2026-11-15 BM-44). Rejoining needs a fresh superblock, which exists
+     * only once the last file on the old one is closed.
+     */
+    if ((READ_ONCE(sbi->fenced) || test_bit(0, &sbi->lease_lost)) && !READ_ONCE(cetrafs_mount_reuse_stopped)) {
+        pr_err("%s: this node's previous mount of the volume is stopped (%s) and still in use -- refusing to "
+               "mount it again; close what is open on it (a lazy unmount waits for that), then mount\n",
+               sb->s_id, cetrafs_sb_stop_cause_name(sb));
+        dput(fc->root);
+        fc->root = NULL;
+        deactivate_locked_super(sb);
+        return -EBUSY;
+    }
+    if (!cetrafs_opts_unmet(fci, sbi, &what))
         return 0;
     pr_err("%s is already mounted without %s -- refusing a second mount that asks for it\n", sb->s_id, what);
     dput(fc->root);
