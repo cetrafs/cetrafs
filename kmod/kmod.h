@@ -1256,6 +1256,7 @@ int cetrafs_node_set_frees(struct super_block *sb, u32 my_node_id, bool on);
 int cetrafs_node_frees_snapshot(struct super_block *sb, u32 my_node_id, bool self_from_row,
                                 u32 seqs[CETRAFS_MAX_READER_NODES], bool *busy);
 int cetrafs_node_is_stale(struct super_block *sb, u32 node_id, bool *out_stale);
+int cetrafs_node_declare_dead(struct super_block *sb, u32 node_id, u32 incarnation);
 int cetrafs_node_is_stale_entry(struct super_block *sb, u32 node_id, const cetrafs_node_entry_t *row, bool *out_stale);
 bool cetrafs_node_prefetch_rows(struct super_block *sb);
 int cetrafs_node_get_entry_prefetched(struct super_block *sb, u32 idx, cetrafs_node_entry_t *out);

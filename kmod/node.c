@@ -447,6 +447,10 @@ struct cetrafs_node_fence_ctx {
     u32 fencer;                     /* the row doing the fencing, or CETRAFS_NODE_ID_NONE */
     u32 reason;                     /* CETRAFS_FENCE_*, stamped into the victim's row */
     char victim_label[CETRAFS_NODE_LABEL_LEN]; /* out: the victim's label as read by the fence */
+    /* A declaration (controls dead=): only this incarnation of the row,
+     * and only while it has recorded no departure. 0 = not one. */
+    u32 declare_incarnation;
+    bool declared_moved; /* out: the row is another incarnation, or already departed */
 };
 
 /* TEST ONLY: the fence bumps the epoch and nothing else -- the row keeps
@@ -464,6 +468,8 @@ static const char *cetrafs_fence_reason_name(u32 r)
         return "reclaim";
     case CETRAFS_FENCE_NOCAW_MOUNT:
         return "mount watch (no atomic CAW)";
+    case CETRAFS_FENCE_DECLARED:
+        return "declared dead (controls)";
     default:
         return "unknown";
     }
@@ -541,10 +547,21 @@ static int cetrafs_node_fence_mutate(void *image, unsigned int len, void *priv)
                            "free; refusing\n");
         return -EUCLEAN;
     }
-    if (cetrafs_le32(ne.state) != CETRAFS_NODE_STATE_REGISTERED)
+    if (cetrafs_le32(ne.state) != CETRAFS_NODE_STATE_REGISTERED) {
+        ctx->declared_moved = ctx->declare_incarnation != 0;
         return 1; /* nothing to do -- not an error */
+    }
     if (!cetrafs_node_image_ok(&ne))
         return -EUCLEAN;
+
+    /* A declaration names the machine the agent power-fenced by the
+     * incarnation it read: a row re-attached since is a node booted
+     * again, and alive. */
+    if (ctx->declare_incarnation && (cetrafs_le32(ne.incarnation) != ctx->declare_incarnation ||
+                                     cetrafs_le32(ne.departure) != CETRAFS_NODE_DEPART_NONE)) {
+        ctx->declared_moved = true;
+        return 1; /* write nothing */
+    }
 
     /*
      * Is the verdict still about this row's CURRENT incarnation? A
@@ -693,10 +710,11 @@ MODULE_PARM_DESC(fence_peer_fail, "TEST ONLY: revoking a stale peer's lease fail
  * one (the no-CAW mount gate); NULL takes the peer watch's. */
 static int cetrafs_node_fence_peer_full(struct super_block *sb, u32 node_id, const char *what, u32 reason,
                                         bool mark_departed, bool check_verdict,
-                                        const struct cetrafs_row_mark *judged)
+                                        const struct cetrafs_row_mark *judged, u32 declare_incarnation)
 {
     struct cetrafs_node_fence_ctx ctx = {.mark_departed = mark_departed, .check_verdict = check_verdict,
-                                         .fencer = CETRAFS_NODE_ID_NONE, .reason = reason};
+                                         .fencer = CETRAFS_NODE_ID_NONE, .reason = reason,
+                                         .declare_incarnation = declare_incarnation};
     const cetrafs_superblock_t *raw_sb = cetrafs_sb_raw(sb);
     int ret;
 
@@ -725,6 +743,8 @@ static int cetrafs_node_fence_peer_full(struct super_block *sb, u32 node_id, con
         ctx.have_mark = cetrafs_sb_peer_judged_mark(sb, node_id, &ctx.mark);
     }
     ret = cetrafs_cas_record(sb, cetrafs_node_row_lba(sb, node_id), cetrafs_node_fence_mutate, &ctx);
+    if (ret == 0 && ctx.declared_moved)
+        return -ESTALE; /* not the incarnation declared, or already departed */
     if (ret == 0 && ctx.reattached) {
         pr_info("fence: node %u came back since it was judged stale -- not revoking, not reclaiming %s\n", node_id,
                 what);
@@ -819,6 +839,39 @@ void cetrafs_node_test_stall_before_swap(void)
         msleep(stall); /* TEST ONLY: see the parameter */
 }
 
+/* TEST ONLY: a reclaim fence revokes the lease and leaves departure NONE,
+ * as before audit 2026-11-15 G-25 (tests/kernel/declare_dead.sh). */
+static bool cetrafs_reclaim_fence_no_dead;
+cetrafs_test_param(reclaim_fence_no_dead, cetrafs_reclaim_fence_no_dead, bool, 0644);
+MODULE_PARM_DESC(reclaim_fence_no_dead, "TEST ONLY: a reclaim fence does not record departure DEAD");
+
+/*
+ * controls dead=<row>:<incarnation> -- a cluster agent that has
+ * power-fenced a host declares its row dead, so the next open of that
+ * host's VMs need not wait out the stale window (M-48, G-25). The same
+ * fence CAS a reclaim runs, plus departure = DEAD, so every node reads
+ * the row stale at once (cetrafs_node_is_stale_entry()). Bound to the
+ * incarnation the agent read from the cluster file: a host that booted
+ * and mounted again since is alive and is not touched (-ESTALE). Never
+ * this node's own row (-EINVAL). The declaration is the agent's
+ * promise that the host can no longer write: like the fence itself it
+ * is advisory, and I/O the host already queued still lands.
+ */
+int cetrafs_node_declare_dead(struct super_block *sb, u32 node_id, u32 incarnation)
+{
+    const cetrafs_superblock_t *raw_sb = cetrafs_sb_raw(sb);
+    u32 me;
+
+    if (!incarnation || !raw_sb || node_id >= le32_to_cpu(raw_sb->node_table_count))
+        return -EINVAL;
+    if (cetrafs_sb_is_fenced(sb))
+        return -EIO;
+    if (!cetrafs_sb_get_node_id(sb, &me) && me == node_id)
+        return -EINVAL;
+    return cetrafs_node_fence_peer_full(sb, node_id, "nothing: declared dead through controls", CETRAFS_FENCE_DECLARED,
+                                        true, false, NULL, incarnation);
+}
+
 int cetrafs_node_fence_peer(struct super_block *sb, u32 node_id, const char *what)
 {
     /*
@@ -844,7 +897,11 @@ int cetrafs_node_fence_peer(struct super_block *sb, u32 node_id, const char *wha
             msleep(stall); /* TEST ONLY: see the parameter */
     }
     {
-        int ret = cetrafs_node_fence_peer_full(sb, node_id, what, CETRAFS_FENCE_RECLAIM, false, true, NULL);
+        /* departure = DEAD with it: the lease is revoked, so the next
+         * observer -- a mount, a tick, a grow -- reads the verdict in one
+         * block instead of watching the row for another window (G-25). */
+        int ret = cetrafs_node_fence_peer_full(sb, node_id, what, CETRAFS_FENCE_RECLAIM,
+                                               !READ_ONCE(cetrafs_reclaim_fence_no_dead), true, NULL, 0);
         unsigned int stall = ret ? 0 : xchg(&cetrafs_reclaim_stall_after_fence_ms, 0);
 
         if (stall)
@@ -1192,7 +1249,7 @@ int cetrafs_node_register(struct super_block *sb,
                 (void) cetrafs_cas_record(sb, cetrafs_node_row_lba(sb, idx), cetrafs_node_test_beat_mutate, NULL);
             if (cetrafs_reattach_race_bump) /* test knob, see its MODULE_PARM_DESC */
                 (void) cetrafs_node_fence_peer_full(sb, idx, "a test-forced concurrent reclaim (reattach_race_bump)",
-                                                    CETRAFS_FENCE_RECLAIM, false, false, NULL);
+                                                    CETRAFS_FENCE_RECLAIM, false, false, NULL, 0);
 
             /* The take-back is a CAS, never a blind write of the row read
              * above -- see cetrafs_node_reattach_mutate() for the fence
@@ -2086,7 +2143,7 @@ int cetrafs_node_live_peer_exists(struct super_block *sb, const u8 *my_uuid, boo
             fret = READ_ONCE(cetrafs_nocaw_gate_fence_fail)
                        ? -EIO
                        : cetrafs_node_fence_peer_full(sb, idx, "this volume (no atomic CAW: one mounter only)",
-                                                      CETRAFS_FENCE_NOCAW_MOUNT, true, true, &judged);
+                                                      CETRAFS_FENCE_NOCAW_MOUNT, true, true, &judged, 0);
             if (fret == -EBUSY) {
                 pr_err("node %u came back while this mount watched it -- it is alive and mounted on this volume\n",
                        idx);

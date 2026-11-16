@@ -609,7 +609,8 @@ static int cetrafs_proc_cluster_show(struct seq_file *m, void *v)
         u = ne.node_uuid;
         seq_printf(m,
                    "node %u: state=%s uuid=%02x%02x%02x%02x-%02x%02x-%02x%02x-%02x%02x-%02x%02x%02x%02x%02x%02x "
-                   "hb_seq=%llu last_seen=%llu label=%*pE caps=0x%x stale_secs=%u departure=%s stale=%s%s\n",
+                   "hb_seq=%llu last_seen=%llu label=%*pE caps=0x%x stale_secs=%u departure=%s stale=%s "
+                   "incarnation=%u%s\n",
                    idx, cetrafs_le32(ne.state) == CETRAFS_NODE_STATE_REGISTERED ? "REGISTERED" : "UNKNOWN", u[0], u[1], u[2], u[3],
                    u[4], u[5], u[6], u[7], u[8], u[9], u[10], u[11], u[12], u[13], u[14], u[15],
                    (unsigned long long) cetrafs_le64(ne.hb_seq), (unsigned long long) cetrafs_le64(ne.last_seen), (int) strnlen(ne.label, sizeof(ne.label)), ne.label,
@@ -618,7 +619,7 @@ static int cetrafs_proc_cluster_show(struct seq_file *m, void *v)
                    : cetrafs_le32(ne.departure) == CETRAFS_NODE_DEPART_DEAD ? "dead"
                    : cetrafs_le32(ne.departure) == CETRAFS_NODE_DEPART_NONE ? "none"
                                                                             : "invalid",
-                   ret ? "unknown" : stale ? "yes" : "no",
+                   ret ? "unknown" : stale ? "yes" : "no", cetrafs_le32(ne.incarnation),
                    idx == my_node_id ? " (this node)" : "");
     }
     ret = 0;
@@ -651,6 +652,8 @@ static int cetrafs_proc_cluster_show(struct seq_file *m, void *v)
  *                defrag.cetra run still works.
  *   defrag_available  read-only: "no" on a nofilelock mount, where
  *                every defrag is refused whatever the switches say.
+ *   dead=<row>:<incarnation>  write-only: declare a power-fenced peer's
+ *                row dead (cetrafs_node_declare_dead()).
  *
  * Per MOUNT, deliberately: the module params are module-wide, and one
  * node may own the images on this volume while another only reads them.
@@ -814,6 +817,28 @@ static ssize_t cetrafs_proc_controls_write(struct file *file, const char __user 
 timing_out:
         mutex_unlock(&cetrafs_controls_lock);
         return trc;
+    }
+
+    /* dead=<row>:<incarnation>: a cluster agent that has power-fenced a
+     * host declares its row dead (cetrafs_node_declare_dead()). Needs
+     * CAP_SYS_ADMIN, not just write access to this file: it lets every
+     * node take the host's claims at once. */
+    if (!strcmp(key, "dead")) {
+        unsigned int row, inc;
+        char tail;
+        int dret;
+
+        if (!capable(CAP_SYS_ADMIN))
+            return -EPERM;
+        if (sscanf(val, "%u:%u%c", &row, &inc, &tail) != 2)
+            return -EINVAL;
+        dret = cetrafs_node_declare_dead(sb, row, inc);
+        if (dret) {
+            pr_warn("%s: controls: dead=%u:%u refused (%d)\n", sb->s_id, row, inc, dret);
+            return dret;
+        }
+        pr_warn("%s: controls: row %u (incarnation %u) declared dead\n", sb->s_id, row, inc);
+        return len;
     }
 
     /* shutdown=now: stop this mount at once, as a crash would

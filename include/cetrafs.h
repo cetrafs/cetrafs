@@ -1202,6 +1202,7 @@ static inline int cetrafs_node_entry_blank(const cetrafs_node_entry_t *ne)
 #define CETRAFS_FENCE_NONE        0 /* never fenced since the row was written */
 #define CETRAFS_FENCE_RECLAIM     1 /* a peer reclaimed something this node held: a lock, a Zone Group, a journal, a namespace lock */
 #define CETRAFS_FENCE_NOCAW_MOUNT 2 /* a mount on a device without atomic CAW watched this row go stale and fenced it */
+#define CETRAFS_FENCE_DECLARED    3 /* an operator or HA agent declared it dead after power-fencing it (controls dead=) */
 
 /* cetrafs_node_entry_t.departure values. */
 #define CETRAFS_NODE_DEPART_NONE  0 /* mounted, or crashed with no verdict yet */
