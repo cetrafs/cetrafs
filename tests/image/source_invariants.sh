@@ -1291,6 +1291,7 @@ dmpath.c:cetrafs_dmpath_sdev wait_event_timeout
 dmpath.c:cetrafs_dmpath_forget wait_event_timeout
 fs.c:cetrafs_sb_release_lock heartbeat-only;-the-writers-wait-killable
 fs.c:cetrafs_sb_release_wait killable;-the-plain-down_read-is-the-release_wait_unkillable-control-knob
+fs.c:cetrafs_sb_release_read_lock killable;-the-plain-down_read-is-the-release_wait_unkillable-control-knob
 fs.c:cetrafs_sb_birth_gate held-across-one-bit-CAS
 fs.c:cetrafs_shutdown_ioctl admin-ioctl;-s_umount
 inode.c:cetrafs_write_vfs_inode invalidate_lock-shared-of-an-inode-being-evicted:-its-only-holders-are-tree-edits-each-bounded-by-its-own-I/O
@@ -1711,7 +1712,8 @@ log "checking every store that can satisfy a wait wakes its queue"
 WAKE_SPEC='journal.c|cetrafs_journal_take_slot|clear_bit\([^,]*, *j->busy\)|j->held\+\+|\+\+j->held|wake_up(_all)?\(&j->slot_wq\)
 dmpath.c|-|->resolving = false|wake_up(_all)?\(&cetrafs_dmpath_wq\)
 caw.c|-|atomic_dec[a-z_]*\(&ctx->running\)|wake_up(_all)?\(&ctx->done\)
-fs.c|-|clear_bit\([^,]*, *sbi->zg_adopt_wanted\)|wake_up(_all)?\(&sbi->zg_adopt_wq\)'
+fs.c|-|clear_bit\([^,]*, *sbi->zg_adopt_wanted\)|wake_up(_all)?\(&sbi->zg_adopt_wq\)
+fs.c|-|clear_bit\([^,]*, *sbi->zg_claiming\)|wake_up(_all)?\(&sbi->zg_claiming_wq\)'
 # The first spec line's exemption is the waiter itself: it clears a held
 # slot's bit and re-sets it under the same j->lock hold, so nothing
 # becomes free (journal.c, "re-set below").
@@ -1725,10 +1727,11 @@ unwoken() { # <file> <exempt fn> <store re> <wake re>: functions storing without
         /^}/ { if (fn != "" && fn != ex && stored && !woke) print FILENAME ":" fn; fn = "" }' "$1"
 }
 WSITES="$(grep -cE '^[^*/]*\bwait_event[a-z_]*\(' "$K"/*.c | awk -F: '{ n += $2 } END { print n + 0 }')"
-# 7: the batch's slot wait (cetrafs_journal_take_batch()) is a second
-# waiter on j->slot_wq, whose stores and wake the first line specifies.
-[ "$WSITES" = 7 ] && pass "wait wakes: 7 wait_event sites, each queue specified" ||
-    fail "wait wakes: $WSITES wait_event sites (specified for 7) -- add the new queue's stores and wake to WAKE_SPEC"
+# 8: the batch's slot wait (cetrafs_journal_take_batch()) is a second
+# waiter on j->slot_wq, whose stores and wake the first line specifies;
+# the claim-in-flight wait (cetrafs_sb_zg_claiming_wait()) the last.
+[ "$WSITES" = 8 ] && pass "wait wakes: 8 wait_event sites, each queue specified" ||
+    fail "wait wakes: $WSITES wait_event sites (specified for 8) -- add the new queue's stores and wake to WAKE_SPEC"
 UW=""
 while IFS= read -r line; do
     f="${line%%|*}"; rest="${line#*|}"; ex="${rest%%|*}"; rest="${rest#*|}"
@@ -1764,7 +1767,9 @@ handler_calls() { # <file> <handler...>: cetrafs_* functions the handlers call
 }
 SIGSAFE_OK='cetrafs_repair_renew:masks SIGALRM around the renewal (sigprocmask)
 cetrafs_repair_node_beat:called from the tick handler only
-cetrafs_repair_release:disarms the timer before any I/O'
+cetrafs_repair_release:disarms the timer before any I/O
+cetrafs_mono_secs:no state: clock_gettime(), async-signal-safe
+cetrafs_sleep_full:no state: nanosleep(), async-signal-safe; the handler restores errno'
 CALLED="$(handler_calls "$U/devutil.h" cetrafs_repair_tick cetrafs_repair_stop)"
 UNL="$(while read -r c; do [ -n "$c" ] && ! grep -q "^$c:" <<<"$SIGSAFE_OK" && echo "$c"; done <<<"$CALLED" || true)"
 [ -n "$CALLED" ] || fail "signal handlers: found nothing the handlers call -- the scan is not seeing them"
