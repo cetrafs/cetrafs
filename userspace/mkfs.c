@@ -480,6 +480,44 @@ static void mkfs_probe_rows_without_sb(int fd, const char *dev)
     fprintf(stderr, "%s: no node beats in those rows -- formatting over them (-f)\n", dev);
 }
 
+/*
+ * A GPT keeps a backup of its header and entries in the LAST 33 sectors
+ * of the disk. Formatting overwrites the primary copy (blocks 0..4) and
+ * left the backup, and the kernel or a partitioning tool that finds a
+ * valid backup with a damaged primary offers to "repair" the table --
+ * writing it back over block 0, the superblock (audit 2026-11-14 M-34).
+ * Cleared only where a header is actually there: the tail of a volume
+ * formatted smaller than its LUN (-s) is otherwise left as it was.
+ */
+#define MKFS_GPT_TAIL_SECTORS 34
+static void mkfs_wipe_backup_gpt(int fd, const char *dev)
+{
+    unsigned long long dev_bytes = 0;
+    unsigned char sec[512], zero[MKFS_GPT_TAIL_SECTORS * 512];
+    struct stat st;
+
+    if (getenv("CETRAFS_TEST_MKFS_KEEP_GPT")) /* TEST ONLY: the control of mkfs_backup_gpt.sh */
+        return;
+    if (ioctl(fd, BLKGETSIZE64, &dev_bytes) < 0) {
+        if (fstat(fd, &st) != 0)
+            return;
+        dev_bytes = (unsigned long long) st.st_size;
+    }
+    if (dev_bytes < sizeof(zero))
+        return;
+    (void) posix_fadvise(fd, (off_t) (dev_bytes - sizeof(zero)), sizeof(zero), POSIX_FADV_DONTNEED);
+    if (pread(fd, sec, sizeof(sec), (off_t) (dev_bytes - sizeof(sec))) != (ssize_t) sizeof(sec))
+        return;
+    if (memcmp(sec, "EFI PART", 8) != 0)
+        return;
+    memset(zero, 0, sizeof(zero));
+    if (pwrite(fd, zero, sizeof(zero), (off_t) (dev_bytes - sizeof(zero))) != (ssize_t) sizeof(zero) || fsync(fd) != 0)
+        die_dev("%s: cannot clear the backup partition table at the end of the device: %s", dev, strerror(errno));
+    fprintf(stderr, "%s: cleared a backup GPT at the end of the device, so no tool restores it over the "
+                    "superblock\n",
+            dev);
+}
+
 static void mkfs_retire_old_superblock(int fd, const char *dev)
 {
     unsigned char old[CETRAFS_BLOCK_SIZE], zero[CETRAFS_BLOCK_SIZE];
@@ -1114,8 +1152,10 @@ int main(int argc, char **argv)
 
     /* Every refusal above is behind us and the first write is below:
      * the old filesystem stops being mountable here, and not before. */
-    if (!dry_run)
+    if (!dry_run) {
         mkfs_retire_old_superblock(fd, dev);
+        mkfs_wipe_backup_gpt(fd, dev);
+    }
 
     /* --------------------------- */
     /* --- ZG table & journals --- */
