@@ -42,6 +42,27 @@ func RunDirectWrite(clients []*Client, baseDir string) (bool, error) {
 	a, b := clients[0], clients[1]
 	linkRestored := true
 	skipSet := false
+	// One conversion per direct write is what the counters below check.
+	// Two things mark a whole 64 KiB unit written on its first write --
+	// the sparse unit (b2ba9f5) and the convert widen -- after which the
+	// unit's other blocks land on written space and convert nothing.
+	// convert_unit_blocks=1 is a block at a time for both, on both nodes.
+	unitPrev := map[*Client]string{}
+	defer func() {
+		for c, prev := range unitPrev {
+			_ = callOK(c, "mod_param", ModParamArgs{Name: "convert_unit_blocks", Value: prev})
+		}
+	}()
+	for _, c := range clients[:2] {
+		var r ModParamResult
+		resp, e := c.Call("mod_param", ModParamArgs{Name: "convert_unit_blocks", Value: "1"})
+		if err := decodeResult(c.Name, resp, e, &r); err != nil {
+			return false, fmt.Errorf("%s: cannot set convert_unit_blocks: %v", c.Name, err)
+		}
+		if prev := strings.TrimSpace(r.Prev); prev != "" {
+			unitPrev[c] = prev
+		}
+	}
 	defer func() {
 		if !linkRestored {
 			if _, err := a.Call("link_up", nil); err != nil {

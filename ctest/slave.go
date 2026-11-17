@@ -1830,6 +1830,9 @@ var settableModParams = map[string]bool{
 	"stale_secs":                 true,
 	// scrub-transit: a queued free has to stay queued across scrub cycles.
 	"hb_drain_off": true,
+	// direct-write: one conversion per direct write; a unit marked
+	// written as a whole would leave the rest of it nothing to convert.
+	"convert_unit_blocks": true,
 	// The background scrub's cadence. A scenario that has to watch the
 	// scrub make (or decline) a decision cannot wait out the 30-minute
 	// default, and these must be set BEFORE the mount: scrub_start()
