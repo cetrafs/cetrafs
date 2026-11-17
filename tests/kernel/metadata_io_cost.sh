@@ -107,8 +107,14 @@ assert_lt "mkdir does not journal the child dirent block nothing can reach" "$DI
 # publish that names new blocks, one after a publish a free may follow)
 # add flushes to the close publish and the parent release: measured
 # create 12.65 -> 15.65, mkdir 14.25 -> 16.25 across that change.
-assert_lt "mkdir device writes stay bounded" "$MKDIR_W" 16.8
-assert_lt "create device writes stay bounded" "$CREATE_W" 16.1
+# Two later changes raised the floor without moving these bounds, so the
+# suite failed from then on (found 2026-11-17, bisected): the flush after
+# allocation bits are written (dbbc10c; mkdir allocates its block, create
+# none: mkdir 16.25 -> 17.32) and the birth claim a never-used number
+# takes too (74bce71; every create now, not about half: create 15.68 ->
+# 16.18, mkdir 17.32 -> 18.32).
+assert_lt "mkdir device writes stay bounded" "$MKDIR_W" 18.8
+assert_lt "create device writes stay bounded" "$CREATE_W" 16.6
 
 # The content must still be right: a blind write that skipped the read
 # publishes uninitialised memory if any byte goes unwritten.
