@@ -2757,6 +2757,16 @@ int cetrafs_fill_super(struct super_block *sb, struct fs_context *fc)
         brelse(bh);
         return -EINVAL;
     }
+    /* It places every group a grow adds (cetrafs_grow_check_bg_header()
+     * computes the layout from it); refused here so nothing ever does
+     * arithmetic with a value that is not a power of two or leaves a
+     * group no data. */
+    if (!cetrafs_data_align_ok(le32_to_cpu(ondisk->data_align_blocks), bg_size_blocks)) {
+        pr_err("invalid data_align_blocks=%u for bg_size_blocks=%llu\n", le32_to_cpu(ondisk->data_align_blocks),
+               (unsigned long long) bg_size_blocks);
+        brelse(bh);
+        return -EINVAL;
+    }
 
     /*
      * There used to be a `bg_regions_start >= 1 + Z + B` check here.

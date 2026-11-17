@@ -52,9 +52,7 @@ sb = f.read(4096)
 bg_table_start = struct.unpack_from('<Q', sb, 64)[0]
 off = (bg_table_start + bg_id) * 4096
 f.seek(off); blk = bytearray(f.read(4096))
-# cetrafs_block_group_t: bg_id u32, start_block u64, off_bg_header u32,
-# off_data_bmap u32, off_data_region u32, data_block_count u64,
-# free_data_blocks u64, owner_zg u32, checksum u32  (see cetrafs.h)
+# cetrafs_block_group_t's layout: see cetrafs.h
 exec(expr, {"blk": blk, "struct": struct})
 f.seek(off); f.write(blk)
 PY

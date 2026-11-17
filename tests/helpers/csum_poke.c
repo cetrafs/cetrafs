@@ -99,7 +99,7 @@ int main(int argc, char **argv)
         cetrafs_block_group_t bg;
 
         rd(&bg, sizeof(bg), (off_t) (cetrafs_le64(sb.bg_table_start) + id) * CETRAFS_BLOCK_SIZE);
-        flip((off_t) (cetrafs_le64(bg.start_block) + cetrafs_le32(bg.off_bg_header)) * CETRAFS_BLOCK_SIZE +
+        flip((off_t) cetrafs_le64(bg.start_block) * CETRAFS_BLOCK_SIZE +
              offsetof(cetrafs_bg_header_t, pad));
     } else if (!strcmp(what, "node")) {
         flip((off_t) (cetrafs_le64(sb.node_table_start) + id) * CETRAFS_BLOCK_SIZE + offsetof(cetrafs_node_entry_t, reserved));

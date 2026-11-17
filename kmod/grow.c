@@ -139,11 +139,10 @@ int cetrafs_grow_check_bg_header(struct super_block *sb, u32 bg_id, u64 start, u
     crc = crc32c(crc, h, off);
     crc = crc32c(crc, zero, clen);
     crc = crc32c(crc, (const u8 *) h + off + clen, sizeof(*h) - off - clen);
-    cetrafs_calc_bg_layout(len, &bmap, &data, &cnt);
+    cetrafs_calc_bg_layout(len, le32_to_cpu(cetrafs_sb_raw(sb)->data_align_blocks), &bmap, &data, &cnt);
     if ((u64) ~crc != le64_to_cpu(h->checksum) || le32_to_cpu(h->bg_id) != bg_id ||
         le64_to_cpu(h->length_blocks) != len || le32_to_cpu(h->off_data_bmap) != bmap ||
-        le32_to_cpu(h->off_data_region) != data || le64_to_cpu(h->data_block_count) != cnt ||
-        le16_to_cpu(h->owner_zg) != (u16) CETRAFS_BG_OWNER_FREE) {
+        le32_to_cpu(h->off_data_region) != data || le64_to_cpu(h->data_block_count) != cnt) {
         pr_err("%s: Block Group %u's header at %llu does not verify (id %u, crc %s) -- its region was not "
                "initialised on the device\n",
                sb->s_id, bg_id, (unsigned long long) start, le32_to_cpu(h->bg_id),

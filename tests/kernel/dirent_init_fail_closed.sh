@@ -44,7 +44,8 @@ for line in sys.argv[3].splitlines():
     if f[0] != "bg":
         continue
     start = int(f[3].split("=")[1])
-    length, off_bmap, off_data = struct.unpack_from("<QII", os.pread(fd, 24, start * 4096), 8)
+    # cetrafs_bg_header_t: bg_id, off_data_bmap, off_data_region (u32), length_blocks (u64)
+    _, off_bmap, off_data, length = struct.unpack_from("<IIIQ", os.pread(fd, 24, start * 4096), 0)
     if start + off_data <= lba < start + length:
         bit = lba - start - off_data
         print(f[1], (start + off_bmap) * 4096 + bit // 8, bit % 8)

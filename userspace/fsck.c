@@ -1000,9 +1000,10 @@ static void fsck_rebuild_zg(int fd, const cetrafs_superblock_t *sb, uint32_t z)
  * The header at `start` names Block Group b, verifies, and describes a
  * region that fits in [start, limit). Fills *hdr. The header is written
  * by mkfs and growfs only and never moves, so a verifying one is the
- * group's geometry (its owner field is the initial one, not current).
+ * group's geometry, laid out on the volume's data alignment.
  */
-static int fsck_bg_header_at(int fd, uint32_t b, uint64_t start, uint64_t limit, cetrafs_bg_header_t *hdr)
+static int fsck_bg_header_at(int fd, uint32_t b, uint64_t start, uint64_t limit, uint64_t align,
+                             cetrafs_bg_header_t *hdr)
 {
     uint8_t blk[CETRAFS_BLOCK_SIZE] = {0};
     uint32_t off_bmap, off_data;
@@ -1019,7 +1020,7 @@ static int fsck_bg_header_at(int fd, uint32_t b, uint64_t start, uint64_t limit,
     if (!cetrafs_le64(hdr->length_blocks) || cetrafs_le64(hdr->length_blocks) > CETRAFS_MAX_BG_SIZE_BLOCKS ||
         cetrafs_le64(hdr->length_blocks) > limit - start)
         return 0;
-    cetrafs_calc_bg_layout(cetrafs_le64(hdr->length_blocks), &off_bmap, &off_data, &cnt);
+    cetrafs_calc_bg_layout(cetrafs_le64(hdr->length_blocks), align, &off_bmap, &off_data, &cnt);
     return cetrafs_le32(hdr->off_data_bmap) == off_bmap && cetrafs_le32(hdr->off_data_region) == off_data &&
            cetrafs_le64(hdr->data_block_count) == cnt;
 }
@@ -1144,12 +1145,13 @@ static int fsck_rebuild_bg_desc(int fd, const cetrafs_superblock_t *sb, uint64_t
     uint32_t nzg = cetrafs_le32(sb->zone_group_count), owner = CETRAFS_BG_OWNER_FREE, bmap_blocks;
     uint16_t flags = 0;
     int queued = 0;
+    const uint64_t align = cetrafs_le32(sb->data_align_blocks);
 
-    if (fsck_bg_header_at(fd, b, prev_end, next_start ? next_start : data_end, &hdr) &&
+    if (fsck_bg_header_at(fd, b, prev_end, next_start ? next_start : data_end, align, &hdr) &&
         (!next_start || prev_end + cetrafs_le64(hdr.length_blocks) <= next_start))
         start = prev_end;
     else if (next_start && next_start > cetrafs_le64(sb->bg_size_blocks) &&
-             fsck_bg_header_at(fd, b, next_start - cetrafs_le64(sb->bg_size_blocks), next_start, &hdr) &&
+             fsck_bg_header_at(fd, b, next_start - cetrafs_le64(sb->bg_size_blocks), next_start, align, &hdr) &&
              cetrafs_le64(hdr.length_blocks) == cetrafs_le64(sb->bg_size_blocks) &&
              next_start - cetrafs_le64(sb->bg_size_blocks) >= prev_end)
         start = next_start - cetrafs_le64(sb->bg_size_blocks);
@@ -1244,7 +1246,6 @@ static int fsck_rebuild_bg_desc(int fd, const cetrafs_superblock_t *sb, uint64_t
     bg.flags = cetrafs_cpu_to_le16(flags);
     bg.start_block = cetrafs_cpu_to_le64(start);
     bg.length_blocks = hdr.length_blocks;
-    bg.off_bg_header = cetrafs_cpu_to_le32(0);
     bg.off_data_bmap = hdr.off_data_bmap;
     bg.off_data_region = hdr.off_data_region;
     bg.data_block_count = hdr.data_block_count;
@@ -2892,6 +2893,12 @@ int main(int argc, char **argv)
                     (unsigned long long) CETRAFS_MAX_BG_SIZE_BLOCKS);
             return 1;
         }
+        /* Every group's layout below is computed from it. */
+        if (!cetrafs_data_align_ok(cetrafs_le32(sb.data_align_blocks), bgsz)) {
+            fprintf(stderr, "ERR: data_align_blocks %u for bg_size_blocks %" PRIu64 " -- it will not mount\n",
+                    cetrafs_le32(sb.data_align_blocks), bgsz);
+            return 1;
+        }
         if (!cetrafs_le64(sb.inode_bmap_blocks) || !cetrafs_le64(sb.inode_table_blocks)) {
             fprintf(stderr, "ERR: inode bitmap or inode table has no blocks (inode_bmap_blocks %" PRIu64
                             ", inode_table_blocks %" PRIu64 ") -- it will not mount\n",
@@ -3541,13 +3548,10 @@ int main(int argc, char **argv)
                 }
             }
         }
-        if (cetrafs_le32(bg.off_bg_header) != 0) {
-            fprintf(stderr, "ERR: BG%zu header off not 0\n", (size_t) b);
-            return 1;
-        }
         uint32_t off_bmap, off_data;
         uint64_t data_cnt;
-        cetrafs_calc_bg_layout(cetrafs_le64(bg.length_blocks), &off_bmap, &off_data, &data_cnt);
+        cetrafs_calc_bg_layout(cetrafs_le64(bg.length_blocks), cetrafs_le32(sb.data_align_blocks), &off_bmap, &off_data,
+                               &data_cnt);
         if (cetrafs_le32(bg.off_data_bmap) != off_bmap || cetrafs_le32(bg.off_data_region) != off_data || cetrafs_le64(bg.data_block_count) != data_cnt) {
             fprintf(stderr, "ERR: BG%zu layout mismatch\n", (size_t) b);
             return 1;
@@ -3570,8 +3574,7 @@ int main(int argc, char **argv)
         bg_free_gen[b] = cetrafs_le64(bg.free_gen);
         bg_flags[b] = cetrafs_le16(bg.flags);
 
-        /* BG header: first block of the BG's own region (off_bg_header,
-         * already checked above to be 0). */
+        /* BG header: the first block of the BG's own region. */
         uint8_t hblk[CETRAFS_BLOCK_SIZE] = {0};
         pread_all(fd, hblk, sizeof(hblk), (off_t) cetrafs_le64(bg.start_block) * CETRAFS_BLOCK_SIZE);
         cetrafs_bg_header_t bh;
@@ -4246,7 +4249,9 @@ int main(int argc, char **argv)
         }
         root_lba = ((uint64_t) cetrafs_le16(le[0].ee_start_hi) << 32) | cetrafs_le32(le[0].ee_start_lo);
     }
-    uint64_t expect_root_lba = cetrafs_le64(sb.bg_regions_start) + 1 + (cetrafs_calc_bg_dbm_blocks(cetrafs_le64(sb.bg_size_blocks)));
+    /* mkfs puts it in BG0's first data block -- wherever the descriptor,
+     * checked above against the layout, says that is. */
+    uint64_t expect_root_lba = bg_data_start[0];
     if (root_lba != expect_root_lba) {
         fprintf(stderr, "ERR: root data lba %" PRIu64 " != expected %" PRIu64 "\n", root_lba, expect_root_lba);
         return 1;
@@ -4323,7 +4328,7 @@ int main(int argc, char **argv)
     }
 
     /* Check bit 0 in BG0 data bitmap set */
-    uint64_t dbm0_lba = cetrafs_le64(sb.bg_regions_start) + 1;
+    uint64_t dbm0_lba = bg_bmap_lba[0];
     uint8_t bm[CETRAFS_BLOCK_SIZE];
     pread_all(fd, bm, sizeof(bm), (off_t) dbm0_lba * CETRAFS_BLOCK_SIZE);
     bool bit0 = (bm[0] & 0x01) != 0;

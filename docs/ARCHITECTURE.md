@@ -176,7 +176,8 @@ volume through the copy when block 0 is damaged, and `-r` restores block
 | checksum | `__le64` | CRC32C over the struct with this field zeroed (low 32 bits used) |
 | uuid[16] | `u8[]` | filesystem UUID |
 | fsck_needed_since, fsck_needed_node | `__le64`, `__le32` | the lasting "needs fsck" mark (0x000A): when, and by which registry row, damaged metadata was first found at runtime; 0 = none. Set once by compare-and-write from the finding node's heartbeat, cleared by `fsck -r` after a clean pass. Status, not layout: the checks that block 0 still describes the mounted volume (grow, mount, refresh) compare around it, and a grow keeps it |
-| reserved[128] | `u8[]` | padding to keep the struct growable |
+| data_align_blocks | `__le32` | data alignment in blocks (0x000A, `mkfs -A`, default 256 = 1 MiB): every Block Group starts on a multiple of it and its data region on the next multiple past its header and bitmap, so data and an emptied group's UNMAP line up with the array's allocation unit or stripe. A power of two up to 64 MiB that divides `bg_size_blocks` (`cetrafs_data_align_ok()`, checked by the mount, `fsck` and `growfs`); 1 is none. Fixed for the volume's life; a grow places its new groups by it |
+| reserved[120] | `u8[]` | padding to keep the struct growable |
 
 ### Zone Group Descriptor — `cetrafs_zone_group_t` (1 block per ZG)
 
@@ -327,7 +328,7 @@ block the allocator has given out again.
 | bg_id | global BG id |
 | owner_zg | owning ZG, per the span `mkfs` assigned it |
 | start_block, length_blocks | absolute LBA + span of the BG region |
-| off_bg_header/data_bmap/data_region | intra-BG offsets, relative to `start_block` |
+| off_data_bmap/off_data_region | intra-BG offsets, relative to `start_block` (the header is block 0); `cetrafs_calc_bg_layout()` of the length and the data alignment |
 | data_block_count, free_data_blocks | usable blocks, cached free count — deltas accrue in the owner's memory on every data-block alloc/free (also rolled up into the owning ZG's aggregate) and are applied by one epoch-guarded compare-and-swap per dirty BG at the durability boundaries |
 | checksum | `__le64` CRC32C, computed by `mkfs`, verified by `fsck` and by the kernel's `cetrafs_read_bg_geom()` |
 | flags | `CETRAFS_BG_FLAG_DISCARDED` (in the pool, already discarded); `CETRAFS_BG_FLAG_DISCARD_PENDING` (its hand-back discard has an unknown outcome: allocated from by nobody until a later discard's outcome is known; see `docs/DISCARD-DESIGN.md`) |
@@ -336,9 +337,13 @@ block the allocator has given out again.
 
 ### BG Header — `cetrafs_bg_header_t` (first block of each BG region)
 
-Mirrors the Block Group Descriptor's layout fields plus a `gen` counter (bumped
-on resize/repair, currently never incremented). `checksum` is likewise `__le64`
-CRC32C, computed by `mkfs` and verified by `fsck`.
+The group's geometry and nothing else: `bg_id`, `off_data_bmap`,
+`off_data_region`, `length_blocks`, `data_block_count`, `checksum` (`__le64`
+CRC32C). Written once by `mkfs` or `growfs`, never again; it is what `fsck -r`
+rebuilds a lost descriptor from and what a live grow checks reached the device.
+Ownership is the descriptor's alone (0x000A removed a never-updated `owner_zg`
+copy, and the unused `flags` and `gen`, from here, and the always-zero
+`off_bg_header` from the descriptor).
 
 ### Inode — `cetrafs_inode_t` (204 bytes, one record per block)
 
@@ -442,7 +447,7 @@ read only from a superblock that passed its checksum.
 
 ## Tools
 
-### `mkfs.cetra <blockdev> [-z ZGs] [-b BG_MiB] [-N inodes] [-J MiB] [-M nodes] [-n] [-f]`
+### `mkfs.cetra <blockdev> [-z ZGs] [-b BG_MiB] [-N inodes] [-J MiB] [-M nodes] [-A KiB] [-n] [-f]`
 
 - `-z`: zone groups, 1..255, default 16 (clamped down to the real BG count)
 - `-b`: BG size in MiB, min 512, default 1024 (auto-shrunk to 512 when omitted on a small device — see below)

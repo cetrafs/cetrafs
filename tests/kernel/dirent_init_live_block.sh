@@ -70,7 +70,8 @@ for line in sys.argv[3].splitlines():
         continue
     start = int(f[3].split("=")[1])
     hdr = os.pread(fd, 24, start * 4096)
-    length, off_bmap, off_data = struct.unpack_from("<QII", hdr, 8)
+    # cetrafs_bg_header_t: bg_id, off_data_bmap, off_data_region (u32), length_blocks (u64)
+    _, off_bmap, off_data, length = struct.unpack_from("<IIIQ", hdr, 0)
     if not (start + off_data <= lba < start + length):
         continue
     bit = lba - start - off_data

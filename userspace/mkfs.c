@@ -215,7 +215,7 @@ static void usage(const char *argv0)
 {
     fprintf(stderr,
             "Usage: %s <blockdev> [-z ZGs] [-b BG_MiB] [-N inodes] [-J MiB] [-M nodes]\n"
-            "       [-s size] [-n] [-f]\n"
+            "       [-A KiB] [-s size] [-n] [-f]\n"
             "  -z: number of Zone Groups (1..%u), default the larger of 16 and -M\n"
             "      -- one per node that may ever write (clamped down to\n"
             "      however many Block Groups the device can actually back if\n"
@@ -230,6 +230,10 @@ static void usage(const char *argv0)
             "      at ~5%% of capacity; 0 disables; pass -J explicitly to\n"
             "      disable the auto-shrink)\n"
             "  -M: Node Registry capacity, max cluster nodes (default 64)\n"
+            "  -A: data alignment in KiB (default 1024): every Block Group and its\n"
+            "      data region start on a multiple of it -- the array's allocation\n"
+            "      unit (UNMAP granularity) or stripe. A power of two, 4..65536,\n"
+            "      dividing the Block Group size; 4 is no alignment\n"
             "  -s: format only this much of the device, leaving the rest unused\n"
             "      until the volume is grown (default: the whole device). Accepts\n"
             "      a K/M/G/T suffix; a bare number is MiB, like -b and -J\n"
@@ -596,6 +600,7 @@ int main(int argc, char **argv)
     u64 inodes_total = 0;                              /* 0 => derive */
     u64 j_per_node_bytes = 2ULL * 1024 * 1024;         /* 2 MiB per node slot */
     u64 node_table_count = 64;                         /* default cluster-size cap */
+    u64 align_blocks = CETRAFS_DATA_ALIGN_DEFAULT_BLOCKS; /* -A, in blocks */
     bool dry_run = false;
     bool force = false;
     bool bg_size_explicit = false;
@@ -603,7 +608,7 @@ int main(int argc, char **argv)
     u64 fs_bytes = 0; /* -s: format only this much of the device (0 => all) */
 
     int opt;
-    while ((opt = getopt(argc - 1, argv + 1, "z:b:N:J:M:s:nf")) != -1) {
+    while ((opt = getopt(argc - 1, argv + 1, "z:b:N:J:M:A:s:nf")) != -1) {
         switch (opt) {
         case 'z': {
             /* long long, as parse_int_arg returns: a 32-bit long cut
@@ -696,6 +701,16 @@ int main(int argc, char **argv)
                 return 2; /* out-of-range argument */
             }
             node_table_count = (u64) m;
+            break;
+        }
+        case 'A': {
+            long long kib = parse_int_arg(optarg, "-A");
+            /* Bounded in the unit it arrived in, before any multiply. */
+            if (kib < CETRAFS_BLOCK_SIZE / 1024 || kib > (long long) (CETRAFS_DATA_ALIGN_MAX_BLOCKS * CETRAFS_BLOCK_SIZE / 1024) ||
+                (kib & (kib - 1)))
+                die_arg("-A must be a power of two from %u to %llu KiB", CETRAFS_BLOCK_SIZE / 1024,
+                        (unsigned long long) (CETRAFS_DATA_ALIGN_MAX_BLOCKS * CETRAFS_BLOCK_SIZE / 1024));
+            align_blocks = (u64) kib * 1024 / CETRAFS_BLOCK_SIZE;
             break;
         }
         case 's':
@@ -917,7 +932,9 @@ int main(int argc, char **argv)
             die("internal calc error: the Zone Group / Block Group solve did not converge");
         zg_blocks = zg_count; /* 1 block each */
         pending_total_blk = (u64) pending_per_zg * zg_count;
-        fixed_wo_B = sb_blocks + zg_blocks + i_bmap_blk + i_tbl_blk + node_tbl_blk + pending_total_blk + j_total_blk;
+        /* + the most the first Block Group's alignment can skip. */
+        fixed_wo_B = sb_blocks + zg_blocks + i_bmap_blk + i_tbl_blk + node_tbl_blk + pending_total_blk + j_total_blk +
+                     (align_blocks - 1);
 
         /* Auto-tune the default BG size (only when -b wasn't given): the
          * default 1 GiB is fine whenever several such BGs fit, but on a
@@ -1013,10 +1030,13 @@ int main(int argc, char **argv)
                 zg_count, (unsigned long long) node_table_count, zg_count,
                 zg_explicit ? ", or a larger -z" : ", or a larger device");
 
+    /* Checked once the group size is final: -A must divide it. */
+    if (!cetrafs_data_align_ok(align_blocks, bg_size_blocks))
+        die_arg("-A %llu KiB does not divide the %llu MiB Block Group size",
+                (unsigned long long) (align_blocks * CETRAFS_BLOCK_SIZE / 1024),
+                (unsigned long long) (bg_size_blocks * CETRAFS_BLOCK_SIZE >> 20));
+
     const u64 bg_table_blk = B; /* one block per BG */
-    const u64 consumed = total_blocks - waste;
-    if (consumed > total_blocks)
-        die("internal calc error: consumed > total");
 
     /* --- lay out absolute LBAs --- */
     const u64 sb_lba = CETRAFS_SB_BLOCK_NR;      /* 0 */
@@ -1027,7 +1047,12 @@ int main(int argc, char **argv)
     const u64 node_tbl_lba = i_tbl_lba + i_tbl_blk;
     const u64 pending_lba = node_tbl_lba + node_tbl_blk;
     const u64 j_area_lba = pending_lba + pending_total_blk;
-    const u64 bg_regions_lba = j_area_lba + j_total_blk;
+    /* The first group on the alignment, so every group is (it divides
+     * the group size); the solve above kept room for the skip. */
+    const u64 bg_regions_lba = (j_area_lba + j_total_blk + align_blocks - 1) / align_blocks * align_blocks;
+
+    if (bg_regions_lba + B * bg_size_blocks > total_blocks)
+        die("internal calc error: consumed > total");
 
     /* --- build superblock --- */
     cetrafs_superblock_t sb;
@@ -1063,6 +1088,7 @@ int main(int argc, char **argv)
     sb.node_journal_blocks = cetrafs_cpu_to_le32((u32) j_per_node_blk);
 
     sb.bg_regions_start = cetrafs_cpu_to_le64(bg_regions_lba);
+    sb.data_align_blocks = cetrafs_cpu_to_le32((u32) align_blocks);
 
     /* The Block Group table starts as ONE contiguous run -- the
      * implicit first segment of the chain (cetrafs_bg_segment_t).
@@ -1148,7 +1174,7 @@ int main(int argc, char **argv)
      * free_data_blocks aggregate before the BG table itself is written */
     u32 off_bmap32, off_data32;
     u64 data_cnt;
-    cetrafs_calc_bg_layout(bg_size_blocks, &off_bmap32, &off_data32, &data_cnt);
+    cetrafs_calc_bg_layout(bg_size_blocks, align_blocks, &off_bmap32, &off_data32, &data_cnt);
 
     /* bg_owner_zg[b] records which ZG will claim BG b, for the BG table
      * loop below to stamp into bg.owner_zg.
@@ -1250,7 +1276,6 @@ int main(int argc, char **argv)
         bg.start_block = cetrafs_cpu_to_le64(next_bg_start);
         bg.length_blocks = cetrafs_cpu_to_le64(bg_size_blocks);
 
-        bg.off_bg_header = cetrafs_cpu_to_le32(0);
         bg.off_data_bmap = cetrafs_cpu_to_le32(off_bmap32);
         bg.off_data_region = cetrafs_cpu_to_le32(off_data32);
 
@@ -1275,9 +1300,6 @@ int main(int argc, char **argv)
         memset(&bh, 0, sizeof(bh));
 
         bh.bg_id = cetrafs_cpu_to_le32((u32) b);
-
-        bh.owner_zg = bg.owner_zg;
-        bh.flags = cetrafs_cpu_to_le16(0);
 
         bh.length_blocks = cetrafs_cpu_to_le64(bg_size_blocks);
         bh.off_data_bmap = cetrafs_cpu_to_le32(off_bmap32);

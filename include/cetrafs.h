@@ -399,7 +399,18 @@ typedef struct {
     __le32 fsck_needed_node;
     __le32 fsck_needed_pad;
 
-    u8  reserved[128];
+    /* Where Block Group data starts, in blocks (format 0x000A): every
+     * group starts on a multiple of it and its data region on the next
+     * multiple past its header and bitmap, so data -- and an emptied
+     * group's UNMAP -- lines up with the array's allocation unit or
+     * stripe. A power of two, at most CETRAFS_DATA_ALIGN_MAX_BLOCKS,
+     * dividing bg_size_blocks (cetrafs_data_align_ok()); 1 is no
+     * alignment. Set by mkfs (-A), fixed for the volume's life: a grow
+     * keeps it, and places its new groups by it. */
+    __le32 data_align_blocks;
+    __le32 data_align_pad;
+
+    u8  reserved[120];
 } CETRA_PACKED cetrafs_superblock_t;
 
 /*
@@ -1308,8 +1319,7 @@ typedef struct {
     __le64 start_block;           /* absolute LBA of the BG region start */
     __le64 length_blocks;         /* span size in blocks */
 
-    /* Intra‑BG offsets (relative to start_block) */
-    __le32 off_bg_header;         /* usually 0 */
+    /* Intra‑BG offsets (relative to start_block; the header is block 0) */
     __le32 off_data_bmap;         /* data bitmap blocks start */
     __le32 off_data_region;       /* first data block usable */
 
@@ -1353,36 +1363,28 @@ typedef struct {
      * fsck run. Fixing the pad to match reality makes both sides hash
      * the same CETRAFS_BLOCK_SIZE bytes without touching either call
      * site. (68 as of v0x0004: reconcile_seq above; 76 as of 0x000A:
-     * free_gen.) */
-    u8  pad[CETRAFS_BLOCK_SIZE - 76];
+     * free_gen; 72 once off_bg_header, always 0, was removed.) */
+    u8  pad[CETRAFS_BLOCK_SIZE - 72];
 } CETRA_PACKED cetrafs_block_group_t;
 
 /* ---- Intra‑BG Header (first block of region) ---- */
+/*  The group's geometry, written once by mkfs or growfs and never
+ *  again: what fsck -r rebuilds a lost descriptor from, and what a live
+ *  grow checks reached the device. Who owns the group is the
+ *  descriptor's alone -- a copy here (owner_zg, with flags and gen,
+ *  until format 0x000A) was never updated and only misled. */
 
 typedef struct {
     __le32 bg_id;
-    __le16 owner_zg;
-    __le16 flags;
-
-    __le64 length_blocks;         /* includes header + bitmap + data */
-
     __le32 off_data_bmap;         /* bitmap start (rel to BG.start) */
     __le32 off_data_region;       /* data region start (rel to BG.start) */
 
+    __le64 length_blocks;         /* includes header + bitmap + data */
     __le64 data_block_count;
 
-    __le64 gen;                   /* increments on resize/repair */
     __le64 checksum;
 
-    /* pad sized against the *real* preceding field total (48 bytes), not
-     * the "-64" guess this had previously -- same bug as
-     * cetrafs_block_group_t above, 16 bytes off here. Not currently a
-     * live checksum mismatch (only mkfs.c/fsck.c ever touch this
-     * struct's checksum, both via sizeof(), so they were at least
-     * self-consistent) but it meant sizeof(cetrafs_bg_header_t) was
-     * 4080, not CETRAFS_BLOCK_SIZE as every comment claims -- fixed for
-     * the same reason, before anything else starts trusting that. */
-    u8  pad[CETRAFS_BLOCK_SIZE - 48];
+    u8  pad[CETRAFS_BLOCK_SIZE - 36];
 } CETRA_PACKED cetrafs_bg_header_t;
 
 /* ---- Extents: ext4‑style tree ---- */
@@ -1956,7 +1958,13 @@ static inline u64 cetrafs_calc_bg_dbm_blocks(u64 bg_length_blocks)
     return CETRAFS_DIV_ROUND_UP(L, CETRAFS_BITS_PER_BLOCK + 1ULL);
 }
 
+/* The layout of a group of bg_length_blocks on a volume aligned to
+ * align_blocks (cetrafs_superblock_t.data_align_blocks; 0 reads as 1):
+ * the data region starts at the first multiple of the alignment past
+ * the header and the bitmap. The one definition: mkfs, growfs, fsck and
+ * the kernel's grow check all use it. */
 static inline void cetrafs_calc_bg_layout(u64 bg_length_blocks,
+                                          u64 align_blocks,
                                           u32 *off_data_bmap,
                                           u32 *off_data_region,
                                           u64 *data_block_count)
@@ -1964,11 +1972,36 @@ static inline void cetrafs_calc_bg_layout(u64 bg_length_blocks,
     u64 dbm = cetrafs_calc_bg_dbm_blocks(bg_length_blocks);
     u64 off_bmap = CETRAFS_BG_HEADER_BLOCKS;          /* header at 0 */
     u64 off_data = off_bmap + dbm;
+
+    if (align_blocks > 1)
+        off_data = (off_data + align_blocks - 1) / align_blocks * align_blocks;
     u64 data_cnt = (bg_length_blocks > off_data) ? (bg_length_blocks - off_data) : 0;
 
     if (off_data_bmap)   *off_data_bmap   = (u32)off_bmap;
     if (off_data_region) *off_data_region = (u32)off_data;
     if (data_block_count)*data_block_count= data_cnt;
+}
+
+/* Data alignment: what mkfs uses unless told otherwise (1 MiB, the
+ * common array allocation unit and partition boundary), and the most
+ * it accepts (64 MiB). */
+#define CETRAFS_DATA_ALIGN_DEFAULT_BLOCKS (1048576ULL / CETRAFS_BLOCK_SIZE)
+#define CETRAFS_DATA_ALIGN_MAX_BLOCKS     (67108864ULL / CETRAFS_BLOCK_SIZE)
+
+/* Is align_blocks a data alignment a volume of bg_size_blocks groups
+ * may have? A power of two up to the maximum that divides the group
+ * size -- so every group of a volume whose first one is aligned is
+ * aligned too -- and leaves the group data. Checked by the mount, fsck
+ * and growfs before any of them uses it. */
+static inline int cetrafs_data_align_ok(u64 align_blocks, u64 bg_size_blocks)
+{
+    u64 cnt;
+
+    if (!align_blocks || align_blocks > CETRAFS_DATA_ALIGN_MAX_BLOCKS || (align_blocks & (align_blocks - 1)) ||
+        !bg_size_blocks || bg_size_blocks % align_blocks)
+        return 0;
+    cetrafs_calc_bg_layout(bg_size_blocks, align_blocks, 0, 0, &cnt);
+    return cnt > 0;
 }
 
 /* Convenience: absolute LBA of first BG region */
@@ -2010,11 +2043,5 @@ static inline void cetrafs_extent_phys_to_hilo(u64 phys, __le16 *hi, __le32 *lo)
     if (hi) *hi = cetrafs_cpu_to_le16((u16)(phys >> 32));
     if (lo) *lo = cetrafs_cpu_to_le32((u32)(phys & 0xFFFFFFFFu));
 }
-
-/* ---- Invariants & guardrails (non-fatal hints; real checks in _sane() funcs) ---- */
-#define CETRAFS_INVAR_BG_OFFSETS_VALID(bg) \
-    ((bg).off_bg_header == 0 && \
-     (bg).off_data_bmap >= CETRAFS_BG_HEADER_BLOCKS && \
-     (bg).off_data_region > (bg).off_data_bmap)
 
 #endif /* CETRAFS_LAYOUT_H */

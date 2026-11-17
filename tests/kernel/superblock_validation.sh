@@ -121,6 +121,9 @@ check inodes_count 0 "an inode table nothing can be allocated from"
 check node_table_count 0 "a Node Registry no node can register in"
 check sb_bytes 439 "a superblock of a size this build does not agree with"
 check node_entry_size 4 "a registry row smaller than the struct written into it"
+check data_align_blocks 0 "no data alignment at all, which every group's layout is computed from"
+check data_align_blocks 3 "a data alignment that is not a power of two"
+check data_align_blocks 1048576 "a data alignment past the 64 MiB maximum"
 
 log "a cluster larger than the read-presence mask is refused"
 # Row indices are taken modulo 64 in cetrafs_inode_t.read_open_nodes, so

@@ -550,12 +550,16 @@ int main(int argc, char **argv)
     if (cetrafs_le64(sb.bg_size_blocks) < 64)
         die("%s: invalid bg_size_blocks %" PRIu64 " -- run fsck.cetra first", dev,
             (u64) cetrafs_le64(sb.bg_size_blocks));
+    /* It places every group this grow adds. */
+    if (!cetrafs_data_align_ok(cetrafs_le32(sb.data_align_blocks), cetrafs_le64(sb.bg_size_blocks)))
+        die("%s: invalid data_align_blocks %u -- run fsck.cetra first", dev, cetrafs_le32(sb.data_align_blocks));
 
     const u64 old_total = cetrafs_le64(sb.total_blocks);
     const u32 old_z = cetrafs_le32(sb.zone_group_count);
     const u32 old_b = cetrafs_le32(sb.block_group_count);
     const u64 bg_size = cetrafs_le64(sb.bg_size_blocks);
     const u64 regions_start = cetrafs_le64(sb.bg_regions_start);
+    const u64 align = cetrafs_le32(sb.data_align_blocks);
 
     if (old_total > dev_blocks)
         die("%s: superblock claims %" PRIu64 " blocks but the device has %" PRIu64
@@ -615,6 +619,11 @@ int main(int argc, char **argv)
 
     if (old_reserve_blocks && old_reserve_start + old_reserve_blocks > new_bg_start)
         new_bg_start = old_reserve_start + old_reserve_blocks;
+    /* On the volume's data alignment, as mkfs placed the first group
+     * (cetrafs_superblock_t.data_align_blocks): the skip widens the hole
+     * bg_data_end already allows for. A never-grown volume's groups end
+     * on it already. */
+    new_bg_start = (new_bg_start + align - 1) / align * align;
 
     /*
      * TEST-ONLY. Shifts the new BG regions by this many BGs, to place
@@ -752,7 +761,7 @@ int main(int argc, char **argv)
     u32 off_bmap32, off_data32;
     u64 data_cnt;
 
-    cetrafs_calc_bg_layout(bg_size, &off_bmap32, &off_data32, &data_cnt);
+    cetrafs_calc_bg_layout(bg_size, align, &off_bmap32, &off_data32, &data_cnt);
 
     fprintf(stdout,
             "cetrafs growfs %s\n"
@@ -926,9 +935,6 @@ int main(int argc, char **argv)
 
             memset(&bh, 0, sizeof(bh));
             bh.bg_id = cetrafs_cpu_to_le32((u32) b);
-            /* Offline: fixed up by the ZG pass below. Live: the pool. */
-            bh.owner_zg = cetrafs_cpu_to_le16(live ? CETRAFS_BG_OWNER_FREE : 0);
-            bh.flags = cetrafs_cpu_to_le16(0);
             bh.length_blocks = cetrafs_cpu_to_le64(bg_size);
             bh.off_data_bmap = cetrafs_cpu_to_le32(off_bmap32);
             bh.off_data_region = cetrafs_cpu_to_le32(off_data32);
@@ -1049,7 +1055,6 @@ int main(int argc, char **argv)
 
             bg.start_block = cetrafs_cpu_to_le64(desc_start);
             bg.length_blocks = cetrafs_cpu_to_le64(bg_size);
-            bg.off_bg_header = cetrafs_cpu_to_le32(0);
             bg.off_data_bmap = cetrafs_cpu_to_le32(off_bmap32);
             bg.off_data_region = cetrafs_cpu_to_le32(off_data32);
             bg.data_block_count = cetrafs_cpu_to_le64(data_cnt);
@@ -1060,22 +1065,6 @@ int main(int argc, char **argv)
 
             memcpy(blk, &bg, sizeof(bg));
             write_block(fd, seg_first_desc + (b - old_b), blk, true);
-
-            /* The header written in step 1 guessed owner_zg; correct it
-             * now that the spans are decided. Still ahead of the publish,
-             * so nothing has ever seen the wrong value. */
-            {
-                cetrafs_bg_header_t bh;
-
-                read_block(fd, start, blk);
-                memcpy(&bh, blk, sizeof(bh));
-                bh.owner_zg = cetrafs_cpu_to_le16((u16) bg_owner[b]);
-                bh.checksum = cetrafs_cpu_to_le64(0);
-                bh.checksum = cetrafs_cpu_to_le64(crc32c_struct(
-                    &bh, sizeof(bh), offsetof(cetrafs_bg_header_t, checksum), sizeof(cetrafs_le64(bh.checksum))));
-                memcpy(blk, &bh, sizeof(bh));
-                write_block(fd, start, blk, !skip_bg_hdr);
-            }
             start += bg_size;
         }
     }
