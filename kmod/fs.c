@@ -7155,11 +7155,18 @@ void cetrafs_sb_undrain_bg(struct super_block *sb, u32 bg_id)
     mutex_unlock(&sbi->alloc_mutex);
 }
 
+/* TEST ONLY: a Block Group's owner is set without owned_lock, as before
+ * audit A-2 -- the control of tests/kernel/grow_live_owned_race.sh B. */
+static bool cetrafs_bg_owner_unlocked;
+cetrafs_test_param(bg_owner_unlocked, cetrafs_bg_owner_unlocked, bool, 0644);
+MODULE_PARM_DESC(bg_owner_unlocked, "TEST ONLY: set a Block Group's owner without owned_lock");
+
 void cetrafs_sb_set_bg_owner(struct super_block *sb, u32 bg_id, u32 zg_id)
 {
     struct cetrafs_sb_info *sbi = sb ? sb->s_fs_info : NULL;
 
     struct cetrafs_bg_chunk *c;
+    bool unlocked = READ_ONCE(cetrafs_bg_owner_unlocked);
     u32 i;
 
     c = cetrafs_bgc(sbi, bg_id, &i);
@@ -7169,15 +7176,19 @@ void cetrafs_sb_set_bg_owner(struct super_block *sb, u32 bg_id, u32 zg_id)
     /* Under owned_lock, like the derive (cetrafs_sb_owned_bgs_derive()):
      * otherwise a release's derive could run between this test of
      * owned_zgs and the set_bit, and the group stayed marked ours in a
-     * Zone Group given away (audit 2026-11-14 A-2). */
-    spin_lock(&sbi->owned_lock);
+     * Zone Group given away (audit 2026-11-14 A-2). It also makes a
+     * release wait out a held layout publish rather than land in it
+     * (tests/kernel/grow_live_owned_race.sh B). */
+    if (!unlocked)
+        spin_lock(&sbi->owned_lock);
     WRITE_ONCE(c->bg_owner_zg[i], (u16) zg_id);
     if (zg_id < CETRAFS_MAX_ZONE_GROUPS && test_bit(zg_id, sbi->owned_zgs) &&
         !cetrafs_sb_bg_discard_pending_ignored(sbi, bg_id))
         set_bit(i, c->owned_bgs), set_bit(i, c->release_check);
     else
         clear_bit(i, c->owned_bgs);
-    spin_unlock(&sbi->owned_lock);
+    if (!unlocked)
+        spin_unlock(&sbi->owned_lock);
 }
 
 /* Any Zone Group this node owns, for claiming a free Block Group into.

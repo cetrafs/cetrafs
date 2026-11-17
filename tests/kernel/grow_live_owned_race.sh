@@ -31,15 +31,21 @@
 #     real lock: the new Block Group is marked.
 #  B. release: Zone Group 1 ours and emptied; the heartbeat's release
 #     (held back with zg_release_hold until the hold began) gives it up
-#     in the hold. Control first, then the lock: nothing stray.
+#     while the publish is held. Since audit A-2 (3047019) the release
+#     sets its groups' owner under owned_lock too, so it waits the hold
+#     out and lands after the publish: nothing stray. The control takes
+#     both locks away (bg_owner_unlocked=1, owned_derive_unlocked=1): the
+#     release then lands inside the hold and leaves the new group marked
+#     ours.
 #
-# DISCRIMINATION: the controls are the lock removed, selected by the knob.
+# DISCRIMINATION: the controls are the lock removed, selected by the knob
+# (A: owned_derive_unlocked; B: that and bg_owner_unlocked).
 # ct-timeout: 900
 set -euo pipefail
 . "$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)/lib/harness.sh"
 require_root
 require_module
-for k in layout_publish_hold_ms owned_derive_unlocked zg_release_hold grow_skip_local_publish zg_claim_layout_stale; do
+for k in layout_publish_hold_ms owned_derive_unlocked bg_owner_unlocked zg_release_hold grow_skip_local_publish zg_claim_layout_stale; do
     [ -w "/sys/module/cetrafs/parameters/$k" ] || { skip "$k is missing"; ct_exit; }
 done
 BG_POKE="$(ct_helper bg_poke)"
@@ -58,6 +64,7 @@ ct_param_set layout_refresh_hb_off 0
 ct_param_set layout_past_end_no_refresh 0
 ct_param_set layout_publish_hold_ms 0
 ct_param_set owned_derive_unlocked 0
+ct_param_set bg_owner_unlocked 0
 ct_param_set zg_release_hold 0
 ct_param_set zg_claim_layout_stale 0
 
@@ -182,20 +189,24 @@ run_claim() {
 run_release() {
     local tag="$1" o0 r
     stage release || return 0
+    ct_param_set bg_owner_unlocked "$2"
     ct_param_set owned_derive_unlocked "$2"
     o0="$(info owned_derive_overlaps)"
     ct_param_set layout_publish_hold_ms 4000
     (head -c 10 "$MNT/v1" >"$MNT.read" 2>/dev/null || true) &
     r=$!
-    hold_began || { wait "$r"; fail "$tag: setup: the read never reached the publish hold"; ct_param_set layout_publish_hold_ms 0; ct_param_set owned_derive_unlocked 0; ct_umount "$MNT"; return 0; }
+    hold_began || { wait "$r"; fail "$tag: setup: the read never reached the publish hold"; ct_param_set layout_publish_hold_ms 0; ct_param_set owned_derive_unlocked 0; ct_param_set bg_owner_unlocked 0; ct_umount "$MNT"; return 0; }
     ct_param_set zg_release_hold 0 # the next beat (2 s) releases Zone Group 1, in the hold
     wait "$r"
     for _ in $(seq 1 20); do [ "$(zg_owner 1)" = none ] && break; sleep 0.5; done
+    ct_param_set bg_owner_unlocked 0
     ct_param_set owned_derive_unlocked 0
-    [ "$(info owned_derive_overlaps)" -gt "$o0" ] && [ "$(info block_group_count)" -gt "$NEWID" ] &&
-        [ "$(zg_owner 1)" = none ] ||
-        { fail "$tag: setup: the release did not land in the held publish (overlaps $o0 -> $(info owned_derive_overlaps), BGs $(info block_group_count), ZG1 owner $(zg_owner 1))"; ct_umount "$MNT"; return 0; }
-    pass "$tag: setup: Zone Group 1 was released while the publish adding BG$NEWID was held"
+    # The release raced the held publish; it lands inside the hold only
+    # without the lock (the control), and that is asserted there.
+    [ "$(info block_group_count)" -gt "$NEWID" ] && [ "$(zg_owner 1)" = none ] &&
+        { [ "$2" = 0 ] || [ "$(info owned_derive_overlaps)" -gt "$o0" ]; } ||
+        { fail "$tag: setup: the release did not race the held publish (overlaps $o0 -> $(info owned_derive_overlaps), BGs $(info block_group_count), ZG1 owner $(zg_owner 1))"; ct_umount "$MNT"; return 0; }
+    pass "$tag: setup: Zone Group 1 was released against the held publish adding BG$NEWID"
     MISSING="$(info owned_bgs_missing)"; STRAY="$(info owned_bgs_stray)"
     [ "$(cat "$MNT.read")" = MARKER-ONE ] || fail "$tag: the read that published got '$(cat "$MNT.read")'"
 }
@@ -217,7 +228,7 @@ log "B: a release inside a held publish"
 MISSING=""; STRAY=""
 run_release "B control" 1
 [ "${STRAY:-0}" -ge 1 ] && pass "B control: without the lock BG$NEWID of the released Zone Group stays marked ours ($STRAY stray)" ||
-    fail "B control: without the lock nothing was left stray (stray ${STRAY:-?}, missing ${MISSING:-?}) -- the suite cannot tell the lock from its absence"
+    fail "B control: without the owner lock nothing was left stray (stray ${STRAY:-?}, missing ${MISSING:-?}) -- the suite cannot tell the lock from its absence"
 mountpoint -q "$MNT" && ct_umount "$MNT"
 MISSING=""; STRAY=""
 run_release "B" 0
