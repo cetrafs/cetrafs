@@ -2914,6 +2914,13 @@ MODULE_PARM_DESC(cold_size_retry_off, "TEST ONLY: the cold reconcile's size appl
 
 static bool cetrafs_apply_trylock_fail_once;
 
+/* TEST ONLY: every size apply of the cold reconcile finds the inode lock
+ * contended, as under a VM's overlapping O_DIRECT reads (review F-55,
+ * tests/kernel/cold_reconcile_size.sh). */
+static bool cetrafs_cold_size_contend;
+cetrafs_test_param(cold_size_contend, cetrafs_cold_size_contend, bool, 0644);
+MODULE_PARM_DESC(cold_size_contend, "TEST ONLY: the cold reconcile's size apply always finds the inode lock contended");
+
 /*
  * The cold reconcile's size half (lock.c's cetrafs_inode_cold_work()).
  * A file_seq change sends the tree and the clean pages back to the
@@ -2950,7 +2957,8 @@ int cetrafs_inode_apply_size_from_raw(struct inode *inode, const cetrafs_inode_t
      * be held long (cetrafs_inode_cold_work()).
      */
     for (attempt = 0;; attempt++) {
-        bool contended = READ_ONCE(cetrafs_apply_trylock_fail_once) && xchg(&cetrafs_apply_trylock_fail_once, false);
+        bool contended = READ_ONCE(cetrafs_cold_size_contend) ||
+                         (READ_ONCE(cetrafs_apply_trylock_fail_once) && xchg(&cetrafs_apply_trylock_fail_once, false));
 
         if (!contended && inode_trylock(inode))
             break;

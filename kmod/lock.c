@@ -4828,6 +4828,13 @@ static unsigned int cetrafs_cold_read_fail;
 cetrafs_test_param(cold_read_fail, cetrafs_cold_read_fail, uint, 0644);
 MODULE_PARM_DESC(cold_read_fail, "TEST ONLY: the next N cold-tree reconciles cannot read the record");
 
+/* TEST ONLY: a size apply that keeps losing the inode lock counts toward
+ * the park's cap and is given up, as before review F-55
+ * (tests/kernel/cold_reconcile_size.sh). */
+static bool cetrafs_cold_size_park_capped;
+cetrafs_test_param(cold_size_park_capped, cetrafs_cold_size_park_capped, bool, 0644);
+MODULE_PARM_DESC(cold_size_park_capped, "TEST ONLY: a contended cold size apply is given up after the park's cap");
+
 static void cetrafs_inode_cold_work(struct work_struct *w)
 {
     struct cetrafs_inode_info *ci = container_of(w, struct cetrafs_inode_info, cold_work);
@@ -4835,7 +4842,7 @@ static void cetrafs_inode_cold_work(struct work_struct *w)
     struct super_block *sb = inode->i_sb;
     cetrafs_inode_t *raw;
     int g = cetrafs_tree_cold_begin(ci);
-    bool dropped = false;
+    bool dropped = false, size_pending = false;
     int rret = -ENOMEM;
 
     if (cetrafs_cold_work_stall_ms)
@@ -4857,6 +4864,7 @@ static void cetrafs_inode_cold_work(struct work_struct *w)
             if (cetrafs_inode_apply_size_from_raw(inode, raw) == -EAGAIN) {
                 dropped = false;
                 rret = -EAGAIN;
+                size_pending = true;
             }
         }
         kfree(raw);
@@ -4897,7 +4905,16 @@ static void cetrafs_inode_cold_work(struct work_struct *w)
          * CETRAFS_COLD_RETRIES_MAX tries it is left cold, said once. An
          * unmount closes the park and drops what is on it.
          */
-        if (++ci->cold_retries <= CETRAFS_COLD_RETRIES_MAX) {
+        /* The size alone still to apply, the record read fine: the
+         * inode lock was busy, under reads that may never pause long
+         * enough -- a VM's overlapping O_DIRECT reads. That retry has no
+         * cap: each is bounded (the apply's trylocks), the record is
+         * sound, and giving up left the held fd at the old size for good
+         * (review F-55). */
+        if (size_pending && !READ_ONCE(cetrafs_cold_size_park_capped)) {
+            if (cetrafs_sb_cold_park(sb, &ci->cold_park))
+                return;
+        } else if (++ci->cold_retries <= CETRAFS_COLD_RETRIES_MAX) {
             if (cetrafs_sb_cold_park(sb, &ci->cold_park))
                 return;
         } else {

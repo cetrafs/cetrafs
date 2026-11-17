@@ -26,23 +26,30 @@
 #      heartbeat, the fd reading short meanwhile -- on an arm64 host it
 #      lost to the suite's own read every time.
 #
+#   4. the inode lock contended on EVERY try, past the park's 8 beats
+#      (cold_size_contend, a VM's overlapping O_DIRECT reads): once it
+#      frees, the size arrives -- the size retry has no cap (review F-55).
+#
 # DISCRIMINATION: cold_size_off=1 (the old reconcile): 1 and 2 fail;
-# cold_size_retry_off=1 (one trylock, then the park): 3 fails.
+# cold_size_retry_off=1 (one trylock, then the park): 3 fails;
+# cold_size_park_capped=1 (given up after 8 beats): 4 fails.
 set -euo pipefail
 . "$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)/lib/harness.sh"
 require_root
 require_module
-for k in cold_size_off cold_size_retry_off apply_trylock_fail_once; do
+for k in cold_size_off cold_size_retry_off apply_trylock_fail_once cold_size_contend cold_size_park_capped; do
     [ -w "/sys/module/cetrafs/parameters/$k" ] || { skip "$k is missing"; ct_exit; }
 done
 ct_param_set cold_size_off 0
 ct_param_set cold_size_retry_off 0
 ct_param_set apply_trylock_fail_once 0
+ct_param_set cold_size_contend 0
+ct_param_set cold_size_park_capped 0
 POKE="$(ct_helper inode_lock_poke)"
 MNT="$(ct_mnt crs)"
 ct_track mnt "$MNT"
 
-# <cold_size_off 0|1> <cold_size_retry_off 0|1> <contend 0|1>
+# <cold_size_off 0|1> <cold_size_retry_off 0|1> <contend 0|1|2 (once|always)> [<capped 0|1>]
 #   -> "open=<blocks> size=<blocks> end=<blocks> data=<ok|short|bad>"
 round() {
     local img dev ino
@@ -62,18 +69,27 @@ os.fsync(fd); os.close(fd)"
     mount -t cetrafs -o nofilelock "$dev" "$MNT"
     echo "$1" >/sys/module/cetrafs/parameters/cold_size_off
     echo "$2" >/sys/module/cetrafs/parameters/cold_size_retry_off
-    python3 - "$MNT/img" "$img" "$ino" "$POKE" "$3" <<'PY'
+    echo "${4:-0}" >/sys/module/cetrafs/parameters/cold_size_park_capped
+    python3 - "$MNT/img" "$img" "$ino" "$POKE" "$3" "$(cat /sys/module/cetrafs/parameters/hb_interval_secs)" <<'PY'
 import os, sys, mmap, subprocess, time
-path, img, ino, poke, contend = sys.argv[1:6]
+path, img, ino, poke, contend, hb = sys.argv[1:7]
+hb = int(hb)
+P = "/sys/module/cetrafs/parameters/"
 buf = mmap.mmap(-1, 4096)
 fd = os.open(path, os.O_RDWR | os.O_DIRECT)
 opened = os.fstat(fd).st_size // 4096
 subprocess.run([poke, img, "--peer-size", ino, str(64 * 4096), "1"], check=True, stdout=subprocess.DEVNULL)
 if contend == "1":
-    open("/sys/module/cetrafs/parameters/apply_trylock_fail_once", "w").write("1")
+    open(P + "apply_trylock_fail_once", "w").write("1")
+if contend == "2":
+    open(P + "cold_size_contend", "w").write("1")
 time.sleep(1.2)                     # past the once-a-second verdict
 os.preadv(fd, [buf], 0)             # the gate reads the record, sees the peer's stamp
 time.sleep(1)                       # the reconcile runs
+if contend == "2":
+    time.sleep(10 * hb + 2)         # past the park's 8 beats, every try contended
+    open(P + "cold_size_contend", "w").write("0")
+    time.sleep(3 * hb + 2)          # a beat or two to retry from the park
 size = os.fstat(fd).st_size // 4096
 end = os.lseek(fd, 0, os.SEEK_END) // 4096
 n = os.preadv(fd, [buf], 40 * 4096)
@@ -84,6 +100,8 @@ PY
     echo 0 >/sys/module/cetrafs/parameters/cold_size_off
     echo 0 >/sys/module/cetrafs/parameters/cold_size_retry_off
     echo 0 >/sys/module/cetrafs/parameters/apply_trylock_fail_once
+    echo 0 >/sys/module/cetrafs/parameters/cold_size_contend
+    echo 0 >/sys/module/cetrafs/parameters/cold_size_park_capped
     umount "$MNT"
 }
 get() { sed -n "s/.*$1=\([0-9a-zA-Z]*\).*/\1/p" <<<"$2"; }
@@ -96,6 +114,13 @@ R3="$(round 0 0 1)"
 log "3: contended once: $R3"
 C3="$(round 0 1 1)"
 log "3 control (one trylock, then the park): $C3"
+# Round 3's control needs the default beat (a park retried inside its
+# second would pass it); round 4 waits out 8 beats, so short ones.
+compress_timing
+R4="$(round 0 0 2 0)"
+log "4: contended past the park's cap: $R4"
+C4="$(round 0 0 2 1)"
+log "4 control (given up after 8 beats): $C4"
 [ "$(get open "$R")" = 16 ] && [ "$(get open "$C")" = 16 ] || { fail "setup: the fd did not open at 16 blocks ($R | $C)"; ct_exit; }
 pass "setup: the held fd opened at 16 blocks"
 [ "$(get size "$R")" = 64 ] && [ "$(get end "$R")" = 64 ] && pass "1: fstat and SEEK_END follow the peer's size (64 blocks)" ||
@@ -109,4 +134,10 @@ pass "setup: the held fd opened at 16 blocks"
 [ "$(get size "$C3")" = 16 ] &&
     pass "3 control: one trylock and the park leave the fd at 16 blocks" ||
     fail "3 control: the single-trylock reconcile still applied the size ($C3) -- the suite does not reach the contention"
+[ "$(get size "$R4")" = 64 ] && [ "$(get data "$R4")" = ok ] &&
+    pass "4: contended past 8 beats, the size still arrives once the lock frees" ||
+    fail "4: after the contention ended the held fd says size=$(get size "$R4"), block 40 $(get data "$R4")"
+[ "$(get size "$C4")" = 16 ] &&
+    pass "4 control: the capped retry gave up and left the fd at 16 blocks" ||
+    fail "4 control: the capped retry still applied the size ($C4) -- the suite does not outlast the cap"
 ct_exit
