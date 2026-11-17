@@ -1052,8 +1052,9 @@ static void cetrafs_status_bio_end(struct bio *bio)
 }
 
 /*
- * Write up to two buffers published by cetrafs_bh_end_update() -- a
- * journal entry's payload and header -- together, and say for each what
+ * Write buffers published by cetrafs_bh_end_update() -- a journal
+ * entry's payload and header, or a whole batch of entries -- together,
+ * and say for each what
  * the DEVICE answered (st[i], an errno): the buffer layer's own completion
  * keeps only "uptodate or not", and a definite "no space" must be told
  * from a write that may have landed (audit 2026-11-14 A-4). Ends each
@@ -1063,14 +1064,28 @@ static void cetrafs_status_bio_end(struct bio *bio)
 void cetrafs_write_bhs_status(struct super_block *sb, struct buffer_head **bhs, unsigned int n, int *st)
 {
     DECLARE_COMPLETION_ONSTACK(all);
-    struct cetrafs_status_bio io[2];
-    bool sent[2] = {false, false};
+    struct cetrafs_status_bio io_two[2], *io = io_two;
+    bool sent_two[2], *sent = sent_two;
     atomic_t left = ATOMIC_INIT(1);
     struct blk_plug plug;
     unsigned int i;
 
-    if (WARN_ON_ONCE(n > 2))
-        n = 2;
+    /* A tree batch's entries come here too, all of them at once
+     * (cetrafs_journal_batch_chunk()); with no memory for that, two at
+     * a time, which is slower and nothing else. */
+    if (n > 2) {
+        io = kmalloc_array(n, sizeof(*io), GFP_NOFS);
+        sent = kmalloc_array(n, sizeof(*sent), GFP_NOFS);
+        if (!io || !sent) {
+            kfree(io);
+            kfree(sent);
+            for (i = 0; i < n; i += 2)
+                cetrafs_write_bhs_status(sb, bhs + i, min(2U, n - i), st + i);
+            return;
+        }
+    }
+    for (i = 0; i < n; i++)
+        sent[i] = false;
     blk_start_plug(&plug);
     for (i = 0; i < n; i++) {
         struct buffer_head *bh = bhs[i];
@@ -1125,6 +1140,10 @@ void cetrafs_write_bhs_status(struct super_block *sb, struct buffer_head **bhs, 
             set_buffer_uptodate(bhs[i]);
         }
         unlock_buffer(bhs[i]);
+    }
+    if (io != io_two) {
+        kfree(io);
+        kfree(sent);
     }
 }
 
@@ -1615,45 +1634,65 @@ void cetrafs_bh_deferred_settle(struct super_block *sb, struct buffer_head *bh, 
 /* The two halves of cetrafs_write_deferred_target(), so a batch can
  * have every target in flight at once: submit returns 1 (no longer held
  * back, nothing submitted), 0 (submitted: wait for it) or an error. */
-int cetrafs_submit_deferred_target(struct super_block *sb, struct buffer_head *bh, u32 *wcrc)
+/*
+ * A held-back tree block refused DEFINITELY (A-4): nothing landed, its
+ * journal entry -- durable, holding this image -- stays live for replay,
+ * the block stays held back for the next boundary, and the boundary
+ * fails with ENOSPC. That is the state a crash right before the target
+ * write leaves, which replay and every peer already handle.
+ */
+static bool cetrafs_tree_refusal_stops;
+cetrafs_test_param(tree_refusal_stops, cetrafs_tree_refusal_stops, bool, 0644);
+MODULE_PARM_DESC(tree_refusal_stops, "TEST ONLY: a tree-block write refused for space stops the mount, as before");
+
+/* TEST ONLY: the next N held-back tree-block target writes answer
+ * BLK_STS_NOSPC unsent (tests/kernel/tree_nospc_boundary.sh). */
+static unsigned int cetrafs_tree_target_nospc;
+cetrafs_test_param(tree_target_nospc, cetrafs_tree_target_nospc, uint, 0644);
+MODULE_PARM_DESC(tree_target_nospc, "TEST ONLY: the next N tree-block target writes are refused for space");
+
+static atomic64_t cetrafs_tree_refusals = ATOMIC64_INIT(0);
+
+u64 cetrafs_tree_refusal_count(void)
 {
-    if (cetrafs_sb_is_fenced(sb))
-        return -EIO;
-    lock_buffer(bh);
-    if (cetrafs_meta_gate_shut(sb)) {
-        unlock_buffer(bh);
-        return -EIO; /* not sent: the fence's sweep discards it */
-    }
-    if (!buffer_cetra_deferred(bh)) {
-        unlock_buffer(bh);
-        return 1;
-    }
-    cetrafs_blk_tail_settle(bh); /* what reaches the device carries its CRC */
-    *wcrc = ~crc32c(~0U, bh->b_data, CETRAFS_BLOCK_SIZE);
-    clear_buffer_write_io_error(bh);
-    clear_buffer_dirty(bh);
-#if LINUX_VERSION_CODE >= KERNEL_VERSION(7, 2, 0)
-    bh_submit(bh, REQ_OP_WRITE | REQ_SYNC, cetrafs_end_write_keep);
-#else
-    get_bh(bh);
-    bh->b_end_io = cetrafs_end_write_keep;
-    submit_bh(REQ_OP_WRITE | REQ_SYNC, bh);
-#endif
-    return 0;
+    return (u64) atomic64_read(&cetrafs_tree_refusals);
 }
 
-int cetrafs_wait_deferred_target(struct super_block *sb, struct buffer_head *bh)
+/* A tree batch's refusal, survivable as above unless the test knob says
+ * otherwise: counted and said once per call. */
+bool cetrafs_tree_refusal_survivable(struct super_block *sb, sector_t block, int status)
 {
-    wait_on_buffer(bh);
-    if (buffer_write_io_error(bh)) {
-        clear_buffer_write_io_error(bh);
-        return cetrafs_meta_write_result(sb, bh, -EIO);
-    }
-    return cetrafs_meta_write_result(sb, bh, 0);
+    if (!cetrafs_refusal_definite(status) || READ_ONCE(cetrafs_tree_refusal_stops))
+        return false;
+    atomic64_inc(&cetrafs_tree_refusals);
+    pr_warn_ratelimited("%s: the device refused a held-back tree-block write (block %llu, %d, no space) -- kept "
+                        "for the next boundary, which fails with ENOSPC meanwhile\n",
+                        sb->s_id, (unsigned long long) block, status);
+    return true;
 }
 
-int cetrafs_write_deferred_target(struct super_block *sb, struct buffer_head *bh, u32 *wcrc)
+static void cetrafs_dtarget_end(struct bio *bio)
 {
+    struct cetrafs_dtarget_io *io = bio->bi_private;
+
+    io->status = blk_status_to_errno(bio->bi_status);
+    bio_put(bio);
+    complete(&io->done);
+}
+
+/*
+ * Send a held-back block's current image to its own LBA, with a bio of
+ * its own so its status is the device's (the buffer layer's completion
+ * keeps only "uptodate or not", and a definite refusal must be told from
+ * a torn write). 0: sent, the buffer stays LOCKED until
+ * cetrafs_wait_deferred_target(); 1: nothing held back, nothing sent;
+ * < 0: not sent.
+ */
+int cetrafs_submit_deferred_target(struct super_block *sb, struct buffer_head *bh, u32 *wcrc,
+                                   struct cetrafs_dtarget_io *io)
+{
+    struct bio *bio;
+
     if (cetrafs_sb_is_fenced(sb))
         return -EIO;
     lock_buffer(bh);
@@ -1671,19 +1710,47 @@ int cetrafs_write_deferred_target(struct super_block *sb, struct buffer_head *bh
     *wcrc = ~crc32c(~0U, bh->b_data, CETRAFS_BLOCK_SIZE);
     clear_buffer_write_io_error(bh);
     clear_buffer_dirty(bh);
-#if LINUX_VERSION_CODE >= KERNEL_VERSION(7, 2, 0)
-    bh_submit(bh, REQ_OP_WRITE | REQ_SYNC, cetrafs_end_write_keep);
-#else
-    get_bh(bh);
-    bh->b_end_io = cetrafs_end_write_keep;
-    submit_bh(REQ_OP_WRITE | REQ_SYNC, bh);
-#endif
-    wait_on_buffer(bh);
-    if (buffer_write_io_error(bh)) {
-        clear_buffer_write_io_error(bh);
-        return cetrafs_meta_write_result(sb, bh, -EIO);
+    init_completion(&io->done);
+    io->status = 0;
+    if (READ_ONCE(cetrafs_tree_target_nospc)) {
+        WRITE_ONCE(cetrafs_tree_target_nospc, cetrafs_tree_target_nospc - 1);
+        io->status = -ENOSPC; /* TEST ONLY: what a full thin pool answers, unsent */
+        complete(&io->done);
+        return 0;
     }
-    return cetrafs_meta_write_result(sb, bh, 0);
+    bio = bio_alloc(bh->b_bdev, 1, REQ_OP_WRITE | REQ_SYNC | REQ_META, GFP_NOIO);
+    bio->bi_iter.bi_sector = bh->b_blocknr * (bh->b_size >> 9);
+    bio_add_folio_nofail(bio, bh->b_folio, bh->b_size, offset_in_folio(bh->b_folio, bh->b_data));
+    bio->bi_private = io;
+    bio->bi_end_io = cetrafs_dtarget_end;
+    submit_bio(bio);
+    return 0;
+}
+
+/* The verdict of a sent target. On failure the buffer keeps its image,
+ * uptodate and still held back (the next boundary writes it again):
+ * a definite refusal is -ENOSPC and the mount runs on, anything else
+ * stops it. */
+int cetrafs_wait_deferred_target(struct super_block *sb, struct buffer_head *bh, struct cetrafs_dtarget_io *io)
+{
+    int r;
+
+    wait_for_completion_io(&io->done);
+    r = io->status;
+    if (!r)
+        set_buffer_uptodate(bh);
+    unlock_buffer(bh);
+    if (r && cetrafs_tree_refusal_survivable(sb, bh->b_blocknr, r))
+        return -ENOSPC;
+    return cetrafs_meta_write_result(sb, bh, r ? -EIO : 0);
+}
+
+int cetrafs_write_deferred_target(struct super_block *sb, struct buffer_head *bh, u32 *wcrc)
+{
+    struct cetrafs_dtarget_io io;
+    int r = cetrafs_submit_deferred_target(sb, bh, wcrc, &io);
+
+    return r ? r : cetrafs_wait_deferred_target(sb, bh, &io);
 }
 
 /*

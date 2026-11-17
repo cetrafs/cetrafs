@@ -1622,22 +1622,25 @@ static int cetrafs_deferred_write_target(struct super_block *sb, struct buffer_h
 
 /* Give a batch's slots back after its entries were retired (or hold the
  * ones whose retire could not be shown, as a kept entry's are held). */
-static void cetrafs_journal_batch_retire(struct super_block *sb, struct cetrafs_journal *j, const u64 *slots,
-                                         struct buffer_head **bhs, unsigned int k)
+static unsigned int cetrafs_journal_batch_retire(struct super_block *sb, struct cetrafs_journal *j,
+                                                 const u64 *slots, struct buffer_head **bhs, unsigned int k)
 {
-    unsigned int i;
+    unsigned int i, held = 0;
 
     for (i = 0; i < k; i++) {
         bool zero_failed = cetrafs_journal_zero_header(sb, cetrafs_journal_header_lba(j, slots[i])) != 0;
 
         mutex_lock(&j->lock);
-        if (zero_failed)
+        if (zero_failed) {
             cetrafs_journal_hold_slot(j, slots[i], bhs[i]->b_blocknr);
-        else
+            held++;
+        } else {
             clear_bit(slots[i], j->busy);
+        }
         mutex_unlock(&j->lock);
     }
     wake_up(&j->slot_wq);
+    return held;
 }
 
 /* TEST ONLY: a held-back batch spends its entries right after their
@@ -1810,7 +1813,8 @@ static int cetrafs_journal_batch_chunk(struct super_block *sb, struct cetrafs_jo
                                        struct buffer_head **pb, struct buffer_head **hb)
 {
     unsigned int i, nw = 0;
-    bool ok = true;
+    bool ok = true, definite = true;
+    struct cetrafs_dtarget_io *tio;
     int ret = 0, ferr;
 
     /* 1. Every entry: payload and header, all out together, waited for
@@ -1826,6 +1830,7 @@ static int cetrafs_journal_batch_chunk(struct super_block *sb, struct cetrafs_jo
             if (pb[i])
                 cetrafs_bh_abort_update(pb[i]);
             ok = false;
+            definite = false;
             break;
         }
         cetrafs_bh_copy_settled(bhs[i], pb[i]->b_data);
@@ -1840,33 +1845,48 @@ static int cetrafs_journal_batch_chunk(struct super_block *sb, struct cetrafs_jo
         cetrafs_bh_end_update(sb, hb[i]);
     }
     if (ok) {
-        struct blk_plug plug;
+        /* Each write's own status (A-4): a definite refusal -- nothing
+         * landed -- is told from a write that may have, which the buffer
+         * layer's "uptodate or not" cannot do. */
+        struct buffer_head **both = kvmalloc_array(2 * k, sizeof(*both), GFP_NOFS);
+        int *st = kvmalloc_array(2 * k, sizeof(*st), GFP_NOFS);
 
-        blk_start_plug(&plug);
-        for (i = 0; i < k; i++) {
-            cetrafs_write_pending_buffer(sb, pb[i], REQ_SYNC);
-            cetrafs_write_pending_buffer(sb, hb[i], REQ_SYNC);
+        if (both && st) {
+            for (i = 0; i < k; i++) {
+                both[2 * i] = pb[i];
+                both[2 * i + 1] = hb[i];
+            }
+            cetrafs_write_bhs_status(sb, both, 2 * k, st);
+            for (i = 0; i < 2 * k; i++) {
+                if (!st[i])
+                    continue;
+                if (!cetrafs_refusal_definite(st[i]))
+                    definite = false;
+                ok = false;
+            }
+        } else {
+            ok = false; /* no memory to send them: nothing was sent */
         }
-        blk_finish_plug(&plug);
+        kvfree(both);
+        kvfree(st);
     }
     for (i = 0; i < k; i++) {
-        if (pb[i]) {
-            wait_on_buffer(pb[i]);
-            if (ok && !buffer_uptodate(pb[i]))
-                ok = false;
+        if (pb[i])
             brelse(pb[i]);
-        }
-        if (hb[i]) {
-            wait_on_buffer(hb[i]);
-            if (ok && !buffer_uptodate(hb[i]))
-                ok = false;
+        if (hb[i])
             brelse(hb[i]);
-        }
     }
     if (!ok) {
-        /* As the single write's journal_failed: retire what may have
-         * landed, refuse, and stop -- the entries' state is unknown. */
-        cetrafs_journal_batch_retire(sb, j, slots, bhs, k);
+        /* Retire what may have landed. Refused DEFINITELY, every one of
+         * them, and every header zeroed: nothing of the batch is on the
+         * device, the blocks stay held back, and the boundary fails
+         * with ENOSPC (A-4). Otherwise, as the single write's
+         * journal_failed: refuse and stop -- the entries' state is
+         * unknown. */
+        unsigned int held = cetrafs_journal_batch_retire(sb, j, slots, bhs, k);
+
+        if (definite && !held && cetrafs_tree_refusal_survivable(sb, bhs[0]->b_blocknr, -ENOSPC))
+            return -ENOSPC;
         cetrafs_sb_fatal(sb, "journal: the device refused a batch of %u tree-block entries", k);
         return -EIO;
     }
@@ -1898,12 +1918,21 @@ static int cetrafs_journal_batch_chunk(struct super_block *sb, struct cetrafs_jo
      * ordering -- and one at a time was a device round trip per block
      * of the batch, the cost of a write into preallocated space. 'hb'
      * (released in 1.) carries which ones were submitted. */
+    tio = kvmalloc_array(k, sizeof(*tio), GFP_NOFS);
+    if (!tio) {
+        /* Nothing sent: every entry stays live, every block held back. */
+        mutex_lock(&j->lock);
+        for (i = 0; i < k; i++)
+            cetrafs_journal_hold_slot(j, slots[i], bhs[i]->b_blocknr);
+        mutex_unlock(&j->lock);
+        return -ENOMEM;
+    }
     {
         struct blk_plug plug;
 
         blk_start_plug(&plug);
         for (i = 0; i < k; i++) {
-            int sret = cetrafs_submit_deferred_target(sb, bhs[i], &wcrc[i]);
+            int sret = cetrafs_submit_deferred_target(sb, bhs[i], &wcrc[i], &tio[i]);
 
             hb[i] = sret == 0 ? bhs[i] : NULL;
             pb[i] = ERR_PTR(sret > 0 ? 0 : sret); /* the result when not submitted */
@@ -1911,7 +1940,7 @@ static int cetrafs_journal_batch_chunk(struct super_block *sb, struct cetrafs_jo
         blk_finish_plug(&plug);
     }
     for (i = 0; i < k; i++) {
-        int werr = hb[i] ? cetrafs_wait_deferred_target(sb, bhs[i]) : (int) PTR_ERR(pb[i]);
+        int werr = hb[i] ? cetrafs_wait_deferred_target(sb, bhs[i], &tio[i]) : (int) PTR_ERR(pb[i]);
 
         if (werr) {
             mutex_lock(&j->lock);
@@ -1926,9 +1955,7 @@ static int cetrafs_journal_batch_chunk(struct super_block *sb, struct cetrafs_jo
         written[i] = true;
         nw++;
     }
-    if (!nw)
-        return ret;
-
+    kvfree(tio);
     if (!nw)
         return ret;
 

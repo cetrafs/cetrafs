@@ -1711,8 +1711,15 @@ static inline bool cetrafs_bh_pending(const struct buffer_head *bh)
 }
 int cetrafs_bh_defer_update(struct inode *inode, struct buffer_head *bh, u32 prev_crc);
 int cetrafs_write_deferred_target(struct super_block *sb, struct buffer_head *bh, u32 *wcrc);
-int cetrafs_submit_deferred_target(struct super_block *sb, struct buffer_head *bh, u32 *wcrc);
-int cetrafs_wait_deferred_target(struct super_block *sb, struct buffer_head *bh);
+struct cetrafs_dtarget_io {
+    struct completion done;
+    int status;
+};
+int cetrafs_submit_deferred_target(struct super_block *sb, struct buffer_head *bh, u32 *wcrc,
+                                   struct cetrafs_dtarget_io *io);
+int cetrafs_wait_deferred_target(struct super_block *sb, struct buffer_head *bh, struct cetrafs_dtarget_io *io);
+bool cetrafs_tree_refusal_survivable(struct super_block *sb, sector_t block, int status);
+u64 cetrafs_tree_refusal_count(void);
 int cetrafs_wait_meta_write(struct super_block *sb, struct buffer_head *bh);
 void cetrafs_bh_end_update_deferred(struct buffer_head *bh);
 void cetrafs_bh_deferred_unlist(struct super_block *sb, struct buffer_head *bh, bool drop);

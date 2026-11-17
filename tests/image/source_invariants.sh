@@ -2153,6 +2153,10 @@ cetrafs_journal_write_block_flags final:the-device-refused-the-write-no-space-th
 cetrafs_sync_new_buffer final:the-device-refused-the-write-no-space-thin-pool-or-test-injection
 __cetrafs_write_raw_inode final:the-device-refused-a-new-record-no-space-thin-pool-the-create-fails-the-mount-runs-on
 cetrafs_sync_buffers_keep final:the-device-refused-a-bitmap-write-no-space-thin-pool-kept-for-a-retry-or-test-injection
+cetrafs_bmap_flush_q_run final:carries-a-kept-bitmap-refusal-reason-to-the-boundary
+cetrafs_journal_batch_chunk final:the-device-refused-every-entry-of-a-tree-batch-no-space-retired-blocks-kept
+cetrafs_submit_deferred_target final:test-injection-what-a-full-thin-pool-answers
+cetrafs_wait_deferred_target final:the-device-refused-a-tree-block-target-no-space-entry-live-block-kept
 cetrafs_write_locked_bh final:the-device-refused-the-write-no-space-thin-pool-or-test-injection
 cetrafs_write_bhs_status final:test-injection-what-a-full-thin-pool-answers
 cetrafs_node_register final:every-registry-row-taken
