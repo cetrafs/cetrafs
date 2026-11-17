@@ -3088,6 +3088,54 @@ static int cetrafs_lock_open_retake(struct cetrafs_inode_info *ci, bool dropped)
     return dropped ? mutex_lock_killable(&ci->lock_mutex) : 0;
 }
 
+/* TEST ONLY: a first local open does not stop this node's defrag pass on
+ * the file -- the negative control of tests/kernel/open_stops_defrag.sh. */
+static bool cetrafs_open_defrag_wait_off;
+cetrafs_test_param(open_defrag_wait_off, cetrafs_open_defrag_wait_off, bool, 0644);
+MODULE_PARM_DESC(open_defrag_wait_off, "TEST ONLY: a first local open does not stop a defrag pass on the file");
+
+/*
+ * Ask this node's defrag pass on the file to stop at its next step
+ * boundary, wait for its pin to go, and take lock_mutex. A boundary that
+ * must decide now -- a suspend's handoff, an open's refresh -- must not
+ * fail because a background optimisation happens to be running (class
+ * 43: a transient state reported as a final answer). Bounded (10 s) and
+ * killable; lock_mutex is not held while waiting, as defrag_end takes
+ * it. 'held': the caller holds lock_mutex now (dropped here, retaken).
+ *
+ * The request stays raised until lock_mutex is ours again, and
+ * defrag_begin refuses under lock_mutex while one is raised: no pass can
+ * pin between the wait and the caller's decision. 0: lock_mutex held.
+ * -EINTR / -EBUSY: not held.
+ */
+static int cetrafs_lock_defrag_stop_relock(struct inode *inode, bool held, const char *who)
+{
+    struct cetrafs_inode_info *ci = CETRAFS_I(inode);
+    unsigned long deadline = jiffies + 10 * HZ;
+
+    atomic_inc(&ci->defrag_stop_asks);
+    if (held)
+        mutex_unlock(&ci->lock_mutex);
+    while (READ_ONCE(ci->defrag_pinned)) {
+        if (schedule_timeout_killable(msecs_to_jiffies(20)) || fatal_signal_pending(current)) {
+            atomic_dec(&ci->defrag_stop_asks);
+            return -EINTR;
+        }
+        if (time_after(jiffies, deadline)) {
+            atomic_dec(&ci->defrag_stop_asks);
+            pr_warn_ratelimited("lock: ino=%llu %s: the defrag pass did not stop within 10 s\n",
+                                (unsigned long long) inode->i_ino, who);
+            return -EBUSY;
+        }
+    }
+    if (mutex_lock_killable(&ci->lock_mutex)) {
+        atomic_dec(&ci->defrag_stop_asks);
+        return -EINTR;
+    }
+    atomic_dec(&ci->defrag_stop_asks);
+    return 0;
+}
+
 int cetrafs_lock_open(struct inode *inode, struct file *file)
 {
     struct cetrafs_inode_info *ci = CETRAFS_I(inode);
@@ -3125,8 +3173,22 @@ int cetrafs_lock_open(struct inode *inode, struct file *file)
 
     /* Killable: another open of this file may hold it through a stale
      * holder's fence and journal replay -- device I/O of unbounded
-     * length. Nothing is changed before this point. */
-    ret = mutex_lock_killable(&ci->lock_mutex);
+     * length. Nothing is changed before this point.
+     *
+     * The first local open refreshes the file from a peer's record
+     * under the inode's locks, and a defrag pass holds those across
+     * each step: the refresh's bounded retries ran out behind one and
+     * the open failed EBUSY -- a takeover's verify, in a two-node run,
+     * right after the takeover's own close handed the file to the
+     * janitor. A pass on a file with no local opener is this node's own
+     * background work: stop it first (TEST ONLY open_defrag_wait_off:
+     * as before). An explicit defrag holds the file open, so it is
+     * never this case. */
+    if (atomic_read(&ci->lock_local_open_count) == 0 && READ_ONCE(ci->defrag_pinned) &&
+        !READ_ONCE(cetrafs_open_defrag_wait_off))
+        ret = cetrafs_lock_defrag_stop_relock(inode, false, "open");
+    else
+        ret = mutex_lock_killable(&ci->lock_mutex);
     if (ret)
         return ret;
 
@@ -6236,29 +6298,11 @@ static int cetrafs_lock_suspend(struct inode *inode, struct file *file)
          * to stop at its next step boundary, wait for the pin to go,
          * and decide again. Bounded and killable; lock_mutex is not
          * held while waiting, as defrag_end takes it. */
-        unsigned long deadline = jiffies + 10 * HZ;
-
-        atomic_inc(&ci->defrag_stop_asks);
-        mutex_unlock(&ci->lock_mutex);
-        while (READ_ONCE(ci->defrag_pinned)) {
-            if (schedule_timeout_killable(msecs_to_jiffies(20)) || fatal_signal_pending(current)) {
-                atomic_dec(&ci->defrag_stop_asks);
-                return -EINTR;
-            }
-            if (time_after(jiffies, deadline)) {
-                atomic_dec(&ci->defrag_stop_asks);
-                pr_warn_ratelimited("lock: ino=%llu suspend: the defrag pass did not stop within 10 s\n",
-                                    (unsigned long long) inode->i_ino);
-                return -EBUSY;
-            }
-        }
-        if (mutex_lock_killable(&ci->lock_mutex)) {
-            atomic_dec(&ci->defrag_stop_asks);
-            return -EINTR;
-        }
-        /* Dropped under lock_mutex: from here the suspend decides under
-         * it, and defrag_begin checks lock_suspended under it too. */
-        atomic_dec(&ci->defrag_stop_asks);
+        ret = cetrafs_lock_defrag_stop_relock(inode, true, "suspend");
+        if (ret)
+            return ret;
+        /* From here the suspend decides under lock_mutex, and
+         * defrag_begin checks lock_suspended under it too. */
         if (ci->lock_suspended || atomic_read(&ci->lock_writer_count) == 0) {
             ret = 0;
             goto out;

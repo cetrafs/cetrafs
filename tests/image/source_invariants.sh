@@ -2189,7 +2189,8 @@ cetrafs_dir_add_entry final:the-directory-is-at-CETRAFS_DIR_MAX_BLOCKS
 cetrafs_tree_resv_fill final:test-injection-convert_append_nospc
 cetrafs_tree_alloc_block final:test-injection-convert_append_nospc
 cetrafs_tree_block_anywhere final:test-injection-tree_alloc_fail_at'
-C43_REG_EBUSY='cetrafs_lock_suspend waits:schedule_timeout_killable
+C43_REG_EBUSY='cetrafs_lock_defrag_stop_relock waits:schedule_timeout_killable
+cetrafs_lock_suspend waits:cetrafs_lock_defrag_stop_relock
 cetrafs_nslock_acquire_tries waits:msleep
 __cetrafs_nslock_acquire_set waits:msleep
 cetrafs_nslock_acquire_set_vfs waits:cetrafs_nswait_queue
