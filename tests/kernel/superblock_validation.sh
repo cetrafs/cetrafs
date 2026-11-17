@@ -149,6 +149,50 @@ fi
 "$SB_POKE" "$DEV" features_ro_compat "$ORIG_RO" >/dev/null
 blockdev --flushbufs "$DEV"
 
+log "an unknown INCOMPAT feature is refused, read-only included"
+ORIG_IN="$(sb_field features_incompat)"
+"$SB_POKE" "$DEV" features_incompat $((ORIG_IN | (1 << 40))) >/dev/null
+blockdev --flushbufs "$DEV"
+if mount -t cetrafs -o ro "$DEV" "$MNT" 2>/dev/null; then
+    umount "$MNT"
+    fail "a volume with an unknown INCOMPAT feature mounted (read-only)"
+else
+    pass "a volume with an unknown INCOMPAT feature is refused, even read-only"
+fi
+"$SB_POKE" "$DEV" features_incompat "$ORIG_IN" >/dev/null
+blockdev --flushbufs "$DEV"
+
+# COMPAT: the mount ignores it; a grow may not (cetrafs.h, the feature
+# rules) -- growfs refuses first, so the kernel's own refusal is asked
+# directly (grow_claim_probe: refused here with EOPNOTSUPP, before the
+# claim check that otherwise answers EBUSY).
+log "an unknown COMPAT feature mounts read-write; a live grow refuses it"
+PROBE="$(ct_helper grow_claim_probe)"
+NONCE=00000000000000000000000000000000
+ORIG_C="$(sb_field features_compat)"
+"$SB_POKE" "$DEV" features_compat $((ORIG_C | (1 << 40))) >/dev/null
+blockdev --flushbufs "$DEV"
+if mount -t cetrafs "$DEV" "$MNT" 2>/dev/null; then
+    pass "a volume with an unknown COMPAT feature mounts read-write"
+    out="$("$PROBE" "$MNT" "$DEV" 0 "$NONCE" 2>&1 || true)"
+    grep -q "errno=$(python3 -c 'import errno; print(errno.EOPNOTSUPP)')" <<<"$out" &&
+        pass "...and the kernel refuses to grow it ($out)" || fail "the kernel grow did not refuse an unknown COMPAT bit: $out"
+    umount "$MNT"
+else
+    fail "a volume with an unknown COMPAT feature was refused"
+fi
+"$SB_POKE" "$DEV" features_compat "$ORIG_C" >/dev/null
+blockdev --flushbufs "$DEV"
+if mount -t cetrafs "$DEV" "$MNT" 2>/dev/null; then
+    out="$("$PROBE" "$MNT" "$DEV" 0 "$NONCE" 2>&1 || true)"
+    umount "$MNT"
+    ! grep -q "errno=$(python3 -c 'import errno; print(errno.EOPNOTSUPP)')" <<<"$out" &&
+        pass "control: with the bit cleared the grow gets past the feature check ($out)" ||
+        fail "control: EOPNOTSUPP with no unknown bit -- the refusal is not the feature check: $out"
+else
+    fail "control: the volume did not mount with the bit cleared"
+fi
+
 # ------------------------------------------------- no false positives
 #
 # The expensive failure mode of a layout check is the opposite one: a

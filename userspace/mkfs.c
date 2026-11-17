@@ -1080,8 +1080,7 @@ int main(int argc, char **argv)
     sb.bg_size_blocks = cetrafs_cpu_to_le64(bg_size_blocks);
 
     {
-        u64 incompat =
-            CETRAFS_FEAT_INCOMPAT_EXTENTS | CETRAFS_FEAT_INCOMPAT_GLOBAL_ITBL | CETRAFS_FEAT_INCOMPAT_NODE_REGISTRY;
+        u64 incompat = CETRAFS_FEAT_INCOMPAT_SUPP;
         sb.features_incompat = cetrafs_cpu_to_le64(incompat);
     }
 

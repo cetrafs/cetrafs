@@ -514,6 +514,16 @@ int main(int argc, char **argv)
     if (cetrafs_le16(sb.version) < CETRAFS_VERSION_MIN || cetrafs_le16(sb.version) > CETRAFS_VERSION)
         die("%s: format version 0x%04X, this build accepts 0x%04X..0x%04X", dev, cetrafs_le16(sb.version),
             CETRAFS_VERSION_MIN, CETRAFS_VERSION);
+    /* A grow rewrites the layout, and a structure it does not know --
+     * even a compatible one -- is one it would grow past or over
+     * (cetrafs.h, the feature rules). Before anything is written. */
+    if ((cetrafs_le64(sb.features_incompat) & ~CETRAFS_FEAT_INCOMPAT_SUPP) ||
+        (cetrafs_le64(sb.features_ro_compat) & ~CETRAFS_FEAT_RO_COMPAT_SUPP) ||
+        (cetrafs_le64(sb.features_compat) & ~CETRAFS_FEAT_COMPAT_SUPP))
+        die("%s: feature bits this growfs does not know are set (compat 0x%" PRIx64 ", ro_compat 0x%" PRIx64
+            ", incompat 0x%" PRIx64 ") -- use the growfs.cetra of the build that set them",
+            dev, (uint64_t) cetrafs_le64(sb.features_compat), (uint64_t) cetrafs_le64(sb.features_ro_compat),
+            (uint64_t) cetrafs_le64(sb.features_incompat));
     if (cetrafs_le32(sb.block_size) != CETRAFS_BLOCK_SIZE)
         die("%s: block size %u != %u", dev, cetrafs_le32(sb.block_size), CETRAFS_BLOCK_SIZE);
     {

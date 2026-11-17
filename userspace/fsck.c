@@ -164,12 +164,10 @@ static void *xcalloc(size_t n, size_t s)
  * you do not understand is how a recoverable volume becomes an
  * unrecoverable one.
  */
-/* Kept byte-for-byte in step with fs.c's definitions: this tool exists
- * to explain a volume the kernel refuses, so it must refuse the same
- * bits. */
-#define CETRAFS_KNOWN_INCOMPAT \
-    (CETRAFS_FEAT_INCOMPAT_EXTENTS | CETRAFS_FEAT_INCOMPAT_GLOBAL_ITBL | CETRAFS_FEAT_INCOMPAT_NODE_REGISTRY)
-#define CETRAFS_KNOWN_RO_COMPAT 0ULL
+/* cetrafs.h's, as the module's: this tool exists to explain a volume the
+ * kernel refuses, so it must refuse the same bits. */
+#define CETRAFS_KNOWN_INCOMPAT  CETRAFS_FEAT_INCOMPAT_SUPP
+#define CETRAFS_KNOWN_RO_COMPAT CETRAFS_FEAT_RO_COMPAT_SUPP
 
 static int repair_mode;    /* -r given */
 static long discard_journal = -1; /* --discard-journal N: the row whose area to park, -1 none */
@@ -2834,6 +2832,14 @@ int main(int argc, char **argv)
         return 1;
     }
 
+    uint32_t sb_crc = crc32c_struct(&sb, sizeof(sb), offsetof(cetrafs_superblock_t, checksum), sizeof(sb.checksum));
+    if ((uint32_t) cetrafs_le64(sb.checksum) != sb_crc) {
+        fprintf(stderr, "ERR: SB CRC mismatch (got 0x%08X want 0x%08X)\n", (uint32_t) cetrafs_le64(sb.checksum), sb_crc);
+        return 1;
+    }
+
+    /* Feature bits are read only from a superblock that passed its
+     * checksum: a torn one is reported as torn, not as "newer". */
     if (cetrafs_le64(sb.features_incompat) & ~CETRAFS_KNOWN_INCOMPAT) {
         fprintf(stderr,
                 "ERR: unsupported INCOMPAT feature bits 0x%" PRIx64
@@ -2845,11 +2851,19 @@ int main(int argc, char **argv)
         fprintf(stderr,
                 "WARN: unsupported RO_COMPAT feature bits 0x%" PRIx64 " -- this volume mounts read-only only\n",
                 (uint64_t) (cetrafs_le64(sb.features_ro_compat) & ~CETRAFS_KNOWN_RO_COMPAT));
-
-    uint32_t sb_crc = crc32c_struct(&sb, sizeof(sb), offsetof(cetrafs_superblock_t, checksum), sizeof(sb.checksum));
-    if ((uint32_t) cetrafs_le64(sb.checksum) != sb_crc) {
-        fprintf(stderr, "ERR: SB CRC mismatch (got 0x%08X want 0x%08X)\n", (uint32_t) cetrafs_le64(sb.checksum), sb_crc);
-        return 1;
+    if (cetrafs_le64(sb.features_compat) & ~CETRAFS_FEAT_COMPAT_SUPP)
+        fprintf(stderr,
+                "WARN: unknown COMPAT feature bits 0x%" PRIx64
+                " -- the volume holds structures this fsck does not check\n",
+                (uint64_t) (cetrafs_le64(sb.features_compat) & ~CETRAFS_FEAT_COMPAT_SUPP));
+    /* A repair rewrites what it finds, and a structure it cannot see --
+     * even a compatible one -- reads to it as space nobody uses. Before
+     * the repair claim: nothing is written (cetrafs.h, the feature rules). */
+    if (repair_mode && ((cetrafs_le64(sb.features_compat) & ~CETRAFS_FEAT_COMPAT_SUPP) ||
+                        (cetrafs_le64(sb.features_ro_compat) & ~CETRAFS_KNOWN_RO_COMPAT))) {
+        fprintf(stderr, "ERR: %s: feature bits this fsck does not know are set -- it will not repair the volume; "
+                        "use the fsck.cetra of the build that set them\n", dev);
+        return FSCK_EXIT_NOEXAM;
     }
 
     /*

@@ -1871,6 +1871,30 @@ static inline int cetrafs_blk_struct_ok(const void *blk, u32 magic)
 
 #define CETRAFS_FEAT_ROCOMPAT_SPARSE       (1ULL << 0)
 
+/*
+ * What this build understands, per class: the one definition the module,
+ * fsck and growfs all check against (audit 2026-11-15 G-14). A later
+ * format change is a new bit, not a version bump, wherever an older
+ * build can be told what to do about a volume that has it:
+ *
+ *   INCOMPAT  -- an older build cannot even read the volume right: it
+ *                refuses to mount it, fsck refuses to check it.
+ *   RO_COMPAT -- an older build reads it right but would write it wrong:
+ *                it mounts read-only only.
+ *   COMPAT    -- an older build reads and writes it right; the module
+ *                ignores the bit.
+ *
+ * fsck -r and growfs refuse a volume with an unknown bit in ANY class:
+ * they rewrite structures, and a structure they cannot see -- even a
+ * compatible one -- reads to them as space nobody uses. A plain fsck
+ * still checks it and says its verdict may not cover it. Not for mixed
+ * versions, which are not supported: for a format that only ever grows.
+ */
+#define CETRAFS_FEAT_INCOMPAT_SUPP                                                                                     \
+    (CETRAFS_FEAT_INCOMPAT_EXTENTS | CETRAFS_FEAT_INCOMPAT_GLOBAL_ITBL | CETRAFS_FEAT_INCOMPAT_NODE_REGISTRY)
+#define CETRAFS_FEAT_RO_COMPAT_SUPP 0ULL
+#define CETRAFS_FEAT_COMPAT_SUPP    0ULL
+
 
 
 /* ------------------------------------------ */

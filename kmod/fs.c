@@ -1802,9 +1802,8 @@ MODULE_PARM_DESC(mount_stopped_ok, "TEST ONLY: a mount that stopped while mounti
         }                                                                                \
     } while (0)
 
-/* Supported incompatible feature bits (reject unknown) */
-#define CETRAFS_KNOWN_INCOMPAT \
-    (CETRAFS_FEAT_INCOMPAT_EXTENTS | CETRAFS_FEAT_INCOMPAT_GLOBAL_ITBL | CETRAFS_FEAT_INCOMPAT_NODE_REGISTRY)
+/* Supported incompatible feature bits (reject unknown): cetrafs.h's. */
+#define CETRAFS_KNOWN_INCOMPAT CETRAFS_FEAT_INCOMPAT_SUPP
 
 /* Supported read-only-compatible feature bits. Deliberately NONE: no
  * ro_compat feature is implemented, so any bit set describes a volume
@@ -1812,7 +1811,7 @@ MODULE_PARM_DESC(mount_stopped_ok, "TEST ONLY: a mount that stopped while mounti
  * a volume mounts read-only and is refused read-write -- which is what
  * the whole ro_compat class is for, and which was simply never checked
  * (the field was read by procfs and by nothing else). */
-#define CETRAFS_KNOWN_RO_COMPAT 0ULL
+#define CETRAFS_KNOWN_RO_COMPAT CETRAFS_FEAT_RO_COMPAT_SUPP
 
 /*
  * Every region the superblock describes, checked against each other and

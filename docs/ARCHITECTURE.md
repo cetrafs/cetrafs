@@ -425,11 +425,20 @@ with backoff before being declared real corruption.
 | `INCOMPAT_NODE_REGISTRY` | 3 | yes | accepted at mount; gates the `node_table_*` SB fields |
 | `ROCOMPAT_SPARSE` | 0 | no | — |
 
-`cetrafs_fill_super()` refuses any incompat bit outside `CETRAFS_KNOWN_INCOMPAT`
-(so an unknown-incompat volume will not mount), and mounts read-only on any
-ro_compat bit outside `CETRAFS_KNOWN_RO_COMPAT`. `fsck` carries copies of both
-known sets and reports an unknown bit, since whatever stops a mount must be
-something the checker can name.
+What this build understands is one definition per class in `cetrafs.h`
+(`CETRAFS_FEAT_INCOMPAT_SUPP`, `_RO_COMPAT_SUPP`, `_COMPAT_SUPP`), checked by
+the module, `fsck`, `growfs` and `mkfs` alike. A later format change is a new
+bit, not a version bump, wherever an older build can be told what to do:
+
+| Class | Unknown to this build: mount | `fsck` | `fsck -r`, `growfs`, live grow |
+|---|---|---|---|
+| INCOMPAT | refused, read-only too | refused (1) | refused |
+| RO_COMPAT | read-only only | warns, checks | refused, nothing written (`fsck -r` exits 3) |
+| COMPAT | ignored | warns, checks | refused, nothing written (`fsck -r` exits 3) |
+
+A tool that rewrites the volume refuses even a compatible unknown bit: a
+structure it cannot see reads to it as space nobody uses. The feature bits are
+read only from a superblock that passed its checksum.
 
 ## Tools
 

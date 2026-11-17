@@ -520,6 +520,14 @@ long cetrafs_grow_ioctl(struct file *file, const cetrafs_grow_arg_t __user *arg)
         return -EROFS;
     if (cetrafs_sb_is_fenced(sb))
         return -EIO;
+    /* A grow over a structure this build does not know -- even a
+     * compatible one, which the mount itself ignores -- may grow past or
+     * over it (cetrafs.h, the feature rules); growfs refuses it too. */
+    if (le64_to_cpu(cetrafs_sb_raw(sb)->features_compat) & ~CETRAFS_FEAT_COMPAT_SUPP) {
+        pr_err("grow: the volume has COMPAT feature bits this build does not know (0x%llx) -- not grown\n",
+               (unsigned long long) le64_to_cpu(cetrafs_sb_raw(sb)->features_compat));
+        return -EOPNOTSUPP;
+    }
     /*
      * Every node must re-read the layout when it moves. One that does
      * not -- a build from before live grow -- would go on judging the
