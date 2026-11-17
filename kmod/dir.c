@@ -2142,6 +2142,38 @@ static void cetrafs_new_record_locked(struct super_block *sb, cetrafs_inode_t *r
     raw->ns_lock_incarnation = cetrafs_cpu_to_le32(cetrafs_sb_incarnation(sb));
 }
 
+/*
+ * A birth that failed after its record was written but before it had an
+ * object to adopt the lock with (iget failed): the record goes back
+ * dead and unlocked, then the number is freed (audit F-52). The free
+ * zeroes nlink by a swap that leaves the lock alone, so the number went
+ * back carrying this node's live lock and every allocator refused it
+ * until this node's next mount swept it. Nothing else can touch the
+ * record meanwhile: the number is ours by its birth claim and no name
+ * reaches it. A rewrite the device refuses leaves it to that sweep, as
+ * before -- a number leaked until the next mount, never shared.
+ */
+static bool cetrafs_born_unwind_off; /* TEST ONLY: see the parameter */
+cetrafs_test_param(born_unwind_off, cetrafs_born_unwind_off, bool, 0644);
+MODULE_PARM_DESC(born_unwind_off, "TEST ONLY: a failed birth frees its number still locked, as before F-52");
+
+static void cetrafs_new_record_unwind(struct super_block *sb, u64 ino, const cetrafs_inode_t *raw)
+{
+    cetrafs_inode_t dead = *raw;
+
+    if (cetrafs_le32(raw->ns_lock_owner) != CETRAFS_NODE_ID_NONE && !READ_ONCE(cetrafs_born_unwind_off)) {
+        dead.nlink = cetrafs_cpu_to_le32(0);
+        dead.ns_lock_owner = cetrafs_cpu_to_le32(CETRAFS_NODE_ID_NONE);
+        dead.ns_lock_incarnation = cetrafs_cpu_to_le32(0);
+        cetrafs_invalidate_raw_inode(sb, ino);
+        if (cetrafs_write_raw_inode_new(sb, ino, &dead))
+            pr_warn_ratelimited("%s: ino=%llu: a failed create could not unlock its record -- the number stays "
+                                "out of use until this node's next mount\n",
+                                sb->s_id, (unsigned long long) ino);
+    }
+    cetrafs_free_inode(sb, ino);
+}
+
 /* The in-core half of the lock a record was born holding, once its
  * object exists: what an acquire leaves (cetrafs_inode_ns_adopt()). */
 static void cetrafs_new_inode_take_born_lock(struct inode *inode, const cetrafs_inode_t *raw)
@@ -2267,7 +2299,7 @@ static int cetrafs_create_locked(struct mnt_idmap *idmap,
      * dirent, because none exists yet. */
     inode = cetrafs_iget(sb, ino);
     if (IS_ERR(inode)) {
-        cetrafs_free_inode(sb, ino);
+        cetrafs_new_record_unwind(sb, ino, &raw);
         return PTR_ERR(inode);
     }
     cetrafs_new_inode_take_born_lock(inode, &raw);
@@ -3084,7 +3116,7 @@ static struct dentry *cetrafs_mkdir_locked(struct mnt_idmap *idmap,
     inode = cetrafs_iget(sb, ino);
     if (IS_ERR(inode)) {
         cetrafs_free_data_block(sb, lba);
-        cetrafs_free_inode(sb, ino);
+        cetrafs_new_record_unwind(sb, ino, &raw);
         return ERR_CAST(inode);
     }
     cetrafs_new_inode_take_born_lock(inode, &raw);
@@ -4603,7 +4635,7 @@ static int cetrafs_symlink_locked(struct mnt_idmap *idmap,
      * failure paths removes a dirent, because none exists yet. */
     inode = cetrafs_iget(sb, ino);
     if (IS_ERR(inode)) {
-        cetrafs_free_inode(sb, ino);
+        cetrafs_new_record_unwind(sb, ino, &raw);
         return PTR_ERR(inode);
     }
     cetrafs_new_inode_take_born_lock(inode, &raw);

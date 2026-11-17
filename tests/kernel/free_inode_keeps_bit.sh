@@ -111,8 +111,11 @@ touch "$MNT/b2" 2>/dev/null && [ "$(stat -c %i "$MNT/b2")" != "$N" ] &&
 ct_umount "$MNT"
 rc=0
 OUT="$("$FSCK" "$DEV" 2>&1)" || rc=$?
-[ "$rc" = 0 ] && grep -q "inode $N is an empty file (nlink=1) that no directory entry names" <<<"$OUT" &&
-    pass "B: fsck reports ino $N as an interrupted create, exit 0" ||
+# The create's unwind writes its record dead and unlocked before the free
+# (F-52), so the number is an orphan -- nlink 0, bit set -- not a record
+# claiming a link no name gives it.
+[ "$rc" = 0 ] && grep -q "inode $N is allocated but has nlink=0 (orphan)" <<<"$OUT" &&
+    pass "B: fsck reports ino $N as an orphan of the failed create, exit 0" ||
     fail "B: fsck rc=$rc: $(grep -E '^(ERR|WARN)' <<<"$OUT" | head -3)"
 "$FSCK" -r "$DEV" >/dev/null 2>&1 || true
 "$FSCK" -r "$DEV" >/dev/null 2>&1 || true
