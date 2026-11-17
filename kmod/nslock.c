@@ -918,6 +918,11 @@ void cetrafs_nslock_release(struct inode *inode)
          * correct because that peer has already replayed our journal. */
         if (ret == 0 || ret == -ESTALE)
             break; /* ret > 0 cannot reach here: the CAS layer flattens it */
+        /* Fenced: no swap of this mount lands again, and retrying only
+         * held the operation -- a create's unwind on a fenced mount took
+         * two seconds more to fail (BM-29's born lock released there). */
+        if (cetrafs_sb_is_fenced(sb))
+            break;
         msleep(CETRAFS_NSLOCK_SLEEP_MS);
     }
 
