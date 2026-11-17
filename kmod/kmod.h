@@ -839,6 +839,7 @@ u64 cetrafs_tree_half_full_count(void); /* file.c */
 u64 cetrafs_close_nospc_drop_count(void); /* lock.c */
 u64 cetrafs_held_flush_batch_count(void); /* ioutil.c */
 u64 cetrafs_ibmap_abandoned_count(void); /* alloc.c */
+u64 cetrafs_ibmap_busy_skip_count(void); /* alloc.c */
 extern bool cetrafs_convert_append_nospc; /* lock.c, test-only */
 bool cetrafs_bh_test_stable(struct buffer_head *bh, bool (*test)(const void *data, void *arg), void *arg);
 void cetrafs_bh_copy_stable(struct buffer_head *bh, void *out, size_t len);

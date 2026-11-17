@@ -482,34 +482,106 @@ u64 cetrafs_ibmap_abandoned_count(void)
     return (u64) atomic64_read(&cetrafs_ibmap_abandoned);
 }
 
-/* Walk the global inode bitmap region by region, trying to claim a free
- * bit in each via CAS. Returns the global bit index, or -ENOSPC. */
+/* TEST ONLY: the inode allocator starts where this node id would
+ * (-1: this node's own), so one host can show where a peer starts
+ * (tests/kernel/ibmap_spread.sh). */
+static int cetrafs_ibmap_start_as_node = -1;
+cetrafs_test_param(ibmap_start_as_node, cetrafs_ibmap_start_as_node, int, 0644);
+MODULE_PARM_DESC(ibmap_start_as_node, "TEST ONLY: the inode allocator starts where this node id would (-1: own)");
+
+/* TEST ONLY: inode bitmap regions (bit n = region n, the first 64) whose
+ * swap reports contention without being tried -- a region peers keep
+ * winning (tests/kernel/ibmap_spread.sh). */
+static unsigned long long cetrafs_ibmap_busy_regions;
+cetrafs_test_param(ibmap_busy_regions, cetrafs_ibmap_busy_regions, ullong, 0644);
+MODULE_PARM_DESC(ibmap_busy_regions, "TEST ONLY: bitmask of inode bitmap regions that report contention");
+
+/* TEST ONLY: start every node at region 0 and fail a contended region
+ * EBUSY, as before audit M-4 -- the control of ibmap_spread.sh. */
+static bool cetrafs_ibmap_spread_off;
+cetrafs_test_param(ibmap_spread_off, cetrafs_ibmap_spread_off, bool, 0644);
+MODULE_PARM_DESC(ibmap_spread_off, "TEST ONLY: every node starts at region 0 and a contended region fails EBUSY");
+
+static atomic64_t cetrafs_ibmap_busy_skips = ATOMIC64_INIT(0);
+
+u64 cetrafs_ibmap_busy_skip_count(void)
+{
+    return (u64) atomic64_read(&cetrafs_ibmap_busy_skips);
+}
+
+/* Passes over every region, all of them contended, before a create gives
+ * up: each contended region already lost its swap 16 times in a row, so
+ * this many passes is not contention but a device that never lets a swap
+ * through. */
+#define CETRAFS_IBMAP_BUSY_PASSES 32
+
+/*
+ * Walk the global inode bitmap region by region, trying to claim a free
+ * bit in each via CAS. Returns the global bit index, -ENOSPC when every
+ * region is full, -EINTR on a fatal signal, or another error.
+ *
+ * Each node starts at its own region, spread over the bitmap by node id,
+ * and wraps: every node starting at region 0 made every create in the
+ * cluster swap the same 512 bytes, and a node that lost that region 16
+ * times returned EBUSY from creat(2), which it never returns (audit
+ * 2026-11-14 M-4). A region lost that many times is now passed over for
+ * the next; only when a whole pass found nothing free and some region
+ * contended does it wait a moment and go round again. Node 0 starts at
+ * region 0, as every node did.
+ */
 static long cetrafs_inode_bitmap_cas_alloc(struct super_block *sb)
 {
     const cetrafs_superblock_t *raw_sb = cetrafs_sb_raw(sb);
     unsigned int region = cetrafs_cas_region_size(sb);
     unsigned int regions_per_block = CETRAFS_BLOCK_SIZE / region;
     u64 start = le64_to_cpu(raw_sb->inode_bmap_start);
-    u64 nblocks = le64_to_cpu(raw_sb->inode_bmap_blocks);
     u64 nbits = le32_to_cpu(raw_sb->inodes_count);
-    u64 blk;
+    u64 nregions = DIV_ROUND_UP(nbits, (u64) region * 8);
+    u32 nodes = max_t(u32, le32_to_cpu(raw_sb->node_table_count), 1);
+    bool spread = !READ_ONCE(cetrafs_ibmap_spread_off);
+    u64 first = 0, k;
+    unsigned int pass;
+    u32 me = 0;
 
-    for (blk = 0; blk < nblocks; blk++) {
-        cond_resched();
-        unsigned int r;
+    if (!nregions || nregions > le64_to_cpu(raw_sb->inode_bmap_blocks) * regions_per_block)
+        return -EIO; /* refused at mount (cetrafs_validate_layout()) */
+    if (spread) {
+        int as = READ_ONCE(cetrafs_ibmap_start_as_node);
 
-        for (r = 0; r < regions_per_block; r++) {
-            u64 base = blk * CETRAFS_BITS_PER_BLOCK + (u64) r * region * 8;
+        if (as >= 0)
+            me = (u32) as;
+        else if (cetrafs_sb_get_node_id(sb, &me))
+            me = 0;
+        first = div64_u64((u64) (me % nodes) * nregions, nodes);
+    }
+
+    for (pass = 0; pass < CETRAFS_IBMAP_BUSY_PASSES; pass++) {
+        bool busy = false;
+
+        if (pass) {
+            if (fatal_signal_pending(current))
+                return -EINTR;
+            if (cetrafs_sb_is_fenced(sb))
+                return -EIO;
+            usleep_range(1000 << min(pass, 4u), 2000 << min(pass, 4u));
+        }
+        for (k = 0; k < nregions; k++) {
+            u64 idx = (first + k) % nregions;
+            u64 blk = div_u64(idx, regions_per_block);
+            unsigned int r = (unsigned int) (idx - blk * regions_per_block);
+            u64 base = idx * region * 8;
             struct cetrafs_bmap_cas_ctx ctx = {.alloc = true};
             bool image_only;
             int ret;
 
-            if (base >= nbits)
-                return -ENOSPC;
+            cond_resched();
             ctx.valid_bits = min_t(u64, (u64) region * 8, nbits - base);
 
         again:
-            ret = cetrafs_cas_region_judged(sb, start + blk, r, cetrafs_bmap_cas_mutate, &ctx, &image_only);
+            if (idx < 64 && (READ_ONCE(cetrafs_ibmap_busy_regions) & (1ULL << idx)))
+                ret = -EBUSY; /* test-only; see the parameter */
+            else
+                ret = cetrafs_cas_region_judged(sb, start + blk, r, cetrafs_bmap_cas_mutate, &ctx, &image_only);
             if (ret == 0 && image_only && !READ_ONCE(cetrafs_ibmap_trust_image)) {
                 /* Decided from the image alone: the bit is set, but a
                  * peer that read the same region built the same bytes,
@@ -539,11 +611,21 @@ static long cetrafs_inode_bitmap_cas_alloc(struct super_block *sb)
                 return (long) (base + ctx.bit);
             if (ret == -ENOSPC)
                 continue; /* region full */
-            return ret;   /* real error (incl. -EBUSY after exhausting retries) */
+            if (ret == -EBUSY && spread) {
+                /* Lost 16 swaps in a row: peers are creating here. */
+                atomic64_inc(&cetrafs_ibmap_busy_skips);
+                busy = true;
+                continue;
+            }
+            return ret; /* a transport error, a fence, or (control) -EBUSY */
         }
+        if (!busy)
+            return -ENOSPC;
     }
-
-    return -ENOSPC;
+    pr_warn_ratelimited("inode bitmap: every region with a free number lost its swap %u passes running -- "
+                        "failing the create\n",
+                        CETRAFS_IBMAP_BUSY_PASSES);
+    return -EIO;
 }
 
 static int cetrafs_inode_bitmap_cas_free(struct super_block *sb, u64 bit)

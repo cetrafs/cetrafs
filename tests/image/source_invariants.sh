@@ -2228,6 +2228,7 @@ cetrafs_grow_claim_owned final:no-growfs-claim-of-this-caller-the-ioctl-was-not-
 cetrafs_lock_open final:test-injection-open_refresh_fail_once
 cetrafs_defrag_inode final:test-injection-defrag_fail_invalidate
 cetrafs_zg_drain_one final:test-injection-pf_drain_busy_region
+cetrafs_inode_bitmap_cas_alloc final:test-injection-ibmap_busy_regions-a-contended-region-is-passed-over
 cetrafs_defrag_check_sole final:a-user-or-a-lock-on-a-fresh-read-defrag-declines
 cetrafs_node_row_quiet waits:msleep_interruptible'
 C43_REG_ETXTBSY='cetrafs_lock_open waits:cetrafs_lock_wait_yield
