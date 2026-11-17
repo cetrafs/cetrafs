@@ -520,7 +520,17 @@ int cetrafs_bg_id_of_lba(struct super_block *sb, u64 lba, u32 *out_bg_id);
 struct fstrim_range;
 bool cetrafs_discard_supported(struct super_block *sb);
 int cetrafs_zeroout_issue(struct super_block *sb, u64 lba, u64 count, bool unmap);
-int cetrafs_discard_space_probe(struct super_block *sb, unsigned int *tries); /* BM-15, F-57 */
+int cetrafs_discard_space_probe(struct super_block *sb, unsigned int *tries); /* BM-15, F-57, F-58 */
+/* One space probe at a time per volume, its answer shared by every failed
+ * O_DIRECT write that waited for it (discard.c, F-58). */
+struct cetrafs_space_probe_state {
+    struct mutex mutex;  /* one probe at a time */
+    u64 done;            /* probes completed, under mutex (read lockless) */
+    int verdict;         /* the last one's answer: -ENOSPC or 0 */
+    unsigned long at;    /* jiffies it was reached */
+    atomic_t trim_yield; /* a probe waiting for trim_mutex: its holders let it in between runs */
+};
+struct cetrafs_space_probe_state *cetrafs_sb_space_probe(struct super_block *sb); /* fs.c */
 bool cetrafs_discard_handback_would_send(struct super_block *sb, bool force);
 int cetrafs_discard_handback(struct super_block *sb, u32 bg_id, unsigned long *pass_started, bool pending,
                              bool force, bool *discarded);

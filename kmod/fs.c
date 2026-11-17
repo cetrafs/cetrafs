@@ -716,6 +716,8 @@ struct cetrafs_sb_info {
     struct mutex trim_mutex;
     u64 trim_lba;
     u64 trim_count;
+    /* The space probe of a failed O_DIRECT write (discard.c, BM-15/F-58). */
+    struct cetrafs_space_probe_state space_probe;
     /* Rows a watch of this mount saw stand still for a whole window,
      * with the mark they stood at (node.c; audit 2026-11-15 BM-22). One
      * per registry row, allocated by the first verdict. */
@@ -2990,6 +2992,8 @@ int cetrafs_fill_super(struct super_block *sb, struct fs_context *fc)
             sbi->peers = kcalloc(sbi->peer_count, sizeof(*sbi->peers), GFP_KERNEL);
         mutex_init(&sbi->alloc_mutex);
         mutex_init(&sbi->trim_mutex);
+        mutex_init(&sbi->space_probe.mutex);
+        atomic_set(&sbi->space_probe.trim_yield, 0);
         mutex_init(&sbi->pf_drain_mutex);
         mutex_init(&sbi->zg_claim_mutex);
         init_waitqueue_head(&sbi->zg_claiming_wq);
@@ -6683,6 +6687,11 @@ void cetrafs_sb_set_discard_enabled(struct super_block *sb, bool on)
 struct mutex *cetrafs_sb_trim_mutex(struct super_block *sb)
 {
     return &((struct cetrafs_sb_info *) sb->s_fs_info)->trim_mutex;
+}
+
+struct cetrafs_space_probe_state *cetrafs_sb_space_probe(struct super_block *sb)
+{
+    return &((struct cetrafs_sb_info *) sb->s_fs_info)->space_probe;
 }
 
 /* TEST ONLY: the free paths ignore a FITRIM's hold -- the negative

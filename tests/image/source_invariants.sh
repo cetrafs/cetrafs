@@ -2218,6 +2218,7 @@ cetrafs_wait_deferred_target final:the-device-refused-a-tree-block-target-no-spa
 cetrafs_write_locked_bh_once final:the-device-refused-the-write-no-space-thin-pool-or-test-injection-an-overwrite-waits-in-cetrafs_write_locked_bh
 cetrafs_write_bhs_status final:test-injection-what-a-full-thin-pool-answers
 cetrafs_dio_nospc_probe final:the-device-refused-a-scratch-write-for-space-thin-pool-a-failed-o_direct-write-says-so-BM-15
+cetrafs_discard_space_probe final:the-device-refused-a-probe-for-space-under-a-second-ago-every-write-failing-now-shares-it-F-58
 cetrafs_node_register final:every-registry-row-taken
 cetrafs_dir_add_entry final:the-directory-is-at-CETRAFS_DIR_MAX_BLOCKS
 cetrafs_tree_resv_fill final:test-injection-convert_append_nospc
