@@ -5592,7 +5592,10 @@ func RunScrubTransit(clients []*Client, baseDir string) (bool, error) {
 		{"scrub", "1"},
 		{"scrub_interval_secs", "3"},
 		{"scrub_gap_secs", "2"},
-		{"hb_interval_secs", "30"},
+		// The queued free must outlast two scrub cycles. A slow beat no
+		// longer holds it (the beat is capped at 30 s), so the drain is
+		// switched off outright until the scrub has been asked.
+		{"hb_drain_off", "1"},
 	} {
 		if err := setParam(a, p.name, p.value); err != nil {
 			return false, fmt.Errorf("%s: setting %s: %w", a.Name, p.name, err)
@@ -5717,7 +5720,7 @@ func RunScrubTransit(clients []*Client, baseDir string) (bool, error) {
 			return false, err
 		}
 		if n <= baseQ {
-			// A's heartbeat drained it before the scrub had two cycles.
+			// Something drained it before the scrub had two cycles.
 			stillQueued = false
 			break
 		}
@@ -5744,8 +5747,8 @@ func RunScrubTransit(clients []*Client, baseDir string) (bool, error) {
 			"will clear that bit again under whatever file owns it by then", r0, r1))
 
 	// And the block still comes back exactly once, via the drain, when the
-	// heartbeat is allowed to run at its normal rate again.
-	if err := setParam(a, "hb_interval_secs", restore["hb_interval_secs"]); err != nil {
+	// heartbeat's drain is switched back on.
+	if err := setParam(a, "hb_drain_off", "0"); err != nil {
 		return false, err
 	}
 	drained := false
@@ -5760,7 +5763,7 @@ func RunScrubTransit(clients []*Client, baseDir string) (bool, error) {
 		}
 		time.Sleep(500 * time.Millisecond)
 	}
-	check(&ok, fmt.Sprintf("%s drained the queued free once its heartbeat resumed", a.Name), drained,
+	check(&ok, fmt.Sprintf("%s drained the queued free once its heartbeat drain was back on", a.Name), drained,
 		"the entry is still queued -- the block never came back at all")
 
 	_, _ = a.Call("rmdir", RmdirArgs{Path: dir})
