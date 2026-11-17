@@ -14,6 +14,7 @@
 #include <sys/ioctl.h>
 #include <sys/stat.h>
 #include <sys/types.h>
+#include <sys/wait.h>
 #include <unistd.h>
 
 #include "cetrafs.h"
@@ -233,6 +234,8 @@ static void fsck_repair_release_atexit(void)
     }
 }
 static int repair_blocked; /* a fault we must not repair around */
+static int live_mode;      /* --live: checked while peers have it mounted (M-38) */
+static int live_pass;      /* --live-pass: one walk of a --live check (internal) */
 static uint64_t repairs_made;
 /* Faults found before the content pass declares its own counter (the
  * root-directory checks). Folded into the final total so an early fault
@@ -2341,6 +2344,145 @@ static void fsck_discard_journal(int fd, const cetrafs_superblock_t *sb, uint32_
     fflush(stdout);
 }
 
+/*
+ * fsck --live (audit 2026-11-15 M-38). The documented check of a stopped
+ * node -- unmount it, run a read-only fsck, mount -- could not run while
+ * the cluster did: fsck refuses whenever any peer is beating, and its
+ * verdict over a volume being changed means nothing. A live check is
+ * still worth having if what it reports is only what lasts. So: up to
+ * FSCK_LIVE_PASSES complete walks, each a fresh process (a walk keeps
+ * global state); the first clean walk ends it, clean. A finding is an
+ * ERR line every walk printed identically -- a peer's write in flight,
+ * a block caught torn, a count moving under the walk does not repeat
+ * word for word, damage does. Findings that never repeat give no
+ * verdict, which is 3, as for a device fsck could not examine.
+ * Read-only, nothing claimed: the peers never see it.
+ */
+#define FSCK_LIVE_PASSES 3
+#define FSCK_LIVE_OUT (4u << 20)
+
+static char *fsck_live_walk(const char *dev, int *rc)
+{
+    int pfd[2], st = 0;
+    size_t len = 0, cap = 1 << 16;
+    char *buf = (char *) xcalloc(cap + 1, 1);
+    pid_t pid;
+
+    if (pipe(pfd)) {
+        perror("pipe");
+        exit(FSCK_EXIT_NOEXAM);
+    }
+    pid = fork();
+    if (pid < 0) {
+        perror("fork");
+        exit(FSCK_EXIT_NOEXAM);
+    }
+    if (!pid) {
+        dup2(pfd[1], 1);
+        dup2(pfd[1], 2);
+        close(pfd[0]);
+        close(pfd[1]);
+        execl("/proc/self/exe", "fsck.cetra", "--live-pass", dev, (char *) NULL);
+        perror("exec");
+        _exit(FSCK_EXIT_NOEXAM);
+    }
+    close(pfd[1]);
+    for (;;) {
+        ssize_t n;
+
+        if (len == cap && cap < FSCK_LIVE_OUT) {
+            buf = (char *) realloc(buf, 2 * cap + 1);
+            if (!buf) {
+                fprintf(stderr, "cetrafs fsck: out of memory\n");
+                exit(FSCK_EXIT_NOEXAM);
+            }
+            cap *= 2;
+        }
+        n = read(pfd[0], buf + len, len < cap ? cap - len : 0);
+        if (n < 0 && errno == EINTR)
+            continue;
+        if (n <= 0) {
+            if (n == 0 && len == cap) { /* past the cap: drain, keep what we have */
+                char sink[4096];
+
+                while (read(pfd[0], sink, sizeof(sink)) > 0)
+                    ;
+            }
+            break;
+        }
+        len += (size_t) n;
+    }
+    buf[len] = 0;
+    close(pfd[0]);
+    while (waitpid(pid, &st, 0) < 0 && errno == EINTR)
+        ;
+    *rc = WIFEXITED(st) ? WEXITSTATUS(st) : FSCK_EXIT_NOEXAM;
+    return buf;
+}
+
+/* Is this exact line in that output? */
+static int fsck_live_has_line(const char *out, const char *line, size_t n)
+{
+    for (const char *p = out; (p = strstr(p, "ERR:")) != NULL; p++)
+        if ((p == out || p[-1] == '\n') && !strncmp(p, line, n) && (p[n] == '\n' || !p[n]))
+            return 1;
+    return 0;
+}
+
+static int fsck_live_check(const char *dev)
+{
+    char *out[FSCK_LIVE_PASSES] = {0};
+    /* Test knob only: fewer walks, so a suite can show what the
+     * repetition filters out (tests/kernel/fsck_live.sh); announced
+     * whenever it is in effect. */
+    int rc = 0, kept = 0,
+        passes = (int) cetrafs_test_env_ll("CETRAFS_TEST_LIVE_PASSES", 1, FSCK_LIVE_PASSES, FSCK_LIVE_PASSES);
+    for (int k = 0; k < passes; k++) {
+        out[k] = fsck_live_walk(dev, &rc);
+        if (rc == 0 || rc != 1) {
+            /* Clean, or not examined (3), or a usage error: that walk's word stands. */
+            fputs(out[k], stdout);
+            if (!rc)
+                printf("cetrafs fsck --live: walk %d of %d found nothing\n", k + 1, passes);
+            for (int j = 0; j <= k; j++)
+                free(out[j]);
+            return rc;
+        }
+        printf("cetrafs fsck --live: walk %d of %d reported problems%s\n", k + 1, passes,
+               k + 1 < passes ? " -- walking again" : "");
+        fflush(stdout);
+    }
+    /* Every walk reported something: what all of them reported alike. */
+    for (const char *p = out[0]; (p = strstr(p, "ERR:")) != NULL; p++) {
+        const char *e;
+        size_t n;
+        int all = 1;
+
+        if (p != out[0] && p[-1] != '\n')
+            continue;
+        e = strchr(p, '\n');
+        n = e ? (size_t) (e - p) : strlen(p);
+        for (int k = 1; k < passes && all; k++)
+            all = fsck_live_has_line(out[k], p, n);
+        if (all) {
+            fprintf(stderr, "%.*s\n", (int) n, p);
+            kept++;
+        }
+    }
+    for (int k = 0; k < passes; k++)
+        free(out[k]);
+    if (!kept) {
+        fprintf(stderr, "cetrafs fsck --live: every walk saw problems but no two alike -- the volume is changing "
+                        "too fast to judge; no verdict. Re-run when it is quieter, or offline.\n");
+        return FSCK_EXIT_NOEXAM;
+    }
+    fprintf(stderr,
+            "cetrafs fsck --live: %d problem(s) every walk repeated -- take the volume offline on every node and "
+            "run fsck.cetra, then fsck.cetra -r\n",
+            kept);
+    return 1;
+}
+
 int main(int argc, char **argv)
 {
     const char *dev = NULL;
@@ -2348,6 +2490,10 @@ int main(int argc, char **argv)
     for (int i = 1; i < argc; ++i) {
         if (!strcmp(argv[i], "-r") || !strcmp(argv[i], "--repair"))
             repair_mode = 1;
+        else if (!strcmp(argv[i], "--live"))
+            live_mode = 1;
+        else if (!strcmp(argv[i], "--live-pass"))
+            live_mode = live_pass = 1;
         else if (!strcmp(argv[i], "--discard-journal") && i + 1 < argc) {
             char *end;
 
@@ -2377,9 +2523,18 @@ int main(int argc, char **argv)
         fprintf(stderr, "                 WITHOUT replaying it (implies -r). Only for an area a mount\n");
         fprintf(stderr, "                 cannot replay (an unreadable block): the redo is lost, and the\n");
         fprintf(stderr, "                 blocks it would have repaired are reported by the walk after.\n");
+        fprintf(stderr, "  --live         check a volume other nodes have mounted, read-only and without\n");
+        fprintf(stderr, "                 claiming it: up to %d walks; a finding counts only if every\n", FSCK_LIVE_PASSES);
+        fprintf(stderr, "                 walk repeats it (a peer's write in flight does not).\n");
         fprintf(stderr, "exit: 0 clean, 1 problems found, 2 usage, 3 could not examine the device\n");
         return FSCK_EXIT_USAGE;
     }
+    if (live_mode && repair_mode) {
+        fprintf(stderr, "--live is read-only: it cannot be combined with -r or --discard-journal\n");
+        return FSCK_EXIT_USAGE;
+    }
+    if (live_mode && !live_pass)
+        return fsck_live_check(dev);
 
     /* Safety first: never check a device a kernel on this system is
      * concurrently mutating -- see devutil.h. */
@@ -2836,8 +2991,10 @@ int main(int argc, char **argv)
 
         /* Same reasoning one level out: a peer mutating this volume
          * while we walk it produces invented "errors", and a clean
-         * result would be just as meaningless. See devutil.h. */
-        int lp = cetrafs_find_live_peer(dev, &row, label, sizeof(label), &age);
+         * result would be just as meaningless. See devutil.h. A live
+         * walk does not ask: its answer would change nothing, and
+         * asking waits up to a heartbeat per walk. */
+        int lp = live_mode ? 0 : cetrafs_find_live_peer(dev, &row, label, sizeof(label), &age);
 
         if (lp < 0) {
             fprintf(stderr,
@@ -2847,7 +3004,11 @@ int main(int argc, char **argv)
                     dev);
             return 3; /* could not examine, same class as an unopenable device */
         }
-        if (lp) {
+        if (live_mode) {
+            printf("  %s: checked live, read-only -- other nodes may have it mounted: a running node's row\n"
+                   "  reads as not departed and its journal as DIRTY, which is expected\n",
+                   dev);
+        } else if (lp) {
             fprintf(stderr,
                     "ERR: %s is mounted by another node (registry row %u%s%s, last seen %llds ago)\n"
                     "     -- its structures are being modified as we read them. Unmount it there;\n"
@@ -6021,7 +6182,9 @@ int main(int argc, char **argv)
          * over a volume a node was changing is a verdict about nothing:
          * ask again before giving one (audit 2026-11-11 F6).
          */
-        if (!repair_mode) {
+        /* A live walk was over a changing volume by design: its verdict
+         * is the repetition fsck_live_check() asks for, not this. */
+        if (!repair_mode && !live_mode) {
             char label[CETRAFS_NODE_LABEL_LEN + 1] = {0};
             long long age = 0;
             uint32_t row = 0;
