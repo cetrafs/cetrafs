@@ -9,8 +9,7 @@
 # filled was not listed, and the notice called every node ready (a
 # sibling of audit 2026-11-14 U1, BUG-CLASSES class 57).
 #
-# The registry is read through the device (this host's cache now holds
-# it), then a not-ready node is registered straight into the backing
+# The registry is read through this host's cache (which now holds it), then a not-ready node is registered straight into the backing
 # file -- the loop device's cache is not told, as with a peer on another
 # host -- and the scan growfs's notice is built from runs again
 # (tests/helpers/caps_scan_probe.c: through growfs the live-peer probe
@@ -18,7 +17,7 @@
 # between the two but hides it from a test).
 #   1. the scan lists the late node, with caps 0.
 #
-# DISCRIMINATION: CETRAFS_TEST_CAPS_CACHED skips the drop; the late node
+# DISCRIMINATION: CETRAFS_TEST_CAPS_CACHED reads through the cache; the late node
 # is then missing from the scan.
 set -euo pipefail
 . "$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)/lib/harness.sh"
@@ -47,7 +46,7 @@ probe() {
     local out
     "$NODE_POKE" "$IMG" 2 0 00 0 >/dev/null # free again
     blockdev --flushbufs "$DEV"
-    out="$("$PROBE" "$DEV")" # read through the device: the cache now holds the registry
+    out="$(CETRAFS_TEST_CAPS_CACHED=1 "$PROBE" "$DEV")" # read through the cache: it now holds the registry
     grep -q "latepeer" <<<"$out" && { echo "SETUP-STALE"; return; }
     "$NODE_POKE" "$IMG" 2 1 cc "$OLD" >/dev/null
     "$NODE_POKE" "$IMG" 2 --label0 latepeer >/dev/null

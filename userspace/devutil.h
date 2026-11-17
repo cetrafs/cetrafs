@@ -308,6 +308,62 @@ static inline int cetrafs_row_same_beat(const cetrafs_node_entry_t *then, const 
            !memcmp(then->node_uuid, now->node_uuid, sizeof(then->node_uuid));
 }
 
+/*
+ * Read registry rows, or a superblock, as the DEVICE has them (audit
+ * 2026-11-14 U1): a peer's write reaches the device, not this host's page cache, and
+ * dropping that cache does not do: POSIX_FADV_DONTNEED is advice that
+ * leaves a page it cannot drop at that instant, and BLKFLSBUF first syncs
+ * the filesystem a mount on this host holds -- so a tool waited out a
+ * mount in flight for as long as it took (it holds the superblock lock
+ * throughout), then judged the registry after the moment it was asked
+ * about, and on a mounted node emptied that node's whole cache. On a
+ * block device the read goes O_DIRECT through a second descriptor on the
+ * same device; an image file has no writer but this host, and is read as
+ * it stands. A descriptor that cannot be opened O_DIRECT fails the read:
+ * every caller treats that as "cannot tell", never as a free row.
+ */
+static inline ssize_t cetrafs_pread_device(int fd, void *buf, size_t len, off_t off)
+{
+    static int dfd = -1, dfd_of = -1;
+    static dev_t dfd_rdev;
+    struct stat st;
+    off_t a = off & ~(off_t) (CETRAFS_BLOCK_SIZE - 1);
+    size_t span = (size_t) (off - a) + len;
+    void *bounce = NULL;
+    ssize_t got;
+
+    if (fstat(fd, &st) != 0)
+        return -1;
+    if (!S_ISBLK(st.st_mode))
+        return pread(fd, buf, len, off);
+    if (dfd_of != fd || dfd_rdev != st.st_rdev) {
+        char path[64];
+
+        if (dfd >= 0)
+            close(dfd);
+        snprintf(path, sizeof(path), "/proc/self/fd/%d", fd);
+        dfd = open(path, O_RDONLY | O_DIRECT | O_CLOEXEC);
+        dfd_of = dfd >= 0 ? fd : -1;
+        dfd_rdev = st.st_rdev;
+        if (dfd < 0)
+            return -1;
+    }
+    span = (span + CETRAFS_BLOCK_SIZE - 1) & ~(size_t) (CETRAFS_BLOCK_SIZE - 1);
+    if (posix_memalign(&bounce, CETRAFS_BLOCK_SIZE, span))
+        return -1;
+    got = pread(dfd, bounce, span, a);
+    if (got < (ssize_t) (off - a)) {
+        free(bounce);
+        return got < 0 ? -1 : 0;
+    }
+    got -= off - a;
+    if ((size_t) got > len)
+        got = (ssize_t) len;
+    memcpy(buf, (char *) bounce + (off - a), (size_t) got);
+    free(bounce);
+    return got;
+}
+
 static inline ssize_t cetrafs_node_row_pread_settled(int fd, unsigned char *blk, off_t off, unsigned *budget_ms)
 {
     unsigned delay = 10;
@@ -317,7 +373,7 @@ static inline ssize_t cetrafs_node_row_pread_settled(int fd, unsigned char *blk,
         cetrafs_node_entry_t ne;
         uint32_t st;
 
-        got = pread(fd, blk, CETRAFS_BLOCK_SIZE, off);
+        got = cetrafs_pread_device(fd, blk, CETRAFS_BLOCK_SIZE, off);
         if (got != (ssize_t) CETRAFS_BLOCK_SIZE)
             return got;
         memcpy(&ne, blk, sizeof(ne));
@@ -595,15 +651,13 @@ static inline void cetrafs_row_drop_cache(int fd, const cetrafs_superblock_t *sb
  * POSIX_FADV_DONTNEED alone is advice: it leaves a page it cannot drop
  * at that instant where it is, and the first sample of mkfs -f's probe
  * read a FREE row a peer had claimed since, one run in two
- * (image/mkfs_probe_fresh.sh). On a block device BLKFLSBUF writes back
- * and invalidates the whole cache, every CPU's LRU drained first. */
+ * (image/mkfs_probe_fresh.sh). The rows themselves are read past the
+ * cache (cetrafs_pread_device()); this only keeps an image file's cache
+ * small. */
 static inline void cetrafs_registry_drop_cache(int fd, const cetrafs_superblock_t *sb)
 {
     uint32_t count = cetrafs_le32(sb->node_table_count);
-    struct stat st;
 
-    if (fstat(fd, &st) == 0 && S_ISBLK(st.st_mode))
-        (void) ioctl(fd, BLKFLSBUF, 0);
     if (count)
         posix_fadvise(fd, cetrafs_node_row_off(sb, 0), (off_t) count * CETRAFS_BLOCK_SIZE, POSIX_FADV_DONTNEED);
 }
@@ -664,7 +718,7 @@ static inline int cetrafs_row_caw(int fd, const cetrafs_superblock_t *sb, uint32
         /* Nothing says it did not execute: the device decides. */
         unsigned char rb[CETRAFS_BLOCK_SIZE];
 
-        if (pread(fd, rb, sizeof(rb), cetrafs_node_row_off(sb, idx)) == (ssize_t) sizeof(rb) &&
+        if (cetrafs_pread_device(fd, rb, sizeof(rb), cetrafs_node_row_off(sb, idx)) == (ssize_t) sizeof(rb) &&
             !memcmp(rb, new_blk, lbs))
             return 0;
     }
@@ -718,7 +772,7 @@ static inline void cetrafs_repair_reap(int fd, const cetrafs_superblock_t *sb, u
     cetrafs_node_entry_t ne, saved;
 
     cetrafs_row_drop_cache(fd, sb, idx); /* the row as the device has it (class 57) */
-    if (pread(fd, blk, sizeof(blk), cetrafs_node_row_off(sb, idx)) != (ssize_t) sizeof(blk))
+    if (cetrafs_pread_device(fd, blk, sizeof(blk), cetrafs_node_row_off(sb, idx)) != (ssize_t) sizeof(blk))
         return;
     memcpy(&ne, blk, sizeof(ne));
     if (cetrafs_le32(ne.state) != CETRAFS_NODE_STATE_REPAIR || !cetrafs_row_same_beat(judged, &ne))
@@ -880,7 +934,7 @@ static inline int cetrafs_repair_row_is_ours(int fd, const cetrafs_superblock_t 
     /* A peer on another host takes a row straight on the device: "still
      * ours" from this host's cache is the unsafe answer (class 57). */
     cetrafs_row_drop_cache(fd, sb, idx);
-    if (pread(fd, &ne, sizeof(ne), cetrafs_node_row_off(sb, idx)) != (ssize_t) sizeof(ne))
+    if (cetrafs_pread_device(fd, &ne, sizeof(ne), cetrafs_node_row_off(sb, idx)) != (ssize_t) sizeof(ne))
         return 0;
     return cetrafs_le32(ne.state) == CETRAFS_NODE_STATE_REPAIR &&
            !memcmp(ne.node_uuid, cetrafs_repair_nonce, sizeof(cetrafs_repair_nonce));
@@ -1069,7 +1123,7 @@ static inline int cetrafs_repair_claim(int fd, const cetrafs_superblock_t *sb, c
             if (!seen)
                 return -1;
             for (idx = 0; idx < count; idx++)
-                if (pread(fd, seen + (size_t) idx * CETRAFS_BLOCK_SIZE, CETRAFS_BLOCK_SIZE,
+                if (cetrafs_pread_device(fd, seen + (size_t) idx * CETRAFS_BLOCK_SIZE, CETRAFS_BLOCK_SIZE,
                           cetrafs_node_row_off(sb, idx)) != (ssize_t) CETRAFS_BLOCK_SIZE) {
                     free(seen);
                     return -1;
@@ -1096,7 +1150,7 @@ static inline int cetrafs_repair_claim(int fd, const cetrafs_superblock_t *sb, c
             unsigned char blk[CETRAFS_BLOCK_SIZE];
             cetrafs_node_entry_t ne;
 
-            if (pread(fd, blk, sizeof(blk), cetrafs_node_row_off(sb, idx)) != (ssize_t) sizeof(blk)) {
+            if (cetrafs_pread_device(fd, blk, sizeof(blk), cetrafs_node_row_off(sb, idx)) != (ssize_t) sizeof(blk)) {
                 free(seen);
                 return -1;
             }
@@ -1221,9 +1275,9 @@ static inline int cetrafs_repair_claim(int fd, const cetrafs_superblock_t *sb, c
 
                 /* ...or, for fsck acting through block 0's copy (A-7)
                  * because block 0 does not verify, that copy. */
-                if (pread(fd, sblk, sizeof(sblk), 0) != (ssize_t) sizeof(sblk) ||
+                if (cetrafs_pread_device(fd, sblk, sizeof(sblk), 0) != (ssize_t) sizeof(sblk) ||
                     (memcmp(sblk, sb, sizeof(*sb)) != 0 &&
-                     (pread(fd, sblk, sizeof(sblk), (off_t) CETRAFS_SB_REPLICA_NR * CETRAFS_BLOCK_SIZE) !=
+                     (cetrafs_pread_device(fd, sblk, sizeof(sblk), (off_t) CETRAFS_SB_REPLICA_NR * CETRAFS_BLOCK_SIZE) !=
                           (ssize_t) sizeof(sblk) ||
                       memcmp(sblk, sb, sizeof(*sb)) != 0))) {
                     cetrafs_repair_release(fd, sb, idx);
@@ -1245,7 +1299,7 @@ static inline int __cetrafs_repair_renew(int fd, const cetrafs_superblock_t *sb,
     cetrafs_node_entry_t ne;
 
     cetrafs_row_drop_cache(fd, sb, row); /* the row as the device has it (class 57) */
-    if (pread(fd, blk, sizeof(blk), cetrafs_node_row_off(sb, row)) != (ssize_t) sizeof(blk))
+    if (cetrafs_pread_device(fd, blk, sizeof(blk), cetrafs_node_row_off(sb, row)) != (ssize_t) sizeof(blk))
         return -1;
     memcpy(&ne, blk, sizeof(ne));
     if (cetrafs_le32(ne.state) != CETRAFS_NODE_STATE_REPAIR ||
@@ -1376,7 +1430,7 @@ static cetrafs_node_entry_t cetrafs_renew_seen[CETRAFS_REPAIR_WATCH_ROWS];
 
 static inline int cetrafs_repair_row_read(int fd, const cetrafs_superblock_t *sb, uint32_t idx, cetrafs_node_entry_t *ne)
 {
-    if (pread(fd, ne, sizeof(*ne), cetrafs_node_row_off(sb, idx)) != (ssize_t) sizeof(*ne))
+    if (cetrafs_pread_device(fd, ne, sizeof(*ne), cetrafs_node_row_off(sb, idx)) != (ssize_t) sizeof(*ne))
         return -1;
     return 0;
 }
@@ -1513,7 +1567,7 @@ static inline void cetrafs_repair_release(int fd, const cetrafs_superblock_t *sb
     if (cetrafs_caw_mode == 1)
         cetrafs_row_drop_cache(fd, sb, row);
     if (!cetrafs_repair_row_is_ours(fd, sb, row) ||
-        pread(fd, cur, sizeof(cur), cetrafs_node_row_off(sb, row)) != (ssize_t) sizeof(cur)) {
+        cetrafs_pread_device(fd, cur, sizeof(cur), cetrafs_node_row_off(sb, row)) != (ssize_t) sizeof(cur)) {
         cetrafs_repair_borrowed = 0;
         return; /* another repairer's claim now: not ours to give back */
     }
@@ -1548,6 +1602,13 @@ static inline void cetrafs_repair_release(int fd, const cetrafs_superblock_t *sb
  * Returns the number of registered rows, -1 on I/O error. Fills the
  * caller's arrays up to 'max'.
  */
+/* TEST ONLY: the control of tests/image/growfs_caps_fresh.sh reads through
+ * this host's cache, as the scan did before class 57. */
+static inline ssize_t cetrafs_caps_pread(int fd, bool cached, void *buf, size_t len, off_t off)
+{
+    return cached ? pread(fd, buf, len, off) : cetrafs_pread_device(fd, buf, len, off);
+}
+
 static inline int cetrafs_scan_node_caps(const char *dev,
                                          char labels[][CETRAFS_NODE_LABEL_LEN + 1],
                                          uint32_t *caps_out,
@@ -1559,6 +1620,7 @@ static inline int cetrafs_scan_node_caps(const char *dev,
     uint32_t count, idx;
     unsigned n = 0;
     int fd;
+    bool cached = cetrafs_test_env("CETRAFS_TEST_CAPS_CACHED");
 
     fd = open(dev, O_RDONLY | O_CLOEXEC);
     if (fd < 0)
@@ -1566,10 +1628,9 @@ static inline int cetrafs_scan_node_caps(const char *dev,
     /* The rows as the device has them: a peer on another host registers
      * straight to the device, and a fresh fd shares this host's page
      * cache. A node registered after that cache filled was missed, and
-     * the gate it feeds said every node was ready (class 57). */
-    if (!cetrafs_test_env("CETRAFS_TEST_CAPS_CACHED")) /* the control of tests/image/growfs_caps_fresh.sh */
-        posix_fadvise(fd, 0, 0, POSIX_FADV_DONTNEED);
-    if (pread(fd, &sb, sizeof(sb), 0) != (ssize_t) sizeof(sb) || cetrafs_le32(sb.magic) != CETRAFS_MAGIC) {
+     * the gate it feeds said every node was ready (class 57). Read past
+     * it (cetrafs_pread_device()). */
+    if (cetrafs_caps_pread(fd, cached, &sb, sizeof(sb), 0) != (ssize_t) sizeof(sb) || cetrafs_le32(sb.magic) != CETRAFS_MAGIC) {
         close(fd);
         return -1;
     }
@@ -1585,7 +1646,7 @@ static inline int cetrafs_scan_node_caps(const char *dev,
          * readiness notice (audit 2026-11-06 L9). */
         off_t off = cetrafs_node_row_off(&sb, idx);
 
-        if (pread(fd, &e, sizeof(e), off) != (ssize_t) sizeof(e)) {
+        if (cetrafs_caps_pread(fd, cached, &e, sizeof(e), off) != (ssize_t) sizeof(e)) {
             close(fd);
             return -1;
         }

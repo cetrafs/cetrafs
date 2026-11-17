@@ -13,6 +13,7 @@
  *
  * usage: renew_mask_probe <image>   prints "inside=<0|1> fired=<0|1>"
  */
+#define _GNU_SOURCE /* O_DIRECT, for devutil.h's device reads */
 #include <errno.h>
 #include <fcntl.h>
 #include <signal.h>

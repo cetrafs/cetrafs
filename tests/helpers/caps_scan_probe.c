@@ -8,6 +8,7 @@
  *
  * usage: caps_scan_probe <device>
  */
+#define _GNU_SOURCE /* O_DIRECT, for devutil.h's device reads */
 #include <errno.h>
 #include <fcntl.h>
 #include <stdint.h>

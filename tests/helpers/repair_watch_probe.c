@@ -16,6 +16,7 @@
  *   Prints "cached_hb=<n> watch_beat=<0|1>". watch_beat=1 is the only
  *   correct answer: the peer beat.
  */
+#define _GNU_SOURCE /* O_DIRECT, for devutil.h's device reads */
 #include <errno.h>
 #include <fcntl.h>
 #include <stdint.h>

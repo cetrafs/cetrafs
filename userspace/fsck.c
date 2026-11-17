@@ -2730,8 +2730,13 @@ int main(int argc, char **argv)
      * walks 2 and 3 and repeated as damage (audit F-54). BLKFLSBUF drops
      * the whole cache, every CPU's LRU drained first. Neither drops a
      * page someone has mapped: a live walk reads O_DIRECT besides
-     * (pread_direct()). */
-    {
+     * (pread_direct()).
+     *
+     * Not on a live walk: it reads past the cache already, and BLKFLSBUF
+     * first syncs the filesystem a mount on this host holds -- waiting
+     * out a mount in flight, and emptying a mounted node's cache, for a
+     * walk that reads none of it. */
+    if (!live_mode) {
         struct stat dst;
 
         if (fstat(fd, &dst) == 0 && S_ISBLK(dst.st_mode))
