@@ -134,11 +134,14 @@ EMPTY_RUN="$(grep -oP '#define CETRAFS_PF_DRAIN_EMPTY_RUN\s+\K[0-9]+' "$ROOT/inc
 ZGS_OWNED="$(awk '/^zg_owned:/{print $2}' "$INFO")"
 [ -n "$ZGS_OWNED" ] && [ "$ZGS_OWNED" -gt 0 ] || ZGS_OWNED=1
 
-D0="$(counter pf_drains)"; B0="$(counter pf_drain_blocks)"
+D0="$(counter pf_drains)"; B0="$(counter pf_drain_blocks)"; W0="$(counter pf_whole_sweeps)"
 # Idle across at least one heartbeat tick, with an empty queue.
 sleep "$(( $(cat /sys/module/cetrafs/parameters/hb_interval_secs 2>/dev/null || echo 15) + 3 ))"
-D1="$(counter pf_drains)"; B1="$(counter pf_drain_blocks)"
-DRAINS=$((D1 - D0)); BLOCKS=$((B1 - B0))
+D1="$(counter pf_drains)"; B1="$(counter pf_drain_blocks)"; W1="$(counter pf_whole_sweeps)"
+# One heartbeat drain in twenty sweeps every owned queue whole, by
+# design (BM-3: an entry past the head is otherwise never found). Those
+# reads are that schedule's, not occupancy-blind scanning: taken out.
+DRAINS=$((D1 - D0)); BLOCKS=$((B1 - B0 - (W1 - W0) * QBLOCKS))
 log "idle ticks: $DRAINS drain pass(es) read $BLOCKS queue block(s) (queue is $QBLOCKS blocks/ZG)"
 
 if [ "$DRAINS" -lt 1 ]; then

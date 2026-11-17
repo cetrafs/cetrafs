@@ -503,6 +503,18 @@ the first read found empty is held, not left for a later drain to
 apply): one more batched read, so about 2.4 ms per pass with work --
 unmeasured on the array, estimated from the row above.
 
+The head is not the whole story, though: an entry a drain left behind
+(a held copy, a busy region) or a peer's append that landed after the
+sweep that emptied the head sits past it, and with only the head read,
+nothing ever brought a drain back for it -- its blocks stayed allocated
+(audit 2026-11-15 BM-3). So a queue whose last drain left something is
+swept whole on every heartbeat drain until it does not, and every owned
+queue is swept whole by the mount's drain and then one heartbeat drain
+in `CETRAFS_PF_FULL_SWEEP_TICKS` (20): one batched 2 MiB read per owned
+Zone Group every five minutes at the 15 s beat, about 1.2 ms each by the
+row above. The allocation path's drain never does either. Counted by
+procfs `pf_whole_sweeps`; `tests/kernel/pf_residue_found.sh`.
+
 A busy region (a consume that keeps losing to appenders) is retried
 with a back-off of 1 .. 128 ms, about a quarter of a second, only by a
 drain that may wait: the heartbeat's and the mount's. A drain from the
@@ -513,7 +525,8 @@ per busy region off the write. Guarded by procfs `pf_drain_busy_waits`
 and `tests/kernel/pf_alloc_drain_no_wait.sh`.
 
 **Guarded by:** procfs `pf_drain_blocks` / `pf_drain_sweeps` (a quiet
-volume's blocks per drain stay ~2 per owned ZG and its sweeps 0);
+volume's blocks per drain stay ~2 per owned ZG, beside the scheduled
+`pf_whole_sweeps`; `tests/kernel/pending_free_backoff.sh`);
 `tests/kernel/pf_stale_copy_later_drain.sh` (correctness). Neither
 measures time -- a loop device serves the reads from the page cache.
 

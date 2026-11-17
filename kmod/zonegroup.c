@@ -3127,7 +3127,7 @@ static int cetrafs_pf_hold_range(struct maple_tree *mt, u64 lba, u32 count)
  * an entry whose stamp is not the group's current one
  * (cetrafs_apply_pending_free(); tests/kernel/pf_late_copy_after_reclaim.sh).
  */
-static int cetrafs_zg_drain_one(struct super_block *sb, u32 zg_id, bool may_wait, bool probed)
+static int cetrafs_zg_drain_one(struct super_block *sb, u32 zg_id, bool may_wait, bool probed, bool whole)
 {
     unsigned int region_sz = cetrafs_cas_region_size(sb);
     unsigned int regions = CETRAFS_BLOCK_SIZE / region_sz;
@@ -3148,8 +3148,9 @@ static int cetrafs_zg_drain_one(struct super_block *sb, u32 zg_id, bool may_wait
         return ret;
 
     /* 1. Anything at all? Already asked when 'probed' (the batched probe
-     * of cetrafs_zg_drain_pending_frees() found something). */
-    any = probed;
+     * of cetrafs_zg_drain_pending_frees() found something). Not asked
+     * when 'whole': the head being empty says nothing about the rest. */
+    any = probed || whole;
     for (qb = 0; qb < qblocks && !probed; qb++) {
         struct buffer_head *bh = cetrafs_bread_uncached_retry(sb, qstart + qb);
         unsigned int r;
@@ -3393,6 +3394,10 @@ static int cetrafs_zg_drain_one(struct super_block *sb, u32 zg_id, bool may_wait
     }
 
 out:
+    /* Anything this drain leaves queued -- a held copy, a busy region, a
+     * stop -- is past whatever the next probe reads (BM-3): the next
+     * heartbeat drain sweeps the whole queue. An error leaves the same. */
+    cetrafs_sb_zg_pf_set_residue(sb, zg_id, ret || stop || hold_all || !mtree_empty(&held_mt));
     if (bhs) {
         for (qb = 0; qb < qblocks; qb++)
             brelse(bhs[qb]);
@@ -3562,6 +3567,24 @@ fail:
     goto out;
 }
 
+/* TEST ONLY: drains read only each queue's head, as before BM-3 (the
+ * control of tests/kernel/pf_residue_found.sh). */
+static bool cetrafs_pf_head_only;
+cetrafs_test_param(pf_head_only, cetrafs_pf_head_only, bool, 0644);
+MODULE_PARM_DESC(pf_head_only, "TEST ONLY: pending-free drains never sweep a queue past its head");
+
+/* One heartbeat drain in this many sweeps every owned queue whole: at
+ * the 15 s beat, an entry nothing else brings a drain back for is
+ * applied within five minutes. */
+#define CETRAFS_PF_FULL_SWEEP_TICKS 20
+
+static atomic64_t cetrafs_pf_whole_sweeps = ATOMIC64_INIT(0);
+
+u64 cetrafs_pf_whole_sweep_count(void)
+{
+    return (u64) atomic64_read(&cetrafs_pf_whole_sweeps);
+}
+
 int cetrafs_zg_drain_pending_frees(struct super_block *sb, bool may_wait)
 {
     atomic64_inc(&cetrafs_pf_drains);
@@ -3569,6 +3592,7 @@ int cetrafs_zg_drain_pending_frees(struct super_block *sb, bool may_wait)
     struct mutex *m = cetrafs_sb_pf_drain_mutex(sb);
     unsigned long *busy;
     u32 zg_count, z;
+    bool full;
     int ret = 0;
 
     if (!raw_sb || !m)
@@ -3582,12 +3606,28 @@ int cetrafs_zg_drain_pending_frees(struct super_block *sb, bool may_wait)
 
     zg_count = le32_to_cpu(raw_sb->zone_group_count);
     busy = cetrafs_zg_probe_queues(sb, zg_count);
+    /* The probe reads each queue's head, which holds everything only
+     * while appends fill from the front -- and an entry a drain left
+     * behind, or a peer's append landing after the sweep that emptied
+     * the head, sits past it with nothing to bring a drain back: its
+     * blocks stayed allocated for good (audit 2026-11-15 BM-3). So the
+     * drains that may wait (the mount's, the heartbeat's) sweep every
+     * owned queue whole on the first pass and then one pass in
+     * CETRAFS_PF_FULL_SWEEP_TICKS, and a queue its last drain left
+     * something in on every pass. The inline drain, inside a write,
+     * never does. */
+    full = may_wait && !READ_ONCE(cetrafs_pf_head_only) &&
+           cetrafs_sb_pf_full_sweep_due(sb, CETRAFS_PF_FULL_SWEEP_TICKS);
     for (z = 0; z < zg_count; z++) {
+        bool whole;
         int rc;
 
         if (!cetrafs_sb_zg_owned_cached(sb, z))
             continue;
-        if (busy && !test_bit(z, busy))
+        whole = full || (may_wait && !READ_ONCE(cetrafs_pf_head_only) && cetrafs_sb_zg_pf_residue(sb, z));
+        if (whole)
+            atomic64_inc(&cetrafs_pf_whole_sweeps);
+        else if (busy && !test_bit(z, busy))
             continue; /* the batched probe found its queue head empty */
         rc = cetrafs_sb_mount_beat(sb); /* the mount-time drain (F1); a no-op from the heartbeat */
         if (rc) {
@@ -3595,7 +3635,7 @@ int cetrafs_zg_drain_pending_frees(struct super_block *sb, bool may_wait)
             break;
         }
 
-        rc = cetrafs_zg_drain_one(sb, z, may_wait, busy != NULL);
+        rc = cetrafs_zg_drain_one(sb, z, may_wait, busy != NULL && test_bit(z, busy), whole);
         if (rc && !ret)
             ret = rc;
     }

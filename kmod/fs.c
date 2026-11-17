@@ -888,6 +888,12 @@ struct cetrafs_sb_info {
     unsigned long *zg_pf_full_until; /* jiffies; 0 = not known full */
     u64 *zg_pf_drop_runs;            /* dropped since the burst began */
     u64 *zg_pf_drop_blocks;
+    /* A drain of this Zone Group's queue left something in it (a held
+     * copy, a busy region, an error): the next heartbeat drain sweeps the
+     * whole queue, past the head the probe reads (audit 2026-11-15 BM-3).
+     * Under pf_drain_mutex. */
+    u8 *zg_pf_residue;
+    u32 pf_full_sweep_tick; /* heartbeat drains since the last whole-queue sweep; under pf_drain_mutex */
 
     unsigned long bg_sweep_last; /* jiffies of the last foreign-descriptor sweep */
     unsigned long pf_drain_last; /* jiffies of the last on-demand pending-free drain */
@@ -2971,8 +2977,10 @@ int cetrafs_fill_super(struct super_block *sb, struct fs_context *fc)
         sbi->zg_pf_full_until = kcalloc(zg_cnt, sizeof(*sbi->zg_pf_full_until), GFP_KERNEL);
         sbi->zg_pf_drop_runs = kcalloc(zg_cnt, sizeof(*sbi->zg_pf_drop_runs), GFP_KERNEL);
         sbi->zg_pf_drop_blocks = kcalloc(zg_cnt, sizeof(*sbi->zg_pf_drop_blocks), GFP_KERNEL);
-        if (!sbi->zg_pf_full_until || !sbi->zg_pf_drop_runs || !sbi->zg_pf_drop_blocks ||
+        sbi->zg_pf_residue = kcalloc(zg_cnt, sizeof(*sbi->zg_pf_residue), GFP_KERNEL);
+        if (!sbi->zg_pf_full_until || !sbi->zg_pf_drop_runs || !sbi->zg_pf_drop_blocks || !sbi->zg_pf_residue ||
             (sbi->peer_count && !sbi->peers) || cetrafs_fill_fail_peers_alloc) {
+            kfree(sbi->zg_pf_residue);
             kfree(sbi->zg_pf_drop_blocks);
             kfree(sbi->zg_pf_drop_runs);
             kfree(sbi->zg_pf_full_until);
@@ -3011,6 +3019,7 @@ int cetrafs_fill_super(struct super_block *sb, struct fs_context *fc)
             cetrafs_layout_free_chain(sbi->layout);
             bitmap_free(sbi->alloc_shadow);
             kvfree(sbi->inode_birth);
+            kfree(sbi->zg_pf_residue);
             kfree(sbi->zg_pf_drop_blocks);
             kfree(sbi->zg_pf_drop_runs);
             kfree(sbi->zg_pf_full_until);
@@ -4369,6 +4378,7 @@ departed:
     sbi->layout = NULL;
     bitmap_free(sbi->alloc_shadow);
     kvfree(sbi->inode_birth);
+    kfree(sbi->zg_pf_residue);
     kfree(sbi->zg_pf_drop_blocks);
     kfree(sbi->zg_pf_drop_runs);
     kfree(sbi->zg_pf_full_until);
@@ -4398,6 +4408,37 @@ bool cetrafs_sb_zg_pf_backoff_active(struct super_block *sb, u32 zg_id)
         return false;
     until = READ_ONCE(sbi->zg_pf_full_until[zg_id]);
     return until && time_before(jiffies, until);
+}
+
+/* BM-3: did the last drain of this Zone Group leave anything queued?
+ * Both under pf_drain_mutex. */
+bool cetrafs_sb_zg_pf_residue(struct super_block *sb, u32 zg_id)
+{
+    struct cetrafs_sb_info *sbi = sb->s_fs_info;
+
+    return sbi && sbi->zg_pf_residue && zg_id < sbi->zg_count && sbi->zg_pf_residue[zg_id];
+}
+
+void cetrafs_sb_zg_pf_set_residue(struct super_block *sb, u32 zg_id, bool left)
+{
+    struct cetrafs_sb_info *sbi = sb->s_fs_info;
+
+    if (sbi && sbi->zg_pf_residue && zg_id < sbi->zg_count)
+        sbi->zg_pf_residue[zg_id] = left;
+}
+
+/* Is this heartbeat drain the one that sweeps every owned queue whole?
+ * The first, then one in 'every'. Under pf_drain_mutex. */
+bool cetrafs_sb_pf_full_sweep_due(struct super_block *sb, u32 every)
+{
+    struct cetrafs_sb_info *sbi = sb->s_fs_info;
+    bool due;
+
+    if (!sbi)
+        return false;
+    due = sbi->pf_full_sweep_tick == 0;
+    sbi->pf_full_sweep_tick = every && sbi->pf_full_sweep_tick + 1 < every ? sbi->pf_full_sweep_tick + 1 : 0;
+    return due;
 }
 
 /* Record dropped runs (extents) and their blocks. Returns true the FIRST

@@ -402,6 +402,7 @@ static int cetrafs_proc_info_show(struct seq_file *m, void *v)
     seq_printf(m, "journal_slots_stuck: %llu\n", cetrafs_journal_held_slots(sb));
     seq_printf(m, "bg_geom_reads: %llu\n", cetrafs_bg_geom_read_count());
     seq_printf(m, "pf_drains: %llu\n", cetrafs_pf_drain_count());
+    seq_printf(m, "pf_whole_sweeps: %llu\n", cetrafs_pf_whole_sweep_count());
     seq_printf(m, "pf_full_scans: %llu\n", cetrafs_pf_full_scans_count());
     seq_printf(m, "pf_drain_blocks: %llu\n", cetrafs_pf_drain_blocks_count());
     seq_printf(m, "pf_drain_sweeps: %llu\n", cetrafs_pf_drain_sweeps_count());

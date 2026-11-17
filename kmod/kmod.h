@@ -298,6 +298,9 @@ bool cetrafs_sb_zg_note_unreadable(struct super_block *sb, u32 zg_id);
 u32 cetrafs_sb_zg_unreadable_count(struct super_block *sb);
 extern bool cetrafs_zg_unreadable_fatal;
 bool cetrafs_sb_zg_pf_backoff_active(struct super_block *sb, u32 zg_id);
+bool cetrafs_sb_zg_pf_residue(struct super_block *sb, u32 zg_id);
+void cetrafs_sb_zg_pf_set_residue(struct super_block *sb, u32 zg_id, bool left);
+bool cetrafs_sb_pf_full_sweep_due(struct super_block *sb, u32 every);
 bool cetrafs_sb_zg_pf_note_drop(struct super_block *sb, u32 zg_id, u32 runs, u64 blocks, unsigned int backoff_ms);
 bool cetrafs_sb_zg_pf_take_drops(struct super_block *sb, u32 zg_id, u64 *runs, u64 *blocks);
 bool cetrafs_sb_owns_any_zg(struct super_block *sb);
@@ -1498,6 +1501,7 @@ u64 cetrafs_journal_write_count(void);
 u64 cetrafs_journal_held_slots(struct super_block *sb); /* journal.c: slots held by kept entries */
 u64 cetrafs_bg_geom_read_count(void);
 u64 cetrafs_pf_drain_count(void);
+u64 cetrafs_pf_whole_sweep_count(void); /* zonegroup.c, BM-3 */
 u64 cetrafs_giveback_block_count(void);
 u64 cetrafs_convert_leaf_full_count(void);
 u64 cetrafs_leaf_split_count(void);
