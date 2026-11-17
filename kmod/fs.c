@@ -1558,8 +1558,9 @@ walked:
              * really does not verify. Found by the fuzzer's
              * fsck-versus-mount oracle.
              */
-            pr_err("Block Group %u's descriptor does not verify (%d) -- refusing to %s\n", b, brc,
-                   prev ? "use the grown layout" : "mount");
+            pr_err("Block Group %u's descriptor does not verify (%d) -- refusing to %s%s\n", b, brc,
+                   prev ? "use the grown layout" : "mount",
+                   brc == -EIO ? "" : "; fsck.cetra -r rebuilds it from the group's header");
             rc = brc == -EIO ? -EIO : -EUCLEAN;
             goto out;
         }

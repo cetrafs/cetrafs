@@ -944,6 +944,142 @@ static void fsck_rebuild_zg(int fd, const cetrafs_superblock_t *sb, uint32_t z)
     pwrite_all(fd, blk, sizeof(blk), (off_t) (cetrafs_le64(sb->zg_table_start) + z) * CETRAFS_BLOCK_SIZE);
 }
 
+/*
+ * The header at `start` names Block Group b, verifies, and describes a
+ * region that fits in [start, limit). Fills *hdr. The header is written
+ * by mkfs and growfs only and never moves, so a verifying one is the
+ * group's geometry (its owner field is the initial one, not current).
+ */
+static int fsck_bg_header_at(int fd, uint32_t b, uint64_t start, uint64_t limit, cetrafs_bg_header_t *hdr)
+{
+    uint8_t blk[CETRAFS_BLOCK_SIZE] = {0};
+    uint32_t off_bmap, off_data;
+    uint64_t cnt;
+
+    if (!start || start >= limit)
+        return 0;
+    pread_all(fd, blk, sizeof(blk), (off_t) start * CETRAFS_BLOCK_SIZE);
+    memcpy(hdr, blk, sizeof(*hdr));
+    if (cetrafs_le32(hdr->bg_id) != b ||
+        (uint32_t) cetrafs_le64(hdr->checksum) !=
+            crc32c_struct(hdr, sizeof(*hdr), offsetof(cetrafs_bg_header_t, checksum), sizeof(hdr->checksum)))
+        return 0;
+    if (!cetrafs_le64(hdr->length_blocks) || cetrafs_le64(hdr->length_blocks) > CETRAFS_MAX_BG_SIZE_BLOCKS ||
+        cetrafs_le64(hdr->length_blocks) > limit - start)
+        return 0;
+    cetrafs_calc_bg_layout(cetrafs_le64(hdr->length_blocks), &off_bmap, &off_data, &cnt);
+    return cetrafs_le32(hdr->off_data_bmap) == off_bmap && cetrafs_le32(hdr->off_data_region) == off_data &&
+           cetrafs_le64(hdr->data_block_count) == cnt;
+}
+
+/*
+ * A Block Group descriptor that fails its checksum, rebuilt (audit
+ * 2026-11-15 B-14). Offline, every field is derivable or safely chosen:
+ *
+ *   geometry -- from the group's own header, found where the previous
+ *     group ends (`prev_end`) or, past a grow's hole, one group size
+ *     before the next descriptor's start. Neither verifying, it is not
+ *     rebuilt: a guessed start would aim every later write.
+ *   owner -- the Zone Group whose pending-free queue names blocks here
+ *     (only the owner's queue receives them); else the pool if the
+ *     bitmap is empty; else its round-robin Zone Group. No node is
+ *     mounted, and the next claim recounts what it takes.
+ *   free_gen -- one past every stamp queued for it, so no queued free
+ *     applies: an entry that was already dead must not come back to
+ *     clear a block reused since. That only leaks, and this run's leak
+ *     pass reclaims it.
+ *   flags -- none: no hand-back is in flight offline.
+ *
+ * Returns 0 rebuilt, -1 not rebuildable.
+ */
+static int fsck_rebuild_bg_desc(int fd, const cetrafs_superblock_t *sb, uint64_t desc_lba, uint32_t b,
+                                uint64_t prev_end, uint64_t next_start, uint64_t data_end)
+{
+    uint8_t blk[CETRAFS_BLOCK_SIZE] = {0};
+    cetrafs_bg_header_t hdr;
+    cetrafs_block_group_t bg;
+    uint64_t start = 0, dstart, cnt, used = 0, max_stamp = 0;
+    uint32_t nzg = cetrafs_le32(sb->zone_group_count), owner = CETRAFS_BG_OWNER_FREE, bmap_blocks;
+    int queued = 0;
+
+    if (fsck_bg_header_at(fd, b, prev_end, next_start ? next_start : data_end, &hdr) &&
+        (!next_start || prev_end + cetrafs_le64(hdr.length_blocks) <= next_start))
+        start = prev_end;
+    else if (next_start && next_start > cetrafs_le64(sb->bg_size_blocks) &&
+             fsck_bg_header_at(fd, b, next_start - cetrafs_le64(sb->bg_size_blocks), next_start, &hdr) &&
+             cetrafs_le64(hdr.length_blocks) == cetrafs_le64(sb->bg_size_blocks) &&
+             next_start - cetrafs_le64(sb->bg_size_blocks) >= prev_end)
+        start = next_start - cetrafs_le64(sb->bg_size_blocks);
+    if (!start)
+        return -1;
+    dstart = start + cetrafs_le32(hdr.off_data_region);
+    cnt = cetrafs_le64(hdr.data_block_count);
+
+    /* What is in use, from the bitmap: the content pass checks the
+     * count against it again. */
+    bmap_blocks = cetrafs_le32(hdr.off_data_region) - cetrafs_le32(hdr.off_data_bmap);
+    for (uint32_t i = 0; i < bmap_blocks; i++) {
+        pread_all(fd, blk, sizeof(blk), (off_t) (start + cetrafs_le32(hdr.off_data_bmap) + i) * CETRAFS_BLOCK_SIZE);
+        for (uint64_t bit = 0; bit < (uint64_t) CETRAFS_BLOCK_SIZE * 8; bit++) {
+            uint64_t idx = (uint64_t) i * CETRAFS_BLOCK_SIZE * 8 + bit;
+
+            if (idx >= cnt)
+                break;
+            if (blk[bit / 8] & (1u << (bit % 8)))
+                used++;
+        }
+    }
+
+    if (sb->pending_free_start) {
+        for (uint32_t z = 0; z < nzg; z++) {
+            for (uint32_t q = 0; q < cetrafs_le32(sb->pending_free_blocks_per_zg); q++) {
+                pread_all(fd, blk, sizeof(blk),
+                          (off_t) (cetrafs_le64(sb->pending_free_start) +
+                                   (uint64_t) z * cetrafs_le32(sb->pending_free_blocks_per_zg) + q) *
+                              CETRAFS_BLOCK_SIZE);
+                for (unsigned e = 0; e < CETRAFS_PENDING_FREE_PER_BLOCK; e++) {
+                    cetrafs_pending_free_t pe;
+
+                    memcpy(&pe, blk + e * sizeof(pe), sizeof(pe));
+                    if (cetrafs_le32(pe.magic) != CETRAFS_PENDING_FREE_MAGIC || !cetrafs_le64(pe.lba) ||
+                        cetrafs_le64(pe.lba) < dstart || cetrafs_le64(pe.lba) - dstart >= cnt)
+                        continue;
+                    if (!queued)
+                        owner = z;
+                    queued = 1;
+                    if (cetrafs_le64(pe.free_gen) > max_stamp)
+                        max_stamp = cetrafs_le64(pe.free_gen);
+                }
+            }
+        }
+    }
+    if (!queued && used)
+        owner = b % nzg;
+
+    memset(&bg, 0, sizeof(bg));
+    bg.bg_id = cetrafs_cpu_to_le32(b);
+    bg.owner_zg = cetrafs_cpu_to_le16((uint16_t) owner);
+    bg.start_block = cetrafs_cpu_to_le64(start);
+    bg.length_blocks = hdr.length_blocks;
+    bg.off_bg_header = cetrafs_cpu_to_le32(0);
+    bg.off_data_bmap = hdr.off_data_bmap;
+    bg.off_data_region = hdr.off_data_region;
+    bg.data_block_count = hdr.data_block_count;
+    bg.free_data_blocks = cetrafs_cpu_to_le64(cnt - used);
+    bg.reconcile_seq = cetrafs_cpu_to_le64(1);
+    bg.free_gen = cetrafs_cpu_to_le64(max_stamp + 1);
+    bg.checksum = cetrafs_cpu_to_le64(
+        crc32c_struct(&bg, sizeof(bg), offsetof(cetrafs_block_group_t, checksum), sizeof(bg.checksum)));
+    memset(blk, 0, sizeof(blk));
+    memcpy(blk, &bg, sizeof(bg));
+    pwrite_all(fd, blk, sizeof(blk), (off_t) desc_lba * CETRAFS_BLOCK_SIZE);
+    printf("  rebuilt the descriptor of BG%u: [%" PRIu64 ",+%" PRIu64 "), owner %s%u, %" PRIu64
+           " block(s) in use, free_gen %" PRIu64 "\n",
+           b, start, (uint64_t) cetrafs_le64(hdr.length_blocks), owner == CETRAFS_BG_OWNER_FREE ? "pool " : "ZG",
+           owner == CETRAFS_BG_OWNER_FREE ? 0 : owner, used, max_stamp + 1);
+    return 0;
+}
+
 static int fsck_alloc_block(int fd,
                             uint32_t bg_count,
                             const uint64_t *bg_data_start,
@@ -2814,6 +2950,41 @@ int main(int argc, char **argv)
         pread_all(fd, blk, sizeof(blk), (off_t) bg_desc_lba[b] * CETRAFS_BLOCK_SIZE);
         cetrafs_block_group_t bg;
         memcpy(&bg, blk, sizeof(bg));
+        /* A descriptor failing its checksum stopped every mount and
+         * this check alike, with nothing to repair it (B-14). Its fields
+         * are garbage, so it is judged before any of them is used:
+         * rebuilt under -r from the group's header, else reported. */
+        if ((uint32_t) cetrafs_le64(bg.checksum) !=
+            crc32c_struct(&bg, sizeof(bg), offsetof(cetrafs_block_group_t, checksum), sizeof(bg.checksum))) {
+            uint64_t next_start = 0, data_end = cetrafs_le64(sb.bg_data_end);
+
+            fprintf(stderr, "ERR: BG%zu descriptor CRC mismatch%s\n", (size_t) b,
+                    repair_mode ? "" : " -- fsck.cetra -r rebuilds it from the group's header");
+            if (!data_end)
+                data_end = cetrafs_le64(sb.bg_regions_start) +
+                           (uint64_t) cetrafs_le32(sb.block_group_count) * cetrafs_le64(sb.bg_size_blocks);
+            if (b + 1 < cetrafs_le32(sb.block_group_count)) {
+                uint8_t nblk[CETRAFS_BLOCK_SIZE] = {0};
+                cetrafs_block_group_t nbg;
+
+                pread_all(fd, nblk, sizeof(nblk), (off_t) bg_desc_lba[b + 1] * CETRAFS_BLOCK_SIZE);
+                memcpy(&nbg, nblk, sizeof(nbg));
+                if ((uint32_t) cetrafs_le64(nbg.checksum) ==
+                    crc32c_struct(&nbg, sizeof(nbg), offsetof(cetrafs_block_group_t, checksum), sizeof(nbg.checksum)))
+                    next_start = cetrafs_le64(nbg.start_block);
+            }
+            /* Geometry from a verifying header or nothing; owner and
+             * free_gen chosen so an error leaks rather than shares. */
+            if (!repair_mode || repair_blocked || /* class 45: rebuild */
+                fsck_rebuild_bg_desc(fd, &sb, bg_desc_lba[b], (uint32_t) b, next, next_start, data_end)) {
+                if (repair_mode)
+                    fprintf(stderr, "ERR: BG%zu: no verifying header where it can start -- not rebuilt\n", (size_t) b);
+                return 1;
+            }
+            repairs_made++;
+            pread_all(fd, blk, sizeof(blk), (off_t) bg_desc_lba[b] * CETRAFS_BLOCK_SIZE);
+            memcpy(&bg, blk, sizeof(bg));
+        }
         /*
          * Ordered and non-overlapping, NOT exactly adjacent.
          *
