@@ -88,7 +88,7 @@ OUT="$("$ROOT/userspace/fsck.cetra" "$DEV" 2>&1)" || true
 unset CETRAFS_PEER_PROBE_SECS
 # fsck then checks the volume and reports the bad slot as damage -- the
 # point is that it gets to.
-! grep -q "is mounted by another node" <<<"$OUT" && grep -q "node slot 1 CRC mismatch" <<<"$OUT" &&
+! grep -q "is mounted by another node" <<<"$OUT" && grep -q "node slot 1 fails its checksum" <<<"$OUT" &&
     [ $((SECONDS - t0)) -le 10 ] &&
     pass "a row that never verifies does not block fsck, which reports it ($((SECONDS - t0)) s)" ||
     fail "a garbage row blocked fsck or slowed it ($((SECONDS - t0)) s): $(tail -1 <<<"$OUT")"

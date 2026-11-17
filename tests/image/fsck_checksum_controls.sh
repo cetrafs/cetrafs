@@ -81,18 +81,22 @@ build
 "$POKE" "$DEV" node 0 >/dev/null
 blockdev --flushbufs "$DEV"
 NODE_OUT="$(ct_fsck "$DEV" 2>&1 || true)"
-echo "$NODE_OUT" | grep -qE "node slot .* CRC mismatch" &&
+echo "$NODE_OUT" | grep -qE "node slot .* fails its checksum" &&
     pass "node registry row: detected" ||
     fail "node registry row: wanted a CRC mismatch, got: $(echo "$NODE_OUT" | grep '^ERR' | head -2 | tr '\n' ' ')"
-# ...and the reason it needed registering first is itself worth an
-# assertion: a FREE row is zero-filled by mkfs and never stamped, so
-# checking its checksum would condemn every fresh volume.
+# A FREE row is zero-filled by mkfs and never stamped: a blank one is
+# not checked, or every fresh volume would fail. One that is NOT blank and
+# does not verify is damage, as the kernel reads it (B-14): reported.
 build
+ct_fsck "$DEV" >/dev/null 2>&1 &&
+    pass "node registry row: blank FREE rows (a fresh volume) are not checked" ||
+    fail "a fresh volume failed fsck -- its blank FREE rows were checked"
 "$POKE" "$DEV" node 0 >/dev/null
 blockdev --flushbufs "$DEV"
-ct_fsck "$DEV" >/dev/null 2>&1 &&
-    pass "node registry row: a FREE row's checksum is correctly NOT checked" ||
-    fail "a corrupted FREE row was reported -- mkfs leaves them zeroed, so every fresh volume would fail"
+FREE_OUT="$(ct_fsck "$DEV" 2>&1 || true)"
+grep -qE "node slot 0 fails its checksum" <<<"$FREE_OUT" &&
+    pass "node registry row: a FREE row that is not blank and does not verify is reported" ||
+    fail "a damaged non-blank FREE row was not reported"
 expect_caught "root inode record"     "root inode CRC(/identity)? mismatch"          inode 1
 expect_caught "root's dirent block"   "tail checksum"                    dirent-tail 1
 
