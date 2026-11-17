@@ -13,6 +13,7 @@
 #include <string.h>
 #include <sys/ioctl.h>
 #include <sys/stat.h>
+#include <sys/sysmacros.h>
 #include <sys/types.h>
 #include <sys/wait.h>
 #include <unistd.h>
@@ -1064,6 +1065,27 @@ static void fsck_scan_pending_journals(int fd, const cetrafs_superblock_t *sb)
     }
 }
 
+/* Does the device take discards (UNMAP)? From the block layer's queue
+ * limits; a plain file or an unreadable answer is no. */
+static int fsck_device_discards(int fd)
+{
+    char path[96], val[32] = {0};
+    struct stat st;
+    FILE *f;
+
+    if (fstat(fd, &st) || !S_ISBLK(st.st_mode))
+        return 0;
+    snprintf(path, sizeof(path), "/sys/dev/block/%u:%u/queue/discard_max_bytes", major(st.st_rdev),
+             minor(st.st_rdev));
+    f = fopen(path, "r");
+    if (!f)
+        return 0;
+    if (!fgets(val, sizeof(val), f))
+        val[0] = 0;
+    fclose(f);
+    return strtoull(val, NULL, 10) > 0;
+}
+
 static int fsck_rebuild_bg_desc(int fd, const cetrafs_superblock_t *sb, uint64_t desc_lba, uint32_t b,
                                 uint64_t prev_end, uint64_t next_start, uint64_t data_end, const uint32_t *zg_owner)
 {
@@ -1072,6 +1094,7 @@ static int fsck_rebuild_bg_desc(int fd, const cetrafs_superblock_t *sb, uint64_t
     cetrafs_block_group_t bg;
     uint64_t start = 0, dstart, cnt, used = 0, max_stamp = 0;
     uint32_t nzg = cetrafs_le32(sb->zone_group_count), owner = CETRAFS_BG_OWNER_FREE, bmap_blocks;
+    uint16_t flags = 0;
     int queued = 0;
 
     if (fsck_bg_header_at(fd, b, prev_end, next_start ? next_start : data_end, &hdr) &&
@@ -1152,9 +1175,25 @@ static int fsck_rebuild_bg_desc(int fd, const cetrafs_superblock_t *sb, uint64_t
         break;
     }
 
+    /* The damaged image's flags are lost with it, DISCARD_PENDING among
+     * them: a group whose hand-back UNMAP had an unknown outcome, kept out
+     * of use until a known one, rebuilt into the pool usable at once
+     * (audit F-50). An empty group is therefore rebuilt as pending, where
+     * the device can discard: its Zone Group's owner discards it again
+     * and only then releases it -- one more discard, at worst. Never in
+     * the pool (a pooled group with the flag is refused as damage), and
+     * never on a device that takes no discards, where nothing could ever
+     * settle it. */
+    if (!used && fsck_device_discards(fd)) {
+        if (owner == CETRAFS_BG_OWNER_FREE)
+            owner = b % nzg;
+        flags |= CETRAFS_BG_FLAG_DISCARD_PENDING;
+    }
+
     memset(&bg, 0, sizeof(bg));
     bg.bg_id = cetrafs_cpu_to_le32(b);
     bg.owner_zg = cetrafs_cpu_to_le16((uint16_t) owner);
+    bg.flags = cetrafs_cpu_to_le16(flags);
     bg.start_block = cetrafs_cpu_to_le64(start);
     bg.length_blocks = hdr.length_blocks;
     bg.off_bg_header = cetrafs_cpu_to_le32(0);
@@ -1170,9 +1209,10 @@ static int fsck_rebuild_bg_desc(int fd, const cetrafs_superblock_t *sb, uint64_t
     memcpy(blk, &bg, sizeof(bg));
     pwrite_all(fd, blk, sizeof(blk), (off_t) desc_lba * CETRAFS_BLOCK_SIZE);
     printf("  rebuilt the descriptor of BG%u: [%" PRIu64 ",+%" PRIu64 "), owner %s%u, %" PRIu64
-           " block(s) in use, free_gen %" PRIu64 "\n",
+           " block(s) in use, free_gen %" PRIu64 "%s\n",
            b, start, (uint64_t) cetrafs_le64(hdr.length_blocks), owner == CETRAFS_BG_OWNER_FREE ? "pool " : "ZG",
-           owner == CETRAFS_BG_OWNER_FREE ? 0 : owner, used, max_stamp + 1);
+           owner == CETRAFS_BG_OWNER_FREE ? 0 : owner, used, max_stamp + 1,
+           flags & CETRAFS_BG_FLAG_DISCARD_PENDING ? ", discard pending (its owner discards it again)" : "");
     return 0;
 }
 

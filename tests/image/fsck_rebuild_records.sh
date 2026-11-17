@@ -68,7 +68,9 @@ WALK=0
 # Two Block Groups at this size: BG0 holds the root directory's block.
 EXPECT="rebuilt the descriptor of BG0: .*owner ZG0, [1-9][0-9]* block(s) in use"
 case_rebuilt "block group 0, holding the root" bg-desc 0
-EXPECT="rebuilt the descriptor of BG1: .*owner pool"
+# Empty: kept out of use for one more discard by its round-robin Zone
+# Group (F-50) -- a loop device takes discards.
+EXPECT="rebuilt the descriptor of BG1: .*owner ZG1, 0 block(s) in use, .*discard pending"
 case_rebuilt "block group 1, empty and last" bg-desc 1
 fill1() { "$BG_POKE" "$DEV" 1 0 fill-bitmap >/dev/null; }
 PRE=fill1

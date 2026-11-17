@@ -13,19 +13,20 @@
 # Now the journals are read before any rebuild:
 #   a. a descriptor whose group an unreplayed entry targets goes to a
 #      Zone Group of that entry's node -- a claim of it replays that
-#      node first -- never to the pool (control: no entry -> pool);
+#      node first -- never to the pool (control: no entry -> its
+#      round-robin ZG1, kept for a discard as every empty group, F-50);
 #   b. a Zone Group record is not rebuilt while any entry is unreplayed;
 #      a mount skips a damaged record, so "mount once, then fsck -r"
 #      is the order (control: no entry -> rebuilt);
 #   c. an entry whose target already holds its payload gates nothing
-#      (only its consume was lost) -> pool, as with no entry.
+#      (only its consume was lost) -> ZG1, as with no entry.
 #
 # The node is row 1, registered and silent (fsck's peer probe finds it
 # not beating); ZG0 is made its own, so (a) also proves the owner is
 # searched for, not taken as BG1's round-robin ZG1.
 #
 # DISCRIMINATION: with the gate removed from fsck.c, (a) prints "owner
-# pool" and (b) "rebuilt the record" -- checked by reverting it.
+# ZG1" and (b) "rebuilt the record" -- checked by reverting it.
 set -euo pipefail
 . "$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)/lib/harness.sh"
 export CETRAFS_PEER_PROBE_SECS=3
@@ -72,9 +73,9 @@ build none
 "$POKE" "$DEV" bg-desc 1 >/dev/null
 blockdev --flushbufs "$DEV"
 out="$(repair)"
-grep -q "rebuilt the descriptor of BG1: .*owner pool" <<<"$out" &&
-    pass "a control: with no entry the empty group goes to the pool" ||
-    fail "a control: the setup does not reach the pool rebuild: $(grep -E 'rebuilt|ERR' <<<"$out" | head -3 | tr '\n' ' ')"
+grep -q "rebuilt the descriptor of BG1: .*owner ZG1, " <<<"$out" &&
+    pass "a control: with no entry the empty group goes to its round-robin ZG1" ||
+    fail "a control: the setup does not reach the round-robin rebuild: $(grep -E 'rebuilt|ERR' <<<"$out" | head -3 | tr '\n' ' ')"
 
 build pending
 "$POKE" "$DEV" zg-hot 1 >/dev/null
@@ -96,7 +97,7 @@ build landed
 "$POKE" "$DEV" bg-desc 1 >/dev/null
 blockdev --flushbufs "$DEV"
 out="$(repair)"
-grep -q "rebuilt the descriptor of BG1: .*owner pool" <<<"$out" &&
+grep -q "rebuilt the descriptor of BG1: .*owner ZG1, " <<<"$out" &&
     pass "c: an entry already on its target gates nothing" ||
     fail "c: $(grep -E 'rebuilt|BG1|ERR' <<<"$out" | head -3 | tr '\n' ' ')"
 ct_exit
