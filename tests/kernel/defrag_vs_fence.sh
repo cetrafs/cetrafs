@@ -19,7 +19,10 @@
 #      was written.
 #
 # DISCRIMINATION: defrag_copy_gate_off=1: the batch's copies land, the
-# patterns are on the device twice.
+# patterns are on the device twice. With meta_gate_unlocked_only=1 too:
+# every buffer write asks the fence again under its lock (BM-24, 72d3481),
+# a second gate behind this one, and with it on the control could not
+# fail -- this suite's gate must be the sole one in its way.
 set -euo pipefail
 . "$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)/lib/harness.sh"
 require_root
@@ -28,6 +31,7 @@ require_module
 ct_param_set alloc_run_blocks 0
 ct_param_set auto_defrag 0
 ct_param_set defrag_copy_stall_ms 0
+ct_param_set meta_gate_unlocked_only 0
 DEFRAG="$ROOT/userspace/defrag.cetra"
 MNT="$(ct_mnt dvf)"
 ct_track mnt "$MNT"
@@ -52,6 +56,7 @@ os.close(a); os.close(b)
 PY
     sync
     echo "$1" >$P/defrag_copy_gate_off
+    echo "$1" >$P/meta_gate_unlocked_only
     echo 4000 >$P/defrag_copy_stall_ms
     "$DEFRAG" "$MNT/f" >/dev/null 2>&1 &
     local dpid=$! dl=$((SECONDS + 30))
@@ -61,6 +66,7 @@ PY
     wait "$dpid" || true
     stopped="$(sed -n 's/^shutdown: //p' "$proc/controls")"
     echo 0 >$P/defrag_copy_gate_off
+    echo 0 >$P/meta_gate_unlocked_only
     echo 0 >$P/defrag_copy_stall_ms
     umount "$MNT" 2>/dev/null || umount -l "$MNT" 2>/dev/null || true
     losetup -d "$dev" 2>/dev/null || true
