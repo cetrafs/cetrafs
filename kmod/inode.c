@@ -2906,6 +2906,14 @@ static bool cetrafs_inode_has_unpublished_state(struct inode *inode)
 static bool cetrafs_cold_size_off;
 cetrafs_test_param(cold_size_off, cetrafs_cold_size_off, bool, 0644);
 
+/* TEST ONLY: the size apply tries the inode lock once, as before -- the
+ * control of tests/kernel/cold_reconcile_size.sh's contended round. */
+static bool cetrafs_cold_size_retry_off;
+cetrafs_test_param(cold_size_retry_off, cetrafs_cold_size_retry_off, bool, 0644);
+MODULE_PARM_DESC(cold_size_retry_off, "TEST ONLY: the cold reconcile's size apply tries the inode lock once");
+
+static bool cetrafs_apply_trylock_fail_once;
+
 /*
  * The cold reconcile's size half (lock.c's cetrafs_inode_cold_work()).
  * A file_seq change sends the tree and the clean pages back to the
@@ -2923,6 +2931,7 @@ int cetrafs_inode_apply_size_from_raw(struct inode *inode, const cetrafs_inode_t
 {
     struct cetrafs_stat_baseline b;
     u64 size = cetrafs_le64(raw->size), blocks = cetrafs_le64(raw->blocks);
+    unsigned int attempt;
 
     if (READ_ONCE(cetrafs_cold_size_off) || !S_ISREG(inode->i_mode))
         return 0;
@@ -2930,8 +2939,25 @@ int cetrafs_inode_apply_size_from_raw(struct inode *inode, const cetrafs_inode_t
         return 0; /* another file now: not ours to apply */
     if ((u64) i_size_read(inode) == size && (u64) inode->i_blocks == blocks)
         return 0;
-    if (!inode_trylock(inode))
-        return -EAGAIN;
+    /*
+     * A reader holds i_rwsem shared for every O_DIRECT read, so a single
+     * trylock lost to whatever read was in flight -- a VM reading its
+     * disk is one, nearly always -- and the reconcile parked until the
+     * next heartbeat, the held fd reading short all that time (the B-10
+     * failure itself), and for good after the park's retries. A short
+     * bounded retry, as cetrafs_apply_raw_to_vfs_inode_sure() does, and
+     * the park only past it: this runs on cold_wq, whose worker must not
+     * be held long (cetrafs_inode_cold_work()).
+     */
+    for (attempt = 0;; attempt++) {
+        bool contended = READ_ONCE(cetrafs_apply_trylock_fail_once) && xchg(&cetrafs_apply_trylock_fail_once, false);
+
+        if (!contended && inode_trylock(inode))
+            break;
+        if (READ_ONCE(cetrafs_cold_size_retry_off) || attempt >= 200)
+            return -EAGAIN;
+        usleep_range(200, 500);
+    }
     if (!cetrafs_inode_has_unpublished_state(inode) && cetrafs_inode_stat_baseline_get(inode, &b)) {
         i_size_write(inode, size);
         inode->i_blocks = blocks;
@@ -2942,8 +2968,9 @@ int cetrafs_inode_apply_size_from_raw(struct inode *inode, const cetrafs_inode_t
 }
 
 /* TEST ONLY: the next apply loses its inode_lock trylock, as it does to
- * a local writer retrying -ETXTBSY. tests/kernel/lock_resume_reconcile.sh. */
-static bool cetrafs_apply_trylock_fail_once;
+ * a local writer retrying -ETXTBSY. tests/kernel/lock_resume_reconcile.sh,
+ * and the cold reconcile's size apply above (cold_reconcile_size.sh).
+ * Declared above it. */
 cetrafs_test_param(apply_trylock_fail_once, cetrafs_apply_trylock_fail_once, bool, 0644);
 MODULE_PARM_DESC(apply_trylock_fail_once, "TEST ONLY: the next refresh apply finds the inode lock contended");
 
