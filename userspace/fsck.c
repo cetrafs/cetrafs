@@ -1080,6 +1080,48 @@ static int fsck_rebuild_bg_desc(int fd, const cetrafs_superblock_t *sb, uint64_t
     return 0;
 }
 
+/*
+ * A Node Registry row that fails its checksum, rebuilt (audit 2026-11-15
+ * B-14). A damaged row refused every mount. Offline, under the repair
+ * claim and the live-peer probe, it is rebuilt as the state a crash
+ * leaves, which every mount already knows how to finish:
+ *
+ *   a repair claim (not ours) -- cleared: a claim owns nothing, and a
+ *     live repairer is excluded by our own claim;
+ *   anything else -- REGISTERED and departed DEAD, keeping its uuid,
+ *     label and incarnation: the next mount replays its journal and
+ *     takes back its Zone Groups and locks, and the node, if it comes
+ *     back with that uuid, re-attaches as after a crash. Its lease epoch
+ *     moves on, so whatever it cached is revoked. Nothing is guessed
+ *     into the cluster's lock-mode election: a departed row takes no
+ *     part in it. Its timers are the defaults.
+ */
+static void fsck_rebuild_node_row(int fd, const cetrafs_superblock_t *sb, uint32_t n, const cetrafs_node_entry_t *old)
+{
+    uint8_t blk[CETRAFS_BLOCK_SIZE] = {0};
+    cetrafs_node_entry_t ne;
+
+    memset(&ne, 0, sizeof(ne));
+    if (cetrafs_le32(old->state) != CETRAFS_NODE_STATE_REPAIR) {
+        memcpy(ne.node_uuid, old->node_uuid, sizeof(ne.node_uuid));
+        memcpy(ne.label, old->label, sizeof(ne.label));
+        ne.label[sizeof(ne.label) - 1] = 0;
+        ne.state = cetrafs_cpu_to_le32(CETRAFS_NODE_STATE_REGISTERED);
+        ne.departure = cetrafs_cpu_to_le32(CETRAFS_NODE_DEPART_DEAD);
+        ne.hb_seq = old->hb_seq;
+        ne.last_seen = old->last_seen;
+        ne.incarnation = old->incarnation;
+        ne.file_lock_mode = old->file_lock_mode;
+        ne.fence_epoch = cetrafs_cpu_to_le64(cetrafs_le64(old->fence_epoch) + 1);
+        ne.hb_interval_secs = cetrafs_cpu_to_le32(CETRAFS_HEARTBEAT_INTERVAL_SECS);
+        ne.stale_secs = cetrafs_cpu_to_le32(CETRAFS_NODE_STALE_SECS);
+        cetrafs_node_row_stamp(&ne);
+    }
+    /* The whole block, as a claim writes it: nothing else in it is kept. */
+    memcpy(blk, &ne, sizeof(ne));
+    pwrite_all(fd, blk, sizeof(blk), cetrafs_node_row_off(sb, n));
+}
+
 static int fsck_alloc_block(int fd,
                             uint32_t bg_count,
                             const uint64_t *bg_data_start,
@@ -3243,6 +3285,32 @@ int main(int argc, char **argv)
         cetrafs_node_entry_t ne;
         /* one row per block as of v0x0007 */
         pread_all(fd, &ne, sizeof(ne), (off_t) (cetrafs_le64(sb.node_table_start) + n) * CETRAFS_BLOCK_SIZE);
+        /* A damaged row stopped every mount and this check (B-14).
+         * A FREE row is either blank or verifies, as the kernel reads
+         * it; any other row verifies. */
+        if ((int) n != repair_row && !cetrafs_node_row_crc_ok(&ne) &&
+            !(cetrafs_le32(ne.state) == CETRAFS_NODE_STATE_FREE && cetrafs_node_entry_blank(&ne))) {
+            int claim = cetrafs_le32(ne.state) == CETRAFS_NODE_STATE_REPAIR;
+
+            fprintf(stderr, "ERR: node slot %u fails its checksum (state %u)%s\n", n, cetrafs_le32(ne.state),
+                    repair_mode ? "" : " -- fsck.cetra -r rebuilds it");
+            early_problems++;
+            /* The state a crash leaves: a dead node to reclaim, or no claim. */
+            if (repair_mode && !repair_blocked) { /* class 45: rebuild */
+                fsck_rebuild_node_row(fd, &sb, n, &ne);
+                printf("  rebuilt node slot %u as %s\n", n,
+                       claim ? "free (a repair claim owns nothing)" : "a dead node, reclaimed by the next mount");
+                repairs_made++;
+                pread_all(fd, &ne, sizeof(ne), (off_t) (cetrafs_le64(sb.node_table_start) + n) * CETRAFS_BLOCK_SIZE);
+            } else if (!claim) {
+                /* Read as the dead node it will be rebuilt as. */
+                node_registered[n] = 1;
+                node_unclean[n] = 1;
+                continue;
+            } else {
+                continue;
+            }
+        }
         if (cetrafs_le32(ne.state) == CETRAFS_NODE_STATE_FREE) {
             node_free_rows++;
             continue;
@@ -3267,12 +3335,6 @@ int main(int argc, char **argv)
         }
         if (cetrafs_le32(ne.state) != CETRAFS_NODE_STATE_REGISTERED) {
             fprintf(stderr, "ERR: node slot %u has unrecognized state %u\n", n, ne.state);
-            return 1;
-        }
-        uint32_t ne_crc = crc32c_struct(&ne, sizeof(ne), offsetof(cetrafs_node_entry_t, checksum), sizeof(ne.checksum));
-        if ((uint32_t) cetrafs_le64(ne.checksum) != ne_crc) {
-            fprintf(stderr, "ERR: node slot %u CRC mismatch (got 0x%08X want 0x%08X)\n", n, (uint32_t) cetrafs_le64(ne.checksum),
-                    ne_crc);
             return 1;
         }
         node_registered[n] = 1;

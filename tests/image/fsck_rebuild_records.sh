@@ -1,6 +1,6 @@
 #!/usr/bin/env bash
 # SPDX-License-Identifier: GPL-2.0-or-later
-# fsck -r rebuilds a damaged Zone Group record or Block Group descriptor
+# fsck -r rebuilds a damaged Zone Group record, Block Group descriptor or registry row
 #
 # One damaged global record refused every mount, and fsck could only say
 # so and stop (audit 2026-11-15 B-14) -- for a record whose every field
@@ -9,7 +9,9 @@
 # recounted from the bitmaps by the same run. A Block Group descriptor
 # is rebuilt from the group's own header: in the pool when its bitmap is
 # empty, else its round-robin Zone Group (absent a queued free naming
-# it), with what its bitmap uses.
+# it), with what its bitmap uses. A registry row is rebuilt as the
+# state a crash leaves: a dead node (the next mount reclaims it), or --
+# a repair claim -- nothing.
 #
 # Each case flips one bit inside the checksummed half of a fresh volume
 # (nothing is mounted: fsck alone), then:
@@ -87,6 +89,22 @@ PRE=queued1
 EXPECT="rebuilt the descriptor of BG1: .*owner ZG0, .*free_gen 6"
 case_rebuilt "block group 1, a free queued by ZG0" bg-desc 1
 PRE=
+
+WALK=1
+NODE_POKE="$(ct_helper node_poke)"
+reg1() { "$NODE_POKE" "$DEV" 1 1 aa "$(date +%s)" >/dev/null; }
+claim3() { "$NODE_POKE" "$DEV" 3 2 bb "$(date +%s)" >/dev/null; }
+PRE=reg1
+EXPECT="rebuilt node slot 1 as a dead node"
+case_rebuilt "registry row of a registered node" node 1
+PRE=
+EXPECT="rebuilt node slot 2 as a dead node"
+case_rebuilt "registry row, free and blank" node 2
+PRE=claim3
+EXPECT="rebuilt node slot 3 as free"
+case_rebuilt "registry row of a repair claim" node 3
+PRE=
+WALK=0
 
 # No verifying header: refused, not guessed.
 build
