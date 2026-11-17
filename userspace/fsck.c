@@ -992,8 +992,77 @@ static int fsck_bg_header_at(int fd, uint32_t b, uint64_t start, uint64_t limit,
  *
  * Returns 0 rebuilt, -1 not rebuildable.
  */
+/*
+ * Journal entries a mount has not yet replayed, collected BEFORE any
+ * record is rebuilt (audit 2026-11-15 F-49). The full journal check
+ * runs much later -- it judges targets against the data regions the
+ * Block Group pass reads -- but the Zone Group and descriptor rebuilds
+ * run before that pass. A rebuild that hands a dead node's group to
+ * the pool or to another Zone Group lets the next mount reuse that
+ * node's blocks before its journal is replayed, and the one redo
+ * prev_checksum cannot refuse -- a reused block of the same kind --
+ * then lands on live data. An entry counts exactly as the late check
+ * counts it: header and payload verify, it is of the area's current
+ * park, it is not a fresh block's, and its target does not already
+ * hold the payload. A target past the device counts (the late check
+ * reports it).
+ */
+static uint64_t *fsck_jp_lba;
+static uint32_t *fsck_jp_node;
+static size_t fsck_jp_n;
+
+static void fsck_scan_pending_journals(int fd, const cetrafs_superblock_t *sb)
+{
+    uint64_t slots;
+
+    if (cetrafs_le32(sb->node_journal_blocks) < 1 + CETRAFS_JOURNAL_SLOT_BLOCKS)
+        return;
+    slots = (cetrafs_le32(sb->node_journal_blocks) - 1) / CETRAFS_JOURNAL_SLOT_BLOCKS;
+    for (uint32_t n = 0; n < cetrafs_le32(sb->node_table_count); ++n) {
+        uint64_t area = cetrafs_le64(sb->node_journal_start) + (uint64_t) n * cetrafs_le32(sb->node_journal_blocks);
+        cetrafs_node_journal_hdr_t flag;
+
+        pread_all(fd, &flag, sizeof(flag), (off_t) area * CETRAFS_BLOCK_SIZE);
+        for (uint64_t sl = 0; sl < slots; ++sl) {
+            uint64_t hlba = area + 1 + sl * CETRAFS_JOURNAL_SLOT_BLOCKS, tlba;
+            uint8_t hblk[CETRAFS_BLOCK_SIZE], pay[CETRAFS_BLOCK_SIZE];
+            cetrafs_journal_header_t hdr;
+
+            pread_all(fd, hblk, sizeof(hblk), (off_t) hlba * CETRAFS_BLOCK_SIZE);
+            memcpy(&hdr, hblk, sizeof(hdr));
+            if (cetrafs_le32(hdr.magic) != CETRAFS_JOURNAL_MAGIC ||
+                (uint32_t) cetrafs_le32(hdr.header_checksum) !=
+                    crc32c_struct(&hdr, sizeof(hdr), offsetof(cetrafs_journal_header_t, header_checksum),
+                                  sizeof(hdr.header_checksum)))
+                continue;
+            if (cetrafs_le32(flag.magic) == CETRAFS_NODE_JOURNAL_MAGIC &&
+                cetrafs_le64(hdr.park_seq) != cetrafs_le64(flag.park_seq))
+                continue;
+            if (cetrafs_le32(hdr.flags) & CETRAFS_JRNL_F_FRESH)
+                continue;
+            pread_all(fd, pay, sizeof(pay), (off_t) (hlba + 1) * CETRAFS_BLOCK_SIZE);
+            if ((uint32_t) cetrafs_le32(hdr.payload_checksum) != crc32c_update(0, pay, sizeof(pay)))
+                continue;
+            tlba = cetrafs_le64(hdr.target_lba);
+            if (tlba < cetrafs_le64(sb->total_blocks)) {
+                pread_all(fd, pay, sizeof(pay), (off_t) tlba * CETRAFS_BLOCK_SIZE);
+                if (crc32c_update(0, pay, sizeof(pay)) == (uint32_t) cetrafs_le32(hdr.payload_checksum))
+                    continue; /* landed: only the consume was lost */
+            }
+            fsck_jp_lba = (uint64_t *) realloc(fsck_jp_lba, (fsck_jp_n + 1) * sizeof(*fsck_jp_lba));
+            fsck_jp_node = (uint32_t *) realloc(fsck_jp_node, (fsck_jp_n + 1) * sizeof(*fsck_jp_node));
+            if (!fsck_jp_lba || !fsck_jp_node) {
+                fprintf(stderr, "cetrafs fsck: out of memory\n");
+                exit(FSCK_EXIT_NOEXAM);
+            }
+            fsck_jp_lba[fsck_jp_n] = tlba;
+            fsck_jp_node[fsck_jp_n++] = n;
+        }
+    }
+}
+
 static int fsck_rebuild_bg_desc(int fd, const cetrafs_superblock_t *sb, uint64_t desc_lba, uint32_t b,
-                                uint64_t prev_end, uint64_t next_start, uint64_t data_end)
+                                uint64_t prev_end, uint64_t next_start, uint64_t data_end, const uint32_t *zg_owner)
 {
     uint8_t blk[CETRAFS_BLOCK_SIZE] = {0};
     cetrafs_bg_header_t hdr;
@@ -1055,6 +1124,30 @@ static int fsck_rebuild_bg_desc(int fd, const cetrafs_superblock_t *sb, uint64_t
     }
     if (!queued && used)
         owner = b % nzg;
+
+    /* An unreplayed entry names a block of this group (F-49): never the
+     * pool, and a Zone Group a claim takes only by replaying that node
+     * first -- one the node owns (b % Z first, the layout's own), or a
+     * damaged record left unrebuilt, which no mount claims. If the node
+     * owns none, the group was never its: it holds no blocks a claim
+     * could hand on, and its entries name another owner's blocks, as
+     * they may with no damage at all (prev_checksum's domain). */
+    for (size_t j = 0; j < fsck_jp_n; j++) {
+        uint32_t pick = CETRAFS_BG_OWNER_FREE;
+
+        if (fsck_jp_lba[j] < start || fsck_jp_lba[j] - start >= cetrafs_le64(hdr.length_blocks))
+            continue;
+        if (zg_owner[b % nzg] == fsck_jp_node[j] || (fsck_zg_damaged && fsck_zg_damaged[b % nzg] == 1))
+            pick = b % nzg;
+        for (uint32_t z = 0; pick == CETRAFS_BG_OWNER_FREE && z < nzg; z++)
+            if (zg_owner[z] == fsck_jp_node[j])
+                pick = z;
+        owner = pick != CETRAFS_BG_OWNER_FREE ? pick : b % nzg;
+        printf("  BG%u: node %u's journal has an entry not yet replayed for block %" PRIu64
+               " -- the group goes to ZG%u, which a mount takes only after replaying it\n",
+               b, fsck_jp_node[j], fsck_jp_lba[j], owner);
+        break;
+    }
 
     memset(&bg, 0, sizeof(bg));
     bg.bg_id = cetrafs_cpu_to_le32(b);
@@ -2768,6 +2861,7 @@ int main(int argc, char **argv)
 
     if (discard_journal >= 0)
         fsck_discard_journal(fd, &sb, (uint32_t) discard_journal);
+    fsck_scan_pending_journals(fd, &sb);
 
     /* ZG table. Also records each ZG's (first_bg_id, bg_count,
      * free_data_blocks) for the ZG<->BG ownership cross-checks below
@@ -2807,7 +2901,15 @@ int main(int argc, char **argv)
             fsck_zg_damaged[z] = 1;
             /* Every field is derivable, and it names no owner: if a later fault blocks repair,
              * its zero counts only understate (the next claim recounts them). */
-            if (repair_mode && !repair_blocked) { /* class 45: rebuild */
+            /* Rebuilt unowned, a mount would claim it at once, before
+             * the dead owner's journal is replayed (F-49). A mount
+             * gets past a damaged record (it skips it), so the order
+             * is: mount once, which replays, then fsck -r. */
+            if (repair_mode && !repair_blocked && fsck_jp_n) /* class 45: keep -- a message only */
+                printf("  ZG%u not rebuilt yet: %zu journal entr%s not yet replayed -- mount the volume once "
+                       "(it skips this record and replays them), then re-run fsck -r\n",
+                       z, fsck_jp_n, fsck_jp_n == 1 ? "y is" : "ies are");
+            if (repair_mode && !repair_blocked && !fsck_jp_n) { /* class 45: rebuild */
                 fsck_rebuild_zg(fd, &sb, z);
                 printf("  rebuilt the record of ZG%u (unowned; its counts recounted below)\n", z);
                 repairs_made++;
@@ -3018,7 +3120,7 @@ int main(int argc, char **argv)
             /* Geometry from a verifying header or nothing; owner and
              * free_gen chosen so an error leaks rather than shares. */
             if (!repair_mode || repair_blocked || /* class 45: rebuild */
-                fsck_rebuild_bg_desc(fd, &sb, bg_desc_lba[b], (uint32_t) b, next, next_start, data_end)) {
+                fsck_rebuild_bg_desc(fd, &sb, bg_desc_lba[b], (uint32_t) b, next, next_start, data_end, zg_owner)) {
                 if (repair_mode)
                     fprintf(stderr, "ERR: BG%zu: no verifying header where it can start -- not rebuilt\n", (size_t) b);
                 return 1;
