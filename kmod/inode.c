@@ -1727,8 +1727,8 @@ static int __cetrafs_write_raw_inode(struct super_block *sb, u64 ino, const cetr
             WRITE_ONCE(cetrafs_new_record_nospc, cetrafs_new_record_nospc - 1);
             cetrafs_test_nospc_once(bh->b_blocknr);
         }
-        ret = refusable && !READ_ONCE(cetrafs_new_record_refusal_stops) ? cetrafs_sync_buffer_op_refusable(sb, bh)
-                                                                          : cetrafs_sync_buffer(sb, bh);
+        refusable = refusable && !READ_ONCE(cetrafs_new_record_refusal_stops);
+        ret = refusable ? cetrafs_sync_buffer_op_refusable(sb, bh) : cetrafs_sync_buffer(sb, bh);
         if (refusable && cetrafs_refusal_definite(ret)) {
             /* Refused before anything landed: the device still holds the
              * number's birth claim, and the cached image is forgotten so

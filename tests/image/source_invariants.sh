@@ -2152,6 +2152,7 @@ cetrafs_xattr_edit final:the-xattr-block-is-full
 cetrafs_journal_write_block_flags final:the-device-refused-the-write-no-space-thin-pool-the-mount-runs-on
 cetrafs_sync_new_buffer final:the-device-refused-the-write-no-space-thin-pool-or-test-injection
 __cetrafs_write_raw_inode final:the-device-refused-a-new-record-no-space-thin-pool-the-create-fails-the-mount-runs-on
+cetrafs_sync_buffers_keep final:the-device-refused-a-bitmap-write-no-space-thin-pool-kept-for-a-retry-or-test-injection
 cetrafs_write_locked_bh final:the-device-refused-the-write-no-space-thin-pool-or-test-injection
 cetrafs_write_bhs_status final:test-injection-what-a-full-thin-pool-answers
 cetrafs_node_register final:every-registry-row-taken

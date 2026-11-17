@@ -1677,7 +1677,7 @@ int cetrafs_journal_write_deferred(struct super_block *sb, struct buffer_head **
  * bit, and every "does this buffer hold a write the device has not seen?"
  * asks cetrafs_bh_pending(). */
 #include <linux/buffer_head.h>
-enum { BH_CetraDeferred = BH_PrivateStart, BH_CetraTailStale, BH_CetraHeld };
+enum { BH_CetraDeferred = BH_PrivateStart, BH_CetraTailStale, BH_CetraHeld, BH_CetraBmap };
 BUFFER_FNS(CetraDeferred, cetra_deferred)
 /* ioutil.c: an allocation-bitmap block modified in cache and HELD from
  * the device until cetrafs writes it at one of its own gated points
@@ -1687,6 +1687,11 @@ BUFFER_FNS(CetraDeferred, cetra_deferred)
  * over a peer's (audit 2026-11-14 A-15). Pinned and listed per sb. */
 BUFFER_FNS(CetraHeld, cetra_held)
 TAS_BUFFER_FNS(CetraHeld, cetra_held)
+/* alloc.c: a data-allocation bitmap block, of a Block Group this node
+ * owns -- the one held block whose refused write may wait for a retry
+ * (cetrafs_keep_refusal_survivable(), A-4). Set by every update. */
+BUFFER_FNS(CetraBmap, cetra_bmap)
+u64 cetrafs_bmap_refusal_count(void);
 void cetrafs_bh_end_update_held(struct super_block *sb, struct buffer_head *bh, bool changed);
 int cetrafs_held_flush(struct super_block *sb);
 unsigned long cetrafs_held_drop_all(struct super_block *sb);

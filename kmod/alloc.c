@@ -78,6 +78,7 @@ static void cetrafs_bmap_end_update(struct super_block *sb, struct buffer_head *
         cetrafs_bh_end_update(sb, bh); /* test-only: dirty, whatever changed */
         return;
     }
+    set_buffer_cetra_bmap(bh);
     cetrafs_bh_end_update_held(sb, bh, changed);
 }
 /*
@@ -3128,6 +3129,7 @@ struct cetrafs_bmap_flush_q {
     u32 bg[CETRAFS_BMAP_FLUSH_BATCH];
     int res[CETRAFS_BMAP_FLUSH_BATCH];
     unsigned int n, cap;
+    int err; /* the device's reason, if every failure was a kept refusal (-ENOSPC); else -EIO */
 };
 
 /* Write what is queued; a failed block fails its group. */
@@ -3144,8 +3146,15 @@ static void cetrafs_bmap_flush_q_run(struct super_block *sb, struct cetrafs_bmap
         /* fenced: nothing was sent, every group fails */
         if (r == -EIO && cetrafs_sb_is_fenced(sb))
             q->res[i] = -EIO;
-        if (q->res[i])
+        if (q->res[i]) {
             __set_bit(q->bg[i], failed);
+            /* A kept refusal is the thin pool's answer, and the caller's
+             * (qemu pauses the guest on ENOSPC); anything else is EIO. */
+            if (q->res[i] != -ENOSPC)
+                q->err = -EIO;
+            else if (!q->err)
+                q->err = -ENOSPC;
+        }
         brelse(q->bh[i]);
     }
     q->n = 0;
@@ -3184,6 +3193,7 @@ static int __cetrafs_alloc_flush_bitmaps(struct super_block *sb)
         goto out;
     }
     q->n = 0;
+    q->err = 0;
     q->cap = READ_ONCE(cetrafs_bmap_flush_serial) ? 1 : CETRAFS_BMAP_FLUSH_BATCH;
     for (; bg_id < bg_count; bg_id = cetrafs_bmap_flush_first(sb, bg_id + 1, bg_count)) {
         struct cetrafs_bg_geom bg;
@@ -3202,6 +3212,7 @@ static int __cetrafs_alloc_flush_bitmaps(struct super_block *sb)
             msleep(stall); /* test-only; see the parameter */
         if (cetrafs_read_bg_geom(sb, bg_id, &bg)) {
             __set_bit(bg_id, failed);
+            q->err = -EIO;
             continue;
         }
         nblocks = bg.off_data_region - bg.off_data_bmap;
@@ -3216,6 +3227,7 @@ static int __cetrafs_alloc_flush_bitmaps(struct super_block *sb)
             if (unlikely(READ_ONCE(cetrafs_alloc_flush_fail)) && (buffer_dirty(bh) || buffer_cetra_held(bh))) {
                 brelse(bh); /* as a failed write leaves it: still pending */
                 __set_bit(bg_id, failed);
+                q->err = -EIO;
                 continue;
             }
             q->bh[q->n] = bh;
@@ -3231,7 +3243,7 @@ static int __cetrafs_alloc_flush_bitmaps(struct super_block *sb)
             cetrafs_sb_note_bmap_alloc(sb, bg_id);
             pr_err_ratelimited("BG %u: allocation bitmap not made durable -- refusing to publish extents\n", bg_id);
             if (!ret)
-                ret = -EIO;
+                ret = q->err ?: -EIO; /* a geometry read or a test failure set no reason: EIO */
         } else {
             /* Written: remembered, so a refused cache flush below can
              * put its mark back. */
