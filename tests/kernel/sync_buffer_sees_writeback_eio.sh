@@ -41,11 +41,18 @@ sync
 [ "$(info stopped)" = none ] || { fail "setup: the mount is already stopped ($(info stopped))"; ct_exit; }
 
 MARK="$(dmesg_mark)"
+# Since A-15 an in-place metadata update is HELD, never dirty, so the
+# flusher cannot take its dirt and nothing staged here could fire: the
+# suite failed its setup from then on. The flusher still owns a buffer
+# left dirty (TEST ONLY meta_writeback: as before A-15), which is the
+# state this check exists for.
+ct_param_set meta_writeback 1
 ct_param_set sync_writeback_eio 1
 RC=0
 { : >"$MNT/d/c1"; } 2>/dev/null || RC=$?
 LEFT="$(cat /sys/module/cetrafs/parameters/sync_writeback_eio)"
 ct_param_set sync_writeback_eio 0
+ct_param_set meta_writeback 0
 [ "$LEFT" = 0 ] || { fail "setup: the create reached no synchronous metadata write (knob still $LEFT)"; umount "$MNT"; ct_exit; }
 [ "$RC" != 0 ] && pass "the create whose update writeback lost failed" ||
     fail "the create succeeded although its metadata write never reached the device"
