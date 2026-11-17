@@ -1967,8 +1967,12 @@ static inline u64 cetrafs_calc_bg_dbm_blocks(u64 bg_length_blocks)
 /* The layout of a group of bg_length_blocks on a volume aligned to
  * align_blocks (cetrafs_superblock_t.data_align_blocks; 0 reads as 1):
  * the data region starts at the first multiple of the alignment past
- * the header and the bitmap. The one definition: mkfs, growfs, fsck and
- * the kernel's grow check all use it. */
+ * the header and the bitmap, and the bitmap ends where the data starts
+ * -- any gap the alignment leaves is between the header and the bitmap.
+ * [off_data_bmap, off_data_region) IS the bitmap to every reader (the
+ * allocator, the flush, the grow's zero check, fsck): a gap after it
+ * would be read as bitmap blocks nobody zeroed. The one definition:
+ * mkfs, growfs, fsck and the kernel's grow check all use it. */
 static inline void cetrafs_calc_bg_layout(u64 bg_length_blocks,
                                           u64 align_blocks,
                                           u32 *off_data_bmap,
@@ -1976,12 +1980,13 @@ static inline void cetrafs_calc_bg_layout(u64 bg_length_blocks,
                                           u64 *data_block_count)
 {
     u64 dbm = cetrafs_calc_bg_dbm_blocks(bg_length_blocks);
-    u64 off_bmap = CETRAFS_BG_HEADER_BLOCKS;          /* header at 0 */
-    u64 off_data = off_bmap + dbm;
+    u64 off_data = CETRAFS_BG_HEADER_BLOCKS + dbm;   /* header at 0 */
+    u64 off_bmap, data_cnt;
 
     if (align_blocks > 1)
         off_data = (off_data + align_blocks - 1) / align_blocks * align_blocks;
-    u64 data_cnt = (bg_length_blocks > off_data) ? (bg_length_blocks - off_data) : 0;
+    off_bmap = off_data - dbm;
+    data_cnt = (bg_length_blocks > off_data) ? (bg_length_blocks - off_data) : 0;
 
     if (off_data_bmap)   *off_data_bmap   = (u32)off_bmap;
     if (off_data_region) *off_data_region = (u32)off_data;

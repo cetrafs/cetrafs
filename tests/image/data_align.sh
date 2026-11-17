@@ -11,7 +11,9 @@
 #
 #   A. default, -A 4096 and -A 4: every group's start and data start are
 #      multiples of the alignment the superblock records (256, 1024, 1);
-#      fsck clean.
+#      the span from the bitmap to the data is exactly the bitmap -- every
+#      reader takes [off_data_bmap, off_data_region) as the bitmap, so the
+#      alignment's gap must sit before it, never after; fsck clean.
 #   B. mkfs refuses an alignment that is not a power of two, out of
 #      range, or not dividing the group size; fsck refuses a superblock
 #      carrying one (the mount: kernel/superblock_validation.sh).
@@ -32,16 +34,23 @@ GROWFS="$ROOT/userspace/growfs.cetra"
 IMG="$(ct_image 1200 dalign)"
 sbf() { "$SBPOKE" "$1" | sed -n "s/^$2=//p"; }
 
-# <dev> <align> -> "ok", or the first group that is not aligned to it
+# <dev> <align> -> "ok", or the first group that is not aligned to it, or
+# whose bitmap does not end where its data starts
 aligned_to() {
-    local dev="$1" a="$2" n b d s o
+    local dev="$1" a="$2" n b d s o m l
     n="$(sbf "$dev" block_group_count)"
     for b in $(seq 0 $((n - 1))); do
         d="$("$BG_POKE" "$dev" "$b" --dump)"
         s="$(sed -n 's/.*start_block=\([0-9]*\).*/\1/p' <<<"$d")"
         o="$(sed -n 's/.*off_data_region=\([0-9]*\).*/\1/p' <<<"$d")"
+        m="$(sed -n 's/.*off_data_bmap=\([0-9]*\).*/\1/p' <<<"$d")"
+        l="$(sed -n 's/.*length_blocks=\([0-9]*\).*/\1/p' <<<"$d")"
         if [ $((s % a)) != 0 ] || [ $(((s + o) % a)) != 0 ]; then
             echo "BG$b start=$s data=+$o"
+            return
+        fi
+        if [ $((o - m)) != $(((l - 1 + 32768) / 32769)) ]; then
+            echo "BG$b bitmap=+$m data=+$o: $((o - m)) blocks read as bitmap, $(((l - 1 + 32768) / 32769)) are"
             return
         fi
     done

@@ -37,6 +37,7 @@ require_module
 
 FREE_MARK=65535
 MAP="$(ct_helper bg_map)"
+BG_POKE="$(ct_helper bg_poke)"
 DEV="$(ct_dev 1700 bgrelsafe)"
 BACK="$(losetup -l -n -O BACK-FILE "$DEV")"
 MNT="$(ct_mnt bgrelsafe)"
@@ -47,6 +48,9 @@ compress_timing
 
 bg_owner() { "$MAP" "$DEV" | awk -v b="$1" '$1 == "bg" && $2 == b {split($3,a,"="); print a[2]}'; }
 bg_start() { "$MAP" "$DEV" | awk -v b="$1" '$1 == "bg" && $2 == b {split($4,a,"="); print a[2]}'; }
+# The group's first bitmap block, where its descriptor says (an aligned
+# volume puts the bitmap just below the data, not right after the header).
+bg_bmap() { echo $(($(bg_start "$1") + $("$BG_POKE" "$DEV" "$1" --dump | sed -n 's/.*off_data_bmap=\([0-9]*\).*/\1/p'))); }
 
 ct_mount "$DEV" "$MNT"
 require_cetrafs_mount "$MNT"
@@ -90,7 +94,7 @@ fi
 
 # The peer: claims the released Block Group and allocates in it, which
 # lands in its bitmap on the device. 64 blocks, a recognisable pattern.
-BMAP_LBA=$(($(bg_start "$REL") + 1))
+BMAP_LBA="$(bg_bmap "$REL")"
 python3 -c "
 import os, sys
 fd = os.open(sys.argv[1], os.O_RDWR)
@@ -148,7 +152,7 @@ else
     fail "C: Zone Group $RZ has no member Block Group -- nothing was handed over, the measurement below would be empty"
     ct_exit
 fi
-ZBMAP=$(($(bg_start "$RB") + 1))
+ZBMAP="$(bg_bmap "$RB")"
 python3 -c "
 import os, sys
 fd = os.open(sys.argv[1], os.O_RDWR)
