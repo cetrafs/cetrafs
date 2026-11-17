@@ -57,11 +57,19 @@ TBL="$("$SBPOKE" "$IMG" | sed -n 's/^inode_table_start[^0-9]*\([0-9]*\).*/\1/p' 
 [ -n "$INODES" ] && [ -n "$TBL" ] ||
     fail "could not read inodes_count/inode_table_start out of the superblock"
 
-FORGED=$((INODES + 64))                       # past the table, inside the device
-SLOT=$((TBL + FORGED - 1))                    # the block that number addresses
+# The forged number addresses a block in the middle of the first Block
+# Group, past its header and bitmap: user data, which fsck must never
+# write. INODES + 64 once did; the tables after the inode table (the
+# Node Registry, the queues, the journals) grew, and it landed on a
+# registry row instead -- which fsck -r rightly rebuilt, failing this
+# suite for the wrong reason.
+BGR="$("$SBPOKE" "$IMG" | sed -n 's/^bg_regions_start=//p')"
+BGSZ="$("$SBPOKE" "$IMG" | sed -n 's/^bg_size_blocks=//p')"
+SLOT=$((BGR + BGSZ / 2))                      # the block that number addresses
+FORGED=$((SLOT - TBL + 1))
 IMG_BLOCKS=$(( $(stat -c %s "$IMG") / 4096 ))
-[ "$SLOT" -lt "$IMG_BLOCKS" ] ||
-    fail "the forged slot ($SLOT) is past the end of the image -- it must land in the data region to prove anything"
+[ -n "$BGR" ] && [ -n "$BGSZ" ] && [ "$FORGED" -gt "$INODES" ] && [ "$SLOT" -lt "$IMG_BLOCKS" ] ||
+    fail "setup: the forged slot ($SLOT, number $FORGED) is not in the first group's data region -- it must be, to prove anything"
 
 "$POKE" "$IMG" plantrec "$FORGED" 040755 2>/dev/null ||
     fail "could not plant a record at the forged slot"
