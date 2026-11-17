@@ -5374,7 +5374,7 @@ static int cetrafs_tree_hold_back(struct inode *inode, struct buffer_head *bh, u
  * back -- the cached leaf is the only copy of the shrunk state -- and
  * the caller appends nothing.
  */
-#define CETRAFS_CONVERT_ATOMIC_MIN 8
+#define CETRAFS_CONVERT_ATOMIC_MIN CETRAFS_JOURNAL_MIN_SLOTS
 
 /* TEST ONLY: write a split's source now even when the boundary is atomic
  * -- the old cost, for measuring against (convert_split_no_flush.sh). */

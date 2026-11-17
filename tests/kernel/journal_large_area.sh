@@ -66,11 +66,11 @@ if mount -t cetrafs "$DEV" "$MNT" 2>/dev/null; then
     fail "the mount accepted a per-node journal past the format's bound"
     umount "$MNT"
 else
-    dmesg_since "$MARK" | grep -q "per-node journal of 4194305 blocks exceeds" &&
+    dmesg_since "$MARK" | grep -q "per-node journal of 4194305 blocks -- the format allows" &&
         pass "the mount refuses a per-node journal past the bound, and says why" ||
         fail "the mount refused, but not for the journal's size: $(dmesg_since "$MARK" | grep superblock | tail -2)"
 fi
 fo="$(ct_fsck "$DEV" 2>&1 || true)"
-grep -q "per-node journal of 4194305 blocks exceeds" <<<"$fo" && pass "and so does fsck" ||
+grep -q "per-node journal of 4194305 blocks -- the format allows" <<<"$fo" && pass "and so does fsck" ||
     fail "fsck did not refuse the oversized journal: $(grep ERR <<<"$fo" | head -2)"
 ct_exit

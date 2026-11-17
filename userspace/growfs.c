@@ -553,6 +553,9 @@ int main(int argc, char **argv)
     /* It places every group this grow adds. */
     if (!cetrafs_data_align_ok(cetrafs_le32(sb.data_align_blocks), cetrafs_le64(sb.bg_size_blocks)))
         die("%s: invalid data_align_blocks %u -- run fsck.cetra first", dev, cetrafs_le32(sb.data_align_blocks));
+    /* It sizes the journal reservation this grow moves past. */
+    if (!cetrafs_journal_blocks_ok(cetrafs_le32(sb.node_journal_blocks)))
+        die("%s: invalid node_journal_blocks %u -- run fsck.cetra first", dev, cetrafs_le32(sb.node_journal_blocks));
 
     const u64 old_total = cetrafs_le64(sb.total_blocks);
     const u32 old_z = cetrafs_le32(sb.zone_group_count);

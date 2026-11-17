@@ -877,10 +877,10 @@ int main(int argc, char **argv)
      * node_table_count, which is fixed, so it can be settled once
      * outside the zg_count clamp loop below. Auto-tune (only when -J
      * wasn't given): cap the TOTAL reservation across all node slots at
-     * ~5% of the device. A per-node area smaller than 1 flag block + 1
-     * slot (slots are 2 blocks) can't hold a single journal entry --
-     * treat that as "journaling disabled" rather than reserving a
-     * useless sliver. */
+     * ~5% of the device. A per-node area smaller than the format's
+     * minimum (CETRAFS_JOURNAL_MIN_BLOCKS) refuses multi-block
+     * boundaries, so it is "journaling disabled", said so, rather than a
+     * journal that fails every fsync needing two blocks (M-24). */
     u64 j_per_node_blk = j_per_node_bytes / CETRAFS_BLOCK_SIZE;
 
     if (!j_explicit) {
@@ -889,9 +889,13 @@ int main(int argc, char **argv)
         if (cap_per_node_blk < j_per_node_blk)
             j_per_node_blk = cap_per_node_blk;
     }
-    if (j_per_node_blk > 0 && j_per_node_blk < 3) {
+    if (j_per_node_blk > 0 && j_per_node_blk < CETRAFS_JOURNAL_MIN_BLOCKS) {
         if (j_explicit)
-            die("-J too small for even one journal slot (need >= 12KiB per node)");
+            die("-J too small: a journal needs at least %u blocks per node", CETRAFS_JOURNAL_MIN_BLOCKS);
+        fprintf(stderr,
+                "mkfs: %" PRIu64 " node slots leave %" PRIu64 " journal blocks per node, under the %u a journal "
+                "needs -- formatting with no journal (a smaller -M, or an explicit -J, keeps one)\n",
+                (uint64_t) node_table_count, (uint64_t) j_per_node_blk, CETRAFS_JOURNAL_MIN_BLOCKS);
         j_per_node_blk = 0;
     }
 

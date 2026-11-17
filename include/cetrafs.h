@@ -799,6 +799,24 @@ typedef struct {
  * and fsck refuse a superblock past it (audit 2026-11-05, class 13/12). */
 #define CETRAFS_JOURNAL_MAX_BLOCKS (4u * 1024u * 1024u)
 
+/* The smallest journal a volume may have, if it has one: 8 slots. An
+ * inode's held-back tree blocks are written at half the journal, plus
+ * what one mutation adds, and all of it must fit one batch -- the batch
+ * is what makes a boundary atomic, and a batch larger than the journal
+ * is refused. One slot (a cap of 0) refused every boundary needing two
+ * blocks, for the volume's life; mkfs made that on a small device with a
+ * large -M (audit 2026-11-14 M-24). The kernel's convert path assumes
+ * the same 8 (CETRAFS_CONVERT_ATOMIC_MIN). 0 is still "no journal". */
+#define CETRAFS_JOURNAL_MIN_SLOTS 8u
+#define CETRAFS_JOURNAL_MIN_BLOCKS (1u + CETRAFS_JOURNAL_MIN_SLOTS * CETRAFS_JOURNAL_SLOT_BLOCKS)
+
+/* The per-node journal size a superblock may declare: none, or between
+ * the two bounds. mkfs, the mount, fsck and growfs all ask this. */
+static inline int cetrafs_journal_blocks_ok(u32 blocks)
+{
+    return blocks == 0 || (blocks >= CETRAFS_JOURNAL_MIN_BLOCKS && blocks <= CETRAFS_JOURNAL_MAX_BLOCKS);
+}
+
 /* ---- Node Registry (global table; dense packed entries, like the inode
  * table -- NOT one block per entry like the ZG/BG tables, since there are
  * far fewer nodes than BGs and a whole block each would be wasteful) ----

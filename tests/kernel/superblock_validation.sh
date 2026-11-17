@@ -125,6 +125,27 @@ check data_align_blocks 0 "no data alignment at all, which every group's layout 
 check data_align_blocks 3 "a data alignment that is not a power of two"
 check data_align_blocks 1048576 "a data alignment past the 64 MiB maximum"
 
+# A journal under 8 slots: an inode's held-back tree blocks are written at
+# half the journal, and a batch larger than the journal is refused -- one
+# slot failed every fsync needing two blocks, for the volume's life
+# (audit M-24). 0 (no journal) and 17+ are legal; the baseline is -J 1.
+log "a journal too small to hold one batch is refused, by the mount, fsck and growfs"
+check node_journal_blocks 3 "one slot: every boundary needing two tree blocks fails EIO"
+check node_journal_blocks 16 "seven slots, one under the minimum a batch is sized for"
+JB_ORIG="$(sb_field node_journal_blocks)"
+for bad in 3 16; do
+    "$SB_POKE" "$DEV" node_journal_blocks "$bad" >/dev/null
+    out="$("$ROOT/userspace/fsck.cetra" "$DEV" 2>&1)" && rc=0 || rc=$?
+    [ "$rc" -ne 0 ] && grep -q "per-node journal of $bad blocks" <<<"$out" &&
+        pass "fsck refuses node_journal_blocks=$bad" || fail "fsck on node_journal_blocks=$bad: rc=$rc: $(tail -1 <<<"$out")"
+    out="$("$ROOT/userspace/growfs.cetra" "$DEV" 2>&1)" && rc=0 || rc=$?
+    [ "$rc" -ne 0 ] && grep -q "invalid node_journal_blocks $bad" <<<"$out" &&
+        pass "growfs refuses node_journal_blocks=$bad" || fail "growfs on node_journal_blocks=$bad: rc=$rc: $(tail -1 <<<"$out")"
+done
+"$SB_POKE" "$DEV" node_journal_blocks "$JB_ORIG" >/dev/null
+"$ROOT/userspace/fsck.cetra" "$DEV" >/dev/null 2>&1 && pass "control: restored, fsck is clean again" ||
+    fail "control: fsck still fails with node_journal_blocks=$JB_ORIG restored"
+
 log "a cluster larger than the read-presence mask is refused"
 # Row indices are taken modulo 64 in cetrafs_inode_t.read_open_nodes, so
 # on a 128-row volume node 64 aliases node 0: node 64's read-open looks

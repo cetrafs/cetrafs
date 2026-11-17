@@ -166,12 +166,12 @@ static int cetrafs_journal_node_area(struct super_block *sb, u32 node_id, u64 *o
     start = le64_to_cpu(raw_sb->node_journal_start);
     per_node = le32_to_cpu(raw_sb->node_journal_blocks);
 
-    if (!start || per_node < 1 + CETRAFS_JOURNAL_SLOT_BLOCKS) {
+    if (!start || !per_node) {
         *out_start = 0;
         *out_slots = 0;
         return 0;
     }
-    if (per_node > CETRAFS_JOURNAL_MAX_BLOCKS)
+    if (!cetrafs_journal_blocks_ok(per_node))
         return -EINVAL; /* refused at mount too; the per-slot arrays are sized from it */
 
     *out_start = start + (u64) node_id * per_node;

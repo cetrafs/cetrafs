@@ -170,7 +170,7 @@ volume through the copy when block 0 is damaged, and `-r` restores block
 | pending_free_start | `__le64` | LBA of the per-ZG pending-free queue region |
 | pending_free_blocks_per_zg | `__le32` | queue blocks per ZG (`CETRAFS_PENDING_FREE_BLOCKS_PER_ZG`) |
 | node_journal_start | `__le64` | LBA of the per-node journal area |
-| node_journal_blocks | `__le32` | blocks per node (flag block + slots) |
+| node_journal_blocks | `__le32` | blocks per node (flag block + slots): 0 (no journal) or 17 (8 slots) up to 4 Mi blocks; the mount, fsck and growfs refuse anything else |
 | layout_gen | `__le64` | layout generation counter: incremented by every grow. Mounted nodes compare it on each heartbeat and rebuild their in-core layout when it moves; a live grow requires every registered node to advertise `CETRAFS_NODE_CAP_LIVE_GROW` |
 | features_compat/incompat/ro_compat | `__le64` | feature bitmasks |
 | checksum | `__le64` | CRC32C over the struct with this field zeroed (low 32 bits used) |
@@ -456,7 +456,7 @@ read only from a superblock that passed its checksum.
 - `-z`: zone groups, 1..255, default 16 (clamped down to the real BG count)
 - `-b`: BG size in MiB, min 512, default 1024 (auto-shrunk to 512 when omitted on a small device — see below)
 - `-N`: total inodes, default 1 per 4 MiB capped at 65536, bounded by what the superblock's `__le32` can hold
-- `-J`: per-**node** journal size in MiB, default 2, 0 disables (capped so the total across all `-M` node slots stays ~5% of the device)
+- `-J`: per-**node** journal size in MiB, default 2, 0 disables (capped so the total across all `-M` node slots stays ~5% of the device; an auto-sized journal that would fall under 8 slots is formatted as no journal, and mkfs says so)
 - `-M`: Node Registry capacity (max cluster nodes), default 64, ≤ `CETRAFS_MAX_READER_NODES` (the read-presence mask width)
 - `-A`: data alignment in KiB, a power of two from 4 to 65536 dividing the BG size, default 1024: the first Block Group starts on it (so every one does) and each data region on the next multiple past its header and bitmap. Set it to the array's UNMAP granularity or stripe; 4 is no alignment. Costs up to one alignment unit per group (1 MiB of 1 GiB by default)
 - `-n`: dry-run (compute & print layout only)

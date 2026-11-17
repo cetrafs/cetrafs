@@ -1898,9 +1898,9 @@ static int cetrafs_validate_layout(const cetrafs_superblock_t *sb, u64 total_blo
         pr_err("superblock: the pending-free queue has zero blocks per Zone Group\n");
         return -EINVAL;
     }
-    if (le32_to_cpu(sb->node_journal_blocks) > CETRAFS_JOURNAL_MAX_BLOCKS) {
-        pr_err("superblock: per-node journal of %u blocks exceeds the format's %u\n",
-               le32_to_cpu(sb->node_journal_blocks), CETRAFS_JOURNAL_MAX_BLOCKS);
+    if (!cetrafs_journal_blocks_ok(le32_to_cpu(sb->node_journal_blocks))) {
+        pr_err("superblock: per-node journal of %u blocks -- the format allows none, or %u to %u\n",
+               le32_to_cpu(sb->node_journal_blocks), CETRAFS_JOURNAL_MIN_BLOCKS, CETRAFS_JOURNAL_MAX_BLOCKS);
         return -EINVAL;
     }
 
