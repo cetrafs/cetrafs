@@ -1898,6 +1898,21 @@ static int cetrafs_validate_layout(const cetrafs_superblock_t *sb, u64 total_blo
         pr_err("superblock: the pending-free queue has zero blocks per Zone Group\n");
         return -EINVAL;
     }
+    /* Size fields bound loops and allocations (the queue's per-ZG walks,
+     * every inode-bitmap scan), and a CRC-valid superblock is bounded
+     * otherwise only by the device: fsck refuses past what mkfs writes,
+     * so the mount and a layout refresh do too (audit 2026-11-14 BM-18). */
+    if (le32_to_cpu(sb->pending_free_blocks_per_zg) > CETRAFS_PENDING_FREE_BLOCKS_PER_ZG) {
+        pr_err("superblock: the pending-free queue has %u blocks per Zone Group -- mkfs writes at most %u\n",
+               le32_to_cpu(sb->pending_free_blocks_per_zg), CETRAFS_PENDING_FREE_BLOCKS_PER_ZG);
+        return -EINVAL;
+    }
+    if (le64_to_cpu(sb->inode_bmap_blocks) != cetrafs_calc_inode_bmap_blocks(le32_to_cpu(sb->inodes_count))) {
+        pr_err("superblock: inode_bmap_blocks %llu, but %u inodes need exactly %llu\n",
+               (unsigned long long) le64_to_cpu(sb->inode_bmap_blocks), le32_to_cpu(sb->inodes_count),
+               (unsigned long long) cetrafs_calc_inode_bmap_blocks(le32_to_cpu(sb->inodes_count)));
+        return -EINVAL;
+    }
     if (!cetrafs_journal_blocks_ok(le32_to_cpu(sb->node_journal_blocks))) {
         pr_err("superblock: per-node journal of %u blocks -- the format allows none, or %u to %u\n",
                le32_to_cpu(sb->node_journal_blocks), CETRAFS_JOURNAL_MIN_BLOCKS, CETRAFS_JOURNAL_MAX_BLOCKS);
@@ -4649,8 +4664,10 @@ static int cetrafs_sb_recount_free_inodes(struct super_block *sb, u64 *out)
         return -EINVAL;
     bmap = le64_to_cpu(raw_sb->inode_bmap_start);
     nblocks = le64_to_cpu(raw_sb->inode_bmap_blocks);
-    for (i = 0; i < nblocks; i++)
+    for (i = 0; i < nblocks; i++) {
         cetrafs_invalidate_block(sb, bmap + i);
+        cond_resched(); /* rule 14: a walk over a disk-read count */
+    }
     return cetrafs_count_free_inodes(sb, out);
 }
 

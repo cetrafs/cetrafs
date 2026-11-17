@@ -2616,8 +2616,10 @@ int cetrafs_ns_count_names(struct super_block *sb, const u64 *inos, u32 n, u32 *
     if (!READ_ONCE(cetrafs_ns_count_cached_bmap)) {
         u64 b, bstart = le64_to_cpu(raw_sb->inode_bmap_start), bn = le64_to_cpu(raw_sb->inode_bmap_blocks);
 
-        for (b = 0; b < bn; b++)
+        for (b = 0; b < bn; b++) {
             cetrafs_invalidate_block(sb, bstart + b);
+            cond_resched(); /* rule 14: a walk over a disk-read count */
+        }
     }
     for (d = 1; d <= ninodes; d += CETRAFS_NS_WALK_BATCH) {
         u64 end = min_t(u64, d + CETRAFS_NS_WALK_BATCH - 1, ninodes), x;

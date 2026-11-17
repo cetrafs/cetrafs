@@ -125,6 +125,38 @@ check data_align_blocks 0 "no data alignment at all, which every group's layout 
 check data_align_blocks 3 "a data alignment that is not a power of two"
 check data_align_blocks 1048576 "a data alignment past the 64 MiB maximum"
 
+# Size fields bound kernel loops and allocations, and fsck refuses past
+# what mkfs writes; the mount only checked them against the device
+# (audit BM-18). Each value below also overlaps a neighbour, which the
+# old code refused for -- so the REASON is what is asserted.
+log "a size field past what mkfs writes is refused for its size"
+# <field> <bad> <message the refusal must carry>
+check_why() {
+    local field="$1" bad="$2" msg="$3" orig mark
+    orig="$(sb_field "$field")"
+    "$SB_POKE" "$DEV" "$field" "$bad" >/dev/null
+    blockdev --flushbufs "$DEV"
+    mark="$(dmesg_mark)"
+    if mount -t cetrafs "$DEV" "$MNT" 2>/dev/null; then
+        umount "$MNT"
+        fail "$field=$bad was accepted"
+    elif dmesg_since "$mark" | grep -q "$msg"; then
+        pass "$field=$bad is refused for its size"
+    else
+        fail "$field=$bad was refused, but not for its size: $(dmesg_since "$mark" | grep -i superblock | tail -1)"
+    fi
+    "$SB_POKE" "$DEV" "$field" "$orig" >/dev/null
+    blockdev --flushbufs "$DEV"
+}
+check_why pending_free_blocks_per_zg 513 "mkfs writes at most 512"
+check_why inode_bmap_blocks 2 "inodes need exactly 1"
+if mount -t cetrafs "$DEV" "$MNT" 2>/dev/null; then
+    umount "$MNT"
+    pass "control: both restored, the volume mounts"
+else
+    fail "control: the volume does not mount with both fields restored"
+fi
+
 # A journal under 8 slots: an inode's held-back tree blocks are written at
 # half the journal, and a batch larger than the journal is refused -- one
 # slot failed every fsync needing two blocks, for the volume's life

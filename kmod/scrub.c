@@ -422,8 +422,10 @@ static int scrub_build_refset(struct cetrafs_scrub *s, struct scrub_ctx *ctx, bo
         u64 b, bmap_start = le64_to_cpu(raw_sb->inode_bmap_start);
         u64 bmap_blocks = le64_to_cpu(raw_sb->inode_bmap_blocks);
 
-        for (b = 0; b < bmap_blocks; b++)
+        for (b = 0; b < bmap_blocks; b++) {
             cetrafs_invalidate_block(sb, bmap_start + b);
+            cond_resched(); /* rule 14: a walk over a disk-read count */
+        }
     }
 
     for (i = 0; i < ctx->nbgs; i++)
