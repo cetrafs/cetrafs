@@ -69,8 +69,16 @@ round() {
     ct_mount "$dev" "$MNT"
     PROC="$(ct_procdir "$dev")"
     wait_for 40 "dmesg_since '$mark' | grep -q 'failed to redo target'" || true
-    sleep 1
-    d1="$("$JPOKE" "$dev" 1 --dump | head -1)"
+    # Every beat (1 s here) a sweep claims the area, is refused and lets
+    # go: one fixed-time sample could land inside a retry's claim (seen
+    # as claimed=<now> beside refused=3). A released claim is what is
+    # asserted, so look for it across a few beats; a claim never let go
+    # still fails.
+    for _ in $(seq 1 20); do
+        d1="$("$JPOKE" "$dev" 1 --dump | head -1)"
+        grep -q ' claimed=0 ' <<<"$d1 " && break
+        sleep 0.25
+    done
     RES="refused=$(dmesg_since "$mark" | grep -c 'failed to redo target' || true)"
     RES="$RES stopped=$(dmesg_since "$mark" | grep -c 'STOPPED' || true) after1=[${d1// /_}]"
     echo 0 >$P/meta_write_nospc_block
