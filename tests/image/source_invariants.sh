@@ -2170,9 +2170,15 @@ grep -q ' bad$' <<<"$C58" && fail "class 58: an O_DIRECT write completes without
     pass "class 58: every __blockdev_direct_IO() write completes through cetrafs_dio_end_io()"
 grep -q 'cetrafs_dio_nospc_probe(' <<<"$(c41_body cetrafs_dio_end_io)" &&
     pass "class 58: cetrafs_dio_end_io() asks the device" || fail "class 58: cetrafs_dio_end_io() no longer calls cetrafs_dio_nospc_probe()"
-C58X="$(grep -n 'cetrafs_dio_nospc_probe(' "$K"/*.c | grep -v 'static int cetrafs_dio_nospc_probe(' | grep -vc 'size == -EIO ? cetrafs_dio_nospc_probe(' || true)"
-[ "$C58X" = 0 ] && pass "class 58: the probe answers only a failed O_DIRECT write" ||
-    fail "class 58: cetrafs_dio_nospc_probe() is called outside cetrafs_dio_end_io() ($C58X) -- a writeback error must stay EIO"
+c58_calls() { # <fn>: code lines (not comments) that name <fn>(
+    grep -hE "$1\\(" "$K"/*.c | grep -vE '^[[:space:]]*(\*|/\*)'
+}
+C58X="$(c58_calls cetrafs_dio_nospc_probe | grep -v 'static int cetrafs_dio_nospc_probe(' | grep -vc 'size == -EIO ? cetrafs_dio_nospc_probe(' || true)"
+C58Y="$(c58_calls cetrafs_discard_space_probe | grep -v '^int cetrafs_discard_space_probe(' | grep -vc 'ret = cetrafs_discard_space_probe(sb, &tries);' || true)"
+[ "$C58X" = 0 ] && [ "$C58Y" = 0 ] && [ "$(c58_calls cetrafs_discard_space_probe | grep -c 'ret = cetrafs_discard_space_probe(sb, &tries);')" = 1 ] &&
+    grep -q 'cetrafs_discard_space_probe(' <<<"$(c41_body cetrafs_dio_nospc_probe)" &&
+    pass "class 58: the probe answers only a failed O_DIRECT write" ||
+    fail "class 58: the space probe is reached from outside cetrafs_dio_end_io() ($C58X, $C58Y) -- a writeback error must stay EIO"
 C58S="$(ct_tmp c58).c"
 printf 'static ssize_t x(struct kiocb *iocb)\n{\n    return __blockdev_direct_IO(iocb, inode, bdev, iter, get_block,\n                                NULL, 0);\n}\n' >"$C58S"
 grep -q ' bad$' <<<"$(c58_dio_calls "$C58S")" && pass "class 58: control -- a planted write with no completion is found" ||
@@ -2403,7 +2409,6 @@ __cetrafs_get_block own:a-block-never-published
 cetrafs_tree_append_inner own:a-leaf-or-index-never-published
 cetrafs_tree_resv_fill own:a-tree-block-reserve-fill-nothing-references-given-back-before-its-reservation-is-unpublished
 cetrafs_xattr_write_new own:its-new-block-named-by-nothing-on-failure
-cetrafs_dio_nospc_probe own:a-scratch-block-written-once-and-named-by-nothing-BM-15
 cetrafs_bg_release_one own:test-injection-release_noop_free-of-an-already-free-block
 cetrafs_tree_split_leaf own:a-new-leaf-whose-write-failed-before-any-interior-names-it
 cetrafs_tree_build own:a-tree-never-published
@@ -2658,7 +2663,6 @@ file.c:__cetrafs_get_block:a block it allocated and never published
 file.c:cetrafs_tree_append_inner:a leaf or index it allocated and never published
 lock.c:cetrafs_tree_resv_fill:a reserve fill nothing references, given back before its reservation is unpublished
 xattr.c:cetrafs_xattr_write_new:its own new block, named by nothing
-file.c:cetrafs_dio_nospc_probe:a scratch block it allocated, wrote once and freed, never published (BM-15) -- the scrub'"'"'s two-pass gap and alloc_seq, as every unpublished allocation
 xattr.c:cetrafs_xattr_set_locked:a new block its failed publish never named (the old block goes through cetrafs_xattr_swap_block'"'"'s bracket)
 alloc.c:cetrafs_bg_release_one:TEST ONLY (release_noop_free): a free of a block already free
 file.c:cetrafs_tree_split_leaf:a new leaf whose write failed, before any interior names it

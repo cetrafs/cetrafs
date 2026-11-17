@@ -520,6 +520,7 @@ int cetrafs_bg_id_of_lba(struct super_block *sb, u64 lba, u32 *out_bg_id);
 struct fstrim_range;
 bool cetrafs_discard_supported(struct super_block *sb);
 int cetrafs_zeroout_issue(struct super_block *sb, u64 lba, u64 count, bool unmap);
+int cetrafs_discard_space_probe(struct super_block *sb, unsigned int *tries); /* BM-15, F-57 */
 bool cetrafs_discard_handback_would_send(struct super_block *sb, bool force);
 int cetrafs_discard_handback(struct super_block *sb, u32 bg_id, unsigned long *pass_started, bool pending,
                              bool force, bool *discarded);

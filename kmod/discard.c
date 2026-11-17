@@ -247,6 +247,131 @@ failed:
 }
 
 /*
+ * Ask the device whether it refuses writes for space: a failed O_DIRECT
+ * write's completion, whose own status the old O_DIRECT code flattened
+ * to EIO (audit BM-15, cetrafs_dio_nospc_probe()). Returns -ENOSPC when
+ * the device refused the probe for space, 0 when it did not say so.
+ *
+ * WHERE it asks is the whole point (F-57). A thin pool provisions whole
+ * chunks (dm-thin 64 KiB and up, arrays 16 KiB to tens of MiB), so a
+ * probe in a chunk that already holds live data -- the head of a free
+ * run is, by construction, right after a live block -- is taken while
+ * the pool is full, and the guest gets EIO anyway. So the probe goes in
+ * the middle of a claimed free run, on a chunk boundary (the device's
+ * discard granularity, at least 64 KiB), with the whole chunk inside the
+ * claim: nothing live shares it. Space freed without a discard (a
+ * deleted image before FITRIM) is provisioned too, so a probe the
+ * device takes is followed by a discard of that chunk -- the claim
+ * holds every block of it, as FITRIM's does -- and a second probe in
+ * the chunk just given back: refused, the pool is full; taken again, it
+ * has space. With no discard (or one refused) the next group is tried,
+ * up to CETRAFS_SPACE_PROBE_TRIES; a device that does not unprovision
+ * on a discard takes the second write and the answer stays EIO.
+ *
+ * FITRIM's protocol throughout (cetrafs_trim_claim_next(),
+ * cetrafs_trim_hold_durable(), cetrafs_trim_release()): the run's bits
+ * are set and durable before anything is written or discarded, a crash
+ * leaks at most the run, and a discard whose outcome is unknown keeps
+ * it. Never waits for the trim mutex: a FITRIM in progress answers
+ * "not known", and the write stays EIO.
+ */
+#define CETRAFS_SPACE_PROBE_TRIES 3
+#define CETRAFS_SPACE_PROBE_SPAN 8192 /* blocks claimed around a probe: 32 MiB */
+
+static bool cetrafs_space_probe_at_head; /* TEST ONLY: see the parameter */
+cetrafs_test_param(space_probe_at_head, cetrafs_space_probe_at_head, bool, 0644);
+MODULE_PARM_DESC(space_probe_at_head,
+                 "TEST ONLY: the space probe writes the head of one free run, no discard (BM-15 before F-57)");
+
+static int cetrafs_space_probe_write(struct super_block *sb, u64 lba)
+{
+    struct page *page = alloc_page(GFP_NOFS);
+    struct bio *bio;
+    int ret;
+
+    if (!page)
+        return -ENOMEM;
+    /* not zeros: an array that detects them would not allocate */
+    memset(page_address(page), 0xc5, PAGE_SIZE);
+    bio = bio_alloc(sb->s_bdev, 1, REQ_OP_WRITE | REQ_SYNC, GFP_NOFS);
+    bio->bi_iter.bi_sector = lba * (CETRAFS_BLOCK_SIZE >> SECTOR_SHIFT);
+    __bio_add_page(bio, page, CETRAFS_BLOCK_SIZE, 0);
+    ret = submit_bio_wait(bio);
+    bio_put(bio);
+    __free_page(page);
+    return ret;
+}
+
+int cetrafs_discard_space_probe(struct super_block *sb, unsigned int *tries)
+{
+    const cetrafs_superblock_t *raw_sb = cetrafs_sb_raw(sb);
+    bool at_head = READ_ONCE(cetrafs_space_probe_at_head);
+    u64 gran, off, need;
+    u32 b, nbg;
+    int ret = 0;
+
+    *tries = 0;
+    if (!raw_sb || cetrafs_sb_is_fenced(sb))
+        return 0;
+    gran = max_t(u64, DIV_ROUND_UP((u64) bdev_discard_granularity(sb->s_bdev), CETRAFS_BLOCK_SIZE),
+                 SZ_64K / CETRAFS_BLOCK_SIZE);
+    off = ((u64) bdev_discard_alignment(sb->s_bdev) / CETRAFS_BLOCK_SIZE) % gran;
+    need = at_head ? 1 : 2 * gran - 1; /* the least run that holds one whole aligned chunk */
+    if (!mutex_trylock(cetrafs_sb_trim_mutex(sb)))
+        return 0;
+    nbg = le32_to_cpu(raw_sb->block_group_count);
+    for (b = 0; b < nbg && *tries < (at_head ? 1 : CETRAFS_SPACE_PROBE_TRIES); b++) {
+        struct cetrafs_trim_run run = {.span = {.link = LIST_HEAD_INIT(run.span.link)}};
+        u64 cursor = 0, lba, first, nchunks;
+        bool again = false;
+        int rc, w, d = 0;
+
+        if (!cetrafs_sb_bg_is_ours(sb, b))
+            continue;
+        rc = cetrafs_trim_claim_next(sb, b, &cursor, need, max_t(u64, need, CETRAFS_SPACE_PROBE_SPAN), &run);
+        if (rc == -ENOSPC || rc == -EAGAIN || rc == -EPERM)
+            continue; /* no run that long here, or not ours any more */
+        if (rc)
+            break;
+        if (at_head) {
+            lba = run.lba;
+        } else {
+            first = DIV64_U64_ROUND_UP(run.lba + gran - off, gran) * gran + off - gran;
+            nchunks = (run.lba + run.count - first) / gran; /* >= 1: the run is 2 * gran - 1 long */
+            lba = first + (nchunks / 2) * gran;
+        }
+        rc = cetrafs_trim_hold_durable(sb, &run);
+        if (rc) {
+            cetrafs_trim_release(sb, &run, false); /* nothing written */
+            break;
+        }
+        (*tries)++;
+        w = cetrafs_space_probe_write(sb, lba);
+        if (!w && !at_head && cetrafs_discard_supported(sb)) {
+            d = cetrafs_discard_issue(sb, b, lba, gran); /* give back what the probe provisioned */
+            if (!d) {
+                /* The chunk is unprovisioned now, whatever it was: ask
+                 * again in it. Taken twice, the device has the space. */
+                (*tries)++;
+                again = true;
+                w = cetrafs_space_probe_write(sb, lba);
+                if (!w)
+                    d = cetrafs_discard_issue(sb, b, lba, gran);
+            }
+        }
+        cetrafs_trim_release(sb, &run, d && !cetrafs_discard_outcome_known(d));
+        if (w) {
+            ret = w == -ENOSPC ? w : 0; /* any other failure says nothing about space */
+            break;
+        }
+        if (again)
+            break;
+    }
+    mutex_unlock(cetrafs_sb_trim_mutex(sb));
+    return ret;
+}
+
+/*
  * The device zeroes [lba, +count) in place (REQ_OP_WRITE_ZEROES), for
  * ZERO_RANGE (cetrafs_zero_range_inplace()). A write of zeros is as
  * destructive as a discard when it is aimed wrong, and with unmap

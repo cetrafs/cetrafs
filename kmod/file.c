@@ -1057,15 +1057,16 @@ MODULE_PARM_DESC(dio_end_io_stall_ms, "TEST ONLY: the next O_DIRECT completion s
  * failed bio into EIO -- a thin pool's "no space" (BLK_STS_NOSPC: SCSI
  * DATA PROTECT 27/07, dm-thin error_if_no_space) included -- and qemu
  * pauses a guest on ENOSPC but hands EIO to it. The write's pages are
- * gone by the completion, so the device is asked with a block no file
- * uses: one scratch block, allocated, written with a pattern (an array
- * that detects zeros would not allocate for them) under its own status,
- * and freed. Never a block of the file: another writer may have written
- * the failed one since, and the probe would land over its data.
+ * gone by the completion, so the device is asked with blocks no file
+ * uses: the middle of a claimed free run, a whole thin chunk nothing
+ * live shares, discarded again after a write the device took
+ * (cetrafs_discard_space_probe(), F-57). Never a block of the file:
+ * another writer may have written the failed one since, and the probe
+ * would land over its data.
  *
- * A miss is safe: a scratch block the device has provisioned already
- * takes the write while the pool is full, and the error stays EIO, as
- * before. Only in task context: an async overwrite's completion can run
+ * A miss is safe: a chunk the device has provisioned anyway (space
+ * freed without a discard, on a device that cannot discard) takes the
+ * write while the pool is full, and the error stays EIO, as before. Only in task context: an async overwrite's completion can run
  * from the bio's end_io (only a write that allocates defers it), and an
  * overwrite of provisioned blocks needs no new space anyway, short of a
  * snapshot on the array.
@@ -1089,29 +1090,13 @@ u64 cetrafs_dio_nospc_found_count(void)
 
 static int cetrafs_dio_nospc_probe(struct super_block *sb)
 {
-    struct page *page;
-    struct bio *bio;
-    u64 lba;
+    unsigned int tries;
     int ret;
 
-    if (READ_ONCE(cetrafs_dio_nospc_probe_off) || !in_task() || cetrafs_sb_is_fenced(sb))
+    if (READ_ONCE(cetrafs_dio_nospc_probe_off) || !in_task())
         return 0;
-    page = alloc_page(GFP_NOFS);
-    if (!page)
-        return 0;
-    if (cetrafs_alloc_block_anywhere(sb, NULL, &lba)) {
-        __free_page(page); /* no block to ask with: the answer stays EIO */
-        return 0;
-    }
-    atomic64_inc(&cetrafs_dio_nospc_probes);
-    memset(page_address(page), 0xc5, PAGE_SIZE);
-    bio = bio_alloc(sb->s_bdev, 1, REQ_OP_WRITE | REQ_SYNC, GFP_NOFS);
-    bio->bi_iter.bi_sector = lba * (CETRAFS_BLOCK_SIZE >> SECTOR_SHIFT);
-    __bio_add_page(bio, page, CETRAFS_BLOCK_SIZE, 0);
-    ret = submit_bio_wait(bio);
-    bio_put(bio);
-    __free_page(page);
-    cetrafs_free_data_block(sb, lba); /* never referenced: nothing to publish first */
+    ret = cetrafs_discard_space_probe(sb, &tries); /* where it asks: F-57, discard.c */
+    atomic64_add(tries, &cetrafs_dio_nospc_probes);
     if (ret != -ENOSPC)
         return 0;
     atomic64_inc(&cetrafs_dio_nospc_found);
