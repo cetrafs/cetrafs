@@ -1720,6 +1720,7 @@ int cetrafs_submit_deferred_target(struct super_block *sb, struct buffer_head *b
 int cetrafs_wait_deferred_target(struct super_block *sb, struct buffer_head *bh, struct cetrafs_dtarget_io *io);
 bool cetrafs_tree_refusal_survivable(struct super_block *sb, sector_t block, int status);
 u64 cetrafs_tree_refusal_count(void);
+u64 cetrafs_alloc_damaged_skip_count(void); /* zonegroup.c, BM-6 */
 int cetrafs_wait_meta_write(struct super_block *sb, struct buffer_head *bh);
 void cetrafs_bh_end_update_deferred(struct buffer_head *bh);
 void cetrafs_bh_deferred_unlist(struct super_block *sb, struct buffer_head *bh, bool drop);

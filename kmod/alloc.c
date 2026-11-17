@@ -1518,6 +1518,11 @@ static int cetrafs_read_bg_geom_at(struct super_block *sb, const cetrafs_superbl
     }
 
     pr_err("BG %u failed its descriptor checksum repeatedly -- corrupted, not just a torn concurrent read\n", bg_id);
+    /* Counted and marked for fsck, as an impossible geometry above is:
+     * damaged metadata found on a read (ERRORS.md, kind 2). It went
+     * uncounted, and nothing told the operator fsck.cetra -r rebuilds
+     * it (found by tests/kernel/alloc_skips_damaged_bg.sh). */
+    cetrafs_sb_corrupt(sb, 0);
     return -EUCLEAN;
 }
 

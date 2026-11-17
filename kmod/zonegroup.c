@@ -3612,6 +3612,36 @@ int cetrafs_alloc_pick_run(struct super_block *sb, u64 count, u64 *out_lba)
 
 /* As above; a given 'span' is published atomically with the bits -- see
  * cetrafs_alloc_data_run_resv(). */
+/*
+ * An owned Block Group whose descriptor is damaged (-EUCLEAN: it failed
+ * its checksum through every retry, and the mount counted it) is passed
+ * over by the allocator, not the end of the allocation: one such group
+ * failed every allocation of the node once its cursor group filled, with
+ * every other owned group free (audit 2026-11-15 BM-6). fsck.cetra -r
+ * rebuilds the descriptor; meanwhile its blocks are simply not used.
+ * An I/O error still ends the allocation.
+ */
+static atomic64_t cetrafs_alloc_damaged_skips = ATOMIC64_INIT(0);
+
+u64 cetrafs_alloc_damaged_skip_count(void)
+{
+    return (u64) atomic64_read(&cetrafs_alloc_damaged_skips);
+}
+
+/* TEST ONLY: a damaged owned descriptor ends the allocation, as before
+ * BM-6 (tests/kernel/alloc_skips_damaged_bg.sh's control). */
+static bool cetrafs_alloc_damaged_aborts;
+cetrafs_test_param(alloc_damaged_aborts, cetrafs_alloc_damaged_aborts, bool, 0644);
+MODULE_PARM_DESC(alloc_damaged_aborts, "TEST ONLY: a damaged owned Block Group descriptor ends the allocation");
+
+static bool cetrafs_alloc_skip_damaged(int ret)
+{
+    if (ret != -EUCLEAN || READ_ONCE(cetrafs_alloc_damaged_aborts))
+        return false;
+    atomic64_inc(&cetrafs_alloc_damaged_skips);
+    return true;
+}
+
 int cetrafs_alloc_pick_run_resv(struct super_block *sb, u64 count, u64 *out_lba, struct cetrafs_resv_span *span)
 {
     u32 bgi;
@@ -3625,7 +3655,7 @@ int cetrafs_alloc_pick_run_resv(struct super_block *sb, u64 count, u64 *out_lba,
         ret = cetrafs_alloc_data_run_resv(sb, bgi, count, out_lba, span);
         if (ret == 0)
             return 0;
-        if (ret != -ENOSPC && ret != -EAGAIN) /* -EAGAIN: released since we looked, try the next */
+        if (ret != -ENOSPC && ret != -EAGAIN && !cetrafs_alloc_skip_damaged(ret)) /* -EAGAIN: released since we looked */
             return ret;
     }
 
@@ -3876,6 +3906,8 @@ retry_scan:
                 u64 total, free;
 
                 ret = cetrafs_bg_data_block_stats(sb, bg, &total, &free);
+                if (ret && cetrafs_alloc_skip_damaged(ret))
+                    continue; /* damaged: passed over, the others still serve (BM-6) */
                 if (ret)
                     return ret;
 
