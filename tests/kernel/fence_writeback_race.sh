@@ -30,6 +30,7 @@ for k in stop_sweep_delay_ms bitmap_writeback hb_maint_delay_ms; do
 done
 NODE_POKE="$(ct_helper node_poke)"
 MAP="$(ct_helper bg_map)"
+BG_POKE="$(ct_helper bg_poke)"
 MNT="$(ct_mnt fwr)"
 ct_track mnt "$MNT"
 ct_param_set auto_defrag 0
@@ -45,7 +46,10 @@ round() {
     dev="$(ct_dev 560 "fwr$1-$RANDOM")"
     back="$(losetup -l -n -O BACK-FILE "$dev" | tr -d ' ')"
     ct_mkfs_small "$dev" >/dev/null
-    lba=$(($("$MAP" "$dev" | awk '$1 == "bg" && $2 == 0 {split($4,a,"="); print a[2]}') + 1))
+    # Group 0's data bitmap: start + off_data_bmap (the alignment gap
+    # sits before the bitmap, not after the header).
+    lba=$(($("$MAP" "$dev" | awk '$1 == "bg" && $2 == 0 {split($4,a,"="); print a[2]}') +
+        $("$BG_POKE" "$dev" 0 --dump | sed -n 's/.*off_data_bmap=\([0-9]*\).*/\1/p')))
     echo "$1" >/sys/module/cetrafs/parameters/bitmap_writeback
     # The heartbeat's maintenance pass writes held (and other) bitmap
     # blocks; held off for the round, so the only writers of the bitmap

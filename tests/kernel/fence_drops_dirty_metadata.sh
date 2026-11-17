@@ -29,7 +29,12 @@ BACK="$(losetup -l -n -O BACK-FILE "$DEV")"
 MNT="$(ct_mnt fdm)"
 ct_mkfs_small "$DEV" >/dev/null
 compress_timing
-BMAP_LBA=$(($("$MAP" "$DEV" | awk '$1 == "bg" && $2 == 0 {split($4,a,"="); print a[2]}') + 1))
+# Group 0's data bitmap: its start plus the header's off_data_bmap (the
+# data alignment's gap sits between the header and the bitmap, so it is
+# not simply the block after the header).
+BG_POKE="$(ct_helper bg_poke)"
+BMAP_LBA=$(($("$MAP" "$DEV" | awk '$1 == "bg" && $2 == 0 {split($4,a,"="); print a[2]}') +
+    $("$BG_POKE" "$DEV" 0 --dump | sed -n 's/.*off_data_bmap=\([0-9]*\).*/\1/p')))
 ct_mount "$DEV" "$MNT"
 require_cetrafs_mount "$MNT"
 ct_param_set auto_defrag 0
