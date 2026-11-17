@@ -442,7 +442,11 @@ bit, not a version bump, wherever an older build can be told what to do:
 | COMPAT | ignored | warns, checks | refused, nothing written (`fsck -r` exits 3) |
 
 A tool that rewrites the volume refuses even a compatible unknown bit: a
-structure it cannot see reads to it as space nobody uses. The feature bits are
+structure it cannot see reads to it as space nobody uses. The same is true of
+an older module's own scrub, which a COMPAT bit does not stop: a COMPAT
+structure must keep its blocks set in the data bitmaps and reachable by the
+scrub's reference set, or that scrub reclaims them as leaked. A structure that
+cannot is RO_COMPAT. The feature bits are
 read only from a superblock that passed its checksum.
 
 ## Tools
@@ -454,6 +458,7 @@ read only from a superblock that passed its checksum.
 - `-N`: total inodes, default 1 per 4 MiB capped at 65536, bounded by what the superblock's `__le32` can hold
 - `-J`: per-**node** journal size in MiB, default 2, 0 disables (capped so the total across all `-M` node slots stays ~5% of the device)
 - `-M`: Node Registry capacity (max cluster nodes), default 64, ≤ `CETRAFS_MAX_READER_NODES` (the read-presence mask width)
+- `-A`: data alignment in KiB, a power of two from 4 to 65536 dividing the BG size, default 1024: the first Block Group starts on it (so every one does) and each data region on the next multiple past its header and bitmap. Set it to the array's UNMAP granularity or stripe; 4 is no alignment. Costs up to one alignment unit per group (1 MiB of 1 GiB by default)
 - `-n`: dry-run (compute & print layout only)
 - `-f`: force (overwrite even if the device looks non-empty)
 

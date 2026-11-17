@@ -1884,7 +1884,13 @@ static inline int cetrafs_blk_struct_ok(const void *blk, u32 magic)
  *   RO_COMPAT -- an older build reads it right but would write it wrong:
  *                it mounts read-only only.
  *   COMPAT    -- an older build reads and writes it right; the module
- *                ignores the bit.
+ *                ignores the bit. It mounts read-WRITE, so its scrub and
+ *                allocator run over the volume: a COMPAT structure must
+ *                keep every block it uses set in the data bitmaps AND
+ *                reachable by the scrub's reference set
+ *                (scrub_build_refset()), or an older module frees it as
+ *                leaked. A structure that cannot promise both is
+ *                RO_COMPAT.
  *
  * fsck -r and growfs refuse a volume with an unknown bit in ANY class:
  * they rewrite structures, and a structure they cannot see -- even a
