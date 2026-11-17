@@ -3720,6 +3720,10 @@ int cetrafs_fill_super(struct super_block *sb, struct fs_context *fc)
 
     /* Populate VFS super_block */
     sb->s_magic = CETRAFS_MAGIC;
+    /* The volume's identity, the same on every node (mkfs's uuid):
+     * blkid-style tools, fanotify and statfs's f_fsid key on it, and the
+     * device number differs per node (audit F-56). */
+    super_set_uuid(sb, cetrafs_sb_raw(sb)->uuid, sizeof(cetrafs_sb_raw(sb)->uuid));
     /* s_maxbytes is the FORMAT ceiling (2^32 blocks), which never moves;
      * the VFS enforces it in setattr_prepare(), generic_write_checks()
      * and vfs_fallocate(). The volume's CAPACITY, which a live grow

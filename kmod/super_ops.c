@@ -8,6 +8,7 @@
 #include <linux/mm.h>
 #include <linux/seq_file.h>
 #include <linux/statfs.h>
+#include <linux/unaligned.h>
 
 #include <linux/delay.h>
 
@@ -421,11 +422,17 @@ static int cetrafs_statfs(struct dentry *dentry, struct kstatfs *stat)
     stat->f_files = le32_to_cpu(raw_sb->inodes_count);
     stat->f_ffree = free_inodes;
     stat->f_namelen = CETRAFS_FILENAME_MAX;
-    /* f_fsid: left zero, every cetrafs mount looked like the same
-     * filesystem to anything that identifies one by it -- NFS export
-     * and `find -xdev` among them. The device number is the identifier
-     * the rest of the kernel already uses for this mount. */
-    stat->f_fsid = u64_to_fsid(huge_encode_dev(sb->s_bdev->bd_dev));
+    /* f_fsid: the volume UUID's two halves folded, as ext4 does, so every
+     * node reports one identity for one volume; the device number it was
+     * built from differs per node (audit F-56). Left zero, every mount
+     * looked like the same filesystem to anything that keys on it. An
+     * all-zero UUID (a hostile image) keeps the device number, so two
+     * such volumes on one host still differ. */
+    {
+        u64 lo = get_unaligned_le64(raw_sb->uuid), hi = get_unaligned_le64(raw_sb->uuid + 8);
+
+        stat->f_fsid = (lo | hi) ? u64_to_fsid(lo ^ hi) : u64_to_fsid(huge_encode_dev(sb->s_bdev->bd_dev));
+    }
     return 0;
 }
 

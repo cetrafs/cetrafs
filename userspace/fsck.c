@@ -2844,6 +2844,12 @@ int main(int argc, char **argv)
         return 1;
     }
 
+    /* The volume's identity, as the kernel publishes it (audit F-56). */
+    printf("  volume uuid: ");
+    for (unsigned k = 0; k < sizeof(sb.uuid); k++)
+        printf("%02x%s", sb.uuid[k], (k == 3 || k == 5 || k == 7 || k == 9) ? "-" : "");
+    printf("\n");
+
     /* Feature bits are read only from a superblock that passed its
      * checksum: a torn one is reported as torn, not as "newer". */
     if (cetrafs_le64(sb.features_incompat) & ~CETRAFS_KNOWN_INCOMPAT) {

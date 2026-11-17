@@ -189,6 +189,7 @@ static int cetrafs_proc_info_show(struct seq_file *m, void *v)
      * sb->s_maxbytes is the format ceiling alone. */
     seq_printf(m, "max_file_size_bytes: %lld\n", (long long) cetrafs_sb_max_file_size(sb));
 
+    seq_printf(m, "volume_uuid: %pUb\n", raw_sb->uuid); /* F-56 */
     seq_printf(m, "block_size: %u\n", le32_to_cpu(raw_sb->block_size));
     seq_printf(m, "total_blocks: %llu\n", (unsigned long long) le64_to_cpu(raw_sb->total_blocks));
     seq_printf(m, "zone_group_count: %u\n", zg_count);
