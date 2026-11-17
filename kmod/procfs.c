@@ -918,6 +918,24 @@ timing_out:
         return len;
     }
 
+    /* release_discards=now: the operator's word that no hand-back UNMAP
+     * sent before now can still land; groups held only for one are
+     * released by the next hand-back pass (BM-48,
+     * cetrafs_sb_waive_pending_discards()). CAP_SYS_ADMIN: wrong, it
+     * lets an UNMAP land on the next owner's data. */
+    if (!strcmp(key, "release_discards")) {
+        unsigned int n;
+
+        if (!capable(CAP_SYS_ADMIN))
+            return -EPERM;
+        if (strcmp(val, "now"))
+            return -EINVAL;
+        n = cetrafs_sb_waive_pending_discards(sb);
+        pr_warn("%s: controls: %u Block Group(s) held for an outstanding discard released on the operator's word\n",
+                sb->s_id, n);
+        return len;
+    }
+
     /* shutdown=now: stop this mount at once, as a crash would
      * (cetrafs_sb_stop()) -- the software fence a cluster manager uses
      * before it reaches for power. Same as FS_IOC_SHUTDOWN with

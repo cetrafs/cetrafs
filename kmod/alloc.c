@@ -5048,6 +5048,14 @@ static int cetrafs_bg_release_one(struct super_block *sb, u32 zg_id, u32 b, unsi
                                b);
             return -EBUSY;
         }
+        /* Waived by the operator (release_discards=now): no earlier
+         * UNMAP can still land, so none is sent again -- the way out for
+         * a device that stopped taking discards (BM-48). */
+        if (cetrafs_sb_bg_discard_waived(sb, b)) {
+            settling = true;
+            pr_warn("BG %u: its outstanding discard is waived by the operator -- releasing it untrimmed\n", b);
+            goto release;
+        }
         ret = cetrafs_discard_handback(sb, b, pass_started, true, force, &ctx.discarded);
         if (ret) {
             return -EBUSY; /* kept for a later pass */

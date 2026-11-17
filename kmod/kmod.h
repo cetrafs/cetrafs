@@ -547,6 +547,8 @@ u64 cetrafs_dio_privs_xattr_reads_count(void);
 u32 cetrafs_sb_next_bmap_alloc_dirty(struct super_block *sb, u32 from);
 u32 cetrafs_sb_next_release_check(struct super_block *sb, u32 from);
 void cetrafs_sb_set_release_check(struct super_block *sb, u32 bg_id, bool on);
+unsigned int cetrafs_sb_waive_pending_discards(struct super_block *sb);
+bool cetrafs_sb_bg_discard_waived(struct super_block *sb, u32 bg_id);
 u32 cetrafs_sb_next_discard_pending(struct super_block *sb, u32 from);
 u64 cetrafs_release_visit_count(void);
 int cetrafs_sb_bmap_flush_begin(struct super_block *sb);

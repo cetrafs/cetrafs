@@ -6721,6 +6721,41 @@ bool cetrafs_sb_set_bg_discard_pending(struct super_block *sb, u32 bg_id, bool o
     return true;
 }
 
+/*
+ * release_discards=now (procfs controls; audit 2026-11-15 BM-48): the
+ * operator's word that no hand-back UNMAP sent before now can still land
+ * -- the paths were reset, the transport timers passed. Every group
+ * pending at this moment is marked waived (value 2), and the next
+ * hand-back pass releases it without sending the discard again
+ * (cetrafs_bg_release_one(): still only provably empty). A group marked
+ * pending after this is not covered. Without it, a device that stopped
+ * taking discards kept every such group out of use for good: the re-issue
+ * is the only other way out, and discard=off does not cancel a command
+ * already sent. Returns how many were marked.
+ */
+unsigned int cetrafs_sb_waive_pending_discards(struct super_block *sb)
+{
+    struct cetrafs_sb_info *sbi = sb ? sb->s_fs_info : NULL;
+    unsigned long idx;
+    unsigned int n = 0;
+    void *e;
+
+    if (!sbi)
+        return 0;
+    xa_for_each(&sbi->discard_pending, idx, e) {
+        if (e == xa_mk_value(1) && !xa_err(xa_cmpxchg(&sbi->discard_pending, idx, e, xa_mk_value(2), GFP_NOFS)))
+            n++;
+    }
+    return n;
+}
+
+bool cetrafs_sb_bg_discard_waived(struct super_block *sb, u32 bg_id)
+{
+    struct cetrafs_sb_info *sbi = sb ? sb->s_fs_info : NULL;
+
+    return sbi && xa_load(&sbi->discard_pending, bg_id) == xa_mk_value(2);
+}
+
 /* The first Block Group at or after 'from' with an outstanding
  * discard, or U32_MAX. */
 u32 cetrafs_sb_next_discard_pending(struct super_block *sb, u32 from)
