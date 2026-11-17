@@ -30,6 +30,7 @@ func RunDefragYield(clients []*Client, baseDir string) (bool, error) {
 	stepDelaySet := false
 	defer func() {
 		if stepDelaySet {
+			_ = callOK(a, "set_control", SetControlArgs{Key: "auto_defrag", Value: "on"})
 			_ = callOK(a, "mod_param", ModParamArgs{Name: "defrag_step_delay_ms", Value: "0"})
 			_ = callOK(a, "mod_param", ModParamArgs{Name: "defrag_ignore_yield", Value: "0"})
 			_ = callOK(b, "mod_param", ModParamArgs{Name: "lock_yield_wait_ms", Value: "10000"})
@@ -86,13 +87,22 @@ func RunDefragYield(clients []*Client, baseDir string) (bool, error) {
 	// fragmented writes a fresh fragmented file on a and waits for a's
 	// janitor to be moving it.
 	fragmented := func(path string) error {
+		// The janitor stays off while both files are written: the pad
+		// is as fragmented as the file, and since sparse files are
+		// moved too (4237c76) its own pass would be the one pinned --
+		// defrag_pinned is the mount's, not the file's. It is then
+		// switched on and handed this file alone, by a writer's close.
+		if err := callOK(a, "set_control", SetControlArgs{Key: "auto_defrag", Value: "off"}); err != nil {
+			return err
+		}
+		if !waitPinned(0, 5*time.Minute) {
+			return fmt.Errorf("an earlier move is still pinned (defrag_pinned=%d)", pinned(a))
+		}
 		if err := callOK(a, "write_at", WriteAtArgs{Path: path, Offset: 0, Size: 0, Create: true}); err != nil {
 			return err
 		}
 		pad := path + ".pad"
 		var bg DioWriteResult
-		// Block 0 left a hole: the janitor declines a sparse file, so
-		// the only move this node makes is the one under test.
 		resp, e := a.Call("dio_write", DioWriteArgs{Path: pad, Offsets: offs[1:], Stamp: "PAD", Par: 1, Create: true, Background: true})
 		if err := decodeResult(a.Name, resp, e, &bg); err != nil {
 			return fmt.Errorf("starting %s: %w", pad, err)
@@ -106,6 +116,17 @@ func RunDefragYield(clients []*Client, baseDir string) (bool, error) {
 		resp, e = a.Call("dio_wait", DioWaitArgs{Job: bg.Job, TimeoutSecs: 300})
 		if err := decodeResult(a.Name, resp, e, &bw); err != nil || !bw.Done {
 			return fmt.Errorf("waiting for %s: %v (done %v)", pad, err, bw.Done)
+		}
+		if err := callOK(a, "set_control", SetControlArgs{Key: "auto_defrag", Value: "on"}); err != nil {
+			return err
+		}
+		var wh OpenHoldResult
+		resp, e = a.Call("open_hold", OpenHoldArgs{Path: path, Mode: "rdwr"})
+		if err := decodeResult(a.Name, resp, e, &wh); err != nil {
+			return fmt.Errorf("open_hold rdwr %s: %w", path, err)
+		}
+		if err := callOK(a, "close", CloseArgs{Handle: wh.Handle}); err != nil {
+			return fmt.Errorf("close %s: %w", path, err)
 		}
 		if !waitPinned(1, 60*time.Second) {
 			return fmt.Errorf("defrag_pinned=%d 60 s after writing %s -- the move never started", pinned(a), path)
