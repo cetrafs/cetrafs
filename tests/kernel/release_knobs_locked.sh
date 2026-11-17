@@ -52,6 +52,10 @@ probe() {
     (echo 1 >"$p") 2>/dev/null && RES="$RES write=ok" || RES="$RES write=refused"
     RES="$RES value=$(cat "$p")"
     echo 0 >"$p" 2>/dev/null || true
+    # A knob with its own ops, outside the macro (F-53): 1 ms of torn reads
+    # with nothing mounted is harmless where it is accepted.
+    (echo 1 >/sys/module/cetrafs/parameters/tail_tear_ms) 2>/dev/null && RES="$RES tear=ok" || RES="$RES tear=refused"
+    echo 0 >/sys/module/cetrafs/parameters/tail_tear_ms 2>/dev/null || true
     mount -t cetrafs "$DEV" "$MNT"
     RES="$RES props=$(sed -n 's/^test_params: //p' "$(ct_procdir "$DEV")/properties")"
     umount "$MNT"
@@ -73,9 +77,12 @@ CT_MODULE_LOADED=0
 rm -rf "$SRC"
 
 [ "$(field optload "$C")" = ok ] && [ "$(field perm "$C")" = 644 ] && [ "$(field write "$C")" = ok ] &&
+    [ "$(field tear "$C")" = ok ] &&
     [ "$(field props "$C")" = settable ] &&
     pass "control: the developer build takes the knob at load and at run time, and says settable" ||
     fail "control: the developer build does not take the knob -- the suite cannot see a lock: $C"
+[ "$(field tear "$R")" = refused ] && pass "F-53: a knob with its own ops (tail_tear_ms) is refused too" ||
+    fail "F-53: the release build took tail_tear_ms: $R"
 [ "$(field optload "$R")" = refused ] && pass "1: a release build refuses a load that names a TEST ONLY knob" ||
     fail "1: the release build loaded with $KNOB=1: $R"
 [ "$(field perm "$R")" = 444 ] && [ "$(field write "$R")" = refused ] && [ "$(field value "$R")" = N ] &&

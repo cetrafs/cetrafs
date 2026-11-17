@@ -3032,4 +3032,91 @@ JI_N="$(ji_scan "$JI_P" | grep -c 'planted.c:' || true)"
     fail "journal_info: control -- planted tree gave $JI_N finding(s), want 1"
 rm -rf "$JI_P"
 
+# F-53: a release build refuses every TEST ONLY knob, but only the
+# ones whose set goes through cetrafs_test_param_set(). Three knobs with
+# their own ops escaped the lock (1af12c2). Every parameter described
+# TEST ONLY must be declared by cetrafs_test_param(), or by
+# module_param_cb() with CETRAFS_TEST_PARAM_PERM and a .set function
+# that calls cetrafs_test_param_set().
+log "checking every TEST ONLY parameter goes through the release lock (F-53)"
+tk_scan() {
+    python3 - "$1" <<'PY'
+import re, sys, glob
+src = {f: open(f).read() for f in glob.glob(sys.argv[1] + "/*.c")}
+alls = "\n".join(src.values())
+for f, s in src.items():
+    for m in re.finditer(r'MODULE_PARM_DESC\(\s*(\w+)\s*,\s*"TEST ONLY', s):
+        n = m.group(1)
+        if re.search(r'cetrafs_test_param\(\s*%s\s*,' % n, s):
+            continue
+        cb = re.search(r'module_param_cb\(\s*%s\s*,\s*&(\w+)\s*,[^;]*CETRAFS_TEST_PARAM_PERM' % n, s)
+        ok = False
+        if cb:
+            ops = re.search(r'kernel_param_ops\s+%s\s*=\s*\{[^}]*\.set\s*=\s*(\w+)' % cb.group(1), alls)
+            if ops:
+                fn = re.search(r'\b%s\([^)]*\)\s*\{(.*?)\n\}' % ops.group(1), alls, re.S)
+                ok = bool(fn and 'cetrafs_test_param_set(' in fn.group(1))
+        if not ok:
+            print("%s: %s" % (f.split("/")[-1], n))
+PY
+}
+TK_REAL="$(tk_scan "$ROOT/kmod")"
+[ -z "$TK_REAL" ] && pass "F-53: every TEST ONLY parameter is locked in a release build" ||
+    fail "F-53: TEST ONLY parameters outside the release lock: $(echo "$TK_REAL" | tr '\n' ' ')"
+TK_P="$(ct_tmp tk-plant)"
+rm -rf "$TK_P"; mkdir -p "$TK_P"
+cat >"$TK_P/planted.c" <<'C'
+cetrafs_test_param(good_a, a, bool, 0644);
+MODULE_PARM_DESC(good_a, "TEST ONLY: locked by the macro");
+static int good_b_set(const char *val, const struct kernel_param *kp)
+{
+    return cetrafs_test_param_set(val, kp, param_set_uint);
+}
+static const struct kernel_param_ops good_b_ops = {.set = good_b_set};
+module_param_cb(good_b, &good_b_ops, &b, CETRAFS_TEST_PARAM_PERM(0644));
+MODULE_PARM_DESC(good_b, "TEST ONLY: locked through its own ops");
+static int bad_c_set(const char *val, const struct kernel_param *kp)
+{
+    return param_set_uint(val, kp);
+}
+static const struct kernel_param_ops bad_c_ops = {.set = bad_c_set};
+module_param_cb(bad_c, &bad_c_ops, &c, CETRAFS_TEST_PARAM_PERM(0644));
+MODULE_PARM_DESC(bad_c, "TEST ONLY: perm locked, set not");
+module_param_cb(bad_d, &good_b_ops, &d, 0644);
+MODULE_PARM_DESC(bad_d, "TEST ONLY: set locked, perm not");
+module_param_named(fine_e, e, uint, 0644);
+MODULE_PARM_DESC(fine_e, "a production knob");
+C
+TK_N="$(tk_scan "$TK_P" | sort | tr '\n' ' ')"
+[ "$TK_N" = "planted.c: bad_c planted.c: bad_d " ] &&
+    pass "F-53: control -- the two planted escapes are found, the locked ones and the production knob are not" ||
+    fail "F-53: control -- planted tree gave: $TK_N"
+rm -rf "$TK_P"
+
+# The other direction: a knob with its own ops and NO description escapes
+# the scan above. So every parameter outside the lock is a production
+# tunable named here; a new one fails until it is judged and listed.
+TK_PROD="alloc_run_blocks alloc_run_max_blocks auto_defrag auto_defrag_min_extents auto_defrag_min_pct
+auto_defrag_quiet_secs bg_sweep_min_secs caw_probe dio_fill_holes ext_cache hb_interval_secs lock_yield_wait_ms
+node_uuid own_claim_resweep_secs pf_drain_min_ms pf_full_backoff_ms scrub scrub_gap_secs scrub_interval_secs
+stale_secs"
+tk_unlocked() {
+    python3 - "$1" <<'PY'
+import re, sys, glob
+for f in glob.glob(sys.argv[1] + "/*.c"):
+    for m in re.finditer(r'^\s*module_param(?:_named|_cb)?\(\s*(\w+)\s*,([^;]*);', open(f).read(), re.M):
+        if 'CETRAFS_TEST_PARAM_PERM' not in m.group(2):
+            print(m.group(1))
+PY
+}
+TK_EXTRA="$(tk_unlocked "$ROOT/kmod" | grep -vxF -f <(tr ' ' '\n' <<<"$TK_PROD" | grep .) || true)"
+[ -z "$TK_EXTRA" ] && pass "F-53: every parameter outside the lock is a listed production tunable" ||
+    fail "F-53: unlocked parameters not judged production (lock them or list them): $(echo "$TK_EXTRA" | tr '\n' ' ')"
+mkdir -p "$TK_P"
+printf 'module_param_cb(sneaky_off, &x_ops, &x, 0644);\nmodule_param_named(scrub, s, bool, 0644);\nmodule_param_cb(t, &o, &v, CETRAFS_TEST_PARAM_PERM(0644));\n' >"$TK_P/planted.c"
+TK_N="$(tk_unlocked "$TK_P" | grep -vxF -f <(tr ' ' '\n' <<<"$TK_PROD" | grep .) | tr '\n' ' ' || true)"
+[ "$TK_N" = "sneaky_off " ] && pass "F-53: control -- an undescribed unlocked knob is found, a listed and a locked one are not" ||
+    fail "F-53: control -- planted tree gave: $TK_N"
+rm -rf "$TK_P"
+
 ct_exit

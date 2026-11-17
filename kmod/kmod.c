@@ -17,8 +17,8 @@
  * lease, the publish flushes, the error policy -- and a copied
  * troubleshooting recipe or a modprobe.d line was all it took (audit
  * 2026-11-15 M-30). A modprobe option for one now fails the load. */
-static int cetrafs_test_param_set(const char *val, const struct kernel_param *kp,
-                                  int (*set)(const char *, const struct kernel_param *))
+int cetrafs_test_param_set(const char *val, const struct kernel_param *kp,
+                           int (*set)(const char *, const struct kernel_param *))
 {
     int ret;
 

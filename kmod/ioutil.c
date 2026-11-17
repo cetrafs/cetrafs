@@ -2316,7 +2316,7 @@ bool cetrafs_blk_read_accepts(const struct buffer_head *bh, u32 magic)
  * image read reads torn -- a peer's write that takes that long to land. */
 static unsigned int cetrafs_tail_tear_ms;
 static unsigned long cetrafs_tail_tear_until;
-static int cetrafs_tail_tear_set(const char *val, const struct kernel_param *kp)
+static int cetrafs_tail_tear_do(const char *val, const struct kernel_param *kp)
 {
     int ret = param_set_uint(val, kp);
 
@@ -2324,8 +2324,12 @@ static int cetrafs_tail_tear_set(const char *val, const struct kernel_param *kp)
         WRITE_ONCE(cetrafs_tail_tear_until, jiffies + msecs_to_jiffies(cetrafs_tail_tear_ms));
     return ret;
 }
+static int cetrafs_tail_tear_set(const char *val, const struct kernel_param *kp)
+{
+    return cetrafs_test_param_set(val, kp, cetrafs_tail_tear_do);
+}
 static const struct kernel_param_ops cetrafs_tail_tear_ops = {.set = cetrafs_tail_tear_set, .get = param_get_uint};
-module_param_cb(tail_tear_ms, &cetrafs_tail_tear_ops, &cetrafs_tail_tear_ms, 0644);
+module_param_cb(tail_tear_ms, &cetrafs_tail_tear_ops, &cetrafs_tail_tear_ms, CETRAFS_TEST_PARAM_PERM(0644));
 MODULE_PARM_DESC(tail_tear_ms, "TEST ONLY: every tail-checksummed read reads torn for this many ms from now");
 
 bool cetrafs_tear_injected(void)
@@ -2337,7 +2341,7 @@ bool cetrafs_tear_injected(void)
  * node row, ZG record, BG descriptor (tests/kernel/record_tear_converges.sh). */
 static unsigned int cetrafs_record_tear_ms;
 static unsigned long cetrafs_record_tear_until;
-static int cetrafs_record_tear_set(const char *val, const struct kernel_param *kp)
+static int cetrafs_record_tear_do(const char *val, const struct kernel_param *kp)
 {
     int ret = param_set_uint(val, kp);
 
@@ -2345,8 +2349,12 @@ static int cetrafs_record_tear_set(const char *val, const struct kernel_param *k
         WRITE_ONCE(cetrafs_record_tear_until, jiffies + msecs_to_jiffies(cetrafs_record_tear_ms));
     return ret;
 }
+static int cetrafs_record_tear_set(const char *val, const struct kernel_param *kp)
+{
+    return cetrafs_test_param_set(val, kp, cetrafs_record_tear_do);
+}
 static const struct kernel_param_ops cetrafs_record_tear_ops = {.set = cetrafs_record_tear_set, .get = param_get_uint};
-module_param_cb(record_tear_ms, &cetrafs_record_tear_ops, &cetrafs_record_tear_ms, 0644);
+module_param_cb(record_tear_ms, &cetrafs_record_tear_ops, &cetrafs_record_tear_ms, CETRAFS_TEST_PARAM_PERM(0644));
 MODULE_PARM_DESC(record_tear_ms, "TEST ONLY: every checksummed record read reads torn for this many ms from now");
 
 /* 'what' names the reader in the log: the test's proof that its

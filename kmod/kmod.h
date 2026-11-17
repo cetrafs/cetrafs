@@ -19,6 +19,11 @@
  * later oops. tests/image/source_invariants.sh fails on a parameter
  * described as test-only and declared any other way.
  */
+/* kmod.c: the one gate every TEST ONLY knob's set goes through -- refused
+ * in a release build, warned and tainted otherwise. A knob with its own
+ * ops calls it with its own setter (audit 2026-11-15 F-53). */
+int cetrafs_test_param_set(const char *val, const struct kernel_param *kp,
+                           int (*set)(const char *, const struct kernel_param *));
 extern const struct kernel_param_ops cetrafs_test_param_ops_bool;
 extern const struct kernel_param_ops cetrafs_test_param_ops_uint;
 extern const struct kernel_param_ops cetrafs_test_param_ops_int;

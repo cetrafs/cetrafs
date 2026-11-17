@@ -640,7 +640,7 @@ MODULE_PARM_DESC(dmpath_ignore_blocked, "TEST ONLY: a blocked SCSI path ranks by
  * (tests/kernel/dmpath_blocked_path.sh). No sysfs knob does this: the
  * device's "state" file takes only running and offline.
  */
-static int cetrafs_dmpath_test_block_set(const char *val, const struct kernel_param *kp)
+static int cetrafs_dmpath_test_block_do(const char *val, const struct kernel_param *kp)
 {
     char path[48], name[32];
     bool unblock = val[0] == '-';
@@ -664,13 +664,16 @@ static int cetrafs_dmpath_test_block_set(const char *val, const struct kernel_pa
                   : scsi_internal_device_block_nowait(sdev);
     mutex_unlock(&sdev->state_mutex);
     pr_warn("dm path: TEST %s %s: %d\n", unblock ? "unblocked" : "blocked", name, ret);
-    add_taint(TAINT_USER, LOCKDEP_STILL_OK); /* as every test knob (cetrafs_test_param()) */
     scsi_device_put(sdev);
     fput(file);
     return ret;
 }
+static int cetrafs_dmpath_test_block_set(const char *val, const struct kernel_param *kp)
+{
+    return cetrafs_test_param_set(val, kp, cetrafs_dmpath_test_block_do);
+}
 static const struct kernel_param_ops cetrafs_dmpath_test_block_ops = {.set = cetrafs_dmpath_test_block_set};
-module_param_cb(dmpath_test_block, &cetrafs_dmpath_test_block_ops, NULL, 0200);
+module_param_cb(dmpath_test_block, &cetrafs_dmpath_test_block_ops, NULL, CETRAFS_TEST_PARAM_PERM(0200));
 MODULE_PARM_DESC(dmpath_test_block, "TEST ONLY: \"sdX\" blocks that SCSI device, \"-sdX\" unblocks it");
 
 static bool cetrafs_dmpath_blocked(const struct scsi_device *sdev)
