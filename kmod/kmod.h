@@ -1703,6 +1703,9 @@ void cetrafs_bh_end_update_held(struct super_block *sb, struct buffer_head *bh, 
 int cetrafs_held_flush(struct super_block *sb);
 unsigned long cetrafs_held_drop_all(struct super_block *sb);
 struct xarray *cetrafs_sb_held(struct super_block *sb);
+u64 cetrafs_held_unlisted_count(void); /* ioutil.c, F-27 */
+void cetrafs_held_unlist(struct super_block *sb, struct buffer_head *bh);
+unsigned long cetrafs_held_listed(struct super_block *sb);
 u64 cetrafs_held_flush_count(void);
 /* A held-back tree block edited since its tail was last stamped: the
  * eh_generation and magic are current, the tail CRC is not. Stamped once

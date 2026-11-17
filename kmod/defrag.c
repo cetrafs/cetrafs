@@ -1274,6 +1274,8 @@ int cetrafs_defrag_inode(struct inode *inode, struct cetrafs_defrag_stats *out_s
                     wait_on_buffer(copy_dst[i]);
                     if (!buffer_uptodate(copy_dst[i]))
                         ret = -EIO;
+                    else
+                        cetrafs_held_unlist(sb, copy_dst[i]); /* written: not pinned until the tick (F-27) */
                     brelse(copy_dst[i]);
                     copy_dst[i] = NULL;
                 }

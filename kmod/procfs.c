@@ -442,6 +442,8 @@ static int cetrafs_proc_info_show(struct seq_file *m, void *v)
     seq_printf(m, "tree_half_full: %llu\n", cetrafs_tree_half_full_count());
     seq_printf(m, "close_nospc_drops: %llu\n", cetrafs_close_nospc_drop_count());
     seq_printf(m, "held_flush_batches: %llu\n", cetrafs_held_flush_batch_count());
+    seq_printf(m, "held_unlisted: %llu\n", cetrafs_held_unlisted_count());
+    seq_printf(m, "held_listed: %lu\n", cetrafs_held_listed(sb));
     seq_printf(m, "ibmap_abandoned: %llu\n", cetrafs_ibmap_abandoned_count());
     seq_printf(m, "convert_leaf_full: %llu\n", cetrafs_convert_leaf_full_count());
     seq_printf(m, "leaf_splits: %llu\n", cetrafs_leaf_split_count());

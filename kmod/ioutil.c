@@ -483,16 +483,33 @@ static int cetrafs_held_run(struct super_block *sb, struct xarray *xa, struct bu
         if (r == -EIO && cetrafs_sb_is_fenced(sb))
             res[i] = -EIO; /* fenced before anything was sent */
         lock_buffer(bh);
-        if (!buffer_cetra_held(bh) && xa_load(xa, idx[i]) == bh) {
-            xa_erase(xa, idx[i]);
+        if (!buffer_cetra_held(bh) && xa_cmpxchg(xa, idx[i], bh, NULL, 0) == bh)
             put_bh(bh); /* the list's pin */
-        }
         unlock_buffer(bh);
         put_bh(bh);
         if (res[i] && (!ret || ret == -ENOSPC))
             ret = res[i]; /* a stop's error before a kept refusal's */
     }
     return ret;
+}
+
+/*
+ * The next listed block at or after *idx, with a reference of the
+ * caller's own, or NULL. Taken under the list's lock: a block's own write
+ * unlists it and drops the list's pin at any time (cetrafs_held_unlist()),
+ * so a walker that took its reference after reading the entry unlocked
+ * could take one on a buffer already freed.
+ */
+static struct buffer_head *cetrafs_held_next(struct xarray *xa, unsigned long *idx)
+{
+    struct buffer_head *bh;
+
+    xa_lock(xa);
+    bh = xa_find(xa, idx, ULONG_MAX, XA_PRESENT);
+    if (bh)
+        get_bh(bh);
+    xa_unlock(xa);
+    return bh;
 }
 
 /*
@@ -531,8 +548,7 @@ int cetrafs_held_flush(struct super_block *sb)
         res = &one_res;
         cap = 1;
     }
-    xa_for_each(xa, idx, bh) {
-        get_bh(bh);
+    for (idx = 0; (bh = cetrafs_held_next(xa, &idx)) != NULL; idx++) {
         bhs[n] = bh;
         idxs[n] = idx;
         if (++n < cap)
@@ -571,16 +587,19 @@ unsigned long cetrafs_held_drop_all(struct super_block *sb)
 
     if (!xa)
         return 0;
-    xa_for_each(xa, idx, bh) {
+    /* No idx++: an entry this pass did not remove (another buffer for
+     * the block listed meanwhile) is found again at the same index. */
+    for (idx = 0; (bh = cetrafs_held_next(xa, &idx)) != NULL;) {
         lock_buffer(bh);
         if (test_clear_buffer_cetra_held(bh)) {
             dropped++;
             if (!buffer_dirty(bh))
                 clear_buffer_uptodate(bh);
         }
+        if (xa_cmpxchg(xa, idx, bh, NULL, 0) == bh)
+            put_bh(bh); /* the list's pin */
         unlock_buffer(bh);
-        xa_erase(xa, idx);
-        put_bh(bh);
+        put_bh(bh); /* ours */
     }
     return dropped;
 }
@@ -964,6 +983,58 @@ const char *cetrafs_block_role(struct super_block *sb, u64 lba)
 #undef CETRAFS_IN
 }
 
+/*
+ * A held block its caller's own write has just put on the device: off the
+ * list, its pin dropped, now rather than at the next held flush (audit
+ * 2026-11-15 F-27). Every in-place metadata update is held, defrag's
+ * copied data blocks among them, and only the tick's flush unlisted: a
+ * node writing fast pinned what it wrote over a whole heartbeat interval
+ * or more, unreclaimable, and the flush then walked all of it.
+ * Only while it is still not held: an update since the write holds it
+ * again, and that one is the flush's. Under the buffer lock, as the flush
+ * unlists (cetrafs_held_run()); a TRY: a buffer someone holds locked
+ * stays listed, and the flush unlists it -- never a wait here.
+ */
+static bool cetrafs_held_unlist_off; /* TEST ONLY: see the parameter */
+cetrafs_test_param(held_unlist_off, cetrafs_held_unlist_off, bool, 0644);
+MODULE_PARM_DESC(held_unlist_off, "TEST ONLY: a written held block stays listed until the held flush, as before F-27");
+
+static atomic64_t cetrafs_held_unlisted = ATOMIC64_INIT(0);
+
+u64 cetrafs_held_unlisted_count(void)
+{
+    return (u64) atomic64_read(&cetrafs_held_unlisted);
+}
+
+/* How many blocks the held list pins now (procfs; a test's measure). */
+unsigned long cetrafs_held_listed(struct super_block *sb)
+{
+    struct xarray *xa = cetrafs_sb_held(sb);
+    struct buffer_head *bh;
+    unsigned long idx, n = 0;
+
+    if (!xa)
+        return 0;
+    xa_for_each(xa, idx, bh)
+        n++;
+    return n;
+}
+
+void cetrafs_held_unlist(struct super_block *sb, struct buffer_head *bh)
+{
+    struct xarray *xa = cetrafs_sb_held(sb);
+
+    if (!xa || READ_ONCE(cetrafs_held_unlist_off) || xa_load(xa, bh->b_blocknr) != bh)
+        return;
+    if (!trylock_buffer(bh))
+        return;
+    if (!buffer_cetra_held(bh) && xa_cmpxchg(xa, bh->b_blocknr, bh, NULL, 0) == bh) {
+        put_bh(bh); /* the list's pin */
+        atomic64_inc(&cetrafs_held_unlisted);
+    }
+    unlock_buffer(bh);
+}
+
 static int cetrafs_meta_write_result(struct super_block *sb, struct buffer_head *bh, int ret)
 {
     if (ret == -ESHUTDOWN)
@@ -972,6 +1043,8 @@ static int cetrafs_meta_write_result(struct super_block *sb, struct buffer_head 
         cetrafs_meta_write_fail--;
         ret = -EIO;
     }
+    if (!ret)
+        cetrafs_held_unlist(sb, bh);
     /* Stop, whatever the cause: a buffer write reports only that it did
      * not complete, never whether anything landed, so "refused, nothing
      * written" cannot be told from a torn write here (O3; ERRORS.md). */
@@ -2059,7 +2132,14 @@ void cetrafs_forget_block(struct super_block *sb, sector_t block)
 
     lock_buffer(bh);
     clear_buffer_dirty(bh);
-    clear_buffer_cetra_held(bh); /* unlisted by the next held flush or drop */
+    clear_buffer_cetra_held(bh);
+    {
+        struct xarray *xa = cetrafs_sb_held(sb);
+
+        /* Forgotten: off the list and unpinned now (F-27). */
+        if (xa && !READ_ONCE(cetrafs_held_unlist_off) && xa_cmpxchg(xa, block, bh, NULL, 0) == bh)
+            put_bh(bh);
+    }
     clear_buffer_uptodate(bh);
     /* The caller has handled the write that failed: a BH_Write_EIO left
      * behind is reported again by the next sync of this block -- the
