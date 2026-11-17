@@ -49,11 +49,61 @@ static void diex(const char *m)
     perror(m);
     exit(FSCK_EXIT_NOEXAM);
 }
+/*
+ * A live walk reads the DEVICE, never this host's page cache (audit
+ * F-54): --live counts a problem only if every walk repeats it, and a
+ * page the cache kept -- one DONTNEED and BLKFLSBUF both leave, such as a
+ * page someone has mapped -- repeats in every walk. So its reads go
+ * through a second, O_DIRECT descriptor, bounced through an aligned
+ * buffer (the callers' buffers and offsets are not aligned for it).
+ */
+static int live_main_fd = -1, live_direct_fd = -1;
+
+static void pread_direct(void *buf, size_t len, off_t off)
+{
+    static uint8_t *bounce;
+    static size_t cap;
+    off_t a = off & ~(off_t) (CETRAFS_BLOCK_SIZE - 1);
+    size_t span = (size_t) (off - a) + len, done = 0;
+
+    span = (span + CETRAFS_BLOCK_SIZE - 1) & ~(size_t) (CETRAFS_BLOCK_SIZE - 1);
+    if (span > cap) {
+        free(bounce);
+        bounce = NULL;
+        if (posix_memalign((void **) &bounce, CETRAFS_BLOCK_SIZE, span)) {
+            fprintf(stderr, "cetrafs fsck: out of memory\n");
+            exit(FSCK_EXIT_NOEXAM);
+        }
+        cap = span;
+    }
+    while (done < span) {
+        ssize_t r = pread(live_direct_fd, bounce + done, span - done, a + (off_t) done);
+
+        if (r < 0 && errno == EINTR)
+            continue;
+        if (r < 0)
+            diex("pread (direct)");
+        if (r == 0)
+            break; /* the device ends inside the last block: the caller's range is checked below */
+        done += (size_t) r;
+    }
+    if (done < (size_t) (off - a) + len) {
+        fprintf(stderr, "pread: unexpected end of device at offset %lld\n", (long long) off);
+        exit(FSCK_EXIT_NOEXAM);
+    }
+    memcpy(buf, bounce + (off - a), len);
+}
+
 /* Short reads are continued and EINTR retried, as growfs does; a read
  * that makes no progress is an EOF, not something to spin on. */
 static void pread_all(int fd, void *buf, size_t len, off_t off)
 {
     uint8_t *p = buf;
+
+    if (fd == live_main_fd && live_direct_fd >= 0 && len) {
+        pread_direct(buf, len, off);
+        return;
+    }
     while (len) {
         ssize_t r = pread(fd, p, len, off);
         if (r < 0 && errno == EINTR)
@@ -2643,6 +2693,18 @@ int main(int argc, char **argv)
     }
 
     int fd = open(dev, (repair_mode ? O_RDWR : O_RDONLY) | O_CLOEXEC);
+
+    /* A live walk reads past the cache (F-54). Test knob only: the
+     * buffered reads, as before (fsck_live_reads_device.sh's control). */
+    if (fd >= 0 && live_pass && !cetrafs_test_env("CETRAFS_TEST_FSCK_LIVE_BUFFERED")) {
+        live_direct_fd = open(dev, O_RDONLY | O_DIRECT | O_CLOEXEC);
+        if (live_direct_fd < 0) {
+            fprintf(stderr, "ERR: %s: cannot open it for direct reads (%s) -- a live check that might read "
+                            "this host's cache gives no verdict\n", dev, strerror(errno));
+            return FSCK_EXIT_NOEXAM;
+        }
+        live_main_fd = fd;
+    }
     if (fd < 0) {
         perror("open");
         return FSCK_EXIT_NOEXAM;
@@ -2661,7 +2723,21 @@ int main(int argc, char **argv)
      * verdict about the volume as it was, and a repair applied to that
      * (audit 2026-11-11 F7, tests/image/fsck_reads_device.sh). The
      * probe drops it again whenever it waited, so a cache filled while
-     * we watched is gone too. */
+     * we watched is gone too.
+     *
+     * DONTNEED is advice: a page it cannot drop at that instant stays
+     * (cetrafs_registry_drop_cache()). A live walk skips the probe, its
+     * other drop, so a block read torn by walk 1 was read the same by
+     * walks 2 and 3 and repeated as damage (audit F-54). BLKFLSBUF drops
+     * the whole cache, every CPU's LRU drained first. Neither drops a
+     * page someone has mapped: a live walk reads O_DIRECT besides
+     * (pread_direct()). */
+    {
+        struct stat dst;
+
+        if (fstat(fd, &dst) == 0 && S_ISBLK(dst.st_mode))
+            (void) ioctl(fd, BLKFLSBUF, 0);
+    }
     (void) posix_fadvise(fd, 0, 0, POSIX_FADV_DONTNEED);
 
     /* SB */
