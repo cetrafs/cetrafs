@@ -13,7 +13,12 @@
 # A fragmented file is held open and appended to, one block every 20 ms
 # for 8 s, with steps slowed so each pass outlives an append:
 #   1. some pass was cancelled by the growth (setup);
-#   2. no more than 4 passes ran in those 8 s;
+#   2. no more than 4 passes ran in those 8 s, counted by the writer
+#      itself before its last close (whose hand-back queues more): the
+#      filler's one decline (the counter is the mount's, not the
+#      file's), the pass the growth cancelled, at most one re-armed by
+#      an append while that pass ran, and then nothing -- the cancel
+#      quieted the trigger;
 #   3. after the writer closes, the file is defragmented (the hand-back
 #      still happens).
 #
@@ -47,7 +52,7 @@ blk = b"g" * 4096
 n = 0
 # The filler takes four extents per block of the file, so it is past the
 # mover's extent cap (lowered below) from the start and stays past it:
-# the janitor declines it once and the passes counted are the file's.
+# the janitor declines it once (that decline is one of the passes counted).
 def fill(n):
     for k in range(4):
         os.pwrite(b, blk, (8 * n + 2 * k) * 4096)
@@ -60,7 +65,9 @@ while time.time() < t:
     os.pwrite(a, blk, n * 4096); fill(n); n += 1
     os.fsync(a); os.fsync(b)
     time.sleep(0.02)
-print(n, flush=True)
+# The passes so far, read BEFORE the closes below hand both files back.
+passes = [l.split()[1] for l in open(sys.argv[3]) if l.startswith("defrag_passes:")][0]
+print(passes, flush=True)
 sys.stdout.flush()
 os.close(a)
 PY
@@ -77,8 +84,7 @@ probe() {
     echo 100 >$P/defrag_step_delay_ms
     p0="$(sed -n 's/^defrag_passes: //p' "$pd/info")"
     g0="$(sed -n 's/^defrag_growth_cancels: //p' "$pd/info")"
-    python3 "$WRITER" "$MNT/f" $P/auto_defrag >/dev/null
-    p1="$(sed -n 's/^defrag_passes: //p' "$pd/info")"
+    p1="$(python3 "$WRITER" "$MNT/f" $P/auto_defrag "$pd/info")"
     g1="$(sed -n 's/^defrag_growth_cancels: //p' "$pd/info")"
     echo 0 >$P/defrag_step_delay_ms
     # The writer's last close hands the file back: wait for the move.
