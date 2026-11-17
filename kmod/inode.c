@@ -1592,7 +1592,27 @@ static unsigned long long cetrafs_record_publish_stall_ino;
 cetrafs_test_param(record_publish_stall_ino, cetrafs_record_publish_stall_ino, ullong, 0644);
 MODULE_PARM_DESC(record_publish_stall_ino, "TEST ONLY: the inode record_publish_stall_ms applies to (0: any)");
 
-static int __cetrafs_write_raw_inode(struct super_block *sb, u64 ino, const cetrafs_inode_t *in, bool sync)
+/* A refused new record: see cetrafs_write_raw_inode_new(). */
+static atomic64_t cetrafs_record_op_refusals = ATOMIC64_INIT(0);
+
+u64 cetrafs_record_op_refusal_count(void)
+{
+    return (u64) atomic64_read(&cetrafs_record_op_refusals);
+}
+/* TEST ONLY: a refused new record stops the mount, as before A-4
+ * (tests/kernel/record_nospc_create.sh's control). */
+static bool cetrafs_new_record_refusal_stops;
+cetrafs_test_param(new_record_refusal_stops, cetrafs_new_record_refusal_stops, bool, 0644);
+MODULE_PARM_DESC(new_record_refusal_stops, "TEST ONLY: a refused new record write stops the mount, as before");
+/* TEST ONLY: the next N new records are refused for space -- by the
+ * device write itself, aimed at the record's own block
+ * (cetrafs_test_nospc_once()), so the path under test is the real one. */
+static unsigned int cetrafs_new_record_nospc;
+cetrafs_test_param(new_record_nospc, cetrafs_new_record_nospc, uint, 0644);
+MODULE_PARM_DESC(new_record_nospc, "TEST ONLY: the next N new inode records are refused for space");
+
+static int __cetrafs_write_raw_inode(struct super_block *sb, u64 ino, const cetrafs_inode_t *in, bool sync,
+                                     bool refusable)
 {
     if (S_ISDIR(cetrafs_le32(in->mode)))
         ctrace("DRECW ino=%llu size=%llu eh=%u depth=%u from=%pS\n", (unsigned long long) ino,
@@ -1702,7 +1722,25 @@ static int __cetrafs_write_raw_inode(struct super_block *sb, u64 ino, const cetr
          * dirent naming it, or a directory that had just grown keep a
          * name in a block its record never mapped: reported created,
          * gone after a remount (tests/kernel/record_write_error.sh). */
-        ret = cetrafs_sync_buffer(sb, bh);
+        if (refusable && READ_ONCE(cetrafs_new_record_nospc)) {
+            /* test-only: the thin pool is full for this record's write */
+            WRITE_ONCE(cetrafs_new_record_nospc, cetrafs_new_record_nospc - 1);
+            cetrafs_test_nospc_once(bh->b_blocknr);
+        }
+        ret = refusable && !READ_ONCE(cetrafs_new_record_refusal_stops) ? cetrafs_sync_buffer_op_refusable(sb, bh)
+                                                                          : cetrafs_sync_buffer(sb, bh);
+        if (refusable && cetrafs_refusal_definite(ret)) {
+            /* Refused before anything landed: the device still holds the
+             * number's birth claim, and the cached image is forgotten so
+             * the caller's free reads that, not this (A-4). */
+            cetrafs_forget_block(sb, bh->b_blocknr);
+            cetrafs_rec_epoch_bump(sb, bh->b_blocknr);
+            atomic64_inc(&cetrafs_record_op_refusals);
+            pr_warn_ratelimited("%s: the device refused the new record of inode %llu (%d, no space) -- the create "
+                                "fails with ENOSPC; the mount runs on\n",
+                                sb->s_id, (unsigned long long) ino, ret);
+            ret = -ENOSPC;
+        }
     }
     brelse(bh);
 
@@ -1722,7 +1760,20 @@ static int __cetrafs_write_raw_inode(struct super_block *sb, u64 ino, const cetr
  */
 int cetrafs_write_raw_inode(struct super_block *sb, u64 ino, const cetrafs_inode_t *in, bool sync)
 {
-    return __cetrafs_write_raw_inode(sb, ino, in, sync);
+    return __cetrafs_write_raw_inode(sb, ino, in, sync, false);
+}
+
+/*
+ * The first whole-record write of a number just allocated (create, mkdir,
+ * symlink): synchronous, and the device's DEFINITE refusal -- a thin pool
+ * out of space, a snapshot's copy-on-write refused -- fails the create
+ * with ENOSPC instead of stopping the mount. Nothing names the record
+ * yet (the dirent comes after, rule 8), so its caller's free of the
+ * number is the whole undo (audit 2026-11-14 A-4).
+ */
+int cetrafs_write_raw_inode_new(struct super_block *sb, u64 ino, const cetrafs_inode_t *in)
+{
+    return __cetrafs_write_raw_inode(sb, ino, in, true, true);
 }
 
 /*
@@ -1747,7 +1798,7 @@ int cetrafs_write_raw_inode_self(struct inode *self, const cetrafs_inode_t *in, 
 
     if (locked)
         cetrafs_inode_fd_pub_lock(self);
-    ret = __cetrafs_write_raw_inode(self->i_sb, self->i_ino, in, sync);
+    ret = __cetrafs_write_raw_inode(self->i_sb, self->i_ino, in, sync, false);
     if (locked)
         cetrafs_inode_fd_pub_unlock(self);
     return ret;

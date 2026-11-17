@@ -619,10 +619,25 @@ MODULE_PARM_DESC(meta_write_nospc, "TEST ONLY: the next N synchronous metadata w
 static unsigned long long cetrafs_meta_write_nospc_block;
 cetrafs_test_param(meta_write_nospc_block, cetrafs_meta_write_nospc_block, ullong, 0644);
 
+/* TEST ONLY, set by a caller's own test knob: the next synchronous write
+ * of this one block answers BLK_STS_NOSPC unsent, once. */
+static sector_t cetrafs_nospc_once_block = (sector_t) -1;
+
+void cetrafs_test_nospc_once(sector_t block)
+{
+    WRITE_ONCE(cetrafs_nospc_once_block, block);
+}
+
 static int cetrafs_write_locked_bh(struct buffer_head *bh)
 {
     struct bio *bio;
     int ret;
+
+    if (unlikely(READ_ONCE(cetrafs_nospc_once_block) == bh->b_blocknr)) {
+        WRITE_ONCE(cetrafs_nospc_once_block, (sector_t) -1);
+        ret = -ENOSPC; /* test-only: see cetrafs_test_nospc_once() */
+        goto done;
+    }
 
     if (READ_ONCE(cetrafs_meta_write_nospc_block) && bh->b_blocknr == READ_ONCE(cetrafs_meta_write_nospc_block)) {
         ret = -ENOSPC; /* test-only: see the parameter */

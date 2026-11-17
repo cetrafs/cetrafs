@@ -897,6 +897,9 @@ bool cetrafs_walk_zero_owns_nothing_test(void);
 int cetrafs_read_raw_inode_walk(struct super_block *sb, u64 ino, cetrafs_inode_t *out);
 int cetrafs_read_raw_inode(struct super_block *sb, u64 ino, cetrafs_inode_t *out);
 int cetrafs_write_raw_inode(struct super_block *sb, u64 ino, const cetrafs_inode_t *in, bool sync);
+int cetrafs_write_raw_inode_new(struct super_block *sb, u64 ino, const cetrafs_inode_t *in);
+void cetrafs_test_nospc_once(sector_t block); /* ioutil.c, TEST ONLY */
+u64 cetrafs_record_op_refusal_count(void);
 int cetrafs_write_raw_inode_self(struct inode *self, const cetrafs_inode_t *in, bool sync); /* inode.c: holds fd_pub */
 void cetrafs_invalidate_raw_inode(struct super_block *sb, u64 ino);
 /*

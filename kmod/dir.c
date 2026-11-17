@@ -2198,7 +2198,7 @@ static int cetrafs_create_locked(struct mnt_idmap *idmap,
      * block itself, since a peer could have allocated an adjacent inode
      * number landing in the same shared block moments ago. */
     cetrafs_invalidate_raw_inode(sb, ino);
-    ret = cetrafs_write_raw_inode(sb, ino, &raw, /*sync=*/true);
+    ret = cetrafs_write_raw_inode_new(sb, ino, &raw);
     if (ret) {
         cetrafs_free_inode(sb, ino);
         return ret;
@@ -2983,7 +2983,7 @@ static struct dentry *cetrafs_mkdir_locked(struct mnt_idmap *idmap,
     /* See inode.c's cetrafs_write_raw_inode() comment and cetrafs_
      * create_locked() above -- same freshly-allocated-inode race. */
     cetrafs_invalidate_raw_inode(sb, ino);
-    ret = cetrafs_write_raw_inode(sb, ino, &raw, /*sync=*/true);
+    ret = cetrafs_write_raw_inode_new(sb, ino, &raw);
     if (ret) {
         cetrafs_free_data_block(sb, lba);
         cetrafs_free_inode(sb, ino);
@@ -4505,7 +4505,7 @@ static int cetrafs_symlink_locked(struct mnt_idmap *idmap,
     /* See inode.c's cetrafs_write_raw_inode() comment and cetrafs_
      * create_locked() above -- same freshly-allocated-inode race. */
     cetrafs_invalidate_raw_inode(sb, ino);
-    ret = cetrafs_write_raw_inode(sb, ino, &raw, /*sync=*/true);
+    ret = cetrafs_write_raw_inode_new(sb, ino, &raw);
     if (ret) {
         cetrafs_free_inode(sb, ino);
         return ret;
