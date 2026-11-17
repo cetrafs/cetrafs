@@ -20,6 +20,12 @@
 #   1. 35 s into the flight Zone Group 1 is still ours;
 #   2. after the flight it is released; fsck clean.
 #
+# The per-Block-Group release is off (bg_release_off): since the UNMAP
+# hand-back it runs first on every tick and takes the emptied member
+# itself -- refused while the count write is in flight, since its swap
+# wants the device's count full -- so the Zone Group release this suite
+# is about never got to look, and the control could not fail.
+#
 # DISCRIMINATION: release_delta_guard_off=1: the release goes ahead with
 # the write still in flight.
 # ct-timeout: 400
@@ -27,7 +33,7 @@ set -euo pipefail
 . "$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)/lib/harness.sh"
 require_root
 require_module
-for k in bg_flush_stall_ms release_delta_guard_off; do
+for k in bg_flush_stall_ms release_delta_guard_off bg_release_off; do
     [ -w "/sys/module/cetrafs/parameters/$k" ] || { skip "$k is missing"; ct_exit; }
 done
 BG_POKE="$(ct_helper bg_poke)"
@@ -35,6 +41,7 @@ MNT="$(ct_mnt zgheld)"
 ct_track mnt "$MNT"
 ct_param_set bg_flush_stall_ms 0
 ct_param_set release_delta_guard_off 0
+ct_param_set bg_release_off 1
 
 # <guard_off 0|1> -> "<owner 35 s into the flight> <owner after it> <fsck>"
 round() {
