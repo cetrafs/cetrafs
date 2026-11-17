@@ -1723,6 +1723,7 @@ int cetrafs_held_flush_nowait(struct super_block *sb);
 unsigned long cetrafs_held_drop_all(struct super_block *sb);
 struct xarray *cetrafs_sb_held(struct super_block *sb);
 u64 cetrafs_held_unlisted_count(void); /* ioutil.c, F-27 */
+u64 cetrafs_keep_lock_deferred_count(void); /* ioutil.c */
 void cetrafs_held_unlist(struct super_block *sb, struct buffer_head *bh);
 unsigned long cetrafs_held_listed(struct super_block *sb);
 u64 cetrafs_held_flush_count(void);

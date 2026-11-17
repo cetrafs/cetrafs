@@ -700,6 +700,13 @@ int cetrafs_journal_sweep_own_claims(struct super_block *sb, u32 my_node_id)
 static unsigned int cetrafs_journal_slots_max;
 cetrafs_test_param(journal_slots_max, cetrafs_journal_slots_max, uint, 0644);
 MODULE_PARM_DESC(journal_slots_max, "TEST ONLY: cap the journal slots a mount made while set uses");
+/* TEST ONLY, one-shot: a pause after an entry's payload and header are
+ * listed held and before they are written, the target block locked
+ * throughout (tests/kernel/held_flush_lock_order.sh). */
+static unsigned int cetrafs_journal_entry_stall_ms;
+cetrafs_test_param(journal_entry_stall_ms, cetrafs_journal_entry_stall_ms, uint, 0644);
+MODULE_PARM_DESC(journal_entry_stall_ms, "TEST ONLY: one-shot pause before a journal entry's write, its target locked");
+
 static unsigned int cetrafs_journal_target_stall_ms;
 cetrafs_test_param(journal_target_stall_ms, cetrafs_journal_target_stall_ms, uint, 0644);
 MODULE_PARM_DESC(journal_target_stall_ms, "TEST ONLY: pause a journaled write between its entry and its target write");
@@ -1302,6 +1309,8 @@ static int cetrafs_journal_write_block_flags(struct super_block *sb, struct buff
             struct buffer_head *pair[2] = {pbh, hbh};
 
             (void) plug;
+            if (READ_ONCE(cetrafs_journal_entry_stall_ms))
+                msleep(xchg(&cetrafs_journal_entry_stall_ms, 0)); /* test-only; see the parameter */
             cetrafs_write_bhs_status(sb, pair, 2, est);
             ok = !est[0] && !est[1] && !cetrafs_journal_fail_entry_write;
             brelse(pbh);

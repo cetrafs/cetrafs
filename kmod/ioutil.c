@@ -1663,16 +1663,40 @@ int cetrafs_sync_buffers_keep(struct super_block *sb, struct buffer_head **bhs, 
     return __cetrafs_sync_buffers_keep(sb, bhs, n, res, false);
 }
 
+/* TEST ONLY: a batch waits for each buffer lock in turn, holding the ones
+ * before it -- the order that deadlocked (tests/kernel/held_flush_lock_order.sh). */
+static bool cetrafs_keep_lock_inorder;
+cetrafs_test_param(keep_lock_inorder, cetrafs_keep_lock_inorder, bool, 0644);
+MODULE_PARM_DESC(keep_lock_inorder, "TEST ONLY: a flush batch waits for each buffer lock holding the earlier ones");
+
+/* A batch's buffer that someone else held locked, written after the rest
+ * of the batch was released (see below). */
+static atomic64_t cetrafs_keep_lock_deferred = ATOMIC64_INIT(0);
+
+u64 cetrafs_keep_lock_deferred_count(void)
+{
+    return (u64) atomic64_read(&cetrafs_keep_lock_deferred);
+}
+
 /* 'trylock': a block someone holds locked is skipped, still held -- the
  * heartbeat's flush, which must never wait out a writer that is itself
  * waiting for a full pool to have space (A-4): its owner writes it, and
- * a refused one stays held for the next flush. */
+ * a refused one stays held for the next flush.
+ *
+ * Without it, a batch still never WAITS for a buffer lock while it holds
+ * another: each is locked as it is sent and stays locked until the whole
+ * batch completes, and the held list is walked in block order, so the
+ * flush held journal blocks (the area sits below the data) while it
+ * waited for a directory block whose writer held that block and waited
+ * for those same journal blocks -- sync and a rename, both in D for good
+ * (KASAN churn run, 2026-11-17). A buffer the batch cannot take at once
+ * is written after the batch has unlocked everything, on its own. */
 static int __cetrafs_sync_buffers_keep(struct super_block *sb, struct buffer_head **bhs, unsigned int n, int *res,
                                        bool trylock)
 {
     struct cetrafs_keep_io {
         struct cetrafs_keep_bio b;
-        int state; /* 1 sent, 0 nothing to write, < 0 an earlier failure found */
+        int state; /* 1 sent, 0 nothing to write, 2 locked by someone: after the batch, < 0 an earlier failure found */
         bool was_dirty, was_held;
     } *io, one;
     DECLARE_COMPLETION_ONSTACK(all);
@@ -1707,13 +1731,17 @@ static int __cetrafs_sync_buffers_keep(struct super_block *sb, struct buffer_hea
         io[i].b.all = &all;
         io[i].b.left = &left;
         io[i].b.status = 0;
-        if (trylock) {
+        if (trylock || (n > 1 && !READ_ONCE(cetrafs_keep_lock_inorder))) {
             if (!trylock_buffer(bh)) {
-                io[i].state = 0; /* someone is writing it: left as it is */
+                /* the heartbeat leaves it to whoever holds it; any other
+                 * flush writes it once this batch holds nothing */
+                io[i].state = trylock ? 0 : 2;
+                if (!trylock)
+                    atomic64_inc(&cetrafs_keep_lock_deferred);
                 continue;
             }
         } else {
-            lock_buffer(bh); /* also waits out a writeback already in flight */
+            lock_buffer(bh); /* also waits out a writeback already in flight; alone, or test-only */
         }
         if (cetrafs_meta_gate_shut(sb)) {
             unlock_buffer(bh);
@@ -1767,6 +1795,8 @@ static int __cetrafs_sync_buffers_keep(struct super_block *sb, struct buffer_hea
         bool kept = false;
 
         r = io[i].state;
+        if (r == 2)
+            continue; /* below, once nothing is locked */
         if (r == 1) {
             /* still locked: the verdict is applied before anyone else
              * can look at the buffer */
@@ -1786,6 +1816,13 @@ static int __cetrafs_sync_buffers_keep(struct super_block *sb, struct buffer_hea
         res[i] = kept ? r : cetrafs_meta_write_result(sb, bh, r);
         if (res[i] && (!ret || ret == -ENOSPC))
             ret = res[i]; /* a stop's error before a kept refusal's */
+    }
+    for (i = 0; i < n; i++) {
+        if (io[i].state != 2)
+            continue;
+        r = __cetrafs_sync_buffers_keep(sb, &bhs[i], 1, &res[i], false);
+        if (r && (!ret || ret == -ENOSPC))
+            ret = r;
     }
     if (io != &one)
         kfree(io);
