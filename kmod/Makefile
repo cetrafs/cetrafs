@@ -79,6 +79,14 @@ UBSAN_SANITIZE := n
 ccflags-y += -Wno-unknown-warning-option -Wno-microsoft-anon-tag -Wno-address-of-packed-member
 endif
 
+# Test knobs (cetrafs_test_param(), kmod.h): settable in a developer
+# build, which the suites and ctest need; refused in a release build --
+# the DKMS and Debian packages build with CETRAFS_RELEASE=1 (audit
+# 2026-11-15 M-30).
+ifeq ($(CETRAFS_RELEASE),)
+ccflags-y += -DCETRAFS_TESTING
+endif
+
 # Trace instrumentation (see kmod.h's ctrace): OFF unless asked for.
 #   make mod CETRAFS_TRACE=1
 ifneq ($(CETRAFS_TRACE),)

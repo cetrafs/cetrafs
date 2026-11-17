@@ -33,7 +33,10 @@ DEST_MODULE_LOCATION[0]="/kernel/fs/cetrafs"
 # CETRAFS_NO_WERROR: a packaged build must not fail on a warning the next
 # compiler adds -- a kernel or compiler update then leaves the node with no
 # module. Developer builds keep -Werror (audit 2026-11-14 O7).
-MAKE[0]="make -C kmod KDIR=/lib/modules/${kernelver}/build CETRAFS_NO_WERROR=1 mod"
+# CETRAFS_RELEASE: the TEST ONLY knobs are read-only and refuse every
+# set, so no option or recipe can bend a safety check (audit 2026-11-15
+# M-30).
+MAKE[0]="make -C kmod KDIR=/lib/modules/${kernelver}/build CETRAFS_NO_WERROR=1 CETRAFS_RELEASE=1 mod"
 CLEAN="make -C kmod KDIR=/lib/modules/${kernelver}/build clean"
 
 # Rebuild automatically whenever a new kernel is installed.

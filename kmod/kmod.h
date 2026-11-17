@@ -23,9 +23,16 @@ extern const struct kernel_param_ops cetrafs_test_param_ops_bool;
 extern const struct kernel_param_ops cetrafs_test_param_ops_uint;
 extern const struct kernel_param_ops cetrafs_test_param_ops_int;
 extern const struct kernel_param_ops cetrafs_test_param_ops_ullong;
+/* A release build (no CETRAFS_TESTING) shows each knob read-only and
+ * refuses every set (kmod.c, M-30). */
+#ifdef CETRAFS_TESTING
+#define CETRAFS_TEST_PARAM_PERM(perm) (perm)
+#else
+#define CETRAFS_TEST_PARAM_PERM(perm) 0444
+#endif
 #define cetrafs_test_param(name, value, type, perm)                                                            \
     param_check_##type(name, &(value));                                                                        \
-    module_param_cb(name, &cetrafs_test_param_ops_##type, &(value), perm);                                     \
+    module_param_cb(name, &cetrafs_test_param_ops_##type, &(value), CETRAFS_TEST_PARAM_PERM(perm));            \
     __MODULE_PARM_TYPE(name, #type)
 
 /*

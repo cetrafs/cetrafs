@@ -572,6 +572,13 @@ static int cetrafs_proc_properties_show(struct seq_file *m, void *v)
      * from. arm64 can be built at 16K or 64K; everything here has been
      * exercised at 4K. */
     seq_printf(m, "kernel_page_size: %lu\n", PAGE_SIZE);
+    /* settable: a developer build, whose TEST ONLY knobs can bend safety
+     * checks; locked: a release build, which refuses them (M-30). */
+#ifdef CETRAFS_TESTING
+    seq_puts(m, "test_params: settable\n");
+#else
+    seq_puts(m, "test_params: locked\n");
+#endif
     seq_printf(m, "blocks_per_page: %lu\n", PAGE_SIZE / CETRAFS_BLOCK_SIZE);
     seq_printf(m, "cluster_id (reserved): %u\n", le32_to_cpu(raw_sb->cluster_id));
     seq_printf(m, "features_compat: 0x%llx\n", (unsigned long long) le64_to_cpu(raw_sb->features_compat));

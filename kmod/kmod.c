@@ -8,11 +8,25 @@
 
 #include "kmod.h"
 
-/* The ops behind cetrafs_test_param() (kmod.h). */
+/* The ops behind cetrafs_test_param() (kmod.h).
+ *
+ * A release build (make CETRAFS_RELEASE=1: the DKMS and Debian packages)
+ * refuses every set, at load as at run time: each knob reads its safe
+ * default and nothing can bend it. They were root-writable in every
+ * build -- skip the single-mounter gate on a no-CAW LUN, switch off the
+ * lease, the publish flushes, the error policy -- and a copied
+ * troubleshooting recipe or a modprobe.d line was all it took (audit
+ * 2026-11-15 M-30). A modprobe option for one now fails the load. */
 static int cetrafs_test_param_set(const char *val, const struct kernel_param *kp,
                                   int (*set)(const char *, const struct kernel_param *))
 {
-    int ret = set(val, kp);
+    int ret;
+
+#ifndef CETRAFS_TESTING
+    pr_err("cetrafs: TEST ONLY parameter %s cannot be set: this is a release build\n", kp->name);
+    return -EPERM;
+#endif
+    ret = set(val, kp);
 
     if (!ret) {
         pr_warn("cetrafs: TEST ONLY parameter %s set to '%.*s' -- it bends a safety check; not for production\n",
