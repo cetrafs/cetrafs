@@ -71,7 +71,7 @@ ct_fsck "$DEV" >/dev/null 2>&1 &&
     fail "the freshly-made image is already reported corrupt: $(ct_fsck "$DEV" 2>&1 | grep -i err | head -2)"
 
 log "the structures fsck checksums"
-expect_caught "superblock"            "SB CRC mismatch"                  sb
+expect_caught "superblock"            "block 0 fails its checksum"       sb
 expect_caught "zone group, hot half"  "ZG[0-9]+ hot-sector CRC mismatch"  zg-hot 0
 expect_caught "zone group, cold half" "ZG[0-9]+ cold-region CRC mismatch" zg-cold 0
 expect_caught "block group descriptor" "BG[0-9]+ descriptor CRC mismatch" bg-desc 0

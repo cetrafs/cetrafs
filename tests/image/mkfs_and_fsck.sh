@@ -30,12 +30,16 @@ log "checking BG descriptor/header checksums catch corruption"
 CORRUPT_IMG="$(mktemp /tmp/cetrafs-corrupt-XXXXXX.img)"
 truncate -s 560M "$CORRUPT_IMG"
 CORRUPT_LOOPDEV="$(losetup --find --show "$CORRUPT_IMG")"
-"$ROOT/userspace/mkfs.cetra" "$CORRUPT_LOOPDEV" -z 1 -b 512 -J 0 -N 1024 -f >/dev/null
+MKFS_OUT="$("$ROOT/userspace/mkfs.cetra" "$CORRUPT_LOOPDEV" -z 1 -b 512 -J 0 -N 1024 -f)"
 
-# BG table is at LBA 2 for this exact geometry (1 ZG, 1 BG) -- flip a byte
-# well inside the BG descriptor's pad[] region (never inspected
-# field-by-field), so only the new checksum can catch it.
-printf '\xFF' | dd of="$CORRUPT_LOOPDEV" bs=1 seek=$((2 * 4096 + 200)) count=1 conv=notrunc status=none
+# The BG table's LBA from mkfs's own summary: it was hardcoded as 2 and
+# moved when block 0's copy took blocks 1..2048 (A-7), after which this
+# flipped a byte of nothing and fsck rightly called the volume clean.
+# Flip a byte well inside the BG descriptor's pad[] region (never
+# inspected field-by-field), so only the checksum can catch it.
+BG_TABLE_LBA="$(echo "$MKFS_OUT" | sed -n 's/.*BG table: LBA \([0-9][0-9]*\).*/\1/p')"
+[ -n "$BG_TABLE_LBA" ] || { fail "setup: mkfs did not say where the BG table is"; ct_exit; }
+printf '\xFF' | dd of="$CORRUPT_LOOPDEV" bs=1 seek=$((BG_TABLE_LBA * 4096 + 200)) count=1 conv=notrunc status=none
 if "$ROOT/userspace/fsck.cetra" "$CORRUPT_LOOPDEV" >/dev/null 2>&1; then
     fail "fsck did not detect a corrupted BG descriptor pad byte"
 else

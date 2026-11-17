@@ -45,7 +45,7 @@ kp_off() {
 }
 echo "p:kprobes/$EV cetrafs:cetrafs_sb_alloc_unlock" >>"$T/kprobe_events" 2>/dev/null ||
     { skip "cannot place a kprobe on cetrafs_sb_alloc_unlock"; ct_exit; }
-trap kp_off EXIT
+ct_track cmd kp_off # after the unmounts, at cleanup -- a trap of our own would replace the harness's
 
 # <one_hold 0|1> -> "<releases> <free blocks gained> <fsck: clean|ERR...>"
 round() {

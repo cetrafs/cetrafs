@@ -44,16 +44,17 @@ ct_fsck "$DEV" >/dev/null && pass "and fsck accepts it" || fail "fsck rejected a
 # loop-backed image in under 50ms, so a fixed sleep either lands before
 # it starts or after it ends (the first version of this did the latter
 # and had nothing to assert). Waiting for the Zone Group table -- block
-# 1, written right after the point the superblock used to be stamped at
-# -- puts the kill inside the window every time, with the journal
+# 2049 since the superblock's copy took 1..2048 (A-7), written right
+# after the point the superblock used to be stamped at -- puts the kill
+# inside the window every time, with the journal
 # zeroing, the node table and the root inode all still ahead.
-dd if=/dev/zero of="$DEV" bs=1M count=8 status=none     # block 0 starts blank
+dd if=/dev/zero of="$DEV" bs=1M count=9 status=none     # block 0, its copy and the ZG table start blank
 "$ROOT/userspace/mkfs.cetra" "$DEV" -z 1 -b 512 -J 2 -N 1024 -f >/dev/null 2>&1 &
 MKPID=$!
 
 ZG_SEEN=0
 for _ in $(seq 1 4000); do
-    if [ -n "$(dd if="$DEV" bs=4096 skip=1 count=1 2>/dev/null | tr -d '\000')" ]; then
+    if [ -n "$(dd if="$DEV" bs=4096 skip=2049 count=1 2>/dev/null | tr -d '\000')" ]; then
         ZG_SEEN=1
         break
     fi

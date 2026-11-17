@@ -24,6 +24,16 @@ OPOKE="$(ct_helper orphan_poke)"
 DPOKE="$(ct_helper dirtree_poke)"
 BGPOKE="$(ct_helper bg_poke)"
 LEAKBIT=8000
+# A block in Block Group 0's data region for the planted directory: it
+# was the literal 2700, inside the data region until block 0's copy
+# moved every table up by 2048 blocks (A-7); there it fell in metadata,
+# fsck disabled repair for that instead, and the suite tested nothing.
+data_blk() { # <dev>
+    local d
+    d="$("$(ct_helper bg_poke)" "$1" 0 --dump)"
+    echo $(( $(tr ' ' '\n' <<<"$d" | sed -n 's/^start_block=\([0-9]*\).*/\1/p' | awk 'NR == 1') + \
+             $(tr ' ' '\n' <<<"$d" | sed -n 's/^off_data_region=\([0-9]*\).*/\1/p' | awk 'NR == 1') + 1100 ))
+}
 get() { grep -o "$1=[^ ]*" <<<"$2" | head -1 | cut -d= -f2; }
 
 # <tag> <ungated 0|1> -> RES
@@ -33,7 +43,7 @@ round() {
     dev="$(ct_loop "$img")"
     ct_mkfs "$dev" -z 1 -b 512 -J 1 -M 4 -N 1024 -f >/dev/null
     "$OPOKE" "$img" 3 0 0 >/dev/null || { fail "setup: orphan_poke failed"; ct_exit; }
-    "$DPOKE" "$img" 2 2700 3 >/dev/null || { fail "setup: dirtree_poke failed"; ct_exit; }
+    "$DPOKE" "$img" 2 "$(data_blk "$dev")" 3 >/dev/null || { fail "setup: dirtree_poke failed"; ct_exit; }
     d0="$("$BGPOKE" "$dev" 0 --dump)"
     bm=$(( $(tr ' ' '\n' <<<"$d0" | sed -n 's/^start_block=\([0-9]*\).*/\1/p' | awk 'NR == 1') + $(tr ' ' '\n' <<<"$d0" | sed -n 's/^off_data_bmap=\([0-9]*\).*/\1/p' | awk 'NR == 1') ))
     off=$((bm * 4096 + LEAKBIT / 8))

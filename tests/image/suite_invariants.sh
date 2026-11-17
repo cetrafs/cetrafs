@@ -74,14 +74,17 @@ log "a suite that mounts must prove it is on a cetrafs mount"
 # success while never touching the filesystem -- the module was not
 # loaded and the "mount" silently wrote to the host fs. Asserting
 # anything before this check is asserting about the wrong filesystem.
-BAD=""
-for f in $(harness_suites); do
-    SRC="$(code "$f")"
-    has "ct_mount" "$SRC" || continue
-    has "require_cetrafs_mount" "$SRC" || BAD="$BAD $(basename "$f")"
-done
-[ -z "$BAD" ] && pass "every suite that mounts checks what it mounted" ||
-    fail "these mount without confirming it is cetrafs:$BAD"
+#
+# ct_mount confirms it itself, so every suite that mounts through it is
+# covered by construction; what is checked is that it still does.
+CTM="$(awk '/^ct_mount\(\) \{/ { f = 1 } f { print } f && /^\}/ { exit }' "$ROOT/tests/lib/harness.sh")"
+[ -n "$CTM" ] || fail "setup: ct_mount is not found in the harness"
+has "require_cetrafs_mount" "$CTM" && pass "ct_mount confirms that what it mounted is cetrafs" ||
+    fail "ct_mount no longer confirms what it mounted -- every suite using it can assert against the host fs"
+# Control: the same test on a body without the check finds it missing.
+has "require_cetrafs_mount" "$(grep -v require_cetrafs_mount <<<"$CTM")" &&
+    fail "control: the check is seen in a ct_mount body that lacks it" ||
+    pass "control: a ct_mount body without the check is caught"
 
 log "a tool whose nonzero exit IS the finding must not be a pipeline condition"
 # `set -o pipefail` makes a pipeline inherit the tool's status, and fsck

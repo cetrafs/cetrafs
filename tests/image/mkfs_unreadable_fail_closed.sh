@@ -37,7 +37,7 @@ dmsetup create "$NAME" --table "0 8 error
 8 $((SECT - 8)) linear $LOOP 8"
 ct_track dm "$NAME"
 OUT="$("$MKFS" "/dev/mapper/$NAME" 2>&1)" && RC=0 || RC=$?
-[ "$RC" != 0 ] && grep -q "Refusing to format non-empty device" <<<"$OUT" &&
+[ "$RC" != 0 ] && grep -q "Refusing to format a non-empty device" <<<"$OUT" &&
     pass "1: mkfs refuses a device whose block 0 it cannot read" ||
     fail "1: rc=$RC: $(tail -2 <<<"$OUT" | tr '\n' ' ')"
 

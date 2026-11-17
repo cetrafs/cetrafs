@@ -182,6 +182,36 @@ int main(int argc, char **argv)
         perror("pwrite");
         return 1;
     }
+    /*
+     * The volume's superblock is block 0 AND its copy (A-7): a layout
+     * edit to block 0 alone leaves a copy describing another layout,
+     * which fsck rightly reports, and every suite that moves a region to
+     * see what fsck says about THAT read the copy's error instead. The
+     * copy follows, if one is there that verifies; the status fields
+     * (fsck_needed_*) are block 0's alone, as in the kernel.
+     * SB_POKE_PRIMARY_ONLY=1 leaves the copy as it was.
+     */
+    if (strncmp(FIELDS[which].name, "fsck_needed_", 12) && !getenv("SB_POKE_PRIMARY_ONLY")) {
+        cetrafs_superblock_t copy;
+        const off_t at = (off_t) CETRAFS_SB_REPLICA_NR * CETRAFS_BLOCK_SIZE;
+
+        if (pread(fd, &copy, sizeof(copy), at) == (ssize_t) sizeof(copy) &&
+            cetrafs_le32(copy.magic) == CETRAFS_MAGIC &&
+            (uint32_t) cetrafs_le64(copy.checksum) ==
+                crc32c_struct(&copy, sizeof(copy), offsetof(cetrafs_superblock_t, checksum), sizeof(copy.checksum))) {
+            copy = sb;
+            copy.fsck_needed_since = cetrafs_cpu_to_le64(0);
+            copy.fsck_needed_node = cetrafs_cpu_to_le32(0);
+            copy.fsck_needed_pad = cetrafs_cpu_to_le32(0);
+            copy.checksum = 0;
+            copy.checksum = cetrafs_cpu_to_le64((uint64_t) crc32c_struct(
+                &copy, sizeof(copy), offsetof(cetrafs_superblock_t, checksum), sizeof(copy.checksum)));
+            if (pwrite(fd, &copy, sizeof(copy), at) != (ssize_t) sizeof(copy)) {
+                perror("pwrite (copy)");
+                return 1;
+            }
+        }
+    }
     if (fsync(fd) < 0) {
         perror("fsync");
         return 1;

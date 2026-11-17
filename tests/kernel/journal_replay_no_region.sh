@@ -51,7 +51,7 @@ WANT="$(md5sum <"$PAY" | cut -d' ' -f1)"
 BEFORE="$(blk)"
 [ "$BEFORE" != "$WANT" ] || { fail "setup: the data block already holds the payload"; ct_exit; }
 ct_param_set journal_ignore_owner 1
-trap 'ct_param_set journal_ignore_owner 0; ct_param_set journal_alloc_region_fail 0' EXIT
+# Both parameters go back at cleanup: ct_param_set records them.
 
 # ------------------------------------------------------------------- 1
 "$JPOKE" "$IMG" "$NID" 0 "$DATA" "$PAY" --guard-current >/dev/null

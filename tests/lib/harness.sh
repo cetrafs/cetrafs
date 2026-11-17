@@ -716,6 +716,10 @@ ct_mount() {
     [ -n "${CT_MOUNT_OPTS:-}" ] && opts=(-o "$CT_MOUNT_OPTS")
     mount -t cetrafs ${opts[@]+"${opts[@]}"} "$1" "$2" || return $?
     ct_track mnt "$2"
+    # What was mounted is cetrafs, or the suite stops here: a run that
+    # "passed" without the module loaded wrote to the host filesystem
+    # (suite_invariants.sh). Here once, rather than in each suite.
+    require_cetrafs_mount "$2"
 }
 ct_umount() { umount "$1"; }
 

@@ -37,7 +37,7 @@ blk() { dd if="$DEV" bs=4096 skip="$1" count=1 iflag=direct status=none | sha256
 ZERO="$(head -c 4096 /dev/zero | sha256sum | cut -d' ' -f1)"
 BEATER=""
 stop_beat() { [ -z "$BEATER" ] || { kill "$BEATER" 2>/dev/null || true; wait "$BEATER" 2>/dev/null || true; BEATER=""; }; }
-trap stop_beat EXIT
+ct_track cmd stop_beat # at cleanup, before the loop device goes -- not a trap of our own
 # stage: a volume, row 1 registered and (with "beat") beating, block 0 zeroed
 stage() {
     "$MKFS" "$DEV" -z 1 -b 512 -J 0 -N 2048 -f >/dev/null 2>&1

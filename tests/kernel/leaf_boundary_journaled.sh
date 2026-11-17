@@ -16,8 +16,10 @@
 # boundary in one journal batch, and dropped when freed.
 #
 #   (1) held back: writes that edit the leaf, writeback forced, and the
-#       leaf on the device has not moved; fsync then writes it, through
-#       the journal (journal_writes moves).
+#       leaf on the device has not moved -- or, when writeback's
+#       conversion of preallocated space (itself a boundary) wrote it,
+#       it got there through the journal; fsync then leaves the device
+#       holding the leaf in core, and journal_writes has moved.
 #   (2) the worst crash: journal_batch_crash_before_targets stops the
 #       mount the moment the batch's entries are durable. The leaf on the
 #       device is then TORN by hand (its first half new, its second half
@@ -127,15 +129,24 @@ H0="$(dev_blk "$L")"
 write_every4 7 24 48
 [ "$(mem_blk "$L")" != "$H0" ] && pass "(1) setup: the writes edited the leaf in core" ||
     { fail "(1) setup: the leaf did not change in core"; exec 7>&-; ct_exit; }
-writeback
-[ "$(dev_blk "$L")" = "$H0" ] && pass "(1) writeback left the held-back leaf alone" ||
-    fail "(1) writeback wrote the leaf in place, before any boundary and unjournaled"
+# Writes into preallocated space are converted at writeback, and that
+# conversion is a boundary: it may write the held-back leaf -- through the
+# journal, as every boundary does. What must never happen is the leaf
+# reaching the device with no journal entry: in place, under writeback.
 J0="$(ctr journal_writes)"
+writeback
+if [ "$(dev_blk "$L")" = "$H0" ]; then
+    pass "(1) writeback left the held-back leaf alone"
+elif [ "$(ctr journal_writes)" -gt "$J0" ]; then
+    pass "(1) writeback's conversion boundary wrote the leaf, through the journal ($J0 -> $(ctr journal_writes))"
+else
+    fail "(1) writeback wrote the leaf in place, unjournaled"
+fi
 python3 -c 'import os,sys; os.fsync(int(sys.argv[1]))' 7
 [ "$(dev_blk "$L")" = "$(mem_blk "$L")" ] && [ "$(dev_blk "$L")" != "$H0" ] &&
-    pass "(1) fsync wrote the leaf" || fail "(1) fsync did not put the leaf on the device"
-[ "$(ctr journal_writes)" -gt "$J0" ] && pass "(1) ...through the journal ($J0 -> $(ctr journal_writes))" ||
-    fail "(1) fsync wrote the leaf without a journal entry"
+    pass "(1) after fsync the leaf on the device is the one in core" || fail "(1) fsync did not put the leaf on the device"
+[ "$(ctr journal_writes)" -gt "$J0" ] && pass "(1) ...and it got there through the journal ($J0 -> $(ctr journal_writes))" ||
+    fail "(1) the leaf reached the device without a journal entry"
 
 # ------------------------------------------------------------------ (2)
 H1="$(dev_blk "$L")"

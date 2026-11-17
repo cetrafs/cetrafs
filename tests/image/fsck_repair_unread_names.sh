@@ -26,6 +26,16 @@ require_root
 OPOKE="$(ct_helper orphan_poke)"
 DPOKE="$(ct_helper dirtree_poke)"
 SBPOKE="$(ct_helper sb_poke)"
+# A block in Block Group 0's data region for the planted directory: it
+# was the literal 2700, inside the data region until block 0's copy
+# moved every table up by 2048 blocks (A-7); there it fell in metadata,
+# fsck disabled repair for that instead, and the suite tested nothing.
+data_blk() { # <dev>
+    local d
+    d="$("$(ct_helper bg_poke)" "$1" 0 --dump)"
+    echo $(( $(tr ' ' '\n' <<<"$d" | sed -n 's/^start_block=\([0-9]*\).*/\1/p' | awk 'NR == 1') + \
+             $(tr ' ' '\n' <<<"$d" | sed -n 's/^off_data_region=\([0-9]*\).*/\1/p' | awk 'NR == 1') + 1100 ))
+}
 
 IMG="$(ct_image 560 fsckunread)"
 DEV="$(ct_loop "$IMG")"
@@ -35,7 +45,7 @@ ct_mkfs "$DEV" -z 1 -b 512 -J 1 -M 4 -N 1024 -f >/dev/null
 
 VICTIM=3
 "$OPOKE" "$IMG" "$VICTIM" 0 0 >/dev/null || { fail "setup: orphan_poke could not plant the victim"; ct_exit; }
-"$DPOKE" "$IMG" 2 2700 "$VICTIM" >/dev/null || { fail "setup: dirtree_poke could not plant the directory"; ct_exit; }
+"$DPOKE" "$IMG" 2 "$(data_blk "$DEV")" "$VICTIM" >/dev/null || { fail "setup: dirtree_poke could not plant the directory"; ct_exit; }
 blockdev --flushbufs "$DEV"
 
 IBM="$("$SBPOKE" "$DEV" | sed -n 's/^inode_bmap_start=//p')"

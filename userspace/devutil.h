@@ -37,6 +37,7 @@
 #include <scsi/sg.h>
 #include <sys/ioctl.h>
 #include <sys/stat.h>
+#include <stdbool.h>
 #include <sys/sysmacros.h>
 #include <sys/time.h>
 #include <sys/types.h>
