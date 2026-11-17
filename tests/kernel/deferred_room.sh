@@ -45,6 +45,12 @@ OKS="$(ct_tmp droom-ok)"
 ct_param_set journal_batch_fail 0
 ct_param_set deferred_room_off 0
 ct_param_set journal_slots_max 8
+# One tree change per converted block, wherever the image lives: a loop
+# device over a filesystem that zeroes ranges marks a whole 64 KiB unit
+# written on its first write (the sparse unit, the convert widen), the
+# set then stays small, and the control never outgrows the journal -- so
+# the suite passed or failed by whether its image landed on tmpfs.
+ct_param_set convert_unit_blocks 1
 info() { sed -n "s/^$1: //p" "$(ct_procdir "$DEV")/info"; }
 
 # Writes with every held-back batch failing, fsyncing every 16 writes,
