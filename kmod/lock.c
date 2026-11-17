@@ -2234,6 +2234,26 @@ void cetrafs_tree_resv_drop(struct inode *inode)
  * the mount, as before B-8 (tests/kernel/tree_full_convert.sh, buf). */
 static bool cetrafs_close_nospc_stops;
 cetrafs_test_param(close_nospc_stops, cetrafs_close_nospc_stops, bool, 0644);
+
+/* TEST ONLY: the last close gives a refusal of the pool's three tries and
+ * then drops, as before F-47 -- the control of close_space_waits.sh. */
+static bool cetrafs_close_space_wait_off;
+cetrafs_test_param(close_space_wait_off, cetrafs_close_space_wait_off, bool, 0644);
+MODULE_PARM_DESC(close_space_wait_off, "TEST ONLY: the last close drops writes a full pool refused, as before F-47");
+
+static atomic64_t cetrafs_close_space_waits = ATOMIC64_INIT(0);
+
+u64 cetrafs_close_space_wait_count(void)
+{
+    return (u64) atomic64_read(&cetrafs_close_space_waits);
+}
+
+/* Every refusal the device made for space, wherever it was counted. */
+static u64 cetrafs_pool_refusals(void)
+{
+    return cetrafs_bmap_refusal_count() + cetrafs_held_refusal_count() + cetrafs_tree_refusal_count() +
+           cetrafs_meta_nospc_count();
+}
 MODULE_PARM_DESC(close_nospc_stops, "TEST ONLY: a last close refused ENOSPC converting buffered blocks stops the mount");
 
 static atomic64_t cetrafs_close_nospc_drops = ATOMIC64_INIT(0);
@@ -4150,16 +4170,41 @@ static void __cetrafs_lock_release(struct inode *inode, const struct cetrafs_clo
          * FD-2). The mount stops instead -- the state a crash before
          * this close leaves, where the blocks were never marked written
          * either and nothing was acknowledged (docs/internal/ERRORS.md). */
+        /* A refusal of the POOL's -- a kept bitmap, a held block, a
+         * tree batch, a new block the device had no space for -- is not
+         * the tree's ceiling: space can come back, and the drop below was
+         * decided for a ceiling that never moves (audit F-47). So while
+         * the refusals are the pool's the close waits for space, as a
+         * VMFS host waits out a full thin pool, with no try limit; only
+         * a fence ends it (and the stop below follows). A refusal counted
+         * elsewhere meanwhile only makes this wait longer than it needed
+         * -- the safe direction. */
         {
             int tries, cret = 0;
+            bool pool = false, told = false;
 
-            for (tries = 0; tries < 3; tries++) {
+            for (tries = 0;; tries++) {
+                u64 before = cetrafs_pool_refusals();
+
                 cret = cetrafs_convert_pending(inode);
                 if (!cetrafs_pending_any(inode) && !cetrafs_conv_unflushed(inode))
                     break;
-                msleep(200);
+                pool = cret == -ENOSPC && cetrafs_pool_refusals() != before &&
+                       !READ_ONCE(cetrafs_close_space_wait_off);
+                if (pool && cetrafs_sb_is_fenced(inode->i_sb))
+                    break;
+                if (!pool && tries >= 2)
+                    break;
+                if (pool && !told) {
+                    told = true;
+                    atomic64_inc(&cetrafs_close_space_waits);
+                    pr_warn("%s: ino=%llu: the last close is waiting for the device to have space for the file's "
+                            "map (a thin pool out of space?)\n",
+                            inode->i_sb->s_id, (unsigned long long) inode->i_ino);
+                }
+                schedule_timeout_idle(msecs_to_jiffies(pool ? 1000 : 200));
             }
-            if (cret == -ENOSPC && cetrafs_pending_any(inode) && !cetrafs_conv_unflushed(inode) &&
+            if (cret == -ENOSPC && !pool && cetrafs_pending_any(inode) && !cetrafs_conv_unflushed(inode) &&
                 !READ_ONCE(cetrafs_close_nospc_stops)) {
                 /* Refused for room: the tree took no new extent (its
                  * ceiling, or no block for a new tree block) and a

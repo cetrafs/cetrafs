@@ -21,7 +21,9 @@
 #   after a remount only the names that were reported created exist,
 #   the attribute is as it was, and fsck is clean.
 #
-# DISCRIMINATION: journal_nospc_stops=1 (as before): T stops the mount.
+# DISCRIMINATION: journal_nospc_stops=1 with space_wait_stops=1 (as
+# before): T stops the mount. (The refused block's plain write now waits
+# for space instead, so both switches are what "before" means.)
 set -euo pipefail
 . "$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)/lib/harness.sh"
 require_root
@@ -33,6 +35,7 @@ P=/sys/module/cetrafs/parameters
 MNT="$(ct_mnt dno)"
 ct_track mnt "$MNT"
 ct_param_set journal_nospc_stops 0
+ct_param_set space_wait_stops 0
 ct_param_set journal_entry_nospc 0
 ct_param_set meta_write_nospc_block 0
 ct_param_set scrub 0
@@ -78,6 +81,7 @@ round() {
     [ -n "$lba" ] && [ -n "$xlba" ] || { fail "setup: no journal target logged (dir=$lba xattr=$xlba)"; ct_exit; }
     n="$(sed -n 's/^journal_op_refusals: //p' "$proc/info")"
     echo "$2" >$P/journal_nospc_stops
+    echo "$2" >$P/space_wait_stops # and the overwrite path stops too, as before A-4's wait
     mark="$(dmesg_mark)"
     echo "$lba" >$P/meta_write_nospc_block
     t="$(mk "$MNT/d/t1")"
@@ -91,6 +95,7 @@ round() {
     x="$(sx "$MNT/xd" new)"
     echo 0 >$P/meta_write_nospc_block
     echo 0 >$P/journal_nospc_stops
+    echo 0 >$P/space_wait_stops
     RES="t=$t p=$p h=$h x=$x after=$(mk "$MNT/d/a1")"
     RES="$RES refusals=$(($(sed -n 's/^journal_op_refusals: //p' "$proc/info") - n))"
     RES="$RES stopped=$(dmesg_since "$mark" | grep -c 'STOPPED' || true)"

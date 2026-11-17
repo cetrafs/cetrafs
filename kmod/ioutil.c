@@ -467,8 +467,11 @@ u64 cetrafs_held_flush_batch_count(void)
  * "uptodate or not", and a definite "no space" for a bitmap block must
  * be told from a torn write (A-4).
  */
+static int __cetrafs_sync_buffers_keep(struct super_block *sb, struct buffer_head **bhs, unsigned int n, int *res,
+                                       bool trylock);
+
 static int cetrafs_held_run(struct super_block *sb, struct xarray *xa, struct buffer_head **bhs,
-                            unsigned long *idx, int *res, unsigned int n)
+                            unsigned long *idx, int *res, unsigned int n, bool trylock)
 {
     unsigned int i;
     int ret = 0, r;
@@ -476,16 +479,17 @@ static int cetrafs_held_run(struct super_block *sb, struct xarray *xa, struct bu
     atomic64_inc(&cetrafs_held_flush_batches);
     for (i = 0; i < n; i++)
         res[i] = 0;
-    r = cetrafs_sync_buffers_keep(sb, bhs, n, res);
+    r = __cetrafs_sync_buffers_keep(sb, bhs, n, res, trylock);
     for (i = 0; i < n; i++) {
         struct buffer_head *bh = bhs[i];
 
         if (r == -EIO && cetrafs_sb_is_fenced(sb))
             res[i] = -EIO; /* fenced before anything was sent */
-        lock_buffer(bh);
-        if (!buffer_cetra_held(bh) && xa_cmpxchg(xa, idx[i], bh, NULL, 0) == bh)
-            put_bh(bh); /* the list's pin */
-        unlock_buffer(bh);
+        if (trylock ? trylock_buffer(bh) : (lock_buffer(bh), 1)) {
+            if (!buffer_cetra_held(bh) && xa_cmpxchg(xa, idx[i], bh, NULL, 0) == bh)
+                put_bh(bh); /* the list's pin */
+            unlock_buffer(bh);
+        }
         put_bh(bh);
         if (res[i] && (!ret || ret == -ENOSPC))
             ret = res[i]; /* a stop's error before a kept refusal's */
@@ -520,7 +524,20 @@ static struct buffer_head *cetrafs_held_next(struct xarray *xa, unsigned long *i
  * every sync queued behind -- where writeback, before A-15, had sent them
  * together and merged neighbours.
  */
+static int __cetrafs_held_flush(struct super_block *sb, bool trylock);
+
 int cetrafs_held_flush(struct super_block *sb)
+{
+    return __cetrafs_held_flush(sb, false);
+}
+
+/* The heartbeat's flush: never waits for a buffer lock (see trylock above). */
+int cetrafs_held_flush_nowait(struct super_block *sb)
+{
+    return __cetrafs_held_flush(sb, true);
+}
+
+static int __cetrafs_held_flush(struct super_block *sb, bool trylock)
 {
     struct xarray *xa = cetrafs_sb_held(sb);
     struct buffer_head *one_bh, **bhs;
@@ -553,14 +570,14 @@ int cetrafs_held_flush(struct super_block *sb)
         idxs[n] = idx;
         if (++n < cap)
             continue;
-        r = cetrafs_held_run(sb, xa, bhs, idxs, res, n);
+        r = cetrafs_held_run(sb, xa, bhs, idxs, res, n, trylock);
         if (r && (!ret || ret == -ENOSPC))
             ret = r;
         n = 0;
         cond_resched();
     }
     if (n) {
-        r = cetrafs_held_run(sb, xa, bhs, idxs, res, n);
+        r = cetrafs_held_run(sb, xa, bhs, idxs, res, n, trylock);
         if (r && (!ret || ret == -ENOSPC))
             ret = r;
     }
@@ -660,7 +677,76 @@ void cetrafs_test_nospc_once(sector_t block)
     WRITE_ONCE(cetrafs_nospc_once_block, block);
 }
 
-static int cetrafs_write_locked_bh(struct buffer_head *bh)
+/*
+ * A thin pool out of space refusing an OVERWRITE (A-4): the block is
+ * provisioned, so the refusal is the pool's -- full, or a snapshot's
+ * copy-on-write with nowhere to go -- and space can come back. As VMFS
+ * does on an array's out-of-space report, the writer waits for it where
+ * it stands instead of the mount stopping: still under the buffer lock,
+ * the buffer still uptodate (a reader takes our bytes, never the old
+ * block's -- the state of a slow write in flight), retried with a
+ * backoff to a second. A fence or a stop ends the wait (the gate is
+ * asked every round), so the wait is never longer than this node's
+ * lease, and the fence's sweep waits at most one round for the lock.
+ * New blocks still fail their operation with ENOSPC
+ * (cetrafs_sync_new_buffer()), which pauses the guest the same way.
+ */
+static bool cetrafs_space_wait_stops;
+cetrafs_test_param(space_wait_stops, cetrafs_space_wait_stops, bool, 0644);
+MODULE_PARM_DESC(space_wait_stops, "TEST ONLY: an overwrite refused for space stops the mount, as before A-4's wait");
+
+static atomic64_t cetrafs_space_waits = ATOMIC64_INIT(0);
+
+u64 cetrafs_space_wait_count(void)
+{
+    return (u64) atomic64_read(&cetrafs_space_waits);
+}
+
+static int cetrafs_write_locked_bh_once(struct buffer_head *bh);
+
+static int cetrafs_write_locked_bh(struct super_block *sb, struct buffer_head *bh, bool wait_space)
+{
+    unsigned int ms = 10;
+    bool waited = false;
+    int ret;
+
+    for (;;) {
+        ret = cetrafs_write_locked_bh_once(bh);
+        if (ret != -ENOSPC || !wait_space || READ_ONCE(cetrafs_space_wait_stops))
+            break;
+        if (!waited) {
+            waited = true;
+            atomic64_inc(&cetrafs_space_waits);
+            pr_warn_ratelimited("%s: the device has no space to overwrite %s block %llu -- waiting for it, as for "
+                                "a thin pool that fills (the mount stays up)\n",
+                                sb->s_id, cetrafs_block_role(sb, bh->b_blocknr),
+                                (unsigned long long) bh->b_blocknr);
+        }
+        schedule_timeout_idle(msecs_to_jiffies(ms));
+        ms = min(ms * 2, 1000u);
+        if (cetrafs_sb_is_fenced(sb)) {
+            /* Fenced or stopped while waiting: nothing landed and nothing
+             * will. The bytes are discarded, as the fence's sweep
+             * discards every unwritten block. */
+            clear_buffer_uptodate(bh);
+            ret = -ESHUTDOWN;
+            break;
+        }
+    }
+    if (ret) {
+        set_buffer_write_io_error(bh);
+        clear_buffer_uptodate(bh);
+    } else {
+        set_buffer_uptodate(bh);
+    }
+    unlock_buffer(bh);
+    if (ret == -ESHUTDOWN)
+        clear_buffer_write_io_error(bh); /* not a device error: the fence's */
+    return ret;
+}
+
+/* One attempt, the buffer locked and staying locked. */
+static int cetrafs_write_locked_bh_once(struct buffer_head *bh)
 {
     struct bio *bio;
     int ret;
@@ -689,13 +775,6 @@ static int cetrafs_write_locked_bh(struct buffer_head *bh)
     ret = submit_bio_wait(bio);
     bio_put(bio);
 done:
-    if (ret) {
-        set_buffer_write_io_error(bh);
-        clear_buffer_uptodate(bh);
-    } else {
-        set_buffer_uptodate(bh);
-    }
-    unlock_buffer(bh);
     return ret;
 }
 
@@ -725,7 +804,7 @@ static inline bool cetrafs_meta_gate_shut(struct super_block *sb)
     return sb && !READ_ONCE(cetrafs_meta_gate_unlocked_only) && cetrafs_sb_is_fenced(sb);
 }
 
-static int __cetrafs_sync_buffer(struct super_block *sb, struct buffer_head *bh)
+static int __cetrafs_sync_buffer(struct super_block *sb, struct buffer_head *bh, bool wait_space)
 {
     lock_buffer(bh);
     /* TEST ONLY: the lock won after a wait the fence landed in -- held
@@ -759,7 +838,8 @@ static int __cetrafs_sync_buffer(struct super_block *sb, struct buffer_head *bh)
     }
     clear_buffer_cetra_held(bh); /* written now, whichever it was */
     clear_buffer_write_io_error(bh);
-    return cetrafs_write_locked_bh(bh);
+    /* The lease renewal never waits: it is what bounds every other wait. */
+    return cetrafs_write_locked_bh(sb, bh, wait_space && !cetrafs_sb_in_renewal(sb));
 }
 
 /*
@@ -912,14 +992,6 @@ void cetrafs_write_pending_buffer(struct super_block *sb, struct buffer_head *bh
 #endif
 }
 
-static int __cetrafs_sync_buffer_keep(struct super_block *sb, struct buffer_head *bh)
-{
-    bool was_dirty, was_held;
-    int ret = __cetrafs_keep_submit(sb, bh, &was_dirty, &was_held);
-
-    return ret == 1 ? __cetrafs_keep_wait(bh, was_dirty, was_held) : ret;
-}
-
 /*
  * A metadata write the device refused is fatal to the mount
  * (docs/internal/ERRORS.md, kind 3). The caller has usually written
@@ -1070,8 +1142,11 @@ bool cetrafs_refusal_definite(int err)
  * them first and stops on the error; and every hand-back of the group
  * (cetrafs_bg_release_bitmap_ready(), unmount) writes them first and
  * gives nothing up when that fails. So the wait is the thin pool's, not
- * a peer's. Any other held block -- a record, a directory block -- is a
- * blind write that must not land late, and still stops.
+ * a peer's. Any other HELD block is kept the same way (A-4, below): held
+ * blocks are written at the next boundary, which has no deadline, so a
+ * kept one is the state before the flush ran. A refused block that was
+ * DIRTY rather than held is not kept: re-dirtied, writeback could put it
+ * on the device after this node's lease, so that one still stops.
  */
 static bool cetrafs_bmap_refusal_stops;
 cetrafs_test_param(bmap_refusal_stops, cetrafs_bmap_refusal_stops, bool, 0644);
@@ -1090,9 +1165,33 @@ u64 cetrafs_bmap_refusal_count(void)
     return (u64) atomic64_read(&cetrafs_bmap_refusals);
 }
 
-static bool cetrafs_keep_refusal_survivable(struct super_block *sb, struct buffer_head *bh, int status)
+static atomic64_t cetrafs_held_refusals = ATOMIC64_INIT(0);
+
+u64 cetrafs_held_refusal_count(void)
 {
-    if (!cetrafs_refusal_definite(status) || !buffer_cetra_bmap(bh) || READ_ONCE(cetrafs_bmap_refusal_stops))
+    return (u64) atomic64_read(&cetrafs_held_refusals);
+}
+
+static bool cetrafs_keep_refusal_survivable(struct super_block *sb, struct buffer_head *bh, int status, bool reheld)
+{
+    if (!cetrafs_refusal_definite(status))
+        return false;
+    /* Any other HELD block (A-4): it is held again, never dirty, so only
+     * a later flush of ours writes it -- under the gate, the lease
+     * renewed. Kept is exactly the state before this flush ran: held
+     * blocks are written at the next boundary, which has no deadline,
+     * so a refusal adds no state, only time in one. */
+    if (!buffer_cetra_bmap(bh)) {
+        if (!reheld || READ_ONCE(cetrafs_space_wait_stops))
+            return false;
+        atomic64_inc(&cetrafs_held_refusals);
+        pr_warn_ratelimited("%s: the device refused a held %s block (%llu, %d, no space) -- kept for the next "
+                            "flush\n",
+                            sb->s_id, cetrafs_block_role(sb, bh->b_blocknr), (unsigned long long) bh->b_blocknr,
+                            status);
+        return true;
+    }
+    if (READ_ONCE(cetrafs_bmap_refusal_stops))
         return false;
     atomic64_inc(&cetrafs_bmap_refusals);
     pr_warn_ratelimited("%s: the device refused an allocation-bitmap write (block %llu, %d, no space) -- kept for "
@@ -1232,7 +1331,7 @@ int cetrafs_sync_buffer_op_refusable(struct super_block *sb, struct buffer_head 
 
     if (cetrafs_sb_is_fenced(sb))
         return -EIO;
-    ret = __cetrafs_sync_buffer(sb, bh);
+    ret = __cetrafs_sync_buffer(sb, bh, false);
     if (cetrafs_refusal_definite(ret))
         return ret;
     return cetrafs_meta_write_result(sb, bh, ret);
@@ -1244,6 +1343,20 @@ int cetrafs_sync_buffer_op_refusable(struct super_block *sb, struct buffer_head 
 int cetrafs_wait_meta_write(struct super_block *sb, struct buffer_head *bh)
 {
     wait_on_buffer(bh);
+    if (!buffer_uptodate(bh) && !cetrafs_sb_is_fenced(sb)) {
+        /* The buffer layer's completion keeps no status, so a full thin
+         * pool read as a torn write and stopped the mount (A-4). The
+         * bytes are still in the page and only the caller's lock lets
+         * anyone write this block: send them once more, synchronously,
+         * where the status is kept -- a refusal for space then waits,
+         * anything else stops as before. */
+        lock_buffer(bh);
+        set_buffer_uptodate(bh);
+        clear_buffer_write_io_error(bh);
+        set_buffer_dirty(bh);
+        unlock_buffer(bh);
+        return cetrafs_sync_buffer(sb, bh);
+    }
     return cetrafs_meta_write_result(sb, bh, buffer_uptodate(bh) ? 0 : -EIO);
 }
 
@@ -1253,7 +1366,7 @@ int cetrafs_sync_buffer(struct super_block *sb, struct buffer_head *bh)
 {
     if (cetrafs_sb_is_fenced(sb))
         return -EIO;
-    return cetrafs_meta_write_result(sb, bh, __cetrafs_sync_buffer(sb, bh));
+    return cetrafs_meta_write_result(sb, bh, __cetrafs_sync_buffer(sb, bh, true));
 }
 
 /*
@@ -1279,7 +1392,7 @@ int cetrafs_sync_buffer_refusable(struct super_block *sb, struct buffer_head *bh
 
     if (cetrafs_sb_is_fenced(sb))
         return -EIO;
-    ret = __cetrafs_sync_buffer(sb, bh);
+    ret = __cetrafs_sync_buffer(sb, bh, false);
     if ((ret == -ENOSPC || ret == -EREMOTEIO) && !READ_ONCE(cetrafs_replay_refusal_stops)) {
         pr_warn_ratelimited("%s: the device refused a journal replay write (%s, block %llu, %d) -- not executed; "
                             "the entry is kept for a later replay\n",
@@ -1324,7 +1437,7 @@ int cetrafs_sync_new_buffer(struct super_block *sb, struct buffer_head *bh)
         unlock_buffer(bh);
         ret = -ENOSPC; /* test-only: what a full pool answers */
     } else {
-        ret = __cetrafs_sync_buffer(sb, bh);
+        ret = __cetrafs_sync_buffer(sb, bh, false);
     }
     if (ret == -ENOSPC && !READ_ONCE(cetrafs_nospc_stops)) {
         atomic64_inc(&cetrafs_meta_nospc);
@@ -1547,11 +1660,21 @@ static int cetrafs_sync_buffers_keep_legacy(struct super_block *sb, struct buffe
 
 int cetrafs_sync_buffers_keep(struct super_block *sb, struct buffer_head **bhs, unsigned int n, int *res)
 {
+    return __cetrafs_sync_buffers_keep(sb, bhs, n, res, false);
+}
+
+/* 'trylock': a block someone holds locked is skipped, still held -- the
+ * heartbeat's flush, which must never wait out a writer that is itself
+ * waiting for a full pool to have space (A-4): its owner writes it, and
+ * a refused one stays held for the next flush. */
+static int __cetrafs_sync_buffers_keep(struct super_block *sb, struct buffer_head **bhs, unsigned int n, int *res,
+                                       bool trylock)
+{
     struct cetrafs_keep_io {
         struct cetrafs_keep_bio b;
         int state; /* 1 sent, 0 nothing to write, < 0 an earlier failure found */
         bool was_dirty, was_held;
-    } *io;
+    } *io, one;
     DECLARE_COMPLETION_ONSTACK(all);
     atomic_t left;
     struct blk_plug plug;
@@ -1562,11 +1685,15 @@ int cetrafs_sync_buffers_keep(struct super_block *sb, struct buffer_head **bhs, 
         return -EIO;
     if (READ_ONCE(cetrafs_keep_batch_legacy))
         return cetrafs_sync_buffers_keep_legacy(sb, bhs, n, res);
-    io = kmalloc_array(n, sizeof(*io), GFP_NOFS);
+    /* One block needs no allocation; with none to be had, one at a time
+     * through the same path -- the older fallback wrote through
+     * __cetrafs_sync_buffer_keep(), which keeps no status, so a held
+     * block refused for space stopped the mount there (A-4, 18a8db5). */
+    io = n == 1 ? &one : kmalloc_array(n, sizeof(*io), GFP_NOFS);
     if (!io) {
         for (i = 0; i < n; i++) {
-            res[i] = cetrafs_meta_write_result(sb, bhs[i], __cetrafs_sync_buffer_keep(sb, bhs[i]));
-            if (res[i] && !ret)
+            res[i] = __cetrafs_sync_buffers_keep(sb, &bhs[i], 1, &res[i], trylock);
+            if (res[i] && (!ret || ret == -ENOSPC))
                 ret = res[i];
         }
         return ret;
@@ -1580,7 +1707,14 @@ int cetrafs_sync_buffers_keep(struct super_block *sb, struct buffer_head **bhs, 
         io[i].b.all = &all;
         io[i].b.left = &left;
         io[i].b.status = 0;
-        lock_buffer(bh); /* also waits out a writeback already in flight */
+        if (trylock) {
+            if (!trylock_buffer(bh)) {
+                io[i].state = 0; /* someone is writing it: left as it is */
+                continue;
+            }
+        } else {
+            lock_buffer(bh); /* also waits out a writeback already in flight */
+        }
         if (cetrafs_meta_gate_shut(sb)) {
             unlock_buffer(bh);
             io[i].state = -ESHUTDOWN;
@@ -1603,6 +1737,10 @@ int cetrafs_sync_buffers_keep(struct super_block *sb, struct buffer_head **bhs, 
             continue;
         }
         io[i].state = 1;
+        if (READ_ONCE(cetrafs_meta_write_nospc_block) && bh->b_blocknr == READ_ONCE(cetrafs_meta_write_nospc_block)) {
+            io[i].b.status = -ENOSPC; /* TEST ONLY: this block refused for space while set, unsent */
+            continue;
+        }
         if (buffer_cetra_bmap(bh) && READ_ONCE(cetrafs_bmap_write_nospc)) {
             WRITE_ONCE(cetrafs_bmap_write_nospc, cetrafs_bmap_write_nospc - 1);
             io[i].b.status = -ENOSPC; /* TEST ONLY: what a full thin pool answers, unsent */
@@ -1640,16 +1778,17 @@ int cetrafs_sync_buffers_keep(struct super_block *sb, struct buffer_head **bhs, 
                     set_buffer_cetra_held(bh);
                 else
                     mark_buffer_dirty(bh);
-                kept = cetrafs_keep_refusal_survivable(sb, bh, r);
+                kept = cetrafs_keep_refusal_survivable(sb, bh, r, io[i].was_held && !io[i].was_dirty);
                 r = kept ? -ENOSPC : -EIO;
             }
             unlock_buffer(bh);
         }
         res[i] = kept ? r : cetrafs_meta_write_result(sb, bh, r);
-        if (res[i] && !ret)
-            ret = res[i];
+        if (res[i] && (!ret || ret == -ENOSPC))
+            ret = res[i]; /* a stop's error before a kept refusal's */
     }
-    kfree(io);
+    if (io != &one)
+        kfree(io);
     return ret;
 }
 

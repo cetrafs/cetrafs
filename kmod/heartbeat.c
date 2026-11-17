@@ -159,6 +159,27 @@ static unsigned long long cetrafs_test_damage_ns_ino;
 cetrafs_test_param(test_damage_ns_ino, cetrafs_test_damage_ns_ino, ullong, 0644);
 MODULE_PARM_DESC(test_damage_ns_ino, "TEST ONLY: flip a checksum bit of this inode's namespace sector, next tick");
 
+/* TEST ONLY: the next maintenance pass holds this inode's cached record
+ * for the held flush that follows it, unchanged -- what an update left
+ * for a later flush looks like (tests/kernel/thin_overwrite_waits.sh). */
+static unsigned long long cetrafs_test_hold_record_ino;
+cetrafs_test_param(test_hold_record_ino, cetrafs_test_hold_record_ino, ullong, 0644);
+MODULE_PARM_DESC(test_hold_record_ino, "TEST ONLY: hold this inode's cached record for the next held flush");
+
+static void cetrafs_test_hold_record(struct super_block *sb, u64 ino)
+{
+    struct buffer_head *bh = sb_find_get_block(sb, cetrafs_inode_lba(sb, ino));
+
+    if (!bh)
+        return;
+    if (buffer_uptodate(bh)) {
+        cetrafs_bh_begin_update(bh); /* no change: only held, by the protocol */
+        cetrafs_bh_end_update(sb, bh);
+        pr_info("heartbeat: TEST: held ino=%llu's record for the held flush\n", (unsigned long long) ino);
+    }
+    brelse(bh);
+}
+
 static void cetrafs_test_damage_ns(struct super_block *sb, u64 ino)
 {
     struct buffer_head *bh = cetrafs_bread_uncached(sb, cetrafs_inode_lba(sb, ino));
@@ -413,7 +434,13 @@ static void cetrafs_heartbeat_maint(struct work_struct *work)
      * the lease just renewed: the boundaries write the allocations their
      * publishes need, and this bounds how long a free stays only in
      * memory. A failure keeps them held for the next tick. */
-    (void) cetrafs_held_flush(sb);
+    {
+        u64 hino = xchg(&cetrafs_test_hold_record_ino, 0);
+
+        if (hino)
+            cetrafs_test_hold_record(sb, hino); /* TEST ONLY: see the parameter */
+    }
+    (void) cetrafs_held_flush_nowait(sb); /* never behind a writer waiting for space (A-4) */
 
     /* Our row's frees-in-flight flag goes back down once nothing is in
      * flight (cetrafs_frees_begin()); peers' scrubs wait while it is up. */

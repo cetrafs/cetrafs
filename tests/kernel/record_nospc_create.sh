@@ -16,7 +16,8 @@
 #   after a remount only the names that were reported created exist,
 #   and fsck is clean -- no number leaked, none left half-born.
 #
-# DISCRIMINATION: new_record_refusal_stops=1 (as before): F stops the
+# DISCRIMINATION: new_record_refusal_stops=1 with space_wait_stops=1
+# (as before -- an overwrite now waits for space): F stops the
 # mount.
 set -euo pipefail
 . "$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)/lib/harness.sh"
@@ -29,6 +30,7 @@ P=/sys/module/cetrafs/parameters
 MNT="$(ct_mnt rnc)"
 ct_track mnt "$MNT"
 ct_param_set new_record_refusal_stops 0
+ct_param_set space_wait_stops 0
 ct_param_set new_record_nospc 0
 ct_param_set scrub 0
 ct_param_set auto_defrag 0
@@ -56,6 +58,7 @@ round() {
     : >"$MNT/a0"
     n="$(sed -n 's/^record_op_refusals: //p' "$proc/info")"
     echo "$2" >$P/new_record_refusal_stops
+    echo "$2" >$P/space_wait_stops # and the overwrite path stops too, as before A-4's wait
     mark="$(dmesg_mark)"
     echo 1 >$P/new_record_nospc
     f="$(op f "$MNT/f1")"
@@ -65,6 +68,7 @@ round() {
     s="$(op s "$MNT/s1")"
     echo 0 >$P/new_record_nospc
     echo 0 >$P/new_record_refusal_stops
+    echo 0 >$P/space_wait_stops
     RES="f=$f d=$d s=$s after=$(op f "$MNT/a1")"
     RES="$RES refusals=$(($(sed -n 's/^record_op_refusals: //p' "$proc/info") - n))"
     RES="$RES stopped=$(dmesg_since "$mark" | grep -c 'STOPPED' || true)"

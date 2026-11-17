@@ -334,6 +334,8 @@ enum cetrafs_stop_cause {
 void cetrafs_sb_stop(struct super_block *sb, enum cetrafs_stop_cause cause, const char *reason);
 void cetrafs_sb_fence(struct super_block *sb, const char *reason);
 bool cetrafs_sb_is_fenced(struct super_block *sb);
+/* fs.c: is the caller the lease renewal itself (A-4: it never waits for space)? */
+bool cetrafs_sb_in_renewal(struct super_block *sb);
 const char *cetrafs_sb_stop_cause_name(struct super_block *sb);
 __printf(2, 3) void cetrafs_sb_fatal(struct super_block *sb, const char *fmt, ...);
 void cetrafs_sb_corrupt(struct super_block *sb, u64 ino);
@@ -1711,8 +1713,12 @@ TAS_BUFFER_FNS(CetraHeld, cetra_held)
  * (cetrafs_keep_refusal_survivable(), A-4). Set by every update. */
 BUFFER_FNS(CetraBmap, cetra_bmap)
 u64 cetrafs_bmap_refusal_count(void);
+u64 cetrafs_held_refusal_count(void);
+u64 cetrafs_space_wait_count(void);
+u64 cetrafs_close_space_wait_count(void);
 void cetrafs_bh_end_update_held(struct super_block *sb, struct buffer_head *bh, bool changed);
 int cetrafs_held_flush(struct super_block *sb);
+int cetrafs_held_flush_nowait(struct super_block *sb);
 unsigned long cetrafs_held_drop_all(struct super_block *sb);
 struct xarray *cetrafs_sb_held(struct super_block *sb);
 u64 cetrafs_held_unlisted_count(void); /* ioutil.c, F-27 */

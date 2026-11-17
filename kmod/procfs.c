@@ -367,6 +367,9 @@ static int cetrafs_proc_info_show(struct seq_file *m, void *v)
     seq_printf(m, "journal_op_refusals: %llu\n", cetrafs_journal_op_refusal_count());
     seq_printf(m, "record_op_refusals: %llu\n", cetrafs_record_op_refusal_count());
     seq_printf(m, "bmap_refusals: %llu\n", cetrafs_bmap_refusal_count());
+    seq_printf(m, "held_refusals: %llu\n", cetrafs_held_refusal_count());
+    seq_printf(m, "space_waits: %llu\n", cetrafs_space_wait_count());
+    seq_printf(m, "close_space_waits: %llu\n", cetrafs_close_space_wait_count());
     seq_printf(m, "tree_refusals: %llu\n", cetrafs_tree_refusal_count());
     seq_printf(m, "alloc_damaged_skips: %llu\n", cetrafs_alloc_damaged_skip_count());
     seq_printf(m, "label_invalidations: %llu\n", cetrafs_label_invalidation_count());

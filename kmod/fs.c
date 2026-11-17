@@ -6296,6 +6296,16 @@ void cetrafs_sb_check_device_size(struct super_block *sb)
                      (unsigned long long) have, (unsigned long long) need);
 }
 
+/* The lease renewal's own work (heartbeat.c): everything else that waits
+ * is bounded by it, so it may not wait itself. */
+bool cetrafs_sb_in_renewal(struct super_block *sb)
+{
+    struct cetrafs_sb_info *sbi = sb->s_fs_info;
+    struct cetrafs_heartbeat *hb = sbi ? READ_ONCE(sbi->hb) : NULL;
+
+    return hb && current_work() == &hb->work.work;
+}
+
 bool cetrafs_sb_is_fenced(struct super_block *sb)
 {
     struct cetrafs_sb_info *sbi = sb->s_fs_info;
