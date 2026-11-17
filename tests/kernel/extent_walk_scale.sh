@@ -23,6 +23,7 @@ set -euo pipefail
 require_root
 require_module
 command -v filefrag >/dev/null || { skip "filefrag (e2fsprogs) not installed"; ct_exit; }
+[ -w /sys/module/cetrafs/parameters/sparse_unit_off ] || { skip "sparse_unit_off is missing"; ct_exit; }
 N=40000
 
 DEV="$(ct_dev 600 extscale)"
@@ -30,6 +31,10 @@ MNT="$(ct_mnt extscale)"
 ct_mkfs_small "$DEV" >/dev/null
 ct_param_set alloc_run_blocks 0
 ct_param_set auto_defrag 0
+# A scattered first write into a hole inside i_size now allocates a whole
+# 64 KiB unit (b2ba9f5), which turns the 40k descending writes into ~2.5k
+# extents; the walk under test needs one extent per block.
+ct_param_set sparse_unit_off 1
 ct_mount "$DEV" "$MNT"
 require_cetrafs_mount "$MNT"
 
