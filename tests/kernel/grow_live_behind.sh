@@ -95,12 +95,21 @@ grep -q "not a data address" <<<"$D" && fail "the address was called damage: $(g
 [ "$(info layout_gen)" = "$gen0" ] || fail "the node adopted a layout its device cannot hold"
 
 log "the device is rescanned"
-dm_size "$FULL"
-sleep 1.5 # past the one-second reuse of "behind"
+# "Behind" is remembered for a second, so the block 0 read is not paid
+# per block; a rescan inside that second must not be answered from it
+# (it was: reads kept failing EIO for up to a second after the rescan
+# that fixed them, ctest grow-unrescanned). So a fresh failed read, the
+# rescan, and the read again -- all inside the second, asserted.
 sync; echo 3 >/proc/sys/vm/drop_caches
+t0="$(date +%s%N)"
+head -c 10 "$MNT/v1" >/dev/null 2>&1 && fail "setup: the read before the rescan succeeded"
+dm_size "$FULL"
+echo 3 >/proc/sys/vm/drop_caches
 got="$(head -c 10 "$MNT/v1" 2>/dev/null || true)"
-[ "$got" = "MARKER-ONE" ] && pass "the same file now reads the block the grow added" ||
-    fail "after the rescan the read returned '${got:-an error}'"
+ms=$((($(date +%s%N) - t0) / 1000000))
+[ "$ms" -lt 900 ] || fail "setup: the rescan and the read took ${ms} ms -- past the second \"behind\" is reused for, so this proves nothing"
+[ "$got" = "MARKER-ONE" ] && pass "right after the rescan (${ms} ms), the same file reads the block the grow added" ||
+    fail "${ms} ms after the rescan the read returned '${got:-an error}'"
 [ "$(info layout_gen)" = "$((gen0 + 1))" ] && pass "and the node is at layout_gen $((gen0 + 1))" ||
     fail "the node is at layout_gen $(info layout_gen), expected $((gen0 + 1))"
 echo more >>"$MNT/v1" && sync && pass "the file still takes writes: it was never marked damaged" ||

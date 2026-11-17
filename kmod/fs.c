@@ -333,8 +333,12 @@ struct cetrafs_sb_info {
     struct cetrafs_bg_layout *layout;
     struct mutex layout_mutex; /* one refresh at a time */
     /* jiffies (|1) of the last refresh that found the volume grown past
-     * this node's device; 0 when not behind. Written under layout_mutex. */
+     * this node's device; 0 when not behind. Written under layout_mutex.
+     * layout_behind_bytes is the device size it judged: the answer is
+     * reused only while the device still has it (rule 10 -- a rescan is
+     * the change that makes it stale, not the clock). */
     unsigned long layout_behind_at;
+    u64 layout_behind_bytes;
     spinlock_t owned_lock;     /* owned_bgs derivation vs a publish (cetrafs_sb_owned_bgs_derive()) */
 
     /* In-memory-only cached free-inode count: there is no on-disk field
@@ -2401,6 +2405,8 @@ static int cetrafs_layout_refresh_locked(struct super_block *sb)
                     "the current layout until then, and refusing I/O past it without calling it damage\n",
                     sb->s_id, (unsigned long long) le64_to_cpu(raw->total_blocks),
                     (unsigned long long) (bdev_nr_bytes(sb->s_bdev) / CETRAFS_BLOCK_SIZE));
+        WRITE_ONCE(sbi->layout_behind_bytes, bdev_nr_bytes(sb->s_bdev));
+        smp_wmb(); /* the size before the stamp that makes it count */
         WRITE_ONCE(sbi->layout_behind_at, jiffies | 1);
         rc = -EAGAIN;
         goto out;
@@ -4532,13 +4538,19 @@ int cetrafs_lba_run_past_end(struct super_block *sb, u64 lba, u64 count)
     might_sleep(); /* a forced read and layout_mutex (GROWFS-LIVE-REVIEW L3) */
     if (READ_ONCE(cetrafs_layout_past_end_no_refresh))
         return -EUCLEAN; /* test-only; see the parameter */
-    /* Behind the device as of less than a second ago: still "cannot
-     * tell", without another read of block 0 for every block a file
-     * in the new space is asked about. Only the answer that marks
-     * NOTHING is reused this way -- reusing "current" would turn a grow
-     * published within that second into damage (L4). */
+    /* Behind the device as of less than a second ago, and the device
+     * still the size that was judged: still "cannot tell", without
+     * another read of block 0 for every block a file in the new space is
+     * asked about. Only the answer that marks NOTHING is reused this way
+     * -- reusing "current" would turn a grow published within that
+     * second into damage (L4). A device that changed size since (the
+     * operator's rescan) is asked again at once: reusing the answer
+     * failed reads for up to a second after the rescan that fixed them
+     * (ctest grow-unrescanned). */
     behind = READ_ONCE(sbi->layout_behind_at);
-    if (behind && time_before(jiffies, behind + HZ))
+    smp_rmb(); /* pairs with the refresh's: the stamp, then its size */
+    if (behind && time_before(jiffies, behind + HZ) &&
+        READ_ONCE(sbi->layout_behind_bytes) == bdev_nr_bytes(sb->s_bdev))
         return -EAGAIN;
     r = cetrafs_sb_layout_refresh(sb);
     if (r == 1)
