@@ -1190,13 +1190,23 @@ static inline int cetrafs_repair_claim(int fd, const cetrafs_superblock_t *sb, c
                     cetrafs_repair_borrowed = 0;
                     return -2;
                 }
+                unsigned rbudget = CETRAFS_ROW_SETTLE_BUDGET_MS;
+
                 for (other = 0; other < count; other++) {
+                    unsigned char oblk[CETRAFS_BLOCK_SIZE];
                     cetrafs_node_entry_t o;
 
-                    if (other == idx ||
-                        pread(fd, &o, sizeof(o), cetrafs_node_row_off(sb, other)) != (ssize_t) sizeof(o))
+                    if (other == idx || cetrafs_node_row_pread_settled(fd, oblk, cetrafs_node_row_off(sb, other),
+                                                                       &rbudget) != (ssize_t) sizeof(oblk))
                         continue;
-                    if (cetrafs_le32(o.state) == CETRAFS_NODE_STATE_REPAIR) {
+                    memcpy(&o, oblk, sizeof(o));
+                    /* A claim that never verifies, re-reads included, is
+                     * damage, not a claimant -- as the probe before the
+                     * claim judges it. Counting it here made one damaged
+                     * row stop every repair, the one that rebuilds it
+                     * included (B-14). A claimant's write in flight
+                     * converges within the settle budget. */
+                    if (cetrafs_le32(o.state) == CETRAFS_NODE_STATE_REPAIR && cetrafs_node_row_crc_ok(&o)) {
                         cetrafs_repair_release(fd, sb, idx);
                         return -2;
                     }
