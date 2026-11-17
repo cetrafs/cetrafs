@@ -112,9 +112,12 @@ assert_lt "mkdir does not journal the child dirent block nothing can reach" "$DI
 # allocation bits are written (dbbc10c; mkdir allocates its block, create
 # none: mkdir 16.25 -> 17.32) and the birth claim a never-used number
 # takes too (74bce71; every create now, not about half: create 15.68 ->
-# 16.18, mkdir 17.32 -> 18.32).
-assert_lt "mkdir device writes stay bounded" "$MKDIR_W" 18.8
-assert_lt "create device writes stay bounded" "$CREATE_W" 16.6
+# 16.18, mkdir 17.32 -> 18.32). A new record is then written holding its
+# own namespace lock until its name lands, so a create stopped between
+# the two is reclaimed online (BM-29): one release swap more, +1.0 each
+# (create 17.18, mkdir 19.32).
+assert_lt "mkdir device writes stay bounded" "$MKDIR_W" 19.8
+assert_lt "create device writes stay bounded" "$CREATE_W" 17.6
 
 # The content must still be right: a blind write that skipped the read
 # publishes uninitialised memory if any byte goes unwritten.

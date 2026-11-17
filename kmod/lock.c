@@ -1441,6 +1441,16 @@ int cetrafs_inode_ns_mutex_lock(struct inode *inode)
     return mutex_lock_killable(&CETRAFS_I(inode)->ns_mutex);
 }
 
+/* A new record written already holding its namespace lock (dir.c's
+ * cetrafs_new_record_locked()): the in-core state an acquire leaves.
+ * Uncontended -- nothing else has the object yet -- so not killable: a
+ * held record with no in-core holder could never be released. */
+void cetrafs_inode_ns_adopt(struct inode *inode)
+{
+    mutex_lock(&CETRAFS_I(inode)->ns_mutex);
+    cetrafs_inode_ns_holder_set(inode, true);
+}
+
 /* See ns_holder's comment in struct cetrafs_inode_info. */
 void cetrafs_inode_ns_holder_set(struct inode *inode, bool held)
 {

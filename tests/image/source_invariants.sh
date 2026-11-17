@@ -1188,6 +1188,31 @@ C54R="$(python3 "$C54_SCAN" "$K")"
 [ -z "$C54R" ] && pass "class 54: no path under the namespace lock takes it again" ||
     fail "class 54: a path re-acquires the namespace lock it holds: $C54R"
 
+# The scan's one exemption, cetrafs_inode_ns_adopt() (a newborn inode's
+# lock, which nothing can hold yet), is exempt only while its sole caller
+# is the create path that hands it the inode it just made. Control: a
+# planted second caller is found.
+c54_adopt_callers() { # <kmod dir> -> the call sites, comments excluded
+    grep -n 'cetrafs_inode_ns_adopt(' "$1"/*.c | grep -v '^[^:]*lock.c:[0-9]*:void cetrafs_inode_ns_adopt(' |
+        grep -v '^[^:]*:[0-9]*: *\(\*\|/\*\)' || true
+}
+c54_adopt_ok() { # <kmod dir>
+    local c
+    c="$(c54_adopt_callers "$1")"
+    [ "$(wc -l <<<"$c")" = 1 ] && grep -q 'dir.c:.*cetrafs_inode_ns_adopt(inode);' <<<"$c" &&
+        awk '/^static void cetrafs_new_inode_take_born_lock\(/,/^}/' "$1/dir.c" | grep -q 'cetrafs_inode_ns_adopt(inode)'
+}
+c54_adopt_ok "$K" && pass "class 54: the newborn exemption has one caller, the create path's" ||
+    fail "class 54: cetrafs_inode_ns_adopt() is called from somewhere the scan's exemption does not cover: $(c54_adopt_callers "$K")"
+C54B="$(ct_tmp ns-adopt-plant)"
+rm -f "$C54B"
+mkdir -p "$C54B"
+cp "$K"/*.c "$C54B"/
+printf 'static void planted_adopt(struct inode *inode)\n{\n    cetrafs_inode_ns_adopt(inode);\n}\n' >>"$C54B/xattr.c"
+c54_adopt_ok "$C54B" && fail "class 54: control -- a planted second caller of the newborn adopt is not found" ||
+    pass "class 54: control -- a planted second caller of the newborn adopt is found"
+rm -rf "$C54B"
+
 # The real nesting guard is the only thing that keeps xattr_set from waiting
 # on the setattr that calls it. Removed from a copy, the scan must find it.
 C54G="$(ct_tmp ns-reentry-guard)"

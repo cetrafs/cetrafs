@@ -2074,6 +2074,11 @@ static void cetrafs_new_inode_discard(struct inode *inode)
     struct super_block *sb = inode->i_sb;
     cetrafs_inode_t raw;
 
+    /* The lock it was born holding goes first: the free below claims the
+     * record, which a held lock refuses (cetrafs_new_record_locked()). */
+    if (cetrafs_inode_ns_held_by_current(inode))
+        cetrafs_nslock_release(inode);
+
     /*
      * The on-disk record still says nlink=1 -- creation wrote it before
      * the name was published, and publishing is what failed. Clearing
@@ -2108,6 +2113,44 @@ static void cetrafs_new_inode_discard(struct inode *inode)
 }
 
 /*
+ * A new record is written holding its own namespace lock, and keeps it
+ * until its name lands (cetrafs_create_publish()). It used to be written
+ * unlocked with its link count already 1: a node that stopped between
+ * the record and the dirent left a file -- or an empty directory -- that
+ * no name reaches, whose count says it is named, and that no lock or
+ * flag marks, so nothing online ever reclaimed it (audit 2026-11-15
+ * BM-29). Held, the stop leaves the lock of a stopped holder, and that
+ * is a case every node already finishes: the scrub breaks it
+ * (scrub_reconcile_stopped_op()) or this node's re-attach sweeps it
+ * (cetrafs_lock_sweep_own_claims()), and the recount finds no name --
+ * nlink 0, and its own eviction frees it. One swap more per create, the
+ * release. A record this node cannot name itself the holder of (no node
+ * id: nothing mounts that far without one) is written unlocked.
+ */
+static bool cetrafs_born_unlocked; /* TEST ONLY: see the parameter */
+cetrafs_test_param(born_unlocked, cetrafs_born_unlocked, bool, 0644);
+MODULE_PARM_DESC(born_unlocked, "TEST ONLY: new records are written unlocked, as before BM-29");
+
+static void cetrafs_new_record_locked(struct super_block *sb, cetrafs_inode_t *raw)
+{
+    u32 me;
+
+    raw->ns_lock_owner = cetrafs_cpu_to_le32(CETRAFS_NODE_ID_NONE); /* v0x000A: 0 is a real node id */
+    if (READ_ONCE(cetrafs_born_unlocked) || cetrafs_sb_get_node_id(sb, &me))
+        return;
+    raw->ns_lock_owner = cetrafs_cpu_to_le32(me);
+    raw->ns_lock_incarnation = cetrafs_cpu_to_le32(cetrafs_sb_incarnation(sb));
+}
+
+/* The in-core half of the lock a record was born holding, once its
+ * object exists: what an acquire leaves (cetrafs_inode_ns_adopt()). */
+static void cetrafs_new_inode_take_born_lock(struct inode *inode, const cetrafs_inode_t *raw)
+{
+    if (cetrafs_le32(raw->ns_lock_owner) != CETRAFS_NODE_ID_NONE)
+        cetrafs_inode_ns_adopt(inode);
+}
+
+/*
  * Shared tail of create/mkdir/symlink: everything between "the child's
  * record is on disk" and "the name exists". The order is the point.
  *
@@ -2128,16 +2171,28 @@ static void cetrafs_new_inode_discard(struct inode *inode)
  * alone (cetrafs_new_inode_discard() above), the parent is untouched,
  * and there is no dirent to remove.
  */
+/* TEST ONLY: hold a create between its record and its name, so a suite
+ * can copy the device as a crash there leaves it
+ * (tests/kernel/create_stopped_unnamed.sh). */
+static unsigned int cetrafs_create_name_stall_ms;
+cetrafs_test_param(create_name_stall_ms, cetrafs_create_name_stall_ms, uint, 0644);
+MODULE_PARM_DESC(create_name_stall_ms, "TEST ONLY: pause a create between its record write and its name");
+
 static int cetrafs_create_publish(struct inode *dir, struct dentry *dentry, struct inode *inode)
 {
     int ret = cetrafs_init_security(inode, dir, &dentry->d_name);
 
     if (ret)
         return ret;
+    if (READ_ONCE(cetrafs_create_name_stall_ms))
+        msleep(min_t(unsigned int, READ_ONCE(cetrafs_create_name_stall_ms), 30000));
 
     ret = cetrafs_dir_add_entry(dir, &dentry->d_name, inode->i_ino, cetrafs_dirent_type(inode));
     if (ret)
         return ret;
+    /* Named: the lock it was born holding goes (cetrafs_new_record_locked()). */
+    if (cetrafs_inode_ns_held_by_current(inode))
+        cetrafs_nslock_release(inode);
 
     /* Unlike .lookup, the dentry here was already hashed negative by the
      * preceding lookup call, so d_splice_alias() (which asserts unhashed)
@@ -2188,7 +2243,7 @@ static int cetrafs_create_locked(struct mnt_idmap *idmap,
     raw.ctime = raw.mtime = raw.atime = cetrafs_cpu_to_le64((u64) now);
     raw.flags = cetrafs_cpu_to_le32(CETRAFS_INODE_EXTENTS);
     raw.generation = cetrafs_cpu_to_le64(cetrafs_inode_new_generation(sb)); /* v0x0008 reuse detector */
-    raw.ns_lock_owner = cetrafs_cpu_to_le32(CETRAFS_NODE_ID_NONE);          /* v0x000A: 0 is a real node id, so be explicit */
+    cetrafs_new_record_locked(sb, &raw); /* held until its name lands (BM-29) */
     raw.eh.eh_magic = cetrafs_cpu_to_le16(CETRAFS_EXT_MAGIC);
     raw.eh.eh_max = cetrafs_cpu_to_le16(ARRAY_SIZE(raw.et.leaf));
     /* eh_entries = 0, eh_depth = 0: a fresh file has no data blocks yet */
@@ -2215,6 +2270,7 @@ static int cetrafs_create_locked(struct mnt_idmap *idmap,
         cetrafs_free_inode(sb, ino);
         return PTR_ERR(inode);
     }
+    cetrafs_new_inode_take_born_lock(inode, &raw);
 
     ret = cetrafs_create_publish(dir, dentry, inode);
     if (ret) {
@@ -2757,6 +2813,31 @@ int cetrafs_ns_reconcile_counted(struct super_block *sb, u64 ino, u64 generation
         goto out;
     want_size = tally.slots * sizeof(cetrafs_dirent_t);
     want_nlink = (u32) min_t(u64, tally.subdirs + 2, U32_MAX);
+    /* An EMPTY directory no name reaches: a mkdir that stopped between
+     * its record and its entry (BM-29), the lock it was born holding
+     * still set. Dead, as an unnamed file is -- its eviction frees it.
+     * Only empty: one with children is somebody's tree, left whole for
+     * fsck -r to put in lost+found. The names are counted across the
+     * volume, which only an empty directory taken over from a stopped
+     * holder pays. */
+    if (tally.slots == 2 && !tally.subdirs && ino != 1 /* the root */ && !READ_ONCE(cetrafs_born_unlocked)) {
+        u32 names = 0;
+
+        ret = cetrafs_ns_count_names(sb, &ino, 1, &names);
+        if (ret == -EUCLEAN)
+            ret = -EIO; /* damage in some directory read for the count is not this one's */
+        if (ret)
+            goto out;
+        if (!names) {
+            pr_warn("dir ino=%llu: empty and named nowhere after an operation that stopped holding its lock -- "
+                    "removed\n",
+                    (unsigned long long) ino);
+            ret = cetrafs_ns_publish_nlink(sb, ino, generation, raw, 0, self);
+            if (!ret)
+                atomic64_inc(&cetrafs_ns_recounts);
+            goto out;
+        }
+    }
     if (cetrafs_le64(raw->size) == want_size && cetrafs_le32(raw->nlink) == want_nlink)
         goto out; /* the operation that stopped had published, or changed nothing */
 
@@ -2968,7 +3049,7 @@ static struct dentry *cetrafs_mkdir_locked(struct mnt_idmap *idmap,
     }
     raw.nlink = cetrafs_cpu_to_le32(2);
     raw.generation = cetrafs_cpu_to_le64(cetrafs_inode_new_generation(sb)); /* v0x0008 reuse detector */
-    raw.ns_lock_owner = cetrafs_cpu_to_le32(CETRAFS_NODE_ID_NONE);          /* v0x000A: 0 is a real node id, so be explicit */
+    cetrafs_new_record_locked(sb, &raw); /* held until its name lands (BM-29) */
     raw.size = cetrafs_cpu_to_le64(sizeof(cetrafs_dirent_t) * 2);
     raw.blocks = cetrafs_cpu_to_le64(CETRAFS_BLOCK_SIZE / 512);
     raw.ctime = raw.mtime = raw.atime = cetrafs_cpu_to_le64((u64) now);
@@ -3006,6 +3087,7 @@ static struct dentry *cetrafs_mkdir_locked(struct mnt_idmap *idmap,
         cetrafs_free_inode(sb, ino);
         return ERR_CAST(inode);
     }
+    cetrafs_new_inode_take_born_lock(inode, &raw);
 
     ret = cetrafs_create_publish(dir, dentry, inode);
     if (ret) {
@@ -4498,7 +4580,7 @@ static int cetrafs_symlink_locked(struct mnt_idmap *idmap,
     raw.ctime = raw.mtime = raw.atime = cetrafs_cpu_to_le64((u64) now);
     raw.flags = cetrafs_cpu_to_le32(CETRAFS_INODE_EXTENTS);
     raw.generation = cetrafs_cpu_to_le64(cetrafs_inode_new_generation(sb)); /* v0x0008 reuse detector */
-    raw.ns_lock_owner = cetrafs_cpu_to_le32(CETRAFS_NODE_ID_NONE);          /* v0x000A: 0 is a real node id, so be explicit */
+    cetrafs_new_record_locked(sb, &raw); /* held until its name lands (BM-29) */
     raw.eh.eh_magic = cetrafs_cpu_to_le16(CETRAFS_EXT_MAGIC);
     raw.eh.eh_max = cetrafs_cpu_to_le16(ARRAY_SIZE(raw.et.leaf));
 
@@ -4524,6 +4606,7 @@ static int cetrafs_symlink_locked(struct mnt_idmap *idmap,
         cetrafs_free_inode(sb, ino);
         return PTR_ERR(inode);
     }
+    cetrafs_new_inode_take_born_lock(inode, &raw);
 
     ret = page_symlink(inode, symname, len);
     if (ret) {

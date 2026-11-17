@@ -19,7 +19,10 @@ reached that way is a self-wait -- unless it is GUARDED: it sits in an
 (xattr.c's nesting check), so a caller that already holds the lock skips it.
 
 The acquire and release entry points are opaque: their own bodies are the
-primitives. Edges the walk cannot follow as direct calls are supplied by
+primitives. So is NEWBORN: cetrafs_inode_ns_adopt() takes the lock of an
+inode a create has just made (the lock its record was born holding,
+BM-29), which no path can already hold -- source_invariants.sh requires
+its one caller to be dir.c's cetrafs_new_inode_take_born_lock(). Edges the walk cannot follow as direct calls are supplied by
 VFS_EDGES: setattr_prepare() reaches the xattr handlers' .set (killpriv
 strips security.capability through vfs_removexattr), notify_change()
 reaches the .setattr operations. A new indirect edge must be added there.
@@ -38,6 +41,8 @@ RELEASE = re.compile(r"\b(cetrafs_nslock_release\w*|cetrafs_inode_ns_mutex_unloc
 OPAQUE = {"cetrafs_nslock_acquire", "cetrafs_nslock_acquire_set", "cetrafs_nslock_acquire_set_vfs",
           "cetrafs_nslock_acquire_tries", "__cetrafs_nslock_acquire_set", "cetrafs_inode_ns_mutex_lock",
           "cetrafs_inode_ns_mutex_unlock", "cetrafs_nslock_release", "cetrafs_nslock_release_set"}
+NEWBORN = {"cetrafs_inode_ns_adopt"}
+OPAQUE |= NEWBORN
 KEYWORDS = {"if", "while", "for", "switch", "return", "sizeof", "do", "else"}
 VFS_EDGES = {
     "setattr_prepare": "xattr-set",

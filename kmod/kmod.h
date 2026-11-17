@@ -1528,6 +1528,7 @@ bool cetrafs_inode_take_staged_record(struct inode *inode, cetrafs_inode_t *out,
 bool cetrafs_inode_peek_staged_record(struct inode *inode, cetrafs_inode_t *out);
 int cetrafs_inode_ns_mutex_lock(struct inode *inode);
 void cetrafs_inode_ns_mutex_unlock(struct inode *inode);
+void cetrafs_inode_ns_adopt(struct inode *inode);
 void cetrafs_inode_ns_holder_set(struct inode *inode, bool held);
 void cetrafs_inode_fd_stage(struct inode *inode, const cetrafs_inode_t *raw);
 void cetrafs_inode_fd_overlay(struct inode *inode, cetrafs_inode_t *raw);
