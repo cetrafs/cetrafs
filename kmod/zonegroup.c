@@ -2905,6 +2905,12 @@ struct cetrafs_pf_drain_ctx {
  * the tree. Bits: 1 = consume stops at an empty run of queue blocks
  * (the old scan); 2 = consume only what the read listed; 4 = apply a
  * range even while a copy is held; 8 = no re-read after consuming. */
+/* TEST ONLY: a region holding only garbage waits for a valid entry, as
+ * before BM-12 (the control of tests/kernel/pf_garbage_cleared.sh). */
+static bool cetrafs_pf_garbage_waits;
+cetrafs_test_param(pf_garbage_waits, cetrafs_pf_garbage_waits, bool, 0644);
+MODULE_PARM_DESC(pf_garbage_waits, "TEST ONLY: a pending-free region holding only garbage is not swapped");
+
 static unsigned int cetrafs_pf_drain_weaken;
 cetrafs_test_param(pf_drain_weaken, cetrafs_pf_drain_weaken, uint, 0644);
 MODULE_PARM_DESC(pf_drain_weaken, "TEST ONLY: disable parts of the drain's copy rule (bits: 1 sweep, 2 consume-all, 4 hold, 8 recheck)");
@@ -2925,9 +2931,8 @@ static int cetrafs_pf_drain_mutate(void *image, unsigned int len, void *priv)
             continue;
 
         /* Garbage is cleared on sight. Nothing can ever apply it, so
-         * leaving it would wedge that slot. A region holding ONLY garbage
-         * never reaches this swap (the drain skips it), so its garbage
-         * waits for a valid entry in the same region. */
+         * leaving it would wedge that slot -- a region holding only
+         * garbage is swapped for too (BM-12). */
         if (cetrafs_le32(ent[e].magic) != CETRAFS_PENDING_FREE_MAGIC || cetrafs_le32(ent[e].count) == 0) {
             memset(&ent[e], 0, sizeof(ent[e]));
             changed = true;
@@ -3206,7 +3211,7 @@ static int cetrafs_zg_drain_one(struct super_block *sb, u32 zg_id, bool may_wait
 
         for (r = 0; r < regions; r++) {
             const cetrafs_pending_free_t *ent = (const cetrafs_pending_free_t *) (bhs[qb]->b_data + r * region_sz);
-            unsigned int idx = qb * regions + r, valid = 0, try;
+            unsigned int idx = qb * regions + r, valid = 0, garbage = 0, try;
 
             for (e = 0; e < slots; e++) {
                 if (cetrafs_le64(ent[e].lba) == 0)
@@ -3215,12 +3220,18 @@ static int cetrafs_zg_drain_one(struct super_block *sb, u32 zg_id, bool may_wait
                     pr_err("pending free: ZG %u queue block %u entry %u is garbage (magic=0x%x count=%u) -- dropping\n",
                            zg_id, qb, r * slots + e, ent[e].magic, ent[e].count);
                     cetrafs_sb_corrupt(sb, 0);
-                    continue; /* the swap clears it, but only if the region has valid entries */
+                    garbage++;
+                    continue; /* the swap clears it */
                 }
                 valid++;
             }
-            if (!valid)
-                continue; /* garbage alone is not swapped for: it waits for a valid entry */
+            /* Garbage alone is swapped for too: the swap clears it and
+             * consumes nothing. Left to wait for a valid entry in the
+             * same region, it was reported -- and counted as damage --
+             * on every drain, for as long as none came (audit 2026-11-15
+             * BM-12). */
+            if (!valid && (!garbage || READ_ONCE(cetrafs_pf_garbage_waits)))
+                continue;
 
             /* A region this drain will not consume -- it stopped on an
              * error, or cannot track what it consumes -- keeps all of its

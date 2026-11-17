@@ -3633,12 +3633,34 @@ int main(int argc, char **argv)
         /* Pending-free queues: one per ZG, holding extents a peer freed
          * out of a ZG it does not own. An entry naming blocks outside
          * the owning ZG would have the owner clear bits in somebody
-         * else's bitmap on its next drain. */
+         * else's bitmap on its next drain.
+         *
+         * Every such entry is one the owner's drain consumes and drops
+         * unapplied -- a leak, never a free. They were fatal here and -r
+         * cleared none, so one stayed reported forever, and garbage --
+         * an entry failing its magic -- was not even seen, though the
+         * kernel counts it as damage on every drain (audit 2026-11-15
+         * BM-12). -r now drops each the drain's way, and the leak pass
+         * of this run reclaims what it named. */
+        /* Drop entry e of qblk the drain's way under -r (zero it), else count it. */
+#define FSCK_PF_DROP()                                                                                                 \
+    do {                                                                                                               \
+        /* class 45: keep -- a dropped queue entry leaks the block, never frees it */                                 \
+        if (repair_mode && !repair_blocked) {                                                                          \
+            memset(qblk + e * sizeof(pe), 0, sizeof(pe));                                                              \
+            q_dirty = 1;                                                                                               \
+            repairs_made++;                                                                                            \
+            printf("  dropped it (its blocks leak, reclaimed below)\n");                                               \
+        } else {                                                                                                       \
+            cl_problems++;                                                                                             \
+        }                                                                                                              \
+    } while (0)
         if (sb.pending_free_start) {
             for (uint32_t z = 0; z < cetrafs_le32(sb.zone_group_count); ++z) {
                 for (uint32_t b = 0; b < cetrafs_le32(sb.pending_free_blocks_per_zg); ++b) {
                     uint64_t qlba = cetrafs_le64(sb.pending_free_start) + (uint64_t) z * cetrafs_le32(sb.pending_free_blocks_per_zg) + b;
                     uint8_t qblk[CETRAFS_BLOCK_SIZE];
+                    int q_dirty = 0;
 
                     pread_all(fd, qblk, sizeof(qblk), (off_t) qlba * CETRAFS_BLOCK_SIZE);
                     for (unsigned e = 0; e < CETRAFS_PENDING_FREE_PER_BLOCK; ++e) {
@@ -3646,12 +3668,12 @@ int main(int argc, char **argv)
                         int64_t fbg, lbg;
 
                         memcpy(&pe, qblk + e * sizeof(pe), sizeof(pe));
-                        if (cetrafs_le32(pe.magic) != CETRAFS_PENDING_FREE_MAGIC || cetrafs_le64(pe.lba) == 0)
+                        if (cetrafs_le64(pe.lba) == 0)
                             continue;
-
-                        if (cetrafs_le32(pe.count) == 0) {
-                            fprintf(stderr, "ERR: ZG%u pending-free entry %u has count 0\n", z, e);
-                            cl_problems++;
+                        if (cetrafs_le32(pe.magic) != CETRAFS_PENDING_FREE_MAGIC || cetrafs_le32(pe.count) == 0) {
+                            fprintf(stderr, "ERR: ZG%u pending-free entry %u is garbage (magic 0x%x, count %u)\n", z, e,
+                                    cetrafs_le32(pe.magic), cetrafs_le32(pe.count));
+                            FSCK_PF_DROP();
                             continue;
                         }
                         FSCK_BG_FOR_LBA((uint64_t) cetrafs_le64(pe.lba), fbg);
@@ -3661,7 +3683,7 @@ int main(int argc, char **argv)
                                     "ERR: ZG%u pending-free entry %u names blocks %" PRIu64 "..%" PRIu64
                                     " outside every BG data region\n",
                                     z, e, (uint64_t) cetrafs_le64(pe.lba), (uint64_t) cetrafs_le64(pe.lba) + cetrafs_le32(pe.count) - 1);
-                            cl_problems++;
+                            FSCK_PF_DROP();
                             continue;
                         }
                         if (fbg != lbg) {
@@ -3669,7 +3691,7 @@ int main(int argc, char **argv)
                                     "ERR: ZG%u pending-free entry %u spans BG%" PRId64 " into BG%" PRId64
                                     " -- an extent never crosses a BG\n",
                                     z, e, fbg, lbg);
-                            cl_problems++;
+                            FSCK_PF_DROP();
                             continue;
                         }
                         /* A stamp is the group's free_gen as its appender
@@ -3680,25 +3702,29 @@ int main(int argc, char **argv)
                                     "ERR: ZG%u pending-free entry %u is stamped %" PRIu64 ", ahead of BG%" PRId64
                                     "'s free_gen %" PRIu64 "\n",
                                     z, e, (uint64_t) cetrafs_le64(pe.free_gen), fbg, bg_free_gen[fbg]);
-                            cl_problems++;
+                            FSCK_PF_DROP();
+                            continue;
                         }
                         if (bg_owner_expected[fbg] == CETRAFS_BG_OWNER_FREE) {
                             fprintf(stderr,
                                     "ERR: ZG%u pending-free entry %u names blocks in BG%" PRId64
                                     ", which is owned by nobody\n",
                                     z, e, fbg);
-                            cl_problems++;
+                            FSCK_PF_DROP();
                         } else if (bg_owner_expected[fbg] != z) {
                             fprintf(stderr,
                                     "ERR: ZG%u pending-free entry %u names blocks in BG%" PRId64
                                     ", which belongs to ZG%u\n",
                                     z, e, fbg, bg_owner_expected[fbg]);
-                            cl_problems++;
+                            FSCK_PF_DROP();
                         }
                     }
+                    if (q_dirty)
+                        pwrite_all(fd, qblk, sizeof(qblk), (off_t) qlba * CETRAFS_BLOCK_SIZE);
                 }
             }
         }
+#undef FSCK_PF_DROP
 #undef FSCK_BG_FOR_LBA
 
         if (journal_unapplied)
