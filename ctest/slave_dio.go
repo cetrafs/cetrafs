@@ -130,7 +130,7 @@ func (s *Slave) doChurn(a ChurnArgs) (ChurnResult, error) {
 
 // doFstrim issues FITRIM on the mountpoint over the whole volume.
 func (s *Slave) doFstrim() (FstrimResult, error) {
-	mp, err := s.resolvePath("")
+	mp, err := s.resolvePath(".") // the mountpoint itself: "" is not a local path to filepath.IsLocal
 	if err != nil {
 		return FstrimResult{}, err
 	}
