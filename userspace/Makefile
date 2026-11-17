@@ -50,16 +50,16 @@ TOOL_CFLAGS = $(CPPFLAGS) $(CFLAGS)
 TOOL_LDFLAGS = $(LDFLAGS)
 
 $(MKFS): mkfs.c $(HDRS)
-	$(CC) -D_FILE_OFFSET_BITS=64 -I $(SDIR)/include -O2 -std=gnu99 -Wall -Wextra $(WERROR) $(TOOL_CFLAGS) $(HARDEN) $(TOOL_LDFLAGS) -o $@ $<
+	$(CC) -D_FILE_OFFSET_BITS=64 -I $(SDIR)/include -O2 -std=gnu99 -Wall -Wextra -Wjump-misses-init $(WERROR) $(TOOL_CFLAGS) $(HARDEN) $(TOOL_LDFLAGS) -o $@ $<
 
 $(FSCK): fsck.c $(HDRS)
-	$(CC) -D_FILE_OFFSET_BITS=64 -I $(SDIR)/include -O2 -std=gnu99 -Wall -Wextra $(WERROR) $(TOOL_CFLAGS) $(HARDEN) $(TOOL_LDFLAGS) -o $@ $<
+	$(CC) -D_FILE_OFFSET_BITS=64 -I $(SDIR)/include -O2 -std=gnu99 -Wall -Wextra -Wjump-misses-init $(WERROR) $(TOOL_CFLAGS) $(HARDEN) $(TOOL_LDFLAGS) -o $@ $<
 
 $(DEFRAG): defrag.c $(HDRS)
-	$(CC) -D_FILE_OFFSET_BITS=64 -I $(SDIR)/include -O2 -std=gnu99 -Wall -Wextra $(WERROR) $(TOOL_CFLAGS) $(HARDEN) $(TOOL_LDFLAGS) -o $@ $<
+	$(CC) -D_FILE_OFFSET_BITS=64 -I $(SDIR)/include -O2 -std=gnu99 -Wall -Wextra -Wjump-misses-init $(WERROR) $(TOOL_CFLAGS) $(HARDEN) $(TOOL_LDFLAGS) -o $@ $<
 
 $(GROWFS): growfs.c $(HDRS)
-	$(CC) -D_FILE_OFFSET_BITS=64 -I $(SDIR)/include -O2 -std=gnu99 -Wall -Wextra $(WERROR) $(TOOL_CFLAGS) $(HARDEN) $(TOOL_LDFLAGS) -o $@ $<
+	$(CC) -D_FILE_OFFSET_BITS=64 -I $(SDIR)/include -O2 -std=gnu99 -Wall -Wextra -Wjump-misses-init $(WERROR) $(TOOL_CFLAGS) $(HARDEN) $(TOOL_LDFLAGS) -o $@ $<
 
 
 # Sparse (>= 0.6.5) static check that every on-disk-struct field is

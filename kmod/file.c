@@ -8737,6 +8737,16 @@ static int cetrafs_do_allocate(struct inode *inode, loff_t offset, loff_t len, b
     u32 tree_have, tree_cap;
     bool built = false;
     int ret, loop_ret = 0;
+    /* Up here, not where first used: out_free frees the map, and the
+     * early exits jumped over a later declaration -- its initialiser
+     * with it -- so a failed record read kvfree'd stack garbage (an Oops
+     * in fallocate). The module builds with -Wjump-misses-init as an
+     * error since (kmod/Makefile). */
+    u64 run_lba = 0; /* blocks claimed for a run and not yet used */
+    u32 run_left = 0, run_bg = 0;
+    bool per_block = READ_ONCE(cetrafs_falloc_lookup_per_block);
+    struct cetrafs_falloc_map map = {0};
+    u32 mi = 0; /* the first map entry that does not end before b */
 
     start_block = (u64) offset / CETRAFS_BLOCK_SIZE;
     end_block = CETRAFS_DIV_ROUND_UP((u64) end, CETRAFS_BLOCK_SIZE);
@@ -8799,11 +8809,6 @@ static int cetrafs_do_allocate(struct inode *inode, loff_t offset, loff_t len, b
      */
     tree_have = cetrafs_tree_extent_count(inode, &raw);
     tree_cap = cetrafs_tree_max_extents();
-    u64 run_lba = 0; /* blocks claimed for a run and not yet used */
-    u32 run_left = 0, run_bg = 0;
-    bool per_block = READ_ONCE(cetrafs_falloc_lookup_per_block);
-    struct cetrafs_falloc_map map = {0};
-    u32 mi = 0; /* the first map entry that does not end before b */
 
     if (!per_block) {
         ret = cetrafs_falloc_map_build(inode, &raw, start_block, end_block, &map);

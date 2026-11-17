@@ -15,6 +15,12 @@ ifeq ($(CETRAFS_NO_WERROR),)
 ccflags-y += -Werror
 endif
 
+# A goto past a declaration skips its initialiser, and C allows it in
+# silence: cetrafs_do_allocate()'s early exits jumped over the map its
+# exit path frees, and a failed record read kvfree'd stack garbage (an
+# Oops in fallocate, 2026-11-17). Every jump of that kind is an error.
+ccflags-y += -Wjump-misses-init
+
 # Pin the stack-frame budget instead of inheriting CONFIG_FRAME_WARN,
 # which DIFFERS BETWEEN KERNELS and made this project's own dev machine
 # blind: Debian's arm64 kernel sets 2048, Proxmox's amd64 kernel sets
