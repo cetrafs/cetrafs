@@ -1051,20 +1051,91 @@ static unsigned int cetrafs_dio_end_io_stall_ms;
 cetrafs_test_param(dio_end_io_stall_ms, cetrafs_dio_end_io_stall_ms, uint, 0644);
 MODULE_PARM_DESC(dio_end_io_stall_ms, "TEST ONLY: the next O_DIRECT completion stalls before converting (one-shot)");
 
+/*
+ * A failed O_DIRECT write, asked again whether the device refused it for
+ * space (audit BM-15). The old O_DIRECT code (fs/direct-io.c) turns every
+ * failed bio into EIO -- a thin pool's "no space" (BLK_STS_NOSPC: SCSI
+ * DATA PROTECT 27/07, dm-thin error_if_no_space) included -- and qemu
+ * pauses a guest on ENOSPC but hands EIO to it. The write's pages are
+ * gone by the completion, so the device is asked with a block no file
+ * uses: one scratch block, allocated, written with a pattern (an array
+ * that detects zeros would not allocate for them) under its own status,
+ * and freed. Never a block of the file: another writer may have written
+ * the failed one since, and the probe would land over its data.
+ *
+ * A miss is safe: a scratch block the device has provisioned already
+ * takes the write while the pool is full, and the error stays EIO, as
+ * before. Only in task context: an async overwrite's completion can run
+ * from the bio's end_io (only a write that allocates defers it), and an
+ * overwrite of provisioned blocks needs no new space anyway, short of a
+ * snapshot on the array.
+ */
+static bool cetrafs_dio_nospc_probe_off; /* TEST ONLY: see the parameter */
+cetrafs_test_param(dio_nospc_probe_off, cetrafs_dio_nospc_probe_off, bool, 0644);
+MODULE_PARM_DESC(dio_nospc_probe_off, "TEST ONLY: a failed O_DIRECT write stays EIO, the device not asked (before BM-15)");
+
+static atomic64_t cetrafs_dio_nospc_probes = ATOMIC64_INIT(0);
+static atomic64_t cetrafs_dio_nospc_found = ATOMIC64_INIT(0);
+
+u64 cetrafs_dio_nospc_probe_count(void)
+{
+    return (u64) atomic64_read(&cetrafs_dio_nospc_probes);
+}
+
+u64 cetrafs_dio_nospc_found_count(void)
+{
+    return (u64) atomic64_read(&cetrafs_dio_nospc_found);
+}
+
+static int cetrafs_dio_nospc_probe(struct super_block *sb)
+{
+    struct page *page;
+    struct bio *bio;
+    u64 lba;
+    int ret;
+
+    if (READ_ONCE(cetrafs_dio_nospc_probe_off) || !in_task() || cetrafs_sb_is_fenced(sb))
+        return 0;
+    page = alloc_page(GFP_NOFS);
+    if (!page)
+        return 0;
+    if (cetrafs_alloc_block_anywhere(sb, NULL, &lba)) {
+        __free_page(page); /* no block to ask with: the answer stays EIO */
+        return 0;
+    }
+    atomic64_inc(&cetrafs_dio_nospc_probes);
+    memset(page_address(page), 0xc5, PAGE_SIZE);
+    bio = bio_alloc(sb->s_bdev, 1, REQ_OP_WRITE | REQ_SYNC, GFP_NOFS);
+    bio->bi_iter.bi_sector = lba * (CETRAFS_BLOCK_SIZE >> SECTOR_SHIFT);
+    __bio_add_page(bio, page, CETRAFS_BLOCK_SIZE, 0);
+    ret = submit_bio_wait(bio);
+    bio_put(bio);
+    __free_page(page);
+    cetrafs_free_data_block(sb, lba); /* never referenced: nothing to publish first */
+    if (ret != -ENOSPC)
+        return 0;
+    atomic64_inc(&cetrafs_dio_nospc_found);
+    pr_warn_ratelimited("%s: an O_DIRECT write failed and the device refuses writes for space -- ENOSPC, not EIO\n",
+                        sb->s_id);
+    return -ENOSPC;
+}
+
 static int cetrafs_dio_end_io(struct kiocb *iocb, loff_t offset, ssize_t size, void *private)
 {
     struct inode *inode = file_inode(iocb->ki_filp);
     unsigned int bits = inode->i_blkbits;
     sector_t b, last;
     int ret = 0;
+    /* The legacy code's only word for a failed bio (BM-15). */
+    int verdict = size == -EIO ? cetrafs_dio_nospc_probe(inode->i_sb) : 0;
 
     if (!cetrafs_dio_is_track(private))
-        return 0;
+        return verdict;
     if (unlikely(READ_ONCE(cetrafs_dio_end_io_stall_ms)))
         msleep(xchg(&cetrafs_dio_end_io_stall_ms, 0)); /* TEST ONLY, one-shot */
     if (size <= 0 || cetrafs_dio_skip_convert) { /* skip: test-only, see the knob */
         cetrafs_dio_track_done(inode, private); /* nothing landed to convert, or kept preallocated */
-        return 0;
+        return verdict;
     }
 
     b = offset >> bits;

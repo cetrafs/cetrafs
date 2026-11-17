@@ -448,6 +448,8 @@ static int cetrafs_proc_info_show(struct seq_file *m, void *v)
     seq_printf(m, "held_flush_batches: %llu\n", cetrafs_held_flush_batch_count());
     seq_printf(m, "held_unlisted: %llu\n", cetrafs_held_unlisted_count());
     seq_printf(m, "keep_lock_deferred: %llu\n", cetrafs_keep_lock_deferred_count());
+    seq_printf(m, "dio_nospc_probes: %llu\n", cetrafs_dio_nospc_probe_count());
+    seq_printf(m, "dio_nospc_found: %llu\n", cetrafs_dio_nospc_found_count());
     seq_printf(m, "held_listed: %lu\n", cetrafs_held_listed(sb));
     seq_printf(m, "ibmap_abandoned: %llu\n", cetrafs_ibmap_abandoned_count());
     seq_printf(m, "ibmap_busy_skips: %llu\n", cetrafs_ibmap_busy_skip_count());

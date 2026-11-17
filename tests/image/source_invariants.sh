@@ -2151,6 +2151,33 @@ printf 'static bool cetrafs_thing_key_matches(const struct ci *ci, const cetrafs
 # literal the scan cannot place in a function fails as well: the scan
 # once missed every __cetrafs_* function, __cetrafs_get_block()'s
 # ENOSPC among them.
+# Class 58: an O_DIRECT write completion is the one place the legacy
+# code's EIO can be told from a device's "no space" (BM-15): every
+# __blockdev_direct_IO() write passes cetrafs_dio_end_io(), and that asks
+# the device. The probe is called from nowhere else: a writeback error
+# reported at fsync must stay EIO -- its pages are clean already, so a
+# guest resumed after an ENOSPC pause would retry the flush, succeed,
+# and never learn the data is gone.
+log "checking every O_DIRECT write completion asks the device whether an EIO was a space refusal (class 58)"
+c58_dio_calls() { # <files...>: "file:line ok|bad" per __blockdev_direct_IO( call
+    # from the call to its closing ");" -- the arguments, however wrapped
+    awk '/__blockdev_direct_IO\(/ && !/^[[:space:]]*\*/ { on = 1; at = FILENAME ":" FNR; ok = 0 }
+         on { if (/cetrafs_dio_end_io/) ok = 1; if (/\);/) { on = 0; print at, (ok ? "ok" : "bad") } }' "$@"
+}
+C58="$(c58_dio_calls "$K"/*.c)"
+[ -n "$C58" ] || fail "class 58: setup -- no __blockdev_direct_IO() call found; the scan is not seeing the tree"
+grep -q ' bad$' <<<"$C58" && fail "class 58: an O_DIRECT write completes without cetrafs_dio_end_io(): $(grep ' bad$' <<<"$C58" | tr '\n' ' ')" ||
+    pass "class 58: every __blockdev_direct_IO() write completes through cetrafs_dio_end_io()"
+grep -q 'cetrafs_dio_nospc_probe(' <<<"$(c41_body cetrafs_dio_end_io)" &&
+    pass "class 58: cetrafs_dio_end_io() asks the device" || fail "class 58: cetrafs_dio_end_io() no longer calls cetrafs_dio_nospc_probe()"
+C58X="$(grep -n 'cetrafs_dio_nospc_probe(' "$K"/*.c | grep -v 'static int cetrafs_dio_nospc_probe(' | grep -vc 'size == -EIO ? cetrafs_dio_nospc_probe(' || true)"
+[ "$C58X" = 0 ] && pass "class 58: the probe answers only a failed O_DIRECT write" ||
+    fail "class 58: cetrafs_dio_nospc_probe() is called outside cetrafs_dio_end_io() ($C58X) -- a writeback error must stay EIO"
+C58S="$(ct_tmp c58).c"
+printf 'static ssize_t x(struct kiocb *iocb)\n{\n    return __blockdev_direct_IO(iocb, inode, bdev, iter, get_block,\n                                NULL, 0);\n}\n' >"$C58S"
+grep -q ' bad$' <<<"$(c58_dio_calls "$C58S")" && pass "class 58: control -- a planted write with no completion is found" ||
+    fail "class 58: control -- a planted write with no completion is not found"
+
 log "checking every -ENOSPC/-EBUSY/-ENOENT/-ETXTBSY names the transient states it waited out (class 43)"
 C43_REG_ENOSPC='cetrafs_alloc_pick_bg waits:cetrafs_sb_release_wait
 cetrafs_alloc_block_anywhere calls:cetrafs_alloc_pick_bg
@@ -2184,6 +2211,7 @@ cetrafs_submit_deferred_target final:test-injection-what-a-full-thin-pool-answer
 cetrafs_wait_deferred_target final:the-device-refused-a-tree-block-target-no-space-entry-live-block-kept
 cetrafs_write_locked_bh_once final:the-device-refused-the-write-no-space-thin-pool-or-test-injection-an-overwrite-waits-in-cetrafs_write_locked_bh
 cetrafs_write_bhs_status final:test-injection-what-a-full-thin-pool-answers
+cetrafs_dio_nospc_probe final:the-device-refused-a-scratch-write-for-space-thin-pool-a-failed-o_direct-write-says-so-BM-15
 cetrafs_node_register final:every-registry-row-taken
 cetrafs_dir_add_entry final:the-directory-is-at-CETRAFS_DIR_MAX_BLOCKS
 cetrafs_tree_resv_fill final:test-injection-convert_append_nospc
@@ -2375,6 +2403,7 @@ __cetrafs_get_block own:a-block-never-published
 cetrafs_tree_append_inner own:a-leaf-or-index-never-published
 cetrafs_tree_resv_fill own:a-tree-block-reserve-fill-nothing-references-given-back-before-its-reservation-is-unpublished
 cetrafs_xattr_write_new own:its-new-block-named-by-nothing-on-failure
+cetrafs_dio_nospc_probe own:a-scratch-block-written-once-and-named-by-nothing-BM-15
 cetrafs_bg_release_one own:test-injection-release_noop_free-of-an-already-free-block
 cetrafs_tree_split_leaf own:a-new-leaf-whose-write-failed-before-any-interior-names-it
 cetrafs_tree_build own:a-tree-never-published
@@ -2629,6 +2658,7 @@ file.c:__cetrafs_get_block:a block it allocated and never published
 file.c:cetrafs_tree_append_inner:a leaf or index it allocated and never published
 lock.c:cetrafs_tree_resv_fill:a reserve fill nothing references, given back before its reservation is unpublished
 xattr.c:cetrafs_xattr_write_new:its own new block, named by nothing
+file.c:cetrafs_dio_nospc_probe:a scratch block it allocated, wrote once and freed, never published (BM-15) -- the scrub'"'"'s two-pass gap and alloc_seq, as every unpublished allocation
 xattr.c:cetrafs_xattr_set_locked:a new block its failed publish never named (the old block goes through cetrafs_xattr_swap_block'"'"'s bracket)
 alloc.c:cetrafs_bg_release_one:TEST ONLY (release_noop_free): a free of a block already free
 file.c:cetrafs_tree_split_leaf:a new leaf whose write failed, before any interior names it
