@@ -59,6 +59,13 @@ PROC="$(ct_procdir "$DEV")"
     fail "hb_interval_secs=0 reached the mount as $(info hb_interval_secs)"
 ct_umount "$MNT"
 
+# A window above 240 s is refused at the write since BM-41 (eacb980) --
+# no peer honours one -- so the mount-side cap is reached only past that
+# refusal, through its TEST ONLY switch.
+(echo 4294967295 >/sys/module/cetrafs/parameters/stale_secs) 2>/dev/null &&
+    fail "stale_secs=4294967295 was accepted at the write" ||
+    pass "stale_secs above 240 is refused at the write"
+ct_param_set stale_param_unbounded 1
 ct_param_set stale_secs 4294967295
 ct_param_set hb_interval_secs 4294967
 ct_mount "$DEV" "$MNT"
@@ -68,6 +75,7 @@ ct_mount "$DEV" "$MNT"
     fail "stale_secs=4294967295 reached the mount as $(info stale_secs)"
 ct_umount "$MNT"
 
+ct_param_set stale_param_unbounded 0
 ct_param_set stale_secs 120
 ct_param_set hb_interval_secs 60
 ct_mount "$DEV" "$MNT"
