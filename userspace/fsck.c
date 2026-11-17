@@ -1232,6 +1232,61 @@ static int fsck_rebuild_bg_desc(int fd, const cetrafs_superblock_t *sb, uint64_t
  *     into the cluster's lock-mode election: a departed row takes no
  *     part in it. Its timers are the defaults.
  */
+/*
+ * The incarnation the records' claims name for row n (audit F-51), or
+ * 'fallback'. A rebuilt row kept the damaged image's incarnation, and a
+ * re-attach draws a new one that is "never the value the row held
+ * before" -- now the damaged value, not the real one, so it could draw
+ * the real one and an old claim of the node would read as the new
+ * mount's. The claims still carry the real value: a file lock, a
+ * namespace lock, a presence bit. One value among them is restored; none,
+ * or several that disagree, keep the image's.
+ */
+static uint32_t fsck_row_claimed_incarnation(int fd, const cetrafs_superblock_t *sb, uint32_t n, uint32_t fallback)
+{
+    enum { CHUNK = 256 };
+    uint64_t count = cetrafs_le32(sb->inodes_count), slot = n % CETRAFS_MAX_READER_NODES;
+    uint8_t *buf = (uint8_t *) xcalloc(CHUNK, CETRAFS_BLOCK_SIZE);
+    uint32_t found = 0;
+    int conflict = 0;
+
+    for (uint64_t i = 0; i < count && !conflict; i += CHUNK) {
+        uint64_t k = count - i < CHUNK ? count - i : CHUNK;
+
+        pread_all(fd, buf, (size_t) k * CETRAFS_BLOCK_SIZE,
+                  (off_t) (cetrafs_le64(sb->inode_table_start) + i) * CETRAFS_BLOCK_SIZE);
+        for (uint64_t j = 0; j < k && !conflict; j++) {
+            cetrafs_inode_t in;
+            uint32_t v[3];
+            int nv = 0;
+
+            memcpy(&in, buf + j * CETRAFS_BLOCK_SIZE, sizeof(in));
+            if (!cetrafs_inode_crcs_ok(&in))
+                continue;
+            if (cetrafs_le32(in.lock_owner_node) == n && cetrafs_le32(in.lock_mode) != CETRAFS_LOCK_NONE)
+                v[nv++] = cetrafs_le32(in.lock_owner_incarnation);
+            if (cetrafs_le32(in.ns_lock_owner) == n)
+                v[nv++] = cetrafs_le32(in.ns_lock_incarnation);
+            if (cetrafs_le64(in.read_open_nodes) & (1ULL << slot))
+                v[nv++] = cetrafs_le32(in.read_open_incarnation[slot]);
+            for (int q = 0; q < nv; q++) {
+                if (!v[q])
+                    continue;
+                if (found && v[q] != found)
+                    conflict = 1;
+                found = v[q];
+            }
+        }
+    }
+    free(buf);
+    if (conflict || !found)
+        return fallback;
+    if (found != fallback)
+        printf("  node slot %u: incarnation restored to %u from the claims its records carry (the image said %u)\n",
+               n, found, fallback);
+    return found;
+}
+
 static void fsck_rebuild_node_row(int fd, const cetrafs_superblock_t *sb, uint32_t n, const cetrafs_node_entry_t *old)
 {
     uint8_t blk[CETRAFS_BLOCK_SIZE] = {0};
@@ -1246,7 +1301,7 @@ static void fsck_rebuild_node_row(int fd, const cetrafs_superblock_t *sb, uint32
         ne.departure = cetrafs_cpu_to_le32(CETRAFS_NODE_DEPART_DEAD);
         ne.hb_seq = old->hb_seq;
         ne.last_seen = old->last_seen;
-        ne.incarnation = old->incarnation;
+        ne.incarnation = cetrafs_cpu_to_le32(fsck_row_claimed_incarnation(fd, sb, n, cetrafs_le32(old->incarnation)));
         ne.file_lock_mode = old->file_lock_mode;
         ne.fence_epoch = cetrafs_cpu_to_le64(cetrafs_le64(old->fence_epoch) + 1);
         ne.hb_interval_secs = cetrafs_cpu_to_le32(CETRAFS_HEARTBEAT_INTERVAL_SECS);
