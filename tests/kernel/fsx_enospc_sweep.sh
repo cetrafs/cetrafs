@@ -44,6 +44,10 @@ set -euo pipefail
 . "$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)/lib/harness.sh"
 require_root
 require_module
+# One extent per scattered write, as the full-leaf step needs: the 64 KiB
+# unit (sparse unit, convert widen) marks a whole unit written on its
+# first write and merges the scatter, and the leaf never filled.
+ct_param_set convert_unit_blocks 1
 P=/sys/module/cetrafs/parameters
 for k in tree_alloc_fail_at tree_resv_off; do
     [ -w "$P/$k" ] || { fail "setup: module parameter $k is missing -- the module predates the class 56 instrument"; ct_exit; }
