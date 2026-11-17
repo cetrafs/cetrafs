@@ -5674,9 +5674,31 @@ func RunScrubTransit(clients []*Client, baseDir string) (bool, error) {
 		return false, fmt.Errorf("%s: writing the file: %w", a.Name, err)
 	}
 
+	// Earlier scenarios on this volume can leave leaked blocks (a node
+	// cut or fenced mid-write), and the scrub rightly reclaims them --
+	// in A's group, which also drops a free queued there from before the
+	// reclaim (its stamp is older; it leaks to the scrub instead). Two
+	// full cycles first, so what follows is measured on a settled group.
+	_, cs, err := scrubCounters(a)
+	if err != nil {
+		return false, err
+	}
+	for settle := time.Now().Add(90 * time.Second); time.Now().Before(settle); time.Sleep(500 * time.Millisecond) {
+		_, cyc, err := scrubCounters(a)
+		if err != nil {
+			return false, err
+		}
+		if cyc >= cs+2 {
+			break
+		}
+	}
+
 	r0, c0, err := scrubCounters(a)
 	if err != nil {
 		return false, err
+	}
+	if c0 < cs+2 {
+		return false, fmt.Errorf("setup: %s's scrub ran %d cycle(s) in 90 s, not the 2 that settle its groups", a.Name, c0-cs)
 	}
 
 	// B deletes it: foreign blocks, so the free is queued on A's queue.
