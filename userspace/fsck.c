@@ -239,6 +239,8 @@ static uint64_t repairs_made;
  * is never silently dropped from the count just because it was found
  * early -- and so a repaired one still makes the run report itself. */
 static uint64_t early_problems;
+/* Per Zone Group: 1 its record is damaged, 2 rebuilt by this run (B-14). */
+static uint8_t *fsck_zg_damaged;
 /* Block 0 did not verify and the volume is checked through its copy;
  * the copy did not match block 0 (A-7). */
 static int sb_from_copy, sb_copy_bad;
@@ -902,6 +904,37 @@ static void fsck_adjust_bg_counts(int fd, uint32_t b, int credit)
     else if (!pool && cetrafs_le64(zg.free_data_blocks))
         zg.free_data_blocks = cetrafs_cpu_to_le64(cetrafs_le64(zg.free_data_blocks) - 1);
     zg.hot_checksum = cetrafs_cpu_to_le64(0);
+    zg.hot_checksum = cetrafs_cpu_to_le64((uint64_t) crc32c_struct((const uint8_t *) &zg + CETRAFS_ZG_HOT_OFF,
+                                                                   CETRAFS_ZG_HOT_LEN,
+                                                                   offsetof(cetrafs_zone_group_t, hot_checksum) -
+                                                                       CETRAFS_ZG_HOT_OFF,
+                                                                   sizeof(zg.hot_checksum)));
+    memcpy(blk, &zg, sizeof(zg));
+    pwrite_all(fd, blk, sizeof(blk), (off_t) (cetrafs_le64(sb->zg_table_start) + z) * CETRAFS_BLOCK_SIZE);
+}
+
+/*
+ * A Zone Group record that fails its checksum, rebuilt (audit 2026-11-15
+ * B-14). Every field is reconstructible offline: its id is its place in
+ * the table; its owner is NONE -- no node is mounted (the repair claim
+ * and the live-peer check hold), and the next mount claims an unowned
+ * Zone Group and recounts it from the bitmaps -- and its counts are
+ * zero here, recounted from the bitmaps by the aggregate pass of this
+ * same run. A grow's pool marker goes with it: the pool is recounted.
+ */
+static void fsck_rebuild_zg(int fd, const cetrafs_superblock_t *sb, uint32_t z)
+{
+    uint8_t blk[CETRAFS_BLOCK_SIZE] = {0};
+    cetrafs_zone_group_t zg;
+
+    memset(&zg, 0, sizeof(zg));
+    zg.zg_id = cetrafs_cpu_to_le16((uint16_t) z);
+    zg.owner_node_id = cetrafs_cpu_to_le16((uint16_t) CETRAFS_NODE_ID_NONE);
+    zg.cold_checksum = cetrafs_cpu_to_le64((uint64_t) crc32c_struct((const uint8_t *) &zg + CETRAFS_ZG_COLD_OFF,
+                                                                    CETRAFS_ZG_COLD_LEN,
+                                                                    offsetof(cetrafs_zone_group_t, cold_checksum) -
+                                                                        CETRAFS_ZG_COLD_OFF,
+                                                                    sizeof(zg.cold_checksum)));
     zg.hot_checksum = cetrafs_cpu_to_le64((uint64_t) crc32c_struct((const uint8_t *) &zg + CETRAFS_ZG_HOT_OFF,
                                                                    CETRAFS_ZG_HOT_LEN,
                                                                    offsetof(cetrafs_zone_group_t, hot_checksum) -
@@ -2571,25 +2604,39 @@ int main(int argc, char **argv)
         pread_all(fd, blk, sizeof(blk), (off_t) (cetrafs_le64(sb.zg_table_start) + z) * CETRAFS_BLOCK_SIZE);
         cetrafs_zone_group_t zg;
         memcpy(&zg, blk, sizeof(zg));
-        if (cetrafs_le16(zg.zg_id) != (uint16_t) z) {
-            fprintf(stderr, "ERR: ZG id %u != %u\n", zg.zg_id, z);
-            return 1;
-        }
         /* v0x0008: hot sector and cold remainder are checksummed
          * independently (cetrafs.h) -- verify both. */
         uint32_t zhot =
             crc32c_struct((const uint8_t *) &zg + CETRAFS_ZG_HOT_OFF, CETRAFS_ZG_HOT_LEN,
                           offsetof(cetrafs_zone_group_t, hot_checksum) - CETRAFS_ZG_HOT_OFF, sizeof(zg.hot_checksum));
-        if ((uint32_t) cetrafs_le64(zg.hot_checksum) != zhot) {
-            fprintf(stderr, "ERR: ZG%u hot-sector CRC mismatch\n", z);
-            return 1;
-        }
         uint32_t zcold = crc32c_struct((const uint8_t *) &zg + CETRAFS_ZG_COLD_OFF, CETRAFS_ZG_COLD_LEN,
                                        offsetof(cetrafs_zone_group_t, cold_checksum) - CETRAFS_ZG_COLD_OFF,
                                        sizeof(zg.cold_checksum));
-        if ((uint32_t) cetrafs_le64(zg.cold_checksum) != zcold) {
-            fprintf(stderr, "ERR: ZG%u cold-region CRC mismatch\n", z);
-            return 1;
+        const char *zbad = cetrafs_le16(zg.zg_id) != (uint16_t) z           ? "names another Zone Group"
+                           : (uint32_t) cetrafs_le64(zg.hot_checksum) != zhot ? "hot-sector CRC mismatch"
+                           : (uint32_t) cetrafs_le64(zg.cold_checksum) != zcold ? "cold-region CRC mismatch"
+                                                                               : NULL;
+
+        /* One damaged record refused every mount and fsck could only
+         * say so (B-14). Rebuilt under -r; otherwise reported, and the
+         * rest of the volume still checked, with this Zone Group read
+         * as unowned. */
+        if (zbad) {
+            fprintf(stderr, "ERR: ZG%u %s%s\n", z, zbad, repair_mode ? "" : " -- fsck.cetra -r rebuilds it");
+            early_problems++;
+            if (!fsck_zg_damaged)
+                fsck_zg_damaged = (uint8_t *) xcalloc(cetrafs_le32(sb.zone_group_count), 1);
+            fsck_zg_damaged[z] = 1;
+            /* Every field is derivable, and it names no owner: if a later fault blocks repair,
+             * its zero counts only understate (the next claim recounts them). */
+            if (repair_mode && !repair_blocked) { /* class 45: rebuild */
+                fsck_rebuild_zg(fd, &sb, z);
+                printf("  rebuilt the record of ZG%u (unowned; its counts recounted below)\n", z);
+                repairs_made++;
+                fsck_zg_damaged[z] = 2; /* rebuilt: its counts are recounted below */
+            }
+            zg_owner[z] = CETRAFS_NODE_ID_NONE;
+            continue;
         }
         /* No span to check. A Zone Group no longer says which Block
          * Groups are its members; the Block Groups say so themselves,
@@ -4381,6 +4428,8 @@ int main(int argc, char **argv)
             uint8_t zblk[CETRAFS_BLOCK_SIZE] = {0};
             cetrafs_zone_group_t zg;
 
+            if (fsck_zg_damaged && fsck_zg_damaged[z] == 1)
+                continue; /* reported above; its counts mean nothing until it is rebuilt */
             pread_all(fd, zblk, sizeof(zblk), (off_t) (cetrafs_le64(sb.zg_table_start) + z) * CETRAFS_BLOCK_SIZE);
             memcpy(&zg, zblk, sizeof(zg));
             int agg_ok = cetrafs_le64(zg.free_data_blocks) == zg_free_truth[z];
