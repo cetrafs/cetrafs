@@ -2762,6 +2762,13 @@ static unsigned int cetrafs_peer_beating_wait_secs;
 cetrafs_test_param(peer_beating_wait_secs, cetrafs_peer_beating_wait_secs, uint, 0644);
 MODULE_PARM_DESC(peer_beating_wait_secs, "TEST ONLY: watch a not-yet-stale peer this long before calling it silent");
 
+/* TEST ONLY: a beat is judged against the shared watch's last sample,
+ * which the heartbeat tick also takes, as before -- the control of
+ * tests/kernel/nofilelock_open_peer_fast.sh round P. */
+static bool cetrafs_peer_beating_shared_watch;
+cetrafs_test_param(peer_beating_shared_watch, cetrafs_peer_beating_shared_watch, bool, 0644);
+MODULE_PARM_DESC(peer_beating_shared_watch, "TEST ONLY: judge a peer's beat against the tick's last sample");
+
 /*
  * Is a peer that is not stale beating, or has it gone silent? Asked
  * where "not stale yet" is not enough to act on (a nofilelock open of a
@@ -2777,13 +2784,15 @@ MODULE_PARM_DESC(peer_beating_wait_secs, "TEST ONLY: watch a not-yet-stale peer 
 static int __cetrafs_node_peer_beating(struct super_block *sb, u32 node_id, bool *beating, bool during,
                                        struct cetrafs_row_mark *still)
 {
+    struct cetrafs_row_mark base;
+    unsigned long base_since = 0;
     bool sampled = false;
 
     *beating = false;
     for (;;) {
         cetrafs_node_entry_t ne;
         unsigned long since, bound;
-        bool first;
+        bool first, moved;
         u32 pi;
         int ret;
 
@@ -2793,14 +2802,40 @@ static int __cetrafs_node_peer_beating(struct super_block *sb, u32 node_id, bool
         if (cetrafs_le32(ne.state) != CETRAFS_NODE_STATE_REGISTERED ||
             cetrafs_le32(ne.departure) != CETRAFS_NODE_DEPART_NONE)
             return 0; /* no live claim at all */
-        /* 'during': only a move seen inside this call counts -- the
+        moved = cetrafs_sb_peer_sample(sb, node_id, &ne, &first, &since);
+        /*
+         * A move is judged against this call's OWN first sample, never
+         * against the shared watch's last one: the heartbeat tick
+         * samples the same watch, and a beat its tick saw first was a
+         * move this loop never saw -- nor a silence, since the tick
+         * also moved the watch's 'since'. The wait slipped by whole
+         * beats at random: 40 s for a peer beating every 5 s, and 14 s
+         * and 31 s opens on a real cluster beating every 15.
+         *
+         * 'during': only a move seen inside this call counts -- the
          * first sample's comparison is against one taken who knows when
-         * (cetrafs_node_declare_dead()). */
-        if (cetrafs_sb_peer_sample(sb, node_id, &ne, &first, &since) && !first && (!during || sampled)) {
+         * (cetrafs_node_declare_dead()).
+         */
+        if (READ_ONCE(cetrafs_peer_beating_shared_watch)) {
+            /* the control: as before */
+            if (moved && !first && (!during || sampled)) {
+                *beating = true;
+                return 0;
+            }
+            base_since = since;
+            sampled = true;
+        } else if (!sampled) {
+            if (moved && !first && !during) {
+                *beating = true;
+                return 0;
+            }
+            cetrafs_row_mark_of(&base, &ne);
+            base_since = since;
+            sampled = true;
+        } else if (!cetrafs_row_mark_same(&base, &ne)) {
             *beating = true;
             return 0;
         }
-        sampled = true;
         pi = min_t(u32, cetrafs_le32(ne.hb_interval_secs), CETRAFS_HB_INTERVAL_MAX_SECS);
         if (!pi)
             pi = CETRAFS_HEARTBEAT_INTERVAL_SECS;
@@ -2813,7 +2848,7 @@ static int __cetrafs_node_peer_beating(struct super_block *sb, u32 node_id, bool
         if (during && !READ_ONCE(cetrafs_declare_silence_one_beat))
             pi *= 3;
         bound = (unsigned long) (READ_ONCE(cetrafs_peer_beating_wait_secs) ?: pi + 5) * HZ;
-        if (time_after_eq(jiffies, since + bound)) {
+        if (time_after_eq(jiffies, base_since + bound)) {
             if (still)
                 cetrafs_row_mark_of(still, &ne);
             return 0; /* silent */

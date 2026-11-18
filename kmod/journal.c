@@ -3991,3 +3991,128 @@ int cetrafs_journal_node_is_dirty(struct super_block *sb, u32 node_id, bool *out
 
     return cetrafs_journal_read_flag(sb, area_start, out_dirty);
 }
+
+/*
+ * Would a replay of node #node_id's journal redo anything RIGHT NOW?
+ *
+ * For a nofilelock open of a file a not-yet-stale peer has open
+ * (cetrafs_lock_open()). What makes opening past a dead node's journal
+ * a hazard is an entry replay would still redo: the open then runs
+ * without that committed tree write, and the redo later lands on the new
+ * writer's (audit 2026-11-14 M-20). An area whose every entry replay
+ * would skip -- landed, rewritten since, freed and reused, from a parked
+ * session, a fresh block's -- holds nothing to run past, whether its
+ * node is alive or dead, and the open need not wait to learn which.
+ *
+ * Asking liveness instead cost one of the peer's heartbeats on every
+ * open: the stale check right before it samples the row, so "beating"
+ * meant waiting for its NEXT beat -- 8-15 s per open of a migration
+ * source's image, several times over for qemu-img.
+ *
+ * Every read is forced-fresh, and each entry is judged as replay judges
+ * it (cetrafs_journal_judge()). Everything this cannot judge -- an
+ * unreadable block, a target it cannot place, a tear -- answers
+ * "pending", which sends the caller to the liveness wait as before:
+ * never a reason to open, only one not to wait.
+ *
+ * A live writer's entry is pending between its journal flush and its
+ * target write, milliseconds; the caller asks again before it waits.
+ */
+#define CETRAFS_JOURNAL_PEEK_BATCH 32
+int cetrafs_journal_node_redo_pending(struct super_block *sb, u32 node_id, bool *out_pending)
+{
+    struct buffer_head *hbhs[CETRAFS_JOURNAL_PEEK_BATCH];
+    sector_t lbas[CETRAFS_JOURNAL_PEEK_BATCH];
+    u64 area_start, slots, park_seq = 0, s;
+    bool dirty = false;
+    int ret;
+
+    *out_pending = true; /* until proved otherwise, on every path */
+    ret = cetrafs_journal_node_area(sb, node_id, &area_start, &slots);
+    if (ret)
+        return ret;
+    if (!area_start) {
+        *out_pending = false;
+        return 0;
+    }
+    ret = cetrafs_journal_read_flag_seq(sb, area_start, &dirty, &park_seq);
+    if (ret)
+        return ret;
+    if (!dirty) {
+        *out_pending = false;
+        return 0;
+    }
+
+    for (s = 0; s < slots; s += CETRAFS_JOURNAL_PEEK_BATCH) {
+        u32 n = (u32) min_t(u64, slots - s, CETRAFS_JOURNAL_PEEK_BATCH), i;
+        bool pending = false;
+
+        for (i = 0; i < n; i++)
+            lbas[i] = area_start + 1 + (s + i) * CETRAFS_JOURNAL_SLOT_BLOCKS;
+        ret = cetrafs_bread_uncached_list(sb, lbas, n, hbhs);
+        if (ret)
+            return ret;
+        for (i = 0; i < n && !pending && !ret; i++) {
+            const cetrafs_journal_header_t *hdr = (const cetrafs_journal_header_t *) hbhs[i]->b_data;
+            struct cetrafs_journal_replay_entry e = {};
+            struct buffer_head *tbh, *pbh = NULL;
+            enum cetrafs_journal_verdict v;
+            u32 tcrc, zg;
+            int lret;
+
+            if (cetrafs_le32(hdr->magic) != CETRAFS_JOURNAL_MAGIC ||
+                cetrafs_journal_header_crc(hbhs[i]->b_data) != cetrafs_le32(hdr->header_checksum))
+                continue; /* an empty or consumed slot: replay skips it */
+            if (cetrafs_le64(hdr->park_seq) != park_seq)
+                continue; /* settled by a park: consumed, never applied */
+            e.flags = cetrafs_le32(hdr->flags);
+            if ((e.flags & CETRAFS_JRNL_F_FRESH) && !cetrafs_journal_ignore_guard)
+                continue; /* replay skips a fresh block's entry by design */
+            e.target_lba = cetrafs_le64(hdr->target_lba);
+            e.prev_checksum = cetrafs_le32(hdr->prev_checksum);
+            e.payload_checksum = cetrafs_le32(hdr->payload_checksum);
+            lret = cetrafs_bg_owner_zg_for_lba(sb, e.target_lba, &zg);
+            if (lret == -EINVAL)
+                continue; /* outside every data region: replay refuses it */
+            if (lret) {
+                pending = true; /* replay keeps it undecided */
+                continue;
+            }
+            tbh = cetrafs_bread_uncached_retry(sb, e.target_lba);
+            if (!tbh) {
+                ret = -EIO;
+                continue;
+            }
+            tcrc = ~crc32c(~0U, tbh->b_data, CETRAFS_BLOCK_SIZE);
+            /* The payload only matters to a target that is not a whole
+             * block (cetrafs_journal_same_kind()): read it then alone. */
+            if (tcrc != e.payload_checksum && tcrc != e.prev_checksum && (e.flags & CETRAFS_JRNL_F_GUARDED) &&
+                !cetrafs_journal_target_intact(tbh)) {
+                pbh = cetrafs_bread_uncached_retry(sb, lbas[i] + 1);
+                if (!pbh) {
+                    brelse(tbh);
+                    ret = -EIO;
+                    continue;
+                }
+            }
+            /* pbh is read above in exactly the case the judge looks
+             * at it. */
+            v = cetrafs_journal_judge(&e, tbh, pbh, tcrc);
+            brelse(pbh);
+            brelse(tbh);
+            /* APPLY and TORN are what replay redoes; the rest it skips
+             * or refuses (UNGUARDED, CHANGED, REUSED, LANDED). */
+            if (v == CETRAFS_JV_APPLY || v == CETRAFS_JV_TORN)
+                pending = true;
+        }
+        for (i = 0; i < n; i++)
+            brelse(hbhs[i]);
+        if (ret)
+            return ret;
+        if (pending)
+            return 0;
+        cond_resched();
+    }
+    *out_pending = false;
+    return 0;
+}

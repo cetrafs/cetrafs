@@ -4055,6 +4055,11 @@ bool cetrafs_sb_peer_progress_stale(struct super_block *sb, u32 node_id, const c
  * inferred), and *since is when the current mark was first seen -- no
  * earlier than the beat itself, so a silence measured from it is never
  * overstated.
+ *
+ * "The last sample" is ANYONE's: the heartbeat tick samples this watch
+ * too, and a move it saw first is not reported here again. A caller
+ * waiting for a move judges it against a sample of its own -- its first
+ * mark, or 'since' against when it began (class 59).
  */
 bool cetrafs_sb_peer_sample(struct super_block *sb, u32 node_id, const cetrafs_node_entry_t *ne, bool *first,
                             unsigned long *since)

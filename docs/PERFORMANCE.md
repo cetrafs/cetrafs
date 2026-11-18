@@ -597,6 +597,39 @@ filefrag, a seek walk and a close; control `read_trust_off`),
 fd's SEEK_DATA after an in-place convert; control `smap_trust_stale`),
 procfs `smap_hits` / `smap_builds`.
 
+## 20. A nofilelock open does not wait on a live peer's heartbeat
+
+A nofilelock open of a file a not-yet-stale peer has open, while that
+peer's journal is dirty, must not run past a DEAD node's unreplayed
+journal (M-20). It learned that by watching the peer's row for its next
+heartbeat -- and a live writer's journal is always dirty (held-back
+batch entries stay live until the next batch retires them), so every
+open of a migration source's image waited most of a beat: 8-15 s per
+open, several per `qemu-img info`, and longer still when the wait lost
+beats to the heartbeat tick (bug class 59).
+
+Now the open first asks the journal itself
+(`cetrafs_journal_node_redo_pending()`: every slot header in batches,
+each current entry's target judged as replay judges it). When a replay
+would redo nothing there is nothing to run past, alive or dead, and the
+open goes on. Only an entry still to redo -- a dead node's, or a live
+writer's caught between its journal flush and its target write, asked
+again over ~70 ms first -- falls back to the wait, which now ends at the
+peer's next beat.
+
+**Measured** on the reference FC array, a 2 GiB image under 20 MB/s of
+64k O_DIRECT writes on one node, opened on the other:
+
+| | before | after |
+|---|---|---|
+| first open | 9 s (once 330 s) | 0.85 s |
+| each later open / `qemu-img info` | up to a beat (15 s) each | 20-30 ms / 40-70 ms |
+
+**Guarded by:** `tests/kernel/nofilelock_open_peer_fast.sh` (three opens
+under 800 ms with a live peer's settled journal; control
+`open_journal_peek_off`), procfs `open_peer_settled` /
+`open_peer_waits`.
+
 ## Measured baseline
 
 On the reference hardware -- an enterprise FC array over 32GFC multipath (two

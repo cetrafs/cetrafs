@@ -3055,6 +3055,63 @@ MODULE_PARM_DESC(open_silent_peer_ok, "TEST ONLY: a nofilelock open ignores a si
 static bool cetrafs_open_replay_stale_off;
 cetrafs_test_param(open_replay_stale_off, cetrafs_open_replay_stale_off, bool, 0644);
 
+/* TEST ONLY: a nofilelock open past a not-yet-stale opener with a dirty
+ * journal always waits for that node's next beat, as before -- the
+ * control of tests/kernel/nofilelock_open_peer_fast.sh. */
+static bool cetrafs_open_journal_peek_off;
+cetrafs_test_param(open_journal_peek_off, cetrafs_open_journal_peek_off, bool, 0644);
+MODULE_PARM_DESC(open_journal_peek_off, "TEST ONLY: a nofilelock open waits for a dirty-journal opener's beat");
+
+/* Opens let past such an opener by its journal, and opens that waited
+ * for its beat instead (procfs open_peer_settled / open_peer_waits). */
+static atomic64_t cetrafs_open_peer_settled = ATOMIC64_INIT(0);
+static atomic64_t cetrafs_open_peer_waits = ATOMIC64_INIT(0);
+
+u64 cetrafs_open_peer_settled_count(void)
+{
+    return (u64) atomic64_read(&cetrafs_open_peer_settled);
+}
+
+u64 cetrafs_open_peer_waits_count(void)
+{
+    return (u64) atomic64_read(&cetrafs_open_peer_waits);
+}
+
+/*
+ * May a nofilelock open go past node n -- not stale, with a dirty
+ * journal, and this file open -- without learning whether it is alive?
+ * Yes when a replay of its journal would redo nothing now
+ * (cetrafs_journal_node_redo_pending()): the hazard of opening past a
+ * dead node is its unreplayed tree writes (M-20), and there are none.
+ * Its node being alive or dead changes nothing then; only whether it
+ * writes more, which a live node may do after any verdict.
+ *
+ * A live writer's entry is unlanded for one flush, so a pending answer
+ * is asked again a few times over ~70 ms before the caller falls back
+ * to watching for the node's next beat. A failed read answers no: the
+ * wait then decides, as before.
+ */
+static bool cetrafs_lock_open_peer_settled(struct super_block *sb, u32 n)
+{
+    unsigned int tries;
+
+    if (READ_ONCE(cetrafs_open_journal_peek_off))
+        return false;
+    for (tries = 0; tries < 4; tries++) {
+        bool pending = true;
+
+        if (tries)
+            msleep(10U << (tries - 1));
+        if (fatal_signal_pending(current))
+            return false;
+        if (cetrafs_journal_node_redo_pending(sb, n, &pending))
+            return false;
+        if (!pending)
+            return true;
+    }
+    return false;
+}
+
 /* TEST ONLY: a nofilelock write-open publishes no write_open_nodes bit,
  * as before audit 2026-11-15 F-37 -- the control of
  * tests/kernel/journal_replay_writers_only.sh. */
@@ -3154,8 +3211,9 @@ int cetrafs_lock_open(struct inode *inode, struct file *file)
      * (cetrafs_journal_replay_node_scoped()); the reread must not take
      * that node round again. */
     u64 replayed_nodes = 0;
-    /* Openers this open watched and found beating, with the mutex
-     * dropped (cetrafs_lock_open_drop()). */
+    /* Openers this open let go past with the mutex dropped
+     * (cetrafs_lock_open_drop()): watched and found beating, or with
+     * nothing in their journal a replay would redo. */
     u64 beating_nodes = 0;
     bool dropped;
     bool claimed = false; /* this open took the exclusive lock */
@@ -3293,6 +3351,18 @@ reread:
                     continue;
                 dropped = !READ_ONCE(cetrafs_lock_open_slow_held);
                 cetrafs_lock_open_drop(ci);
+                /* Nothing in its journal a replay would redo: nothing
+                 * to run past, alive or dead -- no wait for its next
+                 * beat (cetrafs_lock_open_peer_settled()). */
+                if (cetrafs_lock_open_peer_settled(sb, n)) {
+                    atomic64_inc(&cetrafs_open_peer_settled);
+                    ret = cetrafs_lock_open_retake(ci, dropped);
+                    if (ret)
+                        return ret;
+                    beating_nodes |= 1ULL << n;
+                    goto reread;
+                }
+                atomic64_inc(&cetrafs_open_peer_waits);
                 ret = cetrafs_node_peer_beating(sb, n, &beating);
                 if (!ret && !beating) {
                     pr_warn_ratelimited("lock: ino=%llu: node %u had this file open, has stopped beating and is "

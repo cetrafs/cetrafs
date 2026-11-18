@@ -2184,6 +2184,32 @@ printf 'static ssize_t x(struct kiocb *iocb)\n{\n    return __blockdev_direct_IO
 grep -q ' bad$' <<<"$(c58_dio_calls "$C58S")" && pass "class 58: control -- a planted write with no completion is found" ||
     fail "class 58: control -- a planted write with no completion is not found"
 
+# Class 59: cetrafs_sb_peer_sample() answers "moved since the watch's
+# LAST sample", and the heartbeat tick samples the same watch: a wait
+# that watches for that answer loses every beat the tick saw first, and
+# never times out either, since the tick also moves 'since'. The
+# nofilelock open's beat wait did, and slipped by whole beats (40 s on a
+# 5 s beat). Every caller is listed here with how it is immune.
+log "checking every reader of the shared peer watch judges a move against its own sample (class 59)"
+C59_REG='__cetrafs_node_peer_beating compares-its-own-first-sample
+cetrafs_nslock_set_holder_silent compares-since-against-its-own-start'
+c59_callers() { # <files...>: the function around each code call of cetrafs_sb_peer_sample(
+    awk '/^[A-Za-z_]/ && !/;[[:space:]]*$/ && match($0, /[A-Za-z_][A-Za-z_0-9]*\(/) { fn = substr($0, RSTART, RLENGTH - 1) }
+         /cetrafs_sb_peer_sample\(/ && !/^[[:space:]]*(\*|\/\*)/ && fn != "cetrafs_sb_peer_sample" { print fn }' "$@" | sort -u
+}
+C59="$(c59_callers "$K"/*.c)"
+C59X="$(grep -vxF -f <(cut -d' ' -f1 <<<"$C59_REG") <<<"$C59" || true)"
+[ -n "$C59" ] || fail "class 59: setup -- no caller of cetrafs_sb_peer_sample() found; the scan is not seeing the tree"
+[ -z "$C59X" ] && pass "class 59: every caller of cetrafs_sb_peer_sample() is listed" ||
+    fail "class 59: unlisted readers of the shared peer watch (judge a move against your own sample, then list): $(echo "$C59X" | tr '\n' ' ')"
+grep -q 'cetrafs_row_mark_same(&base' <<<"$(c41_body __cetrafs_node_peer_beating)" &&
+    pass "class 59: the beat wait judges a move against its own first sample" ||
+    fail "class 59: __cetrafs_node_peer_beating() no longer compares the row against its own base mark"
+C59S="$(ct_tmp c59).c"
+printf 'static bool w(struct super_block *sb)\n{\n    return cetrafs_sb_peer_sample(sb, 1, &ne, &f, &s);\n}\n' >"$C59S"
+[ "$(c59_callers "$C59S")" = w ] && pass "class 59: control -- a planted reader of the watch is found" ||
+    fail "class 59: control -- a planted reader of the watch is not found"
+
 log "checking every -ENOSPC/-EBUSY/-ENOENT/-ETXTBSY names the transient states it waited out (class 43)"
 C43_REG_ENOSPC='cetrafs_alloc_pick_bg waits:cetrafs_sb_release_wait
 cetrafs_alloc_block_anywhere calls:cetrafs_alloc_pick_bg
