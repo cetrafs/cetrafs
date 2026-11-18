@@ -17,9 +17,13 @@
 #      walked the tree from the device on every write (the extent's
 #      insertion still reads what it rewrites fresh -- rule 5);
 #   2. a peer's publish (its file_seq on the record): the next write into
-#      a hole sees it before it maps, and sends the cached tree cold -- one
-#      tree_cold_marks more than with the stamp ignored, where only the
-#      publish after the write notices;
+#      a hole sees it before it maps, and walks the tree from the device
+#      (alloc_trust_cold) -- never with the stamp ignored. This node's
+#      writes are fsynced first: a peer publishing over this node's
+#      unpublished changes is two writers, and the fresh record then
+#      carries this node's own pending stamp (the shadow overlay). Counted
+#      as total cold marks, this case read 2 against 1 only when the
+#      shadow happened to be published first, and failed 1 run in 4;
 #   3. every write reads back; fsck clean.
 #
 # DISCRIMINATION: alloc_trust_off=1: 1 fails (the tree read per write).
@@ -38,6 +42,7 @@ MNT="$(ct_mnt awr)"
 ct_track mnt "$MNT"
 ct_param_set alloc_trust_off 0
 ct_param_set alloc_trust_ignore_stamp 0
+ct_param_set cold_work_stall_ms 0
 ct_param_set scrub 0
 ct_param_set auto_defrag 0
 ct_param_set alloc_run_blocks 0
@@ -70,6 +75,7 @@ elif op == "write":  # <go-file> <count>: open, wait for go, write into holes, t
     for b in blocks[:w]:
         buf.seek(0); buf.write(stamp(2 * b + 1, 1))
         os.pwritev(f, [buf], (2 * b + 1) * 4096)
+    os.fsync(f)  # published: the peer's stamp lands on this node's own (case 2)
     open(go + ".done", "w").write(" ".join(str(2 * b + 1) for b in blocks[:w]))
     while not os.path.exists(go + "2"):
         time.sleep(0.05)
@@ -112,7 +118,11 @@ round() {
     wpid=$!
     wait_for 10 "[ -e '$go.open' ]" || { fail "setup: the writer never opened the file"; ct_exit; }
     "$NODE_POKE" "$dev" 1 1 bb "$(date +%s)" >/dev/null
-    (for _ in $(seq 1 160); do "$NODE_POKE" "$dev" 1 --beat >/dev/null 2>&1; sleep 0.25; done) &
+    # Beats until the round kills it: a beater that ran out (it used to
+    # stop after 40 s) left node 1 silent on a slow host, this node the
+    # sole opener of the file, and the write rightly trusting its cache
+    # without asking the stamp -- case 2 then failed 1 run in 4.
+    (while :; do "$NODE_POKE" "$dev" 1 --beat >/dev/null 2>&1; sleep 0.25; done) &
     beater=$!
     "$LOCK_POKE" "$dev" "$ino" --reader 1 >/dev/null
     sleep 2 # the writer's presence look is at most once a second
@@ -124,13 +134,18 @@ round() {
     r1="$(awk '{print $1}' "/sys/block/$blk/stat")"
     # a peer's publish: its stamp on the record, the size it leaves unchanged
     size="$(stat -c %s "$MNT/f")"
+    # The reconcile a noticed stamp queues is held back, so the tree is
+    # still cold when the write maps: noticed by the write itself or by
+    # a path just before it, the mapping must walk it from the device.
+    echo 3000 >$P/cold_work_stall_ms
     "$LOCK_POKE" "$dev" --peer-size "$ino" "$size" 1 >/dev/null
-    t1="$(sed -n 's/^tree_cold_marks: //p' "$proc/info")"
+    t1="$(sed -n 's/^alloc_trust_cold: //p' "$proc/info")"
     touch "$go"2
     wait_for 30 "[ -e '$go.done2' ]" || true
-    t2="$(sed -n 's/^tree_cold_marks: //p' "$proc/info")"
+    t2="$(sed -n 's/^alloc_trust_cold: //p' "$proc/info")"
     echo 0 >$P/alloc_trust_off
     echo 0 >$P/alloc_trust_ignore_stamp
+    echo 0 >$P/cold_work_stall_ms
     wait "$wpid" || true
     kill "$beater" 2>/dev/null || true
     wait "$beater" 2>/dev/null || true
@@ -156,14 +171,16 @@ log "fixed: $R"
 [ "$(get reads "$R")" -le $(($(get reads "$C") - W)) ] &&
     pass "1: $W writes into holes read $(get reads "$R") blocks from the device (control: $(get reads "$C"))" ||
     fail "1: $R"
-# The publish after any write notices it overwrote a peer's stamp and
-# marks the tree cold too -- after the mapping. The stamp check marks it
-# BEFORE the mapping: one mark more than with it ignored.
-[ "$(get cold_after_peer "$R")" -gt "$(get cold_after_peer "$S")" ] &&
-    pass "2: the next write saw the peer's stamp before mapping ($(get cold_after_peer "$R") cold marks, stamp ignored: $(get cold_after_peer "$S"))" ||
+# The allocating mapping found the tree cold and walked it from the
+# device: the peer's stamp was seen BEFORE the mapping. With the stamp
+# ignored it trusts the cache and never counts.
+[ "$(get cold_after_peer "$R")" -ge 1 ] &&
+    pass "2: the next write saw the peer's stamp before mapping (alloc_trust_cold +$(get cold_after_peer "$R"))" ||
     fail "2: $R (stamp ignored: $S)"
 [ "$(get check "$R")" = ok ] && [ "$(get fsck_err "$R")" = 0 ] &&
     pass "3: every write reads back; fsck clean" || fail "3: $R"
 pass "control: the writer's gate read $(get reads "$C") blocks for $W writes"
-pass "control: with the stamp ignored, only the publish after the write noticed the peer ($(get cold_after_peer "$S"))"
+[ "$(get cold_after_peer "$S")" = 0 ] &&
+    pass "control: with the stamp ignored the write mapped through the cached tree (alloc_trust_cold +0)" ||
+    fail "control: with the stamp ignored the write still found the tree cold -- the suite does not reach the stamp: $S"
 ct_exit

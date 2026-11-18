@@ -5401,6 +5401,15 @@ static bool cetrafs_alloc_trust_ignore_stamp;
 cetrafs_test_param(alloc_trust_ignore_stamp, cetrafs_alloc_trust_ignore_stamp, bool, 0644);
 MODULE_PARM_DESC(alloc_trust_ignore_stamp, "TEST ONLY: the window's allocating mapping ignores a peer's file_seq");
 
+/* Allocating mappings in the window that found the tree cold and walked
+ * it from the device (procfs alloc_trust_cold). */
+static atomic64_t cetrafs_alloc_trust_cold = ATOMIC64_INIT(0);
+
+u64 cetrafs_alloc_trust_cold_count(void)
+{
+    return (u64) atomic64_read(&cetrafs_alloc_trust_cold);
+}
+
 bool cetrafs_lock_alloc_tree_trusted(struct inode *inode, const cetrafs_inode_t *fresh)
 {
     struct cetrafs_inode_info *ci = CETRAFS_I(inode);
@@ -5413,7 +5422,11 @@ bool cetrafs_lock_alloc_tree_trusted(struct inode *inode, const cetrafs_inode_t 
     if (READ_ONCE(cetrafs_alloc_trust_ignore_stamp))
         return true; /* test-only; see the parameter */
     cetrafs_inode_note_stamp(inode, fresh, my_node_id);
-    return !cetrafs_tree_is_cold(ci);
+    if (cetrafs_tree_is_cold(ci)) {
+        atomic64_inc(&cetrafs_alloc_trust_cold);
+        return false;
+    }
+    return true;
 }
 
 bool cetrafs_lock_read_cache_trusted(struct inode *inode)

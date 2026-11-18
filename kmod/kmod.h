@@ -1460,6 +1460,7 @@ bool cetrafs_lock_identity_cache_trusted(struct inode *inode);
 u64 cetrafs_lock_suspend_count(void);
 u64 cetrafs_lock_resume_count(void);
 u64 cetrafs_open_peer_settled_count(void);
+u64 cetrafs_alloc_trust_cold_count(void);
 u64 cetrafs_open_peer_waits_count(void);
 /* file.c: the close-equivalent durability boundary for a file staying open. */
 int cetrafs_file_make_durable(struct file *file, bool locked);
