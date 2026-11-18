@@ -2016,7 +2016,7 @@ struct fsck_refctx {
 /* Mark one physical run [phys, phys+len) as referenced by 'ino', flagging
  * an out-of-region block or a cross-file overlap. The one place the
  * content pass turns an extent (or a meta block) into bitmap bits, shared
- * by depth 0/1/2 so the depth-2 walk reuses exactly the depth-0 checks. */
+ * by every depth so a deep walk reuses exactly the depth-0 checks. */
 /* The BG whose data region holds the WHOLE run [phys, phys+len), or -1.
  * An extent never crosses a BG, so a legal run fits entirely inside one
  * BG's data range and the question has a single answer for the run.
@@ -2166,8 +2166,8 @@ static int fsck_run_bg(const uint64_t *bg_start, const uint64_t *bg_cnt, uint32_
  * looked at. Each is something the kernel refuses or silently loses:
  * a zero length (seek/fiemap and the unwritten convert call the volume
  * corrupt), an end past the largest file (the convert refuses it), and
- * at depth 2 an extent outside the [ei_block, ei_block_end) range its
- * index entries advertise -- the lookup skips a child on that range, so
+ * below an interior an extent outside the [ei_block, ei_block_end) range
+ * its index entries advertise -- the lookup skips a child on that range, so
  * the block reads as a hole and the next write allocates over it. lo/hi
  * is the narrowest advertised range, hi == 0 for "none". Reported, not
  * repaired: none of these hides a block from the walk. */
@@ -4529,7 +4529,7 @@ int main(int argc, char **argv)
     uint64_t root_lba;
     if (cetrafs_le16(ri.eh.eh_depth) == 0) {
         root_lba = cetrafs_ee_pblk(&ri.et.leaf[0]);
-    } else if (cetrafs_le16(ri.eh.eh_depth) == 2) {
+    } else if (cetrafs_le16(ri.eh.eh_depth) >= 2) {
         /* A root grown past one leaf (M-41): its logical block 0, found
          * through the whole tree. */
         uint32_t rn;
@@ -4537,7 +4537,7 @@ int main(int argc, char **argv)
         cetrafs_extent_t *re = fsck_tree_extents(fd, total_blocks, &ri, &rn, &rwhole);
 
         if (!rwhole || !rn || cetrafs_ee_lblk(&re[0]) != 0) {
-            fprintf(stderr, "ERR: root extent tree (depth 2) does not lead to its first block\n");
+            fprintf(stderr, "ERR: root extent tree (depth %u) does not lead to its first block\n", cetrafs_le16(ri.eh.eh_depth));
             free(re);
             return 1;
         }
@@ -4872,8 +4872,8 @@ int main(int argc, char **argv)
                 continue;
             }
             if (cetrafs_le16(in.eh.eh_depth) > CETRAFS_EXT_MAX_DEPTH) {
-                fprintf(stderr, "%s: inode %" PRIu64 " has extent depth %u (only 0, 1 and 2 exist)\n", FSCK_SEV, ino,
-                        in.eh.eh_depth);
+                fprintf(stderr, "%s: inode %" PRIu64 " has extent depth %u (only 0 to %u exist)\n", FSCK_SEV, ino,
+                        cetrafs_le16(in.eh.eh_depth), CETRAFS_EXT_MAX_DEPTH);
                 problems += !fsck_dead_walk;
                 /* Same reason as the bad-magic case above, and it was
                  * missing here: a tree this walker cannot descend means

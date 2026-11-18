@@ -19,8 +19,8 @@
 #      unlink and a re-add work, and the late blocks are reachable;
 #   5. emptied and removed, both directories give back every block --
 #      fsck clean, and the free count back where it started;
-#   6. a directory at its tree's limit (TEST ONLY caps: one interior of
-#      two leaves) refuses a create ENOSPC and keeps no block for it --
+#   6. a directory at its tree's limit (TEST ONLY caps: two leaves per
+#      interior, one root slot) refuses a create ENOSPC and keeps no block for it --
 #      it used to take the block first and keep it on the failed append,
 #      one per create (audit p3-extent-ceiling R-6).
 #
@@ -39,7 +39,7 @@ N=4200
 IMG="$(ct_image 1200 dirdeep)"
 DEV="$(ct_loop "$IMG")"
 MNT="$(ct_mnt dirdeep)"
-ct_mkfs "$DEV" -z 1 -b 512 -J 16 -M 4 -N 16384 -f >/dev/null
+ct_mkfs "$DEV" -z 1 -b 512 -J 16 -M 4 -N 65536 -f >/dev/null
 ct_mount "$DEV" "$MNT"
 require_cetrafs_mount "$MNT"
 avail() { df --output=avail "$MNT" | tail -1; }

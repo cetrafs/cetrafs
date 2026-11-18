@@ -2,15 +2,15 @@
 # SPDX-License-Identifier: GPL-2.0-or-later
 # a file passing half its extent tree's capacity is announced, once
 #
-# A file's extent tree holds 258,064 extents at most, and a guest's
+# A file's extent tree holds ~65.5 million extents at most, and a guest's
 # scattered first writes walk it up one entry each; at the limit a write
 # needing a new extent fails ENOSPC with the volume free and nothing had
-# said it was coming (audit 2026-11-14 A-1). A depth-2 tree passing half
-# its leaf blocks now logs a warning naming the file, and info counts it
+# said it was coming (audit 2026-11-14 A-1). A tree passing half the
+# leaf blocks of the deepest tree now logs a warning naming the file, and info counts it
 # (tree_half_full).
 #
-# The tree is capped (TEST ONLY tree_root_cap=2, tree_idx_cap=4: eight
-# leaves) and random 4 KiB O_DIRECT writes go into a preallocated file
+# The tree is capped (TEST ONLY tree_root_cap=1, tree_idx_cap=3: nine
+# leaves at depth 3) and random 4 KiB O_DIRECT writes go into a preallocated file
 # until the first ENOSPC.
 #   setup: the file reached its limit;
 #   1. the warning named this file, before the limit was reached;
@@ -34,8 +34,8 @@ ct_mkfs "$DEV" -f >/dev/null
 # The tree is filled a block-sized convert at a time; a 64 KiB convert
 # unit would coalesce the scattered writes that fill it.
 ct_param_set convert_unit_blocks 1
-ct_param_set tree_root_cap 2
-ct_param_set tree_idx_cap 4
+ct_param_set tree_root_cap 1
+ct_param_set tree_idx_cap 3
 ct_param_set auto_defrag 0
 ct_mount "$DEV" "$MNT"
 PROC="$(ct_procdir "$DEV")"

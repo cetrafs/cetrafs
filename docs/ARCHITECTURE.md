@@ -17,7 +17,7 @@ and `docs/` the long-form detail.
 | `fsck.cetra` | Functional, repairs a defined subset | Four passes (structural, cluster metadata, content, namespace), plus reachability from the root and a `/lost+found`. `-r` repairs only what has one derivable answer and refuses entirely on anything ambiguous |
 | Mount / umount | Functional | Validates the whole region map, not just the checksum; `-o ro` is a real read-only cluster observer; a device with no atomic CAW is refused if any peer is mounted |
 | Namespace | Functional | create, mkdir, unlink, rmdir, rename, link, symlink, readdir, `user.*`/`trusted.*`/`security.*` xattrs. Directories grow through the same extent machinery as files |
-| File data | Functional | depth-2 extent tree, up to 2^48 blocks (1 EiB) per file; read/write/truncate/fallocate/punch-hole/fsync/mmap/`O_DIRECT`/`SEEK_HOLE`-`DATA`/`FIEMAP` |
+| File data | Functional | depth-3 extent tree, up to 2^48 blocks (1 EiB) per file; read/write/truncate/fallocate/punch-hole/fsync/mmap/`O_DIRECT`/`SEEK_HOLE`-`DATA`/`FIEMAP` |
 | Allocation | Functional | Run-aware placement, per-BG and per-ZG cached free counts kept in sync and reconciled against the bitmaps whenever a node takes ownership of a Zone Group; a block in a peer's ZG is freed by queueing it to that peer, never by touching its bitmap |
 | Zone Group ownership | Functional | Claim the minimum needed, one more on demand, release a surplus that has emptied, steal from a stale peer |
 | Cross-node exclusion | Functional | Atomic COMPARE AND WRITE only. Per-inode namespace lock, whole-file exclusive open lock, read-presence bitmask, Node Registry rows, ZG ownership and the pending-free queue are all compare-and-swap on a single ≤512-byte record |
@@ -378,16 +378,17 @@ cetrafs_extent_idx_t   (16 bytes: the child's range as a 48-bit lo [ei_block + e
 ```
 
 One extent spans up to 2^31 blocks (8 TiB), so a contiguous multi-TB image is a
-handful of extents. The tree is up to **depth 2**: inode root (4 inline slots)
-→ interior index blocks → leaf blocks → extents, ~344k extents, enough that a
-dense file reaches the 2^48-block (1 EiB) logical ceiling of the 48-bit
-logical block (v0x000A). Every logical block is carried in 64 bits; the root
+handful of extents. The tree is up to **depth 3**: inode root (4 inline slots)
+→ interior index blocks → interior index blocks → leaf blocks → extents,
+4 × 254³ ≈ 65.5M extents (v0x000A; depth 2 held ~258k, which scattered 4 KiB
+first writes exhausted at about 1 GiB of file). Logical blocks are 48-bit: a
+file addresses 2^48 blocks (1 EiB). Every logical block is carried in 64 bits; the root
 slots' ranges are never maintained (always unknown), only interior entries'. Arrays are **append-only and unordered** at every depth — a
 new block always has the highest offset, so growth is a single-block edit with
 no sorted-insert/split/rebalance; readers (fiemap, SEEK, truncate/punch)
 flatten and tolerate the unordered order. Leaf and interior blocks carry a
 `cetrafs_blk_tail_t` `{magic,crc}` tail (v0x000F). Directories use the same
-machinery but stay ≤ depth 1. `mkfs` writes only the trivial case (root as one
+machinery and grow the same way. `mkfs` writes only the trivial case (root as one
 depth-0 extent); everything deeper is kernel-built, and `fsck` walks all depths.
 
 ### Directory entry — `cetrafs_dirent_t` (266 bytes, fixed size)
@@ -516,7 +517,7 @@ pre-portability state (no reformat needed).
 | `inode.c` | the inode I/O choke point: `cetrafs_iget()`, `cetrafs_read_raw_inode()`/`_write_raw_inode()`, `cetrafs_apply_raw_to_vfs_inode()` and the refresh guards (generation, type, dirty, `nlink == 0`) every cross-node refresh path inherits |
 | `dir.c` | directories and the whole namespace surface: lookup, readdir, create, mkdir, unlink, rmdir, rename, link, symlink, the dirent helpers and the dirent-block tail checksum |
 | `nslock.c` | the per-inode namespace lock — acquired over the set of records an operation mutates, in ascending inode order |
-| `file.c` | file data: the depth-2 extent tree, `cetrafs_get_block()`/`cetrafs_inode_map_block()`, truncate, fallocate, fsync, `O_DIRECT`, `SEEK_HOLE`/`DATA`, `FIEMAP`, and the defrag ioctl |
+| `file.c` | file data: the extent tree, `cetrafs_get_block()`/`cetrafs_inode_map_block()`, truncate, fallocate, fsync, `O_DIRECT`, `SEEK_HOLE`/`DATA`, `FIEMAP`, and the defrag ioctl |
 | `defrag.c` | online, incremental defragmentation — whole-extent-aligned steps under the file's own cross-node lock, plus the background janitor |
 | `xattr.c` | `user.*`/`trusted.*`/`security.*` extended attributes over the inode's one lazily-allocated xattr block |
 | `alloc.c` | allocation primitives: global inode bitmap and per-BG data bitmaps, run-aware placement, the cached free counters and their reconcile, and the delegated (pending-free) path for a block in another node's ZG |

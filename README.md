@@ -38,7 +38,7 @@ per contested claim, the same idea as VMFS's ATS — not over a network.
 - **A real POSIX namespace** — directories, hardlinks, symlinks and
   `user.*`/`trusted.*`/`security.*` extended attributes, with LSM labelling
   so SELinux-enforcing hosts work. (No POSIX ACLs, no special files.)
-- **Large, sparse files** — a depth-2 extent tree, up to 1 EiB (2^48 blocks) per file;
+- **Large, sparse files** — a depth-3 extent tree, up to 1 EiB (2^48 blocks) per file;
   `SEEK_HOLE`/`SEEK_DATA` and `FIEMAP`, so thin images stay thin.
 - **Live migration** — the `nofilelock` mount option lets an image be open
   on two nodes during a Proxmox/qemu online-migration handoff, coherently.

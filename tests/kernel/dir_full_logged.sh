@@ -10,10 +10,10 @@
 #
 # A directory is grown among other allocations -- one 4 KiB file
 # written between dirent blocks -- so each of its blocks is an extent of
-# its own. Its tree is held to one interior of two leaves (TEST ONLY
-# caps): a directory now grows to depth 2 like a file (M-41), and its
-# real limit, ~258,000 extents, is far too many creates for a suite. So
-# it fills at ~7,600 entries, with the volume nearly empty. The create that fails must return ENOSPC, and the log must
+# its own. Its tree is held to two leaves per interior and one root slot
+# (TEST ONLY caps): a directory grows to depth 3 like a file (M-41,
+# A-1), and its real limit is far too many creates for a suite. So it
+# fills at four leaves, ~15,000 entries, with the volume nearly empty. The create that fails must return ENOSPC, and the log must
 # name the directory's inode.
 #
 # DISCRIMINATION: on the unfixed module the same run fails the create

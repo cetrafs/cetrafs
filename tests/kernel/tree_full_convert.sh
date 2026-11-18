@@ -12,7 +12,8 @@
 # Now the convert checks the append's room first
 # (cetrafs_tree_append_room()) and refuses with nothing modified.
 #
-# The tree is capped (TEST ONLY tree_root_cap=1, tree_idx_cap=8) so the
+# The tree is capped (TEST ONLY tree_root_cap=1, tree_idx_cap=3: nine
+# leaves at depth 3) so the
 # limit is reached in about a thousand writes. Seeded random 4 KiB writes
 # into a preallocated range until the first ENOSPC, then 200 more
 # attempts, in the three shapes the second audit round rated CRITICAL
@@ -143,7 +144,7 @@ round() {
     ct_mount "$dev" "$MNT"
     proc="$(ct_procdir "$dev")"
     ct_param_set tree_root_cap 1
-    ct_param_set tree_idx_cap 8
+    ct_param_set tree_idx_cap 3
     if [ "$1" = stop ]; then
         echo 1 >/sys/module/cetrafs/parameters/close_nospc_stops
     else

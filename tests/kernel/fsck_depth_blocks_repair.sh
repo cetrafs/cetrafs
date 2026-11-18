@@ -45,15 +45,15 @@ BLOCKS="$("$POKE" "$IMG" extents "$INO" | sed -n 's/.*blocks=\([0-9]*\).*/\1/p')
 
 ct_fsck "$DEV" >/dev/null || fail "the volume was not clean before the poke"
 
-"$POKE" "$IMG" setdepth "$INO" 3 2>/dev/null
+"$POKE" "$IMG" setdepth "$INO" 4 2>/dev/null
 
 MAP="$(ct_helper bg_map)"
 BEFORE_MAP="$("$MAP" "$IMG")"
 OUT="$("$ROOT/userspace/fsck.cetra" -r "$DEV" 2>&1 || true)"
 AFTER_MAP="$("$MAP" "$IMG")"
-echo "$OUT" | grep -q "extent depth 3" &&
+echo "$OUT" | grep -q "extent depth 4" &&
     pass "fsck reports the impossible depth" ||
-    fail "fsck did not notice an extent depth of 3"
+    fail "fsck did not notice an extent depth of 4"
 
 echo "$OUT" | grep -q "nothing repaired" &&
     pass "and repairing is refused rather than guessed at" ||

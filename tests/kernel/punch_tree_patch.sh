@@ -10,13 +10,15 @@
 # free only the old blocks the new tree no longer names
 # (cetrafs_tree_free_meta_except()).
 #
-# A depth-2 file of 3,000 one-block extents, the tree capped at four
-# leaves per interior (TEST ONLY tree_idx_cap) so it spans three
-# interiors at a loop device's scale:
-#   P. a 4-block punch: at most 2 tree blocks written (one leaf, one
-#      interior), not the whole tree;
-#   T. a truncate that empties the last interior: the root drops it; few
-#      writes; the file reads back right;
+# A file of 3,000 one-block extents, the tree capped (TEST ONLY
+# tree_idx_cap) so it is deep at a loop device's scale: four leaves per
+# interior spans three interiors of a depth-2 tree, two leaves per
+# interior makes a depth-3 one (A-1). At each depth:
+#   P. a 4-block punch: at most one tree block per level written (the
+#      leaf and the interiors above it), not the whole tree;
+#   T. a truncate that empties the last interior: its parent drops it;
+#      few writes; the file reads back right.
+# Then, on the depth-3 tree:
 #   A. appends after both: the tree still grows (a new leaf, a new
 #      interior) and every block reads back;
 #   F. a punch while this inode has held-back tree blocks (an O_DIRECT
@@ -42,7 +44,7 @@ ct_track mnt "$MNT"
 ct_param_set auto_defrag 0
 ct_param_set scrub 0
 ct_param_set alloc_run_blocks 0
-ct_param_set tree_idx_cap 4
+ct_param_set tree_idx_cap 4 # recorded for restore; each scenario sets its own
 ct_param_set tree_patch_off 0
 ct_param_set tree_patch_no_flush 0
 P=/sys/module/cetrafs/parameters
@@ -108,13 +110,15 @@ PY
 MODEL="$(ct_tmp tpatch-model)"
 export MODEL
 NODE_POKE="$(ct_helper node_poke)"
+POKE="$(ct_helper inode_block_poke)"
 drv() { python3 -I "$DRV" "$@"; }
 ctr() { awk -F': ' -v k="$1" '$1 == k {print $2}' "$INFO"; }
 
-# <patch_off 0|1> -> RES="p_writes=<n> p_patches=<n> t_writes=<n> t_patches=<n> check=<ok|BAD..>"
+# <patch_off 0|1> <idx_cap> -> RES="depth=<n> p_writes=<n> p_patches=<n> t_writes=<n> t_patches=<n> check=<ok|BAD..>"
 scenario() {
-    local img w0 p0 w1 p1 w2 p2 c
-    img="$(ct_image 560 "tpatch$1")"
+    local img w0 p0 w1 p1 w2 p2 c d
+    echo "$2" >$P/tree_idx_cap
+    img="$(ct_image 560 "tpatch$1-$2")"
     DEV="$(ct_loop "$img")"
     IMG="$img"
     ct_mkfs_small "$DEV" >/dev/null
@@ -124,6 +128,7 @@ scenario() {
     : >"$MODEL"
     drv w "$F" 0 3000 2 # 3,000 one-block extents, blocks 0..5998
     sync
+    d="$("$POKE" "$IMG" extents "$(stat -c %i "$F")" 2>/dev/null | sed -n '1s/^depth=\([0-9]*\).*/\1/p')"
     echo "$1" >$P/tree_patch_off
     w0="$(ctr tree_blocks)" p0="$(ctr tree_patches)"
     drv punch "$F" 601 4 # blocks 602 and 604, in the second leaf
@@ -132,31 +137,39 @@ scenario() {
     w2="$(ctr tree_blocks)" p2="$(ctr tree_patches)"
     c="$(drv check "$F")"
     echo 0 >$P/tree_patch_off
-    RES="p_writes=$((w1 - w0)) p_patches=$((p1 - p0)) t_writes=$((w2 - w1)) t_patches=$((p2 - p1)) check=${c// /_}"
+    RES="depth=$d p_writes=$((w1 - w0)) p_patches=$((p1 - p0)) t_writes=$((w2 - w1)) t_patches=$((p2 - p1)) check=${c// /_}"
 }
 get() { sed -n "s/.*$1=\([^ ]*\).*/\1/p" <<<"$2"; }
 
-log "control: the rebuild (tree_patch_off=1)"
-scenario 1
-C="$RES"
-log "control: $C"
-ct_umount "$MNT"
-log "patched"
-scenario 0
-R="$RES"
-log "patched: $R"
+# <depth> <idx_cap>: P and T against the rebuild, at that depth.
+pt() {
+    log "depth $1: control, the rebuild (tree_patch_off=1)"
+    scenario 1 "$2"
+    C="$RES"
+    log "depth $1: control: $C"
+    ct_umount "$MNT"
+    log "depth $1: patched"
+    scenario 0 "$2"
+    R="$RES"
+    log "depth $1: patched: $R"
 
-[ "$(get p_writes "$C")" -ge 8 ] && [ "$(get t_writes "$C")" -ge 6 ] ||
-    fail "control setup: the rebuild wrote only $(get p_writes "$C") / $(get t_writes "$C") tree blocks -- the tree is not the one this suite needs ($C)"
-[ "$(get check "$C")" = ok ] || fail "control: the rebuilt file reads back wrong ($C)"
-[ "$(get p_patches "$R")" = 1 ] && [ "$(get p_writes "$R")" -le 2 ] &&
-    pass "P: the punch wrote $(get p_writes "$R") tree block(s), the rebuild $(get p_writes "$C")" ||
-    fail "P: $R"
-[ "$(get t_patches "$R")" = 1 ] && [ "$(get t_writes "$R")" -le 2 ] &&
-    pass "T: the truncate wrote $(get t_writes "$R") tree block(s), the rebuild $(get t_writes "$C")" ||
-    fail "T: $R"
-[ "$(get check "$R")" = ok ] && pass "P, T: every block reads back, the punched and truncated ones as zeros" ||
-    fail "P, T: $(get check "$R")"
+    [ "$(get depth "$C")" = "$1" ] && [ "$(get depth "$R")" = "$1" ] ||
+        fail "setup: the trees are depth $(get depth "$C") / $(get depth "$R"), not $1 -- not the tree this case tests"
+    [ "$(get p_writes "$C")" -ge 8 ] && [ "$(get t_writes "$C")" -ge 6 ] ||
+        fail "control setup: the rebuild wrote only $(get p_writes "$C") / $(get t_writes "$C") tree blocks -- the tree is not the one this suite needs ($C)"
+    [ "$(get check "$C")" = ok ] || fail "control: the rebuilt file reads back wrong ($C)"
+    [ "$(get p_patches "$R")" = 1 ] && [ "$(get p_writes "$R")" -le "$1" ] &&
+        pass "P, depth $1: the punch wrote $(get p_writes "$R") tree block(s), the rebuild $(get p_writes "$C")" ||
+        fail "P, depth $1: $R"
+    [ "$(get t_patches "$R")" = 1 ] && [ "$(get t_writes "$R")" -le "$1" ] &&
+        pass "T, depth $1: the truncate wrote $(get t_writes "$R") tree block(s), the rebuild $(get t_writes "$C")" ||
+        fail "T, depth $1: $R"
+    [ "$(get check "$R")" = ok ] && pass "P, T, depth $1: every block reads back, the punched and truncated ones as zeros" ||
+        fail "P, T, depth $1: $(get check "$R")"
+}
+pt 2 4
+ct_umount "$MNT"
+pt 3 2
 
 log "A: appends after the punch and the truncate"
 drv w "$F" 4001 300 2
@@ -199,7 +212,7 @@ log "F, flushed again: $R4"
 # G <patch_off 0|1> <first> <count> -> "writes=<n> patches=<n>": a
 # fallocate over a stride-2 range fills every hole with its own extent,
 # hundreds appended at once -- the last leaf's free slots, new leaves,
-# and (four leaves per interior) a new interior.
+# and (two leaves per interior) new interiors.
 gcase() {
     local w0 p0
     echo "$1" >$P/tree_patch_off

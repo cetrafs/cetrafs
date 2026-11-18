@@ -1,9 +1,10 @@
 #!/usr/bin/env bash
 # SPDX-License-Identifier: GPL-2.0-or-later
-# a full depth-2 tree fills free leaf slots before it returns ENOSPC
+# a full tree fills free leaf slots before it returns ENOSPC
 #
-# A depth-2 tree takes new leaves only through its last interior and has
-# four interiors at most; once that is full, the append returned ENOSPC.
+# A tree takes new leaves only through its last path, and the deepest
+# tree has four top interiors at most; once the last path is full, the
+# append returned ENOSPC.
 # An append-only tree fills every leaf before it gets there. A range split
 # (cetrafs_tree_split_leaf()) leaves both halves part full, so on its own
 # it would reach ENOSPC holding fewer extents -- the "VM pauses on nospace
@@ -11,7 +12,7 @@
 # leaf with a free slot (cetrafs_tree_insert_any_leaf()).
 #
 # The tree is capped for the suite (TEST ONLY tree_root_cap=1,
-# tree_idx_cap=8: one interior of eight leaves) so the limit is reached
+# tree_idx_cap=3: nine leaves at depth 3) so the limit is reached
 # in about a thousand writes. Three files, the same seeded random 4 KiB
 # O_DIRECT writes into a fallocated range until the first ENOSPC:
 #   append    leaf_split_off=1     -- the reference
@@ -43,7 +44,7 @@ ct_param_set convert_unit_blocks 1
 ct_param_set leaf_split_off 0
 ct_param_set tree_any_leaf_off 0
 ct_param_set tree_root_cap 1
-ct_param_set tree_idx_cap 8
+ct_param_set tree_idx_cap 3
 
 NBLK=16384 # 64 MiB
 

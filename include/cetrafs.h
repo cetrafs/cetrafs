@@ -913,18 +913,17 @@ typedef struct {
 
 /* v2: an INTERIOR index block -- same shape as a leaf (header, dense
  * array, tail checksum) but holding cetrafs_extent_idx_t entries that
- * each point at one leaf block. The tree is at most depth 2: the
- * inode's 4 root slots -> up to 4 interior blocks -> leaves. Capacity
- * 4 * ~254 * ~254 extents (~258k, down from ~344k since the index
- * entry grew a range bound), so extent-count exhaustion stops
- * being reachable: a dense 16 TiB file
- * survives down to an average extent of ~48 KiB. Arrays stay
- * APPEND-ONLY and unordered, exactly like depth 1: appends only ever
- * touch the LAST leaf, a full leaf appends an idx to the last interior,
- * a full interior moves to the next root slot. */
+ * each point at one child block -- a leaf, or at depth 3 another
+ * interior. The tree is at most depth 3: the inode's 4 root slots ->
+ * interiors -> interiors -> leaves. Capacity 4 * 254^3 extents (~65.5M;
+ * depth 2 held ~258k, which a guest's scattered 4 KiB writes exhausted
+ * at about 1 GiB of file -- now about 250 GiB, audit 2026-11-15 A-1).
+ * Arrays stay APPEND-ONLY and unordered at every level: appends only
+ * ever touch the LAST leaf, a full node links a new one into its
+ * parent, a full top level grows the tree by one. */
 #define CETRAFS_EXT_BLOCK_MAX_IDX \
     ((CETRAFS_BLK_TAIL_OFF - sizeof(cetrafs_extent_hdr_t)) / sizeof(cetrafs_extent_idx_t))
-#define CETRAFS_EXT_MAX_DEPTH 2
+#define CETRAFS_EXT_MAX_DEPTH 3
 
 /* The most blocks a directory may hold: ~4 million entries. Growth stops
  * there (ENOSPC), and a directory record naming more is damage -- every

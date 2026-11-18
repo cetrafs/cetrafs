@@ -1731,7 +1731,7 @@ cetrafs_test_param(lookup_stall_block, cetrafs_lookup_stall_block, uint, 0644);
 MODULE_PARM_DESC(lookup_stall_block, "TEST ONLY: the block whose next lookup stalls (lookup_stall_ms)");
 static unsigned int cetrafs_lookup_stall_ms;
 cetrafs_test_param(lookup_stall_ms, cetrafs_lookup_stall_ms, uint, 0644);
-MODULE_PARM_DESC(lookup_stall_ms, "TEST ONLY: stall one depth-2 lookup before it reads a leaf, once");
+MODULE_PARM_DESC(lookup_stall_ms, "TEST ONLY: stall one deep-tree lookup before it reads a leaf, once");
 
 static void cetrafs_lookup_stall(struct inode *inode, u64 iblock)
 {
@@ -2074,7 +2074,7 @@ void cetrafs_inode_extents_put(struct cetrafs_inode_extents *ex)
  *
  * The array is unsorted (appends merge only with the last entry), and
  * both SEEK_HOLE and fiemap used to answer "what comes next?" with a
- * fresh scan per step: O(n^2). A depth-2 tree holds ~258k extents --
+ * fresh scan per step: O(n^2). A deep tree holds millions of extents --
  * a fragmented VM image -- which made one lseek(SEEK_HOLE) tens of
  * seconds of CPU under inode_lock_shared with no signal check: the
  * file's writers blocked behind it and nothing could kill it. Sorted
@@ -2124,7 +2124,7 @@ void cetrafs_smap_put(struct cetrafs_smap *m)
 }
 
 /*
- * The identity of a depth-2 tree as this node can read it now: a fold of
+ * The identity of a deep tree as this node can read it now: a fold of
  * every interior and leaf block's address, eh_generation and tail CRC.
  * Every edit of a tree block restamps both before the buffer is unlocked
  * (cetrafs_blk_tail_stamp(), under invalidate_lock held exclusively), a
@@ -2136,7 +2136,7 @@ void cetrafs_smap_put(struct cetrafs_smap *m)
  * holds invalidate_lock (shared at least), which keeps every editor out
  * while the headers are read (class 27).
  *
- * -EAGAIN for a tree that is not depth 2: small enough to sort per call.
+ * -EAGAIN for a tree under depth 2: small enough to sort per call.
  */
 static int cetrafs_identity_node(struct cetrafs_tw *w, struct buffer_head *bh, u64 lba, int level)
 {
@@ -2161,7 +2161,7 @@ static int cetrafs_tree_identity(struct inode *inode, const cetrafs_inode_t *raw
     };
     int ret;
 
-    if (cetrafs_le16(raw->eh.eh_magic) != CETRAFS_EXT_MAGIC || cetrafs_le16(raw->eh.eh_depth) != 2)
+    if (cetrafs_le16(raw->eh.eh_magic) != CETRAFS_EXT_MAGIC || cetrafs_le16(raw->eh.eh_depth) < 2)
         return -EAGAIN;
     ret = cetrafs_tree_walk(&w, raw);
     if (ret)
@@ -2174,7 +2174,7 @@ static int cetrafs_tree_identity(struct inode *inode, const cetrafs_inode_t *raw
  * The extents of 'raw' in logical order, as a reference the caller puts
  * (cetrafs_smap_put()). Caller holds invalidate_lock, shared at least.
  *
- * A depth-2 tree's map is kept on the inode between calls and reused
+ * A deep tree's map is kept on the inode between calls and reused
  * while the tree's identity is unchanged (cetrafs_tree_identity()):
  * sorting a fragmented image's ~258k extents took ~47 ms, and filefrag
  * makes hundreds of FIEMAP calls, each of which sorted again -- 42 s of
@@ -3624,9 +3624,9 @@ static int cetrafs_leaf_array_punch(struct super_block *sb,
 /* ---------------------------------------------------------------------
  * v2 extent tree: inode root (4 inline slots) -> interior index blocks
  * -> leaf blocks -> extents. Depth 0 (inline <=4), depth 1 (one leaf),
- * depth 2 (interiors). Arrays are APPEND-ONLY and unordered: a new block
- * always has a higher logical offset, so it always lands at the END --
- * the last leaf of the last interior. That is what keeps growth a
+ * depth 2 and 3 (one or two levels of interiors). Arrays are APPEND-ONLY
+ * and unordered: a new block always has a higher logical offset, so it
+ * always lands at the END -- the last leaf of the last path. That is what keeps growth a
  * single-block edit at any depth, and why lookups must scan everything.
  * ------------------------------------------------------------------- */
 
@@ -4067,7 +4067,7 @@ void cetrafs_tree_free_meta(struct inode *inode, const cetrafs_inode_t *raw)
 /*
  * For cetrafs_frees_begin(): is every block cetrafs_tree_free_meta()
  * would free for 'raw' in a Block Group this node owns? The same walk:
- * depth 1 is the one leaf, depth 2 the interiors and every leaf they
+ * depth 1 is the one leaf, deeper the interiors and every block they
  * name. An interior that cannot be read reads "not ours" -- the safe
  * answer, the one that announces.
  */
@@ -4181,9 +4181,39 @@ u64 cetrafs_flat_data_blocks(const cetrafs_extent_t *flat, u32 n)
  * old). *out_meta is the number of leaf+interior blocks allocated, for
  * the caller's raw->blocks recompute. n==0 and n<=4 need no meta.
  */
+/* TEST ONLY: cap the record's root slots and the entries per interior
+ * below the format's 4 and CETRAFS_EXT_BLOCK_MAX_IDX, so a suite reaches
+ * a deep tree or the tree's limit in thousands of writes, not millions
+ * (tests/kernel/tree_full_any_leaf.sh, extent_tree_depth3.sh). Every
+ * writer honours them: append, patch and rebuild. 0: no cap. */
+static unsigned int cetrafs_tree_root_cap;
+cetrafs_test_param(tree_root_cap, cetrafs_tree_root_cap, uint, 0644);
+MODULE_PARM_DESC(tree_root_cap, "TEST ONLY: at most N root slots in use (0: the format's 4)");
+static unsigned int cetrafs_tree_idx_cap;
+cetrafs_test_param(tree_idx_cap, cetrafs_tree_idx_cap, uint, 0644);
+MODULE_PARM_DESC(tree_idx_cap, "TEST ONLY: at most N entries per interior (0: the format's maximum)");
+
+/* The entries an interior, or the record's root slots ('root'), may
+ * hold, under the TEST ONLY caps. */
+static u32 cetrafs_tree_node_max(bool root)
+{
+    const u32 max = root ? sizeof_field(cetrafs_inode_t, et.idx) / sizeof(cetrafs_extent_idx_t) : CETRAFS_EXT_BLOCK_MAX_IDX;
+    const u32 cap = root ? READ_ONCE(cetrafs_tree_root_cap) : READ_ONCE(cetrafs_tree_idx_cap);
+
+    return cap && cap < max ? cap : max;
+}
+
+/* Room for one more entry in an interior holding 'entries', or in the
+ * record's root slots ('root'). */
+static bool cetrafs_tree_has_room(u32 entries, bool root)
+{
+    return entries < cetrafs_tree_node_max(root);
+}
+
 /*
- * The most extents the depth-2 tree can hold: the inode's root slots,
- * each an interior block of leaf pointers, each leaf full. One number for
+ * The most extents the deepest tree can hold: the inode's root slots,
+ * each the top of CETRAFS_EXT_MAX_DEPTH - 1 levels of full interiors,
+ * each leaf full. One number for
  * the builder that refuses past it and the planner that must stop before
  * it (cetrafs_do_allocate()). TEST ONLY tree_extent_cap lowers it, so a
  * suite can reach it on a loop device a fraction of the size.
@@ -4214,7 +4244,7 @@ MODULE_PARM_DESC(tree_build_full, "TEST ONLY: tree rebuilds pack every leaf full
 int cetrafs_tree_build(struct inode *inode, const cetrafs_extent_t *flat, u32 n, cetrafs_inode_t *raw, u64 *out_meta)
 {
     struct super_block *sb = inode->i_sb;
-    const u32 slots = ARRAY_SIZE(raw->et.idx);
+    const u32 slots = cetrafs_tree_node_max(true), idx_max = cetrafs_tree_node_max(false);
     cetrafs_extent_idx_t *ent = NULL; /* one entry per node of the level being built */
     u64 *blk = NULL;                  /* every tree block, leaves first, then each level up */
     u32 fill, nleaves, c, total, allocated = 0, b = 0, i;
@@ -4241,7 +4271,7 @@ int cetrafs_tree_build(struct inode *inode, const cetrafs_extent_t *flat, u32 n,
         u32 cap_leaves = slots; /* 258,064 at depth 3: a u32 holds it */
 
         for (depth = 1; depth < CETRAFS_EXT_MAX_DEPTH; depth++)
-            cap_leaves *= CETRAFS_EXT_BLOCK_MAX_IDX;
+            cap_leaves *= idx_max;
         fill = min_t(u32, max_t(u32, CETRAFS_EXT_BLOCK_MAX_LEAVES * 3 / 4, DIV_ROUND_UP(n, cap_leaves)),
                      CETRAFS_EXT_BLOCK_MAX_LEAVES);
     }
@@ -4252,7 +4282,7 @@ int cetrafs_tree_build(struct inode *inode, const cetrafs_extent_t *flat, u32 n,
     total = nleaves;
     depth = 1;
     for (c = nleaves; c > 1 && (depth == 1 || c > slots); depth++) {
-        c = DIV_ROUND_UP(c, CETRAFS_EXT_BLOCK_MAX_IDX);
+        c = DIV_ROUND_UP(c, idx_max);
         total += c;
     }
     if (depth > CETRAFS_EXT_MAX_DEPTH)
@@ -4289,15 +4319,15 @@ int cetrafs_tree_build(struct inode *inode, const cetrafs_extent_t *flat, u32 n,
     }
     /* Each interior level groups the one below. Only entries naming
      * leaves carry a range; an interior's entry is UNKNOWN. Built in
-     * place: node i reads entries from i * MAX_IDX on, at or past the
+     * place: node i reads entries from i * idx_max on, at or past the
      * entry i it then overwrites. */
     for (c = nleaves, level = 1; level < depth; level++) {
-        u32 nodes = DIV_ROUND_UP(c, CETRAFS_EXT_BLOCK_MAX_IDX);
+        u32 nodes = DIV_ROUND_UP(c, idx_max);
 
         for (i = 0; i < nodes; i++) {
-            u32 from = i * CETRAFS_EXT_BLOCK_MAX_IDX;
+            u32 from = i * idx_max;
 
-            ret = cetrafs_write_new_node(sb, blk[b], level, ent + from, min_t(u32, c - from, CETRAFS_EXT_BLOCK_MAX_IDX));
+            ret = cetrafs_write_new_node(sb, blk[b], level, ent + from, min_t(u32, c - from, idx_max));
             if (ret)
                 goto fail;
             cetrafs_idx_set(&ent[i], 0, 0, blk[b++]);
@@ -4307,7 +4337,7 @@ int cetrafs_tree_build(struct inode *inode, const cetrafs_extent_t *flat, u32 n,
     /* The record: the top level's entries, all UNKNOWN (root slots carry
      * no range). */
     memset(&raw->et, 0, sizeof(raw->et));
-    raw->eh.eh_max = cetrafs_cpu_to_le16(slots);
+    raw->eh.eh_max = cetrafs_cpu_to_le16(ARRAY_SIZE(raw->et.idx));
     raw->eh.eh_depth = cetrafs_cpu_to_le16(depth);
     raw->eh.eh_entries = cetrafs_cpu_to_le16(c);
     for (i = 0; i < c; i++)
@@ -4326,7 +4356,7 @@ fail:
 }
 
 /*
- * Remove [start, end) from a depth-2 tree by copying only what changes
+ * Remove [start, end) from a tree of depth 2 or more by copying only what changes
  * (audit 2026-11-15 A-11, G-2). cetrafs_tree_build() writes every leaf
  * and interior of the file for a punch or a truncate, so one guest
  * discard on a fragmented image cost hundreds of synchronous writes with
@@ -4372,7 +4402,6 @@ u64 cetrafs_tree_patch_write_count(void)
     return (u64) atomic64_read(&cetrafs_tree_patch_writes);
 }
 
-static bool cetrafs_tree_has_room(u32 entries, bool root); /* under the TEST ONLY caps */
 
 /*
  * One node open per level, depth first: idx[l] holds the entries of the
@@ -4840,7 +4869,7 @@ static int cetrafs_tree_convert_append(struct inode *inode,
  * Convert 'iblock' from preallocated to initialised, wherever in the
  * tree it lives. Mirrors cetrafs_tree_append()'s shape: the inline root
  * at depth 0, the single leaf at depth 1, the right leaf under the
- * matching interior at depth 2.
+ * matching interiors deeper.
  *
  * External leaf blocks go out through the journal, exactly as the
  * append path does -- this rewrites a block the tree already points at,
@@ -4971,7 +5000,7 @@ static int cetrafs_convert_source_durable(struct inode *inode, struct buffer_hea
 }
 
 /*
- * Split a FULL depth-2 leaf by logical range before a convert edits it.
+ * Split a FULL leaf below an interior by logical range before a convert edits it.
  *
  * A convert that meets a full leaf used to shrink the extent in place and
  * append the converted block (and the preallocated tail) through the
@@ -5007,33 +5036,13 @@ static int cetrafs_convert_source_durable(struct inode *inode, struct buffer_hea
  * -ENOSPC: not split (interior full, batch not atomic, the knob) -- the
  * caller goes on to the append path, as before.
  */
-/* TEST ONLY: cap the depth-2 tree's interiors (root entries) and leaves
- * per interior below the format's 4 and CETRAFS_EXT_BLOCK_MAX_IDX, so a
- * suite reaches the tree's limit in thousands of writes, not hundreds of
- * thousands (tests/kernel/tree_full_any_leaf.sh). 0: no cap. */
-static unsigned int cetrafs_tree_root_cap;
-cetrafs_test_param(tree_root_cap, cetrafs_tree_root_cap, uint, 0644);
-MODULE_PARM_DESC(tree_root_cap, "TEST ONLY: at most N interiors in a depth-2 tree (0: the format's 4)");
-static unsigned int cetrafs_tree_idx_cap;
-cetrafs_test_param(tree_idx_cap, cetrafs_tree_idx_cap, uint, 0644);
-MODULE_PARM_DESC(tree_idx_cap, "TEST ONLY: at most N leaves per interior (0: the format's maximum)");
-
-/* Room for one more entry in an interior holding 'entries', or in the
- * record's root slots ('root'), under the TEST ONLY caps. */
-static bool cetrafs_tree_has_room(u32 entries, bool root)
-{
-    const u32 max = root ? sizeof_field(cetrafs_inode_t, et.idx) / sizeof(cetrafs_extent_idx_t) : CETRAFS_EXT_BLOCK_MAX_IDX;
-    const u32 cap = root ? READ_ONCE(cetrafs_tree_root_cap) : READ_ONCE(cetrafs_tree_idx_cap);
-
-    return entries < (cap && cap < max ? cap : max);
-}
 
 /*
  * A file's extent tree has a fixed ceiling (cetrafs_tree_max_extents(),
  * docs/internal/LIMITATIONS.md), and a guest's scattered first writes
  * walk it up one entry each. Reaching it fails writes ENOSPC with the
- * volume free, so the way there is announced: once a depth-2 tree has
- * used more than half its leaf blocks, a warning and the info counter
+ * volume free, so the way there is announced: once a tree has used
+ * more than half the leaf blocks the deepest tree holds, a warning and the info counter
  * tree_half_full (audit 2026-11-14 A-1). Leaves are what run out -- an
  * interior is full before the next one is added -- so the count is the
  * full interiors before the last plus the last one's entries. Until at
@@ -5046,21 +5055,22 @@ u64 cetrafs_tree_half_full_count(void)
     return (u64) atomic64_read(&cetrafs_tree_half_full);
 }
 
-/* Leaf blocks a depth-2 tree uses, or 0 while it cannot be past half. */
+/* Leaf blocks a tree uses, or 0 while it cannot be past half of what the
+ * deepest tree holds (*max). */
 static u32 cetrafs_tree_leaves_if_half(struct inode *inode, const cetrafs_inode_t *raw, u32 *max)
 {
-    u32 rc = READ_ONCE(cetrafs_tree_root_cap), ic = READ_ONCE(cetrafs_tree_idx_cap);
-    u32 rmax = rc && rc < ARRAY_SIZE(raw->et.idx) ? rc : ARRAY_SIZE(raw->et.idx);
-    u32 idx_max = ic && ic < CETRAFS_EXT_BLOCK_MAX_IDX ? ic : CETRAFS_EXT_BLOCK_MAX_IDX;
+    const u32 rmax = cetrafs_tree_node_max(true), idx_max = cetrafs_tree_node_max(false);
     u32 counts[CETRAFS_EXT_MAX_DEPTH + 1] = {0};
     u32 per = 1, used = 0, nroot;
     int depth = cetrafs_le16(raw->eh.eh_depth), l;
     struct buffer_head *ibh;
 
     /* Leaves under one root slot when full: idx_max per interior level. */
-    for (l = 2; l <= depth && l <= CETRAFS_EXT_MAX_DEPTH; l++)
-        per *= idx_max;
-    *max = rmax * per;
+    for (*max = rmax, l = 2; l <= CETRAFS_EXT_MAX_DEPTH; l++) {
+        *max *= idx_max;
+        if (l <= depth)
+            per *= idx_max;
+    }
     if (cetrafs_le16(raw->eh.eh_magic) != CETRAFS_EXT_MAGIC || depth < 2 || depth > CETRAFS_EXT_MAX_DEPTH)
         return 0;
     nroot = min_t(u32, cetrafs_le16(raw->eh.eh_entries), ARRAY_SIZE(raw->et.idx));
@@ -5872,8 +5882,8 @@ static int cetrafs_tree_convert(struct inode *inode, cetrafs_inode_t *raw, u64 i
 }
 
 /*
- * The depth-2 tree is at its limit -- every interior full and no root
- * slot for another -- but leaves below it are not: a range split
+ * The tree is at its limit -- full at its deepest, every interior on
+ * the last path full and no root slot for another -- but leaves below it are not: a range split
  * (cetrafs_tree_split_leaf()) leaves both halves part full. The append
  * then fills ANY leaf with a free slot, so the tree holds at least as
  * many extents as an append-only one, whose leaves all filled. A lookup
@@ -5889,7 +5899,7 @@ static int cetrafs_tree_convert(struct inode *inode, cetrafs_inode_t *raw, u64 i
  * -ENOSPC: every leaf is full too -- the tree really is.
  */
 cetrafs_test_param(tree_any_leaf_off, cetrafs_tree_any_leaf_off, bool, 0644);
-MODULE_PARM_DESC(tree_any_leaf_off, "TEST ONLY: a full depth-2 tree returns ENOSPC instead of filling free leaf slots");
+MODULE_PARM_DESC(tree_any_leaf_off, "TEST ONLY: a full tree returns ENOSPC instead of filling free leaf slots");
 
 static atomic64_t cetrafs_tree_any_leaf_inserts = ATOMIC64_INIT(0);
 
@@ -9702,7 +9712,7 @@ int cetrafs_flush_tree_blocks(struct inode *inode, const cetrafs_inode_t *raw, b
  * blocks that FIND that data, then the inode record -- in that order.
  *
  * Once a file spills past four inline extents its map lives in external
- * leaf (and, at depth 2, interior) blocks, raw metadata outside the
+ * leaf (and, deeper, interior) blocks, raw metadata outside the
  * inode's page-cache mapping, and a contiguous append only extends the
  * last extent's length in place without syncing it. So a flush that
  * skipped them could return with the data durable but the map that finds
