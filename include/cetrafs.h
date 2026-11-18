@@ -917,7 +917,7 @@ typedef struct {
  * inode's 4 root slots -> up to 4 interior blocks -> leaves. Capacity
  * 4 * ~254 * ~254 extents (~258k, down from ~344k since the index
  * entry grew a range bound), so extent-count exhaustion stops
- * being reachable: a dense 16 TiB file (the ee_block u32 ceiling)
+ * being reachable: a dense 16 TiB file
  * survives down to an average extent of ~48 KiB. Arrays stay
  * APPEND-ONLY and unordered, exactly like depth 1: appends only ever
  * touch the LAST leaf, a full leaf appends an idx to the last interior,

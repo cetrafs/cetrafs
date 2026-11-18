@@ -90,6 +90,73 @@ truncate -s "$CEILING" "$SMNT/trunc" 2>/dev/null &&
     fail "4: truncate to exactly the ceiling was refused -- the clamp is off by one"
 rm -f "$SMNT/at32" "$SMNT/last" "$SMNT/past" "$SMNT/trunc"
 
+# 5. preallocated extents across 2^32, at depth 2, written in the middle.
+#
+# Writing into a preallocated extent finds the leaf holding it by a test
+# on each leaf, and a middle write splits the extent in three, so full
+# leaves are split around a pivot block sorted out of the leaf. Both read
+# the block number back through a void pointer, which no cast or
+# compiler warning shows: after M-42 widened it to u64 they still read
+# 32 bits, so past 2^32 the leaf test looked for the wrong block and the
+# sort ordered keys by their low half. 300 four-block extents at a
+# stride of 8 straddle 2^32 (more than one leaf's 254, so depth 2); the
+# second block of each is written.
+log "preallocated extents across 2^32 at depth 2, each written in its middle"
+OUT="$(python3 -I - "$SMNT/prealloc" <<'PY'
+import ctypes, errno, os, sys
+libc = ctypes.CDLL("libc.so.6", use_errno=True)
+libc.fallocate.argtypes = [ctypes.c_int, ctypes.c_int, ctypes.c_long, ctypes.c_long]
+B, N, S = 2 ** 32 - 150 * 8, 300, 8
+pat = lambda b: (b"P%015d" % b) * 256
+fd = os.open(sys.argv[1], os.O_RDWR | os.O_CREAT, 0o644)
+for i in range(N):
+    if libc.fallocate(fd, 0, (B + S * i) * 4096, 4 * 4096) != 0:
+        print("SETUP: fallocate %d failed: %s" % (i, errno.errorcode.get(ctypes.get_errno())))
+        sys.exit(0)
+os.fsync(fd)
+errs = []
+for i in range(N):
+    b = B + S * i + 1
+    try:
+        os.pwrite(fd, pat(b), b * 4096)
+    except OSError as e:
+        errs.append("write at block %d: %s" % (b, errno.errorcode.get(e.errno)))
+        break
+os.fsync(fd)
+os.close(fd)
+with open("/proc/sys/vm/drop_caches", "w") as f:
+    f.write("3")
+fd = os.open(sys.argv[1], os.O_RDONLY)
+size = os.fstat(fd).st_size  # the last extent ends the file: its gap after is past EOF
+for i in range(N):
+    for k in range(S):
+        b = B + S * i + k
+        got = os.pread(fd, 4096, b * 4096)
+        want = b"" if b * 4096 >= size else pat(b) if k == 1 else b"\0" * 4096
+        if got != want:
+            errs.append("block %d (extent %d +%d) reads wrong" % (b, i, k))
+    if len(errs) > 5:
+        break
+os.close(fd)
+print("\n".join(errs) if errs else "OK")
+sys.stdout.flush()
+PY
+)" || true
+NEXT="$(filefrag "$SMNT/prealloc" 2>/dev/null | sed -n 's/.*: \([0-9]*\) extents\{0,1\} found/\1/p')"
+case "$OUT" in
+SETUP:*) fail "5 setup: $OUT" ;;
+*)
+    if [ "${NEXT:-0}" -le 258 ]; then
+        fail "5 setup: the file has ${NEXT:-?} extents -- not more than depth 1 holds, so no depth-2 tree was built"
+    else
+        [ "$OUT" = OK ] &&
+            pass "5: $NEXT extents across 2^32 at depth 2, each written mid-preallocation, read back in place" ||
+            fail "5: $(printf '%s' "$OUT" | head -6 | tr '\n' ';')"
+    fi
+    ;;
+esac
+rm -f "$SMNT/prealloc"
+
 # ------------------------------------------------- the ordinary volume
 # F6: a file is bounded by the format, not by the volume it lives on. A
 # sparse file may be larger than the volume (sparse_beyond_volume.sh); the

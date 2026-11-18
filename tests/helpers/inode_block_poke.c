@@ -256,7 +256,7 @@ int main(int argc, char **argv)
 
         pread_all(fd, &rec, sizeof(rec), rec_off);
         if (rec.eh.eh_depth != 0) {
-            printf("depth=%u\n", rec.eh.eh_depth);
+            printf("depth=%u\n", cetrafs_le16(rec.eh.eh_depth));
             return 0;
         }
         for (uint32_t e = 0; e < cetrafs_le16(rec.eh.eh_entries) && e < 4; ++e) {
@@ -280,7 +280,7 @@ int main(int argc, char **argv)
         cetrafs_inode_t rec;
 
         pread_all(fd, &rec, sizeof(rec), rec_off);
-        printf("depth=%u entries=%u blocks=%llu size=%llu\n", rec.eh.eh_depth, rec.eh.eh_entries,
+        printf("depth=%u entries=%u blocks=%llu size=%llu\n", cetrafs_le16(rec.eh.eh_depth), cetrafs_le16(rec.eh.eh_entries),
                (unsigned long long) cetrafs_le64(rec.blocks), (unsigned long long) cetrafs_le64(rec.size));
         /* Then the entries themselves, IN STORED ORDER. The array is
          * append-only (insert never sorts), so a file written at
@@ -369,7 +369,7 @@ int main(int argc, char **argv)
 
         pread_all(fd, &rec, sizeof(rec), rec_off);
         if (cetrafs_le16(rec.eh.eh_depth) != 1) {
-            printf("depth=%u (no external leaf)\n", rec.eh.eh_depth);
+            printf("depth=%u (no external leaf)\n", cetrafs_le16(rec.eh.eh_depth));
         } else {
             uint64_t lba = cetrafs_ei_child(&rec.et.idx[0]);
             uint8_t blk[CETRAFS_BLOCK_SIZE];

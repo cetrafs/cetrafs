@@ -76,7 +76,7 @@ int main(int argc, char **argv)
     pread_all(&rec, sizeof(rec), (off_t) (cetrafs_le64(sb.inode_table_start) + ino - 1) * CETRAFS_BLOCK_SIZE /* v0x0007: one record per block */);
 
     if (cetrafs_le16(rec.eh.eh_depth) != 1) {
-        fprintf(stderr, "ino %" PRIu64 " is not depth-1 (depth=%u)\n", ino, rec.eh.eh_depth);
+        fprintf(stderr, "ino %" PRIu64 " is not depth-1 (depth=%u)\n", ino, cetrafs_le16(rec.eh.eh_depth));
         return 1;
     }
 

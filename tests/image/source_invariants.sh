@@ -2251,15 +2251,44 @@ printf 'static u32 z(const cetrafs_extent_t *e)\n{\n    return cetrafs_le32(e->e
 log "checking no logical block is narrowed below 64 bits (M-42)"
 lblk_narrow() { # <files...>: file:line of each narrowing
     grep -nE '\((u32|u16|uint32_t|uint16_t|unsigned|unsigned int|int)\) ?\(?cetrafs_(ee_lblk|ei_lo|ei_end)\(|\b(u32|u16|uint32_t|uint16_t|unsigned|int)[[:space:]]+[a-z_][a-z0-9_]*[[:space:]]*=[[:space:]]*cetrafs_(ee_lblk|ei_lo|ei_end)\(|cetrafs_(ee_set_lblk|ei_set_range|ei_init|ee_init)\([^;]*\((u32|uint32_t|unsigned)\)|\((u32|uint32_t)\) ?\(?(iblock|lblk|ws|start_block|end_block|cv_iblock)\b' "$@" |
-        grep -vE ':[0-9]+:[[:space:]]*(\*|/\*)' || true
+        grep -vE ':[0-9]+:[[:space:]]*(\* |\*$|/\*)' || true
 }
 LNR="$(lblk_narrow "$K"/*.c "$K"/*.h "$ROOT"/userspace/*.c "$ROOT"/userspace/*.h "$ROOT"/tests/helpers/*.c)"
 [ -z "$LNR" ] && pass "M-42: no logical block is narrowed below 64 bits" ||
     fail "M-42: a logical block narrowed (carry it in u64; a run length goes through cetrafs_run_off/_left): $(head -5 <<<"$LNR" | tr '\n' ' ')"
 LNRS="$(ct_tmp lblknarrow).c"
-printf 'static void z(cetrafs_extent_t *e, u64 iblock)\n{\n    u32 b = cetrafs_ee_lblk(e);\n    f((u32) iblock);\n    cetrafs_ee_set_lblk(e, (u32) b);\n}\n' >"$LNRS"
-[ "$(lblk_narrow "$LNRS" | wc -l)" = 3 ] && pass "M-42: control -- a planted narrowing of each kind is found (3)" ||
-    fail "M-42: control -- planted narrowings found: $(lblk_narrow "$LNRS" | wc -l) of 3"
+printf 'static void z(cetrafs_extent_t *e, u64 iblock)\n{\n    u32 b = cetrafs_ee_lblk(e);\n    f((u32) iblock);\n    cetrafs_ee_set_lblk(e, (u32) b);\n    *(u32 *) p = (u32) iblock;\n}\n' >"$LNRS"
+[ "$(lblk_narrow "$LNRS" | wc -l)" = 4 ] && pass "M-42: control -- a planted narrowing of each kind is found (4)" ||
+    fail "M-42: control -- planted narrowings found: $(lblk_narrow "$LNRS" | wc -l) of 4"
+
+# The narrowing no cast shows: a void pointer read back as 32 bits. The
+# compiler checks nothing across a void *, and two survived the M-42
+# widening that way -- a leaf test reading a u64 block number as u32,
+# and a sort of u64 keys with a u32 comparator, each comparing half a
+# number past 2^32. Every such read is listed here by function, after
+# checking what the pointer really points at; a new one fails until it
+# is added.
+log "checking every void pointer read back as 32 bits is a reviewed one (M-42)"
+DEREF32_OK='dir.c:cetrafs_ns_apply_set_nlink
+scrub.c:cetrafs_scrub_secs_set
+file.c:cetrafs_count_leaf
+fsck.c:fsck_bgidx_cmp'
+deref32() { # <files...>: file:function of each 32-bit read through a cast pointer
+    awk '
+        FNR == 1 { fn = "" }
+        /^[a-z][a-z0-9_ ]*[ *]([a-z_][a-z0-9_]*)\(/ { s = $0; sub(/\(.*/, "", s); n = split(s, w, /[ *]+/); fn = w[n] }
+        /\*[[:space:]]*\((const )?(u32|uint32_t|unsigned|unsigned int|u16|uint16_t|int) \*\)/ &&
+            !/^[[:space:]]*(\* |\*$|\/\*)/ { f = FILENAME; sub(/.*\//, "", f); print f ":" fn }
+    ' "$@" | LC_ALL=C sort -u
+}
+D32="$(deref32 "$K"/*.c "$K"/*.h "$ROOT"/userspace/*.c "$ROOT"/userspace/*.h "$ROOT"/tests/helpers/*.c |
+    LC_ALL=C comm -23 - <(printf '%s\n' "$DEREF32_OK" | LC_ALL=C sort -u))"
+[ -z "$D32" ] && pass "M-42: every 32-bit read through a void pointer is a reviewed one" ||
+    fail "M-42: unreviewed 32-bit read through a cast pointer (a logical block is u64): $(tr '\n' ' ' <<<"$D32")"
+D32S="$(ct_tmp deref32).c"
+printf 'static bool t(const void *data, void *arg)\n{\n    u32 iblock = *(const u32 *) arg;\n    return iblock;\n}\n' >"$D32S"
+[ "$(deref32 "$D32S")" = "$(basename "$D32S"):t" ] && pass "M-42: control -- a planted 32-bit pointer read is found" ||
+    fail "M-42: control -- the planted pointer read gave '$(deref32 "$D32S")'"
 
 log "checking every -ENOSPC/-EBUSY/-ENOENT/-ETXTBSY names the transient states it waited out (class 43)"
 C43_REG_ENOSPC='cetrafs_alloc_pick_bg waits:cetrafs_sb_release_wait

@@ -4953,14 +4953,13 @@ static bool cetrafs_leaf_data_holds_uninit(const void *data, void *arg)
 {
     const cetrafs_extent_hdr_t *lhdr = data;
     const cetrafs_extent_t *arr = (const cetrafs_extent_t *) ((const u8 *) data + sizeof(*lhdr));
-    u32 iblock = *(const u32 *) arg;
+    const u64 iblock = *(const u64 *) arg;
     u16 n = min_t(u16, cetrafs_le16(lhdr->eh_entries), CETRAFS_EXT_BLOCK_MAX_LEAVES), i;
 
     for (i = 0; i < n; i++) {
         u64 eb = cetrafs_ee_lblk(&arr[i]);
 
-        if (cetrafs_ee_uninit(&arr[i]) && iblock >= eb &&
-            (u64) iblock < (u64) eb + cetrafs_ee_len(&arr[i]))
+        if (cetrafs_ee_uninit(&arr[i]) && iblock >= eb && iblock < eb + cetrafs_ee_len(&arr[i]))
             return true;
     }
     return false;
@@ -5225,13 +5224,6 @@ u64 cetrafs_leaf_split_count(void)
     return (u64) atomic64_read(&cetrafs_leaf_splits);
 }
 
-static int cetrafs_u32_cmp(const void *a, const void *b)
-{
-    u32 x = *(const u32 *) a, y = *(const u32 *) b;
-
-    return x < y ? -1 : x > y;
-}
-
 /* Would a convert in this leaf need more room than it has (a middle split
  * takes two slots)? */
 static bool cetrafs_leaf_split_wanted(struct inode *inode, struct buffer_head *lbh)
@@ -5357,7 +5349,7 @@ static int cetrafs_tree_split_leaf(struct inode *inode,
     /* The caller holds invalidate_lock: no writer edits the leaf. */
     for (i = 0; i < n; i++)
         keys[i] = cetrafs_ee_lblk(&larr[i]);
-    sort(keys, n, sizeof(*keys), cetrafs_u32_cmp, NULL);
+    sort(keys, n, sizeof(*keys), cetrafs_u64_cmp, NULL);
     pivot = keys[n / 2];
     for (i = 0; i < n; i++)
         if (cetrafs_ee_lblk(&larr[i]) < pivot)

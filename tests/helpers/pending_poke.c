@@ -96,8 +96,8 @@ int main(int argc, char **argv)
         pread_all(&rec, sizeof(rec),
                   (off_t) (cetrafs_le64(sb.inode_table_start) + ino - 1) * CETRAFS_BLOCK_SIZE /* v0x0007: one record per block */);
         if (cetrafs_le16(rec.eh.eh_depth) != 0 || cetrafs_le16(rec.eh.eh_entries) < 1) {
-            fprintf(stderr, "ino %" PRIu64 " has no inline extent 0 (depth=%u entries=%u)\n", ino, rec.eh.eh_depth,
-                    rec.eh.eh_entries);
+            fprintf(stderr, "ino %" PRIu64 " has no inline extent 0 (depth=%u entries=%u)\n", ino, cetrafs_le16(rec.eh.eh_depth),
+                    cetrafs_le16(rec.eh.eh_entries));
             return 1;
         }
         printf("%llu %u\n",
