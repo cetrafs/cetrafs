@@ -4109,7 +4109,9 @@ retry_scan:
      * One read of block 0, on this path only -- never per block. */
     if (!refreshed_layout && !READ_ONCE(cetrafs_alloc_enospc_refresh_off)) {
         refreshed_layout = true;
-        if (cetrafs_sb_layout_refresh(sb) == 1) {
+        /* Not "== 1": a heartbeat that applied the grow under us leaves
+         * this call 0, and the new groups are ours to scan all the same. */
+        if (cetrafs_sb_layout_refresh(sb) >= 0) {
             tried_claim_more = false;
             tried_claim_bg = false;
             goto retry_scan;

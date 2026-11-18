@@ -112,20 +112,24 @@ static inline int cetrafs_bmap_poke_us(int fd, uint64_t lba, uint64_t bit, int v
     return cetrafs_bmap_poke_off_us(fd, lba + cetrafs_bmap_blk(bit), cetrafs_bmap_off(bit), v, raw);
 }
 
+/* One bitmap sector fails its CRC. */
+static inline int cetrafs_bmap_sector_bad_us(const void *sector)
+{
+    cetrafs_bmap_trailer_t t;
+
+    memcpy(&t, (const uint8_t *) sector + CETRAFS_BMAP_SECTOR - sizeof(t), sizeof(t));
+    return cetrafs_le32(t.crc) != cetrafs_bmap_sector_crc_us(sector);
+}
+
 /* The sectors of a bitmap image that fail their CRC; *first the first
  * of them (its block * CETRAFS_BMAP_SECTORS + sector). */
 static inline uint64_t cetrafs_bmap_bad_us(const void *image, uint64_t nblocks, uint64_t *first)
 {
     uint64_t bad = 0;
 
-    for (uint64_t i = 0; i < nblocks * CETRAFS_BMAP_SECTORS; i++) {
-        const uint8_t *sec = (const uint8_t *) image + i * CETRAFS_BMAP_SECTOR;
-        cetrafs_bmap_trailer_t t;
-
-        memcpy(&t, sec + CETRAFS_BMAP_SECTOR - sizeof(t), sizeof(t));
-        if (cetrafs_le32(t.crc) != cetrafs_bmap_sector_crc_us(sec) && !bad++ && first)
+    for (uint64_t i = 0; i < nblocks * CETRAFS_BMAP_SECTORS; i++)
+        if (cetrafs_bmap_sector_bad_us((const uint8_t *) image + i * CETRAFS_BMAP_SECTOR) && !bad++ && first)
             *first = i;
-    }
     return bad;
 }
 

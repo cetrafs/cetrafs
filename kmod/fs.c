@@ -2132,8 +2132,7 @@ static int cetrafs_validate_layout(const cetrafs_superblock_t *sb, u64 total_blo
     /* The Zone Group table chain is room this build does not follow
      * (A-13): a volume that has one is refused, not mounted with the
      * Zone Groups it would have missed. */
-    if (le64_to_cpu(sb->zg_seg_next) ||
-        (le32_to_cpu(sb->zg_first_count) && le32_to_cpu(sb->zg_first_count) != le32_to_cpu(sb->zone_group_count))) {
+    if (cetrafs_sb_zg_chained(sb)) {
         pr_err("superblock: the Zone Group table has appended segments (head %llu, %u of %u Zone Groups in the "
                "first) -- this build cannot follow them\n",
                (unsigned long long) le64_to_cpu(sb->zg_seg_next), le32_to_cpu(sb->zg_first_count),

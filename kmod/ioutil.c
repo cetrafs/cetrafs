@@ -166,6 +166,10 @@ struct buffer_head *cetrafs_bmap_bread(struct super_block *sb, u64 lba, u64 lo, 
     atomic64_inc(&cetrafs_bmap_crc_bad);
     pr_err_ratelimited("bitmap block %llu: a sector fails its checksum -- the block is not used\n",
                        (unsigned long long) lba);
+    /* Damaged metadata found on read, kind 2 (docs/internal/ERRORS.md):
+     * counted against the volume, which corruption=stop consults, as the
+     * inode bitmap's CAS refusal already is (cetrafs_cas_refused_damage()). */
+    cetrafs_sb_corrupt(sb, 0);
     *err = -EUCLEAN;
     return NULL;
 }

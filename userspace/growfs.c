@@ -602,6 +602,13 @@ int main(int argc, char **argv)
             ", incompat 0x%" PRIx64 ") -- use the growfs.cetra of the build that set them",
             dev, (uint64_t) cetrafs_le64(sb.features_compat), (uint64_t) cetrafs_le64(sb.features_ro_compat),
             (uint64_t) cetrafs_le64(sb.features_incompat));
+    /* Room this build does not follow (A-13): a grow would lay its
+     * new groups out over the Zone Groups it cannot see. */
+    if (cetrafs_sb_zg_chained(&sb))
+        die("%s: the Zone Group table has appended segments (head %" PRIu64 ", %u of %u Zone Groups in the first) "
+            "-- this growfs cannot follow them",
+            dev, (uint64_t) cetrafs_le64(sb.zg_seg_next), cetrafs_le32(sb.zg_first_count),
+            cetrafs_le32(sb.zone_group_count));
     if (cetrafs_le32(sb.block_size) != CETRAFS_BLOCK_SIZE)
         die("%s: block size %u != %u", dev, cetrafs_le32(sb.block_size), CETRAFS_BLOCK_SIZE);
     {

@@ -14,17 +14,22 @@
 #   2. the same for an inode-bitmap sector: creates still succeed, at
 #      numbers outside the damaged sector; fsck -r repairs it;
 #   3. a bit changed WITH its checksum restamped is not damage: nothing
-#      is counted (the check is the checksum, not a guess at the bits).
+#      is counted (the check is the checksum, not a guess at the bits);
+#   4. an append whose contiguity hint lies in a damaged sector still
+#      succeeds: the damage is a miss, not the write's answer (review M1).
 #
 # DISCRIMINATION: with cetrafs_bmap_sectors_ok() returning true, 1 and 2
 # count nothing and allocate inside the damaged sector; with
-# cetrafs_bmap_bad_us() returning 0, fsck reports neither.
+# cetrafs_bmap_bad_us() returning 0, fsck reports neither. 4: with
+# cetrafs_alloc_data_block_near() returning the hint's -EUCLEAN, the
+# append fails.
 set -euo pipefail
 . "$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)/lib/harness.sh"
 require_root
 require_module
 POKE="$(ct_helper corrupt_poke)"
 SB_POKE="$(ct_helper sb_poke)"
+POKE_BMP="$(ct_helper bmap_poke)"
 
 DEV="$(ct_dev 700 bmapcrc)"
 MNT="$(ct_mnt bmapcrc)"
@@ -114,5 +119,26 @@ dd if=/dev/zero of="$MNT/g" bs=1M count=2 conv=fsync status=none
 D=$(($(bad_now) - B0))
 [ "$D" = 0 ] && pass "3: the kernel counts nothing" ||
     fail "3: bmap_crc_bad +$D on a valid bitmap"
+ct_umount "$MNT"
+log "4: an append whose hint is in a damaged sector"
+fresh
+ct_mount "$DEV" "$MNT"
+dd if=/dev/urandom of="$MNT/h" bs=4096 count=1 conv=fsync status=none
+L="$(filefrag -v -b4096 "$MNT/h" 2>/dev/null | awk '$1 == "0:" { sub(/\.\..*/, "", $4); print $4 + 0 }')"
+ct_umount "$MNT"
+BG0="$("$(ct_helper bg_map)" "$DEV" | sed -n 's/^bg 0 .* start=\([0-9]*\) .*/\1/p')"
+read -r OBM ODR <<<"$("$(ct_helper bg_poke)" "$DEV" 0 --dump | sed -n 's/.*off_data_bmap=\([0-9]*\).*off_data_region=\([0-9]*\).*/\1 \2/p')"
+HB=$((L + 1 - BG0 - ODR)) # the hint's bit: the block after h's
+[ -n "$L" ] && [ "$HB" -gt 0 ] || { fail "4 setup: no block for h ($L)"; ct_exit; }
+# Another bit of the hint's sector, set without its checksum.
+OTHER=$(( HB / SECTOR_BITS * SECTOR_BITS + (HB % SECTOR_BITS + 7) % SECTOR_BITS ))
+"$POKE_BMP" "$DEV" "$((BG0 + OBM))" "$OTHER" 1 raw
+OUT="$(ct_fsck "$DEV" 2>&1 || true)"
+grep -q '^ERR: data bitmap at block .* fail their checksum' <<<"$OUT" ||
+    { fail "4 setup: the hint's sector is not damaged"; ct_exit; }
+ct_mount "$DEV" "$MNT"
+dd if=/dev/urandom of="$MNT/h" bs=4096 count=4 seek=1 conv=notrunc,fsync status=none 2>/dev/null &&
+    pass "4: the append succeeds, around the damaged sector" ||
+    fail "4: the append failed -- the damaged hint was taken for the write's answer"
 ct_umount "$MNT"
 ct_exit

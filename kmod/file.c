@@ -3416,6 +3416,9 @@ static u32 cetrafs_leaf_array_trim(struct super_block *sb,
     cetrafs_free_batch_init(&fb);
     for (i = 0; i < entries; i++) {
         u32 len = cetrafs_ee_len(&arr[i]);
+
+        if ((i & 4095) == 4095)
+            cond_resched(); /* a flattened depth-3 tree: up to ~65M entries (rule 14) */
         /* Same rule as the punch's splits: a trimmed PREALLOCATED
          * extent stays preallocated. */
         int uninit_entry = cetrafs_ee_uninit(&arr[i]);
@@ -4030,38 +4033,33 @@ static u64 cetrafs_tree_last_contig_lba(struct inode *inode, const cetrafs_inode
     return hint;
 }
 
-/* Free every leaf and interior BLOCK of a tree (not the data blocks). */
-static int cetrafs_free_meta_child(struct cetrafs_tw *w, const cetrafs_extent_idx_t *ie, int level)
-{
-    if (level)
-        return CETRAFS_TW_DESCEND;
-    cetrafs_free_data_block(w->sb, cetrafs_ei_child(ie)); /* a leaf: freed unread */
-    return CETRAFS_TW_SKIP;
-}
-
-/* An interior, after its leaves -- also one that could not be read, whose
- * leaves are then left for the scrub. */
-static int cetrafs_free_meta_done(struct cetrafs_tw *w, u64 lba, int level, int rd)
-{
-    cetrafs_free_data_block(w->sb, lba);
-    return 0;
-}
-
-static const struct cetrafs_tw_ops cetrafs_free_meta_ops = {
-    .child = cetrafs_free_meta_child,
-    .done = cetrafs_free_meta_done,
-};
+/*
+ * Free every leaf and interior BLOCK of a tree (not the data blocks) --
+ * each one read and found to be the tree block its parent says it is
+ * (cetrafs_tree_meta_set(checked)). A tree that cannot be read whole
+ * frees nothing: an interior that names a block it should not -- another
+ * file's data, after damage -- would otherwise free that block to the
+ * allocator, which is sharing, not leaking (rule 19). Its blocks are left
+ * for the scrub.
+ */
+static int cetrafs_tree_meta_set(struct inode *inode, const cetrafs_inode_t *raw, bool checked, u64 **out,
+                                 u32 *out_n);
 
 void cetrafs_tree_free_meta(struct inode *inode, const cetrafs_inode_t *raw)
 {
-    struct cetrafs_tw w = {
-        .ops = &cetrafs_free_meta_ops,
-        .inode = inode,
-        .read = CETRAFS_TW_WRITER,
-        .flags = CETRAFS_TW_SKIP_UNREADABLE,
-    };
+    u64 *set;
+    u32 n, i;
+    int ret = cetrafs_tree_meta_set(inode, raw, true, &set, &n);
 
-    (void) cetrafs_tree_walk(&w, raw);
+    if (ret) {
+        pr_err_ratelimited("ino=%llu: the extent tree could not be read whole (%d) -- its blocks are left for the "
+                           "scrub\n",
+                           (unsigned long long) inode->i_ino, ret);
+        return;
+    }
+    for (i = 0; i < n; i++)
+        cetrafs_free_data_block(inode->i_sb, set[i]);
+    kvfree(set);
 }
 
 /*
@@ -4111,6 +4109,8 @@ bool cetrafs_flat_range_is_ours(struct super_block *sb, const cetrafs_extent_t *
         u64 end = start + cetrafs_ee_len(&arr[i]);
         u64 s, e;
 
+        if ((i & 4095) == 4095)
+            cond_resched(); /* up to ~65M entries, a group lookup each (rule 14) */
         if (end <= from || start >= to)
             continue;
         s = max(start, from);
@@ -4167,8 +4167,11 @@ u64 cetrafs_flat_data_blocks(const cetrafs_extent_t *flat, u32 n)
     u64 b = 0;
     u32 i;
 
-    for (i = 0; i < n; i++)
+    for (i = 0; i < n; i++) {
+        if ((i & 4095) == 4095)
+            cond_resched(); /* up to ~65M entries (rule 14) */
         b += cetrafs_ee_len(&flat[i]);
+    }
     return b;
 }
 
@@ -4507,6 +4510,21 @@ static int cetrafs_patch_children(struct inode *inode, struct cetrafs_tree_patch
 }
 
 /* Open the level-l node at 'lba' and take the range out of what is below it. */
+/* A tree block read where its parent says level 'level' sits: the
+ * walker's own check (cetrafs_tw_block()), for the readers that keep
+ * their own loop. A block that is not one is refused, never read as one. */
+static bool cetrafs_tree_blk_at_level(struct inode *inode, struct buffer_head *bh, int level)
+{
+    const cetrafs_extent_hdr_t *h = (const cetrafs_extent_hdr_t *) bh->b_data;
+
+    if (cetrafs_le16(h->eh_magic) == CETRAFS_EXT_MAGIC && cetrafs_le16(h->eh_depth) == level)
+        return true;
+    pr_err_ratelimited("ino=%llu: extent %s block %llu: depth %u where %d was expected -- refusing it (fsck)\n",
+                       (unsigned long long) inode->i_ino, level ? "index" : "leaf",
+                       (unsigned long long) bh->b_blocknr, cetrafs_le16(h->eh_depth), level);
+    return false;
+}
+
 static int cetrafs_patch_open(struct inode *inode, struct cetrafs_tree_patch_ws *ws, int l, u64 lba, bool spine)
 {
     struct buffer_head *bh = l ? cetrafs_read_index_bh(inode, lba) : cetrafs_read_leaf_bh(inode, lba);
@@ -4515,6 +4533,10 @@ static int cetrafs_patch_open(struct inode *inode, struct cetrafs_tree_patch_ws 
 
     if (!bh)
         return -EIO;
+    if (!cetrafs_tree_blk_at_level(inode, bh, l)) {
+        brelse(bh);
+        return -EIO;
+    }
     ws->n[l] = min_t(u32, cetrafs_le16(((const cetrafs_extent_hdr_t *) bh->b_data)->eh_entries),
                      l ? CETRAFS_EXT_BLOCK_MAX_IDX : CETRAFS_EXT_BLOCK_MAX_LEAVES);
     if (l)
@@ -4687,10 +4709,11 @@ static int cetrafs_u64_cmp(const void *a, const void *b)
     return x < y ? -1 : x > y;
 }
 
-/* The leaf and interior blocks of a depth-1/2 tree, sorted. */
+/* The leaf and interior blocks of a tree, sorted. */
 struct cetrafs_meta_set_ctx {
     u64 *set;
     u32 n, cap;
+    bool checked;
 };
 
 static int cetrafs_meta_set_child(struct cetrafs_tw *w, const cetrafs_extent_idx_t *ie, int level)
@@ -4707,16 +4730,26 @@ static int cetrafs_meta_set_child(struct cetrafs_tw *w, const cetrafs_extent_idx
         m->cap = ncap;
     }
     m->set[m->n++] = cetrafs_ei_child(ie);
-    return level ? CETRAFS_TW_DESCEND : CETRAFS_TW_SKIP;
+    /* Checked: a leaf is read too, and the walk refuses one that is not
+     * a leaf (cetrafs_tw_block()). */
+    return level || m->checked ? CETRAFS_TW_DESCEND : CETRAFS_TW_SKIP;
 }
 
 static const struct cetrafs_tw_ops cetrafs_meta_set_ops = {
     .child = cetrafs_meta_set_child,
 };
 
-static int cetrafs_tree_meta_set(struct inode *inode, const cetrafs_inode_t *raw, u64 **out, u32 *out_n)
+/*
+ * The set of a tree's blocks. Unchecked, a leaf is taken from its
+ * parent's word, unread: right for a set that is KEPT, where a block too
+ * many only keeps it. 'checked' reads every block, and fails the whole
+ * set if any is not what its parent says it is: required of a set that is
+ * FREED, where a block too many is someone else's.
+ */
+static int cetrafs_tree_meta_set(struct inode *inode, const cetrafs_inode_t *raw, bool checked, u64 **out,
+                                 u32 *out_n)
 {
-    struct cetrafs_meta_set_ctx m = {0};
+    struct cetrafs_meta_set_ctx m = {.checked = checked};
     struct cetrafs_tw w = {
         .ops = &cetrafs_meta_set_ops,
         .inode = inode,
@@ -4752,7 +4785,7 @@ void cetrafs_tree_free_meta_except(struct inode *inode, const cetrafs_inode_t *r
     u64 *ks, *rs;
     u32 kn, rn, i;
 
-    if (cetrafs_tree_meta_set(inode, keep, &ks, &kn)) {
+    if (cetrafs_tree_meta_set(inode, keep, false, &ks, &kn)) {
         pr_warn_ratelimited("ino=%llu: the kept extent tree could not be read -- its old blocks are left for the "
                             "scrub\n",
                             (unsigned long long) inode->i_ino);
@@ -4763,7 +4796,7 @@ void cetrafs_tree_free_meta_except(struct inode *inode, const cetrafs_inode_t *r
         cetrafs_tree_free_meta(inode, raw);
         return;
     }
-    if (cetrafs_tree_meta_set(inode, raw, &rs, &rn)) {
+    if (cetrafs_tree_meta_set(inode, raw, true, &rs, &rn)) {
         kvfree(ks);
         pr_warn_ratelimited("ino=%llu: the replaced extent tree could not be read -- its blocks are left for the "
                             "scrub\n",
@@ -5348,6 +5381,10 @@ static int cetrafs_tpath_find_in(struct inode *inode, struct cetrafs_tpath *p, i
                 : cetrafs_read_leaf_bh(inode, cetrafs_ei_child(&arr[i]));
         if (!bh)
             return -EIO;
+        if (!cetrafs_tree_blk_at_level(inode, bh, cl)) {
+            brelse(bh);
+            return -EIO;
+        }
         cn = cetrafs_le16(((const cetrafs_extent_hdr_t *) bh->b_data)->eh_entries);
         cn = min_t(u32, cn, cl ? CETRAFS_EXT_BLOCK_MAX_IDX : CETRAFS_EXT_BLOCK_MAX_LEAVES);
         p->bh[cl] = bh;
@@ -5479,6 +5516,13 @@ static int cetrafs_idx_insert_keep_last(struct inode *inode, struct buffer_head 
  * the new one names too.
  */
 #define CETRAFS_SPLIT_NONE 1
+
+/* TEST ONLY: the next leaf split's second step (shrinking the old leaf)
+ * is refused, as a journal write refused before it lands leaves it --
+ * the old leaf's image unchanged, the new leaf already named. */
+static bool cetrafs_leaf_split_fail_shrink;
+cetrafs_test_param(leaf_split_fail_shrink, cetrafs_leaf_split_fail_shrink, bool, 0644);
+MODULE_PARM_DESC(leaf_split_fail_shrink, "TEST ONLY: the next leaf split fails after naming its new leaf");
 
 static int cetrafs_tree_split_leaf(struct inode *inode,
                                    cetrafs_inode_t *raw,
@@ -5622,7 +5666,9 @@ static int cetrafs_tree_split_leaf(struct inode *inode,
         goto out; /* the new leaf is named in core: it stays */
 
     /* 2. Only now the moved entries out of the old leaf. */
-    {
+    if (unlikely(xchg(&cetrafs_leaf_split_fail_shrink, false))) {
+        ret = -EIO; /* test-only; see the parameter: refused, the old leaf as it was */
+    } else {
         const u32 lprev = cetrafs_bh_begin_update_crc(lbh);
 
         for (i = 0, k = 0; i < n; i++)
@@ -5633,8 +5679,19 @@ static int cetrafs_tree_split_leaf(struct inode *inode,
         cetrafs_blk_tail_stamp(lbh, CETRAFS_LEAF_TAIL_MAGIC);
         ret = cetrafs_tree_hold_back(inode, lbh, lprev, false);
     }
-    if (!ret)
+    if (ret) {
+        /* Step 1 named the new leaf; the old one still holds the moved
+         * entries (an abort restores its image). The tree may now name
+         * those blocks twice, and a delete would free them twice: the
+         * file is marked damaged, which refuses its writes and keeps
+         * eviction from freeing it, until fsck settles it. */
+        pr_err("ino=%llu: a leaf split named its new leaf but could not shrink the old one (%d) -- the file is "
+               "marked damaged\n",
+               (unsigned long long) inode->i_ino, ret);
+        cetrafs_sb_corrupt_inode(inode);
+    } else {
         atomic64_inc(&cetrafs_leaf_splits);
+    }
 out:
     kfree(part);
     kfree(keys);

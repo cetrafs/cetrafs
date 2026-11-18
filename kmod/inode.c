@@ -407,8 +407,16 @@ static int __cetrafs_read_raw_inode(struct super_block *sb, u64 ino, cetrafs_ino
      * segment the number is in, and its dirent reached us before our
      * heartbeat caught the layout up. Caught up once, here, the way an
      * address past the old end is (cetrafs_lba_run_check()). */
-    if (!blk && ino > cetrafs_sb_inodes(sb) && cetrafs_sb_layout_refresh(sb) > 0)
+    if (!blk && ino > cetrafs_sb_inodes(sb)) {
+        /* >= 0: also when a concurrent refresh applied it. A refresh
+         * that failed is "cannot tell", never -EINVAL: callers read
+         * -EINVAL as "past the table, names no inode" (class 48). */
+        int rr = cetrafs_sb_layout_refresh(sb);
+
+        if (rr < 0)
+            return rr == -EINVAL ? -EIO : rr;
         blk = cetrafs_inode_lba(sb, ino);
+    }
     if (!blk)
         return -EINVAL;
 

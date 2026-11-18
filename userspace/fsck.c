@@ -653,7 +653,9 @@ static off_t fsck_ino_off(uint64_t ino)
     return (off_t) cetrafs_iseg_record(fsck_iseg, fsck_niseg, ino) * CETRAFS_BLOCK_SIZE;
 }
 
-/* Is inode 'ino''s bit set on the device now? */
+/* Is inode 'ino''s bit set on the device now? 1 or 0; -1 when its
+ * sector fails its checksum -- a peer's swap seen torn, or damage: no
+ * answer, and each --live re-check treats it as "moved under the walk". */
 static int fsck_ino_bit_on_disk(int fd, uint64_t ino)
 {
     uint8_t blk[CETRAFS_BLOCK_SIZE];
@@ -662,6 +664,8 @@ static int fsck_ino_bit_on_disk(int fd, uint64_t ino)
     if (!lba)
         return 0;
     pread_all(fd, blk, sizeof(blk), (off_t) lba * CETRAFS_BLOCK_SIZE);
+    if (cetrafs_bmap_sector_bad_us(blk + off / 8 / CETRAFS_BMAP_SECTOR * CETRAFS_BMAP_SECTOR))
+        return -1;
     return !!(blk[off / 8] & (1u << (off % 8)));
 }
 
@@ -695,10 +699,35 @@ static uint8_t *fsck_bmap_read(int fd, uint64_t lba, uint64_t cnt, uint64_t *nbl
     return img;
 }
 
-/* A bitmap image written back, every sector restamped. */
+/* Bit 'i' of a bitmap image lies in a sector that fails its checksum:
+ * its value decides nothing (taken as in use, never handed out or
+ * cleared). */
+static int fsck_bmap_bit_damaged(const uint8_t *img, uint64_t i)
+{
+    const uint64_t byte = cetrafs_bmap_blk(i) * CETRAFS_BLOCK_SIZE + cetrafs_bmap_off(i) / 8;
+
+    return cetrafs_bmap_sector_bad_us(img + byte / CETRAFS_BMAP_SECTOR * CETRAFS_BMAP_SECTOR);
+}
+
+/* A bitmap image written back, every sector restamped -- except, when
+ * repair is blocked, a sector that fails its checksum on the device now.
+ * Its bits are what this run could not settle (the walk that would have
+ * named every live block did not run whole), and a restamp would make
+ * them pass for true: a referenced block read as free, handed out again.
+ * Written back exactly as found, it stays damaged, which the kernel
+ * counts as in use (class 45; rule 3). */
 static void fsck_bmap_write(int fd, uint64_t lba, uint8_t *img, uint64_t nblk)
 {
     cetrafs_bmap_stamp_us(img, nblk);
+    if (repair_blocked) {
+        uint8_t *dev = (uint8_t *) xcalloc(nblk, CETRAFS_BLOCK_SIZE);
+
+        pread_all(fd, dev, (size_t) nblk * CETRAFS_BLOCK_SIZE, (off_t) lba * CETRAFS_BLOCK_SIZE);
+        for (uint64_t i = 0; i < nblk * CETRAFS_BMAP_SECTORS; i++)
+            if (cetrafs_bmap_sector_bad_us(dev + i * CETRAFS_BMAP_SECTOR))
+                memcpy(img + i * CETRAFS_BMAP_SECTOR, dev + i * CETRAFS_BMAP_SECTOR, CETRAFS_BMAP_SECTOR);
+        free(dev);
+    }
     pwrite_all(fd, img, (size_t) nblk * CETRAFS_BLOCK_SIZE, (off_t) lba * CETRAFS_BLOCK_SIZE);
 }
 
@@ -957,8 +986,8 @@ static int fsck_live_dangling_holds(int fd, const cetrafs_superblock_t *sb, uint
     cetrafs_inode_t a, b;
 
     fsck_read_inode(fd, sb, t, &a);
-    if (fsck_ino_bit_on_disk(fd, t))
-        return 0; /* allocated now: created after the bitmap was read */
+    if (fsck_ino_bit_on_disk(fd, t) != 0)
+        return 0; /* allocated now (created after the bitmap was read), or unreadable */
     pread_all(fd, blk, sizeof(blk), (off_t) dblk * CETRAFS_BLOCK_SIZE);
     if (!cetrafs_blk_struct_ok(blk, CETRAFS_DIRENT_TAIL_MAGIC) || cetrafs_le64(de[slot].inode) != t)
         return 0; /* the entry moved, or the block is mid-write */
@@ -980,7 +1009,7 @@ static int fsck_live_record_same(int fd, const cetrafs_superblock_t *sb, uint64_
 {
     cetrafs_inode_t in;
 
-    if (!fsck_ino_bit_on_disk(fd, ino))
+    if (fsck_ino_bit_on_disk(fd, ino) != 1)
         return 0;
     fsck_read_inode(fd, sb, ino, &in);
     return cetrafs_inode_crcs_ok(&in) && cetrafs_le64(in.generation) == gen && cetrafs_le32(in.nlink) == nlink;
@@ -1744,7 +1773,7 @@ static int fsck_alloc_block(int fd,
         uint8_t *bmap = fsck_bmap_read(fd, bg_bmap_lba[b], bg_data_cnt[b], &bmap_blocks, NULL, NULL);
 
         for (uint64_t i = 0; i < bg_data_cnt[b]; ++i) {
-            if (cetrafs_bmap_get(bmap, i))
+            if (cetrafs_bmap_get(bmap, i) || fsck_bmap_bit_damaged(bmap, i))
                 continue;
             /* Its flags first: a group with an UNMAP outstanding takes
              * no block, and one marked discarded is marked as holding
@@ -3457,8 +3486,7 @@ int main(int argc, char **argv)
         }
         /* Room this build does not follow (A-13): checking the volume
          * without the Zone Groups it would miss is not checking it. */
-        if (cetrafs_le64(sb.zg_seg_next) ||
-            (cetrafs_le32(sb.zg_first_count) && cetrafs_le32(sb.zg_first_count) != cetrafs_le32(sb.zone_group_count))) {
+        if (cetrafs_sb_zg_chained(&sb)) {
             fprintf(stderr, "ERR: the Zone Group table has appended segments (head %" PRIu64
                             ", %u of %u Zone Groups in the first) -- this build cannot follow them\n",
                     (uint64_t) cetrafs_le64(sb.zg_seg_next), cetrafs_le32(sb.zg_first_count),
@@ -6578,7 +6606,7 @@ int main(int argc, char **argv)
                 uint64_t bg_before = cleared;
 
                 for (uint64_t i = 0; i < bg_data_cnt[b]; ++i, ++ix) {
-                    if (!FSCK_GET(leakd, ix) || !cetrafs_bmap_get(bmap, i))
+                    if (!FSCK_GET(leakd, ix) || !cetrafs_bmap_get(bmap, i) || fsck_bmap_bit_damaged(bmap, i))
                         continue;
                     cetrafs_bmap_put(bmap, i, 0);
                     dirty = 1;

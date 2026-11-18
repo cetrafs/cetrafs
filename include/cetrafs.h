@@ -1999,6 +1999,15 @@ static inline int cetrafs_blk_struct_ok(const void *blk, u32 magic)
  */
 #define CETRAFS_FEAT_INCOMPAT_CAS_STAMP     (1ULL << 4)
 
+/*
+ * RESERVED (A-13): the Zone Group table carries appended segments
+ * (cetrafs_superblock_t.zg_seg_next, zg_first_count). A build that
+ * appends one sets this bit, so a build that cannot follow the chain
+ * refuses the volume by its feature word as well as by the fields
+ * (cetrafs_sb_zg_chained()). No build sets it yet.
+ */
+#define CETRAFS_FEAT_INCOMPAT_ZG_CHAIN      (1ULL << 5)
+
 #define CETRAFS_FEAT_ROCOMPAT_SPARSE       (1ULL << 0)
 
 /*
@@ -2187,6 +2196,14 @@ static inline u32 cetrafs_sb_zg_first_count(const cetrafs_superblock_t *sb)
 static inline u32 cetrafs_sb_zg_shard(const cetrafs_superblock_t *sb, u32 bg_id)
 {
     return bg_id % cetrafs_sb_zg_first_count(sb);
+}
+
+/* The superblock names a Zone Group table chain (A-13): room no build
+ * follows yet -- the mount, fsck and growfs refuse such a volume. */
+static inline int cetrafs_sb_zg_chained(const cetrafs_superblock_t *sb)
+{
+    return cetrafs_le64(sb->zg_seg_next) ||
+           (cetrafs_le32(sb->zg_first_count) && cetrafs_le32(sb->zg_first_count) != cetrafs_le32(sb->zone_group_count));
 }
 
 static inline u64 cetrafs_sb_inode_first_count(const cetrafs_superblock_t *sb)

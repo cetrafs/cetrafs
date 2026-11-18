@@ -19,9 +19,15 @@
 #    the total with it -- left alone it stood above the groups just
 #    lowered under it (audit 2026-11-15 F-34).
 #
+# D. c's bit cleared RAW -- its sector now fails its checksum -- with the
+#    set-bit repair gated, standing for a block the blocked walk never
+#    reached: the blocked run must leave that sector damaged, never
+#    restamp the unsettled 0 into a valid "free" (format batch review H2).
+#
 # DISCRIMINATION: CETRAFS_TEST_FSCK_SETBIT_GATED=1 (as before): c's block
 # stays free. CETRAFS_TEST_FSCK_ZG_LOWER_GATED=1 (as before F-34): Z's
-# total stays above its groups.
+# total stays above its groups. D: with fsck_bmap_write() restamping
+# every sector, the damaged sector checks valid with c's bit 0.
 set -euo pipefail
 . "$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)/lib/harness.sh"
 require_root
@@ -37,7 +43,7 @@ ct_param_set auto_defrag 0
 export CETRAFS_PEER_PROBE_SECS=3
 get() { grep -o "$1=[^ ]*" <<<"$2" | head -1 | cut -d= -f2; }
 
-# <tag> <gated 0|1> [Z <zg gated 0|1>] -> RES
+# <tag> <gated 0|1> [Z <zg gated 0|1> | D] -> RES
 round() {
     local img dev a b c pa pc d0 ds bm out out2 fr
     img="$(ct_image 560 "fsb$1")"
@@ -57,7 +63,11 @@ round() {
     d0="$("$BGPOKE" "$dev" 0 --dump)"
     ds=$(( $(grep -oP 'start_block=\K[0-9]+' <<<"$d0") + $(grep -oP 'off_data_region=\K[0-9]+' <<<"$d0") ))
     bm=$(( $(grep -oP 'start_block=\K[0-9]+' <<<"$d0") + $(grep -oP 'off_data_bmap=\K[0-9]+' <<<"$d0") ))
-    "$BMP" "$img" "$bm" "$((pc - ds))" 0
+    if [ "${3:-}" = D ]; then
+        "$BMP" "$img" "$bm" "$((pc - ds))" 0 raw
+    else
+        "$BMP" "$img" "$bm" "$((pc - ds))" 0
+    fi
     if [ "${3:-}" = Z ]; then
         fr="$(grep -oP 'free_data_blocks=\K[0-9]+' <<<"$d0")"
         "$BGPOKE" "$img" 0 $((fr + 50)) sync-zg >/dev/null || { fail "setup: bg_poke sync-zg"; ct_exit; }
@@ -77,6 +87,8 @@ round() {
     out2="$("$ROOT/userspace/fsck.cetra" "$dev" 2>&1 || true)"
     RES="$RES zgbefore=$(grep -c 'ZG0 aggregate free_data_blocks' <<<"$out" || true)"
     RES="$RES zgafter=$(grep -c 'ZG0 aggregate free_data_blocks' <<<"$out2" || true)"
+    RES="$RES crcbefore=$(grep -c '^ERR: data bitmap at block .* fail their checksum' <<<"$out" || true)"
+    RES="$RES crcafter=$(grep -c '^ERR: data bitmap at block .* fail their checksum' <<<"$out2" || true)"
 }
 
 round c 1
@@ -104,4 +116,13 @@ log "Z control (totals left alone): $ZC"
     fail "Z: the total still disagrees with its groups after the run: $Z"
 [ "$(get zgafter "$ZC")" -ge 1 ] && pass "Z control: as before, the total was left above its groups" ||
     fail "Z control: the total agreed without the change -- the suite does not reach it: $ZC"
+
+round d 1 D
+D="$RES"
+log "D (damaged sector, blocked, set-bit gated): $D"
+[ "$(get blocked "$D")" -ge 1 ] && [ "$(get crcbefore "$D")" -ge 1 ] ||
+    { fail "setup: D had no blocked repair or no damaged sector: $D"; ct_exit; }
+[ "$(get crcafter "$D")" -ge 1 ] && [ "$(get cbit "$D")" = 0 ] &&
+    pass "D: the blocked run left the damaged sector damaged -- its unsettled bits do not pass for true" ||
+    fail "D: the blocked run restamped the damaged sector (c's bit now reads $(get cbit "$D") behind a valid CRC): $D"
 ct_exit

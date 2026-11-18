@@ -413,6 +413,11 @@ static int scrub_build_refset(struct cetrafs_scrub *s, struct scrub_ctx *ctx, bo
 
     if (!raw_sb)
         return -EINVAL;
+    /* The bound from the device's layout: an inode in a segment a peer's
+     * grow added and this node has not caught up with would protect
+     * nothing, and its blocks would read as leaked (rule 6). */
+    if (cetrafs_sb_layout_refresh(sb) < 0)
+        return -EAGAIN;
     ninodes = cetrafs_sb_inodes(sb);
 
     /* The inode bitmap first, and as a whole: it is a handful of blocks

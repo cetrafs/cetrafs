@@ -3868,12 +3868,14 @@ static int cetrafs_jrefs_add(struct cetrafs_journal_refs *r, u64 phys, u64 len)
 static int cetrafs_jrefs_payload(struct cetrafs_journal_refs *r, u64 target, const u8 *payload)
 {
     const cetrafs_extent_hdr_t *eh = (const cetrafs_extent_hdr_t *) payload;
-    u32 n, i, room = (CETRAFS_BLOCK_SIZE - sizeof(*eh)) / sizeof(cetrafs_extent_t);
+    u32 n, i;
     int ret = cetrafs_jrefs_add(r, target, 1);
 
     if (ret || cetrafs_le16(eh->eh_magic) != CETRAFS_EXT_MAGIC)
         return ret;
-    n = min_t(u32, cetrafs_le16(eh->eh_entries), room);
+    /* The format's bound for the block's kind: entries end at the tail. */
+    n = min_t(u32, cetrafs_le16(eh->eh_entries),
+              cetrafs_le16(eh->eh_depth) ? CETRAFS_EXT_BLOCK_MAX_IDX : CETRAFS_EXT_BLOCK_MAX_LEAVES);
     for (i = 0; i < n && !ret; i++) {
         if (cetrafs_le16(eh->eh_depth) == 0) {
             const cetrafs_extent_t *e = (const cetrafs_extent_t *) (payload + sizeof(*eh)) + i;

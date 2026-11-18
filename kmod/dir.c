@@ -370,8 +370,17 @@ static int cetrafs_dirent_block_live_owner(struct super_block *sb, u64 lba, u64 
                (unsigned long long) lba, (unsigned long long) self, ret);
         return -EIO;
     }
-    if (!cetrafs_le32(r.nlink) || !S_ISDIR(cetrafs_le32(r.mode)) || cetrafs_le16(r.eh.eh_magic) != CETRAFS_EXT_MAGIC)
+    if (!cetrafs_le32(r.nlink) || !S_ISDIR(cetrafs_le32(r.mode)))
         return 0;
+    /* A live directory whose record checks but whose tree header does
+     * not: what it lists cannot be read, so the block may be listed --
+     * refused, never zeroed (class 36). */
+    if (cetrafs_le16(r.eh.eh_magic) != CETRAFS_EXT_MAGIC) {
+        pr_err("dirent_block_init: block %llu names LIVE directory ino=%llu, whose extent header is damaged -- "
+               "not zeroing it, the block stays allocated (fsck)\n",
+               (unsigned long long) lba, (unsigned long long) self);
+        return -EUCLEAN;
+    }
 
     /* Its tree at any depth, read fresh. A block of it that cannot be
      * read, or lies past a layout this node has not caught up with, is
@@ -2574,6 +2583,16 @@ int cetrafs_ns_count_names(struct super_block *sb, const u64 *inos, u32 n, u32 *
         ret = -ENOMEM;
         goto out;
     }
+    /*
+     * The bound fresh, too: a directory in a segment a peer's grow added
+     * since this node's last heartbeat is past cetrafs_sb_inodes(), and
+     * the file it names would count 0 for the same reason (rule 6). A
+     * layout that cannot be confirmed leaves the count unknown.
+     */
+    ret = cetrafs_sb_layout_refresh(sb);
+    if (ret < 0)
+        goto out;
+    ret = 0;
     ninodes = cetrafs_sb_inodes(sb);
     /*
      * The inode bitmap fresh, first: it decides which records are walked

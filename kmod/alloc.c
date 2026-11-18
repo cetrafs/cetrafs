@@ -543,7 +543,11 @@ static long cetrafs_bitmap_count_free(struct super_block *sb, u64 bmap_lba, u64 
             continue; /* damaged: nothing in it is handed out, so none of it counts as free */
         if (!bh)
             return err;
+        /* Under the buffer lock: a CAS publish copies into this buffer
+         * under it, and a weight across that copy mixes two images. */
+        cetrafs_bh_read_lock(bh);
         free += nb - cetrafs_bmap_weight(bh->b_data, nb);
+        cetrafs_bh_read_unlock(bh);
         brelse(bh);
     }
 
@@ -2747,7 +2751,9 @@ int cetrafs_alloc_data_block_near(struct super_block *sb, u32 bg_id, u64 preferr
                        __builtin_return_address(0));
                 return 0;
             }
-            if (ret != -ENOSPC)
+            /* -EUCLEAN: the hint's bitmap sector is damaged -- a miss
+             * like a taken block; the allocator below skips the damage. */
+            if (ret != -ENOSPC && ret != -EUCLEAN)
                 return ret; /* a real I/O error, not just "miss" -- don't paper over it */
         }
     }
@@ -3273,9 +3279,11 @@ int cetrafs_inode_is_allocated(struct super_block *sb, u64 ino, bool *out_set)
 {
     u64 off, lba = cetrafs_ino_bit(sb, ino, &off); /* the bit's block, and its offset in that block */
 
+    /* Outside this node's layout is "cannot tell", not "free": a peer's
+     * grow may have added the segment (class 36). */
     if (!lba) {
         *out_set = false;
-        return 0;
+        return -ERANGE;
     }
     return cetrafs_bmap_test_off(sb, lba, off, out_set);
 }
@@ -6200,8 +6208,11 @@ int cetrafs_trim_claim_next(struct super_block *sb, u32 bg_id, u64 *cursor, u64 
          * are set. Every bit of the run read clear a moment ago under
          * this mutex, so clearing the whole run again undoes exactly
          * what was set (a clear bit stays clear). Nothing is discarded. */
-        (void) cetrafs_bitmap_flip_range(sb, bmap_lba, bmap_blocks, start, len, false);
-        pr_err_ratelimited("trim claim: BG %u bitmap unreadable (%ld) -- skipped\n", bg_id, wrong);
+        long undo = cetrafs_bitmap_flip_range(sb, bmap_lba, bmap_blocks, start, len, false);
+
+        /* An undo that fails leaves bits set: a leak the scrub reclaims. */
+        pr_err_ratelimited("trim claim: BG %u bitmap unreadable (%ld) -- skipped%s\n", bg_id, wrong,
+                           undo < 0 ? "; the claim could not be undone, its blocks leak until the scrub" : "");
         run->count = 0;
         ret = (int) wrong;
         goto out;

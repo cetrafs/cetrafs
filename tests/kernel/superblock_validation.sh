@@ -227,6 +227,18 @@ else
 fi
 "$SB_POKE" "$DEV" features_incompat "$ORIG_IN" >/dev/null
 blockdev --flushbufs "$DEV"
+# The reserved Zone Group chain bit (A-13): set by a build that appends
+# Zone Group segments, which this one cannot follow.
+"$SB_POKE" "$DEV" features_incompat $((ORIG_IN | (1 << 5))) >/dev/null
+blockdev --flushbufs "$DEV"
+if mount -t cetrafs "$DEV" "$MNT" 2>/dev/null; then
+    umount "$MNT"
+    fail "a volume with the reserved Zone Group chain feature mounted"
+else
+    pass "a volume with the reserved Zone Group chain feature (A-13) is refused"
+fi
+"$SB_POKE" "$DEV" features_incompat "$ORIG_IN" >/dev/null
+blockdev --flushbufs "$DEV"
 
 # COMPAT: the mount ignores it; a grow may not (cetrafs.h, the feature
 # rules) -- growfs refuses first, so the kernel's own refusal is asked

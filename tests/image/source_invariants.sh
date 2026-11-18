@@ -1246,6 +1246,7 @@ file.c:cetrafs_tree_append_inner the-editor,-under-invalidate_lock-exclusive
 file.c:cetrafs_tpath_cover the-editor,-the-append's-path,-under-invalidate_lock-exclusive
 file.c:cetrafs_tpath_link the-editor,-the-append's-path,-under-invalidate_lock-exclusive
 file.c:cetrafs_tpath_find_in the-editors'-search,-under-invalidate_lock-exclusive
+file.c:cetrafs_tree_blk_at_level a-header-check-for-its-two-callers-(cetrafs_patch_open,-cetrafs_tpath_find_in),-both-under-invalidate_lock-exclusive
 file.c:cetrafs_tpath_narrow the-editor,-convert's-path,-under-invalidate_lock-exclusive
 file.c:cetrafs_tree_split_leaf the-editor,-under-invalidate_lock-exclusive-(asserted);-its-new-leaf-a-new-block
 file.c:cetrafs_tree_insert_any_leaf the-editor,-under-invalidate_lock-exclusive-(asserted)
@@ -2512,8 +2513,7 @@ cetrafs_free_inline_extents prim:evict-s
 cetrafs_free_leaf_array prim:of-free_inline_extents
 cetrafs_leaf_array_punch prim:fallocate-s-punch
 cetrafs_leaf_array_trim prim:truncate-s
-cetrafs_free_meta_child prim:a-hook-of-cetrafs_tree_free_meta-only,-whose-callers-are-listed
-cetrafs_free_meta_done prim:a-hook-of-cetrafs_tree_free_meta-only,-whose-callers-are-listed
+cetrafs_tree_free_meta prim:its-callers-are-listed
 cetrafs_tree_free_meta_except prim:its-callers-are-listed
 cetrafs_alloc_data_run_resv own:a-run-it-just-took-back-on-failure
 cetrafs_trim_claim_next own:undoes-its-own-claim
@@ -2558,13 +2558,6 @@ line ~ ("(^|[^a-z0-9_])" P "\\(") && fn != P && fn != "" { print fn }' "$@"
     done | sort -u
 }
 C14D_FOUND="$(c14d_freers "$K"/*.c)"
-# The free hooks are primitives only while nothing but
-# cetrafs_tree_free_meta() walks with them.
-C14D_OPS="$(grep -n 'cetrafs_free_meta_ops' "$K"/file.c | grep -v 'static const struct cetrafs_tw_ops cetrafs_free_meta_ops' | cut -d: -f1)"
-C14D_OPSFN="$(for l in $C14D_OPS; do awk -v L="$l" 'NR <= L && /^[a-z_][a-z0-9_ *]*\(/ && $0 !~ /;$/ { fn = $0 } NR == L { sub(/\(.*/, "", fn); n = split(fn, a, " "); print a[n]; exit }' "$K"/file.c; done | sort -u)"
-[ "$C14D_OPSFN" = cetrafs_tree_free_meta ] &&
-    pass "class 14: the tree-free hooks are walked by cetrafs_tree_free_meta() alone" ||
-    fail "class 14: cetrafs_free_meta_ops is used by '$(echo $C14D_OPSFN)' -- its hooks are listed as cetrafs_tree_free_meta()'s alone"
 [ "$(grep -c . <<<"$C14D_FOUND")" -ge 20 ] || fail "class 14 (data): setup -- found only $(grep -c . <<<"$C14D_FOUND") freeing functions; the scan is not seeing the tree"
 C14D_NEW="$(comm -23 <(echo "$C14D_FOUND") <(cut -d' ' -f1 <<<"$C14D_REG" | sort -u))"
 C14D_GONE="$(comm -13 <(echo "$C14D_FOUND") <(cut -d' ' -f1 <<<"$C14D_REG" | sort -u))"
@@ -2777,8 +2770,7 @@ file.c:cetrafs_free_inline_extents:primitive
 file.c:cetrafs_free_leaf_array:primitive
 file.c:cetrafs_leaf_array_punch:primitive -- its do_free callers are checked
 file.c:cetrafs_leaf_array_trim:primitive -- its do_free callers are checked
-file.c:cetrafs_free_meta_child:a hook of cetrafs_tree_free_meta only -- a primitive, its callers are checked
-file.c:cetrafs_free_meta_done:a hook of cetrafs_tree_free_meta only -- a primitive, its callers are checked
+file.c:cetrafs_tree_free_meta:primitive -- its callers are checked
 file.c:cetrafs_tree_free_meta_except:primitive -- its callers are checked
 defrag.c:cetrafs_defrag_commit:inside its only caller'"'"'s bracket (cetrafs_defrag_inode)
 super_ops.c:cetrafs_evict_inode:the claimed dead record names every block until forget_tree (H1)
@@ -3011,7 +3003,7 @@ cetrafs_tree_append_inner writes:the-tree
 cetrafs_tree_append_room writes:the-room-check-before-a-convert-edits-the-tree
 cetrafs_evict_reread_claimed frees:the-claimed-dead-records-tree
 cetrafs_tpath_find_in writes:the-tree-convert-and-any-leaf-edit-what-it-finds
-cetrafs_tree_free_meta frees:the-trees-own-blocks
+cetrafs_tree_meta_set frees:the-trees-own-blocks-and-what-a-patch-keeps
 cetrafs_tree_last_contig_lba writes:the-allocation-goal-of-a-write
 cetrafs_tree_meta_is_ours frees:decides-a-free
 cetrafs_tree_meta_set frees:decides-which-old-tree-blocks-go
