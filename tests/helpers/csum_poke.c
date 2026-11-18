@@ -114,7 +114,7 @@ int main(int argc, char **argv)
             fprintf(stderr, "inode %" PRIu64 " is not a simple depth-0 directory\n", id);
             return 1;
         }
-        lba = ((uint64_t) cetrafs_le16(in.et.leaf[0].ee_start_hi) << 32) | cetrafs_le32(in.et.leaf[0].ee_start_lo);
+        lba = cetrafs_ee_pblk(&in.et.leaf[0]);
         flip((off_t) lba * CETRAFS_BLOCK_SIZE); /* first dirent byte: the tail CRC covers it */
     } else {
         fprintf(stderr, "unknown target '%s'\n", what);

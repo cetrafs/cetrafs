@@ -1481,15 +1481,7 @@ int main(int argc, char **argv)
     ri.eh.eh_max = cetrafs_cpu_to_le16(4);   /* inline capacity */
     ri.eh.eh_depth = cetrafs_cpu_to_le16(0); /* leaf */
     ri.eh.eh_generation = cetrafs_cpu_to_le32(0);
-    ri.et.leaf[0].ee_block = 0; /* logical block 0 */
-    ri.et.leaf[0].ee_len = cetrafs_extent_pack_len(1, 0);
-    {
-        __le16 _hi;
-        __le32 _lo;
-        cetrafs_extent_phys_to_hilo(root_data_lba, &_hi, &_lo);
-        ri.et.leaf[0].ee_start_hi = _hi;
-        ri.et.leaf[0].ee_start_lo = _lo;
-    }
+    cetrafs_ee_init(&ri.et.leaf[0], 0 /* logical block 0 */, 1, 0, root_data_lba);
 
     /* v0x0005 two-sector record: identity echoes + per-sector CRCs
      * (plain-native, like the BG descriptor/header checksums above). */

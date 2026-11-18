@@ -80,7 +80,7 @@ int main(int argc, char **argv)
         return 1;
     }
 
-    uint64_t leaf_lba = cetrafs_extent_phys_from_hilo(rec.et.idx[0].ei_leaf_hi, rec.et.idx[0].ei_leaf_lo);
+    uint64_t leaf_lba = cetrafs_ei_child(&rec.et.idx[0]);
 
     if (strcmp(argv[2], "leaf") == 0) {
         printf("%" PRIu64 "\n", leaf_lba);
@@ -122,9 +122,9 @@ int main(int argc, char **argv)
         if (argv[2][0] == 's') {
             for (i = 0; i < n; i++)
                 printf("ent %u block=%u phys=%" PRIu64 " len=%u uninit=%d\n", i,
-                       (unsigned) cetrafs_le32(leaves[i].ee_block),
-                       cetrafs_extent_phys_from_hilo(leaves[i].ee_start_hi, leaves[i].ee_start_lo),
-                       (unsigned) cetrafs_extent_len(leaves[i].ee_len), cetrafs_extent_is_uninit(leaves[i].ee_len));
+                       (unsigned) cetrafs_ee_lblk(&leaves[i]),
+                       cetrafs_ee_pblk(&leaves[i]),
+                       (unsigned) cetrafs_ee_len(&leaves[i]), cetrafs_ee_uninit(&leaves[i]));
             return 0;
         }
         if (argc != 6) {
@@ -136,8 +136,7 @@ int main(int argc, char **argv)
             fprintf(stderr, "entry %u out of range (entries=%u)\n", i, n);
             return 1;
         }
-        leaves[i].ee_len = cetrafs_extent_pack_len(cetrafs_extent_len(leaves[i].ee_len) + (uint32_t) strtoul(argv[5], NULL, 0),
-                                                   cetrafs_extent_is_uninit(leaves[i].ee_len));
+        cetrafs_ee_set_len(&leaves[i], cetrafs_ee_len(&leaves[i]) + (uint32_t) strtoul(argv[5], NULL, 0), cetrafs_ee_uninit(&leaves[i]));
         {
             cetrafs_blk_tail_t *t = (cetrafs_blk_tail_t *) (blk + CETRAFS_BLK_TAIL_OFF);
 
@@ -146,7 +145,7 @@ int main(int argc, char **argv)
         }
         pwrite_all(blk, sizeof(blk), (off_t) leaf_lba * CETRAFS_BLOCK_SIZE);
         printf("leaf_poke: ino %" PRIu64 " leaf %" PRIu64 " entry %u len -> %u\n", ino, leaf_lba, i,
-               (unsigned) cetrafs_extent_len(leaves[i].ee_len));
+               (unsigned) cetrafs_ee_len(&leaves[i]));
         return 0;
     }
 
@@ -172,13 +171,9 @@ int main(int argc, char **argv)
         }
 
         if (set_block) {
-            leaves[entry].ee_block = cetrafs_cpu_to_le32((uint32_t) new_phys);
+            cetrafs_ee_set_lblk(&leaves[entry], (uint32_t) new_phys);
         } else {
-            __le16 hi;
-            __le32 lo;
-            cetrafs_extent_phys_to_hilo(new_phys, &hi, &lo);
-            leaves[entry].ee_start_hi = hi;
-            leaves[entry].ee_start_lo = lo;
+            cetrafs_ee_set_pblk(&leaves[entry], new_phys);
         }
         /* Restamp the v0x000F tail. Without this the kernel rejects the
          * block as a torn read and the suite tests the checksum instead

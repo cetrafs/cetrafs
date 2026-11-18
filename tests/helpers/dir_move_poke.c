@@ -70,11 +70,11 @@ static uint64_t dir_block(uint64_t ino)
 
     rec_read(ino, &r);
     if (cetrafs_le16(r.eh.eh_depth) != 0 || cetrafs_le16(r.eh.eh_entries) != 1 ||
-        cetrafs_extent_len(r.et.leaf[0].ee_len) != 1) {
+        cetrafs_ee_len(&r.et.leaf[0]) != 1) {
         fprintf(stderr, "ino %" PRIu64 ": not a one-block inline directory\n", ino);
         exit(2);
     }
-    return cetrafs_extent_phys_from_hilo(r.et.leaf[0].ee_start_hi, r.et.leaf[0].ee_start_lo);
+    return cetrafs_ee_pblk(&r.et.leaf[0]);
 }
 
 static void blk_stamp(uint8_t *blk)

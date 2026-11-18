@@ -101,9 +101,8 @@ int main(int argc, char **argv)
             return 1;
         }
         printf("%llu %u\n",
-               (unsigned long long) cetrafs_extent_phys_from_hilo(rec.et.leaf[0].ee_start_hi,
-                                                                  rec.et.leaf[0].ee_start_lo),
-               cetrafs_extent_len(rec.et.leaf[0].ee_len));
+               (unsigned long long) cetrafs_ee_pblk(&rec.et.leaf[0]),
+               cetrafs_ee_len(&rec.et.leaf[0]));
         return 0;
     }
 

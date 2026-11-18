@@ -2073,4 +2073,78 @@ static inline void cetrafs_extent_phys_to_hilo(u64 phys, __le16 *hi, __le32 *lo)
     if (lo) *lo = cetrafs_cpu_to_le32((u32)(phys & 0xFFFFFFFFu));
 }
 
+/*
+ * Field accessors for extent and index entries. Everything outside this
+ * header reads and writes an entry through these, never through its
+ * ee_* / ei_* fields (tests/image/source_invariants.sh), so that the
+ * layout of an entry -- how wide a logical block is, where its high bits
+ * live -- is decided here and nowhere else.
+ */
+static inline u32 cetrafs_ee_lblk(const cetrafs_extent_t *e)
+{ return cetrafs_le32(e->ee_block); }
+
+static inline void cetrafs_ee_set_lblk(cetrafs_extent_t *e, u32 lblk)
+{ e->ee_block = cetrafs_cpu_to_le32(lblk); }
+
+/* Length in blocks, without the uninit flag. */
+static inline u32 cetrafs_ee_len(const cetrafs_extent_t *e)
+{ return cetrafs_extent_len(e->ee_len); }
+
+static inline int cetrafs_ee_uninit(const cetrafs_extent_t *e)
+{ return cetrafs_extent_is_uninit(e->ee_len); }
+
+static inline void cetrafs_ee_set_len(cetrafs_extent_t *e, u32 len, int uninit)
+{ e->ee_len = cetrafs_extent_pack_len(len, uninit); }
+
+/* Physical start (an LBA). */
+static inline u64 cetrafs_ee_pblk(const cetrafs_extent_t *e)
+{ return cetrafs_extent_phys_from_hilo(e->ee_start_hi, e->ee_start_lo); }
+
+static inline void cetrafs_ee_set_pblk(cetrafs_extent_t *e, u64 pblk)
+{
+    e->ee_start_hi = cetrafs_cpu_to_le16((u16) (pblk >> 32));
+    e->ee_start_lo = cetrafs_cpu_to_le32((u32) (pblk & 0xFFFFFFFFu));
+}
+
+/* A whole entry, reserved bits zeroed. */
+static inline void cetrafs_ee_init(cetrafs_extent_t *e, u32 lblk, u32 len, int uninit, u64 pblk)
+{
+    cetrafs_ee_set_lblk(e, lblk);
+    e->ee_pad = cetrafs_cpu_to_le16(0);
+    cetrafs_ee_set_len(e, len, uninit);
+    cetrafs_ee_set_pblk(e, pblk);
+}
+
+/* The child's logical range [lo, end); end 0 means "unknown, read it". */
+static inline u32 cetrafs_ei_lo(const cetrafs_extent_idx_t *i)
+{ return cetrafs_le32(i->ei_block); }
+
+static inline void cetrafs_ei_set_lo(cetrafs_extent_idx_t *i, u32 lo)
+{ i->ei_block = cetrafs_cpu_to_le32(lo); }
+
+static inline u32 cetrafs_ei_end(const cetrafs_extent_idx_t *i)
+{ return cetrafs_le32(i->ei_block_end); }
+
+static inline void cetrafs_ei_set_end(cetrafs_extent_idx_t *i, u32 end)
+{ i->ei_block_end = cetrafs_cpu_to_le32(end); }
+
+/* The child block's LBA. */
+static inline u64 cetrafs_ei_child(const cetrafs_extent_idx_t *i)
+{ return cetrafs_extent_phys_from_hilo(i->ei_leaf_hi, i->ei_leaf_lo); }
+
+static inline void cetrafs_ei_set_child(cetrafs_extent_idx_t *i, u64 lba)
+{
+    i->ei_leaf_hi = cetrafs_cpu_to_le16((u16) (lba >> 32));
+    i->ei_leaf_lo = cetrafs_cpu_to_le32((u32) (lba & 0xFFFFFFFFu));
+}
+
+/* A whole entry, reserved bits zeroed. */
+static inline void cetrafs_ei_init(cetrafs_extent_idx_t *i, u32 lo, u32 end, u64 child)
+{
+    cetrafs_ei_set_lo(i, lo);
+    cetrafs_ei_set_end(i, end);
+    i->ei_pad = cetrafs_cpu_to_le16(0);
+    cetrafs_ei_set_child(i, child);
+}
+
 #endif /* CETRAFS_LAYOUT_H */

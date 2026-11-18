@@ -2230,6 +2230,23 @@ printf 'static void y(struct buffer_head *bh)\n{\n    cetrafs_bh_end_update_dirt
 [ -n "$(a15_dirty "$A15S")" ] && pass "A-15: control -- a planted dirty end is found" ||
     fail "A-15: control -- a planted dirty end is not found"
 
+# Extent and index entries are read and written through the accessors in
+# include/cetrafs.h (cetrafs_ee_*, cetrafs_ei_*), never through their
+# fields: the layout of an entry -- how wide a logical block is, where its
+# high bits live -- is then decided in that one header.
+log "checking extent/index entry fields are touched only by their accessors"
+ent_raw() { # <files...>: file:line of each code use of an entry field
+    grep -nE '(\.|->)(ee_block|ee_len|ee_start_hi|ee_start_lo|ee_pad|ei_block|ei_block_end|ei_leaf_hi|ei_leaf_lo|ei_pad)\b' "$@" |
+        grep -vE ':[0-9]+:[[:space:]]*(\*|/\*)' || true
+}
+ENTR="$(ent_raw "$K"/*.c "$K"/*.h "$ROOT"/userspace/*.c "$ROOT"/userspace/*.h "$ROOT"/tests/helpers/*.c)"
+[ -z "$ENTR" ] && pass "entry fields: only include/cetrafs.h touches ee_*/ei_* directly" ||
+    fail "entry fields: raw ee_*/ei_* access outside the accessors: $(head -5 <<<"$ENTR" | tr '\n' ' ')"
+ENTS="$(ct_tmp entraw).c"
+printf 'static u32 z(const cetrafs_extent_t *e)\n{\n    return cetrafs_le32(e->ee_block);\n}\n' >"$ENTS"
+[ -n "$(ent_raw "$ENTS")" ] && pass "entry fields: control -- a planted raw read is found" ||
+    fail "entry fields: control -- a planted raw read is not found"
+
 log "checking every -ENOSPC/-EBUSY/-ENOENT/-ETXTBSY names the transient states it waited out (class 43)"
 C43_REG_ENOSPC='cetrafs_alloc_pick_bg waits:cetrafs_sb_release_wait
 cetrafs_alloc_block_anywhere calls:cetrafs_alloc_pick_bg

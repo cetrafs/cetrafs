@@ -82,8 +82,7 @@ int main(int argc, char **argv)
         cetrafs_inode_t in;
 
         rd(fd, &in, sizeof(in), off);
-        in.et.leaf[0].ee_start_lo = cetrafs_cpu_to_le32((uint32_t) (phys & 0xFFFFFFFFu));
-        in.et.leaf[0].ee_start_hi = cetrafs_cpu_to_le16((uint16_t) (phys >> 32));
+        cetrafs_ee_set_pblk(&in.et.leaf[0], phys);
         cetrafs_inode_stamp_crcs_us(&in); /* v0x0005 */
         wr(fd, &in, sizeof(in), off);
         printf("corrupt_poke: inode %" PRIu64 " extent[0] -> block %" PRIu64 "\n", ino, phys);
@@ -112,8 +111,8 @@ int main(int argc, char **argv)
         memcpy(ext, in.et.leaf, n * sizeof(ext[0]));
 
         for (uint32_t e = 0; e < n; ++e) {
-            uint64_t phys = ((uint64_t) cetrafs_le16(ext[e].ee_start_hi) << 32) | cetrafs_le32(ext[e].ee_start_lo);
-            uint64_t len = cetrafs_le32(ext[e].ee_len) & CETRAFS_EXT_LEN_MASK;
+            uint64_t phys = cetrafs_ee_pblk(&ext[e]);
+            uint64_t len = cetrafs_ee_len(&ext[e]);
 
             for (uint64_t k = 0; k < len; ++k) {
                 uint8_t db[CETRAFS_BLOCK_SIZE];
@@ -164,8 +163,8 @@ int main(int argc, char **argv)
         memcpy(ext, in.et.leaf, n * sizeof(ext[0]));
 
         for (uint32_t e = 0; e < n; ++e) {
-            uint64_t phys = ((uint64_t) cetrafs_le16(ext[e].ee_start_hi) << 32) | cetrafs_le32(ext[e].ee_start_lo);
-            uint64_t len = cetrafs_le32(ext[e].ee_len) & CETRAFS_EXT_LEN_MASK;
+            uint64_t phys = cetrafs_ee_pblk(&ext[e]);
+            uint64_t len = cetrafs_ee_len(&ext[e]);
 
             for (uint64_t k = 0; k < len; ++k) {
                 uint8_t db[CETRAFS_BLOCK_SIZE];
@@ -219,9 +218,8 @@ int main(int argc, char **argv)
         }
         n = cetrafs_le16(in.eh.eh_entries) > 4 ? 4 : cetrafs_le16(in.eh.eh_entries);
         for (uint32_t e = 0; e < n; ++e) {
-            uint64_t phys = ((uint64_t) cetrafs_le16(in.et.leaf[e].ee_start_hi) << 32) |
-                            cetrafs_le32(in.et.leaf[e].ee_start_lo);
-            uint64_t len = cetrafs_le32(in.et.leaf[e].ee_len) & CETRAFS_EXT_LEN_MASK;
+            uint64_t phys = cetrafs_ee_pblk(&in.et.leaf[e]);
+            uint64_t len = cetrafs_ee_len(&in.et.leaf[e]);
 
             for (uint64_t k = 0; k < len; ++k) {
                 uint8_t db[CETRAFS_BLOCK_SIZE];
@@ -269,8 +267,8 @@ int main(int argc, char **argv)
         memcpy(ext, in.et.leaf, n * sizeof(ext[0]));
 
         for (uint32_t e = 0; e < n; ++e) {
-            uint64_t phys = ((uint64_t) cetrafs_le16(ext[e].ee_start_hi) << 32) | cetrafs_le32(ext[e].ee_start_lo);
-            uint64_t len = cetrafs_le32(ext[e].ee_len) & CETRAFS_EXT_LEN_MASK;
+            uint64_t phys = cetrafs_ee_pblk(&ext[e]);
+            uint64_t len = cetrafs_ee_len(&ext[e]);
 
             for (uint64_t k = 0; k < len; ++k) {
                 uint8_t db[CETRAFS_BLOCK_SIZE];

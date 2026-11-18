@@ -70,7 +70,7 @@ int main(int argc, char **argv)
             fprintf(stderr, "inode %" PRIu64 " is depth %u, not 1 -- it has no external leaf\n", ino, in.eh.eh_depth);
             return 1;
         }
-        lba = ((uint64_t) cetrafs_le16(in.et.idx[0].ei_leaf_hi) << 32) | cetrafs_le32(in.et.idx[0].ei_leaf_lo);
+        lba = cetrafs_ei_child(&in.et.idx[0]);
         magic = CETRAFS_LEAF_TAIL_MAGIC;
     } else {
         if (!in.xattr_block) {

@@ -311,15 +311,15 @@ MODULE_PARM_DESC(defrag_extents_unsorted, "TEST ONLY: the defragmenter reads the
 /* Logical order of two extent records, for the sort in read_extents(). */
 static int cetrafs_defrag_ext_cmp(const void *a, const void *b)
 {
-    u32 ea = cetrafs_le32(((const cetrafs_extent_t *) a)->ee_block);
-    u32 eb = cetrafs_le32(((const cetrafs_extent_t *) b)->ee_block);
+    u32 ea = cetrafs_ee_lblk((const cetrafs_extent_t *) a);
+    u32 eb = cetrafs_ee_lblk((const cetrafs_extent_t *) b);
 
     return (ea > eb) - (ea < eb);
 }
 
 static u64 cetrafs_defrag_run_end(const struct cetrafs_ext_list *el, u32 i)
 {
-    return (u64) cetrafs_le32(el->arr[i].ee_block) + cetrafs_extent_len(el->arr[i].ee_len);
+    return (u64) cetrafs_ee_lblk(&el->arr[i]) + cetrafs_ee_len(&el->arr[i]);
 }
 
 /*
@@ -336,10 +336,10 @@ static u64 cetrafs_defrag_rank_logical(const struct cetrafs_ext_list *el, u64 r)
     u32 e;
 
     for (e = 0; e < el->count; e++) {
-        u64 len = cetrafs_extent_len(el->arr[e].ee_len);
+        u64 len = cetrafs_ee_len(&el->arr[e]);
 
         if (r < o + len)
-            return cetrafs_le32(el->arr[e].ee_block) + (r - o);
+            return cetrafs_ee_lblk(&el->arr[e]) + (r - o);
         o += len;
     }
     return el->count ? cetrafs_defrag_run_end(el, el->count - 1) : 0;
@@ -369,7 +369,7 @@ static int cetrafs_defrag_read_extents(struct inode *inode, const cetrafs_inode_
         struct buffer_head *bh;
         const cetrafs_extent_hdr_t *hdr;
 
-        el->leaf_lba = cetrafs_extent_phys_from_hilo(raw->et.idx[0].ei_leaf_hi, raw->et.idx[0].ei_leaf_lo);
+        el->leaf_lba = cetrafs_ei_child(&raw->et.idx[0]);
         /* Through the tree reader, which reads fresh unless this node
          * is the file's local writer, and checks the address. It was a
          * plain cached read under "defrag pins the file's exclusive write
@@ -434,8 +434,8 @@ static int cetrafs_defrag_read_extents(struct inode *inode, const cetrafs_inode_
         /* Defrag copies these blocks and FREES them: an address read off
          * the device is checked before either (rule 19, as the free path
          * and the data path do). */
-        int chk = cetrafs_lba_run_check(sb, cetrafs_extent_phys_from_hilo(el->arr[i].ee_start_hi, el->arr[i].ee_start_lo),
-                                        cetrafs_extent_len(el->arr[i].ee_len));
+        int chk = cetrafs_lba_run_check(sb, cetrafs_ee_pblk(&el->arr[i]),
+                                        cetrafs_ee_len(&el->arr[i]));
 
         if (chk == -EAGAIN)
             return -EIO; /* past a layout this node cannot catch up with: not damage */
@@ -445,31 +445,31 @@ static int cetrafs_defrag_read_extents(struct inode *inode, const cetrafs_inode_
             cetrafs_sb_corrupt_inode(inode);
             return -EUCLEAN;
         }
-        if (cetrafs_le32(el->arr[i].ee_block) != expect)
+        if (cetrafs_ee_lblk(&el->arr[i]) != expect)
             el->dense = false;
         /* The plan maps the k-th mapped block in logical order to the
          * k-th block of the run, which needs the list in that order with
          * nothing overlapping. Sorted above, so only an overlap (damage)
          * or the unsorted test read gets here: decline, as the density
          * test used to. */
-        if (i && cetrafs_le32(el->arr[i].ee_block) < cetrafs_defrag_run_end(el, i - 1))
+        if (i && cetrafs_ee_lblk(&el->arr[i]) < cetrafs_defrag_run_end(el, i - 1))
             return -EOPNOTSUPP;
         /* A run continues while the next extent starts where the last
          * ended, however the extents inside it are cut (a convert splits
          * one). */
-        if (!i || cetrafs_le32(el->arr[i].ee_block) != cetrafs_defrag_run_end(el, i - 1)) {
-            el->rl[2 * el->runs] = cetrafs_le32(el->arr[i].ee_block);
+        if (!i || cetrafs_ee_lblk(&el->arr[i]) != cetrafs_defrag_run_end(el, i - 1)) {
+            el->rl[2 * el->runs] = cetrafs_ee_lblk(&el->arr[i]);
             el->rl[2 * el->runs + 1] = 0;
             el->runs++;
         }
-        el->rl[2 * el->runs - 1] += cetrafs_extent_len(el->arr[i].ee_len);
+        el->rl[2 * el->runs - 1] += cetrafs_ee_len(&el->arr[i]);
         /* cetrafs_extent_len() MASKS the uninit bit off, so a
          * preallocated extent is indistinguishable from data here
          * unless it is asked about explicitly. See the refusal below
          * for why that mattered. */
-        if (cetrafs_extent_is_uninit(el->arr[i].ee_len))
+        if (cetrafs_ee_uninit(&el->arr[i]))
             el->has_uninit = true;
-        expect += cetrafs_extent_len(el->arr[i].ee_len);
+        expect += cetrafs_ee_len(&el->arr[i]);
     }
     el->nblocks = expect;
     return 0;
@@ -693,9 +693,9 @@ static int cetrafs_defrag_pieces(const cetrafs_extent_t *head, u32 head_count, c
 
         if (!x)
             break;
-        len = min_t(u64, i < head_count ? cetrafs_extent_len(x->ee_len) : split_off, to - off);
-        lg = cetrafs_le32(x->ee_block);
-        un = cetrafs_extent_is_uninit(x->ee_len) && !READ_ONCE(cetrafs_defrag_ignore_uninit);
+        len = min_t(u64, i < head_count ? cetrafs_ee_len(x) : split_off, to - off);
+        lg = cetrafs_ee_lblk(x);
+        un = cetrafs_ee_uninit(x) && !READ_ONCE(cetrafs_defrag_ignore_uninit);
         /* Ranks below 'from' are not this window's. */
         skip = from > off ? min_t(u64, from - off, len) : 0;
         off += skip;
@@ -706,23 +706,23 @@ static int cetrafs_defrag_pieces(const cetrafs_extent_t *head, u32 head_count, c
 
         while (len) {
             cetrafs_extent_t *p = n ? &out[n - 1] : NULL;
-            u32 plen = p ? cetrafs_extent_len(p->ee_len) : 0;
+            u32 plen = p ? cetrafs_ee_len(p) : 0;
             u64 take, phys = cetrafs_defrag_dst_of(d, off);
             u64 seg_left = cetrafs_defrag_seg_end(d, off) - off; /* a piece stays inside its segment */
 
-            if (p && (u64) cetrafs_le32(p->ee_block) + plen == lg &&
-                cetrafs_extent_phys_from_hilo(p->ee_start_hi, p->ee_start_lo) + plen == phys &&
-                cetrafs_extent_is_uninit(p->ee_len) == un && plen < CETRAFS_EXT_LEN_MASK) {
+            if (p && (u64) cetrafs_ee_lblk(p) + plen == lg &&
+                cetrafs_ee_pblk(p) + plen == phys &&
+                cetrafs_ee_uninit(p) == un && plen < CETRAFS_EXT_LEN_MASK) {
                 take = min3(len, (u64) CETRAFS_EXT_LEN_MASK - plen, seg_left);
-                p->ee_len = cetrafs_extent_pack_len(plen + (u32) take, un);
+                cetrafs_ee_set_len(p, plen + (u32) take, un);
             } else {
                 if (n >= cap)
                     return -EIO; /* cannot happen: one entry per source piece */
                 take = min3(len, (u64) CETRAFS_EXT_LEN_MASK, seg_left);
                 memset(&out[n], 0, sizeof(out[n]));
-                out[n].ee_block = cetrafs_cpu_to_le32((u32) lg);
-                out[n].ee_len = cetrafs_extent_pack_len((u32) take, un);
-                cetrafs_extent_phys_to_hilo(phys, &out[n].ee_start_hi, &out[n].ee_start_lo);
+                cetrafs_ee_set_lblk(&out[n], (u32) lg);
+                cetrafs_ee_set_len(&out[n], (u32) take, un);
+                cetrafs_ee_set_pblk(&out[n], phys);
                 n++;
             }
             len -= take;
@@ -1199,8 +1199,8 @@ int cetrafs_defrag_inode(struct inode *inode, struct cetrafs_defrag_stats *out_s
             u32 e;
 
             for (e = 0; e < el.count && off < moved; e++) {
-                u64 phys = cetrafs_extent_phys_from_hilo(el.arr[e].ee_start_hi, el.arr[e].ee_start_lo);
-                u64 len = cetrafs_extent_len(el.arr[e].ee_len);
+                u64 phys = cetrafs_ee_pblk(&el.arr[e]);
+                u64 len = cetrafs_ee_len(&el.arr[e]);
 
                 u64 last = min_t(u64, off + len, moved) - 1;
 
@@ -1237,7 +1237,7 @@ int cetrafs_defrag_inode(struct inode *inode, struct cetrafs_defrag_stats *out_s
             suffix_start = el.count; /* index of first suffix extent after this step */
             step_end = moved;
             for (si = 0; si < el.count; si++) {
-                u32 len = cetrafs_extent_len(el.arr[si].ee_len);
+                u32 len = cetrafs_ee_len(&el.arr[si]);
 
                 if (off + len <= moved) {
                     off += len; /* already behind the cursor */
@@ -1315,20 +1315,20 @@ int cetrafs_defrag_inode(struct inode *inode, struct cetrafs_defrag_stats *out_s
             for (; bb < step_end && nb < lim; bb++) {
                 u64 src;
 
-                while (ce < el.count && bb >= ce_off + cetrafs_extent_len(el.arr[ce].ee_len)) {
-                    ce_off += cetrafs_extent_len(el.arr[ce].ee_len);
+                while (ce < el.count && bb >= ce_off + cetrafs_ee_len(&el.arr[ce])) {
+                    ce_off += cetrafs_ee_len(&el.arr[ce]);
                     ce++;
                 }
                 if (ce >= el.count) {
                     ret = -EIO; /* the map does not cover the step: the checks above make this damage */
                     break;
                 }
-                src = cetrafs_extent_phys_from_hilo(el.arr[ce].ee_start_hi, el.arr[ce].ee_start_lo) + (bb - ce_off);
+                src = cetrafs_ee_pblk(&el.arr[ce]) + (bb - ce_off);
                 if (src == cetrafs_defrag_dst_of(&dst, bb)) /* already in place */
                     continue;
                 /* Preallocated: nothing in it is the file's, and it stays
                  * preallocated where it lands (cetrafs_defrag_commit()). */
-                if (cetrafs_extent_is_uninit(el.arr[ce].ee_len) && !READ_ONCE(cetrafs_defrag_ignore_uninit))
+                if (cetrafs_ee_uninit(&el.arr[ce]) && !READ_ONCE(cetrafs_defrag_ignore_uninit))
                     continue;
                 copy_lba[nb] = src;
                 copy_off[nb] = (u32) (bb - moved);
@@ -1415,13 +1415,13 @@ int cetrafs_defrag_inode(struct inode *inode, struct cetrafs_defrag_stats *out_s
             cetrafs_extent_t whole = {0};
 
             if (split_off) {
-                u32 len = cetrafs_extent_len(suffix[0].ee_len);
-                u64 phys = cetrafs_extent_phys_from_hilo(suffix[0].ee_start_hi, suffix[0].ee_start_lo);
+                u32 len = cetrafs_ee_len(&suffix[0]);
+                u64 phys = cetrafs_ee_pblk(&suffix[0]);
 
                 whole = suffix[0];
-                suffix[0].ee_block = cetrafs_cpu_to_le32(cetrafs_le32(whole.ee_block) + split_off);
-                suffix[0].ee_len = cetrafs_extent_pack_len(len - split_off, cetrafs_extent_is_uninit(whole.ee_len));
-                cetrafs_extent_phys_to_hilo(phys + split_off, &suffix[0].ee_start_hi, &suffix[0].ee_start_lo);
+                cetrafs_ee_set_lblk(&suffix[0], cetrafs_ee_lblk(&whole) + split_off);
+                cetrafs_ee_set_len(&suffix[0], len - split_off, cetrafs_ee_uninit(&whole));
+                cetrafs_ee_set_pblk(&suffix[0], phys + split_off);
             }
             /* The commit publishes the step and frees the old tree's
              * meta; the old data blocks follow below. From the publish
@@ -1436,12 +1436,12 @@ int cetrafs_defrag_inode(struct inode *inode, struct cetrafs_defrag_stats *out_s
                 foreign = !cetrafs_tree_meta_is_ours(inode, &raw);
                 for (e = 0; e < el.count && !foreign; e++) {
                     const cetrafs_extent_t *x = (e == suffix_start && split_off) ? &whole : &el.arr[e];
-                    u64 len = cetrafs_extent_len(x->ee_len);
+                    u64 len = cetrafs_ee_len(x);
                     u64 s = max(o, freed_from), t = min(o + len, step_end);
 
                     if (s < t &&
                         !cetrafs_lba_run_is_ours(
-                            sb, cetrafs_extent_phys_from_hilo(x->ee_start_hi, x->ee_start_lo) + (s - o), t - s))
+                            sb, cetrafs_ee_pblk(x) + (s - o), t - s))
                         foreign = true;
                     o += len;
                 }
@@ -1521,10 +1521,10 @@ int cetrafs_defrag_inode(struct inode *inode, struct cetrafs_defrag_stats *out_s
                 u32 e;
 
                 for (e = 0; e < el.count; e++) {
-                    u32 len = cetrafs_extent_len(el.arr[e].ee_len);
+                    u32 len = cetrafs_ee_len(&el.arr[e]);
 
                     if (b < o + len) {
-                        src = cetrafs_extent_phys_from_hilo(el.arr[e].ee_start_hi, el.arr[e].ee_start_lo) + (b - o);
+                        src = cetrafs_ee_pblk(&el.arr[e]) + (b - o);
                         break;
                     }
                     o += len;

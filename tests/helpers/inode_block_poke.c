@@ -260,9 +260,9 @@ int main(int argc, char **argv)
             return 0;
         }
         for (uint32_t e = 0; e < cetrafs_le16(rec.eh.eh_entries) && e < 4; ++e) {
-            uint32_t len = cetrafs_extent_len(rec.et.leaf[e].ee_len);
+            uint32_t len = cetrafs_ee_len(&rec.et.leaf[e]);
 
-            if (cetrafs_extent_is_uninit(rec.et.leaf[e].ee_len)) {
+            if (cetrafs_ee_uninit(&rec.et.leaf[e])) {
                 un += len;
                 nun++;
             } else {
@@ -296,12 +296,11 @@ int main(int argc, char **argv)
              * against a healthy one saw block=0 for both and learned
              * nothing. (It also passed the raw __le32 to %u, unconverted.) */
             for (uint32_t e = 0; e < cetrafs_le16(rec.eh.eh_entries) && e < 4; ++e)
-                printf("ext %u logical=%u phys=%llu len=%u\n", e, cetrafs_le32(rec.et.leaf[e].ee_block),
-                       (unsigned long long) (((uint64_t) cetrafs_le16(rec.et.leaf[e].ee_start_hi) << 32) |
-                                             cetrafs_le32(rec.et.leaf[e].ee_start_lo)),
-                       cetrafs_le32(rec.et.leaf[e].ee_len) & CETRAFS_EXT_LEN_MASK);
+                printf("ext %u logical=%u phys=%llu len=%u\n", e, cetrafs_ee_lblk(&rec.et.leaf[e]),
+                       (unsigned long long) cetrafs_ee_pblk(&rec.et.leaf[e]),
+                       cetrafs_ee_len(&rec.et.leaf[e]));
         } else if (cetrafs_le16(rec.eh.eh_depth) == 1) {
-            uint64_t lba = ((uint64_t) cetrafs_le16(rec.et.idx[0].ei_leaf_hi) << 32) | cetrafs_le32(rec.et.idx[0].ei_leaf_lo);
+            uint64_t lba = cetrafs_ei_child(&rec.et.idx[0]);
             uint8_t blk[CETRAFS_BLOCK_SIZE];
             const cetrafs_extent_hdr_t *lh = (const cetrafs_extent_hdr_t *) blk;
 
@@ -311,10 +310,9 @@ int main(int argc, char **argv)
             uint32_t n = cetrafs_le16(lh->eh_entries) > CETRAFS_EXT_BLOCK_MAX_LEAVES ? CETRAFS_EXT_BLOCK_MAX_LEAVES : cetrafs_le16(lh->eh_entries);
 
             for (uint32_t e = 0; e < n; ++e)
-                printf("ext %u logical=%u phys=%llu len=%u\n", e, cetrafs_le32(le[e].ee_block),
-                       (unsigned long long) (((uint64_t) cetrafs_le16(le[e].ee_start_hi) << 32) |
-                                             cetrafs_le32(le[e].ee_start_lo)),
-                       cetrafs_le32(le[e].ee_len) & CETRAFS_EXT_LEN_MASK);
+                printf("ext %u logical=%u phys=%llu len=%u\n", e, cetrafs_ee_lblk(&le[e]),
+                       (unsigned long long) cetrafs_ee_pblk(&le[e]),
+                       cetrafs_ee_len(&le[e]));
         }
     } else if (strcmp(mode, "lockmode") == 0 && argc == 5) {
         /* A lock_mode no build writes (the enum is 0..3), restamped, so
@@ -373,7 +371,7 @@ int main(int argc, char **argv)
         if (cetrafs_le16(rec.eh.eh_depth) != 1) {
             printf("depth=%u (no external leaf)\n", rec.eh.eh_depth);
         } else {
-            uint64_t lba = ((uint64_t) cetrafs_le16(rec.et.idx[0].ei_leaf_hi) << 32) | cetrafs_le32(rec.et.idx[0].ei_leaf_lo);
+            uint64_t lba = cetrafs_ei_child(&rec.et.idx[0]);
             uint8_t blk[CETRAFS_BLOCK_SIZE];
             const cetrafs_extent_hdr_t *lh = (const cetrafs_extent_hdr_t *) blk;
 
@@ -383,7 +381,7 @@ int main(int argc, char **argv)
             uint32_t n = cetrafs_le16(lh->eh_entries) > CETRAFS_EXT_BLOCK_MAX_LEAVES ? CETRAFS_EXT_BLOCK_MAX_LEAVES : cetrafs_le16(lh->eh_entries);
 
             for (uint32_t e = 0; e < n; ++e)
-                blocks += cetrafs_le32(le[e].ee_len) & CETRAFS_EXT_LEN_MASK;
+                blocks += cetrafs_ee_len(&le[e]);
             printf("depth=1 leaf_lba=%llu leaf_entries=%u leaf_blocks=%llu\n", (unsigned long long) lba,
                    lh->eh_entries, (unsigned long long) blocks);
         }
@@ -401,12 +399,11 @@ int main(int argc, char **argv)
             return 2;
         }
         if (strcmp(argv[5], "block") == 0)
-            rec.et.leaf[i].ee_block = cetrafs_cpu_to_le32(v);
+            cetrafs_ee_set_lblk(&rec.et.leaf[i], v);
         else if (strcmp(argv[5], "uninit") == 0)
-            rec.et.leaf[i].ee_len = cetrafs_extent_pack_len(cetrafs_le32(rec.et.leaf[i].ee_len) & CETRAFS_EXT_LEN_MASK, v != 0);
+            cetrafs_ee_set_len(&rec.et.leaf[i], cetrafs_ee_len(&rec.et.leaf[i]), v != 0);
         else if (strcmp(argv[5], "len") == 0)
-            rec.et.leaf[i].ee_len = cetrafs_cpu_to_le32(
-                (cetrafs_le32(rec.et.leaf[i].ee_len) & ~(uint32_t) CETRAFS_EXT_LEN_MASK) | (v & CETRAFS_EXT_LEN_MASK));
+            cetrafs_ee_set_len(&rec.et.leaf[i], v & CETRAFS_EXT_LEN_MASK, cetrafs_ee_uninit(&rec.et.leaf[i]));
         else {
             fprintf(stderr, "unknown extent field %s\n", argv[5]);
             return 2;
@@ -453,15 +450,15 @@ int main(int argc, char **argv)
             fprintf(stderr, "idxrange: ino %llu is not depth 2\n", (unsigned long long) ino);
             return 1;
         }
-        ilba = ((uint64_t) cetrafs_le16(rec.et.idx[0].ei_leaf_hi) << 32) | cetrafs_le32(rec.et.idx[0].ei_leaf_lo);
+        ilba = cetrafs_ei_child(&rec.et.idx[0]);
         pread_all(fd, blk, sizeof(blk), (off_t) ilba * CETRAFS_BLOCK_SIZE);
         if (e >= cetrafs_le16(((cetrafs_extent_hdr_t *) blk)->eh_entries)) {
             fprintf(stderr, "idxrange: interior has no entry %u\n", e);
             return 1;
         }
         ie = (cetrafs_extent_idx_t *) (blk + sizeof(cetrafs_extent_hdr_t)) + e;
-        ie->ei_block = cetrafs_cpu_to_le32((uint32_t) strtoul(argv[5], NULL, 0));
-        ie->ei_block_end = cetrafs_cpu_to_le32((uint32_t) strtoul(argv[6], NULL, 0));
+        cetrafs_ei_set_lo(ie, (uint32_t) strtoul(argv[5], NULL, 0));
+        cetrafs_ei_set_end(ie, (uint32_t) strtoul(argv[6], NULL, 0));
         t = (cetrafs_blk_tail_t *) (blk + CETRAFS_BLK_TAIL_OFF);
         t->crc = cetrafs_cpu_to_le32(crc32c_update(0, blk, CETRAFS_BLK_TAIL_OFF));
         pwrite_all(fd, blk, sizeof(blk), (off_t) ilba * CETRAFS_BLOCK_SIZE);
@@ -503,12 +500,12 @@ int main(int argc, char **argv)
          * appends a tail and the freeing loop never runs -- the first
          * version of this helper set 1 and the test passed against the
          * unfixed kernel. */
-        rec.et.leaf[0].ee_len = cetrafs_cpu_to_le32((uint32_t) (len & CETRAFS_EXT_LEN_MASK) | CETRAFS_EXT_UNINIT);
-        rec.et.leaf[0].ee_block = cetrafs_cpu_to_le32(0);
-        rec.et.leaf[1].ee_block = cetrafs_cpu_to_le32(0x40000000u);
-        rec.et.leaf[1].ee_len = cetrafs_cpu_to_le32(1);
-        rec.et.leaf[2].ee_block = cetrafs_cpu_to_le32(0x50000000u);
-        rec.et.leaf[2].ee_len = cetrafs_cpu_to_le32(1);
+        cetrafs_ee_set_len(&rec.et.leaf[0], (uint32_t) (len & CETRAFS_EXT_LEN_MASK), 1);
+        cetrafs_ee_set_lblk(&rec.et.leaf[0], 0);
+        cetrafs_ee_set_lblk(&rec.et.leaf[1], 0x40000000u);
+        cetrafs_ee_set_len(&rec.et.leaf[1], 1, 0);
+        cetrafs_ee_set_lblk(&rec.et.leaf[2], 0x50000000u);
+        cetrafs_ee_set_len(&rec.et.leaf[2], 1, 0);
         rec.eh.eh_entries = cetrafs_cpu_to_le16(3);
         rec.eh.eh_depth = 0;
         cetrafs_inode_stamp_crcs_us(&rec); /* v0x0005 */
@@ -535,8 +532,8 @@ int main(int argc, char **argv)
             close(fd);
             return 1;
         }
-        len0 = cetrafs_le32(rec.et.leaf[0].ee_len) & CETRAFS_EXT_LEN_MASK;
-        rec.et.leaf[0].ee_len = cetrafs_cpu_to_le32((len0 + (uint32_t) n) & CETRAFS_EXT_LEN_MASK);
+        len0 = cetrafs_ee_len(&rec.et.leaf[0]);
+        cetrafs_ee_set_len(&rec.et.leaf[0], (len0 + (uint32_t) n) & CETRAFS_EXT_LEN_MASK, 0);
         rec.blocks = cetrafs_cpu_to_le64(cetrafs_le64(rec.blocks) + n * (CETRAFS_BLOCK_SIZE / 512));
         rec.size = cetrafs_cpu_to_le64(cetrafs_le64(rec.size) + n * CETRAFS_BLOCK_SIZE);
         cetrafs_inode_stamp_crcs_us(&rec); /* v0x0005 */
@@ -573,8 +570,8 @@ int main(int argc, char **argv)
             /* The first slot's own interior, so a path that reads every
              * slot regardless of range reads a valid block. */
             rec.et.idx[i] = rec.et.idx[0];
-            rec.et.idx[i].ei_block = cetrafs_cpu_to_le32(0xFFFFFFF0u);
-            rec.et.idx[i].ei_block_end = cetrafs_cpu_to_le32(0xFFFFFFF1u);
+            cetrafs_ei_set_lo(&rec.et.idx[i], 0xFFFFFFF0u);
+            cetrafs_ei_set_end(&rec.et.idx[i], 0xFFFFFFF1u);
         }
         rec.eh.eh_entries = cetrafs_cpu_to_le16((uint16_t) n);
         cetrafs_inode_stamp_crcs_us(&rec);
@@ -630,8 +627,7 @@ int main(int argc, char **argv)
         rec.eh.eh_depth = cetrafs_cpu_to_le16(2);
         if (cetrafs_le16(rec.eh.eh_entries) <= slot)
             rec.eh.eh_entries = cetrafs_cpu_to_le16((uint16_t) (slot + 1));
-        rec.et.idx[slot].ei_leaf_hi = cetrafs_cpu_to_le16((uint16_t) (lba >> 32));
-        rec.et.idx[slot].ei_leaf_lo = cetrafs_cpu_to_le32((uint32_t) lba);
+        cetrafs_ei_set_child(&rec.et.idx[slot], lba);
         cetrafs_inode_stamp_crcs_us(&rec);
         pwrite_all(fd, &rec, sizeof(rec), rec_off);
         fprintf(stderr, "inode_block_poke: ino %llu depth 2, root slot %u -> %llu\n", (unsigned long long) ino, slot,

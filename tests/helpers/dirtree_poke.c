@@ -102,10 +102,9 @@ int main(int argc, char **argv)
     in.eh.eh_magic = cetrafs_cpu_to_le16(CETRAFS_EXT_MAGIC);
     in.eh.eh_max = cetrafs_cpu_to_le16(4);
     in.eh.eh_entries = cetrafs_cpu_to_le16(1);
-    in.et.leaf[0].ee_block = cetrafs_cpu_to_le32(0);
-    in.et.leaf[0].ee_len = cetrafs_cpu_to_le32(1);
-    in.et.leaf[0].ee_start_lo = cetrafs_cpu_to_le32((uint32_t) data);
-    in.et.leaf[0].ee_start_hi = cetrafs_cpu_to_le16((uint16_t) (data >> 32));
+    cetrafs_ee_set_lblk(&in.et.leaf[0], 0);
+    cetrafs_ee_set_len(&in.et.leaf[0], 1, 0);
+    cetrafs_ee_set_pblk(&in.et.leaf[0], data);
     in.read_open_nodes = 0;
     in.ns_lock_owner = cetrafs_cpu_to_le32(CETRAFS_NODE_ID_NONE);
     cetrafs_inode_stamp_crcs_us(&in);

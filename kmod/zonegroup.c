@@ -872,7 +872,7 @@ loff_t cetrafs_max_file_size_for(u64 data_blocks)
      * near this, but MAX_LFS_FILESIZE itself is the contract either way.
      *
      * The second ceiling is the one that bites at real SAN sizes:
-     * cetrafs_extent_t.ee_block is 32 bits, so the extent tree cannot
+     * an extent's logical block is 32 bits, so the extent tree cannot
      * address a logical block past 2^32 -- 16 TiB -- no matter how much
      * capacity the volume has. Without this clamp a 17 TiB volume
      * reported 16.9 TiB, the VFS let a write through at offset 16 TiB,

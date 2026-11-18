@@ -135,8 +135,7 @@ int main(int argc, char **argv)
                     cetrafs_le16(rec.eh.eh_depth), cetrafs_le16(rec.eh.eh_entries));
             return 3;
         }
-        rec.et.idx[0].ei_leaf_lo = cetrafs_cpu_to_le32((uint32_t) (target & 0xffffffffu));
-        rec.et.idx[0].ei_leaf_hi = cetrafs_cpu_to_le16((uint16_t) (target >> 32));
+        cetrafs_ei_set_child(&rec.et.idx[0], target);
         cetrafs_inode_stamp_crcs_us(&rec);
         wr(fd, &rec, sizeof(rec), rec_off);
         printf("extent_phys_poke: ino %" PRIu64 " index0 leaf -> %" PRIu64 ", CRCs restamped\n", ino, target);
@@ -152,14 +151,13 @@ int main(int argc, char **argv)
         return 3;
     }
 
-    uint64_t was = ((uint64_t) cetrafs_le16(rec.et.leaf[0].ee_start_hi) << 32) | cetrafs_le32(rec.et.leaf[0].ee_start_lo);
+    uint64_t was = cetrafs_ee_pblk(&rec.et.leaf[0]);
 
-    rec.et.leaf[0].ee_start_lo = cetrafs_cpu_to_le32((uint32_t) (target & 0xffffffffu));
-    rec.et.leaf[0].ee_start_hi = cetrafs_cpu_to_le16((uint16_t) (target >> 32));
+    cetrafs_ee_set_pblk(&rec.et.leaf[0], target);
     cetrafs_inode_stamp_crcs_us(&rec); /* v0x0005: echoes + both sector CRCs */
     wr(fd, &rec, sizeof(rec), rec_off);
 
     printf("extent_phys_poke: ino %" PRIu64 " extent0 phys %" PRIu64 " -> %" PRIu64 " (len %u), CRCs restamped\n", ino,
-           was, target, cetrafs_extent_len(rec.et.leaf[0].ee_len));
+           was, target, cetrafs_ee_len(&rec.et.leaf[0]));
     return 0;
 }

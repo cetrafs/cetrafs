@@ -3879,12 +3879,12 @@ static int cetrafs_jrefs_payload(struct cetrafs_journal_refs *r, u64 target, con
         if (cetrafs_le16(eh->eh_depth) == 0) {
             const cetrafs_extent_t *e = (const cetrafs_extent_t *) (payload + sizeof(*eh)) + i;
 
-            ret = cetrafs_jrefs_add(r, (u64) cetrafs_le32(e->ee_start_lo) | ((u64) cetrafs_le16(e->ee_start_hi) << 32),
-                                    cetrafs_le32(e->ee_len) & 0x7fffffffU);
+            ret = cetrafs_jrefs_add(r, cetrafs_ee_pblk(e),
+                                    cetrafs_ee_len(e));
         } else {
             const cetrafs_extent_idx_t *x = (const cetrafs_extent_idx_t *) (payload + sizeof(*eh)) + i;
 
-            ret = cetrafs_jrefs_add(r, (u64) cetrafs_le32(x->ei_leaf_lo) | ((u64) cetrafs_le16(x->ei_leaf_hi) << 32),
+            ret = cetrafs_jrefs_add(r, cetrafs_ei_child(x),
                                     1);
         }
     }

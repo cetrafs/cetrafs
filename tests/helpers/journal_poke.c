@@ -104,14 +104,14 @@ static int holds_meta(int fd, const cetrafs_inode_t *in, uint64_t lba)
         return 0;
     if (depth == 0) {
         for (uint16_t i = 0; dir && i < n && i < 4; i++) {
-            uint64_t p = cetrafs_extent_phys_from_hilo(in->et.leaf[i].ee_start_hi, in->et.leaf[i].ee_start_lo);
-            if (lba >= p && lba < p + cetrafs_extent_len(in->et.leaf[i].ee_len))
+            uint64_t p = cetrafs_ee_pblk(&in->et.leaf[i]);
+            if (lba >= p && lba < p + cetrafs_ee_len(&in->et.leaf[i]))
                 return 1;
         }
         return 0;
     }
     for (uint16_t i = 0; i < n && i < 4; i++) {
-        uint64_t child = cetrafs_extent_phys_from_hilo(in->et.idx[i].ei_leaf_hi, in->et.idx[i].ei_leaf_lo);
+        uint64_t child = cetrafs_ei_child(&in->et.idx[i]);
         uint8_t blk[CETRAFS_BLOCK_SIZE];
         const cetrafs_extent_hdr_t *h = (const cetrafs_extent_hdr_t *) blk;
 
@@ -121,13 +121,13 @@ static int holds_meta(int fd, const cetrafs_inode_t *in, uint64_t lba)
         if (depth == 2) {
             const cetrafs_extent_idx_t *ia = (const cetrafs_extent_idx_t *) (blk + sizeof(*h));
             for (uint16_t k = 0; k < cetrafs_le16(h->eh_entries) && k < CETRAFS_EXT_BLOCK_MAX_IDX; k++)
-                if (cetrafs_extent_phys_from_hilo(ia[k].ei_leaf_hi, ia[k].ei_leaf_lo) == lba)
+                if (cetrafs_ei_child(&ia[k]) == lba)
                     return 1;
         } else if (dir) {
             const cetrafs_extent_t *la = (const cetrafs_extent_t *) (blk + sizeof(*h));
             for (uint16_t k = 0; k < cetrafs_le16(h->eh_entries) && k < CETRAFS_EXT_BLOCK_MAX_LEAVES; k++) {
-                uint64_t p = cetrafs_extent_phys_from_hilo(la[k].ee_start_hi, la[k].ee_start_lo);
-                if (lba >= p && lba < p + cetrafs_extent_len(la[k].ee_len))
+                uint64_t p = cetrafs_ee_pblk(&la[k]);
+                if (lba >= p && lba < p + cetrafs_ee_len(&la[k]))
                     return 1;
             }
         }

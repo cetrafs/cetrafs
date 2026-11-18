@@ -1576,8 +1576,8 @@ static int fsck_dir_block(const cetrafs_inode_t *in, uint32_t n, uint64_t total_
     if (cetrafs_le16(in->eh.eh_depth) != 0)
         return -1;
     for (uint32_t e = 0; e < cetrafs_le16(in->eh.eh_entries) && e < 4; ++e) {
-        uint64_t len = cetrafs_le32(in->et.leaf[e].ee_len) & CETRAFS_EXT_LEN_MASK;
-        uint64_t phys = ((uint64_t) cetrafs_le16(in->et.leaf[e].ee_start_hi) << 32) | cetrafs_le32(in->et.leaf[e].ee_start_lo);
+        uint64_t len = cetrafs_ee_len(&in->et.leaf[e]);
+        uint64_t phys = cetrafs_ee_pblk(&in->et.leaf[e]);
 
         if (n < seen + len) {
             uint64_t lba = phys + (n - seen);
@@ -1621,11 +1621,11 @@ static int fsck_dir_extents_dense(const cetrafs_inode_t *dir, uint64_t total_blo
     if (cetrafs_le16(dir->eh.eh_depth) != 0 || cetrafs_le16(dir->eh.eh_entries) > 4)
         return 0;
     for (uint32_t e = 0; e < cetrafs_le16(dir->eh.eh_entries); ++e) {
-        uint64_t len = cetrafs_le32(dir->et.leaf[e].ee_len) & CETRAFS_EXT_LEN_MASK;
-        uint64_t phys = ((uint64_t) cetrafs_le16(dir->et.leaf[e].ee_start_hi) << 32) | cetrafs_le32(dir->et.leaf[e].ee_start_lo);
+        uint64_t len = cetrafs_ee_len(&dir->et.leaf[e]);
+        uint64_t phys = cetrafs_ee_pblk(&dir->et.leaf[e]);
 
         if (len == 0 || !fsck_lba_in_range(phys, total_blocks) || phys + len > total_blocks ||
-            cetrafs_le32(dir->et.leaf[e].ee_block) != next)
+            cetrafs_ee_lblk(&dir->et.leaf[e]) != next)
             return 0;
         next += len;
     }
@@ -1637,8 +1637,8 @@ static uint32_t fsck_dir_nblocks(const cetrafs_inode_t *dir, uint64_t total_bloc
     uint64_t n = 0;
 
     for (uint32_t e = 0; e < cetrafs_le16(dir->eh.eh_entries) && e < 4; ++e) {
-        uint64_t len = cetrafs_le32(dir->et.leaf[e].ee_len) & CETRAFS_EXT_LEN_MASK;
-        uint64_t phys = ((uint64_t) cetrafs_le16(dir->et.leaf[e].ee_start_hi) << 32) | cetrafs_le32(dir->et.leaf[e].ee_start_lo);
+        uint64_t len = cetrafs_ee_len(&dir->et.leaf[e]);
+        uint64_t phys = cetrafs_ee_pblk(&dir->et.leaf[e]);
 
         if (len == 0 || !fsck_lba_in_range(phys, total_blocks) || phys + len > total_blocks)
             continue;
@@ -1751,8 +1751,8 @@ static int fsck_dir_link(int fd,
         uint32_t e = cetrafs_le16(dir.eh.eh_entries);
         if (e > 0) {
             cetrafs_extent_t *last = &dir.et.leaf[e - 1];
-            uint64_t lphys = ((uint64_t) cetrafs_le16(last->ee_start_hi) << 32) | cetrafs_le32(last->ee_start_lo);
-            uint32_t llen = cetrafs_le32(last->ee_len) & CETRAFS_EXT_LEN_MASK;
+            uint64_t lphys = cetrafs_ee_pblk(last);
+            uint32_t llen = cetrafs_ee_len(last);
 
             /* The packer, not a cast. ee_len is 31 bits of length plus
              * the uninit flag; casting the sum to uint16_t truncated it
@@ -1761,7 +1761,7 @@ static int fsck_dir_link(int fd,
              * cetrafs_fiemap() learned to reject it. Growing past the
              * mask simply starts a new entry instead. */
             if (lphys + llen == nlba && (uint64_t) llen + 1 <= CETRAFS_EXT_LEN_MASK) {
-                last->ee_len = cetrafs_extent_pack_len(llen + 1, 0);
+                cetrafs_ee_set_len(last, llen + 1, 0);
                 goto grown;
             }
         }
@@ -1772,10 +1772,9 @@ static int fsck_dir_link(int fd,
             fsck_unalloc_block(fd, bg_count, bg_data_start, bg_data_cnt, bg_bmap_lba, nlba);
             return -1;
         }
-        dir.et.leaf[e].ee_block = cetrafs_cpu_to_le32(nblocks);
-        dir.et.leaf[e].ee_len = cetrafs_extent_pack_len(1, 0);
-        dir.et.leaf[e].ee_start_lo = cetrafs_cpu_to_le32((uint32_t) (nlba & 0xFFFFFFFFu));
-        dir.et.leaf[e].ee_start_hi = cetrafs_cpu_to_le16((uint16_t) (nlba >> 32));
+        cetrafs_ee_set_lblk(&dir.et.leaf[e], nblocks);
+        cetrafs_ee_set_len(&dir.et.leaf[e], 1, 0);
+        cetrafs_ee_set_pblk(&dir.et.leaf[e], nlba);
         dir.eh.eh_entries = cetrafs_cpu_to_le16((uint16_t) (e + 1));
     grown:
         dir.blocks = cetrafs_cpu_to_le64(cetrafs_le64(dir.blocks) + (CETRAFS_BLOCK_SIZE / 512));
@@ -1977,10 +1976,9 @@ static uint64_t fsck_lost_found(int fd,
     nd.eh.eh_magic = cetrafs_cpu_to_le16(CETRAFS_EXT_MAGIC);
     nd.eh.eh_entries = cetrafs_cpu_to_le16(1);
     nd.eh.eh_max = cetrafs_cpu_to_le16(4);
-    nd.et.leaf[0].ee_block = 0;
-    nd.et.leaf[0].ee_len = cetrafs_extent_pack_len(1, 0);
-    nd.et.leaf[0].ee_start_lo = cetrafs_cpu_to_le32((uint32_t) (lba & 0xFFFFFFFFu));
-    nd.et.leaf[0].ee_start_hi = cetrafs_cpu_to_le16((uint16_t) (lba >> 32));
+    cetrafs_ee_set_lblk(&nd.et.leaf[0], 0);
+    cetrafs_ee_set_len(&nd.et.leaf[0], 1, 0);
+    cetrafs_ee_set_pblk(&nd.et.leaf[0], lba);
     fsck_write_inode(fd, sb, ino, &nd);
 
     if (fsck_dir_link(fd, sb, bg_count, bg_data_start, bg_data_cnt, bg_bmap_lba, lf->root_ino, "lost+found", ino,
@@ -2211,8 +2209,8 @@ static int fsck_lruns_overlap(uint64_t ino)
 
 static int fsck_extent_logical(uint64_t ino, const cetrafs_extent_t *x, uint64_t lo, uint64_t hi)
 {
-    uint64_t eb = cetrafs_le32(x->ee_block);
-    uint64_t len = cetrafs_le32(x->ee_len) & CETRAFS_EXT_LEN_MASK;
+    uint64_t eb = cetrafs_ee_lblk(x);
+    uint64_t len = cetrafs_ee_len(x);
 
     if (len) {
         if (fsck_nlruns == fsck_lruns_cap) {
@@ -2230,7 +2228,7 @@ static int fsck_extent_logical(uint64_t ino, const cetrafs_extent_t *x, uint64_t
      * file operation). In a symlink it reads as zeros through
      * get_block; in a directory dir.c ignores the flag. Either way it
      * is a state no kernel path creates. */
-    if (cetrafs_extent_is_uninit(x->ee_len) && fsck_cur_fmt != 0100000u) {
+    if (cetrafs_ee_uninit(x) && fsck_cur_fmt != 0100000u) {
         fprintf(stderr, "%s: inode %" PRIu64 " (not a regular file) has a preallocated extent at logical block %" PRIu64
                         "\n",
                 FSCK_SEV, ino, eb);
@@ -2453,9 +2451,9 @@ static uint64_t fsck_salvage_leaves(int fd, const uint64_t *bg_start, const uint
                                                                        : cetrafs_le16(h->eh_entries);
         for (uint32_t e = 0; e < n; e++) {
             const cetrafs_extent_t *x = &arr[e];
-            uint64_t phys = ((uint64_t) cetrafs_le16(x->ee_start_hi) << 32) | cetrafs_le32(x->ee_start_lo);
-            uint64_t len = cetrafs_le32(x->ee_len) & CETRAFS_EXT_LEN_MASK;
-            uint64_t eb = cetrafs_le32(x->ee_block), base = 0, idx0;
+            uint64_t phys = cetrafs_ee_pblk(x);
+            uint64_t len = cetrafs_ee_len(x);
+            uint64_t eb = cetrafs_ee_lblk(x), base = 0, idx0;
             /* An entry that crosses a 512-byte sector boundary can be
              * half one image and half another -- a tear, or one damaged
              * sector -- and each half looks valid: a logical block from
@@ -4339,10 +4337,10 @@ int main(int argc, char **argv)
      */
     uint64_t root_lba;
     if (cetrafs_le16(ri.eh.eh_depth) == 0) {
-        root_lba = (((uint64_t) cetrafs_le16(ri.et.leaf[0].ee_start_hi)) << 32) | cetrafs_le32(ri.et.leaf[0].ee_start_lo);
+        root_lba = cetrafs_ee_pblk(&ri.et.leaf[0]);
     } else {
         uint8_t rootleaf[CETRAFS_BLOCK_SIZE];
-        uint64_t leaf_lba = ((uint64_t) cetrafs_le16(ri.et.idx[0].ei_leaf_hi) << 32) | cetrafs_le32(ri.et.idx[0].ei_leaf_lo);
+        uint64_t leaf_lba = cetrafs_ei_child(&ri.et.idx[0]);
         const cetrafs_extent_hdr_t *lh = (const cetrafs_extent_hdr_t *) rootleaf;
         const cetrafs_extent_t *le = (const cetrafs_extent_t *) (rootleaf + sizeof(*lh));
 
@@ -4361,7 +4359,7 @@ int main(int argc, char **argv)
             fprintf(stderr, "ERR: root external extent leaf (block %" PRIu64 ") invalid\n", leaf_lba);
             return 1;
         }
-        root_lba = ((uint64_t) cetrafs_le16(le[0].ee_start_hi) << 32) | cetrafs_le32(le[0].ee_start_lo);
+        root_lba = cetrafs_ee_pblk(&le[0]);
     }
     /* mkfs puts it in BG0's first data block -- wherever the descriptor,
      * checked above against the layout, says that is. */
@@ -4713,14 +4711,14 @@ int main(int argc, char **argv)
                 uint32_t n = cetrafs_le16(in.eh.eh_entries) > 4 ? 4 : cetrafs_le16(in.eh.eh_entries);
 
                 for (uint32_t e = 0; e < n; ++e) {
-                    uint64_t phys = ((uint64_t) cetrafs_le16(in.et.leaf[e].ee_start_hi) << 32) | cetrafs_le32(in.et.leaf[e].ee_start_lo);
+                    uint64_t phys = cetrafs_ee_pblk(&in.et.leaf[e]);
 
-                    fsck_mark_run(&rc, phys, cetrafs_le32(in.et.leaf[e].ee_len) & CETRAFS_EXT_LEN_MASK, ino);
+                    fsck_mark_run(&rc, phys, cetrafs_ee_len(&in.et.leaf[e]), ino);
                     problems += fsck_extent_logical(ino, &in.et.leaf[e], 0, 0) && !fsck_dead_walk;
                     extents_seen++;
                 }
             } else if (cetrafs_le16(in.eh.eh_depth) == 1) {
-                uint64_t leaf_lba = ((uint64_t) cetrafs_le16(in.et.idx[0].ei_leaf_hi) << 32) | cetrafs_le32(in.et.idx[0].ei_leaf_lo);
+                uint64_t leaf_lba = cetrafs_ei_child(&in.et.idx[0]);
                 cetrafs_extent_hdr_t *lh;
                 uint32_t n;
 
@@ -4754,9 +4752,9 @@ int main(int argc, char **argv)
                     n = cetrafs_le16(lh->eh_entries) > CETRAFS_EXT_BLOCK_MAX_LEAVES ? CETRAFS_EXT_BLOCK_MAX_LEAVES : cetrafs_le16(lh->eh_entries);
                     for (uint32_t e = 0; e < n; ++e) {
                         const cetrafs_extent_t *x = (const cetrafs_extent_t *) (leafblk + sizeof(*lh)) + e;
-                        uint64_t phys = ((uint64_t) cetrafs_le16(x->ee_start_hi) << 32) | cetrafs_le32(x->ee_start_lo);
+                        uint64_t phys = cetrafs_ee_pblk(x);
 
-                        fsck_mark_run(&rc, phys, cetrafs_le32(x->ee_len) & CETRAFS_EXT_LEN_MASK, ino);
+                        fsck_mark_run(&rc, phys, cetrafs_ee_len(x), ino);
                         problems += fsck_extent_logical(ino, x, 0, 0) && !fsck_dead_walk;
                         extents_seen++;
                     }
@@ -4779,7 +4777,7 @@ int main(int argc, char **argv)
                 }
 
                 for (uint32_t i = 0; i < ni && tree_ok; ++i) {
-                    uint64_t ilba = ((uint64_t) cetrafs_le16(in.et.idx[i].ei_leaf_hi) << 32) | cetrafs_le32(in.et.idx[i].ei_leaf_lo);
+                    uint64_t ilba = cetrafs_ei_child(&in.et.idx[i]);
                     cetrafs_extent_hdr_t *ih;
                     uint32_t iln;
 
@@ -4817,7 +4815,7 @@ int main(int argc, char **argv)
 
                     for (uint32_t li = 0; li < iln && tree_ok; ++li) {
                         const cetrafs_extent_idx_t *ie = (const cetrafs_extent_idx_t *) (idxblk + sizeof(*ih)) + li;
-                        uint64_t llba = ((uint64_t) cetrafs_le16(ie->ei_leaf_hi) << 32) | cetrafs_le32(ie->ei_leaf_lo);
+                        uint64_t llba = cetrafs_ei_child(ie);
                         cetrafs_extent_hdr_t *lh;
                         uint32_t n;
                         /* The range the interior entry bounds this leaf
@@ -4827,9 +4825,9 @@ int main(int argc, char **argv)
                          * (tests/kernel/salvage_root_range.sh). */
                         uint64_t rlo = 0, rhi = 0;
 
-                        if (cetrafs_le32(ie->ei_block_end)) {
-                            rlo = cetrafs_le32(ie->ei_block);
-                            rhi = cetrafs_le32(ie->ei_block_end);
+                        if (cetrafs_ei_end(ie)) {
+                            rlo = cetrafs_ei_lo(ie);
+                            rhi = cetrafs_ei_end(ie);
                         }
 
                         if (!fsck_lba_in_range(llba, cetrafs_le64(sb.total_blocks))) {
@@ -4867,9 +4865,9 @@ int main(int argc, char **argv)
                         n = cetrafs_le16(lh->eh_entries) > CETRAFS_EXT_BLOCK_MAX_LEAVES ? CETRAFS_EXT_BLOCK_MAX_LEAVES : cetrafs_le16(lh->eh_entries);
                         for (uint32_t e = 0; e < n; ++e) {
                             const cetrafs_extent_t *x = (const cetrafs_extent_t *) (leafblk + sizeof(*lh)) + e;
-                            uint64_t phys = ((uint64_t) cetrafs_le16(x->ee_start_hi) << 32) | cetrafs_le32(x->ee_start_lo);
+                            uint64_t phys = cetrafs_ee_pblk(x);
 
-                            fsck_mark_run(&rc, phys, cetrafs_le32(x->ee_len) & CETRAFS_EXT_LEN_MASK, ino);
+                            fsck_mark_run(&rc, phys, cetrafs_ee_len(x), ino);
                             problems += fsck_extent_logical(ino, x, rlo, rhi) && !fsck_dead_walk;
                             extents_seen++;
                         }
@@ -5562,7 +5560,7 @@ int main(int argc, char **argv)
                 n = cetrafs_le16(in.eh.eh_entries) > 4 ? 4 : cetrafs_le16(in.eh.eh_entries);
                 memcpy(ext, in.et.leaf, n * sizeof(ext[0]));
             } else {
-                uint64_t lf = ((uint64_t) cetrafs_le16(in.et.idx[0].ei_leaf_hi) << 32) | cetrafs_le32(in.et.idx[0].ei_leaf_lo);
+                uint64_t lf = cetrafs_ei_child(&in.et.idx[0]);
 
                 /* The index entry is read off the device, so the leaf it
                  * names may be anywhere. Past total_blocks the multiply
@@ -5585,8 +5583,8 @@ int main(int argc, char **argv)
             uint64_t logical = 0;
 
             for (uint32_t e = 0; e < n; ++e) {
-                uint64_t phys = ((uint64_t) cetrafs_le16(ext[e].ee_start_hi) << 32) | cetrafs_le32(ext[e].ee_start_lo);
-                uint64_t len = cetrafs_le32(ext[e].ee_len) & CETRAFS_EXT_LEN_MASK;
+                uint64_t phys = cetrafs_ee_pblk(&ext[e]);
+                uint64_t len = cetrafs_ee_len(&ext[e]);
 
                 /* Judge the whole run before reading a single block of
                  * it -- see fsck_run_bg(). The content pass reports the

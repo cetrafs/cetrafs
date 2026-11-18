@@ -376,7 +376,7 @@ static int cetrafs_dirent_block_live_owner(struct super_block *sb, u64 lba, u64 
         arr = r.et.leaf;
         n = min_t(u32, cetrafs_le16(r.eh.eh_entries), ARRAY_SIZE(r.et.leaf));
     } else if (cetrafs_le16(r.eh.eh_depth) == 1) {
-        u64 leaf_lba = cetrafs_extent_phys_from_hilo(r.et.idx[0].ei_leaf_hi, r.et.idx[0].ei_leaf_lo);
+        u64 leaf_lba = cetrafs_ei_child(&r.et.idx[0]);
 
         int chk = cetrafs_lba_run_check(sb, leaf_lba, 1);
 
@@ -399,9 +399,9 @@ static int cetrafs_dirent_block_live_owner(struct super_block *sb, u64 lba, u64 
     }
 
     for (i = 0; i < n; i++) {
-        u64 p = cetrafs_extent_phys_from_hilo(arr[i].ee_start_hi, arr[i].ee_start_lo);
+        u64 p = cetrafs_ee_pblk(&arr[i]);
 
-        if (lba >= p && lba - p < cetrafs_extent_len(arr[i].ee_len)) {
+        if (lba >= p && lba - p < cetrafs_ee_len(&arr[i])) {
             pr_err(
                 "dirent_block_init: block %llu was allocated as free, but LIVE directory ino=%llu "
                 "(nlink=%u) still lists it -- refusing to zero it, the block stays allocated (fsck)\n",
@@ -599,8 +599,8 @@ static int cetrafs_dir_extents_addr_ok(struct inode *dir, const struct cetrafs_d
     u16 i;
 
     for (i = 0; i < de->entries; i++) {
-        u64 phys = cetrafs_extent_phys_from_hilo(de->arr[i].ee_start_hi, de->arr[i].ee_start_lo);
-        u32 len = cetrafs_extent_len(de->arr[i].ee_len);
+        u64 phys = cetrafs_ee_pblk(&de->arr[i]);
+        u32 len = cetrafs_ee_len(&de->arr[i]);
         int chk = cetrafs_lba_run_check(dir->i_sb, phys, len);
 
         /* A count, not only an address (rule 19): every scan of the
@@ -698,12 +698,12 @@ static int cetrafs_dir_extents_get_unchecked(struct inode *dir, const cetrafs_in
      * peer's growth forces a fresh leaf while a single writer's own
      * directory stays cached and O(1). See cetrafs_read_dir_leaf_bh(). */
     de->leaf_bh = cetrafs_read_dir_leaf_bh(
-        dir, cetrafs_extent_phys_from_hilo(raw->et.idx[0].ei_leaf_hi, raw->et.idx[0].ei_leaf_lo),
+        dir, cetrafs_ei_child(&raw->et.idx[0]),
         cetrafs_dir_needs_fresh(dir, raw));
     if (!de->leaf_bh) {
         pr_warn_ratelimited(
             "dir ino=%llu: extent-leaf block %llu unreadable\n", (unsigned long long) dir->i_ino,
-            (unsigned long long) cetrafs_extent_phys_from_hilo(raw->et.idx[0].ei_leaf_hi, raw->et.idx[0].ei_leaf_lo));
+            (unsigned long long) cetrafs_ei_child(&raw->et.idx[0]));
         return -EIO;
     }
 
@@ -727,7 +727,7 @@ static u64 cetrafs_dir_extents_nblocks(const struct cetrafs_dir_extents *de)
     u16 i;
 
     for (i = 0; i < de->entries; i++)
-        n += cetrafs_extent_len(de->arr[i].ee_len);
+        n += cetrafs_ee_len(&de->arr[i]);
     return n;
 }
 
@@ -798,8 +798,8 @@ static noinline_for_stack int cetrafs_dir_refresh_whole(struct inode *dir, const
     u16 i;
 
     for (i = 0; i < de->entries; i++) {
-        u64 phys = cetrafs_extent_phys_from_hilo(de->arr[i].ee_start_hi, de->arr[i].ee_start_lo);
-        u32 len = cetrafs_extent_len(de->arr[i].ee_len), b, n, k;
+        u64 phys = cetrafs_ee_pblk(&de->arr[i]);
+        u32 len = cetrafs_ee_len(&de->arr[i]), b, n, k;
 
         for (b = 0; b < len; b += n) {
             cond_resched();
@@ -875,8 +875,8 @@ static int cetrafs_walk_dirents_from(struct inode *dir, cetrafs_dirent_visit_fn 
 
     for (i = 0; i < dx.entries; i++) {
         const cetrafs_extent_t *ext = &dx.arr[i];
-        u64 phys = cetrafs_extent_phys_from_hilo(ext->ee_start_hi, ext->ee_start_lo);
-        u32 len = cetrafs_extent_len(ext->ee_len);
+        u64 phys = cetrafs_ee_pblk(ext);
+        u32 len = cetrafs_ee_len(ext);
         u64 first = min_pos > 0 ? (u64) min_pos / CETRAFS_BLOCK_SIZE : 0; /* first block not wholly below min_pos */
         u32 b = 0;
 
@@ -887,8 +887,8 @@ static int cetrafs_walk_dirents_from(struct inode *dir, cetrafs_dirent_visit_fn 
          * of silent iterations with nothing to reschedule (class 13).
          * Same set as "skip while base_pos + BLOCK_SIZE <= min_pos".
          */
-        if (first > cetrafs_le32(ext->ee_block)) {
-            u64 s = first - cetrafs_le32(ext->ee_block);
+        if (first > cetrafs_ee_lblk(ext)) {
+            u64 s = first - cetrafs_ee_lblk(ext);
 
             skipped = true;
             if (s >= len)
@@ -897,7 +897,7 @@ static int cetrafs_walk_dirents_from(struct inode *dir, cetrafs_dirent_visit_fn 
         }
 
         for (; b < len; b++) {
-            loff_t base_pos = ((loff_t) cetrafs_le32(ext->ee_block) + b) * CETRAFS_BLOCK_SIZE;
+            loff_t base_pos = ((loff_t) cetrafs_ee_lblk(ext) + b) * CETRAFS_BLOCK_SIZE;
             struct buffer_head *bh;
             const cetrafs_dirent_t *de;
             unsigned int e;
@@ -1047,8 +1047,8 @@ static int cetrafs_dir_scan_for_slot(struct inode *dir,
 
     for (i = 0; i < dx->entries; i++) {
         const cetrafs_extent_t *ext = &dx->arr[i];
-        u64 phys = cetrafs_extent_phys_from_hilo(ext->ee_start_hi, ext->ee_start_lo);
-        u32 len = cetrafs_extent_len(ext->ee_len);
+        u64 phys = cetrafs_ee_pblk(ext);
+        u32 len = cetrafs_ee_len(ext);
         u32 b;
 
         for (b = 0; b < len; b++) {
@@ -1378,8 +1378,8 @@ int cetrafs_dir_remove_entry(struct inode *dir, const struct qstr *name, u64 exp
 
     for (i = 0; i < dx.entries && !slot; i++) {
         const cetrafs_extent_t *ext = &dx.arr[i];
-        u64 phys = cetrafs_extent_phys_from_hilo(ext->ee_start_hi, ext->ee_start_lo);
-        u32 len = cetrafs_extent_len(ext->ee_len);
+        u64 phys = cetrafs_ee_pblk(ext);
+        u32 len = cetrafs_ee_len(ext);
         u32 b;
 
         for (b = 0; b < len && !slot; b++) {
@@ -1522,8 +1522,8 @@ int cetrafs_dir_update_dotdot(struct inode *dir, u64 new_parent_ino)
 
     for (i = 0; i < dx.entries; i++) {
         const cetrafs_extent_t *ext = &dx.arr[i];
-        u64 phys = cetrafs_extent_phys_from_hilo(ext->ee_start_hi, ext->ee_start_lo);
-        u32 len = cetrafs_extent_len(ext->ee_len);
+        u64 phys = cetrafs_ee_pblk(ext);
+        u32 len = cetrafs_ee_len(ext);
         unsigned int dirents_per_block = CETRAFS_DIRENTS_PER_BLOCK;
         u32 b;
 
@@ -1642,8 +1642,8 @@ static int cetrafs_dir_retarget_entry(struct inode *dir,
 
     for (i = 0; i < dx.entries && !slot; i++) {
         const cetrafs_extent_t *ext = &dx.arr[i];
-        u64 phys = cetrafs_extent_phys_from_hilo(ext->ee_start_hi, ext->ee_start_lo);
-        u32 len = cetrafs_extent_len(ext->ee_len);
+        u64 phys = cetrafs_ee_pblk(ext);
+        u32 len = cetrafs_ee_len(ext);
         u32 b;
 
         for (b = 0; b < len && !slot; b++) {
@@ -2401,7 +2401,7 @@ static int cetrafs_dir_raw_visit(struct super_block *sb, const cetrafs_inode_t *
     if (cetrafs_le16(raw->eh.eh_depth) > 1)
         return -EUCLEAN; /* a directory's tree is at most one level deep */
     if (cetrafs_le16(raw->eh.eh_depth) == 1)
-        dr->skip_leaf = cetrafs_extent_phys_from_hilo(raw->et.idx[0].ei_leaf_hi, raw->et.idx[0].ei_leaf_lo);
+        dr->skip_leaf = cetrafs_ei_child(&raw->et.idx[0]);
     dr->skip_xattr = cetrafs_le64(raw->xattr_block);
     ret = cetrafs_raw_inode_for_each_owned_block(sb, raw, cetrafs_dir_runs_cb, dr, /*fresh=*/true);
     if (!ret && dr->overflow)
@@ -3091,9 +3091,9 @@ static struct dentry *cetrafs_mkdir_locked(struct mnt_idmap *idmap,
     raw.eh.eh_magic = cetrafs_cpu_to_le16(CETRAFS_EXT_MAGIC);
     raw.eh.eh_entries = cetrafs_cpu_to_le16(1);
     raw.eh.eh_max = cetrafs_cpu_to_le16(ARRAY_SIZE(raw.et.leaf));
-    raw.et.leaf[0].ee_block = 0;
-    raw.et.leaf[0].ee_len = cetrafs_extent_pack_len(1, 0);
-    cetrafs_extent_phys_to_hilo(lba, &raw.et.leaf[0].ee_start_hi, &raw.et.leaf[0].ee_start_lo);
+    cetrafs_ee_set_lblk(&raw.et.leaf[0], 0);
+    cetrafs_ee_set_len(&raw.et.leaf[0], 1, 0);
+    cetrafs_ee_set_pblk(&raw.et.leaf[0], lba);
 
     /* See inode.c's cetrafs_write_raw_inode() comment and cetrafs_
      * create_locked() above -- same freshly-allocated-inode race. */
