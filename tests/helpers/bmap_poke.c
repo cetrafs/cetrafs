@@ -16,6 +16,8 @@
  *        bmap_poke <image> <bitmap_start_lba> count <first> <n>  set bits in the run
  *        bmap_poke <image> <bitmap_start_lba> clear0 <first> <n> first clear bit
  *                                                                in the run, or -1
+ *        bmap_poke <image> ino <n> [<0|1>]   inode n's bit, wherever its segment
+ *                                           put its bitmap: print it, or set it
  * The inode bitmap's bit for inode N is N - 1 from inode_bmap_start
  * (the table's first segment); a data block's is its offset in its
  * Block Group's data region, from the group's off_data_bmap.
@@ -54,6 +56,34 @@ int main(int argc, char **argv)
     uint64_t start, bit, first, n, i, set = 0;
     int fd, old;
 
+    if ((argc == 4 || argc == 5) && !strcmp(argv[2], "ino")) {
+        cetrafs_superblock_t sb;
+        uint64_t ino = strtoull(argv[3], NULL, 0), bml = 0, off = 0;
+        uint8_t blk[CETRAFS_BLOCK_SIZE];
+
+        fd = open(argv[1], argc == 5 ? O_RDWR : O_RDONLY);
+        if (fd < 0 || pread(fd, &sb, sizeof(sb), 0) != (ssize_t) sizeof(sb)) {
+            perror(argv[1]);
+            return 1;
+        }
+        if (!cetrafs_u_ino_lba(fd, &sb, ino, &bml, &off) || !bml) {
+            fprintf(stderr, "bmap_poke: inode %" PRIu64 " is in no segment\n", ino);
+            return 1;
+        }
+        if (argc == 5) {
+            if (cetrafs_bmap_poke_off_us(fd, bml, off, atoi(argv[4]) != 0, 0) < 0 || fsync(fd) != 0) {
+                perror("bitmap");
+                return 1;
+            }
+            return 0;
+        }
+        if (pread(fd, blk, sizeof(blk), (off_t) bml * CETRAFS_BLOCK_SIZE) != (ssize_t) sizeof(blk)) {
+            perror("pread");
+            return 1;
+        }
+        printf("%d\n", (blk[off / 8] >> (off % 8)) & 1);
+        return 0;
+    }
     if (argc == 6 && (!strcmp(argv[3], "count") || !strcmp(argv[3], "clear0"))) {
         start = strtoull(argv[2], NULL, 0);
         first = strtoull(argv[4], NULL, 0);

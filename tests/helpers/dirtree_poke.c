@@ -57,7 +57,7 @@ int main(int argc, char **argv)
     uint8_t blk[CETRAFS_BLOCK_SIZE];
     cetrafs_dirent_t *de = (cetrafs_dirent_t *) blk;
     cetrafs_dirent_tail_t tail;
-    uint64_t dir, data, victim, bit;
+    uint64_t dir, data, victim, bit, bblk = 0;
     off_t boff;
     unsigned char byte;
     int fd;
@@ -83,19 +83,19 @@ int main(int argc, char **argv)
 
     /* The directory's inode bit must be free: planting over a live
      * inode would make this a different test. */
-    {
-        uint64_t bblk = 0;
-
-        cetrafs_u_ino_lba(fd, &sb, dir, &bblk, &bit);
-        boff = (off_t) (bblk * CETRAFS_BLOCK_SIZE + bit / 8);
-    }
+    cetrafs_u_ino_lba(fd, &sb, dir, &bblk, &bit);
+    boff = (off_t) (bblk * CETRAFS_BLOCK_SIZE + bit / 8);
     rd(fd, &byte, 1, boff);
     if (byte & (1u << (bit % 8))) {
         fprintf(stderr, "dir-ino %" PRIu64 " is already allocated -- pick a free one\n", dir);
         return 2;
     }
-    byte |= (unsigned char) (1u << (bit % 8));
-    wr(fd, &byte, 1, boff);
+    /* Set through the format's own writer: a raw byte leaves the sector
+     * failing its checksum, a fault this test does not mean. */
+    if (cetrafs_bmap_poke_off_us(fd, bblk, bit, 1, 0) < 0) {
+        perror("inode bitmap");
+        return 1;
+    }
 
     memset(&in, 0, sizeof(in));
     in.ino = cetrafs_cpu_to_le64(dir);

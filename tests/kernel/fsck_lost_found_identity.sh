@@ -20,12 +20,17 @@
 # looked up by (a valid record belonging to a different inode is not
 # /lost+found either).
 #
-# plantrec writes a correctly-stamped record at the slot an arbitrary
-# number addresses, which is exactly the forgery being defended against.
+# Since the inode table is chained (M-36), a number past its end has no
+# slot at all -- it no longer lands in the data region -- so the forgery
+# is the bare number: the read must still refuse it, and fsck -r must
+# write nothing through it (the block the old formula addressed is
+# watched, as before).
 #
-# Discrimination: drop the range check in fsck_read_inode() and fsck
-# adopts the planted record -- the assertion below sees its block
-# rewritten.
+# Discrimination: before M-36, dropping the range check in
+# fsck_read_inode() made fsck adopt a record planted in the data region.
+# A number past the chained table now has no slot to plant in, so the
+# second guard (checksums and the echoed number) refuses it as well: the
+# suite holds the outcome -- refused, nothing written -- not one guard.
 set -euo pipefail
 . "$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)/lib/harness.sh"
 require_root
@@ -71,8 +76,6 @@ IMG_BLOCKS=$(( $(stat -c %s "$IMG") / 4096 ))
 [ -n "$BGR" ] && [ -n "$BGSZ" ] && [ "$FORGED" -gt "$INODES" ] && [ "$SLOT" -lt "$IMG_BLOCKS" ] ||
     fail "setup: the forged slot ($SLOT, number $FORGED) is not in the first group's data region -- it must be, to prove anything"
 
-"$POKE" "$IMG" plantrec "$FORGED" 040755 2>/dev/null ||
-    fail "could not plant a record at the forged slot"
 "$CORRUPT" "$IMG" repoint 1 lost+found "$FORGED" >/dev/null 2>&1 ||
     fail "could not repoint the lost+found entry"
 

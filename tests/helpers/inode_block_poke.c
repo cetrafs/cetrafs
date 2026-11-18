@@ -143,8 +143,16 @@ int main(int argc, char **argv)
          * file, and what fsck must refuse to read as an inode. */
         cetrafs_inode_t rec;
         unsigned long long m = (argc > 4) ? strtoull(argv[4], NULL, 8) : 040755;
-        off_t off = (off_t) cetrafs_u_ino_lba(fd, &sb, ino, NULL, NULL) * cetrafs_le32(sb.block_size);
+        uint64_t lba = cetrafs_u_ino_lba(fd, &sb, ino, NULL, NULL);
+        off_t off = (off_t) lba * cetrafs_le32(sb.block_size);
         uint8_t blk[CETRAFS_BLOCK_SIZE] = {0};
+
+        /* A number with no slot in the (chained) table resolves to 0:
+         * planted there it would overwrite the superblock. */
+        if (!lba) {
+            fprintf(stderr, "plantrec: ino %llu has no slot in the inode table\n", (unsigned long long) ino);
+            return 1;
+        }
 
         memset(&rec, 0, sizeof(rec));
         rec.ino = cetrafs_cpu_to_le64(ino);

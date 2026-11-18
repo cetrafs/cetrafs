@@ -328,9 +328,17 @@ int main(int argc, char **argv)
             perror("malloc");
             return 1;
         }
-        memset(ones, 0xFF, CETRAFS_BLOCK_SIZE);
-        for (uint64_t b = 0; b < bmap_blocks; b++)
-            pwrite_all(fd, ones, CETRAFS_BLOCK_SIZE, bmap_off + (off_t) b * CETRAFS_BLOCK_SIZE);
+        /* Each sector's bits set, its trailer kept and its CRC restamped:
+         * 0xFF over the trailer is a damaged sector, not a full one. */
+        for (uint64_t b = 0; b < bmap_blocks; b++) {
+            off_t at = bmap_off + (off_t) b * CETRAFS_BLOCK_SIZE;
+
+            pread_all(fd, ones, CETRAFS_BLOCK_SIZE, at);
+            for (uint64_t i = 0; i < CETRAFS_BMAP_SECTORS; i++)
+                memset(ones + i * CETRAFS_BMAP_SECTOR, 0xFF, CETRAFS_BMAP_SECTOR_BITS / 8);
+            cetrafs_bmap_stamp_us(ones, 1);
+            pwrite_all(fd, ones, CETRAFS_BLOCK_SIZE, at);
+        }
         free(ones);
         printf("bg_poke: BG%u data bitmap filled (%llu block(s)) -- genuinely full\n", bg_id,
                (unsigned long long) bmap_blocks);
