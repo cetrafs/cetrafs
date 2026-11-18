@@ -3010,7 +3010,6 @@ cetrafs_tree_meta_is_ours frees:decides-a-free
 cetrafs_tree_meta_set frees:decides-which-old-tree-blocks-go
 cetrafs_tree_patch writes:the-tree
 cetrafs_tree_range_mapped writes:the-unit-allocation-around-a-write-is-decided-by-it
-cetrafs_tree_split_leaf writes:the-tree
 __cetrafs_truncate_shrink frees:what-truncate-cuts
 cetrafs_zero_inplace_held writes:zeroes-and-converts-by-it'
 c53_callers() { # <files...>: "<function> <plain reader>" per call site
