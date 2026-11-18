@@ -68,6 +68,11 @@ func RunCasImageCheck(clients []*Client, baseDir string) (bool, error) {
 	if err := callOK(b, "set_control", SetControlArgs{Key: "hb_interval_secs", Value: "5"}); err != nil {
 		return false, fmt.Errorf("%s: hb_interval_secs: %w", b.Name, err)
 	}
+	// The tick already armed runs at the old interval (15 s by default):
+	// let it pass, so the damage armed below lands within one 5 s beat,
+	// inside the 15 s swap. Without this the first 5 s tick could come
+	// after the swap ended and the setup failed.
+	time.Sleep(16 * time.Second)
 	dir := baseDir + "/cas-image-check"
 	fmt.Printf("=== cas-image-check: %s's swap held, %s damages the sector under it ===\n", a.Name, b.Name)
 	if err := callOK(a, "mkdir", MkdirArgs{Path: dir}); err != nil {
