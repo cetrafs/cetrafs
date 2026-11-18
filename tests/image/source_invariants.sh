@@ -127,7 +127,7 @@ for f in "$K"/*.c; do
         # held back for the boundary or journaled now (file.c).
         # cetrafs_bmap_end_update() (alloc.c) ends it on both of its
         # branches: end_update, or end_update_held.
-        inreg && /cetrafs_bh_end_update(_held)?\(|cetrafs_bmap_end_update\(|cetrafs_bh_abort_update\(|cetrafs_journal_write_(new_)?block\(|cetrafs_tree_hold_back\(/ { inreg=0; next }
+        inreg && /cetrafs_bh_end_update(_held|_dirty)?\(|cetrafs_bmap_end_update\(|cetrafs_bh_abort_update\(|cetrafs_journal_write_(new_)?block\(|cetrafs_tree_hold_back\(/ { inreg=0; next }
         # The NULL check belonging to the claim is not a leak: there is no
         # buffer to release yet. Only the few lines right after the claim.
         inreg && NR <= start + 6 && /^[[:space:]]*(return|goto) / { next }
@@ -2209,6 +2209,24 @@ C59S="$(ct_tmp c59).c"
 printf 'static bool w(struct super_block *sb)\n{\n    return cetrafs_sb_peer_sample(sb, 1, &ne, &f, &s);\n}\n' >"$C59S"
 [ "$(c59_callers "$C59S")" = w ] && pass "class 59: control -- a planted reader of the watch is found" ||
     fail "class 59: control -- a planted reader of the watch is not found"
+
+# A-15: an update that ends DIRTY is the block layer's to write, after a
+# fence too. cetrafs_bh_end_update_dirty() is the pre-A-15 publish, kept
+# for ioutil.c's own fallbacks and one test hook (sync_test_dirty_lba);
+# exported for that hook, so nothing else may start calling it.
+log "checking only ioutil.c and the sync test hook end an update dirty (A-15)"
+a15_dirty() { # <files...>: file:line of each code call outside ioutil.c
+    grep -nE 'cetrafs_bh_end_update_dirty\(' "$@" | grep -vE '^[^:]*ioutil\.c:' |
+        grep -vE ':[0-9]+:[[:space:]]*(\*|/\*)' | grep -v 'void cetrafs_bh_end_update_dirty(' || true
+}
+A15D="$(a15_dirty "$K"/*.c)"
+[ "$(wc -l <<<"$A15D")" = 1 ] && grep -q 'super_ops\.c:' <<<"$A15D" &&
+    pass "A-15: only ioutil.c and the sync_test_dirty_lba hook end an update dirty" ||
+    fail "A-15: an update ends dirty outside ioutil.c and the sync hook: $(tr '\n' ' ' <<<"$A15D")"
+A15S="$(ct_tmp a15d).c"
+printf 'static void y(struct buffer_head *bh)\n{\n    cetrafs_bh_end_update_dirty(bh);\n}\n' >"$A15S"
+[ -n "$(a15_dirty "$A15S")" ] && pass "A-15: control -- a planted dirty end is found" ||
+    fail "A-15: control -- a planted dirty end is not found"
 
 log "checking every -ENOSPC/-EBUSY/-ENOENT/-ETXTBSY names the transient states it waited out (class 43)"
 C43_REG_ENOSPC='cetrafs_alloc_pick_bg waits:cetrafs_sb_release_wait
