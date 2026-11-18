@@ -259,9 +259,10 @@ window. The BUFFERED path is not one of them -- it hands in a real
 `buffer_head` sized to one block and must keep getting one block -- so
 every 4 KiB of a buffered write walks the tree from the record down.
 
-On a compact file that walk is free: the record's four root slots carry
-`ei_block_end` ranges, and for a 2-extent file they exclude everything
-without reading a block. The filter degenerates with fragmentation,
+On a compact file that walk is free: up to four extents live inline in
+the record (depth 0), and the walk reads no block at all. Past that, only
+interior index entries carry ranges (lo + span); the root slots' are
+always unknown. The filter degenerates with fragmentation,
 because the arrays are append-only and unordered, so a file written in
 place for months ends up with leaves whose ranges are wide and nearly
 empty -- "may hold this block" becomes true for most of them and the

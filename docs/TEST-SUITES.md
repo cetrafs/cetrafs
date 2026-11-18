@@ -95,7 +95,7 @@ Roughly by area:
 | growfs | growing a volume offline, and live (`grow_live*`): the publish, a node catching up with a grow it did not make (staged with `grow_skip_local_publish`; the real peer is ctest's `grow-live`), the crash points between a live grow's writes, racing growers and an unclaimed publish, a node whose device is behind the grow (`grow_live_behind`), journal replay into new Block Groups (`grow_live_replay`), and a grow landing during a mount (`grow_mid_mount`) |
 | xattr | `user.*` / `trusted.*` / `security.*` and LSM labelling |
 | refresh | a record refresh racing this node's own publishes (`refresh_*`): a read superseded by a local publish is never applied over it |
-| ENOSPC / large offsets | each allocating path filled until it refuses (`enospc_deliberate`, `defrag_enospc_full`), and the block-number boundaries at 2^31 and 2^32 up to the 16 TiB ceiling (`large_offset_sweep`) |
+| ENOSPC / large offsets | each allocating path filled until it refuses (`enospc_deliberate`, `defrag_enospc_full`), and the block-number boundaries at 2^31 and 2^32, an extent straddling 2^32, and the 2^48-block ceiling (`large_offset_sweep`, `max_file_size`) |
 | randomized data and namespace | `fsx_model.sh`: a seeded stream of buffered, mapped, O_DIRECT, truncate, fallocate and punch/zero-range ops against an in-memory model, with a remount compare. `fsstress_namespace.sh`: several processes of seeded namespace churn (links, renames over and across directories, rmdir, xattrs) with a per-process model, then fsck. `fio_verified_io.sh`: fio's crc32c verify over a 1 GiB sparse file, buffered and O_DIRECT jobs at once, re-read after a remount. Each has a negative control that corrupts the model, or one block on the device, and requires the failure |
 
 ---
