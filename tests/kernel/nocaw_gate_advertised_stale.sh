@@ -44,7 +44,7 @@ plant() {
     "$POKE" "$DEV" 1 1 aa "$(date +%s)" >/dev/null
     "$POKE" "$DEV" 1 --stale "$1" >/dev/null
     blockdev --flushbufs "$DEV"
-    grep -q "state=1 .*stale_secs=$1\$" <<<"$("$POKE" "$DEV" 1)" ||
+    grep -qE "state=1 .*stale_secs=$1( |\$)" <<<"$("$POKE" "$DEV" 1)" ||
         { fail "setup: row 1 not planted advertising $1 s: $("$POKE" "$DEV" 1)"; ct_exit; }
 }
 # announced <mark>: the window the gate said it would watch.

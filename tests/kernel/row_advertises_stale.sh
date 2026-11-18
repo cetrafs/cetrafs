@@ -31,7 +31,7 @@ CTL="$(ct_procdir "$DEV")/controls"
 ROW="$(sed -n 's/^node \([0-9]*\): .*(this node)$/\1/p' "$(ct_procdir "$DEV")/cluster")"
 [ -n "$ROW" ] || { fail "setup: could not find this node's row"; ct_exit; }
 
-row_stale() { blockdev --flushbufs "$DEV"; "$NPOKE" "$IMG" "$ROW" | sed -n 's/.* stale_secs=\([0-9]*\)$/\1/p'; }
+row_stale() { blockdev --flushbufs "$DEV"; "$NPOKE" "$IMG" "$ROW" | sed -n 's/.* stale_secs=\([0-9]*\)\( .*\)\{0,1\}$/\1/p'; }
 mine() { sed -n 's/^stale_secs: //p' "$(ct_procdir "$DEV")/controls"; }
 
 # ------------------------------------------------------------------- A
