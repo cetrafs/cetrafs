@@ -185,6 +185,26 @@ static inline void cetrafs_test_hold(const char *name)
     cetrafs_sleep_full((unsigned) cetrafs_test_env_ll(name, 0, 3600, 0));
 }
 
+/* Test-only: hold until a wall-clock instant (ms since the epoch), so two
+ * processes started apart reach the same point together -- a duration
+ * hold keeps whatever skew their start-up had. At most an hour ahead. */
+static inline void cetrafs_test_hold_until(const char *name)
+{
+    long long at = cetrafs_test_env_ll(name, 0, 1LL << 52, 0), ms;
+    struct timespec now, d;
+
+    if (!at)
+        return;
+    clock_gettime(CLOCK_REALTIME, &now);
+    ms = at - ((long long) now.tv_sec * 1000 + now.tv_nsec / 1000000);
+    if (ms <= 0 || ms > 3600 * 1000LL)
+        return;
+    d.tv_sec = ms / 1000;
+    d.tv_nsec = (ms % 1000) * 1000000;
+    while (nanosleep(&d, &d) != 0 && errno == EINTR)
+        ;
+}
+
 /* Returns 1 (and copies the mountpoint into 'where') if 'dev' is a block
  * device currently mounted on this system, 0 otherwise (including when
  * 'dev' is a regular file image, which can't appear in /proc/self/mounts
@@ -1099,6 +1119,7 @@ static inline int cetrafs_repair_claim(int fd, const cetrafs_superblock_t *sb, c
      * check and the claim, so a suite can start two repairers that both
      * passed it (tests/kernel/repair_claim_concurrent.sh). */
     cetrafs_test_hold("CETRAFS_TEST_REPAIR_CLAIM_DELAY_SECS");
+    cetrafs_test_hold_until("CETRAFS_TEST_REPAIR_CLAIM_AT_MS");
     posix_fadvise(fd, 0, 0, POSIX_FADV_DONTNEED); /* the rows as the device has them, not our cache */
     caw = cetrafs_caw_probe(fd);
 
@@ -1216,7 +1237,8 @@ static inline int cetrafs_repair_claim(int fd, const cetrafs_superblock_t *sb, c
                 if (fsync(fd) != 0)
                     return -1;
             }
-            printf("  registry claim written by %s\n", caw ? "COMPARE AND WRITE" : "a plain write (no CAW on this device)");
+            printf("  registry claim written by %s (row %u)\n", caw ? "COMPARE AND WRITE" : "a plain write (no CAW on this device)",
+                   idx);
             fflush(stdout);
             cetrafs_repair_timer(fd, sb, idx, 1); /* renewals from here until the release */
             /* Without CAW the claim is a blind write, so two repairers

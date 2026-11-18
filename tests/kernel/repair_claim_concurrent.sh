@@ -17,7 +17,13 @@
 #
 # Staged with CETRAFS_TEST_REPAIR_CLAIM_DELAY_SECS, a pause between a
 # tool's "is anyone repairing?" check and its claim, so two tools both
-# pass the check.
+# pass the check -- and for A with CETRAFS_TEST_REPAIR_CLAIM_AT_MS, the
+# same pause ending at one instant: a duration keeps the skew the two
+# processes started with, and on a slow kernel (KASAN) the second then
+# scanned after the first claim landed, took the next row, and the two
+# met as B's case -- both yielding, by design, with A reporting it as a
+# failure. A now checks that its claims shared a row, apart from what
+# they then did.
 #   A. same row: both scan before either writes.
 #   B. two rows: the second scans after the first's claim landed.
 #   C. the superblock changes between the read and the claim.
@@ -36,11 +42,11 @@ DEV="$(ct_dev 560 repconc)"
 ct_mkfs_small "$DEV" -M 4 >/dev/null
 O1="$(ct_tmp repconc-1)"; O2="$(ct_tmp repconc-2)"
 
-# pair <delay1> <delay2>: two fsck -r, prints "<completed> <yielded>"
+# pair <delay1> <delay2> [<at_ms>]: two fsck -r, prints "<completed> <yielded>"
 pair() {
-    CETRAFS_TEST_REPAIR_CLAIM_DELAY_SECS="$1" "$FSCK" -r "$DEV" >"$O1" 2>&1 &
+    CETRAFS_TEST_REPAIR_CLAIM_DELAY_SECS="$1" CETRAFS_TEST_REPAIR_CLAIM_AT_MS="${3:-0}" "$FSCK" -r "$DEV" >"$O1" 2>&1 &
     local p1=$!
-    CETRAFS_TEST_REPAIR_CLAIM_DELAY_SECS="$2" "$FSCK" -r "$DEV" >"$O2" 2>&1 &
+    CETRAFS_TEST_REPAIR_CLAIM_DELAY_SECS="$2" CETRAFS_TEST_REPAIR_CLAIM_AT_MS="${3:-0}" "$FSCK" -r "$DEV" >"$O2" 2>&1 &
     local p2=$!
     wait "$p1" || true
     wait "$p2" || true
@@ -62,8 +68,12 @@ no_repair_rows() {
     return 0
 }
 
-read -r D Y <<<"$(pair 2 2)"
+read -r D Y <<<"$(pair 0 0 $(($(date +%s%3N) + 5000)))"
 log "A (same row): $D repaired, $Y yielded"
+claim_row() { sed -n 's/.*registry claim written by .* (row \([0-9]*\))$/\1/p' "$1"; }
+R1="$(claim_row "$O1")"; R2="$(claim_row "$O2")"
+[ -n "$R1" ] && [ "$R1" = "$R2" ] && pass "A setup: both claims were written to row $R1" ||
+    fail "A setup: the claims went to rows '$R1' and '$R2', not one row -- this round measured B's case"
 [ "$D" = 1 ] && [ "$Y" = 1 ] && pass "A: of two repairers that claimed the same row, exactly one repaired" ||
     fail "A: $D repaired and $Y yielded -- $(tail -1 "$O1") / $(tail -1 "$O2")"
 no_repair_rows && pass "A: and no claim was left behind" || fail "A: a repair claim was left in the registry"
