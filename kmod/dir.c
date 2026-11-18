@@ -272,8 +272,8 @@ static struct buffer_head *cetrafs_dirent_bread(struct inode *dir, u64 lba)
  * Called from file.c's cetrafs_get_block() the moment a block is
  * allocated for a DIRECTORY, before the extent referencing it is
  * committed. Ordering matters enormously here: a directory's data block
- * becomes reachable to every node the instant its extent lands (for a
- * depth-1 directory the leaf is journaled synchronously, so that is
+ * becomes reachable to every node the instant its extent lands (a
+ * directory's tree blocks are journaled synchronously, so that is
  * immediate), and whatever the allocator just handed us still holds
  * whatever the block's previous owner left there. A peer walking the
  * directory in that window reads garbage, fails the tail checksum, and
