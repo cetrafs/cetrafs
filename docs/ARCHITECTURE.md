@@ -453,6 +453,7 @@ with backoff before being declared real corruption.
 | `INCOMPAT_BIT2_UNUSED` | 2 | no | was `PR_AWARE`, removed with SCSI PR (v0x000E) |
 | `INCOMPAT_NODE_REGISTRY` | 3 | yes | accepted at mount; gates the `node_table_*` SB fields |
 | `INCOMPAT_CAS_STAMP` | 4 | no | reserved (G-6): every CAS sector carries a stamp field (`cas_stamp`, `ns_cas_stamp`, the inode file sector's `CETRAFS_INODE_FD_STAMP_OFF`, the bitmap and pending-free trailers), zero today; the volume that turns stamping on sets it, and a build that does not stamp refuses the mount |
+| `INCOMPAT_ZG_CHAIN` | 5 | no | reserved (A-13): the Zone Group table carries appended segments (`zg_seg_next`, `zg_first_count`); no build appends one yet, and the mount, fsck and growfs refuse a volume that has one, by the bit or by the fields |
 | `ROCOMPAT_SPARSE` | 0 | no | — |
 
 What this build understands is one definition per class in `cetrafs.h`
