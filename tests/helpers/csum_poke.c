@@ -79,6 +79,27 @@ int main(int argc, char **argv)
     cetrafs_superblock_t sb;
     rd(&sb, sizeof(sb), 0);
 
+    /* A table id past the table aims the flip at whatever follows it --
+     * once the inode bitmap, which a suite then read as the descriptor's
+     * fault. Refuse it: the setup did not arrange what it asked for. */
+    {
+        uint64_t limit = UINT64_MAX;
+
+        if (!strcmp(what, "bg-desc") || !strcmp(what, "bg-hdr")) {
+            limit = cetrafs_le32(sb.block_group_count);
+            if (cetrafs_le64(sb.bg_table_first_count) && cetrafs_le64(sb.bg_table_first_count) < limit)
+                limit = cetrafs_le64(sb.bg_table_first_count);
+        } else if (!strcmp(what, "zg-hot") || !strcmp(what, "zg-cold")) {
+            limit = cetrafs_le32(sb.zone_group_count);
+        } else if (!strcmp(what, "node")) {
+            limit = cetrafs_le32(sb.node_table_count);
+        }
+        if (id >= limit) {
+            fprintf(stderr, "csum_poke: %s %" PRIu64 " is past its table (%" PRIu64 " entries)\n", what, id, limit);
+            return 1;
+        }
+    }
+
     /*
      * Always a PADDING byte where one exists. Poking a meaningful field
      * trips an earlier, more specific check first -- flipping

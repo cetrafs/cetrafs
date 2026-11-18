@@ -44,7 +44,7 @@ round() {
     "$FSCK" "$dev" >/dev/null 2>&1 || rc=$?
     RES="fsck=$rc"
     # Something to repair, so that a repair that runs writes.
-    "$POKE" "$dev" bg-desc 1 >/dev/null
+    "$POKE" "$dev" bg-desc 0 >/dev/null
     blockdev --flushbufs "$dev"
     before="$(sha256sum <"$IMG")"
     rc=0
