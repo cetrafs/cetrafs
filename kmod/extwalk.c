@@ -447,7 +447,7 @@ void cetrafs_tpath_put(struct cetrafs_tpath *p)
  * below its parent, its count taken under the buffer lock and clamped.
  * p->bh[l] holds the path's node at each level from 'upto' up (the
  * caller cetrafs_tpath_put()s it), p->n[l] its count, p->n[depth] the
- * record's. -EIO for a block that could not be read; -EUCLEAN for a
+ * record's, p->slot[l] its entry's index in its parent (the last). -EIO for a block that could not be read; -EUCLEAN for a
  * tree not deeper than 'upto', an empty interior or a block out of place.
  */
 int cetrafs_tree_last_path(struct inode *inode, const cetrafs_inode_t *raw, int upto, bool reader,
@@ -465,6 +465,7 @@ int cetrafs_tree_last_path(struct inode *inode, const cetrafs_inode_t *raw, int 
     p->n[depth] = n;
     lba = cetrafs_ei_child(&raw->et.idx[n - 1]);
     for (level = depth - 1; level >= upto; level--) {
+        p->slot[level] = p->n[level + 1] - 1;
         struct buffer_head *bh = cetrafs_read_tree_bh_for(inode, lba,
                                                           level ? CETRAFS_INDEX_TAIL_MAGIC : CETRAFS_LEAF_TAIL_MAGIC,
                                                           level ? "extent index" : "extent leaf", reader);

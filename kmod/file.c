@@ -4943,9 +4943,9 @@ static bool cetrafs_leaf_data_holds_uninit(const void *data, void *arg)
  * under the buffer lock so it never sees a writer's half-edited array;
  * the extent-tree writers are excluded by invalidate_lock, which the
  * caller holds. */
-static bool cetrafs_leaf_bh_holds_uninit(struct buffer_head *lbh, u64 iblock)
+static bool cetrafs_leaf_bh_holds_uninit(struct buffer_head *lbh, void *iblock)
 {
-    return cetrafs_bh_test_stable(lbh, cetrafs_leaf_data_holds_uninit, &iblock);
+    return cetrafs_bh_test_stable(lbh, cetrafs_leaf_data_holds_uninit, iblock);
 }
 
 /*
@@ -5437,532 +5437,8 @@ MODULE_PARM_DESC(tree_append_room_off,
                  "TEST ONLY: a convert at the tree's limit shrinks its leaf without first checking the append has room");
 
 /*
- * Can the tree take 'need' more extents through cetrafs_tree_append(),
- * merging nothing? Asked BEFORE a convert shrinks a full leaf and hands
- * its pieces -- the converted block and the preallocated tail, at most
- * two extents -- to the append (CETRAFS_CONVERT_APPEND). At the tree's
- * limit that append fails only AFTER the shrink is held back: the
- * written block drops out of the map (allocated, referenced by nothing)
- * and the rest of the preallocation is given back, for a write that
- * then fails ENOSPC anyway (audit 2026-11-14 A-1). Refused here, the
- * write fails ENOSPC with nothing modified and the preallocation kept.
- *
- * Where an append can put an extent: the last leaf, a new leaf (room in
- * the last interior or the root), or -- at the limit -- any leaf with a
- * free slot (cetrafs_tree_insert_any_leaf()). Depth 0 and 1 can always
- * grow a level. The walk reads every leaf, but only at the limit, where
- * the append would walk them all too.
- *
- * 0: room. -ENOSPC: none. -EIO: a tree block could not be read.
- */
-static int cetrafs_tree_append_room(struct inode *inode, const cetrafs_inode_t *raw, u32 need)
-{
-    u32 ni, nroot, avail = 0;
-
-    if (READ_ONCE(cetrafs_tree_append_room_off))
-        return 0; /* TEST ONLY: the old order */
-    if (cetrafs_le16(raw->eh.eh_depth) < 2 || cetrafs_tree_root_has_room(raw))
-        return 0;
-    nroot = min_t(u32, cetrafs_le16(raw->eh.eh_entries), ARRAY_SIZE(raw->et.idx));
-    for (ni = 0; ni < nroot; ni++) {
-        u64 ilba = cetrafs_ei_child(&raw->et.idx[ni]);
-        struct buffer_head *ibh = cetrafs_read_index_bh(inode, ilba);
-        const cetrafs_extent_idx_t *iarr;
-        u32 li, iln;
-        bool last = ni + 1 == nroot;
-
-        if (!ibh)
-            return -EIO;
-        iln = min_t(u32, cetrafs_le16(((const cetrafs_extent_hdr_t *) ibh->b_data)->eh_entries),
-                    CETRAFS_EXT_BLOCK_MAX_IDX);
-        if (last && cetrafs_tree_idx_has_room(iln)) {
-            brelse(ibh);
-            return 0; /* a new leaf takes them */
-        }
-        iarr = (const cetrafs_extent_idx_t *) (ibh->b_data + sizeof(cetrafs_extent_hdr_t));
-        for (li = 0; li < iln; li++) {
-            struct buffer_head *lbh;
-            u16 n;
-
-            /* Without the any-leaf fallback only the last leaf takes appends. */
-            if ((READ_ONCE(cetrafs_tree_any_leaf_off) || !S_ISREG(inode->i_mode)) && !(last && li + 1 == iln))
-                continue;
-            lbh = cetrafs_read_leaf_bh(inode,
-                                       cetrafs_ei_child(&iarr[li]));
-            if (!lbh) {
-                brelse(ibh);
-                return -EIO;
-            }
-            cetrafs_bh_read_lock(lbh);
-            n = cetrafs_le16(((const cetrafs_extent_hdr_t *) lbh->b_data)->eh_entries);
-            cetrafs_bh_read_unlock(lbh);
-            brelse(lbh);
-            if (n < CETRAFS_EXT_BLOCK_MAX_LEAVES)
-                avail += CETRAFS_EXT_BLOCK_MAX_LEAVES - n;
-            if (avail >= need) {
-                brelse(ibh);
-                return 0;
-            }
-        }
-        brelse(ibh);
-    }
-    return -ENOSPC;
-}
-
-/* A convert that needs room: the append's slots checked, then its blocks
- * reserved -- both before anything is edited. */
-static int cetrafs_tree_convert_need_room(struct inode *inode, const cetrafs_inode_t *raw)
-{
-    int ret = cetrafs_tree_append_room(inode, raw, 2);
-
-    if (ret == -ENOSPC)
-        pr_warn_ratelimited("ino=%llu: extent tree full (%u extents at most): a write into preallocated space "
-                            "fails ENOSPC, nothing changed\n",
-                            (unsigned long long) inode->i_ino, cetrafs_tree_max_extents());
-    return ret ? ret : cetrafs_tree_resv_fill(inode);
-}
-
-static int cetrafs_tree_convert_inner(struct inode *inode,
-                                      cetrafs_inode_t *raw,
-                                      u64 iblock,
-                                      u64 lba,
-                                      u32 want,
-                                      u32 *done,
-                                      bool *moving)
-{
-    struct super_block *sb = inode->i_sb;
-    struct cetrafs_convert_tail tail = { 0 };
-    u32 ni;
-    int ret, splits = 0;
-
-    tail.ino = inode;
-
-    if (cetrafs_le16(raw->eh.eh_depth) == 0) {
-        ret = cetrafs_leaf_array_convert(sb, raw->et.leaf, &raw->eh.eh_entries, (u16) ARRAY_SIZE(raw->et.leaf), iblock,
-                                         lba, want, done, &tail);
-        if (ret == CETRAFS_CONVERT_NEED_ROOM) {
-            ret = cetrafs_tree_convert_need_room(inode, raw);
-            if (ret)
-                return ret;
-            tail.may_append = true;
-            ret = cetrafs_leaf_array_convert(sb, raw->et.leaf, &raw->eh.eh_entries, (u16) ARRAY_SIZE(raw->et.leaf),
-                                             iblock, lba, want, done, &tail);
-        }
-        if (ret == CETRAFS_CONVERT_APPEND)
-            return cetrafs_tree_convert_append(inode, raw, iblock, lba, &tail);
-        return ret;
-    }
-
-    if (cetrafs_le16(raw->eh.eh_depth) == 1) {
-        u64 llba = cetrafs_ei_child(&raw->et.idx[0]);
-        struct buffer_head *lbh;
-        cetrafs_extent_hdr_t *lhdr;
-
-retry1:
-        lbh = cetrafs_read_leaf_bh(inode, llba);
-        if (!lbh)
-            return -EIO;
-        /* Full enough that the convert may shrink here and append the
-         * piece elsewhere: a move (cetrafs_tree_move_begin()). */
-        if (cetrafs_leaf_nearly_full(lbh))
-            cetrafs_tree_move_begin(inode, moving);
-        const u32 prev_crc = cetrafs_bh_begin_update_crc(lbh);
-        lhdr = (cetrafs_extent_hdr_t *) lbh->b_data;
-        ret = cetrafs_leaf_array_convert(sb, (cetrafs_extent_t *) (lbh->b_data + sizeof(*lhdr)), &lhdr->eh_entries,
-                                         CETRAFS_EXT_BLOCK_MAX_LEAVES, iblock, lba, want, done, &tail);
-        if (ret == CETRAFS_CONVERT_NEED_ROOM) {
-            cetrafs_bh_abort_update(lbh);
-            brelse(lbh);
-            ret = cetrafs_tree_convert_need_room(inode, raw);
-            if (ret)
-                return ret;
-            tail.may_append = true;
-            goto retry1;
-        }
-        if (ret && ret != CETRAFS_CONVERT_APPEND) {
-            cetrafs_bh_abort_update(lbh);
-            brelse(lbh);
-            return ret;
-        }
-        /* -EAGAIN: the leaf WAS modified (the extent no longer covers
-         * this block), so it must still be published before the block
-         * is appended elsewhere in the tree. */
-        /*
-         * Publishing this leaf: journal it, or -- for a regular file --
-         * leave it dirty for the close/fsync/writeback boundary.
-         *
-         * cetrafs_journal_write_block() costs THREE device cache
-         * flushes plus two synchronous writes. A VM image preallocated
-         * by fallocate() takes this path on EVERY 4 KiB guest write
-         * (each one converts a block out of a preallocated extent), so
-         * on a SAN that is ~147 ms per write: measured at 6.8 IOPS and
-         * 148 flushes per 40 writes, which is the "unusably slow guest".
-         *
-         * The merge path a few hundred lines down already makes exactly
-         * this trade, with the same reasoning: a regular file's leaf is
-         * republished at the next durability boundary, and a crash
-         * before then loses a write the guest was never told had
-         * landed. A DIRECTORY has no such boundary -- no close, no
-         * fsync -- so it must still journal, and does.
-         */
-        cetrafs_blk_tail_stamp(lbh, CETRAFS_LEAF_TAIL_MAGIC);
-        if (S_ISREG(inode->i_mode)) {
-            int wret = cetrafs_tree_hold_back(inode, lbh, prev_crc, true);
-
-            if (!wret && ret == CETRAFS_CONVERT_APPEND)
-                wret = cetrafs_convert_source_durable(inode, lbh);
-            if (wret) {
-                brelse(lbh);
-                return wret;
-            }
-            brelse(lbh);
-        } else {
-            /* A directory: no boundary, so journaled now. */
-            int wret = cetrafs_journal_write_block(sb, cetrafs_journal_owner_of(inode), lbh, prev_crc);
-
-            brelse(lbh);
-            if (wret)
-                return wret;
-        }
-        if (ret == CETRAFS_CONVERT_APPEND)
-            return cetrafs_tree_convert_append(inode, raw, iblock, lba, &tail);
-        return 0;
-    }
-
-again:
-    for (ni = 0; ni < cetrafs_le16(raw->eh.eh_entries) && ni < ARRAY_SIZE(raw->et.idx); ni++) {
-        u64 ilba = cetrafs_ei_child(&raw->et.idx[ni]);
-        struct buffer_head *ibh = cetrafs_read_index_bh(inode, ilba);
-        cetrafs_extent_hdr_t *ihdr;
-        cetrafs_extent_idx_t *iarr;
-        u32 li, iln;
-
-        if (!ibh)
-            return -EIO;
-        ihdr = (cetrafs_extent_hdr_t *) ibh->b_data;
-        iarr = (cetrafs_extent_idx_t *) (ibh->b_data + sizeof(*ihdr));
-        iln = min_t(u32, cetrafs_le16(ihdr->eh_entries), CETRAFS_EXT_BLOCK_MAX_IDX);
-
-        for (li = 0; li < iln; li++) {
-            u64 llba = cetrafs_ei_child(&iarr[li]);
-            struct buffer_head *lbh;
-            cetrafs_extent_hdr_t *lhdr;
-
-            if (!cetrafs_idx_may_hold(&iarr[li], iblock))
-                continue; /* its range rules it out: not even read */
-            lbh = cetrafs_read_leaf_bh(inode, llba);
-            if (!lbh) {
-                brelse(ibh);
-                return -EIO;
-            }
-            /*
-             * Look before claiming. The claim (begin_update) of a leaf
-             * that turns out not to hold the block is released by
-             * cetrafs_bh_abort_update(), which drops a CLEAN buffer's
-             * cached image -- right for its error-path callers, and a
-             * device re-read of every clean leaf this walk passed, on
-             * every later lookup. Invisible while converted leaves stayed
-             * dirty until fsync; once a split writes its source leaf
-             * (cetrafs_convert_source_durable()) it cost 20x on
-             * write_path_cost.sh: 34000 device reads instead of 52.
-             */
-            if (!cetrafs_leaf_bh_holds_uninit(lbh, iblock)) {
-                brelse(lbh);
-                continue; /* not in this leaf; try the next */
-            }
-            /* Full: split it by range and walk again -- the half that
-             * holds the block has room now. */
-            if (splits < 2 && cetrafs_leaf_split_wanted(inode, lbh)) {
-                bool tail_leaf = ni + 1 == cetrafs_le16(raw->eh.eh_entries) && li + 1 == iln;
-                u32 cmax, cbefore = cetrafs_tree_leaves_if_half(inode, raw, &cmax);
-                int sret = cetrafs_tree_split_leaf(inode, raw, ibh, li, lbh, tail_leaf, moving);
-
-                if (!sret)
-                    cetrafs_tree_note_capacity(inode, raw, cbefore);
-
-                if (sret != CETRAFS_SPLIT_NONE) {
-                    brelse(lbh);
-                    brelse(ibh);
-                    if (sret)
-                        return sret;
-                    splits++;
-                    goto again;
-                }
-            }
-            /* Not split, and full enough to append its piece elsewhere: a
-             * move (cetrafs_tree_move_begin()). */
-            if (cetrafs_leaf_nearly_full(lbh))
-                cetrafs_tree_move_begin(inode, moving);
-            const u32 prev_crc = cetrafs_bh_begin_update_crc(lbh);
-            lhdr = (cetrafs_extent_hdr_t *) lbh->b_data;
-            ret = cetrafs_leaf_array_convert(sb, (cetrafs_extent_t *) (lbh->b_data + sizeof(*lhdr)), &lhdr->eh_entries,
-                                             CETRAFS_EXT_BLOCK_MAX_LEAVES, iblock, lba, want, done, &tail);
-            if (ret == -ENOENT) {
-                cetrafs_bh_abort_update(lbh);
-                brelse(lbh);
-                continue; /* not in this leaf; try the next */
-            }
-            if (ret == CETRAFS_CONVERT_NEED_ROOM) {
-                cetrafs_bh_abort_update(lbh);
-                brelse(lbh);
-                brelse(ibh);
-                ret = cetrafs_tree_convert_need_room(inode, raw);
-                if (ret)
-                    return ret;
-                tail.may_append = true;
-                goto again;
-            }
-            if (ret && ret != CETRAFS_CONVERT_APPEND) {
-                cetrafs_bh_abort_update(lbh);
-                brelse(lbh);
-                brelse(ibh);
-                return ret;
-            }
-            /* -EAGAIN: the leaf WAS modified, so publish it before the
-             * block is appended elsewhere in the tree. Missing this on
-             * THIS site (depth 2 -- which is every large VM image) let
-             * -EAGAIN escape to block_write_begin, where io_uring reads
-             * it as "retry" and span forever: a stuck worker in D state
-             * and a migration that never completed. */
-            /* Same trade as the depth-1 site above. */
-            cetrafs_blk_tail_stamp(lbh, CETRAFS_LEAF_TAIL_MAGIC);
-            if (S_ISREG(inode->i_mode)) {
-                int hret = cetrafs_tree_hold_back(inode, lbh, prev_crc, true);
-
-                if (hret) {
-                    brelse(lbh);
-                    brelse(ibh);
-                    return hret;
-                }
-                if (ret == CETRAFS_CONVERT_APPEND) {
-                    int wret = cetrafs_convert_source_durable(inode, lbh);
-
-                    if (wret) {
-                        brelse(lbh);
-                        brelse(ibh);
-                        return wret;
-                    }
-                    /* Only now: a narrowed range on the device must
-                     * never sit over a leaf the device still has
-                     * unshrunk. */
-                    /*
-                     * Something LEFT this leaf (the converted block, the
-                     * preallocated tail, or both go through the tree below), so
-                     * its range in the interior may now be far too wide: ranges
-                     * only ever widen, and a leaf that once held the tail of a
-                     * preallocation advertises everything to the file's end.
-                     * Left so, every leaf that ever held the tail is read by
-                     * every later lookup past it -- write_path_cost.sh's lookup
-                     * cost went from under 8 tree reads per lookup to 48. The
-                     * leaf's whole array is in hand, so its exact range is
-                     * known: narrow it. Regular files only (directories never
-                     * reach depth 2).
-                     */
-                    if (cetrafs_ei_end(&iarr[li])) {
-                        u64 lo, hi;
-
-                        cetrafs_leaf_array_range((const cetrafs_extent_t *) (lbh->b_data + sizeof(*lhdr)),
-                                                 min_t(u16, cetrafs_le16(lhdr->eh_entries), CETRAFS_EXT_BLOCK_MAX_LEAVES), &lo,
-                                                 &hi);
-                        if (hi && (lo != cetrafs_ei_lo(&iarr[li]) || hi != cetrafs_ei_end(&iarr[li]))) {
-                            const u32 nprev = cetrafs_bh_begin_update_crc(ibh);
-                            int nret;
-
-                            cetrafs_ei_set_range(&iarr[li], lo, hi);
-                            cetrafs_blk_tail_stamp(ibh, CETRAFS_INDEX_TAIL_MAGIC);
-                            nret = cetrafs_tree_hold_back(inode, ibh, nprev, false);
-                            if (nret) {
-                                brelse(lbh);
-                                brelse(ibh);
-                                return nret;
-                            }
-                        }
-                    }
-                }
-                brelse(lbh);
-                brelse(ibh);
-            } else {
-                /* Depth 2 is regular files only; journaled as everywhere else. */
-                int wret = cetrafs_journal_write_block(sb, cetrafs_journal_owner_of(inode), lbh, prev_crc);
-
-                brelse(lbh);
-                brelse(ibh);
-                if (wret)
-                    return wret;
-            }
-            if (ret == CETRAFS_CONVERT_APPEND)
-                return cetrafs_tree_convert_append(inode, raw, iblock, lba, &tail);
-            return 0;
-        }
-        brelse(ibh);
-    }
-    return -ENOENT;
-}
-
-/*
- * The only entry point. Guarantees CETRAFS_CONVERT_APPEND never reaches
- * a caller: any path inside that forgets to act on it is a bug here,
- * caught once and loudly, instead of an errno handed to the VFS.
- */
-/* 'moving': set when the convert moved entries (cetrafs_tree_move_begin());
- * the caller ends the move once the new record is staged. */
-/* TEST ONLY: the reserve goes back after every convert, as before
- * (tests/kernel/tree_resv_kept.sh's control). */
-static bool cetrafs_tree_resv_keep_off;
-cetrafs_test_param(tree_resv_keep_off, cetrafs_tree_resv_keep_off, bool, 0644);
-MODULE_PARM_DESC(tree_resv_keep_off, "TEST ONLY: a convert's unused tree reserve is freed after every convert");
-
-static int cetrafs_tree_convert(struct inode *inode, cetrafs_inode_t *raw, u64 iblock, u64 lba, u32 want, u32 *done,
-                                bool *moving)
-{
-    /* A split rewrites a LEAF and can leave the record's depth, entry
-     * count and block count untouched -- the key cannot see it. */
-    cetrafs_inode_ext_cache_drop(inode);
-
-    int ret;
-
-    *done = 0;
-    ret = cetrafs_deferred_room(inode); /* before anything is edited */
-    if (ret)
-        return ret;
-    ret = cetrafs_tree_convert_inner(inode, raw, iblock, lba, want, done, moving);
-    /* What an append did not take stays for the next convert (F-5),
-     * given back at the write close; a refused convert gives it back
-     * now, so an ENOSPC leaves the volume as it found it. */
-    if (ret < 0 || READ_ONCE(cetrafs_tree_resv_keep_off))
-        cetrafs_tree_resv_release(inode);
-    if (WARN_ON_ONCE(ret == CETRAFS_CONVERT_NEED_ROOM))
-        ret = -EIO;
-    if (ret == 0 && *done == 0)
-        *done = 1; /* belt: a path that converted without saying so */
-
-    if (WARN_ON_ONCE(ret == CETRAFS_CONVERT_APPEND)) {
-        pr_err("tree convert: a leaf-full signal escaped unhandled for ino=%llu block %llu -- please report\n",
-               (unsigned long long) inode->i_ino, iblock);
-        return -EIO;
-    }
-    return ret;
-}
-
-/*
- * The depth-2 tree is at its limit -- every interior full and no root
- * slot for another -- but leaves below it are not: a range split
- * (cetrafs_tree_split_leaf()) leaves both halves part full. The append
- * then fills ANY leaf with a free slot, so the tree holds at least as
- * many extents as an append-only one, whose leaves all filled. A lookup
- * pays for it only at the limit: the leaf taken over gets an UNKNOWN
- * range, read by every lookup from then on.
- *
- * UNKNOWN, not widened, and the interior held back BEFORE the leaf: the
- * rule of the append to the last leaf (cetrafs_tree_append()), so a
- * boundary that is not atomic -- one written in place, block by block --
- * never puts the leaf on the device under a range that skips the new
- * extent. Root entries carry no range.
- *
- * -ENOSPC: every leaf is full too -- the tree really is.
- */
-cetrafs_test_param(tree_any_leaf_off, cetrafs_tree_any_leaf_off, bool, 0644);
-MODULE_PARM_DESC(tree_any_leaf_off, "TEST ONLY: a full depth-2 tree returns ENOSPC instead of filling free leaf slots");
-
-static atomic64_t cetrafs_tree_any_leaf_inserts = ATOMIC64_INIT(0);
-
-u64 cetrafs_tree_any_leaf_count(void)
-{
-    return (u64) atomic64_read(&cetrafs_tree_any_leaf_inserts);
-}
-
-static int cetrafs_tree_insert_any_leaf(struct inode *inode,
-                                        cetrafs_inode_t *raw,
-                                        u64 iblock,
-                                        u64 lba,
-                                        u32 count,
-                                        bool uninit,
-                                        bool *merged,
-                                        u32 *leaf_count)
-{
-    struct super_block *sb = inode->i_sb;
-    u32 ni;
-
-    if (READ_ONCE(cetrafs_tree_any_leaf_off) || !S_ISREG(inode->i_mode))
-        return -ENOSPC;
-    lockdep_assert_held_write(&inode->i_mapping->invalidate_lock);
-    for (ni = 0; ni < cetrafs_le16(raw->eh.eh_entries) && ni < ARRAY_SIZE(raw->et.idx); ni++) {
-        u64 ilba = cetrafs_ei_child(&raw->et.idx[ni]);
-        struct buffer_head *ibh = cetrafs_read_index_bh(inode, ilba);
-        cetrafs_extent_hdr_t *ihdr;
-        cetrafs_extent_idx_t *iarr;
-        u32 li, iln;
-
-        if (!ibh)
-            return -EIO;
-        ihdr = (cetrafs_extent_hdr_t *) ibh->b_data;
-        iarr = (cetrafs_extent_idx_t *) (ibh->b_data + sizeof(*ihdr));
-        iln = min_t(u32, cetrafs_le16(ihdr->eh_entries), CETRAFS_EXT_BLOCK_MAX_IDX);
-        for (li = 0; li < iln; li++) {
-            u64 llba = cetrafs_ei_child(&iarr[li]);
-            struct buffer_head *lbh = cetrafs_read_leaf_bh(inode, llba);
-            cetrafs_extent_hdr_t *lhdr;
-            u16 before;
-            int ret;
-
-            if (!lbh) {
-                brelse(ibh);
-                return -EIO;
-            }
-            lhdr = (cetrafs_extent_hdr_t *) lbh->b_data;
-            /* The caller holds invalidate_lock: no writer edits it. */
-            before = cetrafs_le16(lhdr->eh_entries);
-            if (before >= CETRAFS_EXT_BLOCK_MAX_LEAVES) {
-                brelse(lbh);
-                continue;
-            }
-            /* 1. The interior: this leaf's range UNKNOWN, held back first. */
-            if (cetrafs_ei_end(&iarr[li])) {
-                const u32 iprev = cetrafs_bh_begin_update_crc(ibh);
-
-                cetrafs_ei_set_range(&iarr[li], cetrafs_ei_lo(&iarr[li]), 0);
-                cetrafs_blk_tail_stamp(ibh, CETRAFS_INDEX_TAIL_MAGIC);
-                ret = cetrafs_tree_hold_back(inode, ibh, iprev, false);
-                if (ret) {
-                    brelse(lbh);
-                    brelse(ibh);
-                    return ret;
-                }
-            }
-            /* 2. The extent into the leaf. */
-            {
-                const u32 lprev = cetrafs_bh_begin_update_crc(lbh);
-
-                ret = cetrafs_leaf_array_insert((cetrafs_extent_t *) (lbh->b_data + sizeof(*lhdr)), &lhdr->eh_entries,
-                                                CETRAFS_EXT_BLOCK_MAX_LEAVES, iblock, lba, count, uninit);
-                if (ret) {
-                    cetrafs_bh_abort_update(lbh);
-                    brelse(lbh);
-                    if (ret == -ENOSPC)
-                        continue;
-                    brelse(ibh);
-                    return ret;
-                }
-                *merged = cetrafs_le16(lhdr->eh_entries) == before;
-                *leaf_count = cetrafs_le16(lhdr->eh_entries);
-                cetrafs_blk_tail_stamp(lbh, CETRAFS_LEAF_TAIL_MAGIC);
-                ret = cetrafs_tree_hold_back(inode, lbh, lprev, true);
-            }
-            brelse(lbh);
-            brelse(ibh);
-            if (!ret)
-                atomic64_inc(&cetrafs_tree_any_leaf_inserts);
-            return ret;
-        }
-        brelse(ibh);
-    }
-    (void) sb;
-    return -ENOSPC;
-}
-
-/*
- * The last leaf on path 'p' takes [iblock, iblock + count): its range in
- * its parent must not exclude the extent. A regular file's leaf and
+ * The leaf at the end of path 'p' takes [iblock, iblock + count): its
+ * range in its parent must not exclude the extent. A regular file's leaf and
  * interior are both held back, and a boundary batch orders nothing
  * between them: the leaf could reach the device with the extent while
  * the interior still held the old range, and a node dying in between
@@ -5983,9 +5459,9 @@ static int cetrafs_tpath_cover(struct inode *inode, struct cetrafs_tpath *p, u64
     cetrafs_extent_idx_t *e;
     u32 prev;
 
-    if (!ibh || !p->n[1])
+    if (!ibh)
         return 0;
-    e = (cetrafs_extent_idx_t *) (ibh->b_data + sizeof(cetrafs_extent_hdr_t)) + p->n[1] - 1;
+    e = (cetrafs_extent_idx_t *) (ibh->b_data + sizeof(cetrafs_extent_hdr_t)) + p->slot[0];
     if (cetrafs_idx_may_hold(e, iblock) && cetrafs_idx_may_hold(e, iblock + count - 1) &&
         cetrafs_idx_end(iblock, count))
         return 0;
@@ -6107,6 +5583,442 @@ fail:
     for (i = 0; i < nmade; i++)
         cetrafs_free_data_block(sb, made[i]);
     cetrafs_free_data_block(sb, child);
+    return ret;
+}
+
+/*
+ * Depth-first over the leaves below the level-'level' node whose 'n'
+ * entries are at 'arr', in array order, asking hit() of each leaf. A
+ * child whose entry's range excludes 'iblock' is not read (U64_MAX: none
+ * is excluded; the record's slots carry no range). On a hit, 'p' holds
+ * the path down to that leaf and 0 is returned.
+ */
+static int cetrafs_tpath_find_in(struct inode *inode, struct cetrafs_tpath *p, int level,
+                                 const cetrafs_extent_idx_t *arr, u32 n, u64 iblock,
+                                 bool (*hit)(struct buffer_head *lbh, void *arg), void *arg)
+{
+    const int cl = level - 1;
+    u32 i;
+
+    for (i = 0; i < n; i++) {
+        struct buffer_head *bh;
+        u32 cn;
+        int ret;
+
+        if (level < p->depth && iblock != U64_MAX && !cetrafs_idx_may_hold(&arr[i], iblock))
+            continue; /* its range rules it out: not even read */
+        bh = cl ? cetrafs_read_index_bh(inode, cetrafs_ei_child(&arr[i]))
+                : cetrafs_read_leaf_bh(inode, cetrafs_ei_child(&arr[i]));
+        if (!bh)
+            return -EIO;
+        cn = cetrafs_le16(((const cetrafs_extent_hdr_t *) bh->b_data)->eh_entries);
+        cn = min_t(u32, cn, cl ? CETRAFS_EXT_BLOCK_MAX_IDX : CETRAFS_EXT_BLOCK_MAX_LEAVES);
+        p->bh[cl] = bh;
+        p->slot[cl] = i;
+        p->n[cl] = cn;
+        if (cl)
+            ret = cetrafs_tpath_find_in(inode, p, cl,
+                                        (const cetrafs_extent_idx_t *) (bh->b_data + sizeof(cetrafs_extent_hdr_t)), cn,
+                                        iblock, hit, arg);
+        else
+            ret = hit(bh, arg) ? 0 : -ENOENT;
+        if (ret != -ENOENT)
+            return ret;
+        brelse(bh);
+        p->bh[cl] = NULL;
+    }
+    return -ENOENT;
+}
+
+/*
+ * The path to the first leaf of a depth >= 1 tree that hit() accepts,
+ * searching only below entries whose range may hold 'iblock' (U64_MAX:
+ * every leaf). 0 with 'p' filled (the caller cetrafs_tpath_put()s it),
+ * -ENOENT when no leaf is accepted, -EIO when a block cannot be read,
+ * -EUCLEAN for a record that names no tree. The caller holds
+ * invalidate_lock: no writer moves the tree under the search.
+ */
+static int cetrafs_tpath_find(struct inode *inode, const cetrafs_inode_t *raw, struct cetrafs_tpath *p, u64 iblock,
+                              bool (*hit)(struct buffer_head *lbh, void *arg), void *arg)
+{
+    int ret;
+
+    memset(p, 0, sizeof(*p));
+    p->depth = cetrafs_le16(raw->eh.eh_depth);
+    if (p->depth < 1 || p->depth > CETRAFS_EXT_MAX_DEPTH)
+        return -EUCLEAN;
+    p->n[p->depth] = min_t(u32, cetrafs_le16(raw->eh.eh_entries), ARRAY_SIZE(raw->et.idx));
+    ret = cetrafs_tpath_find_in(inode, p, p->depth, raw->et.idx, p->n[p->depth], iblock, hit, arg);
+    if (ret)
+        cetrafs_tpath_put(p);
+    return ret;
+}
+
+/* Is the path's leaf the tree's last one -- the leaf appends go to? */
+static bool cetrafs_tpath_is_last(const struct cetrafs_tpath *p)
+{
+    int l;
+
+    for (l = 0; l < p->depth; l++)
+        if (p->slot[l] + 1 != p->n[l + 1])
+            return false;
+    return true;
+}
+
+/*
+ * Something LEFT the path's leaf (a converted block, a preallocated tail),
+ * so its range in its parent may now be far too wide: ranges only ever
+ * widen, and a leaf that once held the tail of a preallocation advertises
+ * everything to the file's end -- read by every later lookup past it
+ * (write_path_cost.sh: from under 8 tree reads per lookup to 48). Its
+ * whole array is in hand, so its exact range is known: narrowed, held
+ * back. Only after the shrunk leaf is: a narrowed range on the device
+ * must never sit over a leaf the device still has unshrunk. An UNKNOWN
+ * range stays unknown (it may be the append target).
+ */
+static int cetrafs_tpath_narrow(struct inode *inode, struct cetrafs_tpath *p)
+{
+    struct buffer_head *ibh = p->depth >= 2 ? p->bh[1] : NULL;
+    struct buffer_head *lbh = p->bh[0];
+    cetrafs_extent_idx_t *e;
+    u64 lo, hi;
+    u32 prev;
+
+    if (!ibh)
+        return 0;
+    e = (cetrafs_extent_idx_t *) (ibh->b_data + sizeof(cetrafs_extent_hdr_t)) + p->slot[0];
+    if (!cetrafs_ei_end(e))
+        return 0;
+    cetrafs_leaf_array_range((const cetrafs_extent_t *) (lbh->b_data + sizeof(cetrafs_extent_hdr_t)),
+                             min_t(u32, cetrafs_le16(((const cetrafs_extent_hdr_t *) lbh->b_data)->eh_entries),
+                                   CETRAFS_EXT_BLOCK_MAX_LEAVES),
+                             &lo, &hi);
+    if (!hi || (lo == cetrafs_ei_lo(e) && hi == cetrafs_ei_end(e)))
+        return 0;
+    prev = cetrafs_bh_begin_update_crc(ibh);
+    cetrafs_ei_set_range(e, lo, hi);
+    cetrafs_blk_tail_stamp(ibh, CETRAFS_INDEX_TAIL_MAGIC);
+    return cetrafs_tree_hold_back(inode, ibh, prev, false);
+}
+
+/* hit() for a leaf with a free slot. */
+static bool cetrafs_leaf_bh_has_room(struct buffer_head *lbh, void *arg)
+{
+    u16 n;
+
+    cetrafs_bh_read_lock(lbh);
+    n = cetrafs_le16(((const cetrafs_extent_hdr_t *) lbh->b_data)->eh_entries);
+    cetrafs_bh_read_unlock(lbh);
+    return n < CETRAFS_EXT_BLOCK_MAX_LEAVES;
+}
+
+/*
+ * Can the tree take 'need' more extents through cetrafs_tree_append(),
+ * merging nothing? Asked BEFORE a convert shrinks a full leaf and hands
+ * its pieces -- the converted block and the preallocated tail, at most
+ * two extents -- to the append (CETRAFS_CONVERT_APPEND). At the tree's
+ * limit that append fails only AFTER the shrink is held back: the
+ * written block drops out of the map (allocated, referenced by nothing)
+ * and the rest of the preallocation is given back, for a write that
+ * then fails ENOSPC anyway (audit 2026-11-14 A-1). Refused here, the
+ * write fails ENOSPC with nothing modified and the preallocation kept.
+ *
+ * Where an append can put an extent: the last leaf, a new leaf (room in
+ * the last interior or the root), or -- at the limit -- any leaf with a
+ * free slot (cetrafs_tree_insert_any_leaf()). Depth 0 and 1 can always
+ * grow a level. The walk reads every leaf, but only at the limit, where
+ * the append would walk them all too.
+ *
+ * 0: room. -ENOSPC: none. -EIO: a tree block could not be read.
+ */
+struct cetrafs_room_ctx {
+    u32 need, avail;
+};
+
+/* hit() that counts free slots until there are 'need'. */
+static bool cetrafs_leaf_room_count(struct buffer_head *lbh, void *arg)
+{
+    struct cetrafs_room_ctx *r = arg;
+    u16 n;
+
+    cetrafs_bh_read_lock(lbh);
+    n = cetrafs_le16(((const cetrafs_extent_hdr_t *) lbh->b_data)->eh_entries);
+    cetrafs_bh_read_unlock(lbh);
+    if (n < CETRAFS_EXT_BLOCK_MAX_LEAVES)
+        r->avail += CETRAFS_EXT_BLOCK_MAX_LEAVES - n;
+    return r->avail >= r->need;
+}
+
+static int cetrafs_tree_append_room(struct inode *inode, const cetrafs_inode_t *raw, u32 need)
+{
+    struct cetrafs_room_ctx r = {.need = need};
+    struct cetrafs_tpath p;
+    bool linkable;
+    int ret;
+
+    if (READ_ONCE(cetrafs_tree_append_room_off) || cetrafs_le16(raw->eh.eh_depth) == 0)
+        return 0; /* TEST ONLY: the old order; a depth-0 tree can always grow a level */
+    ret = cetrafs_tree_last_path(inode, raw, 0, false, &p);
+    if (ret)
+        return -EIO;
+    r.avail = CETRAFS_EXT_BLOCK_MAX_LEAVES - min_t(u32, p.n[0], CETRAFS_EXT_BLOCK_MAX_LEAVES);
+    linkable = cetrafs_tpath_can_link(raw, &p, 1);
+    cetrafs_tpath_put(&p);
+    if (linkable || r.avail >= need)
+        return 0; /* a new leaf, or the last one, takes them */
+    /* Without the any-leaf fallback only the last leaf takes appends. */
+    if (READ_ONCE(cetrafs_tree_any_leaf_off) || !S_ISREG(inode->i_mode))
+        return -ENOSPC;
+    r.avail = 0;
+    ret = cetrafs_tpath_find(inode, raw, &p, U64_MAX, cetrafs_leaf_room_count, &r);
+    if (!ret)
+        cetrafs_tpath_put(&p);
+    return ret == -ENOENT ? -ENOSPC : ret;
+}
+
+/* A convert that needs room: the append's slots checked, then its blocks
+ * reserved -- both before anything is edited. */
+static int cetrafs_tree_convert_need_room(struct inode *inode, const cetrafs_inode_t *raw)
+{
+    int ret = cetrafs_tree_append_room(inode, raw, 2);
+
+    if (ret == -ENOSPC)
+        pr_warn_ratelimited("ino=%llu: extent tree full (%u extents at most): a write into preallocated space "
+                            "fails ENOSPC, nothing changed\n",
+                            (unsigned long long) inode->i_ino, cetrafs_tree_max_extents());
+    return ret ? ret : cetrafs_tree_resv_fill(inode);
+}
+
+static int cetrafs_tree_convert_inner(struct inode *inode,
+                                      cetrafs_inode_t *raw,
+                                      u64 iblock,
+                                      u64 lba,
+                                      u32 want,
+                                      u32 *done,
+                                      bool *moving)
+{
+    struct super_block *sb = inode->i_sb;
+    struct cetrafs_convert_tail tail = { 0 };
+    int ret, splits = 0;
+
+    tail.ino = inode;
+
+    if (cetrafs_le16(raw->eh.eh_depth) == 0) {
+        ret = cetrafs_leaf_array_convert(sb, raw->et.leaf, &raw->eh.eh_entries, (u16) ARRAY_SIZE(raw->et.leaf), iblock,
+                                         lba, want, done, &tail);
+        if (ret == CETRAFS_CONVERT_NEED_ROOM) {
+            ret = cetrafs_tree_convert_need_room(inode, raw);
+            if (ret)
+                return ret;
+            tail.may_append = true;
+            ret = cetrafs_leaf_array_convert(sb, raw->et.leaf, &raw->eh.eh_entries, (u16) ARRAY_SIZE(raw->et.leaf),
+                                             iblock, lba, want, done, &tail);
+        }
+        if (ret == CETRAFS_CONVERT_APPEND)
+            return cetrafs_tree_convert_append(inode, raw, iblock, lba, &tail);
+        return ret;
+    }
+
+again:
+    {
+        struct cetrafs_tpath p;
+        struct buffer_head *lbh;
+        cetrafs_extent_hdr_t *lhdr;
+        int wret;
+
+        /* The leaf holding the block in a preallocated extent. Looked for
+         * before anything is claimed: the claim (begin_update) of a leaf
+         * that turns out not to hold it is released by
+         * cetrafs_bh_abort_update(), which drops a CLEAN buffer's cached
+         * image -- a device re-read of every leaf passed, on every later
+         * lookup (write_path_cost.sh: 34000 device reads instead of 52). */
+        ret = cetrafs_tpath_find(inode, raw, &p, iblock, cetrafs_leaf_bh_holds_uninit, &iblock);
+        if (ret)
+            return ret;
+        lbh = p.bh[0];
+        /* Full: split it by range and look again -- the half that holds
+         * the block has room now. A depth-1 leaf has no interior to split
+         * into. */
+        if (p.depth >= 2 && splits < 2 && cetrafs_leaf_split_wanted(inode, lbh)) {
+            u32 cmax, cbefore = cetrafs_tree_leaves_if_half(inode, raw, &cmax);
+            int sret = cetrafs_tree_split_leaf(inode, raw, p.bh[1], p.slot[0], lbh, cetrafs_tpath_is_last(&p), moving);
+
+            if (!sret)
+                cetrafs_tree_note_capacity(inode, raw, cbefore);
+            if (sret != CETRAFS_SPLIT_NONE) {
+                cetrafs_tpath_put(&p);
+                if (sret)
+                    return sret;
+                splits++;
+                goto again;
+            }
+        }
+        /* Full enough to shrink here and append its piece elsewhere: a
+         * move (cetrafs_tree_move_begin()). */
+        if (cetrafs_leaf_nearly_full(lbh))
+            cetrafs_tree_move_begin(inode, moving);
+        const u32 prev_crc = cetrafs_bh_begin_update_crc(lbh);
+        lhdr = (cetrafs_extent_hdr_t *) lbh->b_data;
+        ret = cetrafs_leaf_array_convert(sb, (cetrafs_extent_t *) (lbh->b_data + sizeof(*lhdr)), &lhdr->eh_entries,
+                                         CETRAFS_EXT_BLOCK_MAX_LEAVES, iblock, lba, want, done, &tail);
+        if (ret == CETRAFS_CONVERT_NEED_ROOM || (ret && ret != CETRAFS_CONVERT_APPEND)) {
+            cetrafs_bh_abort_update(lbh);
+            cetrafs_tpath_put(&p);
+            if (ret != CETRAFS_CONVERT_NEED_ROOM)
+                return ret;
+            ret = cetrafs_tree_convert_need_room(inode, raw);
+            if (ret)
+                return ret;
+            tail.may_append = true;
+            goto again;
+        }
+        /*
+         * Published even on CETRAFS_CONVERT_APPEND: the leaf WAS modified
+         * (the extent no longer covers this block), and it must be before
+         * the block is appended elsewhere in the tree. Missing that at
+         * depth 2 once let -EAGAIN escape to block_write_begin, which
+         * io_uring reads as "retry": a worker spinning in D state.
+         *
+         * A regular file's leaf is held back for its durability boundary:
+         * a journal write is three device cache flushes, and a VM image
+         * preallocated by fallocate() takes this path on EVERY 4 KiB guest
+         * write (measured: 6.8 IOPS, 148 flushes per 40 writes). A
+         * directory has no boundary and is journaled now
+         * (cetrafs_tree_hold_back()).
+         */
+        cetrafs_blk_tail_stamp(lbh, CETRAFS_LEAF_TAIL_MAGIC);
+        wret = cetrafs_tree_hold_back(inode, lbh, prev_crc, true);
+        if (!wret && ret == CETRAFS_CONVERT_APPEND) {
+            wret = cetrafs_convert_source_durable(inode, lbh);
+            if (!wret)
+                wret = cetrafs_tpath_narrow(inode, &p);
+        }
+        cetrafs_tpath_put(&p);
+        if (wret)
+            return wret;
+        if (ret == CETRAFS_CONVERT_APPEND)
+            return cetrafs_tree_convert_append(inode, raw, iblock, lba, &tail);
+        return 0;
+    }
+}
+
+/*
+ * The only entry point. Guarantees CETRAFS_CONVERT_APPEND never reaches
+ * a caller: any path inside that forgets to act on it is a bug here,
+ * caught once and loudly, instead of an errno handed to the VFS.
+ */
+/* 'moving': set when the convert moved entries (cetrafs_tree_move_begin());
+ * the caller ends the move once the new record is staged. */
+/* TEST ONLY: the reserve goes back after every convert, as before
+ * (tests/kernel/tree_resv_kept.sh's control). */
+static bool cetrafs_tree_resv_keep_off;
+cetrafs_test_param(tree_resv_keep_off, cetrafs_tree_resv_keep_off, bool, 0644);
+MODULE_PARM_DESC(tree_resv_keep_off, "TEST ONLY: a convert's unused tree reserve is freed after every convert");
+
+static int cetrafs_tree_convert(struct inode *inode, cetrafs_inode_t *raw, u64 iblock, u64 lba, u32 want, u32 *done,
+                                bool *moving)
+{
+    /* A split rewrites a LEAF and can leave the record's depth, entry
+     * count and block count untouched -- the key cannot see it. */
+    cetrafs_inode_ext_cache_drop(inode);
+
+    int ret;
+
+    *done = 0;
+    ret = cetrafs_deferred_room(inode); /* before anything is edited */
+    if (ret)
+        return ret;
+    ret = cetrafs_tree_convert_inner(inode, raw, iblock, lba, want, done, moving);
+    /* What an append did not take stays for the next convert (F-5),
+     * given back at the write close; a refused convert gives it back
+     * now, so an ENOSPC leaves the volume as it found it. */
+    if (ret < 0 || READ_ONCE(cetrafs_tree_resv_keep_off))
+        cetrafs_tree_resv_release(inode);
+    if (WARN_ON_ONCE(ret == CETRAFS_CONVERT_NEED_ROOM))
+        ret = -EIO;
+    if (ret == 0 && *done == 0)
+        *done = 1; /* belt: a path that converted without saying so */
+
+    if (WARN_ON_ONCE(ret == CETRAFS_CONVERT_APPEND)) {
+        pr_err("tree convert: a leaf-full signal escaped unhandled for ino=%llu block %llu -- please report\n",
+               (unsigned long long) inode->i_ino, iblock);
+        return -EIO;
+    }
+    return ret;
+}
+
+/*
+ * The depth-2 tree is at its limit -- every interior full and no root
+ * slot for another -- but leaves below it are not: a range split
+ * (cetrafs_tree_split_leaf()) leaves both halves part full. The append
+ * then fills ANY leaf with a free slot, so the tree holds at least as
+ * many extents as an append-only one, whose leaves all filled. A lookup
+ * pays for it only at the limit: the leaf taken over gets an UNKNOWN
+ * range, read by every lookup from then on.
+ *
+ * UNKNOWN, not widened, and the interior held back BEFORE the leaf: the
+ * rule of the append to the last leaf (cetrafs_tree_append()), so a
+ * boundary that is not atomic -- one written in place, block by block --
+ * never puts the leaf on the device under a range that skips the new
+ * extent. Root entries carry no range.
+ *
+ * -ENOSPC: every leaf is full too -- the tree really is.
+ */
+cetrafs_test_param(tree_any_leaf_off, cetrafs_tree_any_leaf_off, bool, 0644);
+MODULE_PARM_DESC(tree_any_leaf_off, "TEST ONLY: a full depth-2 tree returns ENOSPC instead of filling free leaf slots");
+
+static atomic64_t cetrafs_tree_any_leaf_inserts = ATOMIC64_INIT(0);
+
+u64 cetrafs_tree_any_leaf_count(void)
+{
+    return (u64) atomic64_read(&cetrafs_tree_any_leaf_inserts);
+}
+
+static int cetrafs_tree_insert_any_leaf(struct inode *inode,
+                                        cetrafs_inode_t *raw,
+                                        u64 iblock,
+                                        u64 lba,
+                                        u32 count,
+                                        bool uninit,
+                                        bool *merged,
+                                        u32 *leaf_count)
+{
+    struct cetrafs_tpath p;
+    struct buffer_head *lbh;
+    cetrafs_extent_hdr_t *lhdr;
+    u16 before;
+    u32 lprev;
+    int ret;
+
+    if (READ_ONCE(cetrafs_tree_any_leaf_off) || !S_ISREG(inode->i_mode))
+        return -ENOSPC;
+    lockdep_assert_held_write(&inode->i_mapping->invalidate_lock);
+    ret = cetrafs_tpath_find(inode, raw, &p, U64_MAX, cetrafs_leaf_bh_has_room, NULL);
+    if (ret)
+        return ret == -ENOENT ? -ENOSPC : ret;
+    lbh = p.bh[0];
+    lhdr = (cetrafs_extent_hdr_t *) lbh->b_data;
+    /* 1. The interior: this leaf's range made UNKNOWN, held back first. */
+    ret = cetrafs_tpath_cover(inode, &p, iblock, count);
+    if (!ret) {
+        /* 2. The extent into the leaf. The caller holds invalidate_lock:
+         * nobody else edits it, so the room just seen is still there. */
+        before = cetrafs_le16(lhdr->eh_entries);
+        lprev = cetrafs_bh_begin_update_crc(lbh);
+        ret = cetrafs_leaf_array_insert((cetrafs_extent_t *) (lbh->b_data + sizeof(*lhdr)), &lhdr->eh_entries,
+                                        CETRAFS_EXT_BLOCK_MAX_LEAVES, iblock, lba, count, uninit);
+        if (ret) {
+            cetrafs_bh_abort_update(lbh);
+        } else {
+            *merged = cetrafs_le16(lhdr->eh_entries) == before;
+            *leaf_count = cetrafs_le16(lhdr->eh_entries);
+            cetrafs_blk_tail_stamp(lbh, CETRAFS_LEAF_TAIL_MAGIC);
+            ret = cetrafs_tree_hold_back(inode, lbh, lprev, true);
+            if (!ret)
+                atomic64_inc(&cetrafs_tree_any_leaf_inserts);
+        }
+    }
+    cetrafs_tpath_put(&p);
     return ret;
 }
 

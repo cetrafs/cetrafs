@@ -1240,6 +1240,8 @@ file.c:cetrafs_tree_convert_inner the-editor,-under-invalidate_lock-exclusive
 file.c:cetrafs_tree_append_inner the-editor,-under-invalidate_lock-exclusive
 file.c:cetrafs_tpath_cover the-editor,-the-append's-path,-under-invalidate_lock-exclusive
 file.c:cetrafs_tpath_link the-editor,-the-append's-path,-under-invalidate_lock-exclusive
+file.c:cetrafs_tpath_find_in the-editors'-search,-under-invalidate_lock-exclusive
+file.c:cetrafs_tpath_narrow the-editor,-convert's-path,-under-invalidate_lock-exclusive
 file.c:cetrafs_tree_split_leaf the-editor,-under-invalidate_lock-exclusive-(asserted);-its-new-leaf-a-new-block
 file.c:cetrafs_tree_insert_any_leaf the-editor,-under-invalidate_lock-exclusive-(asserted)
 file.c:cetrafs_idx_insert_keep_last the-editor,-reads-only-after-cetrafs_bh_begin_update_crc-takes-the-buffer-lock
@@ -2401,7 +2403,7 @@ cetrafs_bg_trim_pool_one below:owns-no-zone-group-the-pool-pass-stops
 cetrafs_sb_first_owned_zg below:none-owned
 cetrafs_pending_next below:no-pending-range
 cetrafs_leaf_array_convert below:not-covered-here
-cetrafs_tree_convert_inner below:not-covered-here
+cetrafs_tpath_find_in below:no-leaf-accepted-the-caller-decides
 cetrafs_inode_map_block final:a-hole-on-a-read-only-mapping'
 c43_names() { # <errno> <files...>: every function with a literal return/assignment of -<errno>
     local e="$1"
@@ -3001,9 +3003,8 @@ cetrafs_read_leaf_bh wraps:cetrafs_read_tree_bh
 cetrafs_tree_append_inner writes:the-tree
 cetrafs_tree_append_room writes:the-room-check-before-a-convert-edits-the-tree
 cetrafs_evict_reread_claimed frees:the-claimed-dead-records-tree
-cetrafs_tree_convert_inner writes:the-tree
+cetrafs_tpath_find_in writes:the-tree-convert-and-any-leaf-edit-what-it-finds
 cetrafs_tree_free_meta frees:the-trees-own-blocks
-cetrafs_tree_insert_any_leaf writes:the-tree
 cetrafs_tree_last_contig_lba writes:the-allocation-goal-of-a-write
 cetrafs_tree_meta_is_ours frees:decides-a-free
 cetrafs_tree_meta_set frees:decides-which-old-tree-blocks-go
