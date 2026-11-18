@@ -38,6 +38,10 @@ BMAP_LBA=$(($("$MAP" "$DEV" | awk '$1 == "bg" && $2 == 0 {split($4,a,"="); print
 ct_mount "$DEV" "$MNT"
 require_cetrafs_mount "$MNT"
 ct_param_set auto_defrag 0
+# Every beat writes held bitmap blocks; a beat inside the window below put
+# the bits on the device before the setup could see them only in cache
+# (one run in three on a slow kernel).
+ct_param_set hb_held_flush_off 1
 
 rd8() { python3 -I -c "
 import os, sys

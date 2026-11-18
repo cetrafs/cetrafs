@@ -148,6 +148,7 @@ ct_cleanup() {
     # environmental abort cascaded into unrelated failures and made the
     # whole gate read as flaky.
     ct_param_restore_all 2>/dev/null
+    ct_sysctl_restore_all 2>/dev/null
     # A suite that bails out (a setup failure's ct_exit) while it still
     # holds a descriptor on a mounted file -- the `exec 8<"$MNT/f"`
     # pattern -- keeps that mount busy: every umount below failed and the
@@ -1061,6 +1062,28 @@ ct_param_set() { # <name> <value>
 "
     fi
     echo "$2" >"$f"
+}
+
+# A box-wide sysctl, restored when the suite ends, aborted or not (the
+# same rule as a module parameter above). Suites run one at a time per box.
+ct_sysctl_set() { # <name> <value>
+    local f="/proc/sys/${1//.//}"
+    [ -w "$f" ] || { fail "sysctl $1 is not writable"; return 1; }
+    if ! printf '%s' "${CT_SYSCTL_RESTORE:-}" | grep -q "^$1 "; then
+        CT_SYSCTL_RESTORE="${CT_SYSCTL_RESTORE:-}$1 $(cat "$f")
+"
+    fi
+    echo "$2" >"$f"
+}
+
+ct_sysctl_restore_all() {
+    local name val
+    [ -n "${CT_SYSCTL_RESTORE:-}" ] || return 0
+    # In reverse: some settings move others when written.
+    while read -r name val; do
+        [ -n "$name" ] && echo "$val" >"/proc/sys/${name//.//}"
+    done < <(printf '%s' "$CT_SYSCTL_RESTORE" | tac)
+    return 0
 }
 
 ct_param_restore_all() {

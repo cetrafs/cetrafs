@@ -145,6 +145,14 @@ static bool cetrafs_hb_replay_sweep_off;
 cetrafs_test_param(hb_replay_sweep_off, cetrafs_hb_replay_sweep_off, bool, 0644);
 MODULE_PARM_DESC(hb_drain_off, "TEST ONLY: the heartbeat does not drain pending frees");
 
+/* TEST ONLY: the tick leaves held allocation-bitmap blocks held, so a
+ * suite can have bits that are only in this node's cache for longer than
+ * one beat (tests/kernel/fence_drops_dirty_metadata.sh); the boundaries
+ * still write theirs. */
+static bool cetrafs_hb_held_flush_off;
+cetrafs_test_param(hb_held_flush_off, cetrafs_hb_held_flush_off, bool, 0644);
+MODULE_PARM_DESC(hb_held_flush_off, "TEST ONLY: the heartbeat does not write held allocation-bitmap blocks");
+
 /* TEST ONLY: pause a tick right after it re-arms, where a controls
  * write can move the interval under it. */
 static unsigned int cetrafs_hb_tick_stall_ms;
@@ -440,7 +448,8 @@ static void cetrafs_heartbeat_maint(struct work_struct *work)
         if (hino)
             cetrafs_test_hold_record(sb, hino); /* TEST ONLY: see the parameter */
     }
-    (void) cetrafs_held_flush_nowait(sb); /* never behind a writer waiting for space (A-4) */
+    if (!READ_ONCE(cetrafs_hb_held_flush_off))
+        (void) cetrafs_held_flush_nowait(sb); /* never behind a writer waiting for space (A-4) */
 
     /* Our row's frees-in-flight flag goes back down once nothing is in
      * flight (cetrafs_frees_begin()); peers' scrubs wait while it is up. */

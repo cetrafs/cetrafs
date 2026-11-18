@@ -41,6 +41,12 @@ IPOKE="$(ct_helper inode_block_poke)"
 # disk-backed filesystem (the loop's own writes count as dirty there)
 # publishes the 31 MiB file mid-window as well.
 BLOCKS=8000
+# And the flusher out of the way for the window: on a 1.6 GiB box it
+# still published the file mid-window. Ratios, not the *_bytes forms --
+# writing one of those zeroes its ratio, which a restore cannot undo.
+ct_sysctl_set vm.dirty_ratio 90
+ct_sysctl_set vm.dirty_background_ratio 80
+ct_sysctl_set vm.dirty_expire_centisecs 6000
 HOLD=25      # the write, then comfortably more than two cycles of the fast scrub
 
 OUT="$(ct_tmp scrubshadow-out)"
