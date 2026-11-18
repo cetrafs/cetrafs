@@ -3795,8 +3795,51 @@ static bool cetrafs_idx_may_hold(const cetrafs_extent_idx_t *e, u32 iblock)
     return iblock >= cetrafs_ei_lo(e) && iblock < end;
 }
 
-/* Point query across depth 0/1/2. Early-returns on the first match, so
- * it never flattens the whole tree (the full-scan readers do that).
+/* cetrafs_tree_lookup_unchecked()'s walk: one candidate child at a time
+ * (CETRAFS_TW_ONE), the first leaf that maps the block stops it. */
+struct cetrafs_lookup_ctx {
+    u32 iblock;
+    u64 *out_lba;
+    u32 *out_run;
+    bool *out_uninit;
+    bool found;
+    struct cetrafs_ext_span span;
+};
+
+/* THE point of ei_block_end: a child whose range excludes this block is
+ * never read. Without it the walk read every leaf until it hit -- ~56 of
+ * 113 on a fragmented VM image, per mapped block. */
+static int cetrafs_lookup_want(struct cetrafs_tw *w, const cetrafs_extent_idx_t *ie, int level)
+{
+    const struct cetrafs_lookup_ctx *c = w->ctx;
+
+    return cetrafs_idx_may_hold(ie, c->iblock) ? CETRAFS_TW_DESCEND : CETRAFS_TW_SKIP;
+}
+
+static int cetrafs_lookup_child(struct cetrafs_tw *w, const cetrafs_extent_idx_t *ie, int level)
+{
+    if (!level)
+        cetrafs_lookup_stall(w->inode, ((const struct cetrafs_lookup_ctx *) w->ctx)->iblock); /* test-only */
+    return CETRAFS_TW_DESCEND;
+}
+
+/* Under the leaf's buffer lock (the walk takes it). */
+static int cetrafs_lookup_leaf(struct cetrafs_tw *w, const cetrafs_extent_t *arr, u32 n, u64 lba)
+{
+    struct cetrafs_lookup_ctx *c = w->ctx;
+
+    c->found = cetrafs_leaf_array_lookup(arr, n, c->iblock, c->out_lba, c->out_run, c->out_uninit, &c->span);
+    return c->found ? CETRAFS_TW_STOP : 0;
+}
+
+static const struct cetrafs_tw_ops cetrafs_lookup_ops = {
+    .want = cetrafs_lookup_want,
+    .child = cetrafs_lookup_child,
+    .leaf = cetrafs_lookup_leaf,
+};
+
+/* Point query at any depth. Stops at the first match, so it never
+ * flattens the whole tree (the full-scan readers do that).
  *
  * Leaf and index entries are read under the BUFFER lock. A cached tree
  * block is the same memory the extent-tree writers edit in place, under
@@ -3818,8 +3861,7 @@ static int cetrafs_tree_lookup_unchecked(struct inode *inode,
                                          bool *found,
                                          bool reader)
 {
-    struct cetrafs_ext_span span = {0};
-    u32 ni, egen;
+    u32 egen;
 
     *found = false;
     if (out_uninit)
@@ -3857,93 +3899,23 @@ static int cetrafs_tree_lookup_unchecked(struct inode *inode,
      * store below (class 41). */
     egen = cetrafs_inode_ext_cache_gen(inode);
 
-    if (cetrafs_le16(raw->eh.eh_depth) == 1) {
-        u64 llba = cetrafs_ei_child(&raw->et.idx[0]);
-        struct buffer_head *lbh = cetrafs_read_leaf_bh_for(inode, llba, reader);
-        const cetrafs_extent_hdr_t *lhdr;
+    {
+        struct cetrafs_lookup_ctx c = {iblock, out_lba, out_run, out_uninit, false, {0}};
+        struct cetrafs_tw w = {
+            .ops = &cetrafs_lookup_ops,
+            .inode = inode,
+            .read = reader ? CETRAFS_TW_READER : CETRAFS_TW_WRITER,
+            .flags = CETRAFS_TW_ONE,
+            .ctx = &c,
+        };
+        int ret = cetrafs_tree_walk(&w, raw);
 
-        if (!lbh)
-            return -EIO;
-        lhdr = (const cetrafs_extent_hdr_t *) lbh->b_data;
-        /* Under the buffer lock: see cetrafs_tree_lookup_unchecked(). */
-        cetrafs_bh_read_lock(lbh);
-        *found = cetrafs_leaf_array_lookup((const cetrafs_extent_t *) (lbh->b_data + sizeof(*lhdr)),
-                                           min_t(u16, cetrafs_le16(lhdr->eh_entries), CETRAFS_EXT_BLOCK_MAX_LEAVES),
-                                           iblock, out_lba, out_run, out_uninit, &span);
-        cetrafs_bh_read_unlock(lbh);
-        brelse(lbh);
-        if (*found)
-            cetrafs_tree_remember(inode, raw, &span, egen);
-        return 0;
-    }
-
-    for (ni = 0; ni < cetrafs_le16(raw->eh.eh_entries) && ni < ARRAY_SIZE(raw->et.idx); ni++) {
-        u64 ilba;
-        struct buffer_head *ibh;
-        const cetrafs_extent_hdr_t *ihdr;
-        const cetrafs_extent_idx_t *iarr;
-        u32 li, iln;
-
-        /* Skip a whole interior that provably cannot hold this block. */
-        if (!cetrafs_idx_may_hold(&raw->et.idx[ni], iblock))
-            continue;
-        ilba = cetrafs_ei_child(&raw->et.idx[ni]);
-        ibh = cetrafs_read_index_bh_for(inode, ilba, reader);
-
-        if (!ibh)
-            return -EIO;
-        ihdr = (const cetrafs_extent_hdr_t *) ibh->b_data;
-        iarr = (const cetrafs_extent_idx_t *) (ibh->b_data + sizeof(*ihdr));
-
-        for (li = 0;;) {
-            u64 llba;
-            struct buffer_head *lbh;
-            const cetrafs_extent_hdr_t *lhdr;
-            cetrafs_extent_idx_t ie;
-
-            /* The next entry whose range may hold the block, found under
-             * ONE hold of the interior's buffer lock and copied out; the
-             * lock is released before the leaf is locked: never two at
-             * once. Taking the lock per entry was ~160 lock round trips
-             * per lookup on a fragmented image -- most of its cost once
-             * the ranges let it read about one leaf.
-             *
-             * THE point of ei_block_end: a leaf whose range excludes
-             * this block is never read. Without it the walk read every
-             * leaf until it hit -- ~56 of 113 on a fragmented VM image,
-             * per mapped block. */
-            cetrafs_bh_read_lock(ibh);
-            iln = min_t(u32, cetrafs_le16(ihdr->eh_entries), CETRAFS_EXT_BLOCK_MAX_IDX);
-            while (li < iln && !cetrafs_idx_may_hold(&iarr[li], iblock))
-                li++;
-            if (li < iln)
-                ie = iarr[li];
-            cetrafs_bh_read_unlock(ibh);
-            if (li >= iln)
-                break;
-            li++;
-            cetrafs_lookup_stall(inode, iblock); /* test-only; see the knob */
-            llba = cetrafs_ei_child(&ie);
-            lbh = cetrafs_read_leaf_bh_for(inode, llba, reader);
-
-            if (!lbh) {
-                brelse(ibh);
-                return -EIO;
-            }
-            lhdr = (const cetrafs_extent_hdr_t *) lbh->b_data;
-            cetrafs_bh_read_lock(lbh);
-            *found = cetrafs_leaf_array_lookup((const cetrafs_extent_t *) (lbh->b_data + sizeof(*lhdr)),
-                                               min_t(u16, cetrafs_le16(lhdr->eh_entries), CETRAFS_EXT_BLOCK_MAX_LEAVES),
-                                               iblock, out_lba, out_run, out_uninit, &span);
-            cetrafs_bh_read_unlock(lbh);
-            brelse(lbh);
-            if (*found) {
-                brelse(ibh);
-                cetrafs_tree_remember(inode, raw, &span, egen);
-                return 0;
-            }
+        if (ret < 0)
+            return ret;
+        if (c.found) {
+            *found = true;
+            cetrafs_tree_remember(inode, raw, &c.span, egen);
         }
-        brelse(ibh);
     }
     return 0;
 }
@@ -4073,52 +4045,23 @@ static int cetrafs_tree_lookup(struct inode *inode,
  * hint for the next allocation (keeps an append contiguous). 0 if none. */
 static u64 cetrafs_tree_last_contig_lba(struct inode *inode, const cetrafs_inode_t *raw)
 {
-    u64 ilba, llba, hint = 0;
-    struct buffer_head *ibh, *lbh;
+    struct buffer_head *lbh;
     const cetrafs_extent_hdr_t *h;
+    u64 hint;
 
     if (cetrafs_le16(raw->eh.eh_depth) == 0)
         return cetrafs_leaf_array_next_contig_lba(
             raw->et.leaf, min_t(u16, cetrafs_le16(raw->eh.eh_entries), ARRAY_SIZE(raw->et.leaf)));
-    if (cetrafs_le16(raw->eh.eh_entries) == 0)
-        return 0;
-
-    if (cetrafs_le16(raw->eh.eh_depth) == 1) {
-        llba = cetrafs_ei_child(&raw->et.idx[0]);
-    } else {
-        u16 n = cetrafs_le16(raw->eh.eh_entries);
-
-        /* A count read off the disk indexes a 4-slot array: bound it
-         * (rule 19). This is only an allocation hint, so a record that
-         * makes no sense gets none; the paths that act on the tree
-         * refuse it themselves. Nothing upstream checked it: fallocate
-         * reaches here without __cetrafs_get_block()'s record check. */
-        if (cetrafs_le16(raw->eh.eh_depth) != 2 || n > ARRAY_SIZE(raw->et.idx))
-            return 0;
-        ilba = cetrafs_ei_child(&raw->et.idx[n - 1]);
-        ibh = cetrafs_read_index_bh(inode, ilba);
-        if (!ibh)
-            return 0;
-        h = (const cetrafs_extent_hdr_t *) ibh->b_data;
-        if (cetrafs_le16(h->eh_entries) == 0) {
-            brelse(ibh);
-            return 0;
-        }
-        {
-            const cetrafs_extent_idx_t *ia =
-                (const cetrafs_extent_idx_t *) (ibh->b_data + sizeof(*h)) +
-                (min_t(u16, cetrafs_le16(h->eh_entries), CETRAFS_EXT_BLOCK_MAX_IDX) - 1);
-            llba = cetrafs_ei_child(ia);
-        }
-        brelse(ibh);
-    }
-
-    lbh = cetrafs_read_leaf_bh(inode, llba);
+    /* Only an allocation hint: a tree that makes no sense gets none; the
+     * paths that act on it refuse it themselves (rule 19 is the walk's). */
+    lbh = cetrafs_tree_last_node(inode, raw, 0, false, NULL);
     if (!lbh)
         return 0;
     h = (const cetrafs_extent_hdr_t *) lbh->b_data;
+    cetrafs_bh_read_lock(lbh);
     hint = cetrafs_leaf_array_next_contig_lba((const cetrafs_extent_t *) (lbh->b_data + sizeof(*h)),
                                               min_t(u16, cetrafs_le16(h->eh_entries), CETRAFS_EXT_BLOCK_MAX_LEAVES));
+    cetrafs_bh_read_unlock(lbh);
     brelse(lbh);
     return hint;
 }
@@ -5215,25 +5158,37 @@ static u32 cetrafs_tree_leaves_if_half(struct inode *inode, const cetrafs_inode_
     u32 rc = READ_ONCE(cetrafs_tree_root_cap), ic = READ_ONCE(cetrafs_tree_idx_cap);
     u32 rmax = rc && rc < ARRAY_SIZE(raw->et.idx) ? rc : ARRAY_SIZE(raw->et.idx);
     u32 idx_max = ic && ic < CETRAFS_EXT_BLOCK_MAX_IDX ? ic : CETRAFS_EXT_BLOCK_MAX_IDX;
-    u32 nroot, n;
+    u32 counts[CETRAFS_EXT_MAX_DEPTH + 1] = {0};
+    u32 per = 1, used = 0, nroot;
+    int depth = cetrafs_le16(raw->eh.eh_depth), l;
     struct buffer_head *ibh;
-    u64 ilba;
 
-    *max = rmax * idx_max;
-    if (cetrafs_le16(raw->eh.eh_magic) != CETRAFS_EXT_MAGIC || cetrafs_le16(raw->eh.eh_depth) != 2)
+    /* Leaves under one root slot when full: idx_max per interior level. */
+    for (l = 2; l <= depth && l <= CETRAFS_EXT_MAX_DEPTH; l++)
+        per *= idx_max;
+    *max = rmax * per;
+    if (cetrafs_le16(raw->eh.eh_magic) != CETRAFS_EXT_MAGIC || depth < 2 || depth > CETRAFS_EXT_MAX_DEPTH)
         return 0;
     nroot = min_t(u32, cetrafs_le16(raw->eh.eh_entries), ARRAY_SIZE(raw->et.idx));
-    if (!nroot || (u64) nroot * idx_max * 2 <= *max)
+    if (!nroot || (u64) nroot * per * 2 <= *max)
         return 0;
-    ilba = cetrafs_ei_child(&raw->et.idx[nroot - 1]);
     /* It only counts, for a warning: the reporter's reader (class 53),
-     * which trusts a cache the writer's would re-read. */
-    ibh = cetrafs_read_index_bh_for(inode, ilba, true);
+     * which trusts a cache the writer's would re-read. Down to the last
+     * interior: what is full before it is full by construction. */
+    ibh = cetrafs_tree_last_node(inode, raw, 1, true, counts);
     if (!ibh)
         return 0;
-    n = min_t(u32, cetrafs_le16(((const cetrafs_extent_hdr_t *) ibh->b_data)->eh_entries), idx_max);
     brelse(ibh);
-    return (nroot - 1) * idx_max + n;
+    /* Each node on the last path: its entries before the last are full
+     * subtrees of idx_max^(level-1) leaves, the last is counted one level
+     * down; the last interior's entries are leaves. */
+    used = min_t(u32, counts[1], idx_max);
+    for (l = 2, per = idx_max; l <= depth; l++, per *= idx_max) {
+        u32 n = min_t(u32, counts[l], l == depth ? rmax : idx_max);
+
+        used += (n ? n - 1 : 0) * per;
+    }
+    return used;
 }
 
 static void cetrafs_tree_note_capacity(struct inode *inode, const cetrafs_inode_t *raw, u32 before)

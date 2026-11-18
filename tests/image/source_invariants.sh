@@ -1239,12 +1239,10 @@ file.c:cetrafs_write_new_leaf a-new-block,-unreachable-until-published
 file.c:cetrafs_write_new_index a-new-block,-unreachable-until-published
 file.c:cetrafs_tree_convert_inner the-editor,-under-invalidate_lock-exclusive
 file.c:cetrafs_tree_append_inner the-editor,-under-invalidate_lock-exclusive
-file.c:cetrafs_tree_leaves_if_half a-count-for-a-warning,-called-by-the-editors-under-invalidate_lock-exclusive
 file.c:cetrafs_tree_split_leaf the-editor,-under-invalidate_lock-exclusive-(asserted);-its-new-leaf-a-new-block
 file.c:cetrafs_tree_insert_any_leaf the-editor,-under-invalidate_lock-exclusive-(asserted)
 file.c:cetrafs_idx_insert_keep_last the-editor,-reads-only-after-cetrafs_bh_begin_update_crc-takes-the-buffer-lock
 file.c:cetrafs_tree_block_identity via-cetrafs_tree_identity
-file.c:cetrafs_tree_last_contig_lba a-placement-hint,-under-invalidate_lock-exclusive
 file.c:cetrafs_tree_patch the-editor,-under-invalidate_lock-exclusive-(asserted);-what-it-writes-new-blocks
 xattr.c:cetrafs_xattr_write_new its-own-new-block,-named-by-nothing
 leafdefer.c:cetrafs_deferred_settle_locked its-caller-holds-lock_buffer
@@ -2975,6 +2973,9 @@ fn != "" && !/^[[:space:]]*(\*|\/\*|\/\/)/ {
     # well; a _for variant choosing by its caller says "reader ?" first.
     if (line ~ /\.read = CETRAFS_TW_WRITER,/)
         print fn, "CETRAFS_TW_WRITER"
+    # ...and so is the last-path descent asked for a writer read.
+    if (line ~ /cetrafs_tree_last_node\([^;]*, false,/)
+        print fn, "cetrafs_tree_last_node"
 }' "$@" | sort -u | awk '$1 != $2 && $1 != $2 "_for"' | sort -u
 }
 C53_FOUND="$(c53_callers $(ls "$K"/*.c | grep -v '\.mod\.c$') | cut -d' ' -f1 | sort -u)"

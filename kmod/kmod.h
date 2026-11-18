@@ -770,6 +770,7 @@ enum cetrafs_tw_read {
 
 #define CETRAFS_TW_SKIP_UNREADABLE 0x1 /* an unreadable child is skipped, w->unknown set */
 #define CETRAFS_TW_SCRUB_KNOBS     0x2 /* the scrub walk's TEST ONLY leaf knobs apply */
+#define CETRAFS_TW_ONE             0x4 /* one child at a time, nothing allocated: a per-block point query */
 
 struct cetrafs_tw;
 struct cetrafs_tw_ops {
@@ -803,6 +804,8 @@ struct cetrafs_tw {
 };
 
 int cetrafs_tree_walk(struct cetrafs_tw *w, const cetrafs_inode_t *raw);
+struct buffer_head *cetrafs_tree_last_node(struct inode *inode, const cetrafs_inode_t *raw, int upto, bool reader,
+                                           u32 *counts);
 struct buffer_head *cetrafs_scrub_tree_bread(struct super_block *sb, u64 lba, u32 magic, bool fresh);
 
 /* ---- ioutil.c: the whole-block tail checksum ---- */
