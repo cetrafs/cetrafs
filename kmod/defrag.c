@@ -546,17 +546,9 @@ static u64 cetrafs_defrag_seg_end(const struct cetrafs_defrag_dst *d, u64 r)
     return g->first + g->count;
 }
 
-/* The next segment, from rank 'first', 'left' ranks still to place. The
- * span is published with the bits (cetrafs_alloc_pick_run_resv()). */
-static int cetrafs_defrag_dst_grow(struct super_block *sb, struct cetrafs_defrag_dst *d, u64 first, u64 left,
-                                   struct cetrafs_resv_span *span)
+/* Room for one more segment. */
+static int cetrafs_defrag_dst_room(struct cetrafs_defrag_dst *d)
 {
-    u64 want = left, base;
-    unsigned int cap = READ_ONCE(cetrafs_defrag_seg_max);
-    int ret;
-
-    if (cap && want > cap)
-        want = cap;
     if (d->n == d->cap) {
         u32 ncap = d->cap ? d->cap * 2 : 16;
         struct cetrafs_defrag_seg *ns = kvmalloc_array(ncap, sizeof(*ns), GFP_KERNEL);
@@ -569,6 +561,83 @@ static int cetrafs_defrag_dst_grow(struct super_block *sb, struct cetrafs_defrag
         d->seg = ns;
         d->cap = ncap;
     }
+    return 0;
+}
+
+/* TEST ONLY: every pass starts from the file's first block, as before --
+ * the control of tests/kernel/defrag_random_holes.sh. */
+static bool cetrafs_defrag_restart_from_zero;
+cetrafs_test_param(defrag_restart_from_zero, cetrafs_defrag_restart_from_zero, bool, 0644);
+MODULE_PARM_DESC(defrag_restart_from_zero, "TEST ONLY: a defrag pass re-moves the runs already in place");
+
+/*
+ * The file's leading runs already in place: from rank 0, each maximal
+ * physically contiguous run of at least CETRAFS_DEFRAG_SEG_MIN blocks --
+ * what a segment of this mover is -- entered into 'd' as a segment where
+ * it lies, so the pass starts after them. Returns the first rank not
+ * covered ('el' sorted, the caller's read).
+ *
+ * A pass stopped by a local open is handed back and judged again, and it
+ * used to start over from rank 0: it moved the run the stopped pass had
+ * just placed to a new place, and with the file opened every second (a
+ * monitor, a backup's stat, filefrag) no pass ever got past the first
+ * few seconds of the file (tests/kernel/defrag_random_holes.sh). The
+ * runs entered here are the file's as they stand: the commit republishes
+ * them unchanged (cetrafs_defrag_pieces() maps every rank through 'd'),
+ * the prefix check verifies them like any committed rank, and nothing
+ * frees them (a block is freed only where its source is not its
+ * destination).
+ */
+static int cetrafs_defrag_dst_placed(const struct cetrafs_ext_list *el, struct cetrafs_defrag_dst *d, u64 *out)
+{
+    u64 rank = 0;
+    u32 i = 0;
+    int ret;
+
+    *out = 0;
+    if (READ_ONCE(cetrafs_defrag_restart_from_zero) || READ_ONCE(cetrafs_defrag_extents_unsorted))
+        return 0;
+    while (i < el->count) {
+        u64 base = cetrafs_extent_phys_from_hilo(el->arr[i].ee_start_hi, el->arr[i].ee_start_lo);
+        u64 count = 0;
+
+        /* One run: each extent starting where the one before ended. */
+        for (; i < el->count; i++) {
+            u64 len = cetrafs_extent_len(el->arr[i].ee_len);
+
+            if (!len || cetrafs_extent_phys_from_hilo(el->arr[i].ee_start_hi, el->arr[i].ee_start_lo) != base + count)
+                break;
+            count += len;
+        }
+        if (count < CETRAFS_DEFRAG_SEG_MIN)
+            break;
+        ret = cetrafs_defrag_dst_room(d);
+        if (ret)
+            return ret;
+        d->seg[d->n].first = rank;
+        d->seg[d->n].base = base;
+        d->seg[d->n].count = count;
+        d->n++;
+        rank += count;
+    }
+    *out = rank;
+    return 0;
+}
+
+/* The next segment, from rank 'first', 'left' ranks still to place. The
+ * span is published with the bits (cetrafs_alloc_pick_run_resv()). */
+static int cetrafs_defrag_dst_grow(struct super_block *sb, struct cetrafs_defrag_dst *d, u64 first, u64 left,
+                                   struct cetrafs_resv_span *span)
+{
+    u64 want = left, base;
+    unsigned int cap = READ_ONCE(cetrafs_defrag_seg_max);
+    int ret;
+
+    if (cap && want > cap)
+        want = cap;
+    ret = cetrafs_defrag_dst_room(d);
+    if (ret)
+        return ret;
     for (;;) {
         ret = cetrafs_alloc_pick_run_resv(sb, want, &base, span);
         if (!ret)
@@ -861,7 +930,7 @@ int cetrafs_defrag_inode(struct inode *inode, struct cetrafs_defrag_stats *out_s
     sector_t *copy_lba; /* one step's source blocks, for the batched read (M1) */
     u32 *copy_off;      /* ...and each one's block offset from the step's start */
 #define raw (*rawp)
-    u64 nblocks, moved = 0;
+    u64 nblocks, moved = 0, placed;
     struct cetrafs_defrag_dst dst = {0};
     u64 *snapshot_rl = NULL;
     u32 snapshot_runs = 0;
@@ -959,7 +1028,16 @@ int cetrafs_defrag_inode(struct inode *inode, struct cetrafs_defrag_stats *out_s
      * return left the run's first blocks stealable for a scrub cycle
      * (322 of them, in a loaded full-gate run). The negative control
      * passes NULL and publishes nothing, same observable as before. */
-    ret = cetrafs_defrag_dst_grow(sb, &dst, 0, nblocks, cetrafs_defrag_skip_resv ? NULL : &dst_span);
+    /* The runs a stopped pass already placed stay where they are. */
+    ret = cetrafs_defrag_dst_placed(&el, &dst, &placed);
+    if (ret)
+        goto out_unlock;
+    if (placed == nblocks) {
+        ret = 0; /* every run is a segment already */
+        goto out_unlock;
+    }
+    moved = placed;
+    ret = cetrafs_defrag_dst_grow(sb, &dst, placed, nblocks - placed, cetrafs_defrag_skip_resv ? NULL : &dst_span);
     if (ret)
         goto out_unlock;
     have_dst = true;
@@ -1468,7 +1546,7 @@ int cetrafs_defrag_inode(struct inode *inode, struct cetrafs_defrag_stats *out_s
     /* One per run of mapped blocks (more where an extent's length cap or
      * a written/preallocated boundary splits one). */
     stats.extents_after = max_t(u64, snapshot_runs, CETRAFS_DIV_ROUND_UP(nblocks, (u64) CETRAFS_EXT_LEN_MASK));
-    stats.blocks_moved = nblocks;
+    stats.blocks_moved = nblocks - placed;
     ret = 0;
     goto out_done;
 

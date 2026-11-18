@@ -15,8 +15,13 @@
 # the extent count falls by an order of magnitude and the data reads back
 # byte-for-byte -- while the poll opens the file every second, each open
 # stopping the pass (a local stop is a cancel, not a peer's yield; control
-# defrag_local_stop_quiets=1). The control (defrag_extents_unsorted=1, the old read)
-# must leave the file near 16k extents for the same wait. fsck clean.
+# defrag_local_stop_quiets=1), and the next pass keeps the runs the
+# stopped one placed (control defrag_restart_from_zero=1). Every pass is slowed (defrag_step_delay_ms)
+# so that it outlasts the poll's interval: a fast box otherwise finishes
+# the whole file between two opens, and neither the fix nor the quiet
+# control ever meets a stop. The control (defrag_extents_unsorted=1, the
+# old read) must leave the file near 16k extents for the same wait. fsck
+# clean.
 set -euo pipefail
 trap 'echo "ABORT at line $LINENO: $BASH_COMMAND (rc=$?)" >&2' ERR
 . "$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)/lib/harness.sh"
@@ -32,12 +37,16 @@ ct_track mnt "$MNT"
 ct_mkfs "$DEV" -z 1 -b 512 -J 0 -N 1024 -f >/dev/null
 ct_param_set auto_defrag 1 # the harness turns it off for every suite
 ct_param_set sparse_unit_off 1 # the fragmented fill this heals: one extent per random first write
+# 128 steps of 128 blocks at 20 ms each: a pass takes at least 2.6 s, so
+# the once-a-second poll always opens the file in the middle of one.
+ct_param_set defrag_step_delay_ms 20
 ct_mount "$DEV" "$MNT"
 require_cetrafs_mount "$MNT"
 
 # extents <file>: the extent count, one line per extent
 # (-v: the summary line undercounts a file this fragmented)
 extents() { filefrag -v "$1" | grep -cE '^ *[0-9]+:'; }
+info() { sed -n "s/^$1: //p" "$(ct_procdir "$DEV")/info"; }
 
 # fill <file>: every block of a 64 MiB file, written once, in a random
 # order, through one open -- the pattern the janitor has to heal.
@@ -79,6 +88,7 @@ PY
 # ---------------------------------------------------- the trigger, the fix
 log "random 4 KiB writes into holes, then a bounded wait for the janitor"
 ct_param_set defrag_extents_unsorted 0
+P0="$(info defrag_passes)"
 fill "$MNT/rnd"
 E0="$(extents "$MNT/rnd")"
 # Setup: the fill really fragmented the file, or nothing below is measured.
@@ -96,6 +106,12 @@ done
 [ "$E1" -le $((E0 / 10)) ] &&
     pass "auto_defrag heals the random fill: $E0 -> $E1 extents (an order of magnitude)" ||
     fail "auto_defrag left $E1 extents from $E0 after 60 s (wanted at most $((E0 / 10)))"
+# The healing above has to have met a stop, or it says nothing about one:
+# a pass the poll never interrupted is one pass.
+NP=$(($(info defrag_passes) - P0))
+[ "$NP" -ge 2 ] &&
+    pass "setup: the poll's opens stopped the janitor and it resumed ($NP passes)" ||
+    fail "setup: one pass healed the file uninterrupted ($NP passes) -- no stop was met"
 [ "$(verify "$MNT/rnd")" = "BAD=0" ] &&
     pass "every block reads back its own bytes after the healing" ||
     fail "data changed under the defragmenter: $(verify "$MNT/rnd")"
@@ -119,6 +135,26 @@ done
     pass "control: quieted by the poll's opens, the fill stays at $EQ extents after 30 s" ||
     fail "control: quieted by local opens the fill still went to $EQ extents -- the suite does not reach the stop"
 ct_param_set defrag_local_stop_quiets 0
+
+# ------------------------------ the control: every pass starts from zero
+# Each stop hands the pass back, and the next one used to start over at
+# the file's first block -- moving again the run the stopped pass had
+# just placed, so a file opened every second never got healed past its
+# first few seconds (measured: 16,383 extents still 11,009 after 60 s).
+log "control: a pass that re-moves what the last one placed"
+ct_param_set defrag_restart_from_zero 1
+fill "$MNT/rnd-zero"
+EZ0="$(extents "$MNT/rnd-zero")"
+[ "$EZ0" -ge $((BLOCKS / 2)) ] || { fail "control setup: the fill left only $EZ0 extents"; ct_exit; }
+EZ="$EZ0"
+for _ in $(seq 1 30); do
+    sleep 1
+    EZ="$(extents "$MNT/rnd-zero")"
+done
+[ "$EZ" -ge $((BLOCKS / 2)) ] &&
+    pass "control: restarting from zero, the fill is still at $EZ extents after 30 s" ||
+    fail "control: restarting from zero the fill still went to $EZ extents -- the polls do not stop the passes"
+ct_param_set defrag_restart_from_zero 0
 
 # ----------------------------------------------------- the control: old trigger
 log "control: the old unsorted read leaves the fill fragmented"
