@@ -753,6 +753,58 @@ u64 cetrafs_journal_replay_applied_count(void);
 /* file.c: FS_IOC_FIEMAP, shared with dir.c's inode_operations table */
 int cetrafs_fiemap(struct inode *inode, struct fiemap_extent_info *fi, u64 start, u64 len);
 
+/* ---- extwalk.c: the one traversal of an extent tree ---- */
+/* How a walk reads its external blocks: the file's reader or writer trust
+ * rule (cetrafs_read_tree_bh_for()), or the scrub's, which has no inode. */
+enum cetrafs_tw_read {
+    CETRAFS_TW_READER,
+    CETRAFS_TW_WRITER,
+    CETRAFS_TW_SCRUB,       /* cached: a proposing pass */
+    CETRAFS_TW_SCRUB_FRESH, /* forced fresh, tail-checked: a deciding pass */
+};
+
+/* Hook answers. A negative errno aborts the walk with it. */
+#define CETRAFS_TW_DESCEND 0 /* read this child and walk it */
+#define CETRAFS_TW_STOP    1 /* end the walk; cetrafs_tree_walk() returns this */
+#define CETRAFS_TW_SKIP    2 /* leave this child unread */
+
+#define CETRAFS_TW_SKIP_UNREADABLE 0x1 /* an unreadable child is skipped, w->unknown set */
+#define CETRAFS_TW_SCRUB_KNOBS     0x2 /* the scrub walk's TEST ONLY leaf knobs apply */
+
+struct cetrafs_tw;
+struct cetrafs_tw_ops {
+    /* An index entry whose child is at 'level', under its node's buffer
+     * lock: decide only -- no I/O, no other buffer lock. Never asked of
+     * the record's root slots, whose ranges are not maintained. */
+    int (*want)(struct cetrafs_tw *w, const cetrafs_extent_idx_t *ie, int level);
+    /* A wanted child, outside every lock, before it is read: may act on
+     * it, or answer for it (CETRAFS_TW_SKIP leaves it unread). */
+    int (*child)(struct cetrafs_tw *w, const cetrafs_extent_idx_t *ie, int level);
+    /* A leaf's entries: under the leaf's buffer lock (lba 0 for the
+     * record's inline array, which has none). */
+    int (*leaf)(struct cetrafs_tw *w, const cetrafs_extent_t *arr, u32 n, u64 lba);
+    /* A child block once read and checked, before its entries are
+     * walked, outside every lock (a nonzero answer ends the walk). */
+    int (*node)(struct cetrafs_tw *w, struct buffer_head *bh, u64 lba, int level);
+    /* After a child's whole subtree, outside every lock; rd is its read's
+     * result (-EIO when it could not be read). */
+    int (*done)(struct cetrafs_tw *w, u64 lba, int level, int rd);
+};
+
+struct cetrafs_tw {
+    const struct cetrafs_tw_ops *ops;
+    struct inode *inode;     /* NULL for the scrub's reads */
+    struct super_block *sb;  /* filled from inode when NULL */
+    enum cetrafs_tw_read read;
+    unsigned int flags;
+    void *ctx;
+    bool unknown;            /* out: an unreadable subtree was skipped */
+    u64 nodes;               /* out: external blocks walked */
+};
+
+int cetrafs_tree_walk(struct cetrafs_tw *w, const cetrafs_inode_t *raw);
+struct buffer_head *cetrafs_scrub_tree_bread(struct super_block *sb, u64 lba, u32 magic, bool fresh);
+
 /* ---- ioutil.c: the whole-block tail checksum ---- */
 /* A torn read is a peer's write in flight: milliseconds on a LUN. The
  * budget is therefore measured in milliseconds -- 1, 2, 4 ... 128 ms
@@ -1045,10 +1097,9 @@ void cetrafs_free_inline_extents(struct inode *dir, const cetrafs_inode_t *raw);
  * readable before the number is handed back, or a failure there leaks
  * the blocks with nothing left naming them. */
 struct cetrafs_inode_extents {
-    struct buffer_head *leaf_bh; /* held for depth 1 (arr points into it); NULL otherwise */
-    cetrafs_extent_t *heap;      /* depth 2: a flattened copy, freed by _put; NULL otherwise */
-    const cetrafs_extent_t *arr;
-    u32 entries; /* u32: a depth-2 tree can hold far more than 65535 extents */
+    cetrafs_extent_t *heap;      /* an external tree's flattened copy, freed by _put; NULL inline */
+    const cetrafs_extent_t *arr; /* heap, or the record's inline array */
+    u32 entries; /* u32: a tree can hold far more than 65535 extents */
 };
 int cetrafs_inode_extents_get(struct inode *inode, const cetrafs_inode_t *raw, struct cetrafs_inode_extents *ex);
 void cetrafs_inode_extents_put(struct cetrafs_inode_extents *ex);

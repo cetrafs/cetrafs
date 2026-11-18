@@ -248,16 +248,13 @@ static void cetrafs_defrag_inode_unlock(struct inode *inode)
     inode_unlock(inode);
 }
 
-/* A file's extent list, read out of the inode (inline) or its one
- * external leaf. 'arr' is caller-allocated (CETRAFS_EXT_BLOCK_MAX_LEAVES
- * entries). */
+/* A file's extent list, read out of the inode (inline) or flattened from
+ * its tree. 'arr' is caller-allocated ('cap' entries). */
 struct cetrafs_ext_list {
     cetrafs_extent_t *arr;
     u32 count;
     u32 cap; /* entries the caller allocated arr for */
-    u16 depth;
     u64 nblocks;     /* total logical blocks covered */
-    u64 leaf_lba;    /* external leaf LBA if depth==1, else 0 */
     bool dense;      /* no interior holes: extent i starts where i-1 ended */
     bool has_uninit; /* any extent is preallocated-but-never-written */
     /* Which logical blocks are mapped, as runs: (start, length) pairs
@@ -356,42 +353,23 @@ static int cetrafs_defrag_read_extents(struct inode *inode, const cetrafs_inode_
     u32 i;
     u64 expect = 0;
 
-    el->depth = cetrafs_le16(raw->eh.eh_depth);
-    el->leaf_lba = 0;
-
     if (cetrafs_le16(raw->eh.eh_magic) != CETRAFS_EXT_MAGIC)
         return -EIO;
 
     if (cetrafs_le16(raw->eh.eh_depth) == 0) {
         el->count = min_t(u32, cetrafs_le16(raw->eh.eh_entries), 4);
         memcpy(el->arr, raw->et.leaf, el->count * sizeof(el->arr[0]));
-    } else if (cetrafs_le16(raw->eh.eh_depth) == 1) {
-        struct buffer_head *bh;
-        const cetrafs_extent_hdr_t *hdr;
-
-        el->leaf_lba = cetrafs_ei_child(&raw->et.idx[0]);
-        /* Through the tree reader, which reads fresh unless this node
-         * is the file's local writer, and checks the address. It was a
-         * plain cached read under "defrag pins the file's exclusive write
-         * lock, so no peer can be rewriting this leaf: cached is
-         * correct" -- true of the move, false of the cache: the pin
-         * stops a peer from writing NEXT, not from having written since
-         * this node cached the leaf. A peer that appended to it in place
-         * and closed left this node a leaf naming fewer extents; defrag
-         * rebuilt the file from it and published, and the peer's extents
-         * were gone (tests/kernel/defrag_fresh_leaf.sh). Depth 2 already
-         * went through cetrafs_tree_flatten(), which reads this way. */
-        bh = cetrafs_read_leaf_bh(inode, el->leaf_lba);
-        if (!bh)
-            return -EIO;
-        hdr = (const cetrafs_extent_hdr_t *) bh->b_data;
-        el->count = min_t(u32, cetrafs_le16(hdr->eh_entries), CETRAFS_EXT_BLOCK_MAX_LEAVES);
-        memcpy(el->arr, bh->b_data + sizeof(*hdr), el->count * sizeof(el->arr[0]));
-        brelse(bh);
     } else {
-        /* Depth 2 (v2): flatten the whole tree. Beyond the cap it is
-         * declined (not failed) -- the file works, it is just left
-         * fragmented rather than churned for many minutes. */
+        /* An external tree: flattened through the tree reader, which reads
+         * fresh unless this node is the file's local writer, and checks
+         * every address. A plain cached read here was a lost update: the
+         * pin stops a peer from writing NEXT, not from having written since
+         * this node cached the leaf, and a peer that appended in place and
+         * closed left this node a leaf naming fewer extents -- defrag then
+         * rebuilt the file from it and the peer's extents were gone
+         * (tests/kernel/defrag_fresh_leaf.sh). Beyond the cap the file is
+         * declined (not failed): it works, it is just left fragmented
+         * rather than churned for many minutes. */
         cetrafs_extent_t *flat = NULL;
         u32 n = 0;
         int fret = cetrafs_tree_flatten(inode, raw, &flat, &n);

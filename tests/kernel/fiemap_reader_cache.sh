@@ -42,7 +42,10 @@ require_cetrafs_mount "$MNT"
 ct_param_set auto_defrag 0
 ct_param_set read_trust_off 0
 LOOP="$(basename "$DEV")"
-dev_reads() { awk '{print $1}' "/sys/block/$LOOP/stat"; }
+# 4 KiB blocks read from the device: sectors, not requests -- a tree walk
+# reads a node's children as one batch (kmod/extwalk.c), and adjacent
+# blocks then merge into one request however many the walk read.
+dev_reads() { awk '{print int($3 / 8)}' "/sys/block/$LOOP/stat"; }
 
 N=6000
 python3 - "$MNT/frag" "$N" <<'PY'
@@ -115,7 +118,7 @@ close_reads() {
     sync
     python3 - "$MNT/frag" "/sys/block/$LOOP/stat" <<'PY'
 import os, sys
-st = lambda: int(open(sys.argv[2]).read().split()[0])
+st = lambda: int(open(sys.argv[2]).read().split()[2]) // 8  # 4 KiB blocks, as dev_reads
 fd = os.open(sys.argv[1], os.O_RDWR)
 while os.read(fd, 1 << 20):
     pass

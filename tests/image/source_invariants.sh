@@ -1243,24 +1243,18 @@ file.c:cetrafs_tree_leaves_if_half a-count-for-a-warning,-called-by-the-editors-
 file.c:cetrafs_tree_split_leaf the-editor,-under-invalidate_lock-exclusive-(asserted);-its-new-leaf-a-new-block
 file.c:cetrafs_tree_insert_any_leaf the-editor,-under-invalidate_lock-exclusive-(asserted)
 file.c:cetrafs_idx_insert_keep_last the-editor,-reads-only-after-cetrafs_bh_begin_update_crc-takes-the-buffer-lock
-file.c:cetrafs_inode_extents_get_for every-caller-holds-invalidate_lock-(fiemap/seek-shared),-or-the-file-is-being-evicted
-file.c:cetrafs_tree_identity headers-only,-every-caller-holds-invalidate_lock-(fiemap/seek-shared)-and-every-editor-exclusive
 file.c:cetrafs_tree_block_identity via-cetrafs_tree_identity
-file.c:cetrafs_tree_flatten_for via-cetrafs_inode_extents_get_for,-or-defrag-under-invalidate_lock-exclusive
-file.c:cetrafs_tree_extent_count_for do_allocate-exclusive;-close-after-the-last-writer;-the-defrag-worker-heuristic-only
 file.c:cetrafs_tree_last_contig_lba a-placement-hint,-under-invalidate_lock-exclusive
-file.c:cetrafs_tree_free_meta the-old-tree,-after-its-publish-and-under-invalidate_lock-exclusive
 file.c:cetrafs_tree_patch the-editor,-under-invalidate_lock-exclusive-(asserted);-what-it-writes-new-blocks
-file.c:cetrafs_tree_meta_set via-cetrafs_tree_free_meta_except,-whose-callers-hold-invalidate_lock-exclusive
-file.c:cetrafs_tree_meta_is_ours the-old-tree,-under-invalidate_lock-exclusive
-file.c:cetrafs_tree_invalidate_cached drop-only;-an-entry-torn-by-a-local-edit-names-a-block-current-in-the-cache
 xattr.c:cetrafs_xattr_write_new its-own-new-block,-named-by-nothing
 leafdefer.c:cetrafs_deferred_settle_locked its-caller-holds-lock_buffer
-defrag.c:cetrafs_defrag_read_extents under-invalidate_lock-exclusive-(cetrafs_defrag_inode_lock)
 "
 c27_scan() { # <dir>: prints file:function for every unlocked b_data user
     local f
-    for f in "$1"/file.c "$1"/xattr.c "$1"/leafdefer.c "$1"/defrag.c "$1"/planted.c; do
+    # extwalk.c: every walk of a tree reads its blocks there (R3) -- its
+    # entries under the buffer lock, a header's magic and depth (never
+    # edited in place) before it.
+    for f in "$1"/file.c "$1"/xattr.c "$1"/leafdefer.c "$1"/defrag.c "$1"/extwalk.c "$1"/planted.c; do
         [ -f "$f" ] || continue
         awk -v F="$(basename "$f")" '
             function out() { if (fn != "" && bd && !lk) print F ":" fn }
@@ -2461,7 +2455,8 @@ cetrafs_free_inline_extents prim:evict-s
 cetrafs_free_leaf_array prim:of-free_inline_extents
 cetrafs_leaf_array_punch prim:fallocate-s-punch
 cetrafs_leaf_array_trim prim:truncate-s
-cetrafs_tree_free_meta prim:its-callers-are-listed
+cetrafs_free_meta_child prim:a-hook-of-cetrafs_tree_free_meta-only,-whose-callers-are-listed
+cetrafs_free_meta_done prim:a-hook-of-cetrafs_tree_free_meta-only,-whose-callers-are-listed
 cetrafs_tree_free_meta_except prim:its-callers-are-listed
 cetrafs_alloc_data_run_resv own:a-run-it-just-took-back-on-failure
 cetrafs_trim_claim_next own:undoes-its-own-claim
@@ -2504,6 +2499,13 @@ line ~ ("(^|[^a-z0-9_])" P "\\(") && fn != P && fn != "" { print fn }' "$@"
     done | sort -u
 }
 C14D_FOUND="$(c14d_freers "$K"/*.c)"
+# The free hooks are primitives only while nothing but
+# cetrafs_tree_free_meta() walks with them.
+C14D_OPS="$(grep -n 'cetrafs_free_meta_ops' "$K"/file.c | grep -v 'static const struct cetrafs_tw_ops cetrafs_free_meta_ops' | cut -d: -f1)"
+C14D_OPSFN="$(for l in $C14D_OPS; do awk -v L="$l" 'NR <= L && /^[a-z_][a-z0-9_ *]*\(/ && $0 !~ /;$/ { fn = $0 } NR == L { sub(/\(.*/, "", fn); n = split(fn, a, " "); print a[n]; exit }' "$K"/file.c; done | sort -u)"
+[ "$C14D_OPSFN" = cetrafs_tree_free_meta ] &&
+    pass "class 14: the tree-free hooks are walked by cetrafs_tree_free_meta() alone" ||
+    fail "class 14: cetrafs_free_meta_ops is used by '$(echo $C14D_OPSFN)' -- its hooks are listed as cetrafs_tree_free_meta()'s alone"
 [ "$(grep -c . <<<"$C14D_FOUND")" -ge 20 ] || fail "class 14 (data): setup -- found only $(grep -c . <<<"$C14D_FOUND") freeing functions; the scan is not seeing the tree"
 C14D_NEW="$(comm -23 <(echo "$C14D_FOUND") <(cut -d' ' -f1 <<<"$C14D_REG" | sort -u))"
 C14D_GONE="$(comm -13 <(echo "$C14D_FOUND") <(cut -d' ' -f1 <<<"$C14D_REG" | sort -u))"
@@ -2716,7 +2718,8 @@ file.c:cetrafs_free_inline_extents:primitive
 file.c:cetrafs_free_leaf_array:primitive
 file.c:cetrafs_leaf_array_punch:primitive -- its do_free callers are checked
 file.c:cetrafs_leaf_array_trim:primitive -- its do_free callers are checked
-file.c:cetrafs_tree_free_meta:primitive -- its callers are checked
+file.c:cetrafs_free_meta_child:a hook of cetrafs_tree_free_meta only -- a primitive, its callers are checked
+file.c:cetrafs_free_meta_done:a hook of cetrafs_tree_free_meta only -- a primitive, its callers are checked
 file.c:cetrafs_tree_free_meta_except:primitive -- its callers are checked
 defrag.c:cetrafs_defrag_commit:inside its only caller'"'"'s bracket (cetrafs_defrag_inode)
 super_ops.c:cetrafs_evict_inode:the claimed dead record names every block until forget_tree (H1)
@@ -2854,7 +2857,7 @@ UH="$(unhandled_check "$K"/*.c)"
     fail "class 48: a caller of cetrafs_lba_run_check() never handles -EAGAIN: $(echo $UH)"
 # The boolean form folds "cannot tell" into "not data": only for callers
 # whose refusal decides nothing. A new one is a decision to review.
-BOOL_OK='file.c:cetrafs_scrub_tree_bread file.c:cetrafs_tree_invalidate_cached'
+BOOL_OK='extwalk.c:cetrafs_scrub_tree_bread file.c:cetrafs_inval_child'
 BC="$(fns_with 'cetrafs_lba_run_is_data[(]' "$K"/*.c | tr '\n' ' ' | sed 's/ $//')"
 [ "$BC" = "$BOOL_OK" ] && pass "class 48: the boolean address check is used only where 'not data' decides nothing" ||
     fail "class 48: cetrafs_lba_run_is_data() callers changed: '$BC' (reviewed: '$BOOL_OK') -- a caller that marks, drops or zeroes on 'not data' must use cetrafs_lba_run_check()"
@@ -2953,6 +2956,7 @@ cetrafs_tree_last_contig_lba writes:the-allocation-goal-of-a-write
 cetrafs_tree_meta_is_ours frees:decides-a-free
 cetrafs_tree_meta_set frees:decides-which-old-tree-blocks-go
 cetrafs_tree_patch writes:the-tree
+cetrafs_tree_range_mapped writes:the-unit-allocation-around-a-write-is-decided-by-it
 cetrafs_tree_split_leaf writes:the-tree
 __cetrafs_truncate_shrink frees:what-truncate-cuts
 cetrafs_zero_inplace_held writes:zeroes-and-converts-by-it'
@@ -2967,6 +2971,10 @@ fn != "" && !/^[[:space:]]*(\*|\/\*|\/\/)/ {
         print fn, substr(line, RSTART + 1, RLENGTH - 2)
         line = substr(line, RSTART + RLENGTH)
     }
+    # A tree walk (extwalk.c) that reads as a WRITER is a plain reader as
+    # well; a _for variant choosing by its caller says "reader ?" first.
+    if (line ~ /\.read = CETRAFS_TW_WRITER,/)
+        print fn, "CETRAFS_TW_WRITER"
 }' "$@" | sort -u | awk '$1 != $2 && $1 != $2 "_for"' | sort -u
 }
 C53_FOUND="$(c53_callers $(ls "$K"/*.c | grep -v '\.mod\.c$') | cut -d' ' -f1 | sort -u)"

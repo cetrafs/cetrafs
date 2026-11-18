@@ -21,6 +21,7 @@
 #include "cetrafs.h"
 #include "crc32c.h"
 #include "devutil.h"
+#include "extwalk.h"
 
 #define CETRAFS_ROOT_INO 1ULL
 
@@ -2725,6 +2726,119 @@ static int fsck_live_check(const char *dev)
     return 1;
 }
 
+/* --- one inode's extent tree, as reachability (userspace/extwalk.h) --- */
+struct fsck_walkctx {
+    int fd;
+    uint64_t ino;
+    const cetrafs_inode_t *in;
+    struct fsck_refctx *rc;
+    uint64_t *problems;
+    uint64_t *extents_seen;
+    int tree_ok;
+};
+
+static void fsck_walk_read(struct cetrafs_utw *w, uint64_t lba, uint8_t *blk)
+{
+    pread_all(((struct fsck_walkctx *) w->ctx)->fd, blk, CETRAFS_BLOCK_SIZE, (off_t) lba * CETRAFS_BLOCK_SIZE);
+}
+
+/* A block of the tree that cannot be walked. Every one of these leaves the
+ * blocks below it unmarked, so they read as leaked: -r is refused around
+ * them, except a torn leaf of a live file, which -r salvages later. */
+static int fsck_walk_bad(struct cetrafs_utw *w, uint64_t lba, int level, enum cetrafs_utw_bad why, const uint8_t *blk,
+                         uint64_t rlo, uint64_t rhi)
+{
+    struct fsck_walkctx *c = w->ctx;
+    const char *kind = level ? "index" : "leaf";
+
+    *c->problems += !fsck_dead_walk;
+    c->tree_ok = 0;
+    switch (why) {
+    case CETRAFS_UTW_RANGE:
+        fprintf(stderr, "%s: inode %" PRIu64 "'s extent %s (block %" PRIu64 ") is out of range\n", FSCK_SEV, c->ino, kind,
+                lba);
+        repair_block(level ? "an extent index lba is out of range, so the blocks the inode owns cannot be "
+                             "distinguished from leaked ones"
+                           : "an extent leaf lba is out of range, so the blocks the inode owns cannot be "
+                             "distinguished from leaked ones");
+        return 0;
+    case CETRAFS_UTW_TAIL:
+        fprintf(stderr, "%s: inode %" PRIu64 "'s extent %s (block %" PRIu64 ") failed its tail checksum\n", FSCK_SEV,
+                c->ino, kind, lba);
+        if (!level && fsck_salvage_candidate(c->in, blk)) {
+            /* Salvaged after the namespace pass; the rest of the tree is
+             * still walked, or its blocks would read as leaked. */
+            fsck_salvage_note(c->ino, lba, rlo, rhi);
+            fsck_mark_run(c->rc, lba, 1, c->ino); /* the leaf block itself */
+            c->tree_ok = 1;
+            return 1;
+        }
+        repair_block(level ? "an extent index failed its tail checksum, so the blocks the inode owns cannot be "
+                             "distinguished from leaked ones"
+                           : "an extent leaf failed its tail checksum, so the blocks the inode owns cannot be "
+                             "distinguished from leaked ones");
+        return 0;
+    case CETRAFS_UTW_DEPTH:
+        fprintf(stderr, "%s: inode %" PRIu64 "'s extent %s (block %" PRIu64 ") is not an extent block at depth %d\n",
+                FSCK_SEV, c->ino, kind, lba, level);
+        repair_block("an extent tree block is not what its parent names, so the blocks the inode owns cannot be "
+                     "distinguished from leaked ones");
+        return 0;
+    }
+    return 0;
+}
+
+/* The tree block itself is a data block too, and must be accounted for,
+ * or it reads as a leak. */
+static void fsck_walk_node(struct cetrafs_utw *w, uint64_t lba, int level)
+{
+    struct fsck_walkctx *c = w->ctx;
+
+    (void) level;
+    fsck_mark_run(c->rc, lba, 1, c->ino);
+}
+
+/* An empty index node is refused by the kernel's append (-EUCLEAN): a tree
+ * is only ever deepened with entries. And a count rotted to 0 hides the
+ * whole subtree from this walk: its blocks would read as leaked. */
+static void fsck_walk_empty(struct cetrafs_utw *w, uint64_t lba, int level)
+{
+    struct fsck_walkctx *c = w->ctx;
+
+    *c->problems += !fsck_dead_walk;
+    if (!lba) {
+        fprintf(stderr, "%s: inode %" PRIu64 " has a depth-%d extent tree with no entries\n", FSCK_SEV, c->ino, level);
+        repair_block("an extent tree claims no entries, so the blocks the inode owns cannot be distinguished from "
+                     "leaked ones");
+        return;
+    }
+    fprintf(stderr, "%s: inode %" PRIu64 "'s extent index (block %" PRIu64 ") has no entries\n", FSCK_SEV, c->ino, lba);
+    repair_block("an extent index claims no entries, so the blocks the inode owns cannot be distinguished from "
+                 "leaked ones");
+}
+
+static void fsck_walk_leaf(struct cetrafs_utw *w, const cetrafs_extent_t *arr, uint32_t n, uint64_t lba, uint64_t rlo,
+                           uint64_t rhi)
+{
+    struct fsck_walkctx *c = w->ctx;
+
+    (void) lba;
+    for (uint32_t e = 0; e < n; ++e) {
+        fsck_mark_run(c->rc, cetrafs_ee_pblk(&arr[e]), cetrafs_ee_len(&arr[e]), c->ino);
+        *c->problems += fsck_extent_logical(c->ino, &arr[e], rlo, rhi) && !fsck_dead_walk;
+        (*c->extents_seen)++;
+    }
+}
+
+static const struct cetrafs_utw_ops fsck_walk_ops = {
+    .read = fsck_walk_read,
+    .tail = fsck_check_tail,
+    .bad = fsck_walk_bad,
+    .node = fsck_walk_node,
+    .empty = fsck_walk_empty,
+    .leaf = fsck_walk_leaf,
+};
+
 int main(int argc, char **argv)
 {
     const char *dev = NULL;
@@ -4681,18 +4795,15 @@ int main(int argc, char **argv)
                 continue;
             }
 
-            /* Turn this inode's extent tree into reachability bits. The
-             * tree block itself (leaf, and at depth 2 the interiors) is a
-             * data block too and must be accounted for, or it reads as a
-             * leak. fsck_mark_run() is the shared depth-0 marking; the
-             * depth-2 walk reuses it per leaf. */
+            /* Turn this inode's extent tree into reachability bits: every
+             * extent, and every external tree block itself, through
+             * fsck_walk_ops. */
             fsck_nlruns = 0;
             fsck_cur_fmt = cetrafs_le32(in.mode) & 0170000u;
             struct fsck_refctx rc = {refd,      dupd, bg_data_start, bg_data_cnt,
                                      cetrafs_le32(sb.block_group_count), &problems, &blocks_referenced,
                                      weakd,     &stale_blocks};
             uint64_t xattr_lba = cetrafs_le64(in.xattr_block);
-            uint8_t leafblk[CETRAFS_BLOCK_SIZE];
             int tree_ok = 1;
 
             /* The record's inline count indexes a 4-slot array. Clamped
@@ -4707,172 +4818,22 @@ int main(int argc, char **argv)
                              "be distinguished from leaked ones");
             }
 
-            if (cetrafs_le16(in.eh.eh_depth) == 0) {
-                uint32_t n = cetrafs_le16(in.eh.eh_entries) > 4 ? 4 : cetrafs_le16(in.eh.eh_entries);
+            /* Depth 1 is one external leaf, named by root slot 0: the
+             * kernel reads that slot and refuses a record that claims more. */
+            if (cetrafs_le16(in.eh.eh_depth) == 1 && cetrafs_le16(in.eh.eh_entries) > 1) {
+                fprintf(stderr, "%s: inode %" PRIu64 " has a depth-1 extent tree with %u root entries; only one exists\n",
+                        FSCK_SEV, ino, cetrafs_le16(in.eh.eh_entries));
+                problems += !fsck_dead_walk;
+                repair_block("a depth-1 extent tree claims more than one leaf, so the blocks the inode owns cannot "
+                             "be distinguished from leaked ones");
+                continue;
+            }
+            {
+                struct fsck_walkctx wc = {fd, ino, &in, &rc, &problems, &extents_seen, 1};
+                struct cetrafs_utw w = {&fsck_walk_ops, cetrafs_le64(sb.total_blocks), &wc};
 
-                for (uint32_t e = 0; e < n; ++e) {
-                    uint64_t phys = cetrafs_ee_pblk(&in.et.leaf[e]);
-
-                    fsck_mark_run(&rc, phys, cetrafs_ee_len(&in.et.leaf[e]), ino);
-                    problems += fsck_extent_logical(ino, &in.et.leaf[e], 0, 0) && !fsck_dead_walk;
-                    extents_seen++;
-                }
-            } else if (cetrafs_le16(in.eh.eh_depth) == 1) {
-                uint64_t leaf_lba = cetrafs_ei_child(&in.et.idx[0]);
-                cetrafs_extent_hdr_t *lh;
-                uint32_t n;
-
-                if (!fsck_lba_in_range(leaf_lba, cetrafs_le64(sb.total_blocks))) {
-                    fprintf(stderr, "%s: inode %" PRIu64 "'s extent leaf (block %" PRIu64 ") is out of range\n",
-                            FSCK_SEV, ino, leaf_lba);
-                    problems += !fsck_dead_walk;
-                    repair_block("an extent leaf lba is out of range, so the blocks the inode "
-                                 "owns cannot be distinguished from leaked ones");
-                    tree_ok = 0;
-                } else if (pread_all(fd, leafblk, sizeof(leafblk), (off_t) leaf_lba * CETRAFS_BLOCK_SIZE),
-                           fsck_check_tail(leafblk, CETRAFS_LEAF_TAIL_MAGIC) != 0) {
-                    fprintf(stderr, "%s: inode %" PRIu64 "'s extent leaf (block %" PRIu64 ") failed its tail checksum\n",
-                            FSCK_SEV, ino, leaf_lba);
-                    problems += !fsck_dead_walk;
-                    if (fsck_salvage_candidate(&in, leafblk)) {
-                        /* No bound: a root slot's range is not maintained
-                         * (a depth-1 append never widens it), and bounding
-                         * the salvage by a stale one turned the file's
-                         * newest extents into holes
-                         * (tests/kernel/salvage_root_range.sh). */
-                        fsck_salvage_note(ino, leaf_lba, 0, 0);
-                        fsck_mark_run(&rc, leaf_lba, 1, ino); /* the leaf block itself */
-                    } else {
-                        repair_block("an extent leaf failed its tail checksum, so the blocks the inode "
-                                     "owns cannot be distinguished from leaked ones");
-                        tree_ok = 0;
-                    }
-                } else {
-                    lh = (cetrafs_extent_hdr_t *) leafblk;
-                    n = cetrafs_le16(lh->eh_entries) > CETRAFS_EXT_BLOCK_MAX_LEAVES ? CETRAFS_EXT_BLOCK_MAX_LEAVES : cetrafs_le16(lh->eh_entries);
-                    for (uint32_t e = 0; e < n; ++e) {
-                        const cetrafs_extent_t *x = (const cetrafs_extent_t *) (leafblk + sizeof(*lh)) + e;
-                        uint64_t phys = cetrafs_ee_pblk(x);
-
-                        fsck_mark_run(&rc, phys, cetrafs_ee_len(x), ino);
-                        problems += fsck_extent_logical(ino, x, 0, 0) && !fsck_dead_walk;
-                        extents_seen++;
-                    }
-                    fsck_mark_run(&rc, leaf_lba, 1, ino); /* the leaf block itself */
-                }
-            } else {
-                /* depth 2: interiors -> leaves -> extents */
-                uint8_t idxblk[CETRAFS_BLOCK_SIZE];
-                uint32_t ni = cetrafs_le16(in.eh.eh_entries) > 4 ? 4 : cetrafs_le16(in.eh.eh_entries);
-
-                /* An empty depth-2 node is refused by the kernel's append
-                 * (-EUCLEAN): a tree is only ever deepened with entries. */
-                if (ni == 0) {
-                    fprintf(stderr, "%s: inode %" PRIu64 " has a depth-2 extent tree with no entries\n", FSCK_SEV, ino);
-                    problems += !fsck_dead_walk;
-                    /* And a count rotted to 0 hides the whole tree from
-                     * this walk: its blocks would read as leaked. */
-                    repair_block("a depth-2 extent tree claims no entries, so the blocks the inode owns cannot be "
-                                 "distinguished from leaked ones");
-                }
-
-                for (uint32_t i = 0; i < ni && tree_ok; ++i) {
-                    uint64_t ilba = cetrafs_ei_child(&in.et.idx[i]);
-                    cetrafs_extent_hdr_t *ih;
-                    uint32_t iln;
-
-                    if (!fsck_lba_in_range(ilba, cetrafs_le64(sb.total_blocks))) {
-                        fprintf(stderr,
-                                "%s: inode %" PRIu64 "'s extent index (block %" PRIu64 ") is out of range\n",
-                                FSCK_SEV, ino, ilba);
-                        problems += !fsck_dead_walk;
-                        repair_block("an extent index lba is out of range, so the blocks the inode "
-                                     "owns cannot be distinguished from leaked ones");
-                        tree_ok = 0;
-                        break;
-                    }
-                    pread_all(fd, idxblk, sizeof(idxblk), (off_t) ilba * CETRAFS_BLOCK_SIZE);
-                    if (fsck_check_tail(idxblk, CETRAFS_INDEX_TAIL_MAGIC) != 0) {
-                        fprintf(stderr,
-                                "%s: inode %" PRIu64 "'s extent index (block %" PRIu64 ") failed its tail checksum\n",
-                                FSCK_SEV, ino, ilba);
-                        problems += !fsck_dead_walk;
-                        repair_block("an extent index failed its tail checksum, so the blocks the inode "
-                                     "owns cannot be distinguished from leaked ones");
-                        tree_ok = 0;
-                        break;
-                    }
-                    fsck_mark_run(&rc, ilba, 1, ino); /* the interior block itself */
-                    ih = (cetrafs_extent_hdr_t *) idxblk;
-                    iln = cetrafs_le16(ih->eh_entries) > CETRAFS_EXT_BLOCK_MAX_IDX ? CETRAFS_EXT_BLOCK_MAX_IDX : cetrafs_le16(ih->eh_entries);
-                    if (iln == 0) {
-                        fprintf(stderr, "%s: inode %" PRIu64 "'s extent index (block %" PRIu64 ") has no entries\n",
-                                FSCK_SEV, ino, ilba);
-                        problems += !fsck_dead_walk;
-                        repair_block("an extent index claims no entries, so the blocks the inode owns cannot be "
-                                     "distinguished from leaked ones");
-                    }
-
-                    for (uint32_t li = 0; li < iln && tree_ok; ++li) {
-                        const cetrafs_extent_idx_t *ie = (const cetrafs_extent_idx_t *) (idxblk + sizeof(*ih)) + li;
-                        uint64_t llba = cetrafs_ei_child(ie);
-                        cetrafs_extent_hdr_t *lh;
-                        uint32_t n;
-                        /* The range the interior entry bounds this leaf
-                         * by (end 0: none). Never the root slot's: a root
-                         * range is not maintained, and one that went
-                         * stale would cut live extents out of a salvage
-                         * (tests/kernel/salvage_root_range.sh). */
-                        uint64_t rlo = 0, rhi = 0;
-
-                        if (cetrafs_ei_end(ie)) {
-                            rlo = cetrafs_ei_lo(ie);
-                            rhi = cetrafs_ei_end(ie);
-                        }
-
-                        if (!fsck_lba_in_range(llba, cetrafs_le64(sb.total_blocks))) {
-                            fprintf(stderr,
-                                    "%s: inode %" PRIu64 "'s extent leaf (block %" PRIu64 ") is out of range\n",
-                                    FSCK_SEV, ino, llba);
-                            problems += !fsck_dead_walk;
-                            repair_block("an extent leaf lba is out of range, so the blocks the inode "
-                                         "owns cannot be distinguished from leaked ones");
-                            tree_ok = 0;
-                            break;
-                        }
-                        pread_all(fd, leafblk, sizeof(leafblk), (off_t) llba * CETRAFS_BLOCK_SIZE);
-                        if (fsck_check_tail(leafblk, CETRAFS_LEAF_TAIL_MAGIC) != 0) {
-                            fprintf(stderr,
-                                    "%s: inode %" PRIu64 "'s extent leaf (block %" PRIu64
-                                    ") failed its tail checksum\n",
-                                    FSCK_SEV, ino, llba);
-                            problems += !fsck_dead_walk;
-                            if (fsck_salvage_candidate(&in, leafblk)) {
-                                /* Salvaged after the namespace pass; the
-                                 * rest of the tree is still walked, or
-                                 * its blocks would read as leaked. */
-                                fsck_salvage_note(ino, llba, rlo, rhi);
-                                fsck_mark_run(&rc, llba, 1, ino);
-                                continue;
-                            }
-                            repair_block("an extent leaf failed its tail checksum, so the blocks the inode "
-                                         "owns cannot be distinguished from leaked ones");
-                            tree_ok = 0;
-                            break;
-                        }
-                        fsck_mark_run(&rc, llba, 1, ino); /* the leaf block itself */
-                        lh = (cetrafs_extent_hdr_t *) leafblk;
-                        n = cetrafs_le16(lh->eh_entries) > CETRAFS_EXT_BLOCK_MAX_LEAVES ? CETRAFS_EXT_BLOCK_MAX_LEAVES : cetrafs_le16(lh->eh_entries);
-                        for (uint32_t e = 0; e < n; ++e) {
-                            const cetrafs_extent_t *x = (const cetrafs_extent_t *) (leafblk + sizeof(*lh)) + e;
-                            uint64_t phys = cetrafs_ee_pblk(x);
-
-                            fsck_mark_run(&rc, phys, cetrafs_ee_len(x), ino);
-                            problems += fsck_extent_logical(ino, x, rlo, rhi) && !fsck_dead_walk;
-                            extents_seen++;
-                        }
-                    }
-                }
+                (void) cetrafs_utw_walk(&w, &in);
+                tree_ok = wc.tree_ok;
             }
 
             if (!tree_ok)
