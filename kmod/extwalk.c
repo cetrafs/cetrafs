@@ -430,54 +430,86 @@ int cetrafs_tree_walk(struct cetrafs_tw *w, const cetrafs_inode_t *raw)
     return ret;
 }
 
+void cetrafs_tpath_put(struct cetrafs_tpath *p)
+{
+    int l;
+
+    for (l = 0; l < CETRAFS_EXT_MAX_DEPTH; l++) {
+        brelse(p->bh[l]);
+        p->bh[l] = NULL;
+    }
+}
+
 /*
  * The tree's last path: from the record down each node's LAST entry to
- * the last node at level 'upto' (0: the last leaf, where an append lands). Depth-generic, with the walk's
- * rules: each block exactly one level below its parent, its count taken
- * under the buffer lock and clamped. counts[l] is the entry count of the
- * level-l node on the path (counts[depth] the record's); counts may be
- * NULL. Returns that node (the caller brelse()s it), or NULL for a tree
- * not deeper than 'upto', an empty node or anything unreadable or out of
- * place.
+ * the level-'upto' node (0: the last leaf, where an append lands).
+ * Depth-generic, with the walk's rules: each block exactly one level
+ * below its parent, its count taken under the buffer lock and clamped.
+ * p->bh[l] holds the path's node at each level from 'upto' up (the
+ * caller cetrafs_tpath_put()s it), p->n[l] its count, p->n[depth] the
+ * record's. -EIO for a block that could not be read; -EUCLEAN for a
+ * tree not deeper than 'upto', an empty interior or a block out of place.
  */
-struct buffer_head *cetrafs_tree_last_node(struct inode *inode, const cetrafs_inode_t *raw, int upto, bool reader,
-                                           u32 *counts)
+int cetrafs_tree_last_path(struct inode *inode, const cetrafs_inode_t *raw, int upto, bool reader,
+                           struct cetrafs_tpath *p)
 {
     int depth = cetrafs_le16(raw->eh.eh_depth), level;
     u32 n = min_t(u32, cetrafs_le16(raw->eh.eh_entries), ARRAY_SIZE(raw->et.idx));
     u64 lba;
 
-    if (cetrafs_le16(raw->eh.eh_magic) != CETRAFS_EXT_MAGIC || depth <= upto || upto < 0 || depth > CETRAFS_EXT_MAX_DEPTH || !n ||
-        (depth == 1 && n > 1))
-        return NULL;
-    if (counts)
-        counts[depth] = n;
+    memset(p, 0, sizeof(*p));
+    p->depth = depth;
+    if (cetrafs_le16(raw->eh.eh_magic) != CETRAFS_EXT_MAGIC || depth <= upto || upto < 0 ||
+        depth > CETRAFS_EXT_MAX_DEPTH || !n || (depth == 1 && n > 1))
+        return -EUCLEAN;
+    p->n[depth] = n;
     lba = cetrafs_ei_child(&raw->et.idx[n - 1]);
-    for (level = depth - 1;; level--) {
+    for (level = depth - 1; level >= upto; level--) {
         struct buffer_head *bh = cetrafs_read_tree_bh_for(inode, lba,
                                                           level ? CETRAFS_INDEX_TAIL_MAGIC : CETRAFS_LEAF_TAIL_MAGIC,
                                                           level ? "extent index" : "extent leaf", reader);
         const cetrafs_extent_hdr_t *h;
         u32 cap = level ? CETRAFS_EXT_BLOCK_MAX_IDX : CETRAFS_EXT_BLOCK_MAX_LEAVES;
 
-        if (!bh)
-            return NULL;
-        h = (const cetrafs_extent_hdr_t *) bh->b_data;
-        if (cetrafs_le16(h->eh_magic) != CETRAFS_EXT_MAGIC || cetrafs_le16(h->eh_depth) != level) {
-            brelse(bh);
-            return NULL;
+        if (!bh) {
+            cetrafs_tpath_put(p);
+            return -EIO;
         }
+        p->bh[level] = bh;
+        h = (const cetrafs_extent_hdr_t *) bh->b_data;
+        if (cetrafs_le16(h->eh_magic) != CETRAFS_EXT_MAGIC || cetrafs_le16(h->eh_depth) != level)
+            goto fail;
         cetrafs_bh_read_lock(bh);
         n = min_t(u32, cetrafs_le16(h->eh_entries), cap);
         if (level && n)
             lba = cetrafs_ei_child((const cetrafs_extent_idx_t *) (bh->b_data + sizeof(*h)) + n - 1);
         cetrafs_bh_read_unlock(bh);
-        if (counts)
-            counts[level] = n;
-        if (level == upto)
-            return bh;
-        brelse(bh);
-        if (!n)
-            return NULL;
+        p->n[level] = n;
+        if (level > upto && !n)
+            goto fail;
     }
+    return 0;
+fail:
+    cetrafs_tpath_put(p);
+    return -EUCLEAN;
+}
+
+/* The level-'upto' node of the last path (cetrafs_tree_last_path()), and
+ * the counts on the way (counts[l] for l from 'upto' to the depth). */
+struct buffer_head *cetrafs_tree_last_node(struct inode *inode, const cetrafs_inode_t *raw, int upto, bool reader,
+                                           u32 *counts)
+{
+    struct cetrafs_tpath p;
+    struct buffer_head *bh;
+    int l;
+
+    if (cetrafs_tree_last_path(inode, raw, upto, reader, &p))
+        return NULL;
+    if (counts)
+        for (l = upto; l <= p.depth; l++)
+            counts[l] = p.n[l];
+    bh = p.bh[upto];
+    p.bh[upto] = NULL;
+    cetrafs_tpath_put(&p);
+    return bh;
 }

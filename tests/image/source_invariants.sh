@@ -1235,10 +1235,11 @@ rm -rf "$C54G"
 # listed. Negative control: a planted unlocked reader.
 log "checking every unlocked reader of a cached tree or xattr block names why no in-place edit can tear it (class 27)"
 C27_ALLOW="
-file.c:cetrafs_write_new_leaf a-new-block,-unreachable-until-published
-file.c:cetrafs_write_new_index a-new-block,-unreachable-until-published
+file.c:cetrafs_write_new_node a-new-block,-unreachable-until-published
 file.c:cetrafs_tree_convert_inner the-editor,-under-invalidate_lock-exclusive
 file.c:cetrafs_tree_append_inner the-editor,-under-invalidate_lock-exclusive
+file.c:cetrafs_tpath_cover the-editor,-the-append's-path,-under-invalidate_lock-exclusive
+file.c:cetrafs_tpath_link the-editor,-the-append's-path,-under-invalidate_lock-exclusive
 file.c:cetrafs_tree_split_leaf the-editor,-under-invalidate_lock-exclusive-(asserted);-its-new-leaf-a-new-block
 file.c:cetrafs_tree_insert_any_leaf the-editor,-under-invalidate_lock-exclusive-(asserted)
 file.c:cetrafs_idx_insert_keep_last the-editor,-reads-only-after-cetrafs_bh_begin_update_crc-takes-the-buffer-lock
@@ -2308,7 +2309,7 @@ cetrafs_bmap_cas_mutate below:one-region-the-caller-tries-the-next
 cetrafs_inode_bitmap_cas_alloc final:every-inode-number-in-use-a-free-in-flight-holds-its-number-until-published
 cetrafs_leaf_array_insert final:a-full-leaf-the-caller-splits
 cetrafs_leaf_array_punch final:no-room-for-the-split-nothing-changed
-cetrafs_tree_append_inner final:the-extent-tree-is-full
+cetrafs_tpath_link final:the-extent-tree-is-full-at-its-maximum-depth
 cetrafs_tree_append_room final:the-extent-tree-is-full-asked-before-a-convert-edits-it
 cetrafs_tree_insert_any_leaf final:every-interior-and-every-leaf-full-under-invalidate_lock-exclusive
 cetrafs_tree_build final:the-extent-tree-is-full
@@ -2514,7 +2515,8 @@ cetrafs_mkdir_locked own:a-dirent-block-never-published
 cetrafs_do_allocate own:blocks-never-published-held-in-the-reservation-registry
 cetrafs_falloc_run_give_back_span own:the-unused-rest-of-a-fallocate-run-never-published
 __cetrafs_get_block own:a-block-never-published
-cetrafs_tree_append_inner own:a-leaf-or-index-never-published
+cetrafs_tree_append_inner own:a-leaf-never-published
+cetrafs_tpath_link own:a-node-or-child-never-named-freed-only-before-the-link
 cetrafs_tree_resv_fill own:a-tree-block-reserve-fill-nothing-references-given-back-before-its-reservation-is-unpublished
 cetrafs_xattr_write_new own:its-new-block-named-by-nothing-on-failure
 cetrafs_bg_release_one own:test-injection-release_noop_free-of-an-already-free-block
@@ -2776,7 +2778,8 @@ scrub.c:scrub_free_confirmed:the judge itself
 file.c:cetrafs_do_allocate:blocks never published, held in the reservation registry until given back (H2)
 file.c:cetrafs_falloc_run_give_back_span:the unused rest of a fallocate run, never published, held in the reservation registry until given back (H2)
 file.c:__cetrafs_get_block:a block it allocated and never published
-file.c:cetrafs_tree_append_inner:a leaf or index it allocated and never published
+file.c:cetrafs_tree_append_inner:a leaf it allocated and never published
+file.c:cetrafs_tpath_link:the nodes it allocated and the child, freed only before any node names them
 lock.c:cetrafs_tree_resv_fill:a reserve fill nothing references, given back before its reservation is unpublished
 xattr.c:cetrafs_xattr_write_new:its own new block, named by nothing
 xattr.c:cetrafs_xattr_set_locked:a new block its failed publish never named (the old block goes through cetrafs_xattr_swap_block'"'"'s bracket)
@@ -3025,8 +3028,8 @@ fn != "" && !/^[[:space:]]*(\*|\/\*|\/\/)/ {
     if (line ~ /\.read = CETRAFS_TW_WRITER,/)
         print fn, "CETRAFS_TW_WRITER"
     # ...and so is the last-path descent asked for a writer read.
-    if (line ~ /cetrafs_tree_last_node\([^;]*, false,/)
-        print fn, "cetrafs_tree_last_node"
+    if (line ~ /cetrafs_tree_last_(node|path)\([^;]*, false,/)
+        print fn, "cetrafs_tree_last_path"
 }' "$@" | sort -u | awk '$1 != $2 && $1 != $2 "_for"' | sort -u
 }
 C53_FOUND="$(c53_callers $(ls "$K"/*.c | grep -v '\.mod\.c$') | cut -d' ' -f1 | sort -u)"

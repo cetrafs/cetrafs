@@ -807,6 +807,16 @@ struct cetrafs_tw {
 };
 
 int cetrafs_tree_walk(struct cetrafs_tw *w, const cetrafs_inode_t *raw);
+
+/* A path down the tree: level 0 is the leaf, level 'depth' the record. */
+struct cetrafs_tpath {
+    int depth;                                     /* the tree's, as read from the record */
+    struct buffer_head *bh[CETRAFS_EXT_MAX_DEPTH]; /* bh[l]: the level-l node (NULL below 'upto') */
+    u32 n[CETRAFS_EXT_MAX_DEPTH + 1];              /* n[l]: its entry count, as read */
+};
+int cetrafs_tree_last_path(struct inode *inode, const cetrafs_inode_t *raw, int upto, bool reader,
+                           struct cetrafs_tpath *p);
+void cetrafs_tpath_put(struct cetrafs_tpath *p);
 struct buffer_head *cetrafs_tree_last_node(struct inode *inode, const cetrafs_inode_t *raw, int upto, bool reader,
                                            u32 *counts);
 struct buffer_head *cetrafs_scrub_tree_bread(struct super_block *sb, u64 lba, u32 magic, bool fresh);
