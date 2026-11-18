@@ -79,6 +79,28 @@ static int do_info(int fd)
      * golden this fuzzer had until mkgolden.sh learned to grow one. */
     printf("bg_table_next=%llu\n", U64(bg_table_next));
     printf("bg_table_first_count=%llu\n", U64(bg_table_first_count));
+    /* The bitmaps: every sector carries its own CRC, so a blind flip in
+     * one is refused as damage and never reaches the allocator; the
+     * field-aware arm mutates bits and restamps the sector ("bmap"). */
+    printf("inode_bmap_start=%llu\n", U64(inode_bmap_start));
+    printf("inode_bmap_blocks=%llu\n", U64(inode_bmap_blocks));
+    {
+        uint64_t first = le64toh(sb.bg_table_first_count);
+        uint64_t n = le32toh(sb.block_group_count);
+
+        if (first && first < n)
+            n = first;
+        for (uint64_t i = 0; i < n; i++) {
+            cetrafs_block_group_t bg;
+
+            if (read_at(fd, &bg, sizeof(bg), (off_t) ((le64toh(sb.bg_table_start) + i) * CETRAFS_BLOCK_SIZE)))
+                return 1;
+            printf("bg%llu_bmap=%llu\n", (unsigned long long) i,
+                   (unsigned long long) (le64toh(bg.start_block) + le32toh(bg.off_data_bmap)));
+            printf("bg%llu_bmap_blocks=%llu\n", (unsigned long long) i,
+                   (unsigned long long) (le32toh(bg.off_data_region) - le32toh(bg.off_data_bmap)));
+        }
+    }
 #undef U32
 #undef U64
     return 0;
@@ -439,6 +461,17 @@ static int plant_journal(int fd)
     return 0;
 }
 
+/* One bitmap block: every 512-byte sector's CRC trailer restamped. */
+static int stamp_bmap(int fd, off_t off)
+{
+    uint8_t blk[CETRAFS_BLOCK_SIZE];
+
+    if (read_at(fd, blk, sizeof(blk), off))
+        return 1;
+    cetrafs_bmap_stamp_us(blk, 1);
+    return write_at(fd, blk, sizeof(blk), off);
+}
+
 /* dirent / leaf / interior / xattr block: trailing {magic, crc} tail, crc
  * over the block's first CETRAFS_BLK_TAIL_OFF bytes. Both tail structs
  * share the layout (magic then crc, 8 bytes, at BLOCK-8); recompute crc,
@@ -495,6 +528,8 @@ int main(int argc, char **argv)
             rc = stamp_tail(fd, off);
         else if (strcmp(type, "journal") == 0)
             rc = stamp_journal(fd, off);
+        else if (strcmp(type, "bmap") == 0)
+            rc = stamp_bmap(fd, off);
         else {
             fprintf(stderr, "unknown type: %s\n", type);
             rc = 2;

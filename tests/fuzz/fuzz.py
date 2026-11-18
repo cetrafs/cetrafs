@@ -22,7 +22,9 @@ checksum is VALID and the mutation reaches the geometry/validation code
 instead of dying at the CRC -- which is exactly what a hostile image
 author would do. Deeper structures keep their own checksums as-is: raw
 mutations there test the checksum layers themselves plus everything
-unchecksummed (bitmaps, journal slot payloads vs their headers).
+unchecksummed (journal slot payloads vs their headers). Bitmaps carry a
+CRC per sector since 0x000A: a raw flip there is refused as damage, so
+the field-aware arm has a "bmap" target that mutates bits and restamps.
 """
 import os
 import random
@@ -262,6 +264,15 @@ def field_targets(restamp, golden, mode):
             guard += 1
     finally:
         os.close(fd2)
+
+    # The bitmaps, inode and data: a bit set over a free block, or clear
+    # under a live one, behind a valid sector CRC -- what only fsck can
+    # catch and the allocator must survive.
+    for k in range(g.get("inode_bmap_blocks", 0)):
+        t.append(("bmap", (g["inode_bmap_start"] + k) * B, 0, B))
+    for i in range(g["block_group_count"]):
+        for k in range(g.get("bg%d_bmap_blocks" % i, 0)):
+            t.append(("bmap", (g["bg%d_bmap" % i] + k) * B, 0, B))
 
     # Journal replay only runs at MOUNT, and only when a node's flag block is
     # DIRTY -- which the clean golden never is. For mount-fields the loop plants
