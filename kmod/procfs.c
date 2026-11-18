@@ -483,6 +483,8 @@ static int cetrafs_proc_info_show(struct seq_file *m, void *v)
     seq_printf(m, "open_peer_settled: %llu\n", cetrafs_open_peer_settled_count());
     seq_printf(m, "open_peer_waits: %llu\n", cetrafs_open_peer_waits_count());
     seq_printf(m, "alloc_trust_cold: %llu\n", cetrafs_alloc_trust_cold_count());
+    seq_printf(m, "peer_zeroed: %llu\n", cetrafs_peer_zeroed_count());
+    seq_printf(m, "punch_early_refusals: %llu\n", cetrafs_punch_early_refusal_count());
     seq_printf(m, "journal_replay_applied: %llu\n", cetrafs_journal_replay_applied_count());
     seq_printf(m, "journal_replay_skipped: %llu\n", cetrafs_journal_replay_skipped_count());
     /* Nonzero means replay caught an entry whose target another node had

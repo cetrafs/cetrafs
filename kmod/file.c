@@ -9230,63 +9230,84 @@ static bool cetrafs_zero_inplace_off;
 cetrafs_test_param(zero_inplace_off, cetrafs_zero_inplace_off, bool, 0644);
 MODULE_PARM_DESC(zero_inplace_off, "TEST ONLY: ZERO_RANGE punches and preallocates instead of zeroing in place");
 
-static long cetrafs_zero_range_inplace(struct file *file, loff_t offset, loff_t len, bool *out_mapped)
+/*
+ * A punch or ZERO_RANGE while a peer has the file open: the range is
+ * zeroed in place and nothing is freed or allocated, instead of the old
+ * EOPNOTSUPP refusal. Freeing is the hazard of a peer in the file -- its
+ * cached map may still name the blocks -- and zeroing blocks the file
+ * keeps is what write(2) does, which a peer in the file does not stop.
+ * The refusal answered qemu "not supported", and qemu stops asking: a
+ * guest's discards and write-zeroes were then dropped or written as
+ * zeros for the rest of that qemu process, including a VM left on the
+ * source by a cancelled migration. The price: space a guest gives back
+ * during the window stays the file's (docs/internal/TODO.md).
+ */
+static atomic64_t cetrafs_peer_zeroed = ATOMIC64_INIT(0);
+
+u64 cetrafs_peer_zeroed_count(void)
 {
-    struct inode *inode = file_inode(file);
+    return (u64) atomic64_read(&cetrafs_peer_zeroed);
+}
+
+/* TEST ONLY: refuse a punch or ZERO_RANGE of a file a peer has open
+ * with EOPNOTSUPP, as before -- the control of
+ * tests/kernel/punch_peer_zeroes.sh. */
+static bool cetrafs_peer_zero_refuse;
+cetrafs_test_param(peer_zero_refuse, cetrafs_peer_zero_refuse, bool, 0644);
+MODULE_PARM_DESC(peer_zero_refuse, "TEST ONLY: punch/ZERO_RANGE refuse a file a peer has open (EOPNOTSUPP), as before");
+
+/* Punches refused for a peer before the drain and the locks (procfs
+ * punch_early_refusals); TEST ONLY punch_precheck_off: decided under
+ * them only, as before. */
+static atomic64_t cetrafs_punch_early_refusals = ATOMIC64_INIT(0);
+
+u64 cetrafs_punch_early_refusal_count(void)
+{
+    return (u64) atomic64_read(&cetrafs_punch_early_refusals);
+}
+
+static bool cetrafs_punch_precheck_off;
+cetrafs_test_param(punch_precheck_off, cetrafs_punch_precheck_off, bool, 0644);
+MODULE_PARM_DESC(punch_precheck_off, "TEST ONLY: a punch refused for a peer drains I/O and locks the file first");
+
+/* Can a peer-open punch or ZERO_RANGE be answered by zeroing in place?
+ * Not on a device without WRITE ZEROES: a guest's fstrim would become
+ * gigabytes of written zeros -- refused there, as before. */
+static bool cetrafs_peer_zero_possible(struct super_block *sb)
+{
+    return !READ_ONCE(cetrafs_peer_zero_refuse) && !READ_ONCE(cetrafs_zero_inplace_off) && sb->s_bdev &&
+           bdev_write_zeroes_sectors(sb->s_bdev);
+}
+
+/*
+ * The zeroing half of cetrafs_zero_range_inplace(), for a caller that
+ * holds what it takes -- inode_lock, the direct-I/O drain,
+ * invalidate_lock exclusively -- and has passed the write gate: written
+ * blocks of the range zeroed by the device, preallocated ones and holes
+ * left (they read as zeros), the partial edge blocks zeroed through the
+ * page cache. The extent map is not touched and no block is freed.
+ * Also a punch's answer while a peer has the file open
+ * (cetrafs_fallocate()).
+ */
+static long cetrafs_zero_inplace_held(struct inode *inode, loff_t offset, loff_t len, cetrafs_inode_t *raw,
+                                      bool *out_mapped)
+{
     struct super_block *sb = inode->i_sb;
-    struct block_device *bdev = sb->s_bdev;
     struct cetrafs_inode_extents ex;
-    cetrafs_inode_t *raw = NULL;
     u64 start_block, end_block, mapped = 0, zeroed = 0;
     loff_t isize, end, head_end, tail_start;
     bool unmap;
-    u32 i, my_node_id;
-    int ret;
+    u32 i;
+    int ret = 0;
 
     *out_mapped = false;
-    if (READ_ONCE(cetrafs_zero_inplace_off) || !bdev_write_zeroes_sectors(bdev))
-        return -EOPNOTSUPP;
-    raw = kmalloc(sizeof(*raw), GFP_NOFS);
-    if (!raw)
-        return -ENOMEM;
-
-    inode_lock(inode);
-    ret = cetrafs_fallocate_modified(file);
-    if (ret) {
-        inode_unlock(inode);
-        kfree(raw);
-        return ret;
-    }
-    inode_dio_wait(inode); /* before invalidate_lock: a DIO completion takes it */
-    filemap_invalidate_lock(inode->i_mapping);
-    cetrafs_lock_expire_verdicts(inode);
-    ret = cetrafs_sb_is_fenced(sb) ? -EIO : cetrafs_lock_write_gate(inode);
-    if (ret)
-        goto out;
-    ret = cetrafs_sb_get_node_id(sb, &my_node_id);
-    if (ret)
-        goto out;
-    {
-        bool blocked = false, reader = false;
-
-        ret = cetrafs_lock_foreign_user_settled(inode, my_node_id, &blocked, &reader, NULL, NULL);
-        if (ret)
-            goto out;
-        if (blocked || reader) {
-            pr_warn_ratelimited("zero range: ino=%llu is open on another node -- refusing to zero it\n",
-                                (unsigned long long) inode->i_ino);
-            ret = -ETXTBSY; /* the caller makes it EOPNOTSUPP, as a punch's (A-12) */
-            goto out;
-        }
-    }
-
     isize = i_size_read(inode);
     end = offset + len;
     if (end > isize)
         end = isize; /* past EOF there is no data: the preallocation's part */
     if (end <= offset) {
         ret = 0;
-        goto out;
+        return ret;
     }
     start_block = CETRAFS_DIV_ROUND_UP((u64) offset, CETRAFS_BLOCK_SIZE);
     end_block = (u64) end / CETRAFS_BLOCK_SIZE;
@@ -9310,10 +9331,10 @@ static long cetrafs_zero_range_inplace(struct file *file, loff_t offset, loff_t 
 
         ret = cetrafs_read_raw_inode_overlaid(sb, inode, raw);
         if (ret)
-            goto out;
+            return ret;
         ret = cetrafs_inode_extents_get(inode, raw, &ex);
         if (ret)
-            goto out;
+            return ret;
         unmap = cetrafs_sb_discard_enabled(sb);
         for (i = 0; i < ex.entries && !ret; i++) {
             const cetrafs_extent_t *e = &ex.arr[i];
@@ -9351,7 +9372,7 @@ static long cetrafs_zero_range_inplace(struct file *file, loff_t offset, loff_t 
         cetrafs_inode_extents_put(&ex);
         atomic64_add(zeroed, &cetrafs_zero_inplace_blocks);
         if (ret)
-            goto out;
+            return ret;
     }
 
     /*
@@ -9373,6 +9394,65 @@ static long cetrafs_zero_range_inplace(struct file *file, loff_t offset, loff_t 
         mark_inode_dirty(inode);
         *out_mapped = (u64) offset + (u64) len <= (u64) isize && mapped == end_block - min(start_block, end_block);
     }
+    return ret;
+}
+
+static long cetrafs_zero_range_inplace(struct file *file, loff_t offset, loff_t len, bool *out_mapped,
+                                       bool *out_peer)
+{
+    struct inode *inode = file_inode(file);
+    struct super_block *sb = inode->i_sb;
+    struct block_device *bdev = sb->s_bdev;
+    cetrafs_inode_t *raw = NULL;
+    u32 my_node_id;
+    int ret;
+
+    *out_mapped = false;
+    *out_peer = false;
+    if (READ_ONCE(cetrafs_zero_inplace_off) || !bdev_write_zeroes_sectors(bdev))
+        return -EOPNOTSUPP;
+    raw = kmalloc(sizeof(*raw), GFP_NOFS);
+    if (!raw)
+        return -ENOMEM;
+
+    inode_lock(inode);
+    ret = cetrafs_fallocate_modified(file);
+    if (ret) {
+        inode_unlock(inode);
+        kfree(raw);
+        return ret;
+    }
+    inode_dio_wait(inode); /* before invalidate_lock: a DIO completion takes it */
+    filemap_invalidate_lock(inode->i_mapping);
+    cetrafs_lock_expire_verdicts(inode);
+    ret = cetrafs_sb_is_fenced(sb) ? -EIO : cetrafs_lock_write_gate(inode);
+    if (ret)
+        goto out;
+    ret = cetrafs_sb_get_node_id(sb, &my_node_id);
+    if (ret)
+        goto out;
+    {
+        bool blocked = false, reader = false;
+
+        ret = cetrafs_lock_foreign_user_settled(inode, my_node_id, &blocked, &reader, NULL, NULL);
+        if (ret)
+            goto out;
+        /* As the punch: only a peer that is IN the file, holding no
+         * lock on it, is zeroed past (cetrafs_peer_zero_possible()). */
+        if (blocked || (reader && !cetrafs_peer_zero_possible(sb))) {
+            pr_warn_ratelimited("zero range: ino=%llu is open on another node -- refusing to zero it\n",
+                                (unsigned long long) inode->i_ino);
+            ret = -ETXTBSY; /* the caller makes it EOPNOTSUPP, as a punch's (A-12) */
+            goto out;
+        }
+        /* Zeroed in place all the same: blocks the file keeps, as a
+         * write would (cetrafs_peer_zero_possible()). */
+        *out_peer = reader;
+    }
+
+    ret = cetrafs_zero_inplace_held(inode, offset, len, raw, out_mapped);
+    if (!ret && *out_peer)
+        atomic64_inc(&cetrafs_peer_zeroed);
 out:
     filemap_invalidate_unlock(inode->i_mapping);
     inode_unlock(inode);
@@ -9445,20 +9525,28 @@ static long cetrafs_fallocate(struct file *file, int mode, loff_t offset, loff_t
      * qemu's write-zeroes uses this; without it qemu wrote the zeroes.
      */
     if (mode == FALLOC_FL_ZERO_RANGE || mode == (FALLOC_FL_ZERO_RANGE | FALLOC_FL_KEEP_SIZE)) {
-        bool mapped = false;
+        bool mapped = false, peer = false;
         long zrc;
 
         kfree(recs);
-        zrc = cetrafs_zero_range_inplace(file, offset, len, &mapped);
+        zrc = cetrafs_zero_range_inplace(file, offset, len, &mapped, &peer);
         if (zrc == -EOPNOTSUPP)
             zrc = cetrafs_fallocate(file, FALLOC_FL_PUNCH_HOLE | FALLOC_FL_KEEP_SIZE, offset, len);
         else if (!zrc && mapped)
             return 0;
+        /* A peer has the file open: its holes inside i_size read as
+         * zeros already, and the preallocation would rewrite the map
+         * under the peer -- refused below. Only a range that must grow
+         * the file still goes on to that refusal. */
+        else if (!zrc && peer && ((mode & FALLOC_FL_KEEP_SIZE) || offset + len <= i_size_read(inode)))
+            return 0;
         if (!zrc)
             zrc = cetrafs_fallocate(file, mode & FALLOC_FL_KEEP_SIZE, offset, len);
-        /* A peer has the file open (any of the steps): EOPNOTSUPP, so
-         * qemu writes the zeroes itself rather than failing the guest's
-         * request -- see the punch's refusal (audit 2026-11-14 A-12). */
+        /* A peer has the file open and a step could not go on past it
+         * (its lock held, no WRITE ZEROES, or a range that must grow the
+         * file): EOPNOTSUPP, so qemu writes the zeroes itself rather than
+         * failing the guest's request -- see the punch's refusal (audit
+         * 2026-11-14 A-12). */
         if (zrc == -ETXTBSY)
             zrc = -EOPNOTSUPP;
         return zrc;
@@ -9538,6 +9626,28 @@ static long cetrafs_fallocate(struct file *file, int mode, loff_t offset, loff_t
         return -EOPNOTSUPP;
     }
 
+    /*
+     * Where a peer in the file means a refusal (no WRITE ZEROES to zero
+     * it in place instead), say so BEFORE the drain and the locks below:
+     * they stall every other I/O on the file, and a guest discarding
+     * through a migration paid that per discard only to be refused.
+     * Refusing early is the safe direction; a "nobody" here is judged
+     * again under the locks, where it decides.
+     */
+    if (!cetrafs_peer_zero_possible(sb) && !READ_ONCE(cetrafs_punch_precheck_off)) {
+        bool blocked = false, reader = false;
+        u32 me;
+
+        if (!cetrafs_sb_get_node_id(sb, &me) &&
+            !cetrafs_lock_foreign_user_settled(inode, me, &blocked, &reader, NULL, NULL) && (blocked || reader)) {
+            pr_warn_ratelimited("punch: ino=%llu is open on another node -- refusing to free its blocks\n",
+                                (unsigned long long) inode->i_ino);
+            atomic64_inc(&cetrafs_punch_early_refusals);
+            kfree(recs);
+            return -EOPNOTSUPP;
+        }
+    }
+
     inode_lock(inode);
     ret = cetrafs_fallocate_modified(file);
     if (ret) {
@@ -9598,10 +9708,27 @@ static long cetrafs_fallocate(struct file *file, int mode, loff_t offset, loff_t
             ret = cetrafs_lock_foreign_user_settled(inode, my_node_id, &blocked, &reader, NULL, NULL);
             if (ret)
                 goto out;
+            /* Only a peer that is IN the file: one holding its lock (an
+             * exclusive claim, a flock, its mover's pin) is refused as
+             * before -- zeros written under a move are copied away. */
+            if (reader && !blocked && cetrafs_peer_zero_possible(sb)) {
+                bool m;
+
+                /* Zeroed, not freed: the range reads as zeros, the map
+                 * the peer may hold stays true (cetrafs_peer_zeroed). */
+                ret = cetrafs_zero_inplace_held(inode, offset, len, &raw, &m);
+                if (!ret)
+                    atomic64_inc(&cetrafs_peer_zeroed);
+                goto out;
+            }
             if (blocked || reader) {
                 pr_warn_ratelimited("punch: ino=%llu is open on another node -- refusing to free its blocks\n",
                                     (unsigned long long) inode->i_ino);
                 /*
+                 * Reached only where the range cannot be zeroed instead
+                 * (above): a peer holding the file's lock, or a device
+                 * without WRITE ZEROES.
+                 *
                  * EOPNOTSUPP, not ETXTBSY. A punch is how a guest's
                  * discard and write-zeroes reach the image, and during a
                  * live migration under nofilelock the destination holds

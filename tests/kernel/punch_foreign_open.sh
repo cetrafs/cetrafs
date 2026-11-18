@@ -20,6 +20,11 @@
 # migration destination holds the image open; a discard is then skipped
 # and write-zeroes written as zeroes). ZERO_RANGE likewise.
 #
+# Where the device can zero in place, a punch with a peer in the file
+# is now answered by zeroing, freeing nothing (punch_peer_zeroes.sh);
+# the refusal is what is left where it cannot, which zero_inplace_off
+# stands for here.
+#
 # Discrimination: remove the check from cetrafs_fallocate()'s punch
 # branch and the first assertion fails -- the punch succeeds and the
 # blocks go back to the allocator while a peer still references them.
@@ -35,6 +40,7 @@ DEV="$(ct_loop "$IMG")"
 MNT="$(ct_mnt punchforeign)"
 ct_mkfs_small "$DEV" >/dev/null
 ct_track mnt "$MNT"
+ct_param_set zero_inplace_off 1 # no WRITE ZEROES: the punch's answer is the refusal
 ct_mount "$DEV" "$MNT"
 require_cetrafs_mount "$MNT"
 

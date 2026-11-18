@@ -1691,6 +1691,8 @@ zonegroup.c:cetrafs_bg_release_empty:log only
 zonegroup.c:cetrafs_zg_try_claim_one:acts (counts a claim) only on success
 zonegroup.c:cetrafs_bg_data_block_stats:fast-path pick; an error falls to the full scan
 file.c:cetrafs_pending_next:an in-memory lookup; nonzero only means nothing pending
+file.c:cetrafs_sb_get_node_id:early refusal of a punch; an error falls to the check under the locks, which decides
+file.c:cetrafs_lock_foreign_user_settled:early refusal of a punch; an error falls to the check under the locks, which decides
 inode.c:cetrafs_node_get_entry:acts (judges the create gone) only on success; an error keeps the record
 ioutil.c:cetrafs_journal_node_is_dirty:true branch excuses a tear; an error counts it as damage, the strict answer
 node.c:cetrafs_node_entry_blank:returns bool, not an error'
@@ -2936,7 +2938,7 @@ cetrafs_tree_meta_set frees:decides-which-old-tree-blocks-go
 cetrafs_tree_patch writes:the-tree
 cetrafs_tree_split_leaf writes:the-tree
 __cetrafs_truncate_shrink frees:what-truncate-cuts
-cetrafs_zero_range_inplace writes:zeroes-and-converts-by-it'
+cetrafs_zero_inplace_held writes:zeroes-and-converts-by-it'
 c53_callers() { # <files...>: "<function> <plain reader>" per call site
     awk '
 /^[a-z][a-z0-9_ *]*[ *]_*cetrafs_[a-z0-9_]+\(/ { match($0, /_*cetrafs_[a-z0-9_]+\(/); sig = substr($0, RSTART, RLENGTH - 1) }
