@@ -36,7 +36,10 @@ IPOKE="$(ct_helper inode_block_poke)"
 # a 2 GiB test box under memory pressure wrote the file back mid-window,
 # which publishes its record -- after that even the no-overlay scrub sees
 # the blocks referenced and the control "fails" for a reason that has
-# nothing to do with the overlay. The setup check below catches it.
+# nothing to do with the overlay. The setup checks below catch it, at
+# both ends of the window: a box short of memory whose image sits on a
+# disk-backed filesystem (the loop's own writes count as dirty there)
+# publishes the 31 MiB file mid-window as well.
 BLOCKS=8000
 HOLD=25      # the write, then comfortably more than two cycles of the fast scrub
 
@@ -98,6 +101,16 @@ run_probe() {
     wait_for 40 '[ "$(( $(sed -n "s/^scrub_cycles: //p" "'"$PROC"'/info") - '"$c0"' ))" -ge 2 ]' ||
         log "note: fewer than two cycles elapsed"
     got=$(($(reclaimed) - r0))
+    # And still so once the cycles are in: published mid-window (writeback
+    # under memory pressure), the record names the blocks and either arm
+    # is then right to keep them -- a "nothing reclaimed" measures nothing.
+    ondisk="$("$IPOKE" "$DEV" extents "$(stat -c '%i' "$MNT/live")" 2>&1 | head -1)"
+    local published=0
+    case "$ondisk" in
+        *" entries=0 "*) ;;
+        *) published=1
+           fail "$label: setup: the file was published during the window ($ondisk) -- writeback reached it, so nothing was measured" ;;
+    esac
     wait "$pid" && rc=0 || rc=$?
     ct_param_set scrub 0
     ct_param_set scrub_ignore_alloc_seq 0
@@ -108,7 +121,9 @@ run_probe() {
     [ "$(($(cycles) - c0))" -ge 2 ] ||
         fail "$label: the scrub ran fewer than two cycles -- this measures nothing"
 
-    if [ "$expect" = "no" ]; then
+    if [ "$published" = 1 ]; then
+        :
+    elif [ "$expect" = "no" ]; then
         [ "$got" = 0 ] &&
             pass "the scrub reclaimed nothing from a file whose extents are only in the shadow" ||
             fail "the scrub reclaimed $got block(s) of a live file -- they are the allocator's to hand out now"
