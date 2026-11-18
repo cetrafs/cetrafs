@@ -4676,13 +4676,12 @@ int main(int argc, char **argv)
                             FSCK_SEV, ino, leaf_lba);
                     problems += !fsck_dead_walk;
                     if (fsck_salvage_candidate(&in, leafblk)) {
-                        uint64_t rlo = 0, rhi = 0;
-
-                        if (cetrafs_le32(in.et.idx[0].ei_block_end)) {
-                            rlo = cetrafs_le32(in.et.idx[0].ei_block);
-                            rhi = cetrafs_le32(in.et.idx[0].ei_block_end);
-                        }
-                        fsck_salvage_note(ino, leaf_lba, rlo, rhi);
+                        /* No bound: a root slot's range is not maintained
+                         * (a depth-1 append never widens it), and bounding
+                         * the salvage by a stale one turned the file's
+                         * newest extents into holes
+                         * (tests/kernel/salvage_root_range.sh). */
+                        fsck_salvage_note(ino, leaf_lba, 0, 0);
                         fsck_mark_run(&rc, leaf_lba, 1, ino); /* the leaf block itself */
                     } else {
                         repair_block("an extent leaf failed its tail checksum, so the blocks the inode "
@@ -4760,21 +4759,16 @@ int main(int argc, char **argv)
                         uint64_t llba = ((uint64_t) cetrafs_le16(ie->ei_leaf_hi) << 32) | cetrafs_le32(ie->ei_leaf_lo);
                         cetrafs_extent_hdr_t *lh;
                         uint32_t n;
-                        /* The narrowest range the lookup filters this
-                         * leaf by: the root slot's and the interior
-                         * entry's (cetrafs_idx_may_hold(); end 0 means
-                         * no filter). */
+                        /* The range the interior entry bounds this leaf
+                         * by (end 0: none). Never the root slot's: a root
+                         * range is not maintained, and one that went
+                         * stale would cut live extents out of a salvage
+                         * (tests/kernel/salvage_root_range.sh). */
                         uint64_t rlo = 0, rhi = 0;
 
-                        if (cetrafs_le32(in.et.idx[i].ei_block_end)) {
-                            rlo = cetrafs_le32(in.et.idx[i].ei_block);
-                            rhi = cetrafs_le32(in.et.idx[i].ei_block_end);
-                        }
                         if (cetrafs_le32(ie->ei_block_end)) {
-                            if (!rhi || cetrafs_le32(ie->ei_block) > rlo)
-                                rlo = cetrafs_le32(ie->ei_block);
-                            if (!rhi || cetrafs_le32(ie->ei_block_end) < rhi)
-                                rhi = cetrafs_le32(ie->ei_block_end);
+                            rlo = cetrafs_le32(ie->ei_block);
+                            rhi = cetrafs_le32(ie->ei_block_end);
                         }
 
                         if (!fsck_lba_in_range(llba, cetrafs_le64(sb.total_blocks))) {

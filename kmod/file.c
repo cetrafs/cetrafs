@@ -4691,12 +4691,10 @@ int cetrafs_tree_build(struct inode *inode, const cetrafs_extent_t *flat, u32 n,
             raw->eh.eh_depth = cetrafs_cpu_to_le16(1);
             raw->eh.eh_entries = cetrafs_cpu_to_le16(1);
             raw->eh.eh_max = cetrafs_cpu_to_le16(ARRAY_SIZE(raw->et.idx));
-            {
-                u32 lo, hi;
-
-                cetrafs_leaf_array_range(flat, (u16) n, &lo, &hi);
-                cetrafs_idx_set(&raw->et.idx[0], lo, hi, lba);
-            }
+            /* Unknown, as every root slot is: a depth-1 append never
+             * widens it, so a real range here goes stale with the first
+             * extent added past it (tests/kernel/salvage_root_range.sh). */
+            cetrafs_idx_set(&raw->et.idx[0], 0, 0, lba);
             *out_meta = 1;
             return 0;
         }

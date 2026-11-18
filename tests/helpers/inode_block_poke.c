@@ -414,6 +414,30 @@ int main(int argc, char **argv)
         cetrafs_inode_stamp_crcs_us(&rec);
         pwrite_all(fd, &rec, sizeof(rec), rec_off);
         fprintf(stderr, "inode_block_poke: ino %llu extent %u %s -> %u\n", (unsigned long long) ino, i, argv[5], v);
+    } else if (strcmp(mode, "rootrange") == 0 && (argc == 5 || argc == 7)) {
+        /* Root slot <s>: print "lo=<lo> end=<end> child=<lba>", or set its
+         * range to [lo, end) with the record's checksums restamped. */
+        cetrafs_inode_t rec;
+        unsigned slot = (unsigned) strtoul(argv[4], NULL, 0);
+
+        pread_all(fd, &rec, sizeof(rec), rec_off);
+        if (!cetrafs_le16(rec.eh.eh_depth) || slot >= 4) {
+            fprintf(stderr, "rootrange: ino %llu has no root index slot %u\n", (unsigned long long) ino, slot);
+            return 1;
+        }
+        if (argc == 5) {
+            printf("lo=%u end=%u child=%llu\n", cetrafs_le32(rec.et.idx[slot].ei_block),
+                   cetrafs_le32(rec.et.idx[slot].ei_block_end),
+                   (unsigned long long) cetrafs_extent_phys_from_hilo(rec.et.idx[slot].ei_leaf_hi,
+                                                                      rec.et.idx[slot].ei_leaf_lo));
+            return 0;
+        }
+        rec.et.idx[slot].ei_block = cetrafs_cpu_to_le32((uint32_t) strtoul(argv[5], NULL, 0));
+        rec.et.idx[slot].ei_block_end = cetrafs_cpu_to_le32((uint32_t) strtoul(argv[6], NULL, 0));
+        cetrafs_inode_stamp_crcs_us(&rec);
+        pwrite_all(fd, &rec, sizeof(rec), rec_off);
+        fprintf(stderr, "inode_block_poke: ino %llu root slot %u range -> [%s,%s)\n", (unsigned long long) ino, slot,
+                argv[5], argv[6]);
     } else if (strcmp(mode, "idxrange") == 0 && argc == 7) {
         /* Depth 2: set interior entry <e> (under root slot 0) to cover
          * [lo, hi), tail checksum restamped. */
