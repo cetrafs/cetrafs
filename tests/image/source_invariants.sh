@@ -1246,7 +1246,7 @@ file.c:cetrafs_tree_split_leaf the-editor,-under-invalidate_lock-exclusive-(asse
 file.c:cetrafs_tree_insert_any_leaf the-editor,-under-invalidate_lock-exclusive-(asserted)
 file.c:cetrafs_idx_insert_keep_last the-editor,-reads-only-after-cetrafs_bh_begin_update_crc-takes-the-buffer-lock
 file.c:cetrafs_tree_block_identity via-cetrafs_tree_identity
-file.c:cetrafs_tree_patch the-editor,-under-invalidate_lock-exclusive-(asserted);-what-it-writes-new-blocks
+file.c:cetrafs_patch_open the-editor,-under-invalidate_lock-exclusive-(asserted-in-cetrafs_tree_patch,-its-only-entry);-what-it-writes-new-blocks
 xattr.c:cetrafs_xattr_write_new its-own-new-block,-named-by-nothing
 leafdefer.c:cetrafs_deferred_settle_locked its-caller-holds-lock_buffer
 "
@@ -2525,6 +2525,7 @@ cetrafs_bg_release_one own:test-injection-release_noop_free-of-an-already-free-b
 cetrafs_tree_split_leaf own:a-new-leaf-whose-write-failed-before-any-interior-names-it
 cetrafs_tree_build own:a-tree-never-published
 cetrafs_tree_patch own:leaves-and-interiors-it-wrote-and-never-published
+cetrafs_patch_open own:punches-its-own-copy-of-a-leaf-with-do_free-false-nothing-is-freed
 cetrafs_inode_set_reservation own:a-reservation-run-never-published
 cetrafs_inode_drop_reservation own:the-unused-rest-of-a-reservation-run
 cetrafs_tree_resv_release own:the-unused-tree-block-reserve-of-a-convert-never-published
@@ -2789,6 +2790,7 @@ alloc.c:cetrafs_bg_release_one:TEST ONLY (release_noop_free): a free of a block 
 file.c:cetrafs_tree_split_leaf:a new leaf whose write failed, before any interior names it
 file.c:cetrafs_tree_build:a tree it built and never published
 file.c:cetrafs_tree_patch:leaves and interiors it wrote and never published
+file.c:cetrafs_patch_open:punches its own copy of a leaf with do_free false, nothing is freed
 dir.c:cetrafs_mkdir_locked:a dirent block it allocated and never published
 lock.c:cetrafs_inode_set_reservation:a reservation run, never published
 lock.c:cetrafs_inode_drop_reservation:the unused rest of a reservation run, never published
@@ -3008,7 +3010,7 @@ cetrafs_tree_free_meta frees:the-trees-own-blocks
 cetrafs_tree_last_contig_lba writes:the-allocation-goal-of-a-write
 cetrafs_tree_meta_is_ours frees:decides-a-free
 cetrafs_tree_meta_set frees:decides-which-old-tree-blocks-go
-cetrafs_tree_patch writes:the-tree
+cetrafs_patch_open writes:the-tree
 cetrafs_tree_range_mapped writes:the-unit-allocation-around-a-write-is-decided-by-it
 __cetrafs_truncate_shrink frees:what-truncate-cuts
 cetrafs_zero_inplace_held writes:zeroes-and-converts-by-it'

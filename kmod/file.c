@@ -4343,7 +4343,7 @@ fail:
  * boundary's own journal batch.
  *
  * 0: raw's root names the new tree, *out_meta its leaf + interior count.
- * -EAGAIN: not a case for a patch (not depth 2, small enough that a
+ * -EAGAIN: not a case for a patch (depth under 2, small enough that a
  * rebuild is one block, a split in a full leaf, nothing left); the caller
  * rebuilds, nothing was allocated. Other: failed, nothing allocated
  * survives, raw untouched. want_n / want_data are the caller's flattened
@@ -4374,33 +4374,180 @@ u64 cetrafs_tree_patch_write_count(void)
 
 static bool cetrafs_tree_has_room(u32 entries, bool root); /* under the TEST ONLY caps */
 
+/*
+ * One node open per level, depth first: idx[l] holds the entries of the
+ * open level-l interior (idx[depth]: the record's slots), leaf[] the open
+ * leaf's. The last path -- the node appends go to, at every level -- is
+ * the last one opened at each level, so it is still open when the walk
+ * ends, and its entry in its parent is a placeholder until it is closed.
+ */
 struct cetrafs_tree_patch_ws {
-    cetrafs_extent_idx_t idx[4][CETRAFS_EXT_BLOCK_MAX_IDX]; /* each interior's entries, edited */
+    struct super_block *sb;
+    u64 start, end;      /* the range taken out */
+    int depth;
+    u32 n[CETRAFS_EXT_MAX_DEPTH + 1];
+    bool changed[CETRAFS_EXT_MAX_DEPTH + 1];
+    u64 meta, total_n, total_data;
+    u64 *newblk;         /* written here, freed on failure */
+    u32 nnew, cap;
+    cetrafs_extent_idx_t idx[CETRAFS_EXT_MAX_DEPTH + 1][CETRAFS_EXT_BLOCK_MAX_IDX];
     cetrafs_extent_t leaf[CETRAFS_EXT_BLOCK_MAX_LEAVES];
 };
+
+/* The open level-l node written to a new block, *lba. */
+static int cetrafs_patch_write(struct cetrafs_tree_patch_ws *ws, int l, u64 *lba)
+{
+    const void *ent = ws->leaf;
+    u32 bg;
+    int ret;
+
+    if (l)
+        ent = ws->idx[l];
+    if (ws->nnew == ws->cap) {
+        u32 cap = max_t(u32, 64, ws->cap * 2);
+        u64 *nb = kvmalloc_array(cap, sizeof(*nb), GFP_NOFS);
+
+        if (!nb)
+            return -ENOMEM;
+        memcpy(nb, ws->newblk, ws->nnew * sizeof(*nb));
+        kvfree(ws->newblk);
+        ws->newblk = nb;
+        ws->cap = cap;
+    }
+    ret = cetrafs_tree_block_anywhere(ws->sb, &bg, lba);
+    if (ret)
+        return ret;
+    ws->newblk[ws->nnew++] = *lba;
+    return cetrafs_write_new_node(ws->sb, *lba, l, ent, ws->n[l]);
+}
+
+/*
+ * Close the open level-l node, the last entry of the open level-(l+1)
+ * one: dropped when empty, written new when changed (an interior's entry
+ * UNKNOWN, a leaf's exact -- but the 'last' leaf's, where appends go),
+ * else named as it was.
+ */
+static int cetrafs_patch_close(struct cetrafs_tree_patch_ws *ws, int l, bool last)
+{
+    cetrafs_extent_idx_t *pe = &ws->idx[l + 1][ws->n[l + 1] - 1];
+    u64 lo = 0, hi = 0, lba;
+    int ret;
+
+    if (!ws->n[l]) {
+        ws->n[l + 1]--;
+        ws->changed[l + 1] = true;
+        return 0;
+    }
+    ws->meta++;
+    if (!ws->changed[l])
+        return 0;
+    ret = cetrafs_patch_write(ws, l, &lba);
+    if (ret)
+        return ret;
+    if (!l && !last)
+        cetrafs_leaf_array_range(ws->leaf, ws->n[0], &lo, &hi);
+    cetrafs_idx_set(pe, lo, hi, lba);
+    ws->changed[l + 1] = true;
+    return 0;
+}
+
+static int cetrafs_patch_open(struct inode *inode, struct cetrafs_tree_patch_ws *ws, int l, u64 lba, bool spine);
+
+/* Edit every child of the open level-l interior; the last one stays open
+ * on the last path ('spine'). */
+static int cetrafs_patch_children(struct inode *inode, struct cetrafs_tree_patch_ws *ws, int l, bool spine)
+{
+    const u32 n = ws->n[l];
+    u32 i;
+    int ret;
+
+    ws->n[l] = 0;
+    for (i = 0; i < n; i++) {
+        const cetrafs_extent_idx_t e = ws->idx[l][i]; /* compacted in place: n[l] <= i */
+        const bool last = spine && i + 1 == n;
+
+        ws->idx[l][ws->n[l]++] = e;
+        ret = cetrafs_patch_open(inode, ws, l - 1, cetrafs_ei_child(&e), last);
+        if (!ret && !last)
+            ret = cetrafs_patch_close(ws, l - 1, false);
+        if (ret)
+            return ret;
+        cond_resched();
+    }
+    return 0;
+}
+
+/* Open the level-l node at 'lba' and take the range out of what is below it. */
+static int cetrafs_patch_open(struct inode *inode, struct cetrafs_tree_patch_ws *ws, int l, u64 lba, bool spine)
+{
+    struct buffer_head *bh = l ? cetrafs_read_index_bh(inode, lba) : cetrafs_read_leaf_bh(inode, lba);
+    u32 freed = 0;
+    int ret;
+
+    if (!bh)
+        return -EIO;
+    ws->n[l] = min_t(u32, cetrafs_le16(((const cetrafs_extent_hdr_t *) bh->b_data)->eh_entries),
+                     l ? CETRAFS_EXT_BLOCK_MAX_IDX : CETRAFS_EXT_BLOCK_MAX_LEAVES);
+    if (l)
+        memcpy(ws->idx[l], bh->b_data + sizeof(cetrafs_extent_hdr_t), ws->n[l] * sizeof(ws->idx[l][0]));
+    else
+        memcpy(ws->leaf, bh->b_data + sizeof(cetrafs_extent_hdr_t), ws->n[l] * sizeof(ws->leaf[0]));
+    brelse(bh);
+    ws->changed[l] = false;
+    if (l)
+        return cetrafs_patch_children(inode, ws, l, spine);
+
+    ret = cetrafs_leaf_array_punch(ws->sb, ws->leaf, &ws->n[0], CETRAFS_EXT_BLOCK_MAX_LEAVES, ws->start, ws->end,
+                                   &freed, /*do_free=*/false);
+    if (ret == -ENOSPC)
+        return -EAGAIN; /* a split with no slot in its leaf: the rebuild redistributes */
+    if (ret)
+        return ret;
+    /* Nothing overlapped: freed counts every block the range took out,
+     * and a split always takes one. */
+    ws->changed[0] = freed != 0;
+    ws->total_n += ws->n[0];
+    ws->total_data += cetrafs_flat_data_blocks(ws->leaf, ws->n[0]);
+    return 0;
+}
+
+/* Close the open level-l node on the last path and open an empty one
+ * after it, in its parent or -- that full -- in a new one. */
+static int cetrafs_patch_next(struct cetrafs_tree_patch_ws *ws, int l)
+{
+    int ret = cetrafs_patch_close(ws, l, false);
+
+    if (ret)
+        return ret;
+    if (!cetrafs_tree_has_room(ws->n[l + 1], l + 1 == ws->depth)) {
+        if (l + 1 == ws->depth)
+            return -EAGAIN; /* no root slot: the rebuild repacks */
+        ret = cetrafs_patch_next(ws, l + 1);
+        if (ret)
+            return ret;
+    }
+    cetrafs_idx_set(&ws->idx[l + 1][ws->n[l + 1]++], 0, 0, 0); /* named when it is closed */
+    ws->changed[l + 1] = true;
+    ws->n[l] = 0;
+    ws->changed[l] = true;
+    return 0;
+}
 
 int cetrafs_tree_patch(struct inode *inode, cetrafs_inode_t *raw, u64 start, u64 end, const cetrafs_extent_t *add,
                        u32 add_n, u32 want_n, u64 want_data, u64 *out_meta)
 {
-    struct super_block *sb = inode->i_sb;
-    struct cetrafs_tree_patch_ws *ws = NULL;
-    u32 icnt[4] = {0}, nroot, nr, r, kept_roots = 0, bg;
-    bool ichanged[4] = {false};
-    u64 newint[4] = {0};
-    u64 *newblk = NULL, meta = 0, total_data = 0, total_n = 0;
-    u32 nnew = 0, cap = 0, i, joined = 0;
-    int ret;
+    const u32 slots = ARRAY_SIZE(raw->et.idx);
+    struct cetrafs_tree_patch_ws *ws;
+    u32 i, joined = 0, cap = CETRAFS_EXT_BLOCK_MAX_LEAVES;
+    int depth = cetrafs_le16(raw->eh.eh_depth), l, ret;
 
-    BUILD_BUG_ON(ARRAY_SIZE(raw->et.idx) != 4);
     *out_meta = 0;
     /* want_n U32_MAX: the caller cannot say how many entries result
      * (defrag: whether its pieces merge with what the tree holds); the
      * data-block total is still checked, and a full root still refuses. */
-    if (READ_ONCE(cetrafs_tree_patch_off) || !S_ISREG(inode->i_mode) || cetrafs_le16(raw->eh.eh_depth) != 2 ||
+    if (READ_ONCE(cetrafs_tree_patch_off) || !S_ISREG(inode->i_mode) || depth < 2 || depth > CETRAFS_EXT_MAX_DEPTH ||
+        !cetrafs_le16(raw->eh.eh_entries) || cetrafs_le16(raw->eh.eh_entries) > slots ||
         (want_n != U32_MAX && (want_n <= CETRAFS_EXT_BLOCK_MAX_LEAVES || want_n > cetrafs_tree_max_extents())))
-        return -EAGAIN;
-    nroot = cetrafs_le16(raw->eh.eh_entries);
-    if (nroot == 0 || nroot > ARRAY_SIZE(raw->et.idx))
         return -EAGAIN;
     lockdep_assert_held_write(&inode->i_mapping->invalidate_lock);
 
@@ -4411,93 +4558,25 @@ int cetrafs_tree_patch(struct inode *inode, cetrafs_inode_t *raw, u64 start, u64
     }
     cetrafs_inode_ext_cache_drop(inode);
 
-    ws = kvmalloc(sizeof(*ws), GFP_NOFS);
+    ws = kvzalloc(sizeof(*ws), GFP_NOFS);
     if (!ws)
         return -ENOMEM;
-    for (r = 0; r < nroot; r++) {
-        u64 ilba = cetrafs_ei_child(&raw->et.idx[r]);
-        struct buffer_head *ibh = cetrafs_read_index_bh(inode, ilba);
-        const cetrafs_extent_hdr_t *h;
-
-        if (!ibh) {
-            ret = -EIO;
-            goto fail;
-        }
-        h = (const cetrafs_extent_hdr_t *) ibh->b_data;
-        icnt[r] = min_t(u32, cetrafs_le16(h->eh_entries), CETRAFS_EXT_BLOCK_MAX_IDX);
-        memcpy(ws->idx[r], ibh->b_data + sizeof(*h), (size_t) icnt[r] * sizeof(ws->idx[r][0]));
-        brelse(ibh);
-        cap += icnt[r];
-    }
-    /* Every leaf rewritten, the appends' leaves, every interior. */
-    cap += 1 + add_n / (CETRAFS_EXT_BLOCK_MAX_LEAVES / 2) + 1 + ARRAY_SIZE(raw->et.idx);
-    newblk = kvmalloc_array(cap, sizeof(*newblk), GFP_NOFS);
-    if (!newblk) {
-        ret = -ENOMEM;
+    ws->sb = inode->i_sb;
+    ws->start = start;
+    ws->end = end;
+    ws->depth = depth;
+    ws->n[depth] = cetrafs_le16(raw->eh.eh_entries);
+    memcpy(ws->idx[depth], raw->et.idx, ws->n[depth] * sizeof(raw->et.idx[0]));
+    ret = cetrafs_patch_children(inode, ws, depth, true);
+    if (ret)
         goto fail;
-    }
 
-    for (r = 0; r < nroot; r++) {
-        u32 li, w = 0;
-
-        for (li = 0; li < icnt[r]; li++) {
-            u64 llba = cetrafs_ei_child(&ws->idx[r][li]);
-            struct buffer_head *lbh = cetrafs_read_leaf_bh(inode, llba);
-            const cetrafs_extent_hdr_t *h;
-            u32 cnt, n2, freed = 0;
-            u64 lo, hi;
-            u64 nl;
-
-            if (!lbh) {
-                ret = -EIO;
-                goto fail;
-            }
-            h = (const cetrafs_extent_hdr_t *) lbh->b_data;
-            cnt = min_t(u32, cetrafs_le16(h->eh_entries), CETRAFS_EXT_BLOCK_MAX_LEAVES);
-            memcpy(ws->leaf, lbh->b_data + sizeof(*h), (size_t) cnt * sizeof(ws->leaf[0]));
-            brelse(lbh);
-            n2 = cnt;
-            ret = cetrafs_leaf_array_punch(sb, ws->leaf, &n2, CETRAFS_EXT_BLOCK_MAX_LEAVES, start, end, &freed,
-                                           /*do_free=*/false);
-            if (ret == -ENOSPC) {
-                ret = -EAGAIN; /* a split with no slot in its leaf: the rebuild redistributes */
-                goto fail;
-            }
-            if (ret)
-                goto fail;
-            total_n += n2;
-            total_data += cetrafs_flat_data_blocks(ws->leaf, n2);
-            /* Nothing overlapped: freed counts every block the range took
-             * out, and a split always takes one. */
-            if (!freed) {
-                ws->idx[r][w++] = ws->idx[r][li];
-                meta++;
-                continue;
-            }
-            ichanged[r] = true;
-            if (!n2)
-                continue; /* emptied: its interior no longer names it */
-            ret = cetrafs_tree_block_anywhere(sb, &bg, &nl);
-            if (ret)
-                goto fail;
-            newblk[nnew++] = nl;
-            ret = cetrafs_write_new_node(sb, nl, 0, ws->leaf, n2);
-            if (ret)
-                goto fail;
-            cetrafs_leaf_array_range(ws->leaf, n2, &lo, &hi);
-            cetrafs_idx_set(&ws->idx[r][w++], lo, hi, nl);
-            meta++;
-            cond_resched();
-        }
-        icnt[r] = w;
-    }
-
-    if (WARN_ON_ONCE((want_n != U32_MAX && total_n + add_n != want_n) ||
-                     total_data + cetrafs_flat_data_blocks(add, add_n) != want_data)) {
+    if (WARN_ON_ONCE((want_n != U32_MAX && ws->total_n + add_n != want_n) ||
+                     ws->total_data + cetrafs_flat_data_blocks(add, add_n) != want_data)) {
         pr_err("ino=%llu: the tree's leaves hold %llu extent(s) / %llu block(s) after the edit, the flattened map "
                "%u / %llu -- rebuilding from the map\n",
-               (unsigned long long) inode->i_ino, total_n + add_n, total_data + cetrafs_flat_data_blocks(add, add_n),
-               want_n, want_data);
+               (unsigned long long) inode->i_ino, ws->total_n + add_n,
+               ws->total_data + cetrafs_flat_data_blocks(add, add_n), want_n, want_data);
         ret = -EAGAIN;
         goto fail;
     }
@@ -4506,169 +4585,68 @@ int cetrafs_tree_patch(struct inode *inode, cetrafs_inode_t *raw, u64 start, u64
      * Appends go where cetrafs_tree_append() puts them: the free slots of
      * the tree's last leaf (a copy of it), then new leaves after it --
      * filled as a rebuild fills them, a quarter free -- in the last
-     * interior, or a new one when that is full. The last leaf's range is
-     * UNKNOWN, as every last leaf's is; a leaf that stops being last
-     * keeps the range it had, which is either exact or unknown.
+     * interior, or a new one when that is full, at every level. The first
+     * append continuing the last leaf's last entry -- logically,
+     * physically and in kind -- extends it: defrag's steps each add the
+     * next piece of one run.
      */
-    nr = nroot;
-    if (add_n) {
-        u32 rl = nroot, ai = 0, fill = CETRAFS_EXT_BLOCK_MAX_LEAVES;
+    if (add_n && ws->n[0]) {
+        cetrafs_extent_t *le = &ws->leaf[ws->n[0] - 1];
+        u32 llen = cetrafs_ee_len(le), alen = cetrafs_ee_len(&add[0]);
+        bool un = cetrafs_ee_uninit(le);
 
-        if (!READ_ONCE(cetrafs_tree_build_full))
-            fill = CETRAFS_EXT_BLOCK_MAX_LEAVES * 3 / 4;
-        while (rl > 0 && !icnt[rl - 1])
-            rl--;
-        if (!rl) {
-            ret = -EAGAIN;
-            goto fail;
+        if (cetrafs_ee_lblk(le) + llen == cetrafs_ee_lblk(&add[0]) &&
+            cetrafs_ee_pblk(le) + llen == cetrafs_ee_pblk(&add[0]) && un == cetrafs_ee_uninit(&add[0]) &&
+            (u64) llen + alen <= CETRAFS_EXT_LEN_MASK) {
+            cetrafs_ee_set_len(le, llen + alen, un);
+            ws->changed[0] = true;
+            joined = 1;
         }
-        rl--;
-        {
-            cetrafs_extent_idx_t *last = &ws->idx[rl][icnt[rl] - 1];
-            u64 llba = cetrafs_ei_child(last);
-            struct buffer_head *lbh = cetrafs_read_leaf_bh(inode, llba);
-            const cetrafs_extent_hdr_t *h;
-            u32 cnt, take, merged = 0;
-            u64 nl;
-
-            if (!lbh) {
-                ret = -EIO;
-                goto fail;
-            }
-            h = (const cetrafs_extent_hdr_t *) lbh->b_data;
-            cnt = min_t(u32, cetrafs_le16(h->eh_entries), CETRAFS_EXT_BLOCK_MAX_LEAVES);
-            memcpy(ws->leaf, lbh->b_data + sizeof(*h), (size_t) cnt * sizeof(ws->leaf[0]));
-            brelse(lbh);
-            /* The first append continuing the leaf's last entry --
-             * logically, physically and in kind -- extends it: defrag's
-             * steps each add the next piece of one run. */
-            if (cnt) {
-                cetrafs_extent_t *le = &ws->leaf[cnt - 1];
-                u32 llen = cetrafs_ee_len(le), alen = cetrafs_ee_len(&add[0]);
-                bool un = cetrafs_ee_uninit(le);
-
-                if ((u64) cetrafs_ee_lblk(le) + llen == cetrafs_ee_lblk(&add[0]) &&
-                    cetrafs_ee_pblk(le) + llen ==
-                        cetrafs_ee_pblk(&add[0]) &&
-                    un == cetrafs_ee_uninit(&add[0]) && (u64) llen + alen <= CETRAFS_EXT_LEN_MASK) {
-                    cetrafs_ee_set_len(le, llen + alen, un);
-                    merged = 1;
-                    joined = 1;
-                }
-            }
-            take = min_t(u32, CETRAFS_EXT_BLOCK_MAX_LEAVES - cnt, add_n - merged);
-            if (take || merged) {
-                memcpy(ws->leaf + cnt, add + merged, (size_t) take * sizeof(ws->leaf[0]));
-                ret = cetrafs_tree_block_anywhere(sb, &bg, &nl);
-                if (ret)
-                    goto fail;
-                newblk[nnew++] = nl;
-                ret = cetrafs_write_new_node(sb, nl, 0, ws->leaf, cnt + take);
-                if (ret)
-                    goto fail;
-                /* A last leaf this call already rewrote (the removal
-                 * above) is replaced again: that copy was never named by
-                 * anything published, so it goes back now. */
-                for (i = 0; i + 1 < nnew; i++)
-                    if (newblk[i] == llba) {
-                        cetrafs_free_data_block(sb, llba);
-                        newblk[i] = newblk[--nnew - 1];
-                        newblk[nnew - 1] = nl;
-                        break;
-                    }
-                cetrafs_idx_set(last, 0, 0 /* the last leaf: unknown */, nl);
-                ichanged[rl] = true;
-                ai = merged + take;
-            }
-        }
-        while (ai < add_n) {
-            u32 cnt = min_t(u32, fill, add_n - ai);
-            u64 lo, hi;
-            u64 nl;
-
-            if (icnt[rl] >= CETRAFS_EXT_BLOCK_MAX_IDX || !cetrafs_tree_has_room(icnt[rl], false)) {
-                if (nr >= ARRAY_SIZE(raw->et.idx)) {
-                    ret = -EAGAIN; /* no root slot: the rebuild repacks */
-                    goto fail;
-                }
-                rl = nr++;
-                icnt[rl] = 0;
-            }
-            ret = cetrafs_tree_block_anywhere(sb, &bg, &nl);
+    }
+    for (i = joined; i < add_n; i++) {
+        if (ws->n[0] >= cap) {
+            ret = cetrafs_patch_next(ws, 0);
             if (ret)
                 goto fail;
-            newblk[nnew++] = nl;
-            ret = cetrafs_write_new_node(sb, nl, 0, add + ai, cnt);
-            if (ret)
-                goto fail;
-            cetrafs_leaf_array_range(add + ai, cnt, &lo, &hi);
-            cetrafs_idx_set(&ws->idx[rl][icnt[rl]++], lo, hi, nl);
-            ichanged[rl] = true;
-            meta++;
-            ai += cnt;
-            cond_resched();
+            if (!READ_ONCE(cetrafs_tree_build_full))
+                cap = CETRAFS_EXT_BLOCK_MAX_LEAVES * 3 / 4;
         }
-        cetrafs_ei_set_range(&ws->idx[rl][icnt[rl] - 1], 0, 0); /* the last leaf: unknown */
-        ichanged[rl] = true;
+        ws->leaf[ws->n[0]++] = add[i];
+        ws->changed[0] = true;
     }
 
     /* Small enough for one leaf or the record: the rebuild gives it the
      * depth it needs (a defragmented file ends as one extent, not a
-     * depth-2 tree holding one). */
-    if (total_n + add_n - joined <= CETRAFS_EXT_BLOCK_MAX_LEAVES) {
-        ret = -EAGAIN;
+     * deep tree holding one). */
+    ret = -EAGAIN;
+    if (ws->total_n + add_n - joined <= CETRAFS_EXT_BLOCK_MAX_LEAVES)
         goto fail;
-    }
-
-    for (r = 0; r < nr; r++) {
-        if (!icnt[r])
-            continue; /* every leaf of it emptied: the root no longer names it */
-        kept_roots++;
-        meta++;
-        if (!ichanged[r])
-            continue;
-        ret = cetrafs_tree_block_anywhere(sb, &bg, &newint[r]);
-        if (ret)
-            goto fail;
-        newblk[nnew++] = newint[r];
-        ret = cetrafs_write_new_node(sb, newint[r], 1, ws->idx[r], icnt[r]);
+    /* The last path, bottom up. */
+    for (l = 0; l < depth; l++) {
+        ret = cetrafs_patch_close(ws, l, true);
         if (ret)
             goto fail;
     }
-    if (!kept_roots) {
-        ret = -EAGAIN;
+    ret = -EAGAIN;
+    if (!ws->n[depth])
         goto fail;
-    }
 
-    {
-        cetrafs_extent_idx_t root[4];
-        u32 k = 0;
-
-        for (r = 0; r < nr; r++) {
-            if (!icnt[r])
-                continue;
-            if (ichanged[r])
-                cetrafs_idx_set(&root[k], 0, 0 /* root: unknown */, newint[r]);
-            else
-                root[k] = raw->et.idx[r];
-            k++;
-        }
-        memset(&raw->et, 0, sizeof(raw->et));
-        memcpy(raw->et.idx, root, (size_t) k * sizeof(root[0]));
-        raw->eh.eh_entries = cetrafs_cpu_to_le16((u16) k);
-    }
+    memset(&raw->et, 0, sizeof(raw->et));
+    for (i = 0; i < ws->n[depth]; i++) /* root slots carry no range */
+        cetrafs_idx_set(&raw->et.idx[i], 0, 0, cetrafs_ei_child(&ws->idx[depth][i]));
+    raw->eh.eh_entries = cetrafs_cpu_to_le16(ws->n[depth]);
     atomic64_inc(&cetrafs_tree_patches);
-    atomic64_add(nnew, &cetrafs_tree_patch_writes);
-    *out_meta = meta;
-    kvfree(newblk);
+    atomic64_add(ws->nnew, &cetrafs_tree_patch_writes);
+    *out_meta = ws->meta;
+    kvfree(ws->newblk);
     kvfree(ws);
     return 0;
 
 fail:
     /* Written, never named by anything published: back to the allocator. */
-    for (i = 0; i < nnew; i++)
-        cetrafs_free_data_block(sb, newblk[i]);
-    kvfree(newblk);
+    for (i = 0; i < ws->nnew; i++)
+        cetrafs_free_data_block(ws->sb, ws->newblk[i]);
+    kvfree(ws->newblk);
     kvfree(ws);
     return ret;
 }
