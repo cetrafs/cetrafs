@@ -661,6 +661,67 @@ static void fsck_read_inode(int fd, const cetrafs_superblock_t *sb, uint64_t ino
 }
 
 /*
+ * --live: is "directory block 'dblk' slot 'slot' names inode t, whose bit
+ * is free" true at one instant, or two moments of a churn glued together?
+ *
+ * The walk reads the inode bitmap long before it reaches the dirents, so
+ * a file created in between is named by a dirent while its bit reads
+ * free -- and a churn that recreates the same names reuses the same
+ * numbers, so every walk can repeat that line word for word, which is
+ * exactly what the repetition filter cannot tell from damage.
+ *
+ * A create claims the bit, writes the record with a NEW generation
+ * (synchronously) and only then writes the dirent (dir.c); a delete
+ * removes the dirent before it frees the bit. So: generation, bit (still
+ * free), dirent (still naming t), generation again (unchanged). A dirent
+ * read after the bit read free can only be a create's that came after
+ * that bit read, and that create changed the generation in between. All
+ * four reads agreeing means the entry and the free bit coexisted.
+ */
+static int fsck_live_dangling_holds(int fd, const cetrafs_superblock_t *sb, uint64_t dblk, unsigned slot, uint64_t t)
+{
+    uint8_t blk[CETRAFS_BLOCK_SIZE];
+    const cetrafs_dirent_t *de = (const cetrafs_dirent_t *) blk;
+    cetrafs_inode_t a, b;
+    const uint64_t tb = t - 1;
+
+    fsck_read_inode(fd, sb, t, &a);
+    pread_all(fd, blk, sizeof(blk),
+              (off_t) (cetrafs_le64(sb->inode_bmap_start) + tb / 8 / CETRAFS_BLOCK_SIZE) * CETRAFS_BLOCK_SIZE);
+    if (blk[(tb / 8) % CETRAFS_BLOCK_SIZE] & (1u << (tb % 8)))
+        return 0; /* allocated now: created after the bitmap was read */
+    pread_all(fd, blk, sizeof(blk), (off_t) dblk * CETRAFS_BLOCK_SIZE);
+    if (!cetrafs_blk_struct_ok(blk, CETRAFS_DIRENT_TAIL_MAGIC) || cetrafs_le64(de[slot].inode) != t)
+        return 0; /* the entry moved, or the block is mid-write */
+    fsck_read_inode(fd, sb, t, &b);
+    return a.generation == b.generation;
+}
+
+/*
+ * --live: is inode 'ino' still the record the table walk judged -- bit
+ * set, same generation, same nlink? The table is read long before the
+ * dirents, and a file deleted (or deleted and recreated under the same
+ * number) in between reads as unnamed, or as named a different number of
+ * times than its nlink -- and a churn repeating itself repeats that in
+ * every walk. A delete publishes nlink 0 and frees the bit, a recreate
+ * changes the generation: either shows here, and the verdict is about a
+ * file that moved under the walk, not a damaged one.
+ */
+static int fsck_live_record_same(int fd, const cetrafs_superblock_t *sb, uint64_t ino, uint64_t gen, uint32_t nlink)
+{
+    uint8_t blk[CETRAFS_BLOCK_SIZE];
+    cetrafs_inode_t in;
+    const uint64_t bit = ino - 1;
+
+    pread_all(fd, blk, sizeof(blk),
+              (off_t) (cetrafs_le64(sb->inode_bmap_start) + bit / 8 / CETRAFS_BLOCK_SIZE) * CETRAFS_BLOCK_SIZE);
+    if (!(blk[(bit / 8) % CETRAFS_BLOCK_SIZE] & (1u << (bit % 8))))
+        return 0;
+    fsck_read_inode(fd, sb, ino, &in);
+    return cetrafs_inode_crcs_ok(&in) && cetrafs_le64(in.generation) == gen && cetrafs_le32(in.nlink) == nlink;
+}
+
+/*
  * Clear the lasting needs-fsck mark in block 0. Only at the end of a
  * repair pass that found nothing, under the repair claim, so no node is
  * mounted: a plain read-modify-write. Everything but the two status
@@ -5365,6 +5426,8 @@ int main(int argc, char **argv)
          * nothing in it to recover. */
         uint8_t *empty = (uint8_t *) xcalloc(cetrafs_le32(sb.inodes_count) + 1, 1);
         uint8_t *halfl = (uint8_t *) xcalloc(cetrafs_le32(sb.inodes_count) + 1, 1);
+        /* --live only: the generation each record had when the table was walked */
+        uint64_t *gens = live_pass ? (uint64_t *) xcalloc(cetrafs_le32(sb.inodes_count) + 1, sizeof(uint64_t)) : NULL;
         /* How many SUBDIRECTORIES each directory contains. A directory's
          * link count is 2 (itself, plus its own '.') plus one per
          * subdirectory, contributed by that child's '..'. Nothing
@@ -5429,6 +5492,8 @@ int main(int argc, char **argv)
             if (!cetrafs_inode_crcs_ok(&in))
                 continue; /* already reported above */
             nlinks[ino] = cetrafs_le32(in.nlink);
+            if (gens)
+                gens[ino] = cetrafs_le64(in.generation);
             unverified[ino] = !!(cetrafs_le32(in.flags) & CETRAFS_INODE_COUNT_UNVERIFIED);
             is_dir[ino] = ((cetrafs_le32(in.mode) & 0170000u) == 0040000u);
             dsize[ino] = cetrafs_le64(in.size);
@@ -5647,7 +5712,8 @@ int main(int argc, char **argv)
 
                         uint64_t t = cetrafs_le64(de[s].inode);
                         uint64_t tb = t - 1;
-                        if (!(ibmap[tb / 8] & (1u << (tb % 8)))) {
+                        if (!(ibmap[tb / 8] & (1u << (tb % 8))) &&
+                            (!live_pass || fsck_live_dangling_holds(fd, &sb, phys + k, s, t))) {
                             fprintf(stderr,
                                     "ERR: directory %" PRIu64 " names inode %" PRIu64
                                     ", which is marked FREE -- dangling entry\n",
@@ -5755,6 +5821,8 @@ int main(int argc, char **argv)
 
             if (!(ibmap[bit / 8] & (1u << (bit % 8))) || !is_dir[ino] || nlinks[ino] || !refs[ino])
                 continue;
+            if (live_pass && !fsck_live_record_same(fd, &sb, ino, gens[ino], nlinks[ino]))
+                continue; /* recreated under the walk (fsck_live_record_same()) */
             fprintf(stderr,
                     "ERR: directory inode %" PRIu64 " is named by %u directory entr%s but its record says nlink 0 "
                     "-- its entries were not walked\n",
@@ -5837,6 +5905,8 @@ int main(int argc, char **argv)
                             "WARN: inode %" PRIu64 " is an empty file (nlink=%u) that no directory entry names -- "
                             "a create stopped before adding its name\n",
                             ino, nlinks[ino]);
+                } else if (live_pass && !fsck_live_record_same(fd, &sb, ino, gens[ino], nlinks[ino])) {
+                    ; /* deleted or reused under the walk: not damage */
                 } else {
                     fprintf(stderr,
                             "ERR: inode %" PRIu64
@@ -5960,7 +6030,8 @@ int main(int argc, char **argv)
                                 ino, !lfino ? "no lost+found" : !dotdot_ok ? "its '..' cannot be repointed" : "no room in it");
                     }
                 }
-            } else if (!is_dir[ino] && refs[ino] != nlinks[ino]) {
+            } else if (!is_dir[ino] && refs[ino] != nlinks[ino] &&
+                       (!live_pass || fsck_live_record_same(fd, &sb, ino, gens[ino], nlinks[ino]))) {
                 /* The directory entries are the truth: nlink is a cache
                  * of how many of them there are, and P7 showed exactly
                  * how it drifts (a link() increment lost to a peer's
@@ -6365,6 +6436,7 @@ int main(int argc, char **argv)
         free(is_dir);
         free(empty);
         free(halfl);
+        free(gens);
         free(dot_tgt);
         free(dotdot_tgt);
         free(parent);

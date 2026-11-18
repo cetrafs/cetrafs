@@ -19,13 +19,18 @@
 #   4. an inode record nobody touches, damaged: 1, and that ERR reported;
 #   5. under heavy metadata churn --live never says 1 (no invented
 #      damage); control: one walk (CETRAFS_TEST_LIVE_PASSES=1) over the
-#      same churn does -- the repetition is what keeps it out.
+#      same churn does -- the repetition is what keeps it out;
+#   6. a real dangling entry -- a file nobody touches, its inode bit
+#      cleared on the device -- is still reported: the live re-checks a
+#      finding gets (fsck_live_dangling_holds(): the generation and the
+#      bit read again around the entry) filter a churn, not damage.
 set -euo pipefail
 . "$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)/lib/harness.sh"
 export CETRAFS_PEER_PROBE_SECS=3
 require_root
 require_module
 POKE="$(ct_helper csum_poke)"
+SBPOKE="$(ct_helper sb_poke)"
 FSCK="$ROOT/userspace/fsck.cetra"
 IMG="$(ct_image 1200 fsklive)"
 A="$(ct_loop "$IMG")"
@@ -39,6 +44,8 @@ for i in $(seq 30); do echo "$i" >"$MNT/f$i"; done
 mkdir "$MNT/d"
 echo victim >"$MNT/victim"
 VINO="$(stat -c %i "$MNT/victim")"
+echo dangler >"$MNT/dangler"
+DINO="$(stat -c %i "$MNT/dangler")"
 sync
 sleep 1
 
@@ -95,5 +102,25 @@ out="$("$FSCK" --live "$B" 2>&1)" || rc=$?
 [ "$rc" = 1 ] && grep -q "every walk repeated" <<<"$out" && grep -qE "^ERR: .*inode $VINO\b" <<<"$out" &&
     pass "4: a damaged inode record is reported by every walk, and named" ||
     fail "4: rc=$rc: $(grep -E '^ERR|--live' <<<"$out" | head -4 | tr '\n' ' ')"
+ct_umount "$MNT"
+IBM="$("$SBPOKE" "$IMG" | sed -n 's/^inode_bmap_start=//p')"
+[ -n "$IBM" ] || { fail "setup: no inode_bmap_start"; ct_exit; }
+python3 -I - "$IMG" $((IBM * 4096 + (DINO - 1) / 8)) $((1 << ((DINO - 1) % 8))) <<'PY'
+import sys
+p, off, mask = sys.argv[1], int(sys.argv[2]), int(sys.argv[3])
+with open(p, 'r+b') as f:
+    f.seek(off); b = f.read(1)[0]
+    assert b & mask, "the dangler's bit is not set"
+    f.seek(off); f.write(bytes([b & ~mask & 0xff]))
+PY
+blockdev --flushbufs "$B"
+blockdev --flushbufs "$A"
+ct_mount "$A" "$MNT"
+sleep 1
+rc=0
+out="$("$FSCK" --live "$B" 2>&1)" || rc=$?
+[ "$rc" = 1 ] && grep -q "names inode $DINO, which is marked FREE -- dangling entry" <<<"$out" &&
+    pass "6: a real dangling entry is reported by every walk through the live re-check" ||
+    fail "6: rc=$rc: $(grep -E '^ERR|--live' <<<"$out" | head -4 | tr '\n' ' ')"
 ct_umount "$MNT"
 ct_exit
