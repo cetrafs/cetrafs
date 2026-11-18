@@ -413,20 +413,13 @@ static int scrub_build_refset(struct cetrafs_scrub *s, struct scrub_ctx *ctx, bo
 
     if (!raw_sb)
         return -EINVAL;
-    ninodes = le32_to_cpu(raw_sb->inodes_count);
+    ninodes = cetrafs_sb_inodes(sb);
 
     /* The inode bitmap first, and as a whole: it is a handful of blocks
      * and every "is this inode allocated?" below reads it. A stale copy
      * of it is what makes a peer's live inode invisible. */
-    if (fresh) {
-        u64 b, bmap_start = le64_to_cpu(raw_sb->inode_bmap_start);
-        u64 bmap_blocks = le64_to_cpu(raw_sb->inode_bmap_blocks);
-
-        for (b = 0; b < bmap_blocks; b++) {
-            cetrafs_invalidate_block(sb, bmap_start + b);
-            cond_resched(); /* rule 14: a walk over a disk-read count */
-        }
-    }
+    if (fresh)
+        cetrafs_ibmap_invalidate(sb);
 
     for (i = 0; i < ctx->nbgs; i++)
         bitmap_zero(ctx->bgs[i].ref, (unsigned int) ctx->bgs[i].data_count);
@@ -1025,7 +1018,7 @@ static void scrub_reclaim_orphan_inodes(struct cetrafs_scrub *s)
 
     if (!raw_sb || cetrafs_sb_get_node_id(sb, &my_node_id))
         return;
-    ninodes = le32_to_cpu(raw_sb->inodes_count);
+    ninodes = cetrafs_sb_inodes(sb);
 
     for (ino = 2; ino <= ninodes; ino++) { /* 1 is the root, never an orphan */
         cetrafs_inode_t raw;

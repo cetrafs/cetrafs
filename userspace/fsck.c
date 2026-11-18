@@ -483,10 +483,102 @@ static int fsck_record_restampable(const cetrafs_inode_t *in, uint64_t ino)
     return 0;
 }
 
-static void repair_set_nlink(int fd, const cetrafs_superblock_t *sb, uint64_t ino, uint32_t nlink)
+/*
+ * The inode table's segments (struct cetrafs_iseg), built once from the
+ * superblock after it is checked (fsck_isegs_build()). Every record and
+ * bitmap address resolves through them, never through the superblock's
+ * fields; in memory the bitmap is one array indexed by inode - 1.
+ */
+static struct cetrafs_iseg *fsck_iseg;
+static uint32_t fsck_niseg;
+
+static void fsck_isegs_build(const cetrafs_superblock_t *sb)
+{
+    free(fsck_iseg);
+    fsck_iseg = (struct cetrafs_iseg *) xcalloc(1, sizeof(*fsck_iseg));
+    fsck_iseg[0] = (struct cetrafs_iseg) {
+        .first = 1,
+        .count = cetrafs_le32(sb->inodes_count),
+        .bmap = cetrafs_le64(sb->inode_bmap_start),
+        .table = cetrafs_le64(sb->inode_table_start),
+    };
+    fsck_niseg = 1;
+}
+
+/* Byte offset of inode 'ino''s record; the caller has checked 'ino'. */
+static off_t fsck_ino_off(uint64_t ino)
+{
+    return (off_t) cetrafs_iseg_record(fsck_iseg, fsck_niseg, ino) * CETRAFS_BLOCK_SIZE;
+}
+
+/* Is inode 'ino''s bit set on the device now? */
+static int fsck_ino_bit_on_disk(int fd, uint64_t ino)
+{
+    uint8_t blk[CETRAFS_BLOCK_SIZE];
+    uint64_t bit, lba = cetrafs_iseg_bit(fsck_iseg, fsck_niseg, ino, &bit);
+
+    if (!lba)
+        return 0;
+    pread_all(fd, blk, sizeof(blk), (off_t) lba * CETRAFS_BLOCK_SIZE);
+    return !!(blk[bit / 8] & (1u << (bit % 8)));
+}
+
+/* The whole bitmap, indexed by inode - 1. */
+static uint8_t *fsck_ibmap_load(int fd)
+{
+    uint64_t total = 0;
+
+    for (uint32_t s = 0; s < fsck_niseg; s++)
+        total = fsck_iseg[s].first + fsck_iseg[s].count - 1;
+    uint8_t *map = (uint8_t *) xcalloc(total / 8 + 1, 1);
+    uint8_t blk[CETRAFS_BLOCK_SIZE];
+
+    for (uint32_t s = 0; s < fsck_niseg; s++) {
+        const struct cetrafs_iseg *g = &fsck_iseg[s];
+
+        for (uint64_t i = 0; i < g->count; i++) {
+            uint64_t gi = g->first - 1 + i;
+
+            if (i % CETRAFS_BITS_PER_BLOCK == 0)
+                pread_all(fd, blk, sizeof(blk), (off_t) (g->bmap + i / CETRAFS_BITS_PER_BLOCK) * CETRAFS_BLOCK_SIZE);
+            if (blk[(i % CETRAFS_BITS_PER_BLOCK) / 8] & (1u << (i % 8)))
+                map[gi / 8] |= (uint8_t) (1u << (gi % 8));
+        }
+    }
+    return map;
+}
+
+/* The device block holding inode 'ino''s bit, rewritten from 'map'. */
+static void fsck_ibmap_store_block(int fd, const uint8_t *map, uint64_t ino)
+{
+    const struct cetrafs_iseg *g = cetrafs_iseg_find(fsck_iseg, fsck_niseg, ino);
+    uint8_t blk[CETRAFS_BLOCK_SIZE] = {0};
+
+    if (!g)
+        return;
+    uint64_t k = (ino - g->first) / CETRAFS_BITS_PER_BLOCK, i0 = k * CETRAFS_BITS_PER_BLOCK;
+
+    for (uint64_t b = 0; b < CETRAFS_BITS_PER_BLOCK && i0 + b < g->count; b++) {
+        uint64_t gi = g->first - 1 + i0 + b;
+
+        if (map[gi / 8] & (1u << (gi % 8)))
+            blk[b / 8] |= (uint8_t) (1u << (b % 8));
+    }
+    pwrite_all(fd, blk, sizeof(blk), (off_t) (g->bmap + k) * CETRAFS_BLOCK_SIZE);
+}
+
+/* The whole bitmap written back from 'map'. */
+static void fsck_ibmap_store(int fd, const uint8_t *map)
+{
+    for (uint32_t s = 0; s < fsck_niseg; s++)
+        for (uint64_t i = 0; i < fsck_iseg[s].count; i += CETRAFS_BITS_PER_BLOCK)
+            fsck_ibmap_store_block(fd, map, fsck_iseg[s].first + i);
+}
+
+static void repair_set_nlink(int fd, uint64_t ino, uint32_t nlink)
 {
     uint8_t blk[CETRAFS_BLOCK_SIZE] = {0};
-    off_t off = (off_t) (cetrafs_le64(sb->inode_table_start) + (ino - 1)) * CETRAFS_BLOCK_SIZE;
+    off_t off = fsck_ino_off(ino);
     cetrafs_inode_t in;
 
     pread_all(fd, blk, sizeof(blk), off);
@@ -501,10 +593,10 @@ static void repair_set_nlink(int fd, const cetrafs_superblock_t *sb, uint64_t in
 
 /* Clear CETRAFS_INODE_COUNT_UNVERIFIED -- same read-modify-write and
  * restamp as repair_set_nlink() above. */
-static void repair_clear_unverified(int fd, const cetrafs_superblock_t *sb, uint64_t ino)
+static void repair_clear_unverified(int fd, uint64_t ino)
 {
     uint8_t blk[CETRAFS_BLOCK_SIZE] = {0};
-    off_t off = (off_t) (cetrafs_le64(sb->inode_table_start) + (ino - 1)) * CETRAFS_BLOCK_SIZE;
+    off_t off = fsck_ino_off(ino);
     cetrafs_inode_t in;
 
     pread_all(fd, blk, sizeof(blk), off);
@@ -519,10 +611,10 @@ static void repair_clear_unverified(int fd, const cetrafs_superblock_t *sb, uint
 
 /* Rewrite a directory record's size -- same read-modify-write and
  * restamp as repair_set_nlink() above. */
-static void repair_set_dir_size(int fd, const cetrafs_superblock_t *sb, uint64_t ino, uint64_t size)
+static void repair_set_dir_size(int fd, uint64_t ino, uint64_t size)
 {
     uint8_t blk[CETRAFS_BLOCK_SIZE] = {0};
-    off_t off = (off_t) (cetrafs_le64(sb->inode_table_start) + (ino - 1)) * CETRAFS_BLOCK_SIZE;
+    off_t off = fsck_ino_off(ino);
     cetrafs_inode_t in;
 
     pread_all(fd, blk, sizeof(blk), off);
@@ -657,7 +749,7 @@ static void fsck_read_inode(int fd, const cetrafs_superblock_t *sb, uint64_t ino
         return;
     }
 
-    pread_all(fd, blk, sizeof(blk), (off_t) (cetrafs_le64(sb->inode_table_start) + (ino - 1)) * CETRAFS_BLOCK_SIZE);
+    pread_all(fd, blk, sizeof(blk), fsck_ino_off(ino));
     memcpy(out, blk, sizeof(*out));
 }
 
@@ -684,12 +776,9 @@ static int fsck_live_dangling_holds(int fd, const cetrafs_superblock_t *sb, uint
     uint8_t blk[CETRAFS_BLOCK_SIZE];
     const cetrafs_dirent_t *de = (const cetrafs_dirent_t *) blk;
     cetrafs_inode_t a, b;
-    const uint64_t tb = t - 1;
 
     fsck_read_inode(fd, sb, t, &a);
-    pread_all(fd, blk, sizeof(blk),
-              (off_t) (cetrafs_le64(sb->inode_bmap_start) + tb / 8 / CETRAFS_BLOCK_SIZE) * CETRAFS_BLOCK_SIZE);
-    if (blk[(tb / 8) % CETRAFS_BLOCK_SIZE] & (1u << (tb % 8)))
+    if (fsck_ino_bit_on_disk(fd, t))
         return 0; /* allocated now: created after the bitmap was read */
     pread_all(fd, blk, sizeof(blk), (off_t) dblk * CETRAFS_BLOCK_SIZE);
     if (!cetrafs_blk_struct_ok(blk, CETRAFS_DIRENT_TAIL_MAGIC) || cetrafs_le64(de[slot].inode) != t)
@@ -710,13 +799,9 @@ static int fsck_live_dangling_holds(int fd, const cetrafs_superblock_t *sb, uint
  */
 static int fsck_live_record_same(int fd, const cetrafs_superblock_t *sb, uint64_t ino, uint64_t gen, uint32_t nlink)
 {
-    uint8_t blk[CETRAFS_BLOCK_SIZE];
     cetrafs_inode_t in;
-    const uint64_t bit = ino - 1;
 
-    pread_all(fd, blk, sizeof(blk),
-              (off_t) (cetrafs_le64(sb->inode_bmap_start) + bit / 8 / CETRAFS_BLOCK_SIZE) * CETRAFS_BLOCK_SIZE);
-    if (!(blk[(bit / 8) % CETRAFS_BLOCK_SIZE] & (1u << (bit % 8))))
+    if (!fsck_ino_bit_on_disk(fd, ino))
         return 0;
     fsck_read_inode(fd, sb, ino, &in);
     return cetrafs_inode_crcs_ok(&in) && cetrafs_le64(in.generation) == gen && cetrafs_le32(in.nlink) == nlink;
@@ -802,30 +887,30 @@ static void fsck_write_sb_at(int fd, const cetrafs_superblock_t *sb, uint64_t lb
     }
 }
 
-static void fsck_write_inode(int fd, const cetrafs_superblock_t *sb, uint64_t ino, cetrafs_inode_t *in)
+static void fsck_write_inode(int fd, uint64_t ino, cetrafs_inode_t *in)
 {
     uint8_t blk[CETRAFS_BLOCK_SIZE] = {0};
 
     cetrafs_inode_stamp_crcs_us(in);
     memcpy(blk, in, sizeof(*in));
-    pwrite_all(fd, blk, sizeof(blk), (off_t) (cetrafs_le64(sb->inode_table_start) + (ino - 1)) * CETRAFS_BLOCK_SIZE);
+    pwrite_all(fd, blk, sizeof(blk), fsck_ino_off(ino));
 }
 
 /* A record never written goes back as a DEAD one, as mkfs writes every
  * slot (audit 2026-11-15 F-12). A NEW record, written only over one that
  * is not a valid record of anything: zeros, or a create stopped half
  * born or half landed. */
-static void fsck_write_dead_record(int fd, const cetrafs_superblock_t *sb, uint64_t ino)
+static void fsck_write_dead_record(int fd, uint64_t ino)
 {
     uint8_t zb[CETRAFS_BLOCK_SIZE];
     cetrafs_inode_t zin;
 
-    pread_all(fd, zb, sizeof(zb), (off_t) (cetrafs_le64(sb->inode_table_start) + ino - 1) * CETRAFS_BLOCK_SIZE);
+    pread_all(fd, zb, sizeof(zb), fsck_ino_off(ino));
     memcpy(&zin, zb, sizeof(zin));
     if (!cetrafs_inode_crcs_ok(&zin) &&
         (fsck_all_zero(zb, sizeof(zb)) || fsck_half_born(&zin, ino) || fsck_half_landed(&zin, ino))) {
         cetrafs_inode_dead_stamp_us(&zin, ino);
-        fsck_write_inode(fd, sb, ino, &zin);
+        fsck_write_inode(fd, ino, &zin);
     }
 }
 
@@ -960,14 +1045,12 @@ static int fsck_alloc_inode(int fd, const cetrafs_superblock_t *sb, uint8_t *ibm
 {
     for (uint64_t ino = 2; ino <= cetrafs_le32(sb->inodes_count); ++ino) {
         uint64_t bit = ino - 1;
-        uint64_t blk = (bit / 8) / CETRAFS_BLOCK_SIZE;
 
         if (ibmap[bit / 8] & (1u << (bit % 8)))
             continue;
         ibmap[bit / 8] |= (uint8_t) (1u << (bit % 8));
         *dirty = 1;
-        pwrite_all(fd, ibmap + blk * CETRAFS_BLOCK_SIZE, CETRAFS_BLOCK_SIZE,
-                   (off_t) (cetrafs_le64(sb->inode_bmap_start) + blk) * CETRAFS_BLOCK_SIZE);
+        fsck_ibmap_store_block(fd, ibmap, ino);
         *out_ino = ino;
         return 0;
     }
@@ -1392,19 +1475,19 @@ static int fsck_rebuild_bg_desc(int fd, const cetrafs_superblock_t *sb, uint64_t
  * namespace lock, a presence bit. One value among them is restored; none,
  * or several that disagree, keep the image's.
  */
-static uint32_t fsck_row_claimed_incarnation(int fd, const cetrafs_superblock_t *sb, uint32_t n, uint32_t fallback)
+static uint32_t fsck_row_claimed_incarnation(int fd, uint32_t n, uint32_t fallback)
 {
     enum { CHUNK = 256 };
-    uint64_t count = cetrafs_le32(sb->inodes_count), slot = n % CETRAFS_MAX_READER_NODES;
+    uint64_t slot = n % CETRAFS_MAX_READER_NODES;
     uint8_t *buf = (uint8_t *) xcalloc(CHUNK, CETRAFS_BLOCK_SIZE);
     uint32_t found = 0;
     int conflict = 0;
 
-    for (uint64_t i = 0; i < count && !conflict; i += CHUNK) {
-        uint64_t k = count - i < CHUNK ? count - i : CHUNK;
+    for (uint32_t s = 0; s < fsck_niseg && !conflict; s++)
+    for (uint64_t i = 0; i < fsck_iseg[s].count && !conflict; i += CHUNK) {
+        uint64_t k = fsck_iseg[s].count - i < CHUNK ? fsck_iseg[s].count - i : CHUNK;
 
-        pread_all(fd, buf, (size_t) k * CETRAFS_BLOCK_SIZE,
-                  (off_t) (cetrafs_le64(sb->inode_table_start) + i) * CETRAFS_BLOCK_SIZE);
+        pread_all(fd, buf, (size_t) k * CETRAFS_BLOCK_SIZE, (off_t) (fsck_iseg[s].table + i) * CETRAFS_BLOCK_SIZE);
         for (uint64_t j = 0; j < k && !conflict; j++) {
             cetrafs_inode_t in;
             uint32_t v[3];
@@ -1451,7 +1534,7 @@ static void fsck_rebuild_node_row(int fd, const cetrafs_superblock_t *sb, uint32
         ne.departure = cetrafs_cpu_to_le32(CETRAFS_NODE_DEPART_DEAD);
         ne.hb_seq = old->hb_seq;
         ne.last_seen = old->last_seen;
-        ne.incarnation = cetrafs_cpu_to_le32(fsck_row_claimed_incarnation(fd, sb, n, cetrafs_le32(old->incarnation)));
+        ne.incarnation = cetrafs_cpu_to_le32(fsck_row_claimed_incarnation(fd, n, cetrafs_le32(old->incarnation)));
         ne.file_lock_mode = old->file_lock_mode;
         ne.fence_epoch = cetrafs_cpu_to_le64(cetrafs_le64(old->fence_epoch) + 1);
         ne.hb_interval_secs = cetrafs_cpu_to_le32(CETRAFS_HEARTBEAT_INTERVAL_SECS);
@@ -1786,7 +1869,7 @@ linked:
     dir.dirent_seq = cetrafs_cpu_to_le64(cetrafs_le64(dir.dirent_seq) + 1); /* every writer of a dirent block bumps it */
     if (file_type == CETRAFS_FT_DIR)
         dir.nlink = cetrafs_cpu_to_le32(cetrafs_le32(dir.nlink) + 1);
-    fsck_write_inode(fd, sb, dir_ino, &dir);
+    fsck_write_inode(fd, dir_ino, &dir);
     return 0;
 }
 
@@ -1839,7 +1922,7 @@ static void fsck_set_dotdot(int fd, const cetrafs_superblock_t *sb, uint64_t dir
     pwrite_all(fd, blk, sizeof(blk), (off_t) lba * CETRAFS_BLOCK_SIZE);
 
     in.dirent_seq = cetrafs_cpu_to_le64(cetrafs_le64(in.dirent_seq) + 1);
-    fsck_write_inode(fd, sb, dir_ino, &in);
+    fsck_write_inode(fd, dir_ino, &in);
 }
 
 /* Resolve /lost+found, creating it if it is not there. Lazy: a healthy
@@ -1933,13 +2016,8 @@ static uint64_t fsck_lost_found(int fd,
          * give-back goes there too, at once. (ibmap_dirty stays latched:
          * rewriting an unchanged bitmap is harmless, and other passes
          * may have dirtied it for real.) */
-        {
-            uint64_t bb = ((ino - 1) / 8) / CETRAFS_BLOCK_SIZE;
-
-            ibmap[(ino - 1) / 8] &= (uint8_t) ~(1u << ((ino - 1) % 8));
-            pwrite_all(fd, ibmap + bb * CETRAFS_BLOCK_SIZE, CETRAFS_BLOCK_SIZE,
-                       (off_t) (cetrafs_le64(sb->inode_bmap_start) + bb) * CETRAFS_BLOCK_SIZE);
-        }
+        ibmap[(ino - 1) / 8] &= (uint8_t) ~(1u << ((ino - 1) % 8));
+        fsck_ibmap_store_block(fd, ibmap, ino);
         fprintf(stderr, "ERR: no free block for /lost+found\n");
         return 0;
     }
@@ -1980,7 +2058,7 @@ static uint64_t fsck_lost_found(int fd,
     cetrafs_ee_set_lblk(&nd.et.leaf[0], 0);
     cetrafs_ee_set_len(&nd.et.leaf[0], 1, 0);
     cetrafs_ee_set_pblk(&nd.et.leaf[0], lba);
-    fsck_write_inode(fd, sb, ino, &nd);
+    fsck_write_inode(fd, ino, &nd);
 
     if (fsck_dir_link(fd, sb, bg_count, bg_data_start, bg_data_cnt, bg_bmap_lba, lf->root_ino, "lost+found", ino,
                       CETRAFS_FT_DIR)) {
@@ -3403,6 +3481,7 @@ int main(int argc, char **argv)
                     cetrafs_le32(sb.inodes_count), (uint64_t) cetrafs_le64(sb.inode_bmap_blocks) * CETRAFS_BLOCK_SIZE * 8);
             return 1;
         }
+        fsck_isegs_build(&sb);
         if (cetrafs_le32(sb.node_table_count) > CETRAFS_MAX_READER_NODES) {
             fprintf(stderr,
                     "ERR: layout: node_table_count %u exceeds CETRAFS_MAX_READER_NODES (%u) -- row %u would "
@@ -4194,7 +4273,7 @@ int main(int argc, char **argv)
             uint64_t bits;
 
             fsck_repair_heartbeat();
-            pread_all(fd, &in, sizeof(in), (off_t) (cetrafs_le64(sb.inode_table_start) + ino - 1) * CETRAFS_BLOCK_SIZE);
+            pread_all(fd, &in, sizeof(in), fsck_ino_off(ino));
             if (!in.ino && !in.generation)
                 continue; /* never written */
             if (cetrafs_lock_mode_held(cetrafs_le32(in.lock_mode)) && cetrafs_le32(in.lock_owner_node) < nrows)
@@ -4492,7 +4571,7 @@ int main(int argc, char **argv)
     }
 
     /* Root inode checks */
-    uint64_t ioff = (uint64_t) (cetrafs_le64(sb.inode_table_start) + CETRAFS_ROOT_INO - 1) * CETRAFS_BLOCK_SIZE;
+    uint64_t ioff = (uint64_t) fsck_ino_off(CETRAFS_ROOT_INO);
     cetrafs_inode_t ri;
     pread_all(fd, &ri, sizeof(ri), (off_t) ioff);
     if (((cetrafs_le32(ri.mode)) & 0170000) != S_IFDIR) {
@@ -4695,15 +4774,13 @@ int main(int argc, char **argv)
         uint64_t leak_deferred = 0;
         uint64_t stale_blocks = 0, stale_before = 0;
 /* FSCK_SET/FSCK_GET are defined globally above (guarded). */
-        uint8_t *ibmap = (uint8_t *) xcalloc(cetrafs_le64(sb.inode_bmap_blocks), CETRAFS_BLOCK_SIZE);
+        uint8_t *ibmap = fsck_ibmap_load(fd);
         int ibmap_dirty = 0;
         uint64_t orphans_freed = 0;
         uint64_t orphans_linked = 0;
         struct fsck_lf lf = {0, cetrafs_le64(sb.root_ino), 0, 0};
         uint64_t problems = 0, inodes_seen = 0, extents_seen = 0, blocks_referenced = 0;
 
-        pread_all(fd, ibmap, (size_t) cetrafs_le64(sb.inode_bmap_blocks) * CETRAFS_BLOCK_SIZE,
-                  (off_t) cetrafs_le64(sb.inode_bmap_start) * CETRAFS_BLOCK_SIZE);
 
         /* Map a data-block LBA to its index in 'owner', or -1 if the LBA
          * is not inside any BG's data region (which is itself a fault:
@@ -4722,7 +4799,7 @@ int main(int argc, char **argv)
 
             uint8_t iblk[CETRAFS_BLOCK_SIZE];
             cetrafs_inode_t in;
-            pread_all(fd, iblk, sizeof(iblk), (off_t) (cetrafs_le64(sb.inode_table_start) + ino - 1) * CETRAFS_BLOCK_SIZE);
+            pread_all(fd, iblk, sizeof(iblk), fsck_ino_off(ino));
             memcpy(&in, iblk, sizeof(in));
 
             fsck_dead_walk = 0;
@@ -5536,7 +5613,7 @@ int main(int argc, char **argv)
 
             if (!(ibmap[bit / 8] & (1u << (bit % 8))))
                 continue;
-            pread_all(fd, iblk, sizeof(iblk), (off_t) (cetrafs_le64(sb.inode_table_start) + ino - 1) * CETRAFS_BLOCK_SIZE);
+            pread_all(fd, iblk, sizeof(iblk), fsck_ino_off(ino));
             memcpy(&in, iblk, sizeof(in));
             halfl[ino] = (uint8_t) fsck_half_landed(&in, ino);
             if (!cetrafs_inode_crcs_ok(&in))
@@ -5560,7 +5637,7 @@ int main(int argc, char **argv)
 
             if (!(ibmap[bit / 8] & (1u << (bit % 8))))
                 continue;
-            pread_all(fd, iblk, sizeof(iblk), (off_t) (cetrafs_le64(sb.inode_table_start) + ino - 1) * CETRAFS_BLOCK_SIZE);
+            pread_all(fd, iblk, sizeof(iblk), fsck_ino_off(ino));
             memcpy(&in, iblk, sizeof(in));
             if (!cetrafs_inode_crcs_ok(&in))
                 continue; /* already reported above */
@@ -5816,7 +5893,7 @@ int main(int argc, char **argv)
                 continue;
             /* class 45: recount -- the size from the entries this walk counted */
             if (repair_mode && !repair_blocked) {
-                repair_set_dir_size(fd, &sb, ino, want_size);
+                repair_set_dir_size(fd, ino, want_size);
                 repairs_made++;
             }
             fprintf(stderr,
@@ -5983,7 +6060,7 @@ int main(int argc, char **argv)
                      * a /lost+found name. nlink first: the kernel's
                      * allocator refuses a number whose record still
                      * claims links (cetrafs_alloc_inode()). */
-                    repair_set_nlink(fd, &sb, ino, 0);
+                    repair_set_nlink(fd, ino, 0);
                     ibmap[bit / 8] &= (uint8_t) ~(1u << (bit % 8));
                     ibmap_dirty = 1;
                     orphans_freed++;
@@ -5992,7 +6069,7 @@ int main(int argc, char **argv)
                     /* Left zeros, the next create of this number would
                      * open the window where a stop leaves a record no
                      * walk can judge. */
-                    fsck_write_dead_record(fd, &sb, ino);
+                    fsck_write_dead_record(fd, ino);
                     ibmap[bit / 8] &= (uint8_t) ~(1u << (bit % 8));
                     ibmap_dirty = 1;
                     orphans_freed++;
@@ -6067,7 +6144,7 @@ int main(int argc, char **argv)
                  * one right answer -- when the count is complete; while
                  * it is not, only upward (tally_partial, above). */
                 if (repair_mode && !repair_blocked && (!tally_partial || refs[ino] > nlinks[ino])) {
-                    repair_set_nlink(fd, &sb, ino, refs[ino]);
+                    repair_set_nlink(fd, ino, refs[ino]);
                     repairs_made++;
                 }
                 fprintf(stderr, "ERR: inode %" PRIu64 " has nlink=%u but %u directory entries name it\n", ino,
@@ -6100,7 +6177,7 @@ int main(int argc, char **argv)
                     /* subdirs[] is counted from this directory's own
                      * blocks: a skipped one hid some (F3). */
                     if (repair_mode && !repair_blocked && (dwhole[ino] || want_n > nlinks[ino] + dir_gain[ino])) {
-                        repair_set_nlink(fd, &sb, ino, want_n);
+                        repair_set_nlink(fd, ino, want_n);
                         repairs_made++;
                     }
                     fprintf(stderr,
@@ -6141,7 +6218,7 @@ int main(int argc, char **argv)
             uint32_t rsub = subdirs[CETRAFS_ROOT_INO] + dir_gain[CETRAFS_ROOT_INO];
 
             if (repair_mode && !repair_blocked) {
-                repair_set_nlink(fd, &sb, CETRAFS_ROOT_INO, rsub + 2);
+                repair_set_nlink(fd, CETRAFS_ROOT_INO, rsub + 2);
                 repairs_made++;
             }
             fprintf(stderr, "ERR: root directory has nlink=%u but contains %u subdirector%s (expected %u)\n",
@@ -6165,7 +6242,7 @@ int main(int argc, char **argv)
                 continue;
             complete = !tally_partial && (!is_dir[ino] || (walked[ino] && dwhole[ino]));
             if (repair_mode && !repair_blocked && complete) {
-                repair_clear_unverified(fd, &sb, ino);
+                repair_clear_unverified(fd, ino);
                 repairs_made++;
                 fprintf(stderr, "note: inode %" PRIu64 " was flagged with its counts unverified; checked above, flag "
                                 "cleared\n", ino);
@@ -6450,8 +6527,7 @@ int main(int argc, char **argv)
         }
         free(leakd);
         if (ibmap_dirty)
-            pwrite_all(fd, ibmap, (size_t) cetrafs_le64(sb.inode_bmap_blocks) * CETRAFS_BLOCK_SIZE,
-                       (off_t) cetrafs_le64(sb.inode_bmap_start) * CETRAFS_BLOCK_SIZE);
+            fsck_ibmap_store(fd, ibmap);
         if (orphans_linked)
             printf("  linked %" PRIu64 " orphaned inode(s) into /lost+found\n", orphans_linked);
         if (orphans_freed || orphans_linked)

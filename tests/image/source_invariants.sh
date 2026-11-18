@@ -2019,6 +2019,7 @@ cetrafs_invalidate_block buffer
 cetrafs_forget_block buffer
 cetrafs_invalidate_raw_inode calls:cetrafs_invalidate_block
 cetrafs_bg_invalidate_cache calls:cetrafs_invalidate_block
+cetrafs_ibmap_invalidate calls:cetrafs_invalidate_block
 cetrafs_dmpath_forget wait
 cetrafs_sb_peer_watch_forget safe:a-straddling-sample-re-arms-the-watch-at-now-which-only-delays-a-verdict
 cetrafs_deferred_forget_range none:the-held-back-set-changes-under-the-buffer-lock

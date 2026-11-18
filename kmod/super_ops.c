@@ -414,15 +414,15 @@ static int cetrafs_statfs(struct dentry *dentry, struct kstatfs *stat)
         avail_blocks = free_blocks;
     if ((s64) free_inodes < 0)
         free_inodes = 0;
-    if (free_inodes > le32_to_cpu(raw_sb->inodes_count))
-        free_inodes = le32_to_cpu(raw_sb->inodes_count);
+    if (free_inodes > cetrafs_sb_inodes(sb))
+        free_inodes = cetrafs_sb_inodes(sb);
 
     stat->f_type = CETRAFS_MAGIC;
     stat->f_bsize = sb->s_blocksize;
     stat->f_blocks = total_blocks;
     stat->f_bfree = free_blocks;
     stat->f_bavail = avail_blocks;
-    stat->f_files = le32_to_cpu(raw_sb->inodes_count);
+    stat->f_files = cetrafs_sb_inodes(sb);
     stat->f_ffree = free_inodes;
     stat->f_namelen = CETRAFS_FILENAME_MAX;
     /* f_fsid: the volume UUID's two halves folded, as ext4 does, so every

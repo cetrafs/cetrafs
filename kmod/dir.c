@@ -309,13 +309,13 @@ static struct buffer_head *cetrafs_dirent_bread(struct inode *dir, u64 lba)
  * as opposed to a record that failed its checksum? */
 static bool cetrafs_dirent_owner_slot_zero(struct super_block *sb, u64 ino)
 {
-    const cetrafs_superblock_t *raw_sb = cetrafs_sb_raw(sb);
+    u64 rec = cetrafs_inode_lba(sb, ino);
     struct buffer_head *bh;
     bool zero;
 
-    if (!raw_sb)
+    if (!rec)
         return false;
-    bh = cetrafs_bread_uncached(sb, le64_to_cpu(raw_sb->inode_table_start) + (ino - 1));
+    bh = cetrafs_bread_uncached(sb, rec);
     if (!bh)
         return false;
     zero = !memchr_inv(bh->b_data, 0, CETRAFS_BLOCK_SIZE);
@@ -2574,7 +2574,7 @@ int cetrafs_ns_count_names(struct super_block *sb, const u64 *inos, u32 n, u32 *
         ret = -ENOMEM;
         goto out;
     }
-    ninodes = le32_to_cpu(raw_sb->inodes_count);
+    ninodes = cetrafs_sb_inodes(sb);
     /*
      * The inode bitmap fresh, first: it decides which records are walked
      * at all, and a cached block changes only on this node's own swaps.
@@ -2583,14 +2583,8 @@ int cetrafs_ns_count_names(struct super_block *sb, const u64 *inos, u32 n, u32 *
      * direction of staleness (rule 6; audit 2026-11-15 B-22). A handful
      * of blocks, under a lock already held; as the scrub's fresh pass.
      */
-    if (!READ_ONCE(cetrafs_ns_count_cached_bmap)) {
-        u64 b, bstart = le64_to_cpu(raw_sb->inode_bmap_start), bn = le64_to_cpu(raw_sb->inode_bmap_blocks);
-
-        for (b = 0; b < bn; b++) {
-            cetrafs_invalidate_block(sb, bstart + b);
-            cond_resched(); /* rule 14: a walk over a disk-read count */
-        }
-    }
+    if (!READ_ONCE(cetrafs_ns_count_cached_bmap))
+        cetrafs_ibmap_invalidate(sb);
     for (d = 1; d <= ninodes; d += CETRAFS_NS_WALK_BATCH) {
         u64 end = min_t(u64, d + CETRAFS_NS_WALK_BATCH - 1, ninodes), x;
         u32 nw = 0, j;

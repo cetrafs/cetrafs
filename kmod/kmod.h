@@ -133,6 +133,16 @@ void cetrafs_kill_sb(struct super_block *sb);
 /* true: the mount ended stopped (its put_super must write nothing) */
 bool cetrafs_free_sb_info(struct super_block *sb);
 const cetrafs_superblock_t *cetrafs_sb_raw(struct super_block *sb);
+/* fs.c: the inode table, resolved through the published layout's
+ * segments -- never through the superblock's fields. */
+const struct cetrafs_iseg *cetrafs_sb_isegs(struct super_block *sb, u32 *n);
+u64 cetrafs_sb_inodes(struct super_block *sb);
+u64 cetrafs_ino_bit(struct super_block *sb, u64 ino, u64 *bit);
+u64 cetrafs_lba_ino(struct super_block *sb, u64 lba);
+bool cetrafs_lba_in_ibmap(struct super_block *sb, u64 lba);
+/* alloc.c: the inode bitmap's blocks across the table's segments. */
+bool cetrafs_ibmap_block(struct super_block *sb, u64 k, u64 *lba, u64 *first, u64 *nbits);
+void cetrafs_ibmap_invalidate(struct super_block *sb);
 
 /*
  * Is [lba, lba+count) an address a FILE's blocks may legally occupy?

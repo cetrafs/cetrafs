@@ -1182,14 +1182,7 @@ static int cetrafs_cas_nocaw(struct super_block *sb,
  */
 static void cetrafs_cas_refused_damage(struct super_block *sb, u64 fs_lba)
 {
-    const cetrafs_superblock_t *raw = cetrafs_sb_raw(sb);
-    u64 itab = raw ? le64_to_cpu(raw->inode_table_start) : 0;
-    u64 icount = raw ? le32_to_cpu(raw->inodes_count) : 0;
-
-    if (raw && fs_lba >= itab && fs_lba < itab + icount)
-        cetrafs_sb_corrupt(sb, fs_lba - itab + 1);
-    else
-        cetrafs_sb_corrupt(sb, 0);
+    cetrafs_sb_corrupt(sb, cetrafs_lba_ino(sb, fs_lba));
 }
 
 /* Seeds a mutator refused (a torn or edited caller copy), each costing
@@ -1537,10 +1530,7 @@ static int cetrafs_cas_region_seeded_impl(struct super_block *sb,
              * bytes. The raw-path sg duel proved the array atomic even
              * cross-port, so if two nodes both win one bit the
              * divergence MUST be visible here. */
-            const cetrafs_superblock_t *_rsb = cetrafs_sb_raw(sb);
-
-            if (_rsb && fs_lba >= le64_to_cpu(_rsb->inode_bmap_start) &&
-                fs_lba < le64_to_cpu(_rsb->inode_bmap_start) + le64_to_cpu(_rsb->inode_bmap_blocks))
+            if (cetrafs_lba_in_ibmap(sb, fs_lba))
                 ctrace("IBCAS fs_lba=%llu reg=%u dev_lba=%llu att=%d ret=%d old=%16ph new=%16ph\n",
                         (unsigned long long) fs_lba, region_idx, (unsigned long long) dev_lba, attempt, ret,
                         old, new);

@@ -529,21 +529,114 @@ u64 cetrafs_ibmap_busy_skip_count(void)
  * contended does it wait a moment and go round again. Node 0 starts at
  * region 0, as every node did.
  */
+/*
+ * One swap unit of the inode bitmap: its block, its index in the block,
+ * the inode its bit 0 stands for and how many of its bits are inodes.
+ * Units are counted across the table's segments in inode order, so
+ * every unit lies wholly inside one segment's bitmap.
+ */
+struct cetrafs_ibmap_unit {
+    u64 lba;
+    u64 r;
+    u64 first_ino;
+    u64 bits;
+};
+
+/* Unit 'idx' of the table 's' (n segments), or false: there is none --
+ * and then *count, if asked for, is how many there are. */
+static bool cetrafs_ibmap_unit(const struct cetrafs_iseg *s, u32 n, unsigned int region, u64 idx,
+                               struct cetrafs_ibmap_unit *u, u64 *count)
+{
+    const u64 rbits = (u64) region * 8, per_block = CETRAFS_BLOCK_SIZE / region;
+    u64 total = 0;
+    u32 i;
+
+    for (i = 0; i < n; i++) {
+        u64 nr = DIV_ROUND_UP(s[i].count, rbits);
+
+        if (idx - total < nr) {
+            u64 k = idx - total, blk = div64_u64(k, per_block);
+
+            u->lba = s[i].bmap + blk;
+            u->r = k - blk * per_block;
+            u->first_ino = s[i].first + k * rbits;
+            u->bits = min_t(u64, rbits, s[i].count - k * rbits);
+            return true;
+        }
+        total += nr;
+    }
+    if (count)
+        *count = total;
+    return false;
+}
+
+/* The unit holding inode 'ino''s bit, and the bit in it. */
+static bool cetrafs_ibmap_unit_of(const struct cetrafs_iseg *s, u32 n, unsigned int region, u64 ino,
+                                  struct cetrafs_ibmap_unit *u, u64 *bit)
+{
+    const struct cetrafs_iseg *g = cetrafs_iseg_find(s, n, ino);
+    const u64 rbits = (u64) region * 8;
+    u64 k;
+
+    if (!g)
+        return false;
+    k = div64_u64(ino - g->first, rbits);
+    *bit = ino - g->first - k * rbits;
+    return cetrafs_ibmap_unit(g, 1, region, k, u, NULL);
+}
+
+/*
+ * Bitmap block 'k' of the inode table, counted across its segments in
+ * inode order: its address, the inode its bit 0 stands for, and how many
+ * of its bits are inodes. false: there is no block k.
+ */
+bool cetrafs_ibmap_block(struct super_block *sb, u64 k, u64 *lba, u64 *first, u64 *nbits)
+{
+    u32 n, i;
+    const struct cetrafs_iseg *s = cetrafs_sb_isegs(sb, &n);
+
+    for (i = 0; s && i < n; i++) {
+        u64 nb = cetrafs_iseg_bmap_blocks(&s[i]);
+
+        if (k < nb) {
+            *lba = s[i].bmap + k;
+            *first = s[i].first + k * CETRAFS_BITS_PER_BLOCK;
+            *nbits = min_t(u64, CETRAFS_BITS_PER_BLOCK, s[i].count - k * CETRAFS_BITS_PER_BLOCK);
+            return true;
+        }
+        k -= nb;
+    }
+    return false;
+}
+
+/* Every inode-bitmap block dropped from this node's cache: the next
+ * read of each is the device's. */
+void cetrafs_ibmap_invalidate(struct super_block *sb)
+{
+    u64 k, lba, first, nbits;
+
+    for (k = 0; cetrafs_ibmap_block(sb, k, &lba, &first, &nbits); k++) {
+        cetrafs_invalidate_block(sb, lba);
+        cond_resched(); /* rule 14: a walk over a disk-read count */
+    }
+}
+
 static long cetrafs_inode_bitmap_cas_alloc(struct super_block *sb)
 {
     const cetrafs_superblock_t *raw_sb = cetrafs_sb_raw(sb);
     unsigned int region = cetrafs_cas_region_size(sb);
-    unsigned int regions_per_block = CETRAFS_BLOCK_SIZE / region;
-    u64 start = le64_to_cpu(raw_sb->inode_bmap_start);
-    u64 nbits = le32_to_cpu(raw_sb->inodes_count);
-    u64 nregions = DIV_ROUND_UP(nbits, (u64) region * 8);
+    u32 nseg;
+    const struct cetrafs_iseg *seg = cetrafs_sb_isegs(sb, &nseg);
+    struct cetrafs_ibmap_unit u;
+    u64 nregions = 0;
     u32 nodes = max_t(u32, le32_to_cpu(raw_sb->node_table_count), 1);
     bool spread = !READ_ONCE(cetrafs_ibmap_spread_off);
     u64 first = 0, k;
     unsigned int pass;
     u32 me = 0;
 
-    if (!nregions || nregions > le64_to_cpu(raw_sb->inode_bmap_blocks) * regions_per_block)
+    cetrafs_ibmap_unit(seg, nseg, region, U64_MAX, &u, &nregions);
+    if (!nregions)
         return -EIO; /* refused at mount (cetrafs_validate_layout()) */
     if (spread) {
         int as = READ_ONCE(cetrafs_ibmap_start_as_node);
@@ -567,21 +660,20 @@ static long cetrafs_inode_bitmap_cas_alloc(struct super_block *sb)
         }
         for (k = 0; k < nregions; k++) {
             u64 idx = (first + k) % nregions;
-            u64 blk = div_u64(idx, regions_per_block);
-            unsigned int r = (unsigned int) (idx - blk * regions_per_block);
-            u64 base = idx * region * 8;
             struct cetrafs_bmap_cas_ctx ctx = {.alloc = true};
             bool image_only;
             int ret;
 
             cond_resched();
-            ctx.valid_bits = min_t(u64, (u64) region * 8, nbits - base);
+            if (!cetrafs_ibmap_unit(seg, nseg, region, idx, &u, NULL))
+                return -EIO; /* counted above from the same list */
+            ctx.valid_bits = u.bits;
 
         again:
             if (idx < 64 && (READ_ONCE(cetrafs_ibmap_busy_regions) & (1ULL << idx)))
                 ret = -EBUSY; /* test-only; see the parameter */
             else
-                ret = cetrafs_cas_region_judged(sb, start + blk, r, cetrafs_bmap_cas_mutate, &ctx, &image_only);
+                ret = cetrafs_cas_region_judged(sb, u.lba, u.r, cetrafs_bmap_cas_mutate, &ctx, &image_only);
             if (ret == 0 && image_only && !READ_ONCE(cetrafs_ibmap_trust_image)) {
                 /* Decided from the image alone: the bit is set, but a
                  * peer that read the same region built the same bytes,
@@ -595,20 +687,20 @@ static long cetrafs_inode_bitmap_cas_alloc(struct super_block *sb)
                  * scrub cycle would free nothing (review F-11). */
                 atomic64_inc(&cetrafs_ibmap_abandoned);
                 if (!READ_ONCE(cetrafs_ibmap_abandon_no_stamp)) {
-                    int sret = cetrafs_inode_stamp_unborn(sb, base + ctx.bit + 1);
+                    int sret = cetrafs_inode_stamp_unborn(sb, u.first_ino + ctx.bit);
 
                     if (sret < 0)
                         pr_warn("inode bitmap: ino=%llu could not be stamped dead (%d) -- it stays allocated until "
                                 "fsck -r frees it, and the scrub frees nothing while it is unwritten\n",
-                                (unsigned long long) (base + ctx.bit + 1), sret);
+                                (unsigned long long) (u.first_ino + ctx.bit), sret);
                 }
                 pr_warn("inode bitmap: bit %llu was claimed by a swap whose outcome was unknown -- not "
                         "taken; another number is used\n",
-                        (unsigned long long) (base + ctx.bit));
+                        (unsigned long long) (u.first_ino + ctx.bit - 1));
                 goto again;
             }
             if (ret == 0)
-                return (long) (base + ctx.bit);
+                return (long) (u.first_ino + ctx.bit - 1);
             if (ret == -ENOSPC)
                 continue; /* region full */
             if (ret == -EBUSY && spread) {
@@ -628,25 +720,19 @@ static long cetrafs_inode_bitmap_cas_alloc(struct super_block *sb)
     return -EIO;
 }
 
-static int cetrafs_inode_bitmap_cas_free(struct super_block *sb, u64 bit)
+static int cetrafs_inode_bitmap_cas_free(struct super_block *sb, u64 ino)
 {
-    const cetrafs_superblock_t *raw_sb = cetrafs_sb_raw(sb);
-    unsigned int region = cetrafs_cas_region_size(sb);
-    u64 blk = bit / CETRAFS_BITS_PER_BLOCK;
-    u64 bit_in_block = bit % CETRAFS_BITS_PER_BLOCK;
-    unsigned int r = (unsigned int) (bit_in_block / (region * 8));
-    u64 base = blk * CETRAFS_BITS_PER_BLOCK + (u64) r * region * 8;
-    u64 nbits = le32_to_cpu(raw_sb->inodes_count);
+    u32 nseg;
+    const struct cetrafs_iseg *seg = cetrafs_sb_isegs(sb, &nseg);
     struct cetrafs_bmap_cas_ctx ctx = {.alloc = false};
+    struct cetrafs_ibmap_unit u;
     int ret;
 
-    if (blk >= le64_to_cpu(raw_sb->inode_bmap_blocks))
+    if (!seg || !cetrafs_ibmap_unit_of(seg, nseg, cetrafs_cas_region_size(sb), ino, &u, &ctx.bit))
         return -EINVAL;
+    ctx.valid_bits = u.bits;
 
-    ctx.bit = bit_in_block - (u64) r * region * 8;
-    ctx.valid_bits = min_t(u64, (u64) region * 8, nbits > base ? nbits - base : 0);
-
-    ret = cetrafs_cas_region(sb, le64_to_cpu(raw_sb->inode_bmap_start) + blk, r, cetrafs_bmap_cas_mutate, &ctx);
+    ret = cetrafs_cas_region(sb, u.lba, u.r, cetrafs_bmap_cas_mutate, &ctx);
     /* The CAS layer maps the mutate's "already free" (>0) to success, so
      * recover the arbiter verdict from the ctx: success without clearing
      * means someone else freed this number first and THEY own the blocks.
@@ -666,7 +752,7 @@ static int cetrafs_inode_bitmap_cas_free(struct super_block *sb, u64 bit)
      * oracle keys on the BLOCK-level "double free of extent" message,
      * which since the ctx.cleared fix means an actual bug again. */
     if (ret > 0)
-        pr_debug("inode bitmap: bit %llu was already free (lost the free arbitration)\n", (unsigned long long) bit);
+        pr_debug("inode bitmap: bit %llu was already free (lost the free arbitration)\n", (unsigned long long) (ino - 1));
     /* ret > 0 ("was already free") is deliberately passed through rather
      * than flattened to success: the caller must not credit the
      * free-inode count for a bit that was already clear, or a double
@@ -813,10 +899,10 @@ static int cetrafs_birth_read(struct super_block *sb, u64 ino, cetrafs_inode_t *
  * here (the inode bitmap is written by CAS only), so the drop sticks. */
 static int cetrafs_inode_is_allocated_fresh(struct super_block *sb, u64 ino, bool *out_set)
 {
-    const cetrafs_superblock_t *raw_sb = cetrafs_sb_raw(sb);
+    u64 bit, lba = cetrafs_ino_bit(sb, ino, &bit);
 
-    if (raw_sb && ino && ino <= le32_to_cpu(raw_sb->inodes_count))
-        cetrafs_invalidate_block(sb, le64_to_cpu(raw_sb->inode_bmap_start) + (ino - 1) / CETRAFS_BITS_PER_BLOCK);
+    if (lba)
+        cetrafs_invalidate_block(sb, lba);
     return cetrafs_inode_is_allocated(sb, ino, out_set);
 }
 
@@ -1196,7 +1282,7 @@ int cetrafs_free_inode(struct super_block *sb, u64 ino)
         }
     }
 
-    ret = cetrafs_inode_bitmap_cas_free(sb, ino - 1);
+    ret = cetrafs_inode_bitmap_cas_free(sb, ino);
     if (ret > 0)
         return 1; /* ALREADY free: someone else's free won the CAS. Distinct
                    * from 0 so a caller arbitrating "who frees the dead
@@ -1325,7 +1411,7 @@ int cetrafs_free_inode_number_claimed(struct super_block *sb, u64 ino)
 
     /* The bit has been ours since the claim: no create can have taken
      * it, so the birth registry has nothing to say about it. */
-    ret = cetrafs_inode_bitmap_cas_free(sb, ino - 1);
+    ret = cetrafs_inode_bitmap_cas_free(sb, ino);
     if (!ret)
         cetrafs_sb_adjust_free_inodes(sb, 1);
     cetrafs_sb_birth_ungate(sb, true, nofs);
@@ -3019,14 +3105,13 @@ static int cetrafs_bitmap_test_bit(struct super_block *sb, u64 bmap_lba, u64 nbl
  */
 int cetrafs_inode_is_allocated(struct super_block *sb, u64 ino, bool *out_set)
 {
-    const cetrafs_superblock_t *raw_sb = cetrafs_sb_raw(sb);
+    u64 bit, lba = cetrafs_ino_bit(sb, ino, &bit);
 
-    if (!raw_sb || !ino || ino > le32_to_cpu(raw_sb->inodes_count)) {
+    if (!lba) {
         *out_set = false;
         return 0;
     }
-    return cetrafs_bitmap_test_bit(sb, le64_to_cpu(raw_sb->inode_bmap_start), le64_to_cpu(raw_sb->inode_bmap_blocks),
-                                   ino - 1, out_set);
+    return cetrafs_bitmap_test_bit(sb, lba, 1, bit, out_set);
 }
 
 /*
@@ -4259,18 +4344,19 @@ int cetrafs_bg_bump_free_gen(struct super_block *sb, u32 bg_id)
 /* Count free inodes in the global inode bitmap, for statfs. */
 int cetrafs_count_free_inodes(struct super_block *sb, u64 *out_free)
 {
-    const cetrafs_superblock_t *raw_sb = cetrafs_sb_raw(sb);
-    long free;
+    u32 n, i;
+    const struct cetrafs_iseg *s = cetrafs_sb_isegs(sb, &n);
 
-    if (!raw_sb)
+    if (!s)
         return -EINVAL;
+    *out_free = 0;
+    for (i = 0; i < n; i++) {
+        long free = cetrafs_bitmap_count_free(sb, s[i].bmap, cetrafs_iseg_bmap_blocks(&s[i]), s[i].count);
 
-    free = cetrafs_bitmap_count_free(sb, le64_to_cpu(raw_sb->inode_bmap_start), le64_to_cpu(raw_sb->inode_bmap_blocks),
-                                     le32_to_cpu(raw_sb->inodes_count));
-    if (free < 0)
-        return (int) free;
-
-    *out_free = (u64) free;
+        if (free < 0)
+            return (int) free;
+        *out_free += free;
+    }
     return 0;
 }
 

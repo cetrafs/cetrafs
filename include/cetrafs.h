@@ -1955,6 +1955,55 @@ static inline u64 cetrafs_calc_inode_table_blocks(u64 inodes_count, u32 inode_si
     return inodes_count;
 }
 
+/*
+ * One run of the inode table as a reader resolves it: inodes
+ * [first, first + count) -- numbered from 1 -- whose bitmap starts at
+ * block 'bmap' (bit 0 is inode 'first') and whose records start at block
+ * 'table', one per block. The kernel and the tools build the list once
+ * from the superblock and resolve every inode through it, never through
+ * the superblock's fields directly.
+ */
+struct cetrafs_iseg {
+    u64 first;
+    u64 count;
+    u64 bmap;
+    u64 table;
+};
+
+static inline u64 cetrafs_iseg_bmap_blocks(const struct cetrafs_iseg *s)
+{
+    return cetrafs_calc_inode_bmap_blocks(s->count);
+}
+
+/* The run holding inode 'ino', or NULL: none does. */
+static inline const struct cetrafs_iseg *cetrafs_iseg_find(const struct cetrafs_iseg *s, u32 n, u64 ino)
+{
+    while (n--)
+        if (ino >= s[n].first)
+            return ino - s[n].first < s[n].count ? &s[n] : NULL;
+    return NULL;
+}
+
+/* The block holding inode 'ino''s record, or 0: no such inode. */
+static inline u64 cetrafs_iseg_record(const struct cetrafs_iseg *s, u32 n, u64 ino)
+{
+    const struct cetrafs_iseg *g = cetrafs_iseg_find(s, n, ino);
+
+    return g ? g->table + (ino - g->first) : 0;
+}
+
+/* The bitmap block holding inode 'ino''s bit, and the bit in it; 0: no
+ * such inode. */
+static inline u64 cetrafs_iseg_bit(const struct cetrafs_iseg *s, u32 n, u64 ino, u64 *bit)
+{
+    const struct cetrafs_iseg *g = cetrafs_iseg_find(s, n, ino);
+
+    if (!g)
+        return 0;
+    *bit = (ino - g->first) % CETRAFS_BITS_PER_BLOCK;
+    return g->bmap + (ino - g->first) / CETRAFS_BITS_PER_BLOCK;
+}
+
 static inline u64 cetrafs_default_inodes_for_bytes(u64 bytes_total)
 {
     /* heuristic for mkfs when user does not specify -N */

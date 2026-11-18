@@ -315,6 +315,12 @@ struct cetrafs_bg_layout {
     struct cetrafs_lba_range *bg_segs;
     u32 bg_nsegs;
 
+    /* The inode table, in inode order (struct cetrafs_iseg): every
+     * inode number resolves through this, never through the superblock's
+     * fields. A refresh publishes a new list, never edits this one. */
+    struct cetrafs_iseg *isegs;
+    u32 nisegs;
+
     struct cetrafs_bg_layout *older; /* superseded, freed at unmount */
     u32 nchunks;
     struct cetrafs_bg_chunk *chunk[];
@@ -1047,6 +1053,58 @@ static inline struct cetrafs_bg_layout *cetrafs_sb_layout_of(struct cetrafs_sb_i
     return sbi ? smp_load_acquire(&sbi->layout) : NULL;
 }
 
+/* The inode table as this node has it, in inode order; *n segments.
+ * NULL before the mount has built a layout. */
+const struct cetrafs_iseg *cetrafs_sb_isegs(struct super_block *sb, u32 *n)
+{
+    struct cetrafs_bg_layout *l = cetrafs_sb_layout_of(sb ? sb->s_fs_info : NULL);
+
+    *n = l ? l->nisegs : 0;
+    return l ? l->isegs : NULL;
+}
+
+/* How many inodes the table holds. */
+u64 cetrafs_sb_inodes(struct super_block *sb)
+{
+    struct cetrafs_bg_layout *l = cetrafs_sb_layout_of(sb ? sb->s_fs_info : NULL);
+
+    return l ? le32_to_cpu(l->raw.inodes_count) : 0;
+}
+
+/* The inode whose record is block 'lba', or 0: it holds none. */
+u64 cetrafs_lba_ino(struct super_block *sb, u64 lba)
+{
+    u32 n, i;
+    const struct cetrafs_iseg *s = cetrafs_sb_isegs(sb, &n);
+
+    for (i = 0; s && i < n; i++)
+        if (lba >= s[i].table && lba - s[i].table < s[i].count)
+            return s[i].first + (lba - s[i].table);
+    return 0;
+}
+
+/* Is block 'lba' one of the inode bitmap's? */
+bool cetrafs_lba_in_ibmap(struct super_block *sb, u64 lba)
+{
+    u32 n, i;
+    const struct cetrafs_iseg *s = cetrafs_sb_isegs(sb, &n);
+
+    for (i = 0; s && i < n; i++)
+        if (lba >= s[i].bmap && lba - s[i].bmap < cetrafs_iseg_bmap_blocks(&s[i]))
+            return true;
+    return false;
+}
+
+/* The bitmap block holding inode 'ino''s bit, and the bit; 0: no such
+ * inode. */
+u64 cetrafs_ino_bit(struct super_block *sb, u64 ino, u64 *bit)
+{
+    u32 n;
+    const struct cetrafs_iseg *s = cetrafs_sb_isegs(sb, &n);
+
+    return s ? cetrafs_iseg_bit(s, n, ino, bit) : 0;
+}
+
 /* The chunk holding bg_id in the current layout, and its index there;
  * NULL for an id the layout does not have. The bound and the chunk come
  * from ONE snapshot, so a valid id always lands in a chunk that exists. */
@@ -1108,6 +1166,18 @@ static struct cetrafs_bg_layout *cetrafs_layout_alloc(const cetrafs_superblock_t
     if (!l)
         return NULL;
     memcpy(&l->raw, raw, sizeof(*raw));
+    l->isegs = kmalloc(sizeof(*l->isegs), GFP_KERNEL);
+    if (!l->isegs) {
+        kvfree(l);
+        return NULL;
+    }
+    l->isegs[0] = (struct cetrafs_iseg) {
+        .first = 1,
+        .count = le32_to_cpu(raw->inodes_count),
+        .bmap = le64_to_cpu(raw->inode_bmap_start),
+        .table = le64_to_cpu(raw->inode_table_start),
+    };
+    l->nisegs = 1;
     l->bg_count = nbg;
     l->nchunks = nchunks;
     for (ci = 0; ci < nchunks; ci++) {
@@ -1119,6 +1189,7 @@ static struct cetrafs_bg_layout *cetrafs_layout_alloc(const cetrafs_superblock_t
         if (!l->chunk[ci]) {
             while (ci-- > have)
                 kvfree(l->chunk[ci]);
+            kfree(l->isegs);
             kvfree(l);
             return NULL;
         }
@@ -1142,6 +1213,7 @@ static void cetrafs_layout_discard(struct cetrafs_bg_layout *l, const struct cet
     for (ci = prev ? prev->nchunks : 0; ci < l->nchunks; ci++)
         kvfree(l->chunk[ci]);
     kfree(l->bg_segs);
+    kfree(l->isegs);
     kvfree(l);
 }
 
@@ -1629,6 +1701,7 @@ static void cetrafs_layout_free_chain(struct cetrafs_bg_layout *l)
         struct cetrafs_bg_layout *older = l->older;
 
         kfree(l->bg_segs);
+        kfree(l->isegs);
         kvfree(l);
         l = older;
     }
@@ -4682,17 +4755,7 @@ int cetrafs_sb_adjust_free_inodes(struct super_block *sb, s64 delta)
  */
 static int cetrafs_sb_recount_free_inodes(struct super_block *sb, u64 *out)
 {
-    const cetrafs_superblock_t *raw_sb = cetrafs_sb_raw(sb);
-    u64 bmap, nblocks, i;
-
-    if (!raw_sb)
-        return -EINVAL;
-    bmap = le64_to_cpu(raw_sb->inode_bmap_start);
-    nblocks = le64_to_cpu(raw_sb->inode_bmap_blocks);
-    for (i = 0; i < nblocks; i++) {
-        cetrafs_invalidate_block(sb, bmap + i);
-        cond_resched(); /* rule 14: a walk over a disk-read count */
-    }
+    cetrafs_ibmap_invalidate(sb);
     return cetrafs_count_free_inodes(sb, out);
 }
 

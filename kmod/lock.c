@@ -5957,7 +5957,8 @@ MODULE_PARM_DESC(sweep_read_stall_ms, "TEST ONLY: the mount's claim sweep sleeps
 int cetrafs_lock_sweep_own_claims(struct super_block *sb, u32 my_node_id)
 {
     const cetrafs_superblock_t *raw_sb = cetrafs_sb_raw(sb);
-    u64 bmap, nbmap, ninodes, blk, seen = 0, cleared = 0;
+    u64 lba, first, nbits;
+    u64 blk, seen = 0, cleared = 0;
     u64 bit = 1ULL << (my_node_id % CETRAFS_MAX_READER_NODES);
     struct cetrafs_sweep_pending *pd;
     int ret = 0;
@@ -5967,11 +5968,8 @@ int cetrafs_lock_sweep_own_claims(struct super_block *sb, u32 my_node_id)
     pd = kvzalloc(sizeof(*pd), GFP_KERNEL);
     if (!pd)
         return -ENOMEM;
-    bmap = le64_to_cpu(raw_sb->inode_bmap_start);
-    nbmap = le64_to_cpu(raw_sb->inode_bmap_blocks);
-    ninodes = le32_to_cpu(raw_sb->inodes_count);
 
-    for (blk = 0; blk < nbmap && !ret; blk++) {
+    for (blk = 0; cetrafs_ibmap_block(sb, blk, &lba, &first, &nbits) && !ret; blk++) {
         struct buffer_head *bh;
         u64 i;
 
@@ -5980,15 +5978,15 @@ int cetrafs_lock_sweep_own_claims(struct super_block *sb, u32 my_node_id)
         ret = cetrafs_sb_mount_beat(sb);
         if (ret)
             return ret;
-        bh = cetrafs_bread_retry(sb, bmap + blk);
+        bh = cetrafs_bread_retry(sb, lba);
         if (!bh)
             return -EIO;
         for (i = 0; i < CETRAFS_BLOCK_SIZE * 8; i++) {
-            u64 ino = blk * CETRAFS_BLOCK_SIZE * 8 + i + 1;
+            u64 ino = first + i;
             cetrafs_inode_t raw;
             struct cetrafs_own_claims_ctx ctx = {.me = my_node_id, .my_incarnation = cetrafs_sb_incarnation(sb)};
 
-            if (ino > ninodes)
+            if (i >= nbits)
                 break;
             if (!(i & 1023))
                 cond_resched();
@@ -6318,28 +6316,26 @@ static int cetrafs_lock_resweep_one(struct super_block *sb, u64 ino, u32 me)
 int cetrafs_lock_resweep_own_claims(struct super_block *sb, u32 my_node_id, bool (*stop)(struct super_block *))
 {
     const cetrafs_superblock_t *raw_sb = cetrafs_sb_raw(sb);
-    u64 bmap, nbmap, ninodes, blk;
+    u64 lba, first, nbits;
+    u64 blk;
     u64 bit = 1ULL << (my_node_id % CETRAFS_MAX_READER_NODES);
     int cleared = 0;
 
     if (!raw_sb)
         return -EINVAL;
-    bmap = le64_to_cpu(raw_sb->inode_bmap_start);
-    nbmap = le64_to_cpu(raw_sb->inode_bmap_blocks);
-    ninodes = le32_to_cpu(raw_sb->inodes_count);
 
-    for (blk = 0; blk < nbmap; blk++) {
-        struct buffer_head *bh = cetrafs_bread_retry(sb, bmap + blk);
+    for (blk = 0; cetrafs_ibmap_block(sb, blk, &lba, &first, &nbits); blk++) {
+        struct buffer_head *bh = cetrafs_bread_retry(sb, lba);
         u64 i;
 
         if (!bh)
             return -EIO;
         for (i = 0; i < CETRAFS_BLOCK_SIZE * 8; i++) {
-            u64 ino = blk * CETRAFS_BLOCK_SIZE * 8 + i + 1;
+            u64 ino = first + i;
             cetrafs_inode_t raw;
             int r;
 
-            if (ino > ninodes)
+            if (i >= nbits)
                 break;
             if (!(i & 1023)) {
                 cond_resched();

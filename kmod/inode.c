@@ -141,11 +141,10 @@ bool cetrafs_inode_crcs_ok(const cetrafs_inode_t *in)
  * CAS image of an inode record without duplicating either rule. */
 u64 cetrafs_inode_lba(struct super_block *sb, u64 ino)
 {
-    const cetrafs_superblock_t *raw_sb = cetrafs_sb_raw(sb);
+    u32 n;
+    const struct cetrafs_iseg *s = cetrafs_sb_isegs(sb, &n);
 
-    if (!raw_sb || !ino || ino > le32_to_cpu(raw_sb->inodes_count))
-        return 0;
-    return le64_to_cpu(raw_sb->inode_table_start) + (ino - 1);
+    return s ? cetrafs_iseg_record(s, n, ino) : 0;
 }
 
 /*
@@ -176,16 +175,12 @@ static atomic_t *cetrafs_rec_epoch_slot(struct super_block *sb, u64 lba)
 
 void cetrafs_rec_epoch_bump(struct super_block *sb, u64 lba)
 {
-    const cetrafs_superblock_t *raw_sb = cetrafs_sb_raw(sb);
-    u64 first;
+    u32 n;
 
     /* Not an inode record: nothing samples it. Without a layout (mount
      * still building it) bump anyway -- a spare re-read, never a miss. */
-    if (raw_sb) {
-        first = le64_to_cpu(raw_sb->inode_table_start);
-        if (lba < first || lba - first >= le32_to_cpu(raw_sb->inodes_count))
-            return;
-    }
+    if (cetrafs_sb_isegs(sb, &n) && !cetrafs_lba_ino(sb, lba))
+        return;
     smp_mb__before_atomic(); /* the write is visible before the bump */
     atomic_inc(cetrafs_rec_epoch_slot(sb, lba));
     smp_mb__after_atomic();
@@ -405,17 +400,11 @@ int cetrafs_read_raw_inode_walk(struct super_block *sb, u64 ino, cetrafs_inode_t
 
 static int __cetrafs_read_raw_inode(struct super_block *sb, u64 ino, cetrafs_inode_t *out, bool zero_ok)
 {
-    const cetrafs_superblock_t *raw_sb = cetrafs_sb_raw(sb);
-    u64 blk;
+    u64 blk = cetrafs_inode_lba(sb, ino);
     int attempt;
 
-    if (!raw_sb)
+    if (!blk)
         return -EINVAL;
-
-    if (!ino || ino > le32_to_cpu(raw_sb->inodes_count))
-        return -EINVAL;
-
-    blk = le64_to_cpu(raw_sb->inode_table_start) + (ino - 1);
 
     for (attempt = 0; attempt < CETRAFS_RAW_INODE_READ_RETRIES; attempt++) {
         struct buffer_head *bh;
@@ -586,14 +575,11 @@ int cetrafs_read_raw_inode_overlaid(struct super_block *sb, struct inode *inode,
 
 void cetrafs_invalidate_raw_inode(struct super_block *sb, u64 ino)
 {
-    const cetrafs_superblock_t *raw_sb = cetrafs_sb_raw(sb);
     struct buffer_head *bh;
-    sector_t blk;
+    sector_t blk = cetrafs_inode_lba(sb, ino);
 
-    if (!raw_sb || !ino || ino > le32_to_cpu(raw_sb->inodes_count))
+    if (!blk)
         return;
-
-    blk = le64_to_cpu(raw_sb->inode_table_start) + (ino - 1);
 
     /*
      * A DIRTY record buffer makes the invalidate below a silent no-op.
@@ -1619,7 +1605,7 @@ static int __cetrafs_write_raw_inode(struct super_block *sb, u64 ino, const cetr
                (unsigned long long) cetrafs_le64(in->size), (unsigned int) cetrafs_le16(in->eh.eh_entries),
                (unsigned int) cetrafs_le16(in->eh.eh_depth), __builtin_return_address(0));
 
-    const cetrafs_superblock_t *raw_sb = cetrafs_sb_raw(sb);
+    const u64 rec = cetrafs_inode_lba(sb, ino);
     cetrafs_inode_t stamped = *in;
     struct buffer_head *bh;
     int ret = 0;
@@ -1648,10 +1634,7 @@ static int __cetrafs_write_raw_inode(struct super_block *sb, u64 ino, const cetr
             return fret; /* the record would name blocks still FREE on disk */
     }
 
-    if (!raw_sb)
-        return -EINVAL;
-
-    if (!ino || ino > le32_to_cpu(raw_sb->inodes_count))
+    if (!rec)
         return -EINVAL;
 
     if (cetrafs_sb_is_fenced(sb))
@@ -1679,7 +1662,7 @@ static int __cetrafs_write_raw_inode(struct super_block *sb, u64 ino, const cetr
     if (serialise)
         cetrafs_sb_cas_lock(sb);
 
-    bh = sb_getblk(sb, le64_to_cpu(raw_sb->inode_table_start) + (ino - 1));
+    bh = sb_getblk(sb, rec);
     if (!bh) {
         if (serialise)
             cetrafs_sb_cas_unlock(sb);

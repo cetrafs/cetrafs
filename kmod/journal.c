@@ -2443,13 +2443,12 @@ MODULE_PARM_DESC(journal_owner_fail_open, "TEST ONLY: judge an unreadable owner 
 static int cetrafs_journal_owner_holds(struct super_block *sb, const struct cetrafs_journal_replay_entry *e,
                                        bool *is_dir)
 {
-    const cetrafs_superblock_t *raw_sb = cetrafs_sb_raw(sb);
     cetrafs_inode_t raw;
     bool held = false;
     int ret;
 
     *is_dir = false;
-    if (!e->owner_ino || !raw_sb || e->owner_ino > le32_to_cpu(raw_sb->inodes_count))
+    if (!cetrafs_inode_lba(sb, e->owner_ino))
         return 0; /* no writer of this format names no owner */
     cetrafs_invalidate_raw_inode(sb, e->owner_ino);
     if (READ_ONCE(cetrafs_journal_owner_read_fail)) {

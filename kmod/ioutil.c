@@ -1037,9 +1037,9 @@ const char *cetrafs_block_role(struct super_block *sb, u64 lba)
         return "a Zone Group record";
     if (CETRAFS_IN(le64_to_cpu(r->bg_table_start), le64_to_cpu(r->bg_table_first_count)))
         return "a Block Group descriptor";
-    if (CETRAFS_IN(le64_to_cpu(r->inode_bmap_start), le64_to_cpu(r->inode_bmap_blocks)))
+    if (cetrafs_lba_in_ibmap(sb, lba))
         return "the inode bitmap";
-    if (CETRAFS_IN(le64_to_cpu(r->inode_table_start), le64_to_cpu(r->inode_table_blocks)))
+    if (cetrafs_lba_ino(sb, lba))
         return "an inode record";
     if (CETRAFS_IN(le64_to_cpu(r->node_table_start), le64_to_cpu(r->node_table_blocks)))
         return "a Node Registry row";

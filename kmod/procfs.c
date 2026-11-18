@@ -197,7 +197,7 @@ static int cetrafs_proc_info_show(struct seq_file *m, void *v)
     seq_printf(m, "layout_gen: %llu\n", (unsigned long long) le64_to_cpu(raw_sb->layout_gen));
     seq_printf(m, "bg_size_blocks: %llu\n", (unsigned long long) le64_to_cpu(raw_sb->bg_size_blocks));
 
-    seq_printf(m, "inodes_count: %u\n", le32_to_cpu(raw_sb->inodes_count));
+    seq_printf(m, "inodes_count: %llu\n", (unsigned long long) cetrafs_sb_inodes(sb));
     ret = cetrafs_sb_get_free_inodes(sb, &free_inodes);
     if (ret)
         seq_printf(m, "free_inodes: unavailable (%d)\n", ret);
