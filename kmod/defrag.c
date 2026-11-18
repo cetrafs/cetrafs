@@ -587,8 +587,17 @@ MODULE_PARM_DESC(defrag_restart_from_zero, "TEST ONLY: a defrag pass re-moves th
  * the prefix check verifies them like any committed rank, and nothing
  * frees them (a block is freed only where its source is not its
  * destination).
+ *
+ * What is left after them must make a segment of its own. A shorter
+ * tail placed after the kept runs is one more short extent, and the
+ * pass ends where it began: a 64 MiB run followed by one block elsewhere
+ * kept the run, moved the block to another lone block, and stayed at two
+ * extents on every pass (tests/kernel/defrag_step_bounded.sh). So kept
+ * runs are given back, the last first, until the rest makes a segment --
+ * at worst the whole file moves, as it did before.
  */
-static int cetrafs_defrag_dst_placed(const struct cetrafs_ext_list *el, struct cetrafs_defrag_dst *d, u64 *out)
+static int cetrafs_defrag_dst_placed(const struct cetrafs_ext_list *el, u64 nblocks, struct cetrafs_defrag_dst *d,
+                                     u64 *out)
 {
     u64 rank = 0;
     u32 i = 0;
@@ -619,6 +628,10 @@ static int cetrafs_defrag_dst_placed(const struct cetrafs_ext_list *el, struct c
         d->seg[d->n].count = count;
         d->n++;
         rank += count;
+    }
+    while (d->n && rank < nblocks && nblocks - rank < CETRAFS_DEFRAG_SEG_MIN) {
+        d->n--;
+        rank -= d->seg[d->n].count;
     }
     *out = rank;
     return 0;
@@ -1029,7 +1042,7 @@ int cetrafs_defrag_inode(struct inode *inode, struct cetrafs_defrag_stats *out_s
      * (322 of them, in a loaded full-gate run). The negative control
      * passes NULL and publishes nothing, same observable as before. */
     /* The runs a stopped pass already placed stay where they are. */
-    ret = cetrafs_defrag_dst_placed(&el, &dst, &placed);
+    ret = cetrafs_defrag_dst_placed(&el, nblocks, &dst, &placed);
     if (ret)
         goto out_unlock;
     if (placed == nblocks) {
