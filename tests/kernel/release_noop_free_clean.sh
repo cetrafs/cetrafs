@@ -52,7 +52,10 @@ round() {
     echo 1 >/sys/module/cetrafs/parameters/release_noop_free
     mark="$(dmesg_mark)"
     echo 2 >/sys/module/cetrafs/parameters/hb_interval_secs
-    for _ in $(seq 1 60); do
+    # The tick already queued still runs on the old 30 s interval, so the
+    # release can come a whole old interval after this: wait past it (a
+    # KASAN kernel released at 30 s, just outside a 30 s wait).
+    for _ in $(seq 1 120); do
         dmesg_since "$mark" | grep -q "BG 1 handed back" && { rel=1; break; }
         sleep 0.5
     done
