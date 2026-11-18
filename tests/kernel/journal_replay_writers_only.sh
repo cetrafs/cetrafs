@@ -116,14 +116,17 @@ round_r() {
         { fail "setup: the sweep never reached node 1's journal"; ct_exit; }
     sleep 2
     RES="kept=$(($(info journal_replay_live_kept) - k0))"
-    # The sweep off BEFORE node 2 stops beating: on the short stale
-    # window node 2 could read as dead before the unmount, and a sweep
-    # then rightly replayed the entry the round had just watched kept --
-    # leaf=applied beside kept=2, a failure of the suite, not the code.
+    # The sweep off, then the UNMOUNT -- which drains the heartbeat work
+    # -- before node 2 stops beating or the knob changes. The knob is
+    # read only by sweeps that start after it: one already past it
+    # finished its replay after the round moved on, and redid the entry
+    # it had kept, either because node 2 had gone stale or because
+    # journal_any_opener was back to 0 under it (leaf=applied beside
+    # kept=2, a failure of the suite, not the code).
     echo 1 >$P/hb_replay_sweep_off
+    umount "$MNT" 2>/dev/null || umount -l "$MNT"
     ct_unbeat
     echo 0 >$P/journal_any_opener
-    umount "$MNT" 2>/dev/null || umount -l "$MNT"
     echo 0 >$P/hb_replay_sweep_off
     reset_stale_window
     now="$(sha "$img" "$p")"
