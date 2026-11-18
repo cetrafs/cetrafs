@@ -72,8 +72,8 @@ func TestParseInfoRejectsUnknownZGFormat(t *testing.T) {
 // bites is Stale=yes actually parsing as true. TestNodeLineTracksEmitter
 // below checks the field order against procfs.c itself, so the fixture
 // going stale with the regex is no longer enough to hide a drift.
-const realCluster = `node 0: state=REGISTERED uuid=00112233-4455-6677-8899-aabbccddeeff hb_seq=42 last_seen=12345 label=nodeA caps=0x1 stale_secs=120 departure=none stale=no (this node)
-node 1: state=REGISTERED uuid=ffeeddcc-bbaa-9988-7766-554433221100 hb_seq=7 last_seen=99 label=nodeB caps=0x0 stale_secs=15 departure=dead stale=yes
+const realCluster = `node 0: state=REGISTERED uuid=00112233-4455-6677-8899-aabbccddeeff hb_seq=42 last_seen=12345 label=nodeA caps=0x1 stale_secs=120 departure=none stale=no incarnation=1 (this node)
+node 1: state=REGISTERED uuid=ffeeddcc-bbaa-9988-7766-554433221100 hb_seq=7 last_seen=99 label=nodeB caps=0x0 stale_secs=15 departure=dead stale=yes incarnation=1
 `
 
 func TestParseClusterNodes(t *testing.T) {

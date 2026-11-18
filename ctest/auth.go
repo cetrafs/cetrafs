@@ -120,13 +120,16 @@ func joinUnder(mp, relPath string) (string, error) {
 	p := filepath.Join(root, relPath)
 	real, err := filepath.EvalSymlinks(p)
 	if err != nil {
+		if isSymlinkLoop(err) {
+			return p, nil // resolves nowhere: the op itself gets ELOOP
+		}
 		if !os.IsNotExist(err) {
 			return "", err
 		}
 		dir, derr := filepath.EvalSymlinks(filepath.Dir(p))
 		if derr != nil {
-			if os.IsNotExist(derr) {
-				return p, nil // the op itself reports the missing parent
+			if os.IsNotExist(derr) || isSymlinkLoop(derr) {
+				return p, nil // the op itself reports the missing parent, or the loop
 			}
 			return "", derr
 		}
@@ -136,6 +139,15 @@ func joinUnder(mp, relPath string) (string, error) {
 		return "", fmt.Errorf("path %q resolves to %s, outside the mountpoint", relPath, real)
 	}
 	return p, nil
+}
+
+// isSymlinkLoop: EvalSymlinks gave up on a cycle of symlinks. Such a
+// path resolves nowhere -- not outside the mount either -- and the
+// kernel answers the op ELOOP. ns-fuzz's symlinks among its pool names
+// make cycles; refusing them here failed those ops with no errno at all.
+// filepath has no sentinel for it, only this message.
+func isSymlinkLoop(err error) bool {
+	return err != nil && strings.HasSuffix(err.Error(), "too many links")
 }
 
 // safeArg admits the flags and numbers mkfs and insmod are given by the

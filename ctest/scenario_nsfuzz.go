@@ -76,6 +76,14 @@ var nsFuzzLegal = map[string][]syscall.Errno{
 	// extents than its list holds), and -- under nofilelock, always -- a
 	// file it has no lock to pin (lock.c: EOPNOTSUPP).
 	"defrag": {syscall.EBUSY, syscall.EOPNOTSUPP},
+	// With a peer in the file the extent map is not rewritten under it:
+	// a preallocation is refused (B-11), and so is a zero-range that must
+	// grow the file or a punch where the peer holds the file's lock or
+	// the device cannot zero in place -- EOPNOTSUPP, which qemu takes as
+	// "write the zeros yourself" (file.c, cetrafs_fallocate()).
+	"falloc": {syscall.EOPNOTSUPP},
+	"zero":   {syscall.EOPNOTSUPP},
+	"punch":  {syscall.EOPNOTSUPP},
 	// LOCK_NB, contended; and on the default mount, taking back a lock
 	// this fd gave up (LOCK_UN suspends it) on a file unlinked meanwhile:
 	// the resume refuses a record with nlink 0 (inode.c, the apply's

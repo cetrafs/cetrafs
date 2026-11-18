@@ -59,7 +59,7 @@ var (
 	// this pattern cannot read an error, as reZGPrefix does for zg lines.
 	reNodeLine = regexp.MustCompile(
 		`^node (\d+): state=(\S+) uuid=(\S+) hb_seq=(\d+) last_seen=(\d+) label=(\S+) caps=(\S+) ` +
-			`stale_secs=(\d+) departure=(\S+) stale=(\S+)`)
+			`stale_secs=(\d+) departure=(\S+) stale=(\S+) incarnation=(\d+)`)
 	reNodePrefix = regexp.MustCompile(`^node \d+: state=`)
 )
 

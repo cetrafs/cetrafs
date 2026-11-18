@@ -110,7 +110,15 @@ func TestJoinUnderStaysInside(t *testing.T) {
 	if err := os.Symlink(outside, filepath.Join(mp, "escape")); err != nil {
 		t.Fatal(err)
 	}
-	for _, ok := range []string{"f", "d/f", "d", "missing/f"} {
+	// A cycle of symlinks resolves nowhere: let through, the op gets
+	// ELOOP from the kernel (ns-fuzz makes them among its pool names).
+	if err := os.Symlink("loopb", filepath.Join(mp, "loopa")); err != nil {
+		t.Fatal(err)
+	}
+	if err := os.Symlink("loopa", filepath.Join(mp, "loopb")); err != nil {
+		t.Fatal(err)
+	}
+	for _, ok := range []string{"f", "d/f", "d", "missing/f", "loopa", "loopa/f"} {
 		if _, err := joinUnder(mp, ok); err != nil {
 			t.Errorf("joinUnder(%q) refused: %v", ok, err)
 		}
