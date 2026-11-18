@@ -338,8 +338,8 @@ void cetrafs_bh_read_unlock(struct buffer_head *bh)
 }
 
 /* The pre-A-15 publish: dirty, for the block layer's writeback. Only the
- * fallbacks below and TEST ONLY meta_writeback use it. */
-static void cetrafs_bh_end_update_dirty(struct buffer_head *bh)
+ * fallbacks below, TEST ONLY meta_writeback and sync_test_dirty_lba use it. */
+void cetrafs_bh_end_update_dirty(struct buffer_head *bh)
 {
     cetrafs_blk_tail_settle(bh); /* dirty means writeback may write it: never with a stale tail */
     mark_buffer_dirty(bh);

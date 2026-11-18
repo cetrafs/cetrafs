@@ -830,6 +830,8 @@ u32 cetrafs_bh_begin_update_crc(struct buffer_head *bh);
  * replaces every byte. See ioutil.c. */
 struct buffer_head *cetrafs_getblk_overwrite(struct super_block *sb, sector_t block);
 void cetrafs_bh_end_update(struct super_block *sb, struct buffer_head *bh);
+/* Dirty for writeback, as before A-15: test hooks only (ioutil.c). */
+void cetrafs_bh_end_update_dirty(struct buffer_head *bh);
 void cetrafs_write_pending_buffer(struct super_block *sb, struct buffer_head *bh, unsigned int op_flags);
 bool cetrafs_refusal_definite(int err);
 u64 cetrafs_journal_op_refusal_count(void);

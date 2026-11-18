@@ -244,7 +244,10 @@ static int cetrafs_sync_fs(struct super_block *sb, int wait)
             if (tbh) {
                 cetrafs_bh_begin_update(tbh);
                 memset(tbh->b_data, 0xd7, 64);
-                cetrafs_bh_end_update(sb, tbh); /* left dirty for writeback: the point of the knob */
+                /* Dirty for writeback, the point of the knob: an
+                 * update ends held since d6c0a5d, which nothing but a
+                 * gated cetrafs write puts on the device. */
+                cetrafs_bh_end_update_dirty(tbh);
                 brelse(tbh);
             }
             /* ...and the lease runs out now, after the flushes */
