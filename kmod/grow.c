@@ -282,8 +282,8 @@ int cetrafs_grow_commit(struct super_block *sb, const struct cetrafs_grow_plan *
      * grow credits: under the growfs claim no other grow is live, so a
      * marker above the published layout_gen is a grow that died before
      * publishing, and its credit comes back out in the same swap. A
-     * shard is a Zone Group record, keyed by bg_id % zone_group_count,
-     * so shard z is reached through any Block Group id with that
+     * shard is a Zone Group record, keyed by cetrafs_sb_zg_shard(), so
+     * shard z is reached through any Block Group id with that
      * remainder -- z itself. 'published' is the superblock this node
      * refreshed to under the claim, which only a grow moves. */
     for (z = 0; z < plan->nshards; z++) {

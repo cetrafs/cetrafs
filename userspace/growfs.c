@@ -737,18 +737,17 @@ int main(int argc, char **argv)
      * segment -- header, bitmap, records -- follows the Block Group
      * segment in the same reserve.
      */
-    const u64 old_inodes = cetrafs_le32(sb.inodes_count);
+    const u32 old_inodes = cetrafs_le32(sb.inodes_count);
     u64 new_inodes = want_inodes ? want_inodes : cetrafs_default_inodes_for_bytes(target_blocks * CETRAFS_BLOCK_SIZE);
 
     if (want_inodes && want_inodes < old_inodes)
-        die_arg("-N %" PRIu64 " is fewer than the %" PRIu64 " inodes the volume has -- an inode table only grows",
+        die_arg("-N %" PRIu64 " is fewer than the %u inodes the volume has -- an inode table only grows",
                 want_inodes, old_inodes);
     if (new_inodes < old_inodes)
         new_inodes = old_inodes;
     const u64 ino_add = new_inodes - old_inodes;
     const u64 ino_span = ino_add ? 1 + cetrafs_calc_inode_bmap_blocks(ino_add) + ino_add : 0;
 
-    u32 new_z = old_z;
     u64 new_b = old_b;
     u64 reserve_blocks = 0;
     u64 tail_waste = 0;
@@ -795,8 +794,6 @@ int main(int argc, char **argv)
          * This also means the ZG table and the pending-free region do
          * not grow, so only the Block Group table has to be relocated.
          */
-        u64 cand_z = old_z;
-
         /*
          * The tail reserve now holds ONE THING: the appended Block
          * Group table segment -- its header plus a descriptor per added
@@ -818,12 +815,11 @@ int main(int argc, char **argv)
          */
         u64 need = 1 /* segment header */ + (cand_b - old_b) /* added descriptors */ + ino_span;
 
-        if (need == reserve_blocks && cand_b == new_b && cand_z == new_z)
+        if (need == reserve_blocks && cand_b == new_b)
             break;
 
         reserve_blocks = need;
         new_b = cand_b;
-        new_z = (u32) cand_z;
     }
 
     const u64 reserve_start = new_bg_start + (new_b - old_b) * bg_size;
@@ -859,18 +855,18 @@ int main(int argc, char **argv)
             " blocks\n"
             "  Block Groups: %u -> %" PRIu64 " (+%" PRIu64
             ", %llu MiB each)\n"
-            "  Zone Groups:  %u -> %u (+%u)\n"
+            "  Zone Groups:  %u -> %u (a grow adds none)\n"
             "  new BG regions: LBA %" PRIu64 " .. %" PRIu64
             "\n"
             "  tail reserve:   LBA %" PRIu64 "+%" PRIu64
             " (the appended table segments)\n"
-            "  inodes:       %" PRIu64 " -> %" PRIu64
+            "  inodes:       %u -> %" PRIu64
             "\n"
             "  unused tail:    %" PRIu64
             " blocks (rounding)\n",
             dry_run ? "(DRY-RUN)" : "plan", dev_bytes, dev_blocks, old_total, target_blocks, old_b, new_b,
-            new_b - old_b, (unsigned long long) (bg_size * CETRAFS_BLOCK_SIZE / 1024 / 1024), old_z, new_z,
-            new_z - old_z, new_bg_start, reserve_start - 1, reserve_start, reserve_blocks, old_inodes, new_inodes,
+            new_b - old_b, (unsigned long long) (bg_size * CETRAFS_BLOCK_SIZE / 1024 / 1024), old_z, old_z,
+            new_bg_start, reserve_start - 1, reserve_start, reserve_blocks, old_inodes, new_inodes,
             tail_waste);
 
     /*
@@ -1079,7 +1075,7 @@ int main(int argc, char **argv)
      * docs/internal/BG-OWNERSHIP-DESIGN.md
      */
     u32 *bg_owner = (u32 *) xcalloc(new_b, sizeof(u32));
-    u64 *zg_added = (u64 *) xcalloc(new_z, sizeof(u64));
+    u64 *zg_added = (u64 *) xcalloc(old_z, sizeof(u64));
 
     /* Only the NEW Block Groups' owners are decided or used here. The
      * existing ones are never read: on a grown volume their descriptors
@@ -1091,12 +1087,12 @@ int main(int argc, char **argv)
      * Group's free aggregate is accrued in memory by whichever node
      * owns it, so this tool must not write it under a mounted node.
      * The capacity reaches nodes through the ordinary claim path. */
-    for (u64 b = old_b; b < new_b; ++b) {
+    for (u32 b = old_b; b < new_b; ++b) {
         if (live) {
             bg_owner[b] = CETRAFS_BG_OWNER_FREE;
             continue;
         }
-        bg_owner[b] = (u32) (b % old_z);
+        bg_owner[b] = cetrafs_sb_zg_shard(&sb, b);
         /* TEST-ONLY: fold every new Block Group onto the last Zone Group,
          * the behaviour the 255-ZG branch used to have. The spread check
          * in tests/kernel/growfs_zg_cap.sh must see it. */
@@ -1191,7 +1187,7 @@ int main(int argc, char **argv)
         memset(&seg, 0, sizeof(seg));
         seg.magic = cetrafs_cpu_to_le32(CETRAFS_INOSEG_MAGIC);
         seg.count = cetrafs_cpu_to_le32((u32) ino_add);
-        seg.first_id = cetrafs_cpu_to_le32((u32) old_inodes);
+        seg.first_id = cetrafs_cpu_to_le32(old_inodes);
         seg.checksum = cetrafs_cpu_to_le64((u64) crc32c_struct(&seg, sizeof(seg), offsetof(cetrafs_seg_hdr_t, checksum),
                                                                sizeof(seg.checksum)));
         memset(blk, 0, CETRAFS_BLOCK_SIZE);
@@ -1246,7 +1242,6 @@ int main(int argc, char **argv)
      * is entirely inside sector 0 -- one swap carries all of it.
      * --------------------------------------------------------------- */
     sb.total_blocks = cetrafs_cpu_to_le64(target_blocks);
-    sb.zone_group_count = cetrafs_cpu_to_le32(new_z);
     sb.block_group_count = cetrafs_cpu_to_le32((u32) new_b);
     /* zg_table_start, bg_table_start and pending_free_start are NOT
      * touched. Nothing moved, which is the point: every address a
@@ -1262,7 +1257,7 @@ int main(int argc, char **argv)
     if (ino_add) {
         if (cetrafs_le64(sb.inode_seg_next) == 0) {
             sb.inode_seg_next = cetrafs_cpu_to_le64(iseg_lba);
-            sb.inode_first_count = cetrafs_cpu_to_le32((u32) old_inodes);
+            sb.inode_first_count = cetrafs_cpu_to_le32(old_inodes);
         } else if (!live) {
             growfs_link_tail(fd, dev, blk, cetrafs_le64(sb.inode_seg_next), cetrafs_le32(sb.inode_first_count),
                              old_inodes, CETRAFS_INOSEG_MAGIC, "inode", iseg_lba);
@@ -1471,7 +1466,7 @@ int main(int argc, char **argv)
      * needs it on an image. */
     const bool skip_agg = cetrafs_test_env("CETRAFS_GROWFS_TEST_NO_AGGREGATE") != NULL;
 
-    for (u32 z = 0; z < new_z; ++z) {
+    for (u32 z = 0; z < old_z; ++z) {
         cetrafs_zone_group_t zg;
 
         if (!zg_added[z] || skip_agg)

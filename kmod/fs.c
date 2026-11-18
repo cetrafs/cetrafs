@@ -2128,6 +2128,17 @@ static int cetrafs_validate_layout(const cetrafs_superblock_t *sb, u64 total_blo
                le32_to_cpu(sb->inode_first_count), le32_to_cpu(sb->inodes_count));
         return -EINVAL;
     }
+    /* The Zone Group table chain is room this build does not follow
+     * (A-13): a volume that has one is refused, not mounted with the
+     * Zone Groups it would have missed. */
+    if (le64_to_cpu(sb->zg_seg_next) ||
+        (le32_to_cpu(sb->zg_first_count) && le32_to_cpu(sb->zg_first_count) != le32_to_cpu(sb->zone_group_count))) {
+        pr_err("superblock: the Zone Group table has appended segments (head %llu, %u of %u Zone Groups in the "
+               "first) -- this build cannot follow them\n",
+               (unsigned long long) le64_to_cpu(sb->zg_seg_next), le32_to_cpu(sb->zg_first_count),
+               le32_to_cpu(sb->zone_group_count));
+        return -EINVAL;
+    }
     if (le64_to_cpu(sb->inode_bmap_blocks) != cetrafs_calc_inode_bmap_blocks(cetrafs_sb_inode_first_count(sb))) {
         pr_err("superblock: inode_bmap_blocks %llu, but %llu inodes need exactly %llu\n",
                (unsigned long long) le64_to_cpu(sb->inode_bmap_blocks),
@@ -2771,7 +2782,7 @@ int cetrafs_sb_layout_grow(struct super_block *sb, const cetrafs_superblock_t *n
     plan.claim = claim;
     plan.old_count = cur->bg_count;
     plan.new_count = le32_to_cpu(nw->block_group_count);
-    plan.nshards = le32_to_cpu(nw->zone_group_count);
+    plan.nshards = cetrafs_sb_zg_first_count(nw); /* cetrafs_sb_zg_shard(): b % nshards */
     plan.shard_credit = kcalloc(plan.nshards, sizeof(*plan.shard_credit), GFP_KERNEL);
     nl = plan.shard_credit ? cetrafs_layout_alloc(nw, cur) : NULL;
     if (!nl) {

@@ -1193,13 +1193,15 @@ int main(int argc, char **argv)
      * Block Groups can move between Zone Groups at runtime.
      * docs/internal/BG-OWNERSHIP-DESIGN.md
      *
-     * BG 0 still falls to ZG 0 (0 % zg_count == 0), which the root
-     * directory's one-block discount below depends on.
+     * BG 0 still falls to ZG 0 (shard 0), which the root directory's
+     * one-block discount below depends on. The shard
+     * (cetrafs_sb_zg_shard()) is what fsck and the kernel count unowned
+     * capacity under; at mkfs it is just bg % zg_count.
      */
     u32 *bg_owner_zg = (u32 *) xcalloc(B, sizeof(u32));
 
-    for (u64 b = 0; b < B; ++b)
-        bg_owner_zg[b] = (u32) (b % zg_count);
+    for (u32 b = 0; b < B; ++b)
+        bg_owner_zg[b] = cetrafs_sb_zg_shard(&sb, b);
 
     for (u32 z = 0; z < zg_count; ++z) {
         cetrafs_zone_group_t zg;

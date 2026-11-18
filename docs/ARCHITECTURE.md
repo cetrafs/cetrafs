@@ -169,6 +169,7 @@ volume through the copy when block 0 is damaged, and `-r` restores block
 | root_ino | `__le64` | inode # of `/` (always 1 today) |
 | inode_size / inodes_count | `__le32` | on-disk inode size, total inode slots |
 | inode_seg_next / inode_first_count | `__le64` / `__le32` | inode table chain head; inodes in the first segment (both 0: never grown) |
+| zg_seg_next / zg_first_count | `__le64` / `__le32` | Zone Group table chain head; Zone Groups in the first table, also the shard count (both 0: never grown). Room only: no build appends one yet, and the mount and fsck refuse a volume that has one |
 | bg_size_blocks | `__le64` | target BG span |
 | cluster_id | `__le32` | reserved: mkfs writes 0, nothing reads it (membership is the Node Registry) |
 | node_table_start / node_table_blocks | `__le64` | Node Registry LBA + block count |
@@ -200,7 +201,7 @@ checksum.
 | free_data_blocks | hot | cached aggregate of its member BGs' free counts; kept in sync by the owner and reconciled from the bitmaps whenever ownership arrives |
 | hb_seq | hot | heartbeat seq from the owner |
 | hot_checksum | hot | CRC32C over `[0, HOT_SECTOR)` with this field zeroed |
-| pool_free_blocks | hot | capacity (free blocks) of unowned Block Groups sharded to this ZG (shard key: `bg_id % zone_group_count`, the same mapping `mkfs` uses for initial assignment). Maintained by CAS at claim (debit) and release (credit), both ordered so a crash between the two records understates free space. `fsck` cross-checks each shard against the actual unowned members. Placed after `hot_checksum` so pre-0x0009 volumes read it as zero (correct: every BG starts owned) |
+| pool_free_blocks | hot | capacity (free blocks) of unowned Block Groups sharded to this ZG (shard key: `bg_id % zg_first_count`, the same mapping `mkfs` uses for initial assignment; it never moves when Zone Groups are added). Maintained by CAS at claim (debit) and release (credit), both ordered so a crash between the two records understates free space. `fsck` cross-checks each shard against the actual unowned members. Placed after `hot_checksum` so pre-0x0009 volumes read it as zero (correct: every BG starts owned) |
 | pool_grow_gen, pool_grow_id, pool_grow_credit | hot | the live grow whose credit `pool_free_blocks` holds: the `layout_gen` it would publish (0: none), its random id, and what it added. A grow credits before it publishes the superblock; a marker above the published `layout_gen` with no growfs claim held is a grow that died in between, and is taken back by id -- by the next grow, the grow's own failure path and every mount. `fsck -r` clears it with its recount |
 | first_bg_id, bg_count | cold | **UNUSED** (v0x0009+). Block Group ownership is now stored in each BG's `owner_zg` field, not in the ZG's span — this lets a grow add Block Groups without touching any existing ZG record |
 | cold_checksum | cold | CRC32C over the cold region with this field zeroed |

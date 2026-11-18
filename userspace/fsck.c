@@ -1269,7 +1269,7 @@ static void fsck_adjust_bg_counts(int fd, uint32_t b, int credit)
     z = cetrafs_le16(bgd.owner_zg);
     pool = z == CETRAFS_BG_OWNER_FREE;
     if (pool)
-        z = b % cetrafs_le32(sb->zone_group_count);
+        z = cetrafs_sb_zg_shard(sb, b);
     memset(blk, 0, sizeof(blk));
     pread_all(fd, blk, sizeof(blk), (off_t) (cetrafs_le64(sb->zg_table_start) + z) * CETRAFS_BLOCK_SIZE);
     memcpy(&zg, blk, sizeof(zg));
@@ -1469,6 +1469,7 @@ static int fsck_rebuild_bg_desc(int fd, const cetrafs_superblock_t *sb, uint64_t
     cetrafs_block_group_t bg;
     uint64_t start = 0, dstart, cnt, used = 0, max_stamp = 0;
     uint32_t nzg = cetrafs_le32(sb->zone_group_count), owner = CETRAFS_BG_OWNER_FREE, bmap_blocks;
+    const uint32_t shard = cetrafs_sb_zg_shard(sb, b);
     uint16_t flags = 0;
     int queued = 0;
     const uint64_t align = cetrafs_le32(sb->data_align_blocks);
@@ -1525,11 +1526,11 @@ static int fsck_rebuild_bg_desc(int fd, const cetrafs_superblock_t *sb, uint64_t
         }
     }
     if (!queued && used)
-        owner = b % nzg;
+        owner = shard;
 
     /* An unreplayed entry names a block of this group (F-49): never the
      * pool, and a Zone Group a claim takes only by replaying that node
-     * first -- one the node owns (b % Z first, the layout's own), or a
+     * first -- one the node owns (its shard first, the layout's own), or a
      * damaged record left unrebuilt, which no mount claims. If the node
      * owns none, the group was never its: it holds no blocks a claim
      * could hand on, and its entries name another owner's blocks, as
@@ -1539,12 +1540,12 @@ static int fsck_rebuild_bg_desc(int fd, const cetrafs_superblock_t *sb, uint64_t
 
         if (fsck_jp_lba[j] < start || fsck_jp_lba[j] - start >= cetrafs_le64(hdr.length_blocks))
             continue;
-        if (zg_owner[b % nzg] == fsck_jp_node[j] || (fsck_zg_damaged && fsck_zg_damaged[b % nzg] == 1))
-            pick = b % nzg;
+        if (zg_owner[shard] == fsck_jp_node[j] || (fsck_zg_damaged && fsck_zg_damaged[shard] == 1))
+            pick = shard;
         for (uint32_t z = 0; pick == CETRAFS_BG_OWNER_FREE && z < nzg; z++)
             if (zg_owner[z] == fsck_jp_node[j])
                 pick = z;
-        owner = pick != CETRAFS_BG_OWNER_FREE ? pick : b % nzg;
+        owner = pick != CETRAFS_BG_OWNER_FREE ? pick : shard;
         printf("  BG%u: node %u's journal has an entry not yet replayed for block %" PRIu64
                " -- the group goes to ZG%u, which a mount takes only after replaying it\n",
                b, fsck_jp_node[j], fsck_jp_lba[j], owner);
@@ -1562,7 +1563,7 @@ static int fsck_rebuild_bg_desc(int fd, const cetrafs_superblock_t *sb, uint64_t
      * settle it. */
     if (!used && fsck_device_discards(fd)) {
         if (owner == CETRAFS_BG_OWNER_FREE)
-            owner = b % nzg;
+            owner = shard;
         flags |= CETRAFS_BG_FLAG_DISCARD_PENDING;
     }
 
@@ -3425,6 +3426,16 @@ int main(int argc, char **argv)
             fprintf(stderr, "ERR: inode bitmap or inode table has no blocks (inode_bmap_blocks %" PRIu64
                             ", inode_table_blocks %" PRIu64 ") -- it will not mount\n",
                     (uint64_t) cetrafs_le64(sb.inode_bmap_blocks), (uint64_t) cetrafs_le64(sb.inode_table_blocks));
+            return 1;
+        }
+        /* Room this build does not follow (A-13): checking the volume
+         * without the Zone Groups it would miss is not checking it. */
+        if (cetrafs_le64(sb.zg_seg_next) ||
+            (cetrafs_le32(sb.zg_first_count) && cetrafs_le32(sb.zg_first_count) != cetrafs_le32(sb.zone_group_count))) {
+            fprintf(stderr, "ERR: the Zone Group table has appended segments (head %" PRIu64
+                            ", %u of %u Zone Groups in the first) -- this build cannot follow them\n",
+                    (uint64_t) cetrafs_le64(sb.zg_seg_next), cetrafs_le32(sb.zg_first_count),
+                    cetrafs_le32(sb.zone_group_count));
             return 1;
         }
         if (cetrafs_le32(sb.inode_first_count) > cetrafs_le32(sb.inodes_count)) {
@@ -5398,7 +5409,7 @@ int main(int argc, char **argv)
                 /* ...except in the sharded pool, which exists precisely
                  * so that handed-back capacity is counted SOMEWHERE and
                  * statfs does not shrink by 512 MiB per release. */
-                zg_pool_truth[b % cetrafs_le32(sb.zone_group_count)] += really_free;
+                zg_pool_truth[cetrafs_sb_zg_shard(&sb, b)] += really_free;
 
             free(bmap);
         }
@@ -6564,7 +6575,7 @@ int main(int argc, char **argv)
                     pwrite_all(fd, blk, sizeof(blk), (off_t) bg_desc_lba[b] * CETRAFS_BLOCK_SIZE);
 
                     if (pool)
-                        z = b % cetrafs_le32(sb.zone_group_count);
+                        z = cetrafs_sb_zg_shard(&sb, b);
                     memset(blk, 0, sizeof(blk));
                     pread_all(fd, blk, sizeof(blk), (off_t) (cetrafs_le64(sb.zg_table_start) + z) * CETRAFS_BLOCK_SIZE);
                     memcpy(&zg, blk, sizeof(zg));

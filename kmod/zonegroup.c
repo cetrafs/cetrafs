@@ -564,7 +564,7 @@ static int cetrafs_zg_delta_mutate(void *image, unsigned int len, void *priv)
  */
 /* ---- unowned-BG pool shard ------------------------------------------
  * pool_free_blocks counts the capacity of UNOWNED Block Groups sharded
- * to this ZG record (shard key: bg_id %% zone_group_count). Unlike the
+ * to this ZG record (shard key: cetrafs_sb_zg_shard()). Unlike the
  * free aggregate above, a pool adjustment is NOT gated on owning the
  * ZG: the shard is a geometric bucket, and whoever wins the BG
  * descriptor's claim/release CAS owns the matching pool update -- that
@@ -617,7 +617,7 @@ int cetrafs_zg_adjust_pool_blocks(struct super_block *sb, u32 bg_id, s64 delta)
 
     if (!raw_sb)
         return -EINVAL;
-    zg_id = bg_id % le32_to_cpu(raw_sb->zone_group_count);
+    zg_id = cetrafs_sb_zg_shard(raw_sb, bg_id);
     return cetrafs_cas_record(sb, le64_to_cpu(raw_sb->zg_table_start) + zg_id, cetrafs_zg_pool_mutate, &ctx);
 }
 

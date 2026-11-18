@@ -1321,7 +1321,7 @@ struct cetrafs_grow_plan {
     u64 old_inodes;                  /* inodes before; the inode segment, if any, starts after them */
     u64 new_iseg_lba;                /* the inode table segment the grow adds; 0 = none */
     u64 tail_ilba;                   /* the inode segment that links to it; 0 = the superblock does */
-    u32 nshards;                     /* pool shards: one per Zone Group */
+    u32 nshards;                     /* pool shards: cetrafs_sb_zg_first_count() */
     u64 *shard_credit;               /* capacity each shard gains */
     const cetrafs_grow_arg_t *claim; /* the caller's growfs claim, re-checked at the publish */
 };

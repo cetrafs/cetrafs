@@ -421,7 +421,24 @@ typedef struct {
     __le32 inode_first_count;     /* inodes in the implicit first segment */
     __le32 inode_seg_pad;
 
-    u8  reserved[104];
+    /* Zone Group table chain (format 0x000A, audit 2026-11-15 A-13):
+     * ROOM ONLY -- no build appends a Zone Group yet, and the mount and
+     * fsck refuse a volume that has one. Laid out like the other two
+     * chains so that the code, when it comes, needs no format change:
+     * appended segments (cetrafs_seg_hdr_t, CETRAFS_ZGSEG_MAGIC), each a
+     * header, `count` Zone Group records one per block, then their
+     * pending-free queues, pending_free_blocks_per_zg blocks each; ids
+     * carry on where the table before ends, zone_group_count stays the
+     * total. zg_first_count is also the SHARD count
+     * (cetrafs_sb_zg_shard()): a Block Group's initial owner and the
+     * record its unowned capacity is counted in are bg_id modulo it, a
+     * key that adding Zone Groups never moves. Both zero on a table
+     * that has never grown. */
+    __le64 zg_seg_next;           /* LBA of the first appended segment, 0 = none */
+    __le32 zg_first_count;        /* Zone Groups in the implicit first table */
+    __le32 zg_seg_pad;
+
+    u8  reserved[88];
 } CETRA_PACKED cetrafs_superblock_t;
 
 /*
@@ -656,7 +673,7 @@ typedef struct {
     __le64 hot_checksum;          /* CRC32C over [0, CETRAFS_HOT_SECTOR) with this field zeroed */
     /*
      * Free capacity of UNOWNED Block Groups sharded to this record
-     * (shard key: bg_id % zone_group_count -- the same mapping mkfs
+     * (shard key: cetrafs_sb_zg_shard(), bg_id % zg_first_count -- the same mapping mkfs
      * uses for the initial assignment). A released-empty BG belongs to
      * no ZG, so its blocks would otherwise be counted NOWHERE and
      * statfs would shrink by 512 MiB per handed-back group (found by
@@ -1336,6 +1353,7 @@ typedef struct {
  * (cetrafs_calc_inode_bmap_blocks(count) blocks) and their records (one
  * block each). */
 #define CETRAFS_INOSEG_MAGIC 0xC4553B69U
+#define CETRAFS_ZGSEG_MAGIC  0xC4553B6AU /* reserved: see cetrafs_superblock_t.zg_seg_next */
 
 /* The header's live fields and its checksum sit inside the first
  * sector, which is what lets `next` be set by one atomic swap. */
@@ -2023,6 +2041,22 @@ static inline u64 cetrafs_iseg_bit(const struct cetrafs_iseg *s, u32 n, u64 ino,
 /* Inodes in the implicit first segment of the table (the run at
  * inode_bmap_start / inode_table_start): all of them on a table that has
  * never grown. */
+/* The Zone Groups in the first table: zg_first_count, or all of them on
+ * a table that has never grown. Block Groups are sharded over THIS
+ * count, never over zone_group_count: the shard of a Block Group must
+ * not move when Zone Groups are added (A-13). */
+static inline u32 cetrafs_sb_zg_first_count(const cetrafs_superblock_t *sb)
+{
+    return cetrafs_le32(sb->zg_first_count) ? cetrafs_le32(sb->zg_first_count) : cetrafs_le32(sb->zone_group_count);
+}
+
+/* The Zone Group a Block Group is sharded to: its owner at mkfs, and the
+ * record that counts its capacity while nobody owns it. */
+static inline u32 cetrafs_sb_zg_shard(const cetrafs_superblock_t *sb, u32 bg_id)
+{
+    return bg_id % cetrafs_sb_zg_first_count(sb);
+}
+
 static inline u64 cetrafs_sb_inode_first_count(const cetrafs_superblock_t *sb)
 {
     return cetrafs_le32(sb->inode_first_count) ? cetrafs_le32(sb->inode_first_count) : cetrafs_le32(sb->inodes_count);
