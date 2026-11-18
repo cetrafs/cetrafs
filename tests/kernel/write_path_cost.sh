@@ -20,6 +20,9 @@ set -euo pipefail
 . "$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)/lib/harness.sh"
 require_root
 require_module
+# The tree is filled a block-sized convert at a time; a 64 KiB convert
+# unit (1064028) would coalesce the scattered writes that fill it.
+ct_param_set convert_unit_blocks 1
 
 IMG="$(ct_image 2200 wpcost)"
 DEV="$(ct_loop "$IMG")"

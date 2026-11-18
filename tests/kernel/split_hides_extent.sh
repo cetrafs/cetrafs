@@ -35,6 +35,9 @@ set -euo pipefail
 . "$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)/lib/harness.sh"
 require_root
 require_module
+# The tree is filled a block-sized convert at a time; a 64 KiB convert
+# unit (1064028) would coalesce the scattered writes that fill it.
+ct_param_set convert_unit_blocks 1
 for p in lookup_stall_ms tree_move_rerun_off leaf_split_force leaf_split_place_first leaf_split_stall_ms; do
     [ -w "/sys/module/cetrafs/parameters/$p" ] || { skip "$p is missing"; ct_exit; }
 done
