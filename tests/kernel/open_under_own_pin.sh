@@ -14,7 +14,9 @@
 # writer's close demotes it again while the move runs.
 #
 # Staged: a 600-block file fragmented against a filler, the janitor
-# slowed to one step per 3 s (defrag_step_delay_ms).
+# slowed to one step per 3 s (defrag_step_delay_ms), and a reader holding
+# the file open throughout -- the write-open is not the first local open,
+# which would stop the pass instead (open_stops_defrag.sh).
 #
 #  1. the janitor pins the file RELOCATING; a local write-open turns it
 #     EXCLUSIVE; that writer's close turns it back to RELOCATING (the
@@ -62,6 +64,10 @@ for i in range(600):
 PY
     INO="$(stat -c %i "$MNT/f")"
     SUM0="$(sha256sum "$MNT/f" | cut -d' ' -f1)"
+    # A reader already here: a FIRST local open stops this node's pass
+    # instead (6686f72, open_stops_defrag.sh), so the write-open below
+    # must not be the first one.
+    exec 6<"$MNT/f"
     ct_param_set defrag_step_delay_ms 3000
     ct_param_set auto_defrag 1
     : >>"$MNT/f" # the last writer's close queues the janitor
@@ -73,6 +79,7 @@ PY
     sleep 0.5
     CLOSED="$(mode_of "$INO")"
     ct_param_set defrag_step_delay_ms 0
+    exec 6<&-
     wait_mode "$INO" 0 60 || fail "$1: the lock is still held (mode $(mode_of "$INO")) after the move"
     ct_param_set auto_defrag 0
     [ "$(sha256sum "$MNT/f" | cut -d' ' -f1)" = "$SUM0" ] || fail "$1: the content changed"
