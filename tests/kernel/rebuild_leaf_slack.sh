@@ -33,6 +33,11 @@ ct_param_set convert_unit_blocks 1
 ct_param_set auto_defrag 0
 ct_param_set scrub 0
 ct_param_set tree_build_full 0
+# The punch below rebuilds the whole tree only with patching off: since
+# 60335f9 a punch copies just the leaves it touches. A full rebuild is
+# still what a patch that cannot apply, fallocate's allocation and the
+# defrag mover do, and what this suite measures.
+ct_param_set tree_patch_off 1
 
 # <full 0|1> -> "depth=<n> spills=<n> splits=<n>"
 round() {
