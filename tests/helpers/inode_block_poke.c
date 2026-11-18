@@ -391,7 +391,7 @@ int main(int argc, char **argv)
          * the logical fields can see it. */
         cetrafs_inode_t rec;
         unsigned i = (unsigned) strtoul(argv[4], NULL, 0);
-        uint32_t v = (uint32_t) strtoul(argv[6], NULL, 0);
+        uint64_t v = strtoull(argv[6], NULL, 0);
 
         pread_all(fd, &rec, sizeof(rec), rec_off);
         if (i >= 4) {
@@ -410,7 +410,7 @@ int main(int argc, char **argv)
         }
         cetrafs_inode_stamp_crcs_us(&rec);
         pwrite_all(fd, &rec, sizeof(rec), rec_off);
-        fprintf(stderr, "inode_block_poke: ino %llu extent %u %s -> %u\n", (unsigned long long) ino, i, argv[5], v);
+        fprintf(stderr, "inode_block_poke: ino %llu extent %u %s -> %" PRIu64 "\n", (unsigned long long) ino, i, argv[5], v);
     } else if (strcmp(mode, "rootrange") == 0 && (argc == 5 || argc == 7)) {
         /* Root slot <s>: print "lo=<lo> end=<end> child=<lba>", or set its
          * range to [lo, end) with the record's checksums restamped. */

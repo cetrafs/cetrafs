@@ -65,7 +65,7 @@ case_() { # <label> <regex> <poke args...>
 case_ "a FIFO" "mode 010644, a type" setmode "$DI" 010644
 case_ "no extent header" "has no extent header" ehset "$EI" magic 0
 case_ "length 0" "extent of length 0" extset "$DI" 0 len 0
-case_ "past the largest file" "past the largest file" extset "$DI" 0 block 4294967294
+case_ "past the largest file" "past the largest file" extset "$DI" 0 block 281474976710654
 case_ "an empty depth-2 root" "depth-2 extent tree with no entries" ehset "$PI" entries 0
 # The empty root hides every block of the file: -r must not free them.
 dd if="$TPL" of="$IMG" bs=1M conv=notrunc,sparse status=none

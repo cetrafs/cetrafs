@@ -3,7 +3,7 @@
 # fsck does not repair link counts around a directory it could not read
 #
 # fsck's namespace pass skipped, in silence, any directory whose extent
-# tree a directory cannot have (bad magic, depth past 1). Its names then
+# tree a directory cannot have (bad magic, a depth past the format's 2). Its names then
 # counted for nothing: a file named both there and elsewhere had its
 # nlink "repaired" down to the one name fsck could see -- the destructive
 # direction, since unlinking that other name then frees an inode the
@@ -37,8 +37,8 @@ ct_umount "$MNT"
 ct_fsck "$DEV" >/dev/null 2>&1 || { fail "setup: the volume is not clean before the poke"; ct_exit; }
 pass "setup: inode $FINO has two names, one in directory $DINO"
 
-"$POKE" "$IMG" setdepth "$DINO" 2 2>/dev/null
-pass "setup: directory $DINO now has depth 2, checksums restamped"
+"$POKE" "$IMG" setdepth "$DINO" 3 2>/dev/null
+pass "setup: directory $DINO now has depth 3, checksums restamped"
 
 rc=0
 OUT="$("$ROOT/userspace/fsck.cetra" -r "$DEV" 2>&1)" || rc=$?

@@ -40,8 +40,12 @@ cat >"$PROBE" <<'PY'
 import ctypes, fcntl, os, struct, sys
 path, op, n, calls, stat, info = sys.argv[1], sys.argv[2], int(sys.argv[3]), int(sys.argv[4]), sys.argv[5], sys.argv[6]
 libc = ctypes.CDLL(None, use_errno=True)
+# Blocks read, not read requests: the tree walk reads a node's children
+# as one plugged batch, and adjacent blocks merge into one request -- a
+# count of requests read 8 -> 12 for a whole tree read 4x larger, and
+# the control below could no longer see growth.
 def reads():
-    return int(open(stat).read().split()[0])
+    return int(open(stat).read().split()[2]) // 8
 def builds():
     for l in open(info):
         if l.startswith("smap_builds: "):

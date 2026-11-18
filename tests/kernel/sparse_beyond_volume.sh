@@ -2,7 +2,7 @@
 # SPDX-License-Identifier: GPL-2.0-or-later
 # a sparse file may be larger than the volume (audit 2026-11-14 F6)
 #
-# A file's ceiling is the format's, 16 TiB (2^32 logical blocks), not the
+# A file's ceiling is the format's, 2^60 bytes (2^48 logical blocks), not the
 # volume's capacity. ext4, xfs and VMFS all hold a thin image bigger than
 # the datastore it lives on; refusing it with EFBIG was the old policy,
 # kept as a TEST ONLY knob (cap_file_to_volume) so the control below can
@@ -10,14 +10,14 @@
 #
 # Asserted, on a 600 MiB volume:
 #   - truncate to 4 TiB, write at its far end, read it back;
-#   - write at 16 TiB - 4 KiB, the last addressable block, and read it back,
+#   - write at 2^60 - 4 KiB, the last addressable block, and read it back,
 #     with SEEK_DATA walking the map there and an O_DIRECT write beside it;
 #   - fallocate far past the free space fails ENOSPC, not EFBIG, and the
 #     data already on the volume is intact;
 #   - a sequential write past the free space ends in ENOSPC with the
 #     accepted prefix intact (no wrap, no corruption);
 #   - fsck is clean after all of it;
-#   - truncate past 16 TiB is still refused.
+#   - truncate past 2^60 is still refused.
 # The control (cap_file_to_volume=1) must refuse the 4 TiB truncate and the
 # far write with EFBIG, which proves the knob reaches the same checks.
 #
@@ -46,7 +46,7 @@ VOLB="$(df -Pk "$MNT" | awk 'NR==2 {print $2 * 1024}')"
     { fail "setup: the volume is $VOLB bytes, not under 1 GiB -- nothing below would test a file bigger than the volume"; ct_exit; }
 
 TB4=$((4 * 1024 * 1024 * 1024 * 1024))
-TB16=$((16 * 1024 * 1024 * 1024 * 1024))
+CEIL=$((1 << 60)) # the format ceiling: 2^48 blocks of 4 KiB (v0x000A)
 
 # ----------------------------------------------- the lifted ceiling, default
 R="$(python3 - "$MNT/thin" "$TB4" <<'PY'
@@ -71,7 +71,7 @@ PY
 [ "$R" = "OK" ] && pass "a 4 TiB sparse file on a 600 MiB volume: truncate, far write and read-back work" ||
     fail "4 TiB sparse file on a 600 MiB volume gave '$R'"
 
-R="$(python3 - "$MNT/thin" "$TB16" <<'PY'
+R="$(python3 - "$MNT/thin" "$CEIL" <<'PY'
 import os, sys, errno
 path, size = sys.argv[1], int(sys.argv[2])
 fd = os.open(path, os.O_RDWR)
@@ -100,14 +100,14 @@ finally:
     os.close(fd)
 PY
 )"
-[ "$R" = "OK" ] && pass "the last addressable block (16 TiB - 4 KiB) is writable; SEEK_DATA and O_DIRECT reach it too" ||
-    fail "write at 16 TiB - 4 KiB gave '$R'"
+[ "$R" = "OK" ] && pass "the last addressable block (2^60 - 4 KiB) is writable; SEEK_DATA and O_DIRECT reach it too" ||
+    fail "write at 2^60 - 4 KiB gave '$R'"
 
-# The format ceiling itself still holds: past 16 TiB is EFBIG.
-if truncate -s $((TB16 + 4096)) "$MNT/over" 2>/dev/null; then
-    fail "truncate past the 16 TiB format ceiling was accepted"
+# The format ceiling itself still holds: past it is EFBIG.
+if truncate -s $((CEIL + 4096)) "$MNT/over" 2>/dev/null; then
+    fail "truncate past the format ceiling was accepted"
 else
-    pass "truncate past the 16 TiB format ceiling is refused"
+    pass "truncate past the format ceiling is refused"
 fi
 
 # ------------------------------------------------ ENOSPC past the free space

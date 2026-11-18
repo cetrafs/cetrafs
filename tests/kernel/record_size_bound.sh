@@ -3,7 +3,7 @@
 # a record whose size the format cannot hold is damage, not a file
 #
 # A record's size is a length read off the device, and it became i_size
-# unchecked: past 2^32 blocks (16 TiB) it names blocks no extent can
+# unchecked: past 2^48 blocks (2^60 bytes) it names blocks no extent can
 # address, and past 2^63 it is a NEGATIVE loff_t to every VFS path that
 # reads it. The checksum is valid either way; it proves the bytes are
 # what was written, not that they make sense.
@@ -30,7 +30,7 @@ echo a >"$MNT/big"; echo b >"$MNT/neg"; echo c >"$MNT/fine"
 sync
 BI="$(stat -c %i "$MNT/big")"; NI="$(stat -c %i "$MNT/neg")"
 ct_umount "$MNT"
-"$IPOKE" "$IMG" setsize "$BI" $(((1 << 44) + 4096)) 2>/dev/null
+"$IPOKE" "$IMG" setsize "$BI" $(((1 << 60) + 4096)) 2>/dev/null
 "$IPOKE" "$IMG" setsize "$NI" 9223372036854779904 2>/dev/null
 [ "$("$IPOKE" "$IMG" size "$NI")" = 9223372036854779904 ] || { fail "setup: the size was not planted"; ct_exit; }
 blockdev --flushbufs "$DEV"
