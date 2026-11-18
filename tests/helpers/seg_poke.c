@@ -19,6 +19,9 @@
  *        seg_poke <dev> dangle <lba>  -- point the tail at <lba>
  *        seg_poke <dev> firstid <n>   -- lie about the segment's first id
  *        seg_poke <dev> dump
+ *
+ * SEG_POKE_CHAIN=inode aims every injection at the inode table's chain
+ * (cetrafs_superblock_t.inode_seg_next) instead.
  */
 #define _GNU_SOURCE
 #include <fcntl.h>
@@ -51,18 +54,18 @@ static void wr(int fd, const void *b, size_t n, off_t off)
         die("short write");
 }
 
-static void restamp(cetrafs_bg_segment_t *seg)
+static void restamp(cetrafs_seg_hdr_t *seg)
 {
     seg->checksum = 0;
     seg->checksum = cetrafs_cpu_to_le64((uint64_t) crc32c_struct(seg, sizeof(*seg),
-                                                                 offsetof(cetrafs_bg_segment_t, checksum),
+                                                                 offsetof(cetrafs_seg_hdr_t, checksum),
                                                                  sizeof(seg->checksum)));
 }
 
 int main(int argc, char **argv)
 {
     cetrafs_superblock_t sb;
-    cetrafs_bg_segment_t seg;
+    cetrafs_seg_hdr_t seg;
     uint64_t head, cur, prev = 0;
     int fd;
 
@@ -77,7 +80,10 @@ int main(int argc, char **argv)
     if (cetrafs_le32(sb.magic) != CETRAFS_MAGIC)
         die("not a cetrafs volume");
 
-    head = cetrafs_le64(sb.bg_table_next);
+    const int inodes = getenv("SEG_POKE_CHAIN") && !strcmp(getenv("SEG_POKE_CHAIN"), "inode");
+    const uint32_t magic = inodes ? CETRAFS_INOSEG_MAGIC : CETRAFS_BGSEG_MAGIC;
+
+    head = inodes ? cetrafs_le64(sb.inode_seg_next) : cetrafs_le64(sb.bg_table_next);
     if (!head)
         die("no appended segment: grow the volume first");
 
@@ -85,7 +91,7 @@ int main(int argc, char **argv)
     cur = head;
     for (;;) {
         rd(fd, &seg, sizeof(seg), (off_t) cur * CETRAFS_BLOCK_SIZE);
-        if (cetrafs_le32(seg.magic) != CETRAFS_BGSEG_MAGIC)
+        if (cetrafs_le32(seg.magic) != magic)
             die("chain is already broken");
         if (!cetrafs_le64(seg.next))
             break;
@@ -96,7 +102,7 @@ int main(int argc, char **argv)
 
     if (!strcmp(argv[2], "dump")) {
         printf("head=%" PRIu64 " tail=%" PRIu64 " count=%u first_bg_id=%u\n", head, cur, cetrafs_le32(seg.count),
-               cetrafs_le32(seg.first_bg_id));
+               cetrafs_le32(seg.first_id));
     } else if (!strcmp(argv[2], "loop")) {
         seg.next = cetrafs_cpu_to_le64(head);
         restamp(&seg);
@@ -134,6 +140,8 @@ int main(int argc, char **argv)
         wr(fd, &seg, sizeof(seg), (off_t) head * CETRAFS_BLOCK_SIZE);
         printf("seg_poke: head %" PRIu64 " count -> %s (checksum restamped)\n", head, argv[3]);
     } else if (!strcmp(argv[2], "copyto")) {
+        if (inodes)
+            die("copyto copies a Block Group segment only");
         /* Copy the HEAD segment -- header and descriptors, checksums and
          * all -- to <lba>. Pointing bg_table_next there (sb_poke) then
          * gives a chain that verifies in every byte and lies only about
@@ -159,7 +167,7 @@ int main(int argc, char **argv)
         if (argc < 4)
             die("firstid needs a value");
         rd(fd, &seg, sizeof(seg), (off_t) head * CETRAFS_BLOCK_SIZE);
-        seg.first_bg_id = cetrafs_cpu_to_le32((uint32_t) strtoul(argv[3], NULL, 0));
+        seg.first_id = cetrafs_cpu_to_le32((uint32_t) strtoul(argv[3], NULL, 0));
         restamp(&seg);
         wr(fd, &seg, sizeof(seg), (off_t) head * CETRAFS_BLOCK_SIZE);
         printf("seg_poke: head %" PRIu64 " first_bg_id -> %s\n", head, argv[3]);

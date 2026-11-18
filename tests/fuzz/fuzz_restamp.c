@@ -134,9 +134,9 @@ static int stamp_bgseg(int fd, off_t off)
     uint8_t blk[CETRAFS_BLOCK_SIZE];
     if (read_at(fd, blk, sizeof(blk), off))
         return 1;
-    uint32_t crc = crc32c_struct(blk, sizeof(cetrafs_bg_segment_t),
-                                 offsetof(cetrafs_bg_segment_t, checksum), sizeof(uint64_t));
-    put_csum64(blk, offsetof(cetrafs_bg_segment_t, checksum), crc);
+    uint32_t crc = crc32c_struct(blk, sizeof(cetrafs_seg_hdr_t),
+                                 offsetof(cetrafs_seg_hdr_t, checksum), sizeof(uint64_t));
+    put_csum64(blk, offsetof(cetrafs_seg_hdr_t, checksum), crc);
     return write_at(fd, blk, sizeof(blk), off);
 }
 

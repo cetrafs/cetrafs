@@ -78,7 +78,7 @@ int main(int argc, char **argv)
 
     if (!strcmp(argv[2], "extent")) {
         uint64_t ino = strtoull(argv[3], NULL, 0), phys = strtoull(argv[4], NULL, 0);
-        off_t off = (off_t) (cetrafs_le64(sb.inode_table_start) + ino - 1) * CETRAFS_BLOCK_SIZE;
+        off_t off = (off_t) cetrafs_u_ino_lba(fd, &sb, ino, NULL, NULL) * CETRAFS_BLOCK_SIZE;
         cetrafs_inode_t in;
 
         rd(fd, &in, sizeof(in), off);
@@ -102,7 +102,7 @@ int main(int argc, char **argv)
         cetrafs_extent_t ext[4];
         uint32_t n;
 
-        rd(fd, &in, sizeof(in), (off_t) (cetrafs_le64(sb.inode_table_start) + dino - 1) * CETRAFS_BLOCK_SIZE);
+        rd(fd, &in, sizeof(in), (off_t) cetrafs_u_ino_lba(fd, &sb, dino, NULL, NULL) * CETRAFS_BLOCK_SIZE);
         if (in.eh.eh_depth != 0) {
             fprintf(stderr, "repoint mode only handles depth-0 directories\n");
             return 1;
@@ -154,7 +154,7 @@ int main(int argc, char **argv)
         cetrafs_extent_t ext[4];
         uint32_t n;
 
-        rd(fd, &in, sizeof(in), (off_t) (cetrafs_le64(sb.inode_table_start) + dino - 1) * CETRAFS_BLOCK_SIZE);
+        rd(fd, &in, sizeof(in), (off_t) cetrafs_u_ino_lba(fd, &sb, dino, NULL, NULL) * CETRAFS_BLOCK_SIZE);
         if (in.eh.eh_depth != 0) {
             fprintf(stderr, "filetype mode only handles depth-0 directories\n");
             return 1;
@@ -211,7 +211,7 @@ int main(int argc, char **argv)
         cetrafs_inode_t in;
         uint32_t n;
 
-        rd(fd, &in, sizeof(in), (off_t) (cetrafs_le64(sb.inode_table_start) + dino - 1) * CETRAFS_BLOCK_SIZE);
+        rd(fd, &in, sizeof(in), (off_t) cetrafs_u_ino_lba(fd, &sb, dino, NULL, NULL) * CETRAFS_BLOCK_SIZE);
         if (in.eh.eh_depth != 0) {
             fprintf(stderr, "namelen mode only handles depth-0 directories\n");
             return 1;
@@ -258,7 +258,7 @@ int main(int argc, char **argv)
         cetrafs_extent_t ext[4];
         uint32_t n;
 
-        rd(fd, &in, sizeof(in), (off_t) (cetrafs_le64(sb.inode_table_start) + dino - 1) * CETRAFS_BLOCK_SIZE);
+        rd(fd, &in, sizeof(in), (off_t) cetrafs_u_ino_lba(fd, &sb, dino, NULL, NULL) * CETRAFS_BLOCK_SIZE);
         if (in.eh.eh_depth != 0) {
             fprintf(stderr, "dirent mode only handles depth-0 directories\n");
             return 1;

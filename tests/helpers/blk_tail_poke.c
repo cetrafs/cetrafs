@@ -59,7 +59,7 @@ int main(int argc, char **argv)
     rd(&sb, sizeof(sb), 0);
 
     uint8_t rec[CETRAFS_BLOCK_SIZE];
-    rd(rec, sizeof(rec), (off_t) (cetrafs_le64(sb.inode_table_start) + (ino - 1)) * CETRAFS_BLOCK_SIZE);
+    rd(rec, sizeof(rec), (off_t) cetrafs_u_ino_lba(fd, &sb, ino, NULL, NULL) * CETRAFS_BLOCK_SIZE);
     cetrafs_inode_t in;
     memcpy(&in, rec, sizeof(in));
 

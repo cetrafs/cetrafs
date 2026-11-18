@@ -104,12 +104,12 @@ int main(int argc, char **argv)
     } else if (!strcmp(what, "node")) {
         flip((off_t) (cetrafs_le64(sb.node_table_start) + id) * CETRAFS_BLOCK_SIZE + offsetof(cetrafs_node_entry_t, reserved));
     } else if (!strcmp(what, "inode")) {
-        flip((off_t) (cetrafs_le64(sb.inode_table_start) + (id - 1)) * CETRAFS_BLOCK_SIZE + offsetof(cetrafs_inode_t, flags_reserved)); /* v0x0005: a covered-but-meaningless byte in the ns sector */
+        flip((off_t) cetrafs_u_ino_lba(fd, &sb, id, NULL, NULL) * CETRAFS_BLOCK_SIZE + offsetof(cetrafs_inode_t, flags_reserved)); /* v0x0005: a covered-but-meaningless byte in the ns sector */
     } else if (!strcmp(what, "dirent-tail")) {
         cetrafs_inode_t in;
         uint64_t lba;
 
-        rd(&in, sizeof(in), (off_t) (cetrafs_le64(sb.inode_table_start) + (id - 1)) * CETRAFS_BLOCK_SIZE);
+        rd(&in, sizeof(in), (off_t) cetrafs_u_ino_lba(fd, &sb, id, NULL, NULL) * CETRAFS_BLOCK_SIZE);
         if (in.eh.eh_depth != 0 || in.eh.eh_entries == 0) {
             fprintf(stderr, "inode %" PRIu64 " is not a simple depth-0 directory\n", id);
             return 1;

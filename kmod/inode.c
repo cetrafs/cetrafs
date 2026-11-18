@@ -403,6 +403,12 @@ static int __cetrafs_read_raw_inode(struct super_block *sb, u64 ino, cetrafs_ino
     u64 blk = cetrafs_inode_lba(sb, ino);
     int attempt;
 
+    /* Past the table this node has: a peer's grow may have added the
+     * segment the number is in, and its dirent reached us before our
+     * heartbeat caught the layout up. Caught up once, here, the way an
+     * address past the old end is (cetrafs_lba_run_check()). */
+    if (!blk && ino > cetrafs_sb_inodes(sb) && cetrafs_sb_layout_refresh(sb) > 0)
+        blk = cetrafs_inode_lba(sb, ino);
     if (!blk)
         return -EINVAL;
 

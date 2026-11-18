@@ -1095,7 +1095,7 @@ int main(int argc, char **argv)
     sb.data_align_blocks = cetrafs_cpu_to_le32((u32) align_blocks);
 
     /* The Block Group table starts as ONE contiguous run -- the
-     * implicit first segment of the chain (cetrafs_bg_segment_t).
+     * implicit first segment of the chain (cetrafs_seg_hdr_t).
      * Saying so explicitly rather than leaving it zero means a reader
      * never has to infer it from block_group_count, which stops being
      * the first segment's size the moment the volume is grown.

@@ -138,7 +138,6 @@ static int holds_meta(int fd, const cetrafs_inode_t *in, uint64_t lba)
 /* The owner a written entry names (see the header comment); 0/0 if none. */
 static void entry_owner(int fd, const cetrafs_superblock_t *sb, uint64_t lba, uint64_t *ino, uint64_t *gen)
 {
-    uint64_t its = cetrafs_le64(sb->inode_table_start);
     uint32_t count = cetrafs_le32(sb->inodes_count);
     cetrafs_inode_t in;
 
@@ -147,12 +146,12 @@ static void entry_owner(int fd, const cetrafs_superblock_t *sb, uint64_t lba, ui
     if (getenv("JOURNAL_POKE_OWNER") && *getenv("JOURNAL_POKE_OWNER")) {
         *ino = strtoull(getenv("JOURNAL_POKE_OWNER"), NULL, 0);
         if (*ino >= 1 && *ino <= count) {
-            pread_all(fd, &in, sizeof(in), (off_t) (its + *ino - 1) * CETRAFS_BLOCK_SIZE);
+            pread_all(fd, &in, sizeof(in), (off_t) (cetrafs_u_ino_lba(fd, sb, *ino, NULL, NULL) * CETRAFS_BLOCK_SIZE));
             *gen = cetrafs_le64(in.generation);
         }
     } else {
         for (uint64_t i = 1; i <= count; i++) {
-            pread_all(fd, &in, sizeof(in), (off_t) (its + i - 1) * CETRAFS_BLOCK_SIZE);
+            pread_all(fd, &in, sizeof(in), (off_t) (cetrafs_u_ino_lba(fd, sb, i, NULL, NULL) * CETRAFS_BLOCK_SIZE));
             if (!in.generation || cetrafs_le64(in.ino) != i)
                 continue;
             if (holds_meta(fd, &in, lba)) {

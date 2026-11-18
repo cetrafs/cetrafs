@@ -173,7 +173,7 @@ int main(int argc, char **argv)
 
     /* The first segment is the run mkfs laid down; a grow appends
      * segments, each a header then its descriptors
-     * (cetrafs_bg_segment_t). Follow the chain for a grown group. */
+     * (cetrafs_seg_hdr_t). Follow the chain for a grown group. */
     uint32_t first_count = cetrafs_le32(sb.bg_table_first_count);
     off_t bg_off;
 
@@ -187,14 +187,14 @@ int main(int argc, char **argv)
 
         bg_off = -1;
         while (seg_lba && hops++ < 1024) {
-            cetrafs_bg_segment_t seg;
+            cetrafs_seg_hdr_t seg;
 
             pread_all(fd, &seg, sizeof(seg), (off_t) seg_lba * CETRAFS_BLOCK_SIZE);
             if (cetrafs_le32(seg.magic) != CETRAFS_BGSEG_MAGIC)
                 break;
-            if (bg_id >= cetrafs_le32(seg.first_bg_id) &&
-                bg_id < cetrafs_le32(seg.first_bg_id) + cetrafs_le32(seg.count)) {
-                bg_off = (off_t) (seg_lba + 1 + (bg_id - cetrafs_le32(seg.first_bg_id))) * CETRAFS_BLOCK_SIZE;
+            if (bg_id >= cetrafs_le32(seg.first_id) &&
+                bg_id < cetrafs_le32(seg.first_id) + cetrafs_le32(seg.count)) {
+                bg_off = (off_t) (seg_lba + 1 + (bg_id - cetrafs_le32(seg.first_id))) * CETRAFS_BLOCK_SIZE;
                 break;
             }
             seg_lba = cetrafs_le64(seg.next);

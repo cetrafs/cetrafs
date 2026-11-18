@@ -123,7 +123,13 @@ record uses only ~204 of the block, the rest is zero padding. This is
 deliberate — it makes a cross-node clobber of a block-mate record structurally
 impossible (a cross-node data-loss class that packed records suffered). The
 default inode count is 1 per 4 MiB, capped at 65536, so the 4 KiB stride does
-not bloat a large device; `-N` overrides. The Node Registry packs densely by
+not bloat a large device; `-N` overrides. The table grows the way the Block
+Group table does: a grow appends a segment -- a header (`cetrafs_seg_hdr_t`,
+`CETRAFS_INOSEG_MAGIC`), its bitmap, its records -- linked from the superblock
+(`inode_seg_next`) or the previous segment, and inode numbers carry on where
+the table ended; `inodes_count` is the total and `inode_first_count` what the
+first, mkfs-time segment holds. Every reader resolves an inode through the
+segment list (`struct cetrafs_iseg`), never the superblock's fields. The Node Registry packs densely by
 contrast (144 bytes/row, many rows per block) — there are far fewer nodes than
 inodes.
 
@@ -162,6 +168,7 @@ volume through the copy when block 0 is damaged, and `-r` restores block
 | bg_regions_start | `__le64` | LBA of first BG region |
 | root_ino | `__le64` | inode # of `/` (always 1 today) |
 | inode_size / inodes_count | `__le32` | on-disk inode size, total inode slots |
+| inode_seg_next / inode_first_count | `__le64` / `__le32` | inode table chain head; inodes in the first segment (both 0: never grown) |
 | bg_size_blocks | `__le64` | target BG span |
 | cluster_id | `__le32` | reserved: mkfs writes 0, nothing reads it (membership is the Node Registry) |
 | node_table_start / node_table_blocks | `__le64` | Node Registry LBA + block count |

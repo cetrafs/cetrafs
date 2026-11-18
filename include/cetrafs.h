@@ -373,7 +373,7 @@ typedef struct {
      */
     __le64 bg_data_end;
 
-    /* Block Group table chain (see cetrafs_bg_segment_t). Both zero on a
+    /* Block Group table chain (see cetrafs_seg_hdr_t). Both zero on a
      * volume that has never been grown, where the table is exactly the
      * contiguous run at bg_table_start that it has always been. */
     __le64 bg_table_next;        /* LBA of the first appended segment, 0 = none */
@@ -410,7 +410,18 @@ typedef struct {
     __le32 data_align_blocks;
     __le32 data_align_pad;
 
-    u8  reserved[120];
+    /* Inode table chain (format 0x000A, audit 2026-11-15 M-36): the
+     * table grows the way the Block Group table does, by appended
+     * segments (cetrafs_seg_hdr_t, CETRAFS_INOSEG_MAGIC), each a header,
+     * its bitmap and its records, with inode numbers carrying on where
+     * the one before ends. inodes_count stays the total. Both zero on a
+     * table that has never grown, which is exactly the run at
+     * inode_bmap_start / inode_table_start mkfs laid down. */
+    __le64 inode_seg_next;        /* LBA of the first appended segment, 0 = none */
+    __le32 inode_first_count;     /* inodes in the implicit first segment */
+    __le32 inode_seg_pad;
+
+    u8  reserved[104];
 } CETRA_PACKED cetrafs_superblock_t;
 
 /*
@@ -1277,7 +1288,7 @@ typedef char cetrafs_repair_saved_in_cas_sector[(CETRAFS_REPAIR_SAVED_OFF >= siz
 #define CETRAFS_BG_TABLE_START(sb)      ((sb)->bg_table_start)
 #define CETRAFS_BG_REGIONS_START(sb)    ((sb)->bg_regions_start)
 
-/* ---- Block Group table SEGMENT header ---- */
+/* ---- Table SEGMENT header (the Block Group table and the inode table) ---- */
 /*
  * The Block Group table is a CHAIN of segments, not one contiguous run.
  *
@@ -1312,18 +1323,23 @@ typedef char cetrafs_repair_saved_in_cas_sector[(CETRAFS_REPAIR_SAVED_OFF >= siz
 typedef struct {
     __le32 magic;                 /* CETRAFS_BGSEG_MAGIC */
     __le32 count;                 /* descriptor blocks in THIS segment */
-    __le32 first_bg_id;           /* global id of this segment's first descriptor */
+    __le32 first_id;              /* id of the segment's first entry (a Block Group id; an inode number - 1) */
     __le32 pad0;
     __le64 next;                  /* LBA of the next segment header, 0 = tail */
     __le64 checksum;              /* CRC32C over the header with this field zeroed */
     u8     pad[CETRAFS_BLOCK_SIZE - 32];
-} CETRA_PACKED cetrafs_bg_segment_t;
+} CETRA_PACKED cetrafs_seg_hdr_t;
 
 #define CETRAFS_BGSEG_MAGIC 0xC4553B65U
+/* The inode table's appended segments: the same header, 'count' inodes
+ * numbered from first_id + 1, followed by their bitmap
+ * (cetrafs_calc_inode_bmap_blocks(count) blocks) and their records (one
+ * block each). */
+#define CETRAFS_INOSEG_MAGIC 0xC4553B69U
 
 /* The header's live fields and its checksum sit inside the first
  * sector, which is what lets `next` be set by one atomic swap. */
-typedef char cetrafs_bgseg_fits_one_sector[(offsetof(cetrafs_bg_segment_t, pad) <= CETRAFS_HOT_SECTOR) ? 1 : -1];
+typedef char cetrafs_seg_fits_one_sector[(offsetof(cetrafs_seg_hdr_t, pad) <= CETRAFS_HOT_SECTOR) ? 1 : -1];
 
 /* ---- Block Group Descriptor (global table; 1 block per BG) ---- */
 /*  Describes a contiguous DATA region owned by a ZG. No journals here. */
@@ -2003,6 +2019,54 @@ static inline u64 cetrafs_iseg_bit(const struct cetrafs_iseg *s, u32 n, u64 ino,
     *bit = (ino - g->first) % CETRAFS_BITS_PER_BLOCK;
     return g->bmap + (ino - g->first) / CETRAFS_BITS_PER_BLOCK;
 }
+
+/* Inodes in the implicit first segment of the table (the run at
+ * inode_bmap_start / inode_table_start): all of them on a table that has
+ * never grown. */
+static inline u64 cetrafs_sb_inode_first_count(const cetrafs_superblock_t *sb)
+{
+    return cetrafs_le32(sb->inode_first_count) ? cetrafs_le32(sb->inode_first_count) : cetrafs_le32(sb->inodes_count);
+}
+
+#ifndef __KERNEL__
+#include <unistd.h>
+/*
+ * For a tool that reads one inode offline (tests/helpers): the block of
+ * inode 'ino''s record, following the table chain from the superblock,
+ * and -- if bmap is not NULL -- its bitmap block and bit. 0: no such
+ * inode, or a chain that does not reach it. The kernel and fsck walk the
+ * chain once, checked; this trusts what it reads beyond magic and
+ * numbering, which is what a poke tool needs.
+ */
+static inline u64 cetrafs_u_ino_lba(int fd, const cetrafs_superblock_t *sb, u64 ino, u64 *bmap, u64 *bit)
+{
+    struct cetrafs_iseg g = {1, cetrafs_sb_inode_first_count(sb), cetrafs_le64(sb->inode_bmap_start),
+                             cetrafs_le64(sb->inode_table_start)};
+    u64 next = cetrafs_le64(sb->inode_seg_next);
+    u32 guard = 0;
+
+    if (!ino || ino > cetrafs_le32(sb->inodes_count))
+        return 0;
+    while (ino - g.first >= g.count) {
+        cetrafs_seg_hdr_t h;
+
+        if (!next || ++guard > (1U << 20) ||
+            pread(fd, &h, sizeof(h), (off_t) (next * CETRAFS_BLOCK_SIZE)) != (ssize_t) sizeof(h) ||
+            cetrafs_le32(h.magic) != CETRAFS_INOSEG_MAGIC || cetrafs_le32(h.first_id) != g.first + g.count - 1)
+            return 0;
+        g.first += g.count;
+        g.count = cetrafs_le32(h.count);
+        g.bmap = next + 1;
+        g.table = next + 1 + cetrafs_calc_inode_bmap_blocks(g.count);
+        next = cetrafs_le64(h.next);
+    }
+    if (bmap) {
+        *bmap = g.bmap + (ino - g.first) / CETRAFS_BITS_PER_BLOCK;
+        *bit = (ino - g.first) % CETRAFS_BITS_PER_BLOCK;
+    }
+    return g.table + (ino - g.first);
+}
+#endif
 
 static inline u64 cetrafs_default_inodes_for_bytes(u64 bytes_total)
 {

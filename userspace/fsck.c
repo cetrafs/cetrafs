@@ -492,17 +492,159 @@ static int fsck_record_restampable(const cetrafs_inode_t *in, uint64_t ino)
 static struct cetrafs_iseg *fsck_iseg;
 static uint32_t fsck_niseg;
 
-static void fsck_isegs_build(const cetrafs_superblock_t *sb)
+/* The two chains of table segments (kmod/fs.c has the same pair). */
+struct fsck_seg_kind {
+    uint32_t magic;
+    const char *what;    /* "Block Group", "inode" */
+    const char *entries; /* "Block Groups", "inodes" */
+    int inodes;          /* a segment's span: header + count, or header + bitmap + count */
+};
+static const struct fsck_seg_kind fsck_bg_chain = {CETRAFS_BGSEG_MAGIC, "Block Group", "Block Groups", 0};
+static const struct fsck_seg_kind fsck_ino_chain = {CETRAFS_INOSEG_MAGIC, "inode", "inodes", 1};
+
+static uint64_t fsck_seg_span(const struct fsck_seg_kind *k, uint64_t count)
 {
+    return 1 + (k->inodes ? cetrafs_calc_inode_bmap_blocks(count) : 0) + count;
+}
+
+/*
+ * Walk a table chain from 'seg_lba', the entries before it being the
+ * implicit first segment's 'filled', until 'total' are described; each
+ * appended segment's [header, end) goes to lo/hi. The WHOLE chain, not
+ * just until enough entries have been collected: stopping there never
+ * follows the tail's next, so a chain that loops, or whose last link
+ * points past the volume or into metadata, read as clean -- three
+ * injections this check missed until they were actually tried. The
+ * kernel's checks, in the kernel's order (cetrafs_seg_read()): the
+ * count is bounded before it drives anything. 0, or 1 having said why.
+ */
+static int fsck_chain_walk(int fd, const cetrafs_superblock_t *sb, const struct fsck_seg_kind *k, uint64_t seg_lba,
+                           uint64_t filled, uint64_t total, uint64_t dev_bytes, uint64_t *lo, uint64_t *hi,
+                           uint32_t *n)
+{
+    const uint64_t vol = cetrafs_le64(sb->total_blocks), dev_blocks = dev_bytes / CETRAFS_BLOCK_SIZE;
+    uint64_t guard = 0;
+
+    while (seg_lba) {
+        cetrafs_seg_hdr_t seg;
+        int crc_ok;
+
+        if (++guard > total + 1) {
+            fprintf(stderr, "ERR: %s table chain does not terminate\n", k->what);
+            return 1;
+        }
+        /*
+         * Every entry counted and still a link: the segment a grow
+         * LINKED but has not PUBLISHED. growfs writes the segment, then
+         * the old tail's next, then the superblock; a live grow is in
+         * exactly this state between its last two writes, and one that
+         * died there stays in it. It is not damage when the segment is
+         * what the next grow would have written -- intact, continuing the
+         * numbering where the count stops, the end of the chain, past the
+         * published end and on the device -- and the kernel mounts it on
+         * the same terms (cetrafs_layout_pending_link()). Anything else
+         * is.
+         */
+        if (filled == total && seg_lba >= vol && seg_lba < dev_blocks) {
+            pread_all(fd, &seg, sizeof(seg), (off_t) seg_lba * CETRAFS_BLOCK_SIZE);
+            crc_ok = (uint32_t) cetrafs_le64(seg.checksum) ==
+                     crc32c_struct(&seg, sizeof(seg), offsetof(cetrafs_seg_hdr_t, checksum), sizeof(seg.checksum));
+            if (cetrafs_le32(seg.magic) == k->magic && crc_ok && cetrafs_le32(seg.first_id) == total &&
+                cetrafs_le32(seg.count) && seg_lba + fsck_seg_span(k, cetrafs_le32(seg.count)) <= dev_blocks &&
+                !cetrafs_le64(seg.next)) {
+                printf("note: the %s table links a segment at %" PRIu64 " for %s %" PRIu64
+                       ".. the superblock does not count yet -- a grow in progress, or one\n"
+                       "      that was interrupted before it published (re-run growfs.cetra to finish it)\n",
+                       k->what, seg_lba, k->entries, total);
+                return 0;
+            }
+        }
+        if (seg_lba >= vol) {
+            fprintf(stderr, "ERR: %s table segment at %" PRIu64 " is past the end of the volume\n", k->what, seg_lba);
+            return 1;
+        }
+        pread_all(fd, &seg, sizeof(seg), (off_t) seg_lba * CETRAFS_BLOCK_SIZE);
+        if (cetrafs_le32(seg.magic) != k->magic) {
+            fprintf(stderr, "ERR: %s table segment at %" PRIu64 " has no magic\n", k->what, seg_lba);
+            return 1;
+        }
+        if ((uint32_t) cetrafs_le64(seg.checksum) !=
+            crc32c_struct(&seg, sizeof(seg), offsetof(cetrafs_seg_hdr_t, checksum), sizeof(seg.checksum))) {
+            fprintf(stderr, "ERR: %s table segment at %" PRIu64 " fails its checksum\n", k->what, seg_lba);
+            return 1;
+        }
+        if (cetrafs_le32(seg.first_id) != filled) {
+            fprintf(stderr, "ERR: %s table segment at %" PRIu64 " starts at id %u, expected %" PRIu64 "\n", k->what,
+                    seg_lba, cetrafs_le32(seg.first_id), filled);
+            return 1;
+        }
+        if (seg_lba < cetrafs_le64(sb->bg_regions_start)) {
+            fprintf(stderr, "ERR: %s table segment at %" PRIu64 " lies among the fixed tables (before block %" PRIu64
+                            ")\n",
+                    k->what, seg_lba, (uint64_t) cetrafs_le64(sb->bg_regions_start));
+            return 1;
+        }
+        if (!cetrafs_le32(seg.count) || cetrafs_le32(seg.count) > total - filled) {
+            fprintf(stderr, "ERR: %s table chain describes more than the %" PRIu64 " %s recorded (segment at %" PRIu64
+                            " claims %u, %" PRIu64 " left)\n",
+                    k->what, total, k->entries, seg_lba, cetrafs_le32(seg.count), total - filled);
+            return 1;
+        }
+        if (seg_lba + fsck_seg_span(k, cetrafs_le32(seg.count)) > vol) {
+            fprintf(stderr, "ERR: %s table segment at %" PRIu64 " describes blocks past the end of the volume\n",
+                    k->what, seg_lba);
+            return 1;
+        }
+        lo[*n] = seg_lba;
+        hi[(*n)++] = seg_lba + fsck_seg_span(k, cetrafs_le32(seg.count));
+        filled += cetrafs_le32(seg.count);
+        seg_lba = cetrafs_le64(seg.next);
+    }
+    if (filled != total) {
+        fprintf(stderr, "ERR: %s table chain describes %" PRIu64 " of %" PRIu64 " %s\n", k->what, filled, total,
+                k->entries);
+        return 1;
+    }
+    return 0;
+}
+
+/* The inode table's segments, from the superblock's first one and the
+ * chain; the appended ones' ranges added to lo/hi. 0, or 1 having said
+ * why. */
+static int fsck_isegs_build(int fd, const cetrafs_superblock_t *sb, uint64_t dev_bytes, uint64_t *lo, uint64_t *hi,
+                            uint32_t *n)
+{
+    const uint32_t s0 = *n;
+    const uint64_t first = cetrafs_sb_inode_first_count(sb);
+
+    if (fsck_chain_walk(fd, sb, &fsck_ino_chain, cetrafs_le64(sb->inode_seg_next), first,
+                        cetrafs_le32(sb->inodes_count), dev_bytes, lo, hi, n))
+        return 1;
     free(fsck_iseg);
-    fsck_iseg = (struct cetrafs_iseg *) xcalloc(1, sizeof(*fsck_iseg));
+    fsck_niseg = 1 + (*n - s0);
+    fsck_iseg = (struct cetrafs_iseg *) xcalloc(fsck_niseg, sizeof(*fsck_iseg));
     fsck_iseg[0] = (struct cetrafs_iseg) {
         .first = 1,
-        .count = cetrafs_le32(sb->inodes_count),
+        .count = first,
         .bmap = cetrafs_le64(sb->inode_bmap_start),
         .table = cetrafs_le64(sb->inode_table_start),
     };
-    fsck_niseg = 1;
+    for (uint32_t s = 1; s < fsck_niseg; s++) {
+        const struct cetrafs_iseg *p = &fsck_iseg[s - 1];
+        const uint64_t lba = lo[s0 + s - 1];
+        cetrafs_seg_hdr_t seg; /* verified by the walk above */
+
+        pread_all(fd, &seg, sizeof(seg), (off_t) lba * CETRAFS_BLOCK_SIZE);
+        const uint64_t cnt = cetrafs_le32(seg.count);
+
+        fsck_iseg[s] = (struct cetrafs_iseg) {
+            .first = p->first + p->count,
+            .count = cnt,
+            .bmap = lba + 1,
+            .table = lba + 1 + cetrafs_calc_inode_bmap_blocks(cnt),
+        };
+    }
+    return 0;
 }
 
 /* Byte offset of inode 'ino''s record; the caller has checked 'ino'. */
@@ -3257,7 +3399,7 @@ int main(int argc, char **argv)
      */
     {
         uint64_t zg = cetrafs_le32(sb.zone_group_count), bgs = cetrafs_le32(sb.block_group_count);
-        uint64_t bgsz = cetrafs_le64(sb.bg_size_blocks), inodes = cetrafs_le32(sb.inodes_count);
+        uint64_t bgsz = cetrafs_le64(sb.bg_size_blocks), inodes = cetrafs_sb_inode_first_count(&sb);
 
         if (!zg || zg > CETRAFS_MAX_ZONE_GROUPS) {
             fprintf(stderr, "ERR: zone_group_count %" PRIu64 " (1..%u) -- it will not mount\n", zg,
@@ -3285,8 +3427,14 @@ int main(int argc, char **argv)
                     (uint64_t) cetrafs_le64(sb.inode_bmap_blocks), (uint64_t) cetrafs_le64(sb.inode_table_blocks));
             return 1;
         }
+        if (cetrafs_le32(sb.inode_first_count) > cetrafs_le32(sb.inodes_count)) {
+            fprintf(stderr, "ERR: the inode table's first segment holds %u inodes, more than its %u in all -- it "
+                            "will not mount\n",
+                    cetrafs_le32(sb.inode_first_count), cetrafs_le32(sb.inodes_count));
+            return 1;
+        }
         if (!inodes || inodes >= UINT32_MAX || inodes > cetrafs_le64(sb.inode_table_blocks)) {
-            fprintf(stderr, "ERR: inodes_count %" PRIu64 " does not fit its table (%" PRIu64
+            fprintf(stderr, "ERR: the first %" PRIu64 " inodes do not fit their table (%" PRIu64
                             " blocks, one record each) -- it will not mount\n",
                     inodes, (uint64_t) cetrafs_le64(sb.inode_table_blocks));
             return 1;
@@ -3476,12 +3624,12 @@ int main(int argc, char **argv)
                     (uint64_t) cetrafs_le64(sb.root_ino), cetrafs_le32(sb.inodes_count));
             return 1;
         }
-        if (cetrafs_le32(sb.inodes_count) > cetrafs_le64(sb.inode_bmap_blocks) * CETRAFS_BLOCK_SIZE * 8) {
-            fprintf(stderr, "ERR: layout: inodes_count %u exceeds the %" PRIu64 " bits in its bitmap\n",
-                    cetrafs_le32(sb.inodes_count), (uint64_t) cetrafs_le64(sb.inode_bmap_blocks) * CETRAFS_BLOCK_SIZE * 8);
+        if (cetrafs_sb_inode_first_count(&sb) > cetrafs_le64(sb.inode_bmap_blocks) * CETRAFS_BLOCK_SIZE * 8) {
+            fprintf(stderr, "ERR: layout: the first %" PRIu64 " inodes exceed the %" PRIu64 " bits in their bitmap\n",
+                    (uint64_t) cetrafs_sb_inode_first_count(&sb),
+                    (uint64_t) cetrafs_le64(sb.inode_bmap_blocks) * CETRAFS_BLOCK_SIZE * 8);
             return 1;
         }
-        fsck_isegs_build(&sb);
         if (cetrafs_le32(sb.node_table_count) > CETRAFS_MAX_READER_NODES) {
             fprintf(stderr,
                     "ERR: layout: node_table_count %u exceeds CETRAFS_MAX_READER_NODES (%u) -- row %u would "
@@ -3706,119 +3854,30 @@ int main(int argc, char **argv)
     fsck_g_bg_desc_lba = bg_desc_lba;
     /* Each appended segment's [header, last descriptor], checked against
      * the Block Groups once their descriptors are read (as fs.c does). */
-    uint64_t *seg_lo = (uint64_t *) xcalloc(cetrafs_le32(sb.block_group_count) + 1, sizeof(uint64_t));
-    uint64_t *seg_hi = (uint64_t *) xcalloc(cetrafs_le32(sb.block_group_count) + 1, sizeof(uint64_t));
+    /* Each grow appends at most one segment to each chain, and adds at
+     * least one Block Group. */
+    uint64_t *seg_lo = (uint64_t *) xcalloc(2 * (cetrafs_le32(sb.block_group_count) + 1), sizeof(uint64_t));
+    uint64_t *seg_hi = (uint64_t *) xcalloc(2 * (cetrafs_le32(sb.block_group_count) + 1), sizeof(uint64_t));
     uint32_t nsegs = 0;
     {
-        uint32_t nbg = cetrafs_le32(sb.block_group_count), filled = 0, guard = 0;
+        uint32_t nbg = cetrafs_le32(sb.block_group_count), s0;
         uint64_t first = cetrafs_le64(sb.bg_table_first_count);
-        uint64_t seg_lba = cetrafs_le64(sb.bg_table_next);
 
         if (!first || first > nbg)
             first = nbg; /* never grown */
         for (uint32_t b = 0; b < first && b < nbg; b++)
             bg_desc_lba[b] = cetrafs_le64(sb.bg_table_start) + b;
-        filled = (uint32_t) first;
-
-        /* The WHOLE chain, not just until enough descriptors have been
-         * collected. Stopping at `filled == nbg` never follows the
-         * tail's `next`, so a chain that loops, or whose last link
-         * points past the volume or into metadata, read as clean --
-         * three injections that this check missed until they were
-         * actually tried. A dangling tail is corruption even when every
-         * descriptor is accounted for. */
-        while (seg_lba) {
-            cetrafs_bg_segment_t seg;
-
-            if (++guard > nbg + 1) {
-                fprintf(stderr, "ERR: Block Group table chain does not terminate\n");
-                return 1;
-            }
-            /*
-             * Every Block Group counted and still a link: the segment a
-             * grow LINKED but has not PUBLISHED. growfs writes the
-             * segment, then the old tail's next, then the superblock; a
-             * live grow is in exactly this state between its last two
-             * writes, and one that died there stays in it. It is not
-             * damage when the segment is what the next grow would have
-             * written -- intact, continuing the numbering where the
-             * count stops, the end of the chain, past the published end
-             * and on the device -- and
-             * the kernel mounts it on the same terms
-             * (cetrafs_layout_pending_link()). Anything else is.
-             */
-            if (filled == nbg && seg_lba >= cetrafs_le64(sb.total_blocks) && seg_lba < dev_bytes / CETRAFS_BLOCK_SIZE) {
-                pread_all(fd, &seg, sizeof(seg), (off_t) seg_lba * CETRAFS_BLOCK_SIZE);
-                if (cetrafs_le32(seg.magic) == CETRAFS_BGSEG_MAGIC &&
-                    (uint32_t) cetrafs_le64(seg.checksum) == crc32c_struct(&seg, sizeof(seg),
-                                                                           offsetof(cetrafs_bg_segment_t, checksum),
-                                                                           sizeof(seg.checksum)) &&
-                    cetrafs_le32(seg.first_bg_id) == nbg && cetrafs_le32(seg.count) &&
-                    seg_lba + 1 + cetrafs_le32(seg.count) <= dev_bytes / CETRAFS_BLOCK_SIZE && !cetrafs_le64(seg.next)) {
-                    printf("note: the Block Group table links a segment at %" PRIu64
-                           " for Block Groups %u.. the superblock does not count yet -- a grow in progress, or one\n"
-                           "      that was interrupted before it published (re-run growfs.cetra to finish it)\n",
-                           seg_lba, nbg);
-                    break;
-                }
-            }
-            if (seg_lba >= total_blocks) {
-                fprintf(stderr, "ERR: Block Group table segment at %" PRIu64 " is past the end of the volume\n",
-                        seg_lba);
-                return 1;
-            }
-            pread_all(fd, &seg, sizeof(seg), (off_t) seg_lba * CETRAFS_BLOCK_SIZE);
-            if (cetrafs_le32(seg.magic) != CETRAFS_BGSEG_MAGIC) {
-                fprintf(stderr, "ERR: Block Group table segment at %" PRIu64 " has no magic\n", seg_lba);
-                return 1;
-            }
-            {
-                uint32_t scrc = crc32c_struct(&seg, sizeof(seg), offsetof(cetrafs_bg_segment_t, checksum),
-                                              sizeof(seg.checksum));
-                if ((uint32_t) cetrafs_le64(seg.checksum) != scrc) {
-                    fprintf(stderr, "ERR: Block Group table segment at %" PRIu64 " fails its checksum\n", seg_lba);
-                    return 1;
-                }
-            }
-            if (cetrafs_le32(seg.first_bg_id) != filled) {
-                fprintf(stderr, "ERR: Block Group table segment at %" PRIu64 " starts at id %u, expected %u\n",
-                        seg_lba, cetrafs_le32(seg.first_bg_id), filled);
-                return 1;
-            }
-            /* The kernel's bounds (fs.c), BEFORE the count drives a
-             * loop: a segment claiming 2^32 descriptors walked that
-             * many times and wrapped `filled` -- the mount refuses it in
-             * a millisecond, fsck spun on it. And where the segment and
-             * its descriptors sit: a grow puts them past every fixed
-             * table, inside the device. */
-            if (seg_lba < cetrafs_le64(sb.bg_regions_start)) {
-                fprintf(stderr, "ERR: Block Group table segment at %" PRIu64 " lies among the fixed tables "
-                                "(before block %" PRIu64 ")\n",
-                        seg_lba, (uint64_t) cetrafs_le64(sb.bg_regions_start));
-                return 1;
-            }
-            if (cetrafs_le32(seg.count) > nbg - filled) {
-                fprintf(stderr, "ERR: Block Group table chain describes more than the %u Block Groups recorded "
-                                "(segment at %" PRIu64 " claims %u, %u left)\n",
-                        nbg, seg_lba, cetrafs_le32(seg.count), nbg - filled);
-                return 1;
-            }
-            if (seg_lba + 1 + cetrafs_le32(seg.count) > total_blocks) {
-                fprintf(stderr, "ERR: Block Group table segment at %" PRIu64 " describes blocks past the end of "
-                                "the volume\n",
-                        seg_lba);
-                return 1;
-            }
-            for (uint32_t i = 0; i < cetrafs_le32(seg.count); i++, filled++)
-                bg_desc_lba[filled] = seg_lba + 1 + i;
-            seg_lo[nsegs] = seg_lba;
-            seg_hi[nsegs++] = seg_lba + 1 + cetrafs_le32(seg.count);
-            seg_lba = cetrafs_le64(seg.next);
-        }
-        if (filled != nbg) {
-            fprintf(stderr, "ERR: Block Group table chain describes %u of %u Block Groups\n", filled, nbg);
+        s0 = nsegs;
+        if (fsck_chain_walk(fd, &sb, &fsck_bg_chain, cetrafs_le64(sb.bg_table_next), first, nbg, dev_bytes, seg_lo,
+                            seg_hi, &nsegs))
             return 1;
-        }
+        for (uint32_t s = s0; s < nsegs; s++)
+            for (uint64_t i = 0; i < seg_hi[s] - seg_lo[s] - 1; i++)
+                bg_desc_lba[first++] = seg_lo[s] + 1 + i;
+        /* The inode table's segments join the same list: the Block Group
+         * checks below keep both off every group. */
+        if (fsck_isegs_build(fd, &sb, dev_bytes, seg_lo, seg_hi, &nsegs))
+            return 1;
     }
 
     /* BG table & regions monotonicity */
@@ -5358,16 +5417,16 @@ int main(int argc, char **argv)
         uint32_t tail_first = 0, tail_count = 0;
 
         if (cetrafs_le64(sb.tail_reserve_blocks) && cetrafs_le64(sb.tail_reserve_start) < total_blocks) {
-            cetrafs_bg_segment_t tseg;
+            cetrafs_seg_hdr_t tseg;
 
             pread_all(fd, &tseg, sizeof(tseg), (off_t) cetrafs_le64(sb.tail_reserve_start) * CETRAFS_BLOCK_SIZE);
             if (cetrafs_le32(tseg.magic) == CETRAFS_BGSEG_MAGIC &&
                 (uint32_t) cetrafs_le64(tseg.checksum) ==
-                    crc32c_struct(&tseg, sizeof(tseg), offsetof(cetrafs_bg_segment_t, checksum),
+                    crc32c_struct(&tseg, sizeof(tseg), offsetof(cetrafs_seg_hdr_t, checksum),
                                   sizeof(tseg.checksum)) &&
                 cetrafs_le32(tseg.count) &&
-                (uint64_t) cetrafs_le32(tseg.first_bg_id) + cetrafs_le32(tseg.count) <= cetrafs_le32(sb.block_group_count)) {
-                tail_first = cetrafs_le32(tseg.first_bg_id);
+                (uint64_t) cetrafs_le32(tseg.first_id) + cetrafs_le32(tseg.count) <= cetrafs_le32(sb.block_group_count)) {
+                tail_first = cetrafs_le32(tseg.first_id);
                 tail_count = cetrafs_le32(tseg.count);
             }
         }

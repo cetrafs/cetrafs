@@ -49,7 +49,7 @@ static void wr(const void *b, size_t n, off_t o)
 
 static off_t rec_off(uint64_t ino)
 {
-    return (off_t) (cetrafs_le64(sb.inode_table_start) + ino - 1) * cetrafs_le32(sb.block_size);
+    return (off_t) cetrafs_u_ino_lba(fd, &sb, ino, NULL, NULL) * cetrafs_le32(sb.block_size);
 }
 
 static void rec_read(uint64_t ino, cetrafs_inode_t *r)

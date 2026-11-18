@@ -1318,6 +1318,9 @@ struct cetrafs_grow_plan {
     u32 old_count, new_count;        /* Block Groups before and after */
     u64 new_seg_lba;                 /* the table segment the grow adds */
     u64 tail_lba;                    /* the segment that links to it; 0 = the superblock does (first grow) */
+    u64 old_inodes;                  /* inodes before; the inode segment, if any, starts after them */
+    u64 new_iseg_lba;                /* the inode table segment the grow adds; 0 = none */
+    u64 tail_ilba;                   /* the inode segment that links to it; 0 = the superblock does */
     u32 nshards;                     /* pool shards: one per Zone Group */
     u64 *shard_credit;               /* capacity each shard gains */
     const cetrafs_grow_arg_t *claim; /* the caller's growfs claim, re-checked at the publish */
@@ -1328,8 +1331,8 @@ int cetrafs_grow_commit(struct super_block *sb, const struct cetrafs_grow_plan *
 int cetrafs_grow_check_bg_header(struct super_block *sb, u32 bg_id, u64 start, u64 len);
 long cetrafs_grow_ioctl(struct file *file, const cetrafs_grow_arg_t __user *arg);
 int cetrafs_grow_heal_pool(struct super_block *sb);
-u32 cetrafs_bgseg_crc(const cetrafs_bg_segment_t *seg);
-u32 cetrafs_bgseg_crc_prefix(const void *img, unsigned int len);
+u32 cetrafs_seg_crc(const cetrafs_seg_hdr_t *seg);
+u32 cetrafs_seg_crc_prefix(const void *img, unsigned int len);
 u64 cetrafs_layout_refresh_count(void);
 u64 cetrafs_owned_derive_overlap_count(void);
 void cetrafs_sb_owned_bgs_check(struct super_block *sb, u32 *stray, u32 *missing);

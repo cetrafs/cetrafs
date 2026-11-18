@@ -83,8 +83,12 @@ int main(int argc, char **argv)
 
     /* The directory's inode bit must be free: planting over a live
      * inode would make this a different test. */
-    bit = dir - 1;
-    boff = (off_t) cetrafs_le64(sb.inode_bmap_start) * CETRAFS_BLOCK_SIZE + (off_t) (bit / 8);
+    {
+        uint64_t bblk = 0;
+
+        cetrafs_u_ino_lba(fd, &sb, dir, &bblk, &bit);
+        boff = (off_t) (bblk * CETRAFS_BLOCK_SIZE + bit / 8);
+    }
     rd(fd, &byte, 1, boff);
     if (byte & (1u << (bit % 8))) {
         fprintf(stderr, "dir-ino %" PRIu64 " is already allocated -- pick a free one\n", dir);
@@ -113,7 +117,7 @@ int main(int argc, char **argv)
 
         memset(rec, 0, sizeof(rec));
         memcpy(rec, &in, sizeof(in));
-        wr(fd, rec, sizeof(rec), (off_t) (cetrafs_le64(sb.inode_table_start) + dir - 1) * CETRAFS_BLOCK_SIZE);
+        wr(fd, rec, sizeof(rec), (off_t) cetrafs_u_ino_lba(fd, &sb, dir, NULL, NULL) * CETRAFS_BLOCK_SIZE);
     }
 
     memset(blk, 0, sizeof(blk));

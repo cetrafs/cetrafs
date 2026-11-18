@@ -86,7 +86,7 @@ int main(int argc, char **argv)
         }
         pread_all(sfd, &ssb, sizeof(ssb), 0);
         pread_all(sfd, &sin, sizeof(sin),
-                  (off_t) (cetrafs_le64(ssb.inode_table_start) + strtoull(argv[3], NULL, 0) - 1) * CETRAFS_BLOCK_SIZE);
+                  (off_t) cetrafs_u_ino_lba(sfd, &ssb, strtoull(argv[3], NULL, 0), NULL, NULL) * CETRAFS_BLOCK_SIZE);
         if (strcmp(argv[2], "--wo") == 0)
             printf("writers=0x%" PRIx64 " readers=0x%" PRIx64 "\n", (uint64_t) cetrafs_le64(sin.write_open_nodes),
                    (uint64_t) cetrafs_le64(sin.read_open_nodes));
@@ -112,7 +112,7 @@ int main(int argc, char **argv)
             return 1;
         }
         pread_all(pfd, &psb, sizeof(psb), 0);
-        poff = (off_t) (cetrafs_le64(psb.inode_table_start) + strtoull(argv[3], NULL, 0) - 1) * CETRAFS_BLOCK_SIZE;
+        poff = (off_t) cetrafs_u_ino_lba(pfd, &psb, strtoull(argv[3], NULL, 0), NULL, NULL) * CETRAFS_BLOCK_SIZE;
         pread_all(pfd, &pin, sizeof(pin), poff);
         seq = ((cetrafs_le64(pin.file_seq) & CETRAFS_FILE_SEQ_VAL_MASK) + 1) |
               ((uint64_t) strtoul(argv[5], NULL, 0) << CETRAFS_FILE_SEQ_NODE_SHIFT);
@@ -140,7 +140,7 @@ int main(int argc, char **argv)
             return 1;
         }
         pread_all(pfd, &psb, sizeof(psb), 0);
-        poff = (off_t) (cetrafs_le64(psb.inode_table_start) + strtoull(argv[3], NULL, 0) - 1) * CETRAFS_BLOCK_SIZE;
+        poff = (off_t) cetrafs_u_ino_lba(pfd, &psb, strtoull(argv[3], NULL, 0), NULL, NULL) * CETRAFS_BLOCK_SIZE;
         pread_all(pfd, &pin, sizeof(pin), poff);
         pin.size = cetrafs_cpu_to_le64(0);
         pin.blocks = cetrafs_cpu_to_le64(0);
@@ -199,7 +199,7 @@ int main(int argc, char **argv)
      * dense table, no per-record block alignment. On a flat image file
      * this collapses to one absolute offset -- no need to replicate the
      * kernel side's per-block straddle loop. */
-    off_t ino_off = (off_t) (cetrafs_le64(sb.inode_table_start) + ino - 1) * CETRAFS_BLOCK_SIZE /* v0x0007: one record per block */;
+    off_t ino_off = (off_t) cetrafs_u_ino_lba(fd, &sb, ino, NULL, NULL) * CETRAFS_BLOCK_SIZE /* v0x0007: one record per block */;
 
     cetrafs_inode_t in;
     pread_all(fd, &in, sizeof(in), ino_off);

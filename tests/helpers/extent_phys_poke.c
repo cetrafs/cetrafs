@@ -82,7 +82,7 @@ int main(int argc, char **argv)
          * INSIDE the data area, or the TAIL one, in the current reserve
          * past bg_data_end. Live descriptors every node CASes. */
         uint64_t cur = cetrafs_le64(sb.bg_table_next);
-        cetrafs_bg_segment_t seg;
+        cetrafs_seg_hdr_t seg;
 
         if (!cur) {
             fprintf(stderr, "the volume has no appended BG table segment -- it was never grown\n");
@@ -124,7 +124,7 @@ int main(int argc, char **argv)
         return 2;
     }
 
-    off_t rec_off = (off_t) (cetrafs_le64(sb.inode_table_start) + ino - 1) * cetrafs_le32(sb.block_size);
+    off_t rec_off = (off_t) cetrafs_u_ino_lba(fd, &sb, ino, NULL, NULL) * cetrafs_le32(sb.block_size);
     cetrafs_inode_t rec;
 
     rd(fd, &rec, sizeof(rec), rec_off);

@@ -156,7 +156,7 @@ struct cetrafs_bg_chunk {
      * Where each Block Group's DESCRIPTOR lives.
      *
      * It used to be bg_table_start + bg_id, full stop. The table is a
-     * chain now (cetrafs_bg_segment_t): the first segment is still that
+     * chain now (cetrafs_seg_hdr_t): the first segment is still that
      * contiguous run, and growing appends segments elsewhere rather
      * than moving anything. Resolving an id therefore means knowing
      * which segment holds it.
@@ -320,6 +320,13 @@ struct cetrafs_bg_layout {
      * fields. A refresh publishes a new list, never edits this one. */
     struct cetrafs_iseg *isegs;
     u32 nisegs;
+
+    /* Inode numbers mid-BIRTH on this node (cetrafs_sb_birth_begin()),
+     * one bit per number in chunks of CETRAFS_BITS_PER_BLOCK. A grow adds
+     * chunks and never copies one: every layout shares its
+     * predecessor's, so a bit set through any of them is the same bit. */
+    unsigned long **birth;
+    u32 nbirth;
 
     struct cetrafs_bg_layout *older; /* superseded, freed at unmount */
     u32 nchunks;
@@ -859,18 +866,19 @@ struct cetrafs_sb_info {
      * staleness, which is the point: it arbitrates between "the bitmap
      * buffer lied" and "two allocators really were handed one block". */
     unsigned long *alloc_shadow;
-    /* Inode numbers mid-BIRTH on this node: set by cetrafs_alloc_inode(),
-     * cleared once the first name is published (or by any free). The
-     * scrub's orphan reclaim must skip these: a newborn's record is not
-     * yet written, so to a scanner it is indistinguishable from the
-     * previous incarnation's dead record -- the scrub freed exactly such
-     * a number 378us after its rebirth and two files ended up sharing
-     * one inode (2026-10-29, full-probe churn tape). */
-    unsigned long *inode_birth;
+    /* Inode numbers mid-BIRTH on this node live in the layout
+     * (cetrafs_bg_layout.birth), so the map grows with the table. Set by
+     * cetrafs_alloc_inode(), cleared once the first name is published
+     * (or by any free). The scrub's orphan reclaim must skip these: a
+     * newborn's record is not yet written, so to a scanner it is
+     * indistinguishable from the previous incarnation's dead record --
+     * the scrub freed exactly such a number 378us after its rebirth and
+     * two files ended up sharing one inode (2026-10-29, full-probe churn
+     * tape). */
     /* Orders this node's inode allocations against its own orphan
      * reclaims. An allocation holds it shared from its bit CAS until the
-     * number is in inode_birth; a reclaim holds it exclusive from its
-     * claim through its release, and re-checks inode_birth inside. Without
+     * number is in the birth map; a reclaim holds it exclusive from its
+     * claim through its release, and re-checks the birth map inside. Without
      * it a local reclaim could judge a bit this node had just set -- the
      * registry entry not made yet -- and clear it after the creator's
      * birth claim had already landed on its own claim (a peer's reclaim
@@ -1178,6 +1186,21 @@ static struct cetrafs_bg_layout *cetrafs_layout_alloc(const cetrafs_superblock_t
         .table = le64_to_cpu(raw->inode_table_start),
     };
     l->nisegs = 1;
+    l->nbirth = DIV_ROUND_UP(le32_to_cpu(raw->inodes_count) + 1ULL, CETRAFS_BITS_PER_BLOCK);
+    l->birth = kcalloc(l->nbirth, sizeof(*l->birth), GFP_KERNEL);
+    for (ci = 0; l->birth && ci < l->nbirth; ci++) {
+        l->birth[ci] = prev && ci < prev->nbirth ? prev->birth[ci] : bitmap_zalloc(CETRAFS_BITS_PER_BLOCK, GFP_KERNEL);
+        if (!l->birth[ci])
+            break;
+    }
+    if (!l->birth || ci < l->nbirth || (prev && l->nbirth < prev->nbirth)) {
+        while (l->birth && ci-- > (prev ? prev->nbirth : 0))
+            bitmap_free(l->birth[ci]);
+        kfree(l->birth);
+        kfree(l->isegs);
+        kvfree(l);
+        return NULL;
+    }
     l->bg_count = nbg;
     l->nchunks = nchunks;
     for (ci = 0; ci < nchunks; ci++) {
@@ -1189,6 +1212,9 @@ static struct cetrafs_bg_layout *cetrafs_layout_alloc(const cetrafs_superblock_t
         if (!l->chunk[ci]) {
             while (ci-- > have)
                 kvfree(l->chunk[ci]);
+            for (ci = prev ? prev->nbirth : 0; ci < l->nbirth; ci++)
+                bitmap_free(l->birth[ci]);
+            kfree(l->birth);
             kfree(l->isegs);
             kvfree(l);
             return NULL;
@@ -1212,6 +1238,9 @@ static void cetrafs_layout_discard(struct cetrafs_bg_layout *l, const struct cet
         return;
     for (ci = prev ? prev->nchunks : 0; ci < l->nchunks; ci++)
         kvfree(l->chunk[ci]);
+    for (ci = prev ? prev->nbirth : 0; ci < l->nbirth; ci++)
+        bitmap_free(l->birth[ci]);
+    kfree(l->birth);
     kfree(l->bg_segs);
     kfree(l->isegs);
     kvfree(l);
@@ -1256,46 +1285,251 @@ static int cetrafs_layout_note_desc(struct cetrafs_bg_layout *l, u32 b, u32 from
  * of the chain. Anything else is
  * still refused, with the message the mount always gave.
  */
-static int cetrafs_layout_pending_link(struct super_block *sb, const cetrafs_superblock_t *raw, u64 seg_lba, u32 nbg)
+/* The two chains of table segments: what a reader needs to tell them apart. */
+struct cetrafs_seg_kind {
+    u32 magic;
+    const char *what;    /* "BG table", "inode table" */
+    const char *entries; /* "Block Groups", "inodes" */
+    u64 (*span)(u64 count); /* blocks a segment of 'count' entries takes, header included */
+};
+
+static u64 cetrafs_bgseg_span(u64 count)
+{
+    return 1 + count;
+}
+
+static u64 cetrafs_inoseg_span(u64 count)
+{
+    return 1 + cetrafs_calc_inode_bmap_blocks(count) + count;
+}
+
+static const struct cetrafs_seg_kind cetrafs_bg_chain = {CETRAFS_BGSEG_MAGIC, "BG table", "Block Groups",
+                                                         cetrafs_bgseg_span};
+static const struct cetrafs_seg_kind cetrafs_ino_chain = {CETRAFS_INOSEG_MAGIC, "inode table", "inodes",
+                                                          cetrafs_inoseg_span};
+
+static int cetrafs_layout_pending_link(struct super_block *sb, const cetrafs_superblock_t *raw, u64 seg_lba, u64 nbg,
+                                       const struct cetrafs_seg_kind *k)
 {
     u64 dev_blocks = bdev_nr_bytes(sb->s_bdev) / CETRAFS_BLOCK_SIZE;
-    const cetrafs_bg_segment_t *seg;
+    const cetrafs_seg_hdr_t *seg;
     struct buffer_head *sbh;
     int rc = -EUCLEAN;
 
     if (seg_lba >= dev_blocks) {
-        pr_err("BG table chain links to block %llu, past the end of the device (%llu)\n",
+        pr_err("%s chain links to block %llu, past the end of the device (%llu)\n", k->what,
                (unsigned long long) seg_lba, (unsigned long long) dev_blocks);
         return -EUCLEAN;
     }
     /* A grow writes its segment past the end the superblock publishes;
      * a link to anywhere inside the volume is not one. */
     if (seg_lba < le64_to_cpu(raw->total_blocks)) {
-        pr_err("BG table chain links a segment at %llu past the %u Block Groups the superblock counts, inside "
-               "the volume -- refusing\n",
-               (unsigned long long) seg_lba, nbg);
+        pr_err("%s chain links a segment at %llu past the %llu %s the superblock counts, inside the volume -- "
+               "refusing\n",
+               k->what, (unsigned long long) seg_lba, (unsigned long long) nbg, k->entries);
         return -EUCLEAN;
     }
     cetrafs_invalidate_block(sb, seg_lba);
     sbh = sb_bread(sb, seg_lba);
     if (!sbh)
         return -EIO;
-    seg = (const cetrafs_bg_segment_t *) sbh->b_data;
-    if (le32_to_cpu(seg->magic) == CETRAFS_BGSEG_MAGIC && cetrafs_bgseg_crc(seg) == (u32) le64_to_cpu(seg->checksum) &&
-        le32_to_cpu(seg->first_bg_id) == nbg && le32_to_cpu(seg->count) &&
-        seg_lba + 1 + le32_to_cpu(seg->count) <= dev_blocks && !le64_to_cpu(seg->next)) {
-        pr_notice("BG table chain links a segment at %llu for Block Groups %u.. that the superblock does not count "
-                  "yet -- a grow in progress, or one that never published; not used until it does\n",
-                  (unsigned long long) seg_lba, nbg);
+    seg = (const cetrafs_seg_hdr_t *) sbh->b_data;
+    if (le32_to_cpu(seg->magic) == k->magic && cetrafs_seg_crc(seg) == (u32) le64_to_cpu(seg->checksum) &&
+        le32_to_cpu(seg->first_id) == nbg && le32_to_cpu(seg->count) &&
+        seg_lba + k->span(le32_to_cpu(seg->count)) <= dev_blocks && !le64_to_cpu(seg->next)) {
+        pr_notice("%s chain links a segment at %llu for %s %llu.. that the superblock does not count yet -- a "
+                  "grow in progress, or one that never published; not used until it does\n",
+                  k->what, (unsigned long long) seg_lba, k->entries, (unsigned long long) nbg);
         rc = 0;
     } else {
-        pr_err("BG table chain links a segment at %llu past the %u Block Groups the superblock counts, and it is "
-               "not a grow's next segment\n",
-               (unsigned long long) seg_lba, nbg);
+        pr_err("%s chain links a segment at %llu past the %llu %s the superblock counts, and it is not a grow's "
+               "next segment\n",
+               k->what, (unsigned long long) seg_lba, (unsigned long long) nbg, k->entries);
         pr_err("a grow was interrupted before it published -- re-run growfs.cetra\n");
     }
     brelse(sbh);
     return rc;
+}
+
+/*
+ * One appended segment's header, read and checked before anything it
+ * says is used: on the device, the right magic and checksum, at least
+ * one entry and no more than the 'left' the superblock still counts,
+ * all of its span on the device, past the fixed tables, and continuing
+ * the numbering at 'filled' exactly. The caller brelse()s what this
+ * returns; an ERR_PTR on any failure, said once.
+ */
+static struct buffer_head *cetrafs_seg_read(struct super_block *sb, const cetrafs_superblock_t *raw, u64 seg_lba,
+                                            u64 filled, u64 left, bool fresh, const struct cetrafs_seg_kind *k)
+{
+    const u64 total = le64_to_cpu(raw->total_blocks);
+    const cetrafs_seg_hdr_t *seg;
+    struct buffer_head *sbh;
+    u32 cnt;
+
+    /* The link itself, before it is followed: a next pointing off the
+     * device is a corrupt chain, not an I/O error to puzzle over. */
+    if (seg_lba >= total) {
+        pr_err("%s chain links to block %llu, past the end of the device (%llu)\n", k->what,
+               (unsigned long long) seg_lba, (unsigned long long) total);
+        return ERR_PTR(-EUCLEAN);
+    }
+    /* One read per segment, up to a million on a hostile chain:
+     * killable, and never a soft lockup (audit 2026-11-14 M-31, BM-19). */
+    if (fatal_signal_pending(current))
+        return ERR_PTR(-EINTR);
+    cond_resched();
+    if (fresh)
+        cetrafs_invalidate_block(sb, seg_lba);
+    sbh = sb_bread(sb, seg_lba);
+    if (!sbh)
+        return ERR_PTR(-EIO);
+    seg = (const cetrafs_seg_hdr_t *) sbh->b_data;
+    if (le32_to_cpu(seg->magic) != k->magic) {
+        pr_err("%s segment at %llu has no magic\n", k->what, (unsigned long long) seg_lba);
+        goto bad;
+    }
+    /* The checksum this header CARRIES, which the mount path once never
+     * looked at: a single flipped bit in count, first_id or next was
+     * trusted completely by the one reader that acts on them. */
+    if (cetrafs_seg_crc(seg) != (u32) le64_to_cpu(seg->checksum)) {
+        pr_err("%s segment at %llu fails its checksum\n", k->what, (unsigned long long) seg_lba);
+        goto bad;
+    }
+    cnt = le32_to_cpu(seg->count);
+    /* A grow adds at least one entry, so a segment with none is damage
+     * -- and it is what let a chain grow to a million segments without
+     * describing anything. Checked against what is LEFT before anything
+     * is counted: 'cnt' comes off the device, and a count that wraps the
+     * tally could land back on exactly the total. */
+    if (!cnt) {
+        pr_err("%s segment at %llu describes no %s\n", k->what, (unsigned long long) seg_lba, k->entries);
+        goto bad;
+    }
+    if (cnt > left) {
+        pr_err("%s segment at %llu claims %u %s; %llu are left to describe\n", k->what,
+               (unsigned long long) seg_lba, cnt, k->entries, (unsigned long long) left);
+        goto bad;
+    }
+    if (seg_lba + k->span(cnt) > total) {
+        pr_err("%s segment at %llu describes blocks past the end of the device (%llu)\n", k->what,
+               (unsigned long long) seg_lba, (unsigned long long) total);
+        goto bad;
+    }
+    /* And WHERE it is. Only the first segment went through
+     * cetrafs_validate_layout(); an appended one could sit on the inode
+     * table and pass. A grow only ever puts a segment in a tail reserve,
+     * past every fixed table, so nothing below bg_regions_start is
+     * legal; overlap with a Block Group or another segment is checked
+     * once all are known. And it must continue the numbering exactly. */
+    if (seg_lba < le64_to_cpu(raw->bg_regions_start) || le32_to_cpu(seg->first_id) != filled) {
+        pr_err("%s segment at %llu (first id %u, expected %llu) lies among the fixed tables below %llu or breaks "
+               "the numbering -- refusing\n",
+               k->what, (unsigned long long) seg_lba, le32_to_cpu(seg->first_id), (unsigned long long) filled,
+               (unsigned long long) le64_to_cpu(raw->bg_regions_start));
+        goto bad;
+    }
+    return sbh;
+bad:
+    brelse(sbh);
+    return ERR_PTR(-EUCLEAN);
+}
+
+/* Append [start, end) to a growing range list. */
+static int cetrafs_ranges_add(struct cetrafs_lba_range **r, u32 *n, u32 *cap, u64 start, u64 end)
+{
+    if (*n == *cap) {
+        u32 ncap = *cap ? *cap * 2 : 8;
+        void *nr = krealloc_array(*r, ncap, sizeof(**r), GFP_KERNEL);
+
+        if (!nr)
+            return -ENOMEM;
+        *r = nr;
+        *cap = ncap;
+    }
+    (*r)[*n].start = start;
+    (*r)[*n].end = end;
+    (*n)++;
+    return 0;
+}
+
+/*
+ * The inode table's chain: l->isegs, the implicit first segment then
+ * each appended one, and every appended segment's blocks added to the
+ * table-segment ranges the overlap checks and the address guard use.
+ * 'gp' (a grow being validated before it links) supplies the link the
+ * device does not have yet.
+ */
+static int cetrafs_layout_walk_inodes(struct super_block *sb, struct cetrafs_bg_layout *l, bool fresh,
+                                      struct cetrafs_grow_plan *gp, struct cetrafs_lba_range **segs, u32 *nsegs,
+                                      u32 *segcap)
+{
+    const cetrafs_superblock_t *raw = &l->raw;
+    const u64 total = le32_to_cpu(raw->inodes_count);
+    u64 filled = le32_to_cpu(raw->inode_first_count), seg_lba = le64_to_cpu(raw->inode_seg_next), guard = 0;
+    u32 cap = 1;
+    int rc;
+
+    /* Zero on a table that has never grown: the run mkfs laid down. */
+    if (!filled || filled > total)
+        filled = total;
+    l->isegs[0].count = filled;
+    l->nisegs = 1;
+    while (seg_lba) {
+        const cetrafs_seg_hdr_t *seg;
+        struct buffer_head *sbh;
+        u64 cnt;
+
+        if (filled == total)
+            return cetrafs_layout_pending_link(sb, raw, seg_lba, total, &cetrafs_ino_chain);
+        /* A chain is a loop waiting to happen; bound it by the only
+         * number that can honestly bound it. */
+        if (++guard > total) {
+            pr_err("inode table chain does not terminate -- refusing\n");
+            return -EUCLEAN;
+        }
+        sbh = cetrafs_seg_read(sb, raw, seg_lba, filled, total - filled, fresh, &cetrafs_ino_chain);
+        if (IS_ERR(sbh))
+            return PTR_ERR(sbh);
+        seg = (const cetrafs_seg_hdr_t *) sbh->b_data;
+        cnt = le32_to_cpu(seg->count);
+        if (l->nisegs == cap) {
+            void *n = krealloc_array(l->isegs, cap * 2, sizeof(*l->isegs), GFP_KERNEL);
+
+            if (!n) {
+                brelse(sbh);
+                return -ENOMEM;
+            }
+            l->isegs = n;
+            cap *= 2;
+        }
+        l->isegs[l->nisegs++] = (struct cetrafs_iseg) {
+            .first = filled + 1,
+            .count = cnt,
+            .bmap = seg_lba + 1,
+            .table = seg_lba + 1 + cetrafs_calc_inode_bmap_blocks(cnt),
+        };
+        rc = cetrafs_ranges_add(segs, nsegs, segcap, seg_lba, seg_lba + cetrafs_inoseg_span(cnt));
+        if (rc) {
+            brelse(sbh);
+            return rc;
+        }
+        filled += cnt;
+        /* A grow being validated before it is linked: the old tail (or
+         * the superblock) does not name it on the device yet. */
+        if (gp && gp->new_iseg_lba && filled == gp->old_inodes) {
+            gp->tail_ilba = seg_lba;
+            seg_lba = gp->new_iseg_lba;
+        } else
+            seg_lba = le64_to_cpu(seg->next);
+        brelse(sbh);
+    }
+    if (filled != total) {
+        pr_err("inode table chain describes %llu of %llu inodes\n", (unsigned long long) filled,
+               (unsigned long long) total);
+        return -EUCLEAN;
+    }
+    return 0;
 }
 
 /* TEST ONLY: the walk skips the new Block Groups' header check, so
@@ -1329,7 +1563,6 @@ static int cetrafs_layout_walk(struct super_block *sb, struct cetrafs_bg_layout 
                                const struct cetrafs_bg_layout *prev, struct cetrafs_grow_plan *gp)
 {
     const cetrafs_superblock_t *ondisk = &l->raw;
-    const u64 total = le64_to_cpu(ondisk->total_blocks);
     const u32 nbg = l->bg_count, from = prev ? prev->bg_count : 0;
     const bool fresh = prev != NULL;
     const bool ra = !READ_ONCE(cetrafs_mount_bg_ra_off); /* once per walk */
@@ -1367,24 +1600,14 @@ static int cetrafs_layout_walk(struct super_block *sb, struct cetrafs_bg_layout 
          * so a loop or a link into nowhere would mount clean. */
         while (seg_lba) {
             struct buffer_head *sbh;
-            const cetrafs_bg_segment_t *seg;
+            const cetrafs_seg_hdr_t *seg;
             u32 cnt, i;
 
             /* Every Block Group counted, and still a link: a grow's
              * unpublished segment, or corruption. */
             if (filled == nbg) {
-                rc = cetrafs_layout_pending_link(sb, ondisk, seg_lba, nbg);
+                rc = cetrafs_layout_pending_link(sb, ondisk, seg_lba, nbg, &cetrafs_bg_chain);
                 goto walked;
-            }
-
-            /* The link itself, before it is followed: a next pointing
-             * off the device is a corrupt chain, not an I/O error to
-             * puzzle over. */
-            if (seg_lba >= total) {
-                pr_err("BG table chain links to block %llu, past the end of the device (%llu)\n",
-                       (unsigned long long) seg_lba, (unsigned long long) total);
-                rc = -EUCLEAN;
-                goto out;
             }
             /* A chain is a loop waiting to happen; bound it by the only
              * number that can honestly bound it. */
@@ -1393,95 +1616,13 @@ static int cetrafs_layout_walk(struct super_block *sb, struct cetrafs_bg_layout 
                 rc = -EUCLEAN;
                 goto out;
             }
-            /* One read per segment, up to a million on a hostile chain:
-             * killable, and never a soft lockup (audit 2026-11-14 M-31,
-             * BM-19). */
-            if (fatal_signal_pending(current)) {
-                rc = -EINTR;
+            sbh = cetrafs_seg_read(sb, ondisk, seg_lba, filled, nbg - filled, fresh, &cetrafs_bg_chain);
+            if (IS_ERR(sbh)) {
+                rc = PTR_ERR(sbh);
                 goto out;
             }
-            cond_resched();
-            if (fresh)
-                cetrafs_invalidate_block(sb, seg_lba);
-            sbh = sb_bread(sb, seg_lba);
-            if (!sbh) {
-                rc = -EIO;
-                goto out;
-            }
-            seg = (const cetrafs_bg_segment_t *) sbh->b_data;
-            if (le32_to_cpu(seg->magic) != CETRAFS_BGSEG_MAGIC) {
-                pr_err("BG table segment at %llu has no magic\n", (unsigned long long) seg_lba);
-                brelse(sbh);
-                rc = -EUCLEAN;
-                goto out;
-            }
-            /*
-             * The checksum this header CARRIES, which the mount path
-             * once never looked at: growfs writes it and fsck verifies
-             * it, and a single flipped bit in count, first_bg_id or next
-             * was trusted completely by the one reader that acts on
-             * them.
-             */
-            if (cetrafs_bgseg_crc(seg) != (u32) le64_to_cpu(seg->checksum)) {
-                pr_err("BG table segment at %llu fails its checksum\n", (unsigned long long) seg_lba);
-                brelse(sbh);
-                rc = -EUCLEAN;
-                goto out;
-            }
-
+            seg = (const cetrafs_seg_hdr_t *) sbh->b_data;
             cnt = le32_to_cpu(seg->count);
-            /* A grow adds at least one Block Group, so a segment with
-             * none is damage -- and it is what let a chain grow to a
-             * million segments without describing a single group. */
-            if (!cnt) {
-                pr_err("BG table segment at %llu describes no Block Group\n", (unsigned long long) seg_lba);
-                brelse(sbh);
-                rc = -EUCLEAN;
-                goto out;
-            }
-            /*
-             * Checked BEFORE the loop, not after it. 'cnt' comes off the
-             * device and 'filled' is a u32: a segment claiming four
-             * billion descriptors walked that many times, wrapped
-             * 'filled' past 2^32, and could land back on exactly nbg --
-             * passing both this test and the final tally.
-             */
-            if (cnt > nbg - filled) {
-                pr_err("BG table segment at %llu claims %u descriptors; only %u are left of %u\n",
-                       (unsigned long long) seg_lba, cnt, nbg - filled, nbg);
-                brelse(sbh);
-                rc = -EUCLEAN;
-                goto out;
-            }
-            /* And the descriptors a segment points at have to be ON the
-             * device. */
-            if (seg_lba + 1 + cnt > total) {
-                pr_err("BG table segment at %llu describes blocks past the end of the device (%llu)\n",
-                       (unsigned long long) seg_lba, (unsigned long long) total);
-                brelse(sbh);
-                rc = -EUCLEAN;
-                goto out;
-            }
-            /*
-             * And WHERE it is. Only the first segment went through
-             * cetrafs_validate_layout(); an appended one could sit on
-             * the inode table and pass, and every descriptor update
-             * after that is a write into whatever is really there. A
-             * grow only ever puts a segment in a tail reserve, past
-             * every fixed table, so nothing below bg_regions_start is
-             * legal; overlap with a Block Group is checked once their
-             * descriptors are read. And a segment must continue the
-             * numbering exactly.
-             */
-            if (seg_lba < le64_to_cpu(ondisk->bg_regions_start) || le32_to_cpu(seg->first_bg_id) != filled) {
-                pr_err("BG table segment at %llu (first_bg_id %u, expected %u) lies among the fixed tables "
-                       "below %llu or breaks the numbering -- refusing\n",
-                       (unsigned long long) seg_lba, le32_to_cpu(seg->first_bg_id), filled,
-                       (unsigned long long) le64_to_cpu(ondisk->bg_regions_start));
-                brelse(sbh);
-                rc = -EUCLEAN;
-                goto out;
-            }
             /* A segment a live grow added sits past every Block Group
              * that already existed: the grow puts it after the ones it
              * adds. The new Block Groups are checked against it below;
@@ -1495,22 +1636,10 @@ static int cetrafs_layout_walk(struct super_block *sb, struct cetrafs_bg_layout 
                 rc = -EUCLEAN;
                 goto out;
             }
-            if (nsegs == cap) {
-                u32 ncap = cap ? cap * 2 : 8;
-                void *n = krealloc_array(segs, ncap, sizeof(*segs), GFP_KERNEL);
-
-                if (!n) {
-                    brelse(sbh);
-                    rc = -ENOMEM;
-                    goto out;
-                }
-                segs = n;
-                cap = ncap;
-            }
-            {
-                segs[nsegs].start = seg_lba;
-                segs[nsegs].end = seg_lba + 1 + cnt;
-                nsegs++;
+            rc = cetrafs_ranges_add(&segs, &nsegs, &cap, seg_lba, seg_lba + 1 + cnt);
+            if (rc) {
+                brelse(sbh);
+                goto out;
             }
             for (i = 0; i < cnt; i++, filled++) {
                 rc = cetrafs_layout_note_desc(l, filled, from, seg_lba + 1 + i);
@@ -1538,6 +1667,11 @@ walked:
             rc = -EUCLEAN;
             goto out;
         }
+        /* The inode table's segments join the same list: one overlap
+         * check, one address guard, for every table segment. */
+        rc = cetrafs_layout_walk_inodes(sb, l, fresh, gp, &segs, &nsegs, &cap);
+        if (rc)
+            goto out;
     }
 
     /*
@@ -1697,9 +1831,12 @@ static void cetrafs_layout_free_chain(struct cetrafs_bg_layout *l)
         return;
     for (ci = 0; ci < l->nchunks; ci++)
         kvfree(l->chunk[ci]);
+    for (ci = 0; ci < l->nbirth; ci++)
+        bitmap_free(l->birth[ci]);
     while (l) {
         struct cetrafs_bg_layout *older = l->older;
 
+        kfree(l->birth);
         kfree(l->bg_segs);
         kfree(l->isegs);
         kvfree(l);
@@ -1928,30 +2065,30 @@ struct cetrafs_region {
  * inside the region. A prefix whose stored checksum verifies this way
  * therefore came from a block whose padding really is zero.
  */
-u32 cetrafs_bgseg_crc_prefix(const void *img, unsigned int len)
+u32 cetrafs_seg_crc_prefix(const void *img, unsigned int len)
 {
     static const u8 zero[256] = {0};
-    size_t off = offsetof(cetrafs_bg_segment_t, checksum);
-    size_t clen = sizeof(((cetrafs_bg_segment_t *) NULL)->checksum);
+    size_t off = offsetof(cetrafs_seg_hdr_t, checksum);
+    size_t clen = sizeof(((cetrafs_seg_hdr_t *) NULL)->checksum);
     size_t left;
     u32 crc = ~0U;
 
-    if (len > sizeof(cetrafs_bg_segment_t))
-        len = sizeof(cetrafs_bg_segment_t);
+    if (len > sizeof(cetrafs_seg_hdr_t))
+        len = sizeof(cetrafs_seg_hdr_t);
     if (len < off + clen)
         return 0; /* cannot hold the fields; never matches a real checksum by design of the caller */
     crc = crc32c(crc, img, off);
     crc = crc32c(crc, zero, clen);
     crc = crc32c(crc, (const u8 *) img + off + clen, len - off - clen);
-    for (left = sizeof(cetrafs_bg_segment_t) - len; left; left -= min_t(size_t, left, sizeof(zero)))
+    for (left = sizeof(cetrafs_seg_hdr_t) - len; left; left -= min_t(size_t, left, sizeof(zero)))
         crc = crc32c(crc, zero, min_t(size_t, left, sizeof(zero)));
     return ~crc;
 }
 
-u32 cetrafs_bgseg_crc(const cetrafs_bg_segment_t *seg)
+u32 cetrafs_seg_crc(const cetrafs_seg_hdr_t *seg)
 {
     static const u8 zero[8] = {0};
-    size_t off = offsetof(cetrafs_bg_segment_t, checksum);
+    size_t off = offsetof(cetrafs_seg_hdr_t, checksum);
     size_t clen = sizeof(seg->checksum);
     u32 crc = ~0U;
 
@@ -1986,10 +2123,16 @@ static int cetrafs_validate_layout(const cetrafs_superblock_t *sb, u64 total_blo
                le32_to_cpu(sb->pending_free_blocks_per_zg), CETRAFS_PENDING_FREE_BLOCKS_PER_ZG);
         return -EINVAL;
     }
-    if (le64_to_cpu(sb->inode_bmap_blocks) != cetrafs_calc_inode_bmap_blocks(le32_to_cpu(sb->inodes_count))) {
-        pr_err("superblock: inode_bmap_blocks %llu, but %u inodes need exactly %llu\n",
-               (unsigned long long) le64_to_cpu(sb->inode_bmap_blocks), le32_to_cpu(sb->inodes_count),
-               (unsigned long long) cetrafs_calc_inode_bmap_blocks(le32_to_cpu(sb->inodes_count)));
+    if (le32_to_cpu(sb->inode_first_count) > le32_to_cpu(sb->inodes_count)) {
+        pr_err("superblock: the inode table's first segment holds %u inodes, more than its %u in all\n",
+               le32_to_cpu(sb->inode_first_count), le32_to_cpu(sb->inodes_count));
+        return -EINVAL;
+    }
+    if (le64_to_cpu(sb->inode_bmap_blocks) != cetrafs_calc_inode_bmap_blocks(cetrafs_sb_inode_first_count(sb))) {
+        pr_err("superblock: inode_bmap_blocks %llu, but %llu inodes need exactly %llu\n",
+               (unsigned long long) le64_to_cpu(sb->inode_bmap_blocks),
+               (unsigned long long) cetrafs_sb_inode_first_count(sb),
+               (unsigned long long) cetrafs_calc_inode_bmap_blocks(cetrafs_sb_inode_first_count(sb)));
         return -EINVAL;
     }
     if (!cetrafs_journal_blocks_ok(le32_to_cpu(sb->node_journal_blocks))) {
@@ -2260,6 +2403,7 @@ static bool cetrafs_layout_is_grow_of(const cetrafs_superblock_t *cur, const cet
     cetrafs_superblock_t a = *cur, b = *nw;
 
     if (le32_to_cpu(nw->block_group_count) < le32_to_cpu(cur->block_group_count) ||
+        le32_to_cpu(nw->inodes_count) < le32_to_cpu(cur->inodes_count) ||
         le64_to_cpu(nw->total_blocks) < le64_to_cpu(cur->total_blocks) ||
         le64_to_cpu(nw->layout_gen) <= le64_to_cpu(cur->layout_gen))
         return false;
@@ -2273,6 +2417,9 @@ static bool cetrafs_layout_is_grow_of(const cetrafs_superblock_t *cur, const cet
     b.bg_data_end = a.bg_data_end;
     b.bg_table_next = a.bg_table_next;
     b.bg_table_first_count = a.bg_table_first_count;
+    b.inodes_count = a.inodes_count;
+    b.inode_seg_next = a.inode_seg_next;
+    b.inode_first_count = a.inode_first_count;
     b.checksum = a.checksum;
     cetrafs_sb_copy_status(&b, &a); /* status, not layout: a mark may come and go */
     return !memcmp(&a, &b, sizeof(a));
@@ -2598,6 +2745,27 @@ int cetrafs_sb_layout_grow(struct super_block *sb, const cetrafs_superblock_t *n
                sb->s_id);
         goto out;
     }
+    /* The inode table segment, when the grow adds inodes: right after the
+     * Block Group segment in the same reserve. As for that one, the
+     * superblock links it only on the table's first grow; later grows
+     * link it from the old tail and leave the head and the first
+     * segment's count alone. */
+    plan.old_inodes = le32_to_cpu(cur->raw.inodes_count);
+    if (le32_to_cpu(nw->inodes_count) > plan.old_inodes) {
+        plan.new_iseg_lba = plan.new_seg_lba + 1 + (le32_to_cpu(nw->block_group_count) - cur->bg_count);
+        if (cur->nisegs > 1 ? nw->inode_seg_next != cur->raw.inode_seg_next ||
+                                  nw->inode_first_count != cur->raw.inode_first_count
+                            : le64_to_cpu(nw->inode_seg_next) != plan.new_iseg_lba ||
+                                  le32_to_cpu(nw->inode_first_count) != plan.old_inodes) {
+            pr_err("%s: grow refused -- its inode table chain does not append exactly one segment after the "
+                   "Block Group one\n",
+                   sb->s_id);
+            goto out;
+        }
+    } else if (nw->inode_seg_next != cur->raw.inode_seg_next || nw->inode_first_count != cur->raw.inode_first_count) {
+        pr_err("%s: grow refused -- it adds no inodes but changes the inode table chain\n", sb->s_id);
+        goto out;
+    }
     plan.cur = &cur->raw;
     plan.nw = nw;
     plan.claim = claim;
@@ -2908,13 +3076,13 @@ int cetrafs_fill_super(struct super_block *sb, struct fs_context *fc)
      * per inode in the bitmap -- both regions must actually be big
      * enough for the count that indexes them. */
     {
-        u64 inodes = le32_to_cpu(ondisk->inodes_count);
+        u64 inodes = cetrafs_sb_inode_first_count(ondisk);
         u64 bmap_bits = le64_to_cpu(ondisk->inode_bmap_blocks) * CETRAFS_BLOCK_SIZE * 8;
 
         /* < U32_MAX: the birth map below has inodes_count + 1 bits, and
          * that +1 must not wrap to a zero-size map set_bit() overruns. */
         if (!inodes || inodes >= U32_MAX || inodes > bmap_bits || inodes > le64_to_cpu(ondisk->inode_table_blocks)) {
-            pr_err("inodes_count=%llu does not fit its bitmap (%llu bits) / table (%llu blocks)\n",
+            pr_err("the inode table's first %llu inodes do not fit its bitmap (%llu bits) / table (%llu blocks)\n",
                    (unsigned long long) inodes, (unsigned long long) bmap_bits,
                    (unsigned long long) le64_to_cpu(ondisk->inode_table_blocks));
             brelse(bh);
@@ -3100,13 +3268,6 @@ int cetrafs_fill_super(struct super_block *sb, struct fs_context *fc)
         if (cetrafs_alloc_shadow_enabled && sbi->total_blocks <= UINT_MAX)
             sbi->alloc_shadow =
                 bitmap_zalloc((unsigned int) sbi->total_blocks, GFP_KERNEL); /* test-only; NULL is fine */
-        /* kv-: a volume with millions of inodes asks for a contiguous
-         * megabyte, which kmalloc can refuse on a fragmented host -- and
-         * a NULL here used to be accepted, silently switching off the
-         * birth guard the scrub relies on not to reclaim a file mid-
-         * create (cetrafs_sb_birth_active()). */
-        sbi->inode_birth = kvcalloc(BITS_TO_LONGS(le32_to_cpu(ondisk->inodes_count) + 1), sizeof(unsigned long),
-                                    GFP_KERNEL);
         /* The first layout: the superblock copy every path reads
          * (cetrafs_sb_raw()) and zeroed per-Block-Group state, which the
          * chain walk below fills in place before anything asks for a
@@ -3121,11 +3282,10 @@ int cetrafs_fill_super(struct super_block *sb, struct fs_context *fc)
 
             sbi->inline_discard = cetrafs_inline_discard_create(sb, fci && fci->inline_discard);
         }
-        if (!sbi->layout || !sbi->inode_birth || !sbi->inline_discard) {
+        if (!sbi->layout || !sbi->inline_discard) {
             cetrafs_inline_discard_destroy(sbi->inline_discard);
             cetrafs_layout_free_chain(sbi->layout);
             bitmap_free(sbi->alloc_shadow);
-            kvfree(sbi->inode_birth);
             kfree(sbi->zg_pf_residue);
             kfree(sbi->zg_pf_drop_blocks);
             kfree(sbi->zg_pf_drop_runs);
@@ -4493,7 +4653,6 @@ departed:
     cetrafs_layout_free_chain(sbi->layout);
     sbi->layout = NULL;
     bitmap_free(sbi->alloc_shadow);
-    kvfree(sbi->inode_birth);
     kfree(sbi->zg_pf_residue);
     kfree(sbi->zg_pf_drop_blocks);
     kfree(sbi->zg_pf_drop_runs);
@@ -5495,27 +5654,40 @@ bool cetrafs_alloc_shadow_enabled;
 cetrafs_test_param(alloc_shadow, cetrafs_alloc_shadow_enabled, bool, 0644);
 MODULE_PARM_DESC(alloc_shadow, "TEST ONLY: shadow-track every data alloc/free; scream on double alloc");
 
+/* The birth-map chunk holding inode 'ino', and its bit there; NULL for
+ * a number this node's table does not have -- which it can have no
+ * birth of either. */
+static unsigned long *cetrafs_birth_chunk(struct super_block *sb, u64 ino, unsigned long *bit)
+{
+    struct cetrafs_bg_layout *l = cetrafs_sb_layout_of(sb->s_fs_info);
+
+    if (!l || ino / CETRAFS_BITS_PER_BLOCK >= l->nbirth)
+        return NULL;
+    *bit = ino % CETRAFS_BITS_PER_BLOCK;
+    return l->birth[ino / CETRAFS_BITS_PER_BLOCK];
+}
+
 void cetrafs_sb_birth_begin(struct super_block *sb, u64 ino)
 {
-    struct cetrafs_sb_info *sbi = sb->s_fs_info;
+    unsigned long bit, *map = cetrafs_birth_chunk(sb, ino, &bit);
 
-    if (sbi && sbi->inode_birth)
-        set_bit((unsigned int) ino, sbi->inode_birth);
+    if (!WARN_ON_ONCE(!map))
+        set_bit(bit, map);
 }
 
 void cetrafs_sb_birth_end(struct super_block *sb, u64 ino)
 {
-    struct cetrafs_sb_info *sbi = sb->s_fs_info;
+    unsigned long bit, *map = cetrafs_birth_chunk(sb, ino, &bit);
 
-    if (sbi && sbi->inode_birth)
-        clear_bit((unsigned int) ino, sbi->inode_birth);
+    if (map)
+        clear_bit(bit, map);
 }
 
 bool cetrafs_sb_birth_active(struct super_block *sb, u64 ino)
 {
-    struct cetrafs_sb_info *sbi = sb->s_fs_info;
+    unsigned long bit, *map = cetrafs_birth_chunk(sb, ino, &bit);
 
-    return sbi && sbi->inode_birth && test_bit((unsigned int) ino, sbi->inode_birth);
+    return map && test_bit(bit, map);
 }
 
 /* See cetrafs_sb_info.birth_rwsem. */

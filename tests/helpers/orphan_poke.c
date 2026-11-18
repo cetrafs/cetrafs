@@ -49,8 +49,10 @@ int main(int argc, char **argv)
     }
 
     /* Set the inode bitmap bit (dense, LSB-first; bit = ino-1). */
-    uint64_t bit = ino - 1;
-    off_t boff = (off_t) cetrafs_le64(sb.inode_bmap_start) * CETRAFS_BLOCK_SIZE + (off_t) (bit / 8);
+    uint64_t bblk = 0, bit = 0;
+
+    cetrafs_u_ino_lba(fd, &sb, ino, &bblk, &bit);
+    off_t boff = (off_t) (bblk * CETRAFS_BLOCK_SIZE + bit / 8);
     unsigned char byte;
     rd(fd, &byte, 1, boff);
     if (byte & (1u << (bit % 8))) {
@@ -78,7 +80,7 @@ int main(int argc, char **argv)
     uint8_t blk[CETRAFS_BLOCK_SIZE];
     memset(blk, 0, sizeof(blk));
     memcpy(blk, &in, sizeof(in));
-    wr(fd, blk, sizeof(blk), (off_t) (cetrafs_le64(sb.inode_table_start) + ino - 1) * CETRAFS_BLOCK_SIZE);
+    wr(fd, blk, sizeof(blk), (off_t) cetrafs_u_ino_lba(fd, &sb, ino, NULL, NULL) * CETRAFS_BLOCK_SIZE);
 
     printf("orphan_poke: ino=%" PRIu64 " nlink=%u read_open_nodes=0x%" PRIx64 " planted\n", ino, nlink, mask);
     close(fd);

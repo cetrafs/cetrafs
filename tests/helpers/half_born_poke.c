@@ -63,8 +63,9 @@ static int landed(const char *path, uint64_t ino, int fd_half, uint32_t owner, u
         fprintf(stderr, "ino %" PRIu64 " out of range\n", ino);
         return 2;
     }
-    off_t boff = (off_t) cetrafs_le64(sb.inode_bmap_start) * CETRAFS_BLOCK_SIZE + (off_t) ((ino - 1) / 8);
-    off_t roff = (off_t) (cetrafs_le64(sb.inode_table_start) + ino - 1) * CETRAFS_BLOCK_SIZE;
+    uint64_t bblk = 0, bbit = 0;
+    off_t boff = (off_t) (cetrafs_u_ino_lba(fd, &sb, ino, &bblk, &bbit) ? bblk * CETRAFS_BLOCK_SIZE + bbit / 8 : 0);
+    off_t roff = (off_t) cetrafs_u_ino_lba(fd, &sb, ino, NULL, NULL) * CETRAFS_BLOCK_SIZE;
 
     rd(fd, blk, sizeof(blk), roff);
     memcpy(&in, blk, sizeof(in));
@@ -97,7 +98,7 @@ static int landed(const char *path, uint64_t ino, int fd_half, uint32_t owner, u
         wr(fd, blk, CETRAFS_INODE_NS_BYTES, roff);
     }
     rd(fd, &byte, 1, boff);
-    byte |= (unsigned char) (1u << ((ino - 1) % 8));
+    byte |= (unsigned char) (1u << (bbit % 8));
     wr(fd, &byte, 1, boff);
     if (fsync(fd) != 0) {
         perror("fsync");
@@ -136,8 +137,10 @@ int main(int argc, char **argv)
         return 2;
     }
 
-    uint64_t bit = ino - 1;
-    off_t boff = (off_t) cetrafs_le64(sb.inode_bmap_start) * CETRAFS_BLOCK_SIZE + (off_t) (bit / 8);
+    uint64_t bblk = 0, bit = 0;
+
+    cetrafs_u_ino_lba(fd, &sb, ino, &bblk, &bit);
+    off_t boff = (off_t) (bblk * CETRAFS_BLOCK_SIZE + bit / 8);
     unsigned char byte;
     rd(fd, &byte, 1, boff);
     byte |= (unsigned char) (1u << (bit % 8));
@@ -154,7 +157,7 @@ int main(int argc, char **argv)
     in.ns_checksum = cetrafs_cpu_to_le64(0);
     in.ns_checksum = cetrafs_cpu_to_le64(cetrafs_inode_crc_ns_us(&in));
     memcpy(blk, &in, CETRAFS_INODE_NS_BYTES); /* the file sector stays zeros */
-    wr(fd, blk, sizeof(blk), (off_t) (cetrafs_le64(sb.inode_table_start) + ino - 1) * CETRAFS_BLOCK_SIZE);
+    wr(fd, blk, sizeof(blk), (off_t) cetrafs_u_ino_lba(fd, &sb, ino, NULL, NULL) * CETRAFS_BLOCK_SIZE);
     if (fsync(fd) != 0) {
         perror("fsync");
         return 2;

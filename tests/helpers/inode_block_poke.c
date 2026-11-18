@@ -143,7 +143,7 @@ int main(int argc, char **argv)
          * file, and what fsck must refuse to read as an inode. */
         cetrafs_inode_t rec;
         unsigned long long m = (argc > 4) ? strtoull(argv[4], NULL, 8) : 040755;
-        off_t off = (off_t) (cetrafs_le64(sb.inode_table_start) + ino - 1) * cetrafs_le32(sb.block_size);
+        off_t off = (off_t) cetrafs_u_ino_lba(fd, &sb, ino, NULL, NULL) * cetrafs_le32(sb.block_size);
         uint8_t blk[CETRAFS_BLOCK_SIZE] = {0};
 
         memset(&rec, 0, sizeof(rec));
@@ -167,7 +167,7 @@ int main(int argc, char **argv)
         return 1;
     }
 
-    off_t rec_off = (off_t) (cetrafs_le64(sb.inode_table_start) + ino - 1) * cetrafs_le32(sb.block_size) /* v0x0007: one record per block */;
+    off_t rec_off = (off_t) cetrafs_u_ino_lba(fd, &sb, ino, NULL, NULL) * cetrafs_le32(sb.block_size) /* v0x0007: one record per block */;
     unsigned char *buf = malloc(cetrafs_le32(sb.inode_size));
     if (!buf) {
         perror("malloc");

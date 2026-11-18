@@ -72,7 +72,8 @@ cetrafs_test_param(grow_stop_after, cetrafs_grow_stop_after, uint, 0644);
 MODULE_PARM_DESC(grow_stop_after, "TEST ONLY: abandon the next live grow after N of its writes (1 credit, 2 link)");
 
 struct cetrafs_grow_link_ctx {
-    u32 old_count;
+    u32 magic; /* which chain: CETRAFS_BGSEG_MAGIC or CETRAFS_INOSEG_MAGIC */
+    u64 old_count;
     u64 new_seg_lba;
 };
 
@@ -87,20 +88,20 @@ struct cetrafs_grow_link_ctx {
 static int cetrafs_grow_link_mutate(void *image, unsigned int len, void *priv)
 {
     struct cetrafs_grow_link_ctx *ctx = priv;
-    cetrafs_bg_segment_t *seg = image; /* the first CAS region of the block only: every field, no padding */
+    cetrafs_seg_hdr_t *seg = image; /* the first CAS region of the block only: every field, no padding */
 
-    if (len < offsetof(cetrafs_bg_segment_t, pad))
+    if (len < offsetof(cetrafs_seg_hdr_t, pad))
         return -EINVAL;
-    if (le32_to_cpu(seg->magic) != CETRAFS_BGSEG_MAGIC ||
-        cetrafs_bgseg_crc_prefix(image, len) != (u32) le64_to_cpu(seg->checksum))
+    if (le32_to_cpu(seg->magic) != ctx->magic ||
+        cetrafs_seg_crc_prefix(image, len) != (u32) le64_to_cpu(seg->checksum))
         return -EUCLEAN;
-    if ((u64) le32_to_cpu(seg->first_bg_id) + le32_to_cpu(seg->count) != ctx->old_count)
+    if ((u64) le32_to_cpu(seg->first_id) + le32_to_cpu(seg->count) != ctx->old_count)
         return -ESTALE;
     if (le64_to_cpu(seg->next) == ctx->new_seg_lba)
         return 1; /* already linked: an earlier attempt landed */
     seg->next = cpu_to_le64(ctx->new_seg_lba);
     seg->checksum = cpu_to_le64(0);
-    seg->checksum = cpu_to_le64((u64) cetrafs_bgseg_crc_prefix(image, len));
+    seg->checksum = cpu_to_le64((u64) cetrafs_seg_crc_prefix(image, len));
     return 0;
 }
 
@@ -240,6 +241,34 @@ static bool cetrafs_grow_publish_recheck_off;
 cetrafs_test_param(grow_publish_recheck_off, cetrafs_grow_publish_recheck_off, bool, 0644);
 MODULE_PARM_DESC(grow_publish_recheck_off, "TEST ONLY: publish a live grow without re-checking its claim");
 
+/* Point the old tail at a new segment of the 'magic' chain; nothing to
+ * do when the superblock names it (the table's first grow, tail 0). */
+static int cetrafs_grow_link(struct super_block *sb, const struct cetrafs_grow_plan *plan, u64 id, u64 tail,
+                             u32 magic, u64 old_count, u64 new_lba)
+{
+    struct cetrafs_grow_link_ctx lctx = {.magic = magic, .old_count = old_count, .new_seg_lba = new_lba};
+    int rc;
+
+    if (!tail)
+        return 0;
+    rc = cetrafs_cas_record(sb, tail, cetrafs_grow_link_mutate, &lctx);
+    if (rc == 1)
+        rc = 0;
+    if (rc == -ETIMEDOUT || rc == -EIO) {
+        /* Unknown: the link may be on the device. A link with no
+         * publish is a state mount accepts, and the credits are kept
+         * rather than risk taking back ones a publish needs. */
+        pr_err("grow: the table link's outcome is unknown (%d) -- run growfs again\n", rc);
+        return -EIO;
+    }
+    if (rc) {
+        pr_err("grow: linking the new segment from block %llu failed (%d) -- nothing published\n",
+               (unsigned long long) tail, rc);
+        cetrafs_grow_uncredit(sb, plan, id);
+    }
+    return rc;
+}
+
 int cetrafs_grow_commit(struct super_block *sb, const struct cetrafs_grow_plan *plan)
 {
     struct cetrafs_grow_sb_ctx sctx = {.cur = plan->cur, .nw = plan->nw};
@@ -273,27 +302,14 @@ int cetrafs_grow_commit(struct super_block *sb, const struct cetrafs_grow_plan *
         return -EIO;
     }
 
-    /* 2. The link, on a second or later grow. */
-    if (plan->tail_lba) {
-        struct cetrafs_grow_link_ctx lctx = {.old_count = plan->old_count, .new_seg_lba = plan->new_seg_lba};
-
-        rc = cetrafs_cas_record(sb, plan->tail_lba, cetrafs_grow_link_mutate, &lctx);
-        if (rc == 1)
-            rc = 0;
-        if (rc == -ETIMEDOUT || rc == -EIO) {
-            /* Unknown: the link may be on the device. A link with no
-             * publish is a state mount accepts, and the credits are
-             * kept rather than risk taking back ones a publish needs. */
-            pr_err("grow: the table link's outcome is unknown (%d) -- run growfs again\n", rc);
-            return -EIO;
-        }
-        if (rc) {
-            pr_err("grow: linking the new segment from block %llu failed (%d) -- nothing published\n",
-                   (unsigned long long) plan->tail_lba, rc);
-            cetrafs_grow_uncredit(sb, plan, id);
-            return rc == -ESTALE ? -ESTALE : rc;
-        }
-    }
+    /* 2. The links, on a table's second or later grow: the Block Group
+     * table's, then the inode table's if the grow adds inodes. */
+    rc = cetrafs_grow_link(sb, plan, id, plan->tail_lba, CETRAFS_BGSEG_MAGIC, plan->old_count, plan->new_seg_lba);
+    if (!rc && plan->new_iseg_lba)
+        rc = cetrafs_grow_link(sb, plan, id, plan->tail_ilba, CETRAFS_INOSEG_MAGIC, plan->old_inodes,
+                               plan->new_iseg_lba);
+    if (rc)
+        return rc;
     if (stop == 2) {
         pr_warn("grow: stopping after the table link (test)\n");
         return -EIO;

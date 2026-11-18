@@ -194,10 +194,12 @@ static void growfs_write_sb_copy(int fd, const cetrafs_superblock_t *sb)
 static void usage(const char *argv0)
 {
     fprintf(stderr,
-            "Usage: %s <blockdev> [-s size] [-n]\n"
+            "Usage: %s <blockdev> [-s size] [-N inodes] [-n]\n"
             "  grows a cetrafs volume into space the device already has\n"
             "  -s: grow to this size instead of the whole device. Accepts a\n"
             "      K/M/G/T suffix; a bare number is MiB, like mkfs.cetra\n"
+            "  -N: the inode count to grow to (default: what mkfs.cetra would\n"
+            "      give a volume of the new size, if that is more)\n"
             "  -n: dry-run (compute & print, no writes)\n"
             "\n"
             "  Run it on a node that has the volume mounted to grow it live; every\n"
@@ -407,6 +409,61 @@ static void growfs_refuse_live_peer(const char *dev)
             dev, row, label[0] ? ", " : "", label[0] ? label : "", age);
 }
 
+/*
+ * Link a new segment from the TAIL of a table chain -- one record, which
+ * is what the live path swaps -- for a table's second and later grows.
+ *
+ * The tail is the segment the SUPERBLOCK's count ends in, found by
+ * counting entries, never "the one whose next is 0". The link reaches
+ * the device before the publish, so a grow that died in between left
+ * the tail pointing at a segment the old superblock does not count --
+ * and a retry, which computes the same segment address, rewrote that
+ * segment with next=0, walked to it as the tail and linked it to ITSELF.
+ * Counting stops at the real tail and overwrites the stale link instead.
+ * Bounded: a chain that does not reach old_count is corruption, and
+ * looping while holding a volume open is worse than refusing.
+ */
+static void growfs_link_tail(int fd, const char *dev, u8 *blk, u64 cur, u64 filled, u64 old_count, u32 magic,
+                             const char *what, u64 new_lba)
+{
+    u64 guard = 0;
+
+    if (!filled || filled > old_count)
+        die("%s: the %s table's first segment holds %" PRIu64 " of %" PRIu64, dev, what, filled, old_count);
+    for (;;) {
+        cetrafs_seg_hdr_t seg;
+
+        if (!cur || ++guard > old_count + 2)
+            die("%s: the %s table chain does not reach entry %" PRIu64, dev, what, old_count);
+        read_block(fd, cur, blk);
+        memcpy(&seg, blk, sizeof(seg));
+        if (cetrafs_le32(seg.magic) != magic)
+            die("%s: %s table segment at %" PRIu64 " has no magic", dev, what, cur);
+        /* Verified before it is restamped: a restamp would make a
+         * damaged header valid (audit L14). */
+        if ((u32) cetrafs_le64(seg.checksum) !=
+            crc32c_struct(&seg, sizeof(seg), offsetof(cetrafs_seg_hdr_t, checksum), sizeof(seg.checksum)))
+            die("%s: %s table segment at %" PRIu64 " fails its checksum -- run fsck", dev, what, cur);
+        if (cetrafs_le32(seg.first_id) != filled || cetrafs_le32(seg.count) > old_count - filled)
+            die("%s: %s table segment at %" PRIu64 " does not continue the chain", dev, what, cur);
+        filled += cetrafs_le32(seg.count);
+        if (filled == old_count) {
+            if (cetrafs_le64(seg.next) != 0)
+                fprintf(stderr, "growfs.cetra: replacing the link an interrupted grow left at block %" PRIu64 "\n",
+                        cur);
+            seg.next = cetrafs_cpu_to_le64(new_lba);
+            seg.checksum = cetrafs_cpu_to_le64(0);
+            seg.checksum = cetrafs_cpu_to_le64(
+                (u64) crc32c_struct(&seg, sizeof(seg), offsetof(cetrafs_seg_hdr_t, checksum), sizeof(seg.checksum)));
+            memcpy(blk, &seg, sizeof(seg));
+            write_block(fd, cur, blk, true);
+            sync_device(fd, true);
+            return;
+        }
+        cur = cetrafs_le64(seg.next);
+    }
+}
+
 int main(int argc, char **argv)
 {
     int grow_rc = 0; /* a Zone Group row left unstamped after the publish (audit L14) */
@@ -421,11 +478,22 @@ int main(int argc, char **argv)
 
     if (dev[0] == '-')
         die_arg("the device comes first: %s <device> [options] (got '%s' where the device goes)", argv[0], dev);
-    u64 want_bytes = 0;
+    u64 want_bytes = 0, want_inodes = 0;
     int opt;
 
-    while ((opt = getopt(argc - 1, argv + 1, "s:n")) != -1) {
+    while ((opt = getopt(argc - 1, argv + 1, "s:N:n")) != -1) {
         switch (opt) {
+        case 'N': {
+            char *end = NULL;
+            unsigned long long v;
+
+            errno = 0;
+            v = strtoull(optarg, &end, 10);
+            if (errno || !end || *end || !v || v >= UINT32_MAX)
+                die_arg("-N wants an inode count between 1 and %u", UINT32_MAX - 1);
+            want_inodes = v;
+            break;
+        }
         case 's':
             want_bytes = parse_size_bytes(optarg);
             if (want_bytes % CETRAFS_BLOCK_SIZE)
@@ -663,6 +731,23 @@ int main(int argc, char **argv)
      * the way mkfs does: iterate to a fixed point. It converges
      * downward in a couple of rounds and is bounded by the loop count.
      */
+    /*
+     * The inode table grows with the volume (audit 2026-11-15 M-36): to
+     * what mkfs would give a volume of the new size, or to -N. Its new
+     * segment -- header, bitmap, records -- follows the Block Group
+     * segment in the same reserve.
+     */
+    const u64 old_inodes = cetrafs_le32(sb.inodes_count);
+    u64 new_inodes = want_inodes ? want_inodes : cetrafs_default_inodes_for_bytes(target_blocks * CETRAFS_BLOCK_SIZE);
+
+    if (want_inodes && want_inodes < old_inodes)
+        die_arg("-N %" PRIu64 " is fewer than the %" PRIu64 " inodes the volume has -- an inode table only grows",
+                want_inodes, old_inodes);
+    if (new_inodes < old_inodes)
+        new_inodes = old_inodes;
+    const u64 ino_add = new_inodes - old_inodes;
+    const u64 ino_span = ino_add ? 1 + cetrafs_calc_inode_bmap_blocks(ino_add) + ino_add : 0;
+
     u32 new_z = old_z;
     u64 new_b = old_b;
     u64 reserve_blocks = 0;
@@ -731,7 +816,7 @@ int main(int argc, char **argv)
          * peer caches these addresses and reads them with no lock, and
          * what never changes cannot be read stale.
          */
-        u64 need = 1 /* segment header */ + (cand_b - old_b); /* added descriptors */
+        u64 need = 1 /* segment header */ + (cand_b - old_b) /* added descriptors */ + ino_span;
 
         if (need == reserve_blocks && cand_b == new_b && cand_z == new_z)
             break;
@@ -778,12 +863,15 @@ int main(int argc, char **argv)
             "  new BG regions: LBA %" PRIu64 " .. %" PRIu64
             "\n"
             "  tail reserve:   LBA %" PRIu64 "+%" PRIu64
-            " (the appended Block Group table segment)\n"
+            " (the appended table segments)\n"
+            "  inodes:       %" PRIu64 " -> %" PRIu64
+            "\n"
             "  unused tail:    %" PRIu64
             " blocks (rounding)\n",
             dry_run ? "(DRY-RUN)" : "plan", dev_bytes, dev_blocks, old_total, target_blocks, old_b, new_b,
             new_b - old_b, (unsigned long long) (bg_size * CETRAFS_BLOCK_SIZE / 1024 / 1024), old_z, new_z,
-            new_z - old_z, new_bg_start, reserve_start - 1, reserve_start, reserve_blocks, tail_waste);
+            new_z - old_z, new_bg_start, reserve_start - 1, reserve_start, reserve_blocks, old_inodes, new_inodes,
+            tail_waste);
 
     /*
      * Growing is a ONE-WAY DOOR for the whole cluster, so say so once
@@ -1076,19 +1164,39 @@ int main(int argc, char **argv)
      * BEFORE it is linked: everything it describes is already on the
      * device when anything can reach it (rule 8). */
     {
-        cetrafs_bg_segment_t seg;
+        cetrafs_seg_hdr_t seg;
 
         memset(&seg, 0, sizeof(seg));
         seg.magic = cetrafs_cpu_to_le32(CETRAFS_BGSEG_MAGIC);
         seg.count = cetrafs_cpu_to_le32((u32) (new_b - old_b));
-        seg.first_bg_id = cetrafs_cpu_to_le32((u32) old_b);
+        seg.first_id = cetrafs_cpu_to_le32((u32) old_b);
         seg.next = cetrafs_cpu_to_le64(0);
         seg.checksum = cetrafs_cpu_to_le64(0);
         seg.checksum = cetrafs_cpu_to_le64((u64) crc32c_struct(&seg, sizeof(seg),
-                                                               offsetof(cetrafs_bg_segment_t, checksum),
+                                                               offsetof(cetrafs_seg_hdr_t, checksum),
                                                                sizeof(seg.checksum)));
         memcpy(blk, &seg, sizeof(seg));
         write_block(fd, seg_header_lba, blk, true);
+    }
+
+    /* The inode table's segment, after the Block Group one: its bitmap
+     * and records zeroed -- every number free, every record unborn --
+     * and its header last, as above. */
+    const u64 iseg_lba = seg_first_desc + (new_b - old_b);
+
+    if (ino_add) {
+        cetrafs_seg_hdr_t seg;
+
+        zero_blocks(fd, iseg_lba + 1, ino_span - 1, true);
+        memset(&seg, 0, sizeof(seg));
+        seg.magic = cetrafs_cpu_to_le32(CETRAFS_INOSEG_MAGIC);
+        seg.count = cetrafs_cpu_to_le32((u32) ino_add);
+        seg.first_id = cetrafs_cpu_to_le32((u32) old_inodes);
+        seg.checksum = cetrafs_cpu_to_le64((u64) crc32c_struct(&seg, sizeof(seg), offsetof(cetrafs_seg_hdr_t, checksum),
+                                                               sizeof(seg.checksum)));
+        memset(blk, 0, CETRAFS_BLOCK_SIZE);
+        memcpy(blk, &seg, sizeof(seg));
+        write_block(fd, iseg_lba, blk, true);
     }
 
     free(bg_owner);
@@ -1146,67 +1254,20 @@ int main(int argc, char **argv)
      * makes the new descriptors reachable, and it is appended to rather
      * than rewritten -- a volume grown twice links the second segment
      * from the first, not from here. */
-    if (cetrafs_le64(sb.bg_table_next) == 0) {
+    if (cetrafs_le64(sb.bg_table_next) == 0)
         sb.bg_table_next = cetrafs_cpu_to_le64(seg_header_lba);
-    } else if (live) {
-        /* The kernel links it, by compare-and-swap, once it has checked
-         * everything this grow wrote (kmod/grow.c). */
-    } else {
-        /*
-         * Second and later grows link from the TAIL segment, not from
-         * here -- one compare-and-swap on one record, which is what the
-         * live path will do.
-         *
-         * The tail is the segment the SUPERBLOCK's count ends in, found
-         * by counting descriptors, never "the one whose next is 0". This
-         * link reaches the device before the publish below, so a grow
-         * that died in between left the tail pointing at a segment the
-         * old superblock does not count -- and a retry, which computes
-         * the same segment address, rewrote that segment with next=0,
-         * walked to it as the tail and linked it to ITSELF. Counting
-         * stops at the real tail and overwrites the stale link instead.
-         * Bounded: a chain that does not reach old_b is corruption, and
-         * looping while holding a volume open is worse than refusing.
-         */
-        u64 cur = cetrafs_le64(sb.bg_table_next);
-        u64 filled = cetrafs_le64(sb.bg_table_first_count);
-        unsigned guard = 0;
-
-        if (!filled || filled > old_b)
-            die("%s: bg_table_first_count %" PRIu64 " does not fit %" PRIu64 " Block Groups", dev, filled, old_b);
-        for (;;) {
-            cetrafs_bg_segment_t seg;
-
-            if (!cur || ++guard > old_b + 2)
-                die("%s: the Block Group table chain does not reach Block Group %" PRIu64, dev, old_b);
-            read_block(fd, cur, blk);
-            memcpy(&seg, blk, sizeof(seg));
-            if (cetrafs_le32(seg.magic) != CETRAFS_BGSEG_MAGIC)
-                die("%s: Block Group table segment at %" PRIu64 " has no magic", dev, cur);
-            /* Verified before it is restamped: a restamp would make a
-             * damaged header valid (audit L14). */
-            if ((u32) cetrafs_le64(seg.checksum) != crc32c_struct(&seg, sizeof(seg), offsetof(cetrafs_bg_segment_t, checksum),
-                                                                  sizeof(seg.checksum)))
-                die("%s: Block Group table segment at %" PRIu64 " fails its checksum -- run fsck", dev, cur);
-            if (cetrafs_le32(seg.first_bg_id) != filled || cetrafs_le32(seg.count) > old_b - filled)
-                die("%s: Block Group table segment at %" PRIu64 " does not continue the chain", dev, cur);
-            filled += cetrafs_le32(seg.count);
-            if (filled == old_b) {
-                if (cetrafs_le64(seg.next) != 0)
-                    fprintf(stderr, "growfs.cetra: replacing the link an interrupted grow left at block %" PRIu64 "\n",
-                            cur);
-                seg.next = cetrafs_cpu_to_le64(seg_header_lba);
-                seg.checksum = cetrafs_cpu_to_le64(0);
-                seg.checksum = cetrafs_cpu_to_le64((u64) crc32c_struct(&seg, sizeof(seg),
-                                                                       offsetof(cetrafs_bg_segment_t, checksum),
-                                                                       sizeof(seg.checksum)));
-                memcpy(blk, &seg, sizeof(seg));
-                write_block(fd, cur, blk, true);
-                sync_device(fd, true);
-                break;
-            }
-            cur = cetrafs_le64(seg.next);
+    else if (!live) /* live, the kernel links it once it has checked everything this grow wrote (kmod/grow.c) */
+        growfs_link_tail(fd, dev, blk, cetrafs_le64(sb.bg_table_next), cetrafs_le64(sb.bg_table_first_count), old_b,
+                         CETRAFS_BGSEG_MAGIC, "Block Group", seg_header_lba);
+    if (ino_add) {
+        if (cetrafs_le64(sb.inode_seg_next) == 0) {
+            sb.inode_seg_next = cetrafs_cpu_to_le64(iseg_lba);
+            sb.inode_first_count = cetrafs_cpu_to_le32((u32) old_inodes);
+        } else if (!live) {
+            growfs_link_tail(fd, dev, blk, cetrafs_le64(sb.inode_seg_next), cetrafs_le32(sb.inode_first_count),
+                             old_inodes, CETRAFS_INOSEG_MAGIC, "inode", iseg_lba);
         }
+        sb.inodes_count = cetrafs_cpu_to_le32((u32) new_inodes);
     }
     if (cetrafs_le64(sb.bg_table_first_count) == 0)
         sb.bg_table_first_count = cetrafs_cpu_to_le64(old_b); /* pre-chain volume */
