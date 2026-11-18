@@ -755,10 +755,13 @@ int cetrafs_fiemap(struct inode *inode, struct fiemap_extent_info *fi, u64 start
 
 /* ---- extwalk.c: the one traversal of an extent tree ---- */
 /* How a walk reads its external blocks: the file's reader or writer trust
- * rule (cetrafs_read_tree_bh_for()), or the scrub's, which has no inode. */
+ * rule (cetrafs_read_tree_bh_for()), a trust the caller decided itself
+ * (a directory's dirent_seq gate), or the scrub's, which has no inode. */
 enum cetrafs_tw_read {
     CETRAFS_TW_READER,
     CETRAFS_TW_WRITER,
+    CETRAFS_TW_CACHED,      /* the caller trusts the cache: checked for sense */
+    CETRAFS_TW_FRESH,       /* the caller does not: device, tail-checked */
     CETRAFS_TW_SCRUB,       /* cached: a proposing pass */
     CETRAFS_TW_SCRUB_FRESH, /* forced fresh, tail-checked: a deciding pass */
 };
@@ -979,7 +982,8 @@ u64 cetrafs_ext_cache_stale_refused_count(void);
 void cetrafs_inode_ext_cache_drop(struct inode *inode);
 u64 cetrafs_ext_cache_hit_count(void);
 u64 cetrafs_ext_cache_miss_count(void);
-struct buffer_head *cetrafs_read_dir_leaf_bh(struct inode *inode, u64 lba, bool fresh);
+struct buffer_head *cetrafs_read_tree_bh_trust(struct inode *inode, u64 lba, u32 tail_magic, const char *what,
+                                               bool trusted);
 struct buffer_head *cetrafs_read_tree_bh(struct inode *inode, u64 lba, u32 tail_magic, const char *what);
 struct buffer_head *cetrafs_read_index_bh(struct inode *inode, u64 lba);
 struct buffer_head *cetrafs_read_tree_bh_for(struct inode *inode, u64 lba, u32 tail_magic, const char *what, bool reader);
@@ -988,6 +992,7 @@ struct buffer_head *cetrafs_read_index_bh_for(struct inode *inode, u64 lba, bool
 int cetrafs_flush_tree_blocks(struct inode *inode, const cetrafs_inode_t *raw, bool mapping_locked);
 void cetrafs_tree_invalidate_cached(struct inode *inode, const cetrafs_inode_t *raw);
 int cetrafs_tree_flatten(struct inode *inode, const cetrafs_inode_t *raw, cetrafs_extent_t **out_arr, u32 *out_n);
+int cetrafs_tree_extents(struct cetrafs_tw *w, const cetrafs_inode_t *raw, cetrafs_extent_t **out_arr, u32 *out_n);
 int cetrafs_tree_build(struct inode *inode, const cetrafs_extent_t *flat, u32 n, cetrafs_inode_t *raw, u64 *out_meta);
 void cetrafs_tree_free_meta(struct inode *inode, const cetrafs_inode_t *raw);
 void cetrafs_tree_free_meta_except(struct inode *inode, const cetrafs_inode_t *raw, const cetrafs_inode_t *keep);

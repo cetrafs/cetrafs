@@ -10,8 +10,10 @@
 #
 # A directory is grown among other allocations -- one 4 KiB file
 # written between dirent blocks -- so each of its blocks is an extent of
-# its own and its tree fills at ~3,800 entries, with the volume nearly
-# empty. The create that fails must return ENOSPC, and the log must
+# its own. Its tree is held to one interior of two leaves (TEST ONLY
+# caps): a directory now grows to depth 2 like a file (M-41), and its
+# real limit, ~258,000 extents, is far too many creates for a suite. So
+# it fills at ~7,600 entries, with the volume nearly empty. The create that fails must return ENOSPC, and the log must
 # name the directory's inode.
 #
 # DISCRIMINATION: on the unfixed module the same run fails the create
@@ -25,13 +27,15 @@ MNT="$(ct_mnt dfull)"
 ct_mkfs "$DEV" -z 1 -J 0 -N 16384 -f >/dev/null
 ct_mount "$DEV" "$MNT"
 require_cetrafs_mount "$MNT"
+ct_param_set tree_root_cap 1
+ct_param_set tree_idx_cap 2
 mkdir "$MNT/d" "$MNT/pad"
 ino="$(stat -c %i "$MNT/d")"
 res="$(python3 - "$MNT" <<'PY'
 import os, sys, errno
 m = sys.argv[1]
 n = 0
-while n < 8000:
+while n < 20000:
     try:
         open(f"{m}/d/e{n:05d}", "w").close()
     except OSError as e:

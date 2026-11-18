@@ -11,6 +11,7 @@
 #include <linux/kernel.h>
 #include <linux/mnt_idmapping.h>
 #include <linux/namei.h>
+#include <linux/sort.h>
 #include <linux/pagemap.h>
 #include <linux/stat.h>
 #include <linux/string.h>
@@ -333,12 +334,12 @@ static bool cetrafs_dirent_owner_slot_zero(struct super_block *sb, u64 ino)
 static int cetrafs_dirent_block_live_owner(struct super_block *sb, u64 lba, u64 mine)
 {
     struct buffer_head *bh = cetrafs_bread_uncached(sb, lba);
+    struct cetrafs_tw w = {.sb = sb, .read = CETRAFS_TW_SCRUB_FRESH};
     const cetrafs_dirent_t *d;
-    const cetrafs_extent_t *arr;
-    struct buffer_head *leaf = NULL;
+    cetrafs_extent_t *arr = NULL;
     cetrafs_inode_t r;
     u64 self;
-    u32 n, i;
+    u32 n = 0, i;
     int ret = 0;
 
     if (!bh)
@@ -372,32 +373,13 @@ static int cetrafs_dirent_block_live_owner(struct super_block *sb, u64 lba, u64 
     if (!cetrafs_le32(r.nlink) || !S_ISDIR(cetrafs_le32(r.mode)) || cetrafs_le16(r.eh.eh_magic) != CETRAFS_EXT_MAGIC)
         return 0;
 
-    if (cetrafs_le16(r.eh.eh_depth) == 0) {
-        arr = r.et.leaf;
-        n = min_t(u32, cetrafs_le16(r.eh.eh_entries), ARRAY_SIZE(r.et.leaf));
-    } else if (cetrafs_le16(r.eh.eh_depth) == 1) {
-        u64 leaf_lba = cetrafs_ei_child(&r.et.idx[0]);
-
-        int chk = cetrafs_lba_run_check(sb, leaf_lba, 1);
-
-        /* "Past a layout this node cannot catch up with" is not "names
-         * nothing": a peer may have grown the volume and put this
-         * directory's leaf there, and answering 0 zeroes its block. */
-        if (chk == -EAGAIN)
-            return -EIO;
-        if (chk)
-            return 0; /* not a tree that can list anything */
-        leaf = cetrafs_blk_tail_bread(sb, self, cetrafs_le64(r.generation), leaf_lba, CETRAFS_LEAF_TAIL_MAGIC,
-                                      "extent leaf");
-        if (!leaf)
-            return -EIO; /* cannot prove the block free: do not zero it */
-        arr = (const cetrafs_extent_t *) (leaf->b_data + sizeof(cetrafs_extent_hdr_t));
-        n = min_t(u32, cetrafs_le16(((const cetrafs_extent_hdr_t *) leaf->b_data)->eh_entries),
-                  CETRAFS_EXT_BLOCK_MAX_LEAVES);
-    } else {
-        return 0;
-    }
-
+    /* Its tree at any depth, read fresh. A block of it that cannot be
+     * read, or lies past a layout this node has not caught up with, is
+     * not "names nothing": the block may be listed there, so it is not
+     * zeroed (the answer leaks, never shares). */
+    ret = cetrafs_tree_extents(&w, &r, &arr, &n);
+    if (ret)
+        return ret == -ENOMEM ? ret : -EIO;
     for (i = 0; i < n; i++) {
         u64 p = cetrafs_ee_pblk(&arr[i]);
 
@@ -410,7 +392,7 @@ static int cetrafs_dirent_block_live_owner(struct super_block *sb, u64 lba, u64 
             break;
         }
     }
-    brelse(leaf);
+    kvfree(arr);
     return ret;
 }
 
@@ -552,9 +534,9 @@ static bool cetrafs_dir_needs_fresh(struct inode *dir, const cetrafs_inode_t *ra
 /* --- Directory block mapping ------------------------------------------
  *
  * A directory's data blocks are addressed through the very same extent
- * tree a regular file uses, so these helpers resolve BOTH depth-0 (up to
- * 4 extents inline in the record) and depth-1 (spilled into one external
- * leaf block) rather than reaching into raw.et.leaf directly.
+ * tree a regular file uses, at any depth, and read through the same walk
+ * (cetrafs_tree_extents()) -- only the freshness question is the
+ * directory's own, see cetrafs_dir_extents_get_unchecked().
  *
  * Previously every walker here hand-iterated raw.et.leaf and
  * rejected eh_depth != 0, and the growth path appended one new extent
@@ -567,9 +549,8 @@ static bool cetrafs_dir_needs_fresh(struct inode *dir, const cetrafs_inode_t *ra
  * external leaf exactly as a regular file does.
  */
 struct cetrafs_dir_extents {
-    struct buffer_head *leaf_bh; /* held for depth 1, NULL for depth 0 */
-    const cetrafs_extent_t *arr;
-    u16 entries;
+    cetrafs_extent_t *arr; /* every extent, by logical block: cetrafs_dir_extents_put() frees it */
+    u32 entries;
 };
 
 /*
@@ -596,7 +577,7 @@ MODULE_PARM_DESC(dir_len_unbounded, "TEST ONLY: a directory's extents may name a
 static int cetrafs_dir_extents_addr_ok(struct inode *dir, const struct cetrafs_dir_extents *de)
 {
     u64 total = 0;
-    u16 i;
+    u32 i;
 
     for (i = 0; i < de->entries; i++) {
         u64 phys = cetrafs_ee_pblk(&de->arr[i]);
@@ -649,10 +630,16 @@ static int cetrafs_dir_extents_get(struct inode *dir, const cetrafs_inode_t *raw
     return ret;
 }
 
+static int cetrafs_dir_ext_cmp(const void *a, const void *b)
+{
+    u64 x = cetrafs_ee_lblk(a), y = cetrafs_ee_lblk(b);
+
+    return x < y ? -1 : x > y;
+}
+
 static int cetrafs_dir_extents_get_unchecked(struct inode *dir, const cetrafs_inode_t *raw,
                                              struct cetrafs_dir_extents *de)
 {
-    de->leaf_bh = NULL;
     de->arr = NULL;
     de->entries = 0;
 
@@ -678,53 +665,55 @@ static int cetrafs_dir_extents_get_unchecked(struct inode *dir, const cetrafs_in
         return -ENOENT;
     }
 
-    if (cetrafs_le16(raw->eh.eh_magic) != CETRAFS_EXT_MAGIC || cetrafs_le16(raw->eh.eh_depth) > 1) {
+    if (cetrafs_le16(raw->eh.eh_magic) != CETRAFS_EXT_MAGIC || cetrafs_le16(raw->eh.eh_depth) > CETRAFS_EXT_MAX_DEPTH) {
         pr_warn_ratelimited("dir ino=%llu: bad extent header (magic=0x%x depth=%u entries=%u)\n",
-                            (unsigned long long) dir->i_ino, raw->eh.eh_magic, raw->eh.eh_depth, raw->eh.eh_entries);
+                            (unsigned long long) dir->i_ino, cetrafs_le16(raw->eh.eh_magic),
+                            cetrafs_le16(raw->eh.eh_depth), cetrafs_le16(raw->eh.eh_entries));
         return -EIO;
     }
 
-    if (cetrafs_le16(raw->eh.eh_depth) == 0) {
-        de->arr = raw->et.leaf;
-        de->entries = min_t(u16, cetrafs_le16(raw->eh.eh_entries), ARRAY_SIZE(raw->et.leaf));
-        return 0;
-    }
+    /*
+     * The tree lists which data blocks this directory owns, so a stale
+     * block of it makes a scan walk the wrong set and miss a peer's
+     * growth block: duplicate names, INVISIBLE entries. A file's tree
+     * trusts its cache by its lock, and that question is wrong for a
+     * directory -- under nofilelock it reads "no peer has this OPEN",
+     * while peers change a directory through namespace ops without ever
+     * opening it (328 of 401 mkdir()s duplicated in a 3-node run). So
+     * the tree is read fresh exactly when the dirent_seq gate says the
+     * directory changed cross-node -- the signal the dirent-block reads
+     * use -- and a single writer's own directory stays cached.
+     */
+    {
+        struct cetrafs_tw w = {
+            .inode = dir,
+            .read = cetrafs_dir_needs_fresh(dir, raw) ? CETRAFS_TW_FRESH : CETRAFS_TW_CACHED,
+        };
+        int ret = cetrafs_tree_extents(&w, raw, &de->arr, &de->entries);
 
-    /* The leaf lists which data blocks this directory owns, so a stale
-     * one makes a scan walk the wrong set of blocks and miss a peer's
-     * growth block (duplicate names, INVISIBLE entries). Read it fresh
-     * exactly when the dirent_seq gate says the directory changed
-     * cross-node -- the same signal the dirent-block reads use -- so a
-     * peer's growth forces a fresh leaf while a single writer's own
-     * directory stays cached and O(1). See cetrafs_read_dir_leaf_bh(). */
-    de->leaf_bh = cetrafs_read_dir_leaf_bh(
-        dir, cetrafs_ei_child(&raw->et.idx[0]),
-        cetrafs_dir_needs_fresh(dir, raw));
-    if (!de->leaf_bh) {
-        pr_warn_ratelimited(
-            "dir ino=%llu: extent-leaf block %llu unreadable\n", (unsigned long long) dir->i_ino,
-            (unsigned long long) cetrafs_ei_child(&raw->et.idx[0]));
-        return -EIO;
+        if (ret) {
+            pr_warn_ratelimited("dir ino=%llu: extent tree unreadable (%d)\n", (unsigned long long) dir->i_ino, ret);
+            return ret == -ENOMEM ? ret : -EIO;
+        }
     }
-
-    de->arr = (const cetrafs_extent_t *) (de->leaf_bh->b_data + sizeof(cetrafs_extent_hdr_t));
-    de->entries =
-        min_t(u16, cetrafs_le16(((const cetrafs_extent_hdr_t *) de->leaf_bh->b_data)->eh_entries), CETRAFS_EXT_BLOCK_MAX_LEAVES);
+    /* By logical block: readdir resumes at a position, so it must meet
+     * the blocks in position order, and a tree's arrays are unordered. */
+    sort(de->arr, de->entries, sizeof(*de->arr), cetrafs_dir_ext_cmp, NULL);
     return 0;
 }
 
 static void cetrafs_dir_extents_put(struct cetrafs_dir_extents *de)
 {
-    if (de->leaf_bh)
-        brelse(de->leaf_bh);
-    de->leaf_bh = NULL;
+    kvfree(de->arr);
+    de->arr = NULL;
+    de->entries = 0;
 }
 
 /* Total data blocks this directory currently owns. */
 static u64 cetrafs_dir_extents_nblocks(const struct cetrafs_dir_extents *de)
 {
     u64 n = 0;
-    u16 i;
+    u32 i;
 
     for (i = 0; i < de->entries; i++)
         n += cetrafs_ee_len(&de->arr[i]);
@@ -795,7 +784,7 @@ MODULE_PARM_DESC(dir_refresh_whole_off, "TEST ONLY: a stale directory is re-read
 static noinline_for_stack int cetrafs_dir_refresh_whole(struct inode *dir, const struct cetrafs_dir_extents *de)
 {
     struct buffer_head *bhs[32];
-    u16 i;
+    u32 i;
 
     for (i = 0; i < de->entries; i++) {
         u64 phys = cetrafs_ee_pblk(&de->arr[i]);
@@ -822,7 +811,8 @@ static int cetrafs_walk_dirents_from(struct inode *dir, cetrafs_dirent_visit_fn 
     cetrafs_inode_t raw;
     bool fresh, skipped = false;
     cetrafs_dirent_t *img;
-    int ret, i;
+    int ret;
+    u32 i;
 
     /* Any node can add/remove entries in any directory at any time (no
      * whole-file lock covers a directory the way lock.c covers a regular
@@ -1359,7 +1349,8 @@ int cetrafs_dir_remove_entry(struct inode *dir, const struct qstr *name, u64 exp
     cetrafs_dirent_t *slot = NULL;
     time64_t now;
     bool fresh;
-    int ret, i;
+    int ret;
+    u32 i;
 
     /* The staged image if this operation already updated this record --
      * see cetrafs_dir_add_entry(). */
@@ -1509,7 +1500,8 @@ int cetrafs_dir_update_dotdot(struct inode *dir, u64 new_parent_ino)
 {
     struct cetrafs_dir_extents dx;
     cetrafs_inode_t raw;
-    int ret, i;
+    int ret;
+    u32 i;
 
     cetrafs_invalidate_raw_inode(dir->i_sb, dir->i_ino);
     ret = cetrafs_read_raw_inode(dir->i_sb, dir->i_ino, &raw);
@@ -1626,7 +1618,8 @@ static int cetrafs_dir_retarget_entry(struct inode *dir,
     struct buffer_head *bh = NULL;
     cetrafs_dirent_t *slot = NULL;
     time64_t now;
-    int ret, i;
+    int ret;
+    u32 i;
 
     cetrafs_invalidate_raw_inode(dir->i_sb, dir->i_ino);
     ret = cetrafs_read_raw_inode(dir->i_sb, dir->i_ino, &raw);
@@ -2328,33 +2321,9 @@ cetrafs_test_param(ns_count_serial, cetrafs_ns_count_serial, bool, 0644);
 MODULE_PARM_DESC(ns_count_serial, "TEST ONLY: the namespace recount reads one block per round trip");
 
 struct cetrafs_dir_runs {
-    u64 skip_leaf, skip_xattr;
-    u32 n;
-    bool overflow;
-    struct {
-        u64 lba;
-        u32 len;
-    } r[CETRAFS_EXT_BLOCK_MAX_LEAVES];
     /* One batch of dirent blocks, held between its read and its visit. */
     struct buffer_head *bh[CETRAFS_NS_WALK_BATCH];
 };
-
-static void cetrafs_dir_runs_cb(void *p, u64 phys, u32 len)
-{
-    struct cetrafs_dir_runs *dr = p;
-
-    /* The walk reports what the record OWNS: the leaf block and the
-     * xattr block are its, but hold no entries. */
-    if (len == 1 && (phys == dr->skip_leaf || phys == dr->skip_xattr))
-        return;
-    if (dr->n >= ARRAY_SIZE(dr->r)) {
-        dr->overflow = true;
-        return;
-    }
-    dr->r[dr->n].lba = phys;
-    dr->r[dr->n].len = len;
-    dr->n++;
-}
 
 /*
  * Read the n dirent blocks lba..lba+n into dr->bh[0..n) as one batch
@@ -2390,57 +2359,53 @@ static int cetrafs_dirent_batch_read(struct super_block *sb, const cetrafs_inode
 }
 
 /* Read every dirent block of a directory record forced-fresh; visit each
- * occupied entry. The record was read fresh by the caller. */
+ * occupied entry. The record was read fresh by the caller, and its tree
+ * is read fresh here, at any depth: no inode is in hand, so through the
+ * scrub's deciding read. */
 static int cetrafs_dir_raw_visit(struct super_block *sb, const cetrafs_inode_t *raw, struct cetrafs_dir_runs *dr,
                                  void (*visit)(void *priv, const cetrafs_dirent_t *de), void *priv)
 {
-    u32 i;
+    struct cetrafs_tw w = {.sb = sb, .read = CETRAFS_TW_SCRUB_FRESH};
+    cetrafs_extent_t *ext = NULL;
+    u64 total = 0;
+    u32 n = 0, i;
     int ret;
 
     memset(dr, 0, sizeof(*dr));
-    if (cetrafs_le16(raw->eh.eh_depth) > 1)
-        return -EUCLEAN; /* a directory's tree is at most one level deep */
-    if (cetrafs_le16(raw->eh.eh_depth) == 1)
-        dr->skip_leaf = cetrafs_ei_child(&raw->et.idx[0]);
-    dr->skip_xattr = cetrafs_le64(raw->xattr_block);
-    ret = cetrafs_raw_inode_for_each_owned_block(sb, raw, cetrafs_dir_runs_cb, dr, /*fresh=*/true);
-    if (!ret && dr->overflow)
-        ret = -EUCLEAN;
+    ret = cetrafs_tree_extents(&w, raw, &ext, &n);
     if (ret)
         return ret;
     /* The count every other scan refuses (cetrafs_dir_extents_addr_ok(),
      * audit 2026-11-14 RT-3), and this one is a forced-fresh read per
      * block too: a record naming more is damage, not 2^31 reads (re-audit
      * of the fixes -- the signal check made it killable, not bounded). */
-    {
-        u64 total = 0;
-
-        for (i = 0; i < dr->n; i++)
-            total += dr->r[i].len;
-        if (total > CETRAFS_DIR_MAX_BLOCKS && !READ_ONCE(cetrafs_dir_len_unbounded)) {
-            pr_err_ratelimited("dir record: its extents name %llu blocks, more than a directory may hold (%u) -- "
-                               "not scanned (fsck)\n",
-                               (unsigned long long) total, CETRAFS_DIR_MAX_BLOCKS);
-            return -EUCLEAN;
-        }
+    for (i = 0; i < n; i++)
+        total += cetrafs_ee_len(&ext[i]);
+    if (total > CETRAFS_DIR_MAX_BLOCKS && !READ_ONCE(cetrafs_dir_len_unbounded)) {
+        pr_err_ratelimited("dir record: its extents name %llu blocks, more than a directory may hold (%u) -- "
+                           "not scanned (fsck)\n",
+                           (unsigned long long) total, CETRAFS_DIR_MAX_BLOCKS);
+        ret = -EUCLEAN;
+        goto out;
     }
-    for (i = 0; i < dr->n; i++) {
-        u32 b = 0;
+    for (i = 0; i < n; i++) {
+        u64 lba = cetrafs_ee_pblk(&ext[i]);
+        u32 len = cetrafs_ee_len(&ext[i]), b = 0;
 
         /* An address read off the disk aims a read here (rule 19), and
          * "not data" marks the record damaged -- unless it only lies past
          * a grow this node has not caught up with (class 48). */
-        ret = cetrafs_lba_run_check(sb, dr->r[i].lba, dr->r[i].len);
+        ret = cetrafs_lba_run_check(sb, lba, len);
         if (ret) /* -EAGAIN: past a grow not caught up with -- not damage, the caller catches up */
-            return ret;
-        while (b < dr->r[i].len) {
-            u32 nb = min_t(u32, CETRAFS_NS_WALK_BATCH, dr->r[i].len - b);
+            goto out;
+        while (b < len) {
+            u32 nb = min_t(u32, CETRAFS_NS_WALK_BATCH, len - b);
             u32 k;
 
             /* -EUCLEAN only for a block every attempt found damaged */
-            ret = cetrafs_dirent_batch_read(sb, raw, dr, dr->r[i].lba + b, nb);
+            ret = cetrafs_dirent_batch_read(sb, raw, dr, lba + b, nb);
             if (ret)
-                return ret;
+                goto out;
             for (k = 0; k < nb; k++) {
                 const cetrafs_dirent_t *de = (const cetrafs_dirent_t *) dr->bh[k]->b_data;
                 unsigned int e;
@@ -2453,11 +2418,16 @@ static int cetrafs_dir_raw_visit(struct super_block *sb, const cetrafs_inode_t *
             }
             b += nb;
             cond_resched();
-            if (fatal_signal_pending(current))
-                return -EINTR; /* N2: a directory's worth of reads, killable */
+            if (fatal_signal_pending(current)) {
+                ret = -EINTR; /* N2: a directory's worth of reads, killable */
+                goto out;
+            }
         }
     }
-    return 0;
+    ret = 0;
+out:
+    kvfree(ext);
+    return ret;
 }
 
 static bool cetrafs_dirent_is_dot(const cetrafs_dirent_t *de)

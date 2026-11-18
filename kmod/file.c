@@ -1566,18 +1566,17 @@ static const struct cetrafs_tw_ops cetrafs_flat_ops = {
     .leaf = cetrafs_flat_leaf,
 };
 
-static int cetrafs_tree_flatten_for(struct inode *inode, const cetrafs_inode_t *raw, cetrafs_extent_t **out_arr,
-                                    u32 *out_n, bool reader)
+/* The walk 'w' names its reader -- an inode and a read mode, or a super
+ * block and a scrub mode; its ops and ctx are this function's. The array
+ * is the caller's to kvfree(), NULL when the tree holds no extent. */
+int cetrafs_tree_extents(struct cetrafs_tw *w, const cetrafs_inode_t *raw, cetrafs_extent_t **out_arr, u32 *out_n)
 {
     struct cetrafs_flat_ctx f = {0};
-    struct cetrafs_tw w = {
-        .ops = &cetrafs_flat_ops,
-        .inode = inode,
-        .read = reader ? CETRAFS_TW_READER : CETRAFS_TW_WRITER,
-        .ctx = &f,
-    };
-    int ret = cetrafs_tree_walk(&w, raw);
+    int ret;
 
+    w->ops = &cetrafs_flat_ops;
+    w->ctx = &f;
+    ret = cetrafs_tree_walk(w, raw);
     if (ret) {
         kvfree(f.arr);
         return ret < 0 ? ret : -EIO;
@@ -1585,6 +1584,17 @@ static int cetrafs_tree_flatten_for(struct inode *inode, const cetrafs_inode_t *
     *out_arr = f.arr;
     *out_n = f.n;
     return 0;
+}
+
+static int cetrafs_tree_flatten_for(struct inode *inode, const cetrafs_inode_t *raw, cetrafs_extent_t **out_arr,
+                                    u32 *out_n, bool reader)
+{
+    struct cetrafs_tw w = {
+        .inode = inode,
+        .read = reader ? CETRAFS_TW_READER : CETRAFS_TW_WRITER,
+    };
+
+    return cetrafs_tree_extents(&w, raw, out_arr, out_n);
 }
 
 int cetrafs_tree_flatten(struct inode *inode, const cetrafs_inode_t *raw, cetrafs_extent_t **out_arr, u32 *out_n)
@@ -3730,12 +3740,9 @@ static void cetrafs_idx_set(cetrafs_extent_idx_t *e, u64 block, u64 end, u64 lba
     cetrafs_ei_init(e, block, end, lba);
 }
 
-/* Widen a child's range to include [block, end). Only ever widens, so a
- * lookup skipping on it can never skip a child that holds the block. An
- * UNKNOWN child stays unknown: we have not read it, so we cannot claim
- * a bound for what else is in there.
- *
- * Only entries that point at LEAVES carry a range. A root entry points
+/* Only entries that point at LEAVES carry a range, and the leaf appends
+ * go to carries none (UNKNOWN): a range is given only to a leaf that has
+ * stopped growing, or by a rebuild. A root entry points
  * at an interior, and keeping ITS range right means widening it at
  * every site that extends that interior -- new leaf, new interior,
  * bulk rebuild. Missing one skips a whole interior and LOSES DATA,
@@ -3744,21 +3751,6 @@ static void cetrafs_idx_set(cetrafs_extent_idx_t *e, u64 block, u64 end, u64 lba
  * most four root entries, so an exact range there saves four reads
  * against a per-leaf win of dozens. Not worth the exposure: roots are
  * always UNKNOWN. */
-static void cetrafs_idx_widen(cetrafs_extent_idx_t *e, u64 block, u64 end)
-{
-    u64 lo = cetrafs_ei_lo(e), hi = cetrafs_ei_end(e);
-
-    if (!hi)
-        return; /* unknown: leave it so */
-    if (!end) { /* no end known for what is added: becomes unknown */
-        cetrafs_ei_set_range(e, lo, 0);
-        return;
-    }
-    /* A union whose span does not fit 32 bits is written unknown
-     * (cetrafs_ei_set_range()). */
-    cetrafs_ei_set_range(e, min(block, lo), max(end, hi));
-}
-
 /* The end of [iblock, iblock + count) for a range bound. 48-bit blocks
  * plus a 31-bit length cannot wrap a u64; a range too wide for a span is
  * written unknown by cetrafs_ei_set_range(). */
@@ -4979,6 +4971,14 @@ static bool cetrafs_leaf_bh_holds_uninit(struct buffer_head *lbh, u64 iblock)
  * held back for the next durability boundary (leafdefer.c) instead of
  * being dirtied: writeback must never write it in place, and the
  * boundary writes it through the journal. Unlocks the buffer.
+ *
+ * A DIRECTORY has no such boundary -- no lock, no close, no fsync a peer
+ * waits on -- and a peer reads its tree fresh at any moment, so its
+ * block is journaled here and now. An unwritten merge once left the
+ * device showing the shorter extent: every peer missed the files in the
+ * extension, and a peer's own append then journal-wrote the short image
+ * over the merge. Deciding it here, not at each edit, is what lets a
+ * directory use every edit of the tree, depth 2 included.
  */
 /* 'outer': the caller has no other block mid-update, so the inode's
  * held-back set may be written here if it reached its cap
@@ -4986,7 +4986,7 @@ static bool cetrafs_leaf_bh_holds_uninit(struct buffer_head *lbh, u64 iblock)
  * passes false -- the write would wait on that block's lock. */
 static int cetrafs_tree_hold_back(struct inode *inode, struct buffer_head *bh, u32 prev_crc, bool outer)
 {
-    if (!cetrafs_bh_defer_update(inode, bh, prev_crc)) {
+    if (S_ISREG(inode->i_mode) && !cetrafs_bh_defer_update(inode, bh, prev_crc)) {
         if (outer)
             cetrafs_deferred_capped(inode);
         return 0;
@@ -5455,7 +5455,7 @@ MODULE_PARM_DESC(tree_append_room_off,
                  "TEST ONLY: a convert at the tree's limit shrinks its leaf without first checking the append has room");
 
 /*
- * Can the tree take two more extents through cetrafs_tree_append(),
+ * Can the tree take 'need' more extents through cetrafs_tree_append(),
  * merging nothing? Asked BEFORE a convert shrinks a full leaf and hands
  * its pieces -- the converted block and the preallocated tail, at most
  * two extents -- to the append (CETRAFS_CONVERT_APPEND). At the tree's
@@ -5473,9 +5473,8 @@ MODULE_PARM_DESC(tree_append_room_off,
  *
  * 0: room. -ENOSPC: none. -EIO: a tree block could not be read.
  */
-static int cetrafs_tree_append_room(struct inode *inode, const cetrafs_inode_t *raw)
+static int cetrafs_tree_append_room(struct inode *inode, const cetrafs_inode_t *raw, u32 need)
 {
-    const u32 need = 2;
     u32 ni, nroot, avail = 0;
 
     if (READ_ONCE(cetrafs_tree_append_room_off))
@@ -5532,7 +5531,7 @@ static int cetrafs_tree_append_room(struct inode *inode, const cetrafs_inode_t *
  * reserved -- both before anything is edited. */
 static int cetrafs_tree_convert_need_room(struct inode *inode, const cetrafs_inode_t *raw)
 {
-    int ret = cetrafs_tree_append_room(inode, raw);
+    int ret = cetrafs_tree_append_room(inode, raw, 2);
 
     if (ret == -ENOSPC)
         pr_warn_ratelimited("ino=%llu: extent tree full (%u extents at most): a write into preallocated space "
@@ -6083,35 +6082,14 @@ static int cetrafs_tree_append_inner(struct inode *inode,
             *merged = (cetrafs_le16(lhdr->eh_entries) == before);
             *leaf_count = cetrafs_le16(lhdr->eh_entries);
             cetrafs_blk_tail_stamp(lbh, CETRAFS_LEAF_TAIL_MAGIC);
-            if (*merged && S_ISREG(inode->i_mode)) {
-                /* A merge only lengthens the previous extent. For a
-                 * regular file the dirty buffer may wait for the
-                 * close-time flush (lock.c) or fsync -- this node holds
-                 * the exclusive lock, and 256 merges/MiB make this the
-                 * growing-file hot path. A DIRECTORY has no lock, no
-                 * close and no flush: an unwritten merge left the
-                 * DEVICE showing the shorter extent, so every peer's
-                 * fresh read missed the extension and every file named
-                 * in it was unreachable -- and a peer's own append then
-                 * journal-wrote the short image, erasing the merge
-                 *. So only S_ISREG may defer; directories
-                 * fall through to the journal write below. */
-                ret = cetrafs_tree_hold_back(inode, lbh, prev_crc, true);
-                brelse(lbh);
-                return ret;
-            }
-            /* Same trade as the convert path: a regular file's leaf is republished
-             * at the next durability boundary (close, fsync, writeback), so it does
-             * not need three device cache flushes per insert. A DIRECTORY has no
-             * such boundary and must still journal. Missing this here is why the
-             * convert fix alone left 1996 journal entries per 2000 splitting
-             * writes -- the splits land in tree_append, not tree_convert. */
-            if (S_ISREG(inode->i_mode)) {
-                cetrafs_blk_tail_stamp(lbh, CETRAFS_LEAF_TAIL_MAGIC);
-                ret = cetrafs_tree_hold_back(inode, lbh, prev_crc, true);
-            } else {
-                ret = cetrafs_journal_write_block(sb, cetrafs_journal_owner_of(inode), lbh, prev_crc);
-            }
+            /* A merge only lengthens the previous extent; a regular
+             * file's leaf, merged or split, is republished at the next
+             * durability boundary (close, fsync, writeback) -- 256
+             * merges/MiB make this the growing-file hot path, and a
+             * journal entry per insert was 1996 of them per 2000
+             * splitting writes. A directory's is journaled now
+             * (cetrafs_tree_hold_back()). */
+            ret = cetrafs_tree_hold_back(inode, lbh, prev_crc, true);
             brelse(lbh);
             return ret;
         }
@@ -6120,12 +6098,8 @@ static int cetrafs_tree_append_inner(struct inode *inode,
         if (ret != -ENOSPC)
             return ret;
 
-        /* The one leaf is full. A DIRECTORY stays at depth 1 (it never
-         * fragments this far in practice); only regular files spill to
-         * depth 2. */
-        if (!S_ISREG(inode->i_mode))
-            return -ENOSPC;
-
+        /* The one leaf is full: spill to depth 2. A directory does too
+         * (M-41): one leaf held ~3,800 entries in the worst case. */
         {
             u32 bg;
             u64 new_leaf, new_idx;
@@ -6243,57 +6217,39 @@ static int cetrafs_tree_append_inner(struct inode *inode,
                 if (ient && (!cetrafs_idx_may_hold(&iarr[ient - 1], iblock) ||
                              !cetrafs_idx_may_hold(&iarr[ient - 1], iblock + count - 1) ||
                              !cetrafs_idx_end(iblock, count))) {
+                    /*
+                     * A regular file's leaf and interior are both held
+                     * back, and a boundary batch orders nothing between
+                     * them: the leaf could reach the device with this
+                     * extent while the interior still held the old
+                     * range, and a node dying in between left an extent
+                     * every lookup skips -- the block reads as a hole,
+                     * is written again under a second extent, and the
+                     * first resurfaces if the range ever widens.
+                     * Two-node hypervisor storm, a node's device pulled
+                     * mid-write: 251 such extents in one image.
+                     *
+                     * So the leaf appends go to never carries a range
+                     * at all (cetrafs_tree_append() creates it UNKNOWN),
+                     * and one that still does -- a volume written
+                     * before this, or a rebuild -- becomes UNKNOWN here,
+                     * held back with the leaf: one boundary batch
+                     * writes both, entries first, so neither can reach
+                     * the device without the other being redoable
+                     * (leafdefer.c). A directory's interior is journaled
+                     * here, before its leaf.
+                     */
                     const u32 iprev = cetrafs_bh_begin_update_crc(ibh);
+                    int iw;
 
-                    if (S_ISREG(inode->i_mode)) {
-                        /*
-                         * A regular file's leaf and interior are both
-                         * left dirty for writeback, which orders
-                         * nothing: the leaf can reach the device with
-                         * this extent while the interior still holds
-                         * the old range, and a node dying in between
-                         * leaves an extent every lookup skips -- the
-                         * block reads as a hole, is written again under
-                         * a second extent, and the first resurfaces if
-                         * the range ever widens. Two-node hypervisor
-                         * storm, a node's device pulled mid-write: 251
-                         * such extents in one image.
-                         *
-                         * So the leaf appends go to never carries a
-                         * range at all (cetrafs_tree_append() creates
-                         * it UNKNOWN), and one that still does -- a
-                         * volume written before this, or a rebuild --
-                         * becomes UNKNOWN here, on the device BEFORE
-                         * the leaf can be: once per leaf, not per
-                         * block.
-                         */
-                        int iw;
-
-                        cetrafs_ei_set_range(&iarr[ient - 1], cetrafs_ei_lo(&iarr[ient - 1]), 0);
-                        cetrafs_blk_tail_stamp(ibh, CETRAFS_INDEX_TAIL_MAGIC);
-                        /* Held back with the leaf: one boundary batch
-                         * writes both, entries first, so neither can
-                         * reach the device without the other being
-                         * redoable (leafdefer.c). */
-                        iw = cetrafs_tree_hold_back(inode, ibh, iprev, false);
-                        if (iw) {
-                            cetrafs_bh_abort_update(lbh);
-                            brelse(lbh);
-                            brelse(ibh);
-                            return iw;
-                        }
-                    } else {
-                        int iw;
-
-                        cetrafs_idx_widen(&iarr[ient - 1], iblock, cetrafs_idx_end(iblock, count));
-                        cetrafs_blk_tail_stamp(ibh, CETRAFS_INDEX_TAIL_MAGIC);
-                        iw = cetrafs_journal_write_block(sb, cetrafs_journal_owner_of(inode), ibh, iprev);
-                        if (iw) {
-                            cetrafs_bh_abort_update(lbh);
-                            brelse(lbh);
-                            brelse(ibh);
-                            return iw;
-                        }
+                    cetrafs_ei_set_range(&iarr[ient - 1], cetrafs_ei_lo(&iarr[ient - 1]), 0);
+                    cetrafs_blk_tail_stamp(ibh, CETRAFS_INDEX_TAIL_MAGIC);
+                    iw = cetrafs_tree_hold_back(inode, ibh, iprev, false);
+                    if (iw) {
+                        cetrafs_bh_abort_update(lbh);
+                        brelse(lbh);
+                        brelse(ibh);
+                        return iw;
                     }
                 }
                 (void) rent; /* root entries carry no range -- see below */
@@ -6301,24 +6257,8 @@ static int cetrafs_tree_append_inner(struct inode *inode,
             *merged = (cetrafs_le16(lhdr->eh_entries) == before);
             *leaf_count = cetrafs_le16(lhdr->eh_entries);
             cetrafs_blk_tail_stamp(lbh, CETRAFS_LEAF_TAIL_MAGIC);
-            if (*merged) {
-                ret = cetrafs_tree_hold_back(inode, lbh, prev_crc, true);
-                brelse(lbh);
-                brelse(ibh);
-                return ret;
-            }
-            /* Same trade as the convert path: a regular file's leaf is republished
-             * at the next durability boundary (close, fsync, writeback), so it does
-             * not need three device cache flushes per insert. A DIRECTORY has no
-             * such boundary and must still journal. Missing this here is why the
-             * convert fix alone left 1996 journal entries per 2000 splitting
-             * writes -- the splits land in tree_append, not tree_convert. */
-            if (S_ISREG(inode->i_mode)) {
-                cetrafs_blk_tail_stamp(lbh, CETRAFS_LEAF_TAIL_MAGIC);
-                ret = cetrafs_tree_hold_back(inode, lbh, prev_crc, true);
-            } else {
-                ret = cetrafs_journal_write_block(sb, cetrafs_journal_owner_of(inode), lbh, prev_crc);
-            }
+            /* As at depth 1: held back, or a directory's journaled now. */
+            ret = cetrafs_tree_hold_back(inode, lbh, prev_crc, true);
             brelse(lbh);
             brelse(ibh);
             return ret;
@@ -6381,24 +6321,12 @@ static int cetrafs_tree_append_inner(struct inode *inode,
                  * growing, so it gets its exact range -- computed from
                  * this node's copy, which is everything the device's can
                  * hold, so the range can only over-advertise. */
-                if (S_ISREG(inode->i_mode) && ient) {
+                if (ient)
                     cetrafs_ei_set_range(&iarr[ient - 1], full_lo, full_hi);
-                }
                 cetrafs_idx_set(&iarr[ient], 0, 0 /* the appended-to leaf: unknown */, new_leaf);
                 ihdr->eh_entries = cetrafs_cpu_to_le16(cetrafs_le16(ihdr->eh_entries) + 1);
                 cetrafs_blk_tail_stamp(ibh, CETRAFS_INDEX_TAIL_MAGIC);
-                /* Same trade as the convert path: a regular file's leaf is republished
-                 * at the next durability boundary (close, fsync, writeback), so it does
-                 * not need three device cache flushes per insert. A DIRECTORY has no
-                 * such boundary and must still journal. Missing this here is why the
-                 * convert fix alone left 1996 journal entries per 2000 splitting
-                 * writes -- the splits land in tree_append, not tree_convert. */
-                if (S_ISREG(inode->i_mode)) {
-                    cetrafs_blk_tail_stamp(ibh, CETRAFS_INDEX_TAIL_MAGIC);
-                    ret = cetrafs_tree_hold_back(inode, ibh, prev_crc, false);
-                } else {
-                    ret = cetrafs_journal_write_block(sb, cetrafs_journal_owner_of(inode), ibh, prev_crc);
-                }
+                ret = cetrafs_tree_hold_back(inode, ibh, prev_crc, false);
                 brelse(ibh);
                 if (ret) {
                     cetrafs_free_data_block(sb, new_leaf);
@@ -7224,6 +7152,21 @@ relookup:
         }
     }
 
+    /*
+     * A directory's failed append keeps its block (below), so one at its
+     * tree's limit asked the append only after taking a block, and kept
+     * one per failed create (audit p3-extent-ceiling R-6). Asked first,
+     * the create fails ENOSPC with nothing taken.
+     */
+    if (S_ISDIR(inode->i_mode)) {
+        ret = cetrafs_tree_append_room(inode, &raw, 1);
+        if (ret == -ENOSPC)
+            pr_warn_ratelimited("dir ino=%llu cannot grow: its extent tree is full (%u extents at most)\n",
+                                (unsigned long long) inode->i_ino, cetrafs_tree_max_extents());
+        if (ret)
+            return ret;
+    }
+
     {
         ktime_t t0 = ktime_get();
         s64 us;
@@ -7389,9 +7332,9 @@ relookup:
          * tests/kernel/dir_grow_fail_keeps_block.sh.
          */
         if (S_ISDIR(inode->i_mode))
-            pr_err("dir ino=%llu: growth failed after its tree may have named block %llu (%d) -- keeping it "
-                   "allocated\n",
-                   (unsigned long long) inode->i_ino, (unsigned long long) lba, ret);
+            pr_err_ratelimited("dir ino=%llu: growth failed after its tree may have named block %llu (%d) -- "
+                               "keeping it allocated\n",
+                               (unsigned long long) inode->i_ino, (unsigned long long) lba, ret);
         else
             cetrafs_free_data_block(sb, lba);
         return ret;

@@ -2645,12 +2645,14 @@ u64 cetrafs_tree_read_count(void)
 }
 
 /*
- * 'reader': the caller only READS through this block -- it maps a block
- * to serve a read and will write nothing on the strength of it -- so
- * the cache trust question is cetrafs_lock_read_cache_trusted()'s, not
- * the write lock's. See that function for why the two differ.
+ * 'trusted': the caller's answer to "can nothing but this node have
+ * changed this block since it was cached?" -- for a file, its lock
+ * (cetrafs_read_tree_bh_for()); for a directory, its dirent_seq gate
+ * (cetrafs_dir_needs_fresh()). A trusted block is served from the cache,
+ * structure-checked; any other comes off the device, tail-checked.
  */
-struct buffer_head *cetrafs_read_tree_bh_for(struct inode *inode, u64 lba, u32 tail_magic, const char *what, bool reader)
+struct buffer_head *cetrafs_read_tree_bh_trust(struct inode *inode, u64 lba, u32 tail_magic, const char *what,
+                                               bool trusted)
 {
     int chk;
 
@@ -2676,7 +2678,7 @@ struct buffer_head *cetrafs_read_tree_bh_for(struct inode *inode, u64 lba, u32 t
      * this tree, so the cached copy is authoritative AND cannot be
      * torn -- this is the growing-file hot path and must stay off the
      * wire. */
-    if (reader ? cetrafs_lock_read_cache_trusted(inode) : cetrafs_lock_held_for_write_locally(inode)) {
+    if (trusted) {
         /* Cached, but still CHECKED for sense. The cached branch skips
          * the tail verification because nobody else can be mid-write --
          * which is an argument about CONCURRENCY and says nothing about
@@ -2706,12 +2708,25 @@ struct buffer_head *cetrafs_read_tree_bh_for(struct inode *inode, u64 lba, u32 t
         return bh;
     }
 
-    /* Without it, a peer may be mid-write. A DIRECTORY is always in
-     * this case: it never holds a file lock, so every peer walking a
-     * spilled directory reads its leaf unsynchronised. Verify the tail
-     * and retry a mismatch, which is a torn write far more often than
-     * it is corruption. */
+    /* Untrusted: a peer may be mid-write. Verify the tail and retry a
+     * mismatch, which is a torn write far more often than it is
+     * corruption. */
     return cetrafs_blk_tail_bread(inode->i_sb, inode->i_ino, cetrafs_inode_get_generation(inode), lba, tail_magic, what);
+}
+
+/*
+ * 'reader': the caller only READS through this block -- it maps a block
+ * to serve a read and will write nothing on the strength of it -- so
+ * the cache trust question is cetrafs_lock_read_cache_trusted()'s, not
+ * the write lock's. See that function for why the two differ. A
+ * DIRECTORY never holds a file lock, so here it always reads fresh; its
+ * own readers ask its dirent_seq gate instead (dir.c).
+ */
+struct buffer_head *cetrafs_read_tree_bh_for(struct inode *inode, u64 lba, u32 tail_magic, const char *what, bool reader)
+{
+    return cetrafs_read_tree_bh_trust(inode, lba, tail_magic, what,
+                                      reader ? cetrafs_lock_read_cache_trusted(inode)
+                                             : cetrafs_lock_held_for_write_locally(inode));
 }
 
 struct buffer_head *cetrafs_read_tree_bh(struct inode *inode, u64 lba, u32 tail_magic, const char *what)
@@ -2722,67 +2737,6 @@ struct buffer_head *cetrafs_read_tree_bh(struct inode *inode, u64 lba, u32 tail_
 struct buffer_head *cetrafs_read_leaf_bh(struct inode *inode, u64 lba)
 {
     return cetrafs_read_tree_bh(inode, lba, CETRAFS_LEAF_TAIL_MAGIC, "extent leaf");
-}
-
-/*
- * A DIRECTORY's extent-tree leaf, read with an explicit freshness the
- * caller derives from the dirent_seq gate (cetrafs_dir_needs_fresh()) --
- * NOT from cetrafs_lock_held_for_write_locally() the way
- * cetrafs_read_tree_bh() does.
- *
- * That predicate is wrong for a directory under nofilelock: it reads
- * "we are the sole node with this file OPEN", but a peer mutates a
- * directory through namespace ops (create/mkdir/unlink/rmdir under its
- * namespace lock), never by opening it, so the predicate stays true and
- * the leaf is served from this node's stale cache. A spilled directory
- * then misses a peer's growth block: the nodes diverge on the tree's
- * shape, a locked scan walks the wrong blocks, and two mkdir()s of one
- * name both succeed -- 328/401 duplicate directories in a 3-node run,
- * cascading into INVISIBLE / orphaned / unreachable entries.
- *
- * The dirent_seq gate is the correct signal: it is bumped by every
- * cross-node mutation, so "changed since I last read" forces the leaf
- * fresh, while an unchanged directory (the single-writer steady state)
- * keeps the cached leaf and stays O(1). When fresh, verify the tail and
- * retry a torn concurrent write exactly as cetrafs_read_tree_bh() does.
- */
-struct buffer_head *cetrafs_read_dir_leaf_bh(struct inode *inode, u64 lba, bool fresh)
-{
-    /* dir.c reaches a leaf through here rather than through
-     * cetrafs_read_tree_bh(), so the address check has to be repeated:
-     * a subsystem with its own reader is exactly how a check added at
-     * "the" choke point misses the blocks it was written for. */
-    int chk = cetrafs_lba_run_check(inode->i_sb, lba, 1);
-
-    if (chk == -EAGAIN)
-        return NULL; /* past a layout this node cannot catch up with: refused, not damage */
-    if (chk) {
-        pr_err_ratelimited("dir ino=%llu: extent leaf %llu is not a data address -- refusing it (fsck)\n",
-                           (unsigned long long) inode->i_ino, (unsigned long long) lba);
-        cetrafs_sb_corrupt_inode(inode);
-        return NULL;
-    }
-
-    if (!fresh) {
-        /* Same as the file path above: unchanged-since-we-last-read is
-         * not the same as sane, and a block not in the cache yet is
-         * coming off the device -- verify it there. */
-        struct buffer_head *bh = sb_getblk(inode->i_sb, lba);
-
-        if (bh && !buffer_uptodate(bh)) {
-            brelse(bh);
-            return cetrafs_blk_tail_bread(inode->i_sb, inode->i_ino, cetrafs_inode_get_generation(inode), lba, CETRAFS_LEAF_TAIL_MAGIC, "extent leaf");
-        }
-        if (bh && !cetrafs_blk_struct_ok_magic(bh, CETRAFS_LEAF_TAIL_MAGIC)) {
-            pr_err_ratelimited("dir ino=%llu: extent leaf %llu has an impossible entry count -- refusing it\n",
-                               (unsigned long long) inode->i_ino, (unsigned long long) lba);
-            cetrafs_sb_corrupt_inode(inode);
-            brelse(bh);
-            return NULL;
-        }
-        return bh;
-    }
-    return cetrafs_blk_tail_bread(inode->i_sb, inode->i_ino, cetrafs_inode_get_generation(inode), lba, CETRAFS_LEAF_TAIL_MAGIC, "extent leaf");
 }
 
 /* v2: an interior index block, same freshness rules, its own tail magic

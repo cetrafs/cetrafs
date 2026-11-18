@@ -2839,6 +2839,82 @@ static const struct cetrafs_utw_ops fsck_walk_ops = {
     .leaf = fsck_walk_leaf,
 };
 
+/* Every extent of a record's tree, at any depth, sorted by logical block:
+ * what a directory's walk reads its blocks in. A tree block that cannot be
+ * walked is left out and clears 'whole' -- the content pass reports it. */
+struct fsck_flat {
+    int fd;
+    cetrafs_extent_t *arr;
+    uint32_t n, cap;
+    int whole;
+};
+
+static void fsck_flat_read(struct cetrafs_utw *w, uint64_t lba, uint8_t *blk)
+{
+    pread_all(((struct fsck_flat *) w->ctx)->fd, blk, CETRAFS_BLOCK_SIZE, (off_t) lba * CETRAFS_BLOCK_SIZE);
+}
+
+static int fsck_flat_bad(struct cetrafs_utw *w, uint64_t lba, int level, enum cetrafs_utw_bad why, const uint8_t *blk,
+                         uint64_t rlo, uint64_t rhi)
+{
+    (void) lba, (void) level, (void) why, (void) blk, (void) rlo, (void) rhi;
+    ((struct fsck_flat *) w->ctx)->whole = 0;
+    return 1;
+}
+
+static void fsck_flat_leaf(struct cetrafs_utw *w, const cetrafs_extent_t *arr, uint32_t n, uint64_t lba, uint64_t rlo,
+                           uint64_t rhi)
+{
+    struct fsck_flat *f = w->ctx;
+
+    (void) lba, (void) rlo, (void) rhi;
+    if (f->n + n > f->cap) {
+        uint32_t ncap = f->cap ? f->cap * 2 : 64;
+
+        while (ncap < f->n + n)
+            ncap *= 2;
+        cetrafs_extent_t *na = realloc(f->arr, (size_t) ncap * sizeof(*na));
+        if (!na) {
+            fprintf(stderr, "fsck: out of memory reading an extent tree\n");
+            exit(FSCK_EXIT_NOEXAM);
+        }
+        f->arr = na;
+        f->cap = ncap;
+    }
+    memcpy(f->arr + f->n, arr, (size_t) n * sizeof(*arr));
+    f->n += n;
+}
+
+static const struct cetrafs_utw_ops fsck_flat_ops = {
+    .read = fsck_flat_read,
+    .tail = fsck_check_tail,
+    .bad = fsck_flat_bad,
+    .leaf = fsck_flat_leaf,
+};
+
+static int fsck_ext_lblk_cmp(const void *a, const void *b)
+{
+    uint64_t x = cetrafs_ee_lblk(a), y = cetrafs_ee_lblk(b);
+
+    return x < y ? -1 : x > y;
+}
+
+/* free() the result. The caller has checked the root header's magic and
+ * depth (<= CETRAFS_EXT_MAX_DEPTH). */
+static cetrafs_extent_t *fsck_tree_extents(int fd, uint64_t total_blocks, const cetrafs_inode_t *in, uint32_t *n,
+                                           int *whole)
+{
+    struct fsck_flat f = {fd, NULL, 0, 0, 1};
+    struct cetrafs_utw w = {&fsck_flat_ops, total_blocks, &f};
+
+    (void) cetrafs_utw_walk(&w, in);
+    if (f.n)
+        qsort(f.arr, f.n, sizeof(*f.arr), fsck_ext_lblk_cmp);
+    *n = f.n;
+    *whole = f.whole;
+    return f.arr;
+}
+
 int main(int argc, char **argv)
 {
     const char *dev = NULL;
@@ -4430,7 +4506,8 @@ int main(int argc, char **argv)
                 (uint32_t) cetrafs_le64(ri.fd_checksum), cetrafs_inode_crc_fd_us(&ri));
         return 1;
     }
-    if (cetrafs_le16(ri.eh.eh_magic) != CETRAFS_EXT_MAGIC || cetrafs_le16(ri.eh.eh_depth) > 1 || cetrafs_le16(ri.eh.eh_entries) < 1) {
+    if (cetrafs_le16(ri.eh.eh_magic) != CETRAFS_EXT_MAGIC || cetrafs_le16(ri.eh.eh_depth) > CETRAFS_EXT_MAX_DEPTH ||
+        cetrafs_le16(ri.eh.eh_entries) < 1) {
         fprintf(stderr, "ERR: root extents header invalid\n");
         return 1;
     }
@@ -4452,6 +4529,20 @@ int main(int argc, char **argv)
     uint64_t root_lba;
     if (cetrafs_le16(ri.eh.eh_depth) == 0) {
         root_lba = cetrafs_ee_pblk(&ri.et.leaf[0]);
+    } else if (cetrafs_le16(ri.eh.eh_depth) == 2) {
+        /* A root grown past one leaf (M-41): its logical block 0, found
+         * through the whole tree. */
+        uint32_t rn;
+        int rwhole;
+        cetrafs_extent_t *re = fsck_tree_extents(fd, total_blocks, &ri, &rn, &rwhole);
+
+        if (!rwhole || !rn || cetrafs_ee_lblk(&re[0]) != 0) {
+            fprintf(stderr, "ERR: root extent tree (depth 2) does not lead to its first block\n");
+            free(re);
+            return 1;
+        }
+        root_lba = cetrafs_ee_pblk(&re[0]);
+        free(re);
     } else {
         uint8_t rootleaf[CETRAFS_BLOCK_SIZE];
         uint64_t leaf_lba = cetrafs_ei_child(&ri.et.idx[0]);
@@ -5494,11 +5585,10 @@ int main(int argc, char **argv)
              * also named elsewhere has its nlink "repaired" DOWN -- the
              * destructive direction, a later unlink of the other name
              * freeing an inode this directory still names. The kernel
-             * refuses such a directory (directories never grow past
-             * depth 1), so it is a fault, and one this run cannot repair
-             * around.
+             * refuses such a directory, so it is a fault, and one this
+             * run cannot repair around.
              */
-            if (cetrafs_le16(in.eh.eh_magic) != CETRAFS_EXT_MAGIC || cetrafs_le16(in.eh.eh_depth) > 1) {
+            if (cetrafs_le16(in.eh.eh_magic) != CETRAFS_EXT_MAGIC || cetrafs_le16(in.eh.eh_depth) > CETRAFS_EXT_MAX_DEPTH) {
                 fprintf(stderr,
                         "ERR: directory inode %" PRIu64 " has an extent tree a directory cannot have (magic=0x%x "
                         "depth=%u) -- its entries cannot be read\n",
@@ -5513,39 +5603,18 @@ int main(int argc, char **argv)
             walked[ino] = 1;
             dwhole[ino] = 1; /* until a block is skipped below */
 
-            cetrafs_extent_t ext[4 + CETRAFS_EXT_BLOCK_MAX_LEAVES];
+            /* By logical block, so the block holding '.' and '..' is
+             * met as logical 0 whatever order the tree's arrays hold. */
             uint32_t n;
-            uint8_t leafblk[CETRAFS_BLOCK_SIZE];
+            int twhole;
+            cetrafs_extent_t *ext = fsck_tree_extents(fd, total_blocks, &in, &n, &twhole);
 
-            if (cetrafs_le16(in.eh.eh_depth) == 0) {
-                n = cetrafs_le16(in.eh.eh_entries) > 4 ? 4 : cetrafs_le16(in.eh.eh_entries);
-                memcpy(ext, in.et.leaf, n * sizeof(ext[0]));
-            } else {
-                uint64_t lf = cetrafs_ei_child(&in.et.idx[0]);
-
-                /* The index entry is read off the device, so the leaf it
-                 * names may be anywhere. Past total_blocks the multiply
-                 * below is signed-overflow UB before it is even a bad
-                 * read -- the reason fsck_lba_in_range() exists. */
-                if (!fsck_lba_in_range(lf, total_blocks)) {
-                    fprintf(stderr,
-                            "ERR: directory inode %" PRIu64 " names extent leaf block %" PRIu64 ", which is not on the device\n",
-                            ino, lf);
-                    problems++;
-                    dwhole[ino] = 0;
-                    continue;
-                }
-                pread_all(fd, leafblk, sizeof(leafblk), (off_t) lf * CETRAFS_BLOCK_SIZE);
-                cetrafs_extent_hdr_t *lh = (cetrafs_extent_hdr_t *) leafblk;
-                n = cetrafs_le16(lh->eh_entries) > CETRAFS_EXT_BLOCK_MAX_LEAVES ? CETRAFS_EXT_BLOCK_MAX_LEAVES : cetrafs_le16(lh->eh_entries);
-                memcpy(ext, leafblk + sizeof(*lh), n * sizeof(ext[0]));
-            }
-
-            uint64_t logical = 0;
-
+            if (!twhole)
+                dwhole[ino] = 0; /* a tree block the content pass reported: names unseen */
             for (uint32_t e = 0; e < n; ++e) {
                 uint64_t phys = cetrafs_ee_pblk(&ext[e]);
                 uint64_t len = cetrafs_ee_len(&ext[e]);
+                uint64_t logical = cetrafs_ee_lblk(&ext[e]);
 
                 /* Judge the whole run before reading a single block of
                  * it -- see fsck_run_bg(). The content pass reports the
@@ -5558,7 +5627,6 @@ int main(int argc, char **argv)
                             "ERR: directory inode %" PRIu64 " extent [%" PRIu64 ",+%" PRIu64 ") is outside every data region\n",
                             ino, phys, len);
                     problems++;
-                    logical += len;
                     dwhole[ino] = 0;
                     continue;
                 }
@@ -5736,6 +5804,7 @@ int main(int argc, char **argv)
                     }
                 }
             }
+            free(ext);
         }
 
         /* Before the orphan pass below: it links into lost+found, which

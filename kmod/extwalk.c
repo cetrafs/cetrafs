@@ -60,14 +60,13 @@ MODULE_PARM_DESC(flatten_prefetch_off, "TEST ONLY: a tree walk reads its extent 
  * that one block through cetrafs_read_tree_bh_for(), which retries, refuses
  * and reports exactly as before.
  */
-static void cetrafs_tree_batch_fast(struct inode *inode, const sector_t *lbas, u32 n, u32 magic, bool reader,
+static void cetrafs_tree_batch_fast(struct inode *inode, const sector_t *lbas, u32 n, u32 magic, bool trusted,
                                     struct buffer_head **bhs)
 {
     struct super_block *sb = inode->i_sb;
     sector_t *nl = NULL;
     struct buffer_head **nb = NULL;
     u32 *na = NULL;
-    bool trusted;
     u32 i, j, k = 0;
 
     for (i = 0; i < n; i++) {
@@ -86,7 +85,6 @@ static void cetrafs_tree_batch_fast(struct inode *inode, const sector_t *lbas, u
     if (!nl || !na || !nb)
         goto out; /* not an error: every block goes through the per-block reader */
 
-    trusted = reader ? cetrafs_lock_read_cache_trusted(inode) : cetrafs_lock_held_for_write_locally(inode);
     for (i = 0; i < n; i++) {
         struct buffer_head *bh = trusted ? sb_getblk(sb, lbas[i]) : NULL;
 
@@ -122,17 +120,17 @@ out:
  * releases every non-NULL entry.
  */
 static void cetrafs_tree_read_batch(struct inode *inode, const sector_t *lbas, u32 n, u32 magic, const char *what,
-                                    bool reader, struct buffer_head **bhs)
+                                    bool trusted, struct buffer_head **bhs)
 {
     u32 i;
 
     for (i = 0; i < n; i++)
         bhs[i] = NULL;
     if (n >= 2 && !READ_ONCE(cetrafs_flatten_prefetch_off))
-        cetrafs_tree_batch_fast(inode, lbas, n, magic, reader, bhs);
+        cetrafs_tree_batch_fast(inode, lbas, n, magic, trusted, bhs);
     for (i = 0; i < n; i++) {
         if (!bhs[i])
-            bhs[i] = cetrafs_read_tree_bh_for(inode, lbas[i], magic, what, reader);
+            bhs[i] = cetrafs_read_tree_bh_trust(inode, lbas[i], magic, what, trusted);
     }
 }
 
@@ -177,8 +175,14 @@ static void cetrafs_tw_read(struct cetrafs_tw *w, const sector_t *lbas, u32 n, i
 
     switch (w->read) {
     case CETRAFS_TW_READER:
+        cetrafs_tree_read_batch(w->inode, lbas, n, magic, what, cetrafs_lock_read_cache_trusted(w->inode), bhs);
+        return;
     case CETRAFS_TW_WRITER:
-        cetrafs_tree_read_batch(w->inode, lbas, n, magic, what, w->read == CETRAFS_TW_READER, bhs);
+        cetrafs_tree_read_batch(w->inode, lbas, n, magic, what, cetrafs_lock_held_for_write_locally(w->inode), bhs);
+        return;
+    case CETRAFS_TW_CACHED:
+    case CETRAFS_TW_FRESH:
+        cetrafs_tree_read_batch(w->inode, lbas, n, magic, what, w->read == CETRAFS_TW_CACHED, bhs);
         return;
     case CETRAFS_TW_SCRUB:
     case CETRAFS_TW_SCRUB_FRESH:
