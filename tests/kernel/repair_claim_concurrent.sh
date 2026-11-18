@@ -23,7 +23,9 @@
 # scanned after the first claim landed, took the next row, and the two
 # met as B's case -- both yielding, by design, with A reporting it as a
 # failure. A now checks that its claims shared a row, apart from what
-# they then did.
+# they then did -- and the instant is held AFTER each has chosen its
+# row and before it writes, so a process the gate's load woke late
+# still chose before the other's claim landed.
 #   A. same row: both scan before either writes.
 #   B. two rows: the second scans after the first's claim landed.
 #   C. the superblock changes between the read and the claim.

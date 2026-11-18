@@ -1119,7 +1119,6 @@ static inline int cetrafs_repair_claim(int fd, const cetrafs_superblock_t *sb, c
      * check and the claim, so a suite can start two repairers that both
      * passed it (tests/kernel/repair_claim_concurrent.sh). */
     cetrafs_test_hold("CETRAFS_TEST_REPAIR_CLAIM_DELAY_SECS");
-    cetrafs_test_hold_until("CETRAFS_TEST_REPAIR_CLAIM_AT_MS");
     posix_fadvise(fd, 0, 0, POSIX_FADV_DONTNEED); /* the rows as the device has them, not our cache */
     caw = cetrafs_caw_probe(fd);
 
@@ -1217,6 +1216,11 @@ static inline int cetrafs_repair_claim(int fd, const cetrafs_superblock_t *sb, c
              * claim, so a suite can land another claim in between
              * (tests/kernel/repair_claim_caw.sh). */
             cetrafs_test_hold("CETRAFS_TEST_REPAIR_CLAIM_GAP_SECS");
+            /* Test hook only: every claimant writes at one instant, each
+             * having chosen its row before it -- the same row, whatever
+             * the load did to when each process started
+             * (tests/kernel/repair_claim_concurrent.sh, round A). */
+            cetrafs_test_hold_until("CETRAFS_TEST_REPAIR_CLAIM_AT_MS");
             if (caw) {
                 /* Lands only on the row as read: a claim that got there
                  * first makes this one miscompare, and that is another
