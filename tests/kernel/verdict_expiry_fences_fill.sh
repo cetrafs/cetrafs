@@ -33,6 +33,12 @@ ct_mkfs_small "$DEV" >/dev/null
 mount -t cetrafs -o nofilelock "$DEV" "$MNT"
 require_cetrafs_mount "$MNT"
 ct_param_set auto_defrag 0
+# The writes take the exclusive path, which asks the verdict once per
+# write. A shared-lock overwrite (aec5bcc) asks it in its probe and again
+# per DIO mapping: the stalled write's second ask comes after the
+# invalidation and refills correctly, leaving the next write nothing to
+# fill -- the fence holds there too, but this count cannot show it.
+ct_param_set dio_shared_overwrite 0
 INFO="$(ct_procdir "$DEV")/info"
 grep -q '^verdict_fills:' "$INFO" || { skip "no verdict_fills counter"; ct_exit; }
 dd if=/dev/urandom of="$MNT/vm.img" bs=4096 count=16 conv=fsync status=none
