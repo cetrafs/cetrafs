@@ -59,6 +59,45 @@ static void diex(const char *m)
  */
 static int live_main_fd = -1, live_direct_fd = -1;
 
+/*
+ * A live walk first syncs every mount of the volume on THIS host
+ * (syncfs). A mounted node holds its latest metadata edits back from the
+ * device -- held blocks, a tree batch whose entries are durable and whose
+ * targets are not yet -- until its next boundary: consistent once its
+ * journal is replayed, not as a plain device image, and a walk of the
+ * device reads it as damage in every one of its passes when they come
+ * within one heartbeat (tests/kernel/fsck_live.sh). The BLKFLSBUF a walk
+ * used to issue did this as a side effect, along with dropping the cache
+ * and waiting out a mount in flight, which a live walk must not
+ * (c92dae6). A peer's held state is the peer's: the walks' repetition
+ * filter answers for it, as before. A mount in flight has no path yet,
+ * so nothing here waits for one.
+ */
+static void fsck_live_sync_local(const char *dev)
+{
+    struct stat devst, st;
+    char src[4096], mnt[4096];
+    FILE *f;
+
+    if (stat(dev, &devst) != 0 || !S_ISBLK(devst.st_mode))
+        return;
+    f = fopen("/proc/self/mounts", "r");
+    if (!f)
+        return;
+    while (fscanf(f, "%4095s %4095s %*[^\n]", src, mnt) == 2) {
+        int mfd;
+
+        if (stat(src, &st) != 0 || !S_ISBLK(st.st_mode) || st.st_rdev != devst.st_rdev)
+            continue;
+        mfd = open(mnt, O_RDONLY | O_DIRECTORY | O_CLOEXEC);
+        if (mfd < 0)
+            continue; /* an escaped or vanished path: the walks' filter answers for it */
+        (void) syncfs(mfd);
+        close(mfd);
+    }
+    fclose(f);
+}
+
 static void pread_direct(void *buf, size_t len, off_t off)
 {
     static uint8_t *bounce;
@@ -2735,12 +2774,15 @@ int main(int argc, char **argv)
      * Not on a live walk: it reads past the cache already, and BLKFLSBUF
      * first syncs the filesystem a mount on this host holds -- waiting
      * out a mount in flight, and emptying a mounted node's cache, for a
-     * walk that reads none of it. */
+     * walk that reads none of it. What a live walk does need from that
+     * sync is kept (fsck_live_sync_local()). */
     if (!live_mode) {
         struct stat dst;
 
         if (fstat(fd, &dst) == 0 && S_ISBLK(dst.st_mode))
             (void) ioctl(fd, BLKFLSBUF, 0);
+    } else if (live_pass) {
+        fsck_live_sync_local(dev);
     }
     (void) posix_fadvise(fd, 0, 0, POSIX_FADV_DONTNEED);
 
