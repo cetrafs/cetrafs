@@ -188,6 +188,13 @@ static bool cetrafs_defrag_ignore_yield;
 cetrafs_test_param(defrag_ignore_yield, cetrafs_defrag_ignore_yield, bool, 0644);
 MODULE_PARM_DESC(defrag_ignore_yield, "TEST ONLY: background defrag ignores a peer's request for the file");
 
+/* TEST ONLY: this node's own stop ask (a first local open, a suspend)
+ * quiets the file as a peer's does, as before -- the control of
+ * tests/kernel/defrag_random_holes.sh round R. */
+static bool cetrafs_defrag_local_stop_quiets;
+cetrafs_test_param(defrag_local_stop_quiets, cetrafs_defrag_local_stop_quiets, bool, 0644);
+MODULE_PARM_DESC(defrag_local_stop_quiets, "TEST ONLY: a local stop ask quiets the janitor as a peer's yield does");
+
 /* The most blocks any one step has moved under the locks since the
  * module loaded -- procfs info's defrag_max_step_blocks, which is what
  * shows the cap holding (tests/kernel/defrag_step_bounded.sh). */
@@ -1034,10 +1041,24 @@ int cetrafs_defrag_inode(struct inode *inode, struct cetrafs_defrag_stats *out_s
          * EXCLUSIVE lock and no peer asks. */
         /* ...or this node's own lock suspend did (a migration handoff):
          * same stop, no I/O to see it. */
+        /* A peer's ask quiets the file for a while (-EAGAIN: it is
+         * the peer's now). This node's own ask is a local open or
+         * suspend passing through: the pass is cancelled, and handed
+         * back to be judged again (-ECANCELED). Taken as a peer's, every
+         * first open -- a backup's, a monitor's qemu-img info, filefrag
+         * -- quieted the janitor for the whole quiet window, and a file
+         * read now and then was never healed. */
         if ((cetrafs_le32(raw.lock_mode) == CETRAFS_LOCK_YIELD || cetrafs_lock_defrag_stop_asked(inode)) &&
             !READ_ONCE(cetrafs_defrag_ignore_yield)) {
             atomic64_inc(&cetrafs_defrag_yields);
-            ret = -EAGAIN; /* yielded: try again later */
+            ret = cetrafs_le32(raw.lock_mode) == CETRAFS_LOCK_YIELD || READ_ONCE(cetrafs_defrag_local_stop_quiets)
+                      ? -EAGAIN
+                      : -ECANCELED;
+            /* Its last close judges the file again: the pass handed
+             * back below finds the opener still there (-EBUSY) and is
+             * declined, and a read close queues nothing of its own. */
+            if (ret == -ECANCELED)
+                cetrafs_lock_defrag_rejudge_on_close(inode);
             cetrafs_defrag_inode_unlock(inode);
             goto out_free_tail;
         }
@@ -1657,18 +1678,8 @@ static void cetrafs_defrag_worker(struct work_struct *work)
              * is nothing to hand back yet: its last close re-judges the
              * file. Requeueing now only restarts the move it outran.
              */
-            if (ret == -ECANCELED && !(grew && cetrafs_lock_has_local_writer(inode))) {
-                cetrafs_inode_t rr;
-
-                if (cetrafs_read_raw_inode_overlaid(sb, inode, &rr) == 0 &&
-                    cetrafs_le16(rr.eh.eh_magic) == CETRAFS_EXT_MAGIC) {
-                    u32 ext2 = cetrafs_tree_extent_count_for(inode, &rr, true); /* only queues one */
-
-                    if (ext2)
-                        cetrafs_defrag_consider(inode, ext2,
-                                                CETRAFS_DIV_ROUND_UP(cetrafs_le64(rr.size), CETRAFS_BLOCK_SIZE));
-                }
-            }
+            if (ret == -ECANCELED && !(grew && cetrafs_lock_has_local_writer(inode)))
+                cetrafs_defrag_rejudge(inode);
         } else {
             /* Could not take the file's lock: it is open for write
              * somewhere, or a peer holds it, or the inode was replaced.
@@ -1702,6 +1713,21 @@ unsigned int cetrafs_frag_index_pct(u64 nblocks, u32 extents)
     if (ideal == 0)
         ideal = 1;
     return (unsigned int) div64_u64((u64) extents * 100, ideal);
+}
+
+/* Judge the file again from its record, as a write close does: the
+ * janitor queues it if it still needs it (one request per inode). */
+void cetrafs_defrag_rejudge(struct inode *inode)
+{
+    cetrafs_inode_t rr;
+
+    if (cetrafs_read_raw_inode_overlaid(inode->i_sb, inode, &rr) == 0 &&
+        cetrafs_le16(rr.eh.eh_magic) == CETRAFS_EXT_MAGIC) {
+        u32 ext = cetrafs_tree_extent_count_for(inode, &rr, true); /* only queues one */
+
+        if (ext)
+            cetrafs_defrag_consider(inode, ext, CETRAFS_DIV_ROUND_UP(cetrafs_le64(rr.size), CETRAFS_BLOCK_SIZE));
+    }
 }
 
 void cetrafs_defrag_consider(struct inode *inode, u32 extents, u64 nblocks)

@@ -353,6 +353,12 @@ struct cetrafs_inode_info {
      * one ending and the suspend re-taking lock_mutex. A count, so two
      * suspends do not end each other's request. */
     atomic_t defrag_stop_asks;
+    /* A pass on the file was cancelled by this node's own stop ask (a
+     * first local open, a suspend): the last local close judges the
+     * file again (cetrafs_defrag_rejudge()), since a read close queues
+     * nothing of its own and the pass handed back at the cancel finds
+     * the opener still there. */
+    bool defrag_rejudge;
 
     /* Userspace-driven explicit whole-file lock (flock(2), cetrafs_flock).
      * Option A / fd-scoped: the fd that acquired the lock, NULL when this
@@ -4209,7 +4215,7 @@ static void __cetrafs_lock_release(struct inode *inode, const struct cetrafs_clo
     struct super_block *sb = inode->i_sb;
     bool want_write = a->want_write;
     bool lock_on = cetrafs_sb_file_lock_enabled(sb);
-    bool last_writer;
+    bool last_writer, rejudge;
 
     /* The last writer publishes below, and nothing that tells a peer the
      * file is free -- its explicit lock, its presence bit -- may go
@@ -4233,7 +4239,8 @@ static void __cetrafs_lock_release(struct inode *inode, const struct cetrafs_clo
         ci->explicit_lock_file = NULL;
     }
 
-    atomic_dec(&ci->lock_local_open_count);
+    rejudge = atomic_dec_return(&ci->lock_local_open_count) == 0 && READ_ONCE(ci->defrag_rejudge) &&
+              xchg(&ci->defrag_rejudge, false);
 
     /* Withdraw this node from the file's open-presence set, mirroring
      * lock_open's publish: read-closes always; write-closes too under
@@ -4245,6 +4252,8 @@ static void __cetrafs_lock_release(struct inode *inode, const struct cetrafs_clo
 
     if (!want_write) {
         mutex_unlock(&ci->lock_mutex);
+        if (rejudge)
+            cetrafs_defrag_rejudge(inode);
         return;
     }
 
@@ -4488,6 +4497,9 @@ static void __cetrafs_lock_release(struct inode *inode, const struct cetrafs_clo
     }
 
     mutex_unlock(&ci->lock_mutex);
+    /* Deduplicated with the close's own consider by the queue latch. */
+    if (rejudge)
+        cetrafs_defrag_rejudge(inode);
 }
 
 struct cetrafs_close_work {
@@ -7549,6 +7561,11 @@ void cetrafs_lock_defrag_quiet_for(struct inode *inode, unsigned int secs)
 void cetrafs_lock_defrag_yielded_for(struct inode *inode, unsigned int secs)
 {
     WRITE_ONCE(CETRAFS_I(inode)->defrag_yielded_until, jiffies + secs * HZ);
+}
+
+void cetrafs_lock_defrag_rejudge_on_close(struct inode *inode)
+{
+    WRITE_ONCE(CETRAFS_I(inode)->defrag_rejudge, true);
 }
 
 bool cetrafs_lock_defrag_stop_asked(struct inode *inode)

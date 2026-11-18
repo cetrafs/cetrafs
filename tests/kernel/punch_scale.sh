@@ -25,6 +25,9 @@ DEV="$(ct_dev 600 punchscale)"
 MNT="$(ct_mnt punchscale)"
 ct_mkfs_small "$DEV" >/dev/null
 ct_param_set alloc_run_blocks 0
+# One extent per 4 KiB write: a first write into a hole inside i_size
+# allocates a 64 KiB unit (b2ba9f5), which left ~2,500 extents of 40k.
+ct_param_set sparse_unit_off 1
 ct_param_set auto_defrag 0
 ct_mount "$DEV" "$MNT"
 require_cetrafs_mount "$MNT"

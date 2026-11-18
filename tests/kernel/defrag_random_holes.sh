@@ -13,7 +13,9 @@
 #
 # Asserted: after the random fill and a bounded wait, with auto_defrag on,
 # the extent count falls by an order of magnitude and the data reads back
-# byte-for-byte. The control (defrag_extents_unsorted=1, the old read)
+# byte-for-byte -- while the poll opens the file every second, each open
+# stopping the pass (a local stop is a cancel, not a peer's yield; control
+# defrag_local_stop_quiets=1). The control (defrag_extents_unsorted=1, the old read)
 # must leave the file near 16k extents for the same wait. fsck clean.
 set -euo pipefail
 trap 'echo "ABORT at line $LINENO: $BASH_COMMAND (rc=$?)" >&2' ERR
@@ -97,6 +99,26 @@ done
 [ "$(verify "$MNT/rnd")" = "BAD=0" ] &&
     pass "every block reads back its own bytes after the healing" ||
     fail "data changed under the defragmenter: $(verify "$MNT/rnd")"
+
+# ------------------------------------- the control: a local open quiets it
+# The poll above opens the file every second (filefrag), and a first
+# local open stops this node's pass on it (6686f72). Taken as a peer's
+# ask, that quieted the janitor for its whole window, and a file read
+# now and then was never healed; it is now a cancel, handed back.
+log "control: a local open's stop quiets the janitor as a peer's ask did"
+ct_param_set defrag_local_stop_quiets 1
+fill "$MNT/rnd-quiet"
+EQ0="$(extents "$MNT/rnd-quiet")"
+[ "$EQ0" -ge $((BLOCKS / 2)) ] || { fail "control setup: the fill left only $EQ0 extents"; ct_exit; }
+EQ="$EQ0"
+for _ in $(seq 1 30); do
+    sleep 1
+    EQ="$(extents "$MNT/rnd-quiet")"
+done
+[ "$EQ" -ge $((BLOCKS / 2)) ] &&
+    pass "control: quieted by the poll's opens, the fill stays at $EQ extents after 30 s" ||
+    fail "control: quieted by local opens the fill still went to $EQ extents -- the suite does not reach the stop"
+ct_param_set defrag_local_stop_quiets 0
 
 # ----------------------------------------------------- the control: old trigger
 log "control: the old unsorted read leaves the fill fragmented"

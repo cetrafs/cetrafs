@@ -1009,6 +1009,7 @@ int cetrafs_defrag_inode(struct inode *inode, struct cetrafs_defrag_stats *out_s
 int cetrafs_defrag_init(struct super_block *sb, struct cetrafs_defrag **out_d);
 void cetrafs_defrag_stop(struct cetrafs_defrag *d);
 void cetrafs_defrag_consider(struct inode *inode, u32 extents, u64 nblocks);
+void cetrafs_defrag_rejudge(struct inode *inode);
 u64 cetrafs_defrag_stale_req_count(void);
 u32 cetrafs_defrag_pin_count(void);
 u64 cetrafs_lock_yield_ask_count(void);
@@ -1625,6 +1626,7 @@ void cetrafs_lock_defrag_quiet_for(struct inode *inode, unsigned int secs);
 bool cetrafs_lock_defrag_quiet(struct inode *inode);
 bool cetrafs_lock_has_local_writer(struct inode *inode);
 void cetrafs_lock_defrag_yielded_for(struct inode *inode, unsigned int secs);
+void cetrafs_lock_defrag_rejudge_on_close(struct inode *inode);
 bool cetrafs_lock_defrag_yielded(struct inode *inode);
 bool cetrafs_lock_defrag_stop_asked(struct inode *inode);
 void cetrafs_inode_identity_init(struct inode *inode);
