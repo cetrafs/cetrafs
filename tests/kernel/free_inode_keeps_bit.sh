@@ -35,6 +35,7 @@ for k in iget_read_fail free_inode_read_fail; do
 done
 
 SBPOKE="$(ct_helper sb_poke)"
+BMAP_POKE="$(ct_helper bmap_poke)"
 IMG="$(ct_image 560 freeino)"
 DEV="$(ct_loop "$IMG")"
 MNT="$(ct_mnt freeino)"
@@ -47,22 +48,11 @@ PROC="$(ct_procdir "$DEV")"
 info() { sed -n "s/^$1: //p" "$PROC/info"; }
 lowest_free() { # the number the next create takes: the lowest clear bit
     blockdev --flushbufs "$DEV"
-    python3 -I - "$DEV" "$IBM" <<'PY'
-import os, sys
-fd = os.open(sys.argv[1], os.O_RDONLY)
-b = os.pread(fd, 4096, int(sys.argv[2]) * 4096)
-print(next(i + 1 for i in range(len(b) * 8) if not (b[i // 8] >> (i % 8)) & 1))
-PY
+    echo $(($("$BMAP_POKE" "$DEV" "$IBM" clear0 0 31744) + 1))
 }
 bit() { # <ino>: the inode's bit on the device
     blockdev --flushbufs "$DEV"
-    python3 -I - "$DEV" "$IBM" "$1" <<'PY'
-import os, sys
-dev, ibm, ino = sys.argv[1], int(sys.argv[2]), int(sys.argv[3])
-fd = os.open(dev, os.O_RDONLY)
-print((os.pread(fd, 1, ibm * 4096 + (ino - 1) // 8)[0] >> ((ino - 1) % 8)) & 1)
-os.close(fd)
-PY
+    "$BMAP_POKE" "$DEV" "$IBM" "$(($1 - 1))"
 }
 
 # ---------------------------------------------------------------- A

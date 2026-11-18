@@ -23,6 +23,7 @@ require_root
 OPOKE="$(ct_helper orphan_poke)"
 DPOKE="$(ct_helper dirtree_poke)"
 BGPOKE="$(ct_helper bg_poke)"
+BMP="$(ct_helper bmap_poke)"
 LEAKBIT=8000
 # A block in Block Group 0's data region for the planted directory: it
 # was the literal 2700, inside the data region until block 0's copy
@@ -38,7 +39,7 @@ get() { grep -o "$1=[^ ]*" <<<"$2" | head -1 | cut -d= -f2; }
 
 # <tag> <ungated 0|1> -> RES
 round() {
-    local img dev d0 bm off byte out
+    local img dev d0 bm bit out
     img="$(ct_image 560 "flg$1")"
     dev="$(ct_loop "$img")"
     ct_mkfs "$dev" -z 1 -b 512 -J 1 -M 4 -N 1024 -f >/dev/null
@@ -46,8 +47,7 @@ round() {
     "$DPOKE" "$img" 2 "$(data_blk "$dev")" 3 >/dev/null || { fail "setup: dirtree_poke failed"; ct_exit; }
     d0="$("$BGPOKE" "$dev" 0 --dump)"
     bm=$(( $(tr ' ' '\n' <<<"$d0" | sed -n 's/^start_block=\([0-9]*\).*/\1/p' | awk 'NR == 1') + $(tr ' ' '\n' <<<"$d0" | sed -n 's/^off_data_bmap=\([0-9]*\).*/\1/p' | awk 'NR == 1') ))
-    off=$((bm * 4096 + LEAKBIT / 8))
-    printf '\x01' | dd of="$img" bs=1 seek="$off" conv=notrunc status=none
+    "$BMP" "$img" "$bm" "$LEAKBIT" 1
     blockdev --flushbufs "$dev"
     if [ "$2" = 1 ]; then
         out="$(CETRAFS_TEST_FSCK_LEAK_UNGATED=1 "$ROOT/userspace/fsck.cetra" -r "$dev" 2>&1 || true)"
@@ -55,9 +55,9 @@ round() {
         out="$("$ROOT/userspace/fsck.cetra" -r "$dev" 2>&1 || true)"
     fi
     blockdev --flushbufs "$dev"
-    byte="$(dd if="$dev" bs=1 skip="$off" count=1 status=none | od -An -tu1 | tr -d ' ')"
+    bit="$("$BMP" "$dev" "$bm" "$LEAKBIT")"
     RES="partial=$(grep -c 'could not be read' <<<"$out" || true) leaked=$(grep -c 'leaked' <<<"$out" || true)"
-    RES="$RES bit=$((byte & 1)) said=$(grep -c 'not cleared: some directory blocks could not be read' <<<"$out" || true)"
+    RES="$RES bit=$bit said=$(grep -c 'not cleared: some directory blocks could not be read' <<<"$out" || true)"
 }
 
 round c 1

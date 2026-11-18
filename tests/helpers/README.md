@@ -20,6 +20,7 @@ only when the source or the format header is newer.
 | `pending_poke` | a ZG's pending-free queue | `add`, `dump`, and `extent <ino>` (prints an inode's first extent, so a test can learn a real LBA) |
 | `journal_poke` | a node's journal area | write a valid entry, force the clean flag back to MUST-SCAN |
 | `corrupt_poke` | arbitrary structures, for fsck's negative controls | per-field corruption |
+| `bmap_poke` | one bit of a bitmap (inode or data), its sector's CRC restamped | read, set/clear, `raw` (leave the CRC stale: a fault), `count`/`clear0` over a run. The only way a suite reaches a bitmap bit -- bit N is not at byte N/8 (cetrafs.h `CETRAFS_BMAP_SECTOR`) |
 | `fsx_cetra` | one file, a seeded stream of data ops against an in-memory model | `kernel/fsx_model.sh`; `FSX_NEGATIVE` corrupts the model on purpose |
 | `fsstress_cetra` | several processes, a seeded namespace stream, per-process model, shared-directory errno contract | `kernel/fsstress_namespace.sh`; `FSSTRESS_NEGATIVE` corrupts the model |
 

@@ -21,8 +21,10 @@
  *   corrupt_poke <image> repoint <dir_ino> <name> <new_target>
  *                                               -- make an entry name a
  *                                                  different inode
- * The data bitmap carries no checksum of its own, so bitset/bitclr need
- * no fixups; the extent mode restamps the inode checksum.
+ * bitset/bitclr restamp the bit's sector (each bitmap sector carries its
+ * own checksum) unless CORRUPT_POKE_RAW is set, which leaves a sector
+ * whose bits and checksum disagree; the extent mode restamps the inode
+ * checksum.
  */
 #include <fcntl.h>
 #include <inttypes.h>
@@ -310,14 +312,13 @@ int main(int argc, char **argv)
     rd(fd, blk, sizeof(blk), (off_t) (cetrafs_le64(sb.bg_table_start) + bg_id) * CETRAFS_BLOCK_SIZE);
     memcpy(&bg, blk, sizeof(bg));
 
-    off_t bmap = (off_t) (cetrafs_le64(bg.start_block) + cetrafs_le32(bg.off_data_bmap)) * CETRAFS_BLOCK_SIZE + (off_t) (bit / 8);
-    uint8_t byte;
-    rd(fd, &byte, 1, bmap);
-    if (!strcmp(argv[2], "bitset"))
-        byte |= (uint8_t) (1u << (bit % 8));
-    else
-        byte &= (uint8_t) ~(1u << (bit % 8));
-    wr(fd, &byte, 1, bmap);
+    /* Restamped, so the fault is the bit and not its sector's checksum;
+     * CORRUPT_POKE_RAW=1 leaves the checksum as it was. */
+    if (cetrafs_bmap_poke_us(fd, cetrafs_le64(bg.start_block) + cetrafs_le32(bg.off_data_bmap), bit,
+                             !strcmp(argv[2], "bitset"), getenv("CORRUPT_POKE_RAW") != NULL) < 0) {
+        perror("bitmap");
+        return 1;
+    }
     printf("corrupt_poke: BG%u data bitmap bit %" PRIu64 " -> %s\n", bg_id, bit, argv[2] + 3);
     close(fd);
     return 0;

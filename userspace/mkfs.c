@@ -137,9 +137,32 @@ static void zero_blocks(int fd, u64 start_block, u64 count, bool do_write)
         write_block(fd, start_block + i, z, true);
 }
 
-static inline void bmap_set_bit(u8 *bm, u64 bit)
+/* Empty bitmap blocks: no bit set, every sector stamped. */
+static void empty_bitmap_blocks(int fd, u64 start_block, u64 count, bool do_write)
 {
-    bm[bit >> 3] |= (u8) (1u << (bit & 7));
+    u8 blk[CETRAFS_BLOCK_SIZE] = {0};
+
+    cetrafs_bmap_stamp_us(blk, 1);
+    for (u64 i = 0; do_write && i < count; ++i)
+        write_block(fd, start_block + i, blk, true);
+}
+
+/* Set bit 'bit' of the bitmap at 'lba': read, set, restamp, write. */
+static void bmap_set_bit_at(int fd, u64 lba, u64 bit, bool dry_run, const char *what)
+{
+    u8 blk[CETRAFS_BLOCK_SIZE] = {0};
+    const u64 at = lba + cetrafs_bmap_blk(bit);
+
+    /* Read-modify-write: a failed read would leave the zeroed buffer and
+     * the write-back would clear every other bit in this block. The area
+     * was written empty by now, so the read is only confirming that --
+     * but an unchecked RMW is not something to leave in a tool that
+     * formats devices. */
+    if (!dry_run && pread(fd, blk, sizeof(blk), (off_t) at * CETRAFS_BLOCK_SIZE) != (ssize_t) sizeof(blk))
+        die("%s read at block %llu failed: %s", what, (unsigned long long) at, strerror(errno));
+    cetrafs_bmap_put(blk, bit % CETRAFS_BMAP_BLOCK_BITS, 1);
+    cetrafs_bmap_stamp_us(blk, 1);
+    write_block(fd, at, blk, !dry_run);
 }
 
 static bool is_device_nonempty(int fd, u64 blocks_to_scan, u32 *found_magic)
@@ -1319,11 +1342,8 @@ int main(int argc, char **argv)
         memcpy(blk, &bh, sizeof(bh));
         write_block(fd, next_bg_start + 0, blk, !dry_run);
 
-        /* Zero the data bitmap blocks */
-        {
-            u64 dbm_blocks = cetrafs_calc_bg_dbm_blocks(bg_size_blocks);
-            zero_blocks(fd, next_bg_start + off_bmap32, dbm_blocks, !dry_run);
-        }
+        /* An empty data bitmap */
+        empty_bitmap_blocks(fd, next_bg_start + off_bmap32, cetrafs_calc_bg_dbm_blocks(bg_size_blocks), !dry_run);
 
         next_bg_start += bg_size_blocks;
     }
@@ -1334,8 +1354,8 @@ int main(int argc, char **argv)
     /* --- Global inode bitmap & table --- */
     /* ----------------------------------- */
 
-    /* zero them */
-    zero_blocks(fd, i_bmap_lba, i_bmap_blk, !dry_run);
+    /* An empty bitmap */
+    empty_bitmap_blocks(fd, i_bmap_lba, i_bmap_blk, !dry_run);
     /* Every slot a DEAD record, not zeros (cetrafs_inode_dead_stamp_us()).
      * An all-zero record cannot be told from a live one read back as
      * zeros, so no walk that frees may take it as empty -- and a create
@@ -1382,26 +1402,7 @@ int main(int argc, char **argv)
         if (root_idx == 0 || root_idx > inodes_total)
             die("root ino out of range");
 
-        /* Convert to 0-based for bitmap */
-        u64 bit = root_idx - 1;
-
-        /* modify target bitmap block */
-        u64 bm_block_off = (bit / CETRAFS_BITS_PER_BLOCK);
-
-        u8 *bmblk = (u8 *) xcalloc(1, CETRAFS_BLOCK_SIZE);
-
-        off_t off = (off_t) (i_bmap_lba + bm_block_off) * CETRAFS_BLOCK_SIZE;
-        /* Read-modify-write: a failed read would leave the zeroed buffer
-         * and the write-back below would clear every other bit in this
-         * block. The area is zero-filled by now, so the read is only
-         * confirming that -- but an unchecked RMW is not something to
-         * leave in a tool that formats devices. */
-        if (!dry_run && pread(fd, bmblk, CETRAFS_BLOCK_SIZE, off) != (ssize_t) CETRAFS_BLOCK_SIZE)
-            die("inode bitmap read at %lld failed: %s", (long long) off, strerror(errno));
-        bmap_set_bit(bmblk, bit % CETRAFS_BITS_PER_BLOCK);
-        write_block(fd, (i_bmap_lba + bm_block_off), bmblk, !dry_run);
-
-        free(bmblk);
+        bmap_set_bit_at(fd, i_bmap_lba, root_idx - 1, dry_run, "inode bitmap"); /* 0-based */
     }
 
     /* ------------------------------------------- */
@@ -1412,19 +1413,7 @@ int main(int argc, char **argv)
 
     /* Set bit 0 in BG0 data bitmap */
     {
-        u64 dbm0_lba = root_bg_start + off_bmap32;
-
-        u8 *bm = (u8 *) xcalloc(1, CETRAFS_BLOCK_SIZE);
-        if (!dry_run &&
-            pread(fd, bm, CETRAFS_BLOCK_SIZE, (off_t) dbm0_lba * CETRAFS_BLOCK_SIZE) !=
-                (ssize_t) CETRAFS_BLOCK_SIZE)
-            die("BG 0 data bitmap read at block %llu failed: %s", (unsigned long long) dbm0_lba,
-                strerror(errno));
-        bmap_set_bit(bm, 0); /* first data block */
-
-        write_block(fd, dbm0_lba, bm, !dry_run);
-
-        free(bm);
+        bmap_set_bit_at(fd, root_bg_start + off_bmap32, 0, dry_run, "BG 0 data bitmap"); /* first data block */
     }
 
     /* Write directory block with '.' and '..' */

@@ -5971,27 +5971,26 @@ int cetrafs_lock_sweep_own_claims(struct super_block *sb, u32 my_node_id)
 
     for (blk = 0; cetrafs_ibmap_block(sb, blk, &lba, &first, &nbits) && !ret; blk++) {
         struct buffer_head *bh;
-        u64 i;
+        u64 off, i;
 
         /* The sweep runs at mount and walks every allocated inode:
-         * keep beating (audit 2026-11-14 F1). */
+         * keep beating (audit 2026-11-14 F1). Every exit goes through
+         * the kvfree() below. */
         ret = cetrafs_sb_mount_beat(sb);
         if (ret)
-            return ret;
-        bh = cetrafs_bread_retry(sb, lba);
-        if (!bh)
-            return -EIO;
-        for (i = 0; i < CETRAFS_BLOCK_SIZE * 8; i++) {
+            break;
+        bh = cetrafs_bmap_bread(sb, lba, 0, CETRAFS_BMAP_BUF_BITS, &ret);
+        if (!bh && ret != -EUCLEAN)
+            break;
+        /* A damaged block cannot say which numbers are in use: every
+         * one of them is visited, and its record judged. */
+        ret = 0;
+        cetrafs_bmap_for_each_set(cetrafs_bmap_bits_or_all(bh), off, i, nbits) {
             u64 ino = first + i;
             cetrafs_inode_t raw;
             struct cetrafs_own_claims_ctx ctx = {.me = my_node_id, .my_incarnation = cetrafs_sb_incarnation(sb)};
 
-            if (i >= nbits)
-                break;
-            if (!(i & 1023))
-                cond_resched();
-            if (!(bh->b_data[i >> 3] & (1 << (i & 7))))
-                continue;
+            cond_resched();
             seen++;
             /* Per record, not per bitmap block: a block covers 32768
              * numbers, and at a cold read each that was minutes between
@@ -6325,27 +6324,24 @@ int cetrafs_lock_resweep_own_claims(struct super_block *sb, u32 my_node_id, bool
         return -EINVAL;
 
     for (blk = 0; cetrafs_ibmap_block(sb, blk, &lba, &first, &nbits); blk++) {
-        struct buffer_head *bh = cetrafs_bread_retry(sb, lba);
-        u64 i;
+        struct buffer_head *bh;
+        u64 off, i;
+        int err;
 
-        if (!bh)
-            return -EIO;
-        for (i = 0; i < CETRAFS_BLOCK_SIZE * 8; i++) {
+        bh = cetrafs_bmap_bread(sb, lba, 0, CETRAFS_BMAP_BUF_BITS, &err);
+        if (!bh && err != -EUCLEAN)
+            return err;
+        /* Damaged: every number in it is visited (see the sweep above). */
+        cetrafs_bmap_for_each_set(cetrafs_bmap_bits_or_all(bh), off, i, nbits) {
             u64 ino = first + i;
             cetrafs_inode_t raw;
             int r;
 
-            if (i >= nbits)
-                break;
-            if (!(i & 1023)) {
-                cond_resched();
-                if (stop(sb) || cetrafs_sb_is_fenced(sb) || sb_rdonly(sb)) {
-                    brelse(bh);
-                    return cleared;
-                }
+            cond_resched();
+            if (stop(sb) || cetrafs_sb_is_fenced(sb) || sb_rdonly(sb)) {
+                brelse(bh);
+                return cleared;
             }
-            if (!(bh->b_data[i >> 3] & (1 << (i & 7))))
-                continue;
             /* A cheap look first: one record in thousands names us. */
             cetrafs_invalidate_raw_inode(sb, ino);
             if (cetrafs_read_raw_inode_walk(sb, ino, &raw) != 0 || cetrafs_le32(raw.nlink) == 0)

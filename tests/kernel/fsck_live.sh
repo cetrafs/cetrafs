@@ -31,6 +31,7 @@ require_root
 require_module
 POKE="$(ct_helper csum_poke)"
 SBPOKE="$(ct_helper sb_poke)"
+BMP="$(ct_helper bmap_poke)"
 FSCK="$ROOT/userspace/fsck.cetra"
 IMG="$(ct_image 1200 fsklive)"
 A="$(ct_loop "$IMG")"
@@ -105,14 +106,8 @@ out="$("$FSCK" --live "$B" 2>&1)" || rc=$?
 ct_umount "$MNT"
 IBM="$("$SBPOKE" "$IMG" | sed -n 's/^inode_bmap_start=//p')"
 [ -n "$IBM" ] || { fail "setup: no inode_bmap_start"; ct_exit; }
-python3 -I - "$IMG" $((IBM * 4096 + (DINO - 1) / 8)) $((1 << ((DINO - 1) % 8))) <<'PY'
-import sys
-p, off, mask = sys.argv[1], int(sys.argv[2]), int(sys.argv[3])
-with open(p, 'r+b') as f:
-    f.seek(off); b = f.read(1)[0]
-    assert b & mask, "the dangler's bit is not set"
-    f.seek(off); f.write(bytes([b & ~mask & 0xff]))
-PY
+[ "$("$BMP" "$IMG" "$IBM" $((DINO - 1)))" = 1 ] || { fail "setup: the dangler's bit is not set"; ct_exit; }
+"$BMP" "$IMG" "$IBM" $((DINO - 1)) 0
 blockdev --flushbufs "$B"
 blockdev --flushbufs "$A"
 ct_mount "$A" "$MNT"

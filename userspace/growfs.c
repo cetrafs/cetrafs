@@ -159,6 +159,16 @@ static void zero_blocks(int fd, u64 start, u64 count, bool do_write)
         write_block(fd, start + i, z, true);
 }
 
+/* Empty bitmap blocks: no bit set, every sector stamped. */
+static void empty_bitmap_blocks(int fd, u64 start, u64 count, bool do_write)
+{
+    u8 blk[CETRAFS_BLOCK_SIZE] = {0};
+
+    cetrafs_bmap_stamp_us(blk, 1);
+    for (u64 i = 0; do_write && i < count; ++i)
+        write_block(fd, start + i, blk, true);
+}
+
 static void sync_device(int fd, bool do_write)
 {
     if (!do_write)
@@ -1035,14 +1045,14 @@ int main(int argc, char **argv)
 
             /* A stale bitmap from a previous filesystem at these offsets
              * would read as "allocated" and silently cost the volume the
-             * space, so these are really zeroed, not assumed zero. */
+             * space, so these are really written empty, not assumed so. */
             if (dirty_bmp) {
                 /* TEST-ONLY: a bitmap a previous filesystem left behind. */
                 memset(blk, 0xff, CETRAFS_BLOCK_SIZE);
                 for (u64 k = 0; k < cetrafs_calc_bg_dbm_blocks(bg_size); ++k)
                     write_block(fd, start + off_bmap32 + k, blk, !skip_bg_hdr);
             } else {
-                zero_blocks(fd, start + off_bmap32, cetrafs_calc_bg_dbm_blocks(bg_size), !skip_bg_hdr);
+                empty_bitmap_blocks(fd, start + off_bmap32, cetrafs_calc_bg_dbm_blocks(bg_size), !skip_bg_hdr);
             }
             start += bg_size;
         }
@@ -1183,7 +1193,8 @@ int main(int argc, char **argv)
     if (ino_add) {
         cetrafs_seg_hdr_t seg;
 
-        zero_blocks(fd, iseg_lba + 1, ino_span - 1, true);
+        empty_bitmap_blocks(fd, iseg_lba + 1, cetrafs_calc_inode_bmap_blocks(ino_add), true);
+        zero_blocks(fd, iseg_lba + 1 + cetrafs_calc_inode_bmap_blocks(ino_add), ino_add, true);
         memset(&seg, 0, sizeof(seg));
         seg.magic = cetrafs_cpu_to_le32(CETRAFS_INOSEG_MAGIC);
         seg.count = cetrafs_cpu_to_le32((u32) ino_add);

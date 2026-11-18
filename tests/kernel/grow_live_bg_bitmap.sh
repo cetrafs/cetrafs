@@ -1,6 +1,6 @@
 #!/usr/bin/env bash
 # SPDX-License-Identifier: GPL-2.0-or-later
-# a live grow refuses Block Groups whose data bitmap is not zeroed on the device
+# a live grow refuses Block Groups whose data bitmap is not empty on the device
 #
 # The commit verified each new group's header, and nothing about its
 # bitmap. The allocator reads that bitmap the moment the group is handed
@@ -54,7 +54,7 @@ fi
     pass "round 1: nothing published (block_group_count $bgs0, layout_gen $gen0)" ||
     fail "round 1: the layout moved to $(info block_group_count) groups, gen $(info layout_gen)"
 [ "$(sb_sum)" = "$sb0" ] && pass "round 1: block 0 unchanged" || fail "round 1: block 0 was rewritten"
-dmesg_since "$MARK" | grep -q "bitmap block at .* is not zeroed" &&
+dmesg_since "$MARK" | grep -q "bitmap block at .* is not an empty bitmap" &&
     pass "round 1: the kernel named the dirty bitmap" ||
     fail "round 1: no bitmap refusal in the kernel log: $(tail -2 <<<"$out" | tr '\n' ' ')"
 

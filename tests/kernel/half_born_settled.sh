@@ -35,6 +35,7 @@ done
 HB_POKE="$(ct_helper half_born_poke)"
 LOCK_POKE="$(ct_helper inode_lock_poke)"
 SB_POKE="$(ct_helper sb_poke)"
+BMAP_POKE="$(ct_helper bmap_poke)"
 MNT="$(ct_mnt hbs)"
 ct_track mnt "$MNT"
 ct_param_set half_born_settle_off 0
@@ -50,13 +51,7 @@ P=/sys/module/cetrafs/parameters
 N=500
 
 ibit() {
-    python3 -I - "$1" "$2" "$inode_bmap_start" <<'PY'
-import sys
-img, ino, start = sys.argv[1], int(sys.argv[2]), int(sys.argv[3])
-with open(img, "rb") as f:
-    f.seek(start * 4096 + (ino - 1) // 8)
-    print((f.read(1)[0] >> ((ino - 1) % 8)) & 1)
-PY
+    "$BMAP_POKE" "$1" "$inode_bmap_start" "$(($2 - 1))"
 }
 info() { sed -n "s/^$1: //p" "$PROC/info"; }
 

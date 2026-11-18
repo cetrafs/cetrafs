@@ -657,13 +657,54 @@ static off_t fsck_ino_off(uint64_t ino)
 static int fsck_ino_bit_on_disk(int fd, uint64_t ino)
 {
     uint8_t blk[CETRAFS_BLOCK_SIZE];
-    uint64_t bit, lba = cetrafs_iseg_bit(fsck_iseg, fsck_niseg, ino, &bit);
+    uint64_t off, lba = cetrafs_iseg_bit(fsck_iseg, fsck_niseg, ino, &off);
 
     if (!lba)
         return 0;
     pread_all(fd, blk, sizeof(blk), (off_t) lba * CETRAFS_BLOCK_SIZE);
-    return !!(blk[bit / 8] & (1u << (bit % 8)));
+    return !!(blk[off / 8] & (1u << (off % 8)));
 }
+
+/* fsck's own in-memory bitmaps: dense, one bit per entry, no sectors. */
+#ifndef FSCK_SET
+#define FSCK_SET(bm, i) ((bm)[(i) / 8] |= (uint8_t) (1u << ((i) % 8)))
+#define FSCK_GET(bm, i) (((bm)[(i) / 8] >> ((i) % 8)) & 1u)
+#define FSCK_CLR(bm, i) ((bm)[(i) / 8] &= (uint8_t) ~(1u << ((i) % 8)))
+#endif
+
+/* A bitmap of 'cnt' bits at 'lba', read whole: its device image, which
+ * cetrafs_bmap_get() indexes; *nblk is its blocks. With 'what', each
+ * sector's checksum is checked and a failing one reported as an ERR and
+ * counted in *bad -- a repair rewrites it, restamped, from what this run
+ * decides the bits are. */
+static uint8_t *fsck_bmap_read(int fd, uint64_t lba, uint64_t cnt, uint64_t *nblk, const char *what, uint64_t *bad)
+{
+    const uint64_t n = cetrafs_calc_bmap_blocks(cnt);
+    uint8_t *img = (uint8_t *) xcalloc(n ? n : 1, CETRAFS_BLOCK_SIZE);
+    uint64_t first = 0, nbad;
+
+    pread_all(fd, img, (size_t) n * CETRAFS_BLOCK_SIZE, (off_t) lba * CETRAFS_BLOCK_SIZE);
+    *nblk = n;
+    if (what && (nbad = cetrafs_bmap_bad_us(img, n, &first))) {
+        fprintf(stderr,
+                "ERR: %s at block %" PRIu64 ": %" PRIu64 " sector(s) fail their checksum, first sector %" PRIu64
+                " of block %" PRIu64 " -- its bits cannot be trusted\n",
+                what, lba, nbad, first % CETRAFS_BMAP_SECTORS, lba + first / CETRAFS_BMAP_SECTORS);
+        *bad += nbad;
+    }
+    return img;
+}
+
+/* A bitmap image written back, every sector restamped. */
+static void fsck_bmap_write(int fd, uint64_t lba, uint8_t *img, uint64_t nblk)
+{
+    cetrafs_bmap_stamp_us(img, nblk);
+    pwrite_all(fd, img, (size_t) nblk * CETRAFS_BLOCK_SIZE, (off_t) lba * CETRAFS_BLOCK_SIZE);
+}
+
+/* The inode bitmap's sectors that failed their checksum when it was
+ * loaded: a repair rewrites the whole bitmap. */
+static uint64_t fsck_ibmap_bad;
 
 /* The whole bitmap, indexed by inode - 1. */
 static uint8_t *fsck_ibmap_load(int fd)
@@ -673,19 +714,16 @@ static uint8_t *fsck_ibmap_load(int fd)
     for (uint32_t s = 0; s < fsck_niseg; s++)
         total = fsck_iseg[s].first + fsck_iseg[s].count - 1;
     uint8_t *map = (uint8_t *) xcalloc(total / 8 + 1, 1);
-    uint8_t blk[CETRAFS_BLOCK_SIZE];
 
     for (uint32_t s = 0; s < fsck_niseg; s++) {
         const struct cetrafs_iseg *g = &fsck_iseg[s];
+        uint64_t nblk;
+        uint8_t *img = fsck_bmap_read(fd, g->bmap, g->count, &nblk, "inode bitmap", &fsck_ibmap_bad);
 
-        for (uint64_t i = 0; i < g->count; i++) {
-            uint64_t gi = g->first - 1 + i;
-
-            if (i % CETRAFS_BITS_PER_BLOCK == 0)
-                pread_all(fd, blk, sizeof(blk), (off_t) (g->bmap + i / CETRAFS_BITS_PER_BLOCK) * CETRAFS_BLOCK_SIZE);
-            if (blk[(i % CETRAFS_BITS_PER_BLOCK) / 8] & (1u << (i % 8)))
-                map[gi / 8] |= (uint8_t) (1u << (gi % 8));
-        }
+        for (uint64_t i = 0; i < g->count; i++)
+            if (cetrafs_bmap_get(img, i))
+                FSCK_SET(map, g->first - 1 + i);
+        free(img);
     }
     return map;
 }
@@ -698,22 +736,21 @@ static void fsck_ibmap_store_block(int fd, const uint8_t *map, uint64_t ino)
 
     if (!g)
         return;
-    uint64_t k = (ino - g->first) / CETRAFS_BITS_PER_BLOCK, i0 = k * CETRAFS_BITS_PER_BLOCK;
+    uint64_t k = cetrafs_bmap_blk(ino - g->first), i0 = k * CETRAFS_BMAP_BLOCK_BITS;
 
-    for (uint64_t b = 0; b < CETRAFS_BITS_PER_BLOCK && i0 + b < g->count; b++) {
-        uint64_t gi = g->first - 1 + i0 + b;
-
-        if (map[gi / 8] & (1u << (gi % 8)))
-            blk[b / 8] |= (uint8_t) (1u << (b % 8));
-    }
-    pwrite_all(fd, blk, sizeof(blk), (off_t) (g->bmap + k) * CETRAFS_BLOCK_SIZE);
+    /* Read first: the bits are rewritten, the trailers' reserved stamps
+     * (G-6) are kept. */
+    pread_all(fd, blk, sizeof(blk), (off_t) (g->bmap + k) * CETRAFS_BLOCK_SIZE);
+    for (uint64_t b = 0; b < CETRAFS_BMAP_BLOCK_BITS && i0 + b < g->count; b++)
+        cetrafs_bmap_put(blk, b, FSCK_GET(map, g->first - 1 + i0 + b));
+    fsck_bmap_write(fd, g->bmap + k, blk, 1);
 }
 
 /* The whole bitmap written back from 'map'. */
 static void fsck_ibmap_store(int fd, const uint8_t *map)
 {
     for (uint32_t s = 0; s < fsck_niseg; s++)
-        for (uint64_t i = 0; i < fsck_iseg[s].count; i += CETRAFS_BITS_PER_BLOCK)
+        for (uint64_t i = 0; i < fsck_iseg[s].count; i += CETRAFS_BMAP_BLOCK_BITS)
             fsck_ibmap_store_block(fd, map, fsck_iseg[s].first + i);
 }
 
@@ -1492,13 +1529,10 @@ static int fsck_rebuild_bg_desc(int fd, const cetrafs_superblock_t *sb, uint64_t
     bmap_blocks = cetrafs_le32(hdr.off_data_region) - cetrafs_le32(hdr.off_data_bmap);
     for (uint32_t i = 0; i < bmap_blocks; i++) {
         pread_all(fd, blk, sizeof(blk), (off_t) (start + cetrafs_le32(hdr.off_data_bmap) + i) * CETRAFS_BLOCK_SIZE);
-        for (uint64_t bit = 0; bit < (uint64_t) CETRAFS_BLOCK_SIZE * 8; bit++) {
-            uint64_t idx = (uint64_t) i * CETRAFS_BLOCK_SIZE * 8 + bit;
-
-            if (idx >= cnt)
+        for (uint64_t bit = 0; bit < CETRAFS_BMAP_BLOCK_BITS; bit++) {
+            if ((uint64_t) i * CETRAFS_BMAP_BLOCK_BITS + bit >= cnt)
                 break;
-            if (blk[bit / 8] & (1u << (bit % 8)))
-                used++;
+            used += cetrafs_bmap_get(blk, bit);
         }
     }
 
@@ -1513,7 +1547,8 @@ static int fsck_rebuild_bg_desc(int fd, const cetrafs_superblock_t *sb, uint64_t
                     cetrafs_pending_free_t pe;
 
                     memcpy(&pe, blk + e * sizeof(pe), sizeof(pe));
-                    if (cetrafs_le32(pe.magic) != CETRAFS_PENDING_FREE_MAGIC || !cetrafs_le64(pe.lba) ||
+                    if (!cetrafs_pf_slot_is_entry(e) || cetrafs_le32(pe.magic) != CETRAFS_PENDING_FREE_MAGIC ||
+                        !cetrafs_le64(pe.lba) ||
                         cetrafs_le64(pe.lba) < dstart || cetrafs_le64(pe.lba) - dstart >= cnt)
                         continue;
                     if (!queued)
@@ -1705,21 +1740,19 @@ static int fsck_alloc_block(int fd,
     if (cetrafs_test_env("CETRAFS_FSCK_LF_NO_BLOCK"))
         return -1;
     for (uint32_t b = 0; b < bg_count; ++b) {
-        uint64_t bmap_blocks = (bg_data_cnt[b] + CETRAFS_BLOCK_SIZE * 8 - 1) / (CETRAFS_BLOCK_SIZE * 8);
-        uint8_t *bmap = (uint8_t *) xcalloc(bmap_blocks ? bmap_blocks : 1, CETRAFS_BLOCK_SIZE);
+        uint64_t bmap_blocks;
+        uint8_t *bmap = fsck_bmap_read(fd, bg_bmap_lba[b], bg_data_cnt[b], &bmap_blocks, NULL, NULL);
 
-        pread_all(fd, bmap, (size_t) bmap_blocks * CETRAFS_BLOCK_SIZE, (off_t) bg_bmap_lba[b] * CETRAFS_BLOCK_SIZE);
         for (uint64_t i = 0; i < bg_data_cnt[b]; ++i) {
-            if (bmap[i / 8] & (1u << (i % 8)))
+            if (cetrafs_bmap_get(bmap, i))
                 continue;
             /* Its flags first: a group with an UNMAP outstanding takes
              * no block, and one marked discarded is marked as holding
              * data again before it does (fsck_bg_claim_for_write()). */
             if (fsck_bg_claim_for_write(fd, b) == 1)
                 break;
-            bmap[i / 8] |= (uint8_t) (1u << (i % 8));
-            pwrite_all(fd, bmap, (size_t) bmap_blocks * CETRAFS_BLOCK_SIZE,
-                       (off_t) bg_bmap_lba[b] * CETRAFS_BLOCK_SIZE);
+            cetrafs_bmap_put(bmap, i, 1);
+            fsck_bmap_write(fd, bg_bmap_lba[b], bmap, bmap_blocks);
             fsck_adjust_bg_counts(fd, b, 0); /* the bit first: stopped between, a count reads one high -- the next run fixes it */
             *out_lba = bg_data_start[b] + i;
             free(bmap);
@@ -1763,19 +1796,19 @@ static void fsck_unalloc_block(int fd,
                                uint64_t lba)
 {
     for (uint32_t b = 0; b < bg_count; ++b) {
-        uint64_t i;
-        uint8_t byte;
-        off_t at;
+        uint8_t blk[CETRAFS_BLOCK_SIZE];
+        uint64_t i, at;
 
         if (lba < bg_data_start[b] || lba - bg_data_start[b] >= bg_data_cnt[b])
             continue;
         i = lba - bg_data_start[b];
-        at = (off_t) bg_bmap_lba[b] * CETRAFS_BLOCK_SIZE + (off_t) (i / 8);
-        pread_all(fd, &byte, 1, at);
-        if (!(byte & (1u << (i % 8))))
+        at = bg_bmap_lba[b] + cetrafs_bmap_blk(i);
+        pread_all(fd, blk, sizeof(blk), (off_t) at * CETRAFS_BLOCK_SIZE);
+        i %= CETRAFS_BMAP_BLOCK_BITS;
+        if (!cetrafs_bmap_get(blk, i))
             return;
-        byte &= (uint8_t) ~(1u << (i % 8));
-        pwrite_all(fd, &byte, 1, at);
+        cetrafs_bmap_put(blk, i, 0);
+        fsck_bmap_write(fd, at, blk, 1);
         fsck_adjust_bg_counts(fd, b, 1);
         return;
     }
@@ -2213,12 +2246,6 @@ static uint64_t fsck_lost_found(int fd,
     lf->created = 1;
     return ino;
 }
-
-#ifndef FSCK_SET
-#define FSCK_SET(bm, i) ((bm)[(i) / 8] |= (uint8_t) (1u << ((i) % 8)))
-#define FSCK_GET(bm, i) (((bm)[(i) / 8] >> ((i) % 8)) & 1u)
-#define FSCK_CLR(bm, i) ((bm)[(i) / 8] &= (uint8_t) ~(1u << ((i) % 8)))
-#endif
 
 /* Context for fsck_mark_run(): the content pass's reachability bitmaps,
  * the BG data-region tables, and the running tallies. */
@@ -3635,10 +3662,11 @@ int main(int argc, char **argv)
                     (uint64_t) cetrafs_le64(sb.root_ino), cetrafs_le32(sb.inodes_count));
             return 1;
         }
-        if (cetrafs_sb_inode_first_count(&sb) > cetrafs_le64(sb.inode_bmap_blocks) * CETRAFS_BLOCK_SIZE * 8) {
+        const uint64_t ibmap_bits = cetrafs_le64(sb.inode_bmap_blocks) * CETRAFS_BMAP_BLOCK_BITS;
+
+        if (cetrafs_sb_inode_first_count(&sb) > ibmap_bits) {
             fprintf(stderr, "ERR: layout: the first %" PRIu64 " inodes exceed the %" PRIu64 " bits in their bitmap\n",
-                    (uint64_t) cetrafs_sb_inode_first_count(&sb),
-                    (uint64_t) cetrafs_le64(sb.inode_bmap_blocks) * CETRAFS_BLOCK_SIZE * 8);
+                    (uint64_t) cetrafs_sb_inode_first_count(&sb), ibmap_bits);
             return 1;
         }
         if (cetrafs_le32(sb.node_table_count) > CETRAFS_MAX_READER_NODES) {
@@ -4570,6 +4598,14 @@ int main(int argc, char **argv)
                         int64_t fbg, lbg;
 
                         memcpy(&pe, qblk + e * sizeof(pe), sizeof(pe));
+                        if (!cetrafs_pf_slot_is_entry(e)) {
+                            /* A sector's trailer (G-6 room): never an entry. */
+                            if (cetrafs_le64(pe.lba) != 0)
+                                fprintf(stderr, "ERR: ZG%u pending-free queue: the trailer of sector %u holds an "
+                                                "entry -- no build reads it there\n",
+                                        z, e / (unsigned) CETRAFS_PF_SECTOR_SLOTS);
+                            continue;
+                        }
                         if (cetrafs_le64(pe.lba) == 0)
                             continue;
                         if (cetrafs_le32(pe.magic) != CETRAFS_PENDING_FREE_MAGIC || cetrafs_le32(pe.count) == 0) {
@@ -4850,6 +4886,16 @@ int main(int argc, char **argv)
         uint64_t orphans_linked = 0;
         struct fsck_lf lf = {0, cetrafs_le64(sb.root_ino), 0, 0};
         uint64_t problems = 0, inodes_seen = 0, extents_seen = 0, blocks_referenced = 0;
+
+        /* A damaged inode-bitmap sector (reported by the load) is
+         * rewritten, restamped, with the bits this run settles on. */
+        if (fsck_ibmap_bad) {
+            problems += fsck_ibmap_bad;
+            if (repair_mode) {
+                ibmap_dirty = 1;
+                repairs_made++;
+            }
+        }
 
 
         /* Map a data-block LBA to its index in 'owner', or -1 if the LBA
@@ -5139,7 +5185,7 @@ int main(int argc, char **argv)
                         int live = 0;
 
                         memcpy(&pe, q + e * sizeof(pe), sizeof(pe));
-                        if (!cetrafs_le64(pe.lba) || cetrafs_le32(pe.magic) != CETRAFS_PENDING_FREE_MAGIC || !cetrafs_le32(pe.count))
+                        if (!cetrafs_pf_slot_is_entry(e) || !cetrafs_le64(pe.lba) || cetrafs_le32(pe.magic) != CETRAFS_PENDING_FREE_MAGIC || !cetrafs_le32(pe.count))
                             continue;
                         /* A stale stamp: a copy from before a reclaim in
                          * its group, which the drain drops rather than
@@ -5239,14 +5285,22 @@ int main(int argc, char **argv)
             cetrafs_test_hold("CETRAFS_TEST_FSCK_HOLD_BEFORE_BG_PASS_SECS");
         }
         for (uint32_t b = 0; b < cetrafs_le32(sb.block_group_count); ++b) {
-            uint64_t bmap_blocks = (bg_data_cnt[b] + CETRAFS_BLOCK_SIZE * 8 - 1) / (CETRAFS_BLOCK_SIZE * 8);
-            uint8_t *bmap = (uint8_t *) xcalloc(bmap_blocks ? bmap_blocks : 1, CETRAFS_BLOCK_SIZE);
+            uint64_t bmap_blocks, bmap_bad = 0;
+            uint8_t *bmap = fsck_bmap_read(fd, bg_bmap_lba[b], bg_data_cnt[b], &bmap_blocks, "data bitmap", &bmap_bad);
             uint64_t really_free = 0;
+            /* A damaged sector is rewritten, restamped, with the bits
+             * this pass settles on; until then it is a fault. */
             int bmap_dirty = 0;
 
-            pread_all(fd, bmap, (size_t) bmap_blocks * CETRAFS_BLOCK_SIZE, (off_t) bg_bmap_lba[b] * CETRAFS_BLOCK_SIZE);
+            if (bmap_bad) {
+                problems += bmap_bad;
+                if (repair_mode) {
+                    bmap_dirty = 1;
+                    repairs_made++;
+                }
+            }
             for (uint64_t i = 0; i < bg_data_cnt[b]; ++i, ++idx) {
-                int marked = (bmap[i / 8] & (1u << (i % 8))) != 0;
+                int marked = cetrafs_bmap_get(bmap, i);
                 int is_refd = FSCK_GET(refd, idx) != 0;
 
                 if (marked && !is_refd) {
@@ -5303,7 +5357,7 @@ int main(int argc, char **argv)
                      * 2026-11-15 BM-67). Setting a bit never shares a
                      * block; at worst it leaks one for a later run. */
                     if (repair_mode && (!repair_blocked || !fsck_setbit_gated())) {
-                        bmap[i / 8] |= (uint8_t) (1u << (i % 8));
+                        cetrafs_bmap_put(bmap, i, 1);
                         bmap_dirty = 1;
                         marked = 1;
                         repairs_made++;
@@ -5314,8 +5368,7 @@ int main(int argc, char **argv)
             }
 
             if (bmap_dirty)
-                pwrite_all(fd, bmap, (size_t) bmap_blocks * CETRAFS_BLOCK_SIZE,
-                           (off_t) bg_bmap_lba[b] * CETRAFS_BLOCK_SIZE);
+                fsck_bmap_write(fd, bg_bmap_lba[b], bmap, bmap_blocks);
             /* The BG's own cached free_data_blocks against what its
              * bitmap actually says.
              *
@@ -5593,8 +5646,6 @@ int main(int argc, char **argv)
         free(refd);
         free(dupd);
         free(weakd);
-#undef FSCK_SET
-#undef FSCK_GET
 
         /* ---- namespace pass -------------------------------------
          *
@@ -6521,17 +6572,15 @@ int main(int argc, char **argv)
             uint64_t ix = 0, cleared = 0;
 
             for (uint32_t b = 0; b < cetrafs_le32(sb.block_group_count); ++b) {
-                uint64_t bmap_blocks = (bg_data_cnt[b] + CETRAFS_BLOCK_SIZE * 8 - 1) / (CETRAFS_BLOCK_SIZE * 8);
-                uint8_t *bmap = (uint8_t *) xcalloc(bmap_blocks ? bmap_blocks : 1, CETRAFS_BLOCK_SIZE);
+                uint64_t bmap_blocks;
+                uint8_t *bmap = fsck_bmap_read(fd, bg_bmap_lba[b], bg_data_cnt[b], &bmap_blocks, NULL, NULL);
                 int dirty = 0;
                 uint64_t bg_before = cleared;
 
-                pread_all(fd, bmap, (size_t) bmap_blocks * CETRAFS_BLOCK_SIZE,
-                          (off_t) bg_bmap_lba[b] * CETRAFS_BLOCK_SIZE);
                 for (uint64_t i = 0; i < bg_data_cnt[b]; ++i, ++ix) {
-                    if (!((leakd[ix / 8] >> (ix % 8)) & 1u) || !(bmap[i / 8] & (1u << (i % 8))))
+                    if (!FSCK_GET(leakd, ix) || !cetrafs_bmap_get(bmap, i))
                         continue;
-                    bmap[i / 8] &= (uint8_t) ~(1u << (i % 8));
+                    cetrafs_bmap_put(bmap, i, 0);
                     dirty = 1;
                     cleared++;
                 }
@@ -6562,8 +6611,7 @@ int main(int argc, char **argv)
                     /* The bits next, then the counters that credit
                      * them: stopped in between, the counts are low,
                      * which is the direction a reconcile only raises. */
-                    pwrite_all(fd, bmap, (size_t) bmap_blocks * CETRAFS_BLOCK_SIZE,
-                               (off_t) bg_bmap_lba[b] * CETRAFS_BLOCK_SIZE);
+                    fsck_bmap_write(fd, bg_bmap_lba[b], bmap, bmap_blocks);
 
                     pread_all(fd, blk, sizeof(blk), (off_t) bg_desc_lba[b] * CETRAFS_BLOCK_SIZE);
                     memcpy(&bgd, blk, sizeof(bgd));

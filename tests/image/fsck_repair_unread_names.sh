@@ -19,13 +19,14 @@
 # it did not free it.
 #
 # DISCRIMINATION (measured on the unfixed code): the orphan pass clears the
-# victim's bit; the bitmap byte reads 11 (bit 2 clear).
+# victim's bit; the victim's bit then reads 0 (clear).
 set -euo pipefail
 . "$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)/lib/harness.sh"
 require_root
 OPOKE="$(ct_helper orphan_poke)"
 DPOKE="$(ct_helper dirtree_poke)"
 SBPOKE="$(ct_helper sb_poke)"
+BMP="$(ct_helper bmap_poke)"
 # A block in Block Group 0's data region for the planted directory: it
 # was the literal 2700, inside the data region until block 0's copy
 # moved every table up by 2048 blocks (A-7); there it fell in metadata,
@@ -51,9 +52,7 @@ blockdev --flushbufs "$DEV"
 IBM="$("$SBPOKE" "$DEV" | sed -n 's/^inode_bmap_start=//p')"
 [ -n "$IBM" ] || { fail "setup: sb_poke prints no inode_bmap_start"; ct_exit; }
 bit_of() { # the victim's bit in the inode bitmap, as the device has it
-    local bit=$((VICTIM - 1)) byte
-    byte="$(dd if="$DEV" bs=1 skip=$((IBM * 4096 + bit / 8)) count=1 status=none | od -An -tu1 | tr -d ' ')"
-    echo $(((byte >> (bit % 8)) & 1))
+    "$BMP" "$DEV" "$IBM" "$((VICTIM - 1))"
 }
 [ "$(bit_of)" = 1 ] || { fail "setup: the victim's inode bit is not set"; ct_exit; }
 

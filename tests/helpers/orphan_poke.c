@@ -48,19 +48,20 @@ int main(int argc, char **argv)
         return 2;
     }
 
-    /* Set the inode bitmap bit (dense, LSB-first; bit = ino-1). */
-    uint64_t bblk = 0, bit = 0;
+    /* Set the inode bitmap bit, its sector restamped. */
+    uint64_t bblk = 0, off = 0;
+    int old;
 
-    cetrafs_u_ino_lba(fd, &sb, ino, &bblk, &bit);
-    off_t boff = (off_t) (bblk * CETRAFS_BLOCK_SIZE + bit / 8);
-    unsigned char byte;
-    rd(fd, &byte, 1, boff);
-    if (byte & (1u << (bit % 8))) {
+    cetrafs_u_ino_lba(fd, &sb, ino, &bblk, &off);
+    old = cetrafs_bmap_poke_off_us(fd, bblk, off, 1, 0);
+    if (old < 0) {
+        perror("bitmap");
+        return 1;
+    }
+    if (old) {
         fprintf(stderr, "ino %" PRIu64 " is already allocated -- pick a free one\n", ino);
         return 2;
     }
-    byte |= (unsigned char) (1u << (bit % 8));
-    wr(fd, &byte, 1, boff);
 
     /* A minimal regular-file record: no extents, no xattrs, no locks. */
     cetrafs_inode_t in;

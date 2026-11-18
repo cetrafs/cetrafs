@@ -67,6 +67,70 @@ static uint32_t crc32c_struct(const void *s, size_t len, size_t csum_off, size_t
 }
 
 
+/* ---- bitmap sectors (cetrafs.h CETRAFS_BMAP_SECTOR), userspace side ----
+ * Every tool that writes a bitmap restamps it through these, and every
+ * one that reads one may check it; no tool hand-rolls the geometry. */
+#ifdef CETRAFS_VERSION
+
+static inline uint32_t cetrafs_bmap_sector_crc_us(const void *sector)
+{
+    return crc32c_update(0, sector, CETRAFS_BMAP_CRC_LEN);
+}
+
+/* Restamp every sector of a bitmap image of 'nblocks' blocks. */
+static inline void cetrafs_bmap_stamp_us(void *image, uint64_t nblocks)
+{
+    for (uint64_t i = 0; i < nblocks * CETRAFS_BMAP_SECTORS; i++)
+        cetrafs_bmap_trailer((uint8_t *) image + i / CETRAFS_BMAP_SECTORS * CETRAFS_BLOCK_SIZE,
+                             i % CETRAFS_BMAP_SECTORS)
+            ->crc = cetrafs_cpu_to_le32(cetrafs_bmap_sector_crc_us((uint8_t *) image + i * CETRAFS_BMAP_SECTOR));
+}
+
+/* Set ('v' 1) or clear ('v' 0) the bit at buffer offset 'off' of bitmap
+ * block 'lba' on 'fd': the block read, changed, restamped and written
+ * (raw: not restamped, a fault for a test to inject). Returns the bit's
+ * old value, or -1 on an I/O error. */
+static inline int cetrafs_bmap_poke_off_us(int fd, uint64_t lba, uint64_t off, int v, int raw)
+{
+    uint8_t blk[CETRAFS_BLOCK_SIZE];
+    int old;
+
+    if (pread(fd, blk, sizeof(blk), (off_t) lba * CETRAFS_BLOCK_SIZE) != (ssize_t) sizeof(blk))
+        return -1;
+    old = (blk[off / 8] >> (off % 8)) & 1;
+    blk[off / 8] = v ? (uint8_t) (blk[off / 8] | (1u << (off % 8))) : (uint8_t) (blk[off / 8] & ~(1u << (off % 8)));
+    if (!raw)
+        cetrafs_bmap_stamp_us(blk, 1);
+    if (pwrite(fd, blk, sizeof(blk), (off_t) lba * CETRAFS_BLOCK_SIZE) != (ssize_t) sizeof(blk))
+        return -1;
+    return old;
+}
+
+/* The same for bit number 'bit' of the bitmap starting at block 'lba'. */
+static inline int cetrafs_bmap_poke_us(int fd, uint64_t lba, uint64_t bit, int v, int raw)
+{
+    return cetrafs_bmap_poke_off_us(fd, lba + cetrafs_bmap_blk(bit), cetrafs_bmap_off(bit), v, raw);
+}
+
+/* The sectors of a bitmap image that fail their CRC; *first the first
+ * of them (its block * CETRAFS_BMAP_SECTORS + sector). */
+static inline uint64_t cetrafs_bmap_bad_us(const void *image, uint64_t nblocks, uint64_t *first)
+{
+    uint64_t bad = 0;
+
+    for (uint64_t i = 0; i < nblocks * CETRAFS_BMAP_SECTORS; i++) {
+        const uint8_t *sec = (const uint8_t *) image + i * CETRAFS_BMAP_SECTOR;
+        cetrafs_bmap_trailer_t t;
+
+        memcpy(&t, sec + CETRAFS_BMAP_SECTOR - sizeof(t), sizeof(t));
+        if (cetrafs_le32(t.crc) != cetrafs_bmap_sector_crc_us(sec) && !bad++ && first)
+            *first = i;
+    }
+    return bad;
+}
+
+#endif
+
 /* ---- v0x0005 two-sector inode record helpers (userspace tools) ----
  * The record is two independently-checksummed 512-byte sectors (see
  * cetrafs.h). Every userspace stamp/verify goes through these so no tool

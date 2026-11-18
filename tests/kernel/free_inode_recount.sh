@@ -22,6 +22,7 @@ set -euo pipefail
 require_root
 require_module
 SBP="$(ct_helper sb_poke)"
+BMP="$(ct_helper bmap_poke)"
 
 IMG="$(ct_image 560 freeino)"
 DEV="$(ct_loop "$IMG")"
@@ -42,20 +43,9 @@ F1="$(ffree)"
     fail "1: control: the free-inode count moved with nothing changed ($F0 -> $F1)"
 
 # A peer's create: inode 900 taken on the device (bit 900 of the inode bitmap).
-python3 -I - "$IMG" "$BMAP" <<'PY'
-import os, sys
-img, bmap = sys.argv[1], int(sys.argv[2])
-ino = 900
-off = bmap * 4096 + ino // 8
-fd = os.open(img, os.O_RDWR)
-b = os.pread(fd, 1, off)[0]
-was = (b >> (ino % 8)) & 1
-os.pwrite(fd, bytes([b | (1 << (ino % 8))]), off)
-os.fsync(fd)
-os.close(fd)
-print("was %d" % was)
-sys.stdout.flush()
-PY
+was="$("$BMP" "$IMG" "$BMAP" 900)"
+"$BMP" "$IMG" "$BMAP" 900 1
+echo "was $was"
 sleep 11
 F2="$(ffree)"
 [ "$F2" = "$((F0 - 1))" ] && pass "2: after the recount window the peer's inode is counted ($F0 -> $F2)" ||

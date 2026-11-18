@@ -29,6 +29,7 @@ for p in discard_issue_stall_ms trim_hold_sync_off handback_flag_first_off; do
     [ -w "/sys/module/cetrafs/parameters/$p" ] || { skip "$p is missing"; ct_exit; }
 done
 BGPOKE="$(ct_helper bg_poke)"
+BMAP_POKE="$(ct_helper bmap_poke)"
 IMG="$(ct_big_image 1200 dhdf)"
 DEV="$(ct_loop "$IMG")"
 MNT="$(ct_mnt dhdf)"
@@ -50,14 +51,7 @@ bits_set() {
     local g s ob od
     g="$(geom "$1")"
     s="$(field start_block <<<"$g")" ob="$(field off_data_bmap <<<"$g")" od="$(field off_data_region <<<"$g")"
-    python3 -I - "$IMG" "$((s + ob))" "$(($2 - s - od))" "$3" <<'PY'
-import sys
-img, bmap, first, n = sys.argv[1], int(sys.argv[2]), int(sys.argv[3]), int(sys.argv[4])
-with open(img, "rb") as f:
-    f.seek(bmap * 4096 + first // 8)
-    d = f.read((first + n) // 8 - first // 8 + 1)
-print(sum(1 for i in range(first, first + n) if d[i // 8 - first // 8] >> (i % 8) & 1))
-PY
+    "$BMAP_POKE" "$IMG" "$((s + ob))" count "$(($2 - s - od))" "$3"
 }
 flags_of() { geom "$1" | field flags; }
 

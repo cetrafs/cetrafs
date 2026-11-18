@@ -25,6 +25,7 @@ require_root
 require_module
 HPOKE="$(ct_helper half_born_poke)"
 BGPOKE="$(ct_helper bg_poke)"
+BMP="$(ct_helper bmap_poke)"
 MNT="$(ct_mnt fhl)"
 ct_track mnt "$MNT"
 ct_param_set scrub 0
@@ -36,7 +37,7 @@ get() { grep -o "$1=[^ ]*" <<<"$2" | head -1 | cut -d= -f2; }
 
 # <tag> <U|N> <off 0|1> -> RES
 round() {
-    local img dev n d0 bm off byte out out2 rc2=0
+    local img dev n d0 bm leakbit out out2 rc2=0
     img="$(ct_image 560 "fhl$1")"
     dev="$(ct_loop "$img")"
     ct_mkfs "$dev" -z 1 -b 512 -J 0 -M 4 -N 1024 -f >/dev/null
@@ -52,8 +53,7 @@ round() {
     fi
     d0="$("$BGPOKE" "$dev" 0 --dump)"
     bm=$(( $(grep -oP 'start_block=\K[0-9]+' <<<"$d0") + $(grep -oP 'off_data_bmap=\K[0-9]+' <<<"$d0") ))
-    off=$((bm * 4096 + LEAKBIT / 8))
-    printf '\x01' | dd of="$img" bs=1 seek="$off" conv=notrunc status=none
+    "$BMP" "$img" "$bm" "$LEAKBIT" 1
     blockdev --flushbufs "$dev"
     if [ "$3" = 1 ]; then
         out="$(CETRAFS_TEST_FSCK_HALF_LANDED_OFF=1 "$ROOT/userspace/fsck.cetra" -r "$dev" 2>&1 || true)"
@@ -61,10 +61,10 @@ round() {
         out="$("$ROOT/userspace/fsck.cetra" -r "$dev" 2>&1 || true)"
     fi
     blockdev --flushbufs "$dev"
-    byte="$(dd if="$img" bs=1 skip="$off" count=1 status=none | od -An -tu1 | tr -d ' ')"
+    leakbit="$("$BMP" "$img" "$bm" "$LEAKBIT")"
     out2="$("$ROOT/userspace/fsck.cetra" "$dev" 2>&1)" || rc2=$?
     RES="landed=$(grep -c 'different generations' <<<"$out" || true) blocked=$(grep -c 'repair is disabled' <<<"$out" || true)"
-    RES="$RES named=$(grep -c "names inode .*different generations" <<<"$out" || true) leakbit=$((byte & 1))"
+    RES="$RES named=$(grep -c "names inode .*different generations" <<<"$out" || true) leakbit=$leakbit"
     RES="$RES rc2=$rc2 again=$(grep -c 'different generations\|leaked\|checksum is wrong' <<<"$out2" || true)"
     if [ -n "${DEBUG_FHL:-}" ]; then printf '%s\n--\n%s\n' "$out" "$out2" >&2; fi
 }

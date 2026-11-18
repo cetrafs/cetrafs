@@ -137,7 +137,7 @@ const cetrafs_superblock_t *cetrafs_sb_raw(struct super_block *sb);
  * segments -- never through the superblock's fields. */
 const struct cetrafs_iseg *cetrafs_sb_isegs(struct super_block *sb, u32 *n);
 u64 cetrafs_sb_inodes(struct super_block *sb);
-u64 cetrafs_ino_bit(struct super_block *sb, u64 ino, u64 *bit);
+u64 cetrafs_ino_bit(struct super_block *sb, u64 ino, u64 *off); /* the bit's block; *off its buffer offset */
 u64 cetrafs_lba_ino(struct super_block *sb, u64 lba);
 bool cetrafs_lba_in_ibmap(struct super_block *sb, u64 lba);
 /* alloc.c: the inode bitmap's blocks across the table's segments. */
@@ -1822,12 +1822,44 @@ int cetrafs_journal_write_deferred(struct super_block *sb, struct buffer_head **
                                    const struct cetrafs_journal_owner *owners, const u32 *disk_crc, unsigned int n,
                                    bool *written, u32 *wcrc);
 
+/* The in-memory birth bitmap's chunk (cetrafs_bg_layout.birth): memory
+ * only, so plain bits with no sector trailers. */
+#define CETRAFS_BIRTH_CHUNK_BITS (CETRAFS_BLOCK_SIZE * 8ULL)
+
+/* alloc.c: bitmap sectors, each with its own CRC (CETRAFS_BMAP_SECTOR). */
+u32 cetrafs_bmap_sector_crc(const void *sector);
+void cetrafs_bmap_restamp(void *image, u64 off);
+bool cetrafs_bmap_sectors_ok(const void *image, u64 first, u64 n);
+struct buffer_head *cetrafs_bmap_bread(struct super_block *sb, u64 lba, u64 lo, u64 hi, int *err);
+u64 cetrafs_bmap_weight(const void *buf, u64 nbits);
+u64 cetrafs_bmap_next(const void *buf, u64 size, u64 off, bool set);
+extern const unsigned long cetrafs_bmap_all_set[CETRAFS_BLOCK_SIZE / sizeof(long)];
+/* A bitmap block's buffer, in bit offsets: the end of its last sector. */
+#define CETRAFS_BMAP_BUF_BITS (CETRAFS_BLOCK_SIZE * 8ULL)
+/* Every set bit of a bitmap block's buffer below bit number 'nbits':
+ * 'off' its buffer offset, 'i' its bit number in the block. */
+#define cetrafs_bmap_for_each_set(buf, off, i, nbits)                                                                  \
+    for ((off) = cetrafs_bmap_next((buf), CETRAFS_BMAP_BUF_BITS, 0, true);                                             \
+         (off) < CETRAFS_BMAP_BUF_BITS && ((i) = cetrafs_bmap_bit(0, (off))) < (nbits);                                 \
+         (off) = cetrafs_bmap_next((buf), CETRAFS_BMAP_BUF_BITS, (off) + 1, true))
+u64 cetrafs_bmap_crc_bad_count(void);
+extern atomic64_t cetrafs_bmap_crc_bad; /* alloc.c; ioutil.c's bitmap reader counts into it */
+bool cetrafs_bmap_block_empty(const void *block);
+
 /* leafdefer.c: a regular file's tree blocks, held back from the device
  * until a boundary and then journaled in one batch. A deferred buffer is
  * NOT dirty -- writeback must never write it -- so it carries its own
  * bit, and every "does this buffer hold a write the device has not seen?"
  * asks cetrafs_bh_pending(). */
 #include <linux/buffer_head.h>
+/* A bitmap block's bits for a walk that must not miss a set one: the
+ * block's, or every bit set when it was too damaged to read (NULL). */
+static inline const void *cetrafs_bmap_bits_or_all(const struct buffer_head *bh)
+{
+    if (bh)
+        return bh->b_data;
+    return cetrafs_bmap_all_set;
+}
 enum { BH_CetraDeferred = BH_PrivateStart, BH_CetraTailStale, BH_CetraHeld, BH_CetraBmap };
 BUFFER_FNS(CetraDeferred, cetra_deferred)
 /* ioutil.c: an allocation-bitmap block modified in cache and HELD from

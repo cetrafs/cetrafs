@@ -198,18 +198,17 @@ log "4: a number whose record was never written"
 fresh
 ct_umount "$MNT"
 SBPOKE="$(ct_helper sb_poke)"
+BMP="$(ct_helper bmap_poke)"
 IBM="$("$SBPOKE" "$DEV" | sed -n 's/^inode_bmap_start=//p')"
 ITS="$("$SBPOKE" "$DEV" | sed -n 's/^inode_table_start=//p')"
 N=9
 # The slot zeros as well: mkfs writes every slot dead since F-12, so a
 # never-written record is now a slot that is not -- damage, or an old one.
-python3 -I - "$IMG" "$IBM" "$N" "$ITS" <<'PY'
+"$BMP" "$IMG" "$IBM" "$((N - 1))" 1
+python3 -I - "$IMG" "$ITS" "$N" <<'PY'
 import os, sys
-img, ibm, ino, its = sys.argv[1], int(sys.argv[2]), int(sys.argv[3]), int(sys.argv[4])
+img, its, ino = sys.argv[1], int(sys.argv[2]), int(sys.argv[3])
 fd = os.open(img, os.O_RDWR)
-off = ibm * 4096 + (ino - 1) // 8
-b = os.pread(fd, 1, off)[0]
-os.pwrite(fd, bytes([b | (1 << ((ino - 1) % 8))]), off)
 os.pwrite(fd, bytes(4096), (its + ino - 1) * 4096)
 os.fsync(fd)
 PY

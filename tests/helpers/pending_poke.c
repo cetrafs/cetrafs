@@ -153,8 +153,8 @@ int main(int argc, char **argv)
 
             pread_all(ents, sizeof(ents), off);
             for (unsigned e = 0; e < per_block; e++) {
-                if (ents[e].lba)
-                    continue;
+                if (ents[e].lba || !cetrafs_pf_slot_is_entry(e))
+                    continue; /* taken, or a sector's trailer (never an entry) */
                 ents[e].lba = cetrafs_cpu_to_le64(lba);
                 ents[e].count = cetrafs_cpu_to_le32(count);
                 ents[e].magic = cetrafs_cpu_to_le32(CETRAFS_PENDING_FREE_MAGIC);

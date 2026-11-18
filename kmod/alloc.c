@@ -69,6 +69,70 @@ static bool cetrafs_noop_free_dirties;
 cetrafs_test_param(noop_free_dirties, cetrafs_noop_free_dirties, bool, 0644);
 MODULE_PARM_DESC(noop_free_dirties, "TEST ONLY: a no-op free dirties the bitmap and a hand-back keeps it dirty");
 
+/* ---- bitmap sectors: each carries its own CRC (CETRAFS_BMAP_SECTOR) ---- */
+
+atomic64_t cetrafs_bmap_crc_bad = ATOMIC64_INIT(0);
+
+
+u64 cetrafs_bmap_crc_bad_count(void)
+{
+    return (u64) atomic64_read(&cetrafs_bmap_crc_bad);
+}
+
+u32 cetrafs_bmap_sector_crc(const void *sector)
+{
+    return ~crc32c(~0U, sector, CETRAFS_BMAP_CRC_LEN);
+}
+
+/* Restamp the sector of 'image' that holds bit offset 'off' -- after
+ * every change to it, in the same buffer-lock bracket (or CAS image) as
+ * the change, so no reader can see the two disagree. One 512-byte CRC
+ * per allocated block (PERFORMANCE.md rule 1). */
+void cetrafs_bmap_restamp(void *image, u64 off)
+{
+    const u64 i = off / (CETRAFS_BMAP_SECTOR * 8ULL);
+
+    cetrafs_bmap_trailer(image, i)->crc =
+        cpu_to_le32(cetrafs_bmap_sector_crc((const u8 *) image + i * CETRAFS_BMAP_SECTOR));
+}
+
+/* Sectors [first, first + n) of 'image' all carry their own CRC. */
+bool cetrafs_bmap_sectors_ok(const void *image, u64 first, u64 n)
+{
+    u64 i;
+
+    for (i = first; i < first + n; i++)
+        if (le32_to_cpu(cetrafs_bmap_trailer((void *) image, i)->crc) !=
+            cetrafs_bmap_sector_crc((const u8 *) image + i * CETRAFS_BMAP_SECTOR))
+            return false;
+    return true;
+}
+
+/* A bitmap block with no bit set, every sector carrying its CRC: what
+ * mkfs and growfs lay down. */
+bool cetrafs_bmap_block_empty(const void *block)
+{
+    u64 i;
+
+    for (i = 0; i < CETRAFS_BMAP_SECTORS; i++)
+        if (memchr_inv((const u8 *) block + i * CETRAFS_BMAP_SECTOR, 0, CETRAFS_BMAP_CRC_LEN))
+            return false;
+    return cetrafs_bmap_sectors_ok(block, 0, CETRAFS_BMAP_SECTORS);
+}
+
+/* The CAS image of an inode-bitmap unit: refuse to decide anything from
+ * a damaged one. A unit is whole sectors, written in one swap, so a
+ * mismatch is damage, not a tear. */
+static int cetrafs_bmap_image_check(const void *image, unsigned int len, u64 lba)
+{
+    if (cetrafs_bmap_sectors_ok(image, 0, len / CETRAFS_BMAP_SECTOR))
+        return 0;
+    atomic64_inc(&cetrafs_bmap_crc_bad);
+    pr_err_ratelimited("inode bitmap block %llu: a sector fails its checksum -- the unit is not used\n",
+                       (unsigned long long) lba);
+    return -EUCLEAN;
+}
+
 /* Every data-bitmap update ends here: held from writeback until a gated
  * flush (cetrafs_bh_end_update_held(), audit 2026-11-14 A-15), and left
  * clean when it changed nothing (A-3). */
@@ -81,6 +145,187 @@ static void cetrafs_bmap_end_update(struct super_block *sb, struct buffer_head *
     set_buffer_cetra_bmap(bh);
     cetrafs_bh_end_update_held(sb, bh, changed);
 }
+/* The first bit offset at or after 'off' in a bitmap buffer of 'size'
+ * bit offsets (whole sectors) whose bit is 'set', the trailers skipped;
+ * 'size' if none. */
+u64 cetrafs_bmap_next(const void *buf, u64 size, u64 off, bool set)
+{
+    const u64 sbits = CETRAFS_BMAP_SECTOR * 8ULL;
+
+    while (off < size) {
+        const u64 start = off / sbits * sbits, end = start + CETRAFS_BMAP_SECTOR_BITS;
+
+        if (off < end) {
+            u64 r = set ? find_next_bit_le(buf, end, off) : find_next_zero_bit_le(buf, end, off);
+
+            if (r < end)
+                return r;
+        }
+        off = start + sbits;
+    }
+    return size;
+}
+
+/* A bitmap block with every bit set: what a walk that must not miss a
+ * set bit reads in place of a damaged block -- it visits every number,
+ * and judges each one's record itself. */
+const unsigned long cetrafs_bmap_all_set[CETRAFS_BLOCK_SIZE / sizeof(long)] = {
+    [0 ... CETRAFS_BLOCK_SIZE / sizeof(long) - 1] = ~0UL};
+
+/* Restamp every sector of a bitmap block named in 'touched' (bit i:
+ * sector i): for an update that changes several bits under one hold. */
+static void cetrafs_bmap_restamp_touched(void *buf, unsigned long touched)
+{
+    unsigned long i;
+
+    for_each_set_bit(i, &touched, CETRAFS_BMAP_SECTORS)
+        cetrafs_bmap_restamp(buf, i * CETRAFS_BMAP_SECTOR * 8ULL);
+}
+
+/* Set or clear the bit at buffer offset 'off', and restamp its sector:
+ * every in-place bitmap change, under the buffer lock. */
+static void cetrafs_bmap_change(struct super_block *sb, struct buffer_head *bh, u64 off, bool set)
+{
+    cetrafs_bh_begin_update(bh);
+    if (set)
+        __set_bit_le(off, bh->b_data);
+    else
+        __clear_bit_le(off, bh->b_data);
+    cetrafs_bmap_restamp(bh->b_data, off);
+    cetrafs_bmap_end_update(sb, bh, true);
+}
+
+/*
+ * One bitmap block held for update while a loop changes several of its
+ * bits: one lookup and one buffer-lock hold per block, not per bit
+ * (audit 2026-11-14 P2). The sectors it changed are restamped, and the
+ * block left clean if it changed none (A-3), when the hold moves to
+ * another block or ends -- which every holder does before it sleeps on
+ * I/O or lets alloc_mutex go.
+ */
+struct cetrafs_bmap_hold {
+    struct buffer_head *bh;
+    u64 blk;
+    unsigned long touched; /* bit i: sector i changed */
+};
+
+static void cetrafs_bmap_hold_end(struct super_block *sb, struct cetrafs_bmap_hold *h)
+{
+    if (!h->bh)
+        return;
+    cetrafs_bmap_restamp_touched(h->bh->b_data, h->touched);
+    cetrafs_bmap_end_update(sb, h->bh, h->touched != 0);
+    brelse(h->bh);
+    h->bh = NULL;
+}
+
+/* Hold the block of the bitmap at 'bmap_lba' (nblocks long) that has bit
+ * 'bit', ending a hold on any other; *off is the bit's buffer offset.
+ * *looked_up is incremented when a block had to be read. */
+static int cetrafs_bmap_hold_at(struct super_block *sb, struct cetrafs_bmap_hold *h, u64 bmap_lba, u64 nblocks,
+                                u64 bit, u64 *off, atomic64_t *looked_up)
+{
+    const u64 blk = cetrafs_bmap_blk(bit);
+    int err;
+
+    *off = cetrafs_bmap_off(bit);
+    if (h->bh && h->blk == blk)
+        return 0;
+    cetrafs_bmap_hold_end(sb, h);
+    if (blk >= nblocks)
+        return -EINVAL;
+    h->bh = cetrafs_bmap_bread(sb, bmap_lba + blk, 0, CETRAFS_BMAP_BUF_BITS, &err);
+    if (!h->bh)
+        return err;
+    if (looked_up)
+        atomic64_inc(looked_up);
+    cetrafs_bh_begin_update(h->bh); /* held: cetrafs_bmap_hold_end() ends it */
+    h->blk = blk;
+    h->touched = 0;
+    return 0;
+}
+
+/* Change the held bit at buffer offset 'off' to 'set'; false if it
+ * already was. */
+static bool cetrafs_bmap_hold_flip(struct cetrafs_bmap_hold *h, u64 off, bool set)
+{
+    if (test_bit_le(off, h->bh->b_data) == set)
+        return false;
+    if (set)
+        __set_bit_le(off, h->bh->b_data);
+    else
+        __clear_bit_le(off, h->bh->b_data);
+    __set_bit(off / (CETRAFS_BMAP_SECTOR * 8ULL), &h->touched);
+    return true;
+}
+
+/*
+ * The first run of at least 'minlen' free bits at or after 'from', and
+ * its whole length: a run is counted to its real end, in bit numbers, so
+ * it carries across sector and block boundaries and a long run is never
+ * mistaken for a short one. Returns 0 with the run, -ENOSPC if there is
+ * none, or the read's error. Word-wise through find_next_bit: a 1 GiB
+ * Block Group is 32 KiB of bitmap.
+ */
+static int cetrafs_bitmap_find_run(struct super_block *sb, u64 bmap_lba, u64 nblocks, u64 nbits, u64 from,
+                                   u64 minlen, u64 *out_start, u64 *out_len)
+{
+    u64 blk = cetrafs_bmap_blk(from), off = cetrafs_bmap_off(from), run_start = 0;
+    bool in_run = false;
+
+    for (; blk < nblocks && blk * CETRAFS_BMAP_BLOCK_BITS < nbits; blk++, off = 0) {
+        struct buffer_head *bh;
+        int err;
+
+        /* A whole-bitmap walk, under alloc_mutex: on a large Block
+         * Group that is seconds of CPU per pass (audit R18). */
+        cond_resched();
+        bh = cetrafs_bmap_bread(sb, bmap_lba + blk, off, CETRAFS_BMAP_BUF_BITS, &err);
+        if (!bh && err == -EUCLEAN) {
+            in_run = false; /* damaged: no run is found in it, nor across it */
+            continue;
+        }
+        if (!bh)
+            return err;
+        for (;;) {
+            u64 end, stop;
+
+            if (!in_run) {
+                off = cetrafs_bmap_next(bh->b_data, CETRAFS_BMAP_BUF_BITS, off, false);
+                if (off >= CETRAFS_BMAP_BUF_BITS)
+                    break; /* no free bit left in this block */
+                run_start = cetrafs_bmap_bit(blk, off);
+                if (run_start >= nbits) {
+                    brelse(bh);
+                    return -ENOSPC;
+                }
+                in_run = true;
+            }
+            /* The run ends at the next set bit or the bitmap's tail;
+             * free to the end of the block, it runs on into the next. */
+            end = cetrafs_bmap_next(bh->b_data, CETRAFS_BMAP_BUF_BITS, off, true);
+            stop = min(end < CETRAFS_BMAP_BUF_BITS ? cetrafs_bmap_bit(blk, end) : (blk + 1) * CETRAFS_BMAP_BLOCK_BITS,
+                       nbits);
+            if (end >= CETRAFS_BMAP_BUF_BITS && stop < nbits)
+                break;
+            if (stop - run_start >= minlen) {
+                brelse(bh);
+                *out_start = run_start;
+                *out_len = stop - run_start;
+                return 0;
+            }
+            in_run = false;
+            if (stop >= nbits) {
+                brelse(bh);
+                return -ENOSPC;
+            }
+            off = end;
+        }
+        brelse(bh);
+    }
+    return -ENOSPC;
+}
+
 /*
  * 'sync' matters: the global inode bitmap is shared cross-node (the
  * cluster mutex is the only thing closing that race, see
@@ -102,53 +347,34 @@ static long cetrafs_bitmap_alloc_bit(struct super_block *sb, u64 bmap_lba, u64 n
 {
     u64 blk;
 
-    for (blk = 0; blk < nblocks; blk++) {
+    for (blk = 0; blk < nblocks && blk * CETRAFS_BMAP_BLOCK_BITS < nbits; blk++) {
         struct buffer_head *bh;
+        u64 off, idx;
+        int err;
 
         /* A whole-bitmap walk, under alloc_mutex: on a large Block
          * Group that is seconds of CPU per pass (audit R18). */
         cond_resched();
-        bh = cetrafs_bread_retry(sb, bmap_lba + blk);
-        unsigned int byte;
-
+        bh = cetrafs_bmap_bread(sb, bmap_lba + blk, 0, CETRAFS_BMAP_BUF_BITS, &err);
+        if (!bh && err == -EUCLEAN)
+            continue; /* damaged: a bit it calls free may not be -- never handed out */
         if (!bh)
-            return -EIO;
-
-        for (byte = 0; byte < CETRAFS_BLOCK_SIZE; byte++) {
-            u8 *b = (u8 *) bh->b_data + byte;
-            unsigned int bit;
-
-            if (*b == 0xFF)
-                continue; /* fully used byte */
-
-            for (bit = 0; bit < 8; bit++) {
-                u64 idx = blk * CETRAFS_BITS_PER_BLOCK + byte * 8 + bit;
-
-                if (idx >= nbits) {
-                    brelse(bh); /* the bottom-of-loop release is skipped */
-                    goto out_full;
-                }
-
-                if (!(*b & (1u << bit))) {
-                    /* Buffer lock across the modification -- see
-                     * cetrafs_bitmap_free_bit(). Note sync_dirty_buffer()
-                     * takes the lock itself, so it must come after
-                     * end_update(), never inside the region. */
-                    cetrafs_bh_begin_update(bh);
-                    *b |= (u8) (1u << bit);
-                    cetrafs_bmap_end_update(sb, bh, true);
-                    if (sync) /* no caller passes true today */
-                        (void) cetrafs_sync_buffer(sb, bh);
-                    brelse(bh);
-                    return (long) idx;
-                }
-            }
+            return err;
+        off = cetrafs_bmap_next(bh->b_data, CETRAFS_BMAP_BUF_BITS, 0, false);
+        idx = off < CETRAFS_BMAP_BUF_BITS ? cetrafs_bmap_bit(blk, off) : nbits;
+        if (idx < nbits) {
+            /* Buffer lock across the modification -- see
+             * cetrafs_bitmap_free_bit(). Note sync_dirty_buffer() takes
+             * the lock itself, so it must come after the update, never
+             * inside it. */
+            cetrafs_bmap_change(sb, bh, off, true);
+            if (sync) /* no caller passes true today */
+                (void) cetrafs_sync_buffer(sb, bh);
+            brelse(bh);
+            return (long) idx;
         }
-
         brelse(bh);
     }
-
-out_full:
     return -ENOSPC;
 }
 
@@ -166,8 +392,8 @@ out_full:
  *
  * Returns the bit index, -ENOSPC if no run of that length exists (the
  * caller retries with a smaller target), -EIO on read failure. The scan
- * is the same O(bits) walk alloc_bit does; run lengths are counted
- * across block boundaries via 'run' carrying over.
+ * is the same O(bits) walk alloc_bit does; a run is counted in bit
+ * numbers, so it carries across sector and block boundaries.
  */
 static int cetrafs_bitmap_try_alloc_exact(struct super_block *sb,
                                           u64 bmap_lba,
@@ -184,114 +410,45 @@ static long cetrafs_bitmap_alloc_run_start(struct super_block *sb,
                                            u64 run_min,
                                            bool sync)
 {
-    u64 blk, run = 0, run_start = 0;
+    u64 start, len;
+    int err;
 
     if (run_min <= 1)
         return cetrafs_bitmap_alloc_bit(sb, bmap_lba, nblocks, nbits, sync);
-
-    for (blk = 0; blk < nblocks; blk++) {
-        struct buffer_head *bh;
-
-        /* A whole-bitmap walk, under alloc_mutex: on a large Block
-         * Group that is seconds of CPU per pass (audit R18). */
-        cond_resched();
-        bh = cetrafs_bread_retry(sb, bmap_lba + blk);
-        unsigned int byte;
-
-        if (!bh)
-            return -EIO;
-
-        for (byte = 0; byte < CETRAFS_BLOCK_SIZE; byte++) {
-            const u8 *b = (const u8 *) bh->b_data + byte;
-            unsigned int bit;
-
-            if (*b == 0xFF) {
-                run = 0;
-                continue;
-            }
-            if (*b == 0x00 && run && (blk * CETRAFS_BITS_PER_BLOCK + byte * 8 + 8) <= nbits) {
-                /* whole byte free mid-run: fast-forward */
-                run += 8;
-                if (run >= run_min)
-                    goto found;
-                continue;
-            }
-
-            for (bit = 0; bit < 8; bit++) {
-                u64 idx = blk * CETRAFS_BITS_PER_BLOCK + byte * 8 + bit;
-
-                if (idx >= nbits) {
-                    brelse(bh);
-                    goto out_nospc;
-                }
-
-                if (*b & (1u << bit)) {
-                    run = 0;
-                } else {
-                    if (run == 0)
-                        run_start = idx;
-                    run++;
-                    if (run >= run_min)
-                        goto found;
-                }
-            }
-        }
-
-        brelse(bh);
-        continue;
-
-    found:
-        brelse(bh);
-        /* Allocate the run's FIRST bit via the exact-claim helper (it
-         * re-reads the bit's own block; the run's head can't have been
-         * taken meanwhile -- callers hold the node-local alloc mutex,
-         * and this node is the BG's only allocator). */
-        {
-            int rc = cetrafs_bitmap_try_alloc_exact(sb, bmap_lba, nblocks, nbits, run_start, sync);
-
-            if (rc == 0)
-                return (long) run_start;
-            /* Propagate the real reason. Collapsing everything to
-             * -ENOSPC here made a device read error during allocation
-             * surface to userspace as "no space left" on a filesystem
-             * with gigabytes free -- a diagnosis that sends whoever hits
-             * it looking in entirely the wrong place. Only -ENOSPC means
-             * no space. */
-            return rc;
-        }
-    }
-
-out_nospc:
-    return -ENOSPC;
+    err = cetrafs_bitmap_find_run(sb, bmap_lba, nblocks, nbits, 0, run_min, &start, &len);
+    /* Allocate the run's FIRST bit via the exact-claim helper (it
+     * re-reads the bit's own block; the run's head can't have been taken
+     * meanwhile -- callers hold the node-local alloc mutex, and this node
+     * is the BG's only allocator). Its error is the real reason:
+     * collapsing everything to -ENOSPC once made a device read error
+     * read as "no space left" with gigabytes free. */
+    if (!err)
+        err = cetrafs_bitmap_try_alloc_exact(sb, bmap_lba, nblocks, nbits, start, sync);
+    return err ? err : (long) start;
 }
 
 /* Clear bit 'bit' in the same kind of bitmap described above. Same
  * 'sync' reasoning as cetrafs_bitmap_alloc_bit() above. */
 static int cetrafs_bitmap_free_bit(struct super_block *sb, u64 bmap_lba, u64 nblocks, u64 bit, bool sync)
 {
-    u64 blk = bit / CETRAFS_BITS_PER_BLOCK;
-    u32 bit_in_block = bit % CETRAFS_BITS_PER_BLOCK;
-    u32 byte = bit_in_block / 8;
-    u32 bit_in_byte = bit_in_block % 8;
+    const u64 blk = cetrafs_bmap_blk(bit), off = cetrafs_bmap_off(bit);
     struct buffer_head *bh;
+    int err;
 
     if (blk >= nblocks)
         return -EINVAL;
 
-    bh = cetrafs_bread_retry(sb, bmap_lba + blk);
+    bh = cetrafs_bmap_bread(sb, bmap_lba + blk, off, off + 1, &err);
     if (!bh)
-        return -EIO;
+        return err;
 
     /* Buffer lock across the modification, same protocol as every
      * other in-place update: without it a forced-fresh reader can clear
-     * uptodate between the byte write and the mark-dirty and re-read the
-     * old byte straight over it, losing the bit. A bitmap block has no
-     * checksum, so there is no torn-image half of the hazard here -- but
-     * the lost-update half is the same one that cost 12 of 292 directory
-     * entries. */
-    cetrafs_bh_begin_update(bh);
-    *((u8 *) bh->b_data + byte) &= (u8) ~(1u << bit_in_byte);
-    cetrafs_bmap_end_update(sb, bh, true);
+     * uptodate between the bit write and the mark-dirty and re-read the
+     * old sector straight over it, losing the bit -- the lost-update
+     * half of the hazard that cost 12 of 292 directory entries. The
+     * sector's checksum is restamped inside the same bracket. */
+    cetrafs_bmap_change(sb, bh, off, false);
     if (sync) /* no caller passes true today */
         (void) cetrafs_sync_buffer(sb, bh);
     brelse(bh);
@@ -315,34 +472,51 @@ static int cetrafs_bitmap_try_alloc_exact(struct super_block *sb,
                                           u64 bit,
                                           bool sync)
 {
-    u64 blk = bit / CETRAFS_BITS_PER_BLOCK;
-    u32 bit_in_block = bit % CETRAFS_BITS_PER_BLOCK;
-    u32 byte = bit_in_block / 8;
-    u32 bit_in_byte = bit_in_block % 8;
+    const u64 blk = cetrafs_bmap_blk(bit), off = cetrafs_bmap_off(bit);
     struct buffer_head *bh;
-    u8 *b;
+    int err;
 
     if (bit >= nbits || blk >= nblocks)
         return -ENOSPC;
 
-    bh = cetrafs_bread_retry(sb, bmap_lba + blk);
+    bh = cetrafs_bmap_bread(sb, bmap_lba + blk, off, off + 1, &err);
     if (!bh)
-        return -EIO;
+        return err;
 
-    b = (u8 *) bh->b_data + byte;
-    if (*b & (1u << bit_in_byte)) {
+    if (test_bit_le(off, bh->b_data)) {
         brelse(bh);
         return -ENOSPC; /* already taken -- caller falls back to first-fit */
     }
-
-    cetrafs_bh_begin_update(bh);
-    *b |= (u8) (1u << bit_in_byte);
-    cetrafs_bmap_end_update(sb, bh, true);
+    cetrafs_bmap_change(sb, bh, off, true);
     if (sync) /* no caller passes true today */
         (void) cetrafs_sync_buffer(sb, bh);
     brelse(bh);
 
     return 0;
+}
+
+/* The set bits among the first 'nbits' bits of a bitmap block's buffer,
+ * word-wise: a 64-bit population count per word, not a test per bit
+ * (audit 2026-11-14 P3). The bitmap is little-endian bit order -- bit i
+ * is bit i%8 of byte i/8 -- which is bit i of the little-endian 64-bit
+ * word, on any host; a sector's bits are a whole number of words. */
+u64 cetrafs_bmap_weight(const void *buf, u64 nbits)
+{
+    u64 used = 0, i;
+
+    BUILD_BUG_ON(CETRAFS_BMAP_SECTOR_BITS % 64);
+    for (i = 0; nbits; i++) {
+        const __le64 *w = (const __le64 *) ((const u8 *) buf + i * CETRAFS_BMAP_SECTOR);
+        const u64 m = min_t(u64, nbits, CETRAFS_BMAP_SECTOR_BITS);
+        u64 k;
+
+        for (k = 0; k < m / 64; k++)
+            used += hweight64(le64_to_cpu(w[k]));
+        for (k = m / 64 * 64; k < m; k++)
+            used += test_bit_le(i * CETRAFS_BMAP_SECTOR * 8ULL + k, buf);
+        nbits -= m;
+    }
+    return used;
 }
 
 /*
@@ -356,29 +530,20 @@ static long cetrafs_bitmap_count_free(struct super_block *sb, u64 bmap_lba, u64 
     u64 blk;
     u64 free = 0;
 
-    for (blk = 0; blk < nblocks && blk * CETRAFS_BITS_PER_BLOCK < nbits; blk++) {
+    for (blk = 0; blk < nblocks && blk * CETRAFS_BMAP_BLOCK_BITS < nbits; blk++) {
+        const u64 nb = min_t(u64, CETRAFS_BMAP_BLOCK_BITS, nbits - blk * CETRAFS_BMAP_BLOCK_BITS);
         struct buffer_head *bh;
-        unsigned int nb, i, used = 0;
-        const __le64 *w;
+        int err;
 
         /* A whole-bitmap walk, under alloc_mutex: on a large Block
          * Group that is seconds of CPU per pass (audit R18). */
         cond_resched();
-        bh = cetrafs_bread_retry(sb, bmap_lba + blk);
+        bh = cetrafs_bmap_bread(sb, bmap_lba + blk, 0, cetrafs_bmap_off(nb - 1) + 1, &err);
+        if (!bh && err == -EUCLEAN)
+            continue; /* damaged: nothing in it is handed out, so none of it counts as free */
         if (!bh)
-            return -EIO;
-        /* Word-wise: a 64-bit population count per word, not a test per
-         * bit (audit 2026-11-14 P3). The bitmap is little-endian bit
-         * order -- bit i is bit i%8 of byte i/8 -- which is bit i of the
-         * little-endian 64-bit word, on any host. */
-        nb = (unsigned int) min_t(u64, CETRAFS_BITS_PER_BLOCK, nbits - blk * CETRAFS_BITS_PER_BLOCK);
-        w = (const __le64 *) bh->b_data;
-        for (i = 0; i < nb / 64; i++)
-            used += hweight64(le64_to_cpu(w[i]));
-        for (i = (nb / 64) * 64; i < nb; i++)
-            if (((const u8 *) bh->b_data)[i / 8] & (1u << (i % 8)))
-                used++;
-        free += nb - used;
+            return err;
+        free += nb - cetrafs_bmap_weight(bh->b_data, nb);
         brelse(bh);
     }
 
@@ -416,6 +581,7 @@ static long cetrafs_bitmap_count_free(struct super_block *sb, u64 bmap_lba, u64 
  * claims the bit.
  */
 struct cetrafs_bmap_cas_ctx {
+    u64 lba;        /* the unit's block, for the damage report */
     u64 valid_bits; /* bits of this region that are inside the bitmap's real extent */
     u64 bit;        /* in: bit to clear (free); out: bit claimed (alloc), relative to the region */
     bool alloc;
@@ -431,34 +597,48 @@ struct cetrafs_bmap_cas_ctx {
     bool cleared;
 };
 
+/* The bits a CAS unit of 'len' bytes holds: whole sectors, each less its
+ * trailer. */
+static u64 cetrafs_bmap_unit_bits(u64 len)
+{
+    return len / CETRAFS_BMAP_SECTOR * CETRAFS_BMAP_SECTOR_BITS;
+}
+
 static int cetrafs_bmap_cas_mutate(void *image, unsigned int len, void *priv)
 {
     struct cetrafs_bmap_cas_ctx *ctx = priv;
-    u8 *bytes = image;
-    u64 limit = min_t(u64, ctx->valid_bits, (u64) len * 8);
-
-    if (ctx->alloc) {
-        u64 b;
-
-        for (b = 0; b < limit; b++) {
-            if (!(bytes[b >> 3] & (1u << (b & 7)))) {
-                bytes[b >> 3] |= (u8) (1u << (b & 7));
-                ctx->bit = b;
-                return 0;
-            }
-        }
-        return -ENOSPC; /* this region is full -- caller moves to the next */
-    }
+    const u64 limit = min_t(u64, ctx->valid_bits, cetrafs_bmap_unit_bits(len));
+    u64 off;
+    int rc;
 
     /* Reset per attempt: a lost CAS re-runs this on a fresh image, and
      * what the caller may act on is only what the WINNING run did. */
     ctx->cleared = false;
+    rc = cetrafs_bmap_image_check(image, len, ctx->lba);
+    if (rc)
+        return rc;
+    if (ctx->alloc) {
+        u64 b;
+
+        /* A unit is at most one block, so its bits map as a block's do. */
+        off = cetrafs_bmap_next(image, (u64) len * 8, 0, false);
+        b = off < (u64) len * 8 ? cetrafs_bmap_bit(0, off) : limit;
+        if (b >= limit)
+            return -ENOSPC; /* this region is full -- caller moves to the next */
+        __set_bit_le(off, image);
+        cetrafs_bmap_restamp(image, off);
+        ctx->bit = b;
+        return 0;
+    }
+
     if (ctx->bit >= limit)
         return -EINVAL;
-    if (!(bytes[ctx->bit >> 3] & (1u << (ctx->bit & 7))))
+    off = cetrafs_bmap_off(ctx->bit);
+    if (!test_bit_le(off, image))
         return 1; /* already free -- flattened to success by the CAS layer;
                    * the caller must read ctx->cleared, not this */
-    bytes[ctx->bit >> 3] &= (u8) ~(1u << (ctx->bit & 7));
+    __clear_bit_le(off, image);
+    cetrafs_bmap_restamp(image, off);
     ctx->cleared = true;
     return 0;
 }
@@ -547,7 +727,7 @@ struct cetrafs_ibmap_unit {
 static bool cetrafs_ibmap_unit(const struct cetrafs_iseg *s, u32 n, unsigned int region, u64 idx,
                                struct cetrafs_ibmap_unit *u, u64 *count)
 {
-    const u64 rbits = (u64) region * 8, per_block = CETRAFS_BLOCK_SIZE / region;
+    const u64 rbits = cetrafs_bmap_unit_bits(region), per_block = CETRAFS_BLOCK_SIZE / region;
     u64 total = 0;
     u32 i;
 
@@ -575,7 +755,7 @@ static bool cetrafs_ibmap_unit_of(const struct cetrafs_iseg *s, u32 n, unsigned 
                                   struct cetrafs_ibmap_unit *u, u64 *bit)
 {
     const struct cetrafs_iseg *g = cetrafs_iseg_find(s, n, ino);
-    const u64 rbits = (u64) region * 8;
+    const u64 rbits = cetrafs_bmap_unit_bits(region);
     u64 k;
 
     if (!g)
@@ -600,8 +780,8 @@ bool cetrafs_ibmap_block(struct super_block *sb, u64 k, u64 *lba, u64 *first, u6
 
         if (k < nb) {
             *lba = s[i].bmap + k;
-            *first = s[i].first + k * CETRAFS_BITS_PER_BLOCK;
-            *nbits = min_t(u64, CETRAFS_BITS_PER_BLOCK, s[i].count - k * CETRAFS_BITS_PER_BLOCK);
+            *first = s[i].first + k * CETRAFS_BMAP_BLOCK_BITS;
+            *nbits = min_t(u64, CETRAFS_BMAP_BLOCK_BITS, s[i].count - k * CETRAFS_BMAP_BLOCK_BITS);
             return true;
         }
         k -= nb;
@@ -668,6 +848,7 @@ static long cetrafs_inode_bitmap_cas_alloc(struct super_block *sb)
             if (!cetrafs_ibmap_unit(seg, nseg, region, idx, &u, NULL))
                 return -EIO; /* counted above from the same list */
             ctx.valid_bits = u.bits;
+            ctx.lba = u.lba;
 
         again:
             if (idx < 64 && (READ_ONCE(cetrafs_ibmap_busy_regions) & (1ULL << idx)))
@@ -701,8 +882,8 @@ static long cetrafs_inode_bitmap_cas_alloc(struct super_block *sb)
             }
             if (ret == 0)
                 return (long) (u.first_ino + ctx.bit - 1);
-            if (ret == -ENOSPC)
-                continue; /* region full */
+            if (ret == -ENOSPC || ret == -EUCLEAN)
+                continue; /* region full, or damaged (never handed out) */
             if (ret == -EBUSY && spread) {
                 /* Lost 16 swaps in a row: peers are creating here. */
                 atomic64_inc(&cetrafs_ibmap_busy_skips);
@@ -731,6 +912,7 @@ static int cetrafs_inode_bitmap_cas_free(struct super_block *sb, u64 ino)
     if (!seg || !cetrafs_ibmap_unit_of(seg, nseg, cetrafs_cas_region_size(sb), ino, &u, &ctx.bit))
         return -EINVAL;
     ctx.valid_bits = u.bits;
+    ctx.lba = u.lba;
 
     ret = cetrafs_cas_region(sb, u.lba, u.r, cetrafs_bmap_cas_mutate, &ctx);
     /* The CAS layer maps the mutate's "already free" (>0) to success, so
@@ -1600,7 +1782,7 @@ static bool cetrafs_bg_geom_sane(const cetrafs_superblock_t *raw_sb, u32 bg_id, 
     return cetrafs_le32(bg->bg_id) == bg_id && start >= regions && len && len <= CETRAFS_MAX_BG_SIZE_BLOCKS &&
            len <= data_end - regions &&
            start <= data_end - len && bmap >= 1 && bmap < region && region <= len && count <= len - region &&
-           count <= (region - bmap) * CETRAFS_BLOCK_SIZE * 8;
+           count <= (region - bmap) * CETRAFS_BMAP_BLOCK_BITS;
 }
 
 /*
@@ -2648,39 +2830,19 @@ u32 cetrafs_alloc_run_after(struct super_block *sb, u32 bg_id, u64 start_lba, u3
          * (audit 2026-11-14 P2). The test and the set are under the
          * buffer lock, as cetrafs_bitmap_try_alloc_exact()'s set is;
          * nothing here sleeps on I/O while it is held. */
-        struct buffer_head *bh = NULL;
-        u64 held = 0;
+        struct cetrafs_bmap_hold h = {0};
 
         while (got < max && first_bit + got < bg.data_block_count) {
-            u64 bit = first_bit + got, blk = bit / CETRAFS_BITS_PER_BLOCK;
-            u32 in = (u32) (bit % CETRAFS_BITS_PER_BLOCK);
-            u8 *byte;
+            u64 off;
 
-            if (bh && held != blk) {
-                cetrafs_bmap_end_update(sb, bh, true);
-                brelse(bh);
-                bh = NULL;
-            }
-            if (!bh) {
-                if (blk >= bmap_blocks)
-                    break;
-                bh = cetrafs_bread_retry(sb, bmap_lba + blk);
-                if (!bh)
-                    break; /* best effort: what was claimed stands */
-                atomic64_inc(&cetrafs_run_claim_bmap_lookups);
-                cetrafs_bh_begin_update(bh);
-                held = blk;
-            }
-            byte = (u8 *) bh->b_data + in / 8;
-            if (*byte & (1u << (in % 8)))
+            if (cetrafs_bmap_hold_at(sb, &h, bmap_lba, bmap_blocks, first_bit + got, &off,
+                                     &cetrafs_run_claim_bmap_lookups))
+                break; /* best effort: what was claimed stands */
+            if (!cetrafs_bmap_hold_flip(&h, off, true))
                 break;
-            *byte |= (u8) (1u << (in % 8));
             got++;
         }
-        if (bh) {
-            cetrafs_bmap_end_update(sb, bh, true);
-            brelse(bh);
-        }
+        cetrafs_bmap_hold_end(sb, &h);
     }
     if (got) {
         cetrafs_bg_adjust_free_blocks(sb, bg_id, -(s64) got);
@@ -2856,17 +3018,19 @@ void cetrafs_shadow_seed(struct super_block *sb)
 
         if (cetrafs_read_bg_geom(sb, bg_id, &bg))
             continue;
-        for (blk = 0; blk < bg.off_data_region - bg.off_data_bmap; blk++) {
+        for (blk = 0; blk < bg.off_data_region - bg.off_data_bmap && bit < bg.data_block_count; blk++) {
+            const u64 nb = min_t(u64, CETRAFS_BMAP_BLOCK_BITS, bg.data_block_count - bit);
             struct buffer_head *bh;
-            u64 i;
+            u64 off, i;
+            int err;
 
             cond_resched();
-            bh = cetrafs_bread_retry(sb, bg.start_block + bg.off_data_bmap + blk);
+            bh = cetrafs_bmap_bread(sb, bg.start_block + bg.off_data_bmap + blk, 0, CETRAFS_BMAP_BUF_BITS, &err);
             if (!bh)
                 break;
-            for (i = 0; i < CETRAFS_BLOCK_SIZE * 8 && bit < bg.data_block_count; i++, bit++)
-                if (bh->b_data[i >> 3] & (1 << (i & 7)))
-                    cetrafs_shadow_set(sb, bg.start_block + bg.off_data_region + bit, 1, "seed");
+            cetrafs_bmap_for_each_set(bh->b_data, off, i, nb)
+                cetrafs_shadow_set(sb, bg.start_block + bg.off_data_region + bit + i, 1, "seed");
+            bit += nb;
             brelse(bh);
         }
     }
@@ -3048,29 +3212,31 @@ int cetrafs_bg_owner_zg_for_lba(struct super_block *sb, u64 lba, u32 *out_zg_id)
     return 0;
 }
 
-/* Is bit #bit of the same kind of bitmap currently set? */
-static int cetrafs_bitmap_test_bit(struct super_block *sb, u64 bmap_lba, u64 nblocks, u64 bit, bool *out_set)
+/* Is the bit at buffer offset 'off' of bitmap block 'lba' set? */
+static int cetrafs_bmap_test_off(struct super_block *sb, u64 lba, u64 off, bool *out_set)
 {
-    u64 blk = bit / CETRAFS_BITS_PER_BLOCK;
-    u32 bit_in_block = bit % CETRAFS_BITS_PER_BLOCK;
-    u32 byte = bit_in_block / 8;
-    u32 bit_in_byte = bit_in_block % 8;
     struct buffer_head *bh;
-
-    if (blk >= nblocks)
-        return -EINVAL;
+    int err;
 
     /* Retrying: cetrafs_inode_is_allocated_fresh() drops this block
      * before every read, and with several creators doing that at once a
      * plain sb_bread() racing another's drop comes back NULL -- a
      * spurious -EIO (see cetrafs_bread_retry()). */
-    bh = cetrafs_bread_retry(sb, bmap_lba + blk);
+    bh = cetrafs_bmap_bread(sb, lba, off, off + 1, &err);
     if (!bh)
-        return -EIO;
+        return err;
 
-    *out_set = (*((const u8 *) bh->b_data + byte) & (1u << bit_in_byte)) != 0;
+    *out_set = test_bit_le(off, bh->b_data);
     brelse(bh);
     return 0;
+}
+
+/* Is bit #bit of the same kind of bitmap currently set? */
+static int cetrafs_bitmap_test_bit(struct super_block *sb, u64 bmap_lba, u64 nblocks, u64 bit, bool *out_set)
+{
+    if (cetrafs_bmap_blk(bit) >= nblocks)
+        return -EINVAL;
+    return cetrafs_bmap_test_off(sb, bmap_lba + cetrafs_bmap_blk(bit), cetrafs_bmap_off(bit), out_set);
 }
 
 /*
@@ -3105,13 +3271,13 @@ static int cetrafs_bitmap_test_bit(struct super_block *sb, u64 bmap_lba, u64 nbl
  */
 int cetrafs_inode_is_allocated(struct super_block *sb, u64 ino, bool *out_set)
 {
-    u64 bit, lba = cetrafs_ino_bit(sb, ino, &bit);
+    u64 off, lba = cetrafs_ino_bit(sb, ino, &off); /* the bit's block, and its offset in that block */
 
     if (!lba) {
         *out_set = false;
         return 0;
     }
-    return cetrafs_bitmap_test_bit(sb, lba, 1, bit, out_set);
+    return cetrafs_bmap_test_off(sb, lba, off, out_set);
 }
 
 /*
@@ -3149,7 +3315,7 @@ int cetrafs_data_block_is_allocated(struct super_block *sb, u64 lba, bool *out_s
     bit = lba - data_start;
     nblocks = bg.off_data_region - bg.off_data_bmap;
     if (bg.owner_zg == CETRAFS_BG_OWNER_FREE || !cetrafs_sb_zg_owned_cached(sb, bg.owner_zg))
-        cetrafs_invalidate_block(sb, bg.start_block + bg.off_data_bmap + bit / CETRAFS_BITS_PER_BLOCK);
+        cetrafs_invalidate_block(sb, bg.start_block + bg.off_data_bmap + cetrafs_bmap_blk(bit));
     return cetrafs_bitmap_test_bit(sb, bg.start_block + bg.off_data_bmap, nblocks, bit, out_set);
 }
 
@@ -3673,9 +3839,7 @@ cetrafs_test_param(free_chunk_recheck_off, cetrafs_free_chunk_recheck_off, bool,
 
 static int __cetrafs_free_data_extent(struct super_block *sb, u64 lba, u32 count, const u64 *resv_seq, const u64 *alloc_seq, u64 *out_freed, struct cetrafs_free_batch *fb)
 {
-    struct buffer_head *fbh = NULL; /* the bitmap block the loop holds */
-    bool fchg = false; /* fbh had a bit cleared: dirty it, else leave it clean */
-    u64 fblk = 0;
+    struct cetrafs_bmap_hold fh = {0}; /* the bitmap block the loop holds */
     struct cetrafs_bg_geom bg;
     u64 data_start, bit, b, freed = 0, credited = 0;
     u32 bg_id;
@@ -3848,11 +4012,7 @@ static int __cetrafs_free_data_extent(struct super_block *sb, u64 lba, u32 count
          * (that needs its bitmap empty), and the reservation checks
          * below are per block, under the lock, as before. */
         if (b && !(b & 4095)) {
-            if (fbh) { /* never held across the unlock */
-                cetrafs_bmap_end_update(sb, fbh, fchg);
-                brelse(fbh);
-                fbh = NULL;
-            }
+            cetrafs_bmap_hold_end(sb, &fh); /* never held across the unlock */
             if (freed > credited) {
                 cetrafs_bg_adjust_free_blocks(sb, bg_id, (s64) (freed - credited));
                 credited = freed;
@@ -3932,46 +4092,22 @@ static int __cetrafs_free_data_extent(struct super_block *sb, u64 lba, u32 count
              * sleeps on I/O while it is held, and the hold ends at every
              * block change and before alloc_mutex is let go.
              */
-            u64 bb = bit + b, blk = bb / CETRAFS_BITS_PER_BLOCK;
-            u32 in = (u32) (bb % CETRAFS_BITS_PER_BLOCK);
-            u8 *byte;
+            u64 off;
 
-            if (fbh && fblk != blk) {
-                cetrafs_bmap_end_update(sb, fbh, fchg);
-                brelse(fbh);
-                fbh = NULL;
-            }
-            if (!fbh) {
-                if (blk >= bg.off_data_region - bg.off_data_bmap) {
-                    ret = -EINVAL;
-                    break;
-                }
-                fbh = cetrafs_bread_retry(sb, bg.start_block + bg.off_data_bmap + blk);
-                if (!fbh) {
-                    ret = -EIO;
-                    break;
-                }
-                atomic64_inc(&cetrafs_free_bmap_lookups);
-                cetrafs_bh_begin_update(fbh);
-                fblk = blk;
-                fchg = false;
-            }
-            byte = (u8 *) fbh->b_data + in / 8;
-            if (!(*byte & (1u << (in % 8)))) {
+            ret = cetrafs_bmap_hold_at(sb, &fh, bg.start_block + bg.off_data_bmap,
+                                       bg.off_data_region - bg.off_data_bmap, bit + b, &off, &cetrafs_free_bmap_lookups);
+            if (ret)
+                break;
+            if (!cetrafs_bmap_hold_flip(&fh, off, false)) {
                 pr_warn_ratelimited("free: block %llu was already free (double free of extent [%llu +%u))\n",
                                     (unsigned long long) (lba + b), (unsigned long long) lba, count);
                 continue;
             }
-            *byte &= (u8) ~(1u << (in % 8));
-            fchg = true;
         }
         cetrafs_shadow_clear(sb, lba + b, 1, "free_data_extent");
         freed++;
     }
-    if (fbh) {
-        cetrafs_bmap_end_update(sb, fbh, fchg);
-        brelse(fbh);
-    }
+    cetrafs_bmap_hold_end(sb, &fh);
     if (freed > credited)
         cetrafs_bg_adjust_free_blocks(sb, bg_id, (s64) (freed - credited));
     cetrafs_sb_alloc_unlock(sb);
@@ -4066,9 +4202,7 @@ int cetrafs_apply_pending_free(struct super_block *sb, u64 lba, u32 count, u32 e
 {
     struct cetrafs_bg_geom bg;
     u64 data_start, bit, b, freed = 0, total = 0;
-    struct buffer_head *fbh = NULL; /* the bitmap block the loop holds */
-    bool fchg = false; /* fbh had a bit cleared: dirty it, else leave it clean */
-    u64 fblk = 0;
+    struct cetrafs_bmap_hold fh = {0}; /* the bitmap block the loop holds */
     u32 bg_id;
     int ret;
 
@@ -4165,11 +4299,7 @@ int cetrafs_apply_pending_free(struct super_block *sb, u64 lba, u32 count, u32 e
         if (b && !(b & 4095) && !READ_ONCE(cetrafs_pf_apply_one_hold)) {
             struct cetrafs_bg_geom now;
 
-            if (fbh) { /* never held across the unlock */
-                cetrafs_bmap_end_update(sb, fbh, fchg);
-                brelse(fbh);
-                fbh = NULL;
-            }
+            cetrafs_bmap_hold_end(sb, &fh); /* never held across the unlock */
             if (freed) {
                 cetrafs_bg_adjust_free_blocks(sb, bg_id, (s64) freed);
                 total += freed;
@@ -4219,43 +4349,20 @@ int cetrafs_apply_pending_free(struct super_block *sb, u64 lba, u32 count, u32 e
              * the test and the clear under the buffer lock, nothing in
              * the loop sleeping on I/O while it is held, the hold ended
              * at every block change and before alloc_mutex is let go. */
-            u64 bb = bit + b, blk = bb / CETRAFS_BITS_PER_BLOCK;
-            u32 in = (u32) (bb % CETRAFS_BITS_PER_BLOCK);
-            u8 *byte;
+            u64 off;
 
-            if (fbh && fblk != blk) {
-                cetrafs_bmap_end_update(sb, fbh, fchg);
-                brelse(fbh);
-                fbh = NULL;
-            }
-            if (!fbh) {
-                if (blk >= bg.off_data_region - bg.off_data_bmap) {
-                    ret = -EINVAL;
-                    break;
-                }
-                fbh = cetrafs_bread_retry(sb, bg.start_block + bg.off_data_bmap + blk);
-                if (!fbh) {
-                    ret = -EIO;
-                    break;
-                }
-                atomic64_inc(&cetrafs_pf_apply_bmap_lookups);
-                cetrafs_bh_begin_update(fbh);
-                fblk = blk;
-                fchg = false;
-            }
-            byte = (u8 *) fbh->b_data + in / 8;
-            if (!(*byte & (1u << (in % 8))))
+            ret = cetrafs_bmap_hold_at(sb, &fh, bg.start_block + bg.off_data_bmap,
+                                       bg.off_data_region - bg.off_data_bmap, bit + b, &off,
+                                       &cetrafs_pf_apply_bmap_lookups);
+            if (ret)
+                break;
+            if (!cetrafs_bmap_hold_flip(&fh, off, false))
                 continue; /* already free: re-applied entry, or double-queued -- skip the count too */
-            *byte &= (u8) ~(1u << (in % 8));
-            fchg = true;
         }
         cetrafs_shadow_clear(sb, lba + b, 1, "free_data_extent");
         freed++;
     }
-    if (fbh) {
-        cetrafs_bmap_end_update(sb, fbh, fchg);
-        brelse(fbh);
-    }
+    cetrafs_bmap_hold_end(sb, &fh);
     if (freed)
         cetrafs_bg_adjust_free_blocks(sb, bg_id, (s64) freed);
     total += freed;
@@ -5993,71 +6100,18 @@ u64 cetrafs_trim_leaked_count(void)
     return (u64) atomic64_read(&cetrafs_trim_leaked_blocks);
 }
 
-/*
- * The first run of at least 'minlen' free bits at or after 'from', its
- * length capped at 'maxlen'. A run is counted to its real end before the
- * cap is applied, so a long run is not mistaken for a short one; the
- * caller resumes after what it claimed. Returns 0 with the run, -ENOSPC
- * if there is none, -EIO on a read failure. Byte-wise: an all-ones byte
- * ends a run and an all-zero byte extends it without a per-bit test --
- * a 1 GiB Block Group is 32 KiB of bitmap.
- */
+/* The first run of at least 'minlen' free bits at or after 'from', its
+ * length capped at 'maxlen' after it is counted to its real end, so a
+ * long run is not mistaken for a short one; the caller resumes after
+ * what it claimed (cetrafs_bitmap_find_run()). */
 static int cetrafs_bitmap_find_free_run(struct super_block *sb, u64 bmap_lba, u64 nblocks, u64 nbits, u64 from,
                                         u64 minlen, u64 maxlen, u64 *out_start, u64 *out_len)
 {
-    u64 run = 0, run_start = 0, idx = from;
+    int err = cetrafs_bitmap_find_run(sb, bmap_lba, nblocks, nbits, from, max_t(u64, minlen, 1), out_start, out_len);
 
-    while (idx < nbits) {
-        u64 blk = idx / CETRAFS_BITS_PER_BLOCK;
-        struct buffer_head *bh;
-        const u8 *p;
-
-        if (blk >= nblocks)
-            break;
-        cond_resched();
-        bh = cetrafs_bread_retry(sb, bmap_lba + blk);
-        if (!bh)
-            return -EIO;
-        p = (const u8 *) bh->b_data;
-        while (idx < nbits && idx / CETRAFS_BITS_PER_BLOCK == blk) {
-            u32 in = (u32) (idx % CETRAFS_BITS_PER_BLOCK);
-            u8 byte = p[in / 8];
-
-            if (!(in & 7) && idx + 8 <= nbits && (byte == 0x00 || byte == 0xFF)) {
-                if (byte == 0xFF) {
-                    if (run >= minlen)
-                        goto found;
-                    run = 0;
-                } else {
-                    if (!run)
-                        run_start = idx;
-                    run += 8;
-                }
-                idx += 8;
-                continue;
-            }
-            if (byte & (1u << (in & 7))) {
-                if (run >= minlen)
-                    goto found;
-                run = 0;
-            } else {
-                if (!run)
-                    run_start = idx;
-                run++;
-            }
-            idx++;
-        }
-        brelse(bh);
-        continue;
-found:
-        brelse(bh);
-        break;
-    }
-    if (!run || run < minlen)
-        return -ENOSPC;
-    *out_start = run_start;
-    *out_len = min(run, maxlen);
-    return 0;
+    if (!err)
+        *out_len = min(*out_len, maxlen);
+    return err;
 }
 
 /*
@@ -6070,40 +6124,24 @@ found:
 static long cetrafs_bitmap_flip_range(struct super_block *sb, u64 bmap_lba, u64 nblocks, u64 bit, u64 count,
                                       bool set)
 {
-    u64 end = bit + count;
+    struct cetrafs_bmap_hold h = {0};
+    const u64 end = bit + count;
     long wrong = 0;
+    int err = 0;
 
-    while (bit < end) {
-        u64 blk = bit / CETRAFS_BITS_PER_BLOCK;
-        u64 stop = min(end, (blk + 1) * CETRAFS_BITS_PER_BLOCK);
-        struct buffer_head *bh;
-        u8 *p;
+    for (; bit < end; bit++) {
+        u64 off;
 
-        if (blk >= nblocks)
-            return -EINVAL;
-        cond_resched();
-        bh = cetrafs_bread_retry(sb, bmap_lba + blk);
-        if (!bh)
-            return -EIO;
-        p = (u8 *) bh->b_data;
-        cetrafs_bh_begin_update(bh);
-        for (; bit < stop; bit++) {
-            u32 in = (u32) (bit % CETRAFS_BITS_PER_BLOCK);
-            u8 m = (u8) (1u << (in & 7));
-
-            if (!!(p[in / 8] & m) == set) {
-                wrong++;
-                continue;
-            }
-            if (set)
-                p[in / 8] |= m;
-            else
-                p[in / 8] &= (u8) ~m;
-        }
-        cetrafs_bmap_end_update(sb, bh, true);
-        brelse(bh);
+        if (!(bit % CETRAFS_BMAP_BLOCK_BITS))
+            cond_resched();
+        err = cetrafs_bmap_hold_at(sb, &h, bmap_lba, nblocks, bit, &off, NULL);
+        if (err)
+            break;
+        if (!cetrafs_bmap_hold_flip(&h, off, set))
+            wrong++;
     }
-    return wrong;
+    cetrafs_bmap_hold_end(sb, &h);
+    return err ? err : wrong;
 }
 
 /*
@@ -6277,8 +6315,8 @@ out:
         int sret = ret;
 
         if (!sret) {
-            first = (run->lba - bg.start_block - bg.off_data_region) / (CETRAFS_BLOCK_SIZE * 8);
-            last = (run->lba + run->count - 1 - bg.start_block - bg.off_data_region) / (CETRAFS_BLOCK_SIZE * 8);
+            first = cetrafs_bmap_blk(run->lba - bg.start_block - bg.off_data_region);
+            last = cetrafs_bmap_blk(run->lba + run->count - 1 - bg.start_block - bg.off_data_region);
             for (blk = first; blk <= last && !sret; blk++)
                 sret = cetrafs_sync_one_block(sb, bg.start_block + bg.off_data_bmap + blk);
         }
@@ -6313,8 +6351,8 @@ int cetrafs_trim_hold_durable(struct super_block *sb, const struct cetrafs_trim_
     ret = cetrafs_read_bg_geom(sb, run->bg_id, &bg);
     if (ret)
         return ret;
-    first = (run->lba - bg.start_block - bg.off_data_region) / (CETRAFS_BLOCK_SIZE * 8);
-    last = (run->lba + run->count - 1 - bg.start_block - bg.off_data_region) / (CETRAFS_BLOCK_SIZE * 8);
+    first = cetrafs_bmap_blk(run->lba - bg.start_block - bg.off_data_region);
+    last = cetrafs_bmap_blk(run->lba + run->count - 1 - bg.start_block - bg.off_data_region);
     for (blk = first; blk <= last && !ret; blk++)
         ret = cetrafs_sync_one_block(sb, bg.start_block + bg.off_data_bmap + blk);
     return ret;

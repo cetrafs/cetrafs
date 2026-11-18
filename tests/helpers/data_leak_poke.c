@@ -44,16 +44,12 @@ int main(int argc, char **argv)
     cetrafs_block_group_t bg;
     rd(fd, &bg, sizeof(bg), bg_off);
 
-    /* Set the bits in the data bitmap (dense, LSB-first). */
-    off_t bmap_off = (off_t) (cetrafs_le64(bg.start_block) + cetrafs_le32(bg.off_data_bmap)) * CETRAFS_BLOCK_SIZE;
-    for (uint64_t i = 0; i < count; i++) {
-        uint64_t bit = first + i;
-        unsigned char byte;
-        off_t bo = bmap_off + (off_t) (bit / 8);
-        rd(fd, &byte, 1, bo);
-        byte |= (unsigned char) (1u << (bit % 8));
-        wr(fd, &byte, 1, bo);
-    }
+    /* Set the bits in the data bitmap, each sector restamped. */
+    for (uint64_t i = 0; i < count; i++)
+        if (cetrafs_bmap_poke_us(fd, cetrafs_le64(bg.start_block) + cetrafs_le32(bg.off_data_bmap), first + i, 1, 0) < 0) {
+            perror("bitmap");
+            return 1;
+        }
 
     /* Decrement the BG free count to match ("allocated, then leaked"). */
     uint32_t owner_zg = cetrafs_le16(bg.owner_zg);

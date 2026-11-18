@@ -2493,7 +2493,7 @@ static bool cetrafs_pf_region_has_room(const cetrafs_pending_free_t *ent, unsign
     unsigned int e, slots = region / sizeof(*ent);
 
     for (e = 0; e < slots; e++)
-        if (!ent[e].lba)
+        if (cetrafs_pf_slot_is_entry(e) && !ent[e].lba)
             return true;
     return false;
 }
@@ -2515,7 +2515,7 @@ static int cetrafs_pf_append_mutate(void *image, unsigned int len, void *priv)
     for (e = 0; e < slots && ctx->placed < ctx->n; e++) {
         const struct cetrafs_pf_ent *src = &ctx->ents[ctx->placed];
 
-        if (cetrafs_le64(ent[e].lba) != 0)
+        if (!cetrafs_pf_slot_is_entry(e) || cetrafs_le64(ent[e].lba) != 0)
             continue;
         ent[e].lba = cetrafs_cpu_to_le64(src->lba);
         ent[e].count = cetrafs_cpu_to_le32(src->count);
@@ -2927,7 +2927,9 @@ static int cetrafs_pf_drain_mutate(void *image, unsigned int len, void *priv)
      * swap consumes is only what it finds there. */
     ctx->n = 0;
     for (e = 0; e < slots; e++) {
-        if (cetrafs_le64(ent[e].lba) == 0)
+        /* The trailer slot's lba is always 0; asked anyway, so the
+         * garbage clear below can never reach a stamp (G-6). */
+        if (!cetrafs_pf_slot_is_entry(e) || cetrafs_le64(ent[e].lba) == 0)
             continue;
 
         /* Garbage is cleared on sight. Nothing can ever apply it, so
@@ -3037,7 +3039,7 @@ static bool cetrafs_pf_region_used(const cetrafs_pending_free_t *ent, unsigned i
     unsigned int e;
 
     for (e = 0; e < slots; e++)
-        if (ent[e].lba)
+        if (cetrafs_pf_slot_is_entry(e) && ent[e].lba)
             return true;
     return false;
 }
@@ -3215,7 +3217,7 @@ static int cetrafs_zg_drain_one(struct super_block *sb, u32 zg_id, bool may_wait
             unsigned int idx = qb * regions + r, valid = 0, garbage = 0, try;
 
             for (e = 0; e < slots; e++) {
-                if (cetrafs_le64(ent[e].lba) == 0)
+                if (!cetrafs_pf_slot_is_entry(e) || cetrafs_le64(ent[e].lba) == 0)
                     continue;
                 if (cetrafs_le32(ent[e].magic) != CETRAFS_PENDING_FREE_MAGIC || cetrafs_le32(ent[e].count) == 0) {
                     pr_err("pending free: ZG %u queue block %u entry %u is garbage (magic=0x%x count=%u) -- dropping\n",
@@ -3322,7 +3324,8 @@ static int cetrafs_zg_drain_one(struct super_block *sb, u32 zg_id, bool may_wait
                 const cetrafs_pending_free_t *ent = (const cetrafs_pending_free_t *) bhs[qb]->b_data;
 
                 for (e = 0; e < regions * slots; e++)
-                    if (ent[e].lba && cetrafs_le32(ent[e].magic) == CETRAFS_PENDING_FREE_MAGIC &&
+                    if (cetrafs_pf_slot_is_entry(e) && ent[e].lba &&
+                        cetrafs_le32(ent[e].magic) == CETRAFS_PENDING_FREE_MAGIC &&
                         cetrafs_pf_hold_range(&held_mt, cetrafs_le64(ent[e].lba), cetrafs_le32(ent[e].count)))
                         hold_all = true;
             }
@@ -3465,7 +3468,7 @@ int cetrafs_zg_pending_free_for_each(struct super_block *sb, u32 zg_id, void (*c
             unsigned int e;
 
             for (e = 0; e < slots; e++) {
-                if (cetrafs_le64(ent[e].lba) == 0)
+                if (!cetrafs_pf_slot_is_entry(e) || cetrafs_le64(ent[e].lba) == 0)
                     continue;
                 /* Garbage is the drain's problem to report and clear; here
                  * it is simply not a block we can vouch for. */

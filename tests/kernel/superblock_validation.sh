@@ -215,6 +215,16 @@ if mount -t cetrafs -o ro "$DEV" "$MNT" 2>/dev/null; then
 else
     pass "a volume with an unknown INCOMPAT feature is refused, even read-only"
 fi
+# The reserved CAS-stamp bit (G-6): a volume whose writers stamp every
+# CAS sector is not one a build that does not stamp may write.
+"$SB_POKE" "$DEV" features_incompat $((ORIG_IN | (1 << 4))) >/dev/null
+blockdev --flushbufs "$DEV"
+if mount -t cetrafs "$DEV" "$MNT" 2>/dev/null; then
+    umount "$MNT"
+    fail "a volume with the reserved CAS-stamp feature mounted"
+else
+    pass "a volume with the reserved CAS-stamp feature (G-6) is refused"
+fi
 "$SB_POKE" "$DEV" features_incompat "$ORIG_IN" >/dev/null
 blockdev --flushbufs "$DEV"
 

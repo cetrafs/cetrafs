@@ -49,8 +49,8 @@ aligned_to() {
             echo "BG$b start=$s data=+$o"
             return
         fi
-        if [ $((o - m)) != $(((l - 1 + 32768) / 32769)) ]; then
-            echo "BG$b bitmap=+$m data=+$o: $((o - m)) blocks read as bitmap, $(((l - 1 + 32768) / 32769)) are"
+        if [ $((o - m)) != $(((l - 1 + 31744) / 31745)) ]; then
+            echo "BG$b bitmap=+$m data=+$o: $((o - m)) blocks read as bitmap, $(((l - 1 + 31744) / 31745)) are"
             return
         fi
     done

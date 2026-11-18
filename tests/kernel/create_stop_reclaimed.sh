@@ -27,6 +27,7 @@ require_root
 require_module
 LOCK_POKE="$(ct_helper inode_lock_poke)"
 SB_POKE="$(ct_helper sb_poke)"
+BMAP_POKE="$(ct_helper bmap_poke)"
 MNT="$(ct_mnt csr)"
 ct_track mnt "$MNT"
 ct_param_set auto_defrag 0
@@ -41,26 +42,11 @@ N=500 # a number no create here reaches
 
 # <image> <ino> -> 0|1, the number's bit
 ibit() {
-    python3 -I - "$1" "$2" "$inode_bmap_start" <<'PY'
-import sys
-img, ino, start = sys.argv[1], int(sys.argv[2]), int(sys.argv[3])
-with open(img, "rb") as f:
-    f.seek(start * 4096 + (ino - 1) // 8)
-    print((f.read(1)[0] >> ((ino - 1) % 8)) & 1)
-PY
+    "$BMAP_POKE" "$1" "$inode_bmap_start" "$(($2 - 1))"
 }
 # <image> <ino>: set it
 iset() {
-    python3 -I - "$1" "$2" "$inode_bmap_start" <<'PY'
-import os, sys
-img, ino, start = sys.argv[1], int(sys.argv[2]), int(sys.argv[3])
-fd = os.open(img, os.O_RDWR)
-off = start * 4096 + (ino - 1) // 8
-b = os.pread(fd, 1, off)[0] | (1 << ((ino - 1) % 8))
-os.pwrite(fd, bytes([b]), off)
-os.fsync(fd)
-os.close(fd)
-PY
+    "$BMAP_POKE" "$1" "$inode_bmap_start" "$(($2 - 1))" 1
 }
 info() { sed -n "s/^$1: //p" "$PROC/info"; }
 

@@ -29,6 +29,7 @@ require_module
 
 MAP="$(ct_helper bg_map)"
 BGPOKE="$(ct_helper bg_poke)"
+BMAP_POKE="$(ct_helper bmap_poke)"
 IPOKE="$(ct_helper inode_block_poke)"
 DEV="$(ct_dev 560 direntlive)"
 BACK="$(losetup -l -n -O BACK-FILE "$DEV")"
@@ -60,10 +61,10 @@ else
 fi
 
 # Find A's block's Block Group and clear its bit; the counts follow.
-BG="$(python3 - "$BACK" "$LBA" "$("$MAP" "$DEV")" <<'PY'
+read -r BG BML BBIT <<<"$(python3 -I - "$BACK" "$LBA" "$("$MAP" "$DEV")" <<'PY'
 import os, struct, sys
 back, lba = sys.argv[1], int(sys.argv[2])
-fd = os.open(back, os.O_RDWR)
+fd = os.open(back, os.O_RDONLY)
 for line in sys.argv[3].splitlines():
     f = line.split()
     if f[0] != "bg":
@@ -74,16 +75,15 @@ for line in sys.argv[3].splitlines():
     _, off_bmap, off_data, length = struct.unpack_from("<IIIQ", hdr, 0)
     if not (start + off_data <= lba < start + length):
         continue
-    bit = lba - start - off_data
-    off = (start + off_bmap) * 4096 + bit // 8
-    v = os.pread(fd, 1, off)[0]
-    assert v & (1 << (bit % 8)), "bit already clear"
-    os.pwrite(fd, bytes([v & ~(1 << (bit % 8))]), off)
-    os.fsync(fd)
-    print(f[1])
+    # the bitmap's start LBA and the block's bit within it (bmap_poke maps the bit)
+    print(f[1], start + off_bmap, lba - start - off_data)
     break
 PY
 )"
+if [ -n "$BG" ]; then
+    [ "$("$BMAP_POKE" "$BACK" "$BML" "$BBIT")" = 1 ] || { fail "setup: A's block $LBA's bit is already clear"; ct_exit; }
+    "$BMAP_POKE" "$BACK" "$BML" "$BBIT" 0
+fi
 [ -n "$BG" ] && pass "A's block $LBA now reads FREE in BG $BG's bitmap" || { fail "no Block Group holds block $LBA"; ct_exit; }
 "$BGPOKE" "$BACK" "$BG" 1 sync-zg >/dev/null
 free_total="$("$MAP" "$DEV" | awk '$1 == "bg" {split($5,a,"="); split(a[2],b,"/"); s += b[1]} END {print s+0}')"

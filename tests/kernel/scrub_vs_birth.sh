@@ -34,6 +34,7 @@ require_root
 require_module
 
 SBPOKE="$(ct_helper sb_poke)"
+BMAP_POKE="$(ct_helper bmap_poke)"
 LPOKE="$(ct_helper inode_lock_poke)"
 IPOKE="$(ct_helper inode_block_poke)"
 DEV="$(ct_dev 560 scrubbirth)"
@@ -45,21 +46,7 @@ ct_mount "$DEV" "$MNT"
 require_cetrafs_mount "$MNT"
 
 bit() { # <ino> [0|1] -- read, or set, the inode's bit in the backing file
-    python3 - "$BACK" "$IBM" "$1" "${2:-}" <<'PY'
-import os, sys
-back, ibm, ino = sys.argv[1], int(sys.argv[2]), int(sys.argv[3])
-b = ino - 1
-off = ibm * 4096 + b // 8
-fd = os.open(back, os.O_RDWR)
-v = os.pread(fd, 1, off)[0]
-if sys.argv[4] == "":
-    print((v >> (b % 8)) & 1)
-else:
-    v = (v | (1 << (b % 8))) if sys.argv[4] == "1" else (v & ~(1 << (b % 8)))
-    os.pwrite(fd, bytes([v]), off)
-    os.fsync(fd)
-os.close(fd)
-PY
+    "$BMAP_POKE" "$BACK" "$IBM" "$(($1 - 1))" ${2:+"$2"}
 }
 
 # A number with a DEAD record (a virgin all-zero record fails its

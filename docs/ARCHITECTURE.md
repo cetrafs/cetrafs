@@ -40,8 +40,15 @@ cluster must satisfy -- is documented at cetrafs.com.
   (not per-group, unlike ext2/3/4)
 - Journals are per-**node**, not per-ZG (the per-ZG layout was multi-writer and
   unsound; changed since)
-- Dense bitmaps: global inode bitmap and per-BG data bitmaps have no padding
-  between bits
+- Checksummed bitmap sectors (0x000A): the inode bitmap and every per-BG data
+  bitmap are 512-byte sectors of 3968 bits, each ending in a 16-byte trailer
+  (`cetrafs_bmap_trailer_t`) with that sector's CRC32C and a reserved G-6 stamp.
+  A sector is what a device writes atomically and the inode bitmap's CAS unit,
+  so the checksum always lands with its bits: a mismatch is damage, never a
+  tear. The kernel checks a sector before it uses it, re-reads it from the
+  device a few times, then neither allocates from it nor frees into it
+  (`bmap_crc_bad` in procfs counts each); `fsck` reports it and `fsck -r`
+  rewrites it from the bits it settles on
 - Fixed-size directory entries (no variable-length dirent packing), each dirent
   block carrying a `{magic,crc}` tail in its slack
 - Extents use an ext4-style tree: header + inline leaves/index, depth 0/1/2
@@ -100,10 +107,11 @@ BG region (length_blocks total)
 ```
 
 `dbm` (data-bitmap blocks) solves `L = length_blocks - 1` (header excluded)
-against `BITS_PER_BLOCK = 4096*8 = 32768` bits/block:
+against `BMAP_BLOCK_BITS = 8 * 3968 = 31744` bits/block (eight sectors, each
+less its trailer):
 
 ```
-dbm = ceil(L / (BITS_PER_BLOCK + 1))
+dbm = ceil(L / (BMAP_BLOCK_BITS + 1))
 ```
 
 Worked example, default 1 GiB BG (`length_blocks = 262144`):
@@ -310,7 +318,12 @@ extent leaf/interior blocks); the global tables are not.
 
 ### Pending-free queue — `cetrafs_pending_free_t` (32 bytes/entry)
 
-A fixed-slot array per ZG (at `pending_free_start`). When a node frees a block
+A fixed-slot array per ZG (at `pending_free_start`), 16 slots per 512-byte
+sector (the CAS unit), of which the last is the sector's trailer
+(`cetrafs_pf_trailer_t`): never an entry, its `lba` always 0, its stamp
+reserved for G-6 (0x000A). Every walk over the slots skips it
+(`cetrafs_pf_slot_is_entry()`), so a stamp a later build writes there is
+neither read as an entry nor cleared as garbage. When a node frees a block
 that lives in **another** node's ZG, it does not touch that ZG's bitmap; it
 appends a `{lba, count, magic, free_gen}` entry (one per extent) by CAS, and the owner
 drains it at mount, on every heartbeat tick, after an on-demand claim and, rate
@@ -439,6 +452,7 @@ with backoff before being declared real corruption.
 | `INCOMPAT_GLOBAL_ITBL` | 1 | yes | accepted at mount |
 | `INCOMPAT_BIT2_UNUSED` | 2 | no | was `PR_AWARE`, removed with SCSI PR (v0x000E) |
 | `INCOMPAT_NODE_REGISTRY` | 3 | yes | accepted at mount; gates the `node_table_*` SB fields |
+| `INCOMPAT_CAS_STAMP` | 4 | no | reserved (G-6): every CAS sector carries a stamp field (`cas_stamp`, `ns_cas_stamp`, the inode file sector's `CETRAFS_INODE_FD_STAMP_OFF`, the bitmap and pending-free trailers), zero today; the volume that turns stamping on sets it, and a build that does not stamp refuses the mount |
 | `ROCOMPAT_SPARSE` | 0 | no | — |
 
 What this build understands is one definition per class in `cetrafs.h`

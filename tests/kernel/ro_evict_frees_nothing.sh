@@ -30,6 +30,7 @@ CPOKE="$(ct_helper corrupt_poke)"
 SBPOKE="$(ct_helper sb_poke)"
 MAP="$(ct_helper bg_map)"
 EPOKE="$(ct_helper pending_poke)"
+BMAP_POKE="$(ct_helper bmap_poke)"
 
 IMG="$(ct_image 560 roevict)"
 DEV="$(ct_loop "$IMG")"
@@ -45,8 +46,8 @@ ct_umount "$MNT"
 LBA="$("$EPOKE" "$IMG" extent "$INO" | cut -d' ' -f1)"
 [ -n "$LBA" ] && [ "$LBA" -gt 0 ] || { fail "setup: no data block for f"; ct_exit; }
 IBM="$("$SBPOKE" "$DEV" | sed -n 's/^inode_bmap_start=//p')"
-# The data-bitmap byte holding f's first block.
-DOFF="$(python3 - "$IMG" "$LBA" "$("$MAP" "$DEV")" <<'PY'
+# The data bitmap holding f's first block: its start LBA and the bit.
+read -r DBM DBIT <<<"$(python3 -I - "$IMG" "$LBA" "$("$MAP" "$DEV")" <<'PY'
 import os, struct, sys
 fd = os.open(sys.argv[1], os.O_RDONLY); lba = int(sys.argv[2])
 for line in sys.argv[3].splitlines():
@@ -56,12 +57,11 @@ for line in sys.argv[3].splitlines():
     # cetrafs_bg_header_t: bg_id, off_data_bmap, off_data_region (u32), length_blocks (u64)
     _, off_bmap, off_data, length = struct.unpack_from("<IIIQ", os.pread(fd, 24, start * 4096), 0)
     if start + off_data <= lba < start + length:
-        bit = lba - start - off_data
-        print((start + off_bmap) * 4096 + bit // 8); break
+        print(start + off_bmap, lba - start - off_data); break
 PY
 )"
-[ -n "$DOFF" ] || { fail "setup: f's block is in no Block Group"; ct_exit; }
-bits() { { dd if="$IMG" bs=4096 skip="$IBM" count=1 status=none; dd if="$IMG" bs=1 skip="$DOFF" count=1 status=none; } | md5sum; }
+[ -n "$DBM" ] || { fail "setup: f's block is in no Block Group"; ct_exit; }
+bits() { { dd if="$IMG" bs=4096 skip="$IBM" count=1 status=none; dd if="$IMG" bs=4096 skip="$DBM" count=1 status=none; "$BMAP_POKE" "$IMG" "$DBM" "$DBIT"; } | md5sum; }
 
 mount -t cetrafs -o ro "$DEV" "$MNT"
 require_cetrafs_mount "$MNT"

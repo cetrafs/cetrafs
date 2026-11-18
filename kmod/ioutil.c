@@ -122,6 +122,54 @@ struct buffer_head *cetrafs_bread_retry(struct super_block *sb, sector_t block)
     return NULL;
 }
 
+/* Device re-reads of a bitmap block that fails its checksum before it is
+ * called damaged: 0.1, 0.2, 0.4 and 0.8 ms apart. */
+#define CETRAFS_BMAP_CRC_RETRIES 4
+
+/*
+ * Read bitmap block 'lba' and check the sectors that hold buffer bit
+ * offsets [lo, hi): the only way a bitmap block is read. Checked under
+ * the buffer lock, which every in-place update holds across its change
+ * and restamp, so this node's own updates are never seen half-made.
+ * Another node's write, or the device, can still be caught torn: the
+ * read is retried from the device a few times before the block is
+ * called damaged (rule 3). A buffer this node holds back (dirty, or
+ * held) is newer than the device and cannot be re-read: a mismatch
+ * there is ours, and damage at once.
+ */
+struct buffer_head *cetrafs_bmap_bread(struct super_block *sb, u64 lba, u64 lo, u64 hi, int *err)
+{
+    const u64 first = lo / (CETRAFS_BMAP_SECTOR * 8ULL);
+    const u64 n = hi > lo ? DIV_ROUND_UP(hi, CETRAFS_BMAP_SECTOR * 8ULL) - first : 0;
+    int attempt;
+
+    for (attempt = 0; attempt < CETRAFS_BMAP_CRC_RETRIES; attempt++) {
+        struct buffer_head *bh = cetrafs_bread_retry(sb, lba);
+        bool ok, mine;
+
+        if (!bh) {
+            *err = -EIO;
+            return NULL;
+        }
+        lock_buffer(bh);
+        ok = cetrafs_bmap_sectors_ok(bh->b_data, first, n);
+        mine = cetrafs_bh_pending(bh) || buffer_dirty(bh);
+        unlock_buffer(bh);
+        if (ok)
+            return bh;
+        brelse(bh);
+        if (mine)
+            break;
+        cetrafs_invalidate_block(sb, lba);
+        usleep_range(100 << attempt, 200 << attempt);
+    }
+    atomic64_inc(&cetrafs_bmap_crc_bad);
+    pr_err_ratelimited("bitmap block %llu: a sector fails its checksum -- the block is not used\n",
+                       (unsigned long long) lba);
+    *err = -EUCLEAN;
+    return NULL;
+}
+
 /* cetrafs_bread_uncached() with the same bounded retries as
  * cetrafs_bread_retry(), for the same reason: bh_read() reports failure
  * if the uptodate bit is gone by the time it re-checks, which a

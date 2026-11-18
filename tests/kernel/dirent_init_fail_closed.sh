@@ -29,11 +29,12 @@ require_module
 
 MAP="$(ct_helper bg_map)"
 BGPOKE="$(ct_helper bg_poke)"
+BMAP_POKE="$(ct_helper bmap_poke)"
 IPOKE="$(ct_helper inode_block_poke)"
 CPOKE="$(ct_helper csum_poke)"
 MNT="$(ct_mnt direntfc)"
 
-# The block-in-bitmap locator: prints "<bg> <byte offset> <bit>".
+# The block-in-bitmap locator: prints "<bg> <bitmap start LBA> <bit>".
 locate() { # <backing> <lba>
     python3 - "$1" "$2" "$("$MAP" "$DEV")" <<'PY'
 import os, struct, sys
@@ -48,12 +49,12 @@ for line in sys.argv[3].splitlines():
     _, off_bmap, off_data, length = struct.unpack_from("<IIIQ", os.pread(fd, 24, start * 4096), 0)
     if start + off_data <= lba < start + length:
         bit = lba - start - off_data
-        print(f[1], (start + off_bmap) * 4096 + bit // 8, bit % 8)
+        print(f[1], start + off_bmap, bit)
         break
 PY
 }
-bit_of() { python3 -c 'import os,sys; fd=os.open(sys.argv[1],os.O_RDONLY); print((os.pread(fd,1,int(sys.argv[2]))[0]>>int(sys.argv[3]))&1)' "$@"; }
-clear_bit() { python3 -c 'import os,sys; fd=os.open(sys.argv[1],os.O_RDWR); o=int(sys.argv[2]); v=os.pread(fd,1,o)[0]; os.pwrite(fd,bytes([v&~(1<<int(sys.argv[3]))]),o); os.fsync(fd)' "$@"; }
+bit_of() { "$BMAP_POKE" "$1" "$2" "$3"; } # <back> <bitmap LBA> <bit>
+clear_bit() { "$BMAP_POKE" "$1" "$2" "$3" 0; } # <back> <bitmap LBA> <bit>
 blk_sum() { dd if="$1" bs=4096 skip="$2" count=1 status=none | md5sum | cut -d' ' -f1; }
 
 # A with five names, B exactly one full block, the volume full, A's

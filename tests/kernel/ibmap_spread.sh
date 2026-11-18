@@ -10,10 +10,11 @@
 #
 # One host, two TEST ONLY knobs: ibmap_start_as_node makes the walk start
 # where another node id would, ibmap_busy_regions makes chosen regions
-# report the contention a lost swap does. 65536 inodes, 4 nodes: 16
-# regions of 4096 numbers, node 2 starting at region 8.
+# report the contention a lost swap does. 65536 inodes, 4 nodes: 17
+# regions of 3968 numbers (a 512-byte bitmap sector less its trailer),
+# node 2 starting at region 17 * 2 / 4 = 8.
 #
-#   A. as node 2, a create takes a number in region 8 (32769..36864).
+#   A. as node 2, a create takes a number in region 8 (31745..35712).
 #   B. region 0 contended: a create takes a number in region 1 and the
 #      skip is counted.
 #   C. every region contended: the create fails EIO within seconds --
@@ -50,7 +51,9 @@ create() {
         echo "err=${err##*: }"
     fi
 }
-region_of() { echo $((($1 - 1) / 4096)); }
+REGION=3968 # CETRAFS_BMAP_SECTOR_BITS
+NREGIONS=$(((65536 + REGION - 1) / REGION))
+region_of() { echo $((($1 - 1) / REGION)); }
 
 # A. the start region
 echo 2 >$P/ibmap_start_as_node
@@ -93,7 +96,7 @@ case "$B_CTL" in
 esac
 
 # C. every region contended
-echo 65535 >$P/ibmap_busy_regions
+echo $(((1 << NREGIONS) - 1)) >$P/ibmap_busy_regions
 t0=$SECONDS
 C="$(create c)"
 secs=$((SECONDS - t0))

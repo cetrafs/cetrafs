@@ -580,8 +580,10 @@ static int scrub_build_refset(struct cetrafs_scrub *s, struct scrub_ctx *ctx, bo
     return 0;
 }
 
-/* Read a BG's whole data bitmap into a freshly allocated byte buffer (dense,
- * LSB-first, the on-disk convention). Caller frees. */
+/* Read a BG's whole data bitmap, block after block, into a freshly
+ * allocated buffer -- each block checked (cetrafs_bmap_bread()), its
+ * trailers kept in place: scrub_bit_set() maps a bit as on the device.
+ * Caller frees. */
 static u8 *scrub_read_bitmap(struct super_block *sb, const struct scrub_bg *b)
 {
     u8 *buf = kvmalloc(b->bmap_blocks * CETRAFS_BLOCK_SIZE, GFP_NOFS);
@@ -590,7 +592,8 @@ static u8 *scrub_read_bitmap(struct super_block *sb, const struct scrub_bg *b)
     if (!buf)
         return NULL;
     for (i = 0; i < b->bmap_blocks; i++) {
-        struct buffer_head *bh = cetrafs_bread_retry(sb, b->bmap_lba + i);
+        int err;
+        struct buffer_head *bh = cetrafs_bmap_bread(sb, b->bmap_lba + i, 0, CETRAFS_BMAP_BUF_BITS, &err);
 
         if (!bh) {
             kvfree(buf);
@@ -604,7 +607,7 @@ static u8 *scrub_read_bitmap(struct super_block *sb, const struct scrub_bg *b)
 
 static inline bool scrub_bit_set(const u8 *buf, u64 bit)
 {
-    return (buf[bit >> 3] >> (bit & 7)) & 1;
+    return test_bit_le(cetrafs_bmap_blk(bit) * CETRAFS_BMAP_BUF_BITS + cetrafs_bmap_off(bit), buf);
 }
 
 /* Drop a group's candidates for this cycle, and their share of the budget. */

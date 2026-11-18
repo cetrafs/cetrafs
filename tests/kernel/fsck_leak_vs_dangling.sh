@@ -20,6 +20,7 @@ set -euo pipefail
 require_root
 require_module
 SBPOKE="$(ct_helper sb_poke)"
+BMP="$(ct_helper bmap_poke)"
 
 IMG="$(ct_image 560 leakdangle)"
 DEV="$(ct_loop "$IMG")"
@@ -35,16 +36,10 @@ blockdev --flushbufs "$DEV"
 
 IBM="$("$SBPOKE" "$IMG" | sed -n 's/^inode_bmap_start=//p')"
 [ -n "$IBM" ] || { fail "setup: no inode_bmap_start"; ct_exit; }
-OFF=$((IBM * 4096 + (INO - 1) / 8)); MASK=$((1 << ((INO - 1) % 8)))
-flip_bit() {   # $1 = set|clear
-    python3 - "$IMG" "$OFF" "$MASK" "$1" <<'PY'
-import sys
-p, off, mask, op = sys.argv[1], int(sys.argv[2]), int(sys.argv[3]), sys.argv[4]
-with open(p, 'r+b') as f:
-    f.seek(off); b = f.read(1)[0]
-    b = (b | mask) if op == 'set' else (b & ~mask & 0xff)
-    f.seek(off); f.write(bytes([b]))
-PY
+flip_bit() {   # $1 = set|clear: the inode's bit in the inode bitmap
+    local v=0
+    [ "$1" = set ] && v=1
+    "$BMP" "$IMG" "$IBM" "$((INO - 1))" "$v"
     blockdev --flushbufs "$DEV"
 }
 flip_bit clear

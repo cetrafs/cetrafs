@@ -115,7 +115,12 @@ for f in "$K"/*.c; do
         # pristine image for the journal entry -- same region, so it must
         # match here too or every journaled site silently drops out of
         # this audit (it did, for one build).
-        /cetrafs_bh_begin_update(_crc)?\(|cetrafs_getblk_overwrite\(/ && $0 !~ /\*/ { inreg=1; start=NR; next }
+        # cetrafs_bmap_hold_at() (alloc.c) returns its block locked for
+        # update by contract, and cetrafs_bmap_hold_end() ends it: an
+        # opener and an end like the pair above, so every holder is
+        # audited; hold_at body is the one place the region is left open
+        # on purpose (its begin_update carries the comment that says so).
+        /cetrafs_bh_begin_update(_crc)?\(|cetrafs_getblk_overwrite\(|cetrafs_bmap_hold_at\(/ && $0 !~ /\*/ { inreg=1; start=NR; next }
         # cetrafs_journal_write_block() and its _new_block() sibling take
         # a LOCKED buffer and own
         # ending the update on every path -- so a call to it terminates
@@ -127,7 +132,7 @@ for f in "$K"/*.c; do
         # held back for the boundary or journaled now (file.c).
         # cetrafs_bmap_end_update() (alloc.c) ends it on both of its
         # branches: end_update, or end_update_held.
-        inreg && /cetrafs_bh_end_update(_held|_dirty)?\(|cetrafs_bmap_end_update\(|cetrafs_bh_abort_update\(|cetrafs_journal_write_(new_)?block\(|cetrafs_tree_hold_back\(/ { inreg=0; next }
+        inreg && /cetrafs_bh_end_update(_held|_dirty)?\(|cetrafs_bmap_end_update\(|cetrafs_bmap_hold_end\(|cetrafs_bh_abort_update\(|cetrafs_journal_write_(new_)?block\(|cetrafs_tree_hold_back\(/ { inreg=0; next }
         # The NULL check belonging to the claim is not a leak: there is no
         # buffer to release yet. Only the few lines right after the claim.
         inreg && NR <= start + 6 && /^[[:space:]]*(return|goto) / { next }
@@ -2305,8 +2310,7 @@ cetrafs_alloc_data_run_resv below:one-group-has-no-run
 cetrafs_alloc_pick_run_resv final:defrag-only-cannot-defrag-now-is-not-user-visible
 cetrafs_bg_claim_free below:nothing-to-claim-the-pick-goes-on-to-wait-for-a-release
 cetrafs_bitmap_alloc_bit below:one-bitmap
-cetrafs_bitmap_alloc_run_start below:one-bitmap
-cetrafs_bitmap_find_free_run below:one-bitmap
+cetrafs_bitmap_find_run below:one-bitmap
 cetrafs_bitmap_try_alloc_exact below:one-bitmap
 cetrafs_bmap_cas_mutate below:one-region-the-caller-tries-the-next
 cetrafs_inode_bitmap_cas_alloc final:every-inode-number-in-use-a-free-in-flight-holds-its-number-until-published

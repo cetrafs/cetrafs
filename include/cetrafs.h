@@ -210,8 +210,27 @@
 /* Default BG sizing (mkfs can override sb.bg_size_blocks) */
 #define CETRAFS_DEFAULT_BG_SIZE_BYTES  (1ULL << 30) /* 1 GiB */
 
+/*
+ * Bitmap sectors (format 0x000A, audit 2026-11-15 section 8). Every
+ * on-disk bitmap -- the inode bitmap and each Block Group's data bitmap
+ * -- is a run of 512-byte sectors, each CETRAFS_BMAP_SECTOR_BITS bits
+ * followed by a 16-byte trailer (cetrafs_bmap_trailer_t) that carries
+ * the sector's own CRC32C. A sector is what a device writes atomically
+ * and the inode bitmap's CAS unit, so the checksum always lands WITH the
+ * bits it covers: no crash and no concurrent swap can leave a sector
+ * whose bits and checksum disagree, and a mismatch is damage. Bit n of a
+ * bitmap is bit n % SECTOR_BITS of its sector n / SECTOR_BITS, in
+ * little-endian bit order; cetrafs_bmap_blk()/cetrafs_bmap_off() map it
+ * to a block and a bit offset inside that block's buffer.
+ */
+#define CETRAFS_BMAP_SECTOR         512U
+#define CETRAFS_BMAP_TRAILER        16U
+#define CETRAFS_BMAP_SECTOR_BITS    ((CETRAFS_BMAP_SECTOR - CETRAFS_BMAP_TRAILER) * 8ULL) /* 3968 */
+#define CETRAFS_BMAP_SECTORS        (CETRAFS_BLOCK_SIZE / CETRAFS_BMAP_SECTOR)
+#define CETRAFS_BMAP_BLOCK_BITS     (CETRAFS_BMAP_SECTORS * CETRAFS_BMAP_SECTOR_BITS)     /* 31744 */
+#define CETRAFS_BMAP_CRC_LEN        (CETRAFS_BMAP_SECTOR - 4U) /* the CRC covers all but itself */
+
 /* Derived sizing helpers (mkfs can override policies) */
-#define CETRAFS_BITS_PER_BLOCK      (CETRAFS_BLOCK_SIZE * 8ULL)
 #define CETRAFS_DIV_ROUND_UP(n,d)   ( ((u64)(n) + (u64)(d) - 1ULL) / (u64)(d) )
 
 /* BG fixed geometry */
@@ -438,7 +457,13 @@ typedef struct {
     __le32 zg_first_count;        /* Zone Groups in the implicit first table */
     __le32 zg_seg_pad;
 
-    u8  reserved[88];
+    /* Reserved: G-6 stamp of sector 0 (CETRAFS_FEAT_INCOMPAT_CAS_STAMP);
+     * 0. A grow's publish compares the whole superblock against its copy
+     * (kmod/grow.c), so the code that bumps it must carve it out of that
+     * compare, as the fsck mark is. */
+    __le64 cas_stamp;
+
+    u8  reserved[80];
 } CETRA_PACKED cetrafs_superblock_t;
 
 /*
@@ -483,6 +508,29 @@ typedef struct {
 } CETRA_PACKED cetrafs_pending_free_t;
 
 typedef char cetrafs_pf_entry_tiles_sector[(512 % sizeof(cetrafs_pending_free_t) == 0) ? 1 : -1];
+
+/*
+ * The last slot of every 512-byte queue sector -- the CAS unit -- is not
+ * an entry: it is the sector's trailer, reserved for a per-sector CAS
+ * stamp (audit 2026-11-15 G-6, room only). Its lba stays 0 for ever, so
+ * a reader taking it as an empty slot is never wrong; but no build
+ * places an entry in it, clears it as garbage or counts it, so the
+ * bytes a later build stamps survive this one. Every walk over queue
+ * slots asks cetrafs_pf_slot_is_entry().
+ */
+typedef struct {
+    __le64 lba;   /* always 0: never an entry */
+    __le64 pad0;
+    __le64 stamp; /* reserved for G-6; 0 */
+    __le64 pad1;
+} CETRA_PACKED cetrafs_pf_trailer_t;
+
+#define CETRAFS_PF_SECTOR_SLOTS (512U / sizeof(cetrafs_pending_free_t))
+
+static inline int cetrafs_pf_slot_is_entry(u64 slot)
+{
+    return slot % CETRAFS_PF_SECTOR_SLOTS != CETRAFS_PF_SECTOR_SLOTS - 1;
+}
 
 #define CETRAFS_PENDING_FREE_PER_BLOCK (CETRAFS_BLOCK_SIZE / sizeof(cetrafs_pending_free_t))
 /* Per-ZG pending-free queue, in blocks. This is the size mkfs aims
@@ -562,8 +610,9 @@ typedef struct {
      * because the fence refused its target write; without the stamp the
      * next replay redid an operation that had returned -EIO (M10). */
     __le64 park_seq;
+    __le64 cas_stamp;             /* reserved: G-6 stamp (CETRAFS_FEAT_INCOMPAT_CAS_STAMP); 0 */
 
-    u8  pad[CETRAFS_BLOCK_SIZE - 32];
+    u8  pad[CETRAFS_BLOCK_SIZE - 40];
 } CETRA_PACKED cetrafs_node_journal_hdr_t;
 
 /* Cross-node mutual exclusion is atomic COMPARE AND WRITE, full stop
@@ -707,7 +756,8 @@ typedef struct {
     __le64 pool_grow_gen;
     __le64 pool_grow_id;
     __le64 pool_grow_credit;
-    u8     hot_pad[CETRAFS_HOT_SECTOR - 60];
+    __le64 cas_stamp;             /* reserved: G-6 stamp (CETRAFS_FEAT_INCOMPAT_CAS_STAMP); 0 */
+    u8     hot_pad[CETRAFS_HOT_SECTOR - 68];
 
     /* ===== COLD: bytes [CETRAFS_HOT_SECTOR, CETRAFS_BLOCK_SIZE) ===== */
     /*
@@ -1242,8 +1292,9 @@ typedef struct {
     __le32  fenced_by;            /* registry row index of the fencer */
     __le32  fence_reason;         /* CETRAFS_FENCE_* */
     __le64  fenced_at;            /* unix seconds of that fence */
+    __le64 cas_stamp;             /* reserved: G-6 stamp (CETRAFS_FEAT_INCOMPAT_CAS_STAMP); 0 */
 
-    u8   reserved[12];
+    u8   reserved[4];
 } CETRA_PACKED cetrafs_node_entry_t; /* 144 bytes */
 
 /*
@@ -1344,7 +1395,8 @@ typedef struct {
     __le32 pad0;
     __le64 next;                  /* LBA of the next segment header, 0 = tail */
     __le64 checksum;              /* CRC32C over the header with this field zeroed */
-    u8     pad[CETRAFS_BLOCK_SIZE - 32];
+    __le64 cas_stamp;             /* reserved: G-6 stamp (CETRAFS_FEAT_INCOMPAT_CAS_STAMP); 0 */
+    u8     pad[CETRAFS_BLOCK_SIZE - 40];
 } CETRA_PACKED cetrafs_seg_hdr_t;
 
 #define CETRAFS_BGSEG_MAGIC 0xC4553B65U
@@ -1414,8 +1466,10 @@ typedef struct {
      * fsck run. Fixing the pad to match reality makes both sides hash
      * the same CETRAFS_BLOCK_SIZE bytes without touching either call
      * site. (68 as of v0x0004: reconcile_seq above; 76 as of 0x000A:
-     * free_gen; 72 once off_bg_header, always 0, was removed.) */
-    u8  pad[CETRAFS_BLOCK_SIZE - 72];
+     * free_gen; 72 once off_bg_header, always 0, was removed; 80 with
+     * cas_stamp.) The mutators that zero from `pad` on keep cas_stamp. */
+    __le64 cas_stamp;             /* reserved: G-6 stamp (CETRAFS_FEAT_INCOMPAT_CAS_STAMP); 0 */
+    u8  pad[CETRAFS_BLOCK_SIZE - 80];
 } CETRA_PACKED cetrafs_block_group_t;
 
 /* ---- Intra‑BG Header (first block of region) ---- */
@@ -1652,7 +1706,8 @@ typedef struct {
      * (audit 2026-11-15 F-37). A default mount's writer is marked by the
      * file lock instead, and never sets it. */
     __le64 write_open_nodes;
-    u8 ns_pad[CETRAFS_INODE_NS_BYTES - 124 - 4 * CETRAFS_MAX_READER_NODES];
+    __le64 ns_cas_stamp; /* reserved: G-6 stamp of this sector (CETRAFS_FEAT_INCOMPAT_CAS_STAMP); 0 */
+    u8 ns_pad[CETRAFS_INODE_NS_BYTES - 132 - 4 * CETRAFS_MAX_READER_NODES];
 
     /* ===== SECTOR 1: the FILE DOMAIN ===== */
     __le64 fd_ino;                /* identity echo of .ino */
@@ -1747,6 +1802,10 @@ typedef struct {
  * carries, as opposed to the CETRAFS_INODE_FD_BYTES it occupies on
  * disk. Everything in between is the zero tail described above. */
 #define CETRAFS_INODE_FD_LIVE ((unsigned int) (sizeof(cetrafs_inode_t) - CETRAFS_INODE_FD_OFF))
+/* Reserved: the G-6 stamp of the file sector, 8 bytes at this offset in
+ * the sector -- the head of the zero tail, inside what the sector's CRC
+ * covers (CETRAFS_FEAT_INCOMPAT_CAS_STAMP); 0. */
+#define CETRAFS_INODE_FD_STAMP_OFF CETRAFS_INODE_FD_LIVE
 
 /* The two-sector contract is load-bearing: sector-granular CAS and the
  * sector-only write primitives depend on these exact offsets. The
@@ -1926,6 +1985,19 @@ static inline int cetrafs_blk_struct_ok(const void *blk, u32 magic)
 #define CETRAFS_FEAT_INCOMPAT_GLOBAL_ITBL  (1ULL << 1) /* single global inode table */
 #define CETRAFS_FEAT_INCOMPAT_BIT2_UNUSED  (1ULL << 2) /* was PR_AWARE, removed with SCSI PR */
 #define CETRAFS_FEAT_INCOMPAT_NODE_REGISTRY (1ULL << 3) /* node_table_* SB fields are valid */
+/*
+ * RESERVED (audit 2026-11-15 G-6, room only): every CAS-managed sector
+ * carries a monotonic stamp the CAS layer bumps, so an unknown outcome is
+ * decided by a re-read. The bytes are in place -- cas_stamp in the
+ * superblock, Zone Group hot sector, Block Group descriptor, Node
+ * Registry row, journal flag block and segment header; ns_cas_stamp in
+ * an inode's namespace sector; CETRAFS_INODE_FD_STAMP_OFF in its file
+ * sector; the trailers of bitmap and pending-free sectors -- all zero
+ * today. A stamp is only meaningful once EVERY writer bumps it, so a
+ * volume that turns them on sets this bit, and a build that does not
+ * know it refuses the mount. No build sets it yet.
+ */
+#define CETRAFS_FEAT_INCOMPAT_CAS_STAMP     (1ULL << 4)
 
 #define CETRAFS_FEAT_ROCOMPAT_SPARSE       (1ULL << 0)
 
@@ -1968,8 +2040,67 @@ static inline int cetrafs_blk_struct_ok(const void *blk, u32 magic)
 /*
  * Global inode structures
  */
+/* The last 16 bytes of every bitmap sector (see CETRAFS_BMAP_SECTOR). */
+typedef struct {
+    __le64 stamp; /* reserved for a per-sector CAS stamp (audit G-6); 0 */
+    __le32 pad;
+    __le32 crc;   /* CRC32C over the sector's first CETRAFS_BMAP_CRC_LEN bytes */
+} CETRA_PACKED cetrafs_bmap_trailer_t;
+
+/* Bit n of a bitmap: the block of the bitmap it is in... */
+static inline u64 cetrafs_bmap_blk(u64 n)
+{
+    return n / CETRAFS_BMAP_BLOCK_BITS;
+}
+
+/* ...and its bit offset in that block's buffer, the trailers skipped. */
+static inline u64 cetrafs_bmap_off(u64 n)
+{
+    const u64 r = n % CETRAFS_BMAP_BLOCK_BITS;
+
+    return r / CETRAFS_BMAP_SECTOR_BITS * (CETRAFS_BMAP_SECTOR * 8ULL) + r % CETRAFS_BMAP_SECTOR_BITS;
+}
+
+/* The bitmap bit a buffer offset stands for: the inverse of the two
+ * above, for an offset that is not inside a trailer. */
+static inline u64 cetrafs_bmap_bit(u64 blk, u64 off)
+{
+    return blk * CETRAFS_BMAP_BLOCK_BITS + off / (CETRAFS_BMAP_SECTOR * 8ULL) * CETRAFS_BMAP_SECTOR_BITS +
+           off % (CETRAFS_BMAP_SECTOR * 8ULL);
+}
+
+/* Sector 'i' of a bitmap block's buffer, and its trailer. */
+static inline cetrafs_bmap_trailer_t *cetrafs_bmap_trailer(void *block, u64 i)
+{
+    return (cetrafs_bmap_trailer_t *) ((u8 *) block + (i + 1) * CETRAFS_BMAP_SECTOR - CETRAFS_BMAP_TRAILER);
+}
+
+/* Bit 'bit' of a bitmap held as its device image, block after block --
+ * for a tool or a walk that reads a whole bitmap at once. */
+static inline int cetrafs_bmap_get(const void *image, u64 bit)
+{
+    const u64 o = cetrafs_bmap_blk(bit) * (CETRAFS_BLOCK_SIZE * 8ULL) + cetrafs_bmap_off(bit);
+
+    return (((const u8 *) image)[o / 8] >> (o % 8)) & 1;
+}
+
+/* Set ('v' non-zero) or clear it; the sector's CRC is the caller's to
+ * restamp before the image is written. */
+static inline void cetrafs_bmap_put(void *image, u64 bit, int v)
+{
+    const u64 o = cetrafs_bmap_blk(bit) * (CETRAFS_BLOCK_SIZE * 8ULL) + cetrafs_bmap_off(bit);
+    u8 *p = (u8 *) image + o / 8;
+
+    *p = v ? (u8) (*p | (1u << (o % 8))) : (u8) (*p & ~(1u << (o % 8)));
+}
+
+static inline u64 cetrafs_calc_bmap_blocks(u64 bits)
+{
+    return CETRAFS_DIV_ROUND_UP(bits, CETRAFS_BMAP_BLOCK_BITS);
+}
+
 static inline u64 cetrafs_calc_inode_bmap_blocks(u64 inodes_count)
-{ return CETRAFS_DIV_ROUND_UP(inodes_count, CETRAFS_BITS_PER_BLOCK); }
+{ return cetrafs_calc_bmap_blocks(inodes_count); }
 
 static inline u64 cetrafs_calc_inode_table_blocks(u64 inodes_count, u32 inode_size)
 {
@@ -2026,16 +2157,17 @@ static inline u64 cetrafs_iseg_record(const struct cetrafs_iseg *s, u32 n, u64 i
     return g ? g->table + (ino - g->first) : 0;
 }
 
-/* The bitmap block holding inode 'ino''s bit, and the bit in it; 0: no
- * such inode. */
-static inline u64 cetrafs_iseg_bit(const struct cetrafs_iseg *s, u32 n, u64 ino, u64 *bit)
+/* The bitmap block holding inode 'ino''s bit, and the bit's offset in
+ * that block's buffer (cetrafs_bmap_off(): NOT a bit number); 0: no such
+ * inode. */
+static inline u64 cetrafs_iseg_bit(const struct cetrafs_iseg *s, u32 n, u64 ino, u64 *off)
 {
     const struct cetrafs_iseg *g = cetrafs_iseg_find(s, n, ino);
 
     if (!g)
         return 0;
-    *bit = (ino - g->first) % CETRAFS_BITS_PER_BLOCK;
-    return g->bmap + (ino - g->first) / CETRAFS_BITS_PER_BLOCK;
+    *off = cetrafs_bmap_off(ino - g->first);
+    return g->bmap + cetrafs_bmap_blk(ino - g->first);
 }
 
 /* Inodes in the implicit first segment of the table (the run at
@@ -2067,12 +2199,13 @@ static inline u64 cetrafs_sb_inode_first_count(const cetrafs_superblock_t *sb)
 /*
  * For a tool that reads one inode offline (tests/helpers): the block of
  * inode 'ino''s record, following the table chain from the superblock,
- * and -- if bmap is not NULL -- its bitmap block and bit. 0: no such
+ * and -- if bmap is not NULL -- its bitmap block and the bit's offset in
+ * it (cetrafs_bmap_off(), not a bit number). 0: no such
  * inode, or a chain that does not reach it. The kernel and fsck walk the
  * chain once, checked; this trusts what it reads beyond magic and
  * numbering, which is what a poke tool needs.
  */
-static inline u64 cetrafs_u_ino_lba(int fd, const cetrafs_superblock_t *sb, u64 ino, u64 *bmap, u64 *bit)
+static inline u64 cetrafs_u_ino_lba(int fd, const cetrafs_superblock_t *sb, u64 ino, u64 *bmap, u64 *off)
 {
     struct cetrafs_iseg g = {1, cetrafs_sb_inode_first_count(sb), cetrafs_le64(sb->inode_bmap_start),
                              cetrafs_le64(sb->inode_table_start)};
@@ -2095,8 +2228,8 @@ static inline u64 cetrafs_u_ino_lba(int fd, const cetrafs_superblock_t *sb, u64 
         next = cetrafs_le64(h.next);
     }
     if (bmap) {
-        *bmap = g.bmap + (ino - g.first) / CETRAFS_BITS_PER_BLOCK;
-        *bit = (ino - g.first) % CETRAFS_BITS_PER_BLOCK;
+        *bmap = g.bmap + cetrafs_bmap_blk(ino - g.first);
+        *off = cetrafs_bmap_off(ino - g.first);
     }
     return g.table + (ino - g.first);
 }
@@ -2122,15 +2255,15 @@ static inline u64 cetrafs_default_inodes_for_bytes(u64 bytes_total)
  *  - total usable data blocks
  *
  * Derivation: Let L = length_blocks - 1 (exclude header). Each bitmap block
- * maps CETRAFS_BITS_PER_BLOCK data blocks and itself consumes 1 block.
- * Minimal bitmap blocks x is ceil(L / (BITS_PER_BLOCK + 1)).
+ * maps CETRAFS_BMAP_BLOCK_BITS data blocks and itself consumes 1 block.
+ * Minimal bitmap blocks x is ceil(L / (BMAP_BLOCK_BITS + 1)).
  */
 static inline u64 cetrafs_calc_bg_dbm_blocks(u64 bg_length_blocks)
 {
     if (bg_length_blocks <= CETRAFS_BG_HEADER_BLOCKS)
         return 0; /* invalid BG; sanity check elsewhere */
     u64 L = bg_length_blocks - CETRAFS_BG_HEADER_BLOCKS;
-    return CETRAFS_DIV_ROUND_UP(L, CETRAFS_BITS_PER_BLOCK + 1ULL);
+    return CETRAFS_DIV_ROUND_UP(L, CETRAFS_BMAP_BLOCK_BITS + 1ULL);
 }
 
 /* The layout of a group of bg_length_blocks on a volume aligned to

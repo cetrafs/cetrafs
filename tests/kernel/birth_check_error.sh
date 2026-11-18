@@ -32,6 +32,7 @@ require_module
 
 SBPOKE="$(ct_helper sb_poke)"
 LPOKE="$(ct_helper inode_lock_poke)"
+BMPOKE="$(ct_helper bmap_poke)"
 DEV="$(ct_dev 560 birthchk)"
 BACK="$(losetup -l -n -O BACK-FILE "$DEV")"
 MNT="$(ct_mnt birthchk)"
@@ -48,14 +49,7 @@ require_cetrafs_mount "$MNT"
 PROC="$(ct_procdir "$DEV")"
 
 bit() { # <ino>: the inode's bit, read off the backing file
-    python3 -I - "$BACK" "$IBM" "$1" <<'PY'
-import os, sys
-back, ibm, ino = sys.argv[1], int(sys.argv[2]), int(sys.argv[3])
-b = ino - 1
-fd = os.open(back, os.O_RDONLY)
-print((os.pread(fd, 1, ibm * 4096 + b // 8)[0] >> (b % 8)) & 1)
-os.close(fd)
-PY
+    "$BMPOKE" "$BACK" "$IBM" "$(($1 - 1))"
 }
 
 # A dead number: written once (so its record is checksummed, which is

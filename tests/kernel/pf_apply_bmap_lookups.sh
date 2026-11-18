@@ -13,7 +13,7 @@
 # unreferenced), one queued free naming them, the heartbeat drain
 # applies it.
 #   1. the free count rises by N and fsck is clean;
-#   2. the apply looked up at most a few bitmap blocks per 32768 bits.
+#   2. the apply looked up at most a few bitmap blocks per 31744 bits.
 #
 # DISCRIMINATION: pf_apply_per_bit, the old loop: 2N lookups.
 set -euo pipefail

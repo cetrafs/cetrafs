@@ -29,6 +29,7 @@ require_module
 PFPOKE="$(ct_helper pending_poke)"
 PPOKE="$(ct_helper extent_phys_poke)"
 BGPOKE="$(ct_helper bg_poke)"
+BMP="$(ct_helper bmap_poke)"
 MNT="$(ct_mnt fsb)"
 ct_track mnt "$MNT"
 ct_param_set scrub 0
@@ -38,7 +39,7 @@ get() { grep -o "$1=[^ ]*" <<<"$2" | head -1 | cut -d= -f2; }
 
 # <tag> <gated 0|1> [Z <zg gated 0|1>] -> RES
 round() {
-    local img dev a b c pa pc d0 ds bm off byte out out2 fr
+    local img dev a b c pa pc d0 ds bm out out2 fr
     img="$(ct_image 560 "fsb$1")"
     dev="$(ct_loop "$img")"
     ct_mkfs "$dev" -z 1 -b 512 -J 0 -M 4 -N 1024 -f >/dev/null
@@ -56,9 +57,7 @@ round() {
     d0="$("$BGPOKE" "$dev" 0 --dump)"
     ds=$(( $(grep -oP 'start_block=\K[0-9]+' <<<"$d0") + $(grep -oP 'off_data_region=\K[0-9]+' <<<"$d0") ))
     bm=$(( $(grep -oP 'start_block=\K[0-9]+' <<<"$d0") + $(grep -oP 'off_data_bmap=\K[0-9]+' <<<"$d0") ))
-    off=$((bm * 4096 + (pc - ds) / 8))
-    byte="$(dd if="$img" bs=1 skip="$off" count=1 status=none | od -An -tu1 | tr -d ' ')"
-    printf "\\x$(printf %02x $((byte & ~(1 << ((pc - ds) % 8)))))" | dd of="$img" bs=1 seek="$off" conv=notrunc status=none
+    "$BMP" "$img" "$bm" "$((pc - ds))" 0
     if [ "${3:-}" = Z ]; then
         fr="$(grep -oP 'free_data_blocks=\K[0-9]+' <<<"$d0")"
         "$BGPOKE" "$img" 0 $((fr + 50)) sync-zg >/dev/null || { fail "setup: bg_poke sync-zg"; ct_exit; }
@@ -72,9 +71,9 @@ round() {
         out="$("$ROOT/userspace/fsck.cetra" -r "$dev" 2>&1 || true)"
     fi
     blockdev --flushbufs "$dev"
-    byte="$(dd if="$img" bs=1 skip="$off" count=1 status=none | od -An -tu1 | tr -d ' ')"
+    cbit="$("$BMP" "$img" "$bm" "$((pc - ds))")"
     RES="overlap=$(grep -c 'cross-file overlap' <<<"$out" || true) blocked=$(grep -c 'repair is disabled' <<<"$out" || true)"
-    RES="$RES unmarked=$(grep -c 'marked FREE' <<<"$out" || true) cbit=$(((byte >> ((pc - ds) % 8)) & 1))"
+    RES="$RES unmarked=$(grep -c 'marked FREE' <<<"$out" || true) cbit=$cbit"
     out2="$("$ROOT/userspace/fsck.cetra" "$dev" 2>&1 || true)"
     RES="$RES zgbefore=$(grep -c 'ZG0 aggregate free_data_blocks' <<<"$out" || true)"
     RES="$RES zgafter=$(grep -c 'ZG0 aggregate free_data_blocks' <<<"$out2" || true)"

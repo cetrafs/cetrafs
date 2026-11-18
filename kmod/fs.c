@@ -322,7 +322,7 @@ struct cetrafs_bg_layout {
     u32 nisegs;
 
     /* Inode numbers mid-BIRTH on this node (cetrafs_sb_birth_begin()),
-     * one bit per number in chunks of CETRAFS_BITS_PER_BLOCK. A grow adds
+     * one bit per number in chunks of CETRAFS_BIRTH_CHUNK_BITS. A grow adds
      * chunks and never copies one: every layout shares its
      * predecessor's, so a bit set through any of them is the same bit. */
     unsigned long **birth;
@@ -1103,14 +1103,15 @@ bool cetrafs_lba_in_ibmap(struct super_block *sb, u64 lba)
     return false;
 }
 
-/* The bitmap block holding inode 'ino''s bit, and the bit; 0: no such
- * inode. */
-u64 cetrafs_ino_bit(struct super_block *sb, u64 ino, u64 *bit)
+/* The bitmap block holding inode 'ino''s bit, and the bit's offset in
+ * that block's buffer (cetrafs_bmap_off(): the trailers skipped, NOT a
+ * bit number); 0: no such inode. */
+u64 cetrafs_ino_bit(struct super_block *sb, u64 ino, u64 *off)
 {
     u32 n;
     const struct cetrafs_iseg *s = cetrafs_sb_isegs(sb, &n);
 
-    return s ? cetrafs_iseg_bit(s, n, ino, bit) : 0;
+    return s ? cetrafs_iseg_bit(s, n, ino, off) : 0;
 }
 
 /* The chunk holding bg_id in the current layout, and its index there;
@@ -1186,10 +1187,10 @@ static struct cetrafs_bg_layout *cetrafs_layout_alloc(const cetrafs_superblock_t
         .table = le64_to_cpu(raw->inode_table_start),
     };
     l->nisegs = 1;
-    l->nbirth = DIV_ROUND_UP(le32_to_cpu(raw->inodes_count) + 1ULL, CETRAFS_BITS_PER_BLOCK);
+    l->nbirth = DIV_ROUND_UP(le32_to_cpu(raw->inodes_count) + 1ULL, CETRAFS_BIRTH_CHUNK_BITS);
     l->birth = kcalloc(l->nbirth, sizeof(*l->birth), GFP_KERNEL);
     for (ci = 0; l->birth && ci < l->nbirth; ci++) {
-        l->birth[ci] = prev && ci < prev->nbirth ? prev->birth[ci] : bitmap_zalloc(CETRAFS_BITS_PER_BLOCK, GFP_KERNEL);
+        l->birth[ci] = prev && ci < prev->nbirth ? prev->birth[ci] : bitmap_zalloc(CETRAFS_BIRTH_CHUNK_BITS, GFP_KERNEL);
         if (!l->birth[ci])
             break;
     }
@@ -3088,7 +3089,7 @@ int cetrafs_fill_super(struct super_block *sb, struct fs_context *fc)
      * enough for the count that indexes them. */
     {
         u64 inodes = cetrafs_sb_inode_first_count(ondisk);
-        u64 bmap_bits = le64_to_cpu(ondisk->inode_bmap_blocks) * CETRAFS_BLOCK_SIZE * 8;
+        u64 bmap_bits = le64_to_cpu(ondisk->inode_bmap_blocks) * CETRAFS_BMAP_BLOCK_BITS;
 
         /* < U32_MAX: the birth map below has inodes_count + 1 bits, and
          * that +1 must not wrap to a zero-size map set_bit() overruns. */
@@ -5672,10 +5673,10 @@ static unsigned long *cetrafs_birth_chunk(struct super_block *sb, u64 ino, unsig
 {
     struct cetrafs_bg_layout *l = cetrafs_sb_layout_of(sb->s_fs_info);
 
-    if (!l || ino / CETRAFS_BITS_PER_BLOCK >= l->nbirth)
+    if (!l || ino / CETRAFS_BIRTH_CHUNK_BITS >= l->nbirth)
         return NULL;
-    *bit = ino % CETRAFS_BITS_PER_BLOCK;
-    return l->birth[ino / CETRAFS_BITS_PER_BLOCK];
+    *bit = ino % CETRAFS_BIRTH_CHUNK_BITS;
+    return l->birth[ino / CETRAFS_BIRTH_CHUNK_BITS];
 }
 
 void cetrafs_sb_birth_begin(struct super_block *sb, u64 ino)
