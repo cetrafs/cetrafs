@@ -152,7 +152,7 @@ int main(int argc, char **argv)
         ne.checksum = cetrafs_cpu_to_le64(crc32c_struct(&ne, sizeof(ne), offsetof(cetrafs_node_entry_t, checksum), sizeof(cetrafs_le64(ne.checksum))));
         pwrite_all(fd, &ne, sizeof(ne), row_off);
         close(fd);
-        printf("node_poke: row %u hb_seq -> %" PRIu64 " (last_seen untouched)\n", row, ne.hb_seq);
+        printf("node_poke: row %u hb_seq -> %" PRIu64 " (last_seen untouched)\n", row, cetrafs_le64(ne.hb_seq));
         return 0;
     }
 
@@ -164,7 +164,7 @@ int main(int argc, char **argv)
         ne.checksum = cetrafs_cpu_to_le64(crc32c_struct(&ne, sizeof(ne), offsetof(cetrafs_node_entry_t, checksum), sizeof(cetrafs_le64(ne.checksum))));
         pwrite_all(fd, &ne, sizeof(ne), row_off);
         close(fd);
-        printf("node_poke: row %u hb_seq -> %" PRIu64 "\n", row, ne.hb_seq);
+        printf("node_poke: row %u hb_seq -> %" PRIu64 "\n", row, cetrafs_le64(ne.hb_seq));
         return 0;
     }
 
@@ -354,7 +354,7 @@ int main(int argc, char **argv)
         ne.checksum = cetrafs_cpu_to_le64(crc32c_struct(&ne, sizeof(ne), offsetof(cetrafs_node_entry_t, checksum), sizeof(cetrafs_le64(ne.checksum))));
         pwrite_all(fd, &ne, sizeof(ne), row_off);
         close(fd);
-        printf("node_poke: row %u fence_epoch -> %" PRIu64 "\n", row, ne.fence_epoch);
+        printf("node_poke: row %u fence_epoch -> %" PRIu64 "\n", row, cetrafs_le64(ne.fence_epoch));
         return 0;
     }
 

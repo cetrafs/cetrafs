@@ -1434,7 +1434,9 @@ typedef struct {
                                 * bits = up to 8 TiB per extent. */
     __le32 ee_start_lo;        /* low 32 bits of physical start */
     __le16 ee_start_hi;        /* high 16 bits of physical start */
-    __le16 ee_pad;             /* reserved, keep 0 */
+    __le16 ee_block_hi;        /* v0x000A: high 16 bits of ee_block -- a 48-bit
+                                * logical start, so a file is no longer capped
+                                * at 2^32 blocks (16 TiB; audit M-42) */
 } CETRA_PACKED cetrafs_extent_t; /* 16 bytes */
 
 typedef struct {
@@ -1458,11 +1460,14 @@ typedef struct {
      * so a leaf can acquire a block below the one it was created with.
      * Both ends are maintained now.
      */
-    __le32 ei_block;           /* lowest logical block in the child (inclusive) */
-    __le32 ei_block_end;       /* highest + 1 (exclusive); 0 means "unknown, must read" */
+    __le32 ei_block;           /* lowest logical block in the child (inclusive), low 32 bits */
+    __le32 ei_span;            /* v0x000A: end - lo, so [lo, lo + span); 0 means
+                                * "unknown, must read" -- also what a child wider
+                                * than 2^32 blocks is written as (the bound is
+                                * conservative, unknown is always safe) */
     __le32 ei_leaf_lo;         /* low 32 bits of leaf physical block */
     __le16 ei_leaf_hi;         /* high 16 bits of leaf physical block */
-    __le16 ei_pad;             /* reserved, keep 0 */
+    __le16 ei_block_hi;        /* v0x000A: high 16 bits of ei_block (48-bit logical) */
 } CETRA_PACKED cetrafs_extent_idx_t; /* 16 bytes */
 
 /* ---- Inode (GLOBAL) ---- */
@@ -2047,7 +2052,7 @@ static inline u64 cetrafs_bg_region_lba(const cetrafs_block_group_t *bg)
  * FORMAT limit, not a policy one: a write past it truncates the logical
  * block number silently and aliases a low offset in the same file.
  * fs.c clamps s_maxbytes by it and file.c refuses past it. */
-#define CETRAFS_MAX_FILE_BLOCKS 0x100000000ULL
+#define CETRAFS_MAX_FILE_BLOCKS (1ULL << 48) /* v0x000A: 48-bit logical blocks */
 
 #define CETRAFS_EXT_LEN_MASK   0x7FFFFFFFu
 #define CETRAFS_EXT_UNINIT     0x80000000u
@@ -2080,11 +2085,15 @@ static inline void cetrafs_extent_phys_to_hilo(u64 phys, __le16 *hi, __le32 *lo)
  * layout of an entry -- how wide a logical block is, where its high bits
  * live -- is decided here and nowhere else.
  */
-static inline u32 cetrafs_ee_lblk(const cetrafs_extent_t *e)
-{ return cetrafs_le32(e->ee_block); }
+/* First logical block: 48 bits (v0x000A). */
+static inline u64 cetrafs_ee_lblk(const cetrafs_extent_t *e)
+{ return (u64) cetrafs_le32(e->ee_block) | ((u64) cetrafs_le16(e->ee_block_hi) << 32); }
 
-static inline void cetrafs_ee_set_lblk(cetrafs_extent_t *e, u32 lblk)
-{ e->ee_block = cetrafs_cpu_to_le32(lblk); }
+static inline void cetrafs_ee_set_lblk(cetrafs_extent_t *e, u64 lblk)
+{
+    e->ee_block = cetrafs_cpu_to_le32((u32) (lblk & 0xFFFFFFFFu));
+    e->ee_block_hi = cetrafs_cpu_to_le16((u16) (lblk >> 32));
+}
 
 /* Length in blocks, without the uninit flag. */
 static inline u32 cetrafs_ee_len(const cetrafs_extent_t *e)
@@ -2107,26 +2116,31 @@ static inline void cetrafs_ee_set_pblk(cetrafs_extent_t *e, u64 pblk)
 }
 
 /* A whole entry, reserved bits zeroed. */
-static inline void cetrafs_ee_init(cetrafs_extent_t *e, u32 lblk, u32 len, int uninit, u64 pblk)
+static inline void cetrafs_ee_init(cetrafs_extent_t *e, u64 lblk, u32 len, int uninit, u64 pblk)
 {
     cetrafs_ee_set_lblk(e, lblk);
-    e->ee_pad = cetrafs_cpu_to_le16(0);
+    /* ee_block_hi: written by cetrafs_ee_set_lblk() */
     cetrafs_ee_set_len(e, len, uninit);
     cetrafs_ee_set_pblk(e, pblk);
 }
 
 /* The child's logical range [lo, end); end 0 means "unknown, read it". */
-static inline u32 cetrafs_ei_lo(const cetrafs_extent_idx_t *i)
-{ return cetrafs_le32(i->ei_block); }
+static inline u64 cetrafs_ei_lo(const cetrafs_extent_idx_t *i)
+{ return (u64) cetrafs_le32(i->ei_block) | ((u64) cetrafs_le16(i->ei_block_hi) << 32); }
 
-static inline void cetrafs_ei_set_lo(cetrafs_extent_idx_t *i, u32 lo)
-{ i->ei_block = cetrafs_cpu_to_le32(lo); }
+/* The end as lo + span (v0x000A): 0, unknown, when the span is. */
+static inline u64 cetrafs_ei_end(const cetrafs_extent_idx_t *i)
+{ return cetrafs_le32(i->ei_span) ? cetrafs_ei_lo(i) + cetrafs_le32(i->ei_span) : 0; }
 
-static inline u32 cetrafs_ei_end(const cetrafs_extent_idx_t *i)
-{ return cetrafs_le32(i->ei_block_end); }
-
-static inline void cetrafs_ei_set_end(cetrafs_extent_idx_t *i, u32 end)
-{ i->ei_block_end = cetrafs_cpu_to_le32(end); }
+/* Both ends at once: a span is relative to lo, so they are never set
+ * apart. An end not past lo, or a span past 32 bits, is written unknown
+ * -- a conservative bound may always say "read it". */
+static inline void cetrafs_ei_set_range(cetrafs_extent_idx_t *i, u64 lo, u64 end)
+{
+    i->ei_block = cetrafs_cpu_to_le32((u32) (lo & 0xFFFFFFFFu));
+    i->ei_block_hi = cetrafs_cpu_to_le16((u16) (lo >> 32));
+    i->ei_span = cetrafs_cpu_to_le32(end > lo && end - lo <= 0xFFFFFFFFu ? (u32) (end - lo) : 0);
+}
 
 /* The child block's LBA. */
 static inline u64 cetrafs_ei_child(const cetrafs_extent_idx_t *i)
@@ -2139,11 +2153,9 @@ static inline void cetrafs_ei_set_child(cetrafs_extent_idx_t *i, u64 lba)
 }
 
 /* A whole entry, reserved bits zeroed. */
-static inline void cetrafs_ei_init(cetrafs_extent_idx_t *i, u32 lo, u32 end, u64 child)
+static inline void cetrafs_ei_init(cetrafs_extent_idx_t *i, u64 lo, u64 end, u64 child)
 {
-    cetrafs_ei_set_lo(i, lo);
-    cetrafs_ei_set_end(i, end);
-    i->ei_pad = cetrafs_cpu_to_le16(0);
+    cetrafs_ei_set_range(i, lo, end);
     cetrafs_ei_set_child(i, child);
 }
 

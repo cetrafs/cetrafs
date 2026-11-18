@@ -308,8 +308,8 @@ MODULE_PARM_DESC(defrag_extents_unsorted, "TEST ONLY: the defragmenter reads the
 /* Logical order of two extent records, for the sort in read_extents(). */
 static int cetrafs_defrag_ext_cmp(const void *a, const void *b)
 {
-    u32 ea = cetrafs_ee_lblk((const cetrafs_extent_t *) a);
-    u32 eb = cetrafs_ee_lblk((const cetrafs_extent_t *) b);
+    u64 ea = cetrafs_ee_lblk((const cetrafs_extent_t *) a);
+    u64 eb = cetrafs_ee_lblk((const cetrafs_extent_t *) b);
 
     return (ea > eb) - (ea < eb);
 }
@@ -698,7 +698,7 @@ static int cetrafs_defrag_pieces(const cetrafs_extent_t *head, u32 head_count, c
                     return -EIO; /* cannot happen: one entry per source piece */
                 take = min3(len, (u64) CETRAFS_EXT_LEN_MASK, seg_left);
                 memset(&out[n], 0, sizeof(out[n]));
-                cetrafs_ee_set_lblk(&out[n], (u32) lg);
+                cetrafs_ee_set_lblk(&out[n], lg);
                 cetrafs_ee_set_len(&out[n], (u32) take, un);
                 cetrafs_ee_set_pblk(&out[n], phys);
                 n++;

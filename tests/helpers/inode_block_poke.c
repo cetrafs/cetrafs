@@ -296,7 +296,7 @@ int main(int argc, char **argv)
              * against a healthy one saw block=0 for both and learned
              * nothing. (It also passed the raw __le32 to %u, unconverted.) */
             for (uint32_t e = 0; e < cetrafs_le16(rec.eh.eh_entries) && e < 4; ++e)
-                printf("ext %u logical=%u phys=%llu len=%u\n", e, cetrafs_ee_lblk(&rec.et.leaf[e]),
+                printf("ext %u logical=%" PRIu64 " phys=%llu len=%u\n", e, cetrafs_ee_lblk(&rec.et.leaf[e]),
                        (unsigned long long) cetrafs_ee_pblk(&rec.et.leaf[e]),
                        cetrafs_ee_len(&rec.et.leaf[e]));
         } else if (cetrafs_le16(rec.eh.eh_depth) == 1) {
@@ -310,7 +310,7 @@ int main(int argc, char **argv)
             uint32_t n = cetrafs_le16(lh->eh_entries) > CETRAFS_EXT_BLOCK_MAX_LEAVES ? CETRAFS_EXT_BLOCK_MAX_LEAVES : cetrafs_le16(lh->eh_entries);
 
             for (uint32_t e = 0; e < n; ++e)
-                printf("ext %u logical=%u phys=%llu len=%u\n", e, cetrafs_ee_lblk(&le[e]),
+                printf("ext %u logical=%" PRIu64 " phys=%llu len=%u\n", e, cetrafs_ee_lblk(&le[e]),
                        (unsigned long long) cetrafs_ee_pblk(&le[e]),
                        cetrafs_ee_len(&le[e]));
         }
@@ -423,12 +423,11 @@ int main(int argc, char **argv)
             return 1;
         }
         if (argc == 5) {
-            printf("lo=%u end=%u child=%llu\n", cetrafs_ei_lo(&rec.et.idx[slot]), cetrafs_ei_end(&rec.et.idx[slot]),
+            printf("lo=%" PRIu64 " end=%" PRIu64 " child=%llu\n", cetrafs_ei_lo(&rec.et.idx[slot]), cetrafs_ei_end(&rec.et.idx[slot]),
                    (unsigned long long) cetrafs_ei_child(&rec.et.idx[slot]));
             return 0;
         }
-        cetrafs_ei_set_lo(&rec.et.idx[slot], (uint32_t) strtoul(argv[5], NULL, 0));
-        cetrafs_ei_set_end(&rec.et.idx[slot], (uint32_t) strtoul(argv[6], NULL, 0));
+        cetrafs_ei_set_range(&rec.et.idx[slot], strtoull(argv[5], NULL, 0), strtoull(argv[6], NULL, 0));
         cetrafs_inode_stamp_crcs_us(&rec);
         pwrite_all(fd, &rec, sizeof(rec), rec_off);
         fprintf(stderr, "inode_block_poke: ino %llu root slot %u range -> [%s,%s)\n", (unsigned long long) ino, slot,
@@ -455,8 +454,7 @@ int main(int argc, char **argv)
             return 1;
         }
         ie = (cetrafs_extent_idx_t *) (blk + sizeof(cetrafs_extent_hdr_t)) + e;
-        cetrafs_ei_set_lo(ie, (uint32_t) strtoul(argv[5], NULL, 0));
-        cetrafs_ei_set_end(ie, (uint32_t) strtoul(argv[6], NULL, 0));
+        cetrafs_ei_set_range(ie, strtoull(argv[5], NULL, 0), strtoull(argv[6], NULL, 0));
         t = (cetrafs_blk_tail_t *) (blk + CETRAFS_BLK_TAIL_OFF);
         t->crc = cetrafs_cpu_to_le32(crc32c_update(0, blk, CETRAFS_BLK_TAIL_OFF));
         pwrite_all(fd, blk, sizeof(blk), (off_t) ilba * CETRAFS_BLOCK_SIZE);
@@ -568,8 +566,7 @@ int main(int argc, char **argv)
             /* The first slot's own interior, so a path that reads every
              * slot regardless of range reads a valid block. */
             rec.et.idx[i] = rec.et.idx[0];
-            cetrafs_ei_set_lo(&rec.et.idx[i], 0xFFFFFFF0u);
-            cetrafs_ei_set_end(&rec.et.idx[i], 0xFFFFFFF1u);
+            cetrafs_ei_set_range(&rec.et.idx[i], 0xFFFFFFF0u, 0xFFFFFFF1u);
         }
         rec.eh.eh_entries = cetrafs_cpu_to_le16((uint16_t) n);
         cetrafs_inode_stamp_crcs_us(&rec);

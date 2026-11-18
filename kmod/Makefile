@@ -13,6 +13,9 @@ ccflags-y := -I$(src)/../include
 #   make mod CETRAFS_NO_WERROR=1
 ifeq ($(CETRAFS_NO_WERROR),)
 ccflags-y += -Werror
+# printk formats: off by default in some distribution builds, and a u64
+# printed with %u is garbage in exactly the messages that matter (M-42).
+ccflags-y += -Wformat
 endif
 
 # A goto past a declaration skips its initialiser, and C allows it in

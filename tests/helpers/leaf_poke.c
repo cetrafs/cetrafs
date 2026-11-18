@@ -121,8 +121,8 @@ int main(int argc, char **argv)
         }
         if (argv[2][0] == 's') {
             for (i = 0; i < n; i++)
-                printf("ent %u block=%u phys=%" PRIu64 " len=%u uninit=%d\n", i,
-                       (unsigned) cetrafs_ee_lblk(&leaves[i]),
+                printf("ent %u block=%" PRIu64 " phys=%" PRIu64 " len=%u uninit=%d\n", i,
+                       cetrafs_ee_lblk(&leaves[i]),
                        cetrafs_ee_pblk(&leaves[i]),
                        (unsigned) cetrafs_ee_len(&leaves[i]), cetrafs_ee_uninit(&leaves[i]));
             return 0;
@@ -171,7 +171,7 @@ int main(int argc, char **argv)
         }
 
         if (set_block) {
-            cetrafs_ee_set_lblk(&leaves[entry], (uint32_t) new_phys);
+            cetrafs_ee_set_lblk(&leaves[entry], new_phys);
         } else {
             cetrafs_ee_set_pblk(&leaves[entry], new_phys);
         }

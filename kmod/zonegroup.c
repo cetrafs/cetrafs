@@ -871,14 +871,14 @@ loff_t cetrafs_max_file_size_for(u64 data_blocks)
      * overflowing loff_t on the multiply -- real capacities are nowhere
      * near this, but MAX_LFS_FILESIZE itself is the contract either way.
      *
-     * The second ceiling is the one that bites at real SAN sizes:
-     * an extent's logical block is 32 bits, so the extent tree cannot
-     * address a logical block past 2^32 -- 16 TiB -- no matter how much
-     * capacity the volume has. Without this clamp a 17 TiB volume
-     * reported 16.9 TiB, the VFS let a write through at offset 16 TiB,
-     * and the logical block number truncated into the u32 and ALIASED
-     * offset 0 of the same file: measured, bytes written at 16 TiB read
-     * back at offset 0, with i_size happily claiming both. */
+     * The second ceiling is the format's: an extent's logical block is
+     * 48 bits (v0x000A), so the tree cannot address a block past 2^48
+     * however much capacity the volume has. When it was 32 bits and
+     * this clamp was missing, a 17 TiB volume let a write through at
+     * offset 16 TiB, the logical block truncated, and it ALIASED offset
+     * 0 of the same file -- measured: bytes written at 16 TiB read back
+     * at offset 0. Every logical block is u64 now, with no narrowing
+     * casts (M-42). */
     max_blocks = (u64) MAX_LFS_FILESIZE / CETRAFS_BLOCK_SIZE;
     if (max_blocks > CETRAFS_MAX_FILE_BLOCKS)
         max_blocks = CETRAFS_MAX_FILE_BLOCKS;

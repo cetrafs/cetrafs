@@ -1213,7 +1213,7 @@ int cetrafs_dir_add_entry(struct inode *dir, const struct qstr *name, u64 ino, u
      * capped every directory at 60 dirents.
      */
     if (!have_slot) {
-        u32 next_logical = (u32) cetrafs_dir_extents_nblocks(&dx);
+        u64 next_logical = cetrafs_dir_extents_nblocks(&dx);
 
         cetrafs_dir_extents_put(&dx);
         /* The cap every reader enforces (cetrafs_dir_extents_addr_ok()). */
@@ -1228,7 +1228,7 @@ int cetrafs_dir_add_entry(struct inode *dir, const struct qstr *name, u64 ino, u
 
         ret = cetrafs_inode_map_block(dir, next_logical, /*create=*/true, &new_lba);
         if (ret == -ENOSPC)
-            pr_warn_ratelimited("dir ino=%llu cannot grow past %u blocks: its extent tree is full or the volume "
+            pr_warn_ratelimited("dir ino=%llu cannot grow past %llu blocks: its extent tree is full or the volume "
                                 "is out of space\n",
                                 (unsigned long long) dir->i_ino, next_logical);
         if (ret)

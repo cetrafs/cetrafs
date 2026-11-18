@@ -929,21 +929,47 @@ struct buffer_head *cetrafs_read_leaf_bh(struct inode *inode, u64 lba);
 
 /* lock.c: one remembered extent per inode -- see cetrafs_inode_info's
  * ext_valid comment for what keys it and what may not be cached. */
+/*
+ * Where 'iblock' sits inside the run [start, start + len): its offset, and
+ * the blocks left from it. The one place a logical-block difference is
+ * narrowed to a run length (31 bits by format), and only after checking it
+ * is inside -- every caller has found the run by that test already, so a
+ * miss is a bug: warned, and answered with 0 / 1 so that a walk stepping
+ * by the result still moves (rule 14).
+ */
+static inline u32 cetrafs_run_off(u64 start, u32 len, u64 iblock)
+{
+    u64 off = iblock - start;
+
+    if (WARN_ON_ONCE(iblock < start || off >= len))
+        return 0;
+    return (u32) off; /* < len, checked */
+}
+
+static inline u32 cetrafs_run_left(u64 start, u32 len, u64 iblock)
+{
+    u64 off = iblock - start;
+
+    if (WARN_ON_ONCE(iblock < start || off >= len))
+        return 1;
+    return len - (u32) off; /* off < len, checked */
+}
+
 struct cetrafs_ext_span {
-    u32 block; /* first file-relative block the extent covers */
+    u64 block; /* first file-relative block the extent covers */
     u32 len;   /* blocks */
     u64 lba;   /* device block 'block' lives at */
     bool uninit;
 };
 bool cetrafs_inode_ext_cache_lookup(struct inode *inode,
                                     const cetrafs_inode_t *raw,
-                                    u32 iblock,
+                                    u64 iblock,
                                     u64 *out_lba,
                                     u32 *out_run,
                                     bool *out_uninit);
 void cetrafs_inode_ext_cache_store(struct inode *inode,
                                    const cetrafs_inode_t *raw,
-                                   u32 ext_block,
+                                   u64 ext_block,
                                    u32 ext_len,
                                    u64 ext_lba,
                                    bool uninit,
@@ -1092,7 +1118,7 @@ void cetrafs_nslock_exit(void);
 void cetrafs_nslock_release_set(struct inode **inodes, int n);
 
 // file.c
-int cetrafs_inode_map_block(struct inode *inode, u32 iblock, bool create, u64 *out_lba);
+int cetrafs_inode_map_block(struct inode *inode, u64 iblock, bool create, u64 *out_lba);
 void cetrafs_free_inline_extents(struct inode *dir, const cetrafs_inode_t *raw);
 
 /* file.c: an inode's extent list, resolved at any depth. Evict holds one
@@ -1525,19 +1551,19 @@ int cetrafs_convert_pending_locked(struct inode *inode);
 int cetrafs_convert_pending(struct inode *inode);
 int cetrafs_inode_sync_pending(struct inode *inode);
 /* lock.c: the per-inode set those blocks live in. */
-int cetrafs_pending_add(struct inode *inode, u32 first, u32 count);
-u32 cetrafs_pending_run(struct inode *inode, u32 block);
-int cetrafs_pending_next(struct inode *inode, u32 from, u32 *first, u32 *last);
+int cetrafs_pending_add(struct inode *inode, u64 first, u32 count);
+u32 cetrafs_pending_run(struct inode *inode, u64 block);
+int cetrafs_pending_next(struct inode *inode, u64 from, u64 *first, u64 *last);
 /* lock.c: O_DIRECT writes in flight into preallocated blocks (G-1) */
 bool cetrafs_dio_is_track(void *p);
-void *cetrafs_dio_track_add(struct inode *inode, void *cur, u32 first, u32 count);
+void *cetrafs_dio_track_add(struct inode *inode, void *cur, u64 first, u32 count);
 void cetrafs_dio_track_done(struct inode *inode, void *p);
-bool cetrafs_unit_dio_busy(struct inode *inode, u32 first, u32 count);
+bool cetrafs_unit_dio_busy(struct inode *inode, u64 first, u32 count);
 bool cetrafs_pending_any(struct inode *inode);
 bool cetrafs_conv_unflushed(struct inode *inode);
 void cetrafs_conv_unflushed_set(struct inode *inode, bool unflushed);
 bool cetrafs_pending_wb_failed(struct inode *inode);
-void cetrafs_pending_clear(struct inode *inode, u32 first, u32 last);
+void cetrafs_pending_clear(struct inode *inode, u64 first, u64 last);
 void cetrafs_pending_drop_all(struct inode *inode);
 int cetrafs_tree_resv_fill(struct inode *inode);
 int cetrafs_tree_alloc_block(struct inode *inode, u32 *bg, u64 *lba);

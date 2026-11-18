@@ -108,7 +108,7 @@ u64 cetrafs_lock_resume_count(void)
  * all under the one record key (see cetrafs_inode_info.ext_valid). */
 #define CETRAFS_EXT_CACHE_MAX 16
 struct cetrafs_ext_ent {
-    u32 block; /* first file-relative block covered */
+    u64 block; /* first file-relative block covered */
     u32 len;   /* how many blocks */
     u64 lba;   /* device block 'block' lives at */
     bool uninit;
@@ -819,7 +819,7 @@ static bool cetrafs_ext_key_matches(const struct cetrafs_inode_info *ci, const c
  */
 bool cetrafs_inode_ext_cache_lookup(struct inode *inode,
                                     const cetrafs_inode_t *raw,
-                                    u32 iblock,
+                                    u64 iblock,
                                     u64 *out_lba,
                                     u32 *out_run,
                                     bool *out_uninit)
@@ -837,10 +837,10 @@ bool cetrafs_inode_ext_cache_lookup(struct inode *inode,
         for (i = 0; i < ci->ext_n && !hit; i++) {
             const struct cetrafs_ext_ent *e = &ci->ext_ent[i];
 
-            if (iblock >= e->block && (u64) iblock < (u64) e->block + e->len) {
+            if (iblock >= e->block && iblock < e->block + e->len) {
                 *out_lba = e->lba + (iblock - e->block);
                 if (out_run)
-                    *out_run = e->len - (iblock - e->block);
+                    *out_run = cetrafs_run_left(e->block, e->len, iblock);
                 if (out_uninit)
                     *out_uninit = e->uninit;
                 hit = true;
@@ -889,7 +889,7 @@ MODULE_PARM_DESC(ext_cache_entries, "TEST ONLY: extents remembered per inode by 
 
 void cetrafs_inode_ext_cache_store(struct inode *inode,
                                    const cetrafs_inode_t *raw,
-                                   u32 ext_block,
+                                   u64 ext_block,
                                    u32 ext_len,
                                    u64 ext_lba,
                                    bool uninit,
@@ -1767,7 +1767,11 @@ struct list_head *cetrafs_inode_deferred(struct inode *inode)
  * Caller holds invalidate_lock exclusively, which serialises every
  * writer of the set, so the neighbours read here cannot move before the
  * store. */
-int cetrafs_pending_add(struct inode *inode, u32 first, u32 count)
+/* The pending set is a maple tree indexed by unsigned long, and a logical
+ * block is 48 bits (v0x000A): only a 64-bit kernel holds one. */
+static_assert(BITS_PER_LONG == 64, "cetrafs needs 64-bit logical block indices");
+
+int cetrafs_pending_add(struct inode *inode, u64 first, u32 count)
 {
     struct cetrafs_inode_info *ci = CETRAFS_I(inode);
     unsigned long s = first, e = (unsigned long) first + count - 1;
@@ -1817,7 +1821,7 @@ int cetrafs_pending_add(struct inode *inode, u32 first, u32 count)
 
 /* Blocks from `block` to the end of its pending range, 0 if not pending.
  * Lockless. */
-u32 cetrafs_pending_run(struct inode *inode, u32 block)
+u32 cetrafs_pending_run(struct inode *inode, u64 block)
 {
     struct cetrafs_inode_info *ci = CETRAFS_I(inode);
     MA_STATE(mas, &ci->pending, block, block);
@@ -1838,7 +1842,7 @@ u32 cetrafs_pending_run(struct inode *inode, u32 block)
 
 /* The first pending range ending at or after `from`: *first (clamped to
  * `from`) and *last. -ENOENT if there is none. Lockless. */
-int cetrafs_pending_next(struct inode *inode, u32 from, u32 *first, u32 *last)
+int cetrafs_pending_next(struct inode *inode, u64 from, u64 *first, u64 *last)
 {
     struct cetrafs_inode_info *ci = CETRAFS_I(inode);
     MA_STATE(mas, &ci->pending, from, from);
@@ -1848,10 +1852,10 @@ int cetrafs_pending_next(struct inode *inode, u32 from, u32 *first, u32 *last)
     if (mtree_empty(&ci->pending))
         return -ENOENT;
     rcu_read_lock();
-    entry = mas_find(&mas, U32_MAX);
+    entry = mas_find(&mas, ULONG_MAX);
     if (entry) {
-        *first = (u32) max_t(unsigned long, mas.index, from);
-        *last = (u32) min_t(unsigned long, mas.last, U32_MAX);
+        *first = max_t(u64, mas.index, from);
+        *last = mas.last;
         ret = 0;
     }
     rcu_read_unlock();
@@ -1873,7 +1877,7 @@ struct cetrafs_dio_track {
     u32 n;
     struct list_head link;
     struct {
-        u32 first, last;
+        u64 first, last;
     } r[CETRAFS_DIO_TRACK_RANGES];
 };
 
@@ -1893,11 +1897,11 @@ bool cetrafs_dio_is_track(void *p)
  * when none could be allocated -- the write must then fail: untracked,
  * its landed data could be zeroed by a unit convert. Caller holds
  * invalidate_lock exclusively. */
-void *cetrafs_dio_track_add(struct inode *inode, void *cur, u32 first, u32 count)
+void *cetrafs_dio_track_add(struct inode *inode, void *cur, u64 first, u32 count)
 {
     struct cetrafs_inode_info *ci = CETRAFS_I(inode);
     struct cetrafs_dio_track *t = cur;
-    u32 last = first + count - 1;
+    u64 last = first + count - 1;
 
     if (!count)
         return cur;
@@ -1947,11 +1951,11 @@ void cetrafs_dio_track_done(struct inode *inode, void *p)
  * those blocks nor mark them written. Caller holds invalidate_lock
  * exclusively, which every mapping that adds a tracker holds too.
  */
-bool cetrafs_unit_dio_busy(struct inode *inode, u32 first, u32 count)
+bool cetrafs_unit_dio_busy(struct inode *inode, u64 first, u32 count)
 {
     struct cetrafs_inode_info *ci = CETRAFS_I(inode);
     struct cetrafs_dio_track *t;
-    u32 last = first + count - 1;
+    u64 last = first + count - 1;
     bool busy = false;
     u32 i;
 
@@ -1997,7 +2001,7 @@ bool cetrafs_pending_wb_failed(struct inode *inode)
 /* Remove [first, last]. Must not fail: a stale entry would later make a
  * NEW preallocated block at that offset read as data -- whatever its
  * previous owner left there. Caller holds invalidate_lock exclusively. */
-void cetrafs_pending_clear(struct inode *inode, u32 first, u32 last)
+void cetrafs_pending_clear(struct inode *inode, u64 first, u64 last)
 {
     struct cetrafs_inode_info *ci = CETRAFS_I(inode);
 
@@ -2278,10 +2282,10 @@ static void cetrafs_pending_forget_cached(struct inode *inode)
     struct address_space *m = inode->i_mapping;
     unsigned int shift = PAGE_SHIFT - inode->i_blkbits;
     u64 lo = U64_MAX, hi = 0, at = 0;
-    u32 first, last;
+    u64 first, last;
 
     filemap_invalidate_lock(m);
-    while (at <= U32_MAX && !cetrafs_pending_next(inode, (u32) at, &first, &last)) {
+    while (!cetrafs_pending_next(inode, at, &first, &last)) {
         lo = min_t(u64, lo, first);
         hi = max_t(u64, hi, last);
         at = (u64) last + 1;

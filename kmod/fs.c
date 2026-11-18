@@ -3728,7 +3728,7 @@ int cetrafs_fill_super(struct super_block *sb, struct fs_context *fc)
      * blkid-style tools, fanotify and statfs's f_fsid key on it, and the
      * device number differs per node (audit F-56). */
     super_set_uuid(sb, cetrafs_sb_raw(sb)->uuid, sizeof(cetrafs_sb_raw(sb)->uuid));
-    /* s_maxbytes is the FORMAT ceiling (2^32 blocks), which never moves;
+    /* s_maxbytes is the FORMAT ceiling (2^48 blocks, v0x000A), which never moves;
      * the VFS enforces it in setattr_prepare(), generic_write_checks()
      * and vfs_fallocate(). The volume's CAPACITY, which a live grow
      * raises, is enforced by cetrafs_sb_capacity_for() in write_iter,

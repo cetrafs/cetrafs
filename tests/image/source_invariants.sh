@@ -746,7 +746,7 @@ spin_lines() { # <files...>: file:line:code for every line run with a spinlock h
     }' "$@"
 }
 SPIN_SLEEPERS_RE='\b(msleep|usleep_range|ssleep|mutex_lock[a-z_]*|down|down_[a-z_]+|wait_event[a-z_]*|wait_for_[a-z_]+|schedule[a-z_]*|cond_resched|lock_buffer|wait_on_buffer|[a-z_]*bread[a-z_]*|submit_bh|sync_dirty_buffer|iput|brelse|vmalloc|kvmalloc|copy_(to|from)_user|cancel_[a-z_]*_sync|flush_[a-z_]+|synchronize_[a-z_]+)\('
-SPIN_OK='cetrafs_peer_window_floor_secs cetrafs_sb_own_renewal_overdue cetrafs_deferred_on_list cetrafs_deferred_eager cetrafs_ext_key_matches cetrafs_inode_deferred cetrafs_inode_fd_copy cetrafs_inode_get_generation cetrafs_inode_wb_failed cetrafs_le16 cetrafs_le32 cetrafs_le64 cetrafs_nswait_is_current cetrafs_pending_any cetrafs_resv_publish cetrafs_resv_unpublish cetrafs_row_mark_of cetrafs_row_mark_same cetrafs_sb_bg_discard_pending_ignored cetrafs_sb_layout_of cetrafs_sb_stale_secs'
+SPIN_OK='cetrafs_peer_window_floor_secs cetrafs_run_left cetrafs_sb_own_renewal_overdue cetrafs_deferred_on_list cetrafs_deferred_eager cetrafs_ext_key_matches cetrafs_inode_deferred cetrafs_inode_fd_copy cetrafs_inode_get_generation cetrafs_inode_wb_failed cetrafs_le16 cetrafs_le32 cetrafs_le64 cetrafs_nswait_is_current cetrafs_pending_any cetrafs_resv_publish cetrafs_resv_unpublish cetrafs_row_mark_of cetrafs_row_mark_same cetrafs_sb_bg_discard_pending_ignored cetrafs_sb_layout_of cetrafs_sb_stale_secs'
 SL="$(spin_lines "$K"/*.c)"
 [ "$(wc -l <<<"$SL")" -gt 100 ] || fail "class 19 spinlock: setup -- only $(wc -l <<<"$SL") lines found under a spinlock (the scan no longer matches)"
 SPIN_BAD="$(grep -E "$SPIN_SLEEPERS_RE" <<<"$SL" | grep -vE 'GFP_ATOMIC|GFP_NOWAIT' | head -5 || true)"
@@ -2228,7 +2228,7 @@ printf 'static void y(struct buffer_head *bh)\n{\n    cetrafs_bh_end_update_dirt
 # high bits live -- is then decided in that one header.
 log "checking extent/index entry fields are touched only by their accessors"
 ent_raw() { # <files...>: file:line of each code use of an entry field
-    grep -nE '(\.|->)(ee_block|ee_len|ee_start_hi|ee_start_lo|ee_pad|ei_block|ei_block_end|ei_leaf_hi|ei_leaf_lo|ei_pad)\b' "$@" |
+    grep -nE '(\.|->)(ee_block|ee_block_hi|ee_len|ee_start_hi|ee_start_lo|ei_block|ei_block_hi|ei_span|ei_leaf_hi|ei_leaf_lo)\b' "$@" |
         grep -vE ':[0-9]+:[[:space:]]*(\*|/\*)' || true
 }
 ENTR="$(ent_raw "$K"/*.c "$K"/*.h "$ROOT"/userspace/*.c "$ROOT"/userspace/*.h "$ROOT"/tests/helpers/*.c)"
@@ -2238,6 +2238,28 @@ ENTS="$(ct_tmp entraw).c"
 printf 'static u32 z(const cetrafs_extent_t *e)\n{\n    return cetrafs_le32(e->ee_block);\n}\n' >"$ENTS"
 [ -n "$(ent_raw "$ENTS")" ] && pass "entry fields: control -- a planted raw read is found" ||
     fail "entry fields: control -- a planted raw read is not found"
+
+# A logical block is 48 bits (v0x000A, M-42) and is carried in 64 bits
+# everywhere. It used to be 32, and the casts that narrowed it at every
+# entry point were exactly what hid each truncation from the compiler:
+# (u32) iblock compiles silently where u32 x = iblock would warn. So no
+# narrowing of one is written at all -- not a cast of an accessor's
+# result, not a 32-bit variable taking one, not a narrowing cast into a
+# setter, and not a (u32) of the names a logical block goes by. The one
+# narrowing to a run length lives in cetrafs_run_off()/_left(), behind
+# its own range check.
+log "checking no logical block is narrowed below 64 bits (M-42)"
+lblk_narrow() { # <files...>: file:line of each narrowing
+    grep -nE '\((u32|u16|uint32_t|uint16_t|unsigned|unsigned int|int)\) ?\(?cetrafs_(ee_lblk|ei_lo|ei_end)\(|\b(u32|u16|uint32_t|uint16_t|unsigned|int)[[:space:]]+[a-z_][a-z0-9_]*[[:space:]]*=[[:space:]]*cetrafs_(ee_lblk|ei_lo|ei_end)\(|cetrafs_(ee_set_lblk|ei_set_range|ei_init|ee_init)\([^;]*\((u32|uint32_t|unsigned)\)|\((u32|uint32_t)\) ?\(?(iblock|lblk|ws|start_block|end_block|cv_iblock)\b' "$@" |
+        grep -vE ':[0-9]+:[[:space:]]*(\*|/\*)' || true
+}
+LNR="$(lblk_narrow "$K"/*.c "$K"/*.h "$ROOT"/userspace/*.c "$ROOT"/userspace/*.h "$ROOT"/tests/helpers/*.c)"
+[ -z "$LNR" ] && pass "M-42: no logical block is narrowed below 64 bits" ||
+    fail "M-42: a logical block narrowed (carry it in u64; a run length goes through cetrafs_run_off/_left): $(head -5 <<<"$LNR" | tr '\n' ' ')"
+LNRS="$(ct_tmp lblknarrow).c"
+printf 'static void z(cetrafs_extent_t *e, u64 iblock)\n{\n    u32 b = cetrafs_ee_lblk(e);\n    f((u32) iblock);\n    cetrafs_ee_set_lblk(e, (u32) b);\n}\n' >"$LNRS"
+[ "$(lblk_narrow "$LNRS" | wc -l)" = 3 ] && pass "M-42: control -- a planted narrowing of each kind is found (3)" ||
+    fail "M-42: control -- planted narrowings found: $(lblk_narrow "$LNRS" | wc -l) of 3"
 
 log "checking every -ENOSPC/-EBUSY/-ENOENT/-ETXTBSY names the transient states it waited out (class 43)"
 C43_REG_ENOSPC='cetrafs_alloc_pick_bg waits:cetrafs_sb_release_wait

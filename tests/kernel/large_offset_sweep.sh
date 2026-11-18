@@ -3,11 +3,13 @@
 # ct-timeout: 900
 # large logical offsets: writes, holes, SEEK, fiemap, punch and truncate at the format's boundaries
 #
-# A file's logical block is a u32 (ee_block) and an extent covers at most
-# 2^31 blocks (CETRAFS_EXT_LEN_MASK, 8 TiB); a file is addressable to
-# 2^32 blocks, 16 TiB. The arithmetic that crosses those powers of two is
-# where aliasing hides: max_file_size.sh found a write at 16 TiB read
-# back at offset 0. The large-offset suites so far each probe ONE offset;
+# A file's logical block is 48 bits (v0x000A, M-42) and an extent covers
+# at most 2^31 blocks (CETRAFS_EXT_LEN_MASK, 8 TiB); a file is addressable
+# to 2^48 blocks. The arithmetic that crosses powers of two is where
+# aliasing hides: when the block was 32 bits, max_file_size.sh found a
+# write at 16 TiB read back at offset 0. 2^31 and 2^32 stay the edges
+# swept here -- 2^32 is where a leftover 32-bit carry would wrap -- and
+# 4b puts one extent across 2^32. The large-offset suites so far each probe ONE offset;
 # this sweeps the boundaries together, and through every path that
 # reads the same map -- write, read, SEEK_DATA/SEEK_HOLE, FIEMAP, punch,
 # truncate and the byte-level i_size edges.
@@ -49,7 +51,7 @@ B1=$((2 ** 31 - 2))
 B2=$((2 ** 31))
 B3=$((2 ** 32 - 3))
 B4=$((2 ** 32 - 1))
-MAXB=$((2 ** 32))
+MAXB=$((2 ** 48))
 MAXBYTES=$((MAXB * 4096))
 
 # Five low blocks come first. Four extents fill a file's inline array, so
@@ -213,7 +215,7 @@ else
     fail "3b: truncate to just past B3 was refused"
 fi
 
-# ---- 4. byte-level i_size edges at the 16 TiB ceiling
+# ---- 4. byte-level i_size edges at the 2^60-byte ceiling
 log "the byte at the ceiling, and one past it"
 OUT="$(python3 -I - "$MNT/edge" "$MAXBYTES" <<'PY'
 import errno, os, sys
@@ -244,6 +246,9 @@ if os.pread(fd, 1, top - 1) != b"Y" and n == 1:
     errs.append("the in-range byte of a straddling write did not land")
 if os.pread(fd, 1, 0) != b"\0":
     errs.append("offset 0 changed: the top of the file aliased onto it")
+alias = ((top - 1) // 4096 % 2 ** 32) * 4096 + 4095  # where a 32-bit carry would put it
+if os.pread(fd, 1, alias) != b"\0":
+    errs.append("offset %d changed: the top of the file aliased onto its 32-bit truncation" % alias)
 if os.pread(fd, 1, 1234) != b"Z":
     errs.append("the byte written at 1234 was disturbed")
 os.close(fd)
@@ -253,6 +258,55 @@ PY
 )" || true
 [ "$OUT" = OK ] && pass "4: the last byte is writable, the byte past it is refused with EFBIG, and nothing aliases offset 0" ||
     fail "4: i_size edges: $(printf '%s' "$OUT" | tr '\n' ';')"
+
+# ---- 4b. one extent across 2^32
+#
+# Three adjacent blocks written in order merge into one extent whose
+# logical start is below 2^32 and whose end is above it: the start's
+# high bits, the run arithmetic and the punch split all cross there.
+log "an extent straddling block 2^32: read, SEEK, punch"
+OUT="$(python3 -I - "$MNT/straddle" <<'PY'
+import ctypes, errno, os, sys
+libc = ctypes.CDLL("libc.so.6", use_errno=True)
+libc.fallocate.argtypes = [ctypes.c_int, ctypes.c_int, ctypes.c_long, ctypes.c_long]
+SEEK_DATA, SEEK_HOLE = 3, 4
+B = 2 ** 32
+path = sys.argv[1]
+pat = lambda b: (b"S%015d" % b) * 256
+fd = os.open(path, os.O_RDWR | os.O_CREAT, 0o644)
+errs = []
+for b in (B - 1, B, B + 1):
+    os.pwrite(fd, pat(b), b * 4096)
+os.fsync(fd)
+for b in (B - 1, B, B + 1):
+    if os.pread(fd, 4096, b * 4096) != pat(b):
+        errs.append("block %d does not read back" % b)
+for b in (B - 2, 0, 1):
+    if os.pread(fd, 4096, b * 4096) != b"\0" * 4096:
+        errs.append("block %d is not a hole" % b)
+if os.fstat(fd).st_size != (B + 2) * 4096 or os.pread(fd, 4096, (B + 2) * 4096) != b"":
+    errs.append("i_size is %d, not the end of block 2^32+1" % os.fstat(fd).st_size)
+if os.lseek(fd, 0, SEEK_DATA) != (B - 1) * 4096:
+    errs.append("SEEK_DATA from 0 is %d, not block 2^32-1" % os.lseek(fd, 0, SEEK_DATA))
+if os.lseek(fd, (B - 1) * 4096, SEEK_HOLE) != (B + 2) * 4096:
+    errs.append("SEEK_HOLE past the run is %d, not block 2^32+2" % os.lseek(fd, (B - 1) * 4096, SEEK_HOLE))
+if libc.fallocate(fd, 3, B * 4096, 4096) != 0:  # PUNCH_HOLE | KEEP_SIZE
+    errs.append("punching block 2^32 failed: %s" % errno.errorcode.get(ctypes.get_errno()))
+os.fsync(fd)
+if os.pread(fd, 4096, B * 4096) != b"\0" * 4096:
+    errs.append("block 2^32 still holds data after the punch")
+for b in (B - 1, B + 1):
+    if os.pread(fd, 4096, b * 4096) != pat(b):
+        errs.append("block %d lost its data to the punch of 2^32" % b)
+if os.lseek(fd, B * 4096, SEEK_DATA) != (B + 1) * 4096:
+    errs.append("SEEK_DATA from the punched block is %d, not 2^32+1" % os.lseek(fd, B * 4096, SEEK_DATA))
+os.close(fd)
+print("\n".join(errs) if errs else "OK")
+sys.stdout.flush()
+PY
+)" || true
+[ "$OUT" = OK ] && pass "4b: an extent across 2^32 reads back, SEEKs and punches at the right blocks" ||
+    fail "4b: straddling 2^32: $(printf '%s' "$OUT" | tr '\n' ';')"
 
 # ---- 5. control: the sweep must see an alias
 #

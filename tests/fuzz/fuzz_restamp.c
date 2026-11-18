@@ -193,7 +193,7 @@ static void set_extent(cetrafs_extent_t *e, uint32_t block, uint32_t len, uint64
     cetrafs_extent_phys_to_hilo(phys, &hi, &lo);
     e->ee_start_hi = hi;
     e->ee_start_lo = lo;
-    e->ee_pad = 0;
+    e->ee_block_hi = 0;
 }
 
 /* Structure-aware extent-tree crafter (the fuzzer's "next stage"): writes an

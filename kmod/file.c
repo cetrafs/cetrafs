@@ -230,7 +230,7 @@ u64 cetrafs_dio_convert_count(void)
  * workqueue, since converting takes locks and does I/O. */
 static int cetrafs_dio_mark_convert(struct inode *inode, struct buffer_head *bh, sector_t iblock)
 {
-    void *t = cetrafs_dio_track_add(inode, bh->b_private, (u32) iblock, (u32) (bh->b_size >> inode->i_blkbits));
+    void *t = cetrafs_dio_track_add(inode, bh->b_private, iblock, (u32) (bh->b_size >> inode->i_blkbits));
 
     if (!t)
         return -ENOMEM; /* untracked, a unit convert could zero its landed data */
@@ -1197,7 +1197,7 @@ static int __cetrafs_convert_pending(struct inode *inode, bool *flipped)
 {
     struct address_space *m = inode->i_mapping;
     unsigned int bits = inode->i_blkbits;
-    u32 first, last;
+    u64 first, last;
     u64 from = 0, cur = 0;
     int ret;
 
@@ -1226,7 +1226,7 @@ static int __cetrafs_convert_pending(struct inode *inode, bool *flipped)
     {
         u64 lo = U64_MAX, hi = 0, at = 0;
 
-        while (at <= U32_MAX && !cetrafs_pending_next(inode, (u32) at, &first, &last)) {
+        while (!cetrafs_pending_next(inode, at, &first, &last)) {
             lo = min_t(u64, lo, first);
             hi = max_t(u64, hi, last);
             at = (u64) last + 1;
@@ -1256,7 +1256,7 @@ static int __cetrafs_convert_pending(struct inode *inode, bool *flipped)
      * at cetrafs_convert_pending()). */
     *flipped = true;
 
-    while (from <= U32_MAX && !cetrafs_pending_next(inode, (u32) from, &first, &last)) {
+    while (!cetrafs_pending_next(inode, from, &first, &last)) {
         for (cur = first; cur <= last;) {
             struct buffer_head map = {0};
             u64 n;
@@ -1287,7 +1287,7 @@ fail:
      * the next boundary to try again. */
     if (cur > first) {
         smp_wmb();
-        cetrafs_pending_clear(inode, first, (u32) (cur - 1));
+        cetrafs_pending_clear(inode, first, cur - 1);
     }
     pr_err_ratelimited("ino=%llu: could not mark buffered block %llu written (%d) -- it reads as zeros until a later "
                        "fsync or close converts it\n",
@@ -1359,9 +1359,9 @@ static void cetrafs_convert_prewrite(struct inode *inode)
     struct address_space *m = inode->i_mapping;
     unsigned int bits = inode->i_blkbits;
     u64 lo = U64_MAX, hi = 0, at = 0;
-    u32 first, last;
+    u64 first, last;
 
-    while (at <= U32_MAX && !cetrafs_pending_next(inode, (u32) at, &first, &last)) {
+    while (!cetrafs_pending_next(inode, at, &first, &last)) {
         lo = min_t(u64, lo, first);
         hi = max_t(u64, hi, last);
         at = (u64) last + 1;
@@ -1723,7 +1723,7 @@ static unsigned int cetrafs_lookup_stall_ms;
 cetrafs_test_param(lookup_stall_ms, cetrafs_lookup_stall_ms, uint, 0644);
 MODULE_PARM_DESC(lookup_stall_ms, "TEST ONLY: stall one depth-2 lookup before it reads a leaf, once");
 
-static void cetrafs_lookup_stall(struct inode *inode, u32 iblock)
+static void cetrafs_lookup_stall(struct inode *inode, u64 iblock)
 {
     unsigned int ms;
 
@@ -2294,9 +2294,9 @@ static noinline_for_stack u64 cetrafs_cached_first_miss(struct address_space *m,
  * -- or `end`. */
 static u64 cetrafs_pending_first(struct inode *inode, u64 from, u64 end)
 {
-    u32 f, l;
+    u64 f, l;
 
-    if (from > U32_MAX || cetrafs_pending_next(inode, (u32) from, &f, &l))
+    if (cetrafs_pending_next(inode, from, &f, &l))
         return end;
     return min_t(u64, f, end);
 }
@@ -2310,9 +2310,9 @@ static u64 cetrafs_unwritten_first(struct address_space *m, u64 from, u64 end)
         u32 prun;
 
         h = cetrafs_cached_first_miss(m, h, end);
-        if (h >= end || h > U32_MAX)
-            return min(h, end);
-        prun = cetrafs_pending_run(m->host, (u32) h);
+        if (h >= end)
+            return end;
+        prun = cetrafs_pending_run(m->host, h);
         if (!prun)
             return h;
         h += prun; /* at least one: progress whatever the set says */
@@ -2823,8 +2823,8 @@ static void cetrafs_tree_remember(struct inode *inode, const cetrafs_inode_t *ra
  * answer, and a contiguous file is one extent anyway.
  */
 static bool cetrafs_leaf_array_lookup(const cetrafs_extent_t *arr,
-                                      u16 entries,
-                                      u32 iblock,
+                                      u32 entries,
+                                      u64 iblock,
                                       u64 *out_lba,
                                       u32 *out_run,
                                       bool *out_uninit,
@@ -2834,14 +2834,14 @@ static bool cetrafs_leaf_array_lookup(const cetrafs_extent_t *arr,
 
     for (i = 0; i < entries; i++) {
         u32 len = cetrafs_ee_len(&arr[i]);
-        u32 eb = cetrafs_ee_lblk(&arr[i]);
+        u64 eb = cetrafs_ee_lblk(&arr[i]);
 
         if (iblock >= eb && iblock < (u64) eb + len) {
             u64 base = cetrafs_ee_pblk(&arr[i]);
 
             *out_lba = base + (iblock - eb);
             if (out_run)
-                *out_run = len - (iblock - eb);
+                *out_run = cetrafs_run_left(eb, len, iblock);
             if (out_uninit)
                 *out_uninit = cetrafs_ee_uninit(&arr[i]);
             /* The WHOLE extent, not just the tail from iblock: that is
@@ -2885,7 +2885,7 @@ static u64 cetrafs_leaf_array_next_contig_lba(const cetrafs_extent_t *arr, u16 e
  * Returns 0, or -ENOSPC if the array is full and the last entry can't be
  * extended. */
 static int
-cetrafs_leaf_array_insert(cetrafs_extent_t *arr, __le16 *entries, u16 max, u32 iblock, u64 lba, u32 count, bool uninit);
+cetrafs_leaf_array_insert(cetrafs_extent_t *arr, __le16 *entries, u16 max, u64 iblock, u64 lba, u32 count, bool uninit);
 
 /* Preallocated blocks a split could not keep -- the give-back. Every
  * split now grows the tree instead, so this moves only when that growth
@@ -2949,7 +2949,7 @@ u64 cetrafs_convert_leaf_full_count(void)
  */
 static void cetrafs_leaf_array_neighbours(const cetrafs_extent_t *arr,
                                           u16 n,
-                                          u32 iblock,
+                                          u64 iblock,
                                           u64 lba,
                                           u32 count,
                                           int *pred,
@@ -2960,7 +2960,7 @@ static void cetrafs_leaf_array_neighbours(const cetrafs_extent_t *arr,
     *pred = -1;
     *succ = -1;
     for (j = 0; j < n; j++) {
-        u32 eb = cetrafs_ee_lblk(&arr[j]);
+        u64 eb = cetrafs_ee_lblk(&arr[j]);
         u32 len = cetrafs_ee_len(&arr[j]);
         u64 phys = cetrafs_ee_pblk(&arr[j]);
 
@@ -2978,7 +2978,7 @@ static void cetrafs_leaf_array_neighbours(const cetrafs_extent_t *arr,
  * entry: no slot needed, nothing leaves this leaf. Returns false (array
  * untouched) when there is no neighbour to grow.
  */
-static bool cetrafs_leaf_array_coalesce(cetrafs_extent_t *arr, u16 *np, u32 iblock, u64 lba, u32 count)
+static bool cetrafs_leaf_array_coalesce(cetrafs_extent_t *arr, u16 *np, u64 iblock, u64 lba, u32 count)
 {
     int p, q;
 
@@ -3017,7 +3017,7 @@ cetrafs_test_param(tree_resv_off, cetrafs_tree_resv_off, bool, 0644);
 MODULE_PARM_DESC(tree_resv_off, "TEST ONLY: a convert shrinks a full leaf without reserving the append's blocks");
 
 struct cetrafs_convert_tail {
-    u32 block;
+    u64 block;
     u64 lba;
     u32 len;
     bool may_append; /* the tree blocks for an append are reserved */
@@ -3028,7 +3028,7 @@ static int cetrafs_leaf_array_convert(struct super_block *sb,
                                       cetrafs_extent_t *arr,
                                       __le16 *entries,
                                       u16 max,
-                                      u32 iblock,
+                                      u64 iblock,
                                       u64 lba,
                                       u32 want,
                                       u32 *done,
@@ -3044,7 +3044,7 @@ static int cetrafs_leaf_array_convert(struct super_block *sb,
 
     for (i = 0; i < n; i++) {
         u32 len = cetrafs_ee_len(&arr[i]);
-        u32 eb = cetrafs_ee_lblk(&arr[i]);
+        u64 eb = cetrafs_ee_lblk(&arr[i]);
         u32 count;
         u64 phys = cetrafs_ee_pblk(&arr[i]);
         bool middle, in_place;
@@ -3075,7 +3075,7 @@ static int cetrafs_leaf_array_convert(struct super_block *sb,
 
             if (r < 0 && (u64) eb + len <= CETRAFS_MAX_FILE_BLOCKS) {
                 /* Cannot tell (GROWFS-LIVE-REVIEW H2): refused, not marked. */
-                pr_warn_ratelimited("extent [block %u +%u] at lba %llu lies past this node's layout, which it "
+                pr_warn_ratelimited("extent [block %llu +%u] at lba %llu lies past this node's layout, which it "
                                     "cannot bring up to date (%d) -- refusing it, marking nothing\n",
                                     eb, len, (unsigned long long) phys, r);
                 return -EIO;
@@ -3086,7 +3086,7 @@ static int cetrafs_leaf_array_convert(struct super_block *sb,
             }
         }
         if (len == 0 || (u64) eb + len > CETRAFS_MAX_FILE_BLOCKS || phys + len > total_blocks) {
-            pr_err_ratelimited("extent [block %u +%u] at lba %llu does not fit the volume (%llu blocks) -- corrupt\n",
+            pr_err_ratelimited("extent [block %llu +%u] at lba %llu does not fit the volume (%llu blocks) -- corrupt\n",
                                eb, len, (unsigned long long) phys, (unsigned long long) total_blocks);
             /* The inode, not the volume: its later writes are refused
              * (the write gate reads the mark), as for every other damaged
@@ -3151,7 +3151,7 @@ static int cetrafs_leaf_array_convert(struct super_block *sb,
              * converted block back to the caller to append through the
              * tree, where a new leaf gets allocated as normal.
              */
-            u32 head = iblock - eb;
+            u32 head = cetrafs_run_off(eb, len, iblock);
             u32 tail;
 
             /* Rare path (leaf full). Stay single-block here: the run
@@ -3203,7 +3203,7 @@ static int cetrafs_leaf_array_convert(struct super_block *sb,
         }
 
         if (middle) {
-            u32 head = iblock - eb;
+            u32 head = cetrafs_run_off(eb, len, iblock);
 
             if (n + 2 > max && !tail_out->may_append && !READ_ONCE(cetrafs_tree_resv_off))
                 return CETRAFS_CONVERT_NEED_ROOM; /* the append below, reserved first */
@@ -3324,7 +3324,7 @@ static int cetrafs_leaf_array_convert(struct super_block *sb,
  * reads-as-zero extent. Only like merges with like.
  */
 static int
-cetrafs_leaf_array_insert(cetrafs_extent_t *arr, __le16 *entries, u16 max, u32 iblock, u64 lba, u32 count, bool uninit)
+cetrafs_leaf_array_insert(cetrafs_extent_t *arr, __le16 *entries, u16 max, u64 iblock, u64 lba, u32 count, bool uninit)
 {
     u16 n = cetrafs_le16(*entries);
 
@@ -3556,7 +3556,7 @@ static int cetrafs_leaf_array_punch(struct super_block *sb,
             /* hole covers the whole entry: drop it */
         } else if (hs == estart) {
             /* hole eats the front */
-            cetrafs_ee_set_lblk(&e, (u32) he);
+            cetrafs_ee_set_lblk(&e, he);
             cetrafs_ee_set_pblk(&e, phys + (he - estart));
             cetrafs_ee_set_len(&e, (u32) (eend - he), uninit_entry);
             arr[w++] = e;
@@ -3568,7 +3568,7 @@ static int cetrafs_leaf_array_punch(struct super_block *sb,
             /* hole lands entirely inside: split into front + tail */
             cetrafs_extent_t tail;
 
-            cetrafs_ee_set_lblk(&tail, (u32) he);
+            cetrafs_ee_set_lblk(&tail, he);
             cetrafs_ee_set_pblk(&tail, phys + (he - estart));
             cetrafs_ee_set_len(&tail, (u32) (eend - he), uninit_entry);
             cetrafs_ee_set_len(&e, (u32) (hs - estart), uninit_entry);
@@ -3683,34 +3683,25 @@ static int cetrafs_write_new_index(struct super_block *sb, u64 lba, const cetraf
 }
 
 /* The logical range a leaf array actually covers. */
-static void cetrafs_leaf_array_range(const cetrafs_extent_t *arr, u16 n, u32 *out_lo, u32 *out_hi)
+static void cetrafs_leaf_array_range(const cetrafs_extent_t *arr, u16 n, u64 *out_lo, u64 *out_hi)
 {
-    u32 lo = U32_MAX, hi = 0;
+    u64 lo = U64_MAX, hi = 0;
     u16 i;
 
     for (i = 0; i < n; i++) {
-        u32 eb = cetrafs_ee_lblk(&arr[i]);
-        u64 end = (u64) eb + cetrafs_ee_len(&arr[i]);
+        u64 eb = cetrafs_ee_lblk(&arr[i]);
+        u64 end = eb + cetrafs_ee_len(&arr[i]);
 
         /*
-         * In 64 bits, because the sum does not fit in 32.
-         *
-         * A legal block number runs to CETRAFS_MAX_FILE_BLOCKS - 1, so
-         * an extent reaching the last block ends at exactly 2^32 and
-         * wrapped this to 0 -- which is not merely wrong, it is wrong
-         * in the UNSAFE direction: 0 does not raise 'hi', so a leaf
-         * holding that extent plus any lower one advertises a range
-         * that EXCLUDES it, and the walk then skips the leaf and reads
-         * the block as a hole.
-         *
-         * An unrepresentable end becomes UNKNOWN (the 0 that means
-         * "read this child anyway"), never a smaller number. Through
-         * the VFS this is unreachable -- s_maxbytes stops one block
-         * short, measured as EFBIG at block 2^32-1 -- so what it
-         * defends against is a corrupt leaf steering the walk away from
-         * blocks that are really there.
+         * An end past the file's last block is a corrupt leaf, and it
+         * becomes UNKNOWN (the 0 that means "read this child anyway"),
+         * never a smaller number: a range that EXCLUDES an extent steers
+         * the walk away from blocks that are really there. Through the
+         * VFS this is unreachable -- s_maxbytes stops one block short.
+         * (A range wider than a span holds is written unknown by
+         * cetrafs_ei_set_range().)
          */
-        if (end > U32_MAX) {
+        if (end > CETRAFS_MAX_FILE_BLOCKS) {
             *out_lo = 0;
             *out_hi = 0; /* unknown: never skipped */
             return;
@@ -3719,22 +3710,22 @@ static void cetrafs_leaf_array_range(const cetrafs_extent_t *arr, u16 n, u32 *ou
         if (eb < lo)
             lo = eb;
         if (end > hi)
-            hi = (u32) end;
+            hi = end;
     }
-    if (lo == U32_MAX)
+    if (lo == U64_MAX)
         lo = 0;
     *out_lo = lo;
     *out_hi = hi;
 }
 
 /*
- * ei_block_end == 0 means "I do not know this child's range, read it".
+ * An end of 0 (ei_span 0) means "I do not know this child's range, read it".
  * Always safe, never skips. Sites that genuinely know the range set it;
  * anything that does not can leave it unknown without being wrong --
  * which is the property that makes adding this bound to an append-only
  * tree tractable at all.
  */
-static void cetrafs_idx_set(cetrafs_extent_idx_t *e, u32 block, u32 end, u64 lba)
+static void cetrafs_idx_set(cetrafs_extent_idx_t *e, u64 block, u64 end, u64 lba)
 {
     cetrafs_ei_init(e, block, end, lba);
 }
@@ -3753,28 +3744,27 @@ static void cetrafs_idx_set(cetrafs_extent_idx_t *e, u32 block, u32 end, u64 lba
  * most four root entries, so an exact range there saves four reads
  * against a per-leaf win of dozens. Not worth the exposure: roots are
  * always UNKNOWN. */
-static void cetrafs_idx_widen(cetrafs_extent_idx_t *e, u32 block, u32 end)
+static void cetrafs_idx_widen(cetrafs_extent_idx_t *e, u64 block, u64 end)
 {
-    if (!cetrafs_ei_end(e))
+    u64 lo = cetrafs_ei_lo(e), hi = cetrafs_ei_end(e);
+
+    if (!hi)
         return; /* unknown: leave it so */
-    if (!end) { /* an end past 2^32 (cetrafs_idx_end()): becomes unknown */
-        cetrafs_ei_set_end(e, 0);
+    if (!end) { /* no end known for what is added: becomes unknown */
+        cetrafs_ei_set_range(e, lo, 0);
         return;
     }
-    if (block < cetrafs_ei_lo(e))
-        cetrafs_ei_set_lo(e, block);
-    if (end > cetrafs_ei_end(e))
-        cetrafs_ei_set_end(e, end);
+    /* A union whose span does not fit 32 bits is written unknown
+     * (cetrafs_ei_set_range()). */
+    cetrafs_ei_set_range(e, min(block, lo), max(end, hi));
 }
 
-/* The end of [iblock, iblock + count) for a range bound: an end that
- * does not fit 32 bits is 0, UNKNOWN, never a wrapped smaller number --
- * see cetrafs_leaf_array_range(). */
-static u32 cetrafs_idx_end(u32 iblock, u32 count)
+/* The end of [iblock, iblock + count) for a range bound. 48-bit blocks
+ * plus a 31-bit length cannot wrap a u64; a range too wide for a span is
+ * written unknown by cetrafs_ei_set_range(). */
+static u64 cetrafs_idx_end(u64 iblock, u32 count)
 {
-    u64 end = (u64) iblock + count;
-
-    return end > U32_MAX ? 0 : (u32) end;
+    return iblock + count;
 }
 
 /* Does this child possibly hold 'iblock'? Unknown range => yes. */
@@ -3786,9 +3776,9 @@ static bool cetrafs_idx_range_ignore;
 cetrafs_test_param(idx_range_ignore, cetrafs_idx_range_ignore, bool, 0644);
 MODULE_PARM_DESC(idx_range_ignore, "TEST ONLY: ignore extent-index range bounds (restores the full scan)");
 
-static bool cetrafs_idx_may_hold(const cetrafs_extent_idx_t *e, u32 iblock)
+static bool cetrafs_idx_may_hold(const cetrafs_extent_idx_t *e, u64 iblock)
 {
-    u32 end = cetrafs_ei_end(e);
+    u64 end = cetrafs_ei_end(e);
 
     if (cetrafs_idx_range_ignore || !end)
         return true;
@@ -3798,7 +3788,7 @@ static bool cetrafs_idx_may_hold(const cetrafs_extent_idx_t *e, u32 iblock)
 /* cetrafs_tree_lookup_unchecked()'s walk: one candidate child at a time
  * (CETRAFS_TW_ONE), the first leaf that maps the block stops it. */
 struct cetrafs_lookup_ctx {
-    u32 iblock;
+    u64 iblock;
     u64 *out_lba;
     u32 *out_run;
     bool *out_uninit;
@@ -3854,7 +3844,7 @@ static const struct cetrafs_tw_ops cetrafs_lookup_ops = {
  * (cetrafs_bh_read_lock()). */
 static int cetrafs_tree_lookup_unchecked(struct inode *inode,
                                          const cetrafs_inode_t *raw,
-                                         u32 iblock,
+                                         u64 iblock,
                                          u64 *out_lba,
                                          u32 *out_run,
                                          bool *out_uninit,
@@ -3921,7 +3911,7 @@ static int cetrafs_tree_lookup_unchecked(struct inode *inode,
 }
 
 /* Does any extent of an array overlap [lo, hi)? */
-static bool cetrafs_leaf_array_overlaps(const cetrafs_extent_t *arr, u16 entries, u32 lo, u32 hi)
+static bool cetrafs_leaf_array_overlaps(const cetrafs_extent_t *arr, u16 entries, u64 lo, u64 hi)
 {
     u16 i;
 
@@ -3935,9 +3925,9 @@ static bool cetrafs_leaf_array_overlaps(const cetrafs_extent_t *arr, u16 entries
 }
 
 /* May an interior entry's leaf hold anything in [lo, hi)? */
-static bool cetrafs_idx_may_overlap(const cetrafs_extent_idx_t *e, u32 lo, u32 hi)
+static bool cetrafs_idx_may_overlap(const cetrafs_extent_idx_t *e, u64 lo, u64 hi)
 {
-    u32 end = cetrafs_ei_end(e);
+    u64 end = cetrafs_ei_end(e);
 
     if (cetrafs_idx_range_ignore || !end)
         return true;
@@ -3952,7 +3942,7 @@ static bool cetrafs_idx_may_overlap(const cetrafs_extent_idx_t *e, u32 lo, u32 h
  * block in it already read.
  */
 struct cetrafs_range_ctx {
-    u32 lo, hi;
+    u64 lo, hi;
 };
 
 static int cetrafs_range_want(struct cetrafs_tw *w, const cetrafs_extent_idx_t *ie, int level)
@@ -3974,7 +3964,7 @@ static const struct cetrafs_tw_ops cetrafs_range_ops = {
     .leaf = cetrafs_range_leaf,
 };
 
-static int cetrafs_tree_range_mapped(struct inode *inode, const cetrafs_inode_t *raw, u32 lo, u32 hi)
+static int cetrafs_tree_range_mapped(struct inode *inode, const cetrafs_inode_t *raw, u64 lo, u64 hi)
 {
     struct cetrafs_range_ctx r = {.lo = lo, .hi = hi};
     struct cetrafs_tw w = {
@@ -4013,7 +4003,7 @@ static int cetrafs_tree_range_mapped(struct inode *inode, const cetrafs_inode_t 
  */
 static int cetrafs_tree_lookup(struct inode *inode,
                                const cetrafs_inode_t *raw,
-                               u32 iblock,
+                               u64 iblock,
                                u64 *out_lba,
                                u32 *out_run,
                                bool *out_uninit,
@@ -4031,7 +4021,7 @@ static int cetrafs_tree_lookup(struct inode *inode,
         return -EIO; /* past a layout this node cannot catch up with: not damage */
     }
     if (ret) {
-        pr_err_ratelimited("ino=%llu: logical block %u maps to [%llu,+%u), which is not a data address -- refusing it (fsck)\n",
+        pr_err_ratelimited("ino=%llu: logical block %llu maps to [%llu,+%u), which is not a data address -- refusing it (fsck)\n",
                            (unsigned long long) inode->i_ino, iblock, (unsigned long long) *out_lba,
                            out_run ? *out_run : 1);
         cetrafs_sb_corrupt_inode(inode);
@@ -4366,7 +4356,7 @@ int cetrafs_tree_build(struct inode *inode, const cetrafs_extent_t *flat, u32 n,
 
                 {
                     u32 cnt_in_leaf = min_t(u32, n - fe, leaf_fill);
-                    u32 lo, hi;
+                    u64 lo, hi;
 
                     cetrafs_leaf_array_range(flat + fe, (u16) cnt_in_leaf, &lo, &hi);
                     /* The tree's last leaf is the one appends go to:
@@ -4530,7 +4520,8 @@ int cetrafs_tree_patch(struct inode *inode, cetrafs_inode_t *raw, u64 start, u64
             u64 llba = cetrafs_ei_child(&ws->idx[r][li]);
             struct buffer_head *lbh = cetrafs_read_leaf_bh(inode, llba);
             const cetrafs_extent_hdr_t *h;
-            u32 cnt, n2, freed = 0, lo, hi;
+            u32 cnt, n2, freed = 0;
+            u64 lo, hi;
             u64 nl;
 
             if (!lbh) {
@@ -4667,7 +4658,8 @@ int cetrafs_tree_patch(struct inode *inode, cetrafs_inode_t *raw, u64 start, u64
             }
         }
         while (ai < add_n) {
-            u32 cnt = min_t(u32, fill, add_n - ai), lo, hi;
+            u32 cnt = min_t(u32, fill, add_n - ai);
+            u64 lo, hi;
             u64 nl;
 
             if (icnt[rl] >= CETRAFS_EXT_BLOCK_MAX_IDX || !cetrafs_tree_idx_has_room(icnt[rl])) {
@@ -4692,8 +4684,7 @@ int cetrafs_tree_patch(struct inode *inode, cetrafs_inode_t *raw, u64 start, u64
             ai += cnt;
             cond_resched();
         }
-        cetrafs_ei_set_lo(&ws->idx[rl][icnt[rl] - 1], 0);
-        cetrafs_ei_set_end(&ws->idx[rl][icnt[rl] - 1], 0); /* the last leaf: unknown */
+        cetrafs_ei_set_range(&ws->idx[rl][icnt[rl] - 1], 0, 0); /* the last leaf: unknown */
         ichanged[rl] = true;
     }
 
@@ -4871,7 +4862,7 @@ void cetrafs_tree_free_meta_except(struct inode *inode, const cetrafs_inode_t *r
 /* Defined below: grows the tree (new leaf/interior) as needed. */
 static int cetrafs_tree_append(struct inode *inode,
                                cetrafs_inode_t *raw,
-                               u32 iblock,
+                               u64 iblock,
                                u64 lba,
                                u32 count,
                                bool uninit,
@@ -4896,7 +4887,7 @@ u64 cetrafs_convert_spill_count(void)
 
 static int cetrafs_tree_convert_append(struct inode *inode,
                                        cetrafs_inode_t *raw,
-                                       u32 iblock,
+                                       u64 iblock,
                                        u64 lba,
                                        const struct cetrafs_convert_tail *tail)
 {
@@ -4966,7 +4957,7 @@ static bool cetrafs_leaf_data_holds_uninit(const void *data, void *arg)
     u16 n = min_t(u16, cetrafs_le16(lhdr->eh_entries), CETRAFS_EXT_BLOCK_MAX_LEAVES), i;
 
     for (i = 0; i < n; i++) {
-        u32 eb = cetrafs_ee_lblk(&arr[i]);
+        u64 eb = cetrafs_ee_lblk(&arr[i]);
 
         if (cetrafs_ee_uninit(&arr[i]) && iblock >= eb &&
             (u64) iblock < (u64) eb + cetrafs_ee_len(&arr[i]))
@@ -4979,7 +4970,7 @@ static bool cetrafs_leaf_data_holds_uninit(const void *data, void *arg)
  * under the buffer lock so it never sees a writer's half-edited array;
  * the extent-tree writers are excluded by invalidate_lock, which the
  * caller holds. */
-static bool cetrafs_leaf_bh_holds_uninit(struct buffer_head *lbh, u32 iblock)
+static bool cetrafs_leaf_bh_holds_uninit(struct buffer_head *lbh, u64 iblock)
 {
     return cetrafs_bh_test_stable(lbh, cetrafs_leaf_data_holds_uninit, &iblock);
 }
@@ -5273,7 +5264,7 @@ static bool cetrafs_leaf_nearly_full(struct buffer_head *lbh)
 /* Add leaf 'nleaf' [lo, hi) to interior 'dbh', keeping its last entry
  * last (the append target, if this is the last interior). Returns the
  * position the previous last entry moved to through *moved_to. */
-static int cetrafs_idx_insert_keep_last(struct inode *inode, struct buffer_head *dbh, u32 lo, u32 hi, u64 nleaf)
+static int cetrafs_idx_insert_keep_last(struct inode *inode, struct buffer_head *dbh, u64 lo, u64 hi, u64 nleaf)
 {
     cetrafs_extent_hdr_t *h = (cetrafs_extent_hdr_t *) dbh->b_data;
     cetrafs_extent_idx_t *a = (cetrafs_extent_idx_t *) (dbh->b_data + sizeof(*h));
@@ -5312,9 +5303,10 @@ static int cetrafs_tree_split_leaf(struct inode *inode,
     cetrafs_extent_t *larr = (cetrafs_extent_t *) (lbh->b_data + sizeof(*lhdr));
     struct buffer_head *dbh = NULL; /* the interior that takes the new leaf */
     cetrafs_extent_t *part = NULL;
-    u32 *keys = NULL;
+    u64 *keys = NULL;
     u16 n, nl = 0, k, i, ient;
-    u32 pivot, blo, bhi, ulo, uhi, bg, ni;
+    u64 pivot, blo, bhi, ulo, uhi;
+    u32 bg, ni;
     u64 nleaf;
     int ret;
 
@@ -5423,8 +5415,7 @@ static int cetrafs_tree_split_leaf(struct inode *inode,
         }
         cetrafs_idx_set(&iarr[npos], blo, bhi, nleaf);
         if (!(append_target && lpos == ient)) {
-            cetrafs_ei_set_lo(&iarr[lpos], ulo);
-            cetrafs_ei_set_end(&iarr[lpos], uhi);
+            cetrafs_ei_set_range(&iarr[lpos], ulo, uhi);
         }
         ihdr->eh_entries = cetrafs_cpu_to_le16(ient + 1);
         cetrafs_blk_tail_stamp(ibh, CETRAFS_INDEX_TAIL_MAGIC);
@@ -5435,8 +5426,7 @@ static int cetrafs_tree_split_leaf(struct inode *inode,
         if (!ret && !append_target) {
             const u32 iprev = cetrafs_bh_begin_update_crc(ibh);
 
-            cetrafs_ei_set_lo(&iarr[li], ulo);
-            cetrafs_ei_set_end(&iarr[li], uhi);
+            cetrafs_ei_set_range(&iarr[li], ulo, uhi);
             cetrafs_blk_tail_stamp(ibh, CETRAFS_INDEX_TAIL_MAGIC);
             ret = cetrafs_tree_hold_back(inode, ibh, iprev, false);
         }
@@ -5561,7 +5551,7 @@ static int cetrafs_tree_convert_need_room(struct inode *inode, const cetrafs_ino
 
 static int cetrafs_tree_convert_inner(struct inode *inode,
                                       cetrafs_inode_t *raw,
-                                      u32 iblock,
+                                      u64 iblock,
                                       u64 lba,
                                       u32 want,
                                       u32 *done,
@@ -5586,7 +5576,7 @@ static int cetrafs_tree_convert_inner(struct inode *inode,
                                              iblock, lba, want, done, &tail);
         }
         if (ret == CETRAFS_CONVERT_APPEND)
-            return cetrafs_tree_convert_append(inode, raw, (u32) iblock, lba, &tail);
+            return cetrafs_tree_convert_append(inode, raw, iblock, lba, &tail);
         return ret;
     }
 
@@ -5662,7 +5652,7 @@ retry1:
                 return wret;
         }
         if (ret == CETRAFS_CONVERT_APPEND)
-            return cetrafs_tree_convert_append(inode, raw, (u32) iblock, lba, &tail);
+            return cetrafs_tree_convert_append(inode, raw, iblock, lba, &tail);
         return 0;
     }
 
@@ -5796,7 +5786,7 @@ again:
                      * reach depth 2).
                      */
                     if (cetrafs_ei_end(&iarr[li])) {
-                        u32 lo, hi;
+                        u64 lo, hi;
 
                         cetrafs_leaf_array_range((const cetrafs_extent_t *) (lbh->b_data + sizeof(*lhdr)),
                                                  min_t(u16, cetrafs_le16(lhdr->eh_entries), CETRAFS_EXT_BLOCK_MAX_LEAVES), &lo,
@@ -5805,8 +5795,7 @@ again:
                             const u32 nprev = cetrafs_bh_begin_update_crc(ibh);
                             int nret;
 
-                            cetrafs_ei_set_lo(&iarr[li], lo);
-                            cetrafs_ei_set_end(&iarr[li], hi);
+                            cetrafs_ei_set_range(&iarr[li], lo, hi);
                             cetrafs_blk_tail_stamp(ibh, CETRAFS_INDEX_TAIL_MAGIC);
                             nret = cetrafs_tree_hold_back(inode, ibh, nprev, false);
                             if (nret) {
@@ -5829,7 +5818,7 @@ again:
                     return wret;
             }
             if (ret == CETRAFS_CONVERT_APPEND)
-                return cetrafs_tree_convert_append(inode, raw, (u32) iblock, lba, &tail);
+                return cetrafs_tree_convert_append(inode, raw, iblock, lba, &tail);
             return 0;
         }
         brelse(ibh);
@@ -5850,7 +5839,7 @@ static bool cetrafs_tree_resv_keep_off;
 cetrafs_test_param(tree_resv_keep_off, cetrafs_tree_resv_keep_off, bool, 0644);
 MODULE_PARM_DESC(tree_resv_keep_off, "TEST ONLY: a convert's unused tree reserve is freed after every convert");
 
-static int cetrafs_tree_convert(struct inode *inode, cetrafs_inode_t *raw, u32 iblock, u64 lba, u32 want, u32 *done,
+static int cetrafs_tree_convert(struct inode *inode, cetrafs_inode_t *raw, u64 iblock, u64 lba, u32 want, u32 *done,
                                 bool *moving)
 {
     /* A split rewrites a LEAF and can leave the record's depth, entry
@@ -5875,7 +5864,7 @@ static int cetrafs_tree_convert(struct inode *inode, cetrafs_inode_t *raw, u32 i
         *done = 1; /* belt: a path that converted without saying so */
 
     if (WARN_ON_ONCE(ret == CETRAFS_CONVERT_APPEND)) {
-        pr_err("tree convert: a leaf-full signal escaped unhandled for ino=%llu block %u -- please report\n",
+        pr_err("tree convert: a leaf-full signal escaped unhandled for ino=%llu block %llu -- please report\n",
                (unsigned long long) inode->i_ino, iblock);
         return -EIO;
     }
@@ -5911,7 +5900,7 @@ u64 cetrafs_tree_any_leaf_count(void)
 
 static int cetrafs_tree_insert_any_leaf(struct inode *inode,
                                         cetrafs_inode_t *raw,
-                                        u32 iblock,
+                                        u64 iblock,
                                         u64 lba,
                                         u32 count,
                                         bool uninit,
@@ -5958,7 +5947,7 @@ static int cetrafs_tree_insert_any_leaf(struct inode *inode,
             if (cetrafs_ei_end(&iarr[li])) {
                 const u32 iprev = cetrafs_bh_begin_update_crc(ibh);
 
-                cetrafs_ei_set_end(&iarr[li], 0);
+                cetrafs_ei_set_range(&iarr[li], cetrafs_ei_lo(&iarr[li]), 0);
                 cetrafs_blk_tail_stamp(ibh, CETRAFS_INDEX_TAIL_MAGIC);
                 ret = cetrafs_tree_hold_back(inode, ibh, iprev, false);
                 if (ret) {
@@ -6000,7 +5989,7 @@ static int cetrafs_tree_insert_any_leaf(struct inode *inode,
 
 static int cetrafs_tree_append_inner(struct inode *inode,
                                cetrafs_inode_t *raw,
-                               u32 iblock,
+                               u64 iblock,
                                u64 lba,
                                u32 count,
                                bool uninit,
@@ -6216,7 +6205,7 @@ static int cetrafs_tree_append_inner(struct inode *inode,
         cetrafs_extent_hdr_t *lhdr;
         cetrafs_extent_t *larr;
         u16 before;
-        u32 full_lo = 0, full_hi = 0; /* the full last leaf's range, if it is replaced */
+        u64 full_lo = 0, full_hi = 0; /* the full last leaf's range, if it is replaced */
 
         if (!ibh)
             return -EIO;
@@ -6288,7 +6277,7 @@ static int cetrafs_tree_append_inner(struct inode *inode,
                          */
                         int iw;
 
-                        cetrafs_ei_set_end(&iarr[ient - 1], 0);
+                        cetrafs_ei_set_range(&iarr[ient - 1], cetrafs_ei_lo(&iarr[ient - 1]), 0);
                         cetrafs_blk_tail_stamp(ibh, CETRAFS_INDEX_TAIL_MAGIC);
                         /* Held back with the leaf: one boundary batch
                          * writes both, entries first, so neither can
@@ -6401,8 +6390,7 @@ static int cetrafs_tree_append_inner(struct inode *inode,
                  * this node's copy, which is everything the device's can
                  * hold, so the range can only over-advertise. */
                 if (S_ISREG(inode->i_mode) && ient) {
-                    cetrafs_ei_set_lo(&iarr[ient - 1], full_lo);
-                    cetrafs_ei_set_end(&iarr[ient - 1], full_hi);
+                    cetrafs_ei_set_range(&iarr[ient - 1], full_lo, full_hi);
                 }
                 cetrafs_idx_set(&iarr[ient], 0, 0 /* the appended-to leaf: unknown */, new_leaf);
                 ihdr->eh_entries = cetrafs_cpu_to_le16(cetrafs_le16(ihdr->eh_entries) + 1);
@@ -6466,7 +6454,7 @@ static int cetrafs_tree_append_inner(struct inode *inode,
 
 static int cetrafs_tree_append(struct inode *inode,
                                cetrafs_inode_t *raw,
-                               u32 iblock,
+                               u64 iblock,
                                u64 lba,
                                u32 count,
                                bool uninit,
@@ -6501,7 +6489,7 @@ static int cetrafs_tree_append(struct inode *inode,
  * block instead of failing (the 58-entries-per-directory
  * cap). Returns -ENOENT if the block isn't mapped and create is false.
  */
-int cetrafs_inode_map_block(struct inode *inode, u32 iblock, bool create, u64 *out_lba)
+int cetrafs_inode_map_block(struct inode *inode, u64 iblock, bool create, u64 *out_lba)
 {
     struct buffer_head tmp;
     int ret;
@@ -6514,7 +6502,7 @@ int cetrafs_inode_map_block(struct inode *inode, u32 iblock, bool create, u64 *o
         return ret;
     if (!buffer_mapped(&tmp)) {
         if (create)
-            pr_warn_ratelimited("ino=%llu: logical block %u unmapped after create\n", (unsigned long long) inode->i_ino,
+            pr_warn_ratelimited("ino=%llu: logical block %llu unmapped after create\n", (unsigned long long) inode->i_ino,
                                 iblock);
         return create ? -EIO : -ENOENT;
     }
@@ -6615,15 +6603,15 @@ static int cetrafs_convert_zero(struct super_block *sb, u64 lba, u64 count)
 /* Zero the blocks of [first, first + count) (at 'plba') that are not
  * pending; pending ones are skipped, their data landed (the caller's
  * mode says so) -- or, with !pending_landed, any pending one is -EBUSY. */
-static int cetrafs_convert_zero_side(struct inode *inode, u32 first, u64 plba, u32 count, bool pending_landed)
+static int cetrafs_convert_zero_side(struct inode *inode, u64 first, u64 plba, u32 count, bool pending_landed)
 {
     u64 b = first, end = (u64) first + count;
-    u32 pf, pl;
+    u64 pf, pl;
 
     while (b < end) {
         u64 stop = end;
 
-        if (!cetrafs_pending_next(inode, (u32) b, &pf, &pl) && pf < end) {
+        if (!cetrafs_pending_next(inode, b, &pf, &pl) && pf < end) {
             if (!pending_landed)
                 return -EBUSY;
             stop = pf;
@@ -6670,7 +6658,7 @@ u64 cetrafs_convert_healed_count(void)
     return (u64) atomic64_read(&cetrafs_convert_healed);
 }
 
-static bool cetrafs_convert_heal(struct inode *inode, cetrafs_inode_t *raw, u32 iblock, u64 lba, u32 want, u64 ws,
+static bool cetrafs_convert_heal(struct inode *inode, cetrafs_inode_t *raw, u64 iblock, u64 lba, u32 want, u64 ws,
                                  u64 we, bool pending_landed, bool *moving)
 {
     u64 base = lba - (iblock - ws), b;
@@ -6690,24 +6678,24 @@ static bool cetrafs_convert_heal(struct inode *inode, cetrafs_inode_t *raw, u32 
                 b = (u64) iblock + want;
                 continue;
             }
-            if (cetrafs_tree_lookup(inode, raw, (u32) b, &plba, &run, &uninit, &found, false) || !found ||
+            if (cetrafs_tree_lookup(inode, raw, b, &plba, &run, &uninit, &found, false) || !found ||
                 !run || plba != base + (b - ws))
                 return false; /* not the unit's own run: leave it */
             end = min_t(u64, b + run, we);
             if (b < iblock)
                 end = min_t(u64, end, iblock);
             if (uninit) {
-                if (pass == 0 && cetrafs_unit_dio_busy(inode, (u32) b, (u32) (end - b))) {
+                if (pass == 0 && cetrafs_unit_dio_busy(inode, b, (u32) (end - b))) {
                     atomic64_inc(&cetrafs_convert_unit_busy);
                     return false;
                 }
                 if (pass == 1 &&
-                    cetrafs_convert_zero_side(inode, (u32) b, plba, (u32) (end - b), pending_landed))
+                    cetrafs_convert_zero_side(inode, b, plba, (u32) (end - b), pending_landed))
                     return false; /* not all zeroed: nothing marked written yet */
                 if (pass == 2) {
                     u32 done = 0;
 
-                    if (cetrafs_tree_convert(inode, raw, (u32) b, plba, (u32) (end - b), &done, moving) ||
+                    if (cetrafs_tree_convert(inode, raw, b, plba, (u32) (end - b), &done, moving) ||
                         !done)
                         return false; /* what converted is zeroed and written: consistent */
                     end = b + min_t(u64, done, end - b);
@@ -6722,8 +6710,8 @@ static bool cetrafs_convert_heal(struct inode *inode, cetrafs_inode_t *raw, u32 
 
 /* [iblock, iblock + want) at lba is about to be converted: widen it to
  * the aligned unit when the unit is free to take. */
-static void cetrafs_convert_widen(struct inode *inode, cetrafs_inode_t *raw, u32 iblock, u64 lba, u32 want,
-                                  bool pending_landed, bool *moving, u32 *cv_iblock, u64 *cv_lba, u32 *cv_want)
+static void cetrafs_convert_widen(struct inode *inode, cetrafs_inode_t *raw, u64 iblock, u64 lba, u32 want,
+                                  bool pending_landed, bool *moving, u64 *cv_iblock, u64 *cv_lba, u32 *cv_want)
 {
     u32 unit = READ_ONCE(cetrafs_convert_unit_blocks), run = 0;
     u64 ws, we, lws = 0;
@@ -6733,24 +6721,24 @@ static void cetrafs_convert_widen(struct inode *inode, cetrafs_inode_t *raw, u32
         return;
     ws = iblock & ~(u64) (unit - 1);
     we = round_up((u64) iblock + want, (u64) unit);
-    if (we > U32_MAX || we - ws == want)
+    if (we - ws == want)
         return;
     /* The whole unit in the written block's own preallocated extent:
      * the block at its start is uninit, at the matching address, with
      * the run reaching the unit's end. */
-    if (cetrafs_tree_lookup(inode, raw, (u32) ws, &lws, &run, &uninit, &found, false) || !found || !uninit ||
+    if (cetrafs_tree_lookup(inode, raw, ws, &lws, &run, &uninit, &found, false) || !found || !uninit ||
         lws + (iblock - ws) != lba || run < we - ws) {
         if (we - ws == unit)
             (void) cetrafs_convert_heal(inode, raw, iblock, lba, want, ws, we, pending_landed, moving);
         return;
     }
-    if (cetrafs_unit_dio_busy(inode, (u32) ws, (u32) (iblock - ws)) ||
+    if (cetrafs_unit_dio_busy(inode, ws, cetrafs_run_off(ws, unit, iblock)) ||
         cetrafs_unit_dio_busy(inode, iblock + want, (u32) (we - iblock - want))) {
         atomic64_inc(&cetrafs_convert_unit_busy);
         return;
     }
     {
-        int zret = cetrafs_convert_zero_side(inode, (u32) ws, lws, (u32) (iblock - ws), pending_landed);
+        int zret = cetrafs_convert_zero_side(inode, ws, lws, cetrafs_run_off(ws, unit, iblock), pending_landed);
 
         if (!zret)
             zret = cetrafs_convert_zero_side(inode, iblock + want, lba + want, (u32) (we - iblock - want),
@@ -6760,7 +6748,7 @@ static void cetrafs_convert_widen(struct inode *inode, cetrafs_inode_t *raw, u32
         if (zret)
             return; /* not all zeroed: the unit is not marked written; the block alone is */
     }
-    *cv_iblock = (u32) ws;
+    *cv_iblock = ws;
     *cv_lba = lws;
     *cv_want = (u32) (we - ws);
     atomic64_inc(&cetrafs_convert_widened);
@@ -6816,7 +6804,7 @@ static int cetrafs_sparse_unit_alloc(struct inode *inode, const cetrafs_inode_t 
     if (*ws + unit > CETRAFS_MAX_FILE_BLOCKS || (*ws + unit) * CETRAFS_BLOCK_SIZE > (u64) i_size_read(inode))
         return -EAGAIN;
     lo = *ws == iblock ? iblock - 1 : *ws; /* the unit, and the block before the write */
-    if (cetrafs_tree_range_mapped(inode, raw, (u32) lo, (u32) (*ws + unit)) != 0)
+    if (cetrafs_tree_range_mapped(inode, raw, lo, *ws + unit) != 0)
         return -EAGAIN;
     /* The convert widens a unit by zeroing it (WRITE ZEROES). A device
      * without that never widens, and each first write then split the
@@ -6966,7 +6954,7 @@ relookup:
         cetrafs_le16(raw.eh.eh_entries) > ARRAY_SIZE(raw.et.leaf))
         return -EIO;
 
-    ret = cetrafs_tree_lookup(inode, &raw, (u32) iblock, &lba, &run, &uninit, &found, tree_reader);
+    ret = cetrafs_tree_lookup(inode, &raw, iblock, &lba, &run, &uninit, &found, tree_reader);
     if (ret)
         return ret;
     /* A miss while a tree move ran is not believed: the walk may have
@@ -7002,7 +6990,7 @@ relookup:
         S_ISREG(inode->i_mode)) {
         if (unlikely(cetrafs_pending_race_delay_ms))
             msleep(cetrafs_pending_race_delay_ms);
-        prun = cetrafs_pending_run(inode, (u32) iblock);
+        prun = cetrafs_pending_run(inode, iblock);
         if (prun) {
             uninit = false;
             run = min_t(u32, run ? run : 1, prun);
@@ -7061,7 +7049,7 @@ relookup:
         u64 w = bh_result->b_size >> inode->i_blkbits;
         u32 n = (u32) ((w > 1 && run > 1) ? min_t(u64, w, run) : 1);
 
-        ret = cetrafs_pending_add(inode, (u32) iblock, n);
+        ret = cetrafs_pending_add(inode, iblock, n);
         if (ret)
             return ret;
         map_bh(bh_result, sb, lba);
@@ -7090,13 +7078,14 @@ relookup:
         if (!want)
             want = 1;
         {
-            u32 cv_iblock = (u32) iblock, cv_want = want;
+            u64 cv_iblock = iblock;
+            u32 cv_want = want;
             u64 cv_lba = lba;
 
             if (mode == CETRAFS_GB_CONVERT || mode == CETRAFS_GB_CONVERT_PENDING)
-                cetrafs_convert_widen(inode, &raw, (u32) iblock, lba, want, mode == CETRAFS_GB_CONVERT_PENDING, &moving,
+                cetrafs_convert_widen(inode, &raw, iblock, lba, want, mode == CETRAFS_GB_CONVERT_PENDING, &moving,
                                       &cv_iblock, &cv_lba, &cv_want);
-            ahead = (u32) iblock - cv_iblock;
+            ahead = cetrafs_run_off(cv_iblock, cv_want, iblock);
             ret = cetrafs_tree_convert(inode, &raw, cv_iblock, cv_lba, cv_want, &converted, &moving);
             /* A convert may stop short (a split with one free slot hands
              * the rest back), possibly before iblock: go on from where it
@@ -7231,7 +7220,7 @@ relookup:
         u32 unit = 0;
 
         if (!cetrafs_sparse_unit_alloc(inode, &raw, iblock, mode, &unit, &ws, &ulba)) {
-            ret = cetrafs_tree_append(inode, &raw, (u32) ws, ulba, unit, true, &merged, &leaf_count);
+            ret = cetrafs_tree_append(inode, &raw, ws, ulba, unit, true, &merged, &leaf_count);
             if (ret) {
                 cetrafs_free_data_extent(sb, ulba, unit); /* named by nothing: the append failed */
                 return ret;
@@ -7394,7 +7383,7 @@ relookup:
         }
     }
 
-    ret = cetrafs_tree_append(inode, &raw, (u32) iblock, lba, 1, dio_prealloc, &merged, &leaf_count);
+    ret = cetrafs_tree_append(inode, &raw, iblock, lba, 1, dio_prealloc, &merged, &leaf_count);
     if (ret) {
         /*
          * A DIRECTORY's tree blocks go out through the journal, and a
@@ -7469,7 +7458,7 @@ allocated:
     /* After the stage above, so a failure leaves the block where the
      * tree says it is: preallocated, reading as zeros. */
     if (mode == CETRAFS_GB_BUF) {
-        ret = cetrafs_pending_add(inode, (u32) iblock, 1);
+        ret = cetrafs_pending_add(inode, iblock, 1);
         if (ret)
             return ret;
     }
@@ -7984,8 +7973,7 @@ static int __cetrafs_truncate_shrink(struct inode *inode, loff_t new_size)
     {
         u64 keep = CETRAFS_DIV_ROUND_UP((u64) new_size, CETRAFS_BLOCK_SIZE);
 
-        if (keep <= U32_MAX)
-            cetrafs_pending_clear(inode, (u32) keep, U32_MAX);
+        cetrafs_pending_clear(inode, keep, U64_MAX);
     }
     if (cetrafs_truncate_free_stall_ms)
         msleep(cetrafs_truncate_free_stall_ms); /* TEST ONLY: see the parameter */
@@ -8302,8 +8290,8 @@ struct cetrafs_falloc_map {
 
 static int cetrafs_falloc_map_cmp(const void *a, const void *b)
 {
-    u32 ea = cetrafs_ee_lblk((const cetrafs_extent_t *) a);
-    u32 eb = cetrafs_ee_lblk((const cetrafs_extent_t *) b);
+    u64 ea = cetrafs_ee_lblk((const cetrafs_extent_t *) a);
+    u64 eb = cetrafs_ee_lblk((const cetrafs_extent_t *) b);
 
     return ea < eb ? -1 : ea > eb;
 }
@@ -8515,7 +8503,7 @@ static int cetrafs_do_allocate(struct inode *inode, loff_t offset, loff_t len, b
 
         /* Looked up in the OLD tree, which nothing here changes. */
         if (per_block) {
-            loop_ret = cetrafs_tree_lookup(inode, &raw, (u32) b, &lba, NULL, &un, &found, false);
+            loop_ret = cetrafs_tree_lookup(inode, &raw, b, &lba, NULL, &un, &found, false);
             if (loop_ret)
                 break;
             atomic_long_inc(&cetrafs_falloc_tree_lookups);
@@ -8616,7 +8604,7 @@ static int cetrafs_do_allocate(struct inode *inode, loff_t offset, loff_t len, b
                 add_cap = ncap;
             }
             memset(&add[add_n], 0, sizeof(add[add_n]));
-            cetrafs_ee_set_lblk(&add[add_n], (u32) b);
+            cetrafs_ee_set_lblk(&add[add_n], b);
             cetrafs_ee_set_len(&add[add_n], 1, 1);
             cetrafs_ee_set_pblk(&add[add_n], lba);
             add_n++;
@@ -8941,8 +8929,7 @@ static long cetrafs_zero_inplace_held(struct inode *inode, loff_t offset, loff_t
          * would otherwise be flipped to written at the next close or
          * fsync, over the zeros -- publishing what was on the device. Left
          * uninit, they read as zeros, which is the point. */
-        if (start_block <= U32_MAX)
-            cetrafs_pending_clear(inode, (u32) start_block, (u32) min_t(u64, end_block - 1, U32_MAX));
+        cetrafs_pending_clear(inode, start_block, end_block - 1);
 
         ret = cetrafs_read_raw_inode_overlaid(sb, inode, raw);
         if (ret)
@@ -9568,8 +9555,7 @@ static long cetrafs_fallocate(struct file *file, int mode, loff_t offset, loff_t
      * a throughput loss in its own right. */
     truncate_pagecache_range(inode, offset, end - 1);
     /* As truncate: the punched blocks leave the pending set. */
-    if (start_block <= U32_MAX)
-        cetrafs_pending_clear(inode, (u32) start_block, (u32) min_t(u64, end_block - 1, U32_MAX));
+    cetrafs_pending_clear(inode, start_block, end_block - 1);
 
     if (cetrafs_punch_pagecache_delay_ms)
         msleep(cetrafs_punch_pagecache_delay_ms); /* test-only; see the parameter */
