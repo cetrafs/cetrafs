@@ -585,14 +585,14 @@ static int cetrafs_defrag_dst_placed(const struct cetrafs_ext_list *el, u64 nblo
     if (READ_ONCE(cetrafs_defrag_restart_from_zero) || READ_ONCE(cetrafs_defrag_extents_unsorted))
         return 0;
     while (i < el->count) {
-        u64 base = cetrafs_extent_phys_from_hilo(el->arr[i].ee_start_hi, el->arr[i].ee_start_lo);
+        u64 base = cetrafs_ee_pblk(&el->arr[i]);
         u64 count = 0;
 
         /* One run: each extent starting where the one before ended. */
         for (; i < el->count; i++) {
-            u64 len = cetrafs_extent_len(el->arr[i].ee_len);
+            u64 len = cetrafs_ee_len(&el->arr[i]);
 
-            if (!len || cetrafs_extent_phys_from_hilo(el->arr[i].ee_start_hi, el->arr[i].ee_start_lo) != base + count)
+            if (!len || cetrafs_ee_pblk(&el->arr[i]) != base + count)
                 break;
             count += len;
         }

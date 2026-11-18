@@ -423,14 +423,12 @@ int main(int argc, char **argv)
             return 1;
         }
         if (argc == 5) {
-            printf("lo=%u end=%u child=%llu\n", cetrafs_le32(rec.et.idx[slot].ei_block),
-                   cetrafs_le32(rec.et.idx[slot].ei_block_end),
-                   (unsigned long long) cetrafs_extent_phys_from_hilo(rec.et.idx[slot].ei_leaf_hi,
-                                                                      rec.et.idx[slot].ei_leaf_lo));
+            printf("lo=%u end=%u child=%llu\n", cetrafs_ei_lo(&rec.et.idx[slot]), cetrafs_ei_end(&rec.et.idx[slot]),
+                   (unsigned long long) cetrafs_ei_child(&rec.et.idx[slot]));
             return 0;
         }
-        rec.et.idx[slot].ei_block = cetrafs_cpu_to_le32((uint32_t) strtoul(argv[5], NULL, 0));
-        rec.et.idx[slot].ei_block_end = cetrafs_cpu_to_le32((uint32_t) strtoul(argv[6], NULL, 0));
+        cetrafs_ei_set_lo(&rec.et.idx[slot], (uint32_t) strtoul(argv[5], NULL, 0));
+        cetrafs_ei_set_end(&rec.et.idx[slot], (uint32_t) strtoul(argv[6], NULL, 0));
         cetrafs_inode_stamp_crcs_us(&rec);
         pwrite_all(fd, &rec, sizeof(rec), rec_off);
         fprintf(stderr, "inode_block_poke: ino %llu root slot %u range -> [%s,%s)\n", (unsigned long long) ino, slot,
