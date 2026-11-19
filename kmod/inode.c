@@ -1528,9 +1528,16 @@ int cetrafs_write_raw_inode_fd(struct super_block *sb, u64 ino, const cetrafs_in
  * Idempotent; the blocks themselves are already freed, or left to the
  * block scrub as a leak.
  */
+/* TEST ONLY: forget a dead record's tree whoever holds its claim, as
+ * before audit 2026-11-15 BC-49 (tests/kernel/sweep_claim_stolen.sh). */
+static bool cetrafs_forget_tree_any_owner;
+cetrafs_test_param(forget_tree_any_owner, cetrafs_forget_tree_any_owner, bool, 0644);
+MODULE_PARM_DESC(forget_tree_any_owner, "TEST ONLY: drop a dead record's tree without checking the claim is still ours");
+
 int cetrafs_inode_forget_tree(struct super_block *sb, u64 ino, u64 generation, u64 *seq)
 {
     cetrafs_inode_t *raw = kmalloc(sizeof(*raw), GFP_NOFS);
+    u32 me = CETRAFS_NODE_ID_NONE;
     int ret;
 
     if (!raw)
@@ -1538,6 +1545,18 @@ int cetrafs_inode_forget_tree(struct super_block *sb, u64 ino, u64 generation, u
     cetrafs_invalidate_raw_inode(sb, ino);
     ret = cetrafs_read_raw_inode(sb, ino, raw);
     if (!ret && (cetrafs_le64(raw->generation) != generation || cetrafs_le32(raw->nlink) != 0))
+        ret = -ESTALE;
+    /* ...and still OUR claim: the free of the number after this is a
+     * bare bitmap swap that never looks at the record, and the claim is
+     * what keeps a create off it. A caller's verdict may be old -- the
+     * mount sweep judges from its walk read, then writes and flushes
+     * here before the free (rule 15) -- and a peer that took the claim
+     * over from a stale incarnation may have finished the free and
+     * handed the number to a create meanwhile, the record still dead
+     * and of the same generation until that create stamps it (audit
+     * 2026-11-15 BC-49). Not ours: nothing is forgotten or freed. */
+    if (!ret && !READ_ONCE(cetrafs_forget_tree_any_owner) &&
+        (cetrafs_sb_get_node_id(sb, &me) || cetrafs_le32(raw->ns_lock_owner) != me))
         ret = -ESTALE;
     if (!ret && (cetrafs_le16(raw->eh.eh_entries) || cetrafs_le16(raw->eh.eh_depth) || raw->size || raw->blocks)) {
         raw->eh.eh_entries = cetrafs_cpu_to_le16(0);

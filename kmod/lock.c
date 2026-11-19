@@ -6035,6 +6035,11 @@ MODULE_PARM_DESC(sweep_beat_per_block, "TEST ONLY: the mount's claim sweep renew
 
 /* TEST ONLY: the sweep sleeps this many ms per allocated record, as a
  * cold read on a slow LUN takes. */
+/* TEST ONLY: the mount sweep pauses between judging a claimed dead
+ * record and finishing its free (tests/kernel/sweep_claim_stolen.sh). */
+static unsigned int cetrafs_sweep_judge_stall_ms;
+cetrafs_test_param(sweep_judge_stall_ms, cetrafs_sweep_judge_stall_ms, uint, 0644);
+MODULE_PARM_DESC(sweep_judge_stall_ms, "TEST ONLY: the mount sweep pauses before finishing a claimed free");
 static unsigned int cetrafs_sweep_read_stall_ms;
 cetrafs_test_param(sweep_read_stall_ms, cetrafs_sweep_read_stall_ms, uint, 0644);
 MODULE_PARM_DESC(sweep_read_stall_ms, "TEST ONLY: the mount's claim sweep sleeps this many ms per allocated record");
@@ -6152,7 +6157,20 @@ int cetrafs_lock_sweep_own_claims(struct super_block *sb, u32 my_node_id)
             if (cetrafs_le32(raw.nlink) == 0 && cetrafs_le32(raw.ns_lock_owner) == my_node_id) {
                 u64 fseq = cetrafs_le64(raw.dirent_seq);
 
+                if (READ_ONCE(cetrafs_sweep_judge_stall_ms)) {
+                    pr_info("mount: ino=%llu: pausing %u ms before finishing its free (test)\n",
+                            (unsigned long long) ino, cetrafs_sweep_judge_stall_ms);
+                    msleep(READ_ONCE(cetrafs_sweep_judge_stall_ms)); /* TEST ONLY */
+                }
+                /* Judged from the walk's read; forget_tree reads it fresh
+                 * and refuses one no longer ours (BC-49). */
                 ret = cetrafs_inode_forget_tree(sb, ino, ctx.generation, &fseq);
+                if (ret == -ESTALE) {
+                    pr_info("mount: ino=%llu: the free this node claimed is no longer its own -- left alone\n",
+                            (unsigned long long) ino);
+                    ret = 0;
+                    goto release; /* clears only claims that are still ours */
+                }
                 if (!ret)
                     ret = cetrafs_free_inode_number_claimed(sb, ino);
                 if (ret < 0) {

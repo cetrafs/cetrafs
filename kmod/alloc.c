@@ -1633,6 +1633,13 @@ int cetrafs_free_inode_finish(struct super_block *sb, u64 ino, u64 generation, u
     /* Every block reference out of the record first, then the number:
      * after the bit is clear nothing may find blocks to free in it. */
     ret = cetrafs_inode_forget_tree(sb, ino, generation, &seq);
+    if (ret == -ESTALE) {
+        /* Reborn, or the claim is no longer ours: nothing of ours to
+         * free, and nothing to retry -- requeued, it failed every beat. */
+        pr_info("inode ino=%llu: the free is no longer this node's to finish (reborn, or its claim taken over)\n",
+                (unsigned long long) ino);
+        return ret;
+    }
     if (ret < 0) {
         p.seq = seq;
         pr_warn_ratelimited("inode ino=%llu: its record's block references could not be dropped (%d) -- the "
