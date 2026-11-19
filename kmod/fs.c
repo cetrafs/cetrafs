@@ -1461,6 +1461,14 @@ static int cetrafs_ranges_add(struct cetrafs_lba_range **r, u32 *n, u32 *cap, u6
  * 'gp' (a grow being validated before it links) supplies the link the
  * device does not have yet.
  */
+/* TEST ONLY: the walk skips the new Block Groups' header check, so
+ * tests/crash/growfs_live_crash.sh's control can still record a grow
+ * that publishes over regions nobody initialised. Also the new inode
+ * segment's bitmap check (cetrafs_grow_check_iseg_bitmap()). */
+static bool cetrafs_grow_hdr_check_off;
+cetrafs_test_param(grow_hdr_check_off, cetrafs_grow_hdr_check_off, bool, 0644);
+MODULE_PARM_DESC(grow_hdr_check_off, "TEST ONLY: a live grow does not verify its new Block Groups' headers or new inode segment's bitmap");
+
 /* TEST ONLY: the control of tests/kernel/grow_iseg_pinned.sh. */
 static bool cetrafs_layout_iseg_unpinned;
 cetrafs_test_param(layout_iseg_unpinned, cetrafs_layout_iseg_unpinned, bool, 0644);
@@ -1564,6 +1572,15 @@ static int cetrafs_layout_walk_inodes(struct super_block *sb, struct cetrafs_bg_
             brelse(sbh);
             return rc;
         }
+        /* The segment the grow being validated adds: its bitmap must be
+         * empty on the device, as a new Block Group's must be. */
+        if (gp && gp->new_iseg_lba == seg_lba && !READ_ONCE(cetrafs_grow_hdr_check_off)) {
+            rc = cetrafs_grow_check_iseg_bitmap(sb, seg_lba, cnt);
+            if (rc) {
+                brelse(sbh);
+                return rc;
+            }
+        }
         filled += cnt;
         /* A grow being validated before it is linked: the old tail (or
          * the superblock) does not name it on the device yet. */
@@ -1581,13 +1598,6 @@ static int cetrafs_layout_walk_inodes(struct super_block *sb, struct cetrafs_bg_
     }
     return 0;
 }
-
-/* TEST ONLY: the walk skips the new Block Groups' header check, so
- * tests/crash/growfs_live_crash.sh's control can still record a grow
- * that publishes over regions nobody initialised. */
-static bool cetrafs_grow_hdr_check_off;
-cetrafs_test_param(grow_hdr_check_off, cetrafs_grow_hdr_check_off, bool, 0644);
-MODULE_PARM_DESC(grow_hdr_check_off, "TEST ONLY: a live grow does not verify its new Block Groups' headers");
 
 /*
  * Walk the Block Group table chain of l->raw and fill in what the

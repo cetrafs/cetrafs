@@ -179,6 +179,38 @@ int cetrafs_grow_check_bg_header(struct super_block *sb, u32 bg_id, u64 start, u
     return rc;
 }
 
+/*
+ * The inode table segment a grow adds: its bitmap, as the device has it,
+ * must be empty. The allocator reads it the moment the grow publishes,
+ * and a region that held an earlier table's bitmap would read numbers
+ * as in use -- or, set bits with live-looking records under them, as
+ * inodes nobody created. growfs zeroes and syncs it before the commit;
+ * only its header was ever read here (audit 2026-11-15 F-64). The records
+ * are not read: a free bit makes a slot's record unborn whatever it
+ * holds, and a grow may add millions of them. Forced-fresh, one block
+ * at a time. tests/kernel/grow_live_iseg_bitmap.sh.
+ */
+int cetrafs_grow_check_iseg_bitmap(struct super_block *sb, u64 seg_lba, u64 count)
+{
+    u64 i, n = cetrafs_calc_inode_bmap_blocks(count);
+    int rc = 0;
+
+    for (i = 0; !rc && i < n; i++) {
+        struct buffer_head *bh = cetrafs_bread_uncached(sb, seg_lba + 1 + i);
+
+        if (!bh)
+            return -EIO;
+        if (!cetrafs_bmap_block_empty(bh->b_data)) {
+            pr_err("%s: the new inode table segment's bitmap block at %llu is not an empty bitmap -- its region "
+                   "was not initialised on the device\n",
+                   sb->s_id, (unsigned long long) (seg_lba + 1 + i));
+            rc = -EUCLEAN;
+        }
+        brelse(bh);
+    }
+    return rc;
+}
+
 struct cetrafs_grow_sb_ctx {
     const cetrafs_superblock_t *cur, *nw;
 };

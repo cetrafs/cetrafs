@@ -1200,7 +1200,14 @@ int main(int argc, char **argv)
     if (ino_add) {
         cetrafs_seg_hdr_t seg;
 
-        empty_bitmap_blocks(fd, iseg_lba + 1, cetrafs_calc_inode_bmap_blocks(ino_add), true);
+        if (cetrafs_test_env("CETRAFS_GROWFS_TEST_DIRTY_INODE_BITMAP")) {
+            /* TEST-ONLY: a bitmap an earlier table left behind; the kernel must refuse the grow. */
+            memset(blk, 0xff, CETRAFS_BLOCK_SIZE);
+            for (u64 k = 0; k < cetrafs_calc_inode_bmap_blocks(ino_add); ++k)
+                write_block(fd, iseg_lba + 1 + k, blk, true);
+        } else {
+            empty_bitmap_blocks(fd, iseg_lba + 1, cetrafs_calc_inode_bmap_blocks(ino_add), true);
+        }
         zero_blocks(fd, iseg_lba + 1 + cetrafs_calc_inode_bmap_blocks(ino_add), ino_add, true);
         memset(&seg, 0, sizeof(seg));
         seg.magic = cetrafs_cpu_to_le32(CETRAFS_INOSEG_MAGIC);

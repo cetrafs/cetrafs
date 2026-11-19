@@ -1356,6 +1356,7 @@ int cetrafs_sb_layout_grow(struct super_block *sb, const cetrafs_superblock_t *n
 int cetrafs_grow_claim_held(struct super_block *sb, const cetrafs_grow_arg_t *arg);
 int cetrafs_grow_commit(struct super_block *sb, const struct cetrafs_grow_plan *plan);
 int cetrafs_grow_check_bg_header(struct super_block *sb, u32 bg_id, u64 start, u64 len);
+int cetrafs_grow_check_iseg_bitmap(struct super_block *sb, u64 seg_lba, u64 count);
 long cetrafs_grow_ioctl(struct file *file, const cetrafs_grow_arg_t __user *arg);
 int cetrafs_grow_heal_pool(struct super_block *sb);
 u32 cetrafs_seg_crc(const cetrafs_seg_hdr_t *seg);
