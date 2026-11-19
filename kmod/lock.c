@@ -128,6 +128,7 @@ struct cetrafs_inode_info {
                                      * the on-disk presence bit is set on 0->1 and cleared on
                                      * 1->0, so repeated local opens cost nothing on the wire */
     atomic_t lock_local_open_count; /* this node's local open refcount, read+write alike */
+    atomic_t wb_walkers; /* writeback tree walks in flight (cetrafs_inode_wb_walk_begin(), BC-9) */
     /* Tree blocks reserved for a convert that must append through the
      * tree after shrinking a full leaf (cetrafs_tree_resv_fill()). Under
      * invalidate_lock held exclusively. Kept between converts while the
@@ -618,6 +619,35 @@ void cetrafs_inode_drop_reservation(struct inode *inode)
     if (ci->resv_gen == gen || READ_ONCE(cetrafs_resv_drop_unpublish_always))
         cetrafs_resv_unpublish(sb, &ci->resv_span);
     spin_unlock(&ci->resv_lock);
+}
+
+static inline struct cetrafs_inode_info *CETRAFS_I(struct inode *inode);
+
+/*
+ * Writeback maps through the extent tree holding no invalidate_lock (it
+ * cannot: truncate waits for writeback while holding it), so a rebuild's
+ * free of the old tree's blocks could land under a walk that read the
+ * old root before the publish (audit 2026-11-15 BC-9). The walks are
+ * counted, and the free of old tree blocks waits until none is in
+ * flight; a walk that begins after the publish reads the new root. The
+ * walk waits on nothing the rebuild holds. Rare: writeback walks the
+ * tree only for a folio without mapped buffers, and write_begin and
+ * page_mkwrite map every one before it can be dirty.
+ */
+void cetrafs_inode_wb_walk_begin(struct inode *inode)
+{
+    atomic_inc(&CETRAFS_I(inode)->wb_walkers);
+}
+
+void cetrafs_inode_wb_walk_end(struct inode *inode)
+{
+    if (atomic_dec_and_test(&CETRAFS_I(inode)->wb_walkers))
+        wake_up_var(&CETRAFS_I(inode)->wb_walkers);
+}
+
+void cetrafs_inode_wb_walk_drain(struct inode *inode)
+{
+    wait_var_event(&CETRAFS_I(inode)->wb_walkers, !atomic_read(&CETRAFS_I(inode)->wb_walkers));
 }
 
 static inline struct cetrafs_inode_info *CETRAFS_I(struct inode *inode)
@@ -1638,6 +1668,7 @@ static void cetrafs_inode_init_once(void *foo)
     atomic_set(&ci->lock_writer_count, 0);
     atomic_set(&ci->read_opener_count, 0);
     atomic_set(&ci->lock_local_open_count, 0);
+    atomic_set(&ci->wb_walkers, 0);
     mutex_init(&ci->ns_mutex);
     INIT_WORK(&ci->cold_work, cetrafs_inode_cold_work);
     INIT_LIST_HEAD(&ci->cold_park);

@@ -5052,6 +5052,22 @@ static int cetrafs_tree_meta_set(struct inode *inode, const cetrafs_inode_t *raw
     return 0;
 }
 
+/* TEST ONLY, one-shot: a writeback tree walk waits this long first (the
+ * window a rebuild's free must not land in, BC-9). And how many walks
+ * writeback made at all (tests/kernel/wb_walk_drain.sh). */
+static unsigned int cetrafs_wb_walk_stall_ms;
+cetrafs_test_param(wb_walk_stall_ms, cetrafs_wb_walk_stall_ms, uint, 0644);
+MODULE_PARM_DESC(wb_walk_stall_ms, "TEST ONLY: the next writeback tree walk waits this many ms first");
+static bool cetrafs_wb_walk_undrained;
+cetrafs_test_param(wb_walk_undrained, cetrafs_wb_walk_undrained, bool, 0644);
+MODULE_PARM_DESC(wb_walk_undrained, "TEST ONLY: old tree blocks are freed without waiting for writeback walks");
+static atomic64_t cetrafs_wb_tree_walks = ATOMIC64_INIT(0);
+
+u64 cetrafs_wb_tree_walk_count(void)
+{
+    return (u64) atomic64_read(&cetrafs_wb_tree_walks);
+}
+
 /*
  * Free the tree meta of 'raw' that 'keep' does not also name: the old
  * tree after a patch was published (keep = the new one), or a patch's new
@@ -5065,6 +5081,10 @@ void cetrafs_tree_free_meta_except(struct inode *inode, const cetrafs_inode_t *r
     struct super_block *sb = inode->i_sb;
     u64 *ks, *rs;
     u32 kn, rn, i;
+
+    /* No writeback walk that may hold the old root is in flight (BC-9). */
+    if (!READ_ONCE(cetrafs_wb_walk_undrained))
+        cetrafs_inode_wb_walk_drain(inode);
 
     if (cetrafs_tree_meta_set(inode, keep, false, &ks, &kn)) {
         pr_warn_ratelimited("ino=%llu: the kept extent tree could not be read -- its old blocks are left for the "
@@ -7633,8 +7653,15 @@ static int cetrafs_get_block_writeback(struct inode *inode, sector_t iblock, str
     if (cetrafs_bulk_fenced(inode))
         return -EIO;
     /* PLAIN: writeback holds no invalidate_lock, so it may not add to
-     * the pending set. It never maps anything new anyway (below). */
+     * the pending set. It never maps anything new anyway (below).
+     * Counted: a rebuild frees old tree blocks only once no walk that
+     * may hold the old root is in flight (BC-9). */
+    cetrafs_inode_wb_walk_begin(inode);
+    atomic64_inc(&cetrafs_wb_tree_walks);
+    if (unlikely(READ_ONCE(cetrafs_wb_walk_stall_ms)))
+        msleep(xchg(&cetrafs_wb_walk_stall_ms, 0)); /* TEST ONLY: see the parameter */
     ret = __cetrafs_get_block(inode, iblock, bh, create, false, CETRAFS_GB_PLAIN);
+    cetrafs_inode_wb_walk_end(inode);
 
     if (!ret && buffer_new(bh)) {
         pr_err_ratelimited("ino=%llu: writeback allocated/converted block %llu -- every block should be mapped "
@@ -7677,6 +7704,13 @@ static bool cetrafs_wb_chunk_fenced(struct inode *inode)
  * flusher) hands mpage its quota a chunk at a time, mapping's
  * writeback_index carrying the position.
  */
+/* TEST ONLY, one-shot: the next writeback pass looks block 0 up through
+ * the tree, as it does for a folio without mapped buffers -- a state
+ * ordinary I/O does not reach (tests/kernel/wb_walk_drain.sh). */
+static bool cetrafs_wb_walk_force;
+cetrafs_test_param(wb_walk_force, cetrafs_wb_walk_force, bool, 0644);
+MODULE_PARM_DESC(wb_walk_force, "TEST ONLY: the next writeback pass walks the extent tree for block 0");
+
 static int cetrafs_writepages(struct address_space *mapping, struct writeback_control *wbc)
 {
     struct inode *inode = mapping->host;
@@ -7684,6 +7718,11 @@ static int cetrafs_writepages(struct address_space *mapping, struct writeback_co
 
     if (cetrafs_sb_is_fenced(inode->i_sb))
         return -EIO; /* self-fenced: dirty data never reaches the device */
+    if (unlikely(READ_ONCE(cetrafs_wb_walk_force)) && xchg(&cetrafs_wb_walk_force, false)) {
+        struct buffer_head tbh = {.b_size = CETRAFS_BLOCK_SIZE};
+
+        (void) cetrafs_get_block_writeback(inode, 0, &tbh, 0); /* test-only: see the parameter */
+    }
     if (READ_ONCE(cetrafs_fence_per_block_off)) {
         (void) cetrafs_wb_chunk_fenced(inode); /* the test stall only: the old pass asks no more */
         return mpage_writepages(mapping, wbc, cetrafs_get_block_writeback);

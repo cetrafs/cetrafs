@@ -299,6 +299,11 @@ void cetrafs_sb_peer_note_fenced(struct super_block *sb, u32 node_id, const stru
 bool cetrafs_sb_peer_fenced_mark(struct super_block *sb, u32 node_id, struct cetrafs_row_mark *out);
 void cetrafs_sb_set_incarnation(struct super_block *sb, u32 inc);
 u32 cetrafs_sb_incarnation(struct super_block *sb);
+/* lock.c: writeback tree walks in flight (BC-9) */
+void cetrafs_inode_wb_walk_begin(struct inode *inode);
+void cetrafs_inode_wb_walk_end(struct inode *inode);
+void cetrafs_inode_wb_walk_drain(struct inode *inode);
+u64 cetrafs_wb_tree_walk_count(void); /* file.c */
 /* fs.c: bitmap blocks recently confirmed damaged (ioutil.c, F-67) */
 #define CETRAFS_BMAP_BAD_SLOTS 8
 #define CETRAFS_BMAP_BAD_SECS  10
