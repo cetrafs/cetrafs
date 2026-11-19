@@ -17,6 +17,11 @@
 #     no mark.
 #  D. a mark set by a peer while a mount is in flight is not a rewrite:
 #     the mount comes up (it used to be refused as "mkfs?").
+#  E. what fsck -r says about the clear is what it did (audit 2026-11-15
+#     BL-68): it names the row and time it cleared -- it printed the
+#     zeroed fields, "row 0 at 0" -- and a block 0 that no longer
+#     verifies at the clear (CETRAFS_TEST_FSCK_CLEAR_MARK_BADCRC) is not
+#     "cleared": the mark stays and fsck fails.
 #
 # DISCRIMINATION: with damage_record_off the mark never reaches the
 # device and A-C fail (the run below does that as its negative
@@ -119,6 +124,22 @@ else
     fail "D: the mount was refused: $(dmesg_since "$MARK" | grep -m1 -E 'refusing|rewritten' || true)"
 fi
 ct_param_set mount_register_stall_ms 0
-"$SBPOKE" "$IMG" fsck_needed_since 0 >/dev/null
-"$SBPOKE" "$IMG" fsck_needed_node 0 >/dev/null
+
+# ------------------------------------------------------------------- E
+log "E: fsck -r reports the clear it made, and only one it made"
+"$SBPOKE" "$IMG" fsck_needed_since 1234567 >/dev/null
+"$SBPOKE" "$IMG" fsck_needed_node 7 >/dev/null
+blockdev --flushbufs "$DEV"
+OUT="$(CETRAFS_TEST_FSCK_CLEAR_MARK_BADCRC=1 "$ROOT/userspace/fsck.cetra" -r "$DEV" 2>&1)" && RC=0 || RC=$?
+! grep -q "cleared the needs-fsck mark" <<<"$OUT" && [ "$RC" != 0 ] &&
+    pass "E: a block 0 that no longer verifies is not reported cleared, and fsck fails (exit $RC)" ||
+    fail "E: refused clear: exit $RC, $(grep -m1 -E 'cleared|no longer verifies' <<<"$OUT" || true)"
+[ "$(sbf fsck_needed_since)" = 1234567 ] && pass "E: and the mark stays" ||
+    fail "E: the mark reads $(sbf fsck_needed_since) after a refused clear"
+OUT="$("$ROOT/userspace/fsck.cetra" -r "$DEV" 2>&1)" && RC=0 || RC=$?
+grep -q "cleared the needs-fsck mark (recorded by registry row 7 at 1234567)" <<<"$OUT" &&
+    pass "E: the clear names the row and time it cleared" ||
+    fail "E: fsck -r (exit $RC) said: $(grep -m1 'needs-fsck' <<<"$OUT" || echo nothing)"
+[ "$(sbf fsck_needed_since)" = 0 ] && pass "E: block 0 carries no mark" ||
+    fail "E: block 0 still says since $(sbf fsck_needed_since)"
 ct_exit

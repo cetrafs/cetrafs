@@ -1039,17 +1039,23 @@ static int fsck_live_record_same(int fd, const cetrafs_superblock_t *sb, uint64_
  * fields is kept as the device has it, and a block 0 that no longer
  * verifies is left alone.
  */
-static void fsck_clear_needed_mark(int fd, cetrafs_superblock_t *sb)
+/* 0 once the cleared block is on the device (pwrite_all() syncs it, or
+ * exits); -1 when nothing was written. The caller says "cleared" only on
+ * 0: it used to say so after a refusal too, and with the row and time
+ * read back from the block it had just zeroed (audit 2026-11-15 BL-68). */
+static int fsck_clear_needed_mark(int fd, cetrafs_superblock_t *sb)
 {
     unsigned char blk[CETRAFS_BLOCK_SIZE];
     cetrafs_superblock_t cur;
 
     pread_all(fd, blk, sizeof(blk), 0);
     memcpy(&cur, blk, sizeof(cur));
+    if (cetrafs_test_env("CETRAFS_TEST_FSCK_CLEAR_MARK_BADCRC"))
+        cur.checksum = cetrafs_cpu_to_le64(cetrafs_le64(cur.checksum) ^ 1); /* test only: block 0 no longer verifies */
     if ((uint32_t) cetrafs_le64(cur.checksum) !=
         crc32c_struct(&cur, sizeof(cur), offsetof(cetrafs_superblock_t, checksum), sizeof(cur.checksum))) {
         fprintf(stderr, "ERR: block 0 no longer verifies -- leaving the needs-fsck mark\n");
-        return;
+        return -1;
     }
     cur.fsck_needed_since = cetrafs_cpu_to_le64(0);
     cur.fsck_needed_node = cetrafs_cpu_to_le32(0);
@@ -1059,8 +1065,8 @@ static void fsck_clear_needed_mark(int fd, cetrafs_superblock_t *sb)
         crc32c_struct(&cur, sizeof(cur), offsetof(cetrafs_superblock_t, checksum), sizeof(cur.checksum)));
     memcpy(blk, &cur, sizeof(cur));
     pwrite_all(fd, blk, sizeof(blk), 0);
-    fsync(fd);
     *sb = cur;
+    return 0;
 }
 
 /*
@@ -6903,10 +6909,15 @@ int main(int argc, char **argv)
          * repair pass finds the volume clean -- a pass that repaired
          * something has not shown that yet, and says to re-run. */
         if (cetrafs_le64(sb.fsck_needed_since)) {
+            uint32_t was_node = cetrafs_le32(sb.fsck_needed_node);
+            uint64_t was_since = cetrafs_le64(sb.fsck_needed_since);
+
             if (!problems && repair_mode) {
-                fsck_clear_needed_mark(fd, &sb);
-                printf("  cleared the needs-fsck mark (recorded by registry row %u at %" PRIu64 ")\n",
-                       cetrafs_le32(sb.fsck_needed_node), cetrafs_le64(sb.fsck_needed_since));
+                if (fsck_clear_needed_mark(fd, &sb) == 0)
+                    printf("  cleared the needs-fsck mark (recorded by registry row %u at %" PRIu64 ")\n", was_node,
+                           was_since);
+                else
+                    problems++;
             } else {
                 fprintf(stderr,
                         "ERR: the volume is marked as needing fsck: registry row %u found damaged metadata at %" PRIu64
