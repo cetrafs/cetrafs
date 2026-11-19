@@ -37,6 +37,13 @@
 #      over free blocks. ERR, not revived; nlink stays 0.
 #   8. the same with a block another live file now holds: reviving it
 #      shared that block. ERR, not revived.
+#   9. the same with its blocks named by a LATER deleted record nobody
+#      names (review F-70): its walk came first and found them its own;
+#      reviving it leaves the other's pending free to take them. ERR,
+#      not revived.
+#  10. the same with its blocks' bitmap sector failing its checksum
+#      (review F-70): a bit there decides nothing, so it cannot vouch
+#      for a revival. ERR, not revived.
 #
 # The kernel no longer leaves such a record behind -- a freed number's
 # record names nothing since evict clears it first -- but a volume
@@ -51,7 +58,10 @@
 # directory is skipped in silence: -r relinks its children. 7 and 8
 # fail under CETRAFS_TEST_FSCK_REVIVE_ANY (the old revive): each control
 # requires the revived file to read, on the next run, over a free block
-# (7) or a block two files name (8).
+# (7) or a block two files name (8). 9 fails under
+# CETRAFS_TEST_FSCK_DEAD_SHARE_OK and 10 under
+# CETRAFS_TEST_FSCK_DEAD_DAMAGED_OK: each control requires -r to revive
+# the file.
 set -euo pipefail
 . "$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)/lib/harness.sh"
 require_root
@@ -381,4 +391,69 @@ revive_case 7 1
 log "8: a named nlink-0 file one of whose blocks another file holds"
 revive_case 8 0
 revive_case 8 1
+
+# ---------------------------------------------------------------- 9, 10
+# late_case <9|10> <ctl>: the walk vouches for keep only if no later
+# deleted record names its blocks (9) and their bitmap sector reads
+# true (10).
+late_case() {
+    local sc="$1" ctl="$2" N L P BL BB SAVED OUT env="" NL FB
+    fresh
+    dd if=/dev/urandom of="$MNT/keep" bs=4096 count=4 conv=fsync status=none
+    dd if=/dev/urandom of="$MNT/other" bs=4096 count=4 conv=fsync status=none
+    N="$(stat -c %i "$MNT/keep")"
+    L="$(stat -c %i "$MNT/other")"
+    [ "$L" -gt "$N" ] || { ct_umount "$MNT"; fail "$sc($ctl): setup: other ($L) is not after keep ($N)"; return; }
+    ct_umount "$MNT"
+    P="$("$EPOKE" "$IMG" extent "$N" | cut -d' ' -f1)"
+    read -r BL BB <<<"$(data_bit "$P")"
+    [ -n "$BB" ] && [ "$("$BMAP" "$IMG" "$BL" "$BB")" = 1 ] || { fail "$sc($ctl): setup: block $P's bit is not set"; return; }
+    if [ "$sc" = 9 ]; then
+        # other deleted, its free not run yet, and its extent naming keep's blocks
+        SAVED="$(ct_tmp "deadrec-9-$ctl")"
+        save_rec "$L" "$SAVED"
+        ct_mount "$DEV" "$MNT"
+        rm "$MNT/other"
+        ct_umount "$MNT"
+        "$BMAP" "$IMG" ino "$L" 1 >/dev/null
+        plant_dead_rec "$L" "$SAVED"
+        "$XPOKE" "$IMG" "$L" "$P" >/dev/null
+        [ "$("$EPOKE" "$IMG" extent "$L" | cut -d' ' -f1)" = "$P" ] && [ "$("$BMAP" "$IMG" ino "$L")" = 1 ] ||
+            { fail "$sc($ctl): setup: ino $L is not an allocated record naming block $P"; return; }
+        [ "$ctl" = 1 ] && env="CETRAFS_TEST_FSCK_DEAD_SHARE_OK=1"
+    else
+        # a free bit near keep's, set raw: the sector holding keep's bits fails its checksum
+        FB="$("$BMAP" "$IMG" "$BL" clear0 "$BB" 64)"
+        [ "$FB" -ge 0 ] && [ $((FB / 3968)) = $((BB / 3968)) ] ||
+            { fail "$sc($ctl): setup: no free bit near keep's in its sector"; return; }
+        "$BMAP" "$IMG" "$BL" "$FB" 1 raw >/dev/null
+        [ "$ctl" = 1 ] && env="CETRAFS_TEST_FSCK_DEAD_DAMAGED_OK=1"
+    fi
+    "$IPOKE" "$IMG" nlink "$N" 0 >/dev/null
+    blockdev --flushbufs "$DEV"
+    OUT="$("$FSCK" "$DEV" 2>&1 || true)"
+    if [ "$sc" = 10 ]; then
+        grep -q "data bitmap at block .* fail their checksum" <<<"$OUT" ||
+            { fail "$sc($ctl): setup: the bitmap sector does not fail its checksum"; return; }
+    fi
+    pass "$sc($ctl): set up -- named ino $N, nlink 0, $([ "$sc" = 9 ] && echo "deleted ino $L names its block $P" || echo "its bitmap sector damaged")"
+    env $env "$FSCK" -r "$DEV" >/dev/null 2>&1 || true
+    blockdev --flushbufs "$DEV"
+    NL="$("$IPOKE" "$IMG" nsget "$N" | cut -d' ' -f2)"
+    if [ "$ctl" = 0 ]; then
+        grep -q "^ERR: inode $N is deleted (nlink=0) but 1 directory entries name it.*not revived" <<<"$OUT" &&
+            pass "$sc: fsck reports ino $N as not revivable" ||
+            fail "$sc: no 'not revived' ERR for ino $N: $(grep '^ERR' <<<"$OUT" | head -3)"
+        [ "$NL" = 0 ] && pass "$sc: -r left ino $N deleted" || fail "$sc: -r revived ino $N (nlink $NL)"
+    else
+        [ "$NL" = 1 ] && pass "control $sc: the old verdict revives ino $N" ||
+            fail "control $sc: ino $N was not revived (nlink $NL)"
+    fi
+}
+log "9: a named nlink-0 file whose blocks a later deleted record names"
+late_case 9 0
+late_case 9 1
+log "10: a named nlink-0 file whose bitmap sector fails its checksum"
+late_case 10 0
+late_case 10 1
 ct_exit

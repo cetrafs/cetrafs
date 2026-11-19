@@ -2322,6 +2322,22 @@ struct fsck_refctx {
      * blocks. */
     struct fsck_bitcache *bc;
     uint64_t dead_free;
+    struct fsck_deadruns *dr;
+};
+
+/* The runs each deleted record walked so far names, kept while its
+ * verdict may still be "whole" (dead_ok), and the blocks a SECOND
+ * deleted record also names (share). The walk goes in inode order, so
+ * only the later of two deleted records sharing a block sees the other's
+ * claim; the earlier one is found from its runs once the walk is over. */
+struct fsck_deadrun {
+    uint64_t idx0, len, ino;
+};
+struct fsck_deadruns {
+    struct fsck_deadrun *v;
+    size_t n, cap;
+    uint8_t *share;
+    uint64_t shared;
 };
 
 /* One group's data bitmap as the device holds it, read once and kept
@@ -2332,18 +2348,25 @@ struct fsck_bitcache {
     const uint64_t *bg_cnt;
     int group;
     uint8_t *img;
+    uint8_t *bad;
 };
 
+/* A bit in a sector that fails its checksum decides nothing
+ * (fsck_bmap_bit_damaged()): it reads as clear here, so it can never
+ * vouch for a revival. */
 static int fsck_bitcache_get(struct fsck_bitcache *bc, int b, uint64_t off)
 {
     if (bc->group != b) {
-        uint64_t n, bad = 0;
+        uint64_t n, nbad = 0;
 
         free(bc->img);
-        bc->img = fsck_bmap_read(bc->fd, bc->bmap_lba[b], bc->bg_cnt[b], &n, NULL, &bad);
+        free(bc->bad);
+        bc->img = fsck_bmap_read(bc->fd, bc->bmap_lba[b], bc->bg_cnt[b], &n, NULL, &nbad);
+        bc->bad = fsck_bmap_bad_sectors(bc->img, n);
         bc->group = b;
     }
-    return cetrafs_bmap_get(bc->img, off);
+    return cetrafs_bmap_get(bc->img, off) &&
+           (!fsck_bmap_bit_damaged(bc->bad, off) || cetrafs_test_env("CETRAFS_TEST_FSCK_DEAD_DAMAGED_OK"));
 }
 
 /* Mark one physical run [phys, phys+len) as referenced by 'ino', flagging
@@ -2613,6 +2636,17 @@ static void fsck_mark_run(struct fsck_refctx *c, uint64_t phys, uint64_t len, ui
     }
 
     idx0 = base + (phys - c->bg_start[found]);
+    if (fsck_dead_walk && c->dr) {
+        struct fsck_deadruns *dr = c->dr;
+
+        if (dr->n == dr->cap) {
+            dr->cap = dr->cap ? dr->cap * 2 : 64;
+            dr->v = (struct fsck_deadrun *) realloc(dr->v, dr->cap * sizeof(*dr->v));
+            if (!dr->v)
+                diex("realloc");
+        }
+        dr->v[dr->n++] = (struct fsck_deadrun){idx0, len, ino};
+    }
     for (uint64_t k = 0; k < len; ++k) {
         uint64_t idx = idx0 + k;
 
@@ -2620,6 +2654,10 @@ static void fsck_mark_run(struct fsck_refctx *c, uint64_t phys, uint64_t len, ui
             /* Live records were all walked first: whatever already
              * holds this block outranks a deleted record's claim. */
             (*c->stale)++;
+            if (c->dr && FSCK_GET(c->weakd, idx)) {
+                FSCK_SET(c->dr->share, idx); /* an earlier deleted record's too */
+                c->dr->shared++;
+            }
         } else if (FSCK_GET(c->refd, idx)) {
             FSCK_SET(c->dupd, idx); /* this block is double-claimed */
             /* Report the overlap once per run, not once per block -- a
@@ -4999,7 +5037,9 @@ int main(int argc, char **argv)
         /* Two passes: live records (nlink > 0) first, then deleted
          * ones (fsck_dead_walk), so that a block a live record names is
          * the live record's whatever the inode numbering. */
-        struct fsck_bitcache dead_bits = {fd, bg_bmap_lba, bg_data_cnt, -1, NULL};
+        struct fsck_bitcache dead_bits = {fd, bg_bmap_lba, bg_data_cnt, -1, NULL, NULL};
+        struct fsck_deadruns dead_runs = {NULL, 0, 0, (uint8_t *) xcalloc(bmwords, 1), 0};
+        size_t runs_before = 0;
 
         for (int dpass = 0; dpass < 2; ++dpass)
         for (uint64_t ino = 1; ino <= cetrafs_le32(sb.inodes_count); ++ino) {
@@ -5065,6 +5105,7 @@ int main(int argc, char **argv)
                 continue; /* the other pass's */
             fsck_dead_walk = dpass;
             stale_before = stale_blocks;
+            runs_before = dead_runs.n;
             inodes_seen++;
 
             /* A lock_mode no code writes: the kernel treats it as
@@ -5181,7 +5222,7 @@ int main(int argc, char **argv)
             fsck_cur_fmt = cetrafs_le32(in.mode) & 0170000u;
             struct fsck_refctx rc = {refd,      dupd, bg_data_start, bg_data_cnt,
                                      cetrafs_le32(sb.block_group_count), &problems, &blocks_referenced,
-                                     weakd,     &stale_blocks, &dead_bits, 0};
+                                     weakd,     &stale_blocks, &dead_bits, 0, &dead_runs};
             uint64_t xattr_lba = cetrafs_le64(in.xattr_block);
             int tree_ok = 1, whole = 1;
 
@@ -5249,9 +5290,23 @@ int main(int argc, char **argv)
                         ino, stale_blocks - stale_before);
             if (fsck_dead_walk && whole && stale_blocks == stale_before && !rc.dead_free)
                 dead_ok[ino] = 1;
+            else
+                dead_runs.n = runs_before; /* not revivable already: nothing to recheck */
         }
         fsck_dead_walk = 0;
+        /* A block two deleted records name: the later one counted it
+         * stale; the earlier one's verdict was given before the later
+         * was walked, so it is withdrawn here (F-70). Reviving it would
+         * leave the other's free to take that block from under it. */
+        if (dead_runs.shared && !cetrafs_test_env("CETRAFS_TEST_FSCK_DEAD_SHARE_OK"))
+            for (size_t r = 0; r < dead_runs.n; r++)
+                for (uint64_t k = 0; k < dead_runs.v[r].len && dead_ok[dead_runs.v[r].ino]; k++)
+                    if (FSCK_GET(dead_runs.share, dead_runs.v[r].idx0 + k))
+                        dead_ok[dead_runs.v[r].ino] = 0;
+        free(dead_runs.v);
+        free(dead_runs.share);
         free(dead_bits.img);
+        free(dead_bits.bad);
 
         /* Blocks sitting in a per-ZG pending-free queue are marked used
          * and referenced by nothing -- legitimately so, until their
