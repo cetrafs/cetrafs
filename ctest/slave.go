@@ -1298,8 +1298,10 @@ func (s *Slave) doWriteHeld(a HeldIOArgs) (HeldIOResult, error) {
 	if err != nil {
 		return HeldIOResult{}, fmt.Errorf("write at offset %d: %w", a.Offset, err)
 	}
-	if err := f.Sync(); err != nil {
-		return HeldIOResult{}, fmt.Errorf("fsync: %w", err)
+	if !a.NoSync {
+		if err := f.Sync(); err != nil {
+			return HeldIOResult{}, fmt.Errorf("fsync: %w", err)
+		}
 	}
 	sum := sha256.Sum256(buf[:n])
 	return HeldIOResult{Bytes: n, Checksum: hex.EncodeToString(sum[:])}, nil
@@ -1755,6 +1757,11 @@ var settableModParams = map[string]bool{
 	// node with its journal entries durable, and (control) the old
 	// sweep that waited for the area mutex.
 	"journal_replay_refuse":              true,
+	"hb_maint_delay_ms":                  true,
+	"tree_flush_fail_once":               true,
+	"late_flush_blind":                   true,
+	"close_publish_fail":                 true,
+	"stat_publish_root_over_peer":        true,
 	"journal_replay_apply_pause_ms":      true,
 	"journal_batch_crash_before_targets": true,
 	"journal_sweep_waits":                true,

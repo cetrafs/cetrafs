@@ -250,6 +250,9 @@ type HeldIOArgs struct {
 	Offset int64  `json:"offset"`
 	Size   int    `json:"size"`
 	Stamp  string `json:"stamp,omitempty"` // write only: repeated to fill Size
+	// NoSync: write only, no fsync after it -- the tree blocks it
+	// changed stay held back until the close boundary.
+	NoSync bool `json:"no_sync,omitempty"`
 }
 
 type HeldIOResult struct {

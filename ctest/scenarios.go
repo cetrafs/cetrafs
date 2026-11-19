@@ -3266,6 +3266,8 @@ func RunFullSuite(clients []*Client, lockPath, baseDir string, accountingSizeByt
 		{"reader-reclaim", func() (bool, error) { return RunReaderReclaim(clients, baseDir) }},
 		{"sweep-vs-open-replay", func() (bool, error) { return RunSweepVsOpenReplay(clients, baseDir) }},
 		{"replay-after-truncate", func() (bool, error) { return RunReplayAfterTruncate(clients, baseDir) }},
+		{"late-flush", func() (bool, error) { return RunLateFlush(clients, baseDir, false) }},
+		{"late-publish", func() (bool, error) { return RunLateFlush(clients, baseDir, true) }},
 		{"zg-claim-vs-replay", func() (bool, error) { return RunZgClaimVsReplay(clients, baseDir) }}, // reformats
 		{"reader-reattach", func() (bool, error) { return RunReaderReattach(clients, baseDir) }},
 		{"twin-watch", func() (bool, error) { return RunTwinWatch(clients, baseDir) }},

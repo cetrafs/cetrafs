@@ -383,7 +383,7 @@ func runMaster(cfg masterConfig) (bool, error) {
 		"concurrent-rename", "read-presence", "inode-reuse", "link-stale-reuse", "inode-unique", "dirent-cache", "extent-leaf-staleness",
 		"record-write-race", "dirent-torn", "caw", "pending-free", "scrub-transit", "hypervisor-storm", "ns-fuzz",
 		"create-visibility",
-		"fence-reclaim", "replay-race", "direct-write", "direct-overwrite", "zero-range", "fstrim-pool", "defrag-yield", "handback-unknown", "churn-trim", "rename-loop", "damage-incarnation", "cas-image-check", "grow-twice", "grow-unrescanned", "sweep-vs-open-replay", "replay-after-truncate", "zg-claim-vs-replay", "reader-reattach", "twin-watch", "frees-in-flight", "repair-claim-race", "reader-reclaim", "foreign-free-batch",
+		"fence-reclaim", "replay-race", "direct-write", "direct-overwrite", "zero-range", "fstrim-pool", "defrag-yield", "handback-unknown", "churn-trim", "rename-loop", "damage-incarnation", "cas-image-check", "grow-twice", "grow-unrescanned", "sweep-vs-open-replay", "replay-after-truncate", "zg-claim-vs-replay", "reader-reattach", "twin-watch", "frees-in-flight", "repair-claim-race", "reader-reclaim", "foreign-free-batch", "late-flush", "late-publish",
 		"space-accounting",
 		"sparse-bigfile",
 		"grow-live",
@@ -497,6 +497,10 @@ func dispatchScenario(cfg masterConfig, clients []*Client) (bool, error) {
 		return RunSweepVsOpenReplay(clients, cfg.testDir)
 	case "replay-after-truncate":
 		return RunReplayAfterTruncate(clients, cfg.testDir)
+	case "late-flush":
+		return RunLateFlush(clients, cfg.testDir, false)
+	case "late-publish":
+		return RunLateFlush(clients, cfg.testDir, true)
 	case "zg-claim-vs-replay":
 		return RunZgClaimVsReplay(clients, cfg.testDir)
 	case "reader-reattach":
