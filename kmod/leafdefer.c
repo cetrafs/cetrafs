@@ -977,6 +977,12 @@ MODULE_PARM_DESC(flush_all_skip_unhashed, "TEST ONLY: sync skips a set whose ino
 
 #define CETRAFS_FLUSH_ALL_UNHASHED_WAIT_MS 100
 
+/* TEST ONLY: the walk stops at a set it cannot reach or write, as before audit
+ * 2026-11-15 F-73 (tests/kernel/sync_unreachable_set.sh). */
+static bool cetrafs_flush_all_stop_at_failure;
+cetrafs_test_param(flush_all_stop_at_failure, cetrafs_flush_all_stop_at_failure, bool, 0644);
+MODULE_PARM_DESC(flush_all_stop_at_failure, "TEST ONLY: sync stops at a held set it cannot reach or write");
+
 /* TEST ONLY, one-shot: the next sync first unhashes this inode, as the
  * refresh does to an object it finds deleted or reused -- the state the
  * walk below meets (tests/kernel/sync_unreachable_set.sh). */
@@ -1007,11 +1013,48 @@ static int cetrafs_deferred_unreachable(struct xarray *xa, unsigned long idx, u6
     }
 }
 
+/* An owner this walk has already failed to write: its other blocks are
+ * passed over, not tried again (F-73). Grown as needed; the walk stops,
+ * with its error, only if even that allocation fails. */
+struct cetrafs_flush_skip {
+    u64 *ent; /* ino, generation pairs */
+    unsigned int n, cap;
+};
+
+static bool cetrafs_flush_skip_has(const struct cetrafs_flush_skip *sk, u64 ino, u64 gen)
+{
+    unsigned int k;
+
+    for (k = 0; k < sk->n; k++)
+        if (sk->ent[2 * k] == ino && sk->ent[2 * k + 1] == gen)
+            return true;
+    return false;
+}
+
+static bool cetrafs_flush_skip_add(struct cetrafs_flush_skip *sk, u64 ino, u64 gen)
+{
+    if (sk->n == sk->cap) {
+        unsigned int cap = sk->cap ? sk->cap * 2 : 16;
+        u64 *e = krealloc_array(sk->ent, (size_t) cap * 2, sizeof(*e), GFP_NOFS);
+
+        if (!e)
+            return false;
+        sk->ent = e;
+        sk->cap = cap;
+    }
+    sk->ent[2 * sk->n] = ino;
+    sk->ent[2 * sk->n + 1] = gen;
+    sk->n++;
+    return true;
+}
+
 int cetrafs_deferred_flush_all(struct super_block *sb)
 {
     struct xarray *xa = cetrafs_sb_deferred(sb);
     struct list_head *orphans = cetrafs_sb_deferred_orphans(sb);
-    unsigned long rounds = 0, limit = 0, idx;
+    unsigned long rounds = 0, orphan_rounds = 0, limit = 0, idx, cursor = 0;
+    struct cetrafs_flush_skip skip = {0};
+    bool wrapped = false, orphans_done = false;
     struct cetrafs_deferred *d;
     int ret = 0;
 
@@ -1031,53 +1074,116 @@ int cetrafs_deferred_flush_all(struct super_block *sb)
     xa_for_each(xa, idx, d)
         limit++;
     xa_unlock(xa);
-    while (!xa_empty(xa) && rounds++ <= limit) {
-        unsigned long first = 0;
+    /*
+     * One failing or unreachable set must not keep back every set after
+     * it: the walk goes on past it from a cursor and returns the error at
+     * the end (audit 2026-11-15 F-73). Passing over an owner already met
+     * costs no round, so the bound counts only writes; the cursor goes
+     * forward, and back to the start once, for a set listed behind it
+     * meanwhile.
+     */
+    while (!xa_empty(xa) && rounds <= limit) {
+        unsigned long first = cursor;
         struct inode *inode;
-        bool orphan;
+        bool orphan, is_orphan = false;
         u64 ino = 0, gen = 0;
         int r;
 
+        /* A stopped mount writes nothing more, whatever the last set did. */
+        if (cetrafs_sb_is_fenced(sb)) {
+            if (!ret)
+                ret = -EIO;
+            break;
+        }
         xa_lock(xa);
-        orphan = !list_empty(orphans);
+        orphan = !orphans_done && !list_empty(orphans);
         if (!orphan) {
             d = xa_find(xa, &first, ULONG_MAX, XA_PRESENT);
+            if (!d && cursor && !wrapped) {
+                wrapped = true;
+                first = cursor = 0;
+                d = xa_find(xa, &first, ULONG_MAX, XA_PRESENT);
+            }
             ino = d ? d->ino : 0;
             gen = d ? d->generation : 0;
+            is_orphan = d && d->orphan;
         }
         xa_unlock(xa);
         if (orphan) {
+            /* The whole orphan list goes in one batch, owner by owner
+             * (cetrafs_deferred_write_by_inode()). A failure there, or
+             * a list that never empties, ends the orphan rounds; the
+             * walk goes on over the live sets. */
             r = cetrafs_deferred_flush_list(sb, orphans, true);
-        } else if (!ino) {
-            break;
-        } else {
-            /* Not an orphan, so in core -- unless it was evicted since,
-             * and then it is an orphan on the next round. */
-            inode = ilookup(sb, ino);
-            if (inode && cetrafs_inode_get_generation(inode) != gen) {
-                iput(inode); /* the number's new file: not this set's owner */
-                inode = NULL;
+            if (r) {
+                if (!ret || ret == -EBUSY)
+                    ret = r;
+                orphans_done = true;
+            } else if (++orphan_rounds > limit) {
+                orphans_done = true;
             }
-            if (!inode) {
-                if (READ_ONCE(cetrafs_flush_all_skip_unhashed))
-                    continue; /* test-only: the old skip; see the parameter */
-                r = cetrafs_deferred_unreachable(xa, first, ino, gen);
-                if (!r)
-                    continue; /* orphaned meanwhile: the next round writes it */
-                ret = r;
-                break;
-            }
-            if (cetrafs_deferred_flush_no_inode)
-                r = cetrafs_deferred_flush_list(sb, cetrafs_inode_deferred(inode), true); /* test-only */
-            else
-                r = cetrafs_deferred_flush_inode(inode, false);
-            iput(inode);
-            if (r == -ESTALE)
-                r = 0; /* dropped: a peer's newer map, nothing of ours left to write */
+            continue;
         }
+        if (!d)
+            break;
+        /* An orphan entry is on the list (both change under the lock
+         * read above): the orphan rounds' to write, or over and left. */
+        if (is_orphan || cetrafs_flush_skip_has(&skip, ino, gen)) {
+            cursor = first + 1; /* left listed; go on past it */
+            cond_resched();
+            continue;
+        }
+        rounds++;
+        /* Not an orphan, so in core -- unless it was evicted since,
+         * and then it is an orphan on the next round. */
+        inode = ilookup(sb, ino);
+        if (inode && cetrafs_inode_get_generation(inode) != gen) {
+            iput(inode); /* the number's new file: not this set's owner */
+            inode = NULL;
+        }
+        if (!inode) {
+            if (READ_ONCE(cetrafs_flush_all_skip_unhashed))
+                continue; /* test-only: the old skip; see the parameter */
+            r = cetrafs_deferred_unreachable(xa, first, ino, gen);
+            if (!r)
+                continue; /* orphaned meanwhile: the next round writes it */
+            /* Left listed for its owner's close or eviction. The error is
+             * the sync's answer, at the end. */
+            if (!ret)
+                ret = r;
+            if (READ_ONCE(cetrafs_flush_all_stop_at_failure) || !cetrafs_flush_skip_add(&skip, ino, gen))
+                break;
+            cursor = first + 1;
+            continue;
+        }
+        if (cetrafs_deferred_flush_no_inode)
+            r = cetrafs_deferred_flush_list(sb, cetrafs_inode_deferred(inode), true); /* test-only */
+        else
+            r = cetrafs_deferred_flush_inode(inode, false);
+        iput(inode);
+        if (r == -ESTALE)
+            r = 0; /* dropped: a peer's newer map, nothing of ours left to write */
         if (r) {
-            ret = r;
-            break; /* left listed: the next sync, or unmount, retries */
+            /* Left listed: the next sync, or unmount, retries. */
+            if (!ret || ret == -EBUSY)
+                ret = r;
+            if (READ_ONCE(cetrafs_flush_all_stop_at_failure) || !cetrafs_flush_skip_add(&skip, ino, gen))
+                break;
+            cursor = first + 1;
+        }
+    }
+    kfree(skip.ent);
+    /* Orphan rounds that ended with sets still on the list wrote none of
+     * them: not a success. */
+    if (!ret && orphans_done) {
+        bool left;
+
+        xa_lock(xa);
+        left = !list_empty(orphans);
+        xa_unlock(xa);
+        if (left) {
+            pr_warn("deferred: orphaned tree blocks stayed listed through this sync -- not written\n");
+            ret = -EIO;
         }
     }
     /* The last batch's entries, live until a flush after their targets:
@@ -1085,6 +1191,8 @@ int cetrafs_deferred_flush_all(struct super_block *sb)
     {
         int dr = cetrafs_journal_drain_retiring(sb);
 
+        if (ret && dr)
+            pr_warn_ratelimited("deferred: the journal drain after a failed sync failed too (%d)\n", dr);
         return ret ? ret : dr;
     }
 }
