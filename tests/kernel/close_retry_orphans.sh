@@ -68,15 +68,18 @@ round() {
     proc="$(ct_procdir "$dev")"
     f="$MNT/img"
     fallocate -l $((4 << 20)) "$f"
-    for i in $(seq 0 6); do dio_write "$f" $((i * 4)) "$(printf 'B%07d' $((i * 4)))"; done
-    dio_write "$f" 28 B0000028 fsync
+    # 64 apart: gaps too wide for a conversion to zero-fill across (it
+    # does on some backing filesystems), so every write is its own
+    # extent and the map spills into a leaf.
+    for i in $(seq 0 6); do dio_write "$f" $((i * 64)) "$(printf 'B%07d' $((i * 64)))"; done
+    dio_write "$f" 448 B0000448 fsync
     ino="$(stat -c %i "$f")"
     echo "$1" >/sys/module/cetrafs/parameters/retry_orphans_off
     echo 8000 >/sys/module/cetrafs/parameters/hb_maint_delay_ms
     o0="$(sed -n 's/^deferred_orphaned: //p' "$proc/info")"
     mark="$(dmesg_mark)"
     echo 1 >/sys/module/cetrafs/parameters/tree_flush_fail_once
-    dio_write "$f" 120 FIRST001
+    dio_write "$f" 900 FIRST001
     echo 1 >/sys/module/cetrafs/parameters/tree_flush_skip_all
     dmesg_since "$mark" | grep -q "ino=$ino.*\(queued\|retry\|heartbeat\)" && failed=1
     sync -f "$MNT"
@@ -87,7 +90,7 @@ round() {
         dmesg_since "$mark" | grep -q "lock release: ino=$ino close finished by the heartbeat" && { finished=1; break; }
         sleep 0.5
     done
-    "$LP" "$img" show "$ino" | grep -q "^ent [0-9]* block=120 .* uninit=0$" && ondev=1
+    "$LP" "$img" show "$ino" | grep -q "^ent [0-9]* block=900 .* uninit=0$" && ondev=1
     echo 0 >/sys/module/cetrafs/parameters/tree_flush_skip_all
     echo 0 >/sys/module/cetrafs/parameters/retry_orphans_off
     ct_umount "$MNT"
