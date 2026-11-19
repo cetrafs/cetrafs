@@ -3845,6 +3845,13 @@ cetrafs_test_param(free_chunk_stall_ms, cetrafs_free_chunk_stall_ms, uint, 0644)
 static bool cetrafs_free_chunk_recheck_off;
 cetrafs_test_param(free_chunk_recheck_off, cetrafs_free_chunk_recheck_off, bool, 0644);
 
+/* TEST ONLY: a free drops held-back tree edits in its range before it
+ * validates the extent, as before audit 2026-11-15 BL-13
+ * (tests/kernel/free_refused_keeps_edits.sh). */
+static bool cetrafs_free_forget_first;
+cetrafs_test_param(free_forget_first, cetrafs_free_forget_first, bool, 0644);
+MODULE_PARM_DESC(free_forget_first, "TEST ONLY: drop held-back tree edits in a freed range before validating it");
+
 static int __cetrafs_free_data_extent(struct super_block *sb, u64 lba, u32 count, const u64 *resv_seq, const u64 *alloc_seq, u64 *out_freed, struct cetrafs_free_batch *fb)
 {
     struct cetrafs_bmap_hold fh = {0}; /* the bitmap block the loop holds */
@@ -3863,12 +3870,8 @@ static int __cetrafs_free_data_extent(struct super_block *sb, u64 lba, u32 count
     if (cetrafs_sb_is_fenced(sb))
         return -EIO; /* self-fenced */
 
-    /* A tree block of ours held back for a boundary (leafdefer.c) and
-     * freed before it: its edit belongs to a tree that no longer names
-     * it, and written later it would land on the block's next owner.
-     * Every caller has stopped naming these blocks, so the edit goes,
-     * whatever the free below decides. */
-    cetrafs_deferred_forget_range(sb, lba, count);
+    if (READ_ONCE(cetrafs_free_forget_first))
+        cetrafs_deferred_forget_range(sb, lba, count); /* test-only: the old order; see the parameter */
 
     ret = cetrafs_bg_id_for_lba(sb, lba, &bg_id);
     if (ret) {
@@ -3939,6 +3942,18 @@ static int __cetrafs_free_data_extent(struct super_block *sb, u64 lba, u32 count
         cetrafs_sb_corrupt(sb, 0);
         return -EUCLEAN;
     }
+
+    /* A tree block of ours held back for a boundary (leafdefer.c) and
+     * freed before it: its edit belongs to a tree that no longer names
+     * it, and written later it would land on the block's next owner.
+     * Dropped here, once the extent is known to be a free and not
+     * damage: refused above, nothing changes hands, and a range a
+     * corrupt extent names may hold ANOTHER file's held-back leaf, whose
+     * edit was dropped with no free to justify it (audit 2026-11-15
+     * BL-13). A free that leaks below keeps its blocks allocated, so an
+     * edit written later lands on nobody's. */
+    if (!READ_ONCE(cetrafs_free_forget_first))
+        cetrafs_deferred_forget_range(sb, lba, count);
 
     if (cetrafs_sb_caw_available(sb) || cetrafs_pf_force_foreign) {
         if (cetrafs_pf_force_foreign || !cetrafs_sb_zg_owned_cached(sb, bg.owner_zg)) {
