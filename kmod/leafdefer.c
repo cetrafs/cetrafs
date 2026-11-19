@@ -956,6 +956,57 @@ int cetrafs_deferred_flush_orphans_of(struct super_block *sb, u64 ino)
  * and a block edited after its write stays listed (the settle) -- then
  * each inode in core, under its own lock.
  */
+/*
+ * A listed set whose inode ilookup() does not give back. An eviction is
+ * not that: ilookup() waits for an inode being freed, and the eviction
+ * moves its set to the orphans before it ends. What is left is an
+ * object UNHASHED while alive -- a peer deleted the file and reused the
+ * number, and the refresh dropped the stale object from the hash
+ * (inode.c, rule 2) while an fd still holds it: ilookup() then finds
+ * nothing, or the new file under the same number with an empty list.
+ * The walk skipped it, met the same entry on every round until its
+ * bound ran out, and the sync returned success with that set -- and
+ * every set after it -- still held (audit 2026-11-15 BL-23). Now the
+ * sync fails: the set is the live object's to write, at its close or
+ * once evicted, when it becomes an orphan. A short re-check first
+ * covers an eviction that began just after the lookup.
+ */
+static bool cetrafs_flush_all_skip_unhashed;
+cetrafs_test_param(flush_all_skip_unhashed, cetrafs_flush_all_skip_unhashed, bool, 0644);
+MODULE_PARM_DESC(flush_all_skip_unhashed, "TEST ONLY: sync skips a set whose inode is unhashed, as before audit BL-23");
+
+#define CETRAFS_FLUSH_ALL_UNHASHED_WAIT_MS 100
+
+/* TEST ONLY, one-shot: the next sync first unhashes this inode, as the
+ * refresh does to an object it finds deleted or reused -- the state the
+ * walk below meets (tests/kernel/sync_unreachable_set.sh). */
+static unsigned long long cetrafs_flush_all_unhash_ino;
+cetrafs_test_param(flush_all_unhash_ino, cetrafs_flush_all_unhash_ino, ullong, 0644);
+MODULE_PARM_DESC(flush_all_unhash_ino, "TEST ONLY: the next sync first unhashes this inode number");
+
+static int cetrafs_deferred_unreachable(struct xarray *xa, unsigned long idx, u64 ino, u64 generation)
+{
+    unsigned long until = jiffies + msecs_to_jiffies(CETRAFS_FLUSH_ALL_UNHASHED_WAIT_MS);
+    struct cetrafs_deferred *d;
+    bool still;
+
+    for (;;) {
+        xa_lock(xa);
+        d = xa_load(xa, idx);
+        still = d && d->ino == ino && d->generation == generation && !d->orphan;
+        xa_unlock(xa);
+        if (!still)
+            return 0;
+        if (time_after(jiffies, until)) {
+            pr_warn("deferred: ino=%llu (generation %llx) holds tree blocks on an object no longer in the inode "
+                    "cache -- deleted elsewhere while open here; this sync did not write them\n",
+                    (unsigned long long) ino, (unsigned long long) generation);
+            return -EBUSY;
+        }
+        msleep(1);
+    }
+}
+
 int cetrafs_deferred_flush_all(struct super_block *sb)
 {
     struct xarray *xa = cetrafs_sb_deferred(sb);
@@ -966,6 +1017,14 @@ int cetrafs_deferred_flush_all(struct super_block *sb)
 
     if (!xa || !orphans)
         return cetrafs_journal_drain_retiring(sb);
+    if (unlikely(READ_ONCE(cetrafs_flush_all_unhash_ino))) {
+        struct inode *u = ilookup(sb, xchg(&cetrafs_flush_all_unhash_ino, 0));
+
+        if (u) {
+            remove_inode_hash(u); /* test-only: see the parameter */
+            iput(u);
+        }
+    }
     /* Bounded by what is listed now: a writer still deferring blocks
      * must not keep a sync going for ever. */
     xa_lock(xa);
@@ -976,7 +1035,7 @@ int cetrafs_deferred_flush_all(struct super_block *sb)
         unsigned long first = 0;
         struct inode *inode;
         bool orphan;
-        u64 ino = 0;
+        u64 ino = 0, gen = 0;
         int r;
 
         xa_lock(xa);
@@ -984,6 +1043,7 @@ int cetrafs_deferred_flush_all(struct super_block *sb)
         if (!orphan) {
             d = xa_find(xa, &first, ULONG_MAX, XA_PRESENT);
             ino = d ? d->ino : 0;
+            gen = d ? d->generation : 0;
         }
         xa_unlock(xa);
         if (orphan) {
@@ -994,8 +1054,19 @@ int cetrafs_deferred_flush_all(struct super_block *sb)
             /* Not an orphan, so in core -- unless it was evicted since,
              * and then it is an orphan on the next round. */
             inode = ilookup(sb, ino);
-            if (!inode)
-                continue;
+            if (inode && cetrafs_inode_get_generation(inode) != gen) {
+                iput(inode); /* the number's new file: not this set's owner */
+                inode = NULL;
+            }
+            if (!inode) {
+                if (READ_ONCE(cetrafs_flush_all_skip_unhashed))
+                    continue; /* test-only: the old skip; see the parameter */
+                r = cetrafs_deferred_unreachable(xa, first, ino, gen);
+                if (!r)
+                    continue; /* orphaned meanwhile: the next round writes it */
+                ret = r;
+                break;
+            }
             if (cetrafs_deferred_flush_no_inode)
                 r = cetrafs_deferred_flush_list(sb, cetrafs_inode_deferred(inode), true); /* test-only */
             else
