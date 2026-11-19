@@ -1434,6 +1434,16 @@ static int cetrafs_fd_write_mutate(void *image, unsigned int len, void *priv)
  * so a reuse of the number can never be written over, and so the
  * namespace sector is physically untouched.
  */
+/* TEST ONLY: the cache flush after an fd-sector publish fails once, and
+ * its control: the publish then reports success on the stopped mount, as
+ * before audit 2026-11-15 BL-79 (tests/kernel/publish_flush_refused.sh). */
+static bool cetrafs_fd_post_flush_fail;
+cetrafs_test_param(fd_post_flush_fail, cetrafs_fd_post_flush_fail, bool, 0644);
+MODULE_PARM_DESC(fd_post_flush_fail, "TEST ONLY: fail the next cache flush after an fd-sector publish");
+static bool cetrafs_fd_post_flush_stop_ok;
+cetrafs_test_param(fd_post_flush_stop_ok, cetrafs_fd_post_flush_stop_ok, bool, 0644);
+MODULE_PARM_DESC(fd_post_flush_stop_ok, "TEST ONLY: report a publish whose flush stopped the mount as succeeded");
+
 static int __cetrafs_write_raw_inode_fd(struct super_block *sb, u64 ino, const cetrafs_inode_t *src,
                                        struct inode *self, const u64 *plan_seq)
 {
@@ -1478,8 +1488,12 @@ static int __cetrafs_write_raw_inode_fd(struct super_block *sb, u64 ino, const c
              * cache only a flush orders them. A flush the device refuses
              * here leaves the publish landed and its durability unknown:
              * the free that would follow is what must not happen, so the
-             * mount stops (docs/internal/ERRORS.md) and refuses it. */
-            fret = cetrafs_publish_flush(sb);
+             * mount stops (docs/internal/ERRORS.md) and refuses it --
+             * and the caller hears it: returned as success, a truncate
+             * or punch reported done what nobody knows is on the device
+             * (audit 2026-11-15 BL-79). The bookkeeping below still
+             * runs: the swap did land on the device. */
+            fret = xchg(&cetrafs_fd_post_flush_fail, false) ? -EIO : cetrafs_publish_flush(sb);
             if (fret)
                 cetrafs_sb_fatal(sb, "inode %llu: the device refused a cache flush after a publish (%d)",
                                  (unsigned long long) ino, fret);
@@ -1501,6 +1515,8 @@ static int __cetrafs_write_raw_inode_fd(struct super_block *sb, u64 ino, const c
              * (tests/kernel/defrag_final_blocks.sh). */
             if (self)
                 cetrafs_inode_stat_baseline_set(self, src);
+            if (fret && !READ_ONCE(cetrafs_fd_post_flush_stop_ok))
+                ret = -EIO;
         } else if (ret == -ETXTBSY && ctx.check_plan) {
             pr_warn_ratelimited("cetrafs: inode %llu: another node changed the file while this rebuild was "
                                 "planned (stamp %llx, planned from %llx) -- refusing\n",
