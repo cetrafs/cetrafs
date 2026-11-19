@@ -1349,6 +1349,8 @@ struct cetrafs_grow_plan {
     u64 old_inodes;                  /* inodes before; the inode segment, if any, starts after them */
     u64 new_iseg_lba;                /* the inode table segment the grow adds; 0 = none */
     u64 tail_ilba;                   /* the inode segment that links to it; 0 = the superblock does */
+    u64 stale_itail;                 /* a grow adding no inodes: the inode tail whose next is an earlier,
+                                      * unpublished grow's link, cleared before the publish; 0 = none */
     u32 nshards;                     /* pool shards: cetrafs_sb_zg_first_count() */
     u64 *shard_credit;               /* capacity each shard gains */
     const cetrafs_grow_arg_t *claim; /* the caller's growfs claim, re-checked at the publish */

@@ -1469,6 +1469,11 @@ static bool cetrafs_grow_hdr_check_off;
 cetrafs_test_param(grow_hdr_check_off, cetrafs_grow_hdr_check_off, bool, 0644);
 MODULE_PARM_DESC(grow_hdr_check_off, "TEST ONLY: a live grow does not verify its new Block Groups' headers or new inode segment's bitmap");
 
+/* TEST ONLY: the control of tests/kernel/grow_live_stale_ilink.sh. */
+static bool cetrafs_grow_keep_stale_ilink;
+cetrafs_test_param(grow_keep_stale_ilink, cetrafs_grow_keep_stale_ilink, bool, 0644);
+MODULE_PARM_DESC(grow_keep_stale_ilink, "TEST ONLY: a grow adding no inodes leaves an earlier grow's inode link");
+
 /* TEST ONLY: the control of tests/kernel/grow_iseg_pinned.sh. */
 static bool cetrafs_layout_iseg_unpinned;
 cetrafs_test_param(layout_iseg_unpinned, cetrafs_layout_iseg_unpinned, bool, 0644);
@@ -1525,6 +1530,7 @@ static int cetrafs_layout_walk_inodes(struct super_block *sb, struct cetrafs_bg_
     const cetrafs_superblock_t *raw = &l->raw;
     const u64 total = le32_to_cpu(raw->inodes_count);
     u64 filled = le32_to_cpu(raw->inode_first_count), seg_lba = le64_to_cpu(raw->inode_seg_next), guard = 0;
+    u64 last_lba = 0; /* the segment just walked: the one whose next seg_lba is */
     u32 cap = 1;
     int rc;
 
@@ -1538,6 +1544,19 @@ static int cetrafs_layout_walk_inodes(struct super_block *sb, struct cetrafs_bg_
         struct buffer_head *sbh;
         u64 cnt;
 
+        /*
+         * Every inode counted, and still a link: an earlier grow's
+         * segment that never published. A grow that adds no inodes lays
+         * its Block Groups where that segment was, so the link would
+         * then point inside the volume and the volume stop mounting
+         * (audit 2026-11-15 F-65): it is cleared by this grow, before
+         * the publish (cetrafs_grow_commit()). A grow adding inodes
+         * replaces it with its own (gp->new_iseg_lba, below).
+         */
+        if (filled == total && gp && !gp->new_iseg_lba && last_lba && !READ_ONCE(cetrafs_grow_keep_stale_ilink)) {
+            gp->stale_itail = last_lba;
+            return 0;
+        }
         if (filled == total)
             return cetrafs_layout_pending_link(sb, raw, seg_lba, total, &cetrafs_ino_chain);
         /* A chain is a loop waiting to happen; bound it by the only
@@ -1584,6 +1603,7 @@ static int cetrafs_layout_walk_inodes(struct super_block *sb, struct cetrafs_bg_
         filled += cnt;
         /* A grow being validated before it is linked: the old tail (or
          * the superblock) does not name it on the device yet. */
+        last_lba = seg_lba;
         if (gp && gp->new_iseg_lba && filled == gp->old_inodes) {
             gp->tail_ilba = seg_lba;
             seg_lba = gp->new_iseg_lba;

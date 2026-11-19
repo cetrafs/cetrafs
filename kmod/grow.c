@@ -341,6 +341,11 @@ int cetrafs_grow_commit(struct super_block *sb, const struct cetrafs_grow_plan *
     if (!rc && plan->new_iseg_lba)
         rc = cetrafs_grow_link(sb, plan, id, plan->tail_ilba, CETRAFS_INOSEG_MAGIC, plan->old_inodes,
                                plan->new_iseg_lba);
+    /* No inodes added, and an earlier grow's link left on the inode tail:
+     * cleared, before the publish lays Block Groups over where it points
+     * (cetrafs_layout_walk_inodes()). */
+    if (!rc && plan->stale_itail)
+        rc = cetrafs_grow_link(sb, plan, id, plan->stale_itail, CETRAFS_INOSEG_MAGIC, plan->old_inodes, 0);
     if (rc)
         return rc;
     if (stop == 2) {

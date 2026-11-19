@@ -88,8 +88,11 @@ int main(int argc, char **argv)
         die("no appended segment: grow the volume first");
 
     /* Walk to the tail, which is what every injection targets. */
+    uint64_t nsegs = 0;
+
     cur = head;
     for (;;) {
+        nsegs++;
         rd(fd, &seg, sizeof(seg), (off_t) cur * CETRAFS_BLOCK_SIZE);
         if (cetrafs_le32(seg.magic) != magic)
             die("chain is already broken");
@@ -101,8 +104,8 @@ int main(int argc, char **argv)
     (void) prev;
 
     if (!strcmp(argv[2], "dump")) {
-        printf("head=%" PRIu64 " tail=%" PRIu64 " count=%u first_bg_id=%u\n", head, cur, cetrafs_le32(seg.count),
-               cetrafs_le32(seg.first_id));
+        printf("head=%" PRIu64 " tail=%" PRIu64 " count=%u first_bg_id=%u segs=%" PRIu64 "\n", head, cur,
+               cetrafs_le32(seg.count), cetrafs_le32(seg.first_id), nsegs);
     } else if (!strcmp(argv[2], "loop")) {
         seg.next = cetrafs_cpu_to_le64(head);
         restamp(&seg);

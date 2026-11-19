@@ -1288,6 +1288,13 @@ int main(int argc, char **argv)
                              old_inodes, CETRAFS_INOSEG_MAGIC, "inode", iseg_lba);
         }
         sb.inodes_count = cetrafs_cpu_to_le32((u32) new_inodes);
+    } else if (!live && cetrafs_le64(sb.inode_seg_next) != 0 && !cetrafs_test_env("CETRAFS_GROWFS_TEST_KEEP_STALE_ILINK")) {
+        /* No inodes added: an interrupted grow's link on the inode tail is
+         * cleared, or the Block Groups laid down here cover where it
+         * points and the volume stops mounting (audit 2026-11-15 F-65).
+         * Live, the kernel clears it (cetrafs_grow_commit()). */
+        growfs_link_tail(fd, dev, blk, cetrafs_le64(sb.inode_seg_next), cetrafs_le32(sb.inode_first_count),
+                         cetrafs_le32(sb.inodes_count), CETRAFS_INOSEG_MAGIC, "inode", 0);
     }
     if (cetrafs_le64(sb.bg_table_first_count) == 0)
         sb.bg_table_first_count = cetrafs_cpu_to_le64(old_b); /* pre-chain volume */
