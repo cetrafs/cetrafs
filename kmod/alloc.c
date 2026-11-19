@@ -280,7 +280,7 @@ static int cetrafs_bitmap_find_run(struct super_block *sb, u64 bmap_lba, u64 nbl
         /* A whole-bitmap walk, under alloc_mutex: on a large Block
          * Group that is seconds of CPU per pass (audit R18). */
         cond_resched();
-        bh = cetrafs_bmap_bread(sb, bmap_lba + blk, off, CETRAFS_BMAP_BUF_BITS, &err);
+        bh = cetrafs_bmap_bread_scan(sb, bmap_lba + blk, off, CETRAFS_BMAP_BUF_BITS, &err);
         if (!bh && err == -EUCLEAN) {
             in_run = false; /* damaged: no run is found in it, nor across it */
             continue;
@@ -355,7 +355,7 @@ static long cetrafs_bitmap_alloc_bit(struct super_block *sb, u64 bmap_lba, u64 n
         /* A whole-bitmap walk, under alloc_mutex: on a large Block
          * Group that is seconds of CPU per pass (audit R18). */
         cond_resched();
-        bh = cetrafs_bmap_bread(sb, bmap_lba + blk, 0, CETRAFS_BMAP_BUF_BITS, &err);
+        bh = cetrafs_bmap_bread_scan(sb, bmap_lba + blk, 0, CETRAFS_BMAP_BUF_BITS, &err);
         if (!bh && err == -EUCLEAN)
             continue; /* damaged: a bit it calls free may not be -- never handed out */
         if (!bh)
@@ -538,7 +538,7 @@ static long cetrafs_bitmap_count_free(struct super_block *sb, u64 bmap_lba, u64 
         /* A whole-bitmap walk, under alloc_mutex: on a large Block
          * Group that is seconds of CPU per pass (audit R18). */
         cond_resched();
-        bh = cetrafs_bmap_bread(sb, bmap_lba + blk, 0, cetrafs_bmap_off(nb - 1) + 1, &err);
+        bh = cetrafs_bmap_bread_scan(sb, bmap_lba + blk, 0, cetrafs_bmap_off(nb - 1) + 1, &err);
         if (!bh && err == -EUCLEAN)
             continue; /* damaged: nothing in it is handed out, so none of it counts as free */
         if (!bh)

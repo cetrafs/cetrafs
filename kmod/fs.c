@@ -2977,12 +2977,17 @@ void cetrafs_sb_bmap_bad_note(struct super_block *sb, u64 lba, u8 mask, bool bad
             slot = i;
             break;
         }
-        if (!sbi->bmap_bad[i].lba || time_before(sbi->bmap_bad[i].until, sbi->bmap_bad[old].until))
+        /* An empty slot first; else the verdict that ends first. */
+        if (sbi->bmap_bad[old].lba &&
+            (!sbi->bmap_bad[i].lba || time_before(sbi->bmap_bad[i].until, sbi->bmap_bad[old].until)))
             old = i;
     }
     if (bad) {
-        if (slot == CETRAFS_BMAP_BAD_SLOTS) {
-            slot = old;
+        /* A lapsed verdict's sectors were never re-checked: they go,
+         * not carried into the new one. */
+        if (slot == CETRAFS_BMAP_BAD_SLOTS || !time_before(jiffies, sbi->bmap_bad[slot].until)) {
+            if (slot == CETRAFS_BMAP_BAD_SLOTS)
+                slot = old;
             sbi->bmap_bad[slot].lba = lba;
             sbi->bmap_bad[slot].sectors = 0;
         }

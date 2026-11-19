@@ -143,7 +143,8 @@ static bool cetrafs_bmap_bad_unremembered;
 cetrafs_test_param(bmap_bad_unremembered, cetrafs_bmap_bad_unremembered, bool, 0644);
 MODULE_PARM_DESC(bmap_bad_unremembered, "TEST ONLY: a damaged bitmap block is re-read with retries on every read");
 
-struct buffer_head *cetrafs_bmap_bread(struct super_block *sb, u64 lba, u64 lo, u64 hi, int *err)
+static struct buffer_head *__cetrafs_bmap_bread(struct super_block *sb, u64 lba, u64 lo, u64 hi, int *err,
+                                                bool scan)
 {
     const u64 first = lo / (CETRAFS_BMAP_SECTOR * 8ULL);
     const u64 n = hi > lo ? DIV_ROUND_UP(hi, CETRAFS_BMAP_SECTOR * 8ULL) - first : 0;
@@ -152,14 +153,16 @@ struct buffer_head *cetrafs_bmap_bread(struct super_block *sb, u64 lba, u64 lo, 
     u8 badmask = mask; /* the sectors the last read found failing */
     int attempt;
 
-    /* Confirmed damaged a moment ago: refused at once. The first-fit
-     * scan reads an owned group's first bitmap block on every
-     * allocation, under alloc_mutex -- with the retries below each one
-     * paid ~2 ms, for the whole node, for one bad sector (audit F-67).
-     * The verdict lapses after CETRAFS_BMAP_BAD_SECS and the block is
-     * checked in full again, so a rewrite (fsck -r, the owner) is seen.
-     * Per sector: a read of the block's healthy sectors is unaffected. */
-    if (!READ_ONCE(cetrafs_bmap_bad_unremembered) && cetrafs_sb_bmap_bad_fresh(sb, lba, mask)) {
+    /* Confirmed damaged a moment ago: refused at once -- for a SCAN
+     * only, whose refusal is a miss (the first-fit allocator, the free
+     * count). The scan reads an owned group's first bitmap block on
+     * every allocation, under alloc_mutex, and with the retries below
+     * each one paid ~2 ms, for the whole node, for one bad sector
+     * (audit F-67). Every other reader (a free, a claim, the
+     * pending-free apply, replay) still gets the full check: refused
+     * there, a free is leaked, so a tear gets its retries every time.
+     * The verdict lapses after CETRAFS_BMAP_BAD_SECS. */
+    if (scan && !READ_ONCE(cetrafs_bmap_bad_unremembered) && cetrafs_sb_bmap_bad_fresh(sb, lba, mask)) {
         *err = -EUCLEAN;
         return NULL;
     }
@@ -204,6 +207,18 @@ struct buffer_head *cetrafs_bmap_bread(struct super_block *sb, u64 lba, u64 lo, 
     cetrafs_sb_bmap_bad_note(sb, lba, badmask, true);
     *err = -EUCLEAN;
     return NULL;
+}
+
+struct buffer_head *cetrafs_bmap_bread(struct super_block *sb, u64 lba, u64 lo, u64 hi, int *err)
+{
+    return __cetrafs_bmap_bread(sb, lba, lo, hi, err, false);
+}
+
+/* The same read for a whole-bitmap scan, whose refusal is a miss: a
+ * recently confirmed-damaged sector is refused without the retries. */
+struct buffer_head *cetrafs_bmap_bread_scan(struct super_block *sb, u64 lba, u64 lo, u64 hi, int *err)
+{
+    return __cetrafs_bmap_bread(sb, lba, lo, hi, err, true);
 }
 
 /* cetrafs_bread_uncached() with the same bounded retries as

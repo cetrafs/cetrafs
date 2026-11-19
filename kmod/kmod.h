@@ -1876,6 +1876,7 @@ u32 cetrafs_bmap_sector_crc(const void *sector);
 void cetrafs_bmap_restamp(void *image, u64 off);
 bool cetrafs_bmap_sectors_ok(const void *image, u64 first, u64 n);
 struct buffer_head *cetrafs_bmap_bread(struct super_block *sb, u64 lba, u64 lo, u64 hi, int *err);
+struct buffer_head *cetrafs_bmap_bread_scan(struct super_block *sb, u64 lba, u64 lo, u64 hi, int *err);
 u64 cetrafs_bmap_weight(const void *buf, u64 nbits);
 u64 cetrafs_bmap_next(const void *buf, u64 size, u64 off, bool set);
 extern const unsigned long cetrafs_bmap_all_set[CETRAFS_BLOCK_SIZE / sizeof(long)];
