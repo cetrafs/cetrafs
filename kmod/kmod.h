@@ -1027,6 +1027,7 @@ struct buffer_head *cetrafs_read_tree_bh_trust(struct inode *inode, u64 lba, u32
                                                bool trusted);
 struct buffer_head *cetrafs_read_tree_bh(struct inode *inode, u64 lba, u32 tail_magic, const char *what);
 struct buffer_head *cetrafs_read_index_bh(struct inode *inode, u64 lba);
+bool cetrafs_tree_cache_trusted(struct inode *inode, bool reader);
 struct buffer_head *cetrafs_read_tree_bh_for(struct inode *inode, u64 lba, u32 tail_magic, const char *what, bool reader);
 struct buffer_head *cetrafs_read_leaf_bh_for(struct inode *inode, u64 lba, bool reader);
 struct buffer_head *cetrafs_read_index_bh_for(struct inode *inode, u64 lba, bool reader);

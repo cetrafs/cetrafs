@@ -2721,19 +2721,36 @@ struct buffer_head *cetrafs_read_tree_bh_trust(struct inode *inode, u64 lba, u32
     return cetrafs_blk_tail_bread(inode->i_sb, inode->i_ino, cetrafs_inode_get_generation(inode), lba, tail_magic, what);
 }
 
+/* TEST ONLY: the control of tests/kernel/dir_tree_edit_fresh.sh. */
+static bool cetrafs_dir_tree_lock_trust;
+cetrafs_test_param(dir_tree_lock_trust, cetrafs_dir_tree_lock_trust, bool, 0644);
+MODULE_PARM_DESC(dir_tree_lock_trust, "TEST ONLY: a directory's tree trusts its cache by the file lock's predicates");
+
 /*
- * 'reader': the caller only READS through this block -- it maps a block
- * to serve a read and will write nothing on the strength of it -- so
- * the cache trust question is cetrafs_lock_read_cache_trusted()'s, not
- * the write lock's. See that function for why the two differ. A
- * DIRECTORY never holds a file lock, so here it always reads fresh; its
- * own readers ask its dirent_seq gate instead (dir.c).
+ * May a tree read of 'inode' be served from the cache? 'reader': the
+ * caller only READS through it -- maps a block to serve a read and will
+ * write nothing on the strength of it -- so the question is
+ * cetrafs_lock_read_cache_trusted()'s, not the write lock's; see that
+ * function for why the two differ.
+ *
+ * Never for a DIRECTORY. Both predicates are about a FILE lock, which a
+ * directory never holds: under nofilelock the write lock's answers "no
+ * peer has it open", and a directory is never open, so it said trusted
+ * while peers grow the directory through namespace operations (audit
+ * 2026-11-15 F-68). A directory's own scans gate on its dirent_seq and
+ * name their mode (dir.c); an edit, an evict or any other walk of its
+ * tree reads it fresh. Directory growth is rare.
  */
+bool cetrafs_tree_cache_trusted(struct inode *inode, bool reader)
+{
+    if (S_ISDIR(inode->i_mode) && !READ_ONCE(cetrafs_dir_tree_lock_trust))
+        return false;
+    return reader ? cetrafs_lock_read_cache_trusted(inode) : cetrafs_lock_held_for_write_locally(inode);
+}
+
 struct buffer_head *cetrafs_read_tree_bh_for(struct inode *inode, u64 lba, u32 tail_magic, const char *what, bool reader)
 {
-    return cetrafs_read_tree_bh_trust(inode, lba, tail_magic, what,
-                                      reader ? cetrafs_lock_read_cache_trusted(inode)
-                                             : cetrafs_lock_held_for_write_locally(inode));
+    return cetrafs_read_tree_bh_trust(inode, lba, tail_magic, what, cetrafs_tree_cache_trusted(inode, reader));
 }
 
 struct buffer_head *cetrafs_read_tree_bh(struct inode *inode, u64 lba, u32 tail_magic, const char *what)

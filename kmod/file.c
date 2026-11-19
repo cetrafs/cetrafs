@@ -4131,13 +4131,14 @@ static int cetrafs_tree_lookup_unchecked(struct inode *inode,
      * Spilled tree: try the remembered extent first.
      *
      * Gated on exactly the predicate cetrafs_read_tree_bh() uses to
-     * decide a CACHED leaf may be trusted -- this entry was built out
+     * decide a CACHED leaf may be trusted (cetrafs_tree_cache_trusted())
+     * -- this entry was built out
      * of those leaves, so it must not outlive their trust. Where that
      * predicate is false every leaf read goes to the device anyway, and
      * answering from memory there would be the frozen-extent-tree bug
      * with extra steps.
      */
-    if ((reader ? cetrafs_lock_read_cache_trusted(inode) : cetrafs_lock_held_for_write_locally(inode)) &&
+    if (cetrafs_tree_cache_trusted(inode, reader) &&
         cetrafs_inode_ext_cache_lookup(inode, raw, iblock, out_lba, out_run, out_uninit)) {
         *found = true;
         return 0;

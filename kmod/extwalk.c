@@ -175,10 +175,10 @@ static void cetrafs_tw_read(struct cetrafs_tw *w, const sector_t *lbas, u32 n, i
 
     switch (w->read) {
     case CETRAFS_TW_READER:
-        cetrafs_tree_read_batch(w->inode, lbas, n, magic, what, cetrafs_lock_read_cache_trusted(w->inode), bhs);
+        cetrafs_tree_read_batch(w->inode, lbas, n, magic, what, cetrafs_tree_cache_trusted(w->inode, true), bhs);
         return;
     case CETRAFS_TW_WRITER:
-        cetrafs_tree_read_batch(w->inode, lbas, n, magic, what, cetrafs_lock_held_for_write_locally(w->inode), bhs);
+        cetrafs_tree_read_batch(w->inode, lbas, n, magic, what, cetrafs_tree_cache_trusted(w->inode, false), bhs);
         return;
     case CETRAFS_TW_CACHED:
     case CETRAFS_TW_FRESH:
