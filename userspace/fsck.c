@@ -2296,6 +2296,15 @@ static uint64_t fsck_lost_found(int fd,
     return ino;
 }
 
+/* A deleted file a name would bring back, though its walk did not find
+ * every block it names still set and nobody else's (dead_ok). */
+static int fsck_unrevivable(uint64_t ino, const uint32_t *nlinks, const uint32_t *refs, const uint8_t *is_dir,
+                            const uint8_t *dead_ok)
+{
+    return !is_dir[ino] && !nlinks[ino] && refs[ino] && !dead_ok[ino] &&
+           !cetrafs_test_env("CETRAFS_TEST_FSCK_REVIVE_ANY");
+}
+
 /* Context for fsck_mark_run(): the content pass's reachability bitmaps,
  * the BG data-region tables, and the running tallies. */
 struct fsck_refctx {
@@ -2308,7 +2317,34 @@ struct fsck_refctx {
     uint64_t *blocks_referenced;
     uint8_t *weakd; /* referenced only by deleted records (fsck_dead_walk) */
     uint64_t *stale; /* deleted records' blocks a live record also names */
+    /* A deleted record's blocks found clear on the device (fsck_dead_walk):
+     * its free has already run, so a name reviving it would name free
+     * blocks. */
+    struct fsck_bitcache *bc;
+    uint64_t dead_free;
 };
+
+/* One group's data bitmap as the device holds it, read once and kept
+ * while lookups stay in that group. */
+struct fsck_bitcache {
+    int fd;
+    const uint64_t *bmap_lba;
+    const uint64_t *bg_cnt;
+    int group;
+    uint8_t *img;
+};
+
+static int fsck_bitcache_get(struct fsck_bitcache *bc, int b, uint64_t off)
+{
+    if (bc->group != b) {
+        uint64_t n, bad = 0;
+
+        free(bc->img);
+        bc->img = fsck_bmap_read(bc->fd, bc->bmap_lba[b], bc->bg_cnt[b], &n, NULL, &bad);
+        bc->group = b;
+    }
+    return cetrafs_bmap_get(bc->img, off);
+}
 
 /* Mark one physical run [phys, phys+len) as referenced by 'ino', flagging
  * an out-of-region block or a cross-file overlap. The one place the
@@ -2569,6 +2605,8 @@ static void fsck_mark_run(struct fsck_refctx *c, uint64_t phys, uint64_t len, ui
                 FSCK_SEV, ino, phys, len);
         if (!fsck_dead_walk)
             (*c->problems)++;
+        else
+            c->dead_free++; /* not a tree to revive either */
         repair_block("an extent points outside every data region, so the extent tree "
                      "cannot be trusted to say what is referenced");
         return;
@@ -2609,8 +2647,11 @@ static void fsck_mark_run(struct fsck_refctx *c, uint64_t phys, uint64_t len, ui
             if (cetrafs_test_env("CETRAFS_FSCK_DUMP_REFS"))
                 fprintf(stderr, "REF: lba=%" PRIu64 " ino=%" PRIu64 "\n", phys + k, ino);
             FSCK_SET(c->refd, idx);
-            if (fsck_dead_walk)
+            if (fsck_dead_walk) {
                 FSCK_SET(c->weakd, idx);
+                if (c->bc && !fsck_bitcache_get(c->bc, found, phys + k - c->bg_start[found]))
+                    c->dead_free++;
+            }
             (*c->blocks_referenced)++;
         }
     }
@@ -3917,6 +3958,10 @@ int main(int argc, char **argv)
     uint64_t *bg_data_start = (uint64_t *) xcalloc(cetrafs_le32(sb.block_group_count), sizeof(uint64_t));
     uint64_t *bg_data_cnt = (uint64_t *) xcalloc(cetrafs_le32(sb.block_group_count), sizeof(uint64_t));
     uint64_t *bg_bmap_lba = (uint64_t *) xcalloc(cetrafs_le32(sb.block_group_count), sizeof(uint64_t));
+    /* A deleted record (nlink 0) whose walk found its tree whole and
+     * every block it names still set and nobody else's: what a name may
+     * revive (audit 2026-11-15 BL-118). */
+    uint8_t *dead_ok = (uint8_t *) xcalloc(cetrafs_le32(sb.inodes_count) + 1, 1);
     /* Each BG's CACHED free count, kept so pass 3 can compare it against
      * what that BG's bitmap actually says -- see the check there. */
     uint64_t *bg_free_cached = (uint64_t *) xcalloc(cetrafs_le32(sb.block_group_count), sizeof(uint64_t));
@@ -4954,6 +4999,8 @@ int main(int argc, char **argv)
         /* Two passes: live records (nlink > 0) first, then deleted
          * ones (fsck_dead_walk), so that a block a live record names is
          * the live record's whatever the inode numbering. */
+        struct fsck_bitcache dead_bits = {fd, bg_bmap_lba, bg_data_cnt, -1, NULL};
+
         for (int dpass = 0; dpass < 2; ++dpass)
         for (uint64_t ino = 1; ino <= cetrafs_le32(sb.inodes_count); ++ino) {
             fsck_repair_heartbeat();
@@ -5134,9 +5181,9 @@ int main(int argc, char **argv)
             fsck_cur_fmt = cetrafs_le32(in.mode) & 0170000u;
             struct fsck_refctx rc = {refd,      dupd, bg_data_start, bg_data_cnt,
                                      cetrafs_le32(sb.block_group_count), &problems, &blocks_referenced,
-                                     weakd,     &stale_blocks};
+                                     weakd,     &stale_blocks, &dead_bits, 0};
             uint64_t xattr_lba = cetrafs_le64(in.xattr_block);
-            int tree_ok = 1;
+            int tree_ok = 1, whole = 1;
 
             /* The record's inline count indexes a 4-slot array. Clamped
              * below in silence, which reported clean a record the kernel
@@ -5146,6 +5193,7 @@ int main(int argc, char **argv)
                 fprintf(stderr, "%s: inode %" PRIu64 " claims %u inline extent entries; the record holds 4\n", FSCK_SEV, ino,
                         cetrafs_le16(in.eh.eh_entries));
                 problems += !fsck_dead_walk;
+                whole = 0;
                 repair_block("a record's inline extent count is impossible, so the blocks the inode owns cannot "
                              "be distinguished from leaked ones");
             }
@@ -5180,6 +5228,7 @@ int main(int argc, char **argv)
             if (xattr_lba && !fsck_lba_in_range(xattr_lba, cetrafs_le64(sb.total_blocks))) {
                 fprintf(stderr, "%s: inode %" PRIu64 "'s xattr block (block %" PRIu64 ") is out of range\n",
                         FSCK_SEV, ino, xattr_lba);
+                whole = 0;
                 problems += !fsck_dead_walk;
             } else if (xattr_lba) {
                 uint8_t xblk[CETRAFS_BLOCK_SIZE];
@@ -5198,8 +5247,11 @@ int main(int argc, char **argv)
                         " block(s) another file now holds -- stale extents, dropped when the number is "
                         "reclaimed\n",
                         ino, stale_blocks - stale_before);
+            if (fsck_dead_walk && whole && stale_blocks == stale_before && !rc.dead_free)
+                dead_ok[ino] = 1;
         }
         fsck_dead_walk = 0;
+        free(dead_bits.img);
 
         /* Blocks sitting in a per-ZG pending-free queue are marked used
          * and referenced by nothing -- legitimately so, until their
@@ -6130,6 +6182,31 @@ int main(int argc, char **argv)
          * named one -- and a second run, with the rebuilt blocks
          * counted, settles it.
          */
+        /*
+         * A name over a deleted record (nlink 0). Below, the count would
+         * bring the file back, and the blocks it names were left as the
+         * content pass found them: free ones stay free, a block another
+         * record holds stays that record's. Evict frees the blocks
+         * before it empties the record, so unless the walk found every
+         * one still set and nobody else's, the revived file names free
+         * or shared blocks (audit 2026-11-15 BL-118). Not guessed, as a
+         * name of a free inode is not -- and decided here, before the
+         * loop below repairs anything.
+         */
+        for (uint64_t ino = 2; ino <= cetrafs_le32(sb.inodes_count); ++ino) {
+            uint64_t bit = ino - 1;
+
+            if (!(ibmap[bit / 8] & (1u << (bit % 8))) || !fsck_unrevivable(ino, nlinks, refs, is_dir, dead_ok))
+                continue;
+            fprintf(stderr,
+                    "ERR: inode %" PRIu64 " is deleted (nlink=0) but %u directory entries name it, and its blocks "
+                    "were freed or are another file's -- not revived\n",
+                    ino, refs[ino]);
+            problems++;
+            repair_block("a directory entry names a deleted file whose blocks have been freed, so bringing it "
+                         "back would share them");
+        }
+
         bool tally_partial = false;
 
         for (uint64_t ino = 2; ino <= cetrafs_le32(sb.inodes_count) && !tally_partial; ++ino)
@@ -6312,13 +6389,17 @@ int main(int argc, char **argv)
                  * concurrent record write). Setting it to the count has
                  * one right answer -- when the count is complete; while
                  * it is not, only upward (tally_partial, above). */
-                if (repair_mode && !repair_blocked && (!tally_partial || refs[ino] > nlinks[ino])) {
-                    repair_set_nlink(fd, ino, refs[ino]);
-                    repairs_made++;
+                if (fsck_unrevivable(ino, nlinks, refs, is_dir, dead_ok)) {
+                    /* reported, and repair stopped, before this loop */
+                } else {
+                    if (repair_mode && !repair_blocked && (!tally_partial || refs[ino] > nlinks[ino])) {
+                        repair_set_nlink(fd, ino, refs[ino]);
+                        repairs_made++;
+                    }
+                    fprintf(stderr, "ERR: inode %" PRIu64 " has nlink=%u but %u directory entries name it\n", ino,
+                            nlinks[ino], refs[ino]);
+                    problems++;
                 }
-                fprintf(stderr, "ERR: inode %" PRIu64 " has nlink=%u but %u directory entries name it\n", ino,
-                        nlinks[ino], refs[ino]);
-                problems++;
             }
 
             /*

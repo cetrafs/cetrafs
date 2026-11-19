@@ -18,8 +18,9 @@
 #   2. the same with a depth-1 record whose leaf no longer verifies.
 #   3. SAFETY: a record whose nlink drifted to 0 while a name still
 #      points at it is a live file. fsck must call it ERR, and -r must
-#      not free the blocks its unreadable leaf hides: once the leaf is
-#      restamped the file reads back byte-exact.
+#      not free the blocks its unreadable leaf hides -- nor bring the
+#      file back while the leaf hides what it names. Once the leaf is
+#      restamped -r revives it, and the file reads back byte-exact.
 #   4. a number taken by a create stopped before its record write: the
 #      bit is set over an all-zero record. WARN, and -r frees it.
 #   5. a deleted DIRECTORY whose dirent block a live file now holds
@@ -30,6 +31,12 @@
 #      fsck reports it named yet deleted, and -r leaves its children
 #      where they are instead of moving them to lost+found (with the
 #      count put back by hand, D reads back whole).
+#   7. a named file whose nlink drifted to 0 and whose blocks its evict
+#      has already freed (audit 2026-11-15 BL-118): -r used to raise
+#      nlink to the name count and leave the blocks free, a live file
+#      over free blocks. ERR, not revived; nlink stays 0.
+#   8. the same with a block another live file now holds: reviving it
+#      shared that block. ERR, not revived.
 #
 # The kernel no longer leaves such a record behind -- a freed number's
 # record names nothing since evict clears it first -- but a volume
@@ -41,7 +48,10 @@
 # 3 fails if the deleted-record walk stops deferring leak repair: the
 # first -r then clears the live file's blocks. 5 fails if the dirent
 # walk follows an nlink-0 directory. 6 fails if a named nlink-0
-# directory is skipped in silence: -r relinks its children.
+# directory is skipped in silence: -r relinks its children. 7 and 8
+# fail under CETRAFS_TEST_FSCK_REVIVE_ANY (the old revive): each control
+# requires the revived file to read, on the next run, over a free block
+# (7) or a block two files name (8).
 set -euo pipefail
 . "$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)/lib/harness.sh"
 require_root
@@ -172,13 +182,20 @@ ct_umount "$MNT"
 "$IPOKE" "$IMG" nlink "$N" 0 >/dev/null
 "$TPOKE" "$IMG" leaf "$N" corrupt >/dev/null
 OUT="$("$FSCK" "$DEV" 2>&1 || true)"
-grep -q "^ERR: inode $N has nlink=0 but 1 directory entries name it" <<<"$OUT" &&
+grep -q "^ERR: inode $N is deleted (nlink=0) but 1 directory entries name it" <<<"$OUT" &&
     pass "3: fsck reports the named nlink=0 file as ERR" ||
-    fail "3: no ERR for the named nlink=0 file: $(grep -E '^(ERR|WARN)' <<<"$OUT" | head -3)"
+    fail "3: no ERR for the named nlink=0 file: $(grep '^ERR' <<<"$OUT" | head -3)"
 "$FSCK" -r "$DEV" >/dev/null 2>&1 || true
 "$FSCK" -r "$DEV" >/dev/null 2>&1 || true
+[ "$("$IPOKE" "$IMG" nsget "$N" | cut -d' ' -f2)" = 0 ] &&
+    pass "3: -r did not revive it while its leaf hides what it names" ||
+    fail "3: -r revived ino $N over a tree it could not read"
 "$TPOKE" "$IMG" leaf "$N" restamp >/dev/null
 blockdev --flushbufs "$DEV"
+"$FSCK" -r "$DEV" >/dev/null 2>&1 || true
+[ "$("$IPOKE" "$IMG" nsget "$N" | cut -d' ' -f2)" = 1 ] &&
+    pass "3: with the leaf readable and every block still set, -r revives it" ||
+    fail "3: -r did not revive ino $N once its tree was whole"
 OUT="$("$FSCK" "$DEV" 2>&1 || true)"
 grep -q '^ERR' <<<"$OUT" && fail "3: after -r and the restamp: $(grep '^ERR' <<<"$OUT" | head -3)" ||
     pass "3: after -r and the restamp fsck finds nothing wrong"
@@ -291,4 +308,77 @@ ct_mount "$DEV" "$MNT"
     pass "6: fsck -r changed nothing around it: with D's count put back, D/a and D/b are in D, lost+found is empty" ||
     fail "6: fsck -r moved the children: D=[$(ls "$MNT/D" 2>&1 | tr '\n' ' ')] lost+found=[$(ls "$MNT/lost+found" 2>&1 | tr '\n' ' ')]"
 ct_umount "$MNT"
+
+# ---------------------------------------------------------------- 7, 8
+BMAP="$(ct_helper bmap_poke)"
+BGMAP="$(ct_helper bg_map)"
+XPOKE="$(ct_helper extent_phys_poke)"
+EPOKE="$(ct_helper pending_poke)"
+data_bit() { # <lba>: the start of its group's data bitmap and its bit there
+    python3 -I - "$IMG" "$1" "$("$BGMAP" "$DEV")" <<'PY'
+import os, struct, sys
+img, lba = sys.argv[1], int(sys.argv[2])
+fd = os.open(img, os.O_RDONLY)
+for line in sys.argv[3].splitlines():
+    f = line.split()
+    if f[0] != "bg":
+        continue
+    start = int(f[3].split("=")[1])
+    _, off_bmap, off_data, length = struct.unpack_from("<IIIQ", os.pread(fd, 24, start * 4096), 0)
+    if start + off_data <= lba < start + length:
+        print(start + off_bmap, lba - start - off_data)
+        break
+PY
+}
+# revive_case <7|8>: plant, then the fix (control 0) or the old revive (1)
+revive_case() {
+    local sc="$1" ctl="$2" N L P BL BB OUT rc env=""
+    fresh
+    dd if=/dev/urandom of="$MNT/keep" bs=4096 count=4 conv=fsync status=none
+    dd if=/dev/urandom of="$MNT/other" bs=4096 count=4 conv=fsync status=none
+    N="$(stat -c %i "$MNT/keep")"
+    L="$(stat -c %i "$MNT/other")"
+    ct_umount "$MNT"
+    P="$("$EPOKE" "$IMG" extent "$N" | cut -d' ' -f1)"
+    if [ "$sc" = 7 ]; then
+        # its evict freed the blocks; the crash came before the record forgot them
+        read -r BL BB <<<"$(data_bit "$P")"
+        [ -n "$BB" ] && [ "$("$BMAP" "$IMG" "$BL" "$BB")" = 1 ] || { fail "$sc($ctl): setup: block $P's bit is not set"; return; }
+        for i in 0 1 2 3; do "$BMAP" "$IMG" "$BL" "$((BB + i))" 0; done
+    else
+        # one of its blocks is another live file's by now
+        "$XPOKE" "$IMG" "$N" "$("$EPOKE" "$IMG" extent "$L" | cut -d' ' -f1)" >/dev/null
+    fi
+    "$IPOKE" "$IMG" nlink "$N" 0 >/dev/null
+    blockdev --flushbufs "$DEV"
+    OUT="$("$FSCK" "$DEV" 2>&1 || true)"
+    grep -q "^ERR: inode $N is deleted (nlink=0) but 1 directory entries name it.*not revived" <<<"$OUT" ||
+        { fail "$sc($ctl): setup: no 'not revived' ERR for ino $N: $(grep '^ERR' <<<"$OUT" | head -3)"; return; }
+    pass "$sc($ctl): set up -- named ino $N, nlink 0, its blocks $([ "$sc" = 7 ] && echo freed || echo shared)"
+    [ "$ctl" = 1 ] && env="CETRAFS_TEST_FSCK_REVIVE_ANY=1"
+    env $env "$FSCK" -r "$DEV" >/dev/null 2>&1 || true
+    blockdev --flushbufs "$DEV"
+    OUT="$("$FSCK" "$DEV" 2>&1 || true)"
+    if [ "$ctl" = 0 ]; then
+        [ "$("$IPOKE" "$IMG" nsget "$N" | cut -d' ' -f2)" = 0 ] && pass "$sc: -r left ino $N deleted" ||
+            fail "$sc: -r revived ino $N over blocks that are not its own"
+        grep -qE "marked FREE -- it can be|referenced by more than one inode" <<<"$OUT" &&
+            fail "$sc: the next run finds a live file over free or shared blocks: $(grep -m1 '^ERR' <<<"$OUT")" ||
+            pass "$sc: no live file names a free or shared block"
+    elif [ "$sc" = 7 ]; then
+        grep -q "is referenced by an inode but marked FREE" <<<"$OUT" &&
+            pass "control 7: the old revive leaves a live file over free blocks" ||
+            fail "control 7: the old revive did not reach free blocks: $(grep -m2 -E '^(ERR|WARN)' <<<"$OUT")"
+    else
+        grep -q "referenced by more than one inode" <<<"$OUT" &&
+            pass "control 8: the old revive shares a block with a live file" ||
+            fail "control 8: no shared block after the old revive: $(grep -m2 -E '^(ERR|WARN)' <<<"$OUT")"
+    fi
+}
+log "7: a named nlink-0 file whose blocks were freed"
+revive_case 7 0
+revive_case 7 1
+log "8: a named nlink-0 file one of whose blocks another file holds"
+revive_case 8 0
+revive_case 8 1
 ct_exit
