@@ -567,6 +567,7 @@ cetrafs_test_param(late_flush_blind, cetrafs_late_flush_blind, bool, 0644);
 MODULE_PARM_DESC(late_flush_blind, "TEST ONLY: write held-back tree blocks without checking the device still holds what they replace");
 
 static atomic64_t cetrafs_deferred_stale_sets = ATOMIC64_INIT(0);
+static atomic64_t cetrafs_deferred_window_losses = ATOMIC64_INIT(0); /* F-71: a peer's write inside the window */
 
 u64 cetrafs_deferred_stale_set_count(void)
 {
@@ -620,6 +621,101 @@ static int cetrafs_deferred_set_current(struct buffer_head **bhs, const u32 *crc
     return ret;
 }
 
+/* TEST ONLY: the late flush does not look for a peer's write inside its
+ * own window, as before audit 2026-11-15 F-71 (the control of
+ * tests/kernel/late_flush_window.sh). */
+static bool cetrafs_late_flush_unverified;
+cetrafs_test_param(late_flush_unverified, cetrafs_late_flush_unverified, bool, 0644);
+MODULE_PARM_DESC(late_flush_unverified, "TEST ONLY: a late tree flush does not check its window for a peer's write");
+/* TEST ONLY: a late flush waits this long between its device check and
+ * its writes -- the window F-71 names. */
+static unsigned int cetrafs_late_flush_window_ms;
+cetrafs_test_param(late_flush_window_ms, cetrafs_late_flush_window_ms, uint, 0644);
+MODULE_PARM_DESC(late_flush_window_ms, "TEST ONLY: a tree flush pauses this many ms between its check and its writes");
+
+/* The record's file stamp, read from the device; 0 for a record of
+ * another generation or one that cannot be read (never a valid stamp:
+ * cetrafs_file_seq_new_as() never returns a zero value part). */
+static u64 cetrafs_deferred_file_seq(struct super_block *sb, const struct cetrafs_journal_owner *o)
+{
+    cetrafs_inode_t *raw = kmalloc(sizeof(*raw), GFP_NOFS);
+    u64 seq = 0;
+
+    if (!raw)
+        return 0;
+    cetrafs_invalidate_raw_inode(sb, o->ino);
+    if (!cetrafs_read_raw_inode(sb, o->ino, raw) && cetrafs_le64(raw->generation) == o->generation)
+        seq = cetrafs_le64(raw->file_seq);
+    kfree(raw);
+    return seq;
+}
+
+/*
+ * After the writes: did a peer write the file inside the window between
+ * the device check and the writes (audit 2026-11-15 F-71)? The check
+ * reads the set before the batch, and the batch's journal entries and
+ * cache flushes run before the in-place writes -- under nofilelock
+ * nothing keeps a peer from writing a leaf of the set in between, and
+ * one of the two writes is then lost. Not preventable here without the
+ * peer taking a lock it does not take; detected instead, and the file
+ * is marked damaged rather than left silently wrong: a written block
+ * that no longer reads as written (the peer wrote after us), or a
+ * record stamp a peer published since the check (it wrote before us).
+ * In every mode: a lock this node held can be handed to a peer (a
+ * suspend) while a set is still held back, and the orphan flush runs
+ * long after.
+ *
+ * What it does not see, said plainly: a peer that writes a leaf before
+ * our write and publishes its record only after the read below -- its
+ * leaf is gone and nothing here knows (the window is the batch, ms).
+ * What it reports that is not a loss: any peer publish in the window,
+ * even one touching none of the set (under nofilelock that is a
+ * handoff, where both nodes writing is the misuse BASICS.md forbids);
+ * and, on the orphan path, a reopened inode that adopted a block and
+ * wrote it back in the same milliseconds. An unverifiable read counts
+ * as a loss: the correctness bar is "say so", never "assume".
+ */
+static void cetrafs_deferred_window_check(struct super_block *sb, struct buffer_head **bhs, const bool *written,
+                                          const u32 *wcrc, unsigned int n,
+                                          const struct cetrafs_journal_owner *o, u64 seq_before)
+{
+    u64 seq_after;
+    u32 me = 0;
+    void *buf;
+    unsigned int i;
+    bool lost = false;
+
+    if (READ_ONCE(cetrafs_late_flush_unverified) || cetrafs_sb_get_node_id(sb, &me))
+        return;
+    buf = kmalloc(CETRAFS_BLOCK_SIZE, GFP_NOFS);
+    lost = !buf;
+    for (i = 0; buf && i < n && !lost; i++) {
+        struct buffer_head *bh = bhs[i];
+
+        if (!written[i])
+            continue;
+        if (bdev_rw_virt(bh->b_bdev, bh->b_blocknr * (bh->b_size >> SECTOR_SHIFT), buf, CETRAFS_BLOCK_SIZE,
+                         REQ_OP_READ) ||
+            ~crc32c(~0U, buf, CETRAFS_BLOCK_SIZE) != wcrc[i])
+            lost = true;
+    }
+    kfree(buf);
+    /* The stamp only where the one before the batch was read: an
+     * unknown "before" would make any peer's last stamp read as new. */
+    if (!lost && seq_before) {
+        seq_after = cetrafs_deferred_file_seq(sb, o);
+        if (!seq_after || (seq_after != seq_before && CETRAFS_FILE_SEQ_NODE(seq_after) != (me & 0xFFFFu)))
+            lost = true;
+    }
+    if (!lost)
+        return;
+    atomic64_inc(&cetrafs_deferred_window_losses);
+    pr_err("ino=%llu: another node wrote the file while this node's tree flush was landing, or what landed could "
+           "not be read back -- a write may be lost; the file is marked damaged (fsck.cetra)\n",
+           (unsigned long long) o->ino);
+    cetrafs_sb_corrupt_owner(sb, o->ino, o->generation);
+}
+
 /*
  * -ESTALE: the set was dropped, not written -- one inode's whole set,
  * which is one map state and must not be half applied. Each block's
@@ -633,8 +729,11 @@ static int cetrafs_deferred_write_set(struct super_block *sb, struct buffer_head
     bool *written;
     u32 *wcrc;
     unsigned int i, bad = 0;
+    u64 seq_before;
     int ret;
 
+    /* Before the check: a peer's publish after it is in the window. */
+    seq_before = cetrafs_deferred_file_seq(sb, &owners[0]);
     ret = cetrafs_deferred_set_current(bhs, crcs, n, &bad);
     if (ret == -ESTALE) {
         atomic64_inc(&cetrafs_deferred_stale_sets);
@@ -656,6 +755,11 @@ static int cetrafs_deferred_write_set(struct super_block *sb, struct buffer_head
         kvfree(wcrc);
         return -ENOMEM;
     }
+    if (unlikely(READ_ONCE(cetrafs_late_flush_window_ms))) {
+        pr_info("deferred: ino=%llu: TEST pause of %ums between the check and the writes\n",
+                (unsigned long long) owners[0].ino, cetrafs_late_flush_window_ms);
+        msleep(xchg(&cetrafs_late_flush_window_ms, 0));
+    }
     ret = cetrafs_journal_write_deferred(sb, bhs, owners, crcs, n, written, wcrc);
     if (unlikely(cetrafs_deferred_settle_stall_ms) && no_inode) {
         pr_info("deferred: TEST pause of %ums between the target writes and the settle (inode not in core)\n",
@@ -665,6 +769,7 @@ static int cetrafs_deferred_write_set(struct super_block *sb, struct buffer_head
     for (i = 0; i < n; i++)
         if (written[i])
             cetrafs_bh_deferred_settle(sb, bhs[i], wcrc[i]);
+    cetrafs_deferred_window_check(sb, bhs, written, wcrc, n, &owners[0], seq_before);
     kvfree(written);
     kvfree(wcrc);
     return ret;

@@ -2206,6 +2206,7 @@ struct cetrafs_vfs_stat_cas_ctx {
     /* The image carries a peer's publish made after the shadow's base:
      * the shadow's root was not carried, and the shadow goes. */
     bool root_superseded;
+    u64 superseded_seq; /* the peer's stamp root_superseded was decided on */
 };
 
 /* TEST ONLY: a stat publish carries the shadow's extent root over a
@@ -2287,6 +2288,7 @@ static int cetrafs_vfs_stat_cas_mutate(void *image, unsigned int len, void *priv
         ctx->root_superseded = dev != cetrafs_le64(ctx->shadow->file_seq) &&
                                CETRAFS_FILE_SEQ_NODE(dev) != (ctx->me & 0xFFFFu) &&
                                !READ_ONCE(cetrafs_stat_publish_root_over_peer);
+        ctx->superseded_seq = dev;
         if (!ctx->root_superseded) {
             rec.eh = ctx->shadow->eh;
             rec.et = ctx->shadow->et;
@@ -2732,7 +2734,7 @@ int cetrafs_write_vfs_inode(struct inode *inode)
         if (ctx->root_superseded) {
             pr_err("ino=%llu: another node (%u) published the file's extent map after this node's pending "
                    "one was built -- this node's is dropped, not published over theirs\n",
-                   (unsigned long long) inode->i_ino, (unsigned) CETRAFS_FILE_SEQ_NODE(ctx->overstamped_seq));
+                   (unsigned long long) inode->i_ino, (unsigned) CETRAFS_FILE_SEQ_NODE(ctx->superseded_seq));
             cetrafs_lock_tree_superseded(inode);
         } else if (ctx->overstamped && !cetrafs_stat_publish_ignore_overstamp) {
             pr_info_ratelimited("cetrafs: inode %llu: stat publish overwrote stamp %llx from node %u -- "
