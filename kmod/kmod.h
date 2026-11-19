@@ -1757,6 +1757,9 @@ int cetrafs_inode_birth_claim(struct super_block *sb, u64 ino, const cetrafs_ino
  * record whose number is about to be freed. */
 #define CETRAFS_RECLAIM_STEAL 4
 #define CETRAFS_RECLAIM_FORGET 5
+/* Make our held free claim this incarnation's, so no peer can take it
+ * over before the number is freed (inode.c, cetrafs_inode_forget_tree()). */
+#define CETRAFS_RECLAIM_ADOPT 6
 int cetrafs_inode_reclaim_claim(struct super_block *sb, u64 ino, u64 generation, int mode, u64 *seq);
 int cetrafs_inode_reclaim_claim_at(struct super_block *sb, u64 ino, u64 generation, int mode, u64 *seq, u64 expect,
                                    u32 from);

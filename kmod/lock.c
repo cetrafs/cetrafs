@@ -6182,6 +6182,18 @@ int cetrafs_lock_sweep_own_claims(struct super_block *sb, u32 my_node_id)
                 if (!ret)
                     pr_info("mount: ino=%llu: finished a free this node had claimed before its departure\n",
                             (unsigned long long) ino);
+                /* forget_tree made the claim this incarnation's, which the
+                 * release below leaves alone as this mount's own: give it
+                 * back at the stamp it carries, as an evict's finish does. */
+                if (ret >= 0) {
+                    int rr = cetrafs_inode_reclaim_claim(sb, ino, ctx.generation, CETRAFS_RECLAIM_RELEASE, &fseq);
+
+                    if (rr && rr != -ESTALE)
+                        pr_warn("mount: ino=%llu: freed, but its claim could not be given back (%d) -- the next "
+                                "mount's sweep clears it\n",
+                                (unsigned long long) ino, rr);
+                    ret = 0;
+                }
             }
             /*
              * A record whose namespace lock the previous incarnation

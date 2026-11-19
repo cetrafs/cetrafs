@@ -1228,6 +1228,35 @@ static int cetrafs_reclaim_mutate(void *image, unsigned int len, void *priv)
             return -ESTALE;
         rec.xattr_block = cetrafs_cpu_to_le64(0);
         break;
+    case CETRAFS_RECLAIM_ADOPT:
+        /* Our claim on a dead record, at the stamp it was judged by --
+         * left by our previous incarnation (the mount sweep) or taken by
+         * this one (the heartbeat's finish) -- made this incarnation's
+         * (audit F-71). What that buys, and what it does not:
+         *  - the swap advances the stamp, so every takeover verdict read
+         *    before it is refused (the scrub's STEAL and cetrafs_nslock_try()
+         *    both CAS against the stamp or sector they judged);
+         *  - after it, nslock refuses a claim of a live incarnation, but
+         *    the scrub's steal judges the NODE, not the incarnation: it
+         *    takes the claim only once this node reads stale, and by then
+         *    the lease has fenced it (cetrafs_sb_lease_renewed()) and
+         *    every free below is refused -- the advisory-fence residual
+         *    (I/O already queued) the design accepts, nothing narrower.
+         * A create's birth claim on the number advances the stamp, and
+         * this node's creator writes our id too: refused by the stamp.
+         * Left behind by a failure after it, the claim is this mount's:
+         * the evict finish defers it to the heartbeat with the new
+         * stamp, and the mount sweep's failure fails the mount, so the
+         * next sweep finds it a previous incarnation's. A half-born
+         * record so claimed reads "creator live" to its settle meanwhile
+         * (cetrafs_half_born_settle(), -ENODATA): kept, never freed. */
+        if (cetrafs_le32(rec.nlink) != 0 || cetrafs_le32(rec.ns_lock_owner) != ctx->me ||
+            cetrafs_le64(rec.dirent_seq) != ctx->seq)
+            return -ESTALE;
+        if (cetrafs_le32(rec.ns_lock_incarnation) == ctx->my_incarnation)
+            return 1; /* already this incarnation's: nothing to write */
+        rec.ns_lock_incarnation = cetrafs_cpu_to_le32(ctx->my_incarnation);
+        break;
     case CETRAFS_RECLAIM_RELEASE:
         /* Exactly what our claim wrote: a creator's birth claim on the
          * same number (this node's creator also writes our id) has
@@ -1581,6 +1610,12 @@ int cetrafs_write_raw_inode_fd(struct super_block *sb, u64 ino, const cetrafs_in
 static bool cetrafs_forget_tree_any_owner;
 cetrafs_test_param(forget_tree_any_owner, cetrafs_forget_tree_any_owner, bool, 0644);
 MODULE_PARM_DESC(forget_tree_any_owner, "TEST ONLY: drop a dead record's tree without checking the claim is still ours");
+/* TEST ONLY: forget_tree waits this long after its check -- the window
+ * a peer's takeover had before the claim was adopted (audit F-71,
+ * tests/kernel/sweep_claim_stolen.sh). */
+static unsigned int cetrafs_forget_tree_stall_ms;
+cetrafs_test_param(forget_tree_stall_ms, cetrafs_forget_tree_stall_ms, uint, 0644);
+MODULE_PARM_DESC(forget_tree_stall_ms, "TEST ONLY: forget_tree pauses this many ms after its ownership check");
 
 int cetrafs_inode_forget_tree(struct super_block *sb, u64 ino, u64 generation, u64 *seq)
 {
@@ -1590,6 +1625,19 @@ int cetrafs_inode_forget_tree(struct super_block *sb, u64 ino, u64 generation, u
 
     if (!raw)
         return -ENOMEM;
+    /* The claim first becomes this incarnation's (CETRAFS_RECLAIM_ADOPT):
+     * the check below, the CAS and flush after it and the free of the
+     * number then run under a claim no live peer takes over (what the
+     * scrub's steal still can, and why it is fenced: see the mode).
+     * Refused (no longer ours, or a create's): nothing is forgotten or
+     * freed. */
+    if (!READ_ONCE(cetrafs_forget_tree_any_owner)) {
+        ret = cetrafs_inode_reclaim_claim(sb, ino, generation, CETRAFS_RECLAIM_ADOPT, seq);
+        if (ret) {
+            kfree(raw);
+            return ret;
+        }
+    }
     cetrafs_invalidate_raw_inode(sb, ino);
     ret = cetrafs_read_raw_inode(sb, ino, raw);
     if (!ret && (cetrafs_le64(raw->generation) != generation || cetrafs_le32(raw->nlink) != 0))
@@ -1604,8 +1652,15 @@ int cetrafs_inode_forget_tree(struct super_block *sb, u64 ino, u64 generation, u
      * and of the same generation until that create stamps it (audit
      * 2026-11-15 BC-49). Not ours: nothing is forgotten or freed. */
     if (!ret && !READ_ONCE(cetrafs_forget_tree_any_owner) &&
-        (cetrafs_sb_get_node_id(sb, &me) || cetrafs_le32(raw->ns_lock_owner) != me))
+        (cetrafs_sb_get_node_id(sb, &me) || cetrafs_le32(raw->ns_lock_owner) != me ||
+         cetrafs_le32(raw->ns_lock_incarnation) != cetrafs_sb_incarnation(sb)))
         ret = -ESTALE;
+    if (!ret && READ_ONCE(cetrafs_forget_tree_stall_ms)) {
+        pr_info("forget_tree: ino=%llu: pausing %u ms after its check, claim %u/%u (test)\n",
+                (unsigned long long) ino, cetrafs_forget_tree_stall_ms, cetrafs_le32(raw->ns_lock_owner),
+                cetrafs_le32(raw->ns_lock_incarnation));
+        msleep(READ_ONCE(cetrafs_forget_tree_stall_ms)); /* TEST ONLY */
+    }
     if (!ret && (cetrafs_le16(raw->eh.eh_entries) || cetrafs_le16(raw->eh.eh_depth) || raw->size || raw->blocks)) {
         raw->eh.eh_entries = cetrafs_cpu_to_le16(0);
         raw->eh.eh_depth = cetrafs_cpu_to_le16(0);
