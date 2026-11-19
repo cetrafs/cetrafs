@@ -433,6 +433,27 @@ static void growfs_refuse_live_peer(const char *dev)
  * Bounded: a chain that does not reach old_count is corruption, and
  * looping while holding a volume open is worse than refusing.
  */
+/* The inode table's segments as published: the implicit first one and
+ * each appended one the count reaches (not an interrupted grow's link
+ * past it). The chain is verified by mount and fsck; this only counts. */
+static u64 growfs_iseg_count(int fd, const cetrafs_superblock_t *sb)
+{
+    u64 n = 1, filled = cetrafs_sb_inode_first_count(sb), cur = cetrafs_le64(sb->inode_seg_next);
+    const u64 total = cetrafs_le32(sb->inodes_count);
+
+    while (cur && filled < total && n <= CETRAFS_ISEG_MAX) {
+        cetrafs_seg_hdr_t seg;
+
+        if (pread(fd, &seg, sizeof(seg), (off_t) cur * CETRAFS_BLOCK_SIZE) != (ssize_t) sizeof(seg) ||
+            cetrafs_le32(seg.magic) != CETRAFS_INOSEG_MAGIC || !cetrafs_le32(seg.count))
+            break;
+        n++;
+        filled += cetrafs_le32(seg.count);
+        cur = cetrafs_le64(seg.next);
+    }
+    return n;
+}
+
 static void growfs_link_tail(int fd, const char *dev, u8 *blk, u64 cur, u64 filled, u64 old_count, u32 magic,
                              const char *what, u64 new_lba)
 {
@@ -762,6 +783,18 @@ int main(int argc, char **argv)
                 want_inodes, old_inodes);
     if (new_inodes < old_inodes)
         new_inodes = old_inodes;
+    /* A grow that adds inodes adds a segment, and a table may have at
+     * most CETRAFS_ISEG_MAX (audit 2026-11-15 F-66). Asked for with -N,
+     * refused; by default, the grow keeps the inodes it has. */
+    if (new_inodes > old_inodes && growfs_iseg_count(fd, &sb) >= CETRAFS_ISEG_MAX) {
+        if (want_inodes)
+            die_arg("the inode table already has %u segments, the most a volume may have -- grow without -N",
+                    CETRAFS_ISEG_MAX);
+        fprintf(stderr, "growfs.cetra: the inode table has %u segments, the most a volume may have -- not adding "
+                        "inodes\n",
+                CETRAFS_ISEG_MAX);
+        new_inodes = old_inodes;
+    }
     const u64 ino_add = new_inodes - old_inodes;
     const u64 ino_span = ino_add ? 1 + cetrafs_calc_inode_bmap_blocks(ino_add) + ino_add : 0;
 

@@ -2149,13 +2149,33 @@ static inline u64 cetrafs_iseg_bmap_blocks(const struct cetrafs_iseg *s)
     return cetrafs_calc_inode_bmap_blocks(s->count);
 }
 
-/* The run holding inode 'ino', or NULL: none does. */
+/*
+ * The most segments an inode table may have: the implicit first one and
+ * every grow that added inodes. A segment may hold one inode, so the
+ * chain was bounded only by inodes_count (4G): a hostile image made the
+ * mount allocate and walk millions of them, and every inode-number
+ * resolution search them (audit 2026-11-15 F-66). The kernel and fsck
+ * refuse a longer chain; growfs refuses a grow that would make one.
+ */
+#define CETRAFS_ISEG_MAX 1024
+
+/* The run holding inode 'ino', or NULL: none does. Runs are in inode
+ * order: the last whose first is at or below 'ino'. */
 static inline const struct cetrafs_iseg *cetrafs_iseg_find(const struct cetrafs_iseg *s, u32 n, u64 ino)
 {
-    while (n--)
-        if (ino >= s[n].first)
-            return ino - s[n].first < s[n].count ? &s[n] : NULL;
-    return NULL;
+    u32 lo = 0, hi = n;
+
+    while (lo < hi) {
+        u32 mid = lo + (hi - lo) / 2;
+
+        if (s[mid].first <= ino)
+            lo = mid + 1;
+        else
+            hi = mid;
+    }
+    if (!lo)
+        return NULL;
+    return ino - s[lo - 1].first < s[lo - 1].count ? &s[lo - 1] : NULL;
 }
 
 /* The block holding inode 'ino''s record, or 0: no such inode. */

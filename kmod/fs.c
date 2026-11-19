@@ -1474,6 +1474,11 @@ static bool cetrafs_grow_keep_stale_ilink;
 cetrafs_test_param(grow_keep_stale_ilink, cetrafs_grow_keep_stale_ilink, bool, 0644);
 MODULE_PARM_DESC(grow_keep_stale_ilink, "TEST ONLY: a grow adding no inodes leaves an earlier grow's inode link");
 
+/* TEST ONLY: the control of tests/kernel/iseg_chain_cap.sh. */
+static bool cetrafs_layout_iseg_uncapped;
+cetrafs_test_param(layout_iseg_uncapped, cetrafs_layout_iseg_uncapped, bool, 0644);
+MODULE_PARM_DESC(layout_iseg_uncapped, "TEST ONLY: an inode table chain is walked past CETRAFS_ISEG_MAX segments");
+
 /* TEST ONLY: the control of tests/kernel/grow_iseg_pinned.sh. */
 static bool cetrafs_layout_iseg_unpinned;
 cetrafs_test_param(layout_iseg_unpinned, cetrafs_layout_iseg_unpinned, bool, 0644);
@@ -1570,6 +1575,11 @@ static int cetrafs_layout_walk_inodes(struct super_block *sb, struct cetrafs_bg_
             return PTR_ERR(sbh);
         seg = (const cetrafs_seg_hdr_t *) sbh->b_data;
         cnt = le32_to_cpu(seg->count);
+        if (l->nisegs >= CETRAFS_ISEG_MAX && !READ_ONCE(cetrafs_layout_iseg_uncapped)) {
+            pr_err("inode table chain has more than %u segments -- refusing\n", CETRAFS_ISEG_MAX);
+            brelse(sbh);
+            return -EUCLEAN;
+        }
         if (l->nisegs == cap) {
             void *n = krealloc_array(l->isegs, cap * 2, sizeof(*l->isegs), GFP_KERNEL);
 

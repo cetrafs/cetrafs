@@ -533,6 +533,12 @@ static int fsck_chain_walk(int fd, const cetrafs_superblock_t *sb, const struct 
             fprintf(stderr, "ERR: %s table chain does not terminate\n", k->what);
             return 1;
         }
+        /* The implicit first segment and this one: past the cap the
+         * kernel refuses the volume (cetrafs_layout_walk_inodes()). */
+        if (k->inodes && guard + 1 > CETRAFS_ISEG_MAX && filled < total) {
+            fprintf(stderr, "ERR: inode table chain has more than %u segments\n", CETRAFS_ISEG_MAX);
+            return 1;
+        }
         /*
          * Every entry counted and still a link: the segment a grow
          * LINKED but has not PUBLISHED. growfs writes the segment, then
