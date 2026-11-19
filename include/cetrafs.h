@@ -39,6 +39,7 @@
 
 #ifdef __KERNEL__
 # include <linux/types.h>
+# include <linux/bug.h>    /* WARN_ONCE, for cetrafs_extent_pack_len() */
 # include <linux/stddef.h> /* offsetof, for the record-layout asserts */
 # define CETRA_PACKED __packed
 #else
@@ -2380,8 +2381,22 @@ static inline u32 cetrafs_extent_len(__le32 ee_len)
 static inline int cetrafs_extent_is_uninit(__le32 ee_len)
 { return (cetrafs_le32(ee_len) & CETRAFS_EXT_UNINIT) != 0; }
 
+/*
+ * An extent holds at most CETRAFS_EXT_LEN_MASK blocks, and a Block Group
+ * up to U32_MAX: a run longer than an extent can exist. Every writer
+ * splits at the mask (the merges check len + count against it, defrag
+ * and fallocate cut their runs there, an append is one block or a piece
+ * of an existing extent), so the clamp below is never reached -- and
+ * were it reached, the blocks past it would be allocated and named by
+ * nothing. So it is not silent in the kernel (audit 2026-11-15 L-10,
+ * BL-112): the userspace tools pack one-block extents only.
+ */
 static inline __le32 cetrafs_extent_pack_len(u32 len, int uninit)
 {
+#ifdef __KERNEL__
+    WARN_ONCE(len > CETRAFS_EXT_LEN_MASK, "cetrafs: an extent of %u blocks, past the format's %u -- clamped\n", len,
+              CETRAFS_EXT_LEN_MASK);
+#endif
     if (len > CETRAFS_EXT_LEN_MASK) len = CETRAFS_EXT_LEN_MASK;
     return cetrafs_cpu_to_le32(len | (uninit ? CETRAFS_EXT_UNINIT : 0));
 }
