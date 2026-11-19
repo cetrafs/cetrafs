@@ -699,14 +699,25 @@ static uint8_t *fsck_bmap_read(int fd, uint64_t lba, uint64_t cnt, uint64_t *nbl
     return img;
 }
 
-/* Bit 'i' of a bitmap image lies in a sector that fails its checksum:
- * its value decides nothing (taken as in use, never handed out or
- * cleared). */
-static int fsck_bmap_bit_damaged(const uint8_t *img, uint64_t i)
+/* The sectors of a bitmap image, as read, that fail their checksum: one
+ * flag each. Judged before any change -- a bit changed in memory makes
+ * its own sector's CRC stale, and every later bit of it would look
+ * damaged. */
+static uint8_t *fsck_bmap_bad_sectors(const uint8_t *img, uint64_t nblk)
 {
-    const uint64_t byte = cetrafs_bmap_blk(i) * CETRAFS_BLOCK_SIZE + cetrafs_bmap_off(i) / 8;
+    const uint64_t n = nblk * CETRAFS_BMAP_SECTORS;
+    uint8_t *bad = (uint8_t *) xcalloc(n ? n : 1, 1);
 
-    return cetrafs_bmap_sector_bad_us(img + byte / CETRAFS_BMAP_SECTOR * CETRAFS_BMAP_SECTOR);
+    for (uint64_t i = 0; i < n; i++)
+        bad[i] = cetrafs_bmap_sector_bad_us(img + i * CETRAFS_BMAP_SECTOR) != 0;
+    return bad;
+}
+
+/* Bit 'i' lies in a sector 'bad' (fsck_bmap_bad_sectors()) marks: its
+ * value decides nothing -- taken as in use, never handed out or cleared. */
+static int fsck_bmap_bit_damaged(const uint8_t *bad, uint64_t i)
+{
+    return bad[(cetrafs_bmap_blk(i) * CETRAFS_BLOCK_SIZE + cetrafs_bmap_off(i) / 8) / CETRAFS_BMAP_SECTOR];
 }
 
 /* A bitmap image written back, every sector restamped -- except, when
@@ -1771,9 +1782,10 @@ static int fsck_alloc_block(int fd,
     for (uint32_t b = 0; b < bg_count; ++b) {
         uint64_t bmap_blocks;
         uint8_t *bmap = fsck_bmap_read(fd, bg_bmap_lba[b], bg_data_cnt[b], &bmap_blocks, NULL, NULL);
+        uint8_t *bad = fsck_bmap_bad_sectors(bmap, bmap_blocks);
 
         for (uint64_t i = 0; i < bg_data_cnt[b]; ++i) {
-            if (cetrafs_bmap_get(bmap, i) || fsck_bmap_bit_damaged(bmap, i))
+            if (cetrafs_bmap_get(bmap, i) || fsck_bmap_bit_damaged(bad, i))
                 continue;
             /* Its flags first: a group with an UNMAP outstanding takes
              * no block, and one marked discarded is marked as holding
@@ -1784,9 +1796,11 @@ static int fsck_alloc_block(int fd,
             fsck_bmap_write(fd, bg_bmap_lba[b], bmap, bmap_blocks);
             fsck_adjust_bg_counts(fd, b, 0); /* the bit first: stopped between, a count reads one high -- the next run fixes it */
             *out_lba = bg_data_start[b] + i;
+            free(bad);
             free(bmap);
             return 0;
         }
+        free(bad);
         free(bmap);
     }
     return -1;
@@ -6602,11 +6616,12 @@ int main(int argc, char **argv)
             for (uint32_t b = 0; b < cetrafs_le32(sb.block_group_count); ++b) {
                 uint64_t bmap_blocks;
                 uint8_t *bmap = fsck_bmap_read(fd, bg_bmap_lba[b], bg_data_cnt[b], &bmap_blocks, NULL, NULL);
+                uint8_t *bad = fsck_bmap_bad_sectors(bmap, bmap_blocks);
                 int dirty = 0;
                 uint64_t bg_before = cleared;
 
                 for (uint64_t i = 0; i < bg_data_cnt[b]; ++i, ++ix) {
-                    if (!FSCK_GET(leakd, ix) || !cetrafs_bmap_get(bmap, i) || fsck_bmap_bit_damaged(bmap, i))
+                    if (!FSCK_GET(leakd, ix) || !cetrafs_bmap_get(bmap, i) || fsck_bmap_bit_damaged(bad, i))
                         continue;
                     cetrafs_bmap_put(bmap, i, 0);
                     dirty = 1;
@@ -6666,6 +6681,7 @@ int main(int argc, char **argv)
                     memcpy(blk, &zg, sizeof(zg));
                     pwrite_all(fd, blk, sizeof(blk), (off_t) (cetrafs_le64(sb.zg_table_start) + z) * CETRAFS_BLOCK_SIZE);
                 }
+                free(bad);
                 free(bmap);
             }
             repairs_made += cleared;
