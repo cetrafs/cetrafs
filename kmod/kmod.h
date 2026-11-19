@@ -1678,6 +1678,7 @@ u64 cetrafs_tree_move_rerun_count(void);
 u64 cetrafs_zero_inplace_block_count(void);
 u64 cetrafs_tree_block_count(void);
 u64 cetrafs_tree_read_count(void);
+u64 cetrafs_tree_read_fresh_count(void);
 u64 cetrafs_file_cache_reconcile_count(void);
 u64 cetrafs_foreign_free_leak_count(void);
 u64 cetrafs_free_bmap_lookup_count(void);

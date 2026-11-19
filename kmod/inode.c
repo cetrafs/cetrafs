@@ -2641,6 +2641,15 @@ u64 cetrafs_tree_read_count(void)
     return (u64) atomic64_read(&cetrafs_tree_reads);
 }
 
+/* Of those, the ones read off the device because the caller could not
+ * trust its cache (not a cache miss) -- procfs tree_reads_fresh. */
+static atomic64_t cetrafs_tree_reads_fresh = ATOMIC64_INIT(0);
+
+u64 cetrafs_tree_read_fresh_count(void)
+{
+    return (u64) atomic64_read(&cetrafs_tree_reads_fresh);
+}
+
 /*
  * 'trusted': the caller's answer to "can nothing but this node have
  * changed this block since it was cached?" -- for a file, its lock
@@ -2708,6 +2717,7 @@ struct buffer_head *cetrafs_read_tree_bh_trust(struct inode *inode, u64 lba, u32
     /* Untrusted: a peer may be mid-write. Verify the tail and retry a
      * mismatch, which is a torn write far more often than it is
      * corruption. */
+    atomic64_inc(&cetrafs_tree_reads_fresh);
     return cetrafs_blk_tail_bread(inode->i_sb, inode->i_ino, cetrafs_inode_get_generation(inode), lba, tail_magic, what);
 }
 

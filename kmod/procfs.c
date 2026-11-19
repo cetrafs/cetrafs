@@ -469,6 +469,7 @@ static int cetrafs_proc_info_show(struct seq_file *m, void *v)
     seq_printf(m, "zero_inplace_blocks: %llu\n", cetrafs_zero_inplace_block_count());
     seq_printf(m, "tree_blocks: %llu\n", cetrafs_tree_block_count());
     seq_printf(m, "tree_reads: %llu\n", cetrafs_tree_read_count());
+    seq_printf(m, "tree_reads_fresh: %llu\n", cetrafs_tree_read_fresh_count());
     seq_printf(m, "tree_cold_marks: %llu\n", cetrafs_tree_cold_mark_count());
     seq_printf(m, "smap_hits: %llu\n", cetrafs_smap_hit_count());
     seq_printf(m, "smap_builds: %llu\n", cetrafs_smap_build_count());

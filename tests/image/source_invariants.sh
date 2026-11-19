@@ -2109,7 +2109,8 @@ cetrafs_inode_ns_held_by_current none:a-lock-holder-test
 cetrafs_nswait_is_current key:start_time
 cetrafs_xattr_trusted_list none:the-trusted-xattr-namespace
 cetrafs_lock_alloc_tree_trusted calls:cetrafs_inode_note_stamp
-cetrafs_pending_forget_cached none:an-invalidate-class-41'
+cetrafs_pending_forget_cached none:an-invalidate-class-41
+cetrafs_tree_read_fresh_count none:a-statistics-counter'
 c51_names() { # <files...>: every function whose name says it trusts cached state
     grep -hoE '^(static )?(inline )?(void|bool|int|u32|u64) \*?cetrafs_[a-z0-9_]*(cache_lookup|_cached|_trusted|_current|_fresh|_key_matches)[a-z0-9_]*\(' "$@" |
         grep -oE 'cetrafs_[a-z0-9_]*' | sort -u

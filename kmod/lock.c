@@ -3161,6 +3161,18 @@ static bool cetrafs_open_defrag_wait_off;
 cetrafs_test_param(open_defrag_wait_off, cetrafs_open_defrag_wait_off, bool, 0644);
 MODULE_PARM_DESC(open_defrag_wait_off, "TEST ONLY: a first local open does not stop a defrag pass on the file");
 
+/* TEST ONLY: the open looks for a pass only before taking lock_mutex, as
+ * before 2026-11-19 (tests/kernel/open_stops_defrag.sh, case 2). */
+/* TEST ONLY: stall an open between its look for a defrag pin and taking
+ * lock_mutex, where a pass can pin (open_stops_defrag.sh, case 2). */
+static unsigned int cetrafs_open_premutex_stall_ms;
+cetrafs_test_param(open_premutex_stall_ms, cetrafs_open_premutex_stall_ms, uint, 0644);
+MODULE_PARM_DESC(open_premutex_stall_ms, "TEST ONLY: stall an open before it takes lock_mutex");
+
+static bool cetrafs_open_defrag_recheck_off;
+cetrafs_test_param(open_defrag_recheck_off, cetrafs_open_defrag_recheck_off, bool, 0644);
+MODULE_PARM_DESC(open_defrag_recheck_off, "TEST ONLY: an open does not look for a defrag pin again under lock_mutex");
+
 /*
  * Ask this node's defrag pass on the file to stop at its next step
  * boundary, wait for its pin to go, and take lock_mutex. A boundary that
@@ -3230,6 +3242,7 @@ int cetrafs_lock_open(struct inode *inode, struct file *file)
     u32 stale_owner = CETRAFS_NODE_ID_NONE;
     u32 stale_incarnation = 0; /* the incarnation behind the judged stale lock */
     unsigned int yield_rounds = 0; /* relocations this open asked to step aside */
+    bool stop_pass;
     int ret;
 
     ret = cetrafs_sb_get_node_id(sb, &my_node_id);
@@ -3252,13 +3265,28 @@ int cetrafs_lock_open(struct inode *inode, struct file *file)
      * background work: stop it first (TEST ONLY open_defrag_wait_off:
      * as before). An explicit defrag holds the file open, so it is
      * never this case. */
-    if (atomic_read(&ci->lock_local_open_count) == 0 && READ_ONCE(ci->defrag_pinned) &&
-        !READ_ONCE(cetrafs_open_defrag_wait_off))
+    stop_pass = atomic_read(&ci->lock_local_open_count) == 0 && READ_ONCE(ci->defrag_pinned) &&
+                !READ_ONCE(cetrafs_open_defrag_wait_off);
+    if (cetrafs_open_premutex_stall_ms)
+        msleep(cetrafs_open_premutex_stall_ms); /* TEST ONLY; see the parameter */
+    if (stop_pass)
         ret = cetrafs_lock_defrag_stop_relock(inode, false, "open");
     else
         ret = mutex_lock_killable(&ci->lock_mutex);
     if (ret)
         return ret;
+    /* Asked again under lock_mutex: a pass pins under it, so one could
+     * pin between the unlocked look above and the mutex, and this open
+     * went on without asking it to stop -- its refresh then lost every
+     * trylock to the pass's steps and failed EBUSY (two-node
+     * direct-write, 2026-11-19; TEST ONLY open_defrag_recheck_off: as
+     * before). Under the mutex the answer holds: defrag_begin needs it. */
+    if (atomic_read(&ci->lock_local_open_count) == 0 && READ_ONCE(ci->defrag_pinned) &&
+        !READ_ONCE(cetrafs_open_defrag_wait_off) && !READ_ONCE(cetrafs_open_defrag_recheck_off)) {
+        ret = cetrafs_lock_defrag_stop_relock(inode, true, "open");
+        if (ret)
+            return ret;
+    }
 
     /* No PR mutex here any more: the claim below is a single
      * atomic compare-and-swap, which supplies its own atomicity against
@@ -5331,6 +5359,12 @@ static bool cetrafs_read_trust_off;
 cetrafs_test_param(read_trust_off, cetrafs_read_trust_off, bool, 0644);
 MODULE_PARM_DESC(read_trust_off, "TEST ONLY: readers re-read the record per block (the pre-fix behaviour)");
 
+/* TEST ONLY: a local defrag pin makes readers read the tree from the
+ * device, as before 2026-11-19 (tests/kernel/read_trust_defrag_pin.sh). */
+static bool cetrafs_read_trust_defrag_defers;
+cetrafs_test_param(read_trust_defrag_defers, cetrafs_read_trust_defrag_defers, bool, 0644);
+MODULE_PARM_DESC(read_trust_defrag_defers, "TEST ONLY: a local defrag pin makes readers re-read the tree from the device");
+
 /* TEST ONLY: with a local writer the reader's cache question gets the
  * write lock's answer, as before audit 2026-11-15 B-12. */
 bool cetrafs_read_trust_writer_defers;
@@ -5452,9 +5486,22 @@ bool cetrafs_lock_read_cache_trusted(struct inode *inode)
      * argument holds with a local writer as well: a peer cannot free or
      * move a block while this node is in the file, and this node's own
      * frees and moves run under invalidate_lock exclusively, which a
-     * mapping excludes. The local defrag pin still defers.
+     * mapping excludes.
+     *
+     * The local defrag pin is the same case: each step relocates and
+     * edits the tree holding inode_lock and invalidate_lock exclusively,
+     * and every reader's mapping holds one of them -- readahead and
+     * read_folio invalidate_lock shared, an O_DIRECT read inode_lock
+     * (DIO_LOCKING), which the step's drain also waits out. Between
+     * steps the cache holds this node's own newest tree. Distrusting it
+     * made every 4 KiB a reader mapped walk the tree from the device for
+     * the whole pass, and the reader's readahead, holding invalidate_lock
+     * shared across that crawl, kept the pass from its next step: a
+     * buffered read of a fragmented image stalled for minutes behind the
+     * janitor (two-node direct-write, 2026-11-19;
+     * tests/kernel/read_trust_defrag_pin.sh).
      */
-    if (READ_ONCE(ci->defrag_pinned) ||
+    if ((READ_ONCE(cetrafs_read_trust_defrag_defers) && READ_ONCE(ci->defrag_pinned)) ||
         (READ_ONCE(cetrafs_read_trust_writer_defers) && atomic_read(&ci->lock_writer_count) > 0))
         return false;
 
