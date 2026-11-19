@@ -160,11 +160,15 @@ and at least one of them has to run before a layer is called clean.
 
 ## Confidence bar
 
-cetrafs is from-scratch: heavily reviewed + tested (about 4,400 single-node asserts
-across 577 suites, ~67 multi-node ctest scenarios on two rigs, fuzzing, a
-crash rig, and a randomized content oracle whose seeded replays caught
-microsecond-window corruption races at one-in-millions per-operation odds
--- see docs/TEST-SUITES.md) but NOT production-aged like VMFS/ext4.
-Ship to real data only after: L1 gates pass, L2 power-loss clean ×dozens,
-L3–L4 load soak ≥ weeks with zero verify errors and no unexpected fsck finding,
-HA fencing configured. Keep independent backups (to OTHER storage) throughout.
+The filesystem itself arrives here already gated: 837 suites and about
+6,600 assertions per change, a negative control in five suites of six,
+68 two-node scenarios on real shared storage, crash replay, fuzzing, a
+KASAN build and a randomized content oracle whose seeded replays caught
+microsecond-window races at one-in-millions per-operation odds
+(`docs/QUALITY.md`, `docs/TEST-SUITES.md`).
+
+What none of that can check is YOUR storage path. This plan exists for
+that. Put production data on a new installation once: the L1 gates pass
+on every host, L2 power-loss runs come back clean, L3-L4 load runs with
+zero verify errors and no unexpected fsck finding, and host fencing is
+configured. As with any storage system, keep backups on other storage.

@@ -331,10 +331,23 @@ that can write.
 the same change and lifted the read-WRITE data path too, 1834 to 2730
 MB/s on the default mount.
 
+A defrag pass THIS node runs on the file is no reason to distrust it
+either. Each step relocates and edits the tree holding `inode_lock` and
+`invalidate_lock` exclusively, and every reader's mapping holds one of
+them; between steps the cache is this node's own newest tree. The pin
+used to send every reader to the device, and the cost was not linear:
+the tree was walked off the disk per 4 KiB, while readahead held
+`invalidate_lock` shared across that walk -- the lock the pass needed
+for its next step. A buffered read of a fragmented 1 GiB image during a
+background pass had not finished after ten minutes. `tree_reads_fresh`
+in procfs counts the tree reads the trust still withholds.
+
 **Guarded by:** `tests/kernel/read_cache_trust.sh` -- device reads per
 cold read-only pass, a held read-only fd keeping its map, a peer's stamp
 still sending it fresh, and defrag refusing a file a peer has open; each
-with the knob that breaks it.
+with the knob that breaks it. `tests/kernel/read_trust_defrag_pin.sh` --
+a full read of a 4096-extent file during a paced pass takes 0 fresh tree
+reads, against 7,974 with `read_trust_defrag_defers`.
 
 ## 14. An O_DIRECT write into a hole or preallocated space stays direct
 

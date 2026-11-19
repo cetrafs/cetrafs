@@ -23,7 +23,7 @@ and `docs/` the long-form detail.
 | Cross-node exclusion | Functional | Atomic COMPARE AND WRITE only. Per-inode namespace lock, whole-file exclusive open lock, read-presence bitmask, Node Registry rows, ZG ownership and the pending-free queue are all compare-and-swap on a single ≤512-byte record |
 | Node liveness | Functional, best-effort | Heartbeat + staleness timeout, judged against the peer's own advertised tick rate; `fence_epoch` is the lease and a fenced node fails every write with `-EIO` until remount. Timeout-based, not consensus — the split-brain caveat below still applies |
 | Journal | Functional | Per-**node** physical/redo log for dirent, xattr and extent-tree blocks; write-ahead, consumed within its own operation, replayed at mount, at reclaim, and by a heartbeat sweep |
-| Integrity | Functional | CRC32C on every record and on the block tails of dirent, extent (leaf/interior) and xattr blocks (v0x000F), kernel-enforced on read with transient-tear retry; per-inode generation detects cross-node inode-number reuse |
+| Integrity | Functional | CRC32C on every record, on the block tails of dirent, extent (leaf/interior) and xattr blocks (v0x000F), and on every 512-byte sector of the allocation bitmaps (v0x000A), kernel-enforced on read with transient-tear retry; every disk-read address range-checked before it aims an I/O; per-inode generation detects cross-node inode-number reuse |
 | Introspection | Functional | `/proc/fs/cetrafs/<device>/{info,properties,cluster,controls}` (`controls` is writable: per-mount defrag toggles and bounded cluster timing) |
 | Sparse-file APIs | Functional | `SEEK_HOLE`/`SEEK_DATA` and `FS_IOC_FIEMAP`, so `cp --sparse=auto`, `tar -S`, `qemu-img convert` and `filefrag` all work on a thin image |
 | Discard / `UNMAP` | Functional | An emptied Block Group's data region is discarded as it goes back to the unowned pool (on by default where the device supports discard; `nodiscard` or the `discard` control turns it off), and `fstrim` (`FITRIM`) discards the free runs inside the Block Groups a node owns, each one claimed before its UNMAP and held against every free path, then the pool groups handed back while discard was off (each once: a mark in the descriptor says it is done). With `-o discard` (off by default) runs freed inside a node's own Block Groups are also discarded a moment later, batched, through the same claim. `kmod/discard.c`, `docs/DISCARD-DESIGN.md` |
@@ -51,7 +51,7 @@ cluster must satisfy -- is documented at cetrafs.com.
   rewrites it from the bits it settles on
 - Fixed-size directory entries (no variable-length dirent packing), each dirent
   block carrying a `{magic,crc}` tail in its slack
-- Extents use an ext4-style tree: header + inline leaves/index, depth 0/1/2
+- Extents use an ext4-style tree: header + inline leaves/index, depth 0 to 3
 - Cross-node exclusion is atomic COMPARE AND WRITE only; the SCSI Persistent
   Reservation backend was deleted in format v0x000E, along with the
   superblock's `lock_backend` field and the `PR_AWARE` feature. A record that

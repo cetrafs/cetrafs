@@ -7,7 +7,7 @@ and it is layered: each tier catches a class the tier above it
 structurally cannot.
 
 This document is a map of that effort -- the AUTOMATED suites that run
-against every change.
+against every change. `docs/QUALITY.md` is the one-page summary.
 
 Two neighbours, so you land on the right one:
 
@@ -26,7 +26,7 @@ make check
 ```
 
 That is the gate. It runs every suite under `tests/image/` and
-`tests/kernel/` -- **659 suites, about 4,400 individual assertions** --
+`tests/kernel/` -- **837 suites, about 6,600 individual assertions** --
 against a loop-backed volume, and exits nonzero if any assertion fails
 OR if any suite aborts without failing one. Nothing ships on a red gate.
 
@@ -57,13 +57,13 @@ df -Pm /                                       # confirm the floor
 
 ### `tests/image/` -- the tools, with no kernel involved
 
-61 suites. No module is loaded and nothing is mounted: `mkfs.cetra`
+73 suites. No module is loaded and nothing is mounted: `mkfs.cetra`
 writes the structures, a poke helper corrupts exactly one of them, and
 `fsck.cetra` must report *that* fault and exit nonzero.
 
 This is where the on-disk format is pinned down -- superblock
 validation, geometry, the version window that lets a previous release's
-volume be grown rather than rebuilt, and the ~99 distinct faults
+volume be grown rather than rebuilt, and the 118 distinct errors
 `fsck.cetra` can name.
 
 One of them asserts something else: that a fault costs ONE complaint.
@@ -75,7 +75,7 @@ unbounded is still the bug.
 
 ### `tests/kernel/` -- the regression suite proper
 
-598 suites, one concern each, against a loaded module and a real mount.
+764 suites, one concern each, against a loaded module and a real mount.
 Roughly by area:
 
 | area | what it covers |
@@ -323,7 +323,7 @@ source, which is most of the value.
 A "node" in cetrafs is a kernel instance with its own machine UUID, so
 real cross-node behaviour cannot be simulated with two processes on one
 box. `ctest/` is a Go master/slave harness driving **two or more real
-machines against one shared LUN**, with about 67 scenarios. The suite requires
+machines against one shared LUN**, with 68 scenarios. The suite requires
 at least two machines; a second three-node rig on an FC multipath LUN
 exercises scalability beyond the testing minimum.
 

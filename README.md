@@ -7,8 +7,8 @@ the workload, with VM disk images (raw/vmdk) living directly on the one
 volume — the way VMFS backs vSphere.
 
 It is an out-of-tree kernel module (`kmod/`) plus the userspace tools
-`mkfs.cetra`, `fsck.cetra` and `defrag.cetra` (`userspace/`). Nodes
-coordinate through the storage itself — one atomic SCSI COMPARE AND WRITE
+`mkfs.cetra`, `fsck.cetra`, `growfs.cetra` and `defrag.cetra`
+(`userspace/`). Nodes coordinate through the storage itself — one atomic SCSI COMPARE AND WRITE
 per contested claim, the same idea as VMFS's ATS — not over a network.
 
 > **Found it useful?** A **star** on
@@ -32,9 +32,11 @@ per contested claim, the same idea as VMFS's ATS — not over a network.
   device without atomic CAW is restricted to a single mounter.
 - **Crash consistency** — a per-node write-ahead redo journal, replayed at
   mount and whenever a dead peer is reclaimed.
-- **End-to-end integrity** — CRC32C on every on-disk structure,
-  kernel-verified on read with transient-tear retry; per-inode generations
-  detect cross-node inode-number reuse.
+- **End-to-end integrity** — CRC32C on every on-disk structure, and on
+  every 512-byte sector of the allocation bitmaps; kernel-verified on read
+  with transient-tear retry; per-inode generations detect cross-node
+  inode-number reuse. Damage found at runtime refuses writes to what it
+  touches and leaves a lasting "needs fsck" mark in the superblock.
 - **A real POSIX namespace** — directories, hardlinks, symlinks and
   `user.*`/`trusted.*`/`security.*` extended attributes, with LSM labelling
   so SELinux-enforcing hosts work. (No POSIX ACLs, no special files.)
@@ -46,23 +48,37 @@ per contested claim, the same idea as VMFS's ATS — not over a network.
   byte-range locks are not cluster-wide: refused with `ENOLCK` on a default
   mount, granted node-local under `nofilelock` or `-o localposixlocks` (for
   a stock qemu's image locking; Proxmox's qemu needs neither).
-- **Online maintenance** — in-place defragmentation, a background scrubber
-  that reclaims leaked blocks, and an `fsck.cetra` that repairs the
-  mechanically-derivable faults and refuses the ambiguous ones.
+- **Online maintenance** — grow a mounted volume in place (`growfs.cetra`;
+  every node catches up live), in-place defragmentation, UNMAP to a thin
+  LUN (`fstrim`, and an emptied Block Group handed back), a background
+  scrubber that reclaims leaked blocks, and an `fsck.cetra` that repairs
+  the mechanically-derivable faults and refuses the ambiguous ones.
 
 ## Status
 
-**Young, pre-1.0.** Heavily reviewed, fuzzed and crash-tested, but not
-production-aged the way VMFS or ext4 are. Built and tested on Linux
-`7.0.14` and `7.1.8+deb13` (Debian, arm64), on little-endian hosts
-(arm64, amd64). Keep independent backups.
+**Ready for production use on its target workload** — VM disk images on a
+shared, CAW-capable LUN. The on-disk format, the cluster protocol and the
+recovery paths are complete, and the open-defect list is empty.
 
-**Before deploying anything, read
-[Project status](https://cetrafs.com/docs/intro/status/).** It is the
-honest account of what is verified, what is not, and what a trial should
-check first — the first thing worth knowing about software this young.
-If you read one page about this project, read that one; nothing else in
-the docs replaces it.
+That claim rests on the test effort, which is larger than the
+filesystem: 837 regression suites and ~6,600 assertions per gate, a
+negative control in five suites of six proving each fails without the
+fix it guards, 68 two-node scenarios on real Fibre Channel and iSCSI
+storage,
+crash replay at arbitrary cuts, hostile-image fuzzing of both `fsck` and
+the mount path, a KASAN build, and 59 catalogued bug classes each audited
+across the whole tree. **[How cetrafs is tested](docs/QUALITY.md)** is the
+one-page summary.
+
+Built and tested on Linux `7.0.14` and `7.1.8+deb13` (Debian, Proxmox VE),
+on arm64 and amd64. As with any storage system, run it with backups to
+other storage and with host fencing in a multi-node cluster.
+
+Before a first deployment, read
+[Project status](https://cetrafs.com/docs/intro/status/) and validate the
+storage path with [the deployment test plan](docs/TESTING.md): it checks
+the two properties of your SAN that cetrafs depends on (atomic CAW, and
+coherent reads across hosts) before anything is put on it.
 
 ## Feedback
 
@@ -92,6 +108,8 @@ bug so far.
 
 In this repo:
 
+- `docs/QUALITY.md` — **how cetrafs is tested**, in one page
+- `docs/COMPARISON.md` — cetrafs next to VMFS, OCFS2 and GFS2
 - `docs/ARCHITECTURE.md` — the on-disk format reference and a status map
 - `docs/LOCKING.md` — the coordination mechanisms and their rules
 - `docs/PERFORMANCE.md` — the per-block cost invariants and what guards each
@@ -99,8 +117,7 @@ In this repo:
   faults each tier exists to catch
 - `docs/TESTING.md`, `docs/LOGGING.md` — deployment test plan and logging
 - `docs/DISCARD-DESIGN.md` — returning freed space to a thin LUN
-  (UNMAP/discard): what to build and the two things that make it
-  dangerous. Not implemented yet
+  (UNMAP/discard): the design, and the two hazards it is built around
 
 ## Requirements
 
@@ -187,7 +204,7 @@ In this repo:
 ```
 make            # kernel module + userspace tools
 make mod        # kernel module only (kmod/cetrafs.ko)
-make userspace  # mkfs.cetra, fsck.cetra, defrag.cetra
+make userspace  # mkfs.cetra, fsck.cetra, defrag.cetra, growfs.cetra
 make check      # the test suite: loop-backed images, never a real device (needs root)
 make soak       # mixed-workload soak with a full fsck after each round
 ```
@@ -211,15 +228,15 @@ tree needs `kmod/`, `include/` and `dkms.conf` (the module builds in `kmod/`
 and includes the shared format header from `../include`):
 
 ```
-sudo cp -r . /usr/src/cetrafs-0.6      # kmod/ + include/ + dkms.conf
-sudo dkms add     -m cetrafs -v 0.6
-sudo dkms build   -m cetrafs -v 0.6
-sudo dkms install -m cetrafs -v 0.6
+sudo cp -r . /usr/src/cetrafs-0.9.5      # kmod/ + include/ + dkms.conf
+sudo dkms add     -m cetrafs -v 0.9.5
+sudo dkms build   -m cetrafs -v 0.9.5
+sudo dkms install -m cetrafs -v 0.9.5
 ```
 
-Make a distributable source tarball with `dkms mktarball -m cetrafs -v 0.6
+Make a distributable source tarball with `dkms mktarball -m cetrafs -v 0.9.5
 --source-only` (install it elsewhere with `dkms ldtarball` + `dkms
-install`). Keep the `0.6` in step with the release.
+install`). Keep the version in step with `debian/changelog`.
 
 ### Debian packages
 
@@ -237,7 +254,8 @@ beside the source tree, so `make deb` moves what it produced into
 
 It produces **`cetrafs-dkms`** (the module source plus DKMS wiring, so
 `cetrafs.ko` is rebuilt on every kernel upgrade) and **`cetrafs-tools`**
-(`mkfs.cetra`, `fsck.cetra`, `defrag.cetra` in `/usr/sbin`). Install the
+(`mkfs.cetra`, `fsck.cetra`, `growfs.cetra`, `defrag.cetra` in
+`/usr/sbin`). Install the
 pair and nothing else is needed: the module declares the `fs-cetrafs`
 alias, so the first `mount -t cetrafs` loads it.
 
