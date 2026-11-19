@@ -299,6 +299,11 @@ void cetrafs_sb_peer_note_fenced(struct super_block *sb, u32 node_id, const stru
 bool cetrafs_sb_peer_fenced_mark(struct super_block *sb, u32 node_id, struct cetrafs_row_mark *out);
 void cetrafs_sb_set_incarnation(struct super_block *sb, u32 inc);
 u32 cetrafs_sb_incarnation(struct super_block *sb);
+/* fs.c: bitmap blocks recently confirmed damaged (ioutil.c, F-67) */
+#define CETRAFS_BMAP_BAD_SLOTS 8
+#define CETRAFS_BMAP_BAD_SECS  10
+bool cetrafs_sb_bmap_bad_fresh(struct super_block *sb, u64 lba, u8 mask);
+void cetrafs_sb_bmap_bad_note(struct super_block *sb, u64 lba, u8 mask, bool bad);
 void cetrafs_node_report_clock_skew(struct super_block *sb);
 void cetrafs_node_seed_peer_watch(struct super_block *sb);
 bool cetrafs_cluster_all_advertise(struct super_block *sb, u32 cap);

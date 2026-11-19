@@ -17,12 +17,17 @@
 #      is counted (the check is the checksum, not a guess at the bits);
 #   4. an append whose contiguity hint lies in a damaged sector still
 #      succeeds: the damage is a miss, not the write's answer (review M1).
+#   5. a damaged sector is checked in full once, not on every
+#      allocation: the first-fit scan reads the group's first bitmap
+#      block each time, and the retries cost ~2 ms apiece (audit F-67).
+#      100 allocations count it a few times at most.
 #
 # DISCRIMINATION: with cetrafs_bmap_sectors_ok() returning true, 1 and 2
 # count nothing and allocate inside the damaged sector; with
 # cetrafs_bmap_bad_us() returning 0, fsck reports neither. 4: with
 # cetrafs_alloc_data_block_near() returning the hint's -EUCLEAN, the
-# append fails.
+# append fails. 5: with bmap_bad_unremembered=1, every allocation
+# counts it again.
 set -euo pipefail
 . "$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)/lib/harness.sh"
 require_root
@@ -141,4 +146,28 @@ dd if=/dev/urandom of="$MNT/h" bs=4096 count=4 seek=1 conv=notrunc,fsync status=
     pass "4: the append succeeds, around the damaged sector" ||
     fail "4: the append failed -- the damaged hint was taken for the write's answer"
 ct_umount "$MNT"
+
+log "5: a damaged sector is remembered, not re-checked per allocation"
+ct_param_set bmap_bad_unremembered 0
+# <unremembered 0|1> -> the bmap_crc_bad count over 100 allocations
+count5() {
+    local b0 i
+    fresh
+    CORRUPT_POKE_RAW=1 "$POKE" "$DEV" bitset 0 100 >/dev/null
+    echo "$1" >/sys/module/cetrafs/parameters/bmap_bad_unremembered
+    ct_mount "$DEV" "$MNT"
+    b0="$(bad_now)"
+    for i in $(seq 1 100); do printf 'x' >"$MNT/a$i"; sync -d "$MNT/a$i"; done
+    echo $(($(bad_now) - b0))
+    echo 0 >/sys/module/cetrafs/parameters/bmap_bad_unremembered
+    ct_umount "$MNT"
+}
+R5="$(count5 0)"
+C5="$(count5 1)"
+log "5: counted $R5 time(s) remembered, $C5 unremembered"
+# 0 is right too: the mount's own reads may have confirmed it first.
+[ "$R5" -le 5 ] && pass "5: counted $R5 time(s) over 100 allocations" ||
+    fail "5: counted $R5 time(s) over 100 allocations"
+[ "$C5" -ge 50 ] && pass "control: unremembered, it was re-checked on every allocation ($C5)" ||
+    fail "control: only $C5 -- the allocations do not reach the damaged block"
 ct_exit

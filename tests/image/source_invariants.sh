@@ -2112,7 +2112,8 @@ cetrafs_xattr_trusted_list none:the-trusted-xattr-namespace
 cetrafs_lock_alloc_tree_trusted calls:cetrafs_inode_note_stamp
 cetrafs_pending_forget_cached none:an-invalidate-class-41
 cetrafs_tree_read_fresh_count none:a-statistics-counter
-cetrafs_deferred_set_current none:a-device-read-compared-to-a-crc-every-tree-block-write-draws-a-fresh-eh_generation'
+cetrafs_deferred_set_current none:a-device-read-compared-to-a-crc-every-tree-block-write-draws-a-fresh-eh_generation
+cetrafs_sb_bmap_bad_fresh none:a-damage-verdict-that-expires-in-seconds-and-only-refuses'
 c51_names() { # <files...>: every function whose name says it trusts cached state
     grep -hoE '^(static )?(inline )?(void|bool|int|u32|u64) \*?cetrafs_[a-z0-9_]*(cache_lookup|_cached|_trusted|_current|_fresh|_key_matches)[a-z0-9_]*\(' "$@" |
         grep -oE 'cetrafs_[a-z0-9_]*' | sort -u

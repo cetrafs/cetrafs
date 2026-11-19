@@ -137,11 +137,32 @@ struct buffer_head *cetrafs_bread_retry(struct super_block *sb, sector_t block)
  * held) is newer than the device and cannot be re-read: a mismatch
  * there is ours, and damage at once.
  */
+/* TEST ONLY: a confirmed-damaged bitmap block is re-checked in full on
+ * every read, as before audit 2026-11-15 F-67 (tests/kernel/bmap_crc.sh). */
+static bool cetrafs_bmap_bad_unremembered;
+cetrafs_test_param(bmap_bad_unremembered, cetrafs_bmap_bad_unremembered, bool, 0644);
+MODULE_PARM_DESC(bmap_bad_unremembered, "TEST ONLY: a damaged bitmap block is re-read with retries on every read");
+
 struct buffer_head *cetrafs_bmap_bread(struct super_block *sb, u64 lba, u64 lo, u64 hi, int *err)
 {
     const u64 first = lo / (CETRAFS_BMAP_SECTOR * 8ULL);
     const u64 n = hi > lo ? DIV_ROUND_UP(hi, CETRAFS_BMAP_SECTOR * 8ULL) - first : 0;
+    /* The sectors asked for, one bit each (a block has eight). */
+    const u8 mask = n ? (u8) (GENMASK_ULL(first + n - 1, first) & 0xFF) : 0;
+    u8 badmask = mask; /* the sectors the last read found failing */
     int attempt;
+
+    /* Confirmed damaged a moment ago: refused at once. The first-fit
+     * scan reads an owned group's first bitmap block on every
+     * allocation, under alloc_mutex -- with the retries below each one
+     * paid ~2 ms, for the whole node, for one bad sector (audit F-67).
+     * The verdict lapses after CETRAFS_BMAP_BAD_SECS and the block is
+     * checked in full again, so a rewrite (fsck -r, the owner) is seen.
+     * Per sector: a read of the block's healthy sectors is unaffected. */
+    if (!READ_ONCE(cetrafs_bmap_bad_unremembered) && cetrafs_sb_bmap_bad_fresh(sb, lba, mask)) {
+        *err = -EUCLEAN;
+        return NULL;
+    }
 
     for (attempt = 0; attempt < CETRAFS_BMAP_CRC_RETRIES; attempt++) {
         struct buffer_head *bh = cetrafs_bread_retry(sb, lba);
@@ -153,10 +174,20 @@ struct buffer_head *cetrafs_bmap_bread(struct super_block *sb, u64 lba, u64 lo, 
         }
         lock_buffer(bh);
         ok = cetrafs_bmap_sectors_ok(bh->b_data, first, n);
+        if (!ok) {
+            u64 sct;
+
+            badmask = 0;
+            for (sct = first; sct < first + n; sct++)
+                if (!cetrafs_bmap_sectors_ok(bh->b_data, sct, 1))
+                    badmask |= (u8) (1U << sct);
+        }
         mine = cetrafs_bh_pending(bh) || buffer_dirty(bh);
         unlock_buffer(bh);
-        if (ok)
+        if (ok) {
+            cetrafs_sb_bmap_bad_note(sb, lba, mask, false);
             return bh;
+        }
         brelse(bh);
         if (mine)
             break;
@@ -170,6 +201,7 @@ struct buffer_head *cetrafs_bmap_bread(struct super_block *sb, u64 lba, u64 lo, 
      * counted against the volume, which corruption=stop consults, as the
      * inode bitmap's CAS refusal already is (cetrafs_cas_refused_damage()). */
     cetrafs_sb_corrupt(sb, 0);
+    cetrafs_sb_bmap_bad_note(sb, lba, badmask, true);
     *err = -EUCLEAN;
     return NULL;
 }

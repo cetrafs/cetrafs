@@ -964,6 +964,14 @@ struct cetrafs_sb_info {
     /* Inode-number reclaim claims whose give-back did not land (see
      * cetrafs_reclaim_pending in kmod.h). Under rcrel_lock. */
     spinlock_t rcrel_lock;
+    /* Bitmap blocks confirmed damaged, and until when that verdict stands
+     * (cetrafs_sb_bmap_bad_*(), ioutil.c; audit F-67). Under its lock. */
+    struct {
+        u64 lba;
+        unsigned long until;
+        u8 sectors; /* which of the block's sectors */
+    } bmap_bad[CETRAFS_BMAP_BAD_SLOTS];
+    spinlock_t bmap_bad_lock;
     u32 rcrel_count;
     struct cetrafs_reclaim_pending rcrel[CETRAFS_RECLAIM_DEFERRED_MAX];
 
@@ -2933,6 +2941,61 @@ void cetrafs_sb_set_incarnation(struct super_block *sb, u32 inc)
         WRITE_ONCE(sbi->incarnation, inc);
 }
 
+/* Do any of the sectors in 'mask' of bitmap block 'lba' carry a damage
+ * verdict that still stands? Then their reader refuses at once (F-67). */
+bool cetrafs_sb_bmap_bad_fresh(struct super_block *sb, u64 lba, u8 mask)
+{
+    struct cetrafs_sb_info *sbi = sb->s_fs_info;
+    bool fresh = false;
+    u32 i;
+
+    if (!sbi || !lba || !mask)
+        return false;
+    spin_lock(&sbi->bmap_bad_lock);
+    for (i = 0; i < CETRAFS_BMAP_BAD_SLOTS; i++)
+        if (sbi->bmap_bad[i].lba == lba) {
+            fresh = (sbi->bmap_bad[i].sectors & mask) && time_before(jiffies, sbi->bmap_bad[i].until);
+            break;
+        }
+    spin_unlock(&sbi->bmap_bad_lock);
+    return fresh;
+}
+
+/* Record a full check of the sectors in 'mask' of bitmap block 'lba':
+ * damaged for CETRAFS_BMAP_BAD_SECS (the slot whose verdict ends first
+ * makes room), or clean. */
+void cetrafs_sb_bmap_bad_note(struct super_block *sb, u64 lba, u8 mask, bool bad)
+{
+    struct cetrafs_sb_info *sbi = sb->s_fs_info;
+    u32 i, slot = CETRAFS_BMAP_BAD_SLOTS, old = 0;
+
+    if (!sbi || !lba || !mask)
+        return;
+    spin_lock(&sbi->bmap_bad_lock);
+    for (i = 0; i < CETRAFS_BMAP_BAD_SLOTS; i++) {
+        if (sbi->bmap_bad[i].lba == lba) {
+            slot = i;
+            break;
+        }
+        if (!sbi->bmap_bad[i].lba || time_before(sbi->bmap_bad[i].until, sbi->bmap_bad[old].until))
+            old = i;
+    }
+    if (bad) {
+        if (slot == CETRAFS_BMAP_BAD_SLOTS) {
+            slot = old;
+            sbi->bmap_bad[slot].lba = lba;
+            sbi->bmap_bad[slot].sectors = 0;
+        }
+        sbi->bmap_bad[slot].sectors |= mask;
+        sbi->bmap_bad[slot].until = jiffies + CETRAFS_BMAP_BAD_SECS * HZ;
+    } else if (slot < CETRAFS_BMAP_BAD_SLOTS) {
+        sbi->bmap_bad[slot].sectors &= (u8) ~mask;
+        if (!sbi->bmap_bad[slot].sectors)
+            sbi->bmap_bad[slot].lba = 0;
+    }
+    spin_unlock(&sbi->bmap_bad_lock);
+}
+
 u32 cetrafs_sb_incarnation(struct super_block *sb)
 {
     struct cetrafs_sb_info *sbi = sb->s_fs_info;
@@ -3324,6 +3387,7 @@ int cetrafs_fill_super(struct super_block *sb, struct fs_context *fc)
         spin_lock_init(&sbi->flrel_lock);
         spin_lock_init(&sbi->prrel_lock);
         spin_lock_init(&sbi->rcrel_lock);
+        spin_lock_init(&sbi->bmap_bad_lock);
         mutex_init(&sbi->nsrel_mutex);
         mutex_init(&sbi->frees_mutex);
         mutex_init(&sbi->witness_mutex);
