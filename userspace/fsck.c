@@ -323,6 +323,7 @@ static void fsck_repair_release_atexit(void)
     }
 }
 static int repair_blocked; /* a fault we must not repair around */
+static uint64_t fsck_journal_pending; /* entries a mount has not replayed: no -r verdict (BL-115) */
 static int live_mode;      /* --live: checked while peers have it mounted (M-38) */
 static int live_pass;      /* --live-pass: one walk of a --live check (internal) */
 static uint64_t repairs_made;
@@ -4828,6 +4829,7 @@ int main(int argc, char **argv)
 #undef FSCK_PF_DROP
 #undef FSCK_BG_FOR_LBA
 
+        fsck_journal_pending = journal_unapplied;
         if (journal_unapplied)
             repair_block(
                 "journal entries a mount has not yet replayed -- mount the volume once (replay runs at "
@@ -6973,6 +6975,20 @@ int main(int argc, char **argv)
         }
     }
 
+    /*
+     * A repair the journal disabled walked the volume as it is before a
+     * mount replays it: "OK" and exit 0 told a script that asked for a
+     * repair that the volume was checked and clean, and nothing was
+     * (audit 2026-11-15 BL-115). A check alone says what the device
+     * holds, with the WARN above, and stays OK.
+     */
+    if (repair_mode && fsck_journal_pending && !cetrafs_test_env("CETRAFS_TEST_FSCK_PENDING_JOURNAL_OK")) {
+        fprintf(stderr,
+                "cetrafs fsck: nothing repaired and no verdict: %" PRIu64 " journal entr%s a mount has not replayed "
+                "-- mount the volume once, then re-run fsck -r\n",
+                fsck_journal_pending, fsck_journal_pending == 1 ? "y" : "ies");
+        return FSCK_EXIT_PROBLEMS;
+    }
     printf("cetrafs fsck: OK\n");
     return 0;
 }
