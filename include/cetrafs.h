@@ -2383,13 +2383,17 @@ static inline int cetrafs_extent_is_uninit(__le32 ee_len)
 
 /*
  * An extent holds at most CETRAFS_EXT_LEN_MASK blocks, and a Block Group
- * up to U32_MAX: a run longer than an extent can exist. Every writer
- * splits at the mask (the merges check len + count against it, defrag
- * and fallocate cut their runs there, an append is one block or a piece
- * of an existing extent), so the clamp below is never reached -- and
- * were it reached, the blocks past it would be allocated and named by
- * nothing. So it is not silent in the kernel (audit 2026-11-15 L-10,
- * BL-112): the userspace tools pack one-block extents only.
+ * up to U32_MAX: a run longer than an extent can exist. Every call that
+ * GROWS a length checks it against the mask first (enumerated 2026-11-19,
+ * L-10; every other call shrinks or splits a length that was valid):
+ * file.c's neighbour pick for a coalesce (cetrafs_leaf_array_neighbours()
+ * and its bridge), the tail merge of an append, the leaf merge of a
+ * rebuilt run, fallocate's run growth (< mask before +1); defrag's
+ * min3() cut; fsck's dirent-block merge. So the clamp below is never
+ * reached -- were it reached, the blocks past it would be allocated and
+ * named by nothing, a leak the scrub reclaims, never a shared block. It
+ * is not silent in the kernel (BL-112). A new growing call needs the
+ * same check.
  */
 static inline __le32 cetrafs_extent_pack_len(u32 len, int uninit)
 {
