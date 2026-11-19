@@ -361,6 +361,15 @@ func runMaster(cfg masterConfig) (bool, error) {
 	switch cfg.scenario {
 	case "diag", "module-info":
 	default:
+		// A scenario that takes a node's device offline puts it back in
+		// a defer, which a master killed mid-scenario (a timeout, a ^C)
+		// never runs: the node stayed offline and every later run failed
+		// to mount. Every node's link is up before anything runs.
+		for _, c := range clients {
+			if resp, err := c.Call("link_up", nil); decodeResult(c.Name, resp, err, nil) != nil {
+				return false, fmt.Errorf("%s: link_up before the run failed -- its device is not usable", c.Name)
+			}
+		}
 		if err := requireSameModuleBuild(clients); err != nil {
 			if uerr := ensureUnmounted(clients); uerr != nil {
 				fmt.Printf("(cleanup) unmount: %v\n", uerr)
