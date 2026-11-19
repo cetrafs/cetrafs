@@ -9148,6 +9148,17 @@ void cetrafs_kill_sb(struct super_block *sb)
      * queued reconcile still pins, and that reconcile's iput() would
      * then evict it after put_super. */
     cetrafs_sb_cold_close(sb);
+    /* ...and the scrub, for the same reason: an inode it looked up when
+     * evict_inodes() passed is skipped, and its iput() evicts it later --
+     * with SB_ACTIVE gone, any inode, freeing a dead one's blocks -- while
+     * the unmount tears down under it (rule 20). Its stop in put_super
+     * came after evict_inodes(). */
+    if (sb->s_fs_info) {
+        struct cetrafs_sb_info *sbi = sb->s_fs_info;
+
+        cetrafs_scrub_stop(sbi->scrub);
+        sbi->scrub = NULL;
+    }
     /* kill_block_super() will invoke ->put_super() where we free sbi */
     kill_block_super(sb);
     pr_info("unmounted\n");

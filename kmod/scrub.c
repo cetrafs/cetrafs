@@ -1044,24 +1044,54 @@ MODULE_PARM_DESC(scrub_local_no_adopt, "TEST ONLY: skip a dead record this node 
  */
 static void scrub_adopt_local_death(struct super_block *sb, struct inode *local, u64 generation)
 {
-    cetrafs_inode_t now;
+    cetrafs_inode_t *now;
     int ret;
 
-    if (READ_ONCE(cetrafs_scrub_local_no_adopt) || !local->i_nlink ||
-        cetrafs_inode_get_generation(local) != generation || !inode_trylock(local))
+    if (READ_ONCE(cetrafs_scrub_local_no_adopt) || cetrafs_inode_get_generation(local) != generation)
         return;
+    /*
+     * Not under nofilelock. The eviction this hands the free to judges
+     * other users by read presence and the file lock; there an open
+     * writer publishes presence, but a path-based truncate or setxattr
+     * on a third node holds no open file and leaves no mark (audit
+     * F-42), and would have its blocks freed. Left cached, as before:
+     * not lost, only late -- once the object leaves the cache (memory
+     * pressure, the unmount) it is an orphan this walk reclaims. The
+     * same F-42 writer meets this node's own unlink the same way.
+     */
+    if (!cetrafs_sb_file_lock_enabled(sb))
+        return;
+    /* Adopted in an earlier cycle: only the prune is left. A dentry in
+     * use then (an open file, a working directory) kept it cached, and
+     * it is tried again on every cycle until the last one goes. */
+    if (!local->i_nlink)
+        goto prune;
+    now = kmalloc(sizeof(*now), GFP_NOFS); /* 652 bytes: not on the scrub's stack beside the walk's own */
+    if (!now)
+        return;
+    if (!inode_trylock(local)) {
+        kfree(now);
+        return; /* busy: the next cycle */
+    }
     cetrafs_invalidate_raw_inode(sb, local->i_ino);
-    ret = cetrafs_read_raw_inode(sb, local->i_ino, &now);
-    /* Adopted only on a read that says so; an error adopts nothing. */
-    if (!ret && local->i_nlink && cetrafs_le64(now.generation) == generation &&
-        cetrafs_le32(now.nlink) == 0 && ((local->i_mode ^ cetrafs_le32(now.mode)) & S_IFMT) == 0) {
+    ret = cetrafs_read_raw_inode(sb, local->i_ino, now);
+    /* Adopted only on a read that says so; an error adopts nothing. Not
+     * a free: a peer that opened the file since the caller's verdict is
+     * judged by the eviction, which re-reads presence and the lock
+     * fresh before its own free and frees nothing past one (-ETXTBSY,
+     * tests/kernel/evict_foreign_open.sh). */
+    if (!ret && local->i_nlink && cetrafs_le64(now->generation) == generation &&
+        cetrafs_le32(now->nlink) == 0 && ((local->i_mode ^ cetrafs_le32(now->mode)) & S_IFMT) == 0) {
         set_nlink(local, 0);
         pr_info("scrub: ino=%llu: deleted by another node while cached here -- its eviction frees it\n",
                 (unsigned long long) local->i_ino);
     }
     inode_unlock(local);
-    if (!local->i_nlink)
-        d_prune_aliases(local);
+    kfree(now);
+    if (local->i_nlink)
+        return;
+prune:
+    d_prune_aliases(local);
 }
 
 static void scrub_reclaim_orphan_inodes(struct cetrafs_scrub *s)
