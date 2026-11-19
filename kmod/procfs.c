@@ -473,6 +473,7 @@ static int cetrafs_proc_info_show(struct seq_file *m, void *v)
     seq_printf(m, "tree_cold_marks: %llu\n", cetrafs_tree_cold_mark_count());
     seq_printf(m, "smap_hits: %llu\n", cetrafs_smap_hit_count());
     seq_printf(m, "smap_builds: %llu\n", cetrafs_smap_build_count());
+    seq_printf(m, "tree_shared_skips: %llu\n", cetrafs_tree_shared_skip_count());
     /* The remembered-extent hit rate. Exposed because throughput alone
      * cannot tell a cache that works from one that silently never hits:
      * both look like SAN noise until the file is big enough. */

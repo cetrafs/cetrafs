@@ -9,7 +9,9 @@
  *
  * Writes, restamped and with valid tails:
  *   leaf_lba: a leaf of CETRAFS_EXT_BLOCK_MAX_LEAVES one-block extents,
- *             logical 0..n-1, every one at <phys>;
+ *             logical 0..n-1, every one at <phys> (TREE_SHARE_STRIDE=1:
+ *             extent i at logical 2i, physical <phys> + i -- n real,
+ *             separate extents);
  *   i1_lba:   an interior (depth 1) of CETRAFS_EXT_BLOCK_MAX_IDX entries,
  *             every one naming leaf_lba;
  *   i2_lba:   an interior (depth 2) of <k> entries, every one naming i1_lba;
@@ -79,7 +81,7 @@ static void put_index(uint64_t lba, unsigned depth, unsigned n, uint64_t child, 
 
 int main(int argc, char **argv)
 {
-    uint64_t ino, i2, i1, leaf, phys, k, n = CETRAFS_EXT_BLOCK_MAX_LEAVES, rec_lba;
+    uint64_t ino, i2, i1, leaf, phys, k, n = CETRAFS_EXT_BLOCK_MAX_LEAVES, span, rec_lba;
     uint8_t blk[CETRAFS_BLOCK_SIZE] = {0};
     cetrafs_extent_hdr_t *h = (cetrafs_extent_hdr_t *) blk;
     cetrafs_extent_t *ex = (cetrafs_extent_t *) (blk + sizeof(*h));
@@ -118,10 +120,11 @@ int main(int argc, char **argv)
     h->eh_max = cetrafs_cpu_to_le16((uint16_t) CETRAFS_EXT_BLOCK_MAX_LEAVES);
     h->eh_generation = cetrafs_cpu_to_le32(0x5a5a0001u);
     for (i = 0; i < n; i++)
-        cetrafs_ee_init(&ex[i], i, 1, 0, phys);
+        cetrafs_ee_init(&ex[i], getenv("TREE_SHARE_STRIDE") ? 2 * i : i, 1, 0, phys + (getenv("TREE_SHARE_STRIDE") ? i : 0));
     put_block(blk, leaf, CETRAFS_LEAF_TAIL_MAGIC);
-    put_index(i1, 1, CETRAFS_EXT_BLOCK_MAX_IDX, leaf, n, 0x5a5a0002u);
-    put_index(i2, 2, (unsigned) k, i1, n, 0x5a5a0003u);
+    span = getenv("TREE_SHARE_STRIDE") ? 2 * n : n;
+    put_index(i1, 1, CETRAFS_EXT_BLOCK_MAX_IDX, leaf, span, 0x5a5a0002u);
+    put_index(i2, 2, (unsigned) k, i1, span, 0x5a5a0003u);
 
     pread_all(&rec, sizeof(rec), (off_t) rec_lba * CETRAFS_BLOCK_SIZE);
     memset(&rec.et, 0, sizeof(rec.et));
@@ -129,7 +132,7 @@ int main(int argc, char **argv)
     rec.eh.eh_entries = cetrafs_cpu_to_le16(1);
     rec.eh.eh_max = cetrafs_cpu_to_le16(4);
     rec.eh.eh_depth = cetrafs_cpu_to_le16(3);
-    cetrafs_ei_set_range(&rec.et.idx[0], 0, n);
+    cetrafs_ei_set_range(&rec.et.idx[0], 0, span);
     cetrafs_ei_set_child(&rec.et.idx[0], i2);
     cetrafs_inode_stamp_crcs_us(&rec);
     pwrite_all(&rec, sizeof(rec), (off_t) rec_lba * CETRAFS_BLOCK_SIZE);

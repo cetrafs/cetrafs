@@ -832,7 +832,9 @@ struct cetrafs_tw {
     void *ctx;
     bool unknown;            /* out: an unreadable subtree was skipped */
     u64 nodes;               /* out: external blocks walked */
+    struct xarray *seen;     /* the walk's own: blocks already walked */
 };
+u64 cetrafs_tree_shared_skip_count(void);
 
 int cetrafs_tree_walk(struct cetrafs_tw *w, const cetrafs_inode_t *raw);
 

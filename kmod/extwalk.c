@@ -196,6 +196,14 @@ static void cetrafs_tw_read(struct cetrafs_tw *w, const sector_t *lbas, u32 n, i
 
 /* --- the walk ------------------------------------------------------------- */
 
+/* Tree blocks a walk met a second time and did not walk again (procfs). */
+static atomic64_t cetrafs_tree_shared_skips = ATOMIC64_INIT(0);
+
+u64 cetrafs_tree_shared_skip_count(void)
+{
+    return (u64) atomic64_read(&cetrafs_tree_shared_skips);
+}
+
 /* TEST ONLY, the scrub walk's knobs (tests/kernel/scrub_walk_torn.sh): a
  * pause between a leaf's read and the walk's buffer lock -- the window an
  * in-place edit has to start in -- and the control that walks leaves with
@@ -312,6 +320,28 @@ static int cetrafs_tw_index(struct cetrafs_tw *w, struct cetrafs_tw_chunk *lv, s
         if (ret)
             return ret; /* stopped while choosing: nothing was read */
 
+        /* A block this walk has already been through is not walked again
+         * (cetrafs_tree_walk()). */
+        if (w->seen) {
+            u32 kept = 0;
+
+            for (i = 0; i < k; i++) {
+                int e = xa_insert(w->seen, (unsigned long) c->lba[i], xa_mk_value(1), GFP_NOFS);
+
+                if (e == -EBUSY) {
+                    atomic64_inc(&cetrafs_tree_shared_skips);
+                    pr_warn_ratelimited("extent tree of ino=%llu names block %llu twice -- walking it once (fsck if "
+                                        "it persists)\n",
+                                        w->inode ? (unsigned long long) w->inode->i_ino : 0ULL,
+                                        (unsigned long long) c->lba[i]);
+                    continue;
+                }
+                c->ent[kept] = c->ent[i];
+                c->lba[kept++] = c->lba[i];
+            }
+            k = kept;
+        }
+
         /* Outside every lock: the per-child hook, which may act on the
          * child or answer for it without a read. A child it answers for
          * is dropped from the read below. */
@@ -363,6 +393,11 @@ static int cetrafs_tw_index(struct cetrafs_tw *w, struct cetrafs_tw_chunk *lv, s
     }
 }
 
+/* TEST ONLY: the control of tests/kernel/tree_shared_child.sh. */
+static bool cetrafs_tree_walk_no_dedup;
+cetrafs_test_param(tree_walk_no_dedup, cetrafs_tree_walk_no_dedup, bool, 0644);
+MODULE_PARM_DESC(tree_walk_no_dedup, "TEST ONLY: a tree walk walks a block its tree names twice once per name");
+
 /*
  * Walk 'raw's extent tree. Returns 0 when the walk ran to the end,
  * CETRAFS_TW_STOP when a hook stopped it, or a negative errno: the first
@@ -375,12 +410,14 @@ int cetrafs_tree_walk(struct cetrafs_tw *w, const cetrafs_inode_t *raw)
 {
     struct cetrafs_tw_chunk lv[CETRAFS_EXT_MAX_DEPTH];
     struct cetrafs_tw_small small[CETRAFS_EXT_MAX_DEPTH];
+    struct xarray seen;
     void *scratch = NULL;
     u16 depth;
     int i, ret;
 
     w->unknown = false;
     w->nodes = 0;
+    w->seen = NULL;
     if (!w->sb)
         w->sb = w->inode->i_sb;
     if (cetrafs_le16(raw->eh.eh_magic) != CETRAFS_EXT_MAGIC)
@@ -424,8 +461,27 @@ int cetrafs_tree_walk(struct cetrafs_tw *w, const cetrafs_inode_t *raw)
             lv[i].bh = small[i].bh;
         }
     }
+    /*
+     * Every block once. No healthy tree names a block twice, but nothing
+     * on the disk stops one from doing it, and interiors that share their
+     * children let three blocks describe the format's whole 65.5M extents
+     * -- every walk then did 65.5M extents' work, and a flatten copied
+     * them (audit 2026-11-15 F-62). Skipped, not refused: a walk is not a
+     * snapshot, and one that crosses a writer moving entries between two
+     * nodes can meet a block twice for a moment. Walking it once is the
+     * right answer for every walk -- a set of blocks to keep, to free or to
+     * report never wants a member twice. Depth 1 has one child.
+     */
+    if (depth >= 2 && !READ_ONCE(cetrafs_tree_walk_no_dedup)) {
+        xa_init(&seen);
+        w->seen = &seen;
+    }
     ret = cetrafs_tw_index(w, lv, NULL, raw->et.idx, min_t(u32, cetrafs_le16(raw->eh.eh_entries), ARRAY_SIZE(raw->et.idx)),
                            depth);
+    if (w->seen) {
+        xa_destroy(&seen);
+        w->seen = NULL;
+    }
     kvfree(scratch);
     return ret;
 }
