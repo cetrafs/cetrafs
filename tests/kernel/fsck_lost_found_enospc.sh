@@ -20,7 +20,8 @@
 #
 # Discrimination: with the unwind removed from fsck_lost_found(), the
 # follow-up run reports a fault the pre-repair run did not, and the
-# "nothing new" assertions below fail.
+# "nothing new" assertions below fail. For the failed link,
+# CETRAFS_FSCK_LF_UNDO_OFF leaves it all behind, in the suite.
 set -euo pipefail
 . "$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)/lib/harness.sh"
 require_root
@@ -76,6 +77,32 @@ AFTER_ORPHANS="$(echo "$AFTER" | grep -c "NO directory entry names it" || true)"
     pass "no resurrected inode either ($AFTER_ORPHANS orphan(s) after, $BEFORE_ORPHANS before)" ||
     fail "the failed creation ADDED an orphan ($BEFORE_ORPHANS -> $AFTER_ORPHANS):
 $(echo "$AFTER" | grep 'NO directory entry')"
+
+# The same for a lost+found that was built but could not be linked into
+# the root (audit 2026-11-15 BL-116): it held an inode, a live record
+# and a block that nothing named, so every later run found one more
+# directory no name reaches. Its control runs on a copy of the image.
+log "repair attempt with the link into the root forced to fail"
+COPY="$(ct_image 560 lfnospc-copy)"
+blockdev --flushbufs "$DEV"
+cp --sparse=always "$IMG" "$COPY"
+CDEV="$(ct_loop "$COPY")"
+REP="$(CETRAFS_FSCK_LF_NO_LINK=1 ct_fsck_repair "$DEV" 2>&1 || true)"
+echo "$REP" | grep -q "could not add /lost+found to the root directory" &&
+    pass "the link of the new /lost+found failed as forced" ||
+    fail "expected 'could not add /lost+found':
+$REP"
+AFTER="$(ct_fsck "$DEV" 2>&1 || true)"
+AFTER_ORPHANS="$(echo "$AFTER" | grep -c "NO directory entry names it" || true)"
+[ "$AFTER_ORPHANS" -le "$BEFORE_ORPHANS" ] && ! echo "$AFTER" | grep -qi "leak" &&
+    pass "the unlinked /lost+found gave back its inode and its block ($AFTER_ORPHANS orphan(s), no leak)" ||
+    fail "the failed link left something behind ($BEFORE_ORPHANS -> $AFTER_ORPHANS orphans):
+$(echo "$AFTER" | grep -iE 'NO directory entry|leak')"
+REP="$(CETRAFS_FSCK_LF_NO_LINK=1 CETRAFS_FSCK_LF_UNDO_OFF=1 ct_fsck_repair "$CDEV" 2>&1 || true)"
+CAFTER="$(ct_fsck "$CDEV" 2>&1 || true)"
+[ "$(echo "$CAFTER" | grep -c "NO directory entry names it" || true)" -gt "$BEFORE_ORPHANS" ] &&
+    pass "control: without the undo, the unlinked /lost+found is left as one more orphan" ||
+    fail "control: nothing was left behind without the undo -- the assertion above proves nothing"
 
 log "control: with the knob off, the same repair succeeds"
 REP2="$(ct_fsck_repair "$DEV" 2>&1 || true)"

@@ -2170,7 +2170,7 @@ static uint64_t fsck_lost_found(int fd,
                                 struct fsck_lf *lf)
 {
     cetrafs_inode_t root, nd;
-    uint8_t blk[CETRAFS_BLOCK_SIZE];
+    uint8_t blk[CETRAFS_BLOCK_SIZE], was[CETRAFS_BLOCK_SIZE];
     uint64_t lba = 0, ino = 0;
     uint32_t nblocks = 0;
 
@@ -2290,11 +2290,30 @@ static uint64_t fsck_lost_found(int fd,
     cetrafs_ee_set_lblk(&nd.et.leaf[0], 0);
     cetrafs_ee_set_len(&nd.et.leaf[0], 1, 0);
     cetrafs_ee_set_pblk(&nd.et.leaf[0], lba);
+    pread_all(fd, was, sizeof(was), fsck_ino_off(ino)); /* the slot as it was, for the undo below */
     fsck_write_inode(fd, ino, &nd);
 
-    if (fsck_dir_link(fd, sb, bg_count, bg_data_start, bg_data_cnt, bg_bmap_lba, lf->root_ino, "lost+found", ino,
+    if (cetrafs_test_env("CETRAFS_FSCK_LF_NO_LINK") ||
+        fsck_dir_link(fd, sb, bg_count, bg_data_start, bg_data_cnt, bg_bmap_lba, lf->root_ino, "lost+found", ino,
                       CETRAFS_FT_DIR)) {
         fprintf(stderr, "ERR: could not add /lost+found to the root directory\n");
+        /*
+         * Nothing names it: give back what it took, or every later run
+         * finds an allocated directory no name reaches, and its own
+         * attempt to make /lost+found takes another (audit 2026-11-15
+         * BL-116). In the order nothing still refers to what goes: the
+         * slot back as it was -- it no longer names the block -- then
+         * the block, then the number. Each write is synced
+         * (pwrite_all()): stopped between, a block or a number is
+         * left allocated with nothing naming it, never freed while
+         * named.
+         */
+        if (!cetrafs_test_env("CETRAFS_FSCK_LF_UNDO_OFF")) {
+            pwrite_all(fd, was, sizeof(was), fsck_ino_off(ino));
+            fsck_unalloc_block(fd, bg_count, bg_data_start, bg_data_cnt, bg_bmap_lba, lba);
+            ibmap[(ino - 1) / 8] &= (uint8_t) ~(1u << ((ino - 1) % 8));
+            fsck_ibmap_store_block(fd, ibmap, ino);
+        }
         return 0;
     }
     printf("  created /lost+found (inode %" PRIu64 ")\n", ino);
