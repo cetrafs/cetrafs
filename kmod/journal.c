@@ -2444,6 +2444,12 @@ static bool cetrafs_journal_owner_fail_open;
 cetrafs_test_param(journal_owner_fail_open, cetrafs_journal_owner_fail_open, bool, 0644);
 MODULE_PARM_DESC(journal_owner_fail_open, "TEST ONLY: judge an unreadable owner by the guard alone (the old behaviour)");
 
+/* TEST ONLY: a dead owner (nlink 0) still owns the blocks it names, as
+ * before (tests/kernel/journal_replay_owner_dead.sh's control). */
+static bool cetrafs_journal_owner_dead_ok;
+cetrafs_test_param(journal_owner_dead_ok, cetrafs_journal_owner_dead_ok, bool, 0644);
+MODULE_PARM_DESC(journal_owner_dead_ok, "TEST ONLY: a replay entry's dead owner (nlink 0) still owns its blocks");
+
 static int cetrafs_journal_owner_holds(struct super_block *sb, const struct cetrafs_journal_replay_entry *e,
                                        bool *is_dir)
 {
@@ -2480,6 +2486,18 @@ static int cetrafs_journal_owner_holds(struct super_block *sb, const struct cetr
     *is_dir = S_ISDIR(cetrafs_le32(raw.mode));
     if (cetrafs_le64(raw.generation) != e->owner_generation)
         return 0; /* the number belongs to another file now */
+    /* A dead record still names its tree and xattr block until the free
+     * that claimed it forgets them -- and evict frees the blocks FIRST
+     * (the block scrub must see them referenced until each free lands),
+     * so for that whole span the record names blocks the allocator may
+     * already have handed to another file. nlink 0 on the device is the
+     * claim's own precondition: nothing frees a record that reads alive,
+     * and no name reaches a dead one again. A file unlinked while a live
+     * peer holds it open is therefore not repaired: a torn block reads
+     * as damage to that peer, the deleted file's last reader (audit
+     * 2026-11-15 BL-62). */
+    if (!cetrafs_le32(raw.nlink) && !READ_ONCE(cetrafs_journal_owner_dead_ok))
+        return 0;
     ret = cetrafs_raw_inode_holds_meta_block(sb, &raw, e->target_lba, &held);
     if (ret)
         return -EIO;
