@@ -200,22 +200,53 @@ static u32 cetrafs_journal_header_crc(const void *raw)
     return ~crc;
 }
 
+/* TEST ONLY: a flag state no writer stamps, or a magic that is neither
+ * zero nor ours, reads CLEAN again (the verdict before audit BL-40). */
+static bool cetrafs_journal_flag_damage_clean;
+cetrafs_test_param(journal_flag_damage_clean, cetrafs_journal_flag_damage_clean, bool, 0644);
+MODULE_PARM_DESC(journal_flag_damage_clean, "TEST ONLY: a damaged journal flag block reads CLEAN");
+
+/* Does this flag block send a replay to the area? Only CLEAN lets one
+ * skip it. A state no writer stamps is damage, and damage is DIRTY:
+ * replay judges every entry against its target, so a needless replay
+ * redoes nothing, while a skipped one leaves a torn block unrepaired --
+ * and attach then retires the very entry that would have repaired it
+ * (audit 2026-11-15 BL-40). A zero magic is a block never written (a
+ * fresh mkfs; the write path flips it DIRTY durably before its first
+ * entry). */
+static bool cetrafs_journal_hdr_dirty(const cetrafs_node_journal_hdr_t *hdr)
+{
+    if (cetrafs_le32(hdr->magic) != CETRAFS_NODE_JOURNAL_MAGIC)
+        return false;
+    if (READ_ONCE(cetrafs_journal_flag_damage_clean))
+        return cetrafs_le32(hdr->state) == CETRAFS_NODE_JOURNAL_DIRTY;
+    return cetrafs_le32(hdr->state) != CETRAFS_NODE_JOURNAL_CLEAN;
+}
+
 /* Read a node's flag block (always uncached -- another node may have
- * replayed/cleaned it) and report whether it says DIRTY. */
+ * replayed/cleaned it) and report whether it says DIRTY. A magic that is
+ * neither zero nor ours is not a flag block, and nothing can be read
+ * from it, clean least of all: -EUCLEAN, which every caller takes as
+ * "keep off this node" (no replay, no reclaim, no open past it). */
 static int cetrafs_journal_read_flag_seq(struct super_block *sb, u64 area_start, bool *out_dirty, u64 *out_seq)
 {
     struct buffer_head *bh = cetrafs_bread_uncached_retry(sb, area_start);
     const cetrafs_node_journal_hdr_t *hdr;
+    u32 magic;
 
     if (!bh)
         return -EIO;
 
     hdr = (const cetrafs_node_journal_hdr_t *) bh->b_data;
-    /* A fresh zero-filled block (magic 0) reads as CLEAN -- correct for
-     * a fresh mkfs, and safe afterward because the write path durably
-     * flips this to DIRTY before committing its first entry. */
-    *out_dirty = (cetrafs_le32(hdr->magic) == CETRAFS_NODE_JOURNAL_MAGIC &&
-                  cetrafs_le32(hdr->state) == CETRAFS_NODE_JOURNAL_DIRTY);
+    magic = cetrafs_le32(hdr->magic);
+    if (magic && magic != CETRAFS_NODE_JOURNAL_MAGIC && !READ_ONCE(cetrafs_journal_flag_damage_clean)) {
+        brelse(bh);
+        pr_err_ratelimited("journal: the flag block at %llu has bad magic 0x%08x -- not a journal area; "
+                           "run fsck\n",
+                           (unsigned long long) area_start, magic);
+        return -EUCLEAN;
+    }
+    *out_dirty = cetrafs_journal_hdr_dirty(hdr);
     if (out_seq)
         *out_seq = cetrafs_le32(hdr->magic) == CETRAFS_NODE_JOURNAL_MAGIC ? cetrafs_le64(hdr->park_seq) : 0;
     brelse(bh);
@@ -314,7 +345,7 @@ static int cetrafs_journal_fence_park_mutate(void *image, unsigned int len, void
     ctx->parked = false;
     if (!magic && cetrafs_le32(hdr->magic) != 0)
         return -EUCLEAN;
-    if (magic && cetrafs_le32(hdr->state) == CETRAFS_NODE_JOURNAL_DIRTY)
+    if (cetrafs_journal_hdr_dirty(hdr))
         return 1; /* the replay parks it */
     if (!magic) {
         memset(hdr, 0, len < sizeof(*hdr) ? len : sizeof(*hdr));
@@ -398,7 +429,7 @@ static int cetrafs_journal_claim_mutate(void *image, unsigned int len, void *pri
         return 0;
     }
 
-    if (cetrafs_le32(hdr->state) != CETRAFS_NODE_JOURNAL_DIRTY)
+    if (!cetrafs_journal_hdr_dirty(hdr))
         return -EEXIST; /* someone replayed it out from under us */
 
     if (cetrafs_le32(hdr->replay_owner) != CETRAFS_NODE_ID_NONE && cetrafs_le32(hdr->replay_owner) != ctx->my_node_id &&

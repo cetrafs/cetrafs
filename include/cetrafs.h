@@ -570,7 +570,8 @@ static inline int cetrafs_pf_slot_is_entry(u64 slot)
 
 typedef struct {
     __le32 magic; /* CETRAFS_NODE_JOURNAL_MAGIC */
-    __le32 state; /* CETRAFS_NODE_JOURNAL_CLEAN / _DIRTY */
+    __le32 state; /* CETRAFS_NODE_JOURNAL_CLEAN / _DIRTY; any other value
+                   * is damage and reads DIRTY (audit BL-40) */
 
     /* Which node is replaying this area right now, or
      * CETRAFS_NODE_ID_NONE. Replaying a dead node's journal used to be

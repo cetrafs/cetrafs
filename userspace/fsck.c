@@ -2916,6 +2916,7 @@ static void fsck_discard_journal(int fd, const cetrafs_superblock_t *sb, uint32_
     uint64_t area, slots, dropped = 0;
     uint8_t blk[CETRAFS_BLOCK_SIZE];
     cetrafs_node_journal_hdr_t flag;
+    int bad_magic;
 
     if (!jb) {
         fprintf(stderr, "ERR: --discard-journal: this volume has no journal (mkfs -J 0)\n");
@@ -2930,9 +2931,19 @@ static void fsck_discard_journal(int fd, const cetrafs_superblock_t *sb, uint32_
     slots = (jb - 1) / CETRAFS_JOURNAL_SLOT_BLOCKS;
     pread_all(fd, blk, sizeof(blk), (off_t) area * CETRAFS_BLOCK_SIZE);
     memcpy(&flag, blk, sizeof(flag));
-    if (cetrafs_le32(flag.magic) != CETRAFS_NODE_JOURNAL_MAGIC || cetrafs_le32(flag.state) != CETRAFS_NODE_JOURNAL_DIRTY) {
+    /* Damage is DIRTY (the kernel's verdict, audit BL-40): a state no
+     * writer stamps is discarded like DIRTY, and a magic that is neither
+     * zero nor ours is rewritten as a flag block, parked past every
+     * entry it held. */
+    bad_magic = cetrafs_le32(flag.magic) != 0 && cetrafs_le32(flag.magic) != CETRAFS_NODE_JOURNAL_MAGIC;
+    if (!bad_magic &&
+        (cetrafs_le32(flag.magic) != CETRAFS_NODE_JOURNAL_MAGIC || cetrafs_le32(flag.state) == CETRAFS_NODE_JOURNAL_CLEAN)) {
         printf("  node %u journal is not DIRTY -- nothing to discard\n", n);
         return;
+    }
+    if (bad_magic) {
+        memset(&flag, 0, sizeof(flag));
+        flag.magic = cetrafs_cpu_to_le32(CETRAFS_NODE_JOURNAL_MAGIC);
     }
     for (uint64_t sl = 0; sl < slots; ++sl) {
         uint64_t hlba = area + 1 + sl * CETRAFS_JOURNAL_SLOT_BLOCKS;
@@ -2942,6 +2953,8 @@ static void fsck_discard_journal(int fd, const cetrafs_superblock_t *sb, uint32_
         memcpy(&hdr, blk, sizeof(hdr));
         if (cetrafs_le32(hdr.magic) != CETRAFS_JOURNAL_MAGIC)
             continue;
+        if (bad_magic && cetrafs_le64(hdr.park_seq) > cetrafs_le64(flag.park_seq))
+            flag.park_seq = hdr.park_seq;
         printf("  node %u journal slot %" PRIu64 ": txn %" PRIu64 " for block %" PRIu64 " discarded unapplied\n", n, sl,
                (uint64_t) cetrafs_le64(hdr.txn_id), (uint64_t) cetrafs_le64(hdr.target_lba));
         memset(blk, 0, sizeof(blk));
@@ -4486,10 +4499,13 @@ int main(int argc, char **argv)
             if (!cetrafs_le32(sb.node_journal_blocks))
                 break;
             pread_all(fd, &flag, sizeof(flag), (off_t) area * CETRAFS_BLOCK_SIZE);
-            if (cetrafs_le32(flag.magic) != CETRAFS_NODE_JOURNAL_MAGIC)
+            if (cetrafs_le32(flag.magic) != CETRAFS_NODE_JOURNAL_MAGIC) {
+                if (cetrafs_le32(flag.magic))
+                    node_ref[n] = 1; /* damaged: the kernel keeps off it (BL-40) */
                 continue;
-            if (cetrafs_le32(flag.state) == CETRAFS_NODE_JOURNAL_DIRTY)
-                node_ref[n] = 1;
+            }
+            if (cetrafs_le32(flag.state) != CETRAFS_NODE_JOURNAL_CLEAN)
+                node_ref[n] = 1; /* DIRTY, or damage the kernel reads as DIRTY */
             /* A replay claim names its REPLAYER's row, on another
              * node's area: a new node on that row would read as a live
              * replayer mid-replay, and the area's owner would wait on a
@@ -4592,6 +4608,16 @@ int main(int argc, char **argv)
                  * sitting where replay decides whether to scan. */
                 if (cetrafs_le32(flag.magic) != 0 && cetrafs_le32(flag.magic) != CETRAFS_NODE_JOURNAL_MAGIC) {
                     fprintf(stderr, "ERR: node %u journal flag block has bad magic 0x%08X\n", n, (uint32_t) cetrafs_le32(flag.magic));
+                    cl_problems++;
+                } else if (cetrafs_le32(flag.magic) == CETRAFS_NODE_JOURNAL_MAGIC &&
+                           cetrafs_le32(flag.state) != CETRAFS_NODE_JOURNAL_CLEAN &&
+                           cetrafs_le32(flag.state) != CETRAFS_NODE_JOURNAL_DIRTY) {
+                    /* Damage: the kernel reads it DIRTY and replays the
+                     * area, which parks it CLEAN (audit BL-40). */
+                    fprintf(stderr,
+                            "ERR: node %u journal flag block has state %u, neither CLEAN nor DIRTY -- "
+                            "a mount replays the area as DIRTY\n",
+                            n, (uint32_t) cetrafs_le32(flag.state));
                     cl_problems++;
                 } else if (cetrafs_le32(flag.magic) == CETRAFS_NODE_JOURNAL_MAGIC && cetrafs_le32(flag.state) == CETRAFS_NODE_JOURNAL_DIRTY) {
                     fprintf(stderr,

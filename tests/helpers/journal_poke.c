@@ -57,6 +57,10 @@
  * from its record), and JOURNAL_POKE_OWNER_GEN=<n> overrides the
  * generation.
  *
+ * JOURNAL_POKE_STATE=<n> writes the flag's state as <n> (a damaged
+ * value), and JOURNAL_POKE_FLAG_MAGIC=<n> its magic, instead of DIRTY
+ * and the format's magic.
+ *
  * JOURNAL_POKE_PREV_FROM=<file> guards the entry against the image in
  * <file> instead of the target's current one: the second of two entries
  * for one block, written against what the first puts there.
@@ -353,8 +357,12 @@ int main(int argc, char **argv)
      * fast path would skip this area entirely. */
     cetrafs_node_journal_hdr_t flag;
     memset(&flag, 0, sizeof(flag));
-    flag.magic = cetrafs_cpu_to_le32(CETRAFS_NODE_JOURNAL_MAGIC);
-    flag.state = cetrafs_cpu_to_le32(CETRAFS_NODE_JOURNAL_DIRTY);
+    flag.magic = cetrafs_cpu_to_le32(getenv("JOURNAL_POKE_FLAG_MAGIC")
+                                          ? (uint32_t) strtoul(getenv("JOURNAL_POKE_FLAG_MAGIC"), NULL, 0)
+                                          : CETRAFS_NODE_JOURNAL_MAGIC);
+    flag.state = cetrafs_cpu_to_le32(getenv("JOURNAL_POKE_STATE")
+                                          ? (uint32_t) strtoul(getenv("JOURNAL_POKE_STATE"), NULL, 0)
+                                          : CETRAFS_NODE_JOURNAL_DIRTY);
     flag.park_seq = cetrafs_cpu_to_le64(park);
     pwrite_all(fd, &flag, sizeof(flag), (off_t) area_start * CETRAFS_BLOCK_SIZE);
 

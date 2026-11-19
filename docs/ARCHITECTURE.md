@@ -265,7 +265,9 @@ decides whether *another* node's row still counts as a live claim.
 
 Each Node Registry row owns a private journal slice at
 `node_journal_start + node_id * node_journal_blocks`: one
-`cetrafs_node_journal_hdr_t` flag block (its `state` is CLEAN/DIRTY, and
+`cetrafs_node_journal_hdr_t` flag block (its `state` is CLEAN/DIRTY -- any
+other value is damage and reads DIRTY, and a magic neither zero nor the
+format's is refused, never read as CLEAN --, and
 `replay_owner` is CAS-claimed so exactly one node replays a dead peer's area,
 and `replay_incarnation` names the claimant's incarnation: a stale replayer's
 claim is taken only while it is the incarnation judged; `park_seq` counts the
