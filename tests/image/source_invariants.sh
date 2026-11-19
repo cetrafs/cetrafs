@@ -3284,4 +3284,34 @@ TK_N="$(tk_unlocked "$TK_P" | grep -vxF -f <(tr ' ' '\n' <<<"$TK_PROD" | grep .)
     fail "F-53: control -- planted tree gave: $TK_N"
 rm -rf "$TK_P"
 
+# The first COMPAT feature (section 17 C): a module that does not know a
+# COMPAT bit mounts read-write, so its scrub and allocator run over the
+# volume. A COMPAT structure must keep its blocks set in the bitmaps and
+# in the scrub's reference set (cetrafs.h's feature rules) -- so every
+# COMPAT bit defined is named in scrub.c, where that reference set is
+# built, or it is not a COMPAT feature. A new bit fails until it is.
+compat_unseen() { # <header> <scrub.c>
+    python3 - "$1" "$2" <<'PY'
+import re, sys
+hdr = open(sys.argv[1]).read()
+scrub = open(sys.argv[2]).read()
+for name in re.findall(r'^#define\s+(CETRAFS_FEAT_COMPAT_\w+)', hdr, re.M):
+    if name.endswith(('_NONE', '_SUPP')):
+        continue
+    if not re.search(r'\b' + name + r'\b', scrub):
+        print(name)
+PY
+}
+CU="$(compat_unseen "$ROOT/include/cetrafs.h" "$ROOT/kmod/scrub.c" | tr '\n' ' ')"
+[ -z "$CU" ] && pass "COMPAT: every COMPAT feature bit is named where the scrub builds its reference set" ||
+    fail "COMPAT: bits the scrub's reference set never names (make them RO_COMPAT, or count their blocks): $CU"
+CU_P="$(mktemp -d)"
+printf '#define CETRAFS_FEAT_COMPAT_NONE 0ULL\n#define CETRAFS_FEAT_COMPAT_SEEN (1ULL << 0)\n#define CETRAFS_FEAT_COMPAT_HIDDEN (1ULL << 1)\n#define CETRAFS_FEAT_COMPAT_SUPP 0ULL\n' >"$CU_P/h"
+printf '/* CETRAFS_FEAT_COMPAT_SEEN: its blocks join the reference set */\n' >"$CU_P/s.c"
+CU_N="$(compat_unseen "$CU_P/h" "$CU_P/s.c" | tr '\n' ' ')"
+[ "$CU_N" = "CETRAFS_FEAT_COMPAT_HIDDEN " ] &&
+    pass "COMPAT: control -- a bit the scrub never names is found, a named one and NONE/SUPP are not" ||
+    fail "COMPAT: control -- planted tree gave: $CU_N"
+rm -rf "$CU_P"
+
 ct_exit
