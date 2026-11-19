@@ -6864,7 +6864,7 @@ static int __cetrafs_get_block(struct inode *inode,
 
     /*
      * A DIRECTORY has no exclusive write lock -- any node may be
-     * mutating it right now -- and cetrafs_write_raw_inode() is a blind
+     * mutating it right now -- and __cetrafs_write_raw_inode() is a blind
      * full-record write, so growing a directory from a stale cached
      * record silently REVERTS whatever a peer just changed in it: size,
      * mtime, nlink, and dirent_seq. Reverting dirent_seq is the
@@ -6929,7 +6929,7 @@ relookup:
      * that no longer exists: a peer may have deleted it and reused the
      * inode NUMBER for something else. Mapping blocks from that record
      * sends this file's I/O to another file's extents, and the blind
-     * cetrafs_write_raw_inode() further down would then publish the
+     * __cetrafs_write_raw_inode() further down would then publish the
      * dead file's tree. That is silent data corruption, not staleness.
      *
      * Costs one 64-bit compare and no I/O -- the record is already in

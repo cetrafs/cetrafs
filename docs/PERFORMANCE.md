@@ -106,7 +106,7 @@ every BG ever touched makes it quadratic over a long write.
 `cetrafs_bitmap_alloc_bit()` keeps `sync=false`; the BG is marked in
 `bmap_alloc_dirty` (per-BG state in `struct cetrafs_bg_chunk`) and `cetrafs_alloc_flush_bitmaps()` writes those
 bitmap blocks at the same durability boundaries as invariant 4 (close,
-fsync, sync_fs, and `cetrafs_write_raw_inode(sync=true)`). One bitmap
+fsync, sync_fs, and the whole-record write (`__cetrafs_write_raw_inode()`)). One bitmap
 write per BG allocated from since the last boundary, NOT one per block —
 the per-block version is the same ~2 s → ~40 s regression invariant 4
 describes, for the same reason.

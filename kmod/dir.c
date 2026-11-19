@@ -2287,10 +2287,10 @@ static int cetrafs_create_locked(struct mnt_idmap *idmap,
     raw.eh.eh_max = cetrafs_cpu_to_le16(ARRAY_SIZE(raw.et.leaf));
     /* eh_entries = 0, eh_depth = 0: a fresh file has no data blocks yet */
 
-    /* See inode.c's cetrafs_write_raw_inode() comment: a freshly
-     * allocated inode's first write must force a fresh read of its home
-     * block itself, since a peer could have allocated an adjacent inode
-     * number landing in the same shared block moments ago. */
+    /* This node's copy of the number's previous life goes first. (It
+     * once guarded a neighbour's record sharing the block; one record
+     * per block since v0x0007, and the write below replaces the whole
+     * block, so nothing of a cached copy reaches the device.) */
     cetrafs_invalidate_raw_inode(sb, ino);
     ret = cetrafs_write_raw_inode_new(sb, ino, &raw);
     if (ret) {
@@ -3083,8 +3083,7 @@ static struct dentry *cetrafs_mkdir_locked(struct mnt_idmap *idmap,
     cetrafs_ee_set_len(&raw.et.leaf[0], 1, 0);
     cetrafs_ee_set_pblk(&raw.et.leaf[0], lba);
 
-    /* See inode.c's cetrafs_write_raw_inode() comment and cetrafs_
-     * create_locked() above -- same freshly-allocated-inode race. */
+    /* As cetrafs_create_locked(): the previous life's copy goes first. */
     cetrafs_invalidate_raw_inode(sb, ino);
     ret = cetrafs_write_raw_inode_new(sb, ino, &raw);
     if (ret) {
@@ -4606,8 +4605,7 @@ static int cetrafs_symlink_locked(struct mnt_idmap *idmap,
     raw.eh.eh_magic = cetrafs_cpu_to_le16(CETRAFS_EXT_MAGIC);
     raw.eh.eh_max = cetrafs_cpu_to_le16(ARRAY_SIZE(raw.et.leaf));
 
-    /* See inode.c's cetrafs_write_raw_inode() comment and cetrafs_
-     * create_locked() above -- same freshly-allocated-inode race. */
+    /* As cetrafs_create_locked(): the previous life's copy goes first. */
     cetrafs_invalidate_raw_inode(sb, ino);
     ret = cetrafs_write_raw_inode_new(sb, ino, &raw);
     if (ret) {

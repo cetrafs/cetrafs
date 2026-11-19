@@ -370,7 +370,7 @@ static int fsck_half_born(const cetrafs_inode_t *in, uint64_t ino)
 
 /* Both sectors valid and naming this number, but on different
  * generations: a whole-record write stopped between its sectors. Only a
- * create writes a new generation (cetrafs_write_raw_inode() from
+ * create writes a new generation (__cetrafs_write_raw_inode() from
  * create, mkdir and symlink), synced before the dirent that names it,
  * so the record is a create that never finished: unnamed, owning
  * nothing the generation it was meant to start. Its file sector may

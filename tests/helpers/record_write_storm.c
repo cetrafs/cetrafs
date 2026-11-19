@@ -4,7 +4,7 @@
  * writes against concurrent forced-fresh reads of the same records.
  *
  * Every chmod() rewrites the file's on-disk inode record through
- * cetrafs_write_raw_inode(); every open() of a file drives lock.c's
+ * __cetrafs_write_raw_inode(); every open() of a file drives lock.c's
  * invalidate-then-read of ITS record, which is a forced-fresh read. Run
  * both at once across many files and the two collide on the buffer
  * cache.

@@ -4322,7 +4322,7 @@ static void __cetrafs_lock_release(struct inode *inode, const struct cetrafs_clo
          * before releasing the cross-node lock. Needed now that
          * file.c's cetrafs_get_block() no longer syncs its per-block
          * inode update on every allocation (see
-         * inode.c's cetrafs_write_raw_inode() comment) -- the actual
+         * inode.c's __cetrafs_write_raw_inode() comment) -- the actual
          * file *data* was already only ever written back
          * asynchronously, so without this, a different node opening
          * this file the instant after this close() releases the lock

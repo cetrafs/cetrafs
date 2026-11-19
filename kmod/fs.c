@@ -5875,7 +5875,7 @@ void cetrafs_shadow_clear(struct super_block *sb, u64 lba, u64 count, const char
 /*
  * Held across the no-CAW fallback's read-decide-write
  * (cetrafs_cas_region_seeded_impl()) and across a raw inode record write
- * on a no-CAW device (cetrafs_write_raw_inode(), which must not land
+ * on a no-CAW device (__cetrafs_write_raw_inode(), which must not land
  * between a CAS's read and its write). A leaf lock: no CAS mutator and
  * nothing inside the record write acquires anything.
  *

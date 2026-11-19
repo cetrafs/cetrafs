@@ -671,7 +671,7 @@ void cetrafs_invalidate_raw_inode(struct super_block *sb, u64 ino)
  * COMPARE-AND-SWAP (so concurrent claims, presence bits and nlink deltas
  * compose), and its file sector changes only through the fd publish
  * below (so the file hot path can never take the namespace sector
- * backwards). cetrafs_write_raw_inode() -- the whole-record buffered
+ * backwards). __cetrafs_write_raw_inode() -- the whole-record buffered
  * write -- remains for records whose writer is entitled to all of them:
  * a just-allocated number (create/mkdir/symlink and their unwinds),
  * offline tools, and a directory record that rename() rewrites ('..',
@@ -758,7 +758,7 @@ int cetrafs_inode_ns_cas(struct super_block *sb,
     if (cetrafs_sb_is_fenced(sb))
         return -EIO;
     /*
-     * The allocation bits first, as in cetrafs_write_raw_inode() and for
+     * The allocation bits first, as in __cetrafs_write_raw_inode() and for
      * the same reason (rule 8): this swap reaches the device at once, and
      * it can publish a block allocated moments ago -- setxattr's new
      * xattr block -- whose bit is still only in this node's cache. A node
