@@ -190,6 +190,7 @@ void cetrafs_ibmap_invalidate(struct super_block *sb);
  */
 bool cetrafs_sb_lba_run_hits_bg_table(struct super_block *sb, u64 lba, u64 count);
 bool cetrafs_sb_lba_run_in_bg_data(struct super_block *sb, u64 lba, u64 count);
+bool cetrafs_sb_lba_run_past_last_bg(struct super_block *sb, u64 lba, u64 count);
 int cetrafs_lba_run_past_end(struct super_block *sb, u64 lba, u64 count);
 /*
  * 0: [lba, lba+count) is data. -EUCLEAN: it is not, against a layout
@@ -201,7 +202,10 @@ int cetrafs_lba_run_past_end(struct super_block *sb, u64 lba, u64 count);
  * nothing, because a mark is sticky and the address may be valid on
  * every node that caught up (GROWFS-LIVE-REVIEW H2).
  */
-static inline int cetrafs_lba_run_check(struct super_block *sb, u64 lba, u64 count)
+/* 'refresh': a run this node's layout cannot place may be asked of the
+ * device (cetrafs_lba_run_past_end()); false judges the layout as it is
+ * -- what past_end itself asks once it has refreshed. */
+static inline int __cetrafs_lba_run_check(struct super_block *sb, u64 lba, u64 count, bool refresh)
 {
     const cetrafs_superblock_t *raw_sb = cetrafs_sb_raw(sb);
     u64 lo, hi, data_end;
@@ -223,11 +227,25 @@ static inline int cetrafs_lba_run_check(struct super_block *sb, u64 lba, u64 cou
      * allocated in the new space before our heartbeat caught up. Off
      * the per-block budget: a valid address never gets here. */
     if (count > hi || lba > hi - count)
-        return cetrafs_lba_run_past_end(sb, lba, count);
+        return refresh ? cetrafs_lba_run_past_end(sb, lba, count) : -EUCLEAN;
     /* And inside the box, one Block Group's data region: not a header
      * or bitmap between two of them, nor a hole an earlier grow left
      * holding an older table segment. */
-    return cetrafs_sb_lba_run_in_bg_data(sb, lba, count) ? 0 : -EUCLEAN;
+    if (cetrafs_sb_lba_run_in_bg_data(sb, lba, count))
+        return 0;
+    /* Past the last Block Group this node knows, but inside its box: the
+     * tail a grow lays its first new groups in (a grow places them from
+     * the old last group's end, below the old end of the volume). To a
+     * node behind that grow it is "cannot tell", exactly as past the
+     * end is -- not damage (ctest grow-unrescanned). */
+    if (refresh && cetrafs_sb_lba_run_past_last_bg(sb, lba, count))
+        return cetrafs_lba_run_past_end(sb, lba, count);
+    return -EUCLEAN;
+}
+
+static inline int cetrafs_lba_run_check(struct super_block *sb, u64 lba, u64 count)
+{
+    return __cetrafs_lba_run_check(sb, lba, count, true);
 }
 /* For callers whose refusal is not destructive and marks nothing (a
  * skipped invalidation, a scrub candidate dropped): "not known to be

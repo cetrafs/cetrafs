@@ -23,10 +23,19 @@
 #  - the device "rescanned" (table restored), the same file reads the
 #    block the grow added and still takes writes: it was never marked.
 #
+# Two addresses in the new Block Group: T1, past the old end of the
+# volume, and T0, the old end's last block -- a grow starts the new
+# group where the old last group ended, BELOW the old end, so T0 is in
+# its data region and inside the box this node
+# knows, in no group it knows. T0 used to be "not a data address" and
+# marked the file (ctest grow-unrescanned, 2026-11-19).
+#
 # DISCRIMINATION: with "cannot tell" folded into "not data"
 # (cetrafs_lba_run_past_end() answering -EUCLEAN when the refresh
 # fails), the read marks the inode, the corruption count moves, and the
-# write after the rescan is refused (2026-11-08).
+# write after the rescan is refused (2026-11-08). Without the
+# past-the-last-group branch in __cetrafs_lba_run_check(), the same for
+# T0 alone.
 # ct-timeout: 600
 set -euo pipefail
 . "$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)/lib/harness.sh"
@@ -59,7 +68,10 @@ ct_mkfs "$DEV" -s 600M -b 512 -z 1 -J 0 -N 1024 -f >/dev/null
 ct_mount "$DEV" "$MNT"
 require_cetrafs_mount "$MNT"
 dd if=/dev/zero of="$MNT/v1" bs=4096 count=1 conv=fsync status=none
+dd if=/dev/zero of="$MNT/v0" bs=4096 count=1 conv=fsync status=none
 INO1="$(stat -c %i "$MNT/v1")"
+INO0="$(stat -c %i "$MNT/v0")"
+OLDTOTAL=153600 # mkfs -s 600M
 
 ct_param_set layout_refresh_hb_off 1
 gen0="$(info layout_gen)"
@@ -71,6 +83,10 @@ NEWBG="$(sed -n 's/.*new BG regions: LBA \([0-9][0-9]*\) .*/\1/p' <<<"$out")"
 T1=$((NEWBG + 65536))
 printf 'MARKER-ONE\n' | dd of="$IMG" bs=4096 seek="$T1" conv=notrunc,sync status=none
 P1="$("$PPOKE" "$IMG" "$INO1" "$T1")" || { fail "setup: could not aim the extent: $P1"; ct_exit; }
+T0=$((OLDTOTAL - 1)) # the old end's last block: in the new group's data, far past its header
+[ "$T0" -gt $((NEWBG + 1024)) ] || { fail "setup: the new group starts at $NEWBG, not well below the old end ($OLDTOTAL) -- T0 tests nothing"; ct_exit; }
+printf 'MARKER-ZERO\n' | dd of="$IMG" bs=4096 seek="$T0" conv=notrunc,sync status=none
+P0="$("$PPOKE" "$IMG" "$INO0" "$T0")" || { fail "setup: could not aim the extent: $P0"; ct_exit; }
 sync; echo 3 >/proc/sys/vm/drop_caches
 
 dm_size $((1000 * 2048)) # 1000 MiB: the grown volume (1400M) no longer fits
@@ -84,6 +100,12 @@ if got="$(head -c 10 "$MNT/v1" 2>/dev/null)" && [ "$got" = "MARKER-ONE" ]; then
     fail "setup: the read through the new space succeeded on a device that does not hold it"
 else
     pass "the read through the new space is refused"
+fi
+# T0's block is on this device; its group is not in this node's layout.
+if got="$(head -c 11 "$MNT/v0" 2>/dev/null)" && [ "$got" = "MARKER-ZERO" ]; then
+    fail "setup: the read of T0 succeeded through a layout that has no group there"
+else
+    pass "the read below the old end, in the new group, is refused too"
 fi
 D="$(dmesg_since "$mark")"
 grep -q "device has" <<<"$D" && pass "the node says its device is behind the volume" ||
@@ -114,6 +136,9 @@ ms=$((($(date +%s%N) - t0) / 1000000))
     fail "the node is at layout_gen $(info layout_gen), expected $((gen0 + 1))"
 echo more >>"$MNT/v1" && sync && pass "the file still takes writes: it was never marked damaged" ||
     fail "the file refuses writes after the rescan: it was marked damaged while the device was behind"
+[ "$(head -c 11 "$MNT/v0" 2>/dev/null)" = "MARKER-ZERO" ] && echo more >>"$MNT/v0" && sync &&
+    pass "T0's file reads its block and takes writes: it was never marked either" ||
+    fail "T0's file: read '$(head -c 11 "$MNT/v0" 2>/dev/null || echo error)', or refused a write -- it was marked damaged"
 ct_param_set layout_refresh_hb_off 0
 ct_umount "$MNT"
 ct_exit

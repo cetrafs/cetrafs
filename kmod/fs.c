@@ -4809,15 +4809,15 @@ int cetrafs_lba_run_past_end(struct super_block *sb, u64 lba, u64 count)
         READ_ONCE(sbi->layout_behind_bytes) == bdev_nr_bytes(sb->s_bdev))
         return -EAGAIN;
     r = cetrafs_sb_layout_refresh(sb);
-    if (r == 1)
-        return cetrafs_lba_run_check(sb, lba, count);
-    if (r < 0) {
-        pr_warn_ratelimited("%s: blocks %llu+%llu lie past this node's layout, and it cannot learn whether a "
-                            "grow put them there (%d) -- refusing the I/O, marking nothing\n",
-                            sb->s_id, (unsigned long long) lba, (unsigned long long) count, r);
-        return -EAGAIN;
-    }
-    return -EUCLEAN;
+    /* >= 0: the layout is current now -- this call published it (1), or
+     * it already was, perhaps applied by the heartbeat under us (0).
+     * Judged against it as it is, without asking again. */
+    if (r >= 0)
+        return __cetrafs_lba_run_check(sb, lba, count, false);
+    pr_warn_ratelimited("%s: blocks %llu+%llu lie past this node's layout, and it cannot learn whether a "
+                        "grow put them there (%d) -- refusing the I/O, marking nothing\n",
+                        sb->s_id, (unsigned long long) lba, (unsigned long long) count, r);
+    return -EAGAIN;
 }
 
 /*
@@ -4849,6 +4849,15 @@ static bool cetrafs_layout_run_in_bg(const struct cetrafs_bg_layout *l, u32 b, u
  * (ordered: the mount refuses a group that starts before the previous
  * one ends).
  */
+/* Does [lba, lba+count) end past the last Block Group this node's
+ * layout has? The tail where a grow puts its first new groups. */
+bool cetrafs_sb_lba_run_past_last_bg(struct super_block *sb, u64 lba, u64 count)
+{
+    const struct cetrafs_bg_layout *l = cetrafs_sb_layout_of(sb->s_fs_info);
+
+    return l && (lba >= l->last_bg_end || count > l->last_bg_end - lba);
+}
+
 bool cetrafs_sb_lba_run_in_bg_data(struct super_block *sb, u64 lba, u64 count)
 {
     const struct cetrafs_bg_layout *l = cetrafs_sb_layout_of(sb->s_fs_info);
