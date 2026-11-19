@@ -2433,6 +2433,10 @@ static int cetrafs_journal_blocked_by_older(const struct cetrafs_journal_replay_
 static unsigned int cetrafs_journal_owner_read_fail;
 cetrafs_test_param(journal_owner_read_fail, cetrafs_journal_owner_read_fail, uint, 0644);
 MODULE_PARM_DESC(journal_owner_read_fail, "TEST ONLY: fail the next N journal replay owner-record reads with -EIO");
+static bool cetrafs_journal_owner_known_only;
+cetrafs_test_param(journal_owner_known_only, cetrafs_journal_owner_known_only, bool, 0644);
+MODULE_PARM_DESC(journal_owner_known_only,
+                 "TEST ONLY: judge a replay entry's owner past this node's inode table gone without a layout refresh");
 
 /* TEST ONLY: the old fail-open verdict -- an owner that cannot be read
  * leaves the entry to the guard alone. The control for the suite above. */
@@ -2448,8 +2452,23 @@ static int cetrafs_journal_owner_holds(struct super_block *sb, const struct cetr
     int ret;
 
     *is_dir = false;
-    if (!cetrafs_inode_lba(sb, e->owner_ino))
+    if (!e->owner_ino)
         return 0; /* no writer of this format names no owner */
+    /* An owner past the table this node knows is not a gone owner: a
+     * peer's live grow added the segment it is in, and it died before
+     * our heartbeat caught the layout up. Caught up here, so the record
+     * is read rather than presumed gone and the redo dropped (audit
+     * 2026-11-15 F-61). A refresh that fails cannot tell: the entry is
+     * kept, the area stays dirty. Past the table even after a refresh,
+     * the number names no inode (no layout shrinks). */
+    if (!cetrafs_inode_lba(sb, e->owner_ino)) {
+        if (READ_ONCE(cetrafs_journal_owner_known_only))
+            return 0; /* TEST ONLY: the old verdict */
+        if (cetrafs_sb_layout_refresh(sb) < 0)
+            return -EIO;
+        if (!cetrafs_inode_lba(sb, e->owner_ino))
+            return 0;
+    }
     cetrafs_invalidate_raw_inode(sb, e->owner_ino);
     if (READ_ONCE(cetrafs_journal_owner_read_fail)) {
         WRITE_ONCE(cetrafs_journal_owner_read_fail, cetrafs_journal_owner_read_fail - 1);
