@@ -83,6 +83,7 @@
  */
 #include <linux/bitmap.h>
 #include <linux/buffer_head.h>
+#include <linux/dcache.h>
 #include <linux/delay.h>
 #include <linux/fs.h>
 #include <linux/minmax.h>
@@ -970,7 +971,9 @@ static void scrub_free_targets(struct scrub_ctx *ctx)
  *    open keeps its presence bit until close, so any node still reading
  *    the dead file skips it this cycle and its own close converges it.
  *  - a LOCAL in-core object (ilookup) means our own unlinked-but-open
- *    file or a live eviction; its evict owns the free -- skip.
+ *    file, a live eviction, or a file a peer deleted that this node
+ *    still caches; its evict owns the free -- skip, after making sure it
+ *    knows the file is dead (scrub_adopt_local_death(), BL-87).
  *  - a concurrent evict or peer scrub freeing the same number: the
  *    bitmap free is a CAS, one winner; the blocks go through the block
  *    -reclaim machinery that already arbitrates those frees.
@@ -1015,6 +1018,50 @@ static void scrub_reconcile_stopped_op(struct cetrafs_scrub *s, u64 ino, const c
     if (cetrafs_inode_get_generation(inode) == cetrafs_le64(raw->generation) && !cetrafs_nslock_acquire(inode))
         cetrafs_nslock_release(inode);
     iput(inode); /* recounted to 0: this is its eviction, and the free */
+}
+
+/* TEST ONLY: leave a local in-core object of a dead record as it is, as
+ * before audit 2026-11-15 BL-87 (tests/kernel/scrub_adopts_peer_unlink.sh). */
+static bool cetrafs_scrub_local_no_adopt;
+cetrafs_test_param(scrub_local_no_adopt, cetrafs_scrub_local_no_adopt, bool, 0644);
+MODULE_PARM_DESC(scrub_local_no_adopt, "TEST ONLY: skip a dead record this node holds in core without adopting its death");
+
+/*
+ * A dead record this node still holds in core. The skip below assumed
+ * that object's eviction owns the free, and it does only when the
+ * object knows the file died: evict frees on the in-core link count. A
+ * PEER's unlink never moves that count here -- a file this node had
+ * open when a peer deleted it (the peer's evict leaves it to the
+ * opener) keeps i_nlink 1 after the close, its eviction frees nothing,
+ * and the skip spared it for as long as the object stayed cached
+ * (audit 2026-11-15 BL-87). So adopt the death the way writeback adopts
+ * nlink (cetrafs_write_vfs_inode()): under inode_lock, which every
+ * local namespace operation on it holds, from a read made after taking
+ * it, of the same generation and type. Then drop the dentries nobody
+ * uses: with no opener left the caller's iput is the last, and the
+ * eviction frees it with every check it makes (foreign openers, the
+ * claim). Busy (the lock taken): the next cycle.
+ */
+static void scrub_adopt_local_death(struct super_block *sb, struct inode *local, u64 generation)
+{
+    cetrafs_inode_t now;
+    int ret;
+
+    if (READ_ONCE(cetrafs_scrub_local_no_adopt) || !local->i_nlink ||
+        cetrafs_inode_get_generation(local) != generation || !inode_trylock(local))
+        return;
+    cetrafs_invalidate_raw_inode(sb, local->i_ino);
+    ret = cetrafs_read_raw_inode(sb, local->i_ino, &now);
+    /* Adopted only on a read that says so; an error adopts nothing. */
+    if (!ret && local->i_nlink && cetrafs_le64(now.generation) == generation &&
+        cetrafs_le32(now.nlink) == 0 && ((local->i_mode ^ cetrafs_le32(now.mode)) & S_IFMT) == 0) {
+        set_nlink(local, 0);
+        pr_info("scrub: ino=%llu: deleted by another node while cached here -- its eviction frees it\n",
+                (unsigned long long) local->i_ino);
+    }
+    inode_unlock(local);
+    if (!local->i_nlink)
+        d_prune_aliases(local);
 }
 
 static void scrub_reclaim_orphan_inodes(struct cetrafs_scrub *s)
@@ -1104,8 +1151,11 @@ static void scrub_reclaim_orphan_inodes(struct cetrafs_scrub *s)
 
         local = ilookup(sb, ino);
         if (local) {
+            /* Our own object: its eviction owns the free -- once it
+             * knows the file is dead (scrub_adopt_local_death()). */
+            scrub_adopt_local_death(sb, local, cetrafs_le64(raw.generation));
             iput(local);
-            continue; /* our own object is live -- its eviction owns the free */
+            continue;
         }
 
         if (cetrafs_free_inode_if_dead(sb, ino, cetrafs_le64(raw.generation), cetrafs_le64(raw.dirent_seq)) == 0) {
