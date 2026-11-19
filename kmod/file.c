@@ -8333,6 +8333,11 @@ static u64 cetrafs_falloc_map_start(const cetrafs_extent_t *e)
     return cetrafs_ee_lblk(e);
 }
 
+/* In u64: a logical start below 2^48 plus a length below 2^32 cannot
+ * wrap (it was a 32-bit sum once, audit L-8). Two extents of a damaged
+ * map that overlap are harmless here: the planner's walk takes the
+ * union of the sorted map, skipping whatever ends at or before its
+ * cursor, so no hole is planned twice; the overlap itself is fsck's. */
 static u64 cetrafs_falloc_map_end(const cetrafs_extent_t *e)
 {
     return cetrafs_ee_lblk(e) + cetrafs_ee_len(e);
