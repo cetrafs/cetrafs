@@ -45,6 +45,11 @@
  *       the last FLUSH -- i.e. are not yet durable. A batch's entries name
  *       data and bits that must already be on the platter, so the answer
  *       must be 0. Prints "pending=<n> first=<lba>" (or "no-journal-write")
+ *   replay-log --log <logdev> --check-discards-flushed NAME
+ *       after mark NAME: for every DISCARD, were writes still pending
+ *       (issued since the last FLUSH, and not FUA) when it went out? A
+ *       discard is immediate on the device; the writes it follows are
+ *       not durable until a flush. Prints "discards=N unflushed=M"
  *   replay-log --log <logdev> --replay <dev> --reorder-after-fua N
  *              --data-start LBA --journal-start LBA --journal-blocks N
  *       model a volatile-cache power cut: everything through barrier N durable,
@@ -526,12 +531,57 @@ static int check_flushed(int logfd, uint64_t nr_entries, uint32_t ss, const char
     return 3;
 }
 
+static int check_discards(int logfd, uint64_t nr_entries, uint32_t ss, const char *mark)
+{
+    off_t pos = ss;
+    uint64_t pending = 0, discards = 0, unflushed = 0;
+    int started = 0;
+    uint8_t hdr[32];
+
+    for (uint64_t i = 0; i < nr_entries; i++) {
+        if (read_at(logfd, hdr, sizeof(hdr), pos)) {
+            fprintf(stderr, "truncated log at entry %llu\n", (unsigned long long) i);
+            return 1;
+        }
+        uint64_t nr = rd64(hdr + 8), flags = rd64(hdr + 16), data_len = rd64(hdr + 24);
+        off_t hdr_region = (off_t) roundup(32 + data_len, ss);
+        int is_discard = (flags & LOG_DISCARD_FLAG) != 0;
+        off_t next = pos + hdr_region + (is_discard ? 0 : (off_t) nr * ss);
+
+        if (flags & LOG_MARK_FLAG) {
+            if (!started && data_len) {
+                char name[256];
+                size_t n = data_len < sizeof(name) - 1 ? data_len : sizeof(name) - 1;
+                if (!read_at(logfd, name, n, pos + 32)) {
+                    name[n] = '\0';
+                    started = !strcmp(name, mark);
+                }
+            }
+            pos = next;
+            continue;
+        }
+        if (flags & LOG_FLUSH_FLAG)
+            pending = 0;
+        if (started && is_discard && nr) {
+            discards++;
+            if (pending)
+                unflushed++;
+        } else if (nr && !is_discard && !(flags & LOG_FUA_FLAG)) {
+            pending++;
+        }
+        pos = next;
+    }
+    printf("discards=%llu unflushed=%llu\n", (unsigned long long) discards, (unsigned long long) unflushed);
+    return 0;
+}
+
 int main(int argc, char **argv)
 {
     const char *logpath = NULL, *replaypath = NULL, *end_mark = NULL;
     long limit_fua = -1, reorder_after = -1, limit_entries = -1;
     uint64_t data_start_lba = 0, journal_start_lba = 0, journal_blocks = 0;
     int count_fua = 0, count_marks = 0, count_entries = 0;
+    const char *check_discards_mark = NULL;
     const char *entry_of_mark = NULL;
     const char *check_mark = NULL;
     const char *vol_mark = NULL, *vol_token = NULL;
@@ -586,6 +636,8 @@ int main(int argc, char **argv)
             }
         } else if (!strcmp(argv[i], "--volatile-seed") && i + 1 < argc)
             vol_seed = strtoull(argv[++i], NULL, 10);
+        else if (!strcmp(argv[i], "--check-discards-flushed") && i + 1 < argc)
+            check_discards_mark = argv[++i];
         else if (!strcmp(argv[i], "--count-fua"))
             count_fua = 1;
         else if (!strcmp(argv[i], "--count-marks"))
@@ -624,6 +676,11 @@ int main(int argc, char **argv)
         return 1;
     }
 
+    if (check_discards_mark) {
+        int rc = check_discards(logfd, nr_entries, ss, check_discards_mark);
+        close(logfd);
+        return rc;
+    }
     if (check_mark) {
         if (!data_start_lba || !journal_start_lba || !journal_blocks) {
             fprintf(stderr, "--check-flushed-after-mark needs --data-start, --journal-start, --journal-blocks\n");

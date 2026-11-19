@@ -203,6 +203,12 @@ static unsigned int cetrafs_discard_issue_stall_ms;
 cetrafs_test_param(discard_issue_stall_ms, cetrafs_discard_issue_stall_ms, uint, 0644);
 MODULE_PARM_DESC(discard_issue_stall_ms, "TEST ONLY: pause before every discard is sent");
 
+/* TEST ONLY: a discard goes out without the cache flush ahead of it, as
+ * before audit 2026-11-15 BC-42 (tests/crash/discard_after_flush.sh). */
+static bool cetrafs_discard_flush_off;
+cetrafs_test_param(discard_flush_off, cetrafs_discard_flush_off, bool, 0644);
+MODULE_PARM_DESC(discard_flush_off, "TEST ONLY: send a discard without flushing the device cache first");
+
 static int cetrafs_discard_issue(struct super_block *sb, u32 bg_id, u64 lba, u64 count)
 {
     int ret;
@@ -219,6 +225,25 @@ static int cetrafs_discard_issue(struct super_block *sb, u32 bg_id, u64 lba, u64
     ret = cetrafs_issue_range_ok(sb, "discard", bg_id, lba, count);
     if (ret)
         return ret;
+    /*
+     * Every write this discard depends on, made durable first. A discard
+     * takes effect on the device at once; the writes before it -- the
+     * record publish that let the blocks go, the frees, a trim's hold,
+     * a hand-back's pending flag -- only COMPLETED, and on a volatile
+     * cache a power cut can lose them while the UNMAP stands: the record
+     * the device keeps still names blocks that now read as zeros, the
+     * state neither before nor after the operation (audit 2026-11-15
+     * BC-42, rule 21). One flush per command, beside an UNMAP that
+     * costs as much. Failed: nothing is sent, which is a known outcome.
+     */
+    if (!READ_ONCE(cetrafs_discard_flush_off)) {
+        ret = cetrafs_publish_flush(sb);
+        if (ret) {
+            pr_warn_ratelimited("%s: discard [%llu +%llu) not sent: the cache flush ahead of it failed (%d)\n",
+                                sb->s_id, (unsigned long long) lba, (unsigned long long) count, ret);
+            return -EREMOTEIO;
+        }
+    }
 
     if (READ_ONCE(cetrafs_discard_fail_unknown) || READ_ONCE(cetrafs_discard_fail_definite)) {
         unsigned int n = READ_ONCE(cetrafs_discard_fail_unknown);
