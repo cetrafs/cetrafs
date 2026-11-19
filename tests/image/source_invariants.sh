@@ -2403,6 +2403,8 @@ cetrafs_xattr_peer_user final:a-peer-holds-or-reads-the-file-on-a-fresh-read
 cetrafs_ns_apply_xattr_guarded final:a-peer-opened-the-file-seen-inside-the-publishing-swap-nothing-applied
 cetrafs_lock_arm_stale_steal below:a-live-holder-the-flock-and-resume-loops-poll-it'
 C43_REG_ENOENT='cetrafs_dir_extents_get_unchecked final:the-directory-is-gone-on-a-fresh-read
+cetrafs_dirent_tear_explained final:the-directory-is-gone-on-a-fresh-read
+cetrafs_dir_walk_alive final:the-directory-is-gone-on-a-fresh-read
 cetrafs_dir_add_entry final:the-directory-is-gone-on-a-fresh-read
 cetrafs_dir_remove_entry final:the-name-is-gone-under-the-namespace-lock
 cetrafs_dir_retarget_entry final:the-name-is-gone-under-the-namespace-lock

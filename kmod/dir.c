@@ -163,6 +163,8 @@ static bool cetrafs_dirent_block_valid(const struct buffer_head *bh)
 /* As cetrafs_dirent_bread(), saying why a NULL came back: -EUCLEAN when
  * every attempt read the block and found it damaged, -EIO when the
  * device failed a read. */
+static bool cetrafs_dir_walk_no_alive; /* TEST ONLY: see the parameter, at the walk */
+
 /* TEST ONLY: a dirent block that stays torn under a peer's namespace
  * lock counts as damage, as before audit 2026-11-15 M-16
  * (tests/kernel/dirent_tear_under_peer_lock.sh). */
@@ -182,24 +184,51 @@ MODULE_PARM_DESC(dirent_tear_lock_ignored, "TEST ONLY: a torn dirent block under
  * fresh: an older copy can only say "held" of a lock since released,
  * which defers the verdict to the next read, never skips it for good.
  */
-static bool cetrafs_dirent_tear_explained(struct super_block *sb, u64 ino, u64 lba)
+/*
+ * ...and a block that is not a dirent block at all, read for a directory
+ * that died since the reader read its record: the rmdir freed the block
+ * and it was reused as something else (audit 2026-11-15 BL-51). Not
+ * damage either: -ENOENT. 0 when nothing explains it.
+ */
+static int cetrafs_dirent_tear_explained(struct super_block *sb, u64 ino, u64 generation, u64 lba)
 {
     cetrafs_inode_t raw;
     u32 owner, me;
 
-    if (!ino || READ_ONCE(cetrafs_dirent_tear_lock_ignored) || cetrafs_sb_get_node_id(sb, &me))
-        return false;
+    if (!ino || cetrafs_sb_get_node_id(sb, &me))
+        return 0;
     cetrafs_invalidate_raw_inode(sb, ino);
     if (cetrafs_read_raw_inode(sb, ino, &raw))
-        return false;
+        return 0;
+    if (!READ_ONCE(cetrafs_dir_walk_no_alive) &&
+        (cetrafs_le64(raw.generation) != generation || cetrafs_le32(raw.nlink) == 0)) {
+        pr_info_ratelimited("dirent block %llu: directory ino=%llu was removed under the reader -- not damage\n",
+                            (unsigned long long) lba, (unsigned long long) ino);
+        return -ENOENT;
+    }
+    if (READ_ONCE(cetrafs_dirent_tear_lock_ignored))
+        return 0;
     owner = cetrafs_le32(raw.ns_lock_owner);
     if (owner == CETRAFS_NODE_ID_NONE || owner == me)
-        return false;
+        return 0;
     pr_warn_ratelimited("dirent block %llu of directory ino=%llu reads torn while node %u holds its namespace lock -- "
                         "that node's write, in flight or awaiting replay: not counted as damage\n",
                         (unsigned long long) lba, (unsigned long long) ino, owner);
-    return true;
+    return -EAGAIN;
 }
+
+/*
+ * Dirent block loads from the device, counted BEFORE each one. A
+ * lockless walk reads the directory's record, then its blocks, and a
+ * peer's rmdir can free a block in between and its next mkdir make it
+ * another directory's: a valid dirent block, of the right kind, with
+ * the wrong names (audit 2026-11-15 BL-51). Every load is counted here
+ * -- the forced reads below, the walk's cache misses (which come here),
+ * the whole-directory refresh -- so a walk can tell whether anything it
+ * is about to visit may have come off the device after its record read
+ * (cetrafs_walk_dirents_from()).
+ */
+static atomic64_t cetrafs_dirent_loads = ATOMIC64_INIT(0);
 
 static struct buffer_head *cetrafs_dirent_bread_why(struct super_block *sb, u64 ino, u64 generation, u64 lba,
                                                     int *why)
@@ -207,6 +236,7 @@ static struct buffer_head *cetrafs_dirent_bread_why(struct super_block *sb, u64 
     int attempt, nbad = 0;
 
     *why = -EIO;
+    atomic64_inc(&cetrafs_dirent_loads);
 
     for (attempt = 0; attempt < CETRAFS_DIRENT_READ_RETRIES; attempt++) {
         struct buffer_head *bh = cetrafs_bread_uncached(sb, lba);
@@ -244,9 +274,13 @@ static struct buffer_head *cetrafs_dirent_bread_why(struct super_block *sb, u64 
                            CETRAFS_DIRENT_READ_RETRIES);
         return NULL;
     }
-    if (cetrafs_dirent_tear_explained(sb, ino, lba)) {
-        *why = -EAGAIN;
-        return NULL;
+    {
+        int r = cetrafs_dirent_tear_explained(sb, ino, generation, lba);
+
+        if (r) {
+            *why = r;
+            return NULL;
+        }
     }
     pr_err("dirent block %llu failed its tail checksum %d times -- corrupted, not just a torn concurrent read\n",
            (unsigned long long) lba, CETRAFS_DIRENT_READ_RETRIES);
@@ -457,9 +491,11 @@ static struct buffer_head *cetrafs_dirent_read(struct inode *dir, u64 lba, bool 
     if (fresh)
         return cetrafs_dirent_bread(dir, lba);
 
-    bh = cetrafs_bread_retry(dir->i_sb, lba);
+    /* Cached only: a miss is a load from the device, and every load
+     * goes through cetrafs_dirent_bread(), which counts it. */
+    bh = sb_find_get_block(dir->i_sb, lba);
     if (bh) {
-        if (cetrafs_dirent_block_valid(bh))
+        if (buffer_uptodate(bh) && cetrafs_dirent_block_valid(bh))
             return bh;
         brelse(bh);
     }
@@ -809,6 +845,7 @@ static noinline_for_stack int cetrafs_dir_refresh_whole(struct inode *dir, const
             if (cetrafs_dir_killed())
                 return -EINTR; /* RT-3: the count is the disk's */
             n = min_t(u32, len - b, ARRAY_SIZE(bhs));
+            atomic64_inc(&cetrafs_dirent_loads); /* a load, as cetrafs_dirent_bread_why()'s */
             if (cetrafs_bread_uncached_batch(dir->i_sb, phys + b, n, bhs))
                 return -EIO;
             for (k = 0; k < n; k++)
@@ -818,6 +855,35 @@ static noinline_for_stack int cetrafs_dir_refresh_whole(struct inode *dir, const
     return 0;
 }
 
+/* TEST ONLY: visit blocks loaded since the record read without asking
+ * whether the directory still lives, as before audit 2026-11-15 BL-51
+ * (tests/kernel/dir_walk_block_reused.sh). */
+cetrafs_test_param(dir_walk_no_alive, cetrafs_dir_walk_no_alive, bool, 0644);
+MODULE_PARM_DESC(dir_walk_no_alive, "TEST ONLY: a directory walk visits reloaded blocks without checking the directory lives");
+
+/* The directory, read fresh, is still the one walked and still alive:
+ * 0, -ENOENT if not, or the read's error. */
+/* TEST ONLY: one walk pauses this long after its record read, before
+ * any block (tests/kernel/dir_walk_block_reused.sh). One-shot. */
+static unsigned int cetrafs_dir_walk_record_stall_ms;
+cetrafs_test_param(dir_walk_record_stall_ms, cetrafs_dir_walk_record_stall_ms, uint, 0644);
+MODULE_PARM_DESC(dir_walk_record_stall_ms, "TEST ONLY: the next directory walk pauses after reading its record (one-shot)");
+
+static noinline_for_stack int cetrafs_dir_walk_alive(struct inode *dir)
+{
+    cetrafs_inode_t *now = kmalloc(sizeof(*now), GFP_NOFS);
+    int ret;
+
+    if (!now)
+        return -ENOMEM;
+    cetrafs_invalidate_raw_inode(dir->i_sb, dir->i_ino);
+    ret = cetrafs_read_raw_inode(dir->i_sb, dir->i_ino, now);
+    if (!ret && (cetrafs_le64(now->generation) != cetrafs_inode_get_generation(dir) || cetrafs_le32(now->nlink) == 0))
+        ret = -ENOENT;
+    kfree(now);
+    return ret;
+}
+
 static int cetrafs_walk_dirents_from(struct inode *dir, cetrafs_dirent_visit_fn visit, void *priv, loff_t min_pos)
 {
     unsigned int dirents_per_block = CETRAFS_DIRENTS_PER_BLOCK;
@@ -825,8 +891,12 @@ static int cetrafs_walk_dirents_from(struct inode *dir, cetrafs_dirent_visit_fn 
     cetrafs_inode_t raw;
     bool fresh, skipped = false;
     cetrafs_dirent_t *img;
+    s64 loads;
     int ret;
     u32 i;
+
+    /* Before the record read: a load counted after this may postdate it. */
+    loads = atomic64_read(&cetrafs_dirent_loads);
 
     /* Any node can add/remove entries in any directory at any time (no
      * whole-file lock covers a directory the way lock.c covers a regular
@@ -855,6 +925,8 @@ static int cetrafs_walk_dirents_from(struct inode *dir, cetrafs_dirent_visit_fn 
         kfree(img);
         return ret;
     }
+    if (unlikely(READ_ONCE(cetrafs_dir_walk_record_stall_ms)))
+        msleep(xchg(&cetrafs_dir_walk_record_stall_ms, 0)); /* test-only, one-shot */
 
     fresh = cetrafs_dir_needs_fresh(dir, &raw);
 
@@ -917,7 +989,8 @@ static int cetrafs_walk_dirents_from(struct inode *dir, cetrafs_dirent_visit_fn 
             for (tries = 0;; tries++) {
                 bh = cetrafs_dirent_read(dir, phys + b, fresh || tries);
                 if (!bh) {
-                    ret = -EIO;
+                    /* A directory removed under the walk is not an I/O error (BL-51). */
+                    ret = cetrafs_dir_walk_alive(dir) == -ENOENT ? -ENOENT : -EIO;
                     goto out;
                 }
                 if (live)
@@ -930,7 +1003,7 @@ static int cetrafs_walk_dirents_from(struct inode *dir, cetrafs_dirent_visit_fn 
                 /* Re-read under us into something invalid: a write in
                  * flight converges, damage does not (rule 3). */
                 if (tries >= 3) {
-                    ret = -EUCLEAN;
+                    ret = cetrafs_dir_walk_alive(dir) == -ENOENT ? -ENOENT : -EUCLEAN;
                     goto out;
                 }
                 msleep(10 << tries);
@@ -938,6 +1011,22 @@ static int cetrafs_walk_dirents_from(struct inode *dir, cetrafs_dirent_visit_fn 
 
             if (unlikely(READ_ONCE(cetrafs_dir_walk_stall_ms)))
                 msleep(xchg(&cetrafs_dir_walk_stall_ms, 0)); /* test-only, one-shot */
+            /* A block loaded since the record read may no longer be
+             * this directory's (BL-51, cetrafs_dirent_loads). Its blocks
+             * are freed only once it is dead -- directories never shrink
+             * or move a block, and a free follows the publish of nlink
+             * 0 (rule 21) -- so a record that still reads alive, after
+             * the copy was taken, vouches for everything loaded before
+             * it. Dead: the directory went under the walk, and nothing
+             * in it may be visited. */
+            if (atomic64_read(&cetrafs_dirent_loads) != loads && !READ_ONCE(cetrafs_dir_walk_no_alive)) {
+                loads = atomic64_read(&cetrafs_dirent_loads);
+                ret = cetrafs_dir_walk_alive(dir);
+                if (ret) {
+                    brelse(bh); /* NULL unless live */
+                    goto out;
+                }
+            }
             de = live ? (const cetrafs_dirent_t *) bh->b_data : img;
             for (e = 0; e < dirents_per_block; e++) {
                 if (cetrafs_le64(de[e].inode) == 0)
