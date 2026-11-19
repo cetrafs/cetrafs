@@ -700,6 +700,11 @@ static int cetrafs_dir_extents_get_unchecked(struct inode *dir, const cetrafs_in
         };
         int ret = cetrafs_tree_extents(&w, raw, &de->arr, &de->entries);
 
+        if (ret == -EUCLEAN) {
+            /* More extents than a directory may hold (cetrafs_tree_extents()). */
+            cetrafs_sb_corrupt_inode(dir);
+            return ret;
+        }
         if (ret) {
             pr_warn_ratelimited("dir ino=%llu: extent tree unreadable (%d)\n", (unsigned long long) dir->i_ino, ret);
             return ret == -ENOMEM ? ret : -EIO;

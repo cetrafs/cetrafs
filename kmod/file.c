@@ -1532,12 +1532,20 @@ void cetrafs_tree_invalidate_cached(struct inode *inode, const cetrafs_inode_t *
 struct cetrafs_flat_ctx {
     cetrafs_extent_t *arr;
     u32 n, cap;
+    u32 max;   /* 0: the format's structural maximum only */
+    bool over; /* out: the walk met more than 'max' */
 };
 
 static int cetrafs_flat_leaf(struct cetrafs_tw *w, const cetrafs_extent_t *arr, u32 ln, u64 lba)
 {
     struct cetrafs_flat_ctx *f = w->ctx;
 
+    /* Before the buffer grows: the ceiling bounds the memory and the
+     * time, not only the answer. */
+    if (f->max && (u64) f->n + ln > f->max) {
+        f->over = true;
+        return -EUCLEAN;
+    }
     if (f->n + ln > f->cap) {
         u32 ncap = max_t(u32, f->cap ? f->cap * 2 : 512, f->n + ln);
         /*
@@ -1566,7 +1574,21 @@ static const struct cetrafs_tw_ops cetrafs_flat_ops = {
     .leaf = cetrafs_flat_leaf,
 };
 
-/* The walk 'w' names its reader -- an inode and a read mode, or a super
+/* TEST ONLY: the control of tests/kernel/dir_tree_flatten_bound.sh. */
+static bool cetrafs_dir_flatten_unbounded;
+cetrafs_test_param(dir_flatten_unbounded, cetrafs_dir_flatten_unbounded, bool, 0644);
+MODULE_PARM_DESC(dir_flatten_unbounded, "TEST ONLY: a directory's tree is flattened past CETRAFS_DIR_MAX_BLOCKS extents");
+
+/* A directory never holds more than CETRAFS_DIR_MAX_BLOCKS blocks
+ * (cetrafs_dir_add_entry()), so never more extents than that, and its
+ * tree is refused with -EUCLEAN the moment the walk meets one more --
+ * before the copy grows and before any caller sorts it. Shared children
+ * let a few blocks describe the format's whole 65.5M extents; counting
+ * after the copy (cetrafs_dir_extents_addr_ok()) came a GiB too late
+ * (audit 2026-11-15 F-62). Every flatten comes through here, the
+ * directory scans and a directory's evict alike.
+ *
+ * The walk 'w' names its reader -- an inode and a read mode, or a super
  * block and a scrub mode; its ops and ctx are this function's. The array
  * is the caller's to kvfree(), NULL when the tree holds no extent. */
 int cetrafs_tree_extents(struct cetrafs_tw *w, const cetrafs_inode_t *raw, cetrafs_extent_t **out_arr, u32 *out_n)
@@ -1574,11 +1596,17 @@ int cetrafs_tree_extents(struct cetrafs_tw *w, const cetrafs_inode_t *raw, cetra
     struct cetrafs_flat_ctx f = {0};
     int ret;
 
+    if (S_ISDIR(cetrafs_le32(raw->mode)) && !READ_ONCE(cetrafs_dir_flatten_unbounded))
+        f.max = CETRAFS_DIR_MAX_BLOCKS;
     w->ops = &cetrafs_flat_ops;
     w->ctx = &f;
     ret = cetrafs_tree_walk(w, raw);
     if (ret) {
         kvfree(f.arr);
+        if (f.over)
+            pr_err_ratelimited("dir ino=%llu: its extent tree holds more than %u extents, more than a directory may "
+                               "hold -- refusing it (fsck)\n",
+                               (unsigned long long) cetrafs_le64(raw->ino), f.max);
         return ret < 0 ? ret : -EIO;
     }
     *out_arr = f.arr;
