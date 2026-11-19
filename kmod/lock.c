@@ -4091,7 +4091,21 @@ static int cetrafs_lock_publish_and_clear(struct inode *inode, cetrafs_inode_t *
         tree_ret = ret;
     else if (!bmap_ret && cetrafs_le16(raw->eh.eh_magic) == CETRAFS_EXT_MAGIC && cetrafs_le16(raw->eh.eh_depth) >= 1)
         tree_ret = cetrafs_flush_tree_blocks(inode, raw, false);
-    if (tree_ret)
+    if (tree_ret == -ESTALE) {
+        /* Superseded: a peer wrote the file since our boundary failed,
+         * and the set and the shadow built on it are gone
+         * (cetrafs_lock_tree_superseded()). Nothing of ours is left to
+         * publish over theirs -- the close is finished, not failed. */
+        pr_err("lock release: ino=%llu another node wrote the file since this close failed -- its record is "
+               "not published over theirs\n",
+               (unsigned long long) inode->i_ino);
+        if (!may_clear)
+            return 0;
+        /* A lock mode: whoever wrote took the lock from us. Kept as a
+         * failure; the heartbeat's retry finds the set empty and the
+         * lock's own checks decide the clear. */
+        return tree_ret;
+    } else if (tree_ret)
         pr_err("lock release: ino=%llu extent-tree blocks not durable (%d) -- leaving the record unpublished "
                "and keeping the lock\n",
                (unsigned long long) inode->i_ino, tree_ret);
@@ -5089,6 +5103,30 @@ void cetrafs_inode_mark_tree_cold(struct inode *inode)
         if (!cetrafs_sb_queue_cold(inode->i_sb, &ci->cold_work))
             iput(inode);
     }
+}
+
+/*
+ * This node's held-back tree blocks were dropped because a peer rewrote
+ * them (leafdefer.c, cetrafs_deferred_set_current()): what the
+ * record shadow carries was built on them, so it goes too -- published,
+ * its root would supersede the peer's (audit 2026-11-15 BC-31). The
+ * extent cache and the tree are distrusted until the reconcile reads
+ * the peer's map. The stat fields are not touched: they publish as a
+ * delta from their baseline, which merges with the peer's.
+ */
+void cetrafs_lock_tree_superseded(struct inode *inode)
+{
+    struct cetrafs_inode_info *ci = CETRAFS_I(inode);
+
+    spin_lock(&ci->fd_lock);
+    /* class 55: a discard, not a claim to write -- nothing is owed for
+     * this shadow any more, so a second caller reading "clean" is right. */
+    ci->fd_dirty = false;
+    ci->fd_seq++; /* a publish in flight from the old shadow must not clear a newer stage */
+    spin_unlock(&ci->fd_lock);
+    cetrafs_inode_ext_cache_drop(inode);
+    ci->file_seq_cached = U64_MAX;
+    cetrafs_inode_mark_tree_cold(inode);
 }
 
 

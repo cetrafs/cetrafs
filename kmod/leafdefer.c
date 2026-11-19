@@ -40,6 +40,7 @@
  */
 #define pr_fmt(fmt) "cetrafs: " fmt
 
+#include <linux/blkdev.h>
 #include <linux/buffer_head.h>
 #include <linux/delay.h>
 #include <linux/crc32c.h>
@@ -558,13 +559,95 @@ bool cetrafs_deferred_flush_no_inode;
 cetrafs_test_param(deferred_flush_no_inode, cetrafs_deferred_flush_no_inode, bool, 0644);
 MODULE_PARM_DESC(deferred_flush_no_inode, "TEST ONLY: flush held-back blocks without looking up their inode");
 
+/* TEST ONLY: a held-back set is written without asking the device first,
+ * as before audit 2026-11-15 BC-31 (ctest late-flush's control,
+ * tests/kernel/late_flush_stale.sh). */
+static bool cetrafs_late_flush_blind;
+cetrafs_test_param(late_flush_blind, cetrafs_late_flush_blind, bool, 0644);
+MODULE_PARM_DESC(late_flush_blind, "TEST ONLY: write held-back tree blocks without checking the device still holds what they replace");
+
+static atomic64_t cetrafs_deferred_stale_sets = ATOMIC64_INIT(0);
+
+u64 cetrafs_deferred_stale_set_count(void)
+{
+    return (u64) atomic64_read(&cetrafs_deferred_stale_sets);
+}
+
+/*
+ * Does the device still hold, for every block of the set, the image it
+ * was held back against (d->disk_crc)? A held-back block is written in
+ * place, blind, and nothing about a boundary says the device is still
+ * ours to write: a close that failed is finished later by the heartbeat,
+ * a sync or the unmount, and under nofilelock no lock stood between
+ * that failure and a peer opening the file, writing it and publishing
+ * its own map over the same leaves (audit 2026-11-15 BC-31; CLAUDE.md
+ * rule 9). Read from the device itself, not the cache, which holds
+ * our image. A peer's write in flight reads as a change too: either way
+ * the set is no longer the file's. One 4 KiB read per held-back block
+ * per boundary, beside the batch's three cache flushes.
+ * 0: unchanged. -ESTALE: block *bad changed. Other: the read failed.
+ */
+static int cetrafs_deferred_set_current(struct buffer_head **bhs, const u32 *crcs, unsigned int n, unsigned int *bad)
+{
+    void *buf;
+    unsigned int i;
+    int ret = 0;
+
+    /* In every mode. With the file lock on, "the lock is still ours"
+     * should make this a no-op -- a failed close keeps it (B-7) -- but
+     * that is an argument about every path that holds a block back, and
+     * the read costs little beside the batch's flushes. */
+    if (READ_ONCE(cetrafs_late_flush_blind))
+        return 0; /* test-only; see the parameter */
+    buf = kmalloc(CETRAFS_BLOCK_SIZE, GFP_NOFS);
+    if (!buf)
+        return -ENOMEM;
+    for (i = 0; i < n; i++) {
+        struct buffer_head *bh = bhs[i];
+
+        if (bdev_rw_virt(bh->b_bdev, bh->b_blocknr * (bh->b_size >> SECTOR_SHIFT), buf, CETRAFS_BLOCK_SIZE,
+                         REQ_OP_READ)) {
+            ret = -EIO;
+            break;
+        }
+        if (~crc32c(~0U, buf, CETRAFS_BLOCK_SIZE) != crcs[i]) {
+            *bad = i;
+            ret = -ESTALE;
+            break;
+        }
+    }
+    kfree(buf);
+    return ret;
+}
+
+/*
+ * -ESTALE: the set was dropped, not written -- one inode's whole set,
+ * which is one map state and must not be half applied. Each block's
+ * cached image goes with it, so this node reads what the peer wrote.
+ * The caller with the inode drops its record shadow too
+ * (cetrafs_lock_tree_superseded()).
+ */
 static int cetrafs_deferred_write_set(struct super_block *sb, struct buffer_head **bhs, u32 *crcs,
                                       const struct cetrafs_journal_owner *owners, unsigned int n, bool no_inode)
 {
     bool *written;
     u32 *wcrc;
-    unsigned int i;
+    unsigned int i, bad = 0;
     int ret;
+
+    ret = cetrafs_deferred_set_current(bhs, crcs, n, &bad);
+    if (ret == -ESTALE) {
+        atomic64_inc(&cetrafs_deferred_stale_sets);
+        pr_err("ino=%llu: tree block %llu changed on the device since this node held it back -- another node "
+               "wrote the file after this node's last boundary failed; its %u unwritten tree block(s) are "
+               "dropped, not written over that\n",
+               (unsigned long long) owners[0].ino, (unsigned long long) bhs[bad]->b_blocknr, n);
+        for (i = 0; i < n; i++)
+            cetrafs_bh_deferred_unlist(sb, bhs[i], true);
+        return ret;
+    }
+    if (ret)
+        return ret; /* nothing written: the blocks stay held back */
 
     written = kvcalloc(n, sizeof(*written), GFP_NOFS);
     wcrc = kvcalloc(n, sizeof(*wcrc), GFP_NOFS);
@@ -646,6 +729,8 @@ int cetrafs_deferred_flush_inode(struct inode *inode, bool mapping_locked)
     ret = cetrafs_deferred_collect(xa, cetrafs_inode_deferred(inode), &bhs, &crcs, &owners, &n);
     if (!ret && n)
         ret = cetrafs_deferred_write_set(sb, bhs, crcs, owners, n, false);
+    if (ret == -ESTALE)
+        cetrafs_lock_tree_superseded(inode);
     if (!mapping_locked)
         filemap_invalidate_unlock_shared(inode->i_mapping);
     for (i = 0; i < n; i++)
@@ -689,7 +774,9 @@ static int cetrafs_deferred_write_by_inode(struct super_block *sb, struct buffer
             m++;
         }
         w = cetrafs_deferred_write_set(sb, gb, gc, go, m, no_inode);
-        if (w && !r)
+        /* -ESTALE: dropped, superseded by a peer -- nothing left to write
+         * and no inode in core to tell; not a boundary that failed. */
+        if (w && w != -ESTALE && !r)
             r = w;
     }
 out:
@@ -731,9 +818,12 @@ MODULE_PARM_DESC(retry_orphans_off, "TEST ONLY: a close finished by the heartbea
  * mount's orphan list and its own list is empty, so the retry's flush
  * wrote nothing, published the record and cleared the lock -- and the
  * orphan batch later wrote the old leaf over whatever a peer had made of
- * it since (audit 2026-11-14 B-7). They are written first: the lock is
- * still ours, so they are still this node's latest state. A failure
- * keeps the close unfinished.
+ * it since (audit 2026-11-14 B-7). They are written first. With the
+ * lock on it is still ours, so they are still the file's latest state;
+ * under nofilelock no lock says so, and the write checks the device
+ * instead -- a set a peer has rewritten since is dropped, not written
+ * (cetrafs_deferred_set_current(), BC-31). A failure keeps the close
+ * unfinished.
  */
 int cetrafs_deferred_flush_orphans_of(struct super_block *sb, u64 ino)
 {
@@ -806,6 +896,8 @@ int cetrafs_deferred_flush_all(struct super_block *sb)
             else
                 r = cetrafs_deferred_flush_inode(inode, false);
             iput(inode);
+            if (r == -ESTALE)
+                r = 0; /* dropped: a peer's newer map, nothing of ours left to write */
         }
         if (r) {
             ret = r;

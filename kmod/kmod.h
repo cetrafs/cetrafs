@@ -1595,6 +1595,7 @@ bool cetrafs_lock_read_cache_trusted(struct inode *inode);
 bool cetrafs_lock_alloc_tree_trusted(struct inode *inode, const cetrafs_inode_t *fresh);
 u64 cetrafs_tree_cold_mark_count(void);
 void cetrafs_inode_mark_tree_cold(struct inode *inode);
+void cetrafs_lock_tree_superseded(struct inode *inode); /* lock.c: held-back set dropped as stale (BC-31) */
 bool cetrafs_lock_identity_cache_trusted(struct inode *inode);
 /* lock.c: default-mount lock suspension counters (procfs `info`). */
 u64 cetrafs_lock_suspend_count(void);
@@ -1974,6 +1975,7 @@ bool cetrafs_deferred_eager(void);
 u64 cetrafs_deferred_hold_count(void);
 u64 cetrafs_deferred_list_step_count(void);
 int cetrafs_deferred_flush_inode(struct inode *inode, bool mapping_locked);
+u64 cetrafs_deferred_stale_set_count(void); /* leafdefer.c: sets dropped as superseded (BC-31) */
 int cetrafs_deferred_flush_orphans_of(struct super_block *sb, u64 ino);
 int cetrafs_deferred_flush_all(struct super_block *sb);
 unsigned long cetrafs_deferred_drop_all(struct super_block *sb);
