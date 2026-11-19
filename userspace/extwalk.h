@@ -17,7 +17,7 @@
 #include <stdint.h>
 #include <string.h>
 
-#include "../include/cetrafs.h"
+#include "cetrafs.h"
 
 enum cetrafs_utw_bad {
     CETRAFS_UTW_RANGE, /* the address is outside the volume (blk NULL) */

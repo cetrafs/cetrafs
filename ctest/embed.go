@@ -5,6 +5,7 @@ import (
 	"bytes"
 	"embed"
 	"fmt"
+	"io/fs"
 	"os"
 	"os/exec"
 	"path/filepath"
@@ -43,17 +44,18 @@ func buildEmbeddedHelper(name string) (string, error) {
 
 	want := map[string]string{
 		name + ".c": "embedded/" + name + ".c",
-		"cetrafs.h": "embedded/cetrafs.h",
-		"crc32c.h":  "embedded/crc32c.h",
 	}
-	// fsck and mkfs are the userspace TOOLS, carried for the same reason
-	// as the pokes: a node running an installed ctest has no cetrafs
-	// checkout, and until now that meant no fsck on most of the fleet --
-	// so a scenario could not check the volume from the node it was
-	// standing on, and mkfs-guard could not run at all. They need one
-	// extra header the pokes do not.
-	if name == "fsck" || name == "mkfs" || name == "growfs" {
-		want["devutil.h"] = "embedded/devutil.h"
+	// Every embedded header, for every helper: fsck and mkfs are the
+	// userspace TOOLS, carried for the same reason as the pokes (a node
+	// running an installed ctest has no cetrafs checkout), and a list of
+	// which header each one needs drifted -- fsck's extwalk.h was missing
+	// and every scenario's final fsck failed to build.
+	hs, err := fs.Glob(embeddedHelpers, "embedded/*.h")
+	if err != nil {
+		return "", err
+	}
+	for _, h := range hs {
+		want[filepath.Base(h)] = h
 	}
 	for out, src := range want {
 		body, err := embeddedHelpers.ReadFile(src)
