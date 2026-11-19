@@ -1646,7 +1646,7 @@ static unsigned int cetrafs_new_record_nospc;
 cetrafs_test_param(new_record_nospc, cetrafs_new_record_nospc, uint, 0644);
 MODULE_PARM_DESC(new_record_nospc, "TEST ONLY: the next N new inode records are refused for space");
 
-static int __cetrafs_write_raw_inode(struct super_block *sb, u64 ino, const cetrafs_inode_t *in, bool sync,
+static int __cetrafs_write_raw_inode(struct super_block *sb, u64 ino, const cetrafs_inode_t *in,
                                      bool refusable)
 {
     if (S_ISDIR(cetrafs_le32(in->mode)))
@@ -1675,8 +1675,13 @@ static int __cetrafs_write_raw_inode(struct super_block *sb, u64 ino, const cetr
      *
      * Free when nothing was allocated since the last boundary: the dirty
      * set is empty and the scan finds no marked BG.
+     *
+     * Every write here is synchronous. There was a buffered variant
+     * (sync=false) that skipped this flush and left the record to
+     * writeback -- extents published with their bits still volatile;
+     * no caller used it, and it is gone (audit 2026-11-15 BL-41).
      */
-    if (sync) {
+    {
         int fret = cetrafs_alloc_flush_bitmaps(sb);
 
         if (fret)
@@ -1746,7 +1751,7 @@ static int __cetrafs_write_raw_inode(struct super_block *sb, u64 ino, const cetr
             msleep(t);
         }
     }
-    if (sync) {
+    {
         cetrafs_record_write_counted();
         /* The result IS the answer this function exists to give. A
          * failed sync leaves the buffer clean and !uptodate -- the
@@ -1782,20 +1787,6 @@ static int __cetrafs_write_raw_inode(struct super_block *sb, u64 ino, const cetr
 }
 
 /*
- * The whole-record write for a number this node has NO in-core object
- * for: a just-allocated number (create, mkdir, symlink, and their
- * unwinds). A free number has no live object a refresh could be running
- * on -- a refresh needs a reference, and an object for a number is only
- * freed once that number is free -- so there is no fd publish mutex to
- * take. Callers that hold the inode use cetrafs_write_raw_inode_self(),
- * which takes it.
- */
-int cetrafs_write_raw_inode(struct super_block *sb, u64 ino, const cetrafs_inode_t *in, bool sync)
-{
-    return __cetrafs_write_raw_inode(sb, ino, in, sync, false);
-}
-
-/*
  * The first whole-record write of a number just allocated (create, mkdir,
  * symlink): synchronous, and the device's DEFINITE refusal -- a thin pool
  * out of space, a snapshot's copy-on-write refused -- fails the create
@@ -1805,7 +1796,7 @@ int cetrafs_write_raw_inode(struct super_block *sb, u64 ino, const cetrafs_inode
  */
 int cetrafs_write_raw_inode_new(struct super_block *sb, u64 ino, const cetrafs_inode_t *in)
 {
-    return __cetrafs_write_raw_inode(sb, ino, in, true, true);
+    return __cetrafs_write_raw_inode(sb, ino, in, true);
 }
 
 /*
@@ -1823,14 +1814,14 @@ static bool cetrafs_record_publish_unlocked;
 cetrafs_test_param(record_publish_unlocked, cetrafs_record_publish_unlocked, bool, 0644);
 MODULE_PARM_DESC(record_publish_unlocked, "TEST ONLY: whole-record writes publish without fd_pub_mutex");
 
-int cetrafs_write_raw_inode_self(struct inode *self, const cetrafs_inode_t *in, bool sync)
+int cetrafs_write_raw_inode_self(struct inode *self, const cetrafs_inode_t *in)
 {
     bool locked = !READ_ONCE(cetrafs_record_publish_unlocked);
     int ret;
 
     if (locked)
         cetrafs_inode_fd_pub_lock(self);
-    ret = __cetrafs_write_raw_inode(self->i_sb, self->i_ino, in, sync, false);
+    ret = __cetrafs_write_raw_inode(self->i_sb, self->i_ino, in, false);
     if (locked)
         cetrafs_inode_fd_pub_unlock(self);
     return ret;

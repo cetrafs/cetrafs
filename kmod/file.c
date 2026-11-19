@@ -7136,7 +7136,7 @@ relookup:
          * is namespace-owned end to end, publishes whole and sync under
          * the lock the caller holds. */
         if (S_ISDIR(inode->i_mode)) {
-            ret = cetrafs_write_raw_inode_self(inode, &raw, /*sync=*/true);
+            ret = cetrafs_write_raw_inode_self(inode, &raw);
             cetrafs_tree_move_end(inode, &moving);
             if (ret)
                 return ret;
@@ -7461,7 +7461,7 @@ allocated:
          * the stamp (audit 2026-11-15 BM N-72). */
         if (!READ_ONCE(cetrafs_dir_grow_no_stamp))
             raw.dirent_seq = cetrafs_cpu_to_le64(cetrafs_inode_new_generation(sb));
-        ret = cetrafs_write_raw_inode_self(inode, &raw, /*sync=*/true);
+        ret = cetrafs_write_raw_inode_self(inode, &raw);
         if (!ret && unlikely(READ_ONCE(cetrafs_dir_grow_stall_ms)))
             msleep(xchg(&cetrafs_dir_grow_stall_ms, 0)); /* test-only, one-shot */
         if (ret) {

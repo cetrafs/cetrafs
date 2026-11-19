@@ -1655,7 +1655,7 @@ int cetrafs_dir_update_dotdot(struct inode *dir, u64 new_parent_ino)
                      * -- otherwise a peer whose cached seq still matches
                      * would go on serving the old '..' from its cache. */
                     raw.dirent_seq = cetrafs_cpu_to_le64(cetrafs_dirent_seq_new(dir->i_sb));
-                    ret = cetrafs_write_raw_inode_self(dir, &raw, /*sync=*/true);
+                    ret = cetrafs_write_raw_inode_self(dir, &raw);
                     if (ret)
                         return ret;
                     /* No cache claim: this walk stopped at '..' in the
@@ -1825,7 +1825,7 @@ static int cetrafs_dir_retarget_entry(struct inode *dir,
     ctrace("RETGT dir=%llu name='%.*s' new_ino=%llu removed_ino=%llu\n",
             (unsigned long long) dir->i_ino, (int) name->len, name->name,
             (unsigned long long) new_ino, (unsigned long long) *out_old_ino);
-    ret = cetrafs_write_raw_inode_self(dir, &raw, /*sync=*/true);
+    ret = cetrafs_write_raw_inode_self(dir, &raw);
     if (ret)
         return ret;
 
@@ -2194,7 +2194,7 @@ static void cetrafs_new_inode_discard(struct inode *inode)
         cetrafs_le64(raw.generation) == cetrafs_inode_get_generation(inode) &&
         cetrafs_le32(raw.nlink) != 0) {
         raw.nlink = cetrafs_cpu_to_le32(0);
-        (void) cetrafs_write_raw_inode_self(inode, &raw, /*sync=*/true);
+        (void) cetrafs_write_raw_inode_self(inode, &raw);
     }
 
     /* The birth is over: it failed. Eviction frees the number through
