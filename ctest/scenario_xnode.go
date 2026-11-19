@@ -339,35 +339,34 @@ func waitDmesg(c *Client, mark, want string, limit time.Duration) bool {
 	return false
 }
 
-// RunReplayAfterTruncate: a dead node's journal replayed after a
-// survivor freed what it targets, by two survivors, the first of which
-// cannot consume.
+// RunReplayAfterTruncate: a survivor's truncate of a dead node's VM
+// image waits for that node's journal, and two survivors replay it, the
+// first of which cannot consume.
 //
 // Under nofilelock a VM's writer holds no lock, only its presence bit.
-// When that node dies the VM is restarted elsewhere, and the new
-// writer's first truncate fences the dead node and clears its bit --
-// without replaying its journal, which only a lock holder's reclaim
-// does. The truncate then frees blocks the dead node's surviving
-// entries target, and the replay comes later, from a sweep. Two fixes
-// meet here, both staged single-node by planting entries:
-//   - a target freed since its entry is not redone (a19ef23);
+// When that node dies the VM is restarted elsewhere. The new writer's
+// truncate used to fence the dead node and clear its bit WITHOUT
+// replaying its journal, free the blocks its surviving entries target,
+// and leave the redo to a later sweep (a19ef23 made that redo skip a
+// freed target). Since 5afa7f6 (audit F-37) the bit stays while the
+// journal is dirty, so the truncate is refused -- ETXTBSY, as for a live
+// peer -- until a replay has run; the freed-target redo is now reached
+// only single-node, by planted entries. What is left here:
+//   - the truncate is refused while the journal is dirty, and frees
+//     nothing (F-37);
 //   - a replay that cannot consume an entry leaves the area DIRTY, so
-//     the next replay finds the redo in place and finishes (88f350b).
+//     the next replay finds the redo in place and finishes (88f350b),
+//     and the truncate is still refused in between;
+//   - once a replay is through, the same truncate goes through.
 //
 // c stops with entries for vm.img's tree blocks durable and not applied
-// (journal_batch_crash_before_targets) and loses its device. a and b
-// are kept out of its journal (journal_replay_refuse) while a truncates
-// vm.img to 0. Then b replays with its consume failed once
-// (journal_consume_fail_once): the area must still read DIRTY. Then a
-// replays: the area reads CLEAN. vm.img stays empty on both survivors
-// -- the replay of its old tree blocks resurrects nothing -- and fsck is
+// (journal_batch_crash_before_targets) and loses its device. a and b are
+// kept out of its journal (journal_replay_refuse) while a's truncate is
+// refused. Then b replays with its consume failed once
+// (journal_consume_fail_once): the area must still read DIRTY, and a's
+// truncate is refused again. Then a replays: the area reads CLEAN, a's
+// truncate to 0 succeeds, vm.img is empty on both survivors, and fsck is
 // clean once c has come back.
-//
-// On the rig (2026-11-12) the truncated target is refused before the
-// freed-bit check is reached: its owner no longer maps it ("no longer
-// a block of its owner -- freed and reused since"). Either refusal
-// keeps the old tree block off the device; the outcome is what is
-// checked.
 //
 // Control (CTEST_CONSUME_CONTROL=1): b parks the area after the failed
 // consume as it used to (journal_consume_fail_park) -- it must read
@@ -481,16 +480,30 @@ func RunReplayAfterTruncate(clients []*Client, baseDir string) (bool, error) {
 	}
 
 	// The restarted VM's first act: truncate. No lock to reclaim, so
-	// nothing replays c first.
-	if err := callOK(a, "truncate", TruncateArgs{Path: img, Size: 0}); err != nil {
-		check(&ok, a.Name+" truncates the dead node's VM image", false, err.Error())
-		return ok, nil
+	// nothing replays c first -- and c's presence bit refuses it.
+	var s0 StatResult
+	resp, err = a.Call("stat", StatArgs{Path: img})
+	if e := decodeResult(a.Name, resp, err, &s0); e != nil {
+		return false, fmt.Errorf("setup: %s stat: %w", a.Name, e)
 	}
+	refusedBusy := func(label string) {
+		err := callOK(a, "truncate", TruncateArgs{Path: img, Size: 0})
+		check(&ok, label, err != nil && strings.Contains(err.Error(), "text file busy"),
+			fmt.Sprintf("err %v", err))
+	}
+	refusedBusy(a.Name + "'s truncate is refused while " + c.Name + "'s journal is dirty (F-37)")
 	if st := journalState(a, cID); st != 1 {
-		check(&ok, "setup: "+c.Name+"'s journal is still unreplayed after the truncate", false, fmt.Sprintf("state %d", st))
+		check(&ok, "setup: "+c.Name+"'s journal is still unreplayed after the refused truncate", false, fmt.Sprintf("state %d", st))
 		return ok, nil
 	}
-	pass("setup: " + a.Name + " truncated vm.img with " + c.Name + "'s journal still unreplayed")
+	var s1 StatResult
+	resp, err = a.Call("stat", StatArgs{Path: img})
+	if e := decodeResult(a.Name, resp, err, &s1); e != nil {
+		check(&ok, a.Name+" stats vm.img", false, e.Error())
+	} else {
+		check(&ok, "and the refused truncate changed nothing", s1.Size == s0.Size && s1.Size > 0,
+			fmt.Sprintf("size %d -> %d", s0.Size, s1.Size))
+	}
 
 	// b replays and cannot consume.
 	if err := param(b, "journal_consume_fail_once", "1"); err != nil {
@@ -514,11 +527,14 @@ func RunReplayAfterTruncate(clients []*Client, baseDir string) (bool, error) {
 	} else {
 		check(&ok, b.Name+"'s replay could not consume; the area stays dirty for the next replay", st == 1,
 			fmt.Sprintf("state %d", st))
+		refusedBusy(a.Name + "'s truncate is still refused while the area is dirty")
 		_ = callOK(a, "mod_param", ModParamArgs{Name: "journal_replay_refuse", Value: "0"})
 		check(&ok, a.Name+" replays it after "+b.Name, waitDmesg(a, mark, fmt.Sprintf("journal replay: node %d replayed", cID), 40*time.Second),
 			"no replay of "+c.Name+"'s journal on "+a.Name)
 		time.Sleep(2 * time.Second)
 		check(&ok, "and the area reads clean", journalState(a, cID) == 0, fmt.Sprintf("state %d", journalState(a, cID)))
+		err := callOK(a, "truncate", TruncateArgs{Path: img, Size: 0})
+		check(&ok, "with the journal replayed, "+a.Name+"'s truncate goes through", err == nil, fmt.Sprintf("err %v", err))
 	}
 	for _, cl := range []*Client{a, b} {
 		var s StatResult
@@ -527,7 +543,10 @@ func RunReplayAfterTruncate(clients []*Client, baseDir string) (bool, error) {
 			check(&ok, cl.Name+" stats vm.img", false, e.Error())
 			continue
 		}
-		check(&ok, fmt.Sprintf("vm.img is still empty on %s: the replay of its old tree blocks resurrected nothing", cl.Name),
+		if control {
+			continue // nothing truncated it: the control stops at the park
+		}
+		check(&ok, fmt.Sprintf("vm.img is empty on %s after the replay and the truncate", cl.Name),
 			s.Size == 0, fmt.Sprintf("size %d", s.Size))
 	}
 
