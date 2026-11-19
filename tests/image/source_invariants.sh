@@ -2100,6 +2100,7 @@ cetrafs_verdict_current key:verdict_gen
 cetrafs_inode_foreign_opener_cached calls:cetrafs_verdict_current
 cetrafs_lock_identity_cache_trusted calls:cetrafs_inode_foreign_opener_cached
 cetrafs_lock_read_cache_trusted calls:cetrafs_inode_read_stamp_check
+cetrafs_tree_cache_trusted calls:cetrafs_lock_read_cache_trusted
 cetrafs_sb_zg_owned_cached none:this-nodes-own-claims-revoked-only-by-its-fence
 cetrafs_inode_dirent_seq_cached none:an-accessor-of-the-stamp-dir_needs_fresh-compares
 cetrafs_inode_set_dirent_seq_cached none:an-accessor
