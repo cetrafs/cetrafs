@@ -10145,6 +10145,12 @@ static int cetrafs_sync_inode_meta(struct inode *inode, bool datasync)
     return ret;
 }
 
+/* TEST ONLY: fsync publishes the record after a failed bitmap or tree
+ * flush, as before audit 2026-11-15 BL-22 (tests/kernel/fsync_flush_fail.sh). */
+static bool cetrafs_fsync_publish_after_fail;
+cetrafs_test_param(fsync_publish_after_fail, cetrafs_fsync_publish_after_fail, bool, 0644);
+MODULE_PARM_DESC(fsync_publish_after_fail, "TEST ONLY: fsync publishes the record after a failed tree flush");
+
 static int cetrafs_fsync_meta(struct inode *inode, int ret, bool locked, bool datasync)
 {
     struct super_block *sb = inode->i_sb;
@@ -10196,6 +10202,11 @@ static int cetrafs_fsync_meta(struct inode *inode, int ret, bool locked, bool da
      * extent_leaf_staleness.sh, which went from pass to fail on exactly
      * that.
      */
+    /* Not over a failed flush (rule 8, audit BL-22): the record names
+     * the tree and the bits the steps above could not make durable. It
+     * stays dirty, for the next boundary; the fsync reports the error. */
+    if (ret && !READ_ONCE(cetrafs_fsync_publish_after_fail))
+        return ret;
     ret2 = cetrafs_sync_inode_meta(inode, datasync);
     if (ret2 && !ret)
         ret = ret2;
