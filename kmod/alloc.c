@@ -1772,6 +1772,12 @@ u64 cetrafs_bg_geom_read_count(void)
  * against a computed position: a grown volume's Block Groups are not
  * contiguous (cetrafs_superblock_t.bg_data_end).
  */
+/* TEST ONLY: accept any in-bounds layout, as before audit 2026-11-15
+ * BL-33 (tests/kernel/bg_layout_exact.sh). */
+static bool cetrafs_bg_layout_any;
+cetrafs_test_param(bg_layout_any, cetrafs_bg_layout_any, bool, 0644);
+MODULE_PARM_DESC(bg_layout_any, "TEST ONLY: accept a Block Group descriptor whose layout is in bounds but not the computed one");
+
 static bool cetrafs_bg_geom_sane(const cetrafs_superblock_t *raw_sb, u32 bg_id, const cetrafs_block_group_t *bg)
 {
     u64 regions = le64_to_cpu(raw_sb->bg_regions_start);
@@ -1782,6 +1788,8 @@ static bool cetrafs_bg_geom_sane(const cetrafs_superblock_t *raw_sb, u32 bg_id, 
     u64 bmap = cetrafs_le32(bg->off_data_bmap);
     u64 region = cetrafs_le32(bg->off_data_region);
     u64 count = cetrafs_le64(bg->data_block_count);
+    u32 want_bmap, want_region;
+    u64 want_count;
 
     if (!data_end)
         data_end = regions + (u64) le32_to_cpu(raw_sb->block_group_count) * le64_to_cpu(raw_sb->bg_size_blocks);
@@ -1790,10 +1798,21 @@ static bool cetrafs_bg_geom_sane(const cetrafs_superblock_t *raw_sb, u32 bg_id, 
 
     /* len is also bounded by the format's ceiling, not only by the data
      * area: a block offset inside a BG is a u32 (audit L10). */
-    return cetrafs_le32(bg->bg_id) == bg_id && start >= regions && len && len <= CETRAFS_MAX_BG_SIZE_BLOCKS &&
-           len <= data_end - regions &&
-           start <= data_end - len && bmap >= 1 && bmap < region && region <= len && count <= len - region &&
-           count <= (region - bmap) * CETRAFS_BMAP_BLOCK_BITS;
+    if (!(cetrafs_le32(bg->bg_id) == bg_id && start >= regions && len && len <= CETRAFS_MAX_BG_SIZE_BLOCKS &&
+          len <= data_end - regions && start <= data_end - len && bmap >= 1 && bmap < region && region <= len &&
+          count <= len - region && count <= (region - bmap) * CETRAFS_BMAP_BLOCK_BITS))
+        return false;
+    /*
+     * ...and exactly the layout its length gives: the one definition
+     * mkfs, growfs and fsck use (cetrafs_calc_bg_layout()). In bounds is
+     * not enough -- a bitmap moved by a block reads the group's
+     * allocations off by a block's worth of bits, and fsck refused what
+     * the mount served (audit 2026-11-15 BL-33). Two divisions, beside
+     * the descriptor's checksum.
+     */
+    cetrafs_calc_bg_layout(len, le32_to_cpu(raw_sb->data_align_blocks), &want_bmap, &want_region, &want_count);
+    return READ_ONCE(cetrafs_bg_layout_any) ||
+           (bmap == want_bmap && region == want_region && count == want_count);
 }
 
 /*
