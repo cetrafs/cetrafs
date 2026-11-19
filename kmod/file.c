@@ -1544,7 +1544,7 @@ static int cetrafs_flat_leaf(struct cetrafs_tw *w, const cetrafs_extent_t *arr, 
      * time, not only the answer. */
     if (f->max && (u64) f->n + ln > f->max) {
         f->over = true;
-        return -EUCLEAN;
+        return -E2BIG;
     }
     if (f->n + ln > f->cap) {
         u32 ncap = max_t(u32, f->cap ? f->cap * 2 : 512, f->n + ln);
@@ -1591,22 +1591,39 @@ MODULE_PARM_DESC(dir_flatten_unbounded, "TEST ONLY: a directory's tree is flatte
  * The walk 'w' names its reader -- an inode and a read mode, or a super
  * block and a scrub mode; its ops and ctx are this function's. The array
  * is the caller's to kvfree(), NULL when the tree holds no extent. */
+static int cetrafs_tree_extents_max(struct cetrafs_tw *w, const cetrafs_inode_t *raw, u32 max,
+                                    cetrafs_extent_t **out_arr, u32 *out_n);
+
 int cetrafs_tree_extents(struct cetrafs_tw *w, const cetrafs_inode_t *raw, cetrafs_extent_t **out_arr, u32 *out_n)
 {
-    struct cetrafs_flat_ctx f = {0};
     int ret;
 
-    if (S_ISDIR(cetrafs_le32(raw->mode)) && !READ_ONCE(cetrafs_dir_flatten_unbounded))
-        f.max = CETRAFS_DIR_MAX_BLOCKS;
+    if (!S_ISDIR(cetrafs_le32(raw->mode)) || READ_ONCE(cetrafs_dir_flatten_unbounded))
+        return cetrafs_tree_extents_max(w, raw, 0, out_arr, out_n);
+    ret = cetrafs_tree_extents_max(w, raw, CETRAFS_DIR_MAX_BLOCKS, out_arr, out_n);
+    if (ret != -E2BIG)
+        return ret;
+    pr_err_ratelimited("dir ino=%llu: its extent tree holds more than %u extents, more than a directory may hold -- "
+                       "refusing it (fsck)\n",
+                       (unsigned long long) cetrafs_le64(raw->ino), CETRAFS_DIR_MAX_BLOCKS);
+    return -EUCLEAN;
+}
+
+/* As above, -E2BIG as soon as the walk meets extent number max + 1
+ * (0: no ceiling but the format's). */
+static int cetrafs_tree_extents_max(struct cetrafs_tw *w, const cetrafs_inode_t *raw, u32 max,
+                                    cetrafs_extent_t **out_arr, u32 *out_n)
+{
+    struct cetrafs_flat_ctx f = {.max = max};
+    int ret;
+
     w->ops = &cetrafs_flat_ops;
     w->ctx = &f;
     ret = cetrafs_tree_walk(w, raw);
     if (ret) {
         kvfree(f.arr);
         if (f.over)
-            pr_err_ratelimited("dir ino=%llu: its extent tree holds more than %u extents, more than a directory may "
-                               "hold -- refusing it (fsck)\n",
-                               (unsigned long long) cetrafs_le64(raw->ino), f.max);
+            return -E2BIG;
         return ret < 0 ? ret : -EIO;
     }
     *out_arr = f.arr;
@@ -1614,20 +1631,30 @@ int cetrafs_tree_extents(struct cetrafs_tw *w, const cetrafs_inode_t *raw, cetra
     return 0;
 }
 
+/* 'max': -E2BIG past that many extents (0: the format's ceiling; a
+ * directory's is its own, cetrafs_tree_extents()). */
 static int cetrafs_tree_flatten_for(struct inode *inode, const cetrafs_inode_t *raw, cetrafs_extent_t **out_arr,
-                                    u32 *out_n, bool reader)
+                                    u32 *out_n, bool reader, u32 max)
 {
     struct cetrafs_tw w = {
         .inode = inode,
         .read = reader ? CETRAFS_TW_READER : CETRAFS_TW_WRITER,
     };
 
+    if (max && !S_ISDIR(cetrafs_le32(raw->mode)))
+        return cetrafs_tree_extents_max(&w, raw, max, out_arr, out_n);
     return cetrafs_tree_extents(&w, raw, out_arr, out_n);
 }
 
 int cetrafs_tree_flatten(struct inode *inode, const cetrafs_inode_t *raw, cetrafs_extent_t **out_arr, u32 *out_n)
 {
-    return cetrafs_tree_flatten_for(inode, raw, out_arr, out_n, false);
+    return cetrafs_tree_flatten_for(inode, raw, out_arr, out_n, false, 0);
+}
+
+int cetrafs_tree_flatten_max(struct inode *inode, const cetrafs_inode_t *raw, u32 max, cetrafs_extent_t **out_arr,
+                             u32 *out_n)
+{
+    return cetrafs_tree_flatten_for(inode, raw, out_arr, out_n, false, max);
 }
 
 /*
@@ -2039,7 +2066,7 @@ MODULE_PARM_DESC(extents_fetch_fail_once, "TEST ONLY: the next extent-list fetch
 /* 'reader': see cetrafs_tree_flatten_for(). Only for a caller that
  * reports the map -- never one that frees, moves or writes by it. */
 static int cetrafs_inode_extents_get_for(struct inode *inode, const cetrafs_inode_t *raw,
-                                         struct cetrafs_inode_extents *ex, bool reader)
+                                         struct cetrafs_inode_extents *ex, bool reader, u32 max)
 {
     if (cetrafs_extents_fetch_fail_once) {
         cetrafs_extents_fetch_fail_once = false;
@@ -2060,7 +2087,7 @@ static int cetrafs_inode_extents_get_for(struct inode *inode, const cetrafs_inod
         return 0;
     }
 
-    ret = cetrafs_tree_flatten_for(inode, raw, &ex->heap, &ex->entries, reader);
+    ret = cetrafs_tree_flatten_for(inode, raw, &ex->heap, &ex->entries, reader, max);
     if (ret)
         return ret;
     ex->arr = ex->heap;
@@ -2069,7 +2096,7 @@ static int cetrafs_inode_extents_get_for(struct inode *inode, const cetrafs_inod
 
 int cetrafs_inode_extents_get(struct inode *inode, const cetrafs_inode_t *raw, struct cetrafs_inode_extents *ex)
 {
-    return cetrafs_inode_extents_get_for(inode, raw, ex, false);
+    return cetrafs_inode_extents_get_for(inode, raw, ex, false, 0);
 }
 
 void cetrafs_inode_extents_put(struct cetrafs_inode_extents *ex)
@@ -2199,21 +2226,203 @@ static int cetrafs_tree_identity(struct inode *inode, const cetrafs_inode_t *raw
 }
 
 /*
- * The extents of 'raw' in logical order, as a reference the caller puts
+ * The memory budget of one map, in runs (32 bytes each): 32 MiB, the
+ * whole map of a file of ~4 GiB written in scattered 4 KiB blocks. A
+ * depth-3 tree holds 65.5M extents, and a whole map of that was a
+ * GFP_NOFS kvmalloc of 2 GiB with its flatten beside it (audit
+ * 2026-11-15 F-62). Past the budget the map is a WINDOW: the 'budget'
+ * runs of lowest start among those reaching past the caller's block,
+ * found by one walk of the tree with a heap of that size. A caller
+ * moving forward (SEEK from qemu-img, filefrag's FIEMAP calls) reuses a
+ * window until it walks past it, so a whole pass costs one tree walk
+ * per budget's worth of runs.
+ */
+#define CETRAFS_SMAP_BUDGET (1U << 20)
+static unsigned int cetrafs_smap_budget;
+cetrafs_test_param(smap_budget, cetrafs_smap_budget, uint, 0644);
+MODULE_PARM_DESC(smap_budget, "TEST ONLY: the SEEK/FIEMAP map budget in runs (0: the default, 1M; at least 2)");
+static bool cetrafs_smap_unbounded;
+cetrafs_test_param(smap_unbounded, cetrafs_smap_unbounded, bool, 0644);
+MODULE_PARM_DESC(smap_unbounded, "TEST ONLY: SEEK/FIEMAP build a whole map whatever its size, as before F-62");
+
+static atomic64_t cetrafs_smap_windows = ATOMIC64_INIT(0);
+
+u64 cetrafs_smap_window_count(void)
+{
+    return (u64) atomic64_read(&cetrafs_smap_windows);
+}
+
+/* At least two runs: a healthy tree has at most one run covering a
+ * block, so a window of two always reaches past the block it starts at
+ * (cetrafs_smap_window()). */
+static u32 cetrafs_smap_budget_runs(void)
+{
+    u32 b = READ_ONCE(cetrafs_smap_budget);
+
+    return b ? max_t(u32, b, 2) : CETRAFS_SMAP_BUDGET;
+}
+
+/* The window walk: a max-heap on start of the 'k' lowest-starting runs
+ * that reach past 'from'. */
+struct cetrafs_win_ctx {
+    struct cetrafs_ext_run *h;
+    u32 n, k;
+    u64 from;
+    bool zero;
+};
+
+static void cetrafs_win_sift_down(struct cetrafs_ext_run *h, u32 n, u32 i)
+{
+    for (;;) {
+        u32 l = 2 * i + 1, r = l + 1, big = i;
+
+        if (l < n && h[l].start > h[big].start)
+            big = l;
+        if (r < n && h[r].start > h[big].start)
+            big = r;
+        if (big == i)
+            return;
+        swap(h[i], h[big]);
+        i = big;
+    }
+}
+
+static void cetrafs_win_sift_up(struct cetrafs_ext_run *h, u32 i)
+{
+    while (i) {
+        u32 p = (i - 1) / 2;
+
+        if (h[p].start >= h[i].start)
+            return;
+        swap(h[p], h[i]);
+        i = p;
+    }
+}
+
+static int cetrafs_win_leaf(struct cetrafs_tw *w, const cetrafs_extent_t *arr, u32 ln, u64 lba)
+{
+    struct cetrafs_win_ctx *c = w->ctx;
+    u32 i;
+
+    for (i = 0; i < ln; i++) {
+        struct cetrafs_ext_run run = {
+            .start = cetrafs_ee_lblk(&arr[i]),
+            .len = cetrafs_ee_len(&arr[i]),
+            .phys = cetrafs_ee_pblk(&arr[i]),
+            .uninit = cetrafs_ee_uninit(&arr[i]),
+        };
+
+        if (!run.len) {
+            c->zero = true; /* damage, never a step (rule 14) */
+            continue;
+        }
+        if (run.start + run.len <= c->from)
+            continue;
+        if (c->n < c->k) {
+            c->h[c->n] = run;
+            cetrafs_win_sift_up(c->h, c->n++);
+        } else if (run.start < c->h[0].start) {
+            c->h[0] = run;
+            cetrafs_win_sift_down(c->h, c->n, 0);
+        }
+    }
+    return 0;
+}
+
+/* Only a leaf-pointing entry's range is exact (the interiors' are not
+ * maintained), and only a known one prunes. */
+static int cetrafs_win_want(struct cetrafs_tw *w, const cetrafs_extent_idx_t *ie, int level)
+{
+    struct cetrafs_win_ctx *c = w->ctx;
+
+    if (level || !cetrafs_ei_end(ie))
+        return CETRAFS_TW_DESCEND; /* an end of 0 is "unknown" */
+    if (cetrafs_ei_end(ie) <= c->from)
+        return CETRAFS_TW_SKIP; /* everything in it ends before the window */
+    if (c->n == c->k && cetrafs_ei_lo(ie) >= c->h[0].start)
+        return CETRAFS_TW_SKIP; /* nothing in it can displace a run kept */
+    return CETRAFS_TW_DESCEND;
+}
+
+static const struct cetrafs_tw_ops cetrafs_win_ops = {
+    .want = cetrafs_win_want,
+    .leaf = cetrafs_win_leaf,
+};
+
+static int cetrafs_smap_window(struct inode *inode, const cetrafs_inode_t *raw, u64 from, u32 k,
+                               struct cetrafs_smap **out)
+{
+    struct cetrafs_win_ctx c = {.k = k, .from = from};
+    struct cetrafs_tw w = {
+        .ops = &cetrafs_win_ops,
+        .inode = inode,
+        .read = CETRAFS_TW_READER, /* reports the map only */
+        .ctx = &c,
+    };
+    struct cetrafs_smap *m;
+    u64 bound = U64_MAX;
+    u32 n;
+    int ret;
+
+    m = kvmalloc(struct_size(m, runs, k), GFP_NOFS);
+    if (!m)
+        return -ENOMEM;
+    c.h = m->runs;
+    ret = cetrafs_tree_walk(&w, raw);
+    if (ret) {
+        kvfree(m);
+        return ret < 0 ? ret : -EIO;
+    }
+    if (c.zero) {
+        pr_err_ratelimited("ino=%llu: an extent has zero length -- skipping it (fsck)\n",
+                           (unsigned long long) inode->i_ino);
+        cetrafs_sb_corrupt_inode(inode);
+    }
+    n = c.n;
+    if (n == k)
+        bound = m->runs[0].start; /* runs starting here or later may be missing */
+    sort(m->runs, n, sizeof(m->runs[0]), cetrafs_ext_run_cmp, NULL);
+    while (n && m->runs[n - 1].start >= bound)
+        n--;
+    /* 'k' runs all starting at or before 'from' and reaching past it
+     * overlap there: damage, and a window that would not move forward. */
+    if (bound <= from) {
+        kvfree(m);
+        pr_err_ratelimited("ino=%llu: %u extents overlap at block %llu -- refusing the map (fsck)\n",
+                           (unsigned long long) inode->i_ino, k, (unsigned long long) from);
+        cetrafs_sb_corrupt_inode(inode);
+        return -EUCLEAN;
+    }
+    refcount_set(&m->ref, 1);
+    m->n = n;
+    m->from = from;
+    m->bound = bound;
+    m->overlap = cetrafs_runs_overlap(m->runs, n);
+    atomic64_inc(&cetrafs_smap_windows);
+    *out = m;
+    return 0;
+}
+
+/*
+ * The extents of 'raw' in logical order, exact for the blocks in
+ * [from, (*out)->bound) at least, as a reference the caller puts
  * (cetrafs_smap_put()). Caller holds invalidate_lock, shared at least.
  *
  * A deep tree's map is kept on the inode between calls and reused
  * while the tree's identity is unchanged (cetrafs_tree_identity()):
  * sorting a fragmented image's ~258k extents took ~47 ms, and filefrag
  * makes hundreds of FIEMAP calls, each of which sorted again -- 42 s of
- * CPU under the inode lock. Smaller trees are sorted per call.
+ * CPU under the inode lock. Smaller trees are sorted per call. A tree
+ * past the budget is answered by windows, kept the same way.
  */
-static int cetrafs_inode_sorted_runs(struct inode *inode, const cetrafs_inode_t *raw, struct cetrafs_smap **out)
+static int cetrafs_inode_sorted_runs(struct inode *inode, const cetrafs_inode_t *raw, u64 from,
+                                     struct cetrafs_smap **out)
 {
     struct cetrafs_inode_extents ex;
     struct cetrafs_smap *m;
     struct cetrafs_ext_run *r;
-    bool keyed;
+    bool keyed, over = false;
+    u32 budget = READ_ONCE(cetrafs_smap_unbounded) ? 0 : cetrafs_smap_budget_runs();
     u64 key = 0;
     u32 i, n = 0;
     int ret;
@@ -2221,13 +2430,27 @@ static int cetrafs_inode_sorted_runs(struct inode *inode, const cetrafs_inode_t 
     keyed = cetrafs_tree_identity(inode, raw, &key) == 0;
     if (keyed) {
         m = cetrafs_inode_smap_get(inode, key);
-        if (m) {
+        if (m && from >= m->from && from < m->bound) {
             atomic64_inc(&cetrafs_smap_hits);
             *out = m;
             return 0;
         }
+        /* A window of this very tree that does not cover 'from': the
+         * tree is past the budget, no whole map is attempted. */
+        over = m && budget;
+        cetrafs_smap_put(m);
     }
-    ret = cetrafs_inode_extents_get_for(inode, raw, &ex, true); /* reports the map only */
+    ret = over ? -E2BIG : cetrafs_inode_extents_get_for(inode, raw, &ex, true, budget); /* reports the map only */
+    if (ret == -E2BIG && budget) {
+        ret = cetrafs_smap_window(inode, raw, from, budget, &m);
+        if (ret)
+            return ret;
+        m->key = key;
+        if (keyed)
+            cetrafs_inode_smap_store(inode, m);
+        *out = m;
+        return 0;
+    }
     if (ret)
         return ret;
     m = kvmalloc(struct_size(m, runs, max_t(u32, ex.entries, 1)), GFP_NOFS);
@@ -2256,6 +2479,8 @@ static int cetrafs_inode_sorted_runs(struct inode *inode, const cetrafs_inode_t 
     cetrafs_inode_extents_put(&ex);
     sort(r, n, sizeof(*r), cetrafs_ext_run_cmp, NULL);
     m->n = n;
+    m->from = 0;
+    m->bound = U64_MAX;
     m->overlap = cetrafs_runs_overlap(r, n);
     m->key = key;
     if (keyed)
@@ -2479,7 +2704,7 @@ static loff_t cetrafs_seek_hole_data(struct file *file, loff_t offset, int whenc
     struct cetrafs_smap *m;
     cetrafs_inode_t raw;
     loff_t isize, ret;
-    u64 iblock, found, nblocks;
+    u64 iblock, found, nblocks, from;
 
     inode_lock_shared(inode);
     isize = i_size_read(inode);
@@ -2498,30 +2723,49 @@ static loff_t cetrafs_seek_hole_data(struct file *file, loff_t offset, int whenc
     ret = cetrafs_map_snapshot_begin(inode, &raw);
     if (ret)
         goto out;
-    ret = cetrafs_inode_sorted_runs(inode, &raw, &m);
-    if (ret) {
-        filemap_invalidate_unlock_shared(inode->i_mapping);
-        goto out;
-    }
 
     iblock = (u64) offset / CETRAFS_BLOCK_SIZE;
     nblocks = ((u64) isize + CETRAFS_BLOCK_SIZE - 1) / CETRAFS_BLOCK_SIZE;
 
-    if (whence == SEEK_DATA) {
-        found = cetrafs_next_data_block(inode->i_mapping, m->runs, m->n, iblock, m->overlap);
-        if (found == U64_MAX || found >= nblocks)
-            ret = -ENXIO; /* nothing but hole between here and EOF */
-        else /* staying inside the block we were already in means the
-              * answer is the caller's own offset, not the block boundary
-              * below it */
+    /* One map, or windows of it from 'from' on: an answer at or past a
+     * window's bound is not one (a run starting there may be missing),
+     * so the search goes on from the bound -- strictly further each
+     * time (cetrafs_smap_window()). */
+    for (from = iblock;;) {
+        u64 lim;
+
+        ret = cetrafs_inode_sorted_runs(inode, &raw, from, &m);
+        if (ret)
+            break;
+        lim = min(nblocks, m->bound);
+        if (whence == SEEK_DATA) {
+            found = cetrafs_next_data_block(inode->i_mapping, m->runs, m->n, from, m->overlap);
+            if (found >= m->bound && m->bound < nblocks)
+                goto next;
+            if (found == U64_MAX || found >= nblocks)
+                ret = -ENXIO; /* nothing but hole between here and EOF */
+            else /* staying inside the block we were already in means the
+                  * answer is the caller's own offset, not the block boundary
+                  * below it */
+                ret = (found == iblock) ? offset : (loff_t) (found * CETRAFS_BLOCK_SIZE);
+        } else {
+            found = cetrafs_next_hole_block(inode->i_mapping, m->runs, m->n, from, lim, m->overlap);
+            if (found >= lim && lim < nblocks)
+                goto next;
             ret = (found == iblock) ? offset : (loff_t) (found * CETRAFS_BLOCK_SIZE);
-    } else {
-        found = cetrafs_next_hole_block(inode->i_mapping, m->runs, m->n, iblock, nblocks, m->overlap);
-        ret = (found == iblock) ? offset : (loff_t) (found * CETRAFS_BLOCK_SIZE);
-        if (ret > isize)
-            ret = isize; /* EOF is a hole, but never report past it */
+            if (ret > isize)
+                ret = isize; /* EOF is a hole, but never report past it */
+        }
+        cetrafs_smap_put(m);
+        break;
+next:
+        from = m->bound;
+        cetrafs_smap_put(m);
+        if (fatal_signal_pending(current)) {
+            ret = -EINTR;
+            break;
+        }
     }
-    cetrafs_smap_put(m);
     filemap_invalidate_unlock_shared(inode->i_mapping);
 
 out:
@@ -2551,11 +2795,11 @@ out:
  */
 int cetrafs_fiemap(struct inode *inode, struct fiemap_extent_info *fi, u64 start, u64 len)
 {
-    const struct cetrafs_ext_run *runs;
     struct cetrafs_smap *m;
     cetrafs_inode_t raw;
-    u64 cursor, end;
-    u32 nruns, i;
+    u64 cursor, end, from, pl = 0, pp = 0, pn = 0;
+    u32 i, pf = 0;
+    bool have = false, last = false, stop = false;
     int ret;
 
     if (cetrafs_sb_is_fenced(inode->i_sb))
@@ -2567,76 +2811,84 @@ int cetrafs_fiemap(struct inode *inode, struct fiemap_extent_info *fi, u64 start
 
     inode_lock_shared(inode);
 
-    /* The leaf is read in place, and its writers edit it under
+    /*
+     * In logical order (see cetrafs_inode_sorted_runs()): each step
+     * emits the lowest run starting at or after the cursor, and a run
+     * starting behind the cursor (an overlap on a damaged tree) is
+     * skipped. An extent is emitted once the next one is known, so LAST
+     * ("no extent begins after this one") is exact across windows.
+     *
+     * The leaf is read in place, and its writers edit it under
      * invalidate_lock (cetrafs_tree_lookup_unchecked()). Held only
-     * while the sorted map is fetched: the loop below copies to user
-     * memory, which can fault on a mapping of this file. The map is
-     * our own reference -- immutable, and freed only when its last
-     * holder lets go -- so it needs no lock while it is walked. */
-    ret = cetrafs_map_snapshot_begin(inode, &raw);
-    if (ret)
-        goto out;
-    ret = cetrafs_inode_sorted_runs(inode, &raw, &m);
-    filemap_invalidate_unlock_shared(inode->i_mapping);
-    if (ret)
-        goto out;
-    runs = m->runs;
-    nruns = m->n;
-
-    /* In logical order (see cetrafs_inode_sorted_runs()): each step
-     * emits the lowest run starting at or after the cursor, exactly as
-     * the per-step rescan did, and a run starting behind the cursor (an
-     * overlap on a damaged tree) is skipped the same way. */
+     * while a map is fetched -- the record read again for each window:
+     * the loop copies to user memory, which can fault on a mapping of
+     * this file. A map is our own reference -- immutable, and freed only
+     * when its last holder lets go -- so it needs no lock while it is
+     * walked.
+     */
     end = start + len;
     cursor = 0; /* lowest block not yet emitted */
-    i = 0;
-    while (i < nruns) {
-        const struct cetrafs_ext_run *r = &runs[i];
-        u64 logical, phys, blen;
-        u32 flags = 0, j;
-
-        if (r->start < cursor) {
-            i++;
-            continue;
-        }
-        cursor = r->start + r->len;
-        logical = r->start * CETRAFS_BLOCK_SIZE;
-        blen = r->len * CETRAFS_BLOCK_SIZE;
-        phys = r->phys * CETRAFS_BLOCK_SIZE;
-
-        /* The next run that would be emitted, which is also the answer
-         * to LAST ("no extent begins after this one"). */
-        for (j = i + 1; j < nruns && runs[j].start < cursor; j++)
-            ;
-        cond_resched(); /* O(extents) per call; ~258k on a fragmented image */
-
-        if (logical >= end)
+    from = start / CETRAFS_BLOCK_SIZE;
+    for (;;) {
+        ret = cetrafs_map_snapshot_begin(inode, &raw);
+        if (ret)
             break;
-        if (logical + blen <= start) {
-            i = j;
-            continue;
+        ret = cetrafs_inode_sorted_runs(inode, &raw, from, &m);
+        filemap_invalidate_unlock_shared(inode->i_mapping);
+        if (ret)
+            break;
+        for (i = 0; i < m->n && !stop; i++) {
+            const struct cetrafs_ext_run *r = &m->runs[i];
+            u64 logical = r->start * CETRAFS_BLOCK_SIZE, blen = r->len * CETRAFS_BLOCK_SIZE;
+
+            if (r->start < cursor)
+                continue;
+            cursor = r->start + r->len;
+            cond_resched(); /* O(extents) per call */
+            if (logical + blen <= start)
+                continue;
+            if (have) {
+                ret = fiemap_fill_next_extent(fi, pl, pp, pn, pf);
+                have = false;
+                if (ret) {
+                    stop = true;
+                    break;
+                }
+            }
+            if (logical >= end) {
+                stop = true;
+                break;
+            }
+            pl = logical;
+            pp = r->phys * CETRAFS_BLOCK_SIZE;
+            pn = blen;
+            pf = 0;
+            /* Preallocated and never written: the blocks are real and
+             * mapped, the CONTENT is not there yet. */
+            if (r->uninit && cetrafs_pending_first(inode, r->start, r->start + r->len) >= r->start + r->len)
+                pf |= FIEMAP_EXTENT_UNWRITTEN; /* a pending block in it: report data, never a hole */
+            have = true;
         }
-
-        if (j >= nruns)
-            flags |= FIEMAP_EXTENT_LAST;
-        /* Preallocated and never written: the blocks are real and
-         * mapped, the CONTENT is not there yet. */
-        if (r->uninit && cetrafs_pending_first(inode, r->start, r->start + r->len) >= r->start + r->len)
-            flags |= FIEMAP_EXTENT_UNWRITTEN; /* a pending block in it: report data, never a hole */
-
-        ret = fiemap_fill_next_extent(fi, logical, phys, blen, flags);
-        if (ret) {
-            /* 1 means the caller's buffer is full: a complete answer
-             * for what it asked for, not an error. */
-            if (ret == 1)
-                ret = 0;
+        from = m->bound;
+        cetrafs_smap_put(m);
+        if (stop)
+            break;
+        if (from == U64_MAX) {
+            last = true;
             break;
         }
-        i = j;
+        if (fatal_signal_pending(current)) {
+            ret = -EINTR;
+            break;
+        }
     }
-    cetrafs_smap_put(m);
+    if (!ret && have)
+        ret = fiemap_fill_next_extent(fi, pl, pp, pn, pf | (last ? FIEMAP_EXTENT_LAST : 0));
+    /* 1 means the caller's buffer is full: a complete answer for what it
+     * asked for, not an error. */
+    if (ret == 1)
+        ret = 0;
 
-out:
     inode_unlock_shared(inode);
     return ret;
 }

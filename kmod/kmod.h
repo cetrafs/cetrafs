@@ -1033,6 +1033,8 @@ struct buffer_head *cetrafs_read_index_bh_for(struct inode *inode, u64 lba, bool
 int cetrafs_flush_tree_blocks(struct inode *inode, const cetrafs_inode_t *raw, bool mapping_locked);
 void cetrafs_tree_invalidate_cached(struct inode *inode, const cetrafs_inode_t *raw);
 int cetrafs_tree_flatten(struct inode *inode, const cetrafs_inode_t *raw, cetrafs_extent_t **out_arr, u32 *out_n);
+int cetrafs_tree_flatten_max(struct inode *inode, const cetrafs_inode_t *raw, u32 max, cetrafs_extent_t **out_arr,
+                             u32 *out_n);
 int cetrafs_tree_extents(struct cetrafs_tw *w, const cetrafs_inode_t *raw, cetrafs_extent_t **out_arr, u32 *out_n);
 int cetrafs_tree_build(struct inode *inode, const cetrafs_extent_t *flat, u32 n, cetrafs_inode_t *raw, u64 *out_meta);
 void cetrafs_tree_free_meta(struct inode *inode, const cetrafs_inode_t *raw);
@@ -1189,14 +1191,19 @@ struct cetrafs_ext_run {
 /* A sorted map, shared by reference: the per-inode cache keeps one and
  * every caller holds its own while it walks. 'key' is the tree's
  * identity (cetrafs_tree_identity()); 'overlap' that some runs overlap
- * (damage: every run is then data). */
+ * (damage: every run is then data). A map is exact for the blocks in
+ * [from, bound): every run reaching past 'from' and starting below
+ * 'bound' is in it. A whole map is [0, U64_MAX); a tree past the memory
+ * budget is answered one window at a time (cetrafs_inode_sorted_runs()). */
 struct cetrafs_smap {
     refcount_t ref;
     u64 key;
+    u64 from, bound;
     u32 n;
     bool overlap;
     struct cetrafs_ext_run runs[];
 };
+u64 cetrafs_smap_window_count(void);
 void cetrafs_smap_put(struct cetrafs_smap *m);
 u64 cetrafs_smap_hit_count(void);
 u64 cetrafs_smap_build_count(void);

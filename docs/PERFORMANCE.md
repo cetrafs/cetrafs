@@ -605,11 +605,20 @@ under the reader rule too.
 The ~1,000 device reads left are one read of the tree per open (the
 open is where a handoff lands), not per call.
 
+The kept map has a memory budget of 1M runs (32 MiB). A tree past it
+(a depth-3 tree holds 65.5M extents) is answered by windows: the 1M
+runs of lowest start past the block asked about, found by one walk of
+the tree, kept and reused while the caller moves forward inside it. A
+full filefrag or `qemu-img` pass therefore costs one tree walk per 1M
+runs, never a 2 GiB copy.
+
 **Guarded by:** `tests/kernel/fiemap_reader_cache.sh` (device reads for
 filefrag, a seek walk and a close; control `read_trust_off`),
 `tests/kernel/seek_map_cache.sh` (one build per filefrag, and a held
 fd's SEEK_DATA after an in-place convert; control `smap_trust_stale`),
-procfs `smap_hits` / `smap_builds`.
+`tests/kernel/seek_map_budget.sh` (windowed answers equal the whole
+map's; control `smap_unbounded`), procfs `smap_hits` / `smap_builds` /
+`smap_windows`.
 
 ## 20. A nofilelock open does not wait on a live peer's heartbeat
 

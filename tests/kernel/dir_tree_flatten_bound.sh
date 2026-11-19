@@ -12,7 +12,10 @@
 #
 # tree_share_poke gives a directory a depth-3 tree of three blocks: a
 # leaf of 254 extents, an interior naming it 254 times, a top interior
-# naming that k times.
+# naming that k times. A tree walk now visits a shared block once, which
+# defuses this tree on its own; tree_walk_no_dedup takes that away so the
+# cap is tested alone -- it is what bounds a directory whose 2^18 + 1
+# extents are all real.
 #   setup: the tree is planted (the helper reports the extent count);
 #   1. k=254 (16.4M extents): a lookup fails EUCLEAN at once, the flatten
 #      cap named in dmesg; ls fails the same way;
@@ -33,6 +36,10 @@ TSP="$(ct_helper tree_share_poke)"
 MNT="$(ct_mnt dtfb)"
 ct_track mnt "$MNT"
 ct_param_set dir_flatten_unbounded 0
+# The walk visits a shared block once (tree_shared_child.sh), which
+# collapses this tree to its 254 real extents before any cap: switched
+# off, so the cap is the only thing between the tree and the copy.
+ct_param_set tree_walk_no_dedup 1
 
 errno_of() {
     python3 -I -c '
@@ -91,4 +98,5 @@ case "$E1" in setup-*) fail "control setup: $E1"; ct_exit ;; esac
 [ "$CAP" = no ] && [ "$COUNT" = yes ] &&
     pass "control: with the cap lifted the whole tree is copied and refused only by the count after it" ||
     fail "control: cap named: $CAP, count named: $COUNT -- the suite cannot tell"
+ct_param_set tree_walk_no_dedup 0
 ct_exit

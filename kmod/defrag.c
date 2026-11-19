@@ -372,8 +372,15 @@ static int cetrafs_defrag_read_extents(struct inode *inode, const cetrafs_inode_
          * rather than churned for many minutes. */
         cetrafs_extent_t *flat = NULL;
         u32 n = 0;
-        int fret = cetrafs_tree_flatten(inode, raw, &flat, &n);
+        int fret = cetrafs_tree_flatten_max(inode, raw, el->cap, &flat, &n);
 
+        if (fret == -E2BIG) {
+            /* Past the cap while walking, not after a copy of the whole
+             * tree (audit 2026-11-15 F-62). */
+            pr_debug("defrag: ino=%llu has more than %u extents -- declined\n", (unsigned long long) inode->i_ino,
+                     el->cap);
+            return -EOPNOTSUPP;
+        }
         if (fret)
             return fret;
         if (n > el->cap) {

@@ -1584,7 +1584,7 @@ CALLS="$(grep -c 'cetrafs_dmpath_resolve(bdev' "$K/dmpath.c" || true)"
 # KV_OUT names those functions; the check below refuses a new one that
 # returns kv memory through an out-parameter without being listed.
 log "checking nothing kv/vmalloc-allocated is freed with kfree() (N3)"
-KV_OUT='cetrafs_tree_flatten|cetrafs_tree_flatten_for|cetrafs_inode_sorted_runs|cetrafs_tree_meta_set'
+KV_OUT='cetrafs_tree_flatten|cetrafs_tree_flatten_for|cetrafs_tree_flatten_max|cetrafs_inode_sorted_runs|cetrafs_smap_window|cetrafs_tree_meta_set'
 # Not kv out-parameters, though the scan below reads them so: their
 # out-parameter is a count, and their kv memory is freed inside.
 KV_OUT_NOT='cetrafs_tree_patch'
@@ -3019,7 +3019,7 @@ c53_callers() { # <files...>: "<function> <plain reader>" per call site
 /^\}/ { fn = "" }
 fn != "" && !/^[[:space:]]*(\*|\/\*|\/\/)/ {
     line = $0
-    while (match(line, /[^a-z0-9_](cetrafs_inode_extents_get|cetrafs_tree_flatten|cetrafs_tree_extent_count|cetrafs_read_leaf_bh|cetrafs_read_index_bh|cetrafs_read_tree_bh)\(/)) {
+    while (match(line, /[^a-z0-9_](cetrafs_inode_extents_get|cetrafs_tree_flatten|cetrafs_tree_flatten_max|cetrafs_tree_extent_count|cetrafs_read_leaf_bh|cetrafs_read_index_bh|cetrafs_read_tree_bh)\(/)) {
         print fn, substr(line, RSTART + 1, RLENGTH - 2)
         line = substr(line, RSTART + RLENGTH)
     }
