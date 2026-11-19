@@ -364,6 +364,22 @@ void cetrafs_deferred_forget_range(struct super_block *sb, u64 lba, u32 count)
         cetrafs_deferred_unlist_range(sb, (unsigned long) lba, (unsigned long) (lba + count - 1), true);
 }
 
+/* Is any block of [lba, lba + count) held back right now? Asked by the
+ * scrub's free in place of the drop above (alloc.c, audit BC-17). */
+bool cetrafs_deferred_any_in_range(struct super_block *sb, u64 lba, u32 count)
+{
+    struct xarray *xa = cetrafs_sb_deferred(sb);
+    unsigned long pos = (unsigned long) lba;
+    bool any;
+
+    if (!count || !xa || xa_empty(xa))
+        return false;
+    xa_lock(xa);
+    any = xa_find(xa, &pos, (unsigned long) (lba + count - 1), XA_PRESENT) != NULL;
+    xa_unlock(xa);
+    return any;
+}
+
 /* Snapshot the entries on one list -- an inode's, or the orphans --
  * with a reference each. *out is kvmalloc'd; the caller brelse()s and
  * kvfree()s. */

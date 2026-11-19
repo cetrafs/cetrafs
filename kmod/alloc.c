@@ -3823,6 +3823,20 @@ int cetrafs_free_data_extent_batched(struct super_block *sb, u64 lba, u32 count,
  * here, with the bit, nothing can move between the verdict's last word
  * and the clear.
  */
+/*
+ * And the group must still be the one the scrub judged. Its check runs
+ * before this call and a CAS (the free_gen bump) before it, outside the
+ * mutex: a group that left this node in between used to turn the free
+ * into a foreign one, queued to the new owner with a stamp read after
+ * the scrub's own bump -- which that owner's drain accepts, freeing what
+ * it has since allocated there (audit 2026-11-15 BC-17). The scrub's free
+ * never queues, and the owner is re-asked under alloc_mutex with the
+ * first bit.
+ */
+static bool cetrafs_scrub_free_owner_unchecked;
+cetrafs_test_param(scrub_free_owner_unchecked, cetrafs_scrub_free_owner_unchecked, bool, 0644);
+MODULE_PARM_DESC(scrub_free_owner_unchecked, "TEST ONLY: the scrub's free queues to a foreign owner and does not re-ask the owner under the mutex, as before audit BC-17");
+
 int cetrafs_free_data_extent_unless_reserved(struct super_block *sb, u64 lba, u32 count, u64 resv_seq,
                                              const u64 *alloc_seq, u64 *out_freed)
 {
@@ -3961,6 +3975,17 @@ static int __cetrafs_free_data_extent(struct super_block *sb, u64 lba, u32 count
      * is nobody's to change -- the next claimer owns it -- and there is
      * no queue to send it to. This used to fail inside the queue lookup
      * with -EINVAL, unlogged, and every caller drops a free's error. */
+    /* The scrub's free judged a group of ours, its bits set: a group
+     * now FREE or another's was released or taken since -- its verdict
+     * is stale, not the volume damaged, and nothing of it is ours to
+     * change or queue, nor its held-back edits to drop (audit BC-17). */
+    if (resv_seq && !READ_ONCE(cetrafs_scrub_free_owner_unchecked) &&
+        (bg.owner_zg == CETRAFS_BG_OWNER_FREE || cetrafs_pf_force_foreign ||
+         (cetrafs_sb_caw_available(sb) && !cetrafs_sb_zg_owned_cached(sb, bg.owner_zg)))) {
+        pr_info("scrub: BG %u is not this node's any more -- not freeing [%llu +%u]\n", bg_id,
+                (unsigned long long) lba, count);
+        return -EAGAIN;
+    }
     if (bg.owner_zg == CETRAFS_BG_OWNER_FREE) {
         pr_err_ratelimited("free: extent [%llu +%u) is in BG %u, which no Zone Group owns -- a reference to "
                            "unallocated blocks; not freeing (fsck)\n",
@@ -3978,8 +4003,17 @@ static int __cetrafs_free_data_extent(struct super_block *sb, u64 lba, u32 count
      * edit was dropped with no free to justify it (audit 2026-11-15
      * BL-13). A free that leaks below keeps its blocks allocated, so an
      * edit written later lands on nobody's. */
-    if (!READ_ONCE(cetrafs_free_forget_first))
+    /* The scrub's free drops nothing: blocks it judged leaked are no
+     * tree's, so one held back here was allocated since the verdict --
+     * refused, and one allocated after this look moves the allocation
+     * count the mutex check below refuses on. Dropping it here, outside
+     * that check, threw away a live file's edit (audit BC-17). */
+    if (resv_seq && !READ_ONCE(cetrafs_scrub_free_owner_unchecked)) {
+        if (cetrafs_deferred_any_in_range(sb, lba, count))
+            return -EAGAIN;
+    } else if (!READ_ONCE(cetrafs_free_forget_first)) {
         cetrafs_deferred_forget_range(sb, lba, count);
+    }
 
     if (cetrafs_sb_caw_available(sb) || cetrafs_pf_force_foreign) {
         if (cetrafs_pf_force_foreign || !cetrafs_sb_zg_owned_cached(sb, bg.owner_zg)) {
@@ -4047,6 +4081,20 @@ static int __cetrafs_free_data_extent(struct super_block *sb, u64 lba, u32 count
      * twice, which is worth saying out loud rather than absorbing.
      */
     cetrafs_sb_alloc_lock(sb);
+    /* The scrub's: the group is still ours, asked under the mutex every
+     * free of it takes, next to the allocation-count check (BC-17). The
+     * owned bit is the one a release clears (cetrafs_sb_drain_bg()) under
+     * this mutex BEFORE its descriptor swap, so a release either drained
+     * it first and this refuses, or comes after this hold and finds the
+     * bits still set. The chunk re-checks below cover a long extent. */
+    if (resv_seq && !READ_ONCE(cetrafs_scrub_free_owner_unchecked) &&
+        (cetrafs_sb_is_fenced(sb) || !cetrafs_sb_bg_is_ours(sb, bg_id) || cetrafs_sb_bg_owner(sb, bg_id) != bg.owner_zg ||
+         (cetrafs_sb_caw_available(sb) && !cetrafs_sb_zg_owned_cached(sb, bg.owner_zg)))) {
+        cetrafs_sb_alloc_unlock(sb);
+        pr_info("scrub: BG %u left this node before its free -- not freeing [%llu +%u]\n", bg_id,
+                (unsigned long long) lba, count);
+        return -EAGAIN;
+    }
     for (b = 0; b < count; b++) {
         bool set = false;
 
@@ -4426,6 +4474,7 @@ int cetrafs_apply_pending_free(struct super_block *sb, u64 lba, u32 count, u32 e
 
 struct cetrafs_bg_gen_ctx {
     u64 out_gen; /* the value the committed image carries */
+    u32 expect_zg; /* the owner the caller judged the group by */
 };
 
 static int cetrafs_bg_gen_mutate(void *image, unsigned int len, void *priv)
@@ -4435,6 +4484,10 @@ static int cetrafs_bg_gen_mutate(void *image, unsigned int len, void *priv)
 
     if (!cetrafs_bg_image_ok(image, len))
         return -EUCLEAN;
+    /* Not the group the caller judged any more: its new owner's
+     * descriptor is not ours to touch (audit BC-17). */
+    if (le16_to_cpu(bg->owner_zg) != ctx->expect_zg)
+        return -EAGAIN;
     bg->free_gen = cetrafs_cpu_to_le64(cetrafs_le64(bg->free_gen) + 1);
     ctx->out_gen = cetrafs_le64(bg->free_gen);
     memset((u8 *) image + offsetof(cetrafs_block_group_t, pad), 0, len - offsetof(cetrafs_block_group_t, pad));
@@ -4467,10 +4520,10 @@ u64 cetrafs_bg_gen_bump_count(void)
  * the moment this returns. An outcome that is not known is an error: the
  * caller frees nothing.
  */
-int cetrafs_bg_bump_free_gen(struct super_block *sb, u32 bg_id)
+int cetrafs_bg_bump_free_gen(struct super_block *sb, u32 bg_id, u32 expect_zg)
 {
     const cetrafs_superblock_t *raw_sb = cetrafs_sb_raw(sb);
-    struct cetrafs_bg_gen_ctx ctx = {0};
+    struct cetrafs_bg_gen_ctx ctx = {.expect_zg = expect_zg};
     unsigned int region;
     struct buffer_head *bh;
     u8 *seed;

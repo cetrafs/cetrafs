@@ -1305,7 +1305,7 @@ static inline int cetrafs_free_data_block(struct super_block *sb, u64 lba)
     return cetrafs_free_data_extent(sb, lba, 1);
 }
 int cetrafs_apply_pending_free(struct super_block *sb, u64 lba, u32 count, u32 expect_zg, u64 stamp);
-int cetrafs_bg_bump_free_gen(struct super_block *sb, u32 bg_id);
+int cetrafs_bg_bump_free_gen(struct super_block *sb, u32 bg_id, u32 expect_zg);
 u64 cetrafs_pf_stale_drop_count(void);
 u64 cetrafs_bg_gen_bump_count(void);
 int cetrafs_count_free_inodes(struct super_block *sb, u64 *out_free);
@@ -1973,6 +1973,7 @@ void cetrafs_deferred_unlist_locked(struct super_block *sb, struct buffer_head *
 void cetrafs_deferred_settle_locked(struct super_block *sb, struct buffer_head *bh, u32 written_crc);
 u32 cetrafs_deferred_disk_crc(struct super_block *sb, struct buffer_head *bh, u32 fallback);
 void cetrafs_deferred_forget_range(struct super_block *sb, u64 lba, u32 count);
+bool cetrafs_deferred_any_in_range(struct super_block *sb, u64 lba, u32 count);
 void cetrafs_deferred_evict(struct inode *inode);
 struct list_head *cetrafs_inode_deferred(struct inode *inode);
 bool cetrafs_deferred_inode_pending(struct inode *inode); /* leafdefer.c */

@@ -186,6 +186,15 @@ cetrafs_test_param(scrub_ignore_alloc_seq, cetrafs_scrub_ignore_alloc_seq, bool,
 static bool cetrafs_scrub_bg_moved_once;
 cetrafs_test_param(scrub_bg_moved_once, cetrafs_scrub_bg_moved_once, bool, 0644);
 MODULE_PARM_DESC(scrub_bg_moved_once, "TEST ONLY: the scrub's next free finds its Block Group released");
+/* TEST ONLY, one-shot: the group leaves AFTER the scrub's checks, just
+ * before its free -- 1: its in-core owner reads FREE; 2: the free is
+ * routed as one to a foreign owner (pf_force_foreign for that one free:
+ * a loop device has no CAW, so a real foreign owner cannot be staged on
+ * one node); 3: drained, as a release does first, under the mutex.
+ * tests/kernel/scrub_bg_moved.sh, audit BC-17. */
+static unsigned int cetrafs_scrub_bg_moved_late;
+cetrafs_test_param(scrub_bg_moved_late, cetrafs_scrub_bg_moved_late, uint, 0644);
+MODULE_PARM_DESC(scrub_bg_moved_late, "TEST ONLY: the scrub's next free finds its Block Group gone after the checks (1 owner FREE, 2 foreign, 3 drained)");
 MODULE_PARM_DESC(scrub_ignore_alloc_seq,
                  "TEST ONLY: free on a verdict older than the last allocation in the Block Group");
 
@@ -823,7 +832,7 @@ static int scrub_free_confirmed(struct cetrafs_scrub *s, struct scrub_bg *b, u64
              * freeing that file's block. Not raised, nothing is freed.
              */
             if (!gen_raised) {
-                ret = cetrafs_bg_bump_free_gen(sb, b->bg_id);
+                ret = cetrafs_bg_bump_free_gen(sb, b->bg_id, b->zg_id);
                 if (ret) {
                     pr_warn_ratelimited("scrub: BG %u: could not raise its free generation (%d) -- freeing "
                                         "nothing there this cycle\n",
@@ -832,8 +841,23 @@ static int scrub_free_confirmed(struct cetrafs_scrub *s, struct scrub_bg *b, u64
                 }
                 gen_raised = true;
             }
-            ret = cetrafs_free_data_extent_unless_reserved(sb, b->data_start + bit, got_run, b->resv_seq,
-                                                           cetrafs_scrub_ignore_alloc_seq ? NULL : &b->alloc_seq, &got);
+            {
+                unsigned int late = READ_ONCE(cetrafs_scrub_bg_moved_late) ? xchg(&cetrafs_scrub_bg_moved_late, 0) : 0;
+
+                if (late == 1)
+                    cetrafs_sb_set_bg_owner(sb, b->bg_id, CETRAFS_BG_OWNER_FREE); /* TEST ONLY */
+                if (late == 2)
+                    WRITE_ONCE(cetrafs_pf_force_foreign, true); /* TEST ONLY */
+                if (late == 3 && !cetrafs_sb_drain_bg(sb, b->bg_id))
+                    late = 0; /* TEST ONLY: a trim holds a run; not staged */
+                ret = cetrafs_free_data_extent_unless_reserved(sb, b->data_start + bit, got_run, b->resv_seq,
+                                                               cetrafs_scrub_ignore_alloc_seq ? NULL : &b->alloc_seq,
+                                                               &got);
+                if (late == 2)
+                    WRITE_ONCE(cetrafs_pf_force_foreign, false);
+                if (late == 3)
+                    cetrafs_sb_undrain_bg(sb, b->bg_id);
+            }
             atomic64_inc(&cetrafs_scrub_free_calls);
             if (ret == -EAGAIN) {
                 /* A run was released since the verdict: it is somebody's
