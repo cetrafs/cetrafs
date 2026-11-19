@@ -2873,7 +2873,7 @@ int cetrafs_ns_reconcile_counted(struct super_block *sb, u64 ino, u64 generation
         raw->size = cetrafs_cpu_to_le64(want_size);
         if (self)
             cetrafs_inode_fd_pub_lock(self);
-        ret = cetrafs_write_raw_inode_fd(sb, ino, raw, self);
+        ret = cetrafs_write_raw_inode_fd(sb, ino, raw, self, NULL);
         if (self) {
             if (!ret)
                 i_size_write(self, want_size);

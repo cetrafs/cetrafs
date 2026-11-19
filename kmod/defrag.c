@@ -763,6 +763,7 @@ static int cetrafs_defrag_commit(struct inode *inode,
     u32 n = 0, i, cap = head_count + 1 + suffix_count + d->n + 8;
     u64 meta = 0;
     bool verdict_old = false; /* a failed publish proven NOT to have landed */
+    bool landed = false;      /* the publish reached the device, whatever it returned */
     int ret;
 
     out = kvmalloc_array(cap, sizeof(*out), GFP_KERNEL);
@@ -841,12 +842,13 @@ static int cetrafs_defrag_commit(struct inode *inode,
         raw->atime = cetrafs_cpu_to_le64((u64) inode_get_atime_sec(inode));
         raw->mtime = cetrafs_cpu_to_le64((u64) inode_get_mtime_sec(inode));
         fd_seq = cetrafs_inode_fd_seq(inode);
-        ret = cetrafs_write_raw_inode_fd(sb, inode->i_ino, raw, inode);
+        ret = cetrafs_write_raw_inode_fd(sb, inode->i_ino, raw, inode, &landed);
         if (!ret && cetrafs_defrag_publish_lost_ack) {
             cetrafs_defrag_publish_lost_ack = false;
-            ret = -EIO; /* test only, see the knob */
+            landed = false; /* an outcome the caller cannot know */
+            ret = -EIO;     /* test only, see the knob */
         }
-        if (ret) {
+        if (ret && !landed) {
             /*
              * A failed publish is not proof that nothing landed: a CAS
              * whose timeout could not be settled returns an error with
@@ -884,6 +886,14 @@ static int cetrafs_defrag_commit(struct inode *inode,
         cetrafs_inode_fd_pub_unlock(inode);
     }
     if (ret) {
+        /* The record may name the new run (the flush after the swap was
+         * refused, or the swap's outcome is unknown -- both stop the
+         * mount, BL-79): neither tree is freed, and the caller frees no
+         * destination block and reports EIO. */
+        if (landed) {
+            ret = -ENOTRECOVERABLE;
+            goto out;
+        }
         if (verdict_old) {
             cetrafs_tree_free_meta_except(inode, raw, old); /* provably unreferenced: undo the new blocks */
             *raw = *old;

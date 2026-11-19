@@ -7854,6 +7854,7 @@ static int __cetrafs_truncate_shrink(struct inode *inode, loff_t new_size)
     u32 freed_dummy, discard = 0;
     u64 meta_blocks = 0;
     bool foreign; /* a dropped block outside our own groups (cetrafs_frees_begin()) */
+    bool landed = false; /* the publish reached the device, whatever it returned */
     int ret, zret;
 
     recs = kmalloc(2 * sizeof(*recs), GFP_NOFS);
@@ -7964,7 +7965,8 @@ static int __cetrafs_truncate_shrink(struct inode *inode, loff_t new_size)
         fd_seq = cetrafs_inode_fd_seq(inode);
         ret = unlikely(cetrafs_fail_extent_record_write) ? -EIO
                                                          : cetrafs_write_raw_inode_fd_planned(sb, inode->i_ino, &raw, inode,
-                                                                                              cetrafs_le64(old_raw.file_seq));
+                                                                                              cetrafs_le64(old_raw.file_seq),
+                                                                                              &landed);
         if (!ret) {
             cetrafs_inode_fd_published(inode, fd_seq); /* this publish supersedes the overlaid shadow */
             i_size_write(inode, new_size);
@@ -7973,7 +7975,11 @@ static int __cetrafs_truncate_shrink(struct inode *inode, loff_t new_size)
     }
     if (ret) {
         cetrafs_frees_end(sb, foreign);
-        cetrafs_tree_free_meta_except(inode, &raw, &old_raw);
+        /* The record may name the new tree (the flush after the swap was
+         * refused, or the swap's outcome is unknown -- both stop the
+         * mount, BL-79): neither tree is freed, a leak for the scrub. */
+        if (!landed)
+            cetrafs_tree_free_meta_except(inode, &raw, &old_raw);
         kvfree(new_flat);
         kvfree(old_flat);
         kfree(recs);
@@ -8421,6 +8427,7 @@ static int cetrafs_do_allocate(struct inode *inode, loff_t offset, loff_t len, b
     u32 add_n = 0, add_cap = 0, flat_n = 0;
     u32 tree_have, tree_cap;
     bool built = false;
+    bool landed = false; /* the publish reached the device, whatever it returned */
     int ret, loop_ret = 0;
     /* Up here, not where first used: out_free frees the map, and the
      * early exits jumped over a later declaration -- its initialiser
@@ -8734,7 +8741,7 @@ static int cetrafs_do_allocate(struct inode *inode, loff_t offset, loff_t len, b
 
         cetrafs_inode_fd_pub_lock(inode);
         fd_seq = cetrafs_inode_fd_seq(inode);
-        ret = cetrafs_write_raw_inode_fd_planned(sb, inode->i_ino, &raw, inode, plan_seq);
+        ret = cetrafs_write_raw_inode_fd_planned(sb, inode->i_ino, &raw, inode, plan_seq, &landed);
         if (!ret)
             cetrafs_inode_fd_published(inode, fd_seq); /* this publish supersedes the overlaid shadow */
         cetrafs_inode_fd_pub_unlock(inode);
@@ -8742,8 +8749,10 @@ static int cetrafs_do_allocate(struct inode *inode, loff_t offset, loff_t len, b
     if (ret) {
         if (announced)
             cetrafs_frees_end(sb, foreign);
-        if (built)
+        if (built && !landed) /* may have landed (BL-79, as truncate): undo nothing */
             cetrafs_tree_free_meta_except(inode, &raw, &old_raw);
+        if (landed) /* the record may name the added blocks: keep them */
+            goto out_free;
         goto out_free_added;
     }
 
@@ -9106,6 +9115,7 @@ static long cetrafs_fallocate(struct file *file, int mode, loff_t offset, loff_t
     bool published = false; /* the map changed: the tail of the punch updates blocks/ctime */
     bool zeroed = false;    /* a boundary block was partly zeroed: the contents changed */
     bool foreign;           /* a punched block outside our own groups (cetrafs_frees_begin()) */
+    bool landed = false;    /* the publish reached the device, whatever it returned */
     int ret;
 
     /* The capacity check vfs_fallocate() makes at s_maxbytes, against
@@ -9557,14 +9567,16 @@ static long cetrafs_fallocate(struct file *file, int mode, loff_t offset, loff_t
         fd_seq = cetrafs_inode_fd_seq(inode);
         ret = unlikely(cetrafs_fail_extent_record_write) ? -EIO
                                                          : cetrafs_write_raw_inode_fd_planned(sb, inode->i_ino, &raw, inode,
-                                                                                              cetrafs_le64(old_raw.file_seq));
+                                                                                              cetrafs_le64(old_raw.file_seq),
+                                                                                              &landed);
         if (!ret)
             cetrafs_inode_fd_published(inode, fd_seq); /* this publish supersedes the overlaid shadow */
         cetrafs_inode_fd_pub_unlock(inode);
     }
     if (ret) {
         cetrafs_frees_end(sb, foreign);
-        cetrafs_tree_free_meta_except(inode, &raw, &old_raw);
+        if (!landed) /* may have landed (BL-79, as truncate): undo nothing */
+            cetrafs_tree_free_meta_except(inode, &raw, &old_raw);
         kvfree(new_flat);
         kvfree(old_flat);
         goto out;

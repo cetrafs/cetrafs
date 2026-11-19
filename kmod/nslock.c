@@ -860,7 +860,7 @@ void cetrafs_nslock_release(struct inode *inode)
 
                 if (locked)
                     cetrafs_inode_fd_pub_lock(inode);
-                ret = cetrafs_write_raw_inode_fd(sb, inode->i_ino, &recs[1], inode);
+                ret = cetrafs_write_raw_inode_fd(sb, inode->i_ino, &recs[1], inode, NULL);
                 if (locked)
                     cetrafs_inode_fd_pub_unlock(inode);
             }

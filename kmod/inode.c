@@ -1443,9 +1443,15 @@ MODULE_PARM_DESC(fd_post_flush_fail, "TEST ONLY: fail the next cache flush after
 static bool cetrafs_fd_post_flush_stop_ok;
 cetrafs_test_param(fd_post_flush_stop_ok, cetrafs_fd_post_flush_stop_ok, bool, 0644);
 MODULE_PARM_DESC(fd_post_flush_stop_ok, "TEST ONLY: report a publish whose flush stopped the mount as succeeded");
+static bool cetrafs_fd_landed_hidden;
+cetrafs_test_param(fd_landed_hidden, cetrafs_fd_landed_hidden, bool, 0644);
+MODULE_PARM_DESC(fd_landed_hidden, "TEST ONLY: a publish that landed and then failed does not say it landed");
+static bool cetrafs_fd_cas_lost_ack;
+cetrafs_test_param(fd_cas_lost_ack, cetrafs_fd_cas_lost_ack, bool, 0644);
+MODULE_PARM_DESC(fd_cas_lost_ack, "TEST ONLY: the next fd-sector swap lands but reports an error, as an unsettled timeout");
 
 static int __cetrafs_write_raw_inode_fd(struct super_block *sb, u64 ino, const cetrafs_inode_t *src,
-                                       struct inode *self, const u64 *plan_seq)
+                                       struct inode *self, const u64 *plan_seq, bool *landed)
 {
     struct cetrafs_fd_write_ctx ctx = {.src = src, .sb = sb};
     u64 lba = cetrafs_inode_lba(sb, ino);
@@ -1477,9 +1483,16 @@ static int __cetrafs_write_raw_inode_fd(struct super_block *sb, u64 ino, const c
         if (ret)
             return ret;
         ret = cetrafs_cas_record_fd_seeded(sb, lba, NULL, 0, cetrafs_fd_write_mutate, &ctx);
+        if (!ret && xchg(&cetrafs_fd_cas_lost_ack, false))
+            ret = -EIO; /* TEST ONLY: landed, reported as an outcome unknown */
 
         if (ret == 0) {
             int fret;
+
+            /* On the device whatever is returned below: a caller that
+             * hears an error with this set must not undo the publish. */
+            if (landed && !READ_ONCE(cetrafs_fd_landed_hidden))
+                *landed = true;
 
             /* Every caller frees something once this returns -- the old
              * tree's meta, the blocks a truncate or punch dropped, a
@@ -1522,14 +1535,33 @@ static int __cetrafs_write_raw_inode_fd(struct super_block *sb, u64 ino, const c
                                 "planned (stamp %llx, planned from %llx) -- refusing\n",
                                 (unsigned long long) ino, (unsigned long long) ctx.found_seq,
                                 (unsigned long long) ctx.plan_seq);
+        } else if (landed && !READ_ONCE(cetrafs_fd_landed_hidden)) {
+            /* A failed swap is not proof that nothing landed: one whose
+             * command timed out and could not be settled returns an
+             * error with its outcome unknown (caw.c, the undecided
+             * path). Undoing it frees the new tree -- safe exactly when
+             * the record does not name it, so ask the record (rule 21:
+             * an unknown publish frees nothing). Unreadable: unknown. */
+            cetrafs_inode_t *now = kmalloc(sizeof(*now), GFP_NOFS);
+
+            if (!now) {
+                *landed = true;
+            } else {
+                cetrafs_invalidate_raw_inode(sb, ino);
+                if (cetrafs_read_raw_inode(sb, ino, now) || (!memcmp(&now->eh, &src->eh, sizeof(now->eh)) &&
+                                                             !memcmp(&now->et, &src->et, sizeof(now->et))))
+                    *landed = true;
+                kfree(now);
+            }
         }
         return ret;
     }
 }
 
-int cetrafs_write_raw_inode_fd(struct super_block *sb, u64 ino, const cetrafs_inode_t *src, struct inode *self)
+int cetrafs_write_raw_inode_fd(struct super_block *sb, u64 ino, const cetrafs_inode_t *src, struct inode *self,
+                               bool *landed)
 {
-    return __cetrafs_write_raw_inode_fd(sb, ino, src, self, NULL);
+    return __cetrafs_write_raw_inode_fd(sb, ino, src, self, NULL, landed);
 }
 
 /*
@@ -1611,9 +1643,9 @@ int cetrafs_inode_forget_tree(struct super_block *sb, u64 ino, u64 generation, u
  * file sector since 'plan_seq' -- for a caller that built what it
  * publishes from a record read earlier (truncate, punch). */
 int cetrafs_write_raw_inode_fd_planned(struct super_block *sb, u64 ino, const cetrafs_inode_t *src,
-                                       struct inode *self, u64 plan_seq)
+                                       struct inode *self, u64 plan_seq, bool *landed)
 {
-    return __cetrafs_write_raw_inode_fd(sb, ino, src, self, &plan_seq);
+    return __cetrafs_write_raw_inode_fd(sb, ino, src, self, &plan_seq, landed);
 }
 
 /* TEST ONLY, one-shot: the next record write of inode

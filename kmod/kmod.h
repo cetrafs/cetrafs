@@ -1733,9 +1733,14 @@ int cetrafs_inode_ns_cas(struct super_block *sb,
                          const cetrafs_inode_t *seed,
                          void (*apply)(cetrafs_inode_t *rec, void *arg),
                          void *arg);
-int cetrafs_write_raw_inode_fd(struct super_block *sb, u64 ino, const cetrafs_inode_t *src, struct inode *self);
+/* *landed (may be NULL) is set when the swap reached the device or may
+ * have (a refused flush after it, a swap whose outcome is unknown): with
+ * an error, the caller must then free nothing the new record names
+ * (audit 2026-11-15 BL-79). Both causes stop the mount. */
+int cetrafs_write_raw_inode_fd(struct super_block *sb, u64 ino, const cetrafs_inode_t *src, struct inode *self,
+                               bool *landed);
 int cetrafs_write_raw_inode_fd_planned(struct super_block *sb, u64 ino, const cetrafs_inode_t *src,
-                                       struct inode *self, u64 plan_seq);
+                                       struct inode *self, u64 plan_seq, bool *landed);
 int cetrafs_inode_ns_zero_nlink(struct super_block *sb, u64 ino, const cetrafs_inode_t *seed);
 /* Inode-number arbitration between a creator and an orphan scrub, on the
  * record itself -- see inode.c. */
