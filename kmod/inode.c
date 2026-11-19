@@ -2090,7 +2090,17 @@ struct cetrafs_vfs_stat_cas_ctx {
      * node had never seen -- see the end of the mutator. */
     bool overstamped;
     u64 overstamped_seq;
+    /* The image carries a peer's publish made after the shadow's base:
+     * the shadow's root was not carried, and the shadow goes. */
+    bool root_superseded;
 };
+
+/* TEST ONLY: a stat publish carries the shadow's extent root over a
+ * peer's newer one, as before audit 2026-11-15 BC-54
+ * (tests/kernel/stat_publish_root_stale.sh). */
+static bool cetrafs_stat_publish_root_over_peer;
+cetrafs_test_param(stat_publish_root_over_peer, cetrafs_stat_publish_root_over_peer, bool, 0644);
+MODULE_PARM_DESC(stat_publish_root_over_peer, "TEST ONLY: a stat publish carries its shadow root over a peer's newer publish");
 
 /* TEST ONLY: a stat publish forgets the peer stamp it overwrote (the
  * pre-fix behaviour). tests/kernel/stat_publish_peer_stamp.sh. */
@@ -2145,11 +2155,29 @@ static int cetrafs_vfs_stat_cas_mutate(void *image, unsigned int len, void *priv
         return -EUCLEAN;
     }
 
-    /* The hot path's pending extent state supersedes the device's: it is
-     * strictly newer (this node is the file's writer). */
+    /* The hot path's pending extent state supersedes the device's --
+     * when it was built on the device's: the shadow carries the stamp of
+     * the record it started from. "Strictly newer, this node is the
+     * file's writer" is the file lock's promise, and nofilelock has no
+     * lock: a close that failed and was finished later by the heartbeat
+     * put its map over a peer that had written the file in between, and
+     * the peer's fsynced blocks read as zeros (audit 2026-11-15 BC-54,
+     * BC-31's inline-map sibling; CLAUDE.md rule 9). A stamp that is
+     * neither the shadow's base nor ours is a peer's later publish: its
+     * root stays, and ours is dropped after the swap. Decided from the
+     * shadow's own stamp, not from the node's cached one, which a writer
+     * need not have noted before its first publish (rule 6). */
+    ctx->root_superseded = false;
     if (ctx->have_shadow && !ctx->defer_root) {
-        rec.eh = ctx->shadow->eh;
-        rec.et = ctx->shadow->et;
+        u64 dev = cetrafs_le64(rec.file_seq);
+
+        ctx->root_superseded = dev != cetrafs_le64(ctx->shadow->file_seq) &&
+                               CETRAFS_FILE_SEQ_NODE(dev) != (ctx->me & 0xFFFFu) &&
+                               !READ_ONCE(cetrafs_stat_publish_root_over_peer);
+        if (!ctx->root_superseded) {
+            rec.eh = ctx->shadow->eh;
+            rec.et = ctx->shadow->et;
+        }
     }
 
     /* Three-way merge of the stat fields against the baseline, run on
@@ -2194,7 +2222,13 @@ static int cetrafs_vfs_stat_cas_mutate(void *image, unsigned int len, void *priv
     } while (0)
 
     CETRAFS_FD_MERGE64(CETRAFS_FD_F_SIZE, size, i_size_read(inode), false);
-    CETRAFS_FD_MERGE64(CETRAFS_FD_F_BLOCKS, blocks, inode->i_blocks, false);
+    if (ctx->root_superseded) {
+        /* The blocks the root counts are the peer's. */
+        ctx->ours[CETRAFS_FD_F_BLOCKS] = (u64) inode->i_blocks;
+        ctx->merged[CETRAFS_FD_F_BLOCKS] = cetrafs_le64(rec.blocks);
+    } else {
+        CETRAFS_FD_MERGE64(CETRAFS_FD_F_BLOCKS, blocks, inode->i_blocks, false);
+    }
     CETRAFS_FD_MERGE64(CETRAFS_FD_F_ATIME, atime, inode_get_atime_sec(inode), true);
     CETRAFS_FD_MERGE64(CETRAFS_FD_F_MTIME, mtime, inode_get_mtime_sec(inode), true);
 
@@ -2203,7 +2237,7 @@ static int cetrafs_vfs_stat_cas_mutate(void *image, unsigned int len, void *priv
     /* But a shadow's size/blocks never merge DOWN: they are the newest
      * truth this node has. (max() above already guarantees it for the
      * common grow case; this is the belt for a quiet shadow.) */
-    if (ctx->have_shadow) {
+    if (ctx->have_shadow && !ctx->root_superseded) {
         if (cetrafs_le64(ctx->shadow->size) > cetrafs_le64(rec.size))
             rec.size = ctx->shadow->size;
         if (cetrafs_le64(ctx->shadow->blocks) > cetrafs_le64(rec.blocks))
@@ -2569,7 +2603,7 @@ int cetrafs_write_vfs_inode(struct inode *inode)
          * leak, 2026-10-27). */
         if (ctx->defer_root)
             mark_inode_dirty_sync(inode); /* the root is still to go: the shadow stays pending */
-        else
+        else if (!ctx->root_superseded)
             cetrafs_inode_fd_published(inode, fd_seq);
         cetrafs_record_write_counted();
         cetrafs_vfs_stat_adopt(inode, ctx); /* may point 'written' fields back at core: baseline only */
@@ -2582,7 +2616,12 @@ int cetrafs_write_vfs_inode(struct inode *inode)
         /* ...unless it overwrote a peer's change we never saw: then do
          * what seeing it would have done, after the adopt above so the
          * cold mark is the last word. */
-        if (ctx->overstamped && !cetrafs_stat_publish_ignore_overstamp) {
+        if (ctx->root_superseded) {
+            pr_err("ino=%llu: another node (%u) published the file's extent map after this node's pending "
+                   "one was built -- this node's is dropped, not published over theirs\n",
+                   (unsigned long long) inode->i_ino, (unsigned) CETRAFS_FILE_SEQ_NODE(ctx->overstamped_seq));
+            cetrafs_lock_tree_superseded(inode);
+        } else if (ctx->overstamped && !cetrafs_stat_publish_ignore_overstamp) {
             pr_info_ratelimited("cetrafs: inode %llu: stat publish overwrote stamp %llx from node %u -- "
                                 "refetching this node's extent map\n",
                                 (unsigned long long) inode->i_ino, (unsigned long long) ctx->overstamped_seq,
