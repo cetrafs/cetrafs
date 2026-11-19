@@ -14,8 +14,12 @@
 #   1. fsck -r exits 1 and says it gave no verdict, not OK;
 #   2. a check alone (no -r) still says OK, exit 0, with its WARN.
 #
+#   3. a needs-fsck mark on the same volume is kept: the run gave no
+#      verdict, and the mark is the only record that damage was found.
+#
 # DISCRIMINATION: CETRAFS_TEST_FSCK_PENDING_JOURNAL_OK=1 -- fsck -r says
-# OK and exits 0.
+# OK and exits 0; CETRAFS_TEST_FSCK_CLEAR_OVER_JOURNAL=1 -- the mark is
+# cleared.
 set -euo pipefail
 . "$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)/lib/harness.sh"
 require_root
@@ -55,4 +59,17 @@ OUT="$(CETRAFS_TEST_FSCK_PENDING_JOURNAL_OK=1 "$ROOT/userspace/fsck.cetra" -r "$
 [ "$RC" = 0 ] && grep -q "cetrafs fsck: OK" <<<"$OUT" &&
     pass "control: with the old verdict, fsck -r said OK and exited 0 with repair disabled" ||
     fail "control: fsck -r exited $RC -- the suite does not reach the verdict ($(tail -1 <<<"$OUT"))"
+SBPOKE="$(ct_helper sb_poke)"
+sbf() { blockdev --flushbufs "$DEV"; "$SBPOKE" "$IMG" | sed -n "s/^$1=//p"; }
+"$SBPOKE" "$IMG" fsck_needed_since 1234567 >/dev/null
+"$SBPOKE" "$IMG" fsck_needed_node 7 >/dev/null
+blockdev --flushbufs "$DEV"
+OUT="$("$ROOT/userspace/fsck.cetra" -r "$DEV" 2>&1)" || true
+[ "$(sbf fsck_needed_since)" = 1234567 ] && ! grep -q "cleared the needs-fsck mark" <<<"$OUT" &&
+    pass "3: fsck -r over the pending journal kept the needs-fsck mark" ||
+    fail "3: the mark reads $(sbf fsck_needed_since) after fsck -r: $(grep -m1 needs-fsck <<<"$OUT" || true)"
+OUT="$(CETRAFS_TEST_FSCK_CLEAR_OVER_JOURNAL=1 "$ROOT/userspace/fsck.cetra" -r "$DEV" 2>&1)" || true
+[ "$(sbf fsck_needed_since)" = 0 ] &&
+    pass "control: clearing over the pending journal, the mark was gone after a run with no verdict" ||
+    fail "control: the mark stayed anyway -- the suite does not reach the clear ($(sbf fsck_needed_since))"
 ct_exit

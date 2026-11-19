@@ -6933,12 +6933,19 @@ int main(int argc, char **argv)
             uint32_t was_node = cetrafs_le32(sb.fsck_needed_node);
             uint64_t was_since = cetrafs_le64(sb.fsck_needed_since);
 
-            if (!problems && repair_mode) {
+            /* Not over a pending journal either: that run gives no
+             * verdict (below), and the mark is the only lasting record
+             * that damage was found -- consumed by a run that did not
+             * show the volume clean, it was gone for good. */
+            if (!problems && repair_mode &&
+                (!fsck_journal_pending || cetrafs_test_env("CETRAFS_TEST_FSCK_CLEAR_OVER_JOURNAL"))) {
                 if (fsck_clear_needed_mark(fd, &sb) == 0)
                     printf("  cleared the needs-fsck mark (recorded by registry row %u at %" PRIu64 ")\n", was_node,
                            was_since);
                 else
                     problems++;
+            } else if (!problems && repair_mode) {
+                fprintf(stderr, "  the needs-fsck mark stays until a repair pass after the journal replay\n");
             } else {
                 fprintf(stderr,
                         "ERR: the volume is marked as needing fsck: registry row %u found damaged metadata at %" PRIu64
@@ -7002,10 +7009,18 @@ int main(int argc, char **argv)
      * holds, with the WARN above, and stays OK.
      */
     if (repair_mode && fsck_journal_pending && !cetrafs_test_env("CETRAFS_TEST_FSCK_PENDING_JOURNAL_OK")) {
-        fprintf(stderr,
-                "cetrafs fsck: nothing repaired and no verdict: %" PRIu64 " journal entr%s a mount has not replayed "
-                "-- mount the volume once, then re-run fsck -r\n",
-                fsck_journal_pending, fsck_journal_pending == 1 ? "y" : "ies");
+        /* Some repairs run before the journal is read (a registry row,
+         * a descriptor, a pending-free entry): say what was done. */
+        if (repairs_made)
+            fprintf(stderr,
+                    "cetrafs fsck: %" PRIu64 " repaired before the journal was read, and no verdict: %" PRIu64
+                    " journal entr%s a mount has not replayed -- mount the volume once, then re-run fsck -r\n",
+                    repairs_made, fsck_journal_pending, fsck_journal_pending == 1 ? "y" : "ies");
+        else
+            fprintf(stderr,
+                    "cetrafs fsck: nothing repaired and no verdict: %" PRIu64 " journal entr%s a mount has not "
+                    "replayed -- mount the volume once, then re-run fsck -r\n",
+                    fsck_journal_pending, fsck_journal_pending == 1 ? "y" : "ies");
         return FSCK_EXIT_PROBLEMS;
     }
     printf("cetrafs fsck: OK\n");
