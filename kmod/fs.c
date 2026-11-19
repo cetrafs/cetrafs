@@ -1461,6 +1461,55 @@ static int cetrafs_ranges_add(struct cetrafs_lba_range **r, u32 *n, u32 *cap, u6
  * 'gp' (a grow being validated before it links) supplies the link the
  * device does not have yet.
  */
+/* TEST ONLY: the control of tests/kernel/grow_iseg_pinned.sh. */
+static bool cetrafs_layout_iseg_unpinned;
+cetrafs_test_param(layout_iseg_unpinned, cetrafs_layout_iseg_unpinned, bool, 0644);
+MODULE_PARM_DESC(layout_iseg_unpinned,
+                 "TEST ONLY: a refresh adopts inode table segments that moved, or lie inside the old Block Groups");
+
+/*
+ * A refresh may only APPEND to the inode table: every segment this node
+ * already resolves numbers through must come out of the walk where it
+ * was, the same size, and a segment the grow added must lie past every
+ * Block Group that existed before it -- as the Block Group table's own
+ * segments must (cetrafs_layout_walk()). A CRC-valid superblock or chain
+ * that moved or shrank a segment was adopted silently, and the next
+ * record write or bitmap CAS aimed at the new address (audit 2026-11-15
+ * F-63, rule 19).
+ */
+static int cetrafs_layout_isegs_extend(const struct cetrafs_bg_layout *l, const struct cetrafs_bg_layout *prev)
+{
+    u32 i;
+
+    if (!prev || READ_ONCE(cetrafs_layout_iseg_unpinned))
+        return 0;
+    if (l->nisegs < prev->nisegs) {
+        pr_err("inode table: the new layout has %u segments where this node knows %u -- refusing it\n", l->nisegs,
+               prev->nisegs);
+        return -EUCLEAN;
+    }
+    for (i = 0; i < prev->nisegs; i++) {
+        const struct cetrafs_iseg *a = &prev->isegs[i], *b = &l->isegs[i];
+
+        if (a->first != b->first || a->count != b->count || a->bmap != b->bmap || a->table != b->table) {
+            pr_err("inode table: segment %u moved or changed size (inodes %llu+%llu at %llu/%llu, now %llu+%llu at "
+                   "%llu/%llu) -- refusing the new layout\n",
+                   i, (unsigned long long) a->first, (unsigned long long) a->count, (unsigned long long) a->bmap,
+                   (unsigned long long) a->table, (unsigned long long) b->first, (unsigned long long) b->count,
+                   (unsigned long long) b->bmap, (unsigned long long) b->table);
+            return -EUCLEAN;
+        }
+    }
+    for (; i < l->nisegs; i++)
+        if (l->isegs[i].bmap - 1 < prev->last_bg_end) {
+            pr_err("inode table segment at %llu lies inside the Block Groups that existed before the grow (they "
+                   "end at %llu) -- refusing the new layout\n",
+                   (unsigned long long) (l->isegs[i].bmap - 1), (unsigned long long) prev->last_bg_end);
+            return -EUCLEAN;
+        }
+    return 0;
+}
+
 static int cetrafs_layout_walk_inodes(struct super_block *sb, struct cetrafs_bg_layout *l, bool fresh,
                                       struct cetrafs_grow_plan *gp, struct cetrafs_lba_range **segs, u32 *nsegs,
                                       u32 *segcap)
@@ -1671,6 +1720,8 @@ walked:
         /* The inode table's segments join the same list: one overlap
          * check, one address guard, for every table segment. */
         rc = cetrafs_layout_walk_inodes(sb, l, fresh, gp, &segs, &nsegs, &cap);
+        if (!rc)
+            rc = cetrafs_layout_isegs_extend(l, prev);
         if (rc)
             goto out;
     }
