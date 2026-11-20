@@ -290,6 +290,25 @@ void cetrafs_deferred_unlist_locked(struct super_block *sb, struct buffer_head *
  * the image the device holds, so the next boundary's entry carries a
  * replay guard that matches the device.
  */
+/* Under the buffer lock (listing and settle change together under it):
+ * is the block still held back, and against which device image? */
+bool cetrafs_deferred_listed_crc_locked(struct super_block *sb, struct buffer_head *bh, u32 *disk_crc)
+{
+    struct xarray *xa = cetrafs_sb_deferred(sb);
+    struct cetrafs_deferred *d;
+    bool listed;
+
+    if (!xa)
+        return false;
+    xa_lock(xa);
+    d = xa_load(xa, bh->b_blocknr);
+    listed = d && d->bh == bh;
+    if (listed)
+        *disk_crc = d->disk_crc;
+    xa_unlock(xa);
+    return listed;
+}
+
 void cetrafs_deferred_settle_locked(struct super_block *sb, struct buffer_head *bh, u32 written_crc)
 {
     struct xarray *xa = cetrafs_sb_deferred(sb);
@@ -927,6 +946,64 @@ static int __cetrafs_deferred_write_set(struct super_block *sb, struct inode *in
     return ret;
 }
 
+/* TEST ONLY: the next boundary of inode deferred_collect_stall_ino
+ * pauses this long between collecting its set and taking the file's
+ * claim -- where another boundary of this node can write the same
+ * blocks (tests/kernel/deferred_boundary_race.sh). */
+static unsigned int cetrafs_deferred_collect_stall_ms;
+cetrafs_test_param(deferred_collect_stall_ms, cetrafs_deferred_collect_stall_ms, uint, 0644);
+MODULE_PARM_DESC(deferred_collect_stall_ms, "TEST ONLY: one boundary pauses between collecting its set and its claim");
+static unsigned long long cetrafs_deferred_collect_stall_ino;
+cetrafs_test_param(deferred_collect_stall_ino, cetrafs_deferred_collect_stall_ino, ullong, 0644);
+MODULE_PARM_DESC(deferred_collect_stall_ino, "TEST ONLY: the inode whose boundary deferred_collect_stall_ms pauses");
+
+/* TEST ONLY: judge the set by the device images collected before the
+ * claim, as before -- this node's own boundary in between reads as a
+ * peer's write (the control of tests/kernel/deferred_boundary_race.sh). */
+static bool cetrafs_deferred_snapshot_trusted;
+cetrafs_test_param(deferred_snapshot_trusted, cetrafs_deferred_snapshot_trusted, bool, 0644);
+MODULE_PARM_DESC(deferred_snapshot_trusted, "TEST ONLY: a boundary judges its set by images collected before its claim");
+
+/*
+ * The device image each block of the set should have NOW, under the
+ * claim. The set was collected before the claim was taken, and another
+ * boundary of this node -- sync_fs, a writeback tick, the file's own
+ * fsync or close -- may have written and settled the same blocks in
+ * between: its settle moved the listing's image (still edited since) or
+ * unlisted the block (written as it is in core). Judged by the images
+ * collected before, the device showed this node's own write, which read
+ * as a peer's: the set was dropped and the record's shadow with it, and
+ * the file's newest extents were lost with no other node in sight (a
+ * one-node churn run).
+ * A block no longer listed is not this boundary's to write -- another
+ * boundary wrote it, or it was freed (its image in core is then not the
+ * device's) -- and its submit sends nothing: it is judged against the
+ * device's own image, which passes, as it did when still listed.
+ */
+static void cetrafs_deferred_refresh_set(struct super_block *sb, struct buffer_head **bhs, u32 *crcs, unsigned int n)
+{
+    struct xarray *xa = cetrafs_sb_deferred(sb);
+    void *buf = NULL;
+    unsigned int i;
+
+    if (!xa || READ_ONCE(cetrafs_deferred_snapshot_trusted))
+        return;
+    for (i = 0; i < n; i++) {
+        struct buffer_head *bh = bhs[i];
+
+        if (cetrafs_bh_deferred_listed_crc(sb, bh, &crcs[i]))
+            continue;
+        if (!buf)
+            buf = kmalloc(CETRAFS_BLOCK_SIZE, GFP_NOFS);
+        /* Unreadable: the snapshot stays, and the claim's own read of
+         * the same block says what the device does. */
+        if (buf && !bdev_rw_virt(bh->b_bdev, bh->b_blocknr * (bh->b_size >> SECTOR_SHIFT), buf, CETRAFS_BLOCK_SIZE,
+                                 REQ_OP_READ))
+            crcs[i] = ~crc32c(~0U, buf, CETRAFS_BLOCK_SIZE);
+    }
+    kfree(buf);
+}
+
 /* One boundary of this node's at a time per file, claim to final read:
  * a second one's claim inside the first's window would read as a
  * peer's (F-71). */
@@ -936,7 +1013,11 @@ static int cetrafs_deferred_write_set(struct super_block *sb, struct inode *inod
 {
     int ret;
 
+    if (unlikely(READ_ONCE(cetrafs_deferred_collect_stall_ms)) &&
+        owners[0].ino == READ_ONCE(cetrafs_deferred_collect_stall_ino))
+        msleep(xchg(&cetrafs_deferred_collect_stall_ms, 0)); /* test-only, one-shot */
     cetrafs_tree_claim_lock(owners[0].ino);
+    cetrafs_deferred_refresh_set(sb, bhs, crcs, n);
     ret = __cetrafs_deferred_write_set(sb, inode, bhs, crcs, owners, n, no_inode);
     cetrafs_tree_claim_unlock(owners[0].ino);
     return ret;

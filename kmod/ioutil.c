@@ -2034,6 +2034,18 @@ void cetrafs_bh_deferred_unlist(struct super_block *sb, struct buffer_head *bh, 
     unlock_buffer(bh);
 }
 
+/* Is the block still held back? If so, *disk_crc is the device image it
+ * is held back against. */
+bool cetrafs_bh_deferred_listed_crc(struct super_block *sb, struct buffer_head *bh, u32 *disk_crc)
+{
+    bool listed;
+
+    lock_buffer(bh);
+    listed = cetrafs_deferred_listed_crc_locked(sb, bh, disk_crc);
+    unlock_buffer(bh);
+    return listed;
+}
+
 /* Settle: a boundary wrote the image whose checksum is 'written_crc'.
  * Unlisted if that is still the image in core; an edit made since stays
  * listed, against the image now on the device. */
