@@ -504,8 +504,10 @@ t(lambda: os.statvfs(m))
 # stretch is what keeps a slow live node from being declared gone). So a
 # 15 s budget read a correct 35 s watch as a hang: six "findings" in one
 # 3000-iteration run, every one a node row, every one fsck finishing OK.
+# fsck watches TWICE: once before the walk and once after it, to see that
+# no node mounted meanwhile -- so a slow row costs two such windows, 130 s.
 # A timeout earns one patient retry; only a second one is a hang.
-FSCK_PATIENT_SECS = 15 + 2 * 30 + 5
+FSCK_PATIENT_SECS = 15 + 2 * (2 * 30 + 5)
 
 
 def run_fsck(args, loop, env):
