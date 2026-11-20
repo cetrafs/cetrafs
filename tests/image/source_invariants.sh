@@ -226,13 +226,16 @@ log "checking the FILE sector cannot be published without stamping file_seq"
 # Rather than ask each writer to remember, the stamp lives in the single
 # function that writes fd_checksum. So the invariant to hold is simply
 # that nothing ELSE assigns fd_checksum: any new publish path has to go
-# through the stamp, and therefore stamps.
+# through the stamp, and therefore stamps. The one exception is
+# cetrafs_inode_restamp_crc_fd(): a tree flush's claim that wrote
+# nothing puts back the stamp it replaced, from its own claimed stamp
+# only, so a claim that published no change reads as never made (F-71).
 FDC="$(grep -n "fd_checksum *=" "$K"/*.c | grep -v "cetrafs_inode_stamp_crc_fd" || true)"
 # The stamp function's own assignment is the one legitimate hit; it is
 # matched by the line's presence INSIDE that function, so filter by the
 # file/function pair rather than by text.
 FDC="$(awk '
-    /^(static )?void cetrafs_inode_stamp_crc_fd(_as)?\(/ { inside = 1 }
+    /^(static )?void cetrafs_inode_(re)?stamp_crc_fd(_as)?\(/ { inside = 1 }
     inside && /^}/ { inside = 0; next }
     !inside && /fd_checksum[[:space:]]*=/ { print FILENAME ":" NR }
 ' "$K"/*.c || true)"
@@ -1990,7 +1993,9 @@ done
 # sector -- all zeros, file_seq 0 -- and stamps a new file_seq
 # 5: cetrafs_landed_fd_mutate (233f6f9) replaces a half-landed create's
 # file sector only if it is still, byte for byte, the one judged dead.
-[ "$(echo $FDM | wc -w)" = 5 ] || fail "class 9: $(echo $FDM | wc -w) file-sector CAS mutators (pinned at 5: $(echo $FDM)) -- review the new one and update the pin"
+# 6: cetrafs_fd_claim_mutate (F-71) changes only the stamp, and only from
+# the one the caller read (a tree flush's claim, or its undo).
+[ "$(echo $FDM | wc -w)" = 6 ] || fail "class 9: $(echo $FDM | wc -w) file-sector CAS mutators (pinned at 6: $(echo $FDM)) -- review the new one and update the pin"
 [ -z "${FDU// /}" ] && pass "class 9: every file-sector CAS mutator that publishes compares file_seq ($(echo $FDM); stamp-only: $(echo $FDS))" ||
     fail "class 9: a file-sector CAS mutator publishes without comparing file_seq: $FDU"
 SAMPLE="$(ct_tmp fdmut).c"
@@ -2034,7 +2039,8 @@ cetrafs_sb_nslock_forget none:a-release-queue-entry-not-a-cache
 cetrafs_nswait_forget none:a-per-task-deadline-not-a-cache
 cetrafs_file_cache_drop_count none:a-counter
 cetrafs_pending_forget_cached calls:filemap_invalidate_lock
-cetrafs_sb_half_landed_forget safe:a-straddling-first-sight-restarts-the-clock-which-only-delays-a-settle'
+cetrafs_sb_half_landed_forget safe:a-straddling-first-sight-restarts-the-clock-which-only-delays-a-settle
+cetrafs_inode_forget_claim none:a-claim-note-of-a-swap-that-did-not-land-not-a-cache'
 c41_names() { # <files...>: every function whose name says it drops cached state
     grep -hoE '^(static )?(inline )?(void|bool|int|u32|u64) \*?cetrafs_[a-z0-9_]*(cache_drop|expire|invalidate|forget)[a-z0-9_]*\(' "$@" |
         grep -oE 'cetrafs_[a-z0-9_]*' | sort -u
@@ -2345,6 +2351,7 @@ cetrafs_tree_alloc_block final:test-injection-convert_append_nospc
 cetrafs_tree_block_anywhere final:test-injection-tree_alloc_fail_at'
 C43_REG_EBUSY='cetrafs_lock_defrag_stop_relock waits:schedule_timeout_killable
 cetrafs_deferred_unreachable waits:msleep
+cetrafs_deferred_claim waits:msleep
 cetrafs_lock_suspend waits:cetrafs_lock_defrag_stop_relock
 cetrafs_nslock_acquire_tries waits:msleep
 __cetrafs_nslock_acquire_set waits:msleep

@@ -652,48 +652,173 @@ MODULE_PARM_DESC(late_flush_window_ms, "TEST ONLY: a tree flush pauses this many
 /* The record's file stamp, read from the device; 0 for a record of
  * another generation or one that cannot be read (never a valid stamp:
  * cetrafs_file_seq_new_as() never returns a zero value part). */
-static u64 cetrafs_deferred_file_seq(struct super_block *sb, const struct cetrafs_journal_owner *o)
+static u64 cetrafs_deferred_file_seq_gone(struct super_block *sb, const struct cetrafs_journal_owner *o, bool *gone)
 {
     cetrafs_inode_t *raw = kmalloc(sizeof(*raw), GFP_NOFS);
     u64 seq = 0;
 
+    if (gone)
+        *gone = false;
     if (!raw)
         return 0;
     cetrafs_invalidate_raw_inode(sb, o->ino);
-    if (!cetrafs_read_raw_inode(sb, o->ino, raw) && cetrafs_le64(raw->generation) == o->generation)
-        seq = cetrafs_le64(raw->file_seq);
+    if (!cetrafs_read_raw_inode(sb, o->ino, raw)) {
+        if (cetrafs_le64(raw->generation) == o->generation)
+            seq = cetrafs_le64(raw->file_seq);
+        else if (gone)
+            *gone = true; /* read, and another incarnation's */
+    }
     kfree(raw);
     return seq;
 }
 
+static u64 cetrafs_deferred_file_seq(struct super_block *sb, const struct cetrafs_journal_owner *o)
+{
+    return cetrafs_deferred_file_seq_gone(sb, o, NULL);
+}
+
+/* The same read, for the journal's replay (journal.c). */
+u64 cetrafs_deferred_record_seq(struct super_block *sb, const struct cetrafs_journal_owner *o)
+{
+    return cetrafs_deferred_file_seq(sb, o);
+}
+
 /*
- * After the writes: did a peer write the file inside the window between
- * the device check and the writes (audit 2026-11-15 F-71)? The check
- * reads the set before the batch, and the batch's journal entries and
- * cache flushes run before the in-place writes -- under nofilelock
- * nothing keeps a peer from writing a leaf of the set in between, and
- * one of the two writes is then lost. Not preventable here without the
- * peer taking a lock it does not take; detected instead, and the file
- * is marked damaged rather than left silently wrong: a written block
- * that no longer reads as written (the peer wrote after us), or a
- * record stamp a peer published since the check (it wrote before us).
- * In every mode: a lock this node held can be handed to a peer (a
- * suspend) while a set is still held back, and the orphan flush runs
- * long after.
+ * The claim (audit 2026-11-15 F-71). A boundary writes held-back tree
+ * blocks in place, and under nofilelock nothing keeps a peer from
+ * writing the same leaves: a failed close finished later, a sync or an
+ * unmount after the last close, an evicted inode's orphans -- or two
+ * writers, which BASICS.md forbids and this must still not absorb. A
+ * device check before the writes leaves the gap between it and the
+ * writes, and every check after them leaves its own gap after it. What
+ * closes it is an ORDER every boundary takes part in: each claims the
+ * record's file_seq by CAS -- from the stamp it read, to a new one of
+ * its own -- BEFORE its device check, and after its writes and their
+ * read-back requires the stamp to still be exactly its claim. Of two
+ * overlapping boundaries the CAS orders one first: the other either
+ * fails its claim and judges again from the new stamp, or claims after
+ * it -- and then either its device check runs after the first one's
+ * writes (it sees them and drops its set), or the first one's final read
+ * runs after the second claim and sees a stamp that is not its own (it
+ * reports). Nothing overlapping passes silently.
  *
- * What it does not see, said plainly: a peer that writes a leaf before
- * our write and publishes its record only after the read below -- its
- * leaf is gone and nothing here knows (the window is the batch, ms).
- * What it reports that is not a loss: any peer publish in the window,
- * even one touching none of the set (under nofilelock that is a
- * handoff, where both nodes writing is the misuse BASICS.md forbids);
- * and, on the orphan path, a reopened inode that adopted a block and
- * wrote it back in the same milliseconds. An unverifiable read counts
- * as a loss: the correctness bar is "say so", never "assume".
+ * What it reports that may not be a loss: any other publish of the file
+ * landing inside a boundary (record stamps move on every publish), and
+ * a write-back of the same image. Only where a peer changes the file
+ * while this node writes it -- the one-writer rule broken. Tree blocks
+ * written outside a boundary are new blocks, reachable only by the
+ * publish after them, or a journal replay of a dead node's, which
+ * advances the stamp itself.
+ *
+ * Returns 0 (claimed; *before, *claimed set), -ESTALE (drop the set: a
+ * block changed, or the record is another incarnation's) or an error
+ * (keep it held; nothing written, the claim undone).
+ */
+#define CETRAFS_TREE_CLAIM_TRIES 4
+
+/* TEST ONLY: a boundary writes without claiming the file's stamp first,
+ * as before F-71's claim (tests/kernel/late_flush_stale.sh). */
+static bool cetrafs_tree_flush_unclaimed;
+cetrafs_test_param(tree_flush_unclaimed, cetrafs_tree_flush_unclaimed, bool, 0644);
+MODULE_PARM_DESC(tree_flush_unclaimed, "TEST ONLY: a tree flush does not claim the file's stamp before its check");
+
+/*
+ * Orders, per file NUMBER, every tree boundary of this node (claim to
+ * final read) and every other publish of the file's stamp it could see
+ * inside its window: a set with its inode in core, an orphaned one whose
+ * inode was evicted, the dead-file publish of forget_tree, the stat and
+ * extent publishes. Keyed by number, not by in-core object, so an
+ * orphan's boundary and a live one of the same file cannot overlap
+ * (F-71). Hashed: two files sharing a lock only wait on each other; no
+ * holder takes a second one. Not taken by the journal replay's stamp
+ * advance, which runs inside evictions: it is an expect-CAS on the stamp
+ * it judged, so a boundary's claim makes it wait, and its own advance
+ * inside a boundary's window is that boundary's final read's finding.
+ */
+#define CETRAFS_TREE_CLAIM_LOCKS 64
+static struct mutex cetrafs_tree_claim_locks[CETRAFS_TREE_CLAIM_LOCKS];
+
+void cetrafs_deferred_module_init(void)
+{
+    unsigned int i;
+
+    for (i = 0; i < CETRAFS_TREE_CLAIM_LOCKS; i++)
+        mutex_init(&cetrafs_tree_claim_locks[i]);
+}
+
+void cetrafs_tree_claim_lock(u64 ino)
+{
+    mutex_lock(&cetrafs_tree_claim_locks[hash_64(ino, ilog2(CETRAFS_TREE_CLAIM_LOCKS))]);
+}
+
+void cetrafs_tree_claim_unlock(u64 ino)
+{
+    mutex_unlock(&cetrafs_tree_claim_locks[hash_64(ino, ilog2(CETRAFS_TREE_CLAIM_LOCKS))]);
+}
+
+static int cetrafs_deferred_claim(struct super_block *sb, struct inode *inode, struct buffer_head **bhs,
+                                  const u32 *crcs, unsigned int n, const struct cetrafs_journal_owner *o,
+                                  u64 *before, u64 *claimed, unsigned int *bad)
+{
+    unsigned int tries;
+    bool gone;
+    int ret;
+
+    for (tries = 0;; tries++) {
+        *before = cetrafs_deferred_file_seq_gone(sb, o, &gone);
+        if (gone) {
+            *bad = n; /* no block: the file itself */
+            return -ESTALE; /* deleted, the number reused: no file of ours to write */
+        }
+        if (!*before)
+            return -EIO; /* unreadable: kept for the next boundary */
+        /* The claim is noted for this node's gates inside the swap,
+         * before it can land (cetrafs_inode_seq_unwrap()). */
+        ret = cetrafs_inode_file_seq_claim(sb, inode, o->ino, o->generation, *before, 0, claimed);
+        if (ret != -EAGAIN)
+            break;
+        if (tries == CETRAFS_TREE_CLAIM_TRIES)
+            return -EBUSY; /* a peer publishing on and on: two writers; the set stays held */
+        msleep(1U << tries); /* a peer's publish in flight: let it land */
+    }
+    if (ret == -ESTALE) {
+        *bad = n;
+        return -ESTALE; /* the record turned into another incarnation's */
+    }
+    /* Failed, or an outcome not known: nothing is written. A claim that
+     * did land anyway is not taken back -- a second swap could only
+     * guess at what is there. It announces a change that never came:
+     * peers refetch the map once, and this node's gates look through it
+     * (noted in the swap). The set stays held for the next boundary. */
+    if (ret)
+        return ret;
+    ret = cetrafs_deferred_set_current(bhs, crcs, n, bad);
+    if (ret) {
+        u64 back;
+
+        /* Nothing will be written, so the claim announced no change: put
+         * back what it replaced, unless a publish has moved it since. */
+        if (cetrafs_inode_file_seq_claim(sb, NULL, o->ino, o->generation, *claimed, *before, &back))
+            pr_info("ino=%llu: a tree flush could not take back its stamp claim -- peers refetch the file's "
+                    "map\n",
+                    (unsigned long long) o->ino);
+    }
+    return ret;
+}
+
+/*
+ * After the writes: each written block re-read (a peer wrote after us),
+ * and the record's stamp, which must still be our claim (a peer claimed
+ * or published inside our window: see cetrafs_deferred_claim()). A loss
+ * cannot be undone here -- the peer took no lock to exclude -- so the
+ * file is marked damaged rather than left silently wrong. Unclaimed
+ * (the control only), the old test: any foreign stamp since seq_before.
+ * An unverifiable read counts as a loss: the correctness bar is "say
+ * so", never "assume".
  */
 static void cetrafs_deferred_window_check(struct super_block *sb, struct buffer_head **bhs, const bool *written,
                                           const u32 *wcrc, unsigned int n,
-                                          const struct cetrafs_journal_owner *o, u64 seq_before)
+                                          const struct cetrafs_journal_owner *o, u64 seq_before, u64 claimed)
 {
     u64 seq_after;
     u32 me = 0;
@@ -716,9 +841,11 @@ static void cetrafs_deferred_window_check(struct super_block *sb, struct buffer_
             lost = true;
     }
     kfree(buf);
-    /* The stamp only where the one before the batch was read: an
-     * unknown "before" would make any peer's last stamp read as new. */
-    if (!lost && seq_before) {
+    if (!lost && claimed) {
+        lost = cetrafs_deferred_file_seq(sb, o) != claimed;
+    } else if (!lost && seq_before) {
+        /* Unclaimed: an unknown "before" would make any peer's last
+         * stamp read as new. */
         seq_after = cetrafs_deferred_file_seq(sb, o);
         if (!seq_after || (seq_after != seq_before && CETRAFS_FILE_SEQ_NODE(seq_after) != (me & 0xFFFFu)))
             lost = true;
@@ -739,24 +866,33 @@ static void cetrafs_deferred_window_check(struct super_block *sb, struct buffer_
  * The caller with the inode drops its record shadow too
  * (cetrafs_lock_tree_superseded()).
  */
-static int cetrafs_deferred_write_set(struct super_block *sb, struct buffer_head **bhs, u32 *crcs,
-                                      const struct cetrafs_journal_owner *owners, unsigned int n, bool no_inode)
+static int __cetrafs_deferred_write_set(struct super_block *sb, struct inode *inode, struct buffer_head **bhs,
+                                        u32 *crcs, const struct cetrafs_journal_owner *owners, unsigned int n,
+                                        bool no_inode)
 {
     bool *written;
     u32 *wcrc;
     unsigned int i, bad = 0;
-    u64 seq_before;
+    u64 seq_before, claimed = 0;
     int ret;
 
-    /* Before the check: a peer's publish after it is in the window. */
-    seq_before = cetrafs_deferred_file_seq(sb, &owners[0]);
-    ret = cetrafs_deferred_set_current(bhs, crcs, n, &bad);
+    if (!READ_ONCE(cetrafs_tree_flush_unclaimed) && !READ_ONCE(cetrafs_late_flush_blind)) {
+        ret = cetrafs_deferred_claim(sb, inode, bhs, crcs, n, &owners[0], &seq_before, &claimed, &bad);
+    } else {
+        /* Before the check: a peer's publish after it is in the window. */
+        seq_before = cetrafs_deferred_file_seq(sb, &owners[0]);
+        ret = cetrafs_deferred_set_current(bhs, crcs, n, &bad);
+    }
     if (ret == -ESTALE) {
         atomic64_inc(&cetrafs_deferred_stale_sets);
-        pr_err("ino=%llu: tree block %llu changed on the device since this node held it back -- another node "
-               "wrote the file after this node's last boundary failed; its %u unwritten tree block(s) are "
-               "dropped, not written over that\n",
-               (unsigned long long) owners[0].ino, (unsigned long long) bhs[bad]->b_blocknr, n);
+        if (bad >= n)
+            pr_err("ino=%llu: the file was deleted and its number reused since this node held its tree "
+                   "blocks back; its %u unwritten tree block(s) are dropped\n",
+                   (unsigned long long) owners[0].ino, n);
+        else
+            pr_err("ino=%llu: tree block %llu changed on the device since this node held it back -- another "
+                   "node wrote the file; its %u unwritten tree block(s) are dropped, not written over that\n",
+                   (unsigned long long) owners[0].ino, (unsigned long long) bhs[bad]->b_blocknr, n);
         for (i = 0; i < n; i++)
             cetrafs_bh_deferred_unlist(sb, bhs[i], true);
         return ret;
@@ -785,9 +921,24 @@ static int cetrafs_deferred_write_set(struct super_block *sb, struct buffer_head
     for (i = 0; i < n; i++)
         if (written[i])
             cetrafs_bh_deferred_settle(sb, bhs[i], wcrc[i]);
-    cetrafs_deferred_window_check(sb, bhs, written, wcrc, n, &owners[0], seq_before);
+    cetrafs_deferred_window_check(sb, bhs, written, wcrc, n, &owners[0], seq_before, claimed);
     kvfree(written);
     kvfree(wcrc);
+    return ret;
+}
+
+/* One boundary of this node's at a time per file, claim to final read:
+ * a second one's claim inside the first's window would read as a
+ * peer's (F-71). */
+static int cetrafs_deferred_write_set(struct super_block *sb, struct inode *inode, struct buffer_head **bhs,
+                                      u32 *crcs, const struct cetrafs_journal_owner *owners, unsigned int n,
+                                      bool no_inode)
+{
+    int ret;
+
+    cetrafs_tree_claim_lock(owners[0].ino);
+    ret = __cetrafs_deferred_write_set(sb, inode, bhs, crcs, owners, n, no_inode);
+    cetrafs_tree_claim_unlock(owners[0].ino);
     return ret;
 }
 
@@ -849,7 +1000,7 @@ int cetrafs_deferred_flush_inode(struct inode *inode, bool mapping_locked)
         filemap_invalidate_lock_shared(inode->i_mapping);
     ret = cetrafs_deferred_collect(xa, cetrafs_inode_deferred(inode), &bhs, &crcs, &owners, &n);
     if (!ret && n)
-        ret = cetrafs_deferred_write_set(sb, bhs, crcs, owners, n, false);
+        ret = cetrafs_deferred_write_set(sb, inode, bhs, crcs, owners, n, false);
     if (ret == -ESTALE)
         cetrafs_lock_tree_superseded(inode);
     if (!mapping_locked)
@@ -868,8 +1019,9 @@ int cetrafs_deferred_flush_inode(struct inode *inode, bool mapping_locked)
  * was kept under half of it while it was live (cetrafs_deferred_capped())
  * -- the orphans together are not.
  */
-static int cetrafs_deferred_write_by_inode(struct super_block *sb, struct buffer_head **bhs, u32 *crcs,
-                                           struct cetrafs_journal_owner *owners, unsigned int n, bool no_inode)
+static int cetrafs_deferred_write_by_inode(struct super_block *sb, struct inode *in_core, struct buffer_head **bhs,
+                                           u32 *crcs, struct cetrafs_journal_owner *owners, unsigned int n,
+                                           bool no_inode)
 {
     struct buffer_head **gb = kvmalloc_array(n, sizeof(*gb), GFP_NOFS);
     u32 *gc = kvmalloc_array(n, sizeof(*gc), GFP_NOFS);
@@ -894,7 +1046,14 @@ static int cetrafs_deferred_write_by_inode(struct super_block *sb, struct buffer
             done[k] = true;
             m++;
         }
-        w = cetrafs_deferred_write_set(sb, gb, gc, go, m, no_inode);
+        /* The caller's inode, if this set is its file's: its claim is
+         * then noted for that inode's gates (F-71). */
+        w = cetrafs_deferred_write_set(sb,
+                                       in_core && go[0].ino == in_core->i_ino &&
+                                               go[0].generation == cetrafs_inode_get_generation(in_core)
+                                           ? in_core
+                                           : NULL,
+                                       gb, gc, go, m, no_inode);
         /* -ESTALE: dropped, superseded by a peer -- nothing left to write
          * and no inode in core to tell; not a boundary that failed. */
         if (w && w != -ESTALE && !r)
@@ -908,7 +1067,8 @@ out:
     return r;
 }
 
-static int cetrafs_deferred_flush_list(struct super_block *sb, struct list_head *head, bool no_inode)
+static int cetrafs_deferred_flush_list(struct super_block *sb, struct inode *in_core, struct list_head *head,
+                                       bool no_inode)
 {
     struct buffer_head **bhs;
     struct cetrafs_journal_owner *owners;
@@ -918,7 +1078,7 @@ static int cetrafs_deferred_flush_list(struct super_block *sb, struct list_head 
 
     r = cetrafs_deferred_collect(cetrafs_sb_deferred(sb), head, &bhs, &crcs, &owners, &n);
     if (!r && n)
-        r = cetrafs_deferred_write_by_inode(sb, bhs, crcs, owners, n, no_inode);
+        r = cetrafs_deferred_write_by_inode(sb, in_core, bhs, crcs, owners, n, no_inode);
     for (i = 0; i < n; i++)
         brelse(bhs[i]);
     kvfree(bhs);
@@ -946,8 +1106,9 @@ MODULE_PARM_DESC(retry_orphans_off, "TEST ONLY: a close finished by the heartbea
  * (cetrafs_deferred_set_current(), BC-31). A failure keeps the close
  * unfinished.
  */
-int cetrafs_deferred_flush_orphans_of(struct super_block *sb, u64 ino)
+int cetrafs_deferred_flush_orphans_of(struct super_block *sb, struct inode *inode)
 {
+    u64 ino = inode->i_ino;
     struct xarray *xa = cetrafs_sb_deferred(sb);
     struct list_head *orphans = cetrafs_sb_deferred_orphans(sb);
     struct cetrafs_deferred *d;
@@ -963,7 +1124,7 @@ int cetrafs_deferred_flush_orphans_of(struct super_block *sb, u64 ino)
         }
     }
     xa_unlock(xa);
-    return any ? cetrafs_deferred_flush_list(sb, orphans, true) : 0;
+    return any ? cetrafs_deferred_flush_list(sb, inode, orphans, true) : 0;
 }
 
 /*
@@ -1130,7 +1291,7 @@ int cetrafs_deferred_flush_all(struct super_block *sb)
              * (cetrafs_deferred_write_by_inode()). A failure there, or
              * a list that never empties, ends the orphan rounds; the
              * walk goes on over the live sets. */
-            r = cetrafs_deferred_flush_list(sb, orphans, true);
+            r = cetrafs_deferred_flush_list(sb, NULL, orphans, true);
             if (r) {
                 if (!ret || ret == -EBUSY)
                     ret = r;
@@ -1173,7 +1334,7 @@ int cetrafs_deferred_flush_all(struct super_block *sb)
             continue;
         }
         if (cetrafs_deferred_flush_no_inode)
-            r = cetrafs_deferred_flush_list(sb, cetrafs_inode_deferred(inode), true); /* test-only */
+            r = cetrafs_deferred_flush_list(sb, NULL, cetrafs_inode_deferred(inode), true); /* test-only */
         else
             r = cetrafs_deferred_flush_inode(inode, false);
         iput(inode);

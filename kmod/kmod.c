@@ -117,6 +117,7 @@ static int __init cetrafs_init(void)
 
     fs_debug(info, "========================= IN %s UUID %s", __FUNCTION__, muuid);
 
+    cetrafs_deferred_module_init();
     ret = cetrafs_init_inode_cache();
     if (ret) {
         pr_err("Failed to create inode cache\n");

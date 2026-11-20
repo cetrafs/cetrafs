@@ -509,7 +509,19 @@ bool cetrafs_sb_unclean_reattach(struct super_block *sb);
 /* inode.c: advance a record's namespace stamp (dirent_seq) */
 void cetrafs_ns_stamp_advance(cetrafs_inode_t *rec);
 /* as_node: whose change the new file_seq says it is (the replayed node). */
-int cetrafs_inode_advance_change_stamp(struct super_block *sb, u64 ino, u64 generation, bool dir, u32 as_node);
+int cetrafs_inode_advance_change_stamp(struct super_block *sb, u64 ino, u64 generation, bool dir, u32 as_node,
+                                       u64 expect, u64 *stamped);
+u64 cetrafs_inode_seq_unwrap(struct inode *inode, u64 seq);
+#define CETRAFS_CLAIM_RING 8
+/* A file_seq writer id no node holds (ids are row indices, far below):
+ * a change every node judges as another's. */
+#define CETRAFS_FILE_SEQ_NOBODY 0xFFFFu
+void cetrafs_inode_note_claim(struct inode *inode, u64 before, u64 claimed);
+void cetrafs_inode_forget_claim(struct inode *inode, u64 claimed);
+void cetrafs_inode_claim_lock(struct inode *inode);
+void cetrafs_inode_claim_unlock(struct inode *inode);
+int cetrafs_inode_file_seq_claim(struct super_block *sb, struct inode *inode, u64 ino, u64 generation, u64 expect,
+                                 u64 set_to, u64 *out_seq);
 /* lock.c: clear every claim a previous incarnation of this node left */
 int cetrafs_lock_sweep_own_claims(struct super_block *sb, u32 my_node_id);
 u64 cetrafs_deferred_orphaned_count(void);
@@ -1975,6 +1987,10 @@ void cetrafs_deferred_settle_locked(struct super_block *sb, struct buffer_head *
 u32 cetrafs_deferred_disk_crc(struct super_block *sb, struct buffer_head *bh, u32 fallback);
 void cetrafs_deferred_forget_range(struct super_block *sb, u64 lba, u32 count);
 bool cetrafs_deferred_any_in_range(struct super_block *sb, u64 lba, u32 count);
+u64 cetrafs_deferred_record_seq(struct super_block *sb, const struct cetrafs_journal_owner *o);
+void cetrafs_deferred_module_init(void);
+void cetrafs_tree_claim_lock(u64 ino);
+void cetrafs_tree_claim_unlock(u64 ino);
 void cetrafs_deferred_evict(struct inode *inode);
 struct list_head *cetrafs_inode_deferred(struct inode *inode);
 bool cetrafs_deferred_inode_pending(struct inode *inode); /* leafdefer.c */
@@ -1996,7 +2012,7 @@ u64 cetrafs_deferred_hold_count(void);
 u64 cetrafs_deferred_list_step_count(void);
 int cetrafs_deferred_flush_inode(struct inode *inode, bool mapping_locked);
 u64 cetrafs_deferred_stale_set_count(void); /* leafdefer.c: sets dropped as superseded (BC-31) */
-int cetrafs_deferred_flush_orphans_of(struct super_block *sb, u64 ino);
+int cetrafs_deferred_flush_orphans_of(struct super_block *sb, struct inode *inode);
 int cetrafs_deferred_flush_all(struct super_block *sb);
 unsigned long cetrafs_deferred_drop_all(struct super_block *sb);
 int cetrafs_journal_write_new_block(struct super_block *sb, struct buffer_head *bh);

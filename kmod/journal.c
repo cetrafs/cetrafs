@@ -3236,6 +3236,8 @@ static int __cetrafs_journal_replay_node(struct super_block *sb, u32 node_id, bo
         struct inode *oi = NULL; /* this node's opener, its invalidate_lock held across the redo */
         bool apply, owner_dir = false, owner_known = false;
         u32 judged_crc = 0;
+        u64 redo_seq = 0; /* the owner stamp this redo advanced (F-71) */
+        u64 judged_seq = 0; /* the owner stamp read before the target was judged (F-71) */
         int blocked;
 
         if (st[s] == CETRAFS_JR_DEFERRED)
@@ -3339,6 +3341,16 @@ static int __cetrafs_journal_replay_node(struct super_block *sb, u32 node_id, bo
          * to see what is on the DEVICE right now, including writes a
          * peer made that this node has never had reason to re-read.
          * A cached copy would answer the question we are not asking. */
+        /* The owner's stamp BEFORE the target is read: a live boundary
+         * claiming the file after this is seen by the advance below,
+         * which refuses to move a stamp it was not judged against. */
+        judged_seq = 0;
+        if (!cetrafs_journal_ignore_owner) {
+            struct cetrafs_journal_owner jo = {.ino = entries[s].owner_ino,
+                                               .generation = entries[s].owner_generation};
+
+            judged_seq = cetrafs_deferred_record_seq(sb, &jo);
+        }
         tbh = NULL;
         apply = false;
         {
@@ -3579,6 +3591,49 @@ static int __cetrafs_journal_replay_node(struct super_block *sb, u32 node_id, bo
                     cetrafs_journal_owner_pause_ms, (unsigned long long) entries[s].target_lba);
             msleep(cetrafs_journal_owner_pause_ms);
         }
+        /*
+         * A regular file's tree block: the redo takes part in the order
+         * every tree boundary keeps (leafdefer.c, F-71) -- the owner's
+         * stamp moves BEFORE the last look at the target, and must still
+         * be that stamp once the redo is durable. A live node's boundary
+         * claiming the file in between is then seen by one side or the
+         * other: its device check meets the redo, or our final read
+         * meets its claim. Named as the dead owner, as before (review
+         * F1). Only over the stamp read before the target was judged: a
+         * claim since then is a live boundary's, never overwritten --
+         * the entry waits and is judged again. Not advanced: not redone.
+         * Directories hold no tree blocks back (only regular files
+         * defer, file.c), so no boundary of theirs claims a stamp; their
+         * tree is written under the namespace lock.
+         */
+        redo_seq = 0;
+        if (apply && owner_known && !owner_dir && !cetrafs_journal_ignore_owner) {
+            int tret = judged_seq ? cetrafs_inode_advance_change_stamp(sb, entries[s].owner_ino,
+                                                                       entries[s].owner_generation, false, node_id,
+                                                                       judged_seq, &redo_seq)
+                                  : -EIO;
+
+            if (tret == -EAGAIN) {
+                pr_warn_ratelimited("journal replay: node %u txn %llu: ino %llu changed since its block %llu was "
+                                    "judged -- a live node is writing it; the redo waits\n",
+                                    node_id, (unsigned long long) entries[s].txn_id,
+                                    (unsigned long long) entries[s].owner_ino,
+                                    (unsigned long long) entries[s].target_lba);
+                atomic64_inc(&cetrafs_journal_replay_live_kept);
+                entries[s].live_kept = true;
+                tret = -EBUSY;
+            }
+            if (tret) {
+                pr_warn("journal replay: node %u txn %llu: could not advance ino %llu's change stamp before the "
+                        "redo (%d) -- entry kept\n",
+                        node_id, (unsigned long long) entries[s].txn_id,
+                        (unsigned long long) entries[s].owner_ino, tret);
+                brelse(tbh);
+                brelse(pbh);
+                ret = tret;
+                goto keep;
+            }
+        }
         if (apply && !READ_ONCE(cetrafs_journal_no_last_read)) {
             brelse(tbh);
             tbh = cetrafs_bread_uncached_retry(sb, entries[s].target_lba);
@@ -3651,9 +3706,24 @@ static int __cetrafs_journal_replay_node(struct super_block *sb, u32 node_id, bo
              * Failing leaves peers on the old copy until the owner's
              * next change -- said, not fatal: the block itself is
              * right. */
-            if (owner_known && !cetrafs_journal_ignore_owner) {
+            if (redo_seq) {
+                /* Ours still, or a live boundary claimed the file inside
+                 * the redo and one of the two writes may be lost. */
+                struct cetrafs_journal_owner o = {.ino = entries[s].owner_ino,
+                                                  .generation = entries[s].owner_generation};
+
+                if (cetrafs_deferred_record_seq(sb, &o) != redo_seq) {
+                    pr_err("journal replay: node %u txn %llu: ino %llu changed while its block %llu was redone -- "
+                           "a write may be lost; the file is marked damaged (fsck.cetra)\n",
+                           node_id, (unsigned long long) entries[s].txn_id,
+                           (unsigned long long) entries[s].owner_ino,
+                           (unsigned long long) entries[s].target_lba);
+                    cetrafs_sb_corrupt_owner(sb, entries[s].owner_ino, entries[s].owner_generation);
+                }
+            } else if (owner_known && !cetrafs_journal_ignore_owner) {
                 int tret = cetrafs_inode_advance_change_stamp(sb, entries[s].owner_ino,
-                                                              entries[s].owner_generation, owner_dir, node_id);
+                                                              entries[s].owner_generation, owner_dir, node_id,
+                                                              0, NULL);
 
                 if (tret)
                     pr_warn("journal replay: node %u txn %llu: could not advance ino %llu's change stamp after "

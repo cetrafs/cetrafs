@@ -272,6 +272,18 @@ static void cetrafs_inode_stamp_crc_fd_as(struct super_block *sb, cetrafs_inode_
     in->fd_checksum = cetrafs_cpu_to_le64(cetrafs_inode_crc_fd(in));
 }
 
+/* The one exception (tests/image/source_invariants.sh): a tree flush that
+ * claimed the file and then wrote nothing puts back the stamp its claim
+ * replaced, so the claim -- which published no change -- reads as never
+ * made (cetrafs_inode_file_seq_claim()). Only from the claimed stamp. */
+static void cetrafs_inode_restamp_crc_fd(cetrafs_inode_t *in, u64 seq)
+{
+    in->fd_ino = in->ino;
+    in->fd_generation = in->generation;
+    in->file_seq = cetrafs_cpu_to_le64(seq);
+    in->fd_checksum = cetrafs_cpu_to_le64(cetrafs_inode_crc_fd(in));
+}
+
 void cetrafs_inode_stamp_crc_fd(struct super_block *sb, cetrafs_inode_t *in)
 {
     u32 node_id = 0;
@@ -1343,6 +1355,9 @@ struct cetrafs_fd_touch_ctx {
     struct super_block *sb;
     u64 ino, generation;
     u32 as_node;
+    u64 expect;  /* nonzero: only over this stamp (-EAGAIN otherwise) */
+    u64 stamped; /* the file_seq the swap wrote */
+    bool moved;  /* refused: the stamp is not 'expect' */
 };
 
 /* TEST ONLY: the replay's stamp names the replaying node, as it did
@@ -1364,6 +1379,10 @@ static int cetrafs_fd_touch_mutate(void *image, unsigned int len, void *priv)
         return -ESTALE; /* the number was reused: not the entry's file */
     if (cetrafs_inode_crc_fd(&rec) != (u32) cetrafs_le64(rec.fd_checksum))
         return -EUCLEAN; /* restamping would bless the damage */
+    if (ctx->expect && cetrafs_le64(rec.file_seq) != ctx->expect) {
+        ctx->moved = true;
+        return -EAGAIN; /* a publish or a live boundary's claim since it was judged: never over it */
+    }
     rec.ino = rec.fd_ino;
     rec.generation = rec.fd_generation;
     /* A new file_seq, and the CRC over it -- named as the DEAD node's
@@ -1373,13 +1392,19 @@ static int cetrafs_fd_touch_mutate(void *image, unsigned int len, void *priv)
      * was not refused -- on the node most likely to hold the file, the
      * one the VM was restarted on (review F1). */
     cetrafs_inode_stamp_crc_fd_as(ctx->sb, &rec, ctx->as_node);
+    ctx->stamped = cetrafs_le64(rec.file_seq);
     cetrafs_inode_fd_to_image(image, &rec);
     return 0;
 }
 
-int cetrafs_inode_advance_change_stamp(struct super_block *sb, u64 ino, u64 generation, bool dir, u32 as_node)
+int cetrafs_inode_advance_change_stamp(struct super_block *sb, u64 ino, u64 generation, bool dir, u32 as_node,
+                                       u64 expect, u64 *stamped)
 {
-    struct cetrafs_fd_touch_ctx ctx = {.sb = sb, .ino = ino, .generation = generation, .as_node = as_node};
+    struct cetrafs_fd_touch_ctx ctx = {
+        .sb = sb, .ino = ino, .generation = generation, .as_node = as_node, .expect = expect};
+
+    if (stamped)
+        *stamped = 0;
 
     if (READ_ONCE(cetrafs_replay_stamp_as_self))
         (void) cetrafs_sb_get_node_id(sb, &ctx.as_node);
@@ -1395,7 +1420,139 @@ int cetrafs_inode_advance_change_stamp(struct super_block *sb, u64 ino, u64 gene
      * inode being evicted, and the replay can run inside that eviction).
      * The stamp names the dead owner, which no refresh of this node
      * judges as its own -- see BUG-CLASSES class 29. */
-    return cetrafs_cas_record_fd_seeded(sb, lba, NULL, 0, cetrafs_fd_touch_mutate, &ctx);
+    {
+        int ret = cetrafs_cas_record_fd_seeded(sb, lba, NULL, 0, cetrafs_fd_touch_mutate, &ctx);
+
+        if (ret == -EAGAIN && !ctx.moved)
+            ret = -EIO; /* a path refused the command: not a change of the file */
+        if (stamped)
+            *stamped = ret ? 0 : ctx.stamped;
+        return ret;
+    }
+}
+
+/*
+ * A tree flush's claim on the file (leafdefer.c, audit F-71): move the
+ * record's file_seq from 'expect' -- the stamp read before the flush
+ * looked at its blocks -- to a new one of this node's, in one CAS,
+ * before anything is written. A peer that published or claimed since is
+ * seen here (-EAGAIN: the stamp moved). *out_seq: the stamp now on the
+ * record. set_to (nonzero) puts a claimed stamp back to the one it
+ * replaced, for a flush that then wrote nothing.
+ */
+struct cetrafs_fd_claim_ctx {
+    struct super_block *sb;
+    u64 ino, generation, expect, stamped;
+    u64 set_to; /* nonzero: put back this stamp instead of a new one */
+    struct inode *inode; /* if any: the claim is noted before it can land */
+    u64 noted[CETRAFS_CLAIM_RING / 2]; /* the stamps noted, one per run of the mutator */
+    unsigned int nnoted;
+    bool moved; /* refused: the record's stamp is not 'expect' */
+};
+
+/* TEST ONLY: a claim with its inode in core is named as this node's
+ * whatever it replaces, as before the second F-71 review
+ * (tests/kernel/late_flush_stale.sh). */
+static bool cetrafs_claim_self_named;
+cetrafs_test_param(claim_self_named, cetrafs_claim_self_named, bool, 0644);
+MODULE_PARM_DESC(claim_self_named, "TEST ONLY: a tree flush's claim is named as this node's even over a peer's stamp");
+
+static int cetrafs_fd_claim_mutate(void *image, unsigned int len, void *priv)
+{
+    struct cetrafs_fd_claim_ctx *ctx = priv;
+    cetrafs_inode_t rec;
+
+    BUILD_BUG_ON(CETRAFS_MAX_READER_NODES > CETRAFS_FILE_SEQ_NOBODY);
+    if (len < CETRAFS_INODE_FD_BYTES)
+        return -EINVAL;
+    memset(&rec, 0, sizeof(rec));
+    cetrafs_inode_fd_from_image(&rec, image);
+    if (cetrafs_le64(rec.fd_ino) != ctx->ino || cetrafs_le64(rec.fd_generation) != ctx->generation)
+        return -ESTALE;
+    if (cetrafs_inode_crc_fd(&rec) != (u32) cetrafs_le64(rec.fd_checksum))
+        return -EUCLEAN;
+    if (cetrafs_le64(rec.file_seq) != ctx->expect) {
+        ctx->moved = true;
+        return -EAGAIN; /* a publish since the read: re-judge from it */
+    }
+    rec.ino = rec.fd_ino;
+    rec.generation = rec.fd_generation;
+    if (ctx->set_to) {
+        cetrafs_inode_restamp_crc_fd(&rec, ctx->set_to);
+    } else {
+        u32 me = CETRAFS_FILE_SEQ_NOBODY;
+
+        /*
+         * Named as this node's only over a stamp that already is: then
+         * nothing it replaces was anyone else's, and losing its note
+         * (the ring is per in-core inode, and an eviction drops it)
+         * hides nothing. Over anyone else's stamp, or with no inode in
+         * core, it is named as NO node's: every node -- this one
+         * included, on any later sight -- judges it a change it did not
+         * make and re-reads the map. Named as ours, it hid the stamp it
+         * replaced from this node once the note was gone; named as that
+         * stamp's writer, it would hide this flush from that peer
+         * (F-71 reviews).
+         */
+        if (ctx->inode && !cetrafs_sb_get_node_id(ctx->sb, &me) &&
+            CETRAFS_FILE_SEQ_NODE(ctx->expect) != (me & 0xFFFFu) && !READ_ONCE(cetrafs_claim_self_named))
+            me = CETRAFS_FILE_SEQ_NOBODY;
+        if (!ctx->inode)
+            me = CETRAFS_FILE_SEQ_NOBODY;
+        cetrafs_inode_stamp_crc_fd_as(ctx->sb, &rec, me);
+        /* Noted here, before the swap is sent: a gate of this node that
+         * reads the record the moment it lands must already look through
+         * it (cetrafs_inode_seq_unwrap()) -- a no-node claim over the
+         * stamp it last reconciled at is then no change to it. The
+         * caller takes back the notes of swaps that definitely did not
+         * land; past the bookkeeping's room a run notes nothing, which
+         * costs a re-read of the map at worst. */
+        if (ctx->inode && ctx->nnoted < ARRAY_SIZE(ctx->noted)) {
+            cetrafs_inode_note_claim(ctx->inode, ctx->expect, cetrafs_le64(rec.file_seq));
+            ctx->noted[ctx->nnoted++] = cetrafs_le64(rec.file_seq);
+        }
+    }
+    ctx->stamped = cetrafs_le64(rec.file_seq);
+    cetrafs_inode_fd_to_image(image, &rec);
+    return 0;
+}
+
+int cetrafs_inode_file_seq_claim(struct super_block *sb, struct inode *inode, u64 ino, u64 generation, u64 expect,
+                                 u64 set_to, u64 *out_seq)
+{
+    struct cetrafs_fd_claim_ctx ctx = {.sb = sb,
+                                       .ino = ino,
+                                       .generation = generation,
+                                       .expect = expect,
+                                       .set_to = set_to,
+                                       .inode = inode};
+    u64 lba = cetrafs_inode_lba(sb, ino);
+    int ret;
+
+    if (!lba)
+        return -EINVAL;
+    if (cetrafs_sb_is_fenced(sb))
+        return -EIO;
+    ret = cetrafs_cas_record_fd_seeded(sb, lba, NULL, 0, cetrafs_fd_claim_mutate, &ctx);
+    /* The notes of swaps that did not land go: all of them on a definite
+     * failure, all but the landed one on success. An outcome not known
+     * (-ETIMEDOUT, or -EIO from a stopped mount) keeps them all: any may
+     * be on the record. */
+    if (inode) {
+        unsigned int i;
+
+        for (i = 0; i < ctx.nnoted; i++)
+            if ((ret && ret != -ETIMEDOUT && ret != -EIO) || (!ret && ctx.noted[i] != ctx.stamped))
+                cetrafs_inode_forget_claim(inode, ctx.noted[i]);
+    }
+    /* The record's stamp moved: -EAGAIN. Any other -EAGAIN (a path that
+     * refused the command) is an I/O failure, not a peer's publish. */
+    if (ret == -EAGAIN && !ctx.moved)
+        ret = -EIO;
+    /* Also on an error: a swap whose outcome is unknown may have landed
+     * with the stamp the mutator made (0: it made none). */
+    *out_seq = ctx.stamped;
+    return ret;
 }
 
 struct cetrafs_fd_write_ctx {
@@ -1406,6 +1563,7 @@ struct cetrafs_fd_write_ctx {
     u64 plan_seq;     /* the file_seq of the record the caller's plan was built from */
     u32 me;
     u64 found_seq;    /* on a refusal: the peer's stamp found on the device */
+    struct inode *self; /* if any: its own tree claim is looked through (F-71) */
 };
 
 /* TEST ONLY: publish a planned rebuild without its stamp check -- the
@@ -1439,10 +1597,17 @@ static int cetrafs_fd_write_mutate(void *image, unsigned int len, void *priv)
      * put the pre-peer tree back over the peer's extents and erase its
      * stamp. A stamp that moved and is not ours is that peer; our own
      * publishes in the window are serialised with this one locally. */
-    if (ctx->check_plan && cetrafs_le64(rec.file_seq) != ctx->plan_seq &&
-        CETRAFS_FILE_SEQ_NODE(cetrafs_le64(rec.file_seq)) != (ctx->me & 0xFFFFu)) {
-        ctx->found_seq = cetrafs_le64(rec.file_seq);
-        return -ETXTBSY;
+    if (ctx->check_plan) {
+        /* A tree boundary of ours may have claimed the record since the
+         * plan: judge the stamp that claim replaced (F-71). */
+        u64 dev = cetrafs_le64(rec.file_seq);
+        u64 eff = ctx->self ? cetrafs_inode_seq_unwrap(ctx->self, dev) : dev;
+
+        if (cetrafs_le64(rec.file_seq) != ctx->plan_seq && eff != ctx->plan_seq &&
+            CETRAFS_FILE_SEQ_NODE(eff) != (ctx->me & 0xFFFFu)) {
+            ctx->found_seq = eff;
+            return -ETXTBSY;
+        }
     }
 
     cetrafs_inode_fd_copy(&rec, ctx->src);
@@ -1482,7 +1647,7 @@ MODULE_PARM_DESC(fd_cas_lost_ack, "TEST ONLY: the next fd-sector swap lands but 
 static int __cetrafs_write_raw_inode_fd(struct super_block *sb, u64 ino, const cetrafs_inode_t *src,
                                        struct inode *self, const u64 *plan_seq, bool *landed)
 {
-    struct cetrafs_fd_write_ctx ctx = {.src = src, .sb = sb};
+    struct cetrafs_fd_write_ctx ctx = {.src = src, .sb = sb, .self = self};
     u64 lba = cetrafs_inode_lba(sb, ino);
 
     if (!lba)
@@ -1511,7 +1676,13 @@ static int __cetrafs_write_raw_inode_fd(struct super_block *sb, u64 ino, const c
             ret = cetrafs_publish_flush(sb);
         if (ret)
             return ret;
+        /* Not inside one of this node's tree boundaries of the file:
+         * its final read must find its own claim (F-71). */
+        if (self)
+            cetrafs_inode_claim_lock(self);
         ret = cetrafs_cas_record_fd_seeded(sb, lba, NULL, 0, cetrafs_fd_write_mutate, &ctx);
+        if (self)
+            cetrafs_inode_claim_unlock(self);
         if (!ret && xchg(&cetrafs_fd_cas_lost_ack, false))
             ret = -EIO; /* TEST ONLY: landed, reported as an outcome unknown */
 
@@ -1679,8 +1850,11 @@ int cetrafs_inode_forget_tree(struct super_block *sb, u64 ino, u64 generation, u
         {
             struct cetrafs_fd_write_ctx ctx = {.src = raw, .sb = sb};
 
+            /* Outside any tree boundary's window of this file (F-71). */
+            cetrafs_tree_claim_lock(ino);
             ret = cetrafs_cas_record_fd_seeded(sb, cetrafs_inode_lba(sb, ino), NULL, 0, cetrafs_fd_write_mutate,
                                                &ctx);
+            cetrafs_tree_claim_unlock(ino);
             if (!ret) {
                 cetrafs_record_write_counted();
                 ret = cetrafs_publish_flush(sb);
@@ -2283,7 +2457,8 @@ static int cetrafs_vfs_stat_cas_mutate(void *image, unsigned int len, void *priv
      * need not have noted before its first publish (rule 6). */
     ctx->root_superseded = false;
     if (ctx->have_shadow && !ctx->defer_root) {
-        u64 dev = cetrafs_le64(rec.file_seq);
+        /* Through our own tree claim to what it replaced (F-71). */
+        u64 dev = cetrafs_inode_seq_unwrap(inode, cetrafs_le64(rec.file_seq));
 
         ctx->root_superseded = dev != cetrafs_le64(ctx->shadow->file_seq) &&
                                CETRAFS_FILE_SEQ_NODE(dev) != (ctx->me & 0xFFFFu) &&
@@ -2375,7 +2550,7 @@ static int cetrafs_vfs_stat_cas_mutate(void *image, unsigned int len, void *priv
      * to a map a peer had changed. Remembered here, acted on once the
      * swap has landed. */
     {
-        u64 dev = cetrafs_le64(rec.file_seq);
+        u64 dev = cetrafs_inode_seq_unwrap(inode, cetrafs_le64(rec.file_seq));
 
         ctx->overstamped = dev != cetrafs_inode_local_file_seq(inode) &&
                            CETRAFS_FILE_SEQ_NODE(dev) != (ctx->me & 0xFFFFu);
@@ -2702,9 +2877,11 @@ int cetrafs_write_vfs_inode(struct inode *inode)
         goto out_pub;
     }
     ctx->me = my_node_id;
+    cetrafs_inode_claim_lock(inode); /* outside our tree boundaries' windows (F-71) */
     ret = cetrafs_cas_record_fd_seeded(sb, cetrafs_inode_lba(sb, inode->i_ino),
                                        (const u8 *) &bufs[0] + CETRAFS_INODE_FD_OFF, CETRAFS_INODE_FD_LIVE,
                                        cetrafs_vfs_stat_cas_mutate, ctx);
+    cetrafs_inode_claim_unlock(inode);
     ctrace("FDPUB ino=%llu ret=%d shadow=%d blocks=%llu size=%llu seq=%llx\n", (unsigned long long) inode->i_ino,
            ret, (int) ctx->have_shadow, (unsigned long long) (ret == 0 ? cetrafs_le64(ctx->written->blocks) : 0),
            (unsigned long long) (ret == 0 ? cetrafs_le64(ctx->written->size) : 0),
@@ -3600,7 +3777,8 @@ static int cetrafs_refresh_settle(struct inode *inode, cetrafs_inode_t *cur)
     me &= 0xFFFFu;
 
     for (try = 0; try < CETRAFS_REFRESH_SETTLE_TRIES; try++) {
-        u64 seq = cetrafs_le64(cur->file_seq);
+        /* Through our own tree claim: it replaced what is judged. */
+        u64 seq = cetrafs_inode_seq_unwrap(inode, cetrafs_le64(cur->file_seq));
         u64 n1 = cetrafs_inode_local_file_seq(inode);
         u64 n2;
         cetrafs_inode_t nxt;
@@ -3628,7 +3806,8 @@ static int cetrafs_refresh_settle(struct inode *inode, cetrafs_inode_t *cur)
         if (ret)
             return ret;
         n2 = cetrafs_inode_local_file_seq(inode);
-        if (n1 == n2 && cetrafs_le64(nxt.file_seq) == seq && !READ_ONCE(cetrafs_refresh_settle_churn))
+        if (n1 == n2 && cetrafs_inode_seq_unwrap(inode, cetrafs_le64(nxt.file_seq)) == seq &&
+            !READ_ONCE(cetrafs_refresh_settle_churn))
             return 1;
         *cur = nxt;
     }

@@ -515,6 +515,19 @@ struct cetrafs_inode_info {
      * as dirent_seq_cached above. */
     u64 file_seq_cached;
     u64 file_seq_noted_at; /* this mount's stamp clock when file_seq_cached was noted (TEST ONLY age compare) */
+    /* A tree boundary's claim on the record (leafdefer.c, F-71) stamps
+     * it as this node's. claims[] keeps the recent ones, each with the
+     * stamp it replaced -- a peer's, possibly never seen here -- and
+     * every gate that decodes "the stamp is mine" judges that one
+     * instead (cetrafs_inode_seq_unwrap()), so a claim never hides a
+     * peer's change from this node. A ring, not one slot: a claim noted
+     * for a swap that then failed must not push out the one still on the
+     * record (a definite failure takes its own entry back). Under
+     * fd_lock; cetrafs_tree_claim_lock() orders the boundaries. */
+    struct {
+        u64 stamp, before;
+    } claims[CETRAFS_CLAIM_RING];
+    unsigned int claim_next;
 
     /* "Cold": the gate saw a PEER's stamp, so this inode's cached tree
      * blocks may name the wrong physical blocks and every tree read must
@@ -1617,6 +1630,8 @@ static void cetrafs_inode_identity_init_ci(struct cetrafs_inode_info *ci)
     ci->lock_suspended = false;
     ci->dirent_seq_cached = U64_MAX;
     ci->file_seq_cached = U64_MAX;
+    memset(ci->claims, 0, sizeof(ci->claims));
+    ci->claim_next = 0;
     atomic_set(&ci->tree_cold_marks, 0);
     atomic_set(&ci->tree_cold_done, 0);
     ci->cold_retries = 0;
@@ -3757,7 +3772,7 @@ reread:
      * reachable in BOTH mount modes.
      */
     if (atomic_read(&ci->lock_local_open_count) == 0 &&
-        CETRAFS_FILE_SEQ_NODE(cetrafs_le64(raw.file_seq)) != (u32) (my_node_id & 0xFFFFu)) {
+        CETRAFS_FILE_SEQ_NODE(cetrafs_inode_seq_unwrap(inode, cetrafs_le64(raw.file_seq))) != (u32) (my_node_id & 0xFFFFu)) {
         /* -EUCLEAN means the record changed type without changing
          * generation: corruption worth logging, but not worth failing a
          * read on -- the right outcome is simply not to apply it.
@@ -3915,7 +3930,7 @@ reread:
             fret = cetrafs_read_raw_inode(sb, inode->i_ino, &raw);
             if (!fret && cetrafs_le64(raw.generation) != gen)
                 fret = -ESTALE;
-            if (!fret && CETRAFS_FILE_SEQ_NODE(cetrafs_le64(raw.file_seq)) != (u32) (my_node_id & 0xFFFFu))
+            if (!fret && CETRAFS_FILE_SEQ_NODE(cetrafs_inode_seq_unwrap(inode, cetrafs_le64(raw.file_seq))) != (u32) (my_node_id & 0xFFFFu))
                 fret = cetrafs_apply_raw_to_vfs_inode_sure(inode, &raw);
             if (fret && fret != -EUCLEAN) { /* -EUCLEAN: a type change, ignored as the refresh above does */
                 /* Not a view to open on: withdraw the presence just taken. */
@@ -4797,7 +4812,7 @@ void cetrafs_lock_retry_deferred(struct super_block *sb)
                     if (filemap_write_and_wait(inode->i_mapping) || cetrafs_flush_dirty_free_counts(sb))
                         pr_err("lock release retry: ino=%llu data or free counts not flushed\n",
                                (unsigned long long) inode->i_ino);
-                    ret = cetrafs_deferred_flush_orphans_of(sb, inode->i_ino);
+                    ret = cetrafs_deferred_flush_orphans_of(sb, inode);
                     if (!ret)
                         ret = cetrafs_lock_publish_and_clear(inode, raw, false, &cleared);
                 }
@@ -4850,7 +4865,7 @@ void cetrafs_lock_retry_deferred(struct super_block *sb)
         /* A suspended writer's close gave its lock to the peer: nothing
          * of ours to clear, only its mark and bit to settle. Its tree
          * blocks first, wherever an eviction left them. */
-        ret = cetrafs_deferred_flush_orphans_of(sb, inode->i_ino);
+        ret = cetrafs_deferred_flush_orphans_of(sb, inode);
         if (!ret)
             ret = cetrafs_lock_publish_and_clear(inode, raw, !ci->close_owes_suspend_mark, &cleared);
         if (!ret)
@@ -5161,6 +5176,78 @@ void cetrafs_lock_tree_superseded(struct inode *inode)
 }
 
 
+/* TEST ONLY: gates take this node's own claim at face value, as before
+ * the claim was unwrapped (tests/kernel/late_flush_stale.sh). */
+static bool cetrafs_claim_unwrap_off;
+cetrafs_test_param(claim_unwrap_off, cetrafs_claim_unwrap_off, bool, 0644);
+MODULE_PARM_DESC(claim_unwrap_off, "TEST ONLY: a tree boundary's own stamp claim is not looked through by the gates");
+
+/* The stamp a gate should judge: 'seq' itself, or -- when it is this
+ * inode's last claim -- the stamp that claim replaced. */
+u64 cetrafs_inode_seq_unwrap(struct inode *inode, u64 seq)
+{
+    struct cetrafs_inode_info *ci = CETRAFS_I(inode);
+    u64 eff = seq;
+    unsigned int i;
+
+    if (!seq || READ_ONCE(cetrafs_claim_unwrap_off))
+        return seq;
+    spin_lock(&ci->fd_lock);
+    for (i = 0; i < CETRAFS_CLAIM_RING; i++)
+        if (ci->claims[i].stamp == seq) {
+            eff = ci->claims[i].before;
+            break;
+        }
+    spin_unlock(&ci->fd_lock);
+    return eff;
+}
+
+/* A claim from 'before' to 'claimed' may land. Claiming over a claim of
+ * ours keeps what THAT one replaced: a chain of claims unwraps to the
+ * last stamp no claim of ours wrote. */
+void cetrafs_inode_note_claim(struct inode *inode, u64 before, u64 claimed)
+{
+    struct cetrafs_inode_info *ci = CETRAFS_I(inode);
+    unsigned int i;
+
+    spin_lock(&ci->fd_lock);
+    for (i = 0; i < CETRAFS_CLAIM_RING; i++)
+        if (ci->claims[i].stamp && ci->claims[i].stamp == before) {
+            before = ci->claims[i].before;
+            break;
+        }
+    ci->claims[ci->claim_next].stamp = claimed;
+    ci->claims[ci->claim_next].before = before;
+    ci->claim_next = (ci->claim_next + 1) % CETRAFS_CLAIM_RING;
+    spin_unlock(&ci->fd_lock);
+}
+
+/* A noted claim whose swap definitely did not land: its entry goes, so
+ * failures never push a landed claim out of the ring. */
+void cetrafs_inode_forget_claim(struct inode *inode, u64 claimed)
+{
+    struct cetrafs_inode_info *ci = CETRAFS_I(inode);
+    unsigned int i;
+
+    if (!claimed)
+        return;
+    spin_lock(&ci->fd_lock);
+    for (i = 0; i < CETRAFS_CLAIM_RING; i++)
+        if (ci->claims[i].stamp == claimed)
+            ci->claims[i].stamp = 0;
+    spin_unlock(&ci->fd_lock);
+}
+
+void cetrafs_inode_claim_lock(struct inode *inode)
+{
+    cetrafs_tree_claim_lock(inode->i_ino);
+}
+
+void cetrafs_inode_claim_unlock(struct inode *inode)
+{
+    cetrafs_tree_claim_unlock(inode->i_ino);
+}
+
 /*
  * The change-stamp half of the gate: compare a forced-fresh record's
  * file_seq with the one this node's cache was reconciled at, and if a
@@ -5169,7 +5256,9 @@ void cetrafs_lock_tree_superseded(struct inode *inode)
 static void cetrafs_inode_note_stamp(struct inode *inode, const cetrafs_inode_t *rawp, u32 my_node_id)
 {
     struct cetrafs_inode_info *ci = CETRAFS_I(inode);
-    u64 seq = cetrafs_le64(rawp->file_seq);
+    /* Judged through our own tree claim: a claim over the very stamp
+     * we reconciled at is no change of the map (F-71). */
+    u64 seq = cetrafs_inode_seq_unwrap(inode, cetrafs_le64(rawp->file_seq));
 
     if (!cetrafs_file_seq_ignore && seq != ci->file_seq_cached) {
         /* Whose publish is this? Our OWN writeback moves the stamp on
@@ -5183,7 +5272,8 @@ static void cetrafs_inode_note_stamp(struct inode *inode, const cetrafs_inode_t 
          *
          * Decoded from the stamp rather than tracked, so a publish path
          * that forgets to record what it stamped cannot resurrect it. */
-        if (cetrafs_file_seq_ignore_owner || CETRAFS_FILE_SEQ_NODE(seq) != (my_node_id & 0xFFFFu)) {
+        if (cetrafs_file_seq_ignore_owner ||
+            CETRAFS_FILE_SEQ_NODE(seq) != (my_node_id & 0xFFFFu)) {
             /* Only RECORD it. This runs on the per-block path --
              * cetrafs_get_block() and cetrafs_read_tree_bh() both reach
              * here -- and the extent-tree writers hold a leaf buffer
@@ -6943,7 +7033,7 @@ static int cetrafs_lock_resume(struct inode *inode)
          * ours, so this correctly keeps our newer state; and
          * cetrafs_apply_raw_to_vfs_inode() refuses unpublished local
          * state anyway, so unflushed local work is never clobbered. */
-        if (CETRAFS_FILE_SEQ_NODE(cetrafs_le64(raw.file_seq)) != (u32) (my_node_id & 0xFFFFu)) {
+        if (CETRAFS_FILE_SEQ_NODE(cetrafs_inode_seq_unwrap(inode, cetrafs_le64(raw.file_seq))) != (u32) (my_node_id & 0xFFFFu)) {
             /* And it must have APPLIED: a silent decline left the old
              * i_size in core with the gate about to open. Still
              * suspended, so failing gives the lock back and leaves the
@@ -7206,7 +7296,7 @@ static int cetrafs_lock_explicit_acquire(struct inode *inode, struct file *file)
         ret = cetrafs_read_raw_inode(sb, inode->i_ino, &raw);
         if (!ret && cetrafs_lock_raw_is_inode(inode, &raw))
             ret = -ESTALE;
-        if (!ret && CETRAFS_FILE_SEQ_NODE(cetrafs_le64(raw.file_seq)) != (u32) (my_node_id & 0xFFFFu)) {
+        if (!ret && CETRAFS_FILE_SEQ_NODE(cetrafs_inode_seq_unwrap(inode, cetrafs_le64(raw.file_seq))) != (u32) (my_node_id & 0xFFFFu)) {
             cetrafs_tree_invalidate_cached(inode, &raw);
             ret = cetrafs_apply_raw_to_vfs_inode_sure(inode, &raw);
         }
@@ -7613,7 +7703,7 @@ int cetrafs_lock_defrag_begin(struct inode *inode)
      * record last stamped by a peer is applied, and a tree that is
      * then cold is dropped here, where no buffer or folio is held.
      */
-    if (CETRAFS_FILE_SEQ_NODE(cetrafs_le64(raw.file_seq)) != (u32) (my_node_id & 0xFFFFu)) {
+    if (CETRAFS_FILE_SEQ_NODE(cetrafs_inode_seq_unwrap(inode, cetrafs_le64(raw.file_seq))) != (u32) (my_node_id & 0xFFFFu)) {
         /* Applied, or no pass: the final publish takes size and times
          * from core (defrag.c), and a silent decline left the old ones
          * there. */

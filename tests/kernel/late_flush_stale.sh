@@ -38,14 +38,38 @@
 # reports it; the re-read of what we wrote (a peer writing AFTER us)
 # has no staging of its own in this suite.
 #
+# C. The other half of that order: a peer's write landing inside a flush
+# whose record it publishes only later passed silently -- nothing on the
+# device said a flush was under way. Every boundary now claims the
+# record's stamp BEFORE its device check (F-71), so a peer flushing the
+# same file meets the claim: its own claim miscompares, or its final
+# read sees a stamp not its own. Staged as B with no peer:
+#   6. inside the window the record already carries this node's claim.
+#
+# D. A claim stamps the record as this node's, and every gate here reads
+# "the stamp is mine" as "my state is current": claimed over a peer's
+# publish this node never saw, it hid it -- a stale root published over
+# the peer's map. The gates look through the claim to what it replaced.
+# Staged as C, the peer's publish poked onto the record (its stamp)
+# between the failed close and the heartbeat's retry:
+#   7. the retry's publish still reports the peer's stamp;
+#   8. and still does with the claim's note gone (claim_unwrap_off, as an
+#      evicted inode loses it): a claim over a peer's stamp is named as
+#      no node's, so nothing but the note made it look like ours.
+# Not staged: two boundaries of one node overlapping (tree_claim_mutex
+# orders them), and a redo landing inside a boundary (journal.c).
+#
 # DISCRIMINATION: late_flush_blind=1 writes the set unchecked; the
 # control requires the peer's entry back to uninit and its block zeros.
 # late_flush_unverified=1 (B): the loss passes silently.
+# tree_flush_unclaimed=1 (C): the record is unchanged inside the window.
+# claim_unwrap_off=1 claim_self_named=1 (D): the peer's stamp passes
+# unreported.
 set -euo pipefail
 . "$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)/lib/harness.sh"
 require_root
 require_module
-for k in tree_flush_fail_once late_flush_blind hb_maint_delay_ms late_flush_unverified late_flush_window_ms; do
+for k in tree_flush_fail_once late_flush_blind hb_maint_delay_ms late_flush_unverified late_flush_window_ms tree_flush_unclaimed claim_unwrap_off claim_self_named; do
     [ -w "/sys/module/cetrafs/parameters/$k" ] || { skip "$k is missing"; ct_exit; }
 done
 LP="$(ct_helper leaf_poke)"
@@ -59,6 +83,9 @@ ct_param_set late_flush_blind 0
 ct_param_set hb_maint_delay_ms 0
 ct_param_set late_flush_unverified 0
 ct_param_set late_flush_window_ms 0
+ct_param_set tree_flush_unclaimed 0
+ct_param_set claim_unwrap_off 0
+ct_param_set claim_self_named 0
 IPOKE="$(ct_helper inode_block_poke)"
 ct_param_set hb_interval_secs 2
 
@@ -210,4 +237,115 @@ pass "setup B: the peer's leaf and record publish landed inside the late flush's
     fail "5: the peer's write inside the window passed silently ($R)"
 [ "$(get reported "$C")" = 0 ] && pass "control: unverified, the loss passed silently" ||
     fail "control: reported anyway -- the suite does not isolate the check ($C)"
+
+# <unclaimed 0|1> -> "failed= paused= claimed= foreign="
+round_c() {
+    local img dev f ino mark me s0 s1 n1 failed=0 paused=0 claimed=0 foreign=0
+    img="$(ct_image 560 "lfsc$1")"
+    dev="$(ct_loop "$img")"
+    ct_mkfs "$dev" -z 1 -b 512 -J 4 -M 4 -N 1024 -f >/dev/null
+    mount -t cetrafs -o nofilelock "$dev" "$MNT"
+    me="$(sed -n 's/^this_node_id: //p' "$(ct_procdir "$dev")/info")"
+    f="$MNT/img"
+    fallocate -l $((4 << 20)) "$f"
+    for i in $(seq 0 6); do dio_write "$f" $((i * 64)) "$(printf 'B%07d' $((i * 64)))"; done
+    dio_write "$f" 448 B0000448 fsync
+    ino="$(stat -c %i "$f")"
+    echo "$1" >/sys/module/cetrafs/parameters/tree_flush_unclaimed
+    echo 8000 >/sys/module/cetrafs/parameters/hb_maint_delay_ms
+    sleep 3
+    mark="$(dmesg_mark)"
+    echo 1 >/sys/module/cetrafs/parameters/tree_flush_fail_once
+    dio_write "$f" $OURS OURS0900
+    dmesg_since "$mark" | grep -q "lock release: ino=$ino extent-tree blocks not durable" && failed=1
+    s0="$("$IPOKE" "$img" seq "$ino" | cut -d' ' -f1)"
+    echo 6000 >/sys/module/cetrafs/parameters/late_flush_window_ms
+    echo 0 >/sys/module/cetrafs/parameters/hb_maint_delay_ms
+    for _ in $(seq 1 60); do
+        dmesg_since "$mark" | grep -q "deferred: ino=$ino: TEST pause" && { paused=1; break; }
+        sleep 0.2
+    done
+    if [ "$paused" = 1 ]; then
+        read -r s1 n1 <<<"$("$IPOKE" "$img" seq "$ino")"
+        [ "$s1" != "$s0" ] && [ "$n1" = "$me" ] && claimed=1
+    fi
+    for _ in $(seq 1 60); do
+        dmesg_since "$mark" | grep -q "lock release: ino=$ino close publish and flock clear finished by the heartbeat" && break
+        sleep 0.5
+    done
+    # Our own claim must not read as a peer's: no loss reported.
+    dmesg_since "$mark" | grep -q "ino=$ino: another node wrote the file while this node's tree flush" && foreign=1
+    echo 0 >/sys/module/cetrafs/parameters/late_flush_window_ms
+    echo 0 >/sys/module/cetrafs/parameters/tree_flush_unclaimed
+    umount "$MNT" || umount -l "$MNT"
+    echo "failed=$failed paused=$paused claimed=$claimed foreign=$foreign"
+}
+R="$(round_c 0)"
+log "claimed: $R"
+C="$(round_c 1)"
+log "control (unclaimed): $C"
+for v in "$R" "$C"; do
+    [ "$(get failed "$v")" = 1 ] && [ "$(get paused "$v")" = 1 ] ||
+        { fail "setup C: the close did not fail, or the flush never paused ($v)"; ct_exit; }
+done
+pass "setup C: the late flush paused in its window"
+[ "$(get claimed "$R")" = 1 ] && [ "$(get foreign "$R")" = 0 ] &&
+    pass "6: inside the window the record carried this node's claim, and the flush reported nothing" ||
+    fail "6: no claim on the record inside the window, or the flush reported its own claim ($R)"
+[ "$(get claimed "$C")" = 0 ] && pass "control: unclaimed, the record was unchanged inside the window" ||
+    fail "control: the record moved anyway -- the suite does not isolate the claim ($C)"
+
+# <unwrap_off 0|1> <self_named 0|1> -> "failed= peer= finished= reported="
+round_d() {
+    local img dev f ino mark me failed=0 peer=0 finished=0 rep=0
+    img="$(ct_image 560 "lfsd$1$2")"
+    dev="$(ct_loop "$img")"
+    ct_mkfs "$dev" -z 1 -b 512 -J 4 -M 4 -N 1024 -f >/dev/null
+    mount -t cetrafs -o nofilelock "$dev" "$MNT"
+    me="$(sed -n 's/^this_node_id: //p' "$(ct_procdir "$dev")/info")"
+    f="$MNT/img"
+    fallocate -l $((4 << 20)) "$f"
+    for i in $(seq 0 6); do dio_write "$f" $((i * 64)) "$(printf 'B%07d' $((i * 64)))"; done
+    dio_write "$f" 448 B0000448 fsync
+    ino="$(stat -c %i "$f")"
+    echo "$1" >/sys/module/cetrafs/parameters/claim_unwrap_off
+    echo "$2" >/sys/module/cetrafs/parameters/claim_self_named
+    echo 8000 >/sys/module/cetrafs/parameters/hb_maint_delay_ms
+    sleep 3
+    mark="$(dmesg_mark)"
+    echo 1 >/sys/module/cetrafs/parameters/tree_flush_fail_once
+    dio_write "$f" $OURS OURS0900
+    dmesg_since "$mark" | grep -q "lock release: ino=$ino extent-tree blocks not durable" && failed=1
+    "$IPOKE" "$img" peerseq "$ino" $((me + 1)) >/dev/null 2>&1 &&
+        [ "$("$IPOKE" "$img" seq "$ino" | cut -d' ' -f2)" = $((me + 1)) ] && peer=1
+    echo 0 >/sys/module/cetrafs/parameters/hb_maint_delay_ms
+    for _ in $(seq 1 60); do
+        dmesg_since "$mark" | grep -q "lock release: ino=$ino close publish and flock clear finished by the heartbeat" &&
+            { finished=1; break; }
+        sleep 0.5
+    done
+    # The peer's node, or no node's (the claim over it, seen unwrapped).
+    dmesg_since "$mark" | grep -qE "ino=$ino: another node \(($((me + 1))|65535)\) published the file's extent map|inode $ino: stat publish overwrote stamp [0-9a-f]* from node ($((me + 1))|65535)" && rep=1
+    echo 0 >/sys/module/cetrafs/parameters/claim_unwrap_off
+    echo 0 >/sys/module/cetrafs/parameters/claim_self_named
+    umount "$MNT" || umount -l "$MNT"
+    echo "failed=$failed peer=$peer finished=$finished reported=$rep"
+}
+R="$(round_d 0 0)"
+log "looked through: $R"
+N="$(round_d 1 0)"
+log "note gone, no node's: $N"
+C="$(round_d 1 1)"
+log "control (note gone, named as ours): $C"
+for v in "$R" "$N" "$C"; do
+    [ "$(get failed "$v")" = 1 ] && [ "$(get peer "$v")" = 1 ] && [ "$(get finished "$v")" = 1 ] ||
+        { fail "setup D: the close did not fail, the peer's stamp was not planted, or the retry never finished ($v)"; ct_exit; }
+done
+pass "setup D: a peer's publish landed between the failed close and its retry"
+[ "$(get reported "$R")" = 1 ] && pass "7: the retry's publish saw the peer's stamp through this node's claim" ||
+    fail "7: the claim hid the peer's publish from this node ($R)"
+[ "$(get reported "$N")" = 1 ] && pass "8: with the claim's note gone, its no-node name still showed the change" ||
+    fail "8: without its note the claim hid the peer's publish ($N)"
+[ "$(get reported "$C")" = 0 ] && pass "control: note gone and named as ours, the claim hid the peer's stamp" ||
+    fail "control: reported anyway -- the suite does not isolate the claim's name ($C)"
 ct_exit
