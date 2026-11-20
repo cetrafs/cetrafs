@@ -853,8 +853,9 @@ typedef struct {
 
 /* Both new fields live in what used to be `reserved32` and the head of
  * `pad`, and header_checksum keeps its offset (28) -- deliberately, so a
- * module that predates them computes a byte-identical header CRC and the
- * two interoperate during a rolling upgrade. No format bump. An old
+ * module that predates them computes a byte-identical header CRC. No
+ * format bump. (This is not a rolling-upgrade guarantee: mixed releases
+ * on one volume are unsupported, LIMITATIONS.md section 1.) An old
  * writer's entry reads back as flags == 0, which is exactly "unguarded",
  * and replay falls back to its old unconditional behaviour for it. */
 #define CETRAFS_JRNL_F_GUARDED 0x00000001u /* prev_checksum is meaningful */
