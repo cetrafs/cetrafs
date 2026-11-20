@@ -97,6 +97,7 @@ int main(int argc, char **argv)
         fprintf(stderr, "       %s <backing-file> reuse <ino> <gen> <node> (a peer reused the number)\n", argv[0]);
         fprintf(stderr, "       %s <backing-file> size <ino>           (print the on-disk size)\n", argv[0]);
         fprintf(stderr, "       %s <backing-file> mtime <ino>          (print the on-disk mtime)\n", argv[0]);
+        fprintf(stderr, "       %s <backing-file> dump-unstamped <ino>  (dump, G-6 stamps and ns checksum zeroed)\n", argv[0]);
         fprintf(stderr, "       %s <backing-file> nsget <ino>          (print mode (octal) and nlink)\n", argv[0]);
         fprintf(stderr, "       %s <backing-file> bumpseq <ino>        (advance dirent_seq, as a peer would)\n", argv[0]);
         fprintf(stderr, "       %s <backing-file> extents <ino>       (prints depth/entries/blocks)\n", argv[0]);
@@ -182,8 +183,16 @@ int main(int argc, char **argv)
         return 1;
     }
 
-    if (strcmp(mode, "dump") == 0) {
+    if (strcmp(mode, "dump") == 0 || strcmp(mode, "dump-unstamped") == 0) {
         pread_all(fd, buf, cetrafs_le32(sb.inode_size), rec_off);
+        /* dump-unstamped: the G-6 stamps zeroed, and the namespace
+         * sector's checksum that covers its stamp -- every CAS moves
+         * them, a content change is what the caller compares. */
+        if (mode[4]) {
+            memset(buf + offsetof(cetrafs_inode_t, ns_cas_stamp), 0, 8);
+            memset(buf + offsetof(cetrafs_inode_t, ns_checksum), 0, 8);
+            memset(buf + CETRAFS_INODE_FD_OFF + CETRAFS_INODE_FD_STAMP_OFF, 0, 8);
+        }
         for (uint32_t i = 0; i < cetrafs_le32(sb.inode_size); i++)
             printf("%02x", buf[i]);
         printf("\n");

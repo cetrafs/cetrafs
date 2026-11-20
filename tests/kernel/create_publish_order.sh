@@ -21,6 +21,9 @@
 # parent: the byte-compare below fails against it, so this suite
 # discriminates. The symlink_fail_after_write knob supplies the late
 # failure (after the target text: inode + data block exist, name must not).
+# Byte-for-byte except the G-6 stamps (and the namespace checksum that
+# covers its stamp): taking and releasing the parent's namespace lock is a
+# pair of CAS swaps, and every swap moves its sector's stamp by design.
 set -euo pipefail
 . "$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)/lib/harness.sh"
 require_root
@@ -39,7 +42,7 @@ mkdir "$MNT/d"
 DINO="$(stat -c %i "$MNT/d")"
 ct_umount "$MNT"
 blockdev --flushbufs "$DEV"
-BASE="$("$IPOKE" "$DEV" dump "$DINO")"
+BASE="$("$IPOKE" "$DEV" dump-unstamped "$DINO")"
 
 # Control for the control: a mount/umount cycle that does nothing must not
 # dirty the parent record, or the comparison below would be meaningless.
@@ -47,7 +50,7 @@ mount -t cetrafs "$DEV" "$MNT"
 require_cetrafs_mount "$MNT"
 ct_umount "$MNT"
 blockdev --flushbufs "$DEV"
-[ "$("$IPOKE" "$DEV" dump "$DINO")" = "$BASE" ] &&
+[ "$("$IPOKE" "$DEV" dump-unstamped "$DINO")" = "$BASE" ] &&
     pass "an idle mount cycle leaves the parent record byte-identical (comparison is meaningful)" ||
     fail "the parent record changes across an idle mount cycle -- this suite cannot compare records"
 
@@ -69,7 +72,7 @@ blockdev --flushbufs "$DEV"
 # THE assertion. The old publish-first order ran add_entry + remove_entry
 # on this failure path: dirent_seq moved twice, size/mtime redirtied, and
 # this compare failed. Name-last leaves the parent provably untouched.
-[ "$("$IPOKE" "$DEV" dump "$DINO")" = "$BASE" ] &&
+[ "$("$IPOKE" "$DEV" dump-unstamped "$DINO")" = "$BASE" ] &&
     pass "the parent's on-disk record is byte-identical: the name was never published" ||
     fail "the parent record CHANGED across a failed creation -- the name was published before the child was built"
 
@@ -86,7 +89,7 @@ ln -s "some-target" "$MNT/d/link"
     fail "control symlink broken: $(readlink "$MNT/d/link" 2>&1)"
 ct_umount "$MNT"
 blockdev --flushbufs "$DEV"
-[ "$("$IPOKE" "$DEV" dump "$DINO")" != "$BASE" ] &&
+[ "$("$IPOKE" "$DEV" dump-unstamped "$DINO")" != "$BASE" ] &&
     pass "a successful creation moves the parent record (negative control)" ||
     fail "the parent record did not change even for a SUCCESSFUL creation -- the dump is not sensitive"
 
