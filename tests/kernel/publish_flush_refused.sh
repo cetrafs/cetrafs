@@ -59,7 +59,22 @@ round() {
     echo "$1" >/sys/module/cetrafs/parameters/fd_post_flush_stop_ok
     mark="$(dmesg_mark)"
     echo 1 >/sys/module/cetrafs/parameters/fd_post_flush_fail
-    fallocate -p -o 0 -l $((1 << 20)) "$MNT/f" 2>/dev/null || rc=$?
+    # The punch's own answer, not the close's: on the stopped mount the
+    # close cannot publish the times the punch moved, and fallocate(1)
+    # reports that as its failure.
+    rc="$(python3 -I - "$MNT/f" <<'PY2'
+import ctypes, os, sys
+libc = ctypes.CDLL(None, use_errno=True)
+libc.fallocate.argtypes = [ctypes.c_int, ctypes.c_int, ctypes.c_long, ctypes.c_long]
+fd = os.open(sys.argv[1], os.O_RDWR)
+rc = libc.fallocate(fd, 0x01 | 0x02, 0, 1 << 20)  # PUNCH_HOLE | KEEP_SIZE
+print(0 if rc == 0 else ctypes.get_errno(), flush=True)
+try:
+    os.close(fd)
+except OSError:
+    pass
+PY2
+)" || rc=1
     echo 0 >/sys/module/cetrafs/parameters/fd_post_flush_fail
     echo 0 >/sys/module/cetrafs/parameters/fd_post_flush_stop_ok
     dmesg_since "$mark" | grep -q "refused a cache flush after a publish" &&

@@ -39,11 +39,32 @@ writes() { sed -n 's/^record_writes: //p' "$PROC"; }
 truncate -s 4M "$MNT/sparse"
 sync
 
-W0="$(writes)"
-for off in 0 262144 524288 786432 1048576 1310720 1572864 1835008 2097152 2359296; do
-    fallocate -p -n -o "$off" -l 65536 "$MNT/sparse" 2>/dev/null || fail "punch failed at $off"
-done
-W1="$(writes)"
+# Through ONE open file, as qemu issues them: the punches' own cost is
+# read before the close. The close then publishes the times the punches
+# moved (file_modified(), as a write), once -- in nanoseconds a punch
+# always moves them, so a close per punch would publish per punch, which
+# is the times' cost and not the tree's.
+PUNCHED="$(python3 -I - "$MNT/sparse" "$PROC" <<'PY2'
+import ctypes, os, sys
+libc = ctypes.CDLL(None, use_errno=True)
+libc.fallocate.argtypes = [ctypes.c_int, ctypes.c_int, ctypes.c_long, ctypes.c_long]
+def writes():
+    for line in open(sys.argv[2]):
+        if line.startswith("record_writes:"):
+            return int(line.split(":")[1])
+fd = os.open(sys.argv[1], os.O_RDWR)
+w0, bad = writes(), 0
+for off in range(0, 10 * 262144, 262144):
+    if libc.fallocate(fd, 0x01 | 0x02, off, 65536) != 0:  # PUNCH_HOLE | KEEP_SIZE
+        bad += 1
+w1 = writes()
+os.close(fd)
+print("w0=%d w1=%d bad=%d" % (w0, w1, bad), flush=True)
+PY2
+)"
+[ "$(sed -n 's/.*bad=\([0-9]*\).*/\1/p' <<<"$PUNCHED")" = 0 ] || fail "a punch failed ($PUNCHED)"
+W0="$(sed -n 's/.*w0=\([0-9]*\).*/\1/p' <<<"$PUNCHED")"
+W1="$(sed -n 's/.*w1=\([0-9]*\).*/\1/p' <<<"$PUNCHED")"
 NOOP=$((W1 - W0))
 log "10 no-op punches cost $NOOP inode-record writes"
 

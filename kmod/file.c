@@ -9157,6 +9157,7 @@ static long cetrafs_fallocate(struct file *file, int mode, loff_t offset, loff_t
     u64 meta_blocks = 0;
     u32 freed = 0, discard = 0;
     bool published = false; /* the map changed: the tail of the punch updates blocks/ctime */
+    u64 pnow = 0; /* the punch's mtime and ctime, carried by its publish */
     bool zeroed = false;    /* a boundary block was partly zeroed: the contents changed */
     bool foreign;           /* a punched block outside our own groups (cetrafs_frees_begin()) */
     bool landed = false;    /* the publish reached the device, whatever it returned */
@@ -9609,6 +9610,14 @@ static long cetrafs_fallocate(struct file *file, int mode, loff_t offset, loff_t
 
         cetrafs_inode_fd_pub_lock(inode);
         fd_seq = cetrafs_inode_fd_seq(inode);
+        /* The punch's mtime goes out with its map, and the live atime
+         * beside it, under the publish mutex: in nanoseconds the time a
+         * punch stamps always differs from the record's, so stamped
+         * after, it cost a second publish -- one that could fail where
+         * the first had landed. */
+        pnow = cetrafs_now_disk();
+        raw.mtime = cetrafs_cpu_to_le64(pnow);
+        raw.atime = cetrafs_cpu_to_le64(cetrafs_atime_disk(inode));
         ret = unlikely(cetrafs_fail_extent_record_write) ? -EIO
                                                          : cetrafs_write_raw_inode_fd_planned(sb, inode->i_ino, &raw, inode,
                                                                                               cetrafs_le64(old_raw.file_seq),
@@ -9696,8 +9705,8 @@ zero_boundaries:
     }
 
     inode->i_blocks = cetrafs_le64(raw.blocks);
-    cetrafs_set_ctime_disk(inode, cetrafs_now_disk());
-    inode_set_mtime_to_ts(inode, inode_get_ctime(inode));
+    cetrafs_set_ctime_disk(inode, pnow);
+    cetrafs_set_mtime_disk(inode, pnow); /* what the publish carried */
     mark_inode_dirty(inode);
     /* The direct write persists it; the VFS call then clears the dirty
      * state so the inode can still accept cross-node refreshes. Both
