@@ -242,7 +242,7 @@ was being searched for).
 gate's value is covering what you did NOT reason about.  When a run
 produces one failure, you know its mechanism, and the fix is confined
 to what failed, re-running all ~6,600 assertions re-verifies code that
-already passed on that same tree -- 18 minutes to learn something you
+already passed on that same tree -- hours to learn something you
 were already told.  Run the affected suites instead.
 
 The test is whether anything UNEXAMINED changed.  Re-run the gate when
