@@ -2301,9 +2301,10 @@ retry:
     inode->i_blocks = cetrafs_le64(raw.blocks);
     cetrafs_inode_set_generation(inode, cetrafs_le64(raw.generation));
 
-    inode_set_atime(inode, (time64_t) cetrafs_le64(raw.atime), 0);
-    inode_set_mtime(inode, (time64_t) cetrafs_le64(raw.mtime), 0);
-    inode_set_ctime(inode, (time64_t) cetrafs_le64(raw.ctime), 0);
+    cetrafs_set_atime_disk(inode, cetrafs_le64(raw.atime));
+    cetrafs_set_mtime_disk(inode, cetrafs_le64(raw.mtime));
+    cetrafs_set_ctime_disk(inode, cetrafs_le64(raw.ctime));
+    *cetrafs_inode_crtime(inode) = cetrafs_le64(raw.crtime);
 
     /* The in-core stat block now matches the record exactly: that is
      * ->write_inode's baseline for telling our own changes from a
@@ -2553,8 +2554,8 @@ static int cetrafs_vfs_stat_cas_mutate(void *image, unsigned int len, void *priv
     } else {
         CETRAFS_FD_MERGE64(CETRAFS_FD_F_BLOCKS, blocks, inode->i_blocks, false);
     }
-    CETRAFS_FD_MERGE64(CETRAFS_FD_F_ATIME, atime, inode_get_atime_sec(inode), true);
-    CETRAFS_FD_MERGE64(CETRAFS_FD_F_MTIME, mtime, inode_get_mtime_sec(inode), true);
+    CETRAFS_FD_MERGE64(CETRAFS_FD_F_ATIME, atime, cetrafs_atime_disk(inode), true);
+    CETRAFS_FD_MERGE64(CETRAFS_FD_F_MTIME, mtime, cetrafs_mtime_disk(inode), true);
 
 #undef CETRAFS_FD_MERGE64
 
@@ -2654,14 +2655,14 @@ static void cetrafs_vfs_stat_adopt(struct inode *inode, struct cetrafs_vfs_stat_
             w->blocks = cetrafs_cpu_to_le64(ctx->ours[CETRAFS_FD_F_BLOCKS]);
     }
     if (ctx->merged[CETRAFS_FD_F_ATIME] != ctx->ours[CETRAFS_FD_F_ATIME]) {
-        if (have_ilock && (u64) inode_get_atime_sec(inode) == ctx->ours[CETRAFS_FD_F_ATIME])
-            inode_set_atime(inode, (time64_t) ctx->merged[CETRAFS_FD_F_ATIME], 0);
+        if (have_ilock && cetrafs_atime_disk(inode) == ctx->ours[CETRAFS_FD_F_ATIME])
+            cetrafs_set_atime_disk(inode, ctx->merged[CETRAFS_FD_F_ATIME]);
         else
             w->atime = cetrafs_cpu_to_le64(ctx->ours[CETRAFS_FD_F_ATIME]);
     }
     if (ctx->merged[CETRAFS_FD_F_MTIME] != ctx->ours[CETRAFS_FD_F_MTIME]) {
-        if (have_ilock && (u64) inode_get_mtime_sec(inode) == ctx->ours[CETRAFS_FD_F_MTIME])
-            inode_set_mtime(inode, (time64_t) ctx->merged[CETRAFS_FD_F_MTIME], 0);
+        if (have_ilock && cetrafs_mtime_disk(inode) == ctx->ours[CETRAFS_FD_F_MTIME])
+            cetrafs_set_mtime_disk(inode, ctx->merged[CETRAFS_FD_F_MTIME]);
         else
             w->mtime = cetrafs_cpu_to_le64(ctx->ours[CETRAFS_FD_F_MTIME]);
     }
@@ -2895,8 +2896,8 @@ int cetrafs_write_vfs_inode(struct inode *inode)
      * own _fd publisher, so nothing this datasync must make durable can
      * be waiting behind this skip. */
     if (!ctx->have_shadow && (u64) i_size_read(inode) == ctx->base.size && (u64) inode->i_blocks == ctx->base.blocks) {
-        bool times_same = (u64) inode_get_atime_sec(inode) == ctx->base.atime &&
-                          (u64) inode_get_mtime_sec(inode) == ctx->base.mtime;
+        bool times_same = cetrafs_atime_disk(inode) == ctx->base.atime &&
+                          cetrafs_mtime_disk(inode) == ctx->base.mtime;
 
         if (times_same || cetrafs_dsync_drop_times(inode)) {
             ret = 0;
@@ -3169,6 +3170,12 @@ struct buffer_head *cetrafs_read_index_bh_for(struct inode *inode, u64 lba, bool
  * attributes describe a file a peer may own by now
  * (docs/internal/ERRORS.md). Unmount does not ask, so it still works.
  */
+/* TEST ONLY: store every inode time in whole seconds, as format 0x0009
+ * did (tests/kernel/timestamps_ns.sh). */
+bool cetrafs_time_whole_seconds;
+cetrafs_test_param(time_whole_seconds, cetrafs_time_whole_seconds, bool, 0644);
+MODULE_PARM_DESC(time_whole_seconds, "TEST ONLY: inode times are stored in whole seconds");
+
 int cetrafs_getattr(struct mnt_idmap *idmap, const struct path *path, struct kstat *stat, u32 request_mask,
                     unsigned int query_flags)
 {
@@ -3178,6 +3185,16 @@ int cetrafs_getattr(struct mnt_idmap *idmap, const struct path *path, struct kst
     if (cetrafs_sb_is_fenced(inode->i_sb))
         return -EIO;
     generic_fillattr(idmap, request_mask, inode, stat);
+    /* Birth time: the record's crtime, written once by its create
+     * (audit 2026-11-15 L-12). 0 is a record no create stamped. */
+    if (request_mask & STATX_BTIME) {
+        u64 cr = READ_ONCE(*cetrafs_inode_crtime(inode));
+
+        if (cr) {
+            stat->btime = cetrafs_ts_mem(cr);
+            stat->result_mask |= STATX_BTIME;
+        }
+    }
     return 0;
 }
 
@@ -3239,7 +3256,7 @@ static bool cetrafs_inode_has_unpublished_state(struct inode *inode)
     if (!cetrafs_inode_stat_baseline_get(inode, &b))
         return true;
     if (READ_ONCE(cetrafs_apply_times_decline)) /* TEST ONLY: the old guard */
-        if (b.atime != (u64) inode_get_atime_sec(inode) || b.mtime != (u64) inode_get_mtime_sec(inode))
+        if (b.atime != cetrafs_atime_disk(inode) || b.mtime != cetrafs_mtime_disk(inode))
             return true;
     return b.size != (u64) i_size_read(inode) || b.blocks != (u64) inode->i_blocks;
 }
@@ -3355,10 +3372,11 @@ u64 cetrafs_label_invalidation_count(void)
 
 static bool cetrafs_inode_label_may_be_stale(struct inode *inode, const cetrafs_inode_t *raw)
 {
-    time64_t ctime = (time64_t) cetrafs_le64(raw->ctime);
+    u64 ctime_ns = cetrafs_le64(raw->ctime);
+    time64_t ctime = cetrafs_ts_mem(ctime_ns).tv_sec;
     time64_t now = ktime_get_real_seconds();
     time64_t *seen_at = cetrafs_inode_label_seen_at(inode);
-    bool stale = inode_get_ctime(inode).tv_sec != ctime || *seen_at <= ctime + 1;
+    bool stale = cetrafs_ctime_disk(inode) != ctime_ns || *seen_at <= ctime + 1;
 
     *seen_at = now;
     return stale;
@@ -3659,18 +3677,19 @@ static int __cetrafs_apply_raw_to_vfs_inode(struct inode *inode, const cetrafs_i
     {
         struct cetrafs_stat_baseline b;
         bool have_b = cetrafs_inode_stat_baseline_get(inode, &b);
-        time64_t at = inode_get_atime_sec(inode), mt = inode_get_mtime_sec(inode);
-        bool keep_at = have_b && (u64) at != b.atime;
-        bool keep_mt = have_b && (u64) mt != b.mtime;
+        u64 at = cetrafs_atime_disk(inode), mt = cetrafs_mtime_disk(inode);
+        bool keep_at = have_b && at != b.atime;
+        bool keep_mt = have_b && mt != b.mtime;
 
         cetrafs_inode_adopt_identity(inode, raw);
         set_nlink(inode, cetrafs_le32(raw->nlink));
         i_size_write(inode, cetrafs_le64(raw->size));
         inode->i_blocks = cetrafs_le64(raw->blocks);
-        inode_set_atime(inode, keep_at ? at : (time64_t) cetrafs_le64(raw->atime), 0);
-        inode_set_mtime(inode, keep_mt ? mt : (time64_t) cetrafs_le64(raw->mtime), 0);
+        cetrafs_set_atime_disk(inode, keep_at ? at : cetrafs_le64(raw->atime));
+        cetrafs_set_mtime_disk(inode, keep_mt ? mt : cetrafs_le64(raw->mtime));
     }
-    inode_set_ctime(inode, (time64_t) cetrafs_le64(raw->ctime), 0);
+    cetrafs_set_ctime_disk(inode, cetrafs_le64(raw->ctime));
+    *cetrafs_inode_crtime(inode) = cetrafs_le64(raw->crtime);
     cetrafs_inode_stat_baseline_set(inode, raw);
     up_write(&inode->i_mapping->invalidate_lock);
     inode_unlock(inode);

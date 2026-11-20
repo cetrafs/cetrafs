@@ -219,11 +219,16 @@ int main(int argc, char **argv)
     }
 
     if (rec_dump) {
-        printf("size=%" PRIu64 " nlink=%u dirent_seq=%" PRIu64 " generation=%" PRIu64 " mtime=%" PRIu64
-               " flags=0x%x blocks=%" PRIu64 "\n",
+        /* mtime in whole seconds (floored), as stat %Y prints it;
+         * mtime_ns the record's own signed nanoseconds. */
+        int64_t mns = (int64_t) cetrafs_le64(in.mtime);
+        int64_t msec = mns / CETRAFS_TIME_NS - (mns % CETRAFS_TIME_NS < 0);
+
+        printf("size=%" PRIu64 " nlink=%u dirent_seq=%" PRIu64 " generation=%" PRIu64 " mtime=%" PRId64
+               " mtime_ns=%" PRId64 " flags=0x%x blocks=%" PRIu64 "\n",
                (uint64_t) cetrafs_le64(in.size), cetrafs_le32(in.nlink),
                (uint64_t) cetrafs_le64(in.dirent_seq), (uint64_t) cetrafs_le64(in.generation),
-               (uint64_t) cetrafs_le64(in.mtime), cetrafs_le32(in.flags), (uint64_t) cetrafs_le64(in.blocks));
+               msec, mns, cetrafs_le32(in.flags), (uint64_t) cetrafs_le64(in.blocks));
         close(fd);
         return 0;
     }

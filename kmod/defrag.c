@@ -839,8 +839,8 @@ static int cetrafs_defrag_commit(struct inode *inode,
          * orders with, so this read cannot regress (2026-10-29).
          */
         raw->size = cetrafs_cpu_to_le64((u64) i_size_read(inode));
-        raw->atime = cetrafs_cpu_to_le64((u64) inode_get_atime_sec(inode));
-        raw->mtime = cetrafs_cpu_to_le64((u64) inode_get_mtime_sec(inode));
+        raw->atime = cetrafs_cpu_to_le64(cetrafs_atime_disk(inode));
+        raw->mtime = cetrafs_cpu_to_le64(cetrafs_mtime_disk(inode));
         fd_seq = cetrafs_inode_fd_seq(inode);
         ret = cetrafs_write_raw_inode_fd(sb, inode->i_ino, raw, inode, &landed);
         if (!ret && cetrafs_defrag_publish_lost_ack) {

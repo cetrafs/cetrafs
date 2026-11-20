@@ -1678,6 +1678,43 @@ void cetrafs_inode_set_generation(struct inode *inode, u64 gen);
  * "fields we changed" from "fields we merely hold an old copy of", and
  * that needs a baseline to compare both sides against.
  */
+/*
+ * Inode times on disk are signed nanoseconds since the epoch
+ * (CETRAFS_TIME_NS, audit 2026-11-15 L-12); in core they are the VFS's
+ * timespec64. These are the only conversions: every reader and writer
+ * of a record's ctime/crtime/atime/mtime goes through them, and the
+ * stat baseline and the three-way merge compare the disk form.
+ * timespec64_to_ns() saturates outside 1677..2262, the range the mount
+ * declares (s_time_min/s_time_max), so the VFS clamps first.
+ */
+extern bool cetrafs_time_whole_seconds; /* TEST ONLY: the 0x0009 store (inode.c) */
+static inline u64 cetrafs_ts_disk(struct timespec64 ts)
+{
+    if (unlikely(READ_ONCE(cetrafs_time_whole_seconds)))
+        ts.tv_nsec = 0;
+    return (u64) timespec64_to_ns(&ts);
+}
+static inline struct timespec64 cetrafs_ts_mem(u64 v)
+{
+    return ns_to_timespec64((s64) v);
+}
+#define cetrafs_atime_disk(i) cetrafs_ts_disk(inode_get_atime(i))
+#define cetrafs_mtime_disk(i) cetrafs_ts_disk(inode_get_mtime(i))
+#define cetrafs_ctime_disk(i) cetrafs_ts_disk(inode_get_ctime(i))
+#define cetrafs_set_atime_disk(i, v) inode_set_atime_to_ts((i), cetrafs_ts_mem(v))
+#define cetrafs_set_mtime_disk(i, v) inode_set_mtime_to_ts((i), cetrafs_ts_mem(v))
+#define cetrafs_set_ctime_disk(i, v) inode_set_ctime_to_ts((i), cetrafs_ts_mem(v))
+/* Now, in the disk form: what a create or a namespace change stamps. */
+static inline u64 cetrafs_now_disk(void)
+{
+    struct timespec64 ts;
+
+    ktime_get_real_ts64(&ts);
+    return cetrafs_ts_disk(ts);
+}
+/* lock.c: the record's birth time as this node last read it. */
+u64 *cetrafs_inode_crtime(struct inode *inode);
+
 struct cetrafs_stat_baseline {
     bool valid;
     u32 mode, uid, gid, nlink;

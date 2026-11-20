@@ -353,7 +353,7 @@ int main(int argc, char **argv)
         int64_t t = (argc > 4) ? (int64_t) strtoll(argv[4], NULL, 0) : 0;
 
         pread_all(fd, &rec, sizeof(rec), rec_off);
-        rec.mtime = cetrafs_cpu_to_le64((uint64_t) t);
+        rec.mtime = cetrafs_cpu_to_le64((uint64_t) (t * CETRAFS_TIME_NS)); /* ns on disk */
         cetrafs_inode_stamp_crcs_us(&rec);
         pwrite_all(fd, &rec, sizeof(rec), rec_off);
         fprintf(stderr, "inode_block_poke: ino %llu mtime -> %lld\n", (unsigned long long) ino, (long long) t);
@@ -363,7 +363,7 @@ int main(int argc, char **argv)
         int64_t t = (argc > 4) ? (int64_t) strtoll(argv[4], NULL, 0) : 0;
 
         pread_all(fd, &rec, sizeof(rec), rec_off);
-        rec.ctime = cetrafs_cpu_to_le64((uint64_t) t);
+        rec.ctime = cetrafs_cpu_to_le64((uint64_t) (t * CETRAFS_TIME_NS)); /* ns on disk */
         cetrafs_inode_stamp_crcs_us(&rec);
         pwrite_all(fd, &rec, sizeof(rec), rec_off);
         fprintf(stderr, "inode_block_poke: ino %llu ctime -> %lld\n", (unsigned long long) ino, (long long) t);
@@ -683,7 +683,10 @@ int main(int argc, char **argv)
         cetrafs_inode_t rec;
 
         pread_all(fd, &rec, sizeof(rec), rec_off);
-        printf("%llu\n", (unsigned long long) cetrafs_le64(rec.mtime));
+        /* Whole seconds, floored (the record holds signed ns). */
+        int64_t mns = (int64_t) cetrafs_le64(rec.mtime);
+
+        printf("%lld\n", (long long) (mns / CETRAFS_TIME_NS - (mns % CETRAFS_TIME_NS < 0)));
     } else if (strcmp(mode, "xattrblk") == 0) {
         /* Print the record's xattr block, or set it (as a peer that
          * dropped or moved the file's xattrs would). */

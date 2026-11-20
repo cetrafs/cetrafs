@@ -375,7 +375,7 @@ copy, and the unused `flags` and `gen`, from here, and the always-zero
 | ino | global inode number |
 | mode, uid, gid, nlink | standard stat fields |
 | size, blocks | bytes / 512B sectors |
-| atime, mtime, ctime | timestamps |
+| atime, mtime, ctime, crtime | signed nanoseconds since the epoch (crtime: birth, written once at create) |
 | flags | `CETRAFS_INODE_*` (EXTENTS always set; XATTR set when an xattr block exists; SNAPSHOT/COMPRESSED reserved; COUNT_UNVERIFIED set when a recount owed after a stopped namespace operation failed -- the next acquirer recounts and clears it) |
 | eh + et (union) | embedded extent-tree root: a header plus 4 inline leaf extents (depth 0) or 4 inline index entries (depth 1/2). `kmod/file.c`'s extent machinery walks all depths; see "Extents" |
 | xattr_block | external xattr block, or 0. Lazily allocated by `kmod/xattr.c` on the first set; freed and reset to 0 when the last entry is removed. One block, no chaining |

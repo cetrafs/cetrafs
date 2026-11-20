@@ -1265,7 +1265,7 @@ int cetrafs_dir_add_entry(struct inode *dir, const struct qstr *name, u64 ino, u
     cetrafs_inode_t raw;
     struct buffer_head *bh = NULL;
     cetrafs_dirent_t *slot = NULL;
-    time64_t now;
+    u64 now;
     u64 new_lba = 0;
     u64 slot_lba = 0;
     unsigned int slot_idx = 0;
@@ -1458,11 +1458,11 @@ int cetrafs_dir_add_entry(struct inode *dir, const struct qstr *name, u64 ino, u
         return ret; /* a grown block stays as a valid empty one -- see above */
 
     /* update dir's own metadata */
-    now = ktime_get_real_seconds();
+    now = cetrafs_now_disk();
     raw.size = cetrafs_cpu_to_le64(cetrafs_le64(raw.size) + (sizeof(cetrafs_dirent_t)));
     raw.dirent_seq = cetrafs_cpu_to_le64(cetrafs_dirent_seq_new(dir->i_sb)); /* this directory's blocks just changed -- see cetrafs_dirent_read() */
-    raw.mtime = cetrafs_cpu_to_le64((u64) now);
-    raw.ctime = cetrafs_cpu_to_le64((u64) now);
+    raw.mtime = cetrafs_cpu_to_le64(now);
+    raw.ctime = cetrafs_cpu_to_le64(now);
     read_nlink = cetrafs_le32(raw.nlink);
     if (file_type == CETRAFS_FT_DIR)
         raw.nlink = cetrafs_cpu_to_le32(cetrafs_le32(raw.nlink) + 1);
@@ -1485,8 +1485,8 @@ int cetrafs_dir_add_entry(struct inode *dir, const struct qstr *name, u64 ino, u
     cetrafs_inode_set_dirent_seq_cached(dir, cetrafs_le64(raw.dirent_seq));
 
     i_size_write(dir, cetrafs_le64(raw.size));
-    inode_set_mtime(dir, now, 0);
-    inode_set_ctime(dir, now, 0);
+    cetrafs_set_mtime_disk(dir, now);
+    cetrafs_set_ctime_disk(dir, now);
     if (file_type == CETRAFS_FT_DIR)
         set_nlink(dir, dir->i_nlink + 1);
 
@@ -1523,7 +1523,7 @@ int cetrafs_dir_remove_entry(struct inode *dir, const struct qstr *name, u64 exp
     cetrafs_inode_t raw;
     struct buffer_head *bh = NULL;
     cetrafs_dirent_t *slot = NULL;
-    time64_t now;
+    u64 now;
     bool fresh;
     int ret;
     u32 i;
@@ -1616,7 +1616,7 @@ int cetrafs_dir_remove_entry(struct inode *dir, const struct qstr *name, u64 exp
     if (ret)
         return ret;
 
-    now = ktime_get_real_seconds();
+    now = cetrafs_now_disk();
     /* Floored: a directory whose size was mis-counted -- a lost staged
      * publish, a peer's damage -- wrapped to 2^64 here and read back as
      * corrupt from then on (audit 2026-11-14 N4). A size below one entry
@@ -1631,8 +1631,8 @@ int cetrafs_dir_remove_entry(struct inode *dir, const struct qstr *name, u64 exp
         raw.size = cetrafs_cpu_to_le64(cetrafs_le64(raw.size) - (sizeof(cetrafs_dirent_t)));
     }
     raw.dirent_seq = cetrafs_cpu_to_le64(cetrafs_dirent_seq_new(dir->i_sb)); /* this directory's blocks just changed -- see cetrafs_dirent_read() */
-    raw.mtime = cetrafs_cpu_to_le64((u64) now);
-    raw.ctime = cetrafs_cpu_to_le64((u64) now);
+    raw.mtime = cetrafs_cpu_to_le64(now);
+    raw.ctime = cetrafs_cpu_to_le64(now);
     read_nlink = cetrafs_le32(raw.nlink);
     if (*out_file_type == CETRAFS_FT_DIR)
         raw.nlink = cetrafs_cpu_to_le32(cetrafs_le32(raw.nlink) - 1);
@@ -1660,8 +1660,8 @@ int cetrafs_dir_remove_entry(struct inode *dir, const struct qstr *name, u64 exp
      */
 
     i_size_write(dir, cetrafs_le64(raw.size));
-    inode_set_mtime(dir, now, 0);
-    inode_set_ctime(dir, now, 0);
+    cetrafs_set_mtime_disk(dir, now);
+    cetrafs_set_ctime_disk(dir, now);
     if (*out_file_type == CETRAFS_FT_DIR)
         set_nlink(dir, dir->i_nlink - 1);
 
@@ -1793,7 +1793,7 @@ static int cetrafs_dir_retarget_entry(struct inode *dir,
     cetrafs_inode_t raw;
     struct buffer_head *bh = NULL;
     cetrafs_dirent_t *slot = NULL;
-    time64_t now;
+    u64 now;
     int ret;
     u32 i;
 
@@ -1878,10 +1878,10 @@ static int cetrafs_dir_retarget_entry(struct inode *dir,
     if (ret)
         return ret;
 
-    now = ktime_get_real_seconds();
+    now = cetrafs_now_disk();
     raw.dirent_seq = cetrafs_cpu_to_le64(cetrafs_dirent_seq_new(dir->i_sb)); /* this directory's blocks just changed */
-    raw.mtime = cetrafs_cpu_to_le64((u64) now);
-    raw.ctime = cetrafs_cpu_to_le64((u64) now);
+    raw.mtime = cetrafs_cpu_to_le64(now);
+    raw.ctime = cetrafs_cpu_to_le64(now);
     /* size and nlink unchanged: one entry became a different entry.
      *
      * A whole-record write from a fresh read, which rule 5 allows only
@@ -1905,8 +1905,8 @@ static int cetrafs_dir_retarget_entry(struct inode *dir,
     /* Not claiming the dirent cache, for the same reason
      * cetrafs_dir_remove_entry() does not: the scan stopped at the
      * entry it came for, so the blocks past it were never refreshed. */
-    inode_set_mtime(dir, now, 0);
-    inode_set_ctime(dir, now, 0);
+    cetrafs_set_mtime_disk(dir, now);
+    cetrafs_set_ctime_disk(dir, now);
     return 0;
 }
 
@@ -2418,7 +2418,7 @@ static int cetrafs_create_locked(struct mnt_idmap *idmap,
     struct inode *inode;
     cetrafs_inode_t raw;
     u64 ino;
-    time64_t now;
+    u64 now;
     int ret;
 
     fs_debug(info, "create '%.*s' in ino=%llu", (int) dentry->d_name.len, dentry->d_name.name,
@@ -2428,7 +2428,7 @@ static int cetrafs_create_locked(struct mnt_idmap *idmap,
     if (ret)
         return ret;
 
-    now = ktime_get_real_seconds();
+    now = cetrafs_now_disk();
     memset(&raw, 0, sizeof(raw));
     raw.ino = cetrafs_cpu_to_le64(ino);
     {
@@ -2443,7 +2443,7 @@ static int cetrafs_create_locked(struct mnt_idmap *idmap,
         raw.mode = cetrafs_cpu_to_le32(m);
     }
     raw.nlink = cetrafs_cpu_to_le32(1);
-    raw.ctime = raw.mtime = raw.atime = cetrafs_cpu_to_le64((u64) now);
+    raw.crtime = raw.ctime = raw.mtime = raw.atime = cetrafs_cpu_to_le64(now);
     raw.flags = cetrafs_cpu_to_le32(CETRAFS_INODE_EXTENTS);
     raw.generation = cetrafs_cpu_to_le64(cetrafs_inode_new_generation(sb)); /* v0x0008 reuse detector */
     cetrafs_new_record_locked(sb, &raw); /* held until its name lands (BM-29) */
@@ -3142,7 +3142,7 @@ static struct dentry *cetrafs_mkdir_locked(struct mnt_idmap *idmap,
     struct buffer_head *bh;
     u64 ino, lba;
     u32 bg_id;
-    time64_t now;
+    u64 now;
     int ret;
 
     fs_debug(info, "mkdir '%.*s' in ino=%llu", (int) dentry->d_name.len, dentry->d_name.name,
@@ -3224,7 +3224,7 @@ static struct dentry *cetrafs_mkdir_locked(struct mnt_idmap *idmap,
         return ERR_PTR(ret);
     }
 
-    now = ktime_get_real_seconds();
+    now = cetrafs_now_disk();
     memset(&raw, 0, sizeof(raw));
     raw.ino = cetrafs_cpu_to_le64(ino);
     {
@@ -3246,7 +3246,7 @@ static struct dentry *cetrafs_mkdir_locked(struct mnt_idmap *idmap,
     cetrafs_new_record_locked(sb, &raw); /* held until its name lands (BM-29) */
     raw.size = cetrafs_cpu_to_le64(sizeof(cetrafs_dirent_t) * 2);
     raw.blocks = cetrafs_cpu_to_le64(CETRAFS_BLOCK_SIZE / 512);
-    raw.ctime = raw.mtime = raw.atime = cetrafs_cpu_to_le64((u64) now);
+    raw.crtime = raw.ctime = raw.mtime = raw.atime = cetrafs_cpu_to_le64(now);
     raw.flags = cetrafs_cpu_to_le32(CETRAFS_INODE_EXTENTS);
     raw.eh.eh_magic = cetrafs_cpu_to_le16(CETRAFS_EXT_MAGIC);
     raw.eh.eh_entries = cetrafs_cpu_to_le16(1);
@@ -3528,7 +3528,7 @@ static int cetrafs_unlink_locked(struct inode *dir, struct dentry *dentry)
     /* POSIX: removing a link updates the inode's ctime. This was set on
      * the in-core object a few lines below and never on the record, so
      * a surviving hardlink's ctime was whatever it had been before. */
-    raw.ctime = cetrafs_cpu_to_le64((u64) ktime_get_real_seconds());
+    raw.ctime = cetrafs_cpu_to_le64(cetrafs_now_disk());
 
     /* Persist nlink (possibly now 0) but never free blocks/the inode
      * number here -- see super_ops.c's cetrafs_evict_inode() for why
@@ -3549,7 +3549,7 @@ static int cetrafs_unlink_locked(struct inode *dir, struct dentry *dentry)
      * with no names yet UNFREED -- "allocated but no directory entry --
      * unreachable" on a 3-node run ([create,link,unlink]). */
     set_nlink(inode, cetrafs_le32(raw.nlink));
-    inode_set_ctime(inode, ktime_get_real_seconds(), 0);
+    cetrafs_set_ctime_disk(inode, cetrafs_le64(raw.ctime));
 
     return 0;
 }
@@ -3657,7 +3657,7 @@ static int cetrafs_rmdir_locked(struct inode *dir, struct dentry *dentry)
     cetrafs_inode_stage_record(inode, &raw, /*fd_too=*/false, read_nlink);
 
     clear_nlink(inode);
-    inode_set_ctime(inode, ktime_get_real_seconds(), 0);
+    cetrafs_set_ctime_disk(inode, cetrafs_now_disk());
 
     return 0;
 }
@@ -3700,9 +3700,9 @@ static int cetrafs_nlink_step(struct super_block *sb,
                               u64 generation,
                               const cetrafs_inode_t *seed,
                               s32 delta,
-                              time64_t now)
+                              u64 now)
 {
-    struct cetrafs_ns_delta d = {.nlink_delta = delta, .ctime = (u64) now};
+    struct cetrafs_ns_delta d = {.nlink_delta = delta, .ctime = now};
     cetrafs_inode_t raw;
     int ret;
 
@@ -3859,10 +3859,10 @@ static int cetrafs_rename_ns_delta(struct super_block *sb, u64 ino, struct cetra
  * Same retry and report as the rename's own -1, on the generation the
  * +1 was taken on.
  */
-static void cetrafs_nlink_giveback(struct super_block *sb, struct inode *inode, u64 gen, time64_t now,
+static void cetrafs_nlink_giveback(struct super_block *sb, struct inode *inode, u64 gen, u64 now,
                                    const char *what)
 {
-    struct cetrafs_ns_delta d = {.ctime = (u64) now, .nlink_delta = -1, .gen = gen};
+    struct cetrafs_ns_delta d = {.ctime = now, .nlink_delta = -1, .gen = gen};
 
     if (!cetrafs_rename_ns_delta(sb, inode->i_ino, &d, what))
         set_nlink(inode, d.out_nlink);
@@ -3878,7 +3878,7 @@ static int cetrafs_rename_dotdot(struct inode *dir, u64 parent_ino)
 }
 
 static void cetrafs_rename_undo_rest(struct inode *old_dir, struct inode *new_dir, struct inode *old_inode, u64 old_ino,
-                                     u64 old_gen, time64_t now, bool counted, bool dotdot_moved);
+                                     u64 old_gen, u64 now, bool counted, bool dotdot_moved);
 
 static int cetrafs_rename_locked(struct mnt_idmap *idmap,
                                  struct inode *old_dir,
@@ -3897,7 +3897,7 @@ static int cetrafs_rename_locked(struct mnt_idmap *idmap,
     bool removed_first = false;
     u8 discard_file_type;
     u8 old_file_type;
-    time64_t now;
+    u64 now;
     int ret;
 
     if (flags & ~RENAME_NOREPLACE)
@@ -4101,7 +4101,7 @@ static int cetrafs_rename_locked(struct mnt_idmap *idmap,
 
     old_ino = old_inode->i_ino;
     old_file_type = cetrafs_dirent_type(old_inode);
-    now = ktime_get_real_seconds();
+    now = cetrafs_now_disk();
 
     /*
      * Between the new name landing and the old one going, the moved
@@ -4196,7 +4196,7 @@ static int cetrafs_rename_locked(struct mnt_idmap *idmap,
          * the last reference actually goes away. Same reasoning as
          * cetrafs_unlink_locked()/cetrafs_rmdir_locked() above. */
         if (removed_file_type == CETRAFS_FT_DIR) {
-            struct cetrafs_ns_delta d = {.set_nlink_zero = true, .ctime = (u64) now};
+            struct cetrafs_ns_delta d = {.set_nlink_zero = true, .ctime = now};
             int nret;
 
             /* The same retries as the replaced file's -1 below: one
@@ -4228,7 +4228,7 @@ static int cetrafs_rename_locked(struct mnt_idmap *idmap,
                     (unsigned long long) removed_ino, nret);
             clear_nlink(new_inode);
         } else {
-            struct cetrafs_ns_delta d = {.nlink_delta = -1, .ctime = (u64) now};
+            struct cetrafs_ns_delta d = {.nlink_delta = -1, .ctime = now};
 
             ret = cetrafs_rename_ns_delta(new_dir->i_sb, removed_ino, &d, "rename: replaced file");
             /* In-core absolute from the value the swap landed, not a
@@ -4240,7 +4240,7 @@ static int cetrafs_rename_locked(struct mnt_idmap *idmap,
             else
                 drop_nlink(new_inode);
         }
-        inode_set_ctime(new_inode, now, 0);
+        cetrafs_set_ctime_disk(new_inode, now);
     }
 
     if (!new_inode) {
@@ -4276,7 +4276,7 @@ static int cetrafs_rename_locked(struct mnt_idmap *idmap,
          * ...carrying the -1 that matches the +1 above, now that the old
          * name is gone. If it does not land the count stays one high: a
          * leak, never a free -- and said so (cetrafs_rename_ns_delta()). */
-        struct cetrafs_ns_delta d = {.ctime = (u64) now, .nlink_delta = counted ? -1 : 0};
+        struct cetrafs_ns_delta d = {.ctime = now, .nlink_delta = counted ? -1 : 0};
 
         /* A directory renamed inside one parent is not locked by the VFS
          * (vfs_rename() locks a moved directory only when its parent
@@ -4287,7 +4287,7 @@ static int cetrafs_rename_locked(struct mnt_idmap *idmap,
         cetrafs_inode_fd_pub_lock(old_inode);
         if (!cetrafs_rename_ns_delta(old_dir->i_sb, old_ino, &d, "rename: moved file") && counted)
             set_nlink(old_inode, d.out_nlink);
-        inode_set_ctime(old_inode, now, 0);
+        cetrafs_set_ctime_disk(old_inode, now);
         cetrafs_inode_fd_pub_unlock(old_inode);
     }
     ret = 0;
@@ -4333,7 +4333,7 @@ out_uncount:
 
 /* The new name never landed: give the count back, and the '..'. */
 static void cetrafs_rename_undo_rest(struct inode *old_dir, struct inode *new_dir, struct inode *old_inode, u64 old_ino,
-                                     u64 old_gen, time64_t now, bool counted, bool dotdot_moved)
+                                     u64 old_gen, u64 now, bool counted, bool dotdot_moved)
 {
     if (counted)
         cetrafs_nlink_giveback(old_dir->i_sb, old_inode, old_gen, now, "rename: un-moved file");
@@ -4570,7 +4570,7 @@ static int cetrafs_link_locked(struct dentry *old_dentry, struct inode *dir, str
 {
     struct inode *inode = d_inode(old_dentry);
     cetrafs_inode_t raw;
-    time64_t now;
+    u64 now;
     int ret;
 
     if (S_ISDIR(inode->i_mode))
@@ -4664,7 +4664,7 @@ static int cetrafs_link_locked(struct dentry *old_dentry, struct inode *dir, str
      * presence bits above all, which run without this lock. The seed is
      * the forced-fresh read that just verified the identity.
      */
-    now = ktime_get_real_seconds();
+    now = cetrafs_now_disk();
     if (cetrafs_link_step_stall_ms)
         msleep(cetrafs_link_step_stall_ms); /* test-only, see the knob */
     ret = cetrafs_nlink_step(dir->i_sb, inode, cetrafs_le64(raw.generation), &raw, 1, now);
@@ -4685,7 +4685,7 @@ static int cetrafs_link_locked(struct dentry *old_dentry, struct inode *dir, str
         cetrafs_nlink_giveback(dir->i_sb, inode, cetrafs_le64(raw.generation), now, "link: un-linked file");
         return ret;
     }
-    inode_set_ctime(inode, now, 0);
+    cetrafs_set_ctime_disk(inode, now);
     ihold(inode);
     d_instantiate(dentry, inode);
 
@@ -4740,7 +4740,7 @@ static int cetrafs_symlink_locked(struct mnt_idmap *idmap,
     struct inode *inode;
     cetrafs_inode_t raw;
     u64 ino;
-    time64_t now;
+    u64 now;
     int len = strlen(symname) + 1; /* page_symlink() wants the NUL included */
     int ret;
 
@@ -4754,7 +4754,7 @@ static int cetrafs_symlink_locked(struct mnt_idmap *idmap,
     if (ret)
         return ret;
 
-    now = ktime_get_real_seconds();
+    now = cetrafs_now_disk();
     memset(&raw, 0, sizeof(raw));
     raw.ino = cetrafs_cpu_to_le64(ino);
     {
@@ -4770,7 +4770,7 @@ static int cetrafs_symlink_locked(struct mnt_idmap *idmap,
                        * group still inherits from a setgid parent */
     }
     raw.nlink = cetrafs_cpu_to_le32(1);
-    raw.ctime = raw.mtime = raw.atime = cetrafs_cpu_to_le64((u64) now);
+    raw.crtime = raw.ctime = raw.mtime = raw.atime = cetrafs_cpu_to_le64(now);
     raw.flags = cetrafs_cpu_to_le32(CETRAFS_INODE_EXTENTS);
     raw.generation = cetrafs_cpu_to_le64(cetrafs_inode_new_generation(sb)); /* v0x0008 reuse detector */
     cetrafs_new_record_locked(sb, &raw); /* held until its name lands (BM-29) */

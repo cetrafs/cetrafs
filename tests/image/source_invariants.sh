@@ -754,7 +754,7 @@ spin_lines() { # <files...>: file:line:code for every line run with a spinlock h
     }' "$@"
 }
 SPIN_SLEEPERS_RE='\b(msleep|usleep_range|ssleep|mutex_lock[a-z_]*|down|down_[a-z_]+|wait_event[a-z_]*|wait_for_[a-z_]+|schedule[a-z_]*|cond_resched|lock_buffer|wait_on_buffer|[a-z_]*bread[a-z_]*|submit_bh|sync_dirty_buffer|iput|brelse|vmalloc|kvmalloc|copy_(to|from)_user|cancel_[a-z_]*_sync|flush_[a-z_]+|synchronize_[a-z_]+)\('
-SPIN_OK='cetrafs_peer_window_floor_secs cetrafs_run_left cetrafs_sb_own_renewal_overdue cetrafs_deferred_on_list cetrafs_deferred_eager cetrafs_ext_key_matches cetrafs_inode_deferred cetrafs_inode_fd_copy cetrafs_inode_get_generation cetrafs_inode_wb_failed cetrafs_le16 cetrafs_le32 cetrafs_le64 cetrafs_nswait_is_current cetrafs_pending_any cetrafs_resv_publish cetrafs_resv_unpublish cetrafs_row_mark_of cetrafs_row_mark_same cetrafs_sb_bg_discard_pending_ignored cetrafs_sb_layout_of cetrafs_sb_stale_secs'
+SPIN_OK='cetrafs_atime_disk cetrafs_ctime_disk cetrafs_mtime_disk cetrafs_peer_window_floor_secs cetrafs_run_left cetrafs_sb_own_renewal_overdue cetrafs_deferred_on_list cetrafs_deferred_eager cetrafs_ext_key_matches cetrafs_inode_deferred cetrafs_inode_fd_copy cetrafs_inode_get_generation cetrafs_inode_wb_failed cetrafs_le16 cetrafs_le32 cetrafs_le64 cetrafs_nswait_is_current cetrafs_pending_any cetrafs_resv_publish cetrafs_resv_unpublish cetrafs_row_mark_of cetrafs_row_mark_same cetrafs_sb_bg_discard_pending_ignored cetrafs_sb_layout_of cetrafs_sb_stale_secs'
 SL="$(spin_lines "$K"/*.c)"
 [ "$(wc -l <<<"$SL")" -gt 100 ] || fail "class 19 spinlock: setup -- only $(wc -l <<<"$SL") lines found under a spinlock (the scan no longer matches)"
 SPIN_BAD="$(grep -E "$SPIN_SLEEPERS_RE" <<<"$SL" | grep -vE 'GFP_ATOMIC|GFP_NOWAIT' | head -5 || true)"
@@ -1500,6 +1500,8 @@ zonegroup.c:cetrafs_zg_log_foreign_free_leak log
 scrub.c:cetrafs_scrub_cycle procfs-timestamp
 inode.c:cetrafs_inode_label_may_be_stale order-that-fails-toward-a-re-read
 "
+# cetrafs_now_disk() (kmod.h) is the inode-time clock read: a .h is not
+# scanned, so its callers are matched by name.
 c29_scan() { # <dir>: prints file:function for every real-clock read
     local f
     for f in "$1"/*.c; do
@@ -1509,7 +1511,7 @@ c29_scan() { # <dir>: prints file:function for every real-clock read
         awk -v F="$(basename "$f")" '
             /^[a-z].*\(/ && !/;$/ { fn = $0; sub(/\(.*/, "", fn); sub(/.* \**/, "", fn) }
             /^[[:space:]]*(\*|\/\*)/ { next }
-            /ktime_get_real|ktime_get_clocktai|ktime_get_coarse_real|get_seconds\(\)/ { print F ":" fn }' "$f"
+            /ktime_get_real|ktime_get_clocktai|ktime_get_coarse_real|get_seconds\(\)|cetrafs_now_disk\(/ { print F ":" fn }' "$f"
     done | sort -u
 }
 C29P="$(mktemp -d)"

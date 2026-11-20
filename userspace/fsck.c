@@ -2278,7 +2278,14 @@ static uint64_t fsck_lost_found(int fd,
     nd.nlink = cetrafs_cpu_to_le32(2);
     nd.size = cetrafs_cpu_to_le64(sizeof(cetrafs_dirent_t) * 2);
     nd.blocks = cetrafs_cpu_to_le64(CETRAFS_BLOCK_SIZE / 512);
-    nd.ctime = nd.mtime = nd.atime = cetrafs_cpu_to_le64((uint64_t) time(NULL));
+    {
+        /* Signed nanoseconds since the epoch (CETRAFS_TIME_NS). */
+        struct timespec now;
+
+        clock_gettime(CLOCK_REALTIME, &now);
+        nd.crtime = nd.ctime = nd.mtime = nd.atime =
+            cetrafs_cpu_to_le64((uint64_t) ((int64_t) now.tv_sec * CETRAFS_TIME_NS + now.tv_nsec));
+    }
     nd.flags = cetrafs_cpu_to_le32(CETRAFS_INODE_EXTENTS);
     /* Never 0: a zeroed generation is indistinguishable from an
      * unstamped record, and 0 is a valid node id for ns_lock_owner. */

@@ -1597,6 +1597,9 @@ typedef struct {
  * barrier a peer's freshness gate observes.
  */
 #define CETRAFS_INODE_NS_BYTES 512U
+/* Units per second of every inode time on disk (ctime, crtime, atime,
+ * mtime): signed nanoseconds since the epoch, format 0x000A. */
+#define CETRAFS_TIME_NS 1000000000LL
 #define CETRAFS_INODE_FD_OFF   512U
 #define CETRAFS_INODE_FD_BYTES 512U
 
@@ -1619,7 +1622,13 @@ typedef struct {
      * Nothing outside the namespace machinery may write it. */
     __le32 nlink;
 
-    /* ctime is namespace-owned (link/unlink/rename/chmod stamp it).
+    /* Every time in this record -- ctime, crtime, atime, mtime -- is
+     * SIGNED NANOSECONDS since the epoch (CETRAFS_TIME_NS), format
+     * 0x000A: whole seconds let two changes inside one second look like
+     * none to rsync and make (audit 2026-11-15 L-12). An s64 spans
+     * 1677..2262; the mount clamps to that range.
+     *
+     * ctime is namespace-owned (link/unlink/rename/chmod stamp it).
      * A write(2)'s ctime bump lives in-core on the writing node and
      * reaches the record at that node's next namespace-side update;
      * mtime (sector 1) is the cross-node-fresh "data changed" signal. */
@@ -1712,7 +1721,11 @@ typedef struct {
      * file lock instead, and never sets it. */
     __le64 write_open_nodes;
     __le64 ns_cas_stamp; /* reserved: G-6 stamp of this sector (CETRAFS_FEAT_INCOMPAT_CAS_STAMP); 0 */
-    u8 ns_pad[CETRAFS_INODE_NS_BYTES - 132 - 4 * CETRAFS_MAX_READER_NODES];
+    /* Birth time (statx STATX_BTIME), format 0x000A: written once by
+     * the publish that creates the record, never changed after. Same
+     * encoding as ctime/atime/mtime (CETRAFS_TIME_NS). */
+    __le64 crtime;
+    u8 ns_pad[CETRAFS_INODE_NS_BYTES - 140 - 4 * CETRAFS_MAX_READER_NODES];
 
     /* ===== SECTOR 1: the FILE DOMAIN ===== */
     __le64 fd_ino;                /* identity echo of .ino */

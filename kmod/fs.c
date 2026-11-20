@@ -4172,6 +4172,13 @@ int cetrafs_fill_super(struct super_block *sb, struct fs_context *fc)
     sb->s_flags |= SB_NOATIME;
 
     sb->s_maxbytes = cetrafs_max_file_size_for(U64_MAX);
+    /* Inode times are signed nanoseconds on disk (CETRAFS_TIME_NS):
+     * nanosecond granularity, and the range an s64 of them spans, so
+     * the VFS clamps a utimes() outside it instead of the store
+     * saturating it (audit 2026-11-15 L-12). */
+    sb->s_time_gran = 1;
+    sb->s_time_min = KTIME_SEC_MIN;
+    sb->s_time_max = KTIME_SEC_MAX;
     /* link() and mkdir() refuse past this (EMLINK). Far below the u32
      * the record stores, so links added by peers at once -- each checked
      * against its own in-core count -- still cannot reach the wrap; the

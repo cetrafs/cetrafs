@@ -975,14 +975,14 @@ static int cetrafs_xattr_set(struct inode *inode, const char *name, const void *
     }
 
     {
-        u64 now = (u64) ktime_get_real_seconds();
+        u64 now = cetrafs_now_disk();
 
         /* Its first settle may restart the call outside the VFS's locks
          * only where the set came through the restartable acquire. */
         ret = cetrafs_xattr_set_locked(inode, name, value, size, flags, now,
                                        !nested && strncmp(name, XATTR_SECURITY_PREFIX, XATTR_SECURITY_PREFIX_LEN));
         if (!ret)
-            inode_set_ctime(inode, (time64_t) now, 0);
+            cetrafs_set_ctime_disk(inode, now);
     }
     if (!nested)
         cetrafs_nslock_release_set(set, ARRAY_SIZE(set));

@@ -7999,8 +7999,8 @@ static int __cetrafs_truncate_shrink(struct inode *inode, loff_t new_size)
          * says so -- a failed write leaves both where they were, and no
          * other publish can slip the old size in between. */
         raw.size = cetrafs_cpu_to_le64((u64) new_size);
-        raw.atime = cetrafs_cpu_to_le64((u64) inode_get_atime_sec(inode));
-        raw.mtime = cetrafs_cpu_to_le64((u64) inode_get_mtime_sec(inode));
+        raw.atime = cetrafs_cpu_to_le64(cetrafs_atime_disk(inode));
+        raw.mtime = cetrafs_cpu_to_le64(cetrafs_mtime_disk(inode));
         fd_seq = cetrafs_inode_fd_seq(inode);
         ret = unlikely(cetrafs_fail_extent_record_write) ? -EIO
                                                          : cetrafs_write_raw_inode_fd_planned(sb, inode->i_ino, &raw, inode,
@@ -8819,7 +8819,7 @@ static int cetrafs_do_allocate(struct inode *inode, loff_t offset, loff_t len, b
     inode->i_blocks = cetrafs_le64(raw.blocks);
     if (!keep_size && end > i_size_read(inode))
         i_size_write(inode, end);
-    inode_set_ctime(inode, ktime_get_real_seconds(), 0);
+    cetrafs_set_ctime_disk(inode, cetrafs_now_disk());
     inode_set_mtime_to_ts(inode, inode_get_ctime(inode));
     mark_inode_dirty(inode);
     ret = loop_ret; /* a stop part-way (signal, ENOSPC) still reports why */
@@ -9696,7 +9696,7 @@ zero_boundaries:
     }
 
     inode->i_blocks = cetrafs_le64(raw.blocks);
-    inode_set_ctime(inode, ktime_get_real_seconds(), 0);
+    cetrafs_set_ctime_disk(inode, cetrafs_now_disk());
     inode_set_mtime_to_ts(inode, inode_get_ctime(inode));
     mark_inode_dirty(inode);
     /* The direct write persists it; the VFS call then clears the dirty
@@ -10006,7 +10006,7 @@ static int cetrafs_setattr_locked(struct mnt_idmap *idmap, struct dentry *dentry
             .mode = cetrafs_cpu_to_le32(inode->i_mode),
             .uid = cetrafs_cpu_to_le32(i_uid_read(inode)),
             .gid = cetrafs_cpu_to_le32(i_gid_read(inode)),
-            .ctime = cetrafs_cpu_to_le64((u64) inode_get_ctime_sec(inode)),
+            .ctime = cetrafs_cpu_to_le64(cetrafs_ctime_disk(inode)),
         };
         cetrafs_inode_t nsraw;
 

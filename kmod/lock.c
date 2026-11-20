@@ -118,6 +118,9 @@ struct cetrafs_inode_info {
     /* When this node last adopted the record's identity (seconds);
      * cetrafs_inode_label_may_be_stale(). Under inode_lock. */
     time64_t label_seen_at;
+    /* The record's crtime (disk form) as last read or created here;
+     * written once at birth, so any copy is current. */
+    u64 crtime;
     /* This inode's held-back tree blocks (leafdefer.c), so a boundary
      * walks its own and not the mount's. Under the mount's deferred
      * xarray lock; emptied at eviction. */
@@ -1114,9 +1117,9 @@ void cetrafs_inode_stat_baseline_from_incore(struct inode *inode)
     ci->stat_baseline.nlink = inode->i_nlink;
     ci->stat_baseline.size = i_size_read(inode);
     ci->stat_baseline.blocks = inode->i_blocks;
-    ci->stat_baseline.atime = (u64) inode_get_atime_sec(inode);
-    ci->stat_baseline.mtime = (u64) inode_get_mtime_sec(inode);
-    ci->stat_baseline.ctime = (u64) inode_get_ctime_sec(inode);
+    ci->stat_baseline.atime = cetrafs_atime_disk(inode);
+    ci->stat_baseline.mtime = cetrafs_mtime_disk(inode);
+    ci->stat_baseline.ctime = cetrafs_ctime_disk(inode);
     ci->stat_baseline.valid = true;
     spin_unlock(&ci->resv_lock);
 }
@@ -1733,6 +1736,7 @@ struct inode *cetrafs_alloc_vfs_inode(struct super_block *sb)
     if (!ci)
         return NULL;
     ci->label_seen_at = 0; /* a recycled object keeps another file's */
+    ci->crtime = 0;
     if (READ_ONCE(cetrafs_alloc_recycled_reader))
         atomic_set(&ci->read_opener_count, 1); /* test-only; see the parameter */
     /* The local open counters too, for every new inode -- iget's and
@@ -1795,6 +1799,11 @@ void cetrafs_free_vfs_inode(struct inode *inode)
     WARN_ON_ONCE(ci->smap);
 
     kmem_cache_free(cetrafs_inode_cache, ci);
+}
+
+u64 *cetrafs_inode_crtime(struct inode *inode)
+{
+    return &CETRAFS_I(inode)->crtime;
 }
 
 time64_t *cetrafs_inode_label_seen_at(struct inode *inode)
