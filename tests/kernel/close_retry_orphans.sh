@@ -90,7 +90,14 @@ round() {
         dmesg_since "$mark" | grep -q "lock release: ino=$ino close finished by the heartbeat" && { finished=1; break; }
         sleep 0.5
     done
-    "$LP" "$img" show "$ino" | grep -q "^ent [0-9]* block=900 .* uninit=0$" && ondev=1
+    # An initialized extent covering block 900: a conversion may have
+    # zero-filled across a gap and merged it with its neighbour (it does
+    # where the loop's backing file takes write-zeroes, as ext4 does), so
+    # no entry need START there.
+    "$LP" "$img" show "$ino" | awk '/^ent / { b = l = u = -1
+            for (i = 1; i <= NF; i++) { split($i, kv, "="); if (kv[1] == "block") b = kv[2]
+                if (kv[1] == "len") l = kv[2]; if (kv[1] == "uninit") u = kv[2] }
+            if (u == 0 && b <= 900 && 900 < b + l) f = 1 } END { exit !f }' && ondev=1
     echo 0 >/sys/module/cetrafs/parameters/tree_flush_skip_all
     echo 0 >/sys/module/cetrafs/parameters/retry_orphans_off
     ct_umount "$MNT"
