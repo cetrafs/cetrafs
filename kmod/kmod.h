@@ -667,6 +667,11 @@ void cetrafs_nslock_retry_deferred(struct super_block *sb);
  * finished by the heartbeat. */
 #define CETRAFS_FLOCK_DEFERRED_MAX 32
 void cetrafs_sb_flock_defer(struct super_block *sb, u64 ino, u64 generation);
+/* fs.c + lock.c: stale reader bits the I/O-path verdict left to the heartbeat
+ * (cetrafs_lock_retry_reader_reclaims(), audit M-11). Lossy; inode numbers only. */
+#define CETRAFS_RDRECLAIM_MAX 16
+void cetrafs_sb_reader_reclaim_defer(struct super_block *sb, u64 ino);
+u32 cetrafs_sb_reader_reclaim_take(struct super_block *sb, u64 *out, u32 max);
 u32 cetrafs_sb_flock_take_deferred(struct super_block *sb, struct cetrafs_nsrel_pending *out, u32 max);
 void cetrafs_lock_retry_deferred(struct super_block *sb);
 /* fs.c + lock.c: presence bits whose withdraw failed, finished by the
@@ -690,6 +695,7 @@ void cetrafs_sb_reclaim_defer(struct super_block *sb, const struct cetrafs_recla
 u32 cetrafs_sb_reclaim_take_deferred(struct super_block *sb, struct cetrafs_reclaim_pending *out, u32 max);
 void cetrafs_alloc_retry_reclaim(struct super_block *sb); /* alloc.c */
 void cetrafs_lock_retry_presence(struct super_block *sb);
+void cetrafs_lock_retry_reader_reclaims(struct super_block *sb, u32 my_node_id); /* lock.c */
 s64 cetrafs_sb_take_zg_free_delta(struct super_block *sb, u32 zg_id);
 int cetrafs_flush_dirty_free_counts(struct super_block *sb);
 /* Zone Groups carrying an unapplied free-count delta. A delta must
@@ -1739,6 +1745,9 @@ u64 cetrafs_inode_local_file_seq(struct inode *inode);
 u64 cetrafs_inode_local_file_seq_at(struct inode *inode);
 u64 cetrafs_file_cache_drop_count(void);
 u64 cetrafs_verdict_fill_count(void);
+u64 cetrafs_read_stamp_fill_count(void); /* lock.c: reader file_seq checks read from the device */
+u64 cetrafs_verdict_fill_fence_count(void); /* lock.c: fences a fill issued inline (test control) */
+u64 cetrafs_reader_reclaim_deferred_count(void); /* lock.c */
 u64 cetrafs_journal_write_count(void);
 u64 cetrafs_journal_held_slots(struct super_block *sb); /* journal.c: slots held by kept entries */
 u64 cetrafs_bg_geom_read_count(void);

@@ -369,6 +369,9 @@ static int cetrafs_proc_info_show(struct seq_file *m, void *v)
     seq_printf(m, "journal_replay_declines: %llu\n", cetrafs_journal_replay_decline_count());
     seq_printf(m, "file_cache_drops: %llu\n", cetrafs_file_cache_drop_count());
     seq_printf(m, "verdict_fills: %llu\n", cetrafs_verdict_fill_count());
+    seq_printf(m, "read_stamp_fills: %llu\n", cetrafs_read_stamp_fill_count());
+    seq_printf(m, "verdict_fill_fences: %llu\n", cetrafs_verdict_fill_fence_count());
+    seq_printf(m, "reader_reclaims_deferred: %llu\n", cetrafs_reader_reclaim_deferred_count());
     seq_printf(m, "journal_writes: %llu\n", cetrafs_journal_write_count());
     seq_printf(m, "journal_op_refusals: %llu\n", cetrafs_journal_op_refusal_count());
     seq_printf(m, "record_op_refusals: %llu\n", cetrafs_record_op_refusal_count());

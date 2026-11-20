@@ -472,6 +472,9 @@ static void cetrafs_heartbeat_maint(struct work_struct *work)
     /* Same, for file locks: a lock this node kept because its last close
      * could not finish is reclaimed by nobody while we keep beating. */
     cetrafs_lock_retry_deferred(sb);
+    /* Stale peers' reader bits the I/O-path verdict left for us: fenced
+     * and cleared here, never from the data path (audit M-11). */
+    cetrafs_lock_retry_reader_reclaims(sb, my_node_id);
     /* And presence bits: a live node's bit is cleared by nobody else. */
     cetrafs_lock_retry_presence(sb);
     /* And inode-number reclaim claims, for the same reason. */

@@ -60,6 +60,7 @@
  * it. */
 static atomic64_t cetrafs_file_cache_drops = ATOMIC64_INIT(0);
 static atomic64_t cetrafs_verdict_fills = ATOMIC64_INIT(0); /* foreign-opener verdicts read from the device */
+static atomic64_t cetrafs_read_stamp_fills = ATOMIC64_INIT(0); /* reader file_seq checks read from the device */
 
 /* Reconciles COMPLETED by the deferred worker. Every drop must be
  * followed by one: until it lands the inode reads every tree block
@@ -324,6 +325,11 @@ struct cetrafs_inode_info {
      * invalidation can never land after it as current (audit
      * 2026-11-05, N8; cetrafs_lock_expire_verdicts()). */
     atomic_t verdict_gen;
+    /* Single-flight for the foreign-opener refill (cetrafs_inode_foreign_
+     * opener_cached()): the task that finds the verdict expired reads the
+     * device once, and the rest wait for the word it publishes. Taken
+     * only on expiry, never on the cached path. */
+    struct mutex verdict_fill_lock;
 
     /* Defrag pin (defrag.c, incremental mover): while set, the mover is
      * relying on this node's on-disk exclusive lock staying held, so the
@@ -1670,6 +1676,7 @@ static void cetrafs_inode_init_once(void *foo)
     atomic_set(&ci->shared_dio_writers, 0);
     ci->smap = NULL; /* evict drops it, so a recycled object has none */
     mutex_init(&ci->lock_mutex);
+    mutex_init(&ci->verdict_fill_lock);
     spin_lock_init(&ci->resv_lock);
     spin_lock_init(&ci->fd_lock);
     mutex_init(&ci->fd_pub_mutex);
@@ -3006,6 +3013,21 @@ static unsigned int cetrafs_release_step_gap_ms;
 cetrafs_test_param(release_step_gap_ms, cetrafs_release_step_gap_ms, uint, 0644);
 MODULE_PARM_DESC(release_step_gap_ms, "test-only: delay between the close's lock clear and state publish");
 
+/* What the reader judge may do about a stale peer's bit.
+ *  RECLAIM       -- fence the peer and clear its bit, inline (every
+ *                   caller that is already entitled to write).
+ *  DEFER         -- the data path's question: count the bit as a reader
+ *                   and leave the fence and the clear to the heartbeat
+ *                   (cetrafs_lock_retry_reader_reclaims()). A verdict fill
+ *                   on an I/O path must never fence (audit M-11).
+ *  RECLAIM_FILL  -- RECLAIM from inside a verdict fill: test-only, the
+ *                   control that restores the fence on the data path. */
+enum cetrafs_reader_mode {
+    CETRAFS_READER_RECLAIM,
+    CETRAFS_READER_DEFER,
+    CETRAFS_READER_RECLAIM_FILL,
+};
+
 /* Defined below, next to the public wrapper it came from. 'ignore':
  * bits not to count (the caller's own exemption, e.g. suspended writers). */
 static int cetrafs_foreign_reader_from_raw(struct super_block *sb,
@@ -3014,6 +3036,13 @@ static int cetrafs_foreign_reader_from_raw(struct super_block *sb,
                                            u32 my_node_id,
                                            u64 ignore,
                                            bool *out_exists);
+static int cetrafs_foreign_reader_from_raw_mode(struct super_block *sb,
+                                                u64 ino,
+                                                const cetrafs_inode_t *rawp,
+                                                u32 my_node_id,
+                                                u64 ignore,
+                                                bool *out_exists,
+                                                enum cetrafs_reader_mode mode);
 
 
 /*
@@ -4755,6 +4784,57 @@ static int cetrafs_lock_clear_raw(struct super_block *sb, u64 ino, u64 generatio
     return ret < 0 ? ret : 0;
 }
 
+/*
+ * The heartbeat's half of the deferred reader reclaims (audit M-11): the
+ * verdict fill found a stale peer's bit and counted it as a reader rather
+ * than fencing from the I/O path. Each queued inode is re-read fresh and
+ * judged by the same reader judge, inline, which fences the stale node and
+ * clears only the bit of the incarnation it judged (rule 15). A request
+ * that does not finish is dropped: the verdict stays conservative, and the
+ * next fill that finds the bit asks again. Nothing here holds an inode
+ * reference -- the queue names inode numbers, which the fill that queued
+ * them re-validates.
+ */
+/* TEST ONLY: the heartbeat skips the deferred reader reclaims, so a test
+ * can hold a stale bit in place while it looks at the data path. */
+static bool cetrafs_reader_reclaim_hb_off;
+cetrafs_test_param(reader_reclaim_hb_off, cetrafs_reader_reclaim_hb_off, bool, 0644);
+MODULE_PARM_DESC(reader_reclaim_hb_off, "TEST ONLY: the heartbeat does not finish deferred stale-reader reclaims");
+
+void cetrafs_lock_retry_reader_reclaims(struct super_block *sb, u32 my_node_id)
+{
+    u64 inos[CETRAFS_RDRECLAIM_MAX];
+    cetrafs_inode_t *raw;
+    u32 n, i;
+
+    if (READ_ONCE(cetrafs_reader_reclaim_hb_off))
+        return; /* test-only; see the parameter */
+    n = cetrafs_sb_reader_reclaim_take(sb, inos, ARRAY_SIZE(inos));
+    if (!n)
+        return;
+    raw = kmalloc(sizeof(*raw), GFP_NOFS);
+    if (!raw) {
+        for (i = 0; i < n; i++)
+            cetrafs_sb_reader_reclaim_defer(sb, inos[i]);
+        return;
+    }
+    for (i = 0; i < n; i++) {
+        bool exists = false;
+        int ret;
+
+        cetrafs_invalidate_raw_inode(sb, inos[i]);
+        ret = cetrafs_read_raw_inode(sb, inos[i], raw);
+        if (ret)
+            continue; /* not re-queued: the next verdict fill asks again */
+        ret = cetrafs_foreign_reader_from_raw_mode(sb, inos[i], raw, my_node_id, 0, &exists,
+                                                   CETRAFS_READER_RECLAIM);
+        if (ret)
+            pr_warn_ratelimited("reader reclaim: ino=%llu failed (%d); the next verdict fill asks again\n",
+                                (unsigned long long) inos[i], ret);
+    }
+    kfree(raw);
+}
+
 void cetrafs_lock_retry_deferred(struct super_block *sb)
 {
     struct cetrafs_nsrel_pending pend[CETRAFS_FLOCK_DEFERRED_MAX];
@@ -4937,6 +5017,11 @@ void cetrafs_lock_retry_deferred(struct super_block *sb)
  * has it open right now" => trust the cache). This is the negative
  * control for the staleness tests: with it set they MUST fail, which is
  * the only thing proving they test anything. Never set in production. */
+
+u64 cetrafs_read_stamp_fill_count(void)
+{
+    return (u64) atomic64_read(&cetrafs_read_stamp_fills);
+}
 
 u64 cetrafs_verdict_fill_count(void)
 {
@@ -5313,7 +5398,7 @@ static void cetrafs_inode_note_stamp(struct inode *inode, const cetrafs_inode_t 
     }
 }
 
-static bool cetrafs_inode_has_foreign_opener(struct inode *inode)
+static bool cetrafs_inode_has_foreign_opener(struct inode *inode, bool inline_reclaim)
 {
     struct super_block *sb = inode->i_sb;
     cetrafs_inode_t raw;
@@ -5333,7 +5418,8 @@ static bool cetrafs_inode_has_foreign_opener(struct inode *inode)
 
     cetrafs_inode_note_stamp(inode, &raw, my_node_id);
 
-    if (cetrafs_foreign_reader_from_raw(sb, inode->i_ino, &raw, my_node_id, 0, &exists) != 0)
+    if (cetrafs_foreign_reader_from_raw_mode(sb, inode->i_ino, &raw, my_node_id, 0, &exists,
+                                             inline_reclaim ? CETRAFS_READER_RECLAIM_FILL : CETRAFS_READER_DEFER) != 0)
         return true;
     return exists;
 }
@@ -5393,6 +5479,19 @@ void cetrafs_lock_expire_verdicts(struct inode *inode)
     cetrafs_verdicts_invalidate(CETRAFS_I(inode));
 }
 
+/* TEST ONLY: refill without the single-flight lock, as before audit M-11:
+ * every task that finds the verdict expired reads the device itself
+ * (tests/kernel/verdict_refill_single_flight.sh, the control). */
+static bool cetrafs_verdict_fill_unlocked;
+cetrafs_test_param(verdict_fill_unlocked, cetrafs_verdict_fill_unlocked, bool, 0644);
+MODULE_PARM_DESC(verdict_fill_unlocked, "TEST ONLY: every task that finds the foreign-opener verdict expired refills it");
+
+/* TEST ONLY: a verdict fill fences and clears a stale peer's reader bit
+ * inline, as before audit M-11 (the control for the no-fence check). */
+static bool cetrafs_verdict_fill_reclaims;
+cetrafs_test_param(verdict_fill_reclaims, cetrafs_verdict_fill_reclaims, bool, 0644);
+MODULE_PARM_DESC(verdict_fill_reclaims, "TEST ONLY: a foreign-opener verdict fill fences a stale peer on the I/O path");
+
 /*
  * Rate-limited wrapper: re-read the presence mask at most once per second
  * per inode and cache the verdict. The hot path (metadata read per I/O)
@@ -5400,18 +5499,60 @@ void cetrafs_lock_expire_verdicts(struct inode *inode)
  * which is the whole point, since under nofilelock this gates whether a
  * VM's every block I/O re-reads the extent tree from the LUN.
  */
+
+/* A cached word that may be trusted now: current, and read within a second. */
+static bool cetrafs_verdict_current_recent(struct cetrafs_inode_info *ci, unsigned long word, unsigned long now)
+{
+    return cetrafs_verdict_current(ci, word) && !time_after(now, READ_ONCE(ci->foreign_open_checked) + HZ);
+}
+
+/*
+ * The refill is single-flight (audit M-11). Before, every task on an
+ * expired verdict read the device itself, all at once, so a QD-32 writer
+ * paid one round trip per second per open image in parallel, and the fill
+ * that found a stale peer fenced it from the I/O path.
+ *
+ * Staleness direction (CLAUDE.md rules 6 and 10): the cached "no foreign
+ * opener" answer is the dangerous one -- a peer that opened in the last
+ * second is invisible to it, and the writer then trusts a cache a peer may
+ * have changed. So a waiter never uses an EXPIRED word, and never borrows
+ * the word of a fill it did not wait for. It takes the lock, and the word
+ * it then finds is either a current verdict within the second (published by
+ * the fill it waited on, whose gen read came before the device read and is
+ * still the current gen -- so no invalidation sits between that read and
+ * the waiter's use), or it is not, and the waiter fills itself. A verdict
+ * invalidated while the fill was in flight is never current, so an
+ * invalidator's destructive check cannot be served the pre-invalidation
+ * answer (tests/kernel/verdict_expiry_fences_fill.sh still holds).
+ *
+ * The fill itself never fences: a stale peer's bit counts as a reader, the
+ * verdict says "present" (the conservative answer -- fresh reads), and the
+ * reclaim is queued for the heartbeat. A stale bit is never counted as
+ * absent, so the only cost of deferring it is a window of fresh reads.
+ */
 bool cetrafs_inode_foreign_opener_cached(struct inode *inode)
 {
     struct cetrafs_inode_info *ci = CETRAFS_I(inode);
-    unsigned long now = jiffies;
     unsigned long word = smp_load_acquire(&ci->foreign_open_word);
+    bool locked = !READ_ONCE(cetrafs_verdict_fill_unlocked);
+    unsigned long now;
     unsigned int gen;
     bool v;
 
-    if (cetrafs_verdict_current(ci, word) && !time_after(now, READ_ONCE(ci->foreign_open_checked) + HZ))
+    if (cetrafs_verdict_current_recent(ci, word, jiffies))
         return word & 1;
+
+    if (locked) {
+        mutex_lock(&ci->verdict_fill_lock);
+        word = smp_load_acquire(&ci->foreign_open_word);
+        if (cetrafs_verdict_current_recent(ci, word, jiffies)) {
+            mutex_unlock(&ci->verdict_fill_lock);
+            return word & 1;
+        }
+    }
+    now = jiffies;
     gen = atomic_read_acquire(&ci->verdict_gen); /* BEFORE the device read */
-    v = cetrafs_inode_has_foreign_opener(inode);
+    v = cetrafs_inode_has_foreign_opener(inode, READ_ONCE(cetrafs_verdict_fill_reclaims));
     atomic64_inc(&cetrafs_verdict_fills);
     if (READ_ONCE(cetrafs_verdict_fill_stall_ms)) {
         unsigned int ms = xchg(&cetrafs_verdict_fill_stall_ms, 0); /* test-only, one fill */
@@ -5421,6 +5562,8 @@ bool cetrafs_inode_foreign_opener_cached(struct inode *inode)
     }
     WRITE_ONCE(ci->foreign_open_checked, now);
     smp_store_release(&ci->foreign_open_word, cetrafs_verdict_word(gen, v));
+    if (locked)
+        mutex_unlock(&ci->verdict_fill_lock);
     return v;
 }
 
@@ -5555,11 +5698,25 @@ static bool cetrafs_inode_read_stamp_check(struct inode *inode)
 
     bool ok = false;
 
+    bool locked = !READ_ONCE(cetrafs_verdict_fill_unlocked);
+
     if (cetrafs_read_trust_ignore_stamp)
         return true;
     if (cetrafs_verdict_current(ci, smp_load_acquire(&ci->read_seq_word)) &&
         !time_after(now, READ_ONCE(ci->read_seq_checked) + HZ))
         return true;
+    /* Single-flight, as the foreign-opener fill (audit M-11): one task
+     * reads the record, the rest take the word it publishes -- only a
+     * current one, read within the second, never an expired one. */
+    if (locked) {
+        mutex_lock(&ci->verdict_fill_lock);
+        now = jiffies;
+        if (cetrafs_verdict_current(ci, smp_load_acquire(&ci->read_seq_word)) &&
+            !time_after(now, READ_ONCE(ci->read_seq_checked) + HZ)) {
+            mutex_unlock(&ci->verdict_fill_lock);
+            return true;
+        }
+    }
     /* Off the stack: this is reached from deep in the read path, and
      * the record is 652 bytes (see the open path's FRAME_WARN note). */
     raw = kmalloc(sizeof(*raw), GFP_NOFS);
@@ -5569,12 +5726,21 @@ static bool cetrafs_inode_read_stamp_check(struct inode *inode)
         cetrafs_invalidate_raw_inode(sb, inode->i_ino);
         if (cetrafs_read_raw_inode(sb, inode->i_ino, raw) == 0) {
             cetrafs_inode_note_stamp(inode, raw, my_node_id);
+            atomic64_inc(&cetrafs_read_stamp_fills);
+            if (READ_ONCE(cetrafs_verdict_fill_stall_ms)) {
+                unsigned int ms = xchg(&cetrafs_verdict_fill_stall_ms, 0); /* test-only, one fill */
+
+                if (ms)
+                    msleep(ms);
+            }
             WRITE_ONCE(ci->read_seq_checked, now);
             smp_store_release(&ci->read_seq_word, cetrafs_verdict_word(gen, false));
             ok = true;
         }
     }
     kfree(raw);
+    if (locked)
+        mutex_unlock(&ci->verdict_fill_lock);
     return ok;
 }
 
@@ -7875,14 +8041,42 @@ static bool cetrafs_reader_clear_dirty_ok;
 cetrafs_test_param(reader_clear_dirty_ok, cetrafs_reader_clear_dirty_ok, bool, 0644);
 MODULE_PARM_DESC(reader_clear_dirty_ok, "TEST ONLY: a stale node's presence bit is cleared though its journal is dirty");
 
+/* Counters for the I/O-path verdict and its deferred reclaims (procfs
+ * info; tests/kernel/verdict_refill_single_flight.sh). */
+static atomic64_t cetrafs_verdict_fill_fences = ATOMIC64_INIT(0);
+static atomic64_t cetrafs_reader_reclaims_deferred = ATOMIC64_INIT(0);
+
+u64 cetrafs_verdict_fill_fence_count(void)
+{
+    return (u64) atomic64_read(&cetrafs_verdict_fill_fences);
+}
+
+u64 cetrafs_reader_reclaim_deferred_count(void)
+{
+    return (u64) atomic64_read(&cetrafs_reader_reclaims_deferred);
+}
+
 /* The decision half of cetrafs_lock_foreign_reader_exists(), from a
- * record the caller has already read fresh. */
+ * record the caller has already read fresh. Callers entitled to write
+ * reclaim inline. */
 static int cetrafs_foreign_reader_from_raw(struct super_block *sb,
                                            u64 ino,
                                            const cetrafs_inode_t *rawp,
                                            u32 my_node_id,
                                            u64 ignore,
                                            bool *out_exists)
+{
+    return cetrafs_foreign_reader_from_raw_mode(sb, ino, rawp, my_node_id, ignore, out_exists,
+                                                CETRAFS_READER_RECLAIM);
+}
+
+static int cetrafs_foreign_reader_from_raw_mode(struct super_block *sb,
+                                                u64 ino,
+                                                const cetrafs_inode_t *rawp,
+                                                u32 my_node_id,
+                                                u64 ignore,
+                                                bool *out_exists,
+                                                enum cetrafs_reader_mode mode)
 {
     const cetrafs_inode_t raw = *rawp;
     u64 others;
@@ -7928,6 +8122,21 @@ static int cetrafs_foreign_reader_from_raw(struct super_block *sb,
                     return 0;
                 }
             }
+            if (mode == CETRAFS_READER_DEFER) {
+                /* The data path's question. A stale bit is a reader still
+                 * present: count it, and leave the fence and the clear to
+                 * the heartbeat -- never a fence or a CAS from an I/O
+                 * path (audit M-11). A read-only mount writes nothing at
+                 * all, so it only counts. */
+                if (!sb_rdonly(sb)) {
+                    cetrafs_sb_reader_reclaim_defer(sb, ino);
+                    atomic64_inc(&cetrafs_reader_reclaims_deferred);
+                }
+                *out_exists = true;
+                return 0;
+            }
+            if (mode == CETRAFS_READER_RECLAIM_FILL)
+                atomic64_inc(&cetrafs_verdict_fill_fences); /* test-only control */
             if (cetrafs_node_fence_peer(sb, n, "a read-open reference")) {
                 /* Not revoked: it may still be reading. Count it. */
                 *out_exists = true;

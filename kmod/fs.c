@@ -959,6 +959,14 @@ struct cetrafs_sb_info {
     u32 flrel_count;
     struct cetrafs_nsrel_pending flrel[CETRAFS_FLOCK_DEFERRED_MAX];
 
+    /* Stale peers' reader bits the I/O-path verdict found and left to the
+     * heartbeat (cetrafs_lock_retry_reader_reclaims(), audit M-11). Inode
+     * numbers only, no reference. Lossy by design: a dropped entry is asked
+     * again by the next fill that finds the bit. Under rdrel_lock. */
+    spinlock_t rdrel_lock;
+    u32 rdrel_count;
+    u64 rdrel[CETRAFS_RDRECLAIM_MAX];
+
     /* This node's presence bits whose withdraw did not land (see
      * cetrafs_lock_retry_presence()). Same shape and reason as flrel:
      * nobody reclaims a live node's bit. Under prrel_lock. */
@@ -3408,6 +3416,7 @@ int cetrafs_fill_super(struct super_block *sb, struct fs_context *fc)
         mutex_init(&sbi->layout_mutex);
         spin_lock_init(&sbi->nsrel_lock);
         spin_lock_init(&sbi->flrel_lock);
+        spin_lock_init(&sbi->rdrel_lock);
         spin_lock_init(&sbi->prrel_lock);
         spin_lock_init(&sbi->rcrel_lock);
         spin_lock_init(&sbi->bmap_bad_lock);
@@ -8450,6 +8459,49 @@ void cetrafs_sb_flock_defer(struct super_block *sb, u64 ino, u64 generation)
     sbi->flrel[sbi->flrel_count].generation = generation;
     sbi->flrel_count++;
     spin_unlock(&sbi->flrel_lock);
+}
+
+/* Remember a stale reader bit the data path left for the heartbeat. Queued
+ * once per inode; a full queue drops the entry (the next verdict fill asks
+ * again), with a warning, and never fails the caller. */
+void cetrafs_sb_reader_reclaim_defer(struct super_block *sb, u64 ino)
+{
+    struct cetrafs_sb_info *sbi = sb->s_fs_info;
+    u32 i;
+
+    if (!sbi)
+        return;
+    spin_lock(&sbi->rdrel_lock);
+    for (i = 0; i < sbi->rdrel_count; i++)
+        if (sbi->rdrel[i] == ino) {
+            spin_unlock(&sbi->rdrel_lock);
+            return;
+        }
+    if (sbi->rdrel_count == CETRAFS_RDRECLAIM_MAX) {
+        spin_unlock(&sbi->rdrel_lock);
+        pr_warn_ratelimited("%s: reader reclaim for ino=%llu dropped, %u already queued; the next verdict fill asks again\n",
+                            sb->s_id, (unsigned long long) ino, CETRAFS_RDRECLAIM_MAX);
+        return;
+    }
+    sbi->rdrel[sbi->rdrel_count++] = ino;
+    spin_unlock(&sbi->rdrel_lock);
+}
+
+/* Take up to max queued inode numbers, for one heartbeat pass. */
+u32 cetrafs_sb_reader_reclaim_take(struct super_block *sb, u64 *out, u32 max)
+{
+    struct cetrafs_sb_info *sbi = sb->s_fs_info;
+    u32 n;
+
+    if (!sbi)
+        return 0;
+    spin_lock(&sbi->rdrel_lock);
+    n = min(sbi->rdrel_count, max);
+    memcpy(out, sbi->rdrel, n * sizeof(*out));
+    memmove(sbi->rdrel, sbi->rdrel + n, (sbi->rdrel_count - n) * sizeof(*out));
+    sbi->rdrel_count -= n;
+    spin_unlock(&sbi->rdrel_lock);
+    return n;
 }
 
 /* Remember a presence bit whose withdraw did not land, for the heartbeat.

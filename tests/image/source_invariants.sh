@@ -2106,7 +2106,8 @@ C51_REG='cetrafs_inode_ext_cache_lookup calls:cetrafs_ext_key_matches
 cetrafs_ext_key_matches key:file_seq
 cetrafs_dir_needs_fresh key:dirent_seq
 cetrafs_verdict_current key:verdict_gen
-cetrafs_inode_foreign_opener_cached calls:cetrafs_verdict_current
+cetrafs_inode_foreign_opener_cached calls:cetrafs_verdict_current_recent
+cetrafs_verdict_current_recent calls:cetrafs_verdict_current
 cetrafs_lock_identity_cache_trusted calls:cetrafs_inode_foreign_opener_cached
 cetrafs_lock_read_cache_trusted calls:cetrafs_inode_read_stamp_check
 cetrafs_tree_cache_trusted calls:cetrafs_lock_read_cache_trusted
@@ -2618,7 +2619,7 @@ heartbeat.c:cetrafs_heartbeat_maint:alive -> leave its journal alone (keep)
 inode.c:cetrafs_write_vfs_inode:alive -> drop our own dirt (keep the record)
 journal.c:cetrafs_journal_claim_replay:alive -> leave the replay to it (keep)
 lock.c:cetrafs_foreign_claim_from_raw:alive -> a live claim (keep)
-lock.c:cetrafs_foreign_reader_from_raw:alive -> keep its reader bit
+lock.c:cetrafs_foreign_reader_from_raw_mode:alive -> keep its reader bit; a stale one on the data path (DEFER) is counted present and queued for the heartbeat, never cleared there (keep)
 lock.c:cetrafs_lock_ask_mover:alive -> ask its move back and wait, bounded; a dead mover judged alive costs the wait and then the old refusal (keep)
 lock.c:cetrafs_lock_explicit_acquire:alive -> keep waiting; the runtime watch converges
 lock.c:cetrafs_lock_open:alive -> refuse this open; the runtime watch converges on retry
