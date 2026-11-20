@@ -2333,6 +2333,10 @@ func quiesceFreeBlocks(statfsOf func(*Client, string) (StatfsResult, error), nod
 	return nil
 }
 
+// statfsPeerWindow outlasts the kernel's statfs_fresh_ms (1 s): a peer's
+// change to the Zone Group records is in this node's statfs after it.
+const statfsPeerWindow = 1500 * time.Millisecond
+
 // RunSpaceAccounting checks whether free-space accounting (statfs --
 // what `df` reports) is correct on the node that writes/unlinks a
 // large file, and -- separately -- whether a *different* node's own
@@ -2419,6 +2423,10 @@ func RunSpaceAccounting(clients []*Client, baseDir string, sizeBytes int) (bool,
 	if err != nil {
 		return false, err
 	}
+	// A peer's statfs reads the Zone Group table fresh at most once a
+	// second (statfs_fresh_ms, audit M-32): the writer's change reaches
+	// it within that, not at once.
+	time.Sleep(statfsPeerWindow)
 	afterWritePeer, err := statfsOf(peer, "after write")
 	if err != nil {
 		return false, err
@@ -2446,6 +2454,7 @@ func RunSpaceAccounting(clients []*Client, baseDir string, sizeBytes int) (bool,
 	if err != nil {
 		return false, err
 	}
+	time.Sleep(statfsPeerWindow)
 	afterUnlinkPeer, err := statfsOf(peer, "after unlink")
 	if err != nil {
 		return false, err
