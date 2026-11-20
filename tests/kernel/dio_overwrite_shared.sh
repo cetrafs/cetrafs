@@ -269,8 +269,11 @@ def overwrite():
         res["rc"] = os.pwrite(fd, memoryview(b)[o:o + 8 * BS], 0)
     except OSError as e:
         res["rc"] = -e.errno
-    res["delta"] = counter() - c0
+    # The end is when the write returned, before the counter read: the
+    # operation may run the moment the section is left, and a read after
+    # it put a correct order 1 ms the wrong way round.
     res["t1"] = time.monotonic()
+    res["delta"] = counter() - c0
     os.close(fd)
 libc = ctypes.CDLL(None, use_errno=True)
 libc.fallocate.argtypes = [ctypes.c_int, ctypes.c_int, ctypes.c_long, ctypes.c_long]
