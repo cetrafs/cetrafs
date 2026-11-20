@@ -29,6 +29,15 @@ export CETRAFS_PEER_PROBE_SECS=3
 
 IMG="$(ct_image 700 tcdl)"
 DISK="$(ct_lio_disks "$IMG" 1)" || { skip "no LIO loopback target here"; ct_exit; }
+
+# 2 first, before the node exists: on the disk itself the tools do claim
+# by CAW. (Once the dm node holds the disk, a destructive tool's exclusive
+# open of the disk is refused, as it must be under a multipath map.)
+ct_mkfs "$DISK" -z 1 -b 512 -J 0 -M 4 -N 1024 -f >/dev/null
+OUT="$("$FSCK" -r "$DISK" 2>&1 || true)"
+grep -q "registry claim written by COMPARE AND WRITE" <<<"$OUT" ||
+    { fail "setup: fsck -r did not use CAW on the LIO disk itself: $(grep -m2 'registry claim\|ERR' <<<"$OUT")"; ct_exit; }
+pass "2: the disk itself claims by COMPARE AND WRITE"
 NAME="ct-tcdl-$$"
 SECT="$(blockdev --getsz "$DISK")"
 dmsetup create "$NAME" --table "0 $((SECT - 2048)) linear $DISK 2048" ||
@@ -36,13 +45,6 @@ dmsetup create "$NAME" --table "0 $((SECT - 2048)) linear $DISK 2048" ||
 ct_track dm "$NAME"
 NODE="/dev/mapper/$NAME"
 udevadm settle 2>/dev/null || true
-
-# 2 first: on the disk itself the tools do claim by CAW
-ct_mkfs "$DISK" -z 1 -b 512 -J 0 -M 4 -N 1024 -f >/dev/null
-OUT="$("$FSCK" -r "$DISK" 2>&1 || true)"
-grep -q "registry claim written by COMPARE AND WRITE" <<<"$OUT" ||
-    { fail "setup: fsck -r did not use CAW on the LIO disk itself: $(grep -m2 'registry claim\|ERR' <<<"$OUT")"; ct_exit; }
-pass "2: the disk itself claims by COMPARE AND WRITE"
 
 ct_mkfs "$NODE" -z 1 -b 512 -J 0 -M 4 -N 1024 -f >/dev/null
 # fsck -r -> "caw=<0|1> rc=<n>"
