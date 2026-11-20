@@ -3360,7 +3360,11 @@ static int ___cetrafs_journal_replay_node(struct super_block *sb, u32 node_id, b
          * claiming the file after this is seen by the advance below,
          * which refuses to move a stamp it was not judged against. */
         judged_seq = 0;
-        if (!cetrafs_journal_ignore_owner) {
+        if (!cetrafs_journal_ignore_owner &&
+            /* TEST ONLY: the old verdict judges an owner past the known
+             * table gone, and this read would learn the grown layout
+             * first (journal_replay_owner_behind_grow.sh). */
+            !(READ_ONCE(cetrafs_journal_owner_known_only) && !cetrafs_inode_lba(sb, entries[s].owner_ino))) {
             struct cetrafs_journal_owner jo = {.ino = entries[s].owner_ino,
                                                .generation = entries[s].owner_generation};
 
