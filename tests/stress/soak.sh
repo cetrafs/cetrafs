@@ -220,7 +220,10 @@ if [ "${SOAK_RANDOM:-1}" = 1 ] && [ "$ABORTED" = 0 ]; then
             case "$suite" in
             fsx_model) env FSX_LONG=1 FSX_SEEDS="$seed $((seed + 1))" "$ROOT/tests/run.sh" kernel/$suite.sh >"$OUT" 2>&1 || RC=$? ;;
             fsstress_namespace) env FSSTRESS_LONG=1 FSSTRESS_SEEDS="$seed" "$ROOT/tests/run.sh" kernel/$suite.sh >"$OUT" 2>&1 || RC=$? ;;
-            churn_oracle) env CHURN_SEED="$seed" CHURN_ROUNDS="${CHURN_ROUNDS:-6}" CHURN_SECS="${CHURN_SECS:-60}" \
+            # The long mode outlasts run.sh's 300 s default: each round is
+            # its actors' run plus a squeeze to ENOSPC.
+            churn_oracle) cr="${CHURN_ROUNDS:-6}" cs="${CHURN_SECS:-60}"
+                env CHURN_SEED="$seed" CHURN_ROUNDS="$cr" CHURN_SECS="$cs" CT_SUITE_TIMEOUT=$((cr * (cs + 60) + 300)) \
                 "$ROOT/tests/run.sh" kernel/$suite.sh >"$OUT" 2>&1 || RC=$? ;;
             esac
             if [ "$RC" = 0 ]; then
