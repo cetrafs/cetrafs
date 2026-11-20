@@ -104,6 +104,10 @@ file names are the index: `make -C tests list`.
 only thing that exercises the atomic COMPARE AND WRITE itself: a loop
 device has no CAW, so `cetrafs_cas_region()` takes its plain fallback
 there and the primitive every claim path rests on is never really run.
+`fence_witness_cost.sh` measures what the fence witness read costs per
+operation (append, create, overwrite) with the witness on and off; a
+loop device serves that read from the host page cache, so only an array
+gives the real figure.
 
 **`stress/`** -- slow, opt-in, loop-backed.  `soak.sh` is a mixed
 workload with a full fsck after every round (deliberately does not
