@@ -66,7 +66,19 @@ dead_number() {
 }
 
 claim() { "$LPOKE" "$BACK" "$1" --ns 7 >/dev/null; "$IPOKE" "$BACK" bumpseq "$1" 2>/dev/null; }
-release() { "$LPOKE" "$BACK" "$1" --ns 65535 >/dev/null; "$IPOKE" "$BACK" bumpseq "$1" 2>/dev/null; }
+# The stamp moves while the record is still held: a real release is ONE
+# write, so a creator polling for it must never read a released record
+# that then changes again under its birth claim.
+release() { "$IPOKE" "$BACK" bumpseq "$1" 2>/dev/null; "$LPOKE" "$BACK" "$1" --ns 65535 >/dev/null; }
+# bit_set_within <ino> <tries>: wait (10 ms steps) for the create's bit
+bit_set_within() {
+    local i
+    for ((i = 0; i < $2; i++)); do
+        [ "$(bit "$1")" = 1 ] && return 0
+        sleep 0.01
+    done
+    return 1
+}
 
 # verdict <case> <N> <created-file>: the number ends with one owner or none.
 verdict() {
@@ -92,7 +104,7 @@ claim "$N" # claim; its clear is a no-op here, the bit is already clear
 ct_param_set birth_gap_ms 300 # hold the create after its record read
 ( touch "$MNT/newa" ) &
 CPID=$!
-sleep 0.15
+bit_set_within "$N" 25 || true # inside the create's 300 ms gap
 held="$(bit "$N")"
 if [ "$held" = 1 ] && grep -q ' ns_owner=7 ' <<<"$("$LPOKE" "$BACK" "$N")"; then
     pass "(a) set up: the create holds ino $N's bit while the reclaim still holds its record"
@@ -111,7 +123,7 @@ N="$(dead_number oldb)"
 ct_param_set birth_read_gap_ms 1500
 ( touch "$MNT/newb" ) &
 CPID=$!
-sleep 0.3
+bit_set_within "$N" 100 || true # inside the create's 1.5 s read gap
 held="$(bit "$N")"
 if [ "$held" = 1 ] && grep -q ' nlink=0 ' <<<"$("$LPOKE" "$BACK" "$N" --rec)"; then
     pass "(b) set up: the create holds ino $N's bit and has not read the dead record yet"
