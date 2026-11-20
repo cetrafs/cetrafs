@@ -1650,16 +1650,6 @@ cetrafs_test_param(journal_batch_crash_before_targets, cetrafs_journal_batch_cra
 MODULE_PARM_DESC(journal_batch_crash_before_targets,
                  "TEST ONLY: the next deferred tree-block batch stops the mount after its entries, before its targets");
 
-/* Write a deferred block's current image to its own LBA and wait. A
- * block freed since it was collected is skipped (and counts as done: its
- * entry is spent with the rest). */
-static int cetrafs_deferred_write_target(struct super_block *sb, struct buffer_head *bh, u32 *wcrc)
-{
-    int ret = cetrafs_write_deferred_target(sb, bh, wcrc);
-
-    return ret > 0 ? 0 : ret;
-}
-
 /* Give a batch's slots back after its entries were retired (or hold the
  * ones whose retire could not be shown, as a kept entry's are held). */
 static unsigned int cetrafs_journal_batch_retire(struct super_block *sb, struct cetrafs_journal *j,
@@ -1844,6 +1834,14 @@ int cetrafs_journal_settle_range(struct super_block *sb, u64 first, u64 count)
     mutex_unlock(&j->batch_mutex);
     return ret;
 }
+
+/* TEST ONLY: a block no longer held back when its target write came
+ * counts as written by this batch, as before -- read back against an
+ * image this batch never sent (the control of
+ * tests/kernel/deferred_boundary_race.sh). */
+static bool cetrafs_deferred_unsent_counted;
+cetrafs_test_param(deferred_unsent_counted, cetrafs_deferred_unsent_counted, bool, 0644);
+MODULE_PARM_DESC(deferred_unsent_counted, "TEST ONLY: a target not sent (no longer held back) counts as written");
 
 /* A whole deferred batch: k entries in k slots already taken. */
 static int cetrafs_journal_batch_chunk(struct super_block *sb, struct cetrafs_journal *j,
@@ -2032,6 +2030,12 @@ static int cetrafs_journal_batch_chunk(struct super_block *sb, struct cetrafs_jo
             j->retire_slot[j->retire_n] = slots[i];
             j->retire_lba[j->retire_n] = bhs[i]->b_blocknr;
             j->retire_n++;
+            /* Not held back any more when its turn came: another boundary
+             * of this node wrote it, or it was freed. Its entry is spent with the rest, but
+             * this batch sent nothing, so it is not this batch's to settle
+             * or read back (cetrafs_deferred_window_check()). */
+            if (!hb[i] && !READ_ONCE(cetrafs_deferred_unsent_counted))
+                written[i] = false;
         }
         if (!now && !READ_ONCE(cetrafs_journal_retire_early))
             return ret;
@@ -2079,7 +2083,9 @@ static int cetrafs_journal_batch_chunk(struct super_block *sb, struct cetrafs_jo
  * of it.
  *
  * The caller guarantees nobody modifies the blocks meanwhile. written[i]
- * says which reached the device; the rest stay held back for a retry.
+ * says which this call sent and saw reach the device; of the rest, a
+ * block no longer held back was sent by someone else (or freed), and
+ * any other stays held back for a retry.
  * mkfs -J 0 has no journal: step 0, then the targets in place.
  */
 /* Give back the first k slots of a batch that will not be written: a
@@ -2230,11 +2236,15 @@ int cetrafs_journal_write_deferred(struct super_block *sb, struct buffer_head **
         if (ret)
             return ret; /* nothing written: the blocks stay held back */
         for (i = 0; i < n; i++) {
-            int werr = cetrafs_deferred_write_target(sb, bhs[i], &wcrc[i]);
+            /* 1: no longer held back (freed, or written by another
+             * boundary of this node): nothing sent, so not written here. */
+            int werr = cetrafs_write_deferred_target(sb, bhs[i], &wcrc[i]);
 
             if (!werr)
                 written[i] = true;
-            else if (!ret)
+            else if (werr > 0 && READ_ONCE(cetrafs_deferred_unsent_counted))
+                written[i] = true;
+            else if (werr < 0 && !ret)
                 ret = werr;
         }
         return ret;
