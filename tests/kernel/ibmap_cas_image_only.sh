@@ -25,6 +25,13 @@
 #      frees, review F-11) and count no damage; fsck finds no
 #      never-written record.
 #
+# Since G-6 an inode-bitmap swap carries a stamp no other swap writes,
+# so a timed-out swap whose stamp is on the device is ours beyond doubt:
+#   4. stamped, the create keeps the number its swap claimed, nothing
+#      abandoned, fsck clean.
+# 1-3 and their controls stage the unstamped swap (cas_stamp_off=1),
+# where only the image can answer -- the case B-4 is about.
+#
 # DISCRIMINATION: ibmap_trust_image=1 (the old verdict): the create gets
 # the claimed number itself. ibmap_abandon_no_stamp=1 (the record left
 # zeros): every cycle of 3 meets it, and fsck reports it never written.
@@ -32,7 +39,7 @@ set -euo pipefail
 . "$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)/lib/harness.sh"
 require_root
 require_module
-for k in cas_judged_timeout_once ibmap_trust_image; do
+for k in cas_judged_timeout_once ibmap_trust_image cas_stamp_off; do
     [ -w "/sys/module/cetrafs/parameters/$k" ] || { skip "$k is missing"; ct_exit; }
 done
 MNT="$(ct_mnt ibci)"
@@ -40,6 +47,7 @@ ct_track mnt "$MNT"
 ct_param_set cas_judged_timeout_once 0
 ct_param_set ibmap_trust_image 0
 ct_param_set ibmap_abandon_no_stamp 0
+ct_param_set cas_stamp_off 0
 # the scrub, quick: set before each mount (the interval is read there)
 ct_param_set scrub 1
 ct_param_set scrub_interval_secs 3
@@ -48,7 +56,7 @@ ct_param_set scrub_gap_secs 2
 WHY="$(ct_tmp ibci-why)"
 SB_POKE="$(ct_helper sb_poke)"
 
-# <trust 0|1> [<no stamp 0|1>] -> "a=<ino> b=<ino> c=<ino> abandoned=<delta> cycles=<n> damage=<n> unknown=<n> unwritten=<0|1> fsck=<clean|ERR>"
+# <trust 0|1> [<no stamp 0|1>] [<cas stamps off 0|1, default 1>] -> "a=<ino> b=<ino> c=<ino> abandoned=<delta> cycles=<n> damage=<n> unknown=<n> unwritten=<0|1> fsck=<clean|ERR>"
 round() {
     local img disk proc a b c n0 n1 out
     img="$(ct_image 560 "ibci$1")"
@@ -70,9 +78,11 @@ round() {
     n0="$(sed -n 's/^ibmap_abandoned: //p' "$proc/info")"
     echo "${2:-0}" >/sys/module/cetrafs/parameters/ibmap_abandon_no_stamp
     echo "$1" >/sys/module/cetrafs/parameters/ibmap_trust_image
+    echo "${3:-1}" >/sys/module/cetrafs/parameters/cas_stamp_off
     echo 1 >/sys/module/cetrafs/parameters/cas_judged_timeout_once
     touch "$MNT/b"
     echo 0 >/sys/module/cetrafs/parameters/cas_judged_timeout_once
+    echo 0 >/sys/module/cetrafs/parameters/cas_stamp_off
     echo 0 >/sys/module/cetrafs/parameters/ibmap_trust_image
     b="$(stat -c %i "$MNT/b")"
     touch "$MNT/c"
@@ -114,6 +124,11 @@ A="$(get a "$R")"
     [ "$(get unwritten "$R")" = 0 ] &&
     pass "3: the abandoned number was stamped dead: two scrub cycles met no never-written record, no damage" ||
     fail "3: over the abandoned number: $R"
+S="$(round 0 0 0)"
+log "stamped: $S"
+[ "$(get b "$S")" = "$(($(get a "$S") + 1))" ] && [ "$(get abandoned "$S")" = 0 ] && [ "$(get fsck "$S")" = clean ] &&
+    pass "4: stamped, the timed-out swap is known ours: the create kept $(get b "$S"), nothing abandoned" ||
+    fail "4: stamped: $S"
 D="$(round 0 1)"
 log "control (left unwritten): $D"
 [ "$(get unknown "$D")" -gt 0 ] && [ "$(get unwritten "$D")" = 1 ] &&

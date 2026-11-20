@@ -1924,7 +1924,7 @@ static int cetrafs_cas_region_seeded_impl(struct super_block *sb,
             if (!memcmp(vb + off, new, region)) {
                 pr_warn("CAS lba=%llu: command timed out but the swap IS on the device -- taking it as done\n",
                         (unsigned long long) fs_lba);
-                if (image_only && soff < 0)
+                if (image_only && (soff < 0 || READ_ONCE(cetrafs_cas_stamp_off_knob)))
                     *image_only = true; /* unstamped: a peer's identical swap reads the same */
                 kfree(vb);
                 cetrafs_cas_publish_cache(sb, fs_lba, off, new, region, sole_region);
@@ -2015,7 +2015,7 @@ static int cetrafs_cas_region_seeded_impl(struct super_block *sb,
             if (!vret && !memcmp(vb + off, unknown, region)) {
                 pr_warn("CAS lba=%llu: the timed-out command landed late -- taking it as done\n",
                         (unsigned long long) fs_lba);
-                if (image_only && soff < 0)
+                if (image_only && (soff < 0 || READ_ONCE(cetrafs_cas_stamp_off_knob)))
                     *image_only = true;
                 kfree(vb);
                 cetrafs_cas_publish_cache(sb, fs_lba, off, unknown, region, sole_region);
