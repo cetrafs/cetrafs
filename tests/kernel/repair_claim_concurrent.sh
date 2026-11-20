@@ -40,7 +40,12 @@ FSCK="$ROOT/userspace/fsck.cetra"
 SB_POKE="$(ct_helper sb_poke)"
 NPOKE="$(ct_helper node_poke)"
 
-DEV="$(ct_dev 560 repconc)"
+# Two repairers stand for two nodes, each with its own path to the
+# volume: two loop devices over one image. Through one device the tools'
+# exclusive open would refuse the second before it reached the claim.
+IMG="$(ct_image 560 repconc)"
+DEV="$(ct_loop "$IMG")"
+DEV2="$(ct_loop "$IMG")"
 ct_mkfs_small "$DEV" -M 4 >/dev/null
 O1="$(ct_tmp repconc-1)"; O2="$(ct_tmp repconc-2)"
 
@@ -48,7 +53,7 @@ O1="$(ct_tmp repconc-1)"; O2="$(ct_tmp repconc-2)"
 pair() {
     CETRAFS_TEST_REPAIR_CLAIM_DELAY_SECS="$1" CETRAFS_TEST_REPAIR_CLAIM_AT_MS="${3:-0}" "$FSCK" -r "$DEV" >"$O1" 2>&1 &
     local p1=$!
-    CETRAFS_TEST_REPAIR_CLAIM_DELAY_SECS="$2" CETRAFS_TEST_REPAIR_CLAIM_AT_MS="${3:-0}" "$FSCK" -r "$DEV" >"$O2" 2>&1 &
+    CETRAFS_TEST_REPAIR_CLAIM_DELAY_SECS="$2" CETRAFS_TEST_REPAIR_CLAIM_AT_MS="${3:-0}" "$FSCK" -r "$DEV2" >"$O2" 2>&1 &
     local p2=$!
     wait "$p1" || true
     wait "$p2" || true

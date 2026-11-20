@@ -14,7 +14,10 @@
 # and registration) and an offline growfs run inside the pause: nothing
 # is registered yet, so the grow goes ahead, holds and releases its
 # claim, and publishes -- block 0 is a grow of what the mount read, the
-# same state a live grow by a peer leaves.
+# same state a live grow by a peer leaves. The grow runs through a second
+# loop device over the same image, as a peer has its own path to the
+# volume: through the mount's own device the tools' exclusive open is
+# refused while the mount is in flight.
 #
 #  A. the stalled mount comes up at the grown layout, and fsck is clean.
 #  B. the same pause with block 0 changed in a way a grow does not
@@ -33,6 +36,7 @@ SBPOKE="$(ct_helper sb_poke)"
 
 IMG="$(ct_big_image 1500 growmidmount)"
 DEV="$(ct_loop "$IMG")"
+PEER_DEV="$(ct_loop "$IMG")" # the growing "peer"'s own path to the volume
 MNT="$(ct_mnt growmidmount)"
 ct_track mnt "$MNT"
 ct_param_set mount_register_stall_ms 0
@@ -55,7 +59,7 @@ MARK="$(dmesg_mark)"
 mount -t cetrafs "$DEV" "$MNT" 2>"$(ct_tmp growmid-err)" &
 MP=$!
 sleep 2
-out="$(ct_growfs "$DEV" -s 1400M 2>&1)" || true
+out="$(ct_growfs "$PEER_DEV" -s 1400M 2>&1)" || true
 GEN1="$("$SBPOKE" "$IMG" | sed -n 's/^layout_gen=//p')"
 if wait "$MP"; then
     MOUNTED=1

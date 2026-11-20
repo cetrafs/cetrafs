@@ -11,8 +11,10 @@
 # reap) are now a SCSI COMPARE AND WRITE through SG_IO wherever the
 # device has the command, so the late claim miscompares instead.
 #
-# A loop device has no CAW: this runs on a LIO loopback disk
-# (ct_lio_disks). The late claimant is held between its read of the row
+# A loop device has no CAW: this runs on LIO loopback disks
+# (ct_lio_disks), two over one backstore -- one per repairer, as two
+# nodes each have their own path to the volume (through one device the
+# tools' exclusive open refuses the second before it claims). The late claimant is held between its read of the row
 # and its claim (CETRAFS_TEST_REPAIR_CLAIM_GAP_SECS) while the other
 # claims, settles and holds.
 #
@@ -27,7 +29,10 @@ FSCK="$ROOT/userspace/fsck.cetra"
 export CETRAFS_PEER_PROBE_SECS=3
 
 IMG="$(ct_image 600 rccaw)"
-DISK="$(ct_lio_disks "$IMG" 1)" || { skip "no LIO loopback target here"; ct_exit; }
+DISKS="$(ct_lio_disks "$IMG" 2)" || { skip "no LIO loopback target here"; ct_exit; }
+DISK="$(sed -n 1p <<<"$DISKS")"
+DISK2="$(sed -n 2p <<<"$DISKS")"
+[ -b "$DISK" ] && [ -b "$DISK2" ] || { fail "setup: two LIO disks expected, got '$DISKS'"; ct_exit; }
 ct_mkfs "$DISK" -z 1 -b 512 -J 0 -M 4 -N 1024 -f >/dev/null
 
 OUT="$("$FSCK" -r "$DISK" 2>&1 || true)"
@@ -44,7 +49,7 @@ race() {
     env "${env[@]}" CETRAFS_TEST_REPAIR_CLAIM_GAP_SECS=7 CETRAFS_TEST_REPAIR_HOLD_SECS=8 "$FSCK" -r "$DISK" >"$ob" 2>&1 &
     pb=$!
     sleep 1
-    env "${env[@]}" CETRAFS_TEST_REPAIR_HOLD_SECS=16 "$FSCK" -r "$DISK" >"$oa" 2>&1 &
+    env "${env[@]}" CETRAFS_TEST_REPAIR_HOLD_SECS=16 "$FSCK" -r "$DISK2" >"$oa" 2>&1 &
     pa=$!
     wait "$pb" || true
     wait "$pa" || true
