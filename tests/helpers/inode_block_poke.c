@@ -163,6 +163,10 @@ int main(int argc, char **argv)
         rec.ns_lock_owner = cetrafs_cpu_to_le32(CETRAFS_NODE_ID_NONE);
         rec.eh.eh_magic = cetrafs_cpu_to_le16(CETRAFS_EXT_MAGIC);
         rec.eh.eh_max = cetrafs_cpu_to_le16(4);
+        /* Every publish of a file sector stamps a file_seq, never 0 (a
+         * replay reads 0 as "could not read the owner"); this one names
+         * nobody. */
+        rec.file_seq = cetrafs_cpu_to_le64(((uint64_t) CETRAFS_NODE_ID_NONE << 48) | 1);
         cetrafs_inode_stamp_crcs_us(&rec);
         memcpy(blk, &rec, sizeof(rec));
         pwrite_all(fd, blk, sizeof(blk), off);
