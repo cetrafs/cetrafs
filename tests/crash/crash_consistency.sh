@@ -339,7 +339,11 @@ dmsetup create "$P5DM" --table "0 $SECTORS log-writes $P5DATA $P5LOG"
 ct_track dm "$P5DM"
 ct_mkfs "/dev/mapper/$P5DM" $MKFS_ARGS >/dev/null
 mount -t cetrafs "/dev/mapper/$P5DM" "$MNT"
-: > "$MNT/anchor"
+# A DIRECTORY: its xattr block is rewritten in place through the journal.
+# A regular file's is written new and swapped in, so a tear there lands
+# on a copy nothing references yet -- recovery would have nothing to do,
+# and the negative control below said so.
+mkdir "$MNT/anchor"
 python3 -c "import os;os.setxattr('$MNT/anchor','user.k',b'x'*32)"   # allocate the xattr block ONCE
 python3 -c "import os;d=os.open('$MNT',os.O_RDONLY);os.fsync(d);os.close(d)"; sync
 dmsetup message "$P5DM" 0 mark ready
