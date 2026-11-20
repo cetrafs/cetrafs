@@ -43,6 +43,7 @@
 #include <sys/types.h>
 #include <time.h>
 #include <unistd.h>
+#include <sys/random.h>
 
 #include "cetrafs.h"
 #include "crc32c.h"
@@ -718,8 +719,14 @@ static inline void cetrafs_row_cas_stamp(const unsigned char *old_blk, unsigned 
     /* Atomic: the renewal timer's signal handler swaps too. The writer
      * byte is the tools' range, 0x80..0xBF, which no registered node
      * writes (kmod/fs.c, cetrafs_cas_stamp_next()); 24 bits of count. */
-    if (!__atomic_load_n(&tok, __ATOMIC_RELAXED))
-        __atomic_store_n(&tok, (uint32_t) getpid() * 2654435761u ^ (uint32_t) time(NULL), __ATOMIC_RELAXED);
+    if (!__atomic_load_n(&tok, __ATOMIC_RELAXED)) {
+        uint32_t seed = 0;
+
+        /* Random, not pid and time: two tools on two nodes share both. */
+        if (getrandom(&seed, sizeof(seed), GRND_NONBLOCK) != (ssize_t) sizeof(seed))
+            seed = (uint32_t) getpid() * 2654435761u ^ (uint32_t) time(NULL);
+        __atomic_store_n(&tok, seed | 1u, __ATOMIC_RELAXED);
+    }
     t = __atomic_add_fetch(&tok, 1, __ATOMIC_RELAXED);
     t = ((0x80u | ((t >> 24) & 0x3Fu)) << 24) | (t & 0xFFFFFFu);
     memcpy(&ne, old_blk, sizeof(ne));

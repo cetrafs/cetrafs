@@ -19,6 +19,8 @@
 #   4. fsck finds the stamped volume clean;
 #   5. the stamp's token names its writer: this node's registry row in
 #      its top byte, so no two nodes can write the same one (audit F-75).
+#      Not seen here: the registration's own swaps, which use a reserved
+#      writer range (a node on row 0 could not tell that from row 0).
 #
 # NOT STAGED HERE: the verdicts a stamp gives a timed-out command (a
 # swap of ours on the device, the image compared, a peer's first swap)
@@ -83,8 +85,9 @@ round_row() {
     python3 -I - "$(field hb "$a")" "$(field stamp "$a")" "$(field hb "$b")" "$(field stamp "$b")" "$row" <<'PY'
 import sys
 ha, sa, hb, sb, row = (int(x) for x in sys.argv[1:6])
-print("beats=%d swaps=%d tokchg=%d writer=%d row=%d" % (hb - ha, ((sb & 0xffffffff) - (sa & 0xffffffff)) & 0xffffffff,
-                                                       1 if (sa >> 32) != (sb >> 32) else 0, sb >> 56, row), flush=True)
+print("beats=%d swaps=%d tokchg=%d writer=%d writer0=%d row=%d" % (
+    hb - ha, ((sb & 0xffffffff) - (sa & 0xffffffff)) & 0xffffffff, 1 if (sa >> 32) != (sb >> 32) else 0, sb >> 56,
+    sa >> 56, row), flush=True)
 PY
 }
 
@@ -101,11 +104,14 @@ pass "setup: the heartbeat swapped this node's registry row at least twice"
     fail "1: the row's stamp did not move with the swaps ($R)"
 [ "$(field swaps "$C")" = 0 ] && pass "control: with stamps off, the row's stamp stood still ($C)" ||
     fail "control: the stamp moved anyway -- the assertion cannot fail ($C)"
-[ "$(field writer "$R")" = "$(field row "$R")" ] && pass "5: the stamp's token names this node's row as its writer ($R)" ||
+[ "$(field writer "$R")" = "$(field row "$R")" ] && [ "$(field writer0 "$R")" = "$(field row "$R")" ] &&
+    pass "5: the stamp's token names this node's row as its writer ($R)" ||
     fail "5: the token does not name its writer ($R)"
 T="$(round_row 0 1)"
 log "control (random token): $T"
-[ "$(field writer "$T")" != "$(field row "$T")" ] && pass "control: a random token names no writer ($T)" ||
+# Two samples, either differing: a random byte matches the row 1 in 256.
+{ [ "$(field writer "$T")" != "$(field row "$T")" ] || [ "$(field writer0 "$T")" != "$(field row "$T")" ]; } &&
+    pass "control: a random token names no writer ($T)" ||
     fail "control: the random token named the row anyway -- the assertion cannot fail ($T)"
 
 # <forget 0|1> -> "ops= unstamped= remount= fsck="

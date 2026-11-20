@@ -5097,11 +5097,14 @@ bool cetrafs_sb_lba_run_hits_bg_table(struct super_block *sb, u64 lba, u64 count
  * (audit 2026-11-15 G-6). Low half: prev's plus one -- how many swaps
  * the sector has taken, so a re-read tells "one swap since" from "more".
  * High half: this swap's own token -- the writer in its top 8 bits, a
- * per-mount counter in the low 24 -- so no two nodes ever write the same
- * stamp, and one node repeats one only after 16M swaps of its own: a
- * region never returns to a value it held, and a swap's post-image is
- * its own and nobody else's (audit F-75: a random per-mount token alone
- * let two nodes' ranges overlap). The writer is the registry row, below
+ * per-mount counter, randomly started, in the low 24 -- so no two
+ * registered nodes ever write the same stamp (audit F-75: a random
+ * per-mount token alone let two nodes' ranges overlap). What is left is
+ * probabilistic and said: the same writer byte in two lives of one row
+ * (a dead incarnation's late command against the new one's swap from
+ * the same image), two unregistered mounts, or two tools, match with odds
+ * of 2^-24 per such pair; and one mount's counter wraps after 16M swaps,
+ * far longer than any one swap stays undecided. The writer is the registry row, below
  * CETRAFS_MAX_READER_NODES; a mount not registered yet (its own
  * registration swaps) uses 0xC0..0xFF, random per mount, and the tools'
  * repair claims 0x80..0xBF (userspace/devutil.h): ranges no registered
@@ -5120,7 +5123,10 @@ u64 cetrafs_cas_stamp_next(struct super_block *sb, u64 prev)
     u32 node = 0, lo = (u32) prev + 1, hi;
 
     BUILD_BUG_ON(CETRAFS_MAX_READER_NODES > 0x80);
-    if (cetrafs_sb_get_node_id(sb, &node) || node >= CETRAFS_MAX_READER_NODES)
+    /* Registered, not merely a node_id: that is a kzalloc'd 0 -- row 0's
+     * id -- until registration succeeds, and its own swaps run before. */
+    if (!READ_ONCE(sbi->node_registered) || cetrafs_sb_get_node_id(sb, &node) ||
+        node >= CETRAFS_MAX_READER_NODES)
         node = sbi->cas_unreg_writer;
     hi = (node << 24) | ctr;
     if (unlikely(READ_ONCE(cetrafs_cas_token_random)))

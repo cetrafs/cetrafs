@@ -519,15 +519,6 @@ MODULE_PARM_DESC(held_store_fail, "TEST ONLY: listing a held metadata block fail
 static bool cetrafs_held_store_fallback_dirty;
 cetrafs_test_param(held_store_fallback_dirty, cetrafs_held_store_fallback_dirty, bool, 0644);
 MODULE_PARM_DESC(held_store_fallback_dirty, "TEST ONLY: a held block that cannot be listed is dirtied for writeback, as before audit BC-8");
-/* TEST ONLY: the retry's listing fails too, so the mount stops; and with
- * held_store_fatal_keep the stopped block keeps its held flag and pin, as
- * before F-74 (tests/kernel/held_store_stop.sh). */
-static bool cetrafs_held_store_fail_twice;
-cetrafs_test_param(held_store_fail_twice, cetrafs_held_store_fail_twice, bool, 0644);
-MODULE_PARM_DESC(held_store_fail_twice, "TEST ONLY: the retried listing of a held block fails too (the mount stops)");
-static bool cetrafs_held_store_fatal_keep;
-cetrafs_test_param(held_store_fatal_keep, cetrafs_held_store_fatal_keep, bool, 0644);
-MODULE_PARM_DESC(held_store_fatal_keep, "TEST ONLY: a held block whose listing stopped the mount keeps its flag and pin");
 static atomic64_t cetrafs_held_store_retries = ATOMIC64_INIT(0);
 
 u64 cetrafs_held_store_retry_count(void)
@@ -573,8 +564,7 @@ void cetrafs_bh_end_update_held(struct super_block *sb, struct buffer_head *bh, 
          */
         if (xa_is_err(old)) {
             atomic64_inc(&cetrafs_held_store_retries);
-            old = xchg(&cetrafs_held_store_fail_twice, false) ? (void *) XA_ERROR(-ENOMEM) /* TEST ONLY */
-                                                             : xa_store(xa, bh->b_blocknr, bh, GFP_NOFS);
+            old = xa_store(xa, bh->b_blocknr, bh, GFP_NOFS);
         }
         if (xa_is_err(old)) {
             /* Still no room. Neither dirty (ungated, A-15) nor held and
@@ -585,12 +575,20 @@ void cetrafs_bh_end_update_held(struct super_block *sb, struct buffer_head *bh, 
                              (unsigned long long) bh->b_blocknr, xa_err(old));
             /* And its in-memory state goes with it: no list holds it, so
              * nothing at unmount would drop a held flag or the pin, and a
-             * remount on a device kept open met the flag already set,
-             * never listed the block and never wrote it (audit F-74).
-             * Not uptodate either: the bytes are this mount's update that
-             * never landed, and a remount reads the device's. */
-            if (!READ_ONCE(cetrafs_held_store_fatal_keep)) {
+             * remount on a device kept open met the flag already set and
+             * never listed the block -- written then only by a boundary's
+             * per-group bitmap flush, which finds held buffers itself,
+             * not by the tick's (audit F-74; no rig instrument sees the
+             * difference). Not uptodate either: the bytes are this
+             * mount's update that never landed, and a remount reads the
+             * device's. */
+            /* Only when the mount did stop: under the test-only
+             * error_policy_off it runs on, and the block must stay held
+             * to be written. Dirt too, as every gate-shut path drops it:
+             * writeback ignores uptodate (F-74 review). */
+            if (cetrafs_sb_is_fenced(sb)) {
                 clear_buffer_cetra_held(bh);
+                clear_buffer_dirty(bh);
                 clear_buffer_uptodate(bh);
                 put_bh(bh);
             }
