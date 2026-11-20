@@ -1211,12 +1211,15 @@ struct cetrafs_reclaim_ctx {
     u32 my_incarnation;
     u32 steal_from; /* steal: the claimant judged stale and fenced */
     int mode;
+    bool unchanged; /* out: the swap found nothing to write */
 };
 
 static int cetrafs_reclaim_mutate(void *image, unsigned int len, void *priv)
 {
     struct cetrafs_reclaim_ctx *ctx = priv;
     cetrafs_inode_t rec;
+
+    ctx->unchanged = false; /* per attempt: a retry re-judges */
 
     if (len < CETRAFS_INODE_NS_BYTES)
         return -EINVAL;
@@ -1283,8 +1286,10 @@ static int cetrafs_reclaim_mutate(void *image, unsigned int len, void *priv)
         if (cetrafs_le32(rec.nlink) != 0 || cetrafs_le32(rec.ns_lock_owner) != ctx->me ||
             cetrafs_le64(rec.dirent_seq) != ctx->seq)
             return -ESTALE;
-        if (cetrafs_le32(rec.ns_lock_incarnation) == ctx->my_incarnation)
+        if (cetrafs_le32(rec.ns_lock_incarnation) == ctx->my_incarnation) {
+            ctx->unchanged = true;
             return 1; /* already this incarnation's: nothing to write */
+        }
         rec.ns_lock_incarnation = cetrafs_cpu_to_le32(ctx->my_incarnation);
         break;
     case CETRAFS_RECLAIM_RELEASE:
@@ -1339,7 +1344,10 @@ int cetrafs_inode_reclaim_claim_at(struct super_block *sb, u64 ino, u64 generati
         return ret;
     ret = cetrafs_cas_record(sb, lba, cetrafs_reclaim_mutate, &ctx);
     if (ret == 0) {
-        cetrafs_record_write_counted();
+        /* Only a swap that wrote: an evict's own claim is already this
+         * incarnation's, and its ADOPT writes nothing. */
+        if (!ctx.unchanged)
+            cetrafs_record_write_counted();
         if (seq)
             *seq = ctx.seq;
     }
