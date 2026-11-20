@@ -373,6 +373,11 @@ struct cetrafs_sb_info {
      * (audit O9). */
     atomic64_t free_inodes;
     unsigned long free_inodes_next; /* jiffies: the next recount is due at or after this */
+    /* statfs's forced-fresh read of the Zone Group table: at most one
+     * statfs_fresh_ms (a second), one caller at a time (audit
+     * M-32); cetrafs_sb_statfs_fill_begin(). */
+    struct mutex statfs_fill_mutex;
+    unsigned long statfs_fresh_until; /* jiffies; 0 = never filled */
 
     /* This node's own Node Registry row index, found/claimed by
      * cetrafs_node_register() at mount time. Needed by
@@ -3423,6 +3428,7 @@ int cetrafs_fill_super(struct super_block *sb, struct fs_context *fc)
         mutex_init(&sbi->nsrel_mutex);
         mutex_init(&sbi->frees_mutex);
         mutex_init(&sbi->witness_mutex);
+        mutex_init(&sbi->statfs_fill_mutex);
         INIT_LIST_HEAD(&sbi->resv_list);
 
         spin_lock_init(&sbi->peer_lock);
@@ -5219,6 +5225,60 @@ int cetrafs_sb_get_free_inodes(struct super_block *sb, u64 *out)
     }
     *out = (u64) atomic64_read(&sbi->free_inodes);
     return 0;
+}
+
+/* TEST ONLY: the window, in ms. 0 reads the table fresh on every call,
+ * as before audit M-32 (the control of tests/kernel/statfs_fresh_once.sh);
+ * a long one lets that suite see which reads came from the cache. */
+static unsigned int cetrafs_statfs_fresh_ms = 1000;
+cetrafs_test_param(statfs_fresh_ms, cetrafs_statfs_fresh_ms, uint, 0644);
+MODULE_PARM_DESC(statfs_fresh_ms, "TEST ONLY: statfs reads the Zone Group table fresh at most once per this many ms");
+
+static bool cetrafs_statfs_due(struct cetrafs_sb_info *sbi)
+{
+    unsigned long until = READ_ONCE(sbi->statfs_fresh_until);
+
+    return !READ_ONCE(cetrafs_statfs_fresh_ms) || !until || time_after_eq(jiffies, until);
+}
+
+/*
+ * statfs reads the Zone Group table forced-fresh, as one batch -- for any
+ * user, as often as asked, on a LUN every node shares (audit M-32). The
+ * fresh read is now made at most once a second; in between, each record
+ * comes from the buffer cache it filled. That is current for this
+ * node's own records' free count (only this node writes it, through
+ * cetrafs_cas_record(), which installs what it wrote: shown by
+ * tests/kernel/statfs_fresh_once.sh, the cached figure equal to the
+ * fresh one after this node's own write), and at most a second old for
+ * anything a peer writes. statfs reports; nothing
+ * decides on it (it has no caller in the module), so a second-old peer
+ * figure costs a second-old df and nothing else.
+ *
+ * true: a fresh read is due, and the caller holds the fill: it reads and
+ * then calls cetrafs_sb_statfs_fill_end(). Callers that arrive during a
+ * fill wait for it and then read what it fetched.
+ */
+bool cetrafs_sb_statfs_fill_begin(struct super_block *sb)
+{
+    struct cetrafs_sb_info *sbi = sb->s_fs_info;
+
+    if (!sbi || !cetrafs_statfs_due(sbi))
+        return false;
+    mutex_lock(&sbi->statfs_fill_mutex);
+    if (cetrafs_statfs_due(sbi))
+        return true;
+    mutex_unlock(&sbi->statfs_fill_mutex); /* another caller just filled it */
+    return false;
+}
+
+/* 'ok': the fresh read landed; a failed one is due again next call. */
+void cetrafs_sb_statfs_fill_end(struct super_block *sb, bool ok)
+{
+    struct cetrafs_sb_info *sbi = sb->s_fs_info;
+
+    if (ok)
+        WRITE_ONCE(sbi->statfs_fresh_until, (jiffies + msecs_to_jiffies(READ_ONCE(cetrafs_statfs_fresh_ms))) ?: 1);
+    mutex_unlock(&sbi->statfs_fill_mutex);
 }
 
 /* Has this mount registered its own Node Registry row? A fence taken

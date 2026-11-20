@@ -7,8 +7,9 @@
 # statfs every ~10 s (audit 2026-11-14 P13). The table is now read as
 # one batch and each record parsed from it.
 #
-# A volume of 16 Zone Groups; 20 statfs calls; the loop device's
-# completed read requests are counted, and df must still agree.
+# A volume of 16 Zone Groups; 20 statfs calls, each reading fresh
+# (statfs_fresh_ms=0); the loop device's completed read requests are
+# counted, and df must still agree.
 #
 # DISCRIMINATION: zg_prefetch_off reads each record on its own, as
 # before: at least 16 requests per call.
@@ -23,6 +24,11 @@ MNT="$(ct_mnt szb)"
 ct_track mnt "$MNT"
 ct_mkfs "$DEV" -z 16 -b 512 -J 0 -N 1024 -f >/dev/null
 ct_param_set zg_prefetch_off 0
+# The cost of one fresh read per call: no window between them (the
+# window itself is tests/kernel/statfs_fresh_once.sh).
+if [ -w /sys/module/cetrafs/parameters/statfs_fresh_ms ]; then
+    ct_param_set statfs_fresh_ms 0
+fi
 ct_mount "$DEV" "$MNT"
 dd if=/dev/zero of="$MNT/f" bs=1M count=8 conv=fsync status=none
 reads() { awk '{print $1}' "/sys/block/$(basename "$DEV")/stat"; }

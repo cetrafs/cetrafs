@@ -57,8 +57,9 @@ progresses ("the 32 GiB copy gets slower as it goes"). A 64 MiB write does
 
 ## 3. Whole-volume descriptor sweeps must not invalidate BGs this node owns
 
-`cetrafs_statfs()` and procfs `info` force every BG descriptor fresh so a
-node sees a *peer's* writes. Both go through
+procfs `info` forces every BG descriptor fresh so a node sees a *peer's*
+writes (`cetrafs_statfs()` did too, before it read the Zone Group records
+instead -- see 21). It goes through
 `cetrafs_bg_desc_refresh_foreign()` (alloc.c), which skips a BG in a ZG
 this node owns: this node is its only writer, and
 `cetrafs_bg_data_block_stats()` already folds in the accrued-but-unapplied
@@ -652,6 +653,27 @@ peer's next beat.
 under 800 ms with a live peer's settled journal; control
 `open_journal_peek_off`), procfs `open_peer_settled` /
 `open_peer_waits`.
+
+## 21. statfs reads the Zone Group table fresh at most once a second
+
+`cetrafs_statfs()` reads the free counts from the Zone Group records,
+forced fresh so a peer's allocations show, as one batched read of the
+table (`cetrafs_zg_prefetch_all()`). That read is made at most once per
+`statfs_fresh_ms` (1 s), one caller at a time
+(`cetrafs_sb_statfs_fill_begin()`); in between, every record comes from
+the buffer cache it filled. This node's own records are current there
+(its CAS installs what it wrote), and a peer's are at most a second old.
+
+**Cost of removing it:** statfs is callable by any user, as often as
+they like. Per call, one fresh read of the table on the LUN every node
+shares: a `df` loop in a container was read load on every node's
+storage (audit M-32). Measured on a loop device, 3 s of an unprivileged
+statfs loop: about 294,000 calls cost 5 read requests with the window,
+one request per call without it.
+
+**Guarded by:** `tests/kernel/statfs_fresh_once.sh` (control:
+`statfs_fresh_ms=0`); the cost of one fresh read by
+`tests/kernel/statfs_zg_batched.sh`.
 
 ## Measured baseline
 

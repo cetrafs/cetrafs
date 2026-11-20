@@ -257,6 +257,8 @@ static inline bool cetrafs_lba_run_is_data(struct super_block *sb, u64 lba, u64 
 }
 int cetrafs_sb_adjust_free_inodes(struct super_block *sb, s64 delta);
 int cetrafs_sb_get_free_inodes(struct super_block *sb, u64 *out);
+bool cetrafs_sb_statfs_fill_begin(struct super_block *sb);
+void cetrafs_sb_statfs_fill_end(struct super_block *sb, bool ok);
 int cetrafs_sb_get_node_id(struct super_block *sb, u32 *out);
 bool cetrafs_sb_node_registered(struct super_block *sb);
 /*

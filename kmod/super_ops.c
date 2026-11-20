@@ -345,11 +345,19 @@ static int cetrafs_statfs(struct dentry *dentry, struct kstatfs *stat)
      * it, as the per-record loop takes it before its read: a flight
      * ending between the read and a later sample would read as settled
      * with the delta in neither place (class 52). */
+    /* And the batch at most once a second, whoever asks: in between,
+     * each record is read from the cache the last batch filled
+     * (cetrafs_sb_statfs_fill_begin(), audit M-32). */
     gens = kmalloc_array(zg_count, sizeof(*gens), GFP_NOFS);
     if (gens) {
         for (zg_id = 0; zg_id < zg_count; zg_id++)
             gens[zg_id] = cetrafs_sb_zg_flight_gen(sb, zg_id);
-        prefetched = cetrafs_zg_prefetch_all(sb);
+        if (cetrafs_sb_statfs_fill_begin(sb)) {
+            prefetched = cetrafs_zg_prefetch_all(sb);
+            cetrafs_sb_statfs_fill_end(sb, prefetched);
+        } else {
+            prefetched = true; /* the cache a batch filled under a second ago */
+        }
     } else {
         prefetched = false;
     }
