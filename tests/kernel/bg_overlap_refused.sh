@@ -14,6 +14,12 @@
 # 1, its checksum restamped. The mount must refuse it; the same image
 # with the length restored must mount (the edit is the only difference).
 #
+# The stretched length no longer matches the layout its bitmap and data
+# offsets were computed from, which the per-descriptor check refuses on
+# its own (audit 2026-11-15 BL-33) -- before the ordering check is ever
+# reached. bg_layout_any=1 turns only that exact-layout comparison off,
+# so the ordering check is the sole path to the refusal.
+#
 # DISCRIMINATION: without the ordering check the stretched image mounts.
 # NOT COVERED: the companion check that two descriptor table segments do
 # not overlap each other. A chain whose segments overlap and still
@@ -24,6 +30,7 @@ set -euo pipefail
 require_root
 require_module
 BG_POKE="$(ct_helper bg_poke)"
+[ -w /sys/module/cetrafs/parameters/bg_layout_any ] || { skip "bg_layout_any is missing"; ct_exit; }
 
 IMG="$(ct_image 1200 bgovl)"
 DEV="$(ct_loop "$IMG")"
@@ -36,6 +43,7 @@ S0="$(geom 0 start_block)" L0="$(geom 0 length_blocks)" S1="$(geom 1 start_block
     { fail "setup: two ordered Block Groups were not made (BG0 $S0+$L0, BG1 $S1)"; ct_exit; }
 
 "$BG_POKE" "$IMG" 0 --geom=length_blocks $((S1 - S0 + 16)) >/dev/null
+ct_param_set bg_layout_any 1
 MARK="$(dmesg_mark)"
 if mount -t cetrafs "$DEV" "$MNT" 2>/dev/null; then
     fail "a Block Group running 16 blocks into the next one mounted"
@@ -46,6 +54,7 @@ else
         fail "the mount was refused, but not for the overlap: $(dmesg_since "$MARK" | grep -i cetrafs | tail -2)"
 fi
 
+ct_param_set bg_layout_any 0
 "$BG_POKE" "$IMG" 0 --geom=length_blocks "$L0" >/dev/null
 ct_mount "$DEV" "$MNT" && pass "control: the same image with the length restored mounts" ||
     fail "control: the restored image does not mount -- the refusal above proves nothing"
