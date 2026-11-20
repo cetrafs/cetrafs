@@ -31,8 +31,12 @@
 #      read back, without a remount;
 #   4. fsck: no ERR;
 #   5. the same through fio, libaio and io_uring (qemu's async paths);
-#   6. 32 writes failing at once, the probe as slow as on a SAN
-#      (space_probe_stall_ms): all 32 ENOSPC (F-58);
+#   6. 32 writes failing at once (a file each), the probe as slow as on
+#      a SAN (space_probe_stall_ms): none fails EIO -- ENOSPC, or taken
+#      once the probe has handed its chunks back (F-58);
+#   6b. the probe ending between a failure's read of the verdict and of
+#      the probe count (space_probe_seen_gap_ms): still that probe's
+#      answer -- one probe, none EIO;
 #   7. the same while a FITRIM holds the trim mutex, stalled inside a run
 #      (trim_discard_stall_ms): all ENOSPC (F-58);
 #   8. the probe's discards committed at once (space_probe_flush, as a
@@ -42,13 +46,14 @@
 # DISCRIMINATION: dio_nospc_probe_off=1: 1 fails, EIO.
 # space_probe_at_head=1 (5dc0717's placement): 1 fails on the used
 # volume, EIO. space_probe_unshared=1 (8e0f890's trylocks): 6 and 7 see
-# EIO. space_probe_owed_off=1: 8 fails, EIO.
+# EIO. space_probe_owed_off=1: 8 fails, EIO. space_probe_seen_late=1
+# (the verdict read before the probe count): 6b sees a second probe.
 # ct-timeout: 900
 set -euo pipefail
 . "$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)/lib/harness.sh"
 require_root
 require_module
-KNOBS="dio_nospc_probe_off space_probe_at_head space_probe_unshared space_probe_owed_off space_probe_flush space_probe_stall_ms trim_discard_stall_ms"
+KNOBS="dio_nospc_probe_off space_probe_at_head space_probe_unshared space_probe_owed_off space_probe_flush space_probe_stall_ms space_probe_seen_late space_probe_seen_gap_ms trim_discard_stall_ms"
 for k in $KNOBS; do
     [ -w "/sys/module/cetrafs/parameters/$k" ] || { skip "$k is missing"; ct_exit; }
 done
@@ -62,7 +67,7 @@ for k in $KNOBS; do ct_param_set "$k" 0; done
 ct_param_set scrub 0
 
 # <knobs k=v,...|-> <writer one|many|libaio|io_uring> <used 0|1> <fitrim 0|1> <tag>
-#   -> "err=<ENOSPC|EIO|none|MIXED-<enospc>-<other>> probes=<n> found=<n> discards=<n>
+#   -> "err=<ENOSPC|EIO|none|MIXED-<enospc>-<other>-eio<n>> probes=<n> found=<n> discards=<n>
 #       live=<ok|damaged> stopped=<yes|no> after=<ok|errno> fsck=<clean|ERR>"
 round() {
     local knobs=$1 writer=$2 used=$3 fitrim=$4 tag=$5
@@ -87,6 +92,18 @@ round() {
     proc="/proc/fs/cetrafs/$(basename "$(readlink -f "$dev")")"
     dd if=/dev/urandom of="$MNT/live" bs=1M count=4 oflag=direct status=none
     fallocate -l 8M "$MNT/f"
+    # "many": a file each, so the 32 writes run at once. Into one file
+    # they would not: a write into unwritten blocks takes the exclusive
+    # inode lock, and its completion -- the probe -- runs under it, so
+    # the 32 failed one after another and no failure ever met a probe
+    # running (neither 6 nor its control saw the race F-58 is about).
+    if [ "$writer" = many ]; then
+        local i
+        # 128 KiB contiguous holds one whole 64 KiB pool chunk, and the
+        # block at 64 KiB lies in one that is wholly the file's: never
+        # provisioned, whatever the extent's alignment.
+        for i in $(seq 0 31); do fallocate -l 128K "$MNT/m$i"; done
+    fi
     if [ "$used" = 1 ]; then
         # an image deleted without a discard: provisioned, and free
         dd if=/dev/urandom of="$MNT/gone" bs=1M count=40 oflag=direct status=none
@@ -140,10 +157,10 @@ res = [None] * N
 def w(i):
     buf = mmap.mmap(-1, 4096)
     buf.write(b"m" * 4096)
-    fd = os.open(sys.argv[1], os.O_RDWR | os.O_DIRECT)
+    fd = os.open(os.path.join(os.path.dirname(sys.argv[1]), "m%d" % i), os.O_RDWR | os.O_DIRECT)
     go.wait()
     try:
-        os.pwrite(fd, buf, (64 + i) * 16 * 4096)   # 32 chunks, none written before
+        os.pwrite(fd, buf, 16 * 4096)   # its own file, never written: an unprovisioned chunk
         res[i] = "ok"
     except OSError as e:
         res[i] = errno.errorcode.get(e.errno, str(e.errno))
@@ -159,7 +176,7 @@ elif res.count("EIO") == N:
 elif res.count("ok") == N:
     print("none")
 else:
-    print("MIXED-%d-%d" % (nos, N - nos))
+    print("MIXED-%d-%d-eio%d" % (nos, N - nos, res.count("EIO")))
 PY
 )" || true
         ;;
@@ -274,15 +291,46 @@ fi
 # failures meet it running -- in the round and in its control alike.
 M="$(round space_probe_stall_ms=500 many 1 0 mn)"
 log "6: 32 at once: $M"
-[ "$(get err "$M")" = ENOSPC ] && pass "6: 32 writes failing at once all failed ENOSPC ($(get probes "$M") probe writes)" ||
-    fail "6: 32 writes failing at once: $(get err "$M") ($M)"
+# A write issued after the probe gave its chunks back is taken: space
+# was there. EIO is the one wrong answer.
+case "$(get err "$M")" in
+ENOSPC | MIXED-[1-9]*-eio0) pass "6: 32 writes failing at once: none failed EIO ($(get err "$M"), $(get probes "$M") probe writes)" ;;
+*) fail "6: 32 writes failing at once: $(get err "$M") ($M)" ;;
+esac
 sound 6 "$M"
 MC="$(round space_probe_stall_ms=500,space_probe_unshared=1 many 1 0 mnc)"
 log "6 control (8e0f890's trylocks): $MC"
 # the probe ran (some ENOSPC) and the others found it busy (some EIO)
 case "$(get err "$MC")" in
-MIXED-[1-9]*-[1-9]*) pass "6 control: with the probe unshared, one probe answered and the rest got EIO ($(get err "$MC")) -- F-58 reproduced" ;;
+EIO | MIXED-*-eio[1-9]*) pass "6 control: with the probe unshared, failures that met the probe running got EIO ($(get err "$MC")) -- F-58 reproduced" ;;
 *) fail "6 control: unshared, the 32 got $(get err "$MC") ($MC) -- not one probe and the rest EIO" ;;
+esac
+
+# 6b. a failure that read the verdict before the probe published it and
+# its count after: it must still take that probe's answer, not run a
+# probe of its own into the chunks the first one just gave back -- a
+# second probe that, when they are enough, finds space and answers EIO
+# (here F-59's margin keeps it right, so what shows is the second probe
+# itself). space_probe_seen_gap_ms holds every failure that meets the
+# probe running between its two reads, past the probe's end.
+G="$(round space_probe_stall_ms=300,space_probe_seen_gap_ms=600 many 1 0 gp)"
+log "6b: the probe ends between a failure's two reads: $G"
+case "$(get err "$G")" in
+ENOSPC | MIXED-[1-9]*-eio0)
+    [ "$(get probes "$G")" = "$(get probes "$M")" ] &&
+        pass "6b: a probe ending between a failure's two reads answers it: one probe ($(get probes "$G") writes, as 6), none EIO" ||
+        fail "6b: a probe ending between a failure's two reads: a second probe ran ($(get probes "$G") writes, 6 took $(get probes "$M"))" ;;
+*) fail "6b: a probe ending between a failure's two reads: $(get err "$G") ($G)" ;;
+esac
+sound 6b "$G"
+GC="$(round space_probe_stall_ms=300,space_probe_seen_gap_ms=600,space_probe_seen_late=1 many 1 0 gpc)"
+log "6b control (the verdict read first): $GC"
+case "$(get err "$GC")" in
+EIO | MIXED-*-eio[1-9]*) pass "6b control: the verdict read before the count: failures probed again and got EIO ($(get err "$GC"))" ;;
+*)
+    [ "$(get probes "$GC")" -gt "$(get probes "$M")" ] &&
+        pass "6b control: the verdict read before the count: a second probe ran ($(get probes "$GC") writes, 6 took $(get probes "$M"))" ||
+        fail "6b control: the verdict read first: one probe only ($GC) -- the order is not what decides" ;;
 esac
 
 # 7. under a FITRIM (a volume with no provisioned free space: the FITRIM

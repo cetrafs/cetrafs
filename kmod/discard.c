@@ -342,6 +342,15 @@ cetrafs_test_param(space_probe_stall_ms, cetrafs_space_probe_stall_ms, uint, 064
 MODULE_PARM_DESC(space_probe_stall_ms,
                  "TEST ONLY: a space probe takes this much longer, as on a slow SAN, so failures meet it running (F-58)");
 
+static bool cetrafs_space_probe_seen_late; /* TEST ONLY: see the parameter */
+cetrafs_test_param(space_probe_seen_late, cetrafs_space_probe_seen_late, bool, 0644);
+MODULE_PARM_DESC(space_probe_seen_late,
+                 "TEST ONLY: a failing write reads the shared verdict before the probe count, as before");
+static unsigned int cetrafs_space_probe_seen_gap_ms; /* TEST ONLY: see the parameter */
+cetrafs_test_param(space_probe_seen_gap_ms, cetrafs_space_probe_seen_gap_ms, uint, 0644);
+MODULE_PARM_DESC(space_probe_seen_gap_ms,
+                 "TEST ONLY: a failing write that finds a probe running waits this long between reading the verdict and the probe count");
+
 static int cetrafs_space_probe_write(struct super_block *sb, u64 lba)
 {
     struct page *page = alloc_page(GFP_NOFS);
@@ -465,11 +474,34 @@ int cetrafs_discard_space_probe(struct super_block *sb, unsigned int *tries)
     *tries = 0;
     if (!cetrafs_sb_raw(sb) || cetrafs_sb_is_fenced(sb))
         return 0;
-    /* A refusal found under a second ago answers every write failing now. */
-    at = READ_ONCE(ps->at);
-    if (READ_ONCE(ps->verdict) == -ENOSPC && time_before(jiffies, at + HZ) && !unshared)
-        return -ENOSPC;
-    seen = READ_ONCE(ps->done);
+    /*
+     * Which probe this failure has seen, sampled BEFORE the verdict: a
+     * probe that ends between the two is then either the verdict read
+     * below or a done count that moved by the time the mutex is ours.
+     * Sampled after (as it was), a failure could read the verdict just
+     * before a probe published it and the count just after, take
+     * neither, and run its own probe into the chunks the finished one
+     * had just given back -- "space", so the write failed EIO while 30
+     * others failed ENOSPC (dio_thin_nospc 6).
+     */
+    if (unlikely(READ_ONCE(cetrafs_space_probe_seen_late))) {
+        /* TEST ONLY: the old order, verdict first (see the parameter). */
+        at = READ_ONCE(ps->at);
+        if (READ_ONCE(ps->verdict) == -ENOSPC && time_before(jiffies, at + HZ) && !unshared)
+            return -ENOSPC;
+        if (READ_ONCE(cetrafs_space_probe_seen_gap_ms) && mutex_is_locked(&ps->mutex))
+            msleep(READ_ONCE(cetrafs_space_probe_seen_gap_ms));
+        seen = READ_ONCE(ps->done);
+    } else {
+        seen = READ_ONCE(ps->done);
+        smp_rmb(); /* pairs with the smp_wmb() before done moves */
+        if (READ_ONCE(cetrafs_space_probe_seen_gap_ms) && mutex_is_locked(&ps->mutex))
+            msleep(READ_ONCE(cetrafs_space_probe_seen_gap_ms)); /* test-only; see the parameter */
+        /* A refusal found under a second ago answers every write failing now. */
+        at = READ_ONCE(ps->at);
+        if (READ_ONCE(ps->verdict) == -ENOSPC && time_before(jiffies, at + HZ) && !unshared)
+            return -ENOSPC;
+    }
     if (unshared) {
         if (!mutex_trylock(&ps->mutex))
             return 0; /* test-only: 8e0f890's answer to a probe already running */
@@ -498,6 +530,7 @@ int cetrafs_discard_space_probe(struct super_block *sb, unsigned int *tries)
     mutex_unlock(cetrafs_sb_trim_mutex(sb));
     WRITE_ONCE(ps->verdict, ret);
     WRITE_ONCE(ps->at, jiffies);
+    smp_wmb(); /* the verdict before the count a waiter compares */
     WRITE_ONCE(ps->done, ps->done + 1);
     mutex_unlock(&ps->mutex);
     return ret;
