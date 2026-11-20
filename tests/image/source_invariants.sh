@@ -3328,4 +3328,49 @@ CU_N="$(compat_unseen "$CU_P/h" "$CU_P/s.c" | tr '\n' ' ')"
     fail "COMPAT: control -- planted tree gave: $CU_N"
 rm -rf "$CU_P"
 
+
+# M-37: DKMS builds only for the kernels the sources are written against.
+# Both DKMS files (the hand install's and the package's) must carry the
+# same range, and its top must reach the newest kernel the sources
+# carry an adaptation for (a KERNEL_VERSION() test) -- a new adaptation
+# with the range left behind would keep DKMS from ever building for it.
+dkms_range_bad() { # <dkms.conf> <debian dkms> <kmod dir>
+    python3 - "$1" "$2" "$3" <<'PY'
+import glob, os, re, sys
+def rng(path):
+    s = open(path).read()
+    lo = re.search(r'^BUILD_EXCLUSIVE_KERNEL_MIN="([0-9.]+)"', s, re.M)
+    hi = re.search(r'^BUILD_EXCLUSIVE_KERNEL_MAX="([0-9.]+)"', s, re.M)
+    return (lo.group(1) if lo else None, hi.group(1) if hi else None)
+a, b = rng(sys.argv[1]), rng(sys.argv[2])
+if None in a or None in b:
+    print("missing range"); sys.exit()
+if a != b:
+    print("ranges differ: %s vs %s" % (a, b)); sys.exit()
+newest = (0, 0)
+for f in glob.glob(os.path.join(sys.argv[3], "*.[ch]")):
+    for x, y in re.findall(r'KERNEL_VERSION\(\s*(\d+)\s*,\s*(\d+)', open(f).read()):
+        newest = max(newest, (int(x), int(y)))
+top = tuple(int(v) for v in a[1].split(".")[:2])
+if top < newest:
+    print("MAX %s below the newest adaptation %d.%d" % (a[1], newest[0], newest[1]))
+PY
+}
+DR="$(dkms_range_bad "$ROOT/dkms.conf" "$ROOT/debian/cetrafs-dkms.dkms" "$ROOT/kmod")"
+[ -z "$DR" ] && pass "M-37: both DKMS files carry one kernel range, reaching the newest adaptation" ||
+    fail "M-37: DKMS kernel range: $DR"
+DR_P="$(mktemp -d)"
+mkdir "$DR_P/k"
+printf 'BUILD_EXCLUSIVE_KERNEL_MIN="7.0"\nBUILD_EXCLUSIVE_KERNEL_MAX="7.2.999"\n' >"$DR_P/a"
+printf 'BUILD_EXCLUSIVE_KERNEL_MIN="7.0"\nBUILD_EXCLUSIVE_KERNEL_MAX="7.1.999"\n' >"$DR_P/b"
+printf '#if LINUX_VERSION_CODE >= KERNEL_VERSION(7, 3, 0)\n#endif\n' >"$DR_P/k/x.c"
+DR_1="$(dkms_range_bad "$DR_P/a" "$DR_P/b" "$DR_P/k")"
+DR_2="$(dkms_range_bad "$DR_P/a" "$DR_P/a" "$DR_P/k")"
+case "$DR_1|$DR_2" in
+"ranges differ"*"|MAX 7.2.999 below the newest adaptation 7.3")
+    pass "M-37: control -- differing ranges and a range short of an adaptation are both found" ;;
+*) fail "M-37: control -- planted files gave: $DR_1 | $DR_2" ;;
+esac
+rm -rf "$DR_P"
+
 ct_exit

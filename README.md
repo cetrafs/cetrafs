@@ -234,6 +234,16 @@ sudo dkms build   -m cetrafs -v 0.9.5
 sudo dkms install -m cetrafs -v 0.9.5
 ```
 
+#### Kernel upgrades
+
+DKMS builds cetrafs only for kernels 7.0 to 7.2: the oldest it builds
+against and the newest its sources were adapted to (`BUILD_EXCLUSIVE_KERNEL_MIN`
+/ `_MAX` in `dkms.conf`). It skips any other kernel rather than building
+against an API nobody checked, and a node that boots that kernel has no
+cetrafs. So keep the running kernel pinned (on Proxmox,
+`proxmox-boot-tool kernel pin <version>`) and move the pin only after
+`dkms status` lists cetrafs as installed for the new kernel.
+
 Make a distributable source tarball with `dkms mktarball -m cetrafs -v 0.9.5
 --source-only` (install it elsewhere with `dkms ldtarball` + `dkms
 install`). Keep the version in step with `debian/changelog`.

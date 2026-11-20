@@ -39,5 +39,16 @@ DEST_MODULE_LOCATION[0]="/kernel/fs/cetrafs"
 MAKE[0]="make -C kmod KDIR=/lib/modules/${kernelver}/build CETRAFS_NO_WERROR=1 CETRAFS_RELEASE=1 mod"
 CLEAN="make -C kmod KDIR=/lib/modules/${kernelver}/build clean"
 
+# The kernels these sources are written against (audit 2026-11-15 M-37):
+# 7.0 is the oldest that builds (set_default_d_op()), 7.2 the newest the
+# sources carry an adaptation for. DKMS skips any other kernel instead of
+# building against an API nobody checked -- so a kernel upgrade outside
+# this range leaves that kernel WITHOUT cetrafs. Keep the running kernel
+# pinned until `dkms status` shows cetrafs installed for the new one
+# (README, "Kernel upgrades"). Both DKMS files carry the same range
+# (tests/image/source_invariants.sh).
+BUILD_EXCLUSIVE_KERNEL_MIN="7.0"
+BUILD_EXCLUSIVE_KERNEL_MAX="7.2.999"
+
 # Rebuild automatically whenever a new kernel is installed.
 AUTOINSTALL="yes"
