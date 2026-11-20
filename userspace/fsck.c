@@ -271,6 +271,18 @@ static int fsck_leak_ungated(void)
     return v;
 }
 
+/* TEST ONLY: print the rebuild summary's pre-fix wording, which claimed a
+ * name had reached /lost+found in a run that had deferred every link
+ * (audit 2026-11-15 M-47; tests/image/fsck_partial_orphan_defer.sh). */
+static int fsck_old_partial_msg(void)
+{
+    static int v = -1;
+
+    if (v < 0)
+        v = cetrafs_test_env("CETRAFS_TEST_FSCK_OLD_PARTIAL_MSG") != NULL;
+    return v;
+}
+
 static void fsck_repair_lost_check(void)
 {
     if (cetrafs_repair_write_gate() == 3) {
@@ -894,12 +906,16 @@ static void note_bad_dirent_block(uint64_t ino, uint64_t phys, bool first_block)
  *
  * The answer is derivable, which is why this is a repair and not a
  * report. The block's entries are already gone -- that is what "no
- * magic" means -- and every inode they named has by now been found
- * unreachable and linked into /lost+found, so nothing is lost by
- * rewriting the block as a VALID EMPTY one. For the directory's first
- * block the two structural entries are equally derivable: '.' is the
- * directory itself and '..' is whichever directory names it, which the
- * namespace pass has already established.
+ * magic" means -- and every inode they named is found unreachable and
+ * linked into /lost+found, so nothing is lost by rewriting the block as a
+ * VALID EMPTY one. That link is made only by a run that reads every
+ * block: a run that could not (tally_partial) defers it to the next run.
+ * The rebuild itself is not deferred: until it is done the directory is
+ * unreadable, so no later run could read the block to judge its orphans,
+ * and deferring it would never converge. For the directory's first block
+ * the two structural entries are equally derivable: '.' is the directory
+ * itself and '..' is whichever directory names it, which the namespace
+ * pass has already established.
  *
  * What this does NOT do is invent entries for files whose names were in
  * the lost block; their inodes keep their data and reach the operator
@@ -5084,6 +5100,7 @@ int main(int argc, char **argv)
         int ibmap_dirty = 0;
         uint64_t orphans_freed = 0;
         uint64_t orphans_linked = 0;
+        uint64_t orphans_deferred = 0; /* unnamed, left alone: a directory block was unread */
         struct fsck_lf lf = {0, cetrafs_le64(sb.root_ino), 0, 0};
         uint64_t problems = 0, inodes_seen = 0, extents_seen = 0, blocks_referenced = 0;
 
@@ -6425,6 +6442,7 @@ int main(int argc, char **argv)
                             "WARN: inode %" PRIu64 " left as it is: a directory block could not be read, so "
                             "its name may be in it -- run fsck again after it\n",
                             ino);
+                    orphans_deferred++;
                 } else if (nlinks[ino] != 0 && empty[ino] && repair_mode && !repair_blocked) {
                     /* Nothing to recover, so free it rather than give it
                      * a /lost+found name. nlink first: the kernel's
@@ -6783,8 +6801,17 @@ int main(int argc, char **argv)
                        bad_dirent_blocks[i].phys, ino,
                        bad_dirent_blocks[i].first_block ? " (with '.' and '..')" : "");
             }
-            printf("  the rebuilt blocks are readable again and EMPTY: a file they named that has no other "
-                   "name reached /lost+found by inode number; one named elsewhere too keeps that name only\n");
+            /* Not "reached /lost+found": the orphan pass above ran with a
+             * directory block unread, so it linked nothing (tally_partial
+             * defers every link). A file whose only name was in a rebuilt
+             * block is linked by the next run that reads every block. */
+            if (fsck_old_partial_msg())
+                printf("  the rebuilt blocks are readable again and EMPTY: a file they named that has no other "
+                       "name reached /lost+found by inode number; one named elsewhere too keeps that name only\n");
+            else
+                printf("  the rebuilt blocks are readable again and EMPTY: the names they held are gone. A file "
+                       "whose only name was in one is not in /lost+found in this run -- its link is deferred to "
+                       "the next run, once every directory block reads; one named elsewhere too keeps that name\n");
         }
         free(bad_dirent_blocks);
         bad_dirent_blocks = NULL;
@@ -6903,6 +6930,10 @@ int main(int argc, char **argv)
             fsck_ibmap_store(fd, ibmap);
         if (orphans_linked)
             printf("  linked %" PRIu64 " orphaned inode(s) into /lost+found\n", orphans_linked);
+        if (orphans_deferred)
+            printf("  left %" PRIu64 " unnamed inode(s) alone: a directory block could not be read, so their names "
+                   "may be in it -- nothing was linked into or freed for them in this run; run fsck -r again "
+                   "once every directory block reads\n", orphans_deferred);
         if (orphans_freed || orphans_linked)
             printf("  run fsck -r again to settle the free-space counters%s\n",
                    orphans_freed ? " and free the reclaimed blocks" : "");
