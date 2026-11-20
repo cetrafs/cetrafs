@@ -51,8 +51,11 @@ for _ in range(5):
     time.sleep(0.013)
     with open(os.path.join(m, "f"), "r+b") as fh:
         fh.write(b"y")
+        fh.flush()
+        # Sampled before the publish: with whole seconds stored, the
+        # publish hands the truncated value back to the in-core inode.
+        mt = os.stat(os.path.join(m, "f")).st_mtime_ns
         os.fsync(fh.fileno())
-    mt = os.stat(os.path.join(m, "f")).st_mtime_ns
     if mt % 1000000000:
         break
 os.utime(os.path.join(m, "g"), ns=(1700000000123456789, 1700000000987654321))
