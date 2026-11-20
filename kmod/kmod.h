@@ -1988,6 +1988,8 @@ u32 cetrafs_deferred_disk_crc(struct super_block *sb, struct buffer_head *bh, u3
 void cetrafs_deferred_forget_range(struct super_block *sb, u64 lba, u32 count);
 bool cetrafs_deferred_any_in_range(struct super_block *sb, u64 lba, u32 count);
 u64 cetrafs_deferred_record_seq(struct super_block *sb, const struct cetrafs_journal_owner *o);
+void cetrafs_dirent_load_begin(void); /* dir.c: a dirent block install begins (BL-51) */
+void cetrafs_dirent_load_end(void);   /* ...and is done */
 void cetrafs_deferred_module_init(void);
 void cetrafs_tree_claim_lock(u64 ino);
 void cetrafs_tree_claim_unlock(u64 ino);

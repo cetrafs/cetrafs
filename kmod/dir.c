@@ -201,8 +201,56 @@ static bool cetrafs_dirent_tear_explained(struct super_block *sb, u64 ino, u64 l
     return true;
 }
 
-static struct buffer_head *cetrafs_dirent_bread_why(struct super_block *sb, u64 ino, u64 generation, u64 lba,
-                                                    int *why)
+/*
+ * Dirent block content installed in this node's cache, bracketed: every
+ * device load (a walk's forced or missed read and each of its retries,
+ * the whole-directory refresh, the recount's batches and their
+ * per-block fallback), every block this node fills itself (a new block,
+ * mkdir's) and the journal replay's redos. begin() before the install
+ * can start, end() once it is done -- a read's content lands when the
+ * I/O completes, not when it is asked for. A lockless walk reads its
+ * directory's record, then its blocks, and a peer's rmdir can free a
+ * block in between and its next mkdir make it another directory's: a
+ * valid dirent block with the wrong names (audit 2026-11-15 BL-51).
+ * With this a walk knows whether anything it visits may have been
+ * installed after its record read: an install that ended since its
+ * snapshot, or one still in flight (cetrafs_dirent_loads_moved()).
+ */
+static atomic64_t cetrafs_dirent_loads = ATOMIC64_INIT(0);
+static atomic_t cetrafs_dirent_loads_inflight = ATOMIC_INIT(0);
+
+void cetrafs_dirent_load_begin(void)
+{
+    atomic_inc(&cetrafs_dirent_loads_inflight);
+    smp_mb__after_atomic(); /* counted in flight before the install starts */
+}
+
+void cetrafs_dirent_load_end(void)
+{
+    smp_mb__before_atomic(); /* the install is done before it is counted */
+    atomic64_inc(&cetrafs_dirent_loads);
+    smp_mb__after_atomic(); /* counted ended before it stops being in flight */
+    atomic_dec(&cetrafs_dirent_loads_inflight);
+}
+
+/* Before a walk's record read: the installs it may rely on. */
+static s64 cetrafs_dirent_loads_snap(void)
+{
+    smp_mb();
+    return atomic64_read(&cetrafs_dirent_loads);
+}
+
+/* After a block's copy: may anything have been installed since 'snap'?
+ * *now: the count to snap again from, once the record is re-read. */
+static bool cetrafs_dirent_loads_moved(s64 snap, s64 *now)
+{
+    smp_mb(); /* the copy, before the counts */
+    *now = atomic64_read(&cetrafs_dirent_loads);
+    return *now != snap || atomic_read(&cetrafs_dirent_loads_inflight);
+}
+
+static struct buffer_head *__cetrafs_dirent_bread_why(struct super_block *sb, u64 ino, u64 generation, u64 lba,
+                                                      int *why)
 {
     int attempt, nbad = 0;
 
@@ -257,6 +305,18 @@ static struct buffer_head *cetrafs_dirent_bread_why(struct super_block *sb, u64 
     cetrafs_sb_corrupt_owner(sb, ino, generation);
     *why = -EUCLEAN;
     return NULL;
+}
+
+/* Every attempt of the read above installs: bracketed whole (BL-51). */
+static struct buffer_head *cetrafs_dirent_bread_why(struct super_block *sb, u64 ino, u64 generation, u64 lba,
+                                                    int *why)
+{
+    struct buffer_head *bh;
+
+    cetrafs_dirent_load_begin();
+    bh = __cetrafs_dirent_bread_why(sb, ino, generation, lba, why);
+    cetrafs_dirent_load_end();
+    return bh;
 }
 
 static struct buffer_head *cetrafs_dirent_bread(struct inode *dir, u64 lba)
@@ -333,7 +393,7 @@ static bool cetrafs_dirent_owner_slot_zero(struct super_block *sb, u64 ino)
  */
 static int cetrafs_dirent_block_live_owner(struct super_block *sb, u64 lba, u64 mine)
 {
-    struct buffer_head *bh = cetrafs_bread_uncached(sb, lba);
+    struct buffer_head *bh = (cetrafs_dirent_load_begin(), cetrafs_bread_uncached(sb, lba)); /* BL-51 */
     struct cetrafs_tw w = {.sb = sb, .read = CETRAFS_TW_SCRUB_FRESH};
     const cetrafs_dirent_t *d;
     cetrafs_extent_t *arr = NULL;
@@ -342,6 +402,7 @@ static int cetrafs_dirent_block_live_owner(struct super_block *sb, u64 lba, u64 
     u32 n = 0, i;
     int ret = 0;
 
+    cetrafs_dirent_load_end();
     if (!bh)
         return -EIO;
     d = (const cetrafs_dirent_t *) bh->b_data;
@@ -426,12 +487,16 @@ int cetrafs_dirent_block_init(struct super_block *sb, u64 lba, bool *keep)
         return ret;
     }
 
+    cetrafs_dirent_load_begin(); /* an install, as a load (BL-51) */
     bh = cetrafs_getblk_overwrite(sb, lba);
-    if (!bh)
+    if (!bh) {
+        cetrafs_dirent_load_end();
         return -EIO;
+    }
     memset(bh->b_data, 0, CETRAFS_BLOCK_SIZE);
     cetrafs_dirent_block_stamp(bh);
     cetrafs_bh_end_update(sb, bh);
+    cetrafs_dirent_load_end();
     ret = cetrafs_sync_new_buffer(sb, bh); /* on the device before its extent: a failure is the caller's */
     brelse(bh);
     return ret;
@@ -457,9 +522,11 @@ static struct buffer_head *cetrafs_dirent_read(struct inode *dir, u64 lba, bool 
     if (fresh)
         return cetrafs_dirent_bread(dir, lba);
 
-    bh = cetrafs_bread_retry(dir->i_sb, lba);
+    /* Cached only: a miss is a load from the device, and every load
+     * goes through cetrafs_dirent_bread(), which counts it (BL-51). */
+    bh = sb_find_get_block(dir->i_sb, lba);
     if (bh) {
-        if (cetrafs_dirent_block_valid(bh))
+        if (buffer_uptodate(bh) && cetrafs_dirent_block_valid(bh))
             return bh;
         brelse(bh);
     }
@@ -803,13 +870,17 @@ static noinline_for_stack int cetrafs_dir_refresh_whole(struct inode *dir, const
     for (i = 0; i < de->entries; i++) {
         u64 phys = cetrafs_ee_pblk(&de->arr[i]);
         u32 len = cetrafs_ee_len(&de->arr[i]), b, n, k;
+        int rr;
 
         for (b = 0; b < len; b += n) {
             cond_resched();
             if (cetrafs_dir_killed())
                 return -EINTR; /* RT-3: the count is the disk's */
             n = min_t(u32, len - b, ARRAY_SIZE(bhs));
-            if (cetrafs_bread_uncached_batch(dir->i_sb, phys + b, n, bhs))
+            cetrafs_dirent_load_begin(); /* BL-51 */
+            rr = cetrafs_bread_uncached_batch(dir->i_sb, phys + b, n, bhs);
+            cetrafs_dirent_load_end();
+            if (rr)
                 return -EIO;
             for (k = 0; k < n; k++)
                 brelse(bhs[k]);
@@ -818,15 +889,77 @@ static noinline_for_stack int cetrafs_dir_refresh_whole(struct inode *dir, const
     return 0;
 }
 
-static int cetrafs_walk_dirents_from(struct inode *dir, cetrafs_dirent_visit_fn visit, void *priv, loff_t min_pos)
+/* TEST ONLY: a lockless walk does not ask whether its directory still
+ * lives, as before audit 2026-11-15 BL-51 (tests/kernel/dir_walk_block_reused.sh). */
+static bool cetrafs_dir_walk_no_alive;
+cetrafs_test_param(dir_walk_no_alive, cetrafs_dir_walk_no_alive, bool, 0644);
+MODULE_PARM_DESC(dir_walk_no_alive, "TEST ONLY: a lockless directory walk does not check the directory lives");
+
+/* TEST ONLY: a lockless walk visits a block installed after its record
+ * read without reading the record again -- the recheck alone off, the
+ * record read's own check kept (tests/kernel/dir_walk_block_reused.sh). */
+static bool cetrafs_dir_walk_no_recheck;
+cetrafs_test_param(dir_walk_no_recheck, cetrafs_dir_walk_no_recheck, bool, 0644);
+MODULE_PARM_DESC(dir_walk_no_recheck, "TEST ONLY: a lockless directory walk does not re-check the directory before a newly installed block");
+
+/* TEST ONLY: a lockless walk pauses this long once, right after its
+ * record read (tests/kernel/dir_walk_block_reused.sh). */
+static unsigned int cetrafs_dir_walk_record_stall_ms;
+cetrafs_test_param(dir_walk_record_stall_ms, cetrafs_dir_walk_record_stall_ms, uint, 0644);
+MODULE_PARM_DESC(dir_walk_record_stall_ms, "TEST ONLY: one lockless directory walk pauses after its record read");
+
+/* The directory, read fresh, is still the one walked and alive: 0,
+ * -ENOENT if not, or the read's error. */
+static noinline_for_stack int cetrafs_dir_walk_alive(struct inode *dir)
+{
+    cetrafs_inode_t *now = kmalloc(sizeof(*now), GFP_NOFS);
+    int ret;
+
+    if (!now)
+        return -ENOMEM;
+    cetrafs_invalidate_raw_inode(dir->i_sb, dir->i_ino);
+    ret = cetrafs_read_raw_inode(dir->i_sb, dir->i_ino, now);
+    if (!ret && (cetrafs_le64(now->generation) != cetrafs_inode_get_generation(dir) || cetrafs_le32(now->nlink) == 0))
+        ret = -ENOENT;
+    kfree(now);
+    return ret;
+}
+
+/*
+ * 'lockless': the caller holds nothing a peer's rmdir takes (lookup,
+ * revalidate, readdir). Its directory can then die, and a block of it be
+ * freed and become another directory's, between the record read and a
+ * block read -- or before the record read, with that other directory's
+ * block already cached here: a valid dirent block, of the right kind,
+ * with another directory's names, and an open for write of one of them
+ * lands in an unrelated file (audit 2026-11-15 BL-51). So a lockless walk
+ * answers -ENOENT for a directory that reads dead, and visits a block
+ * installed in the cache after its record read only once the record,
+ * read again after the copy was taken, still reads alive: a directory's
+ * blocks are freed only once its death is published (rule 21), and
+ * directories never shrink or move a block, so an alive record vouches
+ * for every block installed before it was read. Locked walks (the
+ * recount, rename's and rmdir's) keep their errors: their directory
+ * cannot die under them, and a dead one met there is the caller's to
+ * judge, not an ENOENT for an operation on another file.
+ */
+static int cetrafs_walk_dirents_from_x(struct inode *dir, cetrafs_dirent_visit_fn visit, void *priv, loff_t min_pos,
+                                       bool lockless)
 {
     unsigned int dirents_per_block = CETRAFS_DIRENTS_PER_BLOCK;
     struct cetrafs_dir_extents dx;
     cetrafs_inode_t raw;
     bool fresh, skipped = false;
     cetrafs_dirent_t *img;
+    s64 loads;
     int ret;
     u32 i;
+
+    bool stall = lockless && READ_ONCE(cetrafs_dir_walk_record_stall_ms);
+
+    lockless = lockless && !READ_ONCE(cetrafs_dir_walk_no_alive);
+    /* Before the record read: an install counted after this may postdate it. */
+    loads = cetrafs_dirent_loads_snap();
 
     /* Any node can add/remove entries in any directory at any time (no
      * whole-file lock covers a directory the way lock.c covers a regular
@@ -840,6 +973,18 @@ static int cetrafs_walk_dirents_from(struct inode *dir, cetrafs_dirent_visit_fn 
 
     if (ret)
         return ret;
+    if (lockless &&
+        (cetrafs_le64(raw.generation) != cetrafs_inode_get_generation(dir) || cetrafs_le32(raw.nlink) == 0))
+        return -ENOENT; /* removed: its blocks may be anyone's now */
+    if (unlikely(stall)) {
+        unsigned int ms = xchg(&cetrafs_dir_walk_record_stall_ms, 0);
+
+        if (ms) {
+            pr_info("dir: ino=%llu: TEST pause of %ums after a lockless walk's record read\n",
+                    (unsigned long long) dir->i_ino, ms);
+            msleep(ms);
+        }
+    }
 
     /* Each block is visited as a private copy, re-validated: the buffer
      * the read validated can be re-read under us by a forced-fresh
@@ -917,7 +1062,8 @@ static int cetrafs_walk_dirents_from(struct inode *dir, cetrafs_dirent_visit_fn 
             for (tries = 0;; tries++) {
                 bh = cetrafs_dirent_read(dir, phys + b, fresh || tries);
                 if (!bh) {
-                    ret = -EIO;
+                    /* A directory removed under the walk is not an I/O error. */
+                    ret = lockless && cetrafs_dir_walk_alive(dir) == -ENOENT ? -ENOENT : -EIO;
                     goto out;
                 }
                 if (live)
@@ -930,7 +1076,7 @@ static int cetrafs_walk_dirents_from(struct inode *dir, cetrafs_dirent_visit_fn 
                 /* Re-read under us into something invalid: a write in
                  * flight converges, damage does not (rule 3). */
                 if (tries >= 3) {
-                    ret = -EUCLEAN;
+                    ret = lockless && cetrafs_dir_walk_alive(dir) == -ENOENT ? -ENOENT : -EUCLEAN;
                     goto out;
                 }
                 msleep(10 << tries);
@@ -938,6 +1084,20 @@ static int cetrafs_walk_dirents_from(struct inode *dir, cetrafs_dirent_visit_fn 
 
             if (unlikely(READ_ONCE(cetrafs_dir_walk_stall_ms)))
                 msleep(xchg(&cetrafs_dir_walk_stall_ms, 0)); /* test-only, one-shot */
+            /* Installed since the last time the record read alive: ask
+             * again, now that the copy is taken (see above). */
+            if (lockless && !READ_ONCE(cetrafs_dir_walk_no_recheck)) {
+                s64 now;
+
+                if (cetrafs_dirent_loads_moved(loads, &now)) {
+                    ret = cetrafs_dir_walk_alive(dir);
+                    if (ret) {
+                        brelse(bh);
+                        goto out;
+                    }
+                    loads = now;
+                }
+            }
             de = live ? (const cetrafs_dirent_t *) bh->b_data : img;
             for (e = 0; e < dirents_per_block; e++) {
                 if (cetrafs_le64(de[e].inode) == 0)
@@ -974,7 +1134,7 @@ out:
 
 static int cetrafs_walk_dirents(struct inode *dir, cetrafs_dirent_visit_fn visit, void *priv)
 {
-    return cetrafs_walk_dirents_from(dir, visit, priv, 0);
+    return cetrafs_walk_dirents_from_x(dir, visit, priv, 0, false);
 }
 
 /*
@@ -1260,7 +1420,9 @@ int cetrafs_dir_add_entry(struct inode *dir, const struct qstr *name, u64 ino, u
          * the block is not an option any more, since the extent
          * referencing it is committed.
          */
+        cetrafs_dirent_load_begin(); /* may be a load (BL-51) */
         bh = cetrafs_bread_retry(dir->i_sb, new_lba);
+        cetrafs_dirent_load_end();
         if (!bh) {
             pr_warn_ratelimited("dir ino=%llu: new dirent block %llu unreadable\n", (unsigned long long) dir->i_ino,
                                 (unsigned long long) new_lba);
@@ -1812,7 +1974,7 @@ static struct dentry *cetrafs_lookup(struct inode *dir, struct dentry *dentry, u
     if (dentry->d_name.len > CETRAFS_FILENAME_MAX)
         return ERR_PTR(-ENAMETOOLONG);
 
-    ret = cetrafs_walk_dirents(dir, cetrafs_lookup_visit, &ctx);
+    ret = cetrafs_walk_dirents_from_x(dir, cetrafs_lookup_visit, &ctx, 0, true); /* no lock: BL-51 */
     if (ret)
         return ERR_PTR(ret);
 
@@ -1904,7 +2066,9 @@ static int cetrafs_d_revalidate(struct inode *dir, const struct qstr *name, stru
             return -EIO; /* test-only, see the knob */
         }
 
-        ret = cetrafs_walk_dirents(dir, cetrafs_lookup_visit, &ctx);
+        ret = cetrafs_walk_dirents_from_x(dir, cetrafs_lookup_visit, &ctx, 0, true); /* no lock: BL-51 */
+        if (ret == -ENOENT)
+            return 0; /* the directory is gone: nothing in it is valid */
         if (ret)
             return ret; /* could not determine -- not the same as "invalid" */
         if (ctx.ino != inode->i_ino)
@@ -2004,7 +2168,7 @@ static int cetrafs_readdir(struct file *file, struct dir_context *dctx)
 
     if (ret)
         return ret;
-    return cetrafs_walk_dirents_from(file_inode(file), cetrafs_readdir_visit, &ctx, dctx->pos);
+    return cetrafs_walk_dirents_from_x(file_inode(file), cetrafs_readdir_visit, &ctx, dctx->pos, true); /* BL-51 */
 }
 
 /*
@@ -2351,7 +2515,11 @@ struct cetrafs_dir_runs {
 static int cetrafs_dirent_batch_read(struct super_block *sb, const cetrafs_inode_t *raw, struct cetrafs_dir_runs *dr,
                                      u64 lba, u32 n)
 {
-    bool batched = !READ_ONCE(cetrafs_ns_count_serial) && !cetrafs_bread_uncached_batch(sb, lba, n, dr->bh);
+    bool batched;
+
+    cetrafs_dirent_load_begin(); /* BL-51: the batch; its per-block fallback brackets itself */
+    batched = !READ_ONCE(cetrafs_ns_count_serial) && !cetrafs_bread_uncached_batch(sb, lba, n, dr->bh);
+    cetrafs_dirent_load_end();
     int why = -EIO;
     u32 k;
 
@@ -3003,9 +3171,12 @@ static struct dentry *cetrafs_mkdir_locked(struct mnt_idmap *idmap,
         cetrafs_free_inode(sb, ino);
         return ERR_PTR(ret);
     }
-    /* Claimed without reading: every byte is overwritten below. */
+    /* Claimed without reading: every byte is overwritten below. An
+     * install, as a load (BL-51), until its update ends. */
+    cetrafs_dirent_load_begin();
     bh = cetrafs_getblk_overwrite(sb, lba);
     if (!bh) {
+        cetrafs_dirent_load_end();
         cetrafs_free_data_block(sb, lba);
         cetrafs_free_inode(sb, ino);
         return ERR_PTR(-EIO);
@@ -3044,6 +3215,7 @@ static struct dentry *cetrafs_mkdir_locked(struct mnt_idmap *idmap,
      * consume) and on the real LUN a write is ~38 ms. */
     cetrafs_dirent_block_stamp(bh);
     cetrafs_bh_end_update(sb, bh);
+    cetrafs_dirent_load_end();
     ret = cetrafs_sync_new_buffer(sb, bh); /* nothing names it yet: a full thin pool is ENOSPC */
     brelse(bh);
     if (ret) {

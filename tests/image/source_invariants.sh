@@ -2360,7 +2360,7 @@ cetrafs_nswait_within below:past-the-deadline-the-caller-answers-ebusy-on-the-ol
 cetrafs_convert_zero_side below:a-write-in-flight-in-the-unit-the-convert-keeps-to-its-own-blocks
 cetrafs_apply_raw_to_vfs_inode_sure waits:usleep_range
 cetrafs_cas_region_seeded_impl waits:usleep_range
-__cetrafs_journal_replay_node waits:time_after_eq
+___cetrafs_journal_replay_node waits:time_after_eq
 cetrafs_rename waits:cetrafs_rename_locked
 cetrafs_rename_locked below:the-target-changed-cetrafs_rename-retries
 cetrafs_nslock_try below:a-held-lock-the-acquire-loop-waits-on
@@ -2422,7 +2422,9 @@ cetrafs_sb_first_owned_zg below:none-owned
 cetrafs_pending_next below:no-pending-range
 cetrafs_leaf_array_convert below:not-covered-here
 cetrafs_tpath_find_in below:no-leaf-accepted-the-caller-decides
-cetrafs_inode_map_block final:a-hole-on-a-read-only-mapping'
+cetrafs_inode_map_block final:a-hole-on-a-read-only-mapping
+cetrafs_dir_walk_alive final:the-directory-is-dead-on-a-fresh-read
+cetrafs_walk_dirents_from_x final:the-directory-is-dead-on-a-fresh-read-a-lockless-walk-reads-no-reused-block'
 c43_names() { # <errno> <files...>: every function with a literal return/assignment of -<errno>
     local e="$1"
     shift

@@ -2797,6 +2797,7 @@ static enum cetrafs_journal_verdict cetrafs_journal_judge(const struct cetrafs_j
  * writes our cache has never seen.
  */
 static int __cetrafs_journal_replay_node(struct super_block *sb, u32 node_id, bool wait_for_claim, u64 scope);
+static int ___cetrafs_journal_replay_node(struct super_block *sb, u32 node_id, bool wait_for_claim, u64 scope);
 
 /* TEST ONLY: this node replays no peer's journal while set (-EBUSY), so
  * a two-node scenario can choose which node claims a dead node's area
@@ -2933,7 +2934,21 @@ static void cetrafs_journal_entry_undecided(struct cetrafs_journal_replay_entry 
     e->undecided = true;
 }
 
+/* A redo installs a block's content -- a directory's among them -- so
+ * the whole replay counts as dirent installs in flight: a lockless
+ * directory walk re-reads its record before trusting any block it meets
+ * meanwhile (BL-51). */
 static int __cetrafs_journal_replay_node(struct super_block *sb, u32 node_id, bool wait_for_claim, u64 scope)
+{
+    int ret;
+
+    cetrafs_dirent_load_begin();
+    ret = ___cetrafs_journal_replay_node(sb, node_id, wait_for_claim, scope);
+    cetrafs_dirent_load_end();
+    return ret;
+}
+
+static int ___cetrafs_journal_replay_node(struct super_block *sb, u32 node_id, bool wait_for_claim, u64 scope)
 {
     u64 area_start, slots, s, park_seq = 0;
     struct cetrafs_journal_replay_entry *entries;
