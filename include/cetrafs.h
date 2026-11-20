@@ -851,13 +851,12 @@ typedef struct {
     u8  pad[CETRAFS_BLOCK_SIZE - 64];
 } CETRA_PACKED cetrafs_journal_header_t;
 
-/* Both new fields live in what used to be `reserved32` and the head of
- * `pad`, and header_checksum keeps its offset (28) -- deliberately, so a
- * module that predates them computes a byte-identical header CRC. No
- * format bump. (This is not a rolling-upgrade guarantee: mixed releases
- * on one volume are unsupported, LIMITATIONS.md section 1.) An old
- * writer's entry reads back as flags == 0, which is exactly "unguarded",
- * and replay falls back to its old unconditional behaviour for it. */
+/* Both fields live in what used to be `reserved32` and the head of
+ * `pad`; header_checksum keeps its offset (28). Every module of this
+ * format writes GUARDED (or FRESH) entries. One with neither flag can
+ * only be damaged or crafted -- a module that predates the guard cannot
+ * mount this format -- and replay refuses it (UNGUARDED, audit L7)
+ * rather than redo a 4 KiB write nothing can check. */
 #define CETRAFS_JRNL_F_GUARDED 0x00000001u /* prev_checksum is meaningful */
 #define CETRAFS_JRNL_F_FRESH                                                                                           \
     0x00000002u /* target was claimed without reading (a freshly                                                       \
