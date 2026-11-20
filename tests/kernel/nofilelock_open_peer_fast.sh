@@ -35,6 +35,7 @@
 # DISCRIMINATION: open_journal_peek_off=1 (as before) -- F's opens wait
 # for node 1's beat and take seconds each; peer_beating_shared_watch=1
 # (as before) -- Q, P's setup, waits past a beat.
+# ct-timeout: 600
 set -euo pipefail
 . "$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)/lib/harness.sh"
 require_root

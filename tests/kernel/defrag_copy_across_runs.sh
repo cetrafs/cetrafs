@@ -21,6 +21,7 @@
 # DISCRIMINATION: defrag_copy_serial is assertion 2 itself. The serial copy
 # must take at least 40 device delays, or the setup did not make the
 # fragmented source the suite is about, and the suite fails on that first.
+# ct-timeout: 600
 set -euo pipefail
 . "$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)/lib/harness.sh"
 require_root
