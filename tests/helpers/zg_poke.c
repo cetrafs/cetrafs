@@ -56,6 +56,8 @@ int main(int argc, char **argv)
         fprintf(stderr, "       %s <image> <zg_id> badsum           (invalidate the hot checksum)\n", argv[0]);
         fprintf(stderr, "       %s <image> <zg_id> bumpseq          (advance hb_seq: the owner re-asserting)\n", argv[0]);
         fprintf(stderr, "       %s <image> <zg_id> seq              (print hb_seq)\n", argv[0]);
+        fprintf(stderr, "       %s <image> <zg_id> stamp            (print hb_seq, pool_free_blocks, cas_stamp)\n",
+                argv[0]);
         return 2;
     }
 
@@ -65,7 +67,8 @@ int main(int argc, char **argv)
     bool badsum_mode = (argc == 4 && !strcmp(argv[3], "badsum"));
     bool bumpseq_mode = (argc == 4 && !strcmp(argv[3], "bumpseq"));
     bool seq_mode = (argc == 4 && !strcmp(argv[3], "seq"));
-    bool write_mode = ((argc == 4) || free_mode) && !seq_mode;
+    bool stamp_mode = (argc == 4 && !strcmp(argv[3], "stamp"));
+    bool write_mode = ((argc == 4) || free_mode) && !seq_mode && !stamp_mode;
     uint16_t owner = (argc == 4) ? (uint16_t) strtoul(argv[3], NULL, 0) : 0;
     uint64_t set_free = free_mode ? strtoull(argv[4], NULL, 0) : 0;
 
@@ -87,6 +90,12 @@ int main(int argc, char **argv)
     cetrafs_zone_group_t zg;
     pread_all(fd, &zg, sizeof(zg), zg_off);
 
+    if (stamp_mode) {
+        printf("hb_seq=%llu pool_free_blocks=%llu cas_stamp=%llu\n", (unsigned long long) cetrafs_le64(zg.hb_seq),
+               (unsigned long long) cetrafs_le64(zg.pool_free_blocks), (unsigned long long) cetrafs_le64(zg.cas_stamp));
+        close(fd);
+        return 0;
+    }
     if (seq_mode) {
         printf("%llu\n", (unsigned long long) cetrafs_le64(zg.hb_seq));
         close(fd);

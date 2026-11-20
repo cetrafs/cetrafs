@@ -11,7 +11,7 @@ only when the source or the format header is newer.
 
 | helper | what it touches | modes |
 |---|---|---|
-| `zg_poke` | a Zone Group's `owner_node_id`, checksum recomputed | set owner |
+| `zg_poke` | a Zone Group's `owner_node_id`, checksum recomputed; `stamp` prints hb_seq, pool shard and G-6 stamp | set owner |
 | `bg_poke` | a Block Group's cached `free_data_blocks` | fake "this BG is full" without writing hundreds of MiB |
 | `node_poke` | a Node Registry row: state / `hb_seq` / `last_seen` / uuid / `fence_epoch` | write a row, `--beat`, `--beat-keep-time`, `--bump-fence` |
 | `inode_lock_poke` | an inode's `lock_owner_node` / `lock_mode`, and dumps `ns_owner` / `readers` | read-only dump (safe while mounted) or write |
