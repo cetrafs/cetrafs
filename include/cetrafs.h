@@ -2002,7 +2002,9 @@ static inline int cetrafs_blk_struct_ok(const void *blk, u32 magic)
  * Registry row, journal flag block and segment header; ns_cas_stamp in
  * an inode's namespace sector; CETRAFS_INODE_FD_STAMP_OFF in its file
  * sector; the trailers of bitmap and pending-free sectors. Low 32 bits:
- * the swaps the sector has taken; high 32: the swap's own token. Each
+ * the swaps the sector has taken; high 32: the swap's own token, its
+ * writer (registry row, or a reserved range) in the top 8 bits and a
+ * per-writer count below. Each
  * is inside its structure's checksum, re-stamped with it (the file
  * sector's is in the tail its CRC takes as zeros). mkfs sets this bit;
  * a build that moves no stamp cannot mount the volume, and this one

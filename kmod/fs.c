@@ -507,9 +507,11 @@ struct cetrafs_sb_info {
      * monotonic clock then, and the last value handed out. */
     s64 stamp_base;
     atomic64_t stamp_last;
-    /* The writer half of every G-6 CAS stamp this mount makes: random
-     * at mount, one more per swap (cetrafs_cas_stamp_next()). */
+    /* The counter half of every G-6 CAS stamp this mount makes, one more
+     * per swap, and the writer byte it uses before it has a registry row
+     * (cetrafs_cas_stamp_next()). */
     atomic_t cas_token;
+    u32 cas_unreg_writer;
     /* Set by cetrafs_sb_alloc_lock(), for the holder only: the NOFS
      * scope it opened and who holds it (cetrafs_sb_in_reclaim_lock()). */
     unsigned int alloc_nofs;
@@ -3434,6 +3436,7 @@ int cetrafs_fill_super(struct super_block *sb, struct fs_context *fc)
         sbi->stamp_base = (s64) ktime_get_real_ns() - (s64) ktime_get_ns();
         atomic64_set(&sbi->stamp_last, 0);
         atomic_set(&sbi->cas_token, (int) get_random_u32());
+        sbi->cas_unreg_writer = 0xC0u | (get_random_u32() & 0x3Fu);
         init_rwsem(&sbi->birth_rwsem);
         mutex_init(&sbi->cas_mutex);
 
@@ -5093,16 +5096,35 @@ bool cetrafs_sb_lba_run_hits_bg_table(struct super_block *sb, u64 lba, u64 count
  * The next G-6 stamp of a CAS-managed sector whose stamp is 'prev'
  * (audit 2026-11-15 G-6). Low half: prev's plus one -- how many swaps
  * the sector has taken, so a re-read tells "one swap since" from "more".
- * High half: this swap's own token, random per mount and one more per
- * swap, so no two swaps from one image ever write the same stamp: a
+ * High half: this swap's own token -- the writer in its top 8 bits, a
+ * per-mount counter in the low 24 -- so no two nodes ever write the same
+ * stamp, and one node repeats one only after 16M swaps of its own: a
  * region never returns to a value it held, and a swap's post-image is
- * its own and nobody else's.
+ * its own and nobody else's (audit F-75: a random per-mount token alone
+ * let two nodes' ranges overlap). The writer is the registry row, below
+ * CETRAFS_MAX_READER_NODES; a mount not registered yet (its own
+ * registration swaps) uses 0xC0..0xFF, random per mount, and the tools'
+ * repair claims 0x80..0xBF (userspace/devutil.h): ranges no registered
+ * node writes.
  */
+/* TEST ONLY: the token is the per-mount random counter alone, as before
+ * F-75 (tests/kernel/cas_stamp.sh). */
+static bool cetrafs_cas_token_random;
+cetrafs_test_param(cas_token_random, cetrafs_cas_token_random, bool, 0644);
+MODULE_PARM_DESC(cas_token_random, "TEST ONLY: G-6 stamp tokens carry no writer id");
+
 u64 cetrafs_cas_stamp_next(struct super_block *sb, u64 prev)
 {
     struct cetrafs_sb_info *sbi = sb->s_fs_info;
-    u32 hi = (u32) atomic_inc_return(&sbi->cas_token);
-    u32 lo = (u32) prev + 1;
+    u32 ctr = (u32) atomic_inc_return(&sbi->cas_token) & 0xFFFFFFu;
+    u32 node = 0, lo = (u32) prev + 1, hi;
+
+    BUILD_BUG_ON(CETRAFS_MAX_READER_NODES > 0x80);
+    if (cetrafs_sb_get_node_id(sb, &node) || node >= CETRAFS_MAX_READER_NODES)
+        node = sbi->cas_unreg_writer;
+    hi = (node << 24) | ctr;
+    if (unlikely(READ_ONCE(cetrafs_cas_token_random)))
+        hi = (u32) atomic_read(&sbi->cas_token) * 2654435761u; /* TEST ONLY */
 
     if (!lo)
         lo = 1; /* never the all-zero stamp of a sector no swap wrote */

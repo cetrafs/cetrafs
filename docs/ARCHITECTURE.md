@@ -454,7 +454,7 @@ with backoff before being declared real corruption.
 | `INCOMPAT_GLOBAL_ITBL` | 1 | yes | accepted at mount |
 | `INCOMPAT_BIT2_UNUSED` | 2 | no | was `PR_AWARE`, removed with SCSI PR (v0x000E) |
 | `INCOMPAT_NODE_REGISTRY` | 3 | yes | accepted at mount; gates the `node_table_*` SB fields |
-| `INCOMPAT_CAS_STAMP` | 4 | yes | required at mount. G-6: every CAS sector carries a stamp (`cas_stamp`, `ns_cas_stamp`, the inode file sector's `CETRAFS_INODE_FD_STAMP_OFF`, the bitmap and pending-free trailers) that every swap moves to a value no swap wrote before -- low 32 bits the swaps taken, high 32 the swap's own token -- inside the structure's checksum. A timed-out swap is judged by it. mkfs sets the bit; the kernel refuses a volume without it |
+| `INCOMPAT_CAS_STAMP` | 4 | yes | required at mount. G-6: every CAS sector carries a stamp (`cas_stamp`, `ns_cas_stamp`, the inode file sector's `CETRAFS_INODE_FD_STAMP_OFF`, the bitmap and pending-free trailers) that every swap moves to a value no swap wrote before -- low 32 bits the swaps taken, high 32 the swap's own token (8 bits of writer, 24 of that writer's count) -- inside the structure's checksum. A timed-out swap is judged by it. mkfs sets the bit; the kernel refuses a volume without it |
 | `INCOMPAT_ZG_CHAIN` | 5 | no | reserved (A-13): the Zone Group table carries appended segments (`zg_seg_next`, `zg_first_count`); no build appends one yet, and the mount, fsck and growfs refuse a volume that has one, by the bit or by the fields |
 | `ROCOMPAT_SPARSE` | 0 | no | — |
 

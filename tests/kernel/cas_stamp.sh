@@ -16,7 +16,9 @@
 #   2. no swap of the workload was on an address the stamp classifier
 #      does not know (cas_unstamped stays 0);
 #   3. the stamp survives a remount and goes on counting from the device;
-#   4. fsck finds the stamped volume clean.
+#   4. fsck finds the stamped volume clean;
+#   5. the stamp's token names its writer: this node's registry row in
+#      its top byte, so no two nodes can write the same one (audit F-75).
 #
 # NOT STAGED HERE: the verdicts a stamp gives a timed-out command (a
 # swap of ours on the device, the image compared, a peer's first swap)
@@ -24,12 +26,13 @@
 #
 # DISCRIMINATION: cas_stamp_off=1 -- the row's stamp stands still across
 # beats (1 fails); cas_stamp_forget_records=1 -- inode-record swaps are
-# counted unstamped (2 fails).
+# counted unstamped (2 fails); cas_token_random=1 -- the token names no
+# writer (5 fails, but for a 1-in-256 coincidence).
 set -euo pipefail
 . "$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)/lib/harness.sh"
 require_root
 require_module
-for k in cas_stamp_off cas_stamp_forget_records; do
+for k in cas_stamp_off cas_stamp_forget_records cas_token_random; do
     [ -w "/sys/module/cetrafs/parameters/$k" ] || { skip "$k is missing"; ct_exit; }
 done
 NODE_POKE="$(ct_helper node_poke)"
@@ -37,6 +40,7 @@ MNT="$(ct_mnt castamp)"
 ct_track mnt "$MNT"
 ct_param_set cas_stamp_off 0
 ct_param_set cas_stamp_forget_records 0
+ct_param_set cas_token_random 0
 compress_timing
 
 field() { sed -n "s/.*\b$1=\([0-9]*\).*/\1/p" <<<"$2"; }
@@ -59,7 +63,7 @@ beat_past() {
     row_now "$img" "$row"
 }
 
-# <stamp_off 0|1> -> "beats= swaps= tokchg="
+# <stamp_off 0|1> [token_random 0|1] -> "beats= swaps= tokchg= writer= row="
 round_row() {
     local img dev proc row a b
     img="$(ct_image 560 "castamp$1")"
@@ -69,16 +73,18 @@ round_row() {
     proc="$(ct_procdir "$dev")"
     row="$(sed -n 's/^this_node_id: //p' "$proc/info")"
     echo "$1" >/sys/module/cetrafs/parameters/cas_stamp_off
+    echo "${2:-0}" >/sys/module/cetrafs/parameters/cas_token_random
     a="$(beat_past "$img" "$row" 0)"
     b="$(beat_past "$img" "$row" "$(field hb "$a")")"
     b="$(beat_past "$img" "$row" "$(field hb "$b")")"
     echo 0 >/sys/module/cetrafs/parameters/cas_stamp_off
+    echo 0 >/sys/module/cetrafs/parameters/cas_token_random
     ct_umount "$MNT"
-    python3 -I - "$(field hb "$a")" "$(field stamp "$a")" "$(field hb "$b")" "$(field stamp "$b")" <<'PY'
+    python3 -I - "$(field hb "$a")" "$(field stamp "$a")" "$(field hb "$b")" "$(field stamp "$b")" "$row" <<'PY'
 import sys
-ha, sa, hb, sb = (int(x) for x in sys.argv[1:5])
-print("beats=%d swaps=%d tokchg=%d" % (hb - ha, ((sb & 0xffffffff) - (sa & 0xffffffff)) & 0xffffffff,
-                                        1 if (sa >> 32) != (sb >> 32) else 0), flush=True)
+ha, sa, hb, sb, row = (int(x) for x in sys.argv[1:6])
+print("beats=%d swaps=%d tokchg=%d writer=%d row=%d" % (hb - ha, ((sb & 0xffffffff) - (sa & 0xffffffff)) & 0xffffffff,
+                                                       1 if (sa >> 32) != (sb >> 32) else 0, sb >> 56, row), flush=True)
 PY
 }
 
@@ -95,6 +101,12 @@ pass "setup: the heartbeat swapped this node's registry row at least twice"
     fail "1: the row's stamp did not move with the swaps ($R)"
 [ "$(field swaps "$C")" = 0 ] && pass "control: with stamps off, the row's stamp stood still ($C)" ||
     fail "control: the stamp moved anyway -- the assertion cannot fail ($C)"
+[ "$(field writer "$R")" = "$(field row "$R")" ] && pass "5: the stamp's token names this node's row as its writer ($R)" ||
+    fail "5: the token does not name its writer ($R)"
+T="$(round_row 0 1)"
+log "control (random token): $T"
+[ "$(field writer "$T")" != "$(field row "$T")" ] && pass "control: a random token names no writer ($T)" ||
+    fail "control: the random token named the row anyway -- the assertion cannot fail ($T)"
 
 # <forget 0|1> -> "ops= unstamped= remount= fsck="
 round_work() {
