@@ -1087,6 +1087,7 @@ static void fsck_sb_strip_status(cetrafs_superblock_t *s)
     s->fsck_needed_since = cetrafs_cpu_to_le64(0);
     s->fsck_needed_node = cetrafs_cpu_to_le32(0);
     s->fsck_needed_pad = cetrafs_cpu_to_le32(0);
+    s->cas_stamp = cetrafs_cpu_to_le64(0); /* CAS bookkeeping (G-6), not layout */
     s->checksum = cetrafs_cpu_to_le64(0);
 }
 

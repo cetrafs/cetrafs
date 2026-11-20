@@ -1124,6 +1124,13 @@ void cetrafs_rec_epoch_bump(struct super_block *sb, u64 lba);
 u64 cetrafs_rec_epoch_sample(struct super_block *sb, u64 ino);
 #define CETRAFS_REC_EPOCH_NONE U64_MAX
 u32 cetrafs_inode_crc_ns(const cetrafs_inode_t *in);
+u32 cetrafs_inode_ns_image_crc(const void *sector);
+u32 cetrafs_zg_hot_image_crc(const void *blk);
+u32 cetrafs_node_image_crc(const void *img);
+u64 cetrafs_cas_stamp_next(struct super_block *sb, u64 prev);
+int cetrafs_sb_bg_seg_role(struct super_block *sb, u64 lba);
+u64 cetrafs_cas_unstamped_count(void);
+u64 cetrafs_cas_stamp_decided_count(void);
 u32 cetrafs_inode_crc_fd(const cetrafs_inode_t *in);
 bool cetrafs_inode_crcs_ok(const cetrafs_inode_t *in);
 void cetrafs_inode_stamp_crc(struct super_block *sb, cetrafs_inode_t *in); /* whole record: echoes + both sector CRCs */
@@ -1890,6 +1897,7 @@ int cetrafs_journal_write_deferred(struct super_block *sb, struct buffer_head **
 
 /* alloc.c: bitmap sectors, each with its own CRC (CETRAFS_BMAP_SECTOR). */
 u32 cetrafs_bmap_sector_crc(const void *sector);
+u32 cetrafs_bg_image_crc(const void *image, unsigned int len);
 void cetrafs_bmap_restamp(void *image, u64 off);
 bool cetrafs_bmap_sectors_ok(const void *image, u64 first, u64 n);
 struct buffer_head *cetrafs_bmap_bread(struct super_block *sb, u64 lba, u64 lo, u64 hi, int *err);

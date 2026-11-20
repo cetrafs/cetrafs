@@ -1313,8 +1313,11 @@ static inline int cetrafs_node_entry_blank(const cetrafs_node_entry_t *ne)
     const unsigned char *p = (const unsigned char *) ne;
     unsigned int i;
 
+    /* The G-6 stamp aside: every swap of the row moves it, a release
+     * that blanks the row included. */
     for (i = 0; i < sizeof(*ne); i++)
-        if (p[i])
+        if (p[i] && (i < offsetof(cetrafs_node_entry_t, cas_stamp) ||
+                     i >= offsetof(cetrafs_node_entry_t, cas_stamp) + sizeof(ne->cas_stamp)))
             return 0;
     return 1;
 }
@@ -1804,9 +1807,12 @@ typedef struct {
  * carries, as opposed to the CETRAFS_INODE_FD_BYTES it occupies on
  * disk. Everything in between is the zero tail described above. */
 #define CETRAFS_INODE_FD_LIVE ((unsigned int) (sizeof(cetrafs_inode_t) - CETRAFS_INODE_FD_OFF))
-/* Reserved: the G-6 stamp of the file sector, 8 bytes at this offset in
- * the sector -- the head of the zero tail, inside what the sector's CRC
- * covers (CETRAFS_FEAT_INCOMPAT_CAS_STAMP); 0. */
+/* The G-6 stamp of the file sector (CETRAFS_FEAT_INCOMPAT_CAS_STAMP), 8
+ * bytes at this offset in the sector: the head of the tail, which the
+ * sector's CRC takes as zeros -- so, unlike every other stamp, this one
+ * is NOT under a checksum. A damaged one can only make a timed-out
+ * swap's verdict UNDECIDABLE or wrong about whose swap it is; the
+ * namespace sector's stamp, checksummed, is the record's other one. */
 #define CETRAFS_INODE_FD_STAMP_OFF CETRAFS_INODE_FD_LIVE
 
 /* The two-sector contract is load-bearing: sector-granular CAS and the
@@ -1988,16 +1994,19 @@ static inline int cetrafs_blk_struct_ok(const void *blk, u32 magic)
 #define CETRAFS_FEAT_INCOMPAT_BIT2_UNUSED  (1ULL << 2) /* was PR_AWARE, removed with SCSI PR */
 #define CETRAFS_FEAT_INCOMPAT_NODE_REGISTRY (1ULL << 3) /* node_table_* SB fields are valid */
 /*
- * RESERVED (audit 2026-11-15 G-6, room only): every CAS-managed sector
- * carries a monotonic stamp the CAS layer bumps, so an unknown outcome is
- * decided by a re-read. The bytes are in place -- cas_stamp in the
- * superblock, Zone Group hot sector, Block Group descriptor, Node
+ * Audit 2026-11-15 G-6: every CAS-managed sector carries a stamp that
+ * every swap moves to a value no swap wrote before, so a region never
+ * returns to an earlier image and an unknown outcome is decided by a
+ * re-read (kmod/caw.c, cetrafs_cas_stamp_next()). The stamps: cas_stamp
+ * in the superblock, Zone Group hot sector, Block Group descriptor, Node
  * Registry row, journal flag block and segment header; ns_cas_stamp in
  * an inode's namespace sector; CETRAFS_INODE_FD_STAMP_OFF in its file
- * sector; the trailers of bitmap and pending-free sectors -- all zero
- * today. A stamp is only meaningful once EVERY writer bumps it, so a
- * volume that turns them on sets this bit, and a build that does not
- * know it refuses the mount. No build sets it yet.
+ * sector; the trailers of bitmap and pending-free sectors. Low 32 bits:
+ * the swaps the sector has taken; high 32: the swap's own token. Each
+ * is inside its structure's checksum, re-stamped with it (the file
+ * sector's is in the tail its CRC takes as zeros). mkfs sets this bit;
+ * a build that moves no stamp cannot mount the volume, and this one
+ * refuses a volume without it.
  */
 #define CETRAFS_FEAT_INCOMPAT_CAS_STAMP     (1ULL << 4)
 
@@ -2038,7 +2047,8 @@ static inline int cetrafs_blk_struct_ok(const void *blk, u32 magic)
  * versions, which are not supported: for a format that only ever grows.
  */
 #define CETRAFS_FEAT_INCOMPAT_SUPP                                                                                     \
-    (CETRAFS_FEAT_INCOMPAT_EXTENTS | CETRAFS_FEAT_INCOMPAT_GLOBAL_ITBL | CETRAFS_FEAT_INCOMPAT_NODE_REGISTRY)
+    (CETRAFS_FEAT_INCOMPAT_EXTENTS | CETRAFS_FEAT_INCOMPAT_GLOBAL_ITBL | CETRAFS_FEAT_INCOMPAT_NODE_REGISTRY |          \
+     CETRAFS_FEAT_INCOMPAT_CAS_STAMP)
 #define CETRAFS_FEAT_RO_COMPAT_SUPP 0ULL
 #define CETRAFS_FEAT_COMPAT_SUPP    0ULL
 

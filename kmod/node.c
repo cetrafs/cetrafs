@@ -50,6 +50,12 @@ static u32 cetrafs_node_crc(const cetrafs_node_entry_t *ne)
     return ~crc32c(~0U, &tmp, sizeof(tmp));
 }
 
+/* The row's CRC over a CAS image of its block (caw.c's G-6 stamp). */
+u32 cetrafs_node_image_crc(const void *img)
+{
+    return cetrafs_node_crc((const cetrafs_node_entry_t *) img);
+}
+
 /*
  * Read node registry row #idx (one whole block per row as of v0x0007).
  *

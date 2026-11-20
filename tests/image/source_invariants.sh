@@ -1962,9 +1962,10 @@ fd_unchecked() { # <file> <mutator...>: the ones whose body never compares file_
     local f="$1"; shift
     for fn in "$@"; do
         # Or the whole sector against the bytes judged, file_seq among
-        # them (the half-landed settle's cetrafs_landed_fd_mutate()).
+        # them (the half-landed settle's cetrafs_landed_fd_mutate()) --
+        # all of it, or all up to its G-6 stamp, which file_seq precedes.
         awk -v fn="$fn" '$0 ~ "^static int " fn "\\(" { on = 1 } on && /file_seq/ && /(!=|==)/ { hit = 1 }
-            on && /memcmp\(image, ctx->seed, CETRAFS_INODE_FD_BYTES\)/ { hit = 1 }
+            on && /memcmp\(image, ctx->seed, CETRAFS_INODE_FD_(BYTES|STAMP_OFF)\)/ { hit = 1 }
             on && /^}/ { on = 0 } END { exit !hit }' "$f" || echo "$fn"
     done
 }

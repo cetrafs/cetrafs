@@ -507,6 +507,9 @@ struct cetrafs_sb_info {
      * monotonic clock then, and the last value handed out. */
     s64 stamp_base;
     atomic64_t stamp_last;
+    /* The writer half of every G-6 CAS stamp this mount makes: random
+     * at mount, one more per swap (cetrafs_cas_stamp_next()). */
+    atomic_t cas_token;
     /* Set by cetrafs_sb_alloc_lock(), for the holder only: the NOFS
      * scope it opened and who holds it (cetrafs_sb_in_reclaim_lock()). */
     unsigned int alloc_nofs;
@@ -2447,6 +2450,9 @@ void cetrafs_sb_copy_status(cetrafs_superblock_t *dst, const cetrafs_superblock_
     dst->fsck_needed_since = src->fsck_needed_since;
     dst->fsck_needed_node = src->fsck_needed_node;
     dst->fsck_needed_pad = src->fsck_needed_pad;
+    /* Not status, but not layout either: every swap of block 0 moves
+     * it (G-6), so a compare of layouts looks past it too. */
+    dst->cas_stamp = src->cas_stamp;
 }
 
 /* Do 'a' and 'b' describe the same volume, status fields aside? */
@@ -3149,6 +3155,16 @@ int cetrafs_fill_super(struct super_block *sb, struct fs_context *fc)
 
     /* Feature flags */
     features_incompat = le64_to_cpu(ondisk->features_incompat);
+    /* Every CAS-managed sector's stamp moves on every swap (G-6), and a
+     * stamp means something only if every writer moves it: a volume
+     * whose writers never did is refused, not half-stamped. */
+    if (!(features_incompat & CETRAFS_FEAT_INCOMPAT_CAS_STAMP)) {
+        pr_err("this volume was made without per-sector CAS stamps (INCOMPAT 0x%llx): reformat it with this "
+               "release's mkfs.cetra\n",
+               (unsigned long long) CETRAFS_FEAT_INCOMPAT_CAS_STAMP);
+        brelse(bh);
+        return -EINVAL;
+    }
     if (features_incompat & ~CETRAFS_KNOWN_INCOMPAT) {
         pr_err("unsupported INCOMPAT features set: 0x%llx\n", (unsigned long long) features_incompat);
         brelse(bh);
@@ -3417,6 +3433,7 @@ int cetrafs_fill_super(struct super_block *sb, struct fs_context *fc)
         init_waitqueue_head(&sbi->zg_adopt_wq);
         sbi->stamp_base = (s64) ktime_get_real_ns() - (s64) ktime_get_ns();
         atomic64_set(&sbi->stamp_last, 0);
+        atomic_set(&sbi->cas_token, (int) get_random_u32());
         init_rwsem(&sbi->birth_rwsem);
         mutex_init(&sbi->cas_mutex);
 
@@ -5050,6 +5067,19 @@ bool cetrafs_sb_lba_run_in_bg_data(struct super_block *sb, u64 lba, u64 count)
     return cetrafs_layout_run_in_bg(l, lo, lba, count);
 }
 
+/* Block 'lba' in an APPENDED Block Group table segment: 1 its header,
+ * 2 one of its descriptors, 0 neither (caw.c's G-6 stamp). */
+int cetrafs_sb_bg_seg_role(struct super_block *sb, u64 lba)
+{
+    struct cetrafs_bg_layout *l = cetrafs_sb_layout_of(sb->s_fs_info);
+    u32 i;
+
+    for (i = 0; l && i < l->bg_nsegs; i++)
+        if (lba >= l->bg_segs[i].start && lba < l->bg_segs[i].end)
+            return lba == l->bg_segs[i].start ? 1 : 2;
+    return 0;
+}
+
 bool cetrafs_sb_lba_run_hits_bg_table(struct super_block *sb, u64 lba, u64 count)
 {
     struct cetrafs_bg_layout *l = cetrafs_sb_layout_of(sb->s_fs_info);
@@ -5057,6 +5087,26 @@ bool cetrafs_sb_lba_run_hits_bg_table(struct super_block *sb, u64 lba, u64 count
     if (!l)
         return true;
     return cetrafs_lba_ranges_hit(l->bg_segs, l->bg_nsegs, lba, count);
+}
+
+/*
+ * The next G-6 stamp of a CAS-managed sector whose stamp is 'prev'
+ * (audit 2026-11-15 G-6). Low half: prev's plus one -- how many swaps
+ * the sector has taken, so a re-read tells "one swap since" from "more".
+ * High half: this swap's own token, random per mount and one more per
+ * swap, so no two swaps from one image ever write the same stamp: a
+ * region never returns to a value it held, and a swap's post-image is
+ * its own and nobody else's.
+ */
+u64 cetrafs_cas_stamp_next(struct super_block *sb, u64 prev)
+{
+    struct cetrafs_sb_info *sbi = sb->s_fs_info;
+    u32 hi = (u32) atomic_inc_return(&sbi->cas_token);
+    u32 lo = (u32) prev + 1;
+
+    if (!lo)
+        lo = 1; /* never the all-zero stamp of a sector no swap wrote */
+    return ((u64) hi << 32) | lo;
 }
 
 const cetrafs_superblock_t *cetrafs_sb_raw(struct super_block *sb)

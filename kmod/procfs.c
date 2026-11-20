@@ -299,6 +299,8 @@ static int cetrafs_proc_info_show(struct seq_file *m, void *v)
     seq_printf(m, "record_writes: %llu\n", cetrafs_record_write_count());
     seq_printf(m, "pending_free_appends: %llu\n", cetrafs_pending_free_append_count());
     seq_printf(m, "held_store_retries: %llu\n", cetrafs_held_store_retry_count());
+    seq_printf(m, "cas_unstamped: %llu\n", cetrafs_cas_unstamped_count());
+    seq_printf(m, "cas_stamp_decided: %llu\n", cetrafs_cas_stamp_decided_count());
     seq_printf(m, "pf_append_reads: %llu\n", cetrafs_pf_append_read_count());
     seq_printf(m, "pending_free_entries: %llu\n", cetrafs_pending_free_entry_count());
     seq_printf(m, "foreign_free_leaks: %llu\n", cetrafs_foreign_free_leak_count());

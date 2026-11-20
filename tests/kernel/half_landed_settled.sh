@@ -18,6 +18,10 @@
 #   L2. the new file sector landed under a birth claim of an earlier
 #       incarnation of this node: settled at once; fsck clean.
 #
+# Every record also carries a G-6 stamp in its file sector's tail, as one
+# any kernel write leaves since G-6: the settle must look past it (the
+# seed it compares is built from the record, tail zero).
+#
 # DISCRIMINATION: half_landed_damage=1 (as before): L1 is counted as
 # damage and the number stays allocated.
 set -euo pipefail
@@ -63,6 +67,15 @@ round() {
         # this node's row; a remount draws a new incarnation, never 7
         "$HB_POKE" "$img" "$N" --landed-fd "$me" 7 >/dev/null
     fi
+    # The file sector's G-6 stamp, as a real write leaves it: outside
+    # the sector's CRC (the tail it takes as zeros), so still valid.
+    python3 -I - "$img" "$inode_table_start" "$N" <<'PY'
+import struct, sys
+img, table, ino = sys.argv[1], int(sys.argv[2]), int(sys.argv[3])
+with open(img, "r+b") as f:
+    f.seek((table + ino - 1) * 4096 + 512 + 140)
+    f.write(struct.pack("<Q", (0x5eed << 32) | 7))
+PY
     echo "$3" >$P/half_landed_damage
     echo "$4" >$P/half_landed_wait_secs
     echo 1 >$P/scrub

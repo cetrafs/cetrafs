@@ -215,15 +215,18 @@ if mount -t cetrafs -o ro "$DEV" "$MNT" 2>/dev/null; then
 else
     pass "a volume with an unknown INCOMPAT feature is refused, even read-only"
 fi
-# The reserved CAS-stamp bit (G-6): a volume whose writers stamp every
-# CAS sector is not one a build that does not stamp may write.
-"$SB_POKE" "$DEV" features_incompat $((ORIG_IN | (1 << 4))) >/dev/null
+# The CAS-stamp bit (G-6): mkfs sets it, and a volume without it -- made
+# by a build whose writers never moved the stamps -- is refused, since a
+# stamp means something only if every writer moves it.
+[ $((ORIG_IN & (1 << 4))) != 0 ] && pass "mkfs sets the CAS-stamp feature (G-6)" ||
+    fail "mkfs did not set the CAS-stamp feature (features_incompat=$ORIG_IN)"
+"$SB_POKE" "$DEV" features_incompat $((ORIG_IN & ~(1 << 4))) >/dev/null
 blockdev --flushbufs "$DEV"
 if mount -t cetrafs "$DEV" "$MNT" 2>/dev/null; then
     umount "$MNT"
-    fail "a volume with the reserved CAS-stamp feature mounted"
+    fail "a volume without the CAS-stamp feature mounted"
 else
-    pass "a volume with the reserved CAS-stamp feature (G-6) is refused"
+    pass "a volume without the CAS-stamp feature (G-6) is refused"
 fi
 "$SB_POKE" "$DEV" features_incompat "$ORIG_IN" >/dev/null
 blockdev --flushbufs "$DEV"

@@ -115,8 +115,9 @@ bool cetrafs_bmap_block_empty(const void *block)
     u64 i;
 
     for (i = 0; i < CETRAFS_BMAP_SECTORS; i++)
-        if (memchr_inv((const u8 *) block + i * CETRAFS_BMAP_SECTOR, 0, CETRAFS_BMAP_CRC_LEN))
-            return false;
+        if (memchr_inv((const u8 *) block + i * CETRAFS_BMAP_SECTOR, 0, CETRAFS_BMAP_SECTOR - CETRAFS_BMAP_TRAILER) ||
+            cetrafs_bmap_trailer((void *) block, i)->pad)
+            return false; /* the trailer's G-6 stamp aside */
     return cetrafs_bmap_sectors_ok(block, 0, CETRAFS_BMAP_SECTORS);
 }
 
@@ -2179,7 +2180,7 @@ static int cetrafs_bg_adjust_free_blocks(struct super_block *sb, u32 bg_id, s64 
  * here is: the in-sector fields with the checksum treated as zero, then
  * (CETRAFS_BLOCK_SIZE - len) zero bytes folded in.
  */
-static u32 cetrafs_bg_image_crc(const void *image, unsigned int len)
+u32 cetrafs_bg_image_crc(const void *image, unsigned int len)
 {
     static const u8 zero[8] = {0};
     size_t off = offsetof(cetrafs_block_group_t, checksum);

@@ -51,6 +51,7 @@
 #include <linux/bio.h>
 #include <linux/blkdev.h>
 #include <linux/buffer_head.h>
+#include <linux/crc32c.h>
 #include <linux/delay.h>
 #include <linux/fs.h>
 #include <linux/kernel.h>
@@ -1093,6 +1094,289 @@ unsigned int cetrafs_cas_region_size(struct super_block *sb)
  */
 
 /*
+ * G-6 (audit 2026-11-15): every CAS-managed sector carries a stamp that
+ * every swap moves to a value no swap ever wrote before
+ * (cetrafs_cas_stamp_next()). So a region never returns to an earlier
+ * image -- a late command that compared against one can never land
+ * after anything else did (the late-CAW ABA) -- and a swap whose outcome
+ * the device never reported is decided by the stamp a re-read finds:
+ * one of ours, the image it compared (not yet), or a peer's first swap
+ * from that image (ours can never land). Set HERE, after the mutator and
+ * its "no change" verdict, for every caller; the structure's own
+ * checksum is then re-stamped over it, so no mutator and no reader
+ * changes.
+ *
+ * Which structure a region is comes from its address, as the superblock
+ * and the layout give it. A swap on an address none names is said, once,
+ * loudly: every CAS writer must move the stamp, and a missed kind is a
+ * writer that does not.
+ */
+enum cetrafs_stamp_kind {
+    CETRAFS_SK_NONE,
+    CETRAFS_SK_SB,
+    CETRAFS_SK_ZG,
+    CETRAFS_SK_BG,
+    CETRAFS_SK_NODE,
+    CETRAFS_SK_JFLAG,
+    CETRAFS_SK_SEG,
+    CETRAFS_SK_INODE,
+    CETRAFS_SK_IBMAP,
+    CETRAFS_SK_PF,
+};
+
+/* TEST ONLY: inode records are not recognised as a stamped kind -- a
+ * CAS writer the classifier misses (tests/kernel/cas_stamp.sh). */
+static bool cetrafs_cas_stamp_forget_records;
+cetrafs_test_param(cas_stamp_forget_records, cetrafs_cas_stamp_forget_records, bool, 0644);
+MODULE_PARM_DESC(cas_stamp_forget_records, "TEST ONLY: the G-6 stamp classifier does not know inode records");
+
+static enum cetrafs_stamp_kind cetrafs_cas_stamp_kind(struct super_block *sb, u64 lba)
+{
+    const cetrafs_superblock_t *r = cetrafs_sb_raw(sb);
+    const struct cetrafs_iseg *is;
+    u32 nis, i;
+    int role;
+    u64 jstart, jblocks;
+#define CETRAFS_IN(start, n) (lba >= (u64) (start) && lba - (u64) (start) < (u64) (n))
+
+    if (!r)
+        return CETRAFS_SK_NONE;
+    if (unlikely(READ_ONCE(cetrafs_cas_stamp_forget_records)) && cetrafs_lba_ino(sb, lba))
+        return CETRAFS_SK_NONE; /* TEST ONLY: see the parameter */
+    if (lba == 0)
+        return CETRAFS_SK_SB;
+    if (CETRAFS_IN(le64_to_cpu(r->zg_table_start), le32_to_cpu(r->zone_group_count)))
+        return CETRAFS_SK_ZG;
+    if (CETRAFS_IN(le64_to_cpu(r->bg_table_start), le64_to_cpu(r->bg_table_first_count)))
+        return CETRAFS_SK_BG;
+    if (cetrafs_lba_in_ibmap(sb, lba))
+        return CETRAFS_SK_IBMAP;
+    if (cetrafs_lba_ino(sb, lba))
+        return CETRAFS_SK_INODE;
+    if (CETRAFS_IN(le64_to_cpu(r->node_table_start), le64_to_cpu(r->node_table_blocks)))
+        return CETRAFS_SK_NODE;
+    jstart = le64_to_cpu(r->node_journal_start);
+    jblocks = le32_to_cpu(r->node_journal_blocks);
+    if (jblocks && CETRAFS_IN(jstart, jblocks * le32_to_cpu(r->node_table_count)))
+        return (lba - jstart) % jblocks == 0 ? CETRAFS_SK_JFLAG : CETRAFS_SK_NONE;
+    if (CETRAFS_IN(le64_to_cpu(r->pending_free_start),
+                   (u64) le32_to_cpu(r->pending_free_blocks_per_zg) * le32_to_cpu(r->zone_group_count)))
+        return CETRAFS_SK_PF;
+    /* Appended Block Group table segments: [header, last descriptor]. */
+    role = cetrafs_sb_bg_seg_role(sb, lba);
+    if (role)
+        return role == 1 ? CETRAFS_SK_SEG : CETRAFS_SK_BG;
+    /* Appended inode table segments: a header block before the bitmap
+     * (the first segment is the superblock's, with none). */
+    is = cetrafs_sb_isegs(sb, &nis);
+    for (i = 1; is && i < nis; i++)
+        if (lba + 1 == is[i].bmap)
+            return CETRAFS_SK_SEG;
+    return CETRAFS_SK_NONE;
+#undef CETRAFS_IN
+}
+
+/* Where the region's primary stamp is, from the region's own start; -1:
+ * the region holds none (the other sector of a 512-byte region pair). */
+static int cetrafs_cas_stamp_off(enum cetrafs_stamp_kind k, unsigned int region_idx, unsigned int region)
+{
+    unsigned int base = region_idx * region; /* the region's offset in its block */
+
+    switch (k) {
+    case CETRAFS_SK_INODE:
+        if (base == 0)
+            return offsetof(cetrafs_inode_t, ns_cas_stamp);
+        return base == CETRAFS_INODE_FD_OFF ? (int) CETRAFS_INODE_FD_STAMP_OFF : -1;
+    case CETRAFS_SK_IBMAP:
+        return CETRAFS_BMAP_SECTOR - CETRAFS_BMAP_TRAILER; /* this region's first sector's trailer */
+    case CETRAFS_SK_PF:
+        return CETRAFS_HOT_SECTOR - sizeof(cetrafs_pf_trailer_t) + offsetof(cetrafs_pf_trailer_t, stamp);
+    default:
+        break;
+    }
+    if (base)
+        return -1; /* every other structure's swapped sector is its block's first */
+    switch (k) {
+    case CETRAFS_SK_SB:
+        return offsetof(cetrafs_superblock_t, cas_stamp);
+    case CETRAFS_SK_ZG:
+        return offsetof(cetrafs_zone_group_t, cas_stamp);
+    case CETRAFS_SK_BG:
+        return offsetof(cetrafs_block_group_t, cas_stamp);
+    case CETRAFS_SK_NODE:
+        return offsetof(cetrafs_node_entry_t, cas_stamp);
+    case CETRAFS_SK_JFLAG:
+        return offsetof(cetrafs_node_journal_hdr_t, cas_stamp);
+    case CETRAFS_SK_SEG:
+        return offsetof(cetrafs_seg_hdr_t, cas_stamp);
+    default:
+        return -1;
+    }
+}
+
+static u64 cetrafs_cas_stamp_get(const u8 *img, int soff)
+{
+    return soff < 0 ? 0 : get_unaligned_le64(img + soff);
+}
+
+/* Is a Node Registry row, its stamp aside, all zero (a FREE row)? */
+static bool cetrafs_cas_row_blank(const u8 *img)
+{
+    unsigned int so = offsetof(cetrafs_node_entry_t, cas_stamp);
+
+    return !memchr_inv(img, 0, so) && !memchr_inv(img + so + 8, 0, sizeof(cetrafs_node_entry_t) - so - 8);
+}
+
+/* Stamp 'img' (the region) with 'stamp' wherever the region holds one,
+ * and re-stamp the checksum each covers. */
+static void cetrafs_cas_stamp_set(enum cetrafs_stamp_kind k, u8 *img, unsigned int region_idx, unsigned int region,
+                                  u64 stamp)
+{
+    unsigned int base = region_idx * region, s;
+
+    switch (k) {
+    case CETRAFS_SK_SB: {
+        cetrafs_superblock_t *sbr = (cetrafs_superblock_t *) img;
+
+        put_unaligned_le64(stamp, &sbr->cas_stamp);
+        sbr->checksum = cpu_to_le64(0);
+        sbr->checksum = cpu_to_le64((u64) ~crc32c(~0U, sbr, sizeof(*sbr)));
+        break;
+    }
+    case CETRAFS_SK_ZG:
+        put_unaligned_le64(stamp, img + offsetof(cetrafs_zone_group_t, cas_stamp));
+        put_unaligned_le64(cetrafs_zg_hot_image_crc(img), img + offsetof(cetrafs_zone_group_t, hot_checksum));
+        break;
+    case CETRAFS_SK_BG:
+        put_unaligned_le64(stamp, img + offsetof(cetrafs_block_group_t, cas_stamp));
+        put_unaligned_le64(cetrafs_bg_image_crc(img, region), img + offsetof(cetrafs_block_group_t, checksum));
+        break;
+    case CETRAFS_SK_NODE:
+        /* A FREE row stays checksum-less, as mkfs leaves it; only its
+         * stamp moves (cetrafs_node_entry_blank() looks past it). */
+        put_unaligned_le64(stamp, img + offsetof(cetrafs_node_entry_t, cas_stamp));
+        if (!cetrafs_cas_row_blank(img))
+            put_unaligned_le64(cetrafs_node_image_crc(img), img + offsetof(cetrafs_node_entry_t, checksum));
+        break;
+    case CETRAFS_SK_JFLAG:
+        put_unaligned_le64(stamp, img + offsetof(cetrafs_node_journal_hdr_t, cas_stamp));
+        break;
+    case CETRAFS_SK_SEG:
+        put_unaligned_le64(stamp, img + offsetof(cetrafs_seg_hdr_t, cas_stamp));
+        put_unaligned_le64(cetrafs_seg_crc_prefix(img, region), img + offsetof(cetrafs_seg_hdr_t, checksum));
+        break;
+    case CETRAFS_SK_INODE:
+        /* Both sectors the region holds; the file sector's stamp is in
+         * the tail its CRC takes as zeros, so only the namespace
+         * sector's CRC moves. */
+        if (base == 0) {
+            put_unaligned_le64(stamp, img + offsetof(cetrafs_inode_t, ns_cas_stamp));
+            put_unaligned_le64(cetrafs_inode_ns_image_crc(img), img + offsetof(cetrafs_inode_t, ns_checksum));
+        }
+        if (base <= CETRAFS_INODE_FD_OFF && base + region > CETRAFS_INODE_FD_OFF)
+            put_unaligned_le64(stamp, img + (CETRAFS_INODE_FD_OFF - base) + CETRAFS_INODE_FD_STAMP_OFF);
+        break;
+    case CETRAFS_SK_IBMAP:
+        for (s = 0; s < region / CETRAFS_BMAP_SECTOR; s++) {
+            cetrafs_bmap_trailer_t *t = cetrafs_bmap_trailer(img, s);
+
+            put_unaligned_le64(stamp, &t->stamp);
+            t->crc = cpu_to_le32(cetrafs_bmap_sector_crc(img + s * CETRAFS_BMAP_SECTOR));
+        }
+        break;
+    case CETRAFS_SK_PF:
+        for (s = 0; s < region / CETRAFS_HOT_SECTOR; s++)
+            put_unaligned_le64(stamp, img + (s + 1) * CETRAFS_HOT_SECTOR - sizeof(cetrafs_pf_trailer_t) +
+                                          offsetof(cetrafs_pf_trailer_t, stamp));
+        break;
+    default:
+        break;
+    }
+}
+
+/* TEST ONLY: swaps leave every G-6 stamp where it was, as before the
+ * stamp (tests/kernel/cas_stamp_aba.sh). */
+static bool cetrafs_cas_stamp_off_knob;
+cetrafs_test_param(cas_stamp_off, cetrafs_cas_stamp_off_knob, bool, 0644);
+MODULE_PARM_DESC(cas_stamp_off, "TEST ONLY: CAS swaps do not move the G-6 per-sector stamp");
+
+static atomic64_t cetrafs_cas_unstamped = ATOMIC64_INIT(0);
+static atomic64_t cetrafs_cas_stamp_decided = ATOMIC64_INIT(0);
+
+u64 cetrafs_cas_stamp_decided_count(void)
+{
+    return (u64) atomic64_read(&cetrafs_cas_stamp_decided);
+}
+
+u64 cetrafs_cas_unstamped_count(void)
+{
+    return (u64) atomic64_read(&cetrafs_cas_unstamped);
+}
+
+/* Move a changed post-image's stamp past the pre-image's. Returns the
+ * stamp written (0: none -- the region has no stamp). */
+static u64 cetrafs_cas_stamp_bump(struct super_block *sb, u64 fs_lba, enum cetrafs_stamp_kind k, const u8 *old,
+                                  u8 *new, unsigned int region_idx, unsigned int region)
+{
+    int soff = cetrafs_cas_stamp_off(k, region_idx, region);
+    u64 stamp;
+
+    if (k == CETRAFS_SK_NONE) {
+        atomic64_inc(&cetrafs_cas_unstamped);
+        if (READ_ONCE(cetrafs_cas_stamp_forget_records))
+            pr_err_ratelimited("cetrafs: a CAS on block %llu (%s) has no G-6 stamp kind (test injection)\n",
+                               (unsigned long long) fs_lba, cetrafs_block_role(sb, fs_lba));
+        else
+            WARN_ONCE(1, "cetrafs: a CAS on block %llu (%s) has no G-6 stamp kind\n", (unsigned long long) fs_lba,
+                      cetrafs_block_role(sb, fs_lba));
+        return 0;
+    }
+    if (soff < 0 || READ_ONCE(cetrafs_cas_stamp_off_knob))
+        return 0;
+    stamp = cetrafs_cas_stamp_next(sb, cetrafs_cas_stamp_get(old, soff));
+    cetrafs_cas_stamp_set(k, new, region_idx, region, stamp);
+    return stamp;
+}
+
+enum cetrafs_stamp_verdict {
+    CETRAFS_SV_UNDECIDABLE, /* two or more swaps since: ours may be under them */
+    CETRAFS_SV_LANDED,      /* one of this call's swaps is on the device */
+    CETRAFS_SV_NOT_YET,     /* the image the swaps compared: none landed yet */
+    CETRAFS_SV_NEVER,       /* a peer's first swap from that image won: none of ours ever lands */
+};
+
+/*
+ * Judge a re-read after a swap whose outcome is unknown, by stamp: 'dev'
+ * on the device, 'pre' in the image every undecided swap of this call
+ * compared, 'issued' the stamps those swaps wrote. A stamp is unique
+ * per swap, so "it is one of ours" and "it is the pre-image's" are exact
+ * -- not "the bytes match", which a peer can reproduce. One more swap
+ * than pre and none of ours: a peer's swap from the same image won, and
+ * ours, comparing that image, can never land now.
+ */
+static enum cetrafs_stamp_verdict cetrafs_cas_stamp_judge(u64 dev, u64 pre, const u64 *issued, unsigned int n,
+                                                          bool overflow)
+{
+    unsigned int i;
+    u32 next = (u32) pre + 1;
+
+    if (!dev || !pre)
+        return CETRAFS_SV_UNDECIDABLE; /* not a stamped region */
+    for (i = 0; i < n; i++)
+        if (issued[i] == dev)
+            return CETRAFS_SV_LANDED;
+    if (dev == pre)
+        return CETRAFS_SV_NOT_YET;
+    /* More swaps of ours than were remembered: the stamp on the device
+     * may be one of the forgotten -- never read it as a peer's. */
+    if (overflow)
+        return CETRAFS_SV_UNDECIDABLE;
+    if ((u32) dev == (next ? next : 1))
+        return CETRAFS_SV_NEVER;
+    return CETRAFS_SV_UNDECIDABLE;
+}
+
+/*
  * The no-CAW half of cetrafs_cas_region_seeded(), split out so its
  * several exit paths cannot forget to drop the serialising mutex its
  * caller holds across this whole call. Everything here assumes that
@@ -1105,7 +1389,9 @@ static int cetrafs_cas_nocaw(struct super_block *sb,
                              u8 *old,
                              u8 *new,
                              cetrafs_cas_fn mutate,
-                             void *priv)
+                             void *priv,
+                             enum cetrafs_stamp_kind sk,
+                             unsigned int region_idx)
 {
     struct buffer_head *bh = cetrafs_bread_uncached_retry(sb, fs_lba);
     int ret;
@@ -1128,6 +1414,7 @@ static int cetrafs_cas_nocaw(struct super_block *sb,
         return (ret > 0) ? 0 : ret;
     if (!memcmp(old, new, region))
         return 0;
+    cetrafs_cas_stamp_bump(sb, fs_lba, sk, old, new, region_idx, region);
 
     bh = cetrafs_bread_retry(sb, fs_lba);
     if (!bh)
@@ -1257,6 +1544,8 @@ static unsigned int cetrafs_cas_stall_ms = 3000;
 cetrafs_test_param(cas_stall_ms, cetrafs_cas_stall_ms, uint, 0644);
 MODULE_PARM_DESC(cas_stall_ms, "TEST ONLY: how long cas_stall_ino pauses (ms)");
 
+#define CETRAFS_CAS_ISSUED_MAX 32
+
 static int cetrafs_cas_region_seeded_impl(struct super_block *sb,
                                           u64 fs_lba,
                                           unsigned int region_idx,
@@ -1275,6 +1564,13 @@ static int cetrafs_cas_region_seeded_impl(struct super_block *sb,
     u64 dev_lba = have_caw ? fs_lba * (CETRAFS_BLOCK_SIZE / caw->logical_block_size) + region_idx : 0;
     u8 *old, *new;
     u8 *unknown = NULL; /* a swap whose outcome was unknown: its post-image, then its pre-image */
+    /* G-6: the region's kind, its primary stamp's offset, and the stamps
+     * this call's swaps wrote since the image they compared. */
+    enum cetrafs_stamp_kind sk = cetrafs_cas_stamp_kind(sb, fs_lba);
+    int soff = cetrafs_cas_stamp_off(sk, region_idx, region);
+    u64 issued[CETRAFS_CAS_ISSUED_MAX];
+    unsigned int nissued = 0;
+    bool issued_over = false; /* a swap went out unremembered: no NEVER verdict */
     bool undecided = false; /* 'unknown' holds a swap that may still land */
     bool seeded = false; /* this attempt's image is the caller's seed, not the device's */
     unsigned long undecided_until = 0;
@@ -1356,7 +1652,7 @@ static int cetrafs_cas_region_seeded_impl(struct super_block *sb,
             ret = -EINTR; /* nothing read, nothing written */
             goto out;
         }
-        ret = cetrafs_cas_nocaw(sb, fs_lba, off, region, old, new, mutate, priv);
+        ret = cetrafs_cas_nocaw(sb, fs_lba, off, region, old, new, mutate, priv, sk, region_idx);
         if (READ_ONCE(cetrafs_cas_nocaw_stall_ms))
             msleep(xchg(&cetrafs_cas_nocaw_stall_ms, 0)); /* once */
         cetrafs_sb_cas_unlock(sb);
@@ -1450,11 +1746,30 @@ static int cetrafs_cas_region_seeded_impl(struct super_block *sb,
                 goto out;
             }
             if (memcmp(old, unknown + region, region)) {
-                cetrafs_sb_fatal(sb, "CAS lba=%llu: the region changed after a timed-out command -- cannot "
-                                     "tell whether it landed",
-                                 (unsigned long long) fs_lba);
-                ret = -EIO;
-                goto out;
+                /* G-6: the stamp says which. */
+                enum cetrafs_stamp_verdict sv = cetrafs_cas_stamp_judge(
+                    cetrafs_cas_stamp_get(old, soff), cetrafs_cas_stamp_get(unknown + region, soff), issued, nissued, issued_over);
+
+                if (sv == CETRAFS_SV_LANDED) {
+                    pr_warn("CAS lba=%llu: a timed-out command landed late -- taking it as done (by its stamp)\n",
+                            (unsigned long long) fs_lba);
+                    cetrafs_cas_publish_cache(sb, fs_lba, off, old, region, sole_region);
+                    ret = 0;
+                    goto out;
+                }
+                if (sv != CETRAFS_SV_NEVER) {
+                    cetrafs_sb_fatal(sb, "CAS lba=%llu: the region changed after a timed-out command -- cannot "
+                                         "tell whether it landed",
+                                     (unsigned long long) fs_lba);
+                    ret = -EIO;
+                    goto out;
+                }
+                /* A peer's swap won from the image ours compared: none
+                 * of ours can land now. Decide afresh from this read. */
+                atomic64_inc(&cetrafs_cas_stamp_decided);
+                undecided = false;
+                nissued = 0;
+                issued_over = false;
             }
         }
 
@@ -1497,6 +1812,14 @@ static int cetrafs_cas_region_seeded_impl(struct super_block *sb,
         if (!memcmp(old, new, region)) {
             ret = 0; /* mutator made no change */
             goto out;
+        }
+        {
+            u64 st = cetrafs_cas_stamp_bump(sb, fs_lba, sk, old, new, region_idx, region);
+
+            if (st && nissued < CETRAFS_CAS_ISSUED_MAX)
+                issued[nissued++] = st;
+            else if (st)
+                issued_over = true; /* past the cap: unjudgeable, as before G-6 */
         }
 
         if (unlikely(READ_ONCE(cetrafs_cas_stall_ino)) && fs_lba == cetrafs_inode_lba(sb, cetrafs_cas_stall_ino) &&
@@ -1564,14 +1887,11 @@ static int cetrafs_cas_region_seeded_impl(struct super_block *sb,
              *                                 first. Refuse loudly
              *                                 rather than guess.
              *
-             * The residue: a peer that produced a byte-identical image
-             * is read as our own success. For every idempotent mutator
-             * that is simply true -- the outcome is the outcome. For a
-             * delta it would drop one, and it needs a timeout AND a
-             * peer landing the identical bytes in the same window; the
-             * log line below is what makes it visible if it ever
-             * happens. Closing it for good needs the record to carry
-             * who wrote it, which is a format change.
+             * Byte compares, then the G-6 stamp: the post-image carries
+             * a stamp no other swap writes, so "ours" is exact, and a
+             * changed region is judged by its stamp before giving up
+             * (cetrafs_cas_stamp_judge()). Undecidable is now only two
+             * or more swaps since the image ours compared.
              */
             u8 *vb = kmalloc(CETRAFS_BLOCK_SIZE, GFP_NOIO);
 
@@ -1604,8 +1924,8 @@ static int cetrafs_cas_region_seeded_impl(struct super_block *sb,
             if (!memcmp(vb + off, new, region)) {
                 pr_warn("CAS lba=%llu: command timed out but the swap IS on the device -- taking it as done\n",
                         (unsigned long long) fs_lba);
-                if (image_only)
-                    *image_only = true; /* a peer's identical swap reads the same */
+                if (image_only && soff < 0)
+                    *image_only = true; /* unstamped: a peer's identical swap reads the same */
                 kfree(vb);
                 cetrafs_cas_publish_cache(sb, fs_lba, off, new, region, sole_region);
                 ret = 0;
@@ -1626,6 +1946,33 @@ static int cetrafs_cas_region_seeded_impl(struct super_block *sb,
                     undecided_until = jiffies + cetrafs_cas_undecided_window(sb);
                 undecided = true;
                 continue;
+            }
+            {
+                /* G-6: the stamp says which. 'old' is the image this
+                 * command compared -- every undecided one before it did
+                 * too, or the read above would have decided them. */
+                enum cetrafs_stamp_verdict sv = cetrafs_cas_stamp_judge(
+                    cetrafs_cas_stamp_get(vb + off, soff), cetrafs_cas_stamp_get(old, soff), issued, nissued, issued_over);
+
+                if (sv == CETRAFS_SV_LANDED) {
+                    pr_warn("CAS lba=%llu: command timed out and a swap of ours IS on the device (by its stamp) "
+                            "-- taking it as done\n",
+                            (unsigned long long) fs_lba);
+                    cetrafs_cas_publish_cache(sb, fs_lba, off, vb + off, region, sole_region);
+                    kfree(vb);
+                    ret = 0;
+                    goto out;
+                }
+                if (sv == CETRAFS_SV_NEVER) {
+                    pr_warn("CAS lba=%llu: command timed out and a peer's swap won (by its stamp) -- retrying\n",
+                            (unsigned long long) fs_lba);
+                    atomic64_inc(&cetrafs_cas_stamp_decided);
+                    kfree(vb);
+                    undecided = false;
+                    nissued = 0;
+                    issued_over = false;
+                    continue;
+                }
             }
             kfree(vb);
             cetrafs_sb_fatal(sb, "CAS lba=%llu: timed out and the region changed since -- cannot tell whether "
@@ -1668,12 +2015,39 @@ static int cetrafs_cas_region_seeded_impl(struct super_block *sb,
             if (!vret && !memcmp(vb + off, unknown, region)) {
                 pr_warn("CAS lba=%llu: the timed-out command landed late -- taking it as done\n",
                         (unsigned long long) fs_lba);
-                if (image_only)
+                if (image_only && soff < 0)
                     *image_only = true;
                 kfree(vb);
                 cetrafs_cas_publish_cache(sb, fs_lba, off, unknown, region, sole_region);
                 ret = 0;
                 goto out;
+            }
+            if (!vret) {
+                enum cetrafs_stamp_verdict sv =
+                    cetrafs_cas_stamp_judge(cetrafs_cas_stamp_get(vb + off, soff),
+                                            cetrafs_cas_stamp_get(unknown + region, soff), issued, nissued, issued_over);
+
+                if (sv == CETRAFS_SV_LANDED) {
+                    pr_warn("CAS lba=%llu: the timed-out command landed late -- taking it as done (by its stamp)\n",
+                            (unsigned long long) fs_lba);
+                    cetrafs_cas_publish_cache(sb, fs_lba, off, vb + off, region, sole_region);
+                    kfree(vb);
+                    ret = 0;
+                    goto out;
+                }
+                if (sv == CETRAFS_SV_NEVER || sv == CETRAFS_SV_NOT_YET) {
+                    /* NEVER: a peer's swap won from our image; ours
+                     * cannot land. NOT_YET cannot follow a MISCOMPARE
+                     * against that image -- treated alike: re-read. */
+                    atomic64_inc(&cetrafs_cas_stamp_decided);
+                    kfree(vb);
+                    undecided = sv == CETRAFS_SV_NOT_YET;
+                    if (!undecided) {
+                        nissued = 0;
+                        issued_over = false;
+                    }
+                    continue;
+                }
             }
             kfree(vb);
             cetrafs_sb_fatal(sb, "CAS lba=%llu: the region changed after a timed-out command -- cannot tell "

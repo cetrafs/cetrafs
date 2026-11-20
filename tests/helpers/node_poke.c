@@ -122,11 +122,13 @@ int main(int argc, char **argv)
 
     if (dump_only) {
         printf("state=%u hb_seq=%" PRIu64 " last_seen=%" PRIu64 " fence_epoch=%" PRIu64 " hb_interval=%u caps=0x%x mode=%u "
-               "departure=%u incarnation=%u stale_secs=%u fenced_by=%u fence_reason=%u fenced_at=%" PRIu64 "\n",
+               "departure=%u incarnation=%u stale_secs=%u fenced_by=%u fence_reason=%u fenced_at=%" PRIu64
+               " cas_stamp=%" PRIu64 "\n",
                cetrafs_le32(ne.state), cetrafs_le64(ne.hb_seq), cetrafs_le64(ne.last_seen), cetrafs_le64(ne.fence_epoch),
                cetrafs_le32(ne.hb_interval_secs), cetrafs_le32(ne.caps), cetrafs_le32(ne.file_lock_mode),
                cetrafs_le32(ne.departure), cetrafs_le32(ne.incarnation), cetrafs_le32(ne.stale_secs),
-               cetrafs_le32(ne.fenced_by), cetrafs_le32(ne.fence_reason), cetrafs_le64(ne.fenced_at));
+               cetrafs_le32(ne.fenced_by), cetrafs_le32(ne.fence_reason), cetrafs_le64(ne.fenced_at),
+               cetrafs_le64(ne.cas_stamp));
         close(fd);
         return 0;
     }

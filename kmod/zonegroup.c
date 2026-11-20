@@ -83,6 +83,12 @@ static u32 cetrafs_zg_hot_crc(const void *blk)
                                offsetof(cetrafs_zone_group_t, hot_checksum));
 }
 
+/* The hot half's CRC over a CAS image of the record (caw.c's G-6 stamp). */
+u32 cetrafs_zg_hot_image_crc(const void *blk)
+{
+    return cetrafs_zg_hot_crc(blk);
+}
+
 static u32 cetrafs_zg_cold_crc(const void *blk)
 {
     return cetrafs_zg_crc_half(blk, CETRAFS_ZG_COLD_OFF, CETRAFS_ZG_COLD_LEN,

@@ -698,6 +698,40 @@ static inline void cetrafs_registry_drop_cache(int fd, const cetrafs_superblock_
  * Returns 0 landed, 1 the row was not old_blk (nothing written to the
  * record), -1 failed (and, when unknown, read back: not landed).
  */
+/*
+ * G-6 (audit 2026-11-15 G-6): every swap of a CAS-managed sector moves its
+ * stamp to a value no swap wrote before, the kernel's and these alike
+ * (kmod/caw.c, cetrafs_cas_stamp_next()): low half the old one's plus
+ * one, high half this swap's own token. Signal-safe: the renewal timer
+ * swaps from a signal handler.
+ */
+static inline void cetrafs_row_cas_stamp(const unsigned char *old_blk, unsigned char *new_blk)
+{
+    static uint32_t tok;
+    cetrafs_node_entry_t ne;
+    uint32_t lo;
+    int blank = 1;
+    unsigned i;
+
+    uint32_t t;
+
+    /* Atomic: the renewal timer's signal handler swaps too. */
+    if (!__atomic_load_n(&tok, __ATOMIC_RELAXED))
+        __atomic_store_n(&tok, (uint32_t) getpid() * 2654435761u ^ (uint32_t) time(NULL), __ATOMIC_RELAXED);
+    t = __atomic_add_fetch(&tok, 1, __ATOMIC_RELAXED);
+    memcpy(&ne, old_blk, sizeof(ne));
+    lo = (uint32_t) cetrafs_le64(ne.cas_stamp) + 1;
+    memcpy(&ne, new_blk, sizeof(ne));
+    ne.cas_stamp = cetrafs_cpu_to_le64(((uint64_t) t << 32) | (lo ? lo : 1));
+    for (i = 0; i < sizeof(ne); i++)
+        if (((const unsigned char *) &ne)[i] && (i < offsetof(cetrafs_node_entry_t, cas_stamp) ||
+                                                 i >= offsetof(cetrafs_node_entry_t, cas_stamp) + 8))
+            blank = 0;
+    if (!blank) /* a FREE row stays checksum-less, as the kernel leaves it */
+        cetrafs_node_row_stamp(&ne);
+    memcpy(new_blk, &ne, sizeof(ne));
+}
+
 static inline int cetrafs_row_caw(int fd, const cetrafs_superblock_t *sb, uint32_t idx, const unsigned char *old_blk,
                                   const unsigned char *new_blk)
 {
@@ -713,6 +747,7 @@ static inline int cetrafs_row_caw(int fd, const cetrafs_superblock_t *sb, uint32
     cdb[13] = 1;
     memcpy(cetrafs_caw_buf, old_blk, lbs);
     memcpy(cetrafs_caw_buf + lbs, new_blk, lbs);
+    cetrafs_row_cas_stamp(old_blk, cetrafs_caw_buf + lbs);
     /* UNIT ATTENTION: not processed (SAM), the same swap again. */
     for (i = 0; i < 3; i++)
         if ((r = cetrafs_sg_cmd(fd, cdb, sizeof(cdb), SG_DXFER_TO_DEV, cetrafs_caw_buf, 2 * lbs)) != 2)
@@ -739,8 +774,8 @@ static inline int cetrafs_row_caw(int fd, const cetrafs_superblock_t *sb, uint32
         unsigned char rb[CETRAFS_BLOCK_SIZE];
 
         if (cetrafs_pread_device(fd, rb, sizeof(rb), cetrafs_node_row_off(sb, idx)) == (ssize_t) sizeof(rb) &&
-            !memcmp(rb, new_blk, lbs))
-            return 0;
+            !memcmp(rb, cetrafs_caw_buf + lbs, lbs))
+            return 0; /* our own stamp: our swap, nobody else's */
     }
     return -1;
 }

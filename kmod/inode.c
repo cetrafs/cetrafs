@@ -11,6 +11,7 @@
 #include <linux/ktime.h>
 #include <linux/minmax.h>
 #include <linux/stat.h>
+#include <linux/unaligned.h>
 #include <linux/string.h>
 #include <linux/uidgid.h>
 
@@ -118,6 +119,13 @@ u32 cetrafs_inode_crc_ns(const cetrafs_inode_t *in)
 {
     /* Sector 0 is carried whole (its pad is structural). */
     return cetrafs_sector_crc((const u8 *) in, CETRAFS_INODE_NS_BYTES, offsetof(cetrafs_inode_t, ns_checksum));
+}
+
+/* The namespace sector's CRC over its 512-byte on-disk image (caw.c's
+ * G-6 stamp). */
+u32 cetrafs_inode_ns_image_crc(const void *sector)
+{
+    return cetrafs_sector_crc(sector, CETRAFS_INODE_NS_BYTES, offsetof(cetrafs_inode_t, ns_checksum));
 }
 
 u32 cetrafs_inode_crc_fd(const cetrafs_inode_t *in)
@@ -938,8 +946,12 @@ static int cetrafs_unborn_fd_mutate(void *image, unsigned int len, void *priv)
         return -EINVAL;
     memset(&rec, 0, sizeof(rec));
     memcpy((u8 *) &rec + CETRAFS_INODE_FD_OFF, image, sizeof(rec) - CETRAFS_INODE_FD_OFF);
-    /* Never written: no change stamp yet, and no other byte either. */
-    if (cetrafs_le64(rec.file_seq) != 0 || memchr_inv(image, 0, CETRAFS_INODE_FD_BYTES)) {
+    /* Never written: no change stamp yet, and no other byte either --
+     * the G-6 stamp aside, which a swap of the namespace sector moves
+     * too where one swap covers both sectors (4Kn). */
+    if (cetrafs_le64(rec.file_seq) != 0 || memchr_inv(image, 0, CETRAFS_INODE_FD_STAMP_OFF) ||
+        memchr_inv((const u8 *) image + CETRAFS_INODE_FD_STAMP_OFF + 8, 0,
+                   CETRAFS_INODE_FD_BYTES - CETRAFS_INODE_FD_STAMP_OFF - 8)) {
         ctx->lost = true;
         return 1;
     }
@@ -1024,7 +1036,13 @@ static int cetrafs_landed_fd_mutate(void *image, unsigned int len, void *priv)
 
     if (len < CETRAFS_INODE_FD_BYTES)
         return -EINVAL;
-    if (memcmp(image, ctx->seed, CETRAFS_INODE_FD_BYTES)) {
+    /* The sector as judged, its G-6 stamp aside: the seed is built from
+     * the record (its tail zero), the device's carries a stamp once any
+     * swap has written the sector. */
+    if (memcmp(image, ctx->seed, CETRAFS_INODE_FD_STAMP_OFF) ||
+        memcmp((const u8 *) image + CETRAFS_INODE_FD_STAMP_OFF + 8,
+               (const u8 *) ctx->seed + CETRAFS_INODE_FD_STAMP_OFF + 8,
+               CETRAFS_INODE_FD_BYTES - CETRAFS_INODE_FD_STAMP_OFF - 8)) {
         ctx->lost = true;
         return 1;
     }
@@ -1995,10 +2013,26 @@ static int __cetrafs_write_raw_inode(struct super_block *sb, u64 ino, const cetr
      * (This is hazard 1 in ioutil.c's own comment -- the one measured as
      * 12 of 292 directory entries lost -- reintroduced by not using the
      * helper that exists to prevent it.) */
-    cetrafs_bh_begin_update(bh);
-    memcpy(bh->b_data, &stamped, sizeof(stamped));
-    memset(bh->b_data + sizeof(stamped), 0, CETRAFS_BLOCK_SIZE - sizeof(stamped));
-    cetrafs_bh_end_update(sb, bh);
+    /* G-6: a whole-record write moves the record's stamps as a swap
+     * does -- past the image it was built from -- so no swap's late
+     * command can ever match what this leaves. */
+    {
+        u64 st;
+
+        cetrafs_bh_begin_update(bh);
+        /* Past the stamp on the device if this node has it, else past
+         * the caller's copy: unique by its token either way, and the
+         * count stays a count where it can (G-6 review). */
+        st = cetrafs_cas_stamp_next(sb, buffer_uptodate(bh)
+                                            ? get_unaligned_le64(bh->b_data + offsetof(cetrafs_inode_t, ns_cas_stamp))
+                                            : cetrafs_le64(stamped.ns_cas_stamp));
+        stamped.ns_cas_stamp = cetrafs_cpu_to_le64(st);
+        cetrafs_inode_stamp_crc_ns(&stamped);
+        memcpy(bh->b_data, &stamped, sizeof(stamped));
+        memset(bh->b_data + sizeof(stamped), 0, CETRAFS_BLOCK_SIZE - sizeof(stamped));
+        put_unaligned_le64(st, bh->b_data + CETRAFS_INODE_FD_OFF + CETRAFS_INODE_FD_STAMP_OFF);
+        cetrafs_bh_end_update(sb, bh);
+    }
     /* A forced-fresh read returns this buffer from here on (a dirty one
      * is never dropped): the record's epoch moves now. */
     cetrafs_rec_epoch_bump(sb, bh->b_blocknr);
