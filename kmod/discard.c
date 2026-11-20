@@ -257,6 +257,10 @@ static int cetrafs_discard_issue(struct super_block *sb, u32 bg_id, u64 lba, u64
         if (ret)
             goto failed;
     }
+    /* Again, after the cache flush above (seconds on a SAN): a lease that
+     * ran out in it must not see the UNMAP go (audit BC-8). */
+    if (cetrafs_sb_is_fenced(sb))
+        return -EIO;
     ret = blkdev_issue_discard(sb->s_bdev, (sector_t) lba * (CETRAFS_BLOCK_SIZE >> SECTOR_SHIFT),
                                (sector_t) count * (CETRAFS_BLOCK_SIZE >> SECTOR_SHIFT), GFP_NOFS);
 failed:

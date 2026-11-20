@@ -3853,8 +3853,12 @@ int cetrafs_free_data_extent_unless_reserved(struct super_block *sb, u64 lba, u3
  * The cached descriptor is the right read here, and not only for speed:
  * a group this node owns is written by this node alone and leaves it
  * only by our own release (which takes only an EMPTY group, and these
- * blocks are allocated) or by a peer's steal (which fences us, and our
- * frees then never land). Every other answer -- a foreign or unowned
+ * blocks are allocated) or by a peer's steal, which comes only after our
+ * one-way lease has lapsed (a premise, see cetrafs_frees_begin()) -- and
+ * a free reaches the device only as a held bitmap block written by a
+ * gated flush, not by writeback (tests/kernel/fence_writeback_race.sh;
+ * audit BC-8), short of a freeze between a gate and its send. Every
+ * other answer -- a foreign or unowned
  * group, an unreadable descriptor, a run past the data region -- is
  * "not ours", which announces: the safe direction.
  */

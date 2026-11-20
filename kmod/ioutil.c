@@ -437,7 +437,9 @@ void cetrafs_bh_read_unlock(struct buffer_head *bh)
 }
 
 /* The pre-A-15 publish: dirty, for the block layer's writeback. Only the
- * fallbacks below, TEST ONLY meta_writeback and sync_test_dirty_lba use it. */
+ * TEST ONLY paths use it -- meta_writeback, bitmap_writeback,
+ * held_store_fallback_dirty and sync_test_dirty_lba -- and an update with
+ * no sb_info (no mount, no lease; it WARNs). */
 void cetrafs_bh_end_update_dirty(struct buffer_head *bh)
 {
     cetrafs_blk_tail_settle(bh); /* dirty means writeback may write it: never with a stale tail */
@@ -508,6 +510,22 @@ u64 cetrafs_held_flush_count(void)
     return (u64) atomic64_read(&cetrafs_held_flushes);
 }
 
+/* TEST ONLY: the held list "cannot take" the next block (an xa_store
+ * failure), and with held_store_fallback_dirty the old answer -- dirty,
+ * for writeback -- is taken (tests/kernel/fence_writeback_race.sh). */
+static bool cetrafs_held_store_fail;
+cetrafs_test_param(held_store_fail, cetrafs_held_store_fail, bool, 0644);
+MODULE_PARM_DESC(held_store_fail, "TEST ONLY: listing a held metadata block fails as if out of memory");
+static bool cetrafs_held_store_fallback_dirty;
+cetrafs_test_param(held_store_fallback_dirty, cetrafs_held_store_fallback_dirty, bool, 0644);
+MODULE_PARM_DESC(held_store_fallback_dirty, "TEST ONLY: a held block that cannot be listed is dirtied for writeback, as before audit BC-8");
+static atomic64_t cetrafs_held_store_retries = ATOMIC64_INIT(0);
+
+u64 cetrafs_held_store_retry_count(void)
+{
+    return (u64) atomic64_read(&cetrafs_held_store_retries);
+}
+
 void cetrafs_bh_end_update_held(struct super_block *sb, struct buffer_head *bh, bool changed)
 {
     struct xarray *xa = cetrafs_sb_held(sb);
@@ -518,22 +536,47 @@ void cetrafs_bh_end_update_held(struct super_block *sb, struct buffer_head *bh, 
         return;
     }
     if (READ_ONCE(cetrafs_bitmap_writeback) || !xa) {
-        cetrafs_bh_end_update_dirty(bh); /* test-only (or no sb_info): dirty, as before */
+        /* test-only; no sb_info is a block updated outside any mount,
+         * where no lease exists to outlive */
+        WARN_ON_ONCE(!xa && !READ_ONCE(cetrafs_bitmap_writeback));
+        cetrafs_bh_end_update_dirty(bh);
         return;
     }
     if (!test_set_buffer_cetra_held(bh)) {
         get_bh(bh);
-        old = xa_store(xa, bh->b_blocknr, bh, GFP_NOFS);
-        if (xa_is_err(old)) {
-            /* No room to list it: dirty, as before -- writeback may
-             * write it, which is the old exposure, not a lost bit. */
+        old = READ_ONCE(cetrafs_held_store_fail) ? (void *) XA_ERROR(-ENOMEM) /* TEST ONLY */
+                                                 : xa_store(xa, bh->b_blocknr, bh, GFP_NOFS);
+        if (xa_is_err(old) && READ_ONCE(cetrafs_held_store_fallback_dirty)) {
+            /* TEST ONLY: the old fallback, dirty for writeback. */
             clear_buffer_cetra_held(bh);
             put_bh(bh);
             cetrafs_bh_end_update_dirty(bh);
             return;
         }
-        if (old)
+        /*
+         * No room to list it: it used to be dirtied instead, and the
+         * block layer's writeback -- which no lease gates -- could then
+         * put this node's bitmap on the device after the lease was gone,
+         * over a peer's (A-15's last residue; audit 2026-11-15 BC-8: a
+         * free decided before a freeze landing after it). A held block
+         * is written only by cetrafs's gated flushes, so the listing is
+         * tried once more, and a second failure stops the mount.
+         */
+        if (xa_is_err(old)) {
+            atomic64_inc(&cetrafs_held_store_retries);
+            old = xa_store(xa, bh->b_blocknr, bh, GFP_NOFS);
+        }
+        if (xa_is_err(old)) {
+            /* Still no room. Neither dirty (ungated, A-15) nor held and
+             * unlisted (never written: a lost bit): stop the mount, the
+             * state a crash leaves -- nothing after this publishes an
+             * extent naming the bit (docs/internal/ERRORS.md). The block
+             * stays held, pinned, and is dropped with the mount. */
+            cetrafs_sb_fatal(sb, "a metadata block (%llu) could not be listed for its gated write (%d)",
+                             (unsigned long long) bh->b_blocknr, xa_err(old));
+        } else if (old) {
             put_bh((struct buffer_head *) old); /* listed already: one pin per entry */
+        }
     }
     unlock_buffer(bh);
 }
@@ -919,6 +962,9 @@ static int __cetrafs_sync_buffer(struct super_block *sb, struct buffer_head *bh,
         }
     }
     if (cetrafs_meta_gate_shut(sb)) {
+        /* A stopped mount writes nothing: its dirt goes now, not at the
+         * sweep, so writeback cannot write it in between (BC-8). */
+        clear_buffer_dirty(bh);
         unlock_buffer(bh);
         return -ESHUTDOWN;
     }
@@ -1848,11 +1894,15 @@ static int __cetrafs_sync_buffers_keep(struct super_block *sb, struct buffer_hea
             continue;
         }
         if (buffer_write_io_error(bh)) {
-            /* an earlier write of these bytes failed: put them back */
+            /* an earlier write of these bytes failed: put them back --
+             * held again if held, never handed to writeback (BC-8) */
+            bool held = buffer_cetra_held(bh);
+
             clear_buffer_write_io_error(bh);
             set_buffer_uptodate(bh);
             unlock_buffer(bh);
-            mark_buffer_dirty(bh);
+            if (!held)
+                mark_buffer_dirty(bh);
             io[i].state = -EIO;
             continue;
         }
@@ -1876,6 +1926,12 @@ static int __cetrafs_sync_buffers_keep(struct super_block *sb, struct buffer_hea
         if (READ_ONCE(cetrafs_keep_batch_fail)) {
             WRITE_ONCE(cetrafs_keep_batch_fail, cetrafs_keep_batch_fail - 1);
             io[i].b.status = -EIO; /* TEST ONLY: refused, unsent */
+            continue;
+        }
+        /* Asked again at the send: the gate above may be a whole batch
+         * of buffer locks ago (audit BC-8). Unsent, as a refusal. */
+        if (cetrafs_meta_gate_shut(sb)) {
+            io[i].b.status = -ESHUTDOWN;
             continue;
         }
         atomic_inc(&left);

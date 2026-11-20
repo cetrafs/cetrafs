@@ -5294,8 +5294,15 @@ u64 cetrafs_sb_resv_seq(struct super_block *sb)
  * still counts every free (frees_count). The verdict is safe in both
  * directions it can be wrong in: a group this node owns is authoritative
  * in its own cache -- it leaves only by our release, which takes only an
- * empty group, or by a peer's steal, which fences us first and our frees
- * then never land -- and anything unreadable or unowned reads foreign.
+ * empty group, or by a peer's steal. A steal comes only once our row is
+ * stale, which is after our own one-way lease has lapsed (a PREMISE on
+ * the two windows and bounded clock rates, not tested), and our free
+ * reaches the device only as a held bitmap block written by a gated
+ * flush, never by the block layer's writeback (fence_writeback_race.sh:
+ * fenced by the device's word; a lease lapse shuts the same gate). What
+ * stays open is the distance between a gate and its send -- a freeze
+ * there lands the write late, as any I/O in flight does (A-6, BM-49).
+ * Anything unreadable or unowned reads foreign.
  *
  * The row flag is written durably before begin returns; a node that
  * cannot write it (fenced, its row lost) must not publish at all, so the
