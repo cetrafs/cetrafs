@@ -806,7 +806,12 @@ int main(int argc, char **argv)
                 dev, row, label[0] ? ", " : "", label[0] ? label : "", age);
     }
 
-    int fd = open(dev, dry_run ? (O_RDONLY | O_CLOEXEC) : (O_RDWR | O_CLOEXEC));
+    /* A real format is exclusive: the kernel refuses the open while the
+     * device is mounted in any mount namespace (the /proc check above
+     * sees only this one) or held by anything else. Dry-run only reads. */
+    int fd = dry_run ? open(dev, O_RDONLY | O_CLOEXEC) : cetrafs_open_excl(dev, O_RDWR | O_CLOEXEC);
+    if (fd < 0 && errno == EBUSY)
+        die_dev(CETRAFS_EXCL_BUSY_FMT, dev);
     if (fd < 0)
         die_dev("open(%s): %s", dev, strerror(errno));
 

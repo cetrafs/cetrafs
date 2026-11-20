@@ -572,8 +572,19 @@ int main(int argc, char **argv)
     if (dry_run && !live)
         growfs_refuse_live_peer(dev);
 
-    int fd = open(dev, dry_run ? (O_RDONLY | O_CLOEXEC) : (O_RDWR | O_CLOEXEC));
+    /* An offline grow is exclusive, so a mount in any namespace refuses it.
+     * A LIVE grow cannot be: the device is mounted here, and the kernel
+     * holds it for that mount. Dry-run only reads. */
+    int fd;
 
+    if (dry_run)
+        fd = open(dev, O_RDONLY | O_CLOEXEC);
+    else if (live)
+        fd = open(dev, O_RDWR | O_CLOEXEC);
+    else
+        fd = cetrafs_open_excl(dev, O_RDWR | O_CLOEXEC);
+    if (fd < 0 && errno == EBUSY)
+        die_dev(CETRAFS_EXCL_BUSY_FMT, dev);
     if (fd < 0)
         die_dev("open(%s): %s", dev, strerror(errno));
 

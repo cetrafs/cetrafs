@@ -127,26 +127,23 @@ static inline long long cetrafs_test_env_ll(const char *name, long long lo, long
     return r;
 }
 
-/* Is 'fd' something only a test makes: an image file, a loop device, or
- * a device-mapper stack whose every member is a loop device (the crash
- * rig's dm-log-writes)? */
-static inline int cetrafs_fd_is_test_device(int fd)
+/* Is the object 'st' describes something only a test makes: an image
+ * file, a loop device, or a device-mapper stack whose every member is a
+ * loop device (the crash rig's dm-log-writes)? */
+static inline int cetrafs_stat_is_test_device(const struct stat *st)
 {
     char path[96];
-    struct stat st;
     DIR *d;
     struct dirent *e;
     int members = 0, others = 0;
 
-    if (fstat(fd, &st))
-        return 0;
-    if (S_ISREG(st.st_mode))
+    if (S_ISREG(st->st_mode))
         return 1;
-    if (!S_ISBLK(st.st_mode))
+    if (!S_ISBLK(st->st_mode))
         return 0;
-    if (major(st.st_rdev) == 7) /* loop */
+    if (major(st->st_rdev) == 7) /* loop */
         return 1;
-    snprintf(path, sizeof(path), "/sys/dev/block/%u:%u/slaves", major(st.st_rdev), minor(st.st_rdev));
+    snprintf(path, sizeof(path), "/sys/dev/block/%u:%u/slaves", major(st->st_rdev), minor(st->st_rdev));
     d = opendir(path);
     if (!d)
         return 0;
@@ -160,6 +157,15 @@ static inline int cetrafs_fd_is_test_device(int fd)
     }
     closedir(d);
     return members > 0 && others == 0;
+}
+
+static inline int cetrafs_fd_is_test_device(int fd)
+{
+    struct stat st;
+
+    if (fstat(fd, &st))
+        return 0;
+    return cetrafs_stat_is_test_device(&st);
 }
 
 /* A TEST knob that DAMAGES the volume (zeroes a journal, leaves Block
@@ -243,6 +249,50 @@ static inline int cetrafs_device_mounted(const char *dev, char *where, size_t wh
 
     fclose(f);
     return mounted;
+}
+
+/*
+ * The message a destructive tool prints when its exclusive open of the
+ * device is refused. Callers pass the device name. The kernel refuses
+ * the open (EBUSY) while the device is mounted in ANY mount namespace or
+ * held by another exclusive opener -- the one check here a private mount
+ * namespace cannot hide from (cetrafs_device_mounted() reads this
+ * namespace's table only). Format string, no trailing newline.
+ */
+#define CETRAFS_EXCL_BUSY_FMT                                                                              \
+    "%s is in use: the exclusive open was refused (EBUSY) -- it is mounted in another mount namespace, " \
+    "or held open exclusively by another process; unmount or release it there, then retry"
+
+/*
+ * open() for a DESTRUCTIVE write. On a block device the open carries
+ * O_EXCL, which the kernel refuses with EBUSY while anything else holds
+ * the device (a mount in any namespace, a dm stack over it, another
+ * exclusive opener). A regular file gets no O_EXCL: without O_CREAT it
+ * is undefined there, and the loop images the tests use are regular
+ * files. Callers print CETRAFS_EXCL_BUSY_FMT on errno == EBUSY.
+ *
+ * TEST ONLY knob CETRAFS_TEST_TOOLS_NO_EXCL: skips O_EXCL, so a suite can
+ * show what the tool did before this check existed. Honoured only on a
+ * test device (an image or loop device); anywhere else it refuses the
+ * run (exit 2), because skipping the claim on a live LUN is damage.
+ */
+static inline int cetrafs_open_excl(const char *dev, int flags)
+{
+    struct stat st;
+    int excl = 0;
+
+    if (stat(dev, &st) == 0 && S_ISBLK(st.st_mode)) {
+        excl = 1;
+        if (cetrafs_test_env("CETRAFS_TEST_TOOLS_NO_EXCL")) {
+            if (!cetrafs_stat_is_test_device(&st)) {
+                fprintf(stderr, "cetrafs: TEST KNOB CETRAFS_TEST_TOOLS_NO_EXCL skips the exclusive open and is "
+                                "honoured only on an image file or a loop device; refusing to run\n");
+                exit(2);
+            }
+            excl = 0;
+        }
+    }
+    return open(dev, flags | (excl ? O_EXCL : 0));
 }
 
 

@@ -3402,7 +3402,15 @@ int main(int argc, char **argv)
         }
     }
 
-    int fd = open(dev, (repair_mode ? O_RDWR : O_RDONLY) | O_CLOEXEC);
+    /* A repair writes, so its open is exclusive: the kernel refuses it
+     * while the device is mounted in any mount namespace (the check above
+     * sees only this one). A read-only check takes no claim. */
+    int fd = repair_mode ? cetrafs_open_excl(dev, O_RDWR | O_CLOEXEC) : open(dev, O_RDONLY | O_CLOEXEC);
+
+    if (fd < 0 && errno == EBUSY) {
+        fprintf(stderr, "ERR: " CETRAFS_EXCL_BUSY_FMT "\n", dev);
+        return FSCK_EXIT_NOEXAM;
+    }
 
     /* A live walk reads past the cache (F-54). Test knob only: the
      * buffered reads, as before (fsck_live_reads_device.sh's control). */
