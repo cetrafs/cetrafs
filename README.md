@@ -186,7 +186,11 @@ In this repo:
 
   for multipath and single-path initiators alike (no multipath: the last
   term is zero). An iSCSI `replacement_timeout` of -1 (no limit) breaks it
-  by definition. Nothing checks this at mount time: setting the timers is
+  by definition. At the other end, `no_path_retry fail` (no queueing at
+  all) turns every moment with no path -- a switch reboot, a
+  controller failover -- into an I/O error on a metadata write, which
+  stops the mount until it is remounted (`docs/internal/ERRORS.md`).
+  Use a bounded count that fits the rule above instead. Nothing checks this at mount time: setting the timers is
   the operator's job, as is hardware fencing where a cluster has it.
 
   A `controls` change lasts until the volume is unmounted; the next mount
