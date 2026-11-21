@@ -26,7 +26,7 @@ make check
 ```
 
 That is the gate. It runs every suite under `tests/image/` and
-`tests/kernel/` -- **837 suites, about 6,600 individual assertions** --
+`tests/kernel/` -- **868 suites, about 6,900 individual assertions** --
 against a loop-backed volume, and exits nonzero if any assertion fails
 OR if any suite aborts without failing one. Nothing ships on a red gate.
 
@@ -57,7 +57,7 @@ df -Pm /                                       # confirm the floor
 
 ### `tests/image/` -- the tools, with no kernel involved
 
-73 suites. No module is loaded and nothing is mounted: `mkfs.cetra`
+74 suites. No module is loaded and nothing is mounted: `mkfs.cetra`
 writes the structures, a poke helper corrupts exactly one of them, and
 `fsck.cetra` must report *that* fault and exit nonzero.
 
@@ -75,7 +75,7 @@ unbounded is still the bug.
 
 ### `tests/kernel/` -- the regression suite proper
 
-764 suites, one concern each, against a loaded module and a real mount.
+794 suites, one concern each, against a loaded module and a real mount.
 Roughly by area:
 
 | area | what it covers |
@@ -323,7 +323,7 @@ source, which is most of the value.
 A "node" in cetrafs is a kernel instance with its own machine UUID, so
 real cross-node behaviour cannot be simulated with two processes on one
 box. `ctest/` is a Go master/slave harness driving **two or more real
-machines against one shared LUN**, with 68 scenarios. The suite requires
+machines against one shared LUN**, with 70 scenarios. The suite requires
 at least two machines; a second three-node rig on an FC multipath LUN
 exercises scalability beyond the testing minimum.
 

@@ -61,9 +61,9 @@ shared, CAW-capable LUN. The on-disk format, the cluster protocol and the
 recovery paths are complete, and the open-defect list is empty.
 
 That claim rests on the test effort, which is larger than the
-filesystem: 837 regression suites and ~6,600 assertions per gate, a
+filesystem: 868 regression suites and ~6,900 assertions per gate, a
 negative control in five suites of six proving each fails without the
-fix it guards, 68 two-node scenarios on real Fibre Channel and iSCSI
+fix it guards, 70 two-node scenarios on real Fibre Channel and iSCSI
 storage,
 crash replay at arbitrary cuts, hostile-image fuzzing of both `fsck` and
 the mount path, a KASAN build, and 59 catalogued bug classes each audited
@@ -82,8 +82,8 @@ coherent reads across hosts) before anything is put on it.
 
 ## Feedback
 
-cetrafs is early, and the fastest way to improve it is to hear from
-people running it on real hardware. A cluster that is not mine finds
+cetrafs is young, and the fastest way to make it better now is to hear
+from people running it on real hardware. A cluster that is not mine finds
 things no amount of review does — that has been true of every serious
 bug so far.
 

@@ -160,9 +160,9 @@ and at least one of them has to run before a layer is called clean.
 
 ## Confidence bar
 
-The filesystem itself arrives here already gated: 837 suites and about
-6,600 assertions per change, a negative control in five suites of six,
-68 two-node scenarios on real shared storage, crash replay, fuzzing, a
+The filesystem itself arrives here already gated: 868 suites and about
+6,900 assertions per change, a negative control in five suites of six,
+70 two-node scenarios on real shared storage, crash replay, fuzzing, a
 KASAN build and a randomized content oracle whose seeded replays caught
 microsecond-window races at one-in-millions per-operation odds
 (`docs/QUALITY.md`, `docs/TEST-SUITES.md`).

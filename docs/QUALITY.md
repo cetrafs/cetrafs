@@ -15,18 +15,18 @@ This page is the summary. `docs/TEST-SUITES.md` is the full map, and
 
 | | |
 |---|---|
-| Automated regression suites (`make check`) | **837** -- 764 against a mounted kernel module, 73 against the tools alone |
-| Assertions per full gate | **~6,600**, every one of which must pass; a suite that aborts without failing an assertion also fails the gate |
-| Suites with a negative control | **631 of 764** kernel suites name the protection they test and prove the test fails without it |
-| Test-only fault switches in the module | **639** -- each removes exactly one protection, so a suite can show *that* protection is what prevents the damage |
-| Two-node scenarios on real shared storage (`ctest/`) | **68**; the release suite runs 46 of them, ~400 cross-node assertions, on a Fibre Channel multipath LUN with real COMPARE AND WRITE |
-| Mechanical checks on the source itself | **155** -- locking order, sleeping under spinlocks, allocator families, async drains, signal handlers, one per bug class where a grep can decide it |
+| Automated regression suites (`make check`) | **868** -- 794 against a mounted kernel module, 74 against the tools alone |
+| Assertions per full gate | **~6,900**, every one of which must pass; a suite that aborts without failing an assertion also fails the gate |
+| Suites with a negative control | about **five in six** of the 794 kernel suites name the protection they test and prove the test fails without it |
+| Test-only fault switches in the module | **699** -- each removes exactly one protection, so a suite can show *that* protection is what prevents the damage |
+| Two-node scenarios on real shared storage (`ctest/`) | **70**; the release suite runs 48 of them, ~480 cross-node assertions, on Fibre Channel and iSCSI LUNs with real COMPARE AND WRITE |
+| Mechanical checks on the source itself | **159** -- locking order, sleeping under spinlocks, allocator families, async drains, signal handlers, one per bug class where a grep can decide it |
 | Bug classes on file | **59**, each with the question an audit must ask, a sweep of the tree, and a mechanical check or instrument |
 | Distinct faults `fsck.cetra` names | **118** errors (131 findings with warnings); the image suites inject faults one at a time and require `fsck` to name the one injected |
 | Fuzz campaigns per release | 4: hostile images against `fsck` and against the mount path, blind and field-aware |
-| Crash-consistency scenarios | 7, replaying every write the filesystem made up to an arbitrary cut |
+| Crash-consistency scenarios | 8, replaying every write the filesystem made up to an arbitrary cut |
 | Performance invariants | **22**, each measured on real SAN hardware and guarded by a test |
-| Lines of test code | **~128,000** -- 1.4x the kernel module and tools combined |
+| Lines of test code | **~133,000** -- 1.4x the kernel module and tools combined |
 | Known open defects | **none** (`docs/internal/OPEN-DEFECTS.md` is kept empty by fixing, not by moving things out of it) |
 
 ---
@@ -37,12 +37,12 @@ This page is the summary. `docs/TEST-SUITES.md` is the full map, and
    reproduces the fault. The fix is then removed -- or its test-only switch
    flipped -- and the suite must fail. A check that has never been seen to
    fail is not counted as coverage.
-2. **The full gate.** All 837 suites on loop-backed volumes, sharded across
+2. **The full gate.** All 868 suites on loop-backed volumes, sharded across
    three machines. Nothing ships on a red gate, and a
    change to the userspace tools gets the whole gate too: almost every kernel
    suite runs `mkfs` and `fsck`.
 3. **The source invariants.** `image/source_invariants.sh` reads the code,
-   not its behaviour: 155 checks that hold the tree to rules learned from
+   not its behaviour: 159 checks that hold the tree to rules learned from
    real bugs (below).
 4. **The two-node suite on real hardware.** `ctest/` drives two or three
    machines against one shared LUN. It is the only tier that exercises the
@@ -73,7 +73,7 @@ This page is the summary. `docs/TEST-SUITES.md` is the full map, and
 The rule the whole tree is held to: **a test that cannot fail is worse than
 no test**, because it reads as coverage. So:
 
-- **Negative controls are part of the suite.** 631 kernel suites carry
+- **Negative controls are part of the suite.** Most kernel suites carry
   one, naming the switch that removes the protection, and run it: with
   the protection the damage does not happen; without it the same suite
   must see the damage. A control that does not fail is
@@ -198,19 +198,24 @@ counts the operations rather than timing them.
 
 ## The last validation run
 
-The format-batch tree, 2026-11-19:
+The 0.10.1 release tree, 2026-11-21:
 
 | stage | result |
 |---|---|
-| full gate, 837 suites on three machines | **6,623 assertions passed, 0 failed** |
-| two-node release suite, FC multipath LUN | 41 of 41 passed; 4 more need a dead node plus two survivors and run on the three-node rig |
+| full gate, 868 suites | **6,937 assertions passed, 0 failed** |
+| two-node release suite, three nodes on an iSCSI LUN | 46 of 46 passed (one rerun on a fresh volume after the earlier scenarios had filled the small test LUN) |
+| live grow, three nodes on an FC multipath LUN | `grow-twice` and `grow-unrescanned` passed |
+| crash rig, every phase and its negative control | passed; every torn journaled block restored by replay |
 | fuzz: `fsck` blind / field-aware | 3,000 / 3,000 iterations, 0 findings |
 | fuzz: mount blind / field-aware | 300 / 300 hostile images, 0 findings, no kernel warning |
-| KASAN build, full gate (6,596 assertions), then the suites the last fixes touched on the final tree | 0 KASAN reports |
+| soak, a full `fsck` after every round | 200 rounds clean; content oracle 6 rounds, every block byte-exact |
+| sparse (endianness) | clean |
+| KASAN build, full gate | 0 reports (on the 2026-11-19 tree; not repeated for this release) |
 
-Every failure that run found was fixed in the same series, with a suite
-that fails without the fix. Three of them were found only by the two-node
-tier.
+The run found no filesystem defect. Four test-harness faults it exposed
+-- a timing window in one suite, two time limits sized too short, and a
+crash-rig phase whose target no longer changes in place -- were fixed
+and their stages run again.
 
 ---
 
