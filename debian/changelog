@@ -1,3 +1,109 @@
+cetrafs (0.10.1) unstable; urgency=medium
+
+  * Format change: CETRAFS_VERSION moves from 0x0009 to 0x000A, so volumes
+    made by earlier releases do not mount. Back up, reformat with
+    mkfs.cetra from this release, and restore. Every node must run this
+    release. From here on the format version is the only compatibility
+    line: nodes on different kernels and different builds of one format
+    may share a volume; another format is refused at mount.
+
+  * Packaging: DKMS builds cetrafs only for kernels 7.0 to 7.2.x. Any other
+    kernel gets no module, so keep the running kernel pinned and move the
+    pin only after `dkms status` lists cetrafs for the new one (README,
+    "Kernel upgrades"). Packaged builds no longer fail on compiler
+    warnings, and their test-only knobs are locked.
+
+  * New: space returns to thin LUNs. An emptied Block Group is discarded
+    (UNMAP) before it goes back to the pool, on devices that support
+    discard; the nodiscard mount option, or discard=off in controls,
+    turns that off. fstrim trims the free space of the Block Groups a
+    node owns and of the unowned pool. Inline discard of freed runs is
+    off by default; the discard mount option turns it on.
+
+  * New: ZERO_RANGE and hole punch zero in place where the device has WRITE
+    ZEROES, so zeroed images stay written and unfragmented. On a file a peer
+    has open they zero rather than refuse, unless the peer holds the file's
+    lock. Without WRITE ZEROES, EOPNOTSUPP is still returned.
+
+  * New: larger files and trees. Extent trees reach depth 3 (about 65.5
+    million extents per file), block numbers are 48 bits (files up to 1 EiB),
+    and directories grow past one leaf. A sparse file's first scattered write
+    allocates a 64 KiB unit, so thin images no longer exhaust the extent tree.
+    Defrag now moves sparse, preallocated and very fragmented files.
+
+  * New: growth and recovery. A live grow raises the largest file size, and a
+    node at ENOSPC asks for the grown layout first. The inode table grows with
+    the volume. mkfs and growfs keep a copy of block 0 at block 2048; a mount
+    with a damaged block 0 is refused and names the copy, and fsck -r restores
+    block 0 from it. fsck -r also rebuilds a damaged Zone Group record, Block
+    Group descriptor or registry row where the rest of the volume determines
+    it. The needs-fsck mark is kept in the superblock until a clean repair pass.
+
+  * Changed, cluster: each registry row advertises its stale window, and peers
+    wait the longest window a live row advertises (at most 240 s). The lease
+    runs on every mount, with or without COMPARE AND WRITE, from registration,
+    timed on boot time. An HA agent may declare a fenced host dead by writing
+    dead=<row>:<incarnation> to controls; the write is refused while that row
+    still beats. A cleanly departed row is reused when no row is free.
+
+  * Changed, multipath and mount: the CAW path follows ALUA and failover, and
+    ranks a blocked SCSI path last. No mount helper checks transport timers any
+    more; queued I/O must end before the lease lapses, as the README describes.
+    Unmount stops the maintenance pass before the lease renewal, a LUN shrunk
+    under a live mount stops it, and a mount that stops while mounting is
+    refused with EIO.
+
+  * Fixed, journal: a replay checks each entry against its owner's inode and
+    generation, re-reads its target after that check, and refuses an entry
+    whose owner is gone. An entry kept for a live opener blocks only its own
+    file. A dirent or xattr write refused for space fails its operation with
+    ENOSPC, not the mount.
+
+  * Fixed, data: fsync publishes no record over a failed flush, and a publish
+    that may have landed is never undone. A record publish keeps a peer's newer
+    extent root, and a held-back leaf a peer rewrote is dropped, not written
+    back. Lookups re-walk after a concurrent tree edit. A tree or dirent block
+    that fails its checksum marks its file.
+
+  * Fixed, locking: flock(LOCK_EX) applies a peer's change before it returns.
+    A defrag pass yields to a peer's open instead of failing it with ETXTBSY.
+    Lock and presence claims name the incarnation that took them, so a
+    re-attached node's old claims are not given back. fcntl and OFD locks get
+    ENOLCK on a default mount (they were granted on one node only); under
+    nofilelock, or with the new localposixlocks option, they are granted
+    node-locally.
+
+  * Fixed, free space: a full Block Group no longer reads as free while its
+    count is being written, so a large fallocate no longer fails ENOSPC with
+    space free. statfs f_bavail leaves out Zone Groups a peer owns. A thin pool
+    out of space fails the operation with ENOSPC, and an O_DIRECT write into a
+    full pool returns ENOSPC, so qemu pauses the guest instead of reporting I/O
+    errors.
+
+  * Fixed, frees and scrub: a queued free for a group that was released or
+    retaken is dropped by its stamp, not counted as damage. The scrub frees
+    only while a group still belongs to the Zone Group it scanned, and its
+    interval and confirmation gap are bounded.
+
+  * Changed, speed: statfs reads the Zone Group table at most once a second.
+    Table, registry, queue, tree and bitmap I/O moves in batches, and fdatasync
+    of a pure overwrite no longer rewrites the inode record.
+
+  * Changed, tools and proc: /proc info and cluster are readable by root only.
+    mkfs, growfs and fsck open offline devices exclusively, so a volume mounted
+    in another mount namespace is refused. Every volume gets its own UUID,
+    published as the filesystem id.
+
+  * Fixed, kernel: an fallocate error path could free uninitialised memory; a
+    repair-refusal message read past its string; unload raced a task_work tail;
+    and the module builds for kernel 7.2.
+
+  * The test gate is 868 suites and 6937 assertions; the two-node suite gained
+    scenarios for in-place zeroing, a live grow beside an unrescanned node, and
+    defrag yield.
+
+ -- Massimo Cetra <mcetra@gmail.com>  Sat, 21 Nov 2026 07:18:27 +0000
+
 cetrafs (0.9.5) unstable; urgency=medium
 
   * No format version change: volumes made by 0.9.4 mount as they are.

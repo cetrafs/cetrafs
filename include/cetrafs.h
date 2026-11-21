@@ -133,7 +133,7 @@
  * relaxed once, to 0x0008, so volumes from 0.8.x could be grown in place;
  * that window closed in 0.9.2.
  *
- * 0x000A (after 0.9.5): one format change landing every fix that needed
+ * 0x000A (0.10.1): one format change landing every fix that needed
  * a field the format did not have -- see the history in
  * docs/ARCHITECTURE.md. growfs stamps CETRAFS_VERSION on what it grows;
  * "has this been grown?" is layout_gen, not the version. 0x000A also
