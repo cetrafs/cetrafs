@@ -184,7 +184,7 @@ int cetrafs_grow_check_bg_header(struct super_block *sb, u32 bg_id, u64 start, u
  * must be empty. The allocator reads it the moment the grow publishes,
  * and a region that held an earlier table's bitmap would read numbers
  * as in use -- or, set bits with live-looking records under them, as
- * inodes nobody created. growfs zeroes and syncs it before the commit;
+ * inodes nobody created. growfs empties and syncs it before the commit;
  * only its header was ever read here (audit 2026-11-15 F-64). The records
  * are not read: a free bit makes a slot's record unborn whatever it
  * holds, and a grow may add millions of them. Forced-fresh, one block

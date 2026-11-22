@@ -128,7 +128,8 @@ static void pread_all(int fd, void *buf, size_t len, off_t off)
     }
 }
 
-static void write_block(int fd, u64 lba, const void *data, bool do_write)
+/* 'n' blocks at 'lba' in one write, under the same gate as every write. */
+static void write_blocks(int fd, u64 lba, const void *data, u64 n, bool do_write)
 {
     if (!do_write)
         return;
@@ -139,7 +140,12 @@ static void write_block(int fd, u64 lba, const void *data, bool do_write)
             cetrafs_repair_lost == 2   ? "a node is mounted on this volume while it is being grown"
             : cetrafs_repair_lost == 3 ? "this grow's registry claim was not renewed in time (a node may call it dead)"
                                        : "this grow's registry claim was taken away");
-    pwrite_all(fd, data, CETRAFS_BLOCK_SIZE, (off_t) lba * CETRAFS_BLOCK_SIZE);
+    pwrite_all(fd, data, (size_t) (n * CETRAFS_BLOCK_SIZE), (off_t) lba * CETRAFS_BLOCK_SIZE);
+}
+
+static void write_block(int fd, u64 lba, const void *data, bool do_write)
+{
+    write_blocks(fd, lba, data, 1, do_write);
 }
 
 static void read_block(int fd, u64 lba, void *data)
@@ -1237,8 +1243,8 @@ int main(int argc, char **argv)
     }
 
     /* The inode table's segment, after the Block Group one: its bitmap
-     * and records zeroed -- every number free, every record unborn --
-     * and its header last, as above. */
+     * empty -- every number free -- its records dead (below), and its
+     * header last, as above. */
     const u64 iseg_lba = seg_first_desc + (new_b - old_b);
 
     if (ino_add) {
@@ -1252,7 +1258,34 @@ int main(int argc, char **argv)
         } else {
             empty_bitmap_blocks(fd, iseg_lba + 1, cetrafs_calc_inode_bmap_blocks(ino_add), true);
         }
-        zero_blocks(fd, iseg_lba + 1 + cetrafs_calc_inode_bmap_blocks(ino_add), ino_add, true);
+        /* Every slot a DEAD record, as mkfs writes them, never zeros: an
+         * all-zero record under a set bit is a record no walk can judge,
+         * so a create that stopped between its bit and its record in a
+         * grown segment stalled every node's scrub until an offline
+         * fsck -r -- the F-12 mode, which mkfs and fsck were fixed for
+         * and the grow was not (audit 2026-11-22 N-5). A dead record is
+         * what the orphan scrub reclaims. TEST-ONLY knob: the zeros, as
+         * before (tests/image/growfs_inode_dead_records.sh's control). */
+        if (cetrafs_test_env_damaging("CETRAFS_GROWFS_TEST_ZERO_INODE_RECORDS", fd)) {
+            zero_blocks(fd, iseg_lba + 1 + cetrafs_calc_inode_bmap_blocks(ino_add), ino_add, true);
+        } else {
+            const u64 tbl = iseg_lba + 1 + cetrafs_calc_inode_bmap_blocks(ino_add), batch = 256;
+            u8 *tb = (u8 *) xcalloc(batch, CETRAFS_BLOCK_SIZE);
+
+            for (u64 b = 0; b < ino_add; b += batch) {
+                const u64 n = ino_add - b < batch ? ino_add - b : batch;
+
+                memset(tb, 0, (size_t) (n * CETRAFS_BLOCK_SIZE));
+                for (u64 k = 0; k < n; ++k) {
+                    cetrafs_inode_t rec;
+
+                    cetrafs_inode_dead_stamp_us(&rec, old_inodes + 1 + b + k);
+                    memcpy(tb + k * CETRAFS_BLOCK_SIZE, &rec, sizeof(rec));
+                }
+                write_blocks(fd, tbl + b, tb, n, true);
+            }
+            free(tb);
+        }
         memset(&seg, 0, sizeof(seg));
         seg.magic = cetrafs_cpu_to_le32(CETRAFS_INOSEG_MAGIC);
         seg.count = cetrafs_cpu_to_le32((u32) ino_add);
