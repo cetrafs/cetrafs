@@ -1895,6 +1895,7 @@ struct cetrafs_scrub; /* opaque; owned entirely by scrub.c */
 int cetrafs_scrub_start(struct super_block *sb, struct cetrafs_scrub **out_s);
 void cetrafs_scrub_stop(struct cetrafs_scrub *s);
 u64 cetrafs_scrub_set_bytes_peak_count(void);
+u64 cetrafs_scrub_bmap_damaged_count(void); /* scrub.c: groups skipped for a damaged bitmap block */
 u64 cetrafs_scrub_cand_deferred_count(void); /* scrub.c: groups that kept no candidates for the candidate budget */
 u64 cetrafs_scrub_unknown_record_count(void);
 u64 cetrafs_half_born_settled_count(void);

@@ -599,19 +599,50 @@ static int scrub_build_refset(struct cetrafs_scrub *s, struct scrub_ctx *ctx, bo
  * allocated buffer -- each block checked (cetrafs_bmap_bread()), its
  * trailers kept in place: scrub_bit_set() maps a bit as on the device.
  * Caller frees. */
-static u8 *scrub_read_bitmap(struct super_block *sb, const struct scrub_bg *b)
+/*
+ * A group's bitmap, whole. NULL on failure, with *err: -ENOMEM, -EIO, or
+ * -EUCLEAN for a block that fails its checksum. A damaged block is that
+ * GROUP's problem -- its bits decide nothing, so it has no candidates
+ * this cycle -- not the cycle's: every other group's leaks stay
+ * reclaimable, as the allocator goes on past a damaged block (audit
+ * 2026-11-22 N-64; the whole cycle used to stop at it, every cycle).
+ */
+static atomic64_t cetrafs_scrub_bmap_damaged = ATOMIC64_INIT(0);
+
+u64 cetrafs_scrub_bmap_damaged_count(void)
+{
+    return (u64) atomic64_read(&cetrafs_scrub_bmap_damaged);
+}
+
+/* TEST ONLY: a damaged bitmap block aborts the whole cycle, as before --
+ * the control of tests/kernel/scrub_skips_damaged_bitmap.sh. */
+static bool cetrafs_scrub_damaged_aborts;
+cetrafs_test_param(scrub_damaged_aborts, cetrafs_scrub_damaged_aborts, bool, 0644);
+MODULE_PARM_DESC(scrub_damaged_aborts, "TEST ONLY: a damaged data-bitmap block aborts the whole scrub cycle");
+
+static u8 *scrub_read_bitmap(struct super_block *sb, const struct scrub_bg *b, int *errp)
 {
     u8 *buf = kvmalloc(b->bmap_blocks * CETRAFS_BLOCK_SIZE, GFP_NOFS);
     u64 i;
 
+    *errp = -ENOMEM;
     if (!buf)
         return NULL;
     for (i = 0; i < b->bmap_blocks; i++) {
-        int err;
+        int err = -EIO;
         struct buffer_head *bh = cetrafs_bmap_bread(sb, b->bmap_lba + i, 0, CETRAFS_BMAP_BUF_BITS, &err);
 
         if (!bh) {
             kvfree(buf);
+            *errp = err == -EUCLEAN ? -EUCLEAN : -EIO;
+            if (*errp == -EUCLEAN) {
+                atomic64_inc(&cetrafs_scrub_bmap_damaged);
+                pr_warn_ratelimited("scrub: BG %u's data bitmap block %llu fails its checksum -- the group has no "
+                                    "candidates this cycle (fsck)\n",
+                                    b->bg_id, (unsigned long long) (b->bmap_lba + i));
+                if (READ_ONCE(cetrafs_scrub_damaged_aborts))
+                    *errp = -EIO;
+            }
             return NULL;
         }
         memcpy(buf + i * CETRAFS_BLOCK_SIZE, bh->b_data, CETRAFS_BLOCK_SIZE);
@@ -672,13 +703,18 @@ static int scrub_cand_add(struct scrub_ctx *ctx, struct scrub_bg *b, u64 bit)
 /* Pass 1: a candidate is an allocated bitmap bit referenced by nothing. */
 static int scrub_mark_candidates(struct super_block *sb, struct scrub_ctx *ctx, struct scrub_bg *b)
 {
-    u8 *bmap = scrub_read_bitmap(sb, b);
+    int ret = 0;
+    u8 *bmap = scrub_read_bitmap(sb, b, &ret);
     bool over = false;
     u64 bit;
-    int ret = 0;
 
-    if (!bmap)
-        return -EIO;
+    if (!bmap) {
+        if (ret != -EUCLEAN)
+            return ret;
+        if (b->cand || b->runs)
+            scrub_cand_release(ctx, b);
+        return 0; /* this group: no candidates */
+    }
     if (b->cand)
         bitmap_zero(b->cand, (unsigned int) b->data_count);
     for (bit = 0; bit < b->data_count && !over; bit++) {
@@ -726,13 +762,13 @@ static bool scrub_is_cand(struct scrub_bg *b, u64 bit)
 static int scrub_free_confirmed(struct cetrafs_scrub *s, struct scrub_bg *b, u64 *out_freed)
 {
     struct super_block *sb = s->sb;
-    u8 *bmap = scrub_read_bitmap(sb, b);
+    int ret;
+    u8 *bmap = scrub_read_bitmap(sb, b, &ret);
     bool gen_raised = false;
     u64 bit;
-    int ret;
 
     if (!bmap)
-        return -EIO;
+        return ret == -EUCLEAN ? 0 : ret; /* damaged since pass 1: nothing of it is freed */
     b->rcur = 0;
     for (bit = 0; bit < b->data_count; bit++) {
         if (READ_ONCE(s->draining))

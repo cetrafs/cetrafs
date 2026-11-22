@@ -530,6 +530,7 @@ static int cetrafs_proc_info_show(struct seq_file *m, void *v)
     seq_printf(m, "release_visits: %llu\n", cetrafs_release_visit_count());
     seq_printf(m, "scrub_set_bytes_peak: %llu\n", cetrafs_scrub_set_bytes_peak_count());
     seq_printf(m, "scrub_cand_deferred: %llu\n", cetrafs_scrub_cand_deferred_count());
+    seq_printf(m, "scrub_bmap_damaged: %llu\n", cetrafs_scrub_bmap_damaged_count());
     seq_printf(m, "scrub_free_calls: %llu\n", cetrafs_scrub_free_call_count());
     seq_printf(m, "scrub_unknown_records: %llu\n", cetrafs_scrub_unknown_record_count());
     seq_printf(m, "half_born_settled: %llu\n", cetrafs_half_born_settled_count());
