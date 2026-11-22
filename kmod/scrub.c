@@ -1298,12 +1298,12 @@ static void cetrafs_scrub_cycle(struct cetrafs_scrub *s)
     u32 i, gap, from, to;
     bool old;
     int ret;
+    ktime_t t0 = ktime_get();
 
     /* Trimmed runs whose quarantine is over are this cycle's to judge;
      * the rest stay on the reservation registry, which every free below
      * consults (cetrafs_trim_quarantine_add()). */
     cetrafs_trim_quarantine_drop(sb, false);
-    ktime_t t0 = ktime_get();
 
     atomic64_set(&cetrafs_scrub_last_start, (s64) ktime_get_real_seconds());
     atomic64_set(&cetrafs_scrub_set_bytes_peak, 0); /* this cycle's, from here */
