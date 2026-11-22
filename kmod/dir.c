@@ -1514,9 +1514,38 @@ static bool cetrafs_remove_expect_off;
 cetrafs_test_param(remove_expect_off, cetrafs_remove_expect_off, bool, 0644);
 MODULE_PARM_DESC(remove_expect_off, "TEST ONLY: a dirent remove does not check it names the locked inode");
 
-int cetrafs_dir_remove_entry(struct inode *dir, const struct qstr *name, u64 expect_ino, u64 *out_ino,
-                             u8 *out_file_type)
+/*
+ * Whether the removed entry was a directory -- which moves the parent's
+ * nlink -- is the locked inode's mode, not the entry's file_type byte.
+ * The byte is a hint nothing verifies (a CRC restamped over damage passes
+ * every check), and a regular file's entry claiming DIR took one off the
+ * parent's count; a rename-over zeroed a hardlinked file's nlink by it,
+ * and its other names then named a file evict freed (audit 2026-11-22,
+ * N-50). A byte that disagrees is damage, said and counted.
+ */
+static bool cetrafs_nlink_trust_dirent_type;
+cetrafs_test_param(nlink_trust_dirent_type, cetrafs_nlink_trust_dirent_type, bool, 0644);
+MODULE_PARM_DESC(nlink_trust_dirent_type, "TEST ONLY: nlink decisions follow the dirent's file_type, as before N-50");
+
+static bool cetrafs_dir_entry_is_dir(struct super_block *sb, u64 dir_ino, u64 ino, u8 file_type, umode_t mode)
 {
+    bool is_dir = S_ISDIR(mode);
+
+    if (READ_ONCE(cetrafs_nlink_trust_dirent_type))
+        return file_type == CETRAFS_FT_DIR;
+    if ((file_type == CETRAFS_FT_DIR) != is_dir) {
+        pr_warn_ratelimited("%s: dir ino=%llu: the entry for ino=%llu says type %u, its record mode %o -- going by "
+                            "the record (run fsck)\n",
+                            sb->s_id, (unsigned long long) dir_ino, (unsigned long long) ino, file_type, mode);
+        cetrafs_sb_corrupt(sb, 0);
+    }
+    return is_dir;
+}
+
+int cetrafs_dir_remove_entry(struct inode *dir, const struct qstr *name, u64 expect_ino, umode_t expect_mode,
+                             u64 *out_ino, u8 *out_file_type)
+{
+    bool was_dir;
     u32 read_nlink;
     unsigned int dirents_per_block = CETRAFS_DIRENTS_PER_BLOCK;
     struct cetrafs_dir_extents dx;
@@ -1605,6 +1634,7 @@ int cetrafs_dir_remove_entry(struct inode *dir, const struct qstr *name, u64 exp
 
     *out_ino = cetrafs_le64(slot->inode);
     *out_file_type = slot->file_type;
+    was_dir = cetrafs_dir_entry_is_dir(dir->i_sb, dir->i_ino, *out_ino, slot->file_type, expect_mode);
     ctrace("REMNAME dir=%llu name='%.*s' ino=%llu\n",
             (unsigned long long) dir->i_ino, (int) name->len, name->name, (unsigned long long) *out_ino);
     const u32 prev_crc = cetrafs_bh_begin_update_crc(bh);
@@ -1634,7 +1664,7 @@ int cetrafs_dir_remove_entry(struct inode *dir, const struct qstr *name, u64 exp
     raw.mtime = cetrafs_cpu_to_le64(now);
     raw.ctime = cetrafs_cpu_to_le64(now);
     read_nlink = cetrafs_le32(raw.nlink);
-    if (*out_file_type == CETRAFS_FT_DIR)
+    if (was_dir)
         raw.nlink = cetrafs_cpu_to_le32(cetrafs_le32(raw.nlink) - 1);
 
     /* Staged for the namespace lock's release -- see
@@ -1662,7 +1692,7 @@ int cetrafs_dir_remove_entry(struct inode *dir, const struct qstr *name, u64 exp
     i_size_write(dir, cetrafs_le64(raw.size));
     cetrafs_set_mtime_disk(dir, now);
     cetrafs_set_ctime_disk(dir, now);
-    if (*out_file_type == CETRAFS_FT_DIR)
+    if (was_dir)
         set_nlink(dir, dir->i_nlink - 1);
 
     return 0;
@@ -3652,7 +3682,7 @@ static int cetrafs_unlink_locked(struct inode *dir, struct dentry *dentry)
             return -ETXTBSY;
     }
 
-    ret = cetrafs_dir_remove_entry(dir, &dentry->d_name, inode->i_ino, &ino, &file_type);
+    ret = cetrafs_dir_remove_entry(dir, &dentry->d_name, inode->i_ino, inode->i_mode, &ino, &file_type);
     if (ret)
         return ret;
 
@@ -3787,7 +3817,7 @@ static int cetrafs_rmdir_locked(struct inode *dir, struct dentry *dentry)
     if (ret)
         return ret;
 
-    ret = cetrafs_dir_remove_entry(dir, &dentry->d_name, inode->i_ino, &ino, &file_type);
+    ret = cetrafs_dir_remove_entry(dir, &dentry->d_name, inode->i_ino, inode->i_mode, &ino, &file_type);
     if (ret)
         return ret;
 
@@ -4312,7 +4342,7 @@ static int cetrafs_rename_locked(struct mnt_idmap *idmap,
      */
     removed_first = old_file_type == CETRAFS_FT_DIR;
     if (removed_first) {
-        ret = cetrafs_dir_remove_entry(old_dir, &old_dentry->d_name, old_inode->i_ino, &discard_ino,
+        ret = cetrafs_dir_remove_entry(old_dir, &old_dentry->d_name, old_inode->i_ino, old_inode->i_mode, &discard_ino,
                                        &discard_file_type);
         if (ret)
             goto out_uncount;
@@ -4368,7 +4398,10 @@ static int cetrafs_rename_locked(struct mnt_idmap *idmap,
          * own eviction trigger super_ops.c's cetrafs_evict_inode() once
          * the last reference actually goes away. Same reasoning as
          * cetrafs_unlink_locked()/cetrafs_rmdir_locked() above. */
-        if (removed_file_type == CETRAFS_FT_DIR) {
+        if (removed_ino == new_inode->i_ino
+                ? cetrafs_dir_entry_is_dir(new_dir->i_sb, new_dir->i_ino, removed_ino, removed_file_type,
+                                           new_inode->i_mode)
+                : removed_file_type == CETRAFS_FT_DIR) {
             struct cetrafs_ns_delta d = {.set_nlink_zero = true, .ctime = now};
             int nret;
 
@@ -4429,7 +4462,7 @@ static int cetrafs_rename_locked(struct mnt_idmap *idmap,
 
         /* A failure from here on leaves the file with both names and the
          * count that says so: consistent, so nothing is given back. */
-        ret = cetrafs_dir_remove_entry(old_dir, &old_dentry->d_name, old_inode->i_ino, &discard_ino,
+        ret = cetrafs_dir_remove_entry(old_dir, &old_dentry->d_name, old_inode->i_ino, old_inode->i_mode, &discard_ino,
                                        &discard_file_type);
         if (ret)
             goto out;

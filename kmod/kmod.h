@@ -1171,8 +1171,8 @@ int cetrafs_ns_count_names(struct super_block *sb, const u64 *inos, u32 n, u32 *
 int cetrafs_ns_publish_nlink(struct super_block *sb, u64 ino, u64 generation, const cetrafs_inode_t *seed,
                              u32 want, struct inode *self);
 u64 cetrafs_ns_recounts_count(void);
-int cetrafs_dir_remove_entry(struct inode *dir, const struct qstr *name, u64 expect_ino, u64 *out_ino,
-                             u8 *out_file_type);
+int cetrafs_dir_remove_entry(struct inode *dir, const struct qstr *name, u64 expect_ino, umode_t expect_mode,
+                             u64 *out_ino, u8 *out_file_type);
 int cetrafs_dirent_block_init(struct super_block *sb, u64 lba, bool *keep);
 int cetrafs_dir_update_dotdot(struct inode *dir, u64 new_parent_ino, bool *published);
 void cetrafs_dir_stamp_after_failed_write(struct inode *dir, u64 generation, int werr);
