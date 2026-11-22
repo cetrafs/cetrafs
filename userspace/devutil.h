@@ -428,23 +428,56 @@ static inline void cetrafs_fd_path(char *path, size_t size, int fd)
     path[i] = '\0';
 }
 
-/* The O_DIRECT twin of 'fd', opened if it is not open yet. Called by the
- * tools before they arm the renewal timer (cetrafs_repair_timer()), so a
- * handler only ever finds it open; open() and close() are async-signal
- * -safe anyway. -1 if it cannot be opened. */
+/*
+ * The O_DIRECT twin of 'fd', cached. Opened by the tools before they arm
+ * the renewal timer (cetrafs_repair_timer()), so a handler normally finds
+ * it open. Only an OUTERMOST read (slot 0 of cetrafs_pread_device()) may
+ * replace it, and it marks the cache invalid while it does: a handler
+ * that interrupts it -- or any read nested in another -- sees no match
+ * and reads through an O_DIRECT descriptor of its own, opened and closed
+ * around that one read. So a twin is never closed under a read using it;
+ * before, a main-line read of another fd re-pointed the twin and a
+ * handler could close the one the main line was inside pread() on.
+ * open() and close() are async-signal-safe. -1 if it cannot be opened;
+ * *own: the caller closes what it was given.
+ */
+static inline int cetrafs_pread_direct_open(int fd)
+{
+    char path[32];
+
+    cetrafs_fd_path(path, sizeof(path), fd);
+    return open(path, O_RDONLY | O_DIRECT | O_CLOEXEC);
+}
+
+static inline int cetrafs_pread_twin(int fd, dev_t rdev, int slot, int *own)
+{
+    *own = 0;
+    if (__atomic_load_n(&cetrafs_pread_dfd_of, __ATOMIC_SEQ_CST) == fd && cetrafs_pread_dfd_rdev == rdev)
+        return cetrafs_pread_dfd;
+    if (slot > 0) {
+        *own = 1;
+        return cetrafs_pread_direct_open(fd);
+    }
+    __atomic_store_n(&cetrafs_pread_dfd_of, -1, __ATOMIC_SEQ_CST);
+    if (cetrafs_pread_dfd >= 0)
+        close(cetrafs_pread_dfd);
+    cetrafs_pread_dfd = cetrafs_pread_direct_open(fd);
+    cetrafs_pread_dfd_rdev = rdev;
+    if (cetrafs_pread_dfd >= 0)
+        __atomic_store_n(&cetrafs_pread_dfd_of, fd, __ATOMIC_SEQ_CST);
+    return cetrafs_pread_dfd;
+}
+
+/* Prime the twin from the main line, outside any read. */
 static inline int cetrafs_pread_direct_fd(int fd, dev_t rdev)
 {
-    if (cetrafs_pread_dfd_of != fd || cetrafs_pread_dfd_rdev != rdev) {
-        char path[32];
+    int own, dfd, slot = __atomic_fetch_add(&cetrafs_pread_depth, 1, __ATOMIC_SEQ_CST);
 
-        if (cetrafs_pread_dfd >= 0)
-            close(cetrafs_pread_dfd);
-        cetrafs_fd_path(path, sizeof(path), fd);
-        cetrafs_pread_dfd = open(path, O_RDONLY | O_DIRECT | O_CLOEXEC);
-        cetrafs_pread_dfd_of = cetrafs_pread_dfd >= 0 ? fd : -1;
-        cetrafs_pread_dfd_rdev = rdev;
-    }
-    return cetrafs_pread_dfd;
+    dfd = cetrafs_pread_twin(fd, rdev, slot, &own);
+    if (own && dfd >= 0)
+        close(dfd);
+    __atomic_fetch_sub(&cetrafs_pread_depth, 1, __ATOMIC_SEQ_CST);
+    return own ? -1 : dfd;
 }
 
 static inline ssize_t cetrafs_pread_device(int fd, void *buf, size_t len, off_t off)
@@ -454,28 +487,33 @@ static inline ssize_t cetrafs_pread_device(int fd, void *buf, size_t len, off_t 
     size_t span = (size_t) (off - a) + len;
     unsigned char *bounce;
     ssize_t got;
-    int dfd, slot;
+    int dfd, slot, own;
 
     if (fstat(fd, &st) != 0)
         return -1;
     if (!S_ISBLK(st.st_mode))
         return pread(fd, buf, len, off);
-    dfd = cetrafs_pread_direct_fd(fd, st.st_rdev);
-    if (dfd < 0)
-        return -1;
     span = (span + CETRAFS_BLOCK_SIZE - 1) & ~(size_t) (CETRAFS_BLOCK_SIZE - 1);
     if (span > sizeof(cetrafs_pread_bounce[0])) {
         errno = EINVAL;
         return -1;
     }
+    /* The slot first: from here no handler replaces the twin. */
     slot = __atomic_fetch_add(&cetrafs_pread_depth, 1, __ATOMIC_SEQ_CST);
     if (slot >= CETRAFS_PREAD_SLOTS) {
         __atomic_fetch_sub(&cetrafs_pread_depth, 1, __ATOMIC_SEQ_CST);
         errno = EBUSY;
         return -1;
     }
+    dfd = cetrafs_pread_twin(fd, st.st_rdev, slot, &own);
+    if (dfd < 0) {
+        __atomic_fetch_sub(&cetrafs_pread_depth, 1, __ATOMIC_SEQ_CST);
+        return -1;
+    }
     bounce = cetrafs_pread_bounce[slot];
     got = pread(dfd, bounce, span, a);
+    if (own)
+        close(dfd);
     if (got < (ssize_t) (off - a)) {
         __atomic_fetch_sub(&cetrafs_pread_depth, 1, __ATOMIC_SEQ_CST);
         return got < 0 ? -1 : 0;
