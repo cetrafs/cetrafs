@@ -533,6 +533,10 @@ static uint64_t fsck_seg_span(const struct fsck_seg_kind *k, uint64_t count)
  * *n of them used: a chain that would need more is refused, never
  * written past (audit 2026-11-22 N-1). 0, or 1 having said why.
  */
+/* Set when a chain ends in a segment linked past the published end: a
+ * grow that wrote its link and not (yet) its superblock. */
+static int fsck_pending_link;
+
 static int fsck_chain_walk(int fd, const cetrafs_superblock_t *sb, const struct fsck_seg_kind *k, uint64_t seg_lba,
                            uint64_t filled, uint64_t total, uint64_t dev_bytes, uint64_t *lo, uint64_t *hi,
                            uint32_t *n, uint32_t cap)
@@ -573,6 +577,7 @@ static int fsck_chain_walk(int fd, const cetrafs_superblock_t *sb, const struct 
             if (cetrafs_le32(seg.magic) == k->magic && crc_ok && cetrafs_le32(seg.first_id) == total &&
                 cetrafs_le32(seg.count) && seg_lba + fsck_seg_span(k, cetrafs_le32(seg.count)) <= dev_blocks &&
                 !cetrafs_le64(seg.next)) {
+                fsck_pending_link = 1;
                 printf("note: the %s table links a segment at %" PRIu64 " for %s %" PRIu64
                        ".. the superblock does not count yet -- a grow in progress, or one\n"
                        "      that was interrupted before it published (re-run growfs.cetra to finish it)\n",
@@ -4161,6 +4166,24 @@ int main(int argc, char **argv)
          * checks below keep both off every group. */
         if (fsck_isegs_build(fd, &sb, dev_bytes, seg_lo, seg_hi, &nsegs, seg_cap))
             return 1;
+    }
+    /*
+     * Checked through the copy, and a table links a segment the copy does
+     * not count. That is a grow that linked its segment -- and it may
+     * also have PUBLISHED: growfs writes the copy only after block 0
+     * (growfs_write_sb_copy()), so one killed in between leaves a copy at
+     * the old layout beside a block 0 at the new one. With block 0 now
+     * gone there is no telling which, and the two answers are opposite:
+     * restoring the copy is right for a grow that never published, and
+     * for one that did it drops the grown space from under every file
+     * written into it since (audit 2026-11-22 N-61). Nothing is restored.
+     */
+    if (sb_from_copy && fsck_pending_link) {
+        fprintf(stderr, "ERR: block 0 is gone and its copy may predate a grow: a table links a segment the copy "
+                        "does not count\n");
+        early_problems++;
+        repair_block("block 0's copy may be older than the layout the volume was last grown to, and restoring "
+                     "it could drop the grown space -- block 0 is left as it is");
     }
 
     /* BG table & regions monotonicity */
