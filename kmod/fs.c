@@ -5642,7 +5642,7 @@ static int cetrafs_trim_quarantine_set(const char *val, const struct kernel_para
         return ret;
     if (v < 1 || v > 86400)
         return -EINVAL;
-    *(unsigned int *) kp->arg = v;
+    WRITE_ONCE(cetrafs_trim_quarantine_secs, v);
     return 0;
 }
 static const struct kernel_param_ops cetrafs_trim_quarantine_ops = {
