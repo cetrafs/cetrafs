@@ -479,7 +479,7 @@ static void cetrafs_node_who(struct super_block *sb, u32 idx, char *out, size_t 
     cetrafs_node_entry_t ne;
 
     if (idx == CETRAFS_NODE_ID_NONE) {
-        snprintf(out, sz, "none (fenced before this node had a row)");
+        snprintf(out, sz, "none (a fencer with no row of its own: a mount gate, or an offline repair's claim)");
         return;
     }
     if (cetrafs_node_get_entry(sb, idx, &ne)) {

@@ -1359,7 +1359,9 @@ static inline int cetrafs_repair_claim(int fd, const cetrafs_superblock_t *sb, c
 
                     memcpy(&sv, cetrafs_repair_saved, sizeof(sv));
                     sv.fence_epoch = cetrafs_cpu_to_le64(cetrafs_le64(sv.fence_epoch) + 1);
-                    sv.fenced_by = cetrafs_cpu_to_le32(idx);
+                    /* The tool has no row of its own: the one it
+                     * stands on is the victim's. */
+                    sv.fenced_by = cetrafs_cpu_to_le32(CETRAFS_NODE_ID_NONE);
                     sv.fence_reason = cetrafs_cpu_to_le32(CETRAFS_FENCE_RECLAIM);
                     sv.fenced_at = cetrafs_cpu_to_le64((uint64_t) time(NULL));
                     cetrafs_node_row_stamp(&sv);

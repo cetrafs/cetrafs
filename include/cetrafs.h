@@ -1289,8 +1289,8 @@ typedef struct {
      * verdict revoked it, and the record outlives the victim's log.
      * fence_reason CETRAFS_FENCE_NONE means never fenced: fenced_by and
      * fenced_at are then not read. fenced_by is CETRAFS_NODE_ID_NONE when
-     * the fencer had no row yet (a mount gate that fences before its own
-     * registration). */
+     * the fencer had no row of its own (a mount gate that fences before
+     * its own registration, or fsck/growfs fencing the row they borrow). */
     __le32  fenced_by;            /* registry row index of the fencer */
     __le32  fence_reason;         /* CETRAFS_FENCE_* */
     __le64  fenced_at;            /* unix seconds of that fence */

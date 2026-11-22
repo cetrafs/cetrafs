@@ -15,7 +15,8 @@
 # Every row of a two-row registry is REGISTERED with a stale beat and
 # departure NONE, so fsck -r must probe and borrow one:
 #   1. setup: it says it claimed a row, and released it (state back to 1);
-#   2. that row's fence_epoch moved by one, its reason is RECLAIM, and
+#   2. that row's fence_epoch moved by one, its reason is RECLAIM, its
+#      fencer none (the tool has no row; not the victim's own index), and
 #      the rest of the registration -- uuid, incarnation -- is as it was;
 #   3. the row's checksum verifies (a read-only fsck does not report it).
 # A CLEAN departure keeps coming back byte for byte
@@ -60,6 +61,9 @@ if [ "$E1" = $((${EP[$B]} + 1)) ] && [ "$(field "$B" fence_reason)" = 1 ] && [ "
 else
     fail "2: row $B: fence_epoch ${EP[$B]} -> $E1, reason $(field "$B" fence_reason), incarnation ${INC[$B]} -> $(field "$B" incarnation)"
 fi
+# The fencer is the tool, which has no row: not the victim's own index.
+[ "$(field "$B" fenced_by)" = 65535 ] && pass "2: fenced_by is none (the tool has no row of its own)" ||
+    fail "2: fenced_by is $(field "$B" fenced_by), not none"
 FO="$(ct_fsck "$DEV" 2>&1 || true)"
 grep -q "node slot $B fails its checksum" <<<"$FO" && fail "3: fsck: row $B fails its checksum" ||
     pass "3: row $B's checksum verifies (fsck does not report it)"
