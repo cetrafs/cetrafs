@@ -2117,6 +2117,12 @@ static bool cetrafs_record_publish_unlocked;
 cetrafs_test_param(record_publish_unlocked, cetrafs_record_publish_unlocked, bool, 0644);
 MODULE_PARM_DESC(record_publish_unlocked, "TEST ONLY: whole-record writes publish without fd_pub_mutex");
 
+/* For a file-sector publisher outside this file (directory growth). */
+bool cetrafs_record_publish_locked(void)
+{
+    return !READ_ONCE(cetrafs_record_publish_unlocked);
+}
+
 int cetrafs_write_raw_inode_self(struct inode *self, const cetrafs_inode_t *in)
 {
     bool locked = !READ_ONCE(cetrafs_record_publish_unlocked);

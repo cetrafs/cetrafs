@@ -246,6 +246,15 @@ static bool cetrafs_dir_grow_no_stamp;
 cetrafs_test_param(dir_grow_no_stamp, cetrafs_dir_grow_no_stamp, bool, 0644);
 MODULE_PARM_DESC(dir_grow_no_stamp, "TEST ONLY: a directory's growth record keeps its old dirent_seq");
 /* TEST ONLY: the next directory growth pauses after its record write. */
+/* TEST ONLY: grow a directory with one whole-record write, as before
+ * audit 2026-11-22 N-46; and pause between the growth's file-sector
+ * publish and its stamp (tests/kernel/dir_grow_publish_order.sh). */
+static bool cetrafs_dir_grow_whole_write;
+cetrafs_test_param(dir_grow_whole_write, cetrafs_dir_grow_whole_write, bool, 0644);
+MODULE_PARM_DESC(dir_grow_whole_write, "TEST ONLY: a growing directory publishes both record sectors in one write");
+static unsigned int cetrafs_dir_grow_publish_stall_ms;
+cetrafs_test_param(dir_grow_publish_stall_ms, cetrafs_dir_grow_publish_stall_ms, uint, 0644);
+MODULE_PARM_DESC(dir_grow_publish_stall_ms, "TEST ONLY: pause a directory's growth between its two publishes (ms, once)");
 static unsigned int cetrafs_dir_grow_stall_ms;
 cetrafs_test_param(dir_grow_stall_ms, cetrafs_dir_grow_stall_ms, uint, 0644);
 MODULE_PARM_DESC(dir_grow_stall_ms, "TEST ONLY: the next directory growth pauses after publishing its record");
@@ -7479,9 +7488,47 @@ allocated:
          * (a dirent block of a directory since removed), a valid block
          * of somebody else's directory, until the entry's release moved
          * the stamp (audit 2026-11-15 BM N-72). */
-        if (!READ_ONCE(cetrafs_dir_grow_no_stamp))
-            raw.dirent_seq = cetrafs_cpu_to_le64(cetrafs_inode_new_generation(sb));
-        ret = cetrafs_write_raw_inode_self(inode, &raw);
+        bool stamp = !READ_ONCE(cetrafs_dir_grow_no_stamp);
+        bool whole = READ_ONCE(cetrafs_dir_grow_whole_write);
+        u64 seq = cetrafs_inode_new_generation(sb);
+
+        if (stamp)
+            raw.dirent_seq = cetrafs_cpu_to_le64(seq);
+        /*
+         * The file sector first, then the stamp by itself (cetrafs.h:
+         * the sector-1-then-sector-0 order is what makes dirent_seq the
+         * barrier). One whole-record write could land torn, sector 0
+         * without sector 1, and each sector's CRC and echo pass on their
+         * own: a peer took the new stamp with the old extent root, and
+         * cached the directory's old mapping as current under it until
+         * the next change (audit 2026-11-22, N-46).
+         */
+        if (whole) {
+            ret = cetrafs_write_raw_inode_self(inode, &raw);
+        } else {
+            bool locked = cetrafs_record_publish_locked(); /* test knob: record_publish_unlocked */
+
+            if (locked)
+                cetrafs_inode_fd_pub_lock(inode);
+            ret = cetrafs_write_raw_inode_fd(sb, inode->i_ino, &raw, inode, NULL);
+            if (locked)
+                cetrafs_inode_fd_pub_unlock(inode);
+            if (!ret && unlikely(READ_ONCE(cetrafs_dir_grow_publish_stall_ms)))
+                msleep(xchg(&cetrafs_dir_grow_publish_stall_ms, 0)); /* test-only, one-shot */
+            if (!ret && stamp) {
+                ret = cetrafs_dir_publish_seq(inode, cetrafs_le64(raw.generation), seq);
+                if (ret) {
+                    /* The extents are out under the old stamp: one more
+                     * try with a fresh one, or the mount stops. */
+                    pr_err("dir ino=%llu: its new block %llu is published but the stamp is not (%d)\n",
+                           (unsigned long long) inode->i_ino, (unsigned long long) lba, ret);
+                    cetrafs_dir_stamp_after_failed_write(inode, cetrafs_le64(raw.generation), ret);
+                    return ret;
+                }
+            }
+        }
+        if (whole && !ret && unlikely(READ_ONCE(cetrafs_dir_grow_publish_stall_ms)))
+            msleep(xchg(&cetrafs_dir_grow_publish_stall_ms, 0)); /* test-only, one-shot */
         if (!ret && unlikely(READ_ONCE(cetrafs_dir_grow_stall_ms)))
             msleep(xchg(&cetrafs_dir_grow_stall_ms, 0)); /* test-only, one-shot */
         if (ret) {
@@ -7491,8 +7538,9 @@ allocated:
             pr_err("dir ino=%llu: record write failed after its tree named block %llu (%d) -- keeping it "
                    "allocated\n",
                    (unsigned long long) inode->i_ino, (unsigned long long) lba, ret);
-            /* A leaf may have changed on the device under the old stamp. */
-            if (cetrafs_le16(raw.eh.eh_depth))
+            /* A leaf may have changed on the device under the old stamp,
+             * or -- the file sector's own outcome unknown -- the root. */
+            if (cetrafs_le16(raw.eh.eh_depth) || !whole)
                 cetrafs_dir_stamp_after_failed_write(inode, cetrafs_le64(raw.generation), ret);
             return ret;
         }

@@ -1756,6 +1756,13 @@ void cetrafs_dir_stamp_after_failed_write(struct inode *dir, u64 generation, int
                      (unsigned long long) dir->i_ino, werr, ret);
 }
 
+/* Publish 'seq' as the directory's dirent_seq by a sector-0 swap that
+ * keeps every other field the device holds. 0, or the swap's error. */
+int cetrafs_dir_publish_seq(struct inode *dir, u64 generation, u64 seq)
+{
+    return cetrafs_inode_ns_cas(dir->i_sb, dir->i_ino, generation, NULL, cetrafs_dir_apply_seq, &seq);
+}
+
 static int cetrafs_rename_record_write(struct inode *dir, cetrafs_inode_t *raw, unsigned int bit)
 {
     if (unlikely(READ_ONCE(cetrafs_rename_record_fail_once) & bit)) {
