@@ -1370,6 +1370,47 @@ static const uint64_t *fsck_g_bg_desc_lba;
  * discarded (audit 2026-11-14 U7). Returns 0 when the group may be
  * written, after clearing the mark, -1 on an I/O error.
  */
+/*
+ * May fsck edit this descriptor and stamp a fresh checksum over it? Only
+ * if it verifies as it stands. A restamp makes whatever the sector holds
+ * valid from then on: a damaged Block Group descriptor or Zone Group hot
+ * sector, edited for a count and restamped, read as sound to every node
+ * after -- and the kernel's policy for a record that fails its checksum
+ * is to leave it alone for the run that rebuilds it (audit 2026-11-22,
+ * N-45). Not verifying, the edit is skipped and said; the count it was
+ * for is one a reconcile recounts.
+ */
+static int fsck_bg_desc_verifies(const cetrafs_block_group_t *bgd, uint32_t b)
+{
+    if (getenv("CETRAFS_FSCK_RESTAMP_UNVERIFIED")) /* test-only: the old edits */
+        return 1;
+    return cetrafs_le32(bgd->bg_id) == b &&
+           (uint32_t) cetrafs_le64(bgd->checksum) ==
+               crc32c_struct(bgd, sizeof(*bgd), offsetof(cetrafs_block_group_t, checksum), sizeof(bgd->checksum));
+}
+
+static int fsck_zg_verifies(const cetrafs_zone_group_t *zg, uint32_t z)
+{
+    if (getenv("CETRAFS_FSCK_RESTAMP_UNVERIFIED"))
+        return 1;
+    return cetrafs_le16(zg->zg_id) == (uint16_t) z &&
+           (uint32_t) cetrafs_le64(zg->hot_checksum) ==
+               crc32c_struct((const uint8_t *) zg + CETRAFS_ZG_HOT_OFF, CETRAFS_ZG_HOT_LEN,
+                             offsetof(cetrafs_zone_group_t, hot_checksum) - CETRAFS_ZG_HOT_OFF,
+                             sizeof(zg->hot_checksum)) &&
+           (uint32_t) cetrafs_le64(zg->cold_checksum) ==
+               crc32c_struct((const uint8_t *) zg + CETRAFS_ZG_COLD_OFF, CETRAFS_ZG_COLD_LEN,
+                             offsetof(cetrafs_zone_group_t, cold_checksum) - CETRAFS_ZG_COLD_OFF,
+                             sizeof(zg->cold_checksum));
+}
+
+static void fsck_restamp_refused(const char *what, uint32_t id, const char *why)
+{
+    fprintf(stderr, "NOTE: %s %u does not verify -- not editing it for %s (a later fsck -r rebuilds it, a "
+                    "reconcile recounts it)\n",
+            what, id, why);
+}
+
 static int fsck_bg_claim_for_write(int fd, uint32_t b)
 {
     uint8_t blk[CETRAFS_BLOCK_SIZE];
@@ -1383,6 +1424,10 @@ static int fsck_bg_claim_for_write(int fd, uint32_t b)
         return 1;
     if (!(flags & CETRAFS_BG_FLAG_DISCARDED))
         return 0;
+    if (!fsck_bg_desc_verifies(&bgd, b)) {
+        fsck_restamp_refused("Block Group", b, "a block written into it");
+        return 1;
+    }
     bgd.flags = cetrafs_cpu_to_le16(flags & ~CETRAFS_BG_FLAG_DISCARDED);
     bgd.checksum = cetrafs_cpu_to_le64(0);
     bgd.checksum = cetrafs_cpu_to_le64(
@@ -1405,6 +1450,10 @@ static void fsck_adjust_bg_counts(int fd, uint32_t b, int credit)
         return;
     pread_all(fd, blk, sizeof(blk), (off_t) fsck_g_bg_desc_lba[b] * CETRAFS_BLOCK_SIZE);
     memcpy(&bgd, blk, sizeof(bgd));
+    if (!fsck_bg_desc_verifies(&bgd, b)) {
+        fsck_restamp_refused("Block Group", b, "its free count");
+        return;
+    }
     if (credit)
         bgd.free_data_blocks = cetrafs_cpu_to_le64(cetrafs_le64(bgd.free_data_blocks) + 1);
     else if (cetrafs_le64(bgd.free_data_blocks))
@@ -1422,6 +1471,10 @@ static void fsck_adjust_bg_counts(int fd, uint32_t b, int credit)
     memset(blk, 0, sizeof(blk));
     pread_all(fd, blk, sizeof(blk), (off_t) (cetrafs_le64(sb->zg_table_start) + z) * CETRAFS_BLOCK_SIZE);
     memcpy(&zg, blk, sizeof(zg));
+    if (!fsck_zg_verifies(&zg, z)) {
+        fsck_restamp_refused("Zone Group", z, "its free count");
+        return;
+    }
     if (credit && pool)
         zg.pool_free_blocks = cetrafs_cpu_to_le64(cetrafs_le64(zg.pool_free_blocks) + 1);
     else if (credit)
@@ -5743,15 +5796,19 @@ int main(int argc, char **argv)
 
                     pread_all(fd, blk, sizeof(blk), (off_t) bg_desc_lba[b] * CETRAFS_BLOCK_SIZE);
                     memcpy(&bgd, blk, sizeof(bgd));
-                    bgd.free_data_blocks = cetrafs_cpu_to_le64(really_free);
-                    bgd.checksum = cetrafs_cpu_to_le64(0);
-                    /* Exactly the convention mkfs stamps with and the
-                     * structural pass above verifies -- plain-native,
-                     * over the struct with the checksum field zeroed. */
-                    bgd.checksum = cetrafs_cpu_to_le64(crc32c_struct(&bgd, sizeof(bgd), offsetof(cetrafs_block_group_t, checksum),
-                                                 sizeof(bgd.checksum)));
-                    memcpy(blk, &bgd, sizeof(bgd));
-                    pwrite_all(fd, blk, sizeof(blk), (off_t) bg_desc_lba[b] * CETRAFS_BLOCK_SIZE);
+                    if (!fsck_bg_desc_verifies(&bgd, b)) {
+                        fsck_restamp_refused("Block Group", b, "its recount");
+                    } else {
+                        bgd.free_data_blocks = cetrafs_cpu_to_le64(really_free);
+                        bgd.checksum = cetrafs_cpu_to_le64(0);
+                        /* Exactly the convention mkfs stamps with and the
+                         * structural pass above verifies -- plain-native,
+                         * over the struct with the checksum field zeroed. */
+                        bgd.checksum = cetrafs_cpu_to_le64(crc32c_struct(&bgd, sizeof(bgd), offsetof(cetrafs_block_group_t, checksum),
+                                                     sizeof(bgd.checksum)));
+                        memcpy(blk, &bgd, sizeof(bgd));
+                        pwrite_all(fd, blk, sizeof(blk), (off_t) bg_desc_lba[b] * CETRAFS_BLOCK_SIZE);
+                    }
                     repairs_made++;
                 }
             }
@@ -5808,6 +5865,7 @@ int main(int argc, char **argv)
                 continue; /* reported above; its counts mean nothing until it is rebuilt */
             pread_all(fd, zblk, sizeof(zblk), (off_t) (cetrafs_le64(sb.zg_table_start) + z) * CETRAFS_BLOCK_SIZE);
             memcpy(&zg, zblk, sizeof(zg));
+            const int zg_verified = fsck_zg_verifies(&zg, z); /* before any edit below (N-45) */
             int agg_ok = cetrafs_le64(zg.free_data_blocks) == zg_free_truth[z];
             int pool_ok = cetrafs_le64(zg.pool_free_blocks) == zg_pool_truth[z];
             /* A live grow names its pool credit before it publishes
@@ -5901,7 +5959,10 @@ int main(int argc, char **argv)
                 if (zg_pool_lower)
                     zg.pool_free_blocks = cetrafs_cpu_to_le64(zg_pool_truth[z]);
             }
-            if (repair_mode && (!repair_blocked || (!fsck_zg_lower_gated() && (zg_free_lower || zg_pool_lower)))) {
+            if (repair_mode && !zg_verified &&
+                (!repair_blocked || (!fsck_zg_lower_gated() && (zg_free_lower || zg_pool_lower))))
+                fsck_restamp_refused("Zone Group", z, "its recount");
+            else if (repair_mode && (!repair_blocked || (!fsck_zg_lower_gated() && (zg_free_lower || zg_pool_lower)))) {
                 if (!repair_blocked) {
                     zg.free_data_blocks = cetrafs_cpu_to_le64(zg_free_truth[z]);
                     zg.pool_free_blocks = cetrafs_cpu_to_le64(zg_pool_truth[z]);
@@ -6947,6 +7008,15 @@ int main(int argc, char **argv)
                      * scrub's order, offline. */
                     pread_all(fd, blk, sizeof(blk), (off_t) bg_desc_lba[b] * CETRAFS_BLOCK_SIZE);
                     memcpy(&bgd, blk, sizeof(bgd));
+                    if (!fsck_bg_desc_verifies(&bgd, b)) {
+                        /* No free_gen raise, so no bit clears: the leak
+                         * stays for a run that can rebuild the group. */
+                        fsck_restamp_refused("Block Group", b, "its leaked blocks");
+                        cleared = bg_before;
+                        free(bad);
+                        free(bmap);
+                        continue;
+                    }
                     bgd.free_gen = cetrafs_cpu_to_le64(cetrafs_le64(bgd.free_gen) + 1);
                     bgd.checksum = cetrafs_cpu_to_le64(0);
                     bgd.checksum = cetrafs_cpu_to_le64(crc32c_struct(
@@ -6973,6 +7043,14 @@ int main(int argc, char **argv)
                     memset(blk, 0, sizeof(blk));
                     pread_all(fd, blk, sizeof(blk), (off_t) (cetrafs_le64(sb.zg_table_start) + z) * CETRAFS_BLOCK_SIZE);
                     memcpy(&zg, blk, sizeof(zg));
+                    if (!fsck_zg_verifies(&zg, z)) {
+                        /* Its count stays low: the direction a reconcile
+                         * only raises. */
+                        fsck_restamp_refused("Zone Group", z, "its leaked blocks' credit");
+                        free(bad);
+                        free(bmap);
+                        continue;
+                    }
                     if (pool)
                         zg.pool_free_blocks = cetrafs_cpu_to_le64(cetrafs_le64(zg.pool_free_blocks) + n);
                     else
