@@ -5159,6 +5159,41 @@ u64 cetrafs_convert_spill_count(void)
     return (u64) atomic64_read(&cetrafs_convert_spills);
 }
 
+/* TEST ONLY: one-shot, the next convert's append of its block fails -EIO
+ * after the leaf was shrunk (tests/kernel/convert_append_fail_marks.sh). */
+static bool cetrafs_convert_append_fail_once;
+cetrafs_test_param(convert_append_fail_once, cetrafs_convert_append_fail_once, bool, 0644);
+MODULE_PARM_DESC(convert_append_fail_once, "TEST ONLY: one-shot, a convert's append of its block fails -EIO");
+
+/* TEST ONLY: a convert whose block went into no extent leaves the file
+ * unmarked, as before audit 2026-11-22 N-3 -- that suite's control. */
+static bool cetrafs_convert_fail_unmarked;
+cetrafs_test_param(convert_fail_unmarked, cetrafs_convert_fail_unmarked, bool, 0644);
+MODULE_PARM_DESC(convert_fail_unmarked, "TEST ONLY: a convert that lost its block leaves the file unmarked");
+
+/*
+ * The shrink of a full leaf is held back -- and may be on the device
+ * already (cetrafs_convert_source_durable()) -- so a convert that fails
+ * after it has taken the block, and any preallocated tail, out of every
+ * extent, while the record the caller now drops still counts them. The
+ * block's data was written before this convert ran (a pending convert
+ * runs at the durability boundary, after the write was acknowledged),
+ * so its offset reads as a hole from here on: that is a loss, and the
+ * file is marked damaged -- its writes refused and its eviction kept
+ * from freeing it -- until fsck settles it, as a split that could not
+ * finish is (cetrafs_tree_split_leaf()). It used to warn that "no data
+ * is lost" (audit 2026-11-22 N-3).
+ */
+static void cetrafs_convert_lost_block(struct inode *inode, u64 iblock, u32 tail_len, int err)
+{
+    pr_err("ino=%llu: a convert shrank a full extent leaf and then could not map block %llu%s (%d): it is in no "
+           "extent now, and what was written there reads as a hole -- the file is marked damaged until fsck\n",
+           (unsigned long long) inode->i_ino, (unsigned long long) iblock,
+           tail_len ? " or the preallocated blocks after it" : "", err);
+    if (!READ_ONCE(cetrafs_convert_fail_unmarked))
+        cetrafs_sb_corrupt_inode(inode);
+}
+
 static int cetrafs_tree_convert_append(struct inode *inode,
                                        cetrafs_inode_t *raw,
                                        u64 iblock,
@@ -5171,7 +5206,10 @@ static int cetrafs_tree_convert_append(struct inode *inode,
 
     atomic64_inc(&cetrafs_convert_spills);
     cetrafs_tree_mark_convert_append(inode, true);
-    ret = cetrafs_tree_append(inode, raw, iblock, lba, 1, /*uninit=*/false, &merged, &leaf_count);
+    if (unlikely(xchg(&cetrafs_convert_append_fail_once, false)))
+        ret = -EIO; /* test-only; see the parameter */
+    else
+        ret = cetrafs_tree_append(inode, raw, iblock, lba, 1, /*uninit=*/false, &merged, &leaf_count);
     cetrafs_tree_mark_convert_append(inode, false);
     if (!ret && tail->len)
         tret = cetrafs_tree_append(inode, raw, tail->block, tail->lba, tail->len, /*uninit=*/true, &merged,
@@ -5186,6 +5224,12 @@ static int cetrafs_tree_convert_append(struct inode *inode,
     if ((ret == -ENOSPC || tret == -ENOSPC) && !READ_ONCE(cetrafs_convert_append_nospc))
         cetrafs_sb_fatal(inode->i_sb, "ino=%llu: a convert's append was refused ENOSPC after its leaf was shrunk",
                          (unsigned long long) inode->i_ino);
+    /* The tail's blocks may hold writes still waiting for their own
+     * convert, so a lost tail is a loss too, not only preallocation. */
+    if ((ret && ret != -ENOSPC) || (tret && tret != -ENOSPC)) {
+        cetrafs_convert_lost_block(inode, ret ? iblock : tail->block, ret ? tail->len : 0, ret ? ret : tret);
+        return ret;
+    }
     if (tail->len && (ret || tret)) {
         /*
          * The tail is in no extent now. It is NOT freed: the leaf that
@@ -6193,6 +6237,8 @@ again:
             wret = cetrafs_convert_source_durable(inode, lbh);
             if (!wret)
                 wret = cetrafs_tpath_narrow(inode, &p);
+            if (wret) /* the shrink is held back: the block is in no extent */
+                cetrafs_convert_lost_block(inode, iblock, tail.len, wret);
         }
         cetrafs_tpath_put(&p);
         if (wret)
