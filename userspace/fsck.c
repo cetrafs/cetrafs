@@ -1669,7 +1669,7 @@ static int fsck_rebuild_bg_desc(int fd, const cetrafs_superblock_t *sb, uint64_t
     uint8_t blk[CETRAFS_BLOCK_SIZE] = {0};
     cetrafs_bg_header_t hdr;
     cetrafs_block_group_t bg;
-    uint64_t start = 0, dstart, cnt, used = 0, max_stamp = 0;
+    uint64_t start = 0, dstart, cnt, used = 0, max_stamp = 0, bad_bits = 0;
     uint32_t nzg = cetrafs_le32(sb->zone_group_count), owner = CETRAFS_BG_OWNER_FREE, bmap_blocks;
     const uint32_t shard = cetrafs_sb_zg_shard(sb, b);
     uint16_t flags = 0;
@@ -1690,13 +1690,32 @@ static int fsck_rebuild_bg_desc(int fd, const cetrafs_superblock_t *sb, uint64_t
     cnt = cetrafs_le64(hdr.data_block_count);
 
     /* What is in use, from the bitmap: the content pass checks the
-     * count against it again. */
+     * count against it again. A bit in a sector that fails its checksum
+     * decides nothing and is taken as in use, as everywhere else
+     * (fsck_bmap_bit_damaged(); class 45): counted as it reads, a
+     * damaged sector reading zeros rebuilt a group holding data as
+     * EMPTY -- into the pool, or flagged for a hand-back discard that
+     * UNMAPs every block of it (audit 2026-11-22 N-172). */
     bmap_blocks = cetrafs_le32(hdr.off_data_region) - cetrafs_le32(hdr.off_data_bmap);
     for (uint32_t i = 0; i < bmap_blocks; i++) {
+        uint8_t bad[CETRAFS_BMAP_SECTORS];
+
         pread_all(fd, blk, sizeof(blk), (off_t) (start + cetrafs_le32(hdr.off_data_bmap) + i) * CETRAFS_BLOCK_SIZE);
+        for (unsigned k = 0; k < CETRAFS_BMAP_SECTORS; k++)
+            bad[k] = !cetrafs_test_env_damaging("CETRAFS_FSCK_TEST_REBUILD_TRUST_BAD_SECTOR", fd) &&
+                     cetrafs_bmap_sector_bad_us(blk + k * CETRAFS_BMAP_SECTOR) != 0;
         for (uint64_t bit = 0; bit < CETRAFS_BMAP_BLOCK_BITS; bit++) {
             if ((uint64_t) i * CETRAFS_BMAP_BLOCK_BITS + bit >= cnt)
                 break;
+            if (bad[bit / CETRAFS_BMAP_SECTOR_BITS]) {
+                if (!bad_bits++)
+                    fprintf(stderr,
+                            "ERR: BG%u: its data bitmap has a sector that fails its checksum -- the rebuilt "
+                            "descriptor counts every block it covers as in use\n",
+                            b);
+                used++;
+                continue;
+            }
             used += cetrafs_bmap_get(blk, bit);
         }
     }
