@@ -4446,13 +4446,20 @@ static void __cetrafs_lock_release(struct inode *inode, const struct cetrafs_clo
          * the tree's ceiling: space can come back, and the drop below was
          * decided for a ceiling that never moves (audit F-47). So while
          * the refusals are the pool's the close waits for space, as a
-         * VMFS host waits out a full thin pool, with no try limit; only
-         * a fence ends it (and the stop below follows). A refusal counted
+         * VMFS host waits out a full thin pool, with no try limit; a
+         * fence ends it (and the stop below follows), and so does the
+         * space_wait_secs budget: renewals keep landing while the pool
+         * refuses only this file's blocks, so nothing fences, and the
+         * close -- the file lock still on the device, a killed writer
+         * stuck in fput -- waited as long as the pool stayed full (audit
+         * 2026-11-22, N-48 / C-1). Past the budget it stops the mount
+         * below, as the ioutil.c overwrite wait does. A refusal counted
          * elsewhere meanwhile only makes this wait longer than it needed
          * -- the safe direction. */
         {
             int tries, cret = 0;
             bool pool = false, told = false;
+            unsigned long since = jiffies;
 
             for (tries = 0;; tries++) {
                 u64 before = cetrafs_pool_refusals();
@@ -4464,10 +4471,16 @@ static void __cetrafs_lock_release(struct inode *inode, const struct cetrafs_clo
                        !READ_ONCE(cetrafs_close_space_wait_off);
                 if (pool && cetrafs_sb_is_fenced(inode->i_sb))
                     break;
+                if (pool && told && cetrafs_space_wait_over(since)) {
+                    pr_err("%s: ino=%llu: the last close waited %u s for space for the file's map -- stopping\n",
+                           inode->i_sb->s_id, (unsigned long long) inode->i_ino, cetrafs_space_wait_secs_get());
+                    break;
+                }
                 if (!pool && tries >= 2)
                     break;
                 if (pool && !told) {
                     told = true;
+                    since = jiffies;
                     atomic64_inc(&cetrafs_close_space_waits);
                     pr_warn("%s: ino=%llu: the last close is waiting for the device to have space for the file's "
                             "map (a thin pool out of space?)\n",

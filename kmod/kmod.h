@@ -2008,6 +2008,8 @@ BUFFER_FNS(CetraBmap, cetra_bmap)
 u64 cetrafs_bmap_refusal_count(void);
 u64 cetrafs_held_refusal_count(void);
 u64 cetrafs_space_wait_count(void);
+unsigned int cetrafs_space_wait_secs_get(void);
+bool cetrafs_space_wait_over(unsigned long since);
 u64 cetrafs_close_space_wait_count(void);
 void cetrafs_bh_end_update_held(struct super_block *sb, struct buffer_head *bh, bool changed);
 u64 cetrafs_held_store_retry_count(void);

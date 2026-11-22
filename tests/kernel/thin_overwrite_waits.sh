@@ -1,6 +1,7 @@
 #!/usr/bin/env bash
 # SPDX-License-Identifier: GPL-2.0-or-later
 # a thin pool out of space makes an overwrite wait for space, not stop the mount
+# ct-timeout: 400
 #
 # A metadata overwrite the device refused for space -- a full thin pool,
 # a snapshot's copy-on-write with nowhere to go -- stopped the mount, and
@@ -24,6 +25,13 @@
 #      waits (close_space_waits up), the data reads back after a remount.
 #   E. W's wait, ended instead by shutdown=now -- the documented way out
 #      when no space can be found: the write fails, the mount stops.
+#   B. W's wait with space_wait_secs=3 and the block never given room:
+#      past the budget the write fails and the mount stops -- the wait
+#      was unbounded, its waiter unkillable, and peers waited on it for as
+#      long as the pool stayed full (audit 2026-11-22, N-34 / C-1).
+#   D. C's close with the refusals never ending and space_wait_secs=3:
+#      the close returns and the mount stops (N-48). Control for both:
+#      space_wait_secs=0, the old unbounded wait -- still waiting at 8 s.
 # fsck clean after each.
 #
 # DISCRIMINATION: space_wait_stops=1 -- W and H stop the mount, as
@@ -47,6 +55,7 @@ ct_param_set new_block_nospc 0
 ct_param_set space_wait_stops 0
 ct_param_set close_space_wait_off 0
 ct_param_set test_hold_record_ino 0
+ct_param_set space_wait_secs 300
 ct_param_set hb_interval_secs 2
 info() { sed -n "s/^$1: //p" "$(ct_procdir "$DEV")/info"; }
 field() { tr ' ' '\n' <<<"$2" | sed -n "s/^$1=//p" | head -1; }
@@ -100,6 +109,54 @@ case_e() {
     for i in $(seq 1 20); do kill -0 "$pid" 2>/dev/null || break; sleep 0.5; done
     kill -0 "$pid" 2>/dev/null && RES="ended=no" || RES="ended=yes secs=$((SECONDS - t0))"
     wait "$pid" 2>/dev/null && RES="$RES chmod=ok" || RES="$RES chmod=fail"
+    RES="$RES$(finish)"
+}
+
+# <budget secs> -> RES: a refused overwrite that never gets room
+case_b() {
+    local lba pid i
+    fresh
+    echo x >"$MNT/f"
+    sync
+    lba="$(rec_lba "$(stat -c %i "$MNT/f")")"
+    echo "$1" >$P/space_wait_secs
+    echo "$lba" >$P/meta_write_nospc_block
+    chmod 600 "$MNT/f" 2>/dev/null &
+    pid=$!
+    for i in $(seq 1 16); do kill -0 "$pid" 2>/dev/null || break; sleep 0.5; done
+    kill -0 "$pid" 2>/dev/null && RES="ended=no" || RES="ended=yes"
+    RES="$RES midstop=$(info stopped | tr ' ' _)"
+    echo 0 >$P/meta_write_nospc_block
+    wait "$pid" 2>/dev/null && RES="$RES chmod=ok" || RES="$RES chmod=fail"
+    echo 300 >$P/space_wait_secs
+    RES="$RES$(finish)"
+}
+
+# <budget secs> -> RES: a last close whose map never gets room
+case_d() {
+    local pid i
+    fresh
+    fallocate -l 4M "$MNT/c"
+    sync
+    echo "$1" >$P/space_wait_secs
+    python3 -c '
+import os, sys
+fd = os.open(sys.argv[1], os.O_RDWR)
+for i in range(1, 62, 2):
+    os.pwrite(fd, b"block-%04d" % i, i * 4096)
+open(sys.argv[2], "w").write("1000000")
+try:
+    os.close(fd)
+except OSError:
+    pass
+' "$MNT/c" "$P/new_block_nospc" &
+    pid=$!
+    for i in $(seq 1 16); do kill -0 "$pid" 2>/dev/null || break; sleep 0.5; done
+    kill -0 "$pid" 2>/dev/null && RES="ended=no" || RES="ended=yes"
+    RES="$RES midstop=$(info stopped | tr ' ' _)"
+    echo 0 >$P/new_block_nospc
+    wait "$pid" 2>/dev/null || true
+    echo 300 >$P/space_wait_secs
     RES="$RES$(finish)"
 }
 
@@ -170,6 +227,18 @@ log "W control: $WC"
 case_e
 E="$RES"
 log "E (shutdown while waiting): $E"
+case_b 3
+B="$RES"
+log "B (budget 3 s): $B"
+case_b 0
+BC="$RES"
+log "B control (no budget): $BC"
+case_d 3
+D="$RES"
+log "D (budget 3 s): $D"
+case_d 0
+DC="$RES"
+log "D control (no budget): $DC"
 case_h 0
 H="$RES"
 log "H fixed: $H"
@@ -192,6 +261,16 @@ log "C control: $CC"
     fail "W control: the refusal did not reach the overwrite -- $WC"
 [ "$(field ended "$E")" = yes ] && [ "$(field chmod "$E")" = fail ] && [ "$(field stopped "$E")" = manual ] &&
     pass "E: shutdown=now ended a write waiting for space ($(field secs "$E") s); the mount stopped" || fail "E: $E"
+[ "$(field ended "$B")" = yes ] && [ "$(field chmod "$B")" = fail ] && [ "$(field midstop "$B")" != none ] &&
+    pass "B: past the budget the refused overwrite failed and the mount stopped ($B)" || fail "B: $B"
+[ "$(field ended "$BC")" = no ] && [ "$(field midstop "$BC")" = none ] &&
+    pass "B control: with no budget it was still waiting at 8 s, the mount up" ||
+    fail "B control: the wait ended without a budget -- the check cannot tell: $BC"
+[ "$(field ended "$D")" = yes ] && [ "$(field midstop "$D")" != none ] &&
+    pass "D: past the budget the last close returned and the mount stopped ($D)" || fail "D: $D"
+[ "$(field ended "$DC")" = no ] && [ "$(field midstop "$DC")" = none ] &&
+    pass "D control: with no budget the close was still waiting at 8 s" ||
+    fail "D control: the close did not wait -- the refusals do not reach it: $DC"
 [ "$(field held "$H")" -ge 1 ] && [ "$(field midstop "$H")" = none ] && [ "$(field stopped "$H")" = none ] &&
     [ "$(field after "$H")" = 0 ] && [ "$(field fsck "$H")" = ok ] && pass "H: a refused held block was kept for the next flush; fsck clean" ||
     fail "H: $H"

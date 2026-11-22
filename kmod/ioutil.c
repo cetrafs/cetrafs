@@ -846,11 +846,39 @@ void cetrafs_test_nospc_once(sector_t block)
  * the buffer still uptodate (a reader takes our bytes, never the old
  * block's -- the state of a slow write in flight), retried with a
  * backoff to a second. A fence or a stop ends the wait (the gate is
- * asked every round), so the wait is never longer than this node's
- * lease, and the fence's sweep waits at most one round for the lock.
- * New blocks still fail their operation with ENOSPC
+ * asked every round), and the fence's sweep waits at most one round for
+ * the lock. New blocks still fail their operation with ENOSPC
  * (cetrafs_sync_new_buffer()), which pauses the guest the same way.
+ *
+ * Bounded by space_wait_secs. "Never longer than the lease" was said
+ * here, and is false: a pool that refuses this block still takes the
+ * heartbeat's, so the lease renews and nothing fences. The waiter holds
+ * the buffer lock -- often inside a namespace-lock section -- and no
+ * signal can end the wait, so a full pool was a stall peers waited on
+ * for as long as it stayed full (audit 2026-11-22, N-34 / C-1). Past
+ * the budget the mount stops, the state a crash leaves, which peers
+ * recover from. A signal does not end it: the write is the only copy of
+ * the block's new image, and the only exit that leaves the volume
+ * consistent is a stop -- which one killed task must not impose on every
+ * guest of the node. shutdown=now is the operator's way out.
  */
+static unsigned int cetrafs_space_wait_secs = 300;
+module_param_named(space_wait_secs, cetrafs_space_wait_secs, uint, 0644);
+MODULE_PARM_DESC(space_wait_secs,
+                 "seconds an overwrite or a last close waits for a full thin pool before the mount stops (0: no limit)");
+
+unsigned int cetrafs_space_wait_secs_get(void)
+{
+    return READ_ONCE(cetrafs_space_wait_secs);
+}
+
+/* Past the space_wait_secs budget that began at 'since'? */
+bool cetrafs_space_wait_over(unsigned long since)
+{
+    unsigned int secs = READ_ONCE(cetrafs_space_wait_secs);
+
+    return secs && time_after(jiffies, since + (unsigned long) secs * HZ);
+}
 static bool cetrafs_space_wait_stops;
 cetrafs_test_param(space_wait_stops, cetrafs_space_wait_stops, bool, 0644);
 MODULE_PARM_DESC(space_wait_stops, "TEST ONLY: an overwrite refused for space stops the mount, as before A-4's wait");
@@ -867,6 +895,7 @@ static int cetrafs_write_locked_bh_once(struct buffer_head *bh);
 static int cetrafs_write_locked_bh(struct super_block *sb, struct buffer_head *bh, bool wait_space)
 {
     unsigned int ms = 10;
+    unsigned long since = jiffies;
     bool waited = false;
     int ret;
 
@@ -874,8 +903,17 @@ static int cetrafs_write_locked_bh(struct super_block *sb, struct buffer_head *b
         ret = cetrafs_write_locked_bh_once(bh);
         if (ret != -ENOSPC || !wait_space || READ_ONCE(cetrafs_space_wait_stops))
             break;
+        if (waited && cetrafs_space_wait_over(since)) {
+            cetrafs_sb_fatal(sb, "the device has had no space to overwrite %s block %llu for %u s",
+                             cetrafs_block_role(sb, bh->b_blocknr), (unsigned long long) bh->b_blocknr,
+                             cetrafs_space_wait_secs_get());
+            clear_buffer_uptodate(bh);
+            ret = -ESHUTDOWN;
+            break;
+        }
         if (!waited) {
             waited = true;
+            since = jiffies;
             atomic64_inc(&cetrafs_space_waits);
             pr_warn_ratelimited("%s: the device has no space to overwrite %s block %llu -- waiting for it, as for "
                                 "a thin pool that fills (the mount stays up)\n",
