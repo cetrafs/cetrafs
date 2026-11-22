@@ -61,6 +61,10 @@ grep -q "leaked" <<<"$FSCK_OUT" &&
 ct_param_set scrub_interval_secs 2
 ct_param_set scrub_gap_floor_secs 1
 ct_param_set scrub_gap_secs 1
+# Taking the Zone Group at mount keeps the scrub out of it
+# for trim_quarantine_secs (a trimmed run of unknown outcome may be in
+# it; trim_quarantine_takeover.sh); this suite needs the scrub at once.
+ct_param_set trim_quarantine_secs 1
 ct_mount "$DEV" "$MNT"
 require_cetrafs_mount "$MNT"
 BEFORE="$(free_blocks)"
