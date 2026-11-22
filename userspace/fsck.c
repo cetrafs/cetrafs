@@ -771,7 +771,23 @@ static void fsck_bmap_write(int fd, uint64_t lba, uint8_t *img, uint64_t nblk)
  * loaded: a repair rewrites the whole bitmap. */
 static uint64_t fsck_ibmap_bad;
 
-/* The whole bitmap, indexed by inode - 1. */
+/* The inode numbers whose bit lay in such a sector, indexed by inode - 1
+ * (NULL when none did): their bits decided nothing, so the load set them
+ * all and fsck_alloc_inode() never hands one out. */
+static uint8_t *fsck_ibmap_damaged;
+
+/*
+ * The whole bitmap, indexed by inode - 1.
+ *
+ * A bit in a sector whose checksum fails is taken as IN USE, as the data
+ * bitmap's are (fsck_bmap_bit_damaged()). It used to be copied as read:
+ * a live inode nothing names, whose bit read 0 there, was skipped by
+ * the inode passes, its blocks cleared as leaked and its number free to
+ * be handed to /lost+found -- and the rewrite then restamped the sector
+ * so the loss looked valid (audit 2026-11-22 N-40). Set, each such
+ * number is judged by its record like any other: an empty or dead one
+ * is freed as before, a live one is walked and, if unnamed, linked.
+ */
 static uint8_t *fsck_ibmap_load(int fd)
 {
     uint64_t total = 0;
@@ -780,14 +796,25 @@ static uint8_t *fsck_ibmap_load(int fd)
         total = fsck_iseg[s].first + fsck_iseg[s].count - 1;
     uint8_t *map = (uint8_t *) xcalloc(total / 8 + 1, 1);
 
+    free(fsck_ibmap_damaged);
+    fsck_ibmap_damaged = NULL;
     for (uint32_t s = 0; s < fsck_niseg; s++) {
         const struct cetrafs_iseg *g = &fsck_iseg[s];
-        uint64_t nblk;
+        uint64_t nblk, before = fsck_ibmap_bad;
         uint8_t *img = fsck_bmap_read(fd, g->bmap, g->count, &nblk, "inode bitmap", &fsck_ibmap_bad);
+        uint8_t *bad = fsck_ibmap_bad != before ? fsck_bmap_bad_sectors(img, nblk) : NULL;
 
-        for (uint64_t i = 0; i < g->count; i++)
-            if (cetrafs_bmap_get(img, i))
+        for (uint64_t i = 0; i < g->count; i++) {
+            if (bad && fsck_bmap_bit_damaged(bad, i)) {
+                if (!fsck_ibmap_damaged)
+                    fsck_ibmap_damaged = (uint8_t *) xcalloc(total / 8 + 1, 1);
+                FSCK_SET(fsck_ibmap_damaged, g->first - 1 + i);
                 FSCK_SET(map, g->first - 1 + i);
+            } else if (cetrafs_bmap_get(img, i)) {
+                FSCK_SET(map, g->first - 1 + i);
+            }
+        }
+        free(bad);
         free(img);
     }
     return map;
@@ -1302,6 +1329,10 @@ static int fsck_alloc_inode(int fd, const cetrafs_superblock_t *sb, uint8_t *ibm
         uint64_t bit = ino - 1;
 
         if (ibmap[bit / 8] & (1u << (bit % 8)))
+            continue;
+        /* Its sector was damaged: the record may be what the bit was
+         * hiding even after the passes freed the number (N-40). */
+        if (fsck_ibmap_damaged && FSCK_GET(fsck_ibmap_damaged, bit))
             continue;
         ibmap[bit / 8] |= (uint8_t) (1u << (bit % 8));
         *dirty = 1;
