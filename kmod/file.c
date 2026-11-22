@@ -7491,6 +7491,9 @@ allocated:
             pr_err("dir ino=%llu: record write failed after its tree named block %llu (%d) -- keeping it "
                    "allocated\n",
                    (unsigned long long) inode->i_ino, (unsigned long long) lba, ret);
+            /* A leaf may have changed on the device under the old stamp. */
+            if (cetrafs_le16(raw.eh.eh_depth))
+                cetrafs_dir_stamp_after_failed_write(inode, cetrafs_le64(raw.generation), ret);
             return ret;
         }
     } else {

@@ -1171,6 +1171,7 @@ int cetrafs_dir_remove_entry(struct inode *dir, const struct qstr *name, u64 exp
                              u8 *out_file_type);
 int cetrafs_dirent_block_init(struct super_block *sb, u64 lba, bool *keep);
 int cetrafs_dir_update_dotdot(struct inode *dir, u64 new_parent_ino, bool *published);
+void cetrafs_dir_stamp_after_failed_write(struct inode *dir, u64 generation, int werr);
 extern const struct inode_operations cetrafs_inode_ops;
 extern const struct file_operations cetrafs_dir_ops;
 extern const struct dentry_operations cetrafs_dentry_ops;

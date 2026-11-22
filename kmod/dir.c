@@ -1677,6 +1677,55 @@ cetrafs_test_param(rename_record_fail_once, cetrafs_rename_record_fail_once, uin
 MODULE_PARM_DESC(rename_record_fail_once,
                  "TEST ONLY: fail the next record write after a landed rename dirent (1 retarget, 2 '..')");
 
+/*
+ * A dirent block -- or a directory's extent leaf -- landed, and the
+ * record write that was to carry the directory's new dirent_seq did not
+ * (werr). Peers judge their cached dirent blocks by that stamp alone
+ * (cetrafs_dir_needs_fresh()), so with it unmoved they went on serving
+ * the block from before the write: a rename-over's destination name
+ * resolving to the replaced inode, a moved directory's old '..', until
+ * the directory next changed (audit 2026-11-22, the N-26 residual).
+ *
+ * So the stamp alone goes out, by a sector-0 swap that keeps everything
+ * else the device holds. A fresh one, not +1: a repeat of a stamp a
+ * peer holds is the one case its cache is trusted. If that swap cannot
+ * land either, the mount stops -- the state a crash leaves -- and
+ * whoever then breaks this directory's namespace lock stamps it
+ * (nslock.c); a fenced mount is already in that state. A failed record
+ * write's own outcome is unknown, so the swap may land over a record
+ * that already moved: one more fresh stamp, the safe direction.
+ */
+static bool cetrafs_dir_stamp_fallback_off;
+cetrafs_test_param(dir_stamp_fallback_off, cetrafs_dir_stamp_fallback_off, bool, 0644);
+MODULE_PARM_DESC(dir_stamp_fallback_off,
+                 "TEST ONLY: a failed directory record write after a landed dirent leaves dirent_seq as it was");
+
+static void cetrafs_dir_apply_seq(cetrafs_inode_t *rec, void *arg)
+{
+    rec->dirent_seq = cetrafs_cpu_to_le64(*(const u64 *) arg);
+}
+
+void cetrafs_dir_stamp_after_failed_write(struct inode *dir, u64 generation, int werr)
+{
+    struct super_block *sb = dir->i_sb;
+    u64 seq;
+    int ret;
+
+    if (READ_ONCE(cetrafs_dir_stamp_fallback_off))
+        return; /* test-only, see the knob */
+    if (cetrafs_sb_is_fenced(sb))
+        return;
+    seq = cetrafs_dirent_seq_new(sb);
+    ret = cetrafs_inode_ns_cas(sb, dir->i_ino, generation, NULL, cetrafs_dir_apply_seq, &seq);
+    if (!ret || ret == -ESTALE)
+        return; /* stamped, or the number is another file's now: nothing of ours to announce */
+    if (cetrafs_sb_is_fenced(sb))
+        return;
+    cetrafs_sb_fatal(sb, "dir ino=%llu: a dirent landed, its record write failed (%d) and so did the stamp "
+                         "that tells peers (%d)",
+                     (unsigned long long) dir->i_ino, werr, ret);
+}
+
 static int cetrafs_rename_record_write(struct inode *dir, cetrafs_inode_t *raw, unsigned int bit)
 {
     if (unlikely(READ_ONCE(cetrafs_rename_record_fail_once) & bit)) {
@@ -1758,8 +1807,10 @@ int cetrafs_dir_update_dotdot(struct inode *dir, u64 new_parent_ino, bool *publi
                      * would go on serving the old '..' from its cache. */
                     raw.dirent_seq = cetrafs_cpu_to_le64(cetrafs_dirent_seq_new(dir->i_sb));
                     ret = cetrafs_rename_record_write(dir, &raw, 2);
-                    if (ret)
+                    if (ret) {
+                        cetrafs_dir_stamp_after_failed_write(dir, cetrafs_le64(raw.generation), ret);
                         return ret;
+                    }
                     /* No cache claim: this walk stopped at '..' in the
                      * first block and never looked at the rest, so it
                      * cannot vouch for them. See
@@ -1934,8 +1985,10 @@ static int cetrafs_dir_retarget_entry(struct inode *dir,
             (unsigned long long) dir->i_ino, (int) name->len, name->name,
             (unsigned long long) new_ino, (unsigned long long) *out_old_ino);
     ret = cetrafs_rename_record_write(dir, &raw, 1);
-    if (ret)
+    if (ret) {
+        cetrafs_dir_stamp_after_failed_write(dir, cetrafs_le64(raw.generation), ret);
         return ret;
+    }
 
     /* Not claiming the dirent cache, for the same reason
      * cetrafs_dir_remove_entry() does not: the scan stopped at the

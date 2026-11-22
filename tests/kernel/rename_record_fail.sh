@@ -25,15 +25,30 @@
 #   2. directory over empty directory: one name, its contents;
 #   3. directory to another parent, '..' record failing: the directory
 #      stayed where it was, and fsck finds its '..' naming that parent.
+#   4. what peers see: the record write that failed was also the one to
+#      move the destination directory's dirent_seq, the stamp a peer's
+#      cached dirent blocks are judged by (cetrafs_dir_needs_fresh()).
+#      Unmoved, a peer kept serving the block from before the landed
+#      dirent -- the destination name resolving to the replaced inode --
+#      until the directory next changed. A file renamed over another in
+#      a DIFFERENT directory, so nothing else of the rename stamps the
+#      destination (a same-directory rename's remove does, and a failed
+#      '..' is put back by a record write that stamps it): its on-disk
+#      dirent_seq must move. Control: with dir_stamp_fallback_off it
+#      does not, so the check can see the difference.
 #
 # DISCRIMINATION (measured on the unfixed code): case 1 leaves both names
 # on one inode with nlink 1, case 2 both names on one directory, case 3
-# a '..' naming the other parent; fsck reports each.
+# a '..' naming the other parent; fsck reports each. Case 4 is
+# discriminated in-suite by its control.
 set -euo pipefail
 . "$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)/lib/harness.sh"
 require_root
 require_module
-[ -w /sys/module/cetrafs/parameters/rename_record_fail_once ] || { skip "rename_record_fail_once is missing"; ct_exit; }
+for p in rename_record_fail_once dir_stamp_fallback_off; do
+    [ -w "/sys/module/cetrafs/parameters/$p" ] || { skip "$p is missing"; ct_exit; }
+done
+LPOKE="$(ct_helper inode_lock_poke)"
 
 DEV="$(ct_dev 560 rnrf)"
 MNT="$(ct_mnt rnrf)"
@@ -107,4 +122,35 @@ remount
     pass "3: the directory stayed in p1" ||
     fail "3: p1/m '$(cat "$MNT/p1/m/keep" 2>/dev/null)', p2/m exists: $([ -e "$MNT/p2/m" ] && echo yes || echo no)"
 fsck_clean "3"
+
+# 4. the stamp peers judge their cache by
+dseq() { blockdev --flushbufs "$DEV"; "$LPOKE" "$DEV" "$1" --rec | sed -n 's/.*dirent_seq=\([0-9]*\).*/\1/p'; }
+# stamp_case <tag> <fallback_off 0|1> -> yes | no | unarmed
+stamp_case() {
+    local d="$MNT/s$1" yino b a r=no
+    mkdir -p "$d/x" "$d/y"
+    echo moved >"$d/x/a"
+    echo replaced >"$d/y/b"
+    sync
+    yino="$(stat -c %i "$d/y")"
+    ct_param_set dir_stamp_fallback_off "$2"
+    b="$(dseq "$yino")"
+    ct_param_set rename_record_fail_once 1
+    do_rename "$d/x/a" "$d/y/b" >/dev/null
+    a="$(dseq "$yino")"
+    ct_param_set dir_stamp_fallback_off 0
+    if ! knob_spent; then
+        r=unarmed
+    elif [ -n "$b" ] && [ "$a" != "$b" ]; then
+        r=yes
+    fi
+    echo "$r"
+}
+R="$(stamp_case ctl 1)"
+[ "$R" = no ] && pass "4: control: with the fallback off, the destination's dirent_seq stays where it was" ||
+    { fail "4: control: the destination's dirent_seq moved: $R -- the check cannot tell"; ct_exit; }
+R="$(stamp_case fix 0)"
+[ "$R" = yes ] && pass "4: the destination's dirent_seq moved although its record write failed" ||
+    fail "4: the destination's dirent_seq: $R"
+fsck_clean "4"
 ct_exit
