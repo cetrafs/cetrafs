@@ -508,6 +508,7 @@ static int cetrafs_proc_info_show(struct seq_file *m, void *v)
     seq_printf(m, "journal_replay_refused: %llu\n", cetrafs_journal_replay_refused_count());
     seq_printf(m, "journal_replay_torn: %llu\n", cetrafs_journal_replay_torn_count());
     seq_printf(m, "journal_replay_live_kept: %llu\n", cetrafs_journal_replay_live_kept_count());
+    seq_printf(m, "journal_reused_kept: %llu\n", cetrafs_journal_reused_kept_count());
     seq_printf(m, "journal_replay_own_opener: %llu\n", cetrafs_journal_replay_own_opener_count());
     seq_printf(m, "journal_replay_scoped_ok: %llu\n", cetrafs_journal_replay_scoped_ok_count());
     seq_printf(m, "journal_replay_kept: %llu\n", cetrafs_journal_replay_kept_count());

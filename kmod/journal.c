@@ -1240,6 +1240,23 @@ static bool cetrafs_journal_op_refusable(struct buffer_head *bh)
            cetrafs_blk_struct_ok_magic(bh, CETRAFS_XATTR_TAIL_MAGIC);
 }
 
+/* TEST ONLY: a single-block entry that fails in a slot taken over from a
+ * kept entry zeroes that slot's header, as before audit 2026-11-22 N-67
+ * (tests/kernel/journal_reused_slot_kept.sh, the control); and one
+ * getblk of an entry block fails, as memory pressure would. */
+static bool cetrafs_journal_reused_zeroed;
+cetrafs_test_param(journal_reused_zeroed, cetrafs_journal_reused_zeroed, bool, 0644);
+MODULE_PARM_DESC(journal_reused_zeroed, "TEST ONLY: a failed entry write zeroes a taken-over kept entry");
+static bool cetrafs_journal_entry_getblk_fail;
+cetrafs_test_param(journal_entry_getblk_fail, cetrafs_journal_entry_getblk_fail, bool, 0644);
+MODULE_PARM_DESC(journal_entry_getblk_fail, "TEST ONLY: the next single-block entry cannot get its payload buffer");
+static atomic64_t cetrafs_journal_reused_kept = ATOMIC64_INIT(0);
+
+u64 cetrafs_journal_reused_kept_count(void)
+{
+    return atomic64_read(&cetrafs_journal_reused_kept);
+}
+
 static int cetrafs_journal_write_block_flags(struct super_block *sb, struct buffer_head *bh, u32 flags, u32 prev_crc,
                                              struct cetrafs_journal_owner owner)
 {
@@ -1259,6 +1276,7 @@ static int cetrafs_journal_write_block_flags(struct super_block *sb, struct buff
     struct buffer_head *pbh, *hbh;
     bool journaled = false;
     bool entry_refused = false; /* the device refused the entry write itself */
+    bool reused = false;        /* the slot held a kept entry for this block (take_slot) */
     /* A directory-entry or xattr block: an operation whose refused write
      * can fail cleanly (cetrafs_journal_op_refusable()). */
     bool op_block = cetrafs_journal_op_refusable(bh);
@@ -1284,7 +1302,7 @@ static int cetrafs_journal_write_block_flags(struct super_block *sb, struct buff
      * mkfs -J 0 is a different thing: no journal at all, by choice.
      */
     if (j && j->area_start) {
-        int tret = cetrafs_journal_take_slot(sb, j, bh->b_blocknr, false, &slot, &txn_id, NULL);
+        int tret = cetrafs_journal_take_slot(sb, j, bh->b_blocknr, false, &slot, &txn_id, &reused);
 
         if (tret) {
             cetrafs_bh_abort_update(bh);
@@ -1310,7 +1328,9 @@ static int cetrafs_journal_write_block_flags(struct super_block *sb, struct buff
          *
          * Both are claimed without reading: every byte of each is
          * overwritten below. */
-        pbh = cetrafs_getblk_overwrite(sb, payload_lba);
+        pbh = (READ_ONCE(cetrafs_journal_entry_getblk_fail) && xchg(&cetrafs_journal_entry_getblk_fail, false))
+                  ? NULL /* test-only, one-shot */
+                  : cetrafs_getblk_overwrite(sb, payload_lba);
         if (!pbh)
             goto journal_failed;
         cetrafs_blk_tail_settle(bh); /* a held-back block's last edit, if it left the tail stale */
@@ -1545,6 +1565,32 @@ static int cetrafs_journal_write_block_flags(struct super_block *sb, struct buff
     return 0;
 
 journal_failed:
+    /*
+     * A slot taken over from a kept entry -- the one a failed write of
+     * this block left for replay -- still holds that entry on the device
+     * if nothing of ours reached its header: claimed but never sent, or
+     * the header write definitely refused. Zeroing it there destroyed
+     * the only redo of a target the device had refused (audit
+     * 2026-11-22, N-67); it is held again, as the batch path does
+     * (cetrafs_journal_untake_batch()).
+     */
+    if (reused && !READ_ONCE(cetrafs_journal_reused_zeroed) &&
+        (!entry_refused || (est[1] && cetrafs_refusal_definite(est[1])))) {
+        cetrafs_bh_abort_update(bh);
+        mutex_lock(&j->lock);
+        clear_bit(slot, j->busy);
+        cetrafs_journal_untake_kept(j, slot, bh->b_blocknr, true);
+        mutex_unlock(&j->lock);
+        wake_up(&j->slot_wq);
+        atomic64_inc(&cetrafs_journal_reused_kept);
+        pr_err_ratelimited("journal: could not write an entry for block %llu -- the kept entry it was to "
+                           "supersede stays, refusing to write it unjournaled\n",
+                           (unsigned long long) bh->b_blocknr);
+        if (entry_refused)
+            cetrafs_sb_fatal(sb, "journal: the device refused the entry for block %llu",
+                             (unsigned long long) bh->b_blocknr);
+        return -EIO;
+    }
     /* The entry refused before any of it was written -- or with its
      * header refused, which is what makes an entry -- for an operation
      * that can fail cleanly (A-4): nothing to retire, ENOSPC, the mount

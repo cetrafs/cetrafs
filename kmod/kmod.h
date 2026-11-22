@@ -795,6 +795,7 @@ u64 cetrafs_journal_replay_decline_count(void);
 u64 cetrafs_journal_replay_refused_count(void);
 u64 cetrafs_journal_replay_torn_count(void);
 u64 cetrafs_journal_replay_live_kept_count(void);
+u64 cetrafs_journal_reused_kept_count(void);
 u64 cetrafs_journal_replay_own_opener_count(void);
 u64 cetrafs_journal_replay_scoped_ok_count(void);
 u64 cetrafs_journal_replay_kept_count(void);
