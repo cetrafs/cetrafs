@@ -450,6 +450,9 @@ static void cetrafs_heartbeat_maint(struct work_struct *work)
     }
     if (!READ_ONCE(cetrafs_hb_held_flush_off))
         (void) cetrafs_held_flush_nowait(sb); /* never behind a writer waiting for space (A-4) */
+    /* A completed tree batch's journal entries, spent once they are a
+     * beat old: their live time is bounded (cetrafs_journal_drain_aged()). */
+    cetrafs_journal_drain_aged(sb, (unsigned long) cetrafs_sb_hb_interval_secs(sb) * HZ);
 
     /* Our row's frees-in-flight flag goes back down once nothing is in
      * flight (cetrafs_frees_begin()); peers' scrubs wait while it is up. */

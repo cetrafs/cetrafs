@@ -28,7 +28,7 @@ set -euo pipefail
 . "$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)/lib/harness.sh"
 require_root
 require_module
-for k in release_journal_unsettled zg_release_hold bg_release_off; do
+for k in release_journal_unsettled zg_release_hold bg_release_off journal_aged_drain_off; do
     [ -w "/sys/module/cetrafs/parameters/$k" ] || { skip "$k is missing"; ct_exit; }
 done
 BG_POKE="$(ct_helper bg_poke)"
@@ -40,6 +40,9 @@ ct_param_set auto_defrag 0
 ct_param_set release_journal_unsettled 0
 ct_param_set bg_release_off 1 # the Zone Group's own hand-back is the path staged
 ct_param_set zg_release_hold 1
+# The release is the path under test: the heartbeat's spend of entries a
+# beat old (cetrafs_journal_drain_aged()) would get to them first.
+ct_param_set journal_aged_drain_off 1
 
 # live <dev> <starts file> <zg1 bgs file> -> live entries naming a block of Zone Group 1
 live() {

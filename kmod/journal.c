@@ -148,6 +148,9 @@ struct cetrafs_journal {
     u64 *retire_slot;
     u64 *retire_lba;
     u64 retire_n;
+    /* jiffies when retire_n last went from 0 to non-zero: the heartbeat
+     * spends entries left this long (cetrafs_journal_drain_aged()). */
+    unsigned long retire_since;
 };
 
 /* Resolve node #node_id's journal slice. *out_start = 0 means journaling
@@ -1826,6 +1829,44 @@ int cetrafs_journal_drain_retiring(struct super_block *sb)
     return ret;
 }
 
+/*
+ * The heartbeat's bound on how long a completed batch's entries stay
+ * live. They were spent only by the next batch, a sync(wait) or the
+ * unmount -- so after the last batch of a burst they stayed replayable
+ * for as long as the node ran, and the judge redoes an entry whenever its
+ * target reads as the entry's before-image again. An extent block's
+ * random eh_generation makes that a 32-bit coincidence, but "live for an
+ * unbounded time on the strength of a nonce" is not a bound (audit
+ * 2026-11-22 N-54): entries left a heartbeat interval are spent here as
+ * at a sync -- flush, then zero. Never behind a batch in progress
+ * (trylock: it spends them itself), and once per tick at most.
+ */
+static bool cetrafs_journal_aged_drain_off;
+cetrafs_test_param(journal_aged_drain_off, cetrafs_journal_aged_drain_off, bool, 0644);
+MODULE_PARM_DESC(journal_aged_drain_off, "TEST ONLY: the heartbeat leaves a completed batch's entries live");
+
+static atomic64_t cetrafs_journal_aged_drains = ATOMIC64_INIT(0);
+
+u64 cetrafs_journal_aged_drain_count(void)
+{
+    return (u64) atomic64_read(&cetrafs_journal_aged_drains);
+}
+
+void cetrafs_journal_drain_aged(struct super_block *sb, unsigned long age)
+{
+    struct cetrafs_journal *j = cetrafs_sb_get_journal(sb);
+
+    if (!j || !j->area_start || READ_ONCE(cetrafs_journal_aged_drain_off))
+        return;
+    if (!mutex_trylock(&j->batch_mutex))
+        return;
+    if (j->retire_n && time_after_eq(jiffies, j->retire_since + age) && !blkdev_issue_flush(sb->s_bdev)) {
+        cetrafs_journal_drain_locked(sb, j);
+        atomic64_inc(&cetrafs_journal_aged_drains);
+    }
+    mutex_unlock(&j->batch_mutex);
+}
+
 /* TEST ONLY: a hand-back leaves this node's live entries for its blocks
  * as they are -- the control of tests/kernel/release_journal_settled.sh. */
 static bool cetrafs_release_journal_unsettled;
@@ -2095,6 +2136,8 @@ static int cetrafs_journal_batch_chunk(struct super_block *sb, struct cetrafs_jo
         for (i = 0; i < k; i++) {
             if (!written[i])
                 continue;
+            if (!j->retire_n)
+                j->retire_since = jiffies;
             j->retire_slot[j->retire_n] = slots[i];
             j->retire_lba[j->retire_n] = bhs[i]->b_blocknr;
             j->retire_n++;

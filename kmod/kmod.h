@@ -1950,6 +1950,8 @@ u64 cetrafs_release_journal_drain_count(void);
 u64 cetrafs_convert_source_flush_count(void);
 u64 cetrafs_deferred_batch_count(void);
 u64 cetrafs_deferred_batch_flush_count(void);
+void cetrafs_journal_drain_aged(struct super_block *sb, unsigned long age);
+u64 cetrafs_journal_aged_drain_count(void);
 int cetrafs_journal_write_deferred(struct super_block *sb, struct buffer_head **bhs,
                                    const struct cetrafs_journal_owner *owners, const u32 *disk_crc, unsigned int n,
                                    bool *written, u32 *wcrc);
