@@ -1186,6 +1186,12 @@ static void cetrafs_zg_test_sleep(struct super_block *sb, unsigned int ms)
     }
 }
 
+/* TEST ONLY: an unowned claim takes no scrub hold, as before the fsck -r
+ * case was closed (tests/kernel/trim_quarantine_takeover.sh, 3). */
+static bool cetrafs_zg_hold_owned_only;
+cetrafs_test_param(zg_hold_owned_only, cetrafs_zg_hold_owned_only, bool, 0644);
+MODULE_PARM_DESC(zg_hold_owned_only, "TEST ONLY: a claim of an unowned Zone Group takes no scrub hold");
+
 /* fin_out: a caller holding the claim mutex itself finishes the claim
  * once it has dropped it (cetrafs_zg_claim_finish()); NULL here finishes
  * it after this call's own unlock. replayed: an owner whose journal the
@@ -1402,8 +1408,12 @@ static int __cetrafs_zg_try_claim_one(struct super_block *sb,
     }
     /* Taken from an owner -- crashed, fenced or departed: any trimmed run
      * it was holding from the scrub is in this group with no hold
-     * (struct cetrafs_trim_quarantined). Before the group is cached. */
-    if (!took_unowned)
+     * (struct cetrafs_trim_quarantined). Before the group is cached.
+     * An unowned one too: a group released alive is empty, but one
+     * whose record fsck -r rebuilt comes back unowned with whatever its
+     * crashed owner was holding still allocated in it. The hold costs a
+     * delayed scrub; its absence, a run the UNMAP may still land on. */
+    if (!took_unowned || !READ_ONCE(cetrafs_zg_hold_owned_only))
         cetrafs_sb_zg_scrub_hold(sb, zg_id);
 
     *out_claimed = true;

@@ -24,6 +24,11 @@
 #      scrub cycles reclaim nothing;
 #   2. once the 30 s are over the scrub reclaims the run, and fsck finds
 #      no leak.
+#   3. the Zone Group left UNOWNED between the unmount and the mount, as
+#      fsck -r leaves one whose damaged record it rebuilt: the claim of an
+#      unowned group holds it too (info, and no reclaim in three cycles).
+#      Control: zg_hold_owned_only=1, the claim as before -- the scrub
+#      reclaims the run at once.
 #
 # DISCRIMINATION (measured with the hold removed): check 1 fails, the
 # scrub reclaiming the run in its first cycles after the remount.
@@ -32,7 +37,7 @@ set -euo pipefail
 require_root
 require_module
 command -v fstrim >/dev/null || { skip "no fstrim(8)"; ct_exit; }
-for p in discard_fail_unknown trim_quarantine_secs scrub_gap_floor_secs; do
+for p in discard_fail_unknown trim_quarantine_secs scrub_gap_floor_secs zg_hold_owned_only; do
     [ -w "/sys/module/cetrafs/parameters/$p" ] || { skip "$p is missing"; ct_exit; }
 done
 MNT="$(ct_mnt tqt)"
@@ -41,6 +46,8 @@ ct_param_set scrub 1
 ct_param_set scrub_interval_secs 2
 ct_param_set scrub_gap_floor_secs 1
 ct_param_set scrub_gap_secs 1
+ct_param_set zg_hold_owned_only 0
+ZG_POKE="$(ct_helper zg_poke)"
 
 # kept_then_remount <tag> <trim_quarantine_secs at the remount>: leaves the
 # volume mounted, the kept run in it and the hold gone with the unmount.
@@ -67,6 +74,7 @@ kept_then_remount() {
     kept=$(($(info trim_leaked_blocks) - l0))
     [ "$kept" = 2048 ] || { fail "$1: setup: the failing discard kept $kept blocks, not 2048"; ct_exit; }
     ct_umount "$MNT"
+    [ "${3:-}" = unowned ] && "$ZG_POKE" "$img" 0 65535 >/dev/null # what fsck -r's rebuild leaves
     ct_param_set trim_quarantine_secs "$2"
     ct_mount "$dev" "$MNT"
     require_cetrafs_mount "$MNT"
@@ -117,4 +125,20 @@ done
 ct_umount "$MNT"
 N="$(CETRAFS_FSCK_DUMP_LEAKS=1 ct_fsck "$DEV" 2>&1 | grep -c '^LEAK: lba=' || true)"
 [ "$N" = 0 ] && pass "2: fsck finds no leaked block" || fail "2: fsck finds $N leaked block(s)"
+
+ct_param_set zg_hold_owned_only 1
+kept_then_remount unownedctl 30 unowned
+N="$(reclaimed_within 4)"
+ct_param_set zg_hold_owned_only 0
+[ "$N" != nocycles ] && [ "$N" -ge 2048 ] &&
+    pass "3 control: claimed unowned with no hold, the scrub reclaimed the run at once ($N blocks)" ||
+    fail "3 control: the scrub reclaimed $N block(s) -- the unowned claim does not reach the check"
+ct_umount "$MNT"
+kept_then_remount unowned 30 unowned
+H="$(info trim_held_zone_groups)"
+N="$(reclaimed_within 3)"
+[ "$H" -ge 1 ] && [ "$N" = 0 ] && [ $(($(date +%s) - T0)) -lt 30 ] &&
+    pass "3: an unowned Zone Group's claim holds it too ($H held, nothing reclaimed in three cycles)" ||
+    fail "3: unowned claim: $H held, $N reclaimed, $(($(date +%s) - T0)) s in"
+ct_umount "$MNT"
 ct_exit

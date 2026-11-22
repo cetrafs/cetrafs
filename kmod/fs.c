@@ -5633,9 +5633,10 @@ int cetrafs_frees_quiet(struct super_block *sb, struct cetrafs_frees_snap *snap,
  * crash, a fence. Whoever takes the group next -- a peer stealing it, or
  * this node re-attaching at mount -- cannot tell which of its leaks are
  * such runs, so it keeps the scrub out of the WHOLE Zone Group for its
- * own trim_quarantine_secs (cetrafs_sb_zg_scrub_hold()). A Zone Group
- * claimed unowned carries none: it was never owned, or was given back
- * empty, and a held run keeps its group from reading empty.
+ * own trim_quarantine_secs (cetrafs_sb_zg_scrub_hold()). So does a claim
+ * of an unowned one: a group given back alive is empty (a held run keeps
+ * it from reading empty), but one whose damaged record fsck -r rebuilt
+ * comes back unowned with its crashed owner's runs still in it.
  */
 struct cetrafs_trim_quarantined {
     struct cetrafs_resv_span span;

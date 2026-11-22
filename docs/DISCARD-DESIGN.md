@@ -374,7 +374,8 @@ heartbeat I/O. On by default where the device supports discard;
   after that. The hold is in memory: a node that takes the run's Zone
   Group from an owner -- a peer after an unmount, a crash or a fence,
   or the same node re-attaching at mount -- keeps the scrub out of the
-  whole group for its own `trim_quarantine_secs`
+  whole group for its own `trim_quarantine_secs`, and so does a claim of
+  an unowned group (one `fsck -r` rebuilt comes back unowned)
   (`trim_held_zone_groups`), since it cannot tell which leaks are such
   runs. Its bits are
   synced to the device before fstrim returns (a fence before writeback
