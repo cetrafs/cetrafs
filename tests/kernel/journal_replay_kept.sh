@@ -24,15 +24,25 @@
 #   D. E1's owner cannot be read on the first pass
 #      (journal_owner_read_fail=5): it waits, E2 waits behind it, and
 #      the root ends at s2, not s1.
+#   U. as D, E1's owner unreadable through every pass (15 failed reads:
+#      five tries in each of three passes, the last one final), with the
+#      replay's entry array handed out full of garbage
+#      (journal_replay_poison=1, what an allocator without init_on_alloc
+#      may return): E1 kept for an unreadable owner must still read
+#      "kept undecided", never "kept for live openers" -- the scan used to
+#      leave live_kept unset, and a garbage one told the caller to go on
+#      with an entry it never repaired (audit 2026-11-22, N-4).
 #
 # DISCRIMINATION: journal_kept_aborts=1 (K): the first replay redoes
 # nothing -- E3's block is still d0. journal_unordered=1 (D): the root
-# ends at s1, E2's write lost.
+# ends at s1, E2's write lost. journal_replay_live_kept_unset=1 (U): the
+# poisoned live_kept reads as a live opener.
 set -euo pipefail
 . "$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)/lib/harness.sh"
 require_root
 require_module
-for p in journal_kept_aborts journal_unordered journal_replay_lookup_fail journal_owner_read_fail journal_replay_refuse; do
+for p in journal_kept_aborts journal_unordered journal_replay_lookup_fail journal_owner_read_fail journal_replay_refuse \
+    journal_replay_poison journal_replay_live_kept_unset; do
     [ -w "/sys/module/cetrafs/parameters/$p" ] || { skip "$p is missing"; ct_exit; }
 done
 JPOKE="$(ct_helper journal_poke)"
@@ -46,6 +56,8 @@ ct_param_set journal_unordered 0
 ct_param_set journal_replay_lookup_fail 0
 ct_param_set journal_owner_read_fail 0
 ct_param_set journal_replay_refuse 0
+ct_param_set journal_replay_poison 0
+ct_param_set journal_replay_live_kept_unset 0
 compress_timing
 
 get() { grep -o "$1=[^ ]*" <<<"$2" | head -1 | sed 's/^[^=]*=//'; }
@@ -124,6 +136,9 @@ round() {
     RES="first_root=$(which_img "$dev" "$t" "$dir/s0" "$dir/s1" "$dir/s2")"
     RES="$RES first_d=$(which_img "$dev" "$d" "$dir/d0" "$dir/d1") first_state=$(state "$dev")"
     RES="$RES kept_logged=$(dmesg_since "$mark" | grep -c 'kept undecided' || true)"
+    RES="$RES live_logged=$(dmesg_since "$mark" | grep -c 'kept for live openers' || true)"
+    echo 0 >"$P/journal_replay_poison"
+    echo 0 >"$P/journal_replay_live_kept_unset"
     echo 0 >"$P/$2"
     echo 0 >"$P/journal_replay_refuse"
     echo 0 >$P/journal_kept_aborts
@@ -148,6 +163,15 @@ log "D control (judged past an older entry): $DC"
 round d journal_owner_read_fail 5 0
 D="$RES"
 log "D: $D"
+echo 1 >"$P/journal_replay_poison"
+echo 1 >"$P/journal_replay_live_kept_unset"
+round uc journal_owner_read_fail 15 0
+UC="$RES"
+log "U control (poisoned, live_kept left unset): $UC"
+echo 1 >"$P/journal_replay_poison"
+round u journal_owner_read_fail 15 0
+U="$RES"
+log "U: $U"
 
 [ "$(get first_state "$K")" = 1 ] && [ "$(get kept_logged "$K")" -ge 1 ] ||
     { fail "setup: the first replay of K kept nothing ($K)"; ct_exit; }
@@ -165,4 +189,11 @@ log "D: $D"
 [ "$(get end_root "$DC")" = s1 ] &&
     pass "D control: judged past the waiting E1, E2 was consumed unapplied and the root ended at s1" ||
     fail "D control: the chain survived without the ordering ($DC) -- the suite does not reach it"
+[ "$(get kept_logged "$U")" -ge 1 ] && [ "$(get live_logged "$U")" = 0 ] && [ "$(get end_root "$U")" = s2 ] &&
+    [ "$(get fsck_err "$U")" = 0 ] &&
+    pass "U: on a poisoned entry array the unreadable owner's entry still blocks as undecided; root at s2" ||
+    fail "U: $U"
+[ "$(get live_logged "$UC")" -ge 1 ] &&
+    pass "U control: with live_kept left unset, the poisoned entry read as kept for a live opener" ||
+    fail "U control: the poison did not reach live_kept ($UC) -- the suite does not see it"
 ct_exit

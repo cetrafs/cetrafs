@@ -2948,6 +2948,16 @@ static void cetrafs_journal_entry_undecided(struct cetrafs_journal_replay_entry 
  * the whole replay counts as dirent installs in flight: a lockless
  * directory walk re-reads its record before trusting any block it meets
  * meanwhile (BL-51). */
+/* TEST ONLY: the replay's entry array filled with garbage, as an
+ * allocator without init_on_alloc may return it; and the fill leaving
+ * live_kept as it found it, as before audit 2026-11-22 N-4 (the control). */
+static bool cetrafs_journal_replay_poison;
+cetrafs_test_param(journal_replay_poison, cetrafs_journal_replay_poison, bool, 0644);
+MODULE_PARM_DESC(journal_replay_poison, "TEST ONLY: fill the replay's entry array with 0xff before the scan");
+static bool cetrafs_journal_replay_live_kept_unset;
+cetrafs_test_param(journal_replay_live_kept_unset, cetrafs_journal_replay_live_kept_unset, bool, 0644);
+MODULE_PARM_DESC(journal_replay_live_kept_unset, "TEST ONLY: the replay scan leaves an entry's live_kept unset");
+
 static int __cetrafs_journal_replay_node(struct super_block *sb, u32 node_id, bool wait_for_claim, u64 scope)
 {
     int ret;
@@ -3080,11 +3090,18 @@ static int ___cetrafs_journal_replay_node(struct super_block *sb, u32 node_id, b
     if (ret || !dirty)
         goto out_release;
 
-    entries = kvmalloc_array(slots, sizeof(*entries), GFP_KERNEL);
+    /* Zeroed, and every field set by the fill below: live_kept was set
+     * only where a live opener kept an entry, and read for every kept
+     * one -- garbage read "kept for a live opener", and a replay with an
+     * entry it never repaired told its caller to go on (audit
+     * 2026-11-22, N-4; tests/kernel/journal_replay_kept.sh, U). */
+    entries = kvcalloc(slots, sizeof(*entries), GFP_KERNEL);
     if (!entries) {
         ret = -ENOMEM;
         goto out_release;
     }
+    if (READ_ONCE(cetrafs_journal_replay_poison))
+        memset(entries, 0xff, slots * sizeof(*entries)); /* test-only: what init_on_alloc=0 may hand out */
 
     for (s = 0; s < slots; s++) {
         u64 header_lba = area_start + 1 + s * CETRAFS_JOURNAL_SLOT_BLOCKS;
@@ -3222,6 +3239,8 @@ static int ___cetrafs_journal_replay_node(struct super_block *sb, u32 node_id, b
         entries[count].undecided = false;
         entries[count].owner_ino = cetrafs_le64(hdr->owner_ino);
         entries[count].owner_generation = cetrafs_le64(hdr->owner_generation);
+        if (!READ_ONCE(cetrafs_journal_replay_live_kept_unset))
+            entries[count].live_kept = false;
         count++;
         brelse(hbh);
     }
