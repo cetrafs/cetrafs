@@ -27,6 +27,7 @@
 set -euo pipefail
 . "$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)/lib/harness.sh"
 require_root
+export CETRAFS_PEER_PROBE_SECS=3 # the borrow's probe, compressed (devutil.h)
 NPOKE="$(ct_helper node_poke)"
 SBPOKE="$(ct_helper sb_poke)"
 
