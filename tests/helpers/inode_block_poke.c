@@ -94,6 +94,7 @@ int main(int argc, char **argv)
         fprintf(stderr, "       %s <backing-file> plantrec <ino> <mode>  (a valid record at ANY slot, in range or not)\n",
                 argv[0]);
         fprintf(stderr, "       %s <backing-file> setsize <ino> <bytes> (as a PEER extending it would)\n", argv[0]);
+        fprintf(stderr, "       %s <backing-file> setlblk <ino> <entry> <lblk> (an inline extent's logical start)\n", argv[0]);
         fprintf(stderr, "       %s <backing-file> reuse <ino> <gen> <node> (a peer reused the number)\n", argv[0]);
         fprintf(stderr, "       %s <backing-file> size <ino>           (print the on-disk size)\n", argv[0]);
         fprintf(stderr, "       %s <backing-file> mtime <ino>          (print the on-disk mtime)\n", argv[0]);
@@ -499,6 +500,23 @@ int main(int argc, char **argv)
         cetrafs_inode_stamp_crcs_us(&rec);
         pwrite_all(fd, &rec, sizeof(rec), rec_off);
         fprintf(stderr, "inode_block_poke: ino %llu eh %s -> %u\n", (unsigned long long) ino, argv[4], v);
+    } else if (strcmp(mode, "setlblk") == 0) {
+        /* Set inline extent <entry>'s LOGICAL start, restamped: a
+         * directory with a gap in its blocks (dir_sparse_refused.sh). */
+        cetrafs_inode_t rec;
+        unsigned long e = (argc > 4) ? strtoul(argv[4], NULL, 0) : 0;
+        unsigned long long lb = (argc > 5) ? strtoull(argv[5], NULL, 0) : 0;
+
+        pread_all(fd, &rec, sizeof(rec), rec_off);
+        if (cetrafs_le16(rec.eh.eh_depth) != 0 || e >= cetrafs_le16(rec.eh.eh_entries)) {
+            fprintf(stderr, "setlblk: ino %llu has no inline extent %lu\n", (unsigned long long) ino, e);
+            return 1;
+        }
+        cetrafs_ee_set_lblk(&rec.et.leaf[e], lb);
+        cetrafs_inode_stamp_crcs_us(&rec);
+        pwrite_all(fd, &rec, sizeof(rec), rec_off);
+        fprintf(stderr, "inode_block_poke: ino %llu extent %lu starts at logical %llu\n", (unsigned long long) ino, e,
+                lb);
     } else if (strcmp(mode, "extlen") == 0) {
         /* Set inline extent 0's length to an arbitrary value and mark it
          * PREALLOCATED, restamping the checksum so the record stays

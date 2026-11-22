@@ -650,6 +650,19 @@ static bool cetrafs_dir_len_unbounded;
 cetrafs_test_param(dir_len_unbounded, cetrafs_dir_len_unbounded, bool, 0644);
 MODULE_PARM_DESC(dir_len_unbounded, "TEST ONLY: a directory's extents may name any number of blocks");
 
+/* TEST ONLY: a directory's extents may leave gaps, as before audit
+ * 2026-11-22 N-28 -- the control of tests/kernel/dir_sparse_refused.sh. */
+static bool cetrafs_dir_density_unchecked;
+cetrafs_test_param(dir_density_unchecked, cetrafs_dir_density_unchecked, bool, 0644);
+MODULE_PARM_DESC(dir_density_unchecked, "TEST ONLY: a directory's extents may leave logical gaps");
+
+/* TEST ONLY: growth writes into the block it mapped without looking, as
+ * before audit 2026-11-22 N-28 -- with dir_density_unchecked, the
+ * control of tests/kernel/dir_sparse_refused.sh. */
+static bool cetrafs_dir_grow_blank_unchecked;
+cetrafs_test_param(dir_grow_blank_unchecked, cetrafs_dir_grow_blank_unchecked, bool, 0644);
+MODULE_PARM_DESC(dir_grow_blank_unchecked, "TEST ONLY: directory growth writes into its new block unchecked");
+
 static int cetrafs_dir_extents_addr_ok(struct inode *dir, const struct cetrafs_dir_extents *de)
 {
     u64 total = 0;
@@ -659,6 +672,24 @@ static int cetrafs_dir_extents_addr_ok(struct inode *dir, const struct cetrafs_d
         u64 phys = cetrafs_ee_pblk(&de->arr[i]);
         u32 len = cetrafs_ee_len(&de->arr[i]);
         int chk = cetrafs_lba_run_check(dir->i_sb, phys, len);
+
+        /* Dense from block 0, by construction: a directory grows only at
+         * its end (cetrafs_dir_add_entry(), next_logical = the blocks it
+         * holds) and never loses a block while it lives. Sorted by
+         * logical block (cetrafs_dir_extents_get_unchecked()), so each
+         * extent starts where the ones before it end. A gap or an overlap
+         * is damage -- and growth trusted the count as the end: next to a
+         * gap, the "new" block it mapped was one the directory already
+         * had, and the first entry written into it went over '.' (audit
+         * 2026-11-22 N-28). */
+        if (cetrafs_ee_lblk(&de->arr[i]) != total && !READ_ONCE(cetrafs_dir_density_unchecked)) {
+            pr_err_ratelimited("dir ino=%llu: extent %u starts at logical block %llu where %llu was expected -- "
+                               "a directory's blocks are dense; refusing them (fsck)\n",
+                               (unsigned long long) dir->i_ino, i, (unsigned long long) cetrafs_ee_lblk(&de->arr[i]),
+                               (unsigned long long) total);
+            cetrafs_sb_corrupt_inode(dir);
+            return -EUCLEAN;
+        }
 
         /* A count, not only an address (rule 19): every scan of the
          * directory reads that many blocks forced-fresh under its
@@ -1429,6 +1460,28 @@ int cetrafs_dir_add_entry(struct inode *dir, const struct qstr *name, u64 ino, u
             return -EIO;
         }
         slot = (cetrafs_dirent_t *) bh->b_data;
+        /* A block growth just mapped is empty: cetrafs_get_block() zeroed
+         * and stamped it. One that names an entry was not new -- the tree
+         * already held it (a gap the density check above did not see, or
+         * a mapping race) -- and writing slot 0 would put the new entry
+         * over whatever is there, '.' in the directory's first block. */
+        {
+            const cetrafs_dirent_t *d = (const cetrafs_dirent_t *) bh->b_data;
+            u32 k;
+
+            for (k = 0; k < CETRAFS_DIRENTS_PER_BLOCK; k++)
+                if (d[k].inode)
+                    break;
+            if (k < CETRAFS_DIRENTS_PER_BLOCK && !READ_ONCE(cetrafs_dir_grow_blank_unchecked)) {
+                pr_err_ratelimited("dir ino=%llu: the block growth mapped (%llu) already names inode %llu -- "
+                                   "not writing over it (fsck)\n",
+                                   (unsigned long long) dir->i_ino, (unsigned long long) new_lba,
+                                   (unsigned long long) cetrafs_le64(d[k].inode));
+                brelse(bh);
+                cetrafs_sb_corrupt_inode(dir);
+                return -EUCLEAN;
+            }
+        }
     } else {
         cetrafs_dir_extents_put(&dx);
         slot = &((cetrafs_dirent_t *) bh->b_data)[slot_idx];
