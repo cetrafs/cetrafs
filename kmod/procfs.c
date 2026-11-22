@@ -429,6 +429,7 @@ static int cetrafs_proc_info_show(struct seq_file *m, void *v)
     seq_printf(m, "discard_handback_unknown: %llu\n", cetrafs_discard_handback_unknown_count());
     seq_printf(m, "discard_pending_bgs: %u\n", cetrafs_sb_discard_pending_count(sb));
     seq_printf(m, "trim_leaked_blocks: %llu\n", cetrafs_trim_leaked_count());
+    seq_printf(m, "trim_quarantined: %llu\n", (unsigned long long) cetrafs_trim_quarantined_count(sb));
     {
         u64 q, dr, gu, c, bl;
 

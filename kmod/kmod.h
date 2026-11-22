@@ -549,6 +549,10 @@ struct cetrafs_resv_span {
 void cetrafs_resv_publish(struct super_block *sb, struct cetrafs_resv_span *span, u64 start, u32 count);
 void cetrafs_resv_unpublish(struct super_block *sb, struct cetrafs_resv_span *span);
 bool cetrafs_resv_covers(struct super_block *sb, u64 lba);
+bool cetrafs_trim_quarantine_add(struct super_block *sb, u64 lba, u64 count);
+void cetrafs_trim_quarantine_drop(struct super_block *sb, bool all);
+u64 cetrafs_trim_quarantined_count(struct super_block *sb);
+unsigned int cetrafs_trim_quarantine_secs_get(void);
 
 /* FITRIM claims (alloc.c): a free run held, bits set, while discard.c
  * discards it. */

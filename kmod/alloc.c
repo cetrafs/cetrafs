@@ -6372,8 +6372,20 @@ void cetrafs_trim_release(struct super_block *sb, struct cetrafs_trim_run *run, 
          * 21). Off the reservation list below, so the scrub reclaims it,
          * minutes from now. */
         atomic64_add((s64) run->count, &cetrafs_trim_leaked_blocks);
-        pr_warn_ratelimited("trim: the discard of [%llu +%llu) may still land -- left allocated for the scrub\n",
-                            (unsigned long long) run->lba, (unsigned long long) run->count);
+        /* ...and held from the scrub too, for longer than a command can
+         * outlive its path: the scrub would otherwise reclaim the run in
+         * minutes and the allocator hand it out under the UNMAP still
+         * queued (N-24). Published before the run's own span goes below,
+         * so the registry never lets go of it in between. */
+        if (cetrafs_trim_quarantine_add(sb, run->lba, run->count))
+            pr_warn_ratelimited("trim: the discard of [%llu +%llu) may still land -- left allocated, and kept from "
+                                "the scrub for %u s\n",
+                                (unsigned long long) run->lba, (unsigned long long) run->count,
+                                cetrafs_trim_quarantine_secs_get());
+        else
+            pr_warn_ratelimited("trim: the discard of [%llu +%llu) may still land -- left allocated for the scrub "
+                                "(no memory to hold it from the scrub)\n",
+                                (unsigned long long) run->lba, (unsigned long long) run->count);
         sync_kept = true;
         goto out;
     }

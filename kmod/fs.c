@@ -1058,6 +1058,9 @@ struct cetrafs_sb_info {
      */
     spinlock_t resv_list_lock;
     struct list_head resv_list;
+    /* FITRIM runs whose discard had an unknown outcome, each held on
+     * resv_list until its quarantine ends (cetrafs_trim_quarantine_add()). */
+    struct list_head trim_quarantine;
     /* Bumped, under resv_list_lock, every time blocks LEAVE the
      * registry: a span unpublished or re-pointed. A released run has
      * become somebody's data (written and closed, committed by a
@@ -3430,6 +3433,7 @@ int cetrafs_fill_super(struct super_block *sb, struct fs_context *fc)
         mutex_init(&sbi->witness_mutex);
         mutex_init(&sbi->statfs_fill_mutex);
         INIT_LIST_HEAD(&sbi->resv_list);
+        INIT_LIST_HEAD(&sbi->trim_quarantine);
 
         spin_lock_init(&sbi->peer_lock);
         sbi->peer_count = le32_to_cpu(ondisk->node_table_count);
@@ -4652,6 +4656,9 @@ bool cetrafs_free_sb_info(struct super_block *sb)
      * cycle bail at its next inode/block boundary rather than stall. */
     cetrafs_scrub_stop(sbi->scrub);
     sbi->scrub = NULL;
+    /* Nothing consumes the quarantine once the scrub is stopped; its
+     * runs' bits stay set on the device (cetrafs_trim_quarantine_add()). */
+    cetrafs_trim_quarantine_drop(sb, true);
 
     /* Unpublish the heartbeat before it is freed: cetrafs_heartbeat_stop()
      * frees it, and sbi->hb must not name the freed object afterwards.
@@ -5604,6 +5611,114 @@ int cetrafs_frees_quiet(struct super_block *sb, struct cetrafs_frees_snap *snap,
     snap->local = local;
     memcpy(snap->seqs, seqs, sizeof(seqs));
     return 0;
+}
+
+/*
+ * A FITRIM run whose discard had an UNKNOWN outcome stays allocated: the
+ * UNMAP may still execute, and a block handed out under it loses its data
+ * when it does. Allocated is not enough on its own, though -- nothing
+ * names those blocks, so the scrub reclaims them as leaked, two passes and
+ * scrub_gap_secs apart, and then the allocator hands them out while the
+ * command may still be queued on a path (audit 2026-11-22 N-24). So the
+ * run is also held on the reservation registry, which every scrub free
+ * consults (cetrafs_resv_covers()), until trim_quarantine_secs have
+ * passed: longer than a command lives on a path that fails it over. A
+ * remount drops the hold, not the bits: the scrub's first cycle comes a
+ * whole scrub_interval_secs after the mount. Lives in memory, no format.
+ */
+struct cetrafs_trim_quarantined {
+    struct cetrafs_resv_span span;
+    struct list_head q;
+    unsigned long until; /* jiffies */
+};
+
+static unsigned int cetrafs_trim_quarantine_secs = 600;
+static int cetrafs_trim_quarantine_set(const char *val, const struct kernel_param *kp)
+{
+    unsigned int v;
+    int ret = kstrtouint(val, 0, &v);
+
+    if (ret)
+        return ret;
+    if (v < 1 || v > 86400)
+        return -EINVAL;
+    *(unsigned int *) kp->arg = v;
+    return 0;
+}
+static const struct kernel_param_ops cetrafs_trim_quarantine_ops = {
+    .set = cetrafs_trim_quarantine_set,
+    .get = param_get_uint,
+};
+module_param_cb(trim_quarantine_secs, &cetrafs_trim_quarantine_ops, &cetrafs_trim_quarantine_secs, 0644);
+MODULE_PARM_DESC(trim_quarantine_secs,
+                 "seconds a trimmed run whose discard outcome is unknown is kept from the scrub (1..86400, default 600)");
+
+/* Hold [lba, +count) from the scrub for trim_quarantine_secs. false when
+ * the hold could not be taken (no memory): the run is still allocated,
+ * and only the scrub can take it back then, as before. */
+bool cetrafs_trim_quarantine_add(struct super_block *sb, u64 lba, u64 count)
+{
+    struct cetrafs_sb_info *sbi = sb->s_fs_info;
+    struct cetrafs_trim_quarantined *t;
+
+    if (!sbi || !sbi->trim_quarantine.next || !count || count > U32_MAX)
+        return false;
+    t = kzalloc(sizeof(*t), GFP_NOFS);
+    if (!t)
+        return false;
+    INIT_LIST_HEAD(&t->span.link);
+    t->until = jiffies + (unsigned long) READ_ONCE(cetrafs_trim_quarantine_secs) * HZ;
+    cetrafs_resv_publish(sb, &t->span, lba, (u32) count);
+    spin_lock(&sbi->resv_list_lock);
+    list_add_tail(&t->q, &sbi->trim_quarantine);
+    spin_unlock(&sbi->resv_list_lock);
+    return true;
+}
+
+/* Release the holds whose quarantine is over -- every one with 'all'
+ * (unmount). Called by the scrub before it gathers its evidence. */
+void cetrafs_trim_quarantine_drop(struct super_block *sb, bool all)
+{
+    struct cetrafs_sb_info *sbi = sb->s_fs_info;
+    struct cetrafs_trim_quarantined *t, *n;
+    LIST_HEAD(done);
+
+    /* Also called by free_sb_info on a mount that failed before the
+     * list was initialised (sb_info is zeroed). */
+    if (!sbi || !sbi->trim_quarantine.next)
+        return;
+    spin_lock(&sbi->resv_list_lock);
+    list_for_each_entry_safe(t, n, &sbi->trim_quarantine, q) {
+        if (all || time_after_eq(jiffies, t->until))
+            list_move(&t->q, &done);
+    }
+    spin_unlock(&sbi->resv_list_lock);
+    list_for_each_entry_safe(t, n, &done, q) {
+        list_del(&t->q);
+        cetrafs_resv_unpublish(sb, &t->span);
+        kfree(t);
+    }
+}
+
+unsigned int cetrafs_trim_quarantine_secs_get(void)
+{
+    return READ_ONCE(cetrafs_trim_quarantine_secs);
+}
+
+/* How many runs are held (procfs info, tests). */
+u64 cetrafs_trim_quarantined_count(struct super_block *sb)
+{
+    struct cetrafs_sb_info *sbi = sb->s_fs_info;
+    struct cetrafs_trim_quarantined *t;
+    u64 n = 0;
+
+    if (!sbi || !sbi->trim_quarantine.next)
+        return 0;
+    spin_lock(&sbi->resv_list_lock);
+    list_for_each_entry(t, &sbi->trim_quarantine, q)
+        n++;
+    spin_unlock(&sbi->resv_list_lock);
+    return n;
 }
 
 bool cetrafs_resv_covers(struct super_block *sb, u64 lba)
