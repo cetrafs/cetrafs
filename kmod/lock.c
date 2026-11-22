@@ -5455,6 +5455,67 @@ static bool cetrafs_verdict_current(struct cetrafs_inode_info *ci, unsigned long
            (word >> 2) == ((unsigned long) (unsigned int) atomic_read(&ci->verdict_gen) & CETRAFS_VERDICT_GEN_MASK);
 }
 
+/*
+ * A word is trusted only with the time of the fill that published it, and
+ * the two are separate stores. The fill used to store the time first: a
+ * lockless reader in between paired the PREVIOUS fill's word -- its
+ * generation still current, since a peer's open bumps nothing here --
+ * with the new time, and took an arbitrarily old "no foreign opener" as
+ * read this second (audit 2026-11-22, N-20). So the word goes first and
+ * the time is the release store; a reader loads the time first. A reader
+ * that sees the new time sees the new word or a later one; one that
+ * sees the old time judges by it, and an old time is only ever a reason
+ * to read the device again (tests/kernel/verdict_publish_order.sh).
+ */
+static unsigned int cetrafs_verdict_publish_stall_ms;
+cetrafs_test_param(verdict_publish_stall_ms, cetrafs_verdict_publish_stall_ms, uint, 0644);
+MODULE_PARM_DESC(verdict_publish_stall_ms, "TEST ONLY: pause the next verdict fill between its two publishing stores");
+static bool cetrafs_verdict_time_first;
+cetrafs_test_param(verdict_time_first, cetrafs_verdict_time_first, bool, 0644);
+MODULE_PARM_DESC(verdict_time_first, "TEST ONLY: publish a verdict's time before its word, as before audit N-20");
+
+static void cetrafs_verdict_publish_stall(void)
+{
+    unsigned int ms;
+
+    if (!READ_ONCE(cetrafs_verdict_publish_stall_ms))
+        return;
+    ms = xchg(&cetrafs_verdict_publish_stall_ms, 0); /* test-only, one fill */
+    if (ms)
+        msleep(ms);
+}
+
+static void cetrafs_verdict_publish(unsigned long *wordp, unsigned long *checkedp, unsigned long word,
+                                    unsigned long now)
+{
+    if (READ_ONCE(cetrafs_verdict_time_first)) {
+        WRITE_ONCE(*checkedp, now);
+        cetrafs_verdict_publish_stall();
+        smp_store_release(wordp, word);
+        return;
+    }
+    WRITE_ONCE(*wordp, word);
+    cetrafs_verdict_publish_stall();
+    smp_store_release(checkedp, now);
+}
+
+/* The word in *wordp, if it is current and its fill read the device
+ * within the second before 'now'. */
+static bool cetrafs_verdict_trusted(struct cetrafs_inode_info *ci, unsigned long *wordp, unsigned long *checkedp,
+                                    unsigned long now, unsigned long *word)
+{
+    unsigned long checked;
+
+    if (READ_ONCE(cetrafs_verdict_time_first)) {
+        *word = smp_load_acquire(wordp);
+        checked = READ_ONCE(*checkedp);
+    } else {
+        checked = smp_load_acquire(checkedp);
+        *word = smp_load_acquire(wordp); /* and before the generation read */
+    }
+    return cetrafs_verdict_current(ci, *word) && !time_after(now, checked + HZ);
+}
+
 static void cetrafs_verdicts_invalidate(struct cetrafs_inode_info *ci)
 {
     atomic_inc(&ci->verdict_gen);
@@ -5501,9 +5562,9 @@ MODULE_PARM_DESC(verdict_fill_reclaims, "TEST ONLY: a foreign-opener verdict fil
  */
 
 /* A cached word that may be trusted now: current, and read within a second. */
-static bool cetrafs_verdict_current_recent(struct cetrafs_inode_info *ci, unsigned long word, unsigned long now)
+static bool cetrafs_verdict_current_recent(struct cetrafs_inode_info *ci, unsigned long now, unsigned long *word)
 {
-    return cetrafs_verdict_current(ci, word) && !time_after(now, READ_ONCE(ci->foreign_open_checked) + HZ);
+    return cetrafs_verdict_trusted(ci, &ci->foreign_open_word, &ci->foreign_open_checked, now, word);
 }
 
 /*
@@ -5533,19 +5594,18 @@ static bool cetrafs_verdict_current_recent(struct cetrafs_inode_info *ci, unsign
 bool cetrafs_inode_foreign_opener_cached(struct inode *inode)
 {
     struct cetrafs_inode_info *ci = CETRAFS_I(inode);
-    unsigned long word = smp_load_acquire(&ci->foreign_open_word);
+    unsigned long word;
     bool locked = !READ_ONCE(cetrafs_verdict_fill_unlocked);
     unsigned long now;
     unsigned int gen;
     bool v;
 
-    if (cetrafs_verdict_current_recent(ci, word, jiffies))
+    if (cetrafs_verdict_current_recent(ci, jiffies, &word))
         return word & 1;
 
     if (locked) {
         mutex_lock(&ci->verdict_fill_lock);
-        word = smp_load_acquire(&ci->foreign_open_word);
-        if (cetrafs_verdict_current_recent(ci, word, jiffies)) {
+        if (cetrafs_verdict_current_recent(ci, jiffies, &word)) {
             mutex_unlock(&ci->verdict_fill_lock);
             return word & 1;
         }
@@ -5560,8 +5620,7 @@ bool cetrafs_inode_foreign_opener_cached(struct inode *inode)
         if (ms)
             msleep(ms);
     }
-    WRITE_ONCE(ci->foreign_open_checked, now);
-    smp_store_release(&ci->foreign_open_word, cetrafs_verdict_word(gen, v));
+    cetrafs_verdict_publish(&ci->foreign_open_word, &ci->foreign_open_checked, cetrafs_verdict_word(gen, v), now);
     if (locked)
         mutex_unlock(&ci->verdict_fill_lock);
     return v;
@@ -5692,7 +5751,7 @@ static bool cetrafs_inode_read_stamp_check(struct inode *inode)
 {
     struct cetrafs_inode_info *ci = CETRAFS_I(inode);
     struct super_block *sb = inode->i_sb;
-    unsigned long now = jiffies;
+    unsigned long now = jiffies, word;
     cetrafs_inode_t *raw;
     u32 my_node_id;
 
@@ -5702,8 +5761,7 @@ static bool cetrafs_inode_read_stamp_check(struct inode *inode)
 
     if (cetrafs_read_trust_ignore_stamp)
         return true;
-    if (cetrafs_verdict_current(ci, smp_load_acquire(&ci->read_seq_word)) &&
-        !time_after(now, READ_ONCE(ci->read_seq_checked) + HZ))
+    if (cetrafs_verdict_trusted(ci, &ci->read_seq_word, &ci->read_seq_checked, now, &word))
         return true;
     /* Single-flight, as the foreign-opener fill (audit M-11): one task
      * reads the record, the rest take the word it publishes -- only a
@@ -5711,8 +5769,7 @@ static bool cetrafs_inode_read_stamp_check(struct inode *inode)
     if (locked) {
         mutex_lock(&ci->verdict_fill_lock);
         now = jiffies;
-        if (cetrafs_verdict_current(ci, smp_load_acquire(&ci->read_seq_word)) &&
-            !time_after(now, READ_ONCE(ci->read_seq_checked) + HZ)) {
+        if (cetrafs_verdict_trusted(ci, &ci->read_seq_word, &ci->read_seq_checked, now, &word)) {
             mutex_unlock(&ci->verdict_fill_lock);
             return true;
         }
@@ -5733,8 +5790,8 @@ static bool cetrafs_inode_read_stamp_check(struct inode *inode)
                 if (ms)
                     msleep(ms);
             }
-            WRITE_ONCE(ci->read_seq_checked, now);
-            smp_store_release(&ci->read_seq_word, cetrafs_verdict_word(gen, false));
+            cetrafs_verdict_publish(&ci->read_seq_word, &ci->read_seq_checked, cetrafs_verdict_word(gen, false),
+                                    now);
             ok = true;
         }
     }
