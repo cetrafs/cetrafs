@@ -553,6 +553,9 @@ bool cetrafs_trim_quarantine_add(struct super_block *sb, u64 lba, u64 count);
 void cetrafs_trim_quarantine_drop(struct super_block *sb, bool all);
 u64 cetrafs_trim_quarantined_count(struct super_block *sb);
 unsigned int cetrafs_trim_quarantine_secs_get(void);
+void cetrafs_sb_zg_scrub_hold(struct super_block *sb, u32 zg_id);
+bool cetrafs_sb_zg_scrub_held(struct super_block *sb, u32 zg_id);
+u32 cetrafs_sb_zg_scrub_held_count(struct super_block *sb);
 
 /* FITRIM claims (alloc.c): a free run held, bits set, while discard.c
  * discards it. */

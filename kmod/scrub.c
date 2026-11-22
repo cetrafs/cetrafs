@@ -777,6 +777,13 @@ static int scrub_free_confirmed(struct cetrafs_scrub *s, struct scrub_bg *b, u64
             pr_info("scrub: ZG %u stopped being ours mid-cycle -- abandoning BG %u\n", b->zg_id, b->bg_id);
             break;
         }
+        /* Taken over from an owner that may have held a trimmed run of
+         * unknown discard outcome: nothing here is ours to free until
+         * that hold would have ended (cetrafs_sb_zg_scrub_hold()). */
+        if (cetrafs_sb_zg_scrub_held(sb, b->zg_id)) {
+            pr_debug("scrub: ZG %u is held after its takeover -- leaving BG %u\n", b->zg_id, b->bg_id);
+            break;
+        }
         /* ...and the Block Group still the Zone Group's: groups are
          * released and claimed one at a time, so the ZG can stay ours
          * while this BG went back to the pool and on to a peer -- the

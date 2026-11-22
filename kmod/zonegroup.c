@@ -1278,6 +1278,9 @@ static int __cetrafs_zg_try_claim_one(struct super_block *sb,
         }
         if (ret)
             goto out_unlock;
+        /* Re-attached after being away: what this node held in memory
+         * for it -- a trimmed run's hold -- is gone. */
+        cetrafs_sb_zg_scrub_hold(sb, zg_id);
     }
     if (owner == (u16) my_node_id) {
         /* re-attaching to a ZG we already owned */
@@ -1397,6 +1400,11 @@ static int __cetrafs_zg_try_claim_one(struct super_block *sb,
             goto out_unlock;
         took_unowned = ctx.took_unowned;
     }
+    /* Taken from an owner -- crashed, fenced or departed: any trimmed run
+     * it was holding from the scrub is in this group with no hold
+     * (struct cetrafs_trim_quarantined). Before the group is cached. */
+    if (!took_unowned)
+        cetrafs_sb_zg_scrub_hold(sb, zg_id);
 
     *out_claimed = true;
     epoch_always = READ_ONCE(cetrafs_reconcile_epoch_always);

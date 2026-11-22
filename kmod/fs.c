@@ -1061,6 +1061,9 @@ struct cetrafs_sb_info {
     /* FITRIM runs whose discard had an unknown outcome, each held on
      * resv_list until its quarantine ends (cetrafs_trim_quarantine_add()). */
     struct list_head trim_quarantine;
+    /* Per Zone Group: jiffies until which the scrub frees nothing in it,
+     * 0 for none (cetrafs_sb_zg_scrub_hold()). */
+    unsigned long zg_scrub_hold[CETRAFS_MAX_ZONE_GROUPS];
     /* Bumped, under resv_list_lock, every time blocks LEAVE the
      * registry: a span unpublished or re-pointed. A released run has
      * become somebody's data (written and closed, committed by a
@@ -5622,9 +5625,17 @@ int cetrafs_frees_quiet(struct super_block *sb, struct cetrafs_frees_snap *snap,
  * command may still be queued on a path (audit 2026-11-22 N-24). So the
  * run is also held on the reservation registry, which every scrub free
  * consults (cetrafs_resv_covers()), until trim_quarantine_secs have
- * passed: longer than a command lives on a path that fails it over. A
- * remount drops the hold, not the bits: the scrub's first cycle comes a
- * whole scrub_interval_secs after the mount. Lives in memory, no format.
+ * passed: longer than a command lives on a path that fails it over.
+ *
+ * The hold lives in this node's memory (no format), and the run outlives
+ * it whenever its Zone Group goes on without this node: an unmount (its
+ * Zone Groups stay with the departed row, for the next claimer), a
+ * crash, a fence. Whoever takes the group next -- a peer stealing it, or
+ * this node re-attaching at mount -- cannot tell which of its leaks are
+ * such runs, so it keeps the scrub out of the WHOLE Zone Group for its
+ * own trim_quarantine_secs (cetrafs_sb_zg_scrub_hold()). A Zone Group
+ * claimed unowned carries none: it was never owned, or was given back
+ * empty, and a held run keeps its group from reading empty.
  */
 struct cetrafs_trim_quarantined {
     struct cetrafs_resv_span span;
@@ -5706,6 +5717,41 @@ unsigned int cetrafs_trim_quarantine_secs_get(void)
 }
 
 /* How many runs are held (procfs info, tests). */
+/* A Zone Group that came to this node from an owner which may have held
+ * a trimmed run (see struct cetrafs_trim_quarantined): no scrub free in
+ * it for trim_quarantine_secs. Called before the group is cached as
+ * ours, so the scrub never sees it owned and unheld. */
+void cetrafs_sb_zg_scrub_hold(struct super_block *sb, u32 zg_id)
+{
+    struct cetrafs_sb_info *sbi = sb->s_fs_info;
+    unsigned long until;
+
+    if (!sbi || zg_id >= CETRAFS_MAX_ZONE_GROUPS)
+        return;
+    until = jiffies + (unsigned long) READ_ONCE(cetrafs_trim_quarantine_secs) * HZ;
+    WRITE_ONCE(sbi->zg_scrub_hold[zg_id], until ? until : 1);
+}
+
+bool cetrafs_sb_zg_scrub_held(struct super_block *sb, u32 zg_id)
+{
+    struct cetrafs_sb_info *sbi = sb->s_fs_info;
+    unsigned long until;
+
+    if (!sbi || zg_id >= CETRAFS_MAX_ZONE_GROUPS)
+        return false;
+    until = READ_ONCE(sbi->zg_scrub_hold[zg_id]);
+    return until && time_before(jiffies, until);
+}
+
+u32 cetrafs_sb_zg_scrub_held_count(struct super_block *sb)
+{
+    u32 z, n = 0;
+
+    for (z = 0; z < CETRAFS_MAX_ZONE_GROUPS; z++)
+        n += cetrafs_sb_zg_scrub_held(sb, z);
+    return n;
+}
+
 u64 cetrafs_trim_quarantined_count(struct super_block *sb)
 {
     struct cetrafs_sb_info *sbi = sb->s_fs_info;

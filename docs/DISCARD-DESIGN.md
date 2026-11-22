@@ -369,7 +369,14 @@ heartbeat I/O. On by default where the device supports discard;
   failure, a plain I/O error -- may still execute on the array, and an
   UNMAP landing after the blocks were handed out destroys the new data
   (bug class 30). Such a FITRIM run stays allocated (counted in
-  `trim_leaked_blocks`; the scrub reclaims it later), its bits are
+  `trim_leaked_blocks`), held from the scrub for `trim_quarantine_secs`
+  (default 600; `trim_quarantined` in `info`) and reclaimed by it
+  after that. The hold is in memory: a node that takes the run's Zone
+  Group from an owner -- a peer after an unmount, a crash or a fence,
+  or the same node re-attaching at mount -- keeps the scrub out of the
+  whole group for its own `trim_quarantine_secs`
+  (`trim_held_zone_groups`), since it cannot tell which leaks are such
+  runs. Its bits are
   synced to the device before fstrim returns (a fence before writeback
   would otherwise hand a peer a bitmap reading FREE), and the pass
   stops. A hand-back keeps its Block Group DRAINED -- out of this node's
@@ -447,8 +454,8 @@ of `discard` and `nodiscard` on a command line wins.
   in the allocator's no-space path): its claims are space a writer
   cannot have, and an ENOSPC must not wait on the array.
 * **Unknown and refused outcomes** are fstrim's: an unknown one keeps
-  the run allocated, its bits synced, for the scrub
-  (`trim_leaked_blocks`) and ends the pass; a refused one frees the run
+  the run allocated, its bits synced, for the scrub once its quarantine
+  is over (`trim_leaked_blocks`, see above) and ends the pass; a refused one frees the run
   and goes on. A run kept for an unknown outcome is freed later by the scrub, and
   that free is noted again: on a transport that keeps failing, the same
   run is retried at scrub cadence -- bounded, counted, never shared.
