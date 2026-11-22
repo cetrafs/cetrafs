@@ -7072,11 +7072,10 @@ static int cetrafs_lock_raw_is_inode(struct inode *inode, const cetrafs_inode_t 
 /*
  * flock(fd, LOCK_EX) on a default mount: take the automatic lock back.
  *
- * NEVER steals -- not even from a holder whose node has gone stale. That
- * reclaim fences the peer and replays its journal, which belongs in
- * cetrafs_lock_open() where it is already implemented and tested; a
- * caller that needs it can close and reopen the file. Here a foreign
- * lock simply means "you cannot have it back right now".
+ * Takes a holder's lock only from a DEAD holder, after fencing it and
+ * replaying its journal (cetrafs_lock_arm_stale_steal(), audit 2026-11-14
+ * M-25); a live holder's lock simply means "you cannot have it back right
+ * now". (This said it never steals, long after it did.)
  *
  * Returns -ETXTBSY when a peer holds it, which cetrafs_flock() maps to
  * -EWOULDBLOCK (or retries, for a blocking LOCK_EX).
@@ -7094,11 +7093,37 @@ MODULE_PARM_DESC(lock_steal_reread_inc, "TEST ONLY: a flock/resume steal binds t
  * to displace exactly that holder's claim and no other. 0: armed, 'raw'
  * re-read; -ETXTBSY: a live holder (or it just let go) -- keep waiting.
  */
+/* TEST ONLY: the steal keeps lock_mutex across the fence and the replay,
+ * as before audit 2026-11-22 N-21 -- the control of
+ * tests/kernel/lock_steal_drops_mutex.sh. */
+static bool cetrafs_lock_steal_holds_mutex;
+cetrafs_test_param(lock_steal_holds_mutex, cetrafs_lock_steal_holds_mutex, bool, 0644);
+MODULE_PARM_DESC(lock_steal_holds_mutex, "TEST ONLY: a stale-lock steal holds lock_mutex across fence and replay");
+
+/* TEST ONLY: stall this long between the fence and the replay of a
+ * stale-lock steal -- where lock_mutex is not held. */
+static unsigned int cetrafs_lock_steal_replay_stall_ms;
+cetrafs_test_param(lock_steal_replay_stall_ms, cetrafs_lock_steal_replay_stall_ms, uint, 0644);
+MODULE_PARM_DESC(lock_steal_replay_stall_ms, "TEST ONLY: stall a stale-lock steal between its fence and its replay");
+
+/*
+ * Called with ci->lock_mutex held. The fence and the replay run WITHOUT
+ * it (*held false meanwhile): they are node-wide and take as long as the
+ * dead node's journal does (the open path quotes ~210 s), and every local
+ * close, LOCK_UN and defrag end of this file waits for lock_mutex
+ * unkillably -- held across them, one stale holder hung them all (audit
+ * 2026-11-22 N-21, C-1). Taken back killably (-EINTR with *held false),
+ * and nothing judged before is trusted after: the record is re-read and
+ * the steal armed only if the SAME holder, the same incarnation, still
+ * holds it; the caller re-checks its own state, which may have moved
+ * while the mutex was down.
+ */
 static int cetrafs_lock_arm_stale_steal(struct inode *inode, u32 my_node_id, cetrafs_inode_t *raw,
-                                        struct cetrafs_lock_cas_ctx *ctx, const char *who)
+                                        struct cetrafs_lock_cas_ctx *ctx, const char *who, bool *held)
 {
+    struct cetrafs_inode_info *ci = CETRAFS_I(inode);
     struct super_block *sb = inode->i_sb;
-    bool stale = false;
+    bool stale = false, drop = !READ_ONCE(cetrafs_lock_steal_holds_mutex);
     u32 owner, judged_inc;
     int ret;
 
@@ -7117,11 +7142,24 @@ static int cetrafs_lock_arm_stale_steal(struct inode *inode, u32 my_node_id, cet
     if (!cetrafs_lock_mode_held(cetrafs_le32(raw->lock_mode)) || owner == my_node_id ||
         cetrafs_node_is_stale(sb, owner, &stale) != 0 || !stale)
         return -ETXTBSY;
+    if (drop) {
+        mutex_unlock(&ci->lock_mutex);
+        *held = false;
+    }
     ret = cetrafs_node_fence_peer(sb, owner, "a file lock (flock)");
     if (ret == -EBUSY)
-        return -ETXTBSY; /* its owner came back: a live holder */
+        ret = -ETXTBSY; /* its owner came back: a live holder */
+    if (!ret && READ_ONCE(cetrafs_lock_steal_replay_stall_ms))
+        msleep(READ_ONCE(cetrafs_lock_steal_replay_stall_ms)); /* test-only; see the parameter */
     if (!ret)
         ret = cetrafs_journal_replay_node_scoped(sb, owner, /*wait_for_claim=*/true, inode->i_ino);
+    if (drop) {
+        if (mutex_lock_killable(&ci->lock_mutex))
+            return -EINTR; /* *held stays false */
+        *held = true;
+    }
+    if (ret == -ETXTBSY)
+        return ret;
     if (ret) {
         pr_err("%s: ino=%llu could not fence and replay stale node %u (%d) -- not taking its lock\n", who,
                (unsigned long long) inode->i_ino, owner, ret);
@@ -7135,6 +7173,12 @@ static int cetrafs_lock_arm_stale_steal(struct inode *inode, u32 my_node_id, cet
         ret = cetrafs_lock_raw_is_inode(inode, raw);
     if (ret)
         return ret;
+    /* Still the holder judged stale? A peer may have taken it, or the
+     * holder let go, while the mutex was down: re-decide from this read,
+     * never from the one before the fence. */
+    if (!cetrafs_lock_mode_held(cetrafs_le32(raw->lock_mode)) || cetrafs_le32(raw->lock_owner_node) != owner ||
+        cetrafs_le32(raw->lock_owner_incarnation) != judged_inc)
+        return -ETXTBSY;
     ctx->generation = cetrafs_le64(raw->generation);
     ctx->allow_steal = true;
     ctx->steal_from = owner;
@@ -7210,11 +7254,21 @@ static int cetrafs_lock_resume(struct inode *inode)
          * the nofilelock flock reclaimed a dead holder and this did not
          * (audit 2026-11-14 M-25). */
         if (cetrafs_le32(raw.lock_mode) != CETRAFS_LOCK_NONE) {
+            bool held = true;
+
             ret = READ_ONCE(cetrafs_lock_resume_no_reclaim)
                       ? -ETXTBSY
-                      : cetrafs_lock_arm_stale_steal(inode, my_node_id, &raw, &ctx, "resume");
+                      : cetrafs_lock_arm_stale_steal(inode, my_node_id, &raw, &ctx, "resume", &held);
+            if (!held)
+                return ret;
             if (ret)
                 goto out;
+            /* The mutex was down across the fence and the replay: a
+             * local resume may have finished meanwhile. */
+            if (!ci->lock_suspended) {
+                ret = atomic_read(&ci->lock_writer_count) > 0 ? 0 : -EOPNOTSUPP;
+                goto out;
+            }
         }
         ret = cetrafs_lock_cas(inode, &ctx, &raw);
         if (ret < 0)
@@ -7479,9 +7533,19 @@ static int cetrafs_lock_explicit_acquire(struct inode *inode, struct file *file)
              * on this very file), then displace exactly that holder's
              * claim and no other.
              */
-            ret = cetrafs_lock_arm_stale_steal(inode, my_node_id, &raw, &ctx, "flock");
+            bool held = true;
+
+            ret = cetrafs_lock_arm_stale_steal(inode, my_node_id, &raw, &ctx, "flock", &held);
+            if (!held)
+                return ret;
             if (ret)
                 goto out;
+            /* The mutex was down across the fence and the replay: another
+             * local fd may have taken the lock meanwhile. */
+            if (ci->explicit_lock_file) {
+                ret = ci->explicit_lock_file == file ? 0 : -EBUSY;
+                goto out;
+            }
             ret = cetrafs_lock_cas(inode, &ctx, &raw);
         }
         if (ret)
