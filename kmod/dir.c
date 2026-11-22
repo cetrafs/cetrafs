@@ -1523,6 +1523,11 @@ MODULE_PARM_DESC(remove_expect_off, "TEST ONLY: a dirent remove does not check i
  * and its other names then named a file evict freed (audit 2026-11-22,
  * N-50). A byte that disagrees is damage, said and counted.
  */
+/* TEST ONLY: a directory's nlink is decremented with no floor at 2, as
+ * before (tests/kernel/dirent_type_not_trusted.sh, 3). */
+static bool cetrafs_dir_nlink_no_floor;
+cetrafs_test_param(dir_nlink_no_floor, cetrafs_dir_nlink_no_floor, bool, 0644);
+MODULE_PARM_DESC(dir_nlink_no_floor, "TEST ONLY: removing a subdirectory may take its parent's nlink below 2");
 static bool cetrafs_nlink_trust_dirent_type;
 cetrafs_test_param(nlink_trust_dirent_type, cetrafs_nlink_trust_dirent_type, bool, 0644);
 MODULE_PARM_DESC(nlink_trust_dirent_type, "TEST ONLY: nlink decisions follow the dirent's file_type, as before N-50");
@@ -1545,7 +1550,7 @@ static bool cetrafs_dir_entry_is_dir(struct super_block *sb, u64 dir_ino, u64 in
 int cetrafs_dir_remove_entry(struct inode *dir, const struct qstr *name, u64 expect_ino, umode_t expect_mode,
                              u64 *out_ino, u8 *out_file_type)
 {
-    bool was_dir;
+    bool was_dir, floored = false;
     u32 read_nlink;
     unsigned int dirents_per_block = CETRAFS_DIRENTS_PER_BLOCK;
     struct cetrafs_dir_extents dx;
@@ -1664,8 +1669,23 @@ int cetrafs_dir_remove_entry(struct inode *dir, const struct qstr *name, u64 exp
     raw.mtime = cetrafs_cpu_to_le64(now);
     raw.ctime = cetrafs_cpu_to_le64(now);
     read_nlink = cetrafs_le32(raw.nlink);
-    if (was_dir)
-        raw.nlink = cetrafs_cpu_to_le32(cetrafs_le32(raw.nlink) - 1);
+    /* A directory's count is 2 plus its subdirectories, so it never
+     * drops below 2 while it is named. Below that the count is wrong
+     * already -- a recount that went by damaged type bytes, which can
+     * call a subdirectory a file -- and with no floor, removing two such
+     * subdirectories took a named directory to 0, for evict to free
+     * (audit 2026-11-22, the N-50 residual). Held at 2 and said; fsck
+     * recounts it. */
+    if (was_dir && read_nlink <= 2 && !READ_ONCE(cetrafs_dir_nlink_no_floor)) {
+        pr_warn_ratelimited("%s: dir ino=%llu: nlink %u with a subdirectory being removed -- holding it at 2 (run "
+                            "fsck)\n",
+                            dir->i_sb->s_id, (unsigned long long) dir->i_ino, read_nlink);
+        cetrafs_sb_corrupt(dir->i_sb, 0);
+        raw.nlink = cetrafs_cpu_to_le32(2);
+        floored = true;
+    } else if (was_dir) {
+        raw.nlink = cetrafs_cpu_to_le32(read_nlink - 1);
+    }
 
     /* Staged for the namespace lock's release -- see
      * cetrafs_dir_add_entry(). */
@@ -1692,8 +1712,10 @@ int cetrafs_dir_remove_entry(struct inode *dir, const struct qstr *name, u64 exp
     i_size_write(dir, cetrafs_le64(raw.size));
     cetrafs_set_mtime_disk(dir, now);
     cetrafs_set_ctime_disk(dir, now);
-    if (was_dir)
-        set_nlink(dir, dir->i_nlink - 1);
+    if (floored)
+        set_nlink(dir, 2);
+    else if (was_dir)
+        set_nlink(dir, READ_ONCE(cetrafs_dir_nlink_no_floor) ? dir->i_nlink - 1 : max(dir->i_nlink, 3U) - 1);
 
     return 0;
 }

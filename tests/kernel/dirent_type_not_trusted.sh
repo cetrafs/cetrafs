@@ -17,19 +17,28 @@
 #   2. rename-over of a hardlinked regular file whose entry says DIR: the
 #      other name keeps the file, nlink 1, its data intact after a
 #      remount.
+#   3. a directory whose nlink is below what its subdirectories need --
+#      what a recount leaves when damaged type bytes call two of them
+#      files -- has both removed: its nlink stays at 2, it is still there
+#      after a remount, and the floor is reported (the N-50 residual: no
+#      floor took it to 0 while named).
 #
 # DISCRIMINATION: the control, in-suite -- nlink_trust_dirent_type=1, the
 # old decisions: the parent drops to 1, and the hardlinked file is lost.
+# For 3, dir_nlink_no_floor=1: the directory reaches nlink 0.
 set -euo pipefail
 . "$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)/lib/harness.sh"
 require_root
 require_module
 P=/sys/module/cetrafs/parameters
-[ -w "$P/nlink_trust_dirent_type" ] || { skip "nlink_trust_dirent_type is missing"; ct_exit; }
+for k in nlink_trust_dirent_type dir_nlink_no_floor; do
+    [ -w "$P/$k" ] || { skip "$k is missing"; ct_exit; }
+done
 IPOKE="$(ct_helper inode_block_poke)"
 DPOKE="$(ct_helper dirent_field_poke)"
 DIRENT=266 # sizeof(cetrafs_dirent_t)
 ct_param_set nlink_trust_dirent_type 0
+ct_param_set dir_nlink_no_floor 0
 ct_param_set auto_defrag 0
 MNT="$(ct_mnt dtnt)"
 ct_track mnt "$MNT"
@@ -64,11 +73,13 @@ round() {
     as_dir "$img" "$p" victim && as_dir "$img" "$q" tgtnm ||
         { fail "$1 setup: the entries could not be found to poke"; ct_exit; }
     echo "$2" >$P/nlink_trust_dirent_type
+    echo "$2" >$P/dir_nlink_no_floor # the control is the old code whole: no floor either
     mark="$(dmesg_mark)"
     ct_mount "$dev" "$MNT"
     rm "$MNT/p/victim"
     mv "$MNT/q/srcnm" "$MNT/q/tgtnm"
     echo 0 >$P/nlink_trust_dirent_type
+    echo 0 >$P/dir_nlink_no_floor
     RES="parent_nlink=$(stat -c %h "$MNT/p")"
     RES="$RES logged=$(dmesg_since "$mark" | grep -c 'going by the record' || true)"
     ct_umount "$MNT"
@@ -79,6 +90,33 @@ round() {
     log "$1: $RES"
 }
 get() { grep -o "$1=[^ ]*" <<<"$2" | cut -d= -f2; }
+
+# floor_round <tag> <no_floor> -> RES
+floor_round() {
+    local img dev t mark
+    img="$(ct_image 560 "dtntf$1")"
+    dev="$(ct_loop "$img")"
+    ct_mkfs_small "$dev" >/dev/null
+    ct_mount "$dev" "$MNT"
+    require_cetrafs_mount "$MNT"
+    mkdir -p "$MNT/t/s1" "$MNT/t/s2"
+    : >"$MNT/t/keep"
+    t="$(stat -c %i "$MNT/t")"
+    ct_umount "$MNT"
+    "$IPOKE" "$img" nlink "$t" 2 2>/dev/null # two subdirectories, counted as none
+    echo "$2" >$P/dir_nlink_no_floor
+    mark="$(dmesg_mark)"
+    ct_mount "$dev" "$MNT"
+    rmdir "$MNT/t/s1" "$MNT/t/s2"
+    echo 0 >$P/dir_nlink_no_floor
+    RES="nlink=$(stat -c %h "$MNT/t" 2>/dev/null || echo gone)"
+    RES="$RES floored=$(dmesg_since "$mark" | grep -c 'holding it at 2' || true)"
+    ct_umount "$MNT"
+    ct_mount "$dev" "$MNT"
+    [ -f "$MNT/t/keep" ] && RES="$RES after=there" || RES="$RES after=gone"
+    ct_umount "$MNT"
+    log "3 $1: $RES"
+}
 
 round ctl 1
 [ "$(get parent_nlink "$RES")" = 1 ] && [ "$(get keep_nlink "$RES")" != 1 ] &&
@@ -91,4 +129,12 @@ round fixed 0
 [ "$(get keep_nlink "$RES")" = 1 ] && [ "$(get keep_data "$RES")" = ok ] &&
     pass "2: the rename-over left the other name its file, nlink 1, data intact" ||
     fail "2: $RES"
+floor_round ctl 1
+case "$(get nlink "$RES")" in 0 | gone) true ;; *) false ;; esac &&
+    pass "3 control: with no floor the named directory reached nlink 0 -- gone from under its name ($RES)" ||
+    fail "3 control: the hazard did not reproduce -- the check cannot tell: $RES"
+floor_round fixed 0
+[ "$(get nlink "$RES")" = 2 ] && [ "$(get floored "$RES")" -ge 1 ] && [ "$(get after "$RES")" = there ] &&
+    pass "3: removing both subdirectories held the directory at nlink 2; it is still there, and it was said" ||
+    fail "3: $RES"
 ct_exit
