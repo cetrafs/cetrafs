@@ -2524,7 +2524,7 @@ printf 'static int __cetrafs_thing_busy(struct super_block *sb,\n               
 # callers; a new caller fails until it says which kind it is.
 log "checking every inode-number free goes through an act-time re-check (class 14)"
 C14_REG='cetrafs_inode_bitmap_cas_free cetrafs_free_inode cetrafs_free_inode_number_claimed
-cetrafs_free_inode cetrafs_create_locked cetrafs_mkdir_locked cetrafs_new_record_unwind cetrafs_symlink_locked
+cetrafs_free_inode cetrafs_create_locked cetrafs_mkdir_locked cetrafs_mkdir_unwind_named cetrafs_new_record_unwind cetrafs_symlink_locked
 cetrafs_free_inode_number_claimed cetrafs_free_inode_finish cetrafs_lock_sweep_own_claims
 cetrafs_free_inode_finish cetrafs_alloc_retry_reclaim cetrafs_evict_inode cetrafs_free_inode_if_dead cetrafs_free_inode_steal'
 # cetrafs_free_inode: the create paths' rollback of a number they
@@ -2582,6 +2582,7 @@ cetrafs_alloc_data_run_resv own:a-run-it-just-took-back-on-failure
 cetrafs_trim_claim_next own:undoes-its-own-claim
 cetrafs_trim_release own:gives-back-its-own-claim
 cetrafs_mkdir_locked own:a-dirent-block-never-published
+cetrafs_mkdir_unwind_named own:the-same-block-after-its-record-is-dead
 cetrafs_do_allocate own:blocks-never-published-held-in-the-reservation-registry
 cetrafs_falloc_run_give_back_span own:the-unused-rest-of-a-fallocate-run-never-published
 __cetrafs_get_block own:a-block-never-published

@@ -2416,21 +2416,78 @@ static bool cetrafs_born_unwind_off; /* TEST ONLY: see the parameter */
 cetrafs_test_param(born_unwind_off, cetrafs_born_unwind_off, bool, 0644);
 MODULE_PARM_DESC(born_unwind_off, "TEST ONLY: a failed birth frees its number still locked, as before F-52");
 
-static void cetrafs_new_record_unwind(struct super_block *sb, u64 ino, const cetrafs_inode_t *raw)
+/* TEST ONLY: the unwind's dead-record write is refused, once. */
+static bool cetrafs_born_unwind_write_fail;
+cetrafs_test_param(born_unwind_write_fail, cetrafs_born_unwind_write_fail, bool, 0644);
+MODULE_PARM_DESC(born_unwind_write_fail, "TEST ONLY: the next failed birth's dead-record write is refused");
+
+/* Returns cetrafs_free_inode()'s answer: negative when the record could
+ * not be shown dead, and the number stays allocated. */
+static int cetrafs_new_record_unwind(struct super_block *sb, u64 ino, const cetrafs_inode_t *raw)
 {
     cetrafs_inode_t dead = *raw;
 
     if (cetrafs_le32(raw->ns_lock_owner) != CETRAFS_NODE_ID_NONE && !READ_ONCE(cetrafs_born_unwind_off)) {
+        int wret;
+
         dead.nlink = cetrafs_cpu_to_le32(0);
         dead.ns_lock_owner = cetrafs_cpu_to_le32(CETRAFS_NODE_ID_NONE);
         dead.ns_lock_incarnation = cetrafs_cpu_to_le32(0);
         cetrafs_invalidate_raw_inode(sb, ino);
-        if (cetrafs_write_raw_inode_new(sb, ino, &dead))
+        wret = (READ_ONCE(cetrafs_born_unwind_write_fail) && xchg(&cetrafs_born_unwind_write_fail, false))
+                   ? -EIO /* test-only, one-shot */
+                   : cetrafs_write_raw_inode_new(sb, ino, &dead);
+        if (wret)
             pr_warn_ratelimited("%s: ino=%llu: a failed create could not unlock its record -- the number stays "
                                 "out of use until this node's next mount\n",
                                 sb->s_id, (unsigned long long) ino);
     }
-    cetrafs_free_inode(sb, ino);
+    return cetrafs_free_inode(sb, ino);
+}
+
+/*
+ * A failed mkdir's '.'/'..' block, once the record naming it is written:
+ * freed only after the record is shown dead (CLAUDE.md rule 21). It was
+ * freed first, and a record write the device then refused -- or a crash
+ * between the two -- left a live-looking directory naming a free block,
+ * for the next allocation to hand out and a recount to free again (audit
+ * 2026-11-22, N-25). Not shown dead, the block stays allocated with the
+ * number: a leak, which fsck reports.
+ */
+static bool cetrafs_mkdir_unwind_free_first;
+cetrafs_test_param(mkdir_unwind_free_first, cetrafs_mkdir_unwind_free_first, bool, 0644);
+MODULE_PARM_DESC(mkdir_unwind_free_first, "TEST ONLY: a failed mkdir frees its block before its record is dead");
+
+static void cetrafs_mkdir_unwind_named(struct super_block *sb, u64 ino, const cetrafs_inode_t *raw, u64 lba)
+{
+    bool first = READ_ONCE(cetrafs_mkdir_unwind_free_first);
+    /* Between the dead record and the free the block is allocated and
+     * named by nothing live: a scrub there would take it as a leak, and
+     * our free then lands on whatever it was handed to next. Announced
+     * like every free that follows a publish (cetrafs_frees_begin()). */
+    bool foreign = !cetrafs_lba_run_is_ours(sb, lba, 1);
+    int ret;
+
+    if (first) {
+        cetrafs_free_data_block(sb, lba);
+        (void) (raw ? cetrafs_new_record_unwind(sb, ino, raw) : cetrafs_free_inode(sb, ino));
+        return;
+    }
+    if (cetrafs_frees_begin(sb, &foreign)) {
+        pr_warn_ratelimited("%s: ino=%llu: a failed mkdir could not announce its free -- its block %llu stays "
+                            "allocated for the scrub\n",
+                            sb->s_id, (unsigned long long) ino, (unsigned long long) lba);
+        (void) (raw ? cetrafs_new_record_unwind(sb, ino, raw) : cetrafs_free_inode(sb, ino));
+        return;
+    }
+    ret = raw ? cetrafs_new_record_unwind(sb, ino, raw) : cetrafs_free_inode(sb, ino);
+    if (ret < 0)
+        pr_warn_ratelimited("%s: ino=%llu: a failed mkdir's record could not be shown dead -- its block %llu "
+                            "stays allocated with it (fsck reports both)\n",
+                            sb->s_id, (unsigned long long) ino, (unsigned long long) lba);
+    else
+        cetrafs_free_data_block(sb, lba);
+    cetrafs_frees_end(sb, foreign);
 }
 
 /* The in-core half of the lock a record was born holding, once its
@@ -3347,8 +3404,8 @@ static struct dentry *cetrafs_mkdir_locked(struct mnt_idmap *idmap,
     cetrafs_invalidate_raw_inode(sb, ino);
     ret = cetrafs_write_raw_inode_new(sb, ino, &raw);
     if (ret) {
-        cetrafs_free_data_block(sb, lba);
-        cetrafs_free_inode(sb, ino);
+        /* The write may have landed: its record may name the block. */
+        cetrafs_mkdir_unwind_named(sb, ino, NULL, lba);
         return ERR_PTR(ret);
     }
     /* No mid-birth theft check here: cetrafs_alloc_inode()'s birth claim
@@ -3364,8 +3421,7 @@ static struct dentry *cetrafs_mkdir_locked(struct mnt_idmap *idmap,
      * be a double free). */
     inode = cetrafs_iget(sb, ino);
     if (IS_ERR(inode)) {
-        cetrafs_free_data_block(sb, lba);
-        cetrafs_new_record_unwind(sb, ino, &raw);
+        cetrafs_mkdir_unwind_named(sb, ino, &raw, lba);
         return ERR_CAST(inode);
     }
     cetrafs_new_inode_take_born_lock(inode, &raw);
