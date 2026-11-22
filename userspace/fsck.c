@@ -4231,9 +4231,44 @@ int main(int argc, char **argv)
      * for one that did it drops the grown space from under every file
      * written into it since (audit 2026-11-22 N-61). Nothing is restored.
      */
-    if (sb_from_copy && fsck_pending_link) {
-        fprintf(stderr, "ERR: block 0 is gone and its copy may predate a grow: a table links a segment the copy "
-                        "does not count\n");
+    /*
+     * A first grow links its segment from the SUPERBLOCK (bg_table_next),
+     * not from a segment header, so through a copy older than that grow
+     * nothing links anything and the walk above sees no pending link.
+     * What such a grow also leaves is its first new Block Group, at the
+     * address growfs derives from the layout the copy describes
+     * (growfs.c: old data end, past the old tail reserve, on the data
+     * alignment), its header naming the next group number. Either a grow
+     * wrote it or a larger earlier format did; both are a reason not to
+     * restore, and leaving block 0 alone is the safe answer to each.
+     */
+    int grown_past_copy = 0;
+
+    if (sb_from_copy && !fsck_pending_link) {
+        const uint64_t bgs = cetrafs_le32(sb.block_group_count), bg_size = cetrafs_le64(sb.bg_size_blocks);
+        const uint64_t align = cetrafs_le32(sb.data_align_blocks);
+        const uint64_t rs = cetrafs_le64(sb.tail_reserve_start), rb = cetrafs_le64(sb.tail_reserve_blocks);
+        uint64_t at = cetrafs_le64(sb.bg_data_end) ? cetrafs_le64(sb.bg_data_end)
+                                                   : cetrafs_le64(sb.bg_regions_start) + bgs * bg_size;
+
+        if (rb && rs + rb > at)
+            at = rs + rb;
+        if (align)
+            at = (at + align - 1) / align * align;
+        if (at < dev_bytes / CETRAFS_BLOCK_SIZE) {
+            cetrafs_bg_header_t bh;
+
+            pread_all(fd, &bh, sizeof(bh), (off_t) at * CETRAFS_BLOCK_SIZE);
+            if (cetrafs_le32(bh.bg_id) == (uint32_t) bgs && cetrafs_le64(bh.length_blocks) &&
+                (uint32_t) cetrafs_le64(bh.checksum) ==
+                    crc32c_struct(&bh, sizeof(bh), offsetof(cetrafs_bg_header_t, checksum), sizeof(bh.checksum)))
+                grown_past_copy = 1;
+        }
+    }
+    if (sb_from_copy && (fsck_pending_link || grown_past_copy)) {
+        fprintf(stderr, "ERR: block 0 is gone and its copy may predate a grow: %s\n",
+                fsck_pending_link ? "a table links a segment the copy does not count"
+                                  : "a Block Group the copy does not count sits where a grow puts the next one");
         early_problems++;
         repair_block("block 0's copy may be older than the layout the volume was last grown to, and restoring "
                      "it could drop the grown space -- block 0 is left as it is");

@@ -8,9 +8,11 @@
 # volume through the copy and, under -r, wrote that older superblock to
 # block 0 -- dropping the grown space from under every file written
 # into it since (audit 2026-11-22 N-61). Through the old copy the grow
-# shows as a table segment linked past the end the copy publishes,
-# which is also what a grow that never published leaves; with block 0
-# gone fsck cannot tell the two apart, so it now restores nothing.
+# shows as a table segment linked past the end the copy publishes or,
+# for a first grow (linked from the superblock itself), as the next
+# Block Group's header where growfs puts it -- both also what a grow
+# that never published leaves; with block 0 gone fsck cannot tell the
+# two apart, so it now restores nothing. This case is a first grow.
 #
 # Offline grows of a 700 MiB volume to 1400 MiB, then block 0 zeroed:
 #   control: the copy carried along (a normal grow). fsck -r restores
