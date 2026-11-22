@@ -880,6 +880,26 @@ static void repair_set_nlink(int fd, uint64_t ino, uint32_t nlink)
     pwrite_all(fd, blk, sizeof(blk), off);
 }
 
+/* A size past the format's ceiling, set to the ceiling: no extent can
+ * address a byte past it, so nothing readable is lost, and the kernel
+ * then opens the file (audit 2026-11-22 N-47). Same read-modify-write
+ * and restamp as repair_set_nlink() above. */
+static void repair_clamp_size(int fd, uint64_t ino)
+{
+    uint8_t blk[CETRAFS_BLOCK_SIZE] = {0};
+    off_t off = fsck_ino_off(ino);
+    cetrafs_inode_t in;
+
+    pread_all(fd, blk, sizeof(blk), off);
+    memcpy(&in, blk, sizeof(in));
+    if (!fsck_record_restampable(&in, ino))
+        return;
+    in.size = cetrafs_cpu_to_le64(CETRAFS_MAX_FILE_BYTES);
+    cetrafs_inode_stamp_crcs_us(&in);
+    memcpy(blk, &in, sizeof(in));
+    pwrite_all(fd, blk, sizeof(blk), off);
+}
+
 /* Clear CETRAFS_INODE_COUNT_UNVERIFIED -- same read-modify-write and
  * restamp as repair_set_nlink() above. */
 static void repair_clear_unverified(int fd, uint64_t ino)
@@ -5445,6 +5465,26 @@ int main(int argc, char **argv)
                     fprintf(stderr, "ERR: inode %" PRIu64 " has mode 0%o, a type the kernel refuses to open\n", ino,
                             cetrafs_le32(in.mode));
                     problems++;
+                }
+            }
+            /* A size past the format's ceiling: every node refuses the
+             * record (cetrafs_size_sane(), -EUCLEAN), so the file is
+             * unreachable cluster-wide, and nothing said so. */
+            /* TEST-ONLY knob: the old pass, which never looked
+             * (tests/image/fsck_size_ceiling.sh's control). */
+            if (cetrafs_le64(in.size) > CETRAFS_MAX_FILE_BYTES &&
+                !cetrafs_test_env("CETRAFS_FSCK_TEST_SIZE_UNCHECKED")) {
+                fprintf(stderr,
+                        "ERR: inode %" PRIu64 " has size %" PRIu64 ", past the format's %llu-byte ceiling -- the "
+                        "kernel refuses to open it%s\n",
+                        ino, (uint64_t) cetrafs_le64(in.size), (unsigned long long) CETRAFS_MAX_FILE_BYTES,
+                        repair_mode ? "" : "; fsck.cetra -r sets it to the ceiling");
+                problems++;
+                /* class 45: lossless -- no extent addresses a byte past the ceiling */
+                if (repair_mode && !repair_blocked) {
+                    repair_clamp_size(fd, ino);
+                    in.size = cetrafs_cpu_to_le64(CETRAFS_MAX_FILE_BYTES);
+                    printf("  set inode %" PRIu64 "'s size to the format's ceiling\n", ino);
                 }
             }
             if (cetrafs_le16(in.eh.eh_magic) != CETRAFS_EXT_MAGIC && cetrafs_le16(in.eh.eh_magic) == 0 && cetrafs_le32(in.nlink) != 0 &&

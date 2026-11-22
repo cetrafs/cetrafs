@@ -2396,6 +2396,11 @@ static inline u64 cetrafs_bg_region_lba(const cetrafs_block_group_t *bg)
  * block number silently and aliases a low offset in the same file.
  * fs.c clamps s_maxbytes by it and file.c refuses past it. */
 #define CETRAFS_MAX_FILE_BLOCKS (1ULL << 48) /* v0x000A: 48-bit logical blocks */
+/* A record's size, bounded by what the format can address: the kernel
+ * refuses a record past it (-EUCLEAN, cetrafs_size_sane()) and fsck
+ * reports one -- one constant for both, or they drift (audit 2026-11-22
+ * N-47). */
+#define CETRAFS_MAX_FILE_BYTES (CETRAFS_MAX_FILE_BLOCKS * (u64) CETRAFS_BLOCK_SIZE)
 
 #define CETRAFS_EXT_LEN_MASK   0x7FFFFFFFu
 #define CETRAFS_EXT_UNINIT     0x80000000u
