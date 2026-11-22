@@ -529,11 +529,13 @@ static uint64_t fsck_seg_span(const struct fsck_seg_kind *k, uint64_t count)
  * points past the volume or into metadata, read as clean -- three
  * injections this check missed until they were actually tried. The
  * kernel's checks, in the kernel's order (cetrafs_seg_read()): the
- * count is bounded before it drives anything. 0, or 1 having said why.
+ * count is bounded before it drives anything. lo/hi hold 'cap' entries,
+ * *n of them used: a chain that would need more is refused, never
+ * written past (audit 2026-11-22 N-1). 0, or 1 having said why.
  */
 static int fsck_chain_walk(int fd, const cetrafs_superblock_t *sb, const struct fsck_seg_kind *k, uint64_t seg_lba,
                            uint64_t filled, uint64_t total, uint64_t dev_bytes, uint64_t *lo, uint64_t *hi,
-                           uint32_t *n)
+                           uint32_t *n, uint32_t cap)
 {
     const uint64_t vol = cetrafs_le64(sb->total_blocks), dev_blocks = dev_bytes / CETRAFS_BLOCK_SIZE;
     uint64_t guard = 0;
@@ -614,6 +616,10 @@ static int fsck_chain_walk(int fd, const cetrafs_superblock_t *sb, const struct 
                     k->what, seg_lba);
             return 1;
         }
+        if (*n >= cap) {
+            fprintf(stderr, "ERR: %s table chain has more segments than fsck can hold (%u)\n", k->what, cap);
+            return 1;
+        }
         lo[*n] = seg_lba;
         hi[(*n)++] = seg_lba + fsck_seg_span(k, cetrafs_le32(seg.count));
         filled += cetrafs_le32(seg.count);
@@ -631,13 +637,13 @@ static int fsck_chain_walk(int fd, const cetrafs_superblock_t *sb, const struct 
  * chain; the appended ones' ranges added to lo/hi. 0, or 1 having said
  * why. */
 static int fsck_isegs_build(int fd, const cetrafs_superblock_t *sb, uint64_t dev_bytes, uint64_t *lo, uint64_t *hi,
-                            uint32_t *n)
+                            uint32_t *n, uint32_t cap)
 {
     const uint32_t s0 = *n;
     const uint64_t first = cetrafs_sb_inode_first_count(sb);
 
     if (fsck_chain_walk(fd, sb, &fsck_ino_chain, cetrafs_le64(sb->inode_seg_next), first,
-                        cetrafs_le32(sb->inodes_count), dev_bytes, lo, hi, n))
+                        cetrafs_le32(sb->inodes_count), dev_bytes, lo, hi, n, cap))
         return 1;
     free(fsck_iseg);
     fsck_niseg = 1 + (*n - s0);
@@ -4095,10 +4101,15 @@ int main(int argc, char **argv)
     fsck_g_bg_desc_lba = bg_desc_lba;
     /* Each appended segment's [header, last descriptor], checked against
      * the Block Groups once their descriptors are read (as fs.c does). */
-    /* Each grow appends at most one segment to each chain, and adds at
-     * least one Block Group. */
-    uint64_t *seg_lo = (uint64_t *) xcalloc(2 * (cetrafs_le32(sb.block_group_count) + 1), sizeof(uint64_t));
-    uint64_t *seg_hi = (uint64_t *) xcalloc(2 * (cetrafs_le32(sb.block_group_count) + 1), sizeof(uint64_t));
+    /* The Block Group chain has at most one appended segment per group
+     * (each adds one), the inode chain at most CETRAFS_ISEG_MAX - 1
+     * (the implicit first segment counts towards the cap). The inode
+     * chain is NOT bounded by the group count: an inode-only grow
+     * appends a segment and no group, and an image can link a chain of
+     * one-inode segments behind a one-group volume (N-1). */
+    const uint32_t seg_cap = cetrafs_le32(sb.block_group_count) + CETRAFS_ISEG_MAX;
+    uint64_t *seg_lo = (uint64_t *) xcalloc(seg_cap, sizeof(uint64_t));
+    uint64_t *seg_hi = (uint64_t *) xcalloc(seg_cap, sizeof(uint64_t));
     uint32_t nsegs = 0;
     {
         uint32_t nbg = cetrafs_le32(sb.block_group_count), s0;
@@ -4110,14 +4121,14 @@ int main(int argc, char **argv)
             bg_desc_lba[b] = cetrafs_le64(sb.bg_table_start) + b;
         s0 = nsegs;
         if (fsck_chain_walk(fd, &sb, &fsck_bg_chain, cetrafs_le64(sb.bg_table_next), first, nbg, dev_bytes, seg_lo,
-                            seg_hi, &nsegs))
+                            seg_hi, &nsegs, seg_cap))
             return 1;
         for (uint32_t s = s0; s < nsegs; s++)
             for (uint64_t i = 0; i < seg_hi[s] - seg_lo[s] - 1; i++)
                 bg_desc_lba[first++] = seg_lo[s] + 1 + i;
         /* The inode table's segments join the same list: the Block Group
          * checks below keep both off every group. */
-        if (fsck_isegs_build(fd, &sb, dev_bytes, seg_lo, seg_hi, &nsegs))
+        if (fsck_isegs_build(fd, &sb, dev_bytes, seg_lo, seg_hi, &nsegs, seg_cap))
             return 1;
     }
 
