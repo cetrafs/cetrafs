@@ -1551,6 +1551,9 @@ int cetrafs_zg_queue_foreign_frees(struct super_block *sb,
 /* may_wait: back off on a busy region (heartbeat, mount); false on the
  * allocation path, where a write is waiting. */
 int cetrafs_zg_drain_pending_frees(struct super_block *sb, bool may_wait);
+int cetrafs_zg_drain_for_space(struct super_block *sb);
+u64 cetrafs_alloc_drain_wait_count(void);
+int cetrafs_pf_drain_holding_now(void);
 /* Read-only walk of a ZG's pending-free queue: the scrub must not treat
  * a block with a free already queued against it as a leak. */
 int cetrafs_zg_pending_free_for_each(struct super_block *sb, u32 zg_id, void (*cb)(void *, u64, u32), void *ctx);
@@ -1947,13 +1950,13 @@ int cetrafs_journal_write_block(struct super_block *sb, struct cetrafs_journal_o
                                 u32 prev_crc);
 unsigned int cetrafs_journal_batch_capacity(struct super_block *sb);
 int cetrafs_journal_drain_retiring(struct super_block *sb);
+void cetrafs_journal_drain_aged(struct super_block *sb, unsigned long age);
+u64 cetrafs_journal_aged_drain_count(void);
 int cetrafs_journal_settle_range(struct super_block *sb, u64 first, u64 count);
 u64 cetrafs_release_journal_drain_count(void);
 u64 cetrafs_convert_source_flush_count(void);
 u64 cetrafs_deferred_batch_count(void);
 u64 cetrafs_deferred_batch_flush_count(void);
-void cetrafs_journal_drain_aged(struct super_block *sb, unsigned long age);
-u64 cetrafs_journal_aged_drain_count(void);
 int cetrafs_journal_write_deferred(struct super_block *sb, struct buffer_head **bhs,
                                    const struct cetrafs_journal_owner *owners, const u32 *disk_crc, unsigned int n,
                                    bool *written, u32 *wcrc);

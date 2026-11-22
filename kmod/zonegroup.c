@@ -3615,7 +3615,65 @@ u64 cetrafs_pf_whole_sweep_count(void)
     return (u64) atomic64_read(&cetrafs_pf_whole_sweeps);
 }
 
+static int __cetrafs_zg_drain_pending_frees(struct super_block *sb, bool may_wait, bool wait_lock);
+
 int cetrafs_zg_drain_pending_frees(struct super_block *sb, bool may_wait)
+{
+    return __cetrafs_zg_drain_pending_frees(sb, may_wait, false);
+}
+
+/* TEST ONLY: an allocator out of space does not wait for a drain that is
+ * running, as before audit 2026-11-22 N-31 -- the control of
+ * tests/kernel/alloc_waits_running_drain.sh. */
+static bool cetrafs_alloc_drain_nowait;
+cetrafs_test_param(alloc_drain_nowait, cetrafs_alloc_drain_nowait, bool, 0644);
+MODULE_PARM_DESC(alloc_drain_nowait, "TEST ONLY: an allocator out of space skips the drain when one is running");
+
+/* TEST ONLY: hold a heartbeat drain this long once it has the mutex,
+ * before any queue -- so an allocator meets it running. */
+static unsigned int cetrafs_pf_drain_hold_ms;
+cetrafs_test_param(pf_drain_hold_ms, cetrafs_pf_drain_hold_ms, uint, 0644);
+MODULE_PARM_DESC(pf_drain_hold_ms, "TEST ONLY: a heartbeat drain holds its mutex this long before starting");
+
+static atomic64_t cetrafs_alloc_drain_waits = ATOMIC64_INIT(0);
+
+/* A drain inside pf_drain_hold_ms right now (procfs; tests only use it). */
+static atomic_t cetrafs_pf_drain_holding = ATOMIC_INIT(0);
+
+int cetrafs_pf_drain_holding_now(void)
+{
+    return atomic_read(&cetrafs_pf_drain_holding);
+}
+
+u64 cetrafs_alloc_drain_wait_count(void)
+{
+    return (u64) atomic64_read(&cetrafs_alloc_drain_waits);
+}
+
+/*
+ * The allocator's drain once it is out of space: unlike the per-block
+ * one, it WAITS for a drain already running (killable) and then drains
+ * itself -- the running one may have started before the Zone Group just
+ * claimed was ours, and "someone else is draining" is not "the frees
+ * queued for us have been applied". The trylock returned 0 there and
+ * the write failed ENOSPC with the space sitting in the queue (audit
+ * 2026-11-22 N-31). Returns whether anything was applied, or -EINTR.
+ */
+int cetrafs_zg_drain_for_space(struct super_block *sb)
+{
+    u64 before = (u64) atomic64_read(&cetrafs_pf_drain_blocks);
+    int ret;
+
+    if (READ_ONCE(cetrafs_alloc_drain_nowait))
+        ret = __cetrafs_zg_drain_pending_frees(sb, false, false);
+    else
+        ret = __cetrafs_zg_drain_pending_frees(sb, false, true);
+    if (ret == -EINTR)
+        return ret;
+    return (u64) atomic64_read(&cetrafs_pf_drain_blocks) != before;
+}
+
+static int __cetrafs_zg_drain_pending_frees(struct super_block *sb, bool may_wait, bool wait_lock)
 {
     atomic64_inc(&cetrafs_pf_drains);
     const cetrafs_superblock_t *raw_sb = cetrafs_sb_raw(sb);
@@ -3631,8 +3689,18 @@ int cetrafs_zg_drain_pending_frees(struct super_block *sb, bool may_wait)
      * each would apply its half without seeing what the other applied
      * (the dedupe above is per drain). One already running does this
      * work; anything it leaves is the next tick's. */
-    if (!mutex_trylock(m))
-        return 0;
+    if (!mutex_trylock(m)) {
+        if (!wait_lock)
+            return 0;
+        atomic64_inc(&cetrafs_alloc_drain_waits);
+        if (mutex_lock_killable(m))
+            return -EINTR;
+    }
+    if (may_wait && READ_ONCE(cetrafs_pf_drain_hold_ms)) {
+        atomic_set(&cetrafs_pf_drain_holding, 1);
+        msleep(READ_ONCE(cetrafs_pf_drain_hold_ms)); /* test-only; see the parameter */
+        atomic_set(&cetrafs_pf_drain_holding, 0);
+    }
 
     zg_count = le32_to_cpu(raw_sb->zone_group_count);
     busy = cetrafs_zg_probe_queues(sb, zg_count);
@@ -3870,7 +3938,7 @@ int cetrafs_alloc_pick_bg(struct super_block *sb, u32 *out_bg_id)
     u32 my_node_id, zg_count;
     bool tried_claim_more = false, tried_claim_bg = false, waited_release = false, waited_adopt = false;
     s64 adopt_pending = -1; /* a dead owner's group, waited for only after the pool claim */
-    bool refreshed_layout = false;
+    bool refreshed_layout = false, waited_drain = false;
     int release_seq = cetrafs_sb_release_seq(sb); /* one plain read; see waited_release */
     int ret;
 
@@ -4046,7 +4114,8 @@ retry_scan:
              * its previous owner (or while unowned) -- apply them now,
              * since they may be exactly the free space this allocation
              * is here looking for. */
-            cetrafs_zg_drain_pending_frees(sb, false); /* a write is waiting */
+            if (cetrafs_zg_drain_for_space(sb) == -EINTR) /* a write is waiting */
+                return -EINTR;
         }
         /* Rescan even without a claim of our own: another thread's may
          * have finished while this one waited for the claim mutex. Once
@@ -4143,6 +4212,18 @@ retry_scan:
             tried_claim_bg = false;
             goto retry_scan;
         }
+    }
+
+    /* Frees queued for the groups we own, applied before the answer is
+     * ENOSPC -- waiting for a drain already running rather than taking
+     * "one is running" for "nothing is queued" (cetrafs_zg_drain_for_space()). */
+    if (!waited_drain) {
+        waited_drain = true;
+        ret = cetrafs_zg_drain_for_space(sb);
+        if (ret < 0)
+            return ret;
+        if (ret > 0)
+            goto retry_scan;
     }
 
     /* Either this node owns no ZGs and none were claimable just now, or

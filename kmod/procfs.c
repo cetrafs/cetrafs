@@ -417,6 +417,8 @@ static int cetrafs_proc_info_show(struct seq_file *m, void *v)
     seq_printf(m, "pf_drains: %llu\n", cetrafs_pf_drain_count());
     seq_printf(m, "pf_whole_sweeps: %llu\n", cetrafs_pf_whole_sweep_count());
     seq_printf(m, "pf_full_scans: %llu\n", cetrafs_pf_full_scans_count());
+    seq_printf(m, "alloc_drain_waits: %llu\n", cetrafs_alloc_drain_wait_count());
+    seq_printf(m, "pf_drain_holding: %d\n", cetrafs_pf_drain_holding_now());
     seq_printf(m, "pf_drain_blocks: %llu\n", cetrafs_pf_drain_blocks_count());
     seq_printf(m, "pf_drain_sweeps: %llu\n", cetrafs_pf_drain_sweeps_count());
     seq_printf(m, "pf_drain_held: %llu\n", cetrafs_pf_drain_held_count());
