@@ -1668,17 +1668,44 @@ int cetrafs_dir_remove_entry(struct inode *dir, const struct qstr *name, u64 exp
     return 0;
 }
 
+/* TEST ONLY: fail the next directory record write that follows a landed
+ * dirent write -- bit 0 a rename-over's retarget, bit 1 a moved
+ * directory's '..' -- as a bitmap flush error, a getblk failure or a
+ * fence would (tests/kernel/rename_record_fail.sh). One-shot per bit. */
+static unsigned int cetrafs_rename_record_fail_once;
+cetrafs_test_param(rename_record_fail_once, cetrafs_rename_record_fail_once, uint, 0644);
+MODULE_PARM_DESC(rename_record_fail_once,
+                 "TEST ONLY: fail the next record write after a landed rename dirent (1 retarget, 2 '..')");
+
+static int cetrafs_rename_record_write(struct inode *dir, cetrafs_inode_t *raw, unsigned int bit)
+{
+    if (unlikely(READ_ONCE(cetrafs_rename_record_fail_once) & bit)) {
+        WRITE_ONCE(cetrafs_rename_record_fail_once, cetrafs_rename_record_fail_once & ~bit);
+        return -EIO; /* test-only, see the knob */
+    }
+    return cetrafs_write_raw_inode_self(dir, raw);
+}
+
 /*
  * Rewrite a directory's '..' dirent to point at a new parent inode number
  * -- used by rename() when a directory moves to a different parent.
+ *
+ * *published (may be NULL) says whether the '..' dirent itself landed.
+ * The directory's record is written after it and can fail on its own
+ * (a bitmap flush, a getblk, a fence); the '..' then names the new
+ * parent whatever this returns, and a caller that took a nonzero return
+ * as "nothing written" left it there while the directory stayed in the
+ * old parent (audit 2026-11-22 N-26).
  */
-int cetrafs_dir_update_dotdot(struct inode *dir, u64 new_parent_ino)
+int cetrafs_dir_update_dotdot(struct inode *dir, u64 new_parent_ino, bool *published)
 {
     struct cetrafs_dir_extents dx;
     cetrafs_inode_t raw;
     int ret;
     u32 i;
 
+    if (published)
+        *published = false;
     cetrafs_invalidate_raw_inode(dir->i_sb, dir->i_ino);
     ret = cetrafs_read_raw_inode(dir->i_sb, dir->i_ino, &raw);
     if (ret)
@@ -1722,13 +1749,15 @@ int cetrafs_dir_update_dotdot(struct inode *dir, u64 new_parent_ino)
                     cetrafs_dir_extents_put(&dx);
                     if (ret)
                         return ret;
+                    if (published)
+                        *published = true;
 
                     /* This rewrote a dirent block, so the sequence has
                      * to move even though no entry was added or removed
                      * -- otherwise a peer whose cached seq still matches
                      * would go on serving the old '..' from its cache. */
                     raw.dirent_seq = cetrafs_cpu_to_le64(cetrafs_dirent_seq_new(dir->i_sb));
-                    ret = cetrafs_write_raw_inode_self(dir, &raw);
+                    ret = cetrafs_rename_record_write(dir, &raw, 2);
                     if (ret)
                         return ret;
                     /* No cache claim: this walk stopped at '..' in the
@@ -1780,13 +1809,17 @@ static bool cetrafs_retarget_expect_off;
 cetrafs_test_param(retarget_expect_off, cetrafs_retarget_expect_off, bool, 0644);
 MODULE_PARM_DESC(retarget_expect_off, "TEST ONLY: a rename-over does not check the slot names the locked inode");
 
+/* *published says whether the dirent itself landed: the directory's
+ * record is written after it and can fail on its own, and from then on
+ * the name names new_ino whatever this returns (N-26). */
 static int cetrafs_dir_retarget_entry(struct inode *dir,
                                       const struct qstr *name,
                                       u64 expect_ino,
                                       u64 new_ino,
                                       u8 new_file_type,
                                       u64 *out_old_ino,
-                                      u8 *out_old_file_type)
+                                      u8 *out_old_file_type,
+                                      bool *published)
 {
     unsigned int dirents_per_block = CETRAFS_DIRENTS_PER_BLOCK;
     struct cetrafs_dir_extents dx;
@@ -1797,6 +1830,7 @@ static int cetrafs_dir_retarget_entry(struct inode *dir,
     int ret;
     u32 i;
 
+    *published = false;
     cetrafs_invalidate_raw_inode(dir->i_sb, dir->i_ino);
     ret = cetrafs_read_raw_inode(dir->i_sb, dir->i_ino, &raw);
     if (!ret)
@@ -1877,6 +1911,7 @@ static int cetrafs_dir_retarget_entry(struct inode *dir,
     brelse(bh);
     if (ret)
         return ret;
+    *published = true;
 
     now = cetrafs_now_disk();
     raw.dirent_seq = cetrafs_cpu_to_le64(cetrafs_dirent_seq_new(dir->i_sb)); /* this directory's blocks just changed */
@@ -1898,7 +1933,7 @@ static int cetrafs_dir_retarget_entry(struct inode *dir,
     ctrace("RETGT dir=%llu name='%.*s' new_ino=%llu removed_ino=%llu\n",
             (unsigned long long) dir->i_ino, (int) name->len, name->name,
             (unsigned long long) new_ino, (unsigned long long) *out_old_ino);
-    ret = cetrafs_write_raw_inode_self(dir, &raw);
+    ret = cetrafs_rename_record_write(dir, &raw, 1);
     if (ret)
         return ret;
 
@@ -3868,13 +3903,14 @@ static void cetrafs_nlink_giveback(struct super_block *sb, struct inode *inode, 
         set_nlink(inode, d.out_nlink);
 }
 
-static int cetrafs_rename_dotdot(struct inode *dir, u64 parent_ino)
+static int cetrafs_rename_dotdot(struct inode *dir, u64 parent_ino, bool *published)
 {
+    *published = false;
     if (cetrafs_rename_dotdot_fail_once) {
         cetrafs_rename_dotdot_fail_once = false;
         return -EIO;
     }
-    return cetrafs_dir_update_dotdot(dir, parent_ino);
+    return cetrafs_dir_update_dotdot(dir, parent_ino, published);
 }
 
 static void cetrafs_rename_undo_rest(struct inode *old_dir, struct inode *new_dir, struct inode *old_inode, u64 old_ino,
@@ -3894,6 +3930,7 @@ static int cetrafs_rename_locked(struct mnt_idmap *idmap,
     u64 old_ino, discard_ino, old_gen = 0;
     bool counted = false;
     bool dotdot_moved = false;
+    int late_err = 0; /* a failure after the destination name landed (N-26) */
     bool removed_first = false;
     u8 discard_file_type;
     u8 old_file_type;
@@ -4137,10 +4174,15 @@ static int cetrafs_rename_locked(struct mnt_idmap *idmap,
      * window (names ahead of '..').
      */
     if (old_file_type == CETRAFS_FT_DIR && old_dir != new_dir) {
-        ret = cetrafs_rename_dotdot(old_inode, new_dir->i_ino);
+        bool landed;
+
+        ret = cetrafs_rename_dotdot(old_inode, new_dir->i_ino, &landed);
+        /* A '..' that landed is put back by the undo even when the
+         * record write after it failed: the dirent names the new parent
+         * whatever the return says (N-26). */
+        dotdot_moved = landed;
         if (ret)
             goto out_uncount;
-        dotdot_moved = true;
     }
 
     /*
@@ -4184,10 +4226,32 @@ static int cetrafs_rename_locked(struct mnt_idmap *idmap,
          * to other processes throughout the renaming operation") and
          * removes the window in which a failure here could destroy the
          * target while leaving the source in place. */
+        bool published;
+
         ret = cetrafs_dir_retarget_entry(new_dir, &new_dentry->d_name, new_inode->i_ino, old_ino, old_file_type,
-                                         &removed_ino, &removed_file_type);
-        if (ret)
+                                         &removed_ino, &removed_file_type, &published);
+        if (ret && !published)
             goto out_unremove;
+        /*
+         * The name landed and only the directory's record write after it
+         * failed: the destination now names the moved inode, whatever
+         * this rename returns. The undo would be wrong from here -- it
+         * skipped the replaced target's -1 and gave the old name back, so
+         * the moved inode had two names and a count of one, and an
+         * unlink through either freed blocks the other still named
+         * (audit 2026-11-22 N-26). So the rename goes FORWARD: the
+         * replaced target is counted down and the old name removed, as
+         * on success, and the error is reported at the end. The record
+         * write that failed is the directory's mtime and dirent_seq.
+         */
+        if (ret) {
+            pr_err("rename: '%*pE' in ino=%llu now names ino=%llu but the directory's record write failed (%d) -- "
+                   "the rename is completed and reported as failed\n",
+                   (int) new_dentry->d_name.len, new_dentry->d_name.name, (unsigned long long) new_dir->i_ino,
+                   (unsigned long long) old_ino, ret);
+            late_err = ret;
+            ret = 0;
+        }
 
         /* Neither branch frees blocks/the inode number here -- just
          * persists the correct nlink (0 for a replaced directory, which
@@ -4290,7 +4354,7 @@ static int cetrafs_rename_locked(struct mnt_idmap *idmap,
         cetrafs_set_ctime_disk(old_inode, now);
         cetrafs_inode_fd_pub_unlock(old_inode);
     }
-    ret = 0;
+    ret = late_err; /* 0, or a record write that failed after its name landed */
 
 out:
     return ret;
@@ -4338,7 +4402,7 @@ static void cetrafs_rename_undo_rest(struct inode *old_dir, struct inode *new_di
     if (counted)
         cetrafs_nlink_giveback(old_dir->i_sb, old_inode, old_gen, now, "rename: un-moved file");
     if (dotdot_moved) {
-        int dret = cetrafs_dir_update_dotdot(old_inode, old_dir->i_ino);
+        int dret = cetrafs_dir_update_dotdot(old_inode, old_dir->i_ino, NULL);
 
         if (dret)
             pr_err("rename: directory ino=%llu stayed in ino=%llu but its '..' could not be put back from ino=%llu "
