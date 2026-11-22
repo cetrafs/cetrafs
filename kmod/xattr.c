@@ -147,6 +147,12 @@ static bool cetrafs_xattr_ctime_cas_fail;
 cetrafs_test_param(xattr_ctime_cas_fail, cetrafs_xattr_ctime_cas_fail, bool, 0644);
 MODULE_PARM_DESC(xattr_ctime_cas_fail, "TEST ONLY: the ctime stamp after an in-place xattr write fails");
 
+/* TEST ONLY: the lockless read's block read judges damage before the
+ * record is re-read, as before audit 2026-11-22 N-51. */
+static bool cetrafs_xattr_read_judges;
+cetrafs_test_param(xattr_read_judges, cetrafs_xattr_read_judges, bool, 0644);
+MODULE_PARM_DESC(xattr_read_judges, "TEST ONLY: a lockless xattr read judges a bad block before re-reading the record");
+
 static int cetrafs_xattr_read_block(struct inode *inode, void **out)
 {
     struct super_block *sb = inode->i_sb;
@@ -157,7 +163,7 @@ static int cetrafs_xattr_read_block(struct inode *inode, void **out)
     *out = NULL;
     for (attempt = 0; attempt < CETRAFS_XATTR_READ_RETRIES; attempt++) {
         struct buffer_head *bh;
-        bool locked;
+        bool locked, bad = false;
         u64 lba, seq;
 
         cetrafs_invalidate_raw_inode(sb, inode->i_ino);
@@ -184,7 +190,29 @@ static int cetrafs_xattr_read_block(struct inode *inode, void **out)
 
         if (!attempt)
             cetrafs_xattr_read_pause(inode->i_ino);
-        bh = cetrafs_blk_tail_bread(sb, inode->i_ino, cetrafs_inode_get_generation(inode), lba, CETRAFS_XATTR_TAIL_MAGIC, "xattr");
+        if (READ_ONCE(cetrafs_xattr_read_judges)) { /* test-only: the verdict before the record re-read */
+            bh = cetrafs_blk_tail_bread(sb, inode->i_ino, cetrafs_inode_get_generation(inode), lba,
+                                        CETRAFS_XATTR_TAIL_MAGIC, "xattr");
+            bad = false;
+        } else {
+            bh = cetrafs_blk_tail_bread_unjudged(sb, inode->i_ino, cetrafs_inode_get_generation(inode), lba,
+                                                 CETRAFS_XATTR_TAIL_MAGIC, "xattr", &bad);
+        }
+        if (!bh && bad) {
+            /* Not this block's kind: damage only if the record still
+             * names it for this file at the same stamp (N-51). */
+            cetrafs_invalidate_raw_inode(sb, inode->i_ino);
+            ret = cetrafs_read_raw_inode(sb, inode->i_ino, &raw);
+            if (ret)
+                goto out;
+            if (cetrafs_le64(raw.generation) == cetrafs_inode_get_generation(inode) &&
+                cetrafs_le64(raw.xattr_block) == lba && cetrafs_le64(raw.xattr_seq) == seq) {
+                cetrafs_blk_tail_judge(sb, inode->i_ino, cetrafs_inode_get_generation(inode), lba, "xattr");
+                ret = -EIO;
+                goto out;
+            }
+            continue; /* the record moved: read what it names now */
+        }
         if (!bh) {
             ret = -EIO;
             goto out;

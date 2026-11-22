@@ -2830,8 +2830,8 @@ static bool cetrafs_tear_awaits_replay(struct super_block *sb, u64 ino, u64 lba,
     return false;
 }
 
-struct buffer_head *cetrafs_blk_tail_bread(struct super_block *sb, u64 ino, u64 generation, u64 lba, u32 magic,
-                                          const char *what)
+static struct buffer_head *__cetrafs_blk_tail_bread(struct super_block *sb, u64 ino, u64 generation, u64 lba,
+                                                   u32 magic, const char *what, bool *unjudged)
 {
     int attempt, nbad = 0, chk;
 
@@ -2884,6 +2884,11 @@ struct buffer_head *cetrafs_blk_tail_bread(struct super_block *sb, u64 ino, u64 
         cetrafs_invalidate_block(sb, lba); /* the next read checks again */
         return NULL;
     }
+    if (unjudged) {
+        *unjudged = true;
+        cetrafs_invalidate_block(sb, lba);
+        return NULL;
+    }
     pr_err("%s block %llu failed its tail checksum %d times -- corrupted, not just a torn concurrent read\n", what,
            (unsigned long long) lba, CETRAFS_BLK_TAIL_READ_RETRIES);
     cetrafs_sb_corrupt_owner(sb, ino, generation);
@@ -2893,6 +2898,37 @@ struct buffer_head *cetrafs_blk_tail_bread(struct super_block *sb, u64 ino, u64 
      * just refused would be served, unchecked, by the next one. */
     cetrafs_invalidate_block(sb, lba);
     return NULL;
+}
+
+struct buffer_head *cetrafs_blk_tail_bread(struct super_block *sb, u64 ino, u64 generation, u64 lba, u32 magic,
+                                          const char *what)
+{
+    return __cetrafs_blk_tail_bread(sb, ino, generation, lba, magic, what, NULL);
+}
+
+/*
+ * For a LOCKLESS reader, who read the record naming the block with no
+ * lock held: a block that fails every attempt may simply not be this
+ * file's any more -- freed by a peer's setxattr and reused as another
+ * kind -- and judging it damage marked a healthy file (writes refused,
+ * under corruption=stop the mount stopped; audit 2026-11-22, N-51). So
+ * the verdict is the caller's: *bad says every read of it failed its
+ * checks, and the caller re-reads the record. Still named, it calls
+ * cetrafs_blk_tail_judge(); moved, it starts over.
+ */
+struct buffer_head *cetrafs_blk_tail_bread_unjudged(struct super_block *sb, u64 ino, u64 generation, u64 lba,
+                                                   u32 magic, const char *what, bool *bad)
+{
+    *bad = false;
+    return __cetrafs_blk_tail_bread(sb, ino, generation, lba, magic, what, bad);
+}
+
+void cetrafs_blk_tail_judge(struct super_block *sb, u64 ino, u64 generation, u64 lba, const char *what)
+{
+    pr_err("%s block %llu failed its tail checksum %d times and its file still names it -- corrupted, not just a "
+           "torn concurrent read\n",
+           what, (unsigned long long) lba, CETRAFS_BLK_TAIL_READ_RETRIES);
+    cetrafs_sb_corrupt_owner(sb, ino, generation);
 }
 
 /*

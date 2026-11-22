@@ -911,6 +911,9 @@ bool cetrafs_blk_image_valid(const void *img, u32 magic);
  * damaged when the block is (0 when no one file owns it). */
 struct buffer_head *cetrafs_blk_tail_bread(struct super_block *sb, u64 ino, u64 generation, u64 lba, u32 magic,
                                           const char *what);
+struct buffer_head *cetrafs_blk_tail_bread_unjudged(struct super_block *sb, u64 ino, u64 generation, u64 lba,
+                                                   u32 magic, const char *what, bool *bad);
+void cetrafs_blk_tail_judge(struct super_block *sb, u64 ino, u64 generation, u64 lba, const char *what);
 int cetrafs_cas_region(struct super_block *sb, u64 fs_lba, unsigned int region_idx, cetrafs_cas_fn mutate, void *priv);
 int cetrafs_cas_region_judged(struct super_block *sb, u64 fs_lba, unsigned int region_idx, cetrafs_cas_fn mutate,
                               void *priv, bool *image_only);

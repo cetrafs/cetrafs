@@ -13,8 +13,16 @@
 # read and its block read; meanwhile, on the device, A's record loses
 # its xattr block and that block is filled with file B's xattr block.
 #
+# And once more with the block reused as ANOTHER kind (zeros here, as a
+# data block would be): every read of it fails its tail check, and the
+# reader judged that damage before asking whether A still named the
+# block -- a healthy file marked damaged, its writes refused (audit
+# 2026-11-22, N-51). It now re-reads the record first: ENODATA, nothing
+# counted.
+#
 # DISCRIMINATION (measured on the old code): getxattr on A returns B's
-# value.
+# value. For the other-kind case, xattr_read_judges=1 (the old order):
+# the read fails EIO and the volume counts a corruption.
 set -euo pipefail
 . "$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)/lib/harness.sh"
 require_root
@@ -107,6 +115,56 @@ GOT="$(cat "$OUT")"
 log "listxattr on A returned: $GOT"
 [ "$GOT" = EMPTY ] && pass "listxattr on A lists nothing" ||
     fail "listxattr on A returned '$GOT' from a block A no longer owns"
+
+# other_kind <judges 0|1> -> "got corruptions"
+other_kind() {
+    local got c0
+    python3 -I -c "
+import os, sys
+os.setxattr(sys.argv[1], 'user.k', b'value-of-A')" "$MNT/a"
+    sync
+    LA="$("$REC_POKE" "$IMG" xattrblk "$AINO")"
+    [ -n "$LA" ] && [ "$LA" != 0 ] || { echo "nosetup 0"; return; }
+    c0="$(sed -n 's/^corruptions: //p' "$(ct_procdir "$DEV")/info")"
+    echo "$1" >/sys/module/cetrafs/parameters/xattr_read_judges
+    ct_param_set xattr_read_pause_ms 1500
+    MARK="$(dmesg_mark)"
+    python3 -I -c "
+import errno, os, sys
+try:
+    print(os.getxattr(sys.argv[1], 'user.k').decode())
+except OSError as e:
+    print(errno.errorcode.get(e.errno, str(e.errno)))
+sys.stdout.flush()" "$MNT/a" >"$OUT" 2>&1 &
+    PID=$!
+    wait_for 15 "dmesg_since '$MARK' | grep -q 'ino=$AINO pausing'" || { kill "$PID" 2>/dev/null; echo "nopause 0"; return; }
+    "$REC_POKE" "$IMG" xattrblk "$AINO" 0 >/dev/null
+    dd if=/dev/zero of="$IMG" bs=4096 seek="$LA" count=1 conv=notrunc status=none
+    wait "$PID" || true
+    ct_param_set xattr_read_pause_ms 0
+    echo 0 >/sys/module/cetrafs/parameters/xattr_read_judges
+    got="$(cat "$OUT")"
+    echo "$got $(($(sed -n 's/^corruptions: //p' "$(ct_procdir "$DEV")/info") - c0))"
+}
+[ -w /sys/module/cetrafs/parameters/xattr_read_judges ] || { skip "xattr_read_judges is missing"; ct_exit; }
+ct_param_set xattr_read_judges 0
+remount_a() {
+    umount "$MNT"
+    "$REC_POKE" "$IMG" xattrblk "$AINO" "$LA" >/dev/null
+    ct_mount "$DEV" "$MNT"
+}
+remount_a
+R="$(other_kind 1)"
+log "other kind, judged first (control): $R"
+[ "${R%% *}" = EIO ] && [ "${R##* }" -ge 1 ] &&
+    pass "other-kind control: judged before the record re-read, A was counted damaged ($R)" ||
+    fail "other-kind control: the hazard did not reproduce -- the check cannot tell: $R"
+remount_a
+R="$(other_kind 0)"
+log "other kind: $R"
+[ "${R%% *}" = ENODATA ] && [ "${R##* }" = 0 ] &&
+    pass "other kind: A's record no longer names the block -- ENODATA, nothing counted" ||
+    fail "other kind: getxattr on A gave '${R% *}', corruptions +${R##* }"
 
 umount "$MNT"
 ct_exit
