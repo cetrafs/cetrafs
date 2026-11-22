@@ -1337,6 +1337,34 @@ static inline int cetrafs_repair_claim(int fd, const cetrafs_superblock_t *sb, c
                     continue; /* written during the probe: alive, not ours to take */
                 memcpy(cetrafs_repair_saved, blk, sizeof(cetrafs_repair_saved));
                 cetrafs_repair_borrowed = 1;
+                /*
+                 * A row that did not depart -- it only stood still for the
+                 * probe -- may belong to a node that is PAUSED, not dead
+                 * (a stopped VM, a stalled host). While the claim holds the
+                 * row a peer can take that node's Zone Groups, and a fence
+                 * of a REPAIR row bumps nothing; the release then put the
+                 * registration back exactly as it was, old fence_epoch and
+                 * all, and the node, resumed, passed its epoch check and
+                 * went on writing into what it no longer owns (audit
+                 * 2026-11-22 N-56). So what goes back carries the fence
+                 * the takeover would have written: every restore -- this
+                 * tool's release, a peer's reap of a dead claim -- copies
+                 * this saved image, and a node resumed after it fences
+                 * itself on its next tick. A CLEAN departure is not
+                 * running; it re-attaches as usual and is put back as it
+                 * was.
+                 */
+                if (pass == 2) {
+                    cetrafs_node_entry_t sv;
+
+                    memcpy(&sv, cetrafs_repair_saved, sizeof(sv));
+                    sv.fence_epoch = cetrafs_cpu_to_le64(cetrafs_le64(sv.fence_epoch) + 1);
+                    sv.fenced_by = cetrafs_cpu_to_le32(idx);
+                    sv.fence_reason = cetrafs_cpu_to_le32(CETRAFS_FENCE_RECLAIM);
+                    sv.fenced_at = cetrafs_cpu_to_le64((uint64_t) time(NULL));
+                    cetrafs_node_row_stamp(&sv);
+                    memcpy(cetrafs_repair_saved, &sv, sizeof(sv));
+                }
             }
             free(seen);
             seen = NULL;
