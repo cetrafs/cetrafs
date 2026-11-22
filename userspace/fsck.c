@@ -227,6 +227,19 @@ static cetrafs_superblock_t repair_sb;
  * (devutil.h): stop before another write. Every repair write asks
  * (pwrite_all()), not only the loops that beat -- whole write phases run
  * between beats. */
+/* The device under check, for the knobs below that take a safety gate
+ * away: honoured on an image file or a loop device only, and refusing
+ * the run (exit 2) on anything else, as the kernel's test knobs are --
+ * an environment a production run inherited from a test shell must not
+ * reach a real LUN with a repair gate switched off (audit 2026-11-22
+ * N-12). Set by main() as soon as the device is open. */
+static int fsck_dev_fd = -1;
+
+static const char *fsck_gate_knob(const char *name)
+{
+    return cetrafs_test_env_damaging(name, fsck_dev_fd);
+}
+
 /* TEST ONLY: the set-bit repair waits for every other fault, as before
  * audit 2026-11-15 BM-67 (tests/kernel/fsck_setbit_when_blocked.sh). */
 static int fsck_setbit_gated(void)
@@ -267,7 +280,7 @@ static int fsck_leak_ungated(void)
     static int v = -1;
 
     if (v < 0)
-        v = cetrafs_test_env("CETRAFS_TEST_FSCK_LEAK_UNGATED") != NULL;
+        v = fsck_gate_knob("CETRAFS_TEST_FSCK_LEAK_UNGATED") != NULL;
     return v;
 }
 
@@ -1382,7 +1395,7 @@ static const uint64_t *fsck_g_bg_desc_lba;
  */
 static int fsck_bg_desc_verifies(const cetrafs_block_group_t *bgd, uint32_t b)
 {
-    if (getenv("CETRAFS_FSCK_RESTAMP_UNVERIFIED")) /* test-only: the old edits */
+    if (fsck_gate_knob("CETRAFS_FSCK_RESTAMP_UNVERIFIED")) /* test-only: the old edits */
         return 1;
     return cetrafs_le32(bgd->bg_id) == b &&
            (uint32_t) cetrafs_le64(bgd->checksum) ==
@@ -1391,7 +1404,7 @@ static int fsck_bg_desc_verifies(const cetrafs_block_group_t *bgd, uint32_t b)
 
 static int fsck_zg_verifies(const cetrafs_zone_group_t *zg, uint32_t z)
 {
-    if (getenv("CETRAFS_FSCK_RESTAMP_UNVERIFIED"))
+    if (fsck_gate_knob("CETRAFS_FSCK_RESTAMP_UNVERIFIED"))
         return 1;
     return cetrafs_le16(zg->zg_id) == (uint16_t) z &&
            (uint32_t) cetrafs_le64(zg->hot_checksum) ==
@@ -1702,7 +1715,7 @@ static int fsck_rebuild_bg_desc(int fd, const cetrafs_superblock_t *sb, uint64_t
 
         pread_all(fd, blk, sizeof(blk), (off_t) (start + cetrafs_le32(hdr.off_data_bmap) + i) * CETRAFS_BLOCK_SIZE);
         for (unsigned k = 0; k < CETRAFS_BMAP_SECTORS; k++)
-            bad[k] = !cetrafs_test_env_damaging("CETRAFS_FSCK_TEST_REBUILD_TRUST_BAD_SECTOR", fd) &&
+            bad[k] = !fsck_gate_knob("CETRAFS_FSCK_TEST_REBUILD_TRUST_BAD_SECTOR") &&
                      cetrafs_bmap_sector_bad_us(blk + k * CETRAFS_BMAP_SECTOR) != 0;
         for (uint64_t bit = 0; bit < CETRAFS_BMAP_BLOCK_BITS; bit++) {
             if ((uint64_t) i * CETRAFS_BMAP_BLOCK_BITS + bit >= cnt)
@@ -2466,7 +2479,7 @@ static int fsck_unrevivable(uint64_t ino, const uint32_t *nlinks, const uint32_t
                             const uint8_t *dead_ok)
 {
     return !is_dir[ino] && !nlinks[ino] && refs[ino] && !dead_ok[ino] &&
-           !cetrafs_test_env("CETRAFS_TEST_FSCK_REVIVE_ANY");
+           !fsck_gate_knob("CETRAFS_TEST_FSCK_REVIVE_ANY");
 }
 
 /* Context for fsck_mark_run(): the content pass's reachability bitmaps,
@@ -2530,7 +2543,7 @@ static int fsck_bitcache_get(struct fsck_bitcache *bc, int b, uint64_t off)
         bc->group = b;
     }
     return cetrafs_bmap_get(bc->img, off) &&
-           (!fsck_bmap_bit_damaged(bc->bad, off) || cetrafs_test_env("CETRAFS_TEST_FSCK_DEAD_DAMAGED_OK"));
+           (!fsck_bmap_bit_damaged(bc->bad, off) || fsck_gate_knob("CETRAFS_TEST_FSCK_DEAD_DAMAGED_OK"));
 }
 
 /* Mark one physical run [phys, phys+len) as referenced by 'ino', flagging
@@ -3540,6 +3553,21 @@ int main(int argc, char **argv)
     if (fd < 0 && errno == EBUSY) {
         fprintf(stderr, "ERR: " CETRAFS_EXCL_BUSY_FMT "\n", dev);
         return FSCK_EXIT_NOEXAM;
+    }
+    fsck_dev_fd = fd;
+    /* Every knob that takes a repair gate away is judged here, before the
+     * first read: one met only deep in a pass would refuse half a repair
+     * in (fsck_gate_knob()). */
+    if (fd >= 0) {
+        static const char *const gate_knobs[] = {
+            "CETRAFS_TEST_FSCK_LEAK_UNGATED",      "CETRAFS_TEST_FSCK_REVIVE_ANY",
+            "CETRAFS_TEST_FSCK_DEAD_DAMAGED_OK",   "CETRAFS_TEST_FSCK_DEAD_SHARE_OK",
+            "CETRAFS_TEST_FSCK_CLEAR_OVER_JOURNAL", "CETRAFS_TEST_FSCK_PENDING_JOURNAL_OK",
+            "CETRAFS_FSCK_RESTAMP_UNVERIFIED",     "CETRAFS_FSCK_TEST_REBUILD_TRUST_BAD_SECTOR",
+        };
+
+        for (size_t i = 0; i < sizeof(gate_knobs) / sizeof(gate_knobs[0]); i++)
+            (void) fsck_gate_knob(gate_knobs[i]);
     }
 
     /* A live walk reads past the cache (F-54). Test knob only: the
@@ -5556,7 +5584,7 @@ int main(int argc, char **argv)
          * stale; the earlier one's verdict was given before the later
          * was walked, so it is withdrawn here (F-70). Reviving it would
          * leave the other's free to take that block from under it. */
-        if (dead_runs.shared && !cetrafs_test_env("CETRAFS_TEST_FSCK_DEAD_SHARE_OK"))
+        if (dead_runs.shared && !fsck_gate_knob("CETRAFS_TEST_FSCK_DEAD_SHARE_OK"))
             for (size_t r = 0; r < dead_runs.n; r++)
                 for (uint64_t k = 0; k < dead_runs.v[r].len && dead_ok[dead_runs.v[r].ino]; k++)
                     if (FSCK_GET(dead_runs.share, dead_runs.v[r].idx0 + k))
@@ -7182,7 +7210,7 @@ int main(int argc, char **argv)
              * that damage was found -- consumed by a run that did not
              * show the volume clean, it was gone for good. */
             if (!problems && repair_mode &&
-                (!fsck_journal_pending || cetrafs_test_env("CETRAFS_TEST_FSCK_CLEAR_OVER_JOURNAL"))) {
+                (!fsck_journal_pending || fsck_gate_knob("CETRAFS_TEST_FSCK_CLEAR_OVER_JOURNAL"))) {
                 if (fsck_clear_needed_mark(fd, &sb) == 0)
                     printf("  cleared the needs-fsck mark (recorded by registry row %u at %" PRIu64 ")\n", was_node,
                            was_since);
@@ -7252,7 +7280,7 @@ int main(int argc, char **argv)
      * (audit 2026-11-15 BL-115). A check alone says what the device
      * holds, with the WARN above, and stays OK.
      */
-    if (repair_mode && fsck_journal_pending && !cetrafs_test_env("CETRAFS_TEST_FSCK_PENDING_JOURNAL_OK")) {
+    if (repair_mode && fsck_journal_pending && !fsck_gate_knob("CETRAFS_TEST_FSCK_PENDING_JOURNAL_OK")) {
         /* Some repairs run before the journal is read (a registry row,
          * a descriptor, a pending-free entry): say what was done. */
         if (repairs_made)
