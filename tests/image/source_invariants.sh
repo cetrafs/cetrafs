@@ -1807,12 +1807,55 @@ UNL="$(while read -r c; do [ -n "$c" ] && ! grep -q "^$c:" <<<"$SIGSAFE_OK" && e
 fn_body "$U/devutil.h" cetrafs_repair_renew | has 'sigprocmask(SIG_BLOCK' &&
     pass "signal handlers: cetrafs_repair_renew masks SIGALRM" ||
     fail "signal handlers: cetrafs_repair_renew no longer masks SIGALRM around the renewal"
-fn_body "$U/devutil.h" cetrafs_repair_release | tail -n +2 | awk '!d && /cetrafs_|pread|pwrite/ { print; d = 1 }' | has 'cetrafs_repair_timer(fd, sb, row, 0)' &&
+fn_body "$U/devutil.h" cetrafs_repair_release | tail -n +2 | awk '!d && /cetrafs_|pread|pwrite/ { print; d = 1 }' | has 'cetrafs_repair_disarm()' &&
     pass "signal handlers: cetrafs_repair_release disarms the timer first" ||
     fail "signal handlers: cetrafs_repair_release does I/O before disarming the timer"
 NB="$(grep -nE 'cetrafs_repair_node_beat\(' "$U"/*.c "$U"/*.h | grep -vE 'static inline int cetrafs_repair_node_beat|cetrafs_renew_fd' || true)"
 [ -z "$NB" ] && pass "signal handlers: cetrafs_repair_node_beat has no main-line caller" ||
     fail "signal handlers: cetrafs_repair_node_beat called from the main line at: $(echo "$NB" | cut -d: -f1,2)"
+# Transitively: everything the handlers can reach, through any depth of
+# devutil.h helpers, calls no allocator and no stdio -- neither is
+# async-signal-safe, and a tick inside the main line's malloc() re-enters
+# it. One level of the scan above missed exactly that: the handlers'
+# row reads went through cetrafs_pread_device(), whose bounce buffer was
+# posix_memalign()'d (audit 2026-11-22 N-2).
+sig_closure() { # <file>: every function the two handlers reach, defined in that file
+    local f c todo="cetrafs_repair_tick cetrafs_repair_stop" seen="" defs
+    defs="$(grep -oE '^static[^(]*[ *](__)?cetrafs_[a-z0-9_]+\(' "$1" | grep -oE '(__)?cetrafs_[a-z0-9_]+' | sort -u)"
+    while [ -n "$todo" ]; do
+        set -- $todo
+        f="$1"
+        shift
+        todo="$*"
+        case " $seen " in *" $f "*) continue ;; esac
+        seen="$seen $f"
+        for c in $(fn_body "$SIGF" "$f" | tail -n +2 | grep -oE '(__)?cetrafs_[a-z0-9_]+\(' | tr -d '(' | sort -u); do
+            grep -qx "$c" <<<"$defs" && todo="$todo $c"
+        done
+    done
+    echo "$seen"
+}
+sig_unsafe() { # <file>: "<fn>:<call>" for each unsafe call in the closure
+    local f
+    for f in $(sig_closure "$SIGF"); do
+        fn_body "$SIGF" "$f" | tail -n +2 |
+            grep -oE '\b(malloc|calloc|realloc|free|posix_memalign|aligned_alloc|strdup|printf|fprintf|snprintf|sprintf|vfprintf|perror|exit|syslog)\(' |
+            sort -u | sed "s/^/$f:/" | tr -d '('
+    done
+}
+SIGF="$U/devutil.h"
+CLOS="$(sig_closure "$SIGF")"
+grep -qw cetrafs_pread_device <<<"$CLOS" && grep -qw cetrafs_repair_release <<<"$CLOS" &&
+    pass "signal handlers: the transitive scan reaches the row reads and the release" ||
+    fail "signal handlers: the transitive scan does not reach cetrafs_pread_device/cetrafs_repair_release -- it sees nothing"
+BAD="$(sig_unsafe "$SIGF" || true)"
+[ -z "$BAD" ] && pass "signal handlers: nothing they reach, at any depth, calls the allocator or stdio" ||
+    fail "signal handlers: they reach unsafe calls: $(echo $BAD)"
+SIGF="$(ct_tmp sig-deep).h"
+printf 'static void cetrafs_repair_tick(int sig)\n{\n    cetrafs_a(fd);\n}\nstatic inline int cetrafs_a(int fd)\n{\n    return cetrafs_b(fd);\n}\nstatic inline int cetrafs_b(int fd)\n{\n    free(malloc(4));\n    return 0;\n}\n' >"$SIGF"
+[ "$(sig_unsafe "$SIGF" | tr '\n' ' ')" = "cetrafs_b:free cetrafs_b:malloc " ] &&
+    pass "signal handlers: control -- an allocation two calls below a handler is seen" ||
+    fail "signal handlers: control -- a planted deep allocation is not seen ($(sig_unsafe "$SIGF" | tr '\n' ' '))"
 SAMPLE="$(ct_tmp sig-sample).h"
 printf 'static void cetrafs_repair_tick(int sig)\n{\n    cetrafs_write_row(fd);\n}\n' >"$SAMPLE"
 [ "$(handler_calls "$SAMPLE" cetrafs_repair_tick)" = cetrafs_write_row ] &&

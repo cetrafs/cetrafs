@@ -393,45 +393,98 @@ static inline int cetrafs_row_same_beat(const cetrafs_node_entry_t *then, const 
  * it stands. A descriptor that cannot be opened O_DIRECT fails the read:
  * every caller treats that as "cannot tell", never as a free row.
  */
+/*
+ * It runs from the repair tools' signal handlers too (the renewal tick
+ * and the stop handler both read the row), so it may call nothing that
+ * is not async-signal-safe: no allocator, no stdio (audit 2026-11-22
+ * N-2 -- a tick inside the main line's malloc re-entered the allocator).
+ * The bounce buffer is one of a few static ones, taken by an atomic
+ * slot count so a handler interrupting a main-line read gets its own;
+ * a read of more than one block is refused ("cannot tell"), and no
+ * caller makes one.
+ */
+#define CETRAFS_PREAD_SLOTS 4
+static unsigned char cetrafs_pread_bounce[CETRAFS_PREAD_SLOTS][2 * CETRAFS_BLOCK_SIZE]
+    __attribute__((aligned(CETRAFS_BLOCK_SIZE)));
+static int cetrafs_pread_depth;
+static int cetrafs_pread_dfd = -1, cetrafs_pread_dfd_of = -1;
+static dev_t cetrafs_pread_dfd_rdev;
+
+/* "/proc/self/fd/<fd>" without stdio. */
+static inline void cetrafs_fd_path(char *path, size_t size, int fd)
+{
+    static const char pre[] = "/proc/self/fd/";
+    char digits[16];
+    size_t n = 0, i = 0;
+    unsigned v = (unsigned) fd;
+
+    do
+        digits[n++] = (char) ('0' + v % 10);
+    while ((v /= 10) && n < sizeof(digits));
+    for (; i < sizeof(pre) - 1 && i < size - 1; i++)
+        path[i] = pre[i];
+    while (n && i < size - 1)
+        path[i++] = digits[--n];
+    path[i] = '\0';
+}
+
+/* The O_DIRECT twin of 'fd', opened if it is not open yet. Called by the
+ * tools before they arm the renewal timer (cetrafs_repair_timer()), so a
+ * handler only ever finds it open; open() and close() are async-signal
+ * -safe anyway. -1 if it cannot be opened. */
+static inline int cetrafs_pread_direct_fd(int fd, dev_t rdev)
+{
+    if (cetrafs_pread_dfd_of != fd || cetrafs_pread_dfd_rdev != rdev) {
+        char path[32];
+
+        if (cetrafs_pread_dfd >= 0)
+            close(cetrafs_pread_dfd);
+        cetrafs_fd_path(path, sizeof(path), fd);
+        cetrafs_pread_dfd = open(path, O_RDONLY | O_DIRECT | O_CLOEXEC);
+        cetrafs_pread_dfd_of = cetrafs_pread_dfd >= 0 ? fd : -1;
+        cetrafs_pread_dfd_rdev = rdev;
+    }
+    return cetrafs_pread_dfd;
+}
+
 static inline ssize_t cetrafs_pread_device(int fd, void *buf, size_t len, off_t off)
 {
-    static int dfd = -1, dfd_of = -1;
-    static dev_t dfd_rdev;
     struct stat st;
     off_t a = off & ~(off_t) (CETRAFS_BLOCK_SIZE - 1);
     size_t span = (size_t) (off - a) + len;
-    void *bounce = NULL;
+    unsigned char *bounce;
     ssize_t got;
+    int dfd, slot;
 
     if (fstat(fd, &st) != 0)
         return -1;
     if (!S_ISBLK(st.st_mode))
         return pread(fd, buf, len, off);
-    if (dfd_of != fd || dfd_rdev != st.st_rdev) {
-        char path[64];
-
-        if (dfd >= 0)
-            close(dfd);
-        snprintf(path, sizeof(path), "/proc/self/fd/%d", fd);
-        dfd = open(path, O_RDONLY | O_DIRECT | O_CLOEXEC);
-        dfd_of = dfd >= 0 ? fd : -1;
-        dfd_rdev = st.st_rdev;
-        if (dfd < 0)
-            return -1;
-    }
-    span = (span + CETRAFS_BLOCK_SIZE - 1) & ~(size_t) (CETRAFS_BLOCK_SIZE - 1);
-    if (posix_memalign(&bounce, CETRAFS_BLOCK_SIZE, span))
+    dfd = cetrafs_pread_direct_fd(fd, st.st_rdev);
+    if (dfd < 0)
         return -1;
+    span = (span + CETRAFS_BLOCK_SIZE - 1) & ~(size_t) (CETRAFS_BLOCK_SIZE - 1);
+    if (span > sizeof(cetrafs_pread_bounce[0])) {
+        errno = EINVAL;
+        return -1;
+    }
+    slot = __atomic_fetch_add(&cetrafs_pread_depth, 1, __ATOMIC_SEQ_CST);
+    if (slot >= CETRAFS_PREAD_SLOTS) {
+        __atomic_fetch_sub(&cetrafs_pread_depth, 1, __ATOMIC_SEQ_CST);
+        errno = EBUSY;
+        return -1;
+    }
+    bounce = cetrafs_pread_bounce[slot];
     got = pread(dfd, bounce, span, a);
     if (got < (ssize_t) (off - a)) {
-        free(bounce);
+        __atomic_fetch_sub(&cetrafs_pread_depth, 1, __ATOMIC_SEQ_CST);
         return got < 0 ? -1 : 0;
     }
     got -= off - a;
     if ((size_t) got > len)
         got = (ssize_t) len;
-    memcpy(buf, (char *) bounce + (off - a), (size_t) got);
-    free(bounce);
+    memcpy(buf, bounce + (off - a), (size_t) got);
+    __atomic_fetch_sub(&cetrafs_pread_depth, 1, __ATOMIC_SEQ_CST);
     return got;
 }
 
@@ -1636,7 +1689,12 @@ static void cetrafs_repair_stop(int sig)
     raise(sig);
 }
 
-static inline void cetrafs_repair_timer(int fd, const cetrafs_superblock_t *sb, uint32_t row, int on)
+/* Stop the renewals and put the stop signals back to their defaults.
+ * Its own function because the release, which the stop handler runs,
+ * needs it: everything a handler can reach must be async-signal-safe,
+ * and the arming half below is not (it reads the environment and may
+ * announce a test knob on stderr). setitimer() and sigaction() are. */
+static inline void cetrafs_repair_disarm(void)
 {
     struct itimerval it;
     struct sigaction sa;
@@ -1644,17 +1702,34 @@ static inline void cetrafs_repair_timer(int fd, const cetrafs_superblock_t *sb, 
 
     memset(&it, 0, sizeof(it));
     memset(&sa, 0, sizeof(sa));
+    setitimer(ITIMER_REAL, &it, NULL);
+    sa.sa_handler = SIG_DFL;
+    sigaction(SIGALRM, &sa, NULL);
+    for (i = 0; i < sizeof(cetrafs_repair_stop_sigs) / sizeof(cetrafs_repair_stop_sigs[0]); i++)
+        sigaction(cetrafs_repair_stop_sigs[i], &sa, NULL);
+    cetrafs_renew_fd = -1;
+}
+
+static inline void cetrafs_repair_timer(int fd, const cetrafs_superblock_t *sb, uint32_t row, int on)
+{
+    struct itimerval it;
+    struct sigaction sa;
+    unsigned i;
+
     if (!on) {
-        setitimer(ITIMER_REAL, &it, NULL);
-        sa.sa_handler = SIG_DFL;
-        sigaction(SIGALRM, &sa, NULL);
-        for (i = 0; i < sizeof(cetrafs_repair_stop_sigs) / sizeof(cetrafs_repair_stop_sigs[0]); i++)
-            sigaction(cetrafs_repair_stop_sigs[i], &sa, NULL);
-        cetrafs_renew_fd = -1;
+        cetrafs_repair_disarm();
         return;
     }
+    memset(&it, 0, sizeof(it));
+    memset(&sa, 0, sizeof(sa));
     cetrafs_renew_sb = *sb;
     cetrafs_renew_row = row;
+    {
+        struct stat st; /* the handlers' reads find the O_DIRECT twin open (N-2) */
+
+        if (fstat(fd, &st) == 0 && S_ISBLK(st.st_mode))
+            (void) cetrafs_pread_direct_fd(fd, st.st_rdev);
+    }
     cetrafs_repair_watch_arm(fd, sb, row);
     cetrafs_renew_stall_secs = (unsigned) cetrafs_test_env_ll("CETRAFS_TEST_REPAIR_RENEW_STALL_SECS", 0, 600, 0);
     cetrafs_renew_no_lease = cetrafs_test_env("CETRAFS_TEST_REPAIR_NO_LEASE") != NULL;
@@ -1684,7 +1759,7 @@ static inline void cetrafs_repair_release(int fd, const cetrafs_superblock_t *sb
 
     unsigned char cur[CETRAFS_BLOCK_SIZE];
 
-    cetrafs_repair_timer(fd, sb, row, 0); /* no renewal may land after the release */
+    cetrafs_repair_disarm(); /* no renewal may land after the release */
     if (cetrafs_caw_mode == 1)
         cetrafs_row_drop_cache(fd, sb, row);
     if (!cetrafs_repair_row_is_ours(fd, sb, row) ||
