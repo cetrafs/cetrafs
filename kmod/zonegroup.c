@@ -2705,6 +2705,7 @@ int cetrafs_zg_queue_foreign_frees(struct super_block *sb,
     struct buffer_head **bhs = NULL;
     u64 qstart;
     u32 qblocks, qb, next = 0;
+    bool scanned = true; /* false: the backoff skipped the scan */
     int ret = 0;
 
     *dropped = 0;
@@ -2722,8 +2723,10 @@ int cetrafs_zg_queue_foreign_frees(struct super_block *sb,
      * not because we looked again. Deleting one large image is tens of
      * thousands of extents, and paying the full scan for each is what
      * makes the filesystem feel stopped. */
-    if (cetrafs_sb_zg_pf_backoff_active(sb, zg_id))
+    if (cetrafs_sb_zg_pf_backoff_active(sb, zg_id)) {
+        scanned = false;
         goto queue_full;
+    }
 
     /* Where the swaps go. The scan starts at block 0 on every pass: the
      * drain's quiet probe stops at CETRAFS_PF_DRAIN_EMPTY_RUN empty blocks,
@@ -2885,7 +2888,7 @@ queue_full:
          * (see the append path above) or at unmount. */
         atomic64_add(n - next, &cetrafs_pf_drop_runs);
         atomic64_add(blocks, &cetrafs_pf_drop_blocks);
-        if (cetrafs_sb_zg_pf_note_drop(sb, zg_id, n - next, blocks, cetrafs_pf_full_backoff_ms))
+        if (cetrafs_sb_zg_pf_note_drop(sb, zg_id, n - next, blocks, cetrafs_pf_full_backoff_ms, scanned))
             cetrafs_zg_log_foreign_free_leak(sb, zg_id, ents[next].lba, ents[next].count);
     }
     return 0;

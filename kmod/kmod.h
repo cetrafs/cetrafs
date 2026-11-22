@@ -353,7 +353,8 @@ bool cetrafs_sb_zg_pf_backoff_active(struct super_block *sb, u32 zg_id);
 bool cetrafs_sb_zg_pf_residue(struct super_block *sb, u32 zg_id);
 void cetrafs_sb_zg_pf_set_residue(struct super_block *sb, u32 zg_id, bool left);
 bool cetrafs_sb_pf_full_sweep_due(struct super_block *sb, u32 every);
-bool cetrafs_sb_zg_pf_note_drop(struct super_block *sb, u32 zg_id, u32 runs, u64 blocks, unsigned int backoff_ms);
+bool cetrafs_sb_zg_pf_note_drop(struct super_block *sb, u32 zg_id, u32 runs, u64 blocks, unsigned int backoff_ms,
+                                bool scanned);
 bool cetrafs_sb_zg_pf_take_drops(struct super_block *sb, u32 zg_id, u64 *runs, u64 *blocks);
 bool cetrafs_sb_owns_any_zg(struct super_block *sb);
 bool cetrafs_sb_bg_is_ours(struct super_block *sb, u32 bg_id);

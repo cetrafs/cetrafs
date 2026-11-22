@@ -4897,6 +4897,12 @@ departed:
  * log one extra line. Not worth a lock on a path whose whole purpose is
  * to stop doing expensive things.
  */
+/* TEST ONLY: every dropped free re-arms the backoff, as before audit
+ * 2026-11-22 N-59 -- the control of tests/kernel/pf_backoff_not_rearmed.sh. */
+static bool cetrafs_pf_backoff_rearm_any;
+cetrafs_test_param(pf_backoff_rearm_any, cetrafs_pf_backoff_rearm_any, bool, 0644);
+MODULE_PARM_DESC(pf_backoff_rearm_any, "TEST ONLY: a free dropped inside the queue-full backoff re-arms it");
+
 bool cetrafs_sb_zg_pf_backoff_active(struct super_block *sb, u32 zg_id)
 {
     struct cetrafs_sb_info *sbi = sb->s_fs_info;
@@ -4941,7 +4947,8 @@ bool cetrafs_sb_pf_full_sweep_due(struct super_block *sb, u32 every)
 
 /* Record dropped runs (extents) and their blocks. Returns true the FIRST
  * time in a burst, which is when the caller does the expensive diagnostic. */
-bool cetrafs_sb_zg_pf_note_drop(struct super_block *sb, u32 zg_id, u32 runs, u64 blocks, unsigned int backoff_ms)
+bool cetrafs_sb_zg_pf_note_drop(struct super_block *sb, u32 zg_id, u32 runs, u64 blocks, unsigned int backoff_ms,
+                                bool scanned)
 {
     struct cetrafs_sb_info *sbi = sb->s_fs_info;
     bool first;
@@ -4960,7 +4967,14 @@ bool cetrafs_sb_zg_pf_note_drop(struct super_block *sb, u32 zg_id, u32 runs, u64
      * jiffies+1 instead would still suppress every scan inside the same
      * tick, which is most of a burst, and the control would measure
      * nothing. */
-    WRITE_ONCE(sbi->zg_pf_full_until[zg_id], backoff_ms ? jiffies + msecs_to_jiffies(backoff_ms) + 1 : 0);
+    /* Armed by a scan that FOUND the queue full, and only by one. A drop
+     * made inside the backoff scanned nothing, so it knows nothing new
+     * about the queue: re-arming there slid the deadline on every free
+     * of a sustained delete, the node never scanned again, and every
+     * free after the first full scan leaked to the scrub while the
+     * owner's drain had long made room (audit 2026-11-22 N-59). */
+    if (scanned || first || READ_ONCE(cetrafs_pf_backoff_rearm_any))
+        WRITE_ONCE(sbi->zg_pf_full_until[zg_id], backoff_ms ? jiffies + msecs_to_jiffies(backoff_ms) + 1 : 0);
     return first;
 }
 
