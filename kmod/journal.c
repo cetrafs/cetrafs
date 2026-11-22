@@ -1247,6 +1247,11 @@ static bool cetrafs_journal_op_refusable(struct buffer_head *bh)
 static bool cetrafs_journal_reused_zeroed;
 cetrafs_test_param(journal_reused_zeroed, cetrafs_journal_reused_zeroed, bool, 0644);
 MODULE_PARM_DESC(journal_reused_zeroed, "TEST ONLY: a failed entry write zeroes a taken-over kept entry");
+/* TEST ONLY: a taken-over slot is held after a refused header even when
+ * the payload write went through, as a71b250 did (the control). */
+static bool cetrafs_journal_reused_payload_ignored;
+cetrafs_test_param(journal_reused_payload_ignored, cetrafs_journal_reused_payload_ignored, bool, 0644);
+MODULE_PARM_DESC(journal_reused_payload_ignored, "TEST ONLY: hold a taken-over slot whatever the payload write did");
 static bool cetrafs_journal_entry_getblk_fail;
 cetrafs_test_param(journal_entry_getblk_fail, cetrafs_journal_entry_getblk_fail, bool, 0644);
 MODULE_PARM_DESC(journal_entry_getblk_fail, "TEST ONLY: the next single-block entry cannot get its payload buffer");
@@ -1575,7 +1580,9 @@ journal_failed:
      * (cetrafs_journal_untake_batch()).
      */
     if (reused && !READ_ONCE(cetrafs_journal_reused_zeroed) &&
-        (!entry_refused || (est[1] && cetrafs_refusal_definite(est[1])))) {
+        (!entry_refused || (est[1] && cetrafs_refusal_definite(est[1]) &&
+                            ((est[0] && cetrafs_refusal_definite(est[0])) ||
+                             READ_ONCE(cetrafs_journal_reused_payload_ignored))))) {
         cetrafs_bh_abort_update(bh);
         mutex_lock(&j->lock);
         clear_bit(slot, j->busy);
@@ -1590,6 +1597,21 @@ journal_failed:
             cetrafs_sb_fatal(sb, "journal: the device refused the entry for block %llu",
                              (unsigned long long) bh->b_blocknr);
         return -EIO;
+    }
+    /*
+     * Taken over, and some of ours may have landed: a payload that went
+     * out overwrote the kept entry's, whatever the header did, and the
+     * kept header then fails its payload check at replay and is skipped.
+     * The one redo of a target the device refused is gone, so this is
+     * not an operation that can fail cleanly: said, and the mount stops
+     * below -- not the ENOSPC exit, which ran on with that target
+     * unprotected (the N-67 residual).
+     */
+    if (reused && entry_refused) {
+        pr_err("journal: the entry kept for block %llu after its write failed is lost -- the entry that was to "
+               "supersede it was refused part-way\n",
+               (unsigned long long) bh->b_blocknr);
+        op_block = false;
     }
     /* The entry refused before any of it was written -- or with its
      * header refused, which is what makes an entry -- for an operation
