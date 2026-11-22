@@ -1342,6 +1342,7 @@ static inline int cetrafs_free_data_block(struct super_block *sb, u64 lba)
 int cetrafs_apply_pending_free(struct super_block *sb, u64 lba, u32 count, u32 expect_zg, u64 stamp);
 int cetrafs_bg_bump_free_gen(struct super_block *sb, u32 bg_id, u32 expect_zg);
 u64 cetrafs_pf_stale_drop_count(void);
+u64 cetrafs_pf_apply_left_drop_count(void);
 u64 cetrafs_bg_gen_bump_count(void);
 int cetrafs_count_free_inodes(struct super_block *sb, u64 *out_free);
 int cetrafs_bg_data_block_stats(struct super_block *sb, u32 bg_id, u64 *out_total, u64 *out_free);

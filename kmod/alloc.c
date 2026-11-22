@@ -4300,6 +4300,47 @@ static bool cetrafs_pf_late_copy_corrupt;
 cetrafs_test_param(pf_late_copy_corrupt, cetrafs_pf_late_copy_corrupt, bool, 0644);
 MODULE_PARM_DESC(pf_late_copy_corrupt, "TEST ONLY: a late pending-free copy for a departed group counts as corruption");
 
+/* TEST ONLY: apply a pending free without asking, under alloc_mutex,
+ * whether its group and Zone Group are still this node's, as before
+ * audit 2026-11-22 N-60 (tests/kernel/pf_apply_foreign_group.sh). */
+static bool cetrafs_pf_apply_owner_unchecked;
+cetrafs_test_param(pf_apply_owner_unchecked, cetrafs_pf_apply_owner_unchecked, bool, 0644);
+MODULE_PARM_DESC(pf_apply_owner_unchecked, "TEST ONLY: a pending-free apply skips its ownership check under alloc_mutex");
+static atomic64_t cetrafs_pf_apply_left_drops = ATOMIC64_INIT(0);
+
+u64 cetrafs_pf_apply_left_drop_count(void)
+{
+    return atomic64_read(&cetrafs_pf_apply_left_drops);
+}
+
+/*
+ * Still this node's to free in, asked under alloc_mutex: the question the
+ * direct free asks there (__cetrafs_free_data_extent()). The apply read
+ * the group's owner before taking the mutex and judged only free_gen
+ * under it, and a Zone Group handed off whole keeps both -- its groups
+ * stay its members and nobody's claim moves their generation. A copy
+ * applied after that hand-off cleared a bit in the new owner's bitmap
+ * (audit 2026-11-22, N-60). The owned bit and the cached Zone Group are
+ * cleared under this mutex by a release, so a release either came first
+ * and this refuses, or comes after and finds the bits this left set.
+ * Dropped like a stale stamp: the entry was consumed, its blocks stay
+ * allocated for the scrub.
+ */
+static bool cetrafs_pf_apply_still_ours(struct super_block *sb, u32 bg_id, u32 expect_zg, u64 lba, u32 count)
+{
+    if (READ_ONCE(cetrafs_pf_apply_owner_unchecked))
+        return true;
+    if (cetrafs_sb_bg_is_ours(sb, bg_id) && cetrafs_sb_bg_owner(sb, bg_id) == expect_zg &&
+        (!cetrafs_sb_caw_available(sb) || cetrafs_sb_zg_owned_cached(sb, expect_zg)))
+        return true;
+    atomic64_inc(&cetrafs_pf_stale_drops);
+    atomic64_inc(&cetrafs_pf_apply_left_drops);
+    pr_warn_ratelimited("pending free [%llu +%u): BG %u or its ZG %u left this node before the apply -- dropped, "
+                        "its blocks stay allocated for the scrub\n",
+                        (unsigned long long) lba, count, bg_id, expect_zg);
+    return false;
+}
+
 int cetrafs_apply_pending_free(struct super_block *sb, u64 lba, u32 count, u32 expect_zg, u64 stamp)
 {
     struct cetrafs_bg_geom bg;
@@ -4363,6 +4404,14 @@ int cetrafs_apply_pending_free(struct super_block *sb, u64 lba, u32 count, u32 e
     bit = lba - data_start;
 
     cetrafs_sb_alloc_lock(sb);
+    if (cetrafs_sb_is_fenced(sb)) {
+        cetrafs_sb_alloc_unlock(sb);
+        return -EIO;
+    }
+    if (!cetrafs_pf_apply_still_ours(sb, bg_id, expect_zg, lba, count)) {
+        cetrafs_sb_alloc_unlock(sb);
+        return 1;
+    }
     {
         struct cetrafs_bg_geom now;
 
@@ -4412,6 +4461,10 @@ int cetrafs_apply_pending_free(struct super_block *sb, u64 lba, u32 count, u32 e
             cetrafs_sb_alloc_lock(sb);
             if (cetrafs_sb_is_fenced(sb)) {
                 ret = -EIO;
+                break;
+            }
+            if (!cetrafs_pf_apply_still_ours(sb, bg_id, expect_zg, lba, count)) {
+                ret = 1;
                 break;
             }
             ret = cetrafs_read_bg_geom(sb, bg_id, &now);
