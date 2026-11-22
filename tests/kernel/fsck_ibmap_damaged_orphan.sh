@@ -17,12 +17,13 @@
 #   control: the inode's bit is intact. Setup: fsck -r links it.
 #   damaged: the bit is cleared WITHOUT restamping its sector
 #            (bmap_poke raw), so the bit reads 0 and the sector fails
-#            its checksum. Setup: read-only fsck reports the damaged
-#            sector. Then fsck -r must still link the inode into
+#            its checksum. Setup: the bit reads back 0. Then fsck -r
+#            must still link the inode into
 #            /lost+found with its data, and leave its blocks allocated.
 #
-# DISCRIMINATION (measured on the unfixed code): the damaged case frees
-# the file's blocks and /lost+found does not hold it.
+# DISCRIMINATION (measured on the unfixed code, 2026-11-22): the damaged
+# case leaves the inode out of /lost+found -- its bit read as free, the
+# inode passes skipped it.
 set -euo pipefail
 . "$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)/lib/harness.sh"
 require_root
@@ -39,7 +40,11 @@ volume() {
     local img dev ino blk slot name ibm bit rc=0 out lf=no data=no sum clean=no
     img="$(ct_image 560 "fibdo$1")"
     dev="$(ct_loop "$img")"
-    ct_mkfs_small "$dev" >/dev/null
+    # More inode numbers than one bitmap sector covers: the damaged
+    # sector's numbers are all taken as in use, so /lost+found needs one
+    # from the next sector (with -N 1024 there is none, and the inode
+    # can only be reported unreachable).
+    ct_mkfs "$dev" -z 1 -b 512 -J 0 -N 8192 -f >/dev/null
     ct_mount "$dev" "$MNT"
     require_cetrafs_mount "$MNT"
     head -c 262144 /dev/urandom >"$MNT/victim"
@@ -61,7 +66,10 @@ volume() {
         bit=$((ino - 1))
         "$BPOKE" "$img" "$ibm" "$bit" 0 raw >/dev/null
         blockdev --flushbufs "$dev"
-        ct_fsck "$dev" 2>&1 | grep -q "inode bitmap.*fail their checksum" ||
+        # Read back by the poke, not by fsck: whether fsck reports the
+        # sector is part of what the fix changed, and the setup must hold
+        # on the code before it too.
+        [ "$("$BPOKE" "$img" "$ibm" "$bit")" = 0 ] ||
             { echo "$ino no no 0 no-damage no"; return; }
     fi
     blockdev --flushbufs "$dev"
