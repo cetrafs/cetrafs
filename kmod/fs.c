@@ -39,6 +39,13 @@ static void cetrafs_sb_resweep_work(struct work_struct *w);
 static unsigned int cetrafs_own_claim_resweep_secs;
 void cetrafs_kill_sb(struct super_block *sb);
 bool cetrafs_free_sb_info(struct super_block *sb);
+/* TEST ONLY: the free-inode count runs before the layout walk, over a
+ * first segment the size of the whole table, as before audit 2026-11-22
+ * N-6 -- the control of tests/kernel/grow_inodes_mount_clean.sh. */
+static bool cetrafs_free_inodes_before_walk;
+cetrafs_test_param(free_inodes_before_walk, cetrafs_free_inodes_before_walk, bool, 0644);
+MODULE_PARM_DESC(free_inodes_before_walk, "TEST ONLY: count free inodes before the layout walk, as before");
+
 /* TEST ONLY: sync_fs and unmount sync the device without asking the
  * fence again after their flushes (B-30's control). */
 bool cetrafs_sync_regate_off;
@@ -1212,9 +1219,14 @@ static struct cetrafs_bg_layout *cetrafs_layout_alloc(const cetrafs_superblock_t
         kvfree(l);
         return NULL;
     }
+    /* The first segment's own count, not the table's: until the walk
+     * adds the rest, a reader sized by the whole count would read the
+     * blocks after this segment as its bitmap and records. Grown or
+     * not, the walk sets it again (cetrafs_layout_walk_inodes()). */
     l->isegs[0] = (struct cetrafs_iseg) {
         .first = 1,
-        .count = le32_to_cpu(raw->inodes_count),
+        .count = READ_ONCE(cetrafs_free_inodes_before_walk) ? le32_to_cpu(raw->inodes_count)
+                                                             : (u32) cetrafs_sb_inode_first_count(raw),
         .bmap = le64_to_cpu(raw->inode_bmap_start),
         .table = le64_to_cpu(raw->inode_table_start),
     };
@@ -3711,9 +3723,8 @@ int cetrafs_fill_super(struct super_block *sb, struct fs_context *fc)
             }
         }
 
-        /* Seed the in-memory free-inode cache via one bitmap scan; from
-         * here on alloc.c keeps it in sync incrementally. */
-        {
+        /* TEST ONLY (cetrafs_free_inodes_before_walk): the old order. */
+        if (READ_ONCE(cetrafs_free_inodes_before_walk)) {
             u64 seeded = 0;
             int rc = cetrafs_count_free_inodes(sb, &seeded);
 
@@ -3731,6 +3742,26 @@ int cetrafs_fill_super(struct super_block *sb, struct fs_context *fc)
         {
             int rc = cetrafs_layout_walk(sb, sbi->layout, NULL, NULL);
 
+            if (rc) {
+                cetrafs_free_sb_info(sb);
+                brelse(bh);
+                return rc;
+            }
+        }
+
+        /* Seed the in-memory free-inode cache via one bitmap scan; from
+         * here on alloc.c keeps it in sync incrementally. AFTER the walk:
+         * the inode table's segments are known only from it, and before
+         * it the first segment spanned the whole count, so on a grown
+         * table the scan read the blocks past the first segment's bitmap
+         * as bitmap -- failing their checksums, a damage mark on the
+         * volume for every mount, and a refused mount under
+         * corruption=stop (audit 2026-11-22 N-6). */
+        if (!READ_ONCE(cetrafs_free_inodes_before_walk)) {
+            u64 seeded = 0;
+            int rc = cetrafs_count_free_inodes(sb, &seeded);
+
+            atomic64_set(&sbi->free_inodes, (s64) seeded);
             if (rc) {
                 cetrafs_free_sb_info(sb);
                 brelse(bh);
