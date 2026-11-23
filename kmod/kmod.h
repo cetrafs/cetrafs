@@ -1915,6 +1915,7 @@ struct cetrafs_heartbeat {
 int cetrafs_heartbeat_start(struct super_block *sb, struct cetrafs_heartbeat **out_hb);
 unsigned int cetrafs_heartbeat_interval_secs(struct super_block *sb);
 void cetrafs_heartbeat_stop(struct cetrafs_heartbeat *hb);
+void cetrafs_heartbeat_maint_now(struct cetrafs_heartbeat *hb);
 
 // scrub.c -- background leaked-block reclaim
 struct cetrafs_scrub; /* opaque; owned entirely by scrub.c */

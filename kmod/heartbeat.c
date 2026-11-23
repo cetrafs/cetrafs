@@ -633,6 +633,22 @@ static bool cetrafs_hb_stop_tick_first;
 cetrafs_test_param(hb_stop_tick_first, cetrafs_hb_stop_tick_first, bool, 0644);
 MODULE_PARM_DESC(hb_stop_tick_first, "TEST ONLY: unmount stops the lease renewal before the maintenance pass");
 
+/*
+ * One maintenance pass now, waited for: at unmount, for claims whose
+ * release is queued for the heartbeat's retry (a close whose boundary was
+ * refused, say). The pass is the heartbeat's own work item, so it never
+ * runs beside another; with the heartbeat stopped they would stay on the
+ * device under our id and the unmount could not announce a clean
+ * departure. Not once the heartbeat is stopping.
+ */
+void cetrafs_heartbeat_maint_now(struct cetrafs_heartbeat *hb)
+{
+    if (!hb || READ_ONCE(hb->stopping))
+        return;
+    mod_delayed_work(system_unbound_wq, &hb->maint, 0);
+    flush_delayed_work(&hb->maint);
+}
+
 void cetrafs_heartbeat_stop(struct cetrafs_heartbeat *hb)
 {
     if (!hb)

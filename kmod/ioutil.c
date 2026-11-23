@@ -1401,6 +1401,13 @@ static bool cetrafs_keep_refusal_survivable(struct super_block *sb, struct buffe
     return true;
 }
 
+/* TEST ONLY: a refusal cetrafs_write_bhs_status() hands back in st[]
+ * also stays on the buffer as its write-error flag, as before
+ * (tests/kernel/journal_refused_entry_umount.sh's control). */
+static bool cetrafs_bhs_status_keep_eio;
+cetrafs_test_param(bhs_status_keep_eio, cetrafs_bhs_status_keep_eio, bool, 0644);
+MODULE_PARM_DESC(bhs_status_keep_eio, "TEST ONLY: a status-reported write refusal also leaves the write-error flag");
+
 /* TEST ONLY: the next N buffers cetrafs_write_bhs_status() writes -- a
  * journal entry's payload, then its header -- answer BLK_STS_NOSPC unsent
  * (tests/kernel/dirent_nospc_op.sh). */
@@ -1431,8 +1438,9 @@ static void cetrafs_status_bio_end(struct bio *bio)
  * the DEVICE answered (st[i], an errno): the buffer layer's own completion
  * keeps only "uptodate or not", and a definite "no space" must be told
  * from a write that may have landed (audit 2026-11-14 A-4). Ends each
- * buffer as end_buffer_write_sync() leaves it. A buffer with nothing to
- * write gets st 0.
+ * buffer as end_buffer_write_sync() leaves it, except that a failure is
+ * reported once, in st[], and not again as the buffer's write-error flag.
+ * A buffer with nothing to write gets st 0.
  */
 void cetrafs_write_bhs_status(struct super_block *sb, struct buffer_head **bhs, unsigned int n, int *st)
 {
@@ -1482,7 +1490,8 @@ void cetrafs_write_bhs_status(struct super_block *sb, struct buffer_head **bhs, 
             (cetrafs_meta_write_nospc && cetrafs_meta_write_nospc--) ||
             (cetrafs_journal_entry_nospc && cetrafs_journal_entry_nospc--)) {
             st[i] = -ENOSPC; /* test-only: what a full thin pool answers */
-            set_buffer_write_io_error(bh);
+            if (READ_ONCE(cetrafs_bhs_status_keep_eio))
+                set_buffer_write_io_error(bh);
             clear_buffer_uptodate(bh);
             unlock_buffer(bh);
             continue;
@@ -1507,7 +1516,14 @@ void cetrafs_write_bhs_status(struct super_block *sb, struct buffer_head **bhs, 
             continue;
         st[i] = io[i].status;
         if (st[i]) {
-            set_buffer_write_io_error(bhs[i]);
+            /* The refusal is the caller's, in st[i]: not left behind as
+             * the buffer layer's error flag too, which the next write of
+             * this block through the keeping path read as a NEW device
+             * error and stopped the mount on (an unmount after a boundary
+             * refused for space, then landed). Not uptodate: the device
+             * does not hold these bytes. */
+            if (READ_ONCE(cetrafs_bhs_status_keep_eio))
+                set_buffer_write_io_error(bhs[i]);
             clear_buffer_uptodate(bhs[i]);
         } else {
             set_buffer_uptodate(bhs[i]);

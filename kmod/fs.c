@@ -33,6 +33,8 @@
 #include <linux/overflow.h>
 #include "kmod.h" /* on-disk layout; uses __le* when __KERNEL__ is set */
 
+static unsigned int cetrafs_sb_releases_queued(struct super_block *sb);
+
 /* Forward decls for exported symbols to silence -Wmissing-prototypes */
 int cetrafs_init_fs_context(struct fs_context *fc);
 static void cetrafs_sb_resweep_work(struct work_struct *w);
@@ -4860,8 +4862,7 @@ departed:
         pr_err("%s: own journal area or claims left unsettled -- not announcing a clean departure\n", sb->s_id);
         flush_err = -EIO;
     }
-    unreleased = READ_ONCE(sbi->nsrel_count) + READ_ONCE(sbi->flrel_count) + READ_ONCE(sbi->prrel_count) +
-                 READ_ONCE(sbi->rcrel_count) + (cetrafs_journal_release_pending(sb) ? 1 : 0);
+    unreleased = cetrafs_sb_releases_queued(sb);
     if (sbi->node_registered && !READ_ONCE(sbi->fenced) && !flush_err && unreleased) {
         pr_err("unmount: %u claim release(s) still queued -- not announcing a clean departure; row %u will go "
                "stale and the next mount sweeps them\n",
@@ -9661,6 +9662,22 @@ int cetrafs_init_fs_context(struct fs_context *fc)
  * one it did not pin is gone (nslock.c, nslock_defer_unpinned). */
 atomic_t cetrafs_sb_kills = ATOMIC_INIT(0);
 
+/* TEST ONLY: no maintenance pass for queued releases at unmount, as
+ * before (tests/kernel/journal_refused_entry_umount.sh's control). */
+static bool cetrafs_umount_no_release_pass;
+cetrafs_test_param(umount_no_release_pass, cetrafs_umount_no_release_pass, bool, 0644);
+MODULE_PARM_DESC(umount_no_release_pass, "TEST ONLY: unmount leaves queued claim releases to put_super");
+
+/* Claim releases queued for the heartbeat's retry, and a journal replay
+ * claim not yet released. */
+static unsigned int cetrafs_sb_releases_queued(struct super_block *sb)
+{
+    struct cetrafs_sb_info *sbi = sb->s_fs_info;
+
+    return READ_ONCE(sbi->nsrel_count) + READ_ONCE(sbi->flrel_count) + READ_ONCE(sbi->prrel_count) +
+           READ_ONCE(sbi->rcrel_count) + (cetrafs_journal_release_pending(sb) ? 1 : 0);
+}
+
 void cetrafs_kill_sb(struct super_block *sb)
 {
     atomic_inc(&cetrafs_sb_kills);
@@ -9679,6 +9696,17 @@ void cetrafs_kill_sb(struct super_block *sb)
 
         cetrafs_scrub_stop(sbi->scrub);
         sbi->scrub = NULL;
+    }
+    /* Claim releases still queued for the heartbeat's retry get one pass
+     * now, while every inode can still be looked up and the heartbeat
+     * runs: left for put_super, they kept the unmount from announcing a
+     * clean departure, and the next mount of this node watched its own
+     * row for minutes before re-attaching. */
+    if (sb->s_fs_info && !READ_ONCE(cetrafs_umount_no_release_pass)) {
+        struct cetrafs_sb_info *sbi = sb->s_fs_info;
+
+        if (sbi->node_registered && !READ_ONCE(sbi->fenced) && cetrafs_sb_releases_queued(sb))
+            cetrafs_heartbeat_maint_now(READ_ONCE(sbi->hb));
     }
     /* kill_block_super() will invoke ->put_super() where we free sbi */
     kill_block_super(sb);
