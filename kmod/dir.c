@@ -249,6 +249,30 @@ static bool cetrafs_dirent_loads_moved(s64 snap, s64 *now)
     return *now != snap || atomic_read(&cetrafs_dirent_loads_inflight);
 }
 
+/* TEST ONLY: a dirent block that never verifies marks its directory
+ * before asking whether it is still alive, as before audit 2026-11-22
+ * N-27 -- the control of tests/kernel/dir_dead_block_not_damage.sh. */
+static bool cetrafs_dirent_damage_unjudged;
+cetrafs_test_param(dirent_damage_unjudged, cetrafs_dirent_damage_unjudged, bool, 0644);
+MODULE_PARM_DESC(dirent_damage_unjudged, "TEST ONLY: a bad dirent block marks its directory without asking if it lives");
+
+/* Is directory ino still the incarnation 'generation' and linked? Read
+ * fresh. A record that cannot be read answers yes: the verdict then
+ * stands as before -- this only ever takes a mark back. */
+static bool cetrafs_dirent_owner_alive(struct super_block *sb, u64 ino, u64 generation)
+{
+    cetrafs_inode_t *raw = kmalloc(sizeof(*raw), GFP_NOFS);
+    bool alive = true;
+
+    if (!raw)
+        return true;
+    cetrafs_invalidate_raw_inode(sb, ino);
+    if (!cetrafs_read_raw_inode(sb, ino, raw))
+        alive = (!generation || cetrafs_le64(raw->generation) == generation) && cetrafs_le32(raw->nlink) != 0;
+    kfree(raw);
+    return alive;
+}
+
 static struct buffer_head *__cetrafs_dirent_bread_why(struct super_block *sb, u64 ino, u64 generation, u64 lba,
                                                       int *why)
 {
@@ -294,6 +318,16 @@ static struct buffer_head *__cetrafs_dirent_bread_why(struct super_block *sb, u6
     }
     if (cetrafs_dirent_tear_explained(sb, ino, lba)) {
         *why = -EAGAIN;
+        return NULL;
+    }
+    /* Right before the verdict, the directory itself, fresh (rule 15): a
+     * peer's rmdir frees its blocks, and one reused for anything else
+     * reads as garbage here -- the block of a directory that no longer
+     * exists, not that directory's damage. Marked as damage, it was
+     * counted (and under corruption=stop stopped the mount) for nothing
+     * the caller still has (N-27). */
+    if (ino && !READ_ONCE(cetrafs_dirent_damage_unjudged) && !cetrafs_dirent_owner_alive(sb, ino, generation)) {
+        *why = -ENOENT;
         return NULL;
     }
     pr_err("dirent block %llu failed its tail checksum %d times -- corrupted, not just a torn concurrent read\n",
