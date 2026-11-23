@@ -898,6 +898,12 @@ struct buffer_head *cetrafs_scrub_tree_bread(struct super_block *sb, u64 lba, u3
  * between attempts, about a quarter of a second in all -- and paid only
  * on a mismatch (cetrafs_tear_backoff(); audit 2026-11-11 X1). */
 #define CETRAFS_BLK_TAIL_READ_RETRIES 9
+/* The checksummed RECORD readers -- inode record, node row, ZG record,
+ * BG descriptor -- wait for the same in-flight write a block reader
+ * does, so the same budget. Five attempts were 15 ms of backoff against
+ * the block readers' 255 ms, and a tear past that marked the record
+ * damaged (audit 2026-11-22 N-65, tests/kernel/record_tear_converges.sh). */
+#define CETRAFS_RECORD_READ_RETRIES CETRAFS_BLK_TAIL_READ_RETRIES
 void cetrafs_tear_backoff(int attempt);
 bool cetrafs_tear_injected(void);
 bool cetrafs_record_tear_injected(const char *what);

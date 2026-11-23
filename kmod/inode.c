@@ -328,7 +328,7 @@ static bool cetrafs_lock_mode_ok_test(u32 m)
  * writer always syncs under its own lock, so a torn observation
  * converges on re-read; only a persistent mismatch is -EUCLEAN. Same
  * shape as dir.c's dirent-tail retry. */
-#define CETRAFS_RAW_INODE_READ_RETRIES 5
+#define CETRAFS_RAW_INODE_READ_RETRIES CETRAFS_RECORD_READ_RETRIES
 
 static int __cetrafs_read_raw_inode(struct super_block *sb, u64 ino, cetrafs_inode_t *out, bool zero_ok);
 

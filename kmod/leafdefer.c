@@ -858,7 +858,7 @@ static bool cetrafs_window_read_injected(unsigned int bit, const char *what)
     return true;
 }
 
-#define CETRAFS_WINDOW_READ_TRIES 5
+#define CETRAFS_WINDOW_READ_TRIES CETRAFS_BLK_TAIL_READ_RETRIES
 
 /* One written block read back: 0 matches, 1 does not (a loss), or the
  * read's error once every try failed. */

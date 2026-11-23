@@ -203,7 +203,7 @@ static int __cetrafs_read_zg(struct super_block *sb, u32 zg_id, cetrafs_zone_gro
         /* Read once: the lock and its unlock below are paired on this. */
         bool unlocked = READ_ONCE(cetrafs_zg_read_unlocked);
 
-        for (attempt = 0; attempt < 5; attempt++) {
+        for (attempt = 0; attempt < CETRAFS_RECORD_READ_RETRIES; attempt++) {
             bh = attempt == 0 && first_cached ? cetrafs_bread_retry(sb, le64_to_cpu(raw_sb->zg_table_start) + zg_id)
                                               : cetrafs_bread_uncached_retry(sb, le64_to_cpu(raw_sb->zg_table_start) + zg_id);
             if (!bh)
@@ -252,7 +252,7 @@ static int __cetrafs_read_zg(struct super_block *sb, u32 zg_id, cetrafs_zone_gro
             /* Same backoff as the inode-record and node-row readers: a
              * checksum tear here is a peer's in-flight write, which
              * takes milliseconds, not microseconds (E2). */
-            if (attempt + 1 < 5)
+            if (attempt + 1 < CETRAFS_RECORD_READ_RETRIES)
                 cetrafs_tear_backoff(attempt);
         }
     }

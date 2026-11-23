@@ -137,7 +137,7 @@ static int __cetrafs_read_node_entry(struct super_block *sb, u32 idx, cetrafs_no
     {
         int attempt;
 
-        for (attempt = 0; attempt < 5; attempt++) {
+        for (attempt = 0; attempt < CETRAFS_RECORD_READ_RETRIES; attempt++) {
             /* Retrying read: a NULL here is usually not an I/O error
              * but a concurrent forced-fresh read of the same block
              * clearing uptodate under us. Bailing out turned that into
@@ -162,7 +162,7 @@ static int __cetrafs_read_node_entry(struct super_block *sb, u32 idx, cetrafs_no
 
             /* Same backoff as the inode-record reader: a tear is a
              * peer's in-flight write, which takes milliseconds (E2). */
-            if (attempt + 1 < 5)
+            if (attempt + 1 < CETRAFS_RECORD_READ_RETRIES)
                 cetrafs_tear_backoff(attempt);
         }
     }

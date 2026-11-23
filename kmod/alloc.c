@@ -1835,7 +1835,7 @@ static int cetrafs_read_bg_geom_at(struct super_block *sb, const cetrafs_superbl
     if (bg_id >= le32_to_cpu(raw_sb->block_group_count))
         return -EINVAL;
 
-    for (attempt = 0; attempt < 5; attempt++) {
+    for (attempt = 0; attempt < CETRAFS_RECORD_READ_RETRIES; attempt++) {
         const cetrafs_block_group_t *bg;
         struct buffer_head *bh;
 
@@ -1894,7 +1894,7 @@ static int cetrafs_read_bg_geom_at(struct super_block *sb, const cetrafs_superbl
          * P5 pass that added the backoff to the inode record, node row
          * and ZG record enumerated four and missed this one, which lives
          * in alloc.c rather than with the others.) */
-        if (attempt + 1 < 5)
+        if (attempt + 1 < CETRAFS_RECORD_READ_RETRIES)
             cetrafs_tear_backoff(attempt);
     }
 

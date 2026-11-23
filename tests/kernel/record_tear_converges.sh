@@ -8,11 +8,18 @@
 # so the whole budget was about a millisecond and a tear lasting longer
 # was declared corruption: the volume marked damaged, writes refused
 # (review E2). They now back off like the block readers (X1,
-# cetrafs_tear_backoff()). Every record read tears for 8 ms
+# cetrafs_tear_backoff()). Every record read tears for 60 ms
 # (record_tear_ms) while one operation that reads each kind runs.
 #
-# DISCRIMINATION (2026-11-11, the four readers before this fix): every
-# case reports "corrupted, not just a torn concurrent read".
+# 60 ms, not 8: the backoff alone still gave up after five attempts --
+# 1+2+4+8 = 15 ms -- where a block reader waits 255 ms for the same
+# kind of in-flight write, and a sync write on an array is tens of ms
+# (audit 2026-11-22 N-65). One budget now, CETRAFS_RECORD_READ_RETRIES.
+#
+# DISCRIMINATION (2026-11-11, the four readers before E2): every case
+# reports "corrupted, not just a torn concurrent read". Again
+# (2026-11-23) with the record readers back on five attempts: all four
+# declare a 60 ms tear corruption.
 set -euo pipefail
 . "$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)/lib/harness.sh"
 require_root
@@ -21,6 +28,7 @@ require_module
 
 DEV="$(ct_dev 560 rectear)"
 MNT="$(ct_mnt rectear)"
+TEAR_MS=60
 # torn <case> <kind...> -- <python statement>: arm an 8 ms tear from
 # inside the process, right before the call (interpreter start-up alone
 # outlasts the window), then require the call to succeed, each named
@@ -45,9 +53,9 @@ torn() {
     python3 -I -c '
 import os, sys
 p = open("/sys/module/cetrafs/parameters/record_tear_ms", "w")
-p.write("8"); p.flush()
-'"$1" "$MNT" "$PROC" >/dev/null 2>&1 || rc=$?
-    sleep 0.05
+p.write(sys.argv[3]); p.flush()
+'"$1" "$MNT" "$PROC" "$TEAR_MS" >/dev/null 2>&1 || rc=$?
+    sleep 0.3
     ct_param_set record_tear_ms 0
     local C
     C="$(awk '$1 == "corruptions:" { print $2 }' "$PROC/info")"
@@ -56,9 +64,9 @@ p.write("8"); p.flush()
         dmesg_since "$mark" | grep -q "record_tear_ms: tore a $k read" ||
             { fail "$c: setup: no $k read was torn"; return; }
     done
-    [ "$C" = 0 ] || { fail "$c: the volume counts $C corruption(s) from an 8 ms tear"; return; }
+    [ "$C" = 0 ] || { fail "$c: the volume counts $C corruption(s) from a $TEAR_MS ms tear"; return; }
     if dmesg_since "$mark" | grep -q "corrupted, not just a torn concurrent read"; then
-        fail "$c: a tear of 8 ms was declared corruption: $(dmesg_since "$mark" | grep "corrupted, not just" | head -1)"
+        fail "$c: a tear of $TEAR_MS ms was declared corruption: $(dmesg_since "$mark" | grep "corrupted, not just" | head -1)"
     elif [ "$rc" != 0 ]; then
         fail "$c: the operation failed (exit $rc)"
     else
