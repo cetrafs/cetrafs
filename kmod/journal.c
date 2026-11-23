@@ -546,6 +546,8 @@ static int cetrafs_journal_claim_replay(struct super_block *sb, u64 area_start, 
         {
             int fret = cetrafs_node_fence_peer(sb, owner, "a journal replay claim");
 
+            if (fret == -EBUSY)
+                return -EEXIST; /* it came back: a live replayer, as above (N-16) */
             if (fret)
                 return fret;
         }

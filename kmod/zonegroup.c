@@ -1364,6 +1364,10 @@ static int __cetrafs_zg_try_claim_one(struct super_block *sb,
          * taking its state, so if it is merely slow rather than dead it
          * must fence itself the moment it notices (node.c). */
         ret = cetrafs_node_fence_peer(sb, owner, "a zone group");
+        if (ret == -EBUSY) {
+            ret = 0; /* it came back: owned by a live node, left alone as above (N-16) */
+            goto out_unlock;
+        }
         if (ret)
             goto out_unlock;
         cetrafs_zg_settle_test_stall(sb); /* one-shot: the settle outside the mutex took it */
@@ -1387,6 +1391,14 @@ static int __cetrafs_zg_try_claim_one(struct super_block *sb,
              * (cetrafs_zg_adopt_wanted() keeps it wanted). */
             atomic64_inc(&cetrafs_zg_claim_replay_deferrals);
             ret = -EAGAIN;
+            goto out_unlock;
+        }
+        /* Came back while the replay waited behind another replayer:
+         * live after all, as for the fence above -- not a failure. The
+         * replay's -EBUSY also means a kept entry or a claim held too
+         * long, so the row is asked, not the errno. */
+        if (ret == -EBUSY && cetrafs_node_reattached_since_fence(sb, owner)) {
+            ret = 0;
             goto out_unlock;
         }
         if (ret) {
@@ -1647,6 +1659,8 @@ static int cetrafs_zg_settle_owner(struct super_block *sb, u32 zg_id, u32 my_nod
         return ret == -EBUSY ? 0 : ret; /* came back: the claim judges it again */
     cetrafs_zg_settle_test_stall(sb);
     ret = cetrafs_journal_replay_node_scoped(sb, owner, may_wait || READ_ONCE(cetrafs_zg_claim_always_waits), 0);
+    if (ret == -EBUSY && cetrafs_node_reattached_since_fence(sb, owner))
+        return 0; /* came back while the replay waited: the claim judges it again */
     if (ret == -EEXIST && !may_wait) {
         atomic64_inc(&cetrafs_zg_claim_replay_deferrals);
         return -EAGAIN;
