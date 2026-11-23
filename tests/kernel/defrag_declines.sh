@@ -20,6 +20,7 @@ set -euo pipefail
 . "$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)/lib/harness.sh"
 require_root
 require_module
+require_file_lock_mode "the defragmenter, which nofilelock disables (nofilelock_no_defrag.sh)"
 # This suite needs FRAGMENTED files: an external leaf, a depth-1 tree, an
 # auto-defrag trigger. Speculative run allocation makes a sequential write
 # land contiguously and merge into one extent, so the fragmentation its

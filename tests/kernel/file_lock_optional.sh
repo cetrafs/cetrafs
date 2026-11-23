@@ -7,7 +7,7 @@
 # which must open the image on BOTH nodes during the handoff -- gets -ETXTBSY
 # from the exclusive lock and cannot migrate. `mount -o nofilelock` turns the
 # lock off: this node claims nothing and refuses no open; the caller owns
-# "don't double-write". Mount-time only, status in procfs; defrag pins the lock on demand.
+# "don't double-write". Mount-time only, status in procfs; defrag is off with the lock.
 set -euo pipefail
 . "$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)/lib/harness.sh"
 require_root
@@ -88,16 +88,16 @@ else
 fi
 ct_umount "$MNT"
 
-# The defragmenter was forced off here until audit 2026-11-14 A-14: it
-# now runs under nofilelock for a file no peer has open, pinning the
-# lock on demand (the rules and their refusals: defrag_nofilelock.sh).
-log "with the lock off, the defragmenter still runs on a file no peer has open"
+# nofilelock disables defrag (docs/internal/BASICS.md): allowed from audit
+# 2026-11-14 A-14 until issue 13, it stalled disk moves
+# (nofilelock_no_defrag.sh has the background pass).
+log "with the lock off, the defragmenter is refused"
 mount -t cetrafs -o nofilelock "$DEV" "$MNT"
 : >"$MNT/df"
 DOUT="$("$ROOT/userspace/defrag.cetra" "$MNT/df" 2>&1)" && rc=0 || rc=$?
-[ "$rc" = 0 ] && ! echo "$DOUT" | grep -qiE "not supported|disabled" &&
-    pass "nofilelock: the defrag ioctl runs (${DOUT##*: })" ||
-    fail "nofilelock: defrag was refused (rc $rc): $DOUT"
+[ "$rc" != 0 ] && echo "$DOUT" | grep -q "not supported" &&
+    pass "nofilelock: the defrag ioctl is refused" ||
+    fail "nofilelock: defrag ran (rc $rc): $DOUT"
 ct_umount "$MNT"
 
 # Clear the poked claim so the volume is pristine, and prove a plain default

@@ -28,6 +28,7 @@ set -euo pipefail
 . "$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)/lib/harness.sh"
 require_root
 require_module
+require_file_lock_mode "the defragmenter, which nofilelock disables (nofilelock_no_defrag.sh)"
 for k in defrag_growth_requeue defrag_step_delay_ms defrag_extent_cap; do
     [ -w "/sys/module/cetrafs/parameters/$k" ] || { skip "$k is missing"; ct_exit; }
 done

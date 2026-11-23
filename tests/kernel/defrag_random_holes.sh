@@ -27,6 +27,7 @@ trap 'echo "ABORT at line $LINENO: $BASH_COMMAND (rc=$?)" >&2' ERR
 . "$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)/lib/harness.sh"
 require_root
 require_module
+require_file_lock_mode "the defragmenter, which nofilelock disables (nofilelock_no_defrag.sh)"
 command -v filefrag >/dev/null || { skip "filefrag is missing"; ct_exit; }
 
 BLOCKS=16384                      # 64 MiB at 4 KiB

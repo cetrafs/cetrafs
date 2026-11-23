@@ -113,6 +113,9 @@ EPOCH_AFTER="${ROW_AFTER#*fence_epoch=}"; EPOCH_AFTER="${EPOCH_AFTER%% *}"
     pass "the tick revoked the stale peer's lease before replaying it ($EPOCH_BEFORE -> $EPOCH_AFTER)" ||
     fail "the peer's journal was replayed with its lease intact (fence_epoch still $EPOCH_AFTER): a merely-slow node would keep writing into what we just rewrote"
 
+if ct_nofilelock_run; then
+    skip "auto-defrag from the extent-append path: nofilelock disables defrag (nofilelock_no_defrag.sh)"
+else
 log "auto-defrag triggers from the EXTENT-APPEND path, on a file never closed"
 # The case this filesystem exists for: a VM image open for months. Only
 # the close-time trigger had a test, and a file that is never closed
@@ -174,6 +177,7 @@ kill -0 "$HOLDER" 2>/dev/null &&
 kill "$HOLDER" 2>/dev/null || true
 wait "$HOLDER" 2>/dev/null || true
 exec 9>&-
+fi
 
 log "the volume is consistent after all of it"
 sync

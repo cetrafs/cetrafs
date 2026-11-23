@@ -20,6 +20,7 @@ set -euo pipefail
 . "$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)/lib/harness.sh"
 require_root
 require_module
+require_file_lock_mode "the defragmenter, which nofilelock disables (nofilelock_no_defrag.sh)"
 [ -w /sys/module/cetrafs/parameters/held_unlist_off ] || { skip "held_unlist_off is missing"; ct_exit; }
 IMG="$(ct_image 560 heldun)"
 DEV="$(ct_loop "$IMG")"

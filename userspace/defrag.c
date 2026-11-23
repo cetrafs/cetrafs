@@ -56,7 +56,7 @@ int main(int argc, char **argv)
              * we; the controls file does (defrag, defrag_available). */
             fprintf(stderr,
                     "%s: defragmentation not supported here -- the file has more extents than the\n"
-                    "       mover takes, or defrag is disabled on this mount\n"
+                    "       mover takes, or defrag is disabled on this mount (nofilelock disables it)\n"
                     "       (/proc/fs/cetrafs/<dev>/controls: defrag, defrag_available).\n",
                     argv[1]);
             break;

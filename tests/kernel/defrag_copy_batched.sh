@@ -18,6 +18,7 @@ set -euo pipefail
 . "$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)/lib/harness.sh"
 require_root
 require_module
+require_file_lock_mode "the defragmenter, which nofilelock disables (nofilelock_no_defrag.sh)"
 [ -w /sys/module/cetrafs/parameters/defrag_copy_serial ] || { skip "defrag_copy_serial is missing"; ct_exit; }
 ct_param_set alloc_run_blocks 0
 ct_param_set auto_defrag 0

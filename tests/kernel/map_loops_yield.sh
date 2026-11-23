@@ -89,7 +89,11 @@ log "control (no yields): $C"
 [ "$(get punch "$R")" -ge 1 ] && pass "1: the whole-range punch yielded $(get punch "$R") time(s)" || fail "1: $R"
 [ "$(get unlink "$R")" -ge 1 ] && pass "2: the unlink's free of every extent yielded $(get unlink "$R") time(s)" ||
     fail "2: $R"
-[ "$(get defrag "$R")" -ge 1 ] && pass "3: the defragmentation yielded $(get defrag "$R") time(s)" || fail "3: $R"
+if ct_nofilelock_run; then
+    skip "3: nofilelock disables defrag (nofilelock_no_defrag.sh)"
+else
+    [ "$(get defrag "$R")" -ge 1 ] && pass "3: the defragmentation yielded $(get defrag "$R") time(s)" || fail "3: $R"
+fi
 [ "$(get data "$R")" = ok ] && [ "$(get err "$R")" = 0 ] && pass "the files read back as expected, fsck clean" ||
     fail "data/fsck: $R"
 [ "$(get punch "$C")" = 0 ] && [ "$(get unlink "$C")" = 0 ] && [ "$(get defrag "$C")" = 0 ] &&

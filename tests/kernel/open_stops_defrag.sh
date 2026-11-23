@@ -31,6 +31,7 @@ set -euo pipefail
 export CETRAFS_PEER_PROBE_SECS=3
 require_root
 require_module
+require_file_lock_mode "the defragmenter, which nofilelock disables (nofilelock_no_defrag.sh)"
 for k in open_defrag_wait_off open_defrag_recheck_off open_premutex_stall_ms defrag_copy_stall_ms auto_defrag_begin_delay_ms auto_defrag; do
     [ -w "/sys/module/cetrafs/parameters/$k" ] || { skip "$k is missing"; ct_exit; }
 done
