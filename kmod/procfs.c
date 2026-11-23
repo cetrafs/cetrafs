@@ -175,6 +175,13 @@ static int cetrafs_proc_info_show(struct seq_file *m, void *v)
                    (unsigned long long) rrefused);
     }
     {
+        u64 rdrops, rkept;
+
+        cetrafs_refresh_cache_counters(&rdrops, &rkept);
+        seq_printf(m, "refresh_cache_drops: %llu\nrefresh_cache_kept: %llu\n", (unsigned long long) rdrops,
+                   (unsigned long long) rkept);
+    }
+    {
         u32 fnode = 0;
         u64 fsince = cetrafs_sb_fsck_needed(sb, &fnode);
 

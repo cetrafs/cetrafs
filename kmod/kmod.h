@@ -1784,6 +1784,8 @@ u64 cetrafs_inode_dirent_seq_cached(struct inode *inode);
 void cetrafs_inode_set_dirent_seq_cached(struct inode *inode, u64 seq);
 void cetrafs_inode_note_local_file_seq(struct inode *inode, u64 seq);
 u64 cetrafs_inode_local_file_seq(struct inode *inode);
+bool cetrafs_inode_file_seq_current(struct inode *inode, const cetrafs_inode_t *raw); /* lock.c */
+void cetrafs_refresh_cache_counters(u64 *drops, u64 *kept); /* inode.c */
 u64 cetrafs_inode_local_file_seq_at(struct inode *inode);
 u64 cetrafs_file_cache_drop_count(void);
 u64 cetrafs_verdict_fill_count(void);

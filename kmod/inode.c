@@ -3574,6 +3574,21 @@ static int cetrafs_apply_identity_check(struct inode *inode, const cetrafs_inode
     return 0;
 }
 
+/* TEST ONLY: every refresh drops the page cache and marks the tree cold,
+ * whatever the change stamp says, as before audit 2026-11-22 N-32
+ * (tests/kernel/refresh_keeps_cache.sh). */
+static bool cetrafs_refresh_drops_always;
+cetrafs_test_param(refresh_drops_always, cetrafs_refresh_drops_always, bool, 0644);
+MODULE_PARM_DESC(refresh_drops_always, "TEST ONLY: a refresh drops a file's caches whatever its file_seq");
+static atomic64_t cetrafs_refresh_cache_drops = ATOMIC64_INIT(0);
+static atomic64_t cetrafs_refresh_cache_kept = ATOMIC64_INIT(0);
+
+void cetrafs_refresh_cache_counters(u64 *drops, u64 *kept)
+{
+    *drops = (u64) atomic64_read(&cetrafs_refresh_cache_drops);
+    *kept = (u64) atomic64_read(&cetrafs_refresh_cache_kept);
+}
+
 static int __cetrafs_apply_raw_to_vfs_inode(struct inode *inode, const cetrafs_inode_t *in,
                                             enum cetrafs_apply_decline *why, bool pub_held, u64 epoch)
 {
@@ -3745,6 +3760,19 @@ static int __cetrafs_apply_raw_to_vfs_inode(struct inode *inode, const cetrafs_i
      * device's word that the file may have changed. Cold sends its reads
      * fresh until the reconcile -- which runs where buffers may be
      * dropped -- has thrown the old tree away. */
+    /* Unless the record's change stamp is the one the cache already
+     * stands at: then the file's map and contents did not move, and a
+     * path stat() -- every revalidate comes here -- dropped a reader's
+     * page cache and sent its tree reads to the device for nothing
+     * (audit 2026-11-22 N-32). The stat fields above are applied
+     * either way. */
+    if (S_ISREG(inode->i_mode) && !READ_ONCE(cetrafs_refresh_drops_always) &&
+        cetrafs_inode_file_seq_current(inode, raw)) {
+        atomic64_inc(&cetrafs_refresh_cache_kept);
+        ret = 0;
+        goto out_free;
+    }
+    atomic64_inc(&cetrafs_refresh_cache_drops);
     if (S_ISREG(inode->i_mode))
         cetrafs_inode_mark_tree_cold(inode);
 

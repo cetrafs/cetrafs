@@ -5411,6 +5411,20 @@ static void cetrafs_inode_note_stamp(struct inode *inode, const cetrafs_inode_t 
     }
 }
 
+/* Is the record's file_seq the stamp this node's cache was reconciled at
+ * (cetrafs_inode_note_stamp())? Then nothing in the file sector moved
+ * since: not its size, not its tree, not a peer's write session, which
+ * publishes at its close or fsync. Never true with stamps ignored, or
+ * before any was noted (U64_MAX). */
+bool cetrafs_inode_file_seq_current(struct inode *inode, const cetrafs_inode_t *raw)
+{
+    struct cetrafs_inode_info *ci = CETRAFS_I(inode);
+
+    if (cetrafs_file_seq_ignore || ci->file_seq_cached == U64_MAX)
+        return false;
+    return cetrafs_inode_seq_unwrap(inode, cetrafs_le64(raw->file_seq)) == ci->file_seq_cached;
+}
+
 static bool cetrafs_inode_has_foreign_opener(struct inode *inode, bool inline_reclaim)
 {
     struct super_block *sb = inode->i_sb;
