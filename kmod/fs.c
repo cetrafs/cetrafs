@@ -2720,6 +2720,12 @@ static int cetrafs_layout_bounds_check(struct super_block *sb, const struct cetr
 }
 
 /* cetrafs_sb_layout_refresh() with layout_mutex held. */
+/* TEST ONLY: the mount's first read of block 0 is served from the cache,
+ * as before audit 2026-11-22 N-63 (tests/kernel/mount_sb_read_fresh.sh). */
+static bool cetrafs_sb_first_read_cached;
+cetrafs_test_param(sb_first_read_cached, cetrafs_sb_first_read_cached, bool, 0644);
+MODULE_PARM_DESC(sb_first_read_cached, "TEST ONLY: the mount reads block 0 through the page cache");
+
 static int cetrafs_layout_refresh_locked(struct super_block *sb)
 {
     struct cetrafs_sb_info *sbi = sb->s_fs_info;
@@ -3120,7 +3126,14 @@ int cetrafs_fill_super(struct super_block *sb, struct fs_context *fc)
         return -EINVAL;
     }
 
-    bh = sb_bread(sb, CETRAFS_SB_BLOCK_NR); /* block 0 */
+    /* Forced fresh, as every later look at block 0 is: a cached copy
+     * outlives a reformat done through any other path -- another host on
+     * a shared LUN, another device over the same storage -- and the
+     * registry write below would be aimed by the OLD layout, landing on
+     * the new volume before the post-registration re-check refuses the
+     * mount (audit 2026-11-22 N-63). */
+    bh = READ_ONCE(cetrafs_sb_first_read_cached) ? sb_bread(sb, CETRAFS_SB_BLOCK_NR)
+                                                 : cetrafs_bread_uncached(sb, CETRAFS_SB_BLOCK_NR); /* block 0 */
     if (!bh) {
         pr_err("unable to read superblock (block 0)\n");
         return -EIO;
