@@ -1826,7 +1826,7 @@ void cetrafs_defrag_consider(struct inode *inode, u32 extents, u64 nblocks)
     /* Both switches: the mount-wide one (nothing here may pin a file's
      * exclusive lock) and the janitor's own. The module param stays as
      * the cross-mount default. */
-    if (!d || !cetrafs_auto_defrag || !cetrafs_sb_defrag_enabled(sb) || !cetrafs_sb_auto_defrag_enabled(sb) ||
+    if (!d || !cetrafs_auto_defrag || !cetrafs_sb_defrag_allowed(sb) || !cetrafs_sb_auto_defrag_enabled(sb) ||
         cetrafs_sb_is_fenced(sb) || cetrafs_sb_defrag_draining(sb))
         return;
     /* Regular files only. Directories reach the extent-append path too

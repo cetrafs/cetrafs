@@ -776,10 +776,10 @@ static int cetrafs_proc_controls_show(struct seq_file *m, void *v)
 
     seq_printf(m, "defrag: %s\n", cetrafs_sb_defrag_enabled(sb) ? "on" : "off");
     seq_printf(m, "auto_defrag: %s\n", cetrafs_sb_auto_defrag_enabled(sb) ? "on" : "off");
-    /* Read-only, beside the switch: under nofilelock there is no file
-     * lock to pin and every defrag is refused (cetrafs_lock_defrag_begin()),
-     * whatever the switch says. "defrag: on" alone told an operator it
-     * would run (audit 2026-11-06 L26). */
+    /* Read-only, beside the switch: under nofilelock defrag is refused
+     * (cetrafs_sb_defrag_allowed(), issue 13), whatever the switch says.
+     * "defrag: on" alone told an operator it would run (audit 2026-11-06
+     * L26). */
     seq_printf(m, "defrag_available: %s\n",
                cetrafs_sb_file_lock_enabled(sb) ? "yes"
                : cetrafs_defrag_nofilelock_refused() ? "no (nofilelock: no file lock to pin)"

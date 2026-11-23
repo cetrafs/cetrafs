@@ -7393,6 +7393,16 @@ bool cetrafs_sb_defrag_enabled(struct super_block *sb)
     return sbi && READ_ONCE(sbi->defrag_enabled);
 }
 
+/* May defrag run here at all: the operator's switch above, and a file
+ * lock to pin -- nofilelock disables defrag (docs/internal/BASICS.md;
+ * issue 13). What the janitor and the ioctl ask; the switch alone is
+ * what procfs reads back. */
+bool cetrafs_sb_defrag_allowed(struct super_block *sb)
+{
+    return cetrafs_sb_defrag_enabled(sb) &&
+           (cetrafs_sb_file_lock_enabled(sb) || !cetrafs_defrag_nofilelock_refused());
+}
+
 /* The cross-node exclusive open lock (lock.c). Set once at mount from the
  * nofilelock option; never changes for the life of the mount. */
 bool cetrafs_sb_file_lock_enabled(struct super_block *sb)
@@ -7463,7 +7473,7 @@ const char *cetrafs_sb_copy_state_name(struct super_block *sb)
 }
 
 /* May the BACKGROUND janitor run? A manual defrag.cetra is unaffected
- * by this one; cetrafs_sb_defrag_enabled() is what covers both. */
+ * by this one; cetrafs_sb_defrag_allowed() is what covers both. */
 bool cetrafs_sb_auto_defrag_enabled(struct super_block *sb)
 {
     struct cetrafs_sb_info *sbi = sb->s_fs_info;

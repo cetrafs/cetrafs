@@ -1,11 +1,11 @@
 #!/usr/bin/env bash
 # SPDX-License-Identifier: GPL-2.0-or-later
-# defrag runs on a nofilelock mount, for a file no peer has open
+# the defrag pin's nofilelock path: it excludes peers and gives its lock back
 #
-# nofilelock is what a VM datastore runs (live migration needs it), and
-# defrag refused every file there: the only repair for a layout that
-# fragments hard was off in the mode that fragments it (audit 2026-11-14
-# A-14). Every open honours a lock present on the record in both modes,
+# nofilelock disables defrag (docs/internal/BASICS.md, issue 13), but the
+# pin's path for that mode is kept, reachable under TEST ONLY
+# defrag_nofilelock, as audit 2026-11-14 A-14 built it; this suite keeps
+# it honest while it exists. Every open honours a lock present on the record in both modes,
 # and a nofilelock write-open publishes its presence by a swap that
 # refuses one -- so the pin, the same swap, still excludes peers: one
 # present before it is seen, one arriving after it asks it to step
@@ -22,13 +22,14 @@
 #   4. procfs says defrag is available;
 #   5. fsck clean.
 #
-# DISCRIMINATION: defrag_nofilelock_off=1 (the old refusal): 1 fails.
+# DISCRIMINATION: defrag_nofilelock=0 (the release behaviour, the refusal):
+# 1 fails. That the release refuses is nofilelock_no_defrag.sh's.
 set -euo pipefail
 . "$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)/lib/harness.sh"
 require_root
 require_module
 ct_mode_own
-[ -w /sys/module/cetrafs/parameters/defrag_nofilelock_off ] || { skip "defrag_nofilelock_off is missing"; ct_exit; }
+[ -w /sys/module/cetrafs/parameters/defrag_nofilelock ] || { skip "defrag_nofilelock is missing"; ct_exit; }
 LPOKE="$(ct_helper inode_lock_poke)"
 NODE_POKE="$(ct_helper node_poke)"
 DEV="$(ct_dev 560 dfnl)"
@@ -37,7 +38,7 @@ ct_track mnt "$MNT"
 ct_mkfs_small "$DEV" >/dev/null
 ct_param_set alloc_run_blocks 0
 ct_param_set auto_defrag 0
-ct_param_set defrag_nofilelock_off 0
+ct_param_set defrag_nofilelock 1
 DEFRAG="$ROOT/userspace/defrag.cetra"
 
 frag() { # 12-extent files: each written a block at a time, interleaved
@@ -89,10 +90,10 @@ case "$(sed -n 's/^defrag_available: //p' "$PROC/controls")" in
 yes*) pass "4: defrag_available says yes" ;;
 *) fail "4: defrag_available: $(sed -n 's/^defrag_available: //p' "$PROC/controls")" ;;
 esac
-echo 1 >/sys/module/cetrafs/parameters/defrag_nofilelock_off
+echo 0 >/sys/module/cetrafs/parameters/defrag_nofilelock
 OUT="$("$DEFRAG" "$MNT/c" 2>&1)" && RC=0 || RC=$?
-echo 0 >/sys/module/cetrafs/parameters/defrag_nofilelock_off
-[ "$RC" != 0 ] && pass "control: the old refusal refuses the same run" || fail "control: defrag_nofilelock_off did not refuse"
+echo 1 >/sys/module/cetrafs/parameters/defrag_nofilelock
+[ "$RC" != 0 ] && pass "control: without the knob the same run is refused" || fail "control: defrag ran under nofilelock without defrag_nofilelock"
 umount "$MNT"
 "$LPOKE" "$DEV" "$G" --unreader 5 >/dev/null
 "$NODE_POKE" "$DEV" 5 0 00 0 >/dev/null # the planted peer leaves: fsck would watch its row

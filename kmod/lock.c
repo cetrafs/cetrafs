@@ -7888,15 +7888,17 @@ u32 cetrafs_defrag_pin_count(void)
     return (u32) atomic_read(&cetrafs_defrag_pins);
 }
 
-/* TEST ONLY: refuse every defrag under nofilelock, as before A-14 -- the
- * control of tests/kernel/defrag_nofilelock.sh. */
-static bool cetrafs_defrag_nofilelock_off;
-cetrafs_test_param(defrag_nofilelock_off, cetrafs_defrag_nofilelock_off, bool, 0644);
-MODULE_PARM_DESC(defrag_nofilelock_off, "TEST ONLY: refuse defrag on a nofilelock mount, as before");
+/* TEST ONLY: defrag runs on a nofilelock mount, for a file no peer has
+ * open, as it did from audit 2026-11-14 A-14 until issue 13 -- the pin's
+ * nofilelock path (tests/kernel/defrag_nofilelock.sh) and the control of
+ * tests/kernel/nofilelock_no_defrag.sh. */
+static bool cetrafs_defrag_nofilelock;
+cetrafs_test_param(defrag_nofilelock, cetrafs_defrag_nofilelock, bool, 0644);
+MODULE_PARM_DESC(defrag_nofilelock, "TEST ONLY: defrag runs on a nofilelock mount, as 0.10.x did");
 
 bool cetrafs_defrag_nofilelock_refused(void)
 {
-    return READ_ONCE(cetrafs_defrag_nofilelock_off);
+    return !READ_ONCE(cetrafs_defrag_nofilelock);
 }
 
 int cetrafs_lock_defrag_begin(struct inode *inode)
@@ -7920,10 +7922,16 @@ int cetrafs_lock_defrag_begin(struct inode *inode)
      * check after it, and a peer arriving after it asks it to step
      * aside. What nofilelock changes is only who holds the lock -- never
      * a local writer, so the pin always claims it, and always gives it
-     * back (defrag_owns_lock). It refused every run: the production
-     * migration mode had no repair for fragmentation at all (audit
-     * 2026-11-14 A-14). TEST ONLY defrag_nofilelock_off: the old refusal. */
-    if (!lock_on && READ_ONCE(cetrafs_defrag_nofilelock_off))
+     * back (defrag_owns_lock).
+     *
+     * And still refused: nofilelock disables defrag (docs/internal/
+     * BASICS.md). Allowed there, the background pass kept taking a VM
+     * image qemu was filling -- each pass holding the file's lock -- and
+     * a disk move ran at a few MB/s against hundreds (issue 13). The
+     * path above is kept, reachable only under TEST ONLY
+     * defrag_nofilelock; cetrafs_sb_defrag_allowed() stops the janitor
+     * and the ioctl before they get here. */
+    if (!lock_on && cetrafs_defrag_nofilelock_refused())
         return -EOPNOTSUPP;
 
     ret = cetrafs_sb_get_node_id(sb, &my_node_id);

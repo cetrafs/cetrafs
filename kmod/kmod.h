@@ -431,6 +431,7 @@ void cetrafs_lock_cold_drop_parked(struct super_block *sb, struct list_head *par
  * _auto_defrag_enabled() gates only the background janitor. */
 bool cetrafs_sb_defrag_enabled(struct super_block *sb);
 bool cetrafs_sb_auto_defrag_enabled(struct super_block *sb);
+bool cetrafs_sb_defrag_allowed(struct super_block *sb);
 bool cetrafs_sb_file_lock_enabled(struct super_block *sb);
 /* fs.c: block 0's copy as found at mount (A-7) */
 #define CETRAFS_SB_COPY_OK    0

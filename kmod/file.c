@@ -10575,7 +10575,7 @@ static long cetrafs_defrag_ioctl(struct file *file, struct cetrafs_defrag_stats 
      * defrag.cetra is told why. This is the gate that makes "nothing on
      * this mount pins a file's exclusive lock for an optimisation" true
      * -- the janitor's own switch leaves this path open. */
-    if (!cetrafs_sb_defrag_enabled(inode->i_sb)) {
+    if (!cetrafs_sb_defrag_allowed(inode->i_sb)) { /* the switch, and nofilelock (issue 13) */
         ret = -EOPNOTSUPP;
         goto out_drop_write;
     }
