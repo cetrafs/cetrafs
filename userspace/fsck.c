@@ -3552,6 +3552,14 @@ static void fsck_walk_leaf(struct cetrafs_utw *w, const cetrafs_extent_t *arr, u
     }
 }
 
+/* A tree block named a second time: not walked again (extwalk.h), but
+ * marked again, so the content pass reports the block as referenced more
+ * than once -- what it said when the walk went through it every time. */
+static void fsck_walk_shared(struct cetrafs_utw *w, uint64_t lba, int level)
+{
+    fsck_walk_node(w, lba, level);
+}
+
 static const struct cetrafs_utw_ops fsck_walk_ops = {
     .read = fsck_walk_read,
     .tail = fsck_check_tail,
@@ -3559,7 +3567,11 @@ static const struct cetrafs_utw_ops fsck_walk_ops = {
     .node = fsck_walk_node,
     .empty = fsck_walk_empty,
     .leaf = fsck_walk_leaf,
+    .shared = fsck_walk_shared,
 };
+
+/* Extent tree blocks the walks read, for CETRAFS_FSCK_TEST_TREE_READS. */
+static uint64_t fsck_tree_reads;
 
 /* Every extent of a record's tree, at any depth, sorted by logical block:
  * what a directory's walk reads its blocks in. A tree block that cannot be
@@ -3574,6 +3586,14 @@ struct fsck_flat {
 static void fsck_flat_read(struct cetrafs_utw *w, uint64_t lba, uint8_t *blk)
 {
     pread_all(((struct fsck_flat *) w->ctx)->fd, blk, CETRAFS_BLOCK_SIZE, (off_t) lba * CETRAFS_BLOCK_SIZE);
+}
+
+/* A directory whose tree names a block twice: its names are not read
+ * twice (the content pass reports the block). */
+static void fsck_flat_shared(struct cetrafs_utw *w, uint64_t lba, int level)
+{
+    (void) lba, (void) level;
+    ((struct fsck_flat *) w->ctx)->whole = 0;
 }
 
 static int fsck_flat_bad(struct cetrafs_utw *w, uint64_t lba, int level, enum cetrafs_utw_bad why, const uint8_t *blk,
@@ -3612,6 +3632,7 @@ static const struct cetrafs_utw_ops fsck_flat_ops = {
     .tail = fsck_check_tail,
     .bad = fsck_flat_bad,
     .leaf = fsck_flat_leaf,
+    .shared = fsck_flat_shared,
 };
 
 static int fsck_ext_lblk_cmp(const void *a, const void *b)
@@ -3627,9 +3648,10 @@ static cetrafs_extent_t *fsck_tree_extents(int fd, uint64_t total_blocks, const 
                                            int *whole)
 {
     struct fsck_flat f = {fd, NULL, 0, 0, 1};
-    struct cetrafs_utw w = {&fsck_flat_ops, total_blocks, &f};
+    struct cetrafs_utw w = {&fsck_flat_ops, total_blocks, &f, NULL, 0};
 
     (void) cetrafs_utw_walk(&w, in);
+    fsck_tree_reads += w.reads;
     if (f.n)
         qsort(f.arr, f.n, sizeof(*f.arr), fsck_ext_lblk_cmp);
     *n = f.n;
@@ -3637,8 +3659,15 @@ static cetrafs_extent_t *fsck_tree_extents(int fd, uint64_t total_blocks, const 
     return f.arr;
 }
 
+static void fsck_print_tree_reads(void)
+{
+    fprintf(stderr, "fsck: extent tree blocks read: %" PRIu64 "\n", fsck_tree_reads);
+}
+
 int main(int argc, char **argv)
 {
+    if (cetrafs_test_env("CETRAFS_FSCK_TEST_TREE_READS"))
+        atexit(fsck_print_tree_reads);
     const char *dev = NULL;
 
     for (int i = 1; i < argc; ++i) {
@@ -5719,9 +5748,10 @@ int main(int argc, char **argv)
             }
             {
                 struct fsck_walkctx wc = {fd, ino, &in, &rc, &problems, &extents_seen, 1};
-                struct cetrafs_utw w = {&fsck_walk_ops, cetrafs_le64(sb.total_blocks), &wc};
+                struct cetrafs_utw w = {&fsck_walk_ops, cetrafs_le64(sb.total_blocks), &wc, NULL, 0};
 
                 (void) cetrafs_utw_walk(&w, &in);
+                fsck_tree_reads += w.reads;
                 tree_ok = wc.tree_ok;
             }
 
