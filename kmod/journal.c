@@ -2867,6 +2867,21 @@ enum cetrafs_journal_verdict {
  * may move between the verdict and the redo before it is refused. */
 #define CETRAFS_JOURNAL_TORN_RETRIES 8
 #define CETRAFS_JOURNAL_MOVED_RETRIES 3
+/* The torn waits of one replay share that 2.5 s: a write in flight lands
+ * in milliseconds wherever it is, and a crash's tear never does, so a
+ * crash that tore many targets paid 2.5 s for each -- minutes, at mount,
+ * before the heartbeat exists (audit 2026-11-22 N-55). Past the shared
+ * budget every torn target still gets the first re-reads (10+20+40 ms),
+ * which outlast a sync write on an array. */
+#define CETRAFS_JOURNAL_TORN_BUDGET_MS 2550U
+#define CETRAFS_JOURNAL_TORN_FLOOR 3
+
+/* TEST ONLY: each torn target waits its own 2.5 s and the entry loop
+ * does not beat, as before audit 2026-11-22 N-55
+ * (tests/kernel/journal_replay_torn_budget.sh). */
+static bool cetrafs_journal_torn_unshared;
+cetrafs_test_param(journal_torn_unshared, cetrafs_journal_torn_unshared, bool, 0644);
+MODULE_PARM_DESC(journal_torn_unshared, "TEST ONLY: every torn replay target waits the full backoff; no beat between entries");
 
 /*
  * Is the target still a block of the entry's KIND? A guarded entry is
@@ -3110,6 +3125,9 @@ static int ___cetrafs_journal_replay_node(struct super_block *sb, u32 node_id, b
     int kept_ret = 0;
     bool dirty = false, claimed = false;
     int ret, werr_consume;
+    unsigned int torn_budget_ms = CETRAFS_JOURNAL_TORN_BUDGET_MS; /* shared by every entry (N-55) */
+    const bool torn_unshared = READ_ONCE(cetrafs_journal_torn_unshared);
+    int beat_ret = 0;
 
     /* No such row, so no such journal: nothing to replay
      * (cetrafs_node_fence_peer_full()). */
@@ -3424,6 +3442,17 @@ static int ___cetrafs_journal_replay_node(struct super_block *sb, u32 node_id, b
             st[s] = CETRAFS_JR_PENDING; /* a new pass looks again */
         if (st[s] != CETRAFS_JR_PENDING)
             continue;
+        /* A replay at mount runs before the heartbeat does: renew when a
+         * beat is due, or the lease registration armed runs out under a
+         * long one and peers may reclaim from a node still mounting
+         * (N-55). A no-op once the heartbeat exists -- it renews on its
+         * own work, whatever this one is doing. Fenced meanwhile: stop. */
+        if (!torn_unshared && !beat_ret)
+            beat_ret = cetrafs_sb_mount_beat(sb);
+        if (beat_ret) {
+            ret = beat_ret;
+            goto out_free;
+        }
 
         blocked = cetrafs_journal_blocked_by_older(entries, st, s);
         if (blocked == CETRAFS_JR_DEFERRED) {
@@ -3564,7 +3593,9 @@ static int ___cetrafs_journal_replay_node(struct super_block *sb, u32 node_id, b
                  * milliseconds and a crash's tear never does: re-read with
                  * backoff (~2.5 s in all) before believing it.
                  */
-                if (v == CETRAFS_JV_TORN && torn_tries < CETRAFS_JOURNAL_TORN_RETRIES) {
+                if (v == CETRAFS_JV_TORN && torn_tries < CETRAFS_JOURNAL_TORN_RETRIES &&
+                    (torn_unshared || torn_tries < CETRAFS_JOURNAL_TORN_FLOOR ||
+                     torn_budget_ms >= (10U << torn_tries))) {
                     if (!torn_tries)
                         pr_info("journal replay: node %u txn %llu target block %llu reads torn -- re-reading in "
                                 "case a live writer is mid-write\n",
@@ -3573,7 +3604,15 @@ static int ___cetrafs_journal_replay_node(struct super_block *sb, u32 node_id, b
                     brelse(tbh);
                     tbh = NULL;
                     msleep(10U << torn_tries);
+                    torn_budget_ms -= min(torn_budget_ms, 10U << torn_tries);
                     torn_tries++;
+                    if (!torn_unshared)
+                        beat_ret = cetrafs_sb_mount_beat(sb);
+                    if (beat_ret) {
+                        brelse(pbh);
+                        ret = beat_ret;
+                        goto keep; /* and the next entry stops the replay */
+                    }
                     continue;
                 }
                 if (v != CETRAFS_JV_APPLY && v != CETRAFS_JV_TORN)
@@ -3979,6 +4018,10 @@ keep:
         kept++;
         kept_ret = kept_ret ?: ret;
         ret = 0;
+    }
+    if (beat_ret) { /* fenced under the last entry's wait */
+        ret = beat_ret;
+        goto out_free;
     }
     if (!deferred)
         break;
