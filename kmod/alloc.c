@@ -3084,6 +3084,12 @@ int cetrafs_alloc_data_run_resv(struct super_block *sb, u32 bg_id, u64 count, u6
                         pr_err_ratelimited("defrag run alloc: could not give back bit %llu of BG %u (%d) -- left "
                                            "allocated for the scrub\n",
                                            (unsigned long long) (run_start + b), bg_id, rc);
+                    /* As the claim: yield at a bitmap block boundary,
+                     * holding nothing (class 13). */
+                    if (!((run_start + b) % CETRAFS_BMAP_BLOCK_BITS)) {
+                        cetrafs_bmap_hold_end(sb, &h);
+                        cond_resched();
+                    }
                 }
                 cetrafs_bmap_hold_end(sb, &h);
                 ret = err;

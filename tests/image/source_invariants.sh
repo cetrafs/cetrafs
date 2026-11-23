@@ -2149,6 +2149,7 @@ printf 'void cetrafs_thing_cache_drop(struct inode *inode)\n{\n    ci->valid = f
 log "checking every cache lookup is keyed on an identity, not a summary (class 51)"
 C51_REG='cetrafs_inode_ext_cache_lookup calls:cetrafs_ext_key_matches
 cetrafs_ext_key_matches key:file_seq
+cetrafs_inode_file_seq_current key:file_seq_cached
 cetrafs_dir_needs_fresh key:dirent_seq
 cetrafs_verdict_current key:verdict_gen
 cetrafs_inode_foreign_opener_cached calls:cetrafs_verdict_current_recent
