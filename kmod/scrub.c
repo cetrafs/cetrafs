@@ -620,36 +620,47 @@ static bool cetrafs_scrub_damaged_aborts;
 cetrafs_test_param(scrub_damaged_aborts, cetrafs_scrub_damaged_aborts, bool, 0644);
 MODULE_PARM_DESC(scrub_damaged_aborts, "TEST ONLY: a damaged data-bitmap block aborts the whole scrub cycle");
 
+struct scrub_read_bitmap_ctx {
+    const struct scrub_bg *b;
+    u8 *buf;
+};
+
+static int scrub_read_bitmap_blk(u64 blk, struct buffer_head *bh, u64 off, u64 nb, void *ctx)
+{
+    struct scrub_read_bitmap_ctx *c = ctx;
+
+    if (!bh) {
+        /* Damaged: the group has no candidates this cycle -- a block it
+         * cannot read may hold set bits, and a set bit read as clear
+         * makes a live block look leaked. */
+        atomic64_inc(&cetrafs_scrub_bmap_damaged);
+        pr_warn_ratelimited("scrub: BG %u's data bitmap block %llu fails its checksum -- the group has no "
+                            "candidates this cycle (fsck)\n",
+                            c->b->bg_id, (unsigned long long) (c->b->bmap_lba + blk));
+        return READ_ONCE(cetrafs_scrub_damaged_aborts) ? -EIO : -EUCLEAN;
+    }
+    memcpy(c->buf + blk * CETRAFS_BLOCK_SIZE, bh->b_data, CETRAFS_BLOCK_SIZE);
+    return 0;
+}
+
 static u8 *scrub_read_bitmap(struct super_block *sb, const struct scrub_bg *b, int *errp)
 {
-    u8 *buf = kvmalloc(b->bmap_blocks * CETRAFS_BLOCK_SIZE, GFP_NOFS);
-    u64 i;
+    struct scrub_read_bitmap_ctx c = {.b = b, .buf = kvmalloc(b->bmap_blocks * CETRAFS_BLOCK_SIZE, GFP_NOFS)};
+    int err;
 
     *errp = -ENOMEM;
-    if (!buf)
+    if (!c.buf)
         return NULL;
-    for (i = 0; i < b->bmap_blocks; i++) {
-        int err = -EIO;
-        struct buffer_head *bh = cetrafs_bmap_bread(sb, b->bmap_lba + i, 0, CETRAFS_BMAP_BUF_BITS, &err);
-
-        if (!bh) {
-            kvfree(buf);
-            *errp = err == -EUCLEAN ? -EUCLEAN : -EIO;
-            if (*errp == -EUCLEAN) {
-                atomic64_inc(&cetrafs_scrub_bmap_damaged);
-                pr_warn_ratelimited("scrub: BG %u's data bitmap block %llu fails its checksum -- the group has no "
-                                    "candidates this cycle (fsck)\n",
-                                    b->bg_id, (unsigned long long) (b->bmap_lba + i));
-                if (READ_ONCE(cetrafs_scrub_damaged_aborts))
-                    *errp = -EIO;
-            }
-            return NULL;
-        }
-        memcpy(buf + i * CETRAFS_BLOCK_SIZE, bh->b_data, CETRAFS_BLOCK_SIZE);
-        brelse(bh);
+    /* Every block, whole: the walk's bit count only bounds it. */
+    err = cetrafs_bmap_walk(sb, b->bmap_lba, b->bmap_blocks, b->bmap_blocks * CETRAFS_BMAP_BLOCK_BITS, 0, 0,
+                            scrub_read_bitmap_blk, &c);
+    if (err) {
+        kvfree(c.buf);
+        *errp = err == -EUCLEAN ? -EUCLEAN : -EIO;
+        return NULL;
     }
     *errp = 0; /* the callers return it: a group with no candidates is not -ENOMEM */
-    return buf;
+    return c.buf;
 }
 
 static inline bool scrub_bit_set(const u8 *buf, u64 bit)

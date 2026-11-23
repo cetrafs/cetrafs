@@ -741,8 +741,15 @@ SAMPLE="$(ct_tmp bitmap-walk-sample)"
 printf '%s\n' 'static long scan(void)' '{' '    for (blk = 0; blk < nblocks; blk++) {' '        test(blk);' '    }' '}' >"$SAMPLE"
 [ -n "$(bitmap_walks_without_resched "$SAMPLE")" ] ||
     fail "bitmap walks: the check does not flag the known-bad sample"
+# The data-bitmap walks (first fit, run search, free count, the scrub's
+# copy, the shadow seed) go through cetrafs_bmap_walk() (kmod.h), whose
+# loop must yield itself (audit 2026-11-22 N-244).
+WALKER="$(awk '/^static __always_inline int cetrafs_bmap_walk\(/ { on = 1 } on { print } on && /^}/ { exit }' "$K/kmod.h")"
+[ -n "$WALKER" ] || fail "bitmap walks: cetrafs_bmap_walk() not found in kmod.h -- the scan is not seeing the tree"
+grep -q 'cond_resched();' <<<"$WALKER" && pass "bitmap walks: cetrafs_bmap_walk() reschedules on every block" ||
+    fail "bitmap walks: cetrafs_bmap_walk() never reschedules (class 13, audit R18)"
 NWALK="$(grep -cE 'for \(blk = 0; blk < ' "$K/alloc.c")"
-[ "$NWALK" -ge 4 ] || fail "bitmap walks: found only $NWALK block walks in alloc.c -- the scan is not seeing the tree"
+[ "$NWALK" -ge 2 ] || fail "bitmap walks: found only $NWALK block walks in alloc.c -- the scan is not seeing the tree"
 HITS="$(bitmap_walks_without_resched "$K/alloc.c" | sed "s|$K/||")"
 [ -z "$HITS" ] && pass "bitmap walks: all $NWALK block-by-block walks in alloc.c reschedule" ||
     fail "bitmap walks: no cond_resched() in the walk at: $(echo $HITS) (class 13, audit R18)"
@@ -2423,8 +2430,7 @@ cetrafs_alloc_data_block_near below:one-group-full-the-pick-chooses-again
 cetrafs_alloc_data_run_resv below:one-group-has-no-run
 cetrafs_alloc_pick_run_resv final:defrag-only-cannot-defrag-now-is-not-user-visible
 cetrafs_bg_claim_free below:nothing-to-claim-the-pick-goes-on-to-wait-for-a-release
-cetrafs_bitmap_alloc_bit below:one-bitmap
-cetrafs_bitmap_find_run below:one-bitmap
+cetrafs_find_run_blk below:one-bitmap
 cetrafs_bitmap_try_alloc_exact below:one-bitmap
 cetrafs_bmap_cas_mutate below:one-region-the-caller-tries-the-next
 cetrafs_inode_bitmap_cas_alloc final:every-inode-number-in-use-a-free-in-flight-holds-its-number-until-published

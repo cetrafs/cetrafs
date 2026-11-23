@@ -2103,6 +2103,54 @@ static inline const void *cetrafs_bmap_bits_or_all(const struct buffer_head *bh)
         return bh->b_data;
     return cetrafs_bmap_all_set;
 }
+
+/*
+ * Walk a data bitmap -- 'nbits' bits in 'nblocks' blocks at 'bmap_lba' --
+ * from bit 'from' on. Each block is read and handed to 'fn' with the
+ * buffer offset the walk starts at in it ('off': from's offset in the
+ * first block, 0 after) and the bits it holds ('nb'). A damaged block
+ * (-EUCLEAN) is handed over as a NULL buffer: what damage MEANS --
+ * nothing free in it, the whole walk off, the group skipped -- differs
+ * by walker, and each says so in its fn rather than in a copy of this
+ * loop (audit 2026-11-22 N-244: six copies, each deciding it inline).
+ * Any other read error ends the walk with it.
+ *
+ * CETRAFS_BW_SCAN: a walk whose refusal is a miss
+ * (cetrafs_bmap_bread_scan()); CETRAFS_BW_HELD: check only the sectors
+ * holding the block's 'nb' bits. fn returns 0 to go on, CETRAFS_BW_STOP
+ * to end the walk there (returned), or an errno (returned). 0 when the
+ * bitmap ended. Yields on every block: a whole-bitmap walk under
+ * alloc_mutex is seconds of CPU on a large Block Group (audit R18).
+ * Inline, so fn is a direct call: alloc_bit is on the allocation path.
+ */
+#define CETRAFS_BW_SCAN 1U
+#define CETRAFS_BW_HELD 2U
+#define CETRAFS_BW_STOP 1
+static __always_inline int cetrafs_bmap_walk(struct super_block *sb, u64 bmap_lba, u64 nblocks, u64 nbits, u64 from,
+                                             unsigned int flags,
+                                             int (*fn)(u64 blk, struct buffer_head *bh, u64 off, u64 nb, void *ctx),
+                                             void *ctx)
+{
+    u64 blk = cetrafs_bmap_blk(from), off = cetrafs_bmap_off(from);
+
+    for (; blk < nblocks && blk * CETRAFS_BMAP_BLOCK_BITS < nbits; blk++, off = 0) {
+        const u64 nb = min_t(u64, CETRAFS_BMAP_BLOCK_BITS, nbits - blk * CETRAFS_BMAP_BLOCK_BITS);
+        const u64 hi = (flags & CETRAFS_BW_HELD) ? cetrafs_bmap_off(nb - 1) + 1 : CETRAFS_BMAP_BUF_BITS;
+        struct buffer_head *bh;
+        int err = -EIO, v;
+
+        cond_resched();
+        bh = (flags & CETRAFS_BW_SCAN) ? cetrafs_bmap_bread_scan(sb, bmap_lba + blk, off, hi, &err)
+                                       : cetrafs_bmap_bread(sb, bmap_lba + blk, off, hi, &err);
+        if (!bh && err != -EUCLEAN)
+            return err;
+        v = fn(blk, bh, off, nb, ctx);
+        brelse(bh);
+        if (v)
+            return v;
+    }
+    return 0;
+}
 enum { BH_CetraDeferred = BH_PrivateStart, BH_CetraTailStale, BH_CetraHeld, BH_CetraBmap };
 BUFFER_FNS(CetraDeferred, cetra_deferred)
 /* ioutil.c: an allocation-bitmap block modified in cache and HELD from
