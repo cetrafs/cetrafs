@@ -3541,7 +3541,7 @@ int main(int argc, char **argv)
         fprintf(stderr, "                 WITHOUT replaying it (implies -r). Only for an area a mount\n");
         fprintf(stderr, "                 cannot replay (an unreadable block): the redo is lost, and the\n");
         fprintf(stderr, "                 blocks it would have repaired are reported by the walk after.\n");
-        fprintf(stderr, "  --live         check a volume other nodes have mounted, read-only and without\n");
+        fprintf(stderr, "  --live         check a mounted volume (this host's mount too), read-only and without\n");
         fprintf(stderr, "                 claiming it: up to %d walks; a finding counts only if every\n", FSCK_LIVE_PASSES);
         fprintf(stderr, "                 walk repeats it (a peer's write in flight does not).\n");
         fprintf(stderr, "exit: 0 clean, 1 problems found, 2 usage, 3 could not examine the device\n");
@@ -3555,8 +3555,14 @@ int main(int argc, char **argv)
         return fsck_live_check(dev);
 
     /* Safety first: never check a device a kernel on this system is
-     * concurrently mutating -- see devutil.h. */
-    {
+     * concurrently mutating -- see devutil.h. Except a --live walk: it
+     * exists for a volume being mutated, reads it read-only, claims
+     * nothing, and syncs this host's own mounts first
+     * (fsck_live_sync_local()). Refused here, a node could only check
+     * the volume from a host that did not mount it, and the sync of a
+     * local mount was unreachable (audit 2026-11-22 N-39). The knob is
+     * the control of tests/kernel/fsck_live_local_mount.sh. */
+    if (!live_pass || cetrafs_test_env("CETRAFS_TEST_FSCK_LIVE_REFUSE_LOCAL")) {
         char where[4096];
 
         if (cetrafs_device_mounted(dev, where, sizeof(where))) {
@@ -3639,7 +3645,7 @@ int main(int argc, char **argv)
 
         if (fstat(fd, &dst) == 0 && S_ISBLK(dst.st_mode))
             (void) ioctl(fd, BLKFLSBUF, 0);
-    } else if (live_pass) {
+    } else if (live_pass && !cetrafs_test_env("CETRAFS_TEST_FSCK_LIVE_NO_SYNC")) {
         fsck_live_sync_local(dev);
     }
     (void) posix_fadvise(fd, 0, 0, POSIX_FADV_DONTNEED);
