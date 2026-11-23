@@ -1363,6 +1363,7 @@ int cetrafs_bg_mount_info(struct super_block *sb, const cetrafs_superblock_t *ra
  * Replaces asking a Zone Group for its contiguous range of members
  * (docs/internal/BG-OWNERSHIP-DESIGN.md). */
 u32 cetrafs_sb_bg_owner(struct super_block *sb, u32 bg_id);
+bool cetrafs_sb_bg_bmap_span(struct super_block *sb, u32 bg_id, u64 *out_lba, u64 *out_blocks);
 void cetrafs_sb_set_bg_owner(struct super_block *sb, u32 bg_id, u32 zg_id);
 /* The LBA of a Block Group's descriptor. The table is a chain, so this
  * is no longer bg_table_start + bg_id. docs/internal/BG-OWNERSHIP-DESIGN.md */

@@ -3552,6 +3552,13 @@ static void cetrafs_bmap_flush_q_run(struct super_block *sb, struct cetrafs_bmap
     q->n = 0;
 }
 
+/* TEST ONLY: the boundary flush fails a group whose descriptor does not
+ * read, as before audit 2026-11-22 N-44 -- the control of
+ * tests/kernel/bmap_flush_desc_unreadable.sh. */
+static bool cetrafs_bmap_flush_needs_desc;
+cetrafs_test_param(bmap_flush_needs_desc, cetrafs_bmap_flush_needs_desc, bool, 0644);
+MODULE_PARM_DESC(bmap_flush_needs_desc, "TEST ONLY: the bitmap flush fails a group whose descriptor does not read");
+
 static int __cetrafs_alloc_flush_bitmaps(struct super_block *sb)
 {
     const cetrafs_superblock_t *raw_sb = cetrafs_sb_raw(sb);
@@ -3589,7 +3596,7 @@ static int __cetrafs_alloc_flush_bitmaps(struct super_block *sb)
     q->cap = READ_ONCE(cetrafs_bmap_flush_serial) ? 1 : CETRAFS_BMAP_FLUSH_BATCH;
     for (; bg_id < bg_count; bg_id = cetrafs_bmap_flush_first(sb, bg_id + 1, bg_count)) {
         struct cetrafs_bg_geom bg;
-        u64 b, nblocks;
+        u64 b, nblocks, bmap_lba;
 
         atomic64_inc(&cetrafs_bmap_flush_visits);
         if (!cetrafs_sb_take_bmap_alloc_dirty(sb, bg_id))
@@ -3602,17 +3609,25 @@ static int __cetrafs_alloc_flush_bitmaps(struct super_block *sb)
         stall = READ_ONCE(cetrafs_alloc_flush_stall_ms) ? xchg(&cetrafs_alloc_flush_stall_ms, 0) : 0;
         if (stall)
             msleep(stall); /* test-only; see the parameter */
-        if (cetrafs_read_bg_geom(sb, bg_id, &bg)) {
+        if (!cetrafs_read_bg_geom(sb, bg_id, &bg)) {
+            bmap_lba = bg.start_block + bg.off_data_bmap;
+            nblocks = bg.off_data_region - bg.off_data_bmap;
+        } else if (READ_ONCE(cetrafs_bmap_flush_needs_desc) ||
+                   !cetrafs_sb_bg_bmap_span(sb, bg_id, &bmap_lba, &nblocks)) {
             __set_bit(bg_id, failed);
             q->err = -EIO;
             continue;
         }
-        nblocks = bg.off_data_region - bg.off_data_bmap;
+        /* else: the descriptor does not read now, but where the bitmap is
+         * was fixed when the mount verified it. Failing here failed
+         * every publish of every file on the node, each finding the same
+         * mark put back (N-44); the descriptor's own damage is counted by
+         * the read and answered where it is used. */
         for (b = 0; b < nblocks; b++) {
             /* find, not read: a block we never cached cannot be dirty,
              * and reading it in just to discover that would turn a flush
              * into I/O over the whole bitmap. */
-            struct buffer_head *bh = sb_find_get_block(sb, bg.start_block + bg.off_data_bmap + b);
+            struct buffer_head *bh = sb_find_get_block(sb, bmap_lba + b);
 
             if (!bh)
                 continue;

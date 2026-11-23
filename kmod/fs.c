@@ -190,6 +190,10 @@ struct cetrafs_bg_chunk {
      */
     u64 bg_data_start[CETRAFS_BGC_SIZE];
     u64 bg_data_count[CETRAFS_BGC_SIZE];
+    /* The data bitmap's length: the bitmap is [data_start - this,
+     * data_start), from the descriptor the mount verified -- so the
+     * boundary flush finds it without reading the descriptor again. */
+    u32 bg_bmap_blocks[CETRAFS_BGC_SIZE];
 
     /*
      * BGs whose DATA BITMAP carries allocation bits this node has not
@@ -1944,6 +1948,7 @@ walked:
         WRITE_ONCE(c->bg_owner_zg[ci], (u16) owner);
         WRITE_ONCE(c->bg_data_start[ci], dstart);
         WRITE_ONCE(c->bg_data_count[ci], t);
+        WRITE_ONCE(c->bg_bmap_blocks[ci], (u32) cetrafs_calc_bg_dbm_blocks(blen));
     }
 
     l->total_data_blocks = total_data;
@@ -8031,6 +8036,27 @@ u64 cetrafs_sb_bg_desc_lba(struct super_block *sb, u32 bg_id)
 
     c = cetrafs_bgc(sbi, bg_id, &i);
     return c ? c->bg_desc_lba[i] : 0;
+}
+
+/* A Block Group's data bitmap, from the published layout: no I/O. False
+ * when the layout does not know the group. */
+bool cetrafs_sb_bg_bmap_span(struct super_block *sb, u32 bg_id, u64 *out_lba, u64 *out_blocks)
+{
+    struct cetrafs_sb_info *sbi = sb ? sb->s_fs_info : NULL;
+    struct cetrafs_bg_chunk *c;
+    u64 start, n;
+    u32 i;
+
+    c = cetrafs_bgc(sbi, bg_id, &i);
+    if (!c)
+        return false;
+    start = READ_ONCE(c->bg_data_start[i]);
+    n = READ_ONCE(c->bg_bmap_blocks[i]);
+    if (!n || n > start)
+        return false;
+    *out_lba = start - n;
+    *out_blocks = n;
+    return true;
 }
 
 u32 cetrafs_sb_bg_owner(struct super_block *sb, u32 bg_id)
