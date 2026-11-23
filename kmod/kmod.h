@@ -1975,6 +1975,7 @@ unsigned int cetrafs_journal_batch_capacity(struct super_block *sb);
 int cetrafs_journal_drain_retiring(struct super_block *sb);
 void cetrafs_journal_drain_aged(struct super_block *sb, unsigned long age);
 u64 cetrafs_journal_aged_drain_count(void);
+u64 cetrafs_journal_batch_nomem_count(void); /* journal.c: tree batches short of memory, nothing sent */
 int cetrafs_journal_settle_range(struct super_block *sb, u64 first, u64 count);
 u64 cetrafs_release_journal_drain_count(void);
 u64 cetrafs_convert_source_flush_count(void);

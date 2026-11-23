@@ -1972,53 +1972,99 @@ static bool cetrafs_deferred_unsent_counted;
 cetrafs_test_param(deferred_unsent_counted, cetrafs_deferred_unsent_counted, bool, 0644);
 MODULE_PARM_DESC(deferred_unsent_counted, "TEST ONLY: a target not sent (no longer held back) counts as written");
 
+static void cetrafs_journal_untake_batch(struct cetrafs_journal *j, struct buffer_head **bhs, const u64 *slots,
+                                         const bool *reused, unsigned int k);
+
+/* TEST ONLY: memory runs out inside the next tree batch -- 1: the second
+ * entry's buffers, 2: the status arrays the writes are sent with
+ * (tests/kernel/tree_batch_nomem.sh). One-shot. And the old outcome:
+ * the first a mount stop, the second a device refusal (the control). */
+static unsigned int cetrafs_journal_batch_nomem;
+cetrafs_test_param(journal_batch_nomem, cetrafs_journal_batch_nomem, uint, 0644);
+MODULE_PARM_DESC(journal_batch_nomem, "TEST ONLY: the next tree batch runs out of memory (1: buffers, 2: arrays)");
+static bool cetrafs_journal_batch_nomem_old;
+cetrafs_test_param(journal_batch_nomem_old, cetrafs_journal_batch_nomem_old, bool, 0644);
+MODULE_PARM_DESC(journal_batch_nomem_old, "TEST ONLY: a tree batch short of memory stops or counts a refusal, as before");
+
+static atomic64_t cetrafs_journal_batch_nomems = ATOMIC64_INIT(0);
+
+u64 cetrafs_journal_batch_nomem_count(void)
+{
+    return (u64) atomic64_read(&cetrafs_journal_batch_nomems);
+}
+
 /* A whole deferred batch: k entries in k slots already taken. */
 static int cetrafs_journal_batch_chunk(struct super_block *sb, struct cetrafs_journal *j,
                                        struct buffer_head **bhs, const struct cetrafs_journal_owner *owners,
                                        const u32 *disk_crc, unsigned int k,
-                                       const u64 *slots, const u64 *txn, bool *written, u32 *wcrc,
-                                       struct buffer_head **pb, struct buffer_head **hb)
+                                       const u64 *slots, const u64 *txn, const bool *reused, bool *written,
+                                       u32 *wcrc, struct buffer_head **pb, struct buffer_head **hb)
 {
     unsigned int i, nw = 0;
     bool ok = true, definite = true;
+    /* Short of memory before anything was sent: not the device's answer
+     * (audit 2026-11-22 N-29). */
+    bool nomem = false;
+    const unsigned int inject = READ_ONCE(cetrafs_journal_batch_nomem) ? xchg(&cetrafs_journal_batch_nomem, 0) : 0;
+    const bool old = READ_ONCE(cetrafs_journal_batch_nomem_old);
     struct cetrafs_dtarget_io *tio;
     int ret = 0, ferr;
 
     /* 1. Every entry: payload and header, all out together, waited for
      * once. Each payload is the block's current image, copied under its
-     * lock; nothing modifies it meanwhile (the caller's invalidate_lock). */
-    for (i = 0; i < k; i++) {
-        u64 hlba = cetrafs_journal_header_lba(j, slots[i]);
-        u32 pcrc;
-
-        pb[i] = cetrafs_getblk_overwrite(sb, hlba + 1);
-        hb[i] = pb[i] ? cetrafs_getblk_overwrite(sb, hlba) : NULL;
-        if (!pb[i] || !hb[i]) {
-            if (pb[i])
-                cetrafs_bh_abort_update(pb[i]);
-            ok = false;
-            definite = false;
-            break;
-        }
-        cetrafs_bh_copy_settled(bhs[i], pb[i]->b_data);
-        pcrc = ~crc32c(~0U, pb[i]->b_data, CETRAFS_BLOCK_SIZE);
-        cetrafs_bh_end_update(sb, pb[i]);
-
-        /* prev: the DEVICE's image, recorded when the block was first held
-         * back -- not the in-core one before the last edit, which never
-         * reached the device and which a replay would never find. */
-        cetrafs_journal_stamp_header(j, hb[i], CETRAFS_JRNL_F_GUARDED, txn[i], bhs[i]->b_blocknr, disk_crc[i], pcrc,
-                                     owners[i]);
-        cetrafs_bh_end_update(sb, hb[i]);
-    }
-    if (ok) {
-        /* Each write's own status (A-4): a definite refusal -- nothing
-         * landed -- is told from a write that may have, which the buffer
-         * layer's "uptodate or not" cannot do. */
-        struct buffer_head **both = kvmalloc_array(2 * k, sizeof(*both), GFP_NOFS);
+     * lock; nothing modifies it meanwhile (the caller's invalidate_lock).
+     *
+     * Everything this needs is taken BEFORE any entry is published: the
+     * status arrays, then every entry's two buffers. A published entry
+     * buffer is held, and the held flush writes it -- so a batch that ran
+     * out of memory halfway through preparing used to leave valid entry
+     * headers behind to land later in slots it no longer had. Taken first,
+     * a shortage aborts what it took and nothing of the batch exists
+     * anywhere (audit 2026-11-22 N-29). */
+    {
+        struct buffer_head **both = inject == 2 ? NULL : kvmalloc_array(2 * k, sizeof(*both), GFP_NOFS);
         int *st = kvmalloc_array(2 * k, sizeof(*st), GFP_NOFS);
 
-        if (both && st) {
+        if (!both || !st) {
+            ok = false;
+            nomem = true;
+        }
+        for (i = 0; ok && i < k; i++) {
+            u64 hlba = cetrafs_journal_header_lba(j, slots[i]);
+
+            pb[i] = inject == 1 && i == 1 ? NULL : cetrafs_getblk_overwrite(sb, hlba + 1); /* test-only inject */
+            hb[i] = pb[i] ? cetrafs_getblk_overwrite(sb, hlba) : NULL;
+            if (!pb[i] || !hb[i]) {
+                ok = false;
+                nomem = true;
+            }
+        }
+        if (nomem) {
+            for (i = 0; i < k; i++) {
+                if (pb[i])
+                    cetrafs_bh_abort_update(pb[i]);
+                if (hb[i])
+                    cetrafs_bh_abort_update(hb[i]);
+            }
+        } else {
+            for (i = 0; i < k; i++) {
+                u32 pcrc;
+
+                cetrafs_bh_copy_settled(bhs[i], pb[i]->b_data);
+                pcrc = ~crc32c(~0U, pb[i]->b_data, CETRAFS_BLOCK_SIZE);
+                cetrafs_bh_end_update(sb, pb[i]);
+
+                /* prev: the DEVICE's image, recorded when the block was
+                 * first held back -- not the in-core one before the last
+                 * edit, which never reached the device and which a replay
+                 * would never find. */
+                cetrafs_journal_stamp_header(j, hb[i], CETRAFS_JRNL_F_GUARDED, txn[i], bhs[i]->b_blocknr,
+                                             disk_crc[i], pcrc, owners[i]);
+                cetrafs_bh_end_update(sb, hb[i]);
+            }
+            /* Each write's own status (A-4): a definite refusal -- nothing
+             * landed -- is told from a write that may have, which the
+             * buffer layer's "uptodate or not" cannot do. */
             for (i = 0; i < k; i++) {
                 both[2 * i] = pb[i];
                 both[2 * i + 1] = hb[i];
@@ -2031,12 +2077,19 @@ static int cetrafs_journal_batch_chunk(struct super_block *sb, struct cetrafs_jo
                     definite = false;
                 ok = false;
             }
-        } else {
-            ok = false; /* no memory to send them: nothing was sent */
         }
         kvfree(both);
         kvfree(st);
     }
+    /* TEST ONLY (the control): the old outcomes of a shortage -- a buffer
+     * that could not be had stopped the mount as an unknown outcome, and
+     * arrays that could not be had were the device's ENOSPC. */
+    if (nomem && old) {
+        nomem = false;
+        definite = inject != 1;
+    }
+    for (i = 0; nomem && i < k; i++)
+        pb[i] = hb[i] = NULL; /* aborted above: nothing to release */
     for (i = 0; i < k; i++) {
         if (pb[i])
             brelse(pb[i]);
@@ -2050,8 +2103,23 @@ static int cetrafs_journal_batch_chunk(struct super_block *sb, struct cetrafs_jo
          * with ENOSPC (A-4). Otherwise, as the single write's
          * journal_failed: refuse and stop -- the entries' state is
          * unknown. */
-        unsigned int held = cetrafs_journal_batch_retire(sb, j, slots, bhs, k);
+        unsigned int held;
 
+        /* Memory, not the device (N-29): nothing of the batch left this
+         * node, so there is nothing on the device to retire -- the slots
+         * go back as a batch that could not take them does, a kept entry
+         * it took over kept (cetrafs_journal_untake_batch()), and the
+         * blocks stay held back for the next boundary. ENOMEM, and not
+         * counted as the device refusing. */
+        if (nomem) {
+            cetrafs_journal_untake_batch(j, bhs, slots, reused, k);
+            atomic64_inc(&cetrafs_journal_batch_nomems);
+            pr_warn_ratelimited("%s: journal: no memory to send a batch of %u tree-block entries -- nothing sent, "
+                                "kept for the next boundary\n",
+                                sb->s_id, k);
+            return -ENOMEM;
+        }
+        held = cetrafs_journal_batch_retire(sb, j, slots, bhs, k);
         if (definite && !held && cetrafs_tree_refusal_survivable(sb, bhs[0]->b_blocknr, -ENOSPC))
             return -ENOSPC;
         cetrafs_sb_fatal(sb, "journal: the device refused a batch of %u tree-block entries", k);
@@ -2421,8 +2489,8 @@ int cetrafs_journal_write_deferred(struct super_block *sb, struct buffer_head **
                 if (ret)
                     cetrafs_journal_untake_batch(j, bhs, slots, reused, k);
                 else
-                    ret = cetrafs_journal_batch_chunk(sb, j, bhs, owners, disk_crc, n, slots, txn, written, wcrc,
-                                                      pb, hb);
+                    ret = cetrafs_journal_batch_chunk(sb, j, bhs, owners, disk_crc, n, slots, txn, reused,
+                                                      written, wcrc, pb, hb);
             }
             mutex_unlock(&j->batch_mutex);
         }

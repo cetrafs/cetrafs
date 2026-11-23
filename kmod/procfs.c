@@ -418,6 +418,7 @@ static int cetrafs_proc_info_show(struct seq_file *m, void *v)
     seq_printf(m, "release_held_delta: %llu\n", cetrafs_release_held_delta_count());
     seq_printf(m, "release_journal_drains: %llu\n", cetrafs_release_journal_drain_count());
     seq_printf(m, "journal_aged_drains: %llu\n", cetrafs_journal_aged_drain_count());
+    seq_printf(m, "journal_batch_nomem: %llu\n", cetrafs_journal_batch_nomem_count());
     /* Slots held by entries a failed write kept for replay. Nonzero is a
      * device that refused writes; at the slot count, journaled writes
      * fail until a rewrite of those blocks (or a remount) frees them. */
