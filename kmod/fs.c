@@ -3880,9 +3880,11 @@ int cetrafs_fill_super(struct super_block *sb, struct fs_context *fc)
              * cross-node mutual exclusion at all. Now that our row is
              * committed a racer is visible: if ANY live foreign row exists,
              * unwind and refuse. Both racers may refuse -- safe, a retry
-             * elects a winner -- but no interleaving lets both proceed (see
-             * cetrafs_node_single_mounter_conflict()). Sequential mounts
-             * never trip this: the gate already refused a live peer. */
+             * elects a winner. Two racers on ONE row are the claim's: a
+             * write landing on ours after this check would hide from it,
+             * which the claim's settle and re-read rule out
+             * (cetrafs_node_nocaw_settle()). Sequential mounts never trip
+             * this: the gate already refused a live peer. */
             if (cetrafs_sb_mount_has_caw(sb)) {
                 /* And the no-CAW peer that registered while we did. */
                 bool nocaw = false;

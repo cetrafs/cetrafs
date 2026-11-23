@@ -1222,6 +1222,90 @@ static int cetrafs_node_other_rows_quiet(struct super_block *sb, u32 mine, const
     return 0;
 }
 
+/*
+ * A row claimed on a volume with no atomic CAW: nothing arbitrates two
+ * machines claiming the same FREE row at once. The claim is a fresh read
+ * that finds the row free and a write of ours right after it -- and a
+ * racer's write, landing a moment after ours, takes the row from under
+ * us. The post-registration check excludes our own UUID, so ours ran
+ * before the overwrite landed and both mounts went ahead, one of them on
+ * a row that was not its own, until a heartbeat noticed (audit
+ * 2026-11-22 N-36).
+ *
+ * So, as Fischer's mutual exclusion: every claim's read-to-write span is
+ * bounded (CETRAFS_NOCAW_CLAIM_BOUND_MS; one over it is given back and
+ * the mount refused), and the claimer waits twice the bound after its
+ * write, then reads its row again. A racer that read the row FREE did so
+ * before our write landed, so its own write landed within the bound of
+ * that -- before our re-read -- and the re-read finds the row not ours.
+ * One whose read came after our write found the row taken. A racer on
+ * ANOTHER row is the post-registration check's (fs.c), which runs after
+ * this re-read. Only a claim pays it; a re-attach to our own row does not
+ * race another machine.
+ */
+#define CETRAFS_NOCAW_CLAIM_BOUND_MS 250
+
+/* TEST ONLY: no settle and no re-read after a no-CAW claim, as before
+ * N-36 (tests/kernel/nocaw_claim_settle.sh's control). */
+static bool cetrafs_nocaw_settle_off;
+cetrafs_test_param(nocaw_settle_off, cetrafs_nocaw_settle_off, bool, 0644);
+MODULE_PARM_DESC(nocaw_settle_off, "TEST ONLY: a no-CAW row claim is trusted without the settle and re-read");
+
+/* TEST ONLY: the racer's late write, played -- right after our no-CAW
+ * claim, our row is rewritten as another machine's. One-shot. */
+static bool cetrafs_nocaw_settle_steal;
+cetrafs_test_param(nocaw_settle_steal, cetrafs_nocaw_settle_steal, bool, 0644);
+MODULE_PARM_DESC(nocaw_settle_steal, "TEST ONLY: the next no-CAW row claim is overwritten as another machine's");
+
+static int cetrafs_node_steal_mutate(void *image, unsigned int len, void *priv)
+{
+    cetrafs_node_entry_t ne;
+
+    (void) priv;
+    memcpy(&ne, image, sizeof(ne));
+    memset(ne.node_uuid, 0xee, sizeof(ne.node_uuid));
+    ne.incarnation = cetrafs_cpu_to_le32(cetrafs_le32(ne.incarnation) + 1);
+    cetrafs_node_image_commit(image, len, &ne);
+    return 0;
+}
+
+/* 0: the row is ours. -EAGAIN: the claim took too long to tell, and is
+ * the caller's to give back. -EBUSY: another machine's write landed on
+ * it -- the row is theirs now, and nothing of it is ours to give back. */
+static int cetrafs_node_nocaw_settle(struct super_block *sb, u32 idx, const u8 *uuid, u32 incarnation,
+                                     ktime_t start, ktime_t done)
+{
+    const s64 span = ktime_ms_delta(done, start);
+    cetrafs_node_entry_t ne;
+    s64 left;
+    int ret;
+
+    if (cetrafs_sb_caw_available(sb) || READ_ONCE(cetrafs_nocaw_settle_off))
+        return 0;
+    if (span > CETRAFS_NOCAW_CLAIM_BOUND_MS) {
+        pr_err("node registration: claiming row %u took %lld ms, over the %d ms within which a claim on a volume "
+               "without atomic CAW can be told from another node's -- giving it back; retry the mount\n",
+               idx, (long long) span, CETRAFS_NOCAW_CLAIM_BOUND_MS);
+        return -EAGAIN;
+    }
+    if (READ_ONCE(cetrafs_nocaw_settle_steal) && xchg(&cetrafs_nocaw_settle_steal, false))
+        (void) cetrafs_cas_record(sb, cetrafs_node_row_lba(sb, idx), cetrafs_node_steal_mutate, NULL);
+    left = 2 * CETRAFS_NOCAW_CLAIM_BOUND_MS - ktime_ms_delta(ktime_get(), done);
+    if (left > 0)
+        msleep(left);
+    ret = cetrafs_read_node_entry(sb, idx, &ne); /* forced-fresh */
+    if (ret)
+        return ret;
+    if (cetrafs_le32(ne.state) != CETRAFS_NODE_STATE_REGISTERED || memcmp(ne.node_uuid, uuid, CETRAFS_NODE_UUID_LEN) ||
+        cetrafs_le32(ne.incarnation) != incarnation) {
+        pr_err("node registration: another node claimed row %u at the same instant on this volume without atomic "
+               "CAW, and only one node may mount it -- refusing; retry the mount\n",
+               idx);
+        return -EBUSY;
+    }
+    return 0;
+}
+
 int cetrafs_node_register(struct super_block *sb,
                           u32 file_lock_mode,
                           u32 *out_node_id,
@@ -1377,8 +1461,11 @@ int cetrafs_node_register(struct super_block *sb,
             .incarnation = cetrafs_node_new_incarnation(0),
             .recycle = pass == 1,
         };
+        const ktime_t start = ktime_get();
+        ktime_t done;
 
         ret = cetrafs_cas_record(sb, cetrafs_node_row_lba(sb, idx), cetrafs_node_claim_mutate, &ctx);
+        done = ktime_get();
         if (ret == 0) {
             u32 twin, j;
             int tret;
@@ -1396,6 +1483,14 @@ int cetrafs_node_register(struct super_block *sb,
                     pr_warn("node registration: could not give back row %u\n", idx);
                 return tret > 0 ? -EBUSY : tret;
             }
+            tret = cetrafs_node_nocaw_settle(sb, idx, my_uuid.b, ctx.incarnation, start, done);
+            if (tret == -EAGAIN) {
+                if (cetrafs_cas_record(sb, cetrafs_node_row_lba(sb, idx), cetrafs_node_unclaim_mutate, my_uuid.b))
+                    pr_warn("node registration: could not give back row %u\n", idx);
+                return -EBUSY;
+            }
+            if (tret)
+                return tret;
             pr_info("node registration: claimed row %u (%s)\n", idx,
                     cetrafs_sb_caw_available(sb) ? "atomic CAS" : "no-CAW fallback");
             cetrafs_sb_set_fence_epoch(sb, 0); /* the mutator zeroes the row */
