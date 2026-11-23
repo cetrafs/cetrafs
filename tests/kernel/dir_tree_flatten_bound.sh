@@ -23,7 +23,8 @@
 #
 # DISCRIMINATION: dir_flatten_unbounded=1 (k=5, 322,580 extents, so the
 # control stays cheap) flattens the whole tree, and only the count after
-# the copy refuses it: the flatten cap is not named.
+# the copy refuses it: the flatten cap is not named. (The density check,
+# which would refuse the copy first, is lifted with it.)
 # What this cannot see: the memory itself. The cap's message is the
 # observable; the control shows that without it the copy is made.
 set -euo pipefail
@@ -40,6 +41,11 @@ ct_param_set dir_flatten_unbounded 0
 # collapses this tree to its 254 real extents before any cap: switched
 # off, so the cap is the only thing between the tree and the copy.
 ct_param_set tree_walk_no_dedup 1
+# The planted extents all start at logical block 0: after the copy the
+# density check refuses them before the count does. The control lifts
+# it too, so the count -- the refusal this suite tells the cap from --
+# is what answers.
+ct_param_set dir_density_unchecked 0
 
 errno_of() {
     python3 -I -c '
@@ -67,6 +73,7 @@ probe() {
     [ -n "$p" ] && [ "$p" -gt 0 ] || { echo "setup-noblocks"; return; }
     "$TSP" "$img" "$ino" "$p" $((p + 1)) $((p + 2)) "$1" "$p" >&2 || { echo "setup-poke"; return; }
     echo "$2" >/sys/module/cetrafs/parameters/dir_flatten_unbounded
+    echo "$2" >/sys/module/cetrafs/parameters/dir_density_unchecked
     ct_mount "$dev" "$MNT"
     mark="$(dmesg_mark)"
     t0=$(date +%s)
@@ -75,6 +82,7 @@ probe() {
     t1=$(date +%s)
     other="$(errno_of ls "$MNT/e")"
     echo 0 >/sys/module/cetrafs/parameters/dir_flatten_unbounded
+    echo 0 >/sys/module/cetrafs/parameters/dir_density_unchecked
     umount "$MNT" 2>/dev/null || umount -l "$MNT"
     local D
     D="$(dmesg_since "$mark")"
