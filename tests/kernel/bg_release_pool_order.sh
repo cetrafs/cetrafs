@@ -35,7 +35,7 @@ MNT="$(ct_mnt bgpool)"
 compress_timing
 ct_track mnt "$MNT"
 # Registered here, in the suite's own shell, so ct_exit restores them.
-for k in bg_release_off bg_release_credit_late bg_release_stall_ms release_claim_unlocked; do
+for k in bg_release_off bg_release_credit_late bg_release_stall_ms release_claim_unlocked bg_claim_debit_refused_ok; do
     ct_param_set "$k" "$(cat /sys/module/cetrafs/parameters/$k)"
 done
 RES="$(ct_tmp bgpool-res)"
@@ -66,6 +66,9 @@ round() {
     sync
 
     ct_param_set bg_release_credit_late "$late"
+    # The control is the old world whole: a claim then swapped on a refused
+    # debit too, and now backs off (bg_claim_racing_debit.sh).
+    ct_param_set bg_claim_debit_refused_ok "$late"
     ct_param_set bg_release_stall_ms 15000
     mark="$(dmesg_mark)"
     ct_param_set bg_release_off 0
@@ -82,9 +85,10 @@ round() {
     wait_for 25 'dmesg_since "'"$mark"'" | grep -q "BG 1 handed back"' || true
     ct_param_set bg_release_off 1
     ct_param_set bg_release_credit_late 0
+    ct_param_set bg_claim_debit_refused_ok 0
     ct_param_set release_claim_unlocked 0
     # The claim debits before its swap (N-15) or, old order, after it.
-    n="$(dmesg_since "$mark" | grep -cE "pool shard debit failed( before the claim)?" || true)"
+    n="$(dmesg_since "$mark" | grep -cE "pool shard (debit failed( before the claim)?|did not take the claim's debit)" || true)"
     ct_umount "$MNT"
     err="$(ct_fsck "$DEV" 2>&1 | grep -c '^ERR' || true)"
     ct_fsck "$DEV" 2>&1 | grep '^ERR' | head -3 >&2 || true
