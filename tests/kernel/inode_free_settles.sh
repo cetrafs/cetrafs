@@ -40,6 +40,7 @@ DEV="$(ct_loop "$IMG")"
 MNT="$(ct_mnt infree)"
 ct_track mnt "$MNT"
 ct_mkfs_small "$DEV" >/dev/null
+ct_param_set trim_quarantine_secs 1 # else every claim holds the scrub off for 600 s
 ct_param_set scrub 0
 ct_mount "$DEV" "$MNT"
 require_cetrafs_mount "$MNT"

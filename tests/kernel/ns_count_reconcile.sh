@@ -118,6 +118,7 @@ recount_round() {
         done
         poke_dead_peer "$sdev" 1 bb
     fi
+    ct_param_set trim_quarantine_secs 1 # else every claim holds the scrub off for 600 s
     ct_param_set "$knob" "$val"
     ct_mount "$sdev" "$MNT"
     if [ "$how" = peer ]; then

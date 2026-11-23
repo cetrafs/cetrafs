@@ -59,6 +59,7 @@ echo "$FSCK_OUT" | grep -q "inode $HIGHER is allocated" &&
     fail "fsck exited $FSCK_RC"
 
 log "the scrub reclaims a high-numbered orphan (bitmap CAS in block 2)"
+ct_param_set trim_quarantine_secs 1 # else every claim holds the scrub off for 600 s
 ct_param_set scrub 1
 ct_param_set scrub_interval_secs 2
 ct_param_set scrub_gap_floor_secs 1

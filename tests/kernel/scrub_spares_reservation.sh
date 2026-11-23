@@ -45,6 +45,7 @@ ct_mkfs_small "$DEV" >/dev/null
 # later change does not shorten the cycle already pending -- it would
 # fire 30 minutes from now, and this test would sit waiting for a cycle
 # that never comes (it did, on the first run).
+ct_param_set trim_quarantine_secs 1 # else every claim holds the scrub off for 600 s
 ct_param_set scrub 1
 ct_param_set scrub_interval_secs 3
 ct_param_set scrub_gap_floor_secs 1

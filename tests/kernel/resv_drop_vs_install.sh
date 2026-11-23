@@ -31,6 +31,7 @@ require_module
 [ -w /sys/module/cetrafs/parameters/resv_drop_stall_ms ] || { skip "resv_drop_stall_ms is missing"; ct_exit; }
 MNT="$(ct_mnt rdvi)"
 ct_track mnt "$MNT"
+ct_param_set trim_quarantine_secs 1 # else every claim holds the scrub off for 600 s
 ct_param_set scrub 1
 ct_param_set scrub_interval_secs 3
 ct_param_set scrub_gap_floor_secs 1

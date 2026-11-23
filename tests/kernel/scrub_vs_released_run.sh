@@ -30,6 +30,7 @@ ct_mkfs_small "$DEV" >/dev/null
 ct_param_set auto_defrag 0
 ct_param_set alloc_run_blocks 256
 ct_param_set alloc_run_max_blocks 256
+ct_param_set trim_quarantine_secs 1 # else every claim holds the scrub off for 600 s
 ct_param_set scrub 0
 ct_param_set scrub_interval_secs 2 # scheduled at mount: set before it
 ct_param_set scrub_gap_floor_secs 1

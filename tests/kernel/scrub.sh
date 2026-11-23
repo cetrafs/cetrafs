@@ -34,6 +34,7 @@ reclaimed() { info | sed -n 's/^scrub_reclaimed: //p'; }
 
 # A fast scrub: a 2 s cycle with a 1 s two-pass gap (the default is 30 min).
 # `scrub` itself is armed only AFTER the baseline below is captured.
+ct_param_set trim_quarantine_secs 1 # else every claim holds the scrub off for 600 s
 ct_param_set scrub_interval_secs 2
 ct_param_set scrub_gap_floor_secs 1
 ct_param_set scrub_gap_secs 1

@@ -39,6 +39,7 @@ set_stale_window "$TEST_STALE_SECS"
 poke_dead_peer "$DEV" 1 aa
 "$ZG_POKE" "$DEV" 1 1 >/dev/null # ZG1 (with BG1) belongs to node 1
 # A fast scrub, scheduled at mount, disarmed until the peers have acted.
+ct_param_set trim_quarantine_secs 1 # else every claim holds the scrub off for 600 s
 ct_param_set scrub_interval_secs 2
 ct_param_set scrub_gap_floor_secs 1
 ct_param_set scrub_gap_secs 1

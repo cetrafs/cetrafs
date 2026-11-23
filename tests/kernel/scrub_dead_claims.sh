@@ -52,6 +52,7 @@ for i in $RD $LK $LIVE; do
 done
 pass "setup: three orphans -- a dead node's presence bit, its lock, a live node's presence bit"
 
+ct_param_set trim_quarantine_secs 1 # else every claim holds the scrub off for 600 s
 ct_param_set scrub 0
 ct_param_set scrub_interval_secs 2
 ct_param_set scrub_gap_floor_secs 1

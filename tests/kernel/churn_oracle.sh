@@ -81,6 +81,7 @@ ct_param_set auto_defrag "$DEFRAG"
 ct_param_set auto_defrag_min_extents 2
 ct_param_set auto_defrag_min_pct 1
 case "$SCRUB" in 2) ct_param_set scrub 0 ;; *) ct_param_set scrub "$SCRUB" ;; esac
+ct_param_set trim_quarantine_secs 1 # else every claim holds the scrub off for 600 s
 ct_param_set scrub_interval_secs 3
 ct_param_set scrub_gap_floor_secs 1
 ct_param_set scrub_gap_secs 2

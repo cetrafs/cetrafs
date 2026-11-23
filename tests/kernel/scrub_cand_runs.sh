@@ -31,6 +31,7 @@ require_module
 LEAK="$(ct_helper data_leak_poke)"
 MNT="$(ct_mnt scand)"
 ct_track mnt "$MNT"
+ct_param_set trim_quarantine_secs 1 # else every claim holds the scrub off for 600 s
 ct_param_set scrub_cand_bitmap 0
 ct_param_set scrub_cand_budget_kb 4096
 ct_param_set scrub_ref_budget_kb 16

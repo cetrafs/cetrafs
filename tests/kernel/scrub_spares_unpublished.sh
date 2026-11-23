@@ -54,6 +54,7 @@ DEV="$(ct_dev 900 scrubshadow)"
 MNT="$(ct_mnt scrubshadow)"
 ct_mkfs_small "$DEV" >/dev/null
 
+ct_param_set trim_quarantine_secs 1 # else every claim holds the scrub off for 600 s
 ct_param_set scrub_interval_secs 2
 ct_param_set scrub_gap_floor_secs 1
 ct_param_set scrub_gap_secs 1

@@ -50,6 +50,7 @@ echo "$FSCK_OUT" | grep -q "inode $ORPHAN is allocated" \
     || fail "fsck exited $FSCK_RC on a volume whose only fault is the designed orphan residue"
 
 log "negative control: with the scrub disabled the orphan must SURVIVE"
+ct_param_set trim_quarantine_secs 1 # else every claim holds the scrub off for 600 s
 ct_param_set scrub 0
 mount -t cetrafs "$DEV" "$MNT"
 require_cetrafs_mount "$MNT"

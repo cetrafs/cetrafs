@@ -27,6 +27,7 @@ MAP="$(ct_helper bg_map)"
 DEV="$(ct_dev 2400 scrubq)"
 MNT="$(ct_mnt scrubq)"
 ct_mkfs "$DEV" -z 2 -b 512 -J 0 -N 1024 -f >/dev/null
+ct_param_set trim_quarantine_secs 1 # else every claim holds the scrub off for 600 s
 ct_param_set scrub 0
 ct_param_set scrub_interval_secs 2
 ct_param_set scrub_gap_floor_secs 1

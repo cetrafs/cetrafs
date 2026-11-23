@@ -196,6 +196,7 @@ clean && pass "reattach: fsck clean" || fail "reattach: fsck: $(grep -m3 -E '^ER
 for ign in 0 1; do
     tag=scrub; [ "$ign" = 1 ] && tag="scrub control"
     ct_param_set nslock_recount_fail 10
+    ct_param_set trim_quarantine_secs 1 # else every claim holds the scrub off for 600 s
     ct_param_set scrub_interval_secs 2 # before the mount: it schedules the first cycle
     start "$SNAP_UNLINK" reattach
     ct_param_set nslock_recount_fail 0

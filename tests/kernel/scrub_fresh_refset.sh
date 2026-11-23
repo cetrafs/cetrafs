@@ -37,6 +37,7 @@ ct_mkfs_small "$DEV" -z 1 >/dev/null
 
 # Fast scrub, set BEFORE the mount (the first cycle is queued with the
 # interval as it reads it then).
+ct_param_set trim_quarantine_secs 1 # else every claim holds the scrub off for 600 s
 ct_param_set scrub 1
 ct_param_set scrub_interval_secs 3
 ct_param_set scrub_gap_floor_secs 1

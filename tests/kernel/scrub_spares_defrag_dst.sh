@@ -35,6 +35,7 @@ MNT="$(ct_mnt defragdst)"
 ct_mkfs_small "$DEV" >/dev/null
 # The fastest cycle the scrub allows, so one lands inside the move
 # rather than the move having to be long enough to catch a slow one.
+ct_param_set trim_quarantine_secs 1 # else every claim holds the scrub off for 600 s
 ct_param_set scrub_interval_secs 1
 ct_param_set scrub_gap_floor_secs 1
 ct_param_set scrub_gap_secs 1

@@ -49,6 +49,7 @@ ct_param_set ibmap_trust_image 0
 ct_param_set ibmap_abandon_no_stamp 0
 ct_param_set cas_stamp_off 0
 # the scrub, quick: set before each mount (the interval is read there)
+ct_param_set trim_quarantine_secs 1 # else every claim holds the scrub off for 600 s
 ct_param_set scrub 1
 ct_param_set scrub_interval_secs 3
 ct_param_set scrub_gap_floor_secs 1

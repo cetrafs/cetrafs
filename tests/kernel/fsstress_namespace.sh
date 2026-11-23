@@ -38,6 +38,7 @@ STRESS="$(ct_helper fsstress_cetra)"
 # nlink=0 inode). It is armed here at a short interval, as churn_oracle
 # arms it, so the orphan assertion below judges the volume after the
 # scrub has had its quiet cycles rather than before.
+ct_param_set trim_quarantine_secs 1 # else every claim holds the scrub off for 600 s
 ct_param_set scrub 1
 ct_param_set scrub_interval_secs 3
 ct_param_set scrub_gap_floor_secs 1
