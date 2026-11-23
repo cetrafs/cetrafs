@@ -26,6 +26,7 @@
  */
 #define pr_fmt(fmt) "cetrafs: " fmt
 
+#include <linux/blkdev.h>
 #include <linux/buffer_head.h>
 #include <linux/crc32c.h>
 #include <linux/random.h>
@@ -2277,11 +2278,53 @@ out:
  * 'visit' returns 0 to keep going, >0 to stop (not an error), <0 to
  * abort with that error -- the same contract as dir.c's dirent walker.
  */
+/* TEST ONLY: the file-lock-mode election skips a silent peer without
+ * fencing it, as before audit 2026-11-22 N-58. */
+static bool cetrafs_election_silent_unfenced;
+cetrafs_test_param(election_silent_unfenced, cetrafs_election_silent_unfenced, bool, 0644);
+MODULE_PARM_DESC(election_silent_unfenced, "TEST ONLY: the file-lock-mode election skips a silent peer unfenced");
+
+/*
+ * The file-lock-mode election's verdict on a peer it judged dead. Skipped
+ * and nothing more, a peer that was only stalled -- paused, partitioned --
+ * resumed in the mode the cluster had left: lock ON beside a cluster
+ * that went OFF, until a reclaim happened to bump its epoch (audit
+ * 2026-11-22 N-58). The verdict is published as the no-CAW gate's is:
+ * its lease revoked and its departure recorded DEAD, so it fences itself
+ * on its next tick. Bound to the row as judged: one that came back is
+ * alive (1). <0: the fence failed, and the election cannot lead.
+ */
+static int cetrafs_election_fence_silent(struct super_block *sb, u32 idx, const struct cetrafs_row_mark *judged)
+{
+    int ret;
+
+    if (READ_ONCE(cetrafs_election_silent_unfenced))
+        return 0;
+    ret = cetrafs_node_fence_peer_full(sb, idx, "nothing: it fell silent while a mount elected the file-lock mode",
+                                       CETRAFS_FENCE_RECLAIM, true, true, judged, 0);
+    if (ret == -EBUSY)
+        return 1;
+    if (ret)
+        pr_err("node %u looks dead but its lease could not be revoked (%d) -- not electing the file-lock mode "
+               "beside it\n",
+               idx, ret);
+    return ret;
+}
+
+/* A read-only mount follows the cluster's mode and never sets it (BM-42):
+ * it has no verdict to publish, and writes nothing for one. */
+static bool cetrafs_election_publishes(struct super_block *sb)
+{
+    return !sb_rdonly(sb) && !bdev_read_only(sb->s_bdev);
+}
+
+/* fence_silent: a row judged dead is fenced (cetrafs_election_fence_silent())
+ * -- the callers whose answer is a verdict the cluster then runs under. */
 static int cetrafs_for_each_live_peer(struct super_block *sb,
                                       const u8 *my_uuid,
                                       bool (*wants)(const cetrafs_node_entry_t *ne, void *priv),
                                       int (*visit)(u32 idx, const cetrafs_node_entry_t *ne, void *priv),
-                                      void *priv)
+                                      void *priv, bool fence_silent)
 {
     const cetrafs_superblock_t *raw_sb = cetrafs_sb_raw(sb);
     cetrafs_node_entry_t ne;
@@ -2336,9 +2379,30 @@ static int cetrafs_for_each_live_peer(struct super_block *sb,
         if (wants && !wants(&ne, priv))
             continue; /* the caller's answer does not depend on it */
         /* Watched stand still already by this mount, and still at that
-         * mark: dead, and not watched again (BM-22). */
-        if (cetrafs_sb_row_silent(sb, idx, &ne))
-            continue;
+         * mark: dead, and not watched again (BM-22) -- fenced first when
+         * the caller publishes a verdict. One that came back meanwhile is
+         * watched as any other. */
+        if (cetrafs_sb_row_silent(sb, idx, &ne)) {
+            struct cetrafs_row_mark m;
+            int f = 0;
+
+            if (fence_silent) {
+                cetrafs_row_mark_of(&m, &ne);
+                f = cetrafs_election_fence_silent(sb, idx, &m);
+            }
+            if (f < 0) {
+                ret = f;
+                goto out;
+            }
+            if (!f)
+                continue;
+            ret = cetrafs_read_node_entry(sb, idx, &ne);
+            if (ret)
+                goto out;
+            if (cetrafs_le32(ne.state) != CETRAFS_NODE_STATE_REGISTERED ||
+                cetrafs_le32(ne.departure) != CETRAFS_NODE_DEPART_NONE || (wants && !wants(&ne, priv)))
+                continue;
+        }
         cetrafs_row_mark_of(&seq[idx], &ne);
         watching[idx] = true;
         candidates++;
@@ -2407,17 +2471,38 @@ static int cetrafs_for_each_live_peer(struct super_block *sb,
             }
             if (expired) {
                 /* Watched for the whole window and never moved: dead,
-                 * and skipped. NOT stamped departed, as the no-CAW gate
-                 * stamps it: this pass answers one mount's question and
-                 * has no verdict to publish, and the next mount that
-                 * depends on this row watches it again. (A DEAD stamp
-                 * would no longer cost the node its own-claim sweeps on
-                 * return -- format 0x000A's departure field, L3.) This
-                 * mount remembers it, so its own later watches do not
-                 * watch it again while it stays at this mark (BM-22). */
+                 * and skipped. Stamped only for a caller that publishes
+                 * a verdict (fence_silent: the file-lock-mode election,
+                 * whose answer the cluster runs under); the others answer
+                 * one mount's question, and the next mount that depends
+                 * on this row watches it again. This mount remembers it,
+                 * so its own later watches do not watch it again while it
+                 * stays at this mark (BM-22). */
                 cetrafs_sb_row_silent_note(sb, idx, &ne);
                 watching[idx] = false;
                 candidates--;
+                if (fence_silent) {
+                    int f = cetrafs_election_fence_silent(sb, idx, &seq[idx]);
+
+                    if (f < 0) {
+                        ret = f;
+                        goto out;
+                    }
+                    if (f > 0) {
+                        /* It beat between our last read and the fence:
+                         * alive after all, and its answer counts. */
+                        ret = cetrafs_read_node_entry(sb, idx, &ne);
+                        if (ret)
+                            goto out;
+                        if (wants && !wants(&ne, priv))
+                            continue;
+                        ret = visit(idx, &ne, priv);
+                        if (ret) {
+                            ret = ret < 0 ? ret : 0;
+                            goto out;
+                        }
+                    }
+                }
             }
         }
     }
@@ -2486,7 +2571,8 @@ int cetrafs_node_cluster_file_lock_mode(struct super_block *sb, const u8 *my_uui
         return 0;
     }
 
-    return cetrafs_for_each_live_peer(sb, my_uuid, cetrafs_mode_differs_wants, cetrafs_cluster_mode_ctx_visit, &ctx);
+    return cetrafs_for_each_live_peer(sb, my_uuid, cetrafs_mode_differs_wants, cetrafs_cluster_mode_ctx_visit, &ctx,
+                                      cetrafs_election_publishes(sb));
 }
 
 /*
@@ -2534,7 +2620,8 @@ int cetrafs_node_file_lock_mode_conflict(struct super_block *sb, const u8 *my_uu
         return 0;
     }
 
-    ret = cetrafs_for_each_live_peer(sb, my_uuid, cetrafs_mode_differs_wants, cetrafs_mode_conflict_visit, &ctx);
+    ret = cetrafs_for_each_live_peer(sb, my_uuid, cetrafs_mode_differs_wants, cetrafs_mode_conflict_visit, &ctx,
+                                     cetrafs_election_publishes(sb));
     *out_conflict = ctx.conflict;
     return ret;
 }
@@ -2576,7 +2663,7 @@ int cetrafs_node_single_mounter_conflict(struct super_block *sb, const u8 *my_uu
         return 0;
     }
 
-    return cetrafs_for_each_live_peer(sb, my_uuid, NULL, cetrafs_single_mounter_visit, out_conflict);
+    return cetrafs_for_each_live_peer(sb, my_uuid, NULL, cetrafs_single_mounter_visit, out_conflict, false);
 }
 
 /*
@@ -2614,7 +2701,8 @@ static bool cetrafs_nocaw_peer_wants(const cetrafs_node_entry_t *ne, void *priv)
 int cetrafs_node_nocaw_peer_exists(struct super_block *sb, const u8 *my_uuid, bool *out_exists)
 {
     *out_exists = false;
-    return cetrafs_for_each_live_peer(sb, my_uuid, cetrafs_nocaw_peer_wants, cetrafs_nocaw_peer_visit, out_exists);
+    return cetrafs_for_each_live_peer(sb, my_uuid, cetrafs_nocaw_peer_wants, cetrafs_nocaw_peer_visit, out_exists,
+                                      false);
 }
 
 /*
