@@ -7085,6 +7085,10 @@ static int cetrafs_lock_raw_is_inode(struct inode *inode, const cetrafs_inode_t 
 static bool cetrafs_lock_steal_reread_inc;
 cetrafs_test_param(lock_steal_reread_inc, cetrafs_lock_steal_reread_inc, bool, 0644);
 MODULE_PARM_DESC(lock_steal_reread_inc, "TEST ONLY: a flock/resume steal binds to the re-read incarnation (F-22)");
+/* Since the steal re-reads the record after retaking lock_mutex (N-21),
+ * that re-check is what refuses a re-attached holder first, and the swap
+ * binding stands behind it: the knob turns off both, or the control of
+ * tests/kernel/lock_steal_judged_inc.sh never reaches its window. */
 
 /*
  * The lock is held, and a claim was refused for it. If its holder is a
@@ -7177,7 +7181,7 @@ static int cetrafs_lock_arm_stale_steal(struct inode *inode, u32 my_node_id, cet
      * holder let go, while the mutex was down: re-decide from this read,
      * never from the one before the fence. */
     if (!cetrafs_lock_mode_held(cetrafs_le32(raw->lock_mode)) || cetrafs_le32(raw->lock_owner_node) != owner ||
-        cetrafs_le32(raw->lock_owner_incarnation) != judged_inc)
+        (cetrafs_le32(raw->lock_owner_incarnation) != judged_inc && !READ_ONCE(cetrafs_lock_steal_reread_inc)))
         return -ETXTBSY;
     ctx->generation = cetrafs_le64(raw->generation);
     ctx->allow_steal = true;

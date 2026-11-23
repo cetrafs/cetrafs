@@ -17,6 +17,9 @@
 #   1. the flock does not get the lock; node 1 still holds it.
 #
 # DISCRIMINATION: lock_steal_reread_inc=1: the flock takes the lock.
+# The knob turns off the re-check after lock_mutex is retaken too
+# (N-21): that re-read refuses a changed incarnation before the swap is
+# armed, and with it on the control never reached the window.
 set -euo pipefail
 . "$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)/lib/harness.sh"
 require_root
