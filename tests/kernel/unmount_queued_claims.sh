@@ -10,9 +10,10 @@
 # and nothing ever cleared it: every peer write-open, unlink and truncate
 # of that file got ETXTBSY.
 #
-# Staged: a read close whose withdraw fails, an unmount before any
-# heartbeat could retry it (the bit is still set after it -- otherwise
-# the case was not reached), then a remount. The row must not read
+# Staged: a read close whose withdraw fails, and fails again in the one
+# retry the unmount runs for queued releases itself (a failure that
+# outlasts it; the bit is still set after the unmount -- otherwise the
+# case was not reached), then a remount. The row must not read
 # departed, and the remount must clear the bit.
 #
 # DISCRIMINATION: without the check the row reads departure=1 and the
@@ -51,10 +52,11 @@ ct_param_set presence_withdraw_fail 0
 python3 - "$MNT/a" <<'PY'
 import os, sys
 fd = os.open(sys.argv[1], os.O_RDONLY)
-open("/sys/module/cetrafs/parameters/presence_withdraw_fail", "w").write("1")
+open("/sys/module/cetrafs/parameters/presence_withdraw_fail", "w").write("2")
 os.close(fd)
 PY
 ct_umount "$MNT"
+echo 0 >/sys/module/cetrafs/parameters/presence_withdraw_fail
 D="$("$LOCK_POKE" "$IMG" "$INO")"
 grep -q 'readers=0x0$' <<<"$D" &&
     { fail "setup: the bit was already withdrawn before the unmount ($D) -- a heartbeat retried first"; ct_exit; }
