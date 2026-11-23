@@ -488,6 +488,7 @@ void cetrafs_sb_release_read_unlock(struct super_block *sb);
 int cetrafs_sb_release_seq(struct super_block *sb);
 bool cetrafs_sb_release_ended_since(struct super_block *sb, int seq);
 u64 cetrafs_enospc_rescan_count(void);
+u64 cetrafs_enospc_drain_rescan_count(void);
 u64 cetrafs_alloc_adopt_skip_count(void);
 void cetrafs_sb_zg_want_adopt(struct super_block *sb, u32 zg_id);
 bool cetrafs_sb_zg_adopt_is_wanted(struct super_block *sb, u32 zg_id);

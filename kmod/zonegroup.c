@@ -2654,6 +2654,9 @@ static atomic64_t cetrafs_pf_full_scans = ATOMIC64_INIT(0);
  * heartbeat tick for every owned ZG, so this is the number that must
  * stay proportional to how full the queue is, not to how big it is. */
 static atomic64_t cetrafs_pf_drain_blocks = ATOMIC64_INIT(0);
+/* Pending-free entries whose blocks a drain applied: what a drain gave
+ * back, where pf_drain_blocks counts what it read. */
+static atomic64_t cetrafs_pf_applied = ATOMIC64_INIT(0);
 static atomic64_t cetrafs_pf_drop_runs = ATOMIC64_INIT(0);
 static atomic64_t cetrafs_pf_drop_blocks = ATOMIC64_INIT(0);
 
@@ -3438,9 +3441,10 @@ static int cetrafs_zg_drain_one(struct super_block *sb, u32 zg_id, bool may_wait
         aret = cetrafs_apply_pending_free(sb, first, got[e].count, zg_id, got[e].stamp);
         if (aret > 0)
             continue; /* stale stamp: dropped, a leak for the scrub (cetrafs_apply_pending_free()) */
-        if (!aret)
+        if (!aret) {
             applied++;
-        else
+            atomic64_inc(&cetrafs_pf_applied);
+        } else
             /* Consumed, so not retried: the blocks stay set and
              * unreferenced, a leak the scrub reclaims. Said, not
              * dropped. */
@@ -3687,7 +3691,10 @@ u64 cetrafs_alloc_drain_wait_count(void)
  */
 int cetrafs_zg_drain_for_space(struct super_block *sb)
 {
-    u64 before = (u64) atomic64_read(&cetrafs_pf_drain_blocks);
+    /* Applied, not read: the queue probe counts every block it reads in
+     * pf_drain_blocks, so that count moved on every call and each ENOSPC
+     * rescanned both tables once more for nothing. */
+    u64 before = (u64) atomic64_read(&cetrafs_pf_applied);
     int ret;
 
     if (READ_ONCE(cetrafs_alloc_drain_nowait))
@@ -3696,7 +3703,7 @@ int cetrafs_zg_drain_for_space(struct super_block *sb)
         ret = __cetrafs_zg_drain_pending_frees(sb, false, true);
     if (ret == -EINTR)
         return ret;
-    return (u64) atomic64_read(&cetrafs_pf_drain_blocks) != before;
+    return (u64) atomic64_read(&cetrafs_pf_applied) != before;
 }
 
 static int __cetrafs_zg_drain_pending_frees(struct super_block *sb, bool may_wait, bool wait_lock)
@@ -3956,6 +3963,13 @@ static atomic64_t cetrafs_enospc_rescans = ATOMIC64_INIT(0);
 u64 cetrafs_enospc_rescan_count(void)
 {
     return (u64) atomic64_read(&cetrafs_enospc_rescans);
+}
+
+/* Rescans after the drain before ENOSPC found frees it applied. */
+static atomic64_t cetrafs_enospc_drain_rescans = ATOMIC64_INIT(0);
+u64 cetrafs_enospc_drain_rescan_count(void)
+{
+    return (u64) atomic64_read(&cetrafs_enospc_drain_rescans);
 }
 
 int cetrafs_alloc_pick_bg(struct super_block *sb, u32 *out_bg_id)
@@ -4248,8 +4262,10 @@ retry_scan:
         ret = cetrafs_zg_drain_for_space(sb);
         if (ret < 0)
             return ret;
-        if (ret > 0)
+        if (ret > 0) {
+            atomic64_inc(&cetrafs_enospc_drain_rescans);
             goto retry_scan;
+        }
     }
 
     /* Either this node owns no ZGs and none were claimable just now, or

@@ -10,10 +10,20 @@
 # A4). Both tables are now read as batches.
 #
 # A volume of 16 Zone Groups is filled by fallocate; then 5 writes fail
-# with ENOSPC, and the loop device's completed reads are counted.
+# with ENOSPC, and the loop device's completed reads are counted. The
+# measure is the reads the batching SAVES, not a ratio: each failed write
+# also probes every owned pending-free queue before its answer (one
+# batched read per queue, the same in both modes), and that fixed cost
+# halved the ratio without touching the scans.
+#
+# Nothing is queued, so the drain before ENOSPC must apply nothing and
+# send the allocator round again for nothing: enospc_drain_rescans stays
+# 0. It counted the blocks it READ as frees applied, and rescanned on
+# every ENOSPC.
 #
 # DISCRIMINATION: zg_prefetch_off reads each record on its own, as
-# before: ~2 x 16 requests per failed write at least.
+# before: two passes of 16 records, ~15 requests more each, per failed
+# write.
 set -euo pipefail
 . "$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)/lib/harness.sh"
 require_root
@@ -46,7 +56,9 @@ run() {
     done
     echo "$(($(reads) - r0)) $fails"
 }
+DR0="$(sed -n 's/^enospc_drain_rescans: //p' "$(ct_procdir "$DEV")/info")"
 read -r R F <<<"$(run 0)"
+DR1="$(sed -n 's/^enospc_drain_rescans: //p' "$(ct_procdir "$DEV")/info")"
 ct_param_set zg_prefetch_off 1
 read -r R0 F0 <<<"$(run 1)"
 ct_param_set zg_prefetch_off 0
@@ -54,6 +66,8 @@ ct_umount "$MNT"
 log "5 writes on a full volume: $R reads batched ($F failed), $R0 one record at a time ($F0 failed)"
 [ "$F" = 5 ] && [ "$F0" = 5 ] || fail "setup: $F / $F0 of 5 writes failed -- the volume was not full"
 [ "$R0" -ge 160 ] || fail "setup: the serial scans took only $R0 reads -- not the 16-record table"
-[ "$R0" -gt $((R * 2)) ] && pass "a full-volume ENOSPC reads the tables in batches ($R against $R0 one at a time)" ||
+[ $((R0 - R)) -ge 150 ] && pass "a full-volume ENOSPC reads the tables in batches ($R against $R0 one at a time)" ||
     fail "$R reads batched against $R0 serial -- the scans are not batched"
+[ -n "$DR0" ] && [ "$DR1" = "$DR0" ] && pass "the drain before ENOSPC applied nothing and sent nobody round again" ||
+    fail "enospc_drain_rescans $DR0 -> $DR1 over 5 failed writes with nothing queued"
 ct_exit
