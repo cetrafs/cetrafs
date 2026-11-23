@@ -1742,14 +1742,48 @@ MODULE_PARM_DESC(journal_batch_crash_before_targets,
                  "TEST ONLY: the next deferred tree-block batch stops the mount after its entries, before its targets");
 
 /* Give a batch's slots back after its entries were retired (or hold the
- * ones whose retire could not be shown, as a kept entry's are held). */
+ * ones whose retire could not be shown, as a kept entry's are held).
+ *
+ * A slot the batch took over from a kept entry -- the redo of a target
+ * the device refused -- still holds that entry if nothing of ours reached
+ * it: payload and header both refused definitely. Zeroing it there
+ * destroyed the one redo of that target, as the single-block path did
+ * before audit 2026-11-22 N-67; it is held again instead (*kept). If
+ * anything of ours may have landed in it, the kept entry is gone either
+ * way (its header no longer matches its payload, or ours replaced it),
+ * and *lost says so. st: the entry writes' statuses, payload then header
+ * per entry (cetrafs_write_bhs_status()). */
 static unsigned int cetrafs_journal_batch_retire(struct super_block *sb, struct cetrafs_journal *j,
-                                                 const u64 *slots, struct buffer_head **bhs, unsigned int k)
+                                                 const u64 *slots, struct buffer_head **bhs, unsigned int k,
+                                                 const bool *reused, const int *st, unsigned int *kept,
+                                                 unsigned int *lost)
 {
     unsigned int i, held = 0;
 
+    *kept = *lost = 0;
     for (i = 0; i < k; i++) {
-        bool zero_failed = cetrafs_journal_zero_header(sb, cetrafs_journal_header_lba(j, slots[i])) != 0;
+        bool zero_failed;
+
+        if (reused[i] && !READ_ONCE(cetrafs_journal_reused_zeroed)) {
+            if (st && st[2 * i] && cetrafs_refusal_definite(st[2 * i]) && st[2 * i + 1] &&
+                cetrafs_refusal_definite(st[2 * i + 1])) {
+                mutex_lock(&j->lock);
+                clear_bit(slots[i], j->busy);
+                cetrafs_journal_untake_kept(j, slots[i], bhs[i]->b_blocknr, true);
+                mutex_unlock(&j->lock);
+                atomic64_inc(&cetrafs_journal_reused_kept);
+                pr_err_ratelimited("journal: could not write a batch entry for block %llu -- the kept entry it "
+                                   "was to supersede stays\n",
+                                   (unsigned long long) bhs[i]->b_blocknr);
+                (*kept)++;
+                continue;
+            }
+            pr_err("journal: the entry kept for block %llu after its write failed is lost -- the batch entry "
+                   "that was to supersede it was refused part-way\n",
+                   (unsigned long long) bhs[i]->b_blocknr);
+            (*lost)++;
+        }
+        zero_failed = cetrafs_journal_zero_header(sb, cetrafs_journal_header_lba(j, slots[i])) != 0;
 
         mutex_lock(&j->lock);
         if (zero_failed) {
@@ -2002,6 +2036,8 @@ static int cetrafs_journal_batch_chunk(struct super_block *sb, struct cetrafs_jo
 {
     unsigned int i, nw = 0;
     bool ok = true, definite = true;
+    /* Each entry write's status, kept for the retire (2 * k). */
+    int *st = NULL;
     /* Short of memory before anything was sent: not the device's answer
      * (audit 2026-11-22 N-29). */
     bool nomem = false;
@@ -2023,7 +2059,8 @@ static int cetrafs_journal_batch_chunk(struct super_block *sb, struct cetrafs_jo
      * anywhere (audit 2026-11-22 N-29). */
     {
         struct buffer_head **both = inject == 2 ? NULL : kvmalloc_array(2 * k, sizeof(*both), GFP_NOFS);
-        int *st = kvmalloc_array(2 * k, sizeof(*st), GFP_NOFS);
+
+        st = kvmalloc_array(2 * k, sizeof(*st), GFP_NOFS);
 
         if (!both || !st) {
             ok = false;
@@ -2079,7 +2116,6 @@ static int cetrafs_journal_batch_chunk(struct super_block *sb, struct cetrafs_jo
             }
         }
         kvfree(both);
-        kvfree(st);
     }
     /* TEST ONLY (the control): the old outcomes of a shortage -- a buffer
      * that could not be had stopped the mount as an unknown outcome, and
@@ -2112,6 +2148,7 @@ static int cetrafs_journal_batch_chunk(struct super_block *sb, struct cetrafs_jo
          * blocks stay held back for the next boundary. ENOMEM, and not
          * counted as the device refusing. */
         if (nomem) {
+            kvfree(st);
             cetrafs_journal_untake_batch(j, bhs, slots, reused, k);
             atomic64_inc(&cetrafs_journal_batch_nomems);
             pr_warn_ratelimited("%s: journal: no memory to send a batch of %u tree-block entries -- nothing sent, "
@@ -2119,12 +2156,28 @@ static int cetrafs_journal_batch_chunk(struct super_block *sb, struct cetrafs_jo
                                 sb->s_id, k);
             return -ENOMEM;
         }
-        held = cetrafs_journal_batch_retire(sb, j, slots, bhs, k);
+        {
+            unsigned int kept, lost;
+
+            held = cetrafs_journal_batch_retire(sb, j, slots, bhs, k, reused, st, &kept, &lost);
+            kvfree(st);
+            /* As the single-block path: an entry refused over a kept one
+             * is not an operation that can fail cleanly -- the target
+             * the kept entry protects stays refused, and a lost one is
+             * unprotected. The mount stops; replay has what is left. */
+            if (kept || lost) {
+                cetrafs_sb_fatal(sb, "journal: a batch of %u entries was refused over %u kept entr%s (%u lost)", k,
+                                 kept + lost, kept + lost == 1 ? "y" : "ies", lost);
+                return -EIO;
+            }
+        }
         if (definite && !held && cetrafs_tree_refusal_survivable(sb, bhs[0]->b_blocknr, -ENOSPC))
             return -ENOSPC;
         cetrafs_sb_fatal(sb, "journal: the device refused a batch of %u tree-block entries", k);
         return -EIO;
     }
+    kvfree(st);
+    st = NULL;
     atomic64_add(k, &cetrafs_journal_writes);
 
     /* 2. The entries on the platter before any target can be. */
