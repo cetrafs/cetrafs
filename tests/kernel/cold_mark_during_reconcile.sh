@@ -13,10 +13,11 @@
 # Driven deterministically with cold_work_stall_ms, which holds the work
 # before its drop and again before its settle:
 #   1. a held O_DIRECT reader caches the victim's leaf;
-#   2. a refresh (stat) marks the tree cold -- reconcile W1 starts;
+#   2. a refresh (stat) of a record a peer republished marks the tree
+#      cold -- reconcile W1 starts;
 #   3. after W1's drop, the reader reloads the leaf (still the old map);
-#   4. the device changes block 0's mapping, and a second stat marks the
-#      tree cold again -- W2 is queued behind W1;
+#   4. the device changes block 0's mapping and its stamp, and a second
+#      stat marks the tree cold again -- W2 is queued behind W1;
 #   5. W1 settles; while W2 is still held before ITS drop, the reader
 #      reads block 0 again. It must see the device's mapping, not the
 #      leaf loaded in step 3.
@@ -30,6 +31,7 @@ require_module
 require_file_lock_mode "its cold marks come from a lookup refresh of a file held open here, which nofilelock trusts without refreshing (cetrafs_lock_identity_cache_trusted()); nofilelock marks the same tree cold from a peer's file_seq (cetrafs_inode_note_stamp() -> cetrafs_tree_mark_cold_ci()), the mark and settle this suite proves in the default mode"
 [ -w /sys/module/cetrafs/parameters/cold_work_stall_ms ] || { skip "cold_work_stall_ms is missing"; ct_exit; }
 LEAF_POKE="$(ct_helper leaf_poke)"
+IPOKE="$(ct_helper inode_block_poke)"
 EXTENT_POKE="$(ct_helper pending_poke)"
 
 IMG="$(ct_image 560 cmr)"
@@ -77,10 +79,14 @@ go 0
 
 S=3000
 ct_param_set cold_work_stall_ms "$S"
+# A refresh marks the tree cold only when the record's change stamp
+# moved (audit 2026-11-22 N-32): each mark below is a peer's publish.
+"$IPOKE" "$IMG" peerseq "$INO" 5 >/dev/null 2>&1
 stat "$MNT/v" >/dev/null # mark 1: W1 holds [0,3s), drops, holds [3s,6s), settles
 sleep 4
 go 1 # inside W1's second hold: cold, so this reloads the leaf -- the old map
 "$LEAF_POKE" "$IMG" setphys "$INO" 0 "$DONOR_PHYS" >/dev/null
+"$IPOKE" "$IMG" peerseq "$INO" 5 >/dev/null 2>&1
 stat "$MNT/v" >/dev/null # mark 2, during W1: W2 queued behind it
 sleep 3                  # past W1's settle (~6s), inside W2's first hold
 go 2

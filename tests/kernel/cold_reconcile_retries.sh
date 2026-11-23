@@ -16,8 +16,8 @@
 # with a warning. Unmount drops what is parked.
 #
 # cold_read_fail fails the next N reconciles' record reads; a stat marks
-# the tree. Asserted: (1) one failure is retried on a beat and settles
-# (file_cache_reconciles moves); (2) an unreadable record is tried 1 + 8
+# the tree (after a peer-stamped publish). Asserted: (1) one failure is
+# retried on a beat and settles (file_cache_reconciles moves); (2) an unreadable record is tried 1 + 8
 # times and no more, a beat apart (not 10 a second), and is reported;
 # (3) a new mark that runs a parked reconcile which fails again does not
 # park it twice; (4) an unmount with a reconcile parked leaves no busy
@@ -34,7 +34,9 @@ require_root
 require_module
 [ -w /sys/module/cetrafs/parameters/cold_read_fail ] || { skip "cold_read_fail is missing"; ct_exit; }
 
-DEV="$(ct_dev 560 coldre)"
+IMG="$(ct_image 560 coldre)"
+DEV="$(ct_loop "$IMG")"
+IPOKE="$(ct_helper inode_block_poke)"
 MNT="$(ct_mnt coldre)"
 ct_track mnt "$MNT"
 ct_mkfs_small "$DEV" >/dev/null
@@ -46,16 +48,20 @@ INFO="$(ct_procdir "$DEV")/info"
 rec() { sed -n 's/^file_cache_reconciles: //p' "$INFO"; }
 echo data >"$MNT/v"
 sync
-stat "$MNT/v" >/dev/null
+INO="$(stat -c %i "$MNT/v")"
+# A refresh marks the tree cold only when the record's change stamp moved
+# (audit 2026-11-22 N-32): every marking stat follows a peer's publish.
+mark() { "$IPOKE" "$IMG" peerseq "$INO" 5 >/dev/null 2>&1; stat "$MNT/v" >/dev/null; }
+mark
 sleep 0.5
 R0="$(rec)"
-stat "$MNT/v" >/dev/null
+mark
 sleep 0.5
 [ "$(rec)" -gt "$R0" ] || { fail "setup: a stat does not reconcile this file's tree at all ($R0 -> $(rec))"; ct_exit; }
 
 R0="$(rec)"
 ct_param_set cold_read_fail 1
-stat "$MNT/v" >/dev/null
+mark
 sleep 6 # within three beats
 LEFT="$(cat /sys/module/cetrafs/parameters/cold_read_fail)"
 ct_param_set cold_read_fail 0
@@ -67,7 +73,7 @@ knob() { cat /sys/module/cetrafs/parameters/cold_read_fail; }
 R0="$(rec)"
 MARK="$(dmesg_mark)"
 ct_param_set cold_read_fail 50
-stat "$MNT/v" >/dev/null
+mark
 sleep 1.5
 EARLY=$((50 - $(knob)))
 [ "$EARLY" -ge 1 ] || { fail "setup: no reconcile ran into the failure"; ct_exit; }
@@ -94,13 +100,13 @@ dmesg_since "$MARK" | grep -q "still not reconciled .* after 8 tries" &&
 parked() { sed -n 's/^file_cache_cold_parked: //p' "$INFO"; }
 [ -n "$(parked)" ] || { fail "setup: procfs info has no file_cache_cold_parked"; ct_exit; }
 ct_param_set cold_read_fail 50
-stat "$MNT/v" >/dev/null
+mark
 DONE=
 for _ in 1 2 3 4 5; do
     for _ in $(seq 1 30); do [ "$(parked)" = 1 ] && break; sleep 0.1; done
     [ "$(parked)" = 1 ] || continue
     K0="$(knob)"
-    stat "$MNT/v" >/dev/null
+    mark
     sleep 0.3
     N="$(parked)"
     [ $((K0 - $(knob))) = 1 ] || continue
@@ -114,7 +120,7 @@ ct_param_set cold_read_fail 0
 
 # unmount while one is parked: its reference must be dropped, not leaked
 ct_param_set cold_read_fail 50
-stat "$MNT/v" >/dev/null
+mark
 sleep 0.5
 [ "$(knob)" -lt 50 ] || { fail "setup: the reconcile did not fail before the unmount"; ct_exit; }
 ct_umount "$MNT"

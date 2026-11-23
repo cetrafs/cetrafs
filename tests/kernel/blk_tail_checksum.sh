@@ -58,6 +58,12 @@ log "a corrupt leaf tail is reported, not parsed"
 # The whole point: without the tail this read returns whatever the
 # garbage extents point at. With it, the read fails loudly.
 "$POKE" "$IMG" leaf "$INO" corrupt >/dev/null
+# Out of every cache: a poke behind the mount moves no change stamp, and
+# a lookup keeps a file's caches while its stamp holds (audit 2026-11-22
+# N-32) -- so without this the read is served from the page cache and
+# never reaches the leaf.
+sync
+echo 3 >/proc/sys/vm/drop_caches
 MARK="$(dmesg_mark)"
 if md5sum <"$MNT/frag" >/dev/null 2>&1; then
     fail "a leaf with a broken tail was parsed anyway -- the extents it names could be any file's blocks"
