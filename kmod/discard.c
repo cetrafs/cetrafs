@@ -597,6 +597,39 @@ bool cetrafs_discard_handback_would_send(struct super_block *sb, bool force)
     return (force || cetrafs_sb_discard_enabled(sb)) && cetrafs_discard_supported(sb) && !cetrafs_sb_is_fenced(sb);
 }
 
+/* TEST ONLY: the budget is tested only by the discard itself, after the
+ * group's drain, scan and flag swaps, as before audit 2026-11-22 N-37
+ * (tests/kernel/handback_budget_first.sh). */
+static bool cetrafs_handback_budget_late;
+cetrafs_test_param(handback_budget_late, cetrafs_handback_budget_late, bool, 0644);
+MODULE_PARM_DESC(handback_budget_late, "TEST ONLY: test the hand-back budget only after a group's release work");
+
+/*
+ * Is this pass's hand-back budget spent, for a group whose release would
+ * send a discard? Asked BEFORE the group's release work: drained,
+ * scanned, flagged and unflagged by two swaps, a group the discard then
+ * deferred paid all of it for nothing and paid it again next tick -- a
+ * round trip count that grew with the number of empty groups, every
+ * tick (audit 2026-11-22 N-37). cetrafs_discard_handback() still tests
+ * it too: the work in between takes time.
+ */
+bool cetrafs_discard_handback_spent(struct super_block *sb, unsigned long *pass_started, bool pending, bool force)
+{
+    unsigned int budget = READ_ONCE(cetrafs_handback_budget_ms);
+
+    if (READ_ONCE(cetrafs_handback_budget_late) || !*pass_started)
+        return false;
+    if (pending ? !cetrafs_discard_supported(sb) || cetrafs_sb_is_fenced(sb)
+                : !cetrafs_discard_handback_would_send(sb, force))
+        return false;
+    if (!budget)
+        budget = CETRAFS_HANDBACK_TRIM_BUDGET_MS;
+    if (!time_after(jiffies, *pass_started + msecs_to_jiffies(budget)))
+        return false;
+    atomic64_inc(&cetrafs_discard_handback_deferred);
+    return true;
+}
+
 int cetrafs_discard_handback(struct super_block *sb, u32 bg_id, unsigned long *pass_started, bool pending,
                              bool force, bool *discarded)
 {

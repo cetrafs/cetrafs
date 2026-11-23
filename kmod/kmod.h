@@ -595,6 +595,7 @@ struct cetrafs_space_probe_state {
 };
 struct cetrafs_space_probe_state *cetrafs_sb_space_probe(struct super_block *sb); /* fs.c */
 bool cetrafs_discard_handback_would_send(struct super_block *sb, bool force);
+bool cetrafs_discard_handback_spent(struct super_block *sb, unsigned long *pass_started, bool pending, bool force);
 int cetrafs_discard_handback(struct super_block *sb, u32 bg_id, unsigned long *pass_started, bool pending,
                              bool force, bool *discarded);
 long cetrafs_fitrim_ioctl(struct file *file, struct fstrim_range __user *arg);

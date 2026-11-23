@@ -5519,6 +5519,8 @@ static int cetrafs_bg_release_one(struct super_block *sb, u32 zg_id, u32 b, unsi
      * not ours (drained), so it is looked for first.
      */
     if (cetrafs_sb_bg_discard_pending(sb, b)) {
+        if (cetrafs_discard_handback_spent(sb, pass_started, true, force))
+            return -EBUSY; /* kept for a later pass, nothing done (N-37) */
         if (cetrafs_bg_data_block_stats(sb, b, &total, &free) != 0 || total == 0 || free != total ||
             cetrafs_bg_release_bitmap_ready(sb, b)) {
             pr_err_ratelimited("BG %u: kept for an outstanding discard, but not provably empty -- not discarded, "
@@ -5576,6 +5578,11 @@ static int cetrafs_bg_release_one(struct super_block *sb, u32 zg_id, u32 b, unsi
         if (cetrafs_bg_data_block_stats(sb, b, &total, &free) == 0 && free != total)
             return 0; /* obviously in use -- never take it out of reach */
     }
+
+    /* Over this pass's budget for a group that would be discarded: kept
+     * for a later pass before anything is done to it (N-37). */
+    if (cetrafs_discard_handback_spent(sb, pass_started, false, force))
+        return -EBUSY;
 
     /* Take it out of the allocator's reach first, then look. The
      * other order leaves a window in which this node allocates into
