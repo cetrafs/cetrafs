@@ -147,7 +147,9 @@ MODULE_PARM_DESC(discard_fail_definite, "TEST ONLY: refuse this many discards wi
  * Did a failed discard certainly NOT execute? Only when the request
  * never left the host or the target answered it: refused by our own
  * range check (-EUCLEAN), unsupported, invalid, or refused by the target
- * (BLK_STS_NOTSUPP, _INVAL, _TARGET). Anything
+ * (BLK_STS_NOTSUPP, _INVAL, _TARGET) -- or never sent because this
+ * mount is fenced (-ESHUTDOWN: cetrafs_discard_issue()'s own answer; no
+ * BLK_STS_ maps to it, so the device cannot give it). Anything
  * else -- a timeout, a transport or path failure, a plain I/O error --
  * may be a command the array has, or will, run anyway, and an UNMAP that
  * lands after the blocks were handed out destroys the new data (class
@@ -155,7 +157,8 @@ MODULE_PARM_DESC(discard_fail_definite, "TEST ONLY: refuse this many discards wi
  */
 static bool cetrafs_discard_outcome_known(int err)
 {
-    return !err || err == -EUCLEAN || err == -EOPNOTSUPP || err == -EINVAL || err == -EREMOTEIO;
+    return !err || err == -EUCLEAN || err == -EOPNOTSUPP || err == -EINVAL || err == -EREMOTEIO ||
+           err == -ESHUTDOWN;
 }
 
 bool cetrafs_discard_supported(struct super_block *sb)
@@ -220,8 +223,12 @@ static int cetrafs_discard_issue(struct super_block *sb, u32 bg_id, u64 lba, u64
                 (unsigned long long) lba, (unsigned long long) count, bg_id, cetrafs_discard_issue_stall_ms);
         msleep(READ_ONCE(cetrafs_discard_issue_stall_ms));
     }
+    /* Fenced: nothing is sent, and -ESHUTDOWN says so -- -EIO read as
+     * "may still land", kept the run allocated and synced its hold on
+     * a mount that refuses the write, which stopped it over a discard
+     * that never left the host (N-38). */
     if (cetrafs_sb_fence_witnessed(sb)) /* the device's word, not only the clock's (B-18) */
-        return -EIO;
+        return -ESHUTDOWN;
     ret = cetrafs_issue_range_ok(sb, "discard", bg_id, lba, count);
     if (ret)
         return ret;
@@ -260,7 +267,7 @@ static int cetrafs_discard_issue(struct super_block *sb, u32 bg_id, u64 lba, u64
     /* Again, after the cache flush above (seconds on a SAN): a lease that
      * ran out in it must not see the UNMAP go (audit BC-8). */
     if (cetrafs_sb_is_fenced(sb))
-        return -EIO;
+        return -ESHUTDOWN; /* not sent, as above */
     ret = blkdev_issue_discard(sb->s_bdev, (sector_t) lba * (CETRAFS_BLOCK_SIZE >> SECTOR_SHIFT),
                                (sector_t) count * (CETRAFS_BLOCK_SIZE >> SECTOR_SHIFT), GFP_NOFS);
 failed:
@@ -748,7 +755,7 @@ long cetrafs_fitrim_ioctl(struct file *file, struct fstrim_range __user *arg)
             }
             rc = cetrafs_discard_issue(sb, b, lba, count);
             cetrafs_trim_release(sb, &run, !cetrafs_discard_outcome_known(rc));
-            if (rc == -EOPNOTSUPP || !cetrafs_discard_outcome_known(rc)) {
+            if (rc == -EOPNOTSUPP || rc == -ESHUTDOWN || !cetrafs_discard_outcome_known(rc)) {
                 /* The device stopped taking them, we are fenced, or the
                  * path is failing: no more this pass. */
                 ret = rc;
@@ -1117,7 +1124,7 @@ static int cetrafs_idq_range(struct cetrafs_inline_discard *d, const struct cetr
         }
         rc = cetrafs_discard_issue(sb, e->bg, run.lba, count);
         cetrafs_trim_release(sb, &run, !cetrafs_discard_outcome_known(rc));
-        if (rc == -EOPNOTSUPP || !cetrafs_discard_outcome_known(rc))
+        if (rc == -EOPNOTSUPP || rc == -ESHUTDOWN || !cetrafs_discard_outcome_known(rc))
             return rc; /* the device stopped taking them, we are stopped, or the path is failing */
         if (!rc) {
             atomic64_inc(&d->cmds);
