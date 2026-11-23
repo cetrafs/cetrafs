@@ -48,6 +48,7 @@
 #include <linux/sched/task.h>
 
 #include <linux/delay.h>
+#include <linux/crc32c.h>
 #include "kmod.h"
 
 /* One directory level of /sys/block/<dm>/slaves/ collected by name. */
@@ -456,7 +457,9 @@ static int cetrafs_dmpath_dev_read(struct block_device *bdev, u64 byte_off, void
  * 0: the path is a 1:1 map of the device, as far as it can be proven
  * here. -EXDEV: it is provably not (no superblock, another volume, a
  * differing last block) -- a different device, not a failing path.
- * -EIO: it could not be read, so nothing is known.
+ * -EIO: it could not be read, so nothing is known. -EAGAIN: the last
+ * block kept changing under the compare -- written, not proven either
+ * way (N-35).
  *
  * Block 0 is compared on the identity fields the superblock carries for
  * the whole life of the volume -- magic and UUID -- and NOT byte for
@@ -471,6 +474,17 @@ static int cetrafs_dmpath_dev_read(struct block_device *bdev, u64 byte_off, void
  * block between the two reads would look like a different device, so the
  * compare is retried before it is believed.
  */
+/* TEST ONLY: the last block's first N reads through the map come back
+ * different each time, as a block being written does; and the old
+ * compare -- three immediate tries, any mismatch not 1:1 -- the control
+ * (tests/kernel/dmpath_last_block_hot.sh). */
+static unsigned int cetrafs_dmpath_last_hot;
+cetrafs_test_param(dmpath_last_hot, cetrafs_dmpath_last_hot, uint, 0644);
+MODULE_PARM_DESC(dmpath_last_hot, "TEST ONLY: the identity check's last block reads changed for N attempts");
+static bool cetrafs_dmpath_last_quick;
+cetrafs_test_param(dmpath_last_quick, cetrafs_dmpath_last_quick, bool, 0644);
+MODULE_PARM_DESC(dmpath_last_quick, "TEST ONLY: the identity check gives the last block three immediate tries");
+
 static int cetrafs_dmpath_identical(struct block_device *dm_bdev, struct scsi_device *sdev, const char *pname)
 {
     unsigned int lbs = bdev_logical_block_size(dm_bdev);
@@ -547,10 +561,26 @@ static int cetrafs_dmpath_identical(struct block_device *dm_bdev, struct scsi_de
         goto out;
     }
 
-    /* The last block: the same LBA on both sides, read fresh from each. */
+    /* The last block: the same LBA on both sides, read fresh from each.
+     *
+     * It is a DATA block, and a peer may be writing it: three immediate
+     * re-reads gave up inside one write in flight, and a hot last block
+     * refused every path -- no CAW, a failed resolution (audit
+     * 2026-11-22 N-35). Re-read with the tear backoff, and only a
+     * mismatch that is STABLE on both sides is an answer: a
+     * multi-segment map reads two fixed, different blocks; a block
+     * that moved under the reads proves nothing (-EAGAIN: tried again,
+     * as a path that could not be read is). */
     last_off = (nr_blocks - 1) * CETRAFS_BLOCK_SIZE;
-    for (attempt = 0; attempt < 3; attempt++) {
+    {
+        const bool quick = READ_ONCE(cetrafs_dmpath_last_quick);
+        const int tries = quick ? 3 : CETRAFS_BLK_TAIL_READ_RETRIES;
+        u32 pcrc0 = 0, dcrc0 = 0;
+        bool moved = false;
+
+    for (attempt = 0; attempt < tries; attempt++) {
         bool same;
+        u32 pcrc, dcrc;
 
         if (cetrafs_dmpath_read(sdev, last_off / lbs, nblocks, pbuf, lbs)) {
             pr_warn("dm path: %s does not answer a passthrough READ of its last block -- not usable for CAW\n",
@@ -562,11 +592,29 @@ static int cetrafs_dmpath_identical(struct block_device *dm_bdev, struct scsi_de
             ret = -EIO;
             goto out;
         }
+        if (attempt < (int) READ_ONCE(cetrafs_dmpath_last_hot))
+            ((u8 *) dbuf)[0] ^= (u8) (attempt + 1); /* test-only: a write in flight, a new image each read */
         same = memcmp(pbuf, dbuf, CETRAFS_BLOCK_SIZE) == 0;
         if (same) {
             ret = 0;
             goto out;
         }
+        pcrc = ~crc32c(~0U, pbuf, CETRAFS_BLOCK_SIZE);
+        dcrc = ~crc32c(~0U, dbuf, CETRAFS_BLOCK_SIZE);
+        if (attempt && (pcrc != pcrc0 || dcrc != dcrc0))
+            moved = true;
+        pcrc0 = pcrc;
+        dcrc0 = dcrc;
+        if (!quick && attempt + 1 < tries)
+            cetrafs_tear_backoff(attempt);
+    }
+    if (moved && !quick) {
+        pr_warn_ratelimited("dm path: %s last block kept changing while it was compared -- a write in flight; not "
+                            "proven either way, tried again later\n",
+                            pname);
+        ret = -EAGAIN;
+        goto out;
+    }
     }
     pr_warn("dm path: %s last block differs from the mapped device's -- the mapping is not 1:1 (a multi-segment "
             "map?), refusing to send CAW to it\n",
