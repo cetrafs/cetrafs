@@ -24,6 +24,7 @@ log "checking cross-node extent-leaf staleness on refresh"
 # (stale cached leaf -- the pre-fix corruption).
 G6_POKE="$(ct_helper leaf_poke)"
 G6_EXTENT_POKE="$(ct_helper pending_poke)"
+G6_IPOKE="$(ct_helper inode_block_poke)"
 
 G6_IMG="$(mktemp /tmp/cetrafs-g6-XXXXXX.img)"
 truncate -s 560M "$G6_IMG"
@@ -50,6 +51,10 @@ head -c 10 "$G6_MNT/victimleaf" >/dev/null
 
 G6_DONOR_PHYS="$("$G6_EXTENT_POKE" "$G6_IMG" extent "$G6_DONOR_INO" | cut -d' ' -f1)"
 "$G6_POKE" "$G6_IMG" setphys "$G6_VICTIM_INO" 0 "$G6_DONOR_PHYS" >/dev/null
+# A peer's rewrite also moves the record's change stamp, and a lookup
+# refreshes a file's caches only when that stamp moved (audit 2026-11-22
+# N-32): poke it as that peer's publish would.
+"$G6_IPOKE" "$G6_IMG" peerseq "$G6_VICTIM_INO" 5 >/dev/null 2>&1
 
 # Fresh path lookup fires the refresh; the read must now go through the
 # POKED leaf (block 0 -> donor's block), not the stale cached one.
