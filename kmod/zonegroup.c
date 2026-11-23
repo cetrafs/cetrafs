@@ -605,15 +605,19 @@ static int cetrafs_zg_pool_mutate(void *image, unsigned int len, void *priv)
         return 1; /* nothing to do */
     /* class 34: the pool is credited by a BG release and debited by a
      * claim, on different nodes. The release credits BEFORE the group
-     * reads FREE and a claim debits only AFTER it took a group that
-     * reads FREE (cetrafs_bg_release(), bg_release_pool_order.sh), so a
-     * debit always follows the credit it consumes and the shard never
-     * legally passes through zero. */
+     * reads FREE and a claim debits only AFTER it read the group FREE
+     * (cetrafs_bg_release(), bg_release_pool_order.sh), so a debit
+     * always follows the credit it consumes. Two claims of one group
+     * both read it FREE, and the second debit is refused here: that
+     * claim backs off without swapping (__cetrafs_bg_claim_one(),
+     * bg_claim_racing_debit.sh), so the shard never passes through
+     * zero. */
     if (want < 0) {
-        /* A count, never negative. Divergence is fsck's to report;
-         * refuse rather than write a wrapped u64. */
-        pr_err("ZG pool delta %lld would take the shard below zero (%lld)\n", (long long) ctx->delta,
-               (long long) cur);
+        /* A count, never negative: refuse rather than write a wrapped
+         * u64. A racing claim lands here by design; every caller says
+         * what a refusal means for it. */
+        pr_info_ratelimited("ZG pool delta %lld would take the shard below zero (%lld) -- refused\n",
+                            (long long) ctx->delta, (long long) cur);
         return -EINVAL;
     }
     zg->pool_free_blocks = cpu_to_le64((u64) want);

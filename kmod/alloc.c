@@ -6052,6 +6052,12 @@ static bool cetrafs_bg_claim_debit_late;
 cetrafs_test_param(bg_claim_debit_late, cetrafs_bg_claim_debit_late, bool, 0644);
 MODULE_PARM_DESC(bg_claim_debit_late, "TEST ONLY: a Block Group claim debits the pool after its swap (old order)");
 
+/* TEST ONLY: a claim whose pool debit did not land swaps all the same, as
+ * before -- the control of tests/kernel/bg_claim_racing_debit.sh. */
+static bool cetrafs_bg_claim_debit_refused_ok;
+cetrafs_test_param(bg_claim_debit_refused_ok, cetrafs_bg_claim_debit_refused_ok, bool, 0644);
+MODULE_PARM_DESC(bg_claim_debit_refused_ok, "TEST ONLY: a Block Group claim swaps even when its pool debit was refused");
+
 static void cetrafs_bg_claim_pool_stall(u32 b)
 {
     unsigned int pause = READ_ONCE(cetrafs_bg_claim_pool_stall_ms) ? xchg(&cetrafs_bg_claim_pool_stall_ms, 0) : 0;
@@ -6103,9 +6109,27 @@ static int __cetrafs_bg_claim_one(struct super_block *sb, u32 zg_id, u32 b, bool
      * first, the same crash understates -- the release's order, which
      * credits the shard before its descriptor reads FREE. A refused swap
      * gives the debit back; an unknown outcome keeps it (understating).
+     *
+     * A debit that did not land ends the attempt here. The shard refuses
+     * to go below zero, and the usual reason it would is another claim of
+     * this very group -- a peer's, or another writer's on this node --
+     * that read it FREE too and debited first. Swapping on regardless,
+     * this claim could win the group while the one holding the debit
+     * lost its swap and gave the debit back: the group owned and its
+     * count in the pool, df over by a whole Block Group until fsck -r
+     * (bg_claim_racing_debit.sh). Backing off, the claim that holds the
+     * debit is the only one that may own the group, and if it loses
+     * too, its give-back makes the group claimable again.
      */
     if (!late && geom.free_data_blocks) {
-        if (cetrafs_zg_adjust_pool_blocks(sb, b, -(s64) geom.free_data_blocks))
+        ret = cetrafs_zg_adjust_pool_blocks(sb, b, -(s64) geom.free_data_blocks);
+        if (ret && !READ_ONCE(cetrafs_bg_claim_debit_refused_ok)) {
+            pr_info_ratelimited("BG %u: its pool shard did not take the claim's debit (%d) -- another claim holds it, "
+                                "or the shard understates (fsck -r); not claimed\n",
+                                b, ret);
+            return -EAGAIN;
+        }
+        if (ret)
             pr_warn("BG %u: its pool shard debit failed before the claim -- df will overstate until fsck\n", b);
         else
             debited = geom.free_data_blocks;
