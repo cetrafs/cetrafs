@@ -15,7 +15,8 @@
 #   1. fsck: nonzero, and names the directory's gap.
 #
 # DISCRIMINATION: the control, in-suite --
-# CETRAFS_FSCK_TEST_DIR_GAPS_UNCHECKED=1, the old walk: the volume is
+# CETRAFS_FSCK_TEST_DIR_GAPS_UNCHECKED=1, the old walk (with the names
+# checks off too, which also see the moved block): the volume is
 # reported clean.
 set -euo pipefail
 . "$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)/lib/harness.sh"
@@ -38,7 +39,10 @@ blockdev --flushbufs "$DEV"
 SAID="directory inode $ROOTINO has extent 0 at logical block 1 where 0 was expected"
 
 CRC=0
-OUT="$(CETRAFS_FSCK_TEST_DIR_GAPS_UNCHECKED=1 "$FSCK" "$DEV" 2>&1)" || CRC=$?
+# the names checks off as well: a first block moved to logical 1 also
+# holds its '.' and '..' out of place (fsck_dir_names.sh), and the gap
+# check must be the only thing that can fail this volume
+OUT="$(CETRAFS_FSCK_TEST_DIR_GAPS_UNCHECKED=1 CETRAFS_FSCK_TEST_NAMES_UNCHECKED=1 "$FSCK" "$DEV" 2>&1)" || CRC=$?
 [ "$CRC" = 0 ] && ! grep -q "$SAID" <<<"$OUT" &&
     pass "control: the old walk reports the volume clean, gap and all" ||
     fail "control: the old walk exited $CRC -- the hazard did not reproduce: $(grep -E '^ERR' <<<"$OUT" | head -2 | tr '\n' ' ')"
