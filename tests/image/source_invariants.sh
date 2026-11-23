@@ -2436,6 +2436,7 @@ cetrafs_lock_explicit_acquire final:a-peer-is-using-the-file-flock-cannot-promis
 cetrafs_fill_super final:a-mount-refused-with-its-reason-repair-running-no-caw-peer-or-a-rewrite
 cetrafs_check_second_mount final:a-second-mount-asking-for-options-the-first-lacks
 cetrafs_node_register final:a-twin-of-this-node-is-mounted
+cetrafs_node_nocaw_settle final:a-mount-refused-another-machine-took-its-no-caw-row-or-the-claim-was-too-slow-to-tell
 cetrafs_grow_claim_present final:no-growfs-claim-the-tool-did-not-ask
 cetrafs_grow_claim_owned final:no-growfs-claim-of-this-caller-the-ioctl-was-not-made-under
 cetrafs_lock_open final:test-injection-open_refresh_fail_once
