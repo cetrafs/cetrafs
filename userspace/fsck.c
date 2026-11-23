@@ -1111,6 +1111,7 @@ typedef struct {
     char *name;
     uint64_t blk;
     uint64_t ino;
+    uint64_t logical; /* the directory's logical block it was read at */
     uint32_t slot;
     uint16_t len;
 } fsck_dname_t;
@@ -1120,7 +1121,8 @@ typedef struct {
     size_t n, cap;
 } fsck_dnames_t;
 
-static void fsck_dnames_add(fsck_dnames_t *d, const char *name, uint16_t len, uint64_t blk, uint32_t slot, uint64_t ino)
+static void fsck_dnames_add(fsck_dnames_t *d, const char *name, uint16_t len, uint64_t blk, uint64_t logical,
+                            uint32_t slot, uint64_t ino)
 {
     if (d->n == d->cap) {
         d->cap = d->cap ? d->cap * 2 : 256;
@@ -1132,6 +1134,7 @@ static void fsck_dnames_add(fsck_dnames_t *d, const char *name, uint16_t len, ui
     memcpy(d->v[d->n].name, name, len);
     d->v[d->n].len = len;
     d->v[d->n].blk = blk;
+    d->v[d->n].logical = logical;
     d->v[d->n].slot = slot;
     d->v[d->n].ino = ino;
     d->n++;
@@ -1202,8 +1205,24 @@ static int fsck_live_name_holds(int fd, const fsck_dname_t *e)
     return cetrafs_le16(de[e->slot].name_len) == e->len && !memcmp(de[e->slot].name, e->name, e->len);
 }
 
-/* Report every name 'd' holds more than once; the number of such names. */
-static unsigned fsck_dnames_dups(int fd, fsck_dnames_t *d, uint64_t dir_ino, int live)
+/*
+ * --live: the directory a walk is reading, as the table pass judged it.
+ * A verdict about where an entry stands -- a misplaced '.', a name held
+ * twice -- is about the directory only while the block is still the
+ * directory's: one deleted under the walk, its block reused as another
+ * directory's first block, reads as a '.' and a '..' out of place and
+ * names held twice (audit 2026-11-22 N-280). fsck_live_dir_maps().
+ */
+struct fsck_live_dir {
+    const cetrafs_superblock_t *sb;
+    uint64_t ino, gen;
+    uint32_t nlink;
+};
+static int fsck_live_dir_maps(int fd, const struct fsck_live_dir *ld, uint64_t logical, uint64_t phys);
+
+/* Report every name 'd' holds more than once; the number of such names.
+ * ld: NULL outside --live. */
+static unsigned fsck_dnames_dups(int fd, fsck_dnames_t *d, uint64_t dir_ino, const struct fsck_live_dir *ld)
 {
     unsigned found = 0;
 
@@ -1219,7 +1238,8 @@ static unsigned fsck_dnames_dups(int fd, fsck_dnames_t *d, uint64_t dir_ino, int
              * side, are two entries that never stood together. Only the
              * ones still there now are counted. */
             for (size_t k = i; k < j; ++k)
-                held += !live || fsck_live_name_holds(fd, &d->v[k]);
+                held += !ld || (fsck_live_name_holds(fd, &d->v[k]) &&
+                                fsck_live_dir_maps(fd, ld, d->v[k].logical, d->v[k].blk));
             if (held > 1) {
                 fprintf(stderr, "ERR: directory inode %" PRIu64 " holds the name ", dir_ino);
                 fsck_put_name(stderr, d->v[i].name, d->v[i].len);
@@ -3657,6 +3677,64 @@ static cetrafs_extent_t *fsck_tree_extents(int fd, uint64_t total_blocks, const 
     *n = f.n;
     *whole = f.whole;
     return f.arr;
+}
+
+/* TEST ONLY: CETRAFS_FSCK_TEST_LIVE_DIR_STALL=<ino>:<path> -- the live
+ * walk, holding directory <ino>'s map, creates <path> and waits (up to a
+ * minute) until it is gone: the moment a directory can change under it. */
+static void fsck_live_dir_stall(uint64_t ino)
+{
+    const char *v = cetrafs_test_env("CETRAFS_FSCK_TEST_LIVE_DIR_STALL");
+    char *colon;
+    int f;
+
+    if (!v || strtoull(v, &colon, 10) != ino || *colon != ':')
+        return;
+    f = open(colon + 1, O_CREAT | O_WRONLY, 0600);
+    if (f >= 0)
+        close(f);
+    for (int t = 0; t < 600 && access(colon + 1, F_OK) == 0; ++t)
+        usleep(100000);
+}
+
+/* TEST ONLY: --live takes a directory's place in a block as given, as
+ * before N-280 (tests/kernel/fsck_live_dir_reused.sh's control). */
+static int fsck_live_dir_unchecked(void)
+{
+    static int v = -1;
+
+    if (v < 0)
+        v = cetrafs_test_env("CETRAFS_FSCK_TEST_LIVE_DIR_UNCHECKED") != NULL;
+    return v;
+}
+
+/* Is block 'phys' still logical block 'logical' of the directory the
+ * walk judged -- the same record (bit, generation, nlink), its tree
+ * mapping it there? */
+static int fsck_live_dir_maps(int fd, const struct fsck_live_dir *ld, uint64_t logical, uint64_t phys)
+{
+    cetrafs_inode_t in;
+    cetrafs_extent_t *ext;
+    uint32_t n;
+    int whole, found = 0;
+
+    if (fsck_live_dir_unchecked())
+        return 1;
+    if (!fsck_live_record_same(fd, ld->sb, ld->ino, ld->gen, ld->nlink))
+        return 0;
+    fsck_read_inode(fd, ld->sb, ld->ino, &in);
+    if (cetrafs_le16(in.eh.eh_magic) != CETRAFS_EXT_MAGIC || cetrafs_le16(in.eh.eh_depth) > CETRAFS_EXT_MAX_DEPTH)
+        return 0;
+    ext = fsck_tree_extents(fd, cetrafs_le64(ld->sb->total_blocks), &in, &n, &whole);
+    for (uint32_t e = 0; e < n && !found; ++e) {
+        uint64_t lo = cetrafs_ee_lblk(&ext[e]);
+
+        found = logical >= lo && logical < lo + cetrafs_ee_len(&ext[e]) &&
+                cetrafs_ee_pblk(&ext[e]) + (logical - lo) == phys;
+    }
+    free(ext);
+    /* and still the same record after the tree was read */
+    return found && fsck_live_record_same(fd, ld->sb, ld->ino, ld->gen, ld->nlink);
 }
 
 static void fsck_print_tree_reads(void)
@@ -6471,7 +6549,10 @@ int main(int argc, char **argv)
             uint32_t n;
             int twhole;
             cetrafs_extent_t *ext = fsck_tree_extents(fd, total_blocks, &in, &n, &twhole);
+            const struct fsck_live_dir ldir = {&sb, ino, live_pass ? gens[ino] : 0, nlinks[ino]};
 
+            if (live_pass)
+                fsck_live_dir_stall(ino);
             if (!twhole)
                 dwhole[ino] = 0; /* a tree block the content pass reported: names unseen */
             /* Dense from logical block 0, as the kernel requires
@@ -6602,7 +6683,7 @@ int main(int argc, char **argv)
                             const uint16_t nl = cetrafs_le16(de[s].name_len);
                             const char *why = fsck_name_impossible(de[s].name, nl);
 
-                            fsck_dnames_add(&dnames, de[s].name, nl, phys + k, s, cetrafs_le64(de[s].inode));
+                            fsck_dnames_add(&dnames, de[s].name, nl, phys + k, logical, s, cetrafs_le64(de[s].inode));
                             /* Still a reference: the entry names its
                              * target whatever it is called, and the
                              * target's count includes it. Reported,
@@ -6640,7 +6721,8 @@ int main(int argc, char **argv)
                          * anywhere else is neither, and is not taken as
                          * the directory's. */
                         if (cetrafs_le16(de[s].name_len) == 1 && de[s].name[0] == '.') {
-                            if (names_checked && (logical != 0 || s != 0)) {
+                            if (names_checked && (logical != 0 || s != 0) &&
+                                (!live_pass || fsck_live_dir_maps(fd, &ldir, logical, phys + k))) {
                                 fprintf(stderr,
                                         "ERR: directory inode %" PRIu64 " has a '.' entry at logical block %" PRIu64
                                         " slot %u -- '.' is the first slot of the first block\n",
@@ -6652,7 +6734,8 @@ int main(int argc, char **argv)
                             continue;
                         }
                         if (cetrafs_le16(de[s].name_len) == 2 && de[s].name[0] == '.' && de[s].name[1] == '.') {
-                            if (names_checked && logical != 0) {
+                            if (names_checked && logical != 0 &&
+                                (!live_pass || fsck_live_dir_maps(fd, &ldir, logical, phys + k))) {
                                 fprintf(stderr,
                                         "ERR: directory inode %" PRIu64 " has a '..' entry at logical block %" PRIu64
                                         " slot %u -- '..' is in the first block\n",
@@ -6739,7 +6822,7 @@ int main(int argc, char **argv)
             }
             free(ext);
             if (names_checked)
-                problems += fsck_dnames_dups(fd, &dnames, ino, live_pass);
+                problems += fsck_dnames_dups(fd, &dnames, ino, live_pass ? &ldir : NULL);
             fsck_dnames_reset(&dnames);
         }
         free(dnames.v);
