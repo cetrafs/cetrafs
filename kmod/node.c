@@ -595,15 +595,19 @@ static int cetrafs_node_fence_mutate(void *image, unsigned int len, void *priv)
     memcpy(ctx->victim_label, ne.label, sizeof(ctx->victim_label));
     /* Record the verdict as well as revoking the lease: departure = DEAD
      * means the next observer costs one block read instead of another
-     * full watch window. Only the mount gate asks for this, because only
-     * the mount gate has actually WATCHED the row long enough to conclude
-     * it. DEAD, never CLEAN: the node did not leave, its claims are still
-     * on the device, and when it comes back it must re-attach as after a
-     * crash and sweep them (L3). (The row stays REGISTERED so the owner
-     * can still re-attach by UUID on its next mount -- freeing it would
-     * cost that node its own identity, which is the bug
-     * cetrafs_node_mark_offline() was written around.) */
-    if (ctx->mark_departed)
+     * full watch window (the mount gate, and a reclaim: G-25). DEAD,
+     * never CLEAN: the node did not leave, its claims are still on the
+     * device, and when it comes back it must re-attach as after a crash
+     * and sweep them (L3). (The row stays REGISTERED so the owner can
+     * still re-attach by UUID on its next mount -- freeing it would cost
+     * that node its own identity, which is the bug
+     * cetrafs_node_mark_offline() was written around.)
+     *
+     * Only over NONE. A node that departed CLEAN said all of that itself
+     * and left nothing to sweep; DEAD over it made its next mount watch a
+     * stale window and the row stop being recyclable as a clean one,
+     * because a Zone Group it still owned was taken (N-57). */
+    if (ctx->mark_departed && cetrafs_le32(ne.departure) == CETRAFS_NODE_DEPART_NONE)
         ne.departure = cetrafs_cpu_to_le32(CETRAFS_NODE_DEPART_DEAD);
 
     cetrafs_node_image_commit(image, len, &ne);
