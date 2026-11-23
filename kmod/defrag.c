@@ -1518,6 +1518,7 @@ int cetrafs_defrag_inode(struct inode *inode, struct cetrafs_defrag_stats *out_s
                 for (e = 0; e < el.count; e++) {
                     u32 len = cetrafs_ee_len(&el.arr[e]);
 
+                    cetrafs_map_yield(e);
                     if (b < o + len) {
                         src = cetrafs_ee_pblk(&el.arr[e]) + (b - o);
                         break;

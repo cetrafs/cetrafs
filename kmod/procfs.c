@@ -529,6 +529,7 @@ static int cetrafs_proc_info_show(struct seq_file *m, void *v)
     seq_printf(m, "pf_apply_bmap_lookups: %llu\n", cetrafs_pf_apply_bmap_lookup_count());
     seq_printf(m, "run_claim_bmap_lookups: %llu\n", cetrafs_run_claim_bmap_lookup_count());
     seq_printf(m, "defrag_run_bmap_lookups: %llu\n", cetrafs_defrag_run_bmap_lookup_count());
+    seq_printf(m, "map_yields: %llu\n", cetrafs_map_yield_count());
     seq_printf(m, "enospc_rescans: %llu\n", cetrafs_enospc_rescan_count());
     seq_printf(m, "enospc_drain_rescans: %llu\n", cetrafs_enospc_drain_rescan_count());
     seq_printf(m, "alloc_adopt_skips: %llu\n", cetrafs_alloc_adopt_skip_count());

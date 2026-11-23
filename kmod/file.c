@@ -3017,6 +3017,26 @@ void cetrafs_tree_free_meta(struct inode *inode, const cetrafs_inode_t *raw);
  * fail. So the list is fetched BEFORE the arbitration now, and a fetch
  * that fails refuses the whole eviction rather than half of it.
  */
+/* TEST ONLY: the whole-map loops do not yield, as before audit
+ * 2026-11-22 N-18 (tests/kernel/map_loops_yield.sh). */
+static bool cetrafs_map_yield_off;
+cetrafs_test_param(map_yield_off, cetrafs_map_yield_off, bool, 0644);
+MODULE_PARM_DESC(map_yield_off, "TEST ONLY: loops over a flattened extent map never yield");
+static atomic64_t cetrafs_map_yields = ATOMIC64_INIT(0);
+
+void __cetrafs_map_yield(void)
+{
+    if (READ_ONCE(cetrafs_map_yield_off))
+        return;
+    atomic64_inc(&cetrafs_map_yields);
+    cond_resched();
+}
+
+u64 cetrafs_map_yield_count(void)
+{
+    return (u64) atomic64_read(&cetrafs_map_yields);
+}
+
 void cetrafs_free_fetched_extents(struct inode *dir, const cetrafs_inode_t *raw, struct cetrafs_inode_extents *ex)
 {
     struct super_block *sb = dir->i_sb;
@@ -3026,9 +3046,11 @@ void cetrafs_free_fetched_extents(struct inode *dir, const cetrafs_inode_t *raw,
     /* A large image is tens of thousands of extents: batched, so one queue
      * swap carries many of them when its owner is another node. */
     cetrafs_free_batch_init(&fb);
-    for (i = 0; i < ex->entries; i++)
+    for (i = 0; i < ex->entries; i++) {
+        cetrafs_map_yield(i);
         cetrafs_free_data_extent_batched(sb, cetrafs_ee_pblk(&ex->arr[i]),
                                          cetrafs_ee_len(&ex->arr[i]), &fb);
+    }
     cetrafs_free_batch_flush(sb, &fb);
     if (cetrafs_le16(raw->eh.eh_depth) != 0)
         cetrafs_tree_free_meta(dir, raw);
@@ -3056,10 +3078,12 @@ void cetrafs_free_inline_extents(struct inode *dir, const cetrafs_inode_t *raw)
             u32 i;
 
             cetrafs_free_batch_init(&fb);
-            for (i = 0; i < ex.entries; i++)
+            for (i = 0; i < ex.entries; i++) {
+                cetrafs_map_yield(i);
                 cetrafs_free_data_extent_batched(sb,
                                                  cetrafs_ee_pblk(&ex.arr[i]),
                                                  cetrafs_ee_len(&ex.arr[i]), &fb);
+            }
             cetrafs_free_batch_flush(sb, &fb);
             cetrafs_inode_extents_put(&ex);
         } else {
@@ -3810,6 +3834,7 @@ static int cetrafs_leaf_array_punch(struct super_block *sb,
         u64 hs = max_t(u64, estart, start_block);
         u64 he = min_t(u64, eend, end_block);
 
+        cetrafs_map_yield(i);
         if (hs >= he)
             continue;
         if (hs > estart && he < eend)
@@ -3845,6 +3870,7 @@ static int cetrafs_leaf_array_punch(struct super_block *sb,
         u64 hs = max_t(u64, estart, start_block); /* [hs, he) is this entry's overlap with the hole */
         u64 he = min_t(u64, eend, end_block);
 
+        cetrafs_map_yield(i);
         if (hs >= he) {
             arr[w++] = e; /* no overlap with the hole */
             continue;

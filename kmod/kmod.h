@@ -632,6 +632,15 @@ u64 cetrafs_sweep_name_walk_count(void);
 u64 cetrafs_bmap_gate_entry_count(void);
 u64 cetrafs_pf_apply_bmap_lookup_count(void);
 u64 cetrafs_run_claim_bmap_lookup_count(void);
+/* file.c: a loop over a flattened map -- up to millions of entries, under
+ * exclusive locks -- yields every 4096 entries (audit 2026-11-22 N-18). */
+void __cetrafs_map_yield(void);
+static inline void cetrafs_map_yield(u64 i)
+{
+    if (i && !(i & 4095))
+        __cetrafs_map_yield();
+}
+u64 cetrafs_map_yield_count(void);
 u64 cetrafs_defrag_run_bmap_lookup_count(void); /* alloc.c: bitmap block lookups of the defrag run allocator */
 u64 cetrafs_dio_privs_xattr_reads_count(void);
 u32 cetrafs_sb_next_bmap_alloc_dirty(struct super_block *sb, u32 from);
