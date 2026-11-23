@@ -5112,6 +5112,8 @@ struct cetrafs_bg_claim_ctx {
     u32 bg_id;
     u64 seq;        /* the count's ownership epoch on the image the claim landed on */
     u16 old_flags;  /* the flags before the claim, for its undo */
+    bool want_count; /* refuse an image whose free count is not want_free (N-279) */
+    u64 want_free;   /* the count the pool shard was debited by */
 };
 
 /* Give back a claim that landed but cannot be used: owner back to the
@@ -5161,6 +5163,13 @@ static int cetrafs_bg_claim_mutate(void *image, unsigned int len, void *priv)
      * refused all the same, since taking it would put data where an
      * UNMAP may still land. */
     if (cetrafs_le16(bg->flags) & CETRAFS_BG_FLAG_DISCARD_PENDING)
+        return -EAGAIN;
+    /* The pool was debited by the count read before the swap. A peer
+     * that claimed, used and released the group in between left another
+     * count: taken anyway, the shard drifted by the difference until
+     * fsck. Refused, the debit is given back and the scan goes on
+     * (audit 2026-11-22 N-279). */
+    if (ctx->want_count && cetrafs_le64(bg->free_data_blocks) != ctx->want_free)
         return -EAGAIN;
 
     ctx->seq = cetrafs_le64(bg->reconcile_seq);
@@ -5947,6 +5956,12 @@ static void cetrafs_bg_claim_pool_stall(u32 b)
     }
 }
 
+/* TEST ONLY: the claim swaps whatever count the image holds, as before
+ * audit 2026-11-22 N-279 (tests/kernel/bg_claim_pool_order.sh). */
+static bool cetrafs_bg_claim_count_unchecked;
+cetrafs_test_param(bg_claim_count_unchecked, cetrafs_bg_claim_count_unchecked, bool, 0644);
+MODULE_PARM_DESC(bg_claim_count_unchecked, "TEST ONLY: a Block Group claim does not require the count it debited");
+
 static int __cetrafs_bg_claim_one(struct super_block *sb, u32 zg_id, u32 b, bool prefetched)
 {
     struct cetrafs_bg_claim_ctx ctx = {.zg_id = zg_id, .bg_id = b};
@@ -5975,8 +5990,8 @@ static int __cetrafs_bg_claim_one(struct super_block *sb, u32 zg_id, u32 b, bool
         return -EAGAIN;
 
     /*
-     * The pool shard first, from the count of the very image the swap
-     * below compares. Swapped first and debited after, a crash between
+     * The pool shard first, by the count read here -- which the swap
+     * below requires the image still to hold (ctx.want_count). Swapped first and debited after, a crash between
      * left the group owned AND counted in the pool: statfs overstated by
      * a whole Block Group until fsck -r (audit 2026-11-22 N-15). Debited
      * first, the same crash understates -- the release's order, which
@@ -5988,6 +6003,8 @@ static int __cetrafs_bg_claim_one(struct super_block *sb, u32 zg_id, u32 b, bool
             pr_warn("BG %u: its pool shard debit failed before the claim -- df will overstate until fsck\n", b);
         else
             debited = geom.free_data_blocks;
+        ctx.want_count = !READ_ONCE(cetrafs_bg_claim_count_unchecked);
+        ctx.want_free = geom.free_data_blocks;
         cetrafs_bg_claim_pool_stall(b);
     }
 

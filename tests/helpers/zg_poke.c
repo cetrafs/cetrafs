@@ -53,6 +53,7 @@ int main(int argc, char **argv)
     if (argc != 3 && argc != 4 && argc != 5) {
         fprintf(stderr, "usage: %s <image> <zg_id> [<owner_node_id>]\n", argv[0]);
         fprintf(stderr, "       %s <image> <zg_id> free <blocks>   (set the aggregate)\n", argv[0]);
+        fprintf(stderr, "       %s <image> <zg_id> pool <blocks>   (set the pool shard, pool_free_blocks)\n", argv[0]);
         fprintf(stderr, "       %s <image> <zg_id> badsum           (invalidate the hot checksum)\n", argv[0]);
         fprintf(stderr, "       %s <image> <zg_id> bumpseq          (advance hb_seq: the owner re-asserting)\n", argv[0]);
         fprintf(stderr, "       %s <image> <zg_id> seq              (print hb_seq)\n", argv[0]);
@@ -64,13 +65,14 @@ int main(int argc, char **argv)
     const char *path = argv[1];
     uint32_t zg_id = (uint32_t) strtoul(argv[2], NULL, 0);
     bool free_mode = (argc == 5 && !strcmp(argv[3], "free"));
+    bool pool_mode = (argc == 5 && !strcmp(argv[3], "pool"));
     bool badsum_mode = (argc == 4 && !strcmp(argv[3], "badsum"));
     bool bumpseq_mode = (argc == 4 && !strcmp(argv[3], "bumpseq"));
     bool seq_mode = (argc == 4 && !strcmp(argv[3], "seq"));
     bool stamp_mode = (argc == 4 && !strcmp(argv[3], "stamp"));
-    bool write_mode = ((argc == 4) || free_mode) && !seq_mode && !stamp_mode;
+    bool write_mode = ((argc == 4) || free_mode || pool_mode) && !seq_mode && !stamp_mode;
     uint16_t owner = (argc == 4) ? (uint16_t) strtoul(argv[3], NULL, 0) : 0;
-    uint64_t set_free = free_mode ? strtoull(argv[4], NULL, 0) : 0;
+    uint64_t set_free = (free_mode || pool_mode) ? strtoull(argv[4], NULL, 0) : 0;
 
     int fd = open(path, write_mode ? O_RDWR : O_RDONLY);
     if (fd < 0) {
@@ -136,6 +138,8 @@ int main(int argc, char **argv)
 
     if (free_mode)
         zg.free_data_blocks = cetrafs_cpu_to_le64(set_free);
+    else if (pool_mode)
+        zg.pool_free_blocks = cetrafs_cpu_to_le64(set_free); /* a hot field too */
     else
         zg.owner_node_id = cetrafs_cpu_to_le16(owner);
     /* v0x0009: owner_node_id is a HOT field -- restamp the hot checksum
@@ -150,6 +154,8 @@ int main(int argc, char **argv)
 
     if (free_mode)
         printf("zg_poke: ZG%u free_data_blocks -> %llu\n", zg_id, (unsigned long long) set_free);
+    else if (pool_mode)
+        printf("zg_poke: ZG%u pool_free_blocks -> %llu\n", zg_id, (unsigned long long) set_free);
     else
         printf("zg_poke: ZG%u owner_node_id -> %u\n", zg_id, owner);
     return 0;
