@@ -1770,11 +1770,13 @@ static int cetrafs_zg_claim_one_more_locked(struct super_block *sb, u32 count, u
             continue; /* already ours -- not a claim candidate */
 
         if (info.owner_node_id != CETRAFS_NODE_ID_NONE) {
-            ret = cetrafs_node_is_stale(sb, info.owner_node_id, &stale);
-            if (ret)
-                return ret;
-            if (!stale)
-                continue; /* live foreign owner: not eligible */
+            /* An owner row we cannot read is one we cannot call stale:
+             * not eligible, like a live one -- and the scan goes on, as
+             * it does past an unreadable Zone Group record. Returning
+             * the error failed the whole claim over one peer's row
+             * while unowned groups sat further down the table (N-30). */
+            if (cetrafs_node_is_stale(sb, info.owner_node_id, &stale) || !stale)
+                continue; /* live foreign owner, or unknown: not eligible */
             if (!may_steal) {
                 /* Not ours to take here: remember the roomiest, for
                  * the heartbeat, in case nothing unowned turns up. */
