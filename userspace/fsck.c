@@ -1101,6 +1101,142 @@ static int fsck_live_dangling_holds(int fd, const cetrafs_superblock_t *sb, uint
 }
 
 /*
+ * One directory's names, gathered while its blocks are walked and judged
+ * after (audit 2026-11-22 N-49). The walk counted references and nothing
+ * else, so two entries with one name -- a lookup finds only one of them,
+ * and unlinking it leaves the other naming a file whose count went down
+ * -- or a name no create can make read as a clean volume.
+ */
+typedef struct {
+    char *name;
+    uint64_t blk;
+    uint64_t ino;
+    uint32_t slot;
+    uint16_t len;
+} fsck_dname_t;
+
+typedef struct {
+    fsck_dname_t *v;
+    size_t n, cap;
+} fsck_dnames_t;
+
+static void fsck_dnames_add(fsck_dnames_t *d, const char *name, uint16_t len, uint64_t blk, uint32_t slot, uint64_t ino)
+{
+    if (d->n == d->cap) {
+        d->cap = d->cap ? d->cap * 2 : 256;
+        d->v = (fsck_dname_t *) realloc(d->v, d->cap * sizeof(*d->v));
+        if (!d->v)
+            diex("realloc");
+    }
+    d->v[d->n].name = (char *) xcalloc(len ? len : 1, 1);
+    memcpy(d->v[d->n].name, name, len);
+    d->v[d->n].len = len;
+    d->v[d->n].blk = blk;
+    d->v[d->n].slot = slot;
+    d->v[d->n].ino = ino;
+    d->n++;
+}
+
+static void fsck_dnames_reset(fsck_dnames_t *d)
+{
+    for (size_t i = 0; i < d->n; ++i)
+        free(d->v[i].name);
+    d->n = 0;
+}
+
+static int fsck_dname_cmp(const void *a, const void *b)
+{
+    const fsck_dname_t *x = (const fsck_dname_t *) a, *y = (const fsck_dname_t *) b;
+    int c;
+
+    if (x->len != y->len)
+        return x->len < y->len ? -1 : 1;
+    c = memcmp(x->name, y->name, x->len);
+    if (c)
+        return c;
+    return x->blk != y->blk ? (x->blk < y->blk ? -1 : 1) : (x->slot < y->slot ? -1 : (x->slot > y->slot));
+}
+
+/* A name as it can be printed: bytes outside printable ASCII escaped,
+ * long names cut. */
+static void fsck_put_name(FILE *f, const char *name, uint16_t len)
+{
+    uint16_t shown = len > 64 ? 64 : len;
+
+    fputc('\'', f);
+    for (uint16_t i = 0; i < shown; ++i) {
+        unsigned char c = (unsigned char) name[i];
+
+        if (c >= 0x20 && c < 0x7f && c != '\'' && c != '\\')
+            fputc(c, f);
+        else
+            fprintf(f, "\\x%02x", c);
+    }
+    fputc('\'', f);
+    if (shown < len)
+        fprintf(f, "...(%u bytes)", (unsigned) len);
+}
+
+/* What no create can name an entry, or NULL. '.' and '..' are judged by
+ * where they stand, by the caller. */
+static const char *fsck_name_impossible(const char *name, uint16_t len)
+{
+    if (len == 0)
+        return "an empty name";
+    if (memchr(name, '/', len))
+        return "a name containing '/'";
+    if (memchr(name, 0, len))
+        return "a name containing a NUL byte";
+    return NULL;
+}
+
+/* --live: does slot 'slot' of dirent block 'blk' still hold this name? */
+static int fsck_live_name_holds(int fd, const fsck_dname_t *e)
+{
+    uint8_t blk[CETRAFS_BLOCK_SIZE];
+    const cetrafs_dirent_t *de = (const cetrafs_dirent_t *) blk;
+
+    pread_all(fd, blk, sizeof(blk), (off_t) e->blk * CETRAFS_BLOCK_SIZE);
+    if (!cetrafs_blk_struct_ok(blk, CETRAFS_DIRENT_TAIL_MAGIC) || cetrafs_le64(de[e->slot].inode) == 0)
+        return 0;
+    return cetrafs_le16(de[e->slot].name_len) == e->len && !memcmp(de[e->slot].name, e->name, e->len);
+}
+
+/* Report every name 'd' holds more than once; the number of such names. */
+static unsigned fsck_dnames_dups(int fd, fsck_dnames_t *d, uint64_t dir_ino, int live)
+{
+    unsigned found = 0;
+
+    qsort(d->v, d->n, sizeof(*d->v), fsck_dname_cmp);
+    for (size_t i = 0; i < d->n;) {
+        size_t j = i + 1, held = 0;
+
+        while (j < d->n && d->v[j].len == d->v[i].len && !memcmp(d->v[j].name, d->v[i].name, d->v[i].len))
+            ++j;
+        if (j - i > 1) {
+            /* A live walk reads one block after another while names come
+             * and go: an unlink and a create of one name, read on either
+             * side, are two entries that never stood together. Only the
+             * ones still there now are counted. */
+            for (size_t k = i; k < j; ++k)
+                held += !live || fsck_live_name_holds(fd, &d->v[k]);
+            if (held > 1) {
+                fprintf(stderr, "ERR: directory inode %" PRIu64 " holds the name ", dir_ino);
+                fsck_put_name(stderr, d->v[i].name, d->v[i].len);
+                fprintf(stderr, " %zu times (inodes", held);
+                for (size_t k = i; k < j; ++k)
+                    fprintf(stderr, " %" PRIu64, d->v[k].ino);
+                fprintf(stderr, ") -- a lookup finds one, and an unlink through it leaves the other naming a file "
+                                "whose count went down\n");
+                found++;
+            }
+        }
+        i = j;
+    }
+    return found;
+}
+
+/*
  * --live: is inode 'ino' still the record the table walk judged -- bit
  * set, same generation, same nlink? The table is read long before the
  * dirents, and a file deleted (or deleted and recreated under the same
@@ -6159,6 +6295,9 @@ int main(int argc, char **argv)
         uint32_t *dot_tgt = (uint32_t *) xcalloc(cetrafs_le32(sb.inodes_count) + 1, sizeof(uint32_t));
         uint32_t *dotdot_tgt = (uint32_t *) xcalloc(cetrafs_le32(sb.inodes_count) + 1, sizeof(uint32_t));
         uint32_t *parent = (uint32_t *) xcalloc(cetrafs_le32(sb.inodes_count) + 1, sizeof(uint32_t));
+        /* The directory being walked's names (fsck_dnames_dups()). */
+        fsck_dnames_t dnames = { 0 };
+        const int names_checked = !cetrafs_test_env("CETRAFS_FSCK_TEST_NAMES_UNCHECKED");
         uint8_t *walked = (uint8_t *) xcalloc(cetrafs_le32(sb.inodes_count) + 1, 1);
         uint32_t *nlinks = (uint32_t *) xcalloc(cetrafs_le32(sb.inodes_count) + 1, sizeof(uint32_t));
         uint8_t *unverified = (uint8_t *) xcalloc(cetrafs_le32(sb.inodes_count) + 1, 1);
@@ -6295,6 +6434,7 @@ int main(int argc, char **argv)
              * never looked at and must not be reported as missing them. */
             walked[ino] = 1;
             dwhole[ino] = 1; /* until a block is skipped below */
+            fsck_dnames_reset(&dnames);
 
             /* By logical block, so the block holding '.' and '..' is
              * met as logical 0 whatever order the tree's arrays hold. */
@@ -6428,6 +6568,26 @@ int main(int argc, char **argv)
                             continue;
                         dirents_seen++;
                         dslots[ino]++; /* every occupied slot is in the size, valid or not */
+                        if (names_checked) {
+                            const uint16_t nl = cetrafs_le16(de[s].name_len);
+                            const char *why = fsck_name_impossible(de[s].name, nl);
+
+                            fsck_dnames_add(&dnames, de[s].name, nl, phys + k, s, cetrafs_le64(de[s].inode));
+                            /* Still a reference: the entry names its
+                             * target whatever it is called, and the
+                             * target's count includes it. Reported,
+                             * not repaired -- what it was meant to be
+                             * called cannot be known. */
+                            if (why) {
+                                fprintf(stderr,
+                                        "ERR: directory inode %" PRIu64 " block %" PRIu64 " slot %u names inode %" PRIu64
+                                        " with %s, which no create can make: ",
+                                        ino, phys + k, s, (uint64_t) cetrafs_le64(de[s].inode), why);
+                                fsck_put_name(stderr, de[s].name, nl);
+                                fputc('\n', stderr);
+                                problems++;
+                            }
+                        }
                         if (cetrafs_le64(de[s].inode) > cetrafs_le32(sb.inodes_count)) {
                             fprintf(stderr,
                                     "ERR: directory %" PRIu64 " has an entry for inode %" PRIu64
@@ -6442,11 +6602,34 @@ int main(int argc, char **argv)
                          * directory's own nlink convention. Recorded
                          * rather than skipped outright, so where they
                          * POINT can be checked after the walk. */
+                        /* Where they stand is part of what they are:
+                         * '.' is the first slot of the first block (the
+                         * kernel identifies a directory's block by it),
+                         * '..' is in the first block (mkdir writes it
+                         * there, rename looks for it there). One found
+                         * anywhere else is neither, and is not taken as
+                         * the directory's. */
                         if (cetrafs_le16(de[s].name_len) == 1 && de[s].name[0] == '.') {
+                            if (names_checked && (logical != 0 || s != 0)) {
+                                fprintf(stderr,
+                                        "ERR: directory inode %" PRIu64 " has a '.' entry at logical block %" PRIu64
+                                        " slot %u -- '.' is the first slot of the first block\n",
+                                        ino, logical, s);
+                                problems++;
+                                continue;
+                            }
                             dot_tgt[ino] = cetrafs_le64(de[s].inode);
                             continue;
                         }
                         if (cetrafs_le16(de[s].name_len) == 2 && de[s].name[0] == '.' && de[s].name[1] == '.') {
+                            if (names_checked && logical != 0) {
+                                fprintf(stderr,
+                                        "ERR: directory inode %" PRIu64 " has a '..' entry at logical block %" PRIu64
+                                        " slot %u -- '..' is in the first block\n",
+                                        ino, logical, s);
+                                problems++;
+                                continue;
+                            }
                             dotdot_tgt[ino] = cetrafs_le64(de[s].inode);
                             continue;
                         }
@@ -6525,7 +6708,11 @@ int main(int argc, char **argv)
                 }
             }
             free(ext);
+            if (names_checked)
+                problems += fsck_dnames_dups(fd, &dnames, ino, live_pass);
+            fsck_dnames_reset(&dnames);
         }
+        free(dnames.v);
 
         /* Before the orphan pass below: it links into lost+found, which
          * moves that directory's entries past what the walk counted. */

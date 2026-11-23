@@ -4,10 +4,11 @@
  * block on a raw, UNMOUNTED cetrafs image, restamping the block's tail
  * CRC so the block stays checksum-valid.
  *
- * usage: dirent_field_poke <image> <block> <slot> <name_len|file_type|inode> <value>
+ * usage: dirent_field_poke <image> <block> <slot> <name_len|file_type|inode|name_byte_<i>> <value>
  *
  * inode 0 unnames the entry, as an unlink that never reached the target's
- * record would leave it.
+ * record would leave it. name_byte_<i> sets byte i of the name: a name no
+ * create can make ('/' or NUL inside it).
  *
  * The class this reproduces is "valid CRC, impossible content": a block
  * every reader accepts by its checksum and structure check, whose entry
@@ -36,7 +37,7 @@ int main(int argc, char **argv)
     int fd;
 
     if (argc != 6) {
-        fprintf(stderr, "usage: %s <image> <block> <slot> <name_len|file_type|inode> <value>\n", argv[0]);
+        fprintf(stderr, "usage: %s <image> <block> <slot> <name_len|file_type|inode|name_byte_<i>> <value>\n", argv[0]);
         return 2;
     }
     fd = open(argv[1], O_RDWR);
@@ -61,6 +62,8 @@ int main(int argc, char **argv)
         de[slot].file_type = (uint8_t) value;
     else if (!strcmp(argv[4], "inode"))
         de[slot].inode = cetrafs_cpu_to_le64((uint64_t) value);
+    else if (!strncmp(argv[4], "name_byte_", 10) && strtoul(argv[4] + 10, NULL, 0) < CETRAFS_FILENAME_MAX)
+        de[slot].name[strtoul(argv[4] + 10, NULL, 0)] = (char) value;
     else {
         fprintf(stderr, "unknown field %s\n", argv[4]);
         return 2;
