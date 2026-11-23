@@ -2174,6 +2174,7 @@ u64 cetrafs_close_space_wait_count(void);
 void cetrafs_bh_end_update_held(struct super_block *sb, struct buffer_head *bh, bool changed);
 u64 cetrafs_held_store_retry_count(void);
 int cetrafs_held_flush(struct super_block *sb);
+bool cetrafs_alloc_flush_failing(void); /* alloc.c: TEST ONLY alloc_flush_fail */
 int cetrafs_held_flush_nowait(struct super_block *sb);
 unsigned long cetrafs_held_drop_all(struct super_block *sb);
 struct xarray *cetrafs_sb_held(struct super_block *sb);

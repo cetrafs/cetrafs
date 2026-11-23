@@ -3488,7 +3488,15 @@ int cetrafs_data_block_is_allocated(struct super_block *sb, u64 lba, bool *out_s
  */
 static bool cetrafs_alloc_flush_fail;
 cetrafs_test_param(alloc_flush_fail, cetrafs_alloc_flush_fail, bool, 0644);
-MODULE_PARM_DESC(alloc_flush_fail, "test-only: fail allocation-bitmap syncs at durability boundaries with -EIO");
+MODULE_PARM_DESC(alloc_flush_fail, "test-only: every write of an allocation-bitmap block fails with -EIO");
+
+/* The same refusal for the held-block flush (ioutil.c), which writes the
+ * same bitmap blocks by another road: a knob that failed one road only
+ * let the other land the bits, and staged no failed flush at all. */
+bool cetrafs_alloc_flush_failing(void)
+{
+    return unlikely(READ_ONCE(cetrafs_alloc_flush_fail));
+}
 
 static int cetrafs_sync_one_block(struct super_block *sb, u64 lba)
 {

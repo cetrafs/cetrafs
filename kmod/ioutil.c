@@ -636,10 +636,13 @@ static int cetrafs_held_run(struct super_block *sb, struct xarray *xa, struct bu
     unsigned int i;
     int ret = 0, r;
 
+    bool refused = cetrafs_alloc_flush_failing(); /* TEST ONLY: alloc_flush_fail, read once */
+
     atomic64_inc(&cetrafs_held_flush_batches);
     for (i = 0; i < n; i++)
-        res[i] = 0;
-    r = __cetrafs_sync_buffers_keep(sb, bhs, n, res, trylock);
+        res[i] = refused ? -EIO : 0;
+    /* Refused: nothing sent, every block stays held, as a failed write leaves it. */
+    r = refused ? -EIO : __cetrafs_sync_buffers_keep(sb, bhs, n, res, trylock);
     for (i = 0; i < n; i++) {
         struct buffer_head *bh = bhs[i];
 
