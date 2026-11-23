@@ -608,8 +608,9 @@ static int cetrafs_zg_pool_mutate(void *image, unsigned int len, void *priv)
      * reads FREE and a claim debits only AFTER it read the group FREE
      * (cetrafs_bg_release(), bg_release_pool_order.sh), so a debit
      * always follows the credit it consumes. Two claims of one group
-     * both read it FREE, and the second debit is refused here: that
-     * claim backs off without swapping (__cetrafs_bg_claim_one(),
+     * both read it FREE, and the second debit is refused here: if that
+     * claim wins, it OWES the debit and lands it once the loser's
+     * give-back is in (cetrafs_pool_owed_settle(),
      * bg_claim_racing_debit.sh), so the shard never passes through
      * zero. */
     if (want < 0) {

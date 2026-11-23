@@ -1074,6 +1074,9 @@ struct cetrafs_sb_info {
     /* FITRIM runs whose discard had an unknown outcome, each held on
      * resv_list until its quarantine ends (cetrafs_trim_quarantine_add()). */
     struct list_head trim_quarantine;
+    /* Pool debits a Block Group claim still owes: it won its swap while
+     * the shard refused the debit (cetrafs_pool_owed_settle()). */
+    struct cetrafs_pool_owed_set pool_owed;
     /* Per Zone Group: jiffies until which the scrub frees nothing in it,
      * 0 for none (cetrafs_sb_zg_scrub_hold()). */
     unsigned long zg_scrub_hold[CETRAFS_MAX_ZONE_GROUPS];
@@ -3469,6 +3472,8 @@ int cetrafs_fill_super(struct super_block *sb, struct fs_context *fc)
         mutex_init(&sbi->statfs_fill_mutex);
         INIT_LIST_HEAD(&sbi->resv_list);
         INIT_LIST_HEAD(&sbi->trim_quarantine);
+        mutex_init(&sbi->pool_owed.lock);
+        INIT_LIST_HEAD(&sbi->pool_owed.list);
 
         spin_lock_init(&sbi->peer_lock);
         sbi->peer_count = le32_to_cpu(ondisk->node_table_count);
@@ -4788,6 +4793,10 @@ bool cetrafs_free_sb_info(struct super_block *sb)
     r = cetrafs_held_flush(sb); /* the frees still held: unmarked, so not in the flush above */
     if (r && !flush_err)
         flush_err = r;
+    /* The pool debits our claims still owe: a last try, then dropped
+     * (cetrafs_pool_owed_settle()). Never an error: what is left is a
+     * shard that was already short. */
+    cetrafs_pool_owed_settle(sb, true);
     r = cetrafs_flush_dirty_free_counts(sb);
     if (r && !flush_err)
         flush_err = r;
@@ -4935,6 +4944,7 @@ departed:
     kfree(sbi->peers);
     kfree(sbi->row_silent);
     bitmap_free(sbi->row_silent_valid);
+    cetrafs_pool_owed_drop(&sbi->pool_owed); /* every path here: a stopped mount skipped the settle */
     left_stopped = stopped || READ_ONCE(sbi->fenced) || test_bit(0, &sbi->lease_lost);
     kfree(sbi);
     sb->s_fs_info = NULL;
@@ -7501,6 +7511,11 @@ void cetrafs_sb_set_discard_enabled(struct super_block *sb, bool on)
 
     if (sbi)
         WRITE_ONCE(sbi->discard_enabled, on);
+}
+
+struct cetrafs_pool_owed_set *cetrafs_sb_pool_owed(struct super_block *sb)
+{
+    return &((struct cetrafs_sb_info *) sb->s_fs_info)->pool_owed;
 }
 
 struct mutex *cetrafs_sb_trim_mutex(struct super_block *sb)

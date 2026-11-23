@@ -450,6 +450,10 @@ static void cetrafs_heartbeat_maint(struct work_struct *work)
     }
     if (!READ_ONCE(cetrafs_hb_held_flush_off))
         (void) cetrafs_held_flush_nowait(sb); /* never behind a writer waiting for space (A-4) */
+    /* Pool debits our claims owe, once the racing give-back they wait
+     * for has landed (cetrafs_pool_owed_settle(); a trylock, never
+     * behind a claim). */
+    cetrafs_pool_owed_settle(sb, false);
     /* A completed tree batch's journal entries, spent once they are a
      * beat old: their live time is bounded (cetrafs_journal_drain_aged()). */
     cetrafs_journal_drain_aged(sb, (unsigned long) cetrafs_sb_hb_interval_secs(sb) * HZ);

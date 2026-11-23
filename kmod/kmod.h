@@ -447,6 +447,16 @@ void cetrafs_sb_set_defrag_enabled(struct super_block *sb, bool on);
 bool cetrafs_sb_discard_enabled(struct super_block *sb);
 void cetrafs_sb_set_discard_enabled(struct super_block *sb, bool on);
 struct mutex *cetrafs_sb_trim_mutex(struct super_block *sb);
+
+/* alloc.c: pool debits a Block Group claim owes (cetrafs_pool_owed_settle()) */
+struct cetrafs_pool_owed_set {
+    struct mutex lock;
+    struct list_head list; /* struct cetrafs_pool_owed */
+    atomic_t n;            /* entries on the list: the heartbeat's cheap test */
+};
+struct cetrafs_pool_owed_set *cetrafs_sb_pool_owed(struct super_block *sb);
+void cetrafs_pool_owed_settle(struct super_block *sb, bool final);
+void cetrafs_pool_owed_drop(struct cetrafs_pool_owed_set *set);
 void cetrafs_sb_set_trim_claim(struct super_block *sb, u32 bg_id, u64 lba, u64 count);
 bool cetrafs_sb_trim_holds(struct super_block *sb, u64 lba);
 /* Block Groups kept drained after a hand-back discard of unknown outcome. */

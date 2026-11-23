@@ -6052,11 +6052,98 @@ static bool cetrafs_bg_claim_debit_late;
 cetrafs_test_param(bg_claim_debit_late, cetrafs_bg_claim_debit_late, bool, 0644);
 MODULE_PARM_DESC(bg_claim_debit_late, "TEST ONLY: a Block Group claim debits the pool after its swap (old order)");
 
-/* TEST ONLY: a claim whose pool debit did not land swaps all the same, as
- * before -- the control of tests/kernel/bg_claim_racing_debit.sh. */
+/* TEST ONLY: a claim whose pool debit was refused owes nothing when it
+ * wins, as before -- the control of tests/kernel/bg_claim_racing_debit.sh. */
 static bool cetrafs_bg_claim_debit_refused_ok;
 cetrafs_test_param(bg_claim_debit_refused_ok, cetrafs_bg_claim_debit_refused_ok, bool, 0644);
-MODULE_PARM_DESC(bg_claim_debit_refused_ok, "TEST ONLY: a Block Group claim swaps even when its pool debit was refused");
+MODULE_PARM_DESC(bg_claim_debit_refused_ok, "TEST ONLY: a Block Group claim that wins on a refused pool debit owes nothing");
+/* TEST ONLY: a claim whose pool debit was refused backs off without
+ * swapping -- the control of tests/kernel/bg_claim_short_shard.sh. */
+static bool cetrafs_bg_claim_refused_backoff;
+cetrafs_test_param(bg_claim_refused_backoff, cetrafs_bg_claim_refused_backoff, bool, 0644);
+MODULE_PARM_DESC(bg_claim_refused_backoff, "TEST ONLY: a Block Group claim whose pool debit was refused is not made");
+
+/* One pool debit a claim owes: the Block Group whose shard it belongs to. */
+struct cetrafs_pool_owed {
+    struct list_head link;
+    u32 bg_id;
+    u64 blocks;
+};
+
+/*
+ * Land the pool debits this node's claims owe. A claim that won its group
+ * while the shard refused its debit owes it (__cetrafs_bg_claim_one()):
+ * retried here at once, on every heartbeat, and a last time at unmount.
+ * An owed debit is the right move whenever it CAN land -- the group is
+ * ours and was counted in the pool -- and the shard refusing it means it
+ * does not hold the count yet: a racing claim's give-back still on its
+ * way, or a shard already short, whose shortage this debit would only
+ * have deepened. 'final' drops what is still refused, saying so.
+ */
+void cetrafs_pool_owed_settle(struct super_block *sb, bool final)
+{
+    struct cetrafs_pool_owed_set *set = cetrafs_sb_pool_owed(sb);
+    struct cetrafs_pool_owed *o, *tmp;
+
+    if (!atomic_read(&set->n))
+        return;
+    if (final)
+        mutex_lock(&set->lock);
+    else if (!mutex_trylock(&set->lock))
+        return; /* another settle is at it; the next beat retries */
+    list_for_each_entry_safe(o, tmp, &set->list, link) {
+        int r = cetrafs_zg_adjust_pool_blocks(sb, o->bg_id, -(s64) o->blocks);
+
+        if (r == 0)
+            pr_info("BG %u: the claim's owed pool debit of %llu landed\n", o->bg_id, (unsigned long long) o->blocks);
+        else if (final && r == -EINVAL)
+            pr_info("BG %u: the claim's owed pool debit of %llu is dropped -- the shard was short of it (fsck -r)\n",
+                    o->bg_id, (unsigned long long) o->blocks);
+        else if (final)
+            pr_warn("BG %u: the claim's owed pool debit of %llu has no known outcome (%d) -- df may overstate until "
+                    "fsck\n",
+                    o->bg_id, (unsigned long long) o->blocks, r);
+        else
+            continue;
+        list_del(&o->link);
+        atomic_dec(&set->n);
+        kfree(o);
+    }
+    mutex_unlock(&set->lock);
+}
+
+/* Free whatever is left, with no I/O: the mount's last step. */
+void cetrafs_pool_owed_drop(struct cetrafs_pool_owed_set *set)
+{
+    struct cetrafs_pool_owed *o, *tmp;
+
+    list_for_each_entry_safe(o, tmp, &set->list, link) {
+        pr_warn("BG %u: the claim's owed pool debit of %llu was never landed -- df may overstate until fsck\n",
+                o->bg_id, (unsigned long long) o->blocks);
+        list_del(&o->link);
+        kfree(o);
+    }
+    atomic_set(&set->n, 0);
+}
+
+static void cetrafs_pool_owe(struct super_block *sb, u32 b, u64 blocks)
+{
+    struct cetrafs_pool_owed_set *set = cetrafs_sb_pool_owed(sb);
+    struct cetrafs_pool_owed *o = kmalloc(sizeof(*o), GFP_NOFS);
+
+    if (!o) {
+        pr_warn("BG %u: no memory to remember the claim's owed pool debit of %llu -- df may overstate until fsck\n",
+                b, (unsigned long long) blocks);
+        return;
+    }
+    o->bg_id = b;
+    o->blocks = blocks;
+    mutex_lock(&set->lock);
+    list_add_tail(&o->link, &set->list);
+    atomic_inc(&set->n);
+    mutex_unlock(&set->lock);
+    cetrafs_pool_owed_settle(sb, false); /* a racing give-back may be in already */
+}
 
 static void cetrafs_bg_claim_pool_stall(u32 b)
 {
@@ -6078,7 +6165,7 @@ static int __cetrafs_bg_claim_one(struct super_block *sb, u32 zg_id, u32 b, bool
 {
     struct cetrafs_bg_claim_ctx ctx = {.zg_id = zg_id, .bg_id = b};
     struct cetrafs_bg_geom geom;
-    u64 total = 0, free = 0, debited = 0;
+    u64 total = 0, free = 0, debited = 0, owed = 0;
     bool late = READ_ONCE(cetrafs_bg_claim_debit_late);
     int ret;
 
@@ -6110,29 +6197,41 @@ static int __cetrafs_bg_claim_one(struct super_block *sb, u32 zg_id, u32 b, bool
      * credits the shard before its descriptor reads FREE. A refused swap
      * gives the debit back; an unknown outcome keeps it (understating).
      *
-     * A debit that did not land ends the attempt here. The shard refuses
-     * to go below zero, and the usual reason it would is another claim of
-     * this very group -- a peer's, or another writer's on this node --
-     * that read it FREE too and debited first. Swapping on regardless,
-     * this claim could win the group while the one holding the debit
-     * lost its swap and gave the debit back: the group owned and its
-     * count in the pool, df over by a whole Block Group until fsck -r
-     * (bg_claim_racing_debit.sh). Backing off, the claim that holds the
-     * debit is the only one that may own the group, and if it loses
-     * too, its give-back makes the group claimable again.
+     * A debit the shard REFUSED (it would go below zero) did not land,
+     * and there are two reasons for it that this claim cannot tell
+     * apart. Another claim of this very group -- a peer's, or another
+     * writer's on this node -- read it FREE too and debited first; or
+     * the shard is short, as a crash between a claim's debit and its
+     * swap, a swap of unknown outcome that did not land, or a dead
+     * grow's clamped takeback leave it on purpose. So the claim goes on,
+     * and a win OWES the debit (cetrafs_pool_owed_settle()). In a race,
+     * the loser gives its debit back and the owed one then lands: no
+     * Block Group owned with its count still in the pool
+     * (bg_claim_racing_debit.sh). With a short shard, it never lands and
+     * is dropped at unmount -- the group claimed, the shortage carried,
+     * nothing stranded (bg_claim_short_shard.sh). Backing off instead
+     * stranded such a group until fsck -r.
+     *
+     * Any other failure is an outcome not known: the debit may have
+     * landed, so it is neither owed nor given back -- understating.
      */
     if (!late && geom.free_data_blocks) {
         ret = cetrafs_zg_adjust_pool_blocks(sb, b, -(s64) geom.free_data_blocks);
-        if (ret && !READ_ONCE(cetrafs_bg_claim_debit_refused_ok)) {
-            pr_info_ratelimited("BG %u: its pool shard did not take the claim's debit (%d) -- another claim holds it, "
-                                "or the shard understates (fsck -r); not claimed\n",
-                                b, ret);
-            return -EAGAIN;
+        if (ret == -EINVAL && READ_ONCE(cetrafs_bg_claim_refused_backoff)) {
+            pr_info("BG %u: its pool shard refused the claim's debit -- not claimed (test)\n", b);
+            return -EAGAIN; /* TEST ONLY: the stranding order, see the parameter */
         }
-        if (ret)
-            pr_warn("BG %u: its pool shard debit failed before the claim -- df will overstate until fsck\n", b);
-        else
+        if (ret == -EINVAL) {
+            pr_info_ratelimited("BG %u: its pool shard refused the claim's debit -- owed if the claim wins\n", b);
+            if (!READ_ONCE(cetrafs_bg_claim_debit_refused_ok))
+                owed = geom.free_data_blocks;
+        } else if (ret) {
+            pr_warn("BG %u: its pool shard debit before the claim has no known outcome (%d) -- df may understate "
+                    "until fsck\n",
+                    b, ret);
+        } else {
             debited = geom.free_data_blocks;
+        }
         ctx.want_count = !READ_ONCE(cetrafs_bg_claim_count_unchecked);
         ctx.want_free = geom.free_data_blocks;
         cetrafs_bg_claim_pool_stall(b);
@@ -6189,6 +6288,8 @@ static int __cetrafs_bg_claim_one(struct super_block *sb, u32 zg_id, u32 b, bool
         if (READ_ONCE(cetrafs_pool_claim_undo_off)) {
             pr_warn("BG %u: claimed, but its cached bitmap could not be dropped (%d) -- left out of reach\n", b,
                     ret);
+            if (owed)
+                cetrafs_pool_owe(sb, b, owed); /* owned all the same */
             return ret;
         }
         uret = cetrafs_cas_record(sb, cetrafs_sb_bg_desc_lba(sb, b), cetrafs_bg_unclaim_mutate, &ctx);
@@ -6196,6 +6297,8 @@ static int __cetrafs_bg_claim_one(struct super_block *sb, u32 zg_id, u32 b, bool
             pr_err("BG %u: claimed, its cached bitmap could not be dropped (%d), and the claim could not be undone "
                    "(%d) -- owned and out of reach until a remount\n",
                    b, ret, uret);
+            if (owed)
+                cetrafs_pool_owe(sb, b, owed); /* owned all the same */
             return ret;
         }
         pr_warn("BG %u: claimed, but its cached bitmap could not be dropped (%d) -- given back to the pool\n", b,
@@ -6205,6 +6308,9 @@ static int __cetrafs_bg_claim_one(struct super_block *sb, u32 zg_id, u32 b, bool
                     b);
         return -EAGAIN; /* try another group */
     }
+    /* The claim stands: a debit the shard refused is owed now. */
+    if (owed)
+        cetrafs_pool_owe(sb, b, owed);
     /* Ownership is entering this node's cache, so its count epoch
      * must too -- BEFORE set_bg_owner() makes the Block Group
      * allocatable, or the first deltas accrue under whatever epoch

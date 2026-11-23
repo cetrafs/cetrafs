@@ -66,8 +66,8 @@ round() {
     sync
 
     ct_param_set bg_release_credit_late "$late"
-    # The control is the old world whole: a claim then swapped on a refused
-    # debit too, and now backs off (bg_claim_racing_debit.sh).
+    # The control is the old world whole: a claim that won on a refused
+    # debit then owed nothing, and now owes it (bg_claim_racing_debit.sh).
     ct_param_set bg_claim_debit_refused_ok "$late"
     ct_param_set bg_release_stall_ms 15000
     mark="$(dmesg_mark)"
@@ -88,7 +88,7 @@ round() {
     ct_param_set bg_claim_debit_refused_ok 0
     ct_param_set release_claim_unlocked 0
     # The claim debits before its swap (N-15) or, old order, after it.
-    n="$(dmesg_since "$mark" | grep -cE "pool shard (debit failed( before the claim)?|did not take the claim's debit)" || true)"
+    n="$(dmesg_since "$mark" | grep -cE "pool shard (debit failed( before the claim)?|refused the claim's debit)" || true)"
     ct_umount "$MNT"
     err="$(ct_fsck "$DEV" 2>&1 | grep -c '^ERR' || true)"
     ct_fsck "$DEV" 2>&1 | grep '^ERR' | head -3 >&2 || true

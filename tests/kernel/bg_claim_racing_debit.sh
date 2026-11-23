@@ -1,28 +1,29 @@
 #!/usr/bin/env bash
 # SPDX-License-Identifier: GPL-2.0-or-later
-# two claims of one Block Group: the one whose pool debit was refused never owns it
+# two claims of one Block Group: a win on a refused pool debit owes the debit
 #
 # A claim debits the unowned pool's shard by the group's count, then swaps
 # the descriptor to its owner (bg_claim_pool_order.sh). Two claims of the
 # same group both read it FREE; the shard takes the first debit and
 # refuses the second, which would take it below zero. The second claim
-# went on and swapped anyway -- and won, while the first, holding the
-# debit, lost its swap and gave the debit back: the group owned AND its
-# count in the pool, fsck "pool_free_blocks 130816 != 0", df over by a
-# whole Block Group. Two writers running out of space together are
-# enough (bg_claim_free.sh caught it under load). A claim whose debit did
-# not land now backs off without swapping.
+# went on and swapped -- and won, while the first, holding the debit,
+# lost its swap and gave the debit back: the group owned AND its count
+# in the pool, fsck "pool_free_blocks 130816 != 0", df over by a whole
+# Block Group. Two writers running out of space together are enough
+# (bg_claim_free.sh caught it under load). A claim that wins on a
+# refused debit now OWES it, and lands it once the loser's give-back is
+# in (cetrafs_pool_owed_settle()).
 #
 # Staged on one node: two Block Groups, the second released to the pool.
 # Writer A runs out of space and claims it, and is held between its debit
 # and its swap (bg_claim_pool_stall_ms). Writer B runs out of space
 # meanwhile and reaches the same group:
-#   setup: B's claim found the shard's debit refused;
-#   1. B did not own the group -- A did;
+#   setup: B's claim found the shard's debit refused, and B won the group;
+#   1. B's owed debit landed after A's give-back;
 #   2. fsck clean: the pool shard holds what is really unowned.
 #
-# DISCRIMINATION: bg_claim_debit_refused_ok=1 lets B swap regardless: B
-# owns the group and fsck reports the pool shard over by its size.
+# DISCRIMINATION: bg_claim_debit_refused_ok=1 -- B wins and owes nothing:
+# fsck reports the pool shard over by the group's size.
 set -euo pipefail
 . "$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)/lib/harness.sh"
 require_root
@@ -41,9 +42,9 @@ done
 ct_param_set scrub 0
 ct_param_set auto_defrag 0
 
-# round <tag> <refused_ok 0|1> -> RES "<B refused 0|1> <owner while A held> <pool ERR lines> <ERR lines>"
+# round <tag> <refused_ok 0|1> -> RES "<B refused 0|1> <owner while A held> <pool ERR lines> <ERR lines> <owed landed>"
 round() {
-    local dev mark i=0 wa wb refused owner perr err out
+    local dev mark i=0 wa wb refused owner perr err out landed
     dev="$(ct_dev 1200 "bgcrd$1")"
     ct_mkfs "$dev" -z 1 -b 512 -J 0 -N 1024 -f >/dev/null
     [ "$("$MAP" "$dev" | sed -n 's/^counts [0-9]* //p')" = 2 ] || { RES="setup-2bg"; return; }
@@ -73,9 +74,9 @@ round() {
     # B, while A is held: it runs out of space and reaches the same group.
     ( dd if=/dev/zero of="$MNT/b" bs=1M count=64 conv=fsync status=none 2>/dev/null || true ) &
     wb=$!
-    wait_for 8 'dmesg_since "'"$mark"'" | grep -qE "BG 1: its pool shard (did not take|debit failed before)"' || true
+    wait_for 8 'dmesg_since "'"$mark"'" | grep -q "BG 1: its pool shard refused the claim"' || true
     refused=0
-    dmesg_since "$mark" | grep -qE "BG 1: its pool shard (did not take|debit failed before)" && refused=1
+    dmesg_since "$mark" | grep -q "BG 1: its pool shard refused the claim" && refused=1
     # Who owns the group while A is still held: B, if B swapped.
     owner="$("$MAP" "$dev" | awk '/^bg 1 /{split($3,a,"="); print a[2]}')"
     wait "$wa" || true
@@ -83,27 +84,28 @@ round() {
     ct_param_set bg_claim_pool_stall_ms 0
     ct_param_set bg_claim_debit_refused_ok 0
     ct_umount "$MNT"
+    landed="$(dmesg_since "$mark" | grep -c "BG 1: the claim's owed pool debit of [0-9]* landed" || true)"
     out="$(ct_fsck "$dev" 2>&1 || true)"
     perr="$(grep -c 'pool_free_blocks' <<<"$out" || true)"
     err="$(grep -c '^ERR' <<<"$out" || true)"
-    RES="$refused $owner $perr $err"
+    RES="$refused $owner $perr $err $landed"
 }
 
 round f 0
-read -r FR FO FP FE <<<"$RES"
-log "fixed: B refused=$FR, owner while A was held=$FO, fsck pool lines=$FP, ERR=$FE"
+read -r FR FO FP FE FL <<<"$RES"
+log "fixed: B refused=$FR, owner while A was held=$FO, fsck pool lines=$FP, ERR=$FE, owed landed=$FL"
 round c 1
-read -r CR CO CP CE <<<"$RES"
-log "control (B swaps regardless): B refused=$CR, owner while A was held=$CO, fsck pool lines=$CP, ERR=$CE"
+read -r CR CO CP CE CL <<<"$RES"
+log "control (B owes nothing): B refused=$CR, owner while A was held=$CO, fsck pool lines=$CP, ERR=$CE"
 case "$FR" in setup-*) fail "setup: $FR"; ct_exit ;; esac
 case "$CR" in setup-*) fail "control setup: $CR"; ct_exit ;; esac
-[ "$FR" = 1 ] && [ "$CR" = 1 ] ||
-    { fail "setup: B's claim never met a refused debit (fixed $FR, control $CR) -- the race was not staged"; ct_exit; }
-[ "$FO" = 65535 ] && pass "1: B backed off -- the group stayed unowned until A, holding the debit, swapped" ||
-    fail "1: the group was owned (owner $FO) while A held the debit"
+[ "$FR" = 1 ] && [ "$CR" = 1 ] && [ "$FO" != 65535 ] && [ "$CO" != 65535 ] ||
+    { fail "setup: B did not win the group on a refused debit (fixed $FR/$FO, control $CR/$CO) -- the race was not staged"; ct_exit; }
+[ "$FL" -ge 1 ] && pass "1: B's owed debit landed once A had given its own back" ||
+    fail "1: B's owed debit never landed"
 [ "$FP" = 0 ] && [ "$FE" = 0 ] && pass "2: fsck clean -- the pool shard holds what is really unowned" ||
     fail "2: fsck reports $FE error(s), $FP on the pool shard"
-[ "$CO" != 65535 ] && [ "$CP" -ge 1 ] &&
-    pass "control: B swapped on a refused debit, owned the group, and the shard overstates ($CP pool line(s))" ||
-    fail "control: owner $CO, $CP pool line(s) -- the staging proves nothing"
+[ "$CP" -ge 1 ] &&
+    pass "control: B won owing nothing, and the shard overstates ($CP pool line(s))" ||
+    fail "control: $CP pool line(s) -- the staging proves nothing"
 ct_exit
