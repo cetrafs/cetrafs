@@ -155,6 +155,19 @@ ct_cleanup() {
     # mount and its loop device outlived the suite. The harness opens no
     # numbered descriptors of its own, so close 3..9 here.
     exec 3>&- 4>&- 5>&- 6>&- 7>&- 8>&- 9>&-
+    # The suite's own background jobs, likewise: one still running after
+    # the suite has exited keeps the file it has open on the mount -- so
+    # the umount below fails -- and keeps run.sh's output pipe open, so
+    # run.sh waits for it for ever. A reader waiting for a "go" file that
+    # a setup failure never created hung a whole gate for hours that way
+    # (kernel/close_not_behind_replay.sh). A finished suite owns no
+    # running job.
+    local j
+    for j in $(jobs -p 2>/dev/null); do
+        pkill -KILL -P "$j" 2>/dev/null
+        kill -KILL "$j" 2>/dev/null
+    done
+    wait 2>/dev/null
     local kind path
     # Mounts first, then the loop devices under them, then the module,
     # then directories, then files -- each category in reverse order of
