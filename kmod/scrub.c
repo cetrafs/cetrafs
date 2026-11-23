@@ -648,6 +648,7 @@ static u8 *scrub_read_bitmap(struct super_block *sb, const struct scrub_bg *b, i
         memcpy(buf + i * CETRAFS_BLOCK_SIZE, bh->b_data, CETRAFS_BLOCK_SIZE);
         brelse(bh);
     }
+    *errp = 0; /* the callers return it: a group with no candidates is not -ENOMEM */
     return buf;
 }
 
