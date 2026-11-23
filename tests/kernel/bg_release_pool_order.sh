@@ -83,7 +83,8 @@ round() {
     ct_param_set bg_release_off 1
     ct_param_set bg_release_credit_late 0
     ct_param_set release_claim_unlocked 0
-    n="$(dmesg_since "$mark" | grep -c "claimed but its pool shard debit failed" || true)"
+    # The claim debits before its swap (N-15) or, old order, after it.
+    n="$(dmesg_since "$mark" | grep -cE "pool shard debit failed( before the claim)?" || true)"
     ct_umount "$MNT"
     err="$(ct_fsck "$DEV" 2>&1 | grep -c '^ERR' || true)"
     ct_fsck "$DEV" 2>&1 | grep '^ERR' | head -3 >&2 || true

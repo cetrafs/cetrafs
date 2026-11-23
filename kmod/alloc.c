@@ -5926,11 +5926,33 @@ static int cetrafs_bg_claim_one(struct super_block *sb, u32 zg_id, u32 b)
     return __cetrafs_bg_claim_one(sb, zg_id, b, false);
 }
 
+/* TEST ONLY: one claim pauses between its two pool-count moves, logging
+ * it (tests/kernel/bg_claim_pool_order.sh). */
+static unsigned int cetrafs_bg_claim_pool_stall_ms;
+cetrafs_test_param(bg_claim_pool_stall_ms, cetrafs_bg_claim_pool_stall_ms, uint, 0644);
+MODULE_PARM_DESC(bg_claim_pool_stall_ms, "TEST ONLY: one Block Group claim pauses between its swap and the pool debit");
+/* TEST ONLY: the claim debits the pool after its swap, as before audit
+ * 2026-11-22 N-15 -- the control of the same suite. */
+static bool cetrafs_bg_claim_debit_late;
+cetrafs_test_param(bg_claim_debit_late, cetrafs_bg_claim_debit_late, bool, 0644);
+MODULE_PARM_DESC(bg_claim_debit_late, "TEST ONLY: a Block Group claim debits the pool after its swap (old order)");
+
+static void cetrafs_bg_claim_pool_stall(u32 b)
+{
+    unsigned int pause = READ_ONCE(cetrafs_bg_claim_pool_stall_ms) ? xchg(&cetrafs_bg_claim_pool_stall_ms, 0) : 0;
+
+    if (pause) {
+        pr_info("BG %u claim: between its counter moves, pausing %u ms (test)\n", b, pause);
+        msleep(pause);
+    }
+}
+
 static int __cetrafs_bg_claim_one(struct super_block *sb, u32 zg_id, u32 b, bool prefetched)
 {
     struct cetrafs_bg_claim_ctx ctx = {.zg_id = zg_id, .bg_id = b};
     struct cetrafs_bg_geom geom;
-    u64 total = 0, free = 0;
+    u64 total = 0, free = 0, debited = 0;
+    bool late = READ_ONCE(cetrafs_bg_claim_debit_late);
     int ret;
 
     /* Forced fresh: the cached copy can predate a peer's claim, and
@@ -5951,6 +5973,23 @@ static int __cetrafs_bg_claim_one(struct super_block *sb, u32 zg_id, u32 b, bool
         return -EAGAIN;
     if (geom.owner_zg != CETRAFS_BG_OWNER_FREE)
         return -EAGAIN;
+
+    /*
+     * The pool shard first, from the count of the very image the swap
+     * below compares. Swapped first and debited after, a crash between
+     * left the group owned AND counted in the pool: statfs overstated by
+     * a whole Block Group until fsck -r (audit 2026-11-22 N-15). Debited
+     * first, the same crash understates -- the release's order, which
+     * credits the shard before its descriptor reads FREE. A refused swap
+     * gives the debit back; an unknown outcome keeps it (understating).
+     */
+    if (!late && geom.free_data_blocks) {
+        if (cetrafs_zg_adjust_pool_blocks(sb, b, -(s64) geom.free_data_blocks))
+            pr_warn("BG %u: its pool shard debit failed before the claim -- df will overstate until fsck\n", b);
+        else
+            debited = geom.free_data_blocks;
+        cetrafs_bg_claim_pool_stall(b);
+    }
 
     if (cetrafs_bg_claim_blind) {
         /* test-only: read, decide, write -- no exclusion at all */
@@ -5973,10 +6012,15 @@ static int __cetrafs_bg_claim_one(struct super_block *sb, u32 zg_id, u32 b, bool
     } else {
         ret = cetrafs_cas_record(sb, cetrafs_sb_bg_desc_lba(sb, b), cetrafs_bg_claim_mutate, &ctx);
     }
-    if (ret == -EAGAIN)
-        return -EAGAIN; /* a peer got there first */
+    if (ret == -EAGAIN) {
+        /* A peer got there first: refused, so certainly not ours. */
+        if (debited && cetrafs_zg_adjust_pool_blocks(sb, b, (s64) debited))
+            pr_warn("BG %u: a lost claim could not give its pool debit back -- df will understate until fsck\n",
+                    b);
+        return -EAGAIN;
+    }
     if (ret)
-        return ret;
+        return ret; /* not known: the debit stays, the safe direction */
 
     /* The descriptor just changed owner, so anything holding the
      * old one must not serve it -- see
@@ -6009,6 +6053,9 @@ static int __cetrafs_bg_claim_one(struct super_block *sb, u32 zg_id, u32 b, bool
         }
         pr_warn("BG %u: claimed, but its cached bitmap could not be dropped (%d) -- given back to the pool\n", b,
                 ret);
+        if (debited && cetrafs_zg_adjust_pool_blocks(sb, b, (s64) debited))
+            pr_warn("BG %u: the undone claim could not give its pool debit back -- df will understate until fsck\n",
+                    b);
         return -EAGAIN; /* try another group */
     }
     /* Ownership is entering this node's cache, so its count epoch
@@ -6037,15 +6084,15 @@ static int __cetrafs_bg_claim_one(struct super_block *sb, u32 zg_id, u32 b, bool
      * refused, and dropped (cetrafs_zg_apply_free_delta()).
      */
     if (cetrafs_bg_data_block_stats(sb, b, &total, &free) == 0 && free) {
-        /* Debit the pool BEFORE crediting the aggregate, both by
-         * immediate CAS -- see the release path for why a lazy
-         * accrual here made peers' statfs dip by this whole Block
-         * Group, and why debit-first keeps a crash window
-         * understating rather than inventing space. The release
-         * credits the pool before the descriptor reads FREE, so a
-         * refusal here means drift, never a credit in flight. */
-        if (cetrafs_zg_adjust_pool_blocks(sb, b, -(s64) free))
-            pr_warn("BG %u: claimed but its pool shard debit failed -- df will overstate until fsck\n", b);
+        /* The pool was debited before the swap (above), so crediting
+         * the aggregate now cannot count the group twice; both moves
+         * are immediate CASes -- see the release path for why a lazy
+         * accrual made peers' statfs dip by this whole Block Group. */
+        if (late) {
+            cetrafs_bg_claim_pool_stall(b); /* test-only: the old order's window */
+            if (cetrafs_zg_adjust_pool_blocks(sb, b, -(s64) free))
+                pr_warn("BG %u: claimed but its pool shard debit failed -- df will overstate until fsck\n", b);
+        }
         if (cetrafs_zg_apply_free_delta(sb, zg_id, (s64) free))
             cetrafs_zg_adjust_free_blocks(sb, zg_id, (s64) free); /* lazy fallback: never lose the move */
     }
