@@ -1343,6 +1343,9 @@ enum cetrafs_stamp_verdict {
     CETRAFS_SV_LANDED,      /* one of this call's swaps is on the device */
     CETRAFS_SV_NOT_YET,     /* the image the swaps compared: none landed yet */
     CETRAFS_SV_NEVER,       /* a peer's first swap from that image won: none of ours ever lands */
+    /* cetrafs_cas_judge_region() only: */
+    CETRAFS_SV_BYTES,       /* the region is the swap's post-image, byte for byte */
+    CETRAFS_SV_PRE,         /* the region is the image the swap compared */
 };
 
 /*
@@ -1374,6 +1377,51 @@ static enum cetrafs_stamp_verdict cetrafs_cas_stamp_judge(u64 dev, u64 pre, cons
     if ((u32) dev == (next ? next : 1))
         return CETRAFS_SV_NEVER;
     return CETRAFS_SV_UNDECIDABLE;
+}
+
+/* TEST ONLY: the attempt-start judge of an undecided swap takes an
+ * unstamped match of bytes as exactly ours, as before audit 2026-11-22
+ * N-66 (tests/kernel/cas_late_image_only.sh's control). */
+static bool cetrafs_cas_late_judge_exact;
+/* TEST ONLY: the next swap whose caller asks about image_only (the inode
+ * bitmap's) times out and lands late, after the timeout's re-read and
+ * before the next attempt's: the attempt-start judge decides it. */
+static bool cetrafs_cas_late_image_once;
+cetrafs_test_param(cas_late_image_once, cetrafs_cas_late_image_once, bool, 0644);
+MODULE_PARM_DESC(cas_late_image_once, "TEST ONLY: the next image_only swap lands late, judged at the next attempt's start");
+cetrafs_test_param(cas_late_judge_exact, cetrafs_cas_late_judge_exact, bool, 0644);
+MODULE_PARM_DESC(cas_late_judge_exact, "TEST ONLY: a late landing judged at an attempt's start is trusted as exactly ours");
+
+/*
+ * The one judge of a region re-read after a swap of this call whose
+ * outcome was unknown: at the timeout itself, at the start of the next
+ * attempt, and after a MISCOMPARE. They were three copies, and the
+ * attempt-start one never said that a match of bytes on a region with no
+ * stamp is not proof the swap was OURS -- a peer's swap building the same
+ * bytes reads the same (the inode allocator takes the lowest free bit,
+ * B-4), so the caller that asks (*image_only) must hear it from every
+ * site (audit 2026-11-22 N-66).
+ *
+ * cur: the region now; post: the swap's post-image; pre: the image it
+ * compared, whose stamp the stamp judge needs. pre_counts: a region equal
+ * to pre is an answer (CETRAFS_SV_PRE) -- not after a MISCOMPARE, where
+ * it means the region moved and came back. exact: TEST ONLY, the old
+ * attempt-start verdict.
+ */
+static enum cetrafs_stamp_verdict cetrafs_cas_judge_region(const u8 *cur, const u8 *post, const u8 *pre,
+                                                           unsigned int region, int soff, const u64 *issued,
+                                                           unsigned int nissued, bool issued_over, bool pre_counts,
+                                                           bool *image_only, bool exact)
+{
+    if (!memcmp(cur, post, region)) {
+        if (image_only && !exact && (soff < 0 || READ_ONCE(cetrafs_cas_stamp_off_knob)))
+            *image_only = true; /* unstamped: a peer's identical swap reads the same */
+        return CETRAFS_SV_BYTES;
+    }
+    if (pre_counts && !memcmp(cur, pre, region))
+        return CETRAFS_SV_PRE;
+    return cetrafs_cas_stamp_judge(cetrafs_cas_stamp_get(cur, soff), cetrafs_cas_stamp_get(pre, soff), issued, nissued,
+                                   issued_over);
 }
 
 /*
@@ -1738,18 +1786,19 @@ static int cetrafs_cas_region_seeded_impl(struct super_block *sb,
          * the MISCOMPARE check below gives.
          */
         if (undecided) {
-            if (!memcmp(old, unknown, region)) {
+            enum cetrafs_stamp_verdict sv =
+                cetrafs_cas_judge_region(old, unknown, unknown + region, region, soff, issued, nissued, issued_over,
+                                         true, image_only, READ_ONCE(cetrafs_cas_late_judge_exact));
+
+            if (sv == CETRAFS_SV_BYTES) {
                 pr_warn("CAS lba=%llu: the timed-out command landed late -- taking it as done\n",
                         (unsigned long long) fs_lba);
                 cetrafs_cas_publish_cache(sb, fs_lba, off, unknown, region, sole_region);
                 ret = 0;
                 goto out;
             }
-            if (memcmp(old, unknown + region, region)) {
+            if (sv != CETRAFS_SV_PRE) {
                 /* G-6: the stamp says which. */
-                enum cetrafs_stamp_verdict sv = cetrafs_cas_stamp_judge(
-                    cetrafs_cas_stamp_get(old, soff), cetrafs_cas_stamp_get(unknown + region, soff), issued, nissued, issued_over);
-
                 if (sv == CETRAFS_SV_LANDED) {
                     pr_warn("CAS lba=%llu: a timed-out command landed late -- taking it as done (by its stamp)\n",
                             (unsigned long long) fs_lba);
@@ -1842,6 +1891,8 @@ static int cetrafs_cas_region_seeded_impl(struct super_block *sb,
         /* Once a swap is undecided, nothing may end this call short of
          * an answer: an -EINTR from a killed wait for a path stopped
          * the mount (M-21). */
+        if (image_only && READ_ONCE(cetrafs_cas_late_image_once) && xchg(&cetrafs_cas_late_image_once, false))
+            WRITE_ONCE(cetrafs_caw_timeout_late_preread_once, true); /* TEST ONLY: see the parameter */
         ret = cetrafs_caw(sb->s_bdev, dev_lba, 1, old, new, killable && !undecided);
         if (image_only && ret == 0 && READ_ONCE(cetrafs_cas_judged_timeout_once) &&
             xchg(&cetrafs_cas_judged_timeout_once, false))
@@ -1894,6 +1945,7 @@ static int cetrafs_cas_region_seeded_impl(struct super_block *sb,
              * or more swaps since the image ours compared.
              */
             u8 *vb = kmalloc(CETRAFS_BLOCK_SIZE, GFP_NOIO);
+            enum cetrafs_stamp_verdict sv;
 
             if (!vb || cetrafs_cas_verify_read(sb, fs_lba, vb)) {
                 kfree(vb);
@@ -1921,17 +1973,17 @@ static int cetrafs_cas_region_seeded_impl(struct super_block *sb,
                 ret = -EIO;
                 goto out;
             }
-            if (!memcmp(vb + off, new, region)) {
+            sv = cetrafs_cas_judge_region(vb + off, new, old, region, soff, issued, nissued, issued_over, true,
+                                          image_only, false);
+            if (sv == CETRAFS_SV_BYTES) {
                 pr_warn("CAS lba=%llu: command timed out but the swap IS on the device -- taking it as done\n",
                         (unsigned long long) fs_lba);
-                if (image_only && (soff < 0 || READ_ONCE(cetrafs_cas_stamp_off_knob)))
-                    *image_only = true; /* unstamped: a peer's identical swap reads the same */
                 kfree(vb);
                 cetrafs_cas_publish_cache(sb, fs_lba, off, new, region, sole_region);
                 ret = 0;
                 goto out;
             }
-            if (!memcmp(vb + off, old, region)) {
+            if (sv == CETRAFS_SV_PRE) {
                 /* Not on the device NOW. A timed-out command can still be
                  * queued on the array and land behind our back, after
                  * this re-read; keep its image, so that if the retry
@@ -1951,9 +2003,6 @@ static int cetrafs_cas_region_seeded_impl(struct super_block *sb,
                 /* G-6: the stamp says which. 'old' is the image this
                  * command compared -- every undecided one before it did
                  * too, or the read above would have decided them. */
-                enum cetrafs_stamp_verdict sv = cetrafs_cas_stamp_judge(
-                    cetrafs_cas_stamp_get(vb + off, soff), cetrafs_cas_stamp_get(old, soff), issued, nissued, issued_over);
-
                 if (sv == CETRAFS_SV_LANDED) {
                     pr_warn("CAS lba=%llu: command timed out and a swap of ours IS on the device (by its stamp) "
                             "-- taking it as done\n",
@@ -2012,21 +2061,20 @@ static int cetrafs_cas_region_seeded_impl(struct super_block *sb,
                 extra++;
                 continue; /* the next attempt's read judges it */
             }
-            if (!vret && !memcmp(vb + off, unknown, region)) {
+            enum cetrafs_stamp_verdict sv =
+                vret ? CETRAFS_SV_UNDECIDABLE
+                     : cetrafs_cas_judge_region(vb + off, unknown, unknown + region, region, soff, issued, nissued,
+                                                issued_over, false, image_only, false);
+
+            if (sv == CETRAFS_SV_BYTES) {
                 pr_warn("CAS lba=%llu: the timed-out command landed late -- taking it as done\n",
                         (unsigned long long) fs_lba);
-                if (image_only && (soff < 0 || READ_ONCE(cetrafs_cas_stamp_off_knob)))
-                    *image_only = true;
                 kfree(vb);
                 cetrafs_cas_publish_cache(sb, fs_lba, off, unknown, region, sole_region);
                 ret = 0;
                 goto out;
             }
             if (!vret) {
-                enum cetrafs_stamp_verdict sv =
-                    cetrafs_cas_stamp_judge(cetrafs_cas_stamp_get(vb + off, soff),
-                                            cetrafs_cas_stamp_get(unknown + region, soff), issued, nissued, issued_over);
-
                 if (sv == CETRAFS_SV_LANDED) {
                     pr_warn("CAS lba=%llu: the timed-out command landed late -- taking it as done (by its stamp)\n",
                             (unsigned long long) fs_lba);
