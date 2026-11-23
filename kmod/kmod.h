@@ -632,6 +632,7 @@ u64 cetrafs_sweep_name_walk_count(void);
 u64 cetrafs_bmap_gate_entry_count(void);
 u64 cetrafs_pf_apply_bmap_lookup_count(void);
 u64 cetrafs_run_claim_bmap_lookup_count(void);
+u64 cetrafs_defrag_run_bmap_lookup_count(void); /* alloc.c: bitmap block lookups of the defrag run allocator */
 u64 cetrafs_dio_privs_xattr_reads_count(void);
 u32 cetrafs_sb_next_bmap_alloc_dirty(struct super_block *sb, u32 from);
 u32 cetrafs_sb_next_release_check(struct super_block *sb, u32 from);

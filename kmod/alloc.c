@@ -2923,6 +2923,17 @@ int cetrafs_alloc_data_run(struct super_block *sb, u32 bg_id, u64 count, u64 *ou
  * FREE" about the finished move (2026-10-29, rule 5: a block must be
  * protected at the moment it becomes stealable).
  */
+/* TEST ONLY: the defrag run is searched and claimed bit by bit, as before
+ * audit 2026-11-22 N-10 (tests/kernel/defrag_run_bmap_lookups.sh). */
+static bool cetrafs_defrag_run_per_bit;
+cetrafs_test_param(defrag_run_per_bit, cetrafs_defrag_run_per_bit, bool, 0644);
+MODULE_PARM_DESC(defrag_run_per_bit, "TEST ONLY: the defrag run allocator tests and claims one bit at a time");
+static atomic64_t cetrafs_defrag_run_bmap_lookups = ATOMIC64_INIT(0);
+u64 cetrafs_defrag_run_bmap_lookup_count(void)
+{
+    return (u64) atomic64_read(&cetrafs_defrag_run_bmap_lookups);
+}
+
 int cetrafs_alloc_data_run_resv(struct super_block *sb, u32 bg_id, u64 count, u64 *out_lba,
                                 struct cetrafs_resv_span *span)
 {
@@ -2954,73 +2965,138 @@ int cetrafs_alloc_data_run_resv(struct super_block *sb, u32 bg_id, u64 count, u6
         goto out_unlock;
     }
 
-    for (bit = 0; bit < bg.data_block_count && !found; bit++) {
-        bool set = false;
+    if (READ_ONCE(cetrafs_defrag_run_per_bit)) { /* test-only: the old per-bit search and claim */
+        for (bit = 0; bit < bg.data_block_count && !found; bit++) {
+            bool set = false;
 
-        if (!(bit & 4095))
-            cond_resched(); /* up to 2^32 bits, under the mutex (class 13) */
-        ret = cetrafs_bitmap_test_bit(sb, bmap_lba, bmap_blocks, bit, &set);
+            if (!(bit & 4095))
+                cond_resched(); /* up to 2^32 bits, under the mutex (class 13) */
+            atomic64_inc(&cetrafs_defrag_run_bmap_lookups);
+            ret = cetrafs_bitmap_test_bit(sb, bmap_lba, bmap_blocks, bit, &set);
+            if (ret)
+                goto out_unlock;
+
+            if (set) {
+                run = 0;
+            } else {
+                if (run == 0)
+                    run_start = bit;
+                if (++run >= count)
+                    found = true;
+            }
+        }
+
+        if (!found) {
+            ret = -ENOSPC;
+            goto out_unlock;
+        }
+
+        for (b = 0; b < count; b++) {
+            if (!(b & 4095))
+                cond_resched(); /* class 13 */
+            if (b == 1 && READ_ONCE(cetrafs_run_alloc_fail_once) && xchg(&cetrafs_run_alloc_fail_once, false))
+                ret = -EIO; /* test-only; see the parameter */
+            else if (atomic64_inc_return(&cetrafs_defrag_run_bmap_lookups))
+                ret = cetrafs_bitmap_try_alloc_exact(sb, bmap_lba, bmap_blocks, bg.data_block_count, run_start + b,
+                                                     /*sync=*/false);
+            if (ret) {
+                int err = ret;
+
+                /* -ENOSPC: a bit this scan found free was taken. That cannot
+                 * happen while we hold the alloc mutex (sole local allocator,
+                 * sole owner of the BG), so memory and disk disagree: stop
+                 * (docs/internal/ERRORS.md). Anything else is the device
+                 * failing the read, which is the caller's error to see as it
+                 * is -- it used to be stopped as the impossible case and
+                 * reported as ENOSPC, sending the defragmenter to look for
+                 * space instead of reporting a failing disk. */
+                if (err == -ENOSPC) {
+                    cetrafs_sb_fatal(sb,
+                                     "defrag run alloc: bit %llu of a scanned-free run was taken under the alloc mutex",
+                                     (unsigned long long) (run_start + b));
+                    err = -EIO;
+                }
+                /* Give back what we took. A give-back that fails leaves the
+                 * bit set: a leak the scrub reclaims, never a block shared --
+                 * but it is said, not swallowed. */
+                while (b--) {
+                    int rc;
+
+                    if (!(b & 4095))
+                        cond_resched();
+                    rc = cetrafs_bitmap_free_bit(sb, bmap_lba, bmap_blocks, run_start + b, false);
+
+                    if (rc)
+                        pr_err_ratelimited("defrag run alloc: could not give back bit %llu of BG %u (%d) -- left "
+                                           "allocated for the scrub\n",
+                                           (unsigned long long) (run_start + b), bg_id, rc);
+                }
+                ret = err;
+                goto out_unlock;
+            }
+        }
+    } else {
+        /*
+         * Found word-wise (cetrafs_bitmap_find_run(): one read per bitmap
+         * block) and claimed holding one bitmap block at a time
+         * (cetrafs_bmap_hold_at()): it used to be a cached bitmap read and
+         * a CRC per bit tested and a restamp per bit claimed, all under
+         * alloc_mutex, which every allocation on the node waits for
+         * (audit 2026-11-22 N-10). A damaged sector is skipped by the
+         * search rather than failing the step.
+         */
+        struct cetrafs_bmap_hold h = {0};
+        u64 len = 0, off;
+
+        atomic64_inc(&cetrafs_defrag_run_bmap_lookups); /* the search */
+        ret = cetrafs_bitmap_find_run(sb, bmap_lba, bmap_blocks, bg.data_block_count, 0, count, &run_start, &len);
         if (ret)
-            goto out_unlock;
+            goto out_unlock; /* -ENOSPC, or the read's error */
+        for (b = 0; b < count; b++) {
+            if (b == 1 && READ_ONCE(cetrafs_run_alloc_fail_once) && xchg(&cetrafs_run_alloc_fail_once, false))
+                ret = -EIO; /* test-only; see the parameter */
+            else
+                ret = cetrafs_bmap_hold_at(sb, &h, bmap_lba, bmap_blocks, run_start + b, &off,
+                                           &cetrafs_defrag_run_bmap_lookups);
+            if (!ret && !cetrafs_bmap_hold_flip(&h, off, true))
+                ret = -ENOSPC;
+            if (ret) {
+                int err = ret;
 
-        if (set) {
-            run = 0;
-        } else {
-            if (run == 0)
-                run_start = bit;
-            if (++run >= count)
-                found = true;
-        }
-    }
+                /* As in the per-bit path: a bit the search found free taken
+                 * under alloc_mutex is memory and disk disagreeing. */
+                if (err == -ENOSPC) {
+                    cetrafs_bmap_hold_end(sb, &h);
+                    cetrafs_sb_fatal(sb,
+                                     "defrag run alloc: bit %llu of a scanned-free run was taken under the alloc "
+                                     "mutex",
+                                     (unsigned long long) (run_start + b));
+                    err = -EIO;
+                }
+                /* Give back what we took; one that cannot be given back
+                 * stays set -- a leak the scrub reclaims, said. */
+                while (b--) {
+                    int rc = cetrafs_bmap_hold_at(sb, &h, bmap_lba, bmap_blocks, run_start + b, &off, NULL);
 
-    if (!found) {
-        ret = -ENOSPC;
-        goto out_unlock;
-    }
-
-    for (b = 0; b < count; b++) {
-        if (!(b & 4095))
-            cond_resched(); /* class 13 */
-        if (b == 1 && READ_ONCE(cetrafs_run_alloc_fail_once) && xchg(&cetrafs_run_alloc_fail_once, false))
-            ret = -EIO; /* test-only; see the parameter */
-        else
-            ret = cetrafs_bitmap_try_alloc_exact(sb, bmap_lba, bmap_blocks, bg.data_block_count, run_start + b,
-                                                 /*sync=*/false);
-        if (ret) {
-            int err = ret;
-
-            /* -ENOSPC: a bit this scan found free was taken. That cannot
-             * happen while we hold the alloc mutex (sole local allocator,
-             * sole owner of the BG), so memory and disk disagree: stop
-             * (docs/internal/ERRORS.md). Anything else is the device
-             * failing the read, which is the caller's error to see as it
-             * is -- it used to be stopped as the impossible case and
-             * reported as ENOSPC, sending the defragmenter to look for
-             * space instead of reporting a failing disk. */
-            if (err == -ENOSPC) {
-                cetrafs_sb_fatal(sb,
-                                 "defrag run alloc: bit %llu of a scanned-free run was taken under the alloc mutex",
-                                 (unsigned long long) (run_start + b));
-                err = -EIO;
+                    if (!rc && !cetrafs_bmap_hold_flip(&h, off, false))
+                        rc = -EINVAL;
+                    if (rc)
+                        pr_err_ratelimited("defrag run alloc: could not give back bit %llu of BG %u (%d) -- left "
+                                           "allocated for the scrub\n",
+                                           (unsigned long long) (run_start + b), bg_id, rc);
+                }
+                cetrafs_bmap_hold_end(sb, &h);
+                ret = err;
+                goto out_unlock;
             }
-            /* Give back what we took. A give-back that fails leaves the
-             * bit set: a leak the scrub reclaims, never a block shared --
-             * but it is said, not swallowed. */
-            while (b--) {
-                int rc;
-
-                if (!(b & 4095))
-                    cond_resched();
-                rc = cetrafs_bitmap_free_bit(sb, bmap_lba, bmap_blocks, run_start + b, false);
-
-                if (rc)
-                    pr_err_ratelimited("defrag run alloc: could not give back bit %llu of BG %u (%d) -- left "
-                                       "allocated for the scrub\n",
-                                       (unsigned long long) (run_start + b), bg_id, rc);
+            /* The hold moves to the next block at a block boundary: yield
+             * there, holding nothing (class 13). */
+            if (!((run_start + b + 1) % CETRAFS_BMAP_BLOCK_BITS)) {
+                cetrafs_bmap_hold_end(sb, &h);
+                cond_resched();
             }
-            ret = err;
-            goto out_unlock;
         }
+        cetrafs_bmap_hold_end(sb, &h);
     }
 
     cetrafs_bg_adjust_free_blocks(sb, bg_id, -(s64) count);
