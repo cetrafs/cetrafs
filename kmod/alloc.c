@@ -2572,6 +2572,13 @@ static int cetrafs_alloc_check_owned(struct super_block *sb, u32 bg_id, const st
         goto not_ours;
     if (cetrafs_sb_zg_owned_cached(sb, bg->owner_zg))
         return 0;
+    /* Released between the pick and the descriptor read: the descriptor
+     * names its new owner (or none), and the group is no longer in
+     * owned_bgs. That is the race the re-check under alloc_mutex answers
+     * with -EAGAIN a moment later; answered -EPERM here, the write
+     * failed instead of choosing again (N-23). */
+    if (cetrafs_alloc_bg_gone(sb, bg_id))
+        return -EAGAIN;
 
 not_ours:
     pr_err("alloc: refusing to allocate from BG %u -- its zone group %u is not owned by this node\n", bg_id,
@@ -2614,6 +2621,12 @@ static bool cetrafs_alloc_test_enospc(struct super_block *sb, u32 bg_id)
 }
 MODULE_PARM_DESC(alloc_force_enospc_once, "TEST ONLY: fail the next data allocation with ENOSPC, once");
 
+/* TEST ONLY: one-shot pause between an allocation's pick of a Block
+ * Group and its descriptor read (tests/kernel/alloc_bg_released_before_read.sh). */
+static unsigned int cetrafs_alloc_pause_before_geom_ms;
+cetrafs_test_param(alloc_pause_before_geom_ms, cetrafs_alloc_pause_before_geom_ms, uint, 0644);
+MODULE_PARM_DESC(alloc_pause_before_geom_ms, "TEST ONLY: one-shot pause before an allocation reads its group's descriptor");
+
 int cetrafs_alloc_data_block(struct super_block *sb, u32 bg_id, u64 *out_lba)
 {
     struct cetrafs_bg_geom bg;
@@ -2624,6 +2637,12 @@ int cetrafs_alloc_data_block(struct super_block *sb, u32 bg_id, u64 *out_lba)
         return -ENOSPC; /* test-only; see the parameters */
     if (cetrafs_sb_is_fenced(sb))
         return -EIO; /* self-fenced */
+    if (unlikely(READ_ONCE(cetrafs_alloc_pause_before_geom_ms))) {
+        unsigned int pause = xchg(&cetrafs_alloc_pause_before_geom_ms, 0);
+
+        if (pause)
+            msleep(pause); /* TEST ONLY: see the parameter */
+    }
 
     ret = cetrafs_read_bg_geom(sb, bg_id, &bg);
     if (ret)
