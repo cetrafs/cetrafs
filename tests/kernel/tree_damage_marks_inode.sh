@@ -53,6 +53,10 @@ PY
 
     mark="$(dmesg_mark)"
     "$POKE" "$img" leaf "$fi" corrupt >/dev/null
+    # A path lookup keeps a file's caches while its file_seq stands (audit
+    # 2026-11-22 N-32), and a poke moves none: the read must reach the leaf.
+    sync
+    echo 3 >/proc/sys/vm/drop_caches
     md5sum <"$MNT/frag" >/dev/null 2>&1 && { fail "setup: the corrupt leaf read back"; ct_exit; }
     wr="$(python3 -c 'import os,sys
 try:
