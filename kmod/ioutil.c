@@ -2790,6 +2790,12 @@ static bool cetrafs_tear_replay_ignored;
 cetrafs_test_param(tear_replay_ignored, cetrafs_tear_replay_ignored, bool, 0644);
 MODULE_PARM_DESC(tear_replay_ignored, "TEST ONLY: a torn tree block whose file a dirty-journal node has open is damage");
 
+/* TEST ONLY: any dirty journal excuses the tear, its entries unread, as
+ * before audit 2026-11-22 N-33 (tests/kernel/torn_leaf_awaits_replay.sh). */
+static bool cetrafs_tear_replay_any_entry;
+cetrafs_test_param(tear_replay_any_entry, cetrafs_tear_replay_any_entry, bool, 0644);
+MODULE_PARM_DESC(tear_replay_any_entry, "TEST ONLY: a dirty journal excuses a torn tree block without an entry for it");
+
 /*
  * A tree block of file 'ino' that stays torn while another node that
  * has the file open -- or holds its lock -- has a DIRTY journal is that
@@ -2799,8 +2805,17 @@ MODULE_PARM_DESC(tear_replay_ignored, "TEST ONLY: a torn tree block whose file a
  * HA had just restarted here, unwritable after the replay had repaired
  * it (audit 2026-11-15 F-35, BM-37). Read fresh; a read that fails
  * explains nothing, and the verdict stands.
+ *
+ * The flag alone is not that write: it stays set for a node's whole
+ * session, so any tear in any file such a node had open went uncounted
+ * -- real damage with it (audit 2026-11-22 N-33). The excuse needs the
+ * file to be the incarnation the block was read for, and the node's
+ * journal to hold an entry its replay would redo ON THIS BLOCK
+ * (cetrafs_journal_node_redo_targets(); undecidable answers yes, and
+ * the next read judges again).
  */
-static bool cetrafs_tear_awaits_replay(struct super_block *sb, u64 ino, u64 lba, const char *what)
+static bool cetrafs_tear_awaits_replay(struct super_block *sb, u64 ino, u64 generation, u64 lba,
+                                       const char *what)
 {
     cetrafs_inode_t raw;
     u64 others;
@@ -2811,6 +2826,8 @@ static bool cetrafs_tear_awaits_replay(struct super_block *sb, u64 ino, u64 lba,
     cetrafs_invalidate_raw_inode(sb, ino);
     if (cetrafs_read_raw_inode(sb, ino, &raw))
         return false;
+    if (generation && cetrafs_le64(raw.generation) != generation)
+        return false; /* another file's now: no replay of the old one's writes repairs it */
     others = cetrafs_le64(raw.read_open_nodes) | cetrafs_le64(raw.suspended_writer_nodes);
     if (cetrafs_lock_mode_held(cetrafs_le32(raw.lock_mode)))
         others |= 1ULL << (cetrafs_le32(raw.lock_owner_node) % CETRAFS_MAX_READER_NODES);
@@ -2820,7 +2837,11 @@ static bool cetrafs_tear_awaits_replay(struct super_block *sb, u64 ino, u64 lba,
         bool dirty = false;
 
         others &= ~(1ULL << n);
-        if (!cetrafs_journal_node_is_dirty(sb, n, &dirty) && dirty) {
+        bool redo = true;
+
+        if (!cetrafs_journal_node_is_dirty(sb, n, &dirty) && dirty &&
+            (READ_ONCE(cetrafs_tear_replay_any_entry) || cetrafs_journal_node_redo_targets(sb, n, lba, &redo) ||
+             redo)) {
             pr_warn_ratelimited("%s block %llu of ino=%llu reads torn while node %u, which has the file open, has "
                                 "an unreplayed journal -- its write, awaiting replay: not counted as damage\n",
                                 what, (unsigned long long) lba, (unsigned long long) ino, n);
@@ -2880,7 +2901,7 @@ static struct buffer_head *__cetrafs_blk_tail_bread(struct super_block *sb, u64 
                            CETRAFS_BLK_TAIL_READ_RETRIES);
         return NULL;
     }
-    if (cetrafs_tear_awaits_replay(sb, ino, lba, what)) {
+    if (cetrafs_tear_awaits_replay(sb, ino, generation, lba, what)) {
         cetrafs_invalidate_block(sb, lba); /* the next read checks again */
         return NULL;
     }

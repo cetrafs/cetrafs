@@ -25,8 +25,13 @@
 #   2. with the sweep let go, the replay -- under this node's own
 #      opener -- repairs the leaf, and the fd reads the file as written.
 #
+#   3. node 1's journal dirty, but its entry for ANOTHER block: the
+#      tear is counted as damage -- the excuse is for a block a replay
+#      would rewrite, not for any tear while some journal is dirty.
+#
 # DISCRIMINATION: tear_replay_ignored=1 (as before): marked, and the
-# fchmod is refused EUCLEAN.
+# fchmod is refused EUCLEAN. tear_replay_any_entry=1 (the flag-only
+# excuse) for check 3: excused, not marked.
 set -euo pipefail
 . "$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)/lib/harness.sh"
 require_root
@@ -41,6 +46,7 @@ ct_track mnt "$MNT"
 ct_param_set auto_defrag 0
 ct_param_set scrub 0
 ct_param_set tear_replay_ignored 0
+ct_param_set tear_replay_any_entry 0
 ct_param_set hb_replay_sweep_off 0
 get() { grep -o "$1=[^ ]*" <<<"$2" | head -1 | cut -d= -f2; }
 nfmount() { mount -t cetrafs -o nofilelock "$1" "$2"; }
@@ -55,6 +61,7 @@ round() {
     mkdir -p "$dir"
     ct_mkfs "$dev" -z 1 -b 512 -J 4 -M 4 -N 1024 -f >/dev/null
     echo "$2" >$P/tear_replay_ignored
+    [ "$1" = O ] && echo 1 >$P/tear_replay_any_entry
     echo 1 >$P/hb_replay_sweep_off
     compress_timing
     nfmount "$dev" "$MNT"
@@ -108,7 +115,13 @@ PY
     "$BPOKE" "$dev" leaf "$ino" corrupt >/dev/null
     poke_dead_peer "$dev" 1 aa
     "$(ct_helper node_poke)" "$dev" 1 --mode 2 >/dev/null
-    "$JPOKE" "$dev" 1 0 "$p" "$dir/good" --guard-current >/dev/null
+    # Round 'o': node 1's journal is dirty, but its entry is for another
+    # block -- no replay of it repairs this leaf.
+    if [ "$1" = o ] || [ "$1" = O ]; then
+        "$JPOKE" "$dev" 1 0 "$((p + 1))" "$dir/good" --guard-current >/dev/null
+    else
+        "$JPOKE" "$dev" 1 0 "$p" "$dir/good" --guard-current >/dev/null
+    fi
     "$LPOKE" "$dev" "$ino" --reader 1 >/dev/null
     "$LPOKE" "$dev" --peer-size "$ino" "$(stat -c %s "$MNT/frag")" 1 >/dev/null
     sync
@@ -117,7 +130,7 @@ PY
     touch "$dir/go"
     wait_for 60 "[ -e '$dir/r1' ]" || { fail "setup: the holder's first read never finished"; ct_exit; }
     out="$(dmesg_since "$mark")"
-    if [ "$2" = 0 ]; then
+    if [ "$2" = 0 ] && [ "$1" != o ] && [ "$1" != O ]; then
         echo 0 >$P/hb_replay_sweep_off
         wait_for 90 "dmesg_since '$mark' | grep -q 'journal replay: node 1 replayed'" || true
     fi
@@ -130,6 +143,7 @@ PY
     RES="read=$r1 marked=$(grep -c "ino=$ino is damaged" <<<"$out" || true) chmod=$x"
     RES="$RES awaits=$(grep -c 'awaiting replay: not counted' <<<"$out" || true) after=$r2"
     echo 0 >$P/tear_replay_ignored
+    echo 0 >$P/tear_replay_any_entry
     echo 0 >$P/hb_replay_sweep_off
     umount "$MNT" 2>/dev/null || umount -l "$MNT"
     reset_stale_window
@@ -150,4 +164,21 @@ log "control (as before): $C"
 [ "$(get marked "$C")" -ge 1 ] && [ "$(get chmod "$C")" = 117 ] &&
     pass "control: as before, the file was marked and the fchmod refused EUCLEAN" ||
     fail "control: not marked without the change -- the suite does not reach it: $C"
+
+# 3. The excuse is for a block the dead node's replay would rewrite. A
+# dirty journal is session-long, so the flag alone excused any tear in
+# any file such a node had open -- real damage went uncounted (N-33).
+round o 0
+O="$RES"
+log "the dead node's entry is for another block: $O"
+[ "$(get read "$O")" != read ] || { fail "3: setup: the torn leaf read back ($O)"; ct_exit; }
+[ "$(get awaits "$O")" = 0 ] && [ "$(get marked "$O")" -ge 1 ] &&
+    pass "3: with no entry for this leaf in the dead node's journal, the tear is counted as damage" ||
+    fail "3: excused although no replay of node 1 rewrites the leaf: $O"
+round O 0
+OC="$RES"
+log "control, any entry excuses (as before): $OC"
+[ "$(get awaits "$OC")" -ge 1 ] && [ "$(get marked "$OC")" = 0 ] &&
+    pass "control 3: as before, the flag alone excused the tear" ||
+    fail "control 3: not excused even with the flag-only rule -- check 3 proves nothing: $OC"
 ct_exit

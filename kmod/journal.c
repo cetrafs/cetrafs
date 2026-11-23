@@ -4324,7 +4324,7 @@ int cetrafs_journal_node_is_dirty(struct super_block *sb, u32 node_id, bool *out
  * target write, milliseconds; the caller asks again before it waits.
  */
 #define CETRAFS_JOURNAL_PEEK_BATCH 32
-int cetrafs_journal_node_redo_pending(struct super_block *sb, u32 node_id, bool *out_pending)
+static int __cetrafs_journal_redo_scan(struct super_block *sb, u32 node_id, u64 only_lba, bool *out_pending)
 {
     struct buffer_head *hbhs[CETRAFS_JOURNAL_PEEK_BATCH];
     sector_t lbas[CETRAFS_JOURNAL_PEEK_BATCH];
@@ -4374,6 +4374,8 @@ int cetrafs_journal_node_redo_pending(struct super_block *sb, u32 node_id, bool 
             if ((e.flags & CETRAFS_JRNL_F_FRESH) && !cetrafs_journal_ignore_guard)
                 continue; /* replay skips a fresh block's entry by design */
             e.target_lba = cetrafs_le64(hdr->target_lba);
+            if (only_lba && e.target_lba != only_lba)
+                continue; /* another block's: not what was asked */
             e.prev_checksum = cetrafs_le32(hdr->prev_checksum);
             e.payload_checksum = cetrafs_le32(hdr->payload_checksum);
             lret = cetrafs_bg_owner_zg_for_lba(sb, e.target_lba, &zg);
@@ -4420,4 +4422,26 @@ int cetrafs_journal_node_redo_pending(struct super_block *sb, u32 node_id, bool 
     }
     *out_pending = false;
     return 0;
+}
+
+int cetrafs_journal_node_redo_pending(struct super_block *sb, u32 node_id, bool *out_pending)
+{
+    return __cetrafs_journal_redo_scan(sb, node_id, 0, out_pending);
+}
+
+/*
+ * Would a replay of node #node_id's journal rewrite block 'lba'? The same
+ * scan and the same judgement, narrowed to entries naming that block --
+ * for a torn tree block excused as a peer's write awaiting its replay
+ * (cetrafs_tear_awaits_replay()). Anything undecidable answers "yes" here
+ * too, and the caller reads that as "do not count it yet": the block is
+ * read again, and judged again, by the next read.
+ */
+int cetrafs_journal_node_redo_targets(struct super_block *sb, u32 node_id, u64 lba, bool *out_pending)
+{
+    if (!lba) {
+        *out_pending = false;
+        return -EINVAL;
+    }
+    return __cetrafs_journal_redo_scan(sb, node_id, lba, out_pending);
 }
