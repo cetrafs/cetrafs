@@ -1237,12 +1237,30 @@ u64 cetrafs_journal_op_refusal_count(void)
     return (u64) atomic64_read(&cetrafs_journal_op_refusals);
 }
 
+/* TEST ONLY: choose by whether the content passes the dirent or xattr
+ * structure check, as before audit 2026-11-22 N-52 -- an extent leaf
+ * passes the dirent one (tests/kernel/leaf_refusal_stops.sh). */
+static bool cetrafs_journal_op_refusable_by_content;
+cetrafs_test_param(journal_op_refusable_by_content, cetrafs_journal_op_refusable_by_content, bool, 0644);
+MODULE_PARM_DESC(journal_op_refusable_by_content, "TEST ONLY: a refused block is an operation's if its content passes a dirent/xattr check");
+
+/* The block's own tail says what it is. Its content does not: the
+ * structure checks dispatch on the magic they are GIVEN, and the dirent
+ * one only bounds name_len every 266 bytes, which an extent leaf
+ * passes -- so a refused leaf write was taken for an operation's ENOSPC
+ * and the mount ran on past half a tree edit (N-52). */
 static bool cetrafs_journal_op_refusable(struct buffer_head *bh)
 {
+    const cetrafs_blk_tail_t *tail = (const cetrafs_blk_tail_t *) (bh->b_data + CETRAFS_BLK_TAIL_OFF);
+    u32 magic = cetrafs_le32(tail->magic);
+
     if (READ_ONCE(cetrafs_journal_nospc_stops))
         return false;
-    return cetrafs_blk_struct_ok_magic(bh, CETRAFS_DIRENT_TAIL_MAGIC) ||
-           cetrafs_blk_struct_ok_magic(bh, CETRAFS_XATTR_TAIL_MAGIC);
+    if (READ_ONCE(cetrafs_journal_op_refusable_by_content))
+        return cetrafs_blk_struct_ok_magic(bh, CETRAFS_DIRENT_TAIL_MAGIC) ||
+               cetrafs_blk_struct_ok_magic(bh, CETRAFS_XATTR_TAIL_MAGIC);
+    return (magic == CETRAFS_DIRENT_TAIL_MAGIC || magic == CETRAFS_XATTR_TAIL_MAGIC) &&
+           cetrafs_blk_struct_ok_magic(bh, magic);
 }
 
 /* TEST ONLY: a single-block entry that fails in a slot taken over from a
