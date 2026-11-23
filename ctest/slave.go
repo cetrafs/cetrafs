@@ -1848,6 +1848,10 @@ var settableModParams = map[string]bool{
 	"scrub":               true,
 	"scrub_interval_secs": true,
 	"scrub_gap_secs":      true,
+	// Every Zone Group claim keeps the scrub out of the group for this
+	// long (600 s by default), so it goes in with the cadence, before
+	// the mount, or the scrub frees nothing for the whole scenario.
+	"trim_quarantine_secs": true,
 }
 
 // Run the embedded fsck against this slave's device. Refuses while this

@@ -5603,6 +5603,8 @@ func RunScrubTransit(clients []*Client, baseDir string) (bool, error) {
 		{"scrub", "1"},
 		{"scrub_interval_secs", "3"},
 		{"scrub_gap_secs", "2"},
+		// A claim holds the scrub off its Zone Group for this long.
+		{"trim_quarantine_secs", "1"},
 		// The queued free must outlast two scrub cycles. A slow beat no
 		// longer holds it (the beat is capped at 30 s), so the drain is
 		// switched off outright until the scrub has been asked.

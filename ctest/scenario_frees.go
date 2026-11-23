@@ -34,7 +34,7 @@ func RunFreesInFlight(clients []*Client, baseDir string) (bool, error) {
 	a, b := clients[0], clients[1]
 	two := []*Client{a, b}
 	control := os.Getenv("CTEST_FREES_CONTROL") != ""
-	setA := [][2]string{{"scrub", "1"}, {"scrub_interval_secs", "5"}, {"scrub_gap_secs", "1"}, {"alloc_run_blocks", "0"}}
+	setA := [][2]string{{"scrub", "1"}, {"scrub_interval_secs", "5"}, {"scrub_gap_secs", "1"}, {"trim_quarantine_secs", "1"}, {"alloc_run_blocks", "0"}}
 	if control {
 		setA = append(setA, [2]string{"scrub_ignore_peer_frees", "1"})
 	}
@@ -46,7 +46,7 @@ func RunFreesInFlight(clients []*Client, baseDir string) (bool, error) {
 			fmt.Printf("WARNING: cleanup unmount failed: %v\n", uerr)
 		}
 		// The scrub cadence goes back to its defaults for whatever runs next.
-		for _, kv := range [][2]string{{"scrub_interval_secs", "1800"}, {"scrub_gap_secs", "15"}} {
+		for _, kv := range [][2]string{{"scrub_interval_secs", "1800"}, {"scrub_gap_secs", "15"}, {"trim_quarantine_secs", "600"}} {
 			_ = callOK(a, "mod_param", ModParamArgs{Name: kv[0], Value: kv[1]})
 		}
 	}()
