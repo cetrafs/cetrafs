@@ -342,6 +342,8 @@ static int cetrafs_proc_info_show(struct seq_file *m, void *v)
     seq_printf(m, "deferred_cap_flushes: %llu\n", cetrafs_deferred_cap_flush_count());
     seq_printf(m, "deferred_room_refusals: %llu\n", cetrafs_deferred_room_refusal_count());
     seq_printf(m, "deferred_stale_sets: %llu\n", cetrafs_deferred_stale_set_count());
+    seq_printf(m, "deferred_window_losses: %llu\n", cetrafs_deferred_window_loss_count());
+    seq_printf(m, "deferred_window_unverified: %llu\n", cetrafs_deferred_window_unverified_count());
     seq_printf(m, "wb_tree_walks: %llu\n", cetrafs_wb_tree_walk_count());
     /* Heartbeat maintenance passes that reached their end. */
     seq_printf(m, "hb_sweeps: %llu\n", cetrafs_hb_sweep_count());

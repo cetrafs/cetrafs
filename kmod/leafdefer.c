@@ -832,8 +832,10 @@ static int cetrafs_deferred_claim(struct super_block *sb, struct inode *inode, s
  * cannot be undone here -- the peer took no lock to exclude -- so the
  * file is marked damaged rather than left silently wrong. Unclaimed
  * (the control only), the old test: any foreign stamp since seq_before.
- * An unverifiable read counts as a loss: the correctness bar is "say
- * so", never "assume".
+ * A read that never succeeds is not a loss: it proves nothing either
+ * way, so it is said and counted as UNVERIFIED (procfs
+ * deferred_window_unverified, beside deferred_window_losses) and the
+ * file is not marked -- "say so", never "assume", in both directions.
  */
 /* TEST ONLY: fail the window check's reads: 1 = the next block
  * read-back once, 2 = the next stamp read once, 4 = every one
@@ -911,6 +913,16 @@ static int cetrafs_window_read_stamp(struct super_block *sb, const struct cetraf
 
 static atomic64_t cetrafs_deferred_window_unverified = ATOMIC64_INIT(0);
 
+u64 cetrafs_deferred_window_loss_count(void)
+{
+    return (u64) atomic64_read(&cetrafs_deferred_window_losses);
+}
+
+u64 cetrafs_deferred_window_unverified_count(void)
+{
+    return (u64) atomic64_read(&cetrafs_deferred_window_unverified);
+}
+
 static void cetrafs_deferred_window_check(struct super_block *sb, struct buffer_head **bhs, const bool *written,
                                           const u32 *wcrc, unsigned int n,
                                           const struct cetrafs_journal_owner *o, u64 seq_before, u64 claimed)
@@ -971,8 +983,8 @@ static void cetrafs_deferred_window_check(struct super_block *sb, struct buffer_
     if (!lost)
         return;
     atomic64_inc(&cetrafs_deferred_window_losses);
-    pr_err("ino=%llu: another node wrote the file while this node's tree flush was landing, or what landed could "
-           "not be read back -- a write may be lost; the file is marked damaged (fsck.cetra)\n",
+    pr_err("ino=%llu: another node wrote the file while this node's tree flush was landing -- a write may be lost; "
+           "the file is marked damaged (fsck.cetra)\n",
            (unsigned long long) o->ino);
     cetrafs_sb_corrupt_owner(sb, o->ino, o->generation);
 }

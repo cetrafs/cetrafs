@@ -530,6 +530,8 @@ int cetrafs_inode_file_seq_claim(struct super_block *sb, struct inode *inode, u6
 int cetrafs_lock_sweep_own_claims(struct super_block *sb, u32 my_node_id);
 u64 cetrafs_deferred_orphaned_count(void);
 u64 cetrafs_deferred_adopted_count(void);
+u64 cetrafs_deferred_window_loss_count(void);       /* leafdefer.c: a peer wrote inside a tree flush */
+u64 cetrafs_deferred_window_unverified_count(void); /* leafdefer.c: a tree flush's read-back never succeeded */
 int cetrafs_lock_resweep_own_claims(struct super_block *sb, u32 my_node_id, bool (*stop)(struct super_block *));
 u64 cetrafs_late_claims_cleared_count(void);
 /* lock.c: clear a dead node's claims on a deleted record (the orphan scrub) */

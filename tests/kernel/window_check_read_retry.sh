@@ -17,7 +17,8 @@
 #   B. the next stamp read fails once (window_read_fail=2);
 #   C. every read-back fails (window_read_fail=4): unverified;
 # in each: the file is not marked damaged, and a later write succeeds.
-# C also logs the read-back as unverified.
+# C also logs the read-back as unverified and counts it in info
+# (deferred_window_unverified).
 #
 # DISCRIMINATION: window_read_no_retry=1 restores the old judgement:
 # round A's file is marked damaged and the later write fails.
@@ -51,17 +52,19 @@ PY
 
 # <tag> <fail mask> <no_retry 0|1> -> RES "damaged= later= unverified= injected="
 round() {
-    local dev f mark dmg=0 later=0 unv=0 inj=0
+    local dev f mark dmg=0 later=0 unv=0 inj=0 proc n0
     dev="$(ct_dev 560 "wcrr$1")"
     ct_mkfs "$dev" -z 1 -b 512 -J 4 -M 4 -N 1024 -f >/dev/null
     mount -t cetrafs -o nofilelock "$dev" "$MNT"
     f="$MNT/img"
+    proc="$(ct_procdir "$dev")"
     fallocate -l $((4 << 20)) "$f"
     # 64 apart: every write its own extent, and the map spills into a leaf.
     for i in $(seq 0 6); do dio_write "$f" $((i * 64)) "$(printf 'B%07d' $((i * 64)))"; done
     dio_write "$f" 448 B0000448 fsync
     echo "$3" >$P/window_read_no_retry
     mark="$(dmesg_mark)"
+    n0="$(sed -n 's/^deferred_window_unverified: //p' "$proc/info")"
     echo "$2" >$P/window_read_fail
     dio_write "$f" 900 OURS0900 fsync 2>/dev/null || true
     echo 0 >$P/window_read_fail
@@ -70,8 +73,9 @@ round() {
     dmesg_since "$mark" | grep -q 'the file is marked damaged' && dmg=1
     dmesg_since "$mark" | grep -q 'could not be read back -- not verified' && unv=1
     dmesg_since "$mark" | grep -q 'window_read_fail: failed a' && inj=1
-    umount "$MNT"
     RES="damaged=$dmg later=$later unverified=$unv injected=$inj"
+    RES="$RES counted=$(($(sed -n 's/^deferred_window_unverified: //p' "$proc/info") - n0))"
+    umount "$MNT"
 }
 get() { sed -n "s/.*\b$1=\([0-9]*\).*/\1/p" <<<"$2"; }
 
@@ -89,8 +93,9 @@ for r in "A:$A" "B:$B" "C:$D"; do
     [ "$(get damaged "$v")" = 0 ] && [ "$(get later "$v")" = 1 ] &&
         pass "$n: the file is not marked damaged, and a later write succeeds" || fail "$n: $v"
 done
-[ "$(get unverified "$D")" = 1 ] && pass "C: the read-back that kept failing is reported as unverified" ||
-    fail "C: no 'not verified' report ($D)"
+[ "$(get unverified "$D")" = 1 ] && [ "$(get counted "$D")" -ge 1 ] &&
+    pass "C: the read-back that kept failing is reported as unverified, and counted in info" ||
+    fail "C: no 'not verified' report, or not counted in deferred_window_unverified ($D)"
 [ "$(get injected "$C")" = 1 ] && [ "$(get damaged "$C")" = 1 ] && [ "$(get later "$C")" = 0 ] &&
     pass "control: without the retry one failed read marks the file damaged and refuses the next write" ||
     fail "control: $C -- the injected failure did not reach the judgement"
