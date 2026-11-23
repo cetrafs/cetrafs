@@ -66,6 +66,10 @@ PY
 # lookup is a pure repeat lookup.
 dd if=/dev/zero of="$MNT/frag" bs=64k count=1024 conv=notrunc,fdatasync status=none
 sync
+# Out of the page cache, so the rewrite maps every block: a lookup keeps
+# a file's pages while its file_seq stands (audit 2026-11-22 N-32), and a
+# rewrite of mapped pages asks the tree nothing.
+echo 1 >/proc/sys/vm/drop_caches
 
 H0="$(hits)"; M0="$(misses)"
 dd if=/dev/zero of="$MNT/frag" bs=64k count=1024 conv=notrunc,fdatasync status=none
