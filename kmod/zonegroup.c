@@ -997,12 +997,26 @@ MODULE_PARM_DESC(reconcile_epoch_always, "TEST ONLY: a clean re-attach or an uno
  * Zone Group up (a clean departure, or a release), so no late delta can
  * arrive: a member whose count matches its bitmap keeps its epoch and is
  * not rewritten. Otherwise every member's epoch moves (P3). */
+/* TEST ONLY: the recount of Block Group (this - 1) fails once with -EIO
+ * (tests/kernel/zg_reconcile_member_fails.sh). 0 = off. */
+static unsigned int cetrafs_reconcile_fail_bg;
+cetrafs_test_param(reconcile_fail_bg, cetrafs_reconcile_fail_bg, uint, 0644);
+MODULE_PARM_DESC(reconcile_fail_bg, "TEST ONLY: fail the next recount of Block Group (value - 1) with -EIO");
+
+/* TEST ONLY: a Zone Group recount stops at its first failed member, as
+ * before audit 2026-11-22 N-8 -- the control of the same suite. */
+static bool cetrafs_reconcile_stop_on_fail;
+cetrafs_test_param(reconcile_stop_on_fail, cetrafs_reconcile_stop_on_fail, bool, 0644);
+MODULE_PARM_DESC(reconcile_stop_on_fail, "TEST ONLY: a Zone Group recount returns at its first failed member");
+
 static int cetrafs_zg_reconcile_free_counts(struct super_block *sb, u32 zg_id, bool keep_epoch)
 {
     const cetrafs_superblock_t *raw_sb = cetrafs_sb_raw(sb);
     u64 truth = 0;
     u32 b, nbg;
-    int ret;
+    s64 stale = 0;
+    bool truth_short = false;
+    int ret, first_err = 0;
 
     if (!raw_sb)
         return -EINVAL;
@@ -1011,13 +1025,10 @@ static int cetrafs_zg_reconcile_free_counts(struct super_block *sb, u32 zg_id, b
     /* Before the recount, not after: a delta taken afterwards could
      * include an allocation made while the scan ran, whose effect the
      * truth below already carries. */
-    {
-        s64 stale = cetrafs_sb_take_zg_free_delta(sb, zg_id);
-
-        if (stale)
-            pr_warn("ZG %u: dropping an accrued aggregate delta of %lld -- this claim recounts the members\n", zg_id,
-                    (long long) stale);
-    }
+    stale = cetrafs_sb_take_zg_free_delta(sb, zg_id);
+    if (stale)
+        pr_warn("ZG %u: dropping an accrued aggregate delta of %lld -- this claim recounts the members\n", zg_id,
+                (long long) stale);
     {
         unsigned int pause = xchg(&cetrafs_zg_reconcile_stall_ms, 0);
 
@@ -1043,20 +1054,42 @@ static int cetrafs_zg_reconcile_free_counts(struct super_block *sb, u32 zg_id, b
             return ret;
 
         cetrafs_bg_prefetch_bitmap(sb, b);
-        ret = cetrafs_sb_zg_owned_cached(sb, zg_id)
-                  ? cetrafs_bg_reconcile_free_count(sb, b, &delta, keep_epoch)
-                  : cetrafs_bg_reconcile_free_count_uncached(sb, b, zg_id, &delta, keep_epoch);
+        if (READ_ONCE(cetrafs_reconcile_fail_bg) == b + 1 &&
+            cmpxchg(&cetrafs_reconcile_fail_bg, b + 1, 0) == b + 1)
+            ret = -EIO; /* test-only; see the parameter */
+        else
+            ret = cetrafs_sb_zg_owned_cached(sb, zg_id)
+                      ? cetrafs_bg_reconcile_free_count(sb, b, &delta, keep_epoch)
+                      : cetrafs_bg_reconcile_free_count_uncached(sb, b, zg_id, &delta, keep_epoch);
         if (ret) {
             /* Never fails the claim: a ZG with an unreadable BG is
              * still better owned than left to nobody, and the ordinary
-             * allocator reports the real error when it gets there. */
+             * allocator reports the real error when it gets there. Nor
+             * does it end the recount: returning here left every member
+             * after this one with no count epoch, so each delta this
+             * node flushed for them was refused and their counts drifted
+             * from their bitmaps (N-8). The member's own count stands in
+             * for its bitmap in the truth -- the best figure there is. */
             pr_err("ZG %u reconcile: BG %u could not be reconciled (%d)\n", zg_id, b, ret);
-            return ret;
+            if (!first_err)
+                first_err = ret;
+            if (READ_ONCE(cetrafs_reconcile_stop_on_fail))
+                return ret; /* test-only; see the parameter (the delta stays dropped, as before) */
         }
-        ret = cetrafs_bg_data_block_stats(sb, b, &total, &free);
-        if (ret)
-            return ret;
+        if (cetrafs_bg_data_block_stats(sb, b, &total, &free)) {
+            truth_short = true;
+            continue;
+        }
         truth += free;
+    }
+
+    /* A member with no count at all leaves the truth short: the
+     * aggregate stays as it was, and the delta taken for it goes back,
+     * still the best account of what this node did to it. */
+    if (truth_short) {
+        if (stale)
+            cetrafs_sb_accrue_zg_free(sb, zg_id, stale);
+        return first_err ?: -EIO;
     }
 
     {
@@ -1064,16 +1097,20 @@ static int cetrafs_zg_reconcile_free_counts(struct super_block *sb, u32 zg_id, b
         s64 delta;
 
         ret = cetrafs_zg_get_info(sb, zg_id, &info);
-        if (ret)
+        if (ret) {
+            if (stale)
+                cetrafs_sb_accrue_zg_free(sb, zg_id, stale); /* nothing corrected: as above */
             return ret;
+        }
 
         delta = (s64) truth - (s64) info.free_data_blocks;
         if (delta == 0)
-            return 0;
+            return first_err;
 
         pr_warn("ZG %u: aggregate free_data_blocks=%llu but its Block Groups hold %llu -- correcting (drift %lld)\n",
                 zg_id, info.free_data_blocks, truth, delta);
-        return cetrafs_zg_apply_free_delta(sb, zg_id, delta);
+        ret = cetrafs_zg_apply_free_delta(sb, zg_id, delta);
+        return ret ?: first_err;
     }
 }
 
