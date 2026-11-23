@@ -183,6 +183,7 @@ static int __cetrafs_read_zg(struct super_block *sb, u32 zg_id, cetrafs_zone_gro
     struct buffer_head *bh;
     const cetrafs_zone_group_t *zg;
     u32 want, got;
+    bool misdirected = false;
 
     if (!raw_sb)
         return -EINVAL;
@@ -229,8 +230,15 @@ static int __cetrafs_read_zg(struct super_block *sb, u32 zg_id, cetrafs_zone_gro
                 if (!unlocked)
                     cetrafs_bh_read_unlock(bh);
                 brelse(bh);
-                if (le16_to_cpu(out->zg_id) != (u16) zg_id)
-                    return -EINVAL;
+                /* Valid checksum, another group's id: a misdirected
+                 * write or a copied sector. Persistent, so not retried,
+                 * and damage like a record that never verifies -- not
+                 * -EINVAL, which no sweep skips and which took the mount,
+                 * every claim scan and statfs down with it (N-17). */
+                if (le16_to_cpu(out->zg_id) != (u16) zg_id) {
+                    misdirected = true;
+                    goto damaged;
+                }
                 if (cetrafs_zg_hot_crc(out) == (u32) le64_to_cpu(out->hot_checksum) &&
                     cetrafs_zg_cold_crc(out) == (u32) le64_to_cpu(out->cold_checksum))
                     return 0;
@@ -258,13 +266,15 @@ static int __cetrafs_read_zg(struct super_block *sb, u32 zg_id, cetrafs_zone_gro
      * 2026-11-15 B-14) took the whole volume down for one sector. Each
      * caller leaves it out; reported once.
      */
+damaged:
     if (cetrafs_sb_zg_owned_cached(sb, zg_id) || READ_ONCE(cetrafs_zg_unreadable_fatal)) {
-        pr_err("ZG %u failed its checksum repeatedly -- corrupted, not just a torn concurrent read\n", zg_id);
+        pr_err("ZG %u %s -- corrupted, not just a torn concurrent read\n", zg_id,
+               misdirected ? "holds another group's record" : "failed its checksum repeatedly");
         cetrafs_sb_corrupt(sb, 0);
     } else if (cetrafs_sb_zg_note_unreadable(sb, zg_id)) {
-        pr_err("ZG %u: its record failed its checksum repeatedly -- damaged; this node leaves the group alone "
+        pr_err("ZG %u: its record %s -- damaged; this node leaves the group alone "
                "(no claim, no release) until `fsck.cetra -r` rebuilds it\n",
-               zg_id);
+               zg_id, misdirected ? "names another Zone Group" : "failed its checksum repeatedly");
     }
     return -EUCLEAN;
 }
