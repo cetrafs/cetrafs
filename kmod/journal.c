@@ -3213,8 +3213,13 @@ static int ___cetrafs_journal_replay_node(struct super_block *sb, u32 node_id, b
         ret = -ENOMEM;
         goto out_release;
     }
+    /* test-only: what init_on_alloc=0 may hand out. 0x01, not 0xff: a
+     * bool left unset then reads true -- the garbage this exists to
+     * show -- without being a value a bool cannot hold, which a UBSAN
+     * kernel reports as an invalid load and the suite's dmesg check
+     * fails on. */
     if (READ_ONCE(cetrafs_journal_replay_poison))
-        memset(entries, 0xff, slots * sizeof(*entries)); /* test-only: what init_on_alloc=0 may hand out */
+        memset(entries, 0x01, slots * sizeof(*entries));
 
     for (s = 0; s < slots; s++) {
         u64 header_lba = area_start + 1 + s * CETRAFS_JOURNAL_SLOT_BLOCKS;
