@@ -5432,8 +5432,6 @@ static bool cetrafs_inode_has_foreign_opener(struct inode *inode, bool inline_re
     u32 my_node_id;
     bool exists = false;
 
-    if (cetrafs_force_foreign_opener)
-        return true;
     if (cetrafs_sb_get_node_id(sb, &my_node_id) != 0)
         return true;
 
@@ -5444,6 +5442,13 @@ static bool cetrafs_inode_has_foreign_opener(struct inode *inode, bool inline_re
         return true; /* cannot tell -> assume present, read fresh */
 
     cetrafs_inode_note_stamp(inode, &raw, my_node_id);
+    /* TEST ONLY: the presence verdict forced -- after the stamp is
+     * noted, as every real verdict's is. Returning before the read, the
+     * knob also skipped the stamp, and tests/kernel/nofilelock_coherency.sh's
+     * peer change was seen only because a path stat dropped every cache
+     * (audit 2026-11-22 N-32). */
+    if (cetrafs_force_foreign_opener)
+        return true;
 
     if (cetrafs_foreign_reader_from_raw_mode(sb, inode->i_ino, &raw, my_node_id, 0, &exists,
                                              inline_reclaim ? CETRAFS_READER_RECLAIM_FILL : CETRAFS_READER_DEFER) != 0)

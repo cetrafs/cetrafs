@@ -26,7 +26,9 @@
 # publishes its file_seq the way every real peer's tree change does; a
 # poke that publishes nothing is a change no peer makes. CASE C is B's
 # control: the same change without the stamp is not seen, so B passes
-# because of the stamp and the map is not re-read per I/O.
+# because of the stamp and the map is not re-read per I/O. Each second read
+# comes after the one-second window the held open's stamp check is cached
+# for; C's change, unstamped, stays unseen past it.
 set -euo pipefail
 . "$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)/lib/harness.sh"
 require_root
@@ -77,6 +79,13 @@ probe_once() {
     if [ "$stamp" = 1 ]; then
         "$LPOKE" "$IMG" --peer-size "$ino" "$(stat -c %s "$MNT/$file")" 1 >/dev/null
     fi
+    # The held open re-checks the record's stamp at most once a second
+    # (the verdict cache, cetrafs_verdict_trusted()): the designed bound
+    # on how long a peer's change goes unseen. Read after it, so what
+    # decides is the stamp and nothing else. (The path stat above once
+    # decided B on its own: a revalidate dropped every cache, stamp or
+    # not -- audit 2026-11-22 N-32.)
+    sleep 1.2
     : >"$go"
     wait "$pid" 2>/dev/null || true
     PROBE_READ1="$(sed -n 's/^read1 //p' "$out")"
