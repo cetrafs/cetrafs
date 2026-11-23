@@ -6298,6 +6298,33 @@ int main(int argc, char **argv)
 
             if (!twhole)
                 dwhole[ino] = 0; /* a tree block the content pass reported: names unseen */
+            /* Dense from logical block 0, as the kernel requires
+             * (cetrafs_dir_extents_addr_ok()): it refuses a directory whose
+             * extents leave a gap or overlap, on every node, and this walk
+             * read such a directory's names as though nothing were wrong
+             * (audit 2026-11-22 N-271). The extents are sorted by logical
+             * block, so each must start where the ones before it end. Only
+             * a whole tree is judged: one with a block skipped above has a
+             * gap of its own, already reported. Its names are still walked
+             * -- every block is read here -- so the link counts stay right;
+             * nothing here can close the gap, so it is reported, not
+             * repaired. */
+            if (twhole && !cetrafs_test_env("CETRAFS_FSCK_TEST_DIR_GAPS_UNCHECKED")) {
+                uint64_t next = 0;
+
+                for (uint32_t e = 0; e < n; ++e) {
+                    if (cetrafs_ee_lblk(&ext[e]) != next) {
+                        fprintf(stderr,
+                                "ERR: directory inode %" PRIu64 " has extent %u at logical block %" PRIu64
+                                " where %" PRIu64 " was expected -- a directory's blocks are dense, and every node "
+                                "refuses it\n",
+                                ino, e, (uint64_t) cetrafs_ee_lblk(&ext[e]), next);
+                        problems++;
+                        break;
+                    }
+                    next += cetrafs_ee_len(&ext[e]);
+                }
+            }
             for (uint32_t e = 0; e < n; ++e) {
                 uint64_t phys = cetrafs_ee_pblk(&ext[e]);
                 uint64_t len = cetrafs_ee_len(&ext[e]);
